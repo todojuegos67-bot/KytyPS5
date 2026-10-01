@@ -887,6 +887,15 @@ bool Translator::DS_BPERMUTE_B32(const Decoder::Instruction& inst) {
 
 bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: {
+			const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
+			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()});
+			for (uint32_t component = 0; component < 4; ++component) {
+				WriteOperand(OffsetOperand(inst.dst, component),
+				    ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(component)}));
+			}
+			return true;
+		}
 		case Decoder::Opcode::S_LOAD_DWORD:
 		case Decoder::Opcode::S_LOAD_DWORDX2:
 		case Decoder::Opcode::S_LOAD_DWORDX4:

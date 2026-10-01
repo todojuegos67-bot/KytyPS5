@@ -660,6 +660,10 @@ uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
 
 bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op         = inst.GetOpcode();
+	if (op == IR::ValueOpcode::BvhIntersect) {
+		ctx.Define(inst, EmitBvhIntersect(ctx, inst));
+		return true;
+	}
 	const auto image_info = IR::ImageOpcodeInfoOf(op);
 	if (image_info.access == IR::ImageAccess::None) {
 		return false;

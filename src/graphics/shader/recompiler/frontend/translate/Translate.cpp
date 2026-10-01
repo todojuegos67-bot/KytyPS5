@@ -193,6 +193,8 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::IntegerInlineConstant:
 		case Decoder::OperandKind::FloatInlineConstant: return IR::U32(IR::Value(operand.value));
 		case Decoder::OperandKind::Null:
+		case Decoder::OperandKind::SharedBase:
+		case Decoder::OperandKind::PrivateBase:
 		case Decoder::OperandKind::PopsExitingWaveId: return IR::U32(IR::Value(0u));
 		case Decoder::OperandKind::Sgpr:
 			return ir.GetScalarReg(static_cast<IR::ScalarReg>(operand.reg));
@@ -521,6 +523,12 @@ IR::U32 Translator::ReadU32(const Decoder::Operand& operand) {
 }
 
 std::array<IR::U32, 2> Translator::ReadU32Pair(const Decoder::Operand& operand) {
+	if (operand.kind == Decoder::OperandKind::PrivateBase ||
+	    operand.kind == Decoder::OperandKind::SharedBase) {
+		return {IR::U32(IR::Value(0u)), IR::U32(IR::Value(
+		    operand.kind == Decoder::OperandKind::PrivateBase ? Decoder::PrivateApertureHigh
+		                                                      : Decoder::SharedApertureHigh))};
+	}
 	if (operand.kind == Decoder::OperandKind::ExecLo) {
 		return {ir.GetExecLo(), ir.GetExecHi()};
 	}

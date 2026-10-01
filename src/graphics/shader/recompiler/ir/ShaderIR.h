@@ -29,6 +29,7 @@ enum class ResourceKind {
 	ScalarAddress,
 	Buffer,
 	Flat,
+	FlatLocal,
 	Global,
 	Scratch,
 	Lds,
@@ -39,7 +40,8 @@ enum class ResourceKind {
 
 [[nodiscard]] constexpr bool IsAddressResourceKind(ResourceKind kind) {
 	return kind == ResourceKind::ScalarAddress || kind == ResourceKind::Flat ||
-	       kind == ResourceKind::Global || kind == ResourceKind::Scratch;
+	       kind == ResourceKind::FlatLocal || kind == ResourceKind::Global ||
+	       kind == ResourceKind::Scratch;
 }
 
 struct MemoryInfo {
@@ -497,6 +499,7 @@ struct ShaderInfo {
 };
 
 struct SpirvRequirements {
+	bool bvh                          = false;
 	bool subgroup_ballot              = false;
 	bool subgroup_shuffle             = false;
 	bool subgroup_local_invocation_id = false;
