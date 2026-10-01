@@ -408,6 +408,7 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                         bvh_intersect_function  = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         lod_stats_variable      = 0;
 	bool                                             lod_stats_subgroup      = false;
@@ -846,6 +847,11 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+void DefineBvhIntersect(EmitterState& state);
+uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
+uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value);
+uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>

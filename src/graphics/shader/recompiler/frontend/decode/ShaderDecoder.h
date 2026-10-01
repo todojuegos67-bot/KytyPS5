@@ -10,6 +10,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
+// PS5 flat stack addresses use these SH_MEM_BASES aperture tags in VA[63:32].
+constexpr uint32_t PrivateApertureHigh = 0x70000000u;
+constexpr uint32_t SharedApertureHigh = 0x80000000u;
+
 enum class Family {
 	Unknown,
 	SOP1,
@@ -542,6 +546,7 @@ enum class Opcode {
 	DS_WRITE_B128,
 	DS_WRITE_ADDTID_B32,
 	DS_READ_ADDTID_B32,
+	IMAGE_BVH_INTERSECT_RAY,
 	IMAGE_GET_RESINFO,
 	IMAGE_GET_LOD,
 	IMAGE_LOAD,
@@ -604,6 +609,8 @@ enum class OperandKind {
 	Scc,
 	M0,
 	PopsExitingWaveId,
+	SharedBase,
+	PrivateBase,
 	Null,
 	Vgpr,
 };
