@@ -2,6 +2,7 @@
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
 #include <algorithm>
 #include <array>
@@ -119,30 +120,22 @@ uint32_t AddU64Low(EmitterState& state, uint32_t low, uint32_t high, uint32_t ad
 	return result;
 }
 
-uint32_t ScratchByteAddress(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t low,
-                            uint32_t high) {
-	auto& state     = ctx.state;
-	auto  immediate = static_cast<int32_t>(mem.offset);
+uint32_t AddAddressOffset(EmitterState& state, const IR::MemoryInfo& mem, uint32_t low,
+                          uint32_t& high) {
+	const auto immediate = static_cast<int32_t>(mem.offset);
+	if (immediate == 0) return low;
 	const auto immediate_low  = ConstantU32(state, static_cast<uint32_t>(immediate));
 	const auto immediate_high = ConstantU32(state, immediate < 0 ? UINT32_MAX : 0u);
-	low                      = AddU64Low(state, low, high, immediate_low, immediate_high, high);
+	return AddU64Low(state, low, high, immediate_low, immediate_high, high);
+}
+
+uint32_t ScratchByteAddress(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t low,
+                            uint32_t high) {
+	auto& state = ctx.state;
+	low         = AddAddressOffset(state, mem, low, high);
 	const auto valid =
 	    Binary(state, OpIEqual, TypeBool(state), high, ConstantU32(state, 0));
 	return Select(state, TypeU32(state), valid, low, ConstantU32(state, UINT32_MAX));
-}
-
-uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value) {
-	return state.builder.Constant(OpConstant, TypeDeviceAddress(state),
-	                              {static_cast<uint32_t>(value),
-	                               static_cast<uint32_t>(value >> 32u)});
-}
-
-uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high) {
-	const auto low64  = Unary(state, OpUConvert, TypeDeviceAddress(state), low);
-	const auto high64 = Binary(state, OpShiftLeftLogical, TypeDeviceAddress(state),
-	                           Unary(state, OpUConvert, TypeDeviceAddress(state), high),
-	                           ConstantDeviceAddress(state, 32));
-	return Binary(state, OpBitwiseOr, TypeDeviceAddress(state), low64, high64);
 }
 
 uint32_t GuestAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
@@ -196,17 +189,9 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	    {OpStore, pointer, Binary(state, OpBitwiseOr, TypeU32(state), value, bit)});
 }
 
-uint32_t GetBdaPointer(ValueEmitContext& ctx, uint32_t address) {
-	auto&      state  = ctx.state;
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpFunctionCall, TypeDeviceAddress(state), result, state.bda_pointer_function, address});
-	return result;
-}
-
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
 	auto&      state   = ctx.state;
-	const auto bda     = GetBdaPointer(ctx, address);
+	const auto bda     = GetBdaPointer(state, address);
 	const auto present = Binary(state, OpINotEqual, TypeBool(state), bda,
 	                            ConstantDeviceAddress(state, 0));
 	return EmitValueOrZeroIfCondition(state, present, [&]() {
@@ -841,6 +826,50 @@ void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resour
 	ctx.state.builder.AddFunction({OpStore, pointer, data});
 }
 
+template <typename Fn>
+void ForEachLocalFlatAccess(ValueEmitContext& ctx, const IR::Inst& inst, Fn&& emit) {
+	auto& state = ctx.state;
+	auto mem = ctx.Memory(inst);
+	auto high = ctx.Arg(inst, 2);
+	const auto low = AddAddressOffset(state, mem, ctx.Arg(inst, 1), high);
+	const auto index = Binary(state, OpShiftRightLogical, TypeU32(state), low, ConstantU32(state, 2));
+	const auto aligned = Binary(state, OpIEqual, TypeBool(state), ConstantU32(state, 0),
+	    Binary(state, OpBitwiseAnd, TypeU32(state), low, ConstantU32(state, 3)));
+	for (const auto kind: {IR::ResourceKind::Scratch, IR::ResourceKind::Lds}) {
+		mem.kind = kind;
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		const auto aperture = kind == IR::ResourceKind::Scratch ? Decoder::PrivateApertureHigh
+		                                                       : Decoder::SharedApertureHigh;
+		const auto selected = Binary(state, OpIEqual, TypeBool(state), high, ConstantU32(state, aperture));
+		const auto valid = AndCondition(state, aligned,
+		    AndCondition(state, selected, EmitMemoryElementInBounds(state, resource, index)));
+		emit(resource, index, valid);
+	}
+}
+
+uint32_t LoadLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		uint32_t result = 0;
+		ForEachLocalFlatAccess(ctx, inst, [&](const auto& resource, uint32_t index, uint32_t valid) {
+			const auto value = EmitValueOrZeroIfCondition(ctx.state, valid, [&]() {
+				return LoadWordInBounds(ctx, resource, index);
+			});
+			result = result == 0 ? value : Binary(ctx.state, OpBitwiseOr, TypeU32(ctx.state), result, value);
+		});
+		return result;
+	});
+}
+
+void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
+	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		ForEachLocalFlatAccess(ctx, inst, [&](const auto& resource, uint32_t index, uint32_t valid) {
+			EmitIfCondition(ctx.state, valid, [&]() {
+				StoreWordInBounds(ctx, resource, index, ctx.Arg(inst, inst.NumArgs() - 2));
+			});
+		});
+	});
+}
+
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
@@ -1416,6 +1445,27 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 
 } // namespace
 
+uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value) {
+	return state.builder.Constant(OpConstant, TypeDeviceAddress(state),
+	                              {static_cast<uint32_t>(value),
+	                               static_cast<uint32_t>(value >> 32u)});
+}
+
+uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high) {
+	const auto low64  = Unary(state, OpUConvert, TypeDeviceAddress(state), low);
+	const auto high64 = Binary(state, OpShiftLeftLogical, TypeDeviceAddress(state),
+	                           Unary(state, OpUConvert, TypeDeviceAddress(state), high),
+	                           ConstantDeviceAddress(state, 32));
+	return Binary(state, OpBitwiseOr, TypeDeviceAddress(state), low64, high64);
+}
+
+uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpFunctionCall, TypeDeviceAddress(state), result, state.bda_pointer_function, address});
+	return result;
+}
+
 void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
 		return;
@@ -1610,6 +1660,16 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto address_info = IR::AddressOpcodeInfoOf(op);
 	const bool load_address = address_info.access == IR::AddressAccess::Read;
+	if (address_info.access != IR::AddressAccess::None &&
+	    ctx.Memory(inst).kind == IR::ResourceKind::FlatLocal) {
+		// A PS5 FLAT stack access tagged with the private/shared aperture (ResourceTracking).
+		if (load_address) {
+			ctx.Define(inst, LoadLocalFlat(ctx, inst));
+		} else {
+			StoreLocalFlat(ctx, inst);
+		}
+		return true;
+	}
 	if (load_address && ctx.Memory(inst).kind != IR::ResourceKind::Scratch) {
 		ctx.Define(inst, LoadBda(ctx, inst, ctx.Memory(inst), address_info.data_bits));
 		return true;
