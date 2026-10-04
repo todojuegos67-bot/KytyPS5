@@ -244,13 +244,13 @@ void DefineBvhIntersect(EmitterState& s) {
 	if (!s.requirements.bvh) return;
 	const auto u = TypeU32(s), f = TypeF32(s), b = TypeBool(s), wide = TypeDeviceAddress(s);
 	const auto vec4 = TypeU32Vector(s, 4), vec3 = TypeF32Vector(s, 3);
-	const auto signature = s.builder.Type(OpTypeFunction, {vec4, vec4, u, f, vec3, vec3, vec3});
+	const auto signature = s.builder.Type(OpTypeFunction, {vec4, vec4, wide, f, vec3, vec3, vec3});
 	s.bvh_intersect_function = s.builder.AllocateId();
 	s.builder.AddName(s.bvh_intersect_function, "bvh_intersect");
 	s.builder.AddFunction({OpFunction, vec4, s.bvh_intersect_function,
 	                      FunctionControlNone, signature});
 	std::array<uint32_t, 6> args;
-	const std::array types {vec4, u, f, vec3, vec3, vec3};
+	const std::array types {vec4, wide, f, vec3, vec3, vec3};
 	for (uint32_t i = 0; i < args.size(); ++i) {
 		args[i] = s.builder.AllocateId();
 		s.builder.AddFunction({OpFunctionParameter, types[i], args[i]});
@@ -271,7 +271,7 @@ void DefineBvhIntersect(EmitterState& s) {
 	const auto shr = [&](uint32_t value, uint32_t shift) {
 		return Binary(s, OpShiftRightLogical, u, value, ConstantU32(s, shift));
 	};
-	const auto kind = and_bits(node, 7);
+	const auto kind = and_bits(Unary(s, OpUConvert, u, node), 7);
 	const auto triangle = Binary(s, OpULessThan, b, kind, ConstantU32(s, 4));
 	const auto full = Binary(s, OpIEqual, b, kind, ConstantU32(s, 5));
 	const auto half = Binary(s, OpIEqual, b, kind, ConstantU32(s, 4));
@@ -280,7 +280,7 @@ void DefineBvhIntersect(EmitterState& s) {
 	const auto grow = and_bits(shr(words[1], 23), 0xff);
 	const auto base = Binary(s, OpShiftLeftLogical, wide,
 	    DeviceAddressFromWords(s, words[0], and_bits(words[1], 0xff)), ConstantDeviceAddress(s, 8));
-	const auto index = Unary(s, OpUConvert, wide, shr(node, 3));
+	const auto index = Binary(s, OpShiftRightLogical, wide, node, ConstantDeviceAddress(s, 3));
 	const auto last_index = Binary(s, OpIAdd, wide, index,
 	    Select(s, wide, full, ConstantDeviceAddress(s, 1), ConstantDeviceAddress(s, 0)));
 	const auto address = Binary(s, OpIAdd, wide, base,
@@ -343,17 +343,23 @@ void DefineBvhIntersect(EmitterState& s) {
 uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
 	const auto* ray = ctx.ImageAddress(inst.Arg(1));
-	if (ray == nullptr || ray->NumArgs() < 11 || s.bvh_intersect_function == 0)
-		ctx.Fail(inst, "BVH intersection requires eleven address components and its shared function");
+	const auto node_words = inst.Flags<uint32_t>();
+	if (ray == nullptr || (node_words != 1u && node_words != 2u) ||
+	    ray->NumArgs() < node_words + 10u || s.bvh_intersect_function == 0)
+		ctx.Fail(inst, "BVH intersection requires its node pointer, ray components and shared function");
 	const auto vector = [&](uint32_t first) {
 		Vec3 values;
 		for (uint32_t i = 0; i < 3; ++i)
 			values[i] = Unary(s, OpBitcast, TypeF32(s), ctx.Arg(*ray, first + i));
 		return Vector(s, TypeF32Vector(s, 3), values);
 	};
-	const auto descriptor = ctx.Arg(inst, 0), node = ctx.Arg(*ray, 0);
-	const auto extent = Unary(s, OpBitcast, TypeF32(s), ctx.Arg(*ray, 1));
-	const auto origin = vector(2), direction = vector(5), inverse = vector(8);
+	const auto descriptor = ctx.Arg(inst, 0);
+	const auto node = node_words == 2u
+	                      ? DeviceAddressFromWords(s, ctx.Arg(*ray, 0), ctx.Arg(*ray, 1))
+	                      : Unary(s, OpUConvert, TypeDeviceAddress(s), ctx.Arg(*ray, 0));
+	const auto extent = Unary(s, OpBitcast, TypeF32(s), ctx.Arg(*ray, node_words));
+	const auto origin = vector(node_words + 1u), direction = vector(node_words + 4u),
+	           inverse = vector(node_words + 7u);
 	return EmitValueOrDefaultIfCondition(s, ctx.Arg(inst, 2), TypeU32Vector(s, 4),
 	    ConstantU32CompositeZero(s, 4), [&] {
 		const auto result = s.builder.AllocateId();
