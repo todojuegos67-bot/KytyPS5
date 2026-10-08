@@ -2255,13 +2255,28 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 				m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(pending->second, &pending->second->done);
 				return nullptr;
 			}
-			auto finished = std::move(pending->second->pipeline);
+			auto job      = pending->second;
+			auto finished = std::move(job->pipeline);
 			m_pending_graphics_pipelines.erase(pending);
 			EXIT_NOT_IMPLEMENTED(finished->pipeline == nullptr || finished->pipeline_layout == nullptr);
 			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(finished));
 			EXIT_IF(!inserted);
 			if (indexed) {
 				m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
+			}
+			// A normal variant compiled on a worker (KYTY_ASYNC_DRAW_PIPELINES): a warmup recipe as the
+			// blocking path records, so the next launch creates it before the game starts.
+			if (!native_bindings) {
+				LocalShaderWarmup::PipelineRecord recipe;
+				recipe.vertex = m_program_cache->RecordedIndex(vertex_program);
+				recipe.pixel  = ps_active ? m_program_cache->RecordedIndex(pixel_program) : LocalShaderWarmup::NoShader;
+				recipe.rendering    = iter->first.rendering;
+				recipe.vertex_input = iter->first.vertex_input;
+				recipe.state        = iter->first.static_params;
+				if (recipe.vertex != LocalShaderWarmup::NoShader &&
+				    (!ps_active || recipe.pixel != LocalShaderWarmup::NoShader)) {
+					m_program_cache->warmup.AddPipeline(recipe);
+				}
 			}
 			return iter->second.get();
 		}

@@ -50,14 +50,18 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1346,6 +1350,28 @@ static void CaptureFrameDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
 	}
 }
 
+// KYTY_ASYNC_DRAW_PIPELINES=1: a draw whose pipeline no cache holds has it compiled on a worker
+// (TryCreateGraphicsPipeline) instead of stopping the frame for the driver compile (100 ms to
+// seconds on NVIDIA when a new area or effect appears). The draw waits at most
+// KYTY_ASYNC_DRAW_WAIT_MS (default 3) and is skipped otherwise: the object shows up a few frames
+// later instead of a stutter. Off by default.
+static bool AsyncDrawPipelines() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_DRAW_PIPELINES");
+		return value != nullptr && *value != '\0' && std::string_view(value) != "0";
+	}();
+	return enabled;
+}
+static std::chrono::microseconds AsyncDrawWait() {
+	static const std::chrono::microseconds wait = [] {
+		const char* value = std::getenv("KYTY_ASYNC_DRAW_WAIT_MS");
+		const double ms   = value != nullptr && *value != '\0' ? std::atof(value) : 3.0;
+		return std::chrono::microseconds(static_cast<int64_t>(std::clamp(ms, 0.0, 1000.0) * 1000.0));
+	}();
+	return wait;
+}
+static std::atomic<uint64_t> g_async_draws_skipped {0};
+
 bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1429,6 +1455,37 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			return false;
 		}
 	}
+	// KYTY_ASYNC_DRAW_PIPELINES: the pipeline before anything is recorded, so a draw whose pipeline
+	// is still compiling can be dropped (nothing of it reached the command buffer yet).
+	PipelineCache::Pipeline* async_pipeline = nullptr;
+	if (AsyncDrawPipelines()) {
+		auto& cache    = m_context.GetPipelineCache();
+		const auto try_create = [&] {
+			return cache.TryCreateGraphicsPipeline(std::span {state.color_info, state.color_count}, state.depth_info,
+			                                       state.vs_input_info, buffer,
+			                                       state.ps_active ? &state.ps_input_info : nullptr, topology,
+			                                       primitive_restart_enable, state.programs.vertex,
+			                                       state.programs.pixel, false);
+		};
+		async_pipeline = try_create();
+		if (async_pipeline == nullptr) {
+			const auto waiting  = cache.PipelineWaiting();
+			const auto deadline = std::chrono::steady_clock::now() + AsyncDrawWait();
+			while (waiting != nullptr && !waiting->load(std::memory_order_acquire) &&
+			       std::chrono::steady_clock::now() < deadline) {
+				std::this_thread::yield();
+			}
+			async_pipeline = try_create();
+		}
+		if (async_pipeline == nullptr) {
+			const auto skipped = g_async_draws_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+			if ((skipped & (skipped - 1)) == 0) {
+				std::printf("Async draw pipelines: %llu draws skipped while their pipelines compile\n",
+				            static_cast<unsigned long long>(skipped));
+			}
+			return true;
+		}
+	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1455,10 +1512,12 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs.vertex, state.programs.pixel);
+	auto& pipeline = async_pipeline != nullptr
+	                     ? *async_pipeline
+	                     : m_context.GetPipelineCache().CreateGraphicsPipeline(
+	                           std::span {state.color_info, state.color_count}, state.depth_info,
+	                           state.vs_input_info, buffer, state.ps_active ? &state.ps_input_info : nullptr,
+	                           topology, primitive_restart_enable, state.programs.vertex, state.programs.pixel);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest

@@ -11,6 +11,8 @@
 #   .\run-windows.ps1 -Language 11           the console language (0-29 as the PS5 numbers them: 1 English (US),
 #                                            11 Chinese (Simplified); default: the config's)
 #   .\run-windows.ps1 -Set KEY=VALUE         override a switch of the config (KEY= removes it)
+#   .\run-windows.ps1 -AsyncShaders         compile new pipelines in the background (no stutter; objects
+#                                            may appear a moment late)
 #   .\run-windows.ps1 -FrameGen 1            DLSS frame generation, 1 generated frame per rendered
 #                                            frame (2x); needs _Build\deps\streamline\sdk
 #   .\run-windows.ps1 -Fps120                the game's frame rate up to 120 fps instead of 60 (a 120 Hz
@@ -48,6 +50,7 @@ param(
 	[switch]$AspectFit,
 	[int]$Language = -1,
 	[int]$FrameGen = 0,
+	[switch]$AsyncShaders,
 	[string]$Affinity = '',
 	[switch]$Prompt,
 	[switch]$Follow,
@@ -285,6 +288,9 @@ if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 # what runs per frame or on a cache miss only, so nothing measurable).
 if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '100' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
+# -AsyncShaders: draws whose pipeline is not compiled yet are skipped while a worker compiles it (an object
+# appears a few frames late instead of a stutter; KYTY_ASYNC_DRAW_PIPELINES in renderDraw.cpp).
+if ($AsyncShaders) { $environment['KYTY_ASYNC_DRAW_PIPELINES'] = '1' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
 # A package built with the Streamline SDK (build.yml) has its DLLs in streamline\ next to this script.
 if ($FrameGen -gt 0 -and !$environment.Contains('KYTY_STREAMLINE_DIR') -and (Test-Path "$PSScriptRoot\streamline\sl.interposer.dll")) {
