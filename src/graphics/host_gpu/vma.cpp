@@ -195,7 +195,8 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 		// The GPU's memory less 3 GB for Windows, the desktop and the driver: 9 GB on a 12 GB card, 13 GB on a
 		// 16 GB one. (A flat 9 GB on a 16 GB card left ~4.5 GB for textures next to ~3.5 GB that cannot be
 		// collected and ~3 GB of buffers: the collector re-uploaded textures every few frames, small stalls.)
-		if (local > 4 * GiB) result = std::min(result, local - 3 * GiB);
+		// At most 10 GB on any card (the process plus Windows and the driver stay near 11 GB on a 16 GB one).
+		if (local > 4 * GiB) result = std::min(result, std::min(local - 3 * GiB, 10 * GiB));
 		return result;
 	}
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;

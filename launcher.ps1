@@ -147,7 +147,7 @@ $present.SelectedIndex = [Math]::Max(0, [Math]::Min(2, [int]$settings.present))
 Add-Row 'Sync' @($present)
 # The emulator's video memory: Auto (the card's memory less 3 GB: fewest texture reloads) or a fixed cap.
 $vram = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 320 }
-$vram.Items.AddRange(@('Auto (GPU memory - 3 GB)', '8 GB', '10 GB', '12 GB'))
+$vram.Items.AddRange(@('Auto (GPU memory - 3 GB, at most 10 GB)', '8 GB', '10 GB', '12 GB'))
 $vram.SelectedIndex = [Math]::Max(0, [Math]::Min(3, [int]$settings.vram))
 Add-Row 'Video memory' @($vram)
 $ecores = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Precompile on the efficiency cores only (slower, the PC stays responsive)'; AutoSize = $true

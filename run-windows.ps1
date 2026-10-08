@@ -287,6 +287,9 @@ if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 # Stutters in the log: frames, shader translations and pipeline creations of 100 ms or more (SLOW lines;
 # what runs per frame or on a cache miss only, so nothing measurable).
 # 40 ms (not 100): the small drops (a frame or two late at 60 fps) are in the log too.
+# At most 8 table mode stores a frame (32 before): a new area brought hundreds of new draw pairs, and the frames
+# that stored them took 240-330 ms (570 new pairs before one, 211 before another).
+if (!$environment.Contains('KYTY_TABLE_STORE_BUDGET') -and !$Baseline) { $environment['KYTY_TABLE_STORE_BUDGET'] = '8' }
 if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '40' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 # Async shaders (renderDraw.cpp, KYTY_ASYNC_DRAW_PIPELINES): a draw whose pipeline is not compiled yet does
