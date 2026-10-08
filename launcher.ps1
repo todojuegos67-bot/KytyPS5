@@ -12,7 +12,7 @@ $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish 
 $resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false; present = 0 }
+	ecores = $false; fps120 = $false; present = 0; vram = 0 }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -60,6 +60,8 @@ function Get-PlayCommand {
 		'-Width', $size[0], '-Height', $size[1], '-Language', $settings.language)
 	if ($settings.fullscreen) { $arguments += '-Fullscreen'; if ($settings.aspect) { $arguments += '-AspectFit' } }
 	if (!$settings.redzone) { $arguments += '-NoRedZone' }
+	$vramMb = @(0, 8192, 10240, 12288)[[Math]::Max(0, [Math]::Min(3, [int]$settings.vram))]
+	if ($vramMb -gt 0) { $arguments += @('-Set', "KYTY_VRAM_BUDGET_MB=$vramMb") }
 	if ([int]$settings.present -eq 1) { $arguments += @('-PresentMode', 'Immediate') } elseif ([int]$settings.present -eq 2) { $arguments += @('-PresentMode', 'Mailbox') }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	# The console stays for the live log; after a crash it waits for a key.
@@ -143,6 +145,11 @@ $present = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle =
 $present.Items.AddRange(@('V-Sync (default)', 'G-Sync / FreeSync (VRR monitor, fullscreen)', 'Triple buffering (Mailbox)'))
 $present.SelectedIndex = [Math]::Max(0, [Math]::Min(2, [int]$settings.present))
 Add-Row 'Sync' @($present)
+# The emulator's video memory: Auto (the card's memory less 3 GB: fewest texture reloads) or a fixed cap.
+$vram = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 320 }
+$vram.Items.AddRange(@('Auto (GPU memory - 3 GB)', '8 GB', '10 GB', '12 GB'))
+$vram.SelectedIndex = [Math]::Max(0, [Math]::Min(3, [int]$settings.vram))
+Add-Row 'Video memory' @($vram)
 $ecores = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Precompile on the efficiency cores only (slower, the PC stays responsive)'; AutoSize = $true
 	Checked = ([bool]$settings.ecores -and $efficiencyMask -ne 0); Enabled = ($efficiencyMask -ne 0) }
 Add-Row '' @($ecores)
@@ -169,6 +176,7 @@ function Read-Form {
 	$settings.language   = $language.SelectedIndex
 	$settings.redzone    = $redzone.Checked
 	$settings.present    = $present.SelectedIndex
+	$settings.vram       = [Math]::Max(0, $vram.SelectedIndex)
 	$settings.ecores     = $ecores.Checked
 	Save-Settings
 }
