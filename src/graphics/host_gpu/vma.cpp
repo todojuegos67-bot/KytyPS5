@@ -27,6 +27,7 @@
 #include "live-counters.h"
 
 #include <cstdio>
+#include "kytyGitVersion.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -90,6 +91,19 @@ bool GraphicContext::CreateAllocator() {
 	g_report_allocator          = allocator;
 	LiveCounters::g_vma_report = WriteVmaReport;
 	g_image_pool_limit         = std::min<uint64_t>(1024ull << 20, GetTotalMemoryBudget() / 32);
+	{
+		// The caches' video memory budget, in the run log with the build (to tell builds apart in a log).
+		uint64_t local = 0;
+		for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+			if (physical_device_memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+				local += physical_device_memory_properties.memoryHeaps[heap].size;
+			}
+		}
+		std::printf("Video memory: %llu MiB on the GPU; the caches' budget is %llu MiB (build %s)\n",
+		            static_cast<unsigned long long>(local >> 20u),
+		            static_cast<unsigned long long>(GetTotalMemoryBudget() >> 20u), KYTY_GIT_HASH);
+		std::fflush(stdout);
+	}
 	return true;
 }
 

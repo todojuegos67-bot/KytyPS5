@@ -292,6 +292,7 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_over_budget_memory     = 0; // the budget itself (UpdateGcThresholds)
+	uint64_t         m_cache_bytes            = 0; // the registered images' accounted bytes
 	uint64_t         m_gc_tick                = 0;
 	std::atomic<uint64_t> m_frame {0};
 	struct PendingDownload {

@@ -343,6 +343,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	++image.registrations;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
+	m_cache_bytes += image.AccountedSize();
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -375,6 +376,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
 	m_total_used_memory -= accounted;
+	m_cache_bytes -= std::min(m_cache_bytes, accounted);
 	image.registered = false;
 }
 
@@ -3284,9 +3286,10 @@ void TextureCache::RunGarbageCollector() {
 	}
 	// Every 1800 frames (half a minute at 60 fps): where the video memory stands (the run log).
 	if (m_graphics.CanReportMemoryUsage() && (tick % 1800u) == 0 && tick != 0) {
-		std::printf("Video memory: %llu MiB in use of a %llu MiB budget (collecting from %llu, pressured from %llu, critical from %llu)\n",
+		std::printf("Video memory: %llu MiB in use of a %llu MiB budget, %llu MiB of it textures (collecting from %llu, pressured from %llu, critical from %llu)\n",
 		            static_cast<unsigned long long>(m_total_used_memory >> 20u),
 		            static_cast<unsigned long long>(m_over_budget_memory >> 20u),
+		            static_cast<unsigned long long>(m_cache_bytes >> 20u),
 		            static_cast<unsigned long long>(m_trigger_gc_memory >> 20u),
 		            static_cast<unsigned long long>(m_pressure_gc_memory >> 20u),
 		            static_cast<unsigned long long>(m_critical_gc_memory >> 20u));
@@ -3309,11 +3312,13 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive, bool dirty_too) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		// Over the budget: images not drawn with in the last 2 frames, oldest first, until the usage is
+		// back under the pressure line (else at most a few dozen a frame, which never caught up).
 		const uint64_t age        = std::min<uint64_t>(
-            aggressive && over_budget ? 30 : aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t deletions = aggressive && over_budget ? 80 : aggressive ? 40 : pressured ? 20 : 10;
+		    aggressive && over_budget ? 2 : aggressive ? 160 : pressured ? 80 : 16, tick);
+		size_t deletions = aggressive && over_budget ? 4096 : aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
-		candidates.reserve(deletions);
+		candidates.reserve(std::min<size_t>(deletions, 256));
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
 		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
@@ -3351,6 +3356,7 @@ void TextureCache::RunGarbageCollector() {
 				std::fflush(stdout);
 			}
 			DeleteImage(id);
+			if (over_budget && m_total_used_memory < m_pressure_gc_memory) break;
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
