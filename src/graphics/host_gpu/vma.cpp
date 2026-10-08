@@ -37,7 +37,7 @@ void FlushBufferReclaimer(); // streamBuffer.cpp (KYTY_BUFFER_RECLAIM)
 
 // Local diagnostic (live `vma <path>`): VMA is thread-safe, so the live thread writes it.
 static VmaAllocator g_report_allocator = nullptr;
-// Freed images kept for reuse (KYTY_IMAGE_POOL): at most 1 GiB, and a 16th of the GPU's memory budget.
+// Freed images kept for reuse (KYTY_IMAGE_POOL): at most 1 GiB, and a 32nd of the GPU's memory budget.
 static uint64_t g_image_pool_limit = 1024ull << 20;
 static void WriteVmaReport(const char* path) {
 	if (g_report_allocator == nullptr) return;
@@ -89,7 +89,7 @@ bool GraphicContext::CreateAllocator() {
 	}
 	g_report_allocator          = allocator;
 	LiveCounters::g_vma_report = WriteVmaReport;
-	g_image_pool_limit         = std::min<uint64_t>(1024ull << 20, GetTotalMemoryBudget() / 16);
+	g_image_pool_limit         = std::min<uint64_t>(1024ull << 20, GetTotalMemoryBudget() / 32);
 	return true;
 }
 
@@ -168,7 +168,18 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 		}
 	}
 	if (discrete) {
-		return budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
+		uint64_t result = budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
+		// A GPU of 16 GB or less: the caches keep 2.5 GB of the card free for Windows, the desktop, a browser
+		// and the driver's own needs (an RTX 5080 reached 15.8 of 16 GB and spilled to system memory, with
+		// second-long stalls). KYTY_VRAM_BUDGET_MB=<n> sets the caches' budget outright.
+		static const uint64_t forced = [] {
+			const char* text = std::getenv("KYTY_VRAM_BUDGET_MB");
+			return text != nullptr ? std::strtoull(text, nullptr, 10) << 20u : uint64_t {0};
+		}();
+		if (forced != 0) return std::min(result, forced);
+		constexpr uint64_t GiB = 1024ull * 1024 * 1024;
+		if (local <= 16 * GiB && local > 3 * GiB) result = std::min(result, local - 5 * GiB / 2);
+		return result;
 	}
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
 	const auto         available      = budget > usage ? budget - usage : uint64_t {0};

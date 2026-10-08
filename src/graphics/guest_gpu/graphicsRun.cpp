@@ -1105,6 +1105,7 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::FlipPreparation:
 			m_renderer.GetGpuResources().EndSubmission();
 			m_renderer.GetGpuResources().AdvanceFrame();
+			m_renderer.GetPipelineCache().AdvanceFrame();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
 		case SubmissionType::FrameBoundary: EXIT("frame boundary already handled\n");

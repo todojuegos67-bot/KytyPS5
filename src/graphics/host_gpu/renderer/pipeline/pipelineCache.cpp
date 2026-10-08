@@ -1365,6 +1365,21 @@ void PipelineCache::BuildOptimized(Pipeline& pipeline, std::function<void(Pipeli
 // Finished optimized builds replace their pipelines in place, for every holder of the Pipeline
 // (native XPR records never look it up again). The unoptimized pipeline stays alive until this
 // cache is destroyed: commands recorded before may still use it.
+void PipelineCache::AdvanceFrame() {
+	Common::LockGuard lock(m_mutex);
+	m_frame++;
+	// 240 frames (4 s at 60 fps): every command buffer recorded with the old handle has long executed
+	// (the scheduler keeps a few frames in flight).
+	constexpr uint64_t keep = 240;
+	size_t freed = 0;
+	while (!m_replaced_pipelines.empty() && m_replaced_pipelines.front().second + keep < m_frame) {
+		m_graphics.device.destroyPipeline(m_replaced_pipelines.front().first, nullptr);
+		m_replaced_pipelines.erase(m_replaced_pipelines.begin());
+		freed++;
+	}
+	m_replaced_freed += freed;
+}
+
 void PipelineCache::PromoteOptimized() {
 	const auto finished = m_optimized_builds.load(std::memory_order_acquire);
 	if (finished == m_promoted_builds) return;
@@ -1373,7 +1388,7 @@ void PipelineCache::PromoteOptimized() {
 		const auto& build = *pipeline->optimized;
 		if (!build.done.load(std::memory_order_acquire)) return false;
 		if (build.pipeline != nullptr) {
-			m_replaced_pipelines.push_back(pipeline->pipeline);
+			m_replaced_pipelines.emplace_back(pipeline->pipeline, m_frame);
 			pipeline->pipeline    = build.pipeline;
 			pipeline->unoptimized = false;
 		}
@@ -1403,8 +1418,8 @@ void PipelineCache::FinishCompileWorkers() {
 	m_table_workers.reset();
 	m_compile_workers.reset();
 	if (m_unoptimized_builds != 0) {
-		PipelineCacheLog("Pipelines compiled unoptimized first: {}, replaced by their optimized build: {}",
-		                 m_unoptimized_builds, m_replaced_pipelines.size());
+		PipelineCacheLog("Pipelines compiled unoptimized first: {}, replaced by their optimized build: {} ({} freed while playing)",
+		                 m_unoptimized_builds, m_replaced_pipelines.size() + m_replaced_freed, m_replaced_freed);
 	}
 	for (auto& [key, pending]: m_pending_graphics_pipelines) {
 		if (pending->done.load(std::memory_order_acquire) && pending->pipeline->pipeline != nullptr) {
@@ -1607,7 +1622,8 @@ PipelineCache::~PipelineCache() {
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
 	m_graphics.pipeline_binaries = nullptr;
-	for (const auto pipeline: m_replaced_pipelines) {
+	for (const auto& [pipeline, frame]: m_replaced_pipelines) {
+		(void)frame;
 		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
 	if (m_driver_cache != nullptr) {

@@ -228,6 +228,9 @@ public:
 	[[nodiscard]] std::shared_ptr<const std::atomic<bool>> TableWaiting() const;
 	// When TryCreateGraphicsPipeline or TryCreateComputePipeline returned null: the completion of that compile.
 	[[nodiscard]] const std::shared_ptr<const std::atomic<bool>>& PipelineWaiting() const { return m_pipeline_waiting; }
+	// Once a frame: unoptimized pipelines replaced by their optimized build are destroyed after the
+	// command buffers that could still bind them have run (they stayed until exit: hundreds of MB).
+	void AdvanceFrame();
 	// As TryCreateGraphicsPipeline: null while a worker compiles it; its layout takes allocated descriptor sets
 	// (native bindings, for table mode programs).
 	[[nodiscard]] Pipeline* TryCreateComputePipeline(const ShaderComputeInputInfo& input_info,
@@ -359,7 +362,9 @@ private:
 	// Unoptimized pipelines whose optimized build is pending, and those it replaced (recorded commands
 	// may still use them).
 	std::vector<Pipeline*>    m_optimizing;
-	std::vector<vk::Pipeline> m_replaced_pipelines;
+	std::vector<std::pair<vk::Pipeline, uint64_t>> m_replaced_pipelines; // (pipeline, frame replaced)
+	uint64_t                                       m_frame = 0;         // (AdvanceFrame)
+	size_t                                         m_replaced_freed = 0;
 	uint32_t                  m_unoptimized_builds = 0;
 	std::atomic<uint32_t>     m_optimized_builds {0}; // finished by workers
 	uint32_t                  m_promoted_builds = 0;  // of those, seen by PromoteOptimized

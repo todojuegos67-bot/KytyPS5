@@ -3282,6 +3282,16 @@ void TextureCache::RunGarbageCollector() {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 		if ((tick & 31u) == 0) UpdateGcThresholds();
 	}
+	// Every 1800 frames (half a minute at 60 fps): where the video memory stands (the run log).
+	if (m_graphics.CanReportMemoryUsage() && (tick % 1800u) == 0 && tick != 0) {
+		std::printf("Video memory: %llu MiB in use of a %llu MiB budget (collecting from %llu, pressured from %llu, critical from %llu)\n",
+		            static_cast<unsigned long long>(m_total_used_memory >> 20u),
+		            static_cast<unsigned long long>(m_over_budget_memory >> 20u),
+		            static_cast<unsigned long long>(m_trigger_gc_memory >> 20u),
+		            static_cast<unsigned long long>(m_pressure_gc_memory >> 20u),
+		            static_cast<unsigned long long>(m_critical_gc_memory >> 20u));
+		std::fflush(stdout);
+	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
@@ -3293,7 +3303,10 @@ void TextureCache::RunGarbageCollector() {
 		m_graphics.TrimImagePool();
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	const auto collect = [&](bool allow_aggressive) {
+	// dirty_too: images the GPU wrote may go (each one is a synchronous download to guest memory first:
+	// under memory pressure these took up to a second a frame). The clean pass runs first; the dirty
+	// pass only when the clean pass left the cache still pressured.
+	const auto collect = [&](bool allow_aggressive, bool dirty_too) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
 		const uint64_t age        = std::min<uint64_t>(
@@ -3321,7 +3334,7 @@ void TextureCache::RunGarbageCollector() {
 				if (safe && owner->info.IsTiled()) {
 					continue;
 				}
-				if (safe && !pressured) {
+				if (safe && (!pressured || !dirty_too)) {
 					continue;
 				}
 				if (safe && !TryDownloadImage(id)) {
@@ -3348,9 +3361,13 @@ void TextureCache::RunGarbageCollector() {
 			}
 		}
 	};
-	collect(false);
+	collect(false, false);
 	if (m_total_used_memory >= m_critical_gc_memory) {
-		collect(true);
+		collect(true, false);
+	}
+	// Still over the budget after the clean passes: the GPU-written ones too, a few per frame.
+	if (over_budget && m_total_used_memory >= m_over_budget_memory) {
+		collect(true, true);
 	}
 }
 
