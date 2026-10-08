@@ -26,6 +26,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <list>
 #include <thread>
@@ -494,9 +497,29 @@ static int FlipRateFloor() {
 	return floor;
 }
 
+// Movies decoded through the system's decoders (VideoDec2, AvPlayer) advance a frame per flip: above a
+// 60 Hz vblank (-Fps120) they played too fast. While one decodes, flips keep the console's 60 per second.
+static std::atomic<int64_t> g_movie_frame_ns {0};
+void NoteMovieFrame() noexcept {
+	if (g_movie_frame_ns.load(std::memory_order_relaxed) == 0) {
+		std::printf("Movie playback: decoded through the system decoder; flips stay at 60 a second while it plays\n");
+		std::fflush(stdout);
+	}
+	g_movie_frame_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+}
+static bool MoviePlaying() {
+	const auto last = g_movie_frame_ns.load(std::memory_order_relaxed);
+	if (last == 0) return false;
+	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+	return now - last < std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(500)).count();
+}
+
 static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, bool capped) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
+	}
+	if (const uint32_t ratio = Config::GetVblankFrequency() / 60; ratio > 1 && MoviePlaying()) {
+		return cfg.vblank_status.count - cfg.last_flip_vblank >= ratio;
 	}
 	if (const int floor = capped ? FlipRateFloor() : 0; floor > cfg.flip_rate) {
 		return cfg.vblank_status.count - cfg.last_flip_vblank >= static_cast<uint64_t>(floor) + 1u;

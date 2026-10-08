@@ -16,7 +16,7 @@
 #   .\run-windows.ps1 -FrameGen 1            DLSS frame generation, 1 generated frame per rendered
 #                                            frame (2x); needs _Build\deps\streamline\sdk
 #   .\run-windows.ps1 -Fps120                the game's frame rate up to 120 fps instead of 60 (a 120 Hz
-#                                            virtual vblank; movies play faster)
+#                                            virtual vblank; movies keep 60 flips a second)
 #   .\run-windows.ps1 -Vblank 240            another virtual vblank rate (default 60, the console's)
 #   .\run-windows.ps1 -Game <folder>         the game (the folder with eboot.bin); remembered in
 #                                            game-path.txt, a folder dialog when none is known

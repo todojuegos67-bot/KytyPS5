@@ -16,6 +16,9 @@ class Presenter;
 
 namespace Libs::VideoOut {
 
+// A movie frame was decoded (VideoDec2, AvPlayer): flips keep 60 per second meanwhile.
+void NoteMovieFrame() noexcept;
+
 struct VideoOutBufferAttribute2;
 struct VideoOutFlipStatus;
 struct VideoOutVblankStatus;

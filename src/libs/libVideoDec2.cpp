@@ -2,6 +2,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/videoDec2Decoder.h"
+#include "graphics/presentation/videoOut.h"
 #include "loader/symbolDatabase.h"
 
 #include <cstddef>
@@ -466,6 +467,7 @@ static int32_t KYTY_SYSV_ABI Decode(Videodec2Decoder decoder, const Videodec2Inp
 	if (state == nullptr) {
 		return VIDEODEC2_ERROR_DECODER_INSTANCE;
 	}
+	VideoOut::NoteMovieFrame();
 
 	if (input_data == nullptr || frame_buffer == nullptr || output_info == nullptr) {
 		return VIDEODEC2_ERROR_ARGUMENT_POINTER;
