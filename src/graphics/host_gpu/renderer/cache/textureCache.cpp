@@ -3286,10 +3286,11 @@ void TextureCache::RunGarbageCollector() {
 	}
 	// Every 1800 frames (half a minute at 60 fps): where the video memory stands (the run log).
 	if (m_graphics.CanReportMemoryUsage() && (tick % 1800u) == 0 && tick != 0) {
-		std::printf("Video memory: %llu MiB in use of a %llu MiB budget, %llu MiB of it textures (collecting from %llu, pressured from %llu, critical from %llu)\n",
+		std::printf("Video memory: %llu MiB in use of a %llu MiB budget, %llu MiB of it textures and %llu MiB buffers (collecting from %llu, pressured from %llu, critical from %llu)\n",
 		            static_cast<unsigned long long>(m_total_used_memory >> 20u),
 		            static_cast<unsigned long long>(m_over_budget_memory >> 20u),
 		            static_cast<unsigned long long>(m_cache_bytes >> 20u),
+		            static_cast<unsigned long long>(m_buffer_cache.CacheBytes() >> 20u),
 		            static_cast<unsigned long long>(m_trigger_gc_memory >> 20u),
 		            static_cast<unsigned long long>(m_pressure_gc_memory >> 20u),
 		            static_cast<unsigned long long>(m_critical_gc_memory >> 20u));

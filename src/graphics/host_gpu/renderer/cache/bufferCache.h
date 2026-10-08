@@ -194,6 +194,7 @@ public:
 
 	void               RunGarbageCollector(bool collect = true);
 	void               UpdateGcThresholds();
+	[[nodiscard]] uint64_t CacheBytes() const noexcept { return m_cache_bytes; }
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -315,6 +316,7 @@ public:
 
 private:
 	uint64_t                                          m_total_used_memory  = 0;
+	uint64_t                                          m_cache_bytes        = 0; // the registered buffers' bytes
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

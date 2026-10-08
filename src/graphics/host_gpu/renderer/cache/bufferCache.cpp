@@ -833,6 +833,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
+		m_cache_bytes += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
@@ -847,6 +848,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_buffers.erase(found);
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
+		m_cache_bytes -= std::min(m_cache_bytes, buffer.Size());
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(pages.first * sizeof(vk::DeviceAddress),
 		                            size_pages * sizeof(vk::DeviceAddress), 0);

@@ -1378,6 +1378,12 @@ void PipelineCache::AdvanceFrame() {
 		freed++;
 	}
 	m_replaced_freed += freed;
+	if ((m_frame % 1800) == 0) {
+		std::printf("Pipelines: %zu graphics, %zu compute, %zu compiling, %zu replaced awaiting their free (%zu freed so far)\n",
+		            m_graphics_pipelines.size(), m_compute_pipelines.size(), m_pending_graphics_pipelines.size(),
+		            m_replaced_pipelines.size(), m_replaced_freed);
+		std::fflush(stdout);
+	}
 }
 
 void PipelineCache::PromoteOptimized() {
