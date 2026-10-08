@@ -363,8 +363,18 @@ void MakeBackgroundThread(const char* avoid_cpus) {
 uint64_t OpenScratchFile() {
 	wchar_t directory[MAX_PATH + 1] {}, path[MAX_PATH + 1] {};
 	if (GetTempPathW(MAX_PATH + 1, directory) == 0 || GetTempFileNameW(directory, L"kyt", 0, path) == 0) return 0;
+	// FILE_ATTRIBUTE_TEMPORARY kept every written page dirty in RAM (Windows does not flush a temporary
+	// file while memory lasts): the shader prefetch's ~6.7 GB of SPIR-V stayed as modified pages, which
+	// is not "available" memory, and Task Manager showed the PC's memory filling. A normal file is
+	// written out in the background and its pages become standby cache (reclaimable, still fast to
+	// read back). KYTY_SCRATCH_IN_MEMORY=1: the temporary file as before.
+	static const bool in_memory = [] {
+		const char* value = std::getenv("KYTY_SCRATCH_IN_MEMORY");
+		return value != nullptr && *value != '\0' && *value != '0';
+	}();
 	HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-	                          FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+	                          (in_memory ? FILE_ATTRIBUTE_TEMPORARY : FILE_ATTRIBUTE_NORMAL) | FILE_FLAG_DELETE_ON_CLOSE,
+	                          nullptr);
 	if (file == INVALID_HANDLE_VALUE) {
 		(void)DeleteFileW(path);
 		return 0;

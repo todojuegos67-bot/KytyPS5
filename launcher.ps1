@@ -60,7 +60,6 @@ function Get-PlayCommand {
 		'-Width', $size[0], '-Height', $size[1], '-Language', $settings.language)
 	if ($settings.fullscreen) { $arguments += '-Fullscreen'; if ($settings.aspect) { $arguments += '-AspectFit' } }
 	if (!$settings.redzone) { $arguments += '-NoRedZone' }
-	if ($settings.fps120) { $arguments += '-Fps120' }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	# The console stays for the live log; after a crash it waits for a key.
 	return 'powershell ' + ($arguments -join ' ') + ' & if !errorlevel! neq 0 pause'
@@ -137,8 +136,6 @@ $language.SelectedIndex = [Math]::Max(0, [Math]::Min($languages.Count - 1, [int]
 Add-Row 'Console language' @($language)
 $redzone = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Red-zone protection (recommended)'; AutoSize = $true; Checked = [bool]$settings.redzone }
 Add-Row '' @($redzone)
-$fps120 = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Up to 120 fps (the game''s own frames; movies play faster)'; AutoSize = $true; Checked = [bool]$settings.fps120 }
-Add-Row '' @($fps120)
 $ecores = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Precompile on the efficiency cores only (slower, the PC stays responsive)'; AutoSize = $true
 	Checked = ([bool]$settings.ecores -and $efficiencyMask -ne 0); Enabled = ($efficiencyMask -ne 0) }
 Add-Row '' @($ecores)
@@ -164,7 +161,6 @@ function Read-Form {
 	$settings.aspect     = $aspect.Checked
 	$settings.language   = $language.SelectedIndex
 	$settings.redzone    = $redzone.Checked
-	$settings.fps120     = $fps120.Checked
 	$settings.ecores     = $ecores.Checked
 	Save-Settings
 }
