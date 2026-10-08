@@ -192,7 +192,8 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 		}();
 		if (forced != 0) return std::min(result, forced);
 		constexpr uint64_t GiB = 1024ull * 1024 * 1024;
-		if (local <= 16 * GiB && local > 3 * GiB) result = std::min(result, local - 5 * GiB / 2);
+		// A 16 GB card: 10 GB for the caches (an RTX 5080 reached 15.8 GB with a 13.7 GB budget).
+		if (local <= 16 * GiB && local > 3 * GiB) result = std::min(result, std::min(local - 5 * GiB / 2, 10 * GiB));
 		return result;
 	}
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
