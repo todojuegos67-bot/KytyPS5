@@ -19,6 +19,7 @@
 #include "native-resource-state.h"
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <bit>
 #include <cinttypes>
@@ -3284,8 +3285,10 @@ void TextureCache::RunGarbageCollector() {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 		if ((tick & 31u) == 0) UpdateGcThresholds();
 	}
-	// Every 1800 frames (half a minute at 60 fps): where the video memory stands (the run log).
-	if (m_graphics.CanReportMemoryUsage() && (tick % 1800u) == 0 && tick != 0) {
+	// Every 30 seconds: where the video memory stands (the run log).
+	static auto last_report = std::chrono::steady_clock::now();
+	if (m_graphics.CanReportMemoryUsage() && std::chrono::steady_clock::now() - last_report >= std::chrono::seconds(30)) {
+		last_report = std::chrono::steady_clock::now();
 		std::printf("Video memory: %llu MiB in use of a %llu MiB budget, %llu MiB of it textures and %llu MiB buffers (collecting from %llu, pressured from %llu, critical from %llu)\n",
 		            static_cast<unsigned long long>(m_total_used_memory >> 20u),
 		            static_cast<unsigned long long>(m_over_budget_memory >> 20u),
