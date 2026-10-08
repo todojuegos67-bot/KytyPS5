@@ -133,6 +133,8 @@ public:
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
 	void UpdateGcThresholds();
+	// The device's video memory usage past the critical line (the last collection's reading).
+	[[nodiscard]] bool OverCritical() const noexcept { return m_critical_gc_memory != 0 && m_total_used_memory >= m_critical_gc_memory; }
 	// The latest tick of a GPU-written image's download that will write guest memory overlapping
 	// the range once the GPU completes it (on the priority thread); 0 when none is pending.
 	[[nodiscard]] uint64_t PendingDownloadTick(uint64_t address, uint64_t size);

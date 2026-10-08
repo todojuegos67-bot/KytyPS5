@@ -286,7 +286,8 @@ if ($Precompile) {
 if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 # Stutters in the log: frames, shader translations and pipeline creations of 100 ms or more (SLOW lines;
 # what runs per frame or on a cache miss only, so nothing measurable).
-if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '100' }
+# 40 ms (not 100): the small drops (a frame or two late at 60 fps) are in the log too.
+if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '40' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 # Async shaders (renderDraw.cpp, KYTY_ASYNC_DRAW_PIPELINES): a draw whose pipeline is not compiled yet does
 # not stop the frame; a worker compiles it and the object appears a few frames later. -NoAsyncShaders: off.

@@ -192,10 +192,11 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 		}();
 		if (forced != 0) return std::min(result, forced);
 		constexpr uint64_t GiB = 1024ull * 1024 * 1024;
-		// At most 9 GB of video memory for the process on any GPU, so 12 GB cards run it with room for
-		// Windows and the driver (an RTX 5080 reached 15.8 GB with a 13.7 GB budget). The caches keep the
-		// process's usage (VK_EXT_memory_budget: everything the driver allocated for it) under this.
-		return std::min(result, 9 * GiB);
+		// The GPU's memory less 3 GB for Windows, the desktop and the driver: 9 GB on a 12 GB card, 13 GB on a
+		// 16 GB one. (A flat 9 GB on a 16 GB card left ~4.5 GB for textures next to ~3.5 GB that cannot be
+		// collected and ~3 GB of buffers: the collector re-uploaded textures every few frames, small stalls.)
+		if (local > 4 * GiB) result = std::min(result, local - 3 * GiB);
+		return result;
 	}
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
 	const auto         available      = budget > usage ? budget - usage : uint64_t {0};

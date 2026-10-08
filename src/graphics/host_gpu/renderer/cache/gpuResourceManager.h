@@ -69,6 +69,7 @@ private:
 	void                      SynchronizeDirtyBdaRegions(GuestRange range);
 	void RefreshBdaRanges();
 	std::atomic<bool>         m_gpu_flip_pending {false};
+	uint64_t                  m_frames = 0;
 	PageManager               m_page_manager;
 	CommandScheduler&         m_scheduler;
 	BufferCache               m_buffer_cache;

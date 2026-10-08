@@ -3318,8 +3318,9 @@ void TextureCache::RunGarbageCollector() {
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
 		// Over the budget: images not drawn with in the last 2 frames, oldest first, until the usage is
 		// back under the pressure line (else at most a few dozen a frame, which never caught up).
+		// (30 frames, not 2: images drawn with a moment ago came straight back as full re-uploads.)
 		const uint64_t age        = std::min<uint64_t>(
-		    aggressive && over_budget ? 2 : aggressive ? 160 : pressured ? 80 : 16, tick);
+		    aggressive && over_budget ? 30 : aggressive ? 160 : pressured ? 80 : 16, tick);
 		size_t deletions = aggressive && over_budget ? 4096 : aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(std::min<size_t>(deletions, 256));
