@@ -6,6 +6,8 @@ name: Build KytyPS5 (Windows)
 on:
   push:
     tags: [ 'v*' ]
+    # This fork: every push to the frame generation branch builds it.
+    branches: [ dlss-framegen ]
   workflow_dispatch:
 
 concurrency:
