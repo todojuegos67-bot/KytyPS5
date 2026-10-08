@@ -292,6 +292,11 @@ if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 # appears a few frames late instead of a stutter; KYTY_ASYNC_DRAW_PIPELINES in renderDraw.cpp).
 if ($AsyncShaders) { $environment['KYTY_ASYNC_DRAW_PIPELINES'] = '1' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
+# Frame generation paces well only from a steady base rate: the game's 42-60 fps on the 60 Hz vblank made
+# uneven generated frames. As record-fg.ps1 (the developer's tested setup): the game's 3D view at a steady
+# 30 fps (KYTY_FLIP_RATE=1, menus and movies keep their rate), x2 = 60 fps, x4 = 120 fps presented.
+# -Set KYTY_FLIP_RATE= turns the cap off.
+if ($FrameGen -gt 0 -and !$environment.Contains('KYTY_FLIP_RATE')) { $environment['KYTY_FLIP_RATE'] = '1' }
 # A package built with the Streamline SDK (build.yml) has its DLLs in streamline\ next to this script.
 if ($FrameGen -gt 0 -and !$environment.Contains('KYTY_STREAMLINE_DIR') -and (Test-Path "$PSScriptRoot\streamline\sl.interposer.dll")) {
 	$environment['KYTY_STREAMLINE_DIR'] = "$PSScriptRoot\streamline"

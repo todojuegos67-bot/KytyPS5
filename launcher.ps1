@@ -12,7 +12,7 @@ $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish 
 $resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false; framegen = $false; asyncshaders = $false }
+	ecores = $false; fps120 = $false; framegen = 0; asyncshaders = $false }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -61,7 +61,7 @@ function Get-PlayCommand {
 	if ($settings.fullscreen) { $arguments += '-Fullscreen'; if ($settings.aspect) { $arguments += '-AspectFit' } }
 	if (!$settings.redzone) { $arguments += '-NoRedZone' }
 	if ($settings.fps120) { $arguments += '-Fps120' }
-	if ($settings.framegen) { $arguments += @('-FrameGen', '1') }
+	if ([int]$settings.framegen -gt 0) { $arguments += @('-FrameGen', [int]$settings.framegen) }
 	if ($settings.asyncshaders) { $arguments += '-AsyncShaders' }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	# The console stays for the live log; after a crash it waits for a key.
@@ -141,9 +141,14 @@ $redzone = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Red-zon
 Add-Row '' @($redzone)
 $fps120 = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Up to 120 fps (the game''s own frames; movies play faster)'; AutoSize = $true; Checked = [bool]$settings.fps120 }
 Add-Row '' @($fps120)
-$framegen = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'DLSS Frame Generation x2 (NVIDIA RTX 40/50)'; AutoSize = $true; Checked = [bool]$settings.framegen
+# DLSS Frame Generation (NVIDIA RTX 40/50): off, or the game at a steady 30 fps with 1 or 3 generated frames.
+$framegenModes = @(@(0, 'Off'), @(1, 'x2: 30 -> 60 fps'), @(3, 'x4: 30 -> 120 fps (120 Hz+ monitor, RTX 50)'))
+$framegen = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 320
 	Enabled = (Test-Path "$root\streamline\sl.interposer.dll") }
-Add-Row '' @($framegen)
+$framegen.Items.AddRange(@($framegenModes | ForEach-Object { $_[1] }))
+$savedFramegen = [int]$settings.framegen
+$framegen.SelectedIndex = [Math]::Max(0, [Array]::IndexOf(@($framegenModes | ForEach-Object { $_[0] }), $savedFramegen))
+Add-Row 'Frame generation' @($framegen)
 $asyncshaders = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Async shaders (fewer stutters; new objects may appear a moment late)'; AutoSize = $true; Checked = [bool]$settings.asyncshaders }
 Add-Row '' @($asyncshaders)
 $ecores = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Precompile on the efficiency cores only (slower, the PC stays responsive)'; AutoSize = $true
@@ -172,7 +177,7 @@ function Read-Form {
 	$settings.language   = $language.SelectedIndex
 	$settings.redzone    = $redzone.Checked
 	$settings.fps120     = $fps120.Checked
-	$settings.framegen   = $framegen.Checked
+	$settings.framegen   = $framegenModes[[Math]::Max(0, $framegen.SelectedIndex)][0]
 	$settings.asyncshaders = $asyncshaders.Checked
 	$settings.ecores     = $ecores.Checked
 	Save-Settings

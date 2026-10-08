@@ -1370,6 +1370,14 @@ static std::chrono::microseconds AsyncDrawWait() {
 	}();
 	return wait;
 }
+// KYTY_ASYNC_DRAW_SYNC_SMALL=0: full-screen passes too go to the worker (default: they block).
+static bool AsyncDrawSyncSmall() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_DRAW_SYNC_SMALL");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	return enabled;
+}
 static std::atomic<uint64_t> g_async_draws_skipped {0};
 
 bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
@@ -1458,7 +1466,12 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// KYTY_ASYNC_DRAW_PIPELINES: the pipeline before anything is recorded, so a draw whose pipeline
 	// is still compiling can be dropped (nothing of it reached the command buffer yet).
 	PipelineCache::Pipeline* async_pipeline = nullptr;
-	if (AsyncDrawPipelines()) {
+	// Full-screen passes (a triangle or a quad: fog, lighting, post effects) keep the blocking compile:
+	// skipping one leaves its render target stale for later passes (visible glitches), and they are
+	// few pipelines. Geometry (many pipelines, the stutters) goes to the worker.
+	const bool full_screen_pass = emit.gpu_args == 0 && emit.direct_run.empty() && draw.index_count <= 6 &&
+	                              draw.instance_count <= 1 && AsyncDrawSyncSmall();
+	if (AsyncDrawPipelines() && !full_screen_pass) {
 		auto& cache    = m_context.GetPipelineCache();
 		const auto try_create = [&] {
 			return cache.TryCreateGraphicsPipeline(std::span {state.color_info, state.color_count}, state.depth_info,
