@@ -6,6 +6,8 @@ name: Build KytyPS5 (Windows)
 on:
   push:
     tags: [ 'v*' ]
+    # This fork: every push to the shaders branch builds it.
+    branches: [ shaders ]
   workflow_dispatch:
 
 concurrency:
@@ -118,6 +120,8 @@ jobs:
   release:
     name: Publish release
     needs: windows
+    # This fork: the build stays a workflow artifact.
+    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
