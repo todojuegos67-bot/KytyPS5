@@ -856,7 +856,15 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
-		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
+		// A shown overlay (the debug warp panel, a dialog) re-presented the last game frame at every vblank the
+		// game missed: an extra frame now and then (61-62 a second, uneven for frame generation such as
+		// Lossless Scaling), and so did every change of its text (the progress, the frame rate panel). While the game
+		// flips, its next frame carries the overlay; only a game stalled for 100 ms (a dialog, a loading pause) gets
+		// overlay-only presents.
+		static auto last_game_flip = std::chrono::steady_clock::now();
+		if (presented) last_game_flip = std::chrono::steady_clock::now();
+		const bool game_stalled = std::chrono::steady_clock::now() - last_game_flip > std::chrono::milliseconds(100);
+		if (!presented && game_stalled && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
 				m_presenter.Present(*frame, true);
 				presented = true;

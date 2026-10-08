@@ -922,6 +922,10 @@ bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
 	       visual.revision != m_impl->presented_overlay_revision.load(std::memory_order_acquire);
 }
 
+bool Presenter::SystemOverlayChanged() const noexcept {
+	return GetSystemOverlayVisualState().revision != m_impl->presented_overlay_revision.load(std::memory_order_acquire);
+}
+
 RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
 }

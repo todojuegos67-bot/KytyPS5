@@ -26,6 +26,8 @@ public:
 	[[nodiscard]] Frame*         PrepareLastFrame();
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
+	// Only the overlay's content changed (not merely shown).
+	[[nodiscard]] bool           SystemOverlayChanged() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
 	// KYTY_FLIP_RATE caps the frame's flip. With frame generation only frames carrying its inputs
 	// are capped (the game's 3D view): movies and menus keep a flip per vblank.
