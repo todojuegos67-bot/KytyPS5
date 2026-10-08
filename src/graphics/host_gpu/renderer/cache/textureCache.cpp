@@ -3288,6 +3288,11 @@ void TextureCache::RunGarbageCollector() {
 	// Past the budget itself (memory already spilling to system RAM): images unused for half a second
 	// go, more of them per collection.
 	const bool over_budget = m_over_budget_memory != 0 && m_total_used_memory >= m_over_budget_memory;
+	if (over_budget) {
+		// The freed images kept for reuse (up to 1 GiB) go first: they hold memory nothing draws with.
+		m_graphics.TrimImagePool();
+		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
