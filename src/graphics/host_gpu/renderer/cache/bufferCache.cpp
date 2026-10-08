@@ -1181,6 +1181,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
+	UpdateGcThresholds();
+}
+
+// As TextureCache::UpdateGcThresholds: from the current budget, re-read during play.
+void BufferCache::UpdateGcThresholds() {
 	constexpr int64_t GiB              = 1024ll * 1024 * 1024;
 	constexpr int64_t target_threshold = 8 * GiB;
 	const auto        budget =
@@ -2095,6 +2100,7 @@ void BufferCache::RunGarbageCollector(bool collect) {
 	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		if ((tick & 31u) == 0) UpdateGcThresholds();
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;

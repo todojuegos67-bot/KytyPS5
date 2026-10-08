@@ -193,6 +193,7 @@ public:
 	[[nodiscard]] bool TakeRegistrationSpans(std::vector<GuestRange>& spans);
 
 	void               RunGarbageCollector(bool collect = true);
+	void               UpdateGcThresholds();
 
 private:
 	friend struct BufferCacheTestAccess;

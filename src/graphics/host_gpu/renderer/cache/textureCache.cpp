@@ -206,16 +206,25 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
-		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		UpdateGcThresholds();
 	}
+}
+
+// The collection thresholds from the GPU's current memory budget. The budget Windows gives a process
+// shrinks while other programs (a browser, an overlay, a recorder) take video memory: thresholds fixed
+// at start-up then let the caches fill past it, and allocations spilled to system memory (16 GB GPUs
+// reached 15 GB of a 14.8 GB budget). Re-read at each collection.
+void TextureCache::UpdateGcThresholds() {
+	constexpr int64_t GiB = 1024ll * 1024 * 1024;
+	const auto        budget =
+	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
+	const auto threshold = std::min<int64_t>(budget, 8 * GiB);
+	m_pressure_gc_memory = static_cast<uint64_t>(
+	    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+	m_critical_gc_memory = static_cast<uint64_t>(
+	    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+	m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+	m_over_budget_memory = static_cast<uint64_t>(std::max<int64_t>(budget, 0));
 }
 
 TextureCache::~TextureCache() {
@@ -3271,15 +3280,20 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		if ((tick & 31u) == 0) UpdateGcThresholds();
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	// Past the budget itself (memory already spilling to system RAM): images unused for half a second
+	// go, more of them per collection.
+	const bool over_budget = m_over_budget_memory != 0 && m_total_used_memory >= m_over_budget_memory;
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		const uint64_t age        = std::min<uint64_t>(
+            aggressive && over_budget ? 30 : aggressive ? 160 : pressured ? 80 : 16, tick);
+		size_t deletions = aggressive && over_budget ? 80 : aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
