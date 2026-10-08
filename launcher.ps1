@@ -12,7 +12,7 @@ $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish 
 $resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false; present = 0 }
+	ecores = $false; fps120 = $false; present = 0; framegen = 0 }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -60,6 +60,7 @@ function Get-PlayCommand {
 		'-Width', $size[0], '-Height', $size[1], '-Language', $settings.language)
 	if ($settings.fullscreen) { $arguments += '-Fullscreen'; if ($settings.aspect) { $arguments += '-AspectFit' } }
 	if (!$settings.redzone) { $arguments += '-NoRedZone' }
+	if ([int]$settings.framegen -gt 0) { $arguments += @('-FrameGen', [int]$settings.framegen) }
 	if ([int]$settings.present -eq 1) { $arguments += @('-PresentMode', 'Immediate') } elseif ([int]$settings.present -eq 2) { $arguments += @('-PresentMode', 'Mailbox') }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	# The console stays for the live log; after a crash it waits for a key.
@@ -143,6 +144,12 @@ $present = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle =
 $present.Items.AddRange(@('V-Sync (default)', 'G-Sync / FreeSync (VRR monitor, fullscreen)', 'Triple buffering (Mailbox)'))
 $present.SelectedIndex = [Math]::Max(0, [Math]::Min(2, [int]$settings.present))
 Add-Row 'Sync' @($present)
+# DLSS Frame Generation (NVIDIA RTX 40/50, experimental): 1, 2 or 3 generated frames per rendered one.
+$framegen = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 320
+	Enabled = (Test-Path "$root\streamline\sl.interposer.dll") }
+$framegen.Items.AddRange(@('Off', 'x2 (RTX 40/50)', 'x3 (RTX 50)', 'x4 (RTX 50)'))
+$framegen.SelectedIndex = [Math]::Max(0, [Math]::Min(3, [int]$settings.framegen))
+Add-Row 'Frame generation' @($framegen)
 $ecores = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Precompile on the efficiency cores only (slower, the PC stays responsive)'; AutoSize = $true
 	Checked = ([bool]$settings.ecores -and $efficiencyMask -ne 0); Enabled = ($efficiencyMask -ne 0) }
 Add-Row '' @($ecores)
@@ -169,6 +176,7 @@ function Read-Form {
 	$settings.language   = $language.SelectedIndex
 	$settings.redzone    = $redzone.Checked
 	$settings.present    = $present.SelectedIndex
+	$settings.framegen   = [Math]::Max(0, $framegen.SelectedIndex)
 	$settings.ecores     = $ecores.Checked
 	Save-Settings
 }

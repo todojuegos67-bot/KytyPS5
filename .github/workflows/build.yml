@@ -7,7 +7,7 @@ on:
   push:
     tags: [ 'v*' ]
     # This fork: every push to the shaders branch builds it.
-    branches: [ shaders ]
+    branches: [ shaders, framegen-exp ]
   workflow_dispatch:
 
 concurrency:
@@ -63,6 +63,36 @@ jobs:
           if ('${{ steps.glslang.outputs.cache-hit }}' -ne 'true') { vcpkg install 'glslang[tools,opt]:x64-windows' }
           "${{ steps.vcpkg.outputs.root }}\installed\x64-windows\tools\glslang" >> $env:GITHUB_PATH
 
+      # NVIDIA Streamline SDK (DLSS Frame Generation, src/local/frame-gen.cpp): downloaded at build time
+      # from NVIDIA's public release, never committed. CMakeLists.txt enables KYTY_FRAMEGEN_STREAMLINE
+      # when _Build/deps/streamline/sdk/include/sl.h exists.
+      - name: Streamline SDK
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STREAMLINE_VERSION: v2.9.0
+        run: |
+          $zips = '_Build\deps\streamline-zip'
+          $unpacked = '_Build\deps\streamline-unpacked'
+          New-Item -ItemType Directory -Force $zips, $unpacked | Out-Null
+          gh release download $env:STREAMLINE_VERSION --repo NVIDIA-RTX/Streamline --pattern '*.zip' --dir $zips
+          if ($LASTEXITCODE -or !(Get-ChildItem $zips -Filter *.zip)) {
+            # No zip on the release: the repository at the tag (its binaries are LFS files).
+            Write-Host 'no release zip; cloning the tag'
+            git lfs install
+            git clone --depth 1 --branch $env:STREAMLINE_VERSION https://github.com/NVIDIA-RTX/Streamline "$unpacked\repo"
+            if ($LASTEXITCODE) { throw 'Streamline clone failed' }
+            git -C "$unpacked\repo" lfs pull
+            $global:LASTEXITCODE = 0
+          }
+          Get-ChildItem $zips -Filter *.zip | ForEach-Object { Write-Host "unpacking $($_.Name)"; Expand-Archive $_.FullName (Join-Path $unpacked $_.BaseName) -Force }
+          $header = Get-ChildItem $unpacked -Recurse -Filter sl.h | Where-Object { $_.Directory.Name -eq 'include' } |
+            Where-Object { Test-Path (Join-Path $_.Directory.Parent.FullName 'bin\x64\sl.interposer.dll') } | Select-Object -First 1
+          if (!$header) { Get-ChildItem $unpacked -Recurse -Depth 3 | ForEach-Object FullName; throw 'no include\sl.h with bin\x64\sl.interposer.dll' }
+          New-Item -ItemType Directory -Force _Build\deps\streamline | Out-Null
+          Move-Item $header.Directory.Parent.FullName _Build\deps\streamline\sdk
+          Get-ChildItem _Build\deps\streamline\sdk\bin\x64 -File | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.Name }
+
       # For other PCs: x86-64-v3 (AVX2), not the runner CPU's -march=native.
       - name: Build
         shell: cmd
@@ -84,6 +114,11 @@ jobs:
             run-windows.ps1, precompile-windows.ps1, launcher.ps1, launcher.cmd, LICENSE $out
           Copy-Item LICENSES $out -Recurse
           Copy-Item run-windows.json "$out\launch.json"
+          # Streamline's production DLLs (bin\x64, not its development\ subfolder) for -FrameGen.
+          $streamline = "$out\streamline"
+          New-Item -ItemType Directory -Force $streamline | Out-Null
+          Copy-Item _Build\deps\streamline\sdk\bin\x64\*.dll $streamline
+          Get-ChildItem _Build\deps\streamline\sdk -File | Where-Object Name -match 'license' | Copy-Item -Destination $streamline
           Copy-Item docs\PORTABLE-README.md "$out\README.md"
           # The seed file's generator: the first launch lists the game's shaders from its files with it (a
           # release cannot hold that list: it contains the game's shader code).
@@ -120,6 +155,8 @@ jobs:
   release:
     name: Publish release
     needs: windows
+    # This fork's builds hold NVIDIA's Streamline DLLs: they stay a workflow artifact, not a public release.
+    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -293,6 +293,10 @@ if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 # not stop the frame; a worker compiles it and the object appears a few frames later. -NoAsyncShaders: off.
 if (!$NoAsyncShaders -and !$Baseline -and !$environment.Contains('KYTY_ASYNC_DRAW_PIPELINES')) { $environment['KYTY_ASYNC_DRAW_PIPELINES'] = '1' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
+# A package built with the Streamline SDK (build.yml) has its DLLs in streamline\ next to this script.
+if ($FrameGen -gt 0 -and !$environment.Contains('KYTY_STREAMLINE_DIR') -and (Test-Path "$PSScriptRoot\streamline\sl.interposer.dll")) {
+	$environment['KYTY_STREAMLINE_DIR'] = "$PSScriptRoot\streamline"
+}
 # -Set KEY=VALUE overrides a switch of the config; KEY= drops it. Several: -Set A=1,B=2 (a comma
 # starts a new pair only before KEY=, so values such as 1,2,3,6,7 stay whole).
 foreach ($pair in ($Set | ForEach-Object { $_ -split ',(?=[A-Za-z_][A-Za-z0-9_]*=)' })) {
