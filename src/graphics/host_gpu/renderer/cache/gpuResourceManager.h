@@ -59,11 +59,16 @@ public:
 	void               EndSubmission();
 	// Once per flip: the frame count and the garbage collection (its ages count frames).
 	void               AdvanceFrame();
+	// A flip the GPU itself submits (EOP flip, the game's normal frames): the next completed submission
+	// advances the frame. Only the CPU's flips (menus, loading screens) did, so in play the caches were
+	// never collected and video memory filled to the driver's limit.
+	void               NoteGpuFlip() noexcept { m_gpu_flip_pending.store(true, std::memory_order_release); }
 
 private:
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault);
 	void                      SynchronizeDirtyBdaRegions(GuestRange range);
 	void RefreshBdaRanges();
+	std::atomic<bool>         m_gpu_flip_pending {false};
 	PageManager               m_page_manager;
 	CommandScheduler&         m_scheduler;
 	BufferCache               m_buffer_cache;

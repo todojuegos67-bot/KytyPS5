@@ -390,6 +390,9 @@ void GpuResourceManager::EndSubmission() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
+	if (m_gpu_flip_pending.exchange(false, std::memory_order_acq_rel)) {
+		AdvanceFrame();
+	}
 }
 
 void GpuResourceManager::AdvanceFrame() {
