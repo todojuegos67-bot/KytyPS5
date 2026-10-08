@@ -1302,10 +1302,15 @@ public:
 		for (auto& thread: m_threads) thread.join();
 	}
 	KYTY_CLASS_NO_COPY(CompileWorkers);
-	void Push(std::function<void()> job) {
+	// urgent: ahead of the queue (a pipeline a draw waits for, not an optimized rebuild).
+	void Push(std::function<void()> job, bool urgent = false) {
 		{
 			std::lock_guard lock(m_mutex);
-			m_jobs.push_back(std::move(job));
+			if (urgent) {
+				m_jobs.push_front(std::move(job));
+			} else {
+				m_jobs.push_back(std::move(job));
+			}
 		}
 		m_wake.notify_one();
 	}
@@ -1336,9 +1341,14 @@ private:
 
 PipelineCache::CompileWorkers& PipelineCache::Workers() {
 	if (m_compile_workers == nullptr) {
-		// The native XPR variants a new area brings (hundreds, ~100 ms each in no cache, unoptimized or not): two
-		// threads queued them for seconds (their draws on the normal path meanwhile). Background threads.
-		m_compile_workers = std::make_unique<CompileWorkers>(std::max(2u, std::thread::hardware_concurrency() / 4u), true);
+		// KYTY_COMPILE_WORKERS, default a quarter of the CPUs (at least 2): entering an area queues dozens of
+		// pipelines of 100-400 ms each, which two threads took seconds to drain (async draws missing meanwhile).
+		// Background threads: they take no time the game's threads want.
+		uint32_t count = std::max(2u, std::thread::hardware_concurrency() / 4u);
+		if (const char* value = std::getenv("KYTY_COMPILE_WORKERS"); value != nullptr && *value != '\0') {
+			count = static_cast<uint32_t>(std::clamp(std::atoi(value), 1, 64));
+		}
+		m_compile_workers = std::make_unique<CompileWorkers>(count, true);
 	}
 	return *m_compile_workers;
 }
@@ -2354,13 +2364,28 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 				m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(pending->second, &pending->second->done);
 				return nullptr;
 			}
-			auto finished = std::move(pending->second->pipeline);
+			auto job      = pending->second;
+			auto finished = std::move(job->pipeline);
 			m_pending_graphics_pipelines.erase(pending);
 			EXIT_NOT_IMPLEMENTED(finished->pipeline == nullptr || finished->pipeline_layout == nullptr);
 			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(finished));
 			EXIT_IF(!inserted);
 			if (indexed) {
 				m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
+			}
+			// A normal variant compiled on a worker (KYTY_ASYNC_DRAW_PIPELINES): a warmup recipe as the
+			// blocking path records, so the next launch creates it before the game starts.
+			if (!native_bindings) {
+				LocalShaderWarmup::PipelineRecord recipe;
+				recipe.vertex = m_program_cache->RecordedIndex(vertex_program);
+				recipe.pixel  = ps_active ? m_program_cache->RecordedIndex(pixel_program) : LocalShaderWarmup::NoShader;
+				recipe.rendering    = iter->first.rendering;
+				recipe.vertex_input = iter->first.vertex_input;
+				recipe.state        = iter->first.static_params;
+				if (recipe.vertex != LocalShaderWarmup::NoShader &&
+				    (!ps_active || recipe.pixel != LocalShaderWarmup::NoShader)) {
+					m_program_cache->warmup.AddPipeline(recipe);
+				}
 			}
 			return iter->second.get();
 		}
@@ -2395,7 +2420,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 			if (table) TablePipelineDone();
 			else MainPipelineDone();
 			job->done.store(true, std::memory_order_release);
-		});
+		}, true);
 		LiveCounters::Add(LiveCounters::AsyncPipelines);
 		m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 		return nullptr;
