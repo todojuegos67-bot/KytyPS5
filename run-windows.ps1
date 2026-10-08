@@ -286,6 +286,10 @@ if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '100' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
+# A package built with the Streamline SDK (build.yml) has its DLLs in streamline\ next to this script.
+if ($FrameGen -gt 0 -and !$environment.Contains('KYTY_STREAMLINE_DIR') -and (Test-Path "$PSScriptRoot\streamline\sl.interposer.dll")) {
+	$environment['KYTY_STREAMLINE_DIR'] = "$PSScriptRoot\streamline"
+}
 # -Set KEY=VALUE overrides a switch of the config; KEY= drops it. Several: -Set A=1,B=2 (a comma
 # starts a new pair only before KEY=, so values such as 1,2,3,6,7 stay whole).
 foreach ($pair in ($Set | ForEach-Object { $_ -split ',(?=[A-Za-z_][A-Za-z0-9_]*=)' })) {

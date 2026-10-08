@@ -12,7 +12,7 @@ $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish 
 $resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false }
+	ecores = $false; fps120 = $false; framegen = $false }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -61,6 +61,7 @@ function Get-PlayCommand {
 	if ($settings.fullscreen) { $arguments += '-Fullscreen'; if ($settings.aspect) { $arguments += '-AspectFit' } }
 	if (!$settings.redzone) { $arguments += '-NoRedZone' }
 	if ($settings.fps120) { $arguments += '-Fps120' }
+	if ($settings.framegen) { $arguments += @('-FrameGen', '1') }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	# The console stays for the live log; after a crash it waits for a key.
 	return 'powershell ' + ($arguments -join ' ') + ' & if !errorlevel! neq 0 pause'
@@ -139,6 +140,9 @@ $redzone = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Red-zon
 Add-Row '' @($redzone)
 $fps120 = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Up to 120 fps (the game''s own frames; movies play faster)'; AutoSize = $true; Checked = [bool]$settings.fps120 }
 Add-Row '' @($fps120)
+$framegen = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'DLSS Frame Generation x2 (NVIDIA RTX 40/50)'; AutoSize = $true; Checked = [bool]$settings.framegen
+	Enabled = (Test-Path "$root\streamline\sl.interposer.dll") }
+Add-Row '' @($framegen)
 $ecores = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Precompile on the efficiency cores only (slower, the PC stays responsive)'; AutoSize = $true
 	Checked = ([bool]$settings.ecores -and $efficiencyMask -ne 0); Enabled = ($efficiencyMask -ne 0) }
 Add-Row '' @($ecores)
@@ -165,6 +169,7 @@ function Read-Form {
 	$settings.language   = $language.SelectedIndex
 	$settings.redzone    = $redzone.Checked
 	$settings.fps120     = $fps120.Checked
+	$settings.framegen   = $framegen.Checked
 	$settings.ecores     = $ecores.Checked
 	Save-Settings
 }
