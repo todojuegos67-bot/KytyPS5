@@ -12,7 +12,7 @@ $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish 
 $resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false }
+	ecores = $false; fps120 = $false; present = 0 }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -60,6 +60,7 @@ function Get-PlayCommand {
 		'-Width', $size[0], '-Height', $size[1], '-Language', $settings.language)
 	if ($settings.fullscreen) { $arguments += '-Fullscreen'; if ($settings.aspect) { $arguments += '-AspectFit' } }
 	if (!$settings.redzone) { $arguments += '-NoRedZone' }
+	if ([int]$settings.present -eq 1) { $arguments += @('-PresentMode', 'Immediate') } elseif ([int]$settings.present -eq 2) { $arguments += @('-PresentMode', 'Mailbox') }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	# The console stays for the live log; after a crash it waits for a key.
 	return 'powershell ' + ($arguments -join ' ') + ' & if !errorlevel! neq 0 pause'
@@ -136,6 +137,12 @@ $language.SelectedIndex = [Math]::Max(0, [Math]::Min($languages.Count - 1, [int]
 Add-Row 'Console language' @($language)
 $redzone = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Red-zone protection (recommended)'; AutoSize = $true; Checked = [bool]$settings.redzone }
 Add-Row '' @($redzone)
+# How frames reach the display: V-Sync (the default), G-Sync/FreeSync (no V-Sync wait: the monitor follows the
+# game's 60 frames a second), or triple buffering.
+$present = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 320 }
+$present.Items.AddRange(@('V-Sync (default)', 'G-Sync / FreeSync (VRR monitor, fullscreen)', 'Triple buffering (Mailbox)'))
+$present.SelectedIndex = [Math]::Max(0, [Math]::Min(2, [int]$settings.present))
+Add-Row 'Sync' @($present)
 $ecores = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Precompile on the efficiency cores only (slower, the PC stays responsive)'; AutoSize = $true
 	Checked = ([bool]$settings.ecores -and $efficiencyMask -ne 0); Enabled = ($efficiencyMask -ne 0) }
 Add-Row '' @($ecores)
@@ -161,6 +168,7 @@ function Read-Form {
 	$settings.aspect     = $aspect.Checked
 	$settings.language   = $language.SelectedIndex
 	$settings.redzone    = $redzone.Checked
+	$settings.present    = $present.SelectedIndex
 	$settings.ecores     = $ecores.Checked
 	Save-Settings
 }
