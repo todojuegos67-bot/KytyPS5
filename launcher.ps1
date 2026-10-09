@@ -9,85 +9,37 @@ $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish 
 	'Portuguese (Portugal)', 'Russian', 'Korean', 'Chinese (Traditional)', 'Chinese (Simplified)', 'Finnish', 'Swedish',
 	'Danish', 'Norwegian', 'Polish', 'Portuguese (Brazil)', 'English (United Kingdom)', 'Turkish', 'Spanish (Latin America)',
 	'Arabic', 'French (Canada)', 'Czech', 'Hungarian', 'Greek', 'Romanian', 'Thai', 'Vietnamese', 'Indonesian'
-# 21:9 sizes too: the game renders 16:9, shown with side bars (Keep 16:9) or stretched to the whole screen.
 $resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160', '2560x1080', '3440x1440', '3840x1600', '5120x2160'
 
-$settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false; present = 0; vramgpu = 0; x3d = $false }
+$settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
 }
 if (!$settings.game -and (Test-Path "$root\game-path.txt")) { $settings.game = (Get-Content "$root\game-path.txt" -TotalCount 1).Trim() }
 
-# The efficiency cores (the lowest efficiency class of a hybrid CPU) as an affinity mask, or 0.
-function Get-EfficiencyMask {
-	Add-Type -Namespace KytyLauncher -Name CpuSets -MemberDefinition @'
-[DllImport("kernel32.dll")]
-static extern bool GetSystemCpuSetInformation(IntPtr information, uint length, out uint returned, IntPtr process, uint flags);
-// Group 0's logical processors as (index, efficiency class) pairs.
-public static int[] Query() {
-	var result = new System.Collections.Generic.List<int>();
-	uint length;
-	GetSystemCpuSetInformation(IntPtr.Zero, 0, out length, IntPtr.Zero, 0);
-	if (length == 0) return result.ToArray();
-	IntPtr buffer = Marshal.AllocHGlobal((int)length);
-	try {
-		if (!GetSystemCpuSetInformation(buffer, length, out length, IntPtr.Zero, 0)) return result.ToArray();
-		for (int offset = 0; offset < length; offset += Marshal.ReadInt32(buffer, offset)) {
-			if (Marshal.ReadInt32(buffer, offset + 4) != 0 || Marshal.ReadInt16(buffer, offset + 12) != 0) continue;
-			result.Add(Marshal.ReadByte(buffer, offset + 14));
-			result.Add(Marshal.ReadByte(buffer, offset + 18));
-		}
-	} finally {
-		Marshal.FreeHGlobal(buffer);
-	}
-	return result.ToArray();
-}
-'@
-	$values = [KytyLauncher.CpuSets]::Query()
-	$sets = for ($i = 0; $i + 1 -lt $values.Count; $i += 2) { [pscustomobject]@{ Cpu = $values[$i]; Class = $values[$i + 1] } }
-	if (@($sets | ForEach-Object Class | Sort-Object -Unique).Count -lt 2) { return [int64]0 }
-	$slowest = ($sets | Measure-Object Class -Minimum).Minimum
-	$mask = [int64]0
-	foreach ($set in $sets | Where-Object { $_.Class -eq $slowest -and $_.Cpu -lt 63 }) { $mask = $mask -bor ([int64]1 -shl $set.Cpu) }
-	return $mask
-}
-$efficiencyMask = Get-EfficiencyMask
-
-# The play / precompile command lines, run by PowerShell itself: no cmd.exe (an overlay or monitoring program that injects a DLL into
-# every process can keep cmd.exe from starting, error 0xc0000142, while PowerShell starts fine).
+# The play / precompile command lines, run by PowerShell itself: no cmd.exe (an overlay or monitoring program that
+# injects a DLL into every process can keep cmd.exe from starting, error 0xc0000142, while PowerShell starts fine).
 function Get-PlayArguments {
 	$size = $settings.resolution -split 'x'
 	$script = @("'$root\run-windows.ps1'", '-Prompt', '-Follow', '-Width', $size[0], '-Height', $size[1], '-Language', $settings.language)
 	if ($settings.fullscreen) { $script += '-Fullscreen'; if ($settings.aspect) { $script += '-AspectFit' } }
 	if (!$settings.redzone) { $script += '-NoRedZone' }
-	if ($settings.x3d) { $script += @('-Affinity', 'FFFF') }
-	$vramMb = @(0, 6656, 8192, 10240, 13312)[[Math]::Max(0, [Math]::Min(4, [int]$settings.vramgpu))]
-	if ($vramMb -gt 0) { $script += @('-Set', "KYTY_VRAM_BUDGET_MB=$vramMb") }
-	if ([int]$settings.present -eq 1) { $script += @('-PresentMode', 'Immediate', '-FlipWhenReady') } elseif ([int]$settings.present -eq 2) { $script += @('-PresentMode', 'Mailbox') }
 	if ($settings.game) { $script += "-Game '$($settings.game.Replace("'", "''"))'" }
+	# The console stays for the live log; after a crash it waits for a key.
 	$command = '& ' + ($script -join ' ') + '; if ($LASTEXITCODE -ne 0) { Read-Host ''Press Enter to close'' | Out-Null }'
 	return @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $command)
 }
 function Get-PrecompileArguments {
 	$script = @("'$root\precompile-windows.ps1'")
-	if ($settings.ecores -and $efficiencyMask -ne 0) { $script += @('-Affinity', $efficiencyMask) }
 	if ($settings.game) { $script += "-Game '$($settings.game.Replace("'", "''"))'" }
 	$command = '& ' + ($script -join ' ') + '; Read-Host ''Press Enter to close'' | Out-Null'
 	return @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $command)
-}
-function Get-PrecompileCommand {
-	$arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$root\precompile-windows.ps1`"")
-	if ($settings.ecores -and $efficiencyMask -ne 0) { $arguments += @('-Affinity', $efficiencyMask) }
-	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
-	return 'powershell ' + ($arguments -join ' ') + ' & pause'
 }
 function Save-Settings { $settings | ConvertTo-Json | Set-Content $settingsPath -Encoding UTF8 }
 if ($DryRun) {
 	"play:       powershell " + ((Get-PlayArguments) -join ' ')
 	"precompile: powershell " + ((Get-PrecompileArguments) -join ' ')
-	"efficiency cores: 0x{0:X}" -f $efficiencyMask
 	return
 }
 
@@ -138,7 +90,7 @@ $resolution = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyl
 $resolution.Items.AddRange($resolutions)
 $resolution.SelectedItem = if ($resolutions -contains $settings.resolution) { $settings.resolution } else { '2560x1440' }
 Add-Row 'Resolution' @($resolution)
-$fullscreen = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Fullscreen'; AutoSize = $true; Checked = [bool]$settings.fullscreen }
+$fullscreen = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Borderless fullscreen (unchecked: window)'; AutoSize = $true; Checked = [bool]$settings.fullscreen }
 $aspect = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Keep 16:9 (black bars)'; AutoSize = $true; Checked = [bool]$settings.aspect }
 $aspect.Enabled = $fullscreen.Checked
 $fullscreen.Add_CheckedChanged({ $aspect.Enabled = $fullscreen.Checked })
@@ -149,25 +101,6 @@ $language.SelectedIndex = [Math]::Max(0, [Math]::Min($languages.Count - 1, [int]
 Add-Row 'Console language' @($language)
 $redzone = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Red-zone protection (recommended)'; AutoSize = $true; Checked = [bool]$settings.redzone }
 Add-Row '' @($redzone)
-# How frames reach the display: V-Sync (the default), G-Sync/FreeSync (no V-Sync wait: the monitor follows the
-# game's 60 frames a second), or triple buffering.
-$present = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 320 }
-$present.Items.AddRange(@('V-Sync (default)', 'G-Sync / FreeSync (VRR monitor: frames shown as soon as ready)', 'Triple buffering (Mailbox)'))
-$present.SelectedIndex = [Math]::Max(0, [Math]::Min(2, [int]$settings.present))
-Add-Row 'Sync' @($present)
-# The emulator's video memory: Auto (the card's memory less 3 GB: fewest texture reloads) or a fixed cap.
-$vram = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 320 }
-$vram.Items.AddRange(@('Auto (detect the graphics card)', 'Graphics card with 8 GB', 'Graphics card with 12 GB', 'Graphics card with 16 GB', 'Graphics card with more than 16 GB'))
-$vram.SelectedIndex = [Math]::Max(0, [Math]::Min(4, [int]$settings.vramgpu))
-Add-Row 'Video memory' @($vram)
-# Ryzen X3D with two CCDs (7950X3D, 9950X3D): the emulator on the first CCD only (logical CPUs 0-15, the one with
-# the 3D V-Cache), so its threads share that cache instead of crossing between CCDs.
-$x3d = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Ryzen X3D: run on the 3D V-Cache cores only (7950X3D / 9950X3D)'; AutoSize = $true; Checked = [bool]$settings.x3d }
-Add-Row '' @($x3d)
-$ecores = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Precompile on the efficiency cores only (slower, the PC stays responsive)'; AutoSize = $true
-	Checked = ([bool]$settings.ecores -and $efficiencyMask -ne 0); Enabled = ($efficiencyMask -ne 0) }
-Add-Row '' @($ecores)
-
 $buttons = New-Object System.Windows.Forms.FlowLayoutPanel -Property @{ AutoSize = $true; Margin = '0,10,0,0' }
 $play = New-Object System.Windows.Forms.Button -Property @{ Text = 'Play'; AutoSize = $true; Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold) }
 $precompile = New-Object System.Windows.Forms.Button -Property @{ Text = 'Precompile shaders'; AutoSize = $true }
@@ -189,10 +122,6 @@ function Read-Form {
 	$settings.aspect     = $aspect.Checked
 	$settings.language   = $language.SelectedIndex
 	$settings.redzone    = $redzone.Checked
-	$settings.present    = $present.SelectedIndex
-	$settings.vramgpu    = [Math]::Max(0, $vram.SelectedIndex)
-	$settings.x3d        = $x3d.Checked
-	$settings.ecores     = $ecores.Checked
 	Save-Settings
 }
 $play.Add_Click({

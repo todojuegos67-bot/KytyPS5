@@ -2211,6 +2211,7 @@ void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {
 		return;
 	}
 	LiveCounters::Add(LiveCounters::RegionSyncs);
+	LiveCounters::ScopedUs timed(LiveCounters::RegionSyncUs);
 	SynchronizeBuffersInRange(request.address, request.size);
 	request.cpu_epoch = 0;
 	if (epoch != 0 && RegionRegistrationEpoch(request.address) == registered &&

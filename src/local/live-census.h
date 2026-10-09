@@ -34,6 +34,16 @@ enum Kind : uint32_t {
 // frame's share: where a busy frame went, without a live session).
 inline uint64_t g_kind_cycles[Kinds] {};
 inline uint64_t g_kind_calls[Kinds] {};
+// ... and the dispatch phases (renderCompute.cpp, phase = b & 15) and draw phases (LogDrawPhase marks).
+constexpr size_t Phases = 16;
+inline uint64_t g_dispatch_phase_cycles[Phases] {};
+inline uint64_t g_draw_phase_cycles[Phases] {};
+inline constexpr const char* DispatchPhaseNames[Phases] = {"program", "consume", "pipeline", "bindings", "find_buffers", "bda",
+                                                           "rebind_buffers", "rebind_images", "commit", "barrier", "p10", "p11",
+                                                           "p12", "p13", "p14", "p15"};
+inline constexpr const char* DrawPhaseNames[Phases] = {"start", "color_target", "depth_target", "programs", "bindings",
+                                                       "vertex_buffers", "pipeline", "begin_rendering", "complete", "p9",
+                                                       "p10", "p11", "p12", "p13", "p14", "p15"};
 inline constexpr const char* KindNames[Kinds] = {"dispatch", "draw", "xpr", "dispatch_phase", "gpu_wait_c", "readback_wait_c",
                                                  "sync_download", "programs", "gather", "queue_run", "srt", "command_sync",
                                                  "draw_phase", "barrier", "guest_command", "submission"};
@@ -85,6 +95,7 @@ public:
 			const uint64_t cycles = __rdtsc() - m_start;
 			g_kind_cycles[m_kind] += cycles;
 			g_kind_calls[m_kind] += 1;
+			if (m_kind == DispatchPhase) g_dispatch_phase_cycles[m_b & (Phases - 1)] += cycles;
 			if (m_table) Add(m_kind, m_a, m_b, cycles);
 		}
 	}
@@ -127,13 +138,14 @@ inline thread_local uint32_t g_draw_phase   = 0;
 inline void MarkDrawPhase(uint32_t next) {
 	if (!g_draw_phases) return;
 	const auto now = __rdtsc();
-	Add(DrawPhase, g_draw_shader, g_draw_phase | g_queue, now - g_draw_phase_start);
+	g_draw_phase_cycles[g_draw_phase & (Phases - 1)] += now - g_draw_phase_start;
+	if (g_on.load(std::memory_order_relaxed)) Add(DrawPhase, g_draw_shader, g_draw_phase | g_queue, now - g_draw_phase_start);
 	g_draw_phase       = next;
 	g_draw_phase_start = now;
 }
 class DrawPhases {
 public:
-	explicit DrawPhases(uint64_t shader): m_on(g_on.load(std::memory_order_relaxed) && g_render && !g_draw_phases) {
+	explicit DrawPhases(uint64_t shader): m_on(g_render && !g_draw_phases) {
 		if (m_on) {
 			g_draw_phases      = true;
 			g_draw_shader      = shader;
