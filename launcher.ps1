@@ -13,7 +13,7 @@ $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish 
 $resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160', '2560x1080', '3440x1440', '3840x1600', '5120x2160'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false; present = 0; vram = 0; x3d = $false }
+	ecores = $false; fps120 = $false; present = 0; vramgpu = 0; x3d = $false }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -62,7 +62,8 @@ function Get-PlayCommand {
 	if ($settings.fullscreen) { $arguments += '-Fullscreen'; if ($settings.aspect) { $arguments += '-AspectFit' } }
 	if (!$settings.redzone) { $arguments += '-NoRedZone' }
 	if ($settings.x3d) { $arguments += @('-Affinity', 'FFFF') }
-	$vramMb = @(0, 8192, 10240, 12288)[[Math]::Max(0, [Math]::Min(3, [int]$settings.vram))]
+	# By the graphics card's memory: the emulator's own budget leaves room for Windows and the driver.
+	$vramMb = @(0, 5632, 8192, 10240, 13312)[[Math]::Max(0, [Math]::Min(4, [int]$settings.vramgpu))]
 	if ($vramMb -gt 0) { $arguments += @('-Set', "KYTY_VRAM_BUDGET_MB=$vramMb") }
 	if ([int]$settings.present -eq 1) { $arguments += @('-PresentMode', 'Immediate') } elseif ([int]$settings.present -eq 2) { $arguments += @('-PresentMode', 'Mailbox') }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
@@ -149,8 +150,8 @@ $present.SelectedIndex = [Math]::Max(0, [Math]::Min(2, [int]$settings.present))
 Add-Row 'Sync' @($present)
 # The emulator's video memory: Auto (the card's memory less 3 GB: fewest texture reloads) or a fixed cap.
 $vram = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 320 }
-$vram.Items.AddRange(@('Auto (GPU memory - 3 GB, at most 10 GB)', '8 GB', '10 GB', '12 GB'))
-$vram.SelectedIndex = [Math]::Max(0, [Math]::Min(3, [int]$settings.vram))
+$vram.Items.AddRange(@('Auto (detect the graphics card)', 'Graphics card with 8 GB', 'Graphics card with 12 GB', 'Graphics card with 16 GB', 'Graphics card with more than 16 GB'))
+$vram.SelectedIndex = [Math]::Max(0, [Math]::Min(4, [int]$settings.vramgpu))
 Add-Row 'Video memory' @($vram)
 # Ryzen X3D with two CCDs (7950X3D, 9950X3D): the emulator on the first CCD only (logical CPUs 0-15, the one with
 # the 3D V-Cache), so its threads share that cache instead of crossing between CCDs.
@@ -182,7 +183,7 @@ function Read-Form {
 	$settings.language   = $language.SelectedIndex
 	$settings.redzone    = $redzone.Checked
 	$settings.present    = $present.SelectedIndex
-	$settings.vram       = [Math]::Max(0, $vram.SelectedIndex)
+	$settings.vramgpu    = [Math]::Max(0, $vram.SelectedIndex)
 	$settings.x3d        = $x3d.Checked
 	$settings.ecores     = $ecores.Checked
 	Save-Settings
