@@ -66,7 +66,6 @@ static const char* PartialRefusal(const Image& image, bool candidate) {
 	if (!image.IsTracked()) return "untracked";
 	if (image.track_addr != info.data.address || image.track_addr_end != info.data.End()) return "partly-tracked";
 	if (!image.CanTakePartialDirty()) return image.IsMaybeCpuDirty() ? "maybe-dirty" : "whole-dirty";
-	if (image.IsGpuModified()) return "gpu-modified";
 	if (image.IsBufferModified()) return "buffer-modified";
 	if (image.IsStencilModified()) return "stencil-modified";
 	return "ok";
@@ -669,10 +668,14 @@ bool TextureCache::PartialDirtyCandidate(const Image& image) {
 bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
                                         uint64_t granule) {
 	const auto& info = image.info;
+	// A GPU-modified image takes a partial write too: the written (or unmapped) span is refreshed from
+	// guest memory at its next use and the GPU's contents elsewhere stay. The game's 320 MiB streaming
+	// arrays are written by the GPU; unmapping one layer of them used to delete the image (its GPU
+	// contents discarded) and re-upload all 320 MiB from guest memory at the next draw: 30-60 ms a
+	// stream event, most of a Boletaria run's stalls.
 	if (!PartialDirtyCandidate(image) || !image.registered || !image.IsTracked() ||
 	    image.track_addr != info.data.address || image.track_addr_end != info.data.End() ||
-	    !image.CanTakePartialDirty() || image.IsGpuModified() || image.IsBufferModified() ||
-	    image.IsStencilModified()) {
+	    !image.CanTakePartialDirty() || image.IsBufferModified() || image.IsStencilModified()) {
 		return false;
 	}
 	const auto base  = info.data.address;
