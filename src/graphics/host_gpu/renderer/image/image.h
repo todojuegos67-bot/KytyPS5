@@ -257,6 +257,7 @@ public:
 	ImageId          depth_id {};
 	uint64_t         frame_accessed_last = 0; // TextureCache::AdvanceFrame count at the last use
 	size_t           lru_id             = 0;
+	uint64_t         lru_tick           = 0; // the collection tick of its last use (TextureCache)
 	// Transit group that last set the whole-image state; see BeginTransitGroup.
 	uint64_t         transit_group      = 0;
 	// Unique per image object: a deleted image's slot id goes to later images.

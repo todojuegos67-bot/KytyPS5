@@ -343,6 +343,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	++image.registrations;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_gc_tick;
 	m_total_used_memory += image.AccountedSize();
 	m_cache_bytes += image.AccountedSize();
 }
@@ -463,6 +464,7 @@ void TextureCache::TouchImage(Image& image) {
 	}
 	if (image.registered) {
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
+		image.lru_tick = m_gc_tick;
 	}
 }
 
@@ -3342,7 +3344,11 @@ void TextureCache::RunGarbageCollector() {
 			// The game's streaming texture arrays (320-352 MiB, a layer streamed in at a time) came straight back
 			// as full re-uploads when evicted past the budget (79 frames with a 320 MiB upload in a Boletaria run on
 			// an 8 GB budget): those go only by the normal 160-frame age.
-			if (over_budget && age < 160 && owner->info.data.size >= (128ull << 20)) {
+			// Not even by the 160-frame age: what turning the camera away for three seconds leaves undrawn came back as
+			// a 320 MiB upload when it turned back (42 of a run's 43 stalls carried ~330 MiB of full uploads). They go
+			// only past the budget, once unused for 20 seconds.
+			if (owner->info.data.size >= (128ull << 20) &&
+			    (!over_budget || tick - owner->lru_tick < 1200u)) {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
