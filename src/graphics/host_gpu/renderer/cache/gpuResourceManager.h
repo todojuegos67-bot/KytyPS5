@@ -29,6 +29,7 @@ public:
 	[[nodiscard]] bool          HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept {
         return m_page_manager.HasReadWatchers(vaddr, size);
 	}
+	[[nodiscard]] const std::atomic<uint64_t>* ReadGranules() const noexcept { return m_page_manager.ReadGranules(); }
 	void                        SetGpu(GuestGpu* gpu) noexcept { m_gpu = gpu; }
 	// After a guest protection change: tracked pages get the tracker's protection back.
 	void ReapplyProtection(uint64_t vaddr, uint64_t size) { m_page_manager.ReapplyProtection(vaddr, size); }
@@ -57,19 +58,19 @@ public:
 	bool PrepareBdaReadRanges(std::span<const GuestRange> ranges);
 	// After each completed submission: its shaders' fault records and the image downloads.
 	void               EndSubmission();
-	// Once per flip: the frame count and the garbage collection (its ages count frames).
+	// A flip the GPU makes (an end-of-pipe flip, all of Demon's Souls' frames): the collectors run at the end of its
+	// submission (EndSubmission), as AdvanceFrame runs them for a CPU flip. Since collection moved to the flips
+	// (81cd311) they never ran in the game, and a GPU under 32 GB filled up. (The texture cache's frame, which
+	// ResolveOverlap's stale-image test counts, still advances with CPU flips only: in this game it never did.)
+	void               NoteGpuFlip() { m_gpu_flip_pending = true; }
+	// Once per CPU flip: the frame count and the garbage collection (its ages count frames).
 	void               AdvanceFrame();
-	// A flip the GPU itself submits (EOP flip, the game's normal frames): the next completed submission
-	// advances the frame. Only the CPU's flips (menus, loading screens) did, so in play the caches were
-	// never collected and video memory filled to the driver's limit.
-	void               NoteGpuFlip() noexcept { m_gpu_flip_pending.store(true, std::memory_order_release); }
 
 private:
+	void                      RunCollectors();
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault);
 	void                      SynchronizeDirtyBdaRegions(GuestRange range);
 	void RefreshBdaRanges();
-	std::atomic<bool>         m_gpu_flip_pending {false};
-	uint64_t                  m_frames = 0;
 	PageManager               m_page_manager;
 	CommandScheduler&         m_scheduler;
 	BufferCache               m_buffer_cache;
@@ -95,6 +96,7 @@ private:
 	std::atomic<uint64_t> m_preparation_alias_epoch {uint64_t{1} << 32};
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_used              = false;
+	bool                      m_gpu_flip_pending      = false;
 };
 
 } // namespace Libs::Graphics

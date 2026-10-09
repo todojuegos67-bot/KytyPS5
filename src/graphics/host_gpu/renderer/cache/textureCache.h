@@ -33,6 +33,9 @@ struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
+	// Every image as a tab-separated row (live "images <path>").
+	void WriteReport(const char* path);
+
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
@@ -132,9 +135,6 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
-	void UpdateGcThresholds();
-	// The device's video memory usage past the critical line (the last collection's reading).
-	[[nodiscard]] bool OverCritical() const noexcept { return m_critical_gc_memory != 0 && m_total_used_memory >= m_critical_gc_memory; }
 	// The latest tick of a GPU-written image's download that will write guest memory overlapping
 	// the range once the GPU completes it (on the priority thread); 0 when none is pending.
 	[[nodiscard]] uint64_t PendingDownloadTick(uint64_t address, uint64_t size);
@@ -196,9 +196,15 @@ private:
 	                                        uint64_t granule);
 	void               UntrackImagePages(Image& image, uint64_t begin, uint64_t end);
 	void               RetrackHoles(Image& image);
+	// The holes' pages inside [begin, end) only (page-aligned); the others stay released.
+	void               RetrackHoles(Image& image, uint64_t begin, uint64_t end);
 	void               FinishRefresh(Image& image);
 	[[nodiscard]] bool UploadImagePartial(Image& image);
-	[[nodiscard]] bool UploadDepthPartial(Image& image);
+	// The dirty layers in [first_layer, last_layer) only.
+	[[nodiscard]] bool UploadDepthPartial(Image& image, uint32_t first_layer = 0,
+	                                      uint32_t last_layer = UINT32_MAX);
+	// A depth target binding's refresh of the layers its view covers; false: RefreshImage's.
+	[[nodiscard]] bool RefreshDepthLayers(ImageId id, const ImageViewInfo& view);
 	void               UpdatePartialHashes(Image& image, bool all);
 	[[nodiscard]] bool CheckPartialHashes(const Image& image);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
@@ -219,6 +225,7 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);
 	void                        InitializeImage(ImageId id);
+	[[nodiscard]] bool          RefillUpload(Image& image);
 	[[nodiscard]] TextureTransferPlan
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] DownloadPlan BuildDownload(const Image& image) const;
@@ -227,7 +234,8 @@ private:
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, DownloadPlan plan);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
-	void CommitGpuWrite(Image& image);
+	// `keep_partial`: the image stays dirty in the ranges a scoped refresh left (RefreshDepthLayers).
+	void CommitGpuWrite(Image& image, bool keep_partial = false);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, const vk::ImageSubresourceRange& range,
 	                const vk::ClearValue& clear);
@@ -257,6 +265,20 @@ private:
 	// Start address -> number of registered images starting there, and the
 	// log of addresses that gained their first one.
 	std::unordered_map<uint64_t, uint32_t>            m_image_starts;
+	// Start addresses per bucket of 4 KiB pages (hashed), and a bit per bucket that has any (8 KiB: it stays in the
+	// cache): a lookup of an address in an empty bucket needs no walk of the map (HasImageStartingAt: every formatted
+	// buffer of a table draw or dispatch asks, mostly at per-frame ring addresses no image starts at; the map's node
+	// walk was ~1% of the GPU thread on the 1-1 walk).
+	static constexpr uint32_t StartBucketBits = 16;
+	[[nodiscard]] static size_t StartBucket(uint64_t address) {
+		return static_cast<size_t>(((address >> 12u) * 0x9e3779b97f4a7c15ull) >> (64u - StartBucketBits));
+	}
+	[[nodiscard]] bool MayStartAt(uint64_t address) const {
+		const auto bucket = StartBucket(address);
+		return ((m_start_bucket_bits[bucket / 64u] >> (bucket % 64u)) & 1u) != 0;
+	}
+	std::unique_ptr<uint32_t[]>                         m_start_buckets = std::make_unique<uint32_t[]>(size_t {1} << StartBucketBits);
+	std::array<uint64_t, (size_t {1} << StartBucketBits) / 64> m_start_bucket_bits {};
 	std::atomic<uint64_t>                             m_start_epoch {1};
 	std::vector<std::pair<uint64_t, uint64_t>>        m_start_log; // (epoch, address)
 	std::atomic<uint64_t>                             m_resolution_epoch {1};
@@ -291,10 +313,7 @@ private:
 	}
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
-	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
-	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
-	uint64_t         m_over_budget_memory     = 0; // the budget itself (UpdateGcThresholds)
-	uint64_t         m_cache_bytes            = 0; // the registered images' accounted bytes
+	uint64_t                                          m_logged_video_memory = 0; // RunGarbageCollector's log line
 	uint64_t         m_gc_tick                = 0;
 	std::atomic<uint64_t> m_frame {0};
 	struct PendingDownload {
@@ -315,10 +334,14 @@ private:
 	[[nodiscard]] bool SameDccSurface(const Image& image, const ImageMetadataInfo& metadata) const;
 	// KYTY_IMAGE_GRANULES: a bit per 64 KiB granule that a registered image covered
 	// since the last rebuild (a superset); region queries skip the page walk on a miss.
+	// Allocated with the cache (never moved): MayHaveImagesRead reads it without m_lock.
 	mutable std::vector<uint64_t> m_image_granules;
 	mutable uint32_t              m_image_granule_releases = 0;
 	void                          MarkImageGranules(uint64_t address, uint64_t size) const;
 	[[nodiscard]] bool            MayHaveImages(uint64_t address, uint64_t size) const;
+	// MayHaveImages without the rebuild (true while one is due): only reads what holders of m_lock write, so
+	// m_lock.ReadShared can ask it.
+	[[nodiscard]] bool            MayHaveImagesRead(uint64_t address, uint64_t size) const;
 	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;

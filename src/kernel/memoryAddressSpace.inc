@@ -192,13 +192,13 @@ public:
 	// Diagnostic (live measure: backing_lock_*, backing_hold_*): the render thread's waits for
 	// either lock are counted when it is contended, and how long the writers hold them.
 	template <typename Lock>
-	static void AcquireCounted(Lock& lock) {
+	static void AcquireCounted(Lock& lock, bool write = false) {
 		if (lock.try_lock()) return;
 		const auto start = std::chrono::steady_clock::now();
 		lock.lock();
 		if (Graphics::GuestGpu::IsGpuThread()) {
-			LiveCounters::Add(LiveCounters::BackingLockWaits);
-			LiveCounters::Add(LiveCounters::BackingLockWaitUs,
+			LiveCounters::Add(write ? LiveCounters::BackingWriteWaits : LiveCounters::BackingLockWaits);
+			LiveCounters::Add(write ? LiveCounters::BackingWriteWaitUs : LiveCounters::BackingLockWaitUs,
 			                  static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 			                                            std::chrono::steady_clock::now() - start)
 			                                            .count()));
@@ -209,9 +209,9 @@ public:
 		AcquireCounted(lock);
 		return lock;
 	}
-	std::unique_lock<std::mutex> DataLock() {
+	std::unique_lock<std::mutex> DataLock(bool write = false) {
 		std::unique_lock lock(m_data_mutex, std::defer_lock);
-		AcquireCounted(lock);
+		AcquireCounted(lock, write);
 		return lock;
 	}
 	struct HoldTimer {
@@ -266,6 +266,31 @@ public:
 		                          });
 	}
 
+	// A write of bytes no data writer writes, such as a linear copy's into pages the CPU owns (TryWriteBacking's GPU
+	// results go to GPU-owned pages only: BufferCache::WriteBackGpuOwned): its own mutex and fence, so it never waits
+	// behind a data write (the render thread's linear copies waited there ~1.5 times a frame, 0.13 ms at Latria). A
+	// reader excludes both kinds of writer (the slow path both mutexes, the fast one both fences). False when one
+	// mapping does not cover the range.
+	bool TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		GuestBackingMutation mutation;
+		if (data == nullptr || !IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		auto            lock = MapReadLock();
+		std::lock_guard cpu_lock(m_cpu_write_mutex);
+		MapEntry        entry {};
+		if (!FindContainingUnlocked(vaddr, size, &entry)) {
+			return false;
+		}
+		const auto begin = entry.backing_offset + vaddr - entry.vaddr;
+		if (!RangeOk(begin, size)) {
+			return false;
+		}
+		DataWriteFence fence(*this, begin, begin + size, m_cpu_write_pages);
+		std::memcpy(m_backing_base + begin, data, size);
+		return true;
+	}
+
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (data == nullptr) {
 			return false;
@@ -293,7 +318,7 @@ public:
 		    data && size && size <= 0x10000 && UINT64_MAX - vaddr >= size) {
 			BackingReadTransaction read(*this);
 			if (read.Acquired()) {
-				auto& cached = m_host_read_translations[(vaddr >> 22) % m_host_read_translations.size()];
+				auto& cached = HostReadTranslationOf(vaddr);
 				MapEntry entry {};
 				if (cached.epoch == m_mapping_epoch &&
 				    GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, size)) {
@@ -325,7 +350,7 @@ public:
 		{
 			BackingReadTransaction read(*this);
 			if (read.Acquired()) {
-				auto& cached = m_host_read_translations[(vaddr >> 22) % m_host_read_translations.size()];
+				auto& cached = HostReadTranslationOf(vaddr);
 				if (cached.epoch == m_mapping_epoch &&
 				    GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, size)) {
 					entry = cached.entry;
@@ -374,8 +399,9 @@ public:
 			return false;
 		}
 
-		auto lock      = MapReadLock();
-		auto data_lock = DataLock();
+		auto            lock      = MapReadLock();
+		auto            data_lock = DataLock();
+		std::lock_guard cpu_lock(m_cpu_write_mutex);
 		const auto      end   = vaddr + size;
 		auto            first = m_maps.lower_bound(vaddr);
 		if (first != m_maps.begin()) {
@@ -684,8 +710,29 @@ public:
 		// KYTY_ALIAS_VERIFY: every answer is compared with the full rebuild it replaces.
 		static const bool verify = std::getenv("KYTY_ALIAS_VERIFY") != nullptr;
 		if (!verify) {
+			if (size == 0 || UINT64_MAX - vaddr < size) return false; // (as FindContainingUnlocked)
 			auto lock = MapReadLock();
-			return IsUniqueRangeUnlocked(vaddr, size);
+			// The mapping over each 4 MiB of address and whether no byte of it is mapped twice (the usual case), kept until
+			// the mappings change (every change moves the epoch under the exclusive lock): any range in such a mapping is
+			// unique. The game asks about ~1000 ranges a frame, most of them new (ring buffers), in a few mappings: two cold
+			// tree lookups each.
+			struct Owner {
+				const GuestBackingStore* store;
+				uint64_t                 epoch;
+				MapEntry                 entry;
+				bool                     unique;
+			};
+			thread_local std::array<Owner, 256> owners {};
+			auto& owner = owners[(vaddr >> 22u) % owners.size()];
+			if (owner.store != this || owner.epoch != m_mapping_epoch ||
+			    !GuestFreeRangeContains(owner.entry.vaddr, owner.entry.size, vaddr, size)) {
+				MapEntry entry {};
+				if (!FindContainingUnlocked(vaddr, size, &entry)) return false;
+				owner = {this, m_mapping_epoch, entry, CoverageUnique(entry.backing_offset, entry.backing_offset + entry.size)};
+			}
+			if (owner.unique) return true;
+			const auto physical = owner.entry.backing_offset + vaddr - owner.entry.vaddr;
+			return CoverageUnique(physical, physical + size);
 		}
 		std::lock_guard lock(m_mutex); // the full rebuild writes its intervals
 		const bool unique = IsUniqueRangeUnlocked(vaddr, size);
@@ -749,9 +796,10 @@ private:
 	}
 
 private:
-	// One writer at a time: data writers hold m_data_mutex (and m_mutex shared), zeroing and
-	// mapping mutations hold m_mutex exclusively, which excludes the data writers.
-	// A writer announces itself before inspecting the one reader slot. Sequential
+	// One writer at a time of each kind: data writers hold m_data_mutex (and m_mutex shared), CPU-owned
+	// writers m_cpu_write_mutex (bytes no data writer writes: TryWriteCpuBacking), zeroing and
+	// mapping mutations hold m_mutex exclusively, which excludes both.
+	// A writer announces itself before inspecting the reader slots. Sequential
 	// consistency makes it impossible for both entrants to miss the other: either
 	// the reader falls back, or the writer waits for its bounded host copy to end.
 	// No GPU work, guest faults, or other locks occur inside that copy transaction.
@@ -761,9 +809,11 @@ private:
 		explicit BackingWriteFence(GuestBackingStore& store): m_store(store) {
 			m_store.m_host_write_pending.store(true, std::memory_order_seq_cst);
 			unsigned spins = 0;
-			while (m_store.m_host_read_pages.load(std::memory_order_seq_cst) != 0) {
-				_mm_pause();
-				if (++spins == 256) { std::this_thread::yield(); spins = 0; }
+			for (const auto& slot: m_store.m_host_read_slots) {
+				while (slot.pages.load(std::memory_order_seq_cst) != 0) {
+					_mm_pause();
+					if (++spins == 256) { std::this_thread::yield(); spins = 0; }
+				}
 			}
 		}
 		~BackingWriteFence() {
@@ -793,40 +843,50 @@ private:
 	class DataWriteFence {
 	public:
 		KYTY_CLASS_NO_COPY(DataWriteFence);
-		DataWriteFence(GuestBackingStore& store, uint64_t begin, uint64_t end): m_store(store) {
+		// `published`: m_data_write_pages, or m_cpu_write_pages for a CPU-owned write (TryWriteCpuBacking).
+		DataWriteFence(GuestBackingStore& store, uint64_t begin, uint64_t end, std::atomic<uint64_t>& published)
+		    : m_published(published) {
 			const auto pages = PackPages(begin, end);
-			m_store.m_data_write_pages.store(pages, std::memory_order_seq_cst);
+			m_published.store(pages, std::memory_order_seq_cst);
 			unsigned spins = 0;
-			while (PagesOverlap(m_store.m_host_read_pages.load(std::memory_order_seq_cst), pages)) {
-				_mm_pause();
-				if (++spins == 256) { std::this_thread::yield(); spins = 0; }
+			for (const auto& slot: store.m_host_read_slots) {
+				while (PagesOverlap(slot.pages.load(std::memory_order_seq_cst), pages)) {
+					_mm_pause();
+					if (++spins == 256) { std::this_thread::yield(); spins = 0; }
+				}
 			}
 		}
-		~DataWriteFence() { m_store.m_data_write_pages.store(0, std::memory_order_release); }
+		~DataWriteFence() { m_published.store(0, std::memory_order_release); }
 	private:
-		GuestBackingStore& m_store;
+		std::atomic<uint64_t>& m_published;
 	};
 
 	class BackingReadTransaction {
 	public:
 		KYTY_CLASS_NO_COPY(BackingReadTransaction);
 		explicit BackingReadTransaction(GuestBackingStore& store): m_store(store) {
-			// One reader at a time; it holds every page until Narrow names the ones it copies.
-			uint64_t idle = 0;
-			if (m_store.m_host_write_pending.load(std::memory_order_relaxed) ||
-			    !m_store.m_host_read_pages.compare_exchange_strong(idle, AllPages, std::memory_order_seq_cst))
-				return;
-			m_acquired = true;
-			if (m_store.m_host_write_pending.load(std::memory_order_seq_cst)) Release();
+			// A reader per slot (this thread's first, then the next free one); it holds every page until Narrow
+			// names the ones it copies.
+			if (m_store.m_host_write_pending.load(std::memory_order_relaxed)) return;
+			thread_local const size_t first = std::hash<std::thread::id> {}(std::this_thread::get_id());
+			for (size_t i = 0; i < HostReadSlots && m_slot == nullptr; ++i) {
+				auto&    slot = m_store.m_host_read_slots[(first + i) % HostReadSlots].pages;
+				uint64_t idle = 0;
+				if (slot.load(std::memory_order_relaxed) == 0 &&
+				    slot.compare_exchange_strong(idle, AllPages, std::memory_order_seq_cst))
+					m_slot = &slot;
+			}
+			if (m_slot != nullptr && m_store.m_host_write_pending.load(std::memory_order_seq_cst)) Release();
 		}
 		~BackingReadTransaction() { Release(); }
-		bool Acquired() const { return m_acquired; }
-		// The read copies backing bytes [begin, end): false (and released) while a data write
+		bool Acquired() const { return m_slot != nullptr; }
+		// The read copies backing bytes [begin, end): false (and released) while a data or CPU-owned write
 		// into overlapping pages is under way.
 		bool Narrow(uint64_t begin, uint64_t end) {
 			const auto pages = PackPages(begin, end);
-			m_store.m_host_read_pages.store(pages, std::memory_order_seq_cst);
-			if (PagesOverlap(m_store.m_data_write_pages.load(std::memory_order_seq_cst), pages)) {
+			m_slot->store(pages, std::memory_order_seq_cst);
+			if (PagesOverlap(m_store.m_data_write_pages.load(std::memory_order_seq_cst), pages) ||
+			    PagesOverlap(m_store.m_cpu_write_pages.load(std::memory_order_seq_cst), pages)) {
 				Release();
 				return false;
 			}
@@ -834,13 +894,13 @@ private:
 		}
 	private:
 		void Release() {
-			if (m_acquired) {
-				m_store.m_host_read_pages.store(0, std::memory_order_release);
-				m_acquired = false;
+			if (m_slot != nullptr) {
+				m_slot->store(0, std::memory_order_release);
+				m_slot = nullptr;
 			}
 		}
-		GuestBackingStore& m_store;
-		bool m_acquired = false;
+		GuestBackingStore&     m_store;
+		std::atomic<uint64_t>* m_slot = nullptr;
 	};
 
 	template <bool Write, typename Transfer>
@@ -850,7 +910,10 @@ private:
 		}
 
 		auto lock      = MapReadLock();
-		auto data_lock = DataLock();
+		auto data_lock = DataLock(Write);
+		// (A reader excludes the CPU-owned writers too; a data writer's bytes are never theirs.)
+		std::unique_lock cpu_lock(m_cpu_write_mutex, std::defer_lock);
+		if constexpr (!Write) cpu_lock.lock();
 		if constexpr (Write) {
 			HoldTimer hold {LiveCounters::BackingHoldWriteUs};
 			// The shared map lock keeps the mapping, so its backing bytes, fixed. A range
@@ -858,7 +921,7 @@ private:
 			MapEntry entry {};
 			if (FindContainingUnlocked(vaddr, size, &entry)) {
 				const auto      begin = entry.backing_offset + vaddr - entry.vaddr;
-				DataWriteFence fence(*this, begin, begin + size);
+				DataWriteFence fence(*this, begin, begin + size, m_data_write_pages);
 				return TransferBackingUnlocked(vaddr, size, transfer);
 			}
 			BackingWriteFence fence(*this);
@@ -963,11 +1026,24 @@ private:
 
 	void InvalidateMappingLookup() {
 		m_alias_ranges_valid = false;
-		if (++m_mapping_epoch == 0) {
-			m_mapping_epoch = 1;
-			// In place: assigning {} builds a 40 KiB array on the stack (every caller's frame, called or not).
-			m_host_read_translations.fill({});
+		if (++m_mapping_epoch == 0) m_mapping_epoch = 1;
+	}
+
+	struct HostReadTranslation { MapEntry entry; uint64_t epoch = 0; };
+	// The host read translation of `vaddr`'s 4 MiB granule, this thread's (readers of different slots fill them at
+	// once): 1024 cover 4 GiB without two granules sharing one (with 64, granules 256 MiB apart evicted each other
+	// and their reads searched m_maps). An entry holds while its epoch is the mappings' (read under a read slot).
+	HostReadTranslation& HostReadTranslationOf(uint64_t vaddr) {
+		struct Translations {
+			const GuestBackingStore*               store = nullptr;
+			std::array<HostReadTranslation, 1024> entries {};
+		};
+		thread_local Translations translations;
+		if (translations.store != this) {
+			translations.store = this;
+			translations.entries.fill({});
 		}
+		return translations.entries[(vaddr >> 22) % translations.entries.size()];
 	}
 
 	bool FindContainingUnlocked(uint64_t vaddr, uint64_t size, MapEntry* out) const {
@@ -1119,6 +1195,7 @@ private:
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
 	std::mutex                   m_data_mutex;
+	std::mutex                   m_cpu_write_mutex; // (TryWriteCpuBacking)
 	std::vector<std::pair<uint64_t, uint64_t>> m_aliased_physical_ranges;
 	bool m_alias_ranges_valid = false;
 	std::map<uint64_t, MapEntry> m_maps;
@@ -1131,12 +1208,16 @@ private:
 	alignas(64) std::atomic_bool m_host_write_pending {false};
 	// The pages of the data write in progress (DataWriteFence), 0 when none.
 	alignas(64) std::atomic<uint64_t> m_data_write_pages {0};
-	// The pages the one active host read copies (all until it knows), 0 when none.
-	alignas(64) std::atomic<uint64_t> m_host_read_pages {0};
-	struct HostReadTranslation { MapEntry entry; uint64_t epoch = 0; };
-	// By 4 MiB granule: 1024 slots cover 4 GiB without two granules sharing one (with 64, granules 256 MiB apart
-	// evicted each other and their reads searched m_maps).
-	std::array<HostReadTranslation, 1024> m_host_read_translations {};
+	// ... of the CPU-owned write in progress (TryWriteCpuBacking).
+	alignas(64) std::atomic<uint64_t> m_cpu_write_pages {0};
+	// The pages each active host read copies (all until it knows), 0 when none: a reader per slot. With one slot,
+	// a read that met another (an upload worker's BackingPointer, hundreds a frame) took the data mutex instead and
+	// waited there behind the copies of the writers (the render thread's per-draw reads: ~2.6 waits, ~0.23 ms a frame).
+	struct alignas(64) HostReadSlot {
+		std::atomic<uint64_t> pages {0};
+	};
+	static constexpr size_t                    HostReadSlots = 8;
+	std::array<HostReadSlot, HostReadSlots> m_host_read_slots {};
 	uint64_t m_mapping_epoch = 1;
 };
 
@@ -1234,6 +1315,9 @@ public:
 
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		return m_backing->TryWriteBacking(vaddr, data, size);
+	}
+	bool TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		return m_backing->TryWriteCpuBacking(vaddr, data, size);
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {

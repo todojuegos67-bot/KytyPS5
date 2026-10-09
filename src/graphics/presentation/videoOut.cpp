@@ -908,6 +908,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
+		if (!presented) presented = m_presenter.PresentSkippedIfDue();
 		// A shown overlay (the debug warp panel, a dialog) re-presented the last game frame at every vblank the
 		// game missed: an extra frame now and then (61-62 a second, uneven for frame generation such as
 		// Lossless Scaling), and so did every change of its text (the progress, the frame rate panel). While the game

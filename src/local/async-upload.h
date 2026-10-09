@@ -8,6 +8,7 @@
 // cannot fault it, and unmapping a range waits for the jobs on it before the range can be reused.
 
 #include "local-platform.h"
+#include "parallel-pages.h"
 
 #include <algorithm>
 #include <atomic>
@@ -126,95 +127,35 @@ private:
 			for (; done < head; ++done) {
 				const Job& job = m_jobs[done % Capacity];
 				if (job.call != nullptr) job.call(job.context, reinterpret_cast<uint64_t>(job.destination), job.size);
-				else if (job.size >= ParallelCopyMin && m_helpers.Count() != 0) m_helpers.Copy(job.destination, job.source, job.size);
-				else std::memcpy(job.destination, job.source, job.size);
+				else Copy(job.destination, job.source, job.size);
 			}
 			m_done.store(done, std::memory_order_seq_cst);
 			if (m_waiters.load(std::memory_order_seq_cst) != 0) m_done.notify_all();
 		}
 	}
 
-	// A large copy (the game's 320 MiB streaming texture arrays, rewritten whole when it streams) is split
-	// across helper threads: one thread copied it in ~35 ms, and the submission that reads it waited that
-	// long before the GPU got the frame. KYTY_UPLOAD_THREADS sets the helper count (0: one thread, as before).
-	static constexpr uint64_t ParallelCopyMin = 8u << 20;
-
-	class Helpers {
-	public:
-		Helpers() {
-			unsigned count = std::thread::hardware_concurrency() / 4;
-			if (const char* value = std::getenv("KYTY_UPLOAD_THREADS"); value != nullptr && *value != '\0') {
-				count = static_cast<unsigned>(std::strtoul(value, nullptr, 10));
-			}
-			m_count = std::min<unsigned>(count, MaxHelpers);
-			for (unsigned i = 0; i < m_count; ++i) m_threads[i] = std::thread([this, i] { Run(i); });
+	// A copy of 1 MiB or more is shared with helper threads of its own (not the render thread's page comparisons'
+	// pool, which would wait behind it). The first read of each source page through this view faults (~1.2 us a
+	// page: 2.3-3.8 GB/s on one thread, 6-11 GB/s on eight), and an image the game streams in is read once: a frame
+	// where it brings a new area (~1 GB of textures, every submission waiting for their copies) stalled ~300 ms.
+	static void Copy(uint8_t* destination, const uint8_t* source, uint64_t size) {
+		constexpr uint64_t Chunk = uint64_t {256} << 10u;
+		if (size < 4 * Chunk) {
+			std::memcpy(destination, source, size);
+			return;
 		}
-		~Helpers() {
-			m_stop.store(true, std::memory_order_seq_cst);
-			m_generation.fetch_add(1, std::memory_order_seq_cst);
-			m_generation.notify_all();
-			for (unsigned i = 0; i < m_count; ++i) m_threads[i].join();
-		}
-		Helpers(const Helpers&)            = delete;
-		Helpers& operator=(const Helpers&) = delete;
-
-		[[nodiscard]] unsigned Count() const { return m_count; }
-
-		// Upload worker only: copies `size` bytes with the helpers and this thread, returns when all are done.
-		void Copy(uint8_t* destination, const uint8_t* source, uint64_t size) {
-			const unsigned parts = m_count + 1;
-			const uint64_t piece = ((size + parts - 1) / parts + 4095) & ~uint64_t {4095};
-			m_destination        = destination;
-			m_source             = source;
-			m_size               = size;
-			m_piece              = piece;
-			m_pending.store(m_count, std::memory_order_seq_cst);
-			m_generation.fetch_add(1, std::memory_order_seq_cst);
-			m_generation.notify_all();
-			// The worker takes the last piece itself.
-			const uint64_t offset = piece * m_count;
-			if (offset < size) std::memcpy(destination + offset, source + offset, size - offset);
-			for (int spin = 0; m_pending.load(std::memory_order_acquire) != 0; ++spin) {
-				if (spin < 100000) _mm_pause();
-				else m_pending.wait(m_pending.load(std::memory_order_relaxed), std::memory_order_seq_cst);
-			}
-		}
-
-	private:
-		static constexpr unsigned MaxHelpers = 7;
-
-		void Run(unsigned index) {
-			LocalPlatform::SetThreadName("Kyty.UploadCopy");
-			LocalPlatform::PinThreadToCpuList(std::getenv("KYTY_RECORDING_CPUS"));
-			uint64_t seen = 0;
-			for (;;) {
-				uint64_t generation = m_generation.load(std::memory_order_acquire);
-				while (generation == seen) {
-					m_generation.wait(seen, std::memory_order_seq_cst);
-					generation = m_generation.load(std::memory_order_acquire);
-				}
-				seen = generation;
-				if (m_stop.load(std::memory_order_seq_cst)) return;
-				const uint64_t offset = m_piece * index;
-				if (offset < m_size) {
-					std::memcpy(m_destination + offset, m_source + offset, std::min(m_piece, m_size - offset));
-				}
-				if (m_pending.fetch_sub(1, std::memory_order_seq_cst) == 1) m_pending.notify_all();
-			}
-		}
-
-		unsigned                          m_count = 0;
-		uint8_t*                          m_destination = nullptr;
-		const uint8_t*                    m_source      = nullptr;
-		uint64_t                          m_size = 0, m_piece = 0;
-		alignas(64) std::atomic<uint64_t> m_generation {0};
-		alignas(64) std::atomic<unsigned> m_pending {0};
-		std::atomic<bool>                 m_stop {false};
-		std::thread                       m_threads[MaxHelpers];
-	};
+		static auto* const pool = new ParallelPages::Pool(7, "Kyty.UploadCopy"); // (never destroyed)
+		struct Context {
+			uint8_t*       destination;
+			const uint8_t* source;
+		} context {destination, source};
+		pool->For(size, Chunk, [](void* at, uint64_t first, uint64_t last) {
+			const auto& copy = *static_cast<const Context*>(at);
+			std::memcpy(copy.destination + first, copy.source + first, last - first);
+		}, &context);
+	}
 
 	std::unique_ptr<Job[]>             m_jobs;
-	Helpers                            m_helpers;
 	alignas(64) std::atomic<uint64_t>  m_head {0};
 	alignas(64) std::atomic<uint64_t>  m_done {0};
 	alignas(64) std::atomic<bool>      m_sleeping {false};

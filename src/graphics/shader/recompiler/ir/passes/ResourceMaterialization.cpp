@@ -390,8 +390,10 @@ private:
 	std::vector<uint32_t>        m_keys;
 };
 
+// `enumeration`: what made the candidates, a description made only for a summary of dropped classes.
+template <typename Describe>
 bool FinishIndirectImage(const ImageResource& image, std::vector<DescriptorValue>& probed,
-                         bool over_approximates, std::string enumeration, IndirectImage& next,
+                         bool over_approximates, const Describe& enumeration, IndirectImage& next,
                          std::string* reason) {
 	std::vector<IndirectImageClass> classes;
 	std::vector<uint32_t>           tally;
@@ -423,7 +425,7 @@ bool FinishIndirectImage(const ImageResource& image, std::vector<DescriptorValue
 			next.dropped_shapes = static_cast<uint32_t>(classes.size() - 1u);
 		}
 		next.dropped_summary =
-		    fmt::format("{} {}={}", std::move(enumeration),
+		    fmt::format("{} {}={}", enumeration(),
 		                over_approximates ? "kept" : "exact probe, refused",
 		                ClassText(classes[dominant]));
 		for (uint32_t index = 0; index < classes.size(); index++) {
@@ -507,8 +509,10 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
 		probed.push_back(candidate);
 	}
 	if (!FinishIndirectImage(image, probed, true,
-	                         fmt::format("dense table=0x{:x} entries={}", indirect.table_offset,
-	                                     indirect.key_bound),
+	                         [&] {
+		                         return fmt::format("dense table=0x{:x} entries={}", indirect.table_offset,
+		                                            indirect.key_bound);
+	                         },
 	                         next, reason)) {
 		return false;
 	}
@@ -541,27 +545,74 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 	MakeRangeReadable(runtime, material_base + indirect.selector_offset,
 	                  (records - 1u) * indirect.selector_stride + sizeof(uint32_t));
 	KeyOrder keys(records);
-	for (uint64_t item = 0; item < records; item++) {
-		const auto address =
-		    material_base + indirect.selector_offset + item * indirect.selector_stride;
-		uint32_t key = 0;
-		if (address > AddressMask || !ReadSpecializationWord(runtime, address, key)) {
-			return note("record key is not readable");
+	// The keys of a span of records in one clean read (one GPU-ownership check for the span instead of one a key:
+	// 32 records of a light table lie within 5 KiB, read for each of its dispatches), word by word where the span
+	// read is refused (as before: the same keys, in the same order).
+	constexpr uint64_t SpanDwords = 1024; // (ReadShaderMemorySpan's limit for clean reads)
+	thread_local std::vector<uint32_t> span;
+	const uint64_t span_records = runtime.try_read_memory_span != nullptr && indirect.selector_stride % 4u == 0u &&
+	                                      indirect.selector_stride <= (SpanDwords - 1u) * 4u
+	                                  ? (SpanDwords - 1u) * 4u / indirect.selector_stride + 1u
+	                                  : 1u;
+	for (uint64_t item = 0; item < records;) {
+		const auto first = material_base + indirect.selector_offset + item * indirect.selector_stride;
+		const auto count = std::min<uint64_t>(records - item, span_records);
+		const auto words = ((count - 1u) * indirect.selector_stride) / 4u + 1u;
+		if (count > 1u && first <= AddressMask - (words - 1u) * 4u) {
+			span.resize(words);
+			if (runtime.try_read_memory_span(runtime.userdata, first, span.data(), static_cast<uint32_t>(words), true)) {
+				for (uint64_t i = 0; i < count; i++) keys.Add(span[i * indirect.selector_stride / 4u]);
+				item += count;
+				continue;
+			}
 		}
-		keys.Add(key);
+		for (const auto end = item + count; item < end; item++) {
+			const auto address = material_base + indirect.selector_offset + item * indirect.selector_stride;
+			uint32_t   key     = 0;
+			if (address > AddressMask || !ReadSpecializationWord(runtime, address, key)) {
+				return note("record key is not readable");
+			}
+			keys.Add(key);
+		}
 	}
 
 	IndirectImage next;
 	next.keys = keys.Take();
 	std::vector<DescriptorValue> probed;
 	probed.reserve(next.keys.size());
+	// The T#s of the keys below a bound from one clean read of the table's start (a light table's keys are light
+	// indices: its ~30 T# reads, each with its own GPU-ownership checks, became one), the others one at a time, as all
+	// of them where that read is refused (a T# the GPU wrote is synchronized first, as before).
+	constexpr uint32_t SpanKeys = 128; // (4 KiB of T#s: ReadShaderMemorySpan's limit for clean reads)
+	uint32_t           span_keys = 0;
+	for (const auto key: next.keys)
+		if (key < SpanKeys) span_keys = std::max(span_keys, key + 1u);
+	thread_local std::vector<uint32_t> table_span;
+	bool                               spanned = false;
+	if (runtime.try_read_memory_span != nullptr && span_keys > 1u) {
+		const auto first = heap_base + indirect.table_offset;
+		const auto words = span_keys << (DenseDescriptorShift - 2u);
+		if (first <= AddressMask - uint64_t {words} * sizeof(uint32_t)) {
+			table_span.resize(words);
+			spanned = runtime.try_read_memory_span(runtime.userdata, first, table_span.data(), words, true);
+		}
+	}
+	// A stale record's key (records past the light count hold anything: half of a light table's keys, 0xfffffffe and
+	// pointers) names an entry past the mapping the table starts in: not the table's, a null candidate without a read
+	// (each was a clean read attempt of memory far away, ~0.4 us).
+	const auto table_end = runtime.mapping_end != nullptr
+	                           ? runtime.mapping_end(runtime.userdata, heap_base + indirect.table_offset)
+	                           : AddressMask + 1u;
 	for (const auto key: next.keys) {
 		DescriptorValue candidate;
 		candidate.dword_count = 8u;
 		const auto entry      = heap_base + indirect.table_offset +
 		                   (static_cast<uint64_t>(key) << DenseDescriptorShift);
-		bool readable = entry + candidate.dword_count * sizeof(uint32_t) <= AddressMask;
-		if (readable) {
+		bool readable = entry + candidate.dword_count * sizeof(uint32_t) <= std::min(AddressMask, table_end);
+		if (readable && spanned && key < span_keys) {
+			std::copy_n(table_span.begin() + (static_cast<size_t>(key) << (DenseDescriptorShift - 2u)),
+			            candidate.dword_count, candidate.dwords.begin());
+		} else if (readable) {
 			MakeRangeReadable(runtime, entry, candidate.dword_count * sizeof(uint32_t));
 			readable = ReadSpecializationDescriptor(runtime, entry, candidate.dwords);
 		}
@@ -572,9 +623,11 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 		probed.push_back(candidate);
 	}
 	if (!FinishIndirectImage(image, probed, true,
-	                         fmt::format("address probe records={} stride={} table=0x{:x} keys={}",
-	                                     indirect.item_bound, indirect.selector_stride,
-	                                     indirect.table_offset, next.keys.size()),
+	                         [&] {
+		                         return fmt::format("address probe records={} stride={} table=0x{:x} keys={}",
+		                                            indirect.item_bound, indirect.selector_stride,
+		                                            indirect.table_offset, next.keys.size());
+	                         },
 	                         next, reason)) {
 		return false;
 	}
@@ -658,9 +711,10 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		probed.push_back(candidate);
 	}
 	if (!FinishIndirectImage(image, probed, step < indirect.selector_stride,
-	                         fmt::format("stride={} step={} probes={} keys={}",
-	                                     indirect.selector_stride, step, probe_count,
-	                                     next.keys.size()),
+	                         [&] {
+		                         return fmt::format("stride={} step={} probes={} keys={}", indirect.selector_stride,
+		                                            step, probe_count, next.keys.size());
+	                         },
 	                         next, reason)) {
 		return false;
 	}
@@ -814,6 +868,50 @@ struct ImageRemap {
 
 template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan);
+
+bool EnumerateAddressProbe(const DescriptorSource::IndirectImage& probe, const ImageResource& root,
+                           uint64_t records_base, uint64_t heap_base, const SrtRuntime& runtime,
+                           AddressProbeCandidates& result) {
+	DescriptorValue records {.dword_count = 2u}, heap {.dword_count = 2u};
+	records.dwords[0] = static_cast<uint32_t>(records_base);
+	records.dwords[1] = static_cast<uint32_t>(records_base >> 32u);
+	heap.dwords[0]    = static_cast<uint32_t>(heap_base);
+	heap.dwords[1]    = static_cast<uint32_t>(heap_base >> 32u);
+	IndirectImage enumerated;
+	if (!MaterializeAddressProbeIndirectImage(probe, root, records, heap, runtime, enumerated, nullptr)) return false;
+	result.keys        = std::move(enumerated.keys);
+	result.candidates  = std::move(enumerated.candidates);
+	result.descriptors = std::move(enumerated.descriptors);
+	return true;
+}
+
+bool TableIndirectForm(ResourceSpecialization& specialization, std::vector<DescriptorValue>* snapshot_images) {
+	auto&    images = specialization.images;
+	uint32_t root = ImageResource::NoIndirectImage, candidates = 0;
+	for (uint32_t index = 0; index < images.size(); index++) {
+		if (images[index].fmask) return false;
+		if (images[index].indirect_root == index) {
+			if (root != ImageResource::NoIndirectImage) return false;
+			root = index;
+		} else if (images[index].indirect_root != ImageResource::NoIndirectImage) {
+			candidates++;
+		}
+	}
+	if (root == ImageResource::NoIndirectImage) return true;
+	constexpr uint32_t capacity = TablePlan::IndirectCapacity;
+	// (The candidates follow every other image: BuildResourceSpecialization appends them.)
+	if (candidates == 0 || candidates + 1u > capacity || images.size() < candidates + 1u ||
+	    (snapshot_images != nullptr && snapshot_images->size() != images.size()))
+		return false;
+	for (size_t index = images.size() - candidates; index < images.size(); index++)
+		if (images[index].indirect_root != root) return false;
+	const auto candidate = images.back();
+	images.resize(images.size() + (capacity - 1u - candidates), candidate);
+	images[root].indirect_mapping_offset    = 0; // (EnterTableMode names the block's mapping)
+	images[root].indirect_search_iterations = ImageResource::RuntimeIndirectSearch;
+	if (snapshot_images != nullptr) snapshot_images->resize(images.size(), DescriptorValue {.dword_count = 8u});
+	return true;
+}
 
 bool PortableShaders() {
 	static const bool enabled = [] {

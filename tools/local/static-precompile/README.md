@@ -6,8 +6,13 @@ shader / pipeline in the game no longer stalls for 1–3 seconds.
 
 ## Flow
 
-1. `precompile.py seeds OUT`: static collection into a seed file (`KytyShaderSeeds2`, the warmup
-   cache's format).
+1. `kyty_shader_precompile --game <dir> --make-seeds OUT` (`src/local/static-seeds.cpp`): static
+   collection into a seed file (`KytyShaderSeeds2`, the warmup cache's format), without Python. It is
+   the C++ port of `precompile.py seeds OUT` and writes the same file byte for byte (`--stages` and
+   `--limit` as there); the Python tools (Python 3 with numpy) stay the reference and do the analyses
+   below. `pass-states.json` is read from `tools/local/static-precompile` below the program's folder (a
+   release package), two folders above it (`_Build/<build>/`) or below the working directory;
+   `--states <file>` names another.
    - Shaders: every CSDR package (`_trinity` is the PS5 Pro variant, skipped) plus the AGC headers and
      code embedded in eboot.bin's data segment.
    - Compile keys: derived from the AGC headers' register tables (`keys.py`, ported from

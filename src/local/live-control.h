@@ -102,12 +102,22 @@ inline void Flip() {
 		static int64_t                                   last_idle = 0;
 		static std::array<int64_t, LiveCensus::Waits>    last_waits {};
 		static std::array<uint64_t, counted.size()>      last_counts {};
+		// The render thread's run time (TSC ticks) and a TSC rate from the first flip on: busy wall time
+		// (the frame less idle) well over cpu is time the thread was ready but not running (preempted).
+		static const uint64_t                            first_tsc  = __rdtsc();
+		static const auto                                first_time = std::chrono::steady_clock::now();
+		static uint64_t                                  last_cycles = 0;
+		const uint64_t                                   cycles      = LocalPlatform::CurrentThreadCycles();
 		const auto                                       now = std::chrono::steady_clock::now();
 		const uint64_t                                   tsc = __rdtsc();
 		const double ms = std::chrono::duration<double, std::milli>(now - last).count();
 		if (last != std::chrono::steady_clock::time_point {} && ms >= std::max(20.0, SlowLog::HitchThreshold())) {
 			std::printf("[tsc %llu] SLOW Frame %.1f ms idle=%.1f", static_cast<unsigned long long>(tsc), ms,
 			            static_cast<double>(g_render_idle_ns - last_idle) / 1e6);
+			if (const double since = std::chrono::duration<double, std::milli>(now - first_time).count();
+			    cycles != 0 && last_cycles != 0 && since > 1000.0)
+				std::printf(" cpu=%.1f", static_cast<double>(cycles - last_cycles) * since /
+				                             static_cast<double>(__rdtsc() - first_tsc));
 			// The render thread's time by call kind (ms), from the frame's own TSC rate.
 			const double ms_per_cycle = tsc > last_tsc ? ms / static_cast<double>(tsc - last_tsc) : 0.0;
 			for (size_t i = 0; i < LiveCensus::Kinds; ++i) {
@@ -148,6 +158,7 @@ inline void Flip() {
 			last_draw_phases[i]     = LiveCensus::g_draw_phase_cycles[i];
 		}
 		for (size_t i = 0; i < 4; ++i) last_xpr[i] = LiveCensus::g_xpr_cycles[i];
+		last_cycles = cycles;
 		for (size_t i = 0; i < LiveCensus::Waits; ++i) last_waits[i] = LiveCensus::g_waits_ns[i];
 		for (size_t i = 0; i < counted.size(); ++i) last_counts[i] = LiveCounters::Value(counted[i]);
 	}
@@ -531,6 +542,14 @@ inline void Run(uint64_t id, const std::string& line) {
 		// vma <path>: the GPU allocator's detailed statistics (JSON: every allocation's type and size).
 		if (LiveCounters::g_vma_report != nullptr) LiveCounters::g_vma_report(arg1);
 		std::printf("LIVE_VMA id=%" PRIu64 " path=%s written=%d\n", id, arg1, LiveCounters::g_vma_report != nullptr ? 1 : 0);
+	} else if (cmd == "images" && n >= 2) {
+		// images <path>: the texture cache's images, one tab-separated row each (what the video memory holds).
+		if (LiveCounters::g_image_report != nullptr) LiveCounters::g_image_report(arg1);
+		std::printf("LIVE_IMAGES id=%" PRIu64 " path=%s written=%d\n", id, arg1, LiveCounters::g_image_report != nullptr ? 1 : 0);
+	} else if (cmd == "sync") {
+		// sync: GPU timelines, deferred submissions and pending guest readbacks (a stalled GPU thread).
+		if (LiveCounters::g_sync_report != nullptr) LiveCounters::g_sync_report();
+		std::printf("LIVE_SYNC id=%" PRIu64 "\n", id);
 	} else if (cmd == "warp" && n >= 2) {
 		// warp <map> <spawn> | warp off: the debug warp (loader/demonsSoulsWarp.h).
 		const bool off = std::string_view(arg1) == "off";

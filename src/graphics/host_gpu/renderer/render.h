@@ -145,6 +145,13 @@ public:
 	// the run writes, or writes what one reads or writes, starts a new run.
 	[[nodiscard]] vk::CommandBuffer CopyRunHandle(vk::Buffer source, uint64_t source_offset, vk::Buffer destination,
 	                                              uint64_t destination_offset, uint64_t size) const;
+	// A run is open: everything recorded since its barrier is its copies (any other command flushes it first).
+	[[nodiscard]] bool InCopyRun() const noexcept { return !m_copy_run.empty(); }
+	// A copy of what the open run wrote (a copy-feedback snapshot, BufferCache::ScheduleCopyFeedback): recorded when the
+	// run ends, after its copies, behind one transfer barrier, then made available to the host. A copy of the run that
+	// writes its source range starts a new run, which records it first.
+	void CopyAfterRun(vk::Buffer source, uint64_t source_offset, vk::Buffer destination, uint64_t destination_offset,
+	                  uint64_t size) const;
 	// Local diagnostic (GPU marks): the handle without draining a pending dependency.
 	[[nodiscard]] vk::CommandBuffer RawHandle() const noexcept { return m_buffer; }
 	// The recorded work count after this buffer's last global barrier (CommandProcessor::EmitGlobalBarrier).
@@ -167,17 +174,23 @@ private:
 	void Begin();
 	void End() const;
 	void FlushCopyRun() const;
+	void FlushRunTail() const;
 
 	struct CopyRunRange {
 		VkBuffer buffer;
 		uint64_t begin, end;
 		bool     written;
 	};
+	struct RunTailCopy {
+		VkBuffer source, destination;
+		uint64_t source_offset, destination_offset, size;
+	};
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
 	mutable bool        m_compute_access_pending = false;
 	mutable std::vector<CopyRunRange> m_copy_run; // a run's ranges (not empty: its after barrier is owed)
+	mutable std::vector<RunTailCopy>  m_run_tail; // CopyAfterRun's copies, owed with the run's end
 	mutable uint64_t    m_graphics_generation    = 0;
 	vk::CommandBuffer   m_buffer          = nullptr;
 	uint32_t            m_timestamp_slot  = UINT32_MAX; // live trace GPU timestamps
@@ -331,6 +344,9 @@ private:
 	                                        std::span<const std::pair<uint32_t, uint32_t>> images,
 	                                        std::span<const std::pair<uint32_t, uint32_t>> buffers);
 	void NativeXprCollect();
+	// A draw state's dynamic state, only what differs from what the emissions recorded in the command buffer.
+	static void NativeXprEmitDynamic(NativeXprCache& cache, vk::CommandBuffer vk_buffer, const NativeXprDrawState& draw_state,
+	                                 bool same_command);
 	void NativeXprLearn(const NativeXprRecord& stale, NativeXprRecord& fresh);
 	void NativeXprStore(CommandBuffer& buffer, const DrawRenderState& state,
 	                    vk::PrimitiveTopology topology, bool primitive_restart_enable,

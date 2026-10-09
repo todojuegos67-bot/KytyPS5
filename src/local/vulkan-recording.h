@@ -44,6 +44,9 @@ bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, boo
 void NoteDeferredSubmitQueued();
 void NoteDeferredSubmitDone();
 void WaitDeferredSubmits();
+// Deferred submissions queued and handed to the driver so far (diagnostics).
+uint64_t DeferredSubmitsQueued();
+uint64_t DeferredSubmitsDone();
 uint64_t StateEpoch();
 // Commands the calling thread recorded that do GPU work or synchronize (draws, dispatches,
 // copies, clears, rendering scopes, barriers): unchanged between two barriers = no work in between.

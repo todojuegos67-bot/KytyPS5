@@ -174,6 +174,12 @@ public:
 		return value;
 	}
 
+	// The copy engine timeline's value now (diagnostics).
+	[[nodiscard]] uint64_t Counter() const {
+		uint64_t counter = 0;
+		(void)d.vkGetSemaphoreCounterValue(m_device, m_semaphore, &counter);
+		return counter;
+	}
 	// GPU thread: the value of the last copy handed to this queue.
 	[[nodiscard]] uint64_t Submitted() const { return m_submitted; }
 	// Any thread.

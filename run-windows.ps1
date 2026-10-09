@@ -370,24 +370,16 @@ $tool = Join-Path (Split-Path $Exe) 'kyty_shader_precompile.exe'
 # The seed file of this game version (Rename-TitleCaches).
 $seedName = if ($param -and $titleId -and $param.contentVersion) { "seeds-$($titleId)_$($param.contentVersion).seeds" } else { 'seeds.seeds' }
 $seeds = @("$PSScriptRoot\$seedName", "$PSScriptRoot\_Build\static-precompile\$seedName") | Where-Object { Test-Path $_ } | Select-Object -First 1
-# No seed file yet (a release has none: it holds the game's shader code): made from the game's files once, as
-# precompile-windows.ps1 makes it (Python 3 with numpy; 16 s on 22 CPUs).
-$generator = "$PSScriptRoot\tools\local\static-precompile\precompile.py"
-if (!$seeds -and !$Precompile -and (Test-Path $tool) -and (Test-Path $generator)) {
-	# (No cmd.exe here: a DLL some overlays inject keeps it from starting, 0xc0000142.)
-	$hasNumpy = $false
-	if (Get-Command python -ErrorAction SilentlyContinue) {
-		try { $null = & python -c 'import numpy' 2>$null; $hasNumpy = $LASTEXITCODE -eq 0 } catch { $hasNumpy = $false }
-	}
-	if ($hasNumpy) {
-		$made = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\static-precompile\$seedName" } else { "$PSScriptRoot\$seedName" }
-		New-Item -ItemType Directory -Force (Split-Path $made) | Out-Null
-		Write-Host "shaders:  listing the game's shaders from its files (once)"
-		python $generator --game $Game seeds $made | Out-Null
-		if ($LASTEXITCODE -eq 0 -and (Test-Path $made)) { $seeds = $made } else { Write-Host 'shaders:  listing failed: the game compiles its shaders when they first appear' }
-	} else {
-		Write-Host 'shaders:  no Python 3 with numpy (winget install Python.Python.3.12, then pip install numpy): the game compiles its shaders when they first appear'
-	}
+# No seed file yet (a release has none: it holds the game's shader code): made from the game's files once by the
+# precompile program, as precompile-windows.ps1 makes it (--make-seeds, with the render-pass states of
+# pass-states.json; precompile.py seeds without Python).
+$passStates = "$PSScriptRoot\tools\local\static-precompile\pass-states.json"
+if (!$seeds -and !$Precompile -and (Test-Path $tool) -and (Test-Path $passStates)) {
+	$made = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\static-precompile\$seedName" } else { "$PSScriptRoot\$seedName" }
+	New-Item -ItemType Directory -Force (Split-Path $made) | Out-Null
+	Write-Host "shaders:  listing the game's shaders from its files (once)"
+	& $tool --game $Game --make-seeds $made --states $passStates | Out-Null
+	if ($LASTEXITCODE -eq 0 -and (Test-Path $made)) { $seeds = $made } else { Write-Host 'shaders:  listing failed: the game compiles its shaders when they first appear' }
 }
 $shaders = !$Precompile -and $seeds -and (Test-Path $tool)
 # The precompile program on the launch's CPUs, its output in the console or a file: its exit code.
@@ -445,7 +437,9 @@ if ($Prompt -and ($offer -or !$tested)) {
 }
 # Memory: Windows ends a program that asks for more than RAM and the page file can hold. The emulator
 # commits about 34 GB (the game's 13.5 GiB of PS5 memory, about 11 GB Windows sets aside to back the
-# video memory in use, the emulator's own) and keeps about 20 GB in RAM.
+# video memory in use, the emulator's own) and takes about 20 GB of RAM while a save loads, but uses
+# only about 4 GB of it in play (10-09: emptied after loading, the working set grew back to 3.5 GB in
+# a minute of play at 60 fps): with 16 GB Windows pages the rest out and loading is slower.
 $os = Get-CimInstance Win32_OperatingSystem
 [double]$ram = $os.TotalVisibleMemorySize * 1KB
 [double]$commit = $os.FreeVirtualMemory * 1KB
@@ -458,7 +452,8 @@ if ((Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile) {
 }
 $memory = @()
 if ($ram -lt 24GB) {
-	$memory += "This PC has {0:N0} GB of RAM and the emulator keeps about 20 GB in use (32 GB recommended): expect long stutters." -f ($ram / 1GB)
+	$memory += ("This PC has {0:N0} GB of RAM: the game runs, but loading takes longer (the emulator takes about 20 GB " +
+		"while a save loads and uses about 4 GB in play; 32 GB recommended).") -f ($ram / 1GB)
 }
 if ($commit -lt 34GB) {
 	$memory += ("Windows can give programs only {0:N0} GB more memory (RAM plus page file) and the emulator needs about 34 GB: " +

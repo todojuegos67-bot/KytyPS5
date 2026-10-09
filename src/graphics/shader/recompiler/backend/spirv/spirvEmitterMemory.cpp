@@ -40,8 +40,10 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	const uint32_t stride  = packed & 0x3fffu;
 	const bool     swizzle = stride != 0u && ((packed >> 14u) & 1u) != 0u;
 	if (((packed >> 20u) & 1u) != 0u) {
-		const auto lane = Binary(state, OpBitwiseAnd, TypeU32(state),
-		                         EmitSubgroupLocalInvocationId(state), ConstantU32(state, 63));
+		// (ADD_TID: the GCN lane. A lane-local wave64 program's subgroup is half a wave: its index in the group.)
+		const auto id   = state.lane_count == 1 && state.program.lane_local ? EmitLocalInvocationIndex(state)
+		                                                                    : EmitSubgroupLocalInvocationId(state);
+		const auto lane = Binary(state, OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 63));
 		index           = Binary(state, OpIAdd, TypeU32(state), index, lane);
 	}
 	if (mem.offset != 0u) {
@@ -1466,6 +1468,18 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction({OpFunctionEnd});
 }
 
+uint32_t EmitTableBlockLoad(EmitterState& state, uint32_t index) {
+	const auto address = TypeDeviceAddress(state);
+	const auto offset  = Binary(state, OpShiftLeftLogical, address, Unary(state, OpUConvert, address, index),
+	                            ConstantU32(state, 2u));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction({OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+	                           Binary(state, OpIAdd, address, state.table_block, offset)});
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer, MemoryAccessAlignedMask, sizeof(uint32_t)});
+	return value;
+}
+
 // Table mode, at the function's entry: the slots the shader reads (IR::TablePlan::gpu) from its block (the block's
 // device address is two dwords of shader data, IR::BindingLayout::TableBlockDword), and each buffer's device
 // address, size in dwords, buffer word and stride (the renderer resolved the V#).
@@ -1477,6 +1491,7 @@ void EmitTableMode(ValueEmitContext& ctx) {
 	const auto  address = TypeDeviceAddress(state);
 	const auto  block   = DeviceAddressFromWords(state, EmitShaderDataDwordLoad(state, program.bindings.TableBlockDword()),
 	                                             EmitShaderDataDwordLoad(state, program.bindings.TableBlockDword() + 1));
+	state.table_block   = block;
 	const auto  load    = [&](uint32_t dword) {
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction({OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,

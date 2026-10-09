@@ -20,7 +20,6 @@
 #include "native-resource-state.h"
 
 #include <algorithm>
-#include <chrono>
 #include <array>
 #include <bit>
 #include <cinttypes>
@@ -54,31 +53,17 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 // KYTY_PARTIAL_IMAGE_DIRTY: a game streaming textures into a large array writes one layer at a
 // time. The whole-image path stopped watching all of the image's pages on the first write and
 // then re-watched, copied, detiled and uploaded all of it (a 352 MiB array: 20-70 ms on the
-// render thread, several times a second while walking into a new area). Images at least this
-// large keep watching everything but the written granules and upload only the subresources
-// over them.
+// render thread, several times a second while walking into a new area). Such images keep
+// watching everything but the written granules and upload only the subresources over them.
+// (Size from which the diagnostic logs report images.)
 constexpr uint64_t PartialDirtyMinSize = uint64_t {16} << 20;
-
-// Why TryInvalidatePartial refuses an image (run-log diagnostics of the large streaming arrays).
-static const char* PartialRefusal(const Image& image, bool candidate) {
-	const auto& info = image.info;
-	if (!candidate) return "not-candidate";
-	if (!image.registered) return "unregistered";
-	if (!image.IsTracked()) return "untracked";
-	if (image.track_addr != info.data.address || image.track_addr_end != info.data.End()) return "partly-tracked";
-	if (!image.CanTakePartialDirty()) return image.IsMaybeCpuDirty() ? "maybe-dirty" : "whole-dirty";
-	if (image.IsBufferModified()) return "buffer-modified";
-	if (image.IsStencilModified()) return "stencil-modified";
-	return "ok";
-}
-
-// Large-image lifecycle in the run log (a few lines a second at most): what deletes the 320 MiB arrays.
-static constexpr uint64_t LargeImageLogSize = 128ull << 20;
-static thread_local const char* g_delete_why = "?";
-
 // A write fault releases the image's granule around it (granules start at the image start):
 // a streamed layer faults a few times instead of once per 4 KiB page.
 constexpr uint64_t PartialDirtyGranule = uint64_t {1} << 20;
+// Every image of two granules or more takes partial writes: below that one granule is the whole image. Mip-streamed
+// textures (5-11 MiB BC: the game writes the levels while draws already sample it) uploaded all of it at each use
+// between the writes (2-10 times in a few ms when entering an area).
+constexpr uint64_t PartialDirtyCandidateSize = 2 * PartialDirtyGranule;
 // A refresh whose subresources cover more than this share of the image uploads all of it.
 constexpr uint64_t PartialUploadMaxShare = 2;
 // Staged runs of picked subresources closer than this are staged as one run.
@@ -218,6 +203,42 @@ void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view
 
 } // namespace
 
+namespace {
+constexpr uint32_t ImageGranuleBits  = 16;
+constexpr uint64_t ImageGranuleSpace = uint64_t {1} << 40; // the image page table's address space
+} // namespace
+
+static TextureCache* g_report_cache = nullptr;
+
+void TextureCache::WriteReport(const char* path) {
+	FILE* file = std::fopen(path, "wb");
+	if (file == nullptr) return;
+	std::fputs("id\taddress\tguest_size\tbytes\tformat\tguest_format\ttype\twidth\theight\tdepth\tlevels\tlayers\tsamples\ttile\tusage\tregistered\tgpu_modified\tlru_tick\tgc_tick\tmemory_type\n", file);
+	std::scoped_lock lock {m_lock};
+	m_slot_images.ForEach([&](ImageId id, Image& image) {
+		VmaAllocationInfo allocation {};
+		if (image.backing.allocation != nullptr) vmaGetAllocationInfo(m_graphics.allocator, image.backing.allocation, &allocation);
+		const auto& usage = image.usage;
+		char        kinds[8] {};
+		size_t      k = 0;
+		if (usage.texture) kinds[k++] = 't';
+		if (usage.storage) kinds[k++] = 's';
+		if (usage.render_target) kinds[k++] = 'r';
+		if (usage.depth_target) kinds[k++] = 'd';
+		if (usage.video_out) kinds[k++] = 'v';
+		if (k == 0) kinds[k++] = '-';
+		std::fprintf(file, "%u\t0x%" PRIx64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%s\t%d\t%d\t%" PRIu64 "\t%" PRIu64 "\t%d\n",
+		             id.index, image.info.data.address, image.info.data.size, static_cast<uint64_t>(allocation.size),
+		             vk::to_string(image.backing.format).c_str(), static_cast<uint32_t>(image.info.guest_format),
+		             static_cast<uint32_t>(image.info.type), image.info.extent.width, image.info.extent.height,
+		             image.info.extent.depth, image.info.resources.levels, image.info.resources.layers, image.info.samples,
+		             static_cast<uint32_t>(image.info.tile_mode), kinds, image.registered ? 1 : 0, image.IsGpuModified() ? 1 : 0,
+		             image.registered ? m_lru_cache.TickOf(image.lru_id) : uint64_t {0}, m_gc_tick,
+		             image.backing.allocation != nullptr ? static_cast<int>(allocation.memoryType) : -1);
+	});
+	std::fclose(file);
+}
+
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
@@ -225,29 +246,19 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
-	if (m_graphics.CanReportMemoryUsage()) {
-		UpdateGcThresholds();
-	}
-}
-
-// The collection thresholds from the GPU's current memory budget. The budget Windows gives a process
-// shrinks while other programs (a browser, an overlay, a recorder) take video memory: thresholds fixed
-// at start-up then let the caches fill past it, and allocations spilled to system memory (16 GB GPUs
-// reached 15 GB of a 14.8 GB budget). Re-read at each collection.
-void TextureCache::UpdateGcThresholds() {
-	constexpr int64_t GiB = 1024ll * 1024 * 1024;
-	const auto        budget =
-	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-	const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-	m_pressure_gc_memory = static_cast<uint64_t>(
-	    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-	m_critical_gc_memory = static_cast<uint64_t>(
-	    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-	m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
-	m_over_budget_memory = static_cast<uint64_t>(std::max<int64_t>(budget, 0));
+	m_image_granules.assign((ImageGranuleSpace >> ImageGranuleBits) / 64, 0);
+	g_report_cache               = this;
+	LiveCounters::g_image_report = [](const char* path) {
+		if (g_report_cache != nullptr) g_report_cache->WriteReport(path);
+	};
+	// Collection starts where the video memory use reaches the budget less its headroom (GetTotalMemoryBudget):
+	// below it a kept image costs nothing, a deleted one an upload when the game uses it again.
+	m_trigger_gc_memory = m_graphics.GetTotalMemoryBudget();
 }
 
 TextureCache::~TextureCache() {
+	LiveCounters::g_image_report = nullptr;
+	g_report_cache               = nullptr;
 	m_slot_images.ForEach([&](ImageId id, const Image& image) {
 		if (image.registered) {
 			UnregisterImage(id);
@@ -354,6 +365,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	}
 	MarkImageGranules(image.info.data.address, image.info.data.size);
 	if (m_image_starts[image.info.data.address]++ == 0) {
+		if (const auto bucket = StartBucket(image.info.data.address); m_start_buckets[bucket]++ == 0)
+			m_start_bucket_bits[bucket / 64u] |= uint64_t {1} << (bucket % 64u);
 		const auto epoch = m_start_epoch.load(std::memory_order_relaxed) + 1;
 		if (m_start_log.size() >= 8192) m_start_log.erase(m_start_log.begin(), m_start_log.begin() + 4096);
 		m_start_log.emplace_back(epoch, image.info.data.address);
@@ -362,9 +375,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	++image.registrations;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
-	image.lru_tick   = m_gc_tick;
 	m_total_used_memory += image.AccountedSize();
-	m_cache_bytes += image.AccountedSize();
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -390,6 +401,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image missing from start index\n");
 	} else if (--start->second == 0) {
 		m_image_starts.erase(start);
+		if (const auto bucket = StartBucket(image.info.data.address); --m_start_buckets[bucket] == 0)
+			m_start_bucket_bits[bucket / 64u] &= ~(uint64_t {1} << (bucket % 64u));
 	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
@@ -397,7 +410,6 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
 	m_total_used_memory -= accounted;
-	m_cache_bytes -= std::min(m_cache_bytes, accounted);
 	image.registered = false;
 }
 
@@ -406,18 +418,6 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
-	if (image->info.data.size >= LargeImageLogSize) {
-		std::printf("[tsc %llu] Large image deleted (%s) addr=0x%llx size=%llu MiB layers=%u levels=%u fmt=%u gpu=%d "
-		            "cpu_dirty=%d partial=%d tracked=%d holes=%zu unused=%llu\n",
-		            static_cast<unsigned long long>(__rdtsc()), g_delete_why,
-		            static_cast<unsigned long long>(image->info.data.address),
-		            static_cast<unsigned long long>(image->info.data.size >> 20u), image->info.resources.layers,
-		            image->info.resources.levels, static_cast<uint32_t>(image->info.guest_format),
-		            image->IsGpuModified() ? 1 : 0, image->IsDefinitelyCpuDirty() ? 1 : 0,
-		            image->IsPartiallyCpuDirty() ? 1 : 0, image->IsTracked() ? 1 : 0, image->untracked_holes.size(),
-		            static_cast<unsigned long long>(m_gc_tick - std::min(m_gc_tick, image->lru_tick)));
-	}
-	g_delete_why = "?";
 	m_partial_plans.erase(image->serial);
 	if (!image->depth_id) {
 		std::vector<ImageId> associations;
@@ -484,7 +484,6 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
 	}
-	g_delete_why = site;
 	DeleteImage(id);
 }
 
@@ -496,7 +495,6 @@ void TextureCache::TouchImage(Image& image) {
 	}
 	if (image.registered) {
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
-		image.lru_tick = m_gc_tick;
 	}
 }
 
@@ -648,6 +646,29 @@ void TextureCache::RetrackHoles(Image& image) {
 	image.untracked_holes.clear();
 }
 
+void TextureCache::RetrackHoles(Image& image, uint64_t begin, uint64_t end) {
+	if (image.untracked_holes.empty()) {
+		return;
+	}
+	if (!image.IsTracked()) {
+		EXIT("TextureCache: untracked image keeps page holes\n");
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> kept;
+	kept.reserve(image.untracked_holes.size() + 1);
+	for (const auto& [hole_begin, hole_end]: image.untracked_holes) {
+		const auto from = std::max(hole_begin, begin);
+		const auto to   = std::min(hole_end, end);
+		if (from >= to) {
+			kept.emplace_back(hole_begin, hole_end);
+			continue;
+		}
+		m_page_manager.UpdatePageWatchers<true>(from, to - from);
+		if (hole_begin < from) kept.emplace_back(hole_begin, from);
+		if (to < hole_end) kept.emplace_back(to, hole_end);
+	}
+	image.untracked_holes = std::move(kept);
+}
+
 void TextureCache::FinishRefresh(Image& image) {
 	// Watch the released pages again before the image counts as clean.
 	RetrackHoles(image);
@@ -661,19 +682,22 @@ bool TextureCache::PartialDirtyCandidate(const Image& image) {
 	// in a texture tile mode (the game's streamed shadow maps) uploads as a texture too; one
 	// that uploads as a depth target takes the whole-image path at refresh (UploadImagePartial).
 	return kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) != 0 &&
-	       info.data.size >= PartialDirtyMinSize && !image.depth_id &&
+	       info.data.size >= PartialDirtyCandidateSize && !image.depth_id &&
 	       image.backing.image != nullptr && info.samples == 1 && !info.IsVolume() &&
 	       !info.HasStencil() && info.metadata.compression == VideoOutCompression::Uncompressed;
 }
 
+// An image the GPU wrote stays GPU-owned outside the invalidated span: its other bytes are the GPU's, the span is
+// uploaded from guest memory at the next use (RefreshImage -> InitializeImage takes the partial path; a depth array
+// uploads whole layers, UploadDepthPartial; a target binding refreshes it before the GPU writes again), as on the
+// console, where a CPU write or a remap replaces only those bytes. A whole-image invalidation uploaded everything from
+// memory, which does not hold what the GPU rendered. The game's shadow-map pool (an 80-layer depth array, 320 MiB) lends
+// its free layers to the texture streamer, which remaps one layer at a time and tiles textures into it from the CPU
+// while shadows render into others: the whole array went to the GPU again every few seconds (100-270 ms frames) and the
+// rendered layers were lost.
 bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
                                         uint64_t granule) {
 	const auto& info = image.info;
-	// A GPU-modified image takes a partial write too: the written (or unmapped) span is refreshed from
-	// guest memory at its next use and the GPU's contents elsewhere stay. The game's 320 MiB streaming
-	// arrays are written by the GPU; unmapping one layer of them used to delete the image (its GPU
-	// contents discarded) and re-upload all 320 MiB from guest memory at the next draw: 30-60 ms a
-	// stream event, most of a Boletaria run's stalls.
 	if (!PartialDirtyCandidate(image) || !image.registered || !image.IsTracked() ||
 	    image.track_addr != info.data.address || image.track_addr_end != info.data.End() ||
 	    !image.CanTakePartialDirty() || image.IsBufferModified() || image.IsStencilModified()) {
@@ -747,11 +771,6 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	}
 }
 
-namespace {
-constexpr uint32_t ImageGranuleBits  = 16;
-constexpr uint64_t ImageGranuleSpace = uint64_t {1} << 40; // the image page table's address space
-} // namespace
-
 void TextureCache::MarkImageGranules(uint64_t address, uint64_t size) const {
 	if (size == 0 || address >= ImageGranuleSpace) return;
 	if (m_image_granules.empty()) m_image_granules.assign((ImageGranuleSpace >> ImageGranuleBits) / 64, 0);
@@ -760,10 +779,7 @@ void TextureCache::MarkImageGranules(uint64_t address, uint64_t size) const {
 }
 
 bool TextureCache::MayHaveImages(uint64_t address, uint64_t size) const {
-	if (kyty_local_image_granules_mode.load(std::memory_order_relaxed) == 0 || m_image_granules.empty() ||
-	    size == 0 || address >= ImageGranuleSpace || size > ImageGranuleSpace - address)
-		return true;
-	if (m_image_granule_releases > 4096) {
+	if (m_image_granule_releases > 4096 && kyty_local_image_granules_mode.load(std::memory_order_relaxed) != 0) {
 		// Released images leave their bits; rebuild from the registered ones.
 		std::fill(m_image_granules.begin(), m_image_granules.end(), 0);
 		m_slot_images.ForEach([&](ImageId, const Image& image) {
@@ -771,6 +787,13 @@ bool TextureCache::MayHaveImages(uint64_t address, uint64_t size) const {
 		});
 		m_image_granule_releases = 0;
 	}
+	return MayHaveImagesRead(address, size);
+}
+
+bool TextureCache::MayHaveImagesRead(uint64_t address, uint64_t size) const {
+	if (kyty_local_image_granules_mode.load(std::memory_order_relaxed) == 0 || m_image_granule_releases > 4096 ||
+	    size == 0 || address >= ImageGranuleSpace || size > ImageGranuleSpace - address)
+		return true;
 	const uint64_t last = (address + size - 1) >> ImageGranuleBits;
 	for (uint64_t g = address >> ImageGranuleBits; g <= last;) {
 		const uint64_t bit  = g & 63;
@@ -1542,9 +1565,49 @@ void TextureCache::UploadStencil(Image& image, Buffer& source, uint64_t source_o
 
 // Local diagnostic: why the latest UploadImagePartial fell back to a whole upload (SLOW log).
 static thread_local const char* g_partial_fail = "";
+
+// KYTY_UPLOAD_LOG: a partial refresh's staged bytes (UPLOAD lines are the whole ones).
+static void LogPartialUpload(const Image& image, size_t pieces, uint64_t bytes) {
+	static const bool log_uploads = std::getenv("KYTY_UPLOAD_LOG") != nullptr;
+	if (!log_uploads) return;
+	std::printf("[tsc %llu] UPLOAD-PART addr=0x%llx size=0x%llx layers=%u levels=%u pieces=%zu bytes=0x%llx serial=%llu\n",
+	            static_cast<unsigned long long>(__rdtsc()), static_cast<unsigned long long>(image.info.data.address),
+	            static_cast<unsigned long long>(image.info.data.size), image.info.resources.layers,
+	            image.info.resources.levels, pieces, static_cast<unsigned long long>(bytes),
+	            static_cast<unsigned long long>(image.serial));
+}
 static bool PartialFail(const char* why) {
 	g_partial_fail = why;
 	return false;
+}
+
+// A texture the game writes while draws sample it (mip streaming: its threads write the levels while the frame is
+// translated) was dirty again at each draw, and each uploaded all of it: 6-14 times in a millisecond for one 2.75 MiB
+// texture, 1.5 GB of the 2.85 GB uploaded in a 10 s walk. While the command buffer that recorded its last whole upload
+// is open, those copies have not run: the upload worker copies the guest bytes again into the same staging, and
+// that upload carries them. Images only sampled (the GPU never writes them): draws recorded since its upload read
+// the bytes written up to the submission, as the console's GPU, a frame behind, reads them when it runs the draws.
+// KYTY_UPLOAD_LOG: why the last RefillUpload did not refill.
+static thread_local const char* g_refill_refusal = "";
+
+bool TextureCache::RefillUpload(Image& image) {
+	const auto refuse = [](const char* why) {
+		g_refill_refusal = why;
+		return false;
+	};
+	if (image.staged_ring == nullptr) return refuse("none");
+	if (image.staged_serial != m_scheduler.CommandSerial() || m_scheduler.CurrentTick() >= CommandScheduler::PendingTick ||
+	    m_scheduler.Current().IsInvalid())
+		return refuse("submitted");
+	if (image.IsBufferModified() || image.IsGpuModified() || image.usage.storage || image.usage.render_target ||
+	    image.usage.depth_target || image.binding.is_target || UploadBinding(image) == BindingType::DepthTarget)
+		return refuse("written");
+	if (!m_buffer_cache.RefillImageStaging(*image.staged_ring, image.staged_offset, image.info.data.address,
+	                                       image.info.data.size))
+		return refuse("source");
+	LiveCounters::Add(LiveCounters::ImageRefills);
+	LiveCounters::Add(LiveCounters::ImageRefillBytes, image.info.data.size);
+	return true;
 }
 
 void TextureCache::InitializeImage(ImageId id) {
@@ -1584,40 +1647,36 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		bool uploaded = false;
-		if (image.IsPartiallyCpuDirty() && !image.IsBufferModified()) {
+		// A refill first: no GPU work at all, where a partial upload records some (and would end the refills: its
+		// copies come after the whole upload's, which a refill would then overwrite with older bytes).
+		bool uploaded = RefillUpload(image);
+		if (uploaded && kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2 &&
+		    PartialDirtyCandidate(image)) {
+			UpdatePartialHashes(image, true);
+		}
+		if (!uploaded && image.IsPartiallyCpuDirty() && !image.IsBufferModified()) {
 			g_partial_fail = "";
 			uploaded = UploadImagePartial(image);
 			if (!uploaded) {
 				LiveCounters::Add(LiveCounters::PartialFallbacks);
+			} else {
+				image.staged_ring = nullptr;
 			}
 		}
 		if (!uploaded) {
+			bool refillable = false;
 			const auto [source, source_offset] =
-			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size, &refillable);
 			marks[2] = Clock::now();
 			if (source == nullptr) {
 				EXIT("TextureCache: failed to obtain image upload source\n");
 			}
 			LiveCounters::Add(LiveCounters::FullUploads);
 			LiveCounters::Add(LiveCounters::FullUploadBytes, image.info.data.size);
-			// A whole upload of a large image (the game's 320 MiB streaming arrays): why it was not partial, in the
-			// run log (a few a second at most; the stalls of a Boletaria run were 320 MiB uploads a frame).
-			if (image.info.data.size >= (128ull << 20)) {
-				std::printf("[tsc %llu] Full upload %llu MiB addr=0x%llx kind=%s partial_fail=%s tracked=%d candidate=%d partial_ok=%d "
-				            "gpu_modified=%d levels=%u layers=%u fmt=%u\n",
-				            static_cast<unsigned long long>(__rdtsc()),
-				            static_cast<unsigned long long>(image.info.data.size >> 20u),
-				            static_cast<unsigned long long>(image.info.data.address), kind,
-				            *g_partial_fail != '\0' ? g_partial_fail : "(not tried)", image.IsTracked() ? 1 : 0,
-				            PartialDirtyCandidate(image) ? 1 : 0, image.CanTakePartialDirty() ? 1 : 0,
-				            image.IsGpuModified() ? 1 : 0, image.info.resources.levels, image.info.resources.layers,
-				            static_cast<uint32_t>(image.info.guest_format));
-			}
 			static const bool log_uploads = std::getenv("KYTY_UPLOAD_LOG") != nullptr;
 			if (log_uploads) {
 				std::printf("[tsc %llu] UPLOAD %s addr=0x%llx size=0x%llx fmt=%u %ux%u layers=%u levels=%u tile=%u "
-				            "target=%d usage=%d%d%d%d gpu=%d serial=%llu\n",
+				            "target=%d usage=%d%d%d%d gpu=%d serial=%llu partial_fail=%s refill=%s\n",
 				            static_cast<unsigned long long>(__rdtsc()), kind,
 				            static_cast<unsigned long long>(image.info.data.address),
 				            static_cast<unsigned long long>(image.info.data.size),
@@ -1626,9 +1685,14 @@ void TextureCache::InitializeImage(ImageId id) {
 				            static_cast<uint32_t>(image.info.tile_mode), image.binding.is_target ? 1 : 0,
 				            image.usage.texture ? 1 : 0, image.usage.storage ? 1 : 0,
 				            image.usage.render_target ? 1 : 0, image.usage.depth_target ? 1 : 0,
-				            image.IsGpuModified() ? 1 : 0, static_cast<unsigned long long>(image.serial));
+				            image.IsGpuModified() ? 1 : 0, static_cast<unsigned long long>(image.serial),
+				            image.IsPartiallyCpuDirty() && !image.IsBufferModified() ? g_partial_fail : "",
+				            g_refill_refusal);
 			}
 			UploadImage(image, *source, source_offset);
+			image.staged_ring   = refillable ? source : nullptr;
+			image.staged_offset = source_offset;
+			image.staged_serial = m_scheduler.CommandSerial();
 			if (kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2 &&
 			    PartialDirtyCandidate(image)) {
 				UpdatePartialHashes(image, true);
@@ -1764,10 +1828,10 @@ bool TextureCache::CheckPartialHashes(const Image& image) {
 	return true;
 }
 
-// A depth array whose CPU writes cover some layers (the game streams shadow maps into an 80-layer
-// pool, a few 4 MiB layers at a time): only those layers are staged, detiled and copied. The
-// whole-image path staged and detiled every layer (320 MiB), 20-65 ms per refresh.
-bool TextureCache::UploadDepthPartial(Image& image) {
+// A depth array whose CPU writes cover some layers (the game's 80-layer shadow-map pool, whose free 4 MiB layers its
+// texture streamer fills from the CPU): only those layers are staged, detiled and copied (of [first_layer, last_layer)
+// only, for RefreshDepthLayers). The whole-image path staged and detiled every layer (320 MiB), 20-65 ms per refresh.
+bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32_t last_layer) {
 	const auto& info = image.info;
 	// What UploadImage's depth path handles without a D16 promotion, one level, whole layers.
 	if (info.samples != 1 || image.backing.samples != 1 || info.HasStencil() || info.IsVolume() ||
@@ -1781,7 +1845,7 @@ bool TextureCache::UploadDepthPartial(Image& image) {
 	const uint64_t base   = info.data.address;
 	const auto&    dirty  = image.CpuDirtyRanges();
 	std::vector<uint32_t> picked;
-	for (uint32_t layer = 0; layer < layers; ++layer) {
+	for (uint32_t layer = first_layer; layer < std::min(layers, last_layer); ++layer) {
 		if (IntersectsRanges(dirty, base + slice * layer, base + slice * (layer + 1))) {
 			picked.push_back(layer);
 		}
@@ -1842,6 +1906,7 @@ bool TextureCache::UploadDepthPartial(Image& image) {
 	image.Upload(copies, linear.buffer, linear.offset, linear.size);
 	LiveCounters::Add(LiveCounters::PartialUploads);
 	LiveCounters::Add(LiveCounters::PartialUploadBytes, total);
+	LogPartialUpload(image, pieces.size(), total);
 	return true;
 }
 
@@ -1994,6 +2059,7 @@ bool TextureCache::UploadImagePartial(Image& image) {
 	image.Upload(regions, linear.buffer, linear.offset, linear.size);
 	LiveCounters::Add(LiveCounters::PartialUploads);
 	LiveCounters::Add(LiveCounters::PartialUploadBytes, total);
+	LogPartialUpload(image, pieces.size(), total);
 	if (kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2) {
 		UpdatePartialHashes(image, false);
 	}
@@ -2087,6 +2153,42 @@ void TextureCache::RefreshImage(ImageId id) {
 		return;
 	}
 	InitializeImage(id);
+}
+
+// A depth target binding writes only the layers its view covers. Of a depth array that is also dirty in other layers,
+// only the dirty layers it covers are uploaded; the others stay dirty (their pages released: no write faults) until a
+// binding covers them. The game's 80-layer shadow-map pool (320 MiB) renders shadows into layers 0-4 while its texture
+// streamer tiles textures into free layers from the CPU: each shadow pass uploaded the layer being streamed (4 MiB per
+// binding, 145 times = 600 MiB in one 101 ms frame at the Shrine).
+bool TextureCache::RefreshDepthLayers(ImageId id, const ImageViewInfo& view) {
+	auto&       image  = m_slot_images[id];
+	const auto& info   = image.info;
+	const auto  layers = info.resources.layers;
+	if (!image.IsPartiallyCpuDirty() || image.IsBufferModified() || image.IsStencilModified() ||
+	    image.IsMaybeCpuDirty() || image.track_addr != info.data.address || image.track_addr_end != info.data.End() ||
+	    layers < 2 || view.layer_count == 0 ||
+	    view.base_layer >= layers || view.layer_count > layers - view.base_layer ||
+	    view.layer_count == layers || info.data.size % layers != 0 ||
+	    (info.data.size / layers) % TRACKER_PAGE_SIZE != 0 || info.data.address % TRACKER_PAGE_SIZE != 0 ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed ||
+	    UploadBinding(image) != BindingType::DepthTarget) {
+		return false;
+	}
+	const uint32_t first = view.base_layer;
+	const uint32_t last  = view.base_layer + view.layer_count;
+	const uint64_t slice = info.data.size / layers;
+	const uint64_t begin = info.data.address + slice * first;
+	const uint64_t end   = info.data.address + slice * last;
+	if (IntersectsRanges(image.CpuDirtyRanges(), begin, end)) {
+		g_partial_fail = "";
+		if (!UploadDepthPartial(image, first, last)) {
+			return false;
+		}
+		// As FinishRefresh, for these layers: watched again before they count as clean.
+		RetrackHoles(image, begin, end);
+		image.RefreshRangeComplete(begin, end);
+	}
+	return true;
 }
 
 void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
@@ -2387,8 +2489,10 @@ void TextureCache::UpdateImage(ImageId id) {
 }
 
 bool TextureCache::HasImageStartingAt(uint64_t address) {
+	// (The bucket bits are written under m_lock: a clear one needs neither the lock nor the map.)
+	if (!m_lock.ReadShared([&] { return MayStartAt(address); })) return false;
 	std::scoped_lock lock {m_lock};
-	return m_image_starts.contains(address);
+	return MayStartAt(address) && m_image_starts.contains(address);
 }
 
 bool TextureCache::NewImageStartsSince(uint64_t epoch, std::vector<std::pair<uint64_t, uint64_t>>& out) {
@@ -2409,7 +2513,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		return {};
 	}
 	// Only registered images starting at `address` qualify.
-	if (!m_image_starts.contains(address)) {
+	if (!MayStartAt(address) || !m_image_starts.contains(address)) {
 		return {};
 	}
 	ImageIds matches;
@@ -2527,7 +2631,10 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.depth_target = true;
-	RefreshImage(id);
+	const bool scoped = RefreshDepthLayers(id, desc.view_info);
+	if (!scoped) {
+		RefreshImage(id);
+	}
 	if (desc.info.HasMetadata()) {
 		// The epoch moves only when metadata state changes: every depth target
 		// acquisition passes here.
@@ -2548,7 +2655,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		}
 		if (changed) m_meta_epoch.fetch_add(1, std::memory_order_release);
 	}
-	CommitGpuWrite(image);
+	CommitGpuWrite(image, scoped);
 	if (desc.info.HasStencil()) {
 		AssociateStencil(id, desc.info.stencil);
 	}
@@ -2567,12 +2674,12 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	CommitGpuWrite(image);
 }
 
-void TextureCache::CommitGpuWrite(Image& image) {
+void TextureCache::CommitGpuWrite(Image& image, bool keep_partial) {
 	if (image.depth_id || image.backing.image == nullptr) {
 		EXIT("TextureCache: stencil association cannot own image contents\n");
 	}
 	image.ClearBufferModified();
-	if (image.IsCpuDirty()) {
+	if (image.IsCpuDirty() && !(keep_partial && image.IsPartiallyCpuDirty())) {
 		FinishRefresh(image);
 	}
 	image.MarkGpuModified();
@@ -3045,6 +3152,10 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return false;
 	}
+	// No image over the range: neither the lock nor the page walk. (The command processor asks for every indirect
+	// register table, ~11K a frame at 1-1, in memory the CPU writes; the locked instruction alone was 0.7% of the GPU
+	// thread.) A registration racing a reader without the lock makes no image the GPU wrote.
+	if (!m_lock.ReadShared([&] { return MayHaveImagesRead(address, size); })) return false;
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
@@ -3096,14 +3207,6 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 				            owner->IsGpuModified() ? 1 : 0, owner->IsBufferModified() ? 1 : 0,
 				            owner->IsStencilModified() ? 1 : 0);
 				std::fflush(stdout);
-			}
-			if (owner->info.data.size >= LargeImageLogSize) {
-				std::printf("[tsc %llu] Large image cpu-write addr=0x%llx size=%llu MiB write=0x%llx+0x%llx refusal=%s\n",
-				            static_cast<unsigned long long>(__rdtsc()),
-				            static_cast<unsigned long long>(owner->info.data.address),
-				            static_cast<unsigned long long>(owner->info.data.size >> 20u),
-				            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
-				            PartialRefusal(*owner, PartialDirtyCandidate(*owner)));
 			}
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id, "cpu-write");
@@ -3252,14 +3355,6 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 		if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
 			continue;
 		}
-		if (owner->info.data.size >= LargeImageLogSize) {
-			std::printf("[tsc %llu] Large image map addr=0x%llx size=%llu MiB map=0x%llx+0x%llx refusal=%s\n",
-			            static_cast<unsigned long long>(__rdtsc()),
-			            static_cast<unsigned long long>(owner->info.data.address),
-			            static_cast<unsigned long long>(owner->info.data.size >> 20u),
-			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
-			            PartialRefusal(*owner, PartialDirtyCandidate(*owner)));
-		}
 		owner->InvalidateCpuWrite(address, size);
 		UntrackImage(id, "map");
 	}
@@ -3324,16 +3419,6 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 			++slow_partial;
 			continue;
 		}
-		if (owner->info.data.size >= LargeImageLogSize) {
-			const bool inside = address > owner->info.data.address || address + size < owner->info.data.End();
-			std::printf("[tsc %llu] Large image unmap addr=0x%llx size=%llu MiB unmap=0x%llx+0x%llx inside=%d refusal=%s\n",
-			            static_cast<unsigned long long>(__rdtsc()),
-			            static_cast<unsigned long long>(owner->info.data.address),
-			            static_cast<unsigned long long>(owner->info.data.size >> 20u),
-			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), inside ? 1 : 0,
-			            PartialRefusal(*owner, PartialDirtyCandidate(*owner)));
-			g_delete_why = "unmap";
-		}
 		++slow_deleted;
 		slow_bytes += owner->info.data.size;
 		if (owner->info.data.size > slow_largest) {
@@ -3361,118 +3446,79 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-		if ((tick & 31u) == 0) UpdateGcThresholds();
 	}
-	// Every 30 seconds: where the video memory stands (the run log).
+	// Every 30 seconds: where the video memory and the process's memory stand (the run log).
 	static auto last_report = std::chrono::steady_clock::now();
 	if (m_graphics.CanReportMemoryUsage() && std::chrono::steady_clock::now() - last_report >= std::chrono::seconds(30)) {
 		last_report = std::chrono::steady_clock::now();
-		std::printf("Video memory: %llu MiB in use of a %llu MiB budget, %llu MiB of it textures and %llu MiB buffers (collecting from %llu, pressured from %llu, critical from %llu)\n",
+		const auto [private_bytes, working_set] = LocalPlatform::ProcessMemory();
+		std::printf("Video memory: %llu MiB in use of a %llu MiB budget (collecting from %llu). System memory: the process "
+		            "holds %llu MiB (%llu MiB resident), %llu MiB of it Vulkan allocations in system RAM\n",
 		            static_cast<unsigned long long>(m_total_used_memory >> 20u),
-		            static_cast<unsigned long long>(m_over_budget_memory >> 20u),
-		            static_cast<unsigned long long>(m_cache_bytes >> 20u),
-		            static_cast<unsigned long long>(m_buffer_cache.CacheBytes() >> 20u),
+		            static_cast<unsigned long long>(m_graphics.GetTotalMemoryBudget() >> 20u),
 		            static_cast<unsigned long long>(m_trigger_gc_memory >> 20u),
-		            static_cast<unsigned long long>(m_pressure_gc_memory >> 20u),
-		            static_cast<unsigned long long>(m_critical_gc_memory >> 20u));
-		uint64_t private_bytes = 0, working_set = 0;
-		LocalPlatform::ProcessMemory(&private_bytes, &working_set);
-		std::printf("System memory: the process holds %llu MiB (%llu MiB resident), %llu MiB of it Vulkan allocations in system RAM\n",
 		            static_cast<unsigned long long>(private_bytes >> 20u), static_cast<unsigned long long>(working_set >> 20u),
 		            static_cast<unsigned long long>(m_graphics.GetHostMemoryUsage() >> 20u));
 		std::fflush(stdout);
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// A GPU short of video memory: a log line on where it goes when its use moved by 256 MiB (checked every 60 flips).
+	if (uint64_t video = 0, budget = 0; m_graphics.small_video_memory && tick % 60 == 0 &&
+	                                    m_graphics.QueryLocalVideoMemory(&video, &budget) &&
+	                                    (video > m_logged_video_memory + (uint64_t {256} << 20u) ||
+	                                     video + (uint64_t {256} << 20u) < m_logged_video_memory)) {
+		m_logged_video_memory = video;
+		char label[32];
+		std::snprintf(label, sizeof(label), "flip %llu", static_cast<unsigned long long>(tick));
+		m_graphics.LogVideoMemory(label);
+	}
+	// Over the budget: the images no draw or dispatch used for StaleTicks flips (~10 s), least recently used first, at
+	// most MaxDeletions a flip. What the game stops drawing it stops binding: 1-1 standing, 3.2 GiB of images were used
+	// in the last 2 flips, 3.0 GiB not for 160 and more, 0.05 GiB in between; turning the camera, images behind it
+	// come back after a few seconds (160 flips: 5-7 MB of uploads a frame instead of 0.2-1.7, 1% low 47 -> 27 fps).
+	constexpr uint64_t StaleTicks   = 600;
+	constexpr size_t   MaxDeletions = 40;
+	if (m_total_used_memory < m_trigger_gc_memory || tick < StaleTicks) {
 		return;
 	}
-	// Past the budget itself (memory already spilling to system RAM): images unused for half a second
-	// go, more of them per collection.
-	const bool over_budget = m_over_budget_memory != 0 && m_total_used_memory >= m_over_budget_memory;
-	if (over_budget) {
-		// The freed images kept for reuse (up to 1 GiB) go first: they hold memory nothing draws with.
-		m_graphics.TrimImagePool();
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
-	// dirty_too: images the GPU wrote may go (each one is a synchronous download to guest memory first:
-	// under memory pressure these took up to a second a frame). The clean pass runs first; the dirty
-	// pass only when the clean pass left the cache still pressured.
-	const auto collect = [&](bool allow_aggressive, bool dirty_too) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		// Over the budget: images not drawn with in the last 2 frames, oldest first, until the usage is
-		// back under the pressure line (else at most a few dozen a frame, which never caught up).
-		// (30 frames, not 2: images drawn with a moment ago came straight back as full re-uploads.)
-		const uint64_t age        = std::min<uint64_t>(
-		    aggressive && over_budget ? 30 : aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t deletions = aggressive && over_budget ? 4096 : aggressive ? 40 : pressured ? 20 : 10;
-		std::vector<ImageId> candidates;
-		candidates.reserve(std::min<size_t>(deletions, 256));
-		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
-		// first.
-		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
-			candidates.push_back(id);
-			return candidates.size() == deletions;
-		});
-		for (const auto id: candidates) {
-			if (deletions == 0) {
-				break;
-			}
-			--deletions;
-			auto owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id) {
-				continue;
-			}
-			// The game's streaming texture arrays (320-352 MiB, a layer streamed in at a time) came straight back
-			// as full re-uploads when evicted past the budget (79 frames with a 320 MiB upload in a Boletaria run on
-			// an 8 GB budget): those go only by the normal 160-frame age.
-			// Not even by the 160-frame age: what turning the camera away for three seconds leaves undrawn came back as
-			// a 320 MiB upload when it turned back (42 of a run's 43 stalls carried ~330 MiB of full uploads). They go
-			// only past the budget, once unused for 20 seconds.
-			if (owner->info.data.size >= (128ull << 20) &&
-			    (!over_budget || tick - owner->lru_tick < 1200u)) {
-				continue;
-			}
-			if (owner->IsGpuModified()) {
-				const bool safe = SafeToDownload(*owner);
-				if (safe && owner->info.IsTiled()) {
-					continue;
-				}
-				if (safe && (!pressured || !dirty_too)) {
-					continue;
-				}
-				if (safe && !TryDownloadImage(id)) {
-					continue;
-				}
-				owner->ClearGpuModified();
-			}
-			if (SlowLog::Threshold() > 0.0 && owner->info.data.size >= PartialDirtyMinSize) {
-				std::printf("[tsc %llu] GC-DELETE addr=0x%llx size=0x%llx used=%llu\n",
-				            static_cast<unsigned long long>(__rdtsc()),
-				            static_cast<unsigned long long>(owner->info.data.address),
-				            static_cast<unsigned long long>(owner->info.data.size),
-				            static_cast<unsigned long long>(m_total_used_memory));
-				std::fflush(stdout);
-			}
-			g_delete_why = "gc";
-			DeleteImage(id);
-			if (over_budget && m_total_used_memory < m_pressure_gc_memory) break;
-			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
-				deletions >>= 2;
-				aggressive = false;
-			}
-			if (m_total_used_memory < m_pressure_gc_memory && pressured) {
-				deletions >>= 1;
-				pressured = false;
-			}
+	// An image the collector keeps (a depth image with its stencil association; one the GPU wrote, tiled: no download
+	// for its data) is passed over, not counted: never used again, kept images stay at the front of the list, and the
+	// first images from the front were only those (until 10-09 no image was collected on any GPU). Deleting depth
+	// deletes its stencil association too, so the traversal ends first.
+	std::vector<ImageId> candidates;
+	candidates.reserve(MaxDeletions);
+	m_lru_cache.ForEachItemBelow(tick - StaleTicks, [&](ImageId id) {
+		const auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered || owner->depth_id ||
+		    (owner->IsGpuModified() && owner->info.IsTiled() && SafeToDownload(*owner))) {
+			return false;
 		}
-	};
-	collect(false, false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
-		collect(true, false);
-	}
-	// Still over the budget after the clean passes: the GPU-written ones too, a few per frame.
-	if (over_budget && m_total_used_memory >= m_over_budget_memory) {
-		collect(true, true);
+		candidates.push_back(id);
+		return candidates.size() == MaxDeletions;
+	});
+	for (const auto id: candidates) {
+		auto owner = m_slot_images.try_get(id);
+		if (m_total_used_memory < m_trigger_gc_memory) {
+			break;
+		}
+		if (owner == nullptr || !owner->registered) {
+			continue;
+		}
+		if (owner->IsGpuModified()) {
+			if (SafeToDownload(*owner) && !TryDownloadImage(id)) {
+				continue;
+			}
+			owner->ClearGpuModified();
+		}
+		if (SlowLog::Threshold() > 0.0 && owner->info.data.size >= PartialDirtyMinSize) {
+			std::printf("[tsc %llu] GC-DELETE addr=0x%llx size=0x%llx used=%llu\n",
+			            static_cast<unsigned long long>(__rdtsc()),
+			            static_cast<unsigned long long>(owner->info.data.address),
+			            static_cast<unsigned long long>(owner->info.data.size),
+			            static_cast<unsigned long long>(m_total_used_memory));
+			std::fflush(stdout);
+		}
+		DeleteImage(id);
+		LiveCounters::Add(LiveCounters::GcImageDeletes);
 	}
 }
 

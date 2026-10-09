@@ -24,14 +24,14 @@ game's `sce_sys\param.json` and warns when the version is not one of these.
 | --- | --- | --- |
 | OS | Windows 10 (1803 or later) or Windows 11, 64-bit | |
 | CPU | AVX2 required (Intel Core 4th generation / AMD Ryzen or later) | 8 cores or more recommended; the test PC has an i9-14900K |
-| RAM | **32 GB or more** | The game process keeps about 18–20 GB in RAM and needs about 34 GB of RAM plus page file: keep the page file "system managed" (the launcher warns when Windows cannot provide it) |
-| GPU | NVIDIA RTX with **12 GB of VRAM or more** | About 11 GB of VRAM in use; the test PC has an RTX 5090; AMD/Intel GPUs are untested |
+| RAM | **32 GB recommended, 16 GB works** | The game process takes about 20 GB while a save loads but uses only about 4 GB of it in play, so with 16 GB Windows moves the rest to the page file and loading takes longer. It needs about 34 GB of RAM plus page file: keep the page file "system managed" (the launcher warns when Windows cannot provide it) |
+| GPU | NVIDIA RTX with **12 GB of VRAM recommended, 8 GB works** | About 11 GB of VRAM in use in the heaviest areas. With less than 12 GB, render targets and buffers keep the video memory and the textures that do not fit are read from system memory. The test PC with its video memory limited to 8 GB: Boletaria's gate 45–52 fps, most areas 40–60, the heaviest (Shrine of Storms, Stonefang 2-1, Boletaria 1-2 and 1-3) 10–35, changing from run to run with the textures the driver keeps in video memory; a slower GPU or PCIe link gives less. The test PC has an RTX 5090; AMD/Intel GPUs are untested |
 | GPU driver | The latest | The emulator uses Vulkan, which comes with the driver |
-| Python | Python 3 with numpy (`winget install Python.Python.3.12`, then `pip install numpy`) | Lists the game's shaders from its files at the first launch, for the shader preparation and the precompile; without it the game compiles each shader when it first appears (stutters) |
 | Disk | About 83 GB for the game, an SSD recommended | The emulator takes about 270 MB, the shader caches up to about 2.5 GB, and while playing the system temp folder needs another 4–5 GB |
 
-On the test PC (i9-14900K + RTX 5090, 2560×1440 window) the game runs at roughly 42–60 fps: about
-42–50 fps in the heaviest areas (Boletaria, the Tower of Latria), 55–60 fps in most others. Much
+On the test PC (i9-14900K + RTX 5090, 2560×1440 window) the game holds its 60 fps in most places; the
+heaviest spots (Boletaria's gate area, the Tower of Latria) run at about 57–60 fps. With "Up to 120 fps"
+on (see the launcher below), most areas run at 70–100 fps; the release notes list every area. Much
 slower PCs may not run it or may stutter badly.
 
 On a CPU with performance and efficiency cores (Intel Core 12th generation and later), the launcher
@@ -72,8 +72,7 @@ Or **double-click `run.cmd`** to start with the default settings (do not double-
 The first launch goes like this:
 
 1. Choose the game folder (see above).
-2. The console lists the game's shaders from its files (once, about 20 seconds; it needs Python 3
-   with numpy, see the system requirements).
+2. The console lists the game's shaders from its files (once; nothing to install for it).
 3. A dialog shows whether the game version is a supported one and offers to precompile the shaders
    first (see the next section).
 4. The console window makes the input files for the background shader preparation (once per

@@ -154,6 +154,7 @@ private:
 	std::mutex                 m_scratch_mutex;
 	std::vector<PooledScratch> m_scratch_pool;
 	uint64_t                   m_scratch_pool_bytes = 0;
+	uint64_t                   m_scratch_pool_budget = 0; // ScratchPoolBudget, at most a 32nd of the GPU's memory budget
 };
 
 } // namespace Libs::Graphics

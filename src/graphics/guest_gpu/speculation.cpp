@@ -860,7 +860,7 @@ void Speculation::Before(Result& result, size_t index) {
 	// In the scheduler's command buffer (submitted before the segment's): the ranges it writes obtained written
 	// (their CPU-dirty pages uploaded, then GPU-owned), those it reads made current, its BDA reads prepared, and each
 	// image where the work found it.
-	Common::LockGuard lock(m_renderer.GetMutex());
+	RenderLockGuard lock(m_renderer.GetMutex());
 	for (size_t i = from.written; i < to.written; ++i) {
 		const auto& range = state.written[i];
 		(void)buffers.ObtainBuffer(range.begin, range.end - range.begin, true);
@@ -931,7 +931,7 @@ void Speculation::After(Result& result, size_t index) {
 		}
 	}
 	if (from.feedbacks != to.feedbacks) {
-		Common::LockGuard lock(m_renderer.GetMutex());
+		RenderLockGuard lock(m_renderer.GetMutex());
 		for (size_t i = from.feedbacks; i < to.feedbacks; ++i)
 			buffers.ScheduleCopyFeedback(state.feedbacks[i].begin, state.feedbacks[i].end - state.feedbacks[i].begin);
 	}

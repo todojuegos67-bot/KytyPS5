@@ -3,8 +3,9 @@
 > **Demon's Souls (PS5, PPSA01341), game versions 1.07 (01.007.000) and 1.05 (01.005.000)**: both are
 > supported, with the same performance patches (each version precompiles its own shader caches); other
 > versions and games are untested here and may not run. Tested on Windows 11 with an Intel i9-14900K and
-> an NVIDIA RTX 5090 (about 45–60 fps at 2560×1440); AMD and Intel GPUs are untested. It needs 32 GB of
-> RAM and a GPU with 12 GB of video memory or more.
+> an NVIDIA RTX 5090 (about 45–60 fps at 2560×1440); AMD and Intel GPUs are untested. 32 GB of RAM and a
+> GPU with 12 GB of video memory are recommended; it also runs with 16 GB of RAM (slower loading) and 8 GB
+> of video memory (the test PC limited to 8 GB: most areas 40–60 fps, the heaviest 10–35).
 >
 > **Download: [the latest release](https://github.com/chenxiao07/KytyPS5/releases/latest)**, a Windows
 > x64 build made by GitHub Actions from this branch. Unzip it, double-click `launcher.cmd` (or
@@ -15,7 +16,8 @@
 > 中文：本分支专为《恶魔之魂》(PS5 版 PPSA01341) 优化，支持游戏版本 1.07 (01.007.000) 和 1.05 (01.005.000)，两者性能补丁相同
 > （着色器缓存按版本分别预编译）；其他版本和游戏未测试。
 > 下载[最新 release](https://github.com/chenxiao07/KytyPS5/releases/latest)，解压后双击 `launcher.cmd`
-> 或 `run.cmd`，选择游戏目录（含 `eboot.bin` 的那一层）。需要 32 GB 内存、12 GB 以上显存的显卡。
+> 或 `run.cmd`，选择游戏目录（含 `eboot.bin` 的那一层）。推荐 32 GB 内存、12 GB 以上显存的显卡；16 GB 内存
+> （加载较慢）和 8 GB 显存（测试机限制到 8 GB 时：多数区域 40–60 帧，最重的场景 10–35 帧）也能运行。
 
 ## Fixes worth cherry-picking
 

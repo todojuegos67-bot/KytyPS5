@@ -881,12 +881,16 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		}
 		const auto key = ctx.Def(handle->Arg(source->indirect_image->key_arg));
-		if (state.flattened_srt_variable == 0 || image.indirect_search_iterations == 0u ||
-		    image.indirect_resources.size() < 2u) {
+		// (A table program's mapping is in its block, at the root's indirect_mapping_offset: IR::TablePlan::IndirectImage.)
+		const bool table = state.program.table_mode;
+		if ((!table && state.flattened_srt_variable == 0) || image.indirect_search_iterations == 0u ||
+		    image.indirect_resources.size() < 2u ||
+		    (table && image.indirect_search_iterations != IR::ImageResource::RuntimeIndirectSearch)) {
 			ctx.Fail(inst, "has no indirect image runtime mapping");
 			return true;
 		}
 		const auto LoadMapping = [&](uint32_t index) {
+			if (table) return EmitTableBlockLoad(state, index);
 			const auto pointer = state.builder.AllocateId();
 			state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state),
 			                           pointer, state.flattened_srt_variable, ConstantU32(state, 0),
@@ -900,7 +904,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			// A portable table: the key mapping's offset from its flattened-SRT word, and the steps
 			// of the unrolled search below in a loop run while the range is non-empty (the same
 			// steps: the unrolled search idles once its range is empty).
-			const auto mapping    = LoadMapping(ConstantU32(state, image.indirect_mapping_offset));
+			const auto mapping    = table ? ConstantU32(state, image.indirect_mapping_offset)
+			                              : LoadMapping(ConstantU32(state, image.indirect_mapping_offset));
 			const auto count      = LoadMapping(mapping);
 			const auto preheader  = state.builder.AllocateId();
 			const auto header     = state.builder.AllocateId();

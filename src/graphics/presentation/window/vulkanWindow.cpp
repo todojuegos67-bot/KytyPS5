@@ -920,6 +920,12 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		copy_indirect.pNext        = const_cast<void*>(create_info.pNext);
 		create_info.pNext          = &copy_indirect;
 	}
+	vk::PhysicalDeviceMemoryPriorityFeaturesEXT memory_priority {};
+	if (graphics.memory_priority_enabled) {
+		memory_priority.memoryPriority = VK_TRUE;
+		memory_priority.pNext          = const_cast<void*>(create_info.pNext);
+		create_info.pNext              = &memory_priority;
+	}
 	vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
 	const bool fault_extension = HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 	if (fault_extension) {
@@ -1324,6 +1330,13 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		// KYTY_SIMULATE_VRAM_MB: the start-up ballast keeps its video memory over the game's (priorities).
+		if (const char* simulate = std::getenv("KYTY_SIMULATE_VRAM_MB");
+		    simulate != nullptr && std::strtoull(simulate, nullptr, 10) > 0 &&
+		    HasExtension(available_extensions, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+			graphic_ctx.memory_priority_enabled = true;
+		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
@@ -1474,6 +1487,13 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		// KYTY_SIMULATE_VRAM_MB: the start-up ballast keeps its video memory over the game's (priorities).
+		if (const char* simulate = std::getenv("KYTY_SIMULATE_VRAM_MB");
+		    simulate != nullptr && std::strtoull(simulate, nullptr, 10) > 0 &&
+		    HasExtension(available_extensions, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+			graphic_ctx.memory_priority_enabled = true;
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,

@@ -382,7 +382,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
 	// (The GPU thread's: a speculation's thread does not take it.)
-	std::optional<Common::LockGuard> lock;
+	std::optional<RenderLockGuard> lock;
 	{
 		LiveCensus::Scope census_lock(LiveCensus::DispatchPhase, sh_ctx.GetCs().cs_regs.data_addr, 12);
 		if (Role() == 0) lock.emplace(m_context.GetMutex());

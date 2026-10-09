@@ -32,6 +32,9 @@ namespace {
 thread_local std::vector<PageManager::DeferredRange>* g_deferred_write_protect = nullptr;
 thread_local uint64_t g_unmapping_begin = 0;
 thread_local uint64_t g_unmapping_end   = 0;
+// PageManager::DeferReadProtection: the GPU thread's pending no-access range [begin, end) (end 0: none).
+thread_local bool     g_defer_read_protect = false;
+thread_local uint64_t g_read_protect_begin = 0, g_read_protect_end = 0;
 
 constexpr uint64_t PAGE_SIZE    = TRACKER_PAGE_SIZE;
 constexpr uint64_t REGION_SIZE  = TRACKER_REGION_SIZE;
@@ -46,6 +49,9 @@ constexpr uint32_t PAGE_READONLY  = 0x02;
 constexpr uint32_t PAGE_READWRITE = 0x04;
 #endif
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
+// HasReadWatchers' filter: a bit per 64 KiB granule.
+constexpr uint64_t READ_GRANULE_SIZE  = 64 * 1024;
+constexpr uint64_t READ_GRANULE_PAGES = READ_GRANULE_SIZE / PAGE_SIZE;
 
 constexpr uint32_t NO_ACCESS_PROTECTION  = PAGE_NOACCESS;
 constexpr uint32_t READ_ONLY_PROTECTION  = PAGE_READONLY;
@@ -249,7 +255,29 @@ struct PageManager::Impl {
 		}
 	}
 
+	static void FlushReadProtect() noexcept {
+		if (g_read_protect_end == 0) return;
+		const auto begin = g_read_protect_begin, end = g_read_protect_end;
+		g_read_protect_end = 0;
+		ProtectHost(begin, end - begin, NO_ACCESS_PROTECTION);
+	}
+
 	void Protect(uint64_t vaddr, uint64_t size, uint32_t protection) noexcept {
+		if (protection == NO_ACCESS_PROTECTION && g_defer_read_protect) {
+			if (g_read_protect_end != 0 && vaddr == g_read_protect_end) {
+				g_read_protect_end = vaddr + size;
+				return;
+			}
+			if (g_read_protect_end != 0 && vaddr + size == g_read_protect_begin) {
+				g_read_protect_begin = vaddr;
+				return;
+			}
+			FlushReadProtect();
+			g_read_protect_begin = vaddr;
+			g_read_protect_end   = vaddr + size;
+			return;
+		}
+		FlushReadProtect(); // (an earlier protection first)
 		const auto end = vaddr + size;
 		if (protection == READ_WRITE_PROTECTION && g_unmapping_end > g_unmapping_begin &&
 		    vaddr < g_unmapping_end && end > g_unmapping_begin) {
@@ -292,6 +320,7 @@ struct PageManager::Impl {
 			                              : page.AddDelta<0, is_read>(address);
 			const auto new_perms = page.Perms();
 			if constexpr (is_read) {
+				if (new_count != 0) MarkReadGranule(address); // (before the page's hint: the bits stay a superset)
 				region.read_hint[page_index].store(new_count != 0, std::memory_order_release);
 			}
 
@@ -317,6 +346,41 @@ struct PageManager::Impl {
 		}
 
 		release_pending();
+		if constexpr (is_read) SyncReadGranules(region, base_addr, first, last);
+	}
+
+	// A bit per 64 KiB granule: some page there may have read watchers. Set before a page's read_hint, cleared after
+	// the granule's last one (both under the region's lock). HasReadWatchers asks it first: a hint byte per page sat on
+	// its own cold line, the region pointer on another, for every page a table read touched (1% of the GPU thread at
+	// 1-1); a line of these bits covers 32 MiB.
+	std::unique_ptr<std::atomic<uint64_t>[]> read_granules =
+	    std::make_unique<std::atomic<uint64_t>[]>(ADDRESS_SIZE / READ_GRANULE_SIZE / 64);
+
+	void MarkReadGranule(uint64_t address) noexcept {
+		const auto granule = address / READ_GRANULE_SIZE;
+		read_granules[granule / 64].fetch_or(uint64_t {1} << (granule % 64), std::memory_order_release);
+	}
+
+	void SyncReadGranules(const Region& region, uint64_t base_addr, size_t first, size_t last) noexcept {
+		if (first >= last) return;
+		for (size_t g = first / READ_GRANULE_PAGES; g <= (last - 1) / READ_GRANULE_PAGES; ++g) {
+			bool any = false;
+			for (size_t p = g * READ_GRANULE_PAGES; p < (g + 1) * READ_GRANULE_PAGES; ++p)
+				any |= region.read_hint[p].load(std::memory_order_relaxed) != 0;
+			const auto granule = base_addr / READ_GRANULE_SIZE + g;
+			const auto bit     = uint64_t {1} << (granule % 64);
+			if (any)
+				read_granules[granule / 64].fetch_or(bit, std::memory_order_release);
+			else if ((read_granules[granule / 64].load(std::memory_order_relaxed) & bit) != 0)
+				read_granules[granule / 64].fetch_and(~bit, std::memory_order_release);
+		}
+	}
+
+	[[nodiscard]] bool MayHaveReadWatchers(uint64_t vaddr, uint64_t last_byte) const noexcept {
+		if (last_byte >= ADDRESS_SIZE) return true;
+		for (auto g = vaddr / READ_GRANULE_SIZE; g <= last_byte / READ_GRANULE_SIZE; ++g)
+			if (((read_granules[g / 64].load(std::memory_order_acquire) >> (g % 64)) & 1u) != 0) return true;
+		return false;
 	}
 
 	void SyncProtection(uint64_t vaddr, uint64_t size) {
@@ -397,8 +461,14 @@ uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
 }
 
+const std::atomic<uint64_t>* PageManager::ReadGranules() const noexcept {
+	static_assert(READ_GRANULE_SIZE == uint64_t {1} << READ_GRANULE_BITS);
+	return m_impl->read_granules.get();
+}
+
 bool PageManager::HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) return false;
+	if (!m_impl->MayHaveReadWatchers(vaddr, vaddr + size - 1)) return false;
 	const auto end = PageStart(vaddr + size - 1);
 	for (auto page = PageStart(vaddr);; page += PAGE_SIZE) {
 		if (const auto* region = m_impl->FindRegion(page);
@@ -450,6 +520,15 @@ void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 
 template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
+
+void PageManager::DeferReadProtection(bool on) noexcept {
+	if (!on) Impl::FlushReadProtect();
+	g_defer_read_protect = on;
+}
+
+void PageManager::FlushDeferredProtection() noexcept {
+	Impl::FlushReadProtect();
+}
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {

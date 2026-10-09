@@ -371,14 +371,30 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
-template<typename Buffer, typename Color, typename Depth, typename Dispatch>
-static void SetGraphicsDynamicParamsImpl(const Buffer& buffer, vk::CommandBuffer vk_buffer,
-                                         bool indexed_viewports, const Color* colors,
-                                         uint32_t color_count, const Depth& depth,
-                                         const Dispatch& dispatch) {
-	KYTY_PROFILER_FUNCTION();
+// A draw's dynamic state as Vulkan values (SetGraphicsDynamicParamsImpl): what it records, computed once.
+struct ResolvedDynamicState {
+	static constexpr uint32_t ViewportSlots = std::size(HW::ScreenViewport {}.viewports);
+	uint32_t                                viewport_count = 0;
+	std::array<vk::Viewport, ViewportSlots> viewports {};
+	std::array<vk::Rect2D, ViewportSlots>   scissors {};
+	float                                   line_width = 1.0f;
+	std::array<float, 4>                    blend_constants {};
+	vk::Bool32                              depth_test = VK_FALSE, depth_write = VK_FALSE;
+	vk::CompareOp                           depth_compare = vk::CompareOp::eNever;
+	vk::Bool32                              depth_bias_enable = VK_FALSE;
+	float                                   bias_constant = 0.0f, bias_clamp = 0.0f, bias_slope = 0.0f;
+	bool                                    stencil = false;
+	PipelineStencilDynamicState             stencil_front {}, stencil_back {};
+	uint32_t                                color_count = 0;
+	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write {};
+};
 
+template<typename Buffer, typename Color, typename Depth>
+static ResolvedDynamicState ResolveGraphicsDynamicParams(const Buffer& buffer, bool indexed_viewports,
+                                                         const Color* colors, uint32_t color_count,
+                                                         const Depth& depth) {
 	EXIT_IF(colors == nullptr);
+	ResolvedDynamicState out {};
 	const auto& ctx = buffer.GetRegisters();
 
 	const auto&  vp = ctx.GetScreenViewport();
@@ -392,10 +408,11 @@ static void SetGraphicsDynamicParamsImpl(const Buffer& buffer, vk::CommandBuffer
 		framebuffer_extent = {limits.maxFramebufferWidth, limits.maxFramebufferHeight};
 	}
 
-	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
-	std::array<vk::Viewport, viewport_slots> viewports {};
-	std::array<vk::Rect2D, viewport_slots>   scissors {};
-	const uint32_t viewport_count = indexed_viewports ? viewport_slots : 1;
+	constexpr uint32_t viewport_slots = ResolvedDynamicState::ViewportSlots;
+	auto&              viewports      = out.viewports;
+	auto&              scissors       = out.scissors;
+	const uint32_t     viewport_count = indexed_viewports ? viewport_slots : 1;
+	out.viewport_count                = viewport_count;
 	for (uint32_t i = 0; i < viewport_count; i++) {
 		const auto& guest    = vp.viewports[i];
 		auto&       viewport = viewports[i];
@@ -425,9 +442,6 @@ static void SetGraphicsDynamicParamsImpl(const Buffer& buffer, vk::CommandBuffer
 			scissor.extent = {0, 0};
 		}
 	}
-	vk_buffer.setViewportWithCount(viewport_count, viewports.data(), dispatch);
-	vk_buffer.setScissorWithCount(viewport_count, scissors.data(), dispatch);
-
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
 		static bool logged = false;
@@ -439,62 +453,125 @@ static void SetGraphicsDynamicParamsImpl(const Buffer& buffer, vk::CommandBuffer
 		}
 		line_width = 1.0f;
 	}
-	vk_buffer.setLineWidth(line_width, dispatch);
-	const auto&      blend = ctx.GetBlendColor();
-	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-	vk_buffer.setBlendConstants(blend_constants.data(), dispatch);
-	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE, dispatch);
-	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE, dispatch);
-	vk_buffer.setDepthCompareOp(depth.depth_compare_op, dispatch);
+	out.line_width          = line_width;
+	const auto& blend       = ctx.GetBlendColor();
+	out.blend_constants     = {blend.red, blend.green, blend.blue, blend.alpha};
+	out.depth_test          = depth.depth_test_enable ? VK_TRUE : VK_FALSE;
+	out.depth_write         = depth.depth_write_enable ? VK_TRUE : VK_FALSE;
+	out.depth_compare       = depth.depth_compare_op;
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
-	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE, dispatch);
+	out.depth_bias_enable         = depth_bias_enable ? VK_TRUE : VK_FALSE;
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
 		    use_front ? poly_offset.front_offset : poly_offset.back_offset;
-		const float constant_factor = ConvertPolygonOffsetConstantFactor(
-		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
-		const float slope_factor =
-		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor, dispatch);
+		out.bias_constant = ConvertPolygonOffsetConstantFactor(guest_constant_factor, poly_offset,
+		                                                       depth.desc.view_info.format);
+		out.bias_clamp    = poly_offset.clamp;
+		out.bias_slope    = (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
 	}
 
-	if (depth.stencil_test_enable) {
-		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,
-		                                depth.stencil_dynamic_front.compareMask, dispatch);
-		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eBack,
-		                                depth.stencil_dynamic_back.compareMask, dispatch);
-		vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eFront,
-		                              depth.stencil_dynamic_front.writeMask, dispatch);
-		vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eBack,
-		                              depth.stencil_dynamic_back.writeMask, dispatch);
-		vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eFront,
-		                              depth.stencil_dynamic_front.reference, dispatch);
-		vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eBack,
-		                              depth.stencil_dynamic_back.reference, dispatch);
+	out.stencil = depth.stencil_test_enable;
+	if (out.stencil) {
+		out.stencil_front = depth.stencil_dynamic_front;
+		out.stencil_back  = depth.stencil_dynamic_back;
 	}
 
+	// Color-control operation selects special color-buffer paths, not the normal component write
+	// mask. Attachment availability therefore follows the target write mask.
+	out.color_count = color_count;
+	for (uint32_t i = 0; i < color_count; i++) {
+		out.color_write[i] = render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0
+		                         ? VK_TRUE
+		                         : VK_FALSE;
+	}
+	return out;
+}
+
+// Records `state`. With `held` (what this command buffer holds: what an earlier call with `held` recorded, nothing
+// else recorded dynamic state since), only the values that differ, and `held` becomes `state`. (Dynamic state stays
+// set until it is set again; bit-equal floats only.)
+template<typename Dispatch>
+static void EmitGraphicsDynamicParams(vk::CommandBuffer vk_buffer, const ResolvedDynamicState& state,
+                                      ResolvedDynamicState* held, const Dispatch& dispatch) {
+	const auto same = [](const auto& a, const auto& b) { return std::memcmp(&a, &b, sizeof(a)) == 0; };
+	const bool all  = held == nullptr;
+	const auto count = state.viewport_count;
+	if (all || held->viewport_count != count ||
+	    std::memcmp(held->viewports.data(), state.viewports.data(), count * sizeof(vk::Viewport)) != 0)
+		vk_buffer.setViewportWithCount(count, state.viewports.data(), dispatch);
+	if (all || held->viewport_count != count ||
+	    std::memcmp(held->scissors.data(), state.scissors.data(), count * sizeof(vk::Rect2D)) != 0)
+		vk_buffer.setScissorWithCount(count, state.scissors.data(), dispatch);
+	if (all || !same(held->line_width, state.line_width)) vk_buffer.setLineWidth(state.line_width, dispatch);
+	if (all || !same(held->blend_constants, state.blend_constants))
+		vk_buffer.setBlendConstants(state.blend_constants.data(), dispatch);
+	if (all || held->depth_test != state.depth_test) vk_buffer.setDepthTestEnable(state.depth_test, dispatch);
+	if (all || held->depth_write != state.depth_write) vk_buffer.setDepthWriteEnable(state.depth_write, dispatch);
+	if (all || held->depth_compare != state.depth_compare) vk_buffer.setDepthCompareOp(state.depth_compare, dispatch);
+	if (all || held->depth_bias_enable != state.depth_bias_enable)
+		vk_buffer.setDepthBiasEnable(state.depth_bias_enable, dispatch);
+	// (The bias and the stencil values are recorded only where they apply: the held ones are the last recorded.)
+	if (state.depth_bias_enable &&
+	    (all || !held->depth_bias_enable || !same(held->bias_constant, state.bias_constant) ||
+	     !same(held->bias_clamp, state.bias_clamp) || !same(held->bias_slope, state.bias_slope)))
+		vk_buffer.setDepthBias(state.bias_constant, state.bias_clamp, state.bias_slope, dispatch);
+	if (state.stencil) {
+		const bool known = !all && held->stencil;
+		const auto face  = [&](vk::StencilFaceFlagBits bits, const PipelineStencilDynamicState& value,
+		                      const PipelineStencilDynamicState& before) {
+			if (!known || before.compareMask != value.compareMask)
+				vk_buffer.setStencilCompareMask(bits, value.compareMask, dispatch);
+			if (!known || before.writeMask != value.writeMask) vk_buffer.setStencilWriteMask(bits, value.writeMask, dispatch);
+			if (!known || before.reference != value.reference) vk_buffer.setStencilReference(bits, value.reference, dispatch);
+		};
+		face(vk::StencilFaceFlagBits::eFront, state.stencil_front, all ? state.stencil_front : held->stencil_front);
+		face(vk::StencilFaceFlagBits::eBack, state.stencil_back, all ? state.stencil_back : held->stencil_back);
+	}
 #if defined(__APPLE__)
 	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the
 	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.
 #else
-	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	// Color-control operation selects special color-buffer paths, not the normal component write
-	// mask. Attachment availability therefore follows the target write mask.
-	for (uint32_t i = 0; i < color_count; i++) {
-		enable[i] = render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0
-		                ? VK_TRUE
-		                : VK_FALSE;
-	}
-	if (color_count != 0) {
-		vk_buffer.setColorWriteEnableEXT(color_count, enable, dispatch);
-	}
+	if (state.color_count != 0 &&
+	    (all || held->color_count != state.color_count ||
+	     std::memcmp(held->color_write.data(), state.color_write.data(), state.color_count * sizeof(vk::Bool32)) != 0))
+		vk_buffer.setColorWriteEnableEXT(state.color_count, state.color_write.data(), dispatch);
 #endif
+	if (held == nullptr) return;
+	// What the buffer holds now: the values recorded, the earlier ones of what this state does not record.
+	const auto before = *held;
+	*held             = state;
+	if (!state.depth_bias_enable) {
+		held->bias_constant = before.bias_constant;
+		held->bias_clamp    = before.bias_clamp;
+		held->bias_slope    = before.bias_slope;
+		// (The bias values are known only once a state with the bias enabled recorded them.)
+		held->depth_bias_enable = VK_FALSE;
+	}
+	if (!state.stencil) {
+		held->stencil       = before.stencil;
+		held->stencil_front = before.stencil_front;
+		held->stencil_back  = before.stencil_back;
+	}
+	if (state.color_count == 0) {
+		held->color_count = before.color_count;
+		held->color_write = before.color_write;
+	}
+}
+
+template<typename Buffer, typename Color, typename Depth, typename Dispatch>
+static void SetGraphicsDynamicParamsImpl(const Buffer& buffer, vk::CommandBuffer vk_buffer,
+                                         bool indexed_viewports, const Color* colors,
+                                         uint32_t color_count, const Depth& depth,
+                                         const Dispatch& dispatch) {
+	KYTY_PROFILER_FUNCTION();
+	EmitGraphicsDynamicParams(vk_buffer, ResolveGraphicsDynamicParams(buffer, indexed_viewports, colors, color_count, depth),
+	                          nullptr, dispatch);
 }
 
 static bool UsesIndexedViewports(const ShaderVertexInputInfo& input) {
@@ -1783,7 +1860,7 @@ bool RenderExecutor::TryDrawIndexRun(uint64_t submit_id, CommandBuffer& buffer,
 	m_context.GetCommandScheduler().PopPendingOperations();
 	LiveTrace::MarkAfter gpu_mark {[&] { return m_context.GetCommandScheduler().Current().RawHandle(); },
 	                               LiveTrace::MarkDraw, buffer.GetShaders().GetPs().ps_regs.data_addr};
-	Common::LockGuard lock(m_context.GetMutex());
+	RenderLockGuard lock(m_context.GetMutex());
 	const auto        mapping_epoch = m_context.GetGpuResources().MappingEpoch();
 	const auto        alias_epoch   = m_context.GetGpuResources().PreparationAliasEpoch();
 	if (!alias_epoch) return false;
@@ -2081,7 +2158,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
-	Common::LockGuard lock(m_context.GetMutex());
+	RenderLockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || args.instance_count == 0) {
 		return true;
 	}
@@ -2181,11 +2258,6 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return true;
 	}
-	if (args.gpu_args != 0 && state.vs_input_info.stage.program->stage == ShaderType::Mesh) {
-		// A mesh draw sizes its task grid from the counts.
-		ResetBindings();
-		return false;
-	}
 
 	bool programs_ok = false;
 	if (XprCapture::Enabled() && XprCapture::g_state.current_xpr &&
@@ -2208,6 +2280,12 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	if (!programs_ok) {
 		ResetBindings();
 		return true;
+	}
+	// A mesh draw sizes its task grid from the counts. (The draw's own program: before RefreshShaders the state held
+	// the previous draw's, or none in a fresh state.)
+	if (args.gpu_args != 0 && state.vs_input_info.stage.program->stage == ShaderType::Mesh) {
+		ResetBindings();
+		return false;
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, args.index_type_and_size,
@@ -2253,7 +2331,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
 	                    args.first_instance);
 
-	Common::LockGuard lock(m_context.GetMutex());
+	RenderLockGuard lock(m_context.GetMutex());
 	if (args.vertex_count == 0 || args.instance_count == 0) {
 		return true;
 	}

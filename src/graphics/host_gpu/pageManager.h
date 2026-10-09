@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -23,6 +24,10 @@ public:
 	// A hint only: callers must still check exact GPU ownership before reading
 	// a backing alias. A missing hint retains the normal faulting guest load.
 	[[nodiscard]] bool HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept;
+	// HasReadWatchers' filter, for callers that test it inline: bit g of word g / 64 is clear when no page of the
+	// 64 KiB granule g (of the tracker's address space) has read watchers.
+	static constexpr uint64_t                   READ_GRANULE_BITS = 16;
+	[[nodiscard]] const std::atomic<uint64_t>* ReadGranules() const noexcept;
 
 	// Restores the watchers' protection after the host protection of watched pages was
 	// changed behind the tracker's back (a guest mprotect). Unwatched pages keep theirs.
@@ -46,6 +51,13 @@ public:
 	// would leave a watched page writable and writes to it unseen. If the unmap fails, the caller
 	// syncs the range (SyncProtection). end == 0 clears it.
 	static void SetUnmappingRange(uint64_t begin, uint64_t end) noexcept;
+	// While set on this thread (the GPU thread), the read protection of pages GPU work will write (no access) waits
+	// for the next protection, which extends it when it is the adjacent range's (consecutive dispatches writing
+	// adjacent ranges made a VirtualProtect call each, ~110 a frame at 1-1), or for FlushDeferredProtection. The
+	// work runs on the GPU and the guest can learn that it ran only after a submission, a label or a guest command
+	// of the GPU thread: it flushes before each of them (and before any other protection, which keeps their order).
+	static void DeferReadProtection(bool on) noexcept;
+	static void FlushDeferredProtection() noexcept;
 	// A write fault on a page no watcher holds: its host protection is not the trackers'. Gives
 	// the page the guest's own protection back (writable if the guest's is) and returns true;
 	// false when the page is watched. Checked and changed under the page's lock, so a watcher

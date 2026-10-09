@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 extern "C" {
@@ -43,6 +44,7 @@ extern volatile std::atomic_uint32_t kyty_local_native_xpr_keep_frames;
 extern volatile std::atomic_uint32_t kyty_local_native_xpr_instance_mode;
 extern volatile std::atomic_uint32_t kyty_local_table_xpr_mode;
 extern volatile std::atomic_uint32_t kyty_local_table_dispatch_mode;
+extern volatile std::atomic_uint32_t kyty_local_table_indirect_mode;
 extern volatile std::atomic_uint32_t kyty_local_table_store_budget;
 #endif
 // Speculative translation of graphics command buffers (src/graphics/guest_gpu/speculation.h).
@@ -123,6 +125,9 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_TABLE_XPR", &kyty_local_table_xpr_mode, 0, 2},
 	    // Table dispatches (src/local/table-xpr.inc).
 	    Switch {"KYTY_TABLE_DISPATCH", &kyty_local_table_dispatch_mode},
+	    // Table dispatches of programs with an address probe's indirect image or reads by device address at offsets no
+	    // slot fixes (the light loops; default on, 0 for an A/B).
+	    Switch {"KYTY_TABLE_INDIRECT", &kyty_local_table_indirect_mode},
 	    // Table store requests per frame (0: no limit).
 	    Switch {"KYTY_TABLE_STORE_BUDGET", &kyty_local_table_store_budget, 0, 65536},
 #endif
@@ -154,6 +159,13 @@ inline void InitializePerformanceSwitches() {
 		LocalPlatform::PinThreadToCpuList(cpus);
 		enabled += std::string(enabled.empty() ? "" : " ") + "KYTY_RENDER_CPUS=" + cpus;
 	}
+	// Above the game's threads (KYTY_RENDER_PRIORITY=0: normal). Walking into a new area, the game's threads
+	// streaming it in held the render CPUs for whole time slices: frames of 35-50 ms where the render thread
+	// ran 10-14 ms, its samples parked for 20-26 ms at one instruction.
+	if (const char* priority = std::getenv("KYTY_RENDER_PRIORITY"); priority == nullptr || std::strcmp(priority, "0") != 0)
+		LocalPlatform::MakeCriticalThread();
+	else
+		enabled += std::string(enabled.empty() ? "" : " ") + "KYTY_RENDER_PRIORITY=0";
 	if (!enabled.empty()) {
 		std::printf("Performance switches: %s\n", enabled.c_str());
 		std::fflush(stdout);

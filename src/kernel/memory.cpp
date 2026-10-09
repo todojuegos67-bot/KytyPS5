@@ -475,6 +475,27 @@ public:
 		return false;
 	}
 
+	// The end of the committed virtual range `virtual_addr` lies in (0: none), itself, not the ranges after it.
+	uint64_t MappingEnd(uint64_t virtual_addr) {
+		thread_local std::array<std::pair<uint64_t, uint64_t>, 16> cache {};       // (begin, end) by address
+		thread_local std::array<std::pair<uint64_t, uint64_t>, 16> cache_stamp {}; // (identity, epoch)
+		const auto slot  = ((virtual_addr >> 20) ^ (virtual_addr >> 32)) & 15u;
+		const auto epoch = m_epoch.load(std::memory_order_acquire);
+		if (!(epoch & 1) && cache_stamp[slot] == std::pair {m_identity, epoch} && virtual_addr >= cache[slot].first &&
+		    virtual_addr < cache[slot].second)
+			return cache[slot].second;
+		Common::LockGuard lock(m_mutex);
+		auto vma = std::upper_bound(m_ranges.begin(), m_ranges.end(), virtual_addr,
+		                            [](uint64_t value, const Range& range) { return value < range.start; });
+		if (vma == m_ranges.begin()) return 0;
+		--vma;
+		const auto vma_end = End(vma->start, vma->size);
+		if (virtual_addr < vma->start || virtual_addr >= vma_end || !IsCommittedRangeType(vma->type)) return 0;
+		cache[slot]       = {vma->start, vma_end};
+		cache_stamp[slot] = {m_identity, m_epoch.load(std::memory_order_relaxed)};
+		return vma_end;
+	}
+
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
@@ -1011,6 +1032,11 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
 
+bool TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryWriteCpuBacking(vaddr, data, size);
+}
+
 [[gnu::noinline]] bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	// Diagnostic (live timecensus, source BackingRead): which code reads the backing, how much.
 	if (size >= 0x10000) KYTY_TIME_CENSUS(BackingRead, size);
@@ -1117,6 +1143,10 @@ bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 		GetGpuResources().GetBufferCache().ReadMemory(vaddr, size);
 	}
 	return true;
+}
+
+uint64_t MappingEnd(uint64_t vaddr) {
+	return g_virtual_ranges != nullptr ? g_virtual_ranges->MappingEnd(vaddr) : 0;
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {

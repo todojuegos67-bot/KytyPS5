@@ -29,6 +29,8 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// VK_EXT_memory_priority, enabled only for KYTY_SIMULATE_VRAM_MB (vma.cpp).
+	bool                               memory_priority_enabled               = false;
 	bool                               rt_extensions_enabled                 = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
@@ -127,12 +129,31 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetHostMemoryUsage() const;
+	// The driver's usage figures read again (VMA otherwise refreshes them every 30 of its own allocations: memory
+	// the driver takes itself, such as pipelines, shows late).
+	void                   RefreshMemoryBudget();
+	// Windows' figures for the process's video memory (LocalPlatform::QueryVideoMemory) without the simulation's
+	// ballast; false where there are none.
+	[[nodiscard]] bool     QueryLocalVideoMemory(uint64_t* usage, uint64_t* budget) const;
+	// A log line on where the video memory goes (Windows' and VMA's figures): diagnostics.
+	void                   LogVideoMemory(const char* label) const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 	// Frees the images kept for reuse (KYTY_IMAGE_POOL): video memory ran out.
 	void                   TrimImagePool();
 	void                   ReportMemoryFallback(const char* what, uint64_t bytes) const;
+	// KYTY_SIMULATE_VRAM_MB: the video memory taken at start-up (left out of the budget and usage above).
+	// A budget under 12 GiB (CreateAllocator): less than the game's working set (Boletaria ~11 GB). Textures yield video
+	// memory to render targets and buffers (CreateImage); the pipeline warmup leaves its pipelines to first use.
+	bool                          small_video_memory = false;
+	// An image only sampled and copied (CreateImage places these apart on such a GPU).
+	[[nodiscard]] static bool     IsTextureUsage(vk::ImageUsageFlags usage) {
+		return !(usage & (vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eDepthStencilAttachment |
+		                  vk::ImageUsageFlagBits::eStorage));
+	}
+	std::vector<vk::DeviceMemory> simulation_ballast;
+	uint64_t                      simulation_ballast_bytes = 0;
 	void                   AppendHardwareRayTracingDeviceExtensions(
 	    const std::vector<vk::ExtensionProperties>& available_extensions,
 	    std::vector<const char*>&                   device_extensions);

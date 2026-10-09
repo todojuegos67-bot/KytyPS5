@@ -14,6 +14,7 @@
 
 #include <array>
 #include <atomic>
+#include <deque>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -47,6 +48,8 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Live "sync" (any thread, racy by design: for a stalled GPU thread).
+	void                   PrintSyncState();
 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
@@ -85,7 +88,14 @@ public:
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
-	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// `refillable`: set when the bytes went to the staging ring by the upload worker (RefillImageStaging may copy them
+	// again while the upload is unsubmitted).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size,
+	                                                               bool* refillable = nullptr);
+	// The guest bytes of [vaddr, vaddr + size) copied again by the upload worker to a staging copy ObtainBufferForImage
+	// made (`ring` at `offset`): whose GPU copies are recorded but not submitted, so they upload the new bytes. False,
+	// with nothing done, where ObtainBufferForImage would not stage them that way now.
+	[[nodiscard]] bool RefillImageStaging(const Buffer& ring, uint64_t offset, uint64_t vaddr, uint64_t size);
 	// Guest ranges staged one after another in one staging allocation of `total` bytes, each
 	// at its `offset`. Returns nullptr (nothing staged) when a range starts in a cached buffer
 	// or holds GPU-written pages: the caller then uploads the whole image instead.
@@ -291,6 +301,17 @@ private:
 	std::vector<SyncStamp> m_sync_stamps;
 	std::vector<SyncBuffer> m_old_sync_buffers; // rebuild scratch
 	std::vector<SyncStamp>  m_old_sync_stamps;
+	// The registration changes since the index was current, applied to it in order (ApplySyncChanges) instead of a
+	// rebuild from every registered buffer (a walk of m_buffers' nodes and slots: ~5 a frame at 1-1, 2% of the GPU
+	// thread). Lost: too many, or the index was never built; the next use rebuilds it.
+	struct SyncChange {
+		BufferId id;
+		uint64_t address = 0, size = 0;
+		bool     insert  = false;
+	};
+	std::vector<SyncChange> m_sync_changes;
+	bool                    m_sync_changes_lost = true;
+	[[nodiscard]] bool      ApplySyncChanges();
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	std::shared_mutex                                 m_gpu_modified_mutex; // (its changes: HasGpuDirtyBytes)
@@ -298,6 +319,9 @@ private:
 	StreamBuffer                                      m_staging_buffer;
 	// ObtainBufferForImage (KYTY_ASYNC_UPLOAD=2): the backing pieces of an image upload.
 	std::vector<std::pair<const uint8_t*, uint64_t>>  m_backing_pieces;
+	// The upload worker's copies of guest [vaddr, vaddr + size) to `staging`; false when it reads the mapped parts
+	// only (a partly unmapped range: the rest is zeros).
+	bool PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint64_t size);
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_host_shader_upload;
 	StreamBuffer                                      m_table_upload;
@@ -323,25 +347,31 @@ private:
 
 	// KYTY_READBACK_QUEUE: GPU writes that may still be in flight, oldest first. An entry's
 	// tick is set at the next point between commands (every write noted by then is recorded
-	// at or before the current tick); entries the GPU completed are dropped from the front.
+	// at or before the current tick: m_gpu_write_stamps); entries the GPU completed are dropped
+	// from the front.
 	struct GpuWrite {
-		uint64_t begin, end, tick;
-		bool     big = false; // spans more granules than GpuWriteSpan: not counted in m_gpu_write_granules
+		uint64_t begin, end;
+		bool     big = false; // spans more granules than GpuWriteSpan: in m_gpu_big_writes, not m_gpu_write_last
 	};
-	// The writes from m_gpu_writes_head on, per 64 KiB granule (hashed into the counters; a write over more than
-	// GpuWriteSpan granules counts in m_gpu_writes_big instead): a range whose granules count none (and with no big
-	// write) overlaps no in-flight write, without a walk of the log (thousands of entries a frame at 1-1).
+	// The ticks of the stamped writes, oldest first: (end, tick) dates the writes numbered from the previous entry's end
+	// (the head's number for the first) up to `end`. (A tick in every entry: each was written once and read once more,
+	// a pass over thousands of cold entries a frame.)
+	std::deque<std::pair<uint64_t, uint64_t>> m_gpu_write_stamps;
+	[[nodiscard]] uint64_t                    GpuWriteTick(size_t index) const;
+	// Per 64 KiB granule (hashed into the counters), 1 + the number (m_gpu_writes_base + index) of the last small write
+	// there; a write over more than GpuWriteSpan granules is in m_gpu_big_writes instead. The in-flight writes are the
+	// log's tail: a range whose granules' last write completed overlaps no in-flight small write, and the walk for one
+	// that may starts at that last write, not at the log's end (thousands of entries a frame at 1-1). (Counting the
+	// writes per granule, up at each write and down at its completion, cost a random read-modify-write per granule.)
 	static constexpr uint32_t   GpuWriteGranuleBits = 16, GpuWriteCounters = 1u << 16u, GpuWriteSpan = 64;
-	std::unique_ptr<uint32_t[]> m_gpu_write_granules = std::make_unique<uint32_t[]>(GpuWriteCounters);
-	size_t                      m_gpu_writes_big     = 0;
-	// Per counter, 1 + the number (m_gpu_writes_base + index) of the last write counted there: no later write touches
-	// those granules, so the walk for a range starts at its granules' last one, not at the log's end.
 	std::unique_ptr<uint64_t[]> m_gpu_write_last = std::make_unique<uint64_t[]>(GpuWriteCounters);
+	// The numbers of the big writes, oldest first (the completed ones dropped at queries): a query looks for an
+	// overlapping one in them (one in flight, a 4-8 MiB copy every frame, made every query walk the log from its end).
+	std::deque<uint64_t>        m_gpu_big_writes;
 	uint64_t                    m_gpu_writes_base = 0; // the number of m_gpu_writes[0]
 	[[nodiscard]] static uint32_t GpuWriteCounter(uint64_t granule) {
 		return static_cast<uint32_t>((granule * 0x9e3779b97f4a7c15ull) >> (64u - 16u));
 	}
-	void CountGpuWrite(const GpuWrite& write, int32_t delta);
 	void ResetGpuWrites();
 	void                  NoteGpuWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] uint64_t InflightWriteTick(uint64_t begin, uint64_t end, uint64_t completed,

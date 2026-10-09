@@ -398,21 +398,21 @@ void AllocateInputVariables(EmitterState& state) {
 		state.interface_variables.push_back(state.lod_helper_variable);
 	}
 
+	const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components, const char* name) {
+		if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) { return input.kind == kind; })) {
+			state.inputs.push_back({kind, 0, components, 0, name});
+		}
+	};
 	if (state.lane_count == 2) {
-		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
-		                             const char* name) {
-			if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) {
-				    return input.kind == kind;
-			    })) {
-				state.inputs.push_back({kind, 0, components, 0, name});
-			}
-		};
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
 			    return input.kind == IR::StageInputKind::GlobalInvocationId;
 		    })) {
 			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		}
+	} else if (state.program.lane_local && state.requirements.subgroup_local_invocation_id) {
+		// (A lane-local wave64 program's GCN lane: BufferByteAddress.)
+		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 	}
 	for (auto& binding: state.inputs) {
 		binding.variable_id = state.builder.AllocateId();

@@ -47,7 +47,8 @@ Kyty PS5 模拟器的 Windows 移植，目标游戏《恶魔之魂》（PPSA0134
 - 问题：游戏第一次遇到新 shader/管线时要现场编译，大的计算 shader 卡 1–3 s 以上。
 - 做法：**静态预编译**——直接从游戏文件收集全部 shader 和管线，提前编译进"静态管线缓存"
   `_PipelineCache/static/PPSA01341_<版本>.bin`（只按 GPU/驱动做 key，跨模拟器版本保留；游戏建管线时先在其中免编译查找）。
-  - 收集：`tools/local/static-precompile/precompile.py seeds`（CSDR 包 + eboot 内嵌 shader + 材质配对 + 学得的渲染状态）。
+  - 收集：`kyty_shader_precompile --make-seeds`（`src/local/static-seeds.cpp`，`tools/local/static-precompile/precompile.py seeds`
+    的 C++ 移植，输出逐字节相同；CSDR 包 + eboot 内嵌 shader + 材质配对 + 学得的渲染状态）。
   - 编译：独立程序 `kyty_shader_precompile.exe`（不开游戏），`precompile-windows.ps1` 分多进程并行、可中断续跑。
   - "便携 shader"（`KYTY_PORTABLE_SHADERS`，默认开）：把只在运行时描述符里的信息（buffer stride、格式、间接纹理表大小、
     空纹理维度）改为运行时读取，使静态编出的模块与游戏运行时的一致。

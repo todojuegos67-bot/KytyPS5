@@ -26,9 +26,14 @@
 
 namespace Libs::Graphics {
 
+// Freed scratch buffers kept for reuse: at most this much.
+static constexpr uint64_t ScratchPoolBudget = 512ull << 20u;
+
 TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
                          StreamBuffer& stream_buffer)
     : m_graphics(graphics), m_scheduler(scheduler), m_stream_buffer(stream_buffer) {
+	// Kept scratch is video memory too: a smaller GPU keeps less (8 GB: ~200 MiB).
+	m_scratch_pool_budget = std::min(ScratchPoolBudget, m_graphics.GetTotalMemoryBudget() / 32);
 	static_assert(FamilyCount == 9);
 	static_assert(sizeof(Push) == 52);
 	std::array<vk::DescriptorSetLayoutBinding, 3> bindings {};
@@ -94,7 +99,6 @@ TileManager::~TileManager() {
 static uint64_t ScratchCapacity(uint64_t size) {
 	return std::max<uint64_t>(uint64_t {1} << 16u, std::bit_ceil(size));
 }
-static constexpr uint64_t ScratchPoolBudget = 512ull << 20u;
 
 TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	EXIT_IF(size == 0);
@@ -133,7 +137,7 @@ void TileManager::DeferDestroy(Scratch scratch) {
 		const auto capacity = ScratchCapacity(scratch.size);
 		{
 			std::scoped_lock lock(m_scratch_mutex);
-			if (m_scratch_pool_bytes + capacity <= ScratchPoolBudget) {
+			if (m_scratch_pool_bytes + capacity <= m_scratch_pool_budget) {
 				m_scratch_pool.push_back({scratch.buffer, scratch.allocation, capacity});
 				m_scratch_pool_bytes += capacity;
 				return;

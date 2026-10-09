@@ -182,6 +182,22 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, uint32_t *value) {
   return true;
 }
 
+bool ReadLinearTestMemorySpan(void *userdata, uint64_t address, uint32_t *values,
+                              uint32_t count, bool) {
+  for (uint32_t i = 0; i < count; i++) {
+    if (!ReadLinearTestMemory(userdata, address + uint64_t{i} * 4u, values + i)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+uint64_t LinearTestMappingEnd(void *userdata, uint64_t address) {
+  const auto *memory = static_cast<const LinearTestMemory *>(userdata);
+  const auto end = memory->base + memory->words.size() * sizeof(uint32_t);
+  return address >= memory->base && address < end ? end : 0;
+}
+
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
                          bool memory_backed_material = false,
@@ -1864,7 +1880,7 @@ void TestFindLsbDenseIndirectImage() {
 }
 
 void TestReadLaneProbeIndirectImage(bool first_lane = false, bool loop_mask = false,
-                                    bool invalid_mask = false) {
+                                    bool invalid_mask = false, bool spans = false) {
   Fixture fixture;
   const auto low = fixture.UserData(0);
   const auto high = fixture.UserData(1);
@@ -1991,6 +2007,55 @@ void TestReadLaneProbeIndirectImage(bool first_lane = false, bool loop_mask = fa
   ResourceSpecialization specialization;
   Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
         "address probe table did not materialize");
+  if (spans) {
+    // The records' keys read a span at a time, and a stale record's key past the table's mapping (no read of its
+    // entry): what word by word reads give.
+    memory_image.words[(0xc00u + 31u * 144u) / 4u] = 0x12345u;
+    Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+          "address probe table with a stale key did not materialize");
+    auto span_runtime = runtime;
+    span_runtime.try_read_memory_span = ReadLinearTestMemorySpan;
+    span_runtime.mapping_end = LinearTestMappingEnd;
+    ResourceSnapshot span_snapshot;
+    ResourceSpecialization span_specialization;
+    Check(MaterializeResources(resource_plan, span_runtime, span_snapshot,
+                               span_specialization) &&
+              span_snapshot.flattened_srt == snapshot.flattened_srt &&
+              span_snapshot.images.size() == snapshot.images.size() &&
+              span_specialization == specialization,
+          "address probe span reads differ from word reads");
+    for (size_t i = 0; i < snapshot.images.size(); i++) {
+      Check(span_snapshot.images[i].dwords == snapshot.images[i].dwords,
+            "address probe span reads found other candidates");
+    }
+    // A refused T# span (one word of key 1's T# unreadable) falls back to reads by key: the same candidates.
+    memory_image.fail_address = memory_image.base + 0x20e0u + 32u + 4u;
+    {
+      ResourceSnapshot word_table, span_table;
+      ResourceSpecialization word_table_specialization, span_table_specialization;
+      const bool word_ok = MaterializeResources(resource_plan, runtime, word_table,
+                                                word_table_specialization);
+      const bool span_ok = MaterializeResources(resource_plan, span_runtime, span_table,
+                                                span_table_specialization);
+      Check(word_ok == span_ok &&
+                (!word_ok || (word_table.flattened_srt == span_table.flattened_srt &&
+                              word_table_specialization == span_table_specialization)),
+            "address probe T# span reads differ where a T# is unreadable");
+    }
+    // A refused span (one record's key unreadable) falls back to word reads: the same outcome as word reads.
+    memory_image.fail_address = memory_image.base + 0xc00u + 7u * 144u;
+    ResourceSnapshot word_failed, span_failed;
+    ResourceSpecialization word_failed_specialization, span_failed_specialization;
+    const bool word_ok = MaterializeResources(resource_plan, runtime, word_failed,
+                                              word_failed_specialization);
+    const bool span_ok = MaterializeResources(resource_plan, span_runtime, span_failed,
+                                              span_failed_specialization);
+    Check(word_ok == span_ok &&
+              (!word_ok || (word_failed.flattened_srt == span_failed.flattened_srt &&
+                            word_failed_specialization == span_failed_specialization)),
+          "address probe span reads skipped an unreadable record key");
+    return;
+  }
   const auto mapping = specialization.images.empty()
                            ? UINT32_MAX
                            : specialization.images[0].indirect_mapping_offset;
@@ -3528,7 +3593,10 @@ int main(int argc, char** argv) {
   }
 
   try {
-    const auto Run = [](const char *name, auto test) {
+    // KYTY_TEST_FILTER: only the tests whose name contains it.
+    const char *filter = std::getenv("KYTY_TEST_FILTER");
+    const auto Run = [filter](const char *name, auto test) {
+      if (filter != nullptr && std::strstr(name, filter) == nullptr) return;
       try {
         test();
       } catch (const std::exception &exception) {
@@ -3559,6 +3627,8 @@ int main(int argc, char** argv) {
     Run("loop-bounded dense images", TestLoopBoundedDenseIndirectImage);
     Run("readlane probe images", [] { TestReadLaneProbeIndirectImage(false); });
     Run("readfirstlane probe images", [] { TestReadLaneProbeIndirectImage(true); });
+    Run("readfirstlane probe images (span reads)",
+        [] { TestReadLaneProbeIndirectImage(true, false, false, true); });
     Run("readfirstlane loop mask", [] { TestReadLaneProbeIndirectImage(true, true); });
     Run("readfirstlane invalid mask", [] { TestReadLaneProbeIndirectImage(true, false, true); });
     Run("readfirstlane invalid loop mask", [] { TestReadLaneProbeIndirectImage(true, true, true); });

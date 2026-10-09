@@ -4,7 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -943,6 +946,19 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	IR::Program result;
 	result.stage               = options.stage;
 	result.wave_size           = options.wave_size;
+	if (options.stage == ShaderType::Compute && options.wave_size == 64u) {
+		// (KYTY_LANE_LOCAL=0: every wave64 program two lanes per invocation, as before; KYTY_LANE_LOCAL_LOG: why not.)
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_LANE_LOCAL");
+			return value == nullptr || std::string_view(value) != "0";
+		}();
+		static const bool log = std::getenv("KYTY_LANE_LOCAL_LOG") != nullptr;
+		std::string reason;
+		result.lane_local = enabled && IsWaveLaneLocal(decoded, log ? &reason : nullptr);
+		if (log)
+			std::printf("LaneLocal CS %016llx: %s\n", static_cast<unsigned long long>(options.shader_hash),
+			            result.lane_local ? "yes" : reason.c_str());
+	}
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
 	result.user_data_count     = options.user_data_count;
@@ -1038,7 +1054,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			total_threads = std::max(workgroup->threads_num[0], 1u) *
 			                std::max(workgroup->threads_num[1], 1u) *
 			                std::max(workgroup->threads_num[2], 1u);
-			if (options.wave_size == 64u && workgroup->host_subgroup_size == 32u &&
+			if (options.wave_size == 64u && workgroup->host_subgroup_size == 32u && !result.lane_local &&
 			    total_threads % 64u != 0u) {
 				initial_exec = entry_ir.ULessThan(builtin(IR::StageInputKind::LocalInvocationIndex),
 				                                  IR::U32(IR::Value(total_threads)));

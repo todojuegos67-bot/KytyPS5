@@ -151,6 +151,31 @@ public:
 		m_partial_dirty = false;
 		m_dirty_ranges.clear();
 	}
+	// A refresh of [begin, end) only (the layers one binding covers): the other ranges stay dirty.
+	void RefreshRangeComplete(uint64_t begin, uint64_t end) {
+		if (!IsPartiallyCpuDirty() || m_maybe_cpu_dirty || begin >= end) {
+			EXIT("image cannot complete a partial refresh\n");
+		}
+		SubtractRange(m_dirty_ranges, begin, end);
+		if (m_dirty_ranges.empty()) {
+			RefreshComplete();
+		}
+	}
+	// Removes [begin, end) from sorted, disjoint ranges.
+	static void SubtractRange(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t begin,
+	                          uint64_t end) {
+		std::vector<std::pair<uint64_t, uint64_t>> kept;
+		kept.reserve(ranges.size() + 1);
+		for (const auto& [range_begin, range_end]: ranges) {
+			if (range_end <= begin || range_begin >= end) {
+				kept.emplace_back(range_begin, range_end);
+				continue;
+			}
+			if (range_begin < begin) kept.emplace_back(range_begin, begin);
+			if (end < range_end) kept.emplace_back(end, range_end);
+		}
+		ranges = std::move(kept);
+	}
 	// Sorted, disjoint [begin, end) ranges; merges adjacent and overlapping ones.
 	static void AddRange(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t begin,
 	                     uint64_t end) {
@@ -262,6 +287,11 @@ public:
 	uint64_t         transit_group      = 0;
 	// Unique per image object: a deleted image's slot id goes to later images.
 	uint64_t         serial             = 0;
+	// The staging copy of the last whole-image upload (null: none or not refillable) and the command buffer it was
+	// recorded in (CommandScheduler::CommandSerial): TextureCache::InitializeImage.
+	const Buffer*    staged_ring        = nullptr;
+	uint64_t         staged_offset      = 0;
+	uint64_t         staged_serial      = 0;
 	// The barrier state (backing.state, backing.subresource_states, transit_group): changed under this lock, which a
 	// speculative translation's thread reads it under (SpeculativeEntry).
 	struct StateLock {

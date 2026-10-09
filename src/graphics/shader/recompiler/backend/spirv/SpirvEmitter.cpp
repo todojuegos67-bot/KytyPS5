@@ -334,10 +334,11 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	    input_info.pixel != nullptr && input_info.pixel->lod_stats_subgroup;
 
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
-	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
-	        ? 2u
-	        : 1u;
+	// (A lane-local wave64 program: one GCN lane per invocation, each 32-wide subgroup a half wave.)
+	state.lane_count = workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u &&
+	                           !program.lane_local
+	                       ? 2u
+	                       : 1u;
 	const auto function_lds = IR::PlanFunctionLdsLayout(program);
 	state.function_lds_slots = function_lds.slots;
 	state.compact_lds_dwords = function_lds.dwords;

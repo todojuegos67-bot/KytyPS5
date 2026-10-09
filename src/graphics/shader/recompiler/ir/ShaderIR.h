@@ -566,9 +566,11 @@ struct ResourceBlock {
 // and stride, resolved from its V#. The shader reads the block through its device address (TableBlockDword).
 struct TablePlan {
 	struct Operand {
-		enum class Kind : uint8_t { Immediate, UserData, Slot };
+		// ShaderBaseLow/High: the low or high dword of the stage's code address plus `value` (a V# of constants the code
+		// embeds, addressed from s_getpc_b64; the renderer has the address from the registers).
+		enum class Kind : uint8_t { Immediate, UserData, Slot, ShaderBaseLow, ShaderBaseHigh };
 		Kind     kind  = Kind::Immediate;
-		uint32_t value = 0; // the immediate, the scalar register or the slot
+		uint32_t value = 0; // the immediate, the scalar register, the slot or the offset from the code address
 		bool     operator==(const Operand&) const = default;
 	};
 	struct Slot {
@@ -588,6 +590,27 @@ struct TablePlan {
 	// Flat or global memory reads: the renderer readies their page table ranges at every use, from the block's slots
 	// and the user data (CompiledShaderInfo::bda_read_plan), as the normal path's PrepareBdaBindings does.
 	bool global_memory = false;
+	// Reads at offsets no slot fixes (a light's record by the index of its bit in a mask): loads by device address,
+	// through the page table, whose ranges the read plan readies (global_memory).
+	bool dynamic_reads = false;
+	// An image an address probe chooses (DescriptorSource::IndirectImage: records whose keys name T#s in a table, the
+	// key the shader's of one record): the renderer enumerates its candidates at every use as resource
+	// materialization does (EnumerateAddressProbe), binds them at the root's and its candidates' elements in an order
+	// of its own and writes the key mapping into the block at `mapping` ([count, (key, candidate)...] by key), which
+	// the shader searches (the root's indirect_mapping_offset: that block dword).
+	struct IndirectImage {
+		uint32_t                        root = 0; // the image whose indirect_resources are its elements
+		DescriptorSource::IndirectImage probe;
+		Operand                         records_low, records_high, heap_low, heap_high; // the tables' addresses
+		uint32_t                        mapping = 0;
+		bool                            operator==(const IndirectImage&) const = default;
+	};
+	// A table program's indirect image has this many elements (the root and its candidates: a draw or dispatch
+	// with fewer candidates binds null images past them), and its mapping room for this many keys.
+	static constexpr uint32_t IndirectCapacity      = 16;
+	static constexpr uint32_t IndirectMaxKeys       = 64;
+	static constexpr uint32_t IndirectMappingDwords = 1 + 2 * IndirectMaxKeys;
+	std::vector<IndirectImage> indirect;
 
 	// A buffer's dwords in the block: its device address (2), size in dwords, buffer word (IR::BufferWord, as
 	// IR::BufferDescriptorWord makes it) and stride, all from the V# the renderer resolved.
@@ -595,7 +618,9 @@ struct TablePlan {
 	[[nodiscard]] uint32_t BufferDword(size_t buffer) const {
 		return static_cast<uint32_t>(slots.size() + BufferDwords * buffer);
 	}
-	[[nodiscard]] uint32_t BlockDwords() const { return BufferDword(buffers.size()); }
+	[[nodiscard]] uint32_t BlockDwords() const {
+		return BufferDword(buffers.size()) + static_cast<uint32_t>(indirect.size()) * IndirectMappingDwords;
+	}
 	bool                   operator==(const TablePlan&) const = default;
 };
 
@@ -664,6 +689,9 @@ struct Program: ResourcePlan {
 	std::vector<std::unique_ptr<Block>> block_storage;
 	BlockList                           blocks;
 	uint32_t                      wave_size      = 64;
+	// A wave64 compute program whose lanes' results depend on no lane outside their 32-lane half
+	// (Frontend::IsWaveLaneLocal): a host with 32-wide subgroups runs it one GCN lane per invocation.
+	bool                          lane_local     = false;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;

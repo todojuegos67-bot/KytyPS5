@@ -4,6 +4,8 @@
 //                          [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines]
 //   kyty_shader_precompile --game <dir> --merge [--prune]
 //   kyty_shader_precompile --game <dir> --seeds <file> --status
+//   kyty_shader_precompile --game <dir> --make-seeds <file> [--states <pass-states.json>]
+//                          [--stages cs,gfx] [--limit <n>]
 //
 // compiles the shaders and pipelines of a seed file on a headless Vulkan device (the one the emulator
 // creates, without a window) into the static pipeline cache _PipelineCache/static/<title>_<version>.bin, which
@@ -22,6 +24,11 @@
 // whether those inputs and the static cache are this GPU's and driver's ("inputs current|stale",
 // "static cache current|stale"; run-windows.ps1 asks before every launch). Run it from the directory
 // the emulator runs in.
+// --make-seeds writes the seed file itself, from the game's files (static-seeds.cpp: every shader the game
+// ships, paired as its materials and the engine draw them, with the render-pass states of pass-states.json,
+// which it finds in tools/local/static-precompile by the program or the working directory): what
+// tools/local/static-precompile/precompile.py seeds writes, byte for byte, without Python and without a
+// Vulkan device.
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -29,6 +36,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "loader/systemContent.h"
+#include "static-seeds.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -43,7 +51,9 @@ static int Usage() {
 	std::fprintf(stderr, "usage: kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] "
 	                     "[--threads <n>] [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines]\n"
 	                     "       kyty_shader_precompile --game <dir> --merge [--prune]\n"
-	                     "       kyty_shader_precompile --game <dir> --seeds <file> --status\n");
+	                     "       kyty_shader_precompile --game <dir> --seeds <file> --status\n"
+	                     "       kyty_shader_precompile --game <dir> --make-seeds <file> [--states <pass-states.json>] "
+	                     "[--stages cs,gfx] [--limit <n>]\n");
 	return 2;
 }
 
@@ -53,6 +63,8 @@ int main(int argc, char* argv[]) {
 	bool                           prune  = false;
 	bool                           status = false;
 	PipelineCache::PrecompileOptions options;
+	StaticSeeds::Options             make_seeds;          // --make-seeds and its options
+	bool                             seed_option = false; // --states, --stages or --limit
 	options.threads = std::max(1u, std::thread::hardware_concurrency());
 	for (int i = 1; i < argc; i++) {
 		const std::string_view arg   = argv[i];
@@ -81,12 +93,33 @@ int main(int argc, char* argv[]) {
 			options.threads = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
 		} else if (arg == "--shard") {
 			if (std::sscanf(argv[++i], "%u/%u", &options.shard, &options.shards) != 2) return Usage();
+		} else if (arg == "--make-seeds") {
+			make_seeds.out = argv[++i];
+		} else if (arg == "--states") {
+			make_seeds.states = argv[++i];
+			seed_option       = true;
+		} else if (arg == "--stages") {
+			make_seeds.stages = argv[++i];
+			seed_option       = true;
+		} else if (arg == "--limit") {
+			char* end        = nullptr;
+			make_seeds.limit = std::strtoll(argv[++i], &end, 10);
+			if (end == argv[i] || *end != '\0') return Usage();
+			seed_option = true;
 		} else {
 			return Usage();
 		}
 	}
-	if (game.empty() || (!merge && options.seeds.empty()) || options.threads == 0 || options.shards == 0 ||
-	    options.shard >= options.shards)
+	// The seed file from the game's files: no Vulkan device, none of the emulator's subsystems.
+	if (!make_seeds.out.empty()) {
+		if (game.empty() || merge || status || !options.seeds.empty()) return Usage();
+		make_seeds.game = game;
+		const int code  = StaticSeeds::Make(make_seeds);
+		std::fflush(nullptr);
+		std::_Exit(code);
+	}
+	if (seed_option || game.empty() || (!merge && options.seeds.empty()) || options.threads == 0 ||
+	    options.shards == 0 || options.shard >= options.shards)
 		return Usage();
 
 	static Common::Subsystems subsystems;

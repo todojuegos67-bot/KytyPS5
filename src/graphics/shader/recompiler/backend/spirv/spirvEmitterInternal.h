@@ -401,6 +401,7 @@ struct EmitterState {
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_lengths {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_strides {};
 	bool table_guarded = false; // a table mode subword store inside its bounds check (StoreSubwordInBounds)
+	uint32_t table_block = 0;   // the block's device address (EmitTableBlockLoad)
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -695,6 +696,8 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 
 void EmitMemoryOffsets(EmitterState& state);
 void EmitTableMode(ValueEmitContext& ctx);
+// Table mode: the block's dword `index` (an id: an indirect image's key mapping), by its device address.
+uint32_t EmitTableBlockLoad(EmitterState& state, uint32_t index);
 
 // The buffer word (IR::BufferWord) of a buffer access's resource, loaded at function entry.
 uint32_t RuntimeBufferWord(const EmitterState& state, const IR::MemoryInfo& mem);

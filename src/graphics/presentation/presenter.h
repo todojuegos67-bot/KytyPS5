@@ -24,6 +24,9 @@ public:
 	[[nodiscard]] Frame&         PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
 	                                               CommandBuffer* producer = nullptr);
 	[[nodiscard]] Frame*         PrepareLastFrame();
+	// The vblank thread, when no flip was presented: shows the frame a present turned away (it came within a display
+	// refresh of the one before) if nothing newer replaced it and the display can take it now.
+	bool                         PresentSkippedIfDue();
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
 	// Only the overlay's content changed (not merely shown).

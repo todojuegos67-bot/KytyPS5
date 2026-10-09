@@ -287,6 +287,212 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	parallel(vertex_jobs.size(), [&](size_t n) {
 		vertex_jobs[n]->second = compile(vertex_jobs[n]->first.first, vertex_jobs[n]->first.second);
 	});
+
+	// The modules the game's other paths make of a seed that carries its recorded specialization (a recorded
+	// warmup file), whose pipelines it otherwise compiles when it meets an area (native XPR variants ~100 ms each,
+	// table mode compute 0.7-4 s), here before it plays:
+	// - exact: the recorded specialization as it is (ProgramCache::Warm: the module a recording's replay gives the
+	//   program, instead of the portable one of a first encounter), at the recorded push data cursor;
+	// - table: ProgramCache::Get's table form of it (no byte-base offsets; no buffer decodes its format from the
+	//   descriptor yet: table_portable 0), translated in table mode at the cursor the table program gets (a pixel
+	//   shader's 0, a vertex shader's after its table pixel program's push data). A program table mode refuses
+	//   (EnterTableMode) has none. With `portable` (bits by buffer: TablePair::portable), the buffers whose V#s a table
+	//   pair saw change format decode the buffer word's (ProgramCache::Get's table_form with table_portable).
+	// A seed without a recorded specialization has neither (its formats are guesses), unless its program binds no
+	// buffer and no image: the empty specialization is then its exact one (a vertex shader drawing from no tables,
+	// whose table pipelines go with many pixel shaders).
+	const auto compile_variant = [&](uint32_t index, bool table, uint32_t push_cursor,
+	                                 uint32_t portable = 0) -> std::unique_ptr<Permutation> {
+		LocalShaderWarmup::Record seed;
+		if (!decode(index, seed)) return nullptr;
+		const bool recorded = !seed.specialization.buffers.empty() || !seed.specialization.images.empty();
+		std::vector<uint32_t> user_data(seed.user_data_count);
+		auto                  options = LocalShaderWarmup::Options(seed, user_data);
+		options.table_mode            = table;
+		try {
+			Common::RecoverableExitScope recoverable;
+			auto translated = ShaderRecompiler::TranslateProgram(seed.code, options);
+			if (!recorded && (!translated.program.info.buffers.empty() || !translated.program.info.images.empty()))
+				return nullptr;
+			auto specialization = std::move(seed.specialization);
+			ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, specialization);
+			if (table) {
+				const auto& buffers = translated.program.info.buffers;
+				for (size_t b = 0; b < specialization.buffers.size(); b++) {
+					auto& buffer            = specialization.buffers[b];
+					buffer.byte_base_offset = false;
+					if (b < 32 && ((portable >> b) & 1u) != 0 && b < buffers.size() &&
+					    ShaderRecompiler::IR::RuntimeBufferFormat(buffers[b])) {
+						buffer.descriptor_format  = Prospero::BufferFormat::kInvalid;
+						buffer.descriptor_swizzle = DstSel(4, 5, 6, 7);
+					}
+				}
+				(void)ShaderRecompiler::IR::TableIndirectForm(specialization, nullptr); // (as ProgramCache::Get's)
+			}
+			auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization,
+			                                               table ? push_cursor : seed.push_cursor);
+			const Spirv     spirv {XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t)),
+			                   result.spirv.size()};
+			ShaderParams    params {seed.code, user_data, seed.hash, seed.back_code};
+			std::lock_guard lock(finish_mutex);
+			auto            permutation = std::make_unique<Permutation>(
+			    programs.FinishPermutation(params, options, std::move(result), std::move(specialization)));
+			spirv_of[permutation.get()] = spirv;
+			return permutation;
+		} catch (Common::RecoverableExit&) {
+			return nullptr; // (a program table mode refuses, or a specialization the recompiler rejects)
+		}
+	};
+	// The seeds of one program (stage, hash, user data count, code and static key: ProgramCache's key) with other
+	// specializations: a table pair takes the table program of the specialization its draw has, a vertex shader's after
+	// its mesh's buffers and a pixel shader's after its material's textures, whatever the pair a recipe was recorded with
+	// (the normal path recorded the pairs it drew before table mode took them).
+	std::vector<uint64_t> program_of(seed_words.size());
+	std::unordered_map<uint64_t, std::vector<uint32_t>> members;
+	for (size_t i = 0; i < seed_words.size(); i++) {
+		const auto& words = seed_words[i];
+		size_t      end   = 5; // (stage, hash, user data count, push cursor; then code, back code, static key)
+		for (int list = 0; list < 3 && end < words.size(); list++) end += 1 + words[end];
+		if (end > words.size() || words.size() < 5) continue;
+		program_of[i] = XXH3_64bits(words.data(), 4 * sizeof(uint32_t)) ^
+		                XXH3_64bits(words.data() + 5, (end - 5) * sizeof(uint32_t)) * 0x9e3779b97f4a7c15ull;
+		members[program_of[i]].push_back(static_cast<uint32_t>(i));
+	}
+	const auto table_recipe = [&](const LocalShaderWarmup::PipelineRecord& recipe) {
+		return recipe.vertex_input.binding_count == 0 && stage_of(recipe.vertex) == ShaderType::Vertex;
+	};
+	const auto group = [&](uint32_t index) -> const std::vector<uint32_t>& {
+		static const std::vector<uint32_t> none;
+		const auto                         found = members.find(program_of[index]);
+		return found != members.end() ? found->second : none;
+	};
+	// The buffers a program's records differ in the format of (bits by buffer): a table pair whose draws or dispatches
+	// meet two of them marks the buffer portable (TablePair::portable) and translates the program again, the buffer
+	// decoding its word's format. Those the runtime can reach: every set of them up to three, else each alone and all.
+	std::unordered_map<uint64_t, uint32_t> varying_of;
+	std::mutex                             varying_mutex;
+	const auto                             varying = [&](uint32_t index) {
+		{
+			std::lock_guard lock(varying_mutex);
+			if (const auto found = varying_of.find(program_of[index]); found != varying_of.end()) return found->second;
+		}
+		uint32_t                                                          bits = 0;
+		std::vector<ShaderRecompiler::IR::ResourceSpecialization::Buffer> first_buffers;
+		bool                                                              have_first = false;
+		for (const auto member: group(index)) {
+			LocalShaderWarmup::Record record;
+			if (!decode(member, record) || record.specialization.buffers.empty()) continue;
+			const auto& buffers = record.specialization.buffers;
+			if (!have_first) {
+				first_buffers = buffers;
+				have_first    = true;
+				continue;
+			}
+			for (size_t b = 0; b < std::min<size_t>({buffers.size(), first_buffers.size(), 32}); b++) {
+				if (buffers[b].descriptor_format != first_buffers[b].descriptor_format ||
+				    buffers[b].descriptor_swizzle != first_buffers[b].descriptor_swizzle)
+					bits |= 1u << b;
+			}
+		}
+		std::lock_guard lock(varying_mutex);
+		varying_of[program_of[index]] = bits;
+		return bits;
+	};
+	const auto portable_sets = [](uint32_t bits) {
+		std::vector<uint32_t> out;
+		if (std::popcount(bits) <= 3) {
+			for (uint32_t set = bits; set != 0; set = (set - 1) & bits) out.push_back(set);
+		} else {
+			for (uint32_t rest = bits; rest != 0; rest &= rest - 1) out.push_back(rest & (~rest + 1));
+			out.push_back(bits);
+		}
+		return out;
+	};
+	std::vector<std::unique_ptr<Permutation>> exact(seed_words.size()), table_first(seed_words.size());
+	// (A table program's variants with portable buffers: by seed and portable set.)
+	std::map<std::pair<uint32_t, uint32_t>, std::unique_ptr<Permutation>> table_more;
+	if (create_pipelines) {
+		std::vector<bool> exact_wanted(seed_words.size()), table_wanted(seed_words.size());
+		for (size_t i = 0; i < seed_words.size(); i++) {
+			exact_wanted[i] = wanted[i];
+			table_wanted[i] = wanted[i] && stage_of(i) == ShaderType::Compute;
+		}
+		for (size_t r = 0; r < recipes.size(); r++) {
+			if (!mine(seed_words.size() + r)) continue;
+			exact_wanted[recipes[r].vertex] = true;
+			if (table_recipe(recipes[r]) && recipes[r].pixel != LocalShaderWarmup::NoShader)
+				for (const auto member: group(recipes[r].pixel)) table_wanted[member] = true;
+		}
+		parallel(seed_words.size(), [&](size_t i) {
+			if (exact_wanted[i]) exact[i] = compile_variant(static_cast<uint32_t>(i), false, 0);
+			if (table_wanted[i]) table_first[i] = compile_variant(static_cast<uint32_t>(i), true, 0);
+		});
+		for (size_t i = 0; i < seed_words.size(); i++) {
+			if (!table_wanted[i] || !table_first[i]) continue;
+			for (const auto set: portable_sets(varying(static_cast<uint32_t>(i))))
+				table_more.try_emplace({static_cast<uint32_t>(i), set});
+		}
+		std::vector<decltype(table_more)::value_type*> more_jobs;
+		for (auto& entry: table_more) more_jobs.push_back(&entry);
+		parallel(more_jobs.size(), [&](size_t n) {
+			more_jobs[n]->second = compile_variant(more_jobs[n]->first.first, true, 0, more_jobs[n]->first.second);
+		});
+	}
+	// A table vertex program's push data starts after its table pixel program's (0 without one).
+	const auto table_cursor = [&](const Permutation* pixel) {
+		uint32_t cursor = 0;
+		if (pixel != nullptr) pixel->program.bindings.AdvancePushData(cursor);
+		return cursor;
+	};
+	// A recipe's table pixel programs: each of its pixel shader's program (none without one: a null entry).
+	const auto table_pixels = [&](const LocalShaderWarmup::PipelineRecord& recipe) {
+		std::vector<const Permutation*> out;
+		if (recipe.pixel == LocalShaderWarmup::NoShader) {
+			out.push_back(nullptr);
+			return out;
+		}
+		std::unordered_set<uint64_t> seen;
+		const auto                   add = [&](const Permutation* permutation) {
+			if (permutation != nullptr && seen.insert(spirv_of.find(permutation)->second.hash).second) out.push_back(permutation);
+		};
+		for (const auto member: group(recipe.pixel)) {
+			add(table_first[member].get());
+			for (auto found = table_more.lower_bound({member, 0}); found != table_more.end() && found->first.first == member;
+			     ++found)
+				add(found->second.get());
+		}
+		return out;
+	};
+	std::map<std::tuple<uint32_t, uint32_t, uint32_t>, std::unique_ptr<Permutation>> table_vertex;
+	// A recipe's vertex shader's portable sets (0: none portable).
+	const auto vertex_sets = [&](const LocalShaderWarmup::PipelineRecord& recipe) {
+		auto sets = portable_sets(varying(recipe.vertex));
+		sets.insert(sets.begin(), 0u);
+		return sets;
+	};
+	if (create_pipelines) {
+		for (size_t r = 0; r < recipes.size(); r++) {
+			if (!mine(seed_words.size() + r) || !table_recipe(recipes[r])) continue;
+			const auto sets = vertex_sets(recipes[r]);
+			for (const auto* pixel: table_pixels(recipes[r]))
+				for (const auto member: group(recipes[r].vertex))
+					for (const auto set: sets) table_vertex.try_emplace({member, table_cursor(pixel), set});
+		}
+		std::vector<decltype(table_vertex)::value_type*> table_jobs;
+		for (auto& entry: table_vertex) table_jobs.push_back(&entry);
+		parallel(table_jobs.size(), [&](size_t n) {
+			const auto [member, cursor, set] = table_jobs[n]->first;
+			table_jobs[n]->second            = compile_variant(member, true, cursor, set);
+		});
+		const auto count = [](const auto& permutations) {
+			return std::ranges::count_if(permutations, [](const auto& permutation) { return permutation != nullptr; });
+		};
+		const auto count_map = [](const auto& permutations) {
+			return std::ranges::count_if(permutations, [](const auto& entry) { return entry.second != nullptr; });
+		};
+		PipelineCacheLog("Shader seeds: {} exact and {} table modules ({} with portable buffers), {} table vertex modules",
+		                 count(exact), count(table_first), count_map(table_more), count_map(table_vertex));
+	}
 	const auto programs_ms = elapsed();
 
 	// Pipelines into the static cache, or a share's into a cache of its own; the objects themselves
@@ -339,6 +545,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	const auto words_of = [&](const Permutation* permutation) {
 		return permutation != nullptr ? spirv_of.find(permutation)->second.words : size_t {0};
 	};
+	const auto spirv_hash = [&](const Permutation* permutation) { return spirv_of.find(permutation)->second.hash; };
 	const auto destroy = [&](Pipeline& pipeline) {
 		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
 		m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
@@ -368,13 +575,27 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 				if (stage_of(n) != ShaderType::Compute) return;
 				LocalShaderWarmup::Record input;
 				if (!decode(static_cast<uint32_t>(n), input)) return;
-				for (const auto& permutation: first[n]) {
-					input.compute.stage.program = &permutation->program;
+				// (`native`: a table mode program's pipeline, TryCreateComputePipeline's.)
+				const auto create = [&](const Permutation& permutation, bool native) {
+					input.compute.stage.program = &permutation.program;
 					Pipeline   pipeline;
 					const auto start = std::chrono::steady_clock::now();
-					CreatePipelineInternal(m_graphics, pipeline, input.compute, permutation->handle.module, driver_cache);
+					CreatePipelineInternal(m_graphics, pipeline, input.compute, permutation.handle.module, driver_cache,
+					                       PipelineBuild::Full, native);
 					destroy(pipeline);
-					created_one(start, words_of(permutation.get()), input.hash, 0);
+					created_one(start, words_of(&permutation), input.hash, 0);
+				};
+				for (const auto& permutation: first[n]) create(*permutation, false);
+				if (exact[n] && std::ranges::none_of(first[n], [&](const auto& permutation) {
+					    return spirv_hash(permutation.get()) == spirv_hash(exact[n].get());
+				    }))
+					create(*exact[n], false);
+				if (table_first[n]) {
+					std::unordered_set<uint64_t> made {spirv_hash(table_first[n].get())};
+					create(*table_first[n], true);
+					for (auto found = table_more.lower_bound({static_cast<uint32_t>(n), 0});
+					     found != table_more.end() && found->first.first == n; ++found)
+						if (found->second && made.insert(spirv_hash(found->second.get())).second) create(*found->second, true);
 				}
 				return;
 			}
@@ -382,20 +603,73 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 			LocalShaderWarmup::Record vs, ps;
 			if (!decode(recipe.vertex, vs) || (recipe.pixel != LocalShaderWarmup::NoShader && !decode(recipe.pixel, ps)))
 				return;
+			// A native XPR record's variant (NativeXprStore): a draw without vertex buffers (not a mesh shader) whose
+			// programs use no DMA and write nothing.
+			const auto readonly = [](const Permutation* permutation) {
+				if (permutation == nullptr) return true;
+				const auto& info = permutation->program.info;
+				return !info.uses_dma &&
+				       std::ranges::none_of(info.buffers, [](const auto& buffer) { return buffer.written || buffer.atomic; }) &&
+				       std::ranges::none_of(info.images, [](const auto& image) {
+					       return image.written || image.atomic ||
+					              image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+				       });
+			};
+			const bool unbuffered = recipe.vertex_input.binding_count == 0 && vs.stage == ShaderType::Vertex;
+			const auto create     = [&](const Permutation& vertex_permutation, const Permutation* pixel, bool native) {
+				vs.vertex.stage.program = &vertex_permutation.program;
+				if (pixel) ps.pixel.stage.program = &pixel->program;
+				Pipeline   pipeline;
+				const auto start = std::chrono::steady_clock::now();
+				CreatePipelineInternal(m_graphics, pipeline, recipe.rendering, recipe.vertex_input, vs.vertex,
+				                       vertex_permutation.handle, pixel ? &ps.pixel : nullptr,
+				                       pixel ? pixel->handle : ShaderProgram {}, recipe.state, driver_cache, native);
+				destroy(pipeline);
+				created_one(start, words_of(&vertex_permutation) + words_of(pixel), vs.hash, pixel != nullptr ? ps.hash : 0);
+			};
+			const auto create_with_native = [&](const Permutation& vertex_permutation, const Permutation* pixel) {
+				create(vertex_permutation, pixel, false);
+				if (unbuffered && readonly(&vertex_permutation) && readonly(pixel)) create(vertex_permutation, pixel, true);
+			};
 			for (const auto& [pixel, cursor]: pixel_variants(recipe)) {
 				const auto found = vertex.find({recipe.vertex, cursor});
 				if (found == vertex.end()) continue;
-				if (pixel) ps.pixel.stage.program = &pixel->program;
-				for (const auto& vertex_permutation: found->second) {
-					vs.vertex.stage.program = &vertex_permutation->program;
-					Pipeline   pipeline;
-					const auto start = std::chrono::steady_clock::now();
-					CreatePipelineInternal(m_graphics, pipeline, recipe.rendering, recipe.vertex_input, vs.vertex,
-					                       vertex_permutation->handle, pixel ? &ps.pixel : nullptr,
-					                       pixel ? pixel->handle : ShaderProgram {}, recipe.state, driver_cache);
-					destroy(pipeline);
-					created_one(start, words_of(vertex_permutation.get()) + words_of(pixel), vs.hash,
-					            pixel != nullptr ? ps.hash : 0);
+				for (const auto& vertex_permutation: found->second) create_with_native(*vertex_permutation, pixel);
+			}
+			// The recording's replay (ProgramCache::Warm, WarmPipelines): its exact modules, unless they are the
+			// portable ones.
+			if (exact[recipe.vertex] && (recipe.pixel == LocalShaderWarmup::NoShader || exact[recipe.pixel])) {
+				const auto* pixel   = recipe.pixel != LocalShaderWarmup::NoShader ? exact[recipe.pixel].get() : nullptr;
+				const auto  same_as = [&](const Permutation* permutation, const Permutation* other) {
+					return permutation == nullptr ? other == nullptr
+					                              : other != nullptr && spirv_hash(permutation) == spirv_hash(other);
+				};
+				bool portable = false;
+				for (const auto& [other_pixel, cursor]: pixel_variants(recipe)) {
+					const auto found = vertex.find({recipe.vertex, cursor});
+					if (found == vertex.end() || !same_as(pixel, other_pixel)) continue;
+					for (const auto& vertex_permutation: found->second)
+						portable |= same_as(exact[recipe.vertex].get(), vertex_permutation.get());
+				}
+				if (!portable) create_with_native(*exact[recipe.vertex], pixel);
+			}
+			// Table mode (TableStore): a draw without vertex buffers, its table programs with native bindings: those of each
+			// specialization of its two programs (the pairs of their SPIR-V once).
+			if (unbuffered) {
+				std::set<std::pair<uint64_t, uint64_t>> made;
+				const auto                              sets = vertex_sets(recipe);
+				for (const auto* pixel: table_pixels(recipe)) {
+					const auto cursor     = table_cursor(pixel);
+					const auto pixel_hash = pixel != nullptr ? spirv_hash(pixel) : 0;
+					for (const auto member: group(recipe.vertex)) {
+						for (const auto set: sets) {
+							const auto found = table_vertex.find({member, cursor, set});
+							if (found == table_vertex.end() || !found->second ||
+							    !made.insert({spirv_hash(found->second.get()), pixel_hash}).second)
+								continue;
+							create(*found->second, pixel, true);
+						}
+					}
 				}
 			}
 		});

@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -20,9 +21,14 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <span>
+#include <string>
+#include <unordered_map>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -249,6 +255,58 @@ static vk::Result CapturePipelineBinaries(GraphicContext& graphics, PipelineCach
 	return result;
 }
 
+bool PipelineKeyLog() {
+	static const bool on = std::getenv("KYTY_PIPELINE_KEY_LOG") != nullptr;
+	return on;
+}
+
+namespace {
+std::mutex                                                          g_key_log_mutex;
+std::unordered_map<VkShaderModule, std::pair<uint64_t, uint64_t>> g_key_log_modules;
+std::unordered_map<VkPipelineLayout, uint64_t>                      g_key_log_layouts;
+
+// (KYTY_PIPELINE_KEY_LOG) What a pipeline layout was made of.
+void NotePipelineKeyLayout(vk::PipelineLayout layout, std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                           bool push_descriptors) {
+	if (!PipelineKeyLog()) return;
+	std::vector<uint32_t> words {push_descriptors ? 1u : 0u, ShaderRecompiler::IR::NativePushConstantSize};
+	for (const auto& binding: bindings) {
+		words.insert(words.end(), {binding.binding, static_cast<uint32_t>(binding.descriptorType), binding.descriptorCount,
+		                           static_cast<uint32_t>(binding.stageFlags)});
+	}
+	std::lock_guard lock(g_key_log_mutex);
+	g_key_log_layouts[static_cast<VkPipelineLayout>(layout)] = XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
+}
+
+std::vector<vk::ShaderModule> ModulesOf(const vk::GraphicsPipelineCreateInfo& info) {
+	std::vector<vk::ShaderModule> modules;
+	for (uint32_t i = 0; i < info.stageCount; i++) modules.push_back(info.pStages[i].module);
+	return modules;
+}
+std::vector<vk::ShaderModule> ModulesOf(const vk::ComputePipelineCreateInfo& info) { return {info.stage.module}; }
+
+template <typename Info>
+void LogPipelineKey(const char* what, const PipelineBinaries::Key& key, const Info& info) {
+	std::lock_guard lock(g_key_log_mutex);
+	const auto      layout = g_key_log_layouts.find(static_cast<VkPipelineLayout>(info.layout));
+	std::string     line   = fmt::format("PIPEKEY {} key={:016x} layout={:016x}", what,
+	                                     XXH3_64bits(key.bytes.data(), key.size),
+	                                     layout != g_key_log_layouts.end() ? layout->second : 0);
+	for (const auto module: ModulesOf(info)) {
+		const auto found = g_key_log_modules.find(static_cast<VkShaderModule>(module));
+		const auto [shader, spirv] =
+		    found != g_key_log_modules.end() ? found->second : std::pair<uint64_t, uint64_t> {0, 0};
+		line += fmt::format(" {:016x}/{:016x}", shader, spirv);
+	}
+	std::printf("%s\n", line.c_str());
+}
+} // namespace
+
+void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash) {
+	std::lock_guard lock(g_key_log_mutex);
+	g_key_log_modules[static_cast<VkShaderModule>(module)] = {shader_hash, spirv_hash};
+}
+
 // The precompile's pipeline another of its shards holds: none is made (the caller destroys a null one).
 static bool ClaimedElsewhere(const GraphicContext& graphics, vk::Result result) {
 	return result == vk::Result::ePipelineCompileRequired && graphics.pipeline_binary_writer != nullptr;
@@ -272,6 +330,7 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 	if (build != PipelineBuild::Optimize && (store != nullptr || writer != nullptr)) {
 		PipelineBinaries::Key key;
 		if (PipelineBinaries::PipelineKey(graphics.device, &info, key)) {
+			if (writer != nullptr && PipelineKeyLog()) LogPipelineKey("tool", key, info);
 			// Another shard of this precompile holds it: no pipeline (see CreatePipelineInternal).
 			if (writer != nullptr && writer->Claimed(key)) return vk::Result::ePipelineCompileRequired;
 			if (const auto binaries = store != nullptr ? store->Load(key) : PipelineBinaries::Handles {};
@@ -288,6 +347,7 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 				}
 				pipeline.pipeline = nullptr;
 			}
+			if (writer == nullptr && PipelineKeyLog()) LogPipelineKey("miss", key, info);
 			if (writer != nullptr) return CapturePipelineBinaries(graphics, pipeline, info, driver_cache, key, create);
 		}
 	}
@@ -571,6 +631,7 @@ void CreatePipelineInternal(
 		}
 		result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 		                                              &pipeline.pipeline_layout);
+		NotePipelineKeyLayout(pipeline.pipeline_layout, descriptor_bindings, pipeline.uses_push_descriptors);
 		if (graphics_debug_dump_enabled()) {
 			LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
 			     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
@@ -719,6 +780,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     1u);
 		const auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 		                                                        &pipeline.pipeline_layout);
+		NotePipelineKeyLayout(pipeline.pipeline_layout, descriptor_bindings, pipeline.uses_push_descriptors);
 		LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

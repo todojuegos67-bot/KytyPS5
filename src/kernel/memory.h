@@ -111,6 +111,9 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
 void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
 void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+// A write of bytes the GPU does not own (no GPU result is written back there while it lasts), one guest mapping's:
+// it does not wait behind TryWriteBacking's writes of GPU results. False when it cannot (TryWriteBacking can).
+bool                   TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 // Destination must be ordinary host storage: copying must not enter guest fault
 // handling. Used by uploads; guest destinations keep TryReadBacking's lock path.
@@ -141,6 +144,8 @@ bool                   RestoreGuestWritable(uint64_t vaddr, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size,
                                          const char** failure_reason = nullptr);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// The end of the guest mapping (one committed virtual range) `vaddr` lies in; 0 when none.
+[[nodiscard]] uint64_t MappingEnd(uint64_t vaddr);
 // Whether guest mappings cover all of [vaddr, vaddr + size), and the parts they cover (as
 // (address, size), in order): what can be read of a range that reaches into unmapped memory.
 [[nodiscard]] bool     IsFullyMapped(uint64_t vaddr, uint64_t size);

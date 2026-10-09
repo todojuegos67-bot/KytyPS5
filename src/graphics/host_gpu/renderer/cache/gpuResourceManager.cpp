@@ -390,25 +390,22 @@ void GpuResourceManager::EndSubmission() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
-	if (m_gpu_flip_pending.exchange(false, std::memory_order_acq_rel)) {
-		AdvanceFrame();
-	}
+	if (std::exchange(m_gpu_flip_pending, false)) RunCollectors();
 }
 
 void GpuResourceManager::AdvanceFrame() {
 	m_texture_cache.AdvanceFrame();
+	RunCollectors();
+}
+
+void GpuResourceManager::RunCollectors() {
 	// Collection runs per frame: per submission (dozens a frame here) its ages of 16 to 160 ticks
 	// were a few frames, and it deleted what the next frames used again.
 	m_texture_cache.RunGarbageCollector();
 	// A shader that reads guest memory through the BDA page table touches no buffer in the LRU: a
 	// buffer collected under it faults back at once, and each registration invalidates every BDA
 	// region proof. Buffers are collected only after a frame without such shaders.
-	// The game uses such shaders every frame, so buffers were never collected (3.3 GB after 25 minutes):
-	// over the video memory budget they are collected once a second anyway (a collected buffer faults
-	// back if a shader still reads it).
-	const bool bda_free = !std::exchange(m_bda_used, false);
-	const bool over     = m_texture_cache.OverCritical();
-	m_buffer_cache.RunGarbageCollector(bda_free || (over && (++m_frames % 60) == 0));
+	m_buffer_cache.RunGarbageCollector(!std::exchange(m_bda_used, false));
 }
 
 } // namespace Libs::Graphics

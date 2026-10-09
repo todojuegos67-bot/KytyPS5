@@ -22,10 +22,8 @@ using Job = void (*)(void* context, uint64_t first, uint64_t last);
 
 class Pool {
 public:
-	static constexpr uint32_t Helpers = 7;
-
-	Pool() {
-		for (uint32_t i = 0; i < Helpers; ++i) std::thread([this] { Run(); }).detach();
+	explicit Pool(uint32_t helpers = 7, const char* name = "Kyty.Pages"): m_name(name) {
+		for (uint32_t i = 0; i < helpers; ++i) std::thread([this] { Run(); }).detach();
 	}
 	Pool(const Pool&)            = delete;
 	Pool& operator=(const Pool&) = delete;
@@ -74,7 +72,7 @@ private:
 	}
 
 	void Run() {
-		LocalPlatform::SetThreadName("Kyty.Pages");
+		LocalPlatform::SetThreadName(m_name);
 		LocalPlatform::AvoidCpuList(std::getenv("KYTY_RENDER_CPUS"));
 		uint32_t seen = 0;
 		for (;;) {
@@ -85,6 +83,7 @@ private:
 		}
 	}
 
+	const char*                       m_name;
 	std::mutex                        m_mutex;
 	uint32_t                          m_jobs    = 0; // (the caller's, under the mutex)
 	Job                               m_job     = nullptr;

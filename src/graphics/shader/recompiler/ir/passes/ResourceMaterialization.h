@@ -97,6 +97,26 @@ void CanonicalizeSpecialization(const ShaderInfo& info, ResourceSpecialization& 
 // first time with it (PipelineCache). False when that leaves the specialization unchanged.
 bool PortableFormats(const ShaderInfo& info, ResourceSpecialization& specialization);
 
+// An address probe's candidates (DescriptorSource::IndirectImage with an item bound) as resource materialization
+// enumerates them for its root image: the keys (key 0, then each record's as first seen), each key's candidate, and
+// the candidates' descriptors (unreadable or invalid ones null, those of other classes than the dominant one null,
+// each once). For table mode (TablePlan::IndirectImage), over the guest memory `runtime` reads.
+struct AddressProbeCandidates {
+	std::vector<uint32_t>        keys;
+	std::vector<uint32_t>        candidates;
+	std::vector<DescriptorValue> descriptors;
+};
+bool EnumerateAddressProbe(const DescriptorSource::IndirectImage& probe, const ImageResource& root,
+                           uint64_t records_base, uint64_t heap_base, const SrtRuntime& runtime,
+                           AddressProbeCandidates& result);
+
+// The table form of a specialization's indirect image (TablePlan::IndirectImage): the root with
+// TablePlan::IndirectCapacity elements whatever its candidates' count, so one table program takes any count (the
+// draw's or dispatch's own null past them), and with the search a table program makes from its block. The snapshot's
+// images (when given) are padded with null descriptors alike. False, unchanged, where table mode takes none: other
+// than one table, fmask images, more candidates.
+bool TableIndirectForm(ResourceSpecialization& specialization, std::vector<DescriptorValue>* snapshot_images);
+
 // The buffer word (BufferWord) of a materialized V#.
 uint32_t BufferDescriptorWord(const DescriptorValue& descriptor);
 

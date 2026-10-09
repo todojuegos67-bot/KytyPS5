@@ -169,7 +169,7 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 	}
 
 	// Capture boundaries follow presentation and exclude concurrent queue access.
-	Common::LockGuard render_lock(renderer.GetMutex());
+	RenderLockGuard render_lock(renderer.GetMutex());
 	Common::LockGuard queue_lock(renderer.GetGraphics().queue_mutex);
 	if (state == RenderDocState::Requested) {
 		StartCapture();

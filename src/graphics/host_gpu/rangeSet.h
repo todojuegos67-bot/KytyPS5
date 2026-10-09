@@ -140,6 +140,30 @@ public:
 		}
 	}
 
+	// The intersections with each interval of `queries` in turn, as ForEachIntersection gives them one query at a time:
+	// one search for the first, then a walk (the queries are sorted and disjoint, as a set's own). A search per query
+	// against ~50K GPU-written ranges after an area streamed in took 80 ms of a walk's slow frames (guest readbacks).
+	template <typename Func>
+	void ForEachIntersection(const RangeSet& queries, Func&& func) const {
+		if (queries.m_ranges.empty() || m_ranges.empty()) return;
+		auto it = UpperBound(queries.m_ranges.front().begin);
+		if (it != m_ranges.begin()) {
+			--it;
+		}
+		for (const auto& query: queries.m_ranges) {
+			while (it != m_ranges.end() && it->end <= query.begin) {
+				++it;
+			}
+			for (auto at = it; at != m_ranges.end() && at->begin < query.end; ++at) {
+				const auto begin = std::max(query.begin, at->begin);
+				const auto last  = std::min(query.end, at->end);
+				if (begin < last) {
+					func(Range {begin, last - begin});
+				}
+			}
+		}
+	}
+
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
 	[[nodiscard]] size_t Count() const { return m_ranges.size(); }
 

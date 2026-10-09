@@ -58,11 +58,12 @@ python3 tools/local/play-demons-souls.py --2k  # 带运行日志的同一正式�
 - 给其他电脑：GitHub Actions（`.github/workflows/build.yml`）编 x86-64-v3 版（`-DKYTY_MARCH=x86-64-v3`；
   `-march=native` 会用到本机的 GFNI，别的 CPU 上直接非法指令），带仓库里的 PGO profile（`tools/pgo/kyty.profdata`），
   装配成发布包：exe、预编译程序、VC++ 运行库 DLL（随包，不用装）、libwinpthread、`run-windows.ps1`、双击用的
-  `run.cmd`、`launcher.cmd`、`precompile.cmd`、`launch.json`（= `run-windows.json`，不绑核）、种子生成脚本
-  （`tools/local/static-precompile`）和给测试者的 `README.md`（源文件 `docs/PORTABLE-README.md`）。只在 Actions 页
+  `run.cmd`、`launcher.cmd`、`precompile.cmd`、`launch.json`（= `run-windows.json`，不绑核）、生成种子用的渲染状态表
+  （`tools/local/static-precompile/pass-states.json`）和给测试者的 `README.md`（源文件 `docs/PORTABLE-README.md`）。只在 Actions 页
   Run workflow 或推 `v*` tag 时编译并发布 release（标为 latest，README 顶部链接到它）；推送代码不触发编译。
   不含游戏、存档、着色器缓存（按 GPU+驱动区分）、Streamline、`srt-aot.dll` 和种子文件（含游戏的 shader 代码）：
-  首次启动由 `run-windows.ps1` 从玩家自己的游戏文件生成 `seeds-<标题>_<版本>.seeds`（Python 3 + numpy，本机 16 秒）。
+  首次启动由 `run-windows.ps1` 从玩家自己的游戏文件生成 `seeds-<标题>_<版本>.seeds`（预编译程序的 `--make-seeds`：
+  `precompile.py seeds` 的 C++ 移植，输出逐字节相同，不再需要 Python + numpy）。
   种子、静态缓存、预取输入和预热录制都按游戏版本命名（`<标题>_<版本>`：1.05 与 1.07 只有 10/约 21000 个 shader
   相同）；旧的只按标题命名的文件由 `run-windows.ps1` / `precompile-windows.ps1` 改名归给上次玩的游戏（`game-path.txt`）。
   窗口比屏幕大时模拟器按比例缩进可用区域。

@@ -28,6 +28,7 @@
 #include <string_view>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -451,8 +452,12 @@ struct Presenter::Impl {
 	// a present blocked there holds the driver's device lock (see Swapchain::Present).
 	std::chrono::steady_clock::time_point last_present {};
 	std::chrono::nanoseconds              min_present_interval {-1}; // -1: not queried yet
+	// A frame PresentDue turned away that no newer present replaced: the vblank thread shows it once the display can
+	// take it (Presenter::PresentSkippedIfDue).
+	bool skipped_unshown = false;
 
-	[[nodiscard]] bool PresentDue() {
+	// `commit`: the present goes ahead now (the next one is timed from it).
+	[[nodiscard]] bool PresentDue(bool commit = true) {
 		if (min_present_interval.count() < 0) {
 			SDL_DisplayMode mode {};
 			const int       display = window.window != nullptr ? SDL_GetWindowDisplayIndex(window.window) : -1;
@@ -465,7 +470,7 @@ struct Presenter::Impl {
 		// A quarter of the interval as slack: a 60 Hz guest on a 60 Hz display flips at the same
 		// rate, and with jitter every third present came a little early (40 fps shown).
 		if (min_present_interval.count() > 0 && now - last_present < min_present_interval * 3 / 4) return false;
-		last_present = now;
+		if (commit) last_present = now;
 		return true;
 	}
 #endif
@@ -864,7 +869,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto*             frame = m_impl->frames.Acquire();
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	RenderLockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
@@ -892,7 +897,10 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire();
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	// Into the GPU thread's command buffer (its flip) under the renderer's lock; the present thread's blank frame
+	// (no producer) touches only the presenter's own scheduler and frame, as Present does.
+	std::optional<RenderLockGuard> render_lock;
+	if (producer != nullptr) render_lock.emplace(m_impl->renderer.GetMutex());
 	frame->fg.valid = false;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
@@ -910,6 +918,24 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 
 Presenter::Frame* Presenter::PrepareLastFrame() {
 	return m_impl->frames.AcquireLast();
+}
+
+bool Presenter::PresentSkippedIfDue() {
+#if defined(_WIN32)
+	// A game above the display's rate had every frame that came within a refresh of the one before turned away, and
+	// the refresh after it showed nothing new when the next frame was late (a 69 fps game on a 60 Hz display: 52
+	// frames a second shown). Each refresh shows the latest frame now. (Frame generation paces its own frames.)
+	if (!m_impl->skipped_unshown || FrameGen::Enabled() || !m_impl->PresentDue(false)) return false;
+	auto* frame = PrepareLastFrame();
+	if (frame == nullptr) {
+		m_impl->skipped_unshown = false; // (the GPU thread took it for a newer frame)
+		return false;
+	}
+	Present(*frame, true);
+	return true;
+#else
+	return false;
+#endif
 }
 
 bool Presenter::IsGuestPaused() const noexcept {
@@ -940,7 +966,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
 #if defined(_WIN32)
 	if (!m_impl->PresentDue()) {
 		// A frame the display could not show anyway (menus and movies run far above it); it
-		// stays the latest frame for an idle refresh.
+		// stays the latest frame for an idle refresh, and the next vblank that finds the display
+		// ready and no newer frame shows it (PresentSkippedIfDue).
+		m_impl->skipped_unshown = true;
 		m_impl->frames.Release(&frame, true);
 		return;
 	}
@@ -963,7 +991,12 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			continue;
 		}
 		{
-			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+			// The present thread records and submits on its own scheduler (present_scheduler: its own pool, timeline
+			// and command buffers; the queue has its own lock), from the presenter's frame image into the swapchain's:
+			// nothing the GPU thread uses. Under the renderer's lock, its GPU thread waited for the whole recording
+			// and submission once a frame (~60 us, ~110 us with the wake-up). Frame generation shares the renderer's.
+			std::optional<RenderLockGuard> render_lock;
+			if (FrameGen::Enabled()) render_lock.emplace(m_impl->renderer.GetMutex());
 			auto&             command          = m_impl->present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    (overlay_visual.active || hud != nullptr) && swapchain.PrepareSystemOverlay(hud);
@@ -1007,6 +1040,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
 
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,
 		                                         std::memory_order_release);
+#if defined(_WIN32)
+		m_impl->skipped_unshown = false;
+#endif
 		m_impl->window.UpdateTitle();
 		m_impl->frames.Release(&frame, true);
 		return;

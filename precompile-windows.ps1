@@ -20,10 +20,12 @@
 # recorded play. An interrupted run resumes: finished shards are merged first, and what the static cache
 # holds is not compiled again (binaries: the final merge keeps only what this run's shards made, so
 # pipelines no seed makes any more are dropped; a .bin left from before is where the first binaries run
-# takes them from without compiling). Build the program with build-windows.cmd kyty_shader_precompile.
-# A release package (.github/workflows/build.yml) has the program, launch.json and the seed file's generator
-# next to this script (precompile.cmd); the seed file is made there. The files are the game version's
-# (seeds-<title>_<version>.seeds): versions need not share shaders.
+# takes them from without compiling). Build the program with build-windows.cmd kyty_shader_precompile; it also
+# makes the seed file when there is none (--make-seeds: the game's shaders from its files, with the render-pass
+# states of tools\local\static-precompile\pass-states.json). A release package (.github/workflows/build.yml) has
+# the program and launch.json next to this script (precompile.cmd) and pass-states.json in that folder below it;
+# the seed file is made there. The files are the game version's (seeds-<title>_<version>.seeds): versions need
+# not share shaders.
 param(
 	[string]$Game = '',
 	# Default: seeds-<title>_<version>.seeds next to this script (a release) or in _Build\static-precompile.
@@ -82,10 +84,11 @@ if (!$Seeds) {
 }
 if ($Recorded -eq '*') { $Recorded = Join-Path (Split-Path $Seeds) "recorded-$gameId.seeds" }
 if (!(Test-Path $Seeds)) {
-	# Every shader the game ships, with the pipelines it draws them with (from the game files).
+	# Every shader the game ships, with the pipelines it draws them with (from the game files, by the program:
+	# precompile.py seeds without Python).
 	New-Item -ItemType Directory -Force (Split-Path $Seeds) | Out-Null
-	python "$PSScriptRoot\tools\local\static-precompile\precompile.py" --game $Game seeds $Seeds
-	if ($LASTEXITCODE) { throw 'precompile.py seeds failed' }
+	& $Exe --game $Game --make-seeds $Seeds --states "$PSScriptRoot\tools\local\static-precompile\pass-states.json"
+	if ($LASTEXITCODE) { throw 'making the seed file failed (kyty_shader_precompile --make-seeds)' }
 }
 if ($Affinity -eq 0) {
 	$config = @("$PSScriptRoot\launch.json", "$PSScriptRoot\run-windows.json") | Where-Object { Test-Path $_ } |

@@ -5,10 +5,60 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
+#include "local-platform.h"
 
 #include <algorithm>
+#include <thread>
 
 namespace Libs::Graphics {
+
+void RenderMutex::BecomeOwner() {
+	EXIT_IF(t_owner);
+	m_mutex.Lock(); // (no requester inside: a later one finds the owner)
+	m_owner_exists = true;
+	m_asymmetric   = LocalPlatform::FlushProcessWriteBuffers();
+	m_owner_depth  = 0;
+	m_owner_locked = false;
+	t_owner        = true;
+	m_mutex.Unlock();
+}
+
+void RenderMutex::ResignOwner() {
+	EXIT_IF(!t_owner || m_owner_depth != 0);
+	m_mutex.Lock();
+	t_owner        = false;
+	m_owner_exists = false;
+	m_mutex.Unlock();
+}
+
+void RenderMutex::OwnerLockSlow() {
+	// A requester holds the mutex or is about to: out, and in after it (or the host has no flush: the mutex always).
+	m_busy.store(0, std::memory_order_release);
+	m_mutex.Lock();
+	m_owner_locked = true;
+}
+
+void RenderMutex::OwnerUnlockSlow() {
+	m_owner_locked = false;
+	m_mutex.Unlock();
+}
+
+void RenderMutex::RequesterLock() {
+	if (t_requester_depth++ != 0) return;
+	m_mutex.Lock();
+	if (!m_owner_exists || !m_asymmetric) return;
+	m_requested.store(1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	// The owner's `busy` store is visible now if it made it, and its next acquisition sees the request.
+	(void)LocalPlatform::FlushProcessWriteBuffers();
+	while (m_busy.load(std::memory_order_acquire) != 0) std::this_thread::yield();
+}
+
+void RenderMutex::RequesterUnlock() {
+	if (--t_requester_depth != 0) return;
+	m_requested.store(0, std::memory_order_release);
+	m_mutex.Unlock();
+}
 
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this), m_compute_render_executor(*this),

@@ -116,10 +116,13 @@ public:
 	}
 
 private:
+	// (The liveness check reads generation and alive, then the caller reads the object: in front of it they share its
+	// first cache line. After it, an object of hundreds of bytes put them on a line of their own: a second cold miss for
+	// every lookup, ~3% of the GPU thread at 1-1.)
 	struct Slot {
-		std::optional<T>      value;
 		std::atomic<uint32_t> generation {1};
 		std::atomic<bool>     alive {false};
+		std::optional<T>      value;
 	};
 	static constexpr uint32_t ChunkBits = 10, ChunkSlots = 1u << ChunkBits, MaxChunks = 1u << 12;
 

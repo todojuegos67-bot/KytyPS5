@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
 #include <array>
@@ -86,17 +87,81 @@ std::optional<TablePlan::Operand> TableOperand(Value value, size_t slots) {
 	return TablePlan::Operand {Kind::Slot, slot.U32()};
 }
 
+// A value of the stage's code address and immediates alone (no user data, memory or control flow).
+bool OfShaderBaseOnly(Value value, uint32_t depth = 0) {
+	value = value.Resolve();
+	if (value.IsImmediate()) return true;
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth > 32) return false;
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::GetShaderBase: return true;
+		case ValueOpcode::Identity:
+		case ValueOpcode::CompositeConstructU64:
+		case ValueOpcode::CompositeExtractU64:
+		case ValueOpcode::CompositeConstructU32x2:
+		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::IAdd64:
+		case ValueOpcode::IAddCarry32:
+		case ValueOpcode::ISub32:
+		case ValueOpcode::ISub64:
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::BitwiseAnd64:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitwiseXor32:
+		case ValueOpcode::ShiftLeftLogical32:
+		case ValueOpcode::ShiftRightLogical32:
+		case ValueOpcode::SelectU1:
+		case ValueOpcode::SelectU32:
+		case ValueOpcode::IEqual32:
+		case ValueOpcode::INotEqual32:
+		case ValueOpcode::ULessThan32:
+		case ValueOpcode::LogicalOr:
+		case ValueOpcode::LogicalAnd:
+		case ValueOpcode::LogicalNot:
+			for (size_t i = 0; i < inst->NumArgs(); ++i)
+				if (!OfShaderBaseOnly(inst->Arg(i), depth + 1)) return false;
+			return true;
+		default: return false;
+	}
+}
+
+// A descriptor's base address dwords (`low`, `high`) as the stage's code address plus an offset below 2^31, the high
+// dword holding nothing else: the offset. Proven by evaluating them at code addresses whose low dword carries into the
+// high one too.
+std::optional<uint32_t> ShaderBaseOffset(Value low, Value high) {
+	if (!OfShaderBaseOnly(low) || !OfShaderBaseOnly(high)) return std::nullopt;
+	const ResourcePlan   none {};
+	const std::array     values {low, high};
+	std::optional<uint32_t> offset;
+	for (const uint64_t base: {0x2'0000'0000ull, 0x2'ffff'ff00ull, 0x9'0271'be00ull, 0x7fff'ffff'ff00ull, 0x3'8000'0000ull}) {
+		SrtRuntime runtime;
+		runtime.shader_base = base;
+		std::array<uint32_t, 2> words {};
+		if (!EvaluateUniformValues(none, values, runtime, words)) return std::nullopt;
+		const auto address = uint64_t {words[0]} | uint64_t {words[1]} << 32u;
+		if (address < base || address - base >= 0x8000'0000ull) return std::nullopt;
+		if (offset && *offset != address - base) return std::nullopt;
+		offset = static_cast<uint32_t>(address - base);
+	}
+	return offset;
+}
+
 } // namespace
 
 void EnterTableMode(Program& program) {
 	const auto refuse = [&](const char* reason) {
 		EXIT("table mode refused: hash=0x%016" PRIx64 " %s\n", program.shader_hash, reason);
 	};
-	if (!program.srt_plan_complete || !program.resource_tracking_complete || !program.dynamic_reads.empty())
+	// Reads at offsets no slot fixes load by device address (LoadBda: the set binds the page table, and the read plan
+	// readies their ranges as the normal path's PrepareBdaBindings does): a compute shader's (the light loops' records).
+	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
+	    (!program.dynamic_reads.empty() && program.stage != ShaderType::Compute))
 		refuse("no complete SRT plan");
 	if (UsesGds(program)) refuse("GDS");
 	TablePlan plan;
 	plan.global_memory = program.info.uses_dma; // (table mode reads its block by device address in any case)
+	plan.dynamic_reads = !program.dynamic_reads.empty();
 	// The flattened SRT's slots in order (a slot's address only depends on lower slots and user data).
 	for (size_t slot = 0; slot < program.srt_reads.size(); ++slot) {
 		const auto* load = program.srt_reads[slot].value.Resolve().TryInstruction();
@@ -120,7 +185,20 @@ void EnterTableMode(Program& program) {
 		if (source_index >= program.descriptor_sources.size()) refuse("a descriptor without a source");
 		const auto& source = program.descriptor_sources[source_index];
 		if (source.dword_count != count || source.indirect_image) refuse("a descriptor table mode cannot evaluate");
+		// A V# of constants the code embeds (s_getpc_b64 plus an offset): its base address words are the code address
+		// plus that offset, which the renderer adds to the address of the pair's code (a compute or pixel shader's: the
+		// one its registers name).
+		std::optional<uint32_t> embedded;
+		if (count == 4 && (program.stage == ShaderType::Compute || program.stage == ShaderType::Pixel) &&
+		    (!TableOperand(source.dwords[0], program.srt_reads.size()) ||
+		     !TableOperand(source.dwords[1], program.srt_reads.size())))
+			embedded = ShaderBaseOffset(source.dwords[0], source.dwords[1]);
 		for (uint32_t i = 0; i < count; ++i) {
+			if (embedded && i < 2) {
+				words[i] = {i == 0 ? TablePlan::Operand::Kind::ShaderBaseLow : TablePlan::Operand::Kind::ShaderBaseHigh,
+				            *embedded};
+				continue;
+			}
 			const auto word = TableOperand(source.dwords[i], program.srt_reads.size());
 			if (!word) refuse("a descriptor word table mode cannot evaluate");
 			words[i] = *word;
@@ -132,9 +210,37 @@ void EnterTableMode(Program& program) {
 			refuse("an aliased, swizzled or ADD_TID buffer");
 		words_of(buffer.source, 4, plan.buffers.emplace_back());
 	}
-	for (const auto& image: program.info.images) {
-		if (image.mip_mode != ImageMipMode::None || image.indirect_root != ImageResource::NoIndirectImage ||
-		    image.indirect_search_iterations != 0)
+	for (uint32_t index = 0; index < program.info.images.size(); ++index) {
+		const auto& image = program.info.images[index];
+		// An address probe's root (a compute shader's sampled image, its only table, in the table form:
+		// TableIndirectForm) and its candidates: the renderer enumerates their words at every use (no words planned).
+		if (image.indirect_root != ImageResource::NoIndirectImage) {
+			if (image.indirect_root == index) {
+				const auto& probe = program.descriptor_sources.at(image.source).indirect_image;
+				if (program.stage != ShaderType::Compute || !probe || probe->item_bound == 0 || probe->key_bound != 0 ||
+				    probe->item_bound + 1u > TablePlan::IndirectMaxKeys || !plan.indirect.empty() ||
+				    image.mip_mode != ImageMipMode::None || image.written || image.atomic ||
+				    image.resource_class == ImageResourceClass::Storage ||
+				    image.indirect_search_iterations != ImageResource::RuntimeIndirectSearch ||
+				    image.indirect_resources.size() != TablePlan::IndirectCapacity)
+					refuse("an indirect image or one of dynamic mip levels");
+				const auto& records = program.descriptor_sources.at(probe->material_source);
+				const auto& heap    = program.descriptor_sources.at(probe->heap_source);
+				const auto  records_low = TableOperand(records.dwords[0], program.srt_reads.size()),
+				           records_high = TableOperand(records.dwords[1], program.srt_reads.size()),
+				           heap_low     = TableOperand(heap.dwords[0], program.srt_reads.size()),
+				           heap_high    = TableOperand(heap.dwords[1], program.srt_reads.size());
+				if (records.dword_count != 2 || heap.dword_count != 2 || !records_low || !records_high || !heap_low ||
+				    !heap_high)
+					refuse("an indirect image table mode cannot address");
+				plan.indirect.push_back({index, *probe, *records_low, *records_high, *heap_low, *heap_high, 0});
+			} else if (plan.indirect.empty() || image.indirect_root != plan.indirect.back().root) {
+				refuse("an indirect image or one of dynamic mip levels");
+			}
+			plan.images.emplace_back(); // (no words)
+			continue;
+		}
+		if (image.mip_mode != ImageMipMode::None || image.indirect_search_iterations != 0)
 			refuse("an indirect image or one of dynamic mip levels");
 		// Pixel and compute shaders may write storage images (TableResolveSet binds them as CommitBindings does: the
 		// deferred decals, the async culling chain's dispatches). The chain's translation is on the frame's critical
@@ -173,6 +279,15 @@ void EnterTableMode(Program& program) {
 	};
 	for (const auto& words: plan.buffers)
 		for (const auto& word: words) mark(plan.cpu, word);
+	// Each indirect image's key mapping after the buffers in the block, which its search reads (the emitter's
+	// LoadMapping in table mode), and the slots of its tables' addresses.
+	for (size_t t = 0; t < plan.indirect.size(); ++t) {
+		auto& entry   = plan.indirect[t];
+		entry.mapping = plan.BufferDword(plan.buffers.size()) + static_cast<uint32_t>(t) * TablePlan::IndirectMappingDwords;
+		program.info.images[entry.root].indirect_mapping_offset = entry.mapping;
+		for (const auto* operand: {&entry.records_low, &entry.records_high, &entry.heap_low, &entry.heap_high})
+			mark(plan.cpu, *operand);
+	}
 	for (const auto* descriptors: {&plan.images, &plan.samplers})
 		for (const auto& descriptor: *descriptors)
 			for (uint32_t i = 0; i < descriptor.count; ++i) mark(plan.cpu, descriptor.words[i]);

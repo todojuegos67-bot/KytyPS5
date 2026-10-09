@@ -159,24 +159,14 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
-	auto* const entry        = SpeculativeEntry();
-	std::optional<StateLock> lock;
-	if (entry == nullptr) {
-		lock.emplace(*this);
-		MoveImageStateEpoch();
-	}
-	auto& state              = entry != nullptr ? entry->state : backing.state;
-	auto& subresource_states = entry != nullptr ? entry->subresources : backing.subresource_states;
-	auto& group              = entry != nullptr ? entry->group : transit_group;
+	auto* const entry = SpeculativeEntry();
 	if (range && info.IsVolume()) {
 		range->base_layer  = 0;
 		range->layer_count = 1;
 	}
-
 	const bool partial =
 	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
-	const bool has_subresource_states = !subresource_states.empty();
 
 	// Reused per thread (each caller records the barriers before the next transition): a vector
 	// per transition was one of the render thread's most frequent allocations.
@@ -187,7 +177,30 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 	// the console, where nothing else orders the storage writes of consecutive draws: no barrier between them
 	// (each was also a render pass break: ~800 per frame in the deferred decal pass). A repeated write after
 	// any other access (an upload, a copy, the emulator's own compute) keeps its barrier.
-	const bool guest = g_transit_group != 0;
+	const bool     guest        = g_transit_group != 0;
+	constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
+	                              vk::AccessFlagBits2::eMemoryWrite;
+	const auto     in_place     = [&](const VulkanImageState& state, uint64_t group) {
+		const bool repeated_write = static_cast<bool>(state.access_mask & write_access);
+		return state.layout == destination_layout && state.access_mask == destination_access &&
+		       (!repeated_write || (guest && state.guest) ||
+		        (DedupeTransitGroups() && g_transit_group != 0 && group == g_transit_group));
+	};
+	// An image already in the layout and access as a whole (a table draw's textures, every draw): nothing changes, so
+	// neither the state lock nor the state epoch, which moving made every table draw after it check and transit its
+	// images again. The barrier state's writer is this thread (the presentation's own transitions run under the
+	// renderer's lock); a speculation's thread only reads it, under the lock.
+	if (entry == nullptr && !partial && backing.subresource_states.empty() && in_place(backing.state, transit_group))
+		return barriers;
+	std::optional<StateLock> lock;
+	if (entry == nullptr) {
+		lock.emplace(*this);
+		MoveImageStateEpoch();
+	}
+	auto&      state                  = entry != nullptr ? entry->state : backing.state;
+	auto&      subresource_states     = entry != nullptr ? entry->subresources : backing.subresource_states;
+	auto&      group                  = entry != nullptr ? entry->group : transit_group;
+	const bool has_subresource_states = !subresource_states.empty();
 	if (partial || has_subresource_states) {
 		if (!has_subresource_states) {
 			subresource_states.resize(info.resources.levels * info.resources.layers, state);
@@ -203,10 +216,7 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 				EXIT_IF(index >= subresource_states.size());
 				auto& subresource_state = subresource_states[index];
 
-				constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
-				                              vk::AccessFlagBits2::eShaderWrite |
-				                              vk::AccessFlagBits2::eMemoryWrite;
-				const bool     repeated_write =
+				const bool repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access) &&
 				    !(guest && subresource_state.guest);
 				if (subresource_state.layout != destination_layout ||
@@ -236,15 +246,7 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 			subresource_states.clear();
 		}
 	} else {
-		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
-		                                vk::AccessFlagBits2::eShaderWrite |
-		                                vk::AccessFlagBits2::eMemoryWrite;
-		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
-		if (state.layout == destination_layout && state.access_mask == destination_access &&
-		    (!repeated_write || (guest && state.guest) ||
-		     (DedupeTransitGroups() && g_transit_group != 0 && group == g_transit_group))) {
-			return barriers;
-		}
+		if (in_place(state, group)) return barriers;
 
 		vk::ImageMemoryBarrier2 barrier {};
 		barrier.srcStageMask                    = state.pl_stage;

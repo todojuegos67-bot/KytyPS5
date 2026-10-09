@@ -132,6 +132,23 @@ struct BufferCache::GuestReadback {
 	std::atomic<uint32_t> state {Pending};
 };
 
+// A value kept between calls on this thread for its storage (a vector's capacity): a call takes it out of `home` and
+// puts it back, so a nested call gets an empty one of its own. (A guest readback's vectors and range set made ~10 heap
+// allocations: 1% of the GPU thread on the 1-1 walk.)
+template <typename T>
+class ScratchValue {
+public:
+	explicit ScratchValue(T& home): m_home(home), m_value(std::move(home)) {}
+	~ScratchValue() { m_home = std::move(m_value); }
+	ScratchValue(const ScratchValue&)            = delete;
+	ScratchValue& operator=(const ScratchValue&) = delete;
+	T& operator*() { return m_value; }
+
+private:
+	T& m_home;
+	T  m_value;
+};
+
 // With the frame pipeline, guest reads of GPU-written memory are copied out
 // asynchronously; read-only GPU bindings may overlap the copy.
 static bool GuestReadbacksEnabled() {
@@ -191,7 +208,10 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 			return {};
 		}
 	}
-	RangeSet available_pages;
+	thread_local RangeSet   available_home;
+	ScratchValue            available_scratch(available_home);
+	auto&                   available_pages = *available_scratch;
+	available_pages.Clear();
 	m_memory_tracker.ForEachDownloadRange<false>(begin, end - begin,
 	    [&](uint64_t a, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, a, bytes, "guest readback");
@@ -205,13 +225,15 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		if (pending) for (const auto& page: pending->pages)
 			available_pages.Subtract(page.address, page.size);
 	}
-	std::vector<DownloadCopy> copies;
+	thread_local std::vector<DownloadCopy> copies_home;
+	ScratchValue                           copies_scratch(copies_home);
+	auto&                                  copies = *copies_scratch;
+	copies.clear();
 	std::vector<GuestRange> pages;
-	available_pages.ForEach([&](uint64_t a, uint64_t end) {
-		pages.push_back({a, end - a});
-		m_gpu_modified_ranges.ForEachIntersection(a, end - a, [&](RangeSet::Range range) {
-			copies.push_back({&buffer, buffer.Offset(range.address), range.address, range.size});
-		});
+	pages.reserve(available_pages.Count());
+	available_pages.ForEach([&](uint64_t a, uint64_t end) { pages.push_back({a, end - a}); });
+	m_gpu_modified_ranges.ForEachIntersection(available_pages, [&](RangeSet::Range range) {
+		copies.push_back({&buffer, buffer.Offset(range.address), range.address, range.size});
 	});
 	if (copies.empty()) {
 		if (completed) *completed = true;
@@ -224,8 +246,11 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	struct Envelope {
 		uint64_t source, size, cursor;
 	};
-	constexpr uint64_t      Gap = 64 * 1024;
-	std::vector<Envelope>   envelopes;
+	constexpr uint64_t                 Gap = 64 * 1024;
+	thread_local std::vector<Envelope> envelopes_home;
+	ScratchValue                       envelopes_scratch(envelopes_home);
+	auto&                              envelopes = *envelopes_scratch;
+	envelopes.clear();
 	std::vector<GuestReadback::Part> parts;
 	parts.reserve(copies.size());
 	uint64_t packed_size = 0;
@@ -283,8 +308,10 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	    ReadbackQueueReady(window, true, request->producer_tick)) {
 		// Also after the slot's last graphics-queue copy (it is submitted: that path flushes).
 		request->producer_tick = std::max(request->producer_tick, m_download_ticks[slot]);
-		std::vector<ReadbackQueue::Queue::Region> regions;
-		regions.reserve(envelopes.size());
+		thread_local std::vector<ReadbackQueue::Queue::Region> regions_home;
+		ScratchValue                                           regions_scratch(regions_home);
+		auto&                                                  regions = *regions_scratch;
+		regions.clear();
 		for (const auto& envelope: envelopes)
 			regions.push_back({buffer.Handle(), {envelope.source, envelope.cursor, envelope.size}});
 		request->parts = std::move(parts);
@@ -337,26 +364,26 @@ static void TraceGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick) {
 	if (LiveTrace::WriteTicks()) LiveTrace::Event(LiveTrace::GpuWrite, vaddr, size | tick << 32u);
 }
 
-// KYTY_READBACK_QUEUE. GPU thread, inside a command: the write is recorded at or after the
-// current tick, so its tick is only set at the next point between commands. Every GPU write
-// into a guest buffer is noted: shader writes, uploads, image copies and buffer joins.
-void BufferCache::CountGpuWrite(const GpuWrite& write, int32_t delta) {
-	if (write.big) {
-		m_gpu_writes_big += delta;
-		return;
-	}
-	for (auto g = write.begin >> GpuWriteGranuleBits; g <= (write.end - 1) >> GpuWriteGranuleBits; ++g)
-		m_gpu_write_granules[GpuWriteCounter(g)] += delta;
-}
-
 void BufferCache::ResetGpuWrites() {
 	m_gpu_writes_base += m_gpu_writes.size(); // (the counters' last numbers stay below it)
 	m_gpu_writes.clear();
 	m_gpu_writes_head = m_gpu_writes_stamped = 0;
-	std::fill_n(m_gpu_write_granules.get(), GpuWriteCounters, 0u);
-	m_gpu_writes_big = 0;
+	m_gpu_big_writes.clear();
+	m_gpu_write_stamps.clear();
 }
 
+// The tick of the write at `index` (UINT64_MAX: not stamped yet).
+uint64_t BufferCache::GpuWriteTick(size_t index) const {
+	if (index >= m_gpu_writes_stamped) return UINT64_MAX;
+	const auto number = m_gpu_writes_base + index;
+	const auto stamp  = std::upper_bound(m_gpu_write_stamps.begin(), m_gpu_write_stamps.end(), number,
+	                                     [](uint64_t value, const auto& entry) { return value < entry.first; });
+	return stamp != m_gpu_write_stamps.end() ? stamp->second : UINT64_MAX;
+}
+
+// KYTY_READBACK_QUEUE. GPU thread, inside a command: the write is recorded at or after the
+// current tick, so its tick is only set at the next point between commands. Every GPU write
+// into a guest buffer is noted: shader writes, uploads, image copies and buffer joins.
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	TraceGpuWrite(vaddr, size, m_scheduler.CurrentTick());
 	if (kyty_local_readback_queue_mode.load(std::memory_order_relaxed) == 0 || m_graphics.readback_queue == nullptr) {
@@ -379,9 +406,10 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	for (size_t i = m_gpu_writes.size(), last = std::max(m_gpu_writes_stamped, i > 4 ? i - 4 : 0); i > last; --i)
 		if (m_gpu_writes[i - 1].begin == vaddr && m_gpu_writes[i - 1].end == vaddr + size) return;
 	const bool big = ((vaddr + size - 1) >> GpuWriteGranuleBits) - (vaddr >> GpuWriteGranuleBits) >= GpuWriteSpan;
-	m_gpu_writes.push_back({vaddr, vaddr + size, 0, big});
-	CountGpuWrite(m_gpu_writes.back(), 1);
-	if (!big) {
+	m_gpu_writes.push_back({vaddr, vaddr + size, big});
+	if (big) {
+		m_gpu_big_writes.push_back(m_gpu_writes_base + m_gpu_writes.size() - 1);
+	} else {
 		const auto number = m_gpu_writes_base + m_gpu_writes.size(); // (1 + the write's)
 		for (auto g = vaddr >> GpuWriteGranuleBits; g <= (vaddr + size - 1) >> GpuWriteGranuleBits; ++g)
 			m_gpu_write_last[GpuWriteCounter(g)] = number;
@@ -397,38 +425,65 @@ uint64_t BufferCache::InflightWriteTick(uint64_t begin, uint64_t end, uint64_t c
                                         bool between_commands) {
 	if (between_commands) {
 		const uint64_t current = m_scheduler.CurrentTick();
-		for (; m_gpu_writes_stamped < m_gpu_writes.size(); ++m_gpu_writes_stamped)
-			m_gpu_writes[m_gpu_writes_stamped].tick = current;
+		if (m_gpu_writes_stamped < m_gpu_writes.size()) {
+			const auto end = m_gpu_writes_base + m_gpu_writes.size();
+			if (!m_gpu_write_stamps.empty() && m_gpu_write_stamps.back().second == current)
+				m_gpu_write_stamps.back().first = end;
+			else
+				m_gpu_write_stamps.emplace_back(end, current);
+			m_gpu_writes_stamped = m_gpu_writes.size();
+		}
 		if (m_gpu_writes_from == UINT64_MAX) m_gpu_writes_from = current;
 	}
 	// Stamps never decrease: the completed writes are a prefix of the dated ones.
-	while (m_gpu_writes_head < m_gpu_writes_stamped && m_gpu_writes[m_gpu_writes_head].tick <= completed)
-		CountGpuWrite(m_gpu_writes[m_gpu_writes_head++], -1);
+	while (!m_gpu_write_stamps.empty() && m_gpu_write_stamps.front().second <= completed) {
+		m_gpu_writes_head = static_cast<size_t>(m_gpu_write_stamps.front().first - m_gpu_writes_base);
+		m_gpu_write_stamps.pop_front();
+	}
 	if (m_gpu_writes_head >= 4096 && m_gpu_writes_head * 2 >= m_gpu_writes.size()) {
 		m_gpu_writes.erase(m_gpu_writes.begin(), m_gpu_writes.begin() + static_cast<std::ptrdiff_t>(m_gpu_writes_head));
 		m_gpu_writes_stamped -= m_gpu_writes_head;
 		m_gpu_writes_base += m_gpu_writes_head;
 		m_gpu_writes_head = 0;
 	}
-	// No write counted in the range's granules (and no write too big to count): none overlaps it. Else none after
-	// the last one counted in them does (a later write would have counted there too).
-	size_t start = m_gpu_writes.size();
-	if (m_gpu_writes_big == 0 && end > begin) {
-		bool     counted = false;
-		uint64_t last    = 0;
-		for (auto g = begin >> GpuWriteGranuleBits; g <= (end - 1) >> GpuWriteGranuleBits; ++g) {
-			counted |= m_gpu_write_granules[GpuWriteCounter(g)] != 0;
-			last = std::max(last, m_gpu_write_last[GpuWriteCounter(g)]);
-		}
-		if (!counted) return 0;
-		if (last > m_gpu_writes_base) start = static_cast<size_t>(std::min<uint64_t>(last - m_gpu_writes_base, start));
-	}
 	// Ticks grow with the index (undated writes are last): the latest overlapping write has the largest.
-	for (size_t i = start; i > m_gpu_writes_head; --i) {
-		const auto& write = m_gpu_writes[i - 1];
-		if (write.begin < end && begin < write.end) return i - 1 < m_gpu_writes_stamped ? write.tick : UINT64_MAX;
+	const auto tick_of = [&](size_t index) { return GpuWriteTick(index); };
+	if (end <= begin) {
+		for (size_t i = m_gpu_writes.size(); i > m_gpu_writes_head; --i) {
+			const auto& write = m_gpu_writes[i - 1];
+			if (write.begin < end && begin < write.end) return tick_of(i - 1);
+		}
+		return 0;
 	}
-	return 0;
+	// The big writes (not in m_gpu_write_last), from their own list: the latest overlapping one.
+	while (!m_gpu_big_writes.empty() && m_gpu_big_writes.front() < m_gpu_writes_base + m_gpu_writes_head)
+		m_gpu_big_writes.pop_front();
+	size_t found = 0; // 1 + the index of the latest overlapping write found
+	for (auto it = m_gpu_big_writes.rbegin(); it != m_gpu_big_writes.rend(); ++it) {
+		const auto  index = static_cast<size_t>(*it - m_gpu_writes_base);
+		const auto& write = m_gpu_writes[index];
+		if (write.begin < end && begin < write.end) {
+			found = index + 1;
+			break;
+		}
+	}
+	// The last small write in the range's granules completed (the in-flight writes are the log's tail): none in flight
+	// overlaps it. Else none after that one does (a later one would be the last there), and one before the overlapping
+	// big write is older than it.
+	uint64_t last = 0;
+	for (auto g = begin >> GpuWriteGranuleBits; g <= (end - 1) >> GpuWriteGranuleBits; ++g)
+		last = std::max(last, m_gpu_write_last[GpuWriteCounter(g)]);
+	if (last > m_gpu_writes_base + m_gpu_writes_head) {
+		const auto start = static_cast<size_t>(std::min<uint64_t>(last - m_gpu_writes_base, m_gpu_writes.size()));
+		for (size_t i = start; i > std::max(m_gpu_writes_head, found); --i) {
+			const auto& write = m_gpu_writes[i - 1];
+			if (!write.big && write.begin < end && begin < write.end) {
+				found = i;
+				break;
+			}
+		}
+	}
+	return found == 0 ? 0 : tick_of(found - 1);
 }
 
 bool BufferCache::ReadbackQueueReady(std::span<const std::pair<uint64_t, uint64_t>> ranges,
@@ -470,7 +525,7 @@ void BufferCache::VerifyReadback(uint64_t address, const uint8_t* fast, const ui
 		for (size_t i = m_gpu_writes_head; i < m_gpu_writes.size() && writes.size() < 300; ++i) {
 			const auto& write = m_gpu_writes[i];
 			if (write.begin < address + size && address < write.end)
-				writes += fmt::format(" [{:#x}+{:#x} t{}{}]", write.begin, write.end - write.begin, write.tick,
+				writes += fmt::format(" [{:#x}+{:#x} t{}{}]", write.begin, write.end - write.begin, GpuWriteTick(i),
 				                      i < m_gpu_writes_stamped ? "" : "?");
 		}
 		std::string bytes;
@@ -689,11 +744,19 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 		feedback.Count(slot, -1);
 	}
 	InvalidateCopyFeedback(vaddr, size);
-	feedback.download.CopyFrom(m_scheduler.Current(), *owner, owner->Offset(vaddr),
-	    selected * CopyFeedback::SlotSize, size, vk::AccessFlagBits::eMemoryWrite,
-	    vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostRead,
-	    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-	    vk::AccessFlagBits::eHostRead);
+	auto& command = m_scheduler.Current();
+	if (command.InCopyRun()) {
+		// The copy just made is in the open run: the snapshot follows the run's copies (CommandBuffer::CopyAfterRun).
+		feedback.download.written_serial = m_scheduler.CommandSerial();
+		command.CopyAfterRun(owner->Handle(), owner->Offset(vaddr), feedback.download.Handle(),
+		                     selected * CopyFeedback::SlotSize, size);
+	} else {
+		feedback.download.CopyFrom(command, *owner, owner->Offset(vaddr), selected * CopyFeedback::SlotSize, size,
+		                           vk::AccessFlagBits::eMemoryWrite,
+		                           vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostRead,
+		                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                           vk::AccessFlagBits::eHostRead);
+	}
 	slot = {vaddr, size, m_scheduler.CurrentTick(), mapping_epoch, owner->Handle()};
 	if (feedback.Insert(vaddr, selected)) feedback.Count(slot, 1);
 	feedback.cursor = (selected + 1) % CopyFeedback::SlotCount;
@@ -733,7 +796,11 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 			--it;
 			const auto& slot = feedback.slots[it->second];
 			if (cursor >= slot.address + slot.size) return false;
-			if (slot.owner != buffer.Handle() || slot.mapping_epoch != mapping_epoch ||
+			// A snapshot of memory unmapped since (every remap unmaps first) is another mapping's. Mappings elsewhere
+			// change nothing in it: the global mapping epoch, which the game's streaming moves every frame or two,
+			// dropped every snapshot then (half of the 1-1 walk's frames read their ~60 snapshotted result pages back
+			// on the copy engine, ~80 us each, on the thread that submits the main batch).
+			if (slot.owner != buffer.Handle() || m_resources->UnmappedSince(slot.mapping_epoch, slot.address, slot.size) ||
 			    !m_resources->IsMapped(slot.address, slot.size) ||
 			    !LibKernel::Memory::IsUniqueGuestBackingRange(slot.address, slot.size)) {
 				return false;
@@ -801,6 +868,12 @@ template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	DrainGuestReadback(m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size());
 	m_sync_buffers_valid = false;
+	if (!m_sync_changes_lost) {
+		if (m_sync_changes.size() < 256)
+			m_sync_changes.push_back({id, m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size(), insert});
+		else
+			m_sync_changes_lost = true;
+	}
 	const auto epoch = m_registration_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
 	if (m_registration_spans.size() < 64) {
 		m_registration_spans.push_back({m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size()});
@@ -1145,6 +1218,8 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 	if (reset) m_lod_stats_buffer.Flush(0, 256 * 16);
 }
 
+static BufferCache* g_sync_cache = nullptr;
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache,
                          GpuResourceManager* resources)
@@ -1167,6 +1242,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache), m_resources(resources) {
 	m_scheduler.SetPrologueHook([this](vk::CommandBuffer command) { FlushPrologueCopies(command); });
 	m_gpu_modified_ranges.AllowFastPath();
+	g_sync_cache = this;
+	LiveCounters::g_sync_report = [] {
+		if (g_sync_cache != nullptr) g_sync_cache->PrintSyncState();
+	};
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	std::memset(m_lod_stats_buffer.Mapped().data(), 0, 256 * 16);
@@ -1200,6 +1279,8 @@ void BufferCache::UpdateGcThresholds() {
 }
 
 BufferCache::~BufferCache() {
+	LiveCounters::g_sync_report = nullptr;
+	g_sync_cache                = nullptr;
 	DrainGuestReadback();
 	m_readback_queue.reset();
     m_graphics.device.destroyPipeline(m_lod_pack_pipeline, nullptr);
@@ -1216,6 +1297,32 @@ BufferCache::~BufferCache() {
 		}
 	}
 	m_buffers.clear();
+}
+
+void BufferCache::PrintSyncState() {
+	auto&    master = m_scheduler.GetMasterSemaphore();
+	uint64_t gpu    = 0;
+	(void)m_graphics.device.getSemaphoreCounterValue(master.Handle(), &gpu);
+	uint64_t queued = 0, done = 0;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	queued = LocalVulkanRecording::DeferredSubmitsQueued();
+	done   = LocalVulkanRecording::DeferredSubmitsDone();
+#endif
+	std::printf("SYNC master gpu=%" PRIu64 " known=%" PRIu64 " current=%" PRIu64 " deferred queued=%" PRIu64 " done=%" PRIu64
+	            " upload pushed=%" PRIu64 "\n",
+	            gpu, master.KnownGpuTick(), m_scheduler.CurrentTick(), queued, done, AsyncUpload::SubmitSequence());
+	if (m_readback_queue)
+		std::printf("SYNC readback queue submitted=%" PRIu64 " counter=%" PRIu64 "\n", m_readback_queue->Submitted(),
+		            m_readback_queue->Counter());
+	for (size_t slot = 0; slot < GuestReadbackSlots; ++slot) {
+		const auto request = m_guest_readbacks[slot];
+		if (!request) continue;
+		std::printf("SYNC readback slot=%zu begin=0x%" PRIx64 " size=0x%" PRIx64 " tick=%" PRIu64 " producer=%" PRIu64
+		            " queue_value=%" PRIu64 " copying=%d copied=%d state=%u\n",
+		            slot, request->begin, request->size, request->tick, request->producer_tick, request->queue_value,
+		            request->copying.load() ? 1 : 0, request->copied.load() ? 1 : 0, request->state.load());
+	}
+	std::fflush(stdout);
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
@@ -1760,7 +1867,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	return {buffer, buffer->Offset(vaddr)};
 }
 
-std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size, bool* refillable) {
 	using Clock = std::chrono::steady_clock;
 	Clock::time_point marks[4] {Clock::now()};
 	const char*       path = "staging";
@@ -1809,32 +1916,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	// records GPU work on it, and every submission waits for the copies pushed before it).
 	if (staging != nullptr && kyty_local_async_upload_mode.load(std::memory_order_relaxed) >= 2 &&
 	    m_staging_buffer.IsCoherent()) {
-		bool queued = false;
-		if (const auto* source = Libs::LibKernel::Memory::TryGetBackingPointer(vaddr, size)) {
-			AsyncUpload::Get().Push(staging, source, size, vaddr);
-			queued = true;
-		} else if (Libs::LibKernel::Memory::TryGetBackingPieces(vaddr, size, m_backing_pieces)) {
-			// Large images usually span several guest mappings.
-			uint64_t offset = 0;
-			for (const auto& [piece, bytes]: m_backing_pieces) {
-				AsyncUpload::Get().Push(staging + offset, piece, bytes, vaddr + offset);
-				offset += bytes;
-			}
-			queued = true;
-		} else {
-			// Partly unmapped (a texture pool with released layers): the worker reads the mapped
-			// parts; the render thread copied hundreds of MiB here synchronously before.
-			path = "sparse";
-			AsyncUpload::Get().PushCall(ReadMappedOrZeroCall, reinterpret_cast<void*>(vaddr),
-			                            reinterpret_cast<uint64_t>(staging), size, vaddr, size);
-			queued = true;
-		}
-		if (queued) {
-			AsyncUpload::Get().Kick();
-			LiveCounters::Add(LiveCounters::AsyncImageBytes, size);
-			m_staging_buffer.Commit();
-			return {&m_staging_buffer, stage_offset};
-		}
+		if (!PushImageStagingCopies(staging, vaddr, size)) path = "sparse";
+		AsyncUpload::Get().Kick();
+		LiveCounters::Add(LiveCounters::AsyncImageBytes, size);
+		m_staging_buffer.Commit();
+		if (refillable != nullptr) *refillable = true;
+		return {&m_staging_buffer, stage_offset};
 	}
 	const char* prt_failure = "not-attempted";
 	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
@@ -1847,6 +1934,44 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};
+}
+
+bool BufferCache::PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint64_t size) {
+	if (const auto* source = Libs::LibKernel::Memory::TryGetBackingPointer(vaddr, size)) {
+		AsyncUpload::Get().Push(staging, source, size, vaddr);
+		return true;
+	}
+	if (Libs::LibKernel::Memory::TryGetBackingPieces(vaddr, size, m_backing_pieces)) {
+		// Large images usually span several guest mappings.
+		uint64_t offset = 0;
+		for (const auto& [piece, bytes]: m_backing_pieces) {
+			AsyncUpload::Get().Push(staging + offset, piece, bytes, vaddr + offset);
+			offset += bytes;
+		}
+		return true;
+	}
+	// Partly unmapped (a texture pool with released layers): the worker reads the mapped
+	// parts; the render thread copied hundreds of MiB here synchronously before.
+	AsyncUpload::Get().PushCall(ReadMappedOrZeroCall, reinterpret_cast<void*>(vaddr),
+	                            reinterpret_cast<uint64_t>(staging), size, vaddr, size);
+	return false;
+}
+
+bool BufferCache::RefillImageStaging(const Buffer& ring, uint64_t offset, uint64_t vaddr, uint64_t size) {
+	// ObtainBufferForImage's staging path, in its order: not over a cached buffer holding the range or GPU-written pages.
+	if (&ring != &m_staging_buffer || !GuestRange {vaddr, size}.Valid() || offset > ring.Size() ||
+	    size > ring.Size() - offset || kyty_local_async_upload_mode.load(std::memory_order_relaxed) < 2 ||
+	    !ring.IsCoherent())
+		return false;
+	DrainGuestReadback(vaddr, size);
+	if (const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	    owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size))
+		return false;
+	if (IsRegionGpuModified(vaddr, size)) return false;
+	(void)PushImageStagingCopies(ring.Mapped().data() + offset, vaddr, size);
+	AsyncUpload::Get().Kick();
+	LiveCounters::Add(LiveCounters::AsyncImageBytes, size);
+	return true;
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<StagingPiece>& pieces,
@@ -2002,8 +2127,10 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		if (!m_memory_tracker.IsRegionFullyCpuModified(address, bytes)) {
 			// (As the write faults would: the images over the pages first.)
 			m_texture_cache.InvalidateMemory(address, bytes);
+			// (The pages are not GPU-modified, CopyBuffer checked: no GPU result is written back there.)
 			if (m_memory_tracker.MarkRegionAsCpuDirtyKeepProtection(address, bytes) &&
-			    Libs::LibKernel::Memory::TryWriteBacking(address, from, bytes)) {
+			    (Libs::LibKernel::Memory::TryWriteCpuBacking(address, from, bytes) ||
+			     Libs::LibKernel::Memory::TryWriteBacking(address, from, bytes))) {
 				Spec::NoteHostWrite(address, bytes);
 				return;
 			}
@@ -2149,6 +2276,7 @@ void BufferCache::RunGarbageCollector(bool collect) {
 		}
 		return ++retire_count == limit;
 	});
+	LiveCounters::Add(LiveCounters::GcBufferDeletes, retire_count);
 	if (dirty_buffers.empty()) {
 		return;
 	}
@@ -2221,8 +2349,58 @@ void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {
 	}
 }
 
+// The index's pieces of a buffer: its range split at tracker region boundaries.
+template <typename Fn>
+static void ForEachSyncPiece(uint64_t address, uint64_t size, Fn&& fn) {
+	const auto end = address + size;
+	for (auto start = address; start < end;) {
+		const auto finish = std::min(end, (start / TRACKER_REGION_SIZE + 1) * TRACKER_REGION_SIZE);
+		fn(start, finish);
+		start = finish;
+	}
+}
+
+// The registration changes into the index, in order; false when one does not fit it (pieces not where they would be:
+// the caller rebuilds). Pieces are sorted by address and disjoint, as registered buffers are.
+bool BufferCache::ApplySyncChanges() {
+	for (const auto& change: m_sync_changes) {
+		const auto end = change.address + change.size;
+		const auto first = std::lower_bound(m_sync_buffers.begin(), m_sync_buffers.end(), change.address,
+		                                    [](const SyncBuffer& piece, uint64_t address) { return piece.start < address; });
+		const auto at    = static_cast<size_t>(first - m_sync_buffers.begin());
+		if (!change.insert) {
+			auto last = at;
+			while (last < m_sync_buffers.size() && m_sync_buffers[last].id == change.id && m_sync_buffers[last].start < end)
+				++last;
+			if (last == at || m_sync_buffers[at].start != change.address || m_sync_buffers[last - 1].end != end) return false;
+			m_sync_buffers.erase(m_sync_buffers.begin() + static_cast<ptrdiff_t>(at),
+			                     m_sync_buffers.begin() + static_cast<ptrdiff_t>(last));
+			m_sync_stamps.erase(m_sync_stamps.begin() + static_cast<ptrdiff_t>(at),
+			                    m_sync_stamps.begin() + static_cast<ptrdiff_t>(last));
+			continue;
+		}
+		auto* buffer = m_slot_buffers.try_get(change.id);
+		if (buffer == nullptr) continue; // (erased since: its removal follows, and finds nothing either)
+		if ((at > 0 && m_sync_buffers[at - 1].end > change.address) ||
+		    (at < m_sync_buffers.size() && m_sync_buffers[at].start < end))
+			return false;
+		size_t count = 0;
+		ForEachSyncPiece(change.address, change.size, [&](uint64_t, uint64_t) { ++count; });
+		m_sync_buffers.insert(m_sync_buffers.begin() + static_cast<ptrdiff_t>(at), count, SyncBuffer {});
+		m_sync_stamps.insert(m_sync_stamps.begin() + static_cast<ptrdiff_t>(at), count, SyncStamp {});
+		auto piece = at;
+		ForEachSyncPiece(change.address, change.size,
+		                 [&](uint64_t start, uint64_t finish) { m_sync_buffers[piece++] = {start, finish, buffer, change.id}; });
+	}
+	return true;
+}
+
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 	DrainGuestReadback(vaddr, size, true);
+	if (!m_sync_buffers_valid && !m_sync_changes_lost && ApplySyncChanges()) {
+		m_sync_changes.clear();
+		m_sync_buffers_valid = true;
+	}
 	if (!m_sync_buffers_valid) {
 		// The pieces of buffers that stayed registered keep their stamps: a stamp is about its own buffer's
 		// contents against the CPU epoch of its region, which another buffer's registration does not move.
@@ -2246,6 +2424,8 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 			}
 		}
 		m_sync_buffers_valid = true;
+		m_sync_changes.clear();
+		m_sync_changes_lost = false;
 	}
 	const auto end = vaddr + size;
 

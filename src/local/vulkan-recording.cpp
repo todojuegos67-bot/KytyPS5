@@ -351,6 +351,8 @@ std::atomic<uint64_t> g_deferred_queued {0};
 std::atomic<uint64_t> g_deferred_done {0};
 } // namespace
 void NoteDeferredSubmitQueued() { g_deferred_queued.fetch_add(1, std::memory_order_release); }
+uint64_t DeferredSubmitsQueued() { return g_deferred_queued.load(std::memory_order_acquire); }
+uint64_t DeferredSubmitsDone() { return g_deferred_done.load(std::memory_order_acquire); }
 void NoteDeferredSubmitDone() {
     g_deferred_done.fetch_add(1, std::memory_order_release);
     g_deferred_done.notify_all();

@@ -30,7 +30,6 @@
 #include "startup-progress.h"
 
 #include <algorithm>
-#include <chrono>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -49,6 +48,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -187,12 +187,28 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 	return true;
 }
 
+uint64_t ShaderMappingEnd(void*, uint64_t address) {
+	return Libs::LibKernel::Memory::MappingEnd(address);
+}
+
 bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
 	// Clean spans also read whole tables (resource materialization); raw spans are SRT groups. The
 	// null page goes word by word (the readers above).
 	return count >= 2 && count <= (clean ? 1024u : 16u) && address >= NullPageEnd &&
 	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
 }
+
+} // namespace
+
+void MaterializationReaders(ShaderRecompiler::IR::SrtRuntime& runtime) {
+	runtime.read_memory                = ReadShaderRawGuestMemory;
+	runtime.read_specialization_memory = ReadShaderGuestMemory;
+	runtime.sync_memory                = SyncShaderGuestMemory;
+	runtime.try_read_memory_span       = ReadShaderMemorySpan;
+	runtime.mapping_end                = ShaderMappingEnd;
+}
+
+namespace {
 
 // Native XPR records evaluate their SRT again over memory the guest may have reused since: a stale
 // pointer on the way fails the evaluation instead of faulting.
@@ -687,6 +703,10 @@ struct PipelineCache::ProgramCache {
 		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 		                     "create recompiled shader module");
 		EXIT_IF(module == nullptr);
+		if (PipelineKeyLog()) {
+			NotePipelineKeyModule(module, options.shader_hash,
+			                      XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t)));
+		}
 		SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
 		                     options.shader_hash);
 		return module;
@@ -768,6 +788,7 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .sync_memory                = SyncShaderGuestMemory,
 		    .try_read_memory_span       = ReadShaderMemorySpan,
+		    .mapping_end                = ShaderMappingEnd,
 		};
 		ShaderReadObserver::Runtime observed_runtime(input_runtime);
 		const auto& runtime = observed_runtime.Get();
@@ -789,6 +810,9 @@ struct PipelineCache::ProgramCache {
 					buffer.descriptor_swizzle = DstSel(4, 5, 6, 7);
 				}
 			}
+			// An indirect image with the table program's elements (its candidates' count is the draw's or dispatch's:
+			// one program takes any), the snapshot it binds from padded alike (TableResolveSet).
+			(void)ShaderRecompiler::IR::TableIndirectForm(table_specialization, &resources.images);
 		};
 		if (entry != programs.end()) {
 			const ShaderRecompiler::IR::ResourceSpecialization* borrowed_specialization = nullptr;
@@ -1277,15 +1301,10 @@ public:
 		for (auto& thread: m_threads) thread.join();
 	}
 	KYTY_CLASS_NO_COPY(CompileWorkers);
-	// urgent: ahead of the queue (a pipeline a draw waits for, not an optimized rebuild).
-	void Push(std::function<void()> job, bool urgent = false) {
+	void Push(std::function<void()> job) {
 		{
 			std::lock_guard lock(m_mutex);
-			if (urgent) {
-				m_jobs.push_front(std::move(job));
-			} else {
-				m_jobs.push_back(std::move(job));
-			}
+			m_jobs.push_back(std::move(job));
 		}
 		m_wake.notify_one();
 	}
@@ -1316,13 +1335,9 @@ private:
 
 PipelineCache::CompileWorkers& PipelineCache::Workers() {
 	if (m_compile_workers == nullptr) {
-		// KYTY_COMPILE_WORKERS, default a quarter of the CPUs (at least 2): entering an area queues dozens of
-		// pipelines of 100-400 ms each, which two threads took seconds to drain (async draws missing meanwhile).
-		uint32_t count = std::max(2u, std::thread::hardware_concurrency() / 4u);
-		if (const char* value = std::getenv("KYTY_COMPILE_WORKERS"); value != nullptr && *value != '\0') {
-			count = static_cast<uint32_t>(std::clamp(std::atoi(value), 1, 64));
-		}
-		m_compile_workers = std::make_unique<CompileWorkers>(count);
+		// The native XPR variants a new area brings (hundreds, ~100 ms each in no cache, unoptimized or not): two
+		// threads queued them for seconds (their draws on the normal path meanwhile). Background threads.
+		m_compile_workers = std::make_unique<CompileWorkers>(std::max(2u, std::thread::hardware_concurrency() / 4u), true);
 	}
 	return *m_compile_workers;
 }
@@ -1335,14 +1350,27 @@ PipelineCache::CompileWorkers& PipelineCache::TableWorkers() {
 	return *m_table_workers;
 }
 
-// KYTY_PIPELINE_FAST_BUILD=0: a pipeline no cache holds is compiled optimized before its first use
-// (up to seconds on NVIDIA) instead of unoptimized now and optimized on a worker.
-static PipelineBuild FirstBuild() {
-	static const bool fast = [] {
+PipelineCache::CompileWorkers& PipelineCache::OptimizeWorkers() {
+	if (m_optimize_workers == nullptr) {
+		m_optimize_workers = std::make_unique<CompileWorkers>(std::max(2u, std::thread::hardware_concurrency() / 4u), true);
+	}
+	return *m_optimize_workers;
+}
+
+// A pipeline no cache holds: compiled unoptimized now (VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) and optimized on a
+// worker, or optimized before its first use (up to seconds on NVIDIA). Unoptimized first only on NVIDIA, where it was
+// measured (~100x faster to compile) and tested. An AMD RX 6700 XT (RDNA2) crashed in its driver at start-up, every
+// run, while the first compute pipelines were made (10-09 report); the precompile, which builds them optimized, ran
+// on that PC without a crash, so the unoptimized build is the suspect (unconfirmed: no AMD GPU here).
+// KYTY_PIPELINE_FAST_BUILD=1 / 0 chooses either on any GPU.
+static PipelineBuild FirstBuild(const GraphicContext& graphics) {
+	static const int fast = [] {
 		const char* value = std::getenv("KYTY_PIPELINE_FAST_BUILD");
-		return value == nullptr || std::string_view(value) != "0";
+		return value == nullptr ? -1 : (std::string_view(value) != "0" ? 1 : 0);
 	}();
-	return fast ? PipelineBuild::Fast : PipelineBuild::Full;
+	constexpr uint32_t NvidiaVendor = 0x10DE;
+	const bool         nvidia       = graphics.GetPhysicalDeviceProperties().vendorID == NvidiaVendor;
+	return fast == 1 || (fast == -1 && nvidia) ? PipelineBuild::Fast : PipelineBuild::Full;
 }
 
 // An unoptimized pipeline (PipelineBuild::Fast): `build` compiles the optimized one on a worker, into
@@ -1355,40 +1383,23 @@ void PipelineCache::BuildOptimized(Pipeline& pipeline, std::function<void(Pipeli
 	auto layouts       = pipeline;
 	layouts.pipeline   = nullptr;
 	layouts.optimized  = nullptr;
-	Workers().Push([this, optimized = pipeline.optimized, layouts, build = std::move(build)]() mutable {
+	OptimizeWorkers().Push([this, optimized = pipeline.optimized, layouts, build = std::move(build)]() mutable {
 		if (!m_stopping.load(std::memory_order_relaxed)) build(layouts);
 		optimized->pipeline = layouts.pipeline;
 		optimized->done.store(true, std::memory_order_release);
 		m_optimized_builds.fetch_add(1, std::memory_order_release);
+		MainPipelineDone();
 	});
+}
+
+void PipelineCache::PromoteFinished() {
+	Common::LockGuard lock(m_mutex);
+	PromoteOptimized();
 }
 
 // Finished optimized builds replace their pipelines in place, for every holder of the Pipeline
 // (native XPR records never look it up again). The unoptimized pipeline stays alive until this
 // cache is destroyed: commands recorded before may still use it.
-void PipelineCache::AdvanceFrame() {
-	Common::LockGuard lock(m_mutex);
-	m_frame++;
-	// 240 frames (4 s at 60 fps): every command buffer recorded with the old handle has long executed
-	// (the scheduler keeps a few frames in flight).
-	constexpr uint64_t keep = 240;
-	size_t freed = 0;
-	while (!m_replaced_pipelines.empty() && m_replaced_pipelines.front().second + keep < m_frame) {
-		m_graphics.device.destroyPipeline(m_replaced_pipelines.front().first, nullptr);
-		m_replaced_pipelines.erase(m_replaced_pipelines.begin());
-		freed++;
-	}
-	m_replaced_freed += freed;
-	static auto last_report = std::chrono::steady_clock::now();
-	if (std::chrono::steady_clock::now() - last_report >= std::chrono::seconds(30)) {
-		last_report = std::chrono::steady_clock::now();
-		std::printf("Pipelines: %zu graphics, %zu compute, %zu compiling, %zu replaced awaiting their free (%zu freed so far)\n",
-		            m_graphics_pipelines.size(), m_compute_pipelines.size(), m_pending_graphics_pipelines.size(),
-		            m_replaced_pipelines.size(), m_replaced_freed);
-		std::fflush(stdout);
-	}
-}
-
 void PipelineCache::PromoteOptimized() {
 	const auto finished = m_optimized_builds.load(std::memory_order_acquire);
 	if (finished == m_promoted_builds) return;
@@ -1397,7 +1408,7 @@ void PipelineCache::PromoteOptimized() {
 		const auto& build = *pipeline->optimized;
 		if (!build.done.load(std::memory_order_acquire)) return false;
 		if (build.pipeline != nullptr) {
-			m_replaced_pipelines.emplace_back(pipeline->pipeline, m_frame);
+			m_replaced_pipelines.push_back(pipeline->pipeline);
 			pipeline->pipeline    = build.pipeline;
 			pipeline->unoptimized = false;
 		}
@@ -1413,6 +1424,12 @@ void PipelineCache::TablePipelineDone() {
 	m_table_pipeline_jobs.fetch_sub(1, std::memory_order_release);
 }
 
+// A pipeline was created with the main driver cache (the saver saves it once such compiles settle).
+void PipelineCache::MainPipelineDone() {
+	m_main_pipeline_last_done.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+	m_main_pipelines_done.fetch_add(1, std::memory_order_release);
+}
+
 void PipelineCache::FinishCompileWorkers() {
 	m_table_cache_saver = {}; // (stops and joins it)
 	if (auto& prefetch = m_program_cache->prefetch; prefetch != nullptr) {
@@ -1424,11 +1441,12 @@ void PipelineCache::FinishCompileWorkers() {
 		prefetch.reset();
 	}
 	m_stopping.store(true, std::memory_order_relaxed);
+	m_optimize_workers.reset();
 	m_table_workers.reset();
 	m_compile_workers.reset();
 	if (m_unoptimized_builds != 0) {
-		PipelineCacheLog("Pipelines compiled unoptimized first: {}, replaced by their optimized build: {} ({} freed while playing)",
-		                 m_unoptimized_builds, m_replaced_pipelines.size() + m_replaced_freed, m_replaced_freed);
+		PipelineCacheLog("Pipelines compiled unoptimized first: {}, replaced by their optimized build: {}",
+		                 m_unoptimized_builds, m_replaced_pipelines.size());
 	}
 	for (auto& [key, pending]: m_pending_graphics_pipelines) {
 		if (pending->done.load(std::memory_order_acquire) && pending->pipeline->pipeline != nullptr) {
@@ -1483,14 +1501,46 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 				}
 			}
 		}
-		m_program_cache->Warm(path, title + device, std::string_view(warmup) == "1", adopt_from);
-		if (std::string_view(warmup) == "1") {
+		// The recorded pipelines (15K, most of other areas) cost ~1 GiB of video memory and ~3 GiB of RAM (5 GiB
+		// committed): a GPU that cannot also hold the game's working set (small_video_memory), or a PC with less RAM
+		// than the ~20 GB the game takes while it loads, makes them when they are first used (~0.75 ms each from the
+		// static precompile's binaries). Such a PC records the shaders but translates none at start-up either: their
+		// SPIR-V and modules took 3.1 GiB of RAM, and the shader prefetch translates every shader of the game in the
+		// background anyway (16 GB reported at 1-1: +76 MiB instead of +3181, the HUD 10 s sooner, the same 59-60 fps
+		// and one slow shader translation).
+		constexpr uint64_t PipelineWarmupMinRam = uint64_t {24} << 30u;
+		const uint64_t     ram                  = LocalPlatform::PhysicalMemory();
+		const bool         low_ram              = ram != 0 && ram < PipelineWarmupMinRam;
+		const bool         compile_shaders      = std::string_view(warmup) == "1" && !low_ram;
+		if (low_ram && std::string_view(warmup) == "1")
+			PipelineCacheLog("Shader warmup: recording only (RAM {} MiB)", ram >> 20u);
+		const auto memory_before = LocalPlatform::ProcessMemory();
+		m_graphics.RefreshMemoryBudget();
+		const auto video_before = m_graphics.GetDeviceMemoryUsage();
+		m_program_cache->Warm(path, title + device, compile_shaders, adopt_from);
+		const auto memory_shaders = LocalPlatform::ProcessMemory();
+		const bool warm_pipelines = !m_graphics.small_video_memory && !low_ram;
+		if (!warm_pipelines && std::string_view(warmup) == "1")
+			PipelineCacheLog("Pipeline warmup: skipped (video memory budget {} MiB, RAM {} MiB)",
+			                 m_graphics.GetTotalMemoryBudget() >> 20u, ram >> 20u);
+		if (std::string_view(warmup) == "1" && warm_pipelines) {
 			const auto begin = std::chrono::steady_clock::now();
 			WarmPipelines();
 			// What the driver had to compile is kept at once: the cache is otherwise written only
 			// at a normal exit, so after a crash the next launch compiled it all again (2+ minutes).
 			if (std::chrono::steady_clock::now() - begin > std::chrono::seconds(5)) (void)Save();
 		}
+		const auto memory_after = LocalPlatform::ProcessMemory();
+		m_graphics.RefreshMemoryBudget();
+		const auto mib = [](uint64_t to, uint64_t from) { return (static_cast<int64_t>(to) - static_cast<int64_t>(from)) >> 20; };
+		PipelineCacheLog("Warmup memory: shaders {:+} MiB committed {:+} MiB resident, pipelines {:+} MiB committed {:+} MiB "
+		                 "resident, video memory {:+} MiB",
+		    mib(memory_shaders.private_bytes, memory_before.private_bytes),
+		    mib(memory_shaders.working_set, memory_before.working_set),
+		    mib(memory_after.private_bytes, memory_shaders.private_bytes),
+		    mib(memory_after.working_set, memory_shaders.working_set),
+		    mib(m_graphics.GetDeviceMemoryUsage(), video_before));
+		m_graphics.LogVideoMemory("warmup");
 		m_program_cache->warmup.StartWriter();
 		if (const char* only = std::getenv("KYTY_SHADER_WARMUP_ONLY"); only && std::string_view(only) == "1") {
 			if (!Save()) {
@@ -1631,8 +1681,7 @@ PipelineCache::~PipelineCache() {
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
 	m_graphics.pipeline_binaries = nullptr;
-	for (const auto& [pipeline, frame]: m_replaced_pipelines) {
-		(void)frame;
+	for (const auto pipeline: m_replaced_pipelines) {
 		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
 	if (m_driver_cache != nullptr) {
@@ -1776,21 +1825,31 @@ void PipelineCache::InitializeDriverCache() {
 		LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
 		std::mutex                  mutex;
 		std::condition_variable_any wake;
-		uint64_t                    saved = m_table_pipelines_done.load();
+		uint64_t                    saved      = m_table_pipelines_done.load();
+		uint64_t                    main_saved = m_main_pipelines_done.load();
+		const auto settled = [](const std::atomic<int64_t>& last_done) {
+			const auto last = std::chrono::steady_clock::time_point(
+			    std::chrono::steady_clock::duration(last_done.load(std::memory_order_acquire)));
+			return std::chrono::steady_clock::now() - last >= std::chrono::seconds(20);
+		};
 		while (!stop.stop_requested()) {
 			{
 				std::unique_lock lock(mutex);
 				wake.wait_for(lock, stop, std::chrono::seconds(5), [] { return false; });
 			}
-			// Once no table pipeline has compiled for 20 s (a burst of new pairs settled).
-			const auto done = m_table_pipelines_done.load(std::memory_order_acquire);
-			const auto last = std::chrono::steady_clock::time_point(
-			    std::chrono::steady_clock::duration(m_table_pipeline_last_done.load(std::memory_order_acquire)));
-			if (stop.stop_requested() || done == saved || m_table_pipeline_jobs.load(std::memory_order_acquire) != 0 ||
-			    std::chrono::steady_clock::now() - last < std::chrono::seconds(20))
-				continue;
-			std::lock_guard save(m_table_cache_mutex);
-			if (SaveDriverCache(m_table_cache, m_table_cache_path, m_table_cache_saved_size)) saved = done;
+			// Each cache once no pipeline has compiled into it for 20 s (a burst of new pairs or pipelines settled).
+			if (stop.stop_requested()) break;
+			if (const auto done = m_table_pipelines_done.load(std::memory_order_acquire);
+			    done != saved && m_table_pipeline_jobs.load(std::memory_order_acquire) == 0 &&
+			    settled(m_table_pipeline_last_done)) {
+				std::lock_guard save(m_table_cache_mutex);
+				if (SaveDriverCache(m_table_cache, m_table_cache_path, m_table_cache_saved_size)) saved = done;
+			}
+			if (const auto done = m_main_pipelines_done.load(std::memory_order_acquire);
+			    done != main_saved && settled(m_main_pipeline_last_done)) {
+				std::lock_guard save(m_main_cache_mutex);
+				if (SaveDriverCache(m_driver_cache, m_driver_cache_path, m_driver_cache_saved_size)) main_saved = done;
+			}
 		}
 	});
 }
@@ -1933,7 +1992,10 @@ bool PipelineCache::Save() {
 	else if (m_program_cache->warmup.Enabled()) PipelineCacheLog("Shader warmup: saved {} inputs and {} pipelines",
 	    m_program_cache->warmup.records.size(), m_program_cache->warmup.pipelines.size());
 	bool saved = inputs_saved;
-	if (m_driver_cache != nullptr) saved &= SaveDriverCache(m_driver_cache, m_driver_cache_path, m_driver_cache_saved_size);
+	if (m_driver_cache != nullptr) {
+		std::lock_guard main(m_main_cache_mutex);
+		saved &= SaveDriverCache(m_driver_cache, m_driver_cache_path, m_driver_cache_saved_size);
+	}
 	if (m_table_cache != nullptr) {
 		std::lock_guard table(m_table_cache_mutex);
 		saved &= SaveDriverCache(m_table_cache, m_table_cache_path, m_table_cache_saved_size);
@@ -2291,28 +2353,13 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 				m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(pending->second, &pending->second->done);
 				return nullptr;
 			}
-			auto job      = pending->second;
-			auto finished = std::move(job->pipeline);
+			auto finished = std::move(pending->second->pipeline);
 			m_pending_graphics_pipelines.erase(pending);
 			EXIT_NOT_IMPLEMENTED(finished->pipeline == nullptr || finished->pipeline_layout == nullptr);
 			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(finished));
 			EXIT_IF(!inserted);
 			if (indexed) {
 				m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
-			}
-			// A normal variant compiled on a worker (KYTY_ASYNC_DRAW_PIPELINES): a warmup recipe as the
-			// blocking path records, so the next launch creates it before the game starts.
-			if (!native_bindings) {
-				LocalShaderWarmup::PipelineRecord recipe;
-				recipe.vertex = m_program_cache->RecordedIndex(vertex_program);
-				recipe.pixel  = ps_active ? m_program_cache->RecordedIndex(pixel_program) : LocalShaderWarmup::NoShader;
-				recipe.rendering    = iter->first.rendering;
-				recipe.vertex_input = iter->first.vertex_input;
-				recipe.state        = iter->first.static_params;
-				if (recipe.vertex != LocalShaderWarmup::NoShader &&
-				    (!ps_active || recipe.pixel != LocalShaderWarmup::NoShader)) {
-					m_program_cache->warmup.AddPipeline(recipe);
-				}
 			}
 			return iter->second.get();
 		}
@@ -2332,14 +2379,22 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		const bool table = vs_input_info.stage.program != nullptr && vs_input_info.stage.program->table_mode;
 		if (table) m_table_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
 		(table ? TableWorkers() : Workers()).Push([this, job, table] {
+			// (KYTY_HITCH_LOG_MS: a pipeline no cache held, compiled while its draws took another path.)
+			SlowLog::Scope slow([&](double ms) {
+				const auto* pixel = job->ps_active ? job->ps_input_info.stage.program : nullptr;
+				std::printf("SLOW AsyncGraphicsPipeline %.1f ms %s VS=0x%016llx PS=0x%016llx\n", ms, table ? "table" : "native",
+				            static_cast<unsigned long long>(job->vs_input_info.stage.program->shader_hash),
+				            static_cast<unsigned long long>(pixel != nullptr ? pixel->shader_hash : 0));
+			}, SlowLog::HitchThreshold());
 			CreatePipelineInternal(m_graphics, *job->pipeline, job->rendering, job->vertex_input,
 			                       job->vs_input_info, job->vertex_program,
 			                       job->ps_active ? &job->ps_input_info : nullptr, job->pixel_program,
 			                       job->static_params, table ? TablePipelineCache() : m_driver_cache,
 			                       job->native_bindings);
 			if (table) TablePipelineDone();
+			else MainPipelineDone();
 			job->done.store(true, std::memory_order_release);
-		}, true);
+		});
 		LiveCounters::Add(LiveCounters::AsyncPipelines);
 		m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 		return nullptr;
@@ -2364,7 +2419,8 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
 	                       vertex_program, ps_input_info, pixel_program, static_params,
-	                       m_driver_cache, native_bindings, FirstBuild());
+	                       m_driver_cache, native_bindings, FirstBuild(m_graphics));
+	MainPipelineDone();
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -2429,7 +2485,8 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 	auto cached = std::make_unique<Pipeline>();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
-	                       FirstBuild());
+	                       FirstBuild(m_graphics));
+	MainPipelineDone();
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
@@ -2479,6 +2536,10 @@ PipelineCache::Pipeline* PipelineCache::TryCreateComputePipeline(const ShaderCom
 	m_pending_compute_pipelines.emplace(compute_program.id, job);
 	m_table_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
 	TableWorkers().Push([this, job] { // (table dispatches' pipelines)
+		SlowLog::Scope slow([&](double ms) {
+			std::printf("SLOW AsyncComputePipeline %.1f ms table CS=0x%016llx\n", ms,
+			            static_cast<unsigned long long>(job->input_info.stage.program->shader_hash));
+		}, SlowLog::HitchThreshold());
 		CreatePipelineInternal(m_graphics, *job->pipeline, job->input_info, job->module, TablePipelineCache(),
 		                       PipelineBuild::Full, true);
 		TablePipelineDone();

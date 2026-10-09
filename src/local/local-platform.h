@@ -26,6 +26,9 @@ bool SetProcessDefaultCpuList(const char* list);
 // Opaque handle of the calling thread for ThreadCpuSeconds (valid while the thread runs).
 uint64_t CurrentThreadHandle();
 double   ThreadCpuSeconds(uint64_t handle);
+// The calling thread's run time in TSC ticks (Windows: QueryThreadCycleTime; exact, unlike the
+// tick-sampled ThreadCpuSeconds). Linux: 0.
+uint64_t CurrentThreadCycles();
 
 // Total CPU seconds of the threads with this name (0 where the OS cannot enumerate them).
 double NamedThreadsCpuSeconds(const char* name);
@@ -33,10 +36,17 @@ double NamedThreadsCpuSeconds(const char* name);
 // Stack bounds of the calling thread; false when unknown.
 bool CurrentThreadStack(uint64_t* low, uint64_t* high);
 
+// Each processor running a thread of the process serializes: their stores made visible, their later loads after
+// the caller's stores (the slow side of an asymmetric lock, RenderMutex). False where the host has no such call.
+bool FlushProcessWriteBuffers();
+
 // The calling thread kept off the CPUs of a list (KYTY_RENDER_CPUS; null or empty: any CPU); with
 // below-normal priority too: background work that must not hold up the game's threads.
 void AvoidCpuList(const char* avoid_cpus);
 void MakeBackgroundThread(const char* avoid_cpus);
+// The calling thread above the normal priority of the game's threads (Windows: THREAD_PRIORITY_HIGHEST; Linux:
+// unchanged): the render thread, which every frame waits for, is not time-sliced against them on its CPUs.
+void MakeCriticalThread();
 
 // A temporary file for scratch data, deleted when it is closed or the process ends (Windows keeps it
 // in memory while it can: FILE_ATTRIBUTE_TEMPORARY); 0 when none could be made. Writes and reads go
@@ -47,6 +57,23 @@ bool     ReadScratchFile(uint64_t file, uint64_t offset, void* data, size_t size
 void     CloseScratchFile(uint64_t file);
 // An existing file (a UTF-8 path) for ReadScratchFile and CloseScratchFile; 0 when it cannot be opened.
 uint64_t OpenFileForReading(const char* path);
+
+// The process's committed private memory and resident working set, and the machine's physical memory, in
+// bytes (0 where the host cannot tell; KYTY_SIMULATE_RAM_MB=<n> reports n MiB of physical memory, for tests).
+struct MemoryUse {
+	uint64_t private_bytes = 0;
+	uint64_t working_set   = 0;
+};
+MemoryUse ProcessMemory();
+uint64_t  PhysicalMemory();
+
+// Windows' own figures for this process's video memory on the GPU with this LUID (Vulkan's deviceLUID, 8 bytes): in
+// use (what Task Manager shows as its dedicated GPU memory) and the budget Windows gives the process (DXGI). NVIDIA's
+// Vulkan heap usage counts what its system memory type holds as well. false where there are none (other systems).
+bool OpenVideoMemoryAdapter(const uint8_t* luid);
+bool QueryVideoMemory(uint64_t* usage, uint64_t* budget);
+// The process's system memory the GPU uses (Task Manager's shared GPU memory).
+bool QuerySharedGpuMemory(uint64_t* usage);
 
 #if defined(_WIN32)
 // With its output in files (run-windows.ps1's logs), the console window a launcher gave the process
@@ -76,9 +103,5 @@ void     CloseThreadForSampling(uint64_t handle);
 // Base address and path of the module that contains the address.
 bool ModuleOf(const void* address, uint64_t* base, char* path, size_t path_size);
 #endif
-
-// The process's memory (bytes): private commit (Windows PrivateUsage / Linux RSS-shared) and the working
-// set (resident); zeros where unknown. For the run log's 30-second "System memory:" line.
-void ProcessMemory(uint64_t* private_bytes, uint64_t* working_set);
 
 } // namespace LocalPlatform

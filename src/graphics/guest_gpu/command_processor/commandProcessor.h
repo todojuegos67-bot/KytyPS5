@@ -218,6 +218,8 @@ private:
 	bool     m_ce_complete = false;
 
 	uint32_t m_const_ram[0x3000] = {0};
+	// The dwords [0, m_const_ram_used) may be nonzero: a reset clears only them (all 48 KiB at every DispatchReset).
+	uint32_t m_const_ram_used = 0;
 
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;
