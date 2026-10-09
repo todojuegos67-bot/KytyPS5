@@ -1558,16 +1558,30 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			                                       state.programs.pixel, false);
 		};
 		async_pipeline = try_create();
-		if (async_pipeline == nullptr) {
+		// The wait is a budget per frame, not per draw: a draw waited up to 3 ms each, and a view with dozens of
+		// objects whose pipelines were compiling spent 20-100 ms a frame spinning here (the same places every
+		// run: draw.bindings in the slow frames, the render thread busy and the GPU idle).
+		static uint64_t                  wait_frame = 0;
+		static std::chrono::microseconds waited {0};
+		if (const auto frame = m_context.FrameNumber(); frame != wait_frame) {
+			wait_frame = frame;
+			waited     = std::chrono::microseconds {0};
+		}
+		if (async_pipeline == nullptr && waited < AsyncDrawWait()) {
 			const auto waiting  = cache.PipelineWaiting();
-			const auto deadline = std::chrono::steady_clock::now() + AsyncDrawWait();
+			const auto start    = std::chrono::steady_clock::now();
+			const auto deadline = start + (AsyncDrawWait() - waited);
 			while (waiting != nullptr && !waiting->load(std::memory_order_acquire) &&
 			       std::chrono::steady_clock::now() < deadline) {
 				std::this_thread::yield();
 			}
+			const auto spent = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
+			waited += spent;
+			LiveCounters::Add(LiveCounters::AsyncDrawWaitUs, static_cast<uint64_t>(spent.count()));
 			async_pipeline = try_create();
 		}
 		if (async_pipeline == nullptr) {
+			LiveCounters::Add(LiveCounters::AsyncDrawSkips);
 			const auto skipped = g_async_draws_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
 			if ((skipped & (skipped - 1)) == 0) {
 				std::printf("Async draw pipelines: %llu draws skipped while their pipelines compile\n",
