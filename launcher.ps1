@@ -9,7 +9,8 @@ $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish 
 	'Portuguese (Portugal)', 'Russian', 'Korean', 'Chinese (Traditional)', 'Chinese (Simplified)', 'Finnish', 'Swedish',
 	'Danish', 'Norwegian', 'Polish', 'Portuguese (Brazil)', 'English (United Kingdom)', 'Turkish', 'Spanish (Latin America)',
 	'Arabic', 'French (Canada)', 'Czech', 'Hungarian', 'Greek', 'Romanian', 'Thai', 'Vietnamese', 'Indonesian'
-$resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160'
+# 21:9 sizes too: the game renders 16:9, shown with side bars (Keep 16:9) or stretched to the whole screen.
+$resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160', '2560x1080', '3440x1440', '3840x1600', '5120x2160'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
 	ecores = $false; fps120 = $false; present = 0; vram = 0; x3d = $false }
