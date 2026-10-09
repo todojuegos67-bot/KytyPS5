@@ -65,7 +65,7 @@ function Get-PlayCommand {
 	# By the graphics card's memory: the emulator's own budget leaves room for Windows and the driver.
 	$vramMb = @(0, 5632, 8192, 10240, 13312)[[Math]::Max(0, [Math]::Min(4, [int]$settings.vramgpu))]
 	if ($vramMb -gt 0) { $arguments += @('-Set', "KYTY_VRAM_BUDGET_MB=$vramMb") }
-	if ([int]$settings.present -eq 1) { $arguments += @('-PresentMode', 'Immediate') } elseif ([int]$settings.present -eq 2) { $arguments += @('-PresentMode', 'Mailbox') }
+	if ([int]$settings.present -eq 1) { $arguments += @('-PresentMode', 'Immediate', '-FlipWhenReady') } elseif ([int]$settings.present -eq 2) { $arguments += @('-PresentMode', 'Mailbox') }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	# The console stays for the live log; after a crash it waits for a key.
 	return 'powershell ' + ($arguments -join ' ') + ' & if !errorlevel! neq 0 pause'
@@ -145,7 +145,7 @@ Add-Row '' @($redzone)
 # How frames reach the display: V-Sync (the default), G-Sync/FreeSync (no V-Sync wait: the monitor follows the
 # game's 60 frames a second), or triple buffering.
 $present = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 320 }
-$present.Items.AddRange(@('V-Sync (default)', 'G-Sync / FreeSync (VRR monitor, fullscreen)', 'Triple buffering (Mailbox)'))
+$present.Items.AddRange(@('V-Sync (default)', 'G-Sync / FreeSync (VRR monitor: frames shown as soon as ready)', 'Triple buffering (Mailbox)'))
 $present.SelectedIndex = [Math]::Max(0, [Math]::Min(2, [int]$settings.present))
 Add-Row 'Sync' @($present)
 # The emulator's video memory: Auto (the card's memory less 3 GB: fewest texture reloads) or a fixed cap.

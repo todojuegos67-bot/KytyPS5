@@ -51,6 +51,7 @@ param(
 	[int]$Language = -1,
 	[int]$FrameGen = 0,
 	[switch]$NoAsyncShaders,
+	[switch]$FlipWhenReady,
 	[string]$Affinity = '',
 	[switch]$Prompt,
 	[switch]$Follow,
@@ -291,6 +292,9 @@ if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 # that stored them took 240-330 ms (570 new pairs before one, 211 before another).
 if (!$environment.Contains('KYTY_TABLE_STORE_BUDGET') -and !$Baseline) { $environment['KYTY_TABLE_STORE_BUDGET'] = '8' }
 if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '40' }
+# -FlipWhenReady: frames shown as soon as they are ready (a VRR display follows them smoothly) instead of at the
+# next 60 Hz tick (16.7 / 33.3 ms steps when the game runs under 60).
+if ($FlipWhenReady) { $environment['KYTY_FLIP_WHEN_READY'] = '1' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 # Async shaders (renderDraw.cpp, KYTY_ASYNC_DRAW_PIPELINES): a draw whose pipeline is not compiled yet does
 # not stop the frame; a worker compiles it and the object appears a few frames later. -NoAsyncShaders: off.

@@ -189,6 +189,7 @@ struct VideoOutConfig {
 	bool                                closing     = false;
 	int                                 flip_rate   = 0;
 	uint64_t                            last_flip_vblank = 0; // vblank_status.count at the last flip
+	uint64_t                            last_flip_qpc    = 0; // QueryPerformanceCounter at the last flip (FlipWhenReady)
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -514,9 +515,31 @@ static bool MoviePlaying() {
 	return now - last < std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(500)).count();
 }
 
+// KYTY_FLIP_WHEN_READY=1: a ready frame is presented as soon as one vblank period has passed since the
+// last flip, not at the next vblank tick. A frame that took 18 ms waited for the 33 ms tick (the display saw
+// 16.7 / 33.3 ms steps, 46-52 fps with a juddering frame time graph); now it shows at 18 ms, which a VRR
+// (G-Sync / FreeSync) display follows smoothly. The vblank itself keeps its 60 Hz (the game's clock), and
+// flips stay at most one per vblank period, so the game's speed and its movies are unchanged.
+static bool FlipWhenReady() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FLIP_WHEN_READY");
+		return value != nullptr && *value != '\0' && *value != '0';
+	}();
+	return enabled;
+}
+
 static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, bool capped) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
+	}
+	if (FlipWhenReady()) {
+		const auto     frequency = Common::Timer::QueryPerformanceFrequency();
+		const uint64_t period    = std::max<uint64_t>(frequency / std::max(Config::GetVblankFrequency(), 1u), 1);
+		uint64_t       intervals = static_cast<uint64_t>(cfg.flip_rate) + 1u;
+		if (const uint32_t ratio = Config::GetVblankFrequency() / 60; ratio > 1 && MoviePlaying()) intervals = std::max<uint64_t>(intervals, ratio);
+		if (const int floor = capped ? FlipRateFloor() : 0; floor > cfg.flip_rate) intervals = static_cast<uint64_t>(floor) + 1u;
+		// 3% of slack: a frame ready a hair before the period would otherwise wait a whole extra millisecond.
+		return Common::Timer::QueryPerformanceCounter() - cfg.last_flip_qpc >= period * intervals * 97 / 100;
 	}
 	if (const uint32_t ratio = Config::GetVblankFrequency() / 60; ratio > 1 && MoviePlaying()) {
 		return cfg.vblank_status.count - cfg.last_flip_vblank >= ratio;
@@ -832,8 +855,17 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		if (total_wait > 0) {
 			const auto remaining_us =
 			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
-			Common::Thread::SleepMicro(static_cast<uint32_t>(
-			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
+			if (FlipWhenReady() && !m_presenter.IsGuestPaused()) {
+				// Until the next vblank tick, in 1 ms steps: a frame that became ready is presented at once
+				// (IsFlipDueLocked keeps flips a vblank period apart).
+				const auto until = sleep_begin + static_cast<uint64_t>(total_wait);
+				while (!token.stop_requested() && Common::Timer::QueryPerformanceCounter() < until) {
+					if (!m_flip_queue.Flip(0)) Common::Thread::SleepMicro(1000);
+				}
+			} else {
+				Common::Thread::SleepMicro(static_cast<uint32_t>(
+				    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
+			}
 		}
 		if (token.stop_requested()) {
 			break;
@@ -1194,6 +1226,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
 		r.cfg->flip_status.count++;
 		r.cfg->last_flip_vblank                     = r.cfg->vblank_status.count;
+		r.cfg->last_flip_qpc                        = Common::Timer::QueryPerformanceCounter();
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
 		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
