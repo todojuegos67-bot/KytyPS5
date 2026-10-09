@@ -374,8 +374,12 @@ $seeds = @("$PSScriptRoot\$seedName", "$PSScriptRoot\_Build\static-precompile\$s
 # precompile-windows.ps1 makes it (Python 3 with numpy; 16 s on 22 CPUs).
 $generator = "$PSScriptRoot\tools\local\static-precompile\precompile.py"
 if (!$seeds -and !$Precompile -and (Test-Path $tool) -and (Test-Path $generator)) {
-	cmd /c 'python -c "import numpy" >nul 2>nul'
-	if ($LASTEXITCODE -eq 0) {
+	# (No cmd.exe here: a DLL some overlays inject keeps it from starting, 0xc0000142.)
+	$hasNumpy = $false
+	if (Get-Command python -ErrorAction SilentlyContinue) {
+		try { $null = & python -c 'import numpy' 2>$null; $hasNumpy = $LASTEXITCODE -eq 0 } catch { $hasNumpy = $false }
+	}
+	if ($hasNumpy) {
 		$made = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\static-precompile\$seedName" } else { "$PSScriptRoot\$seedName" }
 		New-Item -ItemType Directory -Force (Split-Path $made) | Out-Null
 		Write-Host "shaders:  listing the game's shaders from its files (once)"

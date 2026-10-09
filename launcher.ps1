@@ -55,20 +55,27 @@ public static int[] Query() {
 }
 $efficiencyMask = Get-EfficiencyMask
 
-function Get-PlayCommand {
+# The play / precompile command lines, run by PowerShell itself: no cmd.exe (an overlay or monitoring program that injects a DLL into
+# every process can keep cmd.exe from starting, error 0xc0000142, while PowerShell starts fine).
+function Get-PlayArguments {
 	$size = $settings.resolution -split 'x'
-	$arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$root\run-windows.ps1`"", '-Prompt', '-Follow',
-		'-Width', $size[0], '-Height', $size[1], '-Language', $settings.language)
-	if ($settings.fullscreen) { $arguments += '-Fullscreen'; if ($settings.aspect) { $arguments += '-AspectFit' } }
-	if (!$settings.redzone) { $arguments += '-NoRedZone' }
-	if ($settings.x3d) { $arguments += @('-Affinity', 'FFFF') }
-	# By the graphics card's memory: the emulator's own budget leaves room for Windows and the driver.
+	$script = @("'$root\run-windows.ps1'", '-Prompt', '-Follow', '-Width', $size[0], '-Height', $size[1], '-Language', $settings.language)
+	if ($settings.fullscreen) { $script += '-Fullscreen'; if ($settings.aspect) { $script += '-AspectFit' } }
+	if (!$settings.redzone) { $script += '-NoRedZone' }
+	if ($settings.x3d) { $script += @('-Affinity', 'FFFF') }
 	$vramMb = @(0, 6656, 8192, 10240, 13312)[[Math]::Max(0, [Math]::Min(4, [int]$settings.vramgpu))]
-	if ($vramMb -gt 0) { $arguments += @('-Set', "KYTY_VRAM_BUDGET_MB=$vramMb") }
-	if ([int]$settings.present -eq 1) { $arguments += @('-PresentMode', 'Immediate', '-FlipWhenReady') } elseif ([int]$settings.present -eq 2) { $arguments += @('-PresentMode', 'Mailbox') }
-	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
-	# The console stays for the live log; after a crash it waits for a key.
-	return 'powershell ' + ($arguments -join ' ') + ' & if !errorlevel! neq 0 pause'
+	if ($vramMb -gt 0) { $script += @('-Set', "KYTY_VRAM_BUDGET_MB=$vramMb") }
+	if ([int]$settings.present -eq 1) { $script += @('-PresentMode', 'Immediate', '-FlipWhenReady') } elseif ([int]$settings.present -eq 2) { $script += @('-PresentMode', 'Mailbox') }
+	if ($settings.game) { $script += "-Game '$($settings.game.Replace("'", "''"))'" }
+	$command = '& ' + ($script -join ' ') + '; if ($LASTEXITCODE -ne 0) { Read-Host ''Press Enter to close'' | Out-Null }'
+	return @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $command)
+}
+function Get-PrecompileArguments {
+	$script = @("'$root\precompile-windows.ps1'")
+	if ($settings.ecores -and $efficiencyMask -ne 0) { $script += @('-Affinity', $efficiencyMask) }
+	if ($settings.game) { $script += "-Game '$($settings.game.Replace("'", "''"))'" }
+	$command = '& ' + ($script -join ' ') + '; Read-Host ''Press Enter to close'' | Out-Null'
+	return @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $command)
 }
 function Get-PrecompileCommand {
 	$arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$root\precompile-windows.ps1`"")
@@ -78,8 +85,8 @@ function Get-PrecompileCommand {
 }
 function Save-Settings { $settings | ConvertTo-Json | Set-Content $settingsPath -Encoding UTF8 }
 if ($DryRun) {
-	"play:       cmd /v:on /s /c `"$(Get-PlayCommand)`""
-	"precompile: cmd /s /c `"$(Get-PrecompileCommand)`""
+	"play:       powershell " + ((Get-PlayArguments) -join ' ')
+	"precompile: powershell " + ((Get-PrecompileArguments) -join ' ')
 	"efficiency cores: 0x{0:X}" -f $efficiencyMask
 	return
 }
@@ -190,12 +197,12 @@ function Read-Form {
 }
 $play.Add_Click({
 	Read-Form
-	Start-Process cmd -ArgumentList "/v:on /s /c `"$(Get-PlayCommand)`"" -WorkingDirectory $root
+	Start-Process powershell -ArgumentList (Get-PlayArguments) -WorkingDirectory $root
 	$form.Close()
 })
 $precompile.Add_Click({
 	Read-Form
-	Start-Process cmd -ArgumentList "/s /c `"$(Get-PrecompileCommand)`"" -WorkingDirectory $root
+	Start-Process powershell -ArgumentList (Get-PrecompileArguments) -WorkingDirectory $root
 })
 $logs.Add_Click({
 	$folder = if (Test-Path "$root\_Build") { "$root\_Build\run-logs" } else { "$root\logs" }
