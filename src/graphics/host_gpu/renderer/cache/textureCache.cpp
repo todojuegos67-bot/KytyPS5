@@ -1564,6 +1564,18 @@ void TextureCache::InitializeImage(ImageId id) {
 			}
 			LiveCounters::Add(LiveCounters::FullUploads);
 			LiveCounters::Add(LiveCounters::FullUploadBytes, image.info.data.size);
+			// A whole upload of a large image (the game's 320 MiB streaming arrays): why it was not partial, in the
+			// run log (a few a second at most; the stalls of a Boletaria run were 320 MiB uploads a frame).
+			if (image.info.data.size >= (128ull << 20)) {
+				std::printf("[tsc %llu] Full upload %llu MiB kind=%s partial_fail=%s tracked=%d candidate=%d partial_ok=%d "
+				            "gpu_modified=%d levels=%u layers=%u fmt=%u\n",
+				            static_cast<unsigned long long>(__rdtsc()),
+				            static_cast<unsigned long long>(image.info.data.size >> 20u), kind,
+				            *g_partial_fail != '\0' ? g_partial_fail : "(not tried)", image.IsTracked() ? 1 : 0,
+				            PartialDirtyCandidate(image) ? 1 : 0, image.CanTakePartialDirty() ? 1 : 0,
+				            image.IsGpuModified() ? 1 : 0, image.info.resources.levels, image.info.resources.layers,
+				            static_cast<uint32_t>(image.info.guest_format));
+			}
 			static const bool log_uploads = std::getenv("KYTY_UPLOAD_LOG") != nullptr;
 			if (log_uploads) {
 				std::printf("[tsc %llu] UPLOAD %s addr=0x%llx size=0x%llx fmt=%u %ux%u layers=%u levels=%u tile=%u "

@@ -189,7 +189,7 @@ struct VideoOutConfig {
 	bool                                closing     = false;
 	int                                 flip_rate   = 0;
 	uint64_t                            last_flip_vblank = 0; // vblank_status.count at the last flip
-	uint64_t                            last_flip_qpc    = 0; // QueryPerformanceCounter at the last flip (FlipWhenReady)
+	uint64_t                            next_flip_due_qpc = 0; // QueryPerformanceCounter the next flip may be shown at (FlipWhenReady)
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -528,18 +528,38 @@ static bool FlipWhenReady() {
 	return enabled;
 }
 
+// Minimum spacing between two flips (QueryPerformanceCounter units) in flip-when-ready mode.
+static uint64_t FlipStepQpc(const VideoOutConfig& cfg, bool capped) {
+	const auto     frequency = Common::Timer::QueryPerformanceFrequency();
+	const uint64_t period    = std::max<uint64_t>(frequency / std::max(Config::GetVblankFrequency(), 1u), 1);
+	uint64_t       intervals = static_cast<uint64_t>(cfg.flip_rate) + 1u;
+	if (const uint32_t ratio = Config::GetVblankFrequency() / 60; ratio > 1 && MoviePlaying()) intervals = std::max<uint64_t>(intervals, ratio);
+	if (const int floor = capped ? FlipRateFloor() : 0; floor > cfg.flip_rate) intervals = static_cast<uint64_t>(floor) + 1u;
+	return period * intervals;
+}
+
+// Called when a flip is about to be shown: schedules the earliest time for the next one. The schedule is
+// anchored, not measured from the moment the present returned: the present's own cost and the 1 ms poll
+// latency used to be added to every frame (16.7 + ~0.8 ms -> a steady 57 fps instead of 60). A flip that
+// comes late by less than a period keeps the phase (the next one may come a little sooner); a flip late by
+// a full period or more (a stall) re-anchors on now.
+static void ScheduleNextFlipLocked(VideoOutConfig& cfg, bool capped) {
+	const uint64_t now  = Common::Timer::QueryPerformanceCounter();
+	const uint64_t step = FlipStepQpc(cfg, capped);
+	const uint64_t due  = cfg.next_flip_due_qpc;
+	if (due == 0 || now >= due + step) {
+		cfg.next_flip_due_qpc = now + step;
+	} else {
+		cfg.next_flip_due_qpc = due + step;
+	}
+}
+
 static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, bool capped) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
 	}
 	if (FlipWhenReady()) {
-		const auto     frequency = Common::Timer::QueryPerformanceFrequency();
-		const uint64_t period    = std::max<uint64_t>(frequency / std::max(Config::GetVblankFrequency(), 1u), 1);
-		uint64_t       intervals = static_cast<uint64_t>(cfg.flip_rate) + 1u;
-		if (const uint32_t ratio = Config::GetVblankFrequency() / 60; ratio > 1 && MoviePlaying()) intervals = std::max<uint64_t>(intervals, ratio);
-		if (const int floor = capped ? FlipRateFloor() : 0; floor > cfg.flip_rate) intervals = static_cast<uint64_t>(floor) + 1u;
-		// 3% of slack: a frame ready a hair before the period would otherwise wait a whole extra millisecond.
-		return Common::Timer::QueryPerformanceCounter() - cfg.last_flip_qpc >= period * intervals * 97 / 100;
+		return Common::Timer::QueryPerformanceCounter() >= cfg.next_flip_due_qpc;
 	}
 	if (const uint32_t ratio = Config::GetVblankFrequency() / 60; ratio > 1 && MoviePlaying()) {
 		return cfg.vblank_status.count - cfg.last_flip_vblank >= ratio;
@@ -1201,6 +1221,9 @@ bool FlipQueue::Flip(uint32_t micros) {
 		m_done_cond_var.SignalAll();
 		return false;
 	}
+	if (FlipWhenReady()) {
+		ScheduleNextFlipLocked(*r.cfg, capped);
+	}
 
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
@@ -1226,7 +1249,6 @@ bool FlipQueue::Flip(uint32_t micros) {
 	if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
 		r.cfg->flip_status.count++;
 		r.cfg->last_flip_vblank                     = r.cfg->vblank_status.count;
-		r.cfg->last_flip_qpc                        = Common::Timer::QueryPerformanceCounter();
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
 		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;

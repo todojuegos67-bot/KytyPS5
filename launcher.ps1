@@ -63,7 +63,7 @@ function Get-PlayCommand {
 	if (!$settings.redzone) { $arguments += '-NoRedZone' }
 	if ($settings.x3d) { $arguments += @('-Affinity', 'FFFF') }
 	# By the graphics card's memory: the emulator's own budget leaves room for Windows and the driver.
-	$vramMb = @(0, 5632, 8192, 10240, 13312)[[Math]::Max(0, [Math]::Min(4, [int]$settings.vramgpu))]
+	$vramMb = @(0, 6656, 8192, 10240, 13312)[[Math]::Max(0, [Math]::Min(4, [int]$settings.vramgpu))]
 	if ($vramMb -gt 0) { $arguments += @('-Set', "KYTY_VRAM_BUDGET_MB=$vramMb") }
 	if ([int]$settings.present -eq 1) { $arguments += @('-PresentMode', 'Immediate', '-FlipWhenReady') } elseif ([int]$settings.present -eq 2) { $arguments += @('-PresentMode', 'Mailbox') }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
