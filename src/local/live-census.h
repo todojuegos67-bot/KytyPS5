@@ -38,9 +38,10 @@ inline uint64_t g_kind_calls[Kinds] {};
 constexpr size_t Phases = 16;
 inline uint64_t g_dispatch_phase_cycles[Phases] {};
 inline uint64_t g_draw_phase_cycles[Phases] {};
+inline uint64_t g_xpr_cycles[4] {}; // NativeXpr scopes by their a (graphicsRun.cpp: 0 try/emit, 1 store, 2 direct)
 inline constexpr const char* DispatchPhaseNames[Phases] = {"program", "consume", "pipeline", "bindings", "find_buffers", "bda",
-                                                           "rebind_buffers", "rebind_images", "commit", "barrier", "p10", "p11",
-                                                           "p12", "p13", "p14", "p15"};
+                                                           "rebind_buffers", "rebind_images", "commit", "barrier", "table", "linear_copy",
+                                                           "lock", "p13", "p14", "p15"};
 inline constexpr const char* DrawPhaseNames[Phases] = {"start", "color_target", "depth_target", "programs", "bindings",
                                                        "vertex_buffers", "pipeline", "begin_rendering", "complete", "p9",
                                                        "p10", "p11", "p12", "p13", "p14", "p15"};
@@ -96,6 +97,7 @@ public:
 			g_kind_cycles[m_kind] += cycles;
 			g_kind_calls[m_kind] += 1;
 			if (m_kind == DispatchPhase) g_dispatch_phase_cycles[m_b & (Phases - 1)] += cycles;
+			if (m_kind == NativeXpr) g_xpr_cycles[m_a & 3] += cycles;
 			if (m_table) Add(m_kind, m_a, m_b, cycles);
 		}
 	}

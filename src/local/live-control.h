@@ -98,6 +98,7 @@ inline void Flip() {
 		static uint64_t                                  last_tsc = 0;
 		static std::array<uint64_t, LiveCensus::Kinds>   last_kind_cycles {};
 		static std::array<uint64_t, LiveCensus::Phases>  last_dispatch_phases {}, last_draw_phases {};
+		static std::array<uint64_t, 4>                   last_xpr {};
 		static int64_t                                   last_idle = 0;
 		static std::array<int64_t, LiveCensus::Waits>    last_waits {};
 		static std::array<uint64_t, counted.size()>      last_counts {};
@@ -121,6 +122,10 @@ inline void Flip() {
 				const double phase_ms = static_cast<double>(LiveCensus::g_draw_phase_cycles[i] - last_draw_phases[i]) * ms_per_cycle;
 				if (phase_ms >= 0.5) std::printf(" draw.%s=%.1f", LiveCensus::DrawPhaseNames[i], phase_ms);
 			}
+			for (size_t i = 0; i < 4; ++i) {
+				const double xpr_ms = static_cast<double>(LiveCensus::g_xpr_cycles[i] - last_xpr[i]) * ms_per_cycle;
+				if (xpr_ms >= 0.5) std::printf(" xpr.%zu=%.1f", i, xpr_ms);
+			}
 			for (size_t i = 0; i < LiveCensus::Waits; ++i)
 				if (const auto ns = LiveCensus::g_waits_ns[i] - last_waits[i]; ns != 0)
 					std::printf(" %s=%.1f", waits[i], static_cast<double>(ns) / 1e6);
@@ -142,6 +147,7 @@ inline void Flip() {
 			last_dispatch_phases[i] = LiveCensus::g_dispatch_phase_cycles[i];
 			last_draw_phases[i]     = LiveCensus::g_draw_phase_cycles[i];
 		}
+		for (size_t i = 0; i < 4; ++i) last_xpr[i] = LiveCensus::g_xpr_cycles[i];
 		for (size_t i = 0; i < LiveCensus::Waits; ++i) last_waits[i] = LiveCensus::g_waits_ns[i];
 		for (size_t i = 0; i < counted.size(); ++i) last_counts[i] = LiveCounters::Value(counted[i]);
 	}
