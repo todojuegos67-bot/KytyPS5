@@ -81,9 +81,26 @@ std::vector<ChildLoop> FindChildLoops(const Program& program) {
 	return loops;
 }
 
+// An intrusive list unlink in a job worker's loop (01.005.000 eboot+0xd8c1ed, crashed twice in a row on 10-10 at
+// +0xd8c1f5 with rcx = rdx = 0): each object of a list takes its first entry out, `entry->prev->next = entry->next;
+// if (entry->next) entry->next->prev = entry->prev`. The entry's prev was null (an entry already taken out, both of
+// its links cleared, still the object's first): with a null prev only the write through it is skipped (there is no
+// previous entry to update) and the loop goes on as the guest wrote it.
+//   mov rdx, [rax+0x50]; mov rcx, [rax+0x58]; mov [rcx+0x50], rdx; mov rax, [rax+0x50]; test rax, rax; je; mov [rax+0x58], rcx
+constexpr const char* UnlinkCode = "48 8b 50 50 48 8b 48 58 48 89 51 50 48 8b 40 50 48 85 c0 74 ?? 48 89 48 58";
+constexpr uint32_t    UnlinkMoved = 8; // mov rcx, [rax+0x58]; mov [rcx+0x50], rdx
+
 uint64_t              g_base = 0;
 std::atomic<uint32_t> g_skips {0};
 std::atomic<uint32_t> g_child_skips {0};
+std::atomic<uint32_t> g_unlink_skips {0};
+
+void KYTY_SYSV_ABI SkippedUnlink(uint64_t offset, uint64_t entry, uint64_t object) {
+	if (g_unlink_skips.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+	std::printf("Demon's Souls scene guard: an entry with a null prev unlinked at eboot+0x%llx (entry 0x%llx, object 0x%llx)\n",
+	            static_cast<unsigned long long>(offset), static_cast<unsigned long long>(entry),
+	            static_cast<unsigned long long>(object));
+}
 
 void KYTY_SYSV_ABI Skipped(uint64_t offset, uint64_t caller, uint64_t rbx, uint64_t r14) {
 	if (g_skips.fetch_add(1, std::memory_order_relaxed) >= 32) return;
@@ -124,7 +141,10 @@ void Install(Program* program) {
 	}
 	const auto loops = FindChildLoops(*program);
 	if (loops.empty()) std::printf("Demon's Souls scene guard: no children loop of a known build found; retaining their guest code\n");
-	if (!traversals && loops.empty()) return;
+	// The list unlink: its mov rcx, [rax+0x58] (4 bytes in).
+	uint64_t unlink = 0;
+	if (const auto found = GuestCode::FindUnique(*program, GuestCode::Pattern(UnlinkCode))) unlink = *found + 4;
+	if (!traversals && loops.empty() && unlink == 0) return;
 	const auto requested = program->base_vaddr + CaveOffset;
 	const auto allocated = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 	    requested, PageSize, Common::VirtualMemory::Mode::ExecuteReadWrite, "demons_souls_scene_guard", true);
@@ -205,6 +225,40 @@ void Install(Program* program) {
 		c.lea(rsp, ptr[rsp + 128]);
 		c.jmp(reinterpret_cast<const void*>(loop.increment));
 	}
+	// The unlink: prev loaded; a null prev skips the write through it, else the write; then back after both.
+	const uint8_t* unlink_stub = nullptr;
+	if (unlink != 0) {
+		Xbyak::Label null_prev;
+		c.align(16);
+		unlink_stub = c.getCurr();
+		c.mov(rcx, ptr[rax + 0x58]);
+		c.test(rcx, rcx); // (flags are dead here: the guest's next test sets them)
+		c.jz(null_prev);
+		c.mov(ptr[rcx + 0x50], rdx);
+		c.jmp(reinterpret_cast<const void*>(unlink + UnlinkMoved));
+		// Printed (registers, flags and FP state kept; below the red zone, on a realigned stack), then on.
+		c.L(null_prev);
+		c.lea(rsp, ptr[rsp - 128]);
+		c.pushfq();
+		for (const auto& reg: {rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11, rbx})
+			c.push(reg);
+		c.mov(rbx, rsp);
+		c.and_(rsp, -16);
+		c.sub(rsp, 512);
+		c.db(save_fp, sizeof(save_fp));
+		c.mov(rdi, unlink - program->base_vaddr);
+		c.mov(rsi, ptr[rbx + 72]); // the saved rax: the entry
+		c.mov(rdx, ptr[rbx]);      // the saved rbx: the object
+		c.mov(rax, reinterpret_cast<uint64_t>(&SkippedUnlink));
+		c.call(rax);
+		c.fxrstor64(ptr[rsp]);
+		c.mov(rsp, rbx);
+		for (const auto& reg: {rbx, r11, r10, r9, r8, rdi, rsi, rdx, rcx, rax})
+			c.pop(reg);
+		c.popfq();
+		c.lea(rsp, ptr[rsp + 128]);
+		c.jmp(reinterpret_cast<const void*>(unlink + UnlinkMoved));
+	}
 	c.ready();
 	if (Xbyak::GetError() || !Common::VirtualMemory::FlushInstructionCache(allocated, c.getSize()) ||
 	    !Libs::LibKernel::Memory::ProtectGuestMemory(allocated, PageSize, Common::VirtualMemory::Mode::ExecuteRead, nullptr)) {
@@ -225,6 +279,7 @@ void Install(Program* program) {
 		patch(entries[i], stubs[i], 5);
 	for (size_t i = 0; i < loops.size(); i++)
 		patch(loops[i].load, loop_stubs[i], loops[i].moved);
+	if (unlink != 0) patch(unlink, unlink_stub, UnlinkMoved);
 	if (traversals)
 		std::printf("Demon's Souls scene guard: installed (traversals at eboot+0x%llx, 0x%llx and 0x%llx skip a null node)\n",
 		            static_cast<unsigned long long>(entries[0] - program->base_vaddr),
@@ -233,6 +288,11 @@ void Install(Program* program) {
 	for (const auto& loop: loops)
 		std::printf("Demon's Souls scene guard: installed (the children loop at eboot+0x%llx skips a null child)\n",
 		            static_cast<unsigned long long>(loop.load - program->base_vaddr));
+	if (unlink != 0)
+		std::printf("Demon's Souls scene guard: installed (the list unlink at eboot+0x%llx skips a null prev)\n",
+		            static_cast<unsigned long long>(unlink - program->base_vaddr));
+	else
+		std::printf("Demon's Souls scene guard: no list unlink of a known build found; retaining its guest code\n");
 #endif
 }
 } // namespace Loader::DemonsSoulsSceneGuard
