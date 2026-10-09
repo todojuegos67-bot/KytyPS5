@@ -854,7 +854,10 @@ void GuestGpu::ThreadRun(void* data) {
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
 			LiveCounters::Add(LiveCounters::GuestCommands);
-			command();
+			{
+				LiveCensus::Scope census(LiveCensus::GuestCommand, 0);
+				command();
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -868,7 +871,10 @@ void GuestGpu::ThreadRun(void* data) {
 		LiveTrace::Event(LiveTrace::RenderSlice,
 		                 submission.queue_id | static_cast<uint32_t>(submission.type) << 8u | 1u << 17u,
 		                 submission.frame_epoch | uint64_t {submission.commands.size()} << 32u);
-		const bool complete = gpu->Process(submission);
+		const bool complete = [&] {
+			LiveCensus::Scope census(LiveCensus::Submission, submission.queue_id);
+			return gpu->Process(submission);
+		}();
 		LiveTrace::Event(LiveTrace::RenderSlice,
 		                 submission.queue_id | static_cast<uint32_t>(submission.type) << 8u |
 		                     static_cast<uint32_t>(complete) << 16u,

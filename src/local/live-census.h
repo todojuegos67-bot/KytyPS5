@@ -25,8 +25,18 @@ enum Kind : uint32_t {
 	CommandSync   = 11, // GPU-written command memory check before parsing (indirect tables)
 	DrawPhase     = 12, // a: pixel shader, b: phase (LogDrawPhase marks; DrawPhases below)
 	Barrier       = 13, // a: return address of the recorded vkCmdPipelineBarrier(2), b: 1 for the 2 form
-	Kinds         = 14
+	GuestCommand  = 14, // a host command run for a guest thread (GuestGpu::ThreadRun)
+	Submission    = 15, // one submission processed (GuestGpu::Process), whole
+	Kinds         = 16
 };
+
+// Always on, render thread only: cycles and calls per kind since start (the slow-frame lines print the
+// frame's share: where a busy frame went, without a live session).
+inline uint64_t g_kind_cycles[Kinds] {};
+inline uint64_t g_kind_calls[Kinds] {};
+inline constexpr const char* KindNames[Kinds] = {"dispatch", "draw", "xpr", "dispatch_phase", "gpu_wait_c", "readback_wait_c",
+                                                 "sync_download", "programs", "gather", "queue_run", "srt", "command_sync",
+                                                 "draw_phase", "barrier", "guest_command", "submission"};
 
 struct Entry {
 	uint64_t a = 0, b = 0, calls = 0, cycles = 0;
@@ -61,22 +71,29 @@ inline void Add(uint32_t kind, uint64_t a, uint64_t b, uint64_t cycles) {
 
 class Scope {
 public:
-	Scope(uint32_t kind, uint64_t a, uint64_t b = 0): m_on(g_on.load(std::memory_order_relaxed) && g_render) {
+	Scope(uint32_t kind, uint64_t a, uint64_t b = 0): m_on(g_render) {
 		if (m_on) {
 			m_kind  = kind;
 			m_a     = a;
 			m_b     = b | g_queue;
+			m_table = g_on.load(std::memory_order_relaxed);
 			m_start = __rdtsc();
 		}
 	}
 	~Scope() {
-		if (m_on) Add(m_kind, m_a, m_b, __rdtsc() - m_start);
+		if (m_on) {
+			const uint64_t cycles = __rdtsc() - m_start;
+			g_kind_cycles[m_kind] += cycles;
+			g_kind_calls[m_kind] += 1;
+			if (m_table) Add(m_kind, m_a, m_b, cycles);
+		}
 	}
 	Scope(const Scope&)            = delete;
 	Scope& operator=(const Scope&) = delete;
 
 private:
 	bool     m_on;
+	bool     m_table = false;
 	uint32_t m_kind  = 0;
 	uint64_t m_a     = 0, m_b = 0, m_start = 0;
 };

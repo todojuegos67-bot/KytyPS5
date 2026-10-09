@@ -95,14 +95,23 @@ inline void Flip() {
 		                                     C::ImageInitUs, C::BufferSyncUs, C::DrawUs, C::TextureUnmapUs, C::BackingReadUs};
 		static constexpr const char* waits[] = {"gpu_wait", "readback_wait", "download_wait", "compile"};
 		static std::chrono::steady_clock::time_point     last {};
+		static uint64_t                                  last_tsc = 0;
+		static std::array<uint64_t, LiveCensus::Kinds>   last_kind_cycles {};
 		static int64_t                                   last_idle = 0;
 		static std::array<int64_t, LiveCensus::Waits>    last_waits {};
 		static std::array<uint64_t, counted.size()>      last_counts {};
 		const auto                                       now = std::chrono::steady_clock::now();
+		const uint64_t                                   tsc = __rdtsc();
 		const double ms = std::chrono::duration<double, std::milli>(now - last).count();
 		if (last != std::chrono::steady_clock::time_point {} && ms >= std::max(20.0, SlowLog::HitchThreshold())) {
-			std::printf("[tsc %llu] SLOW Frame %.1f ms idle=%.1f", static_cast<unsigned long long>(__rdtsc()), ms,
+			std::printf("[tsc %llu] SLOW Frame %.1f ms idle=%.1f", static_cast<unsigned long long>(tsc), ms,
 			            static_cast<double>(g_render_idle_ns - last_idle) / 1e6);
+			// The render thread's time by call kind (ms), from the frame's own TSC rate.
+			const double ms_per_cycle = tsc > last_tsc ? ms / static_cast<double>(tsc - last_tsc) : 0.0;
+			for (size_t i = 0; i < LiveCensus::Kinds; ++i) {
+				const double kind_ms = static_cast<double>(LiveCensus::g_kind_cycles[i] - last_kind_cycles[i]) * ms_per_cycle;
+				if (kind_ms >= 0.05) std::printf(" %s=%.1f", LiveCensus::KindNames[i], kind_ms);
+			}
 			for (size_t i = 0; i < LiveCensus::Waits; ++i)
 				if (const auto ns = LiveCensus::g_waits_ns[i] - last_waits[i]; ns != 0)
 					std::printf(" %s=%.1f", waits[i], static_cast<double>(ns) / 1e6);
@@ -117,7 +126,9 @@ inline void Flip() {
 			std::fflush(stdout);
 		}
 		last      = now;
+		last_tsc  = tsc;
 		last_idle = g_render_idle_ns;
+		for (size_t i = 0; i < LiveCensus::Kinds; ++i) last_kind_cycles[i] = LiveCensus::g_kind_cycles[i];
 		for (size_t i = 0; i < LiveCensus::Waits; ++i) last_waits[i] = LiveCensus::g_waits_ns[i];
 		for (size_t i = 0; i < counted.size(); ++i) last_counts[i] = LiveCounters::Value(counted[i]);
 	}
