@@ -12,7 +12,7 @@ $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish 
 $resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false; present = 0; vram = 0 }
+	ecores = $false; fps120 = $false; present = 0; vram = 0; x3d = $false }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -60,6 +60,7 @@ function Get-PlayCommand {
 		'-Width', $size[0], '-Height', $size[1], '-Language', $settings.language)
 	if ($settings.fullscreen) { $arguments += '-Fullscreen'; if ($settings.aspect) { $arguments += '-AspectFit' } }
 	if (!$settings.redzone) { $arguments += '-NoRedZone' }
+	if ($settings.x3d) { $arguments += @('-Affinity', 'FFFF') }
 	$vramMb = @(0, 8192, 10240, 12288)[[Math]::Max(0, [Math]::Min(3, [int]$settings.vram))]
 	if ($vramMb -gt 0) { $arguments += @('-Set', "KYTY_VRAM_BUDGET_MB=$vramMb") }
 	if ([int]$settings.present -eq 1) { $arguments += @('-PresentMode', 'Immediate') } elseif ([int]$settings.present -eq 2) { $arguments += @('-PresentMode', 'Mailbox') }
@@ -150,6 +151,10 @@ $vram = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'D
 $vram.Items.AddRange(@('Auto (GPU memory - 3 GB, at most 10 GB)', '8 GB', '10 GB', '12 GB'))
 $vram.SelectedIndex = [Math]::Max(0, [Math]::Min(3, [int]$settings.vram))
 Add-Row 'Video memory' @($vram)
+# Ryzen X3D with two CCDs (7950X3D, 9950X3D): the emulator on the first CCD only (logical CPUs 0-15, the one with
+# the 3D V-Cache), so its threads share that cache instead of crossing between CCDs.
+$x3d = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Ryzen X3D: run on the 3D V-Cache cores only (7950X3D / 9950X3D)'; AutoSize = $true; Checked = [bool]$settings.x3d }
+Add-Row '' @($x3d)
 $ecores = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Precompile on the efficiency cores only (slower, the PC stays responsive)'; AutoSize = $true
 	Checked = ([bool]$settings.ecores -and $efficiencyMask -ne 0); Enabled = ($efficiencyMask -ne 0) }
 Add-Row '' @($ecores)
@@ -177,6 +182,7 @@ function Read-Form {
 	$settings.redzone    = $redzone.Checked
 	$settings.present    = $present.SelectedIndex
 	$settings.vram       = [Math]::Max(0, $vram.SelectedIndex)
+	$settings.x3d        = $x3d.Checked
 	$settings.ecores     = $ecores.Checked
 	Save-Settings
 }

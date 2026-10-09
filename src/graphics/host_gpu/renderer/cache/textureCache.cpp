@@ -3339,6 +3339,12 @@ void TextureCache::RunGarbageCollector() {
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				continue;
 			}
+			// The game's streaming texture arrays (320-352 MiB, a layer streamed in at a time) came straight back
+			// as full re-uploads when evicted past the budget (79 frames with a 320 MiB upload in a Boletaria run on
+			// an 8 GB budget): those go only by the normal 160-frame age.
+			if (over_budget && age < 160 && owner->info.data.size >= (128ull << 20)) {
+				continue;
+			}
 			if (owner->IsGpuModified()) {
 				const bool safe = SafeToDownload(*owner);
 				if (safe && owner->info.IsTiled()) {
