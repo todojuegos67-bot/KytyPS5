@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <chrono>
 #include <cstdlib>
 
 namespace LiveCounters {
@@ -123,13 +124,16 @@ enum Id : uint32_t {
 	TableRegistered,       // table draws and dispatches left to the normal path: a buffer lookup registered a buffer
 	RenderPasses,          // render passes begun (CommandBuffer::BeginRendering)
 	WriteBackSkips,        // bytes of GPU write-backs not written: their pages were CPU-owned (BufferCache::WriteBackGpuOwned)
+	ImageInitUs,           // render thread: TextureCache::InitializeImage (uploads), microseconds
+	BufferSyncUs,          // render thread: BufferCache::SynchronizeBuffer past its clean check, microseconds
+	DrawUs,                // render thread: RenderExecutor::ExecutePreparedDraw, microseconds
 	Count
 };
 
 inline constexpr const char* Names[Count] = {
     "window_faults", "window_pages",     "write_faults",     "read_faults",   "reprotects",
     "reprotect_pages", "unprotects",     "unprotect_pages",  "protect_calls", "protect_calls_render",
-    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "rb_queue_inflight", "rb_queue_verified", "rb_queue_mismatch", "indirect_tables", "direct_draws", "mesh_draws", "backing_read_bytes", "backing_read_us", "xpr_tries", "xpr_hits", "xpr_miss_key", "xpr_miss_state", "xpr_miss_target", "xpr_miss_validate", "xpr_stores", "vblanks", "async_image_bytes", "backing_lock_waits", "backing_lock_wait_us", "backing_hold_zero_us", "backing_hold_write_us", "backing_hold_map_us", "alias_rebuilds", "alias_rebuild_us", "alias_maps", "unmap_finishes", "unmap_finish_us", "partial_dirty_faults", "partial_uploads", "partial_upload_bytes", "partial_fallbacks", "partial_unmaps", "stale_protect_repairs", "readback_parts", "gpu_range_entries", "texture_unmaps", "texture_unmap_us", "texture_unmap_deletes", "full_uploads", "full_upload_bytes", "async_pipelines", "xpr_store_pending", "dispatch_key_new", "dispatch_key_same", "dispatch_key_changed", "draw_key_new", "draw_key_same", "xpr_direct_tries", "xpr_direct_hits", "xpr_stored", "xpr_refuse_program", "xpr_refuse_reads", "xpr_refuse_bind", "xpr_refuse_draw", "xpr_relocated", "xpr_relocated_stored", "depth_overlaps", "depth_overlap_bytes", "xpr_miss_blocked", "xpr_miss_refused", "xpr_miss_unseen", "xpr_miss_budget", "readback_regions", "table_draws", "table_evals", "table_stores", "table_continued", "table_store_variant", "table_store_targets", "table_refused_sets", "table_dispatches", "table_registered", "render_passes", "writeback_skips"};
+    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "rb_queue_inflight", "rb_queue_verified", "rb_queue_mismatch", "indirect_tables", "direct_draws", "mesh_draws", "backing_read_bytes", "backing_read_us", "xpr_tries", "xpr_hits", "xpr_miss_key", "xpr_miss_state", "xpr_miss_target", "xpr_miss_validate", "xpr_stores", "vblanks", "async_image_bytes", "backing_lock_waits", "backing_lock_wait_us", "backing_hold_zero_us", "backing_hold_write_us", "backing_hold_map_us", "alias_rebuilds", "alias_rebuild_us", "alias_maps", "unmap_finishes", "unmap_finish_us", "partial_dirty_faults", "partial_uploads", "partial_upload_bytes", "partial_fallbacks", "partial_unmaps", "stale_protect_repairs", "readback_parts", "gpu_range_entries", "texture_unmaps", "texture_unmap_us", "texture_unmap_deletes", "full_uploads", "full_upload_bytes", "async_pipelines", "xpr_store_pending", "dispatch_key_new", "dispatch_key_same", "dispatch_key_changed", "draw_key_new", "draw_key_same", "xpr_direct_tries", "xpr_direct_hits", "xpr_stored", "xpr_refuse_program", "xpr_refuse_reads", "xpr_refuse_bind", "xpr_refuse_draw", "xpr_relocated", "xpr_relocated_stored", "depth_overlaps", "depth_overlap_bytes", "xpr_miss_blocked", "xpr_miss_refused", "xpr_miss_unseen", "xpr_miss_budget", "readback_regions", "table_draws", "table_evals", "table_stores", "table_continued", "table_store_variant", "table_store_targets", "table_refused_sets", "table_dispatches", "table_registered", "render_passes", "writeback_skips", "image_init_us", "buffer_sync_us", "draw_us"};
 
 inline std::atomic<uint64_t> g_values[Count];
 // The render thread's counts: it is their only writer, so an increment needs no locked
@@ -151,6 +155,16 @@ inline void Add(Id id, uint64_t n = 1) {
 	}
 	g_values[id].fetch_add(n, std::memory_order_relaxed);
 }
+// Adds the scope's duration in microseconds to a counter (the SLOW Frame line's phases).
+struct ScopedUs {
+	Id                                    id;
+	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+	explicit ScopedUs(Id id): id(id) {}
+	~ScopedUs() {
+		Add(id, static_cast<uint64_t>(
+		            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
+	}
+};
 [[nodiscard]] inline uint64_t Value(size_t id) {
 	return g_values[id].load(std::memory_order_relaxed) + g_render_values[id].load(std::memory_order_relaxed);
 }

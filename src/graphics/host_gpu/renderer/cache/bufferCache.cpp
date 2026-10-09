@@ -1449,6 +1449,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		// CPU cleanliness does not prove that an aliased image is current.
 		return is_texel_buffer && SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
+	LiveCounters::ScopedUs timed(LiveCounters::BufferSyncUs);
 	bool fully_gpu_modified = false;
 	if (is_written && kyty_local_buffer_residency_mode.load(std::memory_order_relaxed) != 0 &&
 	    native_buffer_download_depth == 0 && m_gpu_modified_ranges.Contains(vaddr, size)) {

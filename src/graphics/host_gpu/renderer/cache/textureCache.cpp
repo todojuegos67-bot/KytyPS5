@@ -57,6 +57,25 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 // large keep watching everything but the written granules and upload only the subresources
 // over them.
 constexpr uint64_t PartialDirtyMinSize = uint64_t {16} << 20;
+
+// Why TryInvalidatePartial refuses an image (run-log diagnostics of the large streaming arrays).
+static const char* PartialRefusal(const Image& image, bool candidate) {
+	const auto& info = image.info;
+	if (!candidate) return "not-candidate";
+	if (!image.registered) return "unregistered";
+	if (!image.IsTracked()) return "untracked";
+	if (image.track_addr != info.data.address || image.track_addr_end != info.data.End()) return "partly-tracked";
+	if (!image.CanTakePartialDirty()) return image.IsMaybeCpuDirty() ? "maybe-dirty" : "whole-dirty";
+	if (image.IsGpuModified()) return "gpu-modified";
+	if (image.IsBufferModified()) return "buffer-modified";
+	if (image.IsStencilModified()) return "stencil-modified";
+	return "ok";
+}
+
+// Large-image lifecycle in the run log (a few lines a second at most): what deletes the 320 MiB arrays.
+static constexpr uint64_t LargeImageLogSize = 128ull << 20;
+static thread_local const char* g_delete_why = "?";
+
 // A write fault releases the image's granule around it (granules start at the image start):
 // a streamed layer faults a few times instead of once per 4 KiB page.
 constexpr uint64_t PartialDirtyGranule = uint64_t {1} << 20;
@@ -387,6 +406,18 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
+	if (image->info.data.size >= LargeImageLogSize) {
+		std::printf("[tsc %llu] Large image deleted (%s) addr=0x%llx size=%llu MiB layers=%u levels=%u fmt=%u gpu=%d "
+		            "cpu_dirty=%d partial=%d tracked=%d holes=%zu unused=%llu\n",
+		            static_cast<unsigned long long>(__rdtsc()), g_delete_why,
+		            static_cast<unsigned long long>(image->info.data.address),
+		            static_cast<unsigned long long>(image->info.data.size >> 20u), image->info.resources.layers,
+		            image->info.resources.levels, static_cast<uint32_t>(image->info.guest_format),
+		            image->IsGpuModified() ? 1 : 0, image->IsDefinitelyCpuDirty() ? 1 : 0,
+		            image->IsPartiallyCpuDirty() ? 1 : 0, image->IsTracked() ? 1 : 0, image->untracked_holes.size(),
+		            static_cast<unsigned long long>(m_gc_tick - std::min(m_gc_tick, image->lru_tick)));
+	}
+	g_delete_why = "?";
 	m_partial_plans.erase(image->serial);
 	if (!image->depth_id) {
 		std::vector<ImageId> associations;
@@ -453,6 +484,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
 	}
+	g_delete_why = site;
 	DeleteImage(id);
 }
 
@@ -1513,6 +1545,7 @@ static bool PartialFail(const char* why) {
 
 void TextureCache::InitializeImage(ImageId id) {
 	using Clock = std::chrono::steady_clock;
+	LiveCounters::ScopedUs timed(LiveCounters::ImageInitUs);
 	auto&             image = m_slot_images[id];
 	Clock::time_point marks[3] {Clock::now()};
 	const char*       kind = image.IsPartiallyCpuDirty() ? "partial"
@@ -1567,10 +1600,11 @@ void TextureCache::InitializeImage(ImageId id) {
 			// A whole upload of a large image (the game's 320 MiB streaming arrays): why it was not partial, in the
 			// run log (a few a second at most; the stalls of a Boletaria run were 320 MiB uploads a frame).
 			if (image.info.data.size >= (128ull << 20)) {
-				std::printf("[tsc %llu] Full upload %llu MiB kind=%s partial_fail=%s tracked=%d candidate=%d partial_ok=%d "
+				std::printf("[tsc %llu] Full upload %llu MiB addr=0x%llx kind=%s partial_fail=%s tracked=%d candidate=%d partial_ok=%d "
 				            "gpu_modified=%d levels=%u layers=%u fmt=%u\n",
 				            static_cast<unsigned long long>(__rdtsc()),
-				            static_cast<unsigned long long>(image.info.data.size >> 20u), kind,
+				            static_cast<unsigned long long>(image.info.data.size >> 20u),
+				            static_cast<unsigned long long>(image.info.data.address), kind,
 				            *g_partial_fail != '\0' ? g_partial_fail : "(not tried)", image.IsTracked() ? 1 : 0,
 				            PartialDirtyCandidate(image) ? 1 : 0, image.CanTakePartialDirty() ? 1 : 0,
 				            image.IsGpuModified() ? 1 : 0, image.info.resources.levels, image.info.resources.layers,
@@ -3059,6 +3093,14 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 				            owner->IsStencilModified() ? 1 : 0);
 				std::fflush(stdout);
 			}
+			if (owner->info.data.size >= LargeImageLogSize) {
+				std::printf("[tsc %llu] Large image cpu-write addr=0x%llx size=%llu MiB write=0x%llx+0x%llx refusal=%s\n",
+				            static_cast<unsigned long long>(__rdtsc()),
+				            static_cast<unsigned long long>(owner->info.data.address),
+				            static_cast<unsigned long long>(owner->info.data.size >> 20u),
+				            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+				            PartialRefusal(*owner, PartialDirtyCandidate(*owner)));
+			}
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id, "cpu-write");
 			continue;
@@ -3206,6 +3248,14 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 		if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
 			continue;
 		}
+		if (owner->info.data.size >= LargeImageLogSize) {
+			std::printf("[tsc %llu] Large image map addr=0x%llx size=%llu MiB map=0x%llx+0x%llx refusal=%s\n",
+			            static_cast<unsigned long long>(__rdtsc()),
+			            static_cast<unsigned long long>(owner->info.data.address),
+			            static_cast<unsigned long long>(owner->info.data.size >> 20u),
+			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+			            PartialRefusal(*owner, PartialDirtyCandidate(*owner)));
+		}
 		owner->InvalidateCpuWrite(address, size);
 		UntrackImage(id, "map");
 	}
@@ -3269,6 +3319,16 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 			LiveCounters::Add(LiveCounters::PartialUnmaps);
 			++slow_partial;
 			continue;
+		}
+		if (owner->info.data.size >= LargeImageLogSize) {
+			const bool inside = address > owner->info.data.address || address + size < owner->info.data.End();
+			std::printf("[tsc %llu] Large image unmap addr=0x%llx size=%llu MiB unmap=0x%llx+0x%llx inside=%d refusal=%s\n",
+			            static_cast<unsigned long long>(__rdtsc()),
+			            static_cast<unsigned long long>(owner->info.data.address),
+			            static_cast<unsigned long long>(owner->info.data.size >> 20u),
+			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), inside ? 1 : 0,
+			            PartialRefusal(*owner, PartialDirtyCandidate(*owner)));
+			g_delete_why = "unmap";
 		}
 		++slow_deleted;
 		slow_bytes += owner->info.data.size;
@@ -3384,6 +3444,7 @@ void TextureCache::RunGarbageCollector() {
 				            static_cast<unsigned long long>(m_total_used_memory));
 				std::fflush(stdout);
 			}
+			g_delete_why = "gc";
 			DeleteImage(id);
 			if (over_budget && m_total_used_memory < m_pressure_gc_memory) break;
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
