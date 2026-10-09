@@ -135,7 +135,8 @@ bool GraphicContext::CreateAllocator() {
 		physical_device.getProperties2(&device_properties);
 		if (id.deviceLUIDValid) (void)LocalPlatform::OpenVideoMemoryAdapter(id.deviceLUID.data());
 	}
-	small_video_memory = GetTotalMemoryBudget() < (uint64_t {12} << 30u);
+	// (The GPU's own budget, not the caches' cap: a 16 GB card is not short of video memory.)
+	small_video_memory = GetTotalMemoryBudget(false) < (uint64_t {12} << 30u);
 	LogVideoMemory("start");
 	g_report_allocator          = allocator;
 	g_report_context            = this;
@@ -271,7 +272,7 @@ uint64_t GraphicContext::GetHostMemoryUsage() const {
 	return usage;
 }
 
-uint64_t GraphicContext::GetTotalMemoryBudget() const {
+uint64_t GraphicContext::GetTotalMemoryBudget(bool capped) const {
 	if (allocator == nullptr) {
 		return 0;
 	}
@@ -299,20 +300,19 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	local -= std::min(local, simulation_ballast_bytes);
 	if (discrete) {
 		uint64_t result = budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
-		// A GPU of 16 GB or less: the caches keep 2.5 GB of the card free for Windows, the desktop, a browser
-		// and the driver's own needs (an RTX 5080 reached 15.8 of 16 GB and spilled to system memory, with
-		// second-long stalls). KYTY_VRAM_BUDGET_MB=<n> sets the caches' budget outright.
+		if (!capped) return result;
+		// KYTY_VRAM_BUDGET_MB=<n> sets the caches' budget outright.
 		static const uint64_t forced = [] {
 			const char* text = std::getenv("KYTY_VRAM_BUDGET_MB");
 			return text != nullptr ? std::strtoull(text, nullptr, 10) << 20u : uint64_t {0};
 		}();
 		if (forced != 0) return std::min(result, forced);
+		// The caches keep 2.5 GB of the card for Windows, the desktop, a browser and the driver (an RTX 5080 reached
+		// 15.8 of 16 GB when the collector deleted nothing, fixed upstream on 10-09): 13.5 GB on a 16 GB card.
+		// (A 10 GB ceiling on any card made a 16 GB card count as short of video memory: no pipeline warmup, so
+		// thousands of pipelines compiled while playing, and textures placed in system memory past 5 GB.)
 		constexpr uint64_t GiB = 1024ull * 1024 * 1024;
-		// The GPU's memory less 3 GB for Windows, the desktop and the driver: 9 GB on a 12 GB card, 13 GB on a
-		// 16 GB one. (A flat 9 GB on a 16 GB card left ~4.5 GB for textures next to ~3.5 GB that cannot be
-		// collected and ~3 GB of buffers: the collector re-uploaded textures every few frames, small stalls.)
-		// At most 10 GB on any card (the process plus Windows and the driver stay near 11 GB on a 16 GB one).
-		if (local > 4 * GiB) result = std::min(result, std::min(local - 3 * GiB, 10 * GiB));
+		if (local > 4 * GiB) result = std::min(result, local - 2 * GiB - GiB / 2);
 		return result;
 	}
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
@@ -430,7 +430,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	// 22 fps, textures yielding: ~45). It counts that type under the video memory heap: on 8 GB, half is reached
 	// before the first texture.
 	const bool texture = IsTextureUsage(image_info.usage);
-	if (texture && small_video_memory && GetDeviceMemoryUsage() >= GetTotalMemoryBudget() / 2) {
+	if (texture && small_video_memory && GetDeviceMemoryUsage() >= GetTotalMemoryBudget(false) / 2) {
 		alloc_info.requiredFlags = 0;
 		alloc_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	}

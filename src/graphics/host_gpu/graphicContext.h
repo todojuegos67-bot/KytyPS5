@@ -137,7 +137,8 @@ struct GraphicContext {
 	[[nodiscard]] bool     QueryLocalVideoMemory(uint64_t* usage, uint64_t* budget) const;
 	// A log line on where the video memory goes (Windows' and VMA's figures): diagnostics.
 	void                   LogVideoMemory(const char* label) const;
-	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	// capped: the caches' budget (KYTY_VRAM_BUDGET_MB, room kept for Windows); false: what the driver allows.
+	[[nodiscard]] uint64_t GetTotalMemoryBudget(bool capped = true) const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 	// Frees the images kept for reuse (KYTY_IMAGE_POOL): video memory ran out.
