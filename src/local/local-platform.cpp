@@ -1,5 +1,6 @@
 #include "local-platform.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -14,6 +15,7 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <atomic>
 #include <cstdio>
 #include <fcntl.h>
@@ -419,6 +421,19 @@ uint64_t OpenFileForReading(const char* path) {
 	return file == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(file);
 }
 
+
+void ProcessMemory(uint64_t* private_bytes, uint64_t* working_set) {
+	PROCESS_MEMORY_COUNTERS_EX counters {};
+	counters.cb = sizeof(counters);
+	if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+	                            sizeof(counters)) == 0) {
+		*private_bytes = *working_set = 0;
+		return;
+	}
+	*private_bytes = static_cast<uint64_t>(counters.PrivateUsage);
+	*working_set   = static_cast<uint64_t>(counters.WorkingSetSize);
+}
+
 #else
 
 void SetThreadName(const char* name) {
@@ -567,6 +582,20 @@ void CloseScratchFile(uint64_t file) {
 uint64_t OpenFileForReading(const char* path) {
 	const int fd = open(path, O_RDONLY | O_CLOEXEC);
 	return fd < 0 ? 0 : static_cast<uint64_t>(fd) + 1;
+}
+
+
+void ProcessMemory(uint64_t* private_bytes, uint64_t* working_set) {
+	*private_bytes = *working_set = 0;
+	if (FILE* file = std::fopen("/proc/self/statm", "r")) {
+		unsigned long size = 0, resident = 0, shared = 0;
+		if (std::fscanf(file, "%lu %lu %lu", &size, &resident, &shared) == 3) {
+			const auto page = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+			*working_set   = resident * page;
+			*private_bytes = (resident - std::min(resident, shared)) * page;
+		}
+		std::fclose(file);
+	}
 }
 
 #endif

@@ -77,4 +77,8 @@ void     CloseThreadForSampling(uint64_t handle);
 bool ModuleOf(const void* address, uint64_t* base, char* path, size_t path_size);
 #endif
 
+// The process's memory (bytes): private commit (Windows PrivateUsage / Linux RSS-shared) and the working
+// set (resident); zeros where unknown. For the run log's 30-second "System memory:" line.
+void ProcessMemory(uint64_t* private_bytes, uint64_t* working_set);
+
 } // namespace LocalPlatform

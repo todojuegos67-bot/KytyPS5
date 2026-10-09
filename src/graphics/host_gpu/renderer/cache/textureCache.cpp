@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 #include "live-counters.h"
+#include "local-platform.h"
 #include "native-resource-state.h"
 
 #include <algorithm>
@@ -3374,6 +3375,11 @@ void TextureCache::RunGarbageCollector() {
 		            static_cast<unsigned long long>(m_trigger_gc_memory >> 20u),
 		            static_cast<unsigned long long>(m_pressure_gc_memory >> 20u),
 		            static_cast<unsigned long long>(m_critical_gc_memory >> 20u));
+		uint64_t private_bytes = 0, working_set = 0;
+		LocalPlatform::ProcessMemory(&private_bytes, &working_set);
+		std::printf("System memory: the process holds %llu MiB (%llu MiB resident), %llu MiB of it Vulkan allocations in system RAM\n",
+		            static_cast<unsigned long long>(private_bytes >> 20u), static_cast<unsigned long long>(working_set >> 20u),
+		            static_cast<unsigned long long>(m_graphics.GetHostMemoryUsage() >> 20u));
 		std::fflush(stdout);
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {

@@ -232,8 +232,26 @@ public:
 		std::lock_guard lock(m_mutex);
 		HoldTimer       hold {LiveCounters::BackingHoldZeroUs};
 		BackingWriteFence fence(*this);
-		std::memset(m_backing_base + backing_offset, 0, size);
+		// Only the granules a guest mapping has covered before are zeroed: the others hold the zeros
+		// the OS gives untouched backing. Zeroing everything touched every page of each new allocation
+		// (a 1.35 GB streaming pool the game then fills only in part), which stayed resident: system
+		// RAM grew by what the game reserved, not by what it used.
+		const uint64_t end = backing_offset + size;
+		for (uint64_t offset = backing_offset; offset < end;) {
+			const uint64_t granule = offset >> UsedGranuleBits;
+			const uint64_t next    = std::min(end, (granule + 1) << UsedGranuleBits);
+			if (IsUsedGranule(granule)) std::memset(m_backing_base + offset, 0, next - offset);
+			offset = next;
+		}
+		NoteUsedUnlocked(backing_offset, size);
 		return true;
+	}
+
+	// A guest mapping is about to cover the range: its granules count as (possibly) written.
+	void NoteUsed(uint64_t backing_offset, uint64_t size) {
+		if (!IsAvailable() || !RangeOk(backing_offset, size)) return;
+		std::lock_guard lock(m_mutex);
+		NoteUsedUnlocked(backing_offset, size);
 	}
 
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
@@ -1082,6 +1100,21 @@ private:
 	int m_fd = -1;
 #endif
 
+	static constexpr uint64_t UsedGranuleBits = 16; // 64 KiB
+	[[nodiscard]] bool IsUsedGranule(uint64_t granule) const {
+		const uint64_t word = granule >> 6;
+		return word < m_used.size() && (m_used[word] >> (granule & 63)) & 1;
+	}
+	void NoteUsedUnlocked(uint64_t backing_offset, uint64_t size) {
+		if (size == 0) return;
+		const uint64_t last = (backing_offset + size - 1) >> UsedGranuleBits;
+		if (m_used.size() <= (last >> 6)) m_used.resize((last >> 6) + 1, 0);
+		for (uint64_t granule = backing_offset >> UsedGranuleBits; granule <= last; ++granule) {
+			m_used[granule >> 6] |= uint64_t {1} << (granule & 63);
+		}
+	}
+	std::vector<uint64_t>        m_used; // 1 bit per 64 KiB granule of the backing a mapping has covered
+
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
@@ -1262,6 +1295,7 @@ public:
 		const auto host_mode = VirtualMemory::IsExecute(mode)
 		                           ? VirtualMemory::Mode::ExecuteReadWrite
 		                           : VirtualMemory::Mode::ReadWrite;
+		m_backing->NoteUsed(backing_offset, size);
 		if (m_backing->MapExistingPlaceholderFixed(vaddr, size, backing_offset, host_mode,
 		                                           failure_reason)) {
 			EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));

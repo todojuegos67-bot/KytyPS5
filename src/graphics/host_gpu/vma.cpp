@@ -158,6 +158,24 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	return usage;
 }
 
+// Allocations in the heaps that are not device-local (system RAM the driver maps for the GPU): staging and
+// readback buffers, and anything the budget pushed out of video memory.
+uint64_t GraphicContext::GetHostMemoryUsage() const {
+	if (!CanReportMemoryUsage() || allocator == nullptr) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	uint64_t usage = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const bool device_local =
+		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
+		                      vk::MemoryHeapFlagBits::eDeviceLocal);
+		if (!device_local) usage += budgets[heap].usage;
+	}
+	return usage;
+}
+
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	if (allocator == nullptr) {
 		return 0;
