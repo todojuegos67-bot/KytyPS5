@@ -3475,8 +3475,12 @@ void TextureCache::RunGarbageCollector() {
 	// most MaxDeletions a flip. What the game stops drawing it stops binding: 1-1 standing, 3.2 GiB of images were used
 	// in the last 2 flips, 3.0 GiB not for 160 and more, 0.05 GiB in between; turning the camera, images behind it
 	// come back after a few seconds (160 flips: 5-7 MB of uploads a frame instead of 0.2-1.7, 1% low 47 -> 27 fps).
-	constexpr uint64_t StaleTicks   = 600;
-	constexpr size_t   MaxDeletions = 40;
+	// Further past the budget, younger images go and more a flip: a 16 GB card with a 10 GB budget climbed to 13.5 GB
+	// in Boletaria (10 minutes, 1-1 to the first tower), as the images unused for 600 flips came at 40 a flip.
+	constexpr uint64_t GiB          = uint64_t {1} << 30u;
+	const uint64_t     over         = m_total_used_memory > m_trigger_gc_memory ? m_total_used_memory - m_trigger_gc_memory : 0;
+	const uint64_t     StaleTicks   = over >= 2 * GiB ? 120 : over >= GiB ? 300 : 600;
+	const size_t       MaxDeletions = over >= 2 * GiB ? 160 : over >= GiB ? 80 : 40;
 	if (m_total_used_memory < m_trigger_gc_memory || tick < StaleTicks) {
 		return;
 	}
