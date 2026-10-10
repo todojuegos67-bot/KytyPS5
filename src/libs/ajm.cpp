@@ -819,16 +819,16 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 	state.flags   = flags;
 	state.decoder = AjmCreateDecoder(codec, flags);
 
-	{
-		std::scoped_lock lock(g_ajm_instances_mutex);
-		g_ajm_instances[*instance] = std::move(state);
-	}
-
 	// (In the run log, the first instances: which codecs the game decodes with, and how many channels.)
 	static std::atomic<uint32_t> logged_instances {0};
 	if (logged_instances.fetch_add(1, std::memory_order_relaxed) < 32)
 		std::printf("AJM instance 0x%08" PRIx32 ": codec %" PRIu32 " (%s), flags 0x%016" PRIx64 ", %u channels%s\n", *instance, codec,
 		            AjmCodecName(codec), flags, AjmGetFlagChannelCount(flags), state.decoder ? "" : ", no decoder");
+	{
+		std::scoped_lock lock(g_ajm_instances_mutex);
+		g_ajm_instances[*instance] = std::move(state);
+	}
+
 	LOGF("\t context  = %" PRIu32 "\n"
 	     "\t codec    = %" PRIu32 "\n"
 	     "\t flags    = 0x%016" PRIx64 "\n"
