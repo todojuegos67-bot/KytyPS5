@@ -1533,7 +1533,15 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		const auto video_before = m_graphics.GetDeviceMemoryUsage();
 		m_program_cache->Warm(path, title + device, compile_shaders, adopt_from);
 		const auto memory_shaders = LocalPlatform::ProcessMemory();
-		const bool warm_pipelines = !m_graphics.small_video_memory && !low_ram;
+		// Under a video memory cap below 10 GiB (KYTY_VRAM_BUDGET_MB, the 8 GiB default of a 16 GB card) the recorded
+		// pipelines' ~1 GiB of video memory is better left to the game's textures; made at first use from the static
+		// precompile's binaries (~0.75 ms each). KYTY_PIPELINE_WARMUP=0 skips them regardless.
+		static const bool warmup_off = [] {
+			const char* value = std::getenv("KYTY_PIPELINE_WARMUP");
+			return value != nullptr && std::string_view(value) == "0";
+		}();
+		const bool small_cap      = m_graphics.GetTotalMemoryBudget() < (uint64_t {10} << 30u);
+		const bool warm_pipelines = !m_graphics.small_video_memory && !low_ram && !warmup_off && !small_cap;
 		if (!warm_pipelines && std::string_view(warmup) == "1")
 			PipelineCacheLog("Pipeline warmup: skipped (video memory budget {} MiB, RAM {} MiB)",
 			                 m_graphics.GetTotalMemoryBudget() >> 20u, ram >> 20u);
