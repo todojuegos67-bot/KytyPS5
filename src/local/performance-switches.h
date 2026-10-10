@@ -123,7 +123,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_NATIVE_XPR_KEEP_FRAMES", &kyty_local_native_xpr_keep_frames, 0, 1000000},
 	    Switch {"KYTY_NATIVE_XPR_INSTANCES", &kyty_local_native_xpr_instance_mode},
 	    // Diagnosis bits (native-xpr.inc, kyty_local_native_xpr_diag).
-	    Switch {"KYTY_NATIVE_XPR_DIAG", &kyty_local_native_xpr_diag, 0, 7},
+	    Switch {"KYTY_NATIVE_XPR_DIAG", &kyty_local_native_xpr_diag, 0, 31},
 	    // Table draws (src/local/table-xpr.inc), with native XPR draws; 2 also continues clean runs.
 	    Switch {"KYTY_TABLE_XPR", &kyty_local_table_xpr_mode, 0, 2},
 	    // Table dispatches (src/local/table-xpr.inc).

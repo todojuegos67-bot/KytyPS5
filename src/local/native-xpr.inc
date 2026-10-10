@@ -43,7 +43,9 @@ extern "C" {
 // Diagnosis of a glitch that native XPR causes even in verification (KYTY_NATIVE_XPR_DIAG): bit 0 stores no
 // record (the normal path draws everything, nothing is logged or bound for a record), bit 1 leaves CPU-dirty SRT
 // buffers to the upload ring when a record is stored (no EnsureBufferContents/ObtainBuffer cleaning of their owner),
-// bit 2 validates no record (a found record takes the normal path before NativeXprValidate).
+// bit 2 validates no record (a found record takes the normal path before NativeXprValidate), bit 3 tries no native
+// draw at all (NativeXprTry refuses at once), bit 4 leaves the command processor as with native XPR off (no packet
+// observation, no tries).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_diag {0};
 // 1: objects are drawn in last frame's order, so the record that followed this
 // one last frame is prefetched while this draw runs.
@@ -3179,6 +3181,7 @@ bool RenderExecutor::NativeXprDraw(CommandBuffer& buffer, const NativeXprDrawArg
 bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<const uint64_t> commands,
                                   uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
                                   const NativeXprDirectDraw* direct) {
+	if ((kyty_local_native_xpr_diag.load(std::memory_order_relaxed) & 8u) != 0) return false;
 	auto& cache = NativeXprState();
 	// Store requests within the frame's budget (kyty_local_native_xpr_store_budget); the others ask again
 	// in a later frame.

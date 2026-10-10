@@ -1313,7 +1313,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
-			if (kyty_local_native_xpr_mode.load(std::memory_order_relaxed) != 0)
+			if (kyty_local_native_xpr_mode.load(std::memory_order_relaxed) != 0 &&
+			    (kyty_local_native_xpr_diag.load(std::memory_order_relaxed) & 16u) == 0)
 				DrawStateObserver::ObservePacket(opcode, packet, packet_dw, true);
 #endif
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
@@ -1424,7 +1425,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				if (executor) executor->NativeXprEndPacket();
 			}
 		} native_store_end;
-		if (const auto native = kyty_local_native_xpr_mode.load(std::memory_order_relaxed); native != 0) {
+		if (const auto native = kyty_local_native_xpr_mode.load(std::memory_order_relaxed);
+		    native != 0 && (kyty_local_native_xpr_diag.load(std::memory_order_relaxed) & 16u) == 0) {
 			DrawStateObserver::ObservePacket(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw),
 			                                 false);
 			if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT &&
