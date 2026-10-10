@@ -847,6 +847,15 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	if (static const bool log_views = std::getenv("KYTY_UPLOAD_LOG") != nullptr; log_views && levels > 1 && !storage) {
+		std::printf("[tsc %llu] TSHARP addr=0x%llx size=0x%llx fmt=%u %ux%u levels=%u base=%u last=%u min_lod=%u warn=%u "
+		            "stats=%d\n",
+		            static_cast<unsigned long long>(__rdtsc()), static_cast<unsigned long long>(address),
+		            static_cast<unsigned long long>(size.size), static_cast<uint32_t>(format), width, height, levels,
+		            static_cast<uint32_t>(base_level), static_cast<uint32_t>(view_last_level),
+		            static_cast<uint32_t>(descriptor.MinLod()), static_cast<uint32_t>(descriptor.MinLodWarn5()),
+		            descriptor.MipStatsCntEn() ? 1 : 0);
+	}
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);

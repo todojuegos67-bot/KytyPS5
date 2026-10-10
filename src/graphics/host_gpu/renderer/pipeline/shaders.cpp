@@ -753,10 +753,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.module = compute_module;
 	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
+	// A wave64 program translated for 32-lane subgroups (emulated: SupportsComputeWave64) requires those.
 	const auto wave_size = input_info.stage.program->wave_size;
+	const auto subgroup  = wave_size == 64u && input_info.host_subgroup_size == 32u ? 32u : wave_size;
 	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
-		comp_subgroup_size.requiredSubgroupSize = wave_size;
+	    subgroup >= graphics.min_subgroup_size && subgroup <= graphics.max_subgroup_size) {
+		comp_subgroup_size.requiredSubgroupSize = subgroup;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
 

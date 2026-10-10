@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.12...4.3)
+cmake_minimum_required(VERSION 3.18...4.3)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
 	set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for bundled dependencies")
@@ -455,6 +455,10 @@ target_compile_definitions(kyty_shader_precompile PRIVATE KYTY_STATIC_PRECOMPILE
 # seeds); in the precompile program only, the emulator does not read the game's shader bundles.
 target_sources(kyty_shader_precompile PRIVATE "${KYTY_SOURCE_DIR}/local/static-seeds.h"
 	"${KYTY_SOURCE_DIR}/local/static-seeds.cpp")
+# --make-hints and --apply-hints: the specialization hints a release ships (zstd-compressed, as .zar games are).
+target_sources(kyty_shader_precompile PRIVATE "${KYTY_SOURCE_DIR}/local/shader-hints.h"
+	"${KYTY_SOURCE_DIR}/local/shader-hints.cpp")
+target_link_libraries(kyty_shader_precompile libzstd_static)
 if (WIN32)
 	target_link_libraries(kyty_shader_precompile opengl32 setupapi ws2_32)
 endif()
@@ -489,6 +493,12 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
+
+add_executable(archive_file_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ArchiveFileTests.cpp"
+)
+target_link_libraries(archive_file_tests common ZArchive::zarchive)
+target_include_directories(archive_file_tests PRIVATE ${inc_headers})
 
 add_executable(demons_souls_copy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DemonsSoulsCopyTests.cpp")
@@ -652,6 +662,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME demons_souls_copy COMMAND $<TARGET_FILE:demons_souls_copy_tests>)
 	add_test(NAME demons_souls_idle COMMAND $<TARGET_FILE:demons_souls_idle_tests>)
 	add_test(NAME page_protection_table COMMAND $<TARGET_FILE:page_protection_table_tests>)
@@ -728,6 +739,7 @@ if(BUILD_TESTING)
 		image_page_table_tests
 		memory_tracker_tests
 		page_manager_tests
+		archive_file_tests
 		demons_souls_copy_tests
 		demons_souls_idle_tests
 		page_protection_table_tests

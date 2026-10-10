@@ -112,9 +112,12 @@ private:
 };
 
 // Render-thread waits, always summed (the slow-frame lines, LiveControl::Flip): for GPU work, for a guest
-// readback's copy, in a synchronous download, in shader translation and pipeline creation. Steady-clock ns.
-enum Wait : uint32_t { WaitGpu, WaitReadback, WaitDownload, WaitCompile, Waits };
+// readback's copy, in a synchronous download, in shader translation and pipeline creation, for the recording
+// worker (a full stream or a drain). Steady-clock ns.
+enum Wait : uint32_t { WaitGpu, WaitReadback, WaitDownload, WaitCompile, WaitRecord, Waits };
 inline int64_t g_waits_ns[Waits] {};
+// Any thread's waits for the upload worker's copies (the recording worker's submissions above all), steady-clock ns.
+inline std::atomic<int64_t> g_upload_wait_ns {0};
 class WaitScope {
 public:
 	explicit WaitScope(Wait wait): m_wait(wait), m_on(g_render) {

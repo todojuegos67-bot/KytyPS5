@@ -51,6 +51,7 @@ extern volatile std::atomic<uint32_t> kyty_local_texture_resolve_pages_mode;
 // 2: also checks every partial upload against guest data hashes of the untouched part.
 extern volatile std::atomic<uint32_t> kyty_local_partial_image_dirty_mode;
 extern volatile std::atomic<uint32_t> kyty_local_partial_row_bands_mode;
+extern volatile std::atomic<uint32_t> kyty_local_texture_levels_mode;
 // 1: write protection after uploads runs on the upload worker (memoryTracker.h).
 extern volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode;
 // 1: guest readbacks narrow a window that meets an image to the request's pages (bufferCache.cpp).

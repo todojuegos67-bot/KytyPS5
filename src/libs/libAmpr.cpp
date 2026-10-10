@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "common/archive.h"
 #include "common/dateTime.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -9,12 +10,16 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
+#include "local-platform.h"
+#include "slow-log.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -143,8 +148,9 @@ static int GetHostPathStat(const std::string& host_path, LibKernel::FileSystem::
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	const bool is_dir  = Common::File::IsDirectoryExisting(host_path);
-	const bool is_file = Common::File::IsFileExisting(host_path);
+	const auto path    = Common::PathFromUtf8(host_path); // (kept as UTF-8)
+	const bool is_dir  = Common::File::IsDirectoryExisting(path);
+	const bool is_file = Common::File::IsFileExisting(path);
 	if (!is_dir && !is_file) {
 		return LibKernel::KERNEL_ERROR_ENOENT;
 	}
@@ -160,11 +166,11 @@ static int GetHostPathStat(const std::string& host_path, LibKernel::FileSystem::
 		stat.st_blksize = 512;
 		stat.st_blocks  = 0;
 	} else {
-		stat.st_size    = static_cast<int64_t>(Common::File::Size(host_path));
+		stat.st_size    = static_cast<int64_t>(Common::File::Size(path));
 		stat.st_blksize = 512;
 		stat.st_blocks  = (stat.st_size + 511) / 512;
 
-		Common::File::GetLastAccessAndWriteTimeUTC(host_path, &at, &wt);
+		Common::File::GetLastAccessAndWriteTimeUTC(path, &at, &wt);
 	}
 
 	stat.st_atim.tv_sec  = static_cast<int64_t>(at.ToUnix());
@@ -201,13 +207,14 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
 		info.host_path       = Common::PathToString(real_path);
 
-		if (Common::File::IsDirectoryExisting(real_path)) {
+		// (One query for the kind and the size: the game resolves its ~250K paths at start-up.)
+		if (const auto found_info = Common::File::GetInfo(real_path); !found_info) {
+			info.result = LibKernel::KERNEL_ERROR_ENOENT;
+		} else if (!found_info->is_file) {
 			info.is_dir    = true;
 			info.file_size = 0x10000;
-		} else if (Common::File::IsFileExisting(real_path)) {
-			info.file_size = Common::File::Size(real_path);
 		} else {
-			info.result = LibKernel::KERNEL_ERROR_ENOENT;
+			info.file_size = found_info->size;
 		}
 
 		bool log_missing = false;
@@ -445,15 +452,16 @@ static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
 		return OK;
 	}
 
-	if (Common::File::IsDirectoryExisting(host_path)) {
+	const auto path = Common::PathFromUtf8(host_path); // (kept as UTF-8)
+	if (Common::File::IsDirectoryExisting(path)) {
 		*size = 0;
 		return OK;
 	}
-	if (!Common::File::IsFileExisting(host_path)) {
+	if (!Common::File::IsFileExisting(path)) {
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
 	}
 
-	*size = Common::File::Size(host_path);
+	*size = Common::File::Size(path);
 	return OK;
 }
 
@@ -1294,6 +1302,13 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 	if (!TryGetCommandBufferState(command_buffer, &state)) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
+	// The submitting guest thread does the reads (the console's submit returns at once): a slow one stalls that thread.
+	SlowLog::Scope slow([&](double ms) {
+		uint64_t bytes = 0;
+		for (const auto& read: state.read_file_commands) bytes += read.size;
+		std::printf("SLOW AprExecute %.1f ms reads=%zu bytes=%llu tid=%u\n", ms, state.read_file_commands.size(),
+		            static_cast<unsigned long long>(bytes), LocalPlatform::ThreadId());
+	}, SlowLog::HitchThreshold());
 
 	enum class CommandKind {
 		ReadFile,
@@ -1433,6 +1448,31 @@ static bool AdvanceCommandBuffer(uint64_t command_buffer, uint64_t record_size) 
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
+// KYTY_APR_LOG: each read's guest range and file (texture uploads matched with the reads that wrote them).
+static void LogAprRead(const std::string& host_path, uint64_t destination, uint64_t bytes, uint64_t file_offset) {
+	static const bool log_reads = std::getenv("KYTY_APR_LOG") != nullptr;
+	if (log_reads) {
+		const auto slash = host_path.find_last_of("/\\");
+		std::printf("[tsc %llu] APRREAD addr=0x%llx size=0x%llx offset=0x%llx file=%s\n",
+		            static_cast<unsigned long long>(__rdtsc()), static_cast<unsigned long long>(destination),
+		            static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(file_offset),
+		            host_path.c_str() + (slash == std::string::npos ? 0 : slash + 1));
+	}
+}
+
+// A file of a game packed into a ZArchive ("game.zar!/dir/file"), kept open like LocalPlatform::OpenKeptReadFile's:
+// positional reads from any thread. Null: it is not in the archive.
+static const Common::ArchiveFile* KeptArchiveFile(const std::string& host_path) {
+	static std::mutex                                                            mutex;
+	static std::unordered_map<std::string, std::unique_ptr<Common::ArchiveFile>> files;
+	std::lock_guard                                                              lock(mutex);
+	auto&                                                                        file = files[host_path];
+	if (file == nullptr) {
+		file = Common::OpenArchiveFile(Common::PathFromUtf8(host_path)); // (kept as UTF-8)
+	}
+	return file.get();
+}
+
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read) {
 	if (bytes_read == nullptr) {
@@ -1447,11 +1487,86 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
+	// A slow read's phases (a 16 KiB read took 221 ms in play): opening the file, reading it, copying into guest memory
+	// (whose pages may be write-protected: faults).
+	using Clock = std::chrono::steady_clock;
+	const auto start = Clock::now();
+	Clock::duration opening {}, reading {}, copying {};
+	// (The thread's run time over the read, in TSC ticks: far under the wall time is waiting, for the disk or a CPU.)
+	const uint64_t cycles = LocalPlatform::CurrentThreadCycles();
+	SlowLog::Scope slow([&](double ms) {
+		const auto at = [](Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+		const auto slash = host_path.find_last_of("/\\");
+		std::printf("SLOW AprRead %.1f ms open=%.1f read=%.1f copy=%.1f cpu_mcycles=%.2f prio=%d bytes=%llu offset=0x%llx "
+		            "file=%s\n",
+		            ms, at(opening), at(reading), at(copying),
+		            static_cast<double>(LocalPlatform::CurrentThreadCycles() - cycles) / 1e6,
+		            LocalPlatform::CurrentThreadPriority(), static_cast<unsigned long long>(*bytes_read),
+		            static_cast<unsigned long long>(file_offset),
+		            host_path.c_str() + (slash == std::string::npos ? 0 : slash + 1));
+	}, SlowLog::HitchThreshold());
+
+	if (host_path.find('!') != std::string::npos && Common::IsArchivePath(Common::PathFromUtf8(host_path))) {
+		const auto* archive = KeptArchiveFile(host_path);
+		if (archive == nullptr) {
+			LOGF("\tAPR read missing archive file: %s\n", host_path.c_str());
+			return LibKernel::KERNEL_ERROR_ENOENT;
+		}
+		opening = Clock::now() - start;
+		if (file_offset >= archive->Size()) {
+			return OK;
+		}
+		// Decompressed on the archive's host threads, copied into the guest range on this one (pages may fault). One
+		// call for the whole read keeps its chunks in flight on all the lanes.
+		const auto readable = std::min<uint64_t>(size, archive->Size() - file_offset);
+		while (*bytes_read < readable) {
+			const auto request = static_cast<uint32_t>(std::min<uint64_t>(uint64_t {1} << 30u, readable - *bytes_read));
+			const auto read    = archive->ReadAt(file_offset + *bytes_read, reinterpret_cast<void*>(destination + *bytes_read), request);
+			if (read == 0) {
+				break;
+			}
+			*bytes_read += read;
+		}
+		reading = Clock::now() - start - opening;
+		LogAprRead(host_path, destination, *bytes_read, file_offset);
+		return OK;
+	}
+
+	// The file kept open (LocalPlatform::OpenKeptReadFile): opened per read, a streamed file (audio, read 16 KiB at a
+	// time) lost the cache manager's read-ahead at each close, so each chunk was a disk read of its own; under load
+	// one took 100-550 ms while the game waited for it. Positional reads into a buffer of the thread's (the kernel
+	// cannot write into write-protected guest pages), then copied.
+	if (uint64_t kept_size = 0; const auto kept = LocalPlatform::OpenKeptReadFile(host_path, &kept_size)) {
+		opening = Clock::now() - start;
+		if (file_offset >= kept_size) {
+			return OK;
+		}
+		const auto readable = std::min<uint64_t>(size, kept_size - file_offset);
+		thread_local std::vector<uint8_t> kept_buffer;
+		kept_buffer.resize(static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
+		while (*bytes_read < readable) {
+			const auto request = static_cast<uint32_t>(std::min<uint64_t>(kept_buffer.size(), readable - *bytes_read));
+			const auto before  = Clock::now();
+			const auto read    = LocalPlatform::ReadOpenFileAt(kept, file_offset + *bytes_read, kept_buffer.data(), request);
+			const auto after   = Clock::now();
+			reading += after - before;
+			if (read == 0) {
+				break;
+			}
+			std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), kept_buffer.data(), read);
+			copying += Clock::now() - after;
+			*bytes_read += read;
+		}
+		LogAprRead(host_path, destination, *bytes_read, file_offset);
+		return OK;
+	}
+
 	Common::File file;
-	if (!file.Open(host_path, Common::File::Mode::Read)) {
+	if (!file.Open(Common::PathFromUtf8(host_path), Common::File::Mode::Read)) {
 		LOGF("\tAPR read missing host file: %s\n", host_path.c_str());
 		return LibKernel::KERNEL_ERROR_ENOENT;
 	}
+	opening = Clock::now() - start;
 	const auto file_size = file.Size();
 	if (file_offset >= file_size) {
 		file.Close();
@@ -1473,12 +1588,16 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 	while (*bytes_read < readable) {
 		const auto request =
 		    static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), readable - *bytes_read));
-		uint32_t read = 0;
+		uint32_t   read   = 0;
+		const auto before = Clock::now();
 		file.Read(buffer.data(), request, &read);
+		const auto after = Clock::now();
+		reading += after - before;
 		if (read == 0) {
 			break;
 		}
 		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
+		copying += Clock::now() - after;
 		*bytes_read += read;
 	}
 

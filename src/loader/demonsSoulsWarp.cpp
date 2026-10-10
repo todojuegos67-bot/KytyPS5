@@ -1,5 +1,7 @@
 #include "loader/demonsSoulsWarp.h"
 
+#include "common/file.h"
+#include "common/stringUtils.h"
 #include "kernel/fileSystem.h"
 
 #include <algorithm>
@@ -36,8 +38,15 @@ uint32_t Fnv1a(std::span<const uint8_t> data) {
 }
 
 std::vector<uint8_t> ReadFile(const std::filesystem::path& path) {
-	std::ifstream in(path, std::ios::binary);
-	return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+	std::vector<uint8_t> data;
+	Common::File         in;
+	if (in.Open(path, Common::File::Mode::Read)) { // (also a game archive's member)
+		data.resize(static_cast<size_t>(in.Size()));
+		uint32_t read = 0;
+		in.Read(data.data(), static_cast<uint32_t>(data.size()), &read);
+		data.resize(read);
+	}
+	return data;
 }
 
 // The value offset of the one entry starting with `prefix` (key and type bytes), 0 if none or several.
@@ -156,12 +165,11 @@ void CheckDoneLocked() {
 const std::vector<Spawn>& Spawns() {
 	static const std::vector<Spawn> spawns = [] {
 		std::vector<Spawn> all;
-		std::error_code    error;
 		const auto         dir = Libs::LibKernel::FileSystem::GetRealFilename("/app0/cp11demonssouls/dvdroot/map/mapstudio");
 		std::vector<std::filesystem::path> files;
-		for (const auto& entry: std::filesystem::directory_iterator(dir, error)) {
-			const auto name = entry.path().filename().string();
-			if (name.size() == 16 && name.starts_with("m0") && entry.path().extension() == ".msb") files.push_back(entry.path());
+		for (const auto& entry: Common::File::GetDirEntries(dir)) { // (also a game archive's directory)
+			const auto& name = entry.name;
+			if (entry.is_file && name.size() == 16 && name.starts_with("m0") && name.ends_with(".msb")) files.push_back(dir / Common::PathFromUtf8(name));
 		}
 		std::ranges::sort(files);
 		for (const auto& file: files) {

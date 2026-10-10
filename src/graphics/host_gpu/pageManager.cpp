@@ -32,9 +32,13 @@ namespace {
 thread_local std::vector<PageManager::DeferredRange>* g_deferred_write_protect = nullptr;
 thread_local uint64_t g_unmapping_begin = 0;
 thread_local uint64_t g_unmapping_end   = 0;
-// PageManager::DeferReadProtection: the GPU thread's pending no-access range [begin, end) (end 0: none).
-thread_local bool     g_defer_read_protect = false;
-thread_local uint64_t g_read_protect_begin = 0, g_read_protect_end = 0;
+// PageManager::DeferReadProtection: the GPU thread's pending no-access ranges, disjoint and not adjacent (a range
+// next to one extends it).
+thread_local bool g_defer_read_protect = false;
+struct PendingRange {
+	uint64_t begin, end;
+};
+thread_local std::vector<PendingRange> g_read_protects;
 
 constexpr uint64_t PAGE_SIZE    = TRACKER_PAGE_SIZE;
 constexpr uint64_t REGION_SIZE  = TRACKER_REGION_SIZE;
@@ -256,28 +260,51 @@ struct PageManager::Impl {
 	}
 
 	static void FlushReadProtect() noexcept {
-		if (g_read_protect_end == 0) return;
-		const auto begin = g_read_protect_begin, end = g_read_protect_end;
-		g_read_protect_end = 0;
-		ProtectHost(begin, end - begin, NO_ACCESS_PROTECTION);
+		for (const auto& range: g_read_protects) ProtectHost(range.begin, range.end - range.begin, NO_ACCESS_PROTECTION);
+		g_read_protects.clear();
+	}
+
+	// The pending no-access ranges that overlap [begin, end), applied first (a protection change of those pages
+	// comes after them; pages of the others keep theirs pending).
+	static void FlushReadProtectOverlapping(uint64_t begin, uint64_t end) noexcept {
+		auto& ranges = g_read_protects;
+		for (size_t i = 0; i < ranges.size();) {
+			if (ranges[i].begin < end && begin < ranges[i].end) {
+				ProtectHost(ranges[i].begin, ranges[i].end - ranges[i].begin, NO_ACCESS_PROTECTION);
+				ranges[i] = ranges.back();
+				ranges.pop_back();
+			} else {
+				++i;
+			}
+		}
+	}
+
+	// A no-access range joins the pending ones: merged with those it overlaps or touches (one call for all).
+	static void AddReadProtect(uint64_t begin, uint64_t end) noexcept {
+		auto& ranges = g_read_protects;
+		for (size_t i = 0; i < ranges.size();) {
+			if (ranges[i].begin <= end && begin <= ranges[i].end) {
+				begin     = std::min(begin, ranges[i].begin);
+				end       = std::max(end, ranges[i].end);
+				ranges[i] = ranges.back();
+				ranges.pop_back();
+			} else {
+				++i;
+			}
+		}
+		ranges.push_back({begin, end});
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, uint32_t protection) noexcept {
-		if (protection == NO_ACCESS_PROTECTION && g_defer_read_protect) {
-			if (g_read_protect_end != 0 && vaddr == g_read_protect_end) {
-				g_read_protect_end = vaddr + size;
+		if (g_defer_read_protect) {
+			if (protection == NO_ACCESS_PROTECTION) {
+				AddReadProtect(vaddr, vaddr + size);
 				return;
 			}
-			if (g_read_protect_end != 0 && vaddr + size == g_read_protect_begin) {
-				g_read_protect_begin = vaddr;
-				return;
-			}
-			FlushReadProtect();
-			g_read_protect_begin = vaddr;
-			g_read_protect_end   = vaddr + size;
-			return;
+			// (Another protection of the pages of a pending range comes after it; the other ranges stay pending:
+			// protections of disjoint pages do not depend on each other's order.)
+			FlushReadProtectOverlapping(vaddr, vaddr + size);
 		}
-		FlushReadProtect(); // (an earlier protection first)
 		const auto end = vaddr + size;
 		if (protection == READ_WRITE_PROTECTION && g_unmapping_end > g_unmapping_begin &&
 		    vaddr < g_unmapping_end && end > g_unmapping_begin) {

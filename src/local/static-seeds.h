@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace StaticSeeds {
 
@@ -22,5 +23,10 @@ std::filesystem::path FindStates();
 
 // Writes the seed file: 0, or 1 where precompile.py stops with an error (nothing is written then).
 int Make(const Options& options);
+
+// A seed file of these records and pipeline recipes, as Make writes one (the identity line, the XXH3-64 of the body,
+// the body; whole or not at all): the body's size, or 0 where it cannot be written.
+uint64_t Write(const std::filesystem::path& path, std::vector<std::vector<uint32_t>> records,
+               std::vector<std::vector<uint32_t>> pipelines);
 
 } // namespace StaticSeeds

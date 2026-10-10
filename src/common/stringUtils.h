@@ -38,6 +38,15 @@ inline std::string PathToGenericString(const std::filesystem::path& path) {
 #endif
 }
 
+// PathToString's inverse (a std::string made a path directly is read in the ANSI code page on Windows).
+inline std::filesystem::path PathFromUtf8(std::string_view text) {
+#if defined(__cpp_char8_t)
+	return std::filesystem::path(std::u8string(text.begin(), text.end()));
+#else
+	return std::filesystem::u8path(text.begin(), text.end());
+#endif
+}
+
 inline bool IsSpace(char c) {
 	return std::isspace(static_cast<unsigned char>(c)) != 0;
 }

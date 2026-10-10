@@ -798,6 +798,11 @@ static std::string DescribeGuestAddress(uint64_t vaddr) {
 	                   vaddr - program->base_vaddr);
 }
 
+std::string DescribeGuestAddressForDiagnostics(uint64_t vaddr) {
+	if (g_faulting_linker == nullptr || vaddr == 0 || g_faulting_linker->FindProgramByAddr(vaddr) == nullptr) return {};
+	return DescribeGuestAddress(vaddr);
+}
+
 static std::string DescribeGuestCode(uint64_t vaddr) {
 	if (g_faulting_linker == nullptr || g_faulting_linker->FindProgramByAddr(vaddr) == nullptr) {
 		return {};

@@ -1,3 +1,4 @@
+#include "common/archive.h"
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
@@ -560,6 +561,7 @@ public:
 	explicit FileStreamer(AvPlayerFileReplacement f): file(f) {}
 	~FileStreamer() {
 		if (ctx != nullptr) {
+			av_freep(&ctx->buffer);
 			avio_context_free(&ctx);
 		}
 		if (opened && file.close != nullptr) {
@@ -586,6 +588,23 @@ public:
 		ctx = avio_alloc_context(buf, 4096, 0, this, Read, nullptr, Seek);
 		return ctx != nullptr;
 	}
+	// A file inside the game's archive (FFmpeg cannot open it by name).
+	bool InitArchive(const std::filesystem::path& real) {
+		archive = Common::OpenArchiveFile(real);
+		if (archive == nullptr || archive->Size() == 0) {
+			return false;
+		}
+		size      = archive->Size();
+		auto* buf = static_cast<uint8_t*>(av_malloc(64 * 1024));
+		if (buf == nullptr) {
+			return false;
+		}
+		ctx = avio_alloc_context(buf, 64 * 1024, 0, this, Read, nullptr, Seek);
+		if (ctx == nullptr) {
+			av_free(buf);
+		}
+		return ctx != nullptr;
+	}
 	AVIOContext* Context() const { return ctx; }
 
 private:
@@ -594,9 +613,10 @@ private:
 		if (s->pos >= s->size) {
 			return AVERROR_EOF;
 		}
-		len = static_cast<int>(std::min<uint64_t>(len, s->size - s->pos));
-		auto r =
-		    s->file.read_offset(s->file.object_pointer, buf, s->pos, static_cast<uint32_t>(len));
+		len    = static_cast<int>(std::min<uint64_t>(len, s->size - s->pos));
+		auto r = s->archive != nullptr
+		             ? static_cast<int>(s->archive->ReadAt(s->pos, buf, static_cast<uint32_t>(len)))
+		             : s->file.read_offset(s->file.object_pointer, buf, s->pos, static_cast<uint32_t>(len));
 		if (r <= 0) {
 			return r == 0 ? AVERROR_EOF : r;
 		}
@@ -620,11 +640,12 @@ private:
 		s->pos = static_cast<uint64_t>(p);
 		return p;
 	}
-	AvPlayerFileReplacement file;
-	bool                    opened = false;
-	uint64_t                pos    = 0;
-	uint64_t                size   = 0;
-	AVIOContext*            ctx    = nullptr;
+	AvPlayerFileReplacement              file;
+	std::unique_ptr<Common::ArchiveFile> archive; // a member of the game's archive (FFmpeg reads it through `ctx`)
+	bool                                 opened = false;
+	uint64_t                             pos    = 0;
+	uint64_t                             size   = 0;
+	AVIOContext*                         ctx    = nullptr;
 };
 
 class Source {
@@ -669,8 +690,19 @@ public:
 				LOGF("\t avformat_open_input callback failed: %s\n", fferr(rc).c_str());
 				return AVPLAYER_ERROR_OPERATION_FAILED;
 			}
+		} else if (auto real = LibKernel::FileSystem::GetRealFilename(std::string(path.c_str()));
+		           Common::IsArchivePath(real)) {
+			streamer = std::make_unique<FileStreamer>(file);
+			if (!streamer->InitArchive(real)) {
+				avformat_free_context(raw);
+				return AVPLAYER_ERROR_OPERATION_FAILED;
+			}
+			raw->pb = streamer->Context();
+			if (auto rc = avformat_open_input(&raw, path.c_str(), nullptr, nullptr); rc < 0) {
+				LOGF("\t avformat_open_input archive failed: %s path=%s\n", fferr(rc).c_str(), path.c_str());
+				return AVPLAYER_ERROR_OPERATION_FAILED;
+			}
 		} else {
-			auto real     = LibKernel::FileSystem::GetRealFilename(std::string(path.c_str()));
 			auto real_str = Common::PathToString(real);
 			if (auto rc = avformat_open_input(&raw, real_str.c_str(), nullptr, nullptr); rc < 0) {
 				LOGF("\t avformat_open_input failed: %s path=%s\n", fferr(rc).c_str(),

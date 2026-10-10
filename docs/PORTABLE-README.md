@@ -54,6 +54,10 @@ folder (usually named `PPSA01341-app0`).
   so you only choose it once.
 - To use another location: delete `game-path.txt` and launch again, or run
   `run.cmd -Game "D:\Games\PPSA01341-app0"`.
+- Optional: the folder packed into one ZArchive file (`.zar`, about two thirds of its size) works
+  too, read without extracting it: choose it with the launcher's `.zar...` button, or run
+  `run.cmd -Game "D:\Games\PPSA01341-app0.zar"`. Pack it with `zarchive.exe <folder> <file.zar>`
+  (ZArchive, https://github.com/Exzap/ZArchive/releases). The folder stays the main way.
 
 ## Starting the game
 
@@ -93,7 +97,7 @@ shortcut):
 | `-Fullscreen` | Full screen (F11 or Alt+Enter also toggle it in the game) |
 | `-Fullscreen -AspectFit` | Full screen keeping 16:9, with black bars instead of stretching |
 | `-Width 1920 -Height 1080` | The window size (default 2560×1440, shrunk when the screen is smaller) |
-| `-Game <folder>` | The game folder |
+| `-Game <folder>` | The game folder (or a `.zar` archive of it) |
 | `-Language 11` | The console language, as the PS5 numbers them (0 Japanese, 1 English (US), 11 Chinese (Simplified), ...; the launcher lists them) |
 
 ## Shader precompile (without it the game stutters)
@@ -115,13 +119,17 @@ There are two levels of preparation, both specific to the graphics card and driv
    result is a store the game reads pipeline by pipeline (`<title>_<version>.binaries`, about 2 GB, nothing to
    load at launch); with other drivers a cache each launch loads (with a progress bar).
    - Choose "Precompile first" in the dialog at launch, or double-click `precompile.cmd` on its own.
-   - The time depends on the CPU threads: about 45 minutes with 22 threads, about 1 hour with 16,
-     about 2 hours with 8. The CPU is fully loaded meanwhile: running it overnight is a good idea.
+   - The time depends on the CPU threads: about 55 minutes with 22 threads, about 1 hour 15 minutes with
+     16, about 2.5 hours with 8. The CPU is fully loaded meanwhile: running it overnight is a good idea.
    - Closing the window stops it; running it again continues where it stopped.
    - Coming from an older package with a precompiled `_PipelineCache\static\<title>.bin`: the precompile
      turns it into the store in a few minutes; the `.bin` is then unused and can be deleted (about 4 GB).
+   - It compiles the shaders as the game uses them in play too: the package carries what was recorded
+     while playing every world on the test PC (`tools\local\static-precompile\hints-<title>_<version>.hints`,
+     without the game's shader code), completed with the code of your own game files.
    - **After a graphics driver update or a new graphics card it has to be done again**; the launcher
-     asks again.
+     asks again. It also asks after an update of the emulator that precompiles more: running it again
+     then compiles only what is new.
    - To stop being asked: tick "Don't ask about precompiling again" (delete
      `no-precompile-prompt.txt` to be asked again).
 
@@ -167,6 +175,7 @@ can be warped too; one in the character creation cannot (it has no save yet).
 | `logs` | Run logs |
 | `game-path.txt` | The remembered game location |
 | `seeds-<title>_<version>.seeds` | The list of shaders the first launch collects from the game files (one per game version) (it contains the game's shader code: do not share it), for the precompile |
+| `hinted-<title>_<version>.seeds` | The recorded play of the package's hints with the code of your game files (made by each precompile; it contains the game's shader code: do not share it) |
 | `launch.json` | The emulator's switches; normally left alone |
 
 ## Known issues

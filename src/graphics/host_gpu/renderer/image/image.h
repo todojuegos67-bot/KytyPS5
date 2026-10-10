@@ -146,6 +146,15 @@ public:
 	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& CpuDirtyRanges() const noexcept {
 		return m_dirty_ranges;
 	}
+	// A whole-image CPU-dirty state as the one dirty range it amounts to (a refresh of part of it completes that part:
+	// TextureCache::RefreshTextureLevels).
+	void NarrowCpuDirty() {
+		if (!m_cpu_dirty || m_partial_dirty || m_maybe_cpu_dirty) {
+			EXIT("image cannot narrow its dirty state\n");
+		}
+		m_partial_dirty = true;
+		m_dirty_ranges.assign(1, {info.data.address, info.data.End()});
+	}
 	// The whole image must be uploaded again (the image stopped watching all of its pages).
 	void DropPartialDirty() noexcept {
 		m_partial_dirty = false;
@@ -305,6 +314,11 @@ public:
 	mutable std::atomic<bool> state_busy {false};
 	// RegisterImage calls on this object: a proof names one registration.
 	uint32_t         registrations      = 0;
+	// TextureCache::ViewLevelBytes's last answer: the view's levels (base | count << 8; UINT32_MAX: none yet) and their
+	// bytes [level_begin, level_end) (level_end 0: the view needs the whole image).
+	mutable uint32_t level_view         = UINT32_MAX;
+	mutable uint64_t level_begin        = 0;
+	mutable uint64_t level_end          = 0;
 
 private:
 	friend struct ImageTestAccess;

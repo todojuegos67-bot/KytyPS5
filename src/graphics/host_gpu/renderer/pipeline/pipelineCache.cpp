@@ -339,6 +339,7 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COLOR));
 	LOGF_COLOR(Log::Color::BrightRed, "%s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s",
 	           label, shader_hash, messages.c_str());
+	std::fprintf(stderr, "%s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s", label, shader_hash, messages.c_str());
 	LOGF("%s\n", text.c_str());
 	return false;
 }

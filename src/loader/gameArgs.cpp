@@ -1,5 +1,7 @@
 #include "loader/gameArgs.h"
 
+#include "common/file.h"
+
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -39,8 +41,14 @@ bool IsArgsFile(const std::filesystem::path& real) {
 }
 
 std::string Contents(const std::filesystem::path& real) {
-	std::ifstream in(real, std::ios::binary);
-	std::string   text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+	std::string  text;
+	Common::File in;
+	if (in.Open(real, Common::File::Mode::Read)) { // (also a game archive's member)
+		text.resize(static_cast<size_t>(in.Size()));
+		uint32_t read = 0;
+		in.Read(text.data(), static_cast<uint32_t>(text.size()), &read);
+		text.resize(read);
+	}
 	if (!text.empty() && text.back() != '\n') text += '\n';
 	return text + ExtraLines();
 }

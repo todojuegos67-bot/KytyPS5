@@ -121,7 +121,7 @@ struct RenderExecutor::TablePair {
 	};
 	std::array<FlatStage, 2> flat;
 	std::vector<TableVariant>                                   variants;
-	uint64_t                                                    store_frame = 0;
+	uint64_t                                                    store_frame = 0, store_state = 0; // the last request
 	std::unordered_map<uint64_t, std::unique_ptr<TableImageSet>, HashedKey> sets; // by T#/S# words
 	std::array<TableImageSet*, Roles>                           last_set {}; // by role
 	// ShaderMapGeneration under which the shaders at vs and ps were proven those the programs were compiled
@@ -348,12 +348,14 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		TableReset(pair);
 	}
 	if (pair.refused) return Spec::Refuse("table: pair refused"), TableResult::Native;
-	// A store at most once a frame per pair, within the frame's budget (kyty_local_table_store_budget): while its
-	// programs and pipeline compile, the pair's draws keep the native path.
+	// A store at most once a frame per pair and draw state, within the frame's budget (kyty_local_table_store_budget):
+	// while its programs and pipeline compile, the pair's draws keep the native path. (Once a frame per pair kept its
+	// other states' draws on the native path, storing native records, until a later frame.)
 	const auto request_store = [&] {
 		if (Spec::Current() != nullptr) return Spec::Refuse("table store"), TableResult::Native;
 		if (pair.waiting) {
-			if (!pair.waiting->load(std::memory_order_acquire)) return TableResult::Native;
+			if (!pair.waiting->load(std::memory_order_acquire))
+				return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Native; // (programs compiling)
 			pair.waiting.reset();
 		}
 		if (table.store_frame != frame) {
@@ -361,9 +363,12 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 			table.store_requests = 0;
 		}
 		const auto budget = kyty_local_table_store_budget.load(std::memory_order_relaxed);
-		if (pair.store_frame == frame || (budget != 0 && table.store_requests >= budget)) return TableResult::Native;
+		if ((pair.store_frame == frame && pair.store_state == cache.state_key) ||
+		    (budget != 0 && table.store_requests >= budget))
+			return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Native;
 		++table.store_requests;
 		pair.store_frame  = frame;
+		pair.store_state  = cache.state_key;
 		table.store       = &pair;
 		table.store_state = cache.state_key;
 		return TableResult::Store;
@@ -519,6 +524,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	// decals' G-buffer) wholly in General; storage in General; else read-only.
 	std::array<std::vector<TableImageSet::Image>, 2> deps;
 	bool                                             ok = true;
+	for (uint32_t st = 0; st < stages; ++st) deps[st].reserve(prepared[st].images.size()); // (no regrowth: new sets come in bursts)
 	for (uint32_t st = 0; st < stages && ok; ++st)
 		for (auto& binding: prepared[st].images) {
 			auto&       image   = textures.GetImage(binding.image_id);
@@ -606,6 +612,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			}
 			pending.push_back(item);
 		}
+		if (st == 0) set->images.reserve(deps[0].size() + deps[1].size());
 		for (const auto& dep: deps[st])
 			if (dep.layout != vk::ImageLayout::eUndefined) set->images.push_back(dep);
 	}
@@ -635,10 +642,10 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	return publish();
 }
 
-// What FindTexture's RefreshImage uploads before an image is used: guest bytes the CPU wrote, a GPU buffer write over
-// them, or one over its stencil plane.
-static bool TableRefreshPending(const Image& image) {
-	return image.IsCpuDirty() || image.IsBufferModified() || image.IsStencilModified();
+// What FindTexture uploads before an image is used with `desc`: guest bytes the CPU wrote, a GPU buffer write over them,
+// or one over its stencil plane (of a sampled view, only into its levels: TextureCache::RefreshPending).
+static bool TableRefreshPending(const Image& image, const TextureCache::ImageDesc& desc) {
+	return TextureCache::RefreshPending(image, desc);
 }
 
 // A set's images are the same objects, registered and current (as NativeXprValidateResources proves a record's):
@@ -653,12 +660,12 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		if (image == nullptr || image->serial != dep.serial) return false;
 		// The guest rewrote it (a texture streaming in), or a GPU buffer write its bytes or its stencil plane: upload it
 		// as the normal path's FindTexture does.
-		if (TableRefreshPending(*image)) {
+		if (TableRefreshPending(*image, dep.desc)) {
 			if (Spec::Current() != nullptr) return Spec::Refuse("texture upload"), false;
 			if (!image->registered || image->depth_id || image->binding.needs_rebind) return false;
 			(void)textures.FindTexture(dep.id, dep.desc);
 			image = textures.m_slot_images.try_get(dep.id);
-			if (image == nullptr || image->serial != dep.serial || TableRefreshPending(*image)) return false;
+			if (image == nullptr || image->serial != dep.serial || TableRefreshPending(*image, dep.desc)) return false;
 		}
 		if (dep.target) {
 			if (!image->registered || image->binding.needs_rebind) return false;
@@ -1246,7 +1253,7 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 		// An image the shader writes is GPU-modified, CPU-clean and current with buffer writes (as the normal path's
 		// FindTexture leaves a storage image: it acquires it again otherwise). One written since the set was proven this
 		// frame (by the CPU, a GPU buffer write, or into its stencil plane) is uploaded by the normal path's FindTexture.
-		if ((dep.storage && !image->SafeToDownload()) || TableRefreshPending(*image)) return false;
+		if ((dep.storage && !image->SafeToDownload()) || TableRefreshPending(*image, dep.desc)) return false;
 		if (dep.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
 			if (image->info.IsVolume()) return false;
 			const auto address = dep.desc.info.metadata.range.address;
@@ -1290,14 +1297,15 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	}
 	std::optional<LiveCensus::Scope> phase;
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 1);
-	if (!TableEvaluate(pair, user_data)) return Spec::Refuse("table: evaluation"), TableResult::Native;
+	if (!TableEvaluate(pair, user_data))
+		return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: evaluation"), TableResult::Native;
 	TableGather(pair, user_data);
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 2);
 	const auto* set = TableSet(buffer, pair, &variant, &draw_state);
 	if (auto* spec = Spec::Current(); spec != nullptr && set != nullptr)
 		spec->NoteSet(reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(set->set)));
-	if (set == nullptr) return Spec::Refuse("table: no set"), TableResult::Native;
+	if (set == nullptr) return LiveCounters::Add(LiveCounters::TableNoSet), Spec::Refuse("table: no set"), TableResult::Native;
 
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 3);
@@ -1359,7 +1367,8 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// replaces an earlier one) leaves an earlier address stale, where the normal path binds after all its lookups
 	// (RebindBuffers). Such a draw takes the normal path; the next use finds the buffers registered.
 	const auto registration = buffer_cache.RegistrationEpoch();
-	if (!TableBlocks(pair, user_data, blocks, &writes)) return Spec::Refuse("table: blocks"), TableResult::Native;
+	if (!TableBlocks(pair, user_data, blocks, &writes))
+		return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: blocks"), TableResult::Native;
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
 	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;
@@ -1404,10 +1413,12 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	const bool in_place      = same_command && emit.state == &draw_state && table.last_set == set &&
 	                      table.images_epoch == texture_cache.ImagesEpoch() && Spec::Current() == nullptr;
 	if (!in_place) {
-		if (!NativeXprEmitTargets(draw_state, vk_buffer)) return Spec::Refuse("table: targets"), TableResult::Native;
+		if (!NativeXprEmitTargets(draw_state, vk_buffer))
+			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: targets"), TableResult::Native;
 		// The set's images in their layouts (a DCC image with a fast clear pending takes the normal path, whose
 		// FindTexture applies it first).
-		if (!TableTransit(*set, vk_buffer, &draw_state)) return Spec::Refuse("table: transit"), TableResult::Native;
+		if (!TableTransit(*set, vk_buffer, &draw_state))
+			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: transit"), TableResult::Native;
 	}
 	m_context.GetCommandScheduler().BeginRendering(draw_state.rendering);
 	if (same_command && emit.state != &draw_state && emit.state != nullptr &&

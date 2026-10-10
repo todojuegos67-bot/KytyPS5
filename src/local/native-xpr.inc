@@ -76,8 +76,12 @@ extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_dispatch_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_indirect_mode {1};
 // N > 0: at most N table store requests a frame (each takes its draw to the normal path; the others draw from native
-// records meanwhile). A new area brings hundreds of pairs whose programs and pipelines compile in the background.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_store_budget {32};
+// records meanwhile); 0: no limit. A new area brings hundreds of pairs whose programs and pipelines compile in the
+// background. A limit (32 until 10-10) made the draws past it store native records instead: walking into new parts of
+// Boletarian Palace 1-3, ~500 table store requests a slow frame, 32 taken, the others normal draws storing ~150-250
+// native records (each traced and sorted). Without one, three boots each: 1% low walking 33.3 -> 37.7, p99 20.7 ->
+// 19.6 ms, the slowest frame 44 -> 40 ms; the slow frames' render-thread time 118 -> 86 ms, native stores 699 -> 214.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_store_budget {0};
 }
 // Keys that are XXH3 hashes already: their own bucket index (std::hash<uint64_t> is FNV-1a over the bytes on MSVC).
 struct HashedKey {
@@ -599,6 +603,10 @@ struct RenderExecutor::NativeXprCache {
 	// A camera turn rebinds ~1500 sets a frame (Latria): with 32 per layout most retired sets were freed and
 	// allocated again a frame later.
 	static constexpr size_t FreeSetsPerLayout = 2048, FreeSetsMax = 16384;
+	// Sets a driver allocation makes of a layout whose free sets ran out (NativeXprAllocateSet), and the pool that
+	// had no room for them.
+	static constexpr uint32_t AllocateBatch = 4;
+	vk::DescriptorPool        batch_refused = nullptr;
 	std::unordered_map<VkDescriptorSetLayout, std::vector<FreeSet>> free_sets;
 	std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout>      set_layouts;
 	size_t                                                          free_count = 0;
@@ -885,6 +893,31 @@ vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout l
 	allocate.descriptorSetCount = 1;
 	allocate.pSetLayouts        = &layout;
 	vk::DescriptorSet set       = nullptr;
+	// A few of the layout's sets in one call from the newest pool, the rest kept free for its next allocations: a
+	// driver call a set was ~1.2 ms of a walk's slow frame storing ~250 records and resolving new image sets.
+	if (!cache.pools.empty() && cache.pools.back() != cache.batch_refused &&
+	    cache.free_count + NativeXprCache::AllocateBatch <= NativeXprCache::FreeSetsMax) {
+		std::array<vk::DescriptorSetLayout, NativeXprCache::AllocateBatch> layouts;
+		layouts.fill(layout);
+		std::array<vk::DescriptorSet, NativeXprCache::AllocateBatch> sets {};
+		vk::DescriptorSetAllocateInfo batch {};
+		batch.descriptorPool     = cache.pools.back();
+		batch.descriptorSetCount = NativeXprCache::AllocateBatch;
+		batch.pSetLayouts        = layouts.data();
+		if (device.allocateDescriptorSets(&batch, sets.data()) == vk::Result::eSuccess) {
+			auto& free = cache.free_sets[static_cast<VkDescriptorSetLayout>(layout)];
+			for (size_t i = 0; i < sets.size(); ++i) {
+				cache.set_layouts[static_cast<VkDescriptorSet>(sets[i])] = static_cast<VkDescriptorSetLayout>(layout);
+				if (i != 0) {
+					free.push_back({batch.descriptorPool, sets[i]});
+					++cache.free_count;
+				}
+			}
+			pool_out = batch.descriptorPool;
+			return sets[0];
+		}
+		cache.batch_refused = batch.descriptorPool; // (full for a batch: single sets until the next pool)
+	}
 	// Freed sets return to their pool; try the newest pools first.
 	for (size_t i = 0; i < cache.pools.size() && i < 4; ++i) {
 		const auto pool         = cache.pools[cache.pools.size() - 1 - i];
@@ -1354,7 +1387,7 @@ bool RenderExecutor::NativeXprSwitchVariant(NativeXprRecord& record, uint64_t si
 	auto& textures = m_context.GetTextureCache();
 	for (const auto& dep: found->images) {
 		const auto* image = textures.m_slot_images.try_get(dep.id);
-		if (image == nullptr || image->serial != dep.serial || image->IsCpuDirty() ||
+		if (image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image, dep.desc) ||
 		    !textures.IsSampledImageCurrent(dep.id, dep.desc)) {
 			NativeXprRetireSet(found->pool, found->set);
 			record.variants.erase(found);
@@ -2832,7 +2865,7 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 		if (buffers_clean && !images_clean) {
 			images_clean = std::ranges::none_of(record.images, [&](const auto& dep) {
 				const auto* image = textures.m_slot_images.try_get(dep.id);
-				return image == nullptr || image->serial != dep.serial || image->IsCpuDirty();
+				return image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image, dep.desc);
 			});
 			if (images_clean) record.image_dirty_epoch = image_epoch;
 		}
@@ -2913,11 +2946,12 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 		if (image == nullptr || image->serial != dep.serial) return rebind();
 		// The guest rewrote it (a texture streaming in): upload it as the normal path's FindTexture does,
 		// instead of dropping the record and storing it again.
-		if (image->IsCpuDirty()) {
+		if (TextureCache::RefreshPending(*image, dep.desc)) {
 			if (!image->registered || image->depth_id || image->binding.needs_rebind) return false;
 			(void)textures.FindTexture(dep.id, dep.desc);
 			image = textures.m_slot_images.try_get(dep.id);
-			if (image == nullptr || image->serial != dep.serial || image->IsCpuDirty()) return false;
+			if (image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image, dep.desc))
+				return false;
 		}
 		if (registrations_moved) {
 			if (per_image && image->registered && image->registrations == dep.registration &&

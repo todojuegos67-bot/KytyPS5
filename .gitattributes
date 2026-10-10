@@ -1,3 +1,5 @@
 # cmd.exe misreads labels (call :label) in batch files with LF line endings.
 *.cmd text eol=crlf
 *.bat text eol=crlf
+# Specialization hints (tools/local/static-precompile/hints-*.hints): zstd-compressed, never converted.
+*.hints binary

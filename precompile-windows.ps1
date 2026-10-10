@@ -17,7 +17,10 @@
 # after a few hundred pipelines NVIDIA compresses binaries with a dictionary of its own, which only that
 # PC reads (pipelineBinaries.h); a shard that got there anyway left the rest out (exit code 3) and runs
 # again as two. recorded-<title>_<version>.seeds next to the seed file (-Recorded) adds the specializations of
-# recorded play. An interrupted run resumes: finished shards are merged first, and what the static cache
+# recorded play; a PC without a recording of its own (a release) gets those of the specialization hints the release
+# ships (tools\local\static-precompile\hints-<title>_<version>.hints: recordings without the game's code), completed
+# with the code of the seed file into hinted-<title>_<version>.seeds (kyty_shader_precompile --apply-hints, a second).
+# An interrupted run resumes: finished shards are merged first, and what the static cache
 # holds is not compiled again (binaries: the final merge keeps only what this run's shards made, so
 # pipelines no seed makes any more are dropped; a .bin left from before is where the first binaries run
 # takes them from without compiling). Build the program with build-windows.cmd kyty_shader_precompile; it also
@@ -32,7 +35,8 @@ param(
 	[string]$Seeds = '',
 	# The shaders as the game specialized them in recorded play (tools\local\static-precompile\precompile.py
 	# recorded-seeds): the specializations the seeds' guesses miss (a new PC compiled ~55 compute
-	# pipelines, up to 6 s each, before the HUD). '' = none; default: recorded-<title>_<version>.seeds next to the seed file.
+	# pipelines, up to 6 s each, before the HUD). '' = none; default: recorded-<title>_<version>.seeds next to the seed file,
+	# else the release's hints completed with the seed file's code (hinted-<title>_<version>.seeds).
 	[string]$Recorded = '*',
 	[int]$Jobs = 0,
 	[int]$Threads = 3,
@@ -44,12 +48,30 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if (!(Test-Path $Exe)) { throw "missing $Exe; build it with build-windows.cmd kyty_shader_precompile" }
+# The game's sce_sys\param.json (its title and version). The game is its folder (eboot.bin and sce_sys) or the
+# folder packed into a ZArchive (a .zar file, read without extracting it): a .zar's is copied out by the program.
+function Read-GameParam([string]$game) {
+	if (!$game) { return $null }
+	if (Test-Path -LiteralPath "$game\sce_sys\param.json") { return Get-Content -LiteralPath "$game\sce_sys\param.json" -Raw -Encoding UTF8 | ConvertFrom-Json }
+	$tool = $Exe
+	if ($game -notmatch '\.zar$' -or !(Test-Path -LiteralPath $game -PathType Leaf) -or !(Test-Path $tool)) { return $null }
+	$copy = [IO.Path]::GetTempFileName()
+	try {
+		& $tool --game $game --param $copy 2>$null | Out-Null
+		if ($LASTEXITCODE -eq 0) { return Get-Content -LiteralPath $copy -Raw -Encoding UTF8 | ConvertFrom-Json }
+	} catch {
+	} finally {
+		Remove-Item -LiteralPath $copy -ErrorAction SilentlyContinue
+	}
+	return $null
+}
+
 # Caches made from the game's files are named by its title and version (seeds-<title>_<version>.seeds,
 # _PipelineCache\static\<title>_<version>.*, the warmup recordings; versions need not share shaders). Those named
 # by the title alone are from before: the game's that was played last (the remembered one), so they take its
 # name (run-windows.ps1 has the same).
 function Rename-TitleCaches([string]$game) {
-	$info = if (Test-Path "$game\sce_sys\param.json") { Get-Content "$game\sce_sys\param.json" -Raw -Encoding UTF8 | ConvertFrom-Json }
+	$info = Read-GameParam $game
 	if (!$info -or !$info.titleId -or !$info.contentVersion) { return }
 	$title = $info.titleId
 	$id = "$($title)_$($info.contentVersion)"
@@ -76,19 +98,56 @@ $lastGame = if (Test-Path "$PSScriptRoot\game-path.txt") { "$(Get-Content "$PSSc
 if (!$lastGame) { $lastGame = "$env:USERPROFILE\Documents\PPSA01341-app0" }
 Rename-TitleCaches $lastGame
 if (!$Game) { $Game = $lastGame }
-if (!(Test-Path "$Game\sce_sys\param.json")) { throw "no sce_sys\param.json in $Game (-Game <folder>, or start the game once to choose it)" }
-$info = Get-Content "$Game\sce_sys\param.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+$info = Read-GameParam $Game
+if (!$info) { throw "no sce_sys\param.json in $Game (-Game <folder or .zar>, or start the game once to choose it)" }
 $gameId = "$($info.titleId)_$($info.contentVersion)"
+$defaultSeeds = !$Seeds
 if (!$Seeds) {
 	$Seeds = if ((Test-Path "$PSScriptRoot\seeds-$gameId.seeds") -or !(Test-Path "$PSScriptRoot\_Build")) { "$PSScriptRoot\seeds-$gameId.seeds" } else { "$PSScriptRoot\_Build\static-precompile\seeds-$gameId.seeds" }
 }
-if ($Recorded -eq '*') { $Recorded = Join-Path (Split-Path $Seeds) "recorded-$gameId.seeds" }
-if (!(Test-Path $Seeds)) {
+# The seed file another program made (<file>.program: its size and time) is made again (a release unpacked over the
+# last), and replaced where it lists something else (the vertex shaders' indirect draws' records since 10-10): the
+# static cache is then older than it, out of date (--status), and the precompile compiles what is new.
+$programStamp = "$((Get-Item $Exe).Length) $((Get-Item $Exe).LastWriteTimeUtc.Ticks)"
+$madeBy = "$Seeds.program"
+$remake = $defaultSeeds -and (Test-Path $Seeds) -and (!(Test-Path $madeBy) -or "$(Get-Content $madeBy -Raw)".Trim() -ne $programStamp)
+if (!(Test-Path $Seeds) -or $remake) {
 	# Every shader the game ships, with the pipelines it draws them with (from the game files, by the program:
 	# precompile.py seeds without Python).
 	New-Item -ItemType Directory -Force (Split-Path $Seeds) | Out-Null
-	& $Exe --game $Game --make-seeds $Seeds --states "$PSScriptRoot\tools\local\static-precompile\pass-states.json"
+	$made = if ($remake) { "$Seeds.new" } else { $Seeds }
+	& $Exe --game $Game --make-seeds $made --states "$PSScriptRoot\tools\local\static-precompile\pass-states.json"
 	if ($LASTEXITCODE) { throw 'making the seed file failed (kyty_shader_precompile --make-seeds)' }
+	if ($remake -and (Get-FileHash $made).Hash -eq (Get-FileHash $Seeds).Hash) { Remove-Item $made } elseif ($remake) { Move-Item -Force $made $Seeds }
+	Set-Content $madeBy $programStamp
+}
+if ($Recorded -eq '*') {
+	$Recorded = Join-Path (Split-Path $Seeds) "recorded-$gameId.seeds"
+	$hints = "$PSScriptRoot\tools\local\static-precompile\hints-$gameId.hints"
+	if (!(Test-Path $Recorded) -and (Test-Path $hints)) {
+		# (Made again each run: the hints of this release, the code of this seed file.)
+		$Recorded = Join-Path (Split-Path $Seeds) "hinted-$gameId.seeds"
+		& $Exe --game $Game --seeds $Seeds --apply-hints $hints --out $Recorded
+		if ($LASTEXITCODE) {
+			Write-Host 'the specialization hints could not be applied (kyty_shader_precompile --apply-hints): the seeds alone'
+			$Recorded = ''
+		}
+	}
+}
+# The pipeline recipes of a seed file (its body after the identity line and checksum: the records, each its word
+# count and words, then the recipes' count).
+function Get-SeedPipelines([string]$file) {
+	$stream = [IO.File]::OpenRead($file)
+	try {
+		$reader = [IO.BinaryReader]::new($stream)
+		while ($reader.ReadByte() -ne 10) {}
+		$null = $reader.ReadUInt64()
+		$records = $reader.ReadUInt32()
+		for ($i = 0; $i -lt $records; $i++) { $null = $stream.Seek([int64]$reader.ReadUInt32() * 4, [IO.SeekOrigin]::Current) }
+		return $reader.ReadUInt32()
+	} finally {
+		$stream.Dispose()
+	}
 }
 if ($Affinity -eq 0) {
 	$config = @("$PSScriptRoot\launch.json", "$PSScriptRoot\run-windows.json") | Where-Object { Test-Path $_ } |
@@ -150,8 +209,8 @@ Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
 $pending = [System.Collections.Generic.Queue[object]]::new()
 for ($i = 0; $i -lt $Shards; $i++) { $pending.Enqueue(@($Seeds, "$i/$Shards")) }
 if ($Recorded -and (Test-Path $Recorded)) {
-	# A sixteenth of the shards: the recording holds about 5000 pipelines.
-	$count = [math]::Max(1, [math]::Floor($Shards / 16))
+	# About as many pipelines a shard as the seeds' (100: a recording of every world holds about 16000).
+	$count = [math]::Max(1, [math]::Ceiling((Get-SeedPipelines $Recorded) / 100))
 	for ($i = 0; $i -lt $count; $i++) { $pending.Enqueue(@($Recorded, "$i/$count")) }
 }
 # The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that the seeds of several

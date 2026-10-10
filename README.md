@@ -209,7 +209,7 @@ The shortest way to a Release build of the emulator (without the Qt launcher):
    ```
 
    The script finds Visual Studio, `clang-cl` and the Vulkan SDK, checks out submodules that are
-   missing, configures `_Build\windows` the first time (CMake downloads xbyak and zydis) and builds
+   missing, configures `_Build\windows` the first time (CMake downloads xbyak, zydis, zstd and ZArchive) and builds
    `_Build\windows\kyty_emulator.exe`. Run it again after changes for an incremental build;
    `.\build-windows.cmd all` builds every target.
 3. Start a game with its folder (the one with `eboot.bin`; it is remembered in `game-path.txt`):
@@ -220,6 +220,9 @@ The shortest way to a Release build of the emulator (without the Qt launcher):
 
    The emulator switches come from `run-windows.json`; `-DryRun` prints the environment and the
    command, `-Fullscreen`, `-Width`/`-Height` and the others are listed at the top of the script.
+   A ZArchive of the folder (`-Game D:\Games\PPSA01341-app0.zar`) works too, read without extracting
+   it; `.\build-windows.cmd zarchive_tool` builds the packer, `_Build\windows\3rdparty\zarchive.exe
+   <folder> <file.zar>`.
 
 The build is optimized for the CPU it is built on (`-march=native`). For an executable that other
 PCs can run, set `KYTY_CMAKE_ARGS=-DKYTY_MARCH=x86-64-v3` before the first configure. The release

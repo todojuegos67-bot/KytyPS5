@@ -33,6 +33,9 @@ struct GraphicContext {
 	bool                               memory_priority_enabled               = false;
 	bool                               rt_extensions_enabled                 = false;
 	bool                               compute_subgroup_size_control_enabled = false;
+	// With subgroup size control: wave64 compute programs run on 64-lane subgroups (else emulated on 32-lane ones, two
+	// guest lanes an invocation). VulkanInitSubgroupSizeControl decides it (KYTY_COMPUTE_WAVE64).
+	bool                               compute_wave64_native                 = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
@@ -114,8 +117,9 @@ struct GraphicContext {
 		return it->second.first;
 	}
 
+	// Wave64 compute programs run natively: chosen with subgroup size control, else when every subgroup has 64 lanes.
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
-		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
+		return compute_subgroup_size_control_enabled ? compute_wave64_native : subgroup_size == 64u;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {

@@ -157,7 +157,10 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	auto&      programs = *m_program_cache;
 	const auto decode   = [&](uint32_t index, LocalShaderWarmup::Record& record) {
 		LocalShaderWarmup::Reader reader {seed_words[index]};
-		return LocalShaderWarmup::Visit(reader, record);
+		if (!LocalShaderWarmup::Visit(reader, record)) return false;
+		if (args.host_subgroup_size != 0 && record.stage == ShaderType::Compute)
+			record.compute.host_subgroup_size = args.host_subgroup_size;
+		return true;
 	};
 	const auto stage_of = [&](size_t index) { return ShaderType(seed_words[index][0]); };
 	// Graphics recipes; every compute seed gets its pipelines anyway.
@@ -824,7 +827,15 @@ bool PipelineCache::Precompile(GraphicContext& graphics, const PrecompileOptions
 }
 
 // Both files are saved whole (a temporary file renamed), so their first line tells the GPU and driver.
-bool PipelineCache::StaticCacheCurrent(GraphicContext& graphics) {
+bool PipelineCache::StaticCacheCurrent(GraphicContext& graphics, const std::filesystem::path& seeds) {
+	if (!seeds.empty()) {
+		std::error_code error;
+		const auto      written = std::filesystem::last_write_time(
+		    graphics.pipeline_binaries_enabled ? StaticBinariesPath() : StaticCachePath(), error);
+		if (error) return false;
+		const auto seeded = std::filesystem::last_write_time(seeds, error);
+		if (error || written < seeded) return false;
+	}
 	if (graphics.pipeline_binaries_enabled) {
 		return PipelineBinaries::Open(graphics.device, StaticBinariesPath(), StaticBinariesSignature(graphics)) != nullptr;
 	}

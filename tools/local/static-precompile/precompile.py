@@ -184,7 +184,7 @@ def cmd_check(args):
                 if rec.stage == warmfile.ST_COMPUTE:
                     candidates.append(keys.compute_record(rec.code, header, HOST_SUBGROUP_SIZE))
                 elif rec.stage == warmfile.ST_VERTEX:
-                    candidates.append(keys.vertex_record(rec.code, header))
+                    candidates += keys.vertex_records(rec.code, header)
                 elif rec.stage == warmfile.ST_PIXEL:
                     for vs_index in vs_for_ps.get(rec.index, ()) or (None,):
                         vs_code = records[vs_index].code if vs_index is not None else None
@@ -315,14 +315,15 @@ def cmd_seeds(args):
             counts[f'pairs without states ({group})'] += 1
             return
         try:
-            vs = seeds.record(keys.vertex_record(vs_code, vs_agc))
+            vertex = [seeds.record(record) for record in keys.vertex_records(vs_code, vs_agc)]
             ps = seeds.record(keys.pixel_record(ps_code, ps_agc, vs_agc, LOD_STATS_SUBGROUP))
         except ValueError:
             counts['pairs with unsupported inputs'] += 1
             return
-        for words in palette:
-            for variant in _culling_variants(words) if culling else [words]:
-                seeds.pipeline(_with_shaders(variant, vs, ps))
+        for vs in vertex:
+            for words in palette:
+                for variant in _culling_variants(words) if culling else [words]:
+                    seeds.pipeline(_with_shaders(variant, vs, ps))
 
     if 'gfx' in stages:
         done = set()
@@ -334,9 +335,10 @@ def cmd_seeds(args):
         for vs_code, vs_agc, ps_code, ps_agc in inv.engine_pairs():
             graphics(vs_code, vs_agc, ps_code, ps_agc, 'engine', culling=False)
         for vs_code, vs_agc in inv.vertex_only():
-            vs = seeds.record(keys.vertex_record(vs_code, vs_agc))
-            for words in states.get('vertex-only', []):
-                seeds.pipeline(_with_shaders(words, vs, warmfile.NO_SHADER))
+            for record in keys.vertex_records(vs_code, vs_agc):
+                vs = seeds.record(record)
+                for words in states.get('vertex-only', []):
+                    seeds.pipeline(_with_shaders(words, vs, warmfile.NO_SHADER))
 
     if args.limit:
         # A smoke test: the first programs and the pipelines that only use them.

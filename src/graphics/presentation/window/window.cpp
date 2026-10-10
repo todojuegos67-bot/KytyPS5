@@ -24,6 +24,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
@@ -981,7 +982,7 @@ struct WindowIcon {
 
 static void WindowLoadPngIcon(const std::string& path, WindowIcon* icon) {
 	Common::File f;
-	if (!f.Open(path, Common::File::Mode::Read)) {
+	if (!f.Open(Common::PathFromUtf8(path), Common::File::Mode::Read)) { // (UTF-8: SystemContentGetIconPath)
 		EXIT("Can't open icon file %s\n", path.c_str());
 	}
 

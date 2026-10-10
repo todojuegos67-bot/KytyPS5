@@ -55,6 +55,10 @@ extern "C" void __llvm_profile_set_filename(const char*);
 extern "C" int  __llvm_profile_write_file(void);
 #endif
 
+namespace Loader {
+std::string DescribeGuestAddressForDiagnostics(uint64_t vaddr);
+} // namespace Loader
+
 namespace LiveControl {
 
 inline std::atomic_uint64_t g_flips {0};
@@ -75,6 +79,13 @@ inline std::atomic_bool      g_process {false};
 
 // The render thread's time waiting for guest work (GuestGpu::ThreadRun), in steady-clock ns.
 inline int64_t g_render_idle_ns = 0;
+// When the render thread began waiting for the guest's next submission (steady-clock ns; 0 while it has one): its
+// idle waits set it once, a submission taken clears it (guest commands do not: a guest thread may wait on them).
+inline std::atomic<int64_t> g_render_idle_since {0};
+inline void NoteRenderIdle(int64_t now_ns) {
+	int64_t expected = 0;
+	(void)g_render_idle_since.compare_exchange_strong(expected, now_ns, std::memory_order_relaxed);
+}
 
 // Render thread. With KYTY_HITCH_LOG_MS (or KYTY_SLOW_LOG_MS), a frame (flip to flip) that long and
 // at least 20 ms is a SLOW line too, on the same TSC timeline: the hitch the slow calls before it explain.
@@ -94,14 +105,18 @@ inline void Flip() {
 		                                     C::ReadbackParts, C::ReadbackRegions, C::GuestCommands, C::TextureUnmaps, C::AsyncPipelines,
 		                                     C::ImageInitUs, C::BufferSyncUs, C::DrawUs, C::TextureUnmapUs, C::BackingReadUs, C::RegionSyncUs, C::AsyncDrawWaitUs, C::AsyncDrawSkips, C::QueueLockUs,
 		                                     C::TranslateUs, C::Translates, C::ComputePipelineUs, C::ComputePipelines,
-		                                     C::GraphicsPipelineUs, C::GraphicsPipelines, C::FlipSlotWaitUs};
-		static constexpr const char* waits[] = {"gpu_wait", "readback_wait", "download_wait", "compile"};
+		                                     C::GraphicsPipelineUs, C::GraphicsPipelines, C::FlipSlotWaitUs,
+		                                     C::TableDraws, C::TableStores, C::TableStoreVariant, C::TableStoreTargets,
+		                                     C::TableRefusedSets, C::TableNoSet, C::TableDrawNative, C::TableEvaluations,
+		                                     C::TableStoreDeferred};
+		static constexpr const char* waits[] = {"gpu_wait", "readback_wait", "download_wait", "compile", "record_wait"};
 		static std::chrono::steady_clock::time_point     last {};
 		static uint64_t                                  last_tsc = 0;
 		static std::array<uint64_t, LiveCensus::Kinds>   last_kind_cycles {};
 		static std::array<uint64_t, LiveCensus::Phases>  last_dispatch_phases {}, last_draw_phases {};
 		static std::array<uint64_t, 4>                   last_xpr {};
 		static int64_t                                   last_idle = 0;
+		static int64_t                                   last_upload_wait = 0;
 		static std::array<int64_t, LiveCensus::Waits>    last_waits {};
 		static std::array<uint64_t, counted.size()>      last_counts {};
 		// The render thread's run time (TSC ticks) and a TSC rate from the first flip on: busy wall time
@@ -141,6 +156,8 @@ inline void Flip() {
 			for (size_t i = 0; i < LiveCensus::Waits; ++i)
 				if (const auto ns = LiveCensus::g_waits_ns[i] - last_waits[i]; ns != 0)
 					std::printf(" %s=%.1f", waits[i], static_cast<double>(ns) / 1e6);
+			if (const auto ns = LiveCensus::g_upload_wait_ns.load(std::memory_order_relaxed) - last_upload_wait; ns != 0)
+				std::printf(" upload_wait=%.1f", static_cast<double>(ns) / 1e6);
 			for (size_t i = 0; i < counted.size(); ++i) {
 				const auto delta = LiveCounters::Value(counted[i]) - last_counts[i];
 				if (delta != 0) std::printf(" %s=%llu", LiveCounters::Names[counted[i]], static_cast<unsigned long long>(delta));
@@ -154,6 +171,7 @@ inline void Flip() {
 		last      = now;
 		last_tsc  = tsc;
 		last_idle = g_render_idle_ns;
+		last_upload_wait = LiveCensus::g_upload_wait_ns.load(std::memory_order_relaxed);
 		for (size_t i = 0; i < LiveCensus::Kinds; ++i) last_kind_cycles[i] = LiveCensus::g_kind_cycles[i];
 		for (size_t i = 0; i < LiveCensus::Phases; ++i) {
 			last_dispatch_phases[i] = LiveCensus::g_dispatch_phase_cycles[i];
@@ -381,6 +399,17 @@ inline void Run(uint64_t id, const std::string& line) {
 		std::printf("LIVE_PEEK id=%" PRIu64 " va=%s bytes=%s\n", id, arg1, hex.c_str());
 	} else if (cmd == "measure" && n >= 2) {
 		Measure(id, std::strtod(arg1, nullptr), n == 3 ? arg2 : "-");
+	} else if (cmd == "flips" && n == 3) {
+		// flips <count> <path>: the last flips' intervals (us), oldest first, one a line (periodic slow frames).
+		const auto last  = g_flips.load();
+		const auto count = std::min<uint64_t>({std::strtoull(arg1, nullptr, 10), FlipTimes - 1, last ? last - 1 : 0});
+		if (auto* out = std::fopen(arg2, "w")) {
+			for (auto flip = last - count; flip < last; ++flip)
+				std::fprintf(out, "%lld\n", static_cast<long long>((g_flip_times[flip % FlipTimes].load() -
+				                                                    g_flip_times[(flip - 1) % FlipTimes].load()) / 1000));
+			std::fclose(out);
+		}
+		std::printf("LIVE_FLIPS id=%" PRIu64 " count=%llu path=%s\n", id, static_cast<unsigned long long>(count), arg2);
 	} else if ((cmd == "prof" || cmd == "profp" || cmd == "profw") && n == 3) {
 		Profile(id, std::strtod(arg1, nullptr), arg2, cmd == "profp", cmd == "profw");
 #if defined(_WIN32)
@@ -581,6 +610,68 @@ inline void Run(uint64_t id, const std::string& line) {
 }
 
 // Called on the render thread before it consumes commands.
+#if defined(_WIN32)
+// KYTY_STALL_DUMP_MS: the game stopped submitting work for that long in the middle of play (the 60 frames before the
+// wait averaged under 50 ms): every thread but the emulator's own (Kyty.*) and SDL's audio threads is sampled, three times 150 ms apart,
+// to show what the game waits on. STALL lines: the frames of each thread's stack, guest code as module+offset, host
+// code as addresses (symbolize with the build's map). Not with a live `prof` (both prepare the unwind tables).
+inline void StallWatch(int64_t threshold_ns) {
+	LocalPlatform::SetThreadName("Kyty.StallWatch");
+	int64_t stall = 0;
+	int     dumps = 0;
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		const int64_t since = g_render_idle_since.load(std::memory_order_relaxed);
+		if (since == 0) continue;
+		const int64_t idle = std::chrono::steady_clock::now().time_since_epoch().count() - since;
+		if (since != stall) {
+			stall = since;
+			dumps = 0;
+		}
+		if (dumps >= 3 || idle < threshold_ns + dumps * int64_t {150'000'000}) continue;
+		const auto flips = g_flips.load(std::memory_order_acquire);
+		if (flips < 120) continue;
+		const int64_t last  = g_flip_times[(flips - 1) % FlipTimes].load(std::memory_order_relaxed);
+		const int64_t first = g_flip_times[(flips - 61) % FlipTimes].load(std::memory_order_relaxed);
+		if ((last - first) / 60 > 50'000'000 || since - last > 50'000'000) {
+			dumps = 3; // (a loading screen or a pause: not play)
+			continue;
+		}
+		++dumps;
+		LocalPlatform::PrepareSampling();
+		const auto self = LocalPlatform::ThreadId();
+		std::string out;
+		char        line[160];
+		std::snprintf(line, sizeof(line), "STALL idle=%.0f ms (dump %d), render thread waiting since %.0f ms after the last flip\n",
+		              static_cast<double>(idle) / 1e6, dumps, static_cast<double>(since - last) / 1e6);
+		out += line;
+		for (const auto& [tid, name]: LocalPlatform::ProcessThreads()) {
+			if (tid == self || (std::getenv("KYTY_STALL_DUMP_ALL") == nullptr && name.rfind("Kyty.", 0) == 0) || name.rfind("SDLAudio", 0) == 0) continue;
+			const auto handle = LocalPlatform::OpenThreadForSampling(tid);
+			if (handle == 0) continue;
+			uint64_t words[SampleWords] {};
+			const bool sampled = LocalPlatform::SampleThread(handle, 0, 0, words, SampleWords);
+			LocalPlatform::CloseThreadForSampling(handle);
+			if (!sampled) continue;
+			std::snprintf(line, sizeof(line), "STALL   %u %s:", tid, name.empty() ? "-" : name.c_str());
+			out += line;
+			for (const auto word: words) {
+				if (word == 0) break;
+				const auto guest = Loader::DescribeGuestAddressForDiagnostics(word);
+				if (!guest.empty()) out += " " + guest;
+				else {
+					std::snprintf(line, sizeof(line), " %llx", static_cast<unsigned long long>(word));
+					out += line;
+				}
+			}
+			out += "\n";
+		}
+		std::fputs(out.c_str(), stdout);
+		std::fflush(stdout);
+	}
+}
+#endif
+
 inline void Start() {
 	g_render_thread = LocalPlatform::CurrentThreadHandle();
 	g_render_tid.store(LocalPlatform::ThreadId());
@@ -588,6 +679,10 @@ inline void Start() {
 	LiveCounters::g_single_writer = true;
 	(void)LocalPlatform::CurrentThreadStack(&g_stack_low, &g_stack_high);
 	g_render_known.store(true);
+#if defined(_WIN32)
+	if (const char* stall = std::getenv("KYTY_STALL_DUMP_MS"); stall != nullptr && std::atoi(stall) > 0)
+		std::thread(StallWatch, int64_t {std::atoi(stall)} * 1'000'000).detach();
+#endif
 	static const char* const path = std::getenv("KYTY_LIVE_FILE");
 	if (path == nullptr) return;
 	std::thread([] {

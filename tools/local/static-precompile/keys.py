@@ -15,6 +15,9 @@ SPI_SHADER_PGM_RSRC2_PS, SPI_SHADER_PGM_RSRC2_GS = 0xb, 0x8b
 SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR, SPI_PS_IN_CONTROL = 0x1b3, 0x1b4, 0x1b6
 SPI_SHADER_COL_FORMAT, DB_SHADER_CONTROL, PA_CL_VS_OUT_CNTL = 0x1c5, 0x203, 0x207
 IDENTITY_EXPORT_MAPPING = 0xe4
+# The SGPR the game's indirect draws have the CP write the start instance into (START_INST_LOC): the third GS user SGPR,
+# s8 + 2, of a vertex shader with three (its table pointer, then the instance offset; every recorded indirect draw's).
+INDIRECT_START_INSTANCE_SGPR = 8 + 2
 
 
 def _words(code):
@@ -142,9 +145,10 @@ def pixel_record(code, agc, vs_agc, lod_stats_subgroup):
     return _record(warmfile.ST_PIXEL, code, _user_data_count(rsrc2), tuple(key), info)
 
 
-def vertex_record(code, agc):
+def vertex_record(code, agc, start_instance_sgpr=-1):
     """The vertex (NGG 'Gs') record: this game's vertex shaders pull their vertices through the SRT
-    (no fetch tables, no clip transform, no mesh path), so the key holds header fields only."""
+    (no fetch tables, no clip transform, no mesh path), so the key holds header fields only; start_instance_sgpr -1
+    for direct draws, the SGPR the start instance is written to for indirect ones."""
     offsets = agc['user_data']['direct_resource_offset'] if agc['user_data'] else []
     if (len(offsets) > 10 and offsets[10] != 0xffff) or (len(offsets) > 8 and offsets[8] != 0xffff):
         raise ValueError('vertex shader with fetch tables: its key needs draw-time descriptors')
@@ -152,16 +156,26 @@ def vertex_record(code, agc):
     out_cntl = reg_first(agc['cx_registers'], PA_CL_VS_OUT_CNTL, 0)
     info = {
         'resources_num': 0, 'fetch_attrib_reg': 0, 'fetch_buffer_reg': 0, 'scratch_size_dwords': scratch,
-        'pa_cl_vs_out_cntl': out_cntl, 'start_instance_sgpr': -1, 'fetch_external': 0, 'fetch_embedded': 0, 'clip_enabled': 0,
+        'pa_cl_vs_out_cntl': out_cntl, 'start_instance_sgpr': start_instance_sgpr, 'fetch_external': 0, 'fetch_embedded': 0, 'clip_enabled': 0,
         'clip_scale': (0, 0), 'clip_offset': (0, 0), 'clip_half_extent': (0, 0),
         'mesh': {'threads_num': (0, 0, 0), 'lds_size_dwords': 0, 'scratch_size_dwords': 0, 'host_subgroup_size': 64,
                  'wave_size': 64, 'input_primitive': 0, 'primitives_per_group': 0, 'vertices_per_group': 0,
                  'max_vertices': 0, 'max_primitives': 0, 'provoking_vertex': 0},
         'res_fields': [], 'res_dst': [], '_kind': 'vs',
     }
-    key = (0, 0, 0, 0, scratch, out_cntl, 0xffffffff, 0, 0)  # start_instance_sgpr -1: direct draws' variant
+    key = (0, 0, 0, 0, scratch, out_cntl, start_instance_sgpr & 0xffffffff, 0, 0)
     rsrc2 = reg_first(agc['sh_registers'], SPI_SHADER_PGM_RSRC2_GS, 0)
     return _record(warmfile.ST_VERTEX, code, _user_data_count(rsrc2), key, info)
+
+
+def vertex_records(code, agc):
+    """The records of a vertex shader: its direct draws', and its indirect draws' where it has the three user SGPRs
+    whose last the CP writes the start instance into (a pipeline of each: the start instance is read from Vulkan's
+    base instance there)."""
+    direct = vertex_record(code, agc)
+    if direct.udc != 3:
+        return [direct]
+    return [direct, vertex_record(code, agc, INDIRECT_START_INSTANCE_SGPR)]
 
 
 def _record(stage, code, udc, key, info):

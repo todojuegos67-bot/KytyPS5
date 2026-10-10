@@ -1,3 +1,4 @@
+#include "common/archive.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/dateTime.h"
@@ -42,9 +43,9 @@ static std::string GetBuildString() {
 
 static void PrintUsage() {
 	::printf("%s\n", GetBuildString().c_str());
-	::printf("kyty_emulator --game <dir|elf> [options]\n\n");
+	::printf("kyty_emulator --game <dir|elf|zar> [options]\n\n");
 	::printf("Options:\n");
-	::printf("  --game <dir|elf>                     Game directory or ELF to load.\n");
+	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive (.zar) to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
@@ -196,6 +197,15 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (Common::File::IsDirectoryExisting(value)) {
 				options.app0_dir = value;
 				options.elf      = "/app0/eboot.bin";
+			} else if (Common::IsSupportedArchive(value) && Common::File::IsFileExisting(value)) {
+				// A game folder packed into a ZArchive: mounted read-only, read without extracting it.
+				const auto root = Common::MakeArchivePath(value);
+				if (!Common::File::IsFileExisting(root / "eboot.bin")) {
+					::printf("Not a game archive (no eboot.bin at its root, or not a ZArchive): %s\n", value.c_str());
+					return false;
+				}
+				options.app0_dir = root;
+				options.elf      = "/app0/eboot.bin";
 			} else if (Common::File::IsFileExisting(value)) {
 				options.app0_dir = Common::DirectoryWithoutFilename(value);
 				if (options.app0_dir.empty()) {
@@ -203,7 +213,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				}
 				options.elf = "/app0/" + Common::FilenameWithoutDirectory(value);
 			} else {
-				::printf("--game must point to an existing directory or ELF: %s\n", value.c_str());
+				::printf("--game must point to an existing directory, ELF, or .zar: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--game-patch") {

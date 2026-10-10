@@ -39,6 +39,8 @@
 // 1: a partial refresh uploads only the rows of tile blocks over the dirty ranges of a large
 // subresource, not the whole subresource (UploadImagePartial).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_partial_row_bands_mode {0};
+// 0: a sampled view refreshes the whole texture, not only its levels (RefreshTextureLevels; on by default, 0 for an A/B).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_texture_levels_mode {1};
 
 namespace Libs::Graphics {
 
@@ -1910,7 +1912,7 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 	return true;
 }
 
-bool TextureCache::UploadImagePartial(Image& image) {
+bool TextureCache::UploadImagePartial(Image& image, uint64_t window_begin, uint64_t window_end) {
 	const auto& info    = image.info;
 	const auto  binding = UploadBinding(image);
 	const auto  base    = info.data.address;
@@ -1958,7 +1960,8 @@ bool TextureCache::UploadImagePartial(Image& image) {
 		if (plan.regions[index].bufferOffset < tile.linear_offset) {
 			return PartialFail("tile_offset");
 		}
-		if (!IntersectsRanges(dirty, begin, end)) {
+		if (const auto from = std::max(begin, window_begin), to = std::min(end, window_end);
+		    from >= to || !IntersectsRanges(dirty, from, to)) {
 			continue;
 		}
 		TileBlockLayout block {};
@@ -1986,7 +1989,8 @@ bool TextureCache::UploadImagePartial(Image& image) {
 		picks.push_back({begin, end, index});
 		picked += tile.tiled_size;
 	}
-	if (picked > info.data.size / PartialUploadMaxShare) {
+	// (A window's refresh leaves the rest dirty: no whole upload instead.)
+	if (window_begin == 0 && window_end == UINT64_MAX && picked > info.data.size / PartialUploadMaxShare) {
 		return PartialFail("share");
 	}
 	if (picks.empty()) {
@@ -2188,6 +2192,114 @@ bool TextureCache::RefreshDepthLayers(ImageId id, const ImageViewInfo& view) {
 		RetrackHoles(image, begin, end);
 		image.RefreshRangeComplete(begin, end);
 	}
+	return true;
+}
+
+bool TextureCache::LevelRefreshCandidate(const Image& image) {
+	// Textures the CPU writes and the GPU only samples (one written as a target or storage keeps whole refreshes),
+	// without layers (a level is one range of bytes), on whole pages.
+	const auto& info = image.info;
+	return kyty_local_texture_levels_mode.load(std::memory_order_relaxed) != 0 &&
+	       kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 1 && PartialDirtyCandidate(image) &&
+	       image.registered && !image.IsGpuModified() && !image.IsBufferModified() && !image.IsStencilModified() &&
+	       !image.usage.storage && !image.usage.render_target && !image.usage.depth_target && !image.usage.video_out &&
+	       !image.binding.is_target && !info.IsDepth() && !info.HasMetadata() && info.resources.layers == 1 &&
+	       info.resources.levels > 1 && info.resources.levels <= info.mip_layout.size() &&
+	       info.data.address % TRACKER_PAGE_SIZE == 0 && info.data.End() % TRACKER_PAGE_SIZE == 0;
+}
+
+bool TextureCache::ViewLevelBytes(const Image& image, const ImageViewInfo& view, uint64_t& begin, uint64_t& end) {
+	const auto key = view.base_level | view.level_count << 8u;
+	if (image.level_view != key) {
+		image.level_view  = key;
+		image.level_begin = 0;
+		image.level_end   = 0;
+		const auto& info   = image.info;
+		const auto  levels = info.resources.levels;
+		if (view.base_level != 0 && levels <= info.mip_layout.size() && view.base_level < levels &&
+		    view.level_count != 0 && view.level_count <= levels - view.base_level) {
+			uint64_t first = UINT64_MAX, last = 0;
+			for (uint32_t level = view.base_level; level < view.base_level + view.level_count; ++level) {
+				first = std::min(first, info.mip_layout[level].offset);
+				last  = std::max(last, info.mip_layout[level].offset + info.mip_layout[level].size);
+			}
+			// Every level whose bytes the range touches is in it whole (the levels of the mip tail share one block).
+			for (bool grew = true; grew;) {
+				grew = false;
+				for (uint32_t level = 0; level < levels; ++level) {
+					const auto& mip = info.mip_layout[level];
+					if (mip.size == 0 || mip.offset >= last || mip.offset + mip.size <= first) continue;
+					if (mip.offset < first || mip.offset + mip.size > last) {
+						first = std::min(first, mip.offset);
+						last  = std::max(last, mip.offset + mip.size);
+						grew  = true;
+					}
+				}
+			}
+			// Levels left out (the range is not the whole image), on pages of their own: the range ends on page
+			// boundaries.
+			const auto from = info.data.address + first;
+			const auto to   = info.data.address + std::min(last, info.data.size);
+			if (first < last && from < to && (first != 0 || last < info.data.size) && from % TRACKER_PAGE_SIZE == 0 &&
+			    to % TRACKER_PAGE_SIZE == 0) {
+				image.level_begin = from;
+				image.level_end   = to;
+			}
+		}
+	}
+	begin = image.level_begin;
+	end   = image.level_end;
+	return end != 0;
+}
+
+bool TextureCache::DirtyForView(const Image& image, const ImageDesc& desc) {
+	uint64_t begin = 0, end = 0;
+	return !image.IsPartiallyCpuDirty() || desc.type != BindingType::Texture || !LevelRefreshCandidate(image) ||
+	       !ViewLevelBytes(image, desc.view_info, begin, end) || IntersectsRanges(image.CpuDirtyRanges(), begin, end);
+}
+
+// A sampled view reads its levels only. The game streams a texture in from its smallest levels and its T# starts at the
+// first level loaded (2-2 walk: 185 first uploads of textures sampled from level 3, which of a 4096x4096 BC texture is
+// 0.4 of its 21 MiB; the larger levels are bytes the game has not written yet). A whole refresh uploaded all of it, at
+// first use and again after each level that came in: turning into a new view, ~1 GB in three frames (50-68 ms, the GPU
+// behind on the PCIe transfers). Of a texture dirty below the view's levels, only the dirty bytes of its levels (and of
+// the levels sharing their pages) are uploaded; the others stay dirty, their pages released (no write faults while the
+// game streams them in), until a view covers them (the game lowers the T#'s base level once a level is loaded).
+bool TextureCache::RefreshTextureLevels(ImageId id, const ImageViewInfo& view) {
+	auto&       image = m_slot_images[id];
+	const auto& info  = image.info;
+	uint64_t    begin = 0, end = 0;
+	if (!image.IsDefinitelyCpuDirty() || image.IsMaybeCpuDirty() || !LevelRefreshCandidate(image) ||
+	    !ViewLevelBytes(image, view, begin, end)) {
+		return false;
+	}
+	const bool whole = !image.IsPartiallyCpuDirty();
+	if (whole ? image.IsTracked()
+	          : image.track_addr != info.data.address || image.track_addr_end != info.data.End()) {
+		return false;
+	}
+	if (!whole && !IntersectsRanges(image.CpuDirtyRanges(), begin, end)) {
+		return true; // its levels are current
+	}
+	// Watched before the guest bytes are read (as RefreshImage's TrackImage): a write after the read faults.
+	if (whole) {
+		image.track_addr     = info.data.address;
+		image.track_addr_end = info.data.End();
+		m_page_manager.UpdatePageWatchers<true>(begin, end - begin);
+		if (info.data.address < begin) Image::AddRange(image.untracked_holes, info.data.address, begin);
+		if (end < info.data.End()) Image::AddRange(image.untracked_holes, end, info.data.End());
+		image.NarrowCpuDirty();
+		LiveCounters::Add(LiveCounters::LevelSkippedBytes, info.data.size - (end - begin));
+	} else {
+		RetrackHoles(image, begin, end);
+	}
+	g_partial_fail = "";
+	if (!UploadImagePartial(image, begin, end)) {
+		return false; // (RefreshImage watches the rest again and uploads what is dirty)
+	}
+	image.staged_ring = nullptr;
+	image.RefreshRangeComplete(begin, end);
+	LiveCounters::Add(LiveCounters::LevelRefreshes);
 	return true;
 }
 
@@ -2578,7 +2690,9 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	}
 	if (!image.info.data.Empty()) {
 		PrepareDccClear(id, desc);
-		RefreshImage(id);
+		if (desc.type != BindingType::Texture || !RefreshTextureLevels(id, desc.view_info)) {
+			RefreshImage(id);
+		}
 	}
 	switch (desc.type) {
 		case BindingType::Texture: break;

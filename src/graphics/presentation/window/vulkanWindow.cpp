@@ -583,6 +583,28 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	    subgroup_size_control.minSubgroupSize <= 64 &&
 	    subgroup_size_control.maxSubgroupSize >= 64;
 
+	// Wave64 compute programs on 64-lane subgroups where the driver is known to compile them: AMD RDNA3 and later (an
+	// RX 7800 XT ran them). An RX 6700 XT (RDNA2, Adrenalin 26.8.1) crashed inside the driver creating the ~21st compute
+	// pipeline at start-up (an access violation at address 1, with or without optimization; the SPIR-V validates);
+	// other GPUs run them emulated on 32-lane subgroups, the path NVIDIA GPUs always take (no 64-lane subgroups there).
+	// KYTY_COMPUTE_WAVE64=0 or 1 chooses (1 only where the GPU allows 64-lane compute subgroups).
+	const auto& device_properties = properties2.properties;
+	const auto  id                = device_properties.deviceID;
+	const bool  amd_rdna3_or_later =
+	    device_properties.vendorID == 0x1002u &&
+	    ((id >= 0x7440u && id <= 0x75ffu) || id == 0x15bfu || id == 0x15c8u || id == 0x150eu || id == 0x1586u ||
+	     id == 0x1114u);
+	const char* setting = std::getenv("KYTY_COMPUTE_WAVE64");
+	const bool  wanted  = setting != nullptr && *setting != '\0' ? std::string_view(setting) != "0" : amd_rdna3_or_later;
+	graphics.compute_wave64_native = graphics.compute_subgroup_size_control_enabled && wanted;
+	std::printf("Vulkan compute wave64: %s (%s, device 0x%04x:0x%04x)\n",
+	            graphics.SupportsComputeWave64() ? "native" : "emulated on 32-lane subgroups",
+	            setting != nullptr && *setting != '\0' ? "KYTY_COMPUTE_WAVE64"
+	            : amd_rdna3_or_later                    ? "AMD RDNA3 or later"
+	                                                    : "default",
+	            device_properties.vendorID, id);
+	std::fflush(stdout);
+
 	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),

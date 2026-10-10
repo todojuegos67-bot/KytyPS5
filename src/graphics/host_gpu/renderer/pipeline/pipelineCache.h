@@ -137,13 +137,18 @@ public:
 		uint32_t              shards  = 1;
 		uint32_t              threads = 1;
 		bool                  pipelines = true;
+		// Compute seeds translated for this host subgroup size instead of the one they were listed or recorded with
+		// (0: as they were): kyty_shader_precompile passes the GPU's (GetComputeProgram's), --amd what a GPU running
+		// wave64 programs natively (AMD RDNA3) gets.
+		uint32_t              host_subgroup_size = 0;
 	};
 	// left_out: pipelines whose binaries were left out (PipelineBinaryWriter), for a smaller shard.
 	static bool Precompile(GraphicContext& graphics, const PrecompileOptions& options, size_t& left_out);
 	// The shader prefetch's inputs (--static-inputs) are this GPU's and driver's, newer than the seeds;
-	// the static pipeline cache is this GPU's and driver's.
+	// the static pipeline cache is this GPU's and driver's and, unless seeds is empty, newer than the seeds too (a
+	// newer precompile program lists more and makes the seeds again: what is new is compiled then).
 	static bool StaticInputsCurrent(GraphicContext& graphics, const std::filesystem::path& seeds);
-	static bool StaticCacheCurrent(GraphicContext& graphics);
+	static bool StaticCacheCurrent(GraphicContext& graphics, const std::filesystem::path& seeds);
 	// The caches the shards of a precompile saved next to the static cache, merged into it. With
 	// pipeline binaries and `prune`, the store becomes the shards' pipelines only (a whole run's: what
 	// older runs left that no seed makes any more is dropped).

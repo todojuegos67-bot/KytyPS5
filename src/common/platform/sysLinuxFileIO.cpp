@@ -355,6 +355,21 @@ bool SysFileIsError(sys_file_t& f) {
 	return f.type == SYS_FILE_ERROR || (f.type == SYS_FILE_FILE && f.f == nullptr);
 }
 
+bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
+	auto real_name     = get_internal_name(name);
+	auto real_name_str = real_name.string();
+
+	struct stat s {};
+
+	if (0 != stat(real_name_str.c_str(), &s)) {
+		return false;
+	}
+
+	*is_file = !S_ISDIR(s.st_mode); // NOLINT
+	*size    = *is_file ? static_cast<uint64_t>(s.st_size) : 0;
+	return true;
+}
+
 bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
 	auto real_name     = get_internal_name(path);
 	auto real_name_str = real_name.string();

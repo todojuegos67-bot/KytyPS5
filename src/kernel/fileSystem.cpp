@@ -1,5 +1,6 @@
 #include "kernel/fileSystem.h"
 
+#include "common/archive.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/dateTime.h"
@@ -41,8 +42,9 @@ enum class SpecialFile {
 class MountPoints {
 public:
 	struct MountPair {
-		std::filesystem::path dir;
-		std::string           point;
+		std::filesystem::path                  dir;
+		std::string                            point;
+		std::shared_ptr<Common::ArchiveReader> archive; // A mounted archive stays open (its index and block cache).
 	};
 
 	MountPoints() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
@@ -259,10 +261,11 @@ void MountPoints::Mount(const std::filesystem::path& folder, const std::string& 
 	Umount(point_str);
 
 	MountPair p;
-	p.dir   = folder_str;
-	p.point = point_str;
+	p.dir     = Common::PathFromUtf8(folder_str);
+	p.point   = point_str;
+	p.archive = Common::OpenArchive(folder);
 
-	m_mount_pairs.push_back(p);
+	m_mount_pairs.push_back(std::move(p));
 }
 
 void MountPoints::Umount(const std::string& folder_or_point) {
@@ -345,14 +348,18 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 		while (Common::StartsWith(rel_path, '/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
+		const auto native_rel_path = Common::PathFromUtf8(rel_path);
+		if (p.archive != nullptr) {
+			return p.dir / native_rel_path; // (archive names compare without case)
+		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
 			::printf("FileSystem: Windows-incompatible guest filename: %s\n",
 			         mounted_name.c_str());
 		}
-		return p.dir / rel_path;
+		return p.dir / native_rel_path;
 #else
-		return ResolvePathIgnoringCase(p.dir / rel_path);
+		return ResolvePathIgnoringCase(p.dir / native_rel_path);
 #endif
 	}
 
@@ -459,12 +466,19 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	file->real_name = g_mount_points->ResolvePath(file->name);
 
+	if (Common::IsArchivePath(file->real_name) && (rw_mode != Common::File::Mode::Read || trunc || creat)) {
+		g_files->DeleteDescriptor(descriptor);
+		return KERNEL_ERROR_EROFS;
+	}
+
 	if (trunc && rw_mode == Common::File::Mode::Read) {
+		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_EACCES;
 	}
 
-	bool dir_exist  = Common::File::IsDirectoryExisting(file->real_name);
-	bool file_exist = Common::File::IsFileExisting(file->real_name);
+	const auto info       = Common::File::GetInfo(file->real_name);
+	const bool dir_exist  = info && !info->is_file;
+	const bool file_exist = info && info->is_file;
 
 	// A missing path opened without O_CREAT is ENOENT
 	if (!creat && !dir_exist && !file_exist) {
@@ -912,15 +926,13 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 
 	auto real_file_name = g_mount_points->ResolvePath(path);
 
-	bool is_dir  = Common::File::IsDirectoryExisting(real_file_name);
-	bool is_file = Common::File::IsFileExisting(real_file_name);
-
-	if (!is_dir && !is_file) {
+	const auto info = Common::File::GetInfo(real_file_name);
+	if (!info) {
 		LOGF("\t file not found\n");
 		return KERNEL_ERROR_ENOENT;
 	}
 
-	EXIT_NOT_IMPLEMENTED(is_dir && is_file);
+	const bool is_dir = !info->is_file;
 
 	FileStat stat {};
 	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
@@ -937,7 +949,7 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 		// Debug warp and game console variables: a read gets a copy of another size (KernelOpen).
 		auto redirected = Loader::DemonsSoulsWarp::RedirectedSize(real_file_name);
 		if (!redirected) redirected = Loader::GameArgs::RedirectedSize(real_file_name);
-		stat.st_size = static_cast<int64_t>(redirected ? *redirected : Common::File::Size(real_file_name));
+		stat.st_size = static_cast<int64_t>(redirected ? *redirected : info->size);
 		stat.st_blksize = 512;
 		stat.st_blocks  = (stat.st_size + 511) / 512;
 
@@ -1074,6 +1086,9 @@ int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 	}
 
 	auto real_file_name = g_mount_points->ResolvePath(path);
+	if (Common::IsArchivePath(real_file_name)) {
+		return KERNEL_ERROR_EROFS;
+	}
 
 	bool is_dir  = Common::File::IsDirectoryExisting(real_file_name);
 	bool is_file = Common::File::IsFileExisting(real_file_name);
@@ -1111,6 +1126,9 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 	auto to_path   = std::string(to);
 	auto real_from = g_mount_points->ResolvePath(from_path);
 	auto real_to   = g_mount_points->ResolvePath(to_path);
+	if (Common::IsArchivePath(real_from) || Common::IsArchivePath(real_to)) {
+		return KERNEL_ERROR_EROFS;
+	}
 
 	if (!Common::File::IsFileExisting(real_from)) {
 		return KERNEL_ERROR_ENOENT;
@@ -1192,6 +1210,9 @@ int KYTY_SYSV_ABI KernelMkdir(const char* path, uint16_t mode) {
 	     path, mode);
 
 	auto real_name = g_mount_points->ResolvePath(std::string(path));
+	if (Common::IsArchivePath(real_name)) {
+		return Common::File::IsDirectoryExisting(real_name) ? KERNEL_ERROR_EEXIST : KERNEL_ERROR_EROFS;
+	}
 
 	if (Common::File::IsDirectoryExisting(real_name)) {
 		return KERNEL_ERROR_EEXIST;
@@ -1218,6 +1239,9 @@ int KYTY_SYSV_ABI KernelRmdir(const char* path) {
 	LOGF("\t path = %s\n", path);
 
 	auto real_name = g_mount_points->ResolvePath(std::string(path));
+	if (Common::IsArchivePath(real_name)) {
+		return KERNEL_ERROR_EROFS;
+	}
 
 	if (!Common::File::IsDirectoryExisting(real_name)) {
 		return KERNEL_ERROR_ENOENT;
@@ -1251,7 +1275,7 @@ int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 
 	auto real_name = g_mount_points->ResolvePath(mounted_path);
 
-	if (Common::File::IsFileExisting(real_name) || Common::File::IsDirectoryExisting(real_name)) {
+	if (Common::File::GetInfo(real_name)) {
 		return OK;
 	}
 

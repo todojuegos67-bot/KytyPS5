@@ -64,15 +64,31 @@ function Add-Row($label, [object[]]$controls) {
 
 $game = New-Object System.Windows.Forms.TextBox -Property @{ Text = $settings.game; Width = 440 }
 $browse = New-Object System.Windows.Forms.Button -Property @{ Text = 'Browse...'; AutoSize = $true }
-Add-Row 'Game folder' @($game, $browse)
+$browseZar = New-Object System.Windows.Forms.Button -Property @{ Text = '.zar...'; AutoSize = $true }
+Add-Row 'Game folder' @($game, $browse, $browseZar)
 $title = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray' }
 Add-Row '' @($title)
-function Update-Title {
-	$title.Text = 'Choose the folder with eboot.bin and sce_sys (the game dump).'
+# A game: its folder (eboot.bin and sce_sys) or the folder packed into a ZArchive (a .zar file).
+function Read-GameParam([string]$game) {
+	if (!$game) { return $null }
+	if (Test-Path -LiteralPath "$game\sce_sys\param.json") { return Get-Content -LiteralPath "$game\sce_sys\param.json" -Raw -Encoding UTF8 | ConvertFrom-Json }
+	$tool = @("$root\kyty_shader_precompile.exe", "$root\_Build\windows\kyty_shader_precompile.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+	if ($game -notmatch '\.zar$' -or !(Test-Path -LiteralPath $game -PathType Leaf) -or !$tool) { return $null }
+	$copy = [IO.Path]::GetTempFileName()
 	try {
-		$param = Join-Path $game.Text 'sce_sys\param.json'
-		if (Test-Path $param) {
-			$json = Get-Content $param -Raw | ConvertFrom-Json
+		& $tool --game $game --param $copy 2>$null | Out-Null
+		if ($LASTEXITCODE -eq 0) { return Get-Content -LiteralPath $copy -Raw -Encoding UTF8 | ConvertFrom-Json }
+	} catch {
+	} finally {
+		Remove-Item -LiteralPath $copy -ErrorAction SilentlyContinue
+	}
+	return $null
+}
+function Update-Title {
+	$title.Text = 'Choose the folder with eboot.bin and sce_sys (the game dump), or a .zar archive of it.'
+	try {
+		$json = Read-GameParam $game.Text.Trim()
+		if ($json) {
 			$title.Text = '{0} ({1} {2})' -f $json.localizedParameters.($json.localizedParameters.defaultLanguage).titleName,
 				$json.titleId, $json.contentVersion
 		}
@@ -80,8 +96,14 @@ function Update-Title {
 }
 $browse.Add_Click({
 	$dialog = New-Object System.Windows.Forms.FolderBrowserDialog -Property @{ Description = 'The game folder (eboot.bin, sce_sys)' }
-	if ($game.Text -and (Test-Path $game.Text)) { $dialog.SelectedPath = $game.Text }
+	if ($game.Text -and (Test-Path -LiteralPath $game.Text -PathType Container)) { $dialog.SelectedPath = $game.Text }
 	if ($dialog.ShowDialog($form) -eq 'OK') { $game.Text = $dialog.SelectedPath }
+})
+# The game folder packed into a ZArchive (zarchive.exe <folder> <file.zar>): read without extracting it.
+$browseZar.Add_Click({
+	$dialog = New-Object System.Windows.Forms.OpenFileDialog -Property @{ Title = 'The game folder packed into a ZArchive'; Filter = 'ZArchive (*.zar)|*.zar' }
+	if ($game.Text -and (Test-Path -LiteralPath $game.Text -PathType Leaf)) { $dialog.InitialDirectory = Split-Path $game.Text }
+	if ($dialog.ShowDialog($form) -eq 'OK') { $game.Text = $dialog.FileName }
 })
 $game.Add_TextChanged({ Update-Title })
 Update-Title

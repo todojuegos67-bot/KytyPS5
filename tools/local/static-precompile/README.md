@@ -52,6 +52,23 @@ shader / pipeline in the game no longer stalls for 1–3 seconds.
    SPIR-V level = whether the driver cache can hit). `recorded-seeds` turns a recorded cache into
    seeds, compiled the same way with `-Coverage` to get R.
 4. `stalls.py LOG`: compile stall statistics of a run log (`KYTY_SLOW_LOG_MS=30`).
+5. **Specialization hints** (`src/local/shader-hints.cpp`): the seeds guess the formats and table forms the
+   game binds; only recorded play has the real ones (`recorded-<title>_<version>.seeds`, compiled by
+   `precompile-windows.ps1` as its own shards). A recording holds the game's shader code, so a release
+   cannot ship it; it ships `hints-<title>_<version>.hints` here instead: the recording's records with
+   each code and back code replaced by its word count and XXH3-64, no static key (made again from the
+   input info), and the pipeline recipes, zstd-compressed (1.07: 13,345 programs and 16,007 pipelines in
+   239 KiB). On a PC without a recording, `precompile-windows.ps1` completes them with the code of its own
+   seed file (`kyty_shader_precompile --apply-hints`, under a second) into
+   `hinted-<title>_<version>.seeds`, byte for byte the recording's records whose programs the seeds list.
+   Made from this PC's recordings of a version (several `--recorded`; records of another version's code
+   are left out):
+
+   ```
+   kyty_shader_precompile --game <dir> --seeds _Build\static-precompile\seeds-<id>.seeds --make-hints tools\local\static-precompile\hints-<id>.hints --recorded _PipelineCache\warmup-v2\<device>\<id>.shaders
+   ```
+
+   Recording tours (`demons-souls-save.py set-map` spawn points, every world) make the recordings.
 
 ## Portable specialization (recompiler, `KYTY_PORTABLE_SHADERS`, on by default)
 

@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_WIN32)
@@ -482,6 +484,52 @@ uint64_t CurrentThreadCycles() {
 	return QueryThreadCycleTime(GetCurrentThread(), &cycles) != 0 ? cycles : 0;
 }
 
+int CurrentThreadPriority() {
+	return GetThreadPriority(GetCurrentThread());
+}
+
+namespace {
+struct KeptFile {
+	HANDLE   handle = INVALID_HANDLE_VALUE;
+	uint64_t size   = 0;
+};
+std::mutex                                g_kept_files_mutex;
+std::unordered_map<std::string, KeptFile> g_kept_files; // (never closed: the game's files, read-only)
+} // namespace
+
+uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size) {
+	const std::lock_guard lock(g_kept_files_mutex);
+	if (const auto found = g_kept_files.find(path); found != g_kept_files.end()) {
+		*size = found->second.size;
+		return reinterpret_cast<uint64_t>(found->second.handle);
+	}
+	const int wide_size = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+	if (wide_size <= 0) return 0;
+	std::wstring wide(static_cast<size_t>(wide_size), L' ');
+	MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wide.data(), wide_size);
+	HANDLE handle = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+	                            FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (handle == INVALID_HANDLE_VALUE) return 0;
+	LARGE_INTEGER length {};
+	if (GetFileSizeEx(handle, &length) == 0) {
+		CloseHandle(handle);
+		return 0;
+	}
+	g_kept_files.emplace(path, KeptFile {handle, static_cast<uint64_t>(length.QuadPart)});
+	*size = static_cast<uint64_t>(length.QuadPart);
+	return reinterpret_cast<uint64_t>(handle);
+}
+
+uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t size) {
+	// A positional read (the handle is synchronous: it returns when done), so threads share the handle.
+	OVERLAPPED at {};
+	at.Offset     = static_cast<DWORD>(offset);
+	at.OffsetHigh = static_cast<DWORD>(offset >> 32u);
+	DWORD got     = 0;
+	if (ReadFile(reinterpret_cast<HANDLE>(file), buffer, size, &got, &at) == 0) return 0;
+	return got;
+}
+
 double NamedThreadsCpuSeconds(const char* name) {
 	std::wstring wanted;
 	for (const char* p = name; *p != '\0'; ++p) wanted.push_back(static_cast<wchar_t>(*p));
@@ -504,6 +552,30 @@ double NamedThreadsCpuSeconds(const char* name) {
 	}
 	CloseHandle(snapshot);
 	return total;
+}
+
+std::vector<std::pair<uint32_t, std::string>> ProcessThreads() {
+	std::vector<std::pair<uint32_t, std::string>> threads;
+	const DWORD process  = GetCurrentProcessId();
+	HANDLE      snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) return threads;
+	THREADENTRY32 entry {};
+	entry.dwSize = sizeof(entry);
+	for (BOOL more = Thread32First(snapshot, &entry); more != 0; more = Thread32Next(snapshot, &entry)) {
+		if (entry.th32OwnerProcessID != process) continue;
+		HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+		if (thread == nullptr) continue;
+		PWSTR       description = nullptr;
+		std::string name;
+		if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+			for (const wchar_t* c = description; *c != L'\0'; ++c) name.push_back(*c < 128 ? static_cast<char>(*c) : '?');
+			LocalFree(description);
+		}
+		threads.emplace_back(entry.th32ThreadID, std::move(name));
+		CloseHandle(thread);
+	}
+	CloseHandle(snapshot);
+	return threads;
 }
 
 bool FlushProcessWriteBuffers() {
@@ -697,6 +769,22 @@ double ThreadCpuSeconds(uint64_t handle) {
 
 uint64_t CurrentThreadCycles() {
 	return 0;
+}
+
+int CurrentThreadPriority() {
+	return 0;
+}
+
+uint64_t OpenKeptReadFile(const std::string& /*path*/, uint64_t* /*size*/) {
+	return 0;
+}
+
+uint32_t ReadOpenFileAt(uint64_t /*file*/, uint64_t /*offset*/, void* /*buffer*/, uint32_t /*size*/) {
+	return 0;
+}
+
+std::vector<std::pair<uint32_t, std::string>> ProcessThreads() {
+	return {};
 }
 
 double NamedThreadsCpuSeconds(const char* name) {

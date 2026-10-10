@@ -357,6 +357,17 @@ bool SysFileIsError(sys_file_t& f) {
 	       (f.type == SYS_FILE_FILE && f.handle == INVALID_HANDLE_VALUE);
 }
 
+bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
+	WIN32_FILE_ATTRIBUTE_DATA a {};
+	auto                      wide = name.wstring();
+	if (GetFileAttributesExW(wide.c_str(), GetFileExInfoStandard, &a) == 0) {
+		return false;
+	}
+	*is_file = (a.dwFileAttributes & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) == 0u;
+	*size    = *is_file ? (static_cast<uint64_t>(a.nFileSizeHigh) << 32u) | a.nFileSizeLow : 0;
+	return true;
+}
+
 bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
 	auto  wide = path.wstring();
 	DWORD a    = GetFileAttributesW(wide.c_str());
@@ -536,17 +547,12 @@ void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_fi
 }
 
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
-	std::string real_path = Common::ReplaceChar(Common::PathToGenericString(path), '\\', '/');
-	if (!Common::EndsWith(real_path, "/")) {
-		real_path += "/";
-	}
-
-	std::string pattern = real_path + "*";
-
 	HANDLE           h = nullptr;
 	WIN32_FIND_DATAW data;
 
-	auto wide_pattern = std::filesystem::path(pattern).wstring();
+	// The pattern from the path itself: a UTF-8 string of it made a path again went through the ANSI code page (a
+	// non-ASCII game folder listed nothing, so its modules were not loaded).
+	auto wide_pattern = (path / "*").wstring();
 	h                 = FindFirstFileW(wide_pattern.c_str(), &data);
 
 	if (h == INVALID_HANDLE_VALUE) {

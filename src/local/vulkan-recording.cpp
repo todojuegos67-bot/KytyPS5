@@ -1,12 +1,14 @@
 #include "vulkan-recording.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "live-census.h"
+#include "live-counters.h"
 #include "live-trace-gpu.h"
 #include "local-platform.h"
 #include "time-census.h"
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -151,6 +153,20 @@ public:
     }
 };
 
+// A producer waiting for the worker (a full stream, a drain): the slow-frame lines' record_wait (render thread) and
+// the live counter record_wait_us.
+struct RecordWait {
+    LiveCensus::WaitScope                       scope {LiveCensus::WaitRecord};
+    const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    RecordWait() = default;
+    RecordWait(const RecordWait&) = delete;
+    RecordWait& operator=(const RecordWait&) = delete;
+    ~RecordWait() {
+        LiveCounters::Add(LiveCounters::RecordWaitUs,
+                          static_cast<uint64_t>((std::chrono::steady_clock::now() - start).count()) / 1000u);
+    }
+};
+
 class Stream;
 thread_local Stream* executing = nullptr;
 class Stream {
@@ -202,6 +218,7 @@ public:
     void Drain() {
         Publish();
         if (completed.load(std::memory_order_acquire) == sequence) return;
+        const RecordWait waiting;
         for (auto done = completed.load(std::memory_order_acquire); done != sequence;
              done = completed.load(std::memory_order_acquire)) completed.wait(done, std::memory_order_acquire);
     }
@@ -217,8 +234,11 @@ private:
     std::thread worker;
 
     void WaitForRoom() {
-        for (auto done = completed.load(std::memory_order_acquire); sequence - done >= ChunkCount;
-             done = completed.load(std::memory_order_acquire)) completed.wait(done, std::memory_order_acquire);
+        auto done = completed.load(std::memory_order_acquire);
+        if (sequence - done < ChunkCount) return;
+        const RecordWait waiting;
+        for (; sequence - done >= ChunkCount; done = completed.load(std::memory_order_acquire))
+            completed.wait(done, std::memory_order_acquire);
     }
     void Publish() {
         WaitForRoom();

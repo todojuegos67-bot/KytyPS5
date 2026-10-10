@@ -305,6 +305,14 @@ public:
         return signature.starts_with("KytyShaderSeeds2:") && ReadFile(location, signature, contents) &&
                Parse(contents, out_records, out_pipelines);
     }
+    // A seed file, or a warmup file of any device signature (kyty_shader_precompile --make-hints reads recordings).
+    static bool ReadInputs(const std::filesystem::path& location, std::vector<std::vector<uint32_t>>& out_records,
+                           std::vector<std::vector<uint32_t>>& out_pipelines) {
+        const auto signature = FileIdentity(location);
+        std::vector<uint32_t> contents;
+        return (signature.starts_with("KytyShaderSeeds2:") || signature.starts_with("KytyShaderWarmup3:")) &&
+               ReadFile(location, signature, contents) && Parse(contents, out_records, out_pipelines);
+    }
 
 private:
     struct Pending { bool pipeline; std::vector<uint32_t> words; };

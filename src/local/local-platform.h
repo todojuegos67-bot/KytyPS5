@@ -4,6 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace LocalPlatform {
 
@@ -29,9 +32,19 @@ double   ThreadCpuSeconds(uint64_t handle);
 // The calling thread's run time in TSC ticks (Windows: QueryThreadCycleTime; exact, unlike the
 // tick-sampled ThreadCpuSeconds). Linux: 0.
 uint64_t CurrentThreadCycles();
+// The calling thread's scheduling priority (Windows: THREAD_PRIORITY_*, -2 lowest .. 2 highest; Linux: 0).
+int CurrentThreadPriority();
 
 // Total CPU seconds of the threads with this name (0 where the OS cannot enumerate them).
 double NamedThreadsCpuSeconds(const char* name);
+// The process's threads: (thread id, name; empty when it has none). Windows only (Linux: none).
+std::vector<std::pair<uint32_t, std::string>> ProcessThreads();
+
+// A read-only host file kept open for the process (opened once a path, never closed) and its size, for positional
+// reads from any thread (ReadOpenFileAt). 0: it cannot be opened, or (Linux) none are kept: open it for each read.
+uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size);
+// Up to `size` bytes at `offset` of a kept file; the bytes read (0 at the end or on an error).
+uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t size);
 
 // Stack bounds of the calling thread; false when unknown.
 bool CurrentThreadStack(uint64_t* low, uint64_t* high);
