@@ -9,6 +9,11 @@ on:
     # This fork: every push to the shaders branch builds it.
     branches: [ shaders ]
   workflow_dispatch:
+    inputs:
+      pgo_generate:
+        description: 'Instrumented build for a PGO training run (the live command `pgo <file>` writes the profile)'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -33,6 +38,7 @@ jobs:
         run: |
           $name = if ($env:GITHUB_REF_TYPE -eq 'tag') { "KytyPS5-$env:GITHUB_REF_NAME" } else {
             "KytyPS5-$((Get-Date).ToUniversalTime().ToString('yyyyMMdd'))-$($env:GITHUB_SHA.Substring(0, 8))" }
+          if ('${{ inputs.pgo_generate }}' -eq 'true') { $name = "$name-pgogen" }
           "package=$name" >> $env:GITHUB_OUTPUT
 
       # The tested compiler (LLVM 23.1.2 crashed compiling agc.cpp; others are untested).
@@ -63,11 +69,28 @@ jobs:
           if ('${{ steps.glslang.outputs.cache-hit }}' -ne 'true') { vcpkg install 'glslang[tools,opt]:x64-windows' }
           "${{ steps.vcpkg.outputs.root }}\installed\x64-windows\tools\glslang" >> $env:GITHUB_PATH
 
+      # PGO training runs (tools/pgo/raw/*.profraw, written by an instrumented build of this source with the live
+      # command `pgo <file>` while playing) merged into the release profile, weighted over the older one: the
+      # functions changed since it was trained get their profile back. The merged profile goes into the package
+      # (kyty.profdata) to be committed as tools/pgo/kyty.profdata.
+      - name: PGO profile
+        if: ${{ inputs.pgo_generate != true }}
+        shell: pwsh
+        run: |
+          $raw = @(Get-ChildItem tools\pgo\raw\*.profraw -ErrorAction SilentlyContinue)
+          if ($raw.Count -eq 0) { 'no training runs: tools\pgo\kyty.profdata as it is'; exit 0 }
+          $profdata = 'C:\Program Files\LLVM\bin\llvm-profdata.exe'
+          $inputs = @('--weighted-input=1,tools\pgo\kyty.profdata') + ($raw | ForEach-Object { "--weighted-input=4,$($_.FullName)" })
+          & $profdata merge -o tools\pgo\kyty-merged.profdata @inputs
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & $profdata show tools\pgo\kyty-merged.profdata | Select-Object -First 6
+          Move-Item -Force tools\pgo\kyty-merged.profdata tools\pgo\kyty.profdata
+
       # For other PCs: x86-64-v3 (AVX2), not the runner CPU's -march=native.
       - name: Build
         shell: cmd
         env:
-          KYTY_CMAKE_ARGS: -DKYTY_MARCH=x86-64-v3
+          KYTY_CMAKE_ARGS: -DKYTY_MARCH=x86-64-v3 ${{ inputs.pgo_generate == true && '-DKYTY_PGO_GENERATE=ON' || '' }}
         run: |
           call build-windows.cmd kyty_emulator || exit /b 1
           call build-windows.cmd kyty_shader_precompile || exit /b 1
@@ -88,6 +111,8 @@ jobs:
           # The linker map of this exact build: render-thread profiles (live `prof`) are symbolized against it.
           Get-ChildItem "$build\kyty_emulator_*.map" -ErrorAction SilentlyContinue | Select-Object -First 1 |
             ForEach-Object { Copy-Item $_.FullName "$out\kyty_emulator.map" }
+          # The profile this build was optimized with (merged with the training runs, see "PGO profile").
+          if (Test-Path tools\pgo\kyty.profdata) { Copy-Item tools\pgo\kyty.profdata "$out\kyty.profdata" }
           # The render-pass states the precompile program makes the seed file with: the first launch lists the
           # game's shaders from its files (kyty_shader_precompile --make-seeds; a release cannot hold that list: it
           # contains the game's shader code). The Python tools that made it before are not needed. With them, each
@@ -161,5 +186,5 @@ jobs:
             gh release upload "$tag" "$PACKAGE.zip" --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$tag" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "$PACKAGE" --notes "$notes" --latest
+              --title "$PACKAGE" --notes "$notes" $([[ "$PACKAGE" == *-pgogen ]] && echo --latest=false || echo --latest)
           fi
