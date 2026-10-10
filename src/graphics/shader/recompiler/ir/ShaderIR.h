@@ -558,7 +558,9 @@ struct ResourceBlock {
 
 // Table mode (Program::table_mode): the flattened SRT's slots, the V#s of the buffers the shader reads by device
 // address, and the T#s and S#s of its images and samplers. Slot s holds the dword at
-// ((high:low) & 0xffff'ffff'ffff) + (offset & ~3) + immediate, dword aligned; a descriptor is its words. An
+// ((high:low) & 0xffff'ffff'ffff) + (offset & ~3) + immediate, dword aligned (a bounded slot, read through a V#: high
+// and `records` are its words 1 and 2, and a read past its range, NUM_RECORDS bytes or NUM_RECORDS times the stride,
+// fails the evaluation, as the normal path's); a descriptor is its words. An
 // operand is an immediate, a user data register or a lower slot. For each draw the renderer evaluates the slots
 // `cpu` marks (those the shader reads, `gpu`, the image and sampler words, which choose its descriptor set, and
 // what their addresses are read through) as the guest memory holds them then, and gives the shader a block: dword s
@@ -576,6 +578,8 @@ struct TablePlan {
 	struct Slot {
 		Operand low, high, offset;
 		int32_t immediate = 0; // dword aligned
+		Operand records;       // a bounded slot's V# word 2
+		bool    bounded = false;
 		bool    operator==(const Slot&) const = default;
 	};
 	struct Descriptor {

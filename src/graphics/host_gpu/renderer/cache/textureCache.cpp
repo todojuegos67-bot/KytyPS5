@@ -332,9 +332,23 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 }
 
 void TextureCache::StampRegistrationPages(const Image& image, uint64_t epoch) {
+	if (m_registration_log.size() >= 8192) m_registration_log.erase(m_registration_log.begin(), m_registration_log.begin() + 4096);
+	m_registration_log.push_back({epoch, image.info.data.address, image.info.data.End()});
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) return;
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) m_registration_pages[page] = epoch;
+}
+
+bool TextureCache::RegistrationsOverlapSince(uint64_t address, uint64_t size, uint64_t epoch, bool& known) const {
+	const auto& log = m_registration_log;
+	known           = log.empty() || log.front().epoch <= epoch + 1;
+	if (!known) return true;
+	// (At the stamps' page size: what RegistrationsSince would see.)
+	constexpr uint64_t page  = uint64_t {1} << ImageEpochTable::kPageBits;
+	const auto         begin = address & ~(page - 1), end = (address + size + page - 1) & ~(page - 1);
+	for (auto entry = log.rbegin(); entry != log.rend() && entry->epoch > epoch; ++entry)
+		if ((entry->begin & ~(page - 1)) < end && begin < ((entry->end + page - 1) & ~(page - 1))) return true;
+	return false;
 }
 
 bool TextureCache::StillResolved(const Image& image, uint64_t serial, uint64_t epoch) const {
@@ -416,9 +430,13 @@ void TextureCache::UnregisterImage(ImageId id) {
 }
 
 void TextureCache::DeleteImage(ImageId id) {
+	if (DetachImage(id)) RetireImage(id);
+}
+
+bool TextureCache::DetachImage(ImageId id) {
 	auto* image = m_slot_images.try_get(id);
 	if (image == nullptr || !image->registered) {
-		return;
+		return false;
 	}
 	m_partial_plans.erase(image->serial);
 	if (!image->depth_id) {
@@ -456,6 +474,10 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	UnregisterImage(id);
+	return true;
+}
+
+void TextureCache::RetireImage(ImageId id) {
 	// (A speculation's packet may still read it: Spec::PacketNow.)
 	const auto packet = Spec::PacketNow();
 	if (m_scheduler.Active()) {
@@ -507,6 +529,34 @@ void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 	}
 	UntrackImage(id, "maybe-dirty");
 }
+
+namespace {
+
+// KYTY_ASYNC_REPROTECT: the write protection of the pages TrackImage starts watching (again: the pages a refresh
+// released) goes to the upload worker ahead of the upload's copies that read them whole (BufferCache::ImageProtectSink),
+// is applied before any other read of them, and when the upload returns where nothing read them. In the frames that
+// stream textures in, those protection calls took milliseconds of the render thread.
+class DeferredImageProtects {
+public:
+	DeferredImageProtects(BufferCache& cache, PageManager& manager): m_cache(cache), m_manager(manager) {}
+	DeferredImageProtects(const DeferredImageProtects&)            = delete;
+	DeferredImageProtects& operator=(const DeferredImageProtects&) = delete;
+	~DeferredImageProtects() { m_cache.ApplyImageProtects(); }
+
+	template <class F>
+	void Track(F&& track) {
+		const bool defer = kyty_local_async_reprotect_mode.load(std::memory_order_relaxed) != 0;
+		if (defer) PageManager::SetDeferredWriteProtectSink(m_cache.ImageProtectSink(m_manager));
+		track();
+		if (defer) PageManager::SetDeferredWriteProtectSink(nullptr);
+	}
+
+private:
+	BufferCache& m_cache;
+	PageManager& m_manager;
+};
+
+} // namespace
 
 void TextureCache::TrackImage(ImageId id) {
 	auto& image = m_slot_images[id];
@@ -1130,9 +1180,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		// importing cached mip counts would leave the requested layout invalid.
 		(void)GrowImageToLayers(info, cached.info.resources.layers);
 	}
-	info.htile_clear_mask     = 0;
-	const auto replacement_id = InsertImage(info);
-	auto&      replacement    = m_slot_images[replacement_id];
+	info.htile_clear_mask = 0;
+	auto replacement_id   = TakeParkedImage(info);
+	if (!replacement_id) replacement_id = InsertImage(info);
+	auto& replacement = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
@@ -1179,8 +1230,41 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		cached.track_addr     = 0;
 		cached.track_addr_end = 0;
 	}
-	FreeImage(cached_id, "depth-overlap");
+	ParkImage(cached_id);
 	return replacement_id;
+}
+
+// (FreeImage's, but parked: TakeParkedImage takes it back for its description; the collector retires it a flip on.)
+void TextureCache::ParkImage(ImageId id) {
+	auto& image = m_slot_images[id];
+	if (image.IsGpuModified()) {
+		image.ClearGpuModified();
+	}
+	const auto address = image.info.data.address;
+	if (!DetachImage(id)) return;
+	auto& parked = m_parked[address];
+	if (parked.id) RetireImage(parked.id);
+	parked = {id, m_gc_tick};
+}
+
+// An image a depth overlap parked at `info`'s memory made for the same Vulkan image (all of its description but the
+// metadata, which ImageInfo leaves out of the Vulkan image): as InsertImage's new one, registered again.
+ImageId TextureCache::TakeParkedImage(const ImageInfo& info) {
+	const auto parked = m_parked.find(info.data.address);
+	if (parked == m_parked.end()) return {};
+	auto*       image = m_slot_images.try_get(parked->second.id);
+	const auto& held  = image != nullptr ? image->info : info;
+	if (image == nullptr || image->registered || !(held.data == info.data) || !(held.stencil == info.stencil) ||
+	    held.pixel_format != info.pixel_format || held.guest_format != info.guest_format || held.type != info.type ||
+	    held.extent != info.extent || held.resources != info.resources || held.pitch != info.pitch ||
+	    held.bytes_per_block != info.bytes_per_block || held.samples != info.samples || held.tile_mode != info.tile_mode ||
+	    held.bgra16 != info.bgra16 || held.mip_layout != info.mip_layout || info.data.Empty())
+		return {};
+	const auto id = parked->second.id;
+	m_parked.erase(parked);
+	image->PrepareReuse(info);
+	RegisterImage(id);
+	return id;
 }
 
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
@@ -1293,7 +1377,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			if (cached.binding.is_target) {
 				cached.binding.needs_rebind = true;
 				if (merged_id) {
-					m_slot_images[merged_id].binding.is_target = true;
+					auto& merged = m_slot_images[merged_id];
+					if (!merged.binding.is_target) ++merged.validity;
+					merged.binding.is_target = true;
 				}
 				FreeImage(cached_id, "overlap-target-mip");
 				return {merged_id};
@@ -1636,7 +1722,8 @@ void TextureCache::InitializeImage(ImageId id) {
 	if (image.info.data.Empty()) {
 		return;
 	}
-	TrackImage(id);
+	DeferredImageProtects protects {m_buffer_cache, m_page_manager};
+	protects.Track([&] { TrackImage(id); });
 	marks[1] = Clock::now();
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (image.IsCpuDirty()) {
@@ -2076,6 +2163,7 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 	}
 	auto&      image       = m_slot_images[id];
 	bool       changed     = !(image.info.metadata == desc.info.metadata);
+	if (changed) ++image.validity;
 	image.info.metadata    = desc.info.metadata;
 	auto [entry, inserted] = m_surface_metas.try_emplace(
 	    desc.info.metadata.range.address, MetaDataInfo {.type = MetaDataInfo::Type::Dcc});
@@ -2127,7 +2215,8 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 }
 
 void TextureCache::RefreshImage(ImageId id) {
-	TrackImage(id);
+	DeferredImageProtects protects {m_buffer_cache, m_page_manager};
+	protects.Track([&] { TrackImage(id); });
 	auto& image = m_slot_images[id];
 	if (image.IsStencilModified()) {
 		const auto [source, source_offset] =
@@ -2139,6 +2228,7 @@ void TextureCache::RefreshImage(ImageId id) {
 		image.ClearStencilModified();
 	}
 	if (image.IsMaybeCpuDirty()) {
+		m_buffer_cache.ApplyImageProtects(); // (the hash reads the pages: a write after it has to fault)
 		const auto hash = image.HashGuestEdges();
 		if (image.NeedsMaybeCpuHash()) {
 			image.SetMaybeCpuHash(hash);
@@ -2327,6 +2417,7 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
+	if (record.depth_id != depth_id) ++record.validity;
 	record.depth_id = depth_id;
 	if (std::find(m_stencil_associations.begin(), m_stencil_associations.end(), association) ==
 	    m_stencil_associations.end()) {
@@ -2723,6 +2814,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
+	if (!image.usage.render_target) ++image.validity;
 	image.usage.render_target = true;
 	PrepareDccClear(id, desc);
 	RefreshImage(id);
@@ -2744,6 +2836,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
+	if (!image.usage.depth_target) ++image.validity;
 	image.usage.depth_target = true;
 	const bool scoped = RefreshDepthLayers(id, desc.view_info);
 	if (!scoped) {
@@ -2753,6 +2846,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		// The epoch moves only when metadata state changes: every depth target
 		// acquisition passes here.
 		bool changed        = !(image.info.metadata == desc.info.metadata);
+		if (changed) ++image.validity;
 		image.info.metadata = desc.info.metadata;
 		auto [metadata, inserted] =
 		    m_surface_metas.try_emplace(desc.info.metadata.range.address,
@@ -3558,6 +3652,12 @@ void TextureCache::RunGarbageCollector() {
 	EraseRetired();
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	// Parked images not taken back since the flip before: the game left that use of the memory.
+	std::erase_if(m_parked, [&](const auto& item) {
+		if (item.second.tick + 1 >= tick) return false;
+		RetireImage(item.second.id);
+		return true;
+	});
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

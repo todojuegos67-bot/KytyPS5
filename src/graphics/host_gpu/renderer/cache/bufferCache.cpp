@@ -226,6 +226,52 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		if (pending) for (const auto& page: pending->pages)
 			available_pages.Subtract(page.address, page.size);
 	}
+	// KYTY_READBACK_QUEUE: the bytes written back are those of these pages (the window's others are at most copied as
+	// envelope fill, never written back): they take the transfer queue while no unfinished GPU write overlaps them,
+	// whatever other writes in the window do (at Latria the culling's next stage writing the window sent ~4 readbacks
+	// a frame of final bytes behind the whole graphics queue, ~1.2 ms each). When one does but the requested pages'
+	// bytes are final, the pieces it overlaps stay GPU-owned for a later request.
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> runs_home;
+	ScratchValue                                            runs_scratch(runs_home);
+	auto&                                                   runs = *runs_scratch;
+	runs.clear();
+	available_pages.ForEach([&](uint64_t a, uint64_t e) { runs.emplace_back(a, e); });
+	if (const auto queue_mode = kyty_local_readback_queue_mode.load(std::memory_order_relaxed);
+	    (queue_mode == 1 || queue_mode == 3) && m_graphics.readback_queue != nullptr && m_gpu_writes_on &&
+	    m_gpu_writes_from != UINT64_MAX && !runs.empty()) {
+		auto& master = m_scheduler.GetMasterSemaphore();
+		master.Refresh();
+		const uint64_t completed  = master.KnownGpuTick();
+		const uint64_t page_begin = address & ~(TRACKER_PAGE_SIZE - 1);
+		const uint64_t page_end   = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+		if (completed >= m_gpu_writes_from && InflightWriteTick(page_begin, page_end, completed, true) == 0) {
+			constexpr uint64_t Piece = uint64_t {1} << GpuWriteGranuleBits;
+			const auto         drop  = [&](uint64_t from, uint64_t to) {
+				if (from < to && InflightWriteTick(from, to, completed, true) != 0) available_pages.Subtract(from, to - from);
+			};
+			bool narrowed = false;
+			for (const auto& [run_begin, run_end]: runs) {
+				if (InflightWriteTick(run_begin, run_end, completed, true) == 0) continue;
+				narrowed = true;
+				// (By write granule, the requested pages apart.)
+				for (uint64_t at = run_begin; at < run_end;) {
+					const uint64_t next = std::min(run_end, (at / Piece + 1) * Piece);
+					if (next <= page_begin || at >= page_end) {
+						drop(at, next);
+					} else {
+						drop(at, std::max(at, page_begin));
+						drop(std::min(next, page_end), next);
+					}
+					at = next;
+				}
+			}
+			if (narrowed) {
+				LiveCounters::Add(LiveCounters::RbNarrowed);
+				runs.clear();
+				available_pages.ForEach([&](uint64_t a, uint64_t e) { runs.emplace_back(a, e); });
+			}
+		}
+	}
 	thread_local std::vector<DownloadCopy> copies_home;
 	ScratchValue                           copies_scratch(copies_home);
 	auto&                                  copies = *copies_scratch;
@@ -305,8 +351,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	request->packed_size = packed_size;
 	// KYTY_READBACK_QUEUE: bytes whose writers the GPU finished (or, mode 2, has been handed)
 	// need not wait behind the rest of the graphics queue.
-	if (const std::pair<uint64_t, uint64_t> window[] {{begin, end}};
-	    ReadbackQueueReady(window, true, request->producer_tick)) {
+	if (ReadbackQueueReady(runs, true, request->producer_tick)) {
 		// Also after the slot's last graphics-queue copy (it is submitted: that path flushes).
 		request->producer_tick = std::max(request->producer_tick, m_download_ticks[slot]);
 		thread_local std::vector<ReadbackQueue::Queue::Region> regions_home;
@@ -1868,7 +1913,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(*buffer);
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
-		buffer->written_serial = m_scheduler.CommandSerial();
+		// (Not Buffer::written_serial: the write's pages were synchronized above, none of them is a CPU-dirty page an
+		// upload prologue copies later.)
 		InvalidateCopyFeedback(vaddr, size);
 		{
 			const std::unique_lock lock(m_gpu_modified_mutex);
@@ -1907,6 +1953,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
 			path = "buffer";
+			ApplyImageProtects();
 			TouchBuffer(buffer);
 			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 			return {&buffer, buffer.Offset(vaddr)};
@@ -1914,6 +1961,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 	if (IsRegionGpuModified(vaddr, size)) {
 		path = "gpu";
+		ApplyImageProtects();
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 	// More than the whole staging ring holds (a texture over a streamed pool expanded to 1.35 GB while
@@ -1921,6 +1969,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	// fills a staging-sized piece at a time (a temporary buffer past that) and only where memory is mapped.
 	if (size > m_staging_buffer.Size()) {
 		path = "large";
+		ApplyImageProtects();
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 	marks[2] = Clock::now();
@@ -1939,6 +1988,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return {&m_staging_buffer, stage_offset};
 	}
 	const char* prt_failure = "not-attempted";
+	ApplyImageProtects();
 	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
 	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size, &prt_failure))) {
 		EXIT("BufferCache: failed to read mapped guest image backing: "
@@ -1951,7 +2001,36 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return {&m_staging_buffer, stage_offset};
 }
 
+void BufferCache::ApplyImageProtects() {
+	for (const auto& range: m_image_protects) m_image_protect_manager->SyncProtection(range.address, range.size);
+	m_image_protects.clear();
+}
+
+void BufferCache::QueueImageProtects(std::span<const StagingPiece> copied, bool whole_image) {
+	if (m_image_protects.empty()) return;
+	const auto page = whole_image ? m_image_protect_manager->GetPageSize() : 1;
+	for (const auto& range: m_image_protects) {
+		const bool read_whole = std::ranges::any_of(copied, [&](const StagingPiece& piece) {
+			return range.address >= piece.vaddr / page * page &&
+			       range.address + range.size <= (piece.vaddr + piece.size + page - 1) / page * page;
+		});
+		if (!read_whole) {
+			m_image_protect_manager->SyncProtection(range.address, range.size);
+			continue;
+		}
+		// (The page manager's protection of the pages as their watchers are then: the count of this one may be gone.)
+		AsyncUpload::Get().PushProtection(
+		    [](void* manager, uint64_t address, uint64_t bytes) {
+			    static_cast<PageManager*>(manager)->SyncProtection(address, bytes);
+		    },
+		    m_image_protect_manager, range.address, range.size, range.address, range.size);
+	}
+	m_image_protects.clear();
+}
+
 bool BufferCache::PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint64_t size) {
+	const StagingPiece whole {vaddr, size, 0};
+	QueueImageProtects({&whole, 1}, true);
 	if (const auto* source = Libs::LibKernel::Memory::TryGetBackingPointer(vaddr, size)) {
 		AsyncUpload::Get().Push(staging, source, size, vaddr);
 		return true;
@@ -2008,6 +2087,12 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 	}
 	const bool async = kyty_local_async_upload_mode.load(std::memory_order_relaxed) >= 2 &&
 	                   m_staging_buffer.IsCoherent();
+	// (Parts of the image: a deferred protection goes ahead of the worker's copies only of pages one of them reads whole.)
+	if (async) {
+		QueueImageProtects(pieces, false);
+	} else {
+		ApplyImageProtects();
+	}
 	bool queued = false;
 	for (const auto& piece: pieces) {
 		auto* target = staging + piece.offset;
@@ -2152,6 +2237,9 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 			// (Memory the backing view does not hold: written through the guest's view, unprotected first.)
 			InvalidateMemory(address, bytes);
 		}
+		// (Pages CPU-dirty already change no state: their epoch moves, a copy of their bytes taken meanwhile is
+		// stale. A linear copy is a dispatch, no point the observation epoch moves at.)
+		m_memory_tracker.NoteHostWrite(address, bytes);
 		std::memcpy(reinterpret_cast<void*>(address), from, bytes);
 		Spec::NoteHostWrite(address, bytes);
 	};

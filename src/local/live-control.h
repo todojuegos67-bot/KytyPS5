@@ -477,10 +477,20 @@ inline void Run(uint64_t id, const std::string& line) {
 		LocalPlatform::CloseThreadForSampling(handle);
 		std::printf("LIVE_PIN id=%" PRIu64 " thread=%s cpus=%s ok=%d\n", id, arg1, arg2, ok ? 1 : 0);
 	} else if (cmd == "proft" && n == 3) {
-		// proft <tid> <seconds> <path>: sample that thread (the file name follows the seconds).
+		// proft <tid|name> <seconds> <path>: sample that thread (the file name follows the seconds); a name takes the
+		// first thread of that name (e.g. Kyty.Record).
 		char path[256] {};
-		if (std::sscanf(line.c_str(), "%*s %*s %*s %255s", path) == 1)
-			Profile(id, std::strtod(arg2, nullptr), path, false, false, static_cast<uint32_t>(std::strtoul(arg1, nullptr, 10)));
+		auto tid = static_cast<uint32_t>(std::strtoul(arg1, nullptr, 10));
+		if (tid == 0)
+			for (const auto& [thread, name]: LocalPlatform::ProcessThreads())
+				if (name == arg1) {
+					tid = thread;
+					break;
+				}
+		if (tid == 0)
+			std::printf("LIVE_ERROR id=%" PRIu64 " line=proft %s (no such thread)\n", id, arg1);
+		else if (std::sscanf(line.c_str(), "%*s %*s %*s %255s", path) == 1)
+			Profile(id, std::strtod(arg2, nullptr), path, false, false, tid);
 #endif
 	} else if ((cmd == "trace" || cmd == "tracew" || cmd == "tracem") && n == 3) {
 		LiveTrace::g_count.store(0);

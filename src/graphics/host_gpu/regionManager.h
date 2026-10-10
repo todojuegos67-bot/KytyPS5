@@ -197,9 +197,17 @@ public:
 			}
 			UpdateCpuProtection<!enable>(start, end);
 		} else {
+			// (GPU-written pages given back to the CPU hold the GPU's bytes now: the epoch moves, NoteHostWrite.)
+			if constexpr (!enable) m_cpu_epoch.fetch_add(1, std::memory_order_release);
 			UpdateGpuProtection<enable>();
 		}
 	}
+
+	// The emulator wrote CPU-dirty pages of the region (their state stays): what a proof by the epoch holds of their
+	// bytes holds no longer (TableXpr::RingCopy's copies of guest-written ranges). The epoch moves as well when pages
+	// become CPU-dirty and when GPU-written pages are given back (their bytes the GPU's): with the guest's writes to
+	// dirty pages it covers every change of the region's bytes the CPU can see but those.
+	void NoteHostWrite() noexcept { m_cpu_epoch.fetch_add(1, std::memory_order_release); }
 
 	// CPU-dirty with the pages' write protection kept: the emulator wrote them through the backing view (no fault
 	// saw it). A page still write-watched stays so (UpdateCpuProtection moves only pages of a change's range, in its
@@ -229,6 +237,7 @@ public:
 			return;
 		}
 		if constexpr (source == DirtySource::Gpu && clear) {
+			m_cpu_epoch.fetch_add(1, std::memory_order_release); // (as ChangeState's)
 			UpdateGpuProtection<false>();
 		}
 		ForEachRange(mask, std::forward<Func>(func));

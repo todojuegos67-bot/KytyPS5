@@ -58,6 +58,10 @@ public:
 
 	[[nodiscard]] const T* try_get(SlotId id) const noexcept { return is_allocated(id) ? &*At(id.index).value : nullptr; }
 
+	// The slot's first line (its liveness and the object's first members) loading, for a lookup soon.
+	void prefetch(SlotId id) const noexcept {
+		if (id && id.index < m_capacity.load(std::memory_order_acquire)) __builtin_prefetch(&At(id.index));
+	}
 	[[nodiscard]] bool is_allocated(SlotId id) const noexcept {
 		if (!id || id.index >= m_capacity.load(std::memory_order_acquire)) return false;
 		const auto& slot = At(id.index);

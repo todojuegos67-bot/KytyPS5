@@ -148,6 +148,8 @@ public:
 	// Once per guest flip (the unit of NumFramesBeforeRemoval).
 	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
 	[[nodiscard]] uint64_t CurrentFrame() const noexcept { return m_frame.load(std::memory_order_relaxed); }
+	// The collector's runs (one a flip): the LRU's clock. The GPU thread's.
+	[[nodiscard]] uint64_t GcTick() const noexcept { return m_gc_tick; }
 
 private:
 	enum class TransferDirection { Upload, Download };
@@ -185,9 +187,23 @@ private:
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
+	// DeleteImage's halves: out of every index (false: it was not registered), then destroyed once no recorded work
+	// can read it.
+	[[nodiscard]] bool        DetachImage(ImageId id);
+	void                      RetireImage(ImageId id);
 	// Deleted images a speculation's packet may still read (Spec::PacketsPassed), destroyed once it passed.
 	std::vector<std::pair<ImageId, Spec::PacketMarks>> m_retired;
 	void                                               EraseRetired();
+	// An image a depth overlap replaced, out of every index but kept (one an address, the collector's run it was parked
+	// at): ResolveDepthOverlap takes it back when the memory is asked for in its description again, instead of making
+	// another image (the game takes one surface as a depth target and as a color target in turn every frame).
+	struct ParkedImage {
+		ImageId  id;
+		uint64_t tick = 0;
+	};
+	std::unordered_map<uint64_t, ParkedImage> m_parked;
+	void                      ParkImage(ImageId id);
+	[[nodiscard]] ImageId     TakeParkedImage(const ImageInfo& info);
 	void                      FreeImage(ImageId id, const char* site = "");
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
@@ -345,6 +361,14 @@ private:
 	ImageEpochTable    m_registration_pages;
 	void               StampRegistrationPages(const Image& image, uint64_t epoch);
 	[[nodiscard]] bool RegistrationsSince(uint64_t address, uint64_t size, uint64_t epoch) const;
+	// The latest registrations and unregistrations, in order: the epoch each moved m_resolution_epoch to (one each) and
+	// the image's memory. Whether any after `epoch` reached [address, address + size)'s stamp pages; `known` false when
+	// the log no longer reaches back to it (RegistrationsSince answers then).
+	struct RegistrationEntry {
+		uint64_t epoch = 0, begin = 0, end = 0;
+	};
+	std::vector<RegistrationEntry> m_registration_log;
+	[[nodiscard]] bool RegistrationsOverlapSince(uint64_t address, uint64_t size, uint64_t epoch, bool& known) const;
 	// FindTexture's PrepareDccClear with this view's metadata would change only the fields a color target binding
 	// fills (its clear word: no reader but the comparison that moves the meta epoch): the image's DCC surface is the
 	// view's and the metadata record there is DCC's (an unknown or pending one it would make DCC). A pending fast clear

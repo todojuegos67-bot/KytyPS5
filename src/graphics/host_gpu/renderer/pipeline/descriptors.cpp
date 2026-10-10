@@ -926,6 +926,7 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 
 void RenderExecutor::BindRenderTarget(ImageId id) {
 	auto& image             = m_context.GetTextureCache().GetImage(id);
+	if (!image.binding.is_target) ++image.validity;
 	image.binding.is_target = true;
 	TrackImageBinding(id);
 }
@@ -1142,6 +1143,7 @@ bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+		if (storage && !image.usage.storage) ++image.validity;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
 		const auto host_view =

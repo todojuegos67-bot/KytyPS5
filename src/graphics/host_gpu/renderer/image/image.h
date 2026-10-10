@@ -79,6 +79,9 @@ public:
 	KYTY_CLASS_NO_COPY(Image);
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
+	// A parked image taken back for `image_info` (TextureCache::TakeParkedImage, the same Vulkan image): the state the
+	// constructor gives a new one, but for its Vulkan image, views and barrier state (and serial: the same object).
+	void PrepareReuse(const ImageInfo& image_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] const Barriers& GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
@@ -117,9 +120,11 @@ public:
 			m_maybe_hash_valid = false;
 			DropPartialDirty();
 			NoteCpuDirty();
+			++validity;
 		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
 			m_maybe_cpu_dirty = true;
 			NoteCpuDirty();
+			++validity;
 		}
 	}
 
@@ -141,6 +146,7 @@ public:
 		}
 		AddRange(m_dirty_ranges, begin, end);
 		NoteCpuDirty();
+		++validity;
 	}
 	[[nodiscard]] bool IsPartiallyCpuDirty() const noexcept { return m_cpu_dirty && m_partial_dirty; }
 	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& CpuDirtyRanges() const noexcept {
@@ -154,11 +160,13 @@ public:
 		}
 		m_partial_dirty = true;
 		m_dirty_ranges.assign(1, {info.data.address, info.data.End()});
+		++validity;
 	}
 	// The whole image must be uploaded again (the image stopped watching all of its pages).
 	void DropPartialDirty() noexcept {
 		m_partial_dirty = false;
 		m_dirty_ranges.clear();
+		++validity;
 	}
 	// A refresh of [begin, end) only (the layers one binding covers): the other ranges stay dirty.
 	void RefreshRangeComplete(uint64_t begin, uint64_t end) {
@@ -207,6 +215,7 @@ public:
 		if (!m_cpu_dirty) {
 			m_maybe_cpu_dirty = true;
 			NoteCpuDirty();
+			++validity;
 		}
 	}
 	[[nodiscard]] bool NeedsMaybeCpuHash() const {
@@ -240,7 +249,10 @@ public:
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
+	void               MarkGpuModified() noexcept {
+		if (!m_gpu_modified) ++validity; // (a texture GPU work writes refreshes whole: TextureCache::LevelRefreshCandidate)
+		m_gpu_modified = true;
+	}
 	void               ClearGpuModified() noexcept {
 		m_gpu_modified = false;
 		MoveImageStateEpoch();
@@ -249,6 +261,7 @@ public:
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
 		m_buffer_modified = true;
+		++validity;
 		MoveImageStateEpoch();
 	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
@@ -256,6 +269,7 @@ public:
 	[[nodiscard]] bool IsStencilModified() const noexcept { return m_stencil_modified; }
 	void               MarkStencilModified() noexcept {
 		m_stencil_modified = true;
+		++validity;
 		MoveImageStateEpoch();
 	}
 	void               ClearStencilModified() noexcept { m_stencil_modified = false; }
@@ -274,6 +288,14 @@ public:
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
+	// Unique per image object: a deleted image's slot id goes to later images. (First, with validity: on the line of
+	// the slot's liveness, which a lookup reads anyway.)
+	uint64_t         serial             = 0;
+	// Moves with each change of what a use of the image was proven by (RenderExecutor::TableValidateSet): bytes the CPU
+	// wrote or may have written, a GPU buffer or stencil-plane write over them, the first GPU write or use as a target or
+	// storage (a texture used so refreshes whole), its metadata, a stencil association. Registrations over its pages are
+	// stamped instead (TextureCache::RegistrationsSince). (Atomic: the fault handler's threads move it too.)
+	std::atomic<uint64_t> validity {0};
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
@@ -294,8 +316,6 @@ public:
 	uint64_t         lru_tick           = 0; // the collection tick of its last use (TextureCache)
 	// Transit group that last set the whole-image state; see BeginTransitGroup.
 	uint64_t         transit_group      = 0;
-	// Unique per image object: a deleted image's slot id goes to later images.
-	uint64_t         serial             = 0;
 	// The staging copy of the last whole-image upload (null: none or not refillable) and the command buffer it was
 	// recorded in (CommandScheduler::CommandSerial): TextureCache::InitializeImage.
 	const Buffer*    staged_ring        = nullptr;

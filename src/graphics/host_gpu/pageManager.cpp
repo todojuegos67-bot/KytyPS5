@@ -39,6 +39,7 @@ struct PendingRange {
 	uint64_t begin, end;
 };
 thread_local std::vector<PendingRange> g_read_protects;
+thread_local uint64_t                  g_observation_epoch = 0; // (PageManager::ObservationEpoch)
 
 constexpr uint64_t PAGE_SIZE    = TRACKER_PAGE_SIZE;
 constexpr uint64_t REGION_SIZE  = TRACKER_REGION_SIZE;
@@ -549,12 +550,20 @@ template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
 
 void PageManager::DeferReadProtection(bool on) noexcept {
-	if (!on) Impl::FlushReadProtect();
+	if (!on) {
+		Impl::FlushReadProtect();
+		++g_observation_epoch;
+	}
 	g_defer_read_protect = on;
 }
 
 void PageManager::FlushDeferredProtection() noexcept {
 	Impl::FlushReadProtect();
+	++g_observation_epoch;
+}
+
+uint64_t PageManager::ObservationEpoch() noexcept {
+	return g_observation_epoch;
 }
 
 template <bool track, bool is_read>

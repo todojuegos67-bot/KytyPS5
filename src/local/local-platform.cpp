@@ -1,11 +1,14 @@
 #include "local-platform.h"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -491,11 +494,55 @@ int CurrentThreadPriority() {
 
 namespace {
 struct KeptFile {
-	HANDLE   handle = INVALID_HANDLE_VALUE;
-	uint64_t size   = 0;
+	HANDLE   handle     = INVALID_HANDLE_VALUE;
+	uint64_t size       = 0;
+	bool     prefetched = false;
 };
 std::mutex                                g_kept_files_mutex;
 std::unordered_map<std::string, KeptFile> g_kept_files; // (never closed: the game's files, read-only)
+
+std::wstring WidePath(const std::string& path) {
+	const int wide_size = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+	if (wide_size <= 0) return {};
+	std::wstring wide(static_cast<size_t>(wide_size), L' ');
+	MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wide.data(), wide_size);
+	return wide;
+}
+
+// PrefetchKeptFile's thread: the files queued, each read through once in 1 MiB pieces at background priority (low I/O
+// priority too: the game's own reads go first) and by a handle of its own (a synchronous handle runs one read at a
+// time, so the game's next read would wait behind a piece of this one; the cache is the file's, whatever the handle).
+std::mutex              g_prefetch_mutex;
+std::condition_variable g_prefetch_ready;
+std::vector<std::wstring> g_prefetch_queue;
+
+void PrefetchThread() {
+	SetThreadName("Kyty.FilePrefetch");
+	SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+	std::vector<uint8_t> piece(1u << 20u);
+	for (;;) {
+		std::wstring path;
+		{
+			std::unique_lock lock(g_prefetch_mutex);
+			g_prefetch_ready.wait(lock, [] { return !g_prefetch_queue.empty(); });
+			path = std::move(g_prefetch_queue.front());
+			g_prefetch_queue.erase(g_prefetch_queue.begin());
+		}
+		HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+		                          FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+		if (file == INVALID_HANDLE_VALUE) continue;
+		DWORD      got   = 0;
+		uint64_t   total = 0;
+		const auto begin = std::chrono::steady_clock::now();
+		while (ReadFile(file, piece.data(), static_cast<DWORD>(piece.size()), &got, nullptr) != 0 && got != 0) total += got;
+		CloseHandle(file);
+		// KYTY_APR_LOG (libAmpr.cpp's): each file read through.
+		static const bool log_reads = std::getenv("KYTY_APR_LOG") != nullptr;
+		if (log_reads)
+			std::printf("APRPREFETCH %llu bytes %.1f ms %ls\n", static_cast<unsigned long long>(total),
+			            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(), path.c_str());
+	}
+}
 } // namespace
 
 uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size) {
@@ -504,10 +551,8 @@ uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size) {
 		*size = found->second.size;
 		return reinterpret_cast<uint64_t>(found->second.handle);
 	}
-	const int wide_size = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-	if (wide_size <= 0) return 0;
-	std::wstring wide(static_cast<size_t>(wide_size), L' ');
-	MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wide.data(), wide_size);
+	const auto wide = WidePath(path);
+	if (wide.empty()) return 0;
 	HANDLE handle = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
 	                            FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (handle == INVALID_HANDLE_VALUE) return 0;
@@ -529,6 +574,23 @@ uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t s
 	DWORD got     = 0;
 	if (ReadFile(reinterpret_cast<HANDLE>(file), buffer, size, &got, &at) == 0) return 0;
 	return got;
+}
+
+void PrefetchKeptFile(const std::string& path) {
+	{
+		const std::lock_guard lock(g_kept_files_mutex);
+		const auto            found = g_kept_files.find(path);
+		if (found == g_kept_files.end() || std::exchange(found->second.prefetched, true)) return;
+	}
+	auto wide = WidePath(path);
+	if (wide.empty()) return;
+	static std::once_flag started;
+	std::call_once(started, [] { std::thread(PrefetchThread).detach(); });
+	{
+		const std::lock_guard lock(g_prefetch_mutex);
+		g_prefetch_queue.push_back(std::move(wide));
+	}
+	g_prefetch_ready.notify_one();
 }
 
 double NamedThreadsCpuSeconds(const char* name) {
@@ -810,6 +872,8 @@ uint64_t OpenKeptReadFile(const std::string& /*path*/, uint64_t* /*size*/) {
 uint32_t ReadOpenFileAt(uint64_t /*file*/, uint64_t /*offset*/, void* /*buffer*/, uint32_t /*size*/) {
 	return 0;
 }
+
+void PrefetchKeptFile(const std::string& /*path*/) {}
 
 std::vector<std::pair<uint32_t, std::string>> ProcessThreads() {
 	return {};

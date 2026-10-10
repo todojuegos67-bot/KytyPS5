@@ -45,6 +45,9 @@ std::vector<std::pair<uint32_t, std::string>> ProcessThreads();
 uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size);
 // Up to `size` bytes at `offset` of a kept file; the bytes read (0 at the end or on an error).
 uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t size);
+// A kept file read whole once, in the background (the first call for the path; Windows only): its later reads come from
+// the system file cache.
+void PrefetchKeptFile(const std::string& path);
 
 // Stack bounds of the calling thread; false when unknown.
 bool CurrentThreadStack(uint64_t* low, uint64_t* high);

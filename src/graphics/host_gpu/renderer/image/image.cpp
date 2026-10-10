@@ -192,6 +192,26 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 	// renderer's lock); a speculation's thread only reads it, under the lock.
 	if (entry == nullptr && !partial && backing.subresource_states.empty() && in_place(backing.state, transit_group))
 		return barriers;
+	// The same for a part of it (a view's levels or layers: textures streamed in from their small levels, sampled from
+	// a base level above 0), read only: the image, as a whole or in each subresource of the part, already in the layout
+	// with that access, as is its whole-image state. Before, such a transition took the lock, moved the state epoch
+	// (every table draw after it checked and transited its images again) and split a uniform image into subresource
+	// states for good, which every later transition of it walked.
+	if (entry == nullptr && partial && !static_cast<bool>(destination_access & write_access) &&
+	    backing.state.layout == destination_layout && backing.state.access_mask == destination_access) {
+		bool all = true;
+		for (uint32_t level = range->base_level;
+		     all && !backing.subresource_states.empty() && level < range->base_level + range->level_count; ++level)
+			for (uint32_t layer = range->base_layer; layer < range->base_layer + range->layer_count; ++layer) {
+				const auto index = level * info.resources.layers + layer;
+				if (index >= backing.subresource_states.size() || backing.subresource_states[index].layout != destination_layout ||
+				    backing.subresource_states[index].access_mask != destination_access) {
+					all = false;
+					break;
+				}
+			}
+		if (all) return barriers;
+	}
 	std::optional<StateLock> lock;
 	if (entry == nullptr) {
 		lock.emplace(*this);
@@ -817,7 +837,7 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 } // namespace ImageOps
 
 Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
-    : info(image_info), serial(g_image_serial_next.fetch_add(1, std::memory_order_relaxed)),
+    : serial(g_image_serial_next.fetch_add(1, std::memory_order_relaxed)), info(image_info),
       m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
 	ImageOps::Validate(info);
@@ -856,6 +876,35 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}
+}
+
+void Image::PrepareReuse(const ImageInfo& image_info) {
+	info               = image_info;
+	m_cpu_dirty        = !info.data.Empty() && info.metadata.compression == VideoOutCompression::Uncompressed;
+	m_maybe_cpu_dirty  = false;
+	m_maybe_hash_valid = false;
+	m_maybe_cpu_hash   = 0;
+	m_gpu_modified     = false;
+	m_buffer_modified  = false;
+	m_stencil_modified = false;
+	m_partial_dirty    = false;
+	m_dirty_ranges.clear();
+	usage               = {};
+	binding             = {};
+	query_epoch         = 0;
+	track_addr          = 0;
+	track_addr_end      = 0;
+	untracked_holes.clear();
+	partial_hashes.clear();
+	depth_id            = {};
+	frame_accessed_last = 0;
+	staged_ring         = nullptr;
+	staged_offset       = 0;
+	staged_serial       = 0;
+	level_view          = UINT32_MAX;
+	level_begin         = 0;
+	level_end           = 0;
+	++validity;
 }
 
 uint64_t Image::HashGuestEdges() const {

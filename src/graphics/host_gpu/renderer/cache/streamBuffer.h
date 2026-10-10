@@ -78,9 +78,9 @@ public:
 	std::atomic<bool> is_deleted {false};
 	int    stream_score = 0;
 	size_t lru_id       = 0;
-	// The command buffer (CommandScheduler::CommandSerial) that last recorded a write into it: a copy or fill into it,
-	// a shader's (ObtainBuffer as written) or an image's bytes (TextureCache::DownloadImageData). Uploads into it then
-	// stay in order in that buffer (CommandScheduler::UploadPrologue).
+	// The command buffer (CommandScheduler::CommandSerial) that last recorded a copy or fill into it or an image's
+	// bytes (TextureCache::DownloadImageData): writes that need not synchronize their pages first (a shader's write
+	// does, BufferCache::ObtainBuffer). Uploads into it then stay in order in that buffer (UploadPrologue).
 	uint64_t written_serial = 0;
 
 protected:

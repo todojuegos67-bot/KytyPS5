@@ -92,6 +92,16 @@ public:
 	// again while the upload is unsubmitted).
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size,
 	                                                               bool* refillable = nullptr);
+	// KYTY_ASYNC_REPROTECT: the write protection of the pages an image starts watching again (TextureCache's
+	// DeferredImageProtects sets the page manager's deferred write-protect sink to this list around TrackImage), applied
+	// by the upload worker ahead of an upload copy that reads those pages whole (the whole image: PushImageStagingCopies;
+	// parts of it: StageImagePieces), else before any other read of them (ApplyImageProtects, and what is left when the
+	// texture cache's upload returns): a CPU write before the protection is in the copy, one after it faults.
+	[[nodiscard]] std::vector<PageManager::DeferredRange>* ImageProtectSink(PageManager& manager) noexcept {
+		m_image_protect_manager = &manager;
+		return &m_image_protects;
+	}
+	void ApplyImageProtects();
 	// The guest bytes of [vaddr, vaddr + size) copied again by the upload worker to a staging copy ObtainBufferForImage
 	// made (`ring` at `offset`): whose GPU copies are recorded but not submitted, so they upload the new bytes. False,
 	// with nothing done, where ObtainBufferForImage would not stage them that way now.
@@ -322,6 +332,12 @@ private:
 	// The upload worker's copies of guest [vaddr, vaddr + size) to `staging`; false when it reads the mapped parts
 	// only (a partly unmapped range: the rest is zeros).
 	bool PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint64_t size);
+	// ImageProtectSink's protections: those of pages a copy of [vaddr, vaddr + size) the upload worker makes next reads
+	// whole go ahead of it, the others are applied here. `whole_image`: the range is the image's (bytes of its first and
+	// last pages outside it are no other watcher's, or their pages would have been watched already).
+	std::vector<PageManager::DeferredRange> m_image_protects;
+	PageManager*                            m_image_protect_manager = nullptr;
+	void QueueImageProtects(std::span<const StagingPiece> copied, bool whole_image);
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_host_shader_upload;
 	StreamBuffer                                      m_table_upload;

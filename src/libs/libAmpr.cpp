@@ -685,6 +685,12 @@ constexpr uint64_t APR_MAX_READ_LENGTH           = 0x0000000100000000ull;
 constexpr uint64_t APR_MAX_FILE_OFFSET           = 0x0000010000000000ull;
 constexpr uint64_t APR_MAX_APP_ADDRESS           = 0x0000f00000000000ull;
 constexpr uint64_t APR_HOST_READ_CHUNK_SIZE      = 4 * 1024 * 1024;
+// A read of up to a stream piece from a file of these sizes reads the whole file in the background
+// (LocalPlatform::PrefetchKeptFile): the game's audio streams (.at9, .xvag) are 16 KiB pieces of files of 1 to 13 MiB;
+// the tens of thousands of small files it reads whole in one piece are not read again.
+constexpr uint64_t APR_STREAM_PIECE_SIZE         = 64 * 1024;
+constexpr uint64_t APR_PREFETCH_MIN_FILE_SIZE    = 1024 * 1024;
+constexpr uint64_t APR_PREFETCH_MAX_FILE_SIZE    = 16 * 1024 * 1024;
 constexpr uint32_t APR_TYPE_GATHER_SCATTER_VALID = 0x00010000;
 constexpr uint32_t APR_TYPE_MAP_ACTIVE           = 0x00020000;
 
@@ -1542,6 +1548,11 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 			return OK;
 		}
 		const auto readable = std::min<uint64_t>(size, kept_size - file_offset);
+		// A small file read in pieces (an audio stream, 16 KiB at a time from places of the file far apart, so the cache
+		// manager's read-ahead misses them): read whole in the background once, its later pieces wait for no disk (one
+		// waited 330 ms behind the write-back of a store just precompiled).
+		if (readable <= APR_STREAM_PIECE_SIZE && kept_size >= APR_PREFETCH_MIN_FILE_SIZE && kept_size <= APR_PREFETCH_MAX_FILE_SIZE)
+			LocalPlatform::PrefetchKeptFile(host_path);
 		thread_local std::vector<uint8_t> kept_buffer;
 		kept_buffer.resize(static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
 		while (*bytes_read < readable) {

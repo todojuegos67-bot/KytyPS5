@@ -144,6 +144,10 @@ bool MemoryTracker::MarkRegionAsCpuDirtyKeepProtection(uint64_t vaddr, uint64_t 
 	});
 }
 
+void MemoryTracker::NoteHostWrite(uint64_t vaddr, uint64_t size) {
+	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t, uint64_t) { manager->NoteHostWrite(); });
+}
+
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {

@@ -13,18 +13,18 @@
 #include "graphics/guest_gpu/pm4.h"
 
 #include <array>
-#include <bitset>
 #include <cstdint>
 
 namespace Libs::Graphics::DrawStateObserver {
 
 struct Shadow {
-	std::array<uint32_t, Pm4::CX_NUM> cx {};
-	std::array<uint32_t, Pm4::SH_NUM> sh {};
-	std::array<uint32_t, Pm4::UC_NUM> uc {};
-	std::bitset<Pm4::CX_NUM>          cx_valid;
-	std::bitset<Pm4::SH_NUM>          sh_valid;
-	std::bitset<Pm4::UC_NUM>          uc_valid;
+	// Each register's last value (low 32 bits) and the generation it was written in (high 32 bits): known while that is
+	// `generation` (Invalidate starts another), so a write is one compare and a reset is one increment (the command
+	// processor's Reset invalidates at every submission; the UC space alone has 16384 registers).
+	std::array<uint64_t, Pm4::CX_NUM> cx {};
+	std::array<uint64_t, Pm4::SH_NUM> sh {};
+	std::array<uint64_t, Pm4::UC_NUM> uc {};
+	uint64_t generation = uint64_t {1} << 32u;
 	bool chain      = false; // the previous graphics draw was an indexed indirect draw
 	bool dirty      = true;  // graphics state changed since that draw
 	bool last_clean = false; // the latest DRAW_INDEX_INDIRECT was clean
@@ -40,24 +40,24 @@ inline thread_local Shadow g_shadow;
 inline void WriteRegister(uint32_t space, uint32_t raw_offset, uint32_t value) {
 	auto&      s      = g_shadow;
 	const auto offset = raw_offset & 0xffffu;
-	const auto update = [&](auto& values, auto& valid) {
+	const auto update = [&](auto& values) {
 		if (offset >= values.size()) {
 			s.dirty = true;
 			return;
 		}
-		if (!valid[offset] || values[offset] != value) {
-			valid[offset]  = true;
-			values[offset] = value;
+		const uint64_t entry = s.generation | value;
+		if (values[offset] != entry) {
+			values[offset] = entry;
 			s.dirty        = true;
 		}
 	};
 	if (space == 1) {
 		if (offset < Pm4::SH_NUM && ShFree(offset)) return;
-		update(s.sh, s.sh_valid);
+		update(s.sh);
 	} else if (space == 0) {
-		update(s.cx, s.cx_valid);
+		update(s.cx);
 	} else {
-		update(s.uc, s.uc_valid);
+		update(s.uc);
 	}
 }
 
@@ -76,9 +76,13 @@ inline void WriteIndirectBlock(uint32_t space, const uint32_t* packet) {
 // shadow holds is known any more.
 inline void Invalidate() {
 	auto& s = g_shadow;
-	s.cx_valid.reset();
-	s.sh_valid.reset();
-	s.uc_valid.reset();
+	s.generation += uint64_t {1} << 32u;
+	if (s.generation == 0) { // (wrapped: an entry of the first generation would be taken as known again)
+		s.cx.fill(0);
+		s.sh.fill(0);
+		s.uc.fill(0);
+		s.generation = uint64_t {1} << 32u;
+	}
 	s.chain = false;
 	s.dirty = true;
 }

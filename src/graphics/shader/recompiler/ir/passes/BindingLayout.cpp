@@ -69,7 +69,36 @@ bool UsesGds(const Program& program) {
 	return uses_gds;
 }
 
-// A value table mode evaluates at the program's entry: an immediate, user data or an SRT slot below `slots`.
+std::optional<TablePlan::Operand> TableOperand(Value value, size_t slots);
+
+// A phi whose incoming values, through the phis among them, are all one table operand (a loop's headers carrying a
+// value the loop never changes: the light loops' and other compute passes' table pointer, phi(x, phi(x, ...)) cycles
+// constant propagation does not fold): that operand.
+std::optional<TablePlan::Operand> TablePhiOperand(const Inst& phi, size_t slots) {
+	std::optional<TablePlan::Operand> common;
+	std::vector<const Inst*>          pending {&phi}, seen;
+	while (!pending.empty()) {
+		const auto* current = pending.back();
+		pending.pop_back();
+		if (std::ranges::find(seen, current) != seen.end()) continue;
+		seen.push_back(current);
+		if (seen.size() > 256) return std::nullopt;
+		for (size_t i = 0; i < current->NumArgs(); ++i) {
+			const auto incoming = current->Arg(i).Resolve();
+			if (const auto* source = incoming.TryInstruction(); source != nullptr && source->GetOpcode() == ValueOpcode::Phi) {
+				pending.push_back(source);
+				continue;
+			}
+			const auto operand = TableOperand(incoming, slots);
+			if (!operand || (common && !(*common == *operand))) return std::nullopt;
+			common = operand;
+		}
+	}
+	return common;
+}
+
+// A value table mode evaluates at the program's entry: an immediate, user data or an SRT slot below `slots` (or a phi
+// of one of them alone: TablePhiOperand).
 std::optional<TablePlan::Operand> TableOperand(Value value, size_t slots) {
 	using Kind = TablePlan::Operand::Kind;
 	value      = value.Resolve();
@@ -79,6 +108,7 @@ std::optional<TablePlan::Operand> TableOperand(Value value, size_t slots) {
 	}
 	const auto* inst = value.TryInstruction();
 	if (inst == nullptr) return std::nullopt;
+	if (inst->GetOpcode() == ValueOpcode::Phi) return TablePhiOperand(*inst, slots);
 	if (inst->GetOpcode() == ValueOpcode::GetUserData && inst->Arg(0).GetType() == Type::ScalarReg)
 		return TablePlan::Operand {Kind::UserData, static_cast<uint32_t>(RegIndex(inst->Arg(0).ScalarRegister()))};
 	if (inst->GetOpcode() != ValueOpcode::ReadConst) return std::nullopt;
@@ -165,6 +195,25 @@ void EnterTableMode(Program& program) {
 	// The flattened SRT's slots in order (a slot's address only depends on lower slots and user data).
 	for (size_t slot = 0; slot < program.srt_reads.size(); ++slot) {
 		const auto* load = program.srt_reads[slot].value.Resolve().TryInstruction();
+		// A read through a V# (s_buffer_load_dword: the light loops read their tables so): its base address words,
+		// its range (word 2, and word 1's stride) and its offset, an immediate the slot's address takes whole.
+		if (load != nullptr && load->GetOpcode() == ValueOpcode::ReadConstBuffer && load->NumArgs() == 2 &&
+		    load->Flags<MemoryFlags>().index < program.memory_info.size()) {
+			const auto& memory = program.memory_info[load->Flags<MemoryFlags>().index];
+			const auto* handle = load->Arg(0).Resolve().TryInstruction();
+			const auto  offset = load->Arg(1).Resolve();
+			if (memory.kind != ResourceKind::ScalarBuffer || handle == nullptr ||
+			    handle->GetOpcode() != ValueOpcode::GetBufferResource || handle->NumArgs() != 4 ||
+			    static_cast<int32_t>(memory.offset) < 0 ||
+			    !offset.IsImmediate() || offset.GetType() != Type::U32)
+				refuse("an SRT slot that is no scalar buffer load");
+			const auto low = TableOperand(handle->Arg(0), slot), high = TableOperand(handle->Arg(1), slot),
+			           records = TableOperand(handle->Arg(2), slot);
+			const auto bytes   = (uint64_t {static_cast<uint32_t>(memory.offset)} + offset.U32()) & ~uint64_t {3};
+			if (!low || !high || !records || bytes > INT32_MAX) refuse("an SRT slot address table mode cannot evaluate");
+			plan.slots.push_back({*low, *high, TablePlan::Operand {}, static_cast<int32_t>(bytes), *records, true});
+			continue;
+		}
 		if (load == nullptr || load->GetOpcode() != ValueOpcode::LoadAddressU32 || load->NumArgs() != 4 ||
 		    load->Flags<MemoryFlags>().index >= program.memory_info.size())
 			refuse("an SRT slot that is no address load");
@@ -313,7 +362,7 @@ void EnterTableMode(Program& program) {
 	for (size_t slot = plan.slots.size(); slot-- > 0;) {
 		if (plan.cpu[slot] == 0) continue;
 		const auto& read = plan.slots[slot];
-		for (const auto* operand: {&read.low, &read.high, &read.offset}) mark(plan.cpu, *operand);
+		for (const auto* operand: {&read.low, &read.high, &read.offset, &read.records}) mark(plan.cpu, *operand);
 	}
 	program.table_plan    = std::move(plan);
 	program.table_mode    = true;

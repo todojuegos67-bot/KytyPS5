@@ -114,12 +114,16 @@ struct State {
 	std::unique_ptr<PendingDraw>               pending; // completed in ExecutePreparedDraw
 };
 inline thread_local State g_state;
+// KYTY_XPR_CAPTURE is set (Initialize): Enabled() looks at the thread's state only then (the command processor asks at
+// every packet, and the state's thread-local access with its initialization check cost 0.25% of the render thread).
+inline bool g_configured = false;
 
 // Called once by the GPU thread before it consumes commands.
 inline void Initialize() {
 	auto& s = g_state;
 	if (const auto* count = std::getenv("KYTY_XPR_CAPTURE")) {
-		s.remaining = static_cast<uint32_t>(std::strtoul(count, nullptr, 10));
+		g_configured = true;
+		s.remaining  = static_cast<uint32_t>(std::strtoul(count, nullptr, 10));
 	}
 	if (const auto* stride = std::getenv("KYTY_XPR_CAPTURE_STRIDE")) {
 		s.stride = std::max<uint32_t>(static_cast<uint32_t>(std::strtoul(stride, nullptr, 10)), 1);
@@ -128,7 +132,7 @@ inline void Initialize() {
 }
 
 [[nodiscard]] inline bool Enabled() {
-	return g_state.remaining != 0;
+	return g_configured && g_state.remaining != 0;
 }
 
 // The three XPR culling compute programs (xprindexculling variants).

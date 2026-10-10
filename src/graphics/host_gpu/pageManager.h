@@ -59,6 +59,11 @@ public:
 	// after a submission, a label or a guest command of the GPU thread: it flushes before each of them.
 	static void DeferReadProtection(bool on) noexcept;
 	static void FlushDeferredProtection() noexcept;
+	// Moves with each flush of the calling thread's deferred read protections: on the GPU thread, before each point at
+	// which the guest can learn that work it submitted ran (above). Until then the guest writes no memory that work
+	// reads: guest memory the GPU thread's translation reads twice in one epoch was not changed by the guest in
+	// between, unless the guest raced its own GPU work.
+	[[nodiscard]] static uint64_t ObservationEpoch() noexcept;
 	// A write fault on a page no watcher holds: its host protection is not the trackers'. Gives
 	// the page the guest's own protection back (writable if the guest's is) and returns true;
 	// false when the page is watched. Checked and changed under the page's lock, so a watcher

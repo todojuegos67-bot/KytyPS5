@@ -55,6 +55,8 @@ public:
 	// CPU-dirty, the write protection kept (RegionManager::MarkCpuDirtyKeepProtection): for a write through the
 	// backing view. False, with nothing changed, when a page is GPU-dirty.
 	[[nodiscard]] bool MarkRegionAsCpuDirtyKeepProtection(uint64_t vaddr, uint64_t size);
+	// The emulator wrote CPU-dirty memory directly (RegionManager::NoteHostWrite): the regions' epochs move.
+	void               NoteHostWrite(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);

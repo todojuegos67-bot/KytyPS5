@@ -82,6 +82,9 @@ extern "C" {
 // native records (each traced and sorted). Without one, three boots each: 1% low walking 33.3 -> 37.7, p99 20.7 ->
 // 19.6 ms, the slowest frame 44 -> 40 ms; the slow frames' render-thread time 118 -> 86 ms, native stores 699 -> 214.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_store_budget {0};
+// 1: a table set's image uses proven once are checked again only when their image or the registrations over their
+// pages changed (TableValidateSet); 2: all of them checked, those a proof held for that failed counted.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_set_proofs {1};
 }
 // Keys that are XXH3 hashes already: their own bucket index (std::hash<uint64_t> is FNV-1a over the bytes on MSVC).
 struct HashedKey {
@@ -228,6 +231,9 @@ struct RenderExecutor::NativeXprDrawState {
 	// The resolution epoch NativeXprTargetsCurrent last found the targets current at (0: not yet): images are made and
 	// deleted (a slot reused) only with a registration change, which moves it.
 	mutable uint64_t                 targets_checked = 0;
+	// TextureCache::ImagesEpoch after the main executor's last table draw emitted the targets (UINT64_MAX: none): they
+	// stay in place while it does not move (RenderExecutor::TableDraw).
+	mutable uint64_t                 emitted_epoch = UINT64_MAX;
 };
 
 // One object: its resources under the compiled programs it was translated with.

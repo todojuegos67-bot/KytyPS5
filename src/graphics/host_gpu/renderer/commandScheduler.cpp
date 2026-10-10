@@ -198,8 +198,14 @@ void CommandScheduler::CompleteDispatch() {
 	// against how early the queue receives work. Dispatches inside a batch keep
 	// the same chain barriers at any size. (A recorder's buffers are submitted later, whole.)
 	if (t_recorder != nullptr) return;
-	const auto batch = kyty_local_dispatch_batch.load(std::memory_order_relaxed);
-	if (++m_recorded_dispatches < std::clamp(batch, 1u, 65536u)) {
+	const auto batch = std::clamp(kyty_local_dispatch_batch.load(std::memory_order_relaxed), 1u, 65536u);
+	if (++m_recorded_dispatches < batch) {
+		return;
+	}
+	// While the GPU still runs work handed to it the batch goes on (GpuBusy, asked at the batch's end and every 4
+	// dispatches after it), up to 8 batches.
+	if (m_recorded_dispatches < 8 * batch &&
+	    ((m_recorded_dispatches != batch && (m_recorded_dispatches & 3u) != 0) || GpuBusy())) {
 		return;
 	}
 	CheckActive();
@@ -221,6 +227,12 @@ void CommandScheduler::CompleteDraws(uint32_t draws) {
 	if (t_recorder != nullptr || batch == 0 || (m_recorded_draws += draws) < batch) {
 		return;
 	}
+	// As CompleteDispatch's: on while the GPU is busy (asked at the batch's end and about every 16 draws after it), up
+	// to 8 batches.
+	const bool end = m_recorded_draws - draws < batch;
+	if (m_recorded_draws < 8 * batch && ((!end && (m_recorded_draws & 15u) >= draws && draws < 16) || GpuBusy())) {
+		return;
+	}
 	CheckActive();
 	m_command.EndRendering();
 	VulkanMemoryBarrier dependency {};
@@ -230,6 +242,20 @@ void CommandScheduler::CompleteDraws(uint32_t draws) {
 	                                   vk::PipelineStageFlagBits::eAllCommands, {}, 1, &dependency,
 	                                   0, nullptr, 0, nullptr);
 	Flush();
+}
+
+// A batch boundary gives the GPU work early, where it would idle through the batch's translation; while it still runs
+// work it was handed, the boundary gives it nothing it lacks and costs a drain on the GPU (~8 us between back-to-back
+// command buffers) and a submission on the recording worker (~13 us, half of it in the kernel; at 1-1 standing 141
+// submissions a frame were ~1 ms of the GPU's and ~1.8 ms of the worker's, whose lag left the GPU idle ~1.35 ms a frame
+// with work already submitted). The batch then goes on until the GPU has run what it was handed. Same-process A/B, 3-4
+// rounds each: 1-1 standing 60.2 -> 62.4 fps, low1 52.8 -> 56.0 (a boot paced at 60: low1 54.2 -> 55.6); Latria spin
+// 74.2 -> 75.9, low1 53.9 -> 55.4; Shrine standing unchanged (75.3 / 75.3).
+bool CommandScheduler::GpuBusy() {
+	const auto handed = m_driver_tick.load(std::memory_order_acquire);
+	if (m_master.IsFree(handed)) return false;
+	m_master.Refresh();
+	return !m_master.IsFree(handed);
 }
 
 CommandScheduler::~CommandScheduler() {
@@ -534,6 +560,7 @@ struct DeferredSubmit {
 	uint64_t             tick;
 	uint64_t             upload_sequence; // KYTY_ASYNC_UPLOAD copies these buffers read
 	uint32_t             timestamp_slot;  // live trace (the last buffer the stream ends)
+	std::atomic<uint64_t>* driver_tick;   // CommandScheduler::m_driver_tick (GpuBusy)
 };
 void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
                   const vk::detail::DispatchLoaderDynamic& dispatch) {
@@ -578,6 +605,7 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 		if (result == VK_ERROR_DEVICE_LOST) DeviceFault::Report();
 		EXIT("deferred vkQueueSubmit failed: %d, tick=%" PRIu64 "\n", static_cast<int>(result), submit.tick);
 	}
+	submit.driver_tick->store(submit.tick, std::memory_order_release);
 	LocalVulkanRecording::NoteDeferredSubmitDone();
 }
 // A recorded buffer dropped before submission, in order with the commands replayed into it.
@@ -656,6 +684,7 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		submit.AddSignal(m_master.Handle(), deferred.tick);
 		deferred.count          = static_cast<uint32_t>(entries.size());
 		deferred.timestamp_slot = UINT32_MAX;
+		deferred.driver_tick    = &m_driver_tick;
 		for (size_t i = 0; i < entries.size(); ++i) {
 			deferred.commands[i] = entries[i].buffer;
 			deferred.ended[i]    = entries[i].ended;
@@ -718,6 +747,7 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
+		m_driver_tick.store(tick, std::memory_order_release);
 	}
 
 	if (result != vk::Result::eSuccess) {
