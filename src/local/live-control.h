@@ -166,6 +166,20 @@ inline void Flip() {
 				            second.frames, second.sum_ms / n, second.max_ms, second.sum_cpu / n, second.sum_idle / n,
 				            second.sum_waits[0] / n, second.sum_waits[1] / n, second.sum_waits[2] / n, second.sum_waits[3] / n,
 				            second.sum_waits[4] / n, second.missed, second.slow);
+				// The guest threads' tax that second: their write and read faults, protection re-arms and
+				// synchronous GPU reads (what the game's own thread spends outside its code).
+				using G = LiveCounters::Id;
+				static constexpr std::array guest {G::WindowFault, G::WriteFault, G::ReadFault, G::Reprotect, G::Unprotect,
+				                                   G::ProtectCalls, G::SyncReadsGuest, G::SyncDownloads, G::GuestCommands,
+				                                   G::BackingLockWaitUs, G::BackingWriteWaitUs, G::UploadWaitUs};
+				static std::array<uint64_t, guest.size()> last_guest {};
+				std::printf("[fps+]");
+				for (size_t i = 0; i < guest.size(); ++i) {
+					const auto value = LiveCounters::Value(guest[i]);
+					std::printf(" %s=%llu", LiveCounters::Names[guest[i]], static_cast<unsigned long long>(value - last_guest[i]));
+					last_guest[i] = value;
+				}
+				std::printf("\n");
 				std::fflush(stdout);
 				second       = {};
 				second.start = now;
