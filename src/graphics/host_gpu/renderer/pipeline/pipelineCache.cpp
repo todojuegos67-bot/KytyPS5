@@ -991,6 +991,12 @@ struct PipelineCache::ProgramCache {
 				            known_program ? "specialization" : "program");
 			}, SlowLog::HitchThreshold());
 			LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
+			// (The render thread's own waits: the slow frame lines' translate/pipeline counts.)
+			std::optional<LiveCounters::ScopedUs> translate_timed;
+			if (LiveCensus::g_render) {
+				LiveCounters::Add(LiveCounters::Translates);
+				translate_timed.emplace(LiveCounters::TranslateUs);
+			}
 			auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 			if (entry == programs.end()) {
@@ -2422,6 +2428,12 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		            static_cast<unsigned long long>(vs_id), static_cast<unsigned long long>(ps_id));
 	}, SlowLog::HitchThreshold());
 	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
+	// (The render thread's own waits: the slow frame lines' translate/pipeline counts.)
+	std::optional<LiveCounters::ScopedUs> graphics_timed;
+	if (LiveCensus::g_render) {
+		LiveCounters::Add(LiveCounters::GraphicsPipelines);
+		graphics_timed.emplace(LiveCounters::GraphicsPipelineUs);
+	}
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
@@ -2490,6 +2502,12 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 		            static_cast<unsigned long long>(compute_program.id));
 	}, SlowLog::HitchThreshold());
 	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
+	// (The render thread's own waits: the slow frame lines' translate/pipeline counts.)
+	std::optional<LiveCounters::ScopedUs> compute_timed;
+	if (LiveCensus::g_render) {
+		LiveCounters::Add(LiveCounters::ComputePipelines);
+		compute_timed.emplace(LiveCounters::ComputePipelineUs);
+	}
 	auto cached = std::make_unique<Pipeline>();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
 	                       FirstBuild(m_graphics));
