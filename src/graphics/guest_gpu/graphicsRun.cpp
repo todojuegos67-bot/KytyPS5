@@ -821,7 +821,12 @@ void GuestGpu::ThreadRun(void* data) {
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
 		{
+			const auto        lock_start = std::chrono::steady_clock::now();
 			Common::LockGuard lock(gpu->m_queue_mutex);
+			LiveCounters::Add(LiveCounters::QueueLockUs,
+			                  static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                            std::chrono::steady_clock::now() - lock_start)
+			                                            .count()));
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();

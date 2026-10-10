@@ -3459,6 +3459,10 @@ void TextureCache::RunGarbageCollector() {
 		            static_cast<unsigned long long>(m_trigger_gc_memory >> 20u),
 		            static_cast<unsigned long long>(private_bytes >> 20u), static_cast<unsigned long long>(working_set >> 20u),
 		            static_cast<unsigned long long>(m_graphics.GetHostMemoryUsage() >> 20u));
+		// Where the video memory goes (VMA's allocations by memory kind, the driver's own) and the buffer cache's
+		// share: on a 16 GB card the use climbed past the 10 GB budget while the texture collector deleted images.
+		std::printf("Buffer cache: %llu MiB registered\n", static_cast<unsigned long long>(m_buffer_cache.CacheBytes() >> 20u));
+		m_graphics.LogVideoMemory("30 s");
 		std::fflush(stdout);
 	}
 	// A GPU short of video memory: a log line on where it goes when its use moved by 256 MiB (checked every 60 flips).
