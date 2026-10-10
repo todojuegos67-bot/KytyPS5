@@ -682,11 +682,16 @@ void StartWorkingSetTrim() {
 		const char* text    = std::getenv("KYTY_TRIM_RAM_SECONDS");
 		const auto  seconds = text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul;
 		if (seconds == 0) return;
-		std::thread([seconds] {
+		// KYTY_TRIM_RAM_MB (default 8192): only a working set past it is emptied. Emptying it every minute
+		// regardless re-faulted the 4-5 GB the game touches in a minute each time (10-10, 1-1 to the boss).
+		const char* limit_text = std::getenv("KYTY_TRIM_RAM_MB");
+		const auto  limit      = (limit_text != nullptr ? std::strtoull(limit_text, nullptr, 10) : 8192ull) << 20u;
+		std::thread([seconds, limit] {
 			SetThreadDescription(GetCurrentThread(), L"Kyty.TrimRam");
 			for (uint32_t count = 0;; ++count) {
 				std::this_thread::sleep_for(std::chrono::seconds(seconds));
 				const auto before = ProcessMemory().working_set;
+				if (before <= limit) continue;
 				K32EmptyWorkingSet(GetCurrentProcess());
 				if (count < 8 || count % 16 == 0) {
 					std::printf("RAM trim: working set %llu -> %llu MiB\n", static_cast<unsigned long long>(before >> 20u),
