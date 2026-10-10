@@ -54,6 +54,7 @@ param(
 	[switch]$NoAsyncShaders,
 	[switch]$FlipWhenReady,
 	[string]$Affinity = '',
+	[switch]$AllCcds,
 	[switch]$Prompt,
 	[switch]$Follow,
 	[switch]$DryRun
@@ -238,6 +239,53 @@ $all = if ([Environment]::ProcessorCount -ge 64) { [int64]-1 } else { ([int64]1 
 $mask = [int64]0
 if ($Affinity) { $mask = [Convert]::ToInt64(($Affinity -replace '^0x'), 16) } else { foreach ($cpu in $launch.cpu_affinity) { $mask = $mask -bor ([int64]1 -shl [int]$cpu) } }
 $mask = $mask -band $all
+# A CPU of several L3 caches (AMD Ryzen 9 with two CCDs, Threadripper): with no -Affinity and no list in the
+# config, the whole emulator on one of them, the one with the largest L3 (the 3D V-Cache CCD of an X3D), else the
+# first. Its two busiest threads (the game's and the render thread) exchange data every frame; on two CCDs each
+# exchange crosses the Infinity Fabric, and the game ran on the CCD without the V-Cache. 9950X3D, Boletaria's
+# castle: render thread 15.2 -> 12.9 ms a frame, 52 -> 56-60 fps. -AllCcds keeps every CPU.
+if (!$Affinity -and $mask -eq 0 -and !$AllCcds) {
+	try {
+		Add-Type -Namespace Kyty -Name CacheCcds -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern bool GetLogicalProcessorInformationEx(int relation, IntPtr buffer, ref uint length);
+// The L3 caches of processor group 0: (mask, size in bytes) pairs.
+public static long[] L3() {
+	var result = new System.Collections.Generic.List<long>();
+	uint length = 0;
+	GetLogicalProcessorInformationEx(2, IntPtr.Zero, ref length);
+	if (length == 0) return result.ToArray();
+	IntPtr buffer = Marshal.AllocHGlobal((int)length);
+	try {
+		if (!GetLogicalProcessorInformationEx(2, buffer, ref length)) return result.ToArray();
+		for (int offset = 0; offset < length;) {
+			int size = Marshal.ReadInt32(buffer, offset + 4);
+			// CACHE_RELATIONSHIP: Level (byte) at 8, CacheSize (dword) at 12, GroupMask (KAFFINITY, group) at 40.
+			if (Marshal.ReadInt32(buffer, offset) == 2 && Marshal.ReadByte(buffer, offset + 8) == 3 &&
+			    Marshal.ReadInt16(buffer, offset + 48) == 0) {
+				result.Add(Marshal.ReadInt64(buffer, offset + 40));
+				result.Add(Marshal.ReadInt32(buffer, offset + 12) & 0xffffffffL);
+			}
+			offset += size;
+		}
+	} finally {
+		Marshal.FreeHGlobal(buffer);
+	}
+	return result.ToArray();
+}
+'@
+		$l3 = [Kyty.CacheCcds]::L3()
+		if ($l3.Count -ge 4) {
+			$best = 0
+			for ($i = 2; $i + 1 -lt $l3.Count; $i += 2) { if ($l3[$i + 1] -gt $l3[$best + 1]) { $best = $i } }
+			$ccd = $l3[$best] -band $all
+			if ($ccd -ne 0) {
+				$mask = $ccd
+				Write-Host ("CPU:      {0} L3 caches; the emulator on the one of {1} MiB (CPUs 0x{2:X})" -f ($l3.Count / 2), ($l3[$best + 1] / 1MB), $ccd)
+			}
+		}
+	} catch {}
+}
 if ($mask -eq 0) { $mask = $all }
 $cpus = 0
 for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { $cpus++ } }
