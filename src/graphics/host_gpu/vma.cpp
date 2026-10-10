@@ -308,7 +308,7 @@ uint64_t GraphicContext::GetTotalMemoryBudget(bool capped) const {
 			return text != nullptr ? std::strtoull(text, nullptr, 10) << 20u : uint64_t {0};
 		}();
 		if (forced != 0) return std::min(result, forced);
-		// The caches collect from the GPU's memory less 3 GB, at most 10 GB: 9 GB on a 12 GB card, 10 GB on a 16 GB
+		// The caches collect from the GPU's memory less 3 GB, at most 8 GB: 8 GB on a 12 GB card and up
 		// one, so the whole process (pipelines and the driver's own allocations on top) stays near 11-12 GB with
 		// room for Windows, the desktop and a browser. (13.4 GB on a 16 GB card: 13.3 GB in use after 8 minutes,
 		// near 15 GB with the rest of the system.) small_video_memory reads the driver's budget, not this cap.
