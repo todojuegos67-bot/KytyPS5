@@ -1,3 +1,4 @@
+#include "live-counters.h"
 #include "graphics/host_gpu/renderer/sync.h"
 
 #include "common/assert.h"
@@ -195,7 +196,10 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 			     "\n",
 			     result, handle, index, flip_mode, flip_arg);
 		}
-		video_out.WaitForSubmitSlot();
+		{
+			LiveCounters::ScopedUs slot_wait(LiveCounters::FlipSlotWaitUs);
+			video_out.WaitForSubmitSlot();
+		}
 	}
 }
 

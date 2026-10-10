@@ -94,7 +94,7 @@ inline void Flip() {
 		                                     C::ReadbackParts, C::ReadbackRegions, C::GuestCommands, C::TextureUnmaps, C::AsyncPipelines,
 		                                     C::ImageInitUs, C::BufferSyncUs, C::DrawUs, C::TextureUnmapUs, C::BackingReadUs, C::RegionSyncUs, C::AsyncDrawWaitUs, C::AsyncDrawSkips, C::QueueLockUs,
 		                                     C::TranslateUs, C::Translates, C::ComputePipelineUs, C::ComputePipelines,
-		                                     C::GraphicsPipelineUs, C::GraphicsPipelines};
+		                                     C::GraphicsPipelineUs, C::GraphicsPipelines, C::FlipSlotWaitUs};
 		static constexpr const char* waits[] = {"gpu_wait", "readback_wait", "download_wait", "compile"};
 		static std::chrono::steady_clock::time_point     last {};
 		static uint64_t                                  last_tsc = 0;

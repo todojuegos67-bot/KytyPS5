@@ -1358,6 +1358,11 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	}
 
 	Common::LockGuard lock(ctx->mutex);
+	// (In the run log: the game's own flip rate caps it at 30 or 20 fps.)
+	if (ctx->flip_rate != rate) {
+		std::printf("Video out: the game set flip rate %d (%s)\n", rate, rate == 0 ? "every vblank" : rate == 1 ? "30 fps" : "20 fps");
+		std::fflush(stdout);
+	}
 	ctx->flip_rate = rate;
 
 	return OK;
