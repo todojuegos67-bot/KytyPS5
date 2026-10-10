@@ -97,6 +97,8 @@ private:
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_used              = false;
 	bool                      m_gpu_flip_pending      = false;
+	GraphicContext&           m_graphics;
+	uint64_t                  m_collections           = 0; // RunCollectors calls (one a flip)
 };
 
 } // namespace Libs::Graphics

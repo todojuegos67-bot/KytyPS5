@@ -28,7 +28,7 @@ namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_scheduler(scheduler), m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache, this),
-      m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache) {}
+      m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache), m_graphics(graphics) {}
 
 GpuResourceManager::~GpuResourceManager() = default;
 
@@ -405,7 +405,13 @@ void GpuResourceManager::RunCollectors() {
 	// A shader that reads guest memory through the BDA page table touches no buffer in the LRU: a
 	// buffer collected under it faults back at once, and each registration invalidates every BDA
 	// region proof. Buffers are collected only after a frame without such shaders.
-	m_buffer_cache.RunGarbageCollector(!std::exchange(m_bda_used, false));
+	// Demon's Souls runs such shaders every frame, so its buffers were never collected: the buffer cache grew from 0.5 to
+	// 4.2 GB in 17 minutes of 01.005.000 and took the video memory to 12.8 GB of a 10 GB budget. Past the budget they
+	// are collected once a second anyway (the faults and BDA proofs that costs, once a second, instead of a full card).
+	const bool bda_free    = !std::exchange(m_bda_used, false);
+	const bool over_budget = m_graphics.CanReportMemoryUsage() &&
+	                         m_graphics.GetDeviceMemoryUsage() >= m_graphics.GetTotalMemoryBudget();
+	m_buffer_cache.RunGarbageCollector(bda_free || (over_budget && (++m_collections % 60) == 0));
 }
 
 } // namespace Libs::Graphics
