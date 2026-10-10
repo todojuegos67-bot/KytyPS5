@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include <ctime>
 #include <functional>
 #include <string>
@@ -128,6 +129,48 @@ inline void Flip() {
 		const auto                                       now = std::chrono::steady_clock::now();
 		const uint64_t                                   tsc = __rdtsc();
 		const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+		// KYTY_FPS_LOG=1: a line every second with the frames of that second (count, mean and longest), the render
+		// thread's mean run time, idle and waits per frame, and how many frames passed 17 ms (missed 60 fps): what a
+		// frame rate that fluctuates under 60 is made of, below the SLOW Frame threshold.
+		static const bool fps_log = [] {
+			const char* text = std::getenv("KYTY_FPS_LOG");
+			return text != nullptr && *text != '\0' && std::string_view(text) != "0";
+		}();
+		if (fps_log && last != std::chrono::steady_clock::time_point {}) {
+			struct Second {
+				std::chrono::steady_clock::time_point start {};
+				uint32_t frames = 0, missed = 0, slow = 0;
+				double   sum_ms = 0, max_ms = 0, sum_cpu = 0, sum_idle = 0;
+				std::array<double, LiveCensus::Waits> sum_waits {};
+			};
+			static Second second;
+			if (second.start == std::chrono::steady_clock::time_point {}) second.start = now;
+			const double since_first = std::chrono::duration<double, std::milli>(now - first_time).count();
+			const double cpu_ms      = cycles != 0 && last_cycles != 0 && since_first > 1000.0
+			                               ? static_cast<double>(cycles - last_cycles) * since_first /
+			                                     static_cast<double>(__rdtsc() - first_tsc)
+			                               : 0.0;
+			second.frames++;
+			second.sum_ms += ms;
+			second.max_ms = std::max(second.max_ms, ms);
+			second.sum_cpu += cpu_ms;
+			second.sum_idle += static_cast<double>(g_render_idle_ns - last_idle) / 1e6;
+			for (size_t i = 0; i < LiveCensus::Waits; ++i)
+				second.sum_waits[i] += static_cast<double>(LiveCensus::g_waits_ns[i] - last_waits[i]) / 1e6;
+			if (ms > 17.0) second.missed++;
+			if (ms > 25.0) second.slow++;
+			if (now - second.start >= std::chrono::seconds(1)) {
+				const double n = static_cast<double>(second.frames);
+				std::printf("[fps] %u frames: mean %.1f ms, max %.1f, cpu %.1f, idle %.1f, gpu_wait %.2f, readback %.2f, download %.2f, "
+				            "compile %.2f, record %.2f; over 17 ms: %u, over 25 ms: %u\n",
+				            second.frames, second.sum_ms / n, second.max_ms, second.sum_cpu / n, second.sum_idle / n,
+				            second.sum_waits[0] / n, second.sum_waits[1] / n, second.sum_waits[2] / n, second.sum_waits[3] / n,
+				            second.sum_waits[4] / n, second.missed, second.slow);
+				std::fflush(stdout);
+				second       = {};
+				second.start = now;
+			}
+		}
 		if (last != std::chrono::steady_clock::time_point {} && ms >= std::max(20.0, SlowLog::HitchThreshold())) {
 			std::printf("[tsc %llu] SLOW Frame %.1f ms idle=%.1f", static_cast<unsigned long long>(tsc), ms,
 			            static_cast<double>(g_render_idle_ns - last_idle) / 1e6);
