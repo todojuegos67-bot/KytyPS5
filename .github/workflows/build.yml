@@ -85,6 +85,9 @@ jobs:
           Copy-Item LICENSES $out -Recurse
           Copy-Item run-windows.json "$out\launch.json"
           Copy-Item docs\PORTABLE-README.md "$out\README.md"
+          # The linker map of this exact build: render-thread profiles (live `prof`) are symbolized against it.
+          Get-ChildItem "$build\kyty_emulator_*.map" -ErrorAction SilentlyContinue | Select-Object -First 1 |
+            ForEach-Object { Copy-Item $_.FullName "$out\kyty_emulator.map" }
           # The render-pass states the precompile program makes the seed file with: the first launch lists the
           # game's shaders from its files (kyty_shader_precompile --make-seeds; a release cannot hold that list: it
           # contains the game's shader code). The Python tools that made it before are not needed. With them, each
