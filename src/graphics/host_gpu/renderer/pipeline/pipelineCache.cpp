@@ -1337,7 +1337,14 @@ PipelineCache::CompileWorkers& PipelineCache::Workers() {
 	if (m_compile_workers == nullptr) {
 		// The native XPR variants a new area brings (hundreds, ~100 ms each in no cache, unoptimized or not): two
 		// threads queued them for seconds (their draws on the normal path meanwhile). Background threads.
-		m_compile_workers = std::make_unique<CompileWorkers>(std::max(2u, std::thread::hardware_concurrency() / 4u), true);
+		// Half the CPUs on a CPU of 24 threads or more (a quarter before): Boletaria brought ~850 variants of ~145 ms
+		// in 10 minutes on a 32-thread CPU, 173 native stores a slow frame waiting for them, while the background
+		// threads left most of the CPU idle. KYTY_COMPILE_WORKERS=<n> sets the count.
+		const uint32_t cpus  = std::max(1u, std::thread::hardware_concurrency());
+		uint32_t       count = std::max(2u, cpus >= 24 ? cpus / 2u : cpus / 4u);
+		if (const char* value = std::getenv("KYTY_COMPILE_WORKERS"); value != nullptr && *value != '\0')
+			count = static_cast<uint32_t>(std::clamp(std::atoi(value), 1, 64));
+		m_compile_workers = std::make_unique<CompileWorkers>(count, true);
 	}
 	return *m_compile_workers;
 }
