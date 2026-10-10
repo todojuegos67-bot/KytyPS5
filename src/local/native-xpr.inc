@@ -40,6 +40,11 @@ extern "C" {
 // Negative controls for the offline replay only: bit 0 zeroes the vertex
 // stage's flattened SRT in the upload, bit 1 skips the draw call.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_debug {0};
+// Diagnosis of a glitch that native XPR causes even in verification (KYTY_NATIVE_XPR_DIAG): bit 0 stores no
+// record (the normal path draws everything, nothing is logged or bound for a record), bit 1 leaves CPU-dirty SRT
+// buffers to the upload ring when a record is stored (no EnsureBufferContents/ObtainBuffer cleaning of their owner),
+// bit 2 validates no record (a found record takes the normal path before NativeXprValidate).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_diag {0};
 // 1: objects are drawn in last frame's order, so the record that followed this
 // one last frame is prefetched while this draw runs.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_predict_mode {0};
@@ -801,6 +806,7 @@ RenderExecutor::NativeXprCache& RenderExecutor::NativeXprState() {
 }
 
 void RenderExecutor::NativeXprRequestStore() {
+	if ((kyty_local_native_xpr_diag.load(std::memory_order_relaxed) & 1u) != 0) return;
 	m_native_xpr_store = true;
 }
 
@@ -1113,7 +1119,8 @@ const char* RenderExecutor::NativeXprBindResources(NativeXprRecord& record,
 				// Served by the upload ring or pending CPU changes: not a fixed descriptor.
 				const auto* owner = source.id ? buffers.GetBufferIfLive(source.id) : nullptr;
 				bool        cpu   = buffers.IsRegionCpuModified(source.address, source.size);
-				if (owner != nullptr && cpu && !buffers.IsRegionGpuModified(source.address, source.size)) {
+				if (owner != nullptr && cpu && (kyty_local_native_xpr_diag.load(std::memory_order_relaxed) & 2u) == 0 &&
+				    !buffers.IsRegionGpuModified(source.address, source.size)) {
 					// The normal path streams small ranges of CPU-dirty pages through the
 					// upload ring on every draw and never cleans the owner. Clean it once:
 					// a later CPU write faults and the record's proof notices.
@@ -3176,6 +3183,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	// Store requests within the frame's budget (kyty_local_native_xpr_store_budget); the others ask again
 	// in a later frame.
 	const auto request_store = [&] {
+		if ((kyty_local_native_xpr_diag.load(std::memory_order_relaxed) & 1u) != 0) return;
 		if (const auto budget = kyty_local_native_xpr_store_budget.load(std::memory_order_relaxed); budget != 0) {
 			if (cache.store_frame != m_context.FrameNumber()) {
 				cache.store_frame    = m_context.FrameNumber();
@@ -3442,6 +3450,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	const auto frame = m_context.FrameNumber();
 	// Every use reads the SRT words again: the guest may rewrite constants between
 	// two draws of one frame (the normal path reads them at each draw).
+	if ((kyty_local_native_xpr_diag.load(std::memory_order_relaxed) & 4u) != 0) return false;
 	if (!NativeXprValidate(record, frame)) return drop();
 	if (kyty_local_native_xpr_mode.load(std::memory_order_relaxed) == 2) {
 		m_native_xpr_verify = {&record, &draw_state};
