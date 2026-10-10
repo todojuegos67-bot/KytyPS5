@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <string>
+#include <chrono>
 #include <thread>
 #else
 #include <cstdio>
@@ -675,6 +676,28 @@ MemoryUse ProcessMemory() {
 	return {counters.PrivateUsage, counters.WorkingSetSize};
 }
 
+void StartWorkingSetTrim() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		const char* text    = std::getenv("KYTY_TRIM_RAM_SECONDS");
+		const auto  seconds = text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul;
+		if (seconds == 0) return;
+		std::thread([seconds] {
+			SetThreadDescription(GetCurrentThread(), L"Kyty.TrimRam");
+			for (uint32_t count = 0;; ++count) {
+				std::this_thread::sleep_for(std::chrono::seconds(seconds));
+				const auto before = ProcessMemory().working_set;
+				K32EmptyWorkingSet(GetCurrentProcess());
+				if (count < 8 || count % 16 == 0) {
+					std::printf("RAM trim: working set %llu -> %llu MiB\n", static_cast<unsigned long long>(before >> 20u),
+					            static_cast<unsigned long long>(ProcessMemory().working_set >> 20u));
+					std::fflush(stdout);
+				}
+			}
+		}).detach();
+	});
+}
+
 uint64_t PhysicalMemory() {
 	if (const char* simulate = std::getenv("KYTY_SIMULATE_RAM_MB"); simulate != nullptr && *simulate != '\0')
 		return std::strtoull(simulate, nullptr, 10) << 20u;
@@ -909,6 +932,8 @@ MemoryUse ProcessMemory() {
 	}
 	return use;
 }
+
+void StartWorkingSetTrim() {}
 
 uint64_t PhysicalMemory() {
 	if (const char* simulate = std::getenv("KYTY_SIMULATE_RAM_MB"); simulate != nullptr && *simulate != '\0')

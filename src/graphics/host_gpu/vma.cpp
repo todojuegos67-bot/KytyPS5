@@ -137,6 +137,7 @@ bool GraphicContext::CreateAllocator() {
 	}
 	// (The GPU's own budget, not the caches' cap: a 16 GB card is not short of video memory.)
 	small_video_memory = GetTotalMemoryBudget(false) < (uint64_t {12} << 30u);
+	LocalPlatform::StartWorkingSetTrim();
 	LogVideoMemory("start");
 	g_report_allocator          = allocator;
 	g_report_context            = this;
@@ -312,7 +313,8 @@ uint64_t GraphicContext::GetTotalMemoryBudget(bool capped) const {
 		// room for Windows, the desktop and a browser. (13.4 GB on a 16 GB card: 13.3 GB in use after 8 minutes,
 		// near 15 GB with the rest of the system.) small_video_memory reads the driver's budget, not this cap.
 		constexpr uint64_t GiB = 1024ull * 1024 * 1024;
-		if (local > 4 * GiB) result = std::min(result, std::min(local - 3 * GiB, 10 * GiB));
+		// 8 GB at most: a 16 GB card with the desktop, an overlay and a browser stayed near 15 GB in use at 10 GB.
+		if (local > 4 * GiB) result = std::min(result, std::min(local - 3 * GiB, 8 * GiB));
 		return result;
 	}
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
