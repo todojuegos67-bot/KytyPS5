@@ -79,6 +79,10 @@ struct MemoryUse {
 };
 MemoryUse ProcessMemory();
 uint64_t  PhysicalMemory();
+// KYTY_TRIM_RAM_SECONDS=<n>: every n seconds the process's working set is emptied (Windows: the pages go to the
+// standby list or the page file and come back on use), so the RAM in use is what the game touches in n seconds.
+// Started once; nothing where unset, 0 or on other systems.
+void      StartWorkingSetTrim();
 
 // Windows' own figures for this process's video memory on the GPU with this LUID (Vulkan's deviceLUID, 8 bytes): in
 // use (what Task Manager shows as its dedicated GPU memory) and the budget Windows gives the process (DXGI). NVIDIA's

@@ -134,7 +134,10 @@ bool GraphicContext::CreateAllocator() {
 		physical_device.getProperties2(&device_properties);
 		if (id.deviceLUIDValid) (void)LocalPlatform::OpenVideoMemoryAdapter(id.deviceLUID.data());
 	}
-	small_video_memory = GetTotalMemoryBudget() < (uint64_t {12} << 30u);
+	// What the card can hold, not the cap: a card that holds the working set keeps its textures in video memory and
+	// its pipeline warmup under a lower cap (the caches just collect sooner).
+	small_video_memory = GetTotalMemoryBudget(false) < (uint64_t {12} << 30u);
+	LocalPlatform::StartWorkingSetTrim();
 	LogVideoMemory("start");
 	g_report_allocator          = allocator;
 	g_report_context            = this;
@@ -239,7 +242,7 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	return usage - std::min(usage, simulation_ballast_bytes);
 }
 
-uint64_t GraphicContext::GetTotalMemoryBudget() const {
+uint64_t GraphicContext::GetTotalMemoryBudget(bool capped) const {
 	if (allocator == nullptr) {
 		return 0;
 	}
@@ -266,7 +269,14 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	usage -= std::min(usage, simulation_ballast_bytes);
 	local -= std::min(local, simulation_ballast_bytes);
 	if (discrete) {
-		return budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
+		const uint64_t result = budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
+		// KYTY_VRAM_BUDGET_MB=<n>: the caches collect past n MiB of video memory in use (the process's whole use as the
+		// driver counts it), so the emulator stays near n MiB whatever the card holds. 0 or unset: the driver's budget.
+		static const uint64_t forced = [] {
+			const char* text = std::getenv("KYTY_VRAM_BUDGET_MB");
+			return text != nullptr ? std::strtoull(text, nullptr, 10) << 20u : uint64_t {0};
+		}();
+		return capped && forced != 0 ? std::min(result, forced) : result;
 	}
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
 	const auto         available      = budget > usage ? budget - usage : uint64_t {0};
