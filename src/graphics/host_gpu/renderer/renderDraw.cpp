@@ -1547,8 +1547,25 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Full-screen passes (a triangle or a quad: fog, lighting, post effects) keep the blocking compile:
 	// skipping one leaves its render target stale for later passes (visible glitches), and they are
 	// few pipelines. Geometry (many pipelines, the stutters) goes to the worker.
-	const bool full_screen_pass = emit.gpu_args == 0 && emit.direct_run.empty() && draw.index_count <= 6 &&
-	                              draw.instance_count <= 1 && AsyncDrawSyncSmall();
+	// KYTY_ASYNC_DRAW_SYNC_SMALL=0: a full-screen pass goes to the worker too when every target it writes was
+	// written by the GPU before (skipping it then holds the target's last contents, a frame or so of ghosting, not
+	// garbage): its pipelines compiled 100-800 ms each on the render thread, unoptimized, at a new effect's first
+	// use (1-1 to the boss, 10-10). A pass onto a target never written keeps the blocking compile.
+	const bool full_screen = emit.gpu_args == 0 && emit.direct_run.empty() && draw.index_count <= 6 &&
+	                         draw.instance_count <= 1;
+	const auto targets_written = [&] {
+		auto& textures = m_context.GetTextureCache();
+		for (uint32_t i = 0; i < state.color_count; ++i) {
+			const auto* image = state.color_info[i].image_id ? textures.m_slot_images.try_get(state.color_info[i].image_id) : nullptr;
+			if (image == nullptr || !image->IsGpuModified()) return false;
+		}
+		if (state.depth_info.image_id) {
+			const auto* image = textures.m_slot_images.try_get(state.depth_info.image_id);
+			if (image == nullptr || !image->IsGpuModified()) return false;
+		}
+		return true;
+	};
+	const bool full_screen_pass = full_screen && (AsyncDrawSyncSmall() || !targets_written());
 	if (AsyncDrawPipelines() && !full_screen_pass) {
 		auto& cache    = m_context.GetPipelineCache();
 		const auto try_create = [&] {
