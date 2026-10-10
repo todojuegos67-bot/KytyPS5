@@ -4,6 +4,7 @@
 #include "native-buffer-residency.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "local-platform.h"
 #include "live-trace.h"
 #include "native-resource-state.h"
 #include "async-upload.h"
@@ -1220,6 +1221,14 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 
 static BufferCache* g_sync_cache = nullptr;
 
+// The image upload ring: 1 GiB on a PC with 32 GB of RAM or more (512 MiB before). A frame where the game streams
+// in an area uploads 0.8-1.4 GB of textures; past the ring's size the render thread waited for the GPU to finish
+// the first copies before it could reuse the ring (60-80 ms of gpu_wait in those frames, Boletaria).
+static uint64_t StagingRingSize() {
+	const uint64_t     ram = LocalPlatform::PhysicalMemory();
+	return ram >= (uint64_t {32} << 30u) ? 1024 * MiB : 512 * MiB;
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache,
                          GpuResourceManager* resources)
@@ -1229,7 +1238,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB,
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, StagingRingSize(),
                        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_host_shader_upload(graphics, scheduler, MemoryUsage::Upload, 64 * MiB),
