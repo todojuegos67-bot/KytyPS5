@@ -809,8 +809,23 @@ public:
 				return AVPLAYER_ERROR_OPERATION_FAILED;
 			}
 			if (!OpenCodecs()) {
+				std::printf("AvPlayer: codecs failed to open (video stream %d, audio stream %d)\n",
+				            video_id ? *video_id : -1, audio_id ? *audio_id : -1);
 				ResetNoLock(true);
 				return AVPLAYER_ERROR_OPERATION_FAILED;
+			}
+			// (In the run log: a movie whose audio stream was refused plays silent.)
+			if (fmt != nullptr) {
+				std::string streams;
+				for (uint32_t i = 0; i < fmt->nb_streams; i++) {
+					const auto* par = fmt->streams[i]->codecpar;
+					char item[64];
+					const bool used = (video_id && *video_id == static_cast<int>(i)) || (audio_id && *audio_id == static_cast<int>(i));
+					std::snprintf(item, sizeof(item), " %u:%s%s", i, avcodec_get_name(par->codec_id), used ? "*" : "");
+					streams += item;
+				}
+				std::printf("AvPlayer: opened source type %u, streams%s (* = used)\n", static_cast<uint32_t>(source_type),
+				            streams.c_str());
 			}
 			if (!AllocateBuffers()) {
 				ResetNoLock(true);
@@ -1075,11 +1090,14 @@ private:
 			return true;
 		}
 		if (!codec_is_supported_for_source(source_type, t, s->codecpar->codec_id)) {
+			std::printf("AvPlayer: stream %d (%s) refused for source type %u\n", id, avcodec_get_name(s->codecpar->codec_id),
+			            static_cast<uint32_t>(source_type));
 			LOGF("\t unsupported codec for source type: stream=%d codec=%d source=%u\n", id,
 			     static_cast<int>(s->codecpar->codec_id), static_cast<uint32_t>(source_type));
 			return false;
 		}
 		if (avcodec_find_decoder(s->codecpar->codec_id) == nullptr) {
+			std::printf("AvPlayer: no decoder for stream %d (%s)\n", id, avcodec_get_name(s->codecpar->codec_id));
 			LOGF("\t decoder not found: stream=%d codec=%d\n", id,
 			     static_cast<int>(s->codecpar->codec_id));
 			return false;

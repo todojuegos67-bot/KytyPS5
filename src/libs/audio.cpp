@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -729,6 +730,9 @@ int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, u
 	EXIT_IF(g_audio == nullptr);
 
 	auto id = g_audio->AudioOutOpen(type, len, freq, format);
+	// (In the run log: the game's output ports.)
+	std::printf("AudioOut port: type %d, %u samples, %u Hz, %s -> %s\n", type, len, freq, Common::EnumName(format).c_str(),
+	            id.IsValid() ? "opened" : "refused (port full)");
 
 	if (!id.IsValid()) {
 		return AUDIO_OUT_ERROR_PORT_FULL;
@@ -1913,6 +1917,7 @@ int KYTY_SYSV_ABI Ngs2SystemQueryBufferSize(const Ngs2SystemOption* option,
 int KYTY_SYSV_ABI Ngs2SystemCreate(const Ngs2SystemOption*      option,
                                    const Ngs2ContextBufferInfo* buffer_info, uintptr_t* handle) {
 	PRINT_NAME();
+	std::printf("NGS2: system created (the emulator's NGS2 mixes nothing: voices through it stay silent)\n");
 
 	EXIT_NOT_IMPLEMENTED(buffer_info == nullptr);
 	EXIT_NOT_IMPLEMENTED(handle == nullptr);

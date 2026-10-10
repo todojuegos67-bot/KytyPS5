@@ -568,6 +568,20 @@ static bool AjmCodecIsValid(uint32_t codec) {
 	}
 }
 
+// In the run log: the first decode jobs that failed (a stream the game then drops: missing voice lines), and a count.
+static void AjmLogDecodeResult(const char* job, uint32_t instance, const AjmDecodeResult& result, size_t in,
+                               size_t out) {
+	constexpr uint32_t failures = static_cast<uint32_t>(AJM_RESULT_CODEC_ERROR) | static_cast<uint32_t>(AJM_RESULT_FATAL) |
+	                              static_cast<uint32_t>(AJM_RESULT_INVALID_DATA) | static_cast<uint32_t>(AJM_RESULT_NOT_INITIALIZED) |
+	                              static_cast<uint32_t>(AJM_RESULT_INVALID_PARAMETER);
+	if ((static_cast<uint32_t>(result.result) & failures) == 0) return;
+	static std::atomic<uint32_t> count {0};
+	const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n <= 32 || (n & (n - 1)) == 0)
+		std::printf("AJM %s failed #%u: instance 0x%08" PRIx32 " (codec %u) result 0x%08x, in %zu, out %zu\n", job, n,
+		            instance, instance >> 14u, static_cast<unsigned>(result.result), in, out);
+}
+
 static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, size_t input_size,
                                          void* output, size_t output_size, bool multiple_frames) {
 	std::scoped_lock lock(g_ajm_instances_mutex);
@@ -810,6 +824,11 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 		g_ajm_instances[*instance] = std::move(state);
 	}
 
+	// (In the run log, the first instances: which codecs the game decodes with, and how many channels.)
+	static std::atomic<uint32_t> logged_instances {0};
+	if (logged_instances.fetch_add(1, std::memory_order_relaxed) < 32)
+		std::printf("AJM instance 0x%08" PRIx32 ": codec %" PRIu32 " (%s), flags 0x%016" PRIx64 ", %u channels%s\n", *instance, codec,
+		            AjmCodecName(codec), flags, AjmGetFlagChannelCount(flags), state.decoder ? "" : ", no decoder");
 	LOGF("\t context  = %" PRIu32 "\n"
 	     "\t codec    = %" PRIu32 "\n"
 	     "\t flags    = 0x%016" PRIx64 "\n"
@@ -1166,6 +1185,7 @@ int KYTY_SYSV_ABI AjmBatchJobRun(AjmBatchInfo* info, uint32_t instance, uint64_t
 	auto decode_result =
 	    AjmDecodeInstance(instance, data_input, data_input_size, data_output, data_output_size,
 	                      (flags & AJM_FLAG_RUN_MULTIPLE_FRAMES) != 0);
+	AjmLogDecodeResult("run", instance, decode_result, data_input_size, data_output_size);
 	AjmDecoder*      decoder = nullptr;
 	AjmGaplessState* gapless = nullptr;
 	(void)AjmGetInstanceFormat(instance, nullptr, &decoder, &gapless);
@@ -1190,6 +1210,7 @@ int KYTY_SYSV_ABI AjmBatchJobRunSplit(AjmBatchInfo* info, uint32_t instance, uin
 	auto decode_result =
 	    AjmDecodeSplitInstance(instance, input_buffers, input_buffers_num, output_buffers,
 	                           output_buffers_num, (flags & AJM_FLAG_RUN_MULTIPLE_FRAMES) != 0);
+	AjmLogDecodeResult("run-split", instance, decode_result, input_buffers_num, output_buffers_num);
 	AjmDecoder*      decoder = nullptr;
 	AjmGaplessState* gapless = nullptr;
 	(void)AjmGetInstanceFormat(instance, nullptr, &decoder, &gapless);
