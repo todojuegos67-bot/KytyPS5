@@ -100,6 +100,7 @@ public:
 
 	Id       AudioInOpen(uint32_t type, uint32_t samples_num, uint32_t freq, Format format);
 	bool     AudioInValid(Id handle);
+	bool     AudioInClose(Id handle);
 	uint32_t AudioInInput(Id handle, void* dest);
 
 	static constexpr int OUT_PORTS_MAX = 32;
@@ -905,7 +906,9 @@ Audio::Id Audio::AudioInOpen(uint32_t type, uint32_t samples_num, uint32_t freq,
 
 			switch (format) {
 				case Format::Signed16bitMono:
-				case Format::Signed16bitStereo: break;
+				case Format::Signed16bitStereo:
+				case Format::FloatMono:   // AudioInHqOpen only
+				case Format::FloatStereo: break;
 				default: EXIT("unknown format");
 			}
 
@@ -921,6 +924,16 @@ bool Audio::AudioInValid(Id handle) {
 
 	return (handle.GetId() >= 0 && handle.GetId() < IN_PORTS_MAX &&
 	        m_in_ports[handle.GetId()].used);
+}
+
+bool Audio::AudioInClose(Id handle) {
+	Common::LockGuard lock(m_mutex);
+
+	if (handle.GetId() < 0 || handle.GetId() >= IN_PORTS_MAX || !m_in_ports[handle.GetId()].used) {
+		return false;
+	}
+	m_in_ports[handle.GetId()] = PortIn();
+	return true;
 }
 
 uint32_t Audio::AudioInInput(Id handle, void* dest) {
@@ -1172,6 +1185,65 @@ int KYTY_SYSV_ABI AudioInOpen(int user_id, uint32_t type, uint32_t index, uint32
 	return id.ToInt();
 }
 
+// High-quality (asynchronous) input port: the fork's OpenPort validation for the HQ variant
+// (48 kHz, 128 samples, 16-bit or float). Input itself is simulated as for AudioInOpen.
+int KYTY_SYSV_ABI AudioInHqOpen(int user_id, int type, int index, uint32_t len, uint32_t freq,
+                                uint32_t param) {
+	PRINT_NAME();
+
+	LOGF("\t user_id = %d\n"
+	     "\t type    = %d\n"
+	     "\t index   = %d\n"
+	     "\t len     = %u\n"
+	     "\t freq    = %u\n",
+	     user_id, type, index, len, freq);
+
+	if (type != 0 && type != 1) {
+		return AUDIO_IN_ERROR_INVALID_TYPE;
+	}
+	if (index != 0) {
+		return AUDIO_IN_ERROR_INVALID_PARAM;
+	}
+	if (len != 128) {
+		return AUDIO_IN_ERROR_INVALID_SIZE;
+	}
+	if (freq != 48000) {
+		return AUDIO_IN_ERROR_INVALID_FREQ;
+	}
+
+	Audio::Format format = Audio::Format::Unknown;
+
+	switch (param) {
+		case 1: format = Audio::Format::Signed16bitMono; break;
+		case 2: format = Audio::Format::Signed16bitStereo; break;
+		case 0x10:
+		case 0x11: format = Audio::Format::FloatMono; break;
+		case 0x12: format = Audio::Format::FloatStereo; break;
+		default: return AUDIO_IN_ERROR_INVALID_PARAM;
+	}
+
+	LOGF("\t param   = %u (%s)\n", param, Common::EnumName(format).c_str());
+
+	EXIT_IF(g_audio == nullptr);
+
+	auto id = g_audio->AudioInOpen(static_cast<uint32_t>(type), len, freq, format);
+
+	if (!id.IsValid()) {
+		return AUDIO_IN_ERROR_PORT_FULL;
+	}
+
+	return id.ToInt();
+}
+
+int KYTY_SYSV_ABI AudioInClose(int handle) {
+	PRINT_NAME();
+	EXIT_IF(g_audio == nullptr);
+	if (handle <= 0) {
+		return AUDIO_IN_ERROR_INVALID_HANDLE;
+	}
+	return g_audio->AudioInClose(Audio::Id(handle)) ? OK : AUDIO_IN_ERROR_INVALID_HANDLE;
+}
+
 int KYTY_SYSV_ABI AudioInInput(int handle, void* dest) {
 	PRINT_NAME();
 
@@ -1301,6 +1373,15 @@ int KYTY_SYSV_ABI AcmBatchWait(AcmContextId context, AcmBatchId batch, uint32_t 
 int KYTY_SYSV_ABI AcmBatchJobNotification(AcmBatchInfo* batch_info) {
 	PRINT_NAME();
 	acm_advance_batch(batch_info, 2 * 16);
+	return OK;
+}
+
+// Newer than the SDK 10 headers (NID GTfJ64qFCPw); the game calls it for every audio batch after
+// Start. Like the other commands it records nothing, since batches are not executed.
+int KYTY_SYSV_ABI AcmBatchJobPriority(AcmBatchInfo* batch_info, uint32_t priority) {
+	PRINT_NAME();
+	(void)batch_info;
+	(void)priority;
 	return OK;
 }
 

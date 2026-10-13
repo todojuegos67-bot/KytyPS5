@@ -104,6 +104,9 @@ namespace AudioIn {
 
 int KYTY_SYSV_ABI AudioInOpen(int user_id, uint32_t type, uint32_t index, uint32_t len,
                               uint32_t freq, uint32_t param);
+int KYTY_SYSV_ABI AudioInHqOpen(int user_id, int type, int index, uint32_t len, uint32_t freq,
+                                uint32_t param);
+int KYTY_SYSV_ABI AudioInClose(int handle);
 int KYTY_SYSV_ABI AudioInInput(int handle, void* dest);
 int KYTY_SYSV_ABI AudioInGetSilentState(int handle);
 
@@ -211,6 +214,7 @@ int KYTY_SYSV_ABI AcmBatchStartBuffers(AcmContextId context, uint32_t batch_info
                                        AcmBatchError* batch_error, AcmBatchId* batch);
 int KYTY_SYSV_ABI AcmBatchWait(AcmContextId context, AcmBatchId batch, uint32_t timeout);
 int KYTY_SYSV_ABI AcmBatchJobNotification(AcmBatchInfo* batch_info);
+int KYTY_SYSV_ABI AcmBatchJobPriority(AcmBatchInfo* batch_info, uint32_t priority);
 int KYTY_SYSV_ABI AcmConvReverbSharedInput(AcmBatchInfo* batch_info, uint32_t block_count, void* in,
                                            uint32_t count, const void* const ir[],
                                            const float* gain, void* const out[]);
