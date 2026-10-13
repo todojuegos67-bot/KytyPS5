@@ -1146,7 +1146,7 @@ static constexpr uint64_t GUEST_DEFAULT_MAP_BASE = 0x200000000ull;
 static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t alignment) {
 	EXIT_IF(g_guest_address_space == nullptr || g_virtual_ranges == nullptr);
 
-	auto find_in = [&](uint64_t begin, uint64_t end) {
+	auto find_in_range = [&](uint64_t begin, uint64_t end) {
 		auto current = begin;
 		while (current < end && size <= end - current) {
 			const auto candidate =
@@ -1165,6 +1165,20 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 			current = overlap_end;
 		}
 		return uint64_t {0};
+	};
+
+	// The AMM window is skipped: an AMM map placed there later (MAP_FIXED) would replace such a mapping
+	// with fresh pages, zeroing what the game had stored in it (Wolverine's component tables at boot).
+	auto find_in = [&](uint64_t begin, uint64_t end) {
+		constexpr uint64_t amm_end = AMM_VA_START + AMM_VA_SIZE;
+		if (begin >= AMM_VA_START && begin < amm_end) {
+			return find_in_range(begin, end); // a hint inside the window: the guest asked for it
+		}
+		if (begin < AMM_VA_START && end > AMM_VA_START) {
+			if (const auto addr = find_in_range(begin, AMM_VA_START); addr != 0) return addr;
+			return end > amm_end ? find_in_range(amm_end, end) : uint64_t {0};
+		}
+		return find_in_range(begin, end);
 	};
 
 	if (search_addr != 0) {
