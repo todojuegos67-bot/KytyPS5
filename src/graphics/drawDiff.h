@@ -31,6 +31,10 @@ inline constexpr int kFrames = 8;
 // thread (set by the program cache, used by the fresh-read report).
 inline std::atomic<uint64_t> g_frame {0};
 inline thread_local uint64_t t_shader = 0;
+// Where a draw's counts came from when the CPU read them (KYTY_DRAW_DIFF): 0 = the PM4 packet,
+// 4 = DRAW_INDEX_INDIRECT args read by the CPU, 5 = DRAW_INDEX_INDIRECT_MULTI args read by the CPU;
+// +8 when the buffer cache still held GPU-written bytes there (the CPU may have read stale memory).
+inline thread_local uint32_t t_draw_source = 0;
 inline uint64_t              Frame() { return g_frame.load(std::memory_order_relaxed); }
 
 struct Key {
@@ -93,7 +97,12 @@ inline const char* KindName(uint32_t kind) {
 		case 0: return "draw";
 		case 1: return "draw-indirect";
 		case 2: return "dispatch";
-		default: return "dispatch-indirect";
+		case 3: return "dispatch-indirect";
+		case 4: return "draw-cpu-args";
+		case 5: return "draw-cpu-multi";
+		case 12: return "draw-cpu-args-GPUDIRTY";
+		case 13: return "draw-cpu-multi-GPUDIRTY";
+		default: return "draw-?";
 	}
 }
 

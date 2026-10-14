@@ -1366,7 +1366,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 			}
 		}
 		DrawDiff::Note(vs_hash, ps_hash, draw.index_count, draw.instance_count,
-		               indirect_buffer != nullptr ? 1u : 0u);
+		               indirect_buffer != nullptr ? 1u : DrawDiff::t_draw_source);
 	}
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);

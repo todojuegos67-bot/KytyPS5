@@ -1367,12 +1367,19 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	}
 
 	m_num_instances = args.instance_count;
+	if (DrawDiff::Enabled()) {
+		DrawDiff::t_draw_source = 4u + (m_renderer.GetBufferCache().HasGpuDirtyBytes(
+		                                    reinterpret_cast<uint64_t>(args_addr), sizeof(args))
+		                                    ? 8u
+		                                    : 0u);
+	}
 	DrawIndex({.index_count    = index_count,
 	           .index_addr     = index_addr,
 	           .instance_count = args.instance_count,
 	           .base_vertex    = static_cast<int32_t>(args.base_vertex_location),
 	           .first_instance = args.start_instance_location,
 	           .offset_source  = DrawOffsetSource::IndirectArgs});
+	DrawDiff::t_draw_source = 0;
 }
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
@@ -1449,12 +1456,19 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 
 		m_num_instances = args->instance_count;
+		if (DrawDiff::Enabled()) {
+			DrawDiff::t_draw_source = 5u + (m_renderer.GetBufferCache().HasGpuDirtyBytes(
+			                                    static_cast<uint64_t>(args_addr), sizeof(*args))
+			                                    ? 8u
+			                                    : 0u);
+		}
 		DrawIndex({.index_count    = index_count,
 		           .index_addr     = index_addr,
 		           .instance_count = args->instance_count,
 		           .base_vertex    = static_cast<int32_t>(args->base_vertex_location),
 		           .first_instance = args->start_instance_location,
 		           .offset_source  = DrawOffsetSource::IndirectArgs});
+		DrawDiff::t_draw_source = 0;
 	}
 }
 
