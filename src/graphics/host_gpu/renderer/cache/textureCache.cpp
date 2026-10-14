@@ -2144,9 +2144,13 @@ void TextureCache::DumpImage(ImageId id, const char* kind) {
 	              kind, static_cast<unsigned long long>(wanted),
 	              vk::to_string(image.info.pixel_format).c_str(), image.info.extent.width,
 	              image.info.extent.height, static_cast<unsigned>(image.info.tile_mode));
-	const char* skipped = !m_scheduler.Active()    ? "no active command buffer"
-	                      : !image.SafeToDownload() ? "not safe to download"
-	                                                : nullptr;
+	// A sampled image the GPU never wrote (an alias re-created over another one) holds what its
+	// upload put there once RefreshImage is done: dump that too, it is what the shader reads.
+	const bool  uploaded = !image.IsBufferModified() && !image.IsCpuDirty();
+	const bool  readable = std::strcmp(kind, "read") == 0 ? uploaded : image.SafeToDownload();
+	const char* skipped  = !m_scheduler.Active() ? "no active command buffer"
+	                       : !readable           ? "not safe to download"
+	                                             : nullptr;
 	ImageDownload transfer {};
 	if (skipped == nullptr) {
 		transfer = BuildDownload(image);
