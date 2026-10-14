@@ -159,6 +159,8 @@ public:
 	uint64_t         tick_accessed_last = 0;
 	uint64_t         created_frame      = 0; // DrawDiff::Frame() at creation (KYTY_DRAW_DIFF)
 	uint32_t         created_line       = 0; // textureCache.cpp line that created it (KYTY_DRAW_DIFF)
+	uint64_t         last_write_frame   = ~0ull; // DrawDiff::Frame() of the last GPU-write binding
+	uint64_t         last_writer        = 0;     // shader bound when it was last written (KYTY_DRAW_DIFF)
 	size_t           lru_id             = 0;
 
 private:

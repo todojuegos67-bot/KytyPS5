@@ -54,6 +54,7 @@ struct State {
 	std::map<std::string, uint64_t>                      fresh;     // fresh-read description -> count
 	std::map<uint64_t, std::string>                      insert_note; // address -> what overlapped it at creation
 	std::map<std::string, uint64_t>                      writeback;   // writeback result -> count
+	std::map<std::string, uint64_t>                      history;     // history-read description -> count
 };
 
 inline State& Get() {
@@ -125,6 +126,23 @@ inline void NoteWriteback(uint64_t address, const char* result) {
 	char            buf[96];
 	std::snprintf(buf, sizeof(buf), "0x%010llx %s", static_cast<unsigned long long>(address), result);
 	s.writeback[buf]++;
+}
+
+// A sampled read of an image the GPU last wrote in the previous frame: a temporal history (TAA,
+// denoiser, reprojection). Lists which shader reads which image and which shader wrote it.
+inline void NoteHistoryRead(uint64_t reader, uint64_t address, const char* format, uint32_t width,
+                            uint32_t height, uint64_t writer, uint64_t age) {
+	if (!Enabled()) {
+		return;
+	}
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	char            buf[256];
+	std::snprintf(buf, sizeof(buf), "shader %016llx reads 0x%010llx %ux%u %s written %llu frame(s) before by %016llx",
+	              static_cast<unsigned long long>(reader), static_cast<unsigned long long>(address), width,
+	              height, format, static_cast<unsigned long long>(age),
+	              static_cast<unsigned long long>(writer));
+	s.history[buf]++;
 }
 
 // A sampled read of an image created this frame that the GPU has not written yet: whatever it
@@ -208,6 +226,18 @@ inline void EndFrame() {
 			::printf("  %6" PRIu64 "  %s\n", rows[i].first, rows[i].second.c_str());
 		}
 		s.fresh.clear();
+	}
+	if (!s.history.empty()) {
+		std::vector<std::pair<uint64_t, std::string>> rows;
+		for (const auto& [k, n]: s.history) {
+			rows.emplace_back(n, k);
+		}
+		std::sort(rows.rbegin(), rows.rend());
+		::printf("History reads (sampled images written in an earlier frame, since last report):\n");
+		for (size_t i = 0; i < rows.size() && i < 40; i++) {
+			::printf("  %6" PRIu64 "  %s\n", rows[i].first, rows[i].second.c_str());
+		}
+		s.history.clear();
 	}
 	if (!s.writeback.empty()) {
 		::printf("Image writebacks to the buffer cache (since last report):\n");

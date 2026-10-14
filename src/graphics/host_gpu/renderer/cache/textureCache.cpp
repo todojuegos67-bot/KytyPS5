@@ -1650,8 +1650,17 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	}
 	if (desc.type == BindingType::Texture) {
 		DumpImage(id, "read");
+		if (DrawDiff::Enabled() && image.last_write_frame != ~0ull &&
+		    DrawDiff::Frame() > image.last_write_frame && DrawDiff::Frame() - image.last_write_frame <= 2) {
+			DrawDiff::NoteHistoryRead(DrawDiff::t_shader, image.info.data.address,
+			                          vk::to_string(image.info.pixel_format).c_str(),
+			                          image.info.extent.width, image.info.extent.height,
+			                          image.last_writer, DrawDiff::Frame() - image.last_write_frame);
+		}
 	} else if (desc.type == BindingType::Storage) {
 		DumpImage(id, "storage-bind");
+		image.last_write_frame = DrawDiff::Frame();
+		image.last_writer      = DrawDiff::t_shader;
 	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
@@ -1678,6 +1687,8 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.render_target = true;
+	image.last_write_frame    = DrawDiff::Frame();
+	image.last_writer         = DrawDiff::t_shader;
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
@@ -1696,6 +1707,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.depth_target = true;
+	image.last_write_frame   = DrawDiff::Frame();
+	image.last_writer        = DrawDiff::t_shader;
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
