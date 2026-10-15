@@ -83,3 +83,8 @@
 - Frames with it skipped: ~43 ms (22-24 fps); with it back: 52-73 ms (13-19 fps), same session (camera not strictly fixed). The shader costs time as well.
 - Dump (KYTY_DECODED_DUMP_DIR marker trick + --graphics-debug-dump): pixel shader, 2254 RDNA2 instructions (13.7 KiB), 5 image_sample + 3 sample_lz + 1 sample_l, 13 IMAGE_LOAD, 8 IMAGE_STORE (writes UAVs from a pixel shader), S_WQM_B64, F16 compares with SDWA high-half selects, V_CUBE* ops, s_setreg. SPIR-V 263 KiB, 13.5k instructions (1788 OpSelect, 2655 OpBitcast, 643 Phi).
 - docs/shaders/bfacdd28a2288ac4.rdna.txt kept for the analysis.
+
+## 2026-10-15 16:40 — Cause of the device losts (black screen / PC reboot reports)
+- Log 20261015-140613 (ErrorDeviceLost, no new switch): VK_EXT_device_fault says the GPU read **a destroyed buffer**: ReadInvalid at host VA 0x39a055000 "in DESTROYED buffer va=0x39a000000 size=0x254000 guest=0x112444c000, destroyed 2075.5 ms ago". The guest range is now held by a larger buffer (guest=0x112444c000 size=0x35c000, table va=0x3db600000). Something still handed a shader the old buffer's device address two seconds after it was replaced (use-after-free on the GPU).
+- A GPU read of freed memory loses the device; on some drivers that is a black screen, a driver reset or a reboot (users' reports, Demon's Souls too).
+- Next: find which path keeps old buffer device addresses (pointer tables, cached SRT plans, indirect args) after a buffer is replaced.
