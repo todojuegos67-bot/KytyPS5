@@ -27,16 +27,19 @@
 #include "loader/jit.h"
 #include "loader/redZonePatcher.h"
 #include "loader/symbolDatabase.h"
+#include "loader/timer.h"
 #include "loader/x64InstructionEmulator.h"
 #include "live-trace.h"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2158,6 +2161,57 @@ static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// KYTY_QWORD_WATCH=<hex address> (diagnostics): a host thread polls, every half millisecond, the qword at the
+// address (a pointer) and the qword it points to, and prints a QWORD-WATCH line, with the state and protection
+// of both pages, each time either changes (the first 200 changes). Finds when guest data is lost, and whether
+// the page was decommitted or remapped at that moment. Off without the variable.
+static void StartQwordWatch() {
+	const char* text = std::getenv("KYTY_QWORD_WATCH");
+	if (text == nullptr || *text == '\0') return;
+	const uint64_t address = std::strtoull(text, nullptr, 16);
+	if (address == 0) return;
+	std::printf("QWORD-WATCH start: 0x%" PRIx64 "\n", address);
+	std::fflush(stdout);
+	std::thread([address] {
+		const auto query = [](uint64_t at, uint64_t* value, DWORD* state, DWORD* protect) {
+			MEMORY_BASIC_INFORMATION info {};
+			*state = 0, *protect = 0, *value = 0;
+			if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) == 0) return false;
+			*state = info.State, *protect = info.Protect;
+			constexpr DWORD Readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+			                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+			if (info.State != MEM_COMMIT || (info.Protect & Readable) == 0 || (info.Protect & PAGE_GUARD) != 0) return false;
+			*value = *reinterpret_cast<const volatile uint64_t*>(at);
+			return true;
+		};
+		uint64_t last_pointer = 0, last_value = 0;
+		DWORD    last_state = 0, last_protect = 0, last_value_state = 0, last_value_protect = 0;
+		const auto start = GetTickCount64();
+		for (int changes = 0; changes < 200;) {
+			uint64_t pointer = 0, value = 0;
+			DWORD    state = 0, protect = 0, value_state = 0, value_protect = 0;
+			query(address, &pointer, &state, &protect);
+			if (pointer != 0) query(pointer, &value, &value_state, &value_protect);
+			if (pointer != last_pointer || value != last_value || state != last_state || protect != last_protect ||
+			    value_state != last_value_state || value_protect != last_value_protect) {
+				const auto time = Loader::Timer::GetTime().ToString("HH24:MI:SS.FFF");
+				std::printf("QWORD-WATCH [%s] +%" PRIu64 " ms: [0x%" PRIx64 "]=0x%" PRIx64
+				            " (state 0x%lx protect 0x%lx) -> [0x%" PRIx64 "]=0x%" PRIx64
+				            " (state 0x%lx protect 0x%lx)\n",
+				            time.c_str(), GetTickCount64() - start, address, pointer, state, protect, pointer, value,
+				            value_state, value_protect);
+				std::fflush(stdout);
+				last_pointer = pointer, last_value = value, last_state = state, last_protect = protect;
+				last_value_state = value_state, last_value_protect = value_protect;
+				changes++;
+			}
+			std::this_thread::sleep_for(std::chrono::microseconds(500));
+		}
+	}).detach();
+}
+#endif
+
 void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2352,6 +2406,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	}
 
 	LOGF("entry = 0x%016" PRIx64 "\n", program->elf->GetEntry() + program->base_vaddr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (program->file_name.filename() == "eboot.bin") StartQwordWatch();
+#endif
 }
 
 void RuntimeLinker::DeleteProgram(Program* p) {
