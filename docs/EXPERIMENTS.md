@@ -35,3 +35,9 @@
 ## 2026-10-15 05:42 — Moon repeated again, in a cutscene only
 - User report: the repeated moon is back in one cinematic; in gameplay it is fine (engine 1f477d1 with KYTY_CLAMP_SAMPLER_SHADERS=59bdf02950d06cb6).
 - Likely: the cutscene uses another shader not in the clamp list. Pending: capture which shader (dump during that cutscene).
+
+## 2026-10-15 05:55 — Ready for tomorrow (FPS, Demon's Souls method)
+- Built ab36e30 (KytyPS5-2026-10-15-ab36e30, Windows exe md5 12935aa510f820c441c1fae6b466983f): the profiler no longer kills the process when it unwinds the guest render thread (the vectored handler ran before the sampler's __except; 3 crashes at 05:11, 05:13, 05:20).
+- Not installed: the PC went offline. To do: install as engines/wolverine/kyty_emulator-dev-ab36e30.exe, add a mode for it, keep "Normal" on 1f477d1.
+- Known (logs 20261015-022155, 051709): ~19 fps, 50-60 ms frames; Guest_RenderThread 82-98 % of a core is the limit; Thread_Gpu 52-62 %; GPU not the limit.
+- Method step 2: KYTY_PROF=1 via live.txt once in game (never at launch), same spot, 2 min -> split Guest_RenderThread time (guest code vs HLE/fault handlers by first exe caller), then attack the largest block with the Demon's Souls fixes 1-6 (METODO-WOLVERINE.md), each behind a switch with in-process A/B.
