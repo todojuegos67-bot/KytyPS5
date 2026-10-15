@@ -43,8 +43,25 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("MCJ8SkzsQxY", VideoOut::VideoOutLatencyMeasureSetStartPoint);
 	LIB_FUNC("DYhhWbJSeRg", VideoOut::VideoOutColorSettingsSetGamma);
 	LIB_FUNC("pv9CI5VC+R0", VideoOut::VideoOutAdjustColor);
+	LIB_FUNC("w7Ipp9Xl7hg", VideoOut::VideoOutAllowOutputResolutionWqhdDetection);
 }
 
 } // namespace LibGen5
+
+namespace LibGen5::VrrStatus {
+
+LIB_VERSION("VideoOutVrrStatus", 1, "VideoOut", 1, 1);
+
+// Ported from the Wolverine fork: the observed guest call passes no arguments; success keeps
+// Kyty's fixed-refresh path.
+static KYTY_SYSV_ABI int VideoOutVrrStatus_kP2L8t3j_aM() {
+	return 0;
+}
+
+LIB_DEFINE(InitVideoOutVrrStatus_1) {
+	LIB_FUNC("kP2L8t3j-aM", VideoOutVrrStatus_kP2L8t3j_aM);
+}
+
+} // namespace LibGen5::VrrStatus
 
 } // namespace Libs

@@ -1979,6 +1979,13 @@ KYTY_SYSV_ABI int VideoOutColorSettingsSetGamma(VideoOutColorSettings* settings,
 	return OK;
 }
 
+KYTY_SYSV_ABI int VideoOutAllowOutputResolutionWqhdDetection(int handle) {
+	if (!DriverState().IsOpened(handle)) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+	return OK;
+}
+
 KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* settings) {
 	PRINT_NAME();
 

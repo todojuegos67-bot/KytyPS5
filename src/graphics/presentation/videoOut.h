@@ -104,6 +104,7 @@ KYTY_SYSV_ABI int VideoOutLatencyControlWaitBeforeInput(int handle);
 KYTY_SYSV_ABI int VideoOutLatencyMeasureSetStartPoint(int handle, uint32_t point);
 KYTY_SYSV_ABI int VideoOutColorSettingsSetGamma(VideoOutColorSettings* settings, float gamma);
 KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* settings);
+KYTY_SYSV_ABI int VideoOutAllowOutputResolutionWqhdDetection(int handle);
 
 } // namespace Libs::VideoOut
 

@@ -72,7 +72,12 @@ LIB_DEFINE(InitRtc_1);
 
 namespace LibGen5 {
 LIB_DEFINE(InitVideoOut_1);
+namespace VrrStatus {
+LIB_DEFINE(InitVideoOutVrrStatus_1);
+} // namespace VrrStatus
 } // namespace LibGen5
+
+LIB_DEFINE(InitPngEnc_1);
 
 LIB_DEFINE(InitAppContent_1);
 LIB_DEFINE(InitAudio_1);
@@ -136,6 +141,8 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitUserService_1(s);
 	VideoDec2::InitVideoDec2_1(s);
 	LibGen5::InitVideoOut_1(s);
+	LibGen5::VrrStatus::InitVideoOutVrrStatus_1(s);
+	InitPngEnc_1(s);
 	InitWebBrowserDialog_1(s);
 }
 
