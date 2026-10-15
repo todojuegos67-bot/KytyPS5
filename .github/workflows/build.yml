@@ -290,6 +290,13 @@ jobs:
             gh release upload "$tag" "$PACKAGE.zip" --clobber --repo "$GITHUB_REPOSITORY"
           else
             draft=""; [[ "$PACKAGE" == *-dlss ]] && draft="--draft"
+            latest=$([[ "$PACKAGE" == *-pgogen || "$PACKAGE" == *-fsr3 || "$PACKAGE" == *-dlss || "$PACKAGE" == *-fgx3 ]] && echo --latest=false || echo --latest)
+            # Test branches (anything but the main branch or a tag): a pre-release, never the latest one
+            # (README.md links to the latest release).
+            if [ "$GITHUB_REF_TYPE" != tag ] && [ "$GITHUB_REF_NAME" != experiment/perf-40fps-20260926 ]; then
+              latest="--latest=false --prerelease"
+              notes="$(printf 'Test build of branch %s, not for playing Demon'"'"'s Souls.\n\n%s' "$GITHUB_REF_NAME" "$notes")"
+            fi
             gh release create "$tag" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" $draft \
-              --title "$PACKAGE" --notes "$notes" $([[ "$PACKAGE" == *-pgogen || "$PACKAGE" == *-fsr3 || "$PACKAGE" == *-dlss || "$PACKAGE" == *-fgx3 ]] && echo --latest=false || echo --latest)
+              --title "$PACKAGE" --notes "$notes" $latest
           fi
