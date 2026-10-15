@@ -47,3 +47,14 @@
 - KYTY_READBACK_STATS + KYTY_FAULT_STATS (overhead: 6-13 fps while on, not a measurement): 120k-430k write faults and 2-7k read faults per 5 s on 25-31k pages (the same pages re-fault every frame); readbacks 233-673 ms per 5 s on the GPU thread, downloading 1.2-13 GB per 5 s of which 13-29 MB changed.
 - Hottest buffer 0x12c0000000 (70 MiB, written by CS 0xeaa507075716aa3b each frame): guest writes 1743 + reads 318 per 5 s, 655 downloads (698 MiB), 149 ms.
 - Next (existing switch, no build): live A/B KYTY_ASYNC_WRITE_READBACK 0/1 in one process at the same spot, stats off. It keeps exact data (the faulting thread still waits for its download); only the GPU-thread drain goes.
+
+## 2026-10-15 14:09 — Live A/B KYTY_ASYNC_WRITE_READBACK (engine ab36e30, still camera, same spot)
+| state | 5 s windows | mean frame | fps |
+|---|---|---|---|
+| 0 (round 1) | 9 | 69.6-72.1 ms (one 75) | 13.3-14.4 |
+| 1 (round 1) | 7 | 67.8-68.95 ms | 14.5-14.8 |
+| 0 (round 2) | 8 | 69.2-70.4 ms | 14.2-14.5 |
+| 1 (round 2) | 7 | 67.6-68.95 ms | 14.5-14.8 |
+- Result: about -1.5 ms per frame (+2 %), every ON window faster than every OFF window. Exact data (the faulting thread still waits for its own download). Small; worth keeping on.
+- Note: frames are paced to 60 Hz vblanks (p99 ~84 ms = 5 vblanks, mean ~68-70 = mostly 4), so gains show up in steps.
+- Earlier (14:06) an ErrorDeviceLost with no new switch on: the known pending device-lost (also 2026-10-14 19:50).
