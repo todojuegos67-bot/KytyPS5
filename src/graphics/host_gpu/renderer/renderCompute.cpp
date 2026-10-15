@@ -655,6 +655,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk::DeviceSize indirect_offset = args_offset;
 		if (use_thread_dimensions) {
 			EXIT_IF(!args_buffer->HasDeviceAddress());
+			CheckBdaLive(args_buffer->BufferDeviceAddress(), "RenderCompute indirect args");
 			const std::array<uint32_t, 3> local_size {std::max(cs_regs.cs_regs.num_thread_x, 1u),
 			                                          std::max(cs_regs.cs_regs.num_thread_y, 1u),
 			                                          std::max(cs_regs.cs_regs.num_thread_z, 1u)};

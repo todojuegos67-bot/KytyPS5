@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -60,12 +61,14 @@ struct AddressRange {
 	uint64_t cpu_address = 0;
 	uint64_t usage       = 0;
 	int64_t  destroyed_us = 0;
+	const char* reason    = nullptr;
 };
 std::mutex                                       g_address_mutex;
 std::map<uint64_t, AddressRange>                 g_live_addresses;
 std::deque<std::pair<uint64_t, AddressRange>>    g_destroyed_addresses;
 constexpr size_t                                 DestroyedAddressHistory = 8192;
 std::function<void(uint64_t, uint64_t)>          g_guest_page_describer;
+thread_local const char*                         g_destroy_reason = nullptr;
 
 int64_t NowUs() {
 	return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -177,6 +180,50 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+bool StaleBdaCheckEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_STALE_BDA_CHECK");
+		return v != nullptr && v[0] == '1';
+	}();
+	return enabled;
+}
+
+void SetBufferDestroyReason(const char* reason) noexcept {
+	g_destroy_reason = reason;
+}
+
+void CheckBdaLiveSlow(uint64_t address, const char* holder) {
+	std::scoped_lock lock {g_address_mutex};
+	if (auto it = g_live_addresses.upper_bound(address); it != g_live_addresses.begin()) {
+		--it;
+		if (address - it->first < it->second.size) {
+			return;
+		}
+	}
+	const auto now = NowUs();
+	for (auto it = g_destroyed_addresses.rbegin(); it != g_destroyed_addresses.rend(); ++it) {
+		if (address >= it->first && address - it->first < it->second.size) {
+			static std::atomic_uint32_t reports {0};
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::printf("STALE BDA use: va=0x%" PRIx64 " holder=%s buffer va=0x%" PRIx64
+				            " size=0x%" PRIx64 " guest=0x%" PRIx64
+				            " destroyed %.1f ms ago reason=%s\n",
+				            address, holder, it->first, it->second.size, it->second.cpu_address,
+				            static_cast<double>(now - it->second.destroyed_us) / 1000.0,
+				            it->second.reason != nullptr ? it->second.reason : "?");
+				std::fflush(stdout);
+			}
+			return;
+		}
+	}
+	static std::atomic_uint32_t unknown {0};
+	if (unknown.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::printf("STALE BDA use: va=0x%" PRIx64 " holder=%s in no live/recent buffer\n",
+		            address, holder);
+		std::fflush(stdout);
+	}
+}
+
 void SetGuestPageDescriber(std::function<void(uint64_t address, uint64_t size)> describer) {
 	g_guest_page_describer = std::move(describer);
 }
@@ -226,6 +273,7 @@ Buffer::~Buffer() {
 		std::scoped_lock lock {g_address_mutex};
 		if (auto it = g_live_addresses.find(m_device_address); it != g_live_addresses.end()) {
 			it->second.destroyed_us = NowUs();
+			it->second.reason       = g_destroy_reason;
 			g_destroyed_addresses.emplace_back(*it);
 			g_live_addresses.erase(it);
 			if (g_destroyed_addresses.size() > DestroyedAddressHistory) {

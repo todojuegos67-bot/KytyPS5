@@ -45,6 +45,15 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 // Device-loss triage: prints which buffer with a device address covers the faulting GPU
 // address, live or among the last destroyed ones (and how long ago), or that none does.
 void DescribeBufferDeviceAddress(uint64_t address);
+
+// KYTY_STALE_BDA_CHECK=1: report device addresses used after their buffer was destroyed.
+bool StaleBdaCheckEnabled() noexcept;
+void CheckBdaLiveSlow(uint64_t address, const char* holder);
+inline void CheckBdaLive(uint64_t address, const char* holder) {
+	if (address != 0 && StaleBdaCheckEnabled()) CheckBdaLiveSlow(address, holder);
+}
+// Tags buffers destroyed by this thread from now on (for the STALE BDA report).
+void SetBufferDestroyReason(const char* reason) noexcept;
 // Set by the buffer cache: prints which buffer owns each guest page of a range now (the host copy
 // of the BDA page table), for DescribeBufferDeviceAddress.
 void SetGuestPageDescriber(std::function<void(uint64_t address, uint64_t size)> describer);

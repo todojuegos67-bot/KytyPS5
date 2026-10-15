@@ -427,6 +427,7 @@ void BufferCache::WriteBdaEntries(uint64_t first_page, uint64_t pages,
 			const auto element = BDA_DIRECTORY_ENTRIES + uint64_t {slot} * BDA_CHUNK_PAGES +
 			                     (page & (BDA_CHUNK_PAGES - 1u));
 			if (first_address != 0) {
+				CheckBdaLive(first_address, "BufferCache::WriteBdaEntries");
 				addresses.resize(count);
 				for (uint64_t i = 0; i < count; i++) {
 					addresses[i] = first_address + ((page - first_page + i) << CACHING_PAGEBITS);
@@ -486,9 +487,15 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 	Unregister(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
+		m_scheduler.DeferOperation([this, id] {
+			SetBufferDestroyReason("BufferCache::DeleteBuffer(deferred)");
+			m_slot_buffers.erase(id);
+			SetBufferDestroyReason(nullptr);
+		});
 	} else {
+		SetBufferDestroyReason("BufferCache::DeleteBuffer");
 		m_slot_buffers.erase(id);
+		SetBufferDestroyReason(nullptr);
 	}
 }
 
