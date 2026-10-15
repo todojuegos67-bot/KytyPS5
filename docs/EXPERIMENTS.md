@@ -66,3 +66,8 @@
 | 16 | 66.7 64.7 64.9 65.6 65.6 67.3 65.8 / 66.2 65.6 65.2 65.4 64.9 65.8 67.6 | 65.8 |
 - Result: -1.7 ms per frame (+2.6 %), both rounds. Kept on (16). With ASYNC_WRITE_READBACK: ~70 -> ~65.8 ms today (+6 %).
 - Same invalidation call as a one-byte fault (pages only marked CPU-written earlier); a window with GPU data or an image is not taken.
+
+## 2026-10-15 15:05 — Live A/B KYTY_DIRECT_READBACK and KYTY_COPY_QUEUE_INFLIGHT (ed3b0be, AWR=1, WW=16)
+- DIRECT_READBACK 1 vs 0: 66.0-67.8 vs 65.6-68.0 ms. No change.
+- COPY_QUEUE_INFLIGHT 1 vs 0: 65.4-67.1 vs 63.5-66.9 ms. No change.
+- Frames sit at ~66.7 ms = 4 vblanks of 60 Hz: the work per frame lies between 50 and 66.7 ms, so a saving shows only when a frame drops to 3 vblanks (50 ms, 20 fps). Both left off.
