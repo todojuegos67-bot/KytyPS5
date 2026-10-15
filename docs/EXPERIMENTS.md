@@ -77,3 +77,9 @@
 - Rounds (bits/value -> flicker): 1/0 stops, 2/0 stops, 3/0 flickers, 4/4 mostly stops, 5/4 mostly stops, 6/4 mostly stops (one tank texture left), 7/4 flickers, 8/68 flickers, 9/196 stops ("poco").
 - One pixel shader matches 9 bits = 0xc4: **bfacdd28a2288ac4**. Skipping it removes almost all of the flicker; a small remainder (a tank texture) comes from another shader.
 - Next: dump its RDNA2 code and translation (KYTY_DECODED_DUMP_DIR / IR dump) and find the mistranslated instruction.
+
+## 2026-10-15 15:51-15:55 — Flicker shader confirmed and dumped
+- KYTY_LIVE_SKIP_BITS=0 again (explicit value; removing the key does not revert): flicker back. bfacdd28a2288ac4 confirmed.
+- Frames with it skipped: ~43 ms (22-24 fps); with it back: 52-73 ms (13-19 fps), same session (camera not strictly fixed). The shader costs time as well.
+- Dump (KYTY_DECODED_DUMP_DIR marker trick + --graphics-debug-dump): pixel shader, 2254 RDNA2 instructions (13.7 KiB), 5 image_sample + 3 sample_lz + 1 sample_l, 13 IMAGE_LOAD, 8 IMAGE_STORE (writes UAVs from a pixel shader), S_WQM_B64, F16 compares with SDWA high-half selects, V_CUBE* ops, s_setreg. SPIR-V 263 KiB, 13.5k instructions (1788 OpSelect, 2655 OpBitcast, 643 Phi).
+- docs/shaders/bfacdd28a2288ac4.rdna.txt kept for the analysis.
