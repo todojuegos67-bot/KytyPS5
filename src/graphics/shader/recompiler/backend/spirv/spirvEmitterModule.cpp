@@ -388,6 +388,13 @@ void DefineDescriptors(EmitterState& state) {
 				state.image_variables[IR::ImageBindingIndex(binding.kind)] =
 				    Define(ArrayType(ImageType(state, image)), name.c_str(),
 				           spv::StorageClassUniformConstant);
+				// Inside a POPS interlock the read-modify-writes of one pixel must see each
+				// other: storage images are coherent there.
+				if (image.resource_class == IR::ImageResourceClass::Storage && UsesPixelInterlock(state)) {
+					state.builder.AddAnnotation(spv::OpDecorate,
+					                            state.image_variables[IR::ImageBindingIndex(binding.kind)],
+					                            spv::DecorationCoherent);
+				}
 				if (image.dimension == ImageDimension::Dim1D ||
 				    image.dimension == ImageDimension::Dim1DArray) {
 					state.builder.RequireCapability(image.resource_class ==

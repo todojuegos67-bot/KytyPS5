@@ -595,6 +595,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	// Loads of images the shader also stores to read through the storage descriptor.
+	device_features.shaderStorageImageReadWithoutFormat =
+	    supported_features2.features.shaderStorageImageReadWithoutFormat;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	// Optional: IMAGE_SAMPLE*_CL clamps become the MinLod image operand.
 	const bool shader_resource_min_lod =

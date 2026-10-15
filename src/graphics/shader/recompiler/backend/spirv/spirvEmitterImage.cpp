@@ -1053,7 +1053,21 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			        const auto descriptor = LoadImageDescriptor(state, mem.resource);
 			        const auto color      = state.builder.AllocateId();
 			        const auto coord      = CoordU32(ctx, mem, *address, dimension);
-			        if (dimension_info.multisampled != 0u) {
+			        if (image.resource_class == IR::ImageResourceClass::Storage) {
+				        // A load of an image this shader also stores to (ResourceTracking:
+				        // RedirectLoadsOfStoredImages): read through the storage descriptor.
+				        state.builder.RequireCapability(spv::CapabilityStorageImageReadWithoutFormat);
+				        if (dimension_info.multisampled != 0u) {
+					        state.builder.AddFunction(
+					            spv::OpImageRead, ImageVectorType(state, numeric_class, 4), color,
+					            descriptor, coord, spv::ImageOperandsSampleMask,
+					            AddressU32(ctx, mem, *address, dimension_info.coordinate_components));
+				        } else {
+					        state.builder.AddFunction(spv::OpImageRead,
+					                                  ImageVectorType(state, numeric_class, 4), color,
+					                                  descriptor, coord);
+				        }
+			        } else if (dimension_info.multisampled != 0u) {
 				        state.builder.AddFunction(
 				            spv::OpImageFetch, ImageVectorType(state, numeric_class, 4), color,
 				            descriptor, coord, spv::ImageOperandsSampleMask,

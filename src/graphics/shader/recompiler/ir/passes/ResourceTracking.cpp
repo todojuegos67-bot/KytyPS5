@@ -341,6 +341,7 @@ public:
 				}
 			}
 		}
+		RedirectLoadsOfStoredImages();
 		LinkImageAliases();
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
@@ -2884,6 +2885,7 @@ private:
 			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
 			    image.atomic64 == atomic64) {
 				Merge(image, op, pc);
+				NoteImageUse(i, op);
 				return i;
 			}
 		}
@@ -2901,7 +2903,60 @@ private:
 		image.atomic64       = atomic64;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
+		NoteImageUse(static_cast<uint32_t>(m_info.images.size() - 1), op);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
+	}
+
+	// Which kinds of operation use each image resource: 1 plain loads (ImageRead), 2 others.
+	void NoteImageUse(uint32_t resource, ValueOpcode op) {
+		if (m_image_uses.size() <= resource) m_image_uses.resize(resource + 1u, 0u);
+		m_image_uses[resource] |= op == ValueOpcode::ImageRead ? 1u : 2u;
+	}
+
+	// A shader that loads (IMAGE_LOAD) a T# it also stores to does a read-modify-write of one
+	// image. ImageRead is a sampled-image fetch, so the load went through a second, sampled
+	// descriptor of the image while the store went through the storage one: the load does not
+	// see the stores (Wolverine's flickering ground, shader bfacdd28a2288ac4, which orders the
+	// read-modify-write with POPS). Such loads use the storage resource instead (OpImageRead).
+	// KYTY_STORAGE_LOADS=0 (environment): off.
+	void RedirectLoadsOfStoredImages() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_STORAGE_LOADS");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (!enabled) return;
+		for (uint32_t loaded = 0; loaded < m_info.images.size(); loaded++) {
+			const auto& load = m_info.images[loaded];
+			if (load.resource_class != ImageResourceClass::Sampled || loaded >= m_image_uses.size() ||
+			    m_image_uses[loaded] != 1u || load.mip_mode != ImageMipMode::None || load.depth_compare) {
+				continue;
+			}
+			for (uint32_t stored = 0; stored < m_info.images.size(); stored++) {
+				auto& store = m_info.images[stored];
+				if (store.resource_class != ImageResourceClass::Storage || store.source != load.source ||
+				    store.dimension != load.dimension || store.mip_mode != ImageMipMode::None ||
+				    store.r128 != load.r128 || store.atomic64 || !store.written) {
+					continue;
+				}
+				// Only the image patches: buffer and sampler patches number other resources.
+				for (auto& patch: m_handle_patches) {
+					if (patch.resource == loaded &&
+					    std::ranges::find(m_image_handles, patch.handle) != m_image_handles.end()) {
+						patch.resource = stored;
+					}
+				}
+				for (auto& patch: m_memory_patches) {
+					if (patch.resource == loaded &&
+					    std::ranges::find(m_image_memory_indices, patch.index) !=
+					        m_image_memory_indices.end()) {
+						patch.resource = stored;
+					}
+				}
+				store.read         = true;
+				store.first_use_pc = std::min(store.first_use_pc, load.first_use_pc);
+				break;
+			}
+		}
 	}
 
 	static void Merge(ImageResource& image, ValueOpcode op, uint32_t pc) {
@@ -3100,6 +3155,7 @@ private:
 			return;
 		}
 		AddHandlePatch(handle, resource, flags.pc);
+		m_image_handles.push_back(handle);
 		uint32_t sampler = 0;
 		if (image_info.needs_sampler) {
 			if (inst.NumArgs() < 2) {
@@ -3134,6 +3190,7 @@ private:
 			AddSampledPair(resource, sampler, flags.pc);
 		}
 		AddMemoryPatch(flags.index, resource, sampler, image_info.needs_sampler, flags.pc);
+		m_image_memory_indices.push_back(flags.index);
 	}
 
 	const DescriptorSource* Source(uint32_t source) const {
@@ -3175,6 +3232,9 @@ private:
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
+	std::vector<uint8_t>                       m_image_uses;
+	std::vector<Inst*>                         m_image_handles;
+	std::vector<uint32_t>                      m_image_memory_indices;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectImagePlan>             m_indirect_images;
 	// Bindless table reads the shader also uses as values: they stay real buffer reads.
