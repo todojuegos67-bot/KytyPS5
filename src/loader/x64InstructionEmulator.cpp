@@ -802,3 +802,16 @@ bool TryEmulate(void* native_context) {
 }
 
 } // namespace Loader::X64InstructionEmulator
+
+namespace Loader::X64InstructionEmulator {
+
+bool IsReciprocalSquareRoot(const ZydisDecodedInstruction& /*instruction*/,
+                            const ZydisDecodedOperand* /*operands*/) {
+	return false;
+}
+
+uint64_t PatchReciprocalSquareRoots(uint64_t /*address*/, uint64_t /*size*/) {
+	return 0;
+}
+
+} // namespace Loader::X64InstructionEmulator
