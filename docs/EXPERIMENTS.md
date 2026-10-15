@@ -58,3 +58,11 @@
 - Result: about -1.5 ms per frame (+2 %), every ON window faster than every OFF window. Exact data (the faulting thread still waits for its own download). Small; worth keeping on.
 - Note: frames are paced to 60 Hz vblanks (p99 ~84 ms = 5 vblanks, mean ~68-70 = mostly 4), so gains show up in steps.
 - Earlier (14:06) an ErrorDeviceLost with no new switch on: the known pending device-lost (also 2026-10-14 19:50).
+
+## 2026-10-15 14:57 — Live A/B KYTY_WRITE_WINDOW_KB 0/16 (engine ed3b0be, ASYNC_WRITE_READBACK=1, still camera, same spot)
+| state | 5 s windows (mean frame, ms) | average |
+|---|---|---|
+| 0 | 66.2 67.1 66.5 67.8 / 67.1 66.9 68.3 68.2 69.2 67.6 67.8 | 67.5 |
+| 16 | 66.7 64.7 64.9 65.6 65.6 67.3 65.8 / 66.2 65.6 65.2 65.4 64.9 65.8 67.6 | 65.8 |
+- Result: -1.7 ms per frame (+2.6 %), both rounds. Kept on (16). With ASYNC_WRITE_READBACK: ~70 -> ~65.8 ms today (+6 %).
+- Same invalidation call as a one-byte fault (pages only marked CPU-written earlier); a window with GPU data or an image is not taken.
