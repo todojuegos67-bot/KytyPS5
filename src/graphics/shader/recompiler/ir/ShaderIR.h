@@ -489,6 +489,9 @@ struct ShaderInfo {
 	bool                             uses_dma           = false;
 	// Research: loop watchdogs report their trips into the bindless feedback buffer (set 1).
 	bool                             watchdog_reports   = false;
+	// The pixel shader orders its image reads and writes per pixel (POPS: s_setreg POPS_PACKER
+	// ... s_sendmsg MSG_ORDERED_PS_DONE); emitted as a fragment shader interlock.
+	bool                             uses_pops          = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

@@ -600,7 +600,23 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	const bool shader_resource_min_lod =
 	    supported_features2.features.shaderResourceMinLod == VK_TRUE;
 	device_features.shaderResourceMinLod = shader_resource_min_lod ? VK_TRUE : VK_FALSE;
-	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = shader_resource_min_lod});
+	// Optional: POPS pixel shaders run inside a fragment shader pixel interlock.
+	vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT pixel_interlock {};
+	if (HasExtension(device_extensions, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT supported_interlock {};
+		vk::PhysicalDeviceFeatures2                         interlock_query {};
+		interlock_query.pNext = &supported_interlock;
+		physical_device.getFeatures2(&interlock_query);
+		pixel_interlock.fragmentShaderPixelInterlock = supported_interlock.fragmentShaderPixelInterlock;
+	}
+	// KYTY_POPS_INTERLOCK=0 (environment): POPS pixel shaders run unordered, as before (A/B).
+	if (const char* value = std::getenv("KYTY_POPS_INTERLOCK"); value != nullptr && value[0] == '0') {
+		pixel_interlock.fragmentShaderPixelInterlock = VK_FALSE;
+	}
+	const bool pixel_interlock_enabled = pixel_interlock.fragmentShaderPixelInterlock == VK_TRUE;
+	ShaderRecompiler::Spirv::SetHostImageFeatures(
+	    {.min_lod = shader_resource_min_lod, .pixel_interlock = pixel_interlock_enabled});
+	LOGF("Vulkan fragmentShaderPixelInterlock (POPS): %s\n", pixel_interlock_enabled ? "true" : "false");
 	LOGF("Vulkan shaderResourceMinLod (IMAGE_SAMPLE*_CL): %s\n",
 	     shader_resource_min_lod ? "true" : "false");
 	device_features.independentBlend                     = VK_TRUE;
@@ -670,6 +686,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
+	}
+	if (pixel_interlock_enabled) {
+		pixel_interlock.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext     = &pixel_interlock;
 	}
 	vk::DeviceDiagnosticsConfigCreateInfoNV       diagnostics_config {};
 	vk::PhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_features {};
@@ -1159,6 +1179,7 @@ void WindowContext::CreateVulkan() {
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+		                             VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {

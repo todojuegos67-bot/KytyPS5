@@ -96,6 +96,11 @@ const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 }
 
 void EmitReturn(ValueEmitContext& ctx) {
+	// The interlock opened at the top of main ends once, on the way out (MSG_ORDERED_PS_DONE
+	// is near the end of these shaders, after their last image write).
+	if (UsesPixelInterlock(ctx.state)) {
+		ctx.state.builder.AddFunction(spv::OpEndInvocationInterlockEXT);
+	}
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
@@ -1345,6 +1350,11 @@ void EmitProgram(EmitterState& state) {
 		                          ConstantU32(state, 1));
 	}
 	EmitMemoryOffsets(state);
+	// POPS: the whole shader body is the ordered section (the guest waits on
+	// pops_exiting_wave_id before its first image access and signals at the end).
+	if (UsesPixelInterlock(state)) {
+		state.builder.AddFunction(spv::OpBeginInvocationInterlockEXT);
+	}
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {

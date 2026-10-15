@@ -883,6 +883,11 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.program.stage == ShaderType::Pixel) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOriginUpperLeft);
+		if (UsesPixelInterlock(state)) {
+			state.builder.RequireCapability(spv::CapabilityFragmentShaderPixelInterlockEXT);
+			state.builder.RequireExtension("SPV_EXT_fragment_shader_interlock");
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModePixelInterlockOrderedEXT);
+		}
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
 		}

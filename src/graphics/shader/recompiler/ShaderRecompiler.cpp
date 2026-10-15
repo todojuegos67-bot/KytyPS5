@@ -1091,6 +1091,15 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	ir.info.watchdog_reports = ir.bindless_images && ir.info.uses_dma;
+	// POPS (primitive-ordered pixel shading): RDNA2 pixel shaders that read-modify-write images
+	// per pixel wait their turn with s_setreg_b32 HW_REG_POPS_PACKER (id 25) and a loop on
+	// pops_exiting_wave_id. Without the ordering, overlapping fragments race and the result
+	// changes every frame (Wolverine's flickering ground, shader bfacdd28a2288ac4).
+	if (ir.stage == ShaderType::Pixel) {
+		ir.info.uses_pops = std::ranges::any_of(decoded.instructions, [](const auto& inst) {
+			return inst.opcode == Decoder::Opcode::S_SETREG_B32 && (inst.src1.value & 0x3fu) == 25u;
+		});
+	}
 	IR::AllocateBindings(ir, push_data_start_dword);
 	WriteResourceSummary(ir);
 	// KYTY_IR_DUMP_DIR=<dir> (environment): the IR of every program with a bindless sampler plan

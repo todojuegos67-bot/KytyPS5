@@ -16,6 +16,8 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 struct HostImageFeatures {
 	// shaderResourceMinLod: the MinLod image operand, used for IMAGE_SAMPLE*_CL.
 	bool min_lod = false;
+	// fragmentShaderPixelInterlock: POPS pixel shaders run inside a pixel interlock.
+	bool pixel_interlock = false;
 };
 
 void              SetHostImageFeatures(const HostImageFeatures& features);

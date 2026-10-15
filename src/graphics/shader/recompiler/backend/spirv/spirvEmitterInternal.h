@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_INTERNAL_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_INTERNAL_H_
 
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -425,6 +426,11 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
 void EmitMemoryOffsets(EmitterState& state);
+// A POPS pixel shader (IR::ShaderInfo::uses_pops) on a device with fragmentShaderPixelInterlock.
+inline bool UsesPixelInterlock(const EmitterState& state) {
+	return state.program.stage == ShaderType::Pixel && state.program.info.uses_pops &&
+	       GetHostImageFeatures().pixel_interlock;
+}
 
 uint32_t LdsDwordCount(const EmitterState& state);
 void EnsureLdsStorage(EmitterState& state);

@@ -437,14 +437,17 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 
 namespace {
 std::atomic_bool g_image_min_lod {false};
+std::atomic_bool g_pixel_interlock {false};
 } // namespace
 
 void SetHostImageFeatures(const HostImageFeatures& features) {
 	g_image_min_lod.store(features.min_lod, std::memory_order_relaxed);
+	g_pixel_interlock.store(features.pixel_interlock, std::memory_order_relaxed);
 }
 
 HostImageFeatures GetHostImageFeatures() {
-	return {.min_lod = g_image_min_lod.load(std::memory_order_relaxed)};
+	return {.min_lod         = g_image_min_lod.load(std::memory_order_relaxed),
+	        .pixel_interlock = g_pixel_interlock.load(std::memory_order_relaxed)};
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
