@@ -359,6 +359,52 @@ bool ResourceMemoEnabled() {
 // these guest shaders, the same way a shader that fails to compile is skipped. To see what one
 // shader contributes, to step past one that loses the device, or to leave out work nothing can
 // use (the ray-tracing BVH updates whose only consumer gives up).
+// KYTY_LIVE_SKIP_BITS=k / KYTY_LIVE_SKIP_VALUE=v / KYTY_LIVE_SKIP_STAGE=s (live, research):
+// skip, as --skip-shaders does, every shader whose hash has v in its low k bits, to find by
+// bisection which shader draws a visual fault (stage s: 0 all, 1 pixel, 2 compute, 3 vertex).
+// Each skipped hash is printed once per (k, v) as LIVE-SKIP. k = 0: off.
+static bool LiveSkipRequested(uint64_t shader_hash, ShaderType stage) {
+	static auto& bits_switch  = Common::LiveSwitches::Get("KYTY_LIVE_SKIP_BITS", 0);
+	static auto& value_switch = Common::LiveSwitches::Get("KYTY_LIVE_SKIP_VALUE", 0);
+	static auto& stage_switch = Common::LiveSwitches::Get("KYTY_LIVE_SKIP_STAGE", 0);
+	const auto   bits         = bits_switch.load(std::memory_order_relaxed);
+	if (bits <= 0 || bits >= 64) {
+		return false;
+	}
+	switch (stage_switch.load(std::memory_order_relaxed)) {
+		case 1:
+			if (stage != ShaderType::Pixel) return false;
+			break;
+		case 2:
+			if (stage != ShaderType::Compute) return false;
+			break;
+		case 3:
+			if (stage == ShaderType::Pixel || stage == ShaderType::Compute) return false;
+			break;
+		default: break;
+	}
+	const uint64_t mask  = (uint64_t {1} << static_cast<uint32_t>(bits)) - 1u;
+	const uint64_t value = static_cast<uint64_t>(value_switch.load(std::memory_order_relaxed));
+	if ((shader_hash & mask) != (value & mask)) {
+		return false;
+	}
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> printed;
+	static uint64_t                     printed_key = ~uint64_t {0};
+	const uint64_t                      key         = (static_cast<uint64_t>(bits) << 56u) ^ (value & mask);
+	std::lock_guard                     lock(mutex);
+	if (key != printed_key) {
+		printed.clear();
+		printed_key = key;
+	}
+	if (printed.insert(shader_hash).second) {
+		std::printf("LIVE-SKIP bits=%d value=0x%" PRIx64 " stage=%d hash=%016" PRIx64 "\n", static_cast<int>(bits),
+		            value & mask, static_cast<int>(stage), shader_hash);
+		std::fflush(stdout);
+	}
+	return true;
+}
+
 bool SkipShaderRequested(uint64_t shader_hash) {
 	static const std::vector<uint64_t> hashes = [] {
 		std::vector<uint64_t> result;
@@ -815,7 +861,7 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
-		if (SkipShaderRequested(params.hash)) {
+		if (SkipShaderRequested(params.hash) || LiveSkipRequested(params.hash, stage)) {
 			return ShaderProgram {};
 		}
 		BufferCache::SetReadbackStatsShader(params.hash);
