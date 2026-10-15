@@ -25,3 +25,9 @@
 - Test (switch only): the Wolverine engine 1f477d1 without `--amd-cpu`.
 - Result: the game boots. VRSQRTPS emulation is **not** the cause. Discarded.
 - Next: run the Wolverine engine with `--printf-direction Console` and diff its kernel call sequence against the DS engine's log (20261015-041840) up to the fault.
+
+## 2026-10-15 04:35 — Wolverine on the DS engine: linear-image readback off
+- Test (switch only): DS engine 7b660856 with `--readback-linear-images false`.
+- Result: same fault at eboot+0x403fb16. Discarded.
+- New evidence (static + logs): the three objects registered in the table (eboot+0x40411f0, called from 0x4012737/58/c0) are static globals (eboot+0x9b8ae20, 0xbeda190, 0x9b8b230), never null. Yet table[0] reads 0 at the fault and the mask still says 3 entries (r15=0xe000…). So the table's heap memory (InitAllocator heap, 0x1010000000, 650 MiB) was overwritten after registration. File I/O and memory mappings are identical between both engines up to the fault.
+- Next: `KYTY_GPU_WRITE_WATCH=1010000000-1038c00000` on the DS engine to see whether a GPU write-back lands in that heap.
