@@ -903,9 +903,11 @@ void GuestGpu::ThreadRun(void* data) {
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
 			} else {
-				int selected_queue = -1;
+				int  selected_queue = -1;
+				bool any_requeued   = false;
 				for (uint32_t offset = 0; offset < QueueCount; offset++) {
 					const auto id = (gpu->m_next_queue + offset) % QueueCount;
+					if (!gpu->m_queues[id].empty() && gpu->m_queues[id].front().blocked) any_requeued = true;
 					if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked &&
 					    gpu->CanProcessSubmission(gpu->m_queues[id].front())) {
 						selected_queue = static_cast<int>(id);
@@ -918,7 +920,9 @@ void GuestGpu::ThreadRun(void* data) {
 					const auto idle = std::chrono::steady_clock::now();
 					LiveControl::NoteRenderIdle(idle.time_since_epoch().count());
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
-					LiveControl::g_render_idle_ns += (std::chrono::steady_clock::now() - idle).count();
+					const auto waited = (std::chrono::steady_clock::now() - idle).count();
+					LiveControl::g_render_idle_ns += waited;
+					(any_requeued ? LiveControl::g_render_requeued_ns : LiveControl::g_render_ordered_ns) += waited;
 					LiveTrace::Event(LiveTrace::RenderIdle, 0, 1);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {

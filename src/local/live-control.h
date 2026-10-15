@@ -85,6 +85,10 @@ inline std::atomic_bool      g_process {false};
 
 // The render thread's time waiting for guest work (GuestGpu::ThreadRun), in steady-clock ns.
 inline int64_t g_render_idle_ns = 0;
+// Of that, the time submissions were queued but none could run: a queue front requeued because a wait (label,
+// WAIT_REG_MEM) was not met (`requeued`), or refused by frame/compute ordering (`ordered`).
+inline int64_t g_render_requeued_ns = 0;
+inline int64_t g_render_ordered_ns  = 0;
 // When the render thread began waiting for the guest's next submission (steady-clock ns; 0 while it has one): its
 // idle waits set it once, a submission taken clears it (guest commands do not: a guest thread may wait on them).
 inline std::atomic<int64_t> g_render_idle_since {0};
@@ -123,6 +127,7 @@ inline void Flip() {
 		static std::array<uint64_t, LiveCensus::Phases>  last_dispatch_phases {}, last_draw_phases {};
 		static std::array<uint64_t, 4>                   last_xpr {};
 		static int64_t                                   last_idle = 0;
+		static int64_t                                   last_requeued = 0, last_ordered = 0;
 		static int64_t                                   last_upload_wait = 0;
 		static std::array<int64_t, LiveCensus::Waits>    last_waits {};
 		static std::array<uint64_t, counted.size()>      last_counts {};
@@ -209,6 +214,9 @@ inline void Flip() {
 		if (last != std::chrono::steady_clock::time_point {} && ms >= std::max(20.0, SlowLog::HitchThreshold())) {
 			std::printf("[tsc %llu] SLOW Frame %.1f ms idle=%.1f", static_cast<unsigned long long>(tsc), ms,
 			            static_cast<double>(g_render_idle_ns - last_idle) / 1e6);
+			if (g_render_requeued_ns != last_requeued || g_render_ordered_ns != last_ordered)
+				std::printf(" idle_requeued=%.1f idle_ordered=%.1f", static_cast<double>(g_render_requeued_ns - last_requeued) / 1e6,
+				            static_cast<double>(g_render_ordered_ns - last_ordered) / 1e6);
 			if (const double since = std::chrono::duration<double, std::milli>(now - first_time).count();
 			    cycles != 0 && last_cycles != 0 && since > 1000.0)
 				std::printf(" cpu=%.1f", static_cast<double>(cycles - last_cycles) * since /
@@ -249,6 +257,8 @@ inline void Flip() {
 		last      = now;
 		last_tsc  = tsc;
 		last_idle = g_render_idle_ns;
+		last_requeued = g_render_requeued_ns;
+		last_ordered  = g_render_ordered_ns;
 		last_upload_wait = LiveCensus::g_upload_wait_ns.load(std::memory_order_relaxed);
 		for (size_t i = 0; i < LiveCensus::Kinds; ++i) last_kind_cycles[i] = LiveCensus::g_kind_cycles[i];
 		for (size_t i = 0; i < LiveCensus::Phases; ++i) {
