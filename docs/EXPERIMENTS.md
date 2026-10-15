@@ -31,3 +31,7 @@
 - Result: same fault at eboot+0x403fb16. Discarded.
 - New evidence (static + logs): the three objects registered in the table (eboot+0x40411f0, called from 0x4012737/58/c0) are static globals (eboot+0x9b8ae20, 0xbeda190, 0x9b8b230), never null. Yet table[0] reads 0 at the fault and the mask still says 3 entries (r15=0xe000…). So the table's heap memory (InitAllocator heap, 0x1010000000, 650 MiB) was overwritten after registration. File I/O and memory mappings are identical between both engines up to the fault.
 - Next: `KYTY_GPU_WRITE_WATCH=1010000000-1038c00000` on the DS engine to see whether a GPU write-back lands in that heap.
+
+## 2026-10-15 05:42 — Moon repeated again, in a cutscene only
+- User report: the repeated moon is back in one cinematic; in gameplay it is fine (engine 1f477d1 with KYTY_CLAMP_SAMPLER_SHADERS=59bdf02950d06cb6).
+- Likely: the cutscene uses another shader not in the clamp list. Pending: capture which shader (dump during that cutscene).
