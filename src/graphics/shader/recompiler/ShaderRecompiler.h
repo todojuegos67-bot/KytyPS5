@@ -39,6 +39,8 @@ struct TranslateResult {
 	// Research: user-data dwords (indices into CompileOptions::user_data) that held the targets
 	// of inlined calls. The program is valid only while they hold the same values.
 	std::vector<uint32_t> call_target_user_data;
+	// A pixel shader with POPS ordering (IR::ShaderInfo::uses_pops).
+	bool uses_pops = false;
 };
 
 struct CompileResult {
