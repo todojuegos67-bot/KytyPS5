@@ -19,3 +19,9 @@
 | 2026-10-15 | db853ee | live visual A/B: ASYNC_READ_SNAPSHOT=1, ASYNC_READBACK=0, DIRECT_READBACK=1 (also COPY_QUEUE_READBACK=0, LABEL_WAIT_FORWARD=1 with draw diff) | user, still camera | no visible change ("como siempre") |
 | 2026-10-15 | db853ee | KYTY_DRAW_DIFF still camera | per-frame draw keys | ground draws 33d13a84/e6234173 and 4efbcf79/4a49ed80 change index count every frame (e.g. 3085-4604, 1050-12000) with the camera still: geometry submitted differs frame to frame |
 | 2026-10-15 | 1f477d1 | draw diff with count source tags, still camera | where varying ground counts come from | 33d13a84/e6234173 (553-8006 per frame) are direct PM4 counts written by the game's CPU; 4efbcf79/4a49ed80 (11100-14100) are DRAW_INDEX_INDIRECT_MULTI args read by the CPU, never GPU-dirty at read time. The emulator does not read stale counts: the game itself submits different geometry each frame (stormy scene: rain/splash-type dynamic draws). Hypothesis discarded |
+
+## 2026-10-15 04:24 — Wolverine on the DS engine: is VRSQRTPS emulation (`--amd-cpu`) the missing piece?
+- Evidence: the DS engine (7b660856) has no unresolved imports left, yet still faults at eboot+0x403fb16 (null entry in the component table at obj+0x388). The DS engine has no VRSQRTPS emulation.
+- Test (switch only): the Wolverine engine 1f477d1 without `--amd-cpu`.
+- Result: the game boots. VRSQRTPS emulation is **not** the cause. Discarded.
+- Next: run the Wolverine engine with `--printf-direction Console` and diff its kernel call sequence against the DS engine's log (20261015-041840) up to the fault.
