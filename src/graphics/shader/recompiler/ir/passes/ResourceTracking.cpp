@@ -2925,6 +2925,15 @@ private:
 			return value == nullptr || value[0] != '0';
 		}();
 		if (!enabled) return;
+		// Only POPS pixel shaders (s_setreg HW_REG_POPS_PACKER): their read-modify-writes are
+		// ordered per pixel and must see their own stores. Elsewhere a storage read can meet
+		// image layouts the storage path does not read (depth-tiled images: 17:31 run).
+		const bool pops = m_program.stage == ShaderType::Pixel &&
+		                  std::ranges::any_of(m_decoded.instructions, [](const auto& inst) {
+			                  return inst.opcode == Decoder::Opcode::S_SETREG_B32 &&
+			                         (inst.src1.value & 0x3fu) == 25u;
+		                  });
+		if (!pops) return;
 		for (uint32_t loaded = 0; loaded < m_info.images.size(); loaded++) {
 			const auto& load = m_info.images[loaded];
 			if (load.resource_class != ImageResourceClass::Sampled || loaded >= m_image_uses.size() ||
