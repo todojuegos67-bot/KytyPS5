@@ -52,7 +52,8 @@ struct Sources {
 	bool     valid = false;
 };
 
-int      g_generate    = 0;     // frames to generate per rendered frame (0 = off)
+int      g_generate    = 0;
+int      g_dynamic_ok  = -1;    // DLSSGState::bIsDynamicMFGSupported once read (-1: not yet)     // frames to generate per rendered frame (0 = off)
 bool     g_ready       = false; // Streamline loaded and the feature available
 Camera   g_camera;              // Kyty.Gpu: the current guest frame
 Sources  g_sources;             // Kyty.Gpu: the current guest frame
@@ -677,7 +678,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 			std::fflush(stdout);
 			return std::max(fps, 0.0f);
 		}();
-		if (usable && dynamic_target >= 0.0f) {
+		if (usable && dynamic_target >= 0.0f && g_dynamic_ok != 0) { // unsupported: fixed KYTY_FRAMEGEN generation
 			options.mode                   = sl::DLSSGMode::eDynamic;
 			options.dynamicTargetFrameRate = dynamic_target;
 		}
@@ -897,6 +898,10 @@ void AfterPresent() {
 		return;
 	}
 	g_presented_frames.store(std::max(state.numFramesActuallyPresented, 1u), std::memory_order_relaxed);
+	if (const int ok = state.bIsDynamicMFGSupported == sl::Boolean::eTrue ? 1 : 0; ok != g_dynamic_ok) {
+		if (g_dynamic_ok != -1 || ok == 0) g_options_set = false; // re-apply the options (falls back to eOn)
+		g_dynamic_ok = ok;
+	}
 	if (presents % 600 == 1) {
 		LOGF("frame generation: status=0x%x presented=%u max_generated=%u vram=%" PRIu64 " MiB\n",
 		     static_cast<uint32_t>(state.status), state.numFramesActuallyPresented,
