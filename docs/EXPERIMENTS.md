@@ -71,3 +71,9 @@
 - DIRECT_READBACK 1 vs 0: 66.0-67.8 vs 65.6-68.0 ms. No change.
 - COPY_QUEUE_INFLIGHT 1 vs 0: 65.4-67.1 vs 63.5-66.9 ms. No change.
 - Frames sit at ~66.7 ms = 4 vblanks of 60 Hz: the work per frame lies between 50 and 66.7 ms, so a saving shows only when a frame drops to 3 vblanks (50 ms, 20 fps). Both left off.
+
+## 2026-10-15 15:38-15:48 — Live bisection of the flicker (engine 603b618, KYTY_LIVE_SKIP_*)
+- Compute stage first: the game closed at once (skipping compute work hangs the game). Pixel stage only after that.
+- Rounds (bits/value -> flicker): 1/0 stops, 2/0 stops, 3/0 flickers, 4/4 mostly stops, 5/4 mostly stops, 6/4 mostly stops (one tank texture left), 7/4 flickers, 8/68 flickers, 9/196 stops ("poco").
+- One pixel shader matches 9 bits = 0xc4: **bfacdd28a2288ac4**. Skipping it removes almost all of the flicker; a small remainder (a tank texture) comes from another shader.
+- Next: dump its RDNA2 code and translation (KYTY_DECODED_DUMP_DIR / IR dump) and find the mistranslated instruction.
