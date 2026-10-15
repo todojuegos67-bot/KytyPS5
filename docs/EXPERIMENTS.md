@@ -41,3 +41,9 @@
 - Not installed: the PC went offline. To do: install as engines/wolverine/kyty_emulator-dev-ab36e30.exe, add a mode for it, keep "Normal" on 1f477d1.
 - Known (logs 20261015-022155, 051709): ~19 fps, 50-60 ms frames; Guest_RenderThread 82-98 % of a core is the limit; Thread_Gpu 52-62 %; GPU not the limit.
 - Method step 2: KYTY_PROF=1 via live.txt once in game (never at launch), same spot, 2 min -> split Guest_RenderThread time (guest code vs HLE/fault handlers by first exe caller), then attack the largest block with the Demon's Souls fixes 1-6 (METODO-WOLVERINE.md), each behind a switch with in-process A/B.
+
+## 2026-10-15 12:47-14:00 — First real profile of the render thread (engine ab36e30)
+- KYTY_PROF (guest thread sampled, fix ab36e30 works: no crash). Guest_RenderThread, 18 reports: guest code 63 %; BufferCache::ReadMemory from page faults (RenderContext::HandleFault) waiting for the GPU ~24 % (SendCommandSync 12.4, MasterSemaphore::Wait 7.1, WaitPriorityOperations 3.8); page protection/invalidation ~7 %; VideoOutGetFlipStatus 2.3 %. Ceiling if all of that went: ~+40-45 % (19 -> ~27 fps).
+- KYTY_READBACK_STATS + KYTY_FAULT_STATS (overhead: 6-13 fps while on, not a measurement): 120k-430k write faults and 2-7k read faults per 5 s on 25-31k pages (the same pages re-fault every frame); readbacks 233-673 ms per 5 s on the GPU thread, downloading 1.2-13 GB per 5 s of which 13-29 MB changed.
+- Hottest buffer 0x12c0000000 (70 MiB, written by CS 0xeaa507075716aa3b each frame): guest writes 1743 + reads 318 per 5 s, 655 downloads (698 MiB), 149 ms.
+- Next (existing switch, no build): live A/B KYTY_ASYNC_WRITE_READBACK 0/1 in one process at the same spot, stats off. It keeps exact data (the faulting thread still waits for its download); only the GPU-thread drain goes.
