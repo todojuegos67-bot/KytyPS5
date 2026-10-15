@@ -304,9 +304,24 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 		default: break;
 	}
 	const auto swizzle = descriptor.DstSelXYZW();
+	// A storage read ignores the descriptor swizzle and returns the image's components with missing ones filled as
+	// (0, 0, 1): on a 1- or 2-component format, (X,0,0,1) / (X,Y,0,1) reads exactly the same as identity.
+	const auto identity_for_components = [&]() {
+		using F = Prospero::BufferFormat;
+		switch (descriptor.Format()) {
+			case F::k8UNorm: case F::k8SNorm: case F::k8UInt: case F::k8SInt: case F::k16UNorm: case F::k16SNorm:
+			case F::k16UInt: case F::k16SInt: case F::k16Float: case F::k32UInt: case F::k32SInt: case F::k32Float:
+				return swizzle == DstSel(4, 0, 0, 1);
+			case F::k8_8UNorm: case F::k8_8SNorm: case F::k8_8UInt: case F::k8_8SInt: case F::k16_16UNorm:
+			case F::k16_16SNorm: case F::k16_16UInt: case F::k16_16SInt: case F::k16_16Float: case F::k32_32UInt:
+			case F::k32_32SInt: case F::k32_32Float:
+				return swizzle == DstSel(4, 5, 0, 1);
+			default: return false;
+		}
+	};
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(swizzle) &&
-	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
+	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic || identity_for_components());
 	return (is_1d || is_1d_array || is_2d || is_2d_array || is_3d) && supported_tile &&
 	       descriptor.BaseLevel() <= descriptor.LastLevel() &&
 	       descriptor.MinLod() == 0 && supported_swizzle && descriptor.BCSwizzle() == 0 &&
