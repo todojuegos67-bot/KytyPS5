@@ -47,7 +47,7 @@ public:
 	Worker& operator=(const Worker&) = delete;
 
 	// Render thread only: copies the backing of guest [guest, guest + size). Returns the sequence number
-	// that covers this copy.
+	// that covers this copy. A null source zero-fills (an unmapped part of a streamed texture pool).
 	uint64_t Push(uint8_t* destination, const uint8_t* source, uint64_t size, uint64_t guest) {
 		return Add({destination, source, size, nullptr, nullptr, guest, size, false});
 	}
@@ -219,7 +219,8 @@ private:
 			for (; from < to; ++it) {
 				const auto end  = std::min(to, std::next(it)->offset);
 				const auto skip = from - it->offset;
-				CopyFrom(it->destination + skip, it->source + skip, it->guest + skip, end - from);
+				CopyFrom(it->destination + skip, it->source != nullptr ? it->source + skip : nullptr, it->guest + skip,
+				         end - from);
 				from = end;
 			}
 		}, &m_run);
@@ -231,6 +232,10 @@ private:
 	// mapping cannot read (GPU-written, read-protected) ends that part (GuardedCopy); the rest comes from the backing
 	// view, the same bytes (unmapping a range waits for its jobs: the guest mapping is the backing's).
 	static void CopyFrom(uint8_t* destination, const uint8_t* backing, uint64_t guest, uint64_t size) {
+		if (backing == nullptr) {
+			std::memset(destination, 0, size);
+			return;
+		}
 #if defined(_WIN32)
 		if (const auto left = Common::GuardedCopy(destination, reinterpret_cast<const void*>(guest), size); left != 0) {
 			LiveCounters::Add(LiveCounters::UploadGuardStops);

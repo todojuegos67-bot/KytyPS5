@@ -459,6 +459,34 @@ public:
 		return true;
 	}
 
+	// As BackingPieces, for a range with unmapped parts: a hole is a piece with a null pointer. False if
+	// nothing of the range is mapped (or a mapping's backing is out of range).
+	bool SparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
+		pieces.clear();
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) return false;
+		auto       lock   = MapReadLock();
+		const auto end    = vaddr + size;
+		bool       mapped = false;
+		auto       first  = m_maps.lower_bound(vaddr);
+		if (first != m_maps.begin()) {
+			auto previous = std::prev(first);
+			if (previous->second.vaddr + previous->second.size > vaddr) first = previous;
+		}
+		uint64_t current = vaddr;
+		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end; ++mapping) {
+			const auto& entry = mapping->second;
+			const auto  start = std::max(vaddr, entry.vaddr);
+			const auto  bytes = std::min(end, entry.vaddr + entry.size) - start;
+			if (!RangeOk(entry.backing_offset + start - entry.vaddr, bytes)) return false;
+			if (start > current) pieces.emplace_back(nullptr, start - current);
+			pieces.emplace_back(m_backing_base + entry.backing_offset + start - entry.vaddr, bytes);
+			current = start + bytes;
+			mapped  = true;
+		}
+		if (current < end) pieces.emplace_back(nullptr, end - current);
+		return mapped;
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -1501,6 +1529,9 @@ public:
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadSparseBacking(vaddr, data, size);
+	}
+	bool SparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
+		return m_backing->SparseBackingPieces(vaddr, size, pieces);
 	}
 
 	bool IsUniqueBackingRange(uint64_t vaddr, uint64_t size) { return m_backing->IsUniqueRange(vaddr, size); }

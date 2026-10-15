@@ -107,6 +107,7 @@ inline void Flip() {
 		static constexpr std::array counted {C::XprStores, C::XprStored, C::XprStorePending, C::XprRefuseBind,
 		                                     C::XprMissRefused, C::XprMissValidate, C::XprMissUnseen, C::XprMissBudget,
 		                                     C::UploadBytes, C::AsyncImageBytes, C::FullUploadBytes,
+		                                     C::UploadWaitUs, C::UploadBusyUs, C::UploadCallUs, C::UploadSharedRuns, C::UploadGuardStops, C::SparseUploadPieces,
 		                                     C::BufferRegistrations, C::RegionSyncs, C::SyncDownloads, C::AsyncReadbacks,
 		                                     C::ReadbackParts, C::ReadbackRegions, C::GuestCommands, C::TextureUnmaps, C::AsyncPipelines,
 		                                     C::ImageInitUs, C::BufferSyncUs, C::DrawUs, C::TextureUnmapUs, C::BackingReadUs, C::RegionSyncUs, C::AsyncDrawWaitUs, C::AsyncDrawSkips, C::QueueLockUs,

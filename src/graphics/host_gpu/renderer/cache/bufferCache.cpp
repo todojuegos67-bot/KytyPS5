@@ -80,6 +80,17 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 // AsyncUpload call (context: the guest address): an image span with unmapped parts (a streamed
 // texture pool) into staging, the mapped parts as they are and the rest as zeros.
+// KYTY_SPARSE_UPLOAD_PIECES=0: a partly unmapped image span is read by one worker call (TryReadSparseBacking:
+// one thread, under the address space's locks) as before. Default: its mapped parts and holes are pushed as
+// plain copies, which the worker runs as shared runs on the copy pool (a new area's ~1 GB stalled 100+ ms here).
+bool SparseUploadPieces() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SPARSE_UPLOAD_PIECES");
+		return value == nullptr || *value != '0';
+	}();
+	return enabled;
+}
+
 void ReadMappedOrZeroCall(void* context, uint64_t destination, uint64_t size) {
 	auto* target = reinterpret_cast<uint8_t*>(destination);
 	if (!Libs::LibKernel::Memory::TryReadMappedOrZero(reinterpret_cast<uint64_t>(context), target, size)) {
@@ -2464,6 +2475,15 @@ bool BufferCache::PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint6
 	}
 	// Partly unmapped (a texture pool with released layers): the worker reads the mapped
 	// parts; the render thread copied hundreds of MiB here synchronously before.
+	if (SparseUploadPieces() && Libs::LibKernel::Memory::TryGetSparseBackingPieces(vaddr, size, m_backing_pieces)) {
+		uint64_t offset = 0;
+		for (const auto& [piece, bytes]: m_backing_pieces) {
+			AsyncUpload::Get().Push(staging + offset, piece, bytes, vaddr + offset);
+			offset += bytes;
+		}
+		LiveCounters::Add(LiveCounters::SparseUploadPieces, m_backing_pieces.size());
+		return false;
+	}
 	AsyncUpload::Get().PushCall(ReadMappedOrZeroCall, reinterpret_cast<void*>(vaddr),
 	                            reinterpret_cast<uint64_t>(staging), size, vaddr, size);
 	return false;
@@ -2547,8 +2567,18 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 		// pages read as zeros, the rest as they are. The unmapped pages are marked dirty again
 		// when memory is mapped there (TextureCache::MapMemory).
 		if (async) {
-			AsyncUpload::Get().PushCall(ReadMappedOrZeroCall, reinterpret_cast<void*>(piece.vaddr),
-			                            reinterpret_cast<uint64_t>(target), piece.size, piece.vaddr, piece.size);
+			if (SparseUploadPieces() &&
+			    Libs::LibKernel::Memory::TryGetSparseBackingPieces(piece.vaddr, piece.size, m_backing_pieces)) {
+				uint64_t offset = 0;
+				for (const auto& [source, bytes]: m_backing_pieces) {
+					AsyncUpload::Get().Push(target + offset, source, bytes, piece.vaddr + offset);
+					offset += bytes;
+				}
+				LiveCounters::Add(LiveCounters::SparseUploadPieces, m_backing_pieces.size());
+			} else {
+				AsyncUpload::Get().PushCall(ReadMappedOrZeroCall, reinterpret_cast<void*>(piece.vaddr),
+				                            reinterpret_cast<uint64_t>(target), piece.size, piece.vaddr, piece.size);
+			}
 			queued = true;
 			continue;
 		}
