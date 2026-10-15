@@ -610,11 +610,6 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	}
 }
 
-bool TextureCache::HasImagesInRegion(uint64_t address, uint64_t size) {
-	std::scoped_lock lock {m_lock};
-	return !FindImagesInRegion(address, size, true).empty();
-}
-
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
                                                         bool page_overlap) const {
 	ImagePageTable::PageRange pages {};
