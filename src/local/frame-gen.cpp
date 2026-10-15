@@ -666,6 +666,21 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		}
 		g_mode_set = usable ? 1 : 0;
 		options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
+		// KYTY_DLSSG_DYNAMIC=<fps>: Dynamic Multi Frame Generation (Streamline 2.14+, RTX 50): the driver picks
+		// 1..KYTY_FRAMEGEN generated frames per real one to reach <fps> shown (0 or "auto": the display's refresh).
+		static const float dynamic_target = [] {
+			const char* value = std::getenv("KYTY_DLSSG_DYNAMIC");
+			if (value == nullptr || *value == '\0') return -1.0f;
+			const float fps = std::strcmp(value, "auto") == 0 ? 0.0f : static_cast<float>(std::atof(value));
+			std::printf("DLSS-G: dynamic multi frame generation, up to %d generated, target %s fps\n", g_generate,
+			            fps > 0.0f ? value : "display refresh");
+			std::fflush(stdout);
+			return std::max(fps, 0.0f);
+		}();
+		if (usable && dynamic_target >= 0.0f) {
+			options.mode                   = sl::DLSSGMode::eDynamic;
+			options.dynamicTargetFrameRate = dynamic_target;
+		}
 		// KYTY_DLSSG_PARALLEL=1: DLSS-G's work blocks none of the emulator's queues (a comparison: by default it
 		// blocks the presenting queue while it works).
 		static const bool parallel = [] {
@@ -886,9 +901,9 @@ void AfterPresent() {
 		LOGF("frame generation: status=0x%x presented=%u max_generated=%u vram=%" PRIu64 " MiB\n",
 		     static_cast<uint32_t>(state.status), state.numFramesActuallyPresented,
 		     state.numFramesToGenerateMax, state.estimatedVRAMUsageInBytes >> 20u);
-		std::printf("Frame generation: status=0x%x presented=%u max_generated=%u\n",
+		std::printf("Frame generation: status=0x%x presented=%u max_generated=%u dynamic_supported=%d\n",
 		            static_cast<uint32_t>(state.status), state.numFramesActuallyPresented,
-		            state.numFramesToGenerateMax);
+		            state.numFramesToGenerateMax, state.bIsDynamicMFGSupported == sl::Boolean::eTrue ? 1 : 0);
 		std::fflush(stdout);
 	}
 #endif
