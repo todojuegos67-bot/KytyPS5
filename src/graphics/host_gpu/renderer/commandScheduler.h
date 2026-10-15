@@ -27,6 +27,11 @@ public:
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
 	void           EndRendering();
+	// KYTY_UPLOAD_WAIT_OWN (default on): the upload worker jobs pushed so far (AsyncUpload::Pushed()) are read by
+	// commands recorded from now on; the next submission waits only for them (=0: every submission waits for all
+	// pushed). Render thread, called right after the pushes and before their consumer is recorded: noted early is
+	// only conservative (the earlier submission waits, and the stream replays in order).
+	void NoteUploadsPushed();
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
@@ -191,6 +196,7 @@ private:
 	// The last tick handed to the driver (its vkQueueSubmit returned: on the recording worker for a deferred one).
 	std::atomic<uint64_t>        m_driver_tick {0};
 	int                          m_lane  = 0;
+	uint64_t                     m_upload_needed = 0; // NoteUploadsPushed since the last submission
 	bool                         m_lanes = false;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;

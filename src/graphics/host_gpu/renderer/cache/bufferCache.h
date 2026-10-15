@@ -376,6 +376,7 @@ private:
 	// The upload worker's copies of guest [vaddr, vaddr + size) to `staging`; false when it reads the mapped parts
 	// only (a partly unmapped range: the rest is zeros).
 	bool PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint64_t size);
+	bool PushImageStagingJobs(uint8_t* staging, uint64_t vaddr, uint64_t size);
 	// ImageProtectSink's protections: those of pages a copy of [vaddr, vaddr + size) the upload worker makes next reads
 	// whole go ahead of it, the others are applied here. `whole_image`: the range is the image's (bytes of its first and
 	// last pages outside it are no other watcher's, or their pages would have been watched already).

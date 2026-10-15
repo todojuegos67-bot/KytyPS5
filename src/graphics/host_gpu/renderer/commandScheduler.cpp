@@ -730,7 +730,12 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 			deferred.ended[i]    = entries[i].ended;
 			if (!entries[i].ended) deferred.timestamp_slot = entries[i].timestamp_slot;
 		}
-		deferred.upload_sequence = AsyncUpload::SubmitSequence();
+		static const bool wait_own = [] {
+			const char* value = std::getenv("KYTY_UPLOAD_WAIT_OWN");
+			return value == nullptr || *value != '0';
+		}();
+		deferred.upload_sequence = wait_own ? m_upload_needed : AsyncUpload::SubmitSequence();
+		m_upload_needed          = 0;
 		deferred.queue           = m_lane == 1 ? m_graphics.compute_queue : m_graphics.queue;
 		deferred.queue_mutex     = &m_graphics.queue_mutex;
 		deferred.waits           = submit.num_wait_semaphores;
@@ -963,6 +968,11 @@ void CommandScheduler::EnableLanes() {
 	LaneSync::g_lane = 0;
 	LaneSync::g_cur_tick = m_master.CurrentTick();
 	std::printf("Async compute: the game's compute queues go to a second Vulkan queue (KYTY_ASYNC_COMPUTE)\n");
+}
+
+void CommandScheduler::NoteUploadsPushed() {
+	if (AsyncUpload::g_used.load(std::memory_order_relaxed))
+		m_upload_needed = std::max(m_upload_needed, AsyncUpload::Get().Pushed());
 }
 
 void CommandScheduler::SetLane(int lane) {

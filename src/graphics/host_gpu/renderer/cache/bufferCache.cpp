@@ -2214,6 +2214,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			copy.srcOffset += base_offset;
 		}
 		if (async) AsyncUpload::Get().Kick();
+		// The copies (and protections) just pushed are read by the copy commands recorded after this returns.
+		m_scheduler.NoteUploadsPushed();
 		staging_ring.Commit();
 		if (ring_used != nullptr) *ring_used = &staging_ring;
 		return staging_ring.Handle();
@@ -2454,10 +2456,18 @@ void BufferCache::QueueImageProtects(std::span<const StagingPiece> copied, bool 
 		    },
 		    m_image_protect_manager, range.address, range.size, range.address, range.size);
 	}
+	m_scheduler.NoteUploadsPushed();
 	m_image_protects.clear();
 }
 
 bool BufferCache::PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint64_t size) {
+	const bool whole = PushImageStagingJobs(staging, vaddr, size);
+	// Read by the image copy recorded after this (or, refilled, by the one already in the open command buffer).
+	m_scheduler.NoteUploadsPushed();
+	return whole;
+}
+
+bool BufferCache::PushImageStagingJobs(uint8_t* staging, uint64_t vaddr, uint64_t size) {
 	const StagingPiece whole {vaddr, size, 0};
 	QueueImageProtects({&whole, 1}, true);
 	if (const auto* source = Libs::LibKernel::Memory::TryGetBackingPointer(vaddr, size)) {
@@ -2477,10 +2487,13 @@ bool BufferCache::PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint6
 	// parts; the render thread copied hundreds of MiB here synchronously before.
 	if (SparseUploadPieces() && Libs::LibKernel::Memory::TryGetSparseBackingPieces(vaddr, size, m_backing_pieces)) {
 		uint64_t offset = 0;
+		uint64_t holes  = 0;
 		for (const auto& [piece, bytes]: m_backing_pieces) {
 			AsyncUpload::Get().Push(staging + offset, piece, bytes, vaddr + offset);
+			if (piece == nullptr) holes += bytes;
 			offset += bytes;
 		}
+		LiveCounters::Add(LiveCounters::SparseHoleBytes, holes);
 		LiveCounters::Add(LiveCounters::SparseUploadPieces, m_backing_pieces.size());
 		return false;
 	}
@@ -2570,10 +2583,13 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 			if (SparseUploadPieces() &&
 			    Libs::LibKernel::Memory::TryGetSparseBackingPieces(piece.vaddr, piece.size, m_backing_pieces)) {
 				uint64_t offset = 0;
+				uint64_t holes  = 0;
 				for (const auto& [source, bytes]: m_backing_pieces) {
 					AsyncUpload::Get().Push(target + offset, source, bytes, piece.vaddr + offset);
+					if (source == nullptr) holes += bytes;
 					offset += bytes;
 				}
+				LiveCounters::Add(LiveCounters::SparseHoleBytes, holes);
 				LiveCounters::Add(LiveCounters::SparseUploadPieces, m_backing_pieces.size());
 			} else {
 				AsyncUpload::Get().PushCall(ReadMappedOrZeroCall, reinterpret_cast<void*>(piece.vaddr),
@@ -2589,6 +2605,8 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 		AsyncUpload::Get().Kick();
 		LiveCounters::Add(LiveCounters::AsyncImageBytes, total);
 	}
+	// Read by the image copy the caller records from this staging.
+	m_scheduler.NoteUploadsPushed();
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};
 }
