@@ -2148,6 +2148,14 @@ void TextureCache::DumpImage(ImageId id, const char* kind) {
 	if (written >= count_switch.load(std::memory_order_relaxed)) {
 		return;
 	}
+	// KYTY_DUMP_IMAGE_FIRST=1 (live): only the first bind of the image in each frame, i.e. what the frame
+	// starts from; consecutive files then show whether a frame continues from what the previous one left.
+	static auto&    first_switch = Common::LiveSwitches::Get("KYTY_DUMP_IMAGE_FIRST", 0);
+	static uint64_t last_frame   = UINT64_MAX;
+	if (first_switch.load(std::memory_order_relaxed) != 0) {
+		if (DrawDiff::Frame() == last_frame) return;
+		last_frame = DrawDiff::Frame();
+	}
 	const auto frame  = DrawDiff::Frame();
 	const auto shader = DrawDiff::t_shader;
 	const auto order  = sequence++;
