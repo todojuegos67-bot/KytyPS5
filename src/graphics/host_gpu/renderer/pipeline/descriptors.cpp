@@ -283,7 +283,7 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 		case Prospero::TileMode::kLinear: supported_tile = true; break;
 		case Prospero::TileMode::kDepth:
 			supported_tile =
-			    !resource.read && !Prospero::IsFmaskTextureFormat(descriptor.Format()) &&
+			    !Prospero::IsFmaskTextureFormat(descriptor.Format()) &&
 			    (is_2d || is_2d_array) &&
 			    TileGetTextureBlockLayout(descriptor.Format(), tile, false, tile_layout);
 			break;
