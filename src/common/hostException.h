@@ -41,6 +41,10 @@ bool InstallHandler(Handler handler);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();
+
+// While set on a thread, its exceptions go straight to that thread's own __try/__except (a sampler
+// unwinding another thread's stack expects faults); the handler never sees them.
+void SetIgnoreOnThisThread(bool ignore);
 #endif
 
 } // namespace Common::HostException

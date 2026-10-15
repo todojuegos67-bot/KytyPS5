@@ -82,8 +82,14 @@ bool InitializeThreadSignalStack() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+static thread_local bool t_ignore_exceptions = false;
+
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
+
+	if (t_ignore_exceptions) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
 	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C) {
@@ -337,5 +343,13 @@ bool InstallHandler(Handler handler) {
 	g_install_state.store(2, std::memory_order_release);
 	return true;
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void SetIgnoreOnThisThread(bool ignore) {
+	t_ignore_exceptions = ignore;
+}
+#else
+void SetIgnoreOnThisThread(bool /*ignore*/) {}
+#endif
 
 } // namespace Common::HostException

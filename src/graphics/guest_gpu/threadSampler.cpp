@@ -18,6 +18,7 @@ void RegisterCurrentThread(const char* /*name*/) {}
 #include <windows.h> // IWYU pragma: keep
 #include <tlhelp32.h>
 
+#include "common/hostException.h"
 #include "common/liveSwitches.h"
 
 #include <algorithm>
@@ -113,12 +114,16 @@ DWORD64* IntReg(CONTEXT& c, unsigned reg) {
 // make it read garbage. A fault there must end the walk, not the process.
 bool SafeVirtualUnwind(DWORD64 image_base, PRUNTIME_FUNCTION fn, CONTEXT* ctx, PVOID* handler_data,
                        DWORD64* establisher) {
+	// The emulator's vectored handler runs before this __except and would end the process.
+	Common::HostException::SetIgnoreOnThisThread(true);
+	bool ok = true;
 	__try {
 		RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx->Rip, fn, ctx, handler_data, establisher, nullptr);
-		return true;
 	} __except (EXCEPTION_EXECUTE_HANDLER) {
-		return false;
+		ok = false;
 	}
+	Common::HostException::SetIgnoreOnThisThread(false);
+	return ok;
 }
 
 // Walks the copied stack from ctx (registers of the sampled thread at the sample) and returns the
