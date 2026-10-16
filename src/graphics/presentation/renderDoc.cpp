@@ -9,6 +9,7 @@
 #include <chrono>
 #include <filesystem>
 #include <renderdoc_app.h>
+#include <cstdlib>
 #include <string>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -55,6 +56,19 @@ static bool BindRenderDocApi(void* module) {
 	g_api = static_cast<RENDERDOC_API_1_6_0*>(api);
 	g_api->SetCaptureKeys(nullptr, 0);
 	g_api->UnloadCrashHandler();
+	// Keep a capture of this emulator usable: it maps GBs of host-visible memory and guest-backed buffers, so
+	// saving every resource's initial contents (and validation, callstacks) made a capture take minutes.
+	g_api->SetCaptureOptionU32(eRENDERDOC_Option_SaveAllInitials, 0);
+	g_api->SetCaptureOptionU32(eRENDERDOC_Option_RefAllResources, 0);
+	g_api->SetCaptureOptionU32(eRENDERDOC_Option_CaptureAllCmdLists, 0);
+	g_api->SetCaptureOptionU32(eRENDERDOC_Option_VerifyBufferAccess, 0);
+	g_api->SetCaptureOptionU32(eRENDERDOC_Option_APIValidation, 0);
+	g_api->SetCaptureOptionU32(eRENDERDOC_Option_CaptureCallstacks, 0);
+	// KYTY_RD_MEMORY_MB (default 4096): RenderDoc's soft memory limit while capturing.
+	{
+		const char* mb = std::getenv("KYTY_RD_MEMORY_MB");
+		g_api->SetCaptureOptionU32(eRENDERDOC_Option_SoftMemoryLimit, mb != nullptr ? static_cast<uint32_t>(std::atoi(mb)) : 4096u);
+	}
 	LOGF("RenderDoc: API 1.6.0 bound\n");
 	return true;
 }
@@ -162,8 +176,13 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 		return;
 	}
 	if (state == RenderDocState::Capturing) {
-		LOGF("RenderDoc: captured guest flip %u/2\n", ++g_captured_flips);
-		if (g_captured_flips < 2) {
+		// KYTY_RD_FLIPS (default 1): guest flips in one capture (it used to be 2: twice the work).
+		static const uint32_t flips = [] {
+			const char* v = std::getenv("KYTY_RD_FLIPS");
+			return v != nullptr && std::atoi(v) > 0 ? static_cast<uint32_t>(std::atoi(v)) : 1u;
+		}();
+		LOGF("RenderDoc: captured guest flip %u/%u\n", ++g_captured_flips, flips);
+		if (g_captured_flips < flips) {
 			return;
 		}
 	}
