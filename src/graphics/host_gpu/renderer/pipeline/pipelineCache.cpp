@@ -1439,6 +1439,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			return {};
 		}
 	}
+	// The vertex lookups above ran last and left their hash in t_shader: a draw's bindings and
+	// targets are attributed to its pixel shader (KYTY_DUMP_SHADER, DrawDiff), not to its VS.
+	if (pixel_active) {
+		DrawDiff::t_shader = pixel_params.hash;
+	}
 	return result;
 }
 
