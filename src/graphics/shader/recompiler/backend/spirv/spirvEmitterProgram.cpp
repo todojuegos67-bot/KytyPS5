@@ -5,6 +5,11 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <string_view>
+#include <vector>
 #include <functional>
 #include <optional>
 #include <set>
@@ -250,7 +255,49 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 	}(std::index_sequence_for<Args...> {});
 }
 
+// A/B test (KYTY_PS_RFL_PERLANE=1 or a comma list of 16-hex shader hashes): in pixel shaders,
+// V_READFIRSTLANE returns each lane's own value instead of broadcasting the first active lane,
+// since host subgroups pack fragments differently from PS5 waves. Read once at startup; the
+// translated SPIR-V is not cached on disk, so no cache key change is needed.
+static bool PsReadFirstLanePerLane(const EmitterState& state) {
+	if (state.program.stage != ShaderType::Pixel) return false;
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		const char*           value = std::getenv("KYTY_PS_RFL_PERLANE");
+		if (value == nullptr || *value == '\0' || std::string_view(value) == "0") return list;
+		if (std::string_view(value) == "1") {
+			list.push_back(0);
+			return list;
+		}
+		for (const char* p = value; *p != '\0';) {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(p, &end, 16);
+			if (end == p) break;
+			if (hash != 0) list.push_back(hash);
+			p = *end == ',' ? end + 1 : end;
+		}
+		return list;
+	}();
+	if (hashes.empty()) return false;
+	const auto hash = state.program.shader_hash;
+	if (!(hashes.size() == 1 && hashes[0] == 0) && std::ranges::find(hashes, hash) == hashes.end()) return false;
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> logged;
+	{
+		std::lock_guard lock(mutex);
+		if (logged.insert(hash).second) {
+			std::printf("PS_RFL_PERLANE %016llx\n", static_cast<unsigned long long>(hash));
+			std::fflush(stdout);
+		}
+	}
+	return true;
+}
+
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane && PsReadFirstLanePerLane(ctx.state)) {
+		ctx.Define(inst, ctx.Arg(inst, 0));
+		return;
+	}
 	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
 	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
 		// Both operations already combine both emulated halves into one whole-wave result.
