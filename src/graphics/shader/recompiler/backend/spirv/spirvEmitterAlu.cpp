@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "common/emulatorConfig.h"
 
 #include <array>
 
@@ -101,17 +102,18 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 
 } // namespace
 
-#include "common/emulatorConfig.h"
-
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto result = EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
-	if (Config::GetShaderOptimizationType() != Config::ShaderOptimizationType::Performance) {
+	if (::Config::GetShaderOptimizationType() != ::Config::ShaderOptimizationType::Performance) {
 		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
 	}
 	return result;
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	if (::Config::GetShaderOptimizationType() == ::Config::ShaderOptimizationType::Performance) {
+		return EmitFPFma32(state, a, b, c);
+	}
 	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
 	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.
 	// a = EmitFlushF32DenormToSignedZero(state, a);
@@ -119,10 +121,8 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	// c = EmitFlushF32DenormToSignedZero(state, c);
 	const auto product = EmitFPMul32(state, a, b);
 	const auto sum = EmitFPAdd32(state, product, c);
-	if (Config::GetShaderOptimizationType() != Config::ShaderOptimizationType::Performance) {
-		state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
-		state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
-	}
+	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
+	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
 	return sum;
 }
 

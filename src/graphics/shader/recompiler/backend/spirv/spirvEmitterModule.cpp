@@ -910,7 +910,7 @@ void DefineModule(EmitterState& state) {
 		}
 		const bool early_z =
 		    (state.input_info.pixel->ps_early_z ||
-		     Config::GetShaderOptimizationType() == Config::ShaderOptimizationType::Performance) &&
+		     ::Config::GetShaderOptimizationType() == ::Config::ShaderOptimizationType::Performance) &&
 		    !state.input_info.pixel->ps_pixel_kill_enable &&
 		    !state.input_info.pixel->ps_depth_export_enable &&
 		    !state.input_info.pixel->ps_sample_mask_export_enable;

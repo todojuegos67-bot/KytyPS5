@@ -2581,7 +2581,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		buffer.DeferShaderWriteBarrier(shader_write_stages);
 		RecordPendingWrites(stages);
 		// Bound the per-draw overlap checks.
-		if (m_pending_writes.size() > 64) {
+		if (m_pending_writes.size() > 512) {
 			m_context.GetCommandScheduler().EndRendering();
 			m_pending_writes.clear();
 		}

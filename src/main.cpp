@@ -357,6 +357,7 @@ static bool ParseUserId(const std::string& value, int32_t& out) {
 
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
 	show_help = false;
+	options.config.shader_optimization_type = Config::ShaderOptimizationType::Performance;
 
 	for (int i = 1; i < argc; i++) {
 		std::string arg = std::string(argv[i]);
