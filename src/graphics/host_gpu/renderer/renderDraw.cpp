@@ -2517,7 +2517,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			const auto command_size = draw.IsIndexed() ? MeshIndirectArgs::ArgumentsSize
 			                                           : MeshIndirectArgs::DrawArgumentsSize;
 			const auto stride = draw.indirect_stride != 0 ? draw.indirect_stride : command_size;
+			if (gpu_arguments.first == nullptr) {
+				return;
+			}
 			const auto buffer_handle = gpu_arguments.first->Handle();
+			const auto max_count = std::min(draw.indirect_count,
+			    m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxDrawIndirectCount);
 			if (gpu_count.first != nullptr) {
 				// The count lives in GPU-written memory: reading it on the CPU would wait for
 				// that work. The GPU reads it and clamps it to indirect_count (the packet's
@@ -2525,14 +2530,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				if (draw.IsIndexed()) {
 					vk_buffer.drawIndexedIndirectCount(buffer_handle, gpu_arguments.second,
 					                                   gpu_count.first->Handle(), gpu_count.second,
-					                                   draw.indirect_count, stride);
+					                                   max_count, stride);
 				} else {
 					vk_buffer.drawIndirectCount(buffer_handle, gpu_arguments.second,
 					                            gpu_count.first->Handle(), gpu_count.second,
-					                            draw.indirect_count, stride);
+					                            max_count, stride);
 				}
 			} else {
-				for (uint32_t i = 0; i < draw.indirect_count; i++) {
+				for (uint32_t i = 0; i < max_count; i++) {
 					const auto offset = gpu_arguments.second + uint64_t {stride} * i;
 					if (draw.IsIndexed()) {
 						vk_buffer.drawIndexedIndirect(buffer_handle, offset, 1, stride);

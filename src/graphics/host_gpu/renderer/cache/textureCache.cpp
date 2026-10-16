@@ -210,7 +210,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		const auto trigger = std::min(budget - 7 * threshold / 10, budget - 2 * GiB);
+		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>(trigger, GiB));
 	}
 }
 

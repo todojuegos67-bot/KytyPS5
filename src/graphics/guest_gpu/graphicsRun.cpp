@@ -824,7 +824,7 @@ bool GuestGpu::Process(Submission& submission) {
 			cp_inst.BufferFlush();
 			return;
 		}
-		if (!is_complete) {
+		if (is_complete) {
 			cp_inst.BufferFlush();
 			return;
 		}
@@ -1696,8 +1696,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		if (!no_gpu_count && max_count_or_count > 1 &&
 		    (stride_in_bytes == 0 || stride_in_bytes >= args_size) &&
 		    (buffers.IsRegionGpuModified(count_vaddr, sizeof(uint32_t)) ||
-		     buffers.HasGpuDirtyBytes(count_vaddr, sizeof(uint32_t)) ||
-		     buffers.IsPageGpuDirtyHint(count_vaddr)) &&
+		     buffers.HasGpuDirtyBytes(count_vaddr, sizeof(uint32_t))) &&
 		    DrawIndirectFromGpuArgs(args_addr, registers, indexed, max_count_or_count,
 		                            stride_in_bytes, count_vaddr)) {
 			return;
