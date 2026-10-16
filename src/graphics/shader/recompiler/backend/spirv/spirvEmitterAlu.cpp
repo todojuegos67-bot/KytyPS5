@@ -101,9 +101,13 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 
 } // namespace
 
+#include "common/emulatorConfig.h"
+
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto result = EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
-	state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	if (Config::GetShaderOptimizationType() != Config::ShaderOptimizationType::Performance) {
+		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	}
 	return result;
 }
 
@@ -114,11 +118,11 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	// b = EmitFlushF32DenormToSignedZero(state, b);
 	// c = EmitFlushF32DenormToSignedZero(state, c);
 	const auto product = EmitFPMul32(state, a, b);
-	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
-	// const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
 	const auto sum = EmitFPAdd32(state, product, c);
-	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
-	// return EmitFlushF32DenormToSignedZero(state, sum);
+	if (Config::GetShaderOptimizationType() != Config::ShaderOptimizationType::Performance) {
+		state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
+		state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
+	}
 	return sum;
 }
 

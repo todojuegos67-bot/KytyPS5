@@ -258,6 +258,7 @@ struct GraphicsPipelineState {
 	// The fragment stage, when there is one, comes last.
 	uint32_t fragment_stage_count = 0;
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo fragment_subgroup_size {};
+	std::array<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo, 3> vertex_subgroup_sizes {};
 
 	std::array<vk::VertexInputAttributeDescription, ShaderVertexInputInfo::RES_MAX> input_attr {};
 	std::array<vk::VertexInputBindingDescription, ShaderVertexInputInfo::RES_MAX>   input_desc {};
@@ -349,9 +350,18 @@ void BuildGraphicsPipelineState(GraphicsPipelineState& state, GraphicContext& gr
 	auto& shader_stages = state.stages;
 	auto& stage_count   = state.stage_count;
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
-		shader_stages[stage_count++] = {.stage  = NativeShaderStage(vertex_info[i].logical_stage),
+		const auto stage = NativeShaderStage(vertex_info[i].logical_stage);
+		shader_stages[stage_count++] = {.stage  = stage,
 		                                .module = programs.vertex[i].module,
 		                                .pName  = "main"};
+		const auto wave_size = vertex_info[i].wave_size;
+		if (graphics.compute_subgroup_size_control_enabled &&
+		    (graphics.required_subgroup_size_stages & stage) &&
+		    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size &&
+		    i < state.vertex_subgroup_sizes.size()) {
+			state.vertex_subgroup_sizes[i].requiredSubgroupSize = wave_size;
+			shader_stages[stage_count - 1].pNext = &state.vertex_subgroup_sizes[i];
+		}
 	}
 	if (state.rect_list) {
 		shader_stages[stage_count++] = {.stage  = vk::ShaderStageFlagBits::eTessellationControl,
