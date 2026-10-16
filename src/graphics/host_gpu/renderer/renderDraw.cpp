@@ -2536,6 +2536,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 					                            gpu_count.first->Handle(), gpu_count.second,
 					                            max_count, stride);
 				}
+			} else if (m_context.GetGraphics().multi_draw_indirect_enabled && max_count > 1) {
+				if (draw.IsIndexed()) {
+					vk_buffer.drawIndexedIndirect(buffer_handle, gpu_arguments.second, max_count, stride);
+				} else {
+					vk_buffer.drawIndirect(buffer_handle, gpu_arguments.second, max_count, stride);
+				}
 			} else {
 				for (uint32_t i = 0; i < max_count; i++) {
 					const auto offset = gpu_arguments.second + uint64_t {stride} * i;

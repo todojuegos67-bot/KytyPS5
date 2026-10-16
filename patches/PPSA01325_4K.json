@@ -1,0 +1,31 @@
+{
+    "id": "PPSA01325",
+    "mods": [
+        {
+            "enabled": true,
+            "memory": [
+                {
+                    "off": "4c89b568ffffff4c89ad48ffffff84db0f846108000031db4c8d3568978e0041",
+                    "offset": "0x1da4649",
+                    "on": "4c89b568ffffff4c89ad48ffffff84dbe9620800009031db4c8d3568978e0041"
+                }
+            ],
+            "name": "Select the existing non-tiled deferred-lighting renderer"
+        },
+        {
+            "enabled": true,
+            "memory": [
+                {
+                    "off": "4885c0740c83b844050000000f99c0eb0231c041884515",
+                    "offset": "0x1d52517",
+                    "on": "4885c0740c83b8440500000030c090eb0231c041884515"
+                }
+            ],
+            "name": "Select the common GI-unavailable state"
+        }
+    ],
+    "name": "ASTRO's PLAYROOM: NO ray-traced GI",
+    "process": "eboot.bin",
+    "source_sha256": "4591e749a53c324d234eebdc0a92617802143c6dc0fa9e31ad5e30825076243a",
+    "version": "01.905.000"
+}

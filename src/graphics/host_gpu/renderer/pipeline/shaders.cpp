@@ -372,7 +372,6 @@ void BuildGraphicsPipelineState(GraphicsPipelineState& state, GraphicContext& gr
 		// the guest's wave size wherever the driver takes one for fragment shaders.
 		const auto wave_size = ps_input_info->wave_size;
 		if (graphics.compute_subgroup_size_control_enabled &&
-		    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eFragment) &&
 		    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
 			state.fragment_subgroup_size.requiredSubgroupSize = wave_size;
 			shader_stages[stage_count - 1].pNext = &state.fragment_subgroup_size;

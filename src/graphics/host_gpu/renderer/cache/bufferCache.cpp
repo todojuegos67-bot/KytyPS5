@@ -316,12 +316,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		return;
 	}
 	constexpr int64_t GiB              = 1024ll * 1024 * 1024;
-	constexpr int64_t target_threshold = 8 * GiB;
 	const auto        budget =
 	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-	const auto threshold = std::min(budget, target_threshold);
-	const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
-	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
+	// On 8GB GPUs (e.g. RX 6600 XT), keep buffer allocations resident without aggressive GC thrashing
+	const auto expected  = budget - 2 * GiB;
+	const auto critical  = budget - GiB;
 	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
 }
