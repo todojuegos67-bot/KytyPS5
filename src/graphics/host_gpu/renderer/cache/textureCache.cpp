@@ -1687,6 +1687,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.render_target = true;
+	DumpImage(id, "target-before");
 	image.last_write_frame    = DrawDiff::Frame();
 	image.last_writer         = DrawDiff::t_shader;
 	RefreshImage(id);
@@ -2129,11 +2130,19 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 // Comparing a "free" with the next "read" shows whether a frame gets what the last one wrote.
 void TextureCache::DumpImage(ImageId id, const char* kind) {
 	static auto& address_switch = Common::LiveSwitches::Get("KYTY_DUMP_IMAGE", 0);
-	const auto   wanted         = static_cast<uint64_t>(address_switch.load(std::memory_order_relaxed));
+	// KYTY_DUMP_SHADER=<16-hex hash> (startup): every image that shader binds (sampled, storage,
+	// color target) is dumped instead of one address. Not a live switch: hashes exceed int64.
+	static const uint64_t shader_wanted = [] {
+		const char* v = std::getenv("KYTY_DUMP_SHADER");
+		return v != nullptr ? std::strtoull(v, nullptr, 16) : 0ull;
+	}();
+	auto&      image   = m_slot_images[id];
+	const bool by_shader = shader_wanted != 0 && DrawDiff::t_shader == shader_wanted;
+	const auto wanted  = by_shader ? image.info.data.address
+	                               : static_cast<uint64_t>(address_switch.load(std::memory_order_relaxed));
 	if (wanted == 0) {
 		return;
 	}
-	auto& image = m_slot_images[id];
 	if (image.info.data.address != wanted || image.info.data.Empty() || image.depth_id) {
 		return;
 	}
@@ -2141,7 +2150,7 @@ void TextureCache::DumpImage(ImageId id, const char* kind) {
 	static uint64_t last_address = 0;
 	static int64_t  written      = 0;
 	static uint64_t sequence     = 0;
-	if (last_address != wanted) {
+	if (!by_shader && last_address != wanted) {
 		last_address = wanted;
 		written      = 0;
 	}
@@ -2152,7 +2161,7 @@ void TextureCache::DumpImage(ImageId id, const char* kind) {
 	// starts from; consecutive files then show whether a frame continues from what the previous one left.
 	static auto&    first_switch = Common::LiveSwitches::Get("KYTY_DUMP_IMAGE_FIRST", 0);
 	static uint64_t last_frame   = UINT64_MAX;
-	if (first_switch.load(std::memory_order_relaxed) != 0) {
+	if (!by_shader && first_switch.load(std::memory_order_relaxed) != 0) {
 		if (DrawDiff::Frame() == last_frame) return;
 		last_frame = DrawDiff::Frame();
 	}
