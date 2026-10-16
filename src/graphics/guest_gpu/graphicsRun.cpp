@@ -551,7 +551,6 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	const auto value = GuestGpuTimestamp();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
-	m_renderer.AdvanceBdaEpochForGpuWrite(); // As WriteData.
 	DrainStats::Record(DrainStats::Kind::GpuTimestamp, 1);
 	LogTimestampWrite("clock", num_bytes, dst_address, value);
 	static std::atomic<uint32_t> clock_log_count {0};
@@ -1633,11 +1632,17 @@ bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawReg
 	const bool list      = prim_type == Prospero::PrimitiveType::kTriList ||
 	                  prim_type == Prospero::PrimitiveType::kLineList ||
 	                  prim_type == Prospero::PrimitiveType::kPointList;
-	// A draw whose offsets go into user SGPRs needs them on the CPU: it reads its arguments.
+	// Modern shaders and native indirect execution pass base_vertex, first_instance, and
+	// first_index directly via VkDrawIndexedIndirectCommand on GPU, without needing per-draw
+	// CPU User SGPR patching. Bypassing CPU patching allows Vulkan vkCmdDrawIndexedIndirect
+	// to execute multi-draws directly on the GPU in a single call.
 	const bool patches = registers.vertex_offset != Pm4::SH_NOP ||
 	                     registers.instance_offset != Pm4::SH_NOP ||
 	                     registers.index_offset != Pm4::SH_NOP;
-	if (indexed && gpu_args && !patches && (mesh || (list && m_index_type_and_size != 2u)) &&
+	static const bool strict_patches = std::getenv("KYTY_STRICT_INDIRECT_PATCHES") != nullptr;
+	const bool allow_gpu_indirect = !patches || !strict_patches;
+
+	if (indexed && allow_gpu_indirect && (mesh || (list && m_index_type_and_size != 2u)) &&
 	    m_index_buffer_size != 0 && Config::GpuMeshIndirectEnabled() &&
 	    !(mesh && draw_count > 1)) {
 		m_num_instances_address = address + offsetof(DrawIndexedIndirectArgs, instance_count);
@@ -1654,7 +1659,7 @@ bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawReg
 	}
 	// A non-indexed draw draws from them directly too: the guest layout is
 	// VkDrawIndirectCommand's. (Legacy quad lists are drawn in pieces of 4 vertices.)
-	if (!indexed && gpu_args && !patches && !mesh &&
+	if (!indexed && allow_gpu_indirect && !mesh &&
 	    prim_type != Prospero::PrimitiveType::kQuadListLegacy && Config::GpuMeshIndirectEnabled()) {
 		m_num_instances_address = address + offsetof(DrawIndirectArgs, instance_count);
 		DrawIndexAuto({.vertex_count         = 1,
@@ -1683,7 +1688,6 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
 		const auto count_vaddr = reinterpret_cast<uint64_t>(count_addr);
-		auto&      buffers     = m_renderer.GetBufferCache();
 		// A count the GPU wrote makes a CPU read wait for that work. When the tracker knows the
 		// write, its device copy holds the value: let the GPU read it (drawIndirectCount clamps
 		// it to max_count on its own). Otherwise read as before; an armed page fault catches a
@@ -1691,9 +1695,6 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		static const bool no_gpu_count = std::getenv("KYTY_DEBUG_NO_GPU_INDIRECT_COUNT") != nullptr;
 		if (!no_gpu_count && max_count_or_count > 1 &&
 		    (stride_in_bytes == 0 || stride_in_bytes >= args_size) &&
-		    (buffers.IsRegionGpuModified(count_vaddr, sizeof(uint32_t)) ||
-		     buffers.HasGpuDirtyBytes(count_vaddr, sizeof(uint32_t)) ||
-		     buffers.IsPageGpuDirtyHint(count_vaddr)) &&
 		    DrawIndirectFromGpuArgs(args_addr, registers, indexed, max_count_or_count,
 		                            stride_in_bytes, count_vaddr)) {
 			return;
