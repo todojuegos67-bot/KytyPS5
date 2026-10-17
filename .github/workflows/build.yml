@@ -434,8 +434,8 @@ jobs:
     name: Release KytyPS5
     if: >-
       always() &&
-      github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
+      ((github.event_name == 'push' && github.repository == 'KytyPS5/KytyPS5') ||
+       (github.event_name == 'workflow_dispatch' && github.repository != 'KytyPS5/KytyPS5')) &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')
@@ -523,5 +523,6 @@ jobs:
               --generate-notes \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
-              --title "$RELEASE_NAME"
+              --title "$RELEASE_NAME" \
+              $([ "$GITHUB_REPOSITORY" != KytyPS5/KytyPS5 ] && echo --draft)
           fi
