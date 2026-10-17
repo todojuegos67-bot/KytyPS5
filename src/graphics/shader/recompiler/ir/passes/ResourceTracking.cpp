@@ -2934,12 +2934,24 @@ private:
 			                         (inst.src1.value & 0x3fu) == 25u;
 		                  });
 		if (!pops) return;
+		// KYTY_STORAGE_LOADS_MIXED=0 (environment): only images the shader reads with plain loads alone.
+		// An image it also samples (IMAGE_SAMPLE*: one sampled resource for both, uses 1|2) kept its
+		// loads on the sampled descriptor: Wolverine's ground (bfacdd28a2288ac4) still flickered with
+		// the plain-load redirect in (engine 7bd5a63, 10-17), its five read-modify-written images also
+		// bound sampled. There only the loads move to the storage resource; the samples stay.
+		static const bool mixed_enabled = [] {
+			const char* value = std::getenv("KYTY_STORAGE_LOADS_MIXED");
+			return value == nullptr || value[0] != '0';
+		}();
+		uint32_t redirected = 0, mixed = 0;
 		for (uint32_t loaded = 0; loaded < m_info.images.size(); loaded++) {
 			const auto& load = m_info.images[loaded];
 			if (load.resource_class != ImageResourceClass::Sampled || loaded >= m_image_uses.size() ||
-			    m_image_uses[loaded] != 1u || load.mip_mode != ImageMipMode::None || load.depth_compare) {
+			    (m_image_uses[loaded] & 1u) == 0u || load.depth_compare) {
 				continue;
 			}
+			const bool loads_only = m_image_uses[loaded] == 1u && load.mip_mode == ImageMipMode::None;
+			if (!loads_only && !mixed_enabled) continue;
 			for (uint32_t stored = 0; stored < m_info.images.size(); stored++) {
 				auto& store = m_info.images[stored];
 				if (store.resource_class != ImageResourceClass::Storage || store.source != load.source ||
@@ -2947,24 +2959,45 @@ private:
 				    store.r128 != load.r128 || store.atomic64 || !store.written) {
 					continue;
 				}
-				// Only the image patches: buffer and sampler patches number other resources.
-				for (auto& patch: m_handle_patches) {
-					if (patch.resource == loaded &&
-					    std::ranges::find(m_image_handles, patch.handle) != m_image_handles.end()) {
-						patch.resource = stored;
+				if (loads_only) {
+					// Only the image patches: buffer and sampler patches number other resources.
+					for (auto& patch: m_handle_patches) {
+						if (patch.resource == loaded &&
+						    std::ranges::find(m_image_handles, patch.handle) != m_image_handles.end()) {
+							patch.resource = stored;
+						}
 					}
-				}
-				for (auto& patch: m_memory_patches) {
-					if (patch.resource == loaded &&
-					    std::ranges::find(m_image_memory_indices, patch.index) !=
-					        m_image_memory_indices.end()) {
-						patch.resource = stored;
+					for (auto& patch: m_memory_patches) {
+						if (patch.resource == loaded &&
+						    std::ranges::find(m_image_memory_indices, patch.index) !=
+						        m_image_memory_indices.end()) {
+							patch.resource = stored;
+						}
 					}
+					redirected++;
+				} else {
+					// Mixed: the IMAGE_LOADs' memory patches only (their emitter reads mem.resource); the
+					// handle and the samples keep the sampled resource.
+					uint32_t moved = 0;
+					for (auto& patch: m_memory_patches) {
+						if (patch.resource == loaded &&
+						    std::ranges::find(m_image_read_indices, patch.index) != m_image_read_indices.end()) {
+							patch.resource = stored;
+							moved++;
+						}
+					}
+					if (moved == 0) break;
+					mixed++;
 				}
 				store.read         = true;
 				store.first_use_pc = std::min(store.first_use_pc, load.first_use_pc);
 				break;
 			}
+		}
+		if (redirected + mixed != 0) {
+			std::printf("Shaders: POPS %016llx: loads of %u stored image(s) read the storage image (%u also sampled)\n",
+			            static_cast<unsigned long long>(m_program.shader_hash), redirected + mixed, mixed);
+			std::fflush(stdout);
 		}
 	}
 
@@ -3200,6 +3233,7 @@ private:
 		}
 		AddMemoryPatch(flags.index, resource, sampler, image_info.needs_sampler, flags.pc);
 		m_image_memory_indices.push_back(flags.index);
+		if (op == ValueOpcode::ImageRead) m_image_read_indices.push_back(flags.index);
 	}
 
 	const DescriptorSource* Source(uint32_t source) const {
@@ -3244,6 +3278,7 @@ private:
 	std::vector<uint8_t>                       m_image_uses;
 	std::vector<Inst*>                         m_image_handles;
 	std::vector<uint32_t>                      m_image_memory_indices;
+	std::vector<uint32_t>                      m_image_read_indices; // IMAGE_LOADs (ImageRead)
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectImagePlan>             m_indirect_images;
 	// Bindless table reads the shader also uses as values: they stay real buffer reads.
