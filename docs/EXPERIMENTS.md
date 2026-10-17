@@ -115,3 +115,9 @@
 - Conclusion: no single culprit pixel shader. Skipping a quarter of the PS removes the flickering objects themselves (trees, terrain), so the flicker comes from something they all share (shadows, lighting/G-buffer inputs, the game's TAA or another full-screen compute pass), not from one draw.
 - Side note: skipping bits7 value 48 (PS 272c6c9434fa2cb0, 587ddb621bb29db0, ef015ad7addc9db0) made more fog appear that looked right to the user: one of them may hide the fog.
 - live.txt restored to the original values.
+
+## 2026-10-17 08:32-08:40 — Live bisection of compute shaders (engine 7bd5a63, forest)
+- KYTY_LIVE_SKIP_STAGE=2, bits4: value 0 and 1 no change; value 2 closed/hung the game (an essential CS); value 3 (7 CS) -> lighting gone and flicker gone.
+- The 7: 043df42613b9b623, e0cca8c21c2df1e3, 83ceee12d11bd2a3, 7b779927d3dcd963, 021204e9e4fe4393, 105bc58e82354993, a0c0e96d0440cb53. One at a time (bits16): all still flicker except 021204e9e4fe4393, which breaks the image (the lighting itself).
+- So the flicker is in the lighting result: CS 021204e9e4fe4393 or one of its inputs (shadow maps, G-buffer, light lists). Next: KYTY_DUMP_SHADER=021204e9e4fe4393 (its images frame by frame) and its RDNA dump, as done for the ground.
+- live.txt restored.
