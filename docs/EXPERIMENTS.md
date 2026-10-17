@@ -93,3 +93,14 @@
 - Dump with b822785: SPIR-V of bfacdd28a2288ac4 has OpBeginInvocationInterlockEXT/End (1 each), ExecutionMode PixelInterlockOrderedEXT, capability 5378. User: still flickers. Interlock alone is not the fix.
 - The shader read-modify-writes the same images: IMAGE_LOAD and IMAGE_STORE on the same T# (s8, s16, s36). In the SPIR-V all 13 loads are OpImageFetch on **sampled** images (OpTypeImage Sampled=1) and the 8 stores OpImageWrite on **storage** images (Sampled=2): two descriptors for one guest image. ResourceTracking::AddImage keys resources by resource_class, and ImageRead is always ImageResourceClass::Sampled (ValueOpcodes.cpp:217). So the load reads through the texture path (another view, possibly another copy, not coherent with the storage writes), and the read-modify-write sees stale or racing data: frame-to-frame differences.
 - Next: a load of a T# that the shader also stores to goes to the storage resource (OpImageRead, Coherent under the interlock).
+
+## 2026-10-17 07:00-08:10 — Ground flicker: two hypotheses ruled out
+- Dumps of 10-16 18:02 detiled (64KB_R_X render-target swizzle, gpu_tiler_render_target.comp): the ground decal patches change per pixel every frame in the five RMW images of bfacdd28a2288ac4. May be intended stochastic noise resolved later by the game's TAA: not proof of a bug by itself.
+- ec32e98 (loads of stored images on the storage path even when also sampled): the log shows bfacdd28's 5 loads already on the storage images ("Shaders: POPS ... (0 also sampled)", ~20 POPS shaders). Still flickers.
+- 52af0e0 (KYTY_POPS_BARRIER=1: end rendering + shader-write barrier after every POPS draw): still flickers. Ordering between decal draws is not the cause.
+- Next: dump the composite/final image and the pass that resolves the decal noise frame by frame, to find the first pass where the flicker appears.
+
+## 2026-10-17 08:10 — Overall state (user report + log 20261017-065729)
+- Flicker also on trees and mountains; vegetation pops in/out while moving in the forest; long black loading screen with music.
+- FPS: loading 0.4-10, then 10-19 oscillating in some areas, ~23 steady in others. Render thread is the limit (82-98 %), ~24 % of it waiting on GPU for fault-driven readbacks (10-15 profile); 120k-430k write faults / 5 s on the same pages, up to 13 GB downloaded / 5 s.
+- Working hypothesis (unproven): GPU-written data (culling, indirect args, visibility) read through the CPU copy with stale or mixed frames -> popping and flicker; the copies -> low, oscillating FPS. First test: turn off coherence for one hot GPU-written buffer and watch popping/flicker. Occlusion queries are still "always visible" (cost, not popping).
