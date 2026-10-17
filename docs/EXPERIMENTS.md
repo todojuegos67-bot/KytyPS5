@@ -109,3 +109,9 @@
 - live.txt: KYTY_ASYNC_READBACK, KYTY_COPY_QUEUE_READBACK, KYTY_ASYNC_WRITE_READBACK and KYTY_WRITE_WINDOW_KB to 0 (log 20261017-081640: applied at line 1194).
 - User: vegetation popping, ground/trees/mountains flicker all the same. The async/windowed CPU<->GPU copy paths are not the cause. Restored to the original values afterwards.
 - Remaining suspects for popping + flicker everywhere: GPU culling inputs that never go through the CPU (previous frame's depth/HiZ, history images through the image cache), and the game's TAA (motion vectors/jitter).
+
+## 2026-10-17 08:21-08:31 — Live bisection of pixel shaders (trees/mountains flicker, engine 7bd5a63)
+- KYTY_LIVE_SKIP_STAGE=1: bits1 v0 and bits2 v0 -> no flicker; bits3 v0 -> slight; bits3 v4 -> flicker. Deeper steps were inconsistent on re-test: no single PS and no 5-PS group changes it; bits4 v0 re-tested "same".
+- Conclusion: no single culprit pixel shader. Skipping a quarter of the PS removes the flickering objects themselves (trees, terrain), so the flicker comes from something they all share (shadows, lighting/G-buffer inputs, the game's TAA or another full-screen compute pass), not from one draw.
+- Side note: skipping bits7 value 48 (PS 272c6c9434fa2cb0, 587ddb621bb29db0, ef015ad7addc9db0) made more fog appear that looked right to the user: one of them may hide the fog.
+- live.txt restored to the original values.
