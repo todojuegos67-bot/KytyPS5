@@ -1391,6 +1391,23 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
+	// KYTY_POPS_BARRIER (live, default 1): after a POPS pixel shader's draw (read-modify-writes of
+	// storage images, ordered per pixel by the interlock only within one rendering scope), the
+	// rendering ends and a shader-write barrier follows, so the next draw (another decal shader,
+	// possibly in another rendering scope) sees its writes. Wolverine's ground flickered with the
+	// interlock and the storage loads in (ec32e98, 10-17): ~20 POPS shaders write the same images.
+	if (state.ps_active) {
+		static auto& pops_barrier = Common::LiveSwitches::Get("KYTY_POPS_BARRIER", 1);
+		if (pops_barrier.load(std::memory_order_relaxed) != 0) {
+			for (const auto* stage: stages) {
+				if (stage->runtime != nullptr && *stage->runtime &&
+				    stage->runtime->program->stage == ShaderType::Pixel &&
+				    stage->runtime->program->info.uses_pops) {
+					shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+				}
+			}
+		}
+	}
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
