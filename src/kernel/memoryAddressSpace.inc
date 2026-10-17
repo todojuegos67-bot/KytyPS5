@@ -36,6 +36,9 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 	return size != 0 && PlaceholderFree(reinterpret_cast<void*>(vaddr), size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
 }
 
+// Kyty.Trim's trim of a parked range: GuestAddressSpace::TrimParked while the address space lives (below).
+static void TrimParkedRange(uint64_t vaddr, uint64_t size);
+
 // Ranges parked in their views (GuestBackingStore::UnmapOne) taken out of the working set by a thread of its own: mapped,
 // their pages stayed counted in use (~1.5 GB of the game's freed streaming memory at a time), and dropping them costs
 // ~0.5 us per 4 KiB page (VirtualUnlock on pages not locked), which the game's threads no longer pay. Harmless when late:
@@ -63,7 +66,7 @@ private:
 					m_ready.wait(lock, [this] { return !m_ranges.empty(); });
 					ranges.swap(m_ranges);
 				}
-				for (const auto& [vaddr, size]: ranges) VirtualUnlock(reinterpret_cast<void*>(vaddr), size);
+				for (const auto& [vaddr, size]: ranges) TrimParkedRange(vaddr, size);
 				ranges.clear();
 			}
 		}).detach();
@@ -1591,7 +1594,10 @@ private:
 			return nullptr;
 		}
 
-		if (!ApplyProtection(ptr, size, mode)) {
+		// (Mapped with its protection, but for no access, which a view is not mapped with. A protection change of the whole
+		// view right after it is mapped is part of the stand-alone reproducer of bug check 0x1A/0x41202 (issues #5, #50: a
+		// view mapped again while protections change and pages are paged), and changed nothing.)
+		if (mode == VirtualMemory::Mode::NoAccess && !ApplyProtection(ptr, size, mode)) {
 			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
 			SetFailure(failure_reason, FailureReason::ProtectFailed);
 			return nullptr;
@@ -1734,6 +1740,10 @@ private:
 	uint64_t m_alias_epoch = 1;
 };
 
+class GuestAddressSpace;
+// (The address space while it lives: Kyty.Trim's trims go through it, TrimParkedRange.)
+static std::atomic<GuestAddressSpace*> g_trim_space {nullptr};
+
 class GuestAddressSpace {
 	// m_mutex held exclusively, counted with its time (address_space_holds, address_space_hold_kt): every protection
 	// change of the GPU trackers waits for such a hold (ProtectTransient: address_space_waits).
@@ -1761,6 +1771,7 @@ public:
 #endif
 		ReserveGuestRegions();
 		m_backing = new GuestBackingStore(backing_size);
+		g_trim_space.store(this, std::memory_order_release);
 		if (!m_backing->IsAvailable()) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
@@ -1774,6 +1785,7 @@ public:
 	}
 
 	~GuestAddressSpace() {
+		g_trim_space.store(nullptr, std::memory_order_release);
 		delete m_backing;
 		m_backing = nullptr;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2220,12 +2232,48 @@ private:
 		return (value & (m_granularity - 1u)) == 0;
 	}
 
-	// Whether a backing map or unmap is changing a range that overlaps [vaddr, vaddr + size) outside the lock.
+	// Whether a backing map or unmap is changing a range that overlaps [vaddr, vaddr + size) outside the lock: its page-table
+	// pages (2 MiB of addresses each, and the next one where it ends on one's start) as a whole. Windows' memory manager
+	// bug-checked (0x1A/0x41202, issues #5 and #50, 16 GB PCs) in a protection change of a host thread from the first page
+	// of a 2 MiB-aligned range (a texture's) while another view was mapped or unmapped: busy ranges were per view, and a
+	// protection change of a neighbouring view in the same page-table page went on during the system calls. Maps and
+	// unmaps run one at a time anyway; protection changes in those pages wait for them.
 	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size) const {
-		for (const auto& [begin, end]: m_busy)
-			if (vaddr < end && begin < vaddr + size) return true;
+		constexpr uint64_t PageTablePage = uint64_t {2} << 20u;
+		for (const auto& [begin, end]: m_busy) {
+			const auto page_begin = begin & ~(PageTablePage - 1u);
+			const auto page_end   = (end + PageTablePage) & ~(PageTablePage - 1u);
+			if (vaddr < page_end && page_begin < vaddr + size) return true;
+		}
 		return false;
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+public:
+	// Kyty.Trim's trim of a parked range (VirtualUnlock), 16 MiB at a time, each busy meanwhile: no map or unmap runs in
+	// its page-table pages then, nor it during theirs (it ran unlocked before, during a view's map again too: one of the
+	// overlaps of the bug check above). No lock is held during the trim.
+	void TrimParked(uint64_t vaddr, uint64_t size) {
+		constexpr uint64_t Chunk = uint64_t {16} << 20u;
+		for (uint64_t at = vaddr, end = vaddr + size; at < end;) {
+			const uint64_t next = std::min(end, (at & ~(Chunk - 1u)) + Chunk);
+			{
+				ExclusiveLock lock(m_mutex);
+				m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(at, next - at); });
+				m_busy.emplace_back(at, next);
+			}
+			VirtualUnlock(reinterpret_cast<void*>(at), next - at);
+			{
+				ExclusiveLock lock(m_mutex);
+				EraseBusyUnlocked(at, next);
+			}
+			m_busy_done.notify_all();
+			at = next;
+		}
+	}
+
+private:
+#endif
 
 	// (With m_mutex held shared.) Returns once no map or unmap is changing [vaddr, vaddr + size).
 	void WaitNotBusy(std::shared_lock<std::shared_mutex>& lock, uint64_t vaddr, uint64_t size) {
@@ -2810,3 +2858,13 @@ private:
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;
 };
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static void TrimParkedRange(uint64_t vaddr, uint64_t size) {
+	if (auto* space = g_trim_space.load(std::memory_order_acquire); space != nullptr) {
+		space->TrimParked(vaddr, size);
+	} else {
+		VirtualUnlock(reinterpret_cast<void*>(vaddr), size);
+	}
+}
+#endif
