@@ -97,6 +97,13 @@ with a bar for each core, and the memory in use. (The overlays seen in videos wi
 of every part come from separate tools such as MSI Afterburner's RivaTuner Statistics Server.) In the
 game, F8 switches the panel between Off, "Frame rate" and "Detailed", whatever the launcher started it with
 (also when started with `run.cmd`).
+"Safe GPU mode" (off by default) is for PCs where the game stops with a GPU error: "device lost", or the
+screen goes black and the graphics driver restarts (a TDR). The emulator normally lets the graphics card
+overlap Demon's Souls' compute work; in this mode it runs the steps one after another. On a laptop RTX 3080
+(driver 566.07) that had these hangs, 3 of 4 runs through Boletaria hung without it and none of 3 with it,
+but it costs a quarter to almost half of the frame rate there (13.9-17.7 fps instead of 26.8). Leave it off
+when the game runs without such errors; updating the graphics driver can help as well. (With `run.cmd`
+or `run-windows.ps1`: `-Set KYTY_COMPUTE_CHAIN=0`.)
 Its settings and language list follow the KytyPS5 launcher (`src/launcher` in the source, by the
 KytyPS5 developers).
 
@@ -215,6 +222,9 @@ The keyboard has no L2 / R2 by default: use a gamepad when you need them.
 ## Known issues
 
 - It crashes now and then.
+- On some PCs the graphics card hangs ("device lost", the screen goes black and the driver restarts), in a
+  laptop RTX 3080's case within minutes at Boletaria: turn on "Safe GPU mode" in the launcher (see above).
+  It costs frame rate.
 - Sound: 3D sound has no direction, and there is no reverb.
 - It uses a lot of memory and video memory: on PCs with too little it may just exit.
 - On some TVs the picture tears or stutters with VSync on. A user's fix on a 60 Hz TV with an NVIDIA

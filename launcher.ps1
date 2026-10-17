@@ -26,10 +26,18 @@ $qualities = 'Standard (PS5)', 'Low', 'Lowest'
 $frameGens = 'Off', '2x', '3x', '4x', '5x', '6x'
 # The emulator's own panel at the top right of the game image (KYTY_FPS_HUD 0, 1, 2).
 $overlays = 'Off', 'Frame rate', 'Detailed'
+# Safe GPU mode (KYTY_COMPUTE_CHAIN=0): Demon's Souls' compute work runs one dispatch after another instead of letting
+# the GPU overlap them. Slower, but it stops the GPU hangs ("device lost", the driver resetting the display) that some
+# PCs have: on an RTX 3080 Laptop with driver 566.07, 3 of 4 runs through 1-1 hung with overlap, none of 3 without it,
+# at 25-48% less frame rate there (13.9-17.7 fps instead of 26.8 at 1-1, 21-22 instead of 28.8 at 2-2).
+$safeGpuTip = "For PCs where the game stops with a GPU error: 'device lost', or the screen goes black and the graphics driver`n" +
+	"restarts (a TDR). The emulator then runs Demon's Souls' compute work one step after another instead of letting the GPU`n" +
+	"overlap the steps. That stopped these GPU hangs on a PC that had them, but costs a quarter to almost half of the`n" +
+	"frame rate. Leave it off if the game runs without such errors. Updating the graphics driver can help too."
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
 	ecores = $false; fps120 = $false; render = 1440; ratio = '16:9'; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0
-	hud = 0; streamline = '' }
+	hud = 0; streamline = ''; safegpu = $false }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -121,9 +129,14 @@ function Get-PlayCommand {
 	if ($frameGenAvailable -and [int]$settings.framegen -ge 2) {
 		$arguments += @('-FrameGen', ([int]$settings.framegen - 1), '-StreamlineDir', "`"$streamline`"")
 	}
+	# Switches of the config, one -Set argument (run-windows.ps1 splits it at the commas).
+	$sets = @()
 	# The emulator's panel (KYTY_FPS_HUD) at the top right of the game image: the frame rate and frame times, or with
 	# the GPU, processor and memory too.
-	if ([int]$settings.hud -ge 1) { $arguments += @('-Set', "KYTY_FPS_HUD=$([Math]::Min([int]$settings.hud, 2))") }
+	if ([int]$settings.hud -ge 1) { $sets += "KYTY_FPS_HUD=$([Math]::Min([int]$settings.hud, 2))" }
+	# Safe GPU mode: no overlapping compute dispatches ($safeGpuTip).
+	if ($settings.safegpu) { $sets += 'KYTY_COMPUTE_CHAIN=0' }
+	if ($sets.Count) { $arguments += @('-Set', ($sets -join ',')) }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	# The console stays for the live log; after a crash it waits for a key.
 	return 'powershell ' + ($arguments -join ' ') + ' & if !errorlevel! neq 0 pause'
@@ -231,6 +244,9 @@ $vsync = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'VSync (no
 Add-Row '' @($vsync)
 $hdr = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'HDR (turn on "Use HDR" in Windows display settings first)'; AutoSize = $true; Checked = [bool]$settings.hdr }
 Add-Row '' @($hdr)
+$safeGpu = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Safe GPU mode (only if the game stops with GPU errors: lower frame rate)'; AutoSize = $true; Checked = [bool]$settings.safegpu }
+(New-Object System.Windows.Forms.ToolTip -Property @{ AutoPopDelay = 30000 }).SetToolTip($safeGpu, $safeGpuTip)
+Add-Row '' @($safeGpu)
 $render = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
 $render.Items.AddRange($renderHeights)
 $render.SelectedItem = ($renderHeights | Where-Object { ($_ -split ' ')[0] -eq [string][int]$settings.render } | Select-Object -First 1)
@@ -320,6 +336,7 @@ function Read-Form {
 	$settings.fps120     = $fps120.Checked
 	$settings.vsync      = $vsync.Checked
 	$settings.hdr        = $hdr.Checked
+	$settings.safegpu    = $safeGpu.Checked
 	$settings.hud        = $hud.SelectedIndex
 	$settings.render     = [int](([string]$render.SelectedItem -split ' ')[0])
 	$settings.ratio      = ([string]$ratio.SelectedItem -split ' ')[0]
