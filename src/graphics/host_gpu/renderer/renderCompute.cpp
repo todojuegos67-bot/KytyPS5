@@ -35,6 +35,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -355,6 +356,98 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
 	}
 	return true;
+}
+
+// Diagnostic: KYTY_DUMP_BUFFERS_SHADER=<16-hex hash> (startup): every buffer that compute program binds is saved
+// to _TempData/bufdump/f<frame>_<order>_<before|after>_s<slot>_<r|w>_<addr>_<size>.bin right before and right
+// after each of its dispatches (what it read, what it wrote), while KYTY_DUMP_BUFFERS_COUNT (live, default 0)
+// dispatches remain: set it to N in the live file to dump the next N dispatches. Buffers over
+// KYTY_DUMP_BUFFERS_MAX_MB (live, default 64) are skipped. (Wolverine: CS 021204e9e4fe4393 touches only buffers;
+// skipping it ended the flicker.)
+static bool DumpBuffersWanted(uint64_t hash) {
+	static const uint64_t wanted = [] {
+		const char* v = std::getenv("KYTY_DUMP_BUFFERS_SHADER");
+		return v != nullptr ? std::strtoull(v, nullptr, 16) : 0ull;
+	}();
+	if (wanted == 0 || hash != wanted) return false;
+	static auto& count = Common::LiveSwitches::Get("KYTY_DUMP_BUFFERS_COUNT", 0);
+	return count.load(std::memory_order_relaxed) > 0;
+}
+
+void RenderExecutor::DumpBuffers(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                 const PreparedBindings& bindings, const CommandRecorder& vk_buffer,
+                                 const char* when) {
+	static auto&    count    = Common::LiveSwitches::Get("KYTY_DUMP_BUFFERS_COUNT", 0);
+	static auto&    max_mb   = Common::LiveSwitches::Get("KYTY_DUMP_BUFFERS_MAX_MB", 64);
+	static uint64_t sequence = 0;
+	static bool     folder   = false;
+	if (std::strcmp(when, "after") == 0) count.fetch_sub(1, std::memory_order_relaxed);
+	if (!folder) {
+		std::error_code error;
+		std::filesystem::create_directories("_TempData/bufdump", error);
+		folder = true;
+	}
+	auto&       cache  = m_context.GetBufferCache();
+	auto&       sched  = m_context.GetCommandScheduler();
+	const auto  frame  = DrawDiff::Frame();
+	const auto  order  = sequence++;
+	const auto& layout = program.bindings;
+	const auto  limit =
+	    static_cast<uint64_t>(std::max<int64_t>(1, max_mb.load(std::memory_order_relaxed))) << 20u;
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                          nullptr);
+	uint32_t saved = 0;
+	for (uint32_t slot = 0;
+	     slot < layout.memory_offset_count && slot < bindings.buffer_sources.size(); ++slot) {
+		const auto  resource = layout.descriptors.front().resources[slot];
+		const auto& source   = bindings.buffer_sources[slot];
+		if (source.size == 0 || source.address == 0 || source.size > limit) continue;
+		const bool written =
+		    resource < program.info.buffers.size() && program.info.buffers[resource].written;
+		const auto id = cache.FindBuffer(source.address, source.size);
+		if (!id) continue;
+		auto&      src    = cache.GetBuffer(id);
+		const auto offset = src.Offset(source.address);
+		if (offset + source.size > src.Size()) continue;
+		auto download = std::make_shared<Buffer>(m_context.GetGraphics(), sched, MemoryUsage::Download,
+		                                         0, AllFlags, source.size);
+		auto* mapped  = download->Mapped().data();
+		if (mapped == nullptr) continue;
+		const vk::BufferCopy copy {offset, 0, source.size};
+		vk_buffer.copyBuffer(src.Handle(), download->Handle(), 1, &copy);
+		char name[256];
+		std::snprintf(name, sizeof(name), "_TempData/bufdump/f%06llu_%05llu_%s_s%u_%c_%010llx_%llu.bin",
+		              static_cast<unsigned long long>(frame), static_cast<unsigned long long>(order),
+		              when, slot, written ? 'w' : 'r', static_cast<unsigned long long>(source.address),
+		              static_cast<unsigned long long>(source.size));
+		std::string path = name;
+		const auto  size = source.size;
+		sched.DeferPriorityOperation([download, mapped, size, path] {
+			download->Invalidate(0, size);
+			if (FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+				std::fwrite(mapped, 1, size, file);
+				std::fclose(file);
+			}
+		});
+		saved++;
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eTransferRead;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                          vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+	                          nullptr);
+	if (order < 6 || order % 50 == 0) {
+		::printf("Buffer dump: frame %llu #%llu %s: %u of %u slots saved, %u dispatches left\n",
+		         static_cast<unsigned long long>(frame), static_cast<unsigned long long>(order), when,
+		         saved, layout.memory_offset_count,
+		         static_cast<unsigned>(std::max<int64_t>(0, count.load(std::memory_order_relaxed))));
+		std::fflush(stdout);
+	}
 }
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,

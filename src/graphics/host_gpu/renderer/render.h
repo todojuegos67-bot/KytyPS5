@@ -201,6 +201,9 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
+	// KYTY_DUMP_BUFFERS_SHADER (renderCompute.cpp): that program's buffers saved around a dispatch.
+	void DumpBuffers(const ShaderRecompiler::IR::CompiledShaderInfo& program, const PreparedBindings& bindings,
+	                 const CommandRecorder& vk_buffer, const char* when);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	// Bindless heaps: register the draw's heaps, patch their regions, and once per frame resolve
