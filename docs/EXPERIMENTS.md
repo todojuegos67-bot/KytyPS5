@@ -104,3 +104,8 @@
 - Flicker also on trees and mountains; vegetation pops in/out while moving in the forest; long black loading screen with music.
 - FPS: loading 0.4-10, then 10-19 oscillating in some areas, ~23 steady in others. Render thread is the limit (82-98 %), ~24 % of it waiting on GPU for fault-driven readbacks (10-15 profile); 120k-430k write faults / 5 s on the same pages, up to 13 GB downloaded / 5 s.
 - Working hypothesis (unproven): GPU-written data (culling, indirect args, visibility) read through the CPU copy with stale or mixed frames -> popping and flicker; the copies -> low, oscillating FPS. First test: turn off coherence for one hot GPU-written buffer and watch popping/flicker. Occlusion queries are still "always visible" (cost, not popping).
+
+## 2026-10-17 08:17-08:20 — Live A/B: strict coherence (engine 7bd5a63, forest)
+- live.txt: KYTY_ASYNC_READBACK, KYTY_COPY_QUEUE_READBACK, KYTY_ASYNC_WRITE_READBACK and KYTY_WRITE_WINDOW_KB to 0 (log 20261017-081640: applied at line 1194).
+- User: vegetation popping, ground/trees/mountains flicker all the same. The async/windowed CPU<->GPU copy paths are not the cause. Restored to the original values afterwards.
+- Remaining suspects for popping + flicker everywhere: GPU culling inputs that never go through the CPU (previous frame's depth/HiZ, history images through the image cache), and the game's TAA (motion vectors/jitter).
