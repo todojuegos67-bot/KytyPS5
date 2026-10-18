@@ -679,7 +679,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			vk_buffer.shaderTimeBegin(program.shader_hash, true);
 		}
 		DrawDiff::Note(program.shader_hash, 0, thread_group_x * thread_group_y * thread_group_z, 0, 2);
+		const bool dump_buffers = DumpBuffersWanted(program.shader_hash);
+		if (dump_buffers) DumpBuffers(program, bindings, vk_buffer, "before");
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		if (dump_buffers) {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			DumpBuffers(program, bindings, vk_buffer, "after");
+		}
 		if (shader_time) {
 			vk_buffer.shaderTimeEnd();
 		}
@@ -788,7 +794,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			vk_buffer.shaderTimeBegin(program.shader_hash, true);
 		}
 		DrawDiff::Note(program.shader_hash, 0, 0, 0, 3);
+		const bool dump_buffers = DumpBuffersWanted(program.shader_hash);
+		if (dump_buffers) DumpBuffers(program, bindings, vk_buffer, "before");
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+		if (dump_buffers) {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			DumpBuffers(program, bindings, vk_buffer, "after");
+		}
 		if (shader_time) {
 			vk_buffer.shaderTimeEnd();
 		}
