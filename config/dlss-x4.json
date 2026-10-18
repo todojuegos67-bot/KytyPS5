@@ -55,7 +55,7 @@
     "KYTY_ASYNC_DRAW_SYNC_SMALL": "0",
     "KYTY_FRAMEGEN": "3",
     "KYTY_FLIP_DECOUPLE": "1",
-    "KYTY_FLIP_FPS": "52"
+    "KYTY_FLIP_FPS": "56"
   },
   "command": [
     "--",
