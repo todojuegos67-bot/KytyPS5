@@ -748,6 +748,25 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 				cap             = static_cast<uint32_t>(hz - hz * hz / 3600.0);
 			}
 		}
+		// With KYTY_FLIP_FPS already holding the game at or under cap / (1 + generated) (x4: 56 on a 224 Hz vblank,
+		// Reflex's limit 56 too) the emulator's flip pacing alone holds it: two limiters at the same rate beat against
+		// each other (x4 uneven at 56, 10-19; x3 and x5, whose Reflex limit is above their flip rate, were smooth).
+		// KYTY_DLSSG_REFLEX_LIMIT=1: Reflex's limit kept anyway.
+		const int  flip_fps     = [] {
+			const char* v = std::getenv("KYTY_FLIP_FPS");
+			return v != nullptr ? std::atoi(v) : 0;
+		}();
+		const bool force_reflex = [] {
+			const char* v = std::getenv("KYTY_DLSSG_REFLEX_LIMIT");
+			return v != nullptr && *v == '1';
+		}();
+		if (cap != 0 && g_generate > 0 && flip_fps > 0 && !force_reflex &&
+		    static_cast<double>(flip_fps) * (g_generate + 1) <= cap + 0.5 &&
+		    static_cast<double>(cap) / (g_generate + 1) <= flip_fps * 1.03) { // (only where both bind: x4; others as they were)
+			std::printf("Frame generation: shown frames %d x %d = %d (KYTY_FLIP_FPS), under %u: no Reflex limit\n",
+			            flip_fps, g_generate + 1, flip_fps * (g_generate + 1), cap);
+			cap = 0;
+		}
 		if (cap != 0 && g_generate > 0) {
 			reflex.frameLimitUs = static_cast<uint32_t>(1000000.0 * (g_generate + 1) / cap);
 			g_real_interval     = static_cast<double>(g_generate + 1) / cap;
