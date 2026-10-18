@@ -46,6 +46,7 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
+	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
 	std::array<uint32_t, 3>               dispatch_dimensions {};
 	// Bindless: flattened-SRT words to patch (offset, region, entries) and the heaps whose
@@ -56,8 +57,6 @@ struct PreparedBindings {
 
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
-[[nodiscard]] uint32_t
-NativeDescriptorCount(const ShaderRecompiler::IR::DescriptorBinding& binding);
 [[nodiscard]] vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture,
                                                     uint32_t              element = 0);
 

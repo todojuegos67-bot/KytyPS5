@@ -44,13 +44,7 @@ enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,
 	DrawIndexAuto,
-	EopWrite,
-	EopInterrupt,
-	EopWriteBack,
-	EopFlip,
-	EopWriteBackFlip,
-	EopOnlyFlip,
-	DispatchIndirect,
+	DispatchIndirect = 9,
 	Unknown,
 };
 
@@ -133,29 +127,12 @@ public:
 	[[nodiscard]] HW::UserConfig& GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&     GetShaders() const noexcept { return *m_shaders; }
 
-	// KYTY_STATE_CACHE: the graphics dynamic state and pipeline last recorded into this command
-	// buffer, so a draw records only what changed. All draw pipelines share the same dynamic
-	// states, so their values survive pipeline binds. Cleared when the command buffer begins and
-	// by recordings that bind other graphics pipelines (InvalidateDynamicState).
-	struct DynamicState {
-		bool                         valid          = false;
-		vk::Pipeline                 pipeline       = nullptr;
-		uint32_t                     viewport_count = 0;
-		std::array<vk::Viewport, 16> viewports {};
-		std::array<vk::Rect2D, 16>   scissors {};
-		float                        line_width = 0.0f;
-		std::array<float, 4>         blend_constants {};
-		bool                         depth_test_enable  = false;
-		bool                         depth_write_enable = false;
-		vk::CompareOp                depth_compare_op   = vk::CompareOp::eNever;
-		bool                         depth_bias_enable  = false;
-		std::array<float, 3>         depth_bias {};
-		bool                         stencil_test_enable = false;
-		vk::StencilOpState           stencil_front {};
-		vk::StencilOpState           stencil_back {};
-	};
-	[[nodiscard]] DynamicState& GetDynamicState() const noexcept { return m_dynamic_state; }
-	void                        InvalidateDynamicState() const noexcept { m_dynamic_state = {}; }
+	// KYTY_STATE_CACHE: the graphics pipeline last bound into this command buffer, so a draw
+	// binding it again skips the bind (dynamic state is cached by CommandScheduler's
+	// DynamicState). Cleared when the command buffer begins and by recordings that bind other
+	// graphics pipelines (InvalidateDynamicState).
+	[[nodiscard]] vk::Pipeline& BoundPipeline() const noexcept { return m_bound_pipeline; }
+	void                        InvalidateDynamicState() const noexcept { m_bound_pipeline = nullptr; }
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
@@ -183,7 +160,7 @@ private:
 	uint32_t             m_debug_arg3      = 0;
 	uint64_t             m_debug_arg4      = 0;
 	mutable RenderState  m_render_state;
-	mutable DynamicState m_dynamic_state;
+	mutable vk::Pipeline m_bound_pipeline = nullptr;
 	mutable bool         m_rendering   = false;
 	HW::Context*         m_registers   = nullptr;
 	HW::UserConfig*      m_user_config = nullptr;
@@ -198,9 +175,9 @@ public:
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
-	                      uint32_t mode);
+	                      uint32_t mode, bool async_compute);
 	// KYTY_DUMP_BUFFERS_SHADER (renderCompute.cpp): that program's buffers saved around a dispatch.
 	void DumpBuffers(const ShaderRecompiler::IR::CompiledShaderInfo& program, const PreparedBindings& bindings,
 	                 const CommandRecorder& vk_buffer, const char* when);
@@ -214,7 +191,7 @@ public:
 	// Settles again, within the budget, the keys of a window of each heap whose T# changed since
 	// they were settled; returns how many it resolved.
 	uint32_t RevalidateBindlessKeys(uint32_t budget);
-	void                           FindBuffers(PreparedBindings& bindings);
+	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
@@ -239,6 +216,8 @@ private:
 	                              bool ignore_target_mask = false, bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
+	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                   const DrawEmitInfo& emit, DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
@@ -258,14 +237,16 @@ private:
 	                                               std::span<PreparedBindings* const> stages = {});
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
+	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
+	                                                       uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
-	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-	                                                     const CommandBuffer&          buffer);
-	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-	                                              CommandBuffer& command, uint32_t group_x,
-	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	void                     UpdateComputeMetaClears(const ShaderComputeInputInfo& input,
+	                                                 const CommandBuffer&          buffer);
+	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
+	                                        CommandBuffer& command, uint32_t group_x,
+	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
@@ -278,10 +259,8 @@ private:
 	std::vector<std::array<uint32_t, 8>>  m_bindless_window;
 	std::vector<ImageId>                  m_bindless_used;
 	std::vector<uint32_t>                 m_bindless_srt;
-	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	std::vector<uint32_t>                 m_image_occurrences;
 	// Created at the first thread-dimension indirect dispatch.
 	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
 

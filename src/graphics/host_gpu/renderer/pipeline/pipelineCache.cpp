@@ -3,12 +3,14 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -22,7 +24,6 @@
 #include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
-#include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -60,6 +61,18 @@ bool ShaderFailureNonFatal() {
 
 namespace {
 
+constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
+
+uint8_t RemapSourceAlphaFactor(uint8_t factor) {
+	switch (static_cast<Prospero::BlendFactor>(factor)) {
+		case Prospero::BlendFactor::kSrcAlpha:
+			return static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Alpha);
+		case Prospero::BlendFactor::kOneMinusSrcAlpha:
+			return static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+		default: return factor;
+	}
+}
+
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
@@ -89,7 +102,8 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+	// Driver cache entries already distinguish shader code and pipeline state across builds.
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n",
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
@@ -341,8 +355,11 @@ std::vector<uint32_t> ReadShaderCode(uint64_t address) {
 
 bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	KYTY_PROFILER_BLOCK("ShaderGuestMemoryRead");
-	auto*      chunks = static_cast<ShaderReadChunks*>(userdata);
-	const bool ok     = ReadShaderGuestMemoryImpl(chunks, address, values);
+	auto* chunks = static_cast<ShaderReadChunks*>(userdata);
+	// Scalar and unformatted buffer dependencies also accept the backing native raw loads use.
+	const bool ok = ReadShaderGuestMemoryImpl(chunks, address, values) ||
+	                (!values.empty() && Libs::LibKernel::Memory::TryReadBufferBacking(
+	                                        address, values.data(), values.size_bytes()));
 	if (chunks != nullptr) {
 		chunks->Log(address, values, ok);
 	}
@@ -470,7 +487,7 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
-                         const std::vector<uint32_t>& spirv) {
+                         const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
 	if (!Config::ShaderValidationEnabled()) {
 		return true;
 	}
@@ -482,7 +499,9 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 		                        static_cast<int>(position.column), static_cast<int>(position.index),
 		                        message);
 	});
-	if (tools.Validate(spirv)) {
+	spvtools::ValidatorOptions validator_options;
+	validator_options.SetAllowOffsetTextureOperand(maintenance8_enabled);
+	if (tools.Validate(spirv.data(), spirv.size(), validator_options)) {
 		return true;
 	}
 	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
@@ -642,6 +661,7 @@ struct PipelineCache::ProgramCache {
 	};
 
 	struct Permutation {
+		std::vector<uint32_t>                       function_code;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
@@ -660,11 +680,64 @@ struct PipelineCache::ProgramCache {
 		uint64_t                                     last_use = 0;
 	};
 	struct SourceEntry {
-		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
+		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
+		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
+		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {
 			permutations.reserve(8);
 		}
 
+		std::span<const uint32_t> FunctionCode() const {
+			return call_source
+			    ? std::span<const uint32_t>(call_source->linked->code).subspan(call_source->code.size())
+			    : std::span<const uint32_t>{};
+		}
+
+		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+			const auto revision = call_source->revision;
+			ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
+			resource_plan.source_reads = call_source->reads;
+			return revision != call_source->revision;
+		}
+
+		template <bool HasCalls>
+		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		                             uint32_t push_data_cursor) {
+			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+			    resource_plan, runtime, resources, specialization));
+			for (auto& candidate: permutations) {
+				const auto& layout = candidate.program.bindings;
+				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
+				        push_data_cursor, layout.ShaderDataDwords()) ||
+				    candidate.specialization != specialization) {
+					continue;
+				}
+				if constexpr (HasCalls) {
+					if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
+				}
+				return &candidate;
+			}
+			return nullptr;
+		}
+
+		// The permutation for the resources materialized last (and, with calls, the linked
+		// function code), or nullptr.
+		Permutation* MatchPermutation(uint32_t push_data_cursor) {
+			for (auto& candidate: permutations) {
+				const auto& layout = candidate.program.bindings;
+				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
+				        push_data_cursor, layout.ShaderDataDwords()) ||
+				    candidate.specialization != specialization) {
+					continue;
+				}
+				if (call_source && !std::ranges::equal(candidate.function_code, FunctionCode())) {
+					continue;
+				}
+				return &candidate;
+			}
+			return nullptr;
+		}
+
+		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
@@ -824,24 +897,30 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
+	                               uint32_t push_data_start_dword,
+	                               std::span<const uint32_t> function_code) {
 		FrameCosts::Timer cost_timer {FrameCosts::g_shader_us, FrameCosts::g_shader_count};
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
+		                                         Common::DebugCounters::Counter::ShaderCompileNs,
+		                                         Common::DebugCounters::Peak::ShaderCompileNs);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
+		                         options.maintenance8_enabled)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
-		const auto module = CompileSPV(result.spirv, device);
+		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
 		return {
+		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
 		    .handle         = {.id = ++next_shader_id, .module = module},
@@ -909,53 +988,54 @@ struct PipelineCache::ProgramCache {
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			for (uint32_t axis = 0; axis < 3u; axis++) {
-				runtime.workgroup_count[axis] = input_info.dispatch_groups[axis];
+				// Zero for an indirect dispatch: the host does not know the workgroup count.
+				runtime.workgroup_count[axis] = input_info.workgroup_counts[axis];
 				runtime.workgroup_size[axis]  = input_info.threads_num[axis];
 			}
+			runtime.workgroup_counts      = input_info.workgroup_counts;
+			runtime.indirect_args_address = input_info.indirect_args_address;
 		}
+		bool source_changed = false;
 		if (entry != programs.end()) {
-			bool materialized = false;
-			{
-				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
-				materialized = Materialize(entry->second, runtime, read_chunks);
-				if (ShaderRecompiler::IR::SrtNativeStats stats;
-				    ShaderRecompiler::IR::TakeSrtNativeReport(stats)) {
-					::printf("SRT native: %u plans compiled, %u failed, %" PRIu64 " KB of code, %" PRIu64
-					     " instructions, %" PRIu64 " through the interpreter\n",
-					     stats.plans, stats.failed, stats.bytes / 1024u, stats.instructions,
-					     stats.interpreted);
-				}
+			auto& cached = entry->second;
+			if (cached.call_source) {
+				source_changed = cached.RefreshCallSource(runtime);
 			}
-			if (!materialized) {
-				// A descriptor source that cannot be read right now (memory the guest has not
-				// mapped or filled yet) skips this draw rather than the session; the next one
-				// re-evaluates from scratch.
-				if (!ShaderFailureNonFatal()) {
-					EXIT("shader resource materialization failed\n");
+			Permutation* permutation = nullptr;
+			if (!source_changed) {
+				bool materialized = false;
+				{
+					KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
+					materialized = Materialize(entry->second, runtime, read_chunks);
+					if (ShaderRecompiler::IR::SrtNativeStats stats;
+					    ShaderRecompiler::IR::TakeSrtNativeReport(stats)) {
+						::printf("SRT native: %u plans compiled, %u failed, %" PRIu64 " KB of code, %" PRIu64
+						     " instructions, %" PRIu64 " through the interpreter\n",
+						     stats.plans, stats.failed, stats.bytes / 1024u, stats.instructions,
+						     stats.interpreted);
+					}
 				}
-				DrawDiff::NoteSkip(params.hash, "resource materialization failed");
-				static std::atomic<uint32_t> reported = 0;
-				if (reported.fetch_add(1) < 16) {
-					LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
-					     ": resource materialization failed (materialization line %d)\n",
-					     static_cast<uint32_t>(stage), params.hash,
-					     ShaderRecompiler::IR::LastIndirectImageFailureLine());
+				if (!materialized) {
+					// A descriptor source that cannot be read right now (memory the guest has not
+					// mapped or filled yet) skips this draw rather than the session; the next one
+					// re-evaluates from scratch.
+					if (!ShaderFailureNonFatal()) {
+						EXIT("shader resource materialization failed\n");
+					}
+					DrawDiff::NoteSkip(params.hash, "resource materialization failed");
+					static std::atomic<uint32_t> reported = 0;
+					if (reported.fetch_add(1) < 16) {
+						LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
+						     ": resource materialization failed (materialization line %d)\n",
+						     static_cast<uint32_t>(stage), params.hash,
+						     ShaderRecompiler::IR::LastIndirectImageFailureLine());
+					}
+					return ShaderProgram {};
 				}
-				return ShaderProgram {};
-			}
-			auto permutation = entry->second.permutations.end();
-			{
 				KYTY_PROFILER_BLOCK("ProgramCache::FindPermutation");
-				permutation = std::ranges::find_if(
-				    entry->second.permutations, [&](const Permutation& candidate) {
-					    const auto& layout = candidate.program.bindings;
-					    return layout.push_data_start_dword ==
-					               ShaderRecompiler::IR::PushData::StartFor(
-					                   push_data_cursor, layout.ShaderDataDwords()) &&
-					           candidate.specialization == entry->second.specialization;
-				    });
+				permutation = cached.MatchPermutation(push_data_cursor);
 			}
-			if (permutation != entry->second.permutations.end()) {
+			if (permutation != nullptr) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
@@ -988,11 +1068,13 @@ struct PipelineCache::ProgramCache {
 		}
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
+		options.maintenance8_enabled = graphics.maintenance8_enabled;
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
+		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 
@@ -1013,7 +1095,22 @@ struct PipelineCache::ProgramCache {
 		const auto compile_code = lookup_key.function_code.empty()
 		                              ? params.code
 		                              : std::span<const uint32_t>(lookup_key.function_code);
-		auto translated = ShaderRecompiler::TranslateProgram(compile_code, options);
+		// Official call linking (ShaderSource) runs on the code ShaderFunctions expanded, if any.
+		ShaderRecompiler::ShaderSource source;
+		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(compile_code, options);
+		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
+		ShaderRecompiler::TranslateResult translated;
+		if (current != nullptr) {
+			if (current->call) {
+				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+				translated.program.source_reads = current->reads;
+			} else {
+				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+			}
+		} else {
+			translated = ShaderRecompiler::TranslateProgram(compile_code, options);
+		}
 		if (!translated.unsupported && !translated.call_target_user_data.empty() &&
 		    call_targets.try_emplace(params.hash, translated.call_target_user_data).second) {
 			for (const auto index: translated.call_target_user_data) {
@@ -1040,8 +1137,9 @@ struct PipelineCache::ProgramCache {
 			return ShaderProgram {};
 		}
 		if (entry == programs.end()) {
+			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
+			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, runtime, entry->second.resources,
 			        entry->second.specialization)) {
@@ -1058,9 +1156,17 @@ struct PipelineCache::ProgramCache {
 				}
 				return ShaderProgram {};
 			}
+		} else if (source_changed) {
+			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
+				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
+				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				return permutation->handle;
+			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
+		    entry->second.FunctionCode()));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -1081,15 +1187,15 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	ProgramCache(vk::Device device, bool shader_clock, bool bindless_images)
-	    : device(device), shader_clock(shader_clock), bindless_images(bindless_images) {
+	ProgramCache(GraphicContext& graphics, bool shader_clock, bool bindless_images)
+	    : graphics(graphics), shader_clock(shader_clock), bindless_images(bindless_images) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
-				device.destroyShaderModule(permutation.handle.module, nullptr);
+				graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
 			}
 		}
 	}
@@ -1125,7 +1231,7 @@ struct PipelineCache::ProgramCache {
 	uint64_t                              memo_misses = 0;
 	std::vector<uint32_t>                 memo_words;
 	std::chrono::steady_clock::time_point memo_report = std::chrono::steady_clock::now();
-	vk::Device                                                  device;
+	GraphicContext&                                             graphics;
 	bool                                                        shader_clock = false;
 	bool                                                        bindless_images = false;
 	uint64_t                                                    next_shader_id = 0;
@@ -1134,8 +1240,9 @@ struct PipelineCache::ProgramCache {
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics),
       m_program_cache(std::make_unique<ProgramCache>(
-          graphics.device, graphics.shader_device_clock_enabled,
-          graphics.bindless_enabled && Config::BindlessImagesEnabled())) {
+          graphics, graphics.shader_device_clock_enabled,
+          graphics.bindless_enabled && Config::BindlessImagesEnabled())),
+      m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	if (g_async_pipelines) {
@@ -1178,17 +1285,6 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	const std::string_view git_hash     = KYTY_GIT_HASH;
-	const std::string_view git_revision = KYTY_GIT_REVISION;
-	if (git_hash == "unknown" || git_revision == "unknown") {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
-	}
-
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
@@ -1222,7 +1318,7 @@ void PipelineCache::InitializeDriverCache() {
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
 				initial_data.clear();
 				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
+				    "Vulkan pipeline cache: invalidating {} (driver or data mismatch)",
 				    path);
 			} else if (cached_signature != signature) {
 				PipelineCacheLog("Vulkan pipeline cache: keeping {} from another emulator revision",
@@ -1252,22 +1348,37 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	if (!initial_data.empty()) {
-		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {}", initial_data.size(),
-		                 path);
+		PipelineCacheLog("Vulkan pipeline cache: loaded {:.2f} MB from {}",
+		                 static_cast<double>(initial_data.size()) / 1'000'000.0, path);
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
 }
 
 void PipelineCache::Save() {
-	// No worker may use the driver cache once it is destroyed below; later pipelines are
+	// No worker may use the driver cache once it is destroyed (shutdown); later pipelines are
 	// compiled on the GPU thread (FinishPending).
 	if (m_compiler != nullptr) {
 		m_compiler->Stop();
 	}
+	WriteDriverCache();
+}
+
+void PipelineCache::CheckpointDriverCache() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	m_driver_cache_dirty = true;
+	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
+		WriteDriverCache();
+	}
+}
+
+void PipelineCache::WriteDriverCache() {
+	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
+		return;
+	}
+	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -1287,8 +1398,8 @@ void PipelineCache::Save() {
 	}
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
-		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
-		                 vk::to_string(result), size);
+		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
+		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
 		return;
 	}
 	payload.resize(size);
@@ -1310,16 +1421,20 @@ void PipelineCache::Save() {
 	}
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
-	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
+	const bool written = prefix_written == prefix.size() && payload_written == payload.size() && flushed;
+	std::error_code error;
+	if (written) {
+		std::filesystem::rename(temp_path, m_driver_cache_path, error);
+	}
+	if (!written || error) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
 		return;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
+	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	m_driver_cache_dirty = false;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -1341,6 +1456,17 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
+	const bool object_primitive_id = context.HasObjectPrimitiveIdOutput();
+	if (object_primitive_id) {
+		// CxObjectIdMode: register source plus a 32-bit pipelined primitive-ID addition.
+		EXIT_NOT_IMPLEMENTED(sh.m_paClObjprimIdCntl != 2u || mesh_active || tess_active ||
+		                     !pixel_active || (sh.m_vgtDrawPayloadCntl & 8u) == 0 ||
+		                     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList);
+		const auto& target = context.GetRenderTarget(7);
+		EXIT_NOT_IMPLEMENTED(Prospero::ResolveRenderTargetFormat(target.info.format,
+		                                                       target.info.channel_type)
+		                         .buffer_format != Prospero::BufferFormat::k32UInt);
+	}
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info[0].mesh;
@@ -1384,6 +1510,36 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				pixel_info.target_sint_mask |= 1u << slot;
 			}
 		}
+		pixel_info.object_primitive_id = object_primitive_id;
+		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
+			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
+			if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;
+			const auto& rt = context.GetRenderTarget(slot);
+			const auto target_mask = render_target_mask_slot(context.GetRenderTargetMask(), slot);
+			if (rt.base.addr == 0 || target_mask == 0u) continue;
+			const auto format = Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type);
+			if (format.buffer_format != Prospero::BufferFormat::k11_11_10UNorm) continue;
+			const auto mapping = pixel_info.target_export_mapping[export_index];
+			const auto shader_mask = render_target_mask_slot(pixel_info.target_shader_mask, slot);
+			const bool blend = context.GetBlendControl(slot).enable && !rt.info.blend_bypass;
+			if (blend || (mapping.ApplyMask(target_mask) & 7u) != 7u ||
+			    (mapping.ApplyMask(shader_mask) & 7u) != 7u ||
+			    pixel_info.target_output_mode[export_index] != 9u) {
+				EXIT("unsupported packed UNorm render-target export: slot=%u export=%u mode=%u "
+				     "target_mask=0x%x shader_mask=0x%x mapping=0x%02x blend=%u\n",
+				     slot, export_index, pixel_info.target_output_mode[export_index], target_mask,
+				     shader_mask, mapping.packed, static_cast<uint32_t>(blend));
+			}
+			pixel_info.target_packed_unorm_mask |= 1u << export_index;
+			pixel_info.target_round_mode |= static_cast<uint8_t>(rt.info.round_mode) << export_index;
+		}
+		if (!mesh_active && !tess_active && Prospero::IsRectList(user_config.GetPrimType())) {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
+		} else if (context.GetModeControl().provoking_vtx_last) {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::LastVertex;
+		} else {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
+		}
 		const auto& blend = context.GetBlendControl(0);
 		pixel_info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
@@ -1403,14 +1559,24 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
 		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
 		                       std::end(pixel_info.target_output_mode),
-		                       [](uint8_t mode) { return mode == 0; }) &&
-		           ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0]) ==
-		               BlendMappingSupport::SourceAlpha) {
-			// Preserve logical alpha when the export mapping moves it.
-			pixel_info.alpha_blend_source_remap = true;
-			pixel_info.dual_source_blending     = true;
-			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
-			pixel_info.target_export_mapping[1] = {};
+		                       [](uint8_t mode) { return mode == 0; })) {
+			switch (ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0])) {
+				case BlendMappingSupport::SourceAlpha:
+					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlpha;
+					break;
+				case BlendMappingSupport::SourceAlphaOne:
+					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaOne;
+					break;
+				case BlendMappingSupport::SourceAlphaZero:
+					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaZero;
+					break;
+				default: break;
+			}
+			if (pixel_info.alpha_blend_source != ShaderAlphaBlendSource::None) {
+				pixel_info.dual_source_blending     = true;
+				pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
+				pixel_info.target_export_mapping[1] = {};
+			}
 		}
 	}
 	if (context.GetClipControl().clip_disable) {
@@ -1427,8 +1593,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
-	uint32_t          push_data_cursor =
-	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
+	    mesh_active, object_primitive_id);
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
@@ -1452,19 +1618,8 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
-	// Use one effective size for the cache key, LDS declaration, and access bounds.
-	const auto max_lds_dwords =
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
-	if (input_info.lds_size_dwords > max_lds_dwords) {
-		static std::atomic_bool warned = false;
-		if (!warned.exchange(true, std::memory_order_relaxed)) {
-			PipelineCacheLog("GPU warning: game compute shader requests {} bytes of LDS, but "
-			                 "the Vulkan device limit is {} bytes. Clamping LDS; rendering may "
-			                 "be incorrect.",
-			                 input_info.lds_size_dwords * 4u, max_lds_dwords * 4u);
-		}
-	}
-	input_info.lds_size_dwords = std::min(input_info.lds_size_dwords, max_lds_dwords);
+	input_info.lds_storage = input_info.lds_size_dwords * 4u >
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
 	return m_program_cache->Get(params, input_info, push_data_cursor);
 }
@@ -1539,6 +1694,9 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
 		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
 		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
+		if (colors[i].desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm) {
+			static_params.color_mask[slot] = 1u;
+		}
 		rendering.color_formats[slot] = colors[i].desc.view_info.format;
 		if (attachment_samples == 0) {
 			attachment_samples = colors[i].desc.info.samples;
@@ -1548,10 +1706,12 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
 		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
-		const bool alpha_remap =
-		    slot == 0 && ps_input_info != nullptr && ps_input_info->alpha_blend_source_remap;
+		auto alpha_source = ShaderAlphaBlendSource::None;
+		if (slot == 0 && ps_input_info != nullptr) {
+			alpha_source = ps_input_info->alpha_blend_source;
+		}
 		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
-		if (static_params.blend_enable[slot] && !alpha_remap &&
+		if (static_params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None &&
 		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
 			static_params.blend_enable[slot] = false;
 			static std::atomic_bool warned = false;
@@ -1563,18 +1723,32 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 				    bc.alpha_srcblend, bc.alpha_destblend, bc.separate_alpha_blend ? 1 : 0));
 			}
 		}
-		if (alpha_remap) {
-			static_params.blend_alpha_source_remap = true;
-		}
 		if (static_params.blend_enable[slot]) {
-			static_params.color_srcblend[slot]       = bc.color_srcblend;
-			static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
-			static_params.color_destblend[slot]      = bc.color_destblend;
-			static_params.separate_alpha_blend[slot] = bc.separate_alpha_blend;
-			if (bc.separate_alpha_blend) {
-				static_params.alpha_srcblend[slot]  = bc.alpha_srcblend;
-				static_params.alpha_comb_fcn[slot]  = bc.alpha_comb_fcn;
-				static_params.alpha_destblend[slot] = bc.alpha_destblend;
+			auto blend = bc;
+			switch (alpha_source) {
+				case ShaderAlphaBlendSource::SourceAlpha:
+					blend.color_srcblend  = RemapSourceAlphaFactor(blend.color_srcblend);
+					blend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
+					blend.separate_alpha_blend = false;
+					break;
+				case ShaderAlphaBlendSource::SourceAlphaOne:
+				case ShaderAlphaBlendSource::SourceAlphaZero:
+					// The second source carries the mapped source factor; its alpha stays logical Sa.
+					blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
+					blend.color_destblend =
+					    static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+					blend.separate_alpha_blend = false;
+					break;
+				case ShaderAlphaBlendSource::None: break;
+			}
+			static_params.color_srcblend[slot]       = blend.color_srcblend;
+			static_params.color_comb_fcn[slot]       = blend.color_comb_fcn;
+			static_params.color_destblend[slot]      = blend.color_destblend;
+			static_params.separate_alpha_blend[slot] = blend.separate_alpha_blend;
+			if (blend.separate_alpha_blend) {
+				static_params.alpha_srcblend[slot]  = blend.alpha_srcblend;
+				static_params.alpha_comb_fcn[slot]  = blend.alpha_comb_fcn;
+				static_params.alpha_destblend[slot] = blend.alpha_destblend;
 			}
 		}
 	}
@@ -1622,9 +1796,6 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
-	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
-	static_params.depth_min_bounds         = depth.depth_min_bounds;
-	static_params.depth_max_bounds         = depth.depth_max_bounds;
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
@@ -1706,16 +1877,23 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			return defer();
 		}
 		LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+		CheckpointDriverCache();
 		return &pipeline;
 	}
-	const auto result = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	{
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+		                                         Common::DebugCounters::Counter::PipelineCreateNs,
+		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		const auto result = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline);
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	CheckpointDriverCache();
 
 	return iter->second.get();
 }
@@ -1737,13 +1915,20 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	{
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+		                                         Common::DebugCounters::Counter::PipelineCreateNs,
+		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+		                       m_driver_cache);
+	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	CheckpointDriverCache();
 
 	return *iter->second;
 }

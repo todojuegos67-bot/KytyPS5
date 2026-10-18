@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <cstdlib>
@@ -45,7 +46,7 @@ struct Fixture {
       program.block_storage.push_back(std::make_unique<Block>());
       auto *block = program.block_storage.back().get();
       program.blocks.push_back(block);
-      program.block_info.push_back({.id = index});
+      program.blocks.back()->id = index;
     }
   }
 
@@ -131,7 +132,7 @@ void TestImmediateFlatteningAndGvn() {
   TestMemory memory_image{{{0x1020u, 0xfeedbeefu}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat), "flattened SRT walk failed");
+  Check(SrtWalker(ExtractResourcePlan(fixture.program), runtime).RefreshFlatBuffer(flat), "flattened SRT walk failed");
   Check(flat == std::vector<uint32_t>{0xfeedbeefu} && memory_image.reads == 1,
         "flattened SRT did not evaluate its canonical read once");
 }
@@ -147,7 +148,7 @@ void TestRawScalarComponentAlignment() {
   TestMemory memory_image{{{0x1000u, 0x12345678u}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat), "raw scalar SRT walk failed");
+  Check(SrtWalker(ExtractResourcePlan(fixture.program), runtime).RefreshFlatBuffer(flat), "raw scalar SRT walk failed");
   Check(
       flat == std::vector<uint32_t>{0x12345678u} && memory_image.reads == 1,
       "raw scalar base, immediate, and offset were not aligned independently");
@@ -202,7 +203,7 @@ void TestNestedSrtWalk() {
   TestMemory memory_image{{{0x1000u, 0x2000u}, {0x2000u, 0xabcdef01u}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat), "nested SRT walk failed");
+  Check(SrtWalker(ExtractResourcePlan(fixture.program), runtime).RefreshFlatBuffer(flat), "nested SRT walk failed");
   Check(flat == std::vector<uint32_t>({0x2000u, 0xabcdef01u}),
         "nested typed SRT reads were not evaluated in dependency order");
 }
@@ -225,7 +226,7 @@ void TestShaderBaseAndUserData() {
   SrtRuntime runtime{.user_data = user_data,
                      .shader_base = 0x12345678abcdef00ull};
   DescriptorValue result;
-  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(0, result),
+  Check(SrtWalker(ExtractResourcePlan(fixture.program), runtime).EvaluateDescriptor(0, result),
         "shader-relative descriptor evaluation failed");
   Check(result.dword_count == 3 && result.dwords[0] == 0xabcdef00u &&
             result.dwords[1] == 0x12345678u && result.dwords[2] == 0x24u,
@@ -250,7 +251,7 @@ void TestCarryAndBitFields() {
       {.dwords = {low, high, inserted, sign}, .dword_count = 4});
 
   DescriptorValue result;
-  Check(SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result),
+  Check(SrtWalker(ExtractResourcePlan(fixture.program), {}).EvaluateDescriptor(0, result),
         "carry and bit-field descriptor evaluation failed");
   Check(result.dwords[0] == 1u && result.dwords[1] == 1u &&
             result.dwords[2] == 0x89abcdefu && result.dwords[3] == 0xffffffffu,
@@ -273,11 +274,12 @@ void TestInvariantAndDivergentPhi() {
   fixture.program.descriptor_sources.push_back(
       {.dwords = {Value(&divergent)}, .dword_count = 1});
 
+  const auto plan = ExtractResourcePlan(fixture.program);
   DescriptorValue result;
-  Check(SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result) &&
+  Check(SrtWalker(plan, {}).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 7u,
         "loop-invariant typed phi was rejected");
-  Check(!SrtWalker(fixture.program, {}).EvaluateDescriptor(1, result),
+  Check(!SrtWalker(plan, {}).EvaluateDescriptor(1, result),
         "divergent phi was accepted");
 }
 
@@ -374,7 +376,7 @@ void TestRuntime64BitDescriptorOps() {
       {.dwords = {low, high}, .dword_count = 2});
 
   DescriptorValue result;
-  Check(SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result) &&
+  Check(SrtWalker(ExtractResourcePlan(fixture.program), {}).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 0xabcdu && result.dwords[1] == 0x1235u,
         "64-bit typed descriptor arithmetic evaluation is incorrect");
 }
@@ -447,12 +449,13 @@ void TestUniformFirstLaneSamplerLod() {
   std::array<uint32_t, 7> user_data{};
   user_data[6] = 3u;
   SrtRuntime runtime{.user_data = user_data};
+  const auto plan = ExtractResourcePlan(fixture.program);
   DescriptorValue result;
-  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(0, result) &&
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 0x00300300u,
         "uniform sampler LOD evaluated incorrectly");
   user_data[6] = 20u;
-  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(0, result) &&
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 0x00ffffffu,
         "uniform sampler LOD clamp evaluated incorrectly");
 }
@@ -487,11 +490,12 @@ void TestFloatComparisonDescriptorInputs() {
     fixture.program.descriptor_sources.push_back(
         {.dwords = {low, high}, .dword_count = 2});
 
+    const auto plan = ExtractResourcePlan(fixture.program);
     for (size_t index = 0; index < inputs.size(); index++) {
       const auto &input = inputs[index];
       const std::array user_data{input.bits};
       DescriptorValue result;
-      Check(SrtWalker(fixture.program, {.user_data = user_data})
+      Check(SrtWalker(plan, {.user_data = user_data})
                     .EvaluateDescriptor(0, result) &&
                 result.dwords[0] == (flush && index < 4 ? 1 : input.less_equal) &&
                 result.dwords[1] == (flush && index < 4 ? 1 : input.greater_equal),
@@ -548,30 +552,51 @@ void TestConstantBufferBounds() {
   struct Case {
     uint32_t offset;
     uint32_t immediate;
-    bool in_range;
+    uint32_t stride;
+    uint32_t records;
+    bool valid;
     uint32_t expected;
+    uint32_t reads;
   };
-  for (const auto &test : {Case{12u, 0u, true, 0xa5a5a5a5u},
-                           Case{3u, 1u, true, 0x12345678u},
-                           Case{0xfffffffcu, 4u, false, 0u},
-                           Case{16u, 0u, false, 0u}}) {
+  struct MemoryProbe {
+    TestMemory memory{{{0x3000u, 0x12345678u}, {0x300cu, 0xa5a5a5a5u}}};
+    uint32_t attempts = 0;
+  };
+  const auto read_memory = [](void *userdata, uint64_t address,
+                              std::span<uint32_t> values) {
+    auto &probe = *static_cast<MemoryProbe *>(userdata);
+    ++probe.attempts;
+    return ReadMemory(&probe.memory, address, values);
+  };
+  // PS5 scalar-buffer loads return zero per out-of-range DWORD; an unreadable
+  // in-range address remains a failed memory read.
+  for (const auto &test : {Case{12u, 0u, 0u, 16u, true, 0xa5a5a5a5u, 1u},
+                           Case{3u, 1u, 0u, 16u, true, 0x12345678u, 1u},
+                           Case{0xfffffffcu, 4u, 0u, 16u, true, 0u, 0u},
+                           Case{16u, 0u, 0u, 16u, true, 0u, 0u},
+                           Case{12u, 0u, 0u, 14u, true, 0u, 0u},
+                           Case{0u, 0u, 0u, 0u, true, 0u, 0u},
+                           Case{8u, 0u, 0u, 16u, false, 0u, 1u},
+                           Case{12u, 0u, 48u, 32768u, true, 0xa5a5a5a5u, 1u},
+                           Case{0x6339c0u, 16u, 48u, 32768u, true, 0u, 0u}}) {
     Fixture fixture;
     const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer, test.immediate);
     const auto buffer =
         fixture.Emit(ValueOpcode::GetBufferResource,
-                     {Value(0x3000u), Value(0u), Value(16u), Value(0u)});
+                     {Value(0x3000u), Value(test.stride << 16u),
+                      Value(test.records), Value(0u)});
     const auto read = fixture.EmitMemory(ValueOpcode::ReadConstBuffer,
                                          {buffer, Value(test.offset)}, memory);
     LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
     fixture.Plan();
 
-    TestMemory memory_image{{{0x3000u, 0x12345678u}, {0x300cu, 0xa5a5a5a5u}}};
-    SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
+    MemoryProbe memory_image;
+    SrtRuntime runtime{.read_memory = read_memory, .userdata = &memory_image};
     std::vector<uint32_t> flat;
-    Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat),
-          "constant-buffer walk failed");
-    Check(flat == std::vector<uint32_t>{test.expected} &&
-              (test.in_range || memory_image.reads == 0),
+    Check(SrtWalker(ExtractResourcePlan(fixture.program), runtime).RefreshFlatBuffer(flat) == test.valid,
+          "constant-buffer walk misaligned or wrapped its offset components");
+    Check((!test.valid || flat == std::vector<uint32_t>{test.expected}) &&
+              memory_image.attempts == test.reads,
           "constant-buffer walk read the wrong word or accessed an out-of-bounds address");
   }
 }
@@ -596,6 +621,124 @@ void TestReadLaneElimination() {
         "dynamic-lane read was rewritten unsafely");
 }
 
+void TestCompleteUMinReduction() {
+  enum class Case {
+    Masked, Subset, Literal, LiteralMasked, LiteralMove, Wave32,
+    UnrelatedSeed, UnmaskedSymbolic, WrongNeutral, RowMask, BankMask,
+    Shift, FetchInactive, BoundControl, Dpp8, MoveExec, UpdateExec,
+    Previous, DppSource, CrossExec, CrossRow, CrossSelectorLow,
+    CrossSelectorHigh, CrossFetch, CrossBound, CrossSource, FinalExec,
+    Endpoint, EndpointSource, DifferentWitness, CrossBlock, WrongOperation
+  };
+  for (const auto test : {Case::Masked, Case::Subset, Case::Literal,
+       Case::LiteralMasked, Case::LiteralMove, Case::Wave32, Case::UnrelatedSeed,
+       Case::UnmaskedSymbolic, Case::WrongNeutral, Case::RowMask, Case::BankMask,
+       Case::Shift, Case::FetchInactive, Case::BoundControl, Case::Dpp8,
+       Case::MoveExec, Case::UpdateExec, Case::Previous, Case::DppSource,
+       Case::CrossExec, Case::CrossRow, Case::CrossSelectorLow,
+       Case::CrossSelectorHigh, Case::CrossFetch, Case::CrossBound,
+       Case::CrossSource, Case::FinalExec, Case::Endpoint, Case::EndpointSource,
+       Case::DifferentWitness, Case::CrossBlock, Case::WrongOperation}) {
+    Fixture fixture(test == Case::CrossBlock ? 2 : 1);
+    const auto source = fixture.Emit(ValueOpcode::LaneId);
+    const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {source, Value(19u)});
+    const auto other_mask = fixture.Emit(ValueOpcode::IEqual32, {source, Value(7u)});
+    const auto negated = fixture.Emit(ValueOpcode::LogicalNot, {mask});
+    const bool literal = test == Case::Literal || test == Case::LiteralMasked;
+    const auto enabled = literal ? Value(true) :
+        fixture.Emit(ValueOpcode::LogicalOr, {negated, mask});
+    auto seed_mask = test == Case::UnrelatedSeed ? other_mask : mask;
+    if (test == Case::Subset)
+      seed_mask = fixture.Emit(ValueOpcode::LogicalAnd, {other_mask, mask});
+    const auto seed = test == Case::Literal || test == Case::UnmaskedSymbolic ? source :
+        fixture.Emit(ValueOpcode::SelectU32,
+            {seed_mask, source, Value(test == Case::WrongNeutral ? 0u : UINT32_MAX)});
+    auto prefix = fixture.Emit(ValueOpcode::SelectU32, {enabled, seed, source});
+    Value preserved;
+    const auto operation = test == Case::WrongOperation ? ValueOpcode::BitwiseOr32 :
+                                                        ValueOpcode::UMin32;
+    for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
+      DppMoveFlags flags{.control = 0x110u + shift};
+      if (shift == 2) {
+        if (test == Case::RowMask) flags.row_mask = 7;
+        if (test == Case::BankMask) flags.bank_mask = 7;
+        if (test == Case::Shift) flags.control = 0x113;
+        if (test == Case::FetchInactive) flags.fetch_inactive = true;
+        if (test == Case::BoundControl) flags.bound_control = true;
+        if (test == Case::Dpp8) flags.dpp8 = true;
+      }
+      const auto move = fixture.Emit(ValueOpcode::DppMoveU32,
+          {test == Case::DppSource ? source : prefix,
+           test == Case::MoveExec ? mask : test == Case::LiteralMove ? Value(true) : enabled});
+      move.Instruction()->SetFlags(flags);
+      const auto combined = fixture.Emit(operation, {move, prefix});
+      const auto update = fixture.Emit(ValueOpcode::DppUpdateU32,
+          {combined, test == Case::Previous ? source : prefix,
+           test == Case::UpdateExec ? mask : enabled});
+      update.Instruction()->SetFlags(flags);
+      prefix = update;
+      if (shift == 2) preserved = fixture.Emit(ValueOpcode::ReferenceU32, {prefix});
+    }
+    auto cross_exec = test == Case::CrossExec ? mask : enabled;
+    if (test == Case::DifferentWitness) {
+      const auto other_not = fixture.Emit(ValueOpcode::LogicalNot, {other_mask});
+      cross_exec = fixture.Emit(ValueOpcode::LogicalOr, {other_mask, other_not});
+    }
+    const auto cross = fixture.Emit(ValueOpcode::Permlane16U32,
+        {test == Case::CrossSource ? source : prefix,
+         Value(test == Case::CrossSelectorLow ? 0xfffffff0u : UINT32_MAX),
+         Value(test == Case::CrossSelectorHigh ? 0xfffffff0u : UINT32_MAX), cross_exec});
+    cross.Instruction()->SetFlags(PermlaneFlags{
+        .x16 = test != Case::CrossRow, .fetch_inactive = test == Case::CrossFetch,
+        .bound_control = test != Case::CrossBound});
+    const auto cross_write = fixture.Emit(ValueOpcode::SelectU32, {enabled, cross, source});
+    const auto combined = fixture.Emit(operation, {prefix, cross_write});
+    const auto final = fixture.Emit(ValueOpcode::SelectU32,
+        {test == Case::FinalExec ? mask : enabled, combined, prefix});
+    const uint32_t result_block = test == Case::CrossBlock ? 1u : 0u;
+    const auto low = fixture.Emit(ValueOpcode::ReadLane,
+        {final, Value(test == Case::Endpoint ? 30u : 31u)}, 0, result_block);
+    const auto high = fixture.Emit(ValueOpcode::ReadLane,
+        {test == Case::EndpointSource ? prefix : final, Value(63u)}, 0, result_block);
+    const auto result = fixture.Emit(operation, {high, low}, 0, result_block);
+    const auto use = fixture.Emit(ValueOpcode::ReferenceU32, {result}, 0, result_block);
+    using Terminator = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+    fixture.BlockAt(result_block).terminator.kind = Terminator::Return;
+    if (result_block != 0) {
+      fixture.BlockAt().AddBranch(&fixture.BlockAt(1));
+      fixture.BlockAt().terminator.kind = Terminator::Branch;
+      fixture.BlockAt().terminator.true_block = &fixture.BlockAt(1);
+    }
+    ValidateProgram(fixture.program, true);
+    const auto stats = EliminateReadLane(fixture.program, test == Case::Wave32 ? 32u : 64u);
+    const bool matches = test == Case::Masked || test == Case::Subset ||
+        test == Case::Literal || test == Case::LiteralMasked || test == Case::LiteralMove;
+    Check(stats.rewritten_reductions == (matches ? 1u : 0u) && stats.rewritten_reads == 0,
+          ("UMin reduction proof failed case " + std::to_string(static_cast<unsigned>(test))).c_str());
+    if (matches) {
+      const auto *reduction = use.Instruction()->Arg(0).ResolveInstruction();
+      Check(reduction->GetOpcode() == ValueOpcode::SubgroupUMinU32 &&
+                reduction->Arg(0).Resolve() == seed.Resolve(),
+            "UMin reduction changed the neutral-masked input");
+      RemoveIdentities(fixture.program);
+      EliminateDeadCode(fixture.program.blocks);
+      uint32_t updates = 0;
+      for (const auto &inst : fixture.BlockAt()) {
+        updates += inst.GetOpcode() == ValueOpcode::DppUpdateU32;
+        Check(inst.GetOpcode() != ValueOpcode::ReadLane &&
+                  inst.GetOpcode() != ValueOpcode::Permlane16U32,
+              "UMin reduction retained unused endpoint or cross-row operations");
+      }
+      Check(updates == 2 && preserved.Instruction()->Arg(0).Instruction()->HasUses(),
+            "UMin reduction destroyed an independently consumed prefix or kept its dead suffix");
+      ValidateProgram(fixture.program, true);
+    } else {
+      Check(use.Instruction()->Arg(0).Resolve() == result,
+            "rejected UMin proof changed its original result");
+    }
+  }
+}
+
 void TestOptimizationPipeline() {
   Fixture fixture;
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {Value(40u), Value(2u)});
@@ -604,7 +747,7 @@ void TestOptimizationPipeline() {
   fixture.Emit(ValueOpcode::IMul32, {Value(6u), Value(7u)});
 
   ConstantPropagationPass(fixture.program.blocks);
-  RemoveIdentities(fixture.program.blocks);
+  RemoveIdentities(fixture.program);
   EliminateDeadCode(fixture.program.blocks);
 
   const auto &instructions = fixture.BlockAt().Instructions();
@@ -623,14 +766,14 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
   entry->AddBranch(taken);
   entry->AddBranch(other);
 
-  auto &entry_info = fixture.program.block_info[0];
+  auto &entry_info = *fixture.program.blocks[0];
   entry_info.terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-  entry_info.terminator.true_block = 1;
-  entry_info.terminator.false_block = 2;
-  fixture.program.block_info[1].terminator.kind =
+  entry_info.terminator.true_block = taken;
+  entry_info.terminator.false_block = other;
+  fixture.program.blocks[1]->terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
-  fixture.program.block_info[2].terminator.kind =
+  fixture.program.blocks[2]->terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
 
   const auto undef = fixture.Emit(ValueOpcode::UndefU32);
@@ -644,8 +787,7 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
   Check(EliminateReadLane(fixture.program, 64).rewritten_reads == 1,
         "control-flow fixture did not eliminate its fixed-lane read");
   ConstantPropagationPass(fixture.program.blocks);
-  ResolveControlFlowIdentities(fixture.program);
-  RemoveIdentities(fixture.program.blocks);
+  RemoveIdentities(fixture.program);
   EliminateDeadCode(fixture.program.blocks);
 
   Check(entry_info.condition == Value(true),
@@ -693,7 +835,7 @@ void TestUndefinedRuntimeValueFails() {
   fixture.program.descriptor_sources.push_back(
       {.dwords = {undef}, .dword_count = 1});
   DescriptorValue result;
-  Check(!SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result),
+  Check(!SrtWalker(ExtractResourcePlan(fixture.program), {}).EvaluateDescriptor(0, result),
         "undefined typed descriptor source was accepted");
 }
 
@@ -733,6 +875,7 @@ int main() {
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
+    TestCompleteUMinReduction();
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();

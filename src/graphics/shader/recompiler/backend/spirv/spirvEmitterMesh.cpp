@@ -55,10 +55,14 @@ bool IsDistance(IR::StageOutputKind kind) {
 
 // The per-lane value a guest export stores: a whole vector, or one clip or cull distance.
 uint32_t MeshOutputType(EmitterState& state, IR::StageOutputKind kind) {
-	if (kind == IR::StageOutputKind::Layer) {
-		return TypeU32(state);
+	switch (kind) {
+		case IR::StageOutputKind::Layer: return TypeU32(state);
+		case IR::StageOutputKind::ClipDistance:
+		case IR::StageOutputKind::CullDistance: return TypeF32(state);
+		case IR::StageOutputKind::Position:
+		case IR::StageOutputKind::Parameter: return TypeF32Vector(state, 4);
+		default: EXIT("unsupported mesh output kind=%u\n", static_cast<uint32_t>(kind));
 	}
-	return IsDistance(kind) ? TypeF32(state) : TypeF32Vector(state, 4);
 }
 
 // Where the copy-out stores an output of the vertex at index: distances are elements of the
@@ -138,7 +142,11 @@ uint32_t UnusableVertex(EmitterState& state, uint32_t vertex, uint32_t vertices)
 
 } // namespace
 
-void DefineMeshOutputs(EmitterState& state) {
+void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
+                       uint32_t cull_distance_count) {
+	// The distance counts come from the outputs themselves below.
+	static_cast<void>(clip_distance_count);
+	static_cast<void>(cull_distance_count);
 	const auto& mesh = state.input_info.vertex->mesh;
 	// Clip and cull distances (the position exports' CCDIST vectors): one per-vertex float[N]
 	// built-in each, like gl_MeshVerticesEXT[].gl_ClipDistance; every distance has its own

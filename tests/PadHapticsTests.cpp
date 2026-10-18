@@ -143,13 +143,13 @@ void DestroyAudioStream(SDL_AudioStream* stream) {
 SDL_AudioDeviceID GetAudioStreamDevice(SDL_AudioStream*) {
 	return 999;
 }
-// Pads 1 and 3 are DualSenses.
+// Pads 1 and 3 are DualSenses; pad 2 only supports rumble.
 SDL_GamepadType GetGamepadTypeForID(SDL_JoystickID id) {
 	return id == 1 || id == 3 ? SDL_GAMEPAD_TYPE_PS5 : SDL_GAMEPAD_TYPE_UNKNOWN;
 }
 SDL_Gamepad* GetGamepadFromID(SDL_JoystickID id) {
-	return id == 1 || id == 3 ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
-	                          : nullptr;
+	return id >= 1 && id <= 3 ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
+	                         : nullptr;
 }
 SDL_GamepadType GetGamepadType(SDL_Gamepad* pad) {
 	return GetGamepadTypeForID(static_cast<SDL_JoystickID>(reinterpret_cast<uintptr_t>(pad)));
@@ -414,11 +414,16 @@ void TestFormatsAndVolume() {
 	Check(opened_device == 10 && opened_spec.channels == 4 && opened_spec.format == SDL_AUDIO_F32,
 	      "did not select quad DualSense PCM");
 	ExpectPcm({0, 0, 0.5f, -0.125f, 0, 0, 1.0f, 0});
+	const std::array gains {0.25f, 2.0f};
+	Haptics::Queue(port.get(), 1, stereo.data(), 2, 2, true, volume.data(), 1.0f, gains.data());
+	ExpectPcm({0, 0, 0.125f, -0.25f, 0, 0, 0.25f, 0});
 	const std::array<int16_t, 2> mono {16384, -32768};
 	Queue(port, mono.data(), 2, 1, false, volume.data() + 1);
 	ExpectPcm({0, 0, 0.25f, 0.25f, 0, 0, -0.5f, -0.5f});
 	Queue(port, mono.data(), 2, 1, false, volume.data() + 1, 0.5f);
 	ExpectPcm({0, 0, 0.125f, 0.125f, 0, 0, -0.25f, -0.25f});
+	Haptics::Queue(port.get(), 1, mono.data(), 2, 1, false, volume.data() + 1, 1.0f, gains.data());
+	ExpectPcm({0, 0, 0.0625f, 0.0625f, 0, 0, -0.125f, -0.125f});
 	std::array<float, 24> multichannel {};
 	multichannel.fill(0.9f);
 	multichannel[0]  = 0.1f;
@@ -438,11 +443,60 @@ void TestDiscoveryAndHotplug() {
 	devices[0].channels = 4;
 	now += 2001;
 	Queue(port, pcm.data());
-	Check(streams.size() == 1 && opened_device == 10, "late USB connection was not discovered");
 	devices.clear();
 	now += 2001;
 	Queue(port, pcm.data());
 	Check(streams.empty(), "disconnected endpoint retained its stream");
+	devices = {{10, "Wireless Controller", 4}};
+	now += 2001;
+	Queue(port, pcm.data());
+	Check(streams.size() == 1 && opened_device == 10,
+	      "Linux Wireless Controller endpoint was not discovered");
+	devices.clear();
+	now += 2001;
+	Queue(port, pcm.data());
+	Check(streams.empty(), "disconnected endpoint retained its stream");
+}
+
+void TestRumbleFallbackGains() {
+	Fixture f;
+	auto    port = Open();
+	const auto queue = [&](std::array<float, 2> gains) {
+		Check(Haptics::Queue(port.get(), 2, pcm.data(), 2, 2, true, unity.data(), 1.0f,
+		                     gains.data()) == 2 * 1000000 / 48000,
+		      "rumble fallback playback time is wrong");
+	};
+	queue({0.0f, 0.25f});
+	Check(pad_rumble[2].large == 0 && pad_rumble[2].small == 16383,
+	      "rumble fallback ignored per-channel gains");
+	queue({0.5f, 0.0f});
+	Check(pad_rumble[2].large == 32767 && pad_rumble[2].small == 0,
+	      "rumble fallback swapped per-channel gains");
+	queue({0.0f, 0.0f});
+	Check(pad_rumble[2].large == 0 && pad_rumble[2].small == 0,
+	      "muted fallback channels still rumbled");
+	Check(streams.empty() && hid_opens == 0, "rumble fallback opened an audio device");
+}
+
+void TestRumbleFallbackSwitch() {
+	for (bool bluetooth: {false, true}) {
+		Fixture f;
+		wireless = hid_available = bluetooth;
+		auto port = Open();
+		Queue(port, pcm.data());
+		Check(bluetooth ? Haptics::UsesBluetooth(port.get()) : streams.size() == 1,
+		      "DualSense transport did not open before fallback");
+		Haptics::Queue(port.get(), 2, pcm.data(), 2, 2, true, unity.data());
+		Check(streams.empty() && !Haptics::UsesBluetooth(port.get()) &&
+		          (!bluetooth || hid_closes == 1),
+		      "switching to rumble retained the DualSense transport");
+		Check(pad_rumble[2].large == 65535 && pad_rumble[2].small == 65535,
+		      "switching from DualSense did not start rumble fallback");
+		Queue(port, pcm.data());
+		Check(bluetooth ? Haptics::UsesBluetooth(port.get()) && hid_opens == 2
+		                : streams.size() == 1 && opens == 2,
+		      "switching back delayed reopening the DualSense transport");
+	}
 }
 
 void TestSpeaker() {
@@ -1140,6 +1194,9 @@ void TestAudioSpeakerRouting() {
 	speaker_scale = 0.5f;
 	audio.AudioOutOutputs(&output, 1, false);
 	ExpectPcm({0.25f, 0.25f, 0, 0, 0.25f, 0.25f, 0, 0});
+	speaker_scale = 2.0f;
+	audio.AudioOutOutputs(&output, 1, false);
+	ExpectPcm({1.0f, 1.0f, 0, 0, 1.0f, 1.0f, 0, 0});
 	speaker_scale = 0.0f;
 	audio.AudioOutOutputs(&output, 1, false);
 	ExpectPcm({});
@@ -1157,7 +1214,7 @@ void TestAudioFallbackGain() {
 		Fixture            f;
 		Libs::Audio::Audio audio;
 		active_controller = 2;
-		speaker_scale     = 0.5f;
+		speaker_scale     = 2.0f;
 		const std::array<int16_t, 4> integer_pcm {16384, 16384, 16384, 16384};
 		const auto  format = is_float ? Libs::Audio::Audio::Format::FloatStereo
 		                              : Libs::Audio::Audio::Format::Signed16bitStereo;
@@ -1168,7 +1225,7 @@ void TestAudioFallbackGain() {
 			audio.AudioOutSetVolume(port, 3, volume.data());
 			Libs::Audio::Audio::OutputParam output {port, data};
 			audio.AudioOutOutputs(&output, 1, false);
-			const float          expected = type == 4 ? 0.125f : 0.25f;
+			const float          expected = type == 4 ? 0.5f : 0.25f;
 			std::array<float, 4> actual {};
 			if (is_float) {
 				Check(SDL_GetAudioStreamData(default_stream, actual.data(), sizeof(actual)) ==
@@ -1223,14 +1280,14 @@ void TestBluetoothAudioSpeakerRouting() {
 	const auto port = audio.AudioOutOpen(4, 1024, 48000, Libs::Audio::Audio::Format::FloatStereo);
 	Check(port.IsValid() && default_stream != nullptr, "Bluetooth pad speaker port did not open");
 	std::vector<float> sound(2048, 0.25f);
-	speaker_scale = 0.5f;
+	speaker_scale = 2.0f;
 	Libs::Audio::Audio::OutputParam output {port, sound.data()};
 	Check(audio.AudioOutOutputs(&output, 1, false) == 1024 && hid_opens == 1 &&
 	          SDL_GetAudioStreamQueued(default_stream) == 0,
 	      "Bluetooth pad speaker also played on the host output");
 	fail_hid_write = true;
 	auto pending = Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000);
-	Check(pending.size() == 1 && std::abs(pending[0].audio[200] - 0.125f) < 1e-4f,
+	Check(pending.size() == 1 && std::abs(pending[0].audio[200] - 0.5f) < 1e-4f,
 	      "Bluetooth speaker did not apply its setting gain");
 	Libs::Controller::DualSenseBluetooth::Send(pending);
 	Check(audio.AudioOutOutputs(&output, 1, false) == 1024 &&
@@ -1263,6 +1320,8 @@ int main() {
 	TestAudioDefaultResumeFailure();
 	TestFormatsAndVolume();
 	TestDiscoveryAndHotplug();
+	TestRumbleFallbackGains();
+	TestRumbleFallbackSwitch();
 	TestSpeaker();
 	TestSpeakerUnplug();
 	TestSpeakerSwitchAndFailures();

@@ -178,7 +178,11 @@ SDL_AudioDeviceID FindDevice() {
 	for (int i = 0; i < count; i++) {
 		const char*   name = SDL_GetAudioDeviceName(devices[i]);
 		SDL_AudioSpec spec {};
-		if (name != nullptr && SDL_strcasestr(name, "DualSense") != nullptr &&
+		const bool is_dualsense_name =
+		    name != nullptr &&
+		    (SDL_strcasestr(name, "DualSense") != nullptr ||
+		     SDL_strcasestr(name, "Wireless Controller") != nullptr);
+		if (is_dualsense_name &&
 		    SDL_GetAudioDeviceFormat(devices[i], &spec, nullptr) && spec.channels == 4) {
 			if (device != 0) {
 				device = 0; // Multiple matching endpoints cannot be associated reliably either.
@@ -311,7 +315,7 @@ bool UsesBluetooth(const Stream* stream) {
 }
 
 uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames, uint32_t channels,
-               bool is_float, const int* volume, float gain) {
+               bool is_float, const int* volume, float gain, const float* gains) {
 	if (stream == nullptr || data == nullptr || frames == 0 || channels == 0 || volume == nullptr) {
 		return 0;
 	}
@@ -321,6 +325,33 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 	frames -= first_frame;
 	if (frames == 0) {
 		return 0;
+	}
+	if (!stream->speaker &&
+	    SDL_GetGamepadTypeForID(static_cast<SDL_JoystickID>(controller)) != SDL_GAMEPAD_TYPE_PS5) {
+		CloseDevice(stream);
+		stream->next_check = 0;
+		// Non-DualSense pads have no haptic audio path: approximate it with the rumble motors.
+		float peak[2] = {0.0f, 0.0f};
+		for (uint32_t frame = 0; frame < frames; frame++) {
+			for (uint32_t ch = 0; ch < 2; ch++) {
+				const auto src_ch = channels == 1 ? 0 : ch;
+				const auto index  = (static_cast<size_t>(first_frame) + frame) * channels + src_ch;
+				float      value  = is_float ? static_cast<const float*>(data)[index]
+				                             : static_cast<const int16_t*>(data)[index] / 32768.0f;
+				value *= volume[src_ch] / 32768.0f * gain * (gains != nullptr ? gains[src_ch] : 1.0f);
+				peak[ch] = std::max(peak[ch], std::fabs(value));
+			}
+		}
+		const auto to_motor = [](float v) {
+			return static_cast<uint16_t>(std::clamp(v * 2.0f, 0.0f, 1.0f) * 65535.0f);
+		};
+		SDL_LockJoysticks();
+		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller));
+		    pad != nullptr) {
+			(void) SDL_RumbleGamepad(pad, to_motor(peak[0]), to_motor(peak[1]), 100);
+		}
+		SDL_UnlockJoysticks();
+		return static_cast<uint64_t>(frames) * 1000000 / stream->freq;
 	}
 	const bool wireless = IsWireless(controller);
 	if (!wireless && !CanUseDevice(controller)) {
@@ -353,7 +384,7 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 			const auto index  = (static_cast<size_t>(first_frame) + frame) * channels + src_ch;
 			float      value  = is_float ? static_cast<const float*>(data)[index]
 			                             : static_cast<const int16_t*>(data)[index] / 32768.0f;
-			value *= volume[src_ch] / 32768.0f * gain;
+			value *= volume[src_ch] / 32768.0f * gain * (gains != nullptr ? gains[src_ch] : 1.0f);
 			// USB places the speaker in front and the actuators in back; Bluetooth takes stereo.
 			stream->buffer[static_cast<size_t>(frame) * output_channels + ch + channel_offset] =
 			    value;

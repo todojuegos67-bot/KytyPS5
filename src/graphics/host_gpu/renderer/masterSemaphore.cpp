@@ -4,6 +4,7 @@
 #include <cinttypes>
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/liveSwitches.h"
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -172,6 +173,8 @@ void MasterSemaphore::Wait(uint64_t tick, std::source_location where) {
 
 	vk::Result result;
 	{
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
+		                                         Common::DebugCounters::Counter::GpuWaitNs);
 		FrameCosts::Timer cost_timer {FrameCosts::g_gpu_wait_us, FrameCosts::g_gpu_waits};
 		const auto        begin = NowUs();
 		result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);

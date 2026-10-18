@@ -3225,6 +3225,15 @@ static void* RunThread(void* arg) {
 		}
 	}
 #endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	if (!thread->name.empty()) {
+#if defined(__APPLE__)
+		pthread_setname_np(thread->name.substr(0, 63).c_str());
+#else
+		pthread_setname_np(pthread_self(), thread->name.substr(0, 15).c_str());
+#endif
+	}
+#endif
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
@@ -4234,6 +4243,10 @@ int KYTY_SYSV_ABI pthread_attr_setschedpolicy(LibKernel::PthreadAttr* attr, int 
 	// PRINT_NAME();
 
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadAttrSetschedpolicy(attr, policy));
+}
+
+int KYTY_SYSV_ABI pthread_attr_setstack(LibKernel::PthreadAttr* attr, void* addr, size_t size) {
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadAttrSetstack(attr, addr, size));
 }
 
 int KYTY_SYSV_ABI pthread_attr_setstacksize(LibKernel::PthreadAttr* attr, size_t stack_size) {

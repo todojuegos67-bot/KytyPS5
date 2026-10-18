@@ -193,7 +193,9 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	command.setScissor(0, 1, &scissor);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
-	// Another graphics pipeline and viewport: the draws' cached dynamic state no longer holds.
+	// The helper pipeline has static state that invalidates the guest draw's dynamic state,
+	// and the draws' cached pipeline bind (KYTY_STATE_CACHE) no longer holds.
+	m_scheduler.GetDynamicState().Invalidate();
 	command_buffer.InvalidateDynamicState();
 }
 

@@ -124,6 +124,11 @@ public:
 	void                            SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Synchronizes the buffers of the ranges queued by QueueBdaSync, within the mapped ranges.
+	void                            SynchronizeBda(const RangeSet& mapped);
+	void                            QueueBdaSync(uint64_t vaddr, uint64_t size) {
+		m_memory_tracker.QueueBdaSync(vaddr, size);
+	}
 	void                            RunGarbageCollector();
 	// Bytes of the cached buffers.
 	[[nodiscard]] uint64_t UsedMemory() const noexcept { return m_total_used_memory; }

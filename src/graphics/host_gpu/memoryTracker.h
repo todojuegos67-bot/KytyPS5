@@ -48,6 +48,10 @@ public:
 			}
 		});
 	}
+	// Queue after changing ownership; a concurrent drain must not consume an event
+	// before the dirty pages it describes become visible.
+	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] RangeSet TakeBdaSync();
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -74,6 +78,7 @@ public:
 				on_flush();
 			}
 		});
+		QueueBdaSync(vaddr, size);
 	}
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -105,27 +110,29 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
-		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		const auto  upload_region = [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-            manager->lock.lock();
-            manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                       bytes, range_func);
-            if (!is_written) {
-                manager->lock.unlock();
-            }
+			manager->lock.lock();
+			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
+			                                                      bytes, range_func);
+			if (!is_written) {
+				manager->lock.unlock();
+			}
 		};
 		if (!is_written && UseRegionBitmap()) {
-			// Only the regions whose CPU summary is set, found in the bitmap.
+			// The bitmap only lists existing regions: create the missing ones (they start
+			// CPU-dirty) first, then visit only the regions whose CPU summary is set.
+			Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 			IterateCpuSummary(vaddr, size, upload_region);
 		} else {
-			Iterate<false>(vaddr, size,
-			               [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-				               if (!is_written && !manager->MaybeModified<DirtySource::Cpu>()) {
-					               return;
-				               }
-				               upload_region(manager, offset, bytes);
-			               });
+			// One traversal creates missing regions and uploads them.
+			Iterate<true>(vaddr, size,
+			              [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				              if (!is_written && !manager->MaybeModified<DirtySource::Cpu>()) {
+					              return;
+				              }
+				              upload_region(manager, offset, bytes);
+			              });
 		}
 		if (is_written) {
 			// The region locks stay held until the GPU-modified marks below.
@@ -234,6 +241,8 @@ private:
 	std::unique_ptr<std::atomic<uint64_t>[]>       m_cpu_summary_bits;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
+	std::mutex                                     m_bda_sync_mutex;
+	RangeSet                                       m_bda_sync;
 	PageManager&                                   m_page_manager;
 };
 

@@ -188,6 +188,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_buffer_cache.QueueBdaSync(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -197,19 +198,19 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		static auto&               skip_idle = Common::LiveSwitches::Get("KYTY_UNMAP_SKIP_IDLE", 0);
-		static uint64_t            unmaps_total   = 0;
-		static uint64_t            unmaps_skipped = 0;
-		static auto                stats_begin    = std::chrono::steady_clock::now();
+		static uint64_t unmaps_total   = 0;
+		static uint64_t unmaps_skipped = 0;
+		static auto     stats_begin    = std::chrono::steady_clock::now();
 		unmaps_total++;
-		// With KYTY_UNMAP_SKIP_IDLE, the drain is skipped when no cached buffer or image, pending
-		// readback or in-flight download shares bytes with the range: nothing the GPU still
-		// runs can then read or write it.
-		bool drain = true;
-		if (skip_idle.load(std::memory_order_relaxed) != 0 &&
-		    !m_buffer_cache.MayReferenceRange(vaddr, size) &&
-		    !m_texture_cache.HasImagesInRegion(vaddr, size)) {
-			drain = false;
+		// Check cache ownership on the GPU thread. Guest-memory callbacks can still access a
+		// range with no cached data, so they must finish before it is unmapped. A cached buffer,
+		// a pending asynchronous readback or an in-flight download sharing bytes with the range
+		// (MayReferenceRange) also needs the drain.
+		const bool drain = m_buffer_cache.MayReferenceRange(vaddr, size) ||
+		                   m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		                   m_texture_cache.IsRegionRegistered(vaddr, size) ||
+		                   m_command_scheduler.HasPendingPriorityOperations();
+		if (!drain) {
 			unmaps_skipped++;
 		}
 		const auto now = std::chrono::steady_clock::now();
@@ -247,13 +248,13 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	// Every cached buffer is synchronized so a global-memory shader sees the CPU's writes.
-	// That walk touched every buffer per dispatch (a quarter of the GPU thread in the
-	// world); it only has to repeat once something became CPU-dirty or a buffer appeared.
-	// The walk runs at most once per guest submission: what the game wrote before submitting is
-	// visible to all its commands, as on the console, and the GPU thread runs behind the game
-	// anyway. Per draw, the walk and the re-protection it triggers took ~38 % of the GPU thread
-	// on the title menu (21 -> 32 fps).
+	// Buffers are synchronized so a global-memory shader sees the CPU's writes; only the ranges
+	// queued since the last synchronization (CPU writes, new buffers, new mappings) are walked.
+	// The walk runs at most once per guest submission once something became CPU-dirty: what the
+	// game wrote before submitting is visible to all its commands, as on the console, and the GPU
+	// thread runs behind the game anyway. Per draw, the walk and the re-protection it triggers
+	// took ~38 % of the GPU thread on the title menu (21 -> 32 fps). Ranges skipped here stay
+	// queued for the next synchronization.
 	const auto epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
 	if (epoch != m_bda_synced_epoch) {
 		const auto submission = g_guest_submission_seq.load(std::memory_order_relaxed);
@@ -262,15 +263,11 @@ void RenderContext::PrepareBda() {
 			return;
 		}
 		m_bda_synced_submission = submission;
+		m_bda_synced_epoch      = epoch;
 	}
-	if (epoch != m_bda_synced_epoch) {
-		// The guest writes somewhere nearly all the time, so the epoch moves between most
-		// dispatches; walk only the regions holding CPU-dirty pages, not every buffer.
+	{
 		std::shared_lock lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(start, end - start);
-		});
-		m_bda_synced_epoch = epoch;
+		m_buffer_cache.SynchronizeBda(m_mapped_ranges);
 	}
 	m_fault_process_pending = true;
 }
