@@ -1330,6 +1330,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	r.cfg->mutex.Lock();
 	int  floor      = 0;
 	bool scene_free = true;
+	bool fg_off     = true;
 	if (r.frame != nullptr) {
 		if (Graphics::Presenter::FlipRateApplies(*r.frame)) floor = FlipRateFloor();
 		// (Also a movie playing, and with frame generation a frame without the game's camera: the PlayStation Studios
@@ -1337,10 +1338,11 @@ bool FlipQueue::Flip(uint32_t micros) {
 		NoteFrameForWorld(Graphics::Presenter::IsSceneFrame(*r.frame) && !MoviePlaying());
 		scene_free = !Graphics::Presenter::IsSceneFrame(*r.frame) || MoviePlaying() || !PlayerInputSeen() ||
 		             (Graphics::Presenter::GeneratesFrames() && !Graphics::Presenter::IsGameView(*r.frame));
-		if (scene_free) {
-			// (No frame generation here: 60, not the mode's base rate; Smooth 120 held the intro to 40, 10-18.)
-			floor = std::max(floor, SceneFreeFloor());
-		} else {
+		// Before the first world and during movies frame generation is off for certain: 60, not the mode's base rate
+		// (Smooth 120 held the intro to 40, 10-18). In the world the floors as they were (no new pacing there).
+		fg_off = MoviePlaying() || !PlayerInputSeen();
+		if (scene_free) floor = std::max(floor, SceneFreeFloor());
+		if (!fg_off) {
 			if (Graphics::Presenter::GeneratesFrames()) floor = std::max(floor, FrameGenFloor());
 			if (Graphics::Presenter::IsSceneFrame(*r.frame)) floor = std::max(floor, FlipFpsFloor());
 		}
@@ -1349,7 +1351,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	// flips keep to that grid, as Reflex holds the game for DLSS-G. Held only at the present, the game made 60 and 4
 	// a second were dropped (a stutter). Half a vblank early is due (the flips land on the nearest vblank).
 	static std::chrono::steady_clock::time_point s_paced_next {};
-	const double paced_interval = r.frame != nullptr && Graphics::Presenter::IsSceneFrame(*r.frame) && !MoviePlaying() && !scene_free
+	const double paced_interval = r.frame != nullptr && Graphics::Presenter::IsSceneFrame(*r.frame) && !MoviePlaying() && !fg_off
 	                                  ? std::max(Graphics::Fsr3::RealFrameInterval(), Graphics::FrameGen::RealFrameInterval())
 	                                  : 0.0;
 	const auto   paced_now      = std::chrono::steady_clock::now();
