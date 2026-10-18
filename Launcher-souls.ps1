@@ -296,7 +296,9 @@ $panel.Controls.Add($chkVsync)
 $tips.SetToolTip($chkLowPc, 'PCs con 16 GB de RAM o graficas de 8 GB o menos: RAM limitada (se devuelve a Windows cada 30 s), VRAM limitada por debajo de 8 GB, texturas a la mitad y sombras mas cortas.')
 $panel.Controls.Add($chkLowPc)
 $tips.SetToolTip($chkUnlock, 'El juego pasa de 60 FPS reales, tambien con frame generation (videos, menus y cargas siguen a 60)')
-$panel.Controls.Add($chkUnlock)
+# (Oculta hasta arreglarla, 10-18: a 120 Hz el juego, entre 65 y 80 FPS, alterna frames de 1 y 2 vblanks
+# (trompicones) y el logo de PlayStation del inicio va acelerado; a 240 el juego iba a camara lenta.)
+$chkUnlock.Checked = $false
 $tips.SetToolTip($chkSafeGpu, 'Para graficas que se cuelgan o dan pantallazo azul: mas estable, ~37% menos FPS')
 $panel.Controls.Add($chkSafeGpu)
 
