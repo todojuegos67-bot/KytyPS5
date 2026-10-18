@@ -304,8 +304,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 #if !defined(__APPLE__)
 		if (fragment_barycentric.fragmentShaderBarycentric != VK_TRUE) {
-			LOGF("fragmentShaderBarycentric is not supported\n");
-			skip_device = true;
+			// (Pascal - GTX 10xx -, RDNA 1 and older drivers: started without it, as KytyPS5 890393fb; only pixel
+			// shaders with per-vertex inputs need it, and they fail alone.)
+			LOGF("fragmentShaderBarycentric is not supported (continuing without it)\n");
 		}
 #endif
 
@@ -865,7 +866,13 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderBufferInt64Atomics == VK_TRUE &&
 	                     supported_features12.shaderBufferInt64Atomics != VK_TRUE);
 #if !defined(__APPLE__)
-	EXIT_NOT_IMPLEMENTED(supported_fragment_barycentric.fragmentShaderBarycentric != VK_TRUE);
+	const bool barycentric_supported =
+	    HasExtension(device_extensions, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) &&
+	    supported_fragment_barycentric.fragmentShaderBarycentric == VK_TRUE;
+	if (!barycentric_supported) {
+		Log::WriteToConsoleAndLog("WARNING: this GPU has no fragmentShaderBarycentric (GTX 10xx, RDNA 1): a few "
+		                          "effects may be missing or wrong.\n");
+	}
 #endif
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
@@ -919,7 +926,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	    vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
 	fragment_barycentric.pNext                     = &features12;
 	fragment_barycentric.fragmentShaderBarycentric = VK_TRUE;
-	robustness2.pNext                              = &fragment_barycentric;
+	robustness2.pNext = barycentric_supported ? static_cast<void*>(&fragment_barycentric) : static_cast<void*>(&features12);
 #endif
 	if (robustness2_ext_enabled) {
 		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
@@ -951,7 +958,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	                                           : static_cast<void*>(&features12);
 #else
 	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                           : static_cast<void*>(&fragment_barycentric);
+	                   : barycentric_supported ? static_cast<void*>(&fragment_barycentric)
+	                                           : static_cast<void*>(&features12);
 #endif
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
@@ -1373,7 +1381,6 @@ void WindowContext::CreateVulkan() {
 #else
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
-	device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
 #endif
 
 #ifdef KYTY_ENABLE_DEBUG_PRINTF
@@ -1441,7 +1448,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
-		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME}) {
+		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
+		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
@@ -1573,7 +1581,6 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 #if !defined(__APPLE__)
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
-	device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
 #endif
 	// The first device with the target API and a graphics+compute queue, preferring discrete.
 	auto devices = EnumerateVulkan<vk::PhysicalDevice>(
@@ -1629,6 +1636,9 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 			    return graphic_ctx.physical_device.enumerateDeviceExtensionProperties(nullptr, count,
 			                                                                          values);
 		    });
+		if (HasExtension(available_extensions, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+		}
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
