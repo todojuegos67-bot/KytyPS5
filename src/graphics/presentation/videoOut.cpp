@@ -531,6 +531,16 @@ static std::atomic<int64_t> g_movie_frame_ns {0};
 void NoteMovieFrame() noexcept {
 	g_movie_frame_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 }
+static std::atomic<bool> g_player_input {false};
+void NotePlayerInput() noexcept {
+	if (!g_player_input.exchange(true, std::memory_order_relaxed)) {
+		std::printf("Input: the player's first button: frame generation and frames above 60 allowed from here\n");
+		std::fflush(stdout);
+	}
+}
+bool PlayerInputSeen() noexcept {
+	return g_player_input.load(std::memory_order_relaxed);
+}
 bool MoviePlaying() noexcept {
 	const auto last = g_movie_frame_ns.load(std::memory_order_relaxed);
 	if (last == 0) return false;
@@ -1295,7 +1305,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		if (Graphics::Presenter::FlipRateApplies(*r.frame)) floor = FlipRateFloor();
 		// (Also a movie playing, and with frame generation a frame without the game's camera: the PlayStation Studios
 		// logo at the start ran at 103-120 fps above 60 Hz, 10-18; the game draws something with its TAA behind it.)
-		const bool scene_free = !Graphics::Presenter::IsSceneFrame(*r.frame) || MoviePlaying() ||
+		const bool scene_free = !Graphics::Presenter::IsSceneFrame(*r.frame) || MoviePlaying() || !PlayerInputSeen() ||
 		                        (Graphics::Presenter::GeneratesFrames() && !Graphics::Presenter::IsGameView(*r.frame));
 		if (scene_free) floor = std::max(floor, SceneFreeFloor());
 		if (Graphics::Presenter::GeneratesFrames()) floor = std::max(floor, FrameGenFloor());

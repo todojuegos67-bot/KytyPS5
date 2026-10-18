@@ -11,6 +11,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
+#include "graphics/presentation/videoOut.h"
 #include "loader/demonsSoulsWarp.h"
 
 #include <algorithm>
@@ -183,6 +184,7 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 		}
 		data->buttons |= g_scripted.buttons.load(std::memory_order_relaxed);
 	}
+	if (data->buttons != 0) Libs::VideoOut::NotePlayerInput();
 	data->connected              = connected;
 	data->timestamp              = state.time;
 	data->connected_count        = static_cast<uint8_t>(std::min(connected_count, 255));

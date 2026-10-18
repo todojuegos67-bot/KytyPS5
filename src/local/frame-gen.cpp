@@ -1002,7 +1002,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	}
 	const sl::ViewportHandle viewport {0};
 	// Movies, menus and loading screens (no TAA pass) are presented as they are: DLSS-G off for them.
-	const bool               usable = inputs != nullptr && inputs->valid && !VideoOut::MoviePlaying();
+	const bool               usable = inputs != nullptr && inputs->valid && !VideoOut::MoviePlaying() && VideoOut::PlayerInputSeen();
 	{
 		const auto now = std::chrono::steady_clock::now();
 		if (g_stat_start == std::chrono::steady_clock::time_point {}) g_stat_start = now;

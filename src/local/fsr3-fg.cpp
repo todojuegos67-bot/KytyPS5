@@ -919,7 +919,7 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	}
 	std::lock_guard lock(g_mutex);
 	const auto now    = std::chrono::steady_clock::now();
-	const bool movie  = VideoOut::MoviePlaying();
+	const bool movie  = VideoOut::MoviePlaying() || !VideoOut::PlayerInputSeen(); // (before the first button: the logo and intro)
 	const bool usable = inputs != nullptr && inputs->valid && !movie && !g_fg_failed;
 
 	// Per-second line: real frames, the frames shown (real and generated), how many had generation.

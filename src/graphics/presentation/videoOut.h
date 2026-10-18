@@ -20,6 +20,10 @@ namespace Libs::VideoOut {
 void NoteMovieFrame() noexcept;
 // A movie frame was decoded within the last half second.
 bool MoviePlaying() noexcept;
+// The first button the player pressed (controller.cpp): until then (the PlayStation Studios logo, the intro and the
+// title screen's "press a button") flips keep 60 a second above 60 Hz and frame generation stays off.
+void NotePlayerInput() noexcept;
+bool PlayerInputSeen() noexcept;
 
 struct VideoOutBufferAttribute2;
 struct VideoOutFlipStatus;
