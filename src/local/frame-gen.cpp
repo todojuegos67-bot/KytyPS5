@@ -1025,16 +1025,23 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 			g_stat_submit_ms = g_stat_submit_max = g_stat_before_ms = g_stat_before_max = 0;
 		}
 	}
-	// DLSS-G options: on while frames carry inputs; sizes are hints for its allocations.
-	if (!g_options_set || g_mode_set != (usable ? 1 : 0) || g_options_format != format ||
+	// DLSS-G on or off (its resources kept, eRetainResourcesWhenOff): off after 30 presents in a row without inputs
+	// (menus, movies, loading), on after 10 with them, so a fade or a cut does not flap it (chenxiao07 d672b238).
+	static uint32_t run_with = 0, run_without = 0;
+	run_with           = usable ? run_with + 1 : 0;
+	run_without        = usable ? 0 : run_without + 1;
+	const bool mode_on = g_mode_set == 1 ? run_without < 30 : run_with >= 10;
+	// DLSS-G options; sizes are hints for its allocations.
+	if (!g_options_set || g_mode_set != (mode_on ? 1 : 0) || g_options_format != format ||
 	    (usable && (g_options_backbuffer != backbuffer || g_options_render != inputs->render_extent))) {
 		sl::DLSSGOptions options {};
-		options.mode                = usable ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
-		if (g_mode_set != (usable ? 1 : 0)) {
-			std::printf("DLSS-G: %s\n", usable ? "on (TAA pass)" : "off (no TAA pass: menu, loading or movie)");
+		options.mode                = mode_on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+		options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
+		if (g_mode_set != (mode_on ? 1 : 0)) {
+			std::printf("DLSS-G: %s\n", mode_on ? "on (TAA pass)" : "off (no TAA pass: menu, loading or movie)");
 			std::fflush(stdout);
 		}
-		g_mode_set = usable ? 1 : 0;
+		g_mode_set = mode_on ? 1 : 0;
 		options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
 		// KYTY_DLSSG_PARALLEL=1: DLSS-G's work blocks none of the emulator's queues (a comparison: by default it
 		// blocks the presenting queue while it works).
