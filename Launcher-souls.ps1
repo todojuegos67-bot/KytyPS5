@@ -140,7 +140,15 @@ function Start-Game {
 	# Modo PC de pocos recursos: el emulador se comporta como con 16 GB de RAM (KYTY_SIMULATE_RAM_MB: sus perfiles de
 	# poca memoria, sin precarga de pipelines, y run-windows vacia cada 30 s la RAM en uso por encima de 8 GB). La VRAM
 	# la mide el emulador en la grafica de verdad. (Con menos de 24 GB de RAM pasa solo, sin la casilla.)
-	if ($chkLowPc.Checked) { $psargs += @('-Set', 'KYTY_SIMULATE_RAM_MB=16384') }
+	# Modo PC de pocos recursos (16 GB de RAM, graficas de 8 GB o menos): perfiles de 16 GB de RAM y vaciado de la RAM
+	# cada 30 s (KYTY_SIMULATE_RAM_MB), las caches de video limitadas a 6.5 GB (KYTY_VRAM_BUDGET_MB: con lo que el
+	# juego y Windows usan aparte, por debajo de 8 GB) y texturas a la mitad y sombras mas cortas (-Quality low).
+	# Modo GPU seguro: el trabajo de compute del juego sin solaparse (KYTY_COMPUTE_CHAIN=0), para graficas que se
+	# cuelgan o dan pantallazo azul (~37% menos FPS).
+	$sets = @()
+	if ($chkLowPc.Checked) { $sets += @('KYTY_SIMULATE_RAM_MB=16384', 'KYTY_VRAM_BUDGET_MB=6656'); $psargs += @('-Quality', 'low', '-TextureReduce', '1') }
+	if ($chkSafeGpu.Checked) { $sets += 'KYTY_COMPUTE_CHAIN=0' }
+	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
 	# hasta 60 reales (FrameGenFloor), videos y menus a 60, y los Smooth (KYTY_FLIP_FPS 40/45) en vblanks justos.
@@ -275,15 +283,18 @@ $chkHdr   = New-Check 'HDR' 350 100 90 'hdr'
 $chkVsync = New-Check 'VSync' 450 100 100 'vsync'
 $chkLowPc = New-Check 'Modo PC de pocos recursos' 670 14 230 'lowpc'
 $chkUnlock = New-Check 'FPS desbloqueados' 910 14 180 'unlock'
+$chkSafeGpu = New-Check 'Modo GPU seguro' 1100 14 170 'safegpu'
 $tips = New-Object System.Windows.Forms.ToolTip
 $tips.SetToolTip($chkHdr, 'HDR10: activa antes "Usar HDR" en la configuracion de pantalla de Windows')
 $tips.SetToolTip($chkVsync, 'VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando')
 $panel.Controls.Add($chkHdr)
 $panel.Controls.Add($chkVsync)
-$tips.SetToolTip($chkLowPc, 'Para PCs con 16 GB de RAM: menos RAM en uso (la que el juego no usa se devuelve a Windows cada 30 s). Puede dar algun tiron mas. Con menos de 24 GB se activa solo.')
+$tips.SetToolTip($chkLowPc, 'PCs con 16 GB de RAM o graficas de 8 GB o menos: RAM limitada (se devuelve a Windows cada 30 s), VRAM limitada por debajo de 8 GB, texturas a la mitad y sombras mas cortas.')
 $panel.Controls.Add($chkLowPc)
 $tips.SetToolTip($chkUnlock, 'Sin frame generation: el juego pasa de 60 FPS (videos, menus y cargas siguen a 60)')
 $panel.Controls.Add($chkUnlock)
+$tips.SetToolTip($chkSafeGpu, 'Para graficas que se cuelgan o dan pantallazo azul: mas estable, ~37% menos FPS')
+$panel.Controls.Add($chkSafeGpu)
 
 # Desplegables con color por marca: titulos de apartado en negrita (NVIDIA verde, Intel azul, AMD rojo) y sus modos
 # en el mismo tono.
