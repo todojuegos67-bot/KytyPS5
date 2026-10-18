@@ -131,6 +131,9 @@ function Start-Game {
 	$sets = @()
 	if ($chkLowPc.Checked) { $sets += @('KYTY_SIMULATE_RAM_MB=16384', 'KYTY_VRAM_BUDGET_MB=6656'); $psargs += @('-Quality', 'low', '-TextureReduce', '1') }
 	if ($chkSafeGpu.Checked) { $sets += 'KYTY_COMPUTE_CHAIN=0' }
+	# Nitidez del reescalado (KYTY_UPSCALE_SHARPNESS): FSR con su propio RCAS, DLSS y XeSS con un paso de nitidez despues.
+	$sharp = $sharpLevels[[math]::Max(0, $cmbSharp.SelectedIndex)][1]
+	if ($sharp -ne '') { $sets += "KYTY_UPSCALE_SHARPNESS=$sharp" }
 	# FPS desbloqueados con frame generation: el juego deja de estar limitado a 60 reales (KYTY_FRAMEGEN_BASE=0); los
 	# modos Smooth siguen en sus FPS fijos (KYTY_FLIP_FPS) y DLSS-G se limita solo con Reflex al tope del monitor.
 	$fgConfig = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
@@ -380,6 +383,22 @@ $cmbPreset.SelectedIndex = [math]::Min([math]::Max(0, $presetIndex), $dlssPreset
 $cmbPreset.Add_SelectedIndexChanged({ Set-IniValue 'dlsspreset' "$($cmbPreset.SelectedIndex)" })
 $tips.SetToolTip($cmbPreset, 'Modelo de DLSS: auto (el de NVIDIA), K = DLSS 4, L y M = DLSS 4.5 (mas nitidos, algo mas lentos)')
 $panel.Controls.Add($cmbPreset)
+
+# Nitidez del reescalado: Auto (FSR 0.3, DLSS y XeSS sin nada) o un nivel fijo para todos.
+$sharpLevels = @(@('Nitidez: auto', ''), @('Nitidez: 0', '0'), @('Nitidez: 25%', '0.25'), @('Nitidez: 50%', '0.5'),
+                 @('Nitidez: 75%', '0.75'), @('Nitidez: 100%', '1'))
+$cmbSharp = New-Object System.Windows.Forms.ComboBox
+$cmbSharp.DropDownStyle = 'DropDownList'
+$cmbSharp.Font     = $smallFont
+$cmbSharp.Location = New-Object System.Drawing.Point(($W - 450), 110)
+$cmbSharp.Size     = New-Object System.Drawing.Size(140, 26)
+foreach ($m in $sharpLevels) { [void]$cmbSharp.Items.Add($m[0]) }
+$sharpIndex = 0
+[void][int]::TryParse((Get-IniValue 'sharpness' '0'), [ref]$sharpIndex)
+$cmbSharp.SelectedIndex = [math]::Min([math]::Max(0, $sharpIndex), $sharpLevels.Count - 1)
+$cmbSharp.Add_SelectedIndexChanged({ Set-IniValue 'sharpness' "$($cmbSharp.SelectedIndex)" })
+$tips.SetToolTip($cmbSharp, 'Nitidez del reescalado (DLSS, XeSS y FSR). Mas alto: mas nitido, pero puede marcar bordes y ruido.')
+$panel.Controls.Add($cmbSharp)
 
 # Precompilar los shaders del juego (todos, de los archivos del juego): la primera vez puede tardar horas.
 $btnPre = New-Button 'Precompilar shaders' ($W - 610) 46 230 58 $false

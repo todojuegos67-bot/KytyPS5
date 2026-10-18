@@ -359,6 +359,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${lod_stats_pack_header}")
 
+# KYTY_UPSCALE_SHARPNESS: sharpening after DLSS or XeSS (src/local/frame-gen.cpp).
+set(sharpen_source "${KYTY_SOURCE_DIR}/local/sharpen.comp")
+set(sharpen_spv "${gpu_tiler_generated_dir}/sharpen.spv")
+set(sharpen_header "${gpu_tiler_generated_dir}/sharpen_spv.h")
+add_custom_command(
+	OUTPUT "${sharpen_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${sharpen_spv}" "${sharpen_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${sharpen_spv} -DOUTPUT=${sharpen_header}
+	        -DSYMBOL=SHARPEN_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${sharpen_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${sharpen_header}")
+
 # KYTY_TAA_REPLACE=upscaler: the raw frame into the TAA's output, its alpha kept (src/local/frame-gen.cpp).
 set(taa_bypass_source "${KYTY_SOURCE_DIR}/local/taa-bypass.comp")
 set(taa_bypass_spv "${gpu_tiler_generated_dir}/taa_bypass.spv")

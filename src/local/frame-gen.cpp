@@ -18,6 +18,7 @@
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 #include "local/vulkan-recording.h"
 #include "gpu_tiler_shaders/taa_bypass_spv.h"
+#include "gpu_tiler_shaders/sharpen_spv.h"
 #endif
 
 #include <algorithm>
@@ -1645,6 +1646,110 @@ uint32_t UpscaleHeight() {
 	return height;
 }
 
+
+// KYTY_UPSCALE_SHARPNESS=<0..1> after DLSS or XeSS (sharpen.comp): g_up_output into g_sharp, which the composite reads.
+struct SharpenPass {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	vk::Sampler             sampler    = nullptr;
+	VulkanImage             image;
+	vk::ImageView           view   = nullptr;
+	bool                    failed = false;
+} g_sharp;
+
+bool EnsureSharpen(GraphicContext& graphics, const VulkanImage& like) {
+	const auto device = graphics.device;
+	if (g_sharp.pipeline == nullptr) {
+		if (g_sharp.failed) return false;
+		g_sharp.failed = true;
+		std::array<vk::DescriptorSetLayoutBinding, 2> bindings {};
+		for (uint32_t i = 0; i < 2; ++i) {
+			bindings[i].binding         = i;
+			bindings[i].descriptorType  = i == 0 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorCount = 1;
+			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+		}
+		vk::DescriptorSetLayoutCreateInfo set_info {};
+		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		set_info.bindingCount = 2;
+		set_info.pBindings    = bindings.data();
+		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_sharp.set_layout) != vk::Result::eSuccess) return false;
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, 4};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = 1;
+		layout_info.pSetLayouts            = &g_sharp.set_layout;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push;
+		if (device.createPipelineLayout(&layout_info, nullptr, &g_sharp.layout) != vk::Result::eSuccess) return false;
+		vk::ShaderModuleCreateInfo module_info {};
+		module_info.codeSize    = sizeof(SHARPEN_SPV);
+		module_info.pCode       = SHARPEN_SPV;
+		vk::ShaderModule module = nullptr;
+		if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		pipeline_info.stage.module = module;
+		pipeline_info.stage.pName  = "main";
+		pipeline_info.layout       = g_sharp.layout;
+		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_sharp.pipeline);
+		device.destroyShaderModule(module, nullptr);
+		if (created != vk::Result::eSuccess) {
+			g_sharp.pipeline = nullptr;
+			return false;
+		}
+		vk::SamplerCreateInfo sampler {};
+		sampler.magFilter    = vk::Filter::eNearest;
+		sampler.minFilter    = vk::Filter::eNearest;
+		sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+		if (device.createSampler(&sampler, nullptr, &g_sharp.sampler) != vk::Result::eSuccess) return false;
+		g_sharp.failed = false;
+	}
+	if (g_sharp.image.image != nullptr && g_sharp.image.format == like.format &&
+	    g_sharp.image.extent.width == like.extent.width && g_sharp.image.extent.height == like.extent.height)
+		return true;
+	if (g_sharp.view != nullptr) {
+		device.waitIdle();
+		device.destroyImageView(g_sharp.view, nullptr);
+		g_sharp.view = nullptr;
+	}
+	if (g_sharp.image.image != nullptr) graphics.DeleteImage(g_sharp.image);
+	g_sharp.image.image = nullptr;
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {like.extent.width, like.extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = like.format;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.samples       = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, g_sharp.image)) {
+		g_sharp.image.image = nullptr;
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = g_sharp.image.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = like.format;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (device.createImageView(&view_info, nullptr, &g_sharp.view) != vk::Result::eSuccess) return false;
+	g_sharp.image.state = {};
+	return true;
+}
+
+float SharpenAmount() {
+	static const float amount = [] {
+		const char* value = std::getenv("KYTY_UPSCALE_SHARPNESS");
+		return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f) : 0.0f;
+	}();
+	return amount;
+}
+
 void ConfigureOutput(GraphicContext& graphics, vk::Format format, vk::Extent2D extent) {
 	if (g_up_output.image != nullptr && g_up_output.format == format && g_up_output.extent.width == extent.width &&
 	    g_up_output.extent.height == extent.height)
@@ -2384,9 +2489,34 @@ void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std:
 	command.InvalidateGraphicsState(); // (the upscaler bound its own pipelines and descriptors)
 	Transition(vk_command, g_up_output, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
 	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+	// Sharpening after DLSS or XeSS (FSR sharpens itself: KYTY_UPSCALE_SHARPNESS goes to its RCAS).
+	bool sharpened = false;
+	if (done && (dlss || xess) && SharpenAmount() > 0.0f && EnsureSharpen(*g_graphics_ctx, g_up_output)) {
+		Transition(vk_command, g_sharp.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+		vk::DescriptorImageInfo infos[2] {};
+		infos[0] = {g_sharp.sampler, g_up_output_view, vk::ImageLayout::eShaderReadOnlyOptimal};
+		infos[1] = {nullptr, g_sharp.view, vk::ImageLayout::eGeneral};
+		vk::WriteDescriptorSet writes[2] {};
+		for (uint32_t i = 0; i < 2; ++i) {
+			writes[i].dstBinding      = i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType  = i == 0 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			writes[i].pImageInfo      = &infos[i];
+		}
+		vk_command.bindPipeline(vk::PipelineBindPoint::eCompute, g_sharp.pipeline);
+		vk_command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_sharp.layout, 0, 2, writes);
+		const float amount = SharpenAmount();
+		vk_command.pushConstants(g_sharp.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(amount), &amount);
+		vk_command.dispatch((g_up_output.extent.width + 7) / 8, (g_up_output.extent.height + 7) / 8, 1);
+		Transition(vk_command, g_sharp.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+		command.InvalidateGraphicsState();
+		sharpened = true;
+	}
 	if (in_pass) command.ResumeRendering(rendering);
 	if (!done) return;
-	scene->image_view = g_up_output_view;
+	scene->image_view = sharpened ? g_sharp.view : g_up_output_view;
 	scene->layout     = vk::ImageLayout::eShaderReadOnlyOptimal;
 	g_up_reset        = false;
 	++g_up_count;
