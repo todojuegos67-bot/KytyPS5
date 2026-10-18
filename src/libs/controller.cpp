@@ -189,7 +189,9 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	{
 		static int64_t held_since = 0;
 		const int64_t  now        = SteadyNanoseconds();
-		if (data->buttons == 0) {
+		if (!connected) {
+			// (Other, empty pad slots the game reads too: they must not reset the hold.)
+		} else if (data->buttons == 0) {
 			held_since = 0;
 		} else if (held_since == 0) {
 			held_since = now;
