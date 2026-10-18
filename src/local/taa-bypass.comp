@@ -1,59 +1,50 @@
 #version 450
-// KYTY_TAA_REPLACE=upscaler / dlss (frame-gen.cpp, AfterTaa): after the game's TAA ran, its output's color replaced by
-// the raw jittered frame's (or DLAA's), its alpha kept (a per-pixel counter and flags later passes read).
-// The TAA's output is brighter than its input in some zones (it scales its history by a game constant: its steady
-// state is w*cur/(1-(1-w)K)); with the raw frame alone those zones looked dark. So the raw frame is scaled by the
-// ratio of the two images' mean luminance, measured on the GPU every frame (no readback):
-//   mode 0: sums of luminance (TAA output, raw) into the buffer
-//   mode 1: one thread: the gain from them (smoothed over frames), the sums reset
-//   mode 2: the output = raw * gain, the TAA's alpha kept
+// KYTY_TAA_REPLACE=upscaler / dlss (frame-gen.cpp, AfterTaa): after the game's TAA ran (on its own history), its
+// output's color replaced by the raw jittered frame's (or DLAA's), its alpha kept (a per-pixel counter and flags later
+// passes read). The TAA brightens some zones (it scales its history by a game constant per pixel blend): one gain for
+// the whole frame (10-17/18: 0.25 to 8 from frame to frame) could not follow it. Now a gain per 8x8 block, the ratio of
+// the TAA's output to the raw frame there, smoothed over frames, interpolated between blocks:
+//   mode 0: one workgroup a block: its ratio into ratios[] (the header: the frame's mean ratio, for the log)
+//   mode 1: nothing (kept for the dispatch sequence)
+//   mode 2: the output = raw * the interpolated ratio, the TAA's alpha kept
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D raw_color;
 layout(binding = 1, rgba16f) uniform image2D taa_output;
 layout(std430, binding = 2) buffer Stats {
-	uint  sum_taa;   // log2 luminance, fixed point (see mode 0)
-	uint  sum_raw;
-	float gain;      // the smoothed gain in use
-	float measured;  // the last frame's ratio (logging)
-	uint  groups;    // the groups summed
+	uint  sum_ratio; // (log) the blocks' ratios, fixed point 1/1024
+	uint  blocks;
+	float mean;      // (log) last frame's mean ratio, written by the first block of the next frame's mode 0
+	float unused;
+	float ratios[];  // one per 8x8 block, blocks_x a row
 } stats;
 
 layout(push_constant) uniform Push {
 	float scale;     // KYTY_TAA_BYPASS_GAIN: a fixed factor on top
 	int   mode;
-	float smoothing; // mode 1: the weight of this frame's ratio
-	int   match;     // 0: no luminance match (gain 1)
+	float smoothing; // this frame's weight in a block's ratio
+	int   match;     // 0: no match (the raw frame times scale)
+	int   blocks_x;
+	int   blocks_y;
 } push;
 
 shared uint group_taa;
 shared uint group_raw;
 
-// log2 of the luminance, offset to [0, 24]: the ratio of the two images' geometric means. (Their plain means: the raw
-// frame's bright specks, which the TAA's neighbourhood clamp removes, gave a ratio of ~0.38 that darkened the rest.)
-float LogLuma(vec3 c) {
-	float l = dot(max(c, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
-	return clamp(log2(l + 1.0e-4), -16.0, 8.0) + 16.0;
+float Luma(vec3 c) {
+	return clamp(dot(max(c, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)), 0.0, 64.0);
+}
+
+float BlockRatio(ivec2 b) {
+	b = clamp(b, ivec2(0), ivec2(push.blocks_x - 1, push.blocks_y - 1));
+	float r = stats.ratios[b.y * push.blocks_x + b.x];
+	return r > 0.0 ? r : 1.0;
 }
 
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	ivec2 size  = imageSize(taa_output);
-	if (push.mode == 1) {
-		if (gl_GlobalInvocationID.x == 0 && gl_GlobalInvocationID.y == 0) {
-			float previous = stats.gain > 0.0 && stats.gain < 16.0 ? stats.gain : 1.0;
-			float ratio    = stats.groups > 16u
-			                     ? exp2((float(stats.sum_taa) - float(stats.sum_raw)) / (float(stats.groups) * 256.0))
-			                     : previous;
-			ratio          = clamp(ratio, 0.25, 8.0);
-			stats.measured = ratio;
-			stats.gain     = push.match != 0 ? mix(previous, ratio, push.smoothing) : 1.0;
-			stats.sum_taa  = 0u;
-			stats.sum_raw  = 0u;
-			stats.groups   = 0u;
-		}
-		return;
-	}
+	if (push.mode == 1) return;
 	if (push.mode == 0) {
 		if (gl_LocalInvocationIndex == 0u) {
 			group_taa = 0u;
@@ -61,21 +52,38 @@ void main() {
 		}
 		barrier();
 		if (pixel.x < size.x && pixel.y < size.y) {
-			// (Fixed point, 1/256: a group's mean at most 24*256 = 6144; 57600 groups fit 32 bits.)
-			atomicAdd(group_taa, uint(LogLuma(imageLoad(taa_output, pixel).rgb) * 256.0));
-			atomicAdd(group_raw, uint(LogLuma(texelFetch(raw_color, pixel, 0).rgb) * 256.0));
+			// (Fixed point, 1/1024: 64 pixels at most 64 each, 4.2M, fits.)
+			atomicAdd(group_taa, uint(Luma(imageLoad(taa_output, pixel).rgb) * 1024.0));
+			atomicAdd(group_raw, uint(Luma(texelFetch(raw_color, pixel, 0).rgb) * 1024.0));
 		}
 		barrier();
 		if (gl_LocalInvocationIndex == 0u) {
-			atomicAdd(stats.sum_taa, group_taa / 64u);
-			atomicAdd(stats.sum_raw, group_raw / 64u);
-			atomicAdd(stats.groups, 1u);
+			ivec2 b     = ivec2(gl_WorkGroupID.xy);
+			int   index = b.y * push.blocks_x + b.x;
+			// (A dark block: the ratio of tiny sums is noise; 64 px at 1/1024 each: below ~0.002 mean, kept at 1.)
+			float ratio = float(group_taa + 128u) / float(group_raw + 128u);
+			ratio       = clamp(ratio, 0.25, 4.0);
+			float prev  = stats.ratios[index];
+			float next  = prev > 0.0 ? mix(prev, ratio, push.smoothing) : ratio;
+			stats.ratios[index] = push.match != 0 ? next : 1.0;
+			if (b == ivec2(0)) {
+				stats.mean      = stats.blocks > 0u ? float(stats.sum_ratio) / 1024.0 / float(stats.blocks) : 1.0;
+				stats.sum_ratio = 0u;
+				stats.blocks    = 0u;
+			}
+			atomicAdd(stats.sum_ratio, uint(next * 1024.0));
+			atomicAdd(stats.blocks, 1u);
 		}
 		return;
 	}
 	if (pixel.x >= size.x || pixel.y >= size.y) return;
-	float gain = (stats.gain > 0.0 && stats.gain < 16.0 ? stats.gain : 1.0) * push.scale;
-	vec4  raw  = texelFetch(raw_color, pixel, 0);
-	vec4  taa  = imageLoad(taa_output, pixel);
-	imageStore(taa_output, pixel, vec4(raw.rgb * gain, taa.a));
+	// Bilinear between the four nearest block centres.
+	vec2  f  = (vec2(pixel) + 0.5) / 8.0 - 0.5;
+	ivec2 b0 = ivec2(floor(f));
+	vec2  t  = f - vec2(b0);
+	float r  = mix(mix(BlockRatio(b0), BlockRatio(b0 + ivec2(1, 0)), t.x),
+	               mix(BlockRatio(b0 + ivec2(0, 1)), BlockRatio(b0 + ivec2(1, 1)), t.x), t.y);
+	vec4 raw = texelFetch(raw_color, pixel, 0);
+	vec4 taa = imageLoad(taa_output, pixel);
+	imageStore(taa_output, pixel, vec4(raw.rgb * r * push.scale, taa.a));
 }

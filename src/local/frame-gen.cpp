@@ -1743,7 +1743,7 @@ bool EnsureBypassPipeline(GraphicContext& graphics) {
 	set_info.bindingCount = static_cast<uint32_t>(bindings.size());
 	set_info.pBindings    = bindings.data();
 	if (device.createDescriptorSetLayout(&set_info, nullptr, &g_bypass.set_layout) != vk::Result::eSuccess) return false;
-	vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, 16};
+	vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, 24};
 	vk::PipelineLayoutCreateInfo layout_info {};
 	layout_info.setLayoutCount         = 1;
 	layout_info.pSetLayouts            = &g_bypass.set_layout;
@@ -1777,7 +1777,7 @@ bool EnsureBypassPipeline(GraphicContext& graphics) {
 	if (device.createSampler(&sampler, nullptr, &g_bypass.sampler) != vk::Result::eSuccess) return false;
 	{
 		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-		create.size  = 32;
+		create.size  = 1u << 20; // (the header and a ratio per 8x8 block, up to 3840x2160)
 		create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 		VmaAllocationCreateInfo allocate {};
 		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
@@ -2011,7 +2011,7 @@ bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<co
 	vk::DescriptorImageInfo  infos[2] {};
 	infos[0] = {g_bypass.sampler, source_view, source_layout};
 	infos[1] = {nullptr, out_b.image_view, vk::ImageLayout::eGeneral};
-	vk::DescriptorBufferInfo stats {g_bypass.stats, 0, 32};
+	vk::DescriptorBufferInfo stats {g_bypass.stats, 0, VK_WHOLE_SIZE};
 	vk::WriteDescriptorSet   writes[3] {};
 	for (uint32_t i = 0; i < 3; ++i) {
 		writes[i].dstBinding      = i;
@@ -2030,14 +2030,31 @@ bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<co
 	// KYTY_TAA_MATCH=0: no luminance match (the raw frame as it is); KYTY_TAA_MATCH_SMOOTH: this frame's weight.
 	static const float scale     = std::max(EnvFloatOr("KYTY_TAA_BYPASS_GAIN", 1.0f), 0.01f);
 	static const bool  match     = EnvFloatOr("KYTY_TAA_MATCH", 1.0f) != 0.0f;
-	static const float smoothing = std::clamp(EnvFloatOr("KYTY_TAA_MATCH_SMOOTH", 0.1f), 0.001f, 1.0f);
+	static const float smoothing = std::clamp(EnvFloatOr("KYTY_TAA_MATCH_SMOOTH", 0.25f), 0.001f, 1.0f);
+	const uint32_t groups_x = (render.width + 7) / 8, groups_y = (render.height + 7) / 8;
 	struct {
 		float   scale;
 		int32_t mode;
 		float   smoothing;
 		int32_t match;
-	} push {scale, 0, smoothing, match ? 1 : 0};
-	const uint32_t groups_x = (render.width + 7) / 8, groups_y = (render.height + 7) / 8;
+		int32_t blocks_x;
+		int32_t blocks_y;
+	} push {scale, 0, smoothing, match ? 1 : 0, static_cast<int32_t>(groups_x), static_cast<int32_t>(groups_y)};
+	// (The block ratios start at 0, "none yet", and again after a size change.)
+	static uint32_t cleared_for = 0;
+	if (cleared_for != groups_x * 65536u + groups_y) {
+		cleared_for = groups_x * 65536u + groups_y;
+		vk_command.fillBuffer(g_bypass.stats, 0, VK_WHOLE_SIZE, 0u);
+		vk::MemoryBarrier2 filled {};
+		filled.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		filled.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		filled.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+		filled.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+		vk::DependencyInfo filled_dep {};
+		filled_dep.memoryBarrierCount = 1;
+		filled_dep.pMemoryBarriers    = &filled;
+		vk_command.pipelineBarrier2(filled_dep);
+	}
 	for (int32_t mode = 0; mode < 3; ++mode) {
 		push.mode = mode;
 		vk_command.pushConstants(g_bypass.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
@@ -2061,15 +2078,16 @@ bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<co
 		float gain = 0.0f, measured = 0.0f;
 		if (g_bypass.readback_mapped != nullptr) {
 			(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_bypass.readback_mem, 0, VK_WHOLE_SIZE);
-			gain     = g_bypass.readback_mapped[2];
-			measured = g_bypass.readback_mapped[3];
+			gain     = g_bypass.readback_mapped[2]; // (the mean of the block ratios)
+			measured = gain;
 		}
 		if (first)
 			std::printf("TAA: ran, then its color replaced by %s %ux%u (its alpha kept, brightness matched to the TAA's: %s)\n",
 			            bypass ? "the raw frame for the upscaler" : "DLAA's", render.width, render.height,
 			            match ? "on" : "off");
-		std::printf("TAA: brightness gain %.3f (TAA/raw this frame %.3f, fixed factor %.3f)\n", static_cast<double>(gain),
-		            static_cast<double>(measured), static_cast<double>(scale));
+		(void)measured;
+		std::printf("TAA: brightness per 8x8 block, mean gain %.3f (fixed factor %.3f)\n", static_cast<double>(gain),
+		            static_cast<double>(scale));
 		std::fflush(stdout);
 	}
 	return true;
