@@ -721,6 +721,9 @@ struct Program: ResourcePlan {
 	// page table at run time, user data from push constants; no flattened SRT, buffer or shader-data binding.
 	bool                          table_mode = false;
 	TablePlan                     table_plan;
+	// Table mode: each slot loaded where the shader reads it (Frontend::TranslatorFeatureTableSlotsAtUse), not all of
+	// them at the entry.
+	bool                          table_slots_at_use = false;
 
 	std::optional<SpirvRequirements> spirv_requirements;
 };

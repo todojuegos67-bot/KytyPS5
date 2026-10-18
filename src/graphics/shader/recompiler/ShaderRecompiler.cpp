@@ -792,7 +792,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	info_options.pixel   = pixel;
 	info_options.compute = compute;
 	IR::CollectShaderInfo(ir, info_options);
-	if (options.table_mode) IR::EnterTableMode(ir);
+	if (options.table_mode) {
+		IR::EnterTableMode(ir);
+		ir.table_slots_at_use = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureTableSlotsAtUse) != 0;
+	}
 	IR::AllocateBindings(ir, push_data_start_dword, options.enable_lod_stats);
 	DumpShaderIr(options, ir);
 	Spirv::AnalyzeProgramRequirements(ir);

@@ -24,14 +24,20 @@ void SetTranslatorFeatures(uint32_t features) {
 }
 
 uint32_t TranslatorFeatureSet() {
-	// (KYTY_LANE_LOCAL_COOP=0/1: the cooperative halves off or on, whatever the store was made with.)
-	static const int cooperative = [] {
-		const char* value = std::getenv("KYTY_LANE_LOCAL_COOP");
+	// (KYTY_LANE_LOCAL_COOP=0/1: the cooperative halves off or on, KYTY_TABLE_SLOTS_AT_USE=0/1 the table slots' loads
+	// at the entry or where they are read, whatever the store was made with.)
+	const auto forced = [](const char* name) {
+		const char* value = std::getenv(name);
 		return value == nullptr ? -1 : std::string_view(value) != "0" ? 1 : 0;
-	}();
-	auto features = g_translator_features.load(std::memory_order_relaxed);
-	if (cooperative >= 0)
-		features = cooperative != 0 ? features | TranslatorFeatureCooperativeHalves : features & ~TranslatorFeatureCooperativeHalves;
+	};
+	static const int cooperative  = forced("KYTY_LANE_LOCAL_COOP");
+	static const int slots_at_use = forced("KYTY_TABLE_SLOTS_AT_USE");
+	auto             features     = g_translator_features.load(std::memory_order_relaxed);
+	const auto       apply        = [&](int value, uint32_t feature) {
+		if (value >= 0) features = value != 0 ? features | feature : features & ~feature;
+	};
+	apply(cooperative, TranslatorFeatureCooperativeHalves);
+	apply(slots_at_use, TranslatorFeatureTableSlotsAtUse);
 	return features;
 }
 

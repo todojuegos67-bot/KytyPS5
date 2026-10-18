@@ -1480,9 +1480,38 @@ uint32_t EmitTableBlockLoad(EmitterState& state, uint32_t index) {
 	return value;
 }
 
+// IR::Program::table_slots_at_use: a slot EmitTableMode leaves to the instruction that reads it (its value, a marker no id
+// has: the slot's load is emitted there, TableSlotValue).
+constexpr uint32_t TableSlotAtUse = UINT32_MAX;
+
+// The value EmitTableMode gives a slot the shader reads at the entry: its load there, or with table_slots_at_use none.
+// (1-1's dragon fire, 059438379702ee83: its 500 slots loaded at the entry stayed live through the whole program, values
+// GCN keeps in at most ~104 SGPRs, as registers of every invocation: 255 registers and 448 bytes of spills a thread on an
+// RTX 3080 Laptop, NVIDIA 566.07, 80 ms a frame, 270 with the cooperative halves' 64 invocations a wave. Loaded where it
+// is read, a slot lives as long as its SGPR did.)
+template <typename Load>
+static uint32_t TableSlotAtEntry(const EmitterState& state, uint32_t slot, const Load& load) {
+	return state.program.table_slots_at_use ? TableSlotAtUse : load(slot);
+}
+
+// A slot's value where the shader reads it: the entry's load, or (TableSlotAtUse) its load here.
+static uint32_t TableSlotValue(EmitterState& state, uint32_t slot) {
+	const auto value = state.table_slot_values[slot];
+	if (value != TableSlotAtUse) return value;
+	const auto address = TypeDeviceAddress(state);
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction({OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+	                           Binary(state, OpIAdd, address, state.table_block,
+	                                  ConstantDeviceAddress(state, uint64_t {slot} * 4))});
+	const auto loaded = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, TypeU32(state), loaded, pointer, MemoryAccessAlignedMask, sizeof(uint32_t)});
+	return loaded;
+}
+
 // Table mode, at the function's entry: the slots the shader reads (IR::TablePlan::gpu) from its block (the block's
-// device address is two dwords of shader data, IR::BindingLayout::TableBlockDword), and each buffer's device
-// address, size in dwords, buffer word and stride (the renderer resolved the V#).
+// device address is two dwords of shader data, IR::BindingLayout::TableBlockDword), unless they are loaded where read
+// (TableSlotAtEntry), and each buffer's device address, size in dwords, buffer word and stride (the renderer resolved
+// the V#).
 void EmitTableMode(ValueEmitContext& ctx) {
 	auto&       state   = ctx.state;
 	const auto& program = state.program;
@@ -1502,7 +1531,7 @@ void EmitTableMode(ValueEmitContext& ctx) {
 	};
 	state.table_slot_values.assign(plan.slots.size(), 0);
 	for (size_t slot = 0; slot < plan.slots.size(); ++slot)
-		if (plan.gpu[slot] != 0) state.table_slot_values[slot] = load(static_cast<uint32_t>(slot));
+		if (plan.gpu[slot] != 0) state.table_slot_values[slot] = TableSlotAtEntry(state, static_cast<uint32_t>(slot), load);
 	// Each buffer as the renderer resolved it (IR::TablePlan::BufferDword).
 	for (size_t i = 0; i < plan.buffers.size(); ++i) {
 		const auto first       = plan.BufferDword(i);
@@ -1549,7 +1578,7 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		// emit nothing.
 		const auto slot = inst.Arg(1).Resolve().U32();
 		ctx.Define(inst, slot < state.table_slot_values.size() && state.table_slot_values[slot] != 0
-		                     ? state.table_slot_values[slot]
+		                     ? TableSlotValue(state, slot)
 		                     : ConstantU32(state, 0));
 		return true;
 	}
