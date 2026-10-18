@@ -906,7 +906,7 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	// for real x (1 + generated) to stay under the cap, as Reflex does for DLSS-G (x4 at 60 real sent 240 to a 224 cap:
 	// 16 frames a second dropped or held, a stutter at a steady 60). Only while generating; movies and menus untouched.
 	const double interval = CapInterval();
-	if (interval > 0.0 && inputs != nullptr && inputs->valid && !VideoOut::MoviePlaying()) {
+	if (interval > 0.0 && inputs != nullptr && inputs->valid && !VideoOut::MoviePlaying() && VideoOut::PlayerInputSeen()) {
 		static std::chrono::steady_clock::time_point next {};
 		const auto step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(interval));
 		auto       now  = std::chrono::steady_clock::now();

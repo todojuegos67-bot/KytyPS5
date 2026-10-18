@@ -531,15 +531,43 @@ static std::atomic<int64_t> g_movie_frame_ns {0};
 void NoteMovieFrame() noexcept {
 	g_movie_frame_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 }
-static std::atomic<bool> g_player_input {false};
+// The world gate (10-18): frame generation and the launcher's frame rates only once the first world loaded. Before it
+// (the logos, the title, the menus) 60 fps without frame generation. The first world: after the player's first button,
+// a loading screen (frames without the game's 3D view for 1.5 s), then the 3D view again; or 90 s of the 3D view after
+// the button (in case no loading screen is seen).
+static std::atomic<bool>    g_player_input {false};
+static std::atomic<int64_t> g_input_ns {0};
+static std::atomic<bool>    g_world_ready {false};
 void NotePlayerInput() noexcept {
 	if (!g_player_input.exchange(true, std::memory_order_relaxed)) {
-		std::printf("Input: the player's first button: frame generation and frames above 60 allowed from here\n");
+		g_input_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+		std::printf("Input: the player's first button (frame generation waits for the first world)\n");
+		std::fflush(stdout);
+	}
+}
+static void NoteFrameForWorld(bool scene) {
+	if (g_world_ready.load(std::memory_order_relaxed) || !g_player_input.load(std::memory_order_relaxed)) return;
+	using namespace std::chrono;
+	static int64_t nonscene_since = 0;
+	static bool    loading_seen   = false;
+	const int64_t  now            = steady_clock::now().time_since_epoch().count();
+	const auto     ns             = [](auto d) { return duration_cast<steady_clock::duration>(d).count(); };
+	if (!scene) {
+		if (nonscene_since == 0) nonscene_since = now;
+		if (now - nonscene_since >= ns(milliseconds(1500))) loading_seen = true;
+		return;
+	}
+	nonscene_since = 0;
+	const bool timeout = now - g_input_ns.load(std::memory_order_relaxed) >= ns(seconds(90));
+	if (loading_seen || timeout) {
+		g_world_ready.store(true, std::memory_order_relaxed);
+		std::printf("World: the first world loaded (%s): frame generation and frames above 60 allowed from here\n",
+		            loading_seen ? "after a loading screen" : "90 s after the first button");
 		std::fflush(stdout);
 	}
 }
 bool PlayerInputSeen() noexcept {
-	return g_player_input.load(std::memory_order_relaxed);
+	return g_world_ready.load(std::memory_order_relaxed);
 }
 bool MoviePlaying() noexcept {
 	const auto last = g_movie_frame_ns.load(std::memory_order_relaxed);
@@ -1300,22 +1328,28 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_mutex.Unlock();
 
 	r.cfg->mutex.Lock();
-	int floor = 0;
+	int  floor      = 0;
+	bool scene_free = true;
 	if (r.frame != nullptr) {
 		if (Graphics::Presenter::FlipRateApplies(*r.frame)) floor = FlipRateFloor();
 		// (Also a movie playing, and with frame generation a frame without the game's camera: the PlayStation Studios
 		// logo at the start ran at 103-120 fps above 60 Hz, 10-18; the game draws something with its TAA behind it.)
-		const bool scene_free = !Graphics::Presenter::IsSceneFrame(*r.frame) || MoviePlaying() || !PlayerInputSeen() ||
-		                        (Graphics::Presenter::GeneratesFrames() && !Graphics::Presenter::IsGameView(*r.frame));
-		if (scene_free) floor = std::max(floor, SceneFreeFloor());
-		if (Graphics::Presenter::GeneratesFrames()) floor = std::max(floor, FrameGenFloor());
-		if (Graphics::Presenter::IsSceneFrame(*r.frame)) floor = std::max(floor, FlipFpsFloor());
+		NoteFrameForWorld(Graphics::Presenter::IsSceneFrame(*r.frame) && !MoviePlaying());
+		scene_free = !Graphics::Presenter::IsSceneFrame(*r.frame) || MoviePlaying() || !PlayerInputSeen() ||
+		             (Graphics::Presenter::GeneratesFrames() && !Graphics::Presenter::IsGameView(*r.frame));
+		if (scene_free) {
+			// (No frame generation here: 60, not the mode's base rate; Smooth 120 held the intro to 40, 10-18.)
+			floor = std::max(floor, SceneFreeFloor());
+		} else {
+			if (Graphics::Presenter::GeneratesFrames()) floor = std::max(floor, FrameGenFloor());
+			if (Graphics::Presenter::IsSceneFrame(*r.frame)) floor = std::max(floor, FlipFpsFloor());
+		}
 	}
 	// FSR 3 under the G-SYNC cap (Fsr3::RealFrameInterval: 1/56 s at x4 on 240 Hz, KYTY_VRR_CAP_FPS): the game's own
 	// flips keep to that grid, as Reflex holds the game for DLSS-G. Held only at the present, the game made 60 and 4
 	// a second were dropped (a stutter). Half a vblank early is due (the flips land on the nearest vblank).
 	static std::chrono::steady_clock::time_point s_paced_next {};
-	const double paced_interval = r.frame != nullptr && Graphics::Presenter::IsSceneFrame(*r.frame) && !MoviePlaying()
+	const double paced_interval = r.frame != nullptr && Graphics::Presenter::IsSceneFrame(*r.frame) && !MoviePlaying() && !scene_free
 	                                  ? std::max(Graphics::Fsr3::RealFrameInterval(), Graphics::FrameGen::RealFrameInterval())
 	                                  : 0.0;
 	const auto   paced_now      = std::chrono::steady_clock::now();

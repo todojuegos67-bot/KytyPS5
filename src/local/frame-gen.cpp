@@ -80,6 +80,8 @@ bool g_taa_bypass_copy = false;
 // the upscaler takes the raw frame, a copy made right after the TAA (UpscaleComposite).
 bool g_taa_bypass_match = false;
 double g_real_interval = 0.0; // DLSS-G under the G-SYNC cap: the real frames' least interval (seconds)
+uint32_t g_reflex_on_limit_us = 0; // Reflex's G-SYNC frame limit while DLSS-G generates (0: none)
+int      g_reflex_mode        = 0;
 bool g_sr_ready = false;
 bool     g_ready       = false; // Streamline loaded and the feature available
 Camera   g_camera;              // Kyty.Gpu: the current guest frame
@@ -418,7 +420,7 @@ bool Requested() {
 }
 
 double RealFrameInterval() {
-	return g_ready ? g_real_interval : 0.0;
+	return g_ready && g_mode_set == 1 ? g_real_interval : 0.0;
 }
 
 bool StreamlineLoaded() {
@@ -755,6 +757,9 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 			            static_cast<double>(cap) / (g_generate + 1), reflex.frameLimitUs);
 		}
 	}
+	g_reflex_on_limit_us = reflex.frameLimitUs;
+	g_reflex_mode        = static_cast<int>(reflex.mode);
+	reflex.frameLimitUs  = 0; // (DLSS-G starts off: the limit only while it generates, BeforePresent)
 	std::printf("Frame generation: Reflex mode %d\n", static_cast<int>(reflex.mode));
 	if (const auto result = g_api.reflex_set_options(reflex); result != sl::Result::eOk) {
 		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
@@ -1042,6 +1047,16 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		if (g_mode_set != (mode_on ? 1 : 0)) {
 			std::printf("DLSS-G: %s\n", mode_on ? "on (TAA pass)" : "off (no TAA pass: menu, loading or movie)");
 			std::fflush(stdout);
+		}
+		if (g_mode_set != (mode_on ? 1 : 0) && g_reflex_on_limit_us != 0) {
+			// Reflex's G-SYNC limit (x4 at 240 Hz: 56 real) only while generating: off (the logos, the title, menus,
+			// movies) the game keeps its 60 (10-18).
+			sl::ReflexOptions reflex {};
+			reflex.mode         = static_cast<sl::ReflexMode>(g_reflex_mode);
+			reflex.frameLimitUs = mode_on ? g_reflex_on_limit_us : 0;
+			if (const auto result = g_api.reflex_set_options(reflex); result != sl::Result::eOk) {
+				LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
+			}
 		}
 		g_mode_set = mode_on ? 1 : 0;
 		options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
