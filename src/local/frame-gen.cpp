@@ -1708,6 +1708,12 @@ struct TaaBypassPipeline {
 	VulkanImage             dlaa;                        // KYTY_TAA_REPLACE=dlss: DLAA's output, then into the TAA's
 	vk::ImageView           dlaa_view = nullptr;
 	uint64_t                raw_frame = UINT64_MAX;      // the guest frame whose raw color `dlaa` holds (bypass)
+	// The TAA's own output (before the raw frame replaced it), put back as its history before its next dispatch: the
+	// TAA then blends with its own past as on the console, and its output, compared with the raw frame, gives the
+	// brightness the raw frame needs (10-17: with the replaced frame as its history the comparison fed on itself
+	// and the gain ran to the 8x clamp).
+	VulkanImage             truth;
+	uint64_t                truth_frame = UINT64_MAX;
 	bool                    failed     = false;
 } g_bypass;
 
@@ -1824,6 +1830,59 @@ bool EnsureDlaaImage(GraphicContext& graphics, vk::Extent2D extent) {
 	return true;
 }
 
+
+// A raw copy between a cache image and one of ours (one size and format), the cache image back in `layout`.
+void CopyWithCacheImage(vk::CommandBuffer vk_command, Image& cache_image, vk::ImageLayout layout, VulkanImage& ours,
+                        bool to_ours) {
+	const vk::ImageSubresourceLayers layers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	vk::ImageCopy copy {};
+	copy.srcSubresource = layers;
+	copy.dstSubresource = layers;
+	copy.extent         = vk::Extent3D {ours.extent.width, ours.extent.height, 1};
+	if (to_ours) {
+		cache_image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, vk_command);
+		Transition(vk_command, ours, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+		           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+		vk_command.copyImage(cache_image.backing.image, vk::ImageLayout::eTransferSrcOptimal, ours.image,
+		                     vk::ImageLayout::eTransferDstOptimal, copy);
+	} else {
+		Transition(vk_command, ours, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+		           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+		cache_image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, vk_command);
+		vk_command.copyImage(ours.image, vk::ImageLayout::eTransferSrcOptimal, cache_image.backing.image,
+		                     vk::ImageLayout::eTransferDstOptimal, copy);
+	}
+	cache_image.Transit(layout, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, {}, vk_command);
+}
+
+bool EnsureTruthImage(GraphicContext& graphics, vk::Extent2D extent) {
+	auto& t = g_bypass.truth;
+	if (t.image != nullptr && t.extent.width == extent.width && t.extent.height == extent.height) return true;
+	if (t.image != nullptr) {
+		graphics.device.waitIdle();
+		graphics.DeleteImage(t);
+		t.image = nullptr;
+	}
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = vk::Format::eR16G16B16A16Sfloat;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.samples       = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, t)) {
+		t.image = nullptr;
+		return false;
+	}
+	t.state             = {};
+	g_bypass.truth_frame = UINT64_MAX;
+	return true;
+}
+
 float EnvFloatOr(const char* name, float fallback) {
 	const char* value = std::getenv(name);
 	return value != nullptr && *value != '\0' ? static_cast<float>(std::atof(value)) : fallback;
@@ -1934,6 +1993,14 @@ bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<co
 #endif
 	}
 
+	// The TAA's own output kept, for its history next frame (ReplaceTaa: RestoreTaaHistory).
+	if (EnsureTruthImage(*g_graphics_ctx, render)) {
+		CopyWithCacheImage(vk_command, output, out_b.layout, g_bypass.truth, true);
+		g_bypass.truth_frame = g_guest_frame;
+		compute_barrier(vk::PipelineStageFlagBits2::eAllCommands,
+		                vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+	}
+
 	vk::DescriptorImageInfo  infos[2] {};
 	infos[0] = {g_bypass.sampler, source_view, source_layout};
 	infos[1] = {nullptr, out_b.image_view, vk::ImageLayout::eGeneral};
@@ -2001,7 +2068,44 @@ bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<co
 	return true;
 }
 
+// Before the TAA dispatch (AfterTaa replaces its output): its history image (binding 4) gets back the TAA's own
+// output of the frame before, when that is the previous frame and the sizes match.
+void RestoreTaaHistory(vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
+	static const bool off = std::getenv("KYTY_TAA_TRUE_HISTORY") != nullptr && *std::getenv("KYTY_TAA_TRUE_HISTORY") == '0';
+	if (off || g_cache == nullptr || images.size() < 7 || g_bypass.truth.image == nullptr) return;
+	if (g_bypass.truth_frame == UINT64_MAX || g_guest_frame != g_bypass.truth_frame + 1) return;
+	const auto& hist_b = images[4];
+	const auto& out_b  = images[6];
+	if (!hist_b.image_id || !out_b.image_id) return;
+	auto& history = g_cache->GetImage(hist_b.image_id);
+	auto& output  = g_cache->GetImage(out_b.image_id);
+	static uint32_t logs = 0;
+	if (history.backing.image == output.backing.image || history.backing.format != vk::Format::eR16G16B16A16Sfloat ||
+	    history.backing.extent.width != g_bypass.truth.extent.width ||
+	    history.backing.extent.height != g_bypass.truth.extent.height) {
+		if (logs < 2) {
+			++logs;
+			std::printf("TAA: history not restored (history %ux%u format %d)\n", history.backing.extent.width,
+			            history.backing.extent.height, static_cast<int>(history.backing.format));
+			std::fflush(stdout);
+		}
+		return;
+	}
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+	LocalVulkanRecording::Drain();
+#endif
+	const auto layout = hist_b.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eShaderReadOnlyOptimal : hist_b.layout;
+	CopyWithCacheImage(vk_command, history, layout, g_bypass.truth, false);
+	if (logs < 2) {
+		++logs;
+		std::printf("TAA: its history is its own output (the raw frame went only to what follows)\n");
+		std::fflush(stdout);
+	}
+}
+
 bool ReplaceTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
+	if ((g_taa_bypass && !g_taa_bypass_copy && g_taa_bypass_match) || (g_taa_dlss && !g_taa_bypass_copy))
+		RestoreTaaHistory(vk_command, images);
 	if (g_taa_bypass) return g_taa_bypass_copy && BypassTaa(vk_command, images);
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	if (!g_taa_dlss || !g_taa_bypass_copy || !g_sr_ready || g_cache == nullptr || images.size() < 7) return false;

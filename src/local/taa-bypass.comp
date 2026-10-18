@@ -12,10 +12,11 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D raw_color;
 layout(binding = 1, rgba16f) uniform image2D taa_output;
 layout(std430, binding = 2) buffer Stats {
-	uint  sum_taa;
+	uint  sum_taa;   // log2 luminance, fixed point (see mode 0)
 	uint  sum_raw;
 	float gain;      // the smoothed gain in use
 	float measured;  // the last frame's ratio (logging)
+	uint  groups;    // the groups summed
 } stats;
 
 layout(push_constant) uniform Push {
@@ -28,8 +29,11 @@ layout(push_constant) uniform Push {
 shared uint group_taa;
 shared uint group_raw;
 
-float Luma(vec3 c) {
-	return clamp(dot(max(c, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)), 0.0, 64.0);
+// log2 of the luminance, offset to [0, 24]: the ratio of the two images' geometric means. (Their plain means: the raw
+// frame's bright specks, which the TAA's neighbourhood clamp removes, gave a ratio of ~0.38 that darkened the rest.)
+float LogLuma(vec3 c) {
+	float l = dot(max(c, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+	return clamp(log2(l + 1.0e-4), -16.0, 8.0) + 16.0;
 }
 
 void main() {
@@ -38,12 +42,15 @@ void main() {
 	if (push.mode == 1) {
 		if (gl_GlobalInvocationID.x == 0 && gl_GlobalInvocationID.y == 0) {
 			float previous = stats.gain > 0.0 && stats.gain < 16.0 ? stats.gain : 1.0;
-			float ratio    = stats.sum_raw > 64u ? float(stats.sum_taa) / float(stats.sum_raw) : previous;
+			float ratio    = stats.groups > 16u
+			                     ? exp2((float(stats.sum_taa) - float(stats.sum_raw)) / (float(stats.groups) * 256.0))
+			                     : previous;
 			ratio          = clamp(ratio, 0.25, 8.0);
 			stats.measured = ratio;
 			stats.gain     = push.match != 0 ? mix(previous, ratio, push.smoothing) : 1.0;
 			stats.sum_taa  = 0u;
 			stats.sum_raw  = 0u;
+			stats.groups   = 0u;
 		}
 		return;
 	}
@@ -54,14 +61,15 @@ void main() {
 		}
 		barrier();
 		if (pixel.x < size.x && pixel.y < size.y) {
-			// (Fixed point, 1/1024: a group's mean at most 64*1024 = 65536; the 57600 groups of 2560x1440 fit 32 bits.)
-			atomicAdd(group_taa, uint(Luma(imageLoad(taa_output, pixel).rgb) * 1024.0));
-			atomicAdd(group_raw, uint(Luma(texelFetch(raw_color, pixel, 0).rgb) * 1024.0));
+			// (Fixed point, 1/256: a group's mean at most 24*256 = 6144; 57600 groups fit 32 bits.)
+			atomicAdd(group_taa, uint(LogLuma(imageLoad(taa_output, pixel).rgb) * 256.0));
+			atomicAdd(group_raw, uint(LogLuma(texelFetch(raw_color, pixel, 0).rgb) * 256.0));
 		}
 		barrier();
 		if (gl_LocalInvocationIndex == 0u) {
 			atomicAdd(stats.sum_taa, group_taa / 64u);
 			atomicAdd(stats.sum_raw, group_raw / 64u);
+			atomicAdd(stats.groups, 1u);
 		}
 		return;
 	}

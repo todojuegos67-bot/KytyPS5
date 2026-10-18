@@ -148,6 +148,9 @@ function Start-Game {
 	# caen justos en los 360 Hz (9 y 10 vblanks): el juego no dibuja frames de mas que se tirarian antes del DLSS.
 	if ($config -eq 'dlss-x4.json') { $psargs += @('-Vblank', '224') }
 	elseif ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
+	# Sin frame generation, "FPS desbloqueados": vblank virtual de 240 Hz, el juego pasa de 60 (a velocidad real:
+	# gameMinDeltaTime en run-windows); videos, menus y pantallas de carga siguen a 60.
+	elseif ($chkUnlock.Checked) { $psargs += @('-Vblank', '240') }
 	$res    = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
 	if ($res[1] -eq 0) { $res = $resModes[0] }
 	# DLSS (reescalado) carga Streamline de NVIDIA; con la generacion de frames de AMD el emulador se cerraba al crear
@@ -271,6 +274,7 @@ function New-Check([string]$text, $x, $y, $w, [string]$key) {
 $chkHdr   = New-Check 'HDR' 350 100 90 'hdr'
 $chkVsync = New-Check 'VSync' 450 100 100 'vsync'
 $chkLowPc = New-Check 'Modo PC de pocos recursos' 670 14 230 'lowpc'
+$chkUnlock = New-Check 'FPS desbloqueados' 910 14 180 'unlock'
 $tips = New-Object System.Windows.Forms.ToolTip
 $tips.SetToolTip($chkHdr, 'HDR10: activa antes "Usar HDR" en la configuracion de pantalla de Windows')
 $tips.SetToolTip($chkVsync, 'VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando')
@@ -278,6 +282,8 @@ $panel.Controls.Add($chkHdr)
 $panel.Controls.Add($chkVsync)
 $tips.SetToolTip($chkLowPc, 'Para PCs con 16 GB de RAM: menos RAM en uso (la que el juego no usa se devuelve a Windows cada 30 s). Puede dar algun tiron mas. Con menos de 24 GB se activa solo.')
 $panel.Controls.Add($chkLowPc)
+$tips.SetToolTip($chkUnlock, 'Sin frame generation: el juego pasa de 60 FPS (videos, menus y cargas siguen a 60)')
+$panel.Controls.Add($chkUnlock)
 
 # Desplegables con color por marca: titulos de apartado en negrita (NVIDIA verde, Intel azul, AMD rojo) y sus modos
 # en el mismo tono.
