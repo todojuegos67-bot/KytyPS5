@@ -148,6 +148,10 @@ function Start-Game {
 	$sets = @()
 	if ($chkLowPc.Checked) { $sets += @('KYTY_SIMULATE_RAM_MB=16384', 'KYTY_VRAM_BUDGET_MB=6656'); $psargs += @('-Quality', 'low', '-TextureReduce', '1') }
 	if ($chkSafeGpu.Checked) { $sets += 'KYTY_COMPUTE_CHAIN=0' }
+	# FPS desbloqueados con frame generation: el juego deja de estar limitado a 60 reales (KYTY_FRAMEGEN_BASE=0); los
+	# modos Smooth siguen en sus FPS fijos (KYTY_FLIP_FPS) y DLSS-G se limita solo con Reflex al tope del monitor.
+	$fgConfig = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
+	if ($chkUnlock.Checked -and $fgConfig -and $fgConfig -ne 'sin-fg.json') { $sets += 'KYTY_FRAMEGEN_BASE=0' }
 	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
@@ -291,7 +295,7 @@ $panel.Controls.Add($chkHdr)
 $panel.Controls.Add($chkVsync)
 $tips.SetToolTip($chkLowPc, 'PCs con 16 GB de RAM o graficas de 8 GB o menos: RAM limitada (se devuelve a Windows cada 30 s), VRAM limitada por debajo de 8 GB, texturas a la mitad y sombras mas cortas.')
 $panel.Controls.Add($chkLowPc)
-$tips.SetToolTip($chkUnlock, 'Sin frame generation: el juego pasa de 60 FPS (videos, menus y cargas siguen a 60)')
+$tips.SetToolTip($chkUnlock, 'El juego pasa de 60 FPS reales, tambien con frame generation (videos, menus y cargas siguen a 60)')
 $panel.Controls.Add($chkUnlock)
 $tips.SetToolTip($chkSafeGpu, 'Para graficas que se cuelgan o dan pantallazo azul: mas estable, ~37% menos FPS')
 $panel.Controls.Add($chkSafeGpu)
