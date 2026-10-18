@@ -160,9 +160,9 @@ function Start-Game {
 	# caen justos en los 360 Hz (9 y 10 vblanks): el juego no dibuja frames de mas que se tirarian antes del DLSS.
 	if ($config -eq 'dlss-x4.json') { $psargs += @('-Vblank', '224') }
 	elseif ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
-	# Sin frame generation, "FPS desbloqueados": vblank virtual de 240 Hz, el juego pasa de 60 (a velocidad real:
+	# Sin frame generation, "FPS desbloqueados": vblank de 120 Hz (-Fps120, el modo probado de chenxiao07; a 240 los menus y el intro iban acelerados, 10-18), el juego pasa de 60 (a velocidad real:
 	# gameMinDeltaTime en run-windows); videos, menus y pantallas de carga siguen a 60.
-	elseif ($chkUnlock.Checked) { $psargs += @('-Vblank', '240') }
+	elseif ($chkUnlock.Checked) { $psargs += '-Fps120' }
 	$res    = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
 	if ($res[1] -eq 0) { $res = $resModes[0] }
 	# DLSS (reescalado) carga Streamline de NVIDIA; con la generacion de frames de AMD el emulador se cerraba al crear
