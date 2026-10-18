@@ -870,8 +870,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	    HasExtension(device_extensions, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) &&
 	    supported_fragment_barycentric.fragmentShaderBarycentric == VK_TRUE;
 	if (!barycentric_supported) {
-		Log::WriteToConsoleAndLog("WARNING: this GPU has no fragmentShaderBarycentric (GTX 10xx, RDNA 1): a few "
-		                          "effects may be missing or wrong.\n");
+		LOGF("WARNING: this GPU has no fragmentShaderBarycentric (GTX 10xx, RDNA 1): a few effects may be missing or "
+		     "wrong.\n");
+		std::printf("WARNING: this GPU has no fragmentShaderBarycentric (GTX 10xx, RDNA 1): a few effects may be "
+		            "missing or wrong.\n");
 	}
 #endif
 	vk::PhysicalDeviceFeatures device_features {};
