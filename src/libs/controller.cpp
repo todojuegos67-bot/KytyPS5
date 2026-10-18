@@ -184,7 +184,19 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 		}
 		data->buttons |= g_scripted.buttons.load(std::memory_order_relaxed);
 	}
-	if (data->buttons != 0) Libs::VideoOut::NotePlayerInput();
+	// The intro ends with a button held for 2 s (10-18: a single press, the game's own "press a button" too, let frame
+	// generation start while the title still played).
+	{
+		static int64_t held_since = 0;
+		const int64_t  now        = SteadyNanoseconds();
+		if (data->buttons == 0) {
+			held_since = 0;
+		} else if (held_since == 0) {
+			held_since = now;
+		} else if (now - held_since >= 2'000'000'000LL) {
+			Libs::VideoOut::NotePlayerInput();
+		}
+	}
 	data->connected              = connected;
 	data->timestamp              = state.time;
 	data->connected_count        = static_cast<uint8_t>(std::min(connected_count, 255));
