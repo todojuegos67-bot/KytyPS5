@@ -1511,6 +1511,9 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (FrameCapture::Active()) {
 		CaptureFrameDraw(buffer, draw, state, bindings.vertex, bindings.pixel);
 	}
+	if (state.vs_input_info.stage.program != nullptr) FrameGen::NoteShader(state.vs_input_info.stage.program->shader_hash, 'v');
+	if (state.ps_active && state.ps_input_info.stage.program != nullptr)
+		FrameGen::NoteShader(state.ps_input_info.stage.program->shader_hash, 'p');
 	if (FrameGen::Capturing() && state.vs_input_info.stage.program != nullptr) {
 		FrameGen::OnDraw(state.vs_input_info.stage.program->shader_hash,
 		                 state.vs_input_info.stage.resources.flattened_srt);

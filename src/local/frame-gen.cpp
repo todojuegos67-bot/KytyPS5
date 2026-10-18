@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include <tuple>
+#include <mutex>
 #include <unordered_map>
 #include <utility>
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -1236,6 +1237,42 @@ void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 	}
 	g_camera.jitter_ndc = {AsFloat(srt[SrtJitter]), AsFloat(srt[SrtJitter + 1])};
 	g_camera.valid      = true;
+}
+
+// KYTY_SHADER_CENSUS=1: every program the game runs (vertex, pixel, compute) with the first and last guest flip it ran
+// in and how many draws or dispatches, printed every 10 s ("[census]" lines; the full list each time): the PlayStation
+// Studios logo's programs are those it alone uses (10-18: to hold it at 60 without frame generation).
+void NoteShader(uint64_t hash, char stage) {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_SHADER_CENSUS");
+		return value != nullptr && *value == '1';
+	}();
+	if (!on || hash == 0) return;
+	struct Entry {
+		uint64_t first = 0, last = 0, count = 0;
+		char     stage = '?';
+	};
+	static std::mutex                             mutex;
+	static std::unordered_map<uint64_t, Entry>    seen;
+	static auto                                   printed = std::chrono::steady_clock::now();
+	const uint64_t                                flip    = g_flips_taken.load(std::memory_order_relaxed);
+	std::lock_guard                               lock(mutex);
+	auto& e = seen[hash];
+	if (e.count == 0) {
+		e.first = flip;
+		e.stage = stage;
+	}
+	e.last = flip;
+	e.count++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - printed < std::chrono::seconds(10)) return;
+	printed = now;
+	std::printf("[census] flip %llu: %zu programs\n", static_cast<unsigned long long>(flip), seen.size());
+	for (const auto& [h, v]: seen)
+		std::printf("[census] %c %016llx first %llu last %llu count %llu\n", v.stage, static_cast<unsigned long long>(h),
+		            static_cast<unsigned long long>(v.first), static_cast<unsigned long long>(v.last),
+		            static_cast<unsigned long long>(v.count));
+	std::fflush(stdout);
 }
 
 void NoteScene() {

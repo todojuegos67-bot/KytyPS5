@@ -126,6 +126,8 @@ void NoteScene();
 // no constants on the CPU), whose hook reads it.
 [[nodiscard]] bool WantsCamera();
 void OnDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt);
+// KYTY_SHADER_CENSUS=1 (frame-gen.cpp): a program the game ran (stage v, p or c).
+void NoteShader(uint64_t hash, char stage);
 void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId motion,
                 uint64_t motion_address);
 // At the guest flip, in the frame's command buffer: copy the gathered images into `inputs`.
