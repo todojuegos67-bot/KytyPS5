@@ -1293,7 +1293,11 @@ bool FlipQueue::Flip(uint32_t micros) {
 	int floor = 0;
 	if (r.frame != nullptr) {
 		if (Graphics::Presenter::FlipRateApplies(*r.frame)) floor = FlipRateFloor();
-		if (!Graphics::Presenter::IsSceneFrame(*r.frame)) floor = std::max(floor, SceneFreeFloor());
+		// (Also a movie playing, and with frame generation a frame without the game's camera: the PlayStation Studios
+		// logo at the start ran at 103-120 fps above 60 Hz, 10-18; the game draws something with its TAA behind it.)
+		const bool scene_free = !Graphics::Presenter::IsSceneFrame(*r.frame) || MoviePlaying() ||
+		                        (Graphics::Presenter::GeneratesFrames() && !Graphics::Presenter::IsGameView(*r.frame));
+		if (scene_free) floor = std::max(floor, SceneFreeFloor());
 		if (Graphics::Presenter::GeneratesFrames()) floor = std::max(floor, FrameGenFloor());
 		if (Graphics::Presenter::IsSceneFrame(*r.frame)) floor = std::max(floor, FlipFpsFloor());
 	}
