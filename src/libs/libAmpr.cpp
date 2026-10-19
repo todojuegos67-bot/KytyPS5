@@ -4,6 +4,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "graphics/presentation/videoOut.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -1313,6 +1314,8 @@ static void NoteSceneRead(const std::string& path) {
 		else if (c != '_') return;
 	}
 	SceneTags::Enter(id != 0 ? id : 0x80000000u);
+	// A map's load list: the world (the world gate: frame generation and frames above 60 from here).
+	VideoOut::NoteWorldFile(path.c_str());
 }
 
 static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_result,
@@ -1394,6 +1397,14 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 				}
 
 				NoteSceneRead(host_path);
+				// The game's in-engine cinematics (cinematics/scnNNNNNN_<name>/...): shown as a movie while read.
+				if (host_path.find("cinematics") != std::string::npos) {
+					static thread_local std::string last;
+					const auto slash = host_path.find("scn");
+					const auto scene = slash != std::string::npos ? host_path.substr(slash, host_path.find_first_of("/\\", slash) - slash) : host_path;
+					VideoOut::NoteCinematic(scene != last ? scene.c_str() : nullptr);
+					last = scene;
+				}
 				uint64_t bytes_read = 0;
 				auto result = ReadHostFileToGuest(host_path, command.file_offset,
 				                                  command.destination, command.size, &bytes_read);
