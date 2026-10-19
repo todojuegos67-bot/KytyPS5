@@ -64,7 +64,7 @@ VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT g_mutable {};
 
 bool Load() {
 	static const bool loaded = [] {
-		if (!Wanted()) return false;
+		if (!Wanted() && !SrPathWanted()) return false;
 		wchar_t exe[MAX_PATH] {};
 		GetModuleFileNameW(nullptr, exe, MAX_PATH);
 		std::wstring dir(exe);
