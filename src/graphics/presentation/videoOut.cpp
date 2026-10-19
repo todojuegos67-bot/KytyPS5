@@ -554,8 +554,20 @@ static void NoteFrameForWorld(bool scene) {
 	const auto     ns             = [](auto d) { return duration_cast<steady_clock::duration>(d).count(); };
 	if (!scene) {
 		if (nonscene_since == 0) nonscene_since = now;
-		if (now - nonscene_since >= ns(milliseconds(1500))) loading_seen = true;
+		// (A long one: the menus' short black screens (the title to the main menu, 1.5-3 s) are not the world's load,
+		// the fog's. KYTY_WORLD_LOADING_MS: how long, default 4000.)
+		static const int64_t loading_ms = [] {
+			const char* value = std::getenv("KYTY_WORLD_LOADING_MS");
+			return value != nullptr ? std::max<int64_t>(500, std::atoll(value)) : int64_t {4000};
+		}();
+		if (now - nonscene_since >= ns(milliseconds(loading_ms))) loading_seen = true;
 		return;
+	}
+	if (nonscene_since != 0 && now - nonscene_since >= ns(milliseconds(500))) {
+		std::printf("World: a screen without the 3D view for %lld ms (%s)\n",
+		            static_cast<long long>(duration_cast<milliseconds>(steady_clock::duration(now - nonscene_since)).count()),
+		            loading_seen ? "the world's load" : "shorter than the world's load");
+		std::fflush(stdout);
 	}
 	nonscene_since = 0;
 	const bool timeout = now - g_input_ns.load(std::memory_order_relaxed) >= ns(seconds(90));
