@@ -455,6 +455,10 @@ void CompileSrtWalker(ResourcePlan& program) {
 		code.push(code.rdi);
 		code.mov(code.rdi, code.qword[code.rdi + pointer_offset]);
 		code.and_(code.rdi, code.r9);
+		// A null (or not yet written) table pointer: no native read, the evaluator takes it
+		// (Wolverine: a user-data pointer still 0 faulted at address 0 on a host thread).
+		code.cmp(code.rdi, 0x10000);
+		code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
 		const auto first = reads.begin()->first;
 		const auto last = reads.rbegin()->first;
 		if (first < 0) {
