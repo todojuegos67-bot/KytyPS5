@@ -2421,10 +2421,12 @@ private:
 	// `call` with the whole address space busy: no map, unmap or protection change of the guest's views runs meanwhile
 	// (they wait for it, as for each other; the working set trim, LocalPlatform::SetTrimRunner).
 public:
-	void RunQuiet(void (*call)()) {
+	// (At most 200 ms waiting for the maps and unmaps under way: past that the trim is skipped this time, never stalled.)
+	bool RunQuiet(void (*call)()) {
 		{
 			ExclusiveLock lock(m_mutex);
-			m_busy_done.wait(lock.Lock(), [&] { return m_busy.empty(); });
+			if (!m_busy_done.wait_for(lock.Lock(), std::chrono::milliseconds(200), [&] { return m_busy.empty(); }))
+				return false;
 			m_busy.emplace_back(0, uint64_t {1} << 47u);
 		}
 		call();
@@ -2433,6 +2435,7 @@ public:
 			EraseBusyUnlocked(0, uint64_t {1} << 47u);
 		}
 		m_busy_done.notify_all();
+		return true;
 	}
 
 private:
