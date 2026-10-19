@@ -23,6 +23,8 @@
 #include "vulkan-recording.h"
 #endif
 
+#include <cstdlib>
+#include <string>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -432,7 +434,12 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		}
 	}
 	if (static std::atomic<uint32_t> reports {0}; reports.fetch_add(1, std::memory_order_relaxed) < 2) {
-		std::printf("Super resolution: %s, the game's exposure %s\n", dlss ? "DLSS" : "stretch",
+		static const char* const upscaler_name = [] {
+			const char* value = std::getenv("KYTY_UPSCALER");
+			const std::string kind = value != nullptr ? value : "";
+			return kind == "xess" ? "XeSS" : kind == "fsr" ? "FSR 3.1" : "DLSS";
+		}();
+		std::printf("Super resolution: %s, the game's exposure %s\n", dlss ? upscaler_name : "stretch",
 		            record.exposure_pass.pipeline != nullptr ? "applied" : "not applied");
 		std::fflush(stdout);
 	}
