@@ -94,6 +94,8 @@ param(
 	[switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
+# (Any error that stops this script, with where it came from, in run-error.txt next to it.)
+trap { "$(Get-Date -Format s) $_`n$($_.ScriptStackTrace)" | Out-File -Append -LiteralPath (Join-Path $PSScriptRoot 'run-error.txt'); break }
 if (!(Test-Path $Exe)) { throw "missing $Exe; build it with build-windows.cmd" }
 
 # Dialogs: sharp on scaled displays (the process is DPI aware before its first window).

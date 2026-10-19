@@ -6,6 +6,8 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 $ErrorActionPreference = 'Stop'
+# (Any error that stops this script, with where it came from, in launcher-error.txt next to it.)
+trap { "$(Get-Date -Format s) $_`n$($_.ScriptStackTrace)" | Out-File -Append -LiteralPath (Join-Path $PSScriptRoot 'launcher-error.txt'); break }
 $root     = $PSScriptRoot
 $exeName  = 'kyty_emulator.exe'
 $pathFile = Join-Path $root 'game-path.txt'
