@@ -5,6 +5,9 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 namespace Libs::Graphics {
 
 SamplerCache::~SamplerCache() {
@@ -148,6 +151,22 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 		sampler_info.maxAnisotropy    = 1.0f;
 		sampler_info.compareEnable    = VK_FALSE;
 		sampler_info.mipLodBias       = 0.0f;
+	}
+
+	// KYTY_FORCE_ANISO=<2..16> (startup): every linearly minified, mipmapped sampler gets at
+	// least that anisotropy, as a driver override would. Bindless materials fall back to a plain
+	// trilinear sampler (BindlessBindings.h) and the game's own samplers may ask for less than
+	// the console showed; both look blurry on ground and walls seen at an angle.
+	static const float force_aniso = [] {
+		const char* v = std::getenv("KYTY_FORCE_ANISO");
+		return v != nullptr ? static_cast<float>(std::atof(v)) : 0.0f;
+	}();
+	if (force_aniso > 1.0f && !r.ForceUnormCoords() && sampler_info.compareEnable == VK_FALSE &&
+	    sampler_info.minFilter == vk::Filter::eLinear &&
+	    sampler_info.mipmapMode == vk::SamplerMipmapMode::eLinear) {
+		const float limit = m_graphics.GetPhysicalDeviceProperties().limits.maxSamplerAnisotropy;
+		sampler_info.anisotropyEnable = VK_TRUE;
+		sampler_info.maxAnisotropy    = std::min(std::max(sampler_info.maxAnisotropy, force_aniso), limit);
 	}
 
 	vk::Sampler vk_sampler = nullptr;
