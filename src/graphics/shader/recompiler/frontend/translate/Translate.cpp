@@ -511,6 +511,32 @@ IR::F32 Translator::ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_
 	return IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
 }
 
+// Both f16 lanes of a packed operand, from one shared UnpackHalf2x16 for plain registers.
+// Reading each lane through ReadF16LaneAsF32 costs an extract, a mask and an unpack per lane,
+// which made Ghost of Yotei's packed-math shaders several times larger than needed.
+std::array<IR::F32, 2> Translator::ReadF16PairAsF32(const Decoder::Operand& operand) {
+	const bool plain = (operand.kind == Decoder::OperandKind::Vgpr ||
+	                    operand.kind == Decoder::OperandKind::Sgpr) &&
+	                   operand.sdwa_sel == 6u;
+	if (!plain) {
+		return {ReadF16LaneAsF32(operand, false), ReadF16LaneAsF32(operand, true)};
+	}
+	const auto bits     = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
+	const auto unpacked = ir.Emit(IR::ValueOpcode::UnpackHalf2x16, {bits});
+	const auto lane     = [&](bool high) {
+		const uint32_t index = (high ? operand.op_sel_hi : operand.op_sel) ? 1u : 0u;
+		auto value = IR::F32(ir.Emit(IR::ValueOpcode::CompositeExtractF32x2, {unpacked, IR::Value(index)}));
+		if (operand.absolute) {
+			value = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value}));
+		}
+		if (high ? operand.negate_hi : operand.negate) {
+			value = IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {value}));
+		}
+		return value;
+	};
+	return {lane(false), lane(true)};
+}
+
 IR::F32 Translator::ReadF16AsF32(const Decoder::Operand& operand) {
 	return ReadF16LaneAsF32(operand, false);
 }

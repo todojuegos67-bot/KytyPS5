@@ -115,7 +115,7 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 	} else {
 		state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), converted_raw, trunc);
 	}
-	const auto nan = EmitClassifyF32(state, src).nan;
+	const auto nan = Unary(state, spv::OpIsNan, TypeBool(state), src);
 	if (signed_value) {
 		const auto below = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), src,
 		                          ConstantF32(state, 0xcf000000u));
@@ -245,6 +245,10 @@ uint32_t EmitCompositeExtractU64(EmitterState& state, uint32_t arg0, IR::Value a
 
 uint32_t EmitCompositeExtractU32x2(EmitterState& state, uint32_t arg0, IR::Value arg1) {
 	return EmitNative<spv::OpCompositeExtract, IR::Type::U32>(state, arg0, arg1.U32());
+}
+
+uint32_t EmitCompositeExtractF32x2(EmitterState& state, uint32_t arg0, IR::Value arg1) {
+	return EmitNative<spv::OpCompositeExtract, IR::Type::F32>(state, arg0, arg1.U32());
 }
 
 uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1) {

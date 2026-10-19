@@ -7,16 +7,20 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
+	const auto lhs = ReadF16PairAsF32(inst.src0);
+	const auto rhs = ReadF16PairAsF32(inst.src1);
+	std::array<IR::F32, 2> third {};
+	const bool has_third = accumulator || inst.src_count == 3u;
+	if (has_third) {
+		third = ReadF16PairAsF32(accumulator ? inst.dst : inst.src2);
+	}
 	const auto translate_lane = [&](bool high) {
-		const auto lhs = ReadF16LaneAsF32(inst.src0, high);
-		const auto rhs = ReadF16LaneAsF32(inst.src1, high);
+		const auto i = high ? 1u : 0u;
 		IR::F32    result;
-		if (accumulator) {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.dst, high)}));
-		} else if (inst.src_count == 3u) {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.src2, high)}));
+		if (has_third) {
+			result = IR::F32(ir.Emit(opcode, {lhs[i], rhs[i], third[i]}));
 		} else {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs}));
+			result = IR::F32(ir.Emit(opcode, {lhs[i], rhs[i]}));
 		}
 		return ApplyF32ResultModifiers(inst.dst, result);
 	};

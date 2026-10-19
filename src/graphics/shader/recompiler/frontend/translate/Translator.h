@@ -42,6 +42,7 @@ private:
 	std::array<IR::U32, 2> ReadU32Pair(const Decoder::Operand& operand);
 	IR::U64                ReadU64(const Decoder::Operand& operand);
 	IR::F32 ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane);
+	std::array<IR::F32, 2> ReadF16PairAsF32(const Decoder::Operand& operand);
 	IR::F32 ReadF16AsF32(const Decoder::Operand& operand);
 	IR::F32 ReadMixF32(const Decoder::Operand& operand);
 	IR::U32 ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane, bool sign_extend);
