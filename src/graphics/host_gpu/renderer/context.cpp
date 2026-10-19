@@ -285,15 +285,6 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	m_rendering    = true;
 }
 
-void CommandBuffer::ResumeRendering(const RenderState& state) const {
-	RenderState load = state;
-	for (auto& attachment: load.color_attachments) attachment.is_clear = false;
-	load.depth_stencil_attachment.depth_clear   = false;
-	load.depth_stencil_attachment.stencil_clear = false;
-	BeginRendering(load);
-	m_render_state = state;
-}
-
 void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
