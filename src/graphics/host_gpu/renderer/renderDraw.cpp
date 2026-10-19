@@ -40,7 +40,6 @@
 #include "device-fault.h"
 #include "frame-capture.h"
 #include "frame-gen.h"
-#include "frame-gen-hudless.h"
 #include "native-preparation-state.h"
 #include "slow-log.h"
 #include "xpr-capture.h"

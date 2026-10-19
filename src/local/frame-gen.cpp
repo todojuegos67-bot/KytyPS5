@@ -414,27 +414,6 @@ bool FeatureFunction(sl::Feature feature, const char* name, F*& function) {
 	return true;
 }
 
-// KYTY_FG_HUDLESS: the frame's image without its HUD, laid out as the backbuffer (`game`: where that shows the game
-// image; frame-gen-hudless.h), or none for a frame without one (DLSS-G then takes the backbuffer as it is).
-void TagHudless(sl::FrameToken& token, const FrameInputs& inputs, const sl::Extent& game) {
-	const auto&  image = inputs.hudless.display;
-	sl::Resource hudless(sl::ResourceType::eTex2d, static_cast<VkImage>(image.image), nullptr,
-	                     static_cast<VkImageView>(inputs.hudless.display_view),
-	                     static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
-	hudless.width        = image.extent.width;
-	hudless.height       = image.extent.height;
-	hudless.nativeFormat = static_cast<uint32_t>(image.format);
-	hudless.mipLevels    = 1;
-	hudless.arrayLayers  = 1;
-	hudless.flags        = 0;
-	hudless.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.usage));
-	const sl::ResourceTag tag(inputs.hudless.has_display ? &hudless : nullptr, sl::kBufferTypeHUDLessColor,
-	                          sl::ResourceLifecycle::eValidUntilPresent, &game);
-	if (const auto result = g_api.set_tag_for_frame(token, sl::ViewportHandle {0}, &tag, 1, nullptr);
-	    result != sl::Result::eOk && g_presents < 8) {
-		LOGF("frame generation: slSetTagForFrame (HUD-less) failed (%d)\n", static_cast<int>(result));
-	}
-}
 #endif
 
 } // namespace
@@ -923,7 +902,6 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
 	}
 	g_ready = true;
-	InitializeHudless();
 	LOGF("frame generation: DLSS-G ready\n");
 	std::printf("Frame generation: DLSS-G ready (%d generated frame(s) per frame)\n", g_generate);
 	std::fflush(stdout);
@@ -1316,9 +1294,6 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		if (const auto result = g_api.set_tag_for_frame(token, viewport, tags.data(), static_cast<uint32_t>(tags.size()), nullptr);
 		    result != sl::Result::eOk && g_presents < 8) {
 			LOGF("frame generation: slSetTagForFrame failed (%d)\n", static_cast<int>(result));
-		}
-		if (HudlessOn()) {
-			TagHudless(token, *inputs, game);
 		}
 	} else {
 		// Menus, movies, loading: no valid depth and motion (DLSS-G then presents the frame as is).
@@ -3064,7 +3039,6 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 			graphics.DeleteImage(*image);
 		}
 	}
-	DestroyHudlessInputs(graphics, inputs);
 	inputs.valid = false;
 }
 
