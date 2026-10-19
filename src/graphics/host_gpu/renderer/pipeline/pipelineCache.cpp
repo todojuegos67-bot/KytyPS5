@@ -26,6 +26,12 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <unordered_set>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -497,6 +503,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	StopAsyncCompute();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -1053,4 +1060,153 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	return *iter->second;
 }
+
+// KYTY_ASYNC_COMPUTE_WORDS=<n> (default 0 = off): compute pipelines whose SPIR-V has more words than
+// that are created by background threads; their dispatches are skipped until the pipeline is ready,
+// so the game keeps running (with a missing effect for a few seconds) instead of freezing.
+// KYTY_ASYNC_COMPUTE_THREADS=<n> (default 6) sets the number of compile threads.
+struct PipelineCache::AsyncCompute {
+	struct Job {
+		uint64_t                  id = 0;
+		std::unique_ptr<Pipeline> pipeline;
+		ComputePipelineJob        job;
+	};
+
+	std::mutex                                               mutex;
+	std::condition_variable                                  cv;
+	std::deque<Job>                                          queue;
+	std::unordered_set<uint64_t>                             pending;
+	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>>  done;
+	std::vector<std::thread>                                 threads;
+	bool                                                     stop = false;
+};
+
+static uint64_t AsyncComputeWords() {
+	static const uint64_t words = [] {
+		const char* v = std::getenv("KYTY_ASYNC_COMPUTE_WORDS");
+		return v != nullptr ? std::strtoull(v, nullptr, 10) : 0ull;
+	}();
+	return words;
+}
+
+void PipelineCache::StopAsyncCompute() {
+	if (m_async_compute == nullptr) {
+		return;
+	}
+	auto& async = *m_async_compute;
+	{
+		std::lock_guard lock(async.mutex);
+		async.stop = true;
+		async.queue.clear();
+	}
+	async.cv.notify_all();
+	for (auto& t: async.threads) {
+		t.join();
+	}
+	for (auto& [id, pipeline]: async.done) {
+		m_compute_pipelines.emplace(id, std::move(pipeline));
+	}
+	async.done.clear();
+	m_async_compute.reset();
+}
+
+PipelineCache::Pipeline*
+PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+                                     const ShaderProgram&          compute_program) {
+	EXIT_IF(!compute_program);
+	if (auto iter = m_compute_pipelines.find(compute_program.id);
+	    iter != m_compute_pipelines.end()) {
+		return iter->second.get();
+	}
+	const uint64_t threshold = AsyncComputeWords();
+	if (threshold == 0 || (compute_program.spirv_words <= threshold && m_async_compute == nullptr)) {
+		return &GetComputePipeline(input_info, compute_program);
+	}
+	if (m_async_compute != nullptr) {
+		auto&                       async = *m_async_compute;
+		std::unique_ptr<Pipeline>   ready;
+		bool                        is_pending = false;
+		{
+			std::lock_guard lock(async.mutex);
+			if (auto it = async.done.find(compute_program.id); it != async.done.end()) {
+				ready = std::move(it->second);
+				async.done.erase(it);
+			} else {
+				is_pending = async.pending.contains(compute_program.id);
+			}
+		}
+		if (ready != nullptr) {
+			auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(ready));
+			EXIT_IF(!inserted);
+			CheckpointDriverCache();
+			std::printf("Pipeline: async compute %016llx ready\n",
+			            static_cast<unsigned long long>(compute_program.id));
+			return iter->second.get();
+		}
+		if (is_pending) {
+			return nullptr;
+		}
+	}
+	if (compute_program.spirv_words <= threshold) {
+		return &GetComputePipeline(input_info, compute_program);
+	}
+
+	if (m_async_compute == nullptr) {
+		m_async_compute = std::make_unique<AsyncCompute>();
+		uint32_t count  = 6;
+		if (const char* v = std::getenv("KYTY_ASYNC_COMPUTE_THREADS"); v != nullptr) {
+			count = std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(v, nullptr, 10)), 1u, 32u);
+		}
+		auto* async = m_async_compute.get();
+		for (uint32_t i = 0; i < count; i++) {
+			async->threads.emplace_back([this, async] {
+				for (;;) {
+					AsyncCompute::Job job;
+					{
+						std::unique_lock lock(async->mutex);
+						async->cv.wait(lock, [async] { return async->stop || !async->queue.empty(); });
+						if (async->stop) {
+							return;
+						}
+						job = std::move(async->queue.front());
+						async->queue.pop_front();
+					}
+					const auto start = std::chrono::steady_clock::now();
+					CreateComputePipelineObject(m_graphics, *job.pipeline, job.job, m_driver_cache);
+					const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					                    std::chrono::steady_clock::now() - start)
+					                    .count();
+					std::printf("Pipeline: async compute %016llx compiled in %lld ms\n",
+					            static_cast<unsigned long long>(job.id), static_cast<long long>(ms));
+					std::lock_guard lock(async->mutex);
+					async->pending.erase(job.id);
+					async->done.emplace(job.id, std::move(job.pipeline));
+				}
+			});
+		}
+		std::printf("Pipeline: async compute enabled, %u threads, SPIR-V > %llu words\n", count,
+		            static_cast<unsigned long long>(threshold));
+	}
+
+	if (graphics_debug_dump_enabled()) {
+		ShaderDbgDumpInputInfo(input_info);
+	}
+	AsyncCompute::Job job;
+	job.id       = compute_program.id;
+	job.pipeline = std::make_unique<Pipeline>();
+	// Layout and descriptor set layout are cheap and read the program, so build them here.
+	CreateComputeLayoutInternal(m_graphics, *job.pipeline, input_info, compute_program.module,
+	                            compute_program.spirv_words, job.job);
+	std::printf("Pipeline: async compute %016llx queued (%llu words)\n",
+	            static_cast<unsigned long long>(job.id),
+	            static_cast<unsigned long long>(compute_program.spirv_words));
+	{
+		std::lock_guard lock(m_async_compute->mutex);
+		m_async_compute->pending.insert(job.id);
+		m_async_compute->queue.push_back(std::move(job));
+	}
+	m_async_compute->cv.notify_one();
+	return nullptr;
+}
 } // namespace Libs::Graphics
+

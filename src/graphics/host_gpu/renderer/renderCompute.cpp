@@ -347,8 +347,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto* pipeline_ptr =
+	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pipeline_ptr == nullptr) {
+		// Still compiling in the background (KYTY_ASYNC_COMPUTE_WORDS): skip this dispatch.
+		ResetBindings();
+		return;
+	}
+	auto& pipeline = *pipeline_ptr;
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
@@ -477,7 +483,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto* pipeline_ptr =
+	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pipeline_ptr == nullptr) {
+		ResetBindings();
+		return;
+	}
+	auto& pipeline = *pipeline_ptr;
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;

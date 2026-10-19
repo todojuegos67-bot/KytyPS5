@@ -581,24 +581,19 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
-                            uint64_t spirv_words) {
+void CreateComputeLayoutInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 const ShaderComputeInputInfo& input_info,
+                                 vk::ShaderModule compute_module, uint64_t spirv_words,
+                                 ComputePipelineJob& job) {
 	EXIT_IF(compute_module == nullptr);
-
-	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
-	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
-	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
-	comp_shader_stage_info.module = compute_module;
-	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
+	job                = {};
+	job.module         = compute_module;
+	job.spirv_words    = spirv_words;
 	const auto wave_size = input_info.stage.program->wave_size;
 	if (graphics.compute_subgroup_size_control_enabled &&
 	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
-		comp_subgroup_size.requiredSubgroupSize = wave_size;
-		comp_shader_stage_info.pNext            = &comp_subgroup_size;
+		job.required_subgroup_size = wave_size;
 	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
@@ -625,6 +620,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
+}
+
+// Thread-safe: touches only the device, the (internally synchronized) driver cache and `pipeline`.
+void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 const ComputePipelineJob& job, vk::PipelineCache driver_cache) {
+	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
+	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
+	comp_shader_stage_info.module = job.module;
+	comp_shader_stage_info.pName  = "main";
+	if (job.required_subgroup_size != 0) {
+		comp_subgroup_size.requiredSubgroupSize = job.required_subgroup_size;
+		comp_shader_stage_info.pNext            = &comp_subgroup_size;
+	}
 
 	vk::ComputePipelineCreateInfo info {};
 	// KYTY_FAST_COMPILE_WORDS=<n> (default 300000, 0 = off): compute shaders whose SPIR-V has more words
@@ -634,10 +643,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		const char* v = std::getenv("KYTY_FAST_COMPILE_WORDS");
 		return v != nullptr ? std::strtoull(v, nullptr, 10) : 300000ull;
 	}();
-	if (fast_compile_words != 0 && spirv_words > fast_compile_words) {
+	if (fast_compile_words != 0 && job.spirv_words > fast_compile_words) {
 		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 		std::printf("Pipeline: compute SPIR-V %llu words, driver optimization disabled (KYTY_FAST_COMPILE_WORDS)\n",
-		            static_cast<unsigned long long>(spirv_words));
+		            static_cast<unsigned long long>(job.spirv_words));
 	}
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
@@ -647,13 +656,22 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
-	                                                &pipeline.pipeline);
+	const auto result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
+	                                                           &pipeline.pipeline);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+}
+
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const ShaderComputeInputInfo& input_info,
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
+                            uint64_t spirv_words) {
+	ComputePipelineJob job;
+	CreateComputeLayoutInternal(graphics, pipeline, input_info, compute_module, spirv_words, job);
+	CreateComputePipelineObject(graphics, pipeline, job, driver_cache);
 }
 
 } // namespace Libs::Graphics

@@ -142,9 +142,14 @@ public:
 	                              const GraphicsPrograms& programs);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
+	// Like GetComputePipeline, but large shaders are compiled by background threads
+	// (KYTY_ASYNC_COMPUTE_WORDS); returns nullptr while that compile is still running.
+	Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+	                                const ShaderProgram&          compute_program);
 
 private:
 	struct ProgramCache;
+	struct AsyncCompute;
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
@@ -180,6 +185,9 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	std::unique_ptr<AsyncCompute>                            m_async_compute;
+
+	void StopAsyncCompute();
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
@@ -198,6 +206,18 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
                             uint64_t spirv_words = 0);
+
+struct ComputePipelineJob {
+	vk::ShaderModule module                 = nullptr;
+	uint32_t         required_subgroup_size = 0;
+	uint64_t         spirv_words            = 0;
+};
+void CreateComputeLayoutInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 const ShaderComputeInputInfo& input_info,
+                                 vk::ShaderModule compute_module, uint64_t spirv_words,
+                                 ComputePipelineJob& job);
+void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 const ComputePipelineJob& job, vk::PipelineCache driver_cache);
 
 } // namespace Libs::Graphics
 
