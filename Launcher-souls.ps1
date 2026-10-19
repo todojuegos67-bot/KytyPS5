@@ -129,7 +129,9 @@ function Start-Game {
 	# Modo GPU seguro: el trabajo de compute del juego sin solaparse (KYTY_COMPUTE_CHAIN=0), para graficas que se
 	# cuelgan o dan pantallazo azul (~37% menos FPS).
 	$sets = @()
-	if ($chkLowPc.Checked) { $sets += @('KYTY_SIMULATE_RAM_MB=16384', 'KYTY_VRAM_BUDGET_MB=6656'); $psargs += @('-Quality', 'low', '-TextureReduce', '1') }
+	# Modo TURBO (run-windows -Turbo): caches de video a 4.5 GB (unos 6 GB en total), texturas a la mitad, detalle bajo
+	# del juego y la RAM vaciada cada 15 s por encima de 5 GB: para PCs de 16 GB que se cerraban en zonas pesadas.
+	if ($chkLowPc.Checked) { $sets += 'KYTY_SIMULATE_RAM_MB=16384'; $psargs += @('-Turbo', '-Quality', 'low', '-TextureReduce', '1') }
 	if ($chkSafeGpu.Checked) { $sets += 'KYTY_COMPUTE_CHAIN=0' }
 	# Nitidez del reescalado (KYTY_UPSCALE_SHARPNESS): FSR con su propio RCAS, DLSS y XeSS con un paso de nitidez despues.
 	$sharp = $sharpLevels[[math]::Max(0, $cmbSharp.SelectedIndex)][1]
@@ -270,7 +272,7 @@ function New-Check([string]$text, $x, $y, $w, [string]$key) {
 }
 $chkHdr   = New-Check 'HDR' 350 100 90 'hdr'
 $chkVsync = New-Check 'VSync' 450 100 100 'vsync'
-$chkLowPc = New-Check 'Modo PC de pocos recursos' 670 14 230 'lowpc'
+$chkLowPc = New-Check 'Modo TURBO (16 GB)' 670 14 230 'lowpc'
 $chkUnlock = New-Check 'FPS desbloqueados' 910 14 180 'unlock'
 $chkSafeGpu = New-Check 'Modo GPU seguro' 1100 14 170 'safegpu'
 $tips = New-Object System.Windows.Forms.ToolTip
@@ -278,7 +280,7 @@ $tips.SetToolTip($chkHdr, 'HDR10: activa antes "Usar HDR" en la configuracion de
 $tips.SetToolTip($chkVsync, 'VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando')
 $panel.Controls.Add($chkHdr)
 $panel.Controls.Add($chkVsync)
-$tips.SetToolTip($chkLowPc, 'PCs con 16 GB de RAM o graficas de 8 GB o menos: RAM limitada (se devuelve a Windows cada 30 s), VRAM limitada por debajo de 8 GB, texturas a la mitad y sombras mas cortas.')
+$tips.SetToolTip($chkLowPc, 'PCs con 16 GB de RAM o menos o graficas de 8 GB o menos: unos 6 GB de VRAM como maximo, RAM devuelta a Windows cada 15 s, texturas a la mitad y sombras mas cortas. Para que no se cierre en zonas pesadas.')
 $panel.Controls.Add($chkLowPc)
 $tips.SetToolTip($chkUnlock, 'El juego pasa de 60 FPS reales, tambien con frame generation (videos, menus y cargas siguen a 60)')
 # (Oculta hasta arreglarla, 10-18: a 120 Hz el juego, entre 65 y 80 FPS, alterna frames de 1 y 2 vblanks
@@ -409,6 +411,10 @@ $btnPre.Add_Click({
 	$pre = Join-Path $root 'precompile-windows.ps1'
 	if (-not (Test-Path -LiteralPath $pre)) { [System.Windows.Forms.MessageBox]::Show('Falta precompile-windows.ps1', 'Launcher', 'OK', 'Error') | Out-Null; return }
 	$a = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$pre`"", '-Game', "`"$(Get-GamePath)`"")
+	# Suave: la mitad de la CPU a prioridad minima (PCs que se reiniciaban o se calentaban precompilando).
+	$suave = [System.Windows.Forms.MessageBox]::Show("Precompilar en modo SUAVE?`n`nSi: usa la mitad de la CPU, tarda mas y el PC no se calienta ni se reinicia.`nNo: a toda potencia (lo normal).", 'Precompilar shaders', 'YesNoCancel', 'Question')
+	if ($suave -eq 'Cancel') { return }
+	if ($suave -eq 'Yes') { $a += '-Gentle' }
 	Start-Process -FilePath 'powershell' -ArgumentList $a -WorkingDirectory $root | Out-Null
 })
 $panel.Controls.Add($btnPre)
