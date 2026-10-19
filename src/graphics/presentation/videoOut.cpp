@@ -596,19 +596,22 @@ void NoteCinematic(const char* name) noexcept {
 	const auto now  = std::chrono::steady_clock::now().time_since_epoch().count();
 	const auto last = g_cinematic_ns.exchange(now, std::memory_order_relaxed);
 	if (name != nullptr && now - last > std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(5)).count()) {
-		std::printf("Cinematic: %s (held as a movie: 60 fps, no frame generation)\n", name);
+		std::printf("Cinematic: %s (its frames flipped at 60)\n", name);
 		std::fflush(stdout);
 	}
 }
-bool MoviePlaying() noexcept {
-	// KYTY_CINEMATIC_HOLD_MS (default 2000): a cinematic file read that recently counts as a movie playing.
+// An in-engine cinematic's files read within KYTY_CINEMATIC_HOLD_MS (default 2000): its frames are flipped at 60 (the
+// unlocked mode sped them up). Frame generation stays on through them: the game's real frames are 60 there anyway, and
+// turning FSR 3's generation off right after it came on lost the device (10-20, the Boletaria intro).
+bool CinematicPlaying() noexcept {
 	static const int64_t hold = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds([] {
 		const char* value = std::getenv("KYTY_CINEMATIC_HOLD_MS");
 		return value != nullptr ? std::atoll(value) : 2000ll;
 	}())).count();
-	if (const auto cinematic = g_cinematic_ns.load(std::memory_order_relaxed);
-	    cinematic != 0 && std::chrono::steady_clock::now().time_since_epoch().count() - cinematic < hold)
-		return true;
+	const auto cinematic = g_cinematic_ns.load(std::memory_order_relaxed);
+	return cinematic != 0 && std::chrono::steady_clock::now().time_since_epoch().count() - cinematic < hold;
+}
+bool MoviePlaying() noexcept {
 	const auto last = g_movie_frame_ns.load(std::memory_order_relaxed);
 	if (last == 0) return false;
 	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1379,7 +1382,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		// (Also a movie playing, and with frame generation a frame without the game's camera: the PlayStation Studios
 		// logo at the start ran at 103-120 fps above 60 Hz, 10-18; the game draws something with its TAA behind it.)
 		NoteFrameForWorld(Graphics::Presenter::IsSceneFrame(*r.frame) && !MoviePlaying());
-		scene_free = !Graphics::Presenter::IsSceneFrame(*r.frame) || MoviePlaying() || !PlayerInputSeen() ||
+		scene_free = !Graphics::Presenter::IsSceneFrame(*r.frame) || MoviePlaying() || CinematicPlaying() || !PlayerInputSeen() ||
 		             (Graphics::Presenter::GeneratesFrames() && !Graphics::Presenter::IsGameView(*r.frame));
 		// Before the first world and during movies frame generation is off for certain: 60, not the mode's base rate
 		// (Smooth 120 held the intro to 40, 10-18). In the world the floors as they were (no new pacing there).
