@@ -151,7 +151,9 @@ function Start-Game {
 	if ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
 	# Sin frame generation, "FPS desbloqueados": vblank de 120 Hz (-Fps120, el modo probado de chenxiao07; a 240 los menus y el intro iban acelerados, 10-18), el juego pasa de 60 (a velocidad real:
 	# gameMinDeltaTime en run-windows); videos, menus y pantallas de carga siguen a 60.
-	elseif ($chkUnlock.Checked) { $psargs += '-Fps120' }
+	# (Desbloqueado sin frame generation: vblank virtual de 360 Hz y cada frame se muestra en cuanto esta listo
+	# (-FlipWhenReady), no al siguiente tick de 120 Hz: a ~80 FPS los frames alternaban 8 y 17 ms (tirones).)
+	elseif ($chkUnlock.Checked) { $psargs += @('-Vblank', '360', '-FlipWhenReady') }
 	$res    = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
 	if ($res[1] -eq 0) { $res = $resModes[0] }
 	# DLSS (reescalado) carga Streamline de NVIDIA; con la generacion de frames de AMD el emulador se cerraba al crear
