@@ -2418,6 +2418,22 @@ private:
 		return true;
 	}
 
+	// `call` with the whole address space busy: no map, unmap or protection change of the guest's views runs meanwhile
+	// (they wait for it, as for each other; the working set trim, LocalPlatform::SetTrimRunner).
+	void RunQuiet(void (*call)()) {
+		{
+			ExclusiveLock lock(m_mutex);
+			m_busy_done.wait(lock.Lock(), [&] { return m_busy.empty(); });
+			m_busy.emplace_back(0, uint64_t {1} << 47u);
+		}
+		call();
+		{
+			ExclusiveLock lock(m_mutex);
+			EraseBusyUnlocked(0, uint64_t {1} << 47u);
+		}
+		m_busy_done.notify_all();
+	}
+
 	// The ranges parked in views over [vaddr, vaddr + size) made free placeholders before a map or commit there: their
 	// views split for real (GuestBackingStore::Materialize), busy meanwhile (their mapped parts are mapped again).
 	void MaterializeParked(uint64_t vaddr, uint64_t size) {

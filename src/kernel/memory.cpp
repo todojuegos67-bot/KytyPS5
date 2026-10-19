@@ -1,4 +1,5 @@
 #include "kernel/memory.h"
+#include "local-platform.h"
 #include "live-census.h"
 #include "live-counters.h"
 #include "live-trace.h"
@@ -1644,6 +1645,10 @@ void Initialize() {
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
+	LocalPlatform::SetTrimRunner([](void (*call)()) {
+		if (g_guest_address_space != nullptr) g_guest_address_space->RunQuiet(call);
+		else call();
+	});
 	g_physical_memory     = std::make_unique<PhysicalMemory>();
 	g_flexible_memory     = std::make_unique<FlexibleMemory>();
 	g_pooled_memory       = std::make_unique<PooledMemory>();

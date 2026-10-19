@@ -101,6 +101,9 @@ uint64_t  PhysicalMemory();
 // standby list or the page file and come back on use), so the RAM in use is what the game touches in n seconds.
 // Started once; nothing where unset, 0 or on other systems.
 void      StartWorkingSetTrim();
+// How the trim runs its system call: set by the guest memory (kernel/memory.cpp) so that no mapping, unmapping or
+// protection change of the guest's views runs meanwhile (Windows' memory manager bug-checked, 0x1A, PCs that trim).
+void      SetTrimRunner(void (*runner)(void (*call)()));
 // The physical memory the system can still give without paging (free and standby; Linux: MemAvailable). 0: unknown.
 uint64_t AvailablePhysicalMemory();
 // Diagnostics: the process's address space in [begin, end) to stdout, labelled: each allocation of 16 MiB and more (its

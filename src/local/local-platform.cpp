@@ -1481,6 +1481,11 @@ MemoryUse ProcessMemory() {
 	return {counters.PrivateUsage, counters.WorkingSetSize};
 }
 
+static std::atomic<void (*)(void (*)())> g_trim_runner {nullptr};
+void SetTrimRunner(void (*runner)(void (*call)())) {
+	g_trim_runner.store(runner, std::memory_order_release);
+}
+
 void StartWorkingSetTrim() {
 	static std::once_flag once;
 	std::call_once(once, [] {
@@ -1497,7 +1502,11 @@ void StartWorkingSetTrim() {
 				std::this_thread::sleep_for(std::chrono::seconds(seconds));
 				const auto before = ProcessMemory().working_set;
 				if (before <= limit) continue;
-				K32EmptyWorkingSet(GetCurrentProcess());
+				// (With every guest map, unmap and protection change held off meanwhile: the guest memory's runner.)
+				if (auto* runner = g_trim_runner.load(std::memory_order_acquire); runner != nullptr)
+					runner([] { K32EmptyWorkingSet(GetCurrentProcess()); });
+				else
+					K32EmptyWorkingSet(GetCurrentProcess());
 				if (count < 8 || count % 16 == 0) {
 					std::printf("RAM trim: working set %llu -> %llu MiB\n", static_cast<unsigned long long>(before >> 20u),
 					            static_cast<unsigned long long>(ProcessMemory().working_set >> 20u));
@@ -1869,6 +1878,7 @@ MemoryUse ProcessMemory() {
 }
 
 void StartWorkingSetTrim() {}
+void SetTrimRunner(void (*)(void (*)())) {}
 
 uint64_t PhysicalMemory() {
 	if (const char* simulate = std::getenv("KYTY_SIMULATE_RAM_MB"); simulate != nullptr && *simulate != '\0')
