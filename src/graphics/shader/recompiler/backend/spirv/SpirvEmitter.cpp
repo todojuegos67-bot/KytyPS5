@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "common/assert.h"
@@ -465,7 +466,11 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
 	ValidateNativeProgram(program);
-	IR::ValidateProgram(program, true);
+	// KYTY_IR_VALIDATE=1: the IR consistency check (a debug aid; ~10% of the GPU thread while shaders compile).
+	static const bool ir_validate = [] { const char* v = std::getenv("KYTY_IR_VALIDATE"); return v != nullptr && *v == '1'; }();
+	if (ir_validate) {
+		IR::ValidateProgram(program, true);
+	}
 	EmitterState state(program, input_info);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =

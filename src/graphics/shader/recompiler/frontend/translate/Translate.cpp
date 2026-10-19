@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/shader.h"
@@ -1369,7 +1370,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index]);
 	}
-	IR::ValidateProgram(result, false);
+	// KYTY_IR_VALIDATE=1: the IR consistency check (a debug aid; ~10% of the GPU thread while shaders compile).
+	static const bool ir_validate = [] { const char* v = std::getenv("KYTY_IR_VALIDATE"); return v != nullptr && *v == '1'; }();
+	if (ir_validate) {
+		IR::ValidateProgram(result, false);
+	}
 	return result;
 }
 
