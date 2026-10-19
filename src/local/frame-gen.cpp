@@ -280,6 +280,7 @@ vk::Extent2D     g_options_render {};
 vk::Format       g_options_format = vk::Format::eUndefined; // SDR or HDR10 swapchain
 uint64_t         g_presents = 0;
 int              g_mode_set = -1; // the DLSS-G mode last set (1 on, 0 off)
+std::atomic<bool> g_discontinuity {false}; // a frame with inputs left unshown (NoteDroppedFrame): the next resets
 std::chrono::steady_clock::time_point g_stat_start {};
 uint32_t         g_stat_real = 0, g_stat_on = 0;
 double           g_stat_present_ms = 0, g_stat_present_max = 0;
@@ -1359,15 +1360,14 @@ void AfterPresent() {
 void SwapchainChanging() {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// Off before the swapchain is made again (DLSS-G guide: before a resize or a full screen change).
-	if (!g_ready || !g_mode_on) return;
+	if (!g_ready || g_mode_set != 1) return;
 	sl::DLSSGOptions options {};
 	options.mode                = sl::DLSSGMode::eOff;
 	options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
 	options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
 	if (const auto result = g_api.dlssg_set_options(sl::ViewportHandle {0}, options); result != sl::Result::eOk)
 		LOGF("frame generation: slDLSSGSetOptions (off) failed (%d)\n", static_cast<int>(result));
-	g_mode_on     = false;
-	g_run_with    = 0;
+	g_mode_set    = 0;
 	g_options_set = false; // (the next present sends its sizes again)
 #endif
 }
