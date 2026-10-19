@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <type_traits>
@@ -142,6 +143,14 @@ public:
 	                              const GraphicsPrograms& programs);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
+	// Like GetGraphicsPipeline, but large pipelines are compiled in the background
+	// (KYTY_ASYNC_COMPUTE_WORDS); returns nullptr while that compile is still running.
+	Pipeline* TryGetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
+	                                 const RenderDepthInfo&                 depth,
+	                                 std::span<const ShaderVertexInputInfo> vertex_info,
+	                                 CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
+	                                 vk::PrimitiveTopology topology, bool primitive_restart_enable,
+	                                 const GraphicsPrograms& programs);
 	// Like GetComputePipeline, but large shaders are compiled by background threads
 	// (KYTY_ASYNC_COMPUTE_WORDS); returns nullptr while that compile is still running.
 	Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
@@ -150,6 +159,7 @@ public:
 private:
 	struct ProgramCache;
 	struct AsyncCompute;
+	struct GraphicsJob;
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
@@ -188,6 +198,13 @@ private:
 	std::unique_ptr<AsyncCompute>                            m_async_compute;
 
 	void StopAsyncCompute();
+	void EnqueueAsync(std::function<void()> work, const std::function<void()>& mark_pending);
+	Pipeline* GraphicsPipelineImpl(std::span<const RenderColorInfo>       colors,
+	                               const RenderDepthInfo&                 depth,
+	                               std::span<const ShaderVertexInputInfo> vertex_info,
+	                               CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
+	                               vk::PrimitiveTopology topology, bool primitive_restart_enable,
+	                               const GraphicsPrograms& programs, bool allow_async);
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();

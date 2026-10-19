@@ -29,6 +29,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -240,7 +241,6 @@ struct PipelineCache::ProgramCache {
 		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
 		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
 		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {
-			permutations.reserve(8);
 		}
 
 		std::span<const uint32_t> FunctionCode() const {
@@ -280,7 +280,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
+		std::deque<Permutation>                     permutations; // stable addresses: async pipeline jobs keep program pointers
 	};
 
 	struct ProgramKeyHash {
@@ -819,11 +819,63 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
+// KYTY_ASYNC_COMPUTE_WORDS=<n> (default 0 = off): compute and graphics pipelines whose SPIR-V has
+// more words than that are created by background threads; their dispatches/draws are skipped until
+// the pipeline is ready, so the game keeps running (missing an effect for a few seconds) instead of
+// freezing. KYTY_ASYNC_COMPUTE_THREADS=<n> (default 6) sets the number of compile threads.
+struct PipelineCache::GraphicsJob {
+	GraphicsPipelineKey                key;
+	std::vector<ShaderVertexInputInfo> vertex_info;
+	bool                               ps_active = false;
+	ShaderPixelInputInfo               ps_input_info {};
+	GraphicsPrograms                   programs;
+	uint64_t                           words = 0;
+};
+
+struct PipelineCache::AsyncCompute {
+	std::mutex                                               mutex;
+	std::condition_variable                                  cv;
+	std::deque<std::function<void()>>                        queue;
+	std::unordered_set<uint64_t>                             pending;
+	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>>  done;
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> graphics_pending;
+	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
+	                                                         graphics_done;
+	std::vector<std::thread>                                 threads;
+	bool                                                     stop = false;
+};
+
+static uint64_t AsyncComputeWords() {
+	static const uint64_t words = [] {
+		const char* v = std::getenv("KYTY_ASYNC_COMPUTE_WORDS");
+		return v != nullptr ? std::strtoull(v, nullptr, 10) : 0ull;
+	}();
+	return words;
+}
+
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs) {
+	return *GraphicsPipelineImpl(colors, depth, vertex_info, command, ps_input_info, topology,
+	                             primitive_restart_enable, programs, false);
+}
+
+PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
+    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+    std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
+    const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+    bool primitive_restart_enable, const GraphicsPrograms& programs) {
+	return GraphicsPipelineImpl(colors, depth, vertex_info, command, ps_input_info, topology,
+	                            primitive_restart_enable, programs, true);
+}
+
+PipelineCache::Pipeline* PipelineCache::GraphicsPipelineImpl(
+    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+    std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
+    const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+    bool primitive_restart_enable, const GraphicsPrograms& programs, bool allow_async) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -992,7 +1044,82 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+		return iter->second.get();
+	}
+
+	uint64_t total_words = programs.pixel.spirv_words;
+	for (const auto& program: programs.vertex) {
+		total_words += program.spirv_words;
+	}
+	if (m_async_compute != nullptr) {
+		std::unique_ptr<Pipeline> ready;
+		bool                      is_pending = false;
+		{
+			std::lock_guard lock(m_async_compute->mutex);
+			if (auto it = m_async_compute->graphics_done.find(key);
+			    it != m_async_compute->graphics_done.end()) {
+				ready = std::move(it->second);
+				m_async_compute->graphics_done.erase(it);
+			} else {
+				is_pending = m_async_compute->graphics_pending.contains(key);
+			}
+		}
+		if (ready != nullptr) {
+			auto [iter, inserted] = m_graphics_pipelines.emplace(key, std::move(ready));
+			EXIT_IF(!inserted);
+			CheckpointDriverCache();
+			return iter->second.get();
+		}
+		if (is_pending) {
+			if (allow_async) {
+				return nullptr;
+			}
+			// A synchronous caller needs it now: wait for the background compile.
+			for (;;) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				std::lock_guard lock(m_async_compute->mutex);
+				if (auto it = m_async_compute->graphics_done.find(key);
+				    it != m_async_compute->graphics_done.end()) {
+					ready = std::move(it->second);
+					m_async_compute->graphics_done.erase(it);
+					break;
+				}
+			}
+			auto [iter, inserted] = m_graphics_pipelines.emplace(key, std::move(ready));
+			EXIT_IF(!inserted);
+			return iter->second.get();
+		}
+	}
+	if (allow_async && AsyncComputeWords() != 0 && total_words > AsyncComputeWords() &&
+	    !rect_list) {
+		auto job = std::make_shared<GraphicsJob>();
+		job->key          = key;
+		job->vertex_info.assign(vertex_info.begin(), vertex_info.end());
+		job->ps_active    = ps_active;
+		if (ps_active) {
+			job->ps_input_info = *ps_input_info;
+		}
+		job->programs = programs;
+		job->words    = total_words;
+		std::printf("Pipeline: async graphics VS=%016llx PS=%016llx queued (%llu words)\n",
+		            static_cast<unsigned long long>(vs_id), static_cast<unsigned long long>(ps_id),
+		            static_cast<unsigned long long>(total_words));
+		EnqueueAsync([this, job] {
+			auto       pipeline = std::make_unique<Pipeline>();
+			const auto start    = std::chrono::steady_clock::now();
+			CreatePipelineInternal(m_graphics, *pipeline, job->key.rendering, job->key.vertex_input,
+			                       job->vertex_info, job->ps_active ? &job->ps_input_info : nullptr,
+			                       job->programs, job->key.static_params, m_driver_cache);
+			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			                    std::chrono::steady_clock::now() - start)
+			                    .count();
+			std::printf("Pipeline: async graphics (%llu words) compiled in %lld ms\n",
+			            static_cast<unsigned long long>(job->words), static_cast<long long>(ms));
+			std::lock_guard lock(m_async_compute->mutex);
+			m_async_compute->graphics_pending.erase(job->key);
+			m_async_compute->graphics_done.emplace(job->key, std::move(pipeline));
+		}, [this, job] { m_async_compute->graphics_pending.insert(job->key); });
+		return nullptr;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1023,7 +1150,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_IF(!inserted);
 	CheckpointDriverCache();
 
-	return *iter->second;
+	return iter->second.get();
 }
 
 PipelineCache::Pipeline&
@@ -1061,34 +1188,6 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	return *iter->second;
 }
 
-// KYTY_ASYNC_COMPUTE_WORDS=<n> (default 0 = off): compute pipelines whose SPIR-V has more words than
-// that are created by background threads; their dispatches are skipped until the pipeline is ready,
-// so the game keeps running (with a missing effect for a few seconds) instead of freezing.
-// KYTY_ASYNC_COMPUTE_THREADS=<n> (default 6) sets the number of compile threads.
-struct PipelineCache::AsyncCompute {
-	struct Job {
-		uint64_t                  id = 0;
-		std::unique_ptr<Pipeline> pipeline;
-		ComputePipelineJob        job;
-	};
-
-	std::mutex                                               mutex;
-	std::condition_variable                                  cv;
-	std::deque<Job>                                          queue;
-	std::unordered_set<uint64_t>                             pending;
-	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>>  done;
-	std::vector<std::thread>                                 threads;
-	bool                                                     stop = false;
-};
-
-static uint64_t AsyncComputeWords() {
-	static const uint64_t words = [] {
-		const char* v = std::getenv("KYTY_ASYNC_COMPUTE_WORDS");
-		return v != nullptr ? std::strtoull(v, nullptr, 10) : 0ull;
-	}();
-	return words;
-}
-
 void PipelineCache::StopAsyncCompute() {
 	if (m_async_compute == nullptr) {
 		return;
@@ -1106,8 +1205,48 @@ void PipelineCache::StopAsyncCompute() {
 	for (auto& [id, pipeline]: async.done) {
 		m_compute_pipelines.emplace(id, std::move(pipeline));
 	}
+	for (auto& [key, pipeline]: async.graphics_done) {
+		m_graphics_pipelines.emplace(key, std::move(pipeline));
+	}
 	async.done.clear();
+	async.graphics_done.clear();
 	m_async_compute.reset();
+}
+
+void PipelineCache::EnqueueAsync(std::function<void()> work, const std::function<void()>& mark_pending) {
+	if (m_async_compute == nullptr) {
+		m_async_compute = std::make_unique<AsyncCompute>();
+		uint32_t count  = 6;
+		if (const char* v = std::getenv("KYTY_ASYNC_COMPUTE_THREADS"); v != nullptr) {
+			count = std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(v, nullptr, 10)), 1u, 32u);
+		}
+		auto* async = m_async_compute.get();
+		for (uint32_t i = 0; i < count; i++) {
+			async->threads.emplace_back([async] {
+				for (;;) {
+					std::function<void()> task;
+					{
+						std::unique_lock lock(async->mutex);
+						async->cv.wait(lock, [async] { return async->stop || !async->queue.empty(); });
+						if (async->stop) {
+							return;
+						}
+						task = std::move(async->queue.front());
+						async->queue.pop_front();
+					}
+					task();
+				}
+			});
+		}
+		std::printf("Pipeline: async compile enabled, %u threads, SPIR-V > %llu words\n", count,
+		            static_cast<unsigned long long>(AsyncComputeWords()));
+	}
+	{
+		std::lock_guard lock(m_async_compute->mutex);
+		mark_pending();
+		m_async_compute->queue.push_back(std::move(work));
+	}
+	m_async_compute->cv.notify_one();
 }
 
 PipelineCache::Pipeline*
@@ -1119,13 +1258,10 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 		return iter->second.get();
 	}
 	const uint64_t threshold = AsyncComputeWords();
-	if (threshold == 0 || (compute_program.spirv_words <= threshold && m_async_compute == nullptr)) {
-		return &GetComputePipeline(input_info, compute_program);
-	}
 	if (m_async_compute != nullptr) {
-		auto&                       async = *m_async_compute;
-		std::unique_ptr<Pipeline>   ready;
-		bool                        is_pending = false;
+		auto&                     async = *m_async_compute;
+		std::unique_ptr<Pipeline> ready;
+		bool                      is_pending = false;
 		{
 			std::lock_guard lock(async.mutex);
 			if (auto it = async.done.find(compute_program.id); it != async.done.end()) {
@@ -1139,73 +1275,40 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 			auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(ready));
 			EXIT_IF(!inserted);
 			CheckpointDriverCache();
-			std::printf("Pipeline: async compute %016llx ready\n",
-			            static_cast<unsigned long long>(compute_program.id));
 			return iter->second.get();
 		}
 		if (is_pending) {
 			return nullptr;
 		}
 	}
-	if (compute_program.spirv_words <= threshold) {
+	if (threshold == 0 || compute_program.spirv_words <= threshold) {
 		return &GetComputePipeline(input_info, compute_program);
-	}
-
-	if (m_async_compute == nullptr) {
-		m_async_compute = std::make_unique<AsyncCompute>();
-		uint32_t count  = 6;
-		if (const char* v = std::getenv("KYTY_ASYNC_COMPUTE_THREADS"); v != nullptr) {
-			count = std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(v, nullptr, 10)), 1u, 32u);
-		}
-		auto* async = m_async_compute.get();
-		for (uint32_t i = 0; i < count; i++) {
-			async->threads.emplace_back([this, async] {
-				for (;;) {
-					AsyncCompute::Job job;
-					{
-						std::unique_lock lock(async->mutex);
-						async->cv.wait(lock, [async] { return async->stop || !async->queue.empty(); });
-						if (async->stop) {
-							return;
-						}
-						job = std::move(async->queue.front());
-						async->queue.pop_front();
-					}
-					const auto start = std::chrono::steady_clock::now();
-					CreateComputePipelineObject(m_graphics, *job.pipeline, job.job, m_driver_cache);
-					const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-					                    std::chrono::steady_clock::now() - start)
-					                    .count();
-					std::printf("Pipeline: async compute %016llx compiled in %lld ms\n",
-					            static_cast<unsigned long long>(job.id), static_cast<long long>(ms));
-					std::lock_guard lock(async->mutex);
-					async->pending.erase(job.id);
-					async->done.emplace(job.id, std::move(job.pipeline));
-				}
-			});
-		}
-		std::printf("Pipeline: async compute enabled, %u threads, SPIR-V > %llu words\n", count,
-		            static_cast<unsigned long long>(threshold));
 	}
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(input_info);
 	}
-	AsyncCompute::Job job;
-	job.id       = compute_program.id;
-	job.pipeline = std::make_unique<Pipeline>();
+	auto pipeline = std::make_shared<std::unique_ptr<Pipeline>>(std::make_unique<Pipeline>());
+	auto job      = std::make_shared<ComputePipelineJob>();
 	// Layout and descriptor set layout are cheap and read the program, so build them here.
-	CreateComputeLayoutInternal(m_graphics, *job.pipeline, input_info, compute_program.module,
-	                            compute_program.spirv_words, job.job);
+	CreateComputeLayoutInternal(m_graphics, **pipeline, input_info, compute_program.module,
+	                            compute_program.spirv_words, *job);
+	const uint64_t id = compute_program.id;
 	std::printf("Pipeline: async compute %016llx queued (%llu words)\n",
-	            static_cast<unsigned long long>(job.id),
+	            static_cast<unsigned long long>(id),
 	            static_cast<unsigned long long>(compute_program.spirv_words));
-	{
+	EnqueueAsync([this, pipeline, job, id] {
+		const auto start = std::chrono::steady_clock::now();
+		CreateComputePipelineObject(m_graphics, **pipeline, *job, m_driver_cache);
+		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                    std::chrono::steady_clock::now() - start)
+		                    .count();
+		std::printf("Pipeline: async compute %016llx compiled in %lld ms\n",
+		            static_cast<unsigned long long>(id), static_cast<long long>(ms));
 		std::lock_guard lock(m_async_compute->mutex);
-		m_async_compute->pending.insert(job.id);
-		m_async_compute->queue.push_back(std::move(job));
-	}
-	m_async_compute->cv.notify_one();
+		m_async_compute->pending.erase(id);
+		m_async_compute->done.emplace(id, std::move(*pipeline));
+	}, [this, id] { m_async_compute->pending.insert(id); });
 	return nullptr;
 }
 } // namespace Libs::Graphics
