@@ -868,7 +868,20 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    image.indirect_root != ImageResource::NoIndirectImage ||
 			    std::ranges::any_of(program.info.sampled_pairs,
 			                        [&](const auto& pair) { return pair.image == i; })) {
-				return SpecializationFail("FMASK requires a direct image load");
+				// The host has no FMASK: bind a null image instead (reads return 0, i.e. every
+				// sample maps to fragment 0) rather than ending the emulator.
+				static bool logged = false;
+				if (!logged) {
+					logged = true;
+					std::printf("ResourceMaterialization: FMASK image %u used indirectly/sampled, bound as null\n", i);
+				}
+				snapshot.images[i].dwords = {};
+				image.fmask         = false;
+				image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
+				                                  : Prospero::TextureNumericClass::Float;
+				image.dimension     = Decoder::ImageDimension::Dim2D;
+				image.cube          = false;
+				continue;
 			}
 		}
 		image.conversion_format = ImageConversionFormat(format);
