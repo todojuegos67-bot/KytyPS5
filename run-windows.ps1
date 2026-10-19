@@ -373,7 +373,10 @@ if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -m
 if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
 # -Upscale fsr: the 3D image (at -RenderHeight) upscaled to 1440 by FSR 3.1 before the game's composite (frame-gen.h
 # UpscaleComposite), instead of the game's own scaling in that composite.
-if ($Upscale) { $environment['KYTY_UPSCALE'] = $Upscale }
+# One upscaler: -Upscale (the old path after the game's TAA) goes to the PS5 Pro path (-Upscaler) with the same upscaler.
+if ($Upscale -in 'dlss', 'xess', 'fsr' -and !$Upscaler) { $Upscaler = $Upscale }
+if ($environment['KYTY_UPSCALE'] -in 'dlss', 'xess', 'fsr' -and !$Upscaler) { $Upscaler = $environment['KYTY_UPSCALE'] }
+$environment.Remove('KYTY_UPSCALE')
 # -UpscaleHeight: the upscaled image's height (default 1440; 2160 for DLSS ultra performance); -DlssPreset K|L|M|J.
 if ($UpscaleHeight -gt 0) { $environment['KYTY_UPSCALE_HEIGHT'] = "$UpscaleHeight" }
 if ($DlssPreset) { $environment['KYTY_DLSS_PRESET'] = $DlssPreset }
