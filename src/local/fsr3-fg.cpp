@@ -799,7 +799,7 @@ bool SrPathWanted() {
 }
 
 bool SrReady() {
-	return SrPathWanted() && !g_up_failed && LoadApi() && g_get_device_proc != nullptr;
+	return SrPathWanted() && !g_up_failed && LoadApi();
 }
 
 bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {

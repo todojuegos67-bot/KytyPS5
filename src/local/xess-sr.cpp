@@ -175,7 +175,9 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 }
 
 bool Ready() {
-	return !g_failed && Load() && g_device != VK_NULL_HANDLE;
+	// (Asked when the game's eboot is patched, which may come before the device: libxess.dll loading is enough there;
+	// without the device Upscale fails and the PS5 Pro path's stretch shows.)
+	return !g_failed && Load();
 }
 
 bool Upscale(const UpscaleDesc& desc) {
