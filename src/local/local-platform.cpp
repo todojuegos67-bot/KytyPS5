@@ -1482,6 +1482,7 @@ MemoryUse ProcessMemory() {
 }
 
 static std::atomic<void (*)(void (*)())> g_trim_runner {nullptr};
+static SIZE_T g_ws_min = 0, g_ws_max = 0; // the working set sizes the process started with
 void SetTrimRunner(void (*runner)(void (*call)())) {
 	g_trim_runner.store(runner, std::memory_order_release);
 }
@@ -1496,17 +1497,42 @@ void StartWorkingSetTrim() {
 		// regardless re-faulted the 4-5 GB the game touches in a minute each time (10-10, 1-1 to the boss).
 		const char* limit_text = std::getenv("KYTY_TRIM_RAM_MB");
 		const auto  limit      = (limit_text != nullptr ? std::strtoull(limit_text, nullptr, 10) : 8192ull) << 20u;
+		{
+			DWORD flags = 0;
+			GetProcessWorkingSetSizeEx(GetCurrentProcess(), &g_ws_min, &g_ws_max, &flags);
+		}
 		std::thread([seconds, limit] {
 			SetThreadDescription(GetCurrentThread(), L"Kyty.TrimRam");
 			for (uint32_t count = 0;; ++count) {
 				std::this_thread::sleep_for(std::chrono::seconds(seconds));
 				const auto before = ProcessMemory().working_set;
 				if (before <= limit) continue;
-				// (With every guest map, unmap and protection change held off meanwhile: the guest memory's runner.)
-				if (auto* runner = g_trim_runner.load(std::memory_order_acquire); runner != nullptr)
-					runner([] { K32EmptyWorkingSet(GetCurrentProcess()); });
-				else
-					K32EmptyWorkingSet(GetCurrentProcess());
+				// In steps of 512 MiB down to half the limit (a hard working set maximum lowered each step, then soft
+				// again), each with every guest map, unmap and protection change held off (the guest memory's runner):
+				// emptying it at once stalled a frame 135-230 ms (10-19, Turbo 2.0).
+				const auto run = [](void (*call)()) {
+					if (auto* runner = g_trim_runner.load(std::memory_order_acquire); runner != nullptr) runner(call);
+					else call();
+				};
+				static std::atomic<uint64_t> g_step_target {0};
+				const uint64_t               floor = limit / 2;
+				for (uint64_t ws = before; ws > floor;) {
+					const uint64_t target = ws > floor + (512ull << 20u) ? ws - (512ull << 20u) : floor;
+					g_step_target.store(target, std::memory_order_relaxed);
+					run([] {
+						SetProcessWorkingSetSizeEx(GetCurrentProcess(), 1u << 20u,
+						                           static_cast<SIZE_T>(g_step_target.load(std::memory_order_relaxed)),
+						                           QUOTA_LIMITS_HARDWS_MAX_ENABLE | QUOTA_LIMITS_HARDWS_MIN_DISABLE);
+					});
+					std::this_thread::sleep_for(std::chrono::milliseconds(50));
+					const auto now = ProcessMemory().working_set;
+					if (now >= ws) break; // (no progress)
+					ws = now;
+				}
+				// (Soft again: the game grows back as it needs.)
+				// ((-1, -1) would empty it: the sizes the process started with.)
+				SetProcessWorkingSetSizeEx(GetCurrentProcess(), g_ws_min, g_ws_max,
+				                           QUOTA_LIMITS_HARDWS_MAX_DISABLE | QUOTA_LIMITS_HARDWS_MIN_DISABLE);
 				if (count < 8 || count % 16 == 0) {
 					std::printf("RAM trim: working set %llu -> %llu MiB\n", static_cast<unsigned long long>(before >> 20u),
 					            static_cast<unsigned long long>(ProcessMemory().working_set >> 20u));

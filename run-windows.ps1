@@ -373,6 +373,8 @@ if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -m
 # -RenderHeight: the height Demon's Souls' performance mode renders its 3D at (src/loader/demonsSoulsRenderSize.h);
 # the game upscales it to its 3840x2160 output as it does 1440 (a laptop's RTX 3080 at Boletaria 1-1: standing
 # 20.7 -> 24.5 fps at 1080, walking 18.7 -> 22.2).
+# -Turbo2: the 3D at 1080 at most (its render targets ~45% of 1440's video memory; with an upscaler it stayed under 6 GB).
+if ($Turbo2 -and ($RenderHeight -le 0 -or $RenderHeight -gt 1080)) { $RenderHeight = 1080 }
 if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
 # -Upscale fsr: the 3D image (at -RenderHeight) upscaled to 1440 by FSR 3.1 before the game's composite (frame-gen.h
 # UpscaleComposite), instead of the game's own scaling in that composite.
