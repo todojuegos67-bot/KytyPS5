@@ -1,0 +1,18 @@
+name: PS syntax check
+on:
+  push:
+    branches: [ merge-1019 ]
+jobs:
+  check:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - shell: powershell
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem -Filter *.ps1) {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs) | Out-Null
+            foreach ($e in $errs) { Write-Host "::error::$($f.Name):$($e.Extent.StartLineNumber): $($e.Message)"; $bad++ }
+          }
+          if ($bad) { exit 1 }
