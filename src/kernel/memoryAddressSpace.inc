@@ -2420,6 +2420,7 @@ private:
 
 	// `call` with the whole address space busy: no map, unmap or protection change of the guest's views runs meanwhile
 	// (they wait for it, as for each other; the working set trim, LocalPlatform::SetTrimRunner).
+public:
 	void RunQuiet(void (*call)()) {
 		{
 			ExclusiveLock lock(m_mutex);
@@ -2433,6 +2434,8 @@ private:
 		}
 		m_busy_done.notify_all();
 	}
+
+private:
 
 	// The ranges parked in views over [vaddr, vaddr + size) made free placeholders before a map or commit there: their
 	// views split for real (GuestBackingStore::Materialize), busy meanwhile (their mapped parts are mapped again).
