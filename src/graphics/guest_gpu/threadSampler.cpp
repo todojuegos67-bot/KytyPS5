@@ -47,6 +47,7 @@ struct Target {
 	std::unordered_map<std::string, uint64_t>    outside; // module name -> count
 	std::unordered_map<uint64_t, uint64_t>       callers; // CallerKey(first exe caller, module id) -> count
 	std::unordered_map<std::string, uint64_t>    chains;  // "module|exe+a<exe+b<..." (up to 4 exe frames) -> count
+	std::unordered_map<uint64_t, uint64_t>       guest;   // guest code (no module): 64-byte block of rip -> count
 };
 
 std::mutex          g_mutex; // NOLINT
@@ -270,6 +271,25 @@ void Print(Target& t) {
 				::printf("  %5.2f%%  exe+0x%" PRIx64 "  [%s]\n", pct, off, mod);
 			}
 		}
+		auto guest = Sorted(t.guest);
+		if (!guest.empty()) {
+			// Guest code by 64-byte block (absolute guest addresses): one hot block is a spin loop.
+			::printf("  guest code by 64-byte block:\n");
+			for (size_t i = 0; i < guest.size() && i < 30; i++) {
+				::printf("  %5.2f%%  guest 0x%" PRIx64 "\n", 100.0 * static_cast<double>(guest[i].second) / total,
+				         guest[i].first << 6u);
+			}
+			std::unordered_map<uint64_t, uint64_t> pages;
+			for (const auto& [block, n]: t.guest) {
+				pages[block >> 6u] += n;
+			}
+			auto sorted_pages = Sorted(pages);
+			::printf("  guest code by 4 KiB page:\n");
+			for (size_t i = 0; i < sorted_pages.size() && i < 20; i++) {
+				::printf("  %5.2f%%  guest 0x%" PRIx64 "\n",
+				         100.0 * static_cast<double>(sorted_pages[i].second) / total, sorted_pages[i].first << 12u);
+			}
+		}
 		auto chains = Sorted(t.chains);
 		::printf("  by call chain (sample frame < its callers):\n");
 		for (size_t i = 0; i < chains.size() && i < 30; i++) {
@@ -281,6 +301,7 @@ void Print(Target& t) {
 	t.outside.clear();
 	t.callers.clear();
 	t.chains.clear();
+	t.guest.clear();
 }
 
 void SamplerThread() {
@@ -332,6 +353,9 @@ void SamplerThread() {
 				} else {
 					const std::string& mod = ModuleName(rip);
 					t.outside[mod]++;
+					if (mod == "outside:<no module>") {
+						t.guest[rip >> 6u]++;
+					}
 					const std::string short_name = mod.compare(0, 8, "outside:") == 0 ? mod.substr(8) : mod;
 					auto              it         = g_module_ids.find(short_name);
 					if (it == g_module_ids.end()) {
