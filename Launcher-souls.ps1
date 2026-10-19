@@ -169,9 +169,7 @@ function Start-Game {
 	if ($res[3] -gt 0) { $psargs += @('-UpscaleHeight', "$($res[3])") }
 	$preset = $dlssPresets[[math]::Max(0, $cmbPreset.SelectedIndex)][1]
 	if ($res[2] -like '*dlss' -and $preset) { $psargs += @('-DlssPreset', $preset) }
-	# (-NoExit: si run-windows falla antes de arrancar el juego, su error queda a la vista en su ventana.)
-	$psargs = @('-NoExit') + $psargs
-	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Minimized | Out-Null
+	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Hidden | Out-Null
 	$form.WindowState = 'Minimized'
 }
 
@@ -289,7 +287,6 @@ $panel.Controls.Add($chkLowPc)
 $tips.SetToolTip($chkUnlock, 'El juego pasa de 60 FPS reales, tambien con frame generation (videos, menus y cargas siguen a 60)')
 # (Oculta hasta arreglarla, 10-18: a 120 Hz el juego, entre 65 y 80 FPS, alterna frames de 1 y 2 vblanks
 # (trompicones) y el logo de PlayStation del inicio va acelerado; a 240 el juego iba a camara lenta.)
-$chkUnlock.Checked = $false
 $tips.SetToolTip($chkSafeGpu, 'Para graficas que se cuelgan o dan pantallazo azul: mas estable, ~37% menos FPS')
 $panel.Controls.Add($chkSafeGpu)
 
