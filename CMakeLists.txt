@@ -844,3 +844,5 @@ endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
 endif()
+
+add_kyty_full_emulator_test(yotei_repro "${KYTY_TESTS_DIR}/YoteiRepro.cpp")
