@@ -447,8 +447,6 @@ if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_
 # -FlipWhenReady: frames shown as soon as they are ready (a VRR display follows them smoothly) instead of at the
 # next 60 Hz tick (16.7 / 33.3 ms steps when the game runs under 60).
 if ($FlipWhenReady) { $environment['KYTY_FLIP_WHEN_READY'] = '1' }
-# The world gate's loading screen (videoOut.cpp): the fog's load measured 2983 ms (10-19); the menus' are shorter.
-if (!$environment.Contains('KYTY_WORLD_LOADING_MS')) { $environment['KYTY_WORLD_LOADING_MS'] = '2500' }
 # -Fsr3FrameGen: AMD FSR 3 frame generation x2 (src/local/fsr3-fg.cpp; amd_fidelityfx_vk.dll next to the emulator), on
 # only while the game renders its 3D scene (its TAA pass); movies, menus and loading screens are shown as they are.
 if ($Fsr3FrameGen) { $environment['KYTY_FSR3_FG'] = '1' }

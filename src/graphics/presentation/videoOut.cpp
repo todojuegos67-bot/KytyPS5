@@ -538,6 +538,13 @@ void NoteMovieFrame() noexcept {
 static std::atomic<bool>    g_player_input {false};
 static std::atomic<int64_t> g_input_ns {0};
 static std::atomic<bool>    g_world_ready {false};
+static std::atomic<bool>    g_world_file {false};
+void NoteWorldFile(const char* name) noexcept {
+	if (g_player_input.load(std::memory_order_relaxed) && !g_world_file.exchange(true, std::memory_order_relaxed)) {
+		std::printf("World: the game loads a world (%s)\n", name);
+		std::fflush(stdout);
+	}
+}
 void NotePlayerInput() noexcept {
 	if (!g_player_input.exchange(true, std::memory_order_relaxed)) {
 		g_input_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
@@ -571,10 +578,13 @@ static void NoteFrameForWorld(bool scene) {
 	}
 	nonscene_since = 0;
 	const bool timeout = now - g_input_ns.load(std::memory_order_relaxed) >= ns(seconds(90));
-	if (loading_seen || timeout) {
+	// The world: its files read (levels/...) after the first button, then the 3D view (the loading screens of 1.9-4 s
+	// measured, menus too: their length tells nothing); else 90 s of the 3D view.
+	const bool world_file = g_world_file.load(std::memory_order_relaxed);
+	if (world_file || timeout) {
 		g_world_ready.store(true, std::memory_order_relaxed);
 		std::printf("World: the first world loaded (%s): frame generation and frames above 60 allowed from here\n",
-		            loading_seen ? "after a loading screen" : "90 s after the first button");
+		            world_file ? "its files read" : loading_seen ? "after a loading screen" : "90 s after the first button");
 		std::fflush(stdout);
 	}
 }

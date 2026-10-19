@@ -20,6 +20,8 @@ namespace Libs::VideoOut {
 void NoteMovieFrame() noexcept;
 // A read of one of the game's cinematic files (`name` on its open, logged): MoviePlaying() while they are read.
 void NoteCinematic(const char* name) noexcept;
+// The game opened one of a world's files (levels/...): the next 3D view after it is the world (the world gate).
+void NoteWorldFile(const char* name) noexcept;
 // A movie frame was decoded within the last half second.
 bool MoviePlaying() noexcept;
 // The first button the player pressed (controller.cpp): until then (the PlayStation Studios logo, the intro and the
