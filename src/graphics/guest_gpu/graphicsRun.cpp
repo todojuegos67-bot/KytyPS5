@@ -38,6 +38,14 @@
 #include <semaphore>
 #include <thread>
 #include <vector>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef min
+#undef max
+#endif
 
 namespace Libs::Graphics {
 
@@ -255,6 +263,26 @@ void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) 
 	// memory the GPU wrote to; the write itself goes back to the GPU thread.
 	m_renderer.GetCommandScheduler().DeferPriorityOperation([this, address, value, size,
 	                                                         sequence] {
+		// KYTY_LABEL_DIRECT=1 (live): the label written here, as the GPU completes, when its page is plainly writable
+		// (no tracking protection to fault on): the guest's wait ends without the hop through the GPU thread's queue
+		// (Wolverine's title screen: ~2000 label waits a second, each one hop). The GPU thread still clears its entry.
+		static auto& direct = Common::LiveSwitches::Get("KYTY_LABEL_DIRECT", 0);
+#if defined(_WIN32)
+		if (direct.load(std::memory_order_relaxed) != 0) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == sizeof(info) &&
+			    info.State == MEM_COMMIT && (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0 &&
+			    (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0 &&
+			    address + size <= reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize) {
+				if (size == 8) {
+					reinterpret_cast<std::atomic<uint64_t>*>(address)->store(value, std::memory_order_release);
+				} else {
+					reinterpret_cast<std::atomic<uint32_t>*>(address)->store(static_cast<uint32_t>(value),
+					                                                       std::memory_order_release);
+				}
+			}
+		}
+#endif
 		(void)TrySendCommand([this, address, value, size, sequence] {
 			std::memcpy(reinterpret_cast<void*>(address), &value, size);
 			const auto pending = m_pending_labels.find(address);
