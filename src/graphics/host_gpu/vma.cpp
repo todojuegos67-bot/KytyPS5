@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cstdio>
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #if defined(__clang__)
@@ -154,12 +156,29 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
+	auto              result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	if (result != vk::Result::eSuccess) {
+		// Video memory is full (Ghost of Yotei streams past 16 GB): place the image in any memory
+		// type the driver accepts, usually system RAM. Slower to sample, but the game goes on.
+		LogMemoryBudget();
+		alloc_info.requiredFlags  = 0;
+		alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		native_image              = VK_NULL_HANDLE;
+		image.allocation          = nullptr;
+		result = static_cast<vk::Result>(vmaCreateImage(
+		    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &alloc_info,
+		    &native_image, &image.allocation, nullptr));
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("VMA: video memory full, image %ux%u placed outside VRAM: %s\n",
+			            image_info.extent.width, image_info.extent.height,
+			            result == vk::Result::eSuccess ? "ok" : "failed");
+		}
+	}
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
-		LogMemoryBudget();
 		return false;
 	}
 
