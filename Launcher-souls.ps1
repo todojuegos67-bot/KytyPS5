@@ -163,7 +163,10 @@ function Start-Game {
 		[System.Windows.Forms.MessageBox]::Show('El reescalado DLSS va con "Sin frame generation" o con DLSS frame generation. Con la generacion de AMD usa FSR o XeSS para reescalar.', 'Launcher', 'OK', 'Warning') | Out-Null
 		return
 	}
-	if ($res[1] -ne 1440) { $psargs += @('-RenderHeight', "$($res[1])") }
+	# DLSS, XeSS and FSR go through the game's PS5 Pro path, whose output is 4K (2160): each mode's height scaled from
+	# the 1440 output it was listed for (Calidad 960 -> 1440, Rendimiento 720 -> 1080, DLAA 1440 -> 2160).
+	$height = if ($res[2] -in 'dlss', 'xess', 'fsr') { [int][math]::Round($res[1] * 1.5) } else { $res[1] }
+	if ($height -ne 1440 -or $res[2] -in 'dlss', 'xess', 'fsr') { $psargs += @('-RenderHeight', "$height") }
 	# "sin TAA": el TAA del juego no se ejecuta; DLSS (DLAA) en su lugar, o (taa-up-*) el reescalador elegido toma la
 	# imagen sin filtrar y hace el antialiasing el solo (encima del TAA salia como una acuarela, con estelas).
 	if ($res[2] -like 'taa-up-*') { $psargs += @('-Upscale', $res[2].Substring(7), '-TaaReplace', 'upscaler') }
