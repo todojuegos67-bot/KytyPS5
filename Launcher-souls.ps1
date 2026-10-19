@@ -133,7 +133,8 @@ function Start-Game {
 	$sets = @()
 	# Modo TURBO (run-windows -Turbo): caches de video a 4.5 GB (unos 6 GB en total), texturas a la mitad, detalle bajo
 	# del juego y la RAM vaciada cada 15 s por encima de 5 GB: para PCs de 16 GB que se cerraban en zonas pesadas.
-	if ($chkLowPc.Checked) { $sets += 'KYTY_SIMULATE_RAM_MB=16384'; $psargs += @('-Turbo', '-Quality', 'low', '-TextureReduce', '1') }
+	if ($chkTurbo2.Checked) { $psargs += @('-Turbo2', '-Quality', 'lowest', '-TextureReduce', '2') }
+	elseif ($chkLowPc.Checked) { $sets += 'KYTY_SIMULATE_RAM_MB=16384'; $psargs += @('-Turbo', '-Quality', 'low', '-TextureReduce', '1') }
 	if ($chkSafeGpu.Checked) { $sets += 'KYTY_COMPUTE_CHAIN=0' }
 	# Nitidez del reescalado (KYTY_UPSCALE_SHARPNESS): FSR con su propio RCAS, DLSS y XeSS con un paso de nitidez despues.
 	$sharp = $sharpLevels[[math]::Max(0, $cmbSharp.SelectedIndex)][1]
@@ -278,6 +279,7 @@ $chkHdr   = New-Check 'HDR' 350 100 90 'hdr'
 $chkVsync = New-Check 'VSync' 450 100 100 'vsync'
 $chkLowPc = New-Check 'Modo TURBO (16 GB)' 670 14 230 'lowpc'
 $chkUnlock = New-Check 'FPS desbloqueados' 910 14 180 'unlock'
+$chkTurbo2 = New-Check 'TURBO 2.0 (8-12 GB)' 910 14 180 'turbo2'
 $chkSafeGpu = New-Check 'Modo GPU seguro' 1100 14 170 'safegpu'
 $tips = New-Object System.Windows.Forms.ToolTip
 $tips.SetToolTip($chkHdr, 'HDR10: activa antes "Usar HDR" en la configuracion de pantalla de Windows')
@@ -286,6 +288,8 @@ $panel.Controls.Add($chkHdr)
 $panel.Controls.Add($chkVsync)
 $tips.SetToolTip($chkLowPc, 'PCs con 16 GB de RAM o menos o graficas de 8 GB o menos: unos 6 GB de VRAM como maximo, RAM devuelta a Windows cada 15 s, texturas a la mitad y sombras mas cortas. Para que no se cierre en zonas pesadas.')
 $panel.Controls.Add($chkLowPc)
+$tips.SetToolTip($chkTurbo2, 'PCs de 8 a 12 GB de RAM o graficas de 4 a 6 GB: unos 3.5 GB de VRAM, RAM devuelta a Windows cada 5 s, texturas a un cuarto y detalle minimo. Se ve peor, pero no se cierra.')
+$panel.Controls.Add($chkTurbo2)
 $tips.SetToolTip($chkUnlock, 'El juego pasa de 60 FPS reales, tambien con frame generation (videos, menus y cargas siguen a 60)')
 # (Oculta otra vez, 10-19: a 120 Hz tirones (frames de 8 y 17 ms alternos a ~80 FPS); a 360 Hz con flip al estar listo,
 # fluido pero una cinematica del motor iba acelerada: el juego ata algunas cosas a los frames.)
