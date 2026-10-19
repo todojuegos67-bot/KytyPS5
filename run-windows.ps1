@@ -465,20 +465,20 @@ if (!$NoAsyncShaders -and !$Baseline -and !$environment.Contains('KYTY_ASYNC_DRA
 # meanwhile: no 0x1A), smaller shader and draw stores.
 if ($Turbo2) {
 	$turboSet = [ordered]@{ KYTY_VRAM_BUDGET_MB = '2560'; KYTY_GC_BUDGET_CAP_MB = '2560'; KYTY_SMALL_VRAM = '1'
-		KYTY_TEXTURE_REDUCE = '2'; KYTY_TRIM_RAM_SECONDS = '15'; KYTY_TRIM_RAM_MB = '3072'; KYTY_IMAGE_POOL = '0'
+		KYTY_TEXTURE_REDUCE = '2'; KYTY_TRIM_RAM_SECONDS = '0'; KYTY_IMAGE_POOL = '0'
 		KYTY_NATIVE_XPR_STORE_BUDGET = '64'; KYTY_TABLE_STORE_BUDGET = '4'; KYTY_SIMULATE_RAM_MB = '8192' }
 	foreach ($key in $turboSet.Keys) { $environment[$key] = $turboSet[$key] }
 	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars['lowest']) | Where-Object { $_ }) -join ';'
-	Write-Host 'memory:   turbo 2.0 (8-12 GB PCs, 4-6 GB GPUs): video memory caches 2.5 GB, textures a quarter, RAM trimmed every 15 s'
+	Write-Host 'memory:   turbo 2.0 (8-12 GB PCs, 4-6 GB GPUs): video memory caches 2.5 GB, textures a quarter, no RAM trim'
 }
 elseif ($Turbo) {
 	$turboSet = [ordered]@{ KYTY_VRAM_BUDGET_MB = '4608'; KYTY_GC_BUDGET_CAP_MB = '4608'; KYTY_SMALL_VRAM = '1'
-		KYTY_TEXTURE_REDUCE = '1'; KYTY_TRIM_RAM_SECONDS = '15'; KYTY_TRIM_RAM_MB = '5120'; KYTY_IMAGE_POOL = '0' }
+		KYTY_TEXTURE_REDUCE = '1'; KYTY_TRIM_RAM_SECONDS = '0'; KYTY_IMAGE_POOL = '0' }
 	foreach ($key in $turboSet.Keys) { $environment[$key] = $turboSet[$key] }
 	if (!$Quality) {
 		$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars['low']) | Where-Object { $_ }) -join ';'
 	}
-	Write-Host 'memory:   turbo (16 GB PCs): video memory caches 4.5 GB, textures reduced, RAM trimmed every 15 s'
+	Write-Host 'memory:   turbo (16 GB PCs): video memory caches 4.5 GB, textures reduced, no RAM trim'
 }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
 # -Upscaler dlss: src/loader/demonsSoulsSuperResolution.h.
@@ -666,7 +666,11 @@ if ([double]"$($environment['KYTY_SIMULATE_RAM_MB'])" -gt 0) { $ram = [double]$e
 # Under 24 GB of RAM (or simulated so): the working set past 8 GB emptied every 30 s (KYTY_TRIM_RAM_SECONDS), so the RAM
 # in use is what the game touches meanwhile (after a trim it grew back to about 3.5 GB in a minute of play, 10-09) and
 # Windows keeps room for itself; the configs leave it off (0) for bigger PCs. -Set KYTY_TRIM_RAM_SECONDS=... wins.
-if ($ram -lt 24GB -and "$($environment['KYTY_TRIM_RAM_SECONDS'])" -in @('', '0') -and !($Set -match 'KYTY_TRIM_RAM_SECONDS=')) {
+# OFF since 10-20: emptying the working set, even with every guest map, unmap and protection change held off meanwhile,
+# bug-checked Windows (0x1A, 0x41202) three times in an evening of Turbo play (the pages it leaves in transition meet the
+# trackers' protection changes after it). RAM is saved by the turbos' smaller caches instead; -Set KYTY_TRIM_RAM_SECONDS=n
+# still turns it on, for tests.
+if ($false) {
 	$environment['KYTY_TRIM_RAM_SECONDS'] = '30'
 	if (!$environment['KYTY_TRIM_RAM_MB']) { $environment['KYTY_TRIM_RAM_MB'] = '8192' }
 	Write-Host 'memory:   under 24 GB of RAM: the working set past 8 GB is emptied every 30 s'
