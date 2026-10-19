@@ -458,9 +458,9 @@ if (!$NoAsyncShaders -and !$Baseline -and !$environment.Contains('KYTY_ASYNC_DRA
 # (textures yield to render targets; no pipeline warmup), the working set past 5 GB emptied every 15 s, and the
 # game's low detail. Players with 16 GB crashed in heavy zones (Boletaria, the Nexus) even with the safe options.
 if ($Turbo) {
-	$turbo = [ordered]@{ KYTY_VRAM_BUDGET_MB = '4608'; KYTY_GC_BUDGET_CAP_MB = '4608'; KYTY_SMALL_VRAM = '1'
+	$turboSet = [ordered]@{ KYTY_VRAM_BUDGET_MB = '4608'; KYTY_GC_BUDGET_CAP_MB = '4608'; KYTY_SMALL_VRAM = '1'
 		KYTY_TEXTURE_REDUCE = '1'; KYTY_TRIM_RAM_SECONDS = '15'; KYTY_TRIM_RAM_MB = '5120'; KYTY_IMAGE_POOL = '0' }
-	foreach ($key in $turbo.Keys) { $environment[$key] = $turbo[$key] }
+	foreach ($key in $turboSet.Keys) { $environment[$key] = $turboSet[$key] }
 	if (!$Quality) {
 		$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars['low']) | Where-Object { $_ }) -join ';'
 	}
