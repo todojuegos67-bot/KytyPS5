@@ -287,7 +287,9 @@ $panel.Controls.Add($chkVsync)
 $tips.SetToolTip($chkLowPc, 'PCs con 16 GB de RAM o menos o graficas de 8 GB o menos: unos 6 GB de VRAM como maximo, RAM devuelta a Windows cada 15 s, texturas a la mitad y sombras mas cortas. Para que no se cierre en zonas pesadas.')
 $panel.Controls.Add($chkLowPc)
 $tips.SetToolTip($chkUnlock, 'El juego pasa de 60 FPS reales, tambien con frame generation (videos, menus y cargas siguen a 60)')
-$panel.Controls.Add($chkUnlock)
+# (Oculta otra vez, 10-19: a 120 Hz tirones (frames de 8 y 17 ms alternos a ~80 FPS); a 360 Hz con flip al estar listo,
+# fluido pero una cinematica del motor iba acelerada: el juego ata algunas cosas a los frames.)
+$chkUnlock.Checked = $false
 $tips.SetToolTip($chkSafeGpu, 'Para graficas que se cuelgan o dan pantallazo azul: mas estable, ~37% menos FPS')
 $panel.Controls.Add($chkSafeGpu)
 
