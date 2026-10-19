@@ -374,6 +374,34 @@ static bool DumpBuffersWanted(uint64_t hash) {
 	return count.load(std::memory_order_relaxed) > 0;
 }
 
+// Diagnostic: KYTY_BUFFER_USERS_ADDR=<hex guest address> (startup): while KYTY_BUFFER_USERS_COUNT (live, default
+// 0) is above 0, every compute dispatch that binds a buffer covering that address is logged (frame, shader hash,
+// slot, read/write, bound range), one line per binding, counting down. Finds who fills a buffer (Wolverine: the
+// light list at 0x11a59e8000 that CS 021204e9e4fe4393 sorts).
+static void LogBufferUsers(const ShaderRecompiler::IR::CompiledShaderInfo& program, const PreparedBindings& bindings) {
+	static const uint64_t address = [] {
+		const char* v = std::getenv("KYTY_BUFFER_USERS_ADDR");
+		return v != nullptr ? std::strtoull(v, nullptr, 16) : 0ull;
+	}();
+	if (address == 0) return;
+	static auto& count = Common::LiveSwitches::Get("KYTY_BUFFER_USERS_COUNT", 0);
+	if (count.load(std::memory_order_relaxed) <= 0) return;
+	const auto& layout = program.bindings;
+	if (layout.descriptors.empty()) return;
+	for (uint32_t slot = 0; slot < layout.memory_offset_count && slot < bindings.buffer_sources.size(); ++slot) {
+		const auto& source = bindings.buffer_sources[slot];
+		if (source.size == 0 || address < source.address || address >= source.address + source.size) continue;
+		const auto resource = layout.descriptors.front().resources[slot];
+		const bool written  = resource < program.info.buffers.size() && program.info.buffers[resource].written;
+		::printf("Buffer user: frame %llu cs %016llx slot %u %s 0x%010llx+0x%llx\n",
+		         static_cast<unsigned long long>(DrawDiff::Frame()),
+		         static_cast<unsigned long long>(program.shader_hash), slot, written ? "WRITE" : "read",
+		         static_cast<unsigned long long>(source.address), static_cast<unsigned long long>(source.size));
+		count.fetch_sub(1, std::memory_order_relaxed);
+	}
+	std::fflush(stdout);
+}
+
 void RenderExecutor::DumpBuffers(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                  const PreparedBindings& bindings, const CommandRecorder& vk_buffer,
                                  const char* when) {
@@ -679,6 +707,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			vk_buffer.shaderTimeBegin(program.shader_hash, true);
 		}
 		DrawDiff::Note(program.shader_hash, 0, thread_group_x * thread_group_y * thread_group_z, 0, 2);
+		LogBufferUsers(program, bindings);
 		const bool dump_buffers = DumpBuffersWanted(program.shader_hash);
 		if (dump_buffers) DumpBuffers(program, bindings, vk_buffer, "before");
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
@@ -794,6 +823,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			vk_buffer.shaderTimeBegin(program.shader_hash, true);
 		}
 		DrawDiff::Note(program.shader_hash, 0, 0, 0, 3);
+		LogBufferUsers(program, bindings);
 		const bool dump_buffers = DumpBuffersWanted(program.shader_hash);
 		if (dump_buffers) DumpBuffers(program, bindings, vk_buffer, "before");
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
