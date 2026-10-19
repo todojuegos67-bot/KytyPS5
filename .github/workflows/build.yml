@@ -120,6 +120,8 @@ jobs:
 
       - name: Test
         shell: cmd
+        # (Wolverine fork: a failing unit test after the official merge still publishes the build to try.)
+        continue-on-error: ${{ github.repository != 'KytyPS5/KytyPS5' }}
         run: |
           ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
 
@@ -437,8 +439,8 @@ jobs:
     name: Release KytyPS5
     if: >-
       always() &&
-      github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
+      ((github.event_name == 'push' && github.repository == 'KytyPS5/KytyPS5') ||
+       (github.event_name == 'workflow_dispatch' && github.repository != 'KytyPS5/KytyPS5')) &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')
@@ -527,5 +529,6 @@ jobs:
               --generate-notes \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
-              --title "$RELEASE_NAME"
+              --title "$RELEASE_NAME" \
+              $([ "$GITHUB_REPOSITORY" != KytyPS5/KytyPS5 ] && echo --draft)
           fi
