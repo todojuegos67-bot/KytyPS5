@@ -1027,6 +1027,25 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
 		return true;
 	}
+	if (op == IR::ValueOpcode::ImageAtomicFMin32 || op == IR::ValueOpcode::ImageAtomicFMax32) {
+		// IMAGE_ATOMIC_FMIN/FMAX (Ghost of Yotei): a compare-exchange loop on the texel, as the buffer ones.
+		const auto dimension = image.dimension;
+		const bool max_value = op == IR::ValueOpcode::ImageAtomicFMax32;
+		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
+			           const auto pointer = state.builder.AllocateId();
+			           const auto pointer_type =
+			               state.builder.Type(OpTypePointer, {StorageClassImage, TypeU32(state)});
+			           state.builder.AddFunction(
+			               {OpImageTexelPointer, pointer_type, pointer,
+			                StorageImageDescriptorPointer(state, mem.resource),
+			                CoordU32(ctx, mem, *address, dimension), ConstantU32(state, 0)});
+			           const auto value = ctx.Arg(inst, 2);
+			           return AtomicUpdate(state, pointer, IR::ResourceKind::Image, [&](uint32_t old) {
+				           return EmitFloatAtomicReplacement(state, old, value, max_value);
+			           });
+		           }));
+		return true;
+	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);
 	if (atomic_opcode != 0u) {
 		const auto dimension = image.dimension;
