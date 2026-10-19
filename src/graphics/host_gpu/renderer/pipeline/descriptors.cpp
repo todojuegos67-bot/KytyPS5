@@ -1,5 +1,8 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -46,6 +49,25 @@
 #endif
 
 namespace Libs::Graphics {
+
+// KYTY_ALLOW_SCALAR_WRITE_OVERLAP=1: a bound writable buffer that only covers a specialization (descriptor)
+// read keeps running with a one-time warning instead of stopping. Ghost of Yotei's ray tracing binds a
+// large writable range over its descriptor tables; the stop killed the game at boot with RT saved on.
+static bool ScalarWriteOverlapAllowed() {
+	static const bool allowed = [] {
+		const char* v = std::getenv("KYTY_ALLOW_SCALAR_WRITE_OVERLAP");
+		return v != nullptr && *v == '1';
+	}();
+	if (allowed) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			std::printf("Warning: scalar resource reads overlap a shader buffer write (allowed by KYTY_ALLOW_SCALAR_WRITE_OVERLAP)\n");
+			std::fflush(stdout);
+		}
+	}
+	return allowed;
+}
 
 namespace {
 
@@ -757,7 +779,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
 							} else if (address - read_address < read_size) {
-								EXIT("scalar resource reads overlap a shader buffer write\n");
+								if (!ScalarWriteOverlapAllowed()) EXIT("scalar resource reads overlap a shader buffer write\n");
 							}
 						}
 					}
@@ -952,7 +974,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+						if (!ScalarWriteOverlapAllowed()) EXIT("scalar resource reads overlap a shader buffer write\n");
 					}
 				}
 			}
