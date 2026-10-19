@@ -167,6 +167,8 @@ function Start-Game {
 	if ($res[3] -gt 0) { $psargs += @('-UpscaleHeight', "$($res[3])") }
 	$preset = $dlssPresets[[math]::Max(0, $cmbPreset.SelectedIndex)][1]
 	if ($res[2] -like '*dlss' -and $preset) { $psargs += @('-DlssPreset', $preset) }
+	# (-NoExit: si run-windows falla antes de arrancar el juego, su error queda a la vista en su ventana.)
+	$psargs = @('-NoExit') + $psargs
 	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Minimized | Out-Null
 	$form.WindowState = 'Minimized'
 }
