@@ -18,6 +18,8 @@ namespace Libs::VideoOut {
 
 // A movie frame was decoded (VideoDec2, AvPlayer): flips keep 60 per second meanwhile.
 void NoteMovieFrame() noexcept;
+// A read of one of the game's cinematic files (`name` on its open, logged): MoviePlaying() while they are read.
+void NoteCinematic(const char* name) noexcept;
 // A movie frame was decoded within the last half second.
 bool MoviePlaying() noexcept;
 // The first button the player pressed (controller.cpp): until then (the PlayStation Studios logo, the intro and the

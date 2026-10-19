@@ -581,7 +581,24 @@ static void NoteFrameForWorld(bool scene) {
 bool PlayerInputSeen() noexcept {
 	return g_world_ready.load(std::memory_order_relaxed);
 }
+static std::atomic<int64_t> g_cinematic_ns {0};
+void NoteCinematic(const char* name) noexcept {
+	const auto now  = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto last = g_cinematic_ns.exchange(now, std::memory_order_relaxed);
+	if (name != nullptr && now - last > std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(5)).count()) {
+		std::printf("Cinematic: %s (held as a movie: 60 fps, no frame generation)\n", name);
+		std::fflush(stdout);
+	}
+}
 bool MoviePlaying() noexcept {
+	// KYTY_CINEMATIC_HOLD_MS (default 2000): a cinematic file read that recently counts as a movie playing.
+	static const int64_t hold = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds([] {
+		const char* value = std::getenv("KYTY_CINEMATIC_HOLD_MS");
+		return value != nullptr ? std::atoll(value) : 2000ll;
+	}())).count();
+	if (const auto cinematic = g_cinematic_ns.load(std::memory_order_relaxed);
+	    cinematic != 0 && std::chrono::steady_clock::now().time_since_epoch().count() - cinematic < hold)
+		return true;
 	const auto last = g_movie_frame_ns.load(std::memory_order_relaxed);
 	if (last == 0) return false;
 	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();

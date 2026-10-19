@@ -16,6 +16,7 @@
 #include "libs/network.h"
 #include "loader/demonsSoulsWarp.h"
 #include "loader/gameArgs.h"
+#include "graphics/presentation/videoOut.h"
 
 #include <algorithm>
 #include <atomic>
@@ -81,6 +82,7 @@ struct File {
 	Common::Mutex                       mutex;
 	std::vector<uint8_t>                dirents;
 	uint64_t                            dents_offset;
+	bool                                cinematic = false; // under the game's cinematics folder (VideoOut::NoteCinematic)
 };
 
 class FileDescriptors {
@@ -509,6 +511,10 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	file->real_name = g_mount_points->ResolvePath(file->name);
+	// The game's in-engine cinematics (Demon's Souls: cinematics/scnNNNNNN_<name>/...): presented as a movie while
+	// their files are read (VideoOut::NoteCinematic).
+	file->cinematic = file->name.find("/cinematics/") != std::string::npos;
+	if (file->cinematic) Libs::VideoOut::NoteCinematic(file->name.c_str());
 
 	if (Common::IsArchivePath(file->real_name) && (rw_mode != Common::File::Mode::Read || trunc || creat)) {
 		g_files->DeleteDescriptor(descriptor);
@@ -721,6 +727,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		return KERNEL_ERROR_EIO;
 	}
 
+	if (file->cinematic) Libs::VideoOut::NoteCinematic(nullptr);
 	LogKernelRead("read", file->real_name, nbytes, -1, bytes_read);
 	LOGF("\tRead %u bytes from: %s\n", bytes_read, Common::PathToString(file->real_name).c_str());
 
@@ -844,6 +851,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return KERNEL_ERROR_EIO;
 	}
 
+	if (file->cinematic) Libs::VideoOut::NoteCinematic(nullptr);
 	LogKernelRead("pread", file->real_name, nbytes, offset, bytes_read);
 	LOGF("\tRead %u bytes (pos = %" PRId64 ") from: %s\n", bytes_read, offset,
 	     Common::PathToString(file->real_name).c_str());
