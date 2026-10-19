@@ -259,8 +259,11 @@ struct PipelineCache::ProgramCache {
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization));
+			materialize_failed = !ShaderRecompiler::IR::MaterializeResources(
+			    resource_plan, runtime, resources, specialization);
+			if (materialize_failed) {
+				return nullptr;
+			}
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
 				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -280,7 +283,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::deque<Permutation>                     permutations; // stable addresses: async pipeline jobs keep program pointers
+		std::deque<Permutation>                     permutations;
+		bool                                        materialize_failed = false; // stable addresses: async pipeline jobs keep program pointers
 	};
 
 	struct ProgramKeyHash {
@@ -335,6 +339,19 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	// A shader whose resources the emulator cannot specialize used to end the emulator; now the
+	// draw/dispatch that uses it is skipped (the effect is missing) and the game keeps going.
+	template <typename InputInfo>
+	static ShaderProgram SkipUnsupported(uint64_t hash, InputInfo& input_info) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+			std::printf("Shader %016llx: unsupported resources, skipping its draws/dispatches\n",
+			            static_cast<unsigned long long>(hash));
+		}
+		input_info.stage = {};
+		return {};
+	}
+
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
@@ -378,6 +395,9 @@ struct PipelineCache::ProgramCache {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
+			}
+			if (cached.materialize_failed) {
+				return SkipUnsupported(params.hash, input_info);
 			}
 		}
 
@@ -443,15 +463,20 @@ struct PipelineCache::ProgramCache {
 			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(
+			        entry->second.resource_plan, runtime, entry->second.resources,
+			        entry->second.specialization)) {
+				return SkipUnsupported(params.hash, input_info);
+			}
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
+			}
+			if (entry->second.materialize_failed) {
+				return SkipUnsupported(params.hash, input_info);
 			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
@@ -798,8 +823,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
+	bool unsupported = pixel_active && !result.pixel;
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		unsupported      = unsupported || !result.vertex[i];
+	}
+	if (unsupported) {
+		return {}; // The caller skips the draw.
 	}
 	return result;
 }
