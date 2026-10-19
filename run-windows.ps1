@@ -459,15 +459,15 @@ if (!$NoAsyncShaders -and !$Baseline -and !$environment.Contains('KYTY_ASYNC_DRA
 # (textures yield to render targets; no pipeline warmup), the working set past 5 GB emptied every 15 s, and the
 # game's low detail. Players with 16 GB crashed in heavy zones (Boletaria, the Nexus) even with the safe options.
 # -Turbo2: PCs with 8-12 GB of RAM and graphics cards of 4-6 GB: the caches' video memory at 2.5 GB, textures a quarter
-# of their size, the game's lowest detail, the working set past 2 GB emptied every 5 s (with the guest memory quiet
+# of their size, the game's lowest detail, the working set past 3 GB emptied every 15 s (each empty stalls ~140 ms) (with the guest memory quiet
 # meanwhile: no 0x1A), smaller shader and draw stores.
 if ($Turbo2) {
 	$turboSet = [ordered]@{ KYTY_VRAM_BUDGET_MB = '2560'; KYTY_GC_BUDGET_CAP_MB = '2560'; KYTY_SMALL_VRAM = '1'
-		KYTY_TEXTURE_REDUCE = '2'; KYTY_TRIM_RAM_SECONDS = '5'; KYTY_TRIM_RAM_MB = '2048'; KYTY_IMAGE_POOL = '0'
+		KYTY_TEXTURE_REDUCE = '2'; KYTY_TRIM_RAM_SECONDS = '15'; KYTY_TRIM_RAM_MB = '3072'; KYTY_IMAGE_POOL = '0'
 		KYTY_NATIVE_XPR_STORE_BUDGET = '64'; KYTY_TABLE_STORE_BUDGET = '4'; KYTY_SIMULATE_RAM_MB = '8192' }
 	foreach ($key in $turboSet.Keys) { $environment[$key] = $turboSet[$key] }
 	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars['lowest']) | Where-Object { $_ }) -join ';'
-	Write-Host 'memory:   turbo 2.0 (8-12 GB PCs, 4-6 GB GPUs): video memory caches 2.5 GB, textures a quarter, RAM trimmed every 5 s'
+	Write-Host 'memory:   turbo 2.0 (8-12 GB PCs, 4-6 GB GPUs): video memory caches 2.5 GB, textures a quarter, RAM trimmed every 15 s'
 }
 elseif ($Turbo) {
 	$turboSet = [ordered]@{ KYTY_VRAM_BUDGET_MB = '4608'; KYTY_GC_BUDGET_CAP_MB = '4608'; KYTY_SMALL_VRAM = '1'
