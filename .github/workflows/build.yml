@@ -169,7 +169,7 @@ jobs:
       # Intel XeSS SDK (super resolution, src/local/xess-sr.cpp; the upscale branch): its headers and libxess.dll
       # (Intel's redistributable binary) from Intel's public repository, never committed.
       - name: XeSS SDK
-        if: ${{ github.ref_name == 'upscale' }}
+        if: ${{ github.ref_name == 'upscale' || github.ref_name == 'merge-1019' }}
         shell: pwsh
         env:
           XESS_VERSION: v3.0.2
