@@ -71,5 +71,10 @@ constexpr uint32_t TranslatorFeatures = TranslatorFeatureCooperativeHalves | Tra
 // table slots' loads.
 void                   SetTranslatorFeatures(uint32_t features);
 [[nodiscard]] uint32_t TranslatorFeatureSet();
+// Those this GPU's translation may use (default: all) and those it uses whatever the store was made with (`required`,
+// default: none), set with the device before anything is translated: TranslatorFeatureSet() holds no others (but those
+// KYTY_LANE_LOCAL_COOP=1 / KYTY_TABLE_SLOTS_AT_USE=1 force), and a static store made without the others is up to date.
+void                   SetTranslatorDeviceFeatures(uint32_t features, uint32_t required = 0);
+[[nodiscard]] uint32_t TranslatorDeviceFeatures();
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

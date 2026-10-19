@@ -98,6 +98,8 @@ bool                  CommandBufferDumpEnabled();
 std::filesystem::path GetCommandBufferDumpFolder();
 
 bool GraphicsDebugDumpEnabled();
+bool SyncValidationEnabled();
+bool VulkanObjectNamesEnabled();
 
 OutputDirection       GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();

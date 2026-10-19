@@ -784,6 +784,57 @@ static vk::PipelineCache BlobCache(GraphicContext& graphics, const std::vector<u
 	return graphics.device.createPipelineCache(&create, nullptr, &cache) == vk::Result::eSuccess ? cache : nullptr;
 }
 
+// KYTY_PIPELINE_STATS=1 (a survey): each pipeline made once more with the driver's statistics
+// (VK_KHR_pipeline_executable_properties), a "PIPESTATS kind hash hash executable: name=value; ..." line per executable,
+// and destroyed. A pipeline's local memory (its spills) is per thread: the driver keeps one pool for the largest of
+// them times the threads the GPU runs, video memory it never gives back (8 GB cards: ~1 GB more with 1-1 dragon fire's
+// table forms before 966c891d; destroying 13,000 idle pipelines freed none).
+template <typename Info, typename Create>
+static void LogPipelineStatistics(GraphicContext& graphics, Info info, Create create, const char* kind, uint64_t a,
+                                  uint64_t b) {
+	if (!graphics.pipeline_statistics_enabled) return;
+	InlineStages inlined;
+	inlined.Apply(info);
+	info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+	vk::Pipeline made = nullptr;
+	if (create(info, made) != vk::Result::eSuccess || made == nullptr) return;
+	vk::PipelineInfoKHR pipeline_info {};
+	pipeline_info.pipeline = made;
+	uint32_t executables   = 0;
+	(void)graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &executables, nullptr);
+	std::vector<vk::PipelineExecutablePropertiesKHR> properties(executables);
+	(void)graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &executables, properties.data());
+	for (uint32_t e = 0; e < executables; e++) {
+		vk::PipelineExecutableInfoKHR executable {};
+		executable.pipeline        = made;
+		executable.executableIndex = e;
+		uint32_t count             = 0;
+		(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &count, nullptr);
+		std::vector<vk::PipelineExecutableStatisticKHR> statistics(count);
+		(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &count, statistics.data());
+		std::string line = fmt::format("PIPESTATS {} {:016x} {:016x} {}:", kind, a, b, properties[e].name.data());
+		for (const auto& statistic: statistics) {
+			switch (statistic.format) {
+				case vk::PipelineExecutableStatisticFormatKHR::eBool32:
+					line += fmt::format(" {}={};", statistic.name.data(), statistic.value.b32);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eInt64:
+					line += fmt::format(" {}={};", statistic.name.data(), statistic.value.i64);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eUint64:
+					line += fmt::format(" {}={};", statistic.name.data(), statistic.value.u64);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eFloat64:
+					line += fmt::format(" {}={:.1f};", statistic.name.data(), statistic.value.f64);
+					break;
+			}
+		}
+		std::printf("%s\n", line.c_str());
+	}
+	std::fflush(stdout);
+	graphics.device.destroyPipeline(made, nullptr);
+}
+
 // The static precompile's pipeline when it holds this one (no compilation), else built as `build` says. `identity`
 // (GraphicsPipelineIdentity, ComputePipelineIdentity; 0: none) finds it among pipeline cache blobs.
 template <typename Info, typename Create>
@@ -1311,6 +1362,13 @@ void CreatePipelineInternal(
 	}
 	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&
 	                     (result != vk::Result::eSuccess || pipeline.pipeline == nullptr));
+	LogPipelineStatistics(
+	    graphics, pipeline_info,
+	    [&](const vk::GraphicsPipelineCreateInfo& create, vk::Pipeline& made) {
+		    return graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &made);
+	    },
+	    vs_input_info.stage.program->table_mode ? "gfx-table" : native_bindings ? "gfx-native" : "gfx-normal",
+	    vs_input_info.stage.program->shader_hash, ps_active ? ps_input_info->stage.program->shader_hash : 0);
 	if (DeviceFault::BreadcrumbsOn()) {
 		DeviceFault::NotePipeline(pipeline.pipeline,
 		                          fmt::format("{} vs {:016x} ps {:016x}",
@@ -1408,6 +1466,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&
 	                     (result != vk::Result::eSuccess || pipeline.pipeline == nullptr));
+	LogPipelineStatistics(
+	    graphics, info,
+	    [&](const vk::ComputePipelineCreateInfo& create, vk::Pipeline& made) {
+		    return graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &made);
+	    },
+	    native_bindings ? "cs-table" : "cs-normal", input_info.stage.program->shader_hash, 0);
 	if (DeviceFault::BreadcrumbsOn()) {
 		DeviceFault::NotePipeline(pipeline.pipeline, fmt::format("{} cs {:016x}", native_bindings ? "cs-table" : "cs-normal",
 		                                                         input_info.stage.program->shader_hash));

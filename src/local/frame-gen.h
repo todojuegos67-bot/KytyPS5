@@ -14,7 +14,9 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <span>
+#include <string>
 
 namespace Libs::Graphics {
 struct RenderState;
@@ -46,6 +48,15 @@ struct Camera {
 	bool                  valid = false;
 };
 
+// KYTY_FG_HUDLESS (frame-gen-hudless.h): a frame's game image without its HUD, its pixels as the frame image's
+// (`image`), and that laid out as the backbuffer (`display`, the present's: DLSS-G's HUD-less color).
+struct HudlessImages {
+	std::unique_ptr<VulkanImage> image;
+	VulkanImage                  display;
+	vk::ImageView                display_view = nullptr;
+	bool                         has_image = false, has_display = false;
+};
+
 // One presented frame's inputs, owned by the presenter's frame.
 struct FrameInputs {
 	VulkanImage   depth, motion;
@@ -67,8 +78,8 @@ struct FrameInputs {
 	bool          valid       = false;
 };
 
-// Process start, before the window: loads Streamline when KYTY_FRAMEGEN is set (it then becomes
-// SDL's Vulkan loader, and so the proxy of instance, device and swapchain calls).
+// Process start, before the window: loads Streamline when KYTY_FRAMEGEN or KYTY_UPSCALER=dlss is set (it then
+// becomes SDL's Vulkan loader, and so the proxy of instance, device and swapchain calls).
 void Initialize();
 // After Initialize: Streamline is loaded (device creation then adds what it relies on but does
 // not add itself, VK_KHR_present_id for its VK_NV_low_latency2).
@@ -88,6 +99,13 @@ void NoteGpuWaitMs(double ms);
 void NoteFlipPresentMs(double ms);
 void NoteSubmitMs(double ms);        // present thread: record + submit of the copy into the swapchain
 void NoteBeforePresentMs(double ms); // BeforePresent (Streamline tags and options)
+// Before the device is created: why Streamline says DLSS-G cannot run with this GPU, driver and Windows (e.g.
+// hardware-accelerated GPU scheduling turned off), logged; empty when it can, or when frame generation is off. A refused
+// device's error repeats it.
+[[nodiscard]] std::string SupportProblem(vk::PhysicalDevice physical_device);
+// A refused device's advice when this process runs without bottom-up ASLR (issue #45: forcing it on for the emulator in
+// Windows' Exploit protection let the driver make the device); empty otherwise.
+[[nodiscard]] std::string RefusedDeviceAdvice();
 // After the device exists: checks that DLSS-G is available on it.
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device);
 // Right after the dispatcher is loaded for the device (before the recording layer copies it):
@@ -104,6 +122,10 @@ void BypassCommandHooks(vk::Device device);
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2D region,
                    vk::Format format, uint32_t image_count);
 void AfterPresent();
+// Present thread: the swapchain is made again (DLSS-G off until frames with inputs turn it on again).
+void SwapchainChanging();
+// Any thread: a frame with inputs was left unshown (the presenter kept a newer one): the next one resets DLSS-G's history.
+void NoteDroppedFrame();
 // Present thread: the frames DLSS-G showed per presented frame (1 without generation), as last
 // queried (about once a second), for the KYTY_FPS_HUD panel.
 [[nodiscard]] uint32_t PresentedFrames();
@@ -125,11 +147,16 @@ void NoteScene();
 // The current guest frame has no camera yet: its next G-buffer draw goes the normal way (the table way's draws have
 // no constants on the CPU), whose hook reads it.
 [[nodiscard]] bool WantsCamera();
+// The current guest frame has DLSS-G's inputs so far (the camera, the TAA pass's or the upscale's depth and motion),
+// which its flip takes (PrepareInputs).
+[[nodiscard]] bool InputsGathered();
 void OnDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt);
 // KYTY_SHADER_CENSUS=1 (frame-gen.cpp): a program the game ran (stage v, p or c).
 void NoteShader(uint64_t hash, char stage);
 void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId motion,
                 uint64_t motion_address);
+// The game's super resolution dispatch in place of its TAA (renderSuperResolution.cpp): the same depth and motion.
+void OnUpscale(ImageId depth, uint64_t depth_address, ImageId motion, uint64_t motion_address);
 // At the guest flip, in the frame's command buffer: copy the gathered images into `inputs`.
 // `flip` (`flip_id`): the image this flip shows (the HUD-less image is taken from the next ones like it).
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
@@ -173,6 +200,37 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
 // Present thread, in the present's command buffer: the HUD-less image scaled to the backbuffer (DLSS-G).
 void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,
                   vk::Format format);
+
+// Frame generation's own images (not the texture cache's; frame-gen-hudless.cpp's too), on the thread that records
+// them: `image` (re)made as a sampled copy target like `source`, with its view (with `attachment`, a color attachment
+// too where the format allows it, *attachment tells); a barrier from `image`'s state to `layout`, `access` at `stage`.
+void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view, const VulkanImage& source,
+               bool* attachment = nullptr);
+void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFlags aspect, vk::ImageLayout layout,
+                vk::AccessFlags2 access, vk::PipelineStageFlags2 stage);
+
+// DLSS super resolution (KYTY_UPSCALER=dlss) in place of Sony's PS5 Pro upscaler the game dispatches
+// (graphics/guest_gpu/superResolution.h, renderer/renderSuperResolution.cpp).
+struct UpscaleImage {
+	vk::Image           image  = nullptr;
+	vk::ImageView       view   = nullptr;
+	vk::ImageLayout     layout = vk::ImageLayout::eUndefined; // as the command buffer leaves it for the upscaler
+	vk::Format          format = vk::Format::eUndefined;
+	vk::Extent2D        extent {};
+	vk::ImageUsageFlags usage {};
+};
+struct UpscaleInputs {
+	UpscaleImage color, depth, motion, output; // color, depth and motion at the render size
+	float        jitter_x = 0.0f, jitter_y = 0.0f;       // the projection's offset, in render pixels
+	float        motion_scale_x = 0.0f, motion_scale_y = 0.0f; // motion vector * scale = render pixels to the previous
+	bool         reset = false;                           // no history (a cut, a level load)
+	std::array<float, 16> view_to_clip {};                // row vectors (p' = p * M)
+	float        near_plane = 0.1f, far_plane = 3000.0f;
+};
+// Streamline offers DLSS super resolution on this device.
+[[nodiscard]] bool UpscalerReady();
+// Records DLSS into `command` (outside a render pass; the images in their `layout`s): false when it could not.
+[[nodiscard]] bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

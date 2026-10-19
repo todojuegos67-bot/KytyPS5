@@ -390,8 +390,15 @@ struct Presenter::Impl {
 	void RecoverSwapchain(Swapchain::Status status) {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
+		// (DLSS-G off while the swapchain is made again; the next frame with its inputs turns it on.)
+		if (FrameGen::Enabled()) FrameGen::SwapchainChanging();
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
+#if defined(_WIN32)
+		// The display's refresh again (PresentDue): a window moved to another display, its mode or full screen changed (a
+		// TV between 60 and 120 Hz).
+		min_present_interval = std::chrono::nanoseconds {-1};
+#endif
 	}
 
 	Image& ResolveSurface(const ImageInfo& info, ImageId* out_id = nullptr) {
@@ -550,15 +557,19 @@ struct Presenter::Impl {
 		// The graph: the last 300 frames (5 seconds at 60 fps).
 		PerfOverlay::RecentFrames(300, &hud.perf.frame_ms, level >= 2 ? &hud.perf.busy_ms : nullptr);
 		const double seconds = std::chrono::duration<double>(now - hud_window).count();
-		if (seconds >= 1.0) {
+		// (Switched on with F8: the panel at once, from the last second's flips, then refreshed each second. It had
+		// waited a second empty, which looked like a level without a panel, the user 10-19.)
+		const bool first = hud.title.empty();
+		if (seconds >= 1.0 || first) {
 			// The emulator's own frame rate (the game's flips) is the number; with frame generation, the frames DLSS-G
 			// presents (those it got, each with its generated ones) are, and the game's rate is below it.
-			const double   game     = PerfOverlay::Summarize(seconds).fps;
+			const double   game     = PerfOverlay::Summarize(std::max(seconds, 1.0)).fps;
 			const uint32_t presents = FrameGen::Enabled() ? FrameGen::PresentedFrames() : 1u;
 			std::array<char, 32>  title {};
 			std::array<char, 128> detail {};
 			if (presents > 1) {
-				std::snprintf(title.data(), title.size(), "%.0f FPS", hud_frames / seconds * presents);
+				std::snprintf(title.data(), title.size(), "%.0f FPS",
+				              (seconds >= 1.0 ? hud_frames / seconds : game) * presents);
 				std::snprintf(detail.data(), detail.size(), "DLSS Frame Generation %ux  |  game %.0f fps", presents, game);
 			} else {
 				std::snprintf(title.data(), title.size(), "%.0f FPS", game);
@@ -620,6 +631,8 @@ struct Presenter::Impl {
 			dropped = std::exchange(waiting, next);
 		}
 		waiting_changed.notify_one();
+		// (A game frame DLSS-G had inputs for never shown: the next one's motion spans two frames.)
+		if (dropped.frame != nullptr && !dropped.reuse && dropped.frame->fg.valid) FrameGen::NoteDroppedFrame();
 		// (A last frame shown again stays the last one.)
 		if (dropped.frame != nullptr) frames.Release(dropped.frame, dropped.reuse);
 	}
@@ -986,16 +999,19 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 		const char* value = std::getenv("KYTY_PRESENT_ASPECT");
 		return value != nullptr && std::string_view(value) == "fit";
 	}();
-	// KYTY_RENDER_ASPECT: the game's 3D was rendered wider and squeezed into its 16:9 output; a frame showing it is
-	// shown at that aspect, the others (movies, menus, loading screens) at their own 16:9, both fitted to the window
-	// (within 2% of the window's aspect: filling it).
+	// KYTY_RENDER_ASPECT: the game's 3D was rendered wider and squeezed into its 16:9 output; every frame is shown at that
+	// aspect, fitted to the window (within 2% of the window's aspect: filling it): the 3D as it was rendered, the others
+	// (movies, menus, loading screens) stretched from their 16:9 (the user, 10-19: the opening movie filling the screen).
+	// With the wide output (DemonsSoulsRenderSize::WideOutputWidth) the game's frames are as wide as the 3D; one without
+	// it (movies, menus, loading screens) holds its 16:9 picture at the left: that part is shown, stretched.
 	int          dst_x = 0, dst_y = 0;
 	int          dst_w = static_cast<int>(m_extent.width), dst_h = static_cast<int>(m_extent.height);
-	const double frame_aspect = source.extent.height != 0
-	                                ? static_cast<double>(source.extent.width) / source.extent.height
-	                                : 0.0;
+	uint32_t     src_w = source.extent.width;
+	if (!scene && Loader::DemonsSoulsRenderSize::WideOutputWidth() != 0 && source.extent.height != 0)
+		src_w = std::min(src_w, (source.extent.height * 16u + 8u) / 9u);
+	const double frame_aspect = source.extent.height != 0 ? static_cast<double>(src_w) / source.extent.height : 0.0;
 	const double wide         = Loader::DemonsSoulsRenderSize::WideAspect();
-	double       aspect       = wide > 0.0 ? (scene ? wide : frame_aspect) : aspect_fit ? frame_aspect : 0.0;
+	double       aspect       = wide > 0.0 ? wide : aspect_fit ? frame_aspect : 0.0;
 	if (const double window = static_cast<double>(m_extent.width) / std::max(1u, m_extent.height);
 	    wide > 0.0 && std::fabs(aspect / window - 1.0) < 0.02) {
 		aspect = 0.0;
@@ -1026,7 +1042,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	region.srcSubresource.mipLevel       = 0;
 	region.srcSubresource.baseArrayLayer = 0;
 	region.srcSubresource.layerCount     = 1;
-	region.srcOffsets[1].x               = static_cast<int>(source.extent.width);
+	region.srcOffsets[1].x               = static_cast<int>(src_w);
 	region.srcOffsets[1].y               = static_cast<int>(source.extent.height);
 	region.srcOffsets[1].z               = 1;
 	region.dstSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;

@@ -23,7 +23,7 @@ public class K {
   }
 }
 "@
-$vk = @{ up = 0x26; down = 0x28; left = 0x25; right = 0x27; enter = 0x0D; esc = 0x1B; space = 0x20; f8 = 0x77; f9 = 0x78; f10 = 0x79 }
+$vk = @{ up = 0x26; down = 0x28; left = 0x25; right = 0x27; enter = 0x0D; esc = 0x1B; space = 0x20; f8 = 0x77; f9 = 0x78; f10 = 0x79; lctrl = 0xA2; lshift = 0xA0 }
 $code = if ($vk.ContainsKey($Key)) { $vk[$Key] } else { [int][char]$Key.ToUpper() }
 $ext = $Key -in @('up', 'down', 'left', 'right')
 # Windows only lets a process take the foreground right after input: tap Alt first.

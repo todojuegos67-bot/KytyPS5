@@ -9,6 +9,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/saveDataMountSlots.h"
+#include "libs/saveDataBackup.h"
 #include "libs/saveDataCapacity.h"
 #include "libs/saveDataInfo.h"
 #include "loader/symbolDatabase.h"
@@ -18,6 +19,7 @@
 #include <cstdio>
 #include <fstream>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <fstream>
 #include <vector>
@@ -356,12 +358,59 @@ static StoredParam read_param(std::string_view name) {
 	return param;
 }
 
+// (Written beside it, flushed, then renamed over it: a crash leaves the old or the new one, not zeros. Issue #73.)
 static void write_param(std::string_view name, const StoredParam& param) {
 	std::error_code ec;
 	const auto      path = param_metadata(name);
 	std::filesystem::create_directories(path.parent_path(), ec);
-	std::ofstream file(path, std::ios::binary | std::ios::trunc);
-	file.write(reinterpret_cast<const char*>(&param), sizeof(param));
+	auto temporary = path;
+	temporary += ".tmp";
+	{
+		std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+		file.write(reinterpret_cast<const char*>(&param), sizeof(param));
+		if (!file) return;
+	}
+	Backup::FlushFile(temporary);
+	std::filesystem::rename(temporary, path, ec);
+}
+
+// Issue #73 (libs/saveDataBackup.h): a slot's files, and the folder of its backups.
+static Backup::SlotFiles slot_files(std::string_view name) {
+	return {std::filesystem::path(SAVE_DATA_DIR) / get_title_id() / std::string(name), param_metadata(name),
+	        capacity_metadata(name)};
+}
+
+static std::filesystem::path backup_root(std::string_view name) {
+	return std::filesystem::path(SAVE_DATA_DIR) / ".kyty-backup" / get_title_id() / std::string(name);
+}
+
+// The slot's files flushed to disk, and a backup of them made when they changed since the last one.
+static void keep_safe(std::string_view name) {
+	static bool noted = false;
+	const auto  slot  = slot_files(name);
+	Backup::FlushSlot(slot);
+	if (const auto made = Backup::Make(slot, backup_root(name), std::time(nullptr)); made && !noted) {
+		noted = true;
+		std::printf("Save data: each save is also kept in %s (the last %zu, at least %d minutes apart)\n",
+		            backup_root(name).parent_path().string().c_str(), Backup::Generations,
+		            static_cast<int>(Backup::ReplaceSeconds / 60));
+	}
+}
+
+// A slot left broken by a crash (a file of zeros) gets its newest good backup back before the game reads it.
+static void repair(std::string_view name) {
+	const auto slot = slot_files(name);
+	if (!Backup::Broken(slot)) return;
+	const auto root = backup_root(name);
+	if (const auto restored = Backup::Restore(slot, root, std::time(nullptr))) {
+		std::printf("Save data: %.*s had a file of zeros (as a crash while saving leaves it): its backup %s is put back; "
+		            "the broken files are kept in %s\n",
+		            static_cast<int>(name.size()), name.data(), restored->c_str(), root.string().c_str());
+	} else {
+		std::printf("Save data: %.*s has a file of zeros (as a crash while saving leaves it) and no good backup in %s\n",
+		            static_cast<int>(name.size()), name.data(), root.string().c_str());
+	}
+	std::fflush(stdout);
 }
 
 // A slot's modification time (time_t) as the PS5 reports it: the time of its last write, here its newest file.
@@ -608,6 +657,10 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		EXIT_NOT_IMPLEMENTED((!Common::File::IsDirectoryExisting(mount_dir)));
 	}
 
+	if (!created) {
+		repair(dir_name);
+	}
+
 	const auto metadata = capacity_metadata(dir_name);
 	const auto capacity = ReadSaveDataCapacity(mount_dir, metadata);
 	if (!capacity || !WriteSaveDataCapacity(metadata, std::max(capacity->blocks, mount->blocks))) {
@@ -780,11 +833,13 @@ int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
+	const std::string dir_name = g_mount_slots.Directory(static_cast<size_t>(slot));
+	LibKernel::FileSystem::Umount(point);
+	g_mount_slots.Release(static_cast<size_t>(slot));
+	keep_safe(dir_name);
 	if ((mode & SAVE_DATA_UMOUNT_MODE_BACKUP_ASYNC) != 0) {
 		queue_save_data_event(SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END, 0, nullptr, nullptr);
 	}
-	LibKernel::FileSystem::Umount(point);
-	g_mount_slots.Release(static_cast<size_t>(slot));
 
 	return OK;
 }
@@ -816,6 +871,12 @@ int KYTY_SYSV_ABI SaveDataCommit(const SaveDataCommitParam* param) {
 	     "\t commit_mode = %" PRIu32 "\n",
 	     param->resource, param->commit_mode);
 
+	{
+		Common::LockGuard lock(g_mount_mutex);
+		for (size_t slot = 0; slot < SaveDataMountSlots::COUNT; slot++) {
+			if (g_mount_slots.IsMounted(slot)) keep_safe(g_mount_slots.Directory(slot));
+		}
+	}
 	if ((param->commit_mode & SAVE_DATA_COMMIT_MODE_BACKUP_ASYNC) != 0) {
 		queue_save_data_event(SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END, 0, nullptr, nullptr);
 	}
@@ -991,6 +1052,10 @@ int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
 	     backup->user_id, backup->title_id != nullptr ? backup->title_id->data : "<default>",
 	     backup->dir_name->data);
 
+	{
+		Common::LockGuard lock(g_mount_mutex);
+		keep_safe(std::string(backup->dir_name->data, strnlen(backup->dir_name->data, sizeof(backup->dir_name->data))));
+	}
 	queue_save_data_event(SAVE_DATA_EVENT_TYPE_BACKUP_END, backup->user_id, backup->title_id,
 	                      backup->dir_name);
 

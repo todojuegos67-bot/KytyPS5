@@ -40,7 +40,7 @@ void        RequireVulkanSuccess(vk::Result result, const char* operation);
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,
                           Args&&... args) {
-	if (!Config::GraphicsDebugDumpEnabled() || device == nullptr || handle == nullptr ||
+	if (!Config::VulkanObjectNamesEnabled() || device == nullptr || handle == nullptr ||
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
 		return;
 	}

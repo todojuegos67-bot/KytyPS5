@@ -61,8 +61,9 @@ folder (usually named `PPSA01341-app0`).
 
 ## Starting the game
 
-**Double-click `launcher.cmd`** for a small settings window: the game folder, the resolution,
-fullscreen (optionally keeping 16:9 with black bars), the console language and red-zone protection,
+**Double-click `launcher.cmd`** for a small settings window: the game folder, the resolution with the
+aspect ratio, render height and upscaler beside it, fullscreen (optionally keeping the aspect ratio with
+black bars), the console language and red-zone protection,
 with buttons to play, to precompile the shaders (optionally on the efficiency cores only, so the PC
 stays responsive), and to open the logs folder. It remembers the settings (`launcher-settings.json`).
 "Up to 120 fps" (off by default) lets the game render up to 120 frames a second instead of the
@@ -75,15 +76,32 @@ less sharp. The interface stays 4K either way.
 "Aspect ratio" (16:9 by default, as on the PS5) renders the 3D wider for ultrawide displays: 21:9
 (3416x1440 at render height 1440) or 32:9, seeing more to the sides, not a stretched 16:9 picture. In
 play the HUD keeps its shape: health, magic, stamina and the equipment at the left edge, the souls at
-the right edge, the boss's health in the middle. The in-game menus are stretched to the width; the lock-on
-and enemy health bars stay on their targets; pre-rendered movies and loading screens are shown at 16:9
-with black bars. Pick the matching resolution (2560x1080, 3440x1440, 5120x2160, ...) or full screen.
+the right edge, the boss's health in the middle. The in-game menus, pre-rendered movies and loading
+screens are stretched to the width; the lock-on and enemy health bars stay on their targets. The
+"Resolution" list follows the aspect ratio (2560x1080, 3440x1440, 3840x1600, 5120x2160 at 21:9), and
+"Render height" offers the heights whose 3D the game's render target memory holds (it was made for its own
+3840x2160): up to 1800 at 21:9 (4264x1800), 1512 at 32:9 (5376x1512). Larger ones drew the 3D red or broken, and
+2160 at 21:9 ended the game at start-up; the emulator now lowers such a height by itself.
 "Graphics" (Standard by default, as on the PS5) sets how much the game draws. Low picks the level of
 detail as for a 720-line picture and ends sun shadows at 125 m (250 m); Lowest picks detail as for 480
 lines, ends sun shadows at 60 m and turns off ambient shadowing
 and the shadows of torches and other lamps. Each thing drawn costs the emulator processor time, so these
 help where the processor limits the frame rate (a laptop Ryzen 9 5900HX standing at the Gates of
 Boletaria: 21.9 fps at Standard, 25.6 at Lowest).
+"Upscaler" (Game by default, as on the PS5) with "DLSS (PS5 Pro path)" runs the game's own PS5 Pro mode:
+its 3D at the render height (1080 at least) is made a real 3840x2160 image by NVIDIA DLSS in place of Sony's
+PS5 Pro upscaler, and the game finishes it at 4K (bloom, depth of field, the HUD), instead of anti-aliasing
+at the render height and stretching to 4K. The launcher keeps a render height for each upscaler: DLSS starts
+at 1080, DLSS's Performance (on an RTX 5090 about the frame rate of the game's own TAA at 1440, with a
+sharper picture); 1440 is its Quality, 1512 the PS5 Pro's own 2688x1512, 2160 DLAA. NVIDIA RTX only, with
+NVIDIA's Streamline runtime as for frame generation below: on a PC without an NVIDIA RTX graphics card (AMD,
+Intel, GeForce GTX) the launcher keeps this row and frame generation off, and the game's own TAA makes the
+picture at its own render height. The in-game "Cinematic" mode stays native 4K without DLSS.
+With an "Aspect ratio" wider than 16:9, DLSS makes the picture at its full width: 5120x2160 at 21:9 (from
+2560x1080 at render height 1080), and the game finishes it at that size, with the HUD at the screen's edges,
+instead of a 3840x2160 picture widened on the screen. On an RTX 5090 at Boletaria's start that ran at 64.5 fps,
+the game's TAA at 21:9 at 59.3. Screens without the 3D (movies, the title, loading) are stretched to the
+width, as without DLSS.
 "Frame generation" (DLSS, 2x to 6x; NVIDIA RTX 40 or newer, 3x and up RTX 50) uses NVIDIA's Streamline
 runtime, which this package does not include: download the Streamline SDK (a release zip from
 https://github.com/NVIDIA-RTX/Streamline/releases), unpack it and choose its folder with the launcher's
@@ -97,13 +115,14 @@ with a bar for each core, and the memory in use. (The overlays seen in videos wi
 of every part come from separate tools such as MSI Afterburner's RivaTuner Statistics Server.) In the
 game, F8 switches the panel between Off, "Frame rate" and "Detailed", whatever the launcher started it with
 (also when started with `run.cmd`).
-"Safe GPU mode" (off by default) is for PCs where the game stops with a GPU error: "device lost", or the
-screen goes black and the graphics driver restarts (a TDR). The emulator normally lets the graphics card
-overlap Demon's Souls' compute work; in this mode it runs the steps one after another. On a laptop RTX 3080
-(driver 566.07) that had these hangs, 3 of 4 runs through Boletaria hung without it and none of 3 with it,
-but it costs a quarter to almost half of the frame rate there (13.9-17.7 fps instead of 26.8). Leave it off
-when the game runs without such errors; updating the graphics driver can help as well. (With `run.cmd`
-or `run-windows.ps1`: `-Set KYTY_COMPUTE_CHAIN=0`.)
+"Safe GPU mode" (off by default) prevents the crashes and blue screens that come from the graphics card
+hanging ("device lost", the screen going black while the graphics driver restarts, a VIDEO_TDR_FAILURE blue
+screen), but **the frame rate is about 37% lower**. The emulator normally lets the graphics card overlap
+Demon's Souls' compute work; in this mode it runs the steps one after another. On a laptop RTX 3080 (driver
+566.07) that had these hangs, 3 of 4 runs through Boletaria hung without it and none of 3 with it, at 17 fps
+instead of 27. It does not help the MEMORY_MANAGEMENT blue screens of a full RAM (see RAM under System
+requirements). Leave it off when the game runs without such crashes; a current graphics driver can help as well.
+(With `run.cmd` or `run-windows.ps1`: `-Set KYTY_COMPUTE_CHAIN=0`.)
 Its settings and language list follow the KytyPS5 launcher (`src/launcher` in the source, by the
 KytyPS5 developers).
 
@@ -137,7 +156,7 @@ shortcut):
 | `-Game <folder>` | The game folder (or a `.zar` archive of it) |
 | `-Language 11` | The console language, as the PS5 numbers them (0 Japanese, 1 English (US), 11 Chinese (Simplified), ...; the launcher lists them) |
 | `-RenderHeight 1080` | The height the game renders its 3D at (720–1440, default 1440 as on the PS5): lower is faster on a slow graphics card and less sharp |
-| `-Aspect 21:9` | The 3D rendered wider (`21:9` or `32:9`) for ultrawide displays; the HUD keeps its shape at the sides, in-game menus are stretched, movies stay 16:9 |
+| `-Aspect 21:9` | The 3D rendered wider (`21:9` or `32:9`) for ultrawide displays; the HUD keeps its shape at the sides; in-game menus, movies and loading screens are stretched to the width |
 | `-Quality low` | How much the game draws: `low` or `lowest` (shorter shadows, simpler distant detail), faster where the processor limits the frame rate |
 
 ## Shader precompile (without it the game stutters)
@@ -201,6 +220,7 @@ Default keyboard layout:
 | F7 | Camera with the mouse (press again to release the mouse) |
 | Space | **Pause / resume the emulation** (careful not to hit it by accident) |
 | F8 | The emulator's overlay: Off, Frame rate, Detailed (the launcher's "Overlay" is where it starts) |
+| F9 | **Debug snapshot**: pauses the game and saves the picture on screen and where you are (`_DebugSnapshots\<date-time>\`: `screen.png`, `info.txt` with the position, the run's log and the switches); F9 again resumes. Attach the folder to an issue when something looks wrong |
 | F11, Alt+Enter | Toggle full screen |
 
 The keyboard has no L2 / R2 by default: use a gamepad when you need them.
@@ -211,7 +231,7 @@ The keyboard has no L2 / R2 by default: use a gamepad when you need them.
 | --- | --- |
 | `run.cmd` | Starts the game |
 | `precompile.cmd` | Full shader precompile |
-| `_SaveData` | **Saves** (created by the first run; back them up now and then) |
+| `_SaveData` | **Saves** (created by the first run; back them up now and then). Each save the game makes is also kept in `_SaveData\.kyty-backup\<game>\<slot>\<date-time>` (the last 4, at least 5 minutes apart); a save left broken by a crash while saving (a file of zeros) gets the newest good one back when the game opens it, the broken files kept beside the backups, and the log says so |
 | `_PipelineCache` | Shader caches (valid only for this PC's graphics card and driver: do not copy them to other PCs) |
 | `logs` | Run logs |
 | `game-path.txt` | The remembered game location |
@@ -222,14 +242,18 @@ The keyboard has no L2 / R2 by default: use a gamepad when you need them.
 ## Known issues
 
 - It crashes now and then.
-- On some PCs the graphics card hangs ("device lost", the screen goes black and the driver restarts), in a
-  laptop RTX 3080's case within minutes at Boletaria: turn on "Safe GPU mode" in the launcher (see above).
-  It costs frame rate.
+- On some PCs the graphics card hangs ("device lost", the screen goes black and the driver restarts, or a
+  VIDEO_TDR_FAILURE blue screen), in a laptop RTX 3080's case within minutes at Boletaria: turn on "Safe GPU
+  mode" in the launcher (see above). The frame rate is then about 37% lower.
 - Sound: 3D sound has no direction, and there is no reverb.
 - It uses a lot of memory and video memory: on PCs with too little it may just exit.
 - On some TVs the picture tears or stutters with VSync on. A user's fix on a 60 Hz TV with an NVIDIA
   card (issue #30): in the NVIDIA Control Panel, Manage 3D settings > Program Settings, add
   `kyty_emulator.exe` and set "Vertical sync" to On and "Vulkan/OpenGL present method" to "Prefer native".
+- With DLSS frame generation on, the game may stop at start-up with "Could not create the Vulkan device with DLSS
+  frame generation". A user's fix on an RTX 5080 (issue #45): in Windows Security, App & browser control > Exploit
+  protection > Program settings, add `kyty_emulator.exe` and, under "Randomize memory allocations (Bottom-up ASLR)",
+  tick "Override system settings" and turn it On.
 - Windows may say "Windows protected your PC" (the programs are not signed): click
   "More info → Run anyway". For a zip downloaded from the internet, you can tick "Unblock" in the
   zip file's properties before extracting it.

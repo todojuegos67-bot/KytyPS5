@@ -566,7 +566,7 @@ bool PlanQueues(vk::PhysicalDevice physical_device, uint32_t queue_family, uint3
 }
 
 void OnDevice(GraphicContext& graphics, const QueuePlan& plan) {
-	if (g_requested || (UpscaleWanted() && LoadApi())) {
+	if (g_requested || ((UpscaleWanted() || SrPathWanted()) && LoadApi())) {
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 		g_get_device_proc = LocalVulkanRecording::DirectDispatch().vkGetDeviceProcAddr;
 #endif
@@ -790,8 +790,20 @@ bool UpscaleWanted() {
 	return wanted;
 }
 
+bool SrPathWanted() {
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_UPSCALER");
+		return value != nullptr && std::string(value) == "fsr";
+	}();
+	return wanted;
+}
+
+bool SrReady() {
+	return SrPathWanted() && !g_up_failed && LoadApi() && g_get_device_proc != nullptr;
+}
+
 bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
-	if (!UpscaleWanted() || g_up_failed || !LoadApi() || g_get_device_proc == nullptr || desc.color == nullptr ||
+	if (!(UpscaleWanted() || SrPathWanted()) || g_up_failed || !LoadApi() || g_get_device_proc == nullptr || desc.color == nullptr ||
 	    desc.depth == nullptr || desc.motion == nullptr || desc.output == nullptr || desc.command == VK_NULL_HANDLE)
 		return false;
 	if (g_up_context == nullptr || desc.render.width > g_up_render.width || desc.render.height > g_up_render.height ||
@@ -845,6 +857,11 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 	// motion (FSR wants pixels towards the previous position, as for frame generation).
 	up.jitterOffset      = {desc.jitter[0], desc.jitter[1]}; // (0 after the TAA; the camera's for the raw frame)
 	up.motionVectorScale = {mv_sign * static_cast<float>(desc.render.width), mv_sign * static_cast<float>(desc.render.height)};
+	// The PS5 Pro path's vectors: their own scale to pixels (KYTY_SR_MV_SIGN=-1 the other way round).
+	if (desc.mv_scale[0] != 0.0f || desc.mv_scale[1] != 0.0f) {
+		static const float sr_sign = EnvFloat("KYTY_SR_MV_SIGN", 1.0f) >= 0 ? 1.0f : -1.0f;
+		up.motionVectorScale = {sr_sign * desc.mv_scale[0], sr_sign * desc.mv_scale[1]};
+	}
 	up.renderSize        = {desc.render.width, desc.render.height};
 	up.upscaleSize       = {desc.upscale.width, desc.upscale.height};
 	const float sharpness = EnvFloat("KYTY_UPSCALE_SHARPNESS", 0.3f);
@@ -853,10 +870,10 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 	up.frameTimeDelta    = std::clamp(desc.delta_ms, 1.0f, 100.0f);
 	up.preExposure       = 1.0f;
 	up.reset             = desc.reset;
-	const float z_near   = EnvFloat("KYTY_FSR3_NEAR", camera.valid ? camera.z_near : 0.1f);
+	const float z_near   = EnvFloat("KYTY_FSR3_NEAR", desc.z_near > 0.0f ? desc.z_near : camera.valid ? camera.z_near : 0.1f);
 	up.cameraNear        = FLT_MAX; // reversed infinite depth: the SDK's convention (frame generation's too)
 	up.cameraFar         = z_near;
-	up.cameraFovAngleVertical  = EnvFloat("KYTY_FSR3_FOV", camera.valid ? camera.fov : 1.0f);
+	up.cameraFovAngleVertical  = EnvFloat("KYTY_FSR3_FOV", desc.fov > 0.0f ? desc.fov : camera.valid ? camera.fov : 1.0f);
 	up.viewSpaceToMetersFactor = 1.0f;
 	up.flags                   = 0;
 	const auto result = g_ffx.Dispatch(&g_up_context, &up.header);
@@ -1131,6 +1148,12 @@ double RealFrameInterval() {
 	return 0.0;
 }
 bool UpscaleWanted() {
+	return false;
+}
+bool SrPathWanted() {
+	return false;
+}
+bool SrReady() {
 	return false;
 }
 bool Upscale(GraphicContext&, const UpscaleDesc&) {

@@ -1037,9 +1037,11 @@ bool PipelineCache::StaticCacheCurrent(GraphicContext& graphics, const std::file
 		                    ("hints-" + PipelineCacheGameId() + ".hints");
 		const auto hinted = std::filesystem::last_write_time(hints, error);
 		if (!error && written < hinted) return false;
-		// Made without a translation feature of this emulator's: the precompile makes the pipelines it changes.
+		// Made without a translation feature of this emulator's for this GPU, and no precompile with it tried since: one
+		// makes the pipelines it changes.
 		namespace Translate = ShaderRecompiler::Frontend;
-		if ((ReadStaticFeatures() & Translate::TranslatorFeatures) != Translate::TranslatorFeatures) return false;
+		const auto wanted = Translate::TranslatorDeviceFeatures();
+		if ((ReadStaticStamp().second & wanted) != wanted) return false;
 	}
 	if (graphics.pipeline_binaries_enabled) {
 		return PipelineBinaries::Open(graphics.device, StaticBinariesPath(), StaticBinariesSignature(graphics)) != nullptr;
@@ -1168,10 +1170,10 @@ static bool MergeBlobShards(GraphicContext& graphics, bool prune, bool keep_shar
 }
 
 // The shard files are removed once merged. A pruned merge makes the store of this run's pipelines alone: stamped with the
-// translation features they were made with (WriteStaticFeatures).
-bool PipelineCache::MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards) {
+// translation features they were made with; a precompile's last merge (`stamp`) with those it tried (WriteStaticFeatures).
+bool PipelineCache::MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards, bool stamp) {
 	const auto stamped = [&](bool merged) {
-		if (merged && prune) WriteStaticFeatures();
+		if (merged && (prune || stamp)) WriteStaticFeatures(prune);
 		return merged;
 	};
 	if (graphics.pipeline_binaries_enabled) return stamped(MergeBinaryShards(graphics, prune, keep_shards));

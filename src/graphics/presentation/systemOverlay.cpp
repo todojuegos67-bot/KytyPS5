@@ -667,6 +667,20 @@ struct SystemOverlay::Impl {
 		if (exists(fonts + "segoeuib.ttf")) {
 			hud_font = io.Fonts->AddFontFromFileTTF((fonts + "segoeuib.ttf").c_str(), 32.0f);
 		}
+		// The dialogs draw the game's own texts (save names and their detail, messages), which are not
+		// ASCII: the system's CJK face where Windows has one, with the ranges those texts use. Plain
+		// "?" for every character is what the default font, which only holds ASCII, drew before.
+		for (const char* face: {"msyh.ttc", "msyhbd.ttc", "simhei.ttf", "simsun.ttc"}) {
+			if (!exists(fonts + face)) {
+				continue;
+			}
+			dialog_font = io.Fonts->AddFontFromFileTTF(
+			    (fonts + face).c_str(), 32.0f, nullptr,
+			    io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+			if (dialog_font != nullptr) {
+				break;
+			}
+		}
 #endif
 		ImGui::StyleColorsDark();
 		auto& style          = ImGui::GetStyle();
@@ -972,7 +986,7 @@ struct SystemOverlay::Impl {
 		}
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24.0f * scale, 24.0f * scale});
 		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12.0f * scale, 16.0f * scale});
-		ImGui::PushFont(nullptr, 20.0f * scale);
+		ImGui::PushFont(dialog_font, 20.0f * scale);
 		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
 		                                   ImGuiWindowFlags_NoSavedSettings |
 		                                   ImGuiWindowFlags_AlwaysAutoResize;
@@ -1011,7 +1025,7 @@ struct SystemOverlay::Impl {
 		}
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24.0f * scale, 20.0f * scale});
 		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12.0f * scale, 10.0f * scale});
-		ImGui::PushFont(nullptr, 20.0f * scale);
+		ImGui::PushFont(dialog_font, 20.0f * scale);
 		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
 		                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize;
 		ImGui::Begin("##SaveDataList", nullptr, flags);
@@ -1287,6 +1301,7 @@ struct SystemOverlay::Impl {
 	GraphicContext&                       graphics;
 	ImGuiContext*                         imgui_context      = nullptr;
 	ImFont*                               hud_font           = nullptr; // null: the default font
+	ImFont*                               dialog_font        = nullptr; // null: the default font
 	bool                                  vulkan_initialized = false;
 	bool                                  shift              = false;
 	bool                                  symbol_mode        = false;

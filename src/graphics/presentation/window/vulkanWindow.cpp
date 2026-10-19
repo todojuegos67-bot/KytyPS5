@@ -35,9 +35,11 @@
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
+#include "local-platform.h"
 #include "frame-gen.h"
 #include "local/xess-sr.h"
 #include "local/fsr3-fg.h"
@@ -53,6 +55,8 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -614,6 +618,23 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	            : amd_rdna3_or_later                    ? "AMD RDNA3 or later"
 	                                                    : "default",
 	            device_properties.vendorID, id);
+	// The cooperative halves (ShaderRecompiler::Frontend::TranslatorFeatures) only on NVIDIA GPUs, where they were
+	// tested: an RX 6800 XT (RDNA2, its wave64 compute emulated on 32-lane subgroups as NVIDIA's; Adrenalin 26.8.1) drew
+	// black squares across the scene with them, compiled by the game or precompiled alike (issue #64). Elsewhere those
+	// programs translate as before them, and a store made with them stays in use for the rest.
+	// AMD GPUs always load a table mode slot where the shader reads it, whatever the store was made with: 4 table mode
+	// compute shaders at the Vanguard read 1049-1078 slots, which loaded at the entry reset an RX 9070 XT and an RX 9060
+	// XT (RDNA4, Linux RADV: page faults or a ring timeout) at their first dispatches; with them loaded at use, or those
+	// 4 on the normal path, the fight passed (issue #51). A store made without it is out of date there (precompile
+	// again); until then its table mode pipelines are compiled at their first use.
+	namespace Translate = ShaderRecompiler::Frontend;
+	if (device_properties.vendorID != 0x10deu) {
+		const bool amd = device_properties.vendorID == 0x1002u;
+		Translate::SetTranslatorDeviceFeatures(Translate::TranslatorFeatures & ~Translate::TranslatorFeatureCooperativeHalves,
+		                                       amd ? Translate::TranslatorFeatureTableSlotsAtUse : 0u);
+		std::printf("Cooperative halves: off on this GPU (tested on NVIDIA GPUs; KYTY_LANE_LOCAL_COOP=1 forces them)%s\n",
+		            amd ? "; table mode slots loaded at use" : "");
+	}
 	std::fflush(stdout);
 
 	graphics.fragment_wave64_requirable =
@@ -1027,6 +1048,12 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		memory_priority.pNext          = const_cast<void*>(create_info.pNext);
 		create_info.pNext              = &memory_priority;
 	}
+	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_features {};
+	if (graphics.pipeline_statistics_enabled) {
+		executable_features.pipelineExecutableInfo = VK_TRUE;
+		executable_features.pNext                  = const_cast<void*>(create_info.pNext);
+		create_info.pNext                          = &executable_features;
+	}
 	vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
 	const bool fault_extension = HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 	if (fault_extension) {
@@ -1045,7 +1072,17 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 
 	vk::Device device = nullptr;
 
+	// (Frame generation's device creation reserves host address space below 1 TiB: the range kept free for it, issue #45.)
+	LibKernel::Memory::ReleaseFrameGenAddressHole();
+	// KYTY_FRAMEGEN_VMMAP=1: the host address space from 4 GiB to 4 TiB before and after the device creation (what the
+	// driver reserves for it, issue #45).
+	static const bool vmmap = [] {
+		const char* value = std::getenv("KYTY_FRAMEGEN_VMMAP");
+		return value != nullptr && *value == '1';
+	}();
+	if (vmmap) LocalPlatform::LogAddressSpace("before vkCreateDevice", uint64_t {1} << 32u, uint64_t {1} << 42u);
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
+	if (vmmap) LocalPlatform::LogAddressSpace("after vkCreateDevice", uint64_t {1} << 32u, uint64_t {1} << 42u);
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
 		std::printf("vkCreateDevice failed: %s (%u extensions)\n", vk::to_string(result).c_str(),
@@ -1089,7 +1126,7 @@ static void VulkanGetExtensions(SDL_Window* window, VulkanExtensions& r) {
 		        return vk::enumerateInstanceExtensionProperties(nullptr, count, values);
 	        });
 
-	r.enable_validation_layers = Config::VulkanValidationEnabled();
+	r.enable_validation_layers = Config::VulkanValidationEnabled() || Config::SyncValidationEnabled();
 	// HDR10 surface formats (VK_COLOR_SPACE_HDR10_ST2084_EXT) are listed only with this extension.
 	if (Config::HdrEnabled() &&
 	    HasExtension(r.available_extensions, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) &&
@@ -1201,6 +1238,24 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		default: severity_str = "?";
 	}
 
+	if (error && Config::SyncValidationEnabled()) {
+		// (KYTY_VULKAN_SYNCVAL: logged, not fatal: 5 messages of a kind - the id and the message's first 240 characters
+		// with the digits left out, so the same hazard on another handle or command is not a new kind - and 20000 in
+		// all; the layer's own limit of 10 an id is off, KYTY_VULKAN_SYNCVAL sets VK_KHRONOS_VALIDATION_ENABLE_MESSAGE_LIMIT.)
+		static std::mutex                                logged_mutex;
+		static std::unordered_map<std::string, uint32_t> logged;
+		static uint32_t                                  total = 0;
+		const std::string id = callback_data->pMessageIdName != nullptr ? callback_data->pMessageIdName : "?";
+		std::string       kind = id + ':';
+		for (const char* at = callback_data->pMessage; *at != '\0' && kind.size() < id.size() + 240; ++at)
+			if (*at < '0' || *at > '9') kind += *at;
+		std::lock_guard lock(logged_mutex);
+		if (const auto count = ++logged[kind]; count <= 5 && ++total <= 20000) {
+			std::printf("SYNCVAL %s #%u (kinds %zu): %s\n", id.c_str(), count, logged.size(), callback_data->pMessage);
+			std::fflush(stdout);
+		}
+		return VK_FALSE;
+	}
 	if (error) {
 		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
 		           static_cast<uint32_t>(message_types), callback_data->pMessage);
@@ -1283,8 +1338,30 @@ void WindowContext::CreateVulkan() {
 		EXIT("--spirv-debug-printf and --gpu-assisted-validation are mutually exclusive\n");
 	}
 
-	vk::ValidationFeatureEnableEXT enabled_features[3]    = {};
+	vk::ValidationFeatureEnableEXT enabled_features[4]    = {};
 	uint32_t                       enabled_features_count = 0;
+	// KYTY_VULKAN_SYNCVAL: synchronization validation; alone (without --vulkan-validation) the other checks are off.
+	vk::ValidationFeatureDisableEXT disabled_features[5]    = {};
+	uint32_t                        disabled_features_count = 0;
+	if (Config::SyncValidationEnabled()) {
+		// (Read by the layer when the instance is made: every hazard reaches the callback, which limits them itself.)
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		_putenv_s("VK_KHRONOS_VALIDATION_ENABLE_MESSAGE_LIMIT", "false");
+		_putenv_s("VK_KHRONOS_VALIDATION_SYNCVAL_MESSAGE_EXTRA_PROPERTIES", "true");
+#else
+		setenv("VK_KHRONOS_VALIDATION_ENABLE_MESSAGE_LIMIT", "false", 1);
+		setenv("VK_KHRONOS_VALIDATION_SYNCVAL_MESSAGE_EXTRA_PROPERTIES", "true", 1);
+#endif
+		enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eSynchronizationValidation;
+		if (!Config::VulkanValidationEnabled()) {
+			for (const auto feature: {vk::ValidationFeatureDisableEXT::eCoreChecks, vk::ValidationFeatureDisableEXT::eThreadSafety,
+			                          vk::ValidationFeatureDisableEXT::eApiParameters,
+			                          vk::ValidationFeatureDisableEXT::eObjectLifetimes, vk::ValidationFeatureDisableEXT::eShaders})
+				disabled_features[disabled_features_count++] = feature;
+		}
+		std::printf("Vulkan synchronization validation is enabled (KYTY_VULKAN_SYNCVAL): hazards are logged as SYNCVAL lines\n");
+		std::fflush(stdout);
+	}
 #ifdef KYTY_ENABLE_BEST_PRACTICES
 	enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eBestPractices;
 #endif
@@ -1305,8 +1382,8 @@ void WindowContext::CreateVulkan() {
 	validation_features.pNext                          = nullptr;
 	validation_features.enabledValidationFeatureCount  = enabled_features_count;
 	validation_features.pEnabledValidationFeatures     = enabled_features;
-	validation_features.disabledValidationFeatureCount = 0;
-	validation_features.pDisabledValidationFeatures    = nullptr;
+	validation_features.disabledValidationFeatureCount = disabled_features_count;
+	validation_features.pDisabledValidationFeatures    = disabled_features_count != 0 ? disabled_features : nullptr;
 
 	vk::DebugUtilsMessengerCreateInfoEXT dbg_create_info {};
 	dbg_create_info.sType           = vk::StructureType::eDebugUtilsMessengerCreateInfoEXT;
@@ -1456,6 +1533,13 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		// KYTY_PIPELINE_STATS=1 (a survey): each pipeline made again with the driver's statistics (shaders.cpp).
+		if (const char* stats = std::getenv("KYTY_PIPELINE_STATS");
+		    stats != nullptr && *stats == '1' &&
+		    HasExtension(available_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+			graphic_ctx.pipeline_statistics_enabled = true;
+		}
 		// KYTY_GPU_CHECKPOINTS (diagnostic): the pipelines a GPU hang or fault ran (device-fault.h).
 		if (DeviceFault::CheckpointsRequested() &&
 		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
@@ -1483,7 +1567,7 @@ void WindowContext::CreateVulkan() {
 			}
 		}
 		// KYTY_UPSCALE=xess: what XeSS's Vulkan backend asks for (VK_EXT_mutable_descriptor_type).
-		if (Libs::Graphics::Xess::Wanted())
+		if (Libs::Graphics::Xess::Wanted() || Libs::Graphics::Xess::SrPathWanted())
 			Libs::Graphics::Xess::AddDeviceExtensions(graphic_ctx.instance, graphic_ctx.physical_device, available_extensions,
 			                                          device_extensions);
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
@@ -1497,14 +1581,17 @@ void WindowContext::CreateVulkan() {
 	const char* internal_cache                 = std::getenv("KYTY_PIPELINE_BINARY_INTERNAL_CACHE");
 	graphic_ctx.pipeline_binary_internal_cache = internal_cache != nullptr && std::string_view(internal_cache) == "1";
 
+	// (Streamline's own answer whether DLSS-G can run here, asked before the device: the refusal below gives it.)
+	const std::string frame_gen_problem = FrameGen::SupportProblem(graphic_ctx.physical_device);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx.physical_device, r, queue_family,
 	                                        device_extensions, graphic_ctx);
 	if (graphic_ctx.device == nullptr) {
 		// (Issue #32: an RTX 5080 whose driver refused the device Streamline asked for; the game runs without it.)
 		if (FrameGen::StreamlineLoaded()) {
-			EXIT("Could not create the Vulkan device with DLSS frame generation (NVIDIA Streamline): start without "
+			EXIT("Could not create the Vulkan device with DLSS frame generation (NVIDIA Streamline)%s%s: start without "
 			     "frame generation (launcher: Frame generation -> Off). KYTY_FRAMEGEN_VERBOSE=1 logs why the driver "
-			     "refused it.\n");
+			     "refused it.%s\n",
+			     frame_gen_problem.empty() ? "" : ": ", frame_gen_problem.c_str(), FrameGen::RefusedDeviceAdvice().c_str());
 		}
 		EXIT("Could not create device");
 	}

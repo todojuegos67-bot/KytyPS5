@@ -463,6 +463,27 @@ uint32_t RecordedWaypoints() {
 	return g_waypoints.load(std::memory_order_relaxed);
 }
 
+void ShowNotice(std::string message, int seconds) {
+	std::lock_guard lock(g_mutex);
+	Show(std::move(message), seconds);
+}
+
+bool PlayerPlace(float xyz[3], float* yaw) {
+#if defined(_WIN32)
+	uint64_t ctrl = 0, body = 0;
+	float    at[3] {}, angles[4] {};
+	if (!IsPlayerBuild() || !FindPlayer(&ctrl, &body) || !Peek(body + 0x10, &angles) || !Peek(body + 0x20, &at) ||
+	    !std::isfinite(at[0]) || !std::isfinite(at[1]) || !std::isfinite(at[2]))
+		return false;
+	xyz[0] = at[0], xyz[1] = at[1], xyz[2] = at[2];
+	*yaw   = angles[1];
+	return true;
+#else
+	(void)xyz, (void)yaw;
+	return false;
+#endif
+}
+
 std::string HudText() {
 	std::lock_guard lock(g_mutex);
 	const auto      now = std::chrono::steady_clock::now();

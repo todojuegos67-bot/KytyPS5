@@ -159,6 +159,7 @@ uint32_t CpOpPopMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, u
 uint32_t CpOpWaitRegMem64(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpFlip(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpReleaseMem(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpSuperResolution(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 
 } // namespace Libs::Graphics
 

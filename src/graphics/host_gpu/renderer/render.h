@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/superResolution.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -126,11 +127,11 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
-	// The render pass `state` again after an interruption (a copy of its target): its attachments loaded, not
-	// cleared, and `state` kept as the current one (the next draws with it continue the pass).
+	// The render pass `state` again after an interruption (a copy of an attachment): its attachments loaded, not
+	// cleared, and `state` kept as the current one, so that the next BeginRendering with it continues the pass.
 	void ResumeRendering(const RenderState& state) const;
-	// The render pass `state` is the one in progress.
-	[[nodiscard]] bool RenderingWith(const RenderState& state) const { return m_rendering && m_render_state == state; }
+	// The render pass in progress is `state`'s, as BeginRendering compares them.
+	[[nodiscard]] bool RenderingWith(const RenderState& state) const;
 	// Raw internal graphics operations must invalidate the values recorded by
 	// the ordinary draw path. Compute and transfer commands do not alter them.
 	void InvalidateGraphicsState() const noexcept;
@@ -229,6 +230,8 @@ public:
 	// (predicted), as the catalog knows them.
 	void PredictDispatch(const HW::Shader& sh_ctx, uint32_t thread_group_x, uint32_t thread_group_y,
 	                     uint32_t thread_group_z, uint32_t mode, Spec::State& record);
+	// An R_SUPER_RESOLUTION packet's upscale (graphics/guest_gpu/superResolution.h; renderSuperResolution.cpp).
+	void RunSuperResolution(CommandBuffer& buffer, const SuperResolution::Packet& packet);
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void PrepareBindingsInto(const ShaderStageRuntime& runtime, PreparedBindings& prepared);

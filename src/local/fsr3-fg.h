@@ -45,6 +45,10 @@ void OnDevice(GraphicContext& graphics, const QueuePlan& plan);
 // pass's depth and motion vectors (FrameGen::UpscaleComposite records it right before the game's composite reads it).
 // The images: color, depth and motion in SHADER_READ_ONLY_OPTIMAL, the output in GENERAL; recorded into `command`.
 [[nodiscard]] bool UpscaleWanted();
+// KYTY_UPSCALER=fsr: the game's PS5 Pro path upscaled by FSR 3.1 (FrameGen::Upscale).
+[[nodiscard]] bool SrPathWanted();
+// The FidelityFX API loaded and the device known (after OnDevice).
+[[nodiscard]] bool SrReady();
 struct UpscaleDesc {
 	VkCommandBuffer          command = VK_NULL_HANDLE;
 	const VulkanImage*       color   = nullptr;
@@ -57,6 +61,8 @@ struct UpscaleDesc {
 	bool                     reset    = false;
 	float                    delta_ms = 16.7f;
 	float jitter[2] {0.0f, 0.0f}; // (pixels, as DLSS takes it: the raw jittered frame of KYTY_TAA_REPLACE=upscaler)
+	float mv_scale[2] {0.0f, 0.0f}; // vectors * scale = pixels to the previous frame (0: the TAA's UV vectors)
+	float fov = 0.0f, z_near = 0.0f; // the camera's (0: from `camera`)
 };
 bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc);
 bool               CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR& info, vk::SwapchainKHR* out);

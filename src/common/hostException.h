@@ -44,6 +44,29 @@ using GuardPageHandler = bool (*)(uint64_t address, void* native_context);
 
 void SetGuardPageHandler(GuardPageHandler handler);
 
+// Windows: the stack range the TEB gives while guest code runs on a guest or fiber stack (RunOnGuestStack, RunEntry):
+// the region every guest and fiber stack lies in (pthread.cpp PTHREAD_STACK_BOTTOM..TOP, MapGuestStack), where the
+// thread's host stack lies above it, else none (zeros). With Control Flow Guard on for the process, ntdll checks that an
+// exception's continuation (RtlGuardRestoreContext) has its rsp within the TEB's range and fails fast (0xC0000409, code
+// 13) otherwise: every write-tracking fault on a guest thread ended the process - issue #56, a "lite" Windows that
+// turns CFG on for all programs (reproduced with PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_ON).
+// __chkstk probes only below the range's low end: never, as with zeros. The kernel's stack growth needs the faulting
+// address between the TEB's DeallocationStack and the range's top: never, with the host stack above it. Scratch
+// registers: rcx, rdx and r<zero> (a number: "10").
+inline constexpr uint64_t GuestStacksLow  = 0x0000040000ull;
+inline constexpr uint64_t GuestStacksHigh = 0x07efff8000ull;
+#define KYTY_GUEST_TEB_STACK_RANGE_ASM(zero)                                                                           \
+	"xorq %%r" zero ", %%r" zero "\n\t"                                                                                 \
+	"movq %%gs:0x1478, %%rcx\n\t"                                                                                       \
+	"movabsq $0x7efff8000, %%rdx\n\t"                                                                                   \
+	"cmpq %%rdx, %%rcx\n\t"                                                                                             \
+	"cmovbq %%r" zero ", %%rdx\n\t"                                                                                     \
+	"movq %%rdx, %%gs:0x08\n\t"                                                                                         \
+	"movl $0x40000, %%ecx\n\t"                                                                                          \
+	"testq %%rdx, %%rdx\n\t"                                                                                            \
+	"cmovzq %%r" zero ", %%rcx\n\t"                                                                                     \
+	"movq %%rcx, %%gs:0x10\n\t"
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();
 #endif

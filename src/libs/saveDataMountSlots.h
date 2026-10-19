@@ -30,6 +30,10 @@ public:
 
 	void Mount(size_t slot, std::string_view directory) { m_directories[slot] = directory; }
 
+	[[nodiscard]] bool IsMounted(size_t slot) const {
+		return slot < m_directories.size() && m_directories[slot].has_value();
+	}
+
 	[[nodiscard]] const std::string& Directory(size_t slot) const {
 		return m_directories.at(slot).value();
 	}

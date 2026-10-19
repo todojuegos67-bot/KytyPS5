@@ -1016,6 +1016,7 @@ void BufferCache::Register(BufferId id) {
 }
 
 void BufferCache::Unregister(BufferId id) {
+	++m_unregister_epoch;
 	ChangeRegister<false>(id);
 }
 
@@ -1072,9 +1073,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
-		m_bda_pagetable_buffer.MakeResident(pages.first * sizeof(vk::DeviceAddress), size_pages * sizeof(vk::DeviceAddress));
-		WriteDataBuffer(m_bda_pagetable_buffer, pages.first * sizeof(vk::DeviceAddress),
-		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		if (pages.last_exclusive * sizeof(vk::DeviceAddress) > GetBdaPageTableBuffer()->Size()) {
+			GrowBdaTable(pages.last_exclusive);
+		}
+		WriteBdaEntries(pages.first, size_pages, addresses.data());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -1083,8 +1085,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_total_used_memory -= buffer.Size();
 		m_cache_bytes -= std::min(m_cache_bytes, buffer.Size());
 		m_lru_cache.Free(buffer.lru_id);
-		m_bda_pagetable_buffer.Fill(pages.first * sizeof(vk::DeviceAddress),
-		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		WriteBdaEntries(pages.first, size_pages, nullptr);
 		buffer.is_deleted = true;
 	}
 }
@@ -1406,13 +1407,77 @@ static MemoryUsage PageTableUsage(const GraphicContext& graphics) {
 	return wanted && graphics.sparse_residency_buffers ? MemoryUsage::SparseDeviceLocal : MemoryUsage::DeviceLocal;
 }
 
+// The guest addresses the BDA page table covers at first: 128 GiB, 64 MiB of video memory instead of the 512 MiB of
+// the whole 1 TiB. The PS5's kernel places mappings in its system-managed range by default (to 32 GiB); Demon's Souls
+// registers buffers there, by its executable (36 GiB) and at the start of the user range among its PRT pages (66 GiB).
+// 1-1 tours with 8 GB (KYTY_SIMULATE_VRAM_MB=8192) back to back: walk 63.6 -> 68.9 fps, spin 62.1 -> 67.7, points under
+// 60 fps 44 -> 24 of 84 (the route's middle third 54.3 -> 63.8, 27 of 29 points faster; its last third even: the room
+// filled up again). A registration past it grows it (GrowBdaTable; 1-1 starting at 12 GiB grew three times while
+// loading, no error). KYTY_BDA_TABLE_GIB=<n>: n GiB at first (tests of the growth). A sparse table is whole (its pages
+// get memory as entries are written).
+static uint64_t InitialBdaTableBytes(MemoryUsage usage) {
+	constexpr uint64_t Whole = BufferCache::BDA_PAGETABLE_SIZE;
+	if (usage == MemoryUsage::SparseDeviceLocal) return Whole;
+	const char* value   = std::getenv("KYTY_BDA_TABLE_GIB");
+	uint64_t    covered = value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) << 30u
+	                                                           : uint64_t {128} << 30u;
+	covered = std::clamp<uint64_t>(covered, uint64_t {1} << 30u, uint64_t {1} << 40u);
+	return std::min(Whole, (covered >> BufferCache::CACHING_PAGEBITS) * sizeof(vk::DeviceAddress));
+}
+
+void BufferCache::WriteBdaEntries(uint64_t first, uint64_t count, const vk::DeviceAddress* entries) {
+	// (The first table's memory may have held other data: zero before its first entry. A sparse one is zeroed as its
+	// pages get memory.)
+	if (!m_bda_zeroed) {
+		m_bda_zeroed = true;
+		auto& table  = *m_bda_tables.front();
+		if (table.Usage() != MemoryUsage::SparseDeviceLocal) table.Fill(0, table.Size(), 0);
+	}
+	if (count == 0) return;
+	for (const auto& table: m_bda_tables) {
+		const uint64_t held = table->Size() / sizeof(vk::DeviceAddress);
+		if (first >= held) continue;
+		const uint64_t part = std::min(count, held - first);
+		table->MakeResident(first * sizeof(vk::DeviceAddress), part * sizeof(vk::DeviceAddress));
+		if (entries != nullptr) {
+			WriteDataBuffer(*table, first * sizeof(vk::DeviceAddress), entries, part * sizeof(vk::DeviceAddress));
+		} else {
+			table->Fill(first * sizeof(vk::DeviceAddress), part * sizeof(vk::DeviceAddress), 0);
+		}
+	}
+}
+
+// A registration past the newest table: a table twice its size at least (to the whole 1 TiB), the old entries copied,
+// the rest zero, takes its place. The old one stays and is written alike (WriteBdaEntries): a set made with it - a
+// native record's, a table set, one written into a command buffer already recorded - reads right entries for what it
+// covers and zero past it, as before, never a freed buffer's; native records and table sets made before are made again
+// before their next use (their generation: NativeXprValidate, NativeXprDraw, TableValidateSet).
+void BufferCache::GrowBdaTable(uint64_t entries) {
+	if (!m_bda_zeroed) WriteBdaEntries(0, 0, nullptr);
+	auto*    old   = GetBdaPageTableBuffer();
+	uint64_t bytes = old->Size();
+	while (bytes < entries * sizeof(vk::DeviceAddress) && bytes < BDA_PAGETABLE_SIZE) bytes *= 2;
+	bytes      = std::min(bytes, BDA_PAGETABLE_SIZE);
+	auto table = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, bytes);
+	SetVulkanObjectNameF(m_graphics.device, table->Handle(), "BDA Page Table Buffer");
+	table->CopyFrom(m_scheduler.Current(), *old, 0, 0, old->Size());
+	table->Fill(old->Size(), bytes - old->Size(), 0);
+	m_bda_table.store(table.get(), std::memory_order_release);
+	m_bda_tables.push_back(std::move(table));
+	s_bda_table_generation.fetch_add(1, std::memory_order_acq_rel);
+	std::printf("BDA page table: %llu MiB for guest addresses up to %llu GiB (a buffer at 0x%llx)\n",
+	            static_cast<unsigned long long>(bytes >> 20u),
+	            static_cast<unsigned long long>((bytes / sizeof(vk::DeviceAddress)) >> (30u - CACHING_PAGEBITS)),
+	            static_cast<unsigned long long>((entries - 1) << CACHING_PAGEBITS));
+	std::fflush(stdout);
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache,
                          GpuResourceManager* resources)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_lod_stats_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, 256 * 16),
-      m_bda_pagetable_buffer(graphics, scheduler, PageTableUsage(graphics), 0, AllFlags, BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, StagingRingSize(),
                        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
@@ -1425,6 +1490,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache), m_resources(resources) {
+	{
+		const auto usage = PageTableUsage(graphics);
+		m_bda_tables.push_back(
+		    std::make_unique<Buffer>(graphics, scheduler, usage, 0, AllFlags, InitialBdaTableBytes(usage)));
+		m_bda_table.store(m_bda_tables.back().get(), std::memory_order_release);
+	}
 	m_scheduler.SetPrologueHook([this](vk::CommandBuffer command) { FlushPrologueCopies(command); });
 	m_gpu_modified_ranges.AllowFastPath();
 	g_sync_cache = this;
@@ -1441,7 +1512,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		reinterpret_cast<uint32_t*>(m_lod_stats_buffer.Mapped().data())[i * 4] = 15;
 	}
 	m_lod_stats_buffer.Flush(0, 256 * 16);
-	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
+	SetVulkanObjectNameF(m_graphics.device, GetBdaPageTableBuffer()->Handle(),
 	                     "BDA Page Table Buffer");
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
@@ -2244,6 +2315,40 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	const auto handle = temporary->Handle();
 	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
 	return handle;
+}
+
+// A read through a pointer into memory no buffer holds misses the GPU's page table: it reads nothing (zeros) and leaves
+// a fault, which gets those pages a buffer only once the submission's faults are processed (FaultManager). A Bink video's
+// first decode read its blocks' flags that way, and the frames predicted from it kept the error until the video looped
+// (issue #52: the archstone preview's colours wrong for 10 s whenever the decoder's memory was new to the GPU). So the
+// start of each range a dispatch or a draw reads through pointers - 64 KiB from its base, its offsets known or not - is
+// given a buffer with the guest's bytes before the work is recorded (GpuResourceManager::PrepareBdaReadRanges).
+void BufferCache::EnsureBdaReadable(std::span<const GuestRange> ranges) {
+	constexpr uint64_t HeadBytes = uint64_t {64} << 10u;
+	const auto         held      = [this](uint64_t page) {
+        const auto* owner = m_page_table.Find(page);
+        return owner != nullptr && *owner;
+	};
+	for (const auto& range: ranges) {
+		const auto last = (range.address + std::min(range.size, HeadBytes) - 1) >> PageTable::kPageBits;
+		for (auto page = range.address >> PageTable::kPageBits; page <= last;) {
+			if (held(page)) {
+				++page;
+				continue;
+			}
+			// (One buffer for a run of such pages.)
+			auto end = page + 1;
+			while (end <= last && !held(end)) ++end;
+			const auto begin = page << PageTable::kPageBits, bytes = (end - page) << PageTable::kPageBits;
+			if (IsGpuMapped(begin, bytes) && LibKernel::Memory::IsFullyMapped(begin, bytes)) {
+				auto& buffer    = m_slot_buffers[FindBuffer(begin, bytes)];
+				buffer.bda_read = true;
+				TouchBuffer(buffer);
+				(void)SynchronizeBuffer(buffer, begin, bytes, false, false);
+			}
+			page = end;
+		}
+	}
 }
 
 void BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {

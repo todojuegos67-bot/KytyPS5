@@ -54,9 +54,15 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// `may_fail` (a sampled texture's lookup): no image when the GPU cannot make one (its memory full, or more layers or
+	// bytes than the format allows), an invalid id, and none tried again for that memory for a while.
+	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false, bool may_fail = false);
 	// An image of exactly this guest texture is registered (what FindImage takes first; no lookup side effects).
 	[[nodiscard]] bool          HoldsImage(const ImageInfo& info);
+	// The layers of a one-level array a sampled view reads, `info` (slices one after another: descriptors.cpp
+	// HoldLayerRange), held by an image of other layers too: `info` becomes that image's and `first` the view's first
+	// layer in it. See the definition.
+	void                        HoldLayers(ImageInfo& info, uint32_t& first);
 	// Addresses that gained their first registered image, in registration
 	// order: a caller that proved "no image starts here" at StartEpoch() E only
 	// needs the addresses logged after E.
@@ -157,6 +163,8 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// RunGarbageCollector's line on the PC's memory, when it moved.
+	void LogPcMemory(uint64_t tick);
 	// The images no draw or dispatch used for a while go (RunGarbageCollector, once a flip).
 	void RetireStaleImages(uint64_t tick);
 	// The latest tick of a GPU-written image's download that will write guest memory overlapping
@@ -201,7 +209,17 @@ private:
 	// Resolution epoch of the last (un)registration per image page.
 	using ImageEpochTable = MultiLevelPageTable<uint64_t, 20, 40, 10>;
 
-	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
+	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, bool may_fail = false);
+	// Room for an image that must exist, which the GPU could not make (InsertImage): the images freed. Caller holds m_lock.
+	size_t                    ReclaimImageMemory(uint64_t bytes, bool all);
+	// Images the GPU could not make (InsertImage's `may_fail`): their memory is not asked for again for FailedRetryTicks
+	// collector runs, and meanwhile the collector takes images unused for a shorter time (RunGarbageCollector).
+	struct FailedImage {
+		uint64_t address = 0, size = 0, tick = 0;
+	};
+	std::vector<FailedImage>  m_failed_images;
+	uint64_t                  m_failed_tick = 0; // (+1: 0 is none)
+	[[nodiscard]] bool        RecentlyFailed(const ImageInfo& info) const;
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
@@ -256,6 +274,7 @@ private:
 	// A whole upload of a large image a piece of guest memory at a time; false: not such an image (ObtainBufferForImage's).
 	// `only`: the subresources over those [begin, end) ranges alone, of an image of any size.
 	[[nodiscard]] bool UploadImageChunked(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>* only = nullptr);
+	[[nodiscard]] bool UploadImageSubresources(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 	// The dirty layers in [first_layer, last_layer) only.
 	[[nodiscard]] bool UploadDepthPartial(Image& image, uint32_t first_layer = 0,
 	                                      uint32_t last_layer = UINT32_MAX);
@@ -383,6 +402,9 @@ private:
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_logged_video_memory = 0; // RunGarbageCollector's log line
 	uint64_t                                          m_logged_shared_memory = 0;
+	uint64_t                                          m_logged_working_set   = 0; // (and its line on the PC's memory)
+	uint64_t                                          m_logged_private       = 0;
+	bool                                              m_logged_short_of_ram  = false;
 	uint64_t         m_gc_tick                = 0;
 	std::atomic<uint64_t> m_frame {0};
 	struct PendingDownload {

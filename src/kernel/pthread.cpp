@@ -92,6 +92,9 @@ constexpr size_t   PTHREAD_STACK_INITIAL   = 0x200000;
 constexpr size_t   PTHREAD_STACK_EXTRA     = 0x100000;
 constexpr uint64_t PTHREAD_STACK_TOP       = 0x7efff8000ull;
 constexpr uint64_t PTHREAD_STACK_BOTTOM    = 0x0000040000ull;
+// (The TEB's stack range on guest stacks, KYTY_GUEST_TEB_STACK_RANGE_ASM, which spells the numbers out.)
+static_assert(PTHREAD_STACK_TOP == Common::HostException::GuestStacksHigh &&
+              PTHREAD_STACK_BOTTOM == Common::HostException::GuestStacksLow);
 constexpr uint32_t SIGNAL_APC_POLL_MICROS  = 10000;
 
 static constexpr KernelClockid KERNEL_CLOCK_REALTIME          = 0;
@@ -1137,9 +1140,7 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "movq %%gs:0x08, %%r14\n\t"
 	             "movq %%gs:0x10, %%r15\n\t"
-	             "xorq %%rcx, %%rcx\n\t"
-	             "movq %%rcx, %%gs:0x08\n\t"
-	             "movq %%rcx, %%gs:0x10\n\t"
+	             KYTY_GUEST_TEB_STACK_RANGE_ASM("10")
 #endif
 	             "movq %%rsp, %%r12\n\t"
 	             "movq %%rbp, %%r13\n\t"

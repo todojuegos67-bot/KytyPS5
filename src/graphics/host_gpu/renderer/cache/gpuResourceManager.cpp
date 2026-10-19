@@ -420,6 +420,8 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 		spec->bda.insert(spec->bda.end(), ranges.begin(), ranges.end());
 		return true;
 	}
+	// (Before the lock: making buffers asks for it.)
+	m_buffer_cache.EnsureBdaReadable(ranges);
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	RefreshBdaRanges();
 	LiveCounters::Add(LiveCounters::BdaRangeCalls);

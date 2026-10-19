@@ -8,9 +8,6 @@
 #include "sync-stats.h"
 
 #include <algorithm>
-#include <atomic>
-#include <cstdio>
-#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -18,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 // KYTY_COMPUTE_CHAIN=0: no chains (10-14, the 8 GB laptop's GPU hangs at 2-2, a TDR in ~half of the 10-minute tours
 // with chains: none in 8 tours without them, at ~25% less fps there). Fencing only the culling, list-building or atomic
@@ -47,6 +45,58 @@ bool ComputeChains() {
 	}();
 	(void)reported;
 	return IsSupportedGame() && kyty_local_compute_chain_mode.load(std::memory_order_relaxed) != 0;
+}
+
+bool ComputeChains(uint64_t shader_hash) {
+	if (!ComputeChains()) return false;
+	static const std::vector<uint64_t> only = [] {
+		std::vector<uint64_t> list;
+		for (const char* at = std::getenv("KYTY_CHAIN_ONLY"); at != nullptr && *at != '\0';) {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(at, &end, 16);
+			if (end == at) break;
+			list.push_back(hash);
+			if (*end != ',' && *end != ';') break;
+			at = end + 1;
+		}
+		if (!list.empty()) std::printf("Compute chains: only %zu programs (KYTY_CHAIN_ONLY)\n", list.size());
+		return list;
+	}();
+	// KYTY_CHAIN_FENCE=<hash>[;<hash>...] and KYTY_CHAIN_FENCE_RANGE=<lo>-<hi> (hex): those programs' dispatches get
+	// barriers, every other one chains (bisections for a chain hang). None by default: 10-18, an RTX 3080 Laptop (NVIDIA
+	// 566.07) at the world tour's 1-1 arena save, the GPU hung (TDR) with chains in 3 of 8 runs of its first 15 route points
+	// and 3 of 4 full routes; fencing the program that continues chains most (fe938d3a2d22b5c2) made it rarer (1 hang in 10
+	// short runs, 0 in 4 full routes) but did not stop it, fencing the next two (abf2e4efdcec565c;c8334ecdfb41296f) not even
+	// that (2 of 5), and the fence of fe93 cost 12% of the frame rate on an RTX 5090 (114.6 -> ~100 fps): the user's call
+	// 10-18 was no fence by default. KYTY_COMPUTE_CHAIN=0 stops it there (3 of 3 full routes, at ~35% less fps).
+	struct Fence {
+		std::vector<uint64_t> list;
+		uint64_t              lo = 1, hi = 0; // (empty range)
+	};
+	static const Fence fence = [] {
+		Fence parsed;
+		for (const char* at = std::getenv("KYTY_CHAIN_FENCE"); at != nullptr && *at != '\0';) {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(at, &end, 16);
+			if (end == at) break;
+			parsed.list.push_back(hash);
+			if (*end != ',' && *end != ';') break;
+			at = end + 1;
+		}
+		if (const char* range = std::getenv("KYTY_CHAIN_FENCE_RANGE"); range != nullptr && *range != '\0') {
+			char* end = nullptr;
+			parsed.lo = std::strtoull(range, &end, 16);
+			parsed.hi = end != nullptr && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : parsed.lo;
+		}
+		if (!parsed.list.empty() || parsed.lo <= parsed.hi)
+			std::printf("Compute chains: %zu programs fenced, range %016llx-%016llx (KYTY_CHAIN_FENCE)\n", parsed.list.size(),
+			            static_cast<unsigned long long>(parsed.lo), static_cast<unsigned long long>(parsed.hi));
+		return parsed;
+	}();
+	if ((shader_hash >= fence.lo && shader_hash <= fence.hi) ||
+	    std::find(fence.list.begin(), fence.list.end(), shader_hash) != fence.list.end())
+		return false;
+	return only.empty() || std::find(only.begin(), only.end(), shader_hash) != only.end();
 }
 
 // The engine's cs_memset32 shader (coredata/enginesupport/shaders/_ps5/cs_memset32) as the builds seen have it:

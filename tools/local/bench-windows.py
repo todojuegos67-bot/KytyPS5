@@ -25,7 +25,10 @@ SAVES = ROOT / '_SaveData'
 BASELINE = Path(os.environ.get('KYTY_BENCH_BASELINE') or ROOT / '_Build/walk-fps-20260914/save-baseline')
 STATE = ROOT / '_Build/windows-bench'
 LIVE_FILE = STATE / 'live-commands.txt'
-ENTRIES = ('PPSA01341', '.kyty-capacity')
+# The save and the emulator's bookkeeping for it: the slots' capacity, texts (.kyty-param) and backups (.kyty-backup,
+# libs/saveDataBackup.h): a run's backups of the bench save must not stay among the user's, where a broken save
+# would get the bench save back.
+ENTRIES = ('PPSA01341', '.kyty-capacity', '.kyty-param', '.kyty-backup')
 
 
 def digest(root):

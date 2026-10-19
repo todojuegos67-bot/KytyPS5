@@ -50,10 +50,11 @@ static bool IsHole(uint32_t header) {
 		case Pm4::IT_RELEASE_MEM:
 		case Pm4::IT_WAIT_REG_MEM:
 		case Pm4::IT_WAIT_REG_MEM_64: return true;
-		// (A wait for a display buffer's flip: the commit waits there before the rendering after it.)
+		// (A wait for a display buffer's flip: the commit waits there before the rendering after it. A super resolution
+		// dispatch runs its upscaler there.)
 		case Pm4::IT_NOP:
 			return KYTY_PM4_R(header) == Pm4::R_RELEASE_MEM || KYTY_PM4_R(header) == Pm4::R_WAIT_FLIP_DONE ||
-			       KYTY_PM4_R(header) == Pm4::R_FLIP;
+			       KYTY_PM4_R(header) == Pm4::R_FLIP || KYTY_PM4_R(header) == Pm4::R_SUPER_RESOLUTION;
 		case Pm4::IT_GET_LOD_STATS: return true;
 		default: return false;
 	}

@@ -144,6 +144,8 @@ public:
 	                    uint32_t mode, uint64_t indirect_args = 0);
 	void DispatchIndirect(uint32_t data_offset, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
+	// An R_SUPER_RESOLUTION packet (graphics/guest_gpu/superResolution.h): the upscaler in place of Sony's.
+	void SuperResolution(const uint32_t* packet, uint32_t dwords);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
 	void SetUserDataMarker(HW::UserSgprType type) { m_user_data_marker = type; }

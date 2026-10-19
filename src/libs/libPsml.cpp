@@ -1,9 +1,16 @@
+#include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/superResolution.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
 #include <atomic>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
 
 namespace Libs {
 
@@ -13,12 +20,22 @@ LIB_VERSION("Psml", 1, "Psml", 1, 1);
 
 namespace Psml {
 
+// Sony's PS5 Pro super resolution (PSSR, "Mfsr"). Demon's Souls 01.007.000 calls it from SuperResolution.cpp
+// (made only where sceKernelIsTrinityMode says PS5 Pro; loader/demonsSoulsSuperResolution.h makes it here):
+// InitSystem = initialize, main memory requirements, shared resources; InitContext(3840, 2160) = context memory
+// requirements, create context; Apply each frame in place of the TAA = the game's wrapper asks the dispatch size,
+// reserves that many dwords in its draw command buffer and calls dispatch with {cursor, dwords}. The objects the game
+// keeps are 64-bit handles; here pointers to Object.
+
+namespace Pm4 = Graphics::Pm4; // (KYTY_PM4)
+
 constexpr int Error(uint32_t value) {
 	return static_cast<int>(value);
 }
 
 constexpr int PSML_ERROR_NOT_INITIALIZED = Error(0x8a810001u);
 constexpr int PSML_ERROR_INVALID_OBJECT  = Error(0x8a810005u);
+constexpr int PSML_ERROR_OUT_OF_SPACE    = Error(0x8a810006u); // (the game's wrapper's own, for too few dwords)
 constexpr int PSML_ERROR_INVALID_POINTER = Error(0x8a810009u);
 constexpr int PSML_ERROR_INVALID_VALUE   = Error(0x8a81000du);
 constexpr int PSML_ERROR_NULL_OBJECT     = Error(0x8a810014u);
@@ -54,12 +71,42 @@ struct SharedResourcesInitParameters {
 	uint64_t                 virtual_address_start;
 };
 
+// The game's (InitContext): +0x08 blocks, +0x10 block count, +0x18/+0x1a the output width and height (16 bits),
+// +0x20 and +0x28 a {4, width, height} triple, +0x38 the shared resources.
+struct ContextInitParameters {
+	uint32_t                 type;
+	uint32_t                 reserved;
+	const DirectMemoryBlock* blocks;
+	uint64_t                 block_count;
+	uint16_t                 width;
+	uint16_t                 height;
+	uint32_t                 reserved2;
+	const uint32_t*          size_a;
+	const uint32_t*          size_b;
+	uint64_t                 reserved3;
+	uint64_t                 shared_resources;
+};
+static_assert(offsetof(ContextInitParameters, width) == 0x18 && offsetof(ContextInitParameters, shared_resources) == 0x38);
+
+// What the dispatch writes into: the game's reservation in its draw command buffer.
+struct CommandSpan {
+	uint32_t* commands;
+	uint32_t  dwords;
+};
+
+struct Object {
+	uint32_t magic  = 0;
+	uint32_t number = 0;
+	uint32_t width = 0, height = 0; // a context's output
+};
+
 static_assert(sizeof(MainMemoryRequirements) == 24);
 static_assert(sizeof(DirectMemoryBlock) == 16);
 
-static bool                 g_initialized      = false;
-static uint32_t             g_supported_modes  = 0x3;
-static std::atomic<int32_t> g_shared_ref_count = 0;
+static bool                  g_initialized      = false;
+static uint32_t              g_supported_modes  = 0x3;
+static std::atomic<int32_t>  g_shared_ref_count = 0;
+static std::atomic<uint32_t> g_contexts         = 0;
 
 static uint64_t BaseVaBytes(uint32_t type) {
 	// The native implementation indexes this table before adding one 6 MiB range.
@@ -92,22 +139,13 @@ static int CheckInitialized() {
 	return (g_initialized ? OK : PSML_ERROR_NOT_INITIALIZED);
 }
 
-static void MarkSharedResources(void* resources, const SharedResourcesInitParameters& params) {
-	auto* bytes = static_cast<uint8_t*>(resources);
-
-	*reinterpret_cast<uint32_t*>(bytes)                        = SHARED_RESOURCES_MAGIC;
-	*reinterpret_cast<const DirectMemoryBlock**>(bytes + 0x08) = params.blocks;
-	*reinterpret_cast<uint64_t*>(bytes + 0x18)                 = params.block_count;
-	*reinterpret_cast<uint32_t*>(bytes + 0x20)                 = params.type;
-	*reinterpret_cast<uint64_t*>(bytes + 0x28)                 = params.virtual_address_start;
+static const Object* AsObject(uint64_t handle, uint32_t magic) {
+	const auto* object = reinterpret_cast<const Object*>(handle);
+	return object != nullptr && object->magic == magic ? object : nullptr;
 }
 
-static bool HasKnownObjectMagic(const void* object) {
-	if (object == nullptr) {
-		return false;
-	}
-	const auto magic = *static_cast<const uint32_t*>(object);
-	return magic == SHARED_RESOURCES_MAGIC || magic == CONTEXT_MAGIC;
+static bool IsObject(uint64_t handle) {
+	return AsObject(handle, SHARED_RESOURCES_MAGIC) != nullptr || AsObject(handle, CONTEXT_MAGIC) != nullptr;
 }
 
 static int KYTY_SYSV_ABI PsmlInitialize() {
@@ -142,15 +180,14 @@ static int KYTY_SYSV_ABI PsmlGetMainMemoryRequirements(MainMemoryRequirements*  
 	return OK;
 }
 
-static int KYTY_SYSV_ABI
-PsmlSharedResourcesInitialize(void* resources, const SharedResourcesInitParameters* params) {
+static int KYTY_SYSV_ABI PsmlCreateSharedResources(uint64_t* out, const SharedResourcesInitParameters* params) {
 	PRINT_NAME();
 
 	const auto init_error = CheckInitialized();
 	if (init_error != OK) {
 		return init_error;
 	}
-	if (resources == nullptr || params == nullptr || params->blocks == nullptr) {
+	if (out == nullptr || params == nullptr || params->blocks == nullptr) {
 		return PSML_ERROR_INVALID_POINTER;
 	}
 	if (params->reserved != 0 || !IsSupportedType(params->type) ||
@@ -158,21 +195,26 @@ PsmlSharedResourcesInitialize(void* resources, const SharedResourcesInitParamete
 		return PSML_ERROR_INVALID_VALUE;
 	}
 
-	MarkSharedResources(resources, *params);
+	auto* object  = new Object;
+	object->magic = SHARED_RESOURCES_MAGIC;
+	*out          = reinterpret_cast<uint64_t>(object);
 	g_shared_ref_count.fetch_add(1, std::memory_order_relaxed);
 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlSharedResourcesFinalize(void* resources) {
+static int KYTY_SYSV_ABI PsmlDestroySharedResources(uint64_t handle) {
 	PRINT_NAME();
 
 	const auto init_error = CheckInitialized();
 	if (init_error != OK) {
 		return init_error;
 	}
-	if (resources == nullptr) {
+	if (handle == 0) {
 		return PSML_ERROR_NULL_OBJECT;
+	}
+	if (AsObject(handle, SHARED_RESOURCES_MAGIC) == nullptr) {
+		return PSML_ERROR_INVALID_OBJECT;
 	}
 
 	g_shared_ref_count.fetch_sub(1, std::memory_order_relaxed);
@@ -180,8 +222,7 @@ static int KYTY_SYSV_ABI PsmlSharedResourcesFinalize(void* resources) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlGetContextMemoryRequirements(MainMemoryRequirements* out,
-                                                          uint64_t /*params*/) {
+static int KYTY_SYSV_ABI PsmlGetContextMemoryRequirements(MainMemoryRequirements* out, const void* /*params*/) {
 	PRINT_NAME();
 
 	const auto init_error = CheckInitialized();
@@ -199,125 +240,152 @@ static int KYTY_SYSV_ABI PsmlGetContextMemoryRequirements(MainMemoryRequirements
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlContextInitialize(void* context, const void* params) {
+static int KYTY_SYSV_ABI PsmlCreateContext(uint64_t* out, const ContextInitParameters* params) {
 	PRINT_NAME();
 
 	const auto init_error = CheckInitialized();
 	if (init_error != OK) {
 		return init_error;
 	}
-	if (context == nullptr || params == nullptr) {
+	if (out == nullptr || params == nullptr) {
 		return PSML_ERROR_INVALID_POINTER;
 	}
-
-	auto* bytes            = static_cast<uint8_t*>(context);
-	auto* params_bytes     = static_cast<const uint8_t*>(params);
-	auto* shared_resources = *reinterpret_cast<void* const*>(params_bytes + 0x08);
-	if (shared_resources == nullptr) {
-		return PSML_ERROR_INVALID_POINTER;
-	}
-
-	*reinterpret_cast<uint32_t*>(bytes)        = CONTEXT_MAGIC;
-	*reinterpret_cast<void**>(bytes + 0x360)   = shared_resources;
-	*reinterpret_cast<uint8_t*>(bytes + 0x368) = 0;
-
-	return OK;
-}
-
-static int KYTY_SYSV_ABI PsmlContextFinalize(void* context) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
-	}
-	if (!HasKnownObjectMagic(context)) {
+	if (AsObject(params->shared_resources, SHARED_RESOURCES_MAGIC) == nullptr) {
 		return PSML_ERROR_INVALID_OBJECT;
 	}
 
-	*static_cast<uint32_t*>(context) = 0;
+	auto* object   = new Object;
+	object->magic  = CONTEXT_MAGIC;
+	object->number = g_contexts.fetch_add(1, std::memory_order_relaxed);
+	object->width  = params->width;
+	object->height = params->height;
+	*out           = reinterpret_cast<uint64_t>(object);
+	std::printf("Super resolution: context %u for a %ux%u output\n", object->number, object->width, object->height);
+	std::fflush(stdout);
 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlGetWorkAreaSize(const void* object, uint32_t* out_size) {
+static int KYTY_SYSV_ABI PsmlDestroyContext(uint64_t handle) {
 	PRINT_NAME();
 
 	const auto init_error = CheckInitialized();
 	if (init_error != OK) {
 		return init_error;
 	}
-	if (!HasKnownObjectMagic(object)) {
-		return PSML_ERROR_INVALID_OBJECT;
-	}
-	if (out_size == nullptr) {
-		return PSML_ERROR_INVALID_POINTER;
-	}
-
-	*out_size = 0x600;
-
-	return OK;
-}
-
-static int KYTY_SYSV_ABI PsmlDispatch(void* context, uint64_t command, uint64_t params) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
-	}
-	if (!HasKnownObjectMagic(context)) {
-		return PSML_ERROR_INVALID_OBJECT;
-	}
-	if (command == 0 || params == 0) {
-		return PSML_ERROR_INVALID_POINTER;
-	}
-
-	return OK;
-}
-
-static int KYTY_SYSV_ABI PsmlGetProgress(const void* object, float* out_progress,
-                                         uint32_t /*frame_index*/) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
-	}
-	if (!HasKnownObjectMagic(object)) {
-		return PSML_ERROR_INVALID_OBJECT;
-	}
-	if (out_progress == nullptr) {
-		return PSML_ERROR_INVALID_POINTER;
-	}
-
-	*out_progress = 0.0f;
-
-	return OK;
-}
-
-static int KYTY_SYSV_ABI PsmlRequestCapture(const void* object) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
-	}
-	if (!HasKnownObjectMagic(object)) {
+	if (AsObject(handle, CONTEXT_MAGIC) == nullptr) {
 		return PSML_ERROR_INVALID_OBJECT;
 	}
 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlValidateObject(const void* object) {
+// The dwords a dispatch writes: one R_SUPER_RESOLUTION packet.
+static int KYTY_SYSV_ABI PsmlGetDispatchSize(uint64_t handle, uint32_t* out_dwords) {
+	const auto init_error = CheckInitialized();
+	if (init_error != OK) {
+		return init_error;
+	}
+	if (AsObject(handle, CONTEXT_MAGIC) == nullptr) {
+		return PSML_ERROR_INVALID_OBJECT;
+	}
+	if (out_dwords == nullptr) {
+		return PSML_ERROR_INVALID_POINTER;
+	}
+
+	*out_dwords = Graphics::SuperResolution::PacketDwords;
+
+	return OK;
+}
+
+// The game's parameter block (SuperResolution::Apply) copied into the packet, with the T#s its first fields point to.
+static int KYTY_SYSV_ABI PsmlDispatch(uint64_t handle, const CommandSpan* span, const uint8_t* params) {
+	const auto init_error = CheckInitialized();
+	if (init_error != OK) {
+		return init_error;
+	}
+	const auto* context = AsObject(handle, CONTEXT_MAGIC);
+	if (context == nullptr) {
+		return PSML_ERROR_INVALID_OBJECT;
+	}
+	if (span == nullptr || span->commands == nullptr || params == nullptr) {
+		return PSML_ERROR_INVALID_POINTER;
+	}
+	if (span->dwords < Graphics::SuperResolution::PacketDwords) {
+		return PSML_ERROR_OUT_OF_SPACE;
+	}
+
+	Graphics::SuperResolution::Packet packet {};
+	packet.context       = context->number;
+	packet.output_width  = context->width;
+	packet.output_height = context->height;
+	std::memcpy(packet.parameters, params, sizeof(packet.parameters));
+	for (uint32_t slot = 0; slot < Graphics::SuperResolution::TextureSlots; slot++) {
+		const uint32_t* descriptor = nullptr;
+		std::memcpy(&descriptor, params + slot * sizeof(uint64_t), sizeof(descriptor));
+		if (descriptor == nullptr) continue;
+		std::memcpy(packet.textures[slot], descriptor, sizeof(packet.textures[slot]));
+		packet.textures_given |= 1u << slot;
+	}
+	auto* commands = span->commands;
+	// (The game's reservation is exactly the dispatch size.)
+	commands[0] = KYTY_PM4(Graphics::SuperResolution::PacketDwords, Graphics::Pm4::IT_NOP, Graphics::Pm4::R_SUPER_RESOLUTION);
+	std::memcpy(commands + 1, &packet, sizeof(packet));
+	const auto rest = span->dwords - Graphics::SuperResolution::PacketDwords;
+	if (rest == 1) {
+		commands[Graphics::SuperResolution::PacketDwords] = 0x80000000u; // (a type-2 filler)
+	} else if (rest >= 2) {
+		commands[Graphics::SuperResolution::PacketDwords] = KYTY_PM4(rest, Graphics::Pm4::IT_NOP, Graphics::Pm4::R_ZERO);
+	}
+
+	return OK;
+}
+
+// The game's texture LOD bias for the input size `width` x `height`: it adds 0.5 and keeps it at most 0, so this
+// gives it the size's ratio to the output in powers of two (DLSS' advice: -0.49 at 1440 for 2160).
+static int KYTY_SYSV_ABI PsmlGetMipBias(uint64_t handle, float* out_bias, uint32_t width, uint32_t height) {
+	const auto init_error = CheckInitialized();
+	if (init_error != OK) {
+		return init_error;
+	}
+	const auto* context = AsObject(handle, CONTEXT_MAGIC);
+	if (context == nullptr) {
+		return PSML_ERROR_INVALID_OBJECT;
+	}
+	if (out_bias == nullptr) {
+		return PSML_ERROR_INVALID_POINTER;
+	}
+
+	(void)width;
+	*out_bias = height != 0 && context->height != 0
+	                ? static_cast<float>(std::log2(static_cast<double>(height) / static_cast<double>(context->height)) - 0.5)
+	                : 0.0f;
+
+	return OK;
+}
+
+static int KYTY_SYSV_ABI PsmlRequestCapture(uint64_t handle) {
 	PRINT_NAME();
 
 	const auto init_error = CheckInitialized();
 	if (init_error != OK) {
 		return init_error;
 	}
-	if (!HasKnownObjectMagic(object)) {
+	if (!IsObject(handle)) {
+		return PSML_ERROR_INVALID_OBJECT;
+	}
+
+	return OK;
+}
+
+static int KYTY_SYSV_ABI PsmlValidateObject(uint64_t handle) {
+	PRINT_NAME();
+
+	const auto init_error = CheckInitialized();
+	if (init_error != OK) {
+		return init_error;
+	}
+	if (!IsObject(handle)) {
 		return PSML_ERROR_INVALID_OBJECT;
 	}
 
@@ -329,20 +397,18 @@ static int KYTY_SYSV_ABI PsmlValidateObject(const void* object) {
 LIB_DEFINE(InitPsml_1) {
 	LIB_FUNC("3WVD91e12ZQ", Psml::PsmlInitialize);
 	LIB_FUNC("+2KpvixvL6E", Psml::PsmlGetMainMemoryRequirements);
-	LIB_FUNC("eWoKNeB6V-k", Psml::PsmlSharedResourcesInitialize);
-	LIB_FUNC("jEevBXmagOQ", Psml::PsmlSharedResourcesFinalize);
+	LIB_FUNC("eWoKNeB6V-k", Psml::PsmlCreateSharedResources);
+	LIB_FUNC("jEevBXmagOQ", Psml::PsmlDestroySharedResources);
+	LIB_FUNC("VGjrQa-WqdU", Psml::PsmlGetContextMemoryRequirements);
 	LIB_FUNC("EO9YQXmJEN8", Psml::PsmlGetContextMemoryRequirements);
 	LIB_FUNC("IMlj247LdTo", Psml::PsmlGetContextMemoryRequirements);
 	LIB_FUNC("sjTyYheKTrU", Psml::PsmlGetContextMemoryRequirements);
 	LIB_FUNC("ArakEpzsZo0", Psml::PsmlGetContextMemoryRequirements);
-	LIB_FUNC("VGjrQa-WqdU", Psml::PsmlGetContextMemoryRequirements);
-	LIB_FUNC("2ecEbQaf9VU", Psml::PsmlContextInitialize);
-	LIB_FUNC("vUk2pWMx3KQ", Psml::PsmlContextInitialize);
-	LIB_FUNC("gxv3i+MTEzU", Psml::PsmlContextInitialize);
-	LIB_FUNC("JaLBe0P3jSU", Psml::PsmlContextFinalize);
-	LIB_FUNC("AHalTX9wFZY", Psml::PsmlGetWorkAreaSize);
-	LIB_FUNC("RUNLFro+qok", Psml::PsmlDispatch);
-	LIB_FUNC("GHna9-DvnUk", Psml::PsmlGetProgress);
+	LIB_FUNC("fccGInHrj8A", Psml::PsmlCreateContext);
+	LIB_FUNC("JaLBe0P3jSU", Psml::PsmlDestroyContext);
+	LIB_FUNC("AHalTX9wFZY", Psml::PsmlGetDispatchSize);
+	LIB_FUNC("94iBp3KvIuI", Psml::PsmlDispatch);
+	LIB_FUNC("GHna9-DvnUk", Psml::PsmlGetMipBias);
 	LIB_FUNC("GJY0MvuTcs8", Psml::PsmlRequestCapture);
 	LIB_FUNC("LXq+6mIxpCw", Psml::PsmlValidateObject);
 	LIB_FUNC("FSGaTQze0UY", Psml::PsmlValidateObject);

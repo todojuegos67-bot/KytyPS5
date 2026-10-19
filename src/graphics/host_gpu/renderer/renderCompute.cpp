@@ -296,6 +296,79 @@ static void StallDump(uint64_t reached) {
 }
 } // namespace DispatchTiming
 
+namespace {
+// KYTY_PROG_TRACE=<hash,...> (diagnostic, issue #52): for these programs' normal-path dispatches, a line per dispatch
+// with each buffer binding (guest range, written, whether its bytes were CPU-dirty before it was resolved, bound from
+// the shader upload ring or a game buffer) and each image binding (range, format, size, image serial, GPU-written).
+// "indirect" in the list adds every indirect dispatch (who reads the arguments a traced program wrote). At most 50 lines a
+// program, 20000 in all: the programs asked for are not crowded out by others. Out of DispatchDirect, which calls it
+// without a condition: a branch there changes that function's control flow, and the compiler then drops its PGO profile
+// (10-18: ~3 ms a frame more render-thread time at 1-1 on the laptop).
+class ProgTrace {
+public:
+	ProgTrace(uint64_t shader_hash, uint64_t indirect_args, const PreparedBindings& bindings, BufferCache& cache) {
+		if (!Programs().empty()) Begin(shader_hash, indirect_args, bindings, cache);
+	}
+	void Print(const PreparedBindings& bindings, RenderContext& context, const Common::SlotVector<Image>& images,
+	           uint32_t groups_x, uint32_t groups_y, uint32_t groups_z, uint64_t indirect_args) const {
+		if (m_on) PrintLine(bindings, context, images, groups_x, groups_y, groups_z, indirect_args);
+	}
+
+private:
+	static const std::string& Programs() {
+		static const std::string programs = [] {
+			const char* value = std::getenv("KYTY_PROG_TRACE");
+			return value != nullptr ? std::string(value) : std::string();
+		}();
+		return programs;
+	}
+	[[gnu::noinline]] void Begin(uint64_t shader_hash, uint64_t indirect_args, const PreparedBindings& bindings,
+	                             BufferCache& cache) {
+		m_on = Programs().find(fmt::format("{:016x}", shader_hash)) != std::string::npos ||
+		       (indirect_args != 0 && Programs().find("indirect") != std::string::npos);
+		if (!m_on) return;
+		m_shader_hash = shader_hash;
+		for (const auto& source: bindings.buffer_sources)
+			m_dirty_before.push_back(source.size != 0 && cache.IsRegionCpuModified(source.address, source.size));
+	}
+	[[gnu::noinline]] void PrintLine(const PreparedBindings& bindings, RenderContext& context,
+	                                 const Common::SlotVector<Image>& images, uint32_t groups_x, uint32_t groups_y,
+	                                 uint32_t groups_z, uint64_t indirect_args) const {
+		static std::mutex                             lines_mutex;
+		static std::unordered_map<uint64_t, uint32_t> per_program;
+		static uint32_t                               lines = 0;
+		{
+			std::lock_guard lock(lines_mutex);
+			if (lines >= 20000 || per_program[m_shader_hash]++ >= 50) return;
+			++lines;
+		}
+		const auto& program = *bindings.runtime->program;
+		std::string text    = fmt::format("PROG-TRACE cs={:016x} tick={} groups={},{},{} indirect=0x{:x}", m_shader_hash,
+		                                  context.GetCommandScheduler().CurrentTick(), groups_x, groups_y, groups_z,
+		                                  indirect_args);
+		const auto ring = context.GetBufferCache().GetShaderUploadBuffer().Handle();
+		for (size_t i = 0; i < bindings.buffer_sources.size() && i < bindings.buffers.size(); ++i) {
+			const auto& source = bindings.buffer_sources[i];
+			text += fmt::format(" b{}=0x{:x}+0x{:x}{}{}{}", i, source.address, source.size,
+			                    i < program.info.buffers.size() && program.info.buffers[i].written ? "w" : "",
+			                    m_dirty_before[i] ? ":dirty" : ":clean", bindings.buffers[i].buffer == ring ? ":ring" : ":buf");
+		}
+		for (size_t i = 0; i < bindings.images.size(); ++i) {
+			const auto* image = images.try_get(bindings.images[i].image_id);
+			if (image == nullptr) continue;
+			text += fmt::format(" i{}=0x{:x}+0x{:x}:{}:{}x{}:s{}{}", i, image->info.data.address, image->info.data.size,
+			                    static_cast<uint32_t>(image->info.guest_format), image->info.extent.width,
+			                    image->info.extent.height, image->serial, image->IsGpuModified() ? ":gpu" : "");
+		}
+		std::printf("%s\n", text.c_str());
+	}
+
+	bool              m_on          = false;
+	uint64_t          m_shader_hash = 0;
+	std::vector<bool> m_dirty_before;
+};
+} // namespace
+
 static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 	const uint64_t records = descriptor.NumRecords();
 	const uint64_t stride  = descriptor.Stride();
@@ -968,10 +1041,27 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (indirect_args != 0) {
 		m_context.GetBufferCache().EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
 	}
+	auto&    buffer_cache = m_context.GetBufferCache();
+	uint64_t unregistered = buffer_cache.UnregisterEpoch();
+	// (KYTY_PROG_TRACE: ProgTrace, called here without a condition.)
+	const ProgTrace prog_trace(program.shader_hash, indirect_args, bindings, buffer_cache);
 	RebindBuffers(bindings);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 7);
 	RebindImages(bindings);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 8);
+	prog_trace.Print(bindings, m_context, m_context.GetTextureCache().m_slot_images, thread_group_x, thread_group_y,
+	                 thread_group_z, indirect_args);
+	// (A buffer resolved above joined into a new one since - by a later buffer's lookup or an image's refresh - no longer
+	// owns its bytes, and the dispatch's writes there would be lost: as PrepareGraphicsBindingsInto.)
+	for (uint32_t attempt = 0; attempt < 4 && buffer_cache.UnregisterEpoch() != unregistered; ++attempt) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+			std::printf("Bindings: a buffer was unregistered while a dispatch's bindings were made (CS 0x%016llx), resolved "
+			            "again\n",
+			            static_cast<unsigned long long>(program.shader_hash));
+		unregistered = buffer_cache.UnregisterEpoch();
+		RebindBuffers(bindings);
+	}
 	if (FrameGen::IsTaaShader(program.shader_hash)) FrameGen::NoteScene(); // (the game's 3D view)
 	FrameGen::NoteShader(program.shader_hash, 'c');
 	if (FrameGen::Capturing() && FrameGen::IsTaaShader(program.shader_hash) &&
@@ -1052,7 +1142,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		indirect_offset = owner.Offset(indirect_args);
 	}
 
-	const bool        chain            = DemonsSouls::ComputeChains();
+	const bool        chain            = DemonsSouls::ComputeChains(program.shader_hash);
 	auto              vk_buffer        = chain ? buffer.ChainHandle() : buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,

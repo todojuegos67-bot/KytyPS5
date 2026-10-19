@@ -31,7 +31,10 @@ int main() {
 	std::ofstream(meta, std::ios::trunc) << "invalid";
 	value = ReadSaveDataCapacity(data, meta);
 	Check(value && value->blocks == 100 && value->free_blocks == 0);
-	{ std::ofstream zeros(meta, std::ios::binary | std::ios::trunc); zeros.write("\0\0\0\0", 4); }
+	{
+		std::ofstream zeros(meta, std::ios::binary | std::ios::trunc);
+		zeros.write("\0\0\0\0", 4);
+	}
 	std::filesystem::resize_file(data / "payload", 1);
 	value = ReadSaveDataCapacity(data, meta);
 	Check(value && value->blocks == 48 && value->free_blocks == 47);

@@ -262,10 +262,9 @@ struct TextureCacheTestAccess {
 
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
-                                         uint64_t tick, uint64_t pressure) {
+                                         uint64_t tick, [[maybe_unused]] uint64_t pressure) {
+    // (One collection threshold since 10-01: collecting from no memory use.)
     cache.m_trigger_gc_memory = 0;
-    cache.m_pressure_gc_memory = pressure;
-    cache.m_critical_gc_memory = UINT64_MAX;
     cache.m_gc_tick = tick;
     std::vector<ImageId> live;
     cache.m_lru_cache = {};
@@ -430,7 +429,8 @@ struct RenderExecutorTestAccess {
   static bool TryConsumeComputeMetaClear(RenderExecutor &executor,
                                          const ShaderComputeInputInfo &input,
                                          const CommandBuffer &buffer) {
-    return executor.TryConsumeComputeMetaClear(input, buffer, 0, 0, 0, 0);
+    uint64_t cleared = 0;
+    return executor.TryConsumeComputeMetaClear(input, buffer, 0, 0, 0, 0, cleared);
   }
 
   static TextureBinding
@@ -5646,6 +5646,143 @@ public:
             "a metadata write-only fill was not consumed as a clear");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // TextureCache::HoldLayers (issue #49): layers of one-level arrays on one grid of slices share an image. One over
+  // part of a view's layers grows into one image of both: its layers copied on the GPU (their guest bytes change
+  // behind the cache's back here, so an upload of them would show), the others uploaded; a view inside it is served
+  // from it. A sampled texture past the format's layer limit has no image when it may fail, and is not tried again.
+  void CheckTextureLayerRanges() {
+    constexpr const char *name = "TextureLayerRanges";
+    constexpr uint64_t base = 0x000000020a000000ull, slice = 0x10000, slices = 32, size = slice * slices;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+        0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, 0x10000, 0, &physical) == 0,
+        "guest allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", Libs::LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, 0x10000) == 0 && mapped == reinterpret_cast<void *>(base),
+        "guest mapping failed");
+    const auto fill = [&](uint32_t layer, uint32_t value, bool behind) {
+      std::vector<uint32_t> words(slice / 4, value);
+      if (behind) {
+        Require(name, "backing write", Libs::LibKernel::Memory::TryWriteBacking(
+            base + slice * layer, words.data(), slice), "backing write failed");
+      } else {
+        std::memcpy(reinterpret_cast<void *>(base + slice * layer), words.data(), slice);
+      }
+    };
+    for (uint32_t layer = 0; layer < slices; ++layer) fill(layer, 0x5a000000u + layer, false);
+    auto &context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&context.GetGpu());
+      auto &textures = resources.GetTextureCache();
+      resources.MapMemory(base, size);
+      // 128x128 R32: one 64 KiB block of the 64 KiB tiling a layer, every texel of layer L the same word.
+      const auto layers = [&](uint32_t first, uint32_t count) {
+        TextureCache::ImageDesc desc{};
+        desc.type = TextureCache::BindingType::Texture;
+        desc.info.data = {base + slice * first, slice * count};
+        desc.info.type = Prospero::ImageType::kColor2D;
+        desc.info.pixel_format = vk::Format::eR32Uint;
+        desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+        desc.info.extent = {128, 128, 1};
+        desc.info.resources = {1, count};
+        desc.info.pitch = 128;
+        desc.info.bytes_per_block = 4;
+        desc.info.tile_mode = Prospero::TileMode::kStandard64KB;
+        desc.info.mip_layout[0] = {0, slice * count, 128, 128};
+        desc.view_info.format = desc.info.pixel_format;
+        desc.view_info.type = vk::ImageViewType::e2DArray;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        desc.view_info.layer_count = count;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        return desc;
+      };
+      const auto texel = [&](ImageId id, uint32_t layer) {
+        auto &image = textures.GetImage(id);
+        auto probe = CreateHostBuffer(name, sizeof(u32), vk::BufferUsageFlagBits::eTransferDst, {});
+        scheduler.Current().EndRendering();
+        image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+                      scheduler.Current().Handle());
+        vk::BufferImageCopy copy{};
+        copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, layer, 1};
+        copy.imageExtent = {1, 1, 1};
+        scheduler.Current().Handle().copyImageToBuffer(image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+                                                       probe.buffer, 1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = probe.buffer;
+        barrier.size = probe.size;
+        scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                     vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier,
+                                                     0, nullptr);
+        scheduler.Finish();
+        const auto value = ReadBuffer(name, probe, 1).at(0);
+        DestroyBuffer(&probe);
+        return value;
+      };
+      auto first_view = layers(4, 6);
+      const auto first_id = textures.FindImage(first_view);
+      Require(name, "first view", textures.FindTexture(first_id, first_view) != nullptr,
+              "the view of layers 4..9 was not made");
+      for (uint32_t layer = 4; layer < 10; ++layer) fill(layer, 0x6b000000u + layer, true);
+      for (uint32_t layer = 10; layer < slices; ++layer) fill(layer, 0x6b000000u + layer, false);
+      auto grown = layers(6, 7);
+      uint32_t first = 0;
+      textures.HoldLayers(grown.info, first);
+      Require(name, "union", grown.info.data.address == base + slice * 4 && grown.info.resources.layers == 9 &&
+              first == 2, "layers 6..12 beside the image of 4..9 did not grow into one of 4..12");
+      grown.view_info.base_layer = first;
+      const auto grown_id = textures.FindImage(grown);
+      const auto *replaced = TextureCacheTestAccess::Owner(textures, first_id);
+      Require(name, "union image", textures.FindTexture(grown_id, grown) != nullptr && grown_id != first_id &&
+              textures.GetImage(grown_id).backing.layers == 9 && (replaced == nullptr || !replaced->registered),
+              "the grown image was not the one of 9 layers that replaced the first");
+      for (uint32_t layer = 0; layer < 9; ++layer) {
+        const uint32_t expected = layer < 6 ? 0x5a000000u + 4 + layer : 0x6b000000u + 4 + layer;
+        const uint32_t observed = texel(grown_id, layer);
+        if (observed != expected) {
+          std::printf("[gpu]     %s: layer %u holds 0x%08x, 0x%08x expected\n", name, layer, observed, expected);
+        }
+        Require(name, "union layers", observed == expected,
+                "a layer of the first image was uploaded again, or a new one was not uploaded");
+      }
+      auto inner = layers(5, 3);
+      textures.HoldLayers(inner.info, first);
+      Require(name, "holder", inner.info.data.address == base + slice * 4 && inner.info.resources.layers == 9 &&
+              first == 1, "the image of layers 4..12 did not serve a view of 5..7");
+      const auto max_layers = m_runtime_context.GetPhysicalDeviceProperties().limits.maxImageArrayLayers;
+      TextureCache::ImageDesc huge = layers(0, 1);
+      huge.info.data = {base, uint64_t {64} * (max_layers + 1)};
+      huge.info.extent = {4, 4, 1};
+      huge.info.resources = {1, max_layers + 1};
+      huge.info.pitch = 4;
+      huge.info.tile_mode = Prospero::TileMode::kLinear;
+      huge.info.mip_layout[0] = {0, huge.info.data.size, 4, 4};
+      huge.view_info.layer_count = max_layers + 1;
+      Require(name, "past the layer limit", !textures.FindImage(huge, false, true) &&
+              !textures.FindImage(huge, false, true), "a texture past the GPU's layers had an image");
+      resources.SetGpu(nullptr);
+      resources.UnmapMemory(base, size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, size) == 0, "guest mapping release failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0,
+            "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckDepthSliceGrowth() {
@@ -14519,7 +14656,7 @@ OpFunctionEnd
     scheduler.Begin(registers, user_config, shaders);
     StreamBuffer parameters(m_runtime_context, scheduler, MemoryUsage::Stream,
                             1u << 20);
-    TileManager tile_manager(m_runtime_context, scheduler, parameters);
+    TileManager tile_manager(m_runtime_context, scheduler);
     constexpr uint64_t conversion_limit = 128ull << 20;
     Require(name, "D16 conversion chunk boundaries",
             TileManagerTestAccess::ConversionRows(0, 32ull << 10, 32ull << 10,
@@ -28929,6 +29066,15 @@ void CheckDepthTextureEncoding() {
   std::printf("[host]    %-32s ok\n", "DepthTextureEncoding");
 }
 
+// (The storage-view validation these death tests expect to end the process: since b310b97c the binding reports the view
+// and binds null, StorageTextureReport.)
+void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource &resource, const ShaderTextureResource &descriptor,
+                            uint64_t size) {
+  if (const auto report = StorageTextureReport(resource, descriptor, size); !report.empty()) {
+    EXIT("%s\n", report.c_str());
+  }
+}
+
 ShaderRecompiler::IR::ImageResource BasicStorageTextureResource() {
   ShaderRecompiler::IR::ImageResource resource{};
   resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
@@ -32270,6 +32416,11 @@ int main(int argc, char **argv) {
     vulkan.CheckDepthSliceGrowth();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--texture-layer-ranges-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureLayerRanges();
+    return 0;
+  }
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
   if (argc == 2 && std::strcmp(argv[1], "--draw-run-ranges-only") == 0) {
     VulkanHarness vulkan;
@@ -32544,6 +32695,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckDepthSliceGrowth();
+  vulkan.CheckTextureLayerRanges();
   vulkan.CheckBgra16Readback();
   vulkan.CheckRasterization(false);
   vulkan.CheckRasterization(false, false, 8, true);

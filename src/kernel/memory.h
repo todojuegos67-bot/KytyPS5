@@ -111,6 +111,9 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
 void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
 void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+// With frame generation: the address range held free above the guest since start-up, released right before the
+// Vulkan device is made (ReserveGuestRegions, issue #45). Nothing without it.
+void                   ReleaseFrameGenAddressHole();
 // A write of bytes the GPU does not own (no GPU result is written back there while it lasts), one guest mapping's:
 // it does not wait behind TryWriteBacking's writes of GPU results. False when it cannot (TryWriteBacking can).
 bool                   TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size);

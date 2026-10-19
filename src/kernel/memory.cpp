@@ -242,6 +242,16 @@ static uint32_t g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 
 #include "memoryAddressSpace.inc"
 
+void ReleaseFrameGenAddressHole() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (g_frame_gen_hole != nullptr) {
+		VirtualFree(std::exchange(g_frame_gen_hole, nullptr), 0, MEM_RELEASE);
+		std::printf("Memory: 64 GiB above the guest released for the Vulkan device (KYTY_FG_ADDRESS_HOLE=0: none)\n");
+		std::fflush(stdout);
+	}
+#endif
+}
+
 enum class VirtualRangeType {
 	Reserved,
 	PoolReserved,

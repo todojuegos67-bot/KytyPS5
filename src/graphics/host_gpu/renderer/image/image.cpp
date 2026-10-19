@@ -14,6 +14,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <xxhash.h>
 
 extern "C" {
@@ -838,7 +840,7 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 
 } // namespace ImageOps
 
-Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
+Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info, bool may_fail)
     : serial(g_image_serial_next.fetch_add(1, std::memory_order_relaxed)), info(image_info),
       m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
@@ -873,10 +875,31 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
-	if (!graphics.CreateImage(create, backing)) {
-		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
-		     create.extent.width, create.extent.height, create.extent.depth,
-		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
+	// (More layers, texels or bytes than the format allows is no image at all: the driver may not even refuse it. Images
+	// that must exist try anyway, as before.)
+	const bool within_limits = create.arrayLayers <= properties.maxArrayLayers &&
+	                           create.extent.width <= properties.maxExtent.width &&
+	                           create.extent.height <= properties.maxExtent.height &&
+	                           create.extent.depth <= properties.maxExtent.depth &&
+	                           info.data.size <= properties.maxResourceSize;
+	// KYTY_TEST_IMAGE_FAIL_MB=<n>: those that may fail fail past n MiB (a GPU out of memory: null textures, no exit).
+	static const uint64_t test_fail_above = [] {
+		const char* value = std::getenv("KYTY_TEST_IMAGE_FAIL_MB");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0;
+	}();
+	const bool test_fail = test_fail_above != 0 && info.data.size > test_fail_above;
+	if ((may_fail && (!within_limits || test_fail)) || !graphics.CreateImage(create, backing)) {
+		m_create_failed = true;
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("Image: could not create %ux%ux%u format=%d layers=%u levels=%u (%llu MiB)%s\n",
+			            create.extent.width, create.extent.height, create.extent.depth,
+			            static_cast<int>(create.format), create.arrayLayers, create.mipLevels,
+			            static_cast<unsigned long long>(info.data.size >> 20u),
+			            within_limits ? "" : ": past the format's limits");
+			std::fflush(stdout);
+		}
+		return;
 	}
 }
 

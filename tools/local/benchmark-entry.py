@@ -22,7 +22,9 @@ import time
 from debug_cpu_policy import atomic_json, start_ticks
 
 ROOT = Path(__file__).resolve().parents[2]
-SAVE_SCOPES = (Path('PPSA01341'), Path('.kyty-capacity/PPSA01341'))
+# (With the slots' texts and backups: a test save's backups must not stay among the user's, libs/saveDataBackup.h.)
+SAVE_SCOPES = (Path('PPSA01341'), Path('.kyty-capacity/PPSA01341'), Path('.kyty-param/PPSA01341'),
+               Path('.kyty-backup/PPSA01341'))
 
 
 def restore_save_snapshot(snapshot, save_root):

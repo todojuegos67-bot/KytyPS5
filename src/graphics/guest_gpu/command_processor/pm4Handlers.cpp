@@ -1886,6 +1886,14 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 	return 5;
 }
 
+KYTY_CP_OP_PARSER(CpOpSuperResolution) {
+	KYTY_PROFILER_FUNCTION();
+
+	const auto body = KYTY_PM4_LEN(cmd_id) - 1;
+	cp.SuperResolution(buffer, body);
+	return body;
+}
+
 KYTY_CP_OP_PARSER(CpOpIncrementCeCounter) {
 	KYTY_PROFILER_FUNCTION();
 

@@ -9,8 +9,9 @@
 #include <vector>
 
 // Debug warp for Demon's Souls (PPSA01341): start the character on another map. A warp is armed
-// (F8 with F9/F10 picking the spawn point, or the live command `warp MAP SPAWN`); the next time the
-// game reads its save (Continue on the title screen) it gets a copy whose map and position are those
+// (the live command `warp MAP SPAWN`; Select/ToggleSelected have no keys now: F8 is the overlay, F9 a debug
+// snapshot); the next time the game reads its save (Continue on the title screen) it gets a copy whose map and position
+// are those
 // of the chosen spawn point, a player part of the map's MSB file. The save on disk is not touched:
 // the game writes the new location itself when it next saves, which ends the warp.
 namespace Loader::DemonsSoulsWarp {
@@ -30,6 +31,10 @@ const std::vector<Spawn>& Spawns();
 // format automated tours read); RecordedWaypoints counts them (the window title shows it).
 void     RecordWaypoint();
 uint32_t RecordedWaypoints();
+// The player's position and yaw (01.007.000; false: another build, or no character loaded).
+bool PlayerPlace(float xyz[3], float* yaw);
+// A line in the panel (HudText) for `seconds`.
+void ShowNotice(std::string message, int seconds);
 // Live `glide X Y Z SPEED` (01.007.000, automated tours): the player moved there in a straight line at SPEED m/s by the
 // game's warp request each 16 ms, facing the way it goes; returns the seconds it takes (-1: no player, another build).
 double Glide(float x, float y, float z, float speed);
@@ -44,8 +49,8 @@ void RunQueuedCommand();
 
 bool        Arm(std::string_view map, std::string_view spawn);
 void        Disarm();
-void        Select(int step);    // F9/F10: the spawn point an F8 arms
-void        ToggleSelected();    // F8
+void        Select(int step);    // the spawn point ToggleSelected arms
+void        ToggleSelected();
 std::string HudText();           // the panel text (empty: none)
 
 // USR-DATA with the spawn's map and position (the size and FNV-1a checksum recomputed; a save without

@@ -33,6 +33,8 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	// VK_EXT_memory_priority, enabled only for KYTY_SIMULATE_VRAM_MB (vma.cpp).
 	bool                               memory_priority_enabled               = false;
+	// VK_KHR_pipeline_executable_properties, enabled only for KYTY_PIPELINE_STATS=1 (shaders.cpp: a survey).
+	bool                               pipeline_statistics_enabled           = false;
 	bool                               rt_extensions_enabled                 = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	// A pipeline may require 64-lane subgroups of its pixel shader (KYTY_PS_WAVE64).

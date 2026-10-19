@@ -12,6 +12,7 @@
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 #include "local-platform.h"
+#include "scene-tags.h"
 #include "slow-log.h"
 
 #include <algorithm>
@@ -1298,6 +1299,22 @@ static bool AppendAmmMapRecord(uint64_t                                 command_
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
 
+// Demon's Souls loads a map: its .arealoadlist first (/map/m02_00_00_00/m02_00_00_00.arealoadlist). The map is the
+// scene the pipeline warmup makes the recorded pipelines of (local/scene-tags.h).
+static void NoteSceneRead(const std::string& path) {
+	constexpr std::string_view Suffix = ".arealoadlist";
+	constexpr size_t           Name   = 12; // m02_00_00_00
+	if (path.size() < Suffix.size() + Name || !path.ends_with(Suffix)) return;
+	const auto name = std::string_view(path).substr(path.size() - Suffix.size() - Name, Name);
+	if (name[0] != 'm') return;
+	uint32_t id = 0;
+	for (const char c: name.substr(1)) {
+		if (c >= '0' && c <= '9') id = id << 4u | static_cast<uint32_t>(c - '0');
+		else if (c != '_') return;
+	}
+	SceneTags::Enter(id != 0 ? id : 0x80000000u);
+}
+
 static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_result,
                                    uint32_t* error_offset) {
 	if (execution_result == nullptr || error_offset == nullptr) {
@@ -1376,6 +1393,7 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 					return OK;
 				}
 
+				NoteSceneRead(host_path);
 				uint64_t bytes_read = 0;
 				auto result = ReadHostFileToGuest(host_path, command.file_offset,
 				                                  command.destination, command.size, &bytes_read);

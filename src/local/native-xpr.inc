@@ -341,6 +341,8 @@ struct RenderExecutor::NativeXprRecord {
 	vk::DescriptorSet     set    = nullptr;
 	vk::DescriptorPool    pool   = nullptr;
 	vk::Buffer            upload = nullptr; // ring the dynamic bindings point into
+	// BufferCache::BdaTableGeneration when the sets got the BDA page table: the record goes once the table grew.
+	uint64_t              bda_generation = 0;
 	std::array<Stage, 2>  stages;
 	uint32_t              stage_count = 1;
 	vk::ShaderStageFlags  push_stages;
@@ -1312,6 +1314,7 @@ const char* RenderExecutor::NativeXprBindResources(NativeXprRecord& record,
 		EXIT_IF(value == nullptr);
 		return {value->Handle(), 0, value->Size()};
 	};
+	record.bda_generation = BufferCache::BdaTableGeneration(); // (read before the table: BufferCache::GrowBdaTable)
 	const auto upload = buffers.GetShaderUploadBuffer().Handle();
 	std::array<NativeXprRecord::Stage, 2> data;
 	std::array<std::vector<std::vector<std::pair<uint32_t, uint32_t>>>, 2> positions;
@@ -2823,6 +2826,7 @@ bool RenderExecutor::NativeXprReevaluate(NativeXprRecord& record) {
 
 // Once per frame: is the record's content still what a fresh translation gives?
 bool RenderExecutor::NativeXprValidate(NativeXprRecord& record, uint64_t frame) {
+	if (record.bda_generation != BufferCache::BdaTableGeneration()) return false; // (the page table grew since)
 	auto& cache     = *m_native_xpr;
 	auto& resources = m_context.GetGpuResources();
 	// A guest mapping change forces the buffer and image proofs below; the words
@@ -3351,6 +3355,7 @@ bool RenderExecutor::NativeXprDraw(CommandBuffer& buffer, const NativeXprDrawArg
 		return false;
 	}
 	auto&      record    = *found->second;
+	if (record.bda_generation != BufferCache::BdaTableGeneration()) return false; // (NativeXprTry makes it again)
 	const auto state_key = NativeXprStateKey(buffer);
 	const auto state_it  = cache.states.find(state_key);
 	const auto pipeline_it =

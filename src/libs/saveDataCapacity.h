@@ -43,8 +43,14 @@ inline std::optional<SaveDataCapacity> ReadSaveDataCapacity(const std::filesyste
 	// The emulator's own bookkeeping: unreadable (a file of zeros after a power cut) counts as none, it is
 	// rewritten at the mount. Refusing the mount for it made every later save of the game fail.
 	std::ifstream file(metadata);
-	if (file && !(file >> allocated)) {
-		allocated = 0;
+	if (file) {
+		// The emulator's own bookkeeping: unreadable (a file of zeros after a power cut) counts as none, and the
+		// mount writes it again. Refused, it failed every later mount of that save.
+		if (!(file >> allocated)) {
+			allocated = 0;
+		}
+	} else if (std::filesystem::exists(metadata, ec) || ec) {
+		return std::nullopt;
 	}
 	allocated = std::max({allocated, used, SaveDataCapacity::MinimumBlocks});
 	return SaveDataCapacity {allocated, allocated - used};

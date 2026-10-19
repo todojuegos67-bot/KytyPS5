@@ -15,6 +15,10 @@ struct Camera;
 namespace Xess {
 
 [[nodiscard]] bool Wanted();
+// KYTY_UPSCALER=xess: the game's PS5 Pro path upscaled by XeSS (FrameGen::Upscale).
+[[nodiscard]] bool SrPathWanted();
+// The device has what XeSS needs (after OnDevice).
+[[nodiscard]] bool Ready();
 // Device creation: the extensions XeSS asks for (VK_EXT_mutable_descriptor_type), when the device has them.
 void AddDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical_device,
                          const std::vector<vk::ExtensionProperties>& available, std::vector<const char*>& extensions);
@@ -38,6 +42,7 @@ struct UpscaleDesc {
 	vk::Extent2D       upscale {};
 	bool               reset = false;
 	float jitter[2] {0.0f, 0.0f}; // (pixels, as DLSS takes it: the raw jittered frame of KYTY_TAA_REPLACE=upscaler)
+	float mv_scale[2] {0.0f, 0.0f}; // vectors * scale = pixels to the previous frame (0: the TAA's UV vectors)
 };
 // Color, depth and motion in SHADER_READ_ONLY_OPTIMAL, the output in GENERAL.
 bool Upscale(const UpscaleDesc& desc);

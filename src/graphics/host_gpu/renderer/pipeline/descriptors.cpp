@@ -634,8 +634,14 @@ static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc
 // game's streamed texture pool is one T# of ~1700 1024x1024 BC layers (1.7 GB at 0x1009000000, over the shadow-map
 // pool's lent layers) of which a view samples one (base layer 737 at 2-3, 1617 at 4-1): the whole array was made, its
 // buffer joined from 8 others (3 s), and that buffer over the shadow-map layers refused their partial uploads, which
-// became whole 320 MiB uploads: frames of 5 and 17 s on an 8 GB laptop. Not a view of more than half the layers (an
-// array view from layer 17 of 1585 at 4-2): an image of nearly all of it beside the whole one other views take.
+// became whole 320 MiB uploads: frames of 5 and 17 s on an 8 GB laptop. Not a view of more than half the layers past
+// a few (an array view from layer 17 of 1585 at 4-2): an image of nearly all of it beside the whole one other views
+// take; past LayerRangeLeftOut of layers before it the whole is mostly what no view reads (issue #49, a 16 GB RX 9070:
+// the 1024x1024 pool's views from layer 1761 of 3633 made the whole 3.6 GB image). An image of more of the pool's
+// layers may hold them already, or grow to (TextureCache::HoldLayers). An array of more layers than the GPU's images
+// hold (NVIDIA: 2048, the pools after enough streamed in, e.g. a tour ending at Shrine of Storms 4-1) is held so as well
+// when the view's layers fit, where the whole view was a null image; a view of more stays one (its later layers would
+// clamp to another texture).
 // (With any video memory since 10-15, not only below 12 GiB: a 16 GB RTX 4080 froze for seconds and once lost the
 // device at 2-3 and 4-1, each new layer count of the pool a whole new image uploaded (issue #9); a 32 GB RTX 5090 held
 // no layer range in a 4-1 tour or a 2-3 walk, the same frames and pictures as without.)
@@ -644,21 +650,26 @@ static bool TextureLayerRangeEnabled() {
 	return value == nullptr || value[0] != '0';
 }
 
-static void HoldLayerRange(TextureCache& cache, TextureCache::ImageDesc& desc) {
+constexpr uint64_t LayerRangeLeftOut = uint64_t {64} << 20u;
+
+static void HoldLayerRange(TextureCache& cache, TextureCache::ImageDesc& desc, uint32_t max_layers) {
 	const auto& full  = desc.info;
 	const auto  first = desc.view_info.base_layer;
 	const auto  count = desc.view_info.layer_count;
-	if (first == 0 || count == 0 || full.resources.layers < 2 || first + count > full.resources.layers ||
-	    count > full.resources.layers / 2 ||
+	const bool  fits  = full.resources.layers <= max_layers;
+	if (count == 0 || full.resources.layers < 2 || first + count > full.resources.layers ||
 	    !TextureLayerRangeEnabled() || full.resources.levels != 1 || full.samples != 1 ||
-	    full.IsVolume() || full.IsDepth() || full.HasMetadata() || full.HasStencil() || full.mip_layout.empty() ||
+	    full.IsVolume() || full.IsDepth() || full.HasMetadata() || full.HasStencil() ||
 	    full.mip_layout[0].offset != 0 || full.mip_layout[0].size != full.data.size ||
-	    full.data.size % full.resources.layers != 0 || cache.HoldsImage(full)) {
+	    full.data.size % full.resources.layers != 0 || (fits && (first == 0 || cache.HoldsImage(full)))) {
 		return;
 	}
 	// One level with nothing before or after it: the layers are whole slices, one after another.
 	const uint64_t slice = full.data.size / full.resources.layers;
-	ImageInfo      from  = full;
+	if ((fits && count > full.resources.layers / 2 && slice * first < LayerRangeLeftOut) || count > max_layers) {
+		return;
+	}
+	ImageInfo from = full;
 	from.data             = {full.data.address + slice * first, slice * count};
 	from.resources.layers = count;
 	from.mip_layout       = {};
@@ -675,8 +686,10 @@ static void HoldLayerRange(TextureCache& cache, TextureCache::ImageDesc& desc) {
 			            static_cast<unsigned long long>(from.data.size >> 20u),
 			            static_cast<unsigned long long>(full.data.size >> 20u));
 	}
+	uint32_t held_first = 0;
+	cache.HoldLayers(from, held_first);
 	desc.info                 = from;
-	desc.view_info.base_layer = 0;
+	desc.view_info.base_layer = held_first;
 }
 
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
@@ -870,7 +883,9 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	TileSizeAlign size {};
 	const auto& limits    = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
 	const char* rejection = nullptr;
-	if (volume ? depth > limits.maxImageDimension3D : image_layers > limits.maxImageArrayLayers) {
+	// (An array of more layers than the GPU's images hold may still have a view of few enough: HoldLayerRange, below.
+	// The game's texture pools pass NVIDIA's 2048 once enough has streamed in, and their views were null images.)
+	if (volume && depth > limits.maxImageDimension3D) {
 		rejection = "exceeds host image limits";
 	} else if (multisampled) {
 		const auto bytes = Prospero::NumBytesPerElement(format);
@@ -1041,8 +1056,32 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	if (!storage && type == Prospero::ImageType::kColor2D) {
 		HoldFromBaseLevel(texture_cache, desc, m_context.GetGraphics().small_video_memory);
 	}
-	if (!storage) HoldLayerRange(texture_cache, desc);
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	// KYTY_TEST_MAX_ARRAY_LAYERS=<n>: textures held as if the GPU's images held no more than n layers. 2048 = NVIDIA's: an
+	// AMD GPU (8192) then binds the texture-pool views past it null as NVIDIA does (issue #24: a picture broken on AMD
+	// alone, after some play); with KYTY_TEXTURE_LAYER_RANGE=0 too, every view of such a pool, as before c3a332ba.
+	static const uint32_t test_max_layers = [] {
+		const char* value = std::getenv("KYTY_TEST_MAX_ARRAY_LAYERS");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	const uint32_t max_layers =
+	    test_max_layers != 0 ? std::min(test_max_layers, limits.maxImageArrayLayers) : limits.maxImageArrayLayers;
+	if (!storage) HoldLayerRange(texture_cache, desc, max_layers);
+	if (desc.info.resources.layers > max_layers) {
+		return bind_null(fmt::format("unrepresentable texture (exceeds host image limits): {}x{} layers={} levels={} "
+		                             "format={} base_array={} addr=0x{:016x}",
+		                             width, height, desc.info.resources.layers, levels, static_cast<uint32_t>(format),
+		                             descriptor.BaseArray5(), address));
+	}
+	// (A texture or storage image the GPU cannot make, its memory full: a null image, not the end of the emulator; a
+	// storage view loses its writes until the collector made room. Issue #53: a 320x180x61 storage image of the cinematic
+	// mode on a 16 GB RX 7800 XT whose video memory the 4K targets had filled.)
+	auto id = texture_cache.FindImage(desc, shader_conversion, true);
+	if (!id) {
+		return bind_null(fmt::format("no image could be made for the texture: {}x{} layers={} levels={} format={} "
+		                             "addr=0x{:016x} size=0x{:x}",
+		                             width, height, desc.info.resources.layers, desc.info.resources.levels,
+		                             static_cast<uint32_t>(format), desc.info.data.address, desc.info.data.size));
+	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -1329,6 +1368,16 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
+// A dynamic storage binding's levels and the level of its view `mip`: a null image's (bind_null: no image could be made,
+// issue #53) one level stands for each level the shader picks. (Out of AcquireImages, whose control flow and so its PGO
+// profile stay as they were.)
+[[gnu::noinline]] static uint32_t DynamicStorageLevels(const TextureBinding& binding, uint32_t mip_count) {
+	return binding.desc.info.data.Empty() ? mip_count : binding.desc.view_info.level_count;
+}
+[[gnu::noinline]] static uint32_t DynamicStorageLevel(const TextureBinding& binding, uint32_t mip) {
+	return binding.desc.info.data.Empty() ? 0u : mip;
+}
+
 bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
 	const auto& program       = *prepared.runtime->program;
 	auto&       images        = prepared.images;
@@ -1341,11 +1390,11 @@ bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
 			EXIT_IF(resource.mip_count == 0u ||
-			        resource.mip_count != binding.desc.view_info.level_count);
+			        resource.mip_count != DynamicStorageLevels(binding, resource.mip_count));
 			binding.mip_views.reserve(resource.mip_count);
 			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
 				auto desc = binding.desc;
-				desc.view_info.base_level += mip;
+				desc.view_info.base_level += DynamicStorageLevel(binding, mip);
 				desc.view_info.level_count = 1;
 				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
 			}
@@ -1397,6 +1446,8 @@ void RenderExecutor::PrepareGraphicsBindingsInto(const ShaderStageRuntime& verte
 		FindBuffers(*bindings.pixel);
 	}
 	PrepareBdaBindings(bindings.vertex, bindings.pixel ? &*bindings.pixel : nullptr);
+	auto&    cache = m_context.GetBufferCache();
+	uint64_t epoch = cache.UnregisterEpoch();
 	RebindBuffers(bindings.vertex);
 	if (bindings.pixel) {
 		RebindBuffers(*bindings.pixel);
@@ -1404,6 +1455,21 @@ void RenderExecutor::PrepareGraphicsBindingsInto(const ShaderStageRuntime& verte
 	RebindImages(bindings.vertex);
 	if (bindings.pixel) {
 		RebindImages(*bindings.pixel);
+	}
+	// A buffer resolved here can be joined into a new one by what comes after it (a later buffer's lookup, an image's
+	// refresh asking the buffer cache for its bytes): the old Vulkan buffer no longer owns the bytes, and the draw's writes
+	// there are lost (an 8 GB laptop's culling chain hung on counts it read later, 10-18). Resolved again until nothing was
+	// unregistered meanwhile.
+	for (uint32_t attempt = 0; attempt < 4 && cache.UnregisterEpoch() != epoch; ++attempt) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+			std::printf("Bindings: a buffer was unregistered while a draw's bindings were made (VS 0x%016llx), resolved again\n",
+			            static_cast<unsigned long long>(bindings.vertex.runtime->program->shader_hash));
+		epoch = cache.UnregisterEpoch();
+		RebindBuffers(bindings.vertex);
+		if (bindings.pixel) {
+			RebindBuffers(*bindings.pixel);
+		}
 	}
 }
 

@@ -577,17 +577,76 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 		queue_size = static_cast<uint32_t>(cvt.len_cvt);
 	}
 
+	const auto now       = LibKernel::KernelGetProcessTime();
+	const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
+	// A test, KYTY_AUDIO_CUSHION_MS (default 0: none): a port's first output is preceded by that much silence, a reserve
+	// that absorbs a late game's grains up to that much (with KYTY_AUDIO_CATCHUP_MS, libAudio2.cpp, the game makes up the
+	// grains it missed and the reserve stays), for that much more latency; above it and 100 ms more queued, a grain is
+	// left out, so that the latency cannot grow. KYTY_AUDIO_LOG reports dropouts (the device's queue found empty after
+	// the first output: it played silence), grains left out and a main port's queue level.
+	static const uint64_t cushion_us = [] {
+		const char* value = std::getenv("KYTY_AUDIO_CUSHION_MS");
+		return static_cast<uint64_t>(value != nullptr ? std::clamp(std::atoi(value), 0, 500) : 0) * 1000u;
+	}();
+	static const bool            log_queue = std::getenv("KYTY_AUDIO_LOG") != nullptr;
+	static std::atomic<uint32_t> empties {0}, clears {0}, trims {0};
+	const uint32_t               queued_bytes =
+	    log_queue || cushion_us != 0 ? SDL_GetQueuedAudioSize(port->audio_device) : 1u;
+	// (KYTY_AUDIO_LOG.) A main port's queue level before each output (ms), its lowest and highest every 2 s.
+	if (log_queue && port->type == 0 && queue_size != 0 && buffer_us != 0 && port->audio_device < 64) {
+		struct Level {
+			uint64_t since = 0;
+			double   low = 1e9, high = 0;
+		};
+		static Level levels[64];
+		auto&        level = levels[port->audio_device];
+		const double ms    = static_cast<double>(queued_bytes) * static_cast<double>(buffer_us) / 1000.0 / queue_size;
+		level.low          = std::min(level.low, ms);
+		level.high         = std::max(level.high, ms);
+		if (level.since == 0) level.since = now;
+		if (now - level.since >= 2000000) {
+			std::printf("AudioOut: at %.1f s main port (device %u) queue %.1f-%.1f ms over 2 s\n",
+			            static_cast<double>(now) / 1e6, static_cast<unsigned>(port->audio_device), level.low, level.high);
+			level = Level {now};
+		}
+	}
+	if (port->last_output_time != 0 && queued_bytes == 0) {
+		const auto count = empties.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (log_queue && (count <= 40 || count % 100 == 0)) {
+			std::printf("AudioOut: port type %d queue ran empty (#%u), %.1f ms since its last output\n", port->type, count,
+			            static_cast<double>(now - port->last_output_time) / 1000.0);
+		}
+	}
+	if (cushion_us != 0 && buffer_us != 0) {
+		const auto cushion_grains = (cushion_us + buffer_us - 1) / buffer_us;
+		if (port->last_output_time == 0) {
+			std::vector<uint8_t> silence(static_cast<size_t>(queue_size * cushion_grains), port->audio_spec.silence);
+			(void)SDL_QueueAudio(port->audio_device, silence.data(), static_cast<uint32_t>(silence.size()));
+		} else if (const auto limit_grains = cushion_grains + (100000u + buffer_us - 1) / buffer_us;
+		           queued_bytes > queue_size * limit_grains) {
+			const auto count = trims.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (log_queue && (count <= 40 || count % 100 == 0)) {
+				std::printf("AudioOut: port type %d grain left out (#%u): %.1f ms queued\n", port->type, count,
+				            static_cast<double>(queued_bytes) * static_cast<double>(buffer_us) / 1000.0 / queue_size);
+			}
+			return true;
+		}
+	}
+
 	if (blocking) {
 		constexpr uint64_t target_latency_us = 40000;
-		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
 		const auto buffers =
 		    buffer_us != 0 ? static_cast<uint32_t>((target_latency_us + buffer_us - 1) / buffer_us)
 		                   : 2u;
 		const auto min_queued_size = queue_size * std::clamp(buffers, 2u, 16u);
-		const auto wait_start      = LibKernel::KernelGetProcessTime();
+		const auto wait_start      = now;
 		while (SDL_GetQueuedAudioSize(port->audio_device) > min_queued_size) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
 				SDL_ClearQueuedAudio(port->audio_device);
+				if (log_queue) {
+					std::printf("AudioOut: port type %d queue cleared after 200 ms without draining (#%u)\n", port->type,
+					            clears.fetch_add(1, std::memory_order_relaxed) + 1);
+				}
 				break;
 			}
 			Common::Thread::SleepMicro(1000);

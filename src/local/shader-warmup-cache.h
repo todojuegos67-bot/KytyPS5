@@ -446,4 +446,15 @@ private:
         return !ec;
     }
 };
+
+// A recipe's identity in the scene tags (local/scene-tags.h): the hash of its words as the recording holds them
+// (its shader records by index, so of this recording only); never 0.
+inline uint64_t RecipeKey(const std::vector<uint32_t>& words) {
+    const auto key = XXH3_64bits(words.data(), words.size() * 4);
+    return key != 0 ? key : 1;
+}
+inline uint64_t RecipeKey(PipelineRecord record) {
+    Writer writer;
+    return VisitPipeline(writer, record) ? RecipeKey(writer.words) : 0;
+}
 } // namespace LocalShaderWarmup

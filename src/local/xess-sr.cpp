@@ -28,6 +28,14 @@ bool Wanted() {
 	return wanted;
 }
 
+bool SrPathWanted() {
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_UPSCALER");
+		return value != nullptr && std::string(value) == "xess";
+	}();
+	return wanted;
+}
+
 #if defined(_WIN32) && defined(KYTY_XESS)
 namespace {
 
@@ -49,6 +57,7 @@ VkDevice              g_device      = VK_NULL_HANDLE;
 xess_context_handle_t g_context     = nullptr;
 vk::Extent2D          g_output {};
 vk::Extent2D          g_render {};
+float                 g_scale[2] {};
 bool                  g_failed      = false;
 uint32_t              g_errors      = 0;
 VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT g_mutable {};
@@ -165,6 +174,10 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 	g_device   = static_cast<VkDevice>(device);
 }
 
+bool Ready() {
+	return !g_failed && Load() && g_device != VK_NULL_HANDLE;
+}
+
 bool Upscale(const UpscaleDesc& desc) {
 	if (g_failed || !Load() || g_device == VK_NULL_HANDLE || desc.command == VK_NULL_HANDLE || desc.color == nullptr ||
 	    desc.depth == nullptr || desc.motion == nullptr || desc.output == nullptr)
@@ -202,11 +215,23 @@ bool Upscale(const UpscaleDesc& desc) {
 		}();
 		g_api.set_velocity_scale(g_context, sign * static_cast<float>(desc.render.width),
 		                         sign * static_cast<float>(desc.render.height));
+		g_scale[0] = g_scale[1] = 0.0f;
 		g_output = desc.upscale;
 		g_render = desc.render;
 		std::printf("XeSS: %ux%u -> %ux%u, quality %d\n", desc.render.width, desc.render.height, desc.upscale.width,
 		            desc.upscale.height, static_cast<int>(init.qualitySetting));
 		std::fflush(stdout);
+	}
+	// The PS5 Pro path's vectors: their own scale to pixels (the game's constants; XeSS's own sign convention).
+	if ((desc.mv_scale[0] != 0.0f || desc.mv_scale[1] != 0.0f) &&
+	    (desc.mv_scale[0] != g_scale[0] || desc.mv_scale[1] != g_scale[1])) {
+		g_scale[0] = desc.mv_scale[0];
+		g_scale[1] = desc.mv_scale[1];
+		static const float sign = [] {
+			const char* value = std::getenv("KYTY_SR_MV_SIGN");
+			return value != nullptr && std::atof(value) < 0 ? -1.0f : 1.0f;
+		}();
+		g_api.set_velocity_scale(g_context, sign * g_scale[0], sign * g_scale[1]);
 	}
 	xess_vk_execute_params_t exec {};
 	exec.colorTexture    = ViewInfo(*desc.color, desc.color_view, false);
@@ -239,6 +264,9 @@ bool Upscale(const UpscaleDesc& desc) {
 
 void AddDeviceExtensions(vk::Instance, vk::PhysicalDevice, const std::vector<vk::ExtensionProperties>&,
                          std::vector<const char*>&) {}
+bool Ready() {
+	return false;
+}
 void* ChainDeviceFeatures(const std::vector<const char*>&, void* next) {
 	return next;
 }

@@ -1940,11 +1940,13 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 	// areas goes the normal way, drawn once for each.
 	const auto hud = HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), packet[1]));
 	if (hud.Several()) return 0u;
-	std::optional<HudAnchor::Scope> anchor;
+	std::optional<HudAnchor::Scope>        anchor;
+	std::optional<HudAnchor::StretchScope> widen;
 	if (hud.Single()) {
 		anchor.emplace(m_ctx, m_sh_ctx.GetPs(), static_cast<uint32_t>(std::countr_zero(hud.areas)), false);
 	} else {
 		HudAnchor::RestoreMask(m_sh_ctx.GetPs());
+		if (HudAnchor::Stretched(m_ctx)) widen.emplace(m_ctx, m_sh_ctx.GetPs());
 	}
 	const RenderExecutor::NativeXprDirectDraw draw {0, packet[1], m_num_instances, false};
 	return m_renderer.GetRenderExecutor().NativeXprTry(CurrentBuffer(), false, {}, 0, 0, vk::IndexType::eUint16, &draw)
@@ -2308,11 +2310,13 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h).
 	const auto hud = HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), args.vertex_count));
 	if (hud.areas == 0 || hud.Single()) {
-		std::optional<HudAnchor::Scope> anchor;
+		std::optional<HudAnchor::Scope>        anchor;
+		std::optional<HudAnchor::StretchScope> widen;
 		if (hud.Single()) {
 			anchor.emplace(m_ctx, m_sh_ctx.GetPs(), static_cast<uint32_t>(std::countr_zero(hud.areas)), false);
 		} else {
 			HudAnchor::RestoreMask(m_sh_ctx.GetPs());
+			if (HudAnchor::Stretched(m_ctx)) widen.emplace(m_ctx, m_sh_ctx.GetPs());
 		}
 		return m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 	}
@@ -2326,8 +2330,12 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (hud.outside) {
 		std::array<HudAnchor::Rect, 32> rects {};
 		const auto                      count = HudAnchor::Complement(m_ctx, rects);
+		// (The wide output's: widened as the canvas's other draws, the rectangles with them.)
+		const bool wide = HudAnchor::Stretched(m_ctx);
 		for (uint32_t r = 0; r < count; ++r) {
-			HudAnchor::ClipScope clip(m_ctx, rects[r]);
+			std::optional<HudAnchor::StretchScope> widen;
+			if (wide) widen.emplace(m_ctx, m_sh_ctx.GetPs());
+			HudAnchor::ClipScope clip(m_ctx, wide ? HudAnchor::Widened(rects[r]) : rects[r]);
 			drawn = m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args) && drawn;
 		}
 	}

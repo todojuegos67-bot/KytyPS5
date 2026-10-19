@@ -22,6 +22,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -175,7 +176,7 @@ public:
 	// pipeline binaries and `prune`, the store becomes the shards' pipelines only (a whole run's: what
 	// older runs left that no seed makes any more is dropped).
 	// `keep_shards`: the shard files stay (a merge in the middle of a run, which its final pruning merge counts).
-	static bool MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards = false);
+	static bool MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards = false, bool stamp = false);
 #endif
 
 	// A pipeline no cache holds, compiled without optimization so its draw or dispatch need not wait:
@@ -199,6 +200,10 @@ public:
 		// to make it again (a pipeline the static store gave: made again from it; null: never evicted).
 		mutable uint32_t                                       last_flip = 0;
 		std::shared_ptr<const std::function<void(Pipeline&)>> remake;
+		// Its warmup recipe (LocalShaderWarmup::RecipeKey; 0: none, a native variant), and the scene generation it was
+		// last bound in (local/scene-tags.h: noted once per scene).
+		uint64_t         recipe      = 0;
+		mutable uint64_t scene_noted = 0;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		// Immutable encoding plan; queued packets keep their own shared ownership.
 		mutable std::shared_ptr<const LocalDescriptorPlan> local_descriptor_plan;
@@ -447,6 +452,16 @@ private:
 	void              StartShaderPrefetch(std::vector<std::vector<uint32_t>> recorded_inputs);
 	std::thread       m_warmup_thread;
 	std::atomic<bool> m_warmup_stop {false};
+	// The warmup by scene (local/scene-tags.h, KYTY_SCENE_WARMUP): the recording's file (its .scenes beside it), whether
+	// it is on, and what it made. WarmScene: the pipelines of `scene` (every recorded one for a scene not known yet), from
+	// the warmup's own records (`in_memory`, the first scene) or the recording read again; SceneLoop: those of each scene
+	// the game loads later, until m_warmup_stop.
+	std::filesystem::path        m_warmup_path;
+	bool                         m_scene_warmup     = false;
+	bool                         m_scene_warmed_all = false;
+	std::unordered_set<uint32_t> m_scenes_warmed;
+	void                         WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory);
+	void                         SceneLoop(uint64_t compute_video);
 	// Pipelines made where first needed (CreateGraphicsPipeline, CreateComputePipeline), and the time it took.
 	uint64_t m_render_pipelines   = 0;
 	double   m_render_pipeline_ms = 0.0;
@@ -456,7 +471,8 @@ private:
 	void            BuildOptimized(Pipeline& pipeline, std::function<void(Pipeline&)> build);
 	void            PromoteOptimized();
 	// At each flip: with the video memory in use near the GPU's budget, the pipelines no binding used for a while leave
-	// it (their handles destroyed; BindPipelineHandle makes one again from the static store when it is bound).
+	// it (their handles destroyed; BindPipelineHandle makes one again from the static store when it is bound); and a
+	// while after the game changed its world (SceneTags), those of the worlds it left.
 	void            EvictIdlePipelines();
 	// (EvictIdlePipelines) A graphics pipeline's inputs, as its remake keeps them.
 	struct GraphicsMakeInputs;
@@ -464,6 +480,12 @@ private:
 	// (EvictIdlePipelines) When each recent flip began (steady clock, by flip % size), and the video memory pressure.
 	std::array<int64_t, 32768> m_flip_times {};
 	bool                      m_evict_pressure = false;
+	// (EvictIdlePipelines) The world the game is in: its SceneTags generation, the flip and time it began, and whether
+	// the pipelines of the worlds before it went.
+	uint64_t                              m_scene_generation = 0;
+	uint32_t                              m_scene_flip       = 0;
+	std::chrono::steady_clock::time_point m_scene_since {};
+	bool                                  m_scene_swept = true;
 	void InitializeDriverCache();
 	vk::PipelineCache LoadDriverCache(const std::filesystem::path& file_path, uint64_t limit, size_t& loaded_size);
 	bool SaveDriverCache(vk::PipelineCache cache, const std::filesystem::path& file_path, size_t& saved_size);
@@ -472,7 +494,8 @@ private:
 	void              MainPipelineDone();
 	void InitializeStaticCache(bool create);
 	// The recorded pipelines; compute ones, newest first, while they took less than `compute_video` bytes of video memory.
-	void WarmPipelines(uint64_t compute_video, bool background);
+	// `only`: of these recipes alone (LocalShaderWarmup::RecipeKey), none the cache has.
+	void WarmPipelines(uint64_t compute_video, bool background, const std::unordered_set<uint64_t>* only = nullptr);
 #ifdef KYTY_STATIC_PRECOMPILE
 	bool SaveStaticCache(vk::PipelineCache cache, const std::filesystem::path& path);
 	static bool MergeBinaryShards(GraphicContext& graphics, bool prune, bool keep_shards);

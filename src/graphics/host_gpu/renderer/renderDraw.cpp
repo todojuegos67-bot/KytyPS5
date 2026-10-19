@@ -40,6 +40,7 @@
 #include "device-fault.h"
 #include "frame-capture.h"
 #include "frame-gen.h"
+#include "frame-gen-hudless.h"
 #include "native-preparation-state.h"
 #include "slow-log.h"
 #include "xpr-capture.h"
@@ -1620,18 +1621,23 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
-	if (!mesh_active) {
-		LogDrawPhase(draw.name, "PrepareVertexBuffers");
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vs_input_info);
-		index_binding   = PrepareIndexBuffer(buffer, index_source);
-	}
 	std::pair<Buffer*, uint64_t> gpu_args {};
-	if (emit.gpu_args != 0) {
-		const uint64_t size = emit.indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
-		gpu_args = m_context.GetBufferCache().ObtainBuffer(
-		    emit.gpu_args, uint64_t {emit.gpu_args_count - 1u} * emit.gpu_args_stride + size, false);
-		EXIT_IF(gpu_args.first == nullptr);
-	}
+	auto&    buffer_cache = m_context.GetBufferCache();
+	uint64_t unregistered = buffer_cache.UnregisterEpoch();
+	const auto acquire_buffers = [&] {
+		if (!mesh_active) {
+			LogDrawPhase(draw.name, "PrepareVertexBuffers");
+			vertex_bindings = AcquireVertexBuffers(buffer, state.vs_input_info);
+			index_binding   = PrepareIndexBuffer(buffer, index_source);
+		}
+		if (emit.gpu_args != 0) {
+			const uint64_t size = emit.indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
+			gpu_args = buffer_cache.ObtainBuffer(
+			    emit.gpu_args, uint64_t {emit.gpu_args_count - 1u} * emit.gpu_args_stride + size, false);
+			EXIT_IF(gpu_args.first == nullptr);
+		}
+	};
+	acquire_buffers();
 	if (!emit.direct_run.empty() &&
 	    (m_context.GetGpuResources().MappingEpoch() != emit.run_mapping_epoch ||
 	     m_context.GetGpuResources().PreparationAliasEpoch() != emit.run_alias_epoch)) {
@@ -1640,6 +1646,22 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         bindings.pixel);
+	// (The vertex, index and argument buffers and the targets' refreshes can join a buffer resolved before them into a new
+	// one, which then no longer owns its bytes: the bindings and these buffers resolved again until nothing was
+	// unregistered meanwhile, as PrepareGraphicsBindingsInto.)
+	for (uint32_t attempt = 0; attempt < 4 && buffer_cache.UnregisterEpoch() != unregistered; ++attempt) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+			std::printf("Bindings: a buffer was unregistered while a draw's buffers and targets were made (VS 0x%016llx), "
+			            "resolved again\n",
+			            static_cast<unsigned long long>(bindings.vertex.runtime->program->shader_hash));
+		unregistered = buffer_cache.UnregisterEpoch();
+		RebindBuffers(bindings.vertex);
+		if (bindings.pixel) {
+			RebindBuffers(*bindings.pixel);
+		}
+		acquire_buffers();
+	}
 
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
@@ -1667,7 +1689,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	bool record_draw = false;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	const auto primitive = ucfg.GetPrimType();
-	record_draw = LocalVulkanRecording::PacketsEnabled() && !mesh_active && emit.gpu_args == 0 &&
+	record_draw = flip_slot < 0 && LocalVulkanRecording::PacketsEnabled() && !mesh_active && emit.gpu_args == 0 &&
 	    ((!set_bind_debug && !set_auto_debug) ||
 	     kyty_local_draw_packets_mode.load(std::memory_order_relaxed) != 0) &&
 	    (primitive == Prospero::PrimitiveType::kPointList ||

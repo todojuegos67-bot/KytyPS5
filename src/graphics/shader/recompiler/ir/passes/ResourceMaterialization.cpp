@@ -583,7 +583,7 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 	probed.reserve(next.keys.size());
 	// The T#s of the keys below a bound from one clean read of the table's start (a light table's keys are light
 	// indices: its ~30 T# reads, each with its own GPU-ownership checks, became one), the others one at a time, as all
-	// of them where that read is refused (a T# the GPU wrote is synchronized first, as before).
+	// of them where that read is refused (only then is a T# the GPU wrote synchronized first).
 	constexpr uint32_t SpanKeys = 128; // (4 KiB of T#s: ReadShaderMemorySpan's limit for clean reads)
 	uint32_t           span_keys = 0;
 	for (const auto key: next.keys)
@@ -614,7 +614,10 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 			std::copy_n(table_span.begin() + (static_cast<size_t>(key) << (DenseDescriptorShift - 2u)),
 			            candidate.dword_count, candidate.dwords.begin());
 		} else if (readable) {
-			MakeRangeReadable(runtime, entry, candidate.dword_count * sizeof(uint32_t));
+			// An entry the GPU wrote past a table the CPU wrote (its start read clean above) is a stale record's key into
+			// GPU output (1-3 with live enemies: keys such as 0x100000, 32 MiB on): a null candidate, as when unreadable,
+			// instead of a GPU drain for it (~8 a second of ~4 ms each there; none of them gave a valid T#).
+			if (!spanned) MakeRangeReadable(runtime, entry, candidate.dword_count * sizeof(uint32_t));
 			readable = ReadSpecializationDescriptor(runtime, entry, candidate.dwords);
 		}
 		if (!readable || NullImageDescriptor(candidate) ||

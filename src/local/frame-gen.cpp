@@ -42,6 +42,7 @@
 #include <sl_consts.h>
 #include <sl_dlss.h>
 #include <sl_dlss_g.h>
+#include <sl_helpers.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
 
@@ -52,6 +53,11 @@
 #include <string>
 #include <vector>
 #endif
+
+extern "C" {
+// DLSS-G frames' Reflex sleep (slReflexSleep, every present): 0 skips it (KYTY_FRAMEGEN_SLEEP=0).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_framegen_sleep {1};
+}
 
 namespace Libs::Graphics::FrameGen {
 
@@ -82,6 +88,10 @@ bool g_taa_bypass_match = false;
 double g_real_interval = 0.0; // DLSS-G under the G-SYNC cap: the real frames' least interval (seconds)
 bool g_sr_ready = false;
 bool     g_ready       = false; // Streamline loaded and the feature available
+bool     g_upscale     = false; // KYTY_UPSCALER=dlss: DLSS super resolution asked for (Streamline loaded for it)
+bool     g_upscale_ready = false; // ... and available on the device
+// KYTY_UPSCALER=xess|fsr: the PS5 Pro path (renderSuperResolution.cpp) upscaled by our XeSS or FSR 3.1 instead of DLSS.
+int      g_sr_kind = 0; // 0 none, 1 DLSS, 2 XeSS, 3 FSR
 Camera   g_camera;              // Kyty.Gpu: the current guest frame
 Sources  g_sources;             // Kyty.Gpu: the current guest frame
 uint64_t g_guest_frame = 0;     // Kyty.Gpu
@@ -107,6 +117,8 @@ bool IsDepthFormat(vk::Format format) {
 	}
 }
 
+} // namespace
+
 void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFlags aspect,
                 vk::ImageLayout layout, vk::AccessFlags2 access, vk::PipelineStageFlags2 stage) {
 	vk::ImageMemoryBarrier2 barrier {};
@@ -130,7 +142,7 @@ void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFl
 // (Re)create `image` as a sampled copy target like `source`; with `attachment`, a color
 // attachment too where the format allows it (*attachment tells).
 void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view,
-               const VulkanImage& source, bool* attachment = nullptr) {
+               const VulkanImage& source, bool* attachment) {
 	if (image.image != nullptr && image.format == source.format &&
 	    image.extent.width == source.extent.width && image.extent.height == source.extent.height) {
 		return;
@@ -175,6 +187,8 @@ void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view
 	RequireVulkanSuccess(graphics.device.createImageView(&view_info, nullptr, &view),
 	                     "frame generation input view");
 }
+
+namespace {
 
 void CopyInto(vk::CommandBuffer command, Image& source, VulkanImage& target) {
 	const auto aspect = IsDepthFormat(source.backing.format) ? vk::ImageAspectFlagBits::eDepth
@@ -255,6 +269,7 @@ struct Api {
 	PFun_slPCLSetMarker*         pcl_set_marker      = nullptr;
 	PFun_slEvaluateFeature*      evaluate            = nullptr;
 	PFun_slDLSSSetOptions*       dlss_set_options    = nullptr;
+	PFun_slDLSSGetOptimalSettings* dlss_get_optimal_settings = nullptr;
 };
 Api              g_api;
 sl::FrameToken*  g_token = nullptr; // present thread: the frame being presented
@@ -398,6 +413,28 @@ bool FeatureFunction(sl::Feature feature, const char* name, F*& function) {
 	function = reinterpret_cast<F*>(pointer);
 	return true;
 }
+
+// KYTY_FG_HUDLESS: the frame's image without its HUD, laid out as the backbuffer (`game`: where that shows the game
+// image; frame-gen-hudless.h), or none for a frame without one (DLSS-G then takes the backbuffer as it is).
+void TagHudless(sl::FrameToken& token, const FrameInputs& inputs, const sl::Extent& game) {
+	const auto&  image = inputs.hudless.display;
+	sl::Resource hudless(sl::ResourceType::eTex2d, static_cast<VkImage>(image.image), nullptr,
+	                     static_cast<VkImageView>(inputs.hudless.display_view),
+	                     static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+	hudless.width        = image.extent.width;
+	hudless.height       = image.extent.height;
+	hudless.nativeFormat = static_cast<uint32_t>(image.format);
+	hudless.mipLevels    = 1;
+	hudless.arrayLayers  = 1;
+	hudless.flags        = 0;
+	hudless.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.usage));
+	const sl::ResourceTag tag(inputs.hudless.has_display ? &hudless : nullptr, sl::kBufferTypeHUDLessColor,
+	                          sl::ResourceLifecycle::eValidUntilPresent, &game);
+	if (const auto result = g_api.set_tag_for_frame(token, sl::ViewportHandle {0}, &tag, 1, nullptr);
+	    result != sl::Result::eOk && g_presents < 8) {
+		LOGF("frame generation: slSetTagForFrame (HUD-less) failed (%d)\n", static_cast<int>(result));
+	}
+}
 #endif
 
 } // namespace
@@ -421,8 +458,81 @@ double RealFrameInterval() {
 	return g_ready ? g_real_interval : 0.0;
 }
 
+std::string SupportProblem(vk::PhysicalDevice physical_device) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (g_upscale) {
+		sl::AdapterInfo adapter {};
+		adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
+		const auto result        = g_api.is_feature_supported(sl::kFeatureDLSS, adapter);
+		std::printf("DLSS super resolution: %s\n", result == sl::Result::eOk
+		                                               ? "Streamline offers it with this GPU and driver"
+		                                               : (std::string("not offered here (") + sl::getResultAsStr(result) +
+		                                                  "; an NVIDIA RTX GPU and a recent driver)")
+		                                                     .c_str());
+		std::fflush(stdout);
+	}
+#endif
+	if (g_generate == 0) {
+		return {};
+	}
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// (Streamline answers before the device too: its programming guide asks while the adapters are enumerated. Issue
+	// #45: a device refused with no word why; the driver's own refusal says nothing either.)
+	sl::AdapterInfo adapter {};
+	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
+	const auto  result       = g_api.is_feature_supported(sl::kFeatureDLSS_G, adapter);
+	std::string problem;
+	switch (result) {
+		case sl::Result::eOk: break;
+		case sl::Result::eErrorOSDisabledHWS:
+			problem = "Windows' hardware-accelerated GPU scheduling is off (Settings > System > Display > Graphics > "
+			          "Advanced graphics settings; then restart the PC)";
+			break;
+		case sl::Result::eErrorOSOutOfDate: problem = "this Windows version is too old for DLSS frame generation"; break;
+		case sl::Result::eErrorDriverOutOfDate: problem = "the NVIDIA driver is too old for DLSS frame generation"; break;
+		case sl::Result::eErrorNoSupportedAdapterFound:
+		case sl::Result::eErrorAdapterNotSupported:
+			problem = "this graphics card has no DLSS frame generation (NVIDIA RTX 40 or newer)";
+			break;
+		default: problem = std::string("Streamline does not offer DLSS frame generation here (") + sl::getResultAsStr(result) + ")"; break;
+	}
+	if (problem.empty()) {
+		LOGF("frame generation: Streamline offers DLSS-G with this GPU, driver and Windows\n");
+		std::printf("Frame generation: Streamline offers DLSS-G with this GPU, driver and Windows\n");
+	} else {
+		LOGF("frame generation: %s\n", problem.c_str());
+		std::printf("Frame generation: %s\n", problem.c_str());
+	}
+	// (Where the driver's reservations go, for a refused device's log: RefusedDeviceAdvice.)
+	PROCESS_MITIGATION_ASLR_POLICY aslr {};
+	if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessASLRPolicy, &aslr, sizeof(aslr))) {
+		std::printf("Frame generation: bottom-up ASLR %s for the emulator\n", aslr.EnableBottomUpRandomization != 0 ? "on" : "off");
+	}
+	std::fflush(stdout);
+	return problem;
+#else
+	(void)physical_device;
+	return {};
+#endif
+}
+
+std::string RefusedDeviceAdvice() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// (The emulator is built with fixed addresses, so without bottom-up ASLR its host allocations pack upward from the
+	// guest's ceiling; an RTX 5080's driver refused the device until Exploit protection forced it on for the emulator.)
+	PROCESS_MITIGATION_ASLR_POLICY aslr {};
+	if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessASLRPolicy, &aslr, sizeof(aslr)) &&
+	    aslr.EnableBottomUpRandomization == 0) {
+		return " If it keeps failing, in Windows Security: App & browser control > Exploit protection > Program settings > "
+		       "add kyty_emulator.exe > Randomize memory allocations (Bottom-up ASLR): Override system settings, On "
+		       "(issue #45).";
+	}
+#endif
+	return {};
+}
+
 bool StreamlineLoaded() {
-	return g_generate > 0 || g_dlss_sr || g_taa_dlss;
+	return g_generate > 0 || g_dlss_sr || g_taa_dlss || g_upscale;
 }
 
 int GeneratedFrames() {
@@ -462,10 +572,14 @@ bool WantsCamera() {
 	return g_ready && !g_camera.valid;
 }
 
+bool InputsGathered() {
+	return g_sources.valid && g_camera.valid;
+}
+
 void BypassCommandHooks(vk::Device device) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// KYTY_FRAMEGEN_HOOKS=1 keeps Streamline's wrappers (for comparison).
-	if ((g_generate == 0 && !g_dlss_sr && !g_taa_dlss) || std::getenv("KYTY_FRAMEGEN_HOOKS") != nullptr) {
+	if ((g_generate == 0 && !g_dlss_sr && !g_taa_dlss && !g_upscale) || std::getenv("KYTY_FRAMEGEN_HOOKS") != nullptr) {
 		return;
 	}
 	// The real loader: Streamline itself forwards to it.
@@ -549,10 +663,25 @@ void Initialize() {
 		// upscaler alone: 10-17 the Nexus went black and lost the ghosts and glowing runes, drawn after the TAA.)
 		g_taa_bypass_match = !(std::getenv("KYTY_TAA_BYPASS_MODE") != nullptr &&
 		                       std::string(std::getenv("KYTY_TAA_BYPASS_MODE")) == "raw");
+		// KYTY_UPSCALER: the game's PS5 Pro path (its upscaler in place of the TAA) with DLSS, XeSS or FSR.
+		const char* upscaler = std::getenv("KYTY_UPSCALER");
+		const std::string kind = upscaler != nullptr ? upscaler : "";
+		g_sr_kind = kind == "dlss" ? 1 : kind == "xess" ? 2 : kind == "fsr" ? 3 : 0;
+		g_upscale = g_sr_kind == 1;
 	}
-	if (g_generate == 0 && !g_dlss_sr && !g_taa_dlss) {
+	if (g_generate == 0 && !g_dlss_sr && !g_taa_dlss && !g_upscale) {
 		return;
 	}
+	// (Every way out without Streamline turns both off.)
+	struct Off {
+		bool done = false;
+		~Off() {
+			if (!done) {
+				g_generate = 0;
+				g_upscale  = false;
+			}
+		}
+	} off;
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// NVIDIA's Streamline runtime, which no release ships (the user's own copy: the Streamline SDK's bin\x64):
 	// KYTY_STREAMLINE_DIR (the launcher's "Streamline..." folder, run-windows -StreamlineDir), else a "streamline"
@@ -631,8 +760,9 @@ void Initialize() {
 	static const std::wstring log_dir    = (dir.parent_path() / "logs").wstring();
 	static const wchar_t*     plugin_paths[] {plugin_dir.c_str()};
 	// KYTY_FRAMEGEN_FEATURES=dlssg,reflex,pcl: the plugins to load (a diagnostic subset).
-	static std::vector<sl::Feature> features {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
-	if (const char* list = std::getenv("KYTY_FRAMEGEN_FEATURES"); list != nullptr) {
+	static std::vector<sl::Feature> features;
+	if (g_generate > 0) features = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
+	if (const char* list = std::getenv("KYTY_FRAMEGEN_FEATURES"); list != nullptr && g_generate > 0) {
 		const std::string text = list;
 		features.clear();
 		if (text.find("dlssg") != std::string::npos) features.push_back(sl::kFeatureDLSS_G);
@@ -642,7 +772,7 @@ void Initialize() {
 	// DLSS super resolution (KYTY_UPSCALE=dlss, KYTY_TAA_REPLACE=dlss): its plugin too. Without frame generation the
 	// same plugins are loaded all the same (DLSS-G then stays off): with only the DLSS plugin the emulator closed as the
 	// Vulkan device was made (logs 005353, 013603), with the frame generation set it ran.
-	if (g_dlss_sr || g_taa_dlss) features.push_back(sl::kFeatureDLSS);
+	if (g_dlss_sr || g_taa_dlss || g_upscale) features.push_back(sl::kFeatureDLSS);
 	sl::Preferences           preferences {};
 	preferences.showConsole        = false;
 	preferences.logLevel           = std::getenv("KYTY_FRAMEGEN_VERBOSE") ? sl::LogLevel::eVerbose
@@ -671,8 +801,9 @@ void Initialize() {
 	// goes through Streamline, which adds what DLSS-G needs.
 	SetEnvironmentVariableW(L"SDL_VULKAN_LIBRARY", interposer.c_str());
 	_putenv_s("SDL_VULKAN_LIBRARY", interposer.string().c_str());
-	LOGF("frame generation: Streamline loaded from %s, %d generated frame(s)\n",
-	     dir.string().c_str(), g_generate);
+	LOGF("frame generation: Streamline loaded from %s, %d generated frame(s), DLSS super resolution %s\n",
+	     dir.string().c_str(), g_generate, g_upscale ? "asked for" : "off");
+	off.done = true;
 #else
 	LOGF("frame generation: this build has no Streamline support\n");
 	g_generate = 0;
@@ -684,13 +815,26 @@ void Initialize() {
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device) {
 	(void)instance;
 	(void)device;
-	if (g_generate == 0 && !g_dlss_sr && !g_taa_dlss) {
+	if (g_generate == 0 && !g_dlss_sr && !g_taa_dlss && !g_upscale) {
 		return;
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	sl::AdapterInfo adapter {};
 	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
 	bool loaded              = false;
+	if (g_upscale) {
+		bool dlss_loaded = false;
+		if (g_api.is_feature_supported(sl::kFeatureDLSS, adapter) == sl::Result::eOk &&
+		    g_api.is_feature_loaded(sl::kFeatureDLSS, dlss_loaded) == sl::Result::eOk && dlss_loaded &&
+		    FeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", g_api.dlss_set_options) &&
+		    FeatureFunction(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", g_api.dlss_get_optimal_settings)) {
+			g_upscale_ready = true;
+			std::printf("DLSS super resolution (PS5 Pro path): ready\n");
+		} else {
+			std::printf("DLSS super resolution (PS5 Pro path): not available on this device\n");
+		}
+		std::fflush(stdout);
+	}
 	if (g_dlss_sr || g_taa_dlss) {
 		bool dlss_loaded = false;
 		if (g_api.is_feature_supported(sl::kFeatureDLSS, adapter) != sl::Result::eOk ||
@@ -779,6 +923,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
 	}
 	g_ready = true;
+	InitializeHudless();
 	LOGF("frame generation: DLSS-G ready\n");
 	std::printf("Frame generation: DLSS-G ready (%d generated frame(s) per frame)\n", g_generate);
 	std::fflush(stdout);
@@ -813,7 +958,10 @@ sl::Constants MakeConstants(bool usable, const Camera& camera_in, vk::Extent2D r
 	constants.depthInverted       = sl::Boolean::eTrue;
 	constants.cameraMotionIncluded = sl::Boolean::eTrue;
 	constants.motionVectors3D     = sl::Boolean::eFalse;
-	constants.reset               = usable ? sl::Boolean::eFalse : sl::Boolean::eTrue;
+	// (A frame left unshown before this one: its motion and matrices are to the game's previous frame, not to the one
+	// presented last.)
+	const bool discontinuity      = g_discontinuity.exchange(false, std::memory_order_relaxed);
+	constants.reset               = usable && !discontinuity ? sl::Boolean::eFalse : sl::Boolean::eTrue;
 	constants.orthographicProjection = sl::Boolean::eFalse;
 	constants.motionVectorsDilated   = sl::Boolean::eFalse;
 	constants.motionVectorsJittered  = sl::Boolean::eFalse;
@@ -1169,6 +1317,9 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		    result != sl::Result::eOk && g_presents < 8) {
 			LOGF("frame generation: slSetTagForFrame failed (%d)\n", static_cast<int>(result));
 		}
+		if (HudlessOn()) {
+			TagHudless(token, *inputs, game);
+		}
 	} else {
 		// Menus, movies, loading: no valid depth and motion (DLSS-G then presents the frame as is).
 		sl::ResourceTag tags[] {
@@ -1228,6 +1379,31 @@ void AfterPresent() {
 		std::fflush(stdout);
 	}
 #endif
+}
+
+void SwapchainChanging() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// Off before the swapchain is made again (DLSS-G guide: before a resize or a full screen change).
+	if (!g_ready || !g_mode_on) return;
+	sl::DLSSGOptions options {};
+	options.mode                = sl::DLSSGMode::eOff;
+	options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
+	options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
+	if (const auto result = g_api.dlssg_set_options(sl::ViewportHandle {0}, options); result != sl::Result::eOk)
+		LOGF("frame generation: slDLSSGSetOptions (off) failed (%d)\n", static_cast<int>(result));
+	g_mode_on     = false;
+	g_run_with    = 0;
+	g_options_set = false; // (the next present sends its sizes again)
+#endif
+}
+
+void NoteDroppedFrame() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	g_discontinuity.store(true, std::memory_order_relaxed);
+#endif
+	static std::atomic<uint32_t> dropped {0};
+	if (const auto count = dropped.fetch_add(1, std::memory_order_relaxed) + 1; count <= 8 || count % 600 == 0)
+		LOGF("frame generation: %u frame(s) with inputs left unshown (the next resets DLSS-G's history)\n", count);
 }
 
 uint32_t PresentedFrames() {
@@ -1319,6 +1495,10 @@ void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId
 	if (!IsTaaShader(cs_hash)) {
 		return;
 	}
+	g_sources = {depth, motion, depth_address, motion_address, true};
+}
+
+void OnUpscale(ImageId depth, uint64_t depth_address, ImageId motion, uint64_t motion_address) {
 	g_sources = {depth, motion, depth_address, motion_address, true};
 }
 
@@ -2642,6 +2822,236 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	inputs.valid         = true;
 }
 
+bool UpscalerReady() {
+	if (g_sr_kind == 2) return Xess::Ready();
+	if (g_sr_kind == 3) return Fsr3::SrReady();
+	return g_upscale_ready;
+}
+
+namespace {
+// The PS5 Pro path's images as our upscalers take them.
+void AsVulkanImage(const UpscaleImage& in, VulkanImage& out) {
+	out.format = in.format;
+	out.extent = vk::Extent3D {in.extent.width, in.extent.height, 1};
+	out.usage  = in.usage;
+	out.image  = in.image;
+}
+bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
+	VulkanImage color, depth, motion, output;
+	AsVulkanImage(inputs.color, color);
+	AsVulkanImage(inputs.depth, depth);
+	AsVulkanImage(inputs.motion, motion);
+	AsVulkanImage(inputs.output, output);
+	const float fov = inputs.view_to_clip[5] != 0.0f ? 2.0f * std::atan(1.0f / std::fabs(inputs.view_to_clip[5])) : 1.0f;
+	bool done = false;
+	if (g_sr_kind == 2) {
+		Xess::UpscaleDesc x;
+		x.command     = static_cast<VkCommandBuffer>(command);
+		x.color       = &color;
+		x.color_view  = inputs.color.view;
+		x.depth       = &depth;
+		x.depth_view  = inputs.depth.view;
+		x.motion      = &motion;
+		x.motion_view = inputs.motion.view;
+		x.output      = &output;
+		x.output_view = inputs.output.view;
+		x.render      = inputs.color.extent;
+		x.upscale     = inputs.output.extent;
+		x.reset       = inputs.reset;
+		x.jitter[0]   = inputs.jitter_x;
+		x.jitter[1]   = inputs.jitter_y;
+		x.mv_scale[0] = inputs.motion_scale_x;
+		x.mv_scale[1] = inputs.motion_scale_y;
+		done          = Xess::Upscale(x);
+	} else if (g_graphics_ctx != nullptr) {
+		static auto last = std::chrono::steady_clock::now();
+		const auto  now  = std::chrono::steady_clock::now();
+		const float delta = std::chrono::duration<float, std::milli>(now - last).count();
+		last              = now;
+		Fsr3::UpscaleDesc desc;
+		desc.command     = static_cast<VkCommandBuffer>(command);
+		desc.color       = &color;
+		desc.depth       = &depth;
+		desc.motion      = &motion;
+		desc.output      = &output;
+		desc.render      = inputs.color.extent;
+		desc.upscale     = inputs.output.extent;
+		desc.reset       = inputs.reset;
+		desc.delta_ms    = delta;
+		desc.jitter[0]   = inputs.jitter_x;
+		desc.jitter[1]   = inputs.jitter_y;
+		desc.mv_scale[0] = inputs.motion_scale_x;
+		desc.mv_scale[1] = inputs.motion_scale_y;
+		desc.fov         = fov;
+		desc.z_near      = inputs.near_plane;
+		done             = Fsr3::Upscale(*g_graphics_ctx, desc);
+	}
+	static bool said = false;
+	if (!said) {
+		said = true;
+		std::printf("Super resolution (PS5 Pro path): %s %ux%u -> %ux%u%s\n", g_sr_kind == 2 ? "XeSS" : "FSR 3.1",
+		            inputs.color.extent.width, inputs.color.extent.height, inputs.output.extent.width,
+		            inputs.output.extent.height, done ? "" : " (failed: stretched)");
+		std::fflush(stdout);
+	}
+	return done;
+}
+} // namespace
+
+bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
+	if (g_sr_kind == 2 || g_sr_kind == 3) return UpscaleOurs(command, inputs);
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_upscale_ready) return false;
+	// Its own viewport: DLSS-G's (0) takes its constants and tags at the present.
+	const sl::ViewportHandle viewport {1};
+	static vk::Extent2D options_render {}, options_output {};
+	if (options_render != inputs.color.extent || options_output != inputs.output.extent) {
+		// The mode by the input's share of the output's height (DLSS takes any input size; the mode picks its model and
+		// limits): PS5 Pro's 1512 of 2160 and 1440 are quality, 1080 performance, the output's own DLAA.
+		const double share = static_cast<double>(inputs.color.extent.height) / inputs.output.extent.height;
+		sl::DLSSOptions options {};
+		options.mode = share >= 0.95   ? sl::DLSSMode::eDLAA
+		               : share >= 0.62 ? sl::DLSSMode::eMaxQuality
+		               : share >= 0.55 ? sl::DLSSMode::eBalanced
+		               : share >= 0.45 ? sl::DLSSMode::eMaxPerformance
+		                               : sl::DLSSMode::eUltraPerformance;
+		options.outputWidth     = inputs.output.extent.width;
+		options.outputHeight    = inputs.output.extent.height;
+		options.colorBuffersHDR = sl::Boolean::eTrue; // (the game's linear HDR scene, before its tone mapping)
+		options.useAutoExposure = sl::Boolean::eTrue;
+		// KYTY_DLSS_PRESET=<letter> (a test): that DLSS model for every mode instead of the mode's default.
+		if (const char* preset = std::getenv("KYTY_DLSS_PRESET"); preset != nullptr && *preset >= 'A' && *preset <= 'O') {
+			const auto value = static_cast<sl::DLSSPreset>(*preset - 'A' + 1);
+			options.dlaaPreset = options.qualityPreset = options.balancedPreset = options.performancePreset =
+			    options.ultraPerformancePreset = options.ultraQualityPreset = value;
+		}
+		if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk) {
+			std::printf("DLSS super resolution: slDLSSSetOptions failed (%s)\n", sl::getResultAsStr(result));
+			std::fflush(stdout);
+			return false;
+		}
+		sl::DLSSOptimalSettings settings {};
+		(void)g_api.dlss_get_optimal_settings(options, settings);
+		std::printf("DLSS super resolution: %ux%u -> %ux%u, mode %u (its range %ux%u-%ux%u)\n", inputs.color.extent.width,
+		            inputs.color.extent.height, inputs.output.extent.width, inputs.output.extent.height,
+		            static_cast<uint32_t>(options.mode), settings.renderWidthMin, settings.renderHeightMin,
+		            settings.renderWidthMax, settings.renderHeightMax);
+		std::fflush(stdout);
+		options_render = inputs.color.extent;
+		options_output = inputs.output.extent;
+	}
+	static uint32_t frame = 0;
+	++frame;
+	sl::FrameToken* token = nullptr;
+	if (g_api.get_new_frame_token(token, &frame) != sl::Result::eOk || token == nullptr) return false;
+
+	sl::Constants constants {};
+	Mat4          identity;
+	for (uint32_t i = 0; i < 4; ++i) {
+		identity[i] = sl::float4(i == 0, i == 1, i == 2, i == 3);
+	}
+	Mat4 view_to_clip;
+	for (uint32_t i = 0; i < 4; ++i) {
+		view_to_clip[i] = sl::float4(inputs.view_to_clip[i * 4], inputs.view_to_clip[i * 4 + 1], inputs.view_to_clip[i * 4 + 2],
+		                             inputs.view_to_clip[i * 4 + 3]);
+	}
+	constants.cameraViewToClip = view_to_clip;
+	if (!Inverted(view_to_clip, constants.clipToCameraView)) constants.clipToCameraView = identity;
+	constants.clipToLensClip      = identity;
+	constants.clipToPrevClip      = identity;
+	constants.prevClipToClip      = identity;
+	constants.jitterOffset        = sl::float2(inputs.jitter_x, inputs.jitter_y);
+	// (Streamline's motion vectors are in render-size UV units: its scale makes them so from the game's pixels.)
+	constants.mvecScale = sl::float2(inputs.motion_scale_x / static_cast<float>(inputs.color.extent.width),
+	                                 inputs.motion_scale_y / static_cast<float>(inputs.color.extent.height));
+	constants.cameraPinholeOffset = sl::float2(0.0f, 0.0f);
+	constants.cameraPos           = sl::float3(0, 0, 0);
+	constants.cameraUp            = sl::float3(0, 1, 0);
+	constants.cameraRight         = sl::float3(1, 0, 0);
+	constants.cameraFwd           = sl::float3(0, 0, 1);
+	constants.cameraNear          = inputs.near_plane;
+	constants.cameraFar           = inputs.far_plane;
+	constants.cameraFOV           = inputs.view_to_clip[5] != 0.0f ? 2.0f * std::atan(1.0f / std::fabs(inputs.view_to_clip[5])) : 1.0f;
+	constants.cameraAspectRatio   = static_cast<float>(inputs.color.extent.width) / static_cast<float>(inputs.color.extent.height);
+	constants.motionVectorsInvalidValue = sl::INVALID_FLOAT;
+	constants.depthInverted             = sl::Boolean::eTrue;
+	constants.cameraMotionIncluded      = sl::Boolean::eTrue;
+	constants.motionVectors3D           = sl::Boolean::eFalse;
+	constants.reset                     = inputs.reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+	constants.orthographicProjection    = sl::Boolean::eFalse;
+	constants.motionVectorsDilated      = sl::Boolean::eFalse;
+	constants.motionVectorsJittered     = sl::Boolean::eFalse;
+	if (const auto result = g_api.set_constants(constants, *token, viewport); result != sl::Result::eOk) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("DLSS super resolution: slSetConstants failed (%s)\n", sl::getResultAsStr(result));
+		return false;
+	}
+	const auto resource = [](const UpscaleImage& image) {
+		sl::Resource r(sl::ResourceType::eTex2d, static_cast<VkImage>(image.image), nullptr, static_cast<VkImageView>(image.view),
+		               static_cast<uint32_t>(static_cast<VkImageLayout>(image.layout)));
+		r.width        = image.extent.width;
+		r.height       = image.extent.height;
+		r.nativeFormat = static_cast<uint32_t>(static_cast<VkFormat>(image.format));
+		r.mipLevels    = 1;
+		r.arrayLayers  = 1;
+		r.flags        = 0;
+		r.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.usage));
+		return r;
+	};
+	auto             color  = resource(inputs.color);
+	auto             depth  = resource(inputs.depth);
+	auto             motion = resource(inputs.motion);
+	auto             output = resource(inputs.output);
+	// (KYTY_SR_LOG: the first two evaluations' images and constants.)
+	static const bool describe = std::getenv("KYTY_SR_LOG") != nullptr;
+	if (static std::atomic<uint32_t> described {0}; describe && described.fetch_add(1, std::memory_order_relaxed) < 2) {
+		const std::pair<const char*, const UpscaleImage*> images[] {
+		    {"color", &inputs.color}, {"depth", &inputs.depth}, {"motion", &inputs.motion}, {"output", &inputs.output}};
+		for (const auto& [name, image]: images) {
+			std::printf("DLSS super resolution: %s image %p view %p layout %d format %d %ux%u usage 0x%x\n", name,
+			            static_cast<void*>(static_cast<VkImage>(image->image)),
+			            static_cast<void*>(static_cast<VkImageView>(image->view)), static_cast<int>(image->layout),
+			            static_cast<int>(image->format), image->extent.width, image->extent.height,
+			            static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image->usage)));
+		}
+		std::printf("DLSS super resolution: jitter %g %g, motion scale %g %g, reset %d, near %g far %g\n", inputs.jitter_x,
+		            inputs.jitter_y, inputs.motion_scale_x, inputs.motion_scale_y, inputs.reset ? 1 : 0, inputs.near_plane,
+		            inputs.far_plane);
+		std::fflush(stdout);
+	}
+	const sl::Extent render {0, 0, inputs.color.extent.width, inputs.color.extent.height};
+	const sl::Extent full {0, 0, inputs.output.extent.width, inputs.output.extent.height};
+	const sl::ResourceTag tags[] {
+	    sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
+	    sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &full),
+	    sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
+	    sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
+	};
+	auto* command_buffer = reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(command));
+	if (const auto result = g_api.set_tag_for_frame(*token, viewport, tags, static_cast<uint32_t>(std::size(tags)), command_buffer);
+	    result != sl::Result::eOk) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("DLSS super resolution: slSetTagForFrame failed (%s)\n", sl::getResultAsStr(result));
+		return false;
+	}
+	const sl::BaseStructure* evaluate_inputs[] {&viewport};
+	if (const auto result = g_api.evaluate(sl::kFeatureDLSS, *token, evaluate_inputs, 1, command_buffer);
+	    result != sl::Result::eOk) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("DLSS super resolution: slEvaluateFeature failed (%s)\n", sl::getResultAsStr(result));
+		return false;
+	}
+	return true;
+#else
+	(void)command;
+	(void)inputs;
+	return false;
+#endif
+}
+
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 	for (auto* view: {&inputs.depth_view, &inputs.motion_view, &inputs.hudless_view, &inputs.hudless_display_view}) {
 		if (*view != nullptr) {
@@ -2654,6 +3064,7 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 			graphics.DeleteImage(*image);
 		}
 	}
+	DestroyHudlessInputs(graphics, inputs);
 	inputs.valid = false;
 }
 

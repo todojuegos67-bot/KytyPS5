@@ -1,0 +1,23 @@
+#version 450
+// The game's exposure on the upscaled image (renderSuperResolution.cpp): its PS5 Pro path finishes the frame from an
+// image already multiplied by it, which Sony's upscaler made and DLSS does not. In place: each invocation reads and
+// writes its own pixel (the image general, read through a sampled view, written through a storage view). The exposure
+// is the float the game's 1x1 exposure texture holds, read from its memory as a buffer.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 1) writeonly uniform image2D target;
+layout(set = 0, binding = 2, std430) readonly buffer Exposure {
+    float values[];
+} exposure;
+layout(push_constant) uniform Parameters {
+    uint width;
+    uint height;
+    uint index;
+} parameters;
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(parameters.width) || p.y >= int(parameters.height)) return;
+    float scale = exposure.values[parameters.index];
+    if (!(scale > 0.0 && scale < 65536.0)) scale = 1.0;
+    imageStore(target, p, vec4(texelFetch(source, p, 0).rgb * scale, 1.0));
+}

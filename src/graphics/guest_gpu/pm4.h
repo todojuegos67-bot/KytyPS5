@@ -88,6 +88,8 @@ constexpr uint32_t R_FLIP           = 0x17;
 constexpr uint32_t R_RELEASE_MEM    = 0x18;
 constexpr uint32_t R_DMA_DATA       = 0x19;
 constexpr uint32_t R_CONTEXT_STATE  = 0x1A;
+// Sony's PSSR dispatch (libs/libPsml.cpp; graphics/guest_gpu/superResolution.h).
+constexpr uint32_t R_SUPER_RESOLUTION = 0x1B;
 
 constexpr uint32_t R_NUM = 0x3F + 1;
 

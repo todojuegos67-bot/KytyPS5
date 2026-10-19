@@ -74,6 +74,8 @@ public:
 		return owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size) ? *owner : BufferId {};
 	}
 	void                   EnsureBufferContents(uint64_t vaddr, uint64_t size);
+	// The start of each range shaders read through pointers held by a buffer with the guest's bytes (see the definition).
+	void                   EnsureBdaReadable(std::span<const GuestRange> ranges);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -96,7 +98,12 @@ public:
 	[[nodiscard]] const Buffer* GetLodStatsBuffer() const noexcept { return &m_lod_stats_buffer; }
 	void ReportLodStats(void* dst, uint32_t size, bool reset);
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	// The BDA page table descriptor writes take (the newest: GrowBdaTable). A set made with it records
+	// BdaTableGeneration() read before it, and is made again once that moved.
+	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return m_bda_table.load(std::memory_order_acquire); }
+	[[nodiscard]] static uint64_t BdaTableGeneration() noexcept {
+		return s_bda_table_generation.load(std::memory_order_acquire);
+	}
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	// `refillable`: set when the bytes went to the staging ring by the upload worker (RefillImageStaging may copy them
 	// again while the upload is unsubmitted).
@@ -174,6 +181,11 @@ public:
 	// needs no second ObtainBuffer (TableBlocks' memo).
 	[[nodiscard]] uint64_t WrittenObtainEpoch() const { return m_written_obtain_epoch.load(std::memory_order_acquire); }
 	void                   MoveWrittenObtainEpoch() { m_written_obtain_epoch.fetch_add(1, std::memory_order_acq_rel); }
+	// Moves whenever a buffer is unregistered (deleted, or joined into a new one): Vulkan buffers a binding resolved
+	// before it is unchanged are still the owners of their bytes. A join copies the old buffer's bytes into the new
+	// one in the open command buffer, so a binding to the old one GPU work records after it reads or writes bytes
+	// nothing reads again (the old buffer lives until the tick). The render thread's.
+	[[nodiscard]] uint64_t UnregisterEpoch() const { return m_unregister_epoch; }
 	// A buffer registered or unregistered in the tracker regions of the range since `epoch`.
 	[[nodiscard]] bool RegisteredSince(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
 		for (auto region = vaddr / TRACKER_REGION_SIZE, last = (vaddr + size - 1) / TRACKER_REGION_SIZE; region <= last; ++region)
@@ -273,6 +285,10 @@ private:
 	}
 	[[nodiscard]] static std::pair<uint64_t, uint64_t> DownloadEnvelope(const DownloadCopy& copy);
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	// The BDA page tables' entries [first, first + count): written (`entries`) or cleared (null), in every table that
+	// holds them (m_bda_tables). GrowBdaTable: a table with `entries` entries at least replaces the newest.
+	void WriteBdaEntries(uint64_t first, uint64_t count, const vk::DeviceAddress* entries);
+	void GrowBdaTable(uint64_t entries);
 	// GPU thread: InvalidateMemoryForWrite's work where GPU-written bytes are in the range.
 	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
@@ -324,12 +340,18 @@ private:
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_lod_stats_buffer;
-	Buffer                                            m_bda_pagetable_buffer;
+	// The BDA page tables: the newest last (m_bda_table), the ones it replaced kept and written alike - sets made before
+	// it grew may still read them, never a freed buffer or a stale entry (GrowBdaTable).
+	std::vector<std::unique_ptr<Buffer>>              m_bda_tables;
+	std::atomic<Buffer*>                              m_bda_table {nullptr};
+	bool                                              m_bda_zeroed = false; // the first table (WriteBdaEntries)
+	static inline std::atomic<uint64_t>               s_bda_table_generation {0};
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
 	// (Read by a speculative translation's thread: src/graphics/guest_gpu/speculation.h.)
 	std::atomic<uint64_t> m_registration_epoch {1};
+	uint64_t              m_unregister_epoch {1};
 	// Per tracker region, see RegionRegistrationEpoch.
 	std::unique_ptr<std::atomic<uint64_t>[]> m_region_registrations =
 	    std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);

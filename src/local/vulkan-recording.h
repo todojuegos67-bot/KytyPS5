@@ -34,6 +34,9 @@ bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
                    std::shared_ptr<const void> owner = {});
 // Preserve order when a packet cannot fit. Does not retain any argument.
 void ReplayInline(ReplayPacket replay, std::span<const Segment> segments);
+// A packet's replay that records commands the recording does not see (a library's own: DLSS through Streamline)
+// ends the reuse of bound pipelines and dynamic state the draws' replays keep, as a direct call does.
+void InvalidateReplayState();
 // Command-buffer begin/end and queue submission, queued in order with the recorded
 // commands instead of draining the recording queue first (KYTY_DEFERRED_SUBMIT).
 // A submit packet is published at once: other threads may wait on its tick.

@@ -391,6 +391,7 @@ void ReplayInline(ReplayPacket replay, std::span<const Segment> segments) {
     if (producer) producer->BeforeDirect();
     replay(segments, original);
 }
+void InvalidateReplayState() { InvalidateRawState(); }
 ProducerScope::ProducerScope() {
     if (producer) std::abort();
     producer = std::make_unique<Stream>();

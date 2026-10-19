@@ -10,7 +10,8 @@ _PipelineCache/
 /no-precompile-prompt.txt
 /launcher-settings.json
 
-# Runtime data (saves, dev logs)
+# Runtime data (saves, dev logs, F9's debug snapshots)
 _DevLog/
 _SaveData/
+_DebugSnapshots/
 __pycache__/

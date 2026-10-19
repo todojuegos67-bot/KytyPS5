@@ -466,3 +466,23 @@ licenses included with those components.
   of the original Kyty project.
 - [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for memory-model
   understanding and the AVPlayer implementation.
+
+## Contributors to this fork
+
+Code from these contributors is part of this branch. Thank you!
+
+- [@nerdjb](https://github.com/nerdjb): the Linux port fixes, the `int 0x41` skip on Linux, Linux packaging
+  (`build-linux.sh`, the Linux workflow), the live-budget texture collector and `run_ds.sh`
+  ([#3](https://github.com/chenxiao07/KytyPS5/pull/3); its commits carry the author name "CachyOS", mapped in `.mailmap`).
+- [@Myoko](https://github.com/Myoko): DualSense haptics and a resizable window ([#18](https://github.com/chenxiao07/KytyPS5/pull/18)),
+  add-on content ([#25](https://github.com/chenxiao07/KytyPS5/pull/25)), CJK text in the save dialogs
+  ([#75](https://github.com/chenxiao07/KytyPS5/pull/75)).
+- [@todojuegos67-bot](https://github.com/todojuegos67-bot): wave OR in pixel shaders, the water in Demon's Souls
+  ([#19](https://github.com/chenxiao07/KytyPS5/pull/19)).
+- [@MikeSee0](https://github.com/MikeSee0): Windows build tool selection ([#39](https://github.com/chenxiao07/KytyPS5/pull/39)).
+- [@iSamigor](https://github.com/iSamigor): AMD pipeline cache keys and unwritten color targets
+  ([#41](https://github.com/chenxiao07/KytyPS5/pull/41)).
+- [@Vorshim92](https://github.com/Vorshim92): GPU buffers back in video memory ([#44](https://github.com/chenxiao07/KytyPS5/pull/44)),
+  HUD-less frame generation ([#72](https://github.com/chenxiao07/KytyPS5/pull/72)), save bookkeeping after a power cut
+  ([#74](https://github.com/chenxiao07/KytyPS5/pull/74)).
+- [@Sandermand](https://github.com/Sandermand): AudioOut2 catch-up ([#68](https://github.com/chenxiao07/KytyPS5/pull/68)).

@@ -38,3 +38,13 @@ profile 里改过的函数会因哈希不符而失去 PGO，需要重新训练�
 1-1 站立，ab-exe 两轮 ABBA（需要 `-StartupSeconds 240`：16 GB 下 1-1 要约 180 s 才到 HUD）：
 渲染线程 33.60 → 32.00 ms/帧（-4.8%），fps 22.87 → 23.12（站立时帧还在等游戏侧）。
 清理构建可以用 `ninja -C _Build\windows -t clean` 代替 `cmake --build ... --target clean`。
+
+2026-10-18（台式机，RTX 5090）：6bae2db5 之后的提交让 29 个 TU 里 75 个函数失配（扫描：用 `ninja -t compdb -x` 取编译命令，
+把 `-Wno-profile-instr-out-of-date` 换成 `-Wprofile-instr-out-of-date`，-O0、不带 LTO 逐个编译，看每个 TU 的
+"of N functions, M have mismatched data"；前端的 CFG 哈希与优化级别无关）。热函数里加任何 if/循环/&&/||/?: 都会让它整个
+失去 profile，诊断代码要放到函数外、用无条件调用。在 670eee86 上训练四个场景后合并：默认存档（序章）、`user-20261001`、
+`world-latria`、`rec-m02_00_00_00-c0000_0006`（1-1 竞技场，光照循环和 fe93 那类小 dispatch 多）。重扫只剩两处，都是
+按设计的：graphicsRun.cpp 的 live 命令处理（有 `KYTY_PGO_GENERATE` 才有的分支）和 redZonePatcher.cpp（加载器）。
+ab-exe ABBA，120 Hz 上限（`-Vblank 120`），走 10 s 后两个 6 s 窗口：
+- 1-1：渲染线程 13.52 → 12.81 ms/帧（-5.3%），fps 65.3 → 69.3（A 的第一轮带预热，去掉它 +2.7%）；
+- Latria：12.47 → 12.15 ms/帧（-2.6%），fps 75.2 → 76.1。

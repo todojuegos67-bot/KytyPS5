@@ -233,6 +233,7 @@ constexpr auto MakeCustomOpcodeDispatchTable() {
 	g_cp_op_custom_func[Pm4::R_FLIP]           = CpOpFlip;
 	g_cp_op_custom_func[Pm4::R_RELEASE_MEM]    = CpOpReleaseMem;
 	g_cp_op_custom_func[Pm4::R_CONTEXT_STATE]  = CpOpContextState;
+	g_cp_op_custom_func[Pm4::R_SUPER_RESOLUTION] = CpOpSuperResolution;
 
 	return g_cp_op_custom_func;
 }

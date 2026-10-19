@@ -75,9 +75,15 @@ public:
 
 class Image final {
 public:
-	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	// `may_fail`: an image the GPU cannot make (its memory full, more layers or bytes than the format allows) is left
+	// without one (CreateFailed) instead of ending the emulator: a sampled texture's lookup binds a null image instead.
+	// One that must exist is tried past those limits, and left without one only when its memory could not be had
+	// (TextureCache::InsertImage makes room and tries again).
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info, bool may_fail = false);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
+
+	[[nodiscard]] bool CreateFailed() const noexcept { return m_create_failed; }
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	// A parked image taken back for `image_info` (TextureCache::TakeParkedImage, the same Vulkan image): the state the
@@ -320,8 +326,10 @@ private:
 			}
 			at = m_buffer_ranges.erase(at, last);
 			m_buffer_ranges.insert(at, {begin, end});
-			// (Past a few, all of it: what a whole upload costs.)
-			if (m_buffer_ranges.size() > 16) {
+			// (Past a few, all of it: what a whole upload costs. More in an image uploaded a piece at a time anyway (256 MiB
+			// and up, TextureCache's ChunkedUploadMin), where the whole is GBs: a texture pool's range over memory the GPU
+			// writes in many places, issue #49.)
+			if (m_buffer_ranges.size() > (info.data.size >= (uint64_t {256} << 20u) ? 256u : 16u)) {
 				m_buffer_whole = true;
 				m_buffer_ranges.clear();
 			}
@@ -418,6 +426,7 @@ private:
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
+	bool              m_create_failed    = false;
 	uint64_t          m_maybe_cpu_hash   = 0;
 	static void NoteCpuDirty() noexcept { s_cpu_dirty_epoch.fetch_add(1, std::memory_order_release); }
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {1};

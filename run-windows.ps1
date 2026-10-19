@@ -18,6 +18,9 @@
 #   .\run-windows.ps1 -FrameGen 1            DLSS frame generation, 1 generated frame per rendered
 #                                            frame (2x; up to 5, at most what the GPU makes); needs
 #                                            NVIDIA's Streamline runtime (-StreamlineDir)
+#   .\run-windows.ps1 -Upscaler dlss         DLSS super resolution: Demon's Souls' own PS5 Pro path (its 3D at
+#                                            2688x1512 or -RenderHeight, 1080 at least), DLSS in place of Sony's
+#                                            upscaler making the 3840x2160 image; NVIDIA's Streamline runtime
 #   .\run-windows.ps1 -StreamlineDir <dir>   where NVIDIA's Streamline runtime is (the Streamline SDK
 #                                            or its bin\x64; default: a "streamline" folder next to
 #                                            the emulator)
@@ -28,7 +31,7 @@
 #                                            (720-1440; its 4K output and UI stay): faster where the GPU limits
 #   .\run-windows.ps1 -Aspect 21:9           Demon's Souls renders its 3D wider (21:9 = 64:27, up to 32:9; 3416x1440
 #                                            at 21:9), seeing more to the sides; shown at that aspect (the HUD at
-#                                            its sides unstretched, in-game menus stretched), movies at 16:9
+#                                            its sides unstretched; menus and movies stretched)
 #   .\run-windows.ps1 -Quality low            Demon's Souls draws less (low / lowest: shorter shadows and
 #                                            distant detail): faster where the CPU limits
 #   .\run-windows.ps1 -TextureReduce 1       large textures without their largest level: half the size per side
@@ -80,6 +83,9 @@ param(
 	[switch]$NoAsyncShaders,
 	[switch]$FlipWhenReady,
 	[switch]$Fsr3FrameGen,
+	[switch]$Turbo,
+	[switch]$GentlePrecompile,
+	[ValidateSet('', 'dlss', 'xess', 'fsr')][string]$Upscaler = '',
 	[string]$StreamlineDir = '',
 	[string]$Affinity = '',
 	[switch]$AllCcds,
@@ -375,7 +381,7 @@ if ($DlssPreset) { $environment['KYTY_DLSS_PRESET'] = $DlssPreset }
 # the game's TAA skipped, the upscaler gets the raw jittered frame and does the anti-aliasing itself.
 if ($TaaReplace) { $environment['KYTY_TAA_REPLACE'] = $TaaReplace }
 # -Aspect 21:9 (or 32:9, w:h): the 3D rendered at that aspect, its width at the render height (3416x1440), the game's
-# projection widened to match; the presenter shows those frames at the aspect and the others at 16:9.
+# projection widened to match; the presenter shows every frame at the aspect (movies and menus stretched).
 if ($Aspect -and $Aspect -ne '16:9') { $environment['KYTY_RENDER_ASPECT'] = $Aspect }
 # -Quality low|lowest: Demon's Souls engine settings that cut what a frame draws, for PCs whose CPU limits the frame
 # rate (each draw costs the emulator CPU time). low: levels of detail chosen as for a 720-line picture (1080), sun
@@ -442,10 +448,25 @@ if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 # Async shaders (renderDraw.cpp, KYTY_ASYNC_DRAW_PIPELINES): a draw whose pipeline is not compiled yet does
 # not stop the frame; a worker compiles it and the object appears a few frames later. -NoAsyncShaders: off.
 if (!$NoAsyncShaders -and !$Baseline -and !$environment.Contains('KYTY_ASYNC_DRAW_PIPELINES')) { $environment['KYTY_ASYNC_DRAW_PIPELINES'] = '1' }
+# -Turbo: PCs with 16 GB of RAM or less and any graphics card: the video memory caches held to 4.5 GB (about 6 GB for
+# the whole process with the driver's own), textures without their largest level, the GPU treated as a small one
+# (textures yield to render targets; no pipeline warmup), the working set past 5 GB emptied every 15 s, and the
+# game's low detail. Players with 16 GB crashed in heavy zones (Boletaria, the Nexus) even with the safe options.
+if ($Turbo) {
+	$turbo = [ordered]@{ KYTY_VRAM_BUDGET_MB = '4608'; KYTY_GC_BUDGET_CAP_MB = '4608'; KYTY_SMALL_VRAM = '1'
+		KYTY_TEXTURE_REDUCE = '1'; KYTY_TRIM_RAM_SECONDS = '15'; KYTY_TRIM_RAM_MB = '5120'; KYTY_IMAGE_POOL = '0' }
+	foreach ($key in $turbo.Keys) { $environment[$key] = $turbo[$key] }
+	if (!$Quality) {
+		$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars['low']) | Where-Object { $_ }) -join ';'
+	}
+	Write-Host 'memory:   turbo (16 GB PCs): video memory caches 4.5 GB, textures reduced, RAM trimmed every 15 s'
+}
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
+# -Upscaler dlss: src/loader/demonsSoulsSuperResolution.h.
+if ($Upscaler) { $environment['KYTY_UPSCALER'] = $Upscaler }
 # Without -StreamlineDir, the Streamline folder chosen in the launcher (launcher-settings.json), as the launcher passes
 # it: run.cmd -FrameGen 1 had started with frame generation off, its runtime not found (issue #38).
-if (!$StreamlineDir -and $FrameGen -gt 0 -and (Test-Path "$PSScriptRoot\launcher-settings.json")) {
+if (!$StreamlineDir -and ($FrameGen -gt 0 -or $Upscaler) -and (Test-Path "$PSScriptRoot\launcher-settings.json")) {
 	$chosen = try { [string](Get-Content "$PSScriptRoot\launcher-settings.json" -Raw | ConvertFrom-Json).streamline } catch { '' }
 	if ($chosen -and (Test-Path $chosen)) { $StreamlineDir = $chosen }
 }
@@ -596,12 +617,13 @@ if ($Prompt -and ($offer -or !$tested)) {
 				"The precompile compiles every shader of the game once: $time on this PC (with the CPU fully loaded; closing its window stops it, and the next run continues). " +
 				"It is needed only once, and again after a graphics driver update."
 		}
-		$choice, $never = Show-Choice $message @('Precompile first, then start the game', 'Start the game now', 'Quit') "Don't ask about precompiling again"
+		$choice, $never = Show-Choice $message @('Precompile first, then start the game', 'Start the game now', 'Quit', 'Precompile gently (half the CPU, slower)') "Don't ask about precompiling again"
 		if ($never) { Set-Content $noPrompt 'run-windows.ps1 -Prompt: no precompile dialog (delete this file to get it back)' }
+		if ($choice -eq 3) { $GentlePrecompile = $true; $choice = 0 }
 		if ($choice -ne 0 -and $choice -ne 1) { Write-Host 'cancelled'; return }
 		if ($choice -eq 0) {
 			try {
-				& "$PSScriptRoot\precompile-windows.ps1" -Game $Game -Affinity $mask
+				& "$PSScriptRoot\precompile-windows.ps1" -Game $Game -Affinity $mask -Gentle:$GentlePrecompile
 				$inputsReady = $true # the full run ends with them
 			} catch {
 				Write-Host "precompile failed ($($_.Exception.Message)); starting the game anyway"
@@ -666,6 +688,8 @@ if ($shaders -and !$inputsReady) {
 foreach ($entry in $environment.GetEnumerator()) { Set-Item "env:$($entry.Key)" $entry.Value }
 New-Item -ItemType Directory -Force $logDir | Out-Null
 $out = "$logDir\$stamp.out.log"
+# (Named to the emulator too: F9's debug snapshot, src/local/debug-snapshot.h, notes the run's log.)
+$env:KYTY_RUN_LOG = $out
 $process = Start-Process -FilePath $Exe -ArgumentList $quoted -WorkingDirectory $PSScriptRoot -PassThru `
 	-RedirectStandardOutput $out -RedirectStandardError "$logDir\$stamp.err.log"
 if ($mask -ne $all) { $process.ProcessorAffinity = [IntPtr]$mask }

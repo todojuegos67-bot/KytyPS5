@@ -255,13 +255,13 @@ jobs:
           Set-Content "$out\run.cmd" -Encoding ASCII -Value @(
             '@echo off',
             'rem Starts the game; the options are those of run-windows.ps1 (e.g. run.cmd -Fullscreen).',
-            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Prompt -Follow %*',
+            '"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Prompt -Follow %*',
             'if %errorlevel% neq 0 pause')
           Set-Content "$out\precompile.cmd" -Encoding ASCII -Value @(
             '@echo off',
             'rem Every shader and pipeline of the game into the static pipeline cache: hours on a few cores (run it',
             'rem overnight, it resumes when interrupted). Options: those of precompile-windows.ps1.',
-            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0precompile-windows.ps1" %*',
+            '"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0precompile-windows.ps1" %*',
             'pause')
           $root = (Resolve-Path $out).Path
           Get-ChildItem $out -Recurse -File | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($root.Length + 1) }

@@ -406,6 +406,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${hud_split_header}")
+# The game's exposure on the upscaled image of its super resolution path (renderSuperResolution.cpp).
+set(sr_exposure_source "${KYTY_SOURCE_DIR}/local/sr-exposure.comp")
+set(sr_exposure_spv "${gpu_tiler_generated_dir}/sr_exposure.spv")
+set(sr_exposure_header "${gpu_tiler_generated_dir}/sr_exposure_spv.h")
+add_custom_command(
+	OUTPUT "${sr_exposure_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${sr_exposure_spv}" "${sr_exposure_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${sr_exposure_spv} -DOUTPUT=${sr_exposure_header}
+	        -DSYMBOL=SR_EXPOSURE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${sr_exposure_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${sr_exposure_header}")
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
@@ -444,6 +459,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/xess-sr.cpp"
 	"${KYTY_SOURCE_DIR}/local/sync-stats.h"
 	"${KYTY_SOURCE_DIR}/local/sync-stats.cpp"
+	"${KYTY_SOURCE_DIR}/local/debug-snapshot.h"
+	"${KYTY_SOURCE_DIR}/local/debug-snapshot.cpp"
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.h"
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.cpp"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.h"
@@ -517,6 +534,8 @@ function(add_kyty_full_emulator_test target source)
 	endif()
 	if (KYTY_CLANG_CL)
 		target_link_libraries(${target} onecore)
+		# The threads' stacks as the emulator's (below): the driver compiles pipelines on the calling thread.
+		target_link_options(${target} PRIVATE "/STACK:16777216")
 		add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:${target}>/libwinpthread-1.dll)
 	endif()
 	# The macOS x86_64 guest address space needs its .zerofill segments anchored
@@ -682,6 +701,10 @@ add_kyty_full_emulator_test(kernel_file_system_tests
 add_executable(save_data_capacity_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataCapacityTests.cpp")
 target_include_directories(save_data_capacity_tests PRIVATE ${inc_headers})
+add_executable(save_data_backup_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SaveDataBackupTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/saveDataBackup.cpp")
+target_include_directories(save_data_backup_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(fiber_migration_tests
 	"${KYTY_TESTS_DIR}/FiberMigrationTests.cpp")
 
@@ -765,6 +788,7 @@ if(BUILD_TESTING)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME save_data_capacity COMMAND $<TARGET_FILE:save_data_capacity_tests>)
+	add_test(NAME save_data_backup COMMAND $<TARGET_FILE:save_data_backup_tests>)
 	add_test(NAME fiber_migration COMMAND $<TARGET_FILE:fiber_migration_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
@@ -844,6 +868,7 @@ if(BUILD_TESTING)
 		kernel_file_system_tests
 		fiber_migration_tests
 		save_data_capacity_tests
+		save_data_backup_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
@@ -862,6 +887,7 @@ if(LINUX)
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandScheduler.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/textureCache.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/tiler.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 		"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
@@ -924,7 +950,12 @@ set(KYTY_EMULATOR_MAP_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/${KYTY_EMULATOR_MAP
 set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 
 if(KYTY_CLANG_CL)
+	# /STACK: 16 MiB reserved for each thread that does not ask for a size (committed only as it is used), not
+	# Windows' 1 MiB. The driver compiles a pipeline on the thread that creates it: NVIDIA 566.07's compiler ran a
+	# wave64 compute shader's cooperative halves (9935d547) past 1 MiB (STATUS_STACK_OVERFLOW in nvoglv64.dll, a
+	# precompile shard on an RTX 3080 Laptop) and through it at 16 MiB.
 	target_link_options(kyty_emulator PRIVATE
+		"/STACK:16777216"
 		"/DYNAMICBASE:NO"
 		"/DEBUG:FULL"
 		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"

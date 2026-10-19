@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 
 namespace Config {
@@ -97,6 +98,22 @@ std::filesystem::path GetCommandBufferDumpFolder() {
 
 bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
+}
+
+// KYTY_VULKAN_SYNCVAL=1 (diagnostic): the validation layer with only its synchronization checks, errors logged, not
+// fatal (a missing barrier between commands of one queue: hazards on the buffers and images the layer sees, not on
+// device-address accesses).
+bool SyncValidationEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VULKAN_SYNCVAL");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// Vulkan object names (guest ranges of buffers, shader hashes): for a graphics dump and for synchronization validation.
+bool VulkanObjectNamesEnabled() {
+	return g_config->graphics_debug_dump_enabled || SyncValidationEnabled();
 }
 
 OutputDirection GetPrintfDirection() {

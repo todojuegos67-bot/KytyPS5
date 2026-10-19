@@ -3,7 +3,7 @@
 //   kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] [--threads <n>]
 //                          [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines] [--dry-run]
 //                          [--plan <file>] [--native-variants [--native-guesses]]
-//   kyty_shader_precompile --game <dir> --merge [--prune] [--keep-shards]
+//   kyty_shader_precompile --game <dir> --merge [--prune] [--keep-shards] [--stamp]
 //   kyty_shader_precompile --game <dir> --seeds <file> --status
 //   kyty_shader_precompile --game <dir> --make-seeds <file> [--states <pass-states.json>]
 //                          [--stages cs,gfx] [--limit <n>]
@@ -22,7 +22,8 @@
 // (_PipelineCache/static/<title>_<version>.binaries, read by the emulator when it needs a pipeline): every share
 // writes its pipelines' binaries to a shard file, and --merge --prune makes the store of the shards' alone
 // (what no seed makes any more is dropped; without --prune the store keeps its pipelines too; --keep-shards leaves
-// the shard files for a later merge: precompile-windows.ps1 merges the specializations of recorded play first); exit code
+// the shard files for a later merge: precompile-windows.ps1 merges the specializations of recorded play first; --stamp:
+// a precompile's last merge, which notes the translation features it used, those of the store with --prune); exit code
 // 3: binaries were left out (the driver began compressing with its own dictionary), to be made by two
 // shards (2n) instead. --out
 // writes what was compiled as a warmup file, for precompile.py coverage; --static-inputs
@@ -77,7 +78,7 @@ static int Usage() {
 	std::fprintf(stderr, "usage: kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] "
 	                     "[--threads <n>] [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines] "
 	                     "[--dry-run] [--plan <file>] [--native-variants [--native-guesses]]\n"
-	                     "       kyty_shader_precompile --game <dir> --merge [--prune] [--keep-shards]\n"
+	                     "       kyty_shader_precompile --game <dir> --merge [--prune] [--keep-shards] [--stamp]\n"
 	                     "       kyty_shader_precompile --game <dir> --seeds <file> --status\n"
 	                     "       kyty_shader_precompile --game <dir> --make-seeds <file> [--states <pass-states.json>] "
 	                     "[--stages cs,gfx] [--limit <n>]\n"
@@ -94,6 +95,7 @@ int main(int argc, char* argv[]) {
 	bool                           merge  = false;
 	bool                           prune  = false;
 	bool                           keep   = false; // --keep-shards
+	bool                           stamp  = false; // --stamp: a precompile's last merge (the store's translation features)
 	bool                           status = false;
 	PipelineCache::PrecompileOptions options;
 	StaticSeeds::Options             make_seeds;          // --make-seeds and its options
@@ -113,6 +115,8 @@ int main(int argc, char* argv[]) {
 			prune = true;
 		} else if (arg == "--keep-shards") {
 			keep = true;
+		} else if (arg == "--stamp") {
+			stamp = true;
 		} else if (arg == "--status") {
 			status = true;
 		} else if (arg == "--no-pipelines") {
@@ -267,7 +271,7 @@ int main(int argc, char* argv[]) {
 		std::_Exit(0);
 	}
 	size_t     left_out = 0;
-	const bool done     = merge ? PipelineCache::MergePrecompileShards(graphics, prune, keep)
+	const bool done     = merge ? PipelineCache::MergePrecompileShards(graphics, prune, keep, stamp)
 	                            : PipelineCache::Precompile(graphics, options, left_out);
 	std::printf("Shader precompile: %s\n", !done ? "failed" : left_out != 0 ? "partial" : "complete");
 	std::fflush(nullptr);

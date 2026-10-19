@@ -101,6 +101,11 @@ uint64_t  PhysicalMemory();
 // standby list or the page file and come back on use), so the RAM in use is what the game touches in n seconds.
 // Started once; nothing where unset, 0 or on other systems.
 void      StartWorkingSetTrim();
+// The physical memory the system can still give without paging (free and standby; Linux: MemAvailable). 0: unknown.
+uint64_t AvailablePhysicalMemory();
+// Diagnostics: the process's address space in [begin, end) to stdout, labelled: each allocation of 16 MiB and more (its
+// base, size, state and type), the smaller ones counted, and the free gaps of 1 GiB and more. Windows only.
+void LogAddressSpace(const char* label, uint64_t begin, uint64_t end);
 // Diagnostics: the busy blocks of every heap of the process by size ("size<TAB>count<TAB>bytes" lines to `path`, the
 // heaps locked while walked: a pause of a second or so), by size and first qword (<path>.sig.tsv: SPIR-V, a vtable as
 // module+offset, zero, data) and the committed private allocations (<path>.vm.tsv, the heaps' marked); false where

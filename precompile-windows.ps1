@@ -56,6 +56,7 @@ param(
 	[int]$Threads = 3,
 	[int]$Shards = 512,
 	[int64]$Affinity = 0, # 0: the launch config's CPUs (this PC's leave out 4 and 5, where the compiler crashes), else all
+	[switch]$Gentle, # half the CPUs (every other one), idle priority, half the processes: for PCs that overheat or restart
 	[switch]$Coverage,
 	[switch]$Quick,
 	[switch]$Full,
@@ -240,6 +241,15 @@ if ($Affinity -eq 0) {
 $all = if ([Environment]::ProcessorCount -ge 64) { [int64]-1 } else { ([int64]1 -shl [Environment]::ProcessorCount) - 1 }
 $mask = $Affinity -band $all
 if ($mask -eq 0) { $mask = $all }
+# -Gentle: every other CPU of the mask (one per core where cores have two threads), so the CPU never runs fully loaded
+# (players' PCs restarted during the precompile: power supplies and coolers at 100% for an hour).
+if ($Gentle) {
+	$half = [int64]0
+	$n = 0
+	for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { if (($n++ % 2) -eq 0) { $half = $half -bor ([int64]1 -shl $bit) } } }
+	if ($half -ne 0) { $mask = $half }
+	Write-Host 'precompile: gentle (half the CPUs, idle priority): slower, the PC stays cool'
+}
 $cpus = 0
 for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { $cpus++ } }
 # A process scales to a few threads (4: 85%), and each translates the programs its share needs.
@@ -253,14 +263,27 @@ $begin = Get-Date
 
 # Each process gets an empty NVIDIA disk cache of its own (nothing trained yet), removed when it is done.
 $nvidiaCaches = Join-Path ([IO.Path]::GetTempPath()) "kyty-precompile-$stamp"
+# Windows 11 guesses the quality of service of a process without a window of its own from its priority and its
+# console's visibility, and may run low ones on the efficiency cores only: an i7-12700's 4 E-cores at 100% and its 16
+# P-core threads idle (#63). Each shard is tagged HighQoS (power throttling of its execution speed off), which comes
+# before those guesses; it stays below normal priority, and -Affinity still decides the CPUs.
+Add-Type -Namespace KytyPrecompile -Name Qos -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)] public struct PowerThrottlingState { public uint Version, ControlMask, StateMask; }
+[DllImport("kernel32.dll", SetLastError = true)] static extern bool SetProcessInformation(IntPtr process, int infoClass, ref PowerThrottlingState state, uint size);
+public static bool High(IntPtr process) {
+	// ProcessPowerThrottling (4), PROCESS_POWER_THROTTLING_CURRENT_VERSION (1), EXECUTION_SPEED (1) controlled and off.
+	var state = new PowerThrottlingState { Version = 1, ControlMask = 1, StateMask = 0 };
+	return SetProcessInformation(process, 4, ref state, (uint)Marshal.SizeOf(state));
+}
+'@
 function Start-Precompile([string]$name, [string[]]$arguments) {
 	$env:__GL_SHADER_DISK_CACHE_PATH = Join-Path $nvidiaCaches $name
 	New-Item -ItemType Directory -Force $env:__GL_SHADER_DISK_CACHE_PATH | Out-Null
 	$process = Start-Process -FilePath $Exe -ArgumentList (@('--game', "`"$Game`"") + $arguments) -NoNewWindow -PassThru `
 		-WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logs\$name.out.log" -RedirectStandardError "$logs\$name.err.log"
-	$process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+	$process.PriorityClass = if ($Gentle) { [System.Diagnostics.ProcessPriorityClass]::Idle } else { [System.Diagnostics.ProcessPriorityClass]::BelowNormal }
 	$process.ProcessorAffinity = [IntPtr]$mask
-	$null = $process.Handle # keeps the exit code readable after the process ends
+	$null = [KytyPrecompile.Qos]::High($process.Handle) # also keeps the exit code readable after the process ends
 	$process | Add-Member NoteProperty NvidiaCache $env:__GL_SHADER_DISK_CACHE_PATH -PassThru
 }
 function Remove-NvidiaCache($process) { Remove-Item -Recurse -Force $process.NvidiaCache -ErrorAction SilentlyContinue }
@@ -381,7 +404,8 @@ while ($first.Count -or $second.Count -or $running.Count) {
 $env:KYTY_PRECOMPILE_CLAIMS = $null
 # (-Quick: what the store held of the other shaders stays. Recorded play that could not be gathered: the pipelines an
 # earlier run made for it stay too - pruned to the seeds alone, the game compiled them all again while playing.)
-$mergeArguments = @('--merge')
+# (--stamp: the store's translation features, those this run used: ShaderRecompiler TranslatorFeatures.)
+$mergeArguments = @('--merge', '--stamp')
 if (!$Quick -and !$recordedLost) { $mergeArguments += '--prune' }
 Wait-Precompile (Start-Precompile 'merge' $mergeArguments) 'merge'
 if ($Quick) { Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs' }

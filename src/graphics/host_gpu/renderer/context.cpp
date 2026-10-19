@@ -205,6 +205,26 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 // The same rendering: the size, the layers, the depth/stencil attachment and the color attachments up to the count
 // (those past it are no part of a rendering). (All eight compared, at every table draw: ~1% of the render thread at
 // Latria standing.)
+// The store of a depth or stencil aspect the attachment's layout makes read-only: none. The draws of such a pass cannot
+// write that aspect, and a store is a write for synchronization (a pass sampling the depth buffer it tests against, then
+// the next transition of it: a write-after-write the barrier, made for the shader reads before it, did not cover).
+[[gnu::noinline]] static vk::AttachmentStoreOp DepthStoreOp(vk::ImageLayout layout) {
+	switch (layout) {
+		case vk::ImageLayout::eDepthStencilReadOnlyOptimal:
+		case vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal:
+		case vk::ImageLayout::eDepthReadOnlyOptimal: return vk::AttachmentStoreOp::eNone;
+		default: return vk::AttachmentStoreOp::eStore;
+	}
+}
+[[gnu::noinline]] static vk::AttachmentStoreOp StencilStoreOp(vk::ImageLayout layout) {
+	switch (layout) {
+		case vk::ImageLayout::eDepthStencilReadOnlyOptimal:
+		case vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal:
+		case vk::ImageLayout::eStencilReadOnlyOptimal: return vk::AttachmentStoreOp::eNone;
+		default: return vk::AttachmentStoreOp::eStore;
+	}
+}
+
 static bool SameRendering(const RenderState& a, const RenderState& b) {
 	if (a.num_color_attachments != b.num_color_attachments || a.width != b.width || a.height != b.height ||
 	    a.num_layers != b.num_layers || !(a.depth_stencil_attachment == b.depth_stencil_attachment))
@@ -241,7 +261,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	depth.imageLayout = depth_stencil.image_layout;
 	depth.loadOp =
 	    depth_stencil.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
-	depth.storeOp                       = vk::AttachmentStoreOp::eStore;
+	depth.storeOp                       = DepthStoreOp(depth_stencil.image_layout);
 	depth.clearValue.depthStencil.depth = std::bit_cast<float>(depth_stencil.clear_value[0]);
 
 	vk::RenderingAttachmentInfo stencil {};
@@ -249,7 +269,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	stencil.imageLayout = depth_stencil.image_layout;
 	stencil.loadOp =
 	    depth_stencil.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
-	stencil.storeOp                         = vk::AttachmentStoreOp::eStore;
+	stencil.storeOp                         = StencilStoreOp(depth_stencil.image_layout);
 	stencil.clearValue.depthStencil.stencil = depth_stencil.clear_value[1];
 
 	vk::RenderingInfo rendering {};
@@ -281,6 +301,21 @@ void CommandBuffer::EndRendering() const {
 	Handle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
+}
+
+void CommandBuffer::ResumeRendering(const RenderState& state) const {
+	RenderState load = state;
+	for (uint32_t i = 0; i < load.num_color_attachments; i++) {
+		load.color_attachments[i].is_clear = false;
+	}
+	load.depth_stencil_attachment.depth_clear   = false;
+	load.depth_stencil_attachment.stencil_clear = false;
+	BeginRendering(load);
+	m_render_state = state;
+}
+
+bool CommandBuffer::RenderingWith(const RenderState& state) const {
+	return m_rendering && SameRendering(m_render_state, state);
 }
 
 } // namespace Libs::Graphics
