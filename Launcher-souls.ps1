@@ -142,10 +142,9 @@ function Start-Game {
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
 	# hasta 60 reales (FrameGenFloor), videos y menus a 60, y los Smooth (KYTY_FLIP_FPS 40/45) en vblanks justos.
-	# DLSS x4: el juego frenado a 56 (KYTY_FLIP_FPS), 4 vblanks justos de 224 Hz -> 224 en pantalla. x5 (40) y x6 (36)
+	# DLSS x4: solo Reflex (56 reales, 224 en pantalla; el modo mas suave, 10-19). x5 (40) y x6 (36)
 	# caen justos en los 360 Hz (9 y 10 vblanks): el juego no dibuja frames de mas que se tirarian antes del DLSS.
-	if ($config -eq 'dlss-x4.json') { $psargs += @('-Vblank', '224') }
-	elseif ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
+	if ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
 	# Sin frame generation, "FPS desbloqueados": vblank de 120 Hz (-Fps120, el modo probado de chenxiao07; a 240 los menus y el intro iban acelerados, 10-18), el juego pasa de 60 (a velocidad real:
 	# gameMinDeltaTime en run-windows); videos, menus y pantallas de carga siguen a 60.
 	elseif ($chkUnlock.Checked) { $psargs += '-Fps120' }
