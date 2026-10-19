@@ -373,6 +373,10 @@ private:
 
 } // namespace
 
+// Read in place of a null SRT table pointer by the native walker (zeros: an unbound table).
+constexpr uint32_t kZeroTableHalf = 32768;
+alignas(64) const uint8_t kZeroTable[2 * kZeroTableHalf] = {};
+
 void CompileSrtWalker(ResourcePlan& program) {
 	if (!program.resource_tracking_complete || !program.srt_plan_complete ||
 	    program.capture_specialization_reads || !program.control_flow.empty() ||
@@ -455,11 +459,20 @@ void CompileSrtWalker(ResourcePlan& program) {
 		code.push(code.rdi);
 		code.mov(code.rdi, code.qword[code.rdi + pointer_offset]);
 		code.and_(code.rdi, code.r9);
-		// A null (or not yet written) table pointer: no native read, the evaluator takes it
-		// (Wolverine: a user-data pointer still 0 faulted at address 0 on a host thread).
-		code.cmp(code.rdi, 0x10000);
-		code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
 		const auto first = reads.begin()->first;
+		// A null (or not yet written) table pointer reads as zeros, as an unbound table, instead
+		// of faulting at address 0 on a host thread (Wolverine: a user-data pointer still 0).
+		{
+			Xbyak::Label mapped;
+			code.cmp(code.rdi, 0x10000);
+			code.jae(mapped, Xbyak::CodeGenerator::T_NEAR);
+			if (first < -int32_t {kZeroTableHalf} || reads.rbegin()->first + 4 > int32_t {kZeroTableHalf}) {
+				code.jmp(failed, Xbyak::CodeGenerator::T_NEAR);
+			} else {
+				code.mov(code.rdi, reinterpret_cast<uint64_t>(kZeroTable + kZeroTableHalf));
+			}
+			code.L(mapped);
+		}
 		const auto last = reads.rbegin()->first;
 		if (first < 0) {
 			code.mov(code.r10, -static_cast<int64_t>(first));
