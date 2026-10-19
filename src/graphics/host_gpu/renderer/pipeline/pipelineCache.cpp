@@ -324,7 +324,8 @@ struct PipelineCache::ProgramCache {
 		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = {.id = ++next_shader_id, .module = module,
+		                       .spirv_words = static_cast<uint64_t>(result.spirv.size())},
 		};
 	}
 
@@ -1040,7 +1041,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
-		                       m_driver_cache);
+		                       m_driver_cache, compute_program.spirv_words);
 	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);

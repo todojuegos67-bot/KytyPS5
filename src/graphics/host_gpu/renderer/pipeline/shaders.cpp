@@ -584,7 +584,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
+                            uint64_t spirv_words) {
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
@@ -626,6 +627,18 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::ComputePipelineCreateInfo info {};
+	// KYTY_FAST_COMPILE_WORDS=<n> (default 300000, 0 = off): compute shaders whose SPIR-V has more words
+	// than that are created with DISABLE_OPTIMIZATION. Ghost of Yotei's packed-FP16 shaders translate to
+	// 1-2 MB of SPIR-V and the NVIDIA driver spent minutes optimizing each, freezing the game.
+	static const uint64_t fast_compile_words = [] {
+		const char* v = std::getenv("KYTY_FAST_COMPILE_WORDS");
+		return v != nullptr ? std::strtoull(v, nullptr, 10) : 300000ull;
+	}();
+	if (fast_compile_words != 0 && spirv_words > fast_compile_words) {
+		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+		std::printf("Pipeline: compute SPIR-V %llu words, driver optimization disabled (KYTY_FAST_COMPILE_WORDS)\n",
+		            static_cast<unsigned long long>(spirv_words));
+	}
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
