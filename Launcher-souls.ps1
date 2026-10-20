@@ -178,6 +178,13 @@ function Start-Game {
 	if ($res[3] -gt 0) { $psargs += @('-UpscaleHeight', "$($res[3])") }
 	$preset = $dlssPresets[[math]::Max(0, $cmbPreset.SelectedIndex)][1]
 	if ($res[2] -like '*dlss' -and $preset) { $psargs += @('-DlssPreset', $preset) }
+	# G-Sync: vblank virtual sin atar a los del monitor, frames mostrados en cuanto estan listos y tope de FPS por
+	# tiempo justo por debajo del refresco (240 Hz -> 224) para no salir del rango VRR.
+	if ($chkGsync.Checked) {
+		$env:KYTY_VSYNC_LOCK = '0'; $env:KYTY_FPS_CAP = 'auto'; $env:KYTY_FLIP_WHEN_READY = '1'
+	} else {
+		Remove-Item Env:KYTY_VSYNC_LOCK, Env:KYTY_FPS_CAP, Env:KYTY_FLIP_WHEN_READY -ErrorAction SilentlyContinue
+	}
 	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Hidden | Out-Null
 	$form.WindowState = 'Minimized'
 }
@@ -292,6 +299,8 @@ $tips.SetToolTip($chkHdr, 'HDR10: activa antes "Usar HDR" en la configuracion de
 $tips.SetToolTip($chkVsync, 'VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando')
 $panel.Controls.Add($chkHdr)
 $panel.Controls.Add($chkVsync)
+$chkGsync = New-Check 'G-Sync' 910 56 180 'gsync'
+$panel.Controls.Add($chkGsync)
 $tips.SetToolTip($chkLowPc, 'PCs con 16 GB de RAM o menos o graficas de 8 GB o menos: unos 6 GB de VRAM como maximo, RAM devuelta a Windows cada 15 s, texturas a la mitad y sombras mas cortas. Para que no se cierre en zonas pesadas.')
 # (Un solo TURBO desde 10-20: sin vaciado de RAM los dos solo se diferenciaban en la VRAM.)
 $chkLowPc.Checked = $false

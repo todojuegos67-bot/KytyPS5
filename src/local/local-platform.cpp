@@ -911,6 +911,24 @@ void CountDisplayVblanks(KmtOpenFn open, KmtWaitFn wait, KmtCloseFn close) {
 }
 } // namespace
 
+void SleepUntilPrecise(int64_t deadline_ns) {
+	using clock = std::chrono::steady_clock;
+	const auto deadline = clock::time_point(std::chrono::duration_cast<clock::duration>(std::chrono::nanoseconds(deadline_ns)));
+	const auto coarse   = deadline - std::chrono::microseconds(500);
+	if (clock::now() < coarse) {
+		static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+		const auto wait_100ns = std::chrono::duration_cast<std::chrono::nanoseconds>(coarse - clock::now()).count() / 100;
+		LARGE_INTEGER due {};
+		due.QuadPart = -static_cast<LONGLONG>(wait_100ns);
+		if (timer != nullptr && wait_100ns > 0 && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+			WaitForSingleObject(timer, INFINITE);
+		} else if (wait_100ns > 0) {
+			std::this_thread::sleep_until(coarse);
+		}
+	}
+	while (clock::now() < deadline) YieldProcessor();
+}
+
 int DisplayRefreshHz(void* window) {
 	HMONITOR       monitor = nullptr;
 	MONITORINFOEXW info {};
@@ -1889,6 +1907,14 @@ void MakeBackgroundThread(const char* avoid_cpus) {
 }
 
 void MakeCriticalThread() {}
+
+void SleepUntilPrecise(int64_t deadline_ns) {
+	using clock = std::chrono::steady_clock;
+	const auto deadline = clock::time_point(std::chrono::duration_cast<clock::duration>(std::chrono::nanoseconds(deadline_ns)));
+	const auto coarse   = deadline - std::chrono::microseconds(500);
+	if (clock::now() < coarse) std::this_thread::sleep_until(coarse);
+	while (clock::now() < deadline) {}
+}
 
 int DisplayRefreshHz(void* /*window*/) {
 	return 0;
