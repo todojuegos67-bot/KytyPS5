@@ -1,3 +1,5 @@
+#include <utility>
+
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -47,12 +49,27 @@ void Translator::EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpc
 	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {lhs, rhs})), false, cmpx);
 }
 
-void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered) {
+void Translator::EmitInteger64Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+                                      bool swap, bool negate, bool cmpx) {
+	// The IR has only <, > and ==/!= for 64-bit integers: the rest swap operands and/or negate.
+	auto lhs = ReadOperand(inst.src0, IR::Type::U64);
+	auto rhs = ReadOperand(inst.src1, IR::Type::U64);
+	if (swap) {
+		std::swap(lhs, rhs);
+	}
+	auto result = IR::U1(ir.Emit(opcode, {lhs, rhs}));
+	if (negate) {
+		result = ir.LogicalNot(result);
+	}
+	EmitCompareResult(inst, result, false, cmpx);
+}
+
+void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx) {
 	const auto lhs       = IR::F32(ReadOperand(inst.src0, IR::Type::F32));
 	const auto rhs       = IR::F32(ReadOperand(inst.src1, IR::Type::F32));
 	const auto unordered = ir.LogicalOr(IR::U1(ir.Emit(IR::ValueOpcode::FPIsNan32, {lhs})),
 	                                    IR::U1(ir.Emit(IR::ValueOpcode::FPIsNan32, {rhs})));
-	EmitCompareResult(inst, ordered ? ir.LogicalNot(unordered) : unordered, false, false);
+	EmitCompareResult(inst, ordered ? ir.LogicalNot(unordered) : unordered, false, cmpx);
 }
 
 void Translator::EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx) {

@@ -125,7 +125,9 @@ private:
 	                          bool signed_value, bool cmpx);
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,
 	                      bool cmpx);
-	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered);
+	void EmitInteger64Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool swap,
+	                          bool negate, bool cmpx);
+	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx = false);
 	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx);
 	void V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index);
 	void V_CVT_F32_U32(const Decoder::Instruction& inst);
@@ -166,6 +168,7 @@ private:
 	bool Integer16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool arithmetic);
 	bool Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
 	bool V_MED3_I16(const Decoder::Instruction& inst);
+	bool V_MIN3_U16(const Decoder::Instruction& inst);
 	bool PackedInteger16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool arithmetic);
 	bool PackedInteger16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode);

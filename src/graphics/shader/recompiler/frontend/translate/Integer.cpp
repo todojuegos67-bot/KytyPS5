@@ -22,6 +22,14 @@ bool Translator::Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpco
 	return true;
 }
 
+bool Translator::V_MIN3_U16(const Decoder::Instruction& inst) {
+	const auto result = IR::U32(ir.Emit(
+	    IR::ValueOpcode::UMinTri32, {ReadU16AsU32(inst.src0, false), ReadU16AsU32(inst.src1, false),
+	                                 ReadU16AsU32(inst.src2, false)}));
+	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
+	return true;
+}
+
 bool Translator::V_MED3_I16(const Decoder::Instruction& inst) {
 	const auto result = IR::U32(ir.Emit(
 	    IR::ValueOpcode::SMedTri32, {ReadU16AsU32(inst.src0, true), ReadU16AsU32(inst.src1, true),
