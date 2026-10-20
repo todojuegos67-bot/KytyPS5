@@ -409,6 +409,7 @@ struct EmitterState {
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         bvh_intersect_function  = 0;
+	uint32_t                                         bvh_counter_variable    = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         lod_stats_variable      = 0;
 	bool                                             lod_stats_subgroup      = false;
