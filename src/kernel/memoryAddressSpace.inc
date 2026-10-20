@@ -634,6 +634,7 @@ public:
 			InvalidateMappingLookup();
 			EXIT_IF(!MapsEmplace(MapEntry {vaddr, size, backing_offset, mode}));
 			EXIT_IF(!m_views.emplace(vaddr, size).second);
+			NoteAliasesUnlocked(vaddr, size, backing_offset);
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
@@ -653,6 +654,47 @@ public:
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #endif
+	}
+
+	// KYTY_ALIAS_STATS (default on): whether the physical memory a view maps is mapped at another address too (the PS5's
+	// aliases: what makes the backing a shared section, the first ingredient of bug check 0x1A/0x41202). Counted per map,
+	// the first ones logged; the totals every 512 maps: whether the guest memory could be private memory instead.
+	void NoteAliasesUnlocked(uint64_t vaddr, uint64_t size, uint64_t backing_offset) {
+		static const bool on = [] {
+			const char* value = std::getenv("KYTY_ALIAS_STATS");
+			return value == nullptr || *value != '0';
+		}();
+		if (!on) return;
+		static uint64_t maps = 0, aliased_maps = 0, aliased_bytes = 0, mapped_bytes = 0;
+		uint64_t        overlap = 0;
+		for (const auto& [_, entry]: m_maps) {
+			if (entry.vaddr == vaddr) continue;
+			const auto begin = std::max(entry.backing_offset, backing_offset);
+			const auto end   = std::min(entry.backing_offset + entry.size, backing_offset + size);
+			if (begin < end) {
+				overlap += end - begin;
+				if (aliased_maps < 16) {
+					std::printf("Alias: guest 0x%llx+0x%llx (physical 0x%llx) also at guest 0x%llx (0x%llx bytes shared)\n",
+					            static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+					            static_cast<unsigned long long>(backing_offset), static_cast<unsigned long long>(entry.vaddr),
+					            static_cast<unsigned long long>(end - begin));
+					std::fflush(stdout);
+				}
+			}
+		}
+		++maps;
+		mapped_bytes += size;
+		if (overlap != 0) {
+			++aliased_maps;
+			aliased_bytes += overlap;
+		}
+		if (maps % 512 == 0 || (overlap != 0 && aliased_maps <= 16)) {
+			std::printf("Alias stats: %llu maps (%llu MiB), %llu aliased (%llu MiB shared with another address); %zu views now\n",
+			            static_cast<unsigned long long>(maps), static_cast<unsigned long long>(mapped_bytes >> 20u),
+			            static_cast<unsigned long long>(aliased_maps), static_cast<unsigned long long>(aliased_bytes >> 20u),
+			            m_maps.size());
+			std::fflush(stdout);
+		}
 	}
 
 	// [vaddr, vaddr + size) unmapped. The ranges that became free placeholders (each one placeholder) are appended to
