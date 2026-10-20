@@ -3113,11 +3113,19 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		EXIT("TextureCache: stencil association requires a depth/stencil image\n");
 	}
 
+	// (Not an image the GPU draws or writes to at that address: memory it shares with the stencil plane (a pool of
+	// targets reused while an area loads) made it the depth image's from then on, and the next draw to it ended the
+	// emulator, "color target requires rediscovery before final acquisition" (issue #94, fast travel to 1-1). A record of
+	// its own beside it.)
 	ImageId association {};
 	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
 		const auto owner = m_slot_images.try_get(id);
-		if (owner != nullptr && owner->info.data.address == stencil.address) {
+		if (owner == nullptr || owner->info.data.address != stencil.address) continue;
+		if (!owner->usage.render_target && !owner->usage.depth_target && !owner->usage.storage) {
 			association = id;
+		} else if (static std::atomic<uint32_t> reports {0}; reports.fetch_add(1, std::memory_order_relaxed) < 4) {
+			std::printf("TextureCache: a %s target at 0x%llx shares its memory with a depth image's stencil: kept apart\n",
+			            owner->usage.depth_target ? "depth" : "color", static_cast<unsigned long long>(stencil.address));
 		}
 	}
 	if (!association) {
