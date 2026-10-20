@@ -32,6 +32,9 @@ extern volatile std::atomic<uint32_t> kyty_local_async_upload_mode;
 
 namespace AsyncUpload {
 
+// True on the worker's thread (a fault there cannot wait for the render thread, which may wait for the worker).
+inline thread_local bool t_worker = false;
+
 class Worker {
 public:
 	static constexpr uint64_t Capacity = 1u << 16;
@@ -124,6 +127,7 @@ private:
 
 	void Run() {
 		LocalPlatform::SetThreadName("Kyty.Upload");
+		t_worker = true;
 		// Created by the render thread: do not inherit its dedicated CPU.
 		LocalPlatform::PinThreadToCpuList(std::getenv("KYTY_RECORDING_CPUS"));
 		// Pause iterations the worker polls for new copies before it sleeps.

@@ -44,7 +44,25 @@ double Glide(float x, float y, float z, float speed);
 // reads the pad, through the engine's own command entry (the one its debug "golden path" helper calls). False: another
 // build (nothing queued).
 bool QueueCommand(std::string_view text);
-// The pad read (libs/controller.cpp): runs a queued command.
+// Live `gamekill RADIUS` (01.007.000, automated tours): the characters but the player within RADIUS m of it that still
+// have HP die the way +cp11_allSuicideExceptPlayer kills every character (the game's suicide of a ChrIns), on the
+// game's pad-reading thread as a queued command; a boss of 1000 HP or more within 40 m widens it to 60 m (a boss dies with
+// its parts). False: another build (nothing queued).
+// The way they die: the suicide; their HP set to 0 only (`gamekill R hp`: nothing dies); HP 0 and the state machine to
+// DeathBegin, a normal death (`gamekill R death`; the suicide's state left Havok over freed shapes once the player moved).
+enum class KillMode { Suicide, HpZero, Death };
+bool QueueKill(float radius, KillMode mode = KillMode::Suicide);
+// Live `gamestrike RADIUS` (01.007.000, automated tours; blocks until done): with the player's hits made deadly
+// (cp11_characters_playerExterminate) the player is put before each living character within RADIUS m, nearest first,
+// facing it, and attacks (R1, up to 3 times): a normal death, the game's events with it (a boss's DEMON VANQUISHED).
+// Returns the report ("killed K of N ...") or why nothing was done.
+std::string Strike(float radius);
+// Live `gamesweep SECONDS [RADIUS]` (automated kill tours; blocks until done): Strike's kill, one character after another,
+// always the nearest living one within RADIUS m (default 1000) of where the player is, given up on after 3 hits (8 for
+// a boss of 1000 HP or more, each from another side); no damage taken, no death. One log line each ("Game sweep: killed|skipped X Y Z hp H D m t=T s"), until none is left or
+// SECONDS are up.
+std::string Sweep(double seconds, float radius);
+// The pad read (libs/controller.cpp): runs a queued command (and a queued kill).
 void RunQueuedCommand();
 
 bool        Arm(std::string_view map, std::string_view spawn);

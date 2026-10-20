@@ -22,6 +22,7 @@
 #include "kernel/memory.h"
 #include "speculation-state.h"
 #include "fresh-memory.h"
+#include "texture-offload.h"
 
 extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_bda_dirty_regions_mode {0};
@@ -222,8 +223,16 @@ bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	TextureOffload::OnHostAccess(vaddr, size, false, false);
 	FreshOverwrite(vaddr, size); // (a host write follows: its pages are writable, its granules written)
 	m_buffer_cache.InvalidateMemory(vaddr, size);
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	return true;
+}
+
+bool GpuResourceManager::InvalidateImages(uint64_t vaddr, uint64_t size) {
+	if (!IsMapped(vaddr, size)) return false;
+	TextureOffload::OnHostAccess(vaddr, size, false, true); // (its caller writes all of it: CompareMove)
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
 }
@@ -232,6 +241,7 @@ bool GpuResourceManager::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size)
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	TextureOffload::OnHostAccess(vaddr, size, false, true); // (it writes all of it)
 	FreshOverwrite(vaddr, size);
 	m_buffer_cache.InvalidateMemoryForWrite(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
@@ -281,6 +291,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	TextureOffload::OnHostAccess(vaddr, size, true, false);
 	const auto unmap = [this, vaddr, size, releasing] {
 		// Released memory loses its host protection with the mapping: the watchers removed
 		// below need not restore it page run by page run first.

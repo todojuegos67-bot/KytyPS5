@@ -60,6 +60,8 @@ public:
 	// The binaries stored for a pipeline key (empty: none, or their data is damaged).
 	[[nodiscard]] Handles Load(const Key& key) const;
 	[[nodiscard]] bool    Holds(const Key& key) const { return m_pipelines.contains(key); }
+	// Its binaries' data reads back whole (their hashes hold): what a copy of them needs (the precompile's).
+	[[nodiscard]] bool Intact(const Key& key) const;
 	[[nodiscard]] size_t  Pipelines() const { return m_pipelines.size(); }
 	[[nodiscard]] size_t  Binaries() const { return m_binaries.size(); }
 	[[nodiscard]] uint64_t DataBytes() const;

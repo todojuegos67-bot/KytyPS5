@@ -170,6 +170,11 @@ private:
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
+		// KYTY_TRACKING_FAIL_IR=1: the program's IR as tracking saw it (a refused shader's structure).
+		if (const char* ir = std::getenv("KYTY_TRACKING_FAIL_IR"); ir != nullptr && ir[0] == '1') {
+			std::printf("%s\n%s\n", message.c_str(), ProgramToString(m_program).c_str());
+			std::fflush(stdout);
+		}
 		EXIT("%s", message.c_str());
 		std::abort();
 	}
@@ -231,6 +236,98 @@ private:
 		}
 	}
 
+	// The structurizer joins a program's early exits (a pixel shader's branches to its discard at the end) in one block
+	// that merges every register over them and branches on a flag the exit edges set to a constant: code after it sees
+	// a phi of a descriptor the exit path never loaded (the SRT pointer left in s0:s1 beside the V# read into them, a
+	// Valley pixel shader 0x53732ccfe9deda5c: the emulator ended there). The arms of `value` (a phi) on edges whose flag
+	// sends them away from `use` never reach it: one value left over is the descriptor's.
+	Value PruneExitArms(Value value, const Block* use, uint32_t depth) const {
+		const auto* phi = value.Resolve().TryInstruction();
+		if (use == nullptr || depth > 8u || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi) return value;
+		const auto* merge = phi->Parent();
+		const auto& blocks = m_program.blocks;
+		if (merge == nullptr || blocks.size() != m_program.block_info.size()) return value;
+		const auto index_of = [&](const Block* block) -> size_t {
+			for (size_t i = 0; i < blocks.size(); i++)
+				if (blocks[i] == block) return i;
+			return SIZE_MAX;
+		};
+		const auto index_by_id = [&](uint32_t id) -> size_t {
+			for (size_t i = 0; i < m_program.block_info.size(); i++)
+				if (m_program.block_info[i].id == id) return i;
+			return SIZE_MAX;
+		};
+		const auto m = index_of(merge), u = index_of(use);
+		if (m == SIZE_MAX || u == SIZE_MAX || m == u) return value;
+		const auto& info = m_program.block_info[m];
+		if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch) return value;
+		const auto t = index_by_id(info.terminator.true_block), f = index_by_id(info.terminator.false_block);
+		if (t == SIZE_MAX || f == SIZE_MAX || t == f) return value;
+		// The flag: a phi of this block (or its negation).
+		auto        condition = info.condition.Resolve();
+		bool        negated   = false;
+		const auto* flag      = condition.TryInstruction();
+		if (flag != nullptr && flag->GetOpcode() == ValueOpcode::LogicalNot) {
+			negated = true;
+			flag    = flag->Arg(0).Resolve().TryInstruction();
+		}
+		if (flag == nullptr || flag->GetOpcode() != ValueOpcode::Phi || flag->Parent() != merge) return value;
+		// Which way leads to `use` (not passing this block again): one only.
+		const auto reaches = [&](size_t from) {
+			std::vector<uint8_t> seen(blocks.size());
+			std::vector<size_t>  pending {from};
+			while (!pending.empty()) {
+				const auto at = pending.back();
+				pending.pop_back();
+				if (at == u) return true;
+				if (at == m || seen[at] != 0) continue;
+				seen[at]          = 1;
+				const auto& stop  = m_program.block_info[at].terminator;
+				const auto  visit = [&](uint32_t id) {
+					const auto next = index_by_id(id);
+					if (next != SIZE_MAX) pending.push_back(next);
+				};
+				switch (stop.kind) {
+					case CFG::TerminatorKind::Branch: visit(stop.true_block); break;
+					case CFG::TerminatorKind::ConditionalBranch:
+						visit(stop.true_block);
+						visit(stop.false_block);
+						break;
+					case CFG::TerminatorKind::IndirectBranch:
+						for (const auto id: stop.indirect_targets) visit(id);
+						break;
+					default: break;
+				}
+			}
+			return false;
+		};
+		const bool via_true = reaches(t), via_false = reaches(f);
+		if (via_true == via_false) return value;
+		const bool needed = via_true;
+		Value      kept;
+		for (size_t arm = 0; arm < phi->NumArgs(); arm++) {
+			// Its edge's flag: a constant sending it the other way drops the arm.
+			bool dropped = false;
+			for (size_t other = 0; other < flag->NumArgs(); other++) {
+				if (flag->PhiBlock(other) != phi->PhiBlock(arm)) continue;
+				const auto bit = flag->Arg(other).Resolve();
+				dropped        = bit.IsImmediate() && bit.GetType() == Type::U1 && (bit.U1() != negated) != needed;
+				break;
+			}
+			if (dropped) continue;
+			const auto resolved = PruneExitArms(ResolveInvariantPhi(m_program, phi->Arg(arm)).IsEmpty()
+			                                        ? phi->Arg(arm)
+			                                        : ResolveInvariantPhi(m_program, phi->Arg(arm)),
+			                                    use, depth + 1u);
+			if (kept.IsEmpty()) {
+				kept = resolved;
+			} else if (!EquivalentValue(m_program, kept, resolved)) {
+				return value;
+			}
+		}
+		return kept.IsEmpty() ? value : kept;
+	}
+
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
 	                DescriptorSource& descriptor, uint32_t pc) const {
 		if (handle.NumArgs() != width) {
@@ -242,6 +339,14 @@ private:
 			descriptor.dwords[i] = handle.Arg(i).Resolve();
 		}
 		CollapseNullDescriptorPaths(descriptor, width);
+		// (Only where tracking refuses otherwise: a phi that is not one value fails ValidateSource.)
+		for (uint32_t i = 0; i < width; i++) {
+			const auto* phi = descriptor.dwords[i].Resolve().TryInstruction();
+			if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi &&
+			    ResolveInvariantPhi(m_program, descriptor.dwords[i]).IsEmpty()) {
+				descriptor.dwords[i] = PruneExitArms(descriptor.dwords[i], handle.Parent(), 0);
+			}
+		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
 		}

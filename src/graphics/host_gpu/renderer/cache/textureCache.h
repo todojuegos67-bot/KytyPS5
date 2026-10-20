@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <map>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
@@ -163,6 +164,22 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// KYTY_TEXTURE_OFFLOAD(_PROBE) (texture-offload.h): the guest bytes of clean sampled textures probed for touches, or
+	// dropped from RAM after a download checked to give them back exactly (RunGarbageCollector).
+	void OffloadScan(uint64_t tick);
+	// Render thread: the dropped bytes over [vaddr, vaddr + size) downloaded back from their images (texture-offload.h;
+	// `touch`: TextureOffload::Touch; `async`: written back by the offload worker when the GPU is done, touches waiting
+	// till then). Takes m_lock unless the caller holds it.
+	void RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch, bool async = false);
+	struct OffloadCheck;
+	struct OffloadRestore;
+	std::vector<std::unique_ptr<OffloadRestore>> m_offload_restores;   // asynchronous restores (until done)
+	bool                                         m_offload_unsubmitted = false; // one is not submitted yet
+	std::unordered_set<uint64_t>                 m_offload_differ_kinds; // image kinds a check found to differ
+	std::unordered_map<uint64_t, uint64_t>      m_offload_clean;    // image serial -> the first scan it was clean at
+	std::unordered_map<uint64_t, bool>          m_offload_exact;    // image serial -> its download gave its guest bytes
+	std::unordered_set<uint64_t>                m_offload_checking; // image serials a check downloads
+	std::vector<std::unique_ptr<OffloadCheck>> m_offload_checks;
 	// RunGarbageCollector's line on the PC's memory, when it moved.
 	void LogPcMemory(uint64_t tick);
 	// The images no draw or dispatch used for a while go (RunGarbageCollector, once a flip).
@@ -182,6 +199,10 @@ private:
 	enum class TransferDirection { Upload, Download };
 	struct TextureTransferPlan;
 	struct DownloadPlan;
+	// (The texture offload's checks and restores: detiled in video memory, then one linear copy to `host`; the
+	// scratch buffer returned.)
+	std::unique_ptr<Buffer> StageOffloadDownloads(std::vector<std::pair<Image*, DownloadPlan>>& images,
+	                                              const std::vector<uint64_t>& offsets, uint64_t total, Buffer& host);
 
 	struct MetaDataInfo {
 		// A guest metadata-fill dispatch may initialize DCC before its render target is bound.

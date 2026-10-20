@@ -32,6 +32,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -57,6 +58,9 @@ constexpr std::array<Area, 5> Areas {{
     {0.3f, 1.1f, 0.3f, 0.7f, 1.0f},        // the items picked up, under the souls (their top reaches into the souls')
 }};
 constexpr uint32_t Outside = 1u << Areas.size(); // (Classify: a vertex in none of them)
+// (Classify: a marker over the world, held to the centre: Scope's area MarkerArea.)
+constexpr uint32_t Marker     = Outside << 1u;
+constexpr uint32_t MarkerArea = Areas.size();
 
 // The HUD's round icon in the top left corner (with its frame) and nothing else: the HUD shows.
 constexpr Area Icon {-1.02f, -0.85f, 0.78f, 1.05f, -1.0f};
@@ -74,13 +78,21 @@ struct MaskPatch {
 
 struct State {
 	std::array<std::pair<uint64_t, uint64_t>, 256> hashes {}; // shader address -> hash (direct mapped)
-	uint64_t icon_frame = 0;              // FrameGen::GuestFlips() + 1 of the frame the icon was last drawn in
+	uint64_t icon_frame = 0;              // `frame` + 1 of the frame the icon was last drawn in
+	uint64_t frame      = 0;              // the guest flips the GPU thread's command stream has reached (NoteFlip)
 	std::array<MaskPatch, 32> patches {};  // (by address, round robin)
 	uint32_t                  next_patch = 0;
 	bool                      patched    = false; // any patch outstanding
 	uint64_t                  canvas     = 0;     // the wide output's interface canvas (an interface shader's target)
 };
 inline State g_state; // (the GPU thread's)
+
+// A guest flip in the GPU thread's command stream (a GPU flip, a CPU flip's preparation): the frame Classify tells the
+// HUD's draws (after the icon) and the markers over the world (before it) by, in the order the draws come. (The
+// presenter's count, FrameGen::GuestFlips, runs on its own thread: not in step with the draws, the markers were missed.)
+inline void NoteFlip() {
+	++g_state.frame;
+}
 
 // The wide output's canvas width (0: none).
 inline uint32_t WideWidth() {
@@ -175,6 +187,40 @@ inline bool ReadVsharp(const uint32_t* words, uint64_t& base, uint32_t& stride) 
 	return base != 0 && stride >= 12;
 }
 
+// The lock-on reticle: drawn after the icon among the HUD's draws (not with the markers before it), two quads of
+// ClipShaders[1] that sample their own places of the interface's texture array. The shader's third V# (user data
+// words 8-11) holds each vertex's u, v and layer; the reticle's (01.007.000, 1-1 frame dumps):
+struct Sprite {
+	float u0, u1, v0, v1, layer;
+};
+constexpr std::array<Sprite, 2> ReticleSprites {{
+    {0.9873f, 0.9990f, 0.2471f, 0.2588f, 1.0f},
+    {0.9824f, 0.9980f, 0.7134f, 0.7290f, 2.0f},
+}};
+
+// A quad of ClipShaders[1] (four vertices from `first`) samples one of the reticle's sprites.
+inline bool IsReticle(const HW::VertexShaderInfo& vs, uint32_t first) {
+	const auto& user = vs.gs_user_sgpr;
+	uint64_t    base = 0;
+	uint32_t    stride = 0;
+	if (user.count < 12 || !ReadVsharp(user.value + 8, base, stride) || stride < 12 ||
+	    !HostMemoryRangeIsReadable(base + static_cast<uint64_t>(first) * stride, 4u * stride))
+		return false;
+	float u0 = 2.0f, u1 = -1.0f, v0 = 2.0f, v1 = -1.0f, layer = -1.0f;
+	for (uint32_t i = 0; i < 4; ++i) {
+		float uvl[3] {};
+		std::memcpy(uvl, reinterpret_cast<const void*>(base + static_cast<uint64_t>(first + i) * stride), sizeof(uvl));
+		if (i > 0 && uvl[2] != layer) return false;
+		layer = uvl[2];
+		u0 = std::min(u0, uvl[0]), u1 = std::max(u1, uvl[0]), v0 = std::min(v0, uvl[1]), v1 = std::max(v1, uvl[1]);
+	}
+	constexpr float e = 0.002f;
+	return std::any_of(ReticleSprites.begin(), ReticleSprites.end(), [&](const Sprite& s) {
+		return s.layer == layer && std::fabs(s.u0 - u0) < e && std::fabs(s.u1 - u1) < e && std::fabs(s.v0 - v0) < e &&
+		       std::fabs(s.v1 - v1) < e;
+	});
+}
+
 // The areas the draw's vertices lie in (a bit each, Outside for one in none), from its vertices in guest memory; 0 when
 // it is no interface draw into the canvas in a frame showing the 3D, or its vertices are not readable.
 inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs, uint32_t first, uint32_t count) {
@@ -219,6 +265,7 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 		return 0;
 	uint32_t areas = 0;
 	bool     icon  = true;
+	float    min_x = 2.0f, max_x = -2.0f;
 	for (uint32_t i = 0; i < count; ++i) {
 		float xy[2] {};
 		std::memcpy(xy, reinterpret_cast<const void*>(base + static_cast<uint64_t>(first + i) * stride), sizeof(xy));
@@ -229,7 +276,9 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 		}
 		// (The wide canvas: the window x the viewport puts it at, in the 3840 wide layout's clip coordinates.)
 		if (width != CanvasWidth) xy[0] = 2.0f * (viewport.xoffset + xy[0] * viewport.xscale) / CanvasWidth - 1.0f;
-		icon = icon && xy[0] >= Icon.x0 && xy[0] <= Icon.x1 && xy[1] >= Icon.y0 && xy[1] <= Icon.y1;
+		icon  = icon && xy[0] >= Icon.x0 && xy[0] <= Icon.x1 && xy[1] >= Icon.y0 && xy[1] <= Icon.y1;
+		min_x = std::min(min_x, xy[0]);
+		max_x = std::max(max_x, xy[0]);
 		uint32_t bit = Outside;
 		for (uint32_t a = 0; a < Areas.size(); ++a) {
 			const auto& area = Areas[a];
@@ -241,11 +290,30 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 		areas |= bit;
 	}
 	// The HUD is what the frame draws from its round icon on: the markers over the world (enemies' health bars and the
-	// damage dealt, the lock-on) come before it, at their targets, often inside the HUD's areas (a bar above an enemy in
-	// the top left one), and are no HUD.
-	const auto frame = FrameGen::GuestFlips() + 1;
+	// damage dealt) come before it, at their targets, often inside the HUD's areas (a bar above an enemy in the top left
+	// one), and are no HUD; the lock-on reticle comes after it (IsReticle).
+	const auto frame = state.frame + 1;
 	if (icon) state.icon_frame = frame;
-	return state.icon_frame == frame ? areas : 0u;
+	// The lock-on reticle, drawn after the icon: a marker over the world as the ones before it (below).
+	if (state.icon_frame == frame && clip && hash == ClipShaders[1] && count == 4 && areas == Outside && IsReticle(vs, first))
+		return Marker;
+	if (state.icon_frame == frame) return areas;
+	// The game places those markers with its own 16:9 projection of their targets: aspect / (16/9) times as far from the
+	// screen's centre as the wider 3D shows the targets (the lock-on and an enemy's health bar beside an enemy off the
+	// centre, the user 10-19). A draw before the icon in a frame after one with the HUD is drawn as an area held to the
+	// centre (Scope, MarkerArea): back over its target, unstretched. They come batched, the lock-on and the health bars
+	// in one draw that also reaches the canvas's left edge (36 vertices, x -0.98 to 0.09: a slot parked there); only a
+	// draw over the whole width (a fade over the screen) is left as it is.
+	if (state.icon_frame + 1 == frame && !(min_x <= -0.99f && max_x >= 0.99f)) {
+		static bool noted = false;
+		if (!noted) {
+			noted = true;
+			std::printf("HUD anchor: markers over the world held to the screen's centre (first at frame %llu)\n",
+			            static_cast<unsigned long long>(frame));
+		}
+		return Marker;
+	}
+	return 0u;
 }
 
 // The draws a draw is drawn as: once for each of `areas` (Scope), and with `outside` once for each rectangle of the
@@ -253,11 +321,12 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 struct Plan {
 	uint32_t areas   = 0;
 	bool     outside = false;
+	bool     marker  = false; // a marker over the world (Classify): drawn as MarkerArea
 	[[nodiscard]] bool Single() const { return !outside && std::popcount(areas) == 1; }
 	[[nodiscard]] bool Several() const { return areas != 0 && !Single(); }
 };
 inline Plan Split(uint32_t areas) {
-	return {areas & (Outside - 1u), (areas & Outside) != 0 && (areas & (Outside - 1u)) != 0};
+	return {areas & (Outside - 1u), (areas & Outside) != 0 && (areas & (Outside - 1u)) != 0, (areas & Marker) != 0};
 }
 
 // The canvas outside the areas (as drawn: the viewport unchanged) in window pixels, as rectangles: bands between the
@@ -356,10 +425,11 @@ class Scope {
 public:
 	Scope(HW::Context& ctx, const HW::PixelShaderInfo& ps, uint32_t area, bool scissor) {
 		const double wide = ::Loader::DemonsSoulsRenderSize::WideAspect();
-		if (wide <= 0.0 || area >= Areas.size()) return;
+		if (wide <= 0.0 || area > MarkerArea || (scissor && area == MarkerArea)) return;
 		const auto&  screen   = ctx.GetScreenViewport();
 		const auto&  viewport = screen.viewports[0];
-		const auto&  a        = Areas[area];
+		// (A marker over the world: held to the centre, MarkerArea.)
+		const auto&  a        = area < Areas.size() ? Areas[area] : Area {-1.0f, 1.0f, -1.0f, 1.0f, 0.0f};
 		const auto   width    = std::max(CanvasWidthOf(ctx), CanvasWidth);
 		m_ctx                 = &ctx;
 		m_xscale              = viewport.xscale;

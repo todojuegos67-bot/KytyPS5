@@ -14,6 +14,8 @@
 
 #include "common/assert.h"
 #include "device-fault.h"
+#include "live-census.h"
+#include "live-counters.h"
 #include "graphics/host_gpu/graphicContext.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
@@ -188,6 +190,8 @@ public:
 	// Any thread.
 	[[nodiscard]] bool Done(uint64_t value) {
 		if (m_known.load(std::memory_order_acquire) >= value) return true;
+		LiveCounters::Add(LiveCounters::TimelineQueries);
+		if (LiveCensus::g_render) LiveCounters::Add(LiveCounters::TimelineQueriesRender);
 		uint64_t counter = 0;
 		Check(d.vkGetSemaphoreCounterValue(m_device, m_semaphore, &counter), "read readback timeline");
 		Advance(counter);

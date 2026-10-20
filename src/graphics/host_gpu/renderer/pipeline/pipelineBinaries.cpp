@@ -198,6 +198,15 @@ bool PipelineBinaries::CreateBinaries(std::span<const uint32_t> indices, VkPipel
 	return false;
 }
 
+bool PipelineBinaries::Intact(const Key& key) const {
+	const auto found = m_pipelines.find(key);
+	if (found == m_pipelines.end() || found->second.count == 0) return false;
+	std::vector<uint8_t> data;
+	for (uint32_t i = 0; i < found->second.count; i++)
+		if (!ReadData(m_binaries[m_refs[found->second.first + i]], data)) return false;
+	return true;
+}
+
 PipelineBinaries::Handles PipelineBinaries::Load(const Key& key) const {
 	Handles handles;
 	handles.device   = m_device;

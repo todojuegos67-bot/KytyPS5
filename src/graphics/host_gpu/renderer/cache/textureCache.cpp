@@ -18,6 +18,11 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 #include "fresh-memory.h"
+#include "texture-offload.h"
+#include "async-upload.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "kernel/pthread.h"
+#include "common/hostException.h"
 #include "live-counters.h"
 #include "local-platform.h"
 #include "native-resource-state.h"
@@ -27,11 +32,14 @@
 #include <bit>
 #include <chrono>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <span>
+#include <thread>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
@@ -259,6 +267,90 @@ void TextureCache::WriteReport(const char* path) {
 	std::fclose(file);
 }
 
+// KYTY_TEXTURE_OFFLOAD (texture-offload.h): the cache its restores go to, while it lives.
+static TextureCache*     g_offload_cache = nullptr;
+static std::atomic<bool> g_offload_alive {false};
+
+// A check of images' downloads against their guest bytes (OffloadScan): downloaded into one buffer, compared by the
+// offload worker when the GPU is done.
+struct TextureCache::OffloadCheck {
+	struct Entry {
+		uint64_t    serial = 0, address = 0, begin = 0, end = 0, offset = 0; // (offset: of the image's first byte, `address`)
+		uint64_t    kind = 0;                                                // (OffloadKind)
+		std::string what;                                                    // (for the log)
+	};
+	struct Result {
+		uint64_t serial = 0, kind = 0;
+		bool     equal = false, known = true; // (known: its guest bytes were there to compare)
+	};
+	std::unique_ptr<Buffer> buffer, scratch; // (system memory; video memory the images are detiled into first)
+	std::vector<Entry>      entries;
+	std::vector<Result>     results;
+	std::atomic<bool>       done {false};
+};
+
+// An asynchronous restore (RestoreOffloaded): the images' bytes downloaded into one buffer, written back to the ranges by
+// the offload worker when the GPU is done.
+struct TextureCache::OffloadRestore {
+	struct Copy {
+		size_t   range  = 0;
+		uint64_t source = 0; // (offset of the range's first byte in the buffer)
+	};
+	std::unique_ptr<Buffer>                buffer, scratch; // (as OffloadCheck's)
+	std::vector<TextureOffload::Restoring> ranges;
+	std::vector<Copy>                      copies;
+	uint64_t                               bytes = 0, lost = 0;
+	std::chrono::steady_clock::time_point  start;
+	std::atomic<bool>                      done {false};
+};
+
+// The checks' compares, the asynchronous restores' write-backs and the discards of taken ranges: on a thread of their
+// own (the first two handed over by the priority thread when the GPU is done, where they would hold up the game's
+// end-of-pipe and flip operations; the discards took 10-90 ms of the render thread a scan).
+class OffloadWorker {
+public:
+	static void Post(std::function<void()> job) {
+		static auto* worker = new OffloadWorker; // (never destroyed: its thread may outlive static destructors)
+		{
+			std::lock_guard lock(worker->m_mutex);
+			worker->m_jobs.push_back(std::move(job));
+		}
+		worker->m_ready.notify_one();
+	}
+
+private:
+	OffloadWorker() {
+		std::thread([this] {
+			LocalPlatform::SetThreadName("Kyty.Offload");
+			std::vector<std::function<void()>> jobs;
+			for (;;) {
+				{
+					std::unique_lock lock(m_mutex);
+					m_ready.wait(lock, [this] { return !m_jobs.empty(); });
+					jobs.swap(m_jobs);
+				}
+				for (auto& job: jobs) job();
+				jobs.clear();
+			}
+		}).detach();
+	}
+	std::mutex                         m_mutex;
+	std::condition_variable            m_ready;
+	std::vector<std::function<void()>> m_jobs;
+};
+
+// What makes two images' downloads the same transformation of their bytes: format, tiling, extent, levels, layers.
+[[maybe_unused]] static uint64_t OffloadKind(const Image& image) {
+	const auto& info = image.info;
+	uint64_t    kind = static_cast<uint64_t>(info.guest_format);
+	for (const uint64_t value: {static_cast<uint64_t>(info.tile_mode), static_cast<uint64_t>(info.extent.width),
+	                            static_cast<uint64_t>(info.extent.height), static_cast<uint64_t>(info.extent.depth),
+	                            static_cast<uint64_t>(info.resources.levels), static_cast<uint64_t>(info.resources.layers),
+	                            static_cast<uint64_t>(info.bgra16 ? 1 : 0)})
+		kind = kind * 0x100000001b3ull ^ value;
+	return kind;
+}
+
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
@@ -274,6 +366,40 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	// Collection starts where the video memory use reaches the budget less its headroom (GetTotalMemoryBudget):
 	// below it a kept image costs nothing, a deleted one an upload when the game uses it again.
 	m_trigger_gc_memory = m_graphics.GetTotalMemoryBudget();
+#if defined(_WIN32)
+	if (TextureOffload::Enabled()) {
+		const bool offload = TextureOffload::GetMode() == TextureOffload::Mode::Offload;
+		g_offload_cache    = this;
+		g_offload_alive.store(true, std::memory_order_release);
+		auto& state = TextureOffload::Get();
+		state.remove.store(+[](uint64_t vaddr, uint64_t size) { g_offload_cache->m_page_manager.UpdateReadWatchers<false>(vaddr, size); });
+		if (offload) {
+			// A restore on the render thread; from a game thread through it (as a guest readback: BufferCache::ReadMemory).
+			state.restore.store(+[](uint64_t vaddr, uint64_t size, TextureOffload::Touch touch) {
+				auto* cache = g_offload_cache;
+				if (cache == nullptr || !g_offload_alive.load(std::memory_order_acquire)) return;
+				if (GuestGpu::IsGpuThread()) {
+					cache->RestoreOffloaded(vaddr, size, static_cast<uint8_t>(touch));
+					return;
+				}
+				cache->m_scheduler.Context().GetGpu().SendCommandSync(
+				    [cache, vaddr, size, touch] { cache->RestoreOffloaded(vaddr, size, static_cast<uint8_t>(touch)); });
+			});
+			// Not: the upload worker (the render thread waits for it), deferred GPU work, a speculation's recorder (they
+			// cannot wait for the GPU), other host threads (the render thread may wait for them).
+			state.can_wait.store(+[] {
+				if (AsyncUpload::t_worker || CommandScheduler::InDeferredOperation() || CommandScheduler::ThreadRecorder() != nullptr)
+					return false;
+				return GuestGpu::IsGpuThread() || LibKernel::PthreadSelfOrNull() != nullptr;
+			});
+		}
+		Common::HostException::SetProbeHandler(TextureOffload::OnFault);
+		std::printf(offload ? "Texture offload: on (the guest bytes of clean sampled textures of 256 KiB or more dropped from RAM "
+		                      "after 2 s clean and a download that gives them back exactly; KYTY_TEXTURE_OFFLOAD=0 keeps them)\n"
+		                    : "Texture offload probe: on (clean sampled textures of 256 KiB or more made inaccessible after 2 s "
+		                      "clean; nothing discarded)\n");
+	}
+#endif
 }
 
 void KytyTextureGcThresholds(uint64_t total_budget, uint64_t& trigger, uint64_t& pressure, uint64_t& critical) {
@@ -322,6 +448,10 @@ uint64_t KytyGcLiveBudgetValue(const GraphicContext& graphics) {
 }
 
 TextureCache::~TextureCache() {
+	g_offload_alive.store(false, std::memory_order_release); // (no restores: the images go)
+	// (Jobs of the priority thread and the offload worker may still name them: never freed.)
+	for (auto& check: m_offload_checks) (void)check.release();
+	for (auto& restore: m_offload_restores) (void)restore.release();
 	LiveCounters::g_image_report = nullptr;
 	g_report_cache               = nullptr;
 	m_slot_images.ForEach([&](ImageId id, const Image& image) {
@@ -549,6 +679,13 @@ void TextureCache::UnregisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (!image.registered) {
 		return;
+	}
+	// Its dropped guest bytes back first (texture-offload.h).
+	if (TextureOffload::GetMode() == TextureOffload::Mode::Offload && g_offload_alive.load(std::memory_order_relaxed) &&
+	    TextureOffload::Overlaps(image.info.data.address, image.info.data.size)) {
+		// (Its download goes with the work before the image is erased; the bytes land when the GPU is done.)
+		RestoreOffloaded(image.info.data.address, image.info.data.size, static_cast<uint8_t>(TextureOffload::Touch::ImageGone),
+		                 true);
 	}
 	StampRegistrationPages(image, m_resolution_epoch.fetch_add(1, std::memory_order_release) + 1);
 	++m_image_granule_releases;
@@ -2022,6 +2159,19 @@ void TextureCache::InitializeImage(ImageId id) {
     }, SlowLog::HitchThreshold());
 	if (image.info.data.Empty()) {
 		return;
+	}
+	// Guest bytes it reads that were dropped from RAM come back first (texture-offload.h), the asynchronous restores of
+	// images gone too (submitted first: the offload worker writes them back when the GPU is done).
+	if (TextureOffload::Overlaps(image.info.data.address, image.info.data.size)) {
+		RestoreOffloaded(image.info.data.address, image.info.data.size, static_cast<uint8_t>(TextureOffload::Touch::Upload));
+	}
+	if (TextureOffload::IsRestoring(image.info.data.address, image.info.data.size)) {
+		if (CommandScheduler::ThreadRecorder() != nullptr) throw CommandScheduler::RecorderRefusal {"texture offload restore"};
+		if (m_offload_unsubmitted) {
+			m_offload_unsubmitted = false;
+			m_scheduler.Flush();
+		}
+		TextureOffload::WaitRestores(image.info.data.address, image.info.data.size);
 	}
 	DeferredImageProtects protects {m_buffer_cache, m_page_manager};
 	protects.Track([&] { TrackImage(id); });
@@ -3977,6 +4127,372 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	return true;
 }
 
+// The offload's downloads (checks, restores) into `host` (system memory, `total` bytes, zeros where no subresource lands):
+// each image detiled into a video-memory scratch buffer, then one linear copy over. The tiler's scattered writes went
+// straight over the bus before, a few bytes at a time: after each scan the frame's GPU work ended hundreds of ms late
+// and the game waited for it (walk frames of 130-830 ms, the render thread idle). The scratch buffer lives until the GPU
+// is done with it (the caller keeps it).
+std::unique_ptr<Buffer> TextureCache::StageOffloadDownloads(std::vector<std::pair<Image*, DownloadPlan>>& images,
+                                                            const std::vector<uint64_t>& offsets, uint64_t total,
+                                                            Buffer& host) {
+	auto scratch = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, total);
+	m_scheduler.EndRendering();
+	scratch->Fill(0, total, 0);
+	for (size_t i = 0; i < images.size(); i++)
+		DownloadImageData(*images[i].first, *scratch, offsets[i], images[i].first->info.data.size, std::move(images[i].second));
+	m_scheduler.EndRendering();
+	host.CopyFrom(m_scheduler.Current(), *scratch, 0, 0, total);
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask       = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = host.Handle();
+	barrier.offset              = 0;
+	barrier.size                = total;
+	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eHost,
+	                                               {}, 0, nullptr, 1, &barrier, 0, nullptr);
+	return scratch;
+}
+
+// KYTY_TEXTURE_OFFLOAD(_PROBE) (texture-offload.h): every 120 flips, a sampled-only texture image clean at two scans in
+// a row (GPU work never wrote it, no CPU write since its upload, tracked whole) has its whole pages probed, or dropped
+// once a download of it gave its guest bytes back exactly (checked here first, 16 MiB of images a scan by default).
+void TextureCache::OffloadScan(uint64_t tick) {
+#if defined(_WIN32)
+	const bool offload = TextureOffload::GetMode() == TextureOffload::Mode::Offload;
+	TextureOffload::Drain();
+	TextureOffload::Report(false);
+	std::erase_if(m_offload_checks, [&](const std::unique_ptr<OffloadCheck>& check) {
+		if (!check->done.load(std::memory_order_acquire)) return false;
+		for (const auto& result: check->results) {
+			m_offload_exact[result.serial] = result.equal;
+			if (!result.equal && result.known) m_offload_differ_kinds.insert(result.kind);
+		}
+		for (const auto& entry: check->entries) m_offload_checking.erase(entry.serial);
+		return true;
+	});
+	std::erase_if(m_offload_restores,
+	              [](const std::unique_ptr<OffloadRestore>& restore) { return restore->done.load(std::memory_order_acquire); });
+	// (The collector's retirements just recorded theirs: on their way now, for whoever waits for them.)
+	if (m_offload_unsubmitted) {
+		m_offload_unsubmitted = false;
+		m_scheduler.Flush();
+	}
+	if (tick % 120 != 0) return;
+	// (Diagnostics: where a scan's time goes, printed when it took 10 ms or more.)
+	using Clock          = std::chrono::steady_clock;
+	const auto scan_start = Clock::now();
+	double     ms[8] {}; // images, drain, watch, discard, protect, buffer, record, total
+	const auto since = [](Clock::time_point from) { return std::chrono::duration<double, std::milli>(Clock::now() - from).count(); };
+	constexpr uint64_t MinSize     = uint64_t {256} << 10u;
+	constexpr uint64_t MaxSize     = uint64_t {512} << 20u;
+	// (KYTY_TEXTURE_OFFLOAD_CHECK_MB, default 16: the images a scan checks. Their downloads go with the frame's GPU work: 128
+	// MiB a scan made walk frames of 30-55 ms every 2 s, the game waiting for its GPU work behind them.)
+	static const uint64_t CheckBudget = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_OFFLOAD_CHECK_MB");
+		return (value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {16}) << 20u;
+	}();
+	const auto         pages_of    = [](const Image& image) {
+        return std::pair {(image.info.data.address + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1),
+                          image.info.data.End() & ~(TRACKER_PAGE_SIZE - 1)};
+	};
+	std::unordered_map<uint64_t, uint64_t>        seen;
+	std::vector<ImageId>                          take;
+	std::vector<std::pair<ImageId, DownloadPlan>> check;
+	uint64_t                                      check_bytes = 0;
+	m_slot_images.ForEach([&](ImageId id, Image& image) {
+		if (!image.registered || image.depth_id || image.IsGpuModified() || image.IsCpuDirty() || image.IsBufferModified() ||
+		    !image.usage.texture || image.usage.storage || image.usage.render_target || image.usage.depth_target ||
+		    image.usage.video_out || !image.IsTracked() || !image.untracked_holes.empty())
+			return;
+		const auto [begin, end] = pages_of(image);
+		if (end <= begin || end - begin < MinSize) return;
+		const auto first   = m_offload_clean.find(image.serial);
+		seen[image.serial] = first != m_offload_clean.end() ? first->second : tick;
+		if (first == m_offload_clean.end() || TextureOffload::Taken(begin, end - begin, image.serial)) return;
+		if (!offload) {
+			take.push_back(id);
+			return;
+		}
+		if (image.backing.image == nullptr || image.info.data.size > MaxSize ||
+		    HasPendingDownload(image.info.data.address, image.info.data.size))
+			return;
+		if (const auto exact = m_offload_exact.find(image.serial); exact != m_offload_exact.end()) {
+			if (exact->second) take.push_back(id);
+			return;
+		}
+		if (m_offload_checking.contains(image.serial) || check_bytes >= CheckBudget) return;
+		// (A texture in depth tiling has no download: BuildTextureTransfer ends the emulator on one. Of a kind a check found
+		// to differ: not checked again.)
+		if (image.info.tile_mode == Prospero::TileMode::kDepth || m_offload_differ_kinds.contains(OffloadKind(image))) {
+			m_offload_exact[image.serial] = false;
+			return;
+		}
+		for (uint64_t at = begin; at < end;) {
+			const auto mapping_end = Libs::LibKernel::Memory::BackingMappingEnd(at);
+			const auto piece       = mapping_end > at ? std::min(mapping_end, end) - at : 0;
+			if (piece == 0 || Libs::LibKernel::Memory::TryGetBackingPointer(at, piece) == nullptr) {
+				m_offload_exact[image.serial] = false; // (no backing bytes for all of it: never taken)
+				return;
+			}
+			at += piece;
+		}
+		auto plan = BuildDownload(image);
+		// (No buffer the GPU wrote over it: its guest bytes are the image's.)
+		if (!plan.valid || plan.depth_target || m_buffer_cache.HasGpuDirtyBytes(image.info.data.address, image.info.data.size)) {
+			m_offload_exact[image.serial] = false;
+			return;
+		}
+		check_bytes += (image.info.data.size + 255) & ~uint64_t {255};
+		check.emplace_back(id, std::move(plan));
+	});
+	m_offload_clean.swap(seen);
+	std::erase_if(m_offload_exact, [&](const auto& item) { return !m_offload_clean.contains(item.first); });
+	ms[0] = since(scan_start);
+	const auto report = [&] {
+		ms[7] = since(scan_start);
+		if (ms[7] < 10.0) return;
+		std::printf("Texture offload: scan %.1f ms (images %.1f; %zu taken: drain %.1f, watch %.1f, discard %.1f, protect %.1f; %zu "
+		            "checked: buffer %.1f, record %.1f)\n",
+		            ms[7], ms[0], take.size(), ms[1], ms[2], ms[3], ms[4], check.size(), ms[5], ms[6]);
+	};
+	std::vector<std::pair<uint64_t, uint64_t>> discards;
+	for (const auto id: take) {
+		auto& image             = m_slot_images[id];
+		const auto [begin, end] = pages_of(image);
+		std::vector<TextureOffload::Piece> pieces;
+		uint64_t                           covered = 0;
+		for (uint64_t at = begin; at < end;) {
+			const auto  mapping_end = Libs::LibKernel::Memory::BackingMappingEnd(at);
+			const auto  piece       = mapping_end > at ? std::min(mapping_end, end) - at : 0;
+			const auto* backing     = piece != 0 ? Libs::LibKernel::Memory::TryGetBackingPointer(at, piece) : nullptr;
+			if (backing == nullptr) break;
+			pieces.push_back({reinterpret_cast<uint64_t>(backing), piece});
+			covered += piece;
+			at += piece;
+		}
+		// (Two images of one scan over the same pages, aliases of a format: the first one only. A range's pages are one
+		// image's.)
+		if (covered != end - begin || TextureOffload::Taken(begin, end - begin, image.serial)) continue;
+		// (Pending upload jobs read its backing first. Known before its protection: a fault on its pages finds it; a
+		// game thread's waits for the render thread, which drops its pages first.)
+		auto mark = Clock::now();
+		if (offload) AsyncUpload::DrainRange(begin, end - begin);
+		ms[1] += since(mark);
+		TextureOffload::Add(begin, end - begin, pieces, image.serial, (static_cast<uint64_t>(id.generation) << 32u) | id.index,
+		                    offload);
+		mark = Clock::now();
+		m_page_manager.UpdateReadWatchers<true>(begin, end - begin);
+		ms[2] += since(mark);
+		if (offload) {
+			discards.emplace_back(begin, end - begin);
+			continue;
+		}
+		mark = Clock::now();
+		for (const auto& piece: pieces) (void)TextureOffload::Protect(piece.backing, piece.size, PAGE_NOACCESS);
+		ms[4] += since(mark);
+	}
+	// The pages dropped by the worker thread (DiscardVirtualMemory took 10-90 ms of the render thread a scan): until then
+	// they hold their bytes, and a restore meanwhile has nothing to wait for.
+	if (!discards.empty()) {
+		OffloadWorker::Post([discards = std::move(discards)] {
+			// (KYTY_TEXTURE_OFFLOAD_TRIM=0: the guest view's pages left to Windows.)
+			static const bool trim = [] {
+				const char* value = std::getenv("KYTY_TEXTURE_OFFLOAD_TRIM");
+				return value == nullptr || value[0] != '0';
+			}();
+			for (const auto& [begin, size]: discards)
+				if (TextureOffload::DiscardRange(begin) && trim) Libs::LibKernel::Memory::TrimGuestRange(begin, size);
+		});
+	}
+	if (check.empty()) {
+		report();
+		return;
+	}
+	auto mark     = Clock::now();
+	auto entry    = std::make_unique<OffloadCheck>();
+	entry->buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0, AllFlags, check_bytes);
+	ms[5]         = since(mark);
+	mark          = Clock::now();
+	uint64_t                                      offset = 0;
+	std::vector<std::pair<Image*, DownloadPlan>> downloads;
+	std::vector<uint64_t>                         offsets;
+	for (auto& [id, plan]: check) {
+		auto& image             = m_slot_images[id];
+		const auto [begin, end] = pages_of(image);
+		const auto& info = image.info;
+		char        what[160];
+		std::snprintf(what, sizeof(what), "fmt=%u tile=%u %ux%ux%u levels=%u layers=%u size=0x%llx bgra16=%d",
+		              static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode), info.extent.width,
+		              info.extent.height, info.extent.depth, info.resources.levels, info.resources.layers,
+		              static_cast<unsigned long long>(info.data.size), info.bgra16 ? 1 : 0);
+		entry->entries.push_back({image.serial, info.data.address, begin, end, offset, OffloadKind(image), what});
+		m_offload_checking.insert(image.serial);
+		downloads.emplace_back(&image, std::move(plan));
+		offsets.push_back(offset);
+		offset += (image.info.data.size + 255) & ~uint64_t {255};
+	}
+	// (Bytes between subresources: zeros, as a restore leaves them.)
+	entry->scratch = StageOffloadDownloads(downloads, offsets, check_bytes, *entry->buffer);
+	ms[6]          = since(mark);
+	auto* raw = entry.get();
+	m_offload_checks.push_back(std::move(entry));
+	report();
+	m_scheduler.DeferPriorityOperation([raw] { OffloadWorker::Post([raw] {
+		if (!g_offload_alive.load(std::memory_order_acquire)) {
+			raw->done.store(true, std::memory_order_release);
+			return;
+		}
+		raw->buffer->Invalidate(0, raw->buffer->Size());
+		const auto* mapped = raw->buffer->Mapped().data();
+		uint64_t    bytes = 0, failed = 0;
+		static std::atomic<uint32_t> reports {0};
+		for (const auto& item: raw->entries) {
+			// The image's whole pages against guest memory's backing bytes, a mapping at a time.
+			bool     equal = true, known = true;
+			uint64_t first = 0;
+			// (Not over another image's range taken since (a texture streamed in where an offloaded one was): its bytes
+			// are gone, a read of them a miss and zeros, "differs" for the kind. Discards run on this thread: none during
+			// the compare.)
+			if (TextureOffload::Overlaps(item.begin, item.end - item.begin)) equal = known = false;
+			for (uint64_t at = item.begin; at < item.end && equal;) {
+				const auto  mapping_end = Libs::LibKernel::Memory::BackingMappingEnd(at);
+				const auto  piece       = mapping_end > at ? std::min(mapping_end, item.end) - at : 0;
+				const auto* backing     = piece != 0 ? Libs::LibKernel::Memory::TryGetBackingPointer(at, piece) : nullptr;
+				const auto* downloaded  = mapped + item.offset + (at - item.address);
+				known = backing != nullptr;
+				equal = known && std::memcmp(backing, downloaded, piece) == 0;
+				if (!equal && known) {
+					first = at;
+					while (first < at + piece && backing[first - at] == downloaded[first - at]) ++first;
+				}
+				at += std::max<uint64_t>(piece, 1);
+			}
+			if (!equal && known && reports.fetch_add(1, std::memory_order_relaxed) < 24) {
+				std::printf("Texture offload: download differs from the guest bytes at +0x%llx: %s\n",
+				            static_cast<unsigned long long>(first - item.address), item.what.c_str());
+			}
+			bytes += item.end - item.begin;
+			failed += equal || !known ? 0 : 1;
+			raw->results.push_back({item.serial, item.kind, equal, known});
+		}
+		TextureOffload::NoteCheck(raw->entries.size(), bytes, failed);
+		raw->done.store(true, std::memory_order_release);
+	}); });
+#else
+	(void)tick;
+#endif
+}
+
+// Render thread (a speculation's recorder refuses): the discarded ranges over [vaddr, vaddr + size) downloaded back from
+// their images in one submission, the render thread waiting for it; their read watchers then go.
+void TextureCache::RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch_value, bool async) {
+#if defined(_WIN32)
+	if (CommandScheduler::ThreadRecorder() != nullptr) throw CommandScheduler::RecorderRefusal {"texture offload restore"};
+	const auto touch  = static_cast<TextureOffload::Touch>(touch_value);
+	auto       ranges = TextureOffload::BeginRestore(vaddr, size, touch, touch == TextureOffload::Touch::Count, async);
+	if (ranges.empty()) return;
+	const auto                         start = std::chrono::steady_clock::now();
+	std::unique_lock<TrackingSpinLock> lock(m_lock, std::defer_lock);
+	if (!m_lock.OwnedByCurrentThread()) lock.lock();
+	struct Job {
+		size_t       range  = 0;
+		Image*       image  = nullptr;
+		DownloadPlan plan   = {};
+		uint64_t     offset = 0;
+	};
+	std::vector<Job> jobs;
+	uint64_t         total = 0, bytes = 0, lost = 0;
+	for (size_t i = 0; i < ranges.size(); i++) {
+		const auto& range = ranges[i];
+		for (const auto& piece: range.pieces) (void)TextureOffload::Protect(piece.backing, piece.size, PAGE_READWRITE);
+		auto* image = m_slot_images.try_get(ImageId {static_cast<uint32_t>(range.image), static_cast<uint32_t>(range.image >> 32u)});
+		auto  plan  = image != nullptr && image->serial == range.serial && image->backing.image != nullptr ? BuildDownload(*image)
+		                                                                                                 : DownloadPlan {};
+		if (!plan.valid || plan.depth_target) {
+			lost++;
+			std::printf("Texture offload: LOST 0x%llx..0x%llx (its image gone or not downloadable: zeros)\n",
+			            static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end));
+			continue;
+		}
+		jobs.push_back({i, image, std::move(plan), total});
+		total += (image->info.data.size + 255) & ~uint64_t {255};
+	}
+	if (!jobs.empty()) {
+		auto                                          owned    = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0, AllFlags, total);
+		auto&                                         download = *owned;
+		std::vector<std::pair<Image*, DownloadPlan>> downloads;
+		std::vector<uint64_t>                         offsets;
+		for (auto& job: jobs) {
+			downloads.emplace_back(job.image, std::move(job.plan));
+			offsets.push_back(job.offset);
+		}
+		auto scratch = StageOffloadDownloads(downloads, offsets, total, download);
+		if (async) {
+			auto restore     = std::make_unique<OffloadRestore>();
+			restore->buffer  = std::move(owned);
+			restore->scratch = std::move(scratch);
+			restore->lost   = lost;
+			restore->start  = start;
+			for (const auto& job: jobs) {
+				const auto& range = ranges[job.range];
+				restore->copies.push_back({job.range, job.offset + (range.begin - job.image->info.data.address)});
+				restore->bytes += range.end - range.begin;
+			}
+			restore->ranges = std::move(ranges);
+			auto* raw       = restore.get();
+			m_offload_restores.push_back(std::move(restore));
+			m_offload_unsubmitted = true;
+			m_scheduler.DeferPriorityOperation([this, raw] { OffloadWorker::Post([this, raw] {
+				if (!g_offload_alive.load(std::memory_order_acquire)) {
+					raw->done.store(true, std::memory_order_release);
+					return;
+				}
+				raw->buffer->Invalidate(0, raw->buffer->Size());
+				const auto* mapped = raw->buffer->Mapped().data();
+				for (const auto& copy: raw->copies) {
+					const auto* source = mapped + copy.source;
+					for (const auto& piece: raw->ranges[copy.range].pieces) {
+						std::memcpy(reinterpret_cast<void*>(piece.backing), source, piece.size);
+						source += piece.size;
+					}
+				}
+				for (const auto& range: raw->ranges) m_page_manager.UpdateReadWatchers<false>(range.begin, range.end - range.begin);
+				const auto us = static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - raw->start).count());
+				TextureOffload::EndRestore(raw->ranges, raw->bytes, us, raw->lost);
+				raw->done.store(true, std::memory_order_release);
+			}); });
+			return;
+		}
+		m_scheduler.Wait(m_scheduler.CurrentTick());
+		download.Invalidate(0, total);
+		const auto* mapped = download.Mapped().data();
+		for (const auto& job: jobs) {
+			const auto& range  = ranges[job.range];
+			const auto* source = mapped + job.offset + (range.begin - job.image->info.data.address);
+			for (const auto& piece: range.pieces) {
+				std::memcpy(reinterpret_cast<void*>(piece.backing), source, piece.size);
+				source += piece.size;
+			}
+			bytes += range.end - range.begin;
+		}
+	}
+	for (const auto& range: ranges) m_page_manager.UpdateReadWatchers<false>(range.begin, range.end - range.begin);
+	const auto us = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+	TextureOffload::EndRestore(ranges, bytes, us, lost);
+	static std::atomic<uint32_t> reports {0};
+	if (us >= 2000 && reports.fetch_add(1, std::memory_order_relaxed) < 64) {
+		std::printf("Texture offload: restore of %zu ranges (%.1f MiB, %s) took %.1f ms\n", ranges.size(), bytes / 1048576.0,
+		            touch == TextureOffload::Touch::Count ? "after a miss" : TextureOffload::TouchName(touch), us / 1000.0);
+	}
+#else
+	(void)vaddr, (void)size, (void)touch_value;
+#endif
+}
+
 bool TextureCache::HasPendingDownload(uint64_t address, uint64_t size) {
 	std::lock_guard lock(m_download_mutex);
 	return std::ranges::any_of(m_pending_downloads, [&](const PendingDownload& pending) {
@@ -4477,6 +4993,7 @@ void TextureCache::RunGarbageCollector() {
 		return true;
 	});
 	RetireStaleImages(tick);
+	if (TextureOffload::Enabled()) OffloadScan(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

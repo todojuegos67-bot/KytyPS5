@@ -276,7 +276,7 @@ bool CommandScheduler::GpuBusy() {
 // recorded as they would be into the next buffer.)
 void CommandScheduler::DeferrableFlush() {
 	if (const auto backlog = kyty_local_flush_defer.load(std::memory_order_relaxed);
-	    backlog != 0 && t_recorder == nullptr && !m_command.IsInvalid() && Backlog() >= backlog) {
+	    backlog != 0 && t_recorder == nullptr && !m_command.IsInvalid() && BacklogAtLeast(backlog)) {
 		m_command.EndRendering();
 		(void)m_command.Handle();
 		m_flush_deferred = true;
@@ -295,17 +295,23 @@ bool CommandScheduler::FlushedDeferred(uint32_t weight) {
 	if (!m_flush_deferred) return false;
 	if ((m_deferred_checks += weight) < 16) return false;
 	m_deferred_checks = 0;
-	if (Backlog() > 1) return false;
+	if (BacklogAtLeast(2)) return false;
 	Flush();
 	return true;
 }
 
-// The submissions the GPU has still to finish (the recording worker's not handed yet included).
-uint64_t CommandScheduler::Backlog() {
+// The GPU's tick as last read is never ahead of it: the backlog it gives is never short. Under `count` that way, under
+// `count` for sure, without a timeline read (a system call on Linux' RADV, ~9 us; these polls asked ~400 times a frame
+// at 1-1, issue #80).
+bool CommandScheduler::BacklogAtLeast(uint64_t count) {
+	const auto backlog = [this] {
+		const auto submitted = m_master.CurrentTick() - 1;
+		const auto done      = m_master.KnownGpuTick();
+		return submitted > done ? submitted - done : 0;
+	};
+	if (backlog() < count) return false;
 	m_master.Refresh();
-	const auto submitted = m_master.CurrentTick() - 1;
-	const auto done      = m_master.KnownGpuTick();
-	return submitted > done ? submitted - done : 0;
+	return backlog() >= count;
 }
 
 CommandScheduler::~CommandScheduler() {
@@ -436,11 +442,17 @@ void CommandScheduler::PopPendingOperations() {
 	// Refresh() issues a Vulkan timeline query and the drain takes the operation
 	// mutex, so let an atomic count prove there is nothing to retire first. The
 	// count is only a hint: the queue is still re-checked under the lock.
-	if (kyty_local_pending_drain_mode.load(std::memory_order_relaxed) != 0 &&
-	    m_pending_operation_count.load(std::memory_order_acquire) == 0) {
-		return;
+	if (kyty_local_pending_drain_mode.load(std::memory_order_relaxed) != 0) {
+		if (m_pending_operation_count.load(std::memory_order_acquire) == 0) return;
+		// Nor while the oldest waits for a submission the driver has not been handed yet (the open buffer, or one still
+		// with the recording worker: the GPU cannot have run it), and no timeline read when the GPU was seen past it
+		// already (a system call each on Linux' RADV, issue #80).
+		const auto front = m_pending_front_tick.load(std::memory_order_acquire);
+		if (front > m_driver_tick.load(std::memory_order_acquire)) return;
+		if (!m_master.IsFree(front)) m_master.Refresh();
+	} else {
+		m_master.Refresh();
 	}
-	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
 		{
@@ -451,6 +463,8 @@ void CommandScheduler::PopPendingOperations() {
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
+			m_pending_front_tick.store(m_pending_operations.empty() ? UINT64_MAX : m_pending_operations.front().tick,
+			                           std::memory_order_relaxed);
 			m_pending_operation_count.fetch_sub(1, std::memory_order_relaxed);
 		}
 		WaitPriorityOperations(operation.tick);
@@ -465,6 +479,7 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
 		m_pending_operations.push({std::move(operation), CurrentTick()});
+		if (m_pending_operations.size() == 1) m_pending_front_tick.store(CurrentTick(), std::memory_order_relaxed);
 		m_pending_operation_count.fetch_add(1, std::memory_order_release);
 		return;
 	}

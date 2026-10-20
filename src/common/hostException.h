@@ -44,6 +44,13 @@ using GuardPageHandler = bool (*)(uint64_t address, void* native_context);
 
 void SetGuardPageHandler(GuardPageHandler handler);
 
+// Windows, the texture offload (src/local/texture-offload.h): an access violation outside the guest's fault handling is
+// first offered to this handler (the touched address, the faulting instruction, whether it wrote); true resumes the
+// thread.
+using ProbeHandler = bool (*)(uint64_t address, uint64_t rip, const void* native_context, bool write);
+
+void SetProbeHandler(ProbeHandler handler);
+
 // Windows: the stack range the TEB gives while guest code runs on a guest or fiber stack (RunOnGuestStack, RunEntry):
 // the region every guest and fiber stack lies in (pthread.cpp PTHREAD_STACK_BOTTOM..TOP, MapGuestStack), where the
 // thread's host stack lies above it, else none (zeros). With Control Flow Guard on for the process, ntdll checks that an

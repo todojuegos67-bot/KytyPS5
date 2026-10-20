@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
+#include <thread>
 
 namespace Libs::Graphics {
 
@@ -58,14 +59,28 @@ public:
 	void WaitAll();
 
 private:
+<<<<<<< HEAD
 	static constexpr size_t LaneRing = 1u << 20;
+=======
+	void Publish(uint64_t counter) noexcept;
+	void Watch(const std::stop_token& stop);
+
+>>>>>>> upstream/experiment/perf-40fps-20260926
 	GraphicContext&       m_graphics;
 	vk::Semaphore         m_semaphore[2] {nullptr, nullptr};
 	std::atomic<uint64_t> m_gpu_tick[2] {0, 0};
 	std::atomic<uint64_t> m_last_tick[2] {0, 0};
 	std::atomic<uint64_t> m_current_tick {1};
+<<<<<<< HEAD
 	bool                  m_lanes_on = false;
 	std::atomic<uint8_t>* m_lane_of = nullptr;
+=======
+	// Where a timeline read is a system call (Linux' RADV, ~9 us; issue #80: ~1,500 reads a frame at 1-1, most of them
+	// the render thread's polls of whether the GPU is still busy), a thread waits for each tick and publishes it, and
+	// Refresh reads nothing. KYTY_TIMELINE_WATCHER=0|1 (default: when a read takes 1 us or more).
+	bool         m_watched = false;
+	std::jthread m_watcher;
+>>>>>>> upstream/experiment/perf-40fps-20260926
 };
 
 } // namespace Libs::Graphics

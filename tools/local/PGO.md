@@ -48,3 +48,7 @@ profile 里改过的函数会因哈希不符而失去 PGO，需要重新训练�
 ab-exe ABBA，120 Hz 上限（`-Vblank 120`），走 10 s 后两个 6 s 窗口：
 - 1-1：渲染线程 13.52 → 12.81 ms/帧（-5.3%），fps 65.3 → 69.3（A 的第一轮带预热，去掉它 +2.7%）；
 - Latria：12.47 → 12.15 ms/帧（-2.6%），fps 75.2 → 76.1。
+2026-10-20（台式机，发布前）：10-18 之后的提交让 20 个 TU 里 62 个函数失配（bufferCache 6、renderDraw 6、graphicsRun 4、
+textureCache 4 等）。在 ddc59a8e 上用同样四个场景重新训练（`pgo-multi.ps1`），ab-exe ABBA，120 Hz 上限：
+- 1-1：渲染线程 13.71 → 13.04 ms/帧（-4.9%），fps 70.0 → 72.8；
+- Latria：12.23 → 12.17 ms/帧，fps 75.8 → 76.5。

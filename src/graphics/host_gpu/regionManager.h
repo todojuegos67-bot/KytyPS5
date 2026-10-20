@@ -69,6 +69,7 @@ public:
 		m_owner.store(0, std::memory_order_relaxed);
 		m_lock.clear(std::memory_order_release);
 	}
+	[[nodiscard]] bool OwnedByCurrentThread() const noexcept { return m_owner.load(std::memory_order_relaxed) == CurrentThread(); }
 	// A read of state only holders of this lock write, without taking it: valid when no holder
 	// was inside while it ran (the sequence even and unchanged), else done again under the lock.
 	// The query then costs no locked instruction and leaves the lock's line to the writers.

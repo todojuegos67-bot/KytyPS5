@@ -181,7 +181,8 @@ private:
 	// A deferred flush done once the GPU is down to its last submission, asked every 16 units of `weight`
 	// (DeferrableFlush).
 	[[nodiscard]] bool     FlushedDeferred(uint32_t weight);
-	[[nodiscard]] uint64_t Backlog();
+	// The submissions the GPU has still to finish is at least `count` (the recording worker's not handed yet included).
+	[[nodiscard]] bool BacklogAtLeast(uint64_t count);
 	std::function<void(vk::CommandBuffer)> m_prologue_hook;
 
 	MasterSemaphore              m_master;
@@ -208,6 +209,8 @@ private:
 	// Count of live entries in m_pending_operations, updated under
 	// m_operation_mutex and read lock-free as a "nothing to retire" hint.
 	std::atomic<uint32_t> m_pending_operation_count {0};
+	// The tick of m_pending_operations' oldest entry (UINT64_MAX: none), the same way.
+	std::atomic<uint64_t> m_pending_front_tick {UINT64_MAX};
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;

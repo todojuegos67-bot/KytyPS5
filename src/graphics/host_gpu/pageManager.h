@@ -85,6 +85,11 @@ public:
 
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
+	// The texture offload's hold on whole pages (texture-offload.h): no access while it lasts, a count of its own beside
+	// the watchers (the memory tracker's read watcher of a page GPU work wrote stays its own); reads of them fault
+	// (HasReadWatchers).
+	template <bool track>
+	void UpdateReadWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
 

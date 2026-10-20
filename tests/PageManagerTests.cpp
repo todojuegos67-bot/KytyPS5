@@ -586,6 +586,61 @@ void CheckDeathCase(const char *name) {
 #endif
 }
 
+// Issue #91: the texture offload's hold and the memory tracker's read watcher over one page, either first, and two
+// holds of aliased images: no access until the last one goes, then the page's protection is the watchers' again.
+void TestOffloadHoldBesideReadWatcher() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *memory = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  const auto page = region_base + page_size * 20;
+  const auto *pointer = reinterpret_cast<void *>(page);
+  RegionBits mask;
+  mask.Set(20);
+
+  manager.UpdateReadWatchers<true>(page, page_size);
+  Check(Protection(pointer) == PAGE_NOACCESS &&
+            manager.HasReadWatchers(page, page_size),
+        "offload hold did not take the page's access");
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+  Check(Protection(pointer) == PAGE_NOACCESS,
+        "read watcher beside an offload hold changed the page");
+  manager.UpdateReadWatchers<false>(page, page_size);
+  Check(Protection(pointer) == PAGE_NOACCESS &&
+            manager.HasReadWatchers(page, page_size),
+        "offload release gave back a page the read watcher keeps");
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, mask);
+  Check(IsWritable(pointer) && !manager.HasReadWatchers(page, page_size),
+        "page not writable after both went");
+
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+  manager.UpdateReadWatchers<true>(page, page_size);
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, mask);
+  Check(Protection(pointer) == PAGE_NOACCESS &&
+            manager.HasReadWatchers(page, page_size),
+        "read watcher release gave back a page the offload holds");
+  manager.UpdateReadWatchers<true>(page, page_size);
+  manager.UpdateReadWatchers<false>(page, page_size);
+  Check(Protection(pointer) == PAGE_NOACCESS,
+        "second offload hold's release gave back the page");
+  manager.UpdateReadWatchers<false>(page, page_size);
+  Check(IsWritable(pointer) && !manager.HasReadWatchers(page, page_size),
+        "page not writable after the last offload hold");
+
+  manager.UpdatePageWatchersForRegion<true>(region_base, mask);
+  manager.UpdateReadWatchers<true>(page, page_size);
+  manager.UpdateReadWatchers<false>(page, page_size);
+  Check(Protection(pointer) == PAGE_READONLY,
+        "offload release lost the page's write watcher");
+  manager.UpdatePageWatchersForRegion<false>(region_base, mask);
+  Check(IsWritable(pointer), "page not writable after the write watcher");
+
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestFatalPaths() {
   for (const char *name :
        {"invalid-range", "unknown-untrack", "destructor-watch",
@@ -603,6 +658,10 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
   return ProtectAddressSpace(vaddr, size, mode);
 }
 
+bool RestoreGuestWritable(uint64_t /*vaddr*/, uint64_t /*size*/) {
+  return false;
+}
+
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
@@ -617,6 +676,7 @@ int main(int argc, char **argv) {
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
+  TestOffloadHoldBesideReadWatcher();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

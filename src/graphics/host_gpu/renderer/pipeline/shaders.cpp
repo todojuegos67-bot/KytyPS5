@@ -880,6 +880,15 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 			if (InlineKeyCheck()) CheckInlineKey(graphics.device, original, key);
 			// Another shard of this precompile holds it: no pipeline (see CreatePipelineInternal).
 			if (writer != nullptr && writer->Claimed(key)) return vk::Result::ePipelineCompileRequired;
+			// The precompile keeps a stored pipeline's binaries as they are, intact: the store is this GPU's and
+			// driver's (Open's signature). Made from them only to be copied, its pipelines took ~5 ms each here, more on
+			// slower PCs: in an update run (new hints) a third of the time (issue #85: on an RTX 2060 it looked like a run
+			// from zero). No pipeline then, as for one another shard holds.
+			if (writer != nullptr && store != nullptr && store->Intact(key)) {
+				writer->Copy(key, *store);
+				t_static_hit = true;
+				return vk::Result::ePipelineCompileRequired;
+			}
 			if (const auto binaries = store != nullptr ? store->Load(key) : PipelineBinaries::Handles {};
 			    !binaries.binaries.empty()) {
 				const auto result = made_of(binaries);

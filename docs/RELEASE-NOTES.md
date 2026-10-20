@@ -1,75 +1,84 @@
 ## New in this build
 
-- **DLSS super resolution** (new launcher row "Upscaler", NVIDIA RTX only, off by default): Demon's Souls' own PS5 Pro
-  mode, with NVIDIA DLSS in place of Sony's PS5 Pro upscaler. The 3D is rendered at the render height and DLSS makes a
-  real 3840x2160 image of it, which the game finishes at 4K (bloom, depth of field, the HUD). It starts at render
-  height 1080 (DLSS Performance): on an RTX 5090 about the frame rate of the game's own TAA at 1440, with a sharper
-  picture; 1440 is DLSS Quality, 1512 the PS5 Pro's own, 2160 DLAA. It needs NVIDIA's Streamline runtime, chosen as
-  for frame generation (the launcher's "Streamline..." button). The in-game Cinematic mode stays native 4K.
-- **Higher render heights:** the launcher's "Render height" now goes above the PS5's 1440, up to 2160 (the 3D at the
-  output's own 3840x2160). It also works on game version 01.005.000 now, where it had no effect (issue #69).
-- **Ultrawide displays:**
-  - Resolution, aspect ratio, render height and upscaler are side by side in the launcher. The resolutions follow the
-    aspect ratio (21:9: 2560x1080, 3440x1440, 3840x1600, 5120x2160; 32:9: 3840x1080, 5120x1440, 7680x2160), and the
-    render heights stop where the game's render target memory ends (21:9 up to 1800, 32:9 up to 1512).
-  - A 21:9 render height of 2160 ended the game at start-up, and one of 1864 showed the 3D in red only: the game's
-    render targets are made for its own 3840x2160. The emulator now lowers a height that does not fit by itself and
-    says so in the log.
-  - With DLSS, an ultrawide aspect makes the full-width picture (5120x2160 at 21:9) instead of a widened 16:9 one.
-  - Movies, menus and loading screens are stretched to the full width instead of 16:9 between black bars.
-  - Enemy health bars stay over their enemies, and the box of picked-up items stays whole.
-  - Known issues: at 21:9 the lock-on marker sits a little off an enemy that is off the screen's centre; with DLSS at
-    21:9 the opening movie can show at the left three quarters of the screen.
-- **Saves are kept safe from a crash while saving** (issue #73): a blue screen while the game saved could leave the
-  save file full of zeros. Saves are now flushed to disk when the game finishes them, and each save is also copied to
-  `_SaveData\.kyty-backup` (the last 4, at least 5 minutes apart). A save found broken that way at the next start gets
-  the newest good copy back automatically; the log says which one, and the broken files are kept beside the backups.
-- **AMD graphics cards:**
-  - Black squares all over the picture after precompiling with v20261018 (RX 6000 series, issues #64, #71): a shader
-    change of that version is now made for NVIDIA cards only.
-  - The GPU reset at the Vanguard (RX 9070 XT on Linux, issue #51) is fixed.
-  - Both change shaders on AMD cards: the launcher offers the precompile again at the first start.
+v20261020b fixes a crash of v20261020 on PCs with 16 GB of RAM. Everything new in v20261020 (further below) is in it
+too.
+
+- **Crash on PCs with 16 GB of RAM (issue #91):** v20261020's new memory saving for textures (on by default with 20 GB
+  of RAM or less) could end the emulator with "PageManager fatal: read-watcher overflow" while a level loaded. Fixed;
+  the saving stays on. If you added `-Set KYTY_TEXTURE_OFFLOAD=0` to get around the crash, you can remove it again.
+- **Four shaders that ended the emulator:** four of the game's pixel shaders could not be translated, and the emulator
+  stopped where the game drew with one of them (an automated tour hit one in the Valley of Defilement). They translate
+  now, and the precompile builds them.
+- **More shaders precompiled:** automated tours through all six worlds, fighting and killing every enemy (bosses too),
+  added 153 shader programs and 580 pipelines to the hints. Among them are three large Shrine of Storms shaders that
+  froze the game for up to 40 s the first time they were needed. The launcher offers the precompile again at the first
+  start; only the new part is compiled.
+- **Linux with AMD graphics:** the emulator's main thread asked the graphics driver about 2,000 times a frame how far
+  the GPU had got. On Linux each question is a system call (about 9 µs on RADV). Questions whose answer is already known
+  are skipped now, and where a question is slow, a separate thread follows the GPU instead (`KYTY_TIMELINE_WATCHER=0`
+  turns it off). Not measured on Linux yet: reports are welcome in issue #80.
+- **Thanks** to @ededaelita1-afk for the crash report and to @yazuc for the Linux profiles.
+
+## New in v20261020
+
+- **Less memory on 16 GB PCs and 8 GB graphics cards:**
+  - Game memory nothing ever wrote is no longer read when the GPU first uses it, only taken as zeros: 0.7-1.4 GB less
+    RAM in use on a 16 GB PC (`KYTY_FRESH_MEMORY=0` turns it off).
+  - On PCs with 16 GB of RAM, textures the game only reads keep one copy, in video memory, instead of a second one in
+    RAM: about 0.5 GB less RAM in use (`KYTY_TEXTURE_OFFLOAD=0` turns it off, `=1` turns it on with more RAM).
+  - The shaders of a world the game left are dropped a minute after it, on every graphics card. Before, they piled up
+    for the whole session (the driver's memory went from 0.9 to 2 GB on a trip through five worlds).
+  - The warm-up at start compiles the shaders recorded for the map the game loads, not those of every map (up to 4 GB
+    of the driver's memory).
+  - Video memory: the GPU's address table takes 64 MiB instead of 512 MiB, and game buffers no longer keep video
+    memory for game memory the game freed. On cards with less than 12 GB, video memory is also allocated in smaller
+    blocks and game buffers are compacted after the game frees memory: about 0.6 GB less video memory on an 8 GB card
+    after travelling between worlds (`KYTY_BUFFER_DEFRAG=0` turns the compacting off).
+- **AMD and Intel graphics cards:** pipelines compiled while playing are kept and loaded at the next start, instead of
+  being compiled again every session (issue #78; `KYTY_PLAYED_PIPELINES=0` turns it off).
+- **More shaders precompiled:** a player shared the shader hints of a whole 1.07 playthrough (issue #88, thanks
+  @tscftw): 2,091 more shader programs and 2,213 more pipelines, from places our own test runs never reached. The
+  launcher offers the precompile again at the first start; only the new part is compiled.
+- **Smoother:** in places with many lights and enemies (Boletaria 1-3), reading a light table no longer waits for the
+  GPU: a few more fps and fewer short stutters.
 - **Fixes:**
-  - The precompile uses every core on Windows 11 PCs with efficiency cores; some ran it on the efficiency cores only
-    (issue #63).
-  - A rare exit after long sessions with DLSS ("PageManager fatal: invalid range vaddr=0x0", issue #70).
-  - A debug message from a system library no longer ends the emulator, and a fatal end writes what and where to the log
-    (issue #56).
-  - The MEMORY_MANAGEMENT blue screen (0x1A/0x41202, issues #5, #50): a stronger fix is on by default: every page
-    protection change now waits for any memory map or unmap in progress. Please tell us if it still happens.
-- **In the game:**
-  - **F9** saves a debug snapshot and pauses the game: the picture shown, where you are and the run's log, in
-    `_DebugSnapshots\<date-time>\`. F9 again resumes. Attach the folder to an issue when something looks wrong.
-  - F8's "Frame rate" panel shows at once instead of after a second.
-- **Options** (off by default): `KYTY_FG_HUDLESS=1` gives DLSS frame generation the game image without its HUD, for
-  steadier HUD in generated frames (a contribution, PR #72); `KYTY_AUDIO_CATCHUP_MS` and `KYTY_AUDIO_CUSHION_MS` for
-  audio dropouts with heavy GPU add-ons (a contribution, PR #68).
-- **Diagnostics** (for bug reports): `KYTY_PIPELINE_STATS=1` (the driver's statistics of each pipeline),
-  `KYTY_SR_TIMING=1` and `KYTY_DLSS_PRESET=<letter>` (DLSS), and a backtrace when the page tracker ends the emulator.
+  - On "lite" Windows builds that turn Control Flow Guard on for every program, the emulator ended within the first
+    seconds without a line in the log (issue #56).
+  - The save dialogs show Chinese, Japanese and Korean text with the system's font instead of "?" (a contribution by
+    @Myoko, PR #75).
+  - A save whose capacity record was all zeros (after a power cut) failed every time the game opened it; it now counts
+    as empty (a contribution by @Vorshim92, PR #74).
+  - The driver's shader caches: a small one is saved at least once a minute while shaders compile, and with the
+    precompiled store one past 256 MiB starts over instead of growing.
+- **README:** how to play in Chinese, Japanese or Korean (a value in the game's `param.json` picks the language list),
+  and how to update to a newer package (extract it over the old folder; what is kept).
+- **Thanks** to @nerdjb for the Linux port fixes and the Linux package, and to everyone who sent logs and tests.
 
 ## 本版本的变化
 
-- **DLSS 超分辨率**（启动器新增"Upscaler"一行，仅限 NVIDIA RTX，默认关闭）：使用《恶魔之魂》自己的 PS5 Pro 模式，用 NVIDIA DLSS 代替索尼的 PS5 Pro 超分。3D 按渲染高度渲染，由 DLSS 生成真正的 3840x2160 图像，再由游戏在 4K 下完成后期（泛光、景深、HUD）。默认从渲染高度 1080 开始（DLSS 性能档）：在 RTX 5090 上帧率与游戏自带 TAA 在 1440 时相当，画面更清晰；1440 为 DLSS 质量档，1512 是 PS5 Pro 原生设置，2160 为 DLAA。需要 NVIDIA 的 Streamline 运行库，选择方式和帧生成一样（启动器的"Streamline..."按钮）。游戏内的电影模式仍为原生 4K。
-- **更高的渲染高度：** 启动器的"Render height"现在可以超过 PS5 的 1440，最高到 2160（3D 按输出本身的 3840x2160 渲染）。在游戏版本 01.005.000 上也生效了，之前在该版本上不起作用（issue #69）。
-- **超宽屏：**
-  - 启动器里的分辨率、画面比例、渲染高度和超分方式放在一起。分辨率列表跟随画面比例（21:9：2560x1080、3440x1440、3840x1600、5120x2160；32:9：3840x1080、5120x1440、7680x2160），渲染高度只列出游戏渲染目标内存装得下的（21:9 最高 1800，32:9 最高 1512）。
-  - 21:9 下渲染高度 2160 会让游戏启动即退出，1864 会让 3D 画面只剩红色：游戏的渲染目标是按它自己的 3840x2160 分配的。现在模拟器会自动把装不下的高度降下来，并在日志里说明。
-  - 使用 DLSS 时，超宽画面比例会直接生成全宽画面（21:9 下为 5120x2160），而不是把 16:9 画面拉宽。
-  - 过场视频、菜单和加载画面拉伸铺满全宽，不再是 16:9 加黑边。
-  - 敌人血条保持在敌人头上，拾取物品的提示框保持完整。
-  - 已知问题：21:9 下，不在屏幕中央的敌人身上的锁定标记会略有偏移；DLSS 加 21:9 时，开场动画可能只显示在屏幕左侧四分之三。
-- **保存时崩溃也不会丢存档**（issue #73）：以前如果在游戏保存时蓝屏，存档文件可能变成全零。现在游戏每次保存完成都会写入磁盘，并另外复制一份到 `_SaveData\.kyty-backup`（保留最近 4 份，彼此至少间隔 5 分钟）。下次启动时如果发现存档这样损坏，会自动换回最新的完好备份，日志里会写明用的是哪一份，损坏的文件保留在备份旁边。
-- **AMD 显卡：**
-  - 用 v20261018 预编译后画面上出现大量黑色方块（RX 6000 系列，issue #64、#71）：那个版本的一项着色器改动现在只用于 NVIDIA 显卡。
-  - 先锋恶魔处的 GPU 重置（Linux 上的 RX 9070 XT，issue #51）已修正。
-  - 这两项都改变了 AMD 显卡上的着色器：第一次启动时启动器会再次提示预编译。
+v20261020b 修正了 v20261020 在 16 GB 内存电脑上的一个崩溃。v20261020 的所有新内容（见下方）也都包含在内。
+
+- **16 GB 内存电脑上的崩溃（issue #91）：** v20261020 新增的纹理省内存功能（内存 20 GB 及以下默认开启）可能在加载关卡时让模拟器以 "PageManager fatal: read-watcher overflow" 退出。已修正，该功能保持开启。如果你为了绕过崩溃加了 `-Set KYTY_TEXTURE_OFFLOAD=0`，现在可以去掉了。
+- **会让模拟器退出的四个着色器：** 游戏里有四个像素着色器无法翻译，游戏用到它们的地方模拟器就会停止（自动测试在污秽谷（Valley of Defilement）遇到了其中一个）。现在它们可以正常翻译，预编译也会生成它们。
+- **预编译的着色器更多了：** 自动测试跑遍了全部六个世界，与每个敌人（包括 Boss）战斗并击杀，提示里多了 153 个着色器程序和 580 个管线。其中包括风暴神殿（Shrine of Storms）的三个大型着色器，它们第一次用到时会让游戏卡住最长约 40 秒。第一次启动时启动器会再次提示预编译，只会编译新增的部分。
+- **Linux 和 AMD 显卡：** 模拟器主线程每帧向显卡驱动询问 GPU 进度约 2,000 次。在 Linux 上每次询问都是一次系统调用（RADV 上约 9 微秒）。现在已知答案的询问会被跳过；询问较慢时，改由一个单独的线程跟踪 GPU 进度（`KYTY_TIMELINE_WATCHER=0` 可关闭）。尚未在 Linux 上实测，欢迎在 issue #80 反馈。
+- **感谢** @ededaelita1-afk 报告崩溃，感谢 @yazuc 提供 Linux 性能分析数据。
+
+## v20261020 的变化
+
+- **16 GB 内存的电脑和 8 GB 显卡占用更少：**
+  - 游戏从未写过的内存，在 GPU 第一次使用时不再去读取，直接当作全零：16 GB 内存的电脑上少用 0.7-1.4 GB 内存（`KYTY_FRESH_MEMORY=0` 可关闭）。
+  - 在 16 GB 内存的电脑上，游戏只读取的纹理只在显存里保留一份，不再在内存里多存一份：少用约 0.5 GB 内存（`KYTY_TEXTURE_OFFLOAD=0` 可关闭，`=1` 可在更大内存上开启）。
+  - 游戏离开一个世界一分钟后，那个世界的着色器会被释放，所有显卡都是如此。之前它们会在整个游玩过程中一直累积（走一遍五个世界，驱动内存从 0.9 GB 涨到 2 GB）。
+  - 启动时的预热只编译游戏正在加载的地图录到的着色器，不再编译所有地图的（之前最多占用驱动 4 GB 内存）。
+  - 显存：GPU 地址表只占 64 MiB，不再是 512 MiB；游戏缓冲区不再为游戏已释放的内存保留显存。显存小于 12 GB 的显卡上，显存还会按更小的块分配，游戏释放内存后缓冲区会被整理紧凑：8 GB 显卡在几个世界之间来回之后显存少用约 0.6 GB（`KYTY_BUFFER_DEFRAG=0` 可关闭整理）。
+- **AMD 和 Intel 显卡：** 游戏过程中编译的管线会被保存，下次启动直接载入，不再每次都重新编译（issue #78；`KYTY_PLAYED_PIPELINES=0` 可关闭）。
+- **预编译的着色器更多了：** 一位玩家分享了他完整通关 1.07 版的着色器提示（issue #88，感谢 @tscftw）：多了 2,091 个着色器程序和 2,213 个管线，来自我们自己的测试路线没有走到的地方。第一次启动时启动器会再次提示预编译，只会编译新增的部分。
+- **更流畅：** 在灯光和敌人很多的地方（波雷塔利亚 1-3），读取灯光表不再等待 GPU：帧率高几帧，短暂卡顿更少。
 - **修正：**
-  - 在有能效核的 Windows 11 电脑上，预编译会用上所有核心；之前有些电脑只在能效核上运行（issue #63）。
-  - 长时间使用 DLSS 后偶尔退出的问题（"PageManager fatal: invalid range vaddr=0x0"，issue #70）。
-  - 系统库输出调试信息时不再导致模拟器退出；致命错误退出时会在日志里写明原因和位置（issue #56）。
-  - MEMORY_MANAGEMENT 蓝屏（0x1A/0x41202，issue #5、#50）：更强的修正默认开启：每次修改页保护时都会等待正在进行的内存映射或解除映射。如果还会发生，请告诉我们。
-- **游戏中：**
-  - **F9** 保存一份调试快照并暂停游戏：当前画面、所在位置和本次运行的日志，存放在 `_DebugSnapshots\<日期-时间>\`。再按 F9 继续。画面有问题时，把这个文件夹附到 issue 里。
-  - F8 的"Frame rate"面板切换后立即显示，不再等一秒。
-- **选项**（默认关闭）：`KYTY_FG_HUDLESS=1` 给 DLSS 帧生成提供不含 HUD 的游戏画面，让生成帧里的 HUD 更稳定（社区贡献，PR #72）；`KYTY_AUDIO_CATCHUP_MS` 和 `KYTY_AUDIO_CUSHION_MS` 用于使用重型 GPU 插件时的音频断续（社区贡献，PR #68）。
-- **诊断**（用于报告问题）：`KYTY_PIPELINE_STATS=1`（驱动对每个管线的统计）、`KYTY_SR_TIMING=1` 和 `KYTY_DLSS_PRESET=<字母>`（DLSS），以及页面跟踪器结束模拟器时输出调用栈。
+  - 在对所有程序都开启控制流防护（CFG）的"精简版" Windows 上，模拟器会在开头几秒内退出，日志里没有任何记录（issue #56）。
+  - 存档对话框里的中文、日文、韩文改用系统字体显示，不再显示为"?"（@Myoko 的贡献，PR #75）。
+  - 容量记录全为零的存档（断电之后）以前每次打开都会失败，现在按空存档处理（@Vorshim92 的贡献，PR #74）。
+  - 驱动的着色器缓存：编译着色器期间，较小的缓存至少每分钟保存一次；有预编译存储时，超过 256 MiB 的缓存会重新开始，不再一直增长。
+- **README：** 如何用中文、日文或韩文游玩（游戏 `param.json` 里的一个值决定可选语言），以及如何更新到新的包（解压覆盖旧文件夹，哪些内容会保留）。
+- **感谢** @nerdjb 完成 Linux 移植的修正和 Linux 安装包，也感谢所有提供日志和测试的玩家。

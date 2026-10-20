@@ -1944,6 +1944,8 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 	std::optional<HudAnchor::StretchScope> widen;
 	if (hud.Single()) {
 		anchor.emplace(m_ctx, m_sh_ctx.GetPs(), static_cast<uint32_t>(std::countr_zero(hud.areas)), false);
+	} else if (hud.marker) {
+		anchor.emplace(m_ctx, m_sh_ctx.GetPs(), HudAnchor::MarkerArea, false);
 	} else {
 		HudAnchor::RestoreMask(m_sh_ctx.GetPs());
 		if (HudAnchor::Stretched(m_ctx)) widen.emplace(m_ctx, m_sh_ctx.GetPs());
@@ -2314,6 +2316,8 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		std::optional<HudAnchor::StretchScope> widen;
 		if (hud.Single()) {
 			anchor.emplace(m_ctx, m_sh_ctx.GetPs(), static_cast<uint32_t>(std::countr_zero(hud.areas)), false);
+		} else if (hud.marker) {
+			anchor.emplace(m_ctx, m_sh_ctx.GetPs(), HudAnchor::MarkerArea, false);
 		} else {
 			HudAnchor::RestoreMask(m_sh_ctx.GetPs());
 			if (HudAnchor::Stretched(m_ctx)) widen.emplace(m_ctx, m_sh_ctx.GetPs());
@@ -2754,6 +2758,7 @@ void CommandProcessor::Flip() {
 	}
 
 	auto& command = CurrentBuffer();
+	HudAnchor::NoteFlip();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	LiveTrace::Event(LiveTrace::FlipSubmit, request);
@@ -2774,6 +2779,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
+	HudAnchor::NoteFlip();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	LiveTrace::Event(LiveTrace::FlipSubmit, request);
@@ -2801,6 +2807,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	}
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
+	HudAnchor::NoteFlip();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	LiveTrace::Event(LiveTrace::FlipSubmit, request);
@@ -2822,6 +2829,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	ProcessorScope processor_scope(*this);
 
 	LiveTrace::Event(LiveTrace::FlipSubmit, request_id, 1);
+	HudAnchor::NoteFlip();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, CurrentBuffer());
 	GetScheduler().Flush();
 	m_renderer.GetVideoOut().CompleteFlip(request_id);
