@@ -144,7 +144,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          STREAMLINE_VERSION: v2.14.1
+          STREAMLINE_VERSION: v2.14.16
         run: |
           $zips = '_Build\deps\streamline-zip'
           $unpacked = '_Build\deps\streamline-unpacked'

@@ -218,6 +218,7 @@ struct UpscaleImage {
 	vk::Format          format = vk::Format::eUndefined;
 	vk::Extent2D        extent {};
 	vk::ImageUsageFlags usage {};
+	uint32_t            level = 0, layer = 0; // the view's subresource
 };
 struct UpscaleInputs {
 	UpscaleImage color, depth, motion, output; // color, depth and motion at the render size

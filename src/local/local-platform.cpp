@@ -939,6 +939,18 @@ int DisplayRefreshHz(void* window) {
 	return mode.dmDisplayFrequency > 1 ? static_cast<int>(mode.dmDisplayFrequency) : 0;
 }
 
+uint32_t DisplayHeight(void* window) {
+	HMONITOR monitor = window != nullptr ? MonitorFromWindow(static_cast<HWND>(window), MONITOR_DEFAULTTONEAREST)
+	                                     : MonitorFromPoint(POINT {0, 0}, MONITOR_DEFAULTTOPRIMARY);
+	MONITORINFOEXW info {};
+	info.cbSize = sizeof(info);
+	if (monitor == nullptr || GetMonitorInfoW(monitor, &info) == FALSE) return 0;
+	DEVMODEW mode {};
+	mode.dmSize = sizeof(mode);
+	if (EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) == FALSE) return 0;
+	return static_cast<uint32_t>(mode.dmPelsHeight);
+}
+
 bool StartDisplayVblanks(void* window) {
 	g_display_vblanks.window.store(static_cast<HWND>(window));
 	if (g_display_vblanks.started.load()) return true;
@@ -1917,6 +1929,10 @@ void SleepUntilPrecise(int64_t deadline_ns) {
 }
 
 int DisplayRefreshHz(void* /*window*/) {
+	return 0;
+}
+
+uint32_t DisplayHeight(void* /*window*/) {
 	return 0;
 }
 

@@ -19,7 +19,7 @@
 #                                            frame (2x; up to 5, at most what the GPU makes); needs
 #                                            NVIDIA's Streamline runtime (-StreamlineDir)
 #   .\run-windows.ps1 -Upscaler dlss         DLSS super resolution: Demon's Souls' own PS5 Pro path (its 3D at
-#                                            2688x1512 or -RenderHeight, 1080 at least), DLSS in place of Sony's
+#                                            2688x1512 or -RenderHeight, 720-2160), DLSS in place of Sony's
 #                                            upscaler making the 3840x2160 image; NVIDIA's Streamline runtime
 #   .\run-windows.ps1 -StreamlineDir <dir>   where NVIDIA's Streamline runtime is (the Streamline SDK
 #                                            or its bin\x64; default: a "streamline" folder next to
@@ -68,6 +68,7 @@ param(
 	[int]$Vblank = 0,
 	[switch]$Fps120,
 	[int]$RenderHeight = 0,
+	[double]$UpscaleRatio = 0,
 	[string]$Upscale = '',
 	[int]$UpscaleHeight = 0,
 	[string]$DlssPreset = '',
@@ -377,6 +378,10 @@ if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -m
 # -Turbo2: the 3D at 1080 at most (its render targets ~45% of 1440's video memory; with an upscaler it stayed under 6 GB).
 if ($Turbo2 -and ($RenderHeight -le 0 -or $RenderHeight -gt 1080)) { $RenderHeight = 1080 }
 if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
+# -UpscaleRatio <1..4> (with -Upscaler and no -RenderHeight): the 3D at the monitor's height over the ratio (DLAA 1.0,
+# Quality 1.5, Balanced 1.72, Performance 2.0, Ultra Performance 3.0; the monitor detected by the emulator,
+# KYTY_DISPLAY_HEIGHT overrides it), 720-2160.
+if ($UpscaleRatio -gt 0 -and $RenderHeight -le 0) { $environment['KYTY_UPSCALE_RATIO'] = $UpscaleRatio.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
 # -Upscale fsr: the 3D image (at -RenderHeight) upscaled to 1440 by FSR 3.1 before the game's composite (frame-gen.h
 # UpscaleComposite), instead of the game's own scaling in that composite.
 # One upscaler: -Upscale (the old path after the game's TAA) goes to the PS5 Pro path (-Upscaler) with the same upscaler.

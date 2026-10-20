@@ -70,6 +70,21 @@ struct Sources {
 };
 
 int      g_generate    = 0;     // frames to generate per rendered frame (0 = off)
+// KYTY_DLSSG_DYNAMIC=1: an app-side dynamic multiplier. Streamline's eDynamic is D3D12 only (not on Vulkan, and it
+// ignores numFramesToGenerate), so DLSS-G stays eOn and the emulator picks numFramesToGenerate itself, once a second:
+// gen = clamp(floor(target / real) - 1, 1, KYTY_FRAMEGEN (default 3), numFramesToGenerateMax), changed only when the new
+// value held for two windows in a row. Target: KYTY_DLSSG_TARGET_FPS, default refresh - refresh^2 / 3600 (224 on
+// 240 Hz). No Reflex frame limit from the multiplier: the real rate stays the game's own pacing.
+bool     g_dlssg_dynamic   = false;
+float    g_dlssg_target_fps = 0.0f;
+int      g_dyn_gen         = 1;   // the current generated frame count in dynamic mode (g_generate is its maximum)
+int      g_dyn_pending     = 0;   // a candidate value and how many windows in a row it came out
+int      g_dyn_pending_n   = 0;
+double   g_dyn_real_fps    = 0.0; // smoothed real fps
+
+int CurrentGenerate() {
+	return g_dlssg_dynamic ? std::min(g_dyn_gen, g_generate) : g_generate;
+}
 bool g_dlss_sr = false; // KYTY_UPSCALE=dlss: DLSS super resolution (Streamline's DLSS plugin)
 bool g_taa_dlss = false; // KYTY_TAA_REPLACE=dlss: DLSS (DLAA) in place of the game's TAA
 // KYTY_TAA_REPLACE=upscaler (with KYTY_UPSCALE dlss|fsr|xess): the game's TAA skipped, its jittered image copied to
@@ -631,6 +646,27 @@ void BypassCommandHooks(vk::Device device) {
 void Initialize() {
 	const char* value = std::getenv("KYTY_FRAMEGEN");
 	g_generate        = value != nullptr ? std::clamp(std::atoi(value), 0, 5) : 0;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (const char* dyn = std::getenv("KYTY_DLSSG_DYNAMIC"); dyn != nullptr && *dyn == '1') {
+		if (value == nullptr) g_generate = 3; // KYTY_FRAMEGEN is the maximum (default 3: x4)
+	}
+	if (const char* dyn = std::getenv("KYTY_DLSSG_DYNAMIC"); dyn != nullptr && *dyn == '1' && g_generate > 0) {
+		g_dlssg_dynamic = true;
+		if (const char* t = std::getenv("KYTY_DLSSG_TARGET_FPS"); t != nullptr && std::atof(t) > 0) {
+			g_dlssg_target_fps = static_cast<float>(std::atof(t));
+		} else {
+			DEVMODEA dm {};
+			dm.dmSize = sizeof(dm);
+			if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm) != 0 && dm.dmDisplayFrequency > 30) {
+				const double hz    = dm.dmDisplayFrequency;
+				g_dlssg_target_fps = static_cast<float>(std::floor(hz - hz * hz / 3600.0));
+			}
+		}
+		if (g_dlssg_target_fps <= 0.0f) g_dlssg_target_fps = 224.0f;
+		// First guess: the game's usual 60 real fps.
+		g_dyn_gen = std::clamp(static_cast<int>(std::floor(g_dlssg_target_fps / 60.0)) - 1, 1, g_generate);
+	}
+#endif
 	{
 		const char* upscale = std::getenv("KYTY_UPSCALE");
 		g_dlss_sr           = upscale != nullptr && std::string(upscale) == "dlss";
@@ -884,6 +920,11 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 			const char* v = std::getenv("KYTY_DLSSG_REFLEX_LIMIT");
 			return v != nullptr && *v == '1';
 		}();
+		if (cap != 0 && g_dlssg_dynamic) {
+			std::printf("Frame generation: dynamic multiplier: no Reflex frame limit (KYTY_VRR_CAP_FPS %u ignored; target %.0f)\n",
+			            cap, static_cast<double>(g_dlssg_target_fps));
+			cap = 0;
+		}
 		if (cap != 0 && g_generate > 0 && flip_fps > 0 && !force_reflex &&
 		    static_cast<double>(flip_fps) * (g_generate + 1) <= cap + 0.5 &&
 		    static_cast<double>(cap) / (g_generate + 1) <= flip_fps * 1.03) { // (only where both bind: x4; others as they were)
@@ -1158,8 +1199,31 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		const double window = std::chrono::duration<double>(now - g_stat_start).count();
 		if (window >= 1.0) {
 			const double n = g_stat_real != 0 ? static_cast<double>(g_stat_real) : 1.0;
-			std::printf("[dlssg] real %.1f fps, shown %.1f fps; generation on %u of %u frames; present call %.2f ms (max %.1f); "
+			if (g_dlssg_dynamic && g_mode_set == 1) {
+				const double real = g_stat_real / window;
+				g_dyn_real_fps    = g_dyn_real_fps <= 0.0 ? real : 0.5 * g_dyn_real_fps + 0.5 * real;
+				int limit         = g_generate;
+				const int cand    = std::clamp(
+				    static_cast<int>(std::floor(static_cast<double>(g_dlssg_target_fps) / std::max(g_dyn_real_fps, 1.0))) - 1, 1,
+				    std::max(limit, 1));
+				if (cand == g_dyn_gen) {
+					g_dyn_pending_n = 0;
+				} else if (cand == g_dyn_pending) {
+					if (++g_dyn_pending_n >= 2) {
+						g_dyn_gen       = cand;
+						g_dyn_pending_n = 0;
+						g_options_set   = false; // send numFramesToGenerate again
+					}
+				} else {
+					g_dyn_pending   = cand;
+					g_dyn_pending_n = 1;
+				}
+				std::printf("[dlssg] dynamic x%d; real %.1f fps (smoothed %.1f), shown %.1f, target %.0f\n", g_dyn_gen + 1, real,
+				            g_dyn_real_fps, real * (g_dyn_gen + 1), static_cast<double>(g_dlssg_target_fps));
+			}
+			std::printf("[dlssg] %s x%u; real %.1f fps, shown %.1f fps; generation on %u of %u frames; present call %.2f ms (max %.1f); "
 			            "acquire %.2f (max %.1f), record+submit %.2f (max %.1f), gpu wait %.2f (max %.1f), before %.2f (max %.1f), flip present %.2f (max %.1f)\n",
+			            g_dlssg_dynamic ? "dynamic" : "fixed", PresentedFrames(),
 			            g_stat_real / window, g_stat_real / window * static_cast<double>(PresentedFrames()), g_stat_on,
 			            g_stat_real, g_stat_present_ms / n, g_stat_present_max, g_stat_acquire_ms / n, g_stat_acquire_max,
 			            g_stat_submit_ms / n, g_stat_submit_max, g_stat_gpuwait_ms / n, g_stat_gpuwait_max, g_stat_before_ms / n,
@@ -1185,12 +1249,24 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		sl::DLSSGOptions options {};
 		options.mode                = mode_on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
 		options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
+		{
+			static bool once = false;
+			if (!once) {
+				once = true;
+				if (g_dlssg_dynamic)
+					std::printf("[dlssg] mode: app-side dynamic multiplier (eOn; eDynamic is D3D12 only), up to %d generated, "
+					            "target %.0f fps, starting x%d\n", g_generate, static_cast<double>(g_dlssg_target_fps), g_dyn_gen + 1);
+				else
+					std::printf("[dlssg] mode: fixed x%d (eOn)\n", g_generate + 1);
+				std::fflush(stdout);
+			}
+		}
 		if (g_mode_set != (mode_on ? 1 : 0)) {
 			std::printf("DLSS-G: %s\n", mode_on ? "on (TAA pass)" : "off (no TAA pass: menu, loading or movie)");
 			std::fflush(stdout);
 		}
 		g_mode_set = mode_on ? 1 : 0;
-		options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
+		options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
 		// KYTY_DLSSG_PARALLEL=1: DLSS-G's work blocks none of the emulator's queues (a comparison: by default it
 		// blocks the presenting queue while it works).
 		static const bool parallel = [] {
@@ -1364,7 +1440,7 @@ void SwapchainChanging() {
 	sl::DLSSGOptions options {};
 	options.mode                = sl::DLSSGMode::eOff;
 	options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
-	options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
+	options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
 	if (const auto result = g_api.dlssg_set_options(sl::ViewportHandle {0}, options); result != sl::Result::eOk)
 		LOGF("frame generation: slDLSSGSetOptions (off) failed (%d)\n", static_cast<int>(result));
 	g_mode_set    = 0;
@@ -1830,7 +1906,52 @@ struct SharpenPass {
 	VulkanImage             image;
 	vk::ImageView           view   = nullptr;
 	bool                    failed = false;
+	// The PS5 Pro path when the output's format has no storage support: sharpen.comp into this rgba16f image, then
+	// blitted back into the output.
+	VulkanImage             out16;
+	vk::ImageView           out16_view = nullptr;
 } g_sharp;
+
+bool StorageFormat(GraphicContext& graphics, vk::Format format) {
+	return static_cast<bool>(graphics.physical_device.getFormatProperties(format).optimalTilingFeatures &
+	                         vk::FormatFeatureFlagBits::eStorageImage);
+}
+
+bool EnsureSharpenOut16(GraphicContext& graphics, vk::Extent3D extent) {
+	const auto device = graphics.device;
+	if (g_sharp.out16.image != nullptr && g_sharp.out16.extent.width == extent.width && g_sharp.out16.extent.height == extent.height)
+		return true;
+	if (g_sharp.out16_view != nullptr) {
+		device.waitIdle();
+		device.destroyImageView(g_sharp.out16_view, nullptr);
+		g_sharp.out16_view = nullptr;
+	}
+	if (g_sharp.out16.image != nullptr) graphics.DeleteImage(g_sharp.out16);
+	g_sharp.out16.image = nullptr;
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = vk::Format::eR16G16B16A16Sfloat;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc;
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.samples       = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, g_sharp.out16)) {
+		g_sharp.out16.image = nullptr;
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = g_sharp.out16.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = vk::Format::eR16G16B16A16Sfloat;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (device.createImageView(&view_info, nullptr, &g_sharp.out16_view) != vk::Result::eSuccess) return false;
+	g_sharp.out16.state = {};
+	return true;
+}
 
 bool EnsureSharpen(GraphicContext& graphics, const VulkanImage& like) {
 	const auto device = graphics.device;
@@ -1899,7 +2020,9 @@ bool EnsureSharpen(GraphicContext& graphics, const VulkanImage& like) {
 	create.format        = like.format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
-	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+	create.usage         = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
+	// (Storage only where the format has it: B10G11R11 may not.)
+	if (StorageFormat(graphics, like.format)) create.usage |= vk::ImageUsageFlagBits::eStorage;
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
 	if (!graphics.CreateImage(create, g_sharp.image)) {
@@ -2873,8 +2996,7 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 }
 } // namespace
 
-bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
-	if (g_sr_kind == 2 || g_sr_kind == 3) return UpscaleOurs(command, inputs);
+static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	if (!g_upscale_ready) return false;
 	// Its own viewport: DLSS-G's (0) takes its constants and tags at the present.
@@ -2882,13 +3004,14 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 	static vk::Extent2D options_render {}, options_output {};
 	if (options_render != inputs.color.extent || options_output != inputs.output.extent) {
 		// The mode by the input's share of the output's height (DLSS takes any input size; the mode picks its model and
-		// limits): PS5 Pro's 1512 of 2160 and 1440 are quality, 1080 performance, the output's own DLAA.
+		// limits): PS5 Pro's 1512 of 2160 and 1440 are quality, 1080 performance, the output's own DLAA; below half
+		// the output (performance's least, 1080 of 2160) ultra performance, down to its third (720).
 		const double share = static_cast<double>(inputs.color.extent.height) / inputs.output.extent.height;
 		sl::DLSSOptions options {};
 		options.mode = share >= 0.95   ? sl::DLSSMode::eDLAA
 		               : share >= 0.62 ? sl::DLSSMode::eMaxQuality
 		               : share >= 0.55 ? sl::DLSSMode::eBalanced
-		               : share >= 0.45 ? sl::DLSSMode::eMaxPerformance
+		               : share >= 0.5  ? sl::DLSSMode::eMaxPerformance
 		                               : sl::DLSSMode::eUltraPerformance;
 		options.outputWidth     = inputs.output.extent.width;
 		options.outputHeight    = inputs.output.extent.height;
@@ -3025,6 +3148,132 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 	(void)inputs;
 	return false;
 #endif
+}
+
+namespace {
+// KYTY_UPSCALE_SHARPNESS on the PS5 Pro path after DLSS or XeSS (FSR's RCAS takes it itself): the output (general)
+// copied into g_sharp, then sharpen.comp from it back into the output, which the game's composite reads.
+void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float amount) {
+	const auto& out = inputs.output;
+	// Any float color format (sharpen.comp writes without a format qualifier): in place where the output takes storage
+	// writes, else into an rgba16f image blitted back (needs transfer dst).
+	const bool float_format = out.format == vk::Format::eR16G16B16A16Sfloat || out.format == vk::Format::eB10G11R11UfloatPack32 ||
+	                          out.format == vk::Format::eR32G32B32A32Sfloat || out.format == vk::Format::eA2B10G10R10UnormPack32 ||
+	                          out.format == vk::Format::eR8G8B8A8Unorm || out.format == vk::Format::eB8G8R8A8Unorm;
+	const bool direct = g_graphics_ctx != nullptr && (out.usage & vk::ImageUsageFlagBits::eStorage) &&
+	                    StorageFormat(*g_graphics_ctx, out.format);
+	const bool via16 = !direct && (out.usage & vk::ImageUsageFlagBits::eTransferDst);
+	if (g_graphics_ctx == nullptr || out.view == nullptr || !float_format || !(out.usage & vk::ImageUsageFlagBits::eTransferSrc) ||
+	    (!direct && !via16)) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("Super resolution sharpening: skipped (output format %d usage 0x%x)\n", static_cast<int>(out.format),
+			            static_cast<uint32_t>(static_cast<VkImageUsageFlags>(out.usage)));
+			std::fflush(stdout);
+		}
+		return;
+	}
+	VulkanImage like;
+	like.format = out.format;
+	like.extent = vk::Extent3D {out.extent.width, out.extent.height, 1};
+	if (!EnsureSharpen(*g_graphics_ctx, like)) return;
+	if (via16 && !EnsureSharpenOut16(*g_graphics_ctx, like.extent)) return;
+	{
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("Super resolution sharpening: output format %d %ux%u, %s\n", static_cast<int>(out.format), out.extent.width,
+			            out.extent.height, direct ? "in place" : "via rgba16f + blit");
+			std::fflush(stdout);
+		}
+	}
+	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
+	                        vk::AccessFlags2 dst) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = src_stage;
+		barrier.srcAccessMask = src;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	// The upscaler's writes before the copy.
+	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite, vk::PipelineStageFlagBits2::eCopy,
+	       vk::AccessFlagBits2::eTransferRead);
+	Transition(command, g_sharp.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eCopy);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, out.level, out.layer, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = vk::Extent3D {out.extent.width, out.extent.height, 1};
+	command.copyImage(out.image, vk::ImageLayout::eGeneral, g_sharp.image.image, vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+	Transition(command, g_sharp.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderSampledRead, vk::PipelineStageFlagBits2::eComputeShader);
+	// The copy's reads of the output before the pass writes it.
+	global(vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eComputeShader,
+	       vk::AccessFlagBits2::eShaderStorageWrite);
+	vk::DescriptorImageInfo infos[2] {};
+	infos[0] = {g_sharp.sampler, g_sharp.view, vk::ImageLayout::eShaderReadOnlyOptimal};
+	if (via16)
+		Transition(command, g_sharp.out16, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	infos[1] = {nullptr, via16 ? g_sharp.out16_view : out.view, vk::ImageLayout::eGeneral};
+	vk::WriteDescriptorSet writes[2] {};
+	for (uint32_t i = 0; i < 2; ++i) {
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = i == 0 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+		writes[i].pImageInfo      = &infos[i];
+	}
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_sharp.pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_sharp.layout, 0, 2, writes);
+	command.pushConstants(g_sharp.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(amount), &amount);
+	command.dispatch((out.extent.width + 7) / 8, (out.extent.height + 7) / 8, 1);
+	if (via16) {
+		Transition(command, g_sharp.out16, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+		           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eBlit);
+		global(vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eCopy,
+		       vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eBlit,
+		       vk::AccessFlagBits2::eTransferWrite);
+		vk::ImageBlit blit {};
+		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, out.level, out.layer, 1};
+		blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(out.extent.width), static_cast<int32_t>(out.extent.height), 1};
+		blit.dstOffsets[1]  = blit.srcOffsets[1];
+		command.blitImage(g_sharp.out16.image, vk::ImageLayout::eTransferSrcOptimal, out.image, vk::ImageLayout::eGeneral, 1, &blit,
+		                  vk::Filter::eNearest);
+		global(vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands,
+		       vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+		return;
+	}
+	// The pass's writes before whatever reads or writes the output next (the exposure pass, the composite).
+	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+	       vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+}
+} // namespace
+
+bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
+	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
+	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
+	const bool  fsr  = g_sr_kind == 3;
+	// (FSR: its RCAS, KYTY_UPSCALE_SHARPNESS defaulting to 0.3 in Fsr3::Upscale; DLSS and XeSS: 0 unless set.)
+	const float amount = fsr ? [] {
+		const char* value = std::getenv("KYTY_UPSCALE_SHARPNESS");
+		return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f) : 0.3f;
+	}()
+	                         : SharpenAmount();
+	static bool said = false;
+	if (!said) {
+		said = true;
+		std::printf("Super resolution sharpening: %g (%s)\n", amount,
+		            fsr ? "FSR RCAS" : g_sr_kind == 2 ? "XeSS + sharpen.comp" : "DLSS + sharpen.comp");
+		std::fflush(stdout);
+	}
+	if (done && !fsr && amount > 0.0f) SharpenOutput(command, inputs, amount);
+	return done;
 }
 
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {

@@ -26,7 +26,8 @@ $fgModes = @(
 	@('   Frame generation DLSS x4',                    'dlss-x4.json'),
 	@('   200 FPS Nvidia Smooth x5',                    'dlss-x5.json'),
 	@('   216 FPS Nvidia Smooth x6',                    'dlss-x6.json'),
-	@('   120 FPS Nvidia Smooth Souls',                 'dlss-x3-120.json')
+	@('   120 FPS Nvidia Smooth Souls',                 'dlss-x3-120.json'),
+	@('   DLSS MFG dinamico',                           'dlss-dynamic.json')
 )
 # Reescalado: texto -> altura del 3D (run-windows.ps1 -RenderHeight), reescalador (-Upscale) y altura de salida
 # (-UpscaleHeight; 0 = 1440). DLSS (NVIDIA RTX): DLAA 1x, Ultra calidad 1.3x, Calidad 1.5x, Equilibrado 1.72x,
@@ -34,23 +35,28 @@ $fgModes = @(
 # Ultra calidad 1.5x, Calidad 1.7x, Equilibrado 2x, Rendimiento 2.3x (940 -> 2160). FSR 3.1 (graficas de bajo rendimiento).
 # "juego": el 3D a menos resolucion y lo sube el propio juego.
 $resModes = @(
+	# Upscalers (DLSS, XeSS, FSR): the second column is the ratio of the monitor's height (detected by the emulator)
+	# to the render height: 1440 monitor -> DLAA 1440, Calidad 960, Equilibrado 836, Rendimiento 720, U.rendim. 480
+	# (the game's 4K output needs 720 at least: 720). Others: the render height itself.
 	@('1440p nativo',   1440, '',     0),
-	@('DLSS DLAA',      1440, 'dlss', 0),
-	@('DLSS U.calidad', 1108, 'dlss', 0),
-	@('DLSS Calidad',   960,  'dlss', 0),
-	@('DLSS Equilib.',  836,  'dlss', 0),
-	@('DLSS Rendim.',   720,  'dlss', 0),
-	@('DLSS U.rendim.', 720,  'dlss', 2160),
-	@('XeSS AA',        1440, 'xess', 0),
-	@('XeSS U.cal.+',   1108, 'xess', 0),
-	@('XeSS U.calidad', 960,  'xess', 0),
-	@('XeSS Calidad',   848,  'xess', 0),
-	@('XeSS Equilib.',  720,  'xess', 0),
-	@('XeSS Rendim.',   940,  'xess', 2160),
-	@('FSR U.calidad',  1108, 'fsr',  0),
-	@('FSR Calidad',    960,  'fsr',  0),
-	@('FSR Equilib.',   848,  'fsr',  0),
-	@('FSR Rendim.',    720,  'fsr',  0),
+	@('DLSS DLAA',      1.0,  'dlss', 0),
+	@('DLSS U.calidad', 1.3,  'dlss', 0),
+	@('DLSS Calidad',   1.5,  'dlss', 0),
+	@('DLSS Equilib.',  1.72, 'dlss', 0),
+	@('DLSS Rendim.',   2.0,  'dlss', 0),
+	@('DLSS U.rendim.', 3.0,  'dlss', 0),
+	@('XeSS AA',        1.0,  'xess', 0),
+	@('XeSS U.cal.+',   1.3,  'xess', 0),
+	@('XeSS U.calidad', 1.5,  'xess', 0),
+	@('XeSS Calidad',   1.7,  'xess', 0),
+	@('XeSS Equilib.',  2.0,  'xess', 0),
+	@('XeSS Rendim.',   2.3,  'xess', 0),
+	@('XeSS U.rendim.', 3.0,  'xess', 0),
+	@('FSR U.calidad',  1.3,  'fsr',  0),
+	@('FSR Calidad',    1.5,  'fsr',  0),
+	@('FSR Equilib.',   1.72, 'fsr',  0),
+	@('FSR Rendim.',    2.0,  'fsr',  0),
+	@('FSR U.rendim.',  3.0,  'fsr',  0),
 	@('1080p juego',    1080, '',     0),
 	@('900p juego',     900,  '',     0),
 	@('720p juego',     720,  '',     0)
@@ -166,10 +172,11 @@ function Start-Game {
 		[System.Windows.Forms.MessageBox]::Show('El reescalado DLSS va con "Sin frame generation" o con DLSS frame generation. Con la generacion de AMD usa FSR o XeSS para reescalar.', 'Launcher', 'OK', 'Warning') | Out-Null
 		return
 	}
-	# DLSS, XeSS and FSR go through the game's PS5 Pro path, whose output is 4K (2160): each mode's height scaled from
-	# the 1440 output it was listed for (Calidad 960 -> 1440, Rendimiento 720 -> 1080, DLAA 1440 -> 2160).
-	$height = if ($res[2] -in 'dlss', 'xess', 'fsr') { [int][math]::Round($res[1] * 1.5) } else { $res[1] }
-	if ($height -ne 1440 -or $res[2] -in 'dlss', 'xess', 'fsr') { $psargs += @('-RenderHeight', "$height") }
+	# DLSS, XeSS and FSR go through the game's PS5 Pro path (its output 4K): the ratio to the monitor's height, the
+	# emulator detecting it (KYTY_UPSCALE_RATIO); the others their render height.
+	if ($res[2] -in 'dlss', 'xess', 'fsr') {
+		$psargs += @('-UpscaleRatio', ([double]$res[1]).ToString([System.Globalization.CultureInfo]::InvariantCulture))
+	} elseif ($res[1] -ne 1440) { $psargs += @('-RenderHeight', "$($res[1])") }
 	# "sin TAA": el TAA del juego no se ejecuta; DLSS (DLAA) en su lugar, o (taa-up-*) el reescalador elegido toma la
 	# imagen sin filtrar y hace el antialiasing el solo (encima del TAA salia como una acuarela, con estelas).
 	if ($res[2] -like 'taa-up-*') { $psargs += @('-Upscale', $res[2].Substring(7), '-TaaReplace', 'upscaler') }
