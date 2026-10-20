@@ -35,11 +35,11 @@ constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
     {0x04u, Opcode::V_SUB_F32, Vop2SdwaProfile::Float32},
     {0x05u, Opcode::V_SUBREV_F32},
     {0x08u, Opcode::V_MUL_F32, Vop2SdwaProfile::Float32},
-    {0x09u, Opcode::V_MUL_I32_I24, Vop2SdwaProfile::IntegerFullDestination},
-    {0x0bu, Opcode::V_MUL_U32_U24, Vop2SdwaProfile::IntegerFullDestination},
+    {0x09u, Opcode::V_MUL_I32_I24, Vop2SdwaProfile::IntegerPartialDestination},
+    {0x0bu, Opcode::V_MUL_U32_U24, Vop2SdwaProfile::IntegerPartialDestination},
     {0x0fu, Opcode::V_MIN_F32},
     {0x10u, Opcode::V_MAX_F32},
-    {0x11u, Opcode::V_MIN_I32},
+    {0x11u, Opcode::V_MIN_I32, Vop2SdwaProfile::IntegerFullDestination},
     {0x12u, Opcode::V_MAX_I32},
     {0x13u, Opcode::V_MIN_U32, Vop2SdwaProfile::IntegerPartialDestination},
     {0x14u, Opcode::V_MAX_U32, Vop2SdwaProfile::IntegerFullDestination},
@@ -542,7 +542,7 @@ struct Vop1SdwaRule {
 
 constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
     {Opcode::V_MOV_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
-     SdwaSelWords() | SdwaSelFull(), false},
+     SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::V_CVT_F32_U32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_I32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_UBYTE0, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
@@ -922,7 +922,8 @@ constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
     {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
-    {SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
+    // Bitwise: WriteRawU32 inserts a byte or word destination like any other partial write.
+    {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
 };
 static_assert(sizeof(VOP2_SDWA_RULES) / sizeof(VOP2_SDWA_RULES[0]) ==
               static_cast<size_t>(Vop2SdwaProfile::Count));

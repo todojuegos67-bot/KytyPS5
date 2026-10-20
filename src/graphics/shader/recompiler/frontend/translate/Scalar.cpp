@@ -133,6 +133,36 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 
 		case O::S_ABS_I32:
 			return SimpleInteger(inst, IR::ValueOpcode::IAbs32, IR::Type::U32, false, false, true);
+		case O::S_SEXT_I32_I8:
+		case O::S_SEXT_I32_I16: {
+			// Sign extension leaves SCC unchanged.
+			const auto bits = inst.opcode == O::S_SEXT_I32_I8 ? 8u : 16u;
+			WriteOperand(inst.dst, IR::U32(ir.Emit(IR::ValueOpcode::BitFieldSExtract,
+			                                       {ReadU32(inst.src0), IR::Value(0u), IR::Value(bits)})));
+			return true;
+		}
+		case O::S_BCNT0_I32_B32:
+		case O::S_FF0_I32_B32: {
+			const auto value  = ir.BitwiseNot(ReadU32(inst.src0));
+			const bool count  = inst.opcode == O::S_BCNT0_I32_B32;
+			const auto result = IR::U32(ir.Emit(count ? IR::ValueOpcode::BitCount32
+			                                          : IR::ValueOpcode::FindILsb32, {value}));
+			WriteOperand(inst.dst, result);
+			if (count) {
+				ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
+			}
+			return true;
+		}
+		case O::S_BCNT0_I32_B64: {
+			auto value = ReadU32Pair(inst.src0);
+			const auto low    = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {ir.BitwiseNot(value[0])}));
+			const auto high   = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {ir.BitwiseNot(value[1])}));
+			const auto result = ir.IAdd(low, high);
+			WriteOperand(inst.dst, result);
+			ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
+			return true;
+		}
+		case O::S_FF0_I32_B64: return S_FF1_I32_B64(inst, true);
 		case O::S_MUL_I32:
 		case O::S_MULK_I32:
 			return SimpleInteger(inst, IR::ValueOpcode::IMul32, IR::Type::U32, false, false, false);
@@ -188,7 +218,7 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return ComposedIntegerBinary(inst, IR::ValueOpcode::BitwiseOr32, false, true, true);
 		case O::S_XNOR_B32:
 			return ComposedIntegerBinary(inst, IR::ValueOpcode::BitwiseXor32, false, true, true);
-		case O::S_FF1_I32_B64: return S_FF1_I32_B64(inst);
+		case O::S_FF1_I32_B64: return S_FF1_I32_B64(inst, false);
 		case O::S_FLBIT_I32_B32: return V_FFBH_32(inst, false);
 		case O::S_FLBIT_I32_B64: return S_FLBIT_I32_B64(inst);
 

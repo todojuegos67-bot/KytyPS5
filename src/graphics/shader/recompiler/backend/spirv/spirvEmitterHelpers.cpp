@@ -106,6 +106,14 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
 	if (control == 0x141u) {
 		return EmitDppMirrorTargetLane(state, subid, true);
 	}
+	// row_share:N reads lane N of the caller's row of 16 (official 053f5fd3; was an identity move).
+	if (control >= 0x150u && control <= 0x15fu) {
+		const auto row    = state.builder.AllocateId();
+		const auto target = state.builder.AllocateId();
+		state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), row, subid, ConstantU32(state, 0xfffffff0u)});
+		state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, row, ConstantU32(state, control & 0xfu)});
+		return {target, ConstantBool(state, true)};
+	}
 	if (control >= 0x160u && control <= 0x16fu) {
 		const auto target = state.builder.AllocateId();
 		state.builder.AddFunction(

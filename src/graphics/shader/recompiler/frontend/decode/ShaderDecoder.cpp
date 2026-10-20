@@ -483,6 +483,12 @@ std::string InstructionToString(const Instruction& inst) {
 			                                               OperandToString(inst.dst).c_str(),
 			                                               OperandToString(inst.src0).c_str()));
 		case Opcode::S_ABS_I32:
+		case Opcode::S_SEXT_I32_I8:
+		case Opcode::S_SEXT_I32_I16:
+		case Opcode::S_BCNT0_I32_B32:
+		case Opcode::S_BCNT0_I32_B64:
+		case Opcode::S_FF0_I32_B32:
+		case Opcode::S_FF0_I32_B64:
 		case Opcode::S_BREV_B32:
 		case Opcode::S_BCNT1_I32_B32:
 		case Opcode::S_FLBIT_I32_B32:
@@ -636,6 +642,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::FLAT_LOAD_SBYTE:
 		case Opcode::FLAT_LOAD_USHORT:
 		case Opcode::FLAT_LOAD_SSHORT:
+		case Opcode::FLAT_LOAD_SHORT_D16:
 		case Opcode::FLAT_LOAD_DWORD:
 		case Opcode::FLAT_LOAD_DWORDX2:
 		case Opcode::FLAT_LOAD_DWORDX3:

@@ -215,8 +215,13 @@ bool Translator::V_XOR3_B32(const Decoder::Instruction& inst) {
 	return true;
 }
 
-bool Translator::S_FF1_I32_B64(const Decoder::Instruction& inst) {
-	const auto source        = ExtractU64(ReadU64(inst.src0));
+bool Translator::S_FF1_I32_B64(const Decoder::Instruction& inst, bool find_zero) {
+	auto source = ExtractU64(ReadU64(inst.src0));
+	if (find_zero) {
+		// S_FF0: first zero bit = first one bit of the complement.
+		source[0] = ir.BitwiseNot(source[0]);
+		source[1] = ir.BitwiseNot(source[1]);
+	}
 	const auto low_lsb       = IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {source[0]}));
 	const auto high_lsb      = IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {source[1]}));
 	const auto high_position = ir.IAdd(high_lsb, IR::U32(IR::Value(32u)));
