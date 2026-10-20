@@ -520,14 +520,13 @@ static int SceneFreeFloor() {
 	return floor;
 }
 
-// Demon's Souls (on by default; KYTY_UNLOCK_30=0: off, KYTY_UNLOCK_30=1: any game): the game's sceVideoOutSetFlipRate
+// Off by default for every game (tested: did not work); KYTY_UNLOCK_30=1 enables it: the game's sceVideoOutSetFlipRate
 // ignored (VideoOutSetFlipRate stores 0), every frame at least vblank/60 vblanks apart instead (60 fps at most, as
 // SceneFreeFloor): Cinematic mode's 30 fps cap lifted to 60, as the performance mode.
 static bool Unlock30() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_UNLOCK_30");
-		if (value != nullptr && *value != 0) return std::strcmp(value, "0") != 0;
-		return Libs::Graphics::DemonsSouls::IsSupportedGame();
+		return value != nullptr && std::strcmp(value, "1") == 0;
 	}();
 	return on;
 }
@@ -1672,7 +1671,7 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 		return VIDEO_OUT_ERROR_INVALID_VALUE;
 	}
 
-	// Unlock30 (Demon's Souls by default): the game's 30 fps flip rate (Demon's Souls' Cinematic mode, display mode 4) not kept: the flips
+	// Unlock30 (off by default, KYTY_UNLOCK_30=1): the game's 30 fps flip rate (Demon's Souls' Cinematic mode, display mode 4) not kept: the flips
 	// at most 60 fps (Unlock30Floor), whatever rate the game asks for. Logged either way (what the game uses).
 	std::printf("VideoOut: sceVideoOutSetFlipRate(%d)%s\n", rate, Unlock30() && rate != 0 ? ": unlocked (KYTY_UNLOCK_30), 60 fps at most instead" : "");
 	std::fflush(stdout);
