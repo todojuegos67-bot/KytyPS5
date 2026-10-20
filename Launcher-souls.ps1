@@ -26,7 +26,8 @@ $fgModes = @(
 	@('   Frame generation DLSS x4',                    'dlss-x4.json'),
 	@('   200 FPS Nvidia Smooth x5',                    'dlss-x5.json'),
 	@('   216 FPS Nvidia Smooth x6',                    'dlss-x6.json'),
-	@('   120 FPS Nvidia Smooth Souls',                 'dlss-x3-120.json')
+	@('   120 FPS Nvidia Smooth Souls',                 'dlss-x3-120.json'),
+	@('   DLSS MFG dinamico',                           'dlss-dynamic.json')
 )
 # Reescalado: texto -> altura del 3D (run-windows.ps1 -RenderHeight), reescalador (-Upscale) y altura de salida
 # (-UpscaleHeight; 0 = 1440). DLSS (NVIDIA RTX): DLAA 1x, Ultra calidad 1.3x, Calidad 1.5x, Equilibrado 1.72x,
