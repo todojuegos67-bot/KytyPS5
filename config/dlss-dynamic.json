@@ -45,7 +45,6 @@
     "KYTY_TABLE_XPR": "2",
     "KYTY_TABLE_DISPATCH": "1",
     "KYTY_TRIM_RAM_SECONDS": "0",
-    "KYTY_VRR_CAP_FPS": "auto",
     "KYTY_TRIM_RAM_MB": "8192",
     "KYTY_ASYNC_DRAW_PIPELINES": "1",
     "KYTY_ASYNC_DRAW_WAIT_MS": "3",
@@ -53,7 +52,7 @@
     "KYTY_FPS_LOG": "1",
     "KYTY_SYNC_STATS": "0",
     "KYTY_ASYNC_DRAW_SYNC_SMALL": "0",
-    "KYTY_FRAMEGEN": "5",
+    "KYTY_FRAMEGEN": "3",
     "KYTY_FLIP_DECOUPLE": "1",
     "KYTY_DLSSG_DYNAMIC": "1"
   },

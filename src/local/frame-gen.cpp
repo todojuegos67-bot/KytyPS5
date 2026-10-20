@@ -70,11 +70,21 @@ struct Sources {
 };
 
 int      g_generate    = 0;     // frames to generate per rendered frame (0 = off)
-// KYTY_DLSSG_DYNAMIC=1: DLSS-G Dynamic Multi Frame Generation (sl::DLSSGMode::eDynamic, Streamline 2.14+): DLSS-G picks
-// the multiplier each frame (up to numFramesToGenerate) to reach dynamicTargetFrameRate. KYTY_DLSSG_TARGET_FPS=<fps>;
-// default refresh - refresh^2 / 3600 (224 on 240 Hz). Falls back to eOn when the GPU / driver reports no support.
+// KYTY_DLSSG_DYNAMIC=1: an app-side dynamic multiplier. Streamline's eDynamic is D3D12 only (not on Vulkan, and it
+// ignores numFramesToGenerate), so DLSS-G stays eOn and the emulator picks numFramesToGenerate itself, once a second:
+// gen = clamp(floor(target / real) - 1, 1, KYTY_FRAMEGEN (default 3), numFramesToGenerateMax), changed only when the new
+// value held for two windows in a row. Target: KYTY_DLSSG_TARGET_FPS, default refresh - refresh^2 / 3600 (224 on
+// 240 Hz). No Reflex frame limit from the multiplier: the real rate stays the game's own pacing.
 bool     g_dlssg_dynamic   = false;
 float    g_dlssg_target_fps = 0.0f;
+int      g_dyn_gen         = 1;   // the current generated frame count in dynamic mode (g_generate is its maximum)
+int      g_dyn_pending     = 0;   // a candidate value and how many windows in a row it came out
+int      g_dyn_pending_n   = 0;
+double   g_dyn_real_fps    = 0.0; // smoothed real fps
+
+int CurrentGenerate() {
+	return g_dlssg_dynamic ? std::min(g_dyn_gen, g_generate) : g_generate;
+}
 bool g_dlss_sr = false; // KYTY_UPSCALE=dlss: DLSS super resolution (Streamline's DLSS plugin)
 bool g_taa_dlss = false; // KYTY_TAA_REPLACE=dlss: DLSS (DLAA) in place of the game's TAA
 // KYTY_TAA_REPLACE=upscaler (with KYTY_UPSCALE dlss|fsr|xess): the game's TAA skipped, its jittered image copied to
@@ -637,9 +647,11 @@ void Initialize() {
 	const char* value = std::getenv("KYTY_FRAMEGEN");
 	g_generate        = value != nullptr ? std::clamp(std::atoi(value), 0, 5) : 0;
 #ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (const char* dyn = std::getenv("KYTY_DLSSG_DYNAMIC"); dyn != nullptr && *dyn == '1') {
+		if (value == nullptr) g_generate = 3; // KYTY_FRAMEGEN is the maximum (default 3: x4)
+	}
 	if (const char* dyn = std::getenv("KYTY_DLSSG_DYNAMIC"); dyn != nullptr && *dyn == '1' && g_generate > 0) {
 		g_dlssg_dynamic = true;
-		g_generate      = 5; // upper bound; clamped to DLSSGState::numFramesToGenerateMax at the first state query
 		if (const char* t = std::getenv("KYTY_DLSSG_TARGET_FPS"); t != nullptr && std::atof(t) > 0) {
 			g_dlssg_target_fps = static_cast<float>(std::atof(t));
 		} else {
@@ -650,6 +662,9 @@ void Initialize() {
 				g_dlssg_target_fps = static_cast<float>(std::floor(hz - hz * hz / 3600.0));
 			}
 		}
+		if (g_dlssg_target_fps <= 0.0f) g_dlssg_target_fps = 224.0f;
+		// First guess: the game's usual 60 real fps.
+		g_dyn_gen = std::clamp(static_cast<int>(std::floor(g_dlssg_target_fps / 60.0)) - 1, 1, g_generate);
 	}
 #endif
 	{
@@ -905,6 +920,11 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 			const char* v = std::getenv("KYTY_DLSSG_REFLEX_LIMIT");
 			return v != nullptr && *v == '1';
 		}();
+		if (cap != 0 && g_dlssg_dynamic) {
+			std::printf("Frame generation: dynamic multiplier: no Reflex frame limit (KYTY_VRR_CAP_FPS %u ignored; target %.0f)\n",
+			            cap, static_cast<double>(g_dlssg_target_fps));
+			cap = 0;
+		}
 		if (cap != 0 && g_generate > 0 && flip_fps > 0 && !force_reflex &&
 		    static_cast<double>(flip_fps) * (g_generate + 1) <= cap + 0.5 &&
 		    static_cast<double>(cap) / (g_generate + 1) <= flip_fps * 1.03) { // (only where both bind: x4; others as they were)
@@ -1179,6 +1199,28 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		const double window = std::chrono::duration<double>(now - g_stat_start).count();
 		if (window >= 1.0) {
 			const double n = g_stat_real != 0 ? static_cast<double>(g_stat_real) : 1.0;
+			if (g_dlssg_dynamic && g_mode_set == 1) {
+				const double real = g_stat_real / window;
+				g_dyn_real_fps    = g_dyn_real_fps <= 0.0 ? real : 0.5 * g_dyn_real_fps + 0.5 * real;
+				int limit         = g_generate;
+				const int cand    = std::clamp(
+				    static_cast<int>(std::floor(static_cast<double>(g_dlssg_target_fps) / std::max(g_dyn_real_fps, 1.0))) - 1, 1,
+				    std::max(limit, 1));
+				if (cand == g_dyn_gen) {
+					g_dyn_pending_n = 0;
+				} else if (cand == g_dyn_pending) {
+					if (++g_dyn_pending_n >= 2) {
+						g_dyn_gen       = cand;
+						g_dyn_pending_n = 0;
+						g_options_set   = false; // send numFramesToGenerate again
+					}
+				} else {
+					g_dyn_pending   = cand;
+					g_dyn_pending_n = 1;
+				}
+				std::printf("[dlssg] dynamic x%d; real %.1f fps (smoothed %.1f), shown %.1f, target %.0f\n", g_dyn_gen + 1, real,
+				            g_dyn_real_fps, real * (g_dyn_gen + 1), static_cast<double>(g_dlssg_target_fps));
+			}
 			std::printf("[dlssg] %s x%u; real %.1f fps, shown %.1f fps; generation on %u of %u frames; present call %.2f ms (max %.1f); "
 			            "acquire %.2f (max %.1f), record+submit %.2f (max %.1f), gpu wait %.2f (max %.1f), before %.2f (max %.1f), flip present %.2f (max %.1f)\n",
 			            g_dlssg_dynamic ? "dynamic" : "fixed", PresentedFrames(),
@@ -1205,16 +1247,15 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	if (!g_options_set || g_mode_set != (mode_on ? 1 : 0) || g_options_format != format ||
 	    (usable && (g_options_backbuffer != backbuffer || g_options_render != inputs->render_extent))) {
 		sl::DLSSGOptions options {};
-		options.mode                = mode_on ? (g_dlssg_dynamic ? sl::DLSSGMode::eDynamic : sl::DLSSGMode::eOn) : sl::DLSSGMode::eOff;
+		options.mode                = mode_on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
 		options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
-		if (g_dlssg_dynamic) options.dynamicTargetFrameRate = g_dlssg_target_fps;
 		{
 			static bool once = false;
 			if (!once) {
 				once = true;
 				if (g_dlssg_dynamic)
-					std::printf("[dlssg] mode: DYNAMIC MFG (eDynamic), up to %d generated, target %.0f fps\n", g_generate,
-					            static_cast<double>(g_dlssg_target_fps));
+					std::printf("[dlssg] mode: app-side dynamic multiplier (eOn; eDynamic is D3D12 only), up to %d generated, "
+					            "target %.0f fps, starting x%d\n", g_generate, static_cast<double>(g_dlssg_target_fps), g_dyn_gen + 1);
 				else
 					std::printf("[dlssg] mode: fixed x%d (eOn)\n", g_generate + 1);
 				std::fflush(stdout);
@@ -1225,7 +1266,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 			std::fflush(stdout);
 		}
 		g_mode_set = mode_on ? 1 : 0;
-		options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
+		options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
 		// KYTY_DLSSG_PARALLEL=1: DLSS-G's work blocks none of the emulator's queues (a comparison: by default it
 		// blocks the presenting queue while it works).
 		static const bool parallel = [] {
@@ -1380,12 +1421,6 @@ void AfterPresent() {
 		g_generate    = static_cast<int>(state.numFramesToGenerateMax);
 		g_options_set = false;
 	}
-	if (g_dlssg_dynamic && state.bIsDynamicMFGSupported == sl::Boolean::eFalse && state.numFramesToGenerateMax != 0) {
-		std::printf("[dlssg] Dynamic MFG not supported by this GPU/driver: fixed x%d instead\n", g_generate + 1);
-		std::fflush(stdout);
-		g_dlssg_dynamic = false;
-		g_options_set   = false;
-	}
 	if (presents % 600 == 1) {
 		LOGF("frame generation: status=0x%x presented=%u max_generated=%u vram=%" PRIu64 " MiB\n",
 		     static_cast<uint32_t>(state.status), state.numFramesActuallyPresented,
@@ -1405,7 +1440,7 @@ void SwapchainChanging() {
 	sl::DLSSGOptions options {};
 	options.mode                = sl::DLSSGMode::eOff;
 	options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
-	options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
+	options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
 	if (const auto result = g_api.dlssg_set_options(sl::ViewportHandle {0}, options); result != sl::Result::eOk)
 		LOGF("frame generation: slDLSSGSetOptions (off) failed (%d)\n", static_cast<int>(result));
 	g_mode_set    = 0;
