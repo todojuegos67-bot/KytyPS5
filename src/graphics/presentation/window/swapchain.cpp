@@ -495,12 +495,21 @@ struct Presenter::Impl {
 
 	// The shader prefetch's progress line while it runs, and for a few seconds after.
 	std::chrono::steady_clock::time_point prefetch_finished {};
+	std::chrono::steady_clock::time_point status_shown {};
 	void UpdateStatus(std::chrono::steady_clock::time_point now) {
 		const auto progress = renderer.GetPipelineCache().GetPrefetchProgress();
 		hud.status.clear();
 		if (progress.total == 0) {
 			return;
 		}
+		// KYTY_STATUS_HUD_SECONDS=<n> (default 6, 0: always): the progress line goes after n seconds on screen; the
+		// work carries on behind (the launcher's choice: shown a moment, not over the whole game).
+		static const int hide_after = [] {
+			const char* value = std::getenv("KYTY_STATUS_HUD_SECONDS");
+			return value != nullptr && *value != '\0' ? std::max(0, std::atoi(value)) : 6;
+		}();
+		if (status_shown == std::chrono::steady_clock::time_point {}) status_shown = now;
+		if (hide_after > 0 && now - status_shown >= std::chrono::seconds(hide_after)) return;
 		std::array<char, 128> line {};
 		if (progress.done < progress.total || progress.label != nullptr) {
 			std::snprintf(line.data(), line.size(), "%s %zu%%  (%zu / %zu)",
