@@ -21,10 +21,12 @@ constexpr uint8_t Taken[5] {0xb0, 0x01, 0x0f, 0x1f, 0x00};
 
 // SuperResolution::IsEnabled (01.007.000 eboot+0xa53700): display mode 5 and the render target's height (a float at
 // +4 of the render job's size) at least 1080.0 (vucomiss [rip + 1080.0f]; setae al): below it the renderer skips the
-// upscaler for a plain copy. The compare and setae (11 bytes) become mov al, 1 and a 9-byte nop: any height in mode 5.
+// upscaler for a plain copy. The compare (8 bytes) becomes cmp dword [rax+4], 720.0f (a positive float compares as an
+// integer), setae kept: 720 and above in mode 5. (Any height: the menus' 480x270 background went through it too, the
+// upscaler remade for every switch between it and the 3D view, a second a frame.)
 constexpr std::string_view EnabledCheck =
     "83 78 3c 05 75 15 48 8b 46 50 c5 fa 10 40 04 c5 f8 2e 05 ?? ?? ?? ?? 0f 93 c0 c3";
-constexpr uint8_t AnyHeightBytes[11] {0xb0, 0x01, 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00};
+constexpr uint8_t AnyHeightBytes[11] {0x81, 0x78, 0x04, 0x00, 0x00, 0x34, 0x44, 0x0f, 0x93, 0xc0, 0x90};
 
 bool g_active     = false;
 bool g_any_height = false;
