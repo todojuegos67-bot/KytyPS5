@@ -1,0 +1,14 @@
+Demon's Souls Turbo (KytyPS5, 20-10-2026)
+
+1. Abre Launcher-souls.cmd.
+2. Settings: la carpeta del juego volcado (PPSA01341, version 01.007.000).
+3. Precompilar shaders (la primera vez; "suave" si el PC se calienta o se reinicia).
+4. Jugar.
+
+Reescalado (modo PS5 Pro del juego): DLSS (NVIDIA RTX), XeSS y FSR 3.1 (cualquier grafica).
+Frame generation: AMD (cualquier grafica, x2-x4) o DLSS (RTX 40/50).
+DLSS necesita el runtime Streamline de NVIDIA (no se incluye): copia la carpeta bin\x64 del
+Streamline SDK de NVIDIA como "streamline" junto a kyty_emulator.exe.
+TURBO: para graficas de 8 GB o menos (unos 6 GB de VRAM).
+Menu y cinematicas a 60; el frame generation se activa al cargar el mundo.
+Recomendado: 32 GB de RAM (con 16 GB Windows puede reiniciarse por un fallo de memoria de Windows).
