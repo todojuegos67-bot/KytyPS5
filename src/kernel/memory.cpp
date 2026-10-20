@@ -5,6 +5,7 @@
 #include "live-trace.h"
 #include "time-census.h"
 #include "writeback-verify.h"
+#include "fresh-memory.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -303,6 +304,16 @@ public:
 		bool             disallow_merge = false;
 		char             name[KERNEL_MAXIMUM_NAME_LENGTH];
 	};
+
+	// Diagnostics (live `ranges`): every range, one tab-separated row each.
+	void Dump(FILE* file) {
+		Common::LockGuard lock(m_mutex);
+		std::fprintf(file, "start\tsize\toffset\tprotection\tmemory_type\ttype\tname\n");
+		for (const auto& [start, range]: m_ranges)
+			std::fprintf(file, "0x%llx\t0x%llx\t0x%llx\t0x%x\t%d\t%d\t%s\n", static_cast<unsigned long long>(range.start),
+			             static_cast<unsigned long long>(range.size), static_cast<unsigned long long>(range.offset),
+			             static_cast<unsigned>(range.protection), range.memory_type, static_cast<int>(range.type), range.name);
+	}
 
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
@@ -1164,6 +1175,35 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 		addr = find_in(HOST_USER_MIN, HOST_USER_MAX + 1u);
 	}
 	return addr;
+}
+
+bool WriteGuestRanges(const char* path) {
+	if (g_virtual_ranges == nullptr || path == nullptr) return false;
+	FILE* file = std::fopen(path, "w");
+	if (file == nullptr) return false;
+	g_virtual_ranges->Dump(file);
+	std::fclose(file);
+	return true;
+}
+
+bool BackingView(uint64_t* base, uint64_t* size) {
+	if (g_guest_address_space == nullptr || base == nullptr || size == nullptr) return false;
+	*base = g_guest_address_space->GetBackingBase();
+	*size = g_guest_address_space->GetBackingSize();
+	return *base != 0 && *size != 0;
+}
+
+bool GuestRangeAccess(uint64_t vaddr, uint64_t size, bool* gpu, bool* cpu_write) {
+	std::vector<VirtualRanges::Range> ranges;
+	if (g_virtual_ranges == nullptr || gpu == nullptr || cpu_write == nullptr || !g_virtual_ranges->QuerySpan(vaddr, size, &ranges))
+		return false;
+	*gpu       = false;
+	*cpu_write = false;
+	for (const auto& range: ranges) {
+		*gpu       = *gpu || (range.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0;
+		*cpu_write = *cpu_write || (range.protection & PROT_CPU_WRITE) != 0;
+	}
+	return true;
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
@@ -4439,6 +4479,8 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	if (!DecodeMemoryProtection(prot, &mode, &gpu_mode)) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	// (Fresh memory: bytes the CPU may write from now on without a write watch count as written, before it can.)
+	if ((prot & PROT_CPU_WRITE) != 0) FreshMemory::MarkGuestRange(aligned_addr, aligned_len);
 	std::vector<VirtualRanges::Range> old_ranges;
 	if (!g_virtual_ranges->QuerySpan(aligned_addr, aligned_len, &old_ranges) ||
 	    std::any_of(old_ranges.begin(), old_ranges.end(),

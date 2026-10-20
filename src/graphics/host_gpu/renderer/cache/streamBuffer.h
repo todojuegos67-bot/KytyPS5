@@ -45,8 +45,17 @@ class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	// A game buffer bound to `allocation` (a defragmentation pass's destination: BufferCache::Defragment).
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::BufferUsageFlags flags,
+	       uint64_t size, VmaAllocation allocation);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
+
+	[[nodiscard]] VmaAllocation Allocation() const noexcept { return m_allocation; }
+	// Defragmentation: the allocation it is destroyed without (a moved buffer's memory, which the pass frees), and the
+	// one it takes (the moved allocation, now at its memory).
+	void                        ReleaseAllocation() noexcept { m_allocation = nullptr; }
+	void                        AdoptAllocation(VmaAllocation allocation) noexcept { m_allocation = allocation; }
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }

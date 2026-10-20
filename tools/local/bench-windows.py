@@ -56,11 +56,20 @@ def prepare():
     backup = STATE / f'user-save-{stamp}'
     backup.mkdir(parents=True)
     manifest = {'stamp': stamp, 'backup': str(backup), 'entries': {}}
-    for name in ENTRIES:
-        source = SAVES / name
-        if source.exists():
-            manifest['entries'][name] = digest(source) if source.is_dir() else None
-            source.rename(backup / name)  # a move on the same volume: nothing is deleted
+    moved = []
+    try:
+        for name in ENTRIES:
+            source = SAVES / name
+            if source.exists():
+                manifest['entries'][name] = digest(source) if source.is_dir() else None
+                source.rename(backup / name)  # a move on the same volume: nothing is deleted
+                moved.append(name)
+    except OSError:
+        # (A folder another program holds, e.g. 10-20 .kyty-capacity: the ones moved go back, the user's save in place.)
+        for name in reversed(moved):
+            (backup / name).rename(SAVES / name)
+        backup.rmdir()
+        raise
     for name in ENTRIES:
         if (BASELINE / name).exists():
             shutil.copytree(BASELINE / name, SAVES / name)

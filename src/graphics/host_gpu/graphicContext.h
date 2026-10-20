@@ -17,6 +17,7 @@ namespace Libs::Graphics {
 struct VulkanImage;
 class PipelineBinaries;
 class PipelineBinaryWriter;
+class PlayedPipelines;
 class PipelineCacheBlobs;
 class PipelineCacheBlobWriter;
 
@@ -64,6 +65,8 @@ struct GraphicContext {
 	bool                               pipeline_binary_internal_cache        = true;
 	const PipelineBinaries*            pipeline_binaries                     = nullptr;
 	PipelineBinaryWriter*              pipeline_binary_writer                = nullptr;
+	// Pipelines compiled in earlier sessions' play, and this one's kept (pipelineBinaries.h).
+	PlayedPipelines*                   played_pipelines                      = nullptr;
 	// Without pipeline binaries: the static precompile's pipelines as each one's own pipeline cache data, keyed by
 	// its identity (pipelineCacheBlobs.h); in the precompile, its output.
 	const PipelineCacheBlobs*          pipeline_blobs                        = nullptr;
@@ -178,6 +181,9 @@ struct GraphicContext {
 	// A budget under 12 GiB (CreateAllocator): less than the game's working set (Boletaria ~11 GB). Textures yield video
 	// memory to render targets and buffers (CreateImage); the pipeline warmup leaves its pipelines to first use.
 	bool                          small_video_memory = false;
+	// The game buffers' own VMA pool (BufferCache), whose blocks BufferCache::Defragment compacts. KYTY_BUFFER_DEFRAG:
+	// on with a small video memory, 0 off, 1 on any GPU. Null: off, game buffers in VMA's default pools.
+	VmaPool                       game_buffer_pool = nullptr;
 	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue
 	// (MemoryUsage::SparseDeviceLocal).
 	bool                          sparse_residency_buffers = false;

@@ -381,6 +381,7 @@ public:
 		return TryTransferBacking<true>(vaddr, size,
 		                          [source](uint8_t* backing, uint64_t data_offset, size_t bytes) {
 			                          std::memcpy(backing, source + data_offset, bytes);
+			                          FreshMemory::MarkBacking(reinterpret_cast<uint64_t>(backing), bytes);
 		                          });
 	}
 
@@ -406,6 +407,7 @@ public:
 		}
 		DataWriteFence fence(*this, begin, begin + size, m_cpu_write_pages);
 		std::memcpy(m_backing_base + begin, data, size);
+		FreshMemory::MarkBacking(reinterpret_cast<uint64_t>(m_backing_base + begin), size);
 		return true;
 	}
 
@@ -1644,6 +1646,9 @@ private:
 			SetFailure(failure_reason, FailureReason::ProtectFailed);
 			return nullptr;
 		}
+		// (A view mapped again comes back without the trackers' protection until it is applied: a write meanwhile goes
+		// unseen, so its write-watched never-written granules count as written.)
+		FreshMemory::MarkArmedBacking(GetBackingBase() + backing_offset, size);
 		return ptr;
 	}
 

@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -152,6 +153,53 @@ private:
 	std::unordered_map<PipelineBinaries::Key, std::vector<uint32_t>, PipelineBinaries::KeyHash> m_pipelines;
 	std::atomic<size_t> m_copied {0}, m_captured {0}, m_left_out {0};
 	mutable std::atomic<size_t> m_claimed {0};
+};
+
+// Pipelines compiled in play (none of the static store's) kept as their binaries for the sessions after: a driver's
+// own cache is not enough (AMD's Windows driver adds nothing to its 1 GiB cache once it is full: such pipelines, 478-1051
+// a session, compiled again in every session, issue #78). Beside the driver cache: <name>.played.binaries and the
+// captures saved since, <name>.played.<n>.binaries, merged into it at a start once there are more than MergeAt.
+class PlayedPipelines {
+public:
+	// Null when the driver gives no keys (`signature` empty). Files of another GPU or driver are removed, and all of
+	// them past Limit bytes (pipelines of shaders long changed pile up): their pipelines compile again.
+	static std::unique_ptr<PlayedPipelines> Open(vk::Device device, const std::filesystem::path& base,
+	                                             const std::string& signature);
+	~PlayedPipelines();
+
+	// The binaries an earlier session kept for a pipeline key.
+	[[nodiscard]] PipelineBinaries::Handles Load(const PipelineBinaries::Key& key) const;
+	// Whether pipelines compiled now are made with VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR and kept: not once the
+	// driver compresses binaries with NVIDIA's dictionary (PipelineBinaryWriter), which a later process may not read.
+	[[nodiscard]] bool Capturing() const { return m_capturing.load(std::memory_order_relaxed); }
+	// A pipeline created with the capture flag (its captured data is released).
+	void Capture(const PipelineBinaries::Key& key, vk::Pipeline pipeline);
+	// The captures since the last save into a file of their own, when there are any.
+	bool Save();
+	void Report() const;
+	// The report once its counts changed (a session that is ended, not exited, reports none at its end).
+	void ReportChanged();
+
+	std::atomic<uint64_t> hits {0}, refused {0};
+
+private:
+	PlayedPipelines() = default;
+	static constexpr uint64_t Limit   = uint64_t {1} << 30u;
+	static constexpr size_t   MergeAt = 8;
+
+	vk::Device                                     m_device;
+	std::filesystem::path                          m_base;
+	std::string                                    m_signature;
+	std::vector<std::unique_ptr<PipelineBinaries>> m_stores; // newest first
+	size_t                                         m_held = 0;
+	uint32_t                                       m_next = 0; // the next file's <n>
+	// Captures go into the current writer; a save takes it (exclusively) and writes it without blocking them.
+	mutable std::shared_mutex             m_session_mutex;
+	std::unique_ptr<PipelineBinaryWriter> m_session;
+	std::mutex                            m_save_mutex;
+	std::atomic<bool>                     m_capturing {true};
+	std::atomic<uint64_t>                 m_captured {0}, m_saved {0}, m_save_failures {0};
+	uint64_t                              m_reported = 0;
 };
 
 } // namespace Libs::Graphics

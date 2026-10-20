@@ -258,15 +258,24 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	}
 
+	// A game buffer goes in the game buffers' pool (graphicContext.h), with no room there where VMA puts it.
+	if (usage == MemoryUsage::DeviceLocal && with_bda && cpu_address != 0 && !forced_spill)
+		allocation_info.pool = graphics.game_buffer_pool;
+
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
 	const auto        create        = [&] {
 		return vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
 		                       &allocation_info, &native_buffer, &m_allocation, &allocation_result) == VK_SUCCESS;
 	};
+	bool created = create();
+	if (!created && allocation_info.pool != nullptr) {
+		allocation_info.pool = nullptr;
+		created              = create();
+	}
 	// Over the video memory budget VMA places it in system memory; when even that fails, without
 	// the images kept for reuse and over budget.
-	if (!create()) {
+	if (!created) {
 		graphics.TrimImagePool();
 		allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
 		if (!create()) graphics.ReportMemoryFallback("a buffer could not be created", size);
@@ -294,6 +303,37 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
+	}
+}
+
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::BufferUsageFlags flags,
+               uint64_t size, VmaAllocation allocation)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal), m_cpu_address(cpu_address),
+      m_size(size) {
+	EXIT_IF(graphics.allocator == nullptr || size == 0 || allocation == nullptr);
+	// (As the constructor above makes one: the same requirements, those the destination was reserved with.)
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.size  = size;
+	buffer_info.usage = flags;
+	const uint32_t families[] {graphics.queue_family, graphics.readback_family};
+	if (graphics.readback_family != static_cast<uint32_t>(-1)) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = 2;
+		buffer_info.pQueueFamilyIndices   = families;
+	}
+	const auto native_device = static_cast<VkDevice>(graphics.device);
+	const auto raw           = static_cast<VkBufferCreateInfo>(buffer_info);
+	VkBuffer   native_buffer = VK_NULL_HANDLE;
+	EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateBuffer(native_device, &raw, nullptr, &native_buffer) != VK_SUCCESS);
+	EXIT_NOT_IMPLEMENTED(vmaBindBufferMemory(graphics.allocator, allocation, native_buffer) != VK_SUCCESS);
+	m_buffer     = native_buffer;
+	m_allocation = allocation;
+	if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = m_buffer;
+		m_device_address    = graphics.device.getBufferAddress(address_info);
+		EXIT_IF(m_device_address == 0);
+		DeviceFault::NoteCreated(m_device_address, size, cpu_address);
 	}
 }
 

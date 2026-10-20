@@ -855,39 +855,57 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 		pipeline.pipeline = nullptr;
 		return false;
 	};
-	// Its binaries (pipelineBinaries.h) when the store holds them; the precompile keeps every pipeline's.
+	// Its binaries (pipelineBinaries.h) when the store holds them; the precompile keeps every pipeline's. Then those an
+	// earlier session kept of its compiles in play.
 	const auto* store  = graphics.pipeline_binaries;
 	auto*       writer = graphics.pipeline_binary_writer;
-	if (build != PipelineBuild::Optimize && (store != nullptr || writer != nullptr)) {
-		PipelineBinaries::Key key;
-		if (PipelineBinaries::PipelineKey(graphics.device, &info, key)) {
+	auto*       played = writer == nullptr ? graphics.played_pipelines : nullptr;
+	const auto  made_of = [&](const PipelineBinaries::Handles& binaries) {
+		vk::PipelineBinaryInfoKHR from {};
+		from.binaryCount       = static_cast<uint32_t>(binaries.binaries.size());
+		from.pPipelineBinaries = reinterpret_cast<const vk::PipelineBinaryKHR*>(binaries.binaries.data());
+		auto with              = info;
+		from.pNext             = with.pNext;
+		with.pNext             = &from;
+		const auto result      = create(nullptr, with);
+		if (result != vk::Result::eSuccess) pipeline.pipeline = nullptr;
+		return result;
+	};
+	PipelineBinaries::Key key;
+	bool                  keyed = false;
+	if (build != PipelineBuild::Optimize && (store != nullptr || writer != nullptr || played != nullptr)) {
+		keyed = PipelineBinaries::PipelineKey(graphics.device, &info, key);
+		if (keyed) {
 			if (writer != nullptr && PipelineKeyLog()) LogPipelineKey("tool", key, original);
 			if (InlineKeyCheck()) CheckInlineKey(graphics.device, original, key);
 			// Another shard of this precompile holds it: no pipeline (see CreatePipelineInternal).
 			if (writer != nullptr && writer->Claimed(key)) return vk::Result::ePipelineCompileRequired;
 			if (const auto binaries = store != nullptr ? store->Load(key) : PipelineBinaries::Handles {};
 			    !binaries.binaries.empty()) {
-				vk::PipelineBinaryInfoKHR from {};
-				from.binaryCount       = static_cast<uint32_t>(binaries.binaries.size());
-				from.pPipelineBinaries = reinterpret_cast<const vk::PipelineBinaryKHR*>(binaries.binaries.data());
-				auto with              = info;
-				from.pNext             = with.pNext;
-				with.pNext             = &from;
-				const auto result      = create(nullptr, with);
+				const auto result = made_of(binaries);
 				if (result == vk::Result::eSuccess) {
 					if (writer != nullptr) writer->Copy(key, *store);
 					if (writer == nullptr) g_binary_outcomes.Count(g_binary_outcomes.hits);
 					t_static_hit = true;
 					return vk::Result::eSuccess;
 				}
-				pipeline.pipeline = nullptr;
 				if (writer == nullptr) g_binary_outcomes.Refused(result);
-			} else if (writer == nullptr) {
+			} else if (writer == nullptr && store != nullptr) {
 				g_binary_outcomes.Count(store->Holds(key) ? g_binary_outcomes.damaged : g_binary_outcomes.absent);
+			}
+			if (played != nullptr) {
+				if (const auto binaries = played->Load(key); !binaries.binaries.empty()) {
+					if (made_of(binaries) == vk::Result::eSuccess) {
+						played->hits.fetch_add(1, std::memory_order_relaxed);
+						t_static_hit = true;
+						return vk::Result::eSuccess;
+					}
+					played->refused.fetch_add(1, std::memory_order_relaxed);
+				}
 			}
 			if (writer == nullptr && PipelineKeyLog()) LogPipelineKey("miss", key, original);
 			if (writer != nullptr) return CapturePipelineBinaries(graphics, pipeline, info, driver_cache, key, create);
-		} else if (writer == nullptr) {
+		} else if (writer == nullptr && store != nullptr) {
 			g_binary_outcomes.Count(g_binary_outcomes.unasked);
 		}
 	}
@@ -963,6 +981,20 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 	if (build != PipelineBuild::Optimize && store == nullptr && cached(graphics.static_pipeline_cache)) {
 		t_static_hit = true;
 		return vk::Result::eSuccess;
+	}
+	// A pipeline compiled now (in no cache) is kept for the sessions after (PlayedPipelines); a driver cache's is not.
+	if (build == PipelineBuild::Full && keyed && played != nullptr && played->Capturing() &&
+	    graphics.pipeline_cache_control_enabled) {
+		if (cached(driver_cache)) return vk::Result::eSuccess;
+		vk::PipelineCreateFlags2CreateInfoKHR flags {};
+		flags.flags = vk::PipelineCreateFlags2KHR(static_cast<VkPipelineCreateFlags>(info.flags)) |
+		              vk::PipelineCreateFlagBits2KHR::eCaptureDataKHR;
+		flags.pNext       = info.pNext;
+		auto kept         = info;
+		kept.pNext        = &flags;
+		const auto result = create(driver_cache, kept);
+		if (result == vk::Result::eSuccess) played->Capture(key, pipeline.pipeline);
+		return result;
 	}
 	if (build != PipelineBuild::Fast) return create(driver_cache, info);
 	if (cached(driver_cache)) return vk::Result::eSuccess;

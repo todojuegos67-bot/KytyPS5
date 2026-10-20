@@ -49,7 +49,9 @@
 #include <string>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <thread>
 #include <unistd.h>
+#include <x86intrin.h>
 #endif
 
 namespace LocalPlatform {
@@ -1027,6 +1029,20 @@ bool WriteHeapHistogram(const char* path) {
 	if (blocks == nullptr) return false;
 	std::vector<std::pair<uint64_t, uint64_t>> by_size(static_cast<size_t>(count) * Small); // heap, size -> blocks, bytes
 	size_t recorded = 0, dropped = 0;
+	// KYTY_HEAP_SAMPLE=<size>: the bytes of some busy blocks of that size (the first 32, then every 32768th) in
+	// <path>.samples.txt, to tell what they are.
+	const char*       sample_value = std::getenv("KYTY_HEAP_SAMPLE");
+	const uint64_t    sample_size  = sample_value != nullptr ? std::strtoull(sample_value, nullptr, 10) : 0;
+	constexpr size_t  SampleCount = 128, SampleBytes = 256;
+	struct Sample {
+		uint64_t address;
+		uint64_t size;
+		uint8_t  bytes[SampleBytes];
+	};
+	auto*  samples = sample_size != 0 ? static_cast<Sample*>(VirtualAlloc(nullptr, SampleCount * sizeof(Sample),
+	                                                                       MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
+	                                  : nullptr;
+	size_t sampled = 0, sample_seen = 0;
 	// Where the heaps' memory lies: their regions (segments) and blocks of a megabyte or more (each its own
 	// allocation): the private allocations of <path>.vm.tsv that are the heaps'.
 	constexpr size_t      MaxPlaces = 65536;
@@ -1039,6 +1055,13 @@ bool WriteHeapHistogram(const char* path) {
 			if ((entry.wFlags & PROCESS_HEAP_REGION) != 0 && place_count < MaxPlaces)
 				places[place_count++] = reinterpret_cast<uint64_t>(entry.lpData);
 			if ((entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) == 0) continue;
+			if (samples != nullptr && entry.cbData == sample_size && sampled < SampleCount &&
+			    (sample_seen++ < 32 || sample_seen % 32768 == 0)) {
+				samples[sampled].address = reinterpret_cast<uint64_t>(entry.lpData);
+				samples[sampled].size    = entry.cbData;
+				std::memcpy(samples[sampled].bytes, entry.lpData, std::min<size_t>(entry.cbData, SampleBytes));
+				sampled++;
+			}
 			if (entry.cbData >= (uint64_t {1} << 20u) && place_count < MaxPlaces)
 				places[place_count++] = reinterpret_cast<uint64_t>(entry.lpData);
 			if (entry.cbData < Small) {
@@ -1077,6 +1100,22 @@ bool WriteHeapHistogram(const char* path) {
 		std::fprintf(file, "%llu\t%llu\t%llu\n", static_cast<unsigned long long>(size),
 		             static_cast<unsigned long long>(use.first), static_cast<unsigned long long>(use.second));
 	std::fclose(file);
+	if (samples != nullptr) {
+		if (FILE* out = std::fopen((std::string(path) + ".samples.txt").c_str(), "w"); out != nullptr) {
+			for (size_t i = 0; i < sampled; i++) {
+				std::fprintf(out, "%llx %llu:", static_cast<unsigned long long>(samples[i].address),
+				             static_cast<unsigned long long>(samples[i].size));
+				for (size_t at = 0; at + 8 <= std::min<size_t>(samples[i].size, SampleBytes); at += 8) {
+					uint64_t qword = 0;
+					std::memcpy(&qword, samples[i].bytes + at, sizeof(qword));
+					std::fprintf(out, " %llx", static_cast<unsigned long long>(qword));
+				}
+				std::fprintf(out, "\n");
+			}
+			std::fclose(out);
+		}
+		VirtualFree(samples, 0, MEM_RELEASE);
+	}
 	// What the blocks are, per heap: <path>.sig.tsv groups blocks of 16 bytes or more by size and first qword: SPIR-V's
 	// magic, an address in a module (a vtable: module+offset), zero, else data; groups under 64 KiB and 16 blocks go
 	// to "rest" per heap.
@@ -1733,8 +1772,19 @@ double ThreadCpuSeconds(uint64_t handle) {
 	return ClockSeconds(clock);
 }
 
+// The thread's CPU time in TSC ticks, as Windows' thread cycle count is (the slow-frame lines' cpu=: busy wall time well
+// over it is time the thread was blocked or not running). The TSC rate is measured once.
 uint64_t CurrentThreadCycles() {
-	return 0;
+	static const double ticks_per_ns = [] {
+		const auto     start = std::chrono::steady_clock::now();
+		const uint64_t first = __rdtsc();
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+		return ns > 0 ? static_cast<double>(__rdtsc() - first) / static_cast<double>(ns) : 0.0;
+	}();
+	timespec time {};
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) != 0) return 0;
+	return static_cast<uint64_t>((static_cast<double>(time.tv_sec) * 1e9 + static_cast<double>(time.tv_nsec)) * ticks_per_ns);
 }
 
 int CurrentThreadPriority() {

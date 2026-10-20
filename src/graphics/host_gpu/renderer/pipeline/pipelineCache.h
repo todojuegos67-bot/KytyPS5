@@ -35,6 +35,7 @@ struct LocalDescriptorPlan;
 #endif
 class CommandBuffer;
 class PipelineBinaries;
+class PlayedPipelines;
 class PipelineCacheBlobs;
 
 namespace HW {
@@ -383,6 +384,8 @@ private:
 	// Or its binaries (pipelineBinaries.h): GraphicContext::pipeline_binaries while open.
 	std::unique_ptr<PipelineBinaries> m_static_binaries;
 	std::unique_ptr<PipelineCacheBlobs> m_static_blobs;
+	// Pipelines compiled in play kept as their binaries beside the driver cache: GraphicContext::played_pipelines.
+	std::unique_ptr<PlayedPipelines> m_played;
 	std::filesystem::path         m_driver_cache_path;
 	std::string                   m_driver_cache_key;
 	// The size of the driver cache's data when it was loaded or last saved (Save skips an unchanged one).

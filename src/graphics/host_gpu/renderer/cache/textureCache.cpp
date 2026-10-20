@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
+#include "fresh-memory.h"
 #include "live-counters.h"
 #include "local-platform.h"
 #include "native-resource-state.h"
@@ -4455,6 +4456,13 @@ void TextureCache::RetireStaleImages(uint64_t tick) {
 	            static_cast<unsigned long long>(tick), static_cast<unsigned long long>(use.working_set >> 20u),
 	            static_cast<unsigned long long>(use.private_bytes >> 20u), static_cast<unsigned long long>(available >> 20u),
 	            static_cast<unsigned long long>(LocalPlatform::PhysicalMemory() >> 20u));
+	if (const auto* fresh = FreshMemory::Get())
+		std::printf("Fresh memory: %llu MiB of uploads were never-written bytes (zeros, not read); %llu MiB watched, %llu MiB "
+		            "written at a first write, %llu MiB by other writes\n",
+		            static_cast<unsigned long long>(fresh->zero_upload_bytes.load() >> 20u),
+		            static_cast<unsigned long long>(fresh->watched_bytes.load() >> 20u),
+		            static_cast<unsigned long long>(fresh->faults.load() >> 20u),
+		            static_cast<unsigned long long>(fresh->marked.load() >> 20u));
 	std::fflush(stdout);
 }
 

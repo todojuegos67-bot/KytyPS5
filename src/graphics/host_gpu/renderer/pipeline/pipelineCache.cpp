@@ -2509,6 +2509,7 @@ void PipelineCache::ReportSession() {
 	                 m_program_cache->render_translations, m_program_cache->render_translate_ms, m_render_pipelines,
 	                 m_render_pipeline_ms);
 	ReportStaticStore();
+	if (m_played != nullptr) m_played->Report();
 	if (const auto kept = g_pipeline_evictions.kept.load(); kept != 0) {
 		PipelineCacheLog("Pipelines out of video memory while idle: {} evicted of {} that could be, {} made again ({:.0f} ms, at "
 		                 "most {:.1f} ms)",
@@ -3090,6 +3091,8 @@ PipelineCache::~PipelineCache() {
 	DestroySharedLayouts(m_graphics.device);
 	m_graphics.pipeline_binaries = nullptr;
 	m_graphics.pipeline_blobs    = nullptr;
+	m_graphics.played_pipelines  = nullptr;
+	m_played.reset();
 	for (const auto pipeline: m_replaced_pipelines) {
 		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
@@ -3378,6 +3381,18 @@ void PipelineCache::InitializeDriverCache() {
 	};
 	m_driver_cache = LoadDriverCache(m_driver_cache_path, ram_limit(uint64_t {2} << 30u), m_driver_cache_saved_size);
 	if (m_driver_cache == nullptr) return;
+#ifndef KYTY_STATIC_PRECOMPILE
+	// Pipelines compiled in play as their binaries beside it, for the sessions after (PlayedPipelines): AMD's Windows
+	// driver gives none of them from this cache or its own once that is full (issue #78). KYTY_PLAYED_PIPELINES=0: none.
+	if (const char* value = std::getenv("KYTY_PLAYED_PIPELINES");
+	    m_graphics.pipeline_binaries_enabled && m_graphics.pipeline_cache_control_enabled &&
+	    !(value != nullptr && std::string_view(value) == "0")) {
+		auto base = m_driver_cache_path;
+		base.replace_extension(".played.binaries");
+		m_played                    = PlayedPipelines::Open(m_graphics.device, base, StaticBinariesSignature(m_graphics));
+		m_graphics.played_pipelines = m_played.get();
+	}
+#endif
 	// Table mode pipelines (src/local/table-xpr.inc) in a cache of their own: the static precompile holds none of
 	// them (each compiles in ~0.1-4 s), they are saved once their compiles settle (not only at a clean exit), and
 	// they do not push the main cache past its limit.
@@ -3395,6 +3410,7 @@ void PipelineCache::InitializeDriverCache() {
 		uint64_t                    main_saved = m_main_pipelines_done.load();
 		auto                        table_at   = std::chrono::steady_clock::now();
 		auto                        main_at    = table_at;
+		auto                        played_at  = table_at;
 		const auto settled = [&](const std::atomic<int64_t>& last_done, std::chrono::steady_clock::time_point saved_at) {
 			const auto now  = std::chrono::steady_clock::now();
 			const auto last = std::chrono::steady_clock::time_point(
@@ -3421,6 +3437,13 @@ void PipelineCache::InitializeDriverCache() {
 				std::lock_guard save(m_main_cache_mutex);
 				if (SaveDriverCache(m_driver_cache, m_driver_cache_path, m_driver_cache_saved_size)) main_saved = done;
 				main_at = std::chrono::steady_clock::now();
+			}
+			// The pipelines kept of this session's compiles (none: nothing written), as both caches settle.
+			if (m_played != nullptr && settled(m_main_pipeline_last_done, played_at) &&
+			    settled(m_table_pipeline_last_done, played_at)) {
+				(void)m_played->Save();
+				m_played->ReportChanged();
+				played_at = std::chrono::steady_clock::now();
 			}
 		}
 	});
@@ -3573,6 +3596,7 @@ bool PipelineCache::Save() {
 		std::lock_guard table(m_table_cache_mutex);
 		saved &= SaveDriverCache(m_table_cache, m_table_cache_path, m_table_cache_saved_size);
 	}
+	if (m_played != nullptr) saved &= m_played->Save();
 	return saved;
 }
 

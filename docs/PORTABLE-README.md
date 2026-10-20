@@ -18,16 +18,19 @@ not share shaders), so the shader precompile is done once per version. Other ver
 and other games have not been tested and may not run or may fail. At start-up the launcher reads the
 game's `sce_sys\param.json` and warns when the version is not one of these.
 
+This dump is the European release, whose language list has no Chinese, Japanese or Korean; the game files
+hold every language, and one value turns the others on: see [Game language](#game-language-chinese-japanese-korean-and-others).
+
 ## System requirements
 
 | Item | Requirement | Notes |
 | --- | --- | --- |
 | OS | Windows 10 (1803 or later) or Windows 11, 64-bit | |
 | CPU | AVX2 required (Intel Core 4th generation / AMD Ryzen or later) | 8 cores or more recommended; the test PC has an i9-14900K |
-| RAM | **32 GB recommended, 16 GB works** | The game process takes about 20 GB while a save loads but uses only about 4 GB of it in play, so with 16 GB Windows moves the rest to the page file and loading takes longer. It needs about 34 GB of RAM plus page file: keep the page file "system managed" (the launcher warns when Windows cannot provide it) |
-| GPU | NVIDIA RTX with **12 GB of VRAM recommended, 8 GB works** | About 11 GB of VRAM in use in the heaviest areas. With less than 12 GB, render targets and buffers keep the video memory and the textures that do not fit are read from system memory. The test PC with its video memory limited to 8 GB: Boletaria's gate 45–52 fps, most areas 40–60, the heaviest (Shrine of Storms, Stonefang 2-1, Boletaria 1-2 and 1-3) 10–35, changing from run to run with the textures the driver keeps in video memory; a slower GPU or PCIe link gives less. The test PC has an RTX 5090; AMD/Intel GPUs are untested |
+| RAM | **32 GB recommended, 16 GB works** | The game process takes about 20 GB while a save loads but uses only about 4 GB of it in play, so with 16 GB Windows moves the rest to the page file and loading takes longer. It needs about 34 GB of RAM plus page file: keep the page file "system managed" or set it to at least 32 GB (the launcher warns when Windows cannot provide it). When the RAM runs full (a browser open beside the game, the first session's shader preparation), some 16 GB PCs get a MEMORY_MANAGEMENT blue screen (issue #50): close other large programs while playing |
+| GPU | NVIDIA RTX with **12 GB of VRAM recommended, 8 GB works** | About 11 GB of VRAM in use in the heaviest areas. With less than 12 GB, render targets and buffers keep the video memory and the textures that do not fit are read from system memory. The test PC with its video memory limited to 8 GB: Boletaria's gate 45–52 fps, most areas 40–60, the heaviest (Shrine of Storms, Stonefang 2-1, Boletaria 1-2 and 1-3) 10–35, changing from run to run with the textures the driver keeps in video memory; a slower GPU or PCIe link gives less. The test PC has an RTX 5090; users run it on AMD Radeon (RX 6000 and newer) and Intel Arc cards too, with problems of their own tracked in the issues |
 | GPU driver | The latest | The emulator uses Vulkan, which comes with the driver |
-| Disk | About 83 GB for the game, an SSD recommended | The emulator takes about 270 MB, the shader caches up to about 2.5 GB, and while playing the system temp folder needs another 4–5 GB |
+| Disk | About 83 GB for the game, an SSD recommended | The emulator takes about 270 MB, the shader caches about 2.5–5 GB, and while playing the system temp folder needs another 4–5 GB |
 
 On the test PC (i9-14900K + RTX 5090, 2560×1440 window) the game holds its 60 fps in most places; the
 heaviest spots (Boletaria's gate area, the Tower of Latria) run at about 57–60 fps. With "Up to 120 fps"
@@ -69,6 +72,9 @@ stays responsive), and to open the logs folder. It remembers the settings (`laun
 "Up to 120 fps" (off by default) lets the game render up to 120 frames a second instead of the
 console's 60 where the PC is fast enough: play keeps its speed, and movies, menus and loading screens
 stay at 60.
+"VSync" (off by default) waits for the display's refresh, so the picture does not tear; displays with
+adaptive sync (G-SYNC, FreeSync) keep it. "HDR" (off by default) outputs HDR10 when "Use HDR" is on for the
+display in Windows' display settings (the game is told the TV takes HDR); otherwise the picture stays SDR.
 "Render height" (1440 by default, as on the PS5) is the height the game renders its 3D at before it
 upscales it to its 4K picture; lower heights (1296, 1152, 1080, 900) are faster where the graphics card
 limits the frame rate (a laptop RTX 3080 at Boletaria's start: 20.7 fps at 1440, 24.8 at 1080) and
@@ -158,6 +164,52 @@ shortcut):
 | `-RenderHeight 1080` | The height the game renders its 3D at (720–1440, default 1440 as on the PS5): lower is faster on a slow graphics card and less sharp |
 | `-Aspect 21:9` | The 3D rendered wider (`21:9` or `32:9`) for ultrawide displays; the HUD keeps its shape at the sides; in-game menus, movies and loading screens are stretched to the width |
 | `-Quality low` | How much the game draws: `low` or `lowest` (shorter shadows, simpler distant detail), faster where the processor limits the frame rate |
+| `-TextureReduce 2` | Large textures without their largest levels: `1` half the size per side (the default with less than 12 GB of video memory), `2` a quarter, `0` whole |
+| `-Fps120` | The game's frame rate up to 120 fps instead of 60 (the launcher's "Up to 120 fps") |
+| `-PresentMode Fifo` | VSync on (the launcher's "VSync") |
+| `-Hdr` | HDR10 output when Windows' "Use HDR" is on for the display |
+| `-Upscaler dlss` | DLSS super resolution through the game's PS5 Pro path (NVIDIA RTX, needs Streamline: see "Upscaler" above) |
+| `-FrameGen 1` | DLSS frame generation, the number of generated frames per rendered one (`1` = 2x, up to `5`; RTX 40 or newer, needs Streamline) |
+| `-Set KEY=VALUE` | An emulator switch, e.g. `-Set KYTY_SHADER_PREFETCH=0` (several: `-Set A=1,B=2`); the issues name the ones worth trying |
+
+## Game language (Chinese, Japanese, Korean and others)
+
+The game files hold every language of the game, but the game offers only those of its release. It
+picks the release from `userDefinedParam1` in the game folder's `sce_sys\param.json`, an index into a
+table inside the game. This dump (the European release) has `2`, whose list has no Chinese, Japanese
+or Korean. The emulator stores saves by the title ID in `param.json`, which does not change, so the
+saves stay where they are.
+
+| `userDefinedParam1` | Release | The game's language list |
+| --- | --- | --- |
+| `0` | Global | Every language: Arabic, Chinese (Traditional and Simplified), Danish, Dutch, English, English (UK), Finnish, French, German, Italian, Japanese, Korean, Norwegian, Polish, Portuguese, Portuguese (Brazil), Russian, Spanish, Spanish (Latin America), Swedish, Turkish, Thai |
+| `1` | America | English, French, Portuguese (Brazil), Spanish (Latin America) |
+| `2` | Europe (as dumped) | Arabic, Danish, Dutch, English (UK), Finnish, French, German, Italian, Norwegian, Polish, Portuguese, Russian, Spanish, Swedish, Turkish |
+| `3` | Japan | English (UK), Japanese |
+| `4` | Asia | Chinese (Traditional and Simplified), English (UK), Korean, Thai |
+
+To switch:
+
+1. Close the game. Copy `sce_sys\param.json` somewhere as a backup, open it with Notepad, change
+   `"userDefinedParam1": 2,` to `0` (every language) or to `4` (the Asian release), and save it.
+2. In the launcher, set "Console language" to the language you want (`run.cmd -Language 11` for
+   Chinese (Simplified), `10` Traditional, `0` Japanese, `9` Korean): when the release has it, the game's
+   list starts on it.
+3. The game asks for its language only while there is no options save:
+   - No saves yet (a new installation): it asks at the first start.
+   - With saves: back up the `_SaveData` folder, then move the folder
+     `_SaveData\PPSA01341\SAVEDATA0OptionsProfile0` out of `_SaveData` (to the desktop, say). The characters
+     are in the `SAVEDATA0PlayerProfile...` folders and stay as they are; only the game's options
+     (brightness, controls, camera, subtitles) go back to their defaults.
+4. Start the game: "LANGUAGE SELECT" lists the languages of that release. Choose one and confirm with ×
+   (J on the keyboard); the brightness and the speech and subtitle settings follow in that language.
+
+中文说明：游戏文件里其实包含全部语言，只是游戏按 `sce_sys\param.json` 里的 `userDefinedParam1`（发行区域）决定
+语言选择列表。本 dump 是欧版（值为 `2`，列表里没有中文、日文、韩文）。用记事本把它改成 `0`（全部语言，含简繁中文和日文）
+或 `4`（亚洲版：简繁中文、英文、韩文、泰文）并保存（先备份原文件）；启动器的 "Console language" 选中文（简体）。
+没有存档时首次启动就会出现语言选择；已有存档时，先备份 `_SaveData`，再把 `_SaveData\PPSA01341\SAVEDATA0OptionsProfile0`
+这个文件夹移出 `_SaveData`（角色存档在 `SAVEDATA0PlayerProfile...` 里，不受影响，只有亮度、按键等游戏设置会恢复默认），
+下次启动时在 "LANGUAGE SELECT" 里选择简体中文即可。存档按 `param.json` 里的 Title ID 保存，改这个值不影响存档位置。
 
 ## Shader precompile (without it the game stutters)
 
@@ -238,6 +290,19 @@ The keyboard has no L2 / R2 by default: use a gamepad when you need them.
 | `seeds-<title>_<version>.seeds` | The list of shaders the first launch collects from the game files (one per game version) (it contains the game's shader code: do not share it), for the precompile |
 | `hinted-<title>_<version>.seeds` | The recorded play of the package's hints and of your own play with the code of your game files (made by each precompile, from `released-<title>_<version>.seeds` and `recorded-play-<title>_<version>.hints`; the `.seeds` files contain the game's shader code: do not share them) |
 | `launch.json` | The emulator's switches; normally left alone |
+| `launcher-settings.json` | The launcher's settings |
+| `_DebugSnapshots` | The F9 debug snapshots (picture, position, log), to attach to an issue |
+
+## Updating to a newer package
+
+Close the game and the launcher, then extract the new zip over the old folder and let it replace the
+files. The zip holds only the program files (the emulator, its DLLs, the scripts, `launch.json`, this
+README, the licenses and the shader hints under `tools`). Your saves, shader caches, logs and settings
+are in files it does not have (`_SaveData`, `_PipelineCache`, `logs`, `game-path.txt`,
+`launcher-settings.json`, the `seeds-...` files), so they stay as they are. The launcher asks for a new
+precompile only when the new version needs one, and that run compiles only what is new. If you edited
+`launch.json` yourself, make the edit again in the new one. A copy of `_SaveData` before an update never
+hurts.
 
 ## Known issues
 
@@ -247,6 +312,10 @@ The keyboard has no L2 / R2 by default: use a gamepad when you need them.
   mode" in the launcher (see above). The frame rate is then about 37% lower.
 - Sound: 3D sound has no direction, and there is no reverb.
 - It uses a lot of memory and video memory: on PCs with too little it may just exit.
+- On some PCs whose RAM runs full (mostly 16 GB with a browser open), Windows stops with a
+  MEMORY_MANAGEMENT blue screen after 10 minutes to an hour of play (issue #50, being worked on). Until it is
+  fixed: close other large programs while playing, keep a page file of at least 32 GB, and restart the game
+  after long sessions.
 - On some TVs the picture tears or stutters with VSync on. A user's fix on a 60 Hz TV with an NVIDIA
   card (issue #30): in the NVIDIA Control Panel, Manage 3D settings > Program Settings, add
   `kyty_emulator.exe` and set "Vertical sync" to On and "Vulkan/OpenGL present method" to "Prefer native".

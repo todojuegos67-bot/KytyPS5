@@ -1030,6 +1030,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		vk::PhysicalDeviceProperties2                 properties {};
 		properties.pNext = &binary_properties;
 		physical_device.getProperties2(&properties);
+		std::printf("Vulkan pipeline binaries: internal cache %u (control %u, preferred %u, precompiled %u), compressed %u\n",
+		            binary_properties.pipelineBinaryInternalCache, binary_properties.pipelineBinaryInternalCacheControl,
+		            binary_properties.pipelineBinaryPrefersInternalCache,
+		            binary_properties.pipelineBinaryPrecompiledInternalCache, binary_properties.pipelineBinaryCompressedData);
 		if (!graphics.pipeline_binary_internal_cache && binary_properties.pipelineBinaryInternalCacheControl) {
 			internal_cache.disableInternalCache = VK_TRUE;
 			internal_cache.pNext                = create_info.pNext;

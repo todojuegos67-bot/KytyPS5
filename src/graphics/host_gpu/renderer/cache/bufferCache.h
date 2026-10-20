@@ -13,9 +13,12 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "speculation-state.h"
 
+#include <vk_mem_alloc.h>
+
 #include <array>
 #include <atomic>
 #include <deque>
+#include <future>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -266,6 +269,23 @@ private:
 	// A game buffer in use made in system memory (Buffer::IsInSystemMemory: video memory over budget then) goes back to
 	// video memory once there is room for it, one a call (RunGarbageCollector, every 60 flips). True when one moved.
 	bool MoveSpilledBufferBack();
+	// The game buffers' pool compacted (GraphicContext::game_buffer_pool): a pass of moves at a time, every flip while
+	// one runs (RunGarbageCollector).
+	void Defragment(uint64_t tick);
+	void EndDefragmentation();
+	struct DefragMove {
+		BufferId source, destination;
+	};
+	VmaDefragmentationContext      m_defrag = nullptr;
+	VmaDefragmentationPassMoveInfo m_defrag_pass {};
+	std::vector<DefragMove>        m_defrag_moves; // (a pass's, by its moves' order; none: ignored)
+	bool                           m_defrag_pass_open = false;
+	std::future<VkResult>          m_defrag_ending;     // (the pass ending on a worker thread)
+	std::vector<VmaAllocation>     m_defrag_free_later; // (moved allocations of new buffers destroyed meanwhile)
+	uint64_t                       m_defrag_next_check = 0;
+	uint64_t                       m_defrag_free_after = 0; // the pool's free bytes after the last compaction
+	uint32_t                       m_defrag_passes     = 0;
+	double                         m_defrag_ms = 0, m_defrag_max_ms = 0; // the GPU thread's time in its passes
 
 	using BufferMap = std::map<uint64_t, BufferId>;
 	struct OverlapResult {

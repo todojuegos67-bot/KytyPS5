@@ -22,6 +22,7 @@
 #include "local/skip-shader.h"
 #include "common/assert.h"
 #include "frame-capture.h"
+#include "kernel/memory.h"
 #include "live-census.h"
 #include "live-counters.h"
 #include "lane-sync.h"
@@ -678,6 +679,10 @@ inline void Run(uint64_t id, const std::string& line) {
 		// images <path>: the texture cache's images, one tab-separated row each (what the video memory holds).
 		if (LiveCounters::g_image_report != nullptr) LiveCounters::g_image_report(arg1);
 		std::printf("LIVE_IMAGES id=%" PRIu64 " path=%s written=%d\n", id, arg1, LiveCounters::g_image_report != nullptr ? 1 : 0);
+	} else if (cmd == "ranges" && n >= 2) {
+		// ranges <path>: the guest's virtual ranges with the names the game gave them (Memory::WriteGuestRanges).
+		const bool ok = Libs::LibKernel::Memory::WriteGuestRanges(arg1);
+		std::printf("LIVE_RANGES id=%" PRIu64 " path=%s written=%d\n", id, arg1, ok ? 1 : 0);
 	} else if (cmd == "buffers" && n >= 2) {
 		// buffers <path>: the buffer cache's buffers, one tab-separated row each (what stays registered).
 		if (LiveCounters::g_buffer_report != nullptr) LiveCounters::g_buffer_report(arg1);

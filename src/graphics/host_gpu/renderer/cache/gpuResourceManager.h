@@ -9,9 +9,12 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -91,6 +94,24 @@ private:
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t window_begin, uint64_t window_size);
 	void                      SynchronizeDirtyBdaRegions(GuestRange range);
 	void RefreshBdaRanges();
+	// Fresh memory (src/local/fresh-memory.h): the never-written granules of a mapping the CPU and the GPU may use,
+	// write-watched until their first write (MapMemory), unwatched when unmapped (UnmapMemory: `mark` counts them as
+	// written, as when the mapping stays without the watch), a first write's (HandleFault: true when it was one) and a
+	// host overwrite's (InvalidateMemoryForWrite) granules written. Each watched part is one granule's bytes in one
+	// mapping, by its guest address; the parts of a granule (all its mappings) go together.
+	void FreshWatch(uint64_t vaddr, uint64_t size);
+	void FreshUnwatch(uint64_t vaddr, uint64_t size, bool mark);
+	bool FreshFirstWrite(uint64_t vaddr);
+	void FreshOverwrite(uint64_t vaddr, uint64_t size);
+	void FreshUnwatchGranule(uint64_t granule); // (m_fresh_mutex held)
+	struct FreshPart {
+		uint64_t end     = 0;
+		uint64_t granule = 0;
+	};
+	std::mutex                                          m_fresh_mutex;
+	std::map<uint64_t, FreshPart>                       m_fresh_parts;    // by guest address
+	std::unordered_map<uint64_t, std::vector<uint64_t>> m_fresh_granules; // the addresses of the parts of a granule
+	uint64_t                                            m_fresh_report_flip = 0;
 	PageManager               m_page_manager;
 	CommandScheduler&         m_scheduler;
 	BufferCache               m_buffer_cache;
