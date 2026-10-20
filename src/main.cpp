@@ -235,6 +235,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.game_patch = value;
+		} else if (arg == "--skip-shaders") {
+			// Read by SkipShader::HashList (src/local/skip-shader.h) at the first draw/dispatch.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			_putenv_s("KYTY_SKIP_SHADERS", value.c_str());
+#else
+			setenv("KYTY_SKIP_SHADERS", value.c_str(), 1);
+#endif
 		} else if (arg == "--screen-width") {
 			options.config.screen_width = static_cast<uint32_t>(Common::ToInt32(value));
 		} else if (arg == "--screen-height") {

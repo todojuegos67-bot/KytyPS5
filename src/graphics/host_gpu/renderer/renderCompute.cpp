@@ -853,6 +853,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
+	if (compute_program && input_info.stage.program != nullptr &&
+	    SkipShader::HashSkipped(input_info.stage.program->shader_hash, "dispatches")) {
+		ResetBindings();
+		return;
+	}
 	if (compute_program && input_info.stage.program != nullptr && input_info.stage.program->has_bvh) {
 		// As the Wolverine fork: KYTY_SKIP_BVH_DISPATCHES (default 1; 0 executes them) skips the dispatches of
 		// programs with BVH intersections (IMAGE_BVH_INTERSECT_RAY); their software traversal loses the device

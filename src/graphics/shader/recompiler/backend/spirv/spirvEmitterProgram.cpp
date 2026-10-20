@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <unordered_set>
@@ -118,6 +120,55 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 	return result;
 }
 
+// Loop watchdog (research): KYTY_LOOP_CAP=N (default 0 = off) makes every compute invocation leave its loops once
+// it has taken more than N loop decisions (all loops share one per-invocation Private counter): a loop header or
+// continue block whose conditional branch already has the loop merge as one target takes that exit. Only existing
+// CFG edges are used, so merge-block phis stay valid; a loop with no such exit edge is not capped. The dispatcher
+// fallback loop (irreducible CFGs) is capped the same way. Read once at the first compile.
+uint32_t LoopCap() {
+	static const uint32_t cap = [] {
+		const char* value = std::getenv("KYTY_LOOP_CAP");
+		const auto  v     = value == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
+		if (v != 0) std::printf("Loop watchdog: compute loops exit after %u decisions per invocation (KYTY_LOOP_CAP)\n", v);
+		return v;
+	}();
+	return cap;
+}
+
+// Returns a bool id: true once the invocation exceeded the cap (counter incremented here). 0 if disabled.
+uint32_t EmitLoopWatchdog(EmitterState& s) {
+	const auto cap = LoopCap();
+	if (cap == 0 || s.program.stage != ShaderType::Compute) return 0;
+	if (s.loop_counter_variable == 0) {
+		s.loop_counter_variable = s.builder.DefineInitializedVariable(
+		    TypePointer(s, StorageClassPrivate, TypeU32(s)), StorageClassPrivate, ConstantU32(s, 0));
+		s.builder.AddName(s.loop_counter_variable, "loop_watchdog");
+	}
+	const auto count = s.builder.AllocateId();
+	s.builder.AddFunction({OpLoad, TypeU32(s), count, s.loop_counter_variable});
+	const auto next = s.builder.AllocateId();
+	s.builder.AddFunction({OpIAdd, TypeU32(s), next, count, ConstantU32(s, 1)});
+	s.builder.AddFunction({OpStore, s.loop_counter_variable, next});
+	const auto over = s.builder.AllocateId();
+	s.builder.AddFunction({OpUGreaterThan, TypeBool(s), over, next, ConstantU32(s, cap)});
+	return over;
+}
+
+// condition' that leaves to `exit_block` when the watchdog fired.
+uint32_t WatchdogCondition(EmitterState& s, uint32_t condition, bool exit_on_true) {
+	const auto over = EmitLoopWatchdog(s);
+	if (over == 0) return condition;
+	const auto result = s.builder.AllocateId();
+	if (exit_on_true) {
+		s.builder.AddFunction({OpLogicalOr, TypeBool(s), result, condition, over});
+	} else {
+		const auto keep = s.builder.AllocateId();
+		s.builder.AddFunction({OpLogicalNot, TypeBool(s), keep, over});
+		s.builder.AddFunction({OpLogicalAnd, TypeBool(s), result, condition, keep});
+	}
+	return result;
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
                               const IR::BlockInfo& info) {
 	const auto& program = ctx.state.program;
@@ -157,7 +208,24 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = BranchCondition(ctx, info);
+			auto condition = BranchCondition(ctx, info);
+			if (LoopCap() != 0) {
+				// The merge this branch may leave to: its own (loop header) or the loop's whose continue block it is.
+				uint32_t loop_merge = UINT32_MAX;
+				if (term.loop_header) {
+					loop_merge = term.merge_block;
+				} else {
+					for (const auto& other: program.block_info)
+						if (other.terminator.loop_header && other.terminator.continue_block == info.id) {
+							loop_merge = other.terminator.merge_block;
+							break;
+						}
+				}
+				if (loop_merge != UINT32_MAX && term.true_block != term.false_block) {
+					if (term.true_block == loop_merge) condition = WatchdogCondition(ctx.state, condition, true);
+					else if (term.false_block == loop_merge) condition = WatchdogCondition(ctx.state, condition, false);
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(
 			    {OpBranchConditional, condition, ctx.Label(true_block), ctx.Label(false_block)});
@@ -345,9 +413,10 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction({OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                           dispatcher.continue_label});
-	const auto done = state.builder.AllocateId();
+	auto done = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpIEqual, TypeBool(state), done, pc, ConstantU32(ctx.state, UINT32_MAX)});
+	done = WatchdogCondition(state, done, true); // KYTY_LOOP_CAP
 	state.builder.AddFunction(
 	    {OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label, LoopControlNone});
 	state.builder.AddFunction(
