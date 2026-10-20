@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <limits>
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -175,6 +177,27 @@ int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optva
 	return FinishSocketCall(Net::Setsockopt(s, level, optname, optval, optlen));
 }
 
+int KYTY_SYSV_ABI NetConnect(int s, const void* addr, uint32_t addrlen) {
+	return FinishSocketCall(Net::Connect(s, addr, addrlen));
+}
+
+int KYTY_SYSV_ABI NetGetsockopt(int s, int level, int optname, void* optval, uint32_t* optlen) {
+	return FinishSocketCall(Net::Getsockopt(s, level, optname, optval, optlen));
+}
+
+int KYTY_SYSV_ABI NetSendto(int s, const void* buf, size_t len, int flags, const void* addr,
+                            uint32_t addrlen) {
+	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	return FinishSocketCall(
+	    static_cast<int>(Net::Sendto(s, buf, size, flags | 0x20000, addr, addrlen)));
+}
+
+int KYTY_SYSV_ABI NetRecvfrom(int s, void* buf, size_t len, int flags, void* addr,
+                              uint32_t* addrlen) {
+	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	return FinishSocketCall(static_cast<int>(Net::Recvfrom(s, buf, size, flags, addr, addrlen)));
+}
+
 uint32_t KYTY_SYSV_ABI NetHtonl(uint32_t host32) {
 	return ((host32 & 0x000000ffu) << 24u) | ((host32 & 0x0000ff00u) << 8u) |
 	       ((host32 & 0x00ff0000u) >> 8u) | ((host32 & 0xff000000u) >> 24u);
@@ -219,6 +242,10 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("Q4qBuN-c0ZM", LibNet::NetSocket);
 	LIB_FUNC("45ggEzakPJQ", LibNet::NetSocketClose);
 	LIB_FUNC("2mKX2Spso7I", LibNet::NetSetsockopt);
+	LIB_FUNC("OXXX4mUk3uk", LibNet::NetConnect);
+	LIB_FUNC("xphrZusl78E", LibNet::NetGetsockopt);
+	LIB_FUNC("gvD1greCu0A", LibNet::NetSendto);
+	LIB_FUNC("304ooNZxWDY", LibNet::NetRecvfrom);
 	LIB_FUNC("9T2pDF2Ryqg", LibNet::NetHtonl);
 	LIB_FUNC("iWQWrwiSt8A", LibNet::NetHtons);
 	LIB_FUNC("pQGpHYopAIY", LibNet::NetNtohl);

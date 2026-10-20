@@ -3304,6 +3304,35 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 	return OK;
 }
 
+static Ngs2Internal* Ngs2FindSystem(uintptr_t system_handle) {
+	for (auto* ngs = g_ngs_list; ngs != nullptr; ngs = ngs->next) {
+		if (reinterpret_cast<uintptr_t>(ngs) == system_handle) {
+			return ngs;
+		}
+	}
+	return nullptr;
+}
+
+int KYTY_SYSV_ABI Ngs2SystemLock(uintptr_t system_handle) {
+	PRINT_NAME();
+	auto* ngs = Ngs2FindSystem(system_handle);
+	if (ngs == nullptr) {
+		return static_cast<int32_t>(0x804a8201u); // NGS2_ERROR_INVALID_SYSTEM_HANDLE
+	}
+	ngs->mutex.Lock();
+	return OK;
+}
+
+int KYTY_SYSV_ABI Ngs2SystemUnlock(uintptr_t system_handle) {
+	PRINT_NAME();
+	auto* ngs = Ngs2FindSystem(system_handle);
+	if (ngs == nullptr) {
+		return static_cast<int32_t>(0x804a8201u); // NGS2_ERROR_INVALID_SYSTEM_HANDLE
+	}
+	ngs->mutex.Unlock();
+	return OK;
+}
+
 int KYTY_SYSV_ABI Ngs2VoiceGetStateFlags(uintptr_t voice_handle, uint32_t* state_flags) {
 	PRINT_NAME();
 

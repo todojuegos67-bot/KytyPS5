@@ -72,10 +72,15 @@ LIB_DEFINE(InitRtc_1);
 
 namespace LibGen5 {
 LIB_DEFINE(InitVideoOut_1);
+namespace VrrStatus {
+LIB_DEFINE(InitVideoOutVrrStatus_1);
+} // namespace VrrStatus
 } // namespace LibGen5
 
 LIB_DEFINE(InitAppContent_1);
 LIB_DEFINE(InitAudio_1);
+LIB_DEFINE(InitBluetoothHid_1);
+LIB_DEFINE(InitDeviceService_1);
 LIB_DEFINE(InitConvertKeycode_1);
 LIB_DEFINE(InitDbgAddressSanitizer_1);
 LIB_DEFINE(InitDialog_1);
@@ -94,6 +99,7 @@ LIB_DEFINE(InitShare_1);
 LIB_DEFINE(InitSysmodule_1);
 LIB_DEFINE(InitSystemService_1);
 LIB_DEFINE(InitTextToSpeech2_1);
+LIB_DEFINE(InitUsbd_1);
 LIB_DEFINE(InitUserService_1);
 LIB_DEFINE(InitWebBrowserDialog_1);
 
@@ -115,6 +121,9 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitFont_1(s);
 	InitFontFt_1(s);
 	InitAgcDriver_1(s);
+	InitBluetoothHid_1(s);
+	InitDeviceService_1(s);
+	InitUsbd_1(s);
 	InitLibKernel_1(s);
 	LibMouse::InitMouse_1(s);
 	LibKeyboard::InitKeyboard_1(s);
@@ -136,6 +145,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitUserService_1(s);
 	VideoDec2::InitVideoDec2_1(s);
 	LibGen5::InitVideoOut_1(s);
+	LibGen5::VrrStatus::InitVideoOutVrrStatus_1(s);
 	InitWebBrowserDialog_1(s);
 }
 

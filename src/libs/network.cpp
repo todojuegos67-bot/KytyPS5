@@ -1830,12 +1830,12 @@ int KYTY_SYSV_ABI Shutdown(int s, int how) {
 	if (::shutdown(socket, how) == SOCKET_ERROR) {
 		return SetHostSocketError();
 	}
-
-	return 0;
 #else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
+	if (::shutdown(socket, how) != 0) {
+		return SetHostSocketError();
+	}
 #endif
+	return 0;
 }
 
 int KYTY_SYSV_ABI Getsockname(int s, void* addr, uint32_t* addrlen) {

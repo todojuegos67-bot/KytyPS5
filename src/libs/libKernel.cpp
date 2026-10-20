@@ -2011,6 +2011,11 @@ int KYTY_SYSV_ABI listen(int s, int backlog) {
 	return Network::Net::Listen(s, backlog);
 }
 
+int KYTY_SYSV_ABI shutdown(int s, int how) {
+	PRINT_NAME();
+	return Network::Net::Shutdown(s, how);
+}
+
 int KYTY_SYSV_ABI accept(int s, void* addr, uint32_t* addrlen) {
 	PRINT_NAME();
 	return Network::Net::Accept(s, addr, addrlen);
@@ -2239,6 +2244,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("KuOmgKoqCdY", Posix::bind);
 	LIB_FUNC("XVL8So3QJUk", Posix::connect);
 	LIB_FUNC("pxnCmagrtao", Posix::listen);
+	LIB_FUNC("TUuiYS2kE8s", Posix::shutdown);
 	LIB_FUNC("3e+4Iv7IJ8U", Posix::accept);
 	LIB_FUNC("RenI1lL1WFk", Posix::getsockname);
 	LIB_FUNC("6O8EwYOgH9Y", Posix::getsockopt);
@@ -3153,6 +3159,7 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("nKWi-N2HBV4", FileSystem::KernelPwrite);
 	LIB_FUNC("eV9wAD2riIA", FileSystem::KernelStat);
 	LIB_FUNC("kBwCPsYX-m4", FileSystem::KernelFstat);
+	LIB_FUNC("WlyEA-sLDf0", FileSystem::KernelTruncate);
 	LIB_FUNC("AUXVxWeJU-A", FileSystem::KernelUnlink);
 	LIB_FUNC("52NcYU9+lEo", FileSystem::KernelRename);
 	LIB_FUNC("taRWhTJFTgE", FileSystem::KernelGetdirentries);

@@ -1101,6 +1101,67 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
+	PRINT_NAME();
+	if (path == nullptr) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	if (path[0] != '/' || length < 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	size_t component_length = 0;
+	for (size_t i = 0; path[i] != '\0'; ++i) {
+		if (i >= 1023) {
+			return KERNEL_ERROR_ENAMETOOLONG;
+		}
+		if (path[i] == '/') {
+			component_length = 0;
+		} else if (++component_length > 255) {
+			return KERNEL_ERROR_ENAMETOOLONG;
+		}
+	}
+	if (IsRandomDevice(path)) {
+		return OK;
+	}
+	const auto real_name = g_mount_points->ResolvePath(path);
+	if (real_name.empty()) {
+		return KERNEL_ERROR_ENOENT;
+	}
+	if (Common::IsArchivePath(real_name)) {
+		return KERNEL_ERROR_EROFS;
+	}
+
+	std::error_code error;
+	const auto      status = std::filesystem::status(real_name, error);
+	if (!error) {
+		if (!std::filesystem::exists(status)) {
+			return KERNEL_ERROR_ENOENT;
+		}
+		if (std::filesystem::is_directory(status)) {
+			return KERNEL_ERROR_EISDIR;
+		}
+		if (std::filesystem::is_regular_file(status)) {
+			std::filesystem::resize_file(real_name, static_cast<uint64_t>(length), error);
+		}
+	}
+	if (error) {
+		switch (static_cast<std::errc>(error.default_error_condition().value())) {
+			case std::errc::no_such_file_or_directory: return KERNEL_ERROR_ENOENT;
+			case std::errc::not_a_directory: return KERNEL_ERROR_ENOTDIR;
+			case std::errc::filename_too_long: return KERNEL_ERROR_ENAMETOOLONG;
+			case std::errc::permission_denied: return KERNEL_ERROR_EACCES;
+			case std::errc::read_only_file_system: return KERNEL_ERROR_EROFS;
+			case std::errc::file_too_large: return KERNEL_ERROR_EFBIG;
+			case std::errc::invalid_argument: return KERNEL_ERROR_EINVAL;
+			case std::errc::no_space_on_device: return KERNEL_ERROR_ENOSPC;
+			default: return KERNEL_ERROR_EIO;
+		}
+	}
+	LOGF("\tTruncate (size = %" PRId64 ") file: %s\n", length,
+	     Common::PathToString(real_name).c_str());
+	return OK;
+}
+
 int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	PRINT_NAME();
 
