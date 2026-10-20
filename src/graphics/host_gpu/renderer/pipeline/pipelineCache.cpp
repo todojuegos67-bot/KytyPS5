@@ -1741,14 +1741,19 @@ struct PipelineCache::ProgramCache {
 			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 			translate_ms = front_ms;
 			if (entry == programs.end()) {
-				auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-				if (!ReportMaterialization(label, stage, params.hash, report,
-				                           ShaderRecompiler::IR::MaterializeResources(
-				                               resource_plan, runtime, resources, specialization, &report)))
-					return {};
-				entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+				// The plan is the program's, whatever this dispatch's tables hold: kept even when they do not
+				// materialize, so the next dispatch of the program only materializes again (the existing-entry
+				// path above) instead of translating it again. Dropping it made every skipped dispatch of a program
+				// whose tables never evaluate (silent after the first log lines: Astro Bot's BVH/FLAT-stack
+				// compute shaders, ~75 ms of translation a frame) pay a full TranslateProgram.
+				entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
 				entry->second.plan_use      = plan_clock;
 				entry->second.source_digest = SourceDigest(params.code, params.back_code);
+				if (!ReportMaterialization(label, stage, params.hash, report,
+				                           ShaderRecompiler::IR::MaterializeResources(
+				                               entry->second.resource_plan, runtime, resources, specialization,
+				                               &report)))
+					return {};
 			}
 			// A specialization met for the first time whose formatted buffers can decode their formats at
 			// run time gets the portable module (IR::PortableFormats) under its own specialization: the
