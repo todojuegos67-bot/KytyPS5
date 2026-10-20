@@ -2882,13 +2882,14 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 	static vk::Extent2D options_render {}, options_output {};
 	if (options_render != inputs.color.extent || options_output != inputs.output.extent) {
 		// The mode by the input's share of the output's height (DLSS takes any input size; the mode picks its model and
-		// limits): PS5 Pro's 1512 of 2160 and 1440 are quality, 1080 performance, the output's own DLAA.
+		// limits): PS5 Pro's 1512 of 2160 and 1440 are quality, 1080 performance, the output's own DLAA; below half
+		// the output (performance's least, 1080 of 2160) ultra performance, down to its third (720).
 		const double share = static_cast<double>(inputs.color.extent.height) / inputs.output.extent.height;
 		sl::DLSSOptions options {};
 		options.mode = share >= 0.95   ? sl::DLSSMode::eDLAA
 		               : share >= 0.62 ? sl::DLSSMode::eMaxQuality
 		               : share >= 0.55 ? sl::DLSSMode::eBalanced
-		               : share >= 0.45 ? sl::DLSSMode::eMaxPerformance
+		               : share >= 0.5  ? sl::DLSSMode::eMaxPerformance
 		                               : sl::DLSSMode::eUltraPerformance;
 		options.outputWidth     = inputs.output.extent.width;
 		options.outputHeight    = inputs.output.extent.height;

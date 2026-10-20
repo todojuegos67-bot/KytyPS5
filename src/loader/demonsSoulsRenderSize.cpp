@@ -6,6 +6,7 @@
 #include "loader/elf.h"
 #include "loader/guestCode.h"
 #include "loader/runtimeLinker.h"
+#include "local/local-platform.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -138,7 +139,9 @@ uint32_t WideOutputWidth() {
 void Install(Program* program) {
 	const char* setting = std::getenv("KYTY_RENDER_HEIGHT");
 	const char* wide    = std::getenv("KYTY_RENDER_ASPECT");
-	if (((setting == nullptr || *setting == 0) && (wide == nullptr || *wide == 0)) || program == nullptr ||
+	const char* ratio_s = std::getenv("KYTY_UPSCALE_RATIO");
+	const bool  by_ratio = (setting == nullptr || *setting == 0) && ratio_s != nullptr && *ratio_s != 0;
+	if (((setting == nullptr || *setting == 0) && !by_ratio && (wide == nullptr || *wide == 0)) || program == nullptr ||
 	    !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin")
 		return;
 	// (The game's super resolution path: display mode 5 is the performance mode, loader/demonsSoulsSuperResolution.h.)
@@ -148,11 +151,31 @@ void Install(Program* program) {
 	const int      mode        = trinity ? TrinityMode : PerformanceMode;
 	auto requested = setting != nullptr && *setting != 0 ? static_cast<uint32_t>(std::strtoul(setting, nullptr, 10))
 	                                                     : game_height;
+	// KYTY_UPSCALE_RATIO=<1..4> (the launcher's DLSS/FSR/XeSS presets: DLAA 1.0, Quality 1.5, Balanced 1.72,
+	// Performance 2.0, Ultra Performance 3.0) with no KYTY_RENDER_HEIGHT: the render height is the monitor's own height
+	// (the primary display's current mode; KYTY_DISPLAY_HEIGHT=<n> overrides it) over the ratio, so the 3D renders at
+	// what the preset means for that monitor. The game's upscaler output stays 3840x2160 (its frame after it, the HUD
+	// and the composite are made for it), the presenter scales that to the window; within 720-2160.
+	if (by_ratio) {
+		const double ratio   = std::strtod(ratio_s, nullptr);
+		const char*  forced  = std::getenv("KYTY_DISPLAY_HEIGHT");
+		uint32_t     display = forced != nullptr && *forced != 0 ? static_cast<uint32_t>(std::strtoul(forced, nullptr, 10))
+		                                                         : LocalPlatform::DisplayHeight(nullptr);
+		if (display == 0) display = OutputHeight;
+		if (ratio >= 1.0 && ratio <= 4.0) {
+			const auto height = static_cast<uint32_t>(std::lround(display / ratio));
+			requested         = std::clamp<uint32_t>(height, 720, OutputHeight);
+			std::printf("Demon's Souls render size: KYTY_UPSCALE_RATIO=%s on a %u high display: %u%s\n", ratio_s, display,
+			            requested, requested != height ? " (720-2160)" : "");
+		} else {
+			std::printf("Demon's Souls render size: KYTY_UPSCALE_RATIO=%s is not 1-4; ignored\n", ratio_s);
+		}
+	}
 	const auto aspect    = wide != nullptr && *wide != 0 ? ParseAspect(wide) : 0.0;
 	if (wide != nullptr && *wide != 0 && aspect == 0.0)
 		std::printf("Demon's Souls render size: KYTY_RENDER_ASPECT=%s is not wider than 16:9 and at most 32:9; 16:9 kept\n",
 		            wide);
-	if (trinity && requested >= 720 && requested < SuperResolutionLeastHeight) {
+	if (trinity && !DemonsSoulsSuperResolution::AnyHeight() && requested >= 720 && requested < SuperResolutionLeastHeight) {
 		std::printf("Demon's Souls render size: KYTY_RENDER_HEIGHT=%u is below the game's super resolution (1080 at "
 		            "least); 1080 instead\n",
 		            requested);

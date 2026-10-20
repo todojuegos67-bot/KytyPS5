@@ -14,7 +14,7 @@ struct Program;
 // Unset or 1440: the game as it is. The game's own 1080p output modes (r_Wants4K 1 and 2) are no option: their UI
 // keeps the 4K layout (off screen). With the game's super resolution path on (KYTY_UPSCALER,
 // loader/demonsSoulsSuperResolution.h) the performance mode is display mode 5: the height sizes its 3D instead
-// (unset: the PS5 Pro's 2688x1512; at least 1080), the upscaler making the 3840x2160 image from it.
+// (unset: the PS5 Pro's 2688x1512; 720-2160, the game's 1080 least patched out: DemonsSoulsSuperResolution::AnyHeight), the upscaler making the 3840x2160 image from it.
 // KYTY_RENDER_ASPECT=<w>:<h> (run-windows.ps1 -Aspect, the launcher's "Aspect ratio"; 21:9 is taken as 64:27): the 3D
 // rendered wider than 16:9, up to 32:9, at the render height - 3416x1440 for 21:9 - and its projection's aspect (the
 // render setup's 16:9, AspectStore) to match: more of the world to the sides, not a stretched 16:9 view. The game's
@@ -44,7 +44,7 @@ inline constexpr uint32_t         OutputWidth = 3840, OutputHeight = 2160, Rende
 // the super resolution flag set, then the jump (01.007.000).
 inline constexpr std::string_view TrinityCase = "c5 fb 10 0d ?? ?? ?? ?? c5 fb 10 05 ?? ?? ?? ?? c6 45 ?? 01 eb";
 inline constexpr uint32_t         TrinityWidth = 2688, TrinityHeight = 1512;
-// The least render height the game's super resolution runs at (SuperResolution::IsEnabled).
+// The least render height the game's super resolution runs at (SuperResolution::IsEnabled) when its check is kept.
 inline constexpr uint32_t SuperResolutionLeastHeight = 1080;
 // The wide output's places (01.007.000, DemonsSoulsRenderSize.cpp InstallWideOutput):
 // - display mode 4's cases (Cinematic), loading its 3D size and output from the modes' shared 3840x2160 output pair:
