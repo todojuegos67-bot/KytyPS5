@@ -744,6 +744,13 @@ void Swapchain::Create() {
 		               surface.capabilities.maxImageExtent.height);
 	}
 	uint32_t image_count = surface.capabilities.minImageCount + 1;
+	// KYTY_FLIP_WHEN_READY: the shortest FIFO queue (2 images, or the surface's minimum) so a frame is shown the
+	// refresh after it is done, not 1-2 queued presents later (with G-SYNC the display follows each present).
+	// KYTY_SWAPCHAIN_IMAGES=N overrides the count (clamped to the surface's limits).
+	if (VideoOut::FlipWhenReady()) image_count = std::max(2u, surface.capabilities.minImageCount);
+	if (const char* value = std::getenv("KYTY_SWAPCHAIN_IMAGES"); value != nullptr && std::atoi(value) > 0) {
+		image_count = std::max(static_cast<uint32_t>(std::atoi(value)), surface.capabilities.minImageCount);
+	}
 	// KYTY_FRAMEGEN: DLSS-G holds the presented image while it generates and shows its frames (one more per generated
 	// frame); with the minimum the acquire of the next image waited for them, and the flip (done when the present
 	// returns) with it: the game then waited for the flip (log 032429: 32 % of the render thread in WaitFlipDone).
@@ -1126,6 +1133,7 @@ Swapchain::Status Swapchain::Present() {
 		result = graphics.queue.presentKHR(&present);
 	}
 	VideoOut::NotePace(1);
+	VideoOut::NotePresentDone();
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:

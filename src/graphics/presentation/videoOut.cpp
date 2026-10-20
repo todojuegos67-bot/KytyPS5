@@ -217,7 +217,7 @@ public:
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot();
-	bool Flip(uint32_t micros);
+	bool Flip(uint32_t micros, bool when_ready = false);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
 
@@ -231,6 +231,7 @@ private:
 		int                         index;
 		int64_t                     flip_arg;
 		uint64_t                    submit_ptc;
+		std::chrono::steady_clock::time_point submit_time;
 		FlipRequestSource           source;
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
@@ -257,6 +258,9 @@ public:
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 		Init(width, height);
 		m_present_thread = std::jthread([this](std::stop_token token) { PresentThread(token); });
+		if (FlipWhenReady()) {
+			m_ready_thread = std::jthread([this](std::stop_token token) { ReadyThread(token); });
+		}
 	}
 	~Impl();
 	KYTY_CLASS_NO_COPY(Impl);
@@ -275,6 +279,7 @@ public:
 	void VblankBegin();
 	void VblankEnd();
 	void PresentThread(std::stop_token token);
+	void ReadyThread(std::stop_token token);
 
 private:
 	Common::Mutex            m_mutex;
@@ -283,6 +288,7 @@ private:
 	Graphics::Presenter&     m_presenter;
 	FlipQueue                m_flip_queue;
 	std::jthread             m_present_thread;
+	std::jthread             m_ready_thread; // KYTY_FLIP_WHEN_READY
 };
 
 static std::unique_ptr<VideoOutDriver> g_video_out_driver;
@@ -704,6 +710,18 @@ static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, int 
 	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
 }
 
+// KYTY_FLIP_WHEN_READY: no vblank grid. A floor (non-3D frames, KYTY_FLIP_FPS, the game's own flip rate) is kept
+// only as a minimum number of vblanks since the last flip; with none (an unlocked 3D frame) the flip is always due,
+// so the present time follows the frame's completion and is never rounded to a vblank tick.
+static bool IsFlipDueReadyLocked(const VideoOutConfig& cfg, uint64_t generation, int floor) {
+	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
+		return false;
+	}
+	const int need = std::max(floor, cfg.flip_rate);
+	if (need <= 0) return true;
+	return cfg.vblank_status.count - cfg.last_flip_vblank >= static_cast<uint64_t>(need) + 1u;
+}
+
 static bool IsValidBufferIndex(int index) {
 	return index >= VIDEO_OUT_BUFFER_INDEX_BLACK && index < VIDEO_OUT_BUFFER_NUM_MAX;
 }
@@ -814,6 +832,10 @@ void VideoOutShutdown() {
 }
 
 VideoOutDriver::Impl::~Impl() {
+	if (m_ready_thread.joinable()) {
+		m_ready_thread.request_stop();
+		m_ready_thread.join();
+	}
 	if (m_present_thread.joinable()) {
 		m_present_thread.request_stop();
 		m_present_thread.join();
@@ -997,6 +1019,20 @@ void VideoOutDriver::Impl::VblankEnd() {
 	}
 }
 
+void VideoOutDriver::Impl::ReadyThread(std::stop_token token) {
+	KYTY_PROFILER_THREAD("Kyty.FlipReady");
+	while (!token.stop_requested()) {
+		if (m_presenter.IsGuestPaused()) {
+			Common::Thread::SleepMicro(1000);
+			continue;
+		}
+		if (!m_flip_queue.Flip(2000, true)) {
+			// Nothing ready, or held by a floor / pacing: retry shortly (the floors are counted in vblanks).
+			Common::Thread::SleepMicro(250);
+		}
+	}
+}
+
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
@@ -1099,7 +1135,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		}
 
 		VblankBegin();
-		bool presented = m_flip_queue.Flip(0);
+		bool presented = FlipWhenReady() ? false : m_flip_queue.Flip(0);
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh() && m_presenter.PresentIdle()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
 				m_presenter.Submit(*frame, true);
@@ -1158,6 +1194,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	r.index      = index;
 	r.flip_arg   = flip_arg;
 	r.submit_ptc = LibKernel::KernelGetProcessTimeCounter();
+	r.submit_time = std::chrono::steady_clock::now();
 	r.source     = source;
 	r.state      = RequestState::Reserved;
 
@@ -1412,7 +1449,16 @@ bool FlipQueue::Flip(uint32_t micros) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
 	m_mutex.Lock();
-	if (m_requests.empty()) {
+	if (when_ready) {
+		// KYTY_FLIP_WHEN_READY: wait for the front request's GPU work (Complete signals), not for a vblank.
+		if (m_requests.empty() || m_requests.front().state != RequestState::Ready) {
+			m_submit_cond_var.WaitFor(&m_mutex, micros);
+		}
+		if (m_requests.empty() || m_requests.front().state != RequestState::Ready) {
+			m_mutex.Unlock();
+			return false;
+		}
+	} else if (m_requests.empty()) {
 		m_submit_cond_var.WaitFor(&m_mutex, micros);
 
 		if (m_requests.empty()) {
@@ -1464,7 +1510,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 	const auto   paced_slack    = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
 	                                  std::chrono::duration<double>(0.5 / std::max(Config::GetVblankFrequency(), 1u)));
 	const bool   paced_wait     = paced_interval > 0.0 && paced_now + paced_slack < s_paced_next;
-	if (paced_wait || !IsFlipDueLocked(*r.cfg, r.generation, floor)) {
+	const bool due = when_ready ? IsFlipDueReadyLocked(*r.cfg, r.generation, floor) : IsFlipDueLocked(*r.cfg, r.generation, floor);
+	if (paced_wait || !due) {
 		r.cfg->mutex.Unlock();
 		Common::LockGuard queue_lock(m_mutex);
 		m_processing = false;
@@ -1485,6 +1532,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	// own copy; a port closed meanwhile takes no status or event.
 	r.cfg->mutex.Unlock();
 
+	NoteFlipSubmitted(r.submit_time);
 	m_presenter.Submit(*r.frame);
 
 	r.cfg->mutex.Lock();
@@ -2210,6 +2258,75 @@ KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* s
 	ctx->mutex.Unlock();
 
 	return OK;
+}
+
+// KYTY_FLIP_WHEN_READY=1 (run-windows.ps1 -FlipWhenReady): a guest flip is presented as soon as its GPU work is done
+// (FlipQueue::Complete) by its own thread (ReadyThread), not at the next virtual vblank; the vblanks (events, counters)
+// keep ticking as before, so the game's timing is the same.
+bool FlipWhenReady() noexcept {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_FLIP_WHEN_READY");
+		const bool  r     = value != nullptr && value[0] == '1';
+		if (r) {
+			std::printf("Flips: presented when ready (KYTY_FLIP_WHEN_READY=1), not on vblank ticks\n");
+			std::fflush(stdout);
+		}
+		return r;
+	}();
+	return on;
+}
+
+namespace {
+struct PresentTiming {
+	std::mutex                            mutex;
+	std::chrono::steady_clock::time_point pending {};
+	std::chrono::steady_clock::time_point last_present {};
+	double                                lat_sum = 0, lat_sq = 0, int_sum = 0, int_sq = 0;
+	uint32_t                              lat_n = 0, int_n = 0;
+};
+PresentTiming g_present_timing;
+} // namespace
+
+void NoteFlipSubmitted(std::chrono::steady_clock::time_point submit_time) noexcept {
+	std::lock_guard lock(g_present_timing.mutex);
+	g_present_timing.pending = submit_time;
+}
+
+void NotePresentDone() noexcept {
+	const auto      now = std::chrono::steady_clock::now();
+	auto&           t   = g_present_timing;
+	std::lock_guard lock(t.mutex);
+	if (t.pending.time_since_epoch().count() != 0) {
+		const double ms = std::chrono::duration<double, std::milli>(now - t.pending).count();
+		t.lat_sum += ms;
+		t.lat_sq += ms * ms;
+		t.lat_n++;
+		t.pending = {};
+		if (t.last_present.time_since_epoch().count() != 0) {
+			const double iv = std::chrono::duration<double, std::milli>(now - t.last_present).count();
+			if (iv < 250.0) {
+				t.int_sum += iv;
+				t.int_sq += iv * iv;
+				t.int_n++;
+			}
+		}
+		t.last_present = now;
+	}
+}
+
+bool TakePresentTiming(double& lat_mean, double& lat_sd, double& int_mean, double& int_sd) noexcept {
+	auto&           t   = g_present_timing;
+	std::lock_guard lock(t.mutex);
+	auto            msd = [](double sum, double sq, uint32_t n, double& mean, double& sd) {
+        mean = n != 0 ? sum / n : 0.0;
+        sd   = n > 1 ? std::sqrt(std::max(0.0, sq / n - mean * mean)) : 0.0;
+	};
+	const bool any = t.lat_n != 0;
+	msd(t.lat_sum, t.lat_sq, t.lat_n, lat_mean, lat_sd);
+	msd(t.int_sum, t.int_sq, t.int_n, int_mean, int_sd);
+	t.lat_sum = t.lat_sq = t.int_sum = t.int_sq = 0;
+	t.lat_n = t.int_n = 0;
+	return any;
 }
 
 } // namespace Libs::VideoOut

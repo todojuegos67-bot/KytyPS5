@@ -7,6 +7,7 @@
 #include "common/abi.h"
 #include "kernel/eventQueue.h"
 
+#include <chrono>
 #include <memory>
 
 namespace Libs::Graphics {
@@ -31,6 +32,12 @@ bool PlayerInputSeen() noexcept;
 // KYTY_PACE_STATS (default 1): every 5 s in a world, how evenly the game asks for flips (kind 0) and how evenly
 // they reach the screen (kind 1), and how far the two disagree frame by frame (what the eye sees as roughness).
 void NotePace(int kind) noexcept;
+// KYTY_FLIP_WHEN_READY=1: guest flips presented when their GPU work completes, not on virtual vblank ticks.
+bool FlipWhenReady() noexcept;
+// [fps] diagnostics: guest flip submit -> vkQueuePresentKHR return, and the interval between those presents.
+void NoteFlipSubmitted(std::chrono::steady_clock::time_point submit_time) noexcept;
+void NotePresentDone() noexcept;
+bool TakePresentTiming(double& lat_mean, double& lat_sd, double& int_mean, double& int_sd) noexcept;
 
 struct VideoOutBufferAttribute2;
 struct VideoOutFlipStatus;
