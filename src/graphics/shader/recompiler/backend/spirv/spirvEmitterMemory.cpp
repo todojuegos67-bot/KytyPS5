@@ -942,11 +942,13 @@ void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 
 uint32_t SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
-		case IR::ValueOpcode::BufferAtomicCmpSwap32: return OpAtomicCompareExchange;
+		case IR::ValueOpcode::BufferAtomicCmpSwap32:
+		case IR::ValueOpcode::SharedAtomicCmpSwap32: return OpAtomicCompareExchange;
 		case IR::ValueOpcode::BufferAtomicSwap32:
 		case IR::ValueOpcode::BufferAtomicSwap64:
 		case IR::ValueOpcode::SharedAtomicSwap32: return OpAtomicExchange;
 		case IR::ValueOpcode::BufferAtomicIAdd32:
+		case IR::ValueOpcode::BufferAtomicIAdd64:
 		case IR::ValueOpcode::SharedAtomicIAdd32: return OpAtomicIAdd;
 		case IR::ValueOpcode::BufferAtomicISub32:
 		case IR::ValueOpcode::SharedAtomicISub32: return OpAtomicISub;
@@ -972,9 +974,14 @@ uint32_t SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t pointer,
                              uint32_t scope) {
 	const auto old = ctx.state.builder.AllocateId();
-	if (inst.GetOpcode() == IR::ValueOpcode::BufferAtomicCmpSwap32) {
-		const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
-		const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+	if (inst.GetOpcode() == IR::ValueOpcode::BufferAtomicCmpSwap32 ||
+	    inst.GetOpcode() == IR::ValueOpcode::SharedAtomicCmpSwap32) {
+		auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
+		auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+		if (inst.GetOpcode() == IR::ValueOpcode::SharedAtomicCmpSwap32) {
+			// RDNA2 DS compares DATA and stores DATA2, opposite to BUFFER atomics.
+			std::swap(desired, comparator);
+		}
 		ctx.state.builder.AddFunction(
 		    {OpAtomicCompareExchange, TypeU32(ctx.state), old, pointer, ConstantU32(ctx.state, scope),
 		     ConstantU32(ctx.state, MemorySemanticsNone),

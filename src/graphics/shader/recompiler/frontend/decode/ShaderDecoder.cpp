@@ -622,6 +622,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_UMAX:
 		case Opcode::BUFFER_ATOMIC_AND:
 		case Opcode::BUFFER_ATOMIC_OR:
+		case Opcode::BUFFER_ATOMIC_ADD_X2:
 		case Opcode::BUFFER_ATOMIC_OR_X2:
 		case Opcode::BUFFER_ATOMIC_XOR:
 		case Opcode::BUFFER_ATOMIC_FMIN:
@@ -663,6 +664,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_XOR_B32:
 		case Opcode::DS_XOR_RTN_B32:
 		case Opcode::DS_WRXCHG_RTN_B32:
+		case Opcode::DS_CMPST_RTN_B32:
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32:
 		case Opcode::DS_SWIZZLE_B32:

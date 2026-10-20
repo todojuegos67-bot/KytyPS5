@@ -239,6 +239,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 				return index == 0u ? decoded.src1 : MakeM0Operand();
 			case Decoder::Opcode::DS_MIN_F32:
 			case Decoder::Opcode::DS_MAX_F32:
+			case Decoder::Opcode::DS_CMPST_RTN_B32:
 				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
 			case Decoder::Opcode::DS_WRITE_B8:
 			case Decoder::Opcode::DS_WRITE_B16:
@@ -962,6 +963,8 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicAnd32);
 		case Decoder::Opcode::BUFFER_ATOMIC_OR:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicOr32);
+		case Decoder::Opcode::BUFFER_ATOMIC_ADD_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicIAdd64);
 		case Decoder::Opcode::BUFFER_ATOMIC_OR_X2:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicOr64);
 		case Decoder::Opcode::BUFFER_ATOMIC_XOR:
@@ -1013,6 +1016,16 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicXor32, true);
 		case Decoder::Opcode::DS_WRXCHG_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSwap32, true);
+		case Decoder::Opcode::DS_CMPST_RTN_B32: {
+			// LDS[addr] = LDS[addr] == DATA ? DATA2 : LDS[addr]; returns the old value.
+			const auto memory = MemoryInfoFromDecoded(inst);
+			const auto result = ir.Emit(IR::ValueOpcode::SharedAtomicCmpSwap32,
+			                            {ReadU32(MemorySourceAt(inst, 1)), ReadU32(MemorySourceAt(inst, 0)),
+			                             ReadU32(MemorySourceAt(inst, 2)), ir.GetExec()},
+			                            AddMemoryInfo(memory, inst.pc));
+			WriteOperand(inst.dst, result);
+			return true;
+		}
 
 		case Decoder::Opcode::IMAGE_ATOMIC_SWAP:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSwap32);

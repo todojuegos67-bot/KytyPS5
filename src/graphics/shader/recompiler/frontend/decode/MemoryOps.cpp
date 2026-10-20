@@ -60,6 +60,7 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x3fu, Opcode::BUFFER_ATOMIC_FMIN, 1, 32},
     {0x40u, Opcode::BUFFER_ATOMIC_FMAX, 1, 32},
     {0x50u, Opcode::BUFFER_ATOMIC_SWAP_X2, 2, 32},
+    {0x52u, Opcode::BUFFER_ATOMIC_ADD_X2, 2, 32},
     {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
 };
 
@@ -99,6 +100,7 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x27u, Opcode::DS_MIN_RTN_U32, 1, 32},      {0x28u, Opcode::DS_MAX_RTN_U32, 1, 32},
     {0x29u, Opcode::DS_AND_RTN_B32, 1, 32},      {0x2au, Opcode::DS_OR_RTN_B32, 1, 32},
     {0x2bu, Opcode::DS_XOR_RTN_B32, 1, 32},      {0x2du, Opcode::DS_WRXCHG_RTN_B32, 1, 32},
+    {0x30u, Opcode::DS_CMPST_RTN_B32, 1, 32},
     {0x35u, Opcode::DS_SWIZZLE_B32, 1, 32},      {0x36u, Opcode::DS_READ_B32, 1, 32},
     {0x37u, Opcode::DS_READ2_B32, 2, 32},        {0x38u, Opcode::DS_READ2ST64_B32, 2, 32},
     {0x39u, Opcode::DS_READ_I8, 1, 8, true},     {0x3au, Opcode::DS_READ_U8, 1, 8},
@@ -182,7 +184,8 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_OR_RTN_B32:
 		case Opcode::DS_XOR_B32:
 		case Opcode::DS_XOR_RTN_B32:
-		case Opcode::DS_WRXCHG_RTN_B32: return true;
+		case Opcode::DS_WRXCHG_RTN_B32:
+		case Opcode::DS_CMPST_RTN_B32: return true;
 		default: return false;
 	}
 }
@@ -194,7 +197,8 @@ uint32_t DsSourceCount(Opcode opcode) {
 		case Opcode::DS_WRITE2_B64:
 		case Opcode::DS_WRITE2ST64_B64:
 		case Opcode::DS_MIN_F32:
-		case Opcode::DS_MAX_F32: return 3u;
+		case Opcode::DS_MAX_F32:
+		case Opcode::DS_CMPST_RTN_B32: return 3u;
 		case Opcode::DS_BPERMUTE_B32: return 2u;
 		case Opcode::DS_READ_ADDTID_B32:
 		case Opcode::DS_CONSUME:
@@ -395,6 +399,9 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	     inst.opcode == Opcode::DS_WRITE_ADDTID_B32 ||
 	     inst.opcode == Opcode::DS_READ_ADDTID_B32)) {
 		SetUnsupported(inst, Family::DS, opcode, "DS lane operation is available only for LDS");
+	}
+	if (inst.gds && inst.opcode == Opcode::DS_CMPST_RTN_B32) {
+		SetUnsupported(inst, Family::DS, opcode, "DS compare-store return B32 GDS variant is not implemented");
 	}
 	if (inst.opcode == Opcode::DS_WRITE_ADDTID_B32 && data1 != 0u) {
 		SetUnsupported(inst, Family::DS, opcode,
