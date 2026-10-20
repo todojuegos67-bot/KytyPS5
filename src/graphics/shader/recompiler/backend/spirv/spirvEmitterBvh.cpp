@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <span>
 #include <utility>
 #include <vector>
@@ -238,6 +239,17 @@ uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
 	return Vector(s, TypeU32Vector(s, 4), indices);
 }
 
+// Watchdog for the game's own traversal loop: once an invocation has made more than KYTY_BVH_LOOP_CAP
+// intersections (default 4096, 0 disables), every further one returns all-0xFFFFFFFF (no children / invalid),
+// which ends the traversal naturally instead of hanging the GPU (device lost).
+uint32_t BvhLoopCap() {
+	static const uint32_t cap = [] {
+		const char* value = std::getenv("KYTY_BVH_LOOP_CAP");
+		return value == nullptr ? 4096u : static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
+	}();
+	return cap;
+}
+
 } // namespace
 
 void DefineBvhIntersect(EmitterState& s) {
@@ -360,12 +372,29 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto extent = Unary(s, OpBitcast, TypeF32(s), ctx.Arg(*ray, node_words));
 	const auto origin = vector(node_words + 1u), direction = vector(node_words + 4u),
 	           inverse = vector(node_words + 7u);
-	return EmitValueOrDefaultIfCondition(s, ctx.Arg(inst, 2), TypeU32Vector(s, 4),
-	    ConstantU32CompositeZero(s, 4), [&] {
+	const auto call = [&] {
 		const auto result = s.builder.AllocateId();
 		s.builder.AddFunction({OpFunctionCall, TypeU32Vector(s, 4), result,
 		    s.bvh_intersect_function, descriptor, node, extent, origin, direction, inverse});
 		return result;
+	};
+	const auto cap = BvhLoopCap();
+	return EmitValueOrDefaultIfCondition(s, ctx.Arg(inst, 2), TypeU32Vector(s, 4),
+	    ConstantU32CompositeZero(s, 4), [&] {
+		if (cap == 0) return call();
+		if (s.bvh_counter_variable == 0) {
+			s.bvh_counter_variable = s.builder.DefineInitializedVariable(
+			    TypePointer(s, StorageClassPrivate, TypeU32(s)), StorageClassPrivate, ConstantU32(s, 0));
+			s.builder.AddName(s.bvh_counter_variable, "bvh_watchdog");
+		}
+		const auto count = s.builder.AllocateId();
+		s.builder.AddFunction({OpLoad, TypeU32(s), count, s.bvh_counter_variable});
+		const auto next = Binary(s, OpIAdd, TypeU32(s), count, ConstantU32(s, 1));
+		s.builder.AddFunction({OpStore, s.bvh_counter_variable, next});
+		const auto within = Binary(s, OpULessThanEqual, TypeBool(s), next, ConstantU32(s, cap));
+		const std::array none {ConstantU32(s, ~0u), ConstantU32(s, ~0u), ConstantU32(s, ~0u), ConstantU32(s, ~0u)};
+		return EmitValueOrDefaultIfCondition(s, within, TypeU32Vector(s, 4),
+		    Vector(s, TypeU32Vector(s, 4), none), call);
 	});
 }
 
