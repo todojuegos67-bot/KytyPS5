@@ -1,9 +1,6 @@
 #include "graphics/drawDiff.h"
 #include "graphics/frameCosts.h"
 #include "graphics/guest_gpu/graphicsRun.h"
-#ifdef KYTY_LOCAL_VULKAN_RECORDING
-#include "local/vulkan-recording.h"
-#endif
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -218,10 +215,6 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
-#ifdef KYTY_LOCAL_VULKAN_RECORDING
-	// The caller may hand its command buffer to the GPU thread: its recorded commands first.
-	LocalVulkanRecording::Drain();
-#endif
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_commands.push_back(std::move(command));
@@ -363,10 +356,6 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
-#ifdef KYTY_LOCAL_VULKAN_RECORDING
-	// The caller may hand its command buffer to the GPU thread: its recorded commands first.
-	LocalVulkanRecording::Drain();
-#endif
 	std::binary_semaphore done {0};
 	SendCommand([operation = std::move(command), &done]() mutable {
 		operation();
@@ -794,9 +783,6 @@ void GuestGpu::ThreadRun(void* data) {
 	ThreadSampler::RegisterCurrentThread("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
-#ifdef KYTY_LOCAL_VULKAN_RECORDING
-	LocalVulkanRecording::ProducerScope recording;
-#endif
 
 	for (;;) {
 		Submission                   submission;

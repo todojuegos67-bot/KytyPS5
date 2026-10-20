@@ -866,21 +866,6 @@ if(APPLE)
 endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
-
-# Vulkan commands recorded on a worker thread (KYTY_VULKAN_RECORDING=1, from the Demon's Souls engine).
-if(WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-	find_package(Python3 REQUIRED COMPONENTS Interpreter)
-	set(recording_generated "${CMAKE_CURRENT_BINARY_DIR}/local-vulkan-recording.inc")
-	add_custom_command(OUTPUT "${recording_generated}"
-		COMMAND "${Python3_EXECUTABLE}" "${KYTY_SOURCE_DIR}/local/generate-vulkan-recording.py"
-			"${KYTY_THIRD_PARTY_DIR}/Vulkan-Headers/registry/vk.xml"
-			"${KYTY_THIRD_PARTY_DIR}/Vulkan-Headers/include/vulkan/vulkan.hpp" "${recording_generated}"
-		DEPENDS "${KYTY_SOURCE_DIR}/local/generate-vulkan-recording.py"
-		VERBATIM)
-	target_sources(kyty_emulator PRIVATE "${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}")
-	target_include_directories(kyty_emulator PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-	target_compile_definitions(kyty_emulator PRIVATE KYTY_LOCAL_VULKAN_RECORDING=1)
-endif()
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
 
