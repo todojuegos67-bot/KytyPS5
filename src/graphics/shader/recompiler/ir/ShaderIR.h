@@ -648,6 +648,7 @@ struct CompiledShaderInfo {
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
 	bool                          table_mode          = false; // see Program::table_mode
+	bool                          has_bvh             = false; // see Program::has_bvh
 	TablePlan                     table_plan;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
@@ -714,6 +715,8 @@ struct Program: ResourcePlan {
 	std::vector<uint32_t>         cooperative_reads;
 	std::vector<uint32_t>         cooperative_branches;
 	uint32_t                      scratch_dwords = 0;
+	// It has IMAGE_BVH_INTERSECT_RAY (BvhIntersect): its dispatches are skipped unless KYTY_SKIP_BVH_DISPATCHES=0.
+	bool                          has_bvh        = false;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;

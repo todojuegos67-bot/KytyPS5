@@ -57,6 +57,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 extern volatile std::atomic<uint32_t> kyty_local_fill_clear_mode; // (textureCache.cpp)
@@ -851,6 +852,31 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			            indirect_args != 0 ? "an indirect" : "a", groups[0], groups[1], groups[2], unevaluated.c_str());
 		ResetBindings();
 		return;
+	}
+	if (compute_program && input_info.stage.program != nullptr && input_info.stage.program->has_bvh) {
+		// As the Wolverine fork: KYTY_SKIP_BVH_DISPATCHES (default 1; 0 executes them) skips the dispatches of
+		// programs with BVH intersections (IMAGE_BVH_INTERSECT_RAY); their software traversal loses the device
+		// in Astro Bot right after its intro video.
+		static const bool skip_bvh = [] {
+			const char* value = std::getenv("KYTY_SKIP_BVH_DISPATCHES");
+			return value == nullptr || std::strcmp(value, "0") != 0;
+		}();
+		if (skip_bvh) {
+			const uint64_t hash = input_info.stage.program->shader_hash;
+			static std::mutex                   warned_mutex;
+			static std::unordered_set<uint64_t> warned;
+			bool                                first = false;
+			{
+				std::lock_guard lock(warned_mutex);
+				first = warned.insert(hash).second;
+			}
+			if (first)
+				std::printf("Warning: skipping dispatches of shaders with BVH intersections (shader=0x%016" PRIx64
+				            "); KYTY_SKIP_BVH_DISPATCHES=0 executes them.\n",
+				            hash);
+			ResetBindings();
+			return;
+		}
 	}
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 1);
 	if (use_thread_dimensions) {
