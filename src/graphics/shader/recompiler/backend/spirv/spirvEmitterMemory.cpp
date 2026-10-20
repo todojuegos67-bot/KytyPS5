@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <initializer_list>
 #include <utility>
@@ -13,6 +15,20 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
+
+// BDA bounds (KYTY_BDA_BOUNDS, default on; =0 disables): a guest address past the BDA page table's 1 TiB coverage
+// reads zero (its page index would otherwise index past the table, or alias a lower page once truncated to 32 bits),
+// and table mode's out-of-bounds load is branched around instead of issued at the buffer's first dword (a null or
+// stale base there is an unbacked device address: on NVIDIA that loses the device, where the guest's GPU reads 0).
+bool BdaBounds() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_BDA_BOUNDS");
+		const bool  v     = value == nullptr || std::strtoul(value, nullptr, 0) != 0;
+		std::printf("BDA bounds checks: %s (KYTY_BDA_BOUNDS)\n", v ? "on" : "off");
+		return v;
+	}();
+	return on;
+}
 
 uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, OpLogicalAnd, TypeBool(state), lhs, rhs);
@@ -342,6 +358,16 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index) {
+	if (resource.bda_base != 0 && BdaBounds()) {
+		auto&      state     = ctx.state;
+		const auto in_bounds = EmitMemoryElementInBoundsExplicit(state, resource, index);
+		return EmitValueOrZeroIfCondition(state, in_bounds, [&]() {
+			const auto pointer = EmitMemoryElementPointer(state, resource, index);
+			const auto value   = state.builder.AllocateId();
+			state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer, MemoryAccessAlignedMask, sizeof(uint32_t)});
+			return value;
+		});
+	}
 	if (resource.bda_base != 0) {
 		// Table mode: the buffer's device address (EmitTableMode). Out of bounds reads zero, as the device's bounds
 		// make a storage buffer's: the load (of the first dword, which a null buffer's address also holds) is not
@@ -1484,14 +1510,20 @@ void DefineGetBdaPointer(EmitterState& state) {
 	const auto page64 = Binary(
 	    state, OpShiftRightLogical, type, address,
 	    ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
-	const auto page = Unary(state, OpUConvert, TypeU32(state), page64);
+	const auto bounds  = BdaBounds();
+	const auto covered = bounds ? Binary(state, OpULessThan, TypeBool(state), page64,
+	                                     ConstantDeviceAddress(state, BufferCache::CACHING_NUMPAGES))
+	                            : 0u;
+	auto page = Unary(state, OpUConvert, TypeU32(state), page64);
+	if (bounds) page = Select(state, TypeU32(state), covered, page, ConstantU32(state, 0));
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, TypeDeviceAddressStoragePointer(state), entry_pointer,
 	                           state.bda_pagetable_variable, ConstantU32(state, 0), page});
 	const auto base = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, type, base, entry_pointer});
-	const auto missing =
+	auto missing =
 	    Binary(state, OpIEqual, TypeBool(state), base, ConstantDeviceAddress(state, 0));
+	if (bounds) missing = Binary(state, OpLogicalOr, TypeBool(state), missing, Unary(state, OpLogicalNot, TypeBool(state), covered));
 	const auto fault_label     = state.builder.AllocateId();
 	const auto available_label = state.builder.AllocateId();
 	const auto merge_label     = state.builder.AllocateId();
