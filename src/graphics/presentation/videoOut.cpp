@@ -1445,7 +1445,7 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
-bool FlipQueue::Flip(uint32_t micros) {
+bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
 	m_mutex.Lock();
