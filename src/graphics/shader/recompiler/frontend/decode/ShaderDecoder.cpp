@@ -539,6 +539,10 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_CBRANCH_VCCNZ:
 		case Opcode::S_CBRANCH_EXECZ:
 		case Opcode::S_CBRANCH_EXECNZ:
+		case Opcode::S_CBRANCH_CDBGSYS:
+		case Opcode::S_CBRANCH_CDBGUSER:
+		case Opcode::S_CBRANCH_CDBGSYS_OR_USER:
+		case Opcode::S_CBRANCH_CDBGSYS_AND_USER:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} 0x{:08x}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               inst.branch_target));
