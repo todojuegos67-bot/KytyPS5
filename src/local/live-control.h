@@ -28,6 +28,7 @@
 #include "lane-sync.h"
 #include "live-trace.h"
 #include "libs/controller.h"
+#include "graphics/presentation/videoOut.h"
 #include "loader/demonsSoulsWarp.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
@@ -173,11 +174,14 @@ inline void Flip() {
 			if (ms > 25.0) second.slow++;
 			if (now - second.start >= std::chrono::seconds(1)) {
 				const double n = static_cast<double>(second.frames);
+				double fp_mean = 0, fp_sd = 0, pi_mean = 0, pi_sd = 0;
+				(void)Libs::VideoOut::TakePresentTiming(fp_mean, fp_sd, pi_mean, pi_sd);
 				std::printf("[fps] %u frames: mean %.1f ms, max %.1f, cpu %.1f, idle %.1f, gpu_wait %.2f, readback %.2f, download %.2f, "
-				            "compile %.2f, record %.2f; over 17 ms: %u, over 25 ms: %u\n",
+				            "compile %.2f, record %.2f; over 17 ms: %u, over 25 ms: %u; flip->present mean %.2f sd %.2f ms, "
+				            "present interval mean %.2f sd %.2f ms\n",
 				            second.frames, second.sum_ms / n, second.max_ms, second.sum_cpu / n, second.sum_idle / n,
 				            second.sum_waits[0] / n, second.sum_waits[1] / n, second.sum_waits[2] / n, second.sum_waits[3] / n,
-				            second.sum_waits[4] / n, second.missed, second.slow);
+				            second.sum_waits[4] / n, second.missed, second.slow, fp_mean, fp_sd, pi_mean, pi_sd);
 				// The guest threads' tax that second: their write and read faults, protection re-arms and
 				// synchronous GPU reads (what the game's own thread spends outside its code).
 				using G = LiveCounters::Id;
