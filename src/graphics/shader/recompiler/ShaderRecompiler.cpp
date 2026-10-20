@@ -628,6 +628,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
+	const bool has_bvh = std::any_of(decoded.instructions.begin(), decoded.instructions.end(),
+	                                 [](const Decoder::Instruction& inst) {
+		                                 return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
+	                                 });
 
 	std::string decoded_dump;
 	if (options.dump_ir) {
@@ -758,6 +762,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);
+	result.program.has_bvh = has_bvh;
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);
 		result.cfg_dump     = CFG::GraphToString(cfg);
