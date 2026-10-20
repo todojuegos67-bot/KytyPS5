@@ -61,7 +61,7 @@ bool HdrEnabled() {
 }
 
 uint32_t GetVblankFrequency() {
-	return std::clamp(g_config->vblank_frequency, 30u, 360u);
+	return std::clamp(g_config->vblank_frequency, 30u, 1000u);
 }
 
 uint32_t GetConsoleLanguage() {
