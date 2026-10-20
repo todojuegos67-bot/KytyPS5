@@ -141,7 +141,7 @@ BdaReadPlan BuildBdaReadPlan(const Program& program) {
 				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32) continue;
 				return {};
 			}
-			if (memory.kind == ResourceKind::Scratch) continue;
+			if (memory.kind == ResourceKind::Scratch || memory.kind == ResourceKind::FlatLocal) continue;
 			if (!IsAddressResourceKind(memory.kind)) return {};
 			if (address.access != AddressAccess::Read || inst.NumArgs() != 4 ||
 			    (address.data_bits != 8 && address.data_bits != 16 && address.data_bits != 32))
