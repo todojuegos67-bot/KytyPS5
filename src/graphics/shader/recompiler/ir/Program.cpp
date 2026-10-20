@@ -144,6 +144,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .user_data_count = user_data_count,
 	    .scratch_dwords  = scratch_dwords,
 	    .table_mode      = table_mode,
+	    .has_bvh         = has_bvh,
 	    .table_plan      = std::move(table_plan),
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
