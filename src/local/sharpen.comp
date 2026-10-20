@@ -4,7 +4,8 @@
 // within the neighbourhood's range (no halos), then back.
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D src;
-layout(binding = 1, rgba16f) uniform writeonly image2D dst;
+// No format qualifier (shaderStorageImageWriteWithoutFormat, required by the emulator): rgba16f, B10G11R11, ...
+layout(binding = 1) uniform writeonly image2D dst;
 layout(push_constant) uniform Push {
 	float amount;
 } push;

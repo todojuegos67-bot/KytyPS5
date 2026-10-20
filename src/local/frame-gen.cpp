@@ -1906,7 +1906,52 @@ struct SharpenPass {
 	VulkanImage             image;
 	vk::ImageView           view   = nullptr;
 	bool                    failed = false;
+	// The PS5 Pro path when the output's format has no storage support: sharpen.comp into this rgba16f image, then
+	// blitted back into the output.
+	VulkanImage             out16;
+	vk::ImageView           out16_view = nullptr;
 } g_sharp;
+
+bool StorageFormat(GraphicContext& graphics, vk::Format format) {
+	return static_cast<bool>(graphics.physical_device.getFormatProperties(format).optimalTilingFeatures &
+	                         vk::FormatFeatureFlagBits::eStorageImage);
+}
+
+bool EnsureSharpenOut16(GraphicContext& graphics, vk::Extent3D extent) {
+	const auto device = graphics.device;
+	if (g_sharp.out16.image != nullptr && g_sharp.out16.extent.width == extent.width && g_sharp.out16.extent.height == extent.height)
+		return true;
+	if (g_sharp.out16_view != nullptr) {
+		device.waitIdle();
+		device.destroyImageView(g_sharp.out16_view, nullptr);
+		g_sharp.out16_view = nullptr;
+	}
+	if (g_sharp.out16.image != nullptr) graphics.DeleteImage(g_sharp.out16);
+	g_sharp.out16.image = nullptr;
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = vk::Format::eR16G16B16A16Sfloat;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc;
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.samples       = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, g_sharp.out16)) {
+		g_sharp.out16.image = nullptr;
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = g_sharp.out16.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = vk::Format::eR16G16B16A16Sfloat;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (device.createImageView(&view_info, nullptr, &g_sharp.out16_view) != vk::Result::eSuccess) return false;
+	g_sharp.out16.state = {};
+	return true;
+}
 
 bool EnsureSharpen(GraphicContext& graphics, const VulkanImage& like) {
 	const auto device = graphics.device;
@@ -1975,7 +2020,9 @@ bool EnsureSharpen(GraphicContext& graphics, const VulkanImage& like) {
 	create.format        = like.format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
-	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
+	create.usage         = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
+	// (Storage only where the format has it: B10G11R11 may not.)
+	if (StorageFormat(graphics, like.format)) create.usage |= vk::ImageUsageFlagBits::eStorage;
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
 	if (!graphics.CreateImage(create, g_sharp.image)) {
@@ -3108,8 +3155,16 @@ namespace {
 // copied into g_sharp, then sharpen.comp from it back into the output, which the game's composite reads.
 void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float amount) {
 	const auto& out = inputs.output;
-	if (g_graphics_ctx == nullptr || out.view == nullptr || out.format != vk::Format::eR16G16B16A16Sfloat ||
-	    !(out.usage & vk::ImageUsageFlagBits::eTransferSrc) || !(out.usage & vk::ImageUsageFlagBits::eStorage)) {
+	// Any float color format (sharpen.comp writes without a format qualifier): in place where the output takes storage
+	// writes, else into an rgba16f image blitted back (needs transfer dst).
+	const bool float_format = out.format == vk::Format::eR16G16B16A16Sfloat || out.format == vk::Format::eB10G11R11UfloatPack32 ||
+	                          out.format == vk::Format::eR32G32B32A32Sfloat || out.format == vk::Format::eA2B10G10R10UnormPack32 ||
+	                          out.format == vk::Format::eR8G8B8A8Unorm || out.format == vk::Format::eB8G8R8A8Unorm;
+	const bool direct = g_graphics_ctx != nullptr && (out.usage & vk::ImageUsageFlagBits::eStorage) &&
+	                    StorageFormat(*g_graphics_ctx, out.format);
+	const bool via16 = !direct && (out.usage & vk::ImageUsageFlagBits::eTransferDst);
+	if (g_graphics_ctx == nullptr || out.view == nullptr || !float_format || !(out.usage & vk::ImageUsageFlagBits::eTransferSrc) ||
+	    (!direct && !via16)) {
 		static bool said = false;
 		if (!said) {
 			said = true;
@@ -3123,6 +3178,16 @@ void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float
 	like.format = out.format;
 	like.extent = vk::Extent3D {out.extent.width, out.extent.height, 1};
 	if (!EnsureSharpen(*g_graphics_ctx, like)) return;
+	if (via16 && !EnsureSharpenOut16(*g_graphics_ctx, like.extent)) return;
+	{
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("Super resolution sharpening: output format %d %ux%u, %s\n", static_cast<int>(out.format), out.extent.width,
+			            out.extent.height, direct ? "in place" : "via rgba16f + blit");
+			std::fflush(stdout);
+		}
+	}
 	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
 	                        vk::AccessFlags2 dst) {
 		vk::MemoryBarrier2 barrier {};
@@ -3152,7 +3217,10 @@ void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float
 	       vk::AccessFlagBits2::eShaderStorageWrite);
 	vk::DescriptorImageInfo infos[2] {};
 	infos[0] = {g_sharp.sampler, g_sharp.view, vk::ImageLayout::eShaderReadOnlyOptimal};
-	infos[1] = {nullptr, out.view, vk::ImageLayout::eGeneral};
+	if (via16)
+		Transition(command, g_sharp.out16, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	infos[1] = {nullptr, via16 ? g_sharp.out16_view : out.view, vk::ImageLayout::eGeneral};
 	vk::WriteDescriptorSet writes[2] {};
 	for (uint32_t i = 0; i < 2; ++i) {
 		writes[i].dstBinding      = i;
@@ -3164,6 +3232,23 @@ void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_sharp.layout, 0, 2, writes);
 	command.pushConstants(g_sharp.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(amount), &amount);
 	command.dispatch((out.extent.width + 7) / 8, (out.extent.height + 7) / 8, 1);
+	if (via16) {
+		Transition(command, g_sharp.out16, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+		           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eBlit);
+		global(vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eCopy,
+		       vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eBlit,
+		       vk::AccessFlagBits2::eTransferWrite);
+		vk::ImageBlit blit {};
+		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, out.level, out.layer, 1};
+		blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(out.extent.width), static_cast<int32_t>(out.extent.height), 1};
+		blit.dstOffsets[1]  = blit.srcOffsets[1];
+		command.blitImage(g_sharp.out16.image, vk::ImageLayout::eTransferSrcOptimal, out.image, vk::ImageLayout::eGeneral, 1, &blit,
+		                  vk::Filter::eNearest);
+		global(vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands,
+		       vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+		return;
+	}
 	// The pass's writes before whatever reads or writes the output next (the exposure pass, the composite).
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 	       vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
