@@ -33,6 +33,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <string>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1108,6 +1109,40 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	return scheduler.Submit(submit);
 }
 
+// KYTY_FPS_CAP=<fps> (or auto: refresh - refresh^2/3600, 240 -> 224, under the G-SYNC range) with KYTY_FLIP_WHEN_READY:
+// each present waits until 1/cap after the last one, by time (a high-resolution timer and a spin), not by vblanks.
+static double FpsCapInterval(SDL_Window* window) {
+	static const double interval = [window] {
+		const char* value = std::getenv("KYTY_FPS_CAP");
+		if (value == nullptr || *value == 0 || !VideoOut::FlipWhenReady()) return 0.0;
+		double cap = 0.0;
+		int    refresh = 0;
+		if (std::string(value) == "auto") {
+#if defined(_WIN32)
+			SDL_SysWMinfo info {};
+			SDL_VERSION(&info.version);
+			if (window != nullptr && SDL_GetWindowWMInfo(window, &info) == SDL_TRUE && info.subsystem == SDL_SYSWM_WINDOWS) {
+				refresh = LocalPlatform::DisplayRefreshHz(info.info.win.window);
+			}
+#else
+			(void)window;
+#endif
+			if (refresh > 0) cap = refresh - static_cast<double>(refresh) * refresh / 3600.0;
+		} else {
+			cap = std::atof(value);
+		}
+		if (cap > 0.0) {
+			std::printf("Present: fps cap %.2f (KYTY_FPS_CAP=%s%s)\n", cap, value,
+			            refresh > 0 ? (", display " + std::to_string(refresh) + " Hz").c_str() : "");
+		} else {
+			std::printf("Present: no fps cap (KYTY_FPS_CAP=%s: no display refresh / invalid)\n", value);
+		}
+		std::fflush(stdout);
+		return cap > 0.0 ? 1.0 / cap : 0.0;
+	}();
+	return interval;
+}
+
 Swapchain::Status Swapchain::Present() {
 	EXIT_IF(m_image_index >= m_render_complete.size());
 	const auto         ready = m_render_complete[m_image_index];
@@ -1119,6 +1154,17 @@ Swapchain::Status Swapchain::Present() {
 	present.pWaitSemaphores    = &ready;
 	present.waitSemaphoreCount = 1;
 
+	if (const double cap = FpsCapInterval(m_window.window); cap > 0.0) {
+		static std::chrono::steady_clock::time_point next {};
+		const auto step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(cap));
+		auto       now  = std::chrono::steady_clock::now();
+		if (now < next) {
+			LocalPlatform::SleepUntilPrecise(std::chrono::duration_cast<std::chrono::nanoseconds>(next.time_since_epoch()).count());
+			now = std::chrono::steady_clock::now();
+		}
+		// (Late by more than a step: no catching up with presents back to back.)
+		next = std::max(next + step, now);
+	}
 	vk::Result result;
 	if (m_fsr3) {
 		// The frame generation swapchain queues it (its threads pace and present; its submissions take the

@@ -71,6 +71,9 @@ void MakeCriticalThread();
 
 // The refresh rate in Hz of the display a window is on (its HWND on Windows; 0 when unknown or elsewhere).
 int DisplayRefreshHz(void* window);
+// Sleeps until the steady_clock time `deadline_ns` (its time_since_epoch in ns): a high-resolution waitable timer on
+// Windows (sleep_until elsewhere) to about 0.5 ms before it, then a spin.
+void SleepUntilPrecise(int64_t deadline_ns);
 // Vertical blanks of that display, counted by a thread of their own that waits for each (Windows:
 // D3DKMTWaitForVerticalBlankEvent on the window's display, again when the window moves to another one); a window
 // passed again replaces the first. false where there are none.
