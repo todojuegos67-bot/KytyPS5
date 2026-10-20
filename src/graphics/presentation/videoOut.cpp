@@ -1,3 +1,4 @@
+#include <mutex>
 #include "graphics/presentation/videoOut.h"
 #include "live-counters.h"
 #include "live-trace.h"
@@ -588,6 +589,62 @@ static void NoteFrameForWorld(bool scene) {
 		std::fflush(stdout);
 	}
 }
+namespace {
+struct PaceSeries {
+	std::chrono::steady_clock::time_point last {};
+	std::vector<double>                    ms;
+};
+std::mutex     g_pace_mutex;
+PaceSeries     g_pace[2];
+std::chrono::steady_clock::time_point g_pace_report {};
+bool PaceOn() {
+	static const bool on = [] { const char* v = std::getenv("KYTY_PACE_STATS"); return v == nullptr || v[0] != '0'; }();
+	return on;
+}
+void PaceLine(const char* name, std::vector<double> v) {
+	if (v.empty()) return;
+	double sum = 0, sq = 0;
+	for (double x: v) { sum += x; sq += x * x; }
+	const double mean = sum / v.size(), sd = std::sqrt(std::max(0.0, sq / v.size() - mean * mean));
+	std::sort(v.begin(), v.end());
+	std::printf("[pace] %s: %zu, mean %.2f ms, sd %.2f, p1 %.2f, p50 %.2f, p99 %.2f, max %.2f\n", name, v.size(), mean, sd,
+	            v[v.size() / 100], v[v.size() / 2], v[v.size() * 99 / 100], v.back());
+}
+} // namespace
+void NotePace(int kind) noexcept {
+	if (!PaceOn() || kind < 0 || kind > 1 || !g_world_ready.load(std::memory_order_relaxed)) return;
+	const auto now = std::chrono::steady_clock::now();
+	std::lock_guard lock(g_pace_mutex);
+	auto& p = g_pace[kind];
+	if (p.last.time_since_epoch().count() != 0) {
+		const double ms = std::chrono::duration<double, std::milli>(now - p.last).count();
+		if (ms < 200.0) p.ms.push_back(ms);
+	}
+	p.last = now;
+	if (g_pace_report.time_since_epoch().count() == 0) g_pace_report = now;
+	if (now - g_pace_report < std::chrono::seconds(5)) return;
+	g_pace_report = now;
+	auto& a = g_pace[0].ms;
+	auto& b = g_pace[1].ms;
+	PaceLine("game asks", a);
+	PaceLine("on screen", b);
+	const size_t n = std::min(a.size(), b.size());
+	if (n > 0) {
+		double diff = 0, big = 0;
+		size_t over2 = 0;
+		for (size_t i = 0; i < n; ++i) {
+			const double d = std::fabs(a[a.size() - n + i] - b[b.size() - n + i]);
+			diff += d;
+			big = std::max(big, d);
+			if (d > 2.0) over2++;
+		}
+		std::printf("[pace] frame by frame the screen differs from the game's step by %.2f ms on average (max %.2f; %zu of %zu over 2 ms)\n",
+		            diff / n, big, over2, n);
+	}
+	std::fflush(stdout);
+	a.clear();
+	b.clear();
+}
 bool PlayerInputSeen() noexcept {
 	return g_world_ready.load(std::memory_order_relaxed);
 }
@@ -1086,6 +1143,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
                         uint64_t& request_id) {
+	NotePace(0);
 	Common::LockGuard lock(m_mutex);
 
 	if (m_requests.size() + m_cpu_requests.size() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) {

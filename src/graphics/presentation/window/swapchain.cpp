@@ -1125,6 +1125,7 @@ Swapchain::Status Swapchain::Present() {
 		Common::LockGuard lock(graphics.queue_mutex);
 		result = graphics.queue.presentKHR(&present);
 	}
+	VideoOut::NotePace(1);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:

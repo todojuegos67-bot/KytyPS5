@@ -28,6 +28,9 @@ bool MoviePlaying() noexcept;
 // title screen's "press a button") flips keep 60 a second above 60 Hz and frame generation stays off.
 void NotePlayerInput() noexcept;
 bool PlayerInputSeen() noexcept;
+// KYTY_PACE_STATS (default 1): every 5 s in a world, how evenly the game asks for flips (kind 0) and how evenly
+// they reach the screen (kind 1), and how far the two disagree frame by frame (what the eye sees as roughness).
+void NotePace(int kind) noexcept;
 
 struct VideoOutBufferAttribute2;
 struct VideoOutFlipStatus;
