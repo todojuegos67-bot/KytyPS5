@@ -1474,6 +1474,11 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          bool primitive_restart_enable, bool log_pipeline_phase,
                                          bool set_bind_debug, bool set_auto_debug) {
 	LiveCounters::ScopedUs timed(LiveCounters::DrawUs);
+	if ((state.vs_input_info.stage.program != nullptr &&
+	     SkipShader::HashSkipped(state.vs_input_info.stage.program->shader_hash, "draws")) ||
+	    (state.ps_active && state.ps_input_info.stage.program != nullptr &&
+	     SkipShader::HashSkipped(state.ps_input_info.stage.program->shader_hash, "draws")))
+		return true; // KYTY_SKIP_SHADERS
 	auto& ucfg = buffer.GetUserConfig();
 	const bool mesh_active = state.vs_input_info.stage.program->stage == ShaderType::Mesh;
 	uint32_t   mesh_groups = 0;
