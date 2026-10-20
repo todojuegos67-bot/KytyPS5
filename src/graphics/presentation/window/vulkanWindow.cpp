@@ -611,7 +611,10 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	     id == 0x1114u);
 	const char* setting = std::getenv("KYTY_COMPUTE_WAVE64");
 	const bool  wanted  = setting != nullptr && *setting != '\0' ? std::string_view(setting) != "0" : amd_rdna3_or_later;
-	graphics.compute_wave64_native = graphics.compute_subgroup_size_control_enabled && wanted;
+	// GCN (and any GPU whose compute subgroups cannot be smaller than 64 lanes, e.g. an R9 380 on RADV: min = max = 64):
+	// 32-lane emulation would require a subgroup size the device cannot give, so wave64 is native there.
+	const bool only_wave64 = subgroup_size_control.minSubgroupSize >= 64;
+	graphics.compute_wave64_native = graphics.compute_subgroup_size_control_enabled && (wanted || only_wave64);
 	std::printf("Vulkan compute wave64: %s (%s, device 0x%04x:0x%04x)\n",
 	            graphics.SupportsComputeWave64() ? "native" : "emulated on 32-lane subgroups",
 	            setting != nullptr && *setting != '\0' ? "KYTY_COMPUTE_WAVE64"
