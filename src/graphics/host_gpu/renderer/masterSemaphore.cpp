@@ -170,7 +170,13 @@ void MasterSemaphore::Wait(uint64_t tick) {
 			}
 			DeviceFault::Report();
 		}
-		EXIT_NOT_IMPLEMENTED(result != vk::Result::eTimeout);
+		if (result != vk::Result::eTimeout) {
+			// (Not a timeout - a timeout only logs STALL below and keeps waiting: the device was lost, a GPU hang the
+			// driver reset (Windows TDR, 2 s), or another wait error. Say which, so the log is not read as a timeout.)
+			EXIT("GPU wait failed: %s (%s timeline, tick %llu) - device lost means the GPU hung and was reset\n",
+			     vk::to_string(result).c_str(), LaneOf(tick) == 0 ? "graphics" : "compute",
+			     static_cast<unsigned long long>(tick));
+		}
 		uint64_t now = 0;
 		(void)m_graphics.device.getSemaphoreCounterValue(semaphore, &now);
 		std::printf("STALL %s timeline: tick %llu not reached after %llu s, at %llu\n", LaneOf(tick) == 0 ? "graphics" : "compute",
