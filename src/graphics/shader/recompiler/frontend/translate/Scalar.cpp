@@ -225,6 +225,11 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CBRANCH_VCCNZ:
 		case O::S_CBRANCH_EXECZ:
 		case O::S_CBRANCH_EXECNZ:
+		// Debug-mode branches (never taken outside shader debugging): not branches to the CFG, plain fall-through.
+		case O::S_CBRANCH_CDBGSYS:
+		case O::S_CBRANCH_CDBGUSER:
+		case O::S_CBRANCH_CDBGSYS_OR_USER:
+		case O::S_CBRANCH_CDBGSYS_AND_USER:
 		case O::S_ENDPGM: return true;
 		default: return false;
 	}
