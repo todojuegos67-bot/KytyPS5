@@ -456,8 +456,15 @@ CameraFrame Decompose(const std::array<float, 16>& m) {
 	return c;
 }
 
+// DLSS evaluations NGX refused (Streamline's slEvaluateFeature says eOk all the same; its log has them): its output
+// image is then never written, the game black (issue #87).
+std::atomic<uint32_t> g_dlss_refusals {0};
+
 void LogMessage(sl::LogType type, const char* message) {
 	LOGF("Streamline[%d]: %s", static_cast<int>(type), message);
+	if (type == sl::LogType::eError && message != nullptr && std::strstr(message, "[sl.dlss]") != nullptr &&
+	    std::strstr(message, "evaluate feature failed") != nullptr)
+		g_dlss_refusals.fetch_add(1, std::memory_order_relaxed);
 	// KYTY_FRAMEGEN_VERBOSE: every message on stdout (the run log), not only errors.
 	static const bool verbose = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr;
 	if (type == sl::LogType::eError || verbose) {
@@ -3656,6 +3663,19 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 	if (!g_upscale_ready) return false;
 	// Its own viewport: DLSS-G's (0) takes its constants and tags at the present.
 	const sl::ViewportHandle viewport {1};
+	// DLSS given up (the game's image stretched instead, renderSuperResolution.cpp): an input outside the sizes the
+	// mode takes (the NVIDIA app's DLSS override of the program can ask for another scale: 3802x2138-3840x2160 for a
+	// 1920x1080 input, issue #87), or NGX refusing its evaluations.
+	static bool given_up = false;
+	if (given_up) return false;
+	if (g_dlss_refusals.load(std::memory_order_relaxed) >= 3) {
+		given_up = true;
+		std::printf("DLSS super resolution: NGX refused it %u times (Streamline errors above): the game's image is "
+		            "upscaled without it from here on\n",
+		            g_dlss_refusals.load(std::memory_order_relaxed));
+		std::fflush(stdout);
+		return false;
+	}
 	static vk::Extent2D options_render {}, options_output {};
 	if (options_render != inputs.color.extent || options_output != inputs.output.extent) {
 		// The mode by the input's share of the output's height (DLSS takes any input size; the mode picks its model and
@@ -3691,6 +3711,17 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 		            static_cast<uint32_t>(options.mode), settings.renderWidthMin, settings.renderHeightMin,
 		            settings.renderWidthMax, settings.renderHeightMax);
 		std::fflush(stdout);
+		if (settings.renderWidthMax != 0 && settings.renderHeightMax != 0 &&
+		    (inputs.color.extent.width < settings.renderWidthMin || inputs.color.extent.width > settings.renderWidthMax ||
+		     inputs.color.extent.height < settings.renderHeightMin || inputs.color.extent.height > settings.renderHeightMax)) {
+			given_up = true;
+			std::printf("DLSS super resolution: the game renders %ux%u, outside what DLSS takes in this mode: the game's "
+			            "image is upscaled without it. A DLSS override for this program in the NVIDIA app (Super Resolution "
+			            "mode or scaling ratio) does this; set it back to the default for kyty_emulator.exe\n",
+			            inputs.color.extent.width, inputs.color.extent.height);
+			std::fflush(stdout);
+			return false;
+		}
 		options_render = inputs.color.extent;
 		options_output = inputs.output.extent;
 	}
