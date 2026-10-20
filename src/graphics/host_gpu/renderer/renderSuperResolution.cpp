@@ -390,6 +390,8 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		out.format = binding.desc.view_info.format;
 		out.extent = extent(binding, image);
 		out.usage  = image.backing.usage;
+		out.level  = binding.desc.view_info.base_level;
+		out.layer  = binding.desc.view_info.base_layer;
 		return out;
 	};
 	UpscaleRecord record;

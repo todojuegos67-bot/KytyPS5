@@ -1940,7 +1940,7 @@ bool EnsureSharpen(GraphicContext& graphics, const VulkanImage& like) {
 	create.format        = like.format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
-	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
 	if (!graphics.CreateImage(create, g_sharp.image)) {
@@ -2914,8 +2914,7 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 }
 } // namespace
 
-bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
-	if (g_sr_kind == 2 || g_sr_kind == 3) return UpscaleOurs(command, inputs);
+static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	if (!g_upscale_ready) return false;
 	// Its own viewport: DLSS-G's (0) takes its constants and tags at the present.
@@ -3067,6 +3066,94 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 	(void)inputs;
 	return false;
 #endif
+}
+
+namespace {
+// KYTY_UPSCALE_SHARPNESS on the PS5 Pro path after DLSS or XeSS (FSR's RCAS takes it itself): the output (general)
+// copied into g_sharp, then sharpen.comp from it back into the output, which the game's composite reads.
+void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float amount) {
+	const auto& out = inputs.output;
+	if (g_graphics_ctx == nullptr || out.view == nullptr || out.format != vk::Format::eR16G16B16A16Sfloat ||
+	    !(out.usage & vk::ImageUsageFlagBits::eTransferSrc) || !(out.usage & vk::ImageUsageFlagBits::eStorage)) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("Super resolution sharpening: skipped (output format %d usage 0x%x)\n", static_cast<int>(out.format),
+			            static_cast<uint32_t>(static_cast<VkImageUsageFlags>(out.usage)));
+			std::fflush(stdout);
+		}
+		return;
+	}
+	VulkanImage like;
+	like.format = out.format;
+	like.extent = vk::Extent3D {out.extent.width, out.extent.height, 1};
+	if (!EnsureSharpen(*g_graphics_ctx, like)) return;
+	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
+	                        vk::AccessFlags2 dst) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = src_stage;
+		barrier.srcAccessMask = src;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	// The upscaler's writes before the copy.
+	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite, vk::PipelineStageFlagBits2::eCopy,
+	       vk::AccessFlagBits2::eTransferRead);
+	Transition(command, g_sharp.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eCopy);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, out.level, out.layer, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = vk::Extent3D {out.extent.width, out.extent.height, 1};
+	command.copyImage(out.image, vk::ImageLayout::eGeneral, g_sharp.image.image, vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+	Transition(command, g_sharp.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderSampledRead, vk::PipelineStageFlagBits2::eComputeShader);
+	// The copy's reads of the output before the pass writes it.
+	global(vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eComputeShader,
+	       vk::AccessFlagBits2::eShaderStorageWrite);
+	vk::DescriptorImageInfo infos[2] {};
+	infos[0] = {g_sharp.sampler, g_sharp.view, vk::ImageLayout::eShaderReadOnlyOptimal};
+	infos[1] = {nullptr, out.view, vk::ImageLayout::eGeneral};
+	vk::WriteDescriptorSet writes[2] {};
+	for (uint32_t i = 0; i < 2; ++i) {
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = i == 0 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+		writes[i].pImageInfo      = &infos[i];
+	}
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_sharp.pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_sharp.layout, 0, 2, writes);
+	command.pushConstants(g_sharp.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(amount), &amount);
+	command.dispatch((out.extent.width + 7) / 8, (out.extent.height + 7) / 8, 1);
+	// The pass's writes before whatever reads or writes the output next (the exposure pass, the composite).
+	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+	       vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+}
+} // namespace
+
+bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
+	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
+	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
+	const bool  fsr  = g_sr_kind == 3;
+	// (FSR: its RCAS, KYTY_UPSCALE_SHARPNESS defaulting to 0.3 in Fsr3::Upscale; DLSS and XeSS: 0 unless set.)
+	const float amount = fsr ? [] {
+		const char* value = std::getenv("KYTY_UPSCALE_SHARPNESS");
+		return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f) : 0.3f;
+	}()
+	                         : SharpenAmount();
+	static bool said = false;
+	if (!said) {
+		said = true;
+		std::printf("Super resolution sharpening: %g (%s)\n", amount,
+		            fsr ? "FSR RCAS" : g_sr_kind == 2 ? "XeSS + sharpen.comp" : "DLSS + sharpen.comp");
+		std::fflush(stdout);
+	}
+	if (done && !fsr && amount > 0.0f) SharpenOutput(command, inputs, amount);
+	return done;
 }
 
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
