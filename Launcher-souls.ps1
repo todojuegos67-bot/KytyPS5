@@ -114,11 +114,14 @@ function Start-Game {
 		return
 	}
 	Backup-Partidas
+	# (A folder with ram16.txt: the 16 GB profile, run-windows -Ram16.)
+	$ram16 = Test-Path -LiteralPath (Join-Path $root 'ram16.txt')
 	$config = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	# Rutas entre comillas: Start-Process une los argumentos con espacios, y una carpeta con espacios
 	# (C:\Users\Juan Perez\...) partia la ruta y PowerShell se cerraba sin arrancar nada.
 	$psargs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $root 'run-windows.ps1')`"",
 	          '-Exe', "`"$(Join-Path $root $exeName)`"", '-Config', "`"$(Join-Path $root "config\$config")`"", '-Fullscreen')
+	if ($ram16) { $psargs += '-Ram16' }
 	# HDR10 (solo si "Usar HDR" esta activado en la pantalla de Windows) y VSync (modo FIFO: sin tearing).
 	if ($chkHdr.Checked)   { $psargs += '-Hdr' }
 	if ($chkVsync.Checked) { $psargs += @('-PresentMode', 'Fifo') }

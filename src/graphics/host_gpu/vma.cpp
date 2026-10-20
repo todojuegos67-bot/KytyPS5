@@ -150,6 +150,7 @@ bool GraphicContext::CreateAllocator() {
 	const char* small_env = std::getenv("KYTY_SMALL_VRAM");
 	small_video_memory = GetTotalMemoryBudget(false) < (uint64_t {12} << 30u) || (small_env != nullptr && *small_env == '1');
 	LocalPlatform::StartWorkingSetTrim();
+	LocalPlatform::KeepResident();
 	LogVideoMemory("start");
 	g_report_allocator          = allocator;
 	g_report_context            = this;

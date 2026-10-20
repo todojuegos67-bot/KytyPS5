@@ -85,6 +85,7 @@ param(
 	[switch]$Fsr3FrameGen,
 	[switch]$Turbo,
 	[switch]$Turbo2,
+	[switch]$Ram16,
 	[switch]$GentlePrecompile,
 	[ValidateSet('', 'dlss', 'xess', 'fsr')][string]$Upscaler = '',
 	[string]$StreamlineDir = '',
@@ -460,6 +461,14 @@ if (!$NoAsyncShaders -and !$Baseline -and !$environment.Contains('KYTY_ASYNC_DRA
 # the whole process with the driver's own), textures without their largest level, the GPU treated as a small one
 # (textures yield to render targets; no pipeline warmup), the working set past 5 GB emptied every 15 s, and the
 # game's low detail. Players with 16 GB crashed in heavy zones (Boletaria, the Nexus) even with the safe options.
+# -Ram16 (16 GB PCs; a package folder with ram16.txt passes it): 6 GB of the process kept in RAM (KYTY_RESIDENT_MB: Windows
+# does not page the game's memory out below it, the third ingredient of bug check 0x1A/0x41202), and the shader prefetch
+# held while less than 3 GB of RAM is left (KYTY_PREFETCH_MIN_AVAIL_MB).
+if ($Ram16) {
+	if (!$environment.Contains('KYTY_RESIDENT_MB')) { $environment['KYTY_RESIDENT_MB'] = '6144' }
+	if (!$environment.Contains('KYTY_PREFETCH_MIN_AVAIL_MB')) { $environment['KYTY_PREFETCH_MIN_AVAIL_MB'] = '3072' }
+	Write-Host 'memory:   16 GB profile: 6 GB kept in RAM, the shader prefetch waits under 3 GB free'
+}
 # -Turbo2: PCs with 8-12 GB of RAM and graphics cards of 4-6 GB: the caches' video memory at 2.5 GB, textures a quarter
 # of their size, the game's lowest detail, the working set past 3 GB emptied every 15 s (each empty stalls ~140 ms) (with the guest memory quiet
 # meanwhile: no 0x1A), smaller shader and draw stores.

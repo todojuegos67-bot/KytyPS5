@@ -1482,6 +1482,23 @@ MemoryUse ProcessMemory() {
 }
 
 static std::atomic<void (*)(void (*)())> g_trim_runner {nullptr};
+
+void KeepResident() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		const char* text = std::getenv("KYTY_RESIDENT_MB");
+		const auto  mb   = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+		if (mb == 0) return;
+		const SIZE_T minimum = static_cast<SIZE_T>(mb << 20u);
+		// (The maximum soft: the process may grow past it; the minimum hard: Windows keeps that much in RAM.)
+		const SIZE_T maximum = minimum + (SIZE_T {512} << 20u);
+		const bool   ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), minimum, maximum,
+		                                             QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) != 0;
+		std::printf("Memory: %llu MiB kept in RAM (KYTY_RESIDENT_MB)%s\n", static_cast<unsigned long long>(mb),
+		            ok ? "" : ": refused by Windows");
+		std::fflush(stdout);
+	});
+}
 static SIZE_T g_ws_min = 0, g_ws_max = 0; // the working set sizes the process started with
 void SetTrimRunner(void (*runner)(void (*call)())) {
 	g_trim_runner.store(runner, std::memory_order_release);
@@ -1904,6 +1921,7 @@ MemoryUse ProcessMemory() {
 }
 
 void StartWorkingSetTrim() {}
+void KeepResident() {}
 void SetTrimRunner(void (*)(void (*)())) {}
 
 uint64_t PhysicalMemory() {
