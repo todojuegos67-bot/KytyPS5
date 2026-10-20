@@ -365,11 +365,28 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitExt(state, TypeU32(state), GlslPackUnorm2x16, {ctx.Arg(inst, 0)}));
 			return true;
 		case IR::ValueOpcode::PackFloat2x16Rtz: {
-			const auto low = EmitF32ToF16RtzBits(state, ctx.Arg(inst, 0));
-			const auto high =
-			    Binary(state, OpShiftLeftLogical, TypeU32(state),
-			              EmitF32ToF16RtzBits(state, ctx.Arg(inst, 1)), ConstantU32(state, 16));
-			ctx.Define(inst, Binary(state, OpBitwiseOr, TypeU32(state), low, high));
+			// Official 83db2efe: pack with the native half conversion, unpack, and step each half
+			// whose magnitude exceeds its input's one unit toward zero (same bits as the integer
+			// emulation for finite inputs and infinities; NaN stays NaN).
+			const auto arg0 = ctx.Arg(inst, 0);
+			const auto arg1 = ctx.Arg(inst, 1);
+			const auto pair = state.builder.AllocateId();
+			state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0, arg1});
+			const auto packed = EmitExt(state, TypeU32(state), GlslPackHalf2x16, {pair});
+			const auto back   = EmitExt(state, TypeF32Vector(state, 2), GlslUnpackHalf2x16, {packed});
+			auto       result = packed;
+			for (uint32_t i = 0; i < 2; i++) {
+				const auto rounded = state.builder.AllocateId();
+				state.builder.AddFunction({OpCompositeExtract, TypeF32(state), rounded, back, i});
+				const auto above =
+				    Binary(state, OpFOrdGreaterThan, TypeBool(state),
+				           EmitExt(state, TypeF32(state), GlslFAbs, {rounded}),
+				           EmitExt(state, TypeF32(state), GlslFAbs, {i == 0 ? arg0 : arg1}));
+				result = Binary(state, OpISub, TypeU32(state), result,
+				                Select(state, TypeU32(state), above,
+				                       ConstantU32(state, i == 0 ? 1u : 0x10000u), ConstantU32(state, 0)));
+			}
+			ctx.Define(inst, result);
 			return true;
 		}
 		case IR::ValueOpcode::FPAbs32:
@@ -379,9 +396,14 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitFNegateValue(state, ctx.Arg(inst, 0)));
 			return true;
 		case IR::ValueOpcode::FPSaturate32:
-			ctx.Define(inst, EmitExt(state, TypeF32(state), GlslFClamp,
-			                         {ctx.Arg(inst, 0), ConstantF32(state, 0),
-			                          ConstantF32(state, 0x3f800000u)}));
+		{
+			// The clamp modifier runs in DX10 clamp mode: NaN becomes 0. FClamp leaves NaN undefined.
+			const auto clamped = EmitExt(state, TypeF32(state), GlslFClamp,
+			                             {ctx.Arg(inst, 0), ConstantF32(state, 0),
+			                              ConstantF32(state, 0x3f800000u)});
+			ctx.Define(inst, Select(state, TypeF32(state), EmitClassifyF32(state, ctx.Arg(inst, 0)).nan,
+			                        ConstantF32(state, 0), clamped));
+		}
 			return true;
 		case IR::ValueOpcode::BitFieldInsert:
 			ctx.Emit(inst, OpBitFieldInsert, IR::Type::U32,

@@ -1,3 +1,4 @@
+#include <bit>
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/shader.h"
@@ -535,6 +536,16 @@ std::array<IR::U32, 2> Translator::ReadU32Pair(const Decoder::Operand& operand) 
 	if (operand.kind == Decoder::OperandKind::VccLo) {
 		return {ir.GetVccLo(), ir.GetVccHi()};
 	}
+	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+		// A float inline constant read by a 64-bit operand is the f64 bit pattern, for integer
+		// B64 opcodes too (official b82512be).
+		const auto bits =
+		    operand.value == 0x3e22f983u
+		        ? 0x3fc45f306dc9c882ull
+		        : std::bit_cast<uint64_t>(static_cast<double>(std::bit_cast<float>(operand.value)));
+		return {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
+		        IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
+	}
 	const auto low = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
 	IR::U32    high(IR::Value(0u));
 	if (operand.kind == Decoder::OperandKind::Sgpr || operand.kind == Decoder::OperandKind::Vgpr) {
@@ -553,8 +564,11 @@ IR::U64 Translator::ReadU64(const Decoder::Operand& operand) {
 IR::F32 Translator::ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane, bool packed) {
 	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
 		const bool use_zero = packed && (high_lane ? operand.op_sel_hi : operand.op_sel);
+		// 16-bit inline floats have fixed encodings: 1/(2*pi) is half 0x3118 (= f32 0x3e230000),
+		// not the runtime f32->f16 conversion of the 32-bit constant (official b6bd9eca).
 		auto       value    = use_zero ? IR::F32(IR::Value::F32(0.0f))
-		                               : ir.BitCastF32(IR::U32(IR::Value(operand.value)));
+		                               : ir.BitCastF32(IR::U32(IR::Value(
+		                                     operand.value == 0x3e22f983u ? 0x3e230000u : operand.value)));
 		const auto half     = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {value}));
 		value               = IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
 		if (operand.absolute) {
@@ -703,6 +717,10 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 	if (operand.kind == Decoder::OperandKind::LiteralConstant ||
 	    operand.kind == Decoder::OperandKind::IntegerInlineConstant ||
 	    operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+		if (operand.kind == Decoder::OperandKind::FloatInlineConstant && program.wave_size != 64u) {
+			// A wave32 mask is a 32-bit operand: the float constant's f32 bits.
+			return ThreadBit({IR::U32(IR::Value(operand.value)), IR::U32(IR::Value(0u))});
+		}
 		return ThreadBit(ReadU32Pair(operand));
 	}
 	switch (operand.kind) {
