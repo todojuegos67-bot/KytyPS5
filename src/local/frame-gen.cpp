@@ -45,6 +45,7 @@
 #include <sl_helpers.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
+#include <thread>
 
 #include <cinttypes>
 #include <cmath>
@@ -86,6 +87,8 @@ double   g_dyn_real_fps    = 0.0; // smoothed real fps
 // target / (gen + 1). KYTY_DLSSG_DYN_STRETCH=0: the old floor choice (no limit).
 bool     g_dyn_stretch     = true;
 uint32_t g_dyn_limit_us    = 0;
+double   g_dyn_slept       = 0.0; // seconds our limiter waited in this window
+int      g_dyn_block_s     = 0;   // seconds left without taking the extra frame (it cost too much real fps)
 
 int CurrentGenerate() {
 	return g_dlssg_dynamic ? std::min(g_dyn_gen, g_generate) : g_generate;
@@ -1199,6 +1202,18 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	const sl::ViewportHandle viewport {0};
 	// Movies, menus and loading screens (no TAA pass) are presented as they are: DLSS-G off for them.
 	const bool               usable = inputs != nullptr && inputs->valid && !VideoOut::MoviePlaying() && VideoOut::PlayerInputSeen();
+	if (g_dlssg_dynamic && g_dyn_limit_us != 0 && usable) {
+		static std::chrono::steady_clock::time_point next {};
+		const auto step = std::chrono::microseconds(g_dyn_limit_us);
+		auto       t    = std::chrono::steady_clock::now();
+		if (next > t) {
+			g_dyn_slept += std::chrono::duration<double>(next - t).count();
+			std::this_thread::sleep_until(next - std::chrono::milliseconds(1));
+			while (std::chrono::steady_clock::now() < next) std::this_thread::yield();
+			t = next;
+		}
+		next = std::max(next, t - step) + step;
+	}
 	{
 		const auto now = std::chrono::steady_clock::now();
 		if (g_stat_start == std::chrono::steady_clock::time_point {}) g_stat_start = now;
@@ -1209,19 +1224,32 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 			const double n = g_stat_real != 0 ? static_cast<double>(g_stat_real) : 1.0;
 			if (g_dlssg_dynamic && g_mode_set == 1) {
 				const double real = g_stat_real / window;
-				g_dyn_real_fps    = g_dyn_real_fps <= 0.0 ? real : 0.5 * g_dyn_real_fps + 0.5 * real;
+				// Free rate: frames over the time not spent in our limiter (what the game would do unlimited).
+				const double freer = g_stat_real / std::max(window - g_dyn_slept, 0.05);
+				g_dyn_slept       = 0.0;
+				g_dyn_real_fps    = g_dyn_real_fps <= 0.0 ? freer : 0.5 * g_dyn_real_fps + 0.5 * freer;
 				int limit         = g_generate;
 				// Real rate the game would run at without our limit: when we hold it, the measured rate is our cap.
 				const double free_real = g_dyn_real_fps;
 				int cand    = std::clamp(
 				    static_cast<int>(std::floor(static_cast<double>(g_dlssg_target_fps) / std::max(free_real, 1.0))) - 1, 1,
 				    std::max(limit, 1));
-				if (g_dyn_stretch && cand + 1 <= limit &&
+				if (g_dyn_block_s > 0) --g_dyn_block_s;
+				// The extra frame taken but the game fell well under its limit (DLSS-G x4 costing GPU time): back one,
+				// and no extra frame for 60 s.
+				if (g_dyn_stretch && g_dyn_limit_us != 0 && g_dyn_pending_n == 0 &&
+				    free_real < 0.9 * static_cast<double>(g_dlssg_target_fps) / (g_dyn_gen + 1)) {
+					g_dyn_block_s = 60;
+					std::printf("[dlssg] dynamic x%d cost too much (free %.1f fps): back to x%d for 60 s\n", g_dyn_gen + 1, free_real,
+					            g_dyn_gen);
+				}
+				if (g_dyn_stretch && g_dyn_block_s == 0 && cand + 1 <= limit &&
 				    static_cast<double>(g_dlssg_target_fps) / (cand + 2) >= free_real * 0.9) {
 					cand += 1;
 				}
 				// While the limit holds the real rate, keep the stretched choice unless the game falls clearly below it.
-				if (g_dyn_stretch && g_dyn_limit_us != 0 && cand < g_dyn_gen &&
+				if (g_dyn_block_s == 60) cand = std::max(g_dyn_gen - 1, 1);
+				else if (g_dyn_stretch && g_dyn_limit_us != 0 && cand < g_dyn_gen &&
 				    free_real >= 0.95 * static_cast<double>(g_dlssg_target_fps) / (g_dyn_gen + 1)) {
 					cand = g_dyn_gen;
 				}
@@ -1233,15 +1261,11 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 						g_dyn_pending_n = 0;
 						g_options_set   = false; // send numFramesToGenerate again
 						if (g_dyn_stretch) {
-							// Reflex's limit is on shown frames with DLSS-G on (10-21: (gen+1)/target held real at 14 fps on x4).
-							const uint32_t us = static_cast<uint32_t>(1000000.0 / g_dlssg_target_fps);
-							if (us != g_dyn_limit_us) {
-								g_dyn_limit_us      = us;
-								g_reflex_opts.frameLimitUs = us;
-								g_api.reflex_set_options(g_reflex_opts);
-								std::printf("[dlssg] dynamic x%d: real held at %.1f fps (Reflex limit %u us)\n", g_dyn_gen + 1,
-								            static_cast<double>(g_dlssg_target_fps) / (g_dyn_gen + 1), us);
-							}
+							// 10-21: the emulator's own limiter (as FSR3 MFG): Reflex's frame limit beat against the game's
+							// 60 Hz pacing (x4 at 40-43 real with a 224 limit). Real frames at most target / (gen + 1).
+							g_dyn_limit_us = static_cast<uint32_t>(1000000.0 * (g_dyn_gen + 1) / g_dlssg_target_fps);
+							std::printf("[dlssg] dynamic x%d: real held at %.1f fps (emulator limiter)\n", g_dyn_gen + 1,
+							            static_cast<double>(g_dlssg_target_fps) / (g_dyn_gen + 1));
 						}
 					}
 				} else {
