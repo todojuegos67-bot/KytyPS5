@@ -234,6 +234,7 @@ bool EnsurePresentHudless(GraphicContext& graphics, vk::Extent2D extent, vk::For
 	create.usage         = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
+	const ::Libs::Graphics::VramTagScope vram_tag(::Libs::Graphics::VramCategory::Upscaler);
 	if (!graphics.CreateImage(create, g_present_hudless)) {
 		g_present_hudless.image = nullptr;
 		return false;
@@ -354,6 +355,7 @@ bool EnsureHudImage(GraphicContext& graphics, vk::Extent2D extent) {
 	create.usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc;
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
+	const ::Libs::Graphics::VramTagScope vram_tag(::Libs::Graphics::VramCategory::Upscaler);
 	if (!graphics.CreateImage(create, g_hud.image)) {
 		g_hud.image.image = nullptr;
 		return false;

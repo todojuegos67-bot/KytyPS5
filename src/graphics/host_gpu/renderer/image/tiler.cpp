@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -30,6 +31,14 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_graphics(graphics), m_scheduler(scheduler) {
 	// Kept scratch is video memory too: a smaller GPU keeps less (8 GB: ~200 MiB).
 	m_scratch_pool_budget = std::min(ScratchPoolBudget, m_graphics.GetTotalMemoryBudget() / 32);
+	// KYTY_VRAM_DIET=1: at most 64 MiB kept (a scratch buffer is needed only while a texture is detiled; the big ones
+	// are made again when a large texture next uploads, a few ms).
+	if (VramDietEnabled() && m_scratch_pool_budget > (uint64_t {64} << 20u)) {
+		std::printf("[vram-diet] tiler scratch kept: %llu -> 64 MiB (up to %llu MiB saved)\n",
+		            static_cast<unsigned long long>(m_scratch_pool_budget >> 20u),
+		            static_cast<unsigned long long>((m_scratch_pool_budget >> 20u) - 64));
+		m_scratch_pool_budget = uint64_t {64} << 20u;
+	}
 	static_assert(FamilyCount == 9);
 	static_assert(sizeof(Push) == 52);
 	static_assert(std::size(GPU_TILER_VARIANTS) == PipelineCount);
@@ -62,6 +71,7 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler)
 TileManager::~TileManager() {
 	if (m_timing_pool != nullptr) m_graphics.device.destroyQueryPool(m_timing_pool, nullptr);
 	for (const auto& pooled: m_scratch_pool) {
+		VramUntrack(pooled.allocation);
 		vmaDestroyBuffer(m_graphics.allocator, pooled.buffer, pooled.allocation);
 	}
 	for (auto pipeline: m_pipelines) {
@@ -135,7 +145,10 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 			pooled.swap(m_scratch_pool);
 			m_scratch_pool_bytes = 0;
 		}
-		for (const auto& item: pooled) vmaDestroyBuffer(m_graphics.allocator, item.buffer, item.allocation);
+		for (const auto& item: pooled) {
+			VramUntrack(item.allocation);
+			vmaDestroyBuffer(m_graphics.allocator, item.buffer, item.allocation);
+		}
 		result = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
 	}
 	if (result != VK_SUCCESS) {
@@ -144,6 +157,7 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 		if (result == VK_SUCCESS) m_graphics.ReportMemoryFallback("a tiling scratch buffer is in system memory", capacity);
 	}
 	RequireVulkanSuccess(static_cast<vk::Result>(result), "allocate TileManager scratch buffer");
+	VramTrack(m_graphics.allocator, memory, VramCategory::TilerScratch);
 	return {buffer, memory, size};
 }
 
@@ -160,6 +174,7 @@ void TileManager::DeferDestroy(Scratch scratch) {
 				return;
 			}
 		}
+		VramUntrack(scratch.allocation);
 		vmaDestroyBuffer(m_graphics.allocator, scratch.buffer, scratch.allocation);
 	});
 }

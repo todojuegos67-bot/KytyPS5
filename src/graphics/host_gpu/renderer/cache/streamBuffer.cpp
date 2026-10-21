@@ -291,6 +291,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		DeviceFault::NoteCreated(m_device_address, size, cpu_address);
 	}
 
+	VramTrack(graphics.allocator, m_allocation,
+	          usage == MemoryUsage::DeviceLocal && with_bda && cpu_address != 0 ? VramCategory::GameBuffer : VramCategory::RingBuffer);
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
@@ -328,6 +330,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t c
 	EXIT_NOT_IMPLEMENTED(vmaBindBufferMemory(graphics.allocator, allocation, native_buffer) != VK_SUCCESS);
 	m_buffer     = native_buffer;
 	m_allocation = allocation;
+	VramTrack(graphics.allocator, allocation, VramCategory::GameBuffer);
 	if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
 		vk::BufferDeviceAddressInfo address_info {};
 		address_info.buffer = m_buffer;
@@ -347,6 +350,7 @@ Buffer::~Buffer() {
 		return;
 	}
 	if (m_buffer != nullptr) {
+		VramUntrack(m_allocation);
 		if (kyty_local_buffer_reclaim_mode.load(std::memory_order_relaxed) != 0) {
 			Reclaimer().Push(m_graphics->allocator, m_buffer, m_allocation);
 		} else {

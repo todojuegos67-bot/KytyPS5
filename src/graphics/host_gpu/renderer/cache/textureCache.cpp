@@ -849,6 +849,48 @@ void TextureCache::FreeGuestAliases(ImageId written) {
 	for (const auto id: others) FreeImage(id, "guest-alias-written");
 }
 
+// KYTY_VRAM_DIET=1: a sampled texture made from a lower level than an image of the same texture held (the game streamed
+// in its larger levels: KYTY_TEXTURE_PREFIX / KYTY_TEXTURE_REDUCE's TextureFromLevel) frees the smaller one at once
+// instead of leaving it to the collector: its levels are the new image's last ones, and requests of its shape resolve
+// to the new image as a view from a level (ResolveOverlap). Only guest textures (sampled, never GPU-written) of one
+// format, type and layer count whose memory lies inside the new image's.
+void TextureCache::FreeSupersededTextures(ImageId kept_id) {
+	const auto& kept = m_slot_images[kept_id];
+	if (!GuestTexture(kept) || kept.info.data.Empty()) return;
+	const auto begin = kept.info.data.address;
+	const auto end   = begin + kept.info.data.size;
+	ImageIds   superseded;
+	for (const auto id: FindImagesInRegion(begin, kept.info.data.size, false)) {
+		if (id == kept_id) continue;
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !GuestTexture(*image) || image->guest_alias) continue;
+		const auto& info = image->info;
+		if (info.data.address < begin || info.data.address + info.data.size > end || info.data.size >= kept.info.data.size ||
+		    info.guest_format != kept.info.guest_format || info.pixel_format != kept.info.pixel_format ||
+		    info.type != kept.info.type || info.resources.layers != kept.info.resources.layers ||
+		    info.samples != kept.info.samples || info.tile_mode != kept.info.tile_mode ||
+		    info.extent.width >= kept.info.extent.width || info.extent.height > kept.info.extent.height) {
+			continue;
+		}
+		superseded.push_back(id);
+	}
+	static uint64_t freed_count = 0, freed_bytes = 0, logged_mib = 0;
+	for (const auto id: superseded) {
+		VmaAllocationInfo allocation {};
+		if (m_slot_images[id].backing.allocation != nullptr)
+			vmaGetAllocationInfo(m_graphics.allocator, m_slot_images[id].backing.allocation, &allocation);
+		freed_count++;
+		freed_bytes += allocation.size;
+		FreeImage(id, "diet-superseded");
+	}
+	if (!superseded.empty() && (freed_bytes >> 20u) >= logged_mib + (logged_mib == 0 ? 1 : 64)) {
+		logged_mib = freed_bytes >> 20u;
+		std::printf("[vram-diet] superseded texture levels freed at once: %llu images, %llu MiB so far\n",
+		            static_cast<unsigned long long>(freed_count), static_cast<unsigned long long>(logged_mib));
+		std::fflush(stdout);
+	}
+}
+
 void TextureCache::TouchImage(Image& image) {
 	if (auto* spec = Spec::Current()) { // (touched when the speculative translation is committed)
 		auto& touched = spec->touched_images;
@@ -3367,6 +3409,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fai
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			}
+			if (VramDietEnabled() && desc.type == BindingType::Texture && GuestTextureRequest(desc.type, desc.info) &&
+			    !inserted.guest_alias) {
+				FreeSupersededTextures(result);
+			}
 		}
 		if (m_guest_aliases != 0 && desc.type != BindingType::Texture) {
 			FreeGuestAliases(result);
@@ -5013,6 +5059,35 @@ void TextureCache::RunGarbageCollector() {
 		// share: on a 16 GB card the use climbed past the 10 GB budget while the texture collector deleted images.
 		std::printf("Buffer cache: %llu MiB registered\n", static_cast<unsigned long long>(m_buffer_cache.CacheBytes() >> 20u));
 		m_graphics.LogVideoMemory("30 s");
+		if (VramReportEnabled()) {
+			// The cache's images: registered (in use), the rest (parked, retiring), guest-texture aliases, and the
+			// images beside a larger one at the same guest address (another format, levels or layers of that memory).
+			uint64_t registered = 0, unregistered = 0, aliases = 0, same_address = 0, gpu_written = 0;
+			uint64_t count = 0;
+			std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> by_address; // address -> (sum, largest)
+			m_slot_images.ForEach([&](ImageId, Image& image) {
+				if (image.backing.allocation == nullptr) return;
+				VmaAllocationInfo allocation {};
+				vmaGetAllocationInfo(m_graphics.allocator, image.backing.allocation, &allocation);
+				const uint64_t bytes = allocation.size;
+				count++;
+				(image.registered ? registered : unregistered) += bytes;
+				if (image.guest_alias) aliases += bytes;
+				if (image.IsGpuModified()) gpu_written += bytes;
+				if (image.registered && image.info.data.address != 0) {
+					auto& [sum, largest] = by_address[image.info.data.address];
+					sum += bytes;
+					largest = std::max(largest, bytes);
+				}
+			});
+			for (const auto& [address, entry]: by_address) same_address += entry.first - entry.second;
+			std::printf("[vram-report] texture cache: %llu images, %llu MiB registered, %llu MiB parked/retiring, %llu MiB "
+			            "guest aliases, %llu MiB beside a larger image at the same address, %llu MiB GPU-written\n",
+			            static_cast<unsigned long long>(count), static_cast<unsigned long long>(registered >> 20u),
+			            static_cast<unsigned long long>(unregistered >> 20u), static_cast<unsigned long long>(aliases >> 20u),
+			            static_cast<unsigned long long>(same_address >> 20u),
+			            static_cast<unsigned long long>(gpu_written >> 20u));
+		}
 		std::fflush(stdout);
 	}
 	if (KytyGcLiveBudget() && m_graphics.CanReportMemoryUsage()) {

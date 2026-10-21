@@ -270,6 +270,7 @@ private:
 	[[nodiscard]] static bool GuestTextureRequest(BindingType type, const ImageInfo& info);
 	void                      NoteGuestAlias(const ImageInfo& requested, Image& kept);
 	void                      FreeGuestAliases(ImageId written);
+	void                      FreeSupersededTextures(ImageId kept); // KYTY_VRAM_DIET=1
 	void                      ParkImage(ImageId id);
 	[[nodiscard]] ImageId     TakeParkedImage(const ImageInfo& info);
 	void                      FreeImage(ImageId id, const char* site = "");

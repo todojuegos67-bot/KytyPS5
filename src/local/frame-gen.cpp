@@ -188,6 +188,7 @@ void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view
 	}
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
+	const ::Libs::Graphics::VramTagScope vram_tag(::Libs::Graphics::VramCategory::Upscaler);
 	if (!graphics.CreateImage(create, image)) {
 		EXIT("frame generation: cannot allocate a %ux%u input image\n", source.extent.width,
 		     source.extent.height);
@@ -1939,6 +1940,7 @@ bool EnsureSharpenOut16(GraphicContext& graphics, vk::Extent3D extent) {
 	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc;
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
+	const ::Libs::Graphics::VramTagScope vram_tag(::Libs::Graphics::VramCategory::Upscaler);
 	if (!graphics.CreateImage(create, g_sharp.out16)) {
 		g_sharp.out16.image = nullptr;
 		return false;
@@ -2025,6 +2027,7 @@ bool EnsureSharpen(GraphicContext& graphics, const VulkanImage& like) {
 	if (StorageFormat(graphics, like.format)) create.usage |= vk::ImageUsageFlagBits::eStorage;
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
+	const ::Libs::Graphics::VramTagScope vram_tag(::Libs::Graphics::VramCategory::Upscaler);
 	if (!graphics.CreateImage(create, g_sharp.image)) {
 		g_sharp.image.image = nullptr;
 		return false;
@@ -2069,6 +2072,7 @@ void ConfigureOutput(GraphicContext& graphics, vk::Format format, vk::Extent2D e
 	               vk::ImageUsageFlagBits::eTransferDst;
 	create.sharingMode = vk::SharingMode::eExclusive;
 	create.samples     = vk::SampleCountFlagBits::e1;
+	const ::Libs::Graphics::VramTagScope vram_tag(::Libs::Graphics::VramCategory::Upscaler);
 	if (!graphics.CreateImage(create, g_up_output)) {
 		EXIT("upscaling: cannot allocate a %ux%u output image\n", extent.width, extent.height);
 	}
@@ -2257,6 +2261,7 @@ bool EnsureDlaaImage(GraphicContext& graphics, vk::Extent2D extent) {
 	               vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	create.sharingMode = vk::SharingMode::eExclusive;
 	create.samples     = vk::SampleCountFlagBits::e1;
+	const ::Libs::Graphics::VramTagScope vram_tag(::Libs::Graphics::VramCategory::Upscaler);
 	if (!graphics.CreateImage(create, g_bypass.dlaa)) {
 		g_bypass.dlaa.image = nullptr;
 		return false;
@@ -2320,6 +2325,7 @@ bool EnsureTruthImage(GraphicContext& graphics, vk::Extent2D extent) {
 	create.usage         = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
+	const ::Libs::Graphics::VramTagScope vram_tag(::Libs::Graphics::VramCategory::Upscaler);
 	if (!graphics.CreateImage(create, t)) {
 		t.image = nullptr;
 		return false;

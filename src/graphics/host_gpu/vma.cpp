@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__clang__)
@@ -38,6 +40,119 @@
 namespace Libs::Graphics {
 
 void FlushBufferReclaimer(); // streamBuffer.cpp (KYTY_BUFFER_RECLAIM)
+
+// KYTY_VRAM_REPORT=1 (graphicContext.h): the live VMA allocations by category, in video memory or not.
+namespace {
+struct VramEntry {
+	VramCategory category = VramCategory::None;
+	uint64_t     bytes    = 0;
+	bool         local    = false;
+};
+std::mutex                                       g_vram_mutex;
+std::unordered_map<VmaAllocation, VramEntry>     g_vram_entries;
+std::array<uint64_t, size_t(VramCategory::Count)> g_vram_local {}, g_vram_other {}, g_vram_count {};
+thread_local VramCategory                        g_vram_tag = VramCategory::None;
+const char* const g_vram_names[] = {"untagged",     "color target 4K", "color target", "depth target",
+                                    "storage image", "texture BC",      "texture uncompressed", "upscaler/frame gen",
+                                    "present",      "game buffers",    "rings/utility", "tiler scratch", "other buffers"};
+static_assert(std::size(g_vram_names) == size_t(VramCategory::Count));
+} // namespace
+
+bool VramReportEnabled() {
+	static const bool on = [] { const char* v = std::getenv("KYTY_VRAM_REPORT"); return v != nullptr && v[0] == '1'; }();
+	return on;
+}
+bool VramDietEnabled() {
+	static const bool on = [] { const char* v = std::getenv("KYTY_VRAM_DIET"); return v != nullptr && v[0] == '1'; }();
+	return on;
+}
+VramTagScope::VramTagScope(VramCategory category): previous(g_vram_tag) { g_vram_tag = category; }
+VramTagScope::~VramTagScope() { g_vram_tag = previous; }
+
+void VramTrack(VmaAllocator allocator, VmaAllocation allocation, VramCategory category) {
+	if (!VramReportEnabled() || allocator == nullptr || allocation == nullptr) return;
+	if (g_vram_tag != VramCategory::None) category = g_vram_tag;
+	VmaAllocationInfo info {};
+	vmaGetAllocationInfo(allocator, allocation, &info);
+	VkMemoryPropertyFlags flags = 0;
+	vmaGetAllocationMemoryProperties(allocator, allocation, &flags);
+	const VramEntry entry {category, info.size, (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0};
+	std::scoped_lock lock(g_vram_mutex);
+	auto [it, inserted] = g_vram_entries.try_emplace(allocation, entry);
+	if (!inserted) return;
+	const auto index = size_t(category);
+	(entry.local ? g_vram_local : g_vram_other)[index] += entry.bytes;
+	g_vram_count[index]++;
+}
+
+void VramUntrack(VmaAllocation allocation) {
+	if (!VramReportEnabled() || allocation == nullptr) return;
+	std::scoped_lock lock(g_vram_mutex);
+	const auto it = g_vram_entries.find(allocation);
+	if (it == g_vram_entries.end()) return;
+	const auto index = size_t(it->second.category);
+	(it->second.local ? g_vram_local : g_vram_other)[index] -= it->second.bytes;
+	g_vram_count[index]--;
+	g_vram_entries.erase(it);
+}
+
+static bool IsBlockFormat(vk::Format format) {
+	const auto value = static_cast<int32_t>(format);
+	// BC1..BC7 (131..146), ETC2/EAC (147..156), ASTC LDR (157..184)
+	return value >= static_cast<int32_t>(vk::Format::eBc1RgbUnormBlock) &&
+	       value <= static_cast<int32_t>(vk::Format::eAstc12x12SrgbBlock);
+}
+
+static VramCategory ClassifyImage(const vk::ImageCreateInfo& info) {
+	const auto usage = info.usage;
+	if (usage & vk::ImageUsageFlagBits::eDepthStencilAttachment) return VramCategory::DepthTarget;
+	const bool sampled = static_cast<bool>(usage & vk::ImageUsageFlagBits::eSampled);
+	// (A texture cache image of an uncompressed format has attachment and storage usage whatever it serves; one of a
+	// single level and layer at a render-target size is counted as a target, the rest as textures.)
+	if (IsBlockFormat(info.format)) return VramCategory::TextureBc;
+	if (usage & vk::ImageUsageFlagBits::eColorAttachment) {
+		if (info.extent.width >= 3840 && info.extent.height >= 2160) return VramCategory::ColorTarget4K;
+		if (info.mipLevels == 1 && info.extent.width >= 640 && info.extent.height >= 360) return VramCategory::ColorTarget;
+		return sampled ? VramCategory::TextureLinear : VramCategory::ColorTarget;
+	}
+	if (usage & vk::ImageUsageFlagBits::eStorage) return sampled && info.mipLevels > 1 ? VramCategory::TextureLinear : VramCategory::StorageImage;
+	return sampled ? VramCategory::TextureLinear : VramCategory::None;
+}
+
+// The breakdown line (LogVideoMemory with KYTY_VRAM_REPORT=1): each category's video memory, then what is elsewhere.
+static void LogVramBreakdown(VmaAllocator allocator, const vk::PhysicalDeviceMemoryProperties& properties) {
+	std::array<uint64_t, size_t(VramCategory::Count)> local {}, other {}, count {};
+	{
+		std::scoped_lock lock(g_vram_mutex);
+		local = g_vram_local;
+		other = g_vram_other;
+		count = g_vram_count;
+	}
+	std::string line = "[vram-report] by owner (MiB in video memory / elsewhere, count):";
+	uint64_t    total = 0;
+	for (size_t i = 0; i < local.size(); i++) {
+		if (count[i] == 0) continue;
+		char part[128];
+		std::snprintf(part, sizeof(part), " %s %" PRIu64 "/%" PRIu64 " (%" PRIu64 ");", g_vram_names[i], local[i] >> 20u,
+		              other[i] >> 20u, count[i]);
+		line += part;
+		total += local[i];
+	}
+	// VMA's blocks hold more than their allocations: the free space inside them (the allocator's slack).
+	VmaTotalStatistics statistics {};
+	vmaCalculateStatistics(allocator, &statistics);
+	uint64_t block = 0, used = 0;
+	for (uint32_t type = 0; type < properties.memoryTypeCount; type++) {
+		if (!(properties.memoryTypes[type].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) continue;
+		block += statistics.memoryType[type].statistics.blockBytes;
+		used += statistics.memoryType[type].statistics.allocationBytes;
+	}
+	char tail[160];
+	std::snprintf(tail, sizeof(tail), " tracked %" PRIu64 " MiB; device-local blocks %" PRIu64 " MiB of which free inside %" PRIu64
+	              " MiB\n", total >> 20u, block >> 20u, (block - std::min(block, used)) >> 20u);
+	line += tail;
+	std::fputs(line.c_str(), stdout);
+}
 
 // Local diagnostic (live `vma <path>`): VMA is thread-safe, so the live thread writes it.
 static VmaAllocator          g_report_allocator = nullptr;
@@ -80,6 +195,12 @@ bool GraphicContext::CreateAllocator() {
 	// which 8.9 in use); smaller blocks hold less around each straggler. KYTY_VMA_BLOCK_MB=<n> for an A/B.
 	{
 		uint64_t block_mb = 64;
+		// KYTY_VRAM_DIET=1: blocks of 32 MiB (an image of over 16 MiB has memory of its own): what is free inside the
+		// blocks the game's streaming left is half as much per block (the KYTY_VRAM_REPORT line gives it).
+		if (VramDietEnabled()) {
+			block_mb = 32;
+			std::printf("[vram-diet] allocator blocks 64 -> 32 MiB (about half of the free space inside blocks saved)\n");
+		}
 		if (const char* text = std::getenv("KYTY_VMA_BLOCK_MB"); text != nullptr && std::strtoull(text, nullptr, 10) > 0)
 			block_mb = std::strtoull(text, nullptr, 10);
 		info.preferredLargeHeapBlockSize = block_mb << 20u;
@@ -271,6 +392,7 @@ void GraphicContext::LogVideoMemory(const char* label) const {
 	            " MiB, host-visible %" PRIu64 " MiB)\n",
 	            label, video >> 20u, budget >> 20u, local >> 20u, plain_in_video >> 20u, driver >> 20u, shared >> 20u,
 	            plain_in_system >> 20u, host >> 20u);
+	if (VramReportEnabled()) LogVramBreakdown(allocator, properties);
 	std::fflush(stdout);
 }
 
@@ -427,6 +549,7 @@ std::array<uint32_t, 10> ImagePoolKey(const VulkanImage& image) {
 static void DestroyImagePool(VmaAllocator allocator) {
 	std::scoped_lock lock(g_image_pool_mutex);
 	for (const auto& pooled: g_image_pool) {
+		VramUntrack(pooled.allocation);
 		vmaDestroyImage(allocator, pooled.image, pooled.allocation);
 	}
 	g_image_pool.clear();
@@ -526,6 +649,8 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		}
 	}
 
+	VramTrack(allocator, image.allocation, ClassifyImage(image_info));
+
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
 	image.extent     = image_info.extent;
@@ -552,6 +677,7 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 		g_image_pool_bytes += allocation_info.size;
 		while (g_image_pool_bytes > g_image_pool_limit && !g_image_pool.empty()) {
 			auto& oldest = g_image_pool.front();
+			VramUntrack(oldest.allocation);
 			vmaDestroyImage(allocator, oldest.image, oldest.allocation);
 			g_image_pool_bytes -= oldest.bytes;
 			g_image_pool.erase(g_image_pool.begin());
@@ -560,6 +686,7 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 		image.allocation = nullptr;
 		return;
 	}
+	VramUntrack(image.allocation);
 	vmaDestroyImage(allocator, image.image, image.allocation);
 	image.image      = nullptr;
 	image.allocation = nullptr;

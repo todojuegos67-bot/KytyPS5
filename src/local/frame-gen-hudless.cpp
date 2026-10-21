@@ -164,6 +164,7 @@ VulkanImage& Reserve(CommandBuffer& command, std::unique_ptr<VulkanImage>& image
 	create.usage         = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
+	const ::Libs::Graphics::VramTagScope vram_tag(::Libs::Graphics::VramCategory::Upscaler);
 	if (!graphics.CreateImage(create, *image)) {
 		EXIT("HUD-less image: cannot allocate a %ux%u image\n", extent.width, extent.height);
 	}

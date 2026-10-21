@@ -237,6 +237,36 @@ struct VulkanImage {
 	VmaAllocation                allocation = nullptr;
 };
 
+// KYTY_VRAM_REPORT=1: VMA allocations by owner (vma.cpp), logged with each video memory line. An allocation's
+// category is the one of the VramTagScope open on its thread, else what its usage says (images) or its creator's.
+enum class VramCategory : uint8_t {
+	None = 0,
+	ColorTarget4K,  // color-attachment images of at least 3840x2160 (the PS5 Pro path's output chain)
+	ColorTarget,    // other color-attachment-capable images the texture cache made for render targets
+	DepthTarget,    // depth/stencil
+	StorageImage,   // storage images without attachments
+	TextureBc,      // sampled block-compressed textures
+	TextureLinear,  // sampled textures in uncompressed formats (made with attachment/storage usage too)
+	Upscaler,       // the emulator's own upscaler/sharpen/frame-generation images
+	Present,        // swapchain-side copies
+	GameBuffer,     // guest memory mirrored in buffers (buffer cache)
+	RingBuffer,     // upload/stream/staging/download rings and utility buffers
+	TilerScratch,   // detile/tile scratch buffers
+	OtherBuffer,
+	Count
+};
+void VramTrack(VmaAllocator allocator, VmaAllocation allocation, VramCategory category);
+void VramUntrack(VmaAllocation allocation);
+bool VramReportEnabled();
+bool VramDietEnabled(); // KYTY_VRAM_DIET=1
+struct VramTagScope {
+	explicit VramTagScope(VramCategory category);
+	~VramTagScope();
+	VramTagScope(const VramTagScope&)            = delete;
+	VramTagScope& operator=(const VramTagScope&) = delete;
+	VramCategory  previous;
+};
+
 
 
 // Offline tools: the emulator's device without a window (vulkanWindow.cpp).
