@@ -560,6 +560,41 @@ __declspec(noinline) int32_t __cdecl GetSettingHook(void* session, void* profile
 	const int32_t      result   = original(session, profile, id, setting);
 	if (id != kSettingId || setting == nullptr || setting->version != kSettingVersion) return result;
 	if (!(result == kSettingNotFound || (result == kOk && setting->id == id && setting->type == 0))) return result;
+	// Only nvngx_dlssg*.dll's own reads are answered (as MFG-Unlocker does: its override is limited to the
+	// retained DLSS-G provider); other readers of the key (NGX core, Streamline, the driver) keep the driver's
+	// value. Each distinct reader is logged once, to see who reads the key. KYTY_DLSSG_PRESET_ALL=1: every reader.
+	{
+		HMODULE caller = nullptr;
+		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                   static_cast<LPCWSTR>(_ReturnAddress()), &caller);
+		char path[MAX_PATH] = "?";
+		if (caller != nullptr) GetModuleFileNameA(caller, path, MAX_PATH);
+		const char* slash = std::strrchr(path, '\\');
+		const char* name  = slash != nullptr ? slash + 1 : path;
+		const bool  provider = _strnicmp(name, "nvngx_dlssg", 11) == 0;
+		static const bool all = [] {
+			const char* v = std::getenv("KYTY_DLSSG_PRESET_ALL");
+			return v != nullptr && *v != '\0' && *v != '0';
+		}();
+		{
+			static HMODULE seen[16] {};
+			std::lock_guard lock(g_log_mutex);
+			bool known = false;
+			for (HMODULE& m: seen) {
+				if (m == caller) { known = true; break; }
+				if (m == nullptr) { m = caller; break; }
+			}
+			if (!known) {
+				LOGF("[dlssg] FG preset key read by %s (driver %s %u): %s\n", name, result == kOk ? "value" : "none",
+				     result == kOk ? setting->current.dword : 0u, provider || all ? "overridden" : "left as is");
+				std::printf("[dlssg] FG preset key read by %s (driver %s %u): %s\n", name,
+				            result == kOk ? "value" : "none", result == kOk ? setting->current.dword : 0u,
+				            provider || all ? "overridden" : "left as is");
+				std::fflush(stdout);
+			}
+		}
+		if (!provider && !all) return result;
+	}
 	const uint64_t reads = g_reads.fetch_add(1, std::memory_order_relaxed) + 1;
 	const uint32_t was   = result == kOk ? setting->current.dword : 0;
 	const bool has_c = ProviderHasC(_ReturnAddress()); // (Also logs the provider once.)
