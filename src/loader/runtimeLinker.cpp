@@ -1,4 +1,5 @@
 #include "loader/runtimeLinker.h"
+#include "loader/gameArgs.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -1617,6 +1618,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		}
 	}
 	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
+	GameArgs::DumpConvarNames(m_programs.empty() ? nullptr : m_programs.front());
 	for (auto* program : m_programs) DemonsSoulsCopy::Install(program);
 	DemonsSoulsGpuPages::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsSuperResolution::Install(m_programs.empty() ? nullptr : m_programs.front());
