@@ -145,6 +145,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           STREAMLINE_VERSION: v2.14.16
+          DLSS_VERSION: v310.9.16
         run: |
           $zips = '_Build\deps\streamline-zip'
           $unpacked = '_Build\deps\streamline-unpacked'
@@ -165,6 +166,20 @@ jobs:
           New-Item -ItemType Directory -Force _Build\deps\streamline | Out-Null
           Move-Item $header.Directory.Parent.FullName _Build\deps\streamline\sdk
           Get-ChildItem _Build\deps\streamline\sdk\bin\x64 -File | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.Name }
+          # DLSS-G Preset C (KYTY_DLSSG_PRESET=C) needs nvngx_dlssg.dll >= 310.9.16: when Streamline's is older, take
+          # NVIDIA's from the official DLSS SDK release (github.com/NVIDIA/DLSS, redistributable like Streamline's).
+          $dlssg = '_Build\deps\streamline\sdk\bin\x64\nvngx_dlssg.dll'
+          $have = if (Test-Path $dlssg) { [version](Get-Item $dlssg).VersionInfo.FileVersion.Replace(',', '.').Split(' ')[0] } else { [version]'0.0' }
+          Write-Host "Streamline's nvngx_dlssg.dll: $have"
+          if ($have -lt [version]'310.9.16') {
+            git clone --depth 1 --branch $env:DLSS_VERSION --filter=blob:none --sparse https://github.com/NVIDIA/DLSS _Build\deps\dlss
+            if ($LASTEXITCODE) { throw 'DLSS SDK clone failed' }
+            git -C _Build\deps\dlss sparse-checkout set --no-cone /lib/Windows_x86_64/rel/nvngx_dlssg.dll /LICENSE.txt
+            $new = '_Build\deps\dlss\lib\Windows_x86_64\rel\nvngx_dlssg.dll'
+            if (!(Test-Path $new)) { throw 'no nvngx_dlssg.dll in the DLSS SDK' }
+            Copy-Item $new $dlssg -Force
+            Write-Host "nvngx_dlssg.dll from DLSS ${env:DLSS_VERSION}: $((Get-Item $dlssg).VersionInfo.FileVersion)"
+          }
 
       # Intel XeSS SDK (super resolution, src/local/xess-sr.cpp; the upscale branch): its headers and libxess.dll
       # (Intel's redistributable binary) from Intel's public repository, never committed.
