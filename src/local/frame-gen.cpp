@@ -3326,7 +3326,8 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 		options.mode = share >= 0.95   ? sl::DLSSMode::eDLAA
 		               : share >= 0.62 ? sl::DLSSMode::eMaxQuality
 		               : share >= 0.55 ? sl::DLSSMode::eBalanced
-		               : share >= 0.5  ? sl::DLSSMode::eMaxPerformance
+		               : share >= 0.495 ? sl::DLSSMode::eMaxPerformance // (10-21: 1079 of 2160 from a 1.334 ratio fell
+		                                                                // to ultra performance, which takes 720 only: black)
 		                               : sl::DLSSMode::eUltraPerformance;
 		options.outputWidth     = inputs.output.extent.width;
 		options.outputHeight    = inputs.output.extent.height;
