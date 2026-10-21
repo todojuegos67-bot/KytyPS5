@@ -46,6 +46,7 @@ struct Settings {
 	bool        backup_saves = true;
 	// [Pantalla]
 	bool        fullscreen = true;
+	bool        exclusive = false; // KYTY_EXCLUSIVE_FULLSCREEN (with fullscreen)
 	int         width = 2560, height = 1440; // the window's (fullscreen: the desktop's size is used)
 	bool        hdr = false;
 	bool        vsync = false;
@@ -60,6 +61,7 @@ struct Settings {
 	std::string dlss_preset = "auto";
 	// [FrameGeneration]
 	std::string framegen = "sin-fg";
+	std::string fg_preset = "auto"; // KYTY_DLSSG_PRESET (auto: the driver's; C)
 	// [Rendimiento]
 	bool        turbo = false;      // Launcher "TURBO (VRAM 8 GB o menos)" = run-windows -Turbo2
 	bool        profile16 = false;  // run-windows -Ram16 (ram16.txt)

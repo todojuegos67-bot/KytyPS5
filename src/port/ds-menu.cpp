@@ -433,6 +433,7 @@ void Draw(float width, float height) {
 			switch (t) {
 				case 0: {
 					CheckRow("Pantalla completa", true, s.fullscreen);
+					CheckRow("Pantalla completa exclusiva", true, s.exclusive, "Con pantalla completa: la pantalla solo para el juego");
 					CheckRow("HDR", true, s.hdr, "HDR10: solo con \"Usar HDR\" activado en Windows");
 					CheckRow("VSync", true, s.vsync);
 					CheckRow("G-Sync / FreeSync", true, s.gsync, "El reloj del emulador no se ata a los Hz del monitor");
@@ -479,6 +480,8 @@ void Draw(float width, float height) {
 					}
 					ChoiceRow("Modo", true, modes.data(), static_cast<int>(modes.size()), s.framegen,
 					          "AMD: todas las graficas. DLSS: NVIDIA RTX 40/50");
+					static const Choice presets[] = {{"auto", "Auto (driver)"}, {"C", "C"}};
+					ChoiceRow("Preset frame generation DLSS", true, presets, 2, s.fg_preset);
 					const int max_gen = FixedDlssGenerated(g_rt.launched.framegen);
 					if (max_gen > 1 && s.framegen == g_rt.launched.framegen) {
 						if (g_fg_live == 0) g_fg_live = max_gen;

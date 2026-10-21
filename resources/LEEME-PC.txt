@@ -39,6 +39,7 @@ Esta junto al exe y tiene comentarios en cada opcion. Equivalencias con el lanza
   frame_generation  = el desplegable de frame generation (sin-fg, amd-x2..x4, amd-120, amd-dinamico,
                       dlss-x2..x6, dlss-120, dlss-dinamico). Con frame generation el reloj virtual va a 360 Hz.
   hdr, vsync, gsync = las casillas HDR, VSync y G-Sync.
+  pantalla_exclusiva = pantalla completa exclusiva.   fg_preset_dlss = preset de la FG DLSS (auto / C).
   fps_desbloqueados = FPS desbloqueados (experimental; sin FG: reloj a 960 Hz).
   turbo             = TURBO (VRAM 8 GB o menos): 3D a 1080 como maximo; de los reescaladores solo los
                       AA nativos (dlss-dlaa, xess-aa, fsr-aa; otro modo pasa al AA de su familia),
