@@ -25,6 +25,15 @@ void NoteCinematic(const char* name) noexcept;
 void NoteWorldFile(const char* name) noexcept;
 // A movie frame was decoded within the last half second.
 bool MoviePlaying() noexcept;
+// An in-engine cinematic's files were read lately (KYTY_CINEMATIC_HOLD_MS): its frames keep 60.
+bool CinematicPlaying() noexcept;
+// Dynamic frame generation (10-21): the game's 3D view flipped at most `fps` a second, switched at runtime (0: none).
+// Takes effect only when the virtual vblank is a whole multiple of fps (840 Hz: 60 = 14 vblanks, 56 = 15), and never
+// during cinematics, movies or menus. Returns the fps held (0 when refused or none).
+int SetDynamicFlipFps(int fps) noexcept;
+// The largest whole fps f, at least 54 and at most 60, that divides the virtual vblank evenly and with f * multiplier
+// at most target + 1 (0: none; 840 Hz, 224 target: x3 -> 60, x4 -> 56).
+int ReachFps(double target, int multiplier) noexcept;
 // The first button the player pressed (controller.cpp): until then (the PlayStation Studios logo, the intro and the
 // title screen's "press a button") flips keep 60 a second above 60 Hz and frame generation stays off.
 void NotePlayerInput() noexcept;

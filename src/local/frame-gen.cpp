@@ -90,6 +90,22 @@ bool     g_dyn_stretch     = true;
 uint32_t g_dyn_limit_us    = 0;
 double   g_dyn_slept       = 0.0; // seconds our limiter waited in this window
 int      g_dyn_block_s     = 0;   // seconds left without taking the extra frame (it cost too much real fps)
+int      g_dyn_flip_fps    = 0;   // 10-21: the game's own flip floor held for the extra frame (VideoOut::SetDynamicFlipFps)
+
+// The flip floor for `gen` generated frames: the reach rate when gen + 1 at 60 passes the target, else none.
+void DynApplyFlipFloor(int gen) {
+	const int n    = gen + 1;
+	const int want = 60.0 * n > static_cast<double>(g_dlssg_target_fps) + 0.5
+	                     ? VideoOut::ReachFps(static_cast<double>(g_dlssg_target_fps), n)
+	                     : 0;
+	const int fps  = VideoOut::SetDynamicFlipFps(want >= 60 ? 0 : want);
+	if (fps != g_dyn_flip_fps) {
+		if (fps > 0) std::printf("[dyn] x%d: game flips at %d (gameplay)\n", n, fps);
+		else std::printf("[dyn] x%d: game flips at 60\n", n);
+		std::fflush(stdout);
+	}
+	g_dyn_flip_fps = fps;
+}
 
 int CurrentGenerate() {
 	return g_dlssg_dynamic ? std::min(g_dyn_gen, g_generate) : g_generate;
@@ -1456,6 +1472,16 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	const sl::ViewportHandle viewport {0};
 	// Movies, menus and loading screens (no TAA pass) are presented as they are: DLSS-G off for them.
 	const bool               usable = inputs != nullptr && inputs->valid && !VideoOut::MoviePlaying() && VideoOut::PlayerInputSeen();
+	// 10-21: an in-engine cinematic keeps 60 real: x3 at most, no flip floor, at once (not after two windows).
+	if (g_dlssg_dynamic && VideoOut::CinematicPlaying() && (g_dyn_gen > 2 || g_dyn_flip_fps != 0)) {
+		g_dyn_gen       = std::min(g_dyn_gen, std::min(2, std::max(g_generate, 1)));
+		g_dyn_pending_n = 0;
+		g_options_set   = false;
+		VideoOut::SetDynamicFlipFps(0);
+		g_dyn_flip_fps = 0;
+		std::printf("[dyn] cinematic: back to 60, x%d\n", g_dyn_gen + 1);
+		std::fflush(stdout);
+	}
 	if (g_dlssg_dynamic && g_dyn_limit_us != 0 && usable) {
 		static std::chrono::steady_clock::time_point next {};
 		const auto step = std::chrono::microseconds(g_dyn_limit_us);
@@ -1489,24 +1515,30 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 				    static_cast<int>(std::floor(static_cast<double>(g_dlssg_target_fps) / std::max(free_real, 1.0))) - 1, 1,
 				    std::max(limit, 1));
 				if (g_dyn_block_s > 0) --g_dyn_block_s;
+				// The game's flip floor holds the real rate (no limiter of ours: it beat against the game's 60 Hz pacing,
+				// a 4 Hz judder): `held` as the limiter was.
+				const bool   held      = g_dyn_limit_us != 0 || g_dyn_flip_fps != 0;
+				const bool   cinematic = VideoOut::CinematicPlaying();
 				// The extra frame taken but the game fell well under its limit (DLSS-G x4 costing GPU time): back one,
 				// and no extra frame for 60 s.
-				if (g_dyn_stretch && g_dyn_limit_us != 0 && g_dyn_pending_n == 0 &&
+				if (g_dyn_stretch && held && g_dyn_pending_n == 0 &&
 				    free_real < 0.9 * static_cast<double>(g_dlssg_target_fps) / (g_dyn_gen + 1)) {
 					g_dyn_block_s = 60;
 					std::printf("[dlssg] dynamic x%d cost too much (free %.1f fps): back to x%d for 60 s\n", g_dyn_gen + 1, free_real,
 					            g_dyn_gen);
 				}
-				if (g_dyn_stretch && g_dyn_block_s == 0 && cand + 1 <= limit &&
-				    static_cast<double>(g_dlssg_target_fps) / (cand + 2) >= free_real * 0.9) {
-					cand += 1;
+				// The extra frame only where the vblank gives an even rate for it (840 Hz: 56 for x4); else x3 at 60.
+				if (g_dyn_stretch && !cinematic && g_dyn_block_s == 0 && cand + 1 <= limit) {
+					const int reach = VideoOut::ReachFps(static_cast<double>(g_dlssg_target_fps), cand + 2);
+					if (reach > 0 && reach >= free_real * 0.9) cand += 1;
 				}
 				// While the limit holds the real rate, keep the stretched choice unless the game falls clearly below it.
 				if (g_dyn_block_s == 60) cand = std::max(g_dyn_gen - 1, 1);
-				else if (g_dyn_stretch && g_dyn_limit_us != 0 && cand < g_dyn_gen &&
+				else if (g_dyn_stretch && held && !cinematic && cand < g_dyn_gen &&
 				    free_real >= 0.95 * static_cast<double>(g_dlssg_target_fps) / (g_dyn_gen + 1)) {
 					cand = g_dyn_gen;
 				}
+				if (cinematic) cand = std::min(cand, std::min(2, std::max(limit, 1)));
 				if (cand == g_dyn_gen) {
 					g_dyn_pending_n = 0;
 				} else if (cand == g_dyn_pending) {
@@ -1514,13 +1546,10 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 						g_dyn_gen       = cand;
 						g_dyn_pending_n = 0;
 						g_options_set   = false; // send numFramesToGenerate again
-						if (g_dyn_stretch) {
-							// 10-21: the emulator's own limiter (as FSR3 MFG): Reflex's frame limit beat against the game's
-							// 60 Hz pacing (x4 at 40-43 real with a 224 limit). Real frames at most target / (gen + 1).
-							g_dyn_limit_us = static_cast<uint32_t>(1000000.0 * (g_dyn_gen + 1) / g_dlssg_target_fps);
-							std::printf("[dlssg] dynamic x%d: real held at %.1f fps (emulator limiter)\n", g_dyn_gen + 1,
-							            static_cast<double>(g_dlssg_target_fps) / (g_dyn_gen + 1));
-						}
+						// 10-21: no limiter of ours (it beat against the game's own 60 Hz flips: a 4 Hz judder); the game's
+						// flip floor (on an 840 Hz vblank 56 = every 15 vblanks) holds the real rate for the extra frame.
+						g_dyn_limit_us = 0;
+						DynApplyFlipFloor(cinematic ? std::min(g_dyn_gen, 2) : g_dyn_gen);
 					}
 				} else {
 					g_dyn_pending   = cand;
