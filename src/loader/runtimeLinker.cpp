@@ -1521,6 +1521,13 @@ RuntimeLinker::~RuntimeLinker() {
 	Clear();
 }
 
+// Boot steps on stdout, flushed at once (stdout to a file is block-buffered: a process that dies without our fatal
+// report loses what was not flushed, and the log seems to stop earlier than the death).
+static void BootStep(const std::filesystem::path& elf_name, const char* step) {
+	std::printf("Boot: %s: %s\n", Common::PathToString(elf_name.filename()).c_str(), step);
+	std::fflush(stdout);
+}
+
 Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1537,13 +1544,18 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	program->file_name = elf_name;
 	program->unique_id = ++id_seq;
 
+	BootStep(elf_name, "opening");
 	program->elf = std::make_unique<Elf64>();
 	program->elf->Open(elf_name);
 
 	if (program->elf->IsValid()) {
+		BootStep(elf_name, "mapping segments (and red-zone patching)");
 		LoadProgramToMemory(program);
+		BootStep(elf_name, "dynamic info");
 		ParseProgramDynamicInfo(program);
+		BootStep(elf_name, "symbols");
 		CreateSymbolDatabase(program);
+		BootStep(elf_name, "loaded");
 	} else {
 		EXIT("elf is not valid: %s\n", Common::PathToString(elf_name).c_str());
 	}
@@ -2325,7 +2337,15 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			LOGF("Windows guest red-zone patching could not decode function boundaries for %s\n",
 			     Common::PathToString(program->file_name).c_str());
 		}
+		std::printf("Red-zone patching %s: %zu function starts, %zu executable segment(s)\n",
+		            Common::PathToString(program->file_name.filename()).c_str(), function_starts.size(),
+		            executable_segments.size());
+		std::fflush(stdout);
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
+			std::printf("Red-zone patching %s: segment 0x%016" PRIx64 "+0x%" PRIx64 " ...\n",
+			            Common::PathToString(program->file_name.filename()).c_str(),
+			            static_cast<uint64_t>(segment_addr), static_cast<uint64_t>(segment_size));
+			std::fflush(stdout);
 			const auto result =
 			    PatchRedZoneMemoryInstructions(segment_addr, segment_size, function_starts);
 			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64

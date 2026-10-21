@@ -385,9 +385,13 @@ std::string StorageTextureReport(const ShaderRecompiler::IR::ImageResource& reso
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
+	// Atomics on a 32-bit signed or float texture: through an R32_UINT view, as the shader declares it.
+	const bool raw_atomic_storage =
+	    resource.atomic && uint_resource &&
+	    (format == Prospero::BufferFormat::k32SInt || format == Prospero::BufferFormat::k32Float);
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
 	const bool format_ok =
-	    raw_sint_storage ||
+	    raw_sint_storage || raw_atomic_storage ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
@@ -1002,7 +1006,8 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
-	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
+	const auto storage_view_format = storage && (format == Prospero::BufferFormat::k32SInt ||
+	                                             (resource.atomic && format == Prospero::BufferFormat::k32Float))
 	                                     ? vk::Format::eR32Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
 	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined

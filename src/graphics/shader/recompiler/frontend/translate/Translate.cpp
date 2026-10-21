@@ -243,6 +243,23 @@ IR::U32 Translator::ReadScalarCode(uint32_t code) {
 }
 
 IR::U32 Translator::ApplyBitSourceModifiers(const Decoder::Operand& operand, IR::U32 value) {
+	if (operand.dpp8) {
+		// DPP8 as a 16-lane permute: lanes 0-7 of each row of 16 select within 0-7, lanes 8-15 within 8-15.
+		uint32_t low  = 0;
+		uint32_t high = 0;
+		for (uint32_t lane = 0; lane < 8u; lane++) {
+			const uint32_t select = (operand.dpp8_sel >> (lane * 3u)) & 7u;
+			low |= select << (lane * 4u);
+			high |= (select + 8u) << (lane * 4u);
+		}
+		const IR::PermlaneFlags flags {
+		    .x16            = false,
+		    .fetch_inactive = operand.dpp8_fetch_inactive,
+		    .bound_control  = false,
+		};
+		value = IR::U32(ir.Emit(IR::ValueOpcode::Permlane16U32,
+		                        {value, IR::U32(IR::Value(low)), IR::U32(IR::Value(high)), ir.GetExec()}, flags));
+	}
 	if (operand.dpp) {
 		const IR::DppMoveFlags flags {
 		    .control        = static_cast<uint16_t>(operand.dpp_ctrl),
