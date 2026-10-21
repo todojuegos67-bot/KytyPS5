@@ -887,8 +887,11 @@ void Swapchain::Create() {
 		} else if (exclusive_win32.hmonitor == nullptr) {
 			LogExclusive("not supported (no monitor for the window): borderless full screen");
 		} else {
-			exclusive_info.fullScreenExclusive =
-			    Fsr3::Requested() ? kFullScreenExclusiveAllowed : kFullScreenExclusiveApplicationControlled;
+			// (With FSR 3 or Streamline/DLSS-G the presented swapchain is wrapped by the frame generation layer:
+			// left to the driver, never application controlled.)
+			exclusive_info.fullScreenExclusive = (Fsr3::Requested() || FrameGen::StreamlineLoaded())
+			                                         ? kFullScreenExclusiveAllowed
+			                                         : kFullScreenExclusiveApplicationControlled;
 			exclusive_info.pNext = &exclusive_win32;
 			exclusive            = true;
 			auto* get_capabilities2 = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceSurfaceCapabilities2KHR;
@@ -995,7 +998,7 @@ void Swapchain::Create() {
 	if (exclusive) create_info.pNext = &exclusive_info;
 	m_fsr3 = Fsr3::CreateSwapchain(graphics, create_info, &m_handle);
 	if (!m_fsr3) {
-		if (exclusive && exclusive_info.fullScreenExclusive != kFullScreenExclusiveApplicationControlled) {
+		if (exclusive && !FrameGen::StreamlineLoaded() && exclusive_info.fullScreenExclusive != kFullScreenExclusiveApplicationControlled) {
 			// (FSR 3 asked for but its swapchain not made: the plain one, application controlled.)
 			exclusive_info.fullScreenExclusive = kFullScreenExclusiveApplicationControlled;
 		}
@@ -1011,7 +1014,9 @@ void Swapchain::Create() {
 	}
 	EXIT_IF(m_handle == nullptr);
 	if (exclusive) {
-		if (m_fsr3) {
+		if (!m_fsr3 && FrameGen::StreamlineLoaded()) {
+			LogExclusive("left to the driver (Streamline / DLSS-G frame generation: not application controlled)");
+		} else if (m_fsr3) {
 			LogExclusive("left to the driver (FSR 3 frame generation swapchain: its real swapchain is AMD's, so not "
 			             "application controlled)");
 		} else {
