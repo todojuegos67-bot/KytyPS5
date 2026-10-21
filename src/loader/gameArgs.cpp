@@ -38,7 +38,14 @@ const std::string& ExtraLines() {
 	return lines;
 }
 
-enum class Kind { None, Args, PerfConfig };
+enum class Kind { None, Args, PerfConfig, HighConfig };
+
+// KYTY_UPSCALE_RATIO without KYTY_RENDER_HEIGHT (DemonsSoulsRenderSize::CinematicUpscaled).
+bool CinematicByRatio() {
+	const char* ratio  = std::getenv("KYTY_UPSCALE_RATIO");
+	const char* height = std::getenv("KYTY_RENDER_HEIGHT");
+	return ratio != nullptr && *ratio != 0 && (height == nullptr || *height == 0);
+}
 
 // The engine opens them as "$/packagecmdlineargs.txt" and "$/misc/renderconfig_ps5_perf.txt" (lower case): the
 // names are compared without case.
@@ -47,6 +54,11 @@ Kind KindOf(const std::filesystem::path& real) {
 	for (auto& c: name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 	if (name == "packagecmdlineargs.txt" && !ExtraLines().empty()) return Kind::Args;
 	if (name == "renderconfig_ps5_perf.txt" && DemonsSoulsSuperResolution::Active()) return Kind::PerfConfig;
+	// The Cinematic mode (RenderConfig_PS5_High.txt: display mode 4, 3840x2160 natively, no upscaler) with the launcher's
+	// upscaler preset: display mode 5 too, so it renders at the ratio's size (the performance mode's mode 5 size,
+	// DemonsSoulsRenderSize) and goes through the upscaler; the rest of its config (its quality) kept.
+	if (name == "renderconfig_ps5_high.txt" && DemonsSoulsSuperResolution::Active() && CinematicByRatio())
+		return Kind::HighConfig;
 	return Kind::None;
 }
 
@@ -88,7 +100,9 @@ std::filesystem::path RedirectRead(const std::filesystem::path& real) {
 	// The copy goes next to the temporary files; one that cannot be written leaves the file as it is.
 	std::error_code error;
 	const auto      copy = std::filesystem::temp_directory_path(error) /
-	                  (kind == Kind::Args ? "kyty-PackageCmdLineArgs.txt" : "kyty-RenderConfig_PS5_Perf.txt");
+	                  (kind == Kind::Args         ? "kyty-PackageCmdLineArgs.txt"
+	                   : kind == Kind::HighConfig ? "kyty-RenderConfig_PS5_High.txt"
+	                                              : "kyty-RenderConfig_PS5_Perf.txt");
 	if (error) return {};
 	const auto    text = Contents(real, kind);
 	std::ofstream out(copy, std::ios::binary | std::ios::trunc);

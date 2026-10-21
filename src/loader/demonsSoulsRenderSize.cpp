@@ -181,7 +181,20 @@ void Install(Program* program) {
 		            requested);
 		requested = SuperResolutionLeastHeight;
 	}
-	if (requested == game_height && aspect == 0.0) return;
+	// The Cinematic mode (display mode 4: 3840x2160 natively, no upscaler) with KYTY_UPSCALE_RATIO: its config asks for
+	// display mode 5 as the performance mode's does (loader/gameArgs.cpp), so it renders at this same size (within
+	// the same 1080 least / 720 and render target memory limits) and goes through the upscaler.
+	const auto cinematic_note = [&](uint32_t width, uint32_t height) {
+		if (trinity && by_ratio)
+			std::printf("Demon's Souls render size: cinematic mode renders %ux%u instead of %ux%u (output %ux%u, through the "
+			            "upscaler)\n",
+			            width, height, OutputWidth, OutputHeight, g_wide_output != 0 ? g_wide_output : OutputWidth,
+			            OutputHeight);
+	};
+	if (requested == game_height && aspect == 0.0) {
+		cinematic_note(game_width, game_height);
+		return;
+	}
 	auto size = RenderSizeFor(requested, aspect != 0.0 ? aspect : GameAspect);
 	if (const auto most = MaxRenderHeight(aspect != 0.0 ? aspect : GameAspect); size.height > most) {
 		const auto lower = RenderSizeFor(most, aspect != 0.0 ? aspect : GameAspect);
@@ -235,6 +248,7 @@ void Install(Program* program) {
 	std::printf("Demon's Souls render size: performance mode renders %ux%u instead of %ux%u (output %ux%u)%s\n", size.width,
 	            size.height, game_width, game_height, g_wide_output != 0 ? g_wide_output : OutputWidth, OutputHeight,
 	            g_wide_output != 0 ? ", its projection and the output as wide" : aspect_store ? ", its projection as wide" : "");
+	cinematic_note(size.width, size.height);
 }
 
 } // namespace Loader::DemonsSoulsRenderSize
