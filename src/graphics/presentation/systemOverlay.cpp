@@ -1184,6 +1184,16 @@ struct SystemOverlay::Impl {
 					ImGui::TextUnformatted(hud.detail.c_str());
 					ImGui::PopFont();
 				}
+				// (The PC port: the frame generation mode and its multiplier now.)
+				if (const char* fg = PortLive::fg_label.load(std::memory_order_relaxed); fg != nullptr) {
+					const int    now   = PortLive::fg_now.load(std::memory_order_relaxed);
+					const ImVec4 color = PortLive::fg_vendor.load(std::memory_order_relaxed) == 1 ? ImVec4 {0.46f, 0.73f, 0.0f, 1.0f}
+					                                                                               : ImVec4 {0.93f, 0.11f, 0.14f, 1.0f};
+					ImGui::PushFont(hud_font, 21.0f * unit);
+					if (now > 1) ImGui::TextColored(color, "FG %s (ahora x%d)", fg, now);
+					else ImGui::TextColored(color, "FG %s", fg);
+					ImGui::PopFont();
+				}
 				DrawPerf(hud.perf, unit);
 			});
 		}

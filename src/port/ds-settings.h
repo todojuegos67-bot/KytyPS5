@@ -79,6 +79,9 @@ struct Settings {
 bool        LoadSettings(const std::string& path, Settings* settings); // false: no file (the defaults stay)
 bool        SaveSettings(const std::string& path, const Settings& settings);
 const char* FrameGenLabel(const std::string& id);
+// TURBO: an upscaler mode becomes its family's native AA one (dlss-dlaa, xess-aa, fsr-aa); the others stay.
+std::string TurboRes(const std::string& id);
+bool        TurboAllows(const ResMode& mode);
 
 using EnvList = std::vector<std::pair<std::string, std::string>>;
 

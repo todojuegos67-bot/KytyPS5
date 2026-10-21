@@ -208,6 +208,7 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
 			MfgSetActive(want);
 		}
 	}
+	PortLive::fg_now.store(g_mfg.current, std::memory_order_relaxed);
 	const double real = frames / window;
 	const double busy = std::max(window - g_mfg.slept, 0.05);
 	const double free = frames / busy;

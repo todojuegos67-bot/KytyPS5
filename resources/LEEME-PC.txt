@@ -14,7 +14,7 @@ No hace falta PowerShell ni ninguna consola: todo va dentro del exe.
 Menu de opciones dentro del juego
 ---------------------------------
   F1                          abrir / cerrar
-  Mando: mantener OPTIONS + R3 abrir / cerrar
+  Mando: mantener R3 y pulsar OPTIONS  abrir / cerrar (OPTIONS no llega al juego)
   Circulo / Esc               volver al juego
   L1 / R1  (Q / E)            cambiar de pestana
   Cruz / Enter                elegir
@@ -32,19 +32,22 @@ settings.ini
 ------------
 Esta junto al exe y tiene comentarios en cada opcion. Equivalencias con el lanzador anterior
 (Launcher-souls.ps1 + run-windows.ps1):
-  reescalado        = el desplegable de reescalado (DLSS / XeSS / FSR / 1440p nativo / 1080-720 del juego).
+  reescalado        = el desplegable de reescalado (DLSS / XeSS / FSR / 1440p nativo / 1080-720 del juego);
+                      fsr-aa = FSR 3.1 a resolucion nativa (solo antialiasing).
                       DLSS/XeSS/FSR van por el camino PS5 Pro del juego, a la relacion de la altura del monitor.
   nitidez           = Nitidez (auto, 0 ... 1).        preset_dlss = DLSS auto / K / L / M.
   frame_generation  = el desplegable de frame generation (sin-fg, amd-x2..x4, amd-120, amd-dinamico,
                       dlss-x2..x6, dlss-120, dlss-dinamico). Con frame generation el reloj virtual va a 360 Hz.
   hdr, vsync, gsync = las casillas HDR, VSync y G-Sync.
   fps_desbloqueados = FPS desbloqueados (experimental; sin FG: reloj a 960 Hz).
-  turbo             = TURBO (VRAM 8 GB o menos): 3D a 1080 como maximo (o el reescalado calculado
-                      sobre 1080, como mucho Calidad), texturas a un cuarto, detalle bajo, caches de video a 2 GB.
+  turbo             = TURBO (VRAM 8 GB o menos): 3D a 1080 como maximo; de los reescaladores solo los
+                      AA nativos (dlss-dlaa, xess-aa, fsr-aa; otro modo pasa al AA de su familia),
+                      texturas a un cuarto, detalle bajo, caches de video a 2 GB.
   perfil_16gb       = ram16.txt (6 GB fijos en RAM, la precarga de shaders espera con poca RAM).
   gpu_seguro        = Modo GPU seguro.     simular_vram_8gb = Simular grafica 8 GB.
   calidad           = detalle del juego (standard / low / lowest).  reducir_texturas = auto / 0 / 1 / 2.
-  metricas          = panel de FPS dentro del juego (0 / 1 / 2) (antes: Metricas abria metricas.ps1).
+  metricas          = panel de FPS dentro del juego (0 / 1 / 2), con el modo de frame generation y su
+                      multiplicador actual (verde NVIDIA, rojo AMD) (antes: Metricas abria metricas.ps1).
   vibracion, vibracion_fuerza = vibracion del mando desde el audio haptico (KYTY_HAPTIC_RUMBLE / _GAIN).
   extra             = interruptores del emulador (KYTY_X=1;KYTY_Y=2), como -Set de run-windows.ps1.
 

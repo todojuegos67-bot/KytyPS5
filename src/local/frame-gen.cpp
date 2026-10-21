@@ -1325,6 +1325,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		}
 		g_mode_set = mode_on ? 1 : 0;
 		options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
+		PortLive::fg_now.store(static_cast<int>(options.numFramesToGenerate) + 1, std::memory_order_relaxed);
 		// KYTY_DLSSG_PARALLEL=1: DLSS-G's work blocks none of the emulator's queues (a comparison: by default it
 		// blocks the presenting queue while it works).
 		static const bool parallel = [] {
@@ -1499,6 +1500,7 @@ void SwapchainChanging() {
 	options.mode                = sl::DLSSGMode::eOff;
 	options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
 	options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
+	PortLive::fg_now.store(static_cast<int>(options.numFramesToGenerate) + 1, std::memory_order_relaxed);
 	if (const auto result = g_api.dlssg_set_options(sl::ViewportHandle {0}, options); result != sl::Result::eOk)
 		LOGF("frame generation: slDLSSGSetOptions (off) failed (%d)\n", static_cast<int>(result));
 	g_mode_set    = 0;

@@ -18,6 +18,10 @@ inline std::atomic<float> fps_cap {0.0f};     // KYTY_FPS_CAP (with KYTY_FLIP_WH
 inline std::atomic<int>   rumble {-1};        // KYTY_HAPTIC_RUMBLE; < 0: the environment's
 inline std::atomic<float> rumble_gain {0.0f}; // KYTY_HAPTIC_RUMBLE_GAIN; 0: the environment's
 inline std::atomic<bool>  menu_open {false};  // the options menu is shown: no frame generation, the game gets no input
+// The metrics panel's frame generation line (the port sets the name; the engine the multiplier it runs at now).
+inline std::atomic<const char*> fg_label {nullptr}; // null: no line
+inline std::atomic<int>         fg_vendor {0};      // 1 NVIDIA (green), 2 AMD (red)
+inline std::atomic<int>         fg_now {0};         // shown frames per real frame (x2...); 0: unknown
 
 // The port's hooks (null in the emulator): set once by the port's main before the game starts.
 struct Hooks {

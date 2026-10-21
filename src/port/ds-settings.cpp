@@ -26,6 +26,7 @@ const ResMode kResModes[] = {
     {"xess-calidad", "XeSS Calidad", 1.7, "xess"},
     {"xess-equilibrado", "XeSS Equilibrado", 2.0, "xess"},
     {"xess-rendimiento", "XeSS Rendimiento", 2.3, "xess"},
+    {"fsr-aa", "FSR AA (FSR 3.1 nativo)", 1.0, "fsr"},
     {"fsr-ucalidad", "FSR Ultra calidad", 1.3, "fsr"},
     {"fsr-calidad", "FSR Calidad", 1.5, "fsr"},
     {"fsr-equilibrado", "FSR Equilibrado", 1.72, "fsr"},
@@ -114,6 +115,17 @@ const Tables::FgMode* FindFg(const std::string& id) {
 
 } // namespace
 
+std::string TurboRes(const std::string& id) {
+	const ResMode* res = FindRes(id);
+	if (res->upscaler[0] == '\0' || res->value == 1.0) return res->id;
+	const std::string family = res->upscaler;
+	return family == "dlss" ? "dlss-dlaa" : family == "xess" ? "xess-aa" : "fsr-aa";
+}
+
+bool TurboAllows(const ResMode& mode) {
+	return mode.upscaler[0] == '\0' || mode.value == 1.0;
+}
+
 const char* FrameGenLabel(const std::string& id) {
 	return FindFg(id)->label;
 }
@@ -174,7 +186,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 bool SaveSettings(const std::string& path, const Settings& s) {
 	std::ostringstream o;
 	const auto         b = [](bool x) { return x ? "1" : "0"; };
-	o << "; Demon's Souls PC - ajustes. Se cambian tambien dentro del juego (F1, o mantener OPTIONS y pulsar R3).\n"
+	o << "; Demon's Souls PC - ajustes. Se cambian tambien dentro del juego (F1, o mantener R3 y pulsar OPTIONS).\n"
 	  << "; 1 = si, 0 = no. Lo que no se reconoce se ignora; borrar este archivo vuelve a los valores por defecto.\n\n"
 	  << "[Juego]\n"
 	  << "; Carpeta del juego volcado (la que tiene eboot.bin y sce_sys), o un .zar. Vacia: se pregunta al arrancar.\n"
@@ -203,7 +215,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "[Reescalado]\n"
 	  << "; nativo, dlss-dlaa, dlss-ucalidad, dlss-calidad, dlss-equilibrado, dlss-rendimiento,\n"
 	  << "; xess-aa, xess-ucalidad-plus, xess-ucalidad, xess-calidad, xess-equilibrado, xess-rendimiento,\n"
-	  << "; fsr-ucalidad, fsr-calidad, fsr-equilibrado, fsr-rendimiento, juego-1080, juego-900, juego-720\n"
+	  << "; fsr-aa, fsr-ucalidad, fsr-calidad, fsr-equilibrado, fsr-rendimiento, juego-1080, juego-900, juego-720\n"
 	  << "reescalado=" << s.res << "\n"
 	  << "; auto, 0, 0.25, 0.5, 0.75, 1\n"
 	  << "nitidez=" << s.sharpness << "\n"
@@ -214,7 +226,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; dlss-x2, dlss-x3, dlss-x4, dlss-x5, dlss-x6, dlss-120, dlss-dinamico (NVIDIA RTX)\n"
 	  << "frame_generation=" << s.framegen << "\n\n"
 	  << "[Rendimiento]\n"
-	  << "; TURBO: graficas de 8 GB o menos / PCs de 8-12 GB de RAM (3D a 1080 como maximo, texturas a un cuarto)\n"
+	  << "; TURBO: graficas de 8 GB o menos / PCs de 8-12 GB de RAM (3D a 1080, solo reescalado AA nativo: dlss-dlaa, xess-aa, fsr-aa; texturas a un cuarto)\n"
 	  << "turbo=" << b(s.turbo) << "\n"
 	  << "; PCs de 16 GB de RAM: 6 GB del juego fijos en RAM y la precarga de shaders espera con poca RAM libre\n"
 	  << "perfil_16gb=" << b(s.profile16) << "\n"
@@ -260,18 +272,16 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 
 	// Launcher-souls.ps1: super resolution. DLSS with AMD frame generation closed the emulator at device creation
 	// (Streamline): the launcher refused it; here the same ratio with FSR.
-	const ResMode* res      = FindRes(s.res);
+	// TURBO: of the upscalers only their native-resolution AA modes (DLAA, XeSS AA, FSR AA), the 3D at 1080 lines.
+	const std::string res_id = s.turbo ? TurboRes(s.res) : std::string(FindRes(s.res)->id);
+	if (res_id != FindRes(s.res)->id) plan.notes.push_back("TURBO: reescalado " + std::string(FindRes(s.res)->id) + " -> " + res_id + " (solo AA nativo)");
+	const ResMode* res      = FindRes(res_id);
 	std::string    upscaler = res->upscaler;
 	double         ratio    = upscaler.empty() ? 0.0 : res->value;
 	int            render_h = upscaler.empty() && res->value != 1440 ? static_cast<int>(res->value) : 0;
 	if (upscaler == "dlss" && amd_fg) {
 		upscaler = "fsr";
 		plan.notes.emplace_back("DLSS (reescalado) no funciona con la frame generation de AMD: se usa FSR con la misma relacion");
-	}
-	// (The launcher listed at most ratio 1.5 with TURBO.)
-	if (s.turbo && ratio > 1.5) {
-		ratio = 1.5;
-		plan.notes.emplace_back("TURBO: reescalado limitado a la relacion 1.5 (Calidad)");
 	}
 
 	// Launcher-souls.ps1's -Set switches.

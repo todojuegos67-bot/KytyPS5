@@ -1,7 +1,7 @@
 // "Demon's Souls" PC port: the in-game options menu. Drawn by the system overlay (src/graphics/presentation/
 // systemOverlay.cpp) into the swapchain image, after the upscaler and outside frame generation: while it is open the
 // frames go out without generated ones (swapchain.cpp, PortLive::menu_open), and the game gets no input.
-//   F1, or OPTIONS held + R3 (either order): open / close. Circle / Escape: close. L1 / R1, Q / E: the tabs.
+//   F1, or R3 held + OPTIONS (OPTIONS then never reaches the game): open / close. Circle / Escape: close. L1 / R1, Q / E: the tabs.
 // What the engine applies while playing (sharpness, the fps cap, the frame generation multiplier of a fixed DLSS mode,
 // metrics, rumble) is applied at once; the rest is saved to settings.ini and marked "*": it needs a restart, which
 // the menu offers.
@@ -62,6 +62,7 @@ bool                     g_background_tried = false;
 int                      g_bg_w = 0, g_bg_h = 0;
 bool                     g_first_present = true;
 bool                     g_focus_once = true;
+bool                     g_start_swallowed = false; // window thread: OPTIONS went to the menu's combo
 std::atomic<bool>        g_popup {false}; // a combo is open (Circle closes it, not the menu)
 
 void Bump() {
@@ -170,9 +171,10 @@ bool OnEvent(const SDL_Event& e) {
 		case SDL_TEXTEDITING: return open;
 		case SDL_CONTROLLERBUTTONDOWN: {
 			const auto b     = e.cbutton.button;
-			const bool combo = (b == SDL_CONTROLLER_BUTTON_RIGHTSTICK && PadHeld(e.cbutton.which, SDL_CONTROLLER_BUTTON_START)) ||
-			                   (b == SDL_CONTROLLER_BUTTON_START && PadHeld(e.cbutton.which, SDL_CONTROLLER_BUTTON_RIGHTSTICK));
+			// R3 held, then OPTIONS: OPTIONS never reaches the game while R3 is held (its menu would open too).
+			const bool combo = b == SDL_CONTROLLER_BUTTON_START && PadHeld(e.cbutton.which, SDL_CONTROLLER_BUTTON_RIGHTSTICK);
 			if (combo) {
+				g_start_swallowed = true;
 				SetOpen(!open);
 				return true;
 			}
@@ -187,6 +189,10 @@ bool OnEvent(const SDL_Event& e) {
 			return true;
 		}
 		case SDL_CONTROLLERBUTTONUP:
+			if (e.cbutton.button == SDL_CONTROLLER_BUTTON_START && g_start_swallowed) {
+				g_start_swallowed = false;
+				return true;
+			}
 			if (open) {
 				if (const ImGuiKey k = PadKey(e.cbutton.button); k != ImGuiKey_None) Queue({Input::Key, k, false});
 			}
@@ -447,9 +453,15 @@ void Draw(float width, float height) {
 					break;
 				}
 				case 1: {
-					ComboRow("Reescalado", true, kResModeCount, kResModes, s.res, [](const ResMode& m) { return m.id; },
+					if (s.turbo) s.res = TurboRes(s.res);
+					static std::vector<ResMode> shown;
+					shown.clear();
+					for (int i = 0; i < kResModeCount; i++)
+						if (!s.turbo || TurboAllows(kResModes[i])) shown.push_back(kResModes[i]);
+					ComboRow("Reescalado", true, static_cast<int>(shown.size()), shown.data(), s.res, [](const ResMode& m) { return m.id; },
 					         [](const ResMode& m) { return m.label; },
-					         "DLSS: NVIDIA RTX. XeSS: todas las graficas. FSR: graficas de bajo rendimiento");
+					         s.turbo ? "TURBO: solo los modos AA nativos (DLAA, XeSS AA, FSR AA)"
+					                 : "DLSS: NVIDIA RTX. XeSS: todas las graficas. FSR: graficas de bajo rendimiento");
 					if (ChoiceRow("Nitidez", (s.sharpness == "auto") != (g_rt.launched.sharpness == "auto"), kSharpness,
 					              kSharpnessCount, s.sharpness))
 						live_changed = true;
@@ -484,8 +496,10 @@ void Draw(float width, float height) {
 					break;
 				}
 				case 3: {
-					CheckRow("TURBO (graficas de 8 GB o menos)", true, s.turbo,
-					         "3D a 1080 como maximo, texturas a un cuarto, detalle bajo: no se queda sin VRAM");
+					if (CheckRow("TURBO (graficas de 8 GB o menos)", true, s.turbo,
+					             "3D a 1080 como maximo, solo reescalado AA nativo, texturas a un cuarto, detalle bajo") &&
+					    s.turbo)
+						s.res = TurboRes(s.res);
 					CheckRow("Perfil PC de 16 GB de RAM", true, s.profile16);
 					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para graficas que se cuelgan: mas estable, ~37% menos FPS");
 					ChoiceRow("Detalle del juego", true, kQualities, kQualityCount, s.quality);
@@ -600,6 +614,12 @@ void InstallMenu(const Runtime& runtime) {
 	g_saved = runtime.launched;
 	g_edit  = runtime.launched;
 	ApplyLive(runtime.launched);
+	const std::string& fg = runtime.launched.framegen;
+	if (fg != "sin-fg" && !fg.empty()) {
+		PortLive::fg_label  = FrameGenLabel(fg);
+		PortLive::fg_vendor = fg.rfind("dlss", 0) == 0 ? 1 : 2;
+		PortLive::fg_now    = fg == "amd-x2" ? 2 : (fg == "amd-x3" || fg == "amd-120") ? 3 : fg == "amd-x4" ? 4 : 0;
+	}
 	PortLive::g_hooks = &kHooks;
 }
 
