@@ -1737,7 +1737,37 @@ struct PipelineCache::ProgramCache {
 				LiveCounters::Add(LiveCounters::Translates);
 				translate_timed.emplace(LiveCounters::TranslateUs);
 			}
-			auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+			// A program the recompiler refuses (an image descriptor it cannot trace to a runtime value - GPU-selected
+			// descriptor heaps that this branch's resource tracking does not plan, Wolverine CS ade1bef389644fa5 and
+			// Ghost of Yotei CS 34be6ffcc212383c) skips its draws/dispatches instead of ending the emulator; said
+			// once per program. KYTY_SHADER_REFUSE_EXIT=1 ends the emulator as before.
+			static std::mutex                   refused_mutex;
+			static std::unordered_set<uint64_t> refused_programs;
+			static const bool                   refuse_exit = [] {
+				const char* env = std::getenv("KYTY_SHADER_REFUSE_EXIT");
+				return env != nullptr && env[0] == '1';
+			}();
+			{
+				std::lock_guard refused_lock(refused_mutex);
+				if (refused_programs.contains(params.hash)) return {};
+			}
+			std::optional<ShaderRecompiler::TranslateResult> translated_or;
+			if (refuse_exit) {
+				translated_or.emplace(ShaderRecompiler::TranslateProgram(params.code, options));
+			} else {
+				try {
+					Common::RecoverableExitScope recoverable;
+					translated_or.emplace(ShaderRecompiler::TranslateProgram(params.code, options));
+				} catch (const Common::RecoverableExit& refused) {
+					std::lock_guard refused_lock(refused_mutex);
+					refused_programs.insert(params.hash);
+					std::printf("Shader refused, its %s draws/dispatches are skipped: hash=0x%016llx %s\n", label,
+					            static_cast<unsigned long long>(params.hash), refused.message.c_str());
+					std::fflush(stdout);
+					return {};
+				}
+			}
+			auto translated = std::move(*translated_or);
 			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 			translate_ms = front_ms;
 			if (entry == programs.end()) {
