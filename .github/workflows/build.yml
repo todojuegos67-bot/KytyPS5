@@ -44,7 +44,7 @@ jobs:
             "KytyPS5-$((Get-Date).ToUniversalTime().ToString('yyyyMMdd'))-$($env:GITHUB_SHA.Substring(0, 8))" }
           if ('${{ inputs.pgo_generate }}' -eq 'true') { $name = "$name-pgogen" }
           if ($env:GITHUB_REF_NAME -eq 'fsr3-prueba') { $name = "$name-fsr3" }
-          if ($env:GITHUB_REF_NAME -in @('dlss-prueba','dlssg-decouple','dlss-release','lowmem-16gb','merge-1016','upscale','merge-1019')) { $name = "$name-dlss" }
+          if ($env:GITHUB_REF_NAME -in @('dlss-prueba','dlssg-decouple','dlss-release','lowmem-16gb','merge-1016','upscale','merge-1019','fg-preset-c')) { $name = "$name-dlss" }
           if ($env:GITHUB_REF_NAME -eq 'fg/x3') { $name = "$name-fgx3" }
           "package=$name" >> $env:GITHUB_OUTPUT
 
@@ -140,11 +140,12 @@ jobs:
       # build time from NVIDIA's public release, never committed. CMakeLists.txt enables KYTY_FRAMEGEN_STREAMLINE when
       # _Build/deps/streamline/sdk/include/sl.h exists. Its packages are draft releases (they hold NVIDIA's DLLs).
       - name: Streamline SDK
-        if: ${{ github.ref_name == 'dlss-prueba' || github.ref_name == 'dlssg-decouple' || github.ref_name == 'dlss-release' || github.ref_name == 'lowmem-16gb' || github.ref_name == 'merge-1016' || github.ref_name == 'upscale' || github.ref_name == 'merge-1019' }}
+        if: ${{ github.ref_name == 'dlss-prueba' || github.ref_name == 'dlssg-decouple' || github.ref_name == 'dlss-release' || github.ref_name == 'lowmem-16gb' || github.ref_name == 'merge-1016' || github.ref_name == 'upscale' || github.ref_name == 'merge-1019' || github.ref_name == 'fg-preset-c' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           STREAMLINE_VERSION: v2.14.16
+          DLSS_VERSION: v310.9.16
         run: |
           $zips = '_Build\deps\streamline-zip'
           $unpacked = '_Build\deps\streamline-unpacked'
@@ -165,11 +166,25 @@ jobs:
           New-Item -ItemType Directory -Force _Build\deps\streamline | Out-Null
           Move-Item $header.Directory.Parent.FullName _Build\deps\streamline\sdk
           Get-ChildItem _Build\deps\streamline\sdk\bin\x64 -File | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.Name }
+          # DLSS-G Preset C (KYTY_DLSSG_PRESET=C) needs nvngx_dlssg.dll >= 310.9.16: when Streamline's is older, take
+          # NVIDIA's from the official DLSS SDK release (github.com/NVIDIA/DLSS, redistributable like Streamline's).
+          $dlssg = '_Build\deps\streamline\sdk\bin\x64\nvngx_dlssg.dll'
+          $have = if (Test-Path $dlssg) { [version](Get-Item $dlssg).VersionInfo.FileVersion.Replace(',', '.').Split(' ')[0] } else { [version]'0.0' }
+          Write-Host "Streamline's nvngx_dlssg.dll: $have"
+          if ($have -lt [version]'310.9.16') {
+            git clone --depth 1 --branch $env:DLSS_VERSION --filter=blob:none --sparse https://github.com/NVIDIA/DLSS _Build\deps\dlss
+            if ($LASTEXITCODE) { throw 'DLSS SDK clone failed' }
+            git -C _Build\deps\dlss sparse-checkout set --no-cone /lib/Windows_x86_64/rel/nvngx_dlssg.dll /LICENSE.txt
+            $new = '_Build\deps\dlss\lib\Windows_x86_64\rel\nvngx_dlssg.dll'
+            if (!(Test-Path $new)) { throw 'no nvngx_dlssg.dll in the DLSS SDK' }
+            Copy-Item $new $dlssg -Force
+            Write-Host "nvngx_dlssg.dll from DLSS ${env:DLSS_VERSION}: $((Get-Item $dlssg).VersionInfo.FileVersion)"
+          }
 
       # Intel XeSS SDK (super resolution, src/local/xess-sr.cpp; the upscale branch): its headers and libxess.dll
       # (Intel's redistributable binary) from Intel's public repository, never committed.
       - name: XeSS SDK
-        if: ${{ github.ref_name == 'upscale' || github.ref_name == 'merge-1019' }}
+        if: ${{ github.ref_name == 'upscale' || github.ref_name == 'merge-1019' || github.ref_name == 'fg-preset-c' }}
         shell: pwsh
         env:
           XESS_VERSION: v3.0.2
