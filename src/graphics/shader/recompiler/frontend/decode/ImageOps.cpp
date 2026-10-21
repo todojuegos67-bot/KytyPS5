@@ -191,11 +191,15 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
 constexpr Detail::OpcodeMap MIMG_ATOMIC_OPCODE_LIST[] = {
     {0x0fu, Opcode::IMAGE_ATOMIC_SWAP},
     {0x11u, Opcode::IMAGE_ATOMIC_ADD},
+    {0x14u, Opcode::IMAGE_ATOMIC_SMIN},
     {0x15u, Opcode::IMAGE_ATOMIC_UMIN},
+    {0x16u, Opcode::IMAGE_ATOMIC_SMAX},
     {0x17u, Opcode::IMAGE_ATOMIC_UMAX},
     {0x18u, Opcode::IMAGE_ATOMIC_AND},
     {0x19u, Opcode::IMAGE_ATOMIC_OR},
     {0x1au, Opcode::IMAGE_ATOMIC_XOR},
+    {0x1eu, Opcode::IMAGE_ATOMIC_FMIN},
+    {0x1fu, Opcode::IMAGE_ATOMIC_FMAX},
 };
 
 constexpr auto MIMG_SAMPLE_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_SAMPLE_OPCODE_LIST);

@@ -649,6 +649,11 @@ uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::ImageAtomicIAdd32: return OpAtomicIAdd;
 		case IR::ValueOpcode::ImageAtomicUMin32: return OpAtomicUMin;
 		case IR::ValueOpcode::ImageAtomicUMax32: return OpAtomicUMax;
+		case IR::ValueOpcode::ImageAtomicSMin32: return OpAtomicSMin;
+		case IR::ValueOpcode::ImageAtomicSMax32: return OpAtomicSMax;
+		// float min/max: emitted as two integer atomics on the bits (see the emitter)
+		case IR::ValueOpcode::ImageAtomicFMin32: return OpAtomicSMin;
+		case IR::ValueOpcode::ImageAtomicFMax32: return OpAtomicSMax;
 		case IR::ValueOpcode::ImageAtomicAnd32: return OpAtomicAnd;
 		case IR::ValueOpcode::ImageAtomicOr32: return OpAtomicOr;
 		case IR::ValueOpcode::ImageAtomicXor32: return OpAtomicXor;
@@ -1042,12 +1047,48 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			               {OpImageTexelPointer, pointer_type, pointer,
 			                StorageImageDescriptorPointer(state, mem.resource),
 			                CoordU32(ctx, mem, *address, dimension), ConstantU32(state, 0)});
-			           const auto old = state.builder.AllocateId();
-			           state.builder.AddFunction({atomic_opcode, TypeU32(state), old, pointer,
-			                                      ConstantU32(state, ScopeDevice),
+			           const bool is_fmin = op == IR::ValueOpcode::ImageAtomicFMin32;
+			           const bool is_fmax = op == IR::ValueOpcode::ImageAtomicFMax32;
+			           if (!is_fmin && !is_fmax) {
+				           const auto old = state.builder.AllocateId();
+				           state.builder.AddFunction({atomic_opcode, TypeU32(state), old, pointer,
+				                                      ConstantU32(state, ScopeDevice),
+				                                      ConstantU32(state, MemorySemanticsNone),
+				                                      ctx.Arg(inst, 2)});
+				           EmitDeviceAtomicMemoryBarrier(state);
+				           return old;
+			           }
+			           // IMAGE_ATOMIC_FMIN/FMAX on a 32-bit float texel, done with integer atomics on its
+			           // bits (no float atomic feature needed): a value with the sign clear orders like a
+			           // signed int against every texel; one with the sign set orders like an unsigned int
+			           // reversed. fmax: sign clear -> SMax, sign set -> UMin. fmin: SMin / UMax. The atomic
+			           // not taken gets its identity operand (0x80000000 for SMax, 0x7fffffff for SMin,
+			           // 0xffffffff for UMin, 0 for UMax), so it leaves the texel as it is.
+			           const auto value    = ctx.Arg(inst, 2);
+			           const auto negative = state.builder.AllocateId();
+			           state.builder.AddFunction({OpSLessThan, TypeBool(state), negative, value,
+			                                      ConstantU32(state, 0u)});
+			           const auto signed_value = state.builder.AllocateId();
+			           state.builder.AddFunction(
+			               {OpSelect, TypeU32(state), signed_value, negative,
+			                ConstantU32(state, is_fmax ? 0x80000000u : 0x7fffffffu), value});
+			           const auto unsigned_value = state.builder.AllocateId();
+			           state.builder.AddFunction({OpSelect, TypeU32(state), unsigned_value, negative,
+			                                      value,
+			                                      ConstantU32(state, is_fmax ? 0xffffffffu : 0u)});
+			           const auto old_signed = state.builder.AllocateId();
+			           state.builder.AddFunction({is_fmax ? OpAtomicSMax : OpAtomicSMin, TypeU32(state),
+			                                      old_signed, pointer, ConstantU32(state, ScopeDevice),
+			                                      ConstantU32(state, MemorySemanticsNone), signed_value});
+			           const auto old_unsigned = state.builder.AllocateId();
+			           state.builder.AddFunction({is_fmax ? OpAtomicUMin : OpAtomicUMax, TypeU32(state),
+			                                      old_unsigned, pointer, ConstantU32(state, ScopeDevice),
 			                                      ConstantU32(state, MemorySemanticsNone),
-			                                      ctx.Arg(inst, 2)});
+			                                      unsigned_value});
 			           EmitDeviceAtomicMemoryBarrier(state);
+			           const auto old = state.builder.AllocateId();
+			           state.builder.AddFunction(
+			               {OpSelect, TypeU32(state), old, negative, old_unsigned, old_signed});
 			           return old;
 		           }));
 		return true;

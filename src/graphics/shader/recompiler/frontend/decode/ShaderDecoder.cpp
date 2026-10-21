@@ -563,8 +563,12 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_STORE_MIP:
 		case Opcode::IMAGE_ATOMIC_SWAP:
 		case Opcode::IMAGE_ATOMIC_ADD:
+		case Opcode::IMAGE_ATOMIC_SMIN:
 		case Opcode::IMAGE_ATOMIC_UMIN:
+		case Opcode::IMAGE_ATOMIC_SMAX:
 		case Opcode::IMAGE_ATOMIC_UMAX:
+		case Opcode::IMAGE_ATOMIC_FMIN:
+		case Opcode::IMAGE_ATOMIC_FMAX:
 		case Opcode::IMAGE_ATOMIC_AND:
 		case Opcode::IMAGE_ATOMIC_OR:
 		case Opcode::IMAGE_ATOMIC_XOR:

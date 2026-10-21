@@ -1038,6 +1038,14 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicUMin32);
 		case Decoder::Opcode::IMAGE_ATOMIC_UMAX:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicUMax32);
+		case Decoder::Opcode::IMAGE_ATOMIC_SMIN:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSMin32);
+		case Decoder::Opcode::IMAGE_ATOMIC_SMAX:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSMax32);
+		case Decoder::Opcode::IMAGE_ATOMIC_FMIN:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicFMin32);
+		case Decoder::Opcode::IMAGE_ATOMIC_FMAX:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicFMax32);
 		case Decoder::Opcode::IMAGE_ATOMIC_AND:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicAnd32);
 		case Decoder::Opcode::IMAGE_ATOMIC_OR:
