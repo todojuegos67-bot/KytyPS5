@@ -7,8 +7,6 @@
 #   .\run-windows.ps1 -Width 1920 -Height 1080 -Fullscreen
 #   .\run-windows.ps1 -NoRedZone             without guest red-zone protection
 #   .\run-windows.ps1 -Patch <cheat.json>    apply an etaHEN-style game patch
-#   .\run-windows.ps1 -ExclusiveFullscreen   classic exclusive full screen (KYTY_EXCLUSIVE_FULLSCREEN=1;
-#                                            VK_EXT_full_screen_exclusive), not the borderless desktop one
 #   .\run-windows.ps1 -Fullscreen -AspectFit keep the game's 16:9 (black bars) instead of stretching
 #   .\run-windows.ps1 -Hdr                   HDR10 output when Windows HDR is on for the display (the game is
 #                                            told the TV takes HDR and outputs it; SDR otherwise)
@@ -60,7 +58,6 @@ param(
 	[int]$Width = 0,
 	[int]$Height = 0,
 	[switch]$Fullscreen,
-	[switch]$ExclusiveFullscreen,
 	[switch]$Hdr,
 	[switch]$Baseline,
 	[switch]$Precompile,
@@ -89,6 +86,7 @@ param(
 	[switch]$Fsr3FrameGen,
 	[switch]$Turbo,
 	[switch]$Turbo2,
+	[switch]$ExclusiveFullscreen,
 	[switch]$Ram16,
 	[switch]$GentlePrecompile,
 	[ValidateSet('', 'dlss', 'xess', 'fsr')][string]$Upscaler = '',
@@ -219,6 +217,8 @@ for ($i = $start; $i -lt $command.Count; $i++) {
 	if ($command[$i] -eq '--game') { $i++; continue }
 	$options.Add($command[$i])
 }
+# -ExclusiveFullscreen: the window opens full screen and the swapchain takes the display exclusively.
+if ($ExclusiveFullscreen) { $env:KYTY_EXCLUSIVE_FULLSCREEN = '1'; if (-not $options.Contains('--fullscreen')) { $options.Add('--fullscreen') } }
 function Set-Option([string]$name, [string]$value) {
 	$at = $options.IndexOf($name)
 	if ($at -ge 0) { $options[$at + 1] = $value } else { $options.Add($name); $options.Add($value) }
@@ -226,8 +226,6 @@ function Set-Option([string]$name, [string]$value) {
 if ($Width -gt 0) { Set-Option '--screen-width' "$Width" }
 if ($Height -gt 0) { Set-Option '--screen-height' "$Height" }
 if ($Fullscreen) { $options.Add('--fullscreen') }
-# -ExclusiveFullscreen: the window opens full screen and the swapchain takes the display exclusively.
-if ($ExclusiveFullscreen) { $env:KYTY_EXCLUSIVE_FULLSCREEN = '1'; if (-not $options.Contains('--fullscreen')) { $options.Add('--fullscreen') } }
 if ($Hdr) { $options.Add('--hdr') }
 if ($PresentMode) { Set-Option '--present-mode' $PresentMode }
 if ($Language -ge 0) { Set-Option '--console-language' "$Language" }
@@ -381,7 +379,9 @@ if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -m
 # the game upscales it to its 3840x2160 output as it does 1440 (a laptop's RTX 3080 at Boletaria 1-1: standing
 # 20.7 -> 24.5 fps at 1080, walking 18.7 -> 22.2).
 # -Turbo2: the 3D at 1080 at most (its render targets ~45% of 1440's video memory; with an upscaler it stayed under 6 GB).
-if ($Turbo2 -and ($RenderHeight -le 0 -or $RenderHeight -gt 1080)) { $RenderHeight = 1080 }
+# (With an upscaler's ratio Turbo keeps the mode's own size, only no finer than ratio 1.5: Rendimiento stays 720 at 1440.)
+# TURBO juega a 1080p de salida: los modos del reescalador se calculan sobre 1080 (Calidad 720), no sobre el monitor.
+# (10-21) TURBO ya no baja la resolucion (el usuario: "no bajes la resolucion").
 if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
 # -UpscaleRatio <1..4> (with -Upscaler and no -RenderHeight): the 3D at the monitor's height over the ratio (DLAA 1.0,
 # Quality 1.5, Balanced 1.72, Performance 2.0, Ultra Performance 3.0; the monitor detected by the emulator,
@@ -409,8 +409,9 @@ if ($Aspect -and $Aspect -ne '16:9') { $environment['KYTY_RENDER_ASPECT'] = $Asp
 # standard 21.9 fps, lowest 25.6. Not r_forceShadowLOD (until 10-17 in both): it draws objects with their shadow
 # meshes, and objects without one vanish (carts and barricades at the Gates of Boletaria; issue #40), for 6% more.
 $qualityConvars = @{
-	low    = 'r_forceViewportHeightForPixelSizeCalc=720;sunShadowMaxDistance=125'
-	lowest = 'r_forceViewportHeightForPixelSizeCalc=480;sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false'
+	# (10-21) Sin tocar las sombras: acortar su distancia hacia que fueran apareciendo (popping) en TURBO.
+	low    = 'r_forceViewportHeightForPixelSizeCalc=720'
+	lowest = 'r_forceViewportHeightForPixelSizeCalc=480'
 }
 if ($Quality -and $Quality -ne 'standard') {
 	if (!$qualityConvars.Contains($Quality)) { throw "-Quality takes low or lowest (or standard), not '$Quality'" }
@@ -483,12 +484,11 @@ if ($Ram16) {
 # of their size, the game's lowest detail, the working set past 3 GB emptied every 15 s (each empty stalls ~140 ms) (with the guest memory quiet
 # meanwhile: no 0x1A), smaller shader and draw stores.
 if ($Turbo2) {
-	$turboSet = [ordered]@{ KYTY_VRAM_BUDGET_MB = '2560'; KYTY_GC_BUDGET_CAP_MB = '2560'; KYTY_SMALL_VRAM = '1'
+	$turboSet = [ordered]@{ KYTY_VRAM_BUDGET_MB = '2048'; KYTY_GC_BUDGET_CAP_MB = '2048'; KYTY_SMALL_VRAM = '1'
 		KYTY_TEXTURE_REDUCE = '2'; KYTY_TRIM_RAM_SECONDS = '0'; KYTY_IMAGE_POOL = '0'
-		KYTY_NATIVE_XPR_STORE_BUDGET = '64'; KYTY_TABLE_STORE_BUDGET = '4'; KYTY_SIMULATE_RAM_MB = '8192'
-		KYTY_RAM_DIET = '1' }
+		KYTY_NATIVE_XPR_STORE_BUDGET = '64'; KYTY_TABLE_STORE_BUDGET = '4'; KYTY_SIMULATE_RAM_MB = '10240'; KYTY_RAM_DIET = '1' }
 	foreach ($key in $turboSet.Keys) { $environment[$key] = $turboSet[$key] }
-	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars['lowest']) | Where-Object { $_ }) -join ';'
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars['low']) | Where-Object { $_ }) -join ';'
 	Write-Host 'memory:   turbo 2.0 (8-12 GB PCs, 4-6 GB GPUs): video memory caches 2.5 GB, textures a quarter, no RAM trim'
 }
 elseif ($Turbo) {

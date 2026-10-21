@@ -20,6 +20,7 @@ $fgModes = @(
 	@('   Frame generation AMD x3',                     'fsr3-x3.json'),
 	@('   Frame generation AMD x4',                     'fsr3-x4.json'),
 	@('   120 FPS AMD Smooth Souls',                    'fsr3-x3-120.json'),
+	@('   AMD MFG dinamico (x2-x4 automatico)',         'fsr3-mfg-dynamic.json'),
 	@('---------- NVIDIA (RTX) ----------',             ''),
 	@('   Frame generation DLSS x2',                    'dlss-x2.json'),
 	@('   Frame generation DLSS x3',                    'dlss-x3.json'),
@@ -27,7 +28,7 @@ $fgModes = @(
 	@('   200 FPS Nvidia Smooth x5',                    'dlss-x5.json'),
 	@('   216 FPS Nvidia Smooth x6',                    'dlss-x6.json'),
 	@('   120 FPS Nvidia Smooth Souls',                 'dlss-x3-120.json'),
-	@('   DLSS MFG dinamico',                           'dlss-dynamic.json')
+	@('   DLSS MFG dinamico (x2-x4 automatico)',        'dlss-dynamic.json')
 )
 # Reescalado: texto -> altura del 3D (run-windows.ps1 -RenderHeight), reescalador (-Upscale) y altura de salida
 # (-UpscaleHeight; 0 = 1440). DLSS (NVIDIA RTX): DLAA 1x, Ultra calidad 1.3x, Calidad 1.5x, Equilibrado 1.72x,
@@ -36,27 +37,25 @@ $fgModes = @(
 # "juego": el 3D a menos resolucion y lo sube el propio juego.
 $resModes = @(
 	# Upscalers (DLSS, XeSS, FSR): the second column is the ratio of the monitor's height (detected by the emulator)
-	# to the render height: 1440 monitor -> DLAA 1440, Calidad 960, Equilibrado 836, Rendimiento 720, U.rendim. 480
 	# (the game's 4K output needs 720 at least: 720). Others: the render height itself.
 	@('1440p nativo',   1440, '',     0),
 	@('DLSS DLAA',      1.0,  'dlss', 0),
 	@('DLSS U.calidad', 1.3,  'dlss', 0),
-	@('DLSS Calidad',   1.5,  'dlss', 0),
-	@('DLSS Equilib.',  1.72, 'dlss', 0),
+	# (10-21) DLSS sale a 4K por dentro (camino PS5 Pro): solo acepta 3D de 1080 lineas o mas, o 720 exacto
+	# (rendimiento). 960 y 837 (los antiguos Calidad/Equilibrado) dejaban la imagen negra.
+	@('DLSS Calidad',   1.333, 'dlss', 0),
 	@('DLSS Rendim.',   2.0,  'dlss', 0),
-	@('DLSS U.rendim.', 3.0,  'dlss', 0),
 	@('XeSS AA',        1.0,  'xess', 0),
 	@('XeSS U.cal.+',   1.3,  'xess', 0),
 	@('XeSS U.calidad', 1.5,  'xess', 0),
 	@('XeSS Calidad',   1.7,  'xess', 0),
 	@('XeSS Equilib.',  2.0,  'xess', 0),
 	@('XeSS Rendim.',   2.3,  'xess', 0),
-	@('XeSS U.rendim.', 3.0,  'xess', 0),
+	@('FSR AA nativo',  1.0,  'fsr',  0),
 	@('FSR U.calidad',  1.3,  'fsr',  0),
 	@('FSR Calidad',    1.5,  'fsr',  0),
 	@('FSR Equilib.',   1.72, 'fsr',  0),
 	@('FSR Rendim.',    2.0,  'fsr',  0),
-	@('FSR U.rendim.',  3.0,  'fsr',  0),
 	@('1080p juego',    1080, '',     0),
 	@('900p juego',     900,  '',     0),
 	@('720p juego',     720,  '',     0)
@@ -123,11 +122,13 @@ function Start-Game {
 	# (A folder with ram16.txt: the 16 GB profile, run-windows -Ram16.)
 	$ram16 = Test-Path -LiteralPath (Join-Path $root 'ram16.txt')
 	$config = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
+	# (10-21) PC gama baja: el juego a 30 reales (repartidos por igual) y frame generation de AMD x2 = 60.
+	if ($chkLowEnd.Checked) { $config = 'fsr3.json' }
 	# Rutas entre comillas: Start-Process une los argumentos con espacios, y una carpeta con espacios
 	# (C:\Users\Juan Perez\...) partia la ruta y PowerShell se cerraba sin arrancar nada.
 	$psargs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $root 'run-windows.ps1')`"",
 	          '-Exe', "`"$(Join-Path $root $exeName)`"", '-Config', "`"$(Join-Path $root "config\$config")`"", '-Fullscreen')
-	if ($ram16) { $psargs += '-Ram16' }
+	if ($ram16 -or $chkPc16.Checked) { $psargs += '-Ram16' }
 	# HDR10 (solo si "Usar HDR" esta activado en la pantalla de Windows) y VSync (modo FIFO: sin tearing).
 	if ($chkHdr.Checked)   { $psargs += '-Hdr' }
 	if ($chkVsync.Checked) { $psargs += @('-PresentMode', 'Fifo') }
@@ -140,30 +141,48 @@ function Start-Game {
 	# Modo GPU seguro: el trabajo de compute del juego sin solaparse (KYTY_COMPUTE_CHAIN=0), para graficas que se
 	# cuelgan o dan pantallazo azul (~37% menos FPS).
 	$sets = @()
-	# Modo TURBO (run-windows -Turbo): caches de video a 4.5 GB (unos 6 GB en total), texturas a la mitad, detalle bajo
+	# Modo TURBO (run-windows -Turbo): caches de video a 4.5 GB (unos 6 GB en total), texturas a un cuarto, detalle bajo
 	# del juego y la RAM vaciada cada 15 s por encima de 5 GB: para PCs de 16 GB que se cerraban en zonas pesadas.
-	if ($chkTurbo2.Checked) { $psargs += @('-Turbo2', '-Quality', 'lowest', '-TextureReduce', '2') }
-	elseif ($chkLowPc.Checked) { $sets += 'KYTY_SIMULATE_RAM_MB=16384'; $psargs += @('-Turbo', '-Quality', 'low', '-TextureReduce', '1') }
+	if ($chkTurbo2.Checked) { $psargs += @('-Turbo2', '-Quality', 'low', '-TextureReduce', '2') }
+	elseif ($chkLowPc.Checked) { $sets += 'KYTY_SIMULATE_RAM_MB=16384'; $psargs += @('-Turbo', '-Quality', 'low', '-TextureReduce', '2') }
 	if ($chkSafeGpu.Checked) { $sets += 'KYTY_COMPUTE_CHAIN=0' }
+	# Graficos: texturas (0 entera, 1 mitad, 2 cuarto) y distancia de dibujado (-Quality low/lowest: solo el LOD).
+	$psargs += @('-TextureReduce', "$($cmbTex.SelectedIndex)")
+	if ($cmbDist.SelectedIndex -eq 1) { $psargs += @('-Quality', 'low') } elseif ($cmbDist.SelectedIndex -eq 2) { $psargs += @('-Quality', 'lowest') }
+	if ($chkExcl.Checked) { $psargs += '-ExclusiveFullscreen' }
+	# Preset C con la imagen sin HUD (hudless) daba pantalla negra con solo el HUD (10-21): sin ese buffer.
+	# (10-21) Preset C del frame generation de NVIDIA siempre (mas rapido; el emulador solo lo aplica a DLSS-G).
+	$sets += 'KYTY_DLSSG_PRESET=C'
 	# Nitidez del reescalado (KYTY_UPSCALE_SHARPNESS): FSR con su propio RCAS, DLSS y XeSS con un paso de nitidez despues.
 	$sharp = $sharpLevels[[math]::Max(0, $cmbSharp.SelectedIndex)][1]
 	if ($sharp -ne '') { $sets += "KYTY_UPSCALE_SHARPNESS=$sharp" }
 	# FPS desbloqueados con frame generation: el juego deja de estar limitado a 60 reales (KYTY_FRAMEGEN_BASE=0); los
 	# modos Smooth siguen en sus FPS fijos (KYTY_FLIP_FPS) y DLSS-G se limita solo con Reflex al tope del monitor.
 	$fgConfig = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
+	if ($chkLowEnd.Checked) { $fgConfig = 'fsr3.json'; $sets += 'KYTY_FLIP_FPS=30' }
+	# Nombre del modo de frame generation para las metricas.
+	if ($chkLowEnd.Checked) { Set-IniValue 'fglabel' 'MODO PC BAJOS REQUISITOS' } else { Set-IniValue 'fglabel' ($fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][0].Trim()) }
 	if ($chkUnlock.Checked -and $fgConfig -and $fgConfig -ne 'sin-fg.json') { $sets += 'KYTY_FRAMEGEN_BASE=0' }
+	# AMD x4: 56 FPS reales (224 mostrados), por debajo de 240 Hz para que G-SYNC vaya suave.
+	$sets += 'KYTY_FAULT_STATS=1'
+	if ($fgConfig -eq 'fsr3-x4.json') { $sets += 'KYTY_VRR_CAP_FPS=224' }
 	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
 	# hasta 60 reales (FrameGenFloor), videos y menus a 60, y los Smooth (KYTY_FLIP_FPS 40/45) en vblanks justos.
 	# DLSS x4: solo Reflex (56 reales, 224 en pantalla; el modo mas suave, 10-19). x5 (40) y x6 (36)
 	# caen justos en los 360 Hz (9 y 10 vblanks): el juego no dibuja frames de mas que se tirarian antes del DLSS.
-	if ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
+	# (10-21) Modos 224: el juego a 56 reales repartidos por igual (vblank 224, flip cada 4) y x4 = 224; con 360 Hz y
+	# un tope a 56 los 60 del juego se comian 4 frames por segundo (tirones cada 0.25 s).
+	# (10-21 b) Con frame generation siempre 840 Hz y cada frame sale en cuanto esta listo (FLIP_WHEN_READY): por debajo
+	# de 60 los frames ya no se redondean a la rejilla de vblanks (a 40 reales salian con +-3 ms de vaiven: tirones con G-Sync).
+	if ($config -in 'dlss-dynamic.json', 'fsr3-mfg-dynamic.json') { $psargs += @('-Vblank', '840') }  # (10-21: 60 = 14 pulsos, 56 = 15)
+	elseif ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
 	# Sin frame generation, "FPS desbloqueados": vblank de 120 Hz (-Fps120, el modo probado de chenxiao07; a 240 los menus y el intro iban acelerados, 10-18), el juego pasa de 60 (a velocidad real:
 	# gameMinDeltaTime en run-windows); videos, menus y pantallas de carga siguen a 60.
 	# (Desbloqueado sin frame generation: vblank virtual de 360 Hz y cada frame se muestra en cuanto esta listo
 	# (-FlipWhenReady), no al siguiente tick de 120 Hz: a ~80 FPS los frames alternaban 8 y 17 ms (tirones).)
-	elseif ($chkUnlock.Checked) { $psargs += @('-Vblank', '360', '-FlipWhenReady') }
+	elseif ($chkUnlock.Checked) { $psargs += @('-Vblank', '960') }
 	$res    = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
 	if ($res[1] -eq 0) { $res = $resModes[0] }
 	# DLSS (reescalado) carga Streamline de NVIDIA; con la generacion de frames de AMD el emulador se cerraba al crear
@@ -185,14 +204,22 @@ function Start-Game {
 	if ($res[3] -gt 0) { $psargs += @('-UpscaleHeight', "$($res[3])") }
 	$preset = $dlssPresets[[math]::Max(0, $cmbPreset.SelectedIndex)][1]
 	if ($res[2] -like '*dlss' -and $preset) { $psargs += @('-DlssPreset', $preset) }
-	# G-Sync: vblank virtual sin atar a los del monitor, frames mostrados en cuanto estan listos y tope de FPS por
-	# tiempo justo por debajo del refresco (240 Hz -> 224) para no salir del rango VRR.
+	if ($chkVram8.Checked) { $env:KYTY_SIMULATE_VRAM_MB = '8192' } else { Remove-Item Env:KYTY_SIMULATE_VRAM_MB -ErrorAction SilentlyContinue }
+	# Cinematico a 60 quitado (no funcionaba): el modo cinematico queda como en PS5.
+	$env:KYTY_UNLOCK_30 = '0'
+	foreach ($n in 'KYTY_VSYNC_LOCK', 'KYTY_FPS_CAP', 'KYTY_FLIP_WHEN_READY') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
+	# G-Sync: reloj del emulador suelto del monitor. Mostrar cada frame al momento solo con FPS desbloqueados y sin
+	# frame generation; con el juego a 60 (o con frame generation) el ritmo de 60 lo marcan los vblanks y no se toca.
 	if ($chkGsync.Checked) {
-		$env:KYTY_VSYNC_LOCK = '0'; $env:KYTY_FPS_CAP = 'auto'; $env:KYTY_FLIP_WHEN_READY = '1'
-	} else {
-		Remove-Item Env:KYTY_VSYNC_LOCK, Env:KYTY_FPS_CAP, Env:KYTY_FLIP_WHEN_READY -ErrorAction SilentlyContinue
+		$env:KYTY_VSYNC_LOCK = '0'
+		if ($chkUnlock.Checked -and $config -eq 'sin-fg.json') { $env:KYTY_FPS_CAP = 'auto'; $env:KYTY_FLIP_WHEN_READY = '1' }
 	}
 	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Hidden | Out-Null
+	$metArgs = @(); if ($chkRam16.Checked) { $metArgs = @('-RamGB', '16') }
+	if ($chkVram8.Checked) { $metArgs += @('-VramMB', '8192') }
+	# Como administrador solo con el limite de RAM (lo necesita); si no, normal (no molesta a la grabacion de NVIDIA).
+	$metVerb = if ($chkRam16.Checked) { @{ Verb = 'RunAs' } } else { @{} }
+	if ($chkMetricas.Checked -or $chkRam16.Checked -or $chkVram8.Checked) { Start-Process -FilePath 'powershell' -ArgumentList (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ('"' + (Join-Path $root 'metricas.ps1') + '"'), '-LogDir', ('"' + (Join-Path $root 'logs') + '"')) + $metArgs) -WindowStyle Hidden @metVerb -ErrorAction SilentlyContinue | Out-Null }
 	$form.WindowState = 'Minimized'
 }
 
@@ -252,8 +279,8 @@ function New-Button([string]$text, $x, $y, $w, $h, $primary) {
 
 # Barra inferior semitransparente: Play, la casilla del frame generation, Settings y Salir.
 $panel = New-Object System.Windows.Forms.Panel
-$panel.Location  = New-Object System.Drawing.Point(0, ($H - 150))
-$panel.Size      = New-Object System.Drawing.Size($W, 150)
+$panel.Location  = New-Object System.Drawing.Point(0, ($H - 178))
+$panel.Size      = New-Object System.Drawing.Size($W, 178)
 $panel.BackColor = $panelBack
 $form.Controls.Add($panel)
 
@@ -300,23 +327,54 @@ $chkVsync = New-Check 'VSync' 450 100 100 'vsync'
 $chkLowPc = New-Check 'Modo TURBO (16 GB)' 670 14 230 'lowpc'
 $chkUnlock = New-Check 'FPS desbloqueados' 910 14 180 'unlock'
 $chkTurbo2 = New-Check 'TURBO (VRAM 8 GB o menos)' 670 14 230 'turbo2'
+$chkPc16 = New-Check 'Equipo de 16 GB RAM' 670 14 230 'pc16'
+$chkLowEnd = New-Check 'Modo graficas de 8 GB' 910 44 220 'lowend'
+$chkExcl = New-Check 'Pantalla exclusiva' 50 30 180 'exclusive'
+$chkPresetC = New-Check 'DLSS FG Preset C' 1100 44 200 'presetc'
 $chkSafeGpu = New-Check 'Modo GPU seguro' 1100 14 170 'safegpu'
 $tips = New-Object System.Windows.Forms.ToolTip
 $tips.SetToolTip($chkHdr, 'HDR10: activa antes "Usar HDR" en la configuracion de pantalla de Windows')
 $tips.SetToolTip($chkVsync, 'VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando')
 $panel.Controls.Add($chkHdr)
 $panel.Controls.Add($chkVsync)
-$chkGsync = New-Check 'G-Sync' 910 56 180 'gsync'
+$chkGsync = New-Check 'G-Sync' 50 116 120 'gsync'
+$tips.SetToolTip($chkGsync, 'G-Sync / FreeSync: el emulador no ata su reloj a los Hz del monitor (usalo con FPS desbloqueados)')
 $panel.Controls.Add($chkGsync)
+# (10-21: quitada del lanzador; se deja como estaba en uso, activada.)
+$chkGsync.Checked = $true; $chkGsync.Visible = $false
+$chkMetricas = New-Check 'Metricas' 180 116 130 'metricas'
+$tips.SetToolTip($chkMetricas, 'Muestra encima del juego GPU, VRAM, CPU, RAM, FPS y la grafica del frametime')
+$panel.Controls.Add($chkMetricas)
+$chkRam16 = New-Check 'Simular 16 GB RAM' 50 4 200 'ram16sim'
+$tips.SetToolTip($chkRam16, 'Solo el juego: como mucho 12 GB en RAM (4 GB para Windows), el resto a disco, como un PC de 16 GB. Abre las metricas.')
+$panel.Controls.Add($chkRam16)
+$chkVram8 = New-Check 'Simular grafica 8 GB' 260 4 220 'vram8sim'
+$tips.SetToolTip($chkVram8, 'El juego solo puede usar 8 GB de VRAM, como una grafica de 8 GB. Abre las metricas.')
+$panel.Controls.Add($chkVram8)
+$tips.SetToolTip($chkExcl, 'Pantalla completa de toda la vida (exclusiva) en vez de sin bordes: puede ir mejor con G-Sync')
+$panel.Controls.Add($chkExcl)
+# (10-21: quitada; no aportaba nada.)
+$chkExcl.Checked = $false; $chkExcl.Visible = $false
+$tips.SetToolTip($chkPresetC, 'Frame generation de NVIDIA con el Preset C: hasta un 35% mas rapido, algo menos de calidad')
+$panel.Controls.Add($chkPresetC)
+$chkPresetC.Visible = $false
+# (10-21: ocultas hasta arreglar la imagen negra con DLSS-G: pantalla exclusiva y Preset C.)
 $tips.SetToolTip($chkLowPc, 'PCs con 16 GB de RAM o menos o graficas de 8 GB o menos: unos 6 GB de VRAM como maximo, RAM devuelta a Windows cada 15 s, texturas a la mitad y sombras mas cortas. Para que no se cierre en zonas pesadas.')
 # (Un solo TURBO desde 10-20: sin vaciado de RAM los dos solo se diferenciaban en la VRAM.)
 $chkLowPc.Checked = $false
-$tips.SetToolTip($chkTurbo2, 'Graficas de 8 GB o menos: el juego en unos 5.5-6 GB de VRAM (3D a 1080 como maximo, texturas a un cuarto, detalle minimo). Se ve peor, pero no se queda sin memoria de video.')
+$tips.SetToolTip($chkTurbo2, 'Graficas de 8 GB o menos: el juego en unos 5.5-6 GB de VRAM (3D a 1080 como maximo, texturas a un cuarto, detalle bajo). Se ve peor, pero no se queda sin memoria de video.')
 $panel.Controls.Add($chkTurbo2)
+# (10-21) TURBO quitado (se veia raro); en su lugar un modo solo de RAM para equipos de 16 GB.
+$chkTurbo2.Checked = $false; $chkTurbo2.Visible = $false
+$tips.SetToolTip($chkPc16, 'PCs con 16 GB de RAM: el emulador guarda menos en RAM (6 GB fijos) y precarga menos. No cambia los graficos.')
+$panel.Controls.Add($chkPc16)
+$tips.SetToolTip($chkLowEnd, 'Adaptado para graficas de 8 GB como RTX 3060, RTX 3060 Ti, RTX 3070, RTX 2070/2080, RX 6600, RX 6600 XT o RX 6650 XT: el juego a 30 FPS estables y frame generation de AMD x2 (60 en pantalla). Reescalado solo con XeSS o FSR.')
+$panel.Controls.Add($chkLowEnd)
 $tips.SetToolTip($chkUnlock, 'El juego pasa de 60 FPS reales, tambien con frame generation (videos, menus y cargas siguen a 60)')
 # (Oculta otra vez, 10-19: a 120 Hz tirones (frames de 8 y 17 ms alternos a ~80 FPS); a 360 Hz con flip al estar listo,
 # fluido pero una cinematica del motor iba acelerada: el juego ata algunas cosas a los frames.)
 $chkUnlock.Checked = $false
+$panel.Controls.Add($chkUnlock)
 $tips.SetToolTip($chkSafeGpu, 'Para graficas que se cuelgan o dan pantallazo azul: mas estable, ~37% menos FPS')
 $panel.Controls.Add($chkSafeGpu)
 
@@ -364,6 +422,11 @@ function Fill-Res {
 	foreach ($family in (Get-ResFamilies)) {
 		$modes = @($resModes | Where-Object { $(if ($_[2] -eq '' -and $_[1] -ne 1440) { 'juego' } elseif ($_[2] -like 'taa-*') { $_[2] -replace '^taa-(up-)?', '' } else { $_[2] }) -eq $family })
 		if ($family -eq '') { $modes = @($resModes | Where-Object { $_[0] -eq '1440p nativo' }) }
+		# Con TURBO (1080p) solo el antialiasing de cada uno a resolucion nativa (DLAA, XeSS AA, FSR AA): reescalar desde
+		# menos de 1080 se veia peor.
+		# (10-21) TURBO ya no limita la resolucion ni los modos de reescalado.
+		# PC bajos requisitos: sin DLSS (usa el frame generation de AMD x2; solo XeSS, FSR o nativo).
+		if ($chkLowEnd -and $chkLowEnd.Checked -and $family -eq 'dlss') { $modes = @() }
 		if ($modes.Count -eq 0) { continue }
 		if ($titles.ContainsKey($family)) { $shown += , @($titles[$family], 0, '', 0) }
 		foreach ($m in $modes) { $shown += , $m }
@@ -401,6 +464,10 @@ $tips.SetToolTip($cmbRes, 'Reescalado: dibuja el 3D a menos resolucion y lo sube
 $panel.Controls.Add($cmbRes)
 Fill-Res
 $cmbFg.Add_SelectedIndexChanged({ Fill-Res })
+$chkTurbo2.Add_CheckedChanged({ Fill-Res })
+# PC bajos requisitos: la lista de frame generation bloqueada (va con AMD x2) y sin modos DLSS.
+$chkLowEnd.Add_CheckedChanged({ $cmbFg.Enabled = -not $chkLowEnd.Checked; Fill-Res })
+$cmbFg.Enabled = -not $chkLowEnd.Checked
 $cmbFg.Add_DrawItem({ param($sender, $e) Draw-ColoredItem $sender $e })
 
 $cmbPreset = New-Object System.Windows.Forms.ComboBox
@@ -432,6 +499,28 @@ $cmbSharp.Add_SelectedIndexChanged({ Set-IniValue 'sharpness' "$($cmbSharp.Selec
 $tips.SetToolTip($cmbSharp, 'Nitidez del reescalado (DLSS, XeSS y FSR). Mas alto: mas nitido, pero puede marcar bordes y ruido.')
 $panel.Controls.Add($cmbSharp)
 
+# (10-21) Graficos tipo PC: Maximo = el juego tal cual (PS5); nunca baja la resolucion ni toca las sombras.
+$gfxLevels = @('Maximo', 'Medio', 'Bajo')
+$script:gfxTop = @()
+function New-GfxCombo([string]$label, [string]$key, $x, [string]$tip) {
+	$lb = New-Label $label $smallFont $ink $x 6 90 22; $script:gfxTop += $lb
+	$panel.Controls.Add($lb)
+	$c = New-Object System.Windows.Forms.ComboBox
+	$c.DropDownStyle = 'DropDownList'; $c.Font = $smallFont
+	$c.Location = New-Object System.Drawing.Point(($x + 92), 2); $c.Size = New-Object System.Drawing.Size(100, 26)
+	foreach ($l in $gfxLevels) { [void]$c.Items.Add($l) }
+	$i = 0; [void][int]::TryParse((Get-IniValue $key '0'), [ref]$i)
+	$c.SelectedIndex = [math]::Min([math]::Max(0, $i), 2)
+	$c.Tag = $key
+	$c.Add_SelectedIndexChanged({ param($sender, $e) Set-IniValue $sender.Tag "$($sender.SelectedIndex)" })
+	$tips.SetToolTip($c, $tip)
+	$script:gfxTop += $c
+	$panel.Controls.Add($c)
+	return $c
+}
+$cmbTex  = New-GfxCombo 'Texturas' 'gfxtex' 290 'Texturas: Medio = mitad de tamano, Bajo = un cuarto. Lo que mas VRAM ahorra.'
+$cmbDist = New-GfxCombo 'Distancia' 'gfxdist' 500 'Distancia de dibujado: a menos nivel, los objetos lejanos pasan antes a modelos mas simples. Mas FPS si va justo el procesador.'
+
 # Precompilar los shaders del juego (todos, de los archivos del juego): la primera vez puede tardar horas.
 $btnPre = New-Button 'Precompilar shaders' ($W - 610) 46 230 58 $false
 $btnPre.Add_Click({
@@ -456,10 +545,15 @@ $panel.Controls.Add($btnSettings)
 $btnExit = New-Button 'Salir' ($W - 190) 46 140 58 $false
 $btnExit.Add_Click({ $form.Close() })
 $panel.Controls.Add($btnExit)
+# Fila de arriba (10-21): pantalla exclusiva y Preset C; todo lo demas baja 28 px (antes se tapaban con PLAY y Salir).
+foreach ($c in @($panel.Controls)) { if ($c -ne $chkExcl -and $c -ne $chkPresetC -and $script:gfxTop -notcontains $c) { $c.Top += 28 } }
+$chkExcl.Location = New-Object System.Drawing.Point(50, 4)
+$chkPresetC.Location = New-Object System.Drawing.Point(260, 4)
+$chkLowEnd.Location = New-Object System.Drawing.Point(50, 4)
 
 # ---- Settings (panel desplegable) ----
 $settings = New-Object System.Windows.Forms.Panel
-$settings.Location  = New-Object System.Drawing.Point(($W - 650), ($H - 360))
+$settings.Location  = New-Object System.Drawing.Point(($W - 650), ($H - 388))
 $settings.Size      = New-Object System.Drawing.Size(610, 190)
 $settings.BackColor = $panelBack
 $settings.Visible   = $false
