@@ -300,12 +300,13 @@ index 5c47b25..78e6316 100644
      FFX_ASSERT(pRealFrame);
  
      VkImage                currentBackBuffer      = replacementSwapBuffers[currentBackBufferIndex].image;
-@@ -1962,16 +1979,26 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
+@@ -1962,16 +1979,27 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
  
      *pRealFrame = backbuffer;
  
 +    // Kyty MFG: generated frames this present (registered command lists only support one)
-+    const uint32_t numFrames = (registeredInterpolationCommandLists[currentBackBufferIndex] != nullptr) ? 1 : numGeneratedFrames;
++    // (KYTY_FSR3_FG_ACTIVE, set by the emulator at run time: generated frames this present, 1..numGeneratedFrames; dynamic multiplier)
++    const uint32_t numFrames = (registeredInterpolationCommandLists[currentBackBufferIndex] != nullptr) ? 1 : [this] { char v[8] = {}; const DWORD n = GetEnvironmentVariableA("KYTY_FSR3_FG_ACTIVE", v, sizeof(v)); const uint32_t a = (n > 0 && n < sizeof(v)) ? uint32_t(atoi(v)) : numGeneratedFrames; return a < 1u ? 1u : (a > numGeneratedFrames ? numGeneratedFrames : a); }();
 +
      // interpolation queue must wait for output resource to become available
 +    // (Kyty MFG: wait for the latest release among the slot's generated frame images)
