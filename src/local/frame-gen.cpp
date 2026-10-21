@@ -1233,7 +1233,8 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 						g_dyn_pending_n = 0;
 						g_options_set   = false; // send numFramesToGenerate again
 						if (g_dyn_stretch) {
-							const uint32_t us = static_cast<uint32_t>(1000000.0 * (g_dyn_gen + 1) / g_dlssg_target_fps);
+							// Reflex's limit is on shown frames with DLSS-G on (10-21: (gen+1)/target held real at 14 fps on x4).
+							const uint32_t us = static_cast<uint32_t>(1000000.0 / g_dlssg_target_fps);
 							if (us != g_dyn_limit_us) {
 								g_dyn_limit_us      = us;
 								g_reflex_opts.frameLimitUs = us;
