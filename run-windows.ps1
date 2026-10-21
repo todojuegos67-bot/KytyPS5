@@ -529,8 +529,10 @@ if ($vblankHz -gt 60 -and $titleId -match '^PPSA0134[0-2]$' -and "$($environment
 # from the refresh rate (physicsUseFixedTimestep=true, physicsBaseFixedTimestepOnRefreshRate=true: 1/60 s in
 # performance mode, 1/30 s in cinematic; eboot 0x900bdd620 / 0x900bdc730), one step per frame, so above that rate
 # frames can repeat or skip physics-driven motion (judder on VRR). This lets physics step by the frame's real dt.
+# With the GameManager 'Fixed TimeStep' setting on (eboot 0x900b28198), the frame dt also snaps to multiples of
+# fixedDt*gameDeltaTimeCorrectionTolorance (0.5: 8.3 ms steps at 60 Hz); 0.01 makes that 0.17 ms (no effect when off).
 if ("$($environment['KYTY_DS_VARIABLE_STEP'])" -eq '1' -and $titleId -match '^PPSA0134[0-2]$' -and "$($environment['KYTY_GAME_CONVARS'])" -notmatch 'physicsUseFixedTimestep') {
-	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'physicsUseFixedTimestep=false') | Where-Object { $_ }) -join ';'
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'physicsUseFixedTimestep=false', 'gameDeltaTimeCorrectionTolorance=0.01') | Where-Object { $_ }) -join ';'
 }
 
 # The performance cores of a hybrid CPU (Windows' CPU set efficiency classes: an Intel Core with
