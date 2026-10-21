@@ -525,6 +525,13 @@ $vblankHz = if ($Vblank -gt 0) { $Vblank } elseif ($Fps120) { 120 } else { 60 }
 if ($vblankHz -gt 60 -and $titleId -match '^PPSA0134[0-2]$' -and "$($environment['KYTY_GAME_CONVARS'])" -notmatch 'gameMinDeltaTime') {
 	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'gameMinDeltaTime=0.004') | Where-Object { $_ }) -join ';'
 }
+# Experimental, off by default (KYTY_DS_VARIABLE_STEP=1): Demon's Souls steps Havok physics at a fixed step taken
+# from the refresh rate (physicsUseFixedTimestep=true, physicsBaseFixedTimestepOnRefreshRate=true: 1/60 s in
+# performance mode, 1/30 s in cinematic; eboot 0x900bdd620 / 0x900bdc730), one step per frame, so above that rate
+# frames can repeat or skip physics-driven motion (judder on VRR). This lets physics step by the frame's real dt.
+if ("$($environment['KYTY_DS_VARIABLE_STEP'])" -eq '1' -and $titleId -match '^PPSA0134[0-2]$' -and "$($environment['KYTY_GAME_CONVARS'])" -notmatch 'physicsUseFixedTimestep') {
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'physicsUseFixedTimestep=false') | Where-Object { $_ }) -join ';'
+}
 
 # The performance cores of a hybrid CPU (Windows' CPU set efficiency classes: an Intel Core with
 # P- and E-cores), without the core of CPU 0, within the launch's CPUs: a list such as "1,2,3,4,5",
