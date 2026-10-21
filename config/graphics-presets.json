@@ -1,0 +1,77 @@
+{
+  "_comment": "Per-element graphics options for the launcher (one combo per element). 'maximo' is always the game's own PS5 settings (nothing injected). Convars go into KYTY_GAME_CONVARS joined with ';' (Demon's Souls PPSA01340-2 only); 'env' entries are emulator variables. No element lowers the render resolution. 'verified': false means the name exists but its visual/VRAM effect was not measured. Run once with KYTY_GAME_CONVARS_DUMP=1 to list the convar names the eboot holds (log + %TEMP%/kyty-convar-names.txt).",
+  "version": 1,
+  "levels": [
+    { "id": "maximo", "label": "Maximo" },
+    { "id": "medio", "label": "Medio" },
+    { "id": "bajo", "label": "Bajo" }
+  ],
+  "elements": [
+    {
+      "id": "texturas",
+      "label": "Texturas",
+      "description": "Las texturas grandes (BC, 1024 o mas) se guardan sin sus 1 o 2 niveles mas grandes. Solo memoria de video; la resolucion no cambia.",
+      "verified": true,
+      "vram": "1-1: texturas BC 3.7 GiB en Maximo, ~0.9 GiB en Medio; Bajo aun menos (un dieciseisavo por textura reducida)",
+      "evidence": "src/graphics/host_gpu/renderer/pipeline/descriptors.cpp (KYTY_TEXTURE_REDUCE)",
+      "levels": {
+        "maximo": { "env": { "KYTY_TEXTURE_REDUCE": "0" } },
+        "medio": { "env": { "KYTY_TEXTURE_REDUCE": "1" } },
+        "bajo": { "env": { "KYTY_TEXTURE_REDUCE": "2" } }
+      }
+    },
+    {
+      "id": "sombras",
+      "label": "Sombras",
+      "description": "Distancia de las sombras del sol; en Bajo sin sombras de antorchas/luces puntuales ni sombreado ambiental.",
+      "verified": true,
+      "vram": "Sin efecto medido en VRAM (el atlas de sombras de 320 MiB es fijo); ahorra CPU/GPU: sombras ~2600 draws/frame",
+      "evidence": "run-windows.ps1 -Quality low/lowest; docs/EXPERIMENTS.md (sombras 4.95 ms/frame); tools/local/demons-souls-layers.py",
+      "levels": {
+        "maximo": { "convars": [] },
+        "medio": { "convars": ["sunShadowMaxDistance=125"] },
+        "bajo": { "convars": ["sunShadowMaxDistance=60", "r_enableSpotShadows=false", "r_enableAmbientShadowing=false"] }
+      }
+    },
+    {
+      "id": "distancia",
+      "label": "Distancia de dibujado",
+      "description": "Nivel de detalle (LOD) elegido como para una imagen de 720 o 480 lineas: los modelos pasan antes a versiones simples y los pequenos desaparecen antes. NO cambia la resolucion de render. Efecto secundario: sombras de objetos que aparecen al acercarse (pop-in).",
+      "verified": true,
+      "vram": "Poco o ninguno; ahorra CPU (menos draws): 1440, Gates of Boletaria 21.9 -> 25.6 fps junto con Sombras Bajo",
+      "evidence": "run-windows.ps1 qualityConvars (r_forceViewportHeightForPixelSizeCalc only feeds the pixel-size LOD calc; render size is KYTY_RENDER_HEIGHT)",
+      "levels": {
+        "maximo": { "convars": [] },
+        "medio": { "convars": ["r_forceViewportHeightForPixelSizeCalc=720"] },
+        "bajo": { "convars": ["r_forceViewportHeightForPixelSizeCalc=480"] }
+      }
+    },
+    {
+      "id": "efectos",
+      "label": "Efectos",
+      "description": "Medio: sin sombras de contacto y sin profundidad de campo. Bajo: ademas sin calcomanias proyectadas (sangre, manchas, suciedad del suelo).",
+      "verified": false,
+      "vram": "Desconocido; decals = 4860 de ~11000 draws en 1-1 (de ~45 a 60 fps al quitarlos)",
+      "evidence": "tools/local/demons-souls-layers.py (r_contactShadowsEnabled, r_dofEnable registered bools); .claude/skills/ps5-emu-optimization/references/demons-souls.md (r_projectedDecalEnable, diagnostic only)",
+      "levels": {
+        "maximo": { "convars": [] },
+        "medio": { "convars": ["r_contactShadowsEnabled=false", "r_dofEnable=false"] },
+        "bajo": { "convars": ["r_contactShadowsEnabled=false", "r_dofEnable=false", "r_projectedDecalEnable=false"] }
+      }
+    },
+    {
+      "id": "niebla",
+      "label": "Niebla / Volumetricos",
+      "description": "Pendiente: el apagado de la niebla volumetrica se midio (+4.6%) escribiendo el byte del convar, pero su nombre aun no se conoce. Ejecutar con KYTY_GAME_CONVARS_DUMP=1 y buscar 'fog'/'volumetric'.",
+      "verified": false,
+      "available": false,
+      "vram": "Desconocido",
+      "evidence": "docs/EXPERIMENTS.md (volumetric fog off 40.30 -> 42.15 fps, by object byte, no name)",
+      "levels": {
+        "maximo": { "convars": [] },
+        "medio": { "convars": [] },
+        "bajo": { "convars": [] }
+      }
+    }
+  ]
+}

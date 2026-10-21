@@ -1,7 +1,12 @@
 #include "loader/gameArgs.h"
 
 #include "common/file.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "loader/demonsSoulsSuperResolution.h"
+#include "loader/runtimeLinker.h"
+
+#include <algorithm>
+#include <set>
 
 #include <cctype>
 #include <cstdio>
@@ -103,6 +108,74 @@ std::optional<uint64_t> RedirectedSize(const std::filesystem::path& real) {
 	const auto kind = KindOf(real);
 	if (kind == Kind::None) return std::nullopt;
 	return Contents(real, kind).size();
+}
+
+namespace {
+bool IdentChar(unsigned char c) { return std::isalnum(c) != 0 || c == '_'; }
+
+bool Interesting(const std::string& name, int mode) {
+	if (name.size() < 6 || name.size() > 80 || std::isalpha(static_cast<unsigned char>(name[0])) == 0) return false;
+	std::string lower = name;
+	for (auto& c: lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	if (lower.rfind("r_", 0) == 0) return true;
+	static const char* const keys[] = {"shadow", "texture", "stream", "lod", "fog", "volumetric", "ssr", "ambientocc",
+	                                   "decal", "particle", "fur", "hair", "cloth", "probe", "reflection", "resolution",
+	                                   "budget", "pool", "mip", "cascade", "pixelsize", "drawdistance", "viewdistance",
+	                                   "cvar", "convar"};
+	bool key = false;
+	for (const auto* k: keys) key = key || lower.find(k) != std::string::npos;
+	bool has_upper = false;
+	for (char c: name) has_upper = has_upper || std::isupper(static_cast<unsigned char>(c)) != 0;
+	// An identifier, not a sentence or a path: camelCase or snake_case, no spaces (guaranteed by the scan).
+	const bool shaped = has_upper || name.find('_') != std::string::npos;
+	if (key && shaped) return true;
+	if (mode >= 2) {
+		if (lower.rfind("g_", 0) == 0 || lower.rfind("s_", 0) == 0) return true;
+		return name.size() >= 8 && has_upper && std::islower(static_cast<unsigned char>(name[0])) != 0;
+	}
+	return false;
+}
+} // namespace
+
+void DumpConvarNames(const Program* program) {
+	const char* value = std::getenv("KYTY_GAME_CONVARS_DUMP");
+	const int   mode  = value != nullptr ? std::atoi(value) : 0;
+	if (mode <= 0 || program == nullptr || program->file_name.filename() != "eboot.bin") return;
+	std::set<std::string> names;
+	constexpr uint64_t    Page = 0x4000;
+	const uint64_t        base = program->base_vaddr, end = base + program->mapped_size;
+	std::string           run;
+	for (uint64_t page = base; page < end; page += Page) {
+		const uint64_t size = std::min(Page, end - page);
+		if (!Libs::Graphics::HostMemoryRangeIsReadable(page, size)) {
+			run.clear();
+			continue;
+		}
+		const auto* bytes = reinterpret_cast<const unsigned char*>(page);
+		for (uint64_t i = 0; i < size; i++) {
+			if (IdentChar(bytes[i])) {
+				run += static_cast<char>(bytes[i]);
+				if (run.size() > 96) run.clear();
+				continue;
+			}
+			// A whole NUL-terminated identifier string (the name as the game registers it).
+			if (bytes[i] == 0 && Interesting(run, mode)) names.insert(run);
+			run.clear();
+		}
+	}
+	std::string text;
+	for (const auto& name: names) text += name + "\n";
+	std::error_code error;
+	const auto      path = std::filesystem::temp_directory_path(error) / "kyty-convar-names.txt";
+	if (!error) {
+		std::ofstream out(path, std::ios::binary | std::ios::trunc);
+		out.write(text.data(), static_cast<std::streamsize>(text.size()));
+	}
+	std::printf("Game convars: %zu candidate names in the eboot (KYTY_GAME_CONVARS_DUMP=%d; list also in %s)\n%s"
+	            "Game convars: overrides in effect (KYTY_GAME_CONVARS):\n%s",
+	            names.size(), mode, error ? "(no temp folder)" : path.string().c_str(), text.c_str(),
+	            ExtraLines().empty() ? "(none)\n" : ExtraLines().c_str());
+	std::fflush(stdout);
 }
 
 } // namespace Loader::GameArgs
