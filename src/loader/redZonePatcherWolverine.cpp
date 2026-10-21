@@ -3,8 +3,8 @@
 
 // The Wolverine fork's red-zone patcher (idxtri/wolverine-v1 guestInstructionPatcher), kept beside this
 // emulator's patcher: Marvel's Wolverine (PPSA03671) boots only with it (with the default patcher a call rewritten
-// through its trampoline passes a stale stack argument and the game faults at eboot+0x39fe867). Selected per title
-// in runtimeLinker.cpp (KYTY_REDZONE_PATCHER=wolverine|default overrides). Reciprocal square root traps are not
+// through its trampoline passes a stale stack argument and the game faults at eboot+0x39fe867). Used for every title
+// but Demon's Souls (KYTY_REDZONE_PATCHER=wolverine|default overrides; see UseWolverineRedZonePatcher). Reciprocal square root traps are not
 // ported. Everything lives in Loader::RedZoneWolverine so the two patchers keep separate module tables.
 
 #include "loader/redZonePatcher.h"
@@ -1553,11 +1553,15 @@ bool UseWolverineRedZonePatcher() {
 			wolverine = true;
 		} else if (env == nullptr || std::strcmp(env, "default") != 0) {
 			std::string title;
-			wolverine = SystemContentParamSfoGetString("TITLE_ID", &title) && title == "PPSA03671";
+			// Demon's Souls (PPSA01340/1/2) keeps this emulator's patcher, made and measured on it.
+			// Every other title takes the official KytyPS5 / Wolverine fork lineage: Wolverine boots only
+			// with it, and it is the one official builds run Astro Bot with.
+			const bool known = SystemContentParamSfoGetString("TITLE_ID", &title);
+			wolverine = known && title != "PPSA01340" && title != "PPSA01341" && title != "PPSA01342";
 		}
 		if (wolverine) {
-			std::printf("Red-zone patcher: the Wolverine fork's (KYTY_REDZONE_PATCHER=default uses this "
-			            "emulator's)\n");
+			std::printf("Red-zone patcher: the official/Wolverine fork's (KYTY_REDZONE_PATCHER=default: the "
+			            "Demon's Souls one)\n");
 		}
 		return wolverine;
 	}();

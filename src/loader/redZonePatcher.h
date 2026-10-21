@@ -49,8 +49,8 @@ bool               DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, ui
                                                std::vector<uintptr_t>* function_starts);
 } // namespace RedZoneWolverine
 
-// True when this process uses the Wolverine fork's patcher: KYTY_REDZONE_PATCHER=wolverine, or the title is
-// Marvel's Wolverine (PPSA03671) and KYTY_REDZONE_PATCHER is not "default".
+// True when this process uses the Wolverine fork's patcher: KYTY_REDZONE_PATCHER=wolverine, or any title but
+// Demon's Souls (PPSA01340/1/2) when KYTY_REDZONE_PATCHER is not "default".
 bool UseWolverineRedZonePatcher();
 
 } // namespace Loader
