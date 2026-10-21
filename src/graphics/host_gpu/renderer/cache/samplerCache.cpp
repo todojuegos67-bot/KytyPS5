@@ -123,8 +123,7 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		static uint32_t border_count = 0; // (under m_mutex)
 		const uint32_t  n = ++border_count;
 		if (n <= 4 || (n & (n - 1)) == 0) {
-			std::printf("Samplers: %u with a %s border (%s colors; KYTY_SAMPLER_INT_BORDER=1 for INT)
-", n, what,
+			std::printf("Samplers: %u with a %s border (%s colors; KYTY_SAMPLER_INT_BORDER=1 for INT)\n", n, what,
 			            int_border ? "INT" : "float");
 			std::fflush(stdout);
 		}
