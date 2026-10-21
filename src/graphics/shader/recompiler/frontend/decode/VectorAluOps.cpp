@@ -679,6 +679,18 @@ void DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 	ReadLiteralOperands(code, word_index, inst);
 }
 
+// DPP8: the second dword holds the source VGPR (bits 0-7) and eight 3-bit lane selects (bits 8-31).
+uint32_t Dpp8Source(std::span<const uint32_t> code, uint32_t word_index) {
+	return 256u + (code[word_index + 1u] & 0xffu);
+}
+
+void ApplyDpp8(Instruction& inst, std::span<const uint32_t> code, uint32_t word_index, bool fetch_inactive) {
+	inst.src0.dpp8                = true;
+	inst.src0.dpp8_fetch_inactive = fetch_inactive;
+	inst.src0.dpp8_sel            = code[word_index + 1u] >> 8u;
+	SetRawWords(inst, code, word_index, 2);
+}
+
 void ApplyDppModifier(Operand& operand, uint32_t modifier) {
 	operand.negate             = ((modifier >> 20u) & 0x1u) != 0u;
 	operand.absolute           = ((modifier >> 21u) & 0x1u) != 0u;
@@ -1470,6 +1482,14 @@ void DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	switch (src0) {
 		case 249u: DecodeVop2Sdwa(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
 		case 250u: DecodeVop2Dpp(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
+		case 233u:
+		case 234u:
+			DecodeVectorGpr(vdst, inst.dst);
+			DecodeVectorGpr(vsrc1, inst.src1);
+			DecodeScalarSource(Dpp8Source(code, word_index), pc, inst.src0);
+			ApplyDpp8(inst, code, word_index, src0 == 234u);
+			FinalizeVop2Instruction(code, word_index, inst);
+			return;
 		default: break;
 	}
 
@@ -1512,6 +1532,12 @@ void DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	} else {
 		DecodeVectorGpr(vdst, inst.dst);
 	}
+	if (src0 == 233u || src0 == 234u) {
+		DecodeScalarSource(Dpp8Source(code, word_index), pc, inst.src0);
+		ApplyDpp8(inst, code, word_index, src0 == 234u);
+		inst.src_count = 1;
+		return;
+	}
 	DecodeScalarSource(src0, pc, inst.src0);
 	inst.src_count = 1;
 	ReadLiteralOperands(code, word_index, inst);
@@ -1541,6 +1567,12 @@ void DecodeVopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return;
 	}
 	DecodeVectorGpr(vsrc1, inst.src1);
+	if (src0 == 233u || src0 == 234u) {
+		DecodeScalarSource(Dpp8Source(code, word_index), pc, inst.src0);
+		ApplyDpp8(inst, code, word_index, src0 == 234u);
+		inst.src_count = 2;
+		return;
+	}
 	DecodeScalarSource(src0, pc, inst.src0);
 	inst.src_count = 2;
 	ReadLiteralOperands(code, word_index, inst);

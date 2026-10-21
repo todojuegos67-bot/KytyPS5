@@ -1,6 +1,7 @@
 #include "emulator.h"
 
 #include "common/abi.h"
+#include <cstdio>
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -211,10 +212,16 @@ void Run(const RunOptions& options) {
 	MountSandboxDirs();
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	std::printf("Boot: registering the system libraries\n");
+	std::fflush(stdout);
 	Libs::InitAll(rt->Symbols());
 
+	std::printf("Boot: loading %s\n", Common::PathToString(options.elf).c_str());
+	std::fflush(stdout);
 	LoadElf(options.elf);
 
+	std::printf("Boot: starting the game\n");
+	std::fflush(stdout);
 	Execute(options.game_patch);
 }
 
