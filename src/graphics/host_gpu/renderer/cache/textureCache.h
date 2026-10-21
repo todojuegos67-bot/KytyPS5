@@ -90,6 +90,9 @@ public:
 	// DCC metadata (whose pending fast clears FindTexture applies: the caller checks IsMetaCleared), and with
 	// `storage_dcc` one written as storage too.
 	[[nodiscard]] bool IsSampledImageCurrent(ImageId id, const ImageDesc& desc, bool storage_dcc = false);
+	// The view's levels and layers lie in the image `desc` describes. FindImage moves a view into a larger image it found
+	// (its first level and layer in that image), so a description it was given is not a request of its own any more.
+	[[nodiscard]] static bool ViewFitsImage(const ImageDesc& desc);
 	// A depth image sampled through a view of its memory (FindImage takes it through ResolveDepthOverlap, a 32-bit
 	// float view of a D32S8 image having no format of the same class, or through its stencil plane's association): the
 	// lookup finds it again while no image was registered or unregistered over the view's pages since `epoch` (the same

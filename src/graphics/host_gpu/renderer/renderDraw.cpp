@@ -730,7 +730,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
-			target.image_id = cache.FindImage(target.desc);
+			// (Asked again as at first: the lookup moved the view into the image it found then, a larger one.)
+			target.desc.view_info.base_level = target.guest_mip_level;
+			target.desc.view_info.base_layer = target.guest_array_layer;
+			target.image_id                  = cache.FindImage(target.desc);
 			BindRenderTarget(target.image_id);
 		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);

@@ -1261,15 +1261,18 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	return id;
 }
 
+bool TextureCache::ViewFitsImage(const ImageDesc& desc) {
+	const auto& view      = desc.view_info;
+	const auto& resources = desc.info.resources;
+	return view.level_count != 0 && view.layer_count != 0 && view.base_level < resources.levels &&
+	       view.level_count <= resources.levels - view.base_level &&
+	       (desc.info.IsVolume() ||
+	        (view.base_layer < resources.layers && view.layer_count <= resources.layers - view.base_layer));
+}
+
 void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
 	ImageOps::Validate(desc.info);
-	if (desc.view_info.format == vk::Format::eUndefined || desc.view_info.level_count == 0 ||
-	    desc.view_info.layer_count == 0 ||
-	    desc.view_info.base_level >= desc.info.resources.levels ||
-	    desc.view_info.level_count > desc.info.resources.levels - desc.view_info.base_level ||
-	    (!desc.info.IsVolume() &&
-	     (desc.view_info.base_layer >= desc.info.resources.layers ||
-	      desc.view_info.layer_count > desc.info.resources.layers - desc.view_info.base_layer))) {
+	if (desc.view_info.format == vk::Format::eUndefined || !ViewFitsImage(desc)) {
 		EXIT("TextureCache: invalid image view description\n");
 	}
 	if (desc.type == BindingType::DepthTarget && !IsSupportedDepthTargetFormat(desc.info)) {
