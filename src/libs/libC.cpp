@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -75,6 +76,8 @@ const char** GetArgv() {
 static KYTY_SYSV_ABI void exit(int code) {
 	PRINT_NAME();
 
+	std::printf("Exit: the game called exit(%d) (%s) from %p\n", code, "libc", __builtin_return_address(0));
+	std::fflush(stdout);
 	::exit(code);
 }
 

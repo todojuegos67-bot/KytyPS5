@@ -1624,8 +1624,11 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	}
 #endif
 
+	std::printf("Boot: loading the adjacent modules\n"); std::fflush(stdout);
 	PreloadAdjacentPrograms();
+	std::printf("Boot: relocating %zu module(s)\n", m_programs.size()); std::fflush(stdout);
 	RelocateAll();
+	std::printf("Boot: relocated; game patches and title hooks\n"); std::fflush(stdout);
 
 	if (!game_patch.empty()) {
 		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),
@@ -1643,7 +1646,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsRenderSize::InstallSixtyStep(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsSceneGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsTouchGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
+	std::printf("Boot: starting the modules\n"); std::fflush(stdout);
 	StartAllModules();
+	std::printf("Boot: modules started; entering the game's entry point\n"); std::fflush(stdout);
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
@@ -2087,8 +2092,16 @@ int RuntimeLinker::StartModule(Program* program, size_t args, const void* argp,
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Start module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
 
-	return reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->init_vaddr +
-	                                                program->base_vaddr)(args, argp, func);
+	std::printf("Boot: %s: module start (init at 0x%016" PRIx64 ")\n",
+	            Common::PathToString(program->file_name.filename()).c_str(),
+	            program->dynamic_info->init_vaddr + program->base_vaddr);
+	std::fflush(stdout);
+	const int result = reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->init_vaddr +
+	                                                            program->base_vaddr)(args, argp, func);
+	std::printf("Boot: %s: module start returned %d\n", Common::PathToString(program->file_name.filename()).c_str(),
+	            result);
+	std::fflush(stdout);
+	return result;
 }
 
 int RuntimeLinker::StopModule(Program* program, size_t args, const void* argp, module_func_t func) {

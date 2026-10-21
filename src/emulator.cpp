@@ -179,6 +179,8 @@ static void Execute(const std::filesystem::path& game_patch) {
 	    },
 	    &patch_path);
 	Libs::Graphics::WindowRun();
+	std::printf("Exit: the window loop ended (window closed or quit event); the process ends\n");
+	std::fflush(stdout);
 	std::quick_exit(0);
 }
 

@@ -254,6 +254,22 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 		           : EXCEPTION_CONTINUE_SEARCH;
 	}
 
+	// First-chance exceptions other than the access violations and guard pages the emulator uses for memory
+	// tracking (C++ throws, breakpoints, fast-fail-like codes, invalid handles...): the first 64 are printed, so a
+	// process that vanishes says what it met last (KYTY_LOG_FIRST_CHANCE=1 prints access violations too).
+	{
+		static const bool all = [] {
+			const char* env = std::getenv("KYTY_LOG_FIRST_CHANCE");
+			return env != nullptr && env[0] == '1';
+		}();
+		static std::atomic<uint32_t> printed {0};
+		const auto code = exception_record->ExceptionCode;
+		if ((all || code != EXCEPTION_ACCESS_VIOLATION) && printed.fetch_add(1, std::memory_order_relaxed) < 64u) {
+			std::printf("First-chance exception 0x%08lx at %p (thread %lu)\n", static_cast<unsigned long>(code),
+			            exception_record->ExceptionAddress, GetCurrentThreadId());
+			std::fflush(stdout);
+		}
+	}
 	if (exception_record->ExceptionCode == EXCEPTION_STACK_OVERFLOW && !g_fatal_reported.load(std::memory_order_relaxed)) {
 		ReportFatal("stack overflow");
 		return EXCEPTION_CONTINUE_SEARCH;
