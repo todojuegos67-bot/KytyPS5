@@ -619,6 +619,29 @@ bool CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR&
 	create.asyncComputeQueue = {g_async_queue, g_compute_family, nullptr};
 	create.presentQueue      = {g_present_queue, graphics.queue_family, nullptr};
 	create.imageAcquireQueue = {g_acquire_queue, g_compute_family, nullptr};
+	{
+		// Pacing floor (the patched amd_fidelityfx_vk.dll, tools/local/fsr3-mfg; AMD's signed DLL ignores it): no present
+		// of the frame interpolation swapchain closer than the display's refresh period x KYTY_FSR3_PACING_FLOOR (default 1.0,
+		// 0 off). Its pacer spaces presents by (real frame time) / (generated + 1) less the variance and a 0.1 ms margin:
+		// at x4 from 59-60 real fps that is under 4.17 ms on a 240 Hz display, a present above the G-SYNC ceiling.
+		static bool logged = false;
+		double      factor = 1.0;
+		if (const char* text = std::getenv("KYTY_FSR3_PACING_FLOOR"); text != nullptr && *text != '\0') factor = std::strtod(text, nullptr);
+		DEVMODEA mode {};
+		mode.dmSize = sizeof(mode);
+		const bool refresh = EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) != 0 && mode.dmDisplayFrequency > 30;
+		if (factor > 0.0 && refresh) {
+			const double floor_us = 1000000.0 / mode.dmDisplayFrequency * factor;
+			SetEnvironmentVariableA("KYTY_FSR3_PACING_FLOOR_US", std::to_string(floor_us).c_str());
+			if (!logged) std::printf("FSR3 FG: present pacing floor %.3f ms (display %lu Hz x %.2f; KYTY_FSR3_PACING_FLOOR=0 off)\n",
+			                         floor_us / 1000.0, static_cast<unsigned long>(mode.dmDisplayFrequency), factor);
+		} else {
+			SetEnvironmentVariableA("KYTY_FSR3_PACING_FLOOR_US", nullptr);
+			if (!logged) std::printf("FSR3 FG: no present pacing floor (%s)\n", refresh ? "KYTY_FSR3_PACING_FLOOR=0" : "display refresh unknown");
+		}
+		logged = true;
+		std::fflush(stdout);
+	}
 	const auto result        = g_ffx.CreateContext(&g_swapchain_context, &create.header, nullptr);
 	if (result != FFX_API_RETURN_OK || swapchain == VK_NULL_HANDLE) {
 		std::printf("FSR3 FG: frame generation swapchain not created (%u): frame generation off\n", result);

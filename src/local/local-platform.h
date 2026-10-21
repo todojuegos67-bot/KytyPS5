@@ -71,6 +71,8 @@ void MakeCriticalThread();
 
 // The refresh rate in Hz of the display a window is on (its HWND on Windows; 0 when unknown or elsewhere).
 int DisplayRefreshHz(void* window);
+// The HMONITOR of the display a window is on (its HWND on Windows; nullptr when unknown or elsewhere).
+void* MonitorHandle(void* window);
 // The height in pixels of the current mode of the display a window is on (nullptr: the primary display; its HWND on
 // Windows; 0 when unknown or elsewhere): the monitor's native resolution as set, independent of DPI scaling.
 uint32_t DisplayHeight(void* window);

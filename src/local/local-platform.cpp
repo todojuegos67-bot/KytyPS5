@@ -929,6 +929,10 @@ void SleepUntilPrecise(int64_t deadline_ns) {
 	while (clock::now() < deadline) YieldProcessor();
 }
 
+void* MonitorHandle(void* window) {
+	return window != nullptr ? static_cast<void*>(MonitorFromWindow(static_cast<HWND>(window), MONITOR_DEFAULTTONEAREST)) : nullptr;
+}
+
 int DisplayRefreshHz(void* window) {
 	HMONITOR       monitor = nullptr;
 	MONITORINFOEXW info {};
@@ -1926,6 +1930,10 @@ void SleepUntilPrecise(int64_t deadline_ns) {
 	const auto coarse   = deadline - std::chrono::microseconds(500);
 	if (clock::now() < coarse) std::this_thread::sleep_until(coarse);
 	while (clock::now() < deadline) {}
+}
+
+void* MonitorHandle(void* /*window*/) {
+	return nullptr;
 }
 
 int DisplayRefreshHz(void* /*window*/) {
