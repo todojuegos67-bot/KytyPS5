@@ -22,7 +22,8 @@ inline std::atomic<bool>  menu_open {false};  // the options menu is shown: no f
 inline std::atomic<const char*> fg_label {nullptr}; // null: no line
 inline std::atomic<int>         fg_vendor {0};      // 1 NVIDIA (green), 2 AMD (red)
 inline std::atomic<const char*> gfx_line {nullptr}; // the graphics options line under it (null: none)
-inline std::atomic<int>         fg_now {0};         // shown frames per real frame (x2...); 0: unknown
+inline std::atomic<int>         fg_now {0};
+inline std::atomic<bool>        fg_plain {false};   // the label alone (no "FG", no multiplier)         // shown frames per real frame (x2...); 0: unknown
 
 // The port's hooks (null in the emulator): set once by the port's main before the game starts.
 struct Hooks {

@@ -618,7 +618,8 @@ void InstallMenu(const Runtime& runtime) {
 	ApplyLive(runtime.launched);
 	const std::string fg = runtime.launched.low_end ? std::string("amd-x2") : runtime.launched.framegen;
 	if (fg != "sin-fg" && !fg.empty()) {
-		PortLive::fg_label  = FrameGenLabel(fg);
+		PortLive::fg_label  = runtime.launched.low_end ? "MODO PC BAJOS REQUISITOS" : FrameGenLabel(fg);
+		PortLive::fg_plain  = runtime.launched.low_end;
 		PortLive::fg_vendor = fg.rfind("dlss", 0) == 0 ? 1 : 2;
 		PortLive::fg_now    = fg == "amd-x2" ? 2 : (fg == "amd-x3" || fg == "amd-120") ? 3 : fg == "amd-x4" ? 4 : 0;
 	}

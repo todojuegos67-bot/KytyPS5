@@ -1196,7 +1196,8 @@ struct SystemOverlay::Impl {
 					const ImVec4 color = PortLive::fg_vendor.load(std::memory_order_relaxed) == 1 ? ImVec4 {0.46f, 0.73f, 0.0f, 1.0f}
 					                                                                               : ImVec4 {0.93f, 0.11f, 0.14f, 1.0f};
 					ImGui::PushFont(hud_font, 21.0f * unit);
-					if (now > 1) ImGui::TextColored(color, "FG %s (ahora x%d)", fg, now);
+					if (PortLive::fg_plain.load(std::memory_order_relaxed)) ImGui::TextColored(color, "%s", fg);
+					else if (now > 1) ImGui::TextColored(color, "FG %s (ahora x%d)", fg, now);
 					else ImGui::TextColored(color, "FG %s", fg);
 					ImGui::PopFont();
 				}
