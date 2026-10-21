@@ -156,7 +156,6 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	num("idioma", s->language);
 	boo("copia_partidas", s->backup_saves);
 	boo("pantalla_completa", s->fullscreen);
-	boo("pantalla_exclusiva", s->exclusive);
 	num("ancho", s->width);
 	num("alto", s->height);
 	boo("hdr", s->hdr);
@@ -198,8 +197,6 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "copia_partidas=" << b(s.backup_saves) << "\n\n"
 	  << "[Pantalla]\n"
 	  << "pantalla_completa=" << b(s.fullscreen) << "\n"
-	  << "; Pantalla completa exclusiva (con pantalla_completa=1): la pantalla para el juego solo\n"
-	  << "pantalla_exclusiva=" << b(s.exclusive) << "\n"
 	  << "; Tamano de la ventana (sin pantalla completa)\n"
 	  << "ancho=" << s.width << "\nalto=" << s.height << "\n"
 	  << "; HDR10: solo si \"Usar HDR\" esta activado en la configuracion de pantalla de Windows\n"
@@ -378,7 +375,6 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 			env.Set("KYTY_FLIP_WHEN_READY", "1");
 		}
 	}
-	if (s.fullscreen && s.exclusive) env.Set("KYTY_EXCLUSIVE_FULLSCREEN", "1");
 	env.Set("KYTY_DLSSG_PRESET", "C"); // (always: the emulator applies it to nvngx_dlssg only)
 	// The port's own: metrics (the launcher started metricas.ps1; here the in-game panel) and rumble.
 	env.Set("KYTY_FPS_HUD", s.metrics == "1" || s.metrics == "2" ? s.metrics : "");
@@ -403,7 +399,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 
 bool NeedsRestart(const Settings& l, const Settings& n) {
 	// Live: sharpness, the fps cap, metrics and rumble.
-	return l.game != n.game || l.exclusive != n.exclusive || l.language != n.language || l.fullscreen != n.fullscreen || l.width != n.width ||
+	return l.game != n.game || l.language != n.language || l.fullscreen != n.fullscreen || l.width != n.width ||
 	       l.height != n.height || l.hdr != n.hdr || l.vsync != n.vsync || l.gsync != n.gsync ||
 	       l.unlock_fps != n.unlock_fps || l.aspect_fit != n.aspect_fit || l.aspect != n.aspect || l.res != n.res ||
 	       l.dlss_preset != n.dlss_preset || l.framegen != n.framegen || l.turbo != n.turbo ||

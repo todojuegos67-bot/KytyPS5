@@ -433,7 +433,6 @@ void Draw(float width, float height) {
 			switch (t) {
 				case 0: {
 					CheckRow("Pantalla completa", true, s.fullscreen);
-					CheckRow("Pantalla completa exclusiva", true, s.exclusive, "Con pantalla completa: la pantalla solo para el juego");
 					CheckRow("HDR", true, s.hdr, "HDR10: solo con \"Usar HDR\" activado en Windows");
 					CheckRow("VSync", true, s.vsync);
 					CheckRow("G-Sync / FreeSync", true, s.gsync, "El reloj del emulador no se ata a los Hz del monitor");

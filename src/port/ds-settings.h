@@ -46,7 +46,6 @@ struct Settings {
 	bool        backup_saves = true;
 	// [Pantalla]
 	bool        fullscreen = true;
-	bool        exclusive = false; // KYTY_EXCLUSIVE_FULLSCREEN (with fullscreen)
 	int         width = 2560, height = 1440; // the window's (fullscreen: the desktop's size is used)
 	bool        hdr = false;
 	bool        vsync = false;
