@@ -48,9 +48,12 @@ Esta junto al exe y tiene comentarios en cada opcion. Equivalencias con el lanza
                       frame generation de AMD x2 (60 en pantalla), fija. Reescalado solo con XeSS o FSR
                       (un modo DLSS guardado pasa a nativo).
   gpu_seguro        = Modo GPU seguro.     simular_vram_8gb = Simular grafica 8 GB.
-  calidad           = detalle del juego (standard / low / lowest).  reducir_texturas = auto / 0 / 1 / 2.
+  reducir_texturas  = Texturas: 0 Maximo, 1 Medio (mitad), 2 Bajo (un cuarto).
+  calidad           = Distancia de dibujado: standard Maximo (el juego tal cual), low Medio, lowest Bajo
+                      (solo el detalle lejano).
   metricas          = panel de FPS dentro del juego (0 / 1 / 2), con el modo de frame generation y su
-                      multiplicador actual (verde NVIDIA, rojo AMD) (antes: Metricas abria metricas.ps1).
+                      multiplicador actual (verde NVIDIA, rojo AMD; los FPS en blanco sin frame generation) y
+                      el nivel de Texturas y Distancia de dibujado (antes: Metricas abria metricas.ps1).
   vibracion, vibracion_fuerza = vibracion del mando desde el audio haptico (KYTY_HAPTIC_RUMBLE / _GAIN).
   extra             = interruptores del emulador (KYTY_X=1;KYTY_Y=2), como -Set de run-windows.ps1.
 

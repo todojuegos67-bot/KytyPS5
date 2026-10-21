@@ -38,10 +38,10 @@ const Choice kSharpness[] = {{"auto", "Auto"}, {"0", "0"}, {"0.25", "25%"}, {"0.
 const int    kSharpnessCount = 6;
 const Choice kDlssPresets[] = {{"auto", "Auto (NVIDIA)"}, {"K", "DLSS 4 (K)"}, {"L", "DLSS 4.5 (L)"}, {"M", "DLSS 4.5 (M)"}};
 const int    kDlssPresetCount = 4;
-const Choice kQualities[] = {{"standard", "Normal (PS5)"}, {"low", "Baja"}, {"lowest", "Minima"}};
+const Choice kQualities[] = {{"standard", "Maximo"}, {"low", "Medio"}, {"lowest", "Bajo"}}; // draw distance (LOD)
 const int    kQualityCount = 3;
-const Choice kTextureReduce[] = {{"auto", "Auto (segun VRAM)"}, {"0", "Completas"}, {"1", "Mitad"}, {"2", "Un cuarto"}};
-const int    kTextureReduceCount = 4;
+const Choice kTextureReduce[] = {{"0", "Maximo"}, {"1", "Medio"}, {"2", "Bajo"}};
+const int    kTextureReduceCount = 3;
 const Choice kMetrics[] = {{"0", "No"}, {"1", "FPS"}, {"2", "FPS + detalle"}};
 const int    kMetricsCount = 3;
 const Choice kLanguages[] = {{"3", "Espanol (Espana)"}, {"20", "Espanol (Latinoamerica)"}, {"1", "English (US)"},
@@ -219,9 +219,9 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "gama_baja=" << b(s.low_end) << "\n"
 	  << "; Para graficas que se cuelgan o dan pantallazo azul (~37% menos FPS)\n"
 	  << "gpu_seguro=" << b(s.safe_gpu) << "\n"
-	  << "; standard, low, lowest (menos detalle lejano, sombras intactas: ayuda si limita la CPU)\n"
+	  << "; Distancia de dibujado: standard (Maximo, el juego tal cual), low (Medio), lowest (Bajo); solo el detalle lejano\n"
 	  << "calidad=" << s.quality << "\n"
-	  << "; auto, 0 (completas), 1 (mitad), 2 (un cuarto)\n"
+	  << "; Texturas: 0 (Maximo), 1 (Medio, mitad), 2 (Bajo, un cuarto)\n"
 	  << "reducir_texturas=" << s.texture_reduce << "\n"
 	  << "simular_vram_8gb=" << b(s.simulate_vram8) << "\n"
 	  << "; Ryzen con dos CCD: 0 = el juego en el CCD con mas cache L3 (mas rapido); 1 = todos los nucleos\n"
@@ -306,7 +306,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 	    {"low", "r_forceViewportHeightForPixelSizeCalc=720"},
 	    {"lowest", "r_forceViewportHeightForPixelSizeCalc=480"}};
 	if (auto it = convars.find(quality); it != convars.end() && demons) env.AppendConvars(it->second);
-	if (texture == "0" || texture == "1" || texture == "2") env.Set("KYTY_TEXTURE_REDUCE", texture);
+	env.Set("KYTY_TEXTURE_REDUCE", texture == "1" || texture == "2" ? texture : "0"); // (an old "auto": Maximo)
 	env.Default("KYTY_UNMAP_PROTECT_SKIP", "1");
 	env.Set("KYTY_DRIVER_CACHE_KEY", "1f3c29b70e536c8f5a5e812e793b33ac2eb6858b4810ed98ca2a51b9fa5eed97");
 	env.Set("KYTY_SHADER_WARMUP_ONLY", "");

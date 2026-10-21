@@ -1177,7 +1177,13 @@ struct SystemOverlay::Impl {
 		if (!hud.title.empty()) {
 			panel("##FpsHud", [&] {
 				ImGui::PushFont(hud_font, 46.0f * unit);
-				ImGui::TextColored({0.46f, 0.73f, 0.0f, 1.0f}, "%s", hud.title.c_str());
+				// (The PC port: green with NVIDIA frame generation, red with AMD's, white without.)
+				const int    vendor = PortLive::g_hooks != nullptr ? PortLive::fg_vendor.load(std::memory_order_relaxed) : -1;
+				const ImVec4 big    = vendor == 1 ? ImVec4 {0.46f, 0.73f, 0.0f, 1.0f}
+				                      : vendor == 2 ? ImVec4 {0.93f, 0.11f, 0.14f, 1.0f}
+				                      : vendor == 0 ? ImVec4 {1.0f, 1.0f, 1.0f, 1.0f}
+				                                    : ImVec4 {0.46f, 0.73f, 0.0f, 1.0f};
+				ImGui::TextColored(big, "%s", hud.title.c_str());
 				ImGui::PopFont();
 				if (!hud.detail.empty()) {
 					ImGui::PushFont(hud_font, 21.0f * unit);
@@ -1192,6 +1198,11 @@ struct SystemOverlay::Impl {
 					ImGui::PushFont(hud_font, 21.0f * unit);
 					if (now > 1) ImGui::TextColored(color, "FG %s (ahora x%d)", fg, now);
 					else ImGui::TextColored(color, "FG %s", fg);
+					ImGui::PopFont();
+				}
+				if (const char* gfx = PortLive::gfx_line.load(std::memory_order_relaxed); gfx != nullptr) {
+					ImGui::PushFont(hud_font, 21.0f * unit);
+					ImGui::TextUnformatted(gfx);
 					ImGui::PopFont();
 				}
 				DrawPerf(hud.perf, unit);

@@ -65,7 +65,7 @@ struct Settings {
 	bool        low_end = false;    // "Modo graficas de 8 GB": AMD x2 + KYTY_FLIP_FPS=30
 	bool        safe_gpu = false;   // KYTY_COMPUTE_CHAIN=0
 	std::string quality = "standard";
-	std::string texture_reduce = "auto";
+	std::string texture_reduce = "0";
 	bool        simulate_vram8 = false;
 	bool        all_ccds = false;
 	// [Interfaz]

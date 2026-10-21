@@ -504,8 +504,8 @@ void Draw(float width, float height) {
 				case 3: {
 					CheckRow("Equipo de 16 GB RAM", true, s.profile16, "6 GB del juego fijos en RAM; la precarga espera con poca RAM libre");
 					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para graficas que se cuelgan: mas estable, ~37% menos FPS");
-					ChoiceRow("Detalle del juego", true, kQualities, kQualityCount, s.quality);
 					ChoiceRow("Texturas", true, kTextureReduce, kTextureReduceCount, s.texture_reduce);
+					ChoiceRow("Distancia de dibujado", true, kQualities, kQualityCount, s.quality, "Solo el detalle lejano (LOD); Maximo = el juego tal cual");
 					CheckRow("Simular grafica de 8 GB", true, s.simulate_vram8);
 					CheckRow("Usar todos los CCD (Ryzen de dos CCD)", true, s.all_ccds);
 					break;
@@ -621,6 +621,17 @@ void InstallMenu(const Runtime& runtime) {
 		PortLive::fg_label  = FrameGenLabel(fg);
 		PortLive::fg_vendor = fg.rfind("dlss", 0) == 0 ? 1 : 2;
 		PortLive::fg_now    = fg == "amd-x2" ? 2 : (fg == "amd-x3" || fg == "amd-120") ? 3 : fg == "amd-x4" ? 4 : 0;
+	}
+	{
+		static std::string gfx;
+		const auto         level = [](const Choice* items, int count, const std::string& id) {
+            for (int i = 0; i < count; i++)
+                if (id == items[i].id) return items[i].label;
+            return items[0].label;
+		};
+		gfx = std::string("Texturas ") + level(kTextureReduce, kTextureReduceCount, runtime.launched.texture_reduce) +
+		      ", Distancia de dibujado " + level(kQualities, kQualityCount, runtime.launched.quality);
+		PortLive::gfx_line = gfx.c_str();
 	}
 	PortLive::g_hooks = &kHooks;
 }
