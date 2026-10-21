@@ -1526,25 +1526,51 @@ static bool FgPacingEnabled() {
 }
 
 // A frame's measure; true when it is to be released on time (not on the vblank grid).
+// Off (vblank grid, nothing held by us): the ready-to-ready interval is the real cost; engage above floor + 5%.
+// On: never a cost measured through our own hold (that ratcheted to 1/20 s, 10-21). Instead the frame's slack against
+// its scheduled release (last release + target): blocked behind our release, the game's next frame is ready at
+// release + cost, so slack = target - cost exactly. Late: up by most of the lateness; early by more than the 4%
+// headroom: down by half the slack (fast, and the hold never exceeds the cost by much). Off below floor + 1%.
 static bool FgPacingUpdate(std::chrono::steady_clock::time_point ready, double floor_interval) {
-	auto&        p      = g_fg_pacing;
-	// Blocked behind the previous release: the cost since it; ready before it (queued ahead): the throughput.
-	const auto   since  = ready > p.last_release ? std::max(p.last_ready, p.last_release) : p.last_ready;
-	const double sample = p.last_ready == std::chrono::steady_clock::time_point {}
-	                          ? floor_interval
-	                          : std::clamp(std::chrono::duration<double>(ready - since).count(), 0.0, 0.1);
-	p.last_ready = ready;
-	if (p.cost <= 0.0) p.cost = floor_interval;
-	p.cost += (sample - p.cost) * (sample > p.cost ? 0.5 : 0.05);
-	const double want = p.cost * 1.04;
-	if (!p.active && want > floor_interval * 1.05) p.active = true;
-	if (p.active && want < floor_interval * 1.01) {
+	auto&      p    = g_fg_pacing;
+	const bool have = p.last_ready != std::chrono::steady_clock::time_point {};
+	if (!p.active) {
+		const double sample =
+		    have ? std::clamp(std::chrono::duration<double>(ready - p.last_ready).count(), 0.0, 0.1) : floor_interval;
+		if (p.cost <= 0.0) p.cost = floor_interval;
+		p.cost += (sample - p.cost) * 0.25;
+		p.last_ready = ready;
+		if (p.cost * 1.04 > floor_interval * 1.05) {
+			p.active = true;
+			p.target = std::clamp(p.cost * 1.04, floor_interval, 1.0 / 20.0);
+		}
+		return p.active;
+	}
+	p.last_ready          = ready;
+	const auto   scheduled = p.last_release + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+	                                            std::chrono::duration<double>(p.target));
+	const double slack     = std::chrono::duration<double>(scheduled - ready).count(); // > 0: early
+	if (slack < 0.0) {
+		p.target += std::min(-slack, 0.1) * 0.75;
+	} else if (slack > p.target * 0.04) {
+		p.target -= (slack - p.target * 0.04) * 0.5;
+	}
+	p.target = std::clamp(p.target, floor_interval, 1.0 / 20.0);
+	p.cost   = p.target / 1.04;
+	if (p.target < floor_interval * 1.01) {
 		p.active = false;
+		p.cost   = floor_interval;
 		std::printf("[pacing] off: real frames at the floor (%.1f fps), vblank grid\n", 1.0 / floor_interval);
 		std::fflush(stdout);
 	}
-	p.target = std::clamp(want, floor_interval, 1.0 / 20.0);
 	return p.active;
+}
+
+// Movies, cinematics, menus, before the first input: nothing paced, and the state starts over afterwards.
+static void FgPacingReset() {
+	g_fg_pacing.active     = false;
+	g_fg_pacing.cost       = 0.0;
+	g_fg_pacing.last_ready = {};
 }
 
 static void FgPacingNoteRelease(std::chrono::steady_clock::time_point now, bool paced) {
@@ -1647,10 +1673,13 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	// Within a vblank of that time it is waited for precisely here (the port unlocked: the game reserves its next
 	// flip meanwhile; m_processing keeps this request at the front).
 	const uint32_t vblank_hz = std::max(Config::GetVblankFrequency(), 1u);
-	const bool     fg_paced  = !when_ready && FgPacingEnabled() && r.frame != nullptr && !fg_off && !CinematicPlaying() &&
+	const bool     fg_paced  = !when_ready && FgPacingEnabled() && r.frame != nullptr && !fg_off && !MoviePlaying() && !CinematicPlaying() &&
 	                      Graphics::Presenter::GeneratesFrames() && Graphics::Presenter::IsSceneFrame(*r.frame) &&
 	                      Graphics::Presenter::IsGameView(*r.frame) && r.ready_time != g_fg_pacing.last_ready &&
 	                      FgPacingUpdate(r.ready_time, std::max(static_cast<double>(floor + 1) / vblank_hz, 1.0 / 60.0));
+	if (r.frame != nullptr && (fg_off || MoviePlaying() || CinematicPlaying() || !Graphics::Presenter::IsSceneFrame(*r.frame))) {
+		FgPacingReset();
+	}
 	static bool s_fg_paced = false; // this request's decision, kept while it waits for its time (vblank to vblank)
 	static uint64_t s_fg_id = 0;
 	if (s_fg_id != r.id) {
