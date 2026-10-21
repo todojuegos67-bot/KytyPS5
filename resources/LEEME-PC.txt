@@ -32,7 +32,7 @@ settings.ini
 ------------
 Esta junto al exe y tiene comentarios en cada opcion. Equivalencias con el lanzador anterior
 (Launcher-souls.ps1 + run-windows.ps1):
-  reescalado        = el desplegable de reescalado (DLSS / XeSS / FSR / 1440p nativo / 1080-720 del juego);
+  reescalado        = el desplegable de reescalado (DLSS / XeSS / FSR / 1440p nativo);
                       fsr-aa = FSR 3.1 a resolucion nativa (solo antialiasing).
                       DLSS/XeSS/FSR van por el camino PS5 Pro del juego, a la relacion de la altura del monitor.
   nitidez           = Nitidez (auto, 0 ... 1).        preset_dlss = DLSS auto / K / L / M.
@@ -41,10 +41,10 @@ Esta junto al exe y tiene comentarios en cada opcion. Equivalencias con el lanza
   hdr, vsync, gsync = las casillas HDR, VSync y G-Sync.
   (La FG DLSS usa siempre el preset C.)
   fps_desbloqueados = FPS desbloqueados (experimental; sin FG: reloj a 960 Hz).
-  turbo             = TURBO (VRAM 8 GB o menos): 3D a 1080 como maximo; de los reescaladores solo los
-                      AA nativos (dlss-dlaa, xess-aa, fsr-aa; otro modo pasa al AA de su familia),
-                      texturas a un cuarto, detalle bajo, caches de video a 2 GB.
-  perfil_16gb       = ram16.txt (6 GB fijos en RAM, la precarga de shaders espera con poca RAM).
+  perfil_16gb       = Equipo de 16 GB RAM: 6 GB fijos en RAM, la precarga de shaders espera con poca RAM
+                      libre (no cambia los graficos).
+  gama_baja         = PC gama baja (30x2): 30 FPS reales + frame generation AMD x2 (60 en pantalla);
+                      manda sobre frame_generation.
   gpu_seguro        = Modo GPU seguro.     simular_vram_8gb = Simular grafica 8 GB.
   calidad           = detalle del juego (standard / low / lowest).  reducir_texturas = auto / 0 / 1 / 2.
   metricas          = panel de FPS dentro del juego (0 / 1 / 2), con el modo de frame generation y su

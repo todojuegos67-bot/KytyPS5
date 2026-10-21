@@ -61,8 +61,8 @@ struct Settings {
 	// [FrameGeneration]
 	std::string framegen = "sin-fg";
 	// [Rendimiento]
-	bool        turbo = false;      // Launcher "TURBO (VRAM 8 GB o menos)" = run-windows -Turbo2
-	bool        profile16 = false;  // run-windows -Ram16 (ram16.txt)
+	bool        profile16 = false;  // run-windows -Ram16 (ram16.txt): memory only
+	bool        low_end = false;    // "PC gama baja (30x2)": AMD x2 + KYTY_FLIP_FPS=30
 	bool        safe_gpu = false;   // KYTY_COMPUTE_CHAIN=0
 	std::string quality = "standard";
 	std::string texture_reduce = "auto";
@@ -79,9 +79,6 @@ struct Settings {
 bool        LoadSettings(const std::string& path, Settings* settings); // false: no file (the defaults stay)
 bool        SaveSettings(const std::string& path, const Settings& settings);
 const char* FrameGenLabel(const std::string& id);
-// TURBO: an upscaler mode becomes its family's native AA one (dlss-dlaa, xess-aa, fsr-aa); the others stay.
-std::string TurboRes(const std::string& id);
-bool        TurboAllows(const ResMode& mode);
 
 using EnvList = std::vector<std::pair<std::string, std::string>>;
 

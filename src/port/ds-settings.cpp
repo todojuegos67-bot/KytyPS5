@@ -31,9 +31,6 @@ const ResMode kResModes[] = {
     {"fsr-calidad", "FSR Calidad", 1.5, "fsr"},
     {"fsr-equilibrado", "FSR Equilibrado", 1.72, "fsr"},
     {"fsr-rendimiento", "FSR Rendimiento", 2.0, "fsr"},
-    {"juego-1080", "1080p (escalado del juego)", 1080, ""},
-    {"juego-900", "900p (escalado del juego)", 900, ""},
-    {"juego-720", "720p (escalado del juego)", 720, ""},
 };
 const int kResModeCount = static_cast<int>(sizeof(kResModes) / sizeof(kResModes[0]));
 
@@ -115,17 +112,6 @@ const Tables::FgMode* FindFg(const std::string& id) {
 
 } // namespace
 
-std::string TurboRes(const std::string& id) {
-	const ResMode* res = FindRes(id);
-	if (res->upscaler[0] == '\0' || res->value == 1.0) return res->id;
-	const std::string family = res->upscaler;
-	return family == "dlss" ? "dlss-dlaa" : family == "xess" ? "xess-aa" : "fsr-aa";
-}
-
-bool TurboAllows(const ResMode& mode) {
-	return mode.upscaler[0] == '\0' || mode.value == 1.0;
-}
-
 const char* FrameGenLabel(const std::string& id) {
 	return FindFg(id)->label;
 }
@@ -169,8 +155,8 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("nitidez", s->sharpness);
 	str("preset_dlss", s->dlss_preset);
 	str("frame_generation", s->framegen);
-	boo("turbo", s->turbo);
 	boo("perfil_16gb", s->profile16);
+	boo("gama_baja", s->low_end);
 	boo("gpu_seguro", s->safe_gpu);
 	str("calidad", s->quality);
 	str("reducir_texturas", s->texture_reduce);
@@ -215,7 +201,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "[Reescalado]\n"
 	  << "; nativo, dlss-dlaa, dlss-ucalidad, dlss-calidad, dlss-equilibrado, dlss-rendimiento,\n"
 	  << "; xess-aa, xess-ucalidad-plus, xess-ucalidad, xess-calidad, xess-equilibrado, xess-rendimiento,\n"
-	  << "; fsr-aa, fsr-ucalidad, fsr-calidad, fsr-equilibrado, fsr-rendimiento, juego-1080, juego-900, juego-720\n"
+	  << "; fsr-aa, fsr-ucalidad, fsr-calidad, fsr-equilibrado, fsr-rendimiento\n"
 	  << "reescalado=" << s.res << "\n"
 	  << "; auto, 0, 0.25, 0.5, 0.75, 1\n"
 	  << "nitidez=" << s.sharpness << "\n"
@@ -227,10 +213,10 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "frame_generation=" << s.framegen << "\n"
 	  << "\n"
 	  << "[Rendimiento]\n"
-	  << "; TURBO: graficas de 8 GB o menos / PCs de 8-12 GB de RAM (3D a 1080, solo reescalado AA nativo: dlss-dlaa, xess-aa, fsr-aa; texturas a un cuarto)\n"
-	  << "turbo=" << b(s.turbo) << "\n"
 	  << "; PCs de 16 GB de RAM: 6 GB del juego fijos en RAM y la precarga de shaders espera con poca RAM libre\n"
 	  << "perfil_16gb=" << b(s.profile16) << "\n"
+	  << "; PC gama baja (30x2): 30 FPS reales y frame generation AMD x2 (60 en pantalla); manda sobre frame_generation\n"
+	  << "gama_baja=" << b(s.low_end) << "\n"
 	  << "; Para graficas que se cuelgan o dan pantallazo azul (~37% menos FPS)\n"
 	  << "gpu_seguro=" << b(s.safe_gpu) << "\n"
 	  << "; standard, low, lowest (menos detalle lejano, sombras intactas: ayuda si limita la CPU)\n"
@@ -265,7 +251,8 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 	Env        env;
 	const bool demons = title_id.empty() || title_id.rfind("PPSA0134", 0) == 0;
 	// The frame generation config (config/<mode>.json): the common switches, then the mode's.
-	const auto* fg = FindFg(s.framegen);
+	// PC gama baja (30x2): AMD x2 whatever frame_generation says, the game flipped at 30 (12 vblanks of 360 Hz).
+	const auto* fg = FindFg(s.low_end ? "amd-x2" : s.framegen);
 	for (const auto& p: Tables::kBaseEnv) env.Set(p.key, p.value);
 	for (int i = 0; i < fg->env_count; i++) env.Set(fg->env[i].key, fg->env[i].value);
 	const bool with_fg = std::strcmp(fg->id, "sin-fg") != 0;
@@ -273,13 +260,9 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 
 	// Launcher-souls.ps1: super resolution. DLSS with AMD frame generation closed the emulator at device creation
 	// (Streamline): the launcher refused it; here the same ratio with FSR.
-	// TURBO: of the upscalers only their native-resolution AA modes (DLAA, XeSS AA, FSR AA), the 3D at 1080 lines.
-	const std::string res_id = s.turbo ? TurboRes(s.res) : std::string(FindRes(s.res)->id);
-	if (res_id != FindRes(s.res)->id) plan.notes.push_back("TURBO: reescalado " + std::string(FindRes(s.res)->id) + " -> " + res_id + " (solo AA nativo)");
-	const ResMode* res      = FindRes(res_id);
+	const ResMode* res      = FindRes(s.res);
 	std::string    upscaler = res->upscaler;
 	double         ratio    = upscaler.empty() ? 0.0 : res->value;
-	int            render_h = upscaler.empty() && res->value != 1440 ? static_cast<int>(res->value) : 0;
 	if (upscaler == "dlss" && amd_fg) {
 		upscaler = "fsr";
 		plan.notes.emplace_back("DLSS (reescalado) no funciona con la frame generation de AMD: se usa FSR con la misma relacion");
@@ -295,8 +278,8 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 	// Its vblank: 360 Hz with frame generation (the game's speed corrected), 960 unlocked without, else 60.
 	const int vblank = with_fg ? 360 : (s.unlock_fps ? 960 : 60);
 	plan.vblank      = vblank;
-	const std::string quality = s.turbo ? "low" : s.quality;
-	const std::string texture = s.turbo ? "2" : s.texture_reduce;
+	const std::string& quality = s.quality;
+	const std::string& texture = s.texture_reduce;
 
 	// run-windows.ps1, in its order.
 	if (env.Get("KYTY_RENDER_CPUS").empty() && env.Has("KYTY_RECORDING_CPUS")) env.Set("KYTY_RENDER_CPUS", env.Get("KYTY_RECORDING_CPUS"));
@@ -311,11 +294,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 	env.Default("KYTY_NATIVE_XPR_KEEP_FRAMES", "600");
 	env.Default("KYTY_NATIVE_XPR_INSTANCES", "1");
 	if (demons) env.Default("KYTY_GAME_CONVARS", "doIndexBufferCulling=false");
-	// TURBO plays at 1080 lines of output: the upscaler's modes from 1080, else the 3D at 1080 at most.
-	if (s.turbo && ratio > 0 && render_h <= 0) env.Set("KYTY_DISPLAY_HEIGHT", "1080");
-	else if (s.turbo && (render_h <= 0 || render_h > 1080)) render_h = 1080;
-	if (render_h > 0 && render_h != 1440) env.Set("KYTY_RENDER_HEIGHT", std::to_string(render_h));
-	if (ratio > 0 && render_h <= 0) env.Set("KYTY_UPSCALE_RATIO", Num(ratio));
+	if (ratio > 0) env.Set("KYTY_UPSCALE_RATIO", Num(ratio));
 	env.Remove("KYTY_UPSCALE");
 	if (upscaler == "dlss" && s.dlss_preset != "auto" && !s.dlss_preset.empty()) env.Set("KYTY_DLSS_PRESET", s.dlss_preset);
 	if (!s.aspect.empty() && s.aspect != "16:9") env.Set("KYTY_RENDER_ASPECT", s.aspect);
@@ -336,15 +315,6 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 	if (s.profile16) {
 		env.Default("KYTY_RESIDENT_MB", "6144");
 		env.Default("KYTY_PREFETCH_MIN_AVAIL_MB", "3072");
-	}
-	if (s.turbo) {
-		for (const auto& [k, v]: std::initializer_list<std::pair<const char*, const char*>> {
-		         {"KYTY_VRAM_BUDGET_MB", "2048"}, {"KYTY_GC_BUDGET_CAP_MB", "2048"}, {"KYTY_SMALL_VRAM", "1"},
-		         {"KYTY_TEXTURE_REDUCE", "2"}, {"KYTY_TRIM_RAM_SECONDS", "0"}, {"KYTY_IMAGE_POOL", "0"},
-		         {"KYTY_NATIVE_XPR_STORE_BUDGET", "64"}, {"KYTY_TABLE_STORE_BUDGET", "4"}, {"KYTY_SIMULATE_RAM_MB", "10240"},
-		         {"KYTY_RAM_DIET", "1"}})
-			env.Set(k, v);
-		if (demons) env.AppendConvars(convars.at("low"));
 	}
 	if (!upscaler.empty()) env.Set("KYTY_UPSCALER", upscaler);
 	for (const auto& [k, v]: sets) env.Set(k, v);
@@ -377,6 +347,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 		}
 	}
 	env.Set("KYTY_DLSSG_PRESET", "C"); // (always: the emulator applies it to nvngx_dlssg only)
+	if (s.low_end) env.Set("KYTY_FLIP_FPS", "30");
 	// The port's own: metrics (the launcher started metricas.ps1; here the in-game panel) and rumble.
 	env.Set("KYTY_FPS_HUD", s.metrics == "1" || s.metrics == "2" ? s.metrics : "");
 	env.Set("KYTY_HAPTIC_RUMBLE", s.rumble ? "1" : "0");
@@ -403,7 +374,7 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	return l.game != n.game || l.language != n.language || l.fullscreen != n.fullscreen || l.width != n.width ||
 	       l.height != n.height || l.hdr != n.hdr || l.vsync != n.vsync || l.gsync != n.gsync ||
 	       l.unlock_fps != n.unlock_fps || l.aspect_fit != n.aspect_fit || l.aspect != n.aspect || l.res != n.res ||
-	       l.dlss_preset != n.dlss_preset || l.framegen != n.framegen || l.turbo != n.turbo ||
+	       l.dlss_preset != n.dlss_preset || l.framegen != n.framegen || l.low_end != n.low_end ||
 	       l.profile16 != n.profile16 || l.safe_gpu != n.safe_gpu || l.quality != n.quality ||
 	       l.texture_reduce != n.texture_reduce || l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds ||
 	       l.extra != n.extra || (l.sharpness == "auto") != (n.sharpness == "auto");

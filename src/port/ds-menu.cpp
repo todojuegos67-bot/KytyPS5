@@ -435,6 +435,7 @@ void Draw(float width, float height) {
 					CheckRow("Pantalla completa", true, s.fullscreen);
 					CheckRow("HDR", true, s.hdr, "HDR10: solo con \"Usar HDR\" activado en Windows");
 					CheckRow("VSync", true, s.vsync);
+					CheckRow("PC gama baja (30x2)", true, s.low_end, "30 FPS reales + frame generation AMD x2: 60 en pantalla (manda sobre el modo elegido)");
 					CheckRow("G-Sync / FreeSync", true, s.gsync, "El reloj del emulador no se ata a los Hz del monitor");
 					CheckRow("FPS desbloqueados (experimental)", true, s.unlock_fps,
 					         "El juego pasa de 60 FPS reales; videos, menus y cargas siguen a 60");
@@ -453,15 +454,9 @@ void Draw(float width, float height) {
 					break;
 				}
 				case 1: {
-					if (s.turbo) s.res = TurboRes(s.res);
-					static std::vector<ResMode> shown;
-					shown.clear();
-					for (int i = 0; i < kResModeCount; i++)
-						if (!s.turbo || TurboAllows(kResModes[i])) shown.push_back(kResModes[i]);
-					ComboRow("Reescalado", true, static_cast<int>(shown.size()), shown.data(), s.res, [](const ResMode& m) { return m.id; },
+					ComboRow("Reescalado", true, kResModeCount, kResModes, s.res, [](const ResMode& m) { return m.id; },
 					         [](const ResMode& m) { return m.label; },
-					         s.turbo ? "TURBO: solo los modos AA nativos (DLAA, XeSS AA, FSR AA)"
-					                 : "DLSS: NVIDIA RTX. XeSS: todas las graficas. FSR: graficas de bajo rendimiento");
+					         "DLSS: NVIDIA RTX. XeSS: todas las graficas. FSR: graficas de bajo rendimiento");
 					if (ChoiceRow("Nitidez", (s.sharpness == "auto") != (g_rt.launched.sharpness == "auto"), kSharpness,
 					              kSharpnessCount, s.sharpness))
 						live_changed = true;
@@ -477,9 +472,10 @@ void Draw(float width, float height) {
 						                      "dlss-x3", "dlss-x4", "dlss-x5", "dlss-x6", "dlss-120", "dlss-dinamico"})
 							modes.push_back({id, FrameGenLabel(id)});
 					}
+					if (s.low_end) ImGui::TextColored(kWarn, "PC gama baja (30x2) activo: se usa AMD x2.");
 					ChoiceRow("Modo", true, modes.data(), static_cast<int>(modes.size()), s.framegen,
 					          "AMD: todas las graficas. DLSS: NVIDIA RTX 40/50");
-					const int max_gen = FixedDlssGenerated(g_rt.launched.framegen);
+					const int max_gen = g_rt.launched.low_end ? 0 : FixedDlssGenerated(g_rt.launched.framegen);
 					if (max_gen > 1 && s.framegen == g_rt.launched.framegen) {
 						if (g_fg_live == 0) g_fg_live = max_gen;
 						ImGui::AlignTextToFramePadding();
@@ -496,11 +492,7 @@ void Draw(float width, float height) {
 					break;
 				}
 				case 3: {
-					if (CheckRow("TURBO (graficas de 8 GB o menos)", true, s.turbo,
-					             "3D a 1080 como maximo, solo reescalado AA nativo, texturas a un cuarto, detalle bajo") &&
-					    s.turbo)
-						s.res = TurboRes(s.res);
-					CheckRow("Perfil PC de 16 GB de RAM", true, s.profile16);
+					CheckRow("Equipo de 16 GB RAM", true, s.profile16, "6 GB del juego fijos en RAM; la precarga espera con poca RAM libre");
 					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para graficas que se cuelgan: mas estable, ~37% menos FPS");
 					ChoiceRow("Detalle del juego", true, kQualities, kQualityCount, s.quality);
 					ChoiceRow("Texturas", true, kTextureReduce, kTextureReduceCount, s.texture_reduce);
@@ -614,7 +606,7 @@ void InstallMenu(const Runtime& runtime) {
 	g_saved = runtime.launched;
 	g_edit  = runtime.launched;
 	ApplyLive(runtime.launched);
-	const std::string& fg = runtime.launched.framegen;
+	const std::string fg = runtime.launched.low_end ? std::string("amd-x2") : runtime.launched.framegen;
 	if (fg != "sin-fg" && !fg.empty()) {
 		PortLive::fg_label  = FrameGenLabel(fg);
 		PortLive::fg_vendor = fg.rfind("dlss", 0) == 0 ? 1 : 2;
