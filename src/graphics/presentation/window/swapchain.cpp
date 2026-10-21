@@ -360,6 +360,9 @@ public:
 private:
 	void                 Destroy();
 	vk::SurfaceFormatKHR SelectFormat();
+	// KYTY_EXCLUSIVE_FULLSCREEN: the display taken (focused) or given back (focus lost, minimized) before a present.
+	void UpdateExclusive();
+	void ReleaseExclusive(const char* why);
 
 	WindowContext&              m_window;
 	vk::SwapchainKHR            m_handle = nullptr;
@@ -378,6 +381,10 @@ private:
 	uint32_t                    m_frame_index = 0;
 	vk::Rect2D                  m_present_region {};
 	bool                        m_fsr3 = false;
+	bool                        m_exclusive_app      = false; // application controlled exclusive full screen
+	bool                        m_exclusive_acquired = false;
+	std::chrono::steady_clock::time_point m_exclusive_retry {};
+	uint32_t                    m_exclusive_failures = 0;
 };
 
 struct Presenter::Impl {
@@ -734,6 +741,122 @@ vk::SurfaceFormatKHR Swapchain::SelectFormat() {
 	EXIT("no supported UNORM swapchain format\n");
 }
 
+
+// KYTY_EXCLUSIVE_FULLSCREEN=1 (Windows): VK_EXT_full_screen_exclusive. Its structures and functions are in
+// vulkan_win32.h (behind VK_USE_PLATFORM_WIN32_KHR, which this build does not define); the same layouts here, with
+// the structure types and results of vulkan_core.h.
+namespace ExclusiveFullscreen {
+
+bool Requested() {
+#if defined(_WIN32)
+	static const bool requested = [] {
+		const char* value = std::getenv("KYTY_EXCLUSIVE_FULLSCREEN");
+		return value != nullptr && *value == '1';
+	}();
+	return requested;
+#else
+	return false;
+#endif
+}
+
+} // namespace ExclusiveFullscreen
+
+namespace {
+
+constexpr int32_t kFullScreenExclusiveAllowed               = 1; // VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT
+constexpr int32_t kFullScreenExclusiveApplicationControlled = 3; // VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT
+
+struct FullScreenExclusiveInfo { // VkSurfaceFullScreenExclusiveInfoEXT
+	VkStructureType sType               = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT;
+	void*           pNext               = nullptr;
+	int32_t         fullScreenExclusive = kFullScreenExclusiveApplicationControlled;
+};
+struct FullScreenExclusiveWin32Info { // VkSurfaceFullScreenExclusiveWin32InfoEXT
+	VkStructureType sType    = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT;
+	const void*     pNext    = nullptr;
+	void*           hmonitor = nullptr; // HMONITOR
+};
+struct FullScreenExclusiveCapabilities { // VkSurfaceCapabilitiesFullScreenExclusiveEXT
+	VkStructureType sType                         = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_FULL_SCREEN_EXCLUSIVE_EXT;
+	void*           pNext                         = nullptr;
+	VkBool32        fullScreenExclusiveSupported  = VK_FALSE;
+};
+using PfnFullScreenExclusiveMode = VkResult(VKAPI_PTR*)(VkDevice, VkSwapchainKHR);
+
+PfnFullScreenExclusiveMode ExclusiveFunction(vk::Device device, const char* name) {
+	auto* get = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+	return get != nullptr ? reinterpret_cast<PfnFullScreenExclusiveMode>(get(static_cast<VkDevice>(device), name)) : nullptr;
+}
+
+void LogExclusive(const std::string& text) {
+	static std::string last;
+	if (text == last) return;
+	last = text;
+	std::printf("Exclusive fullscreen: %s\n", text.c_str());
+	std::fflush(stdout);
+	LOGF("Exclusive fullscreen: %s\n", text.c_str());
+}
+
+void* WindowMonitor(SDL_Window* window) {
+#if defined(_WIN32)
+	SDL_SysWMinfo info {};
+	SDL_VERSION(&info.version);
+	if (window != nullptr && SDL_GetWindowWMInfo(window, &info) == SDL_TRUE && info.subsystem == SDL_SYSWM_WINDOWS) {
+		return LocalPlatform::MonitorHandle(info.info.win.window);
+	}
+#else
+	(void)window;
+#endif
+	return nullptr;
+}
+
+} // namespace
+
+void Swapchain::ReleaseExclusive(const char* why) {
+	if (!m_exclusive_acquired || m_handle == nullptr) {
+		m_exclusive_acquired = false;
+		return;
+	}
+	m_exclusive_acquired = false;
+	if (auto* release = ExclusiveFunction(m_window.graphic_ctx.device, "vkReleaseFullScreenExclusiveModeEXT"); release != nullptr) {
+		const auto result = static_cast<vk::Result>(release(static_cast<VkDevice>(m_window.graphic_ctx.device),
+		                                                    static_cast<VkSwapchainKHR>(m_handle)));
+		LogExclusive(std::string("released (") + why + ", " + vk::to_string(result) + ")");
+	}
+}
+
+void Swapchain::UpdateExclusive() {
+	if (!m_exclusive_app || m_handle == nullptr) return;
+	const bool wanted = ExclusiveFullscreen::g_wanted.load(std::memory_order_relaxed);
+	if (!wanted) {
+		ReleaseExclusive("focus lost or minimized");
+		return;
+	}
+	if (m_exclusive_acquired) return;
+	const auto now = std::chrono::steady_clock::now();
+	if (now < m_exclusive_retry) return;
+	auto* acquire = ExclusiveFunction(m_window.graphic_ctx.device, "vkAcquireFullScreenExclusiveModeEXT");
+	if (acquire == nullptr) {
+		LogExclusive("not supported (no vkAcquireFullScreenExclusiveModeEXT): borderless full screen");
+		m_exclusive_app = false;
+		return;
+	}
+	const auto result = static_cast<vk::Result>(
+	    acquire(static_cast<VkDevice>(m_window.graphic_ctx.device), static_cast<VkSwapchainKHR>(m_handle)));
+	if (result == vk::Result::eSuccess) {
+		m_exclusive_acquired = true;
+		m_exclusive_failures = 0;
+		LogExclusive("acquired (" + std::to_string(m_extent.width) + "x" + std::to_string(m_extent.height) + ")");
+		return;
+	}
+	// (Not focused yet, or the driver refuses: tried again later, at most every 2 s; given up after 10.)
+	++m_exclusive_failures;
+	m_exclusive_retry = now + std::chrono::seconds(2);
+	LogExclusive("not acquired (" + vk::to_string(result) + ")" +
+	             (m_exclusive_failures >= 10 ? ": given up, borderless full screen" : ": tried again"));
+	if (m_exclusive_failures >= 10) m_exclusive_app = false;
+}
+
 void Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
 	EXIT_IF(graphics.device == nullptr);
@@ -742,8 +865,54 @@ void Swapchain::Create() {
 	Common::LockGuard lock(m_window.mutex);
 	EXIT_IF(graphics.screen_width == 0);
 	EXIT_IF(graphics.screen_height == 0);
-	const auto&       surface = m_window.surface_capabilities;
+	auto&             surface = m_window.surface_capabilities;
 	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
+
+	// KYTY_EXCLUSIVE_FULLSCREEN=1: while the window is full screen, the swapchain is made for exclusive full screen on
+	// its monitor: application controlled (taken after creation and while focused, given back without focus), or, for
+	// the FSR 3 frame generation swapchain (its real swapchain is AMD's, its handle not one the driver knows), left to
+	// the driver (ALLOWED: the driver takes the display itself when the window covers it and has the focus).
+	m_exclusive_app      = false;
+	m_exclusive_acquired = false;
+	m_exclusive_failures = 0;
+	m_exclusive_retry    = {};
+	FullScreenExclusiveInfo      exclusive_info {};
+	FullScreenExclusiveWin32Info exclusive_win32 {};
+	bool                         exclusive = false;
+	if (ExclusiveFullscreen::Requested() && m_window.full_screen_exclusive_ext) {
+		const auto window_flags = SDL_GetWindowFlags(m_window.window);
+		const bool fullscreen   = (window_flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0;
+		exclusive_win32.hmonitor = WindowMonitor(m_window.window);
+		if (!fullscreen) {
+			LogExclusive("off (the window is not full screen): windowed");
+		} else if (exclusive_win32.hmonitor == nullptr) {
+			LogExclusive("not supported (no monitor for the window): borderless full screen");
+		} else {
+			exclusive_info.fullScreenExclusive =
+			    Fsr3::Requested() ? kFullScreenExclusiveAllowed : kFullScreenExclusiveApplicationControlled;
+			exclusive_info.pNext = &exclusive_win32;
+			exclusive            = true;
+			auto* get_capabilities2 = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceSurfaceCapabilities2KHR;
+			if (m_window.surface_capabilities2_ext && get_capabilities2 != nullptr) {
+				// The surface's capabilities for exclusive full screen on that monitor (they replace the plain ones).
+				FullScreenExclusiveCapabilities exclusive_caps {};
+				VkPhysicalDeviceSurfaceInfo2KHR surface_info {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, &exclusive_info,
+				                                              static_cast<VkSurfaceKHR>(m_window.surface)};
+				VkSurfaceCapabilities2KHR       caps2 {VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR, &exclusive_caps, {}};
+				const auto result = static_cast<vk::Result>(
+				    get_capabilities2(static_cast<VkPhysicalDevice>(m_window.graphic_ctx.physical_device), &surface_info, &caps2));
+				if (result != vk::Result::eSuccess) {
+					LogExclusive("not supported (surface capabilities query: " + vk::to_string(result) + "): borderless full screen");
+					exclusive = false;
+				} else if (exclusive_caps.fullScreenExclusiveSupported == VK_FALSE) {
+					LogExclusive("not supported (the driver offers none for this surface and monitor): borderless full screen");
+					exclusive = false;
+				} else {
+					surface.capabilities = *reinterpret_cast<const vk::SurfaceCapabilitiesKHR*>(&caps2.surfaceCapabilities);
+				}
+			}
+		}
+	}
 
 	m_extent = surface.capabilities.currentExtent;
 	if (m_extent.width == std::numeric_limits<uint32_t>::max()) {
@@ -822,12 +991,35 @@ void Swapchain::Create() {
 	}
 	m_fifo.store(create_info.presentMode == vk::PresentModeKHR::eFifo, std::memory_order_relaxed);
 	create_info.clipped          = VK_TRUE;
+	// (The chain lives until the swapchain is made: Streamline's vkCreateSwapchainKHR and AMD's frame interpolation
+	// swapchain pass it on to the driver's; AMD's copies VkSurfaceFullScreenExclusive[Win32]InfoEXT, FFX 1.1.4.)
+	if (exclusive) create_info.pNext = &exclusive_info;
 	m_fsr3 = Fsr3::CreateSwapchain(graphics, create_info, &m_handle);
 	if (!m_fsr3) {
-		RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
-		                     "vkCreateSwapchainKHR");
+		if (exclusive && exclusive_info.fullScreenExclusive != kFullScreenExclusiveApplicationControlled) {
+			// (FSR 3 asked for but its swapchain not made: the plain one, application controlled.)
+			exclusive_info.fullScreenExclusive = kFullScreenExclusiveApplicationControlled;
+		}
+		auto result = graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle);
+		if (result != vk::Result::eSuccess && exclusive) {
+			LogExclusive("not supported (vkCreateSwapchainKHR with it: " + vk::to_string(result) + "): borderless full screen");
+			exclusive         = false;
+			create_info.pNext = nullptr;
+			m_handle          = nullptr;
+			result            = graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle);
+		}
+		RequireVulkanSuccess(result, "vkCreateSwapchainKHR");
 	}
 	EXIT_IF(m_handle == nullptr);
+	if (exclusive) {
+		if (m_fsr3) {
+			LogExclusive("left to the driver (FSR 3 frame generation swapchain: its real swapchain is AMD's, so not "
+			             "application controlled)");
+		} else {
+			m_exclusive_app = true;
+			UpdateExclusive();
+		}
+	}
 	std::printf("Swapchain: %ux%u, present mode %d, %u images%s\n", m_extent.width, m_extent.height,
 	            static_cast<int>(create_info.presentMode), image_count, m_fsr3 ? " (FSR 3 frame generation)" : "");
 	std::fflush(stdout);
@@ -915,6 +1107,8 @@ void Swapchain::Destroy() {
 			graphics.device.destroyImageView(view, nullptr);
 		}
 	}
+	ReleaseExclusive("swapchain made again");
+	m_exclusive_app = false;
 	if (m_handle != nullptr) {
 		if (m_fsr3) {
 			Fsr3::DestroySwapchain(graphics, m_handle);
@@ -971,6 +1165,10 @@ Swapchain::Status Swapchain::AcquireNextImage() {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
+		case static_cast<vk::Result>(VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT):
+			m_exclusive_acquired = false;
+			LogExclusive("lost (vkAcquireNextImageKHR): swapchain made again");
+			return Status::Recreate;
 		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	EXIT_IF(m_image_index >= m_images.size());
@@ -1166,6 +1364,7 @@ Swapchain::Status Swapchain::Present() {
 	present.pWaitSemaphores    = &ready;
 	present.waitSemaphoreCount = 1;
 
+	UpdateExclusive();
 	if (const double cap = FpsCapInterval(m_window.window); cap > 0.0) {
 		static std::chrono::steady_clock::time_point next {};
 		const auto step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(cap));
@@ -1203,6 +1402,10 @@ Swapchain::Status Swapchain::Present() {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
+		case static_cast<vk::Result>(VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT):
+			m_exclusive_acquired = false;
+			LogExclusive("lost (vkQueuePresentKHR): swapchain made again");
+			return Status::Recreate;
 		default: EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	m_frame_index = (m_frame_index + 1u) % static_cast<uint32_t>(m_images.size());

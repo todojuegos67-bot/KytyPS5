@@ -36,6 +36,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <intrin.h>
 #undef min
 #undef max
 // NVIDIA Streamline SDK headers (_Build/deps/streamline/sdk/include, see CMakeLists.txt).
@@ -443,6 +444,223 @@ bool FeatureFunction(sl::Feature feature, const char* name, F*& function) {
 	return true;
 }
 
+// KYTY_DLSSG_PRESET=A|B|C|0: the DLSS Frame Generation preset, for this process only (the driver profile is not
+// touched). nvngx_dlssg.dll reads it through NVAPI DRS GetSetting (nvapi_QueryInterface 0x73BF8338), setting
+// 0x10E41DF1: 0 game/driver, 1 A, 2 B, 3 C ("Performance mode": a lighter model, DLSS-G >= 310.9.16; earlier
+// builds ignore the value, so C is then left to the driver). The provider caches its answer once per process,
+// so the hook must be in place before Streamline loads the provider: nvapi64.dll's nvapi_QueryInterface export
+// is redirected (export table, a jump stub next to the image) before sl.interposer.dll loads, and its answer for
+// 0x73BF8338 is wrapped. Everything else is forwarded unchanged.
+// Approach and NVAPI ABI after MFG-Unlocker (github.com/dashdogy/MFG-Unlocker, source/native/dlssg_preset*,
+// dlssg_provider_policy*), MIT, Copyright (c) 2026 Michael Robles (LICENSES/MFG-Unlocker-MIT.txt).
+namespace DlssgPreset {
+
+constexpr uint32_t kGetSettingInterface = 0x73BF8338u;
+constexpr uint32_t kSettingId           = 0x10E41DF1u;
+constexpr int32_t  kOk                  = 0;
+constexpr int32_t  kSettingNotFound     = -160;
+
+#pragma pack(push, 4)
+union SettingValue {
+	uint32_t dword;
+	struct {
+		uint32_t length;
+		uint8_t  data[4096];
+	} binary;
+	uint16_t text[2048];
+	uint64_t qword;
+};
+struct Setting { // NVDRS_SETTING_V1
+	uint32_t     version;
+	uint16_t     name[2048];
+	uint32_t     id;
+	uint32_t     type;
+	uint32_t     location;
+	uint32_t     current_predefined;
+	uint32_t     predefined_valid;
+	SettingValue predefined;
+	SettingValue current;
+};
+#pragma pack(pop)
+static_assert(sizeof(Setting) == 12320);
+constexpr uint32_t kSettingVersion = sizeof(Setting) | (1u << 16);
+
+using QueryInterfaceFn = void*(__cdecl*)(uint32_t);
+using GetSettingFn     = int32_t(__cdecl*)(void*, void*, uint32_t, Setting*);
+
+uint32_t                  g_preset = 0; // 0 off, else 1..3
+std::atomic<QueryInterfaceFn> g_query {nullptr};
+std::atomic<GetSettingFn>     g_get_setting {nullptr};
+std::atomic<uint64_t>         g_reads {0};
+std::atomic<uint64_t>         g_applied {0};
+std::atomic<int>              g_provider_c {-1}; // -1 unknown, 0 lacks C, 1 has C
+std::mutex                    g_log_mutex;
+
+// The module's VS_FIXEDFILEINFO (from its own resources: no version.dll).
+bool ModuleVersion(HMODULE module, uint16_t v[4]) {
+	HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16));
+	if (resource == nullptr) return false;
+	HGLOBAL     handle = LoadResource(module, resource);
+	const DWORD size   = SizeofResource(module, resource);
+	const auto* bytes  = handle != nullptr ? static_cast<const uint8_t*>(LockResource(handle)) : nullptr;
+	if (bytes == nullptr) return false;
+	for (DWORD i = 0; i + 52 <= size; i += 4) {
+		uint32_t signature = 0;
+		std::memcpy(&signature, bytes + i, 4);
+		if (signature != 0xFEEF04BDu) continue;
+		uint32_t ms = 0, ls = 0;
+		std::memcpy(&ms, bytes + i + 8, 4);
+		std::memcpy(&ls, bytes + i + 12, 4);
+		v[0] = static_cast<uint16_t>(ms >> 16);
+		v[1] = static_cast<uint16_t>(ms);
+		v[2] = static_cast<uint16_t>(ls >> 16);
+		v[3] = static_cast<uint16_t>(ls);
+		return true;
+	}
+	return false;
+}
+
+char Letter(uint32_t preset) { return preset == 0 ? '0' : static_cast<char>('A' + preset - 1); }
+
+// Whether the reading module (nvngx_dlssg.dll) implements Preset C; logs once.
+bool ProviderHasC(const void* caller) {
+	int known = g_provider_c.load(std::memory_order_acquire);
+	if (known >= 0) return known == 1;
+	std::lock_guard lock(g_log_mutex);
+	known = g_provider_c.load(std::memory_order_acquire);
+	if (known >= 0) return known == 1;
+	HMODULE module = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                   static_cast<LPCWSTR>(caller), &module);
+	char     name[MAX_PATH] = "?";
+	uint16_t v[4] {};
+	const bool versioned = module != nullptr && ModuleVersion(module, v);
+	if (module != nullptr && GetModuleFileNameA(module, name, MAX_PATH) != 0) {
+		if (const char* slash = std::strrchr(name, '\\'); slash != nullptr) std::memmove(name, slash + 1, std::strlen(slash));
+	}
+	const uint64_t version = versioned ? (uint64_t(v[0]) << 32) | (uint64_t(v[1]) << 16) | v[2] : 0;
+	const bool     has_c   = versioned && version >= ((uint64_t(310) << 32) | (uint64_t(9) << 16) | 16);
+	if (g_preset == 3) {
+		LOGF("[dlssg] preset C requested; provider %s %u.%u.%u: %s\n", name, v[0], v[1], v[2],
+		     has_c ? "applied" : "not supported (needs >= 310.9.16), left to the driver");
+		std::printf("[dlssg] preset C requested; provider %s %u.%u.%u: %s\n", name, v[0], v[1], v[2],
+		            has_c ? "applied" : "not supported (needs >= 310.9.16)");
+	} else {
+		LOGF("[dlssg] preset %c requested; provider %s %u.%u.%u: applied\n", Letter(g_preset), name, v[0], v[1], v[2]);
+		std::printf("[dlssg] preset %c requested; provider %s %u.%u.%u: applied\n", Letter(g_preset), name, v[0], v[1],
+		            v[2]);
+	}
+	std::fflush(stdout);
+	g_provider_c.store(has_c ? 1 : 0, std::memory_order_release);
+	return has_c;
+}
+
+__declspec(noinline) int32_t __cdecl GetSettingHook(void* session, void* profile, uint32_t id, Setting* setting) {
+	const GetSettingFn original = g_get_setting.load(std::memory_order_acquire);
+	const int32_t      result   = original(session, profile, id, setting);
+	if (id != kSettingId || setting == nullptr || setting->version != kSettingVersion) return result;
+	if (!(result == kSettingNotFound || (result == kOk && setting->id == id && setting->type == 0))) return result;
+	const uint64_t reads = g_reads.fetch_add(1, std::memory_order_relaxed) + 1;
+	const uint32_t was   = result == kOk ? setting->current.dword : 0;
+	const bool has_c = ProviderHasC(_ReturnAddress()); // (Also logs the provider once.)
+	if (g_preset == 3 && !has_c) return result;
+	if (result == kSettingNotFound) {
+		std::memset(setting, 0, sizeof(*setting));
+		setting->version = kSettingVersion;
+		setting->id      = id;
+		constexpr char label[] = "Override DLSS-FG preset";
+		for (size_t i = 0; i < sizeof(label); ++i) setting->name[i] = static_cast<uint16_t>(label[i]);
+	}
+	setting->location           = 0;
+	setting->current_predefined = 0;
+	std::memset(&setting->current, 0, sizeof(setting->current));
+	setting->current.dword = g_preset;
+	const uint64_t applied = g_applied.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((reads & (reads - 1)) == 0) {
+		LOGF("[dlssg] FG preset read #%llu by the provider (driver %s %u, answered %c, %llu overridden)\n",
+		     static_cast<unsigned long long>(reads), result == kOk ? "value" : "none", was, Letter(g_preset),
+		     static_cast<unsigned long long>(applied));
+	}
+	return kOk;
+}
+
+void* __cdecl QueryInterfaceHook(uint32_t id) {
+	void* function = g_query.load(std::memory_order_acquire)(id);
+	if (id != kGetSettingInterface || function == nullptr) return function;
+	GetSettingFn expected = nullptr;
+	if (!g_get_setting.compare_exchange_strong(expected, reinterpret_cast<GetSettingFn>(function)) &&
+	    expected != reinterpret_cast<GetSettingFn>(function)) {
+		return function; // (A second, different implementation: left alone.)
+	}
+	return reinterpret_cast<void*>(&GetSettingHook);
+}
+
+// Points nvapi64.dll's nvapi_QueryInterface export at QueryInterfaceHook (later GetProcAddress calls and imports
+// resolve to it). Before sl.interposer.dll loads.
+void Install() {
+	const char* value = std::getenv("KYTY_DLSSG_PRESET");
+	if (value == nullptr || *value == '\0') return;
+	switch (*value) {
+		case 'A': case 'a': case '1': g_preset = 1; break;
+		case 'B': case 'b': case '2': g_preset = 2; break;
+		case 'C': case 'c': case '3': g_preset = 3; break;
+		case '0': return; // game / driver
+		default: LOGF("[dlssg] KYTY_DLSSG_PRESET=%s: not A, B, C or 0, ignored\n", value); return;
+	}
+	const auto fail = [](const char* why) {
+		LOGF("[dlssg] preset %c requested: not applied (%s)\n", Letter(g_preset), why);
+		std::printf("[dlssg] preset %c requested: not applied (%s)\n", Letter(g_preset), why);
+		g_preset = 0;
+	};
+	HMODULE nvapi = LoadLibraryExW(L"nvapi64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+	if (nvapi == nullptr) return fail("no nvapi64.dll");
+	HMODULE pinned = nullptr; // (Never unloaded: the export now points into our stub.)
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+	                   reinterpret_cast<LPCWSTR>(nvapi), &pinned);
+	auto*       base = reinterpret_cast<uint8_t*>(nvapi);
+	const auto* dos  = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+	const auto* nt   = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+	const auto& dir  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+	if (dir.VirtualAddress == 0) return fail("nvapi64.dll has no exports");
+	const auto* exports   = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
+	const auto* names     = reinterpret_cast<const DWORD*>(base + exports->AddressOfNames);
+	const auto* ordinals  = reinterpret_cast<const WORD*>(base + exports->AddressOfNameOrdinals);
+	auto*       functions = reinterpret_cast<DWORD*>(base + exports->AddressOfFunctions);
+	DWORD*      slot      = nullptr;
+	for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
+		if (std::strcmp(reinterpret_cast<const char*>(base + names[i]), "nvapi_QueryInterface") == 0) {
+			slot = &functions[ordinals[i]];
+			break;
+		}
+	}
+	if (slot == nullptr) return fail("no nvapi_QueryInterface");
+	auto* original = reinterpret_cast<QueryInterfaceFn>(GetProcAddress(nvapi, "nvapi_QueryInterface"));
+	if (original == nullptr || reinterpret_cast<uint8_t*>(original) != base + *slot) return fail("unexpected export");
+	// A jump stub above the image, within the 32-bit export RVA range.
+	const uintptr_t image_end = reinterpret_cast<uintptr_t>(base) + nt->OptionalHeader.SizeOfImage;
+	uint8_t*        stub      = nullptr;
+	for (uintptr_t at = (image_end + 0xFFFF) & ~uintptr_t(0xFFFF);
+	     stub == nullptr && at < reinterpret_cast<uintptr_t>(base) + 0x7FFF0000u; at += 0x10000) {
+		stub = static_cast<uint8_t*>(
+		    VirtualAlloc(reinterpret_cast<void*>(at), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	}
+	if (stub == nullptr) return fail("no memory near nvapi64.dll");
+	const uint64_t target = reinterpret_cast<uint64_t>(&QueryInterfaceHook);
+	stub[0] = 0xFF; stub[1] = 0x25; std::memset(stub + 2, 0, 4); // jmp [rip+0]
+	std::memcpy(stub + 6, &target, 8);
+	DWORD protection = 0;
+	VirtualProtect(stub, 4096, PAGE_EXECUTE_READ, &protection);
+	FlushInstructionCache(GetCurrentProcess(), stub, 14);
+	g_query.store(original, std::memory_order_release);
+	if (!VirtualProtect(slot, sizeof(DWORD), PAGE_READWRITE, &protection)) return fail("export table is read-only");
+	*slot = static_cast<DWORD>(reinterpret_cast<uintptr_t>(stub) - reinterpret_cast<uintptr_t>(base));
+	VirtualProtect(slot, sizeof(DWORD), protection, &protection);
+	LOGF("[dlssg] preset %c requested: NVAPI DRS read hook installed (driver profile untouched)\n", Letter(g_preset));
+	if (GetModuleHandleW(L"nvngx_dlssg.dll") != nullptr) LOGF("[dlssg] warning: nvngx_dlssg.dll was already loaded\n");
+}
+
+} // namespace DlssgPreset
+
 #endif
 
 } // namespace
@@ -760,6 +978,7 @@ void Initialize() {
 			if (GetModuleHandleA(name) != nullptr) std::printf("Frame generation: %s already loaded\n", name);
 		}
 	}
+	DlssgPreset::Install(); // (Before Streamline loads nvngx_dlssg.dll.)
 	HMODULE    module     = LoadLibraryW(interposer.c_str());
 	if (module == nullptr) {
 		LOGF("frame generation: cannot load %s\n", interposer.string().c_str());

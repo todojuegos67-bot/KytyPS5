@@ -473,12 +473,14 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			break;
 
 		case SDL_WINDOWEVENT_MINIMIZED:
+			ExclusiveFullscreen::g_wanted.store(false);
 			LOGF("Window %" PRIu32 " minimized\n", window_event.windowID);
 			break;
 		case SDL_WINDOWEVENT_MAXIMIZED:
 			LOGF("Window %" PRIu32 " maximized\n", window_event.windowID);
 			break;
 		case SDL_WINDOWEVENT_RESTORED:
+			if ((SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0) ExclusiveFullscreen::g_wanted.store(true);
 			LOGF("Window %" PRIu32 " restored\n", window_event.windowID);
 			break;
 		case SDL_WINDOWEVENT_ENTER:
@@ -488,9 +490,11 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			LOGF("Mouse left window %" PRIu32 "\n", window_event.windowID);
 			break;
 		case SDL_WINDOWEVENT_FOCUS_GAINED:
+			ExclusiveFullscreen::g_wanted.store(true);
 			LOGF("Window %" PRIu32 " gained keyboard focus\n", window_event.windowID);
 			break;
 		case SDL_WINDOWEVENT_FOCUS_LOST:
+			ExclusiveFullscreen::g_wanted.store(false);
 			LOGF("Window %" PRIu32 " lost keyboard focus\n", window_event.windowID);
 			break;
 		case SDL_WINDOWEVENT_CLOSE:
@@ -863,7 +867,10 @@ static void WindowCreate(WindowContext& context) {
 	// A window larger than the screen it opens on (2560x1440 on a 1080p or 1440p one) would hang
 	// off it, title bar included: the same shape scaled into the usable area, 5% of its height
 	// left for the title bar.
-	if (SDL_Rect usable {}; !Config::FullscreenEnabled() && SDL_GetDisplayUsableBounds(0, &usable) == 0) {
+	// KYTY_EXCLUSIVE_FULLSCREEN=1: the window opens full screen (a borderless popup over the whole monitor at its
+	// current mode); the swapchain then takes the display exclusively.
+	const bool fullscreen = Config::FullscreenEnabled() || ExclusiveFullscreen::Requested();
+	if (SDL_Rect usable {}; !fullscreen && SDL_GetDisplayUsableBounds(0, &usable) == 0) {
 		const double scale = std::min(usable.w / static_cast<double>(width), usable.h * 0.95 / height);
 		if (scale < 1.0) {
 			width                             = static_cast<int>(width * scale) & ~1;
@@ -875,7 +882,7 @@ static void WindowCreate(WindowContext& context) {
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
-	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled());
+	uint32_t window_flags = WindowContext::InitialWindowFlags(fullscreen);
 #if defined(__APPLE__)
 	// SDL loads Vulkan while creating a Vulkan window, so select the bundled
 	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user

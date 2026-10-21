@@ -1138,6 +1138,13 @@ static void VulkanGetExtensions(SDL_Window* window, VulkanExtensions& r) {
 		r.required_extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
 	}
 
+	// KYTY_EXCLUSIVE_FULLSCREEN: the surface's capabilities asked with the exclusive full screen info chained
+	// (vkGetPhysicalDeviceSurfaceCapabilities2KHR, swapchain.cpp).
+	if (ExclusiveFullscreen::Requested() && HasExtension(r.available_extensions, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) &&
+	    !HasExtension(r.required_extensions, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+		r.required_extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+	}
+
 	if (HasExtension(r.available_extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
 		r.required_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 	} else {
@@ -1561,6 +1568,18 @@ void WindowContext::CreateVulkan() {
 		// device without present-id closed the emulator as it was made.)
 		if (FrameGen::StreamlineLoaded() && HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+		}
+		// KYTY_EXCLUSIVE_FULLSCREEN=1: classic exclusive full screen (swapchain.cpp).
+		if (ExclusiveFullscreen::Requested()) {
+			surface_capabilities2_ext = HasExtension(r.required_extensions, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+			if (HasExtension(available_extensions, "VK_EXT_full_screen_exclusive")) {
+				device_extensions.push_back("VK_EXT_full_screen_exclusive");
+				full_screen_exclusive_ext = true;
+			} else {
+				std::printf("Exclusive fullscreen: not supported (the device has no VK_EXT_full_screen_exclusive): borderless "
+				            "full screen\n");
+				std::fflush(stdout);
+			}
 		}
 		// KYTY_FSR3_FG: the FidelityFX backend calls vkGetBufferMemoryRequirements2KHR (the extension's name,
 		// null on a device without the extension even though the function is core).
