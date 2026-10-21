@@ -36,6 +36,8 @@ void Install(Program* program);
 // choice is saved, but the next boot is forced again). Cinematic without KYTY_UPSCALE_RATIO: RenderConfig_PS5_High
 // as shipped (display mode 4, native 3840x2160, no upscaler).
 void InstallForcedMode(Program* program);
+// KYTY_DS_SIXTY_STEP (default on): every graphics mode at the performance mode's 59.94 fps step and flip rate 0.
+void InstallSixtyStep(Program* program);
 // The aspect the 3D is rendered at when KYTY_RENDER_ASPECT took effect (Install), else 0 (the game's 16:9).
 [[nodiscard]] double WideAspect();
 // The game's output's width when the wide output took effect (Install), else 0 (the game's 3840).

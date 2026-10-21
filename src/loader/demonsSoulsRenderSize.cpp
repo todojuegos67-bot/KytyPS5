@@ -171,6 +171,47 @@ void InstallForcedMode(Program* program) {
 	            value == 1 && (ratio == nullptr || *ratio == 0) ? ", native 3840x2160" : "");
 }
 
+// KYTY_DS_SIXTY_STEP (default on, =0 the game's): the per-mode render setter (01.007.000 eboot 0x90090b3a0) reads a
+// frame rate {59.94, 59.94, 29.97, 19.98} (render setup +0x28: the time step 1/rate, eboot 0x900b280e0, that the logo,
+// menus, movies and cutscene sequencers advance by each frame) and a flip rate {0, 0, 1, 2} (sceVideoOutSetFlipRate)
+// by mode. On the emulator's virtual vblank the flips stay at 60, so Cinematic's 1/30 step ran them twice too fast:
+// every mode gets the performance mode's 59.94 and flip rate 0 (Cinematic keeps its 4K picture).
+void InstallSixtyStep(Program* program) {
+	const char* setting = std::getenv("KYTY_DS_SIXTY_STEP");
+	if ((setting != nullptr && std::strcmp(setting, "0") == 0) || program == nullptr ||
+	    !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin")
+		return;
+	const auto site = GuestCode::FindUnique(
+	    *program, GuestCode::Pattern("48 8d 0d ?? ?? ?? ?? c5 fa 10 04 81 48 8d 0d ?? ?? ?? ?? 8b 34 81 c5 fa 11 47 28"));
+	if (!site) {
+		std::printf("Demon's Souls step: the render setter of a known build not found; the game's step kept\n");
+		return;
+	}
+	const uint64_t rates_at = RipTarget(*site, 3, 7);
+	const uint64_t flips_at = RipTarget(*site, 15, 19);
+	float          rates[4] {};
+	int32_t        flips[4] {};
+	if (!Readable(rates_at, sizeof(rates)) || !Readable(flips_at, sizeof(flips))) {
+		std::printf("Demon's Souls step: the mode tables are not readable; the game's step kept\n");
+		return;
+	}
+	std::memcpy(rates, reinterpret_cast<const void*>(rates_at), sizeof(rates));
+	std::memcpy(flips, reinterpret_cast<const void*>(flips_at), sizeof(flips));
+	if (rates[0] < 59.0f || rates[0] > 60.5f || flips[0] != 0 || flips[2] != 1) {
+		std::printf("Demon's Souls step: unexpected mode tables (%.2f, flip %d/%d); the game's step kept\n",
+		            static_cast<double>(rates[0]), flips[0], flips[2]);
+		return;
+	}
+	for (int i = 1; i < 4; i++) {
+		rates[i] = rates[0];
+		flips[i] = 0;
+	}
+	std::memcpy(reinterpret_cast<void*>(rates_at), rates, sizeof(rates));
+	std::memcpy(reinterpret_cast<void*>(flips_at), flips, sizeof(flips));
+	std::printf("Demon's Souls step: every graphics mode at the 59.94 fps step and flip rate 0 (Cinematic's 1/30 step "
+	            "and 30 fps flips off; KYTY_DS_SIXTY_STEP=0: the game's)\n");
+}
+
 double WideAspect() {
 	return g_wide_aspect;
 }
