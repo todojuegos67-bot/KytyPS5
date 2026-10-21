@@ -13,6 +13,7 @@
 #include "readback-queue.h"
 #include "sync-stats.h"
 #include "fresh-memory.h"
+#include "texture-offload.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -2305,6 +2306,17 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
                                      uint64_t total_size, const Buffer** ring_used) {
 	if (copies.empty()) {
 		return nullptr;
+	}
+	// Bytes of a texture whose image went are being given back (texture-offload.h, an asynchronous restore): read once
+	// they are there, not the discarded pages' zeros (submitted first: the offload worker writes them when the GPU is
+	// done).
+	for (const auto& copy: copies) {
+		const auto address = buffer.CpuAddress() + copy.dstOffset;
+		if (!TextureOffload::MustWaitBeforeRead(address, copy.size)) continue;
+		if (CommandScheduler::ThreadRecorder() != nullptr) throw CommandScheduler::RecorderRefusal {"texture offload restore"};
+		TextureOffload::NoteReadWait(copy.size);
+		m_scheduler.Flush();
+		TextureOffload::WaitRestores(address, copy.size);
 	}
 	LiveCounters::Add(LiveCounters::UploadCopies, copies.size());
 	LiveCounters::Add(LiveCounters::UploadBytes, total_size);

@@ -141,6 +141,8 @@ struct State {
 	uint64_t ages[4] {}; // <1 s, <10 s, <60 s, later
 	uint64_t restores = 0, restore_bytes = 0, restore_us = 0, restore_us_max = 0, lost = 0, missed = 0, missed_bytes = 0;
 	uint64_t checked = 0, checked_bytes = 0, check_failed = 0;
+	// Ranges being restored (any thread), and buffer uploads that waited for an asynchronous restore (WaitBeforeRead).
+	std::atomic<uint64_t> restoring_ranges {0}, read_waits {0}, read_wait_bytes {0};
 	std::unordered_map<uint64_t, uint64_t> rips;    // the emulator's instructions -> touches
 	std::unordered_map<uint64_t, uint64_t> callers; // their callers (one frame unwound) -> touches
 };
@@ -274,6 +276,21 @@ inline void WaitRestores(uint64_t vaddr, uint64_t size) {
 	while (IsRestoring(vaddr, size)) std::this_thread::yield();
 }
 
+// Whether a read of [vaddr, vaddr + size) through the backing view must wait for a restore first (cheap when none
+// runs). An image gone (UnregisterImage) is restored asynchronously: its backing pieces are given read-write access at
+// once and its bytes land when the GPU's download is done, so a reader of the backing view in between (a buffer upload,
+// the async upload worker) read the discarded pages: zeros. At a death and reload under a small video memory budget
+// the collector takes hundreds of offloaded textures at once and the reload reads their memory again: dark textures.
+[[nodiscard]] inline bool MustWaitBeforeRead(uint64_t vaddr, uint64_t size) {
+	auto& state = Get();
+	return state.restoring_ranges.load(std::memory_order_acquire) != 0 && IsRestoring(vaddr, size);
+}
+inline void NoteReadWait(uint64_t size) {
+	auto& state = Get();
+	state.read_waits.fetch_add(1, std::memory_order_relaxed);
+	state.read_wait_bytes.fetch_add(size, std::memory_order_relaxed);
+}
+
 // (state.mutex held) Counted as touched by `touch`.
 inline void CountLocked(State& state, std::map<uint64_t, Range>::iterator it, Touch touch, uint64_t rip = 0, uint64_t caller = 0) {
 	auto&      range = it->second;
@@ -346,6 +363,7 @@ inline std::vector<Restoring> BeginRestore(uint64_t vaddr, uint64_t size, Touch 
 		range.touched   = true;
 		range.restoring = true;
 		range.restorer  = async ? std::thread::id {} : std::this_thread::get_id();
+		state.restoring_ranges.fetch_add(1, std::memory_order_acq_rel);
 		ranges.push_back({it->first, range.guest_end, range.serial, range.image, range.pieces});
 	}
 	return ranges;
@@ -358,6 +376,7 @@ inline void EndRestore(const std::vector<Restoring>& ranges, uint64_t bytes, uin
 	for (const auto& restored: ranges) {
 		auto range = state.guest.find(restored.begin);
 		if (range == state.guest.end()) continue;
+		if (range->second.restoring) state.restoring_ranges.fetch_sub(1, std::memory_order_acq_rel);
 		for (const auto& piece: range->second.pieces) state.backing.erase(piece.backing);
 		state.guest.erase(range);
 	}
@@ -573,11 +592,12 @@ inline void Report(bool force) {
 	            static_cast<unsigned long long>(state.ages[3]));
 	if (offload) {
 		std::printf("Texture offload: checked %llu images (%.0f MiB, %llu differ); %llu restores (%.0f MiB, %.1f ms, at most %.1f ms), "
-		            "%llu lost, %llu missed (%.0f MiB)\n",
+		            "%llu lost, %llu missed (%.0f MiB); %llu buffer reads waited for a restore (%.0f MiB)\n",
 		            static_cast<unsigned long long>(state.checked), state.checked_bytes / MiB,
 		            static_cast<unsigned long long>(state.check_failed), static_cast<unsigned long long>(state.restores),
 		            state.restore_bytes / MiB, state.restore_us / 1000.0, state.restore_us_max / 1000.0,
-		            static_cast<unsigned long long>(state.lost), static_cast<unsigned long long>(state.missed), state.missed_bytes / MiB);
+		            static_cast<unsigned long long>(state.lost), static_cast<unsigned long long>(state.missed), state.missed_bytes / MiB,
+		            static_cast<unsigned long long>(state.read_waits.load()), state.read_wait_bytes.load() / MiB);
 	}
 #if defined(_WIN32)
 	const auto exe  = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
