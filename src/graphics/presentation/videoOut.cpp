@@ -234,6 +234,7 @@ private:
 		int64_t                     flip_arg;
 		uint64_t                    submit_ptc;
 		std::chrono::steady_clock::time_point submit_time;
+		std::chrono::steady_clock::time_point ready_time; // GPU work done (Complete): KYTY_FG_PACING's measure
 		FlipRequestSource           source;
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
@@ -1450,7 +1451,8 @@ void FlipQueue::Complete(uint64_t request_id) {
 			m_mutex.Unlock();
 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
 		}
-		request->state = RequestState::Ready;
+		request->state      = RequestState::Ready;
+		request->ready_time = std::chrono::steady_clock::now();
 		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
 		return;
@@ -1490,6 +1492,83 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	};
 	while (has_request()) {
 		m_done_cond_var.Wait(&m_mutex);
+	}
+}
+
+// KYTY_FG_PACING (default on with frame generation, =0 off): below the flip floor (60, or SetDynamicFlipFps) the real
+// frames landed on the vblank grid wherever they finished (35-55 fps: present interval sd 2-7 ms), a judder frame
+// generation multiplies. Then each 3D flip is released instead at the last release + a smoothed target interval with
+// a precise wait, so the real frames are evenly spaced. The target follows the measured frame cost (ready time since
+// the later of the previous frame's ready and release) + 4%, rising fast and falling slowly, in [floor, 1/20 s];
+// it engages only above floor + 5% and lets go below floor + 1%: at the floor the grid as before. Not
+// KYTY_FLIP_WHEN_READY (an unpaced present: ghosting with FG). The game's clock is untouched (flips only wait).
+namespace {
+struct FgPacing {
+	bool                                  active = false;
+	double                                cost   = 0.0; // smoothed frame cost, s
+	double                                target = 0.0; // release interval while active, s
+	std::chrono::steady_clock::time_point last_ready {};
+	std::chrono::steady_clock::time_point last_release {};
+	// Per-second stats of the release intervals while active.
+	std::chrono::steady_clock::time_point stats_start {};
+	uint32_t                              n = 0;
+	double                                sum = 0.0, sum2 = 0.0;
+};
+FgPacing g_fg_pacing; // (FlipQueue::Flip runs on the vblank thread only)
+} // namespace
+
+static bool FgPacingEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_FG_PACING");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
+// A frame's measure; true when it is to be released on time (not on the vblank grid).
+static bool FgPacingUpdate(std::chrono::steady_clock::time_point ready, double floor_interval) {
+	auto&        p      = g_fg_pacing;
+	// Blocked behind the previous release: the cost since it; ready before it (queued ahead): the throughput.
+	const auto   since  = ready > p.last_release ? std::max(p.last_ready, p.last_release) : p.last_ready;
+	const double sample = p.last_ready == std::chrono::steady_clock::time_point {}
+	                          ? floor_interval
+	                          : std::clamp(std::chrono::duration<double>(ready - since).count(), 0.0, 0.1);
+	p.last_ready = ready;
+	if (p.cost <= 0.0) p.cost = floor_interval;
+	p.cost += (sample - p.cost) * (sample > p.cost ? 0.5 : 0.05);
+	const double want = p.cost * 1.04;
+	if (!p.active && want > floor_interval * 1.05) p.active = true;
+	if (p.active && want < floor_interval * 1.01) {
+		p.active = false;
+		std::printf("[pacing] off: real frames at the floor (%.1f fps), vblank grid\n", 1.0 / floor_interval);
+		std::fflush(stdout);
+	}
+	p.target = std::clamp(want, floor_interval, 1.0 / 20.0);
+	return p.active;
+}
+
+static void FgPacingNoteRelease(std::chrono::steady_clock::time_point now, bool paced) {
+	auto& p = g_fg_pacing;
+	if (paced && p.last_release != std::chrono::steady_clock::time_point {}) {
+		const double iv = std::chrono::duration<double>(now - p.last_release).count();
+		if (iv < 0.1) {
+			p.n++;
+			p.sum += iv;
+			p.sum2 += iv * iv;
+		}
+	}
+	p.last_release = now;
+	if (p.stats_start == std::chrono::steady_clock::time_point {}) p.stats_start = now;
+	if (std::chrono::duration<double>(now - p.stats_start).count() >= 1.0) {
+		if (p.n > 0) {
+			const double mean = p.sum / p.n;
+			const double sd   = std::sqrt(std::max(0.0, p.sum2 / p.n - mean * mean));
+			std::printf("[pacing] target %.2f ms (real %.1f fps), sd %.2f ms\n", p.target * 1000.0, 1.0 / mean, sd * 1000.0);
+			std::fflush(stdout);
+		}
+		p.stats_start = now;
+		p.n           = 0;
+		p.sum = p.sum2 = 0.0;
 	}
 }
 
@@ -1562,8 +1641,40 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	                                  std::chrono::duration<double>(paced_interval));
 	const auto   paced_slack    = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
 	                                  std::chrono::duration<double>(0.5 / std::max(Config::GetVblankFrequency(), 1u)));
-	const bool   paced_wait     = paced_interval > 0.0 && paced_now + paced_slack < s_paced_next;
-	const bool due = when_ready ? IsFlipDueReadyLocked(*r.cfg, r.generation, floor) : IsFlipDueLocked(*r.cfg, r.generation, floor);
+	bool         paced_wait     = paced_interval > 0.0 && paced_now + paced_slack < s_paced_next;
+	bool due = when_ready ? IsFlipDueReadyLocked(*r.cfg, r.generation, floor) : IsFlipDueLocked(*r.cfg, r.generation, floor);
+	// KYTY_FG_PACING: a frame slower than the floor is released at last release + target, not on a vblank tick.
+	// Within a vblank of that time it is waited for precisely here (the port unlocked: the game reserves its next
+	// flip meanwhile; m_processing keeps this request at the front).
+	const uint32_t vblank_hz = std::max(Config::GetVblankFrequency(), 1u);
+	const bool     fg_paced  = !when_ready && FgPacingEnabled() && r.frame != nullptr && !fg_off && !CinematicPlaying() &&
+	                      Graphics::Presenter::GeneratesFrames() && Graphics::Presenter::IsSceneFrame(*r.frame) &&
+	                      Graphics::Presenter::IsGameView(*r.frame) && r.ready_time != g_fg_pacing.last_ready &&
+	                      FgPacingUpdate(r.ready_time, std::max(static_cast<double>(floor + 1) / vblank_hz, 1.0 / 60.0));
+	static bool s_fg_paced = false; // this request's decision, kept while it waits for its time (vblank to vblank)
+	static uint64_t s_fg_id = 0;
+	if (s_fg_id != r.id) {
+		s_fg_id    = r.id;
+		s_fg_paced = fg_paced;
+	}
+	if (s_fg_paced) {
+		const auto release = g_fg_pacing.last_release + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+		                                                    std::chrono::duration<double>(g_fg_pacing.target));
+		const auto period  = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+		    std::chrono::duration<double>(1.0 / vblank_hz));
+		auto now = std::chrono::steady_clock::now();
+		due      = now + period >= release && IsFlipDueReadyLocked(*r.cfg, r.generation, 0);
+		if (due && now < release) {
+			r.cfg->mutex.Unlock();
+			std::this_thread::sleep_until(release - std::chrono::microseconds(500));
+			while (std::chrono::steady_clock::now() < release) std::this_thread::yield();
+			r.cfg->mutex.Lock();
+			due = IsFlipDueReadyLocked(*r.cfg, r.generation, 0);
+		}
+		// The FSR 3 / DLSS-G cap interval (RealFrameInterval) is at most the floor, so under the target: this replaces it.
+		// (Reflex's DLSS-G frame limit is that same cap or none, never above the floor: it never holds a paced frame.)
+		if (g_fg_pacing.target >= paced_interval) paced_wait = false;
+	}
 	if (paced_wait || !due) {
 		r.cfg->mutex.Unlock();
 		Common::LockGuard queue_lock(m_mutex);
@@ -1573,6 +1684,7 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	}
 
 	if (paced_interval > 0.0) s_paced_next = std::max(s_paced_next, paced_now - paced_step) + paced_step;
+	FgPacingNoteRelease(std::chrono::steady_clock::now(), s_fg_paced);
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
 	    m_requests.front().state != RequestState::Ready || !m_processing) {
