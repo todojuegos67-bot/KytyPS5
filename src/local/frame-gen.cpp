@@ -81,6 +81,11 @@ int      g_dyn_gen         = 1;   // the current generated frame count in dynami
 int      g_dyn_pending     = 0;   // a candidate value and how many windows in a row it came out
 int      g_dyn_pending_n   = 0;
 double   g_dyn_real_fps    = 0.0; // smoothed real fps
+// 10-21: when one more generated frame would pass the target but costs at most ~10% of the real rate (60 real on
+// 224: x4 at 56 real = 224 instead of x3 = 180), that multiplier is taken and Reflex holds the real rate at
+// target / (gen + 1). KYTY_DLSSG_DYN_STRETCH=0: the old floor choice (no limit).
+bool     g_dyn_stretch     = true;
+uint32_t g_dyn_limit_us    = 0;
 
 int CurrentGenerate() {
 	return g_dlssg_dynamic ? std::min(g_dyn_gen, g_generate) : g_generate;
@@ -286,6 +291,7 @@ struct Api {
 	PFun_slDLSSSetOptions*       dlss_set_options    = nullptr;
 	PFun_slDLSSGetOptimalSettings* dlss_get_optimal_settings = nullptr;
 };
+sl::ReflexOptions g_reflex_opts {}; // kept for the dynamic multiplier's limit changes
 Api              g_api;
 sl::FrameToken*  g_token = nullptr; // present thread: the frame being presented
 uint32_t         g_frame_index = 0;
@@ -652,6 +658,7 @@ void Initialize() {
 	}
 	if (const char* dyn = std::getenv("KYTY_DLSSG_DYNAMIC"); dyn != nullptr && *dyn == '1' && g_generate > 0) {
 		g_dlssg_dynamic = true;
+		if (const char* st = std::getenv("KYTY_DLSSG_DYN_STRETCH"); st != nullptr && *st == '0') g_dyn_stretch = false;
 		if (const char* t = std::getenv("KYTY_DLSSG_TARGET_FPS"); t != nullptr && std::atof(t) > 0) {
 			g_dlssg_target_fps = static_cast<float>(std::atof(t));
 		} else {
@@ -882,7 +889,8 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 	// pacer held every present ~25 ms (the game at ~37 fps), and with Reflex off the game reached ~56 but DLSS-G
 	// reported Reflex missing (a tinted picture).
 	FeatureFunction(sl::kFeatureReflex, "slReflexSleep", g_api.reflex_sleep);
-	sl::ReflexOptions reflex {};
+	sl::ReflexOptions& reflex = g_reflex_opts;
+	reflex = {};
 	reflex.mode = sl::ReflexMode::eLowLatency;
 	// KYTY_DLSSG_REFLEX=off|low|boost (a comparison of DLSS-G's pacing).
 	if (const char* mode = std::getenv("KYTY_DLSSG_REFLEX"); mode != nullptr) {
@@ -1203,9 +1211,20 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 				const double real = g_stat_real / window;
 				g_dyn_real_fps    = g_dyn_real_fps <= 0.0 ? real : 0.5 * g_dyn_real_fps + 0.5 * real;
 				int limit         = g_generate;
-				const int cand    = std::clamp(
-				    static_cast<int>(std::floor(static_cast<double>(g_dlssg_target_fps) / std::max(g_dyn_real_fps, 1.0))) - 1, 1,
+				// Real rate the game would run at without our limit: when we hold it, the measured rate is our cap.
+				const double free_real = g_dyn_real_fps;
+				int cand    = std::clamp(
+				    static_cast<int>(std::floor(static_cast<double>(g_dlssg_target_fps) / std::max(free_real, 1.0))) - 1, 1,
 				    std::max(limit, 1));
+				if (g_dyn_stretch && cand + 1 <= limit &&
+				    static_cast<double>(g_dlssg_target_fps) / (cand + 2) >= free_real * 0.9) {
+					cand += 1;
+				}
+				// While the limit holds the real rate, keep the stretched choice unless the game falls clearly below it.
+				if (g_dyn_stretch && g_dyn_limit_us != 0 && cand < g_dyn_gen &&
+				    free_real >= 0.95 * static_cast<double>(g_dlssg_target_fps) / (g_dyn_gen + 1)) {
+					cand = g_dyn_gen;
+				}
 				if (cand == g_dyn_gen) {
 					g_dyn_pending_n = 0;
 				} else if (cand == g_dyn_pending) {
@@ -1213,6 +1232,16 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 						g_dyn_gen       = cand;
 						g_dyn_pending_n = 0;
 						g_options_set   = false; // send numFramesToGenerate again
+						if (g_dyn_stretch) {
+							const uint32_t us = static_cast<uint32_t>(1000000.0 * (g_dyn_gen + 1) / g_dlssg_target_fps);
+							if (us != g_dyn_limit_us) {
+								g_dyn_limit_us      = us;
+								g_reflex_opts.frameLimitUs = us;
+								g_api.reflex_set_options(g_reflex_opts);
+								std::printf("[dlssg] dynamic x%d: real held at %.1f fps (Reflex limit %u us)\n", g_dyn_gen + 1,
+								            static_cast<double>(g_dlssg_target_fps) / (g_dyn_gen + 1), us);
+							}
+						}
 					}
 				} else {
 					g_dyn_pending   = cand;
