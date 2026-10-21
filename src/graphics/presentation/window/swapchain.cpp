@@ -1164,7 +1164,7 @@ Swapchain::Status Swapchain::AcquireNextImage() {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
-		case vk::Result::eErrorFullScreenExclusiveModeLostEXT:
+		case static_cast<vk::Result>(VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT):
 			m_exclusive_acquired = false;
 			LogExclusive("lost (vkAcquireNextImageKHR): swapchain made again");
 			return Status::Recreate;
@@ -1399,7 +1399,7 @@ Swapchain::Status Swapchain::Present() {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
-		case vk::Result::eErrorFullScreenExclusiveModeLostEXT:
+		case static_cast<vk::Result>(VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT):
 			m_exclusive_acquired = false;
 			LogExclusive("lost (vkQueuePresentKHR): swapchain made again");
 			return Status::Recreate;
