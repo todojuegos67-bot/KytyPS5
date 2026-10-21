@@ -534,6 +534,12 @@ if ($vblankHz -gt 60 -and $titleId -match '^PPSA0134[0-2]$' -and "$($environment
 if ("$($environment['KYTY_DS_VARIABLE_STEP'])" -eq '1' -and $titleId -match '^PPSA0134[0-2]$' -and "$($environment['KYTY_GAME_CONVARS'])" -notmatch 'physicsUseFixedTimestep') {
 	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'physicsUseFixedTimestep=false', 'gameDeltaTimeCorrectionTolorance=0.01') | Where-Object { $_ }) -join ';'
 }
+# The same switch at 60 Hz: the step's floor max(dt, gameMinDeltaTime < 0 ? fixedDt : gameMinDeltaTime) (0x900b28233)
+# is 1/30 s in the cinematic mode, so 60 fps parts of it (logo, menus) advanced 1/30 a frame (twice too fast) once the
+# snap above lets dt follow real time; a 4 ms floor (as above 60 Hz) keeps every mode in real time.
+if ("$($environment['KYTY_DS_VARIABLE_STEP'])" -eq '1' -and $titleId -match '^PPSA0134[0-2]$' -and "$($environment['KYTY_GAME_CONVARS'])" -notmatch 'gameMinDeltaTime') {
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'gameMinDeltaTime=0.004') | Where-Object { $_ }) -join ';'
+}
 
 # The performance cores of a hybrid CPU (Windows' CPU set efficiency classes: an Intel Core with
 # P- and E-cores), without the core of CPU 0, within the launch's CPUs: a list such as "1,2,3,4,5",
