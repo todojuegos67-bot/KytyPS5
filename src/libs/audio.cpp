@@ -11,6 +11,7 @@
 #include "kernel/semaphore.h"
 #include "libs/audio_internal.h"
 #include "libs/dualSenseHaptics.h"
+#include "libs/controller.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -520,6 +521,29 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 			return Controller::DualSenseHaptics::Write(prepared_data, port->samples_num, port->freq,
 			                                           PreparedChannels(*port),
 			                                           FormatIsFloat(port->format), false, gains);
+		}
+		if (port->type == AUDIO_OUT_PORT_TYPE_VIBRATION) {
+			static const bool rumble = [] {
+				const char* v = std::getenv("KYTY_HAPTIC_RUMBLE");
+				return v == nullptr || *v != '0';
+			}();
+			if (rumble && port->samples_num > 0 && port->channels_num > 0) {
+				// RMS of the first two channels (the left and right actuators), with the port's own gain.
+				const int    ch = port->channels_num;
+				double       sum[2] {0.0, 0.0};
+				const size_t n  = port->samples_num;
+				for (size_t i = 0; i < n; i++) {
+					for (int c = 0; c < std::min(ch, 2); c++) {
+						const double v = FormatIsFloat(port->format)
+						                     ? static_cast<const float*>(data)[i * ch + c]
+						                     : static_cast<const int16_t*>(data)[i * ch + c] / 32768.0;
+						sum[c] += v * v;
+					}
+				}
+				const float l = static_cast<float>(std::sqrt(sum[0] / n) * port->volume[0] / 32768.0);
+				const float r = ch > 1 ? static_cast<float>(std::sqrt(sum[1] / n) * port->volume[1] / 32768.0) : l;
+				Controller::RumbleFromHaptics(l, r);
+			}
 		}
 		return false;
 	}

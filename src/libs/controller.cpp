@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 namespace Libs::Controller {
@@ -865,6 +866,42 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	}
 
 	return ret_num;
+}
+
+// 10-21: Demon's Souls vibrates through the DualSense's haptics (an audio port), never PadSetVibration: without the
+// pad's USB audio endpoint the pad stayed still. The audio's loudness drives the rumble motors instead.
+// KYTY_HAPTIC_RUMBLE=0 off; KYTY_HAPTIC_RUMBLE_GAIN (default 4) scales it.
+void RumbleFromHaptics(float left, float right) {
+	static const float gain = [] {
+		const char* v = std::getenv("KYTY_HAPTIC_RUMBLE_GAIN");
+		const float g = v != nullptr ? static_cast<float>(std::atof(v)) : 4.0f;
+		return g > 0.0f ? g : 4.0f;
+	}();
+	if (g_controller == nullptr) return;
+	const auto to_motor = [](float x) {
+		x = x * gain;
+		if (x < 0.02f) return 0;                      // noise floor: still
+		return static_cast<int>(std::min(x, 1.0f) * 255.0f + 0.5f);
+	};
+	const int large = to_motor(left);
+	const int small = to_motor(right);
+	static int  last_large = -1, last_small = -1;
+	static auto last_sent  = std::chrono::steady_clock::time_point {};
+	const auto  now        = std::chrono::steady_clock::now();
+	const bool  changed    = std::abs(large - last_large) > 6 || std::abs(small - last_small) > 6 ||
+	                     ((large == 0) != (last_large == 0)) || ((small == 0) != (last_small == 0));
+	if (!changed && now - last_sent < std::chrono::milliseconds(100)) return;
+	if (!changed && large == 0 && small == 0) return;
+	last_large = large;
+	last_small = small;
+	last_sent  = now;
+	static bool logged = false;
+	if (!logged && (large != 0 || small != 0)) {
+		logged = true;
+		std::printf("Pad: haptics played as rumble (no DualSense USB audio endpoint), first levels %d/%d\n", large, small);
+		std::fflush(stdout);
+	}
+	g_controller->SetVibration(static_cast<uint8_t>(large), static_cast<uint8_t>(small));
 }
 
 int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
