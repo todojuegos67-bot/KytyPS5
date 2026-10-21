@@ -62,7 +62,7 @@ struct Settings {
 	std::string framegen = "sin-fg";
 	// [Rendimiento]
 	bool        profile16 = false;  // run-windows -Ram16 (ram16.txt): memory only
-	bool        low_end = false;    // "PC gama baja (30x2)": AMD x2 + KYTY_FLIP_FPS=30
+	bool        low_end = false;    // "PC bajos requisitos": AMD x2 + KYTY_FLIP_FPS=30
 	bool        safe_gpu = false;   // KYTY_COMPUTE_CHAIN=0
 	std::string quality = "standard";
 	std::string texture_reduce = "auto";

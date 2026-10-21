@@ -435,7 +435,9 @@ void Draw(float width, float height) {
 					CheckRow("Pantalla completa", true, s.fullscreen);
 					CheckRow("HDR", true, s.hdr, "HDR10: solo con \"Usar HDR\" activado en Windows");
 					CheckRow("VSync", true, s.vsync);
-					CheckRow("PC gama baja (30x2)", true, s.low_end, "30 FPS reales + frame generation AMD x2: 60 en pantalla (manda sobre el modo elegido)");
+					if (CheckRow("PC bajos requisitos", true, s.low_end, "30 FPS reales + frame generation AMD x2 (60 en pantalla); sin DLSS de reescalado") &&
+					    s.low_end && s.res.rfind("dlss", 0) == 0)
+						s.res = "nativo";
 					CheckRow("G-Sync / FreeSync", true, s.gsync, "El reloj del emulador no se ata a los Hz del monitor");
 					CheckRow("FPS desbloqueados (experimental)", true, s.unlock_fps,
 					         "El juego pasa de 60 FPS reales; videos, menus y cargas siguen a 60");
@@ -454,7 +456,12 @@ void Draw(float width, float height) {
 					break;
 				}
 				case 1: {
-					ComboRow("Reescalado", true, kResModeCount, kResModes, s.res, [](const ResMode& m) { return m.id; },
+					if (s.low_end && s.res.rfind("dlss", 0) == 0) s.res = "nativo";
+					static std::vector<ResMode> shown;
+					shown.clear();
+					for (int i = 0; i < kResModeCount; i++)
+						if (!s.low_end || std::string(kResModes[i].upscaler) != "dlss") shown.push_back(kResModes[i]);
+					ComboRow("Reescalado", true, static_cast<int>(shown.size()), shown.data(), s.res, [](const ResMode& m) { return m.id; },
 					         [](const ResMode& m) { return m.label; },
 					         "DLSS: NVIDIA RTX. XeSS: todas las graficas. FSR: graficas de bajo rendimiento");
 					if (ChoiceRow("Nitidez", (s.sharpness == "auto") != (g_rt.launched.sharpness == "auto"), kSharpness,
@@ -472,9 +479,12 @@ void Draw(float width, float height) {
 						                      "dlss-x3", "dlss-x4", "dlss-x5", "dlss-x6", "dlss-120", "dlss-dinamico"})
 							modes.push_back({id, FrameGenLabel(id)});
 					}
-					if (s.low_end) ImGui::TextColored(kWarn, "PC gama baja (30x2) activo: se usa AMD x2.");
-					ChoiceRow("Modo", true, modes.data(), static_cast<int>(modes.size()), s.framegen,
+					if (s.low_end) ImGui::TextColored(kWarn, "PC bajos requisitos: frame generation fija en AMD x2 (30 reales, 60 en pantalla).");
+					ImGui::BeginDisabled(s.low_end);
+					std::string locked = "amd-x2";
+					ChoiceRow("Modo", true, modes.data(), static_cast<int>(modes.size()), s.low_end ? locked : s.framegen,
 					          "AMD: todas las graficas. DLSS: NVIDIA RTX 40/50");
+					ImGui::EndDisabled();
 					const int max_gen = g_rt.launched.low_end ? 0 : FixedDlssGenerated(g_rt.launched.framegen);
 					if (max_gen > 1 && s.framegen == g_rt.launched.framegen) {
 						if (g_fg_live == 0) g_fg_live = max_gen;
