@@ -7,6 +7,8 @@
 #   .\run-windows.ps1 -Width 1920 -Height 1080 -Fullscreen
 #   .\run-windows.ps1 -NoRedZone             without guest red-zone protection
 #   .\run-windows.ps1 -Patch <cheat.json>    apply an etaHEN-style game patch
+#   .\run-windows.ps1 -ExclusiveFullscreen   classic exclusive full screen (KYTY_EXCLUSIVE_FULLSCREEN=1;
+#                                            VK_EXT_full_screen_exclusive), not the borderless desktop one
 #   .\run-windows.ps1 -Fullscreen -AspectFit keep the game's 16:9 (black bars) instead of stretching
 #   .\run-windows.ps1 -Hdr                   HDR10 output when Windows HDR is on for the display (the game is
 #                                            told the TV takes HDR and outputs it; SDR otherwise)
@@ -58,6 +60,7 @@ param(
 	[int]$Width = 0,
 	[int]$Height = 0,
 	[switch]$Fullscreen,
+	[switch]$ExclusiveFullscreen,
 	[switch]$Hdr,
 	[switch]$Baseline,
 	[switch]$Precompile,
@@ -223,6 +226,8 @@ function Set-Option([string]$name, [string]$value) {
 if ($Width -gt 0) { Set-Option '--screen-width' "$Width" }
 if ($Height -gt 0) { Set-Option '--screen-height' "$Height" }
 if ($Fullscreen) { $options.Add('--fullscreen') }
+# -ExclusiveFullscreen: the window opens full screen and the swapchain takes the display exclusively.
+if ($ExclusiveFullscreen) { $env:KYTY_EXCLUSIVE_FULLSCREEN = '1'; if (-not $options.Contains('--fullscreen')) { $options.Add('--fullscreen') } }
 if ($Hdr) { $options.Add('--hdr') }
 if ($PresentMode) { Set-Option '--present-mode' $PresentMode }
 if ($Language -ge 0) { Set-Option '--console-language' "$Language" }

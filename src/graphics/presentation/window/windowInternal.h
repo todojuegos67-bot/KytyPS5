@@ -24,6 +24,15 @@ struct SurfaceCapabilities {
 	std::vector<vk::PresentModeKHR>   present_modes;
 };
 
+// KYTY_EXCLUSIVE_FULLSCREEN=1 (Windows): classic exclusive full screen through VK_EXT_full_screen_exclusive instead of
+// the borderless desktop full screen (swapchain.cpp). The window is the same borderless popup over its monitor; the
+// swapchain asks the driver for the display itself (application controlled), released while the window has no focus.
+namespace ExclusiveFullscreen {
+[[nodiscard]] bool Requested();
+// Set by the window's events (main thread), read by the presenter thread: focused and not minimized.
+inline std::atomic_bool g_wanted {true};
+} // namespace ExclusiveFullscreen
+
 struct WindowLoopState {
 	SDL_Event        event {};
 	bool             need_exit = false;
@@ -56,6 +65,8 @@ struct WindowContext {
 	SDL_Window*                    window        = nullptr;
 	vk::SurfaceKHR                 surface       = nullptr;
 	SurfaceCapabilities            surface_capabilities;
+	bool                           full_screen_exclusive_ext = false; // VK_EXT_full_screen_exclusive enabled
+	bool                           surface_capabilities2_ext = false; // VK_KHR_get_surface_capabilities2 enabled
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;
 	WindowLoopState                loop;
