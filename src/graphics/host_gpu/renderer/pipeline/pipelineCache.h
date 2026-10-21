@@ -417,6 +417,7 @@ private:
 	// may still use them).
 	std::vector<Pipeline*>    m_optimizing;
 	std::vector<vk::Pipeline> m_replaced_pipelines;
+	std::vector<int64_t>      m_replaced_at; // (KYTY_RAM_DIET) steady_clock time each was replaced
 	uint32_t                  m_unoptimized_builds = 0;
 	std::atomic<uint32_t>     m_optimized_builds {0}; // finished by workers
 	uint32_t                  m_promoted_builds = 0;  // of those, seen by PromoteOptimized

@@ -480,7 +480,8 @@ if ($Ram16) {
 if ($Turbo2) {
 	$turboSet = [ordered]@{ KYTY_VRAM_BUDGET_MB = '2560'; KYTY_GC_BUDGET_CAP_MB = '2560'; KYTY_SMALL_VRAM = '1'
 		KYTY_TEXTURE_REDUCE = '2'; KYTY_TRIM_RAM_SECONDS = '0'; KYTY_IMAGE_POOL = '0'
-		KYTY_NATIVE_XPR_STORE_BUDGET = '64'; KYTY_TABLE_STORE_BUDGET = '4'; KYTY_SIMULATE_RAM_MB = '8192' }
+		KYTY_NATIVE_XPR_STORE_BUDGET = '64'; KYTY_TABLE_STORE_BUDGET = '4'; KYTY_SIMULATE_RAM_MB = '8192'
+		KYTY_RAM_DIET = '1' }
 	foreach ($key in $turboSet.Keys) { $environment[$key] = $turboSet[$key] }
 	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars['lowest']) | Where-Object { $_ }) -join ';'
 	Write-Host 'memory:   turbo 2.0 (8-12 GB PCs, 4-6 GB GPUs): video memory caches 2.5 GB, textures a quarter, no RAM trim'
