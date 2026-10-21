@@ -233,7 +233,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "perfil_16gb=" << b(s.profile16) << "\n"
 	  << "; Para graficas que se cuelgan o dan pantallazo azul (~37% menos FPS)\n"
 	  << "gpu_seguro=" << b(s.safe_gpu) << "\n"
-	  << "; standard, low, lowest (menos detalle lejano y sombras: ayuda si limita la CPU)\n"
+	  << "; standard, low, lowest (menos detalle lejano, sombras intactas: ayuda si limita la CPU)\n"
 	  << "calidad=" << s.quality << "\n"
 	  << "; auto, 0 (completas), 1 (mitad), 2 (un cuarto)\n"
 	  << "reducir_texturas=" << s.texture_reduce << "\n"
@@ -320,8 +320,9 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 	if (upscaler == "dlss" && s.dlss_preset != "auto" && !s.dlss_preset.empty()) env.Set("KYTY_DLSS_PRESET", s.dlss_preset);
 	if (!s.aspect.empty() && s.aspect != "16:9") env.Set("KYTY_RENDER_ASPECT", s.aspect);
 	static const std::map<std::string, std::string> convars = {
-	    {"low", "r_forceViewportHeightForPixelSizeCalc=720;sunShadowMaxDistance=125"},
-	    {"lowest", "r_forceViewportHeightForPixelSizeCalc=480;sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false"}};
+	    // (Shadows untouched: their distance and kinds popped in visibly.)
+	    {"low", "r_forceViewportHeightForPixelSizeCalc=720"},
+	    {"lowest", "r_forceViewportHeightForPixelSizeCalc=480"}};
 	if (auto it = convars.find(quality); it != convars.end() && demons) env.AppendConvars(it->second);
 	if (texture == "0" || texture == "1" || texture == "2") env.Set("KYTY_TEXTURE_REDUCE", texture);
 	env.Default("KYTY_UNMAP_PROTECT_SKIP", "1");
