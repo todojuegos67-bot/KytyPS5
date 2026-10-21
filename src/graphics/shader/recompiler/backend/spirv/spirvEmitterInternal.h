@@ -320,6 +320,8 @@ enum : uint32_t {
 	GlslUnpackHalf2x16  = 62,
 	GlslFindILsb        = 73,
 	GlslFindUMsb        = 75,
+	GlslNMin            = 79,
+	GlslNMax            = 80,
 };
 
 struct InputBinding {
