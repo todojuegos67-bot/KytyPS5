@@ -904,6 +904,21 @@ void WindowContext::RunOnMainThread(std::function<void()> task) {
 	}
 }
 
+void WindowContext::PostToMainThread(std::function<void()> task) {
+	if (Common::Thread::IsMainThread()) {
+		task();
+		return;
+	}
+	{
+		Common::LockGuard lock(main_task_mutex);
+		main_tasks.push_back(std::move(task));
+		++main_tasks_queued;
+	}
+	SDL_Event event {};
+	event.type = SDL_USEREVENT;
+	SDL_PushEvent(&event);
+}
+
 void WindowContext::DrainMainThreadTasks() {
 	std::vector<std::function<void()>> tasks;
 	{
@@ -1195,6 +1210,13 @@ void WindowContext::UpdateTitle() {
 		fps_frames  = 0;
 	}
 
+	// Twice a second at most, and never waiting for the main thread (PostToMainThread): the title is set while the
+	// present thread goes on.
+	static uint64_t title_at = 0;
+	if (now - title_at < frequency / 2 || title_posted.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	title_at = now;
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
@@ -1205,7 +1227,10 @@ void WindowContext::UpdateTitle() {
 		text += fmt::format(", waypoints: {}", waypoints);
 	}
 
-	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
+	PostToMainThread([this, text = std::move(text)] {
+		SDL_SetWindowTitle(window, text.c_str());
+		title_posted.store(false, std::memory_order_release);
+	});
 }
 
 } // namespace Libs::Graphics
