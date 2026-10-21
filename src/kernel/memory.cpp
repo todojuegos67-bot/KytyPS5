@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include "loader/systemContent.h"
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -1143,6 +1144,36 @@ static std::recursive_mutex g_memory_operation_mutex;
 // heap below it), so hint-less searches must not fall back to the low system-managed range.
 static constexpr uint64_t GUEST_DEFAULT_MAP_BASE = 0x200000000ull;
 
+uint64_t AmmVaStart() {
+	static const uint64_t base = [] {
+		uint64_t value = 0x0000001000000000ull;
+		if (const char* env = std::getenv("KYTY_AMM_VA_BASE"); env != nullptr && *env != '\0') {
+			const auto parsed = std::strtoull(env, nullptr, 16);
+			if (parsed != 0 && (parsed & 0xffffffull) == 0 && parsed + AMM_VA_SIZE <= HOST_USER_MAX + 1u) {
+				value = parsed;
+			}
+		} else {
+			std::string title;
+			if (Loader::SystemContentParamSfoGetString("TITLE_ID", &title) && title == "PPSA03671") {
+				value = 0x000000E000000000ull;
+			}
+		}
+		std::printf("AMM window: 0x%llx-0x%llx (KYTY_AMM_VA_BASE overrides)\n", static_cast<unsigned long long>(value),
+		            static_cast<unsigned long long>(value + AMM_VA_SIZE));
+		return value;
+	}();
+	return base;
+}
+
+bool QueryGuestMappingOverlap(uint64_t va, uint64_t size, uint64_t* start, uint64_t* len) {
+	if (g_virtual_ranges == nullptr) return false;
+	VirtualRanges::Range overlap {};
+	if (!g_virtual_ranges->QueryOverlap(va, size, &overlap)) return false;
+	if (start != nullptr) *start = overlap.start;
+	if (len != nullptr) *len = overlap.size;
+	return true;
+}
+
 static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t alignment) {
 	EXIT_IF(g_guest_address_space == nullptr || g_virtual_ranges == nullptr);
 
@@ -1170,7 +1201,7 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	// The AMM window is skipped: an AMM map placed there later (MAP_FIXED) would replace such a mapping
 	// with fresh pages, zeroing what the game had stored in it (Wolverine's component tables at boot).
 	auto find_in = [&](uint64_t begin, uint64_t end) {
-		constexpr uint64_t amm_end = AMM_VA_START + AMM_VA_SIZE;
+		const uint64_t amm_end = AMM_VA_START + AMM_VA_SIZE;
 		if (begin >= AMM_VA_START && begin < amm_end) {
 			return find_in_range(begin, end); // a hint inside the window: the guest asked for it
 		}

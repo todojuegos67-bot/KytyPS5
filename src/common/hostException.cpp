@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <exception>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -213,10 +214,27 @@ static void OnInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, u
 	__fastfail(FAST_FAIL_INVALID_ARG);
 }
 
+static void OnProcessExit() {
+	// An ordinary exit (exit(), the window closed, or a guest call that ends the process) says so; a fatal
+	// report was printed already when there was one.
+	if (!g_fatal_reported.load(std::memory_order_relaxed)) {
+		std::printf("Exit: the process ends normally (no fatal report)\n");
+		std::fflush(stdout);
+	}
+}
+
 static void InstallFatalReports() {
 	g_previous_unhandled_filter = SetUnhandledExceptionFilter(OnUnhandledException);
 	std::signal(SIGABRT, OnAbort);
 	_set_invalid_parameter_handler(OnInvalidParameter);
+	std::set_terminate([] {
+		ReportFatal("std::terminate (an uncaught C++ exception or a noexcept violation)");
+		std::abort();
+	});
+	std::atexit(OnProcessExit);
+	// Stack room for the report of a stack overflow on this thread (the handler runs on the overflowed stack).
+	ULONG guarantee = 64u * 1024u;
+	SetThreadStackGuarantee(&guarantee);
 }
 
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
@@ -228,6 +246,11 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 		               handler(exception_record->ExceptionInformation[1], exception->ContextRecord)
 		           ? EXCEPTION_CONTINUE_EXECUTION
 		           : EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	if (exception_record->ExceptionCode == EXCEPTION_STACK_OVERFLOW && !g_fatal_reported.load(std::memory_order_relaxed)) {
+		ReportFatal("stack overflow");
+		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
 	// A guarded copy reached a page without access: it stops there (never the guest's fault).

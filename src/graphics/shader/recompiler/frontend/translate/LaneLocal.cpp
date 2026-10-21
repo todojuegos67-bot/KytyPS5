@@ -523,7 +523,7 @@ private:
 	static bool UniformSources(const Instruction& inst, const State& state) {
 		for (uint32_t s = 0; s < inst.src_count && s < 4; ++s) {
 			const auto& source = *Source(inst, s);
-			if (source.dpp) return false;
+			if (source.dpp || source.dpp8) return false;
 			switch (source.kind) {
 				case OperandKind::Vgpr:
 					if (source.reg >= 256 || !state.uniform.test(source.reg)) return false;

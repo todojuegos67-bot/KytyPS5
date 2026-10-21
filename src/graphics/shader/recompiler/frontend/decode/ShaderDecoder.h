@@ -715,6 +715,11 @@ struct Operand {
 	bool     absolute           = false;
 	bool     clamp              = false;
 	bool     dpp                = false;
+	// GFX10 DPP8 (src0 0xE9, 0xEA with fetch-inactive): each lane reads src0 of lane
+	// (lane & ~7) | sel[lane & 7], the eight 3-bit selects in dpp8_sel (bits 0-23).
+	bool     dpp8               = false;
+	bool     dpp8_fetch_inactive = false;
+	uint32_t dpp8_sel           = 0;
 };
 
 struct Instruction {

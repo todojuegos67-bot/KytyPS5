@@ -332,7 +332,7 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	}
 	if (inst.dst.sdwa_sel != 6u || inst.dst.omod != 0u || inst.dst.clamp ||
 	    inst.src0.sdwa_sel != 6u || inst.src0.sdwa_sext || inst.src0.negate || inst.src0.absolute ||
-	    inst.src0.dpp) {
+	    inst.src0.dpp || inst.src0.dpp8) {
 		EXIT("V_MOVRELS_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
 	}
 	const auto base     = inst.src0.reg;
@@ -352,7 +352,7 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	}
 	if (inst.dst.sdwa_sel != 6u || inst.dst.omod != 0u || inst.dst.clamp ||
 	    inst.src0.sdwa_sel != 6u || inst.src0.sdwa_sext || inst.src0.negate || inst.src0.absolute ||
-	    inst.src0.dpp) {
+	    inst.src0.dpp || inst.src0.dpp8) {
 		EXIT("V_MOVRELD_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
 	}
 	const auto base  = inst.dst.reg;

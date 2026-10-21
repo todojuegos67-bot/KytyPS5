@@ -31,8 +31,15 @@ constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH = 32;
 // The AMM virtual address window (sceAmmGetVirtualAddressRanges): the game places its AMM mappings there
 // itself (MAP_FIXED through AMM command buffers), so the kernel never hands it out for mappings the
 // guest did not place (as on the console, where it is apart from the flexible/direct map range).
-constexpr uint64_t AMM_VA_START = 0x0000001000000000ull;
-constexpr uint64_t AMM_VA_SIZE  = 0x0000001000000000ull;
+// The window's base: 0x1000000000 by default (the start of the user range). Marvel's Wolverine (PPSA03671)
+// gets 0xE000000000 instead, near the top of the user range below the 1 TiB GPU limit: its own hinted mappings
+// at 0x10xxxxxxxx (component tables) met its AMM maps there and were replaced by fresh pages (the Wolverine fork
+// keeps AMM apart as well, at 0x80000000000). KYTY_AMM_VA_BASE=<hex> overrides for any title.
+uint64_t           AmmVaStart();
+constexpr uint64_t AMM_VA_SIZE = 0x0000001000000000ull;
+#define AMM_VA_START (::Libs::LibKernel::Memory::AmmVaStart())
+// The first guest mapping overlapping [va, va+size), for diagnostics: false when there is none.
+bool QueryGuestMappingOverlap(uint64_t va, uint64_t size, uint64_t* start, uint64_t* len);
 
 struct VirtualQueryInfo {
 	uintptr_t start;

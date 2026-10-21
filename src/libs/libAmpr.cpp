@@ -16,6 +16,7 @@
 #include "scene-tags.h"
 #include "slow-log.h"
 
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -685,7 +686,6 @@ constexpr int      PROT_AMPR_WRITE               = 0x80;
 constexpr int      PROT_ACP_READ                 = 0x100;
 constexpr int      PROT_ACP_WRITE                = 0x200;
 using LibKernel::Memory::AMM_VA_SIZE;
-using LibKernel::Memory::AMM_VA_START;
 constexpr uint64_t APR_MAX_READ_LENGTH           = 0x0000000100000000ull;
 constexpr uint64_t APR_MAX_FILE_OFFSET           = 0x0000010000000000ull;
 constexpr uint64_t APR_MAX_APP_ADDRESS           = 0x0000f00000000000ull;
@@ -1268,6 +1268,17 @@ static int ExecuteAmmMapCommand(const CommandBufferState::AmmMapCommand& command
 	if (command.kind == AmmCommandKind::MapAuto &&
 	    !AllocateAmmAutoDirectMemory(command.size, command.type, &dmem_offset)) {
 		return LibKernel::KERNEL_ERROR_EAGAIN;
+	}
+
+	// Diagnostics: an AMM map that replaces a mapping the guest holds (its bytes are lost).
+	if (uint64_t start = 0, len = 0; LibKernel::Memory::QueryGuestMappingOverlap(command.va, command.size, &start, &len)) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+			std::printf("AMM map over a mapped range: va=0x%llx size=0x%llx kind=%u replaces 0x%llx+0x%llx\n",
+			            static_cast<unsigned long long>(command.va), static_cast<unsigned long long>(command.size),
+			            static_cast<unsigned>(command.kind), static_cast<unsigned long long>(start),
+			            static_cast<unsigned long long>(len));
+		}
 	}
 
 	void* addr = reinterpret_cast<void*>(command.va);
