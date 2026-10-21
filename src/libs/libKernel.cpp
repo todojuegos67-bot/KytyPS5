@@ -1703,6 +1703,8 @@ static void KYTY_SYSV_ABI KernelDebugRaiseException(int /*c1*/, int /*c2*/) {
 static void KYTY_SYSV_ABI exit(int code) {
 	PRINT_NAME();
 
+	std::printf("Exit: the game called exit(%d) (%s) from %p\n", code, "libkernel", __builtin_return_address(0));
+	std::fflush(stdout);
 	::exit(code);
 }
 
