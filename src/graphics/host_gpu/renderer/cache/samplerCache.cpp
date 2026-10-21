@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include "common/logging/log.h"
@@ -121,8 +120,8 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	}();
 	vk::BorderColor border = int_border ? vk::BorderColor::eIntTransparentBlack : vk::BorderColor::eFloatTransparentBlack;
 	const auto      note_border = [&](const char* what) {
-		static std::atomic<uint32_t> count {0};
-		const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+		static uint32_t border_count = 0; // (under m_mutex)
+		const uint32_t  n = ++border_count;
 		if (n <= 4 || (n & (n - 1)) == 0) {
 			std::printf("Samplers: %u with a %s border (%s colors; KYTY_SAMPLER_INT_BORDER=1 for INT)
 ", n, what,
