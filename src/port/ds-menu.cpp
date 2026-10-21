@@ -480,8 +480,6 @@ void Draw(float width, float height) {
 					}
 					ChoiceRow("Modo", true, modes.data(), static_cast<int>(modes.size()), s.framegen,
 					          "AMD: todas las graficas. DLSS: NVIDIA RTX 40/50");
-					static const Choice presets[] = {{"auto", "Auto (driver)"}, {"C", "C"}};
-					ChoiceRow("Preset frame generation DLSS", true, presets, 2, s.fg_preset);
 					const int max_gen = FixedDlssGenerated(g_rt.launched.framegen);
 					if (max_gen > 1 && s.framegen == g_rt.launched.framegen) {
 						if (g_fg_live == 0) g_fg_live = max_gen;

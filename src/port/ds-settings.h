@@ -61,7 +61,6 @@ struct Settings {
 	std::string dlss_preset = "auto";
 	// [FrameGeneration]
 	std::string framegen = "sin-fg";
-	std::string fg_preset = "auto"; // KYTY_DLSSG_PRESET (auto: the driver's; C)
 	// [Rendimiento]
 	bool        turbo = false;      // Launcher "TURBO (VRAM 8 GB o menos)" = run-windows -Turbo2
 	bool        profile16 = false;  // run-windows -Ram16 (ram16.txt)

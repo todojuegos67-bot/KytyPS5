@@ -170,7 +170,6 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("nitidez", s->sharpness);
 	str("preset_dlss", s->dlss_preset);
 	str("frame_generation", s->framegen);
-	str("fg_preset_dlss", s->fg_preset);
 	boo("turbo", s->turbo);
 	boo("perfil_16gb", s->profile16);
 	boo("gpu_seguro", s->safe_gpu);
@@ -229,8 +228,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; sin-fg, amd-x2, amd-x3, amd-x4, amd-120, amd-dinamico,\n"
 	  << "; dlss-x2, dlss-x3, dlss-x4, dlss-x5, dlss-x6, dlss-120, dlss-dinamico (NVIDIA RTX)\n"
 	  << "frame_generation=" << s.framegen << "\n"
-	  << "; Preset de la frame generation DLSS: auto (el del driver) o C\n"
-	  << "fg_preset_dlss=" << s.fg_preset << "\n\n"
+	  << "\n"
 	  << "[Rendimiento]\n"
 	  << "; TURBO: graficas de 8 GB o menos / PCs de 8-12 GB de RAM (3D a 1080, solo reescalado AA nativo: dlss-dlaa, xess-aa, fsr-aa; texturas a un cuarto)\n"
 	  << "turbo=" << b(s.turbo) << "\n"
@@ -381,7 +379,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 		}
 	}
 	if (s.fullscreen && s.exclusive) env.Set("KYTY_EXCLUSIVE_FULLSCREEN", "1");
-	if (s.fg_preset == "C" && std::strncmp(fg->id, "dlss", 4) == 0) env.Set("KYTY_DLSSG_PRESET", "C");
+	env.Set("KYTY_DLSSG_PRESET", "C"); // (always: the emulator applies it to nvngx_dlssg only)
 	// The port's own: metrics (the launcher started metricas.ps1; here the in-game panel) and rumble.
 	env.Set("KYTY_FPS_HUD", s.metrics == "1" || s.metrics == "2" ? s.metrics : "");
 	env.Set("KYTY_HAPTIC_RUMBLE", s.rumble ? "1" : "0");
@@ -405,7 +403,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 
 bool NeedsRestart(const Settings& l, const Settings& n) {
 	// Live: sharpness, the fps cap, metrics and rumble.
-	return l.game != n.game || l.exclusive != n.exclusive || l.fg_preset != n.fg_preset || l.language != n.language || l.fullscreen != n.fullscreen || l.width != n.width ||
+	return l.game != n.game || l.exclusive != n.exclusive || l.language != n.language || l.fullscreen != n.fullscreen || l.width != n.width ||
 	       l.height != n.height || l.hdr != n.hdr || l.vsync != n.vsync || l.gsync != n.gsync ||
 	       l.unlock_fps != n.unlock_fps || l.aspect_fit != n.aspect_fit || l.aspect != n.aspect || l.res != n.res ||
 	       l.dlss_preset != n.dlss_preset || l.framegen != n.framegen || l.turbo != n.turbo ||
