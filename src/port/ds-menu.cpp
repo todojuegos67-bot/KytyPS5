@@ -435,7 +435,7 @@ void Draw(float width, float height) {
 					CheckRow("Pantalla completa", true, s.fullscreen);
 					CheckRow("HDR", true, s.hdr, "HDR10: solo con \"Usar HDR\" activado en Windows");
 					CheckRow("VSync", true, s.vsync);
-					if (CheckRow("PC bajos requisitos", true, s.low_end, "30 FPS reales + frame generation AMD x2 (60 en pantalla); sin DLSS de reescalado") &&
+					if (CheckRow("Modo graficas de 8 GB", true, s.low_end, "Adaptado para graficas de 8 GB como RTX 3060, RTX 3060 Ti, RTX 3070, RTX 2070/2080, RX 6600, RX 6600 XT o RX 6650 XT: el juego a 30 FPS estables y frame generation de AMD x2 (60 en pantalla). Reescalado solo con XeSS o FSR.") &&
 					    s.low_end && s.res.rfind("dlss", 0) == 0)
 						s.res = "nativo";
 					CheckRow("G-Sync / FreeSync", true, s.gsync, "El reloj del emulador no se ata a los Hz del monitor");
@@ -479,7 +479,7 @@ void Draw(float width, float height) {
 						                      "dlss-x3", "dlss-x4", "dlss-x5", "dlss-x6", "dlss-120", "dlss-dinamico"})
 							modes.push_back({id, FrameGenLabel(id)});
 					}
-					if (s.low_end) ImGui::TextColored(kWarn, "PC bajos requisitos: frame generation fija en AMD x2 (30 reales, 60 en pantalla).");
+					if (s.low_end) ImGui::TextColored(kWarn, "Modo graficas de 8 GB: frame generation fija en AMD x2 (30 reales, 60 en pantalla).");
 					ImGui::BeginDisabled(s.low_end);
 					std::string locked = "amd-x2";
 					ChoiceRow("Modo", true, modes.data(), static_cast<int>(modes.size()), s.low_end ? locked : s.framegen,

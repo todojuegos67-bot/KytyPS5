@@ -215,7 +215,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "[Rendimiento]\n"
 	  << "; PCs de 16 GB de RAM: 6 GB del juego fijos en RAM y la precarga de shaders espera con poca RAM libre\n"
 	  << "perfil_16gb=" << b(s.profile16) << "\n"
-	  << "; PC bajos requisitos: 30 FPS reales y frame generation AMD x2 (60 en pantalla); manda sobre frame_generation; sin DLSS de reescalado\n"
+	  << "; Modo graficas de 8 GB: Adaptado para graficas de 8 GB como RTX 3060, RTX 3060 Ti, RTX 3070, RTX 2070/2080, RX 6600, RX 6600 XT o RX 6650 XT: el juego a 30 FPS estables y frame generation de AMD x2 (60 en pantalla). Reescalado solo con XeSS o FSR. Manda sobre frame_generation.\n"
 	  << "gama_baja=" << b(s.low_end) << "\n"
 	  << "; Para graficas que se cuelgan o dan pantallazo azul (~37% menos FPS)\n"
 	  << "gpu_seguro=" << b(s.safe_gpu) << "\n"
@@ -251,7 +251,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 	Env        env;
 	const bool demons = title_id.empty() || title_id.rfind("PPSA0134", 0) == 0;
 	// The frame generation config (config/<mode>.json): the common switches, then the mode's.
-	// PC bajos requisitos: AMD x2 whatever frame_generation says, the game flipped at 30 (12 vblanks of 360 Hz).
+	// Modo graficas de 8 GB: AMD x2 whatever frame_generation says, the game flipped at 30 (12 vblanks of 360 Hz).
 	const auto* fg = FindFg(s.low_end ? "amd-x2" : s.framegen);
 	for (const auto& p: Tables::kBaseEnv) env.Set(p.key, p.value);
 	for (int i = 0; i < fg->env_count; i++) env.Set(fg->env[i].key, fg->env[i].value);
@@ -260,9 +260,9 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 
 	// Launcher-souls.ps1: super resolution. DLSS with AMD frame generation closed the emulator at device creation
 	// (Streamline): the launcher refused it; here the same ratio with FSR.
-	// PC bajos requisitos: no DLSS upscaling (a saved DLSS mode plays native).
+	// Modo graficas de 8 GB: no DLSS upscaling (a saved DLSS mode plays native).
 	const bool     no_dlss  = s.low_end && std::string(FindRes(s.res)->upscaler) == "dlss";
-	if (no_dlss) plan.notes.emplace_back("PC bajos requisitos: sin reescalado DLSS, se juega nativo");
+	if (no_dlss) plan.notes.emplace_back("Modo graficas de 8 GB: sin reescalado DLSS, se juega nativo");
 	const ResMode* res      = no_dlss ? &kResModes[0] : FindRes(s.res);
 	std::string    upscaler = res->upscaler;
 	double         ratio    = upscaler.empty() ? 0.0 : res->value;

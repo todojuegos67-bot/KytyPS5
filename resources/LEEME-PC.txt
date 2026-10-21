@@ -43,8 +43,10 @@ Esta junto al exe y tiene comentarios en cada opcion. Equivalencias con el lanza
   fps_desbloqueados = FPS desbloqueados (experimental; sin FG: reloj a 960 Hz).
   perfil_16gb       = Equipo de 16 GB RAM: 6 GB fijos en RAM, la precarga de shaders espera con poca RAM
                       libre (no cambia los graficos).
-  gama_baja         = PC bajos requisitos: 30 FPS reales + frame generation AMD x2 (60 en pantalla),
-                      fija (manda sobre frame_generation); sin DLSS de reescalado (un modo DLSS pasa a nativo).
+  gama_baja         = Modo graficas de 8 GB: adaptado para graficas de 8 GB como RTX 3060, RTX 3060 Ti,
+                      RTX 3070, RTX 2070/2080, RX 6600, RX 6600 XT o RX 6650 XT: el juego a 30 FPS estables y
+                      frame generation de AMD x2 (60 en pantalla), fija. Reescalado solo con XeSS o FSR
+                      (un modo DLSS guardado pasa a nativo).
   gpu_seguro        = Modo GPU seguro.     simular_vram_8gb = Simular grafica 8 GB.
   calidad           = detalle del juego (standard / low / lowest).  reducir_texturas = auto / 0 / 1 / 2.
   metricas          = panel de FPS dentro del juego (0 / 1 / 2), con el modo de frame generation y su
