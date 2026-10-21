@@ -126,7 +126,50 @@ bool InstallWideOutput(const Program& program, int mode, uint32_t width) {
 	return true;
 }
 
+// The save's graphics mode read: call (read int); mov r13d, [rbp - 0x218]; mov rdi, r12; call; xor eax, eax;
+// cmp r13d, 1; mov edi, 4; mov [r15 + 0x64], r13d.
+constexpr std::string_view SavedModeRead =
+    "e8 ?? ?? ?? ?? 44 8b ad e8 fd ff ff 4c 89 e7 e8 ?? ?? ?? ?? 31 c0 41 83 fd 01 bf 04 00 00 00 45 89 6f 64";
+// The default from the system's game preset: mov r12d, 2; call IsTrinity; test al, al; jne store; mov eax, [rbp-0x54];
+// test; je; xor r12d, r12d; cmp eax, 1; setne r12b; store: mov [r14 + 0x64], r12d.
+constexpr std::string_view PresetMode =
+    "41 bc 02 00 00 00 e8 ?? ?? ?? ?? 84 c0 75 11 8b 45 ac 85 c0 74 1a 45 31 e4 83 f8 01 41 0f 95 c4 45 89 66 64";
+
 } // namespace
+
+void InstallForcedMode(Program* program) {
+	const char* setting = std::getenv("KYTY_DS_FORCE_MODE");
+	if (setting == nullptr || *setting == 0 || program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() ||
+	    program->file_name.filename() != "eboot.bin")
+		return;
+	const std::string_view name(setting);
+	uint32_t               value = 0;
+	if (name == "cinematic") {
+		value = 1;
+	} else if (name != "performance") {
+		std::printf("Demon's Souls mode: KYTY_DS_FORCE_MODE=%s is not cinematic or performance; the game's choice kept\n",
+		            setting);
+		return;
+	}
+	const auto saved  = GuestCode::FindUnique(*program, GuestCode::Pattern(SavedModeRead));
+	const auto preset = GuestCode::FindUnique(*program, GuestCode::Pattern(PresetMode));
+	if (!saved || !preset) {
+		std::printf("Demon's Souls mode: the graphics mode's boot reads of a known build not found; the game's choice kept\n");
+		return;
+	}
+	// mov r13d, value; nop (the 7-byte load from the save).
+	uint8_t from_save[7] {0x41, 0xbd, 0, 0, 0, 0, 0x90};
+	std::memcpy(from_save + 2, &value, sizeof(value));
+	std::memcpy(reinterpret_cast<void*>(*saved + 5), from_save, sizeof(from_save));
+	// mov r12d, value; jmp store (over the preset's mapping).
+	uint8_t from_preset[8] {0x41, 0xbc, 0, 0, 0, 0, 0xeb, 0x18};
+	std::memcpy(from_preset + 2, &value, sizeof(value));
+	std::memcpy(reinterpret_cast<void*>(*preset), from_preset, sizeof(from_preset));
+	const char* ratio = std::getenv("KYTY_UPSCALE_RATIO");
+	std::printf("Demon's Souls mode: the game starts in its %s mode (KYTY_DS_FORCE_MODE; still changeable in its options)%s\n",
+	            value == 1 ? "cinematic" : "performance",
+	            value == 1 && (ratio == nullptr || *ratio == 0) ? ", native 3840x2160" : "");
+}
 
 double WideAspect() {
 	return g_wide_aspect;

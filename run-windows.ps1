@@ -69,6 +69,7 @@ param(
 	[switch]$Fps120,
 	[int]$RenderHeight = 0,
 	[double]$UpscaleRatio = 0,
+	[string]$ForceMode = '',
 	[string]$Upscale = '',
 	[int]$UpscaleHeight = 0,
 	[string]$DlssPreset = '',
@@ -387,6 +388,10 @@ if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER
 # Quality 1.5, Balanced 1.72, Performance 2.0, Ultra Performance 3.0; the monitor detected by the emulator,
 # KYTY_DISPLAY_HEIGHT overrides it), 720-2160.
 if ($UpscaleRatio -gt 0 -and $RenderHeight -le 0) { $environment['KYTY_UPSCALE_RATIO'] = $UpscaleRatio.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
+# -ForceMode cinematic|performance: the game starts in that graphics mode (KYTY_DS_FORCE_MODE), still changeable in
+# its options; cinematic without -UpscaleRatio is the game's native 3840x2160.
+if ($ForceMode -eq 'cinematic' -or $ForceMode -eq 'performance') { $environment['KYTY_DS_FORCE_MODE'] = $ForceMode }
+elseif ($ForceMode -ne '') { Write-Warning "-ForceMode $ForceMode is not cinematic or performance; ignored" }
 # -Upscale fsr: the 3D image (at -RenderHeight) upscaled to 1440 by FSR 3.1 before the game's composite (frame-gen.h
 # UpscaleComposite), instead of the game's own scaling in that composite.
 # One upscaler: -Upscale (the old path after the game's TAA) goes to the PS5 Pro path (-Upscaler) with the same upscaler.
