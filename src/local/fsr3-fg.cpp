@@ -137,6 +137,94 @@ float EnvFloat(const char* name, float fallback) {
 	return value != nullptr && *value != '\0' ? static_cast<float>(std::atof(value)) : fallback;
 }
 
+// AMD-side multi frame generation (patched amd_fidelityfx_vk.dll, tools/local/fsr3-mfg: frame k of N-1 interpolated
+// at t = k / N, presents paced 1 / N of the real frame time). KYTY_FSR3_MFG=N (2..4) is the multiplier (it sets
+// KYTY_FSR3_FG_FRAMES = N - 1 for the DLL, read when it makes the swapchain). KYTY_FSR3_DYNAMIC=1: the multiplier
+// (2..max, max = KYTY_FSR3_MFG, default 4) picked once a second: the largest N with free real fps x N under the
+// target (KYTY_FSR3_TARGET_FPS, default refresh - refresh^2 / 3600), one more when its real limit target / (N + 1)
+// costs at most 10% of the free real fps; changed after two windows in a row; real frames limited to target / N.
+// The DLL reads KYTY_FSR3_FG_ACTIVE (generated frames, 1..max) on every present. Both unset: nothing changes.
+struct Mfg {
+	bool   on = false, dynamic = false;
+	int    max = 2;       // multiplier maximum (frames allocated in the DLL)
+	int    current = 2;   // multiplier in use
+	int    pending = 0, pending_n = 0;
+	double target = 0.0;  // shown fps target (dynamic)
+	double slept  = 0.0;  // seconds the limiter waited in this window
+} g_mfg;
+
+double RefreshTarget() {
+	DEVMODEA mode {};
+	mode.dmSize = sizeof(mode);
+	if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) != 0 && mode.dmDisplayFrequency > 30) {
+		const double hz = mode.dmDisplayFrequency;
+		return hz - hz * hz / 3600.0;
+	}
+	return 0.0;
+}
+
+void MfgSetActive(int multiplier) {
+	char text[8];
+	std::snprintf(text, sizeof(text), "%d", multiplier - 1);
+	SetEnvironmentVariableA("KYTY_FSR3_FG_ACTIVE", text);
+}
+
+void MfgInit() {
+	static bool done = false;
+	if (done) return;
+	done = true;
+	const char* n   = std::getenv("KYTY_FSR3_MFG");
+	const char* dyn = std::getenv("KYTY_FSR3_DYNAMIC");
+	g_mfg.dynamic   = dyn != nullptr && *dyn == '1';
+	if ((n == nullptr || *n == '\0') && !g_mfg.dynamic) return;
+	g_mfg.on      = true;
+	g_mfg.max     = std::clamp(n != nullptr && *n != '\0' ? std::atoi(n) : 4, 2, 4);
+	g_mfg.current = g_mfg.max;
+	char frames[8];
+	std::snprintf(frames, sizeof(frames), "%d", g_mfg.max - 1);
+	_putenv_s("KYTY_FSR3_FG_FRAMES", frames); // (CRT and process environment: the DLL reads the latter)
+	if (g_mfg.dynamic) {
+		const float target = EnvFloat("KYTY_FSR3_TARGET_FPS", 0.0f);
+		g_mfg.target       = target > 0.0f ? target : RefreshTarget();
+		if (g_mfg.target <= 0.0) g_mfg.target = 60.0 * g_mfg.max;
+		g_mfg.current = 2;
+	}
+	MfgSetActive(g_mfg.current);
+	std::printf("[fsr3-mfg] %s, up to x%d (patched FidelityFX DLL only; AMD's signed DLL stays x2)\n",
+	            g_mfg.dynamic ? "dynamic multiplier" : "fixed multiplier", g_mfg.max);
+	if (g_mfg.dynamic) std::printf("[fsr3-mfg] target %.0f fps shown\n", g_mfg.target);
+	std::fflush(stdout);
+}
+
+// Once a second (dynamic): real = frames / window, free = frames / (window - limiter wait).
+void MfgUpdate(uint32_t frames, double window, double shown) {
+	if (!g_mfg.on) return;
+	const double real = frames / window;
+	const double busy = std::max(window - g_mfg.slept, 0.05);
+	const double free = frames / busy;
+	g_mfg.slept       = 0.0;
+	if (g_mfg.dynamic && frames > 0) {
+		int cand = std::clamp(static_cast<int>(std::floor(g_mfg.target / std::max(free, 1.0))), 2, g_mfg.max);
+		if (cand < g_mfg.max && g_mfg.target / (cand + 1) >= 0.9 * free) cand++;
+		if (cand == g_mfg.current) {
+			g_mfg.pending_n = 0;
+		} else if (cand == g_mfg.pending) {
+			if (++g_mfg.pending_n >= 2) {
+				g_mfg.current   = cand;
+				g_mfg.pending_n = 0;
+				MfgSetActive(cand);
+			}
+		} else {
+			g_mfg.pending   = cand;
+			g_mfg.pending_n = 1;
+		}
+	}
+	std::printf("[fsr3-mfg] x%d%s; real %.1f fps (free %.1f), shown %.1f fps\n", g_mfg.current, g_mfg.dynamic ? " dynamic" : "",
+	            real, free, shown);
+	if (g_mfg.dynamic) std::printf("[fsr3-mfg] target %.0f, real limit %.1f\n", g_mfg.target, g_mfg.target / g_mfg.current);
+	std::fflush(stdout);
+}
+
 void Message(uint32_t type, const wchar_t* message) {
 	static std::atomic<uint32_t> count {0};
 	if (count.fetch_add(1, std::memory_order_relaxed) > 200) return;
@@ -619,6 +707,7 @@ bool CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR&
 	create.asyncComputeQueue = {g_async_queue, g_compute_family, nullptr};
 	create.presentQueue      = {g_present_queue, graphics.queue_family, nullptr};
 	create.imageAcquireQueue = {g_acquire_queue, g_compute_family, nullptr};
+	MfgInit();
 	const auto result        = g_ffx.CreateContext(&g_swapchain_context, &create.header, nullptr);
 	if (result != FFX_API_RETURN_OK || swapchain == VK_NULL_HANDLE) {
 		std::printf("FSR3 FG: frame generation swapchain not created (%u): frame generation off\n", result);
@@ -909,6 +998,8 @@ static double CapInterval() {
 		std::fflush(stdout);
 		return (1 + generated) / cap;
 	}();
+	// Dynamic multi frame generation: real frames at most target / current multiplier.
+	if (g_mfg.on && g_mfg.dynamic) return g_mfg.current / g_mfg.target;
 	return interval;
 }
 
@@ -919,6 +1010,7 @@ double RealFrameInterval() {
 void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs, vk::SwapchainKHR swapchain,
                    vk::Extent2D backbuffer, vk::Format format) {
 	if (!Active()) return;
+	MfgInit();
 	// G-SYNC: with KYTY_VRR_CAP_FPS (auto = refresh - refresh^2 / 3600; 240 Hz -> 224) the real frames wait just enough
 	// for real x (1 + generated) to stay under the cap, as Reflex does for DLSS-G (x4 at 60 real sent 240 to a 224 cap:
 	// 16 frames a second dropped or held, a stutter at a steady 60). Only while generating; movies and menus untouched.
@@ -928,6 +1020,7 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 		const auto step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(interval));
 		auto       now  = std::chrono::steady_clock::now();
 		if (next > now) {
+			g_mfg.slept += std::chrono::duration<double>(next - now).count();
 			std::this_thread::sleep_until(next - std::chrono::milliseconds(1));
 			while (std::chrono::steady_clock::now() < next) std::this_thread::yield();
 			now = next;
@@ -954,6 +1047,7 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 		            g_stats.no_inputs, g_stats.movie, g_stats.real != 0 ? g_stats.prepare_ms / g_stats.real : 0.0,
 		            g_stats.real != 0 ? g_stats.present_ms / g_stats.real : 0.0, g_stats.max_present_ms);
 		std::fflush(stdout);
+		MfgUpdate(g_stats.real, window, static_cast<double>(shown) / window);
 		g_stats                   = {};
 		g_stats.start             = now;
 		g_stats.presents_at_start = presents;
