@@ -714,6 +714,37 @@ static int FlipFpsFloor() {
 	return floor;
 }
 
+static std::atomic<int> g_dyn_flip_floor {0}; // SetDynamicFlipFps: vblanks - 1 between flips (0: none)
+
+int ReachFps(double target, int multiplier) noexcept {
+	const uint32_t v = Config::GetVblankFrequency();
+	if (multiplier <= 0 || target <= 0.0) return 0;
+	for (uint32_t k = (v + 59) / 60; k > 0 && v / k >= 54; k++) {
+		if (v % k != 0) continue;
+		const uint32_t f = v / k;
+		if (f > 60) continue;
+		if (static_cast<double>(f) * multiplier <= target + 1.0) return static_cast<int>(f);
+	}
+	return 0;
+}
+
+int SetDynamicFlipFps(int fps) noexcept {
+	const uint32_t v      = Config::GetVblankFrequency();
+	int            floor  = 0;
+	int            result = 0;
+	if (fps > 0 && fps < 60) {
+		if (v % static_cast<uint32_t>(fps) == 0) {
+			floor  = static_cast<int>(v / static_cast<uint32_t>(fps)) - 1;
+			result = fps;
+		} else {
+			std::printf("[dyn] flip floor %d fps refused: the %u Hz vblank is not a multiple (use --vblank-frequency 840)\n", fps, v);
+			std::fflush(stdout);
+		}
+	}
+	g_dyn_flip_floor.store(floor, std::memory_order_relaxed);
+	return result;
+}
+
 // `floor`: at least floor + 1 vblanks since the last flip (beyond the game's own flip rate).
 static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, int floor) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
@@ -1512,7 +1543,11 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 		floor = std::max(floor, Unlock30Floor());
 		if (!fg_off) {
 			if (Graphics::Presenter::GeneratesFrames()) floor = std::max(floor, FrameGenFloor());
-			if (Graphics::Presenter::IsSceneFrame(*r.frame)) floor = std::max(floor, FlipFpsFloor());
+			// Never in an in-engine cinematic (10-21: 56 must not apply there; it keeps 60).
+			if (Graphics::Presenter::IsSceneFrame(*r.frame) && !CinematicPlaying()) {
+				floor = std::max(floor, FlipFpsFloor());
+				floor = std::max(floor, g_dyn_flip_floor.load(std::memory_order_relaxed));
+			}
 		}
 	}
 	// FSR 3 under the G-SYNC cap (Fsr3::RealFrameInterval: 1/56 s at x4 on 240 Hz, KYTY_VRR_CAP_FPS): the game's own

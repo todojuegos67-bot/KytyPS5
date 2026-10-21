@@ -73,7 +73,7 @@
     "--printf-direction",
     "Silent",
     "--vblank-frequency",
-    "60",
+    "840",
     "--present-mode",
     "Immediate"
   ]

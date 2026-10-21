@@ -152,7 +152,21 @@ struct Mfg {
 	int    pending = 0, pending_n = 0;
 	double target = 0.0;  // shown fps target (dynamic)
 	double slept  = 0.0;  // seconds the limiter waited in this window
+	int    flip_fps = 0;  // 10-21: the game's own flip floor for this multiplier (VideoOut::SetDynamicFlipFps)
 } g_mfg;
+
+// 10-21: the multiplier `n` at 60 real passing the target: the game's own flips held to the vblank's even reach rate
+// (840 Hz: 56, every 15 vblanks) instead of our limiter (that beat against the game's 60: a 4 Hz judder).
+void MfgApplyFlipFloor(int n) {
+	const int want = 60.0 * n > g_mfg.target + 0.5 ? Libs::VideoOut::ReachFps(g_mfg.target, n) : 0;
+	const int fps  = Libs::VideoOut::SetDynamicFlipFps(want >= 60 ? 0 : want);
+	if (fps != g_mfg.flip_fps) {
+		if (fps > 0) std::printf("[dyn] x%d: game flips at %d (gameplay)\n", n, fps);
+		else std::printf("[dyn] x%d: game flips at 60\n", n);
+		std::fflush(stdout);
+	}
+	g_mfg.flip_fps = fps;
+}
 
 double RefreshTarget() {
 	DEVMODEA mode {};
@@ -214,8 +228,16 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
 	const double free = frames / busy;
 	g_mfg.slept       = 0.0;
 	if (g_mfg.dynamic && frames > 0) {
+		const bool cinematic = Libs::VideoOut::CinematicPlaying();
 		int cand = std::clamp(static_cast<int>(std::floor(g_mfg.target / std::max(free, 1.0))), 2, g_mfg.max);
-		if (cand < g_mfg.max && g_mfg.target / (cand + 1) >= 0.9 * free) cand++;
+		if (cand < g_mfg.max && !cinematic) {
+			// One more only where the vblank has an even rate for it (840 Hz: x4 at 56); else as it is (x3 at 60).
+			const int reach = Libs::VideoOut::ReachFps(g_mfg.target, cand + 1);
+			if (reach > 0 && reach >= 0.9 * free) cand++;
+		}
+		// Held by the flip floor (free = the floor's rate): keep the multiplier unless the game falls clearly under it.
+		if (!cinematic && g_mfg.flip_fps > 0 && cand < g_mfg.current && free >= 0.95 * g_mfg.flip_fps) cand = g_mfg.current;
+		if (cinematic) cand = std::min(cand, 3);
 		if (cand == g_mfg.current) {
 			g_mfg.pending_n = 0;
 		} else if (cand == g_mfg.pending) {
@@ -223,6 +245,7 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
 				g_mfg.current   = cand;
 				g_mfg.pending_n = 0;
 				MfgSetActive(cand);
+				MfgApplyFlipFloor(cand);
 			}
 		} else {
 			g_mfg.pending   = cand;
@@ -1033,7 +1056,21 @@ static double CapInterval() {
 		return (1 + generated) / cap;
 	}();
 	// Dynamic multi frame generation: real frames at most target / current multiplier.
-	if (g_mfg.on && g_mfg.dynamic) return g_mfg.current / g_mfg.target;
+	if (g_mfg.on && g_mfg.dynamic) {
+		// 10-21: an in-engine cinematic keeps 60 real: x3 at most and no flip floor, at once.
+		if (Libs::VideoOut::CinematicPlaying() && (g_mfg.current > 3 || g_mfg.flip_fps != 0)) {
+			g_mfg.current   = std::min(g_mfg.current, 3);
+			g_mfg.pending_n = 0;
+			MfgSetActive(g_mfg.current);
+			Libs::VideoOut::SetDynamicFlipFps(0);
+			g_mfg.flip_fps = 0;
+			std::printf("[dyn] cinematic: back to 60, x%d\n", g_mfg.current);
+			std::fflush(stdout);
+		}
+		// The game's flip floor holds the real rate: no limiter of ours on top (two limiters beat).
+		if (g_mfg.flip_fps > 0) return 0.0;
+		return g_mfg.current / g_mfg.target;
+	}
 	return interval;
 }
 
