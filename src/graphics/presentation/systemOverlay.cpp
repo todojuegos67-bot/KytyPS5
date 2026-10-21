@@ -1,3 +1,4 @@
+#include "local/port-live.h"
 #include "graphics/presentation/systemOverlay.h"
 
 #include "SDL.h"
@@ -475,8 +476,12 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto dialog = DialogIme::GetVisualState();
 	const auto error  = ErrorDialog::GetVisualState();
 	const auto save   = SaveDialog::GetVisualState();
-	return {core.active || dialog.active || error.active || save.active,
-	        core.revision + dialog.revision + error.revision + save.revision};
+	// (The PC port's options menu, src/port: none in the emulator.)
+	const auto* port        = PortLive::g_hooks;
+	const bool  port_active = port != nullptr && port->wants_overlay != nullptr && port->wants_overlay();
+	const auto  port_rev    = port != nullptr && port->revision != nullptr ? port->revision() : 0ull;
+	return {core.active || dialog.active || error.active || save.active || port_active,
+	        core.revision + dialog.revision + error.revision + save.revision + port_rev};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -1211,7 +1216,9 @@ struct SystemOverlay::Impl {
 	                  SystemOverlayHud* hud) {
 		OverlaySnapshot snapshot;
 		bool            dialog = GetOverlaySnapshot(&snapshot);
-		if (!dialog && hud == nullptr) {
+		const auto*     port   = PortLive::g_hooks;
+		const bool port_menu   = port != nullptr && port->draw != nullptr && port->wants_overlay != nullptr && port->wants_overlay();
+		if (!dialog && hud == nullptr && !port_menu) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1244,7 +1251,7 @@ struct SystemOverlay::Impl {
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
 		if (dialog && (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session)) {
-			if (hud == nullptr) {
+			if (hud == nullptr && !port_menu) {
 				ImGui::EndFrame();
 				return false;
 			}
@@ -1261,6 +1268,9 @@ struct SystemOverlay::Impl {
 		}
 		if (hud != nullptr) {
 			DrawHud(*hud);
+		}
+		if (port_menu) {
+			port->draw(static_cast<float>(frame_extent.width), static_cast<float>(frame_extent.height));
 		}
 		ImGui::Render();
 		extent = frame_extent;

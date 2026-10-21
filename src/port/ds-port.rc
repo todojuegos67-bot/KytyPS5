@@ -1,0 +1,27 @@
+// "Demon's Souls.exe" (KYTY_DS_PORT): its icon (the first one: Explorer's and the taskbar's) and version information.
+#include <winver.h>
+
+1 ICON "demons-souls.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+	BLOCK "StringFileInfo"
+	BEGIN
+		BLOCK "040A04B0"
+		BEGIN
+			VALUE "FileDescription", "Demon's Souls PC (KytyPS5)"
+			VALUE "ProductName", "Demon's Souls PC"
+			VALUE "OriginalFilename", "Demon's Souls.exe"
+			VALUE "FileVersion", "1.0"
+			VALUE "ProductVersion", "1.0"
+		END
+	END
+	BLOCK "VarFileInfo"
+	BEGIN
+		VALUE "Translation", 0x040A, 1200
+	END
+END

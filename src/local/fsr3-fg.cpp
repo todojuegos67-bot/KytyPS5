@@ -1,3 +1,4 @@
+#include "local/port-live.h"
 #include "fsr3-fg.h"
 
 #include "frame-gen.h"
@@ -199,6 +200,14 @@ void MfgInit() {
 // Once a second (dynamic): real = frames / window, free = frames / (window - limiter wait).
 void MfgUpdate(uint32_t frames, double window, double shown) {
 	if (!g_mfg.on) return;
+	// (The PC port's menu: a fixed multiplier chosen while playing, up to the launch's.)
+	if (const int live = PortLive::fg_generate.load(std::memory_order_relaxed); live > 0 && !g_mfg.dynamic) {
+		const int want = std::clamp(live + 1, 2, g_mfg.max);
+		if (want != g_mfg.current) {
+			g_mfg.current = want;
+			MfgSetActive(want);
+		}
+	}
 	const double real = frames / window;
 	const double busy = std::max(window - g_mfg.slept, 0.05);
 	const double free = frames / busy;
@@ -953,7 +962,8 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 	}
 	up.renderSize        = {desc.render.width, desc.render.height};
 	up.upscaleSize       = {desc.upscale.width, desc.upscale.height};
-	const float sharpness = EnvFloat("KYTY_UPSCALE_SHARPNESS", 0.3f);
+	const float live      = PortLive::sharpness.load(std::memory_order_relaxed);
+	const float sharpness = live >= 0.0f ? live : EnvFloat("KYTY_UPSCALE_SHARPNESS", 0.3f);
 	up.enableSharpening  = sharpness > 0.0f;
 	up.sharpness         = std::clamp(sharpness, 0.0f, 1.0f);
 	up.frameTimeDelta    = std::clamp(desc.delta_ms, 1.0f, 100.0f);

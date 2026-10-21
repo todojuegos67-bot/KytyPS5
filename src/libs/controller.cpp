@@ -1,3 +1,4 @@
+#include "local/port-live.h"
 #include "libs/controller.h"
 
 #include "SDL.h"
@@ -878,7 +879,8 @@ void RumbleFromHaptics(float left, float right) {
 		return g > 0.0f ? g : 4.0f;
 	}();
 	if (g_controller == nullptr) return;
-	const auto to_motor = [](float x) {
+	const float live_gain = PortLive::rumble_gain.load(std::memory_order_relaxed); // (the PC port's menu)
+	const auto  to_motor  = [gain = live_gain > 0.0f ? live_gain : gain](float x) {
 		x = x * gain;
 		if (x < 0.02f) return 0;                      // noise floor: still
 		return static_cast<int>(std::min(x, 1.0f) * 255.0f + 0.5f);

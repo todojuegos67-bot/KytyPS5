@@ -1,3 +1,4 @@
+#include "local/port-live.h"
 #include "graphics/presentation/window.h"
 
 #include "SDL.h"
@@ -533,6 +534,9 @@ void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
 	EXIT_IF(SDL_GetEventState(SDL_DISPLAYEVENT) != SDL_ENABLE);
+	if (PortLive::g_hooks != nullptr && PortLive::g_hooks->event != nullptr && PortLive::g_hooks->event(*event)) {
+		return; // (the PC port's options menu)
+	}
 	if ((event->type == SDL_KEYDOWN || event->type == SDL_KEYUP) &&
 	    event->key.keysym.sym == SDLK_F7) {
 		if (event->type == SDL_KEYDOWN && event->key.repeat == 0) {
@@ -916,6 +920,9 @@ static void WindowCreate(WindowContext& context) {
 	// the frame into it (KYTY_PRESENT_ASPECT=fit keeps the aspect ratio instead of stretching).
 	SDL_SetWindowResizable(context.window, SDL_TRUE);
 	context.UpdateIcon();
+	if (PortLive::g_hooks != nullptr && PortLive::g_hooks->window_created != nullptr) {
+		PortLive::g_hooks->window_created(context.window); // (the PC port: its own icon)
+	}
 	// SDL2 starts text input with the video subsystem, which keeps the IME attached to the
 	// window: with a Japanese/Chinese IME on, letter keys (the default Cross, WASD...) never
 	// reach the game. The system overlay starts text input itself while it needs it.
@@ -1089,6 +1096,7 @@ void WindowContext::UpdateTitle() {
 		text += fmt::format(", waypoints: {}", waypoints);
 	}
 
+	if (PortLive::g_hooks != nullptr && PortLive::g_hooks->title != nullptr) text = PortLive::g_hooks->title();
 	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
 }
 

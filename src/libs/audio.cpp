@@ -1,3 +1,4 @@
+#include "local/port-live.h"
 #include "libs/audio.h"
 
 #include "SDL.h"
@@ -527,7 +528,8 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 				const char* v = std::getenv("KYTY_HAPTIC_RUMBLE");
 				return v == nullptr || *v != '0';
 			}();
-			if (rumble && port->samples_num > 0 && port->channels_num > 0) {
+			const int  live_rumble = PortLive::rumble.load(std::memory_order_relaxed); // (the PC port's menu)
+			if ((live_rumble < 0 ? rumble : live_rumble != 0) && port->samples_num > 0 && port->channels_num > 0) {
 				// RMS of the first two channels (the left and right actuators), with the port's own gain.
 				const int    ch = port->channels_num;
 				double       sum[2] {0.0, 0.0};

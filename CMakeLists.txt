@@ -877,7 +877,40 @@ if(BUILD_TESTING)
 endif()
 
 
-add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+# -DKYTY_DS_PORT=ON (Windows): kyty_emulator built as the "Demon's Souls" PC port (src/port): a Windows program
+# without a console, its settings from settings.ini, an in-game options menu, the game's icon. The packaging renames
+# it to "Demon's Souls.exe" (.github/workflows/build.yml, the ds-pc-port branch). Off: the emulator as it always was.
+option(KYTY_DS_PORT "Build kyty_emulator as the Demon's Souls PC port (Windows)" OFF)
+set(kyty_emulator_main "${KYTY_SOURCE_DIR}/main.cpp")
+if (KYTY_DS_PORT AND WIN32)
+	enable_language(RC)
+	set(kyty_emulator_main
+		"${KYTY_SOURCE_DIR}/port/ds-main.cpp"
+		"${KYTY_SOURCE_DIR}/port/ds-menu.cpp"
+		"${KYTY_SOURCE_DIR}/port/ds-settings.cpp"
+		"${KYTY_SOURCE_DIR}/port/ds-port.h"
+		"${KYTY_SOURCE_DIR}/port/ds-settings.h"
+		"${KYTY_SOURCE_DIR}/port/ds-tables.h"
+		"${KYTY_SOURCE_DIR}/port/ds-port.rc")
+	if (KYTY_CLANG_CL)
+		set_source_files_properties("${KYTY_SOURCE_DIR}/port/ds-main.cpp" "${KYTY_SOURCE_DIR}/port/ds-menu.cpp"
+			"${KYTY_SOURCE_DIR}/port/ds-settings.cpp" PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
+	endif()
+	# (The icon by name from resources/.)
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/port/ds-port.rc" APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/resources")
+	message(STATUS "Building the Demon's Souls PC port (KYTY_DS_PORT)")
+endif()
+add_executable(kyty_emulator ${kyty_emulator_main} ${kyty_emulator_src})
+if (KYTY_DS_PORT AND WIN32)
+	set_target_properties(kyty_emulator PROPERTIES WIN32_EXECUTABLE ON)
+	target_compile_definitions(kyty_emulator PRIVATE KYTY_DS_PORT=1)
+	target_include_directories(kyty_emulator PRIVATE "${KYTY_THIRD_PARTY_DIR}/imgui")
+	if (MSVC)
+		# A Windows program with the usual main(): no console window.
+		target_link_options(kyty_emulator PRIVATE "/ENTRY:mainCRTStartup")
+	endif()
+	target_link_libraries(kyty_emulator ole32 shell32 uuid gdi32)
+endif()
 configure_macos_guest_address_space(kyty_emulator)
 
 if(LINUX)

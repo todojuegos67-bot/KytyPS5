@@ -1,3 +1,4 @@
+#include "local/port-live.h"
 #include "frame-gen.h"
 #include "fsr3-fg.h"
 #include "xess-sr.h"
@@ -91,6 +92,9 @@ double   g_dyn_slept       = 0.0; // seconds our limiter waited in this window
 int      g_dyn_block_s     = 0;   // seconds left without taking the extra frame (it cost too much real fps)
 
 int CurrentGenerate() {
+	// (The PC port's menu: fewer generated frames than launched with, fixed mode.)
+	if (const int live = PortLive::fg_generate.load(std::memory_order_relaxed); live > 0 && !g_dlssg_dynamic)
+		return std::min(live, g_generate);
 	return g_dlssg_dynamic ? std::min(g_dyn_gen, g_generate) : g_generate;
 }
 bool g_dlss_sr = false; // KYTY_UPSCALE=dlss: DLSS super resolution (Streamline's DLSS plugin)
@@ -2094,6 +2098,7 @@ bool EnsureSharpen(GraphicContext& graphics, const VulkanImage& like) {
 }
 
 float SharpenAmount() {
+	if (const float live = PortLive::sharpness.load(std::memory_order_relaxed); live >= 0.0f) return std::min(live, 1.0f);
 	static const float amount = [] {
 		const char* value = std::getenv("KYTY_UPSCALE_SHARPNESS");
 		return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f) : 0.0f;
@@ -3315,6 +3320,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 	const bool  fsr  = g_sr_kind == 3;
 	// (FSR: its RCAS, KYTY_UPSCALE_SHARPNESS defaulting to 0.3 in Fsr3::Upscale; DLSS and XeSS: 0 unless set.)
 	const float amount = fsr ? [] {
+		if (const float live = PortLive::sharpness.load(std::memory_order_relaxed); live >= 0.0f) return std::min(live, 1.0f);
 		const char* value = std::getenv("KYTY_UPSCALE_SHARPNESS");
 		return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f) : 0.3f;
 	}()

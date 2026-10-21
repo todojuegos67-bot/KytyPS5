@@ -29,6 +29,7 @@ jobs:
     runs-on: windows-2022
     outputs:
       package: ${{ steps.name.outputs.package }}
+      folder: ${{ steps.name.outputs.folder }}
 
     steps:
       - name: Checkout
@@ -46,7 +47,14 @@ jobs:
           if ($env:GITHUB_REF_NAME -eq 'fsr3-prueba') { $name = "$name-fsr3" }
           if ($env:GITHUB_REF_NAME -in @('dlss-prueba','dlssg-decouple','dlss-release','lowmem-16gb','merge-1016','upscale','merge-1019')) { $name = "$name-dlss" }
           if ($env:GITHUB_REF_NAME -eq 'fg/x3') { $name = "$name-fgx3" }
+          # The Demon's Souls PC port (KYTY_DS_PORT): its own package, a folder "Demon's Souls PC".
+          $folder = $name
+          if ($env:GITHUB_REF_NAME -eq 'ds-pc-port') {
+            $name = "DemonsSoulsPC-$((Get-Date).ToUniversalTime().ToString('yyyyMMdd'))-$($env:GITHUB_SHA.Substring(0, 8))"
+            $folder = "Demon's Souls PC"
+          }
           "package=$name" >> $env:GITHUB_OUTPUT
+          "folder=$folder" >> $env:GITHUB_OUTPUT
 
       # The tested compiler (LLVM 23.1.2 crashed compiling agc.cpp; others are untested).
       - name: Install LLVM 19.1.7
@@ -96,7 +104,7 @@ jobs:
       # AMD FidelityFX API, FSR 3.1.4 frame generation (src/local/fsr3-fg.cpp, KYTY_FSR3_FG): AMD's prebuilt,
       # signed amd_fidelityfx_vk.dll (MIT license) from the SDK's v1.1.4 tag, packaged next to the emulator.
       - name: FidelityFX DLL
-        if: ${{ inputs.ffx_mfg != true && github.ref_name != 'fg/x3' }}
+        if: ${{ inputs.ffx_mfg != true && github.ref_name != 'fg/x3' && github.ref_name != 'ds-pc-port' }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force _Build\deps\ffx | Out-Null
@@ -110,7 +118,7 @@ jobs:
       # generated frames per real frame in the Vulkan frame generation swapchain). Unsigned; replaces AMD's DLL.
       # Needs the Vulkan SDK (headers + vulkan-1.lib, >= 1.3.250); shaders use the SDK's own FidelityFX_SC/glslang.
       - name: FidelityFX DLL (patched, multi frame generation)
-        if: ${{ inputs.ffx_mfg == true || github.ref_name == 'fg/x3' }}
+        if: ${{ inputs.ffx_mfg == true || github.ref_name == 'fg/x3' || github.ref_name == 'ds-pc-port' }}
         shell: pwsh
         env:
           VULKAN_VERSION: 1.3.296.0
@@ -140,7 +148,7 @@ jobs:
       # build time from NVIDIA's public release, never committed. CMakeLists.txt enables KYTY_FRAMEGEN_STREAMLINE when
       # _Build/deps/streamline/sdk/include/sl.h exists. Its packages are draft releases (they hold NVIDIA's DLLs).
       - name: Streamline SDK
-        if: ${{ github.ref_name == 'dlss-prueba' || github.ref_name == 'dlssg-decouple' || github.ref_name == 'dlss-release' || github.ref_name == 'lowmem-16gb' || github.ref_name == 'merge-1016' || github.ref_name == 'upscale' || github.ref_name == 'merge-1019' }}
+        if: ${{ github.ref_name == 'dlss-prueba' || github.ref_name == 'dlssg-decouple' || github.ref_name == 'dlss-release' || github.ref_name == 'lowmem-16gb' || github.ref_name == 'merge-1016' || github.ref_name == 'upscale' || github.ref_name == 'merge-1019' || github.ref_name == 'ds-pc-port' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -169,7 +177,7 @@ jobs:
       # Intel XeSS SDK (super resolution, src/local/xess-sr.cpp; the upscale branch): its headers and libxess.dll
       # (Intel's redistributable binary) from Intel's public repository, never committed.
       - name: XeSS SDK
-        if: ${{ github.ref_name == 'upscale' || github.ref_name == 'merge-1019' }}
+        if: ${{ github.ref_name == 'upscale' || github.ref_name == 'merge-1019' || github.ref_name == 'ds-pc-port' }}
         shell: pwsh
         env:
           XESS_VERSION: v3.0.2
@@ -183,7 +191,7 @@ jobs:
       - name: Build
         shell: cmd
         env:
-          KYTY_CMAKE_ARGS: -DKYTY_MARCH=x86-64-v3 ${{ inputs.pgo_generate == true && '-DKYTY_PGO_GENERATE=ON' || '' }}
+          KYTY_CMAKE_ARGS: -DKYTY_MARCH=x86-64-v3 ${{ inputs.pgo_generate == true && '-DKYTY_PGO_GENERATE=ON' || '' }} ${{ github.ref_name == 'ds-pc-port' && '-DKYTY_DS_PORT=ON' || '' }}
         run: |
           call build-windows.cmd kyty_emulator > build.log 2>&1 || (type build.log & exit /b 1)
           call build-windows.cmd kyty_shader_precompile >> build.log 2>&1 || (type build.log & exit /b 1)
@@ -205,8 +213,43 @@ jobs:
         shell: pwsh
         env:
           PACKAGE: ${{ steps.name.outputs.package }}
+          FOLDER: ${{ steps.name.outputs.folder }}
         run: |
           $build = '_Build\windows'
+          if ($env:GITHUB_REF_NAME -eq 'ds-pc-port') {
+            # The Demon's Souls PC port: only what "Demon's Souls.exe" uses (it starts the game itself: no scripts).
+            $out = "_Build\package\$env:FOLDER"
+            New-Item -ItemType Directory -Force $out, "$out\_PipelineCache", "$out\LICENSES" | Out-Null
+            Copy-Item "$build\kyty_emulator.exe" "$out\Demon's Souls.exe"
+            # (The shader preparation before the game: kyty_shader_precompile --make-seeds / --static-inputs.)
+            Copy-Item "$build\kyty_shader_precompile.exe", "$build\libwinpthread-1.dll", fondo-souls.jpg $out
+            Copy-Item resources\settings.ini "$out\settings.ini"
+            Copy-Item resources\LEEME-PC.txt "$out\LEEME.txt"
+            Set-Content "$out\_PipelineCache\LEEME.txt" -Encoding ASCII -Value 'Cache de shaders y pipelines de esta grafica: no la borres (se rehace sola tras actualizar el driver).'
+            Copy-Item LICENSE $out
+            Copy-Item LICENSES\* "$out\LICENSES" -Recurse
+            if (Test-Path _Build\deps\xess\bin\libxess.dll) {
+              Copy-Item _Build\deps\xess\bin\libxess.dll $out
+              Copy-Item _Build\deps\xess\LICENSE.txt "$out\LICENSES\XeSS-LICENSE.txt"
+            }
+            if (Test-Path _Build\deps\streamline\sdk\bin\x64) {
+              New-Item -ItemType Directory -Force "$out\streamline" | Out-Null
+              Copy-Item _Build\deps\streamline\sdk\bin\x64\*.dll "$out\streamline"
+              Get-ChildItem _Build\deps\streamline\sdk -File | Where-Object Name -match 'license' | Copy-Item -Destination "$out\streamline"
+            }
+            Copy-Item _Build\deps\ffx\amd_fidelityfx_vk.dll, _Build\deps\ffx\FidelityFX-LICENSE.txt $out
+            $states = "$out\tools\local\static-precompile"
+            New-Item -ItemType Directory -Force $states | Out-Null
+            Copy-Item tools\local\static-precompile\pass-states.json, tools\local\static-precompile\hints-*.hints $states
+            Copy-Item tools\local\static-precompile\files-*.files $states -ErrorAction SilentlyContinue
+            $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+            $crt = Get-Item "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" | Where-Object { $_.Parent.Parent.Name -match '^\d+\.' } |
+              Sort-Object { [version]$_.Parent.Parent.Name } | Select-Object -Last 1
+            Copy-Item "$($crt.FullName)\msvcp140*.dll", "$($crt.FullName)\vcruntime140*.dll" $out
+            $root = (Resolve-Path $out).Path
+            Get-ChildItem $out -Recurse -File | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($root.Length + 1) }
+            return
+          }
           $out = "_Build\package\$env:PACKAGE"
           New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item "$build\kyty_emulator.exe", "$build\kyty_shader_precompile.exe", "$build\libwinpthread-1.dll",
@@ -283,6 +326,7 @@ jobs:
       contents: write
     env:
       PACKAGE: ${{ needs.windows.outputs.package }}
+      FOLDER: ${{ needs.windows.outputs.folder }}
       GH_TOKEN: ${{ github.token }}
 
     steps:
@@ -302,17 +346,19 @@ jobs:
       - name: Publish
         shell: bash
         run: |
-          (cd package && zip -qr "../$PACKAGE.zip" "$PACKAGE")
+          (cd package && zip -qr "../$PACKAGE.zip" "${FOLDER:-$PACKAGE}")
           # A tag's own release, else a new tag named after the package at this commit.
           tag="$GITHUB_REF_NAME"
           [ "$GITHUB_REF_TYPE" = tag ] || tag="$PACKAGE"
           notes="Windows x64 build of ${GITHUB_SHA::8} (todojuegos67-bot fork, on top of chenxiao07/KytyPS5) for Demon's Souls (PPSA01341, versions 01.007.000 and 01.005.000). Unzip it and double-click run.cmd or launcher.cmd; the README.md inside explains the rest."
           # The notes of this build (what changed, the per-PC shader caches, frame rates), when the commit has them.
-          if [ -s notes/docs/RELEASE-NOTES.md ]; then notes="$(printf '%s\n\n%s' "$notes" "$(cat notes/docs/RELEASE-NOTES.md)")"; fi
+          if [[ "$PACKAGE" == DemonsSoulsPC-* ]]; then
+            notes="Demon's Souls PC (KytyPS5 ${GITHUB_SHA::8}, Windows x64): descomprime la carpeta \"Demon's Souls PC\" y abre \"Demon's Souls.exe\". La primera vez pide la carpeta del juego volcado (PPSA01341 01.007.000 o 01.005.000). Opciones: settings.ini o, dentro del juego, F1 / OPTIONS + R3. Mas en LEEME.txt. Incluye DLSS (Streamline), XeSS y FSR 3 con frame generation x3/x4 (FidelityFX parcheado)."
+          elif [ -s notes/docs/RELEASE-NOTES.md ]; then notes="$(printf '%s\n\n%s' "$notes" "$(cat notes/docs/RELEASE-NOTES.md)")"; fi
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$tag" "$PACKAGE.zip" --clobber --repo "$GITHUB_REPOSITORY"
           else
-            draft=""; [[ "$PACKAGE" == *-dlss ]] && draft="--draft"
+            draft=""; [[ "$PACKAGE" == *-dlss || "$PACKAGE" == DemonsSoulsPC-* ]] && draft="--draft"
             gh release create "$tag" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" $draft \
-              --title "$PACKAGE" --notes "$notes" $([[ "$PACKAGE" == *-pgogen || "$PACKAGE" == *-fsr3 || "$PACKAGE" == *-dlss || "$PACKAGE" == *-fgx3 ]] && echo --latest=false || echo --latest)
+              --title "$PACKAGE" --notes "$notes" $([[ "$PACKAGE" == *-pgogen || "$PACKAGE" == *-fsr3 || "$PACKAGE" == *-dlss || "$PACKAGE" == *-fgx3 || "$PACKAGE" == DemonsSoulsPC-* ]] && echo --latest=false || echo --latest)
           fi

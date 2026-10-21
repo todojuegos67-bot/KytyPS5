@@ -1,3 +1,4 @@
+#include "local/port-live.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -1149,6 +1150,8 @@ static double FpsCapInterval(SDL_Window* window) {
 		std::fflush(stdout);
 		return cap > 0.0 ? 1.0 / cap : 0.0;
 	}();
+	// (The PC port's menu: a cap chosen while playing, where the launch's applies.)
+	if (const float live = PortLive::fps_cap.load(std::memory_order_relaxed); live > 0.0f && interval > 0.0) return 1.0 / live;
 	return interval;
 }
 
@@ -1419,6 +1422,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
 #endif
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
+	// The PC port's options menu (src/port): its frames go out without frame generation (no generated frame
+	// drags the menu with the scene's motion).
+	const bool port_menu      = PortLive::menu_open.load(std::memory_order_relaxed);
 	auto&      swapchain  = m_impl->swapchain;
 	auto*      hud        = m_impl->UpdateHud(reuse);
 	// The guest's own frames choose the color space (PQ or SDR); black and blank flips keep the current one.
@@ -1471,8 +1477,8 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			if (swapchain.IsFsr3() && !draw_system_overlay)
 				Fsr3::RecordHudLayer(m_impl->window.graphic_ctx, command.Handle(), swapchain.CurrentImage(), swapchain.Extent(),
 				                     swapchain.PresentRegion(), frame.image,
-				                     frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr);
-			if (FrameGen::Enabled() && frame.fg.valid && !frame.reusing_last)
+				                     frame.fg.valid && !frame.reusing_last && !port_menu ? &frame.fg : nullptr);
+			if (FrameGen::Enabled() && frame.fg.valid && !frame.reusing_last && !port_menu)
 				FrameGen::ScaleHudless(m_impl->window.graphic_ctx, command.Handle(), frame.fg, swapchain.Extent(), swapchain.Format());
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 			if (timed) FrameGen::NoteSubmitMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_begin).count());
@@ -1493,7 +1499,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		const bool generate = FrameGen::Enabled();
 		if (generate) {
 			const auto before_begin = std::chrono::steady_clock::now();
-			FrameGen::BeforePresent(frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
+			FrameGen::BeforePresent(frame.fg.valid && !frame.reusing_last && !port_menu ? &frame.fg : nullptr,
 			                        swapchain.Extent(), swapchain.PresentRegion(), swapchain.Format(),
 			                        swapchain.ImageCount());
 			FrameGen::NoteBeforePresentMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before_begin).count());
@@ -1501,7 +1507,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		if (swapchain.IsFsr3()) {
 			// KYTY_FSR3_FG: this frame's depth and motion vectors (none: a menu, a loading screen, a movie, an idle
 			// refresh of the last frame; generation off for it).
-			Fsr3::BeforePresent(m_impl->window.graphic_ctx, frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
+			Fsr3::BeforePresent(m_impl->window.graphic_ctx, frame.fg.valid && !frame.reusing_last && !port_menu ? &frame.fg : nullptr,
 			                    swapchain.Handle(), swapchain.Extent(), swapchain.Format());
 		}
 		status = swapchain.Present();
@@ -1516,6 +1522,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,
 		                                         std::memory_order_release);
+		if (PortLive::g_hooks != nullptr && PortLive::g_hooks->presented != nullptr) PortLive::g_hooks->presented();
 		m_impl->window.UpdateTitle();
 		m_impl->frames.Release(&frame, true);
 		return;
