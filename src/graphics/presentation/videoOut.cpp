@@ -536,24 +536,6 @@ static int Unlock30Floor() {
 	return Unlock30() ? SceneFreeFloor() : 0;
 }
 
-// KYTY_CINEMATIC_FLIP_RATE (default 1): in-engine cinematics keep the game's own flip rate in real time (see Flip).
-static bool CinematicFlipRateEnabled() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_CINEMATIC_FLIP_RATE");
-		const bool  r     = value == nullptr || std::strcmp(value, "0") != 0;
-		std::printf("Flips: in-engine cinematics keep the game's flip rate in real time (KYTY_CINEMATIC_FLIP_RATE=%d)\n", r ? 1 : 0);
-		std::fflush(stdout);
-		return r;
-	}();
-	return on;
-}
-
-// Vblanks - 1 between flips for the game's flip rate (1: 30 fps, 2: 20 fps) on this vblank frequency.
-static int CinematicFlipRateFloor(int flip_rate) {
-	const double vblanks = static_cast<double>(Config::GetVblankFrequency()) * (flip_rate + 1) / 60.0;
-	return std::max(0, static_cast<int>(std::lround(vblanks)) - 1);
-}
-
 // Frame generation above 60 Hz: the game's frames too keep 60 (KYTY_FRAMEGEN_BASE=<Hz>: another rate, 0: none). DLSS-G
 // paces the frames it generates from the intervals between the game's own; on the 120 Hz vblanks a game between 60 and
 // 120 fps flipped after one vblank or two by turns (8.3 or 16.7 ms, 3-25 ms with late vblanks; at 60 Hz 16.7 +- 0.3 ms),
@@ -1671,13 +1653,6 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 				floor = std::max(floor, FlipFpsFloor());
 				floor = std::max(floor, g_dyn_flip_floor.load(std::memory_order_relaxed));
 			}
-		}
-		// An in-engine cinematic with the game's own flip rate (Demon's Souls' Cinematic mode: sceVideoOutSetFlipRate(1),
-		// 30 fps): its sequencer advances a fixed 1/30 s a frame (fixedDt), so on a virtual vblank (360-960 Hz) the
-		// game's "every 2nd vblank" and SceneFreeFloor's 60 played it twice too fast (10-22). Kept at the console's
-		// time: (flip_rate + 1) / 60 s between flips. KYTY_CINEMATIC_FLIP_RATE=0 turns it off.
-		if (CinematicFlipRateEnabled() && r.cfg->flip_rate > 0 && CinematicPlaying()) {
-			floor = std::max(floor, CinematicFlipRateFloor(r.cfg->flip_rate));
 		}
 	}
 	// FSR 3 under the G-SYNC cap (Fsr3::RealFrameInterval: 1/56 s at x4 on 240 Hz, KYTY_VRR_CAP_FPS): the game's own
