@@ -1,6 +1,10 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 
 #include "common/assert.h"
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -106,23 +110,45 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		return vk::SamplerAddressMode::eClampToBorder;
 	};
 
-	vk::BorderColor border = vk::BorderColor::eIntTransparentBlack;
+	// The border as a float color: the game's sampled textures are UNORM, float and depth formats, which Vulkan gives
+	// no defined value from an INT border (its bits as a float: opaque white read as ~0, so a shadow map's compare
+	// sampler clamped to a white border - "lit" past the map - came back "in shadow"; the 'low' quality convars of
+	// -Turbo shorten sunShadowMaxDistance, and everything past it sampled that border: distant surfaces dark, lit up
+	// when the camera came close). Black is zero either way. KYTY_SAMPLER_INT_BORDER=1: the INT colors as before.
+	static const bool int_border = [] {
+		const char* value = std::getenv("KYTY_SAMPLER_INT_BORDER");
+		return value != nullptr && value[0] == '1';
+	}();
+	vk::BorderColor border = int_border ? vk::BorderColor::eIntTransparentBlack : vk::BorderColor::eFloatTransparentBlack;
+	const auto      note_border = [&](const char* what) {
+		static std::atomic<uint32_t> count {0};
+		const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n <= 4 || (n & (n - 1)) == 0) {
+			std::printf("Samplers: %u with a %s border (%s colors; KYTY_SAMPLER_INT_BORDER=1 for INT)
+", n, what,
+			            int_border ? "INT" : "float");
+			std::fflush(stdout);
+		}
+	};
 	switch (static_cast<Prospero::SamplerBorderColor>(r.BorderColorType())) {
 		case Prospero::SamplerBorderColor::kTransBlack:
-			border = vk::BorderColor::eIntTransparentBlack;
+			border = int_border ? vk::BorderColor::eIntTransparentBlack : vk::BorderColor::eFloatTransparentBlack;
 			break;
 		case Prospero::SamplerBorderColor::kOpaqueBlack:
-			border = vk::BorderColor::eIntOpaqueBlack;
+			border = int_border ? vk::BorderColor::eIntOpaqueBlack : vk::BorderColor::eFloatOpaqueBlack;
+			note_border("opaque black");
 			break;
 		case Prospero::SamplerBorderColor::kOpaqueWhite:
-			border = vk::BorderColor::eIntOpaqueWhite;
+			border = int_border ? vk::BorderColor::eIntOpaqueWhite : vk::BorderColor::eFloatOpaqueWhite;
+			note_border("opaque white");
 			break;
 		case Prospero::SamplerBorderColor::kFromTable:
 			LOGF(
 			    "temporary: approximating table border color as transparent black, index = %" PRIu16
 			    "\n",
 			    r.BorderColorPtr());
-			border = vk::BorderColor::eIntTransparentBlack;
+			border = int_border ? vk::BorderColor::eIntTransparentBlack : vk::BorderColor::eFloatTransparentBlack;
+			note_border("table (as transparent black)");
 			break;
 		default: EXIT("unknown border color: %d", static_cast<int>(r.BorderColorType()));
 	}
