@@ -23,6 +23,8 @@
 #include <filesystem>
 #include <fstream>
 #include <io.h>
+#include <iterator>
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -141,7 +143,7 @@ void ShowSplash(const std::string& image) {
 		wc.lpfnWndProc   = SplashProc;
 		wc.hInstance     = GetModuleHandleW(nullptr);
 		wc.lpszClassName = L"DemonsSoulsSplash";
-		wc.hCursor       = LoadCursorW(nullptr, IDC_APPSTARTING);
+		wc.hCursor       = LoadCursorW(nullptr, MAKEINTRESOURCEW(32650)); // IDC_APPSTARTING
 		wc.hIcon         = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));
 		RegisterClassW(&wc);
 		// 60% of the screen's width, the image's aspect.
