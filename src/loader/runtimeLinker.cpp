@@ -2203,7 +2203,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	if (use_red_zone_protection) {
 		program->red_zone_trampoline_vaddr = program->base_vaddr + program->base_size_aligned;
 		program->red_zone_trampoline_size  = RED_ZONE_TRAMPOLINE_SIZE;
-		RegisterRedZonePatchModule(reinterpret_cast<void*>(program->base_vaddr),
+		(UseWolverineRedZonePatcher() ? RedZoneWolverine::RegisterRedZonePatchModule
+		                              : RegisterRedZonePatchModule)(
+		                           reinterpret_cast<void*>(program->base_vaddr),
 		                           program->base_size_aligned,
 		                           reinterpret_cast<void*>(program->red_zone_trampoline_vaddr),
 		                           program->red_zone_trampoline_size);
@@ -2319,7 +2321,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		}
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
 			const auto result =
-			    PatchRedZoneMemoryInstructions(segment_addr, segment_size, function_starts);
+			    UseWolverineRedZonePatcher()
+			        ? RedZoneWolverine::PatchGuestInstructions(segment_addr, segment_size, function_starts,
+			                                                   true, false)
+			        : PatchRedZoneMemoryInstructions(segment_addr, segment_size, function_starts);
 			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
 			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
@@ -2374,7 +2379,9 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (program->red_zone_trampoline_size != 0) {
-			UnregisterRedZonePatchModule(reinterpret_cast<void*>(program->base_vaddr));
+			(UseWolverineRedZonePatcher() ? RedZoneWolverine::UnregisterRedZonePatchModule
+			                              : UnregisterRedZonePatchModule)(
+			    reinterpret_cast<void*>(program->base_vaddr));
 		}
 #endif
 		EXIT_IF(
