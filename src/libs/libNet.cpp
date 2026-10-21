@@ -11,10 +11,14 @@
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
@@ -123,6 +127,20 @@ int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
 	return NET_CALL(Net::NetResolverDestroy(rid));
 }
 
+int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags) {
+	return NET_CALL(Net::NetResolverAbort(rid, flags));
+}
+
+int KYTY_SYSV_ABI NetSend(int s, const void* buf, size_t len, int flags) {
+	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	return FinishSocketCall(static_cast<int>(Net::Send(s, buf, size, flags | 0x20000)));
+}
+
+int KYTY_SYSV_ABI NetRecv(int s, void* buf, size_t len, int flags) {
+	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	return FinishSocketCall(static_cast<int>(Net::Recv(s, buf, size, flags)));
+}
+
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags) {
 	return NET_CALL(Net::NetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags));
@@ -226,6 +244,9 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("K7RlrTkI-mw", LibNet::NetPoolDestroy);
 	LIB_FUNC("C4UgDHHPvdw", LibNet::NetResolverCreate);
 	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
+	LIB_FUNC("AzqoBha7js4", LibNet::NetResolverAbort);
+	LIB_FUNC("beRjXBn-z+o", LibNet::NetSend);
+	LIB_FUNC("9wO9XrMsNhc", LibNet::NetRecv);
 	LIB_FUNC("Nd91WaWmG2w", LibNet::NetResolverStartNtoa);
 	LIB_FUNC("8Kcp5d-q1Uo", LibNet::NetInetPton);
 	LIB_FUNC("9vA2aW+CHuA", LibNet::NetInetNtop);
@@ -1567,6 +1588,10 @@ struct NpEntitlementAccessAddcontEntitlementInfo {
 	uint32_t                  download_status;
 };
 
+struct NpEntitlementAccessEntitlementKey {
+	uint8_t data[16];
+};
+
 static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS_ADDON_LIST[] = {
     {{{"85y-je"}, {}}, 3, 4}, // GTA V hash 0xf4315381
     {{{"5d5c48"}, {}}, 3, 4}, // GTA V hash 0x961c34b0
@@ -1719,12 +1744,103 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
 }
 
+static int KYTY_SYSV_ABI NpEntitlementAccessGetEntitlementKey(
+    uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
+    NpEntitlementAccessEntitlementKey* key) {
+	PRINT_NAME();
+
+	LOGF("\t service_label     = %" PRIu32 "\n"
+	     "\t entitlement_label = 0x%016" PRIx64 "\n"
+	     "\t key               = 0x%016" PRIx64 "\n",
+	     service_label, reinterpret_cast<uint64_t>(entitlement_label),
+	     reinterpret_cast<uint64_t>(key));
+
+	if (entitlement_label == nullptr || key == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
+}
+
+// Unified entitlement lists are fetched asynchronously from the network. The emulated console
+// is offline and owns no add-ons, so every request finishes at once with an empty list. Titles
+// poll these every few frames; only the first calls are logged.
+static std::atomic<int64_t>  g_entitlement_request_id {0};
+static std::atomic<uint32_t> g_entitlement_calls_logged {0};
+
+static bool EntitlementLogCall() {
+	return g_entitlement_calls_logged.fetch_add(1, std::memory_order_relaxed) < 16;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessRequestUnifiedEntitlementInfoList(
+    int user_id, uint32_t service_label, const NpUnifiedEntitlementLabel* list, uint32_t list_num,
+    const void* param, int64_t* request_id) {
+	if (EntitlementLogCall()) {
+		PRINT_NAME();
+		LOGF("\t user_id = %d, service_label = %" PRIu32 ", list_num = %" PRIu32 "\n", user_id,
+		     service_label, list_num);
+	}
+	if (request_id == nullptr || (list == nullptr && list_num != 0)) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+	*request_id = ++g_entitlement_request_id;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessPollUnifiedEntitlementInfoList(
+    int64_t request_id, int32_t* result, void* list, uint32_t list_num, uint32_t* hit_num,
+    int32_t* next_offset, int32_t* previous_offset) {
+	if (EntitlementLogCall()) {
+		PRINT_NAME();
+		LOGF("\t request_id = %" PRId64 ", list_num = %" PRIu32 "\n", request_id, list_num);
+	}
+	if (result == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+	*result = 0;
+	if (hit_num != nullptr) {
+		*hit_num = 0;
+	}
+	// A page at offset 0 is a real page, so "no page" is -1 for both directions.
+	if (next_offset != nullptr) {
+		*next_offset = -1;
+	}
+	if (previous_offset != nullptr) {
+		*previous_offset = -1;
+	}
+	return 0; // SCE_NP_POLL_ASYNC_RET_FINISHED
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessAbortRequest(int64_t request_id) {
+	if (EntitlementLogCall()) {
+		PRINT_NAME();
+		LOGF("\t request_id = %" PRId64 "\n", request_id);
+	}
+	// Requests finish as they are made, so there is nothing left to abort.
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessDeleteRequest(int64_t request_id) {
+	if (EntitlementLogCall()) {
+		PRINT_NAME();
+		LOGF("\t request_id = %" PRId64 "\n", request_id);
+	}
+	return 0;
+}
+
 LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 	LIB_FUNC("jO8DM8oyego", LibNpEntitlementAccess::NpEntitlementAccessInitialize);
 	LIB_FUNC("lPDO62PpJIA", LibNpEntitlementAccess::NpEntitlementAccessGetSkuFlag);
 	LIB_FUNC("TFyU+KFBv54",
 	         LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfoList);
 	LIB_FUNC("xddD23+8TfQ", LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfo);
+	LIB_FUNC("5LiMEPuW0DQ", LibNpEntitlementAccess::NpEntitlementAccessGetEntitlementKey);
+	LIB_FUNC("uCZf2L27th8",
+	         LibNpEntitlementAccess::NpEntitlementAccessRequestUnifiedEntitlementInfoList);
+	LIB_FUNC("nAEqawEZG5s",
+	         LibNpEntitlementAccess::NpEntitlementAccessPollUnifiedEntitlementInfoList);
+	LIB_FUNC("HFcQl9TMcFQ", LibNpEntitlementAccess::NpEntitlementAccessAbortRequest);
+	LIB_FUNC("Z0eQj8m7XA8", LibNpEntitlementAccess::NpEntitlementAccessDeleteRequest);
 }
 
 } // namespace LibNpEntitlementAccess
@@ -3840,6 +3956,21 @@ namespace LibGameLiveStreaming {
 
 LIB_VERSION("GameLiveStreaming", 1, "GameLiveStreaming", 1, 1);
 
+constexpr int GAME_LIVE_STREAMING_ERROR_INVALID_PARAM = -2136997886;
+
+struct GameLiveStreamingStatus2 {
+	int32_t  user_id;
+	bool     is_on_air;
+	uint32_t spectator_count;
+	uint32_t text_message_count;
+	uint32_t command_message_count;
+	uint8_t  reserved[52];
+};
+
+static_assert(sizeof(GameLiveStreamingStatus2) == 72);
+static_assert(offsetof(GameLiveStreamingStatus2, is_on_air) == 4);
+static_assert(offsetof(GameLiveStreamingStatus2, spectator_count) == 8);
+
 static int KYTY_SYSV_ABI GameLiveStreamingInitialize(size_t heap_size) {
 	PRINT_NAME();
 
@@ -3854,9 +3985,34 @@ static int KYTY_SYSV_ABI GameLiveStreamingTerminate() {
 	return 0;
 }
 
+static int KYTY_SYSV_ABI GameLiveStreamingGetCurrentStatus2(GameLiveStreamingStatus2* status) {
+	PRINT_NAME();
+
+	if (status == nullptr) {
+		return GAME_LIVE_STREAMING_ERROR_INVALID_PARAM;
+	}
+
+	std::memset(status, 0, sizeof(*status));
+	status->user_id = -1;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int type, uint32_t* count) {
+	PRINT_NAME();
+
+	if (type < 1 || type > 3 || count == nullptr) {
+		return GAME_LIVE_STREAMING_ERROR_INVALID_PARAM;
+	}
+
+	*count = 0;
+	return OK;
+}
+
 LIB_DEFINE(InitPlatform_1_GameLiveStreaming) {
 	LIB_FUNC("kvYEw2lBndk", LibGameLiveStreaming::GameLiveStreamingInitialize);
 	LIB_FUNC("9yK6Fk8mKOQ", LibGameLiveStreaming::GameLiveStreamingTerminate);
+	LIB_FUNC("lK8dLBNp9OE", LibGameLiveStreaming::GameLiveStreamingGetCurrentStatus2);
+	LIB_FUNC("yeQKjHETi40", LibGameLiveStreaming::GameLiveStreamingGetSocialFeedbackMessagesCount);
 }
 
 } // namespace LibGameLiveStreaming
@@ -3865,6 +4021,27 @@ namespace LibSharePlay {
 
 LIB_VERSION("SharePlay", 1, "SharePlay", 1, 1);
 
+constexpr int SHARE_PLAY_ERROR_INVALID_ARGS    = -2129788927;
+constexpr int SHARE_PLAY_ERROR_NOT_INITIALIZED = -2129788924;
+
+struct SharePlayConnectionInfoA {
+	int32_t  status;
+	int32_t  mode;
+	char     host_online_id[20];
+	char     visitor_online_id[20];
+	uint64_t host_account_id;
+	uint64_t visitor_account_id;
+	int32_t  host_user_id;
+	int32_t  visitor_user_id;
+};
+
+static_assert(sizeof(SharePlayConnectionInfoA) == 72);
+static_assert(offsetof(SharePlayConnectionInfoA, host_account_id) == 48);
+static_assert(offsetof(SharePlayConnectionInfoA, host_user_id) == 64);
+
+// Tracked only for GetCurrentConnectionInfoA; Initialize/Terminate keep the base's results.
+static bool g_share_play_initialized = false;
+
 static int KYTY_SYSV_ABI SharePlayInitialize(void* heap, size_t heap_size) {
 	PRINT_NAME();
 
@@ -3872,18 +4049,32 @@ static int KYTY_SYSV_ABI SharePlayInitialize(void* heap, size_t heap_size) {
 	     "\t heap_size = %" PRIu64 "\n",
 	     reinterpret_cast<uint64_t>(heap), static_cast<uint64_t>(heap_size));
 
+	g_share_play_initialized = true;
 	return 0;
 }
 
 static int KYTY_SYSV_ABI SharePlayTerminate() {
 	PRINT_NAME();
 
+	g_share_play_initialized = false;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI SharePlayGetCurrentConnectionInfoA(SharePlayConnectionInfoA* info) {
+	if (!g_share_play_initialized) {
+		return SHARE_PLAY_ERROR_NOT_INITIALIZED;
+	}
+	if (info == nullptr) {
+		return SHARE_PLAY_ERROR_INVALID_ARGS;
+	}
+	*info = {.status = 0, .host_user_id = -1, .visitor_user_id = -1};
 	return 0;
 }
 
 LIB_DEFINE(InitPlatform_1_SharePlay) {
 	LIB_FUNC("isruqthpYcw", LibSharePlay::SharePlayInitialize);
 	LIB_FUNC("UaLjloJinow", LibSharePlay::SharePlayTerminate);
+	LIB_FUNC("+MCXJlWdi+s", LibSharePlay::SharePlayGetCurrentConnectionInfoA);
 }
 
 } // namespace LibSharePlay

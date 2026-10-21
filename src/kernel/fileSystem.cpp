@@ -861,6 +861,105 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	return bytes_read;
 }
 
+static int ValidateIovecs(const KernelIovec* iov, int iovcnt, int64_t offset,
+                          std::vector<KernelIovec>* buffers, size_t* total) {
+	constexpr int MaxIov = 1024;
+	if (iovcnt < 0 || iovcnt > MaxIov || offset < 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (iov == nullptr && iovcnt != 0) {
+		return KERNEL_ERROR_EFAULT;
+	}
+
+	if (iovcnt != 0) {
+		buffers->assign(iov, iov + iovcnt);
+	}
+	*total = 0;
+	for (const auto& buffer: *buffers) {
+		if (buffer.iov_len > INT_MAX - *total) {
+			return KERNEL_ERROR_EINVAL;
+		}
+		if (buffer.iov_base == nullptr && buffer.iov_len != 0) {
+			return KERNEL_ERROR_EFAULT;
+		}
+		*total += buffer.iov_len;
+	}
+	return OK;
+}
+
+int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
+	PRINT_NAME();
+
+	std::vector<KernelIovec> buffers;
+	size_t                   total = 0;
+	const int                error = ValidateIovecs(iov, iovcnt, offset, &buffers, &total);
+	if (error != OK) {
+		return error;
+	}
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_ESPIPE;
+	}
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	Common::LockGuard lock(file->mutex);
+	if (file->directory) {
+		return KERNEL_ERROR_EISDIR;
+	}
+	if (total == 0) {
+		return 0;
+	}
+	if (file->special == SpecialFile::Random) {
+		for (const auto& buffer: buffers) {
+			if (buffer.iov_len != 0) {
+				Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base),
+				                         buffer.iov_len);
+				FillRandomBuffer(buffer.iov_base, buffer.iov_len);
+			}
+		}
+		return static_cast<int64_t>(total);
+	}
+	if (file->f.IsInvalid()) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	const auto position  = file->f.Tell();
+	const auto file_size = file->f.Size();
+	if (!file->f.Seek(static_cast<uint64_t>(offset))) {
+		return KERNEL_ERROR_EIO;
+	}
+	auto    remaining  = static_cast<uint64_t>(offset) < file_size ? file_size - offset : 0;
+	int64_t bytes_read = 0;
+	for (const auto& buffer: buffers) {
+		if (remaining == 0) {
+			break;
+		}
+		if (buffer.iov_len == 0) {
+			continue;
+		}
+		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
+		// Same path as KernelRead/KernelPread: keeps the GPU caches of the guest pages coherent.
+		const uint32_t bytes = ReadIntoGuest(file->f, buffer.iov_base, count);
+		bytes_read += bytes;
+		remaining -= bytes;
+		if (bytes < count) {
+			break;
+		}
+	}
+	if (!file->f.Seek(position)) {
+		return KERNEL_ERROR_EIO;
+	}
+	LOGF("\tReadv %" PRId64 " bytes (pos = %" PRId64 ", iovcnt = %d) from: %s\n", bytes_read,
+	     offset, iovcnt, Common::PathToString(file->real_name).c_str());
+	return bytes_read;
+}
+
 int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_t offset) {
 	PRINT_NAME();
 
@@ -913,6 +1012,121 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	     Common::PathToString(file->real_name).c_str());
 
 	return bytes_written;
+}
+
+int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
+	PRINT_NAME();
+
+	std::vector<KernelIovec> buffers;
+	size_t                   total = 0;
+	const int                error = ValidateIovecs(iov, iovcnt, offset, &buffers, &total);
+	if (error != OK) {
+		return error;
+	}
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_ESPIPE;
+	}
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened || !file->writable) {
+		return KERNEL_ERROR_EBADF;
+	}
+	Common::LockGuard lock(file->mutex);
+	if (file->directory) {
+		return KERNEL_ERROR_EISDIR;
+	}
+	if (file->special != SpecialFile::None) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (total == 0) {
+		return 0;
+	}
+	if (file->f.IsInvalid()) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	const auto position = file->f.Tell();
+	const auto target   = (file->append ? file->f.Size() : static_cast<uint64_t>(offset));
+	if (target > static_cast<uint64_t>(INT64_MAX) - total) {
+		return KERNEL_ERROR_EFBIG;
+	}
+	if (!file->f.Seek(target)) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	int64_t bytes_written = 0;
+	for (const auto& buffer: buffers) {
+		if (buffer.iov_len == 0) {
+			continue;
+		}
+		uint32_t bytes = 0;
+		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
+		bytes_written += bytes;
+		if (bytes < buffer.iov_len) {
+			break;
+		}
+	}
+	const bool flushed  = !file->sync_writes || file->f.Flush();
+	const bool restored = file->f.Seek(position);
+	if (!flushed || !restored) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	LOGF("\tWritev %" PRId64 " bytes (pos = %" PRId64 ", iovcnt = %d) to: %s\n", bytes_written,
+	     offset, iovcnt, Common::PathToString(file->real_name).c_str());
+	return bytes_written;
+}
+
+int KYTY_SYSV_ABI KernelFsync(int d) {
+	PRINT_NAME();
+
+	if (d < 0) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	// stdin, stdout and stderr: KernelWrite flushes stdout and stderr on every write
+	if (d < DESCRIPTOR_MIN) {
+		return OK;
+	}
+
+	// FreeBSD fails fsync with EINVAL on a descriptor that has no vnode
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	auto* file = g_files->GetFile(d);
+
+	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	// Directories, devices and read-only descriptors succeed without a host flush, as on FreeBSD.
+	// Windows refuses FlushFileBuffers on a read-only handle.
+	if (file->directory || file->special != SpecialFile::None || !file->writable) {
+		LOGF("\tFsync (nothing to flush): %s\n", Common::PathToString(file->real_name).c_str());
+		return OK;
+	}
+
+	file->mutex.Lock();
+
+	bool is_invalid = file->f.IsInvalid();
+	bool flushed    = !is_invalid && file->f.Flush();
+
+	file->mutex.Unlock();
+
+	if (is_invalid) {
+		LOGF("\tfile is invalid\n");
+		return KERNEL_ERROR_EIO;
+	}
+
+	// The written data already reached the host, so a failed flush only loses durability
+	LOGF_COLOR(flushed ? Log::Color::Green : Log::Color::Red, "\tFsync: %s, %s\n",
+	           Common::PathToString(file->real_name).c_str(), flushed ? "[ok]" : "[flush failed]");
+
+	return OK;
 }
 
 int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {

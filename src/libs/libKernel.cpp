@@ -1808,6 +1808,12 @@ int KYTY_SYSV_ABI KernelRtldThreadAtexitDecrement(uint64_t* /*c*/) {
 	return 0;
 }
 
+static uint64_t KYTY_SYSV_ABI KernelGetAvailableCpumask() {
+	PRINT_NAME();
+
+	return 0x1fff;
+}
+
 static KYTY_SYSV_ABI int KernelGetCurrentCpu() {
 	PRINT_NAME();
 
@@ -1989,6 +1995,12 @@ int KYTY_SYSV_ABI ftruncate(int d, int64_t length) {
 	PRINT_NAME();
 
 	return POSIX_CALL(LibKernel::FileSystem::KernelFtruncate(d, length));
+}
+
+int KYTY_SYSV_ABI fsync(int d) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelFsync(d));
 }
 
 int KYTY_SYSV_ABI socket(int family, int type, int protocol) {
@@ -2173,6 +2185,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("E6ao34wPw+U", stat);
 	LIB_FUNC("JGMio+21L4c", mkdir);
 	LIB_FUNC("ih4CD9-gghM", Posix::ftruncate);
+	LIB_FUNC("juWbTNM+8hw", Posix::fsync);
 	LIB_FUNC("pDuPEf3m4fI", Posix::sem_init);
 	LIB_FUNC("cDW233RAwWo", Posix::sem_destroy);
 	LIB_FUNC("YCV5dGGBcCo", Posix::sem_wait);
@@ -3156,7 +3169,9 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("Cg4srZ6TKbU", FileSystem::KernelRead);
 	LIB_FUNC("4wSze92BhLI", FileSystem::KernelWrite);
 	LIB_FUNC("+r3rMFwItV4", FileSystem::KernelPread);
+	LIB_FUNC("yTj62I7kw4s", FileSystem::KernelPreadv);
 	LIB_FUNC("nKWi-N2HBV4", FileSystem::KernelPwrite);
+	LIB_FUNC("mBd4AfLP+u8", FileSystem::KernelPwritev);
 	LIB_FUNC("eV9wAD2riIA", FileSystem::KernelStat);
 	LIB_FUNC("kBwCPsYX-m4", FileSystem::KernelFstat);
 	LIB_FUNC("WlyEA-sLDf0", FileSystem::KernelTruncate);
@@ -3378,6 +3393,7 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("C2kJ-byS5rM", Posix::pwrite);
 	LIB_FUNC("9eMlfusH4sU", Posix::flock);
 	LIB_FUNC("mqQMh1zPPT8", Posix::fstat);
+	LIB_FUNC("juWbTNM+8hw", Posix::fsync);
 
 	LIB_FUNC("z0dtnPxYgtg", chmod);
 	LIB_FUNC("VAzswvTOCzI", FileSystem::KernelUnlink);
@@ -3467,6 +3483,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("vYU8P9Td2Zo", KernelAioInitializeImpl);
 	LIB_FUNC("WhCc1w3EhSI", LibKernel::KernelSetThreadAtexitReport);
 	LIB_FUNC("WkwEd3N7w0Y", LibKernel::KernelInstallExceptionHandler);
+	LIB_FUNC("La9uyZv4Kvw", LibKernel::KernelGetAvailableCpumask);
 	LIB_FUNC("g0VTBxfJyu0", LibKernel::KernelGetCurrentCpu);
 	LIB_FUNC("wzvqT4UqKX8", LibKernel::KernelLoadStartModule);
 	LIB_FUNC("Xjoosiw+XPI", LibKernel::KernelUuidCreate);

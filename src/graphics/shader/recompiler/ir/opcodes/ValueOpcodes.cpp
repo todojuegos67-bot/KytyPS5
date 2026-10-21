@@ -219,6 +219,10 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 		case ValueOpcode::ImageAtomicIAdd32:
 		case ValueOpcode::ImageAtomicUMin32:
 		case ValueOpcode::ImageAtomicUMax32:
+		case ValueOpcode::ImageAtomicSMin32:
+		case ValueOpcode::ImageAtomicSMax32:
+		case ValueOpcode::ImageAtomicFMin32:
+		case ValueOpcode::ImageAtomicFMax32:
 		case ValueOpcode::ImageAtomicAnd32:
 		case ValueOpcode::ImageAtomicOr32:
 		case ValueOpcode::ImageAtomicXor32:

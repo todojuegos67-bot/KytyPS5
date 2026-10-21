@@ -28,6 +28,12 @@ using callback_func_t = void (*)(uintptr_t addr, size_t size);
 
 constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH = 32;
 
+// The AMM virtual address window (sceAmmGetVirtualAddressRanges): the game places its AMM mappings there
+// itself (MAP_FIXED through AMM command buffers), so the kernel never hands it out for mappings the
+// guest did not place (as on the console, where it is apart from the flexible/direct map range).
+constexpr uint64_t AMM_VA_START = 0x0000001000000000ull;
+constexpr uint64_t AMM_VA_SIZE  = 0x0000001000000000ull;
+
 struct VirtualQueryInfo {
 	uintptr_t start;
 	uintptr_t end;

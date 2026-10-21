@@ -22,6 +22,7 @@ struct RedZonePatchResult {
 	uint64_t control_flow_memory_instruction_count    = 0;
 	uint64_t unrelocatable_memory_instruction_count   = 0;
 	uint64_t indirect_red_zone_function_count         = 0;
+	uint64_t reciprocal_sqrt_instruction_count        = 0; // the Wolverine fork's patcher only
 	uint64_t swept_instruction_count                  = 0;
 	uint64_t live_call_count                          = 0;
 };
@@ -35,6 +36,22 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(uint64_t segment_addr, uint64_
 
 bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
                                  std::vector<uintptr_t>* function_starts);
+
+// The Wolverine fork's patcher (redZonePatcherWolverine.cpp), with its own module table.
+namespace RedZoneWolverine {
+void               RegisterRedZonePatchModule(void* module_ptr, uint64_t module_size, void* trampoline_area_ptr,
+                                              uint64_t trampoline_area_size);
+void               UnregisterRedZonePatchModule(void* module_ptr);
+RedZonePatchResult PatchGuestInstructions(uint64_t segment_addr, uint64_t segment_size,
+                                          std::span<const uintptr_t> function_starts, bool protect_memory,
+                                          bool emulate_rsqrt);
+bool               DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
+                                               std::vector<uintptr_t>* function_starts);
+} // namespace RedZoneWolverine
+
+// True when this process uses the Wolverine fork's patcher: KYTY_REDZONE_PATCHER=wolverine, or any title but
+// Demon's Souls (PPSA01340/1/2) when KYTY_REDZONE_PATCHER is not "default".
+bool UseWolverineRedZonePatcher();
 
 } // namespace Loader
 

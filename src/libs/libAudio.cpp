@@ -207,6 +207,8 @@ LIB_DEFINE(InitAudio_1_AudioIn) {
 	LIB_FUNC("5NE8Sjc7VC8", AudioIn::AudioInOpen);
 	LIB_FUNC("LozEOU8+anM", AudioIn::AudioInInput);
 	LIB_FUNC("BohEAQ7DlUE", AudioIn::AudioInGetSilentState);
+	LIB_FUNC("nya-R5gDYhM", AudioIn::AudioInHqOpen);
+	LIB_FUNC("Jh6WbHhnI68", AudioIn::AudioInClose);
 }
 
 } // namespace LibAudioIn
@@ -598,6 +600,7 @@ LIB_DEFINE(InitAudio_1_Acm) {
 	LIB_FUNC("8fe55ktlNVo", Acm::AcmBatchStartBuffers);
 	LIB_FUNC("RLN3gRlXJLE", Acm::AcmBatchWait);
 	LIB_FUNC("r7z5YQFZo+U", Acm::AcmBatchJobNotification);
+	LIB_FUNC("GTfJ64qFCPw", Acm::AcmBatchJobPriority);
 	LIB_FUNC("u70oWo92SYQ", Acm::AcmConvReverbSharedInput);
 	LIB_FUNC("9nLbWmRDpa8", Acm::AcmConvReverbSharedIr);
 	LIB_FUNC("KovqaFbmtsM", Acm::AcmFft);

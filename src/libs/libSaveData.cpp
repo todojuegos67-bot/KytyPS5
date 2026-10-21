@@ -1161,6 +1161,70 @@ int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
 	return OK;
 }
 
+struct SaveDataConvertParam {
+	int32_t                   user_id;
+	int32_t                   reserved0;
+	const SceSaveDataDirName* src_dir_name;
+	const SceSaveDataDirName* dst_dir_name; // may be null
+	uint64_t                  dst_blocks;   // 0 keeps the source size
+	uint8_t                   reserved[24];
+};
+
+static_assert(sizeof(SaveDataConvertParam) == 56);
+
+static bool convert_valid_dir_name(const SceSaveDataDirName& name) {
+	const auto* end = std::find(std::begin(name.data), std::end(name.data), '\0');
+	if (end == std::end(name.data)) {
+		return false;
+	}
+	const std::string_view view(name.data, static_cast<size_t>(end - name.data));
+	return !view.empty() && view != "." && view != ".." &&
+	       view.find_first_not_of(
+	           "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.@") ==
+	           std::string_view::npos;
+}
+
+// Converts save data to the current format. A result >= 0 starts an asynchronous conversion that
+// the caller polls with GetConvertProgress; the caller seen treats NOT_FOUND and NO_NEED_CONVERT
+// as "nothing to convert" and goes on to mount or create its save. Kyty only ever writes save data
+// in the current format, so an existing directory needs no conversion.
+int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvertParam* convert) {
+	PRINT_NAME();
+
+	if (convert == nullptr || convert->src_dir_name == nullptr ||
+	    !convert_valid_dir_name(*convert->src_dir_name)) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	if (convert->user_id < 0) {
+		return SAVE_DATA_ERROR_INVALID_LOGIN_USER;
+	}
+
+	LOGF("\t user_id    = %" PRId32 "\n"
+	     "\t src        = %s\n"
+	     "\t dst        = %s\n"
+	     "\t dst_blocks = %" PRIu64 "\n",
+	     convert->user_id, convert->src_dir_name->data,
+	     convert->dst_dir_name != nullptr ? convert->dst_dir_name->data : "<null>",
+	     convert->dst_blocks);
+
+	// Same directory layout as SaveDataMount.
+	std::error_code error;
+	const auto      dir =
+	    std::filesystem::path(SAVE_DATA_DIR) / get_title_id() / convert->src_dir_name->data;
+	return std::filesystem::exists(dir, error) ? SAVE_DATA_ERROR_NO_NEED_CONVERT
+	                                           : SAVE_DATA_ERROR_NOT_FOUND;
+}
+
+// Convert never starts an asynchronous conversion, so any poll sees it finished.
+int KYTY_SYSV_ABI SaveDataGetConvertProgress(float* progress) {
+	PRINT_NAME();
+	if (progress == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	*progress = 1.0f;
+	return OK;
+}
+
 } // namespace SaveData
 
 namespace LibSaveDataNative {
@@ -1194,6 +1258,8 @@ LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("cGjO3wM3V28", ::Libs::SaveData::SaveDataLoadIcon);
 	LIB_FUNC("X4MYzukPc3g", ::Libs::SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("yKDy8S5yLA0", ::Libs::SaveData::SaveDataTerminate);
+	LIB_FUNC("2mfSRGdshtk", ::Libs::SaveData::SaveDataConvert);
+	LIB_FUNC("8EA5OMIL1lQ", ::Libs::SaveData::SaveDataGetConvertProgress);
 }
 
 } // namespace LibSaveDataNative

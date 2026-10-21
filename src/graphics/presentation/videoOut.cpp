@@ -62,6 +62,8 @@ constexpr int      VIDEO_OUT_BUS_TYPE_OVERLAY                           = 1;
 constexpr int      VIDEO_OUT_BUS_TYPE_SUB                               = 2;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC                            = 1;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC_MULTI                      = 4;
+constexpr int      VIDEO_OUT_FLIP_MODE_SLAVE                            = 8;
+constexpr int      VIDEO_OUT_FLIP_MODE_MASTER                           = 9;
 constexpr int      VIDEO_OUT_BUFFER_INDEX_BLACK                         = -2;
 constexpr int      VIDEO_OUT_BUFFER_INDEX_BLANK                         = -1;
 constexpr int      VIDEO_OUT_BUFFER_NUM_MAX                             = 16;
@@ -74,6 +76,7 @@ constexpr uint64_t VIDEO_OUT_REFRESH_RATE_119_88HZ                      = 13;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED     = 0;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED       = 1;
 constexpr uint64_t VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY = 8;
+constexpr uint64_t VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED = 32;
 
 enum class VideoOutEventKind : uintptr_t {
 	Flip           = VIDEO_OUT_EVENT_FLIP,
@@ -196,6 +199,8 @@ struct VideoOutConfig {
 	uint64_t                            generation  = 0;
 	bool                                opened      = false;
 	bool                                closing     = false;
+	VideoOutConfig*                     master      = nullptr; // sceVideoOutSetFlipMaster
+	uint32_t                            slave_count = 0;
 	int                                 flip_rate   = 0;
 	uint64_t                            last_flip_vblank = 0; // vblank_status.count at the last flip
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
@@ -274,6 +279,7 @@ public:
 	VideoOutConfig* Get(int handle);
 	VideoOutConfig* Get(int handle, uint64_t& generation);
 	bool            IsOpened(int handle);
+	int             SetFlipMaster(int slave_handle, int master_handle);
 
 	void                     Init(uint32_t width, uint32_t height);
 	FlipQueue&               GetFlipQueue() { return m_flip_queue; }
@@ -750,7 +756,8 @@ static bool IsSpecialBufferIndex(int index) {
 }
 
 static bool IsValidFlipMode(int mode) {
-	return mode >= VIDEO_OUT_FLIP_MODE_VSYNC && mode <= VIDEO_OUT_FLIP_MODE_VSYNC_MULTI;
+	return (mode >= VIDEO_OUT_FLIP_MODE_VSYNC && mode <= VIDEO_OUT_FLIP_MODE_VSYNC_MULTI) ||
+	       mode == VIDEO_OUT_FLIP_MODE_SLAVE || mode == VIDEO_OUT_FLIP_MODE_MASTER;
 }
 
 static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int index, int flip_mode,
@@ -767,6 +774,10 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	}
 
 	Common::LockGuard lock(video_out->mutex);
+	if ((video_out->master != nullptr) != (flip_mode == VIDEO_OUT_FLIP_MODE_SLAVE) ||
+	    (video_out->slave_count != 0) != (flip_mode == VIDEO_OUT_FLIP_MODE_MASTER)) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
 	if (video_out->closing ||
 	    (!IsSpecialBufferIndex(index) && !video_out->buffers[index].Occupied())) {
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
@@ -784,8 +795,8 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	if (attribute.reserved0 != 0 || attribute.aspect_ratio != 0 || attribute.width == 0 ||
 	    attribute.height == 0 || attribute.width > 16384 || attribute.height > 16384 ||
 	    attribute.pitch_in_pixel != 0 ||
-	    (attribute.option != 0 &&
-	     attribute.option != VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY) ||
+	    (attribute.option & ~(VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY |
+	                          VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED)) != 0 ||
 	    attribute.tiling_mode != 0 || attribute.pad0 != 0 || attribute.reserved1[0] != 0 ||
 	    attribute.reserved1[1] != 0 || attribute.reserved1[2] != 0 || buffer.data_address == 0 ||
 	    compression == Graphics::VideoOutCompression::Unsupported) {
@@ -860,6 +871,11 @@ VideoOutDriver::Impl::~Impl() {
 		m_present_thread.join();
 	}
 	for (int handle = 1; handle < VIDEO_OUT_NUM_MAX; handle++) {
+		if (m_video_out_ctx[handle].master != nullptr) {
+			(void)Close(handle);
+		}
+	}
+	for (int handle = 1; handle < VIDEO_OUT_NUM_MAX; handle++) {
 		(void)Close(handle);
 	}
 }
@@ -925,11 +941,13 @@ bool VideoOutDriver::Impl::Close(int handle) {
 	VideoOutEventQueues pre_vblank_events;
 	VideoOutEventQueues vblank_events;
 	VideoOutEventQueues output_mode_events;
+	VideoOutConfig*     master = nullptr;
 	{
 		Common::LockGuard config_lock(config.mutex);
 		if (config.closing) {
 			return false;
 		}
+		EXIT_IF(config.slave_count != 0);
 		config.opened  = false;
 		config.closing = true;
 		if (++config.generation == 0) {
@@ -943,6 +961,8 @@ bool VideoOutDriver::Impl::Close(int handle) {
 			output_mode_events = std::move(config.events->output_mode);
 		}
 		config.flip_rate = 0;
+		master           = config.master;
+		config.master    = nullptr;
 
 		for (const auto& buffer: config.buffers) {
 			if (buffer.Occupied() &&
@@ -958,6 +978,10 @@ bool VideoOutDriver::Impl::Close(int handle) {
 			group = BufferAttributeGroup {};
 		}
 		config.vblank_cond.SignalAll();
+	}
+	if (master != nullptr) {
+		Common::LockGuard master_lock(master->mutex);
+		master->slave_count--;
 	}
 
 	m_flip_queue.Cancel(config);
@@ -996,6 +1020,31 @@ bool VideoOutDriver::Impl::IsOpened(int handle) {
 	Common::LockGuard lock(m_mutex);
 
 	return handle > 0 && handle < VIDEO_OUT_NUM_MAX && m_video_out_ctx[handle].opened;
+}
+
+int VideoOutDriver::Impl::SetFlipMaster(int slave_handle, int master_handle) {
+	Common::LockGuard lock(m_mutex);
+	if (slave_handle <= 0 || slave_handle >= VIDEO_OUT_NUM_MAX ||
+	    master_handle <= 0 || master_handle >= VIDEO_OUT_NUM_MAX ||
+	    !m_video_out_ctx[slave_handle].opened || !m_video_out_ctx[master_handle].opened) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+	auto& slave  = m_video_out_ctx[slave_handle];
+	auto& master = m_video_out_ctx[master_handle];
+	if (&slave == &master) {
+		return VIDEO_OUT_ERROR_UNSUPPORTED_OPERATION;
+	}
+	Common::LockGuard first_lock(m_video_out_ctx[std::min(slave_handle, master_handle)].mutex);
+	Common::LockGuard second_lock(m_video_out_ctx[std::max(slave_handle, master_handle)].mutex);
+	if (slave.master != nullptr || slave.slave_count != 0 || master.master != nullptr) {
+		return VIDEO_OUT_ERROR_UNSUPPORTED_OPERATION;
+	}
+	if (slave.flip_status.flipPendingNum != 0 || master.flip_status.flipPendingNum != 0) {
+		return VIDEO_OUT_ERROR_RESOURCE_BUSY;
+	}
+	slave.master = &master;
+	master.slave_count++;
+	return OK;
 }
 
 void VideoOutDriver::Impl::VblankBegin() {
@@ -1497,6 +1546,9 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	m_mutex.Unlock();
 
 	r.cfg->mutex.Lock();
+	// A slave port (sceVideoOutSetFlipMaster) flips along with its master. The fork composites it as a
+	// presenter layer; the base presenter has a single layer, so the slave's frame completes unshown.
+	const bool slave = r.cfg->master != nullptr;
 	int  floor      = 0;
 	bool scene_free = true;
 	bool fg_off     = true;
@@ -1531,7 +1583,7 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	                                  std::chrono::duration<double>(0.5 / std::max(Config::GetVblankFrequency(), 1u)));
 	const bool   paced_wait     = paced_interval > 0.0 && paced_now + paced_slack < s_paced_next;
 	const bool due = when_ready ? IsFlipDueReadyLocked(*r.cfg, r.generation, floor) : IsFlipDueLocked(*r.cfg, r.generation, floor);
-	if (paced_wait || !due) {
+	if (!slave && (paced_wait || !due)) {
 		r.cfg->mutex.Unlock();
 		Common::LockGuard queue_lock(m_mutex);
 		m_processing = false;
@@ -1552,8 +1604,12 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	// own copy; a port closed meanwhile takes no status or event.
 	r.cfg->mutex.Unlock();
 
-	NoteFlipSubmitted(r.submit_time);
-	m_presenter.Submit(*r.frame);
+	if (slave) {
+		m_presenter.Discard(*r.frame);
+	} else {
+		NoteFlipSubmitted(r.submit_time);
+		m_presenter.Submit(*r.frame);
+	}
 
 	r.cfg->mutex.Lock();
 	m_mutex.Lock();
@@ -1584,6 +1640,10 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	m_mutex.Unlock();
 	r.cfg->mutex.Unlock();
 
+	if (slave) {
+		return false;
+	}
+
 	Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
 
 	if (Config::GraphicsDebugDumpEnabled() &&
@@ -1598,6 +1658,18 @@ void FlipQueue::GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out) {
 	Common::LockGuard lock(cfg.mutex);
 
 	out = cfg.flip_status;
+}
+
+KYTY_SYSV_ABI int VideoOutSetFlipMaster(int slave_handle, int master_handle) {
+	PRINT_NAME();
+	return DriverState().SetFlipMaster(slave_handle, master_handle);
+}
+
+KYTY_SYSV_ABI void VideoOutAddBufferAttributeOption(VideoOutBufferAttribute2* attribute,
+                                                   uint64_t option) {
+	PRINT_NAME();
+	EXIT_IF(attribute == nullptr);
+	attribute->option |= option;
 }
 
 KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void* param) {
@@ -2119,6 +2191,38 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	status->reserved[1] = 0;
 	status->reserved[2] = 0;
 	ctx->mutex.Unlock();
+
+	return OK;
+}
+
+KYTY_SYSV_ABI int VideoOutAllowOutputResolutionWqhdDetection(int handle) {
+	if (!DriverState().IsOpened(handle)) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+	return OK;
+}
+
+KYTY_SYSV_ABI int VideoOutVrrPegToFixedRate(int handle, uint64_t arg1, uint64_t arg2) {
+	PRINT_NAME();
+
+	static std::atomic_bool logged {false};
+	if (!logged.exchange(true, std::memory_order_relaxed)) {
+		LOGF("\t handle = %d\n"
+		     "\t arg1   = 0x%016" PRIx64 "\n"
+		     "\t arg2   = 0x%016" PRIx64 "\n",
+		     handle, arg1, arg2);
+	}
+
+	return OK;
+}
+
+KYTY_SYSV_ABI int VideoOutVrrUnpegFromFixedRate(int handle) {
+	PRINT_NAME();
+
+	static std::atomic_bool logged {false};
+	if (!logged.exchange(true, std::memory_order_relaxed)) {
+		LOGF("\t handle = %d\n", handle);
+	}
 
 	return OK;
 }

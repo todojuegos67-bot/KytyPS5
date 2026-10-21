@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "kernel/pthread.h"
 
+#include <cstddef>
 #include <filesystem>
 
 namespace Libs::LibKernel::FileSystem {
@@ -43,6 +44,14 @@ struct Lifecycle {
 	static constexpr auto emergency_shutdown = Libs::LibKernel::FileSystem::EmergencyShutdown;
 };
 
+struct KernelIovec {
+	void*  iov_base;
+	size_t iov_len;
+};
+
+static_assert(sizeof(KernelIovec) == 16);
+static_assert(offsetof(KernelIovec, iov_len) == 8);
+
 void                  Mount(const std::filesystem::path& folder, const std::string& point);
 void                  Umount(const std::string& folder_or_point);
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
@@ -53,6 +62,9 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes);
 int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset);
 int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes);
 int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_t offset);
+int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset);
+int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, int64_t offset);
+int KYTY_SYSV_ABI     KernelFsync(int d);
 int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence);
 int KYTY_SYSV_ABI     KernelStat(const char* path, FileStat* sb);
 int KYTY_SYSV_ABI     KernelFstat(int d, FileStat* sb);
