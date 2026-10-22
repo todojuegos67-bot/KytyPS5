@@ -1,4 +1,5 @@
 #include "graphics/frameCosts.h"
+#include "graphics/phaseStats.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include <cinttypes>
@@ -173,6 +174,8 @@ void MasterSemaphore::Wait(uint64_t tick, std::source_location where) {
 	vk::Result result;
 	{
 		FrameCosts::Timer cost_timer {FrameCosts::g_gpu_wait_us, FrameCosts::g_gpu_waits};
+		PhaseStats::Scope phase {PhaseStats::IsGpuThread() ? PhaseStats::GpuWait
+		                                                      : PhaseStats::GuestPhase(PhaseStats::RenderGpuWait, PhaseStats::OtherGpuWait)};
 		const auto        begin = NowUs();
 		result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 		NoteWaitSite(where, NowUs() - begin);

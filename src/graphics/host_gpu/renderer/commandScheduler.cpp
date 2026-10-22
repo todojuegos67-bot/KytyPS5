@@ -3,6 +3,7 @@
 #include <string>
 #include <mutex>
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/phaseStats.h"
 
 #include "common/assert.h"
 #include "common/liveSwitches.h"
@@ -681,6 +682,7 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
+		PhaseStats::Scope phase {PhaseStats::QueueSubmit};
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	if (result == vk::Result::eErrorDeviceLost) {

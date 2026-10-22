@@ -1,4 +1,5 @@
 #include "graphics/drawDiff.h"
+#include "graphics/phaseStats.h"
 #include "graphics/frameCosts.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 
@@ -356,6 +357,7 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
+	PhaseStats::Scope    phase {PhaseStats::GuestPhase(PhaseStats::RenderSync, PhaseStats::OtherSync)};
 	std::binary_semaphore done {0};
 	SendCommand([operation = std::move(command), &done]() mutable {
 		operation();
@@ -781,6 +783,7 @@ void GuestGpu::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	ThreadSampler::RegisterCurrentThread("Thread_Gpu");
+	PhaseStats::MarkGpuThread();
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
@@ -792,6 +795,7 @@ void GuestGpu::ThreadRun(void* data) {
 		// Commands a gated slice left unsubmitted go to the GPU before this thread waits.
 		bool flush_pending = false;
 		Common::Thread::ApplyGpuThreadPriority();
+		PhaseStats::MaybeReport();
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
@@ -804,6 +808,7 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_idle.Signal();
 				{
 					FrameCosts::Timer cost_timer {FrameCosts::g_idle_us, FrameCosts::g_idles};
+					PhaseStats::Scope phase {PhaseStats::GpuIdle};
 					gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 				}
 			}
@@ -837,6 +842,7 @@ void GuestGpu::ThreadRun(void* data) {
 						KYTY_PROFILER_BLOCK("GuestGpu::WaitBlockedQueues");
 						{
 							FrameCosts::Timer cost_timer {FrameCosts::g_idle_us, FrameCosts::g_idles};
+							PhaseStats::Scope phase {PhaseStats::GpuIdle};
 							gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 						}
 					}
@@ -858,6 +864,7 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 		}
 		if (flush_pending) {
+			PhaseStats::Scope phase {PhaseStats::GpuFlushSlices};
 			gpu->FlushPendingSlices();
 			continue;
 		}
@@ -872,6 +879,7 @@ void GuestGpu::ThreadRun(void* data) {
 			EXIT_IF(g_current_processor != nullptr);
 			{
 				KYTY_PROFILER_BLOCK("GuestGpu::RunCommand");
+				PhaseStats::Scope phase {PhaseStats::GpuCommand};
 				command();
 			}
 
@@ -884,7 +892,12 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		bool complete = false;
+		{
+			PhaseStats::Scope phase {submission.type == SubmissionType::Graphics ? PhaseStats::GpuGraphics
+			                                                                       : PhaseStats::GpuCompute};
+			complete = gpu->Process(submission);
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {

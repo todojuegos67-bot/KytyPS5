@@ -1,4 +1,5 @@
 #include "kernel/pthread.h"
+#include "graphics/phaseStats.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -3222,6 +3223,7 @@ static void* RunThread(void* arg) {
 		const char* prof_guest = std::getenv("KYTY_PROF_GUEST");
 		if (thread->name == (prof_guest != nullptr ? prof_guest : "Render Thread")) {
 			Libs::Graphics::ThreadSampler::RegisterCurrentThread("Guest_RenderThread");
+			PhaseStats::MarkGuestRenderThread();
 		}
 	}
 #endif
