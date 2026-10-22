@@ -11,7 +11,8 @@
 //   minimum, down at once when real falls below the current one's; m only where target / m >= its minimum.
 // - Up one level at a time, only when it shows >= 5% more (min(real * m, target)); 2 windows after a step up, the
 //   shown rate is checked against the one before: not >= 5% higher (or real under the minimum) -> back down and that
-//   level blocked for 10 s.
+//   level blocked for 10 s. The level that reaches the target with real capped by <= 10% is preferred (60 real on
+//   224: x4 at 56 real, kept when it shows >= 97% of the target).
 // - The cap (real <= target / m) binds only when real * m would pass the target; when real sits on it for 2 windows
 //   and the lower multiplier's free rate also reaches the target, one step down (no step up for 10 s).
 #include <algorithm>
@@ -75,7 +76,7 @@ struct DynMultiplier {
 				const double c = (1.0 / real - 1.0 / check_real) / std::max(m - from, 1);
 				if (c > 0.0) cost = cost > 0.0 ? 0.5 * cost + 0.5 * c : c;
 			}
-			if (shown < 1.05 * check_shown || real < MinReal(m)) {
+			if ((shown < 1.05 * check_shown && shown < 0.97 * T) || real < MinReal(m)) {
 				block[m] = 10;
 				return go(from);
 			}
@@ -95,7 +96,9 @@ struct DynMultiplier {
 		const int up = m + 1;
 		if (up <= maxm && noup == 0 && block[up] == 0 && real * m < 0.97 * T) {
 			const double est = Estimate(up, real, m);
-			if (est >= MinReal(up) && std::min(est * up, T) >= 1.05 * std::min(real * m, T)) {
+			// Reaching the target with real capped by at most ~10% (60 -> 56 for x4 = 224) is preferred.
+			const bool reach = real * up >= T && T / up >= 0.9 * real;
+			if (est >= MinReal(up) && (reach || std::min(est * up, T) >= 1.05 * std::min(real * m, T))) {
 				if (++up_n >= 2) {
 					check_from  = m;
 					check_real  = real;
