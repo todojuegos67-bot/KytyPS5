@@ -741,18 +741,19 @@ bool Requested() {
 }
 
 // 10-22: KYTY_DLSSG_PACE: how real frames are paced for DLSS-G.
-//   adaptive (default): VideoOut's flip pacer at max(target / m, mean + 0.75 sd of the last windows' present
+//   adaptive (opt-in): VideoOut's flip pacer at max(target / m, mean + 0.75 sd of the last windows' present
 //     intervals). Below the cap (log 20261022-103006: 43-51 real, 21 ms mean) nothing held the frames, so the game's
 //     own frame-time spread reached DLSS-G (present interval sd 1.1-1.9 ms; FSR3's 0.37 was at a held 60); a steady
 //     interval just above the typical frame evens it for a few % of real rate.
-//   grid: the flip pacer at target / m only (75ee561d .. aef26a56).
+//   grid (default): the flip pacer at target / m only. Adaptive is held to at most 1.15 target / m and reset in
+//   cutscenes, cinematics, movies and with DLSS-G off (it learned a 30 fps phase and held its own 36 ms after it).
 //   reflex: Streamline's Reflex limit at target / m and our pacer off.
 int DlssgPaceMode() {
 	static const int mode = [] {
 		const char* v = std::getenv("KYTY_DLSSG_PACE");
-		if (v != nullptr && std::strcmp(v, "grid") == 0) return 1;
+		if (v != nullptr && std::strcmp(v, "adaptive") == 0) return 0;
 		if (v != nullptr && std::strcmp(v, "reflex") == 0) return 2;
-		return 0;
+		return 1; // grid (10-22: adaptive locked at 36 ms after a 30 fps phase, log 20261022-175339)
 	}();
 	return mode;
 }
@@ -761,7 +762,7 @@ std::atomic<double> g_pace_adapt {0.0}; // adaptive: the steady interval from th
 double RealFrameInterval() {
 	if (!g_ready || DlssgPaceMode() == 2) return 0.0;
 	const double base = g_real_interval.load();
-	return base > 0.0 && DlssgPaceMode() == 0 ? std::max(base, g_pace_adapt.load()) : base;
+	return base > 0.0 && DlssgPaceMode() == 0 ? std::clamp(g_pace_adapt.load(), base, 1.15 * base) : base;
 }
 
 std::string SupportProblem(vk::PhysicalDevice physical_device) {
@@ -1602,6 +1603,10 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		const double window = std::chrono::duration<double>(now - g_stat_start).count();
 		if (window >= 1.0) {
 			const double n = g_stat_real != 0 ? static_cast<double>(g_stat_real) : 1.0;
+			if (VideoOut::CinematicPlaying() || VideoOut::CutsceneHeld() || VideoOut::MoviePlaying() || g_mode_set != 1) {
+				g_pace_adapt = 0.0; // (nothing learned from held or ungenerated phases)
+				g_pace_n     = 0.0;
+			}
 			if (g_pace_n >= 10.0) {
 				const double mean = g_pace_sum / g_pace_n;
 				const double sd   = std::sqrt(std::max(g_pace_sq / g_pace_n - mean * mean, 0.0));
