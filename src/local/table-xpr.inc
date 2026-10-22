@@ -2169,6 +2169,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (FrameGen::Capturing() && Spec::Current() == nullptr)
 		FrameGen::OnDraw(pair.programs[0]->shader_hash,
 		                 std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()), 't');
+	if (FrameGen::SsrWanted() && Spec::Current() == nullptr)
+		FrameGen::OnSsrDraw(pair.programs[0]->shader_hash,
+		                    std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
 	if (FrameGen::ContactShadowsWanted() && Spec::Current() == nullptr)
 		FrameGen::OnShadowDraw(pair.programs[0]->shader_hash,
 		                       std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()), false);

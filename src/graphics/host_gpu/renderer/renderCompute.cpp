@@ -1064,6 +1064,18 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	if (FrameGen::IsTaaShader(program.shader_hash)) FrameGen::NoteScene(); // (the game's 3D view)
 	FrameGen::NoteShader(program.shader_hash, 'c');
+	if (FrameGen::SsrWanted() && !bindings.images.empty()) {
+		// (KYTY_SSR, logging only: a dispatch reading the G-buffer targets, the deferred lighting.)
+		std::array<uint64_t, 32>   addresses {};
+		std::array<vk::Format, 32> formats {};
+		const size_t               n = std::min<size_t>(bindings.images.size(), addresses.size());
+		for (size_t i = 0; i < n; ++i) {
+			addresses[i] = bindings.images[i].desc.info.data.address;
+			formats[i]   = bindings.images[i].desc.view_info.format;
+		}
+		FrameGen::OnSsrDispatch(program.shader_hash, std::span<const uint64_t>(addresses.data(), n),
+		                        std::span<const vk::Format>(formats.data(), n));
+	}
 	if (FrameGen::ContactShadowsWanted()) {
 		// (KYTY_CONTACT_SHADOWS: a dispatch sampling the sun's shadow-map array carries the cascade matrices.)
 		FrameGen::ShadowConsumer consumer {};

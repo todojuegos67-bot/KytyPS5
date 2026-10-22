@@ -22,6 +22,7 @@
 #include "gpu_tiler_shaders/sharpen_spv.h"
 #include "gpu_tiler_shaders/ssgi_spv.h"
 #include "gpu_tiler_shaders/gtao_spv.h"
+#include "gpu_tiler_shaders/ssr_spv.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
 #include "kernel/memory.h"
 #include <string>
@@ -4466,6 +4467,528 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 } // namespace
 
 namespace {
+bool Inverse4(const std::array<float, 16>& m, std::array<double, 16>& inv); // (defined with the contact shadows)
+
+// KYTY_SSR=0|1|2|3 ("Reflejos RT": off / Normal / Alta / Ultra; ssr.comp): screen-space reflections, mainly for water,
+// puddles and wet floors, recorded right before the upscaler after SSGI and GTAO, with their inputs (depth, motion
+// vectors, the pre-upscale color, the upscaler's view_to_clip). 1: half-res trace, 24 steps + 4 binary refinements,
+// a-trous 1, 2; 2: full res, 40 + 6, a-trous 1, 2, 4; 3: full res, 64 + 8, longer rays, a-trous 1, 2, 4, 8.
+// Rough surfaces: GGX importance-sampled jitter (IGN per frame); temporal accumulation reprojecting by the surface's and
+// the hit's motion; a-trous by roughness / depth / normal; composite with Schlick Fresnel x a smoothness mask, faded at
+// the screen edges and by ray length; no hit = the game's own image (its own reflections stay).
+// Roughness source: KYTY_SSR_GBUF=<render target slot>.<channel r|g|b|a>[g] (g: the channel is gloss) names a channel
+// of the G-buffer draws' color targets (logged as "SSR: G-buffer draw ..."); unset, or the target not usable this
+// frame: a heuristic mask (depth-derived normals facing up, low local variance, darker than the surroundings).
+// KYTY_SSR_STRENGTH (1.0, 0..2), KYTY_SSR_THICKNESS (view units, 0.25), KYTY_SSR_UP (world up axis for the heuristic:
+// y (default), z or x; "-y" etc. for the negative one). Off (the default): nothing created, nothing recorded, no hooks.
+struct SsrPass {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	vk::Sampler             point      = nullptr;
+	vk::Sampler             linear     = nullptr;
+	bool                    failed     = false;
+	vk::Extent2D            render {}, trace {};
+	SsgiImage               raw, tmp_a, tmp_b, out, mat, hit;
+	SsgiImage               history[2], gbuf[2];
+	uint32_t                frame         = 0;
+	int                     level         = 0;
+	bool                    history_valid = false;
+	int                     source        = -2; // the roughness source last logged (-1 heuristic, else slot*4+channel)
+	vk::QueryPool           pool      = nullptr;
+	double                  period_ns = 1.0;
+	uint64_t                written = 0, read = 0;
+	double                  sum_ms  = 0.0;
+	uint32_t                samples = 0;
+	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+} g_ssr;
+
+struct SsrPush {
+	float   proj[4];
+	float   depth_map[4];
+	float   motion[4];
+	float   trace[4];
+	int32_t misc[4];
+	float   extra[4];
+	float   up[4];
+};
+static_assert(sizeof(SsrPush) == 112);
+
+constexpr uint32_t SsrBindings = 14;
+bool SsrSampled(uint32_t i) { return !(i == 7 || i == 8 || i == 10 || i == 13); }
+
+int SsrLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_SSR");
+		return value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
+	}();
+	return level;
+}
+
+// KYTY_SSR_GBUF: slot, channel, gloss (slot -1: unset or malformed).
+struct SsrGbufChoice {
+	int  slot = -1, channel = 0;
+	bool gloss = false;
+};
+const SsrGbufChoice& SsrChoice() {
+	static const SsrGbufChoice choice = [] {
+		SsrGbufChoice c;
+		const char*   value = std::getenv("KYTY_SSR_GBUF");
+		if (value == nullptr || value[0] < '0' || value[0] > '7' || value[1] != '.') return c;
+		const char ch = value[2];
+		const int  channel = ch == 'r' || ch == 'x' ? 0 : ch == 'g' || ch == 'y' ? 1 : ch == 'b' || ch == 'z' ? 2 : ch == 'a' || ch == 'w' ? 3 : -1;
+		if (channel < 0) return c;
+		c.slot    = value[0] - '0';
+		c.channel = channel;
+		c.gloss   = value[3] == 'g';
+		return c;
+	}();
+	return choice;
+}
+
+const char* SsrFormatName(vk::Format f) {
+	switch (f) {
+		case vk::Format::eR8G8B8A8Unorm: return "RGBA8_UNORM";
+		case vk::Format::eR8G8B8A8Srgb: return "RGBA8_SRGB";
+		case vk::Format::eB8G8R8A8Unorm: return "BGRA8_UNORM";
+		case vk::Format::eA2B10G10R10UnormPack32: return "A2B10G10R10_UNORM";
+		case vk::Format::eA2R10G10B10UnormPack32: return "A2R10G10B10_UNORM";
+		case vk::Format::eR16G16B16A16Sfloat: return "RGBA16F";
+		case vk::Format::eR16G16B16A16Unorm: return "RGBA16_UNORM";
+		case vk::Format::eB10G11R11UfloatPack32: return "R11G11B10F";
+		case vk::Format::eR16G16Sfloat: return "RG16F";
+		case vk::Format::eR16G16Unorm: return "RG16_UNORM";
+		case vk::Format::eR8G8Unorm: return "RG8_UNORM";
+		case vk::Format::eR8Unorm: return "R8_UNORM";
+		case vk::Format::eR16Sfloat: return "R16F";
+		case vk::Format::eR32Sfloat: return "R32F";
+		case vk::Format::eR32Uint: return "R32_UINT";
+		case vk::Format::eR32G32Uint: return "RG32_UINT";
+		case vk::Format::eR16G16B16A16Uint: return "RGBA16_UINT";
+		case vk::Format::eR8G8B8A8Uint: return "RGBA8_UINT";
+		default: return "other";
+	}
+}
+// Filterable, normalized or float: a channel the shader can read as a 0..1 value.
+bool SsrFormatUsable(vk::Format f) {
+	switch (f) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eR16G16Sfloat:
+		case vk::Format::eR16G16Unorm:
+		case vk::Format::eR8G8Unorm:
+		case vk::Format::eR8Unorm:
+		case vk::Format::eR16Sfloat: return true;
+		default: return false;
+	}
+}
+
+// The G-buffer as its draws on the normal path bind it (any recording thread writes, the upscale reads).
+struct SsrGbuffer {
+	std::mutex                  mutex;
+	std::array<SsrTarget, 8>    targets {};
+	uint32_t                    count   = 0;
+	uint64_t                    flip    = 0;
+	bool                        valid   = false;
+	std::vector<std::pair<uint64_t, uint64_t>> logged; // (vs, ps) layouts logged
+	std::vector<uint64_t>       consumers;              // compute programs logged as reading it
+	std::array<float, 16>       view_proj {};
+	bool                        have_vp = false;
+	uint64_t                    vp_flip = ~0ull;
+} g_ssr_gb;
+
+bool SsrEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
+	const auto device = graphics.device;
+	if (g_ssr.pipeline == nullptr) {
+		if (g_ssr.failed) return false;
+		g_ssr.failed = true;
+		std::array<vk::DescriptorSetLayoutBinding, SsrBindings> bindings {};
+		for (uint32_t i = 0; i < SsrBindings; ++i) {
+			bindings[i].binding         = i;
+			bindings[i].descriptorType  = SsrSampled(i) ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorCount = 1;
+			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+		}
+		vk::DescriptorSetLayoutCreateInfo set_info {};
+		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+		set_info.pBindings    = bindings.data();
+		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_ssr.set_layout) != vk::Result::eSuccess) return false;
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(SsrPush)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = 1;
+		layout_info.pSetLayouts            = &g_ssr.set_layout;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push;
+		if (device.createPipelineLayout(&layout_info, nullptr, &g_ssr.layout) != vk::Result::eSuccess) return false;
+		vk::ShaderModuleCreateInfo module_info {};
+		module_info.codeSize    = sizeof(SSR_SPV);
+		module_info.pCode       = SSR_SPV;
+		vk::ShaderModule module = nullptr;
+		if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		pipeline_info.stage.module = module;
+		pipeline_info.stage.pName  = "main";
+		pipeline_info.layout       = g_ssr.layout;
+		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_ssr.pipeline);
+		device.destroyShaderModule(module, nullptr);
+		if (created != vk::Result::eSuccess) {
+			g_ssr.pipeline = nullptr;
+			return false;
+		}
+		for (int i = 0; i < 2; ++i) {
+			vk::SamplerCreateInfo sampler {};
+			sampler.magFilter    = i == 0 ? vk::Filter::eNearest : vk::Filter::eLinear;
+			sampler.minFilter    = sampler.magFilter;
+			sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+			sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+			sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+			if (device.createSampler(&sampler, nullptr, i == 0 ? &g_ssr.point : &g_ssr.linear) != vk::Result::eSuccess) return false;
+		}
+		vk::QueryPoolCreateInfo query {};
+		query.queryType  = vk::QueryType::eTimestamp;
+		query.queryCount = 16;
+		if (device.createQueryPool(&query, nullptr, &g_ssr.pool) != vk::Result::eSuccess) g_ssr.pool = nullptr;
+		g_ssr.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		g_ssr.failed    = false;
+	}
+	if (g_ssr.out.image.image != nullptr && g_ssr.render == render && g_ssr.level == level) return true;
+	const vk::Extent2D trace = level >= 2 ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
+	const std::array<SsgiImage*, 10> all {&g_ssr.raw, &g_ssr.tmp_a, &g_ssr.tmp_b, &g_ssr.out, &g_ssr.mat, &g_ssr.hit,
+	                                      &g_ssr.history[0], &g_ssr.history[1], &g_ssr.gbuf[0], &g_ssr.gbuf[1]};
+	for (auto* img : all)
+		SsgiFreeImage(graphics, *img);
+	bool ok = SsgiMakeImage(graphics, g_ssr.out, render);
+	for (auto* img : all)
+		if (img != &g_ssr.out) ok = ok && SsgiMakeImage(graphics, *img, trace);
+	if (!ok) {
+		for (auto* img : all)
+			SsgiFreeImage(graphics, *img);
+		g_ssr.failed = true;
+		return false;
+	}
+	g_ssr.render        = render;
+	g_ssr.level         = level;
+	g_ssr.trace         = trace;
+	g_ssr.history_valid = false;
+	return true;
+}
+
+void SsrReadTiming() {
+	if (g_ssr.pool == nullptr || g_graphics_ctx == nullptr) return;
+	while (g_ssr.read + 4 <= g_ssr.written) {
+		const auto entry = static_cast<uint32_t>(g_ssr.read % 8);
+		std::array<uint64_t, 2> stamps {};
+		if (g_graphics_ctx->device.getQueryPoolResults(g_ssr.pool, entry * 2, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		                                               vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
+			break;
+		g_ssr.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_ssr.period_ns / 1e6;
+		++g_ssr.samples;
+		++g_ssr.read;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_ssr.last_log >= std::chrono::seconds(5) && g_ssr.samples > 0) {
+		std::printf("SSR: GPU %.3f ms (mean of %u frames)\n", g_ssr.sum_ms / g_ssr.samples, g_ssr.samples);
+		std::fflush(stdout);
+		g_ssr.sum_ms   = 0.0;
+		g_ssr.samples  = 0;
+		g_ssr.last_log = now;
+	}
+}
+
+// World up (KYTY_SSR_UP) in view space: View = P^-1 * view_proj (column vectors; P's column form is the transpose of
+// the row-vector view_to_clip).
+bool SsrUpInView(const std::array<float, 16>& m, std::array<float, 3>& up) {
+	std::array<float, 16> vp {};
+	{
+		std::lock_guard lock(g_ssr_gb.mutex);
+		if (!g_ssr_gb.have_vp || g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.vp_flip + 4) return false;
+		vp = g_ssr_gb.view_proj;
+	}
+	static const std::pair<int, float> axis = [] {
+		const char* value = std::getenv("KYTY_SSR_UP");
+		std::string v     = value != nullptr ? value : "y";
+		float       sign  = 1.0f;
+		if (!v.empty() && v[0] == '-') sign = -1.0f, v.erase(0, 1);
+		const int a = v == "x" ? 0 : v == "z" ? 2 : 1;
+		return std::pair<int, float> {a, sign};
+	}();
+	std::array<float, 16> pc {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
+	std::array<double, 16> pinv {};
+	if (!Inverse4(pc, pinv)) return false;
+	double d[3] {};
+	for (int i = 0; i < 3; ++i)
+		for (int k = 0; k < 4; ++k) d[i] += pinv[i * 4 + k] * vp[k * 4 + axis.first];
+	const double n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+	if (!(n > 1e-9) || !std::isfinite(n)) return false;
+	for (int i = 0; i < 3; ++i) up[i] = static_cast<float>(axis.second * d[i] / n);
+	return true;
+}
+
+bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
+	const int level = SsrLevel();
+	if (level == 0) return false; // off: nothing created or recorded
+	if (g_graphics_ctx == nullptr) return false;
+	if (VideoOut::MoviePlaying()) {
+		g_ssr.history_valid = false;
+		return false;
+	}
+	const auto& color = inputs.color;
+	if (color.view == nullptr || inputs.depth.view == nullptr || inputs.motion.view == nullptr || color.extent.width < 16 ||
+	    color.extent.height < 16)
+		return false;
+	const auto& m = inputs.view_to_clip;
+	if (!(m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f))) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("SSR: skipped (no camera projection from the upscaler)\n");
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	if (!SsrEnsure(*g_graphics_ctx, color.extent, level)) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("SSR: off (could not create its pipeline or images)\n");
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	const bool have_material = inputs.material.view != nullptr && inputs.material_channel >= 0 && inputs.material_channel < 4 &&
+	                           inputs.material.extent == color.extent;
+	const int source = have_material ? SsrChoice().slot * 4 + inputs.material_channel : -1;
+	if (source != g_ssr.source) {
+		static uint32_t reports = 0;
+		if (reports++ < 16) {
+			static const char channels[] = "rgba";
+			if (have_material)
+				std::printf("SSR: level %d, roughness source G-buffer RT%d.%c (%s, %s)\n", level, SsrChoice().slot,
+				            channels[inputs.material_channel], SsrFormatName(inputs.material.format),
+				            inputs.material_gloss ? "gloss: roughness = 1 - value" : "roughness");
+			else
+				std::printf("SSR: level %d, roughness source heuristic (depth-derived up-facing normals + low local variance + low "
+				            "luminance; HEURISTIC)%s\n",
+				            level, SsrChoice().slot >= 0 ? " - KYTY_SSR_GBUF target not usable this frame" : "");
+			std::fflush(stdout);
+		}
+		g_ssr.source = source;
+	}
+	std::array<float, 3> up {};
+	const bool           have_up = SsrUpInView(m, up);
+
+	const float strength = SsgiEnv("KYTY_SSR_STRENGTH", 1.0f, 2.0f);
+	const float thick    = std::max(SsgiEnv("KYTY_SSR_THICKNESS", 0.25f, 4.0f), 0.01f);
+	SsrPush     push {};
+	push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
+	push.depth_map[0] = m[10], push.depth_map[1] = m[14], push.depth_map[2] = m[11], push.depth_map[3] = m[15];
+	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
+	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
+	push.trace[0] = static_cast<float>(g_ssr.trace.width), push.trace[1] = static_cast<float>(g_ssr.trace.height);
+	push.trace[2] = strength, push.trace[3] = level >= 3 ? 60.0f : level >= 2 ? 40.0f : 25.0f;
+	push.extra[1] = static_cast<float>(std::max(inputs.material_channel, 0));
+	push.extra[2] = inputs.material_gloss ? 1.0f : 0.0f;
+	push.extra[3] = thick;
+	push.up[0] = up[0], push.up[1] = up[1], push.up[2] = up[2];
+	{
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("SSR: on (level %d, trace %ux%u, strength %g, thickness %g, up %s)\n", level, g_ssr.trace.width,
+			            g_ssr.trace.height, strength, thick, have_up ? "from the camera" : "unknown (|view y| assumed)");
+			std::fflush(stdout);
+		}
+	}
+	SsrReadTiming();
+	const auto entry = static_cast<uint32_t>(g_ssr.written % 8);
+	const bool timed = g_ssr.pool != nullptr;
+	if (timed) {
+		command.resetQueryPool(g_ssr.pool, entry * 2, 2);
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_ssr.pool, entry * 2);
+	}
+	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
+	                        vk::AccessFlags2 dst) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = src_stage;
+		barrier.srcAccessMask = src;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	auto& g = g_ssr;
+	for (auto* img : {&g.raw, &g.tmp_a, &g.tmp_b, &g.out, &g.mat, &g.hit, &g.history[0], &g.history[1], &g.gbuf[0], &g.gbuf[1]})
+		if (img->image.state.layout != vk::ImageLayout::eGeneral)
+			Transition(command, img->image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+			           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+	       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	const uint32_t cur  = g.frame & 1u;
+	const uint32_t prev = cur ^ 1u;
+	push.misc[1] = static_cast<int32_t>(g.frame);
+	push.misc[2] = level;
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g.history_valid ? 2 : 0) | (have_material ? 4 : 0) | (have_up ? 8 : 0);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
+	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout,
+	                     const SsgiImage& aux_in, const SsgiImage& aux_out, const SsgiImage& mat_in, const SsgiImage& mat_out,
+	                     float step, vk::Extent2D size) {
+		const vk::Sampler       lin = g.linear, pt = g.point;
+		vk::DescriptorImageInfo infos[SsrBindings] {};
+		infos[0]  = {lin, color.view, color.layout};
+		infos[1]  = {pt, inputs.depth.view, inputs.depth.layout};
+		infos[2]  = {pt, inputs.motion.view, inputs.motion.layout};
+		infos[3]  = {lin, a.view, vk::ImageLayout::eGeneral};
+		infos[4]  = {lin, b.view, vk::ImageLayout::eGeneral};
+		infos[5]  = {pt, g.gbuf[cur].view, vk::ImageLayout::eGeneral};
+		infos[6]  = {pt, g.gbuf[prev].view, vk::ImageLayout::eGeneral};
+		infos[7]  = {nullptr, out.view, vk::ImageLayout::eGeneral};
+		infos[8]  = {nullptr, gout.view, vk::ImageLayout::eGeneral};
+		infos[9]  = {pt, aux_in.view, vk::ImageLayout::eGeneral};
+		infos[10] = {nullptr, aux_out.view, vk::ImageLayout::eGeneral};
+		infos[11] = have_material ? vk::DescriptorImageInfo {pt, inputs.material.view, inputs.material.layout}
+		                          : vk::DescriptorImageInfo {pt, color.view, color.layout};
+		infos[12] = {pt, mat_in.view, vk::ImageLayout::eGeneral};
+		infos[13] = {nullptr, mat_out.view, vk::ImageLayout::eGeneral};
+		vk::WriteDescriptorSet writes[SsrBindings] {};
+		for (uint32_t i = 0; i < SsrBindings; ++i) {
+			writes[i].dstBinding      = i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType  = SsrSampled(i) ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			writes[i].pImageInfo      = &infos[i];
+		}
+		push.misc[0]  = mode;
+		push.extra[0] = step;
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, SsrBindings, writes);
+		command.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	};
+	// (Bindings a mode does not write still need a valid storage image: tmp_b is the scratch target; tmp_a the unread
+	// sampled one.)
+	run(0, g.tmp_a, g.tmp_a, g.raw, g.gbuf[cur], g.tmp_a, g.hit, g.tmp_a, g.mat, 0.0f, g.trace);                 // trace
+	run(1, g.raw, g.history[prev], g.history[cur], g.tmp_b, g.hit, g.tmp_b, g.mat, g.tmp_b, 0.0f, g.trace);      // temporal
+	const SsgiImage* src     = &g.history[cur];
+	const SsgiImage* ping[2] = {&g.tmp_a, &g.raw};
+	const int        passes  = level >= 3 ? 4 : level >= 2 ? 3 : 2;
+	for (int i = 0; i < passes; ++i) {
+		const SsgiImage* dst = ping[i & 1];
+		run(2, *src, g.tmp_b, *dst, g.tmp_b, g.hit, g.tmp_b, g.mat, g.tmp_b, static_cast<float>(1 << i), g.trace);
+		src = dst;
+	}
+	run(4, *src, g.tmp_b, g.out, g.tmp_b, g.hit, g.tmp_b, g.mat, g.tmp_b, 0.0f, g.render);                       // composite
+	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
+	       vk::AccessFlagBits2::eMemoryRead);
+	if (timed) {
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g.pool, entry * 2 + 1);
+		++g.written;
+	}
+	++g.frame;
+	g.history_valid = true;
+	inputs.color.image  = g.out.image.image;
+	inputs.color.view   = g.out.view;
+	inputs.color.layout = vk::ImageLayout::eGeneral;
+	inputs.color.format = vk::Format::eR16G16B16A16Sfloat;
+	inputs.color.usage  = g.out.image.usage;
+	inputs.color.level  = 0;
+	inputs.color.layer  = 0;
+	return true;
+}
+} // namespace
+
+bool SsrWanted() { return SsrLevel() > 0; }
+
+void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
+	if (!IsGbufferVertexShader(vs_hash) || srt.size() < SrtViewProj + 16) return;
+	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
+	std::lock_guard lock(g_ssr_gb.mutex);
+	if (g_ssr_gb.vp_flip == flip) return; // (the frame's first G-buffer draw)
+	std::array<float, 16> vp {};
+	for (uint32_t i = 0; i < 16; ++i) {
+		vp[i] = AsFloat(srt[SrtViewProj + i]);
+		if (!std::isfinite(vp[i])) return;
+	}
+	g_ssr_gb.view_proj = vp;
+	g_ssr_gb.have_vp   = true;
+	g_ssr_gb.vp_flip   = flip;
+}
+
+void OnSsrGbuffer(uint64_t vs_hash, uint64_t ps_hash, std::span<const SsrTarget> targets) {
+	if (targets.empty()) return;
+	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
+	std::lock_guard lock(g_ssr_gb.mutex);
+	const uint32_t n = static_cast<uint32_t>(std::min<size_t>(targets.size(), g_ssr_gb.targets.size()));
+	// The layout with the most targets wins (the main G-buffer pass; the decals bind fewer).
+	if (!(g_ssr_gb.valid && g_ssr_gb.flip == flip && g_ssr_gb.count > n)) {
+		for (uint32_t i = 0; i < n; ++i) g_ssr_gb.targets[i] = targets[i];
+		g_ssr_gb.count = n;
+		g_ssr_gb.flip  = flip;
+		g_ssr_gb.valid = true;
+	}
+	const auto key = std::make_pair(vs_hash, ps_hash);
+	if (g_ssr_gb.logged.size() >= 24 || std::find(g_ssr_gb.logged.begin(), g_ssr_gb.logged.end(), key) != g_ssr_gb.logged.end()) return;
+	g_ssr_gb.logged.push_back(key);
+	std::string line;
+	char        buf[160];
+	for (uint32_t i = 0; i < n; ++i) {
+		const auto& t = targets[i];
+		std::snprintf(buf, sizeof(buf), " RT%u %s(%d) %ux%u @0x%llx;", i, SsrFormatName(t.view.format), static_cast<int>(t.view.format),
+		              t.width, t.height, static_cast<unsigned long long>(t.address));
+		line += buf;
+	}
+	std::printf("SSR: G-buffer draw VS %016llx PS %016llx:%s\n", static_cast<unsigned long long>(vs_hash),
+	            static_cast<unsigned long long>(ps_hash), line.c_str());
+	std::fflush(stdout);
+}
+
+void OnSsrDispatch(uint64_t cs_hash, std::span<const uint64_t> addresses, std::span<const vk::Format> formats) {
+	std::lock_guard lock(g_ssr_gb.mutex);
+	if (!g_ssr_gb.valid || g_ssr_gb.consumers.size() >= 32) return;
+	if (std::find(g_ssr_gb.consumers.begin(), g_ssr_gb.consumers.end(), cs_hash) != g_ssr_gb.consumers.end()) return;
+	std::string line;
+	char        buf[128];
+	uint32_t    hits = 0;
+	for (size_t s = 0; s < addresses.size(); ++s)
+		for (uint32_t i = 0; i < g_ssr_gb.count; ++i)
+			if (addresses[s] != 0 && addresses[s] == g_ssr_gb.targets[i].address) {
+				std::snprintf(buf, sizeof(buf), " slot %zu <- RT%u (%s);", s, i, SsrFormatName(s < formats.size() ? formats[s] : vk::Format::eUndefined));
+				line += buf;
+				++hits;
+			}
+	if (hits < 2) return; // (a consumer of the G-buffer reads several of its targets: the deferred lighting)
+	g_ssr_gb.consumers.push_back(cs_hash);
+	std::printf("SSR: G-buffer consumer CS %016llx (%u of %u targets):%s\n", static_cast<unsigned long long>(cs_hash), hits,
+	            g_ssr_gb.count, line.c_str());
+	std::fflush(stdout);
+}
+
+bool SsrMaterial(SsrTarget& target, int& channel, bool& gloss) {
+	const auto& choice = SsrChoice();
+	if (choice.slot < 0) return false;
+	std::lock_guard lock(g_ssr_gb.mutex);
+	if (!g_ssr_gb.valid || static_cast<uint32_t>(choice.slot) >= g_ssr_gb.count) return false;
+	if (g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.flip + 600) return false; // (not seen for ~10 s)
+	const auto& t = g_ssr_gb.targets[choice.slot];
+	if (!SsrFormatUsable(t.view.format) || t.address == 0) return false;
+	target  = t;
+	channel = choice.channel;
+	gloss   = choice.gloss;
+	return true;
+}
+
+namespace {
 // KYTY_CONTACT_SHADOWS=0|1|2|3 ("Sombras RT": No / Normal / Alta / Ultra; cshadow.comp): screen-space contact shadows
 // toward the sun, recorded after SSGI and before the upscaler. 1: half-res trace, 16 steps, temporal + a-trous 1, 2;
 // 2: full res, 24 steps, a-trous 1, 2, 4; 3: full res, 56 steps, longest ray (x1.5), binary-search hit refine, temporal
@@ -5167,6 +5690,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	if (g_graphics_ctx == nullptr && inputs.graphics != nullptr) g_graphics_ctx = inputs.graphics;
 	SsgiApply(command, inputs); // (KYTY_SSGI: inputs.color becomes the composited copy)
 	GtaoApply(command, inputs); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
+	SsrApply(command, inputs); // (KYTY_SSR: likewise, after GTAO; nothing when off)
 	CShadowApply(command, inputs); // (KYTY_CONTACT_SHADOWS: likewise, after SSGI)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);

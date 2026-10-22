@@ -229,6 +229,11 @@ struct UpscaleInputs {
 	std::array<float, 16> view_to_clip {};                // row vectors (p' = p * M)
 	float        near_plane = 0.1f, far_plane = 3000.0f;
 	GraphicContext* graphics = nullptr;                    // the renderer's (SSGI, FSR, sharpening when nothing else set it)
+	// KYTY_SSR with KYTY_SSR_GBUF: the game's G-buffer target holding roughness / gloss (read only; no view: none),
+	// the channel (0..3) and whether it is gloss (1 - roughness).
+	UpscaleImage material;
+	int32_t      material_channel = -1;
+	bool         material_gloss   = false;
 };
 // Streamline offers DLSS super resolution on this device.
 [[nodiscard]] bool UpscalerReady();
@@ -254,6 +259,26 @@ void OnShadowConsumer(uint64_t cs_hash, const ShadowConsumer& consumer, std::spa
 // layer of a shadow-map array (square, >= 512, >= 4 layers) and it has no color target; such vertex shaders are learned,
 // and the table / native-record paths' draws of them read too. Their orthographic view-projection's depth row is the sun.
 void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt, bool shadow_target);
+
+// KYTY_SSR=1|2|3 ("Reflejos RT": Normal / Alta / Ultra): screen-space reflections before the upscaler (in Upscale).
+// Everything below runs only while SsrWanted() (KYTY_SSR > 0), and only reads.
+[[nodiscard]] bool SsrWanted();
+// A G-buffer draw's vertex SRT (any path): the camera's view-projection for the up direction of the heuristic mask.
+void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt);
+// A G-buffer vertex shader's draw on the normal path: its color targets (the G-buffer layout, logged; the one
+// KYTY_SSR_GBUF names is the roughness source).
+struct SsrTarget {
+	ImageId       id;
+	uint64_t      address = 0;
+	uint32_t      width = 0, height = 0;
+	ImageViewInfo view;
+};
+void OnSsrGbuffer(uint64_t vs_hash, uint64_t ps_hash, std::span<const SsrTarget> targets);
+// A dispatch's sampled / storage images (renderCompute.cpp): one reading the G-buffer targets is logged (the deferred
+// lighting's consumer: which of its slots reads which target).
+void OnSsrDispatch(uint64_t cs_hash, std::span<const uint64_t> addresses, std::span<const vk::Format> formats);
+// The roughness source for this frame (renderSuperResolution.cpp): false = the heuristic mask.
+[[nodiscard]] bool SsrMaterial(SsrTarget& target, int& channel, bool& gloss);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics
