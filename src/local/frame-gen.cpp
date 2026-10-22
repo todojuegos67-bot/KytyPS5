@@ -927,7 +927,13 @@ void BypassCommandHooks(vk::Device device) {
 #endif
 }
 
+namespace { int SsgiQuality(); }
 void Initialize() {
+	{
+		const char* ssgi = std::getenv("KYTY_SSGI");
+		std::printf("SSGI: KYTY_SSGI=%s read (quality %d)\n", ssgi != nullptr ? ssgi : "(unset)", SsgiQuality());
+		std::fflush(stdout);
+	}
 	const char* value = std::getenv("KYTY_FRAMEGEN");
 	g_generate        = value != nullptr ? std::clamp(std::atoi(value), 0, 5) : 0;
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -3627,8 +3633,8 @@ void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float
 namespace {
 // KYTY_SSGI=0|1|2 (ssgi.comp): screen-space ray-traced GI + AO on the PS5 Pro path's render-resolution color, recorded
 // right before the upscaler (DLSS / XeSS / FSR), which then reads our composited copy in place of the game's color, so
-// the upscaler and frame generation see it. 1: half-resolution trace, 2: full. KYTY_SSGI_INTENSITY (0.6), KYTY_SSGI_AO
-// (0.5). Normals from depth derivatives; view positions from the game's view_to_clip (handles reverse-Z).
+// the upscaler and frame generation see it. 1: half-resolution trace, 2: full. KYTY_SSGI_INTENSITY (1.0), KYTY_SSGI_AO
+// (0.6). Normals from depth derivatives; view positions from the game's view_to_clip (handles reverse-Z).
 struct SsgiImage {
 	VulkanImage   image;
 	vk::ImageView view = nullptr;
@@ -3812,7 +3818,16 @@ void SsgiReadTiming() {
 // Records the effect; on success `color` is replaced by our composited rgba16f image (general layout).
 bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const int quality = SsgiQuality();
-	if (quality == 0 || g_graphics_ctx == nullptr) return false;
+	const auto skip = [](const char* why) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("SSGI: skipped at the first upscaler frame (%s)\n", why);
+			std::fflush(stdout);
+		}
+	};
+	if (quality == 0) return skip("KYTY_SSGI is 0 or unset"), false;
+	if (g_graphics_ctx == nullptr) return skip("no graphics context"), false;
 	if (VideoOut::MoviePlaying()) {
 		g_ssgi.history_valid = false;
 		return false;
@@ -3820,7 +3835,7 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const auto& color = inputs.color;
 	if (color.view == nullptr || inputs.depth.view == nullptr || inputs.motion.view == nullptr || color.extent.width < 16 ||
 	    color.extent.height < 16)
-		return false;
+		return skip("missing color/depth/motion view"), false;
 	if (!SsgiEnsure(*g_graphics_ctx, color.extent, quality)) {
 		static bool said = false;
 		if (!said) {
@@ -3830,8 +3845,8 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 		return false;
 	}
-	const float intensity = SsgiEnv("KYTY_SSGI_INTENSITY", 0.6f, 4.0f);
-	const float ao        = SsgiEnv("KYTY_SSGI_AO", 0.5f, 1.0f);
+	const float intensity = SsgiEnv("KYTY_SSGI_INTENSITY", 1.0f, 4.0f);
+	const float ao        = SsgiEnv("KYTY_SSGI_AO", 0.6f, 1.0f);
 	const auto& m         = inputs.view_to_clip;
 	SsgiPush    push {};
 	const bool  have_proj = m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f);
