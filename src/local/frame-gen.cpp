@@ -1970,6 +1970,10 @@ void SetStaticRect(float x0, float y0, float x1, float y1) {
 std::atomic<uint32_t> g_cam_seen[3] {}; // normal, table, native record
 std::atomic<uint32_t> g_cam_short {};
 
+std::mutex            g_last_vp_mutex; // (KYTY_CONTACT_SHADOWS: the last captured camera, any frame)
+std::array<float, 16> g_last_vp {};
+bool                  g_have_last_vp = false;
+
 void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt, char path) {
 	if (g_camera.valid || !IsGbufferVertexShader(vs_hash)) {
 		return;
@@ -1991,6 +1995,10 @@ void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt, char path) {
 	}
 	g_camera.jitter_ndc = {AsFloat(srt[SrtJitter]), AsFloat(srt[SrtJitter + 1])};
 	g_camera.valid      = true;
+	{
+		std::lock_guard lock(g_last_vp_mutex);
+		g_last_vp = g_camera.view_proj, g_have_last_vp = true;
+	}
 }
 
 // KYTY_SHADER_CENSUS=1: every program the game runs (vertex, pixel, compute) with the first and last guest flip it ran
@@ -4374,8 +4382,11 @@ void OnShadowConsumer(uint64_t cs_hash, const ShadowConsumer& consumer, std::spa
 		if (bytes == 0 || !Libs::LibKernel::Memory::TryReadBackingToHost(consumer.buffer_address[i], words.data(), bytes)) continue;
 		FindOrthoAxes(words, axes);
 	}
-	const bool camera = g_camera.valid;
-	if (camera) g_sun.view_proj = g_camera.view_proj, g_sun.have_camera = true;
+	bool camera = false;
+	{
+		std::lock_guard vp_lock(g_last_vp_mutex);
+		if (g_have_last_vp) g_sun.view_proj = g_last_vp, g_sun.have_camera = camera = true;
+	}
 	if (g_sun.have_camera)
 		axes.erase(std::remove_if(axes.begin(), axes.end(), [&](const auto& a) { return CameraForwardReject(a, g_sun.view_proj) != 0; }),
 		           axes.end());
@@ -4587,6 +4598,11 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const auto& m = inputs.view_to_clip;
 	if (!(m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f)))
 		return said_once("no camera projection (view_to_clip)"), false;
+	{
+		// No light known: nothing recorded at all (no images made, no writes, no history).
+		std::lock_guard lock(g_sun.mutex);
+		if (!g_sun.valid) return g_cs.history_valid = false, said_once("no sun direction yet: the pass is skipped"), false;
+	}
 	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality)) return said_once("could not create its pipeline or images"), false;
 
 	// The light candidates in view space.

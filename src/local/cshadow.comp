@@ -131,7 +131,7 @@ void Trace(ivec2 pixel) {
 	float ndl = dot(n, l);
 	// Surfaces facing away are the game's own lighting's business (no contact shadow there), and far ones fade out.
 	float v = (ndl <= 0.02 || abs(p.z) > 90.0) ? 1.0 : March(p, n, l, pixel);
-	imageStore(out_img, pixel, vec4(v));
+	imageStore(out_img, pixel, vec4(isnan(v) ? 1.0 : clamp(v, 0.0, 1.0)));
 }
 
 void Temporal(ivec2 pixel) {
@@ -252,8 +252,11 @@ void Composite(ivec2 pixel) {
 		imageStore(out_img, pixel, col);
 		return;
 	}
-	float vis = clamp(Upsample(uv, z), 0.0, 1.0);
-	imageStore(out_img, pixel, vec4(col.rgb * mix(1.0, vis, amt), col.a));
+	float vis = Upsample(uv, z);
+	vis = (isnan(vis) || isinf(vis)) ? 1.0 : clamp(vis, 0.0, 1.0);
+	vec3 rgb = col.rgb * mix(1.0, vis, clamp(amt, 0.0, 1.0));
+	if (any(isnan(rgb)) || any(isinf(rgb))) rgb = col.rgb;
+	imageStore(out_img, pixel, vec4(max(rgb, vec3(0)), col.a));
 }
 
 shared uint s_vote[16];
