@@ -36,7 +36,7 @@ struct DynMultiplier {
 	static double MinReal(int m) { return m <= 2 ? 30.0 : m == 3 ? 40.0 : m == 4 ? 45.0 : 50.0; }
 
 	double Estimate(int m, double base_real, int base_m) const {
-		if (free[m] > 0.0 && age[m] < 30) return free[m];
+		if (free[m] > 0.0 && age[m] < 10) return free[m]; // (recent only: the scene moves on)
 		const double c = cost > 0.0 ? cost : 0.08 / std::max(base_real, 1.0);
 		return 1.0 / (1.0 / std::max(base_real, 1.0) + c * (m - base_m));
 	}
@@ -66,6 +66,9 @@ struct DynMultiplier {
 		// Measure: an EMA of the free rate (a window on the cap is only a lower bound).
 		if (!on_cap || free[m] < real) free[m] = (free[m] > 0.0 && age[m] < 30 && !on_cap) ? 0.5 * free[m] + 0.5 * real : real;
 		age[m]    = 0;
+		// A higher level's stored rate far under what this level measures now was learned in another scene: dropped.
+		for (int k = m + 1; k <= kMax; ++k)
+			if (free[k] > 0.0 && free[k] < 0.75 * real) free[k] = 0.0;
 		last_free = free[m];
 		auto go = [&](int to) {
 			settle = 1;

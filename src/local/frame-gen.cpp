@@ -1483,11 +1483,12 @@ bool TaaReplaceWanted() {
 
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 // 10-22: the dynamic multiplier's Reflex cap: real <= target / (gen + 1), so shown <= target (G-Sync range).
+// gen < 0: no limit (DLSS-G off: menus, movies, loading; x1 is not held to the last multiplier's target / m).
 void DynApplyReflexLimit(int gen) {
-	const uint32_t us = static_cast<uint32_t>(1000000.0 * (gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0));
+	const uint32_t us = gen < 0 ? 0u : static_cast<uint32_t>(1000000.0 * (gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0));
 	if (g_reflex_opts.frameLimitUs == us) return;
 	g_reflex_opts.frameLimitUs = us;
-	g_real_interval            = static_cast<double>(gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0);
+	g_real_interval            = gen < 0 ? 0.0 : static_cast<double>(gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0);
 	if (const auto result = g_api.reflex_set_options(g_reflex_opts); result != sl::Result::eOk)
 		LOGF("frame generation: slReflexSetOptions (dynamic limit) failed (%d)\n", static_cast<int>(result));
 }
@@ -1589,6 +1590,8 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	run_with           = usable ? run_with + 1 : 0;
 	run_without        = usable ? 0 : run_without + 1;
 	const bool mode_on = g_mode_set == 1 ? run_without < 30 : run_with >= 10;
+	// 10-22: the dynamic Reflex limit is target / m of the current m while DLSS-G is on, none while it is off.
+	if (g_dlssg_dynamic) DynApplyReflexLimit(mode_on ? g_dyn_gen : -1);
 	// DLSS-G options; sizes are hints for its allocations.
 	if (!g_options_set || g_mode_set != (mode_on ? 1 : 0) || g_options_format != format ||
 	    (usable && (g_options_backbuffer != backbuffer || g_options_render != inputs->render_extent))) {
