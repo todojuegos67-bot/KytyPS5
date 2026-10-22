@@ -140,9 +140,9 @@ float EnvFloat(const char* name, float fallback) {
 // AMD-side multi frame generation (patched amd_fidelityfx_vk.dll, tools/local/fsr3-mfg: frame k of N-1 interpolated
 // at t = k / N, presents paced 1 / N of the real frame time). KYTY_FSR3_MFG=N (2..4) is the multiplier (it sets
 // KYTY_FSR3_FG_FRAMES = N - 1 for the DLL, read when it makes the swapchain). KYTY_FSR3_DYNAMIC=1: the multiplier
-// (2..max, max = KYTY_FSR3_MFG, default 4) picked once a second: the largest N with free real fps x N under the
-// target (KYTY_FSR3_TARGET_FPS, default refresh - refresh^2 / 3600), one more when its real limit target / (N + 1)
-// costs at most 10% of the free real fps; changed after two windows in a row; real frames limited to target / N.
+// (2..max, max = KYTY_FSR3_MFG, default 4; the patched DLL holds 3 generated frames at most) picked once a second:
+// the largest N with real fps x N <= the target (KYTY_FSR3_TARGET_FPS, default refresh - refresh^2 / 3600), with
+// hysteresis (10-22, MfgUpdate; no flip floor); real frames limited to target / N.
 // The DLL reads KYTY_FSR3_FG_ACTIVE (generated frames, 1..max) on every present. Both unset: nothing changes.
 struct Mfg {
 	bool   on = false, dynamic = false;
@@ -151,6 +151,8 @@ struct Mfg {
 	int    pending = 0, pending_n = 0;
 	double target = 0.0;  // shown fps target (dynamic)
 	double slept  = 0.0;  // seconds the limiter waited in this window
+	double smooth = 0.0;  // 10-22: smoothed real fps
+	int    up_n = 0, pinned_n = 0, noup_s = 0; // 10-22: hysteresis windows (as DLSS-G's dynamic multiplier)
 	int    flip_fps = 0;  // 10-21: the game's own flip floor for this multiplier (VideoOut::SetDynamicFlipFps)
 } g_mfg;
 
@@ -218,28 +220,43 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
 	const double free = frames / busy;
 	g_mfg.slept       = 0.0;
 	if (g_mfg.dynamic && frames > 0) {
-		const bool cinematic = Libs::VideoOut::CinematicPlaying();
-		int cand = std::clamp(static_cast<int>(std::floor(g_mfg.target / std::max(free, 1.0))), 2, g_mfg.max);
-		if (cand < g_mfg.max && !cinematic) {
-			// One more only where the vblank has an even rate for it (840 Hz: x4 at 56); else as it is (x3 at 60).
-			const int reach = Libs::VideoOut::ReachFps(g_mfg.target, cand + 1);
-			if (reach > 0 && reach >= 0.9 * free) cand++;
-		}
-		// Held by the flip floor (free = the floor's rate): keep the multiplier unless the game falls clearly under it.
-		if (!cinematic && g_mfg.flip_fps > 0 && cand < g_mfg.current && free >= 0.95 * g_mfg.flip_fps) cand = g_mfg.current;
-		if (cinematic) cand = std::min(cand, 3);
-		if (cand == g_mfg.current) {
-			g_mfg.pending_n = 0;
-		} else if (cand == g_mfg.pending) {
-			if (++g_mfg.pending_n >= 2) {
-				g_mfg.current   = cand;
-				g_mfg.pending_n = 0;
-				MfgSetActive(cand);
-				MfgApplyFlipFloor(cand);
+		// 10-22: no flip floor (the real rate is never held to reach a multiplier). The largest m (2..max; the patched
+		// DLL holds at most 3 generated frames, x4) with real * m <= target: up after real * (m + 1) <= 0.97 target for
+		// 2 windows (smoothed), down at once past 1.02 target; real capped at target / m (CapInterval). Sitting on that
+		// cap 2 windows: one step down (the game may run faster), no step up for 10 s.
+		const bool   cinematic = Libs::VideoOut::CinematicPlaying();
+		const double T         = g_mfg.target;
+		const int    maxm      = cinematic ? std::min(3, g_mfg.max) : g_mfg.max;
+		g_mfg.smooth           = g_mfg.smooth <= 0.0 ? real : 0.5 * g_mfg.smooth + 0.5 * real;
+		if (g_mfg.noup_s > 0) --g_mfg.noup_s;
+		int next       = std::min(g_mfg.current, maxm);
+		g_mfg.pinned_n = real >= 0.98 * T / g_mfg.current ? g_mfg.pinned_n + 1 : 0;
+		if (real * next > 1.02 * T) {
+			next       = std::clamp(static_cast<int>(std::floor(T / std::max(real, 1.0))), 2, next);
+			g_mfg.up_n = 0;
+		} else if (g_mfg.pinned_n >= 2 && next > 2 && !cinematic) {
+			next           = next - 1;
+			g_mfg.pinned_n = 0;
+			g_mfg.noup_s   = 10;
+			g_mfg.up_n     = 0;
+		} else if (next < maxm && g_mfg.noup_s == 0 && g_mfg.smooth * (next + 1) <= 0.97 * T) {
+			if (++g_mfg.up_n >= 2) {
+				next       = std::clamp(static_cast<int>(std::floor(0.97 * T / std::max(g_mfg.smooth, 1.0))), next + 1, maxm);
+				g_mfg.up_n = 0;
 			}
 		} else {
-			g_mfg.pending   = cand;
-			g_mfg.pending_n = 1;
+			g_mfg.up_n = 0;
+		}
+		(void)free;
+		if (next != g_mfg.current) {
+			g_mfg.current  = next;
+			g_mfg.pinned_n = 0;
+			MfgSetActive(next);
+			if (g_mfg.flip_fps != 0) {
+				Libs::VideoOut::SetDynamicFlipFps(0);
+				g_mfg.flip_fps = 0;
+			}
+			std::printf("[dyn] x%d: real %.1f fps, shown %.1f (target %.0f)\n", next, real, std::min(real * next, T), T);
 		}
 	}
 	std::printf("[fsr3-mfg] x%d%s; real %.1f fps (free %.1f), shown %.1f fps\n", g_mfg.current, g_mfg.dynamic ? " dynamic" : "",
