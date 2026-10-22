@@ -413,6 +413,7 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 	for (uint32_t i = 0; i < 16; i++) inputs.view_to_clip[i] = Word(packet, ViewToClipWord + i);
 	inputs.near_plane = Word(packet, NearWord);
 	inputs.far_plane  = Word(packet, FarWord);
+	inputs.graphics   = &m_context.GetGraphics();
 	// The exposure: the float the 1x1 32-bit float texture of slot 5 holds (the game's constants), read as a buffer.
 	ShaderTextureResource exposure_texture {};
 	std::memcpy(exposure_texture.fields, packet.textures[SlotExposure], sizeof(exposure_texture.fields));

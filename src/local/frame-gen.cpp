@@ -3952,6 +3952,8 @@ bool SsgiWanted() { return SsgiQuality() > 0; }
 
 bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	UpscaleInputs inputs = inputs_in;
+	// (The DLSS-G hudless path sets the context in PrepareInputs; the PS5 Pro path alone needs the renderer's.)
+	if (g_graphics_ctx == nullptr && inputs.graphics != nullptr) g_graphics_ctx = inputs.graphics;
 	SsgiApply(command, inputs); // (KYTY_SSGI: inputs.color becomes the composited copy)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
