@@ -103,6 +103,7 @@ int      g_dyn_up_s        = 0;   // windows in a row the next multiplier fit un
 int      g_dyn_pinned_s    = 0;   // windows in a row the real rate sat at our Reflex cap
 int      g_dyn_noup_s      = 0;   // windows left without switching up (after a step down off the cap)
 Kyty::Local::DynMultiplier g_dyn_dm; // 10-22: the free-rate multiplier choice
+int      g_dyn_flip_asked  = -1;  // the last rate asked of SetDynamicFlipFps (-1: none since a clear)
 int      g_dyn_flip_fps    = 0;   // 10-21: the game's own flip floor held for the extra frame (VideoOut::SetDynamicFlipFps)
 
 // The flip floor for `gen` generated frames: the reach rate when gen + 1 at 60 passes the target, else none.
@@ -111,7 +112,10 @@ void DynApplyFlipFloor(int gen) {
 	const int want = 60.0 * n > static_cast<double>(g_dlssg_target_fps) + 0.5
 	                     ? VideoOut::ReachFps(static_cast<double>(g_dlssg_target_fps), n)
 	                     : 0;
-	const int fps  = VideoOut::SetDynamicFlipFps(want >= 60 ? 0 : want);
+	// (asked again only on a change: a refusal is printed once, not per present)
+	if ((want >= 60 ? 0 : want) == g_dyn_flip_asked) return;
+	g_dyn_flip_asked = want >= 60 ? 0 : want;
+	const int fps    = VideoOut::SetDynamicFlipFps(g_dyn_flip_asked);
 	if (fps != g_dyn_flip_fps) {
 		if (fps > 0) std::printf("[dyn] x%d: game flips at %d (gameplay)\n", n, fps);
 		else std::printf("[dyn] x%d: game flips at 60\n", n);
@@ -1542,10 +1546,28 @@ uint32_t DlssgReflexLimitUs(double interval) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 // 10-22: the dynamic multiplier's Reflex cap: real <= target / (gen + 1), so shown <= target (G-Sync range).
 // gen < 0: no limit (DLSS-G off: menus, movies, loading; x1 is not held to the last multiplier's target / m).
+// 10-23: where the game's 60 would pass the target (x4 on 224), the game's own flips are held to the vblank's reach
+// rate (840 Hz: 56, DynApplyFlipFloor) and our pacer is off: the pacer at 56 against the game's 60 queued a frame
+// (log 20261022-190358, dynamic x4 at 55 real: flip->present mean 43.7 ms sd 3.9 vs 24.1 / 1.4 on fixed x4 at 45 real).
+// Not in cinematics or held cutscenes, nor with DLSS-G off. KYTY_DLSSG_FLIP_FLOOR=0: the pacer only.
 void DynApplyReflexLimit(int gen) {
-	const double interval = gen < 0 ? 0.0 : static_cast<double>(gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0);
+	static const bool floor_on = [] {
+		const char* v = std::getenv("KYTY_DLSSG_FLIP_FLOOR");
+		return v == nullptr || *v != '0';
+	}();
+	if (floor_on && gen >= 0 && !VideoOut::CinematicPlaying() && !VideoOut::CutsceneHeld()) {
+		DynApplyFlipFloor(gen);
+	} else if (g_dyn_flip_fps != 0) {
+		VideoOut::SetDynamicFlipFps(0);
+		g_dyn_flip_asked = -1;
+		g_dyn_flip_fps = 0;
+		std::printf("[dyn] game flips at 60\n");
+	}
+	const double interval = gen < 0 || g_dyn_flip_fps != 0
+	                            ? 0.0
+	                            : static_cast<double>(gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0);
 	if (g_real_interval.load() != interval)
-		std::printf("[dyn] pacer interval %.0f us for x%d\n", interval * 1e6, gen + 1);
+		std::printf("[dyn] pacer interval %.0f us for x%d%s\n", interval * 1e6, gen + 1, g_dyn_flip_fps != 0 ? " (game flips held instead)" : "");
 	g_real_interval       = interval; // the flip pacer (VideoOut, as FSR3's) holds real frames to it on the vblank grid
 	const uint32_t us     = DlssgReflexLimitUs(interval);
 	if (g_reflex_opts.frameLimitUs == us) return;
@@ -1570,6 +1592,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		g_dyn_pending_n = 0;
 		g_options_set   = false;
 		VideoOut::SetDynamicFlipFps(0);
+		g_dyn_flip_asked = -1;
 		g_dyn_flip_fps = 0;
 		DynApplyReflexLimit(g_dyn_gen);
 		std::printf("[dyn] cinematic: back to 60, x%d\n", g_dyn_gen + 1);
@@ -1650,6 +1673,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 					g_dyn_pinned_s = 0;
 					if (g_dyn_flip_fps != 0) {
 						VideoOut::SetDynamicFlipFps(0);
+		g_dyn_flip_asked = -1;
 						g_dyn_flip_fps = 0;
 					}
 					DynApplyReflexLimit(g_dyn_gen);
