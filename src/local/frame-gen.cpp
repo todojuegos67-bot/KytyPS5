@@ -136,7 +136,9 @@ bool g_taa_bypass_copy = false;
 // Default: the TAA's output is left to the game (its exposure, bloom and the rest see what they always saw) and only
 // the upscaler takes the raw frame, a copy made right after the TAA (UpscaleComposite).
 bool g_taa_bypass_match = false;
-std::atomic<double> g_real_interval {0.0}; // DLSS-G under the G-SYNC cap: the real frames' least interval (seconds)
+// DLSS-G under the G-SYNC cap: the real frames' least interval (seconds)
+std::atomic<double> g_real_interval {0.0};
+double g_pace_n = 0.0, g_pace_sum = 0.0, g_pace_sq = 0.0; // real present intervals this window
 bool g_sr_ready = false;
 bool     g_ready       = false; // Streamline loaded and the feature available
 bool     g_upscale     = false; // KYTY_UPSCALER=dlss: DLSS super resolution asked for (Streamline loaded for it)
@@ -738,8 +740,28 @@ bool Requested() {
 	return g_generate > 0;
 }
 
+// 10-22: KYTY_DLSSG_PACE: how real frames are paced for DLSS-G.
+//   adaptive (default): VideoOut's flip pacer at max(target / m, mean + 0.75 sd of the last windows' present
+//     intervals). Below the cap (log 20261022-103006: 43-51 real, 21 ms mean) nothing held the frames, so the game's
+//     own frame-time spread reached DLSS-G (present interval sd 1.1-1.9 ms; FSR3's 0.37 was at a held 60); a steady
+//     interval just above the typical frame evens it for a few % of real rate.
+//   grid: the flip pacer at target / m only (75ee561d .. aef26a56).
+//   reflex: Streamline's Reflex limit at target / m and our pacer off.
+int DlssgPaceMode() {
+	static const int mode = [] {
+		const char* v = std::getenv("KYTY_DLSSG_PACE");
+		if (v != nullptr && std::strcmp(v, "grid") == 0) return 1;
+		if (v != nullptr && std::strcmp(v, "reflex") == 0) return 2;
+		return 0;
+	}();
+	return mode;
+}
+std::atomic<double> g_pace_adapt {0.0}; // adaptive: the steady interval from the present interval statistics
+
 double RealFrameInterval() {
-	return g_ready ? g_real_interval.load() : 0.0;
+	if (!g_ready || DlssgPaceMode() == 2) return 0.0;
+	const double base = g_real_interval.load();
+	return base > 0.0 && DlssgPaceMode() == 0 ? std::max(base, g_pace_adapt.load()) : base;
 }
 
 std::string SupportProblem(vk::PhysicalDevice physical_device) {
@@ -1504,13 +1526,15 @@ bool TaaReplaceWanted() {
 
 // 10-22: real frames are paced by one limiter only: VideoOut's flip pacer (RealFrameInterval, the vblank grid, as
 // FSR3's) holds them to target / m; Reflex stays for latency without a frame limit (two limiters at 56 beat against
-// the game's 60: flip->present sd 1.90 ms vs FSR3's 0.55). KYTY_DLSSG_REFLEX_LIMIT=1: Reflex's limit too (old).
+// the game's 60: flip->present sd 1.90 ms vs FSR3's 0.55). KYTY_DLSSG_REFLEX_LIMIT=1: Reflex's limit too (old);
+// KYTY_DLSSG_PACE=reflex: Reflex's limit only (DlssgPaceMode).
+int DlssgPaceMode();
 uint32_t DlssgReflexLimitUs(double interval) {
 	static const bool force = [] {
 		const char* v = std::getenv("KYTY_DLSSG_REFLEX_LIMIT");
 		return v != nullptr && *v == '1';
 	}();
-	return force && interval > 0.0 ? static_cast<uint32_t>(1000000.0 * interval) : 0u;
+	return (force || DlssgPaceMode() == 2) && interval > 0.0 ? static_cast<uint32_t>(1000000.0 * interval) : 0u;
 }
 
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -1566,9 +1590,34 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		if (g_stat_start == std::chrono::steady_clock::time_point {}) g_stat_start = now;
 		++g_stat_real;
 		if (usable) ++g_stat_on;
+		{
+			static std::chrono::steady_clock::time_point prev {};
+			const double dt = prev == std::chrono::steady_clock::time_point {} ? 0.0 : std::chrono::duration<double>(now - prev).count();
+			prev            = now;
+			if (usable && dt > 0.0 && dt < 0.1) {
+				g_pace_n += 1.0;
+				g_pace_sum += dt;
+				g_pace_sq += dt * dt;
+			}
+		}
 		const double window = std::chrono::duration<double>(now - g_stat_start).count();
 		if (window >= 1.0) {
 			const double n = g_stat_real != 0 ? static_cast<double>(g_stat_real) : 1.0;
+			if (g_pace_n >= 10.0) {
+				const double mean = g_pace_sum / g_pace_n;
+				const double sd   = std::sqrt(std::max(g_pace_sq / g_pace_n - mean * mean, 0.0));
+				// Adaptive pacing: 0.98 mean + 0.75 sd, smoothed (the 2% lets it come down: held frames' mean is the pacer's
+				// own interval, so mean + sd alone would only ever grow). At the cap target / m wins (max).
+				const double want = 0.98 * mean + 0.75 * sd;
+				const double prev = g_pace_adapt.load();
+				g_pace_adapt      = prev <= 0.0 ? want : 0.7 * prev + 0.3 * want;
+				std::printf("[dlssg] present interval sd %.2f ms (mean %.2f, %.0f frames); pacer %.2f ms (%s)\n", sd * 1e3, mean * 1e3,
+				            g_pace_n, RealFrameInterval() * 1e3,
+				            DlssgPaceMode() == 0 ? "adaptive" : DlssgPaceMode() == 1 ? "grid" : "reflex");
+			} else {
+				g_pace_adapt = 0.0;
+			}
+			g_pace_n = g_pace_sum = g_pace_sq = 0.0;
 			if (g_dlssg_dynamic && g_mode_set == 1) {
 				const double real = g_stat_real / window;
 				// Free rate: frames over the time not spent in our limiter (what the game would do unlimited).
