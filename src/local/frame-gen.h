@@ -250,6 +250,10 @@ struct ShadowConsumer {
 };
 void OnShadowConsumer(uint64_t cs_hash, const ShadowConsumer& consumer, std::span<const uint32_t> flattened_srt);
 [[nodiscard]] bool IsShadowConsumer(uint64_t cs_hash);
+// A draw's vertex SRT, read only, while ContactShadowsWanted(): `shadow_target` (normal path) when its depth target is a
+// layer of a shadow-map array (square, >= 512, >= 4 layers) and it has no color target; such vertex shaders are learned,
+// and the table / native-record paths' draws of them read too. Their orthographic view-projection's depth row is the sun.
+void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt, bool shadow_target);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

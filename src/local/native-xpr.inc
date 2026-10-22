@@ -3334,6 +3334,8 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	if (FrameGen::Enabled() && record.stage_count > 0 && record.stages[0].program != nullptr) {
 		FrameGen::OnDraw(record.stages[0].program->shader_hash, record.stages[0].flattened, 'r');
 	}
+	if (FrameGen::ContactShadowsWanted() && record.stage_count > 0 && record.stages[0].program != nullptr)
+		FrameGen::OnShadowDraw(record.stages[0].program->shader_hash, record.stages[0].flattened, false);
 	return true;
 }
 

@@ -1514,6 +1514,13 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.vs_input_info.stage.program != nullptr) FrameGen::NoteShader(state.vs_input_info.stage.program->shader_hash, 'v');
 	if (state.ps_active && state.ps_input_info.stage.program != nullptr)
 		FrameGen::NoteShader(state.ps_input_info.stage.program->shader_hash, 'p');
+	if (FrameGen::ContactShadowsWanted() && state.vs_input_info.stage.program != nullptr) {
+		const auto& info   = state.depth_info.desc.info;
+		const bool  target = state.depth_info.image_id && state.color_count == 0 && info.resources.layers >= 4 &&
+		                    info.extent.width == info.extent.height && info.extent.width >= 512;
+		FrameGen::OnShadowDraw(state.vs_input_info.stage.program->shader_hash, state.vs_input_info.stage.resources.flattened_srt,
+		                       target);
+	}
 	if (FrameGen::Capturing() && state.vs_input_info.stage.program != nullptr) {
 		FrameGen::OnDraw(state.vs_input_info.stage.program->shader_hash,
 		                 state.vs_input_info.stage.resources.flattened_srt);

@@ -2169,6 +2169,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (FrameGen::Capturing() && Spec::Current() == nullptr)
 		FrameGen::OnDraw(pair.programs[0]->shader_hash,
 		                 std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()), 't');
+	if (FrameGen::ContactShadowsWanted() && Spec::Current() == nullptr)
+		FrameGen::OnShadowDraw(pair.programs[0]->shader_hash,
+		                       std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()), false);
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
 	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;

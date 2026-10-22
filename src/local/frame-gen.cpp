@@ -4423,6 +4423,72 @@ void OnShadowConsumer(uint64_t cs_hash, const ShadowConsumer& consumer, std::spa
 	g_sun.valid  = true;
 }
 
+void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> srt, bool shadow_target) {
+	if (srt.empty()) return;
+	static std::mutex                             mutex;
+	static std::unordered_map<uint64_t, uint64_t> learned;  // shadow-pass vertex shaders -> the flip last learned
+	static std::unordered_map<uint64_t, uint64_t> probed;   // others: the flip last scanned (every 300 flips at most)
+	static std::vector<std::array<float, 3>>      axes;     // this flip's
+	static uint64_t                               flip_of = ~0ull;
+	static uint32_t                               draws = 0;
+	static bool                                   said = false;
+	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
+	std::lock_guard lock(mutex);
+	if (flip != flip_of) {
+		// The last flip's axes: the largest group agreeing within 2 degrees becomes the sun.
+		uint32_t best = 0, best_n = 0;
+		for (uint32_t i = 0; i < axes.size(); ++i) {
+			uint32_t n = 0;
+			for (const auto& b: axes) n += std::abs(axes[i][0] * b[0] + axes[i][1] * b[1] + axes[i][2] * b[2]) > 0.9994f ? 1u : 0u;
+			if (n > best_n) best = i, best_n = n;
+		}
+		if (best_n >= 2 || (best_n == 1 && axes.size() == 1)) {
+			const auto a = axes[best];
+			std::lock_guard sun(g_sun.mutex);
+			const bool same = g_sun.valid && std::abs(a[0] * g_sun.axis[0] + a[1] * g_sun.axis[1] + a[2] * g_sun.axis[2]) > 0.9994f;
+			g_sun.stable = same ? g_sun.stable + 1 : 1;
+			g_sun.agree  = best_n;
+			g_sun.axis   = a;
+			g_sun.flip   = flip_of;
+			g_sun.valid  = true;
+			std::lock_guard vp_lock(g_last_vp_mutex);
+			if (g_have_last_vp) g_sun.view_proj = g_last_vp, g_sun.have_camera = true;
+		}
+		axes.clear();
+		flip_of = flip;
+		draws   = 0;
+	}
+	if (draws >= 64) return; // (a sample of a flip's shadow draws)
+	const auto known = learned.find(vs_hash);
+	if (!shadow_target && known == learned.end()) {
+		auto& last = probed[vs_hash];
+		if (last != 0 && flip < last + 300) return;
+		last = flip + 1;
+	}
+	std::vector<float> words(std::min<size_t>(srt.size(), 160));
+	std::memcpy(words.data(), srt.data(), words.size() * 4u);
+	std::vector<std::array<float, 3>> found;
+	FindOrthoAxes(words, found);
+	{
+		std::lock_guard vp_lock(g_last_vp_mutex);
+		if (g_have_last_vp)
+			found.erase(std::remove_if(found.begin(), found.end(), [&](const auto& a) { return CameraForwardReject(a, g_last_vp) != 0; }),
+			            found.end());
+	}
+	if (found.empty()) return;
+	++draws;
+	if (shadow_target || known != learned.end()) learned[vs_hash] = flip;
+	else if (learned.size() < 64) learned[vs_hash] = flip; // (an ortho matrix in an unknown VS: kept as a candidate)
+	axes.push_back(found[0]);
+	if (!said) {
+		said = true;
+		std::printf("CSHADOW: sun matrix from a shadow draw (VS %016llx, %s, SRT %zu words): light axis (%.4f %.4f %.4f)\n",
+		            static_cast<unsigned long long>(vs_hash), shadow_target ? "depth target a shadow-map layer" : "table/record path",
+		            srt.size(), found[0][0], found[0][1], found[0][2]);
+		std::fflush(stdout);
+	}
+}
+
 namespace {
 bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 	const auto device = graphics.device;
