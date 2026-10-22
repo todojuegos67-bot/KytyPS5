@@ -6,7 +6,7 @@
 //    frame index right before that frame's present. With FSR 3 frame generation the PRESENT mark goes on the real frame
 //    handed to the frame generation swapchain (Fsr3::QueuePresent), never on the generated ones it presents itself, as
 //    AMD asks for frame generation. maxFPS 0: KYTY_FLIP_FPS / the flip pacing keep the rate (no second limiter).
-//  - Otherwise (or VK_AMD_anti_lag missing): the emulator's limiter, at most one frame queued between the game and the
+//  - KYTY_ANTILAG=2 only (experimental: corrupted graphics in a test on NVIDIA), VK_AMD_anti_lag missing: the emulator's limiter, at most one frame queued between the game and the
 //    present: the controller read of frame k waits (at most 100 ms) until frame k-2 has been presented.
 // Off when Streamline (DLSS / DLSS-G) is loaded: Reflex is then active.
 #include "graphics/host_gpu/graphicContext.h"

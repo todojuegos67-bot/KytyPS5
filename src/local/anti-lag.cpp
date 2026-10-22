@@ -67,7 +67,7 @@ void Mark(int32_t stage, uint64_t index) {
 bool Requested() {
 	static const bool requested = [] {
 		const char* v = std::getenv("KYTY_ANTILAG");
-		return v != nullptr && v[0] == '1';
+		return v != nullptr && (v[0] == '1' || v[0] == '2');
 	}();
 	return requested;
 }
@@ -99,6 +99,9 @@ void OnDevice(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool extensio
 			g_device = static_cast<VkDevice>(device);
 			mode     = Mode::Amd;
 			text     = "Anti-Lag: AMD Anti-Lag 2 (VK_AMD_anti_lag)";
+		} else if (const char* v = std::getenv("KYTY_ANTILAG"); v == nullptr || v[0] != '2') {
+			// (The limiter's wait in the controller read corrupted the picture in a test on NVIDIA: opt-in only.)
+			text = "Anti-Lag: off (no VK_AMD_anti_lag; KYTY_ANTILAG=2 for the experimental emulator latency limiter)";
 		} else {
 			mode = Mode::Limiter;
 			text = "Anti-Lag: emulator latency limiter (no VK_AMD_anti_lag)";
