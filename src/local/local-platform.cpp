@@ -1561,6 +1561,86 @@ MemoryUse ProcessMemory() {
 	return {counters.PrivateUsage, counters.WorkingSetSize};
 }
 
+// KYTY_MEMORY_BREAKDOWN_SECONDS (default 60, 0 off): where the process's private commit is, from a walk of its
+// address space on a low-priority thread (a few ms per walk, off the game's threads): private committed by kind
+// (process heaps, executable, read-write), mapped (sections: the guest store), and the largest allocations.
+void StartMemoryBreakdown() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		const char* text    = std::getenv("KYTY_MEMORY_BREAKDOWN_SECONDS");
+		const auto  seconds = text != nullptr ? std::strtoul(text, nullptr, 10) : 60ul;
+		if (seconds == 0) return;
+		std::thread([seconds] {
+			SetThreadDescription(GetCurrentThread(), L"Kyty.MemoryBreakdown");
+			SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+			for (;;) {
+				std::this_thread::sleep_for(std::chrono::seconds(seconds));
+				std::set<uint64_t> heaps;
+				{
+					HANDLE handles[256];
+					const DWORD n = GetProcessHeaps(256, handles);
+					for (DWORD i = 0; i < n && i < 256; i++) {
+						MEMORY_BASIC_INFORMATION h {};
+						if (VirtualQuery(handles[i], &h, sizeof(h)) == sizeof(h))
+							heaps.insert(reinterpret_cast<uint64_t>(h.AllocationBase));
+					}
+				}
+				std::map<uint64_t, std::pair<uint64_t, DWORD>> bases; // allocation base -> committed private, its protection
+				uint64_t heap = 0, exec = 0, rw = 0, other = 0, mapped = 0, image = 0, regions = 0;
+				MEMORY_BASIC_INFORMATION info {};
+				for (uint64_t at = 0x10000; VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) == sizeof(info);) {
+					const uint64_t size = info.RegionSize;
+					regions++;
+					if (info.State == MEM_COMMIT) {
+						if (info.Type == MEM_PRIVATE) {
+							const auto base = reinterpret_cast<uint64_t>(info.AllocationBase);
+							auto&      entry = bases[base];
+							entry.first += size;
+							entry.second = info.AllocationProtect;
+							if (heaps.count(base) != 0) heap += size;
+							else if ((info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) exec += size;
+							else if ((info.Protect & PAGE_READWRITE) != 0) rw += size;
+							else other += size;
+						} else if (info.Type == MEM_MAPPED) {
+							mapped += size;
+						} else if (info.Type == MEM_IMAGE) {
+							image += size;
+						}
+					}
+					const uint64_t next = reinterpret_cast<uint64_t>(info.BaseAddress) + size;
+					if (next <= at) break;
+					at = next;
+				}
+				std::vector<std::pair<uint64_t, uint64_t>> top; // committed, base
+				top.reserve(bases.size());
+				for (const auto& [base, entry]: bases) top.emplace_back(entry.first, base);
+				std::sort(top.begin(), top.end(), std::greater<>());
+				char line[1024];
+				int  len = std::snprintf(line, sizeof(line),
+				                         "Private breakdown: heaps %llu MiB, executable %llu MiB, read-write %llu MiB, other %llu "
+				                         "MiB (%zu allocations, %llu regions); mapped views %llu MiB (guest store, not commit "
+				                         "when file-backed), images %llu MiB; largest:",
+				                         static_cast<unsigned long long>(heap >> 20u), static_cast<unsigned long long>(exec >> 20u),
+				                         static_cast<unsigned long long>(rw >> 20u), static_cast<unsigned long long>(other >> 20u),
+				                         bases.size(), static_cast<unsigned long long>(regions),
+				                         static_cast<unsigned long long>(mapped >> 20u), static_cast<unsigned long long>(image >> 20u));
+				for (size_t i = 0; i < top.size() && i < 8 && len > 0 && len < static_cast<int>(sizeof(line)) - 64; i++)
+					len += std::snprintf(line + len, sizeof(line) - len, " 0x%llx=%lluMiB%s",
+					                     static_cast<unsigned long long>(top[i].second),
+					                     static_cast<unsigned long long>(top[i].first >> 20u),
+					                     heaps.count(top[i].second) != 0 ? "(heap)" : "");
+				// Size buckets of the allocations: many mid-size ones are a pool or the driver, one huge one a store.
+				uint64_t small = 0, mid = 0, large = 0;
+				for (const auto& [committed, base]: top) (committed < (1u << 20u) ? small : committed < (64u << 20u) ? mid : large) += committed;
+				std::printf("%s; by allocation size: <1 MiB %llu MiB, 1-64 MiB %llu MiB, >=64 MiB %llu MiB\n", line,
+				            static_cast<unsigned long long>(small >> 20u), static_cast<unsigned long long>(mid >> 20u),
+				            static_cast<unsigned long long>(large >> 20u));
+				std::fflush(stdout);
+			}
+		}).detach();
+	});
+}
+
 static std::atomic<void (*)(void (*)())> g_trim_runner {nullptr};
 
 void KeepResident() {
@@ -2033,6 +2113,7 @@ MemoryUse ProcessMemory() {
 
 void StartWorkingSetTrim() {}
 void KeepResident() {}
+void StartMemoryBreakdown() {}
 void SetTrimRunner(void (*)(void (*)())) {}
 
 uint64_t PhysicalMemory() {

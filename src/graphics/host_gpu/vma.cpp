@@ -152,6 +152,7 @@ bool GraphicContext::CreateAllocator() {
 	small_video_memory = GetTotalMemoryBudget(false) < (uint64_t {12} << 30u) || (small_env != nullptr && *small_env == '1');
 	LocalPlatform::StartWorkingSetTrim();
 	LocalPlatform::KeepResident();
+	LocalPlatform::StartMemoryBreakdown();
 	// The game buffers' pool (graphicContext.h): VMA's device-local type for them, VMA's block sizes (dedicated memory
 	// for big ones, as in the default pools).
 	if (const char* defrag = std::getenv("KYTY_BUFFER_DEFRAG");

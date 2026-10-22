@@ -110,6 +110,8 @@ struct CommitUse {
 	uint64_t limit = 0;
 };
 CommitUse SystemCommit();
+// KYTY_MEMORY_BREAKDOWN_SECONDS (default 60): a periodic "Private breakdown:" log line.
+void StartMemoryBreakdown();
 uint64_t  PhysicalMemory();
 // KYTY_TRIM_RAM_SECONDS=<n>: every n seconds the process's working set is emptied (Windows: the pages go to the
 // standby list or the page file and come back on use), so the RAM in use is what the game touches in n seconds.
