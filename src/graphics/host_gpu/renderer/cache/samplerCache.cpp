@@ -164,6 +164,22 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	    static_cast<float>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)) / 256.0f;
 	sampler_info.anisotropyEnable        = (aniso ? VK_TRUE : VK_FALSE);
 	sampler_info.maxAnisotropy           = aniso_ratio;
+	// KYTY_FORCE_AF=2..16: anisotropic filtering forced on mipmapped linear samplers (launcher "Filtrado x16").
+	// Never on depth-compare (shadow) samplers or point-sampled ones.
+	{
+		static const float force_af = []() {
+			const char* e = std::getenv("KYTY_FORCE_AF");
+			float v = (e != nullptr ? static_cast<float>(std::atof(e)) : 0.0f);
+			return (v >= 2.0f ? (v > 16.0f ? 16.0f : v) : 0.0f);
+		}();
+		if (force_af > 0.0f && sampler_info.minFilter == vk::Filter::eLinear && sampler_info.magFilter == vk::Filter::eLinear &&
+		    sampler_info.mipmapMode == vk::SamplerMipmapMode::eLinear && r.DepthCompareFunc() == 0 && max_lod > 0.0f &&
+		    force_af > sampler_info.maxAnisotropy)
+		{
+			sampler_info.anisotropyEnable = VK_TRUE;
+			sampler_info.maxAnisotropy    = force_af;
+		}
+	}
 	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);
 	sampler_info.compareOp               = static_cast<vk::CompareOp>(r.DepthCompareFunc());
 	sampler_info.minLod                  = min_lod;
