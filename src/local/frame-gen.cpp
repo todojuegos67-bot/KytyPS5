@@ -3638,7 +3638,8 @@ void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float
 namespace {
 // KYTY_SSGI=0|1|2 (ssgi.comp): screen-space ray-traced GI + AO on the PS5 Pro path's render-resolution color, recorded
 // right before the upscaler (DLSS / XeSS / FSR), which then reads our composited copy in place of the game's color, so
-// the upscaler and frame generation see it. Trace (1: half res, 1 ray/px; 2 "Alto": full res, 3 rays/px), temporal (alpha 0.1, clamped),
+// the upscaler and frame generation see it. Trace (1: half res, 1 ray/px; 2 "Alto": full res, 3 rays/px; 3 "Ultra": full res, 5 rays/px, 28 steps + refine),
+// SVGF-style variance-guided temporal + a-trous (3 passes, 4 at Ultra), Ultra anti-flicker, temporal (alpha 0.1, clamped),
 // 2 a-trous passes, bilateral upsample. KYTY_SSGI_INTENSITY (0.6), KYTY_SSGI_AO (0.25).
 // Normals from depth derivatives; view positions from the game's view_to_clip (handles reverse-Z).
 struct SsgiImage {
@@ -3655,7 +3656,10 @@ struct SsgiPass {
 	vk::Extent2D            render {}, trace {};
 	SsgiImage               raw, tmp_a, tmp_b, out;
 	SsgiImage               history[2], gbuf[2];
+	SsgiImage               moments[2], var_a, var_b; // (luma m1, m2, count, variance) / filtered variance (trace res)
+	SsgiImage               gihist[2];                // the composited GI (render res), level 3's anti-flicker
 	uint32_t                frame         = 0;
+	int                     quality       = 0;
 	bool                    history_valid = false;
 	// GPU time: two timestamps a frame, a ring of 8, read 4 frames later.
 	vk::QueryPool           pool      = nullptr;
@@ -3679,7 +3683,7 @@ static_assert(sizeof(SsgiPush) == 96);
 int SsgiQuality() {
 	static const int quality = [] {
 		const char* value = std::getenv("KYTY_SSGI");
-		return value != nullptr ? std::clamp(std::atoi(value), 0, 2) : 0;
+		return value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
 	}();
 	return quality;
 }
@@ -3721,15 +3725,21 @@ void SsgiFreeImage(GraphicContext& graphics, SsgiImage& img) {
 	img.image.image = nullptr;
 }
 
+std::array<SsgiImage*, 14> SsgiAll() {
+	return {&g_ssgi.raw,        &g_ssgi.tmp_a,      &g_ssgi.tmp_b,      &g_ssgi.out,   &g_ssgi.history[0],
+	        &g_ssgi.history[1], &g_ssgi.gbuf[0],    &g_ssgi.gbuf[1],    &g_ssgi.moments[0], &g_ssgi.moments[1],
+	        &g_ssgi.var_a,      &g_ssgi.var_b,      &g_ssgi.gihist[0],  &g_ssgi.gihist[1]};
+}
+
 bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 	const auto device = graphics.device;
 	if (g_ssgi.pipeline == nullptr) {
 		if (g_ssgi.failed) return false;
 		g_ssgi.failed = true;
-		std::array<vk::DescriptorSetLayoutBinding, 9> bindings {};
-		for (uint32_t i = 0; i < 9; ++i) {
+		std::array<vk::DescriptorSetLayoutBinding, 11> bindings {};
+		for (uint32_t i = 0; i < 11; ++i) {
 			bindings[i].binding         = i;
-			bindings[i].descriptorType  = i < 7 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
 			bindings[i].descriptorCount = 1;
 			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
 		}
@@ -3777,23 +3787,25 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		g_ssgi.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
 		g_ssgi.failed    = false;
 	}
-	if (g_ssgi.out.image.image != nullptr && g_ssgi.render == render) return true;
+	if (g_ssgi.out.image.image != nullptr && g_ssgi.render == render && g_ssgi.quality == quality) return true;
 	device.waitIdle();
-	for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.out, &g_ssgi.history[0], &g_ssgi.history[1], &g_ssgi.gbuf[0],
-	                  &g_ssgi.gbuf[1]})
+	for (auto* img : SsgiAll())
 		SsgiFreeImage(graphics, *img);
 	const vk::Extent2D trace = quality >= 2 ? render : vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
 	bool ok = SsgiMakeImage(graphics, g_ssgi.out, render);
-	for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.history[0], &g_ssgi.history[1], &g_ssgi.gbuf[0], &g_ssgi.gbuf[1]})
+	for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.history[0], &g_ssgi.history[1], &g_ssgi.gbuf[0], &g_ssgi.gbuf[1],
+	                  &g_ssgi.moments[0], &g_ssgi.moments[1], &g_ssgi.var_a, &g_ssgi.var_b})
 		ok = ok && SsgiMakeImage(graphics, *img, trace);
+	for (auto* img : {&g_ssgi.gihist[0], &g_ssgi.gihist[1]})
+		ok = ok && SsgiMakeImage(graphics, *img, render);
 	if (!ok) {
-		for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.out, &g_ssgi.history[0], &g_ssgi.history[1],
-		                  &g_ssgi.gbuf[0], &g_ssgi.gbuf[1]})
+		for (auto* img : SsgiAll())
 			SsgiFreeImage(graphics, *img);
 		g_ssgi.failed = true;
 		return false;
 	}
 	g_ssgi.render        = render;
+	g_ssgi.quality       = quality;
 	g_ssgi.trace         = trace;
 	g_ssgi.history_valid = false;
 	return true;
@@ -3902,8 +3914,7 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		command.pipelineBarrier2(dependency);
 	};
 	// Our images general throughout (the first use from undefined).
-	for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.out, &g_ssgi.history[0], &g_ssgi.history[1], &g_ssgi.gbuf[0],
-	                  &g_ssgi.gbuf[1]})
+	for (auto* img : SsgiAll())
 		if (img->image.state.layout != vk::ImageLayout::eGeneral)
 			Transition(command, img->image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
 			           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
@@ -3916,40 +3927,58 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.misc[2] = quality;
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_ssgi.history_valid ? 2 : 0);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_ssgi.pipeline);
+	const SsgiImage* aux_in  = &g_ssgi.moments[prev];
+	const SsgiImage* aux_out = &g_ssgi.moments[cur];
 	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout, float step,
 	                     vk::Extent2D size) {
 		const vk::Sampler       lin = g_ssgi.linear, pt = g_ssgi.point;
-		vk::DescriptorImageInfo infos[9] {};
-		infos[0] = {lin, color.view, color.layout};
-		infos[1] = {pt, inputs.depth.view, inputs.depth.layout};
-		infos[2] = {pt, inputs.motion.view, inputs.motion.layout};
-		infos[3] = {lin, a.view, vk::ImageLayout::eGeneral};
-		infos[4] = {lin, b.view, vk::ImageLayout::eGeneral};
-		infos[5] = {pt, g_ssgi.gbuf[cur].view, vk::ImageLayout::eGeneral};
-		infos[6] = {pt, g_ssgi.gbuf[prev].view, vk::ImageLayout::eGeneral};
-		infos[7] = {nullptr, out.view, vk::ImageLayout::eGeneral};
-		infos[8] = {nullptr, gout.view, vk::ImageLayout::eGeneral};
-		vk::WriteDescriptorSet writes[9] {};
-		for (uint32_t i = 0; i < 9; ++i) {
+		vk::DescriptorImageInfo infos[11] {};
+		infos[0]  = {lin, color.view, color.layout};
+		infos[1]  = {pt, inputs.depth.view, inputs.depth.layout};
+		infos[2]  = {pt, inputs.motion.view, inputs.motion.layout};
+		infos[3]  = {lin, a.view, vk::ImageLayout::eGeneral};
+		infos[4]  = {lin, b.view, vk::ImageLayout::eGeneral};
+		infos[5]  = {pt, g_ssgi.gbuf[cur].view, vk::ImageLayout::eGeneral};
+		infos[6]  = {pt, g_ssgi.gbuf[prev].view, vk::ImageLayout::eGeneral};
+		infos[7]  = {nullptr, out.view, vk::ImageLayout::eGeneral};
+		infos[8]  = {nullptr, gout.view, vk::ImageLayout::eGeneral};
+		infos[9]  = {lin, aux_in->view, vk::ImageLayout::eGeneral};
+		infos[10] = {nullptr, aux_out->view, vk::ImageLayout::eGeneral};
+		vk::WriteDescriptorSet writes[11] {};
+		for (uint32_t i = 0; i < 11; ++i) {
 			writes[i].dstBinding      = i;
 			writes[i].descriptorCount = 1;
-			writes[i].descriptorType  = i < 7 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			writes[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
 			writes[i].pImageInfo      = &infos[i];
 		}
 		push.misc[0] = mode;
 		push.extra[0] = step;
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_ssgi.layout, 0, 9, writes);
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_ssgi.layout, 0, 11, writes);
 		command.pushConstants(g_ssgi.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	};
-	// (Bindings a mode does not write still need a valid storage image: tmp_b, written later anyway.)
+	// SVGF order: trace; temporal (variance-guided count, moments) -> tmp_a; a-trous step 1 -> the colour history;
+	// a-trous 2, 4 (, 8 at level 3) ping-ponging tmp_b / tmp_a with the filtered variance in var_a / var_b; composite
+	// (bilateral upsample, level 3 anti-flicker against gihist[prev]) -> out.
+	// (Bindings a mode does not write still need a valid storage image.)
 	run(0, g_ssgi.tmp_a, g_ssgi.tmp_b, g_ssgi.raw, g_ssgi.gbuf[cur], 0.0f, g_ssgi.trace);
-	run(1, g_ssgi.raw, g_ssgi.history[prev], g_ssgi.history[cur], g_ssgi.tmp_b, 0.0f, g_ssgi.trace);
-	run(2, g_ssgi.history[cur], g_ssgi.tmp_b, g_ssgi.tmp_a, g_ssgi.raw, 1.0f, g_ssgi.trace);
-	run(3, g_ssgi.tmp_a, g_ssgi.raw, g_ssgi.tmp_b, g_ssgi.raw, 2.0f, g_ssgi.trace);
-	run(4, g_ssgi.tmp_b, g_ssgi.raw, g_ssgi.out, g_ssgi.raw, 0.0f, g_ssgi.render);
+	run(1, g_ssgi.raw, g_ssgi.history[prev], g_ssgi.tmp_a, g_ssgi.tmp_b, 0.0f, g_ssgi.trace);
+	aux_in = &g_ssgi.moments[cur], aux_out = &g_ssgi.var_a;
+	run(2, g_ssgi.tmp_a, g_ssgi.raw, g_ssgi.history[cur], g_ssgi.tmp_b, 1.0f, g_ssgi.trace);
+	aux_in = &g_ssgi.var_a, aux_out = &g_ssgi.var_b;
+	run(2, g_ssgi.history[cur], g_ssgi.raw, g_ssgi.tmp_b, g_ssgi.raw, 2.0f, g_ssgi.trace);
+	aux_in = &g_ssgi.var_b, aux_out = &g_ssgi.var_a;
+	run(2, g_ssgi.tmp_b, g_ssgi.raw, g_ssgi.tmp_a, g_ssgi.raw, 4.0f, g_ssgi.trace);
+	const SsgiImage* final_gi = &g_ssgi.tmp_a;
+	if (quality >= 3) {
+		aux_in = &g_ssgi.var_a, aux_out = &g_ssgi.var_b;
+		run(2, g_ssgi.tmp_a, g_ssgi.raw, g_ssgi.tmp_b, g_ssgi.raw, 8.0f, g_ssgi.trace);
+		final_gi = &g_ssgi.tmp_b;
+	}
+	aux_in = &g_ssgi.var_a, aux_out = &g_ssgi.var_b;
+	run(4, *final_gi, g_ssgi.gihist[prev], g_ssgi.out, g_ssgi.gihist[cur], 0.0f, g_ssgi.render);
 	// The composite's writes before the upscaler reads.
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);

@@ -2,11 +2,14 @@
 // KYTY_SSGI (ssgi.cpp): screen-space ray-traced GI + AO on the PS5 Pro path's render-resolution color, before the
 // upscaler. One module, five modes (push.mode):
 //   0 trace:     cosine hemisphere rays marched in the depth buffer -> raw (rgb bounce, a visibility) + gbuf_out
-//                (view normal xyz, view depth) at the trace resolution (half for quality 1, full for 2)
-//   1 temporal:  raw blended (alpha 0.1) with the reprojected history (motion vectors), clamped to the 3x3
-//                neighbourhood, reset on depth/normal disocclusion
-//   2,3 a-trous: edge-aware 5x5 spatial filter, step 1 then 2
-//   4 composite: joint bilateral upsample; color += clamped albedo * indirect * intensity; soft AO -> out (render res)
+//                (view normal xyz, view depth) at the trace resolution (half for quality 1, full for 2 and 3;
+//                3 adds rays, steps and a binary-search hit refine)
+//   1 temporal:  SVGF-style: reprojected history (motion vectors), alpha max(1/count, 0.1 or 0.05 at 3), clamp to the
+//                3x3 neighbourhood loosening with the count, reset on depth/normal disocclusion; moments + variance
+//   2 a-trous:   5x5 with SVGF edge stops (depth, normal, luminance vs variance); the step-1 pass writes the history;
+//                steps 1, 2, 4 (and 8 at quality 3)
+//   4 composite: joint bilateral upsample (+ anti-flicker at 3); color += clamped albedo * indirect * intensity;
+//                soft AO; distance fade -> out (render res)
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D color_tex;   // the game's lit HDR color (render res)
@@ -18,6 +21,8 @@ layout(binding = 5) uniform sampler2D gbuf_cur;    // this frame's normal+depth 
 layout(binding = 6) uniform sampler2D gbuf_prev;   // last frame's normal+depth (trace res)
 layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
 layout(binding = 8, rgba16f) uniform writeonly image2D gbuf_out;
+layout(binding = 9) uniform sampler2D aux_tex;     // temporal: last moments; a-trous: this pass's variance (in .w)
+layout(binding = 10, rgba16f) uniform writeonly image2D aux_out; // temporal: moments (m1, m2, count, var); a-trous: variance
 
 layout(push_constant) uniform Push {
 	// Projection terms (row vectors, p' = p * M): x scale, y scale, x/y offsets from z (jitter, off-centre),
@@ -105,9 +110,9 @@ void Trace(ivec2 pixel) {
 	vec3 t = normalize(abs(n.z) < 0.999 ? cross(n, vec3(0, 0, 1)) : cross(n, vec3(1, 0, 0)));
 	vec3 b = cross(n, t);
 
-	// Few rays (1 at quality 1, 2 at 2): the temporal + spatial passes do the rest.
-	int   rays  = push.misc.z >= 2 ? 3 : 1;
-	int   steps = push.misc.z >= 2 ? 16 : 10;
+	int   q     = push.misc.z;
+	int   rays  = q >= 3 ? 5 : q >= 2 ? 3 : 1;
+	int   steps = q >= 3 ? 28 : q >= 2 ? 16 : 10;
 	// World radius grown with view depth (distant pixels keep a radius of a few screen pixels, not a tiny noisy one).
 	float len   = push.extra.y * max(1.0, abs(p.z) * 0.08);
 	float thick = push.extra.z * max(1.0, abs(p.z) * 0.02);
@@ -125,22 +130,41 @@ void Trace(ivec2 pixel) {
 		float occl   = 0.0;
 		vec3  hit_c  = vec3(0);
 		vec3  origin = p + n * (0.01 * abs(p.z) + 0.01);
+		float k_prev = 0.0;
 		for (int s = 1; s <= steps; ++s) {
 			float k  = (float(s) - 1.0 + jit) / float(steps);
-			vec3  q  = origin + dir * (len * k * k); // denser near the surface
-			vec3  pr = Project(q);
+			vec3  qp = origin + dir * (len * k * k); // denser near the surface
+			vec3  pr = Project(qp);
 			if (any(lessThan(pr.xy, vec2(0))) || any(greaterThan(pr.xy, vec2(1)))) break;
-			float sdep  = textureLod(depth_tex, pr.xy, 0).r;
-			if (IsSky(sdep)) continue; // the sky / far plane never occludes or bounces
-			float sz    = abs(ViewZ(sdep));
-			if (sz > 120.0) continue; // distant / fogged surfaces are no bounce source
-			float delta = abs(q.z) - sz; // > 0: the ray is behind the surface there
+			float sdep = textureLod(depth_tex, pr.xy, 0).r;
+			if (IsSky(sdep)) { k_prev = k; continue; } // the sky / far plane never occludes or bounces
+			float sz = abs(ViewZ(sdep));
+			if (sz > 120.0) { k_prev = k; continue; } // distant / fogged surfaces are no bounce source
+			float delta = abs(qp.z) - sz; // > 0: the ray is behind the surface there
 			if (delta > 0.0 && delta < thick) {
-				float fall = 1.0 - k * k;
+				float kh = k;
+				if (q >= 3) {
+					// Binary-search refine between the last free sample and the hit, then re-test the thickness.
+					float lo = k_prev, hi = k;
+					for (int i = 0; i < 4; ++i) {
+						float mid = 0.5 * (lo + hi);
+						vec3  mq  = origin + dir * (len * mid * mid);
+						vec3  mp  = Project(mq);
+						float md  = abs(mq.z) - abs(ViewZ(textureLod(depth_tex, mp.xy, 0).r));
+						if (md > 0.0) hi = mid; else lo = mid;
+					}
+					kh = hi;
+					vec3  hq = origin + dir * (len * kh * kh);
+					pr       = Project(hq);
+					float hd = abs(hq.z) - abs(ViewZ(textureLod(depth_tex, pr.xy, 0).r));
+					if (hd < 0.0 || hd > thick) { k_prev = k; continue; } // thin-object miss
+				}
+				float fall = 1.0 - kh * kh;
 				occl  = fall;
 				hit_c = textureLod(color_tex, pr.xy, 0).rgb * fall;
 				break;
 			}
+			k_prev = k;
 		}
 		bounce += hit_c;
 		vis += 1.0 - occl;
@@ -153,6 +177,8 @@ void Trace(ivec2 pixel) {
 	imageStore(out_img, pixel, vec4(max(bounce, vec3(0)), vis));
 }
 
+// SVGF-style temporal integration: per-pixel accumulation count and luminance moments, alpha = max(1/count, a_min),
+// the neighbourhood clamp loosening as the pixel converges; variance from the moments (spatial before 4 frames).
 void Temporal(ivec2 pixel) {
 	vec2 ts  = 1.0 / TraceSize();
 	vec2 uv  = (vec2(pixel) + 0.5) * ts;
@@ -160,41 +186,56 @@ void Temporal(ivec2 pixel) {
 	vec4 g   = textureLod(gbuf_cur, uv, 0);
 	if (g.w > 1e5) {
 		imageStore(out_img, pixel, cur);
+		imageStore(aux_out, pixel, vec4(0, 0, 0, 0));
 		return;
 	}
-	// 3x3 neighbourhood statistics (same-surface taps) for history clamping and the disocclusion fallback.
 	vec4  m1 = vec4(0), m2 = vec4(0);
-	float wn = 0.0;
+	float l1 = 0.0, l2 = 0.0, wn = 0.0;
 	for (int y = -1; y <= 1; ++y)
 		for (int x = -1; x <= 1; ++x) {
 			vec2  suv = uv + vec2(x, y) * ts;
 			vec4  sg  = textureLod(gbuf_cur, suv, 0);
 			float w   = (abs(sg.w - g.w) < 0.05 * g.w && dot(sg.xyz, g.xyz) > 0.8) ? 1.0 : 0.0;
-			vec4  s   = textureLod(src_a, suv, 0);
-			m1 += s * w;
-			m2 += s * s * w;
+			vec4  sv  = textureLod(src_a, suv, 0);
+			float sl  = Luma(sv.rgb);
+			m1 += sv * w;
+			m2 += sv * sv * w;
+			l1 += sl * w;
+			l2 += sl * sl * w;
 			wn += w;
 		}
-	m1 /= max(wn, 1.0);
-	m2 /= max(wn, 1.0);
+	wn = max(wn, 1.0);
+	m1 /= wn, m2 /= wn, l1 /= wn, l2 /= wn;
 	vec4 sigma = sqrt(max(m2 - m1 * m1, vec4(0)));
-	vec4 lo = m1 - 1.25 * sigma, hi = m1 + 1.25 * sigma;
 
-	vec2 mv  = textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();
-	vec2 puv = uv + mv;
-	vec4 res = m1; // disocclusion / no history: the neighbourhood mean (less noise than the raw sample)
+	float a_min = push.misc.z >= 3 ? 0.05 : 0.1;
+	float count = 1.0;
+	vec4  res   = m1; // disocclusion / no history: the neighbourhood mean
+	float lc    = Luma(cur.rgb);
+	vec2  mom   = vec2(l1, l2);
+	vec2  mv    = textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();
+	vec2  puv   = uv + mv;
 	if ((push.misc.w & 1) == 0 && (push.misc.w & 2) != 0 && all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
 		vec4  pg = textureLod(gbuf_prev, puv, 0);
 		float dz = abs(pg.w - g.w) / max(g.w, 1e-3);
 		float dn = dot(pg.xyz, g.xyz);
 		if (dz < 0.05 && dn > 0.9) {
-			vec4 hist = clamp(textureLod(src_b, puv, 0), lo, hi);
-			res       = mix(hist, cur, 0.1);
+			vec4  pm    = textureLod(aux_tex, puv, 0);
+			float pc    = max(pm.z, 1.0);
+			count       = min(pc + 1.0, 64.0);
+			float alpha = max(1.0 / count, a_min);
+			float k     = mix(1.25, 3.0, clamp(count / 32.0, 0.0, 1.0)); // looser as it converges
+			vec4  hist  = clamp(textureLod(src_b, puv, 0), m1 - k * sigma, m1 + k * sigma);
+			res         = mix(hist, cur, alpha);
+			mom         = mix(pm.xy, vec2(lc, lc * lc), alpha);
 		}
 	}
+	float var = count < 4.0 ? max(l2 - l1 * l1, 0.0) * (4.0 / count) : max(mom.y - mom.x * mom.x, 0.0);
 	imageStore(out_img, pixel, res);
+	imageStore(aux_out, pixel, vec4(mom, count, var));
 }
 
+// A-trous with the SVGF edge-stopping functions: depth, normal and luminance against the (3x3-blurred) variance.
 void Atrous(ivec2 pixel) {
 	vec2  ts = 1.0 / TraceSize();
 	vec2  uv = (vec2(pixel) + 0.5) * ts;
@@ -202,10 +243,25 @@ void Atrous(ivec2 pixel) {
 	vec4  c  = textureLod(src_a, uv, 0);
 	if (g.w > 1e5) {
 		imageStore(out_img, pixel, c);
+		imageStore(aux_out, pixel, vec4(0));
 		return;
 	}
+	float vb = 0.0;
+	{
+		float gw = 0.0;
+		for (int y = -1; y <= 1; ++y)
+			for (int x = -1; x <= 1; ++x) {
+				float w = (x == 0 && y == 0) ? 0.25 : abs(x) + abs(y) == 1 ? 0.125 : 0.0625;
+				vb += textureLod(aux_tex, uv + vec2(x, y) * ts, 0).w * w;
+				gw += w;
+			}
+		vb /= gw;
+	}
+	float lc   = Luma(c.rgb);
+	float lden = 4.0 * sqrt(max(vb, 0.0)) + 1e-3;
 	const float kern[3] = float[](0.375, 0.25, 0.0625);
 	vec4  sum  = vec4(0);
+	float vsum = 0.0;
 	float wsum = 0.0;
 	float step = push.extra.x;
 	for (int y = -2; y <= 2; ++y)
@@ -213,13 +269,17 @@ void Atrous(ivec2 pixel) {
 			vec2  suv = uv + vec2(x, y) * step * ts;
 			vec4  sg  = textureLod(gbuf_cur, suv, 0);
 			vec4  sc  = textureLod(src_a, suv, 0);
-			float wn  = pow(max(dot(sg.xyz, g.xyz), 0.0), 32.0);
-			float wz  = exp(-abs(sg.w - g.w) / max(g.w * 0.02, 1e-3));
-			float w   = kern[abs(x)] * kern[abs(y)] * wn * wz;
+			float wn  = pow(max(dot(sg.xyz, g.xyz), 0.0), 64.0);
+			float wz  = exp(-abs(sg.w - g.w) / max(g.w * 0.02 * step, 1e-3));
+			float wl  = exp(-abs(Luma(sc.rgb) - lc) / lden);
+			float w   = kern[abs(x)] * kern[abs(y)] * wn * wz * wl;
 			sum += sc * w;
+			vsum += textureLod(aux_tex, suv, 0).w * w * w;
 			wsum += w;
 		}
-	imageStore(out_img, pixel, wsum > 1e-5 ? sum / wsum : c);
+	bool ok = wsum > 1e-5;
+	imageStore(out_img, pixel, ok ? sum / wsum : c);
+	imageStore(aux_out, pixel, vec4(0, 0, 0, ok ? vsum / (wsum * wsum) : vb));
 }
 
 // Joint bilateral upsample: the 4 nearest trace texels, bilinear weights times depth similarity to this pixel.
@@ -248,6 +308,7 @@ void Composite(ivec2 pixel) {
 	float d   = texelFetch(depth_tex, pixel, 0).r;
 	if (IsSky(d)) {
 		imageStore(out_img, pixel, col);
+		imageStore(gbuf_out, pixel, vec4(0, 0, 0, 1));
 		return;
 	}
 	float z  = abs(ViewZ(d));
@@ -255,19 +316,33 @@ void Composite(ivec2 pixel) {
 	float fade = 1.0 - smoothstep(30.0, 90.0, z);
 	if (fade <= 0.0) {
 		imageStore(out_img, pixel, col);
+		imageStore(gbuf_out, pixel, vec4(0, 0, 0, 1));
 		return;
 	}
-	vec4  gi = Upsample(uv, z);
+	vec4 gi = Upsample(uv, z);
+	if (push.misc.z >= 3) {
+		// Anti-flicker: the reprojected last composited GI, clamped to a band around this frame's, blended in.
+		vec4 cg = gi;
+		if ((push.misc.w & 1) == 0 && (push.misc.w & 2) != 0) {
+			vec2 puv = uv + texelFetch(motion_tex, pixel, 0).xy * push.motion.xy / RenderSize();
+			if (all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
+				vec4 pgi = textureLod(src_b, puv, 0);
+				vec4 lo  = gi * 0.75 - vec4(0.002), hi = gi * 1.25 + vec4(0.002);
+				gi = mix(gi, clamp(pgi, lo, hi), 0.6);
+			}
+		}
+		imageStore(gbuf_out, pixel, gi);
+	}
 	float l  = Luma(col.rgb);
 	// Albedo approximation: the lit color's chroma at a fixed mid reflectance (no G-buffer albedo here).
 	vec3 albedo = clamp(col.rgb / max(l, 1e-3), vec3(0), vec3(2)) * 0.3;
 	// Tint by the surface's own color: energy only where a lit bounce exists, no constant ambient.
 	vec3 bounce = albedo * max(gi.rgb, vec3(0)) * push.trace.z * fade;
-	// The added light bounded relative to the pixel's own (plus a small floor for dark corners): a subtle bounce
-	// that cannot lift the frame's average or the auto exposure.
+	// The added light bounded relative to the pixel's own: a subtle bounce that cannot lift the frame's average
+	// or the auto exposure.
 	float bl  = Luma(bounce);
 	float cap = 0.25 * l;
-	if (bl > cap) bounce *= cap / bl;
+	if (bl > cap) bounce *= cap / max(bl, 1e-6);
 	// Soft AO: only the occluded part of the visibility, smoothed, at a modest strength.
 	float ao  = smoothstep(0.0, 1.0, clamp(gi.a, 0.0, 1.0));
 	vec3  rgb = (col.rgb + bounce) * mix(1.0, ao, push.trace.w * fade);
