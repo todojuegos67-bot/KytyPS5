@@ -23,7 +23,7 @@ layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
 layout(binding = 8, rgba16f) uniform writeonly image2D gbuf_out;
 layout(binding = 9) uniform sampler2D aux_tex;
 layout(binding = 10, rgba16f) uniform writeonly image2D aux_out;
-layout(binding = 11, std430) buffer Vote { uint v[]; } vote_buf; // per slot 16 words: candidate k: lit sum, lit n, away sum, away n
+layout(binding = 11, std430) buffer VoteBuf { uint v[]; } vote_buf; // per slot 16 words: candidate k: lit sum, lit n, away sum, away n
 
 layout(push_constant) uniform Push {
 	vec4  proj;      // M[0], M[5], M[8], M[9] (row vectors)
@@ -257,7 +257,7 @@ void Composite(ivec2 pixel) {
 }
 
 shared uint s_vote[16];
-void Vote(ivec2 pixel) {
+void VotePass(ivec2 pixel) {
 	uint li = gl_LocalInvocationIndex;
 	if (li < 16u) s_vote[li] = 0u;
 	barrier();
@@ -290,7 +290,7 @@ void Vote(ivec2 pixel) {
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	int   mode  = push.misc.x;
-	if (mode == 5) { Vote(pixel); return; } // (all invocations reach its barriers)
+	if (mode == 5) { VotePass(pixel); return; } // (all invocations reach its barriers)
 	ivec2 size = ivec2(mode == 4 ? RenderSize() : TraceSize());
 	if (pixel.x >= size.x || pixel.y >= size.y) return;
 	if (mode == 0) Trace(pixel);
