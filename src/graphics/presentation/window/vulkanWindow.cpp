@@ -1067,6 +1067,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		create_info.pNext          = &fault_features;
 	}
 	const bool anti_lag_extension = HasExtension(device_extensions, Libs::Graphics::AntiLag::ExtensionName());
+	const bool reflex_extension   = HasExtension(device_extensions, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) &&
+	                                HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME);
 	create_info.pNext = Libs::Graphics::AntiLag::ChainDeviceFeatures(anti_lag_extension, const_cast<void*>(create_info.pNext));
 	// XeSS (KYTY_UPSCALE=xess): its mutableDescriptorType feature, with its extension.
 	create_info.pNext = Libs::Graphics::Xess::ChainDeviceFeatures(device_extensions, const_cast<void*>(create_info.pNext));
@@ -1100,7 +1102,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		return nullptr;
 	}
 	if (fault_extension) DeviceFault::Enable(device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
-	Libs::Graphics::AntiLag::OnDevice(device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr, anti_lag_extension);
+	Libs::Graphics::AntiLag::OnDevice(device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr, anti_lag_extension,
+	                                  reflex_extension);
 
 	return device;
 }
@@ -1602,6 +1605,15 @@ void WindowContext::CreateVulkan() {
 		// KYTY_ANTILAG=1: AMD Anti-Lag 2 where the device has it (local/anti-lag.h).
 		if (Libs::Graphics::AntiLag::Requested() && HasExtension(available_extensions, Libs::Graphics::AntiLag::ExtensionName()))
 			device_extensions.push_back(Libs::Graphics::AntiLag::ExtensionName());
+		// KYTY_ANTILAG=1 on NVIDIA without Streamline (whose Reflex is then active): VK_NV_low_latency2 and the
+		// present-id extension it needs.
+		if (Libs::Graphics::AntiLag::Requested() && !FrameGen::StreamlineLoaded() &&
+		    HasExtension(available_extensions, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+			if (!HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME))
+				device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+		}
 	}
 
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
@@ -1787,6 +1799,15 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 		// KYTY_ANTILAG=1: AMD Anti-Lag 2 where the device has it (local/anti-lag.h).
 		if (Libs::Graphics::AntiLag::Requested() && HasExtension(available_extensions, Libs::Graphics::AntiLag::ExtensionName()))
 			device_extensions.push_back(Libs::Graphics::AntiLag::ExtensionName());
+		// KYTY_ANTILAG=1 on NVIDIA without Streamline (whose Reflex is then active): VK_NV_low_latency2 and the
+		// present-id extension it needs.
+		if (Libs::Graphics::AntiLag::Requested() && !FrameGen::StreamlineLoaded() &&
+		    HasExtension(available_extensions, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+			if (!HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME))
+				device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+		}
 	}
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
 	const VulkanExtensions no_layers {};

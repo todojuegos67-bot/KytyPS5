@@ -8,6 +8,10 @@
 //    AMD asks for frame generation. maxFPS 0: KYTY_FLIP_FPS / the flip pacing keep the rate (no second limiter).
 //  - KYTY_ANTILAG=2 only (experimental: corrupted graphics in a test on NVIDIA), VK_AMD_anti_lag missing: the emulator's limiter, at most one frame queued between the game and the
 //    present: the controller read of frame k waits (at most 100 ms) until frame k-2 has been presented.
+//  - NVIDIA (VK_NV_low_latency2 + VK_KHR_present_id, no Streamline): Reflex. vkLatencySleepNV waited for at the same
+//    controller read, SIMULATION_START / INPUT_SAMPLE there, SIMULATION_END / RENDERSUBMIT_START at the flip,
+//    RENDERSUBMIT_END / PRESENT_START / PRESENT_END around the present, whose VkPresentIdKHR is the frame index.
+//    Not on FSR 3's frame generation swapchain (its real swapchain is AMD's): off there, logged.
 // Off when Streamline (DLSS / DLSS-G) is loaded: Reflex is then active.
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -20,7 +24,16 @@ namespace Libs::Graphics::AntiLag {
 // Device creation: its feature structure chained before `next` when `enabled` (the extension in the list).
 void* ChainDeviceFeatures(bool enabled, void* next);
 // After vkCreateDevice: which mode runs, logged once.
-void OnDevice(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool extension_enabled);
+void OnDevice(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool extension_enabled, bool reflex_enabled);
+
+// NVIDIA Reflex (VK_NV_low_latency2, KYTY_ANTILAG=1 without Streamline): the swapchain's VkSwapchainLatencyCreateInfoNV
+// chained before `next`; the swapchain made (sleep mode on) or about to go (VK_NULL_HANDLE); FSR 3's: none (logged).
+[[nodiscard]] bool ReflexActive();
+void*              ChainSwapchain(void* next);
+void               OnSwapchain(VkSwapchainKHR swapchain, bool fsr3);
+// The present's VkPresentIdKHR (0: none) and its PRESENT_END marker.
+[[nodiscard]] uint64_t PresentId(uint64_t frame_index);
+void                   AfterPresent(uint64_t frame_index);
 
 // The game reads its controller (scePadRead / scePadReadState): once per flip, the frame's INPUT mark (or the limiter).
 void OnInput();
