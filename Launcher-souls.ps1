@@ -4,6 +4,13 @@
 #   Settings             -> carpeta del juego volcado (game-path.txt). La casilla se recuerda en launcher.ini.
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+public static class FgWin {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+}
+"@
 [System.Windows.Forms.Application]::EnableVisualStyles()
 $ErrorActionPreference = 'Stop'
 # (Any error that stops this script, with where it came from, in launcher-error.txt next to it.)
@@ -19,15 +26,11 @@ $fgModes = @(
 	@('   Frame generation AMD x2',                     'fsr3.json'),
 	@('   Frame generation AMD x3',                     'fsr3-x3.json'),
 	@('   Frame generation AMD x4',                     'fsr3-x4.json'),
-	@('   120 FPS AMD Smooth Souls',                    'fsr3-x3-120.json'),
 	@('   AMD MFG dinamico (x2-x4 automatico)',         'fsr3-mfg-dynamic.json'),
 	@('---------- NVIDIA (RTX) ----------',             ''),
 	@('   Frame generation DLSS x2',                    'dlss-x2.json'),
 	@('   Frame generation DLSS x3',                    'dlss-x3.json'),
 	@('   Frame generation DLSS x4',                    'dlss-x4.json'),
-	@('   200 FPS Nvidia Smooth x5',                    'dlss-x5.json'),
-	@('   216 FPS Nvidia Smooth x6',                    'dlss-x6.json'),
-	@('   120 FPS Nvidia Smooth Souls',                 'dlss-x3-120.json'),
 	@('   DLSS MFG dinamico (x2-x4 automatico)',        'dlss-dynamic.json')
 )
 # Reescalado: texto -> altura del 3D (run-windows.ps1 -RenderHeight), reescalador (-Upscale) y altura de salida
@@ -44,7 +47,9 @@ $resModes = @(
 	# (10-21) DLSS sale a 4K por dentro (camino PS5 Pro): solo acepta 3D de 1080 lineas o mas, o 720 exacto
 	# (rendimiento). 960 y 837 (los antiguos Calidad/Equilibrado) dejaban la imagen negra.
 	@('DLSS Calidad',   1.333, 'dlss', 0),
+	@('DLSS Equilib.',  1.72, 'dlss', 0),  # (10-22) solo con Modo 4K (2160/1.72 = 1256; en 1440p darian 837: pantalla negra)
 	@('DLSS Rendim.',   2.0,  'dlss', 0),
+	@('DLSS U.rendim.', 3.0,  'dlss', 0),  # (10-22) solo con Modo 4K (2160/3 = 720 justo; en 1440p darian 480)
 	@('XeSS AA',        1.0,  'xess', 0),
 	@('XeSS U.cal.+',   1.3,  'xess', 0),
 	@('XeSS U.calidad', 1.5,  'xess', 0),
@@ -70,7 +75,21 @@ $dlssPresets = @(
 function Get-FgIndex {
 	if (Test-Path -LiteralPath $iniFile) {
 		$text = Get-Content -LiteralPath $iniFile -Raw
-		if ($text -match 'fgmode=(\d+)') { return [int]$Matches[1] }
+		# (10-22) Se guarda tambien el config (fgcfg=): el indice cambio al quitar los modos Smooth x5/x6/120.
+		if ($text -match '(?m)^fgcfg=(.+)$') {
+			$cfg = $Matches[1].Trim()
+			for ($i = 0; $i -lt $fgModes.Count; $i++) { if ($fgModes[$i][1] -eq $cfg) { return $i } }
+		}
+		if ($text -match 'fgmode=(\d+)') {
+			# Indice antiguo (lista de 15) -> su config; los quitados al mas parecido.
+			$old = @('sin-fg.json', '', 'fsr3.json', 'fsr3-x3.json', 'fsr3-x4.json', 'fsr3-x3.json', 'fsr3-mfg-dynamic.json', '',
+			         'dlss-x2.json', 'dlss-x3.json', 'dlss-x4.json', 'dlss-x4.json', 'dlss-x4.json', 'dlss-x3.json', 'dlss-dynamic.json')
+			$n = [int]$Matches[1]
+			if ($text -notmatch '(?m)^fgcfg=' -and $n -ge 0 -and $n -lt $old.Count -and $old[$n]) {
+				for ($i = 0; $i -lt $fgModes.Count; $i++) { if ($fgModes[$i][1] -eq $old[$n]) { return $i } }
+			}
+			return $n
+		}
 		if ($text -match 'framegen=1') { return 1 }
 		if ($text -match 'framegen=0') { return 0 }
 	}
@@ -91,7 +110,12 @@ function Set-IniValue([string]$key, [string]$value) {
 	$lines += "$key=$value"
 	[IO.File]::WriteAllText($iniFile, (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding $false))
 }
-function Set-FgIndex([int]$i) { Set-IniValue 'fgmode' "$i" }
+function Set-FgIndex([int]$i) { Set-IniValue 'fgmode' "$i"; if ($i -ge 0 -and $i -lt $fgModes.Count -and $fgModes[$i][1]) { Set-IniValue 'fgcfg' $fgModes[$i][1] } }
+# (10-22) Frame generation fijo (AMD x2): Modo graficas de 8 GB (30 FPS, 1080p, solo AA) o Modo 45 FPS (1440p, reescalado
+# normal). Lo de 1080p y el filtro de AA siguen mirando solo chkLowEnd.
+function Is-FixedFg { return ($chkLowEnd -and $chkLowEnd.Checked) -or ($chkLowEnd45 -and $chkLowEnd45.Checked) }
+# (10-22) FPS desbloqueados siempre, salvo DLSS frame generation (Reflex) y los modos Souls ligero / equilibrado.
+function Is-Unlocked { if (Is-FixedFg) { return $false }; $c = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]; return $true }  # (10-22 d) DLSS tambien desbloqueado: reflexfree (Reflex como unico limite)
 
 function Get-GamePath {
 	if (Test-Path -LiteralPath $pathFile) { return ((Get-Content -LiteralPath $pathFile -Raw) -replace '^\uFEFF', '').Trim() }
@@ -123,7 +147,7 @@ function Start-Game {
 	$ram16 = Test-Path -LiteralPath (Join-Path $root 'ram16.txt')
 	$config = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	# (10-21) PC gama baja: el juego a 30 reales (repartidos por igual) y frame generation de AMD x2 = 60.
-	if ($chkLowEnd.Checked) { $config = 'fsr3.json' }
+	if (Is-FixedFg) { $config = 'fsr3.json' }
 	# Rutas entre comillas: Start-Process une los argumentos con espacios, y una carpeta con espacios
 	# (C:\Users\Juan Perez\...) partia la ruta y PowerShell se cerraba sin arrancar nada.
 	$psargs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $root 'run-windows.ps1')`"",
@@ -148,24 +172,44 @@ function Start-Game {
 	if ($chkSafeGpu.Checked) { $sets += 'KYTY_COMPUTE_CHAIN=0' }
 	# Graficos: texturas (0 entera, 1 mitad, 2 cuarto) y distancia de dibujado (-Quality low/lowest: solo el LOD).
 	$psargs += @('-TextureReduce', "$($cmbTex.SelectedIndex)")
+	if ($chkAntiLag.Checked) { $psargs += '-AntiLag' }
+	if ($cmbRt.SelectedIndex -gt 0) { $psargs += @('-Ssgi', "$($cmbRt.SelectedIndex)") }
+	if ($cmbCs.SelectedIndex -gt 0) { $psargs += @('-ContactShadows', "$($cmbCs.SelectedIndex)") }
+	if ($cmbShadow.SelectedIndex -gt 0) { $psargs += @('-Shadows', "$($cmbShadow.SelectedIndex)") }
 	if ($cmbDist.SelectedIndex -eq 1) { $psargs += @('-Quality', 'low') } elseif ($cmbDist.SelectedIndex -eq 2) { $psargs += @('-Quality', 'lowest') }
 	if ($chkExcl.Checked) { $psargs += '-ExclusiveFullscreen' }
 	# Preset C con la imagen sin HUD (hudless) daba pantalla negra con solo el HUD (10-21): sin ese buffer.
 	# (10-21) Preset C del frame generation de NVIDIA siempre (mas rapido; el emulador solo lo aplica a DLSS-G).
 	$sets += 'KYTY_DLSSG_PRESET=C'
+	$sets += 'KYTY_FG_PACING=0'  # (10-21) el reparto de frames del emulador (se quedaba en 20 FPS) apagado
+	# (10-22) Modo 4K: los reescaladores calculan su resolucion sobre 2160 (salida 4K), no sobre los 1440 del monitor.
+	$outH = Get-OutHeight
+	if ($outH -ne 1440) { $sets += "KYTY_DISPLAY_HEIGHT=$outH" }
+	$sets += 'KYTY_DS_SIXTY_STEP=0'  # (10-22) el paso de 60 en cinematico no arreglaba las cinematicas: el modo como en PS5 y cinematicas a 30 reales
+	$sets += 'KYTY_DS_VARIABLE_STEP=1'  # (10-21) fisica al tiempo real de cada frame (physicsUseFixedTimestep=false)
 	# Nitidez del reescalado (KYTY_UPSCALE_SHARPNESS): FSR con su propio RCAS, DLSS y XeSS con un paso de nitidez despues.
 	$sharp = $sharpLevels[[math]::Max(0, $cmbSharp.SelectedIndex)][1]
 	if ($sharp -ne '') { $sets += "KYTY_UPSCALE_SHARPNESS=$sharp" }
 	# FPS desbloqueados con frame generation: el juego deja de estar limitado a 60 reales (KYTY_FRAMEGEN_BASE=0); los
 	# modos Smooth siguen en sus FPS fijos (KYTY_FLIP_FPS) y DLSS-G se limita solo con Reflex al tope del monitor.
 	$fgConfig = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
-	if ($chkLowEnd.Checked) { $fgConfig = 'fsr3.json'; $sets += 'KYTY_FLIP_FPS=30' }
+	if (Is-FixedFg) { $fgConfig = 'fsr3.json'; $sets += $(if ($chkLowEnd45.Checked) { 'KYTY_FLIP_FPS=45' } else { 'KYTY_FLIP_FPS=30' }) }
 	# Nombre del modo de frame generation para las metricas.
-	if ($chkLowEnd.Checked) { Set-IniValue 'fglabel' 'MODO PC BAJOS REQUISITOS' } else { Set-IniValue 'fglabel' ($fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][0].Trim()) }
-	if ($chkUnlock.Checked -and $fgConfig -and $fgConfig -ne 'sin-fg.json') { $sets += 'KYTY_FRAMEGEN_BASE=0' }
+	if ($chkLowEnd45.Checked) { Set-IniValue 'fglabel' 'Modo Souls equilibrado' } elseif ($chkLowEnd.Checked) { Set-IniValue 'fglabel' 'Modo Souls ligero' } else { Set-IniValue 'fglabel' ($fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][0].Trim()) }
+	# (10-22) FPS desbloqueados solo sin frame generation: con frame generation el juego se queda en su base (60) y el
+	# multiplicador llega al monitor; desbloqueado (110 reales x3 = 330) se pasaba de los 240 Hz y salia de G-Sync.
 	# AMD x4: 56 FPS reales (224 mostrados), por debajo de 240 Hz para que G-SYNC vaya suave.
+	# (10-22 b) FPS desbloqueados + frame generation DINAMICO: como en PC, el juego pasa de 60 reales y el dinamico
+	# elige x2/x3/x4 con el tope de 224 a la salida (limite real = 224/x). Con frame generation fijo sigue a 60.
+	if ((Is-Unlocked) -and -not (Is-FixedFg) -and ($fgConfig -like 'fsr3*' -or $fgConfig -like 'dlss*')) { $sets += 'KYTY_FRAMEGEN_BASE=0' }  # (10-22) AMD y sin FG: siempre desbloqueados; DLSS y los modos Souls/8 GB bloqueados
+	if ($chkAf16.Checked) { $sets += 'KYTY_FORCE_AF=16' }
+	$sets += 'KYTY_DLSSG_PACE=grid'  # (10-22 e) reflexfree esperaba el limite de Reflex en cada fotograma mostrado: 14 reales
+	if ($cmbAo.SelectedIndex -gt 0) { $sets += "KYTY_GTAO=$($cmbAo.SelectedIndex)" }
+	if ($cmbSsr.SelectedIndex -gt 0) { $sets += "KYTY_SSR=$($cmbSsr.SelectedIndex)" }
+	if ($chkPc16.Checked) { $sets += 'KYTY_LOWMEM_VRAM=1' }  # (10-22) menos memoria de video retenida (el driver la cuenta como RAM)
 	$sets += 'KYTY_FAULT_STATS=1'
-	if ($fgConfig -eq 'fsr3-x4.json') { $sets += 'KYTY_VRR_CAP_FPS=224' }
+	if ($fgConfig -eq 'fsr3-x4.json') { $sets += 'KYTY_VRR_CAP_FPS=224' }  # (10-22 d) en DLSS el tope se aplicaba dos veces: 14 reales x4 = 56
+	if ($fgConfig -like '*dyn*') { $sets += 'KYTY_DYN_QUALITY=0.6' }  # (10-22 f) x2 se mantenia justo por debajo (144 < 146) y saltaba a x3
 	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
@@ -176,15 +220,21 @@ function Start-Game {
 	# un tope a 56 los 60 del juego se comian 4 frames por segundo (tirones cada 0.25 s).
 	# (10-21 b) Con frame generation siempre 840 Hz y cada frame sale en cuanto esta listo (FLIP_WHEN_READY): por debajo
 	# de 60 los frames ya no se redondean a la rejilla de vblanks (a 40 reales salian con +-3 ms de vaiven: tirones con G-Sync).
-	if ($config -in 'dlss-dynamic.json', 'fsr3-mfg-dynamic.json') { $psargs += @('-Vblank', '840') }  # (10-21: 60 = 14 pulsos, 56 = 15)
+	if ($config -like 'dlss*' -or $config -eq 'fsr3-mfg-dynamic.json') { $psargs += @('-Vblank', '840') }  # (10-21: 60 = 14 pulsos, 56 = 15)
 	elseif ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
 	# Sin frame generation, "FPS desbloqueados": vblank de 120 Hz (-Fps120, el modo probado de chenxiao07; a 240 los menus y el intro iban acelerados, 10-18), el juego pasa de 60 (a velocidad real:
 	# gameMinDeltaTime en run-windows); videos, menus y pantallas de carga siguen a 60.
 	# (Desbloqueado sin frame generation: vblank virtual de 360 Hz y cada frame se muestra en cuanto esta listo
 	# (-FlipWhenReady), no al siguiente tick de 120 Hz: a ~80 FPS los frames alternaban 8 y 17 ms (tirones).)
-	elseif ($chkUnlock.Checked) { $psargs += @('-Vblank', '960') }
+	elseif ((Is-Unlocked)) { $psargs += @('-Vblank', '960') }
 	$res    = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
 	if ($res[1] -eq 0) { $res = $resModes[0] }
+	# (10-22) Modo 4K: el modo cinematico del juego a 4K nativo (sin reescalado).
+	# (10-22) El modo del juego siempre segun la salida: 4K = cinematico, lo demas = rendimiento (el juego guarda el
+	# ultimo en la partida y sin esto se quedaba en cinematico).
+	$psargs += @('-ForceMode', $(if ($chk4K.Checked -and -not (Is-FixedFg)) { 'cinematic' } else { 'performance' }))  # (10-22) modos Souls: siempre rendimiento
+	# 1080p / 720p sin reescalador: el juego dibuja a esa altura.
+	if ($outH -lt 1440 -and -not $res[2]) { $res = @("${outH}p", $outH, '', 0) }
 	# DLSS (reescalado) carga Streamline de NVIDIA; con la generacion de frames de AMD el emulador se cerraba al crear
 	# el dispositivo grafico. Con AMD: FSR o XeSS para reescalar.
 	if ($res[2] -like '*dlss' -and $config -like 'fsr3*') {
@@ -212,7 +262,7 @@ function Start-Game {
 	# frame generation; con el juego a 60 (o con frame generation) el ritmo de 60 lo marcan los vblanks y no se toca.
 	if ($chkGsync.Checked) {
 		$env:KYTY_VSYNC_LOCK = '0'
-		if ($chkUnlock.Checked -and $config -eq 'sin-fg.json') { $env:KYTY_FPS_CAP = 'auto'; $env:KYTY_FLIP_WHEN_READY = '1' }
+		if ((Is-Unlocked) -and $config -eq 'sin-fg.json') { $env:KYTY_FPS_CAP = 'auto'; $env:KYTY_FLIP_WHEN_READY = '1' }
 	}
 	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Hidden | Out-Null
 	$metArgs = @(); if ($chkRam16.Checked) { $metArgs = @('-RamGB', '16') }
@@ -221,21 +271,51 @@ function Start-Game {
 	$metVerb = if ($chkRam16.Checked) { @{ Verb = 'RunAs' } } else { @{} }
 	if ($chkMetricas.Checked -or $chkRam16.Checked -or $chkVram8.Checked) { Start-Process -FilePath 'powershell' -ArgumentList (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ('"' + (Join-Path $root 'metricas.ps1') + '"'), '-LogDir', ('"' + (Join-Path $root 'logs') + '"')) + $metArgs) -WindowStyle Hidden @metVerb -ErrorAction SilentlyContinue | Out-Null }
 	$form.WindowState = 'Minimized'
+	# (10-22) La ventana del juego al frente (con el foco) en cuanto aparece, y otra vez a los pocos segundos (por si las
+	# metricas o el lanzador se quedaron delante): sin el foco, NVIDIA App cortaba la grabacion.
+	$script:fgTries = 0; $script:fgOk = 0
+	$script:fgTimer = New-Object System.Windows.Forms.Timer
+	$script:fgTimer.Interval = 1000
+	$script:fgTimer.Add_Tick({
+		$script:fgTries++
+		$w = Get-Process -Name 'kyty_emulator*' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+		if ($w) {
+			if ([FgWin]::GetForegroundWindow() -ne $w.MainWindowHandle) { [void][FgWin]::SetForegroundWindow($w.MainWindowHandle); $script:fgOk = 0 }
+			else { $script:fgOk++; if ($script:fgOk -ge 5) { $script:fgTimer.Stop() } }
+		}
+		if ($script:fgTries -ge 90) { $script:fgTimer.Stop() }
+	})
+	$script:fgTimer.Start()
 }
 
 # ---- ventana ----
-$W = 1280; $H = 720
+# (10-22) Pantalla completa sin bordes en la pantalla principal; la columna de ajustes pegada a la derecha.
+$scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+$W = $scr.Width; $H = $scr.Height
 $form = New-Object System.Windows.Forms.Form
 $form.Text            = 'Launcher'
-$form.ClientSize      = New-Object System.Drawing.Size($W, $H)
-$form.StartPosition   = 'CenterScreen'
-$form.FormBorderStyle = 'FixedSingle'
+$form.FormBorderStyle = 'None'
+$form.StartPosition   = 'Manual'
+$form.Bounds          = $scr
 $form.MaximizeBox     = $false
+# Esc cierra el lanzador (como Salir).
+$form.KeyPreview = $true
+$form.Add_KeyDown({ param($sender, $e) if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $form.Close() } })
 $form.BackColor       = [System.Drawing.Color]::FromArgb(14, 16, 22)
 $fondo = Join-Path $root 'fondo-souls.jpg'
 if (Test-Path -LiteralPath $fondo) {
-	$form.BackgroundImage       = [System.Drawing.Image]::FromFile($fondo)
-	$form.BackgroundImageLayout = 'Stretch'
+	# Fondo "cover": llena la pantalla sin deformarse (se recorta lo que sobra por los lados o arriba/abajo).
+	$img = [System.Drawing.Image]::FromFile($fondo)
+	$scale = [math]::Max($W / $img.Width, $H / $img.Height)
+	$sw = [int][math]::Round($W / $scale); $sh = [int][math]::Round($H / $scale)
+	$src = New-Object System.Drawing.Rectangle([int](($img.Width - $sw) / 2), [int](($img.Height - $sh) / 2), $sw, $sh)
+	$bmp = New-Object System.Drawing.Bitmap($W, $H)
+	$gr = [System.Drawing.Graphics]::FromImage($bmp)
+	$gr.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+	$gr.DrawImage($img, (New-Object System.Drawing.Rectangle(0, 0, $W, $H)), $src, [System.Drawing.GraphicsUnit]::Pixel)
+	$gr.Dispose(); $img.Dispose()
+	$form.BackgroundImage       = $bmp
+	$form.BackgroundImageLayout = 'None'
 }
 $ico = Join-Path $root 'kyty_emulator.exe'
 if (Test-Path -LiteralPath $ico) { try { $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($ico) } catch {} }
@@ -279,8 +359,11 @@ function New-Button([string]$text, $x, $y, $w, $h, $primary) {
 
 # Barra inferior semitransparente: Play, la casilla del frame generation, Settings y Salir.
 $panel = New-Object System.Windows.Forms.Panel
-$panel.Location  = New-Object System.Drawing.Point(0, ($H - 178))
-$panel.Size      = New-Object System.Drawing.Size($W, 178)
+$panelW = 440
+$panel.Location  = New-Object System.Drawing.Point(($W - $panelW), 0)
+$panel.Size      = New-Object System.Drawing.Size($panelW, $H)
+$panel.AutoScroll = $true
+$panel.Anchor = 'Top, Bottom, Right'
 $panel.BackColor = $panelBack
 $form.Controls.Add($panel)
 
@@ -289,7 +372,6 @@ $btnPlay.Font = New-Object System.Drawing.Font('Segoe UI Black', 22, [System.Dra
 $btnPlay.Add_Click({ Start-Game })
 $panel.Controls.Add($btnPlay)
 
-$panel.Controls.Add((New-Label 'Frame generation' $smallFont $ink 350 30 300 22))
 $cmbFg = New-Object System.Windows.Forms.ComboBox
 $cmbFg.DropDownStyle = 'DropDownList'
 $cmbFg.Font      = $subFont
@@ -328,7 +410,9 @@ $chkLowPc = New-Check 'Modo TURBO (16 GB)' 670 14 230 'lowpc'
 $chkUnlock = New-Check 'FPS desbloqueados' 910 14 180 'unlock'
 $chkTurbo2 = New-Check 'TURBO (VRAM 8 GB o menos)' 670 14 230 'turbo2'
 $chkPc16 = New-Check 'Equipo de 16 GB RAM' 670 14 230 'pc16'
-$chkLowEnd = New-Check 'Modo graficas de 8 GB' 910 44 220 'lowend'
+$chkLowEnd = New-Check 'Modo Souls ligero' 910 44 220 'lowend'
+$chkLowEnd45 = New-Check 'Modo Souls equilibrado' 0 0 260 'lowend45'
+$chkAntiLag = New-Check 'Anti-Lag' 500 4 140 'antilag'
 $chkExcl = New-Check 'Pantalla exclusiva' 50 30 180 'exclusive'
 $chkPresetC = New-Check 'DLSS FG Preset C' 1100 44 200 'presetc'
 $chkSafeGpu = New-Check 'Modo GPU seguro' 1100 14 170 'safegpu'
@@ -345,6 +429,9 @@ $chkGsync.Checked = $true; $chkGsync.Visible = $false
 $chkMetricas = New-Check 'Metricas' 180 116 130 'metricas'
 $tips.SetToolTip($chkMetricas, 'Muestra encima del juego GPU, VRAM, CPU, RAM, FPS y la grafica del frametime')
 $panel.Controls.Add($chkMetricas)
+$chkAf16 = New-Check 'Filtrado x16' 320 116 150 'af16'
+$tips.SetToolTip($chkAf16, 'Filtrado anisotropico x16 en las texturas: suelos y paredes nitidos a lo lejos y en angulo. Cuesta muy poco.')
+$panel.Controls.Add($chkAf16)
 $chkRam16 = New-Check 'Simular 16 GB RAM' 50 4 200 'ram16sim'
 $tips.SetToolTip($chkRam16, 'Solo el juego: como mucho 12 GB en RAM (4 GB para Windows), el resto a disco, como un PC de 16 GB. Abre las metricas.')
 $panel.Controls.Add($chkRam16)
@@ -368,8 +455,18 @@ $panel.Controls.Add($chkTurbo2)
 $chkTurbo2.Checked = $false; $chkTurbo2.Visible = $false
 $tips.SetToolTip($chkPc16, 'PCs con 16 GB de RAM: el emulador guarda menos en RAM (6 GB fijos) y precarga menos. No cambia los graficos.')
 $panel.Controls.Add($chkPc16)
-$tips.SetToolTip($chkLowEnd, 'Adaptado para graficas de 8 GB como RTX 3060, RTX 3060 Ti, RTX 3070, RTX 2070/2080, RX 6600, RX 6600 XT o RX 6650 XT: el juego a 30 FPS estables y frame generation de AMD x2 (60 en pantalla). Reescalado solo con XeSS o FSR.')
+$tips.SetToolTip($chkLowEnd, 'Adaptado para graficas de 8 GB como RTX 3060, RTX 3060 Ti, RTX 3070, RTX 2070/2080, RX 6600, RX 6600 XT o RX 6650 XT: el juego a 30 FPS estables y frame generation de AMD x2 (60 en pantalla). A 1080p, con el antialiasing de XeSS o de FSR (sin reescalar).')
 $panel.Controls.Add($chkLowEnd)
+$tips.SetToolTip($chkLowEnd45, 'Para graficas de la potencia de una RTX 3080: RTX 2080 Ti, RTX 3070 Ti, RTX 3080, RTX 3080 Ti, RTX 4060 Ti, RTX 4070, RX 6800, RX 6800 XT, RX 6900 XT, RX 6950 XT, RX 7700 XT, RX 7800 XT o Intel Arc B580: el juego a 45 FPS estables y frame generation de AMD x2 (90 en pantalla). A 1440p, con el reescalado que elijas.')
+$panel.Controls.Add($chkLowEnd45)
+# (10-22) Solo uno de los dos modos a la vez (si ya estaban los dos en el ini, gana el de 30).
+if ($chkLowEnd.Checked -and $chkLowEnd45.Checked) { $chkLowEnd45.Checked = $false }
+$tips.SetToolTip($chkAntiLag, 'Menos retraso en los controles: AMD Anti-Lag 2 en graficas AMD, limitador del emulador en las demas. No hace nada con DLSS (ya usa Reflex).')
+$panel.Controls.Add($chkAntiLag)
+$chk4K = New-Check 'Modo 4K' 0 0 120 'modo4k'
+$tips.SetToolTip($chk4K, 'El juego arranca en su modo cinematico a 4K (como en PS5). Con un reescalador, su resolucion se calcula para 4K.')
+$panel.Controls.Add($chk4K)
+$chk4K.Add_CheckedChanged({ Fill-Res })
 $tips.SetToolTip($chkUnlock, 'El juego pasa de 60 FPS reales, tambien con frame generation (videos, menus y cargas siguen a 60)')
 # (Oculta otra vez, 10-19: a 120 Hz tirones (frames de 8 y 17 ms alternos a ~80 FPS); a 360 Hz con flip al estar listo,
 # fluido pero una cinematica del motor iba acelerada: el juego ata algunas cosas a los frames.)
@@ -410,10 +507,23 @@ function Draw-ColoredItem($combo, $e) {
 # con la de NVIDIA solo DLSS; con la de AMD, FSR y XeSS; sin generacion, todos.
 $script:resShown = @()
 function Get-ResFamilies {
+	# (10-22) Modo graficas de 8 GB: frame generation de AMD, asi que XeSS y FSR (aunque la lista tenga uno de NVIDIA).
+	if ($chkLowEnd -and $chkLowEnd.Checked) { return @('xess', 'fsr') }
+	# (10-22) Modo Souls equilibrado: frame generation de AMD, asi que sin DLSS (XeSS, FSR o el del juego).
+	if ($chkLowEnd45 -and $chkLowEnd45.Checked) { return @('', 'xess', 'fsr', 'juego') }
 	$cfg = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	if ($cfg -like 'dlss*') { return @('', 'dlss', 'juego') }
 	if ($cfg -like 'fsr3*') { return @('', 'xess', 'fsr', 'juego') }
 	return @('', 'dlss', 'xess', 'fsr', 'juego')
+}
+function Get-OutHeight {
+	# (10-22) Modo graficas de 8 GB: siempre 1080p.
+	if ($chkLowEnd -and $chkLowEnd.Checked) { return 1080 }
+	# (10-22) Modo 45 FPS: siempre 1440p.
+	if ($chkLowEnd45 -and $chkLowEnd45.Checked) { return 1440 }
+	if ($cmbOut) { switch ($cmbOut.SelectedIndex) { 1 { return 2160 } 2 { return 1080 } 3 { return 720 } } }
+	if ($chk4K -and $chk4K.Checked) { return 2160 }
+	return 1440
 }
 function Fill-Res {
 	$wanted = Get-IniValue 'scalelabel' '1440p nativo'
@@ -426,11 +536,20 @@ function Fill-Res {
 		# menos de 1080 se veia peor.
 		# (10-21) TURBO ya no limita la resolucion ni los modos de reescalado.
 		# PC bajos requisitos: sin DLSS (usa el frame generation de AMD x2; solo XeSS, FSR o nativo).
-		if ($chkLowEnd -and $chkLowEnd.Checked -and $family -eq 'dlss') { $modes = @() }
+		# (10-22) DLSS Equilibrado y Ultra rendimiento solo a 4K: sobre 1440 caen por debajo de lo que acepta DLSS.
+		# Modo graficas de 8 GB: frame generation de AMD, asi que sin DLSS (todos los de XeSS y FSR).
+		if ($chkLowEnd -and $chkLowEnd.Checked) { $modes = @($modes | Where-Object { $_[0] -in 'XeSS AA', 'FSR AA nativo' }) }
+		# (10-22) Modo graficas de 8 GB: tambien sin reescalado (1080p nativo, sin XeSS ni FSR), lo primero de la lista.
+		if ($chkLowEnd -and $chkLowEnd.Checked -and $family -eq 'xess') { $shown += , @('Sin reescalado (1080p nativo)', 1080, '', 0) }
+		$outH = Get-OutHeight
+		if ($family -eq 'dlss') { $modes = @($modes | Where-Object { $h = [math]::Round($outH / $_[1]); $h -ge 1080 -or $h -eq 720 }) }
+		elseif ($family -in 'xess', 'fsr' -and $outH -lt 1440) { $modes = @($modes | Where-Object { $outH / $_[1] -ge 719 }) }
+		if ($family -eq 'juego' -and $outH -lt 1440) { $modes = @() }
 		if ($modes.Count -eq 0) { continue }
 		if ($titles.ContainsKey($family)) { $shown += , @($titles[$family], 0, '', 0) }
 		foreach ($m in $modes) { $shown += , $m }
 	}
+	if ($shown.Count -eq 0) { $shown = @(, $resModes[0]) }
 	$script:resShown = $shown
 	$script:resFilling = $true
 	$cmbRes.Items.Clear()
@@ -445,7 +564,7 @@ $cmbRes.DropDownStyle = 'DropDownList'
 $cmbRes.Font     = $smallFont
 $cmbRes.Location = New-Object System.Drawing.Point(555, 100)
 $cmbRes.Size     = New-Object System.Drawing.Size(110, 26)
-$cmbRes.DropDownWidth = 170
+$cmbRes.DropDownWidth = 230
 $cmbRes.DrawMode = 'OwnerDrawFixed'
 $cmbRes.ItemHeight = 20
 $cmbRes.BackColor = [System.Drawing.Color]::FromArgb(24, 26, 34)
@@ -464,10 +583,19 @@ $tips.SetToolTip($cmbRes, 'Reescalado: dibuja el 3D a menos resolucion y lo sube
 $panel.Controls.Add($cmbRes)
 Fill-Res
 $cmbFg.Add_SelectedIndexChanged({ Fill-Res })
+# (10-22) Con frame generation dinamico los FPS quedan bloqueados (el juego a su base): la casilla se desmarca y no se puede marcar.
+function Update-UnlockForFg {
+	$cfg = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
+	$chkUnlock.Enabled = $true
+}
+$cmbFg.Add_SelectedIndexChanged({ Update-UnlockForFg })
+Update-UnlockForFg
 $chkTurbo2.Add_CheckedChanged({ Fill-Res })
 # PC bajos requisitos: la lista de frame generation bloqueada (va con AMD x2) y sin modos DLSS.
-$chkLowEnd.Add_CheckedChanged({ $cmbFg.Enabled = -not $chkLowEnd.Checked; Fill-Res })
-$cmbFg.Enabled = -not $chkLowEnd.Checked
+function Update-LowEnd { $low = Is-FixedFg; $cmbFg.Enabled = -not $low; if ($cmbOut) { if ($chkLowEnd45.Checked) { $cmbOut.SelectedIndex = 0 }; $cmbOut.Enabled = -not $low; $chk4K.Checked = (-not $low) -and $cmbOut.SelectedIndex -eq 1 }; if ($cmbPreset) { $cmbPreset.Enabled = -not $low }; Fill-Res }
+$chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { $chkLowEnd45.Checked = $false }; Update-LowEnd })
+$chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { $chkLowEnd.Checked = $false }; Update-LowEnd })
+$cmbFg.Enabled = -not (Is-FixedFg)
 $cmbFg.Add_DrawItem({ param($sender, $e) Draw-ColoredItem $sender $e })
 
 $cmbPreset = New-Object System.Windows.Forms.ComboBox
@@ -482,6 +610,7 @@ $cmbPreset.SelectedIndex = [math]::Min([math]::Max(0, $presetIndex), $dlssPreset
 $cmbPreset.Add_SelectedIndexChanged({ Set-IniValue 'dlsspreset' "$($cmbPreset.SelectedIndex)" })
 $tips.SetToolTip($cmbPreset, 'Modelo de DLSS: auto (el de NVIDIA), K = DLSS 4, L y M = DLSS 4.5 (mas nitidos, algo mas lentos)')
 $panel.Controls.Add($cmbPreset)
+$cmbPreset.Enabled = -not (Is-FixedFg)  # (10-22) modos Souls (AMD): el modelo DLSS no se usa
 
 # Nitidez del reescalado: Auto (FSR 0.3, DLSS y XeSS sin nada) o un nivel fijo para todos.
 $sharpLevels = @(@('Nitidez: auto', ''), @('Nitidez: 0', '0'), @('Nitidez: 25%', '0.25'), @('Nitidez: 50%', '0.5'),
@@ -519,6 +648,7 @@ function New-GfxCombo([string]$label, [string]$key, $x, [string]$tip) {
 	return $c
 }
 $cmbTex  = New-GfxCombo 'Texturas' 'gfxtex' 290 'Texturas: Medio = mitad de tamano, Bajo = un cuarto. Lo que mas VRAM ahorra.'
+$cmbShadow = New-GfxCombo 'Sombras' 'gfxshadow' 710 'Sombras: Medio = las del sol hasta 125 m, Bajo = hasta 60 m y sin sombras de focos ni ambientales. Mas FPS, pero pueden aparecer de golpe.'
 $cmbDist = New-GfxCombo 'Distancia' 'gfxdist' 500 'Distancia de dibujado: a menos nivel, los objetos lejanos pasan antes a modelos mas simples. Mas FPS si va justo el procesador.'
 
 # Precompilar los shaders del juego (todos, de los archivos del juego): la primera vez puede tardar horas.
@@ -545,15 +675,131 @@ $panel.Controls.Add($btnSettings)
 $btnExit = New-Button 'Salir' ($W - 190) 46 140 58 $false
 $btnExit.Add_Click({ $form.Close() })
 $panel.Controls.Add($btnExit)
-# Fila de arriba (10-21): pantalla exclusiva y Preset C; todo lo demas baja 28 px (antes se tapaban con PLAY y Salir).
-foreach ($c in @($panel.Controls)) { if ($c -ne $chkExcl -and $c -ne $chkPresetC -and $script:gfxTop -notcontains $c) { $c.Top += 28 } }
-$chkExcl.Location = New-Object System.Drawing.Point(50, 4)
-$chkPresetC.Location = New-Object System.Drawing.Point(260, 4)
-$chkLowEnd.Location = New-Object System.Drawing.Point(50, 4)
+$chk4K.Visible = $false
+# (10-22) Salida: 1440p (el monitor), 4K (modo cinematico del juego), 1080p y 720p (graficas mas modestas). Los
+# reescaladores calculan su resolucion sobre esa altura.
+$lbOut = New-Label 'Salida' $smallFont $ink 925 6 60 22; $panel.Controls.Add($lbOut)
+$cmbOut = New-Object System.Windows.Forms.ComboBox
+$cmbOut.DropDownStyle = 'DropDownList'; $cmbOut.Font = $smallFont
+$cmbOut.Location = New-Object System.Drawing.Point(985, 2); $cmbOut.Size = New-Object System.Drawing.Size(130, 26)
+foreach ($l in '1440p (monitor)', '4K (cinematico)', '1080p', '720p') { [void]$cmbOut.Items.Add($l) }
+$oi = 0; [void][int]::TryParse((Get-IniValue 'salida' $(if ($chk4K.Checked) { '1' } else { '0' })), [ref]$oi)
+$cmbOut.SelectedIndex = [math]::Min([math]::Max(0, $oi), 3)
+$chk4K.Checked = ($cmbOut.SelectedIndex -eq 1)
+$cmbOut.Add_SelectedIndexChanged({ Set-IniValue 'salida' "$($cmbOut.SelectedIndex)"; $chk4K.Checked = ($cmbOut.SelectedIndex -eq 1) -and -not (Is-FixedFg); Fill-Res })
+$tips.SetToolTip($cmbOut, 'Resolucion de salida. 4K: el juego arranca en su modo cinematico a 4K. 1080p y 720p: para graficas mas modestas.')
+$panel.Controls.Add($cmbOut)
+# (10-22) Iluminacion RT (rayos sobre la imagen: luz rebotada y sombreado de contacto). Solo con DLSS, XeSS o FSR.
+$lbRt = New-Label 'Luz RT' $smallFont $ink 1125 6 60 22; $panel.Controls.Add($lbRt)
+$cmbRt = New-Object System.Windows.Forms.ComboBox
+$cmbRt.DropDownStyle = 'DropDownList'; $cmbRt.Font = $smallFont
+$cmbRt.Location = New-Object System.Drawing.Point(1185, 2); $cmbRt.Size = New-Object System.Drawing.Size(85, 26)
+foreach ($l in 'No', 'Media', 'Alta', 'Ultra') { [void]$cmbRt.Items.Add($l) }
+$ri = 0; [void][int]::TryParse((Get-IniValue 'ssgi' '0'), [ref]$ri)
+$cmbRt.SelectedIndex = [math]::Min([math]::Max(0, $ri), 3)
+$cmbRt.Add_SelectedIndexChanged({ Set-IniValue 'ssgi' "$($cmbRt.SelectedIndex)" })
+$tips.SetToolTip($cmbRt, 'Iluminacion por rayos sobre la imagen (luz rebotada y sombreado de contacto). Solo funciona con DLSS, XeSS o FSR. Cuesta FPS. Experimental.')
+$panel.Controls.Add($cmbRt)
+$cmbOut.Enabled = -not (Is-FixedFg)
+if ($chkLowEnd45.Checked) { $cmbOut.SelectedIndex = 0 }
+if (Is-FixedFg) { $chk4K.Checked = $false }
+
+# ---- (10-22) Disposicion por apartados: cada control a su grupo (mismo nombre, clave, tooltip y eventos) ----
+function New-Group([string]$text, $x, $y, $w, $h) {
+	$g = New-Object System.Windows.Forms.GroupBox
+	$g.Text = $text; $g.Font = $boldSmall; $g.ForeColor = $gold
+	$g.BackColor = [System.Drawing.Color]::Transparent
+	$g.Location = New-Object System.Drawing.Point($x, $y); $g.Size = New-Object System.Drawing.Size($w, $h)
+	$panel.Controls.Add($g)
+	return $g
+}
+function Move-To($ctl, $grp, $x, $y, $w) {
+	# Colores y letra de antes (si no, los heredaria del grupo).
+	$fc = $ctl.ForeColor; $fn = $ctl.Font
+	$grp.Controls.Add($ctl)
+	$ctl.ForeColor = $fc; $ctl.Font = $fn
+	$ctl.Location = New-Object System.Drawing.Point($x, $y)
+	if ($w) { $ctl.Width = $w }
+}
+$gImg = New-Group 'Imagen' 10 8 420 152
+$gFg  = New-Group 'Frame generation' 10 456 420 94
+$gGfx = New-Group 'Calidad grafica' 10 168 420 280
+$gScr = New-Group 'Pantalla y otros' 10 558 420 56
+$gPc  = New-Group 'Rendimiento / PC' 10 622 420 146
+# Imagen: salida, reescalado, preset y nitidez.
+Move-To $lbOut $gImg 10 26 98
+Move-To $cmbOut $gImg 110 24 296
+$lbRes = New-Label 'Reescalado' $smallFont $ink 0 0 88 22; Move-To $lbRes $gImg 10 58 98
+Move-To $cmbRes $gImg 110 56 296
+$lbPreset = New-Label 'Preset' $smallFont $ink 0 0 88 22; Move-To $lbPreset $gImg 10 90 98
+Move-To $cmbPreset $gImg 110 88 296
+$lbSharp = New-Label 'Nitidez' $smallFont $ink 0 0 88 22; Move-To $lbSharp $gImg 10 122 98
+Move-To $cmbSharp $gImg 110 120 296
+# Frame generation: modo, FPS desbloqueados y Anti-Lag.
+Move-To $cmbFg $gFg 12 24 396
+Move-To $chkUnlock $gFg 12 60 200
+$chkUnlock.Visible = $false  # (10-22) sin casilla: siempre desbloqueados salvo DLSS y modos Souls
+Move-To $chkAntiLag $gFg 222 60 186
+# Calidad grafica: texturas, distancia, sombras, Luz RT y filtrado x16 ($script:gfxTop: etiqueta y desplegable de Texturas, Sombras, Distancia).
+Move-To $script:gfxTop[0] $gGfx 10 26 98; Move-To $cmbTex $gGfx 110 24 296
+Move-To $script:gfxTop[4] $gGfx 10 58 98; Move-To $cmbDist $gGfx 110 56 296
+Move-To $script:gfxTop[2] $gGfx 10 90 98; Move-To $cmbShadow $gGfx 110 88 296
+Move-To $lbRt $gGfx 10 122 98; Move-To $cmbRt $gGfx 110 120 296
+$lbCs = New-Label 'Sombras RT' $smallFont $ink 0 0 88 22
+$cmbCs = New-Object System.Windows.Forms.ComboBox
+$cmbCs.DropDownStyle = 'DropDownList'; $cmbCs.Font = $smallFont
+foreach ($l in 'No', 'Normal', 'Alta', 'Ultra') { [void]$cmbCs.Items.Add($l) }
+$ci = 0; [void][int]::TryParse((Get-IniValue 'cshadow' '0'), [ref]$ci)
+$cmbCs.SelectedIndex = [math]::Min([math]::Max(0, $ci), 3)
+$cmbCs.Add_SelectedIndexChanged({ Set-IniValue 'cshadow' "$($cmbCs.SelectedIndex)" })
+$tips.SetToolTip($cmbCs, 'Sombras de contacto por rayos sobre la imagen hacia el sol (donde los objetos tocan suelo y paredes). Solo con DLSS, XeSS o FSR. Cuesta FPS. Experimental.')
+Move-To $lbCs $gGfx 10 154 98; Move-To $cmbCs $gGfx 110 152 296
+$lbAo = New-Label 'Oclusion' $smallFont $ink 0 0 98 22
+$cmbAo = New-Object System.Windows.Forms.ComboBox
+$cmbAo.DropDownStyle = 'DropDownList'; $cmbAo.Font = $smallFont
+foreach ($l in 'No', 'Normal', 'Alta', 'Ultra') { [void]$cmbAo.Items.Add($l) }
+$iAo = 0; [void][int]::TryParse((Get-IniValue 'gtao' '0'), [ref]$iAo)
+$cmbAo.SelectedIndex = [math]::Min([math]::Max(0, $iAo), 3)
+$cmbAo.Add_SelectedIndexChanged({ Set-IniValue 'gtao' "$($cmbAo.SelectedIndex)" })
+$tips.SetToolTip($cmbAo, 'Oclusion ambiental avanzada (GTAO): rincones, grietas y contactos mas realistas. Solo con DLSS, XeSS o FSR. Cuesta FPS. Experimental.')
+Move-To $lbAo $gGfx 10 186 98; Move-To $cmbAo $gGfx 110 184 296
+$lbSsr = New-Label 'Reflejos RT' $smallFont $ink 0 0 98 22
+$cmbSsr = New-Object System.Windows.Forms.ComboBox
+$cmbSsr.DropDownStyle = 'DropDownList'; $cmbSsr.Font = $smallFont
+foreach ($l in 'No', 'Normal', 'Alta', 'Ultra') { [void]$cmbSsr.Items.Add($l) }
+$iSsr = 0; [void][int]::TryParse((Get-IniValue 'ssr' '0'), [ref]$iSsr)
+$cmbSsr.SelectedIndex = [math]::Min([math]::Max(0, $iSsr), 3)
+$cmbSsr.Add_SelectedIndexChanged({ Set-IniValue 'ssr' "$($cmbSsr.SelectedIndex)" })
+$tips.SetToolTip($cmbSsr, 'Reflejos por rayos sobre la imagen en agua, charcos y suelos mojados. Solo con DLSS, XeSS o FSR. Cuesta FPS. Experimental.')
+Move-To $lbSsr $gGfx 10 218 98; Move-To $cmbSsr $gGfx 110 216 296
+Move-To $chkAf16 $gGfx 10 248 200
+# Rendimiento / PC (chkLowPc no se muestra: sigue fuera de la ventana como antes).
+Move-To $chkLowEnd $gPc 12 24 396
+Move-To $chkLowEnd45 $gPc 12 54 396
+Move-To $chkPc16 $gPc 12 84 190
+Move-To $chkSafeGpu $gPc 202 84 206
+Move-To $chkRam16 $gPc 12 114 190
+Move-To $chkVram8 $gPc 202 114 206
+Move-To $chkTurbo2 $gPc 202 114 206
+# Pantalla y otros: HDR, VSync, Metricas en una fila (pantalla exclusiva, Modo 4K, Preset C y G-Sync siguen ocultas,
+# en el mismo sitio: no se ven).
+Move-To $chkHdr $gScr 12 24 120
+Move-To $chkVsync $gScr 142 24 120
+Move-To $chkMetricas $gScr 272 24 136
+Move-To $chkExcl $gScr 12 24 120
+Move-To $chk4K $gScr 142 24 120
+Move-To $chkPresetC $gScr 272 24 136
+Move-To $chkGsync $gScr 12 24 120
+# Botones abajo.
+$btnPlay.Location = New-Object System.Drawing.Point(10, 780); $btnPlay.Size = New-Object System.Drawing.Size(420, 64)
+$btnPre.Location = New-Object System.Drawing.Point(10, 852); $btnPre.Size = New-Object System.Drawing.Size(420, 44)
+$btnSettings.Location = New-Object System.Drawing.Point(10, 904); $btnSettings.Size = New-Object System.Drawing.Size(205, 44)
+$btnExit.Location = New-Object System.Drawing.Point(225, 904); $btnExit.Size = New-Object System.Drawing.Size(205, 44)
 
 # ---- Settings (panel desplegable) ----
 $settings = New-Object System.Windows.Forms.Panel
-$settings.Location  = New-Object System.Drawing.Point(($W - 650), ($H - 388))
+$settings.Location  = New-Object System.Drawing.Point(($W - $panelW - 620), ($H - 210))  # a la izquierda de la columna, abajo
+$settings.Anchor = 'Bottom, Right'
 $settings.Size      = New-Object System.Drawing.Size(610, 190)
 $settings.BackColor = $panelBack
 $settings.Visible   = $false

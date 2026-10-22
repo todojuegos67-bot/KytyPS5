@@ -4,71 +4,47 @@ DEMON'S SOULS (PS5) EN PC - NOVEDADES DE ESTA VERSION
 Que hay de nuevo, explicado sin tecnicismos.
 
 
-1. MULTI FRAME GENERATION (MAS FPS EN PANTALLA)
------------------------------------------------
-El juego va a 60 FPS. Con frame generation, la grafica se inventa
-fotogramas intermedios y en pantalla se ven muchos mas.
-
-- NVIDIA (RTX 40 y 50): x2, x3 y x4.
-- AMD / cualquier grafica: ahora tambien x3 y x4, no solo x2.
-- Modo DINAMICO (NVIDIA y AMD): elige solo el multiplicador para
-  acercarse al maximo de tu monitor sin pasarse.
-  Ejemplo: en un monitor de 240 Hz, unos 180 FPS en pantalla.
-- NVIDIA usa automaticamente el "Preset C", la version nueva y mas
-  rapida del frame generation.
+1. FRAME GENERATION DE NVIDIA (DLSS) MAS SUAVE
+----------------------------------------------
+- DLSS x4 y dinamico ya no van a trompicones: los fotogramas llegan
+  al monitor con un ritmo mucho mas regular (como el de AMD o mejor).
+- Menos ghosting en DLSS x4.
 
 
-2. VIBRACION EN CUALQUIER MANDO
+2. MODO DINAMICO MAS LISTO (NVIDIA Y AMD)
+-----------------------------------------
+Antes se quedaba clavado en x4 aunque la grafica fuera sobrada.
+Ahora, cuando sobra potencia, baja a x3 o x2: mejor imagen y menos
+retraso al mover el mando. Si la grafica va justa, vuelve a subir.
+(Es normal que la grafica trabaje mas: hace mas fotogramas reales.)
+
+
+3. FPS DESBLOQUEADOS
+--------------------
+Siempre desbloqueados, sin casilla, salvo en los modos de grafica de
+8 GB y en los modos Souls ligero y equilibrado.
+
+
+4. NUEVOS MODOS EN EL LAUNCHER
+------------------------------
+- Modo Souls ligero: 1080p, 30 FPS, frame generation AMD x2.
+  Para PCs modestos.
+- Modo Souls equilibrado: 1440p, 45 FPS, frame generation AMD x2,
+  reescalado XeSS / FSR / el del juego. Para graficas tipo
+  RTX 3080 / RX 6800 / RX 6900.
+- Launcher a pantalla completa, con las opciones graficas en una
+  columna a la derecha.
+
+
+5. OPCIONES GRAFICAS NUEVAS (EXPERIMENTALES, APAGADAS POR DEFECTO)
+------------------------------------------------------------------
+- Luz RT (iluminacion global) con nivel Ultra.
+- Oclusion ambiental, reflejos y sombras RT: en pruebas, pueden
+  verse raras todavia.
+- Filtrado anisotropico x16.
+
+
+6. OPCION "EQUIPO DE 16 GB RAM"
 -------------------------------
-Demon's Souls solo vibraba con un DualSense conectado por cable.
-Ahora la vibracion funciona tambien con mandos de Xbox, 8BitDo,
-GameSir y el DualSense por Bluetooth.
-
-
-3. REESCALADO (DLSS, XeSS y FSR)
---------------------------------
-- Arreglada la pantalla negra que salia con algunos modos de DLSS.
-- Los modos de DLSS son ahora: DLAA, Ultra calidad, Calidad y
-  Rendimiento (todos funcionan).
-- Nuevo "FSR AA nativo": suaviza los bordes sin bajar la resolucion.
-- Ajuste de nitidez para que la imagen no se vea borrosa.
-
-
-4. MODO TURBO (PCs MAS MODESTOS)
---------------------------------
-Pensado para graficas de 8 GB o menos y PCs de 16 GB de RAM:
-el juego usa unos 5,5-6 GB de VRAM y menos RAM.
-
-- Arreglado: zonas y texturas que se veian muy oscuras de lejos.
-- Arreglado: texturas oscuras al reaparecer despues de morir.
-- En Turbo solo se ofrecen los modos de antialiasing (DLAA, XeSS AA
-  y FSR AA): reescalar desde menos resolucion se veia peor.
-
-
-5. METRICAS EN PANTALLA
------------------------
-Casilla "Metricas": GPU, VRAM, CPU, RAM, FPS y grafica de tiempos
-de fotograma. Ahora tambien muestra:
-- El reescalado en uso (por ejemplo "DLSS Calidad 1080p -> 1440p").
-- El frame generation en uso y su multiplicador actual
-  (verde = NVIDIA, rojo = AMD).
-
-
-6. LANZADOR
------------
-- Nueva imagen de fondo.
-- Opciones mas claras: se han quitado las que no servian.
-
-
-RECOMENDACIONES
----------------
-- Monitor G-Sync / FreeSync: desmarca VSync en el lanzador y activa
-  la Sincronizacion vertical en el panel de NVIDIA (o AMD).
-- Si tienes una grafica potente, no uses TURBO: esta pensado para
-  equipos mas modestos.
-- La primera vez, usa "Precompilar shaders" para evitar tirones al
-  empezar.
-
-
-Necesitas tu propia copia del juego. El emulador no incluye ningun
-archivo del juego.
+Reduce la memoria de video que se queda retenida. Marcala si tu PC
+tiene 16 GB de RAM o menos.

@@ -70,6 +70,10 @@ param(
 	[int]$RenderHeight = 0,
 	[double]$UpscaleRatio = 0,
 	[string]$ForceMode = '',
+	[int]$Shadows = 0,
+	[switch]$AntiLag,
+	[ValidateSet(-1, 0, 1, 2, 3)][int]$ContactShadows = -1, # KYTY_CONTACT_SHADOWS: sombras de contacto por rayos
+	[ValidateSet(-1, 0, 1, 2, 3)][int]$Ssgi = -1, # KYTY_SSGI: iluminacion por rayos en pantalla antes del reescalador
 	[string]$Upscale = '',
 	[int]$UpscaleHeight = 0,
 	[string]$DlssPreset = '',
@@ -85,15 +89,12 @@ param(
 	[switch]$NoAsyncShaders,
 	[switch]$FlipWhenReady,
 	[switch]$Fsr3FrameGen,
-	[switch]$AntiLag,
 	[switch]$Turbo,
 	[switch]$Turbo2,
 	[switch]$ExclusiveFullscreen,
 	[switch]$Ram16,
 	[switch]$GentlePrecompile,
 	[ValidateSet('', 'dlss', 'xess', 'fsr')][string]$Upscaler = '',
-	[ValidateSet(-1, 0, 1, 2)][int]$Ssgi = -1, # KYTY_SSGI: screen-space GI before the upscaler (0 off, 1 medium, 2 high)
-	[ValidateSet(-1, 0, 1, 2, 3)][int]$ContactShadows = -1, # KYTY_CONTACT_SHADOWS: screen-space contact shadows toward the sun (0 off, 1 normal, 2 high, 3 ultra)
 	[string]$StreamlineDir = '',
 	[string]$Affinity = '',
 	[switch]$AllCcds,
@@ -391,8 +392,7 @@ if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER
 # Quality 1.5, Balanced 1.72, Performance 2.0, Ultra Performance 3.0; the monitor detected by the emulator,
 # KYTY_DISPLAY_HEIGHT overrides it), 720-2160.
 if ($UpscaleRatio -gt 0 -and $RenderHeight -le 0) { $environment['KYTY_UPSCALE_RATIO'] = $UpscaleRatio.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
-# -ForceMode cinematic|performance: the game starts in that graphics mode (KYTY_DS_FORCE_MODE), still changeable in
-# its options; cinematic without -UpscaleRatio is the game's native 3840x2160.
+# -ForceMode cinematic|performance: el juego arranca en ese modo grafico (KYTY_DS_FORCE_MODE), se puede cambiar en sus opciones.
 if ($ForceMode -eq 'cinematic' -or $ForceMode -eq 'performance') { $environment['KYTY_DS_FORCE_MODE'] = $ForceMode }
 elseif ($ForceMode -ne '') { Write-Warning "-ForceMode $ForceMode is not cinematic or performance; ignored" }
 # -Upscale fsr: the 3D image (at -RenderHeight) upscaled to 1440 by FSR 3.1 before the game's composite (frame-gen.h
@@ -426,6 +426,16 @@ if ($Quality -and $Quality -ne 'standard') {
 	if ($titleId -match '^PPSA0134[0-2]$') {
 		$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars[$Quality]) | Where-Object { $_ }) -join ';'
 	}
+}
+# (10-22) -AntiLag: AMD Anti-Lag 2 si el driver lo tiene; si no, limitador del emulador (1 frame en cola). No con DLSS (Reflex).
+if ($AntiLag) { $environment['KYTY_ANTILAG'] = '1' }
+if ($Ssgi -ge 0) { $environment['KYTY_SSGI'] = "$Ssgi" }
+if ($ContactShadows -ge 0) { $environment['KYTY_CONTACT_SHADOWS'] = "$ContactShadows" }
+# (10-22) -Shadows 0|1|2: sombras Maximo (las del juego), Medio (sol hasta 125 m), Bajo (sol hasta 60 m, sin sombreado
+# ambiental ni sombras de focos). A menos nivel pueden aparecer de golpe al acercarse (popping).
+if ($Shadows -gt 0 -and $titleId -match '^PPSA0134[0-2]$') {
+	$shadowConvars = if ($Shadows -eq 1) { 'sunShadowMaxDistance=125' } else { 'sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false' }
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $shadowConvars) | Where-Object { $_ }) -join ';'
 }
 # -TextureReduce 0|1|2: large block-compressed textures held without their 1 or 2 largest levels (KYTY_TEXTURE_REDUCE;
 # without it the emulator takes 1 below 12 GB of video memory, else 0). A simulated 8 GB card at Boletaria 1-1: textures
@@ -472,10 +482,6 @@ if ($FlipWhenReady) { $environment['KYTY_FLIP_WHEN_READY'] = '1' }
 # -Fsr3FrameGen: AMD FSR 3 frame generation x2 (src/local/fsr3-fg.cpp; amd_fidelityfx_vk.dll next to the emulator), on
 # only while the game renders its 3D scene (its TAA pass); movies, menus and loading screens are shown as they are.
 if ($Fsr3FrameGen) { $environment['KYTY_FSR3_FG'] = '1' }
-# -AntiLag: low latency (src/local/anti-lag.h): AMD Anti-Lag 2 where the driver has VK_AMD_anti_lag, else the
-# nothing (KYTY_ANTILAG=2 by hand: the experimental emulator limiter). Works with -Fsr3FrameGen and KYTY_FLIP_FPS (8 GB mode: 30 real x2); off with
-# DLSS / DLSS-G (Reflex).
-if ($AntiLag) { $environment['KYTY_ANTILAG'] = '1' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 # Async shaders (renderDraw.cpp, KYTY_ASYNC_DRAW_PIPELINES): a draw whose pipeline is not compiled yet does
 # not stop the frame; a worker compiles it and the object appears a few frames later. -NoAsyncShaders: off.
@@ -490,12 +496,9 @@ if (!$NoAsyncShaders -and !$Baseline -and !$environment.Contains('KYTY_ASYNC_DRA
 if ($Ram16) {
 	if (!$environment.Contains('KYTY_RESIDENT_MB')) { $environment['KYTY_RESIDENT_MB'] = '6144' }
 	if (!$environment.Contains('KYTY_PREFETCH_MIN_AVAIL_MB')) { $environment['KYTY_PREFETCH_MIN_AVAIL_MB'] = '3072' }
-	# The guest's 13.5 GiB backing store in a sparse, delete-on-close file next to the emulator (KYTY_BACKING_FILE):
-	# no commit charge for it (the page-file section charged all 13.5 GiB at launch: ~20 GB committed on a 16 GB PC,
-	# the commit limit that reboots/crashes them); its cold pages go to that file under pressure, not the page file.
-	# Needs 17.5 GB free on the emulator's drive, else the page file, committed on demand (KYTY_BACKING_ON_DEMAND).
-	if (!$environment.Contains('KYTY_BACKING_FILE')) { $environment['KYTY_BACKING_FILE'] = '1' }
-	if (!$environment.Contains('KYTY_BACKING_ON_DEMAND')) { $environment['KYTY_BACKING_ON_DEMAND'] = '1' }
+	# (10-22) Memoria del juego en un archivo del disco (KYTY_BACKING_FILE): no cuenta para el limite de memoria de Windows.
+	# (10-22) Desactivado: no bajo la memoria privada y el juego se colgaba.
+	if (!$environment.Contains('KYTY_BACKING_FILE')) { $environment['KYTY_BACKING_FILE'] = '0' }
 	Write-Host 'memory:   16 GB profile: 6 GB kept in RAM, the shader prefetch waits under 3 GB free, guest memory file-backed (no commit charge)'
 }
 # -Turbo2: PCs with 8-12 GB of RAM and graphics cards of 4-6 GB: the caches' video memory at 2.5 GB, textures a quarter
@@ -521,8 +524,6 @@ elseif ($Turbo) {
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
 # -Upscaler dlss: src/loader/demonsSoulsSuperResolution.h.
 if ($Upscaler) { $environment['KYTY_UPSCALER'] = $Upscaler }
-if ($Ssgi -ge 0) { $environment['KYTY_SSGI'] = "$Ssgi" }
-if ($ContactShadows -ge 0) { $environment['KYTY_CONTACT_SHADOWS'] = "$ContactShadows" }
 # Without -StreamlineDir, the Streamline folder chosen in the launcher (launcher-settings.json), as the launcher passes
 # it: run.cmd -FrameGen 1 had started with frame generation off, its runtime not found (issue #38).
 if (!$StreamlineDir -and (Test-Path "$PSScriptRoot\launcher-settings.json")) {
@@ -545,20 +546,12 @@ $vblankHz = if ($Vblank -gt 0) { $Vblank } elseif ($Fps120) { 120 } else { 60 }
 if ($vblankHz -gt 60 -and $titleId -match '^PPSA0134[0-2]$' -and "$($environment['KYTY_GAME_CONVARS'])" -notmatch 'gameMinDeltaTime') {
 	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'gameMinDeltaTime=0.004') | Where-Object { $_ }) -join ';'
 }
-# Experimental, off by default (KYTY_DS_VARIABLE_STEP=1): Demon's Souls steps Havok physics at a fixed step taken
-# from the refresh rate (physicsUseFixedTimestep=true, physicsBaseFixedTimestepOnRefreshRate=true: 1/60 s in
-# performance mode, 1/30 s in cinematic; eboot 0x900bdd620 / 0x900bdc730), one step per frame, so above that rate
-# frames can repeat or skip physics-driven motion (judder on VRR). This lets physics step by the frame's real dt.
-# With the GameManager 'Fixed TimeStep' setting on (eboot 0x900b28198), the frame dt also snaps to multiples of
-# fixedDt*gameDeltaTimeCorrectionTolorance (0.5: 8.3 ms steps at 60 Hz); 0.01 makes that 0.17 ms (no effect when off).
+# (10-21) KYTY_DS_VARIABLE_STEP=1: la fisica de Demon's Souls avanza con el tiempo real de cada frame, no a pasos fijos
+# de 1/60 (rendimiento) o 1/30 (cinematico) segun el modo (eboot 0x900bdd620 / 0x900bdc730).
 if ("$($environment['KYTY_DS_VARIABLE_STEP'])" -eq '1' -and $titleId -match '^PPSA0134[0-2]$' -and "$($environment['KYTY_GAME_CONVARS'])" -notmatch 'physicsUseFixedTimestep') {
-	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'physicsUseFixedTimestep=false', 'gameDeltaTimeCorrectionTolorance=0.01') | Where-Object { $_ }) -join ';'
-}
-# The same switch at 60 Hz: the step's floor max(dt, gameMinDeltaTime < 0 ? fixedDt : gameMinDeltaTime) (0x900b28233)
-# is 1/30 s in the cinematic mode, so 60 fps parts of it (logo, menus) advanced 1/30 a frame (twice too fast) once the
-# snap above lets dt follow real time; a 4 ms floor (as above 60 Hz) keeps every mode in real time.
-if ("$($environment['KYTY_DS_VARIABLE_STEP'])" -eq '1' -and $titleId -match '^PPSA0134[0-2]$' -and "$($environment['KYTY_GAME_CONVARS'])" -notmatch 'gameMinDeltaTime') {
-	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'gameMinDeltaTime=0.004') | Where-Object { $_ }) -join ';'
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'physicsUseFixedTimestep=false;gameDeltaTimeCorrectionTolorance=0.01') | Where-Object { $_ }) -join ';'
+	# Sin esto, en cinematico (paso base 1/30) cada frame de 60 del logo/menus contaba como 1/30: el doble de rapido.
+	if ("$($environment['KYTY_GAME_CONVARS'])" -notmatch 'gameMinDeltaTime') { $environment['KYTY_GAME_CONVARS'] += ';gameMinDeltaTime=0.004' }
 }
 
 # The performance cores of a hybrid CPU (Windows' CPU set efficiency classes: an Intel Core with

@@ -189,7 +189,7 @@ $script:lastKey = -1; $script:lastLog = ''
 
 # Reescalado en uso: la ultima linea del log con "<NNN>x<NNN> -> <NNN>x<NNN>" de DLSS, XeSS o FSR (se ignoran las
 # imagenes pequenas de los menus).
-$script:scaleText = $null; $script:scaleLog = ''; $script:scalePos = 0
+$script:scaleText = $null; $script:scaleLog = ''; $script:scalePos = 0; $script:outH = 0; $script:force4k = $false
 function Get-ScaleMode {
 	# El modo elegido en el lanzador (launcher.ini, scalelabel), con su nombre completo.
 	try {
@@ -207,7 +207,7 @@ function Get-Scale {
 	if (-not $LogDir -or -not (Test-Path $LogDir)) { return $null }
 	$log = Get-ChildItem -Path $LogDir -Filter "*.out.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 	if (-not $log) { return $null }
-	if ($log.FullName -ne $script:scaleLog) { $script:scaleLog = $log.FullName; $script:scalePos = 0; $script:scaleText = $null }
+	if ($log.FullName -ne $script:scaleLog) { $script:scaleLog = $log.FullName; $script:scalePos = 0; $script:scaleText = $null; $script:outH = 0; $script:force4k = $false }
 	try {
 		$fs = [System.IO.File]::Open($log.FullName, 'Open', 'Read', 'ReadWrite')
 		if ($fs.Length -lt $script:scalePos) { $script:scalePos = 0 }
@@ -217,16 +217,21 @@ function Get-Scale {
 		$n = $fs.Read($buf, 0, $take); $script:scalePos += $n
 		$fs.Close()
 		$text = [System.Text.Encoding]::UTF8.GetString($buf, 0, $n)
+		# (10-22) Modo 4K: la salida es 2160 (KYTY_DISPLAY_HEIGHT), no la altura del monitor.
+		$d = [regex]::Matches($text, 'on a (\d{3,4}) high display')
+		if ($d.Count -gt 0) { $script:outH = [int]$d[$d.Count - 1].Groups[1].Value }
+		if ($text -match 'starts in its cinematic mode \(KYTY_DS_FORCE_MODE') { $script:force4k = $true; if (-not $script:outH) { $script:outH = 2160 } }
 		$m = [regex]::Matches($text, '(DLSS|XeSS|FSR 3\.1)[^\r\n]*?(\d{3,4})x(\d{3,4}) -> (\d{3,4})x(\d{3,4})')
 		for ($i = $m.Count - 1; $i -ge 0; $i--) {
 			$h = [int]$m[$i].Groups[3].Value
 			if ($h -ge 600) {
 				$kind = $m[$i].Groups[1].Value -replace ' 3\.1', ''
 				if (-not $script:screenH) { $script:screenH = (Get-CimInstance Win32_VideoController | Where-Object { $_.CurrentVerticalResolution } | Select-Object -First 1).CurrentVerticalResolution;  }
-				$screen = $script:screenH  # (resolucion real: Screen.Bounds daba 960 con el escalado de Windows al 150 %)
+				$screen = $(if ($script:outH) { $script:outH } else { $script:screenH })  # (resolucion real: Screen.Bounds daba 960 con el escalado de Windows al 150 %)
 				$script:scaleText = ("{0}{1} {2}p -> {3}p" -f $kind, (Get-ScaleMode), $h, $screen)
 				break
 			}
+		if (-not $script:scaleText -and $script:force4k) { $script:scaleText = 'Nativo 2160p (4K)' }
 		if (-not $script:scaleText) {
 			# Sin reescalador: la resolucion a la que dibuja el juego (con TURBO, 1080 aunque pongas 1440).
 			$n = [regex]::Matches($text, 'performance mode renders (\d{3,4})x(\d{3,4})')
@@ -303,21 +308,28 @@ $timer.Add_Tick({
 	}
 	$sc = Get-Scale
 	if ($sc) {
-		$scaleLabel.Text = "Escala $sc"
+		# (10-22) Modelo de DLSS elegido en el lanzador (dlsspreset: 0 auto, 1 K, 2 L, 3 M).
+		$model = ''
+		if ($sc -like 'DLSS*') {
+			try { $pl = Get-Content (Join-Path (Split-Path $LogDir -Parent) 'launcher.ini') -ErrorAction Stop | Where-Object { $_ -like 'dlsspreset=*' } | Select-Object -First 1; $pi = if ($pl) { [int]$pl.Substring(11) } else { 0 } } catch { $pi = 0 }
+			$model = ' (modelo ' + @('auto', 'K', 'L', 'M')[[math]::Min([math]::Max(0, $pi), 3)] + ')'
+		}
+		$scaleLabel.Text = "Escala $sc$model"
 		$scaleLabel.ForeColor = if ($sc -like 'DLSS*') { [System.Drawing.Color]::LimeGreen } elseif ($sc -like 'FSR*') { [System.Drawing.Color]::Red } elseif ($sc -like 'XeSS*') { [System.Drawing.Color]::DeepSkyBlue } else { [System.Drawing.Color]::Orange }
 	} else { $scaleLabel.Text = '' }
 	$fgName = ''
 	try { $l = Get-Content (Join-Path (Split-Path $LogDir -Parent) 'launcher.ini') -ErrorAction Stop | Where-Object { $_ -like 'fglabel=*' } | Select-Object -First 1; if ($l) { $fgName = $l.Substring(8) } } catch { }
 	if ($fgName -and $fgName -ne 'Sin frame generation') {
 		$mult = if ($fps -and $fps.fgMult) { " (ahora x$($fps.fgMult))" } else { '' }
-		$fgLabel.Text = $(if ($fgName -like 'MODO *') { $fgName } else { "FG $fgName$mult" })
+		$fgModel = if ($fgName -match 'DLSS|Nvidia') { ' (modelo C)' } else { '' }
+		$fgLabel.Text = $(if ($fgName -like 'MODO *') { $fgName } else { "FG $fgName$fgModel$mult" })
 		$fgLabel.ForeColor = if ($fgName -match 'DLSS|Nvidia') { [System.Drawing.Color]::LimeGreen } else { [System.Drawing.Color]::Red }
 	} else { $fgLabel.Text = '' }
 	$gfx = @()
 	try {
 		$ini = Get-Content (Join-Path (Split-Path $LogDir -Parent) 'launcher.ini') -ErrorAction Stop
 		$names = @('Maximo', 'Medio', 'Bajo')
-		foreach ($pair in @(@('gfxtex', 'Texturas'), @('gfxdist', 'Distancia de dibujado'))) {
+		foreach ($pair in @(@('gfxtex', 'Texturas'), @('gfxdist', 'Distancia de dibujado'), @('gfxshadow', 'Sombras'))) {
 			$l = $ini | Where-Object { $_ -like "$($pair[0])=*" } | Select-Object -First 1
 			$v = 0; if ($l) { [void][int]::TryParse($l.Substring($pair[0].Length + 1), [ref]$v) }
 			$gfx += "$($pair[1]) $($names[[math]::Min([math]::Max($v, 0), 2)])"
