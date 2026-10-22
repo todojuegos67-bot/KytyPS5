@@ -9,6 +9,10 @@
 #include <cstdlib>
 #include <mutex>
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 namespace Libs::Graphics::AntiLag {
 
 // VK_AMD_anti_lag, declared here (older Vulkan headers do not have it; the values are the registry's).
@@ -63,6 +67,19 @@ VkSemaphore                 g_semaphore = VK_NULL_HANDLE;
 uint64_t                    g_semaphore_value = 0;
 VkSwapchainLatencyCreateInfoNV g_latency_create {};
 std::atomic<bool>           g_fsr3_logged {false};
+bool                        g_fsr3_real = false; // g_swapchain is FSR 3's real one: the DLL marks its presents
+
+// The patched amd_fidelityfx_vk.dll (tools/local/fsr3-mfg): the driver swapchain behind its frame interpolation one.
+using RealSwapchainFn = VkSwapchainKHR (*)(VkSwapchainKHR);
+RealSwapchainFn Fsr3RealSwapchain() {
+#if defined(_WIN32)
+	HMODULE module = GetModuleHandleA("amd_fidelityfx_vk.dll");
+	if (module == nullptr) return nullptr;
+	return reinterpret_cast<RealSwapchainFn>(GetProcAddress(module, "kytyFfxGetRealSwapchainVK"));
+#else
+	return nullptr;
+#endif
+}
 
 void ReflexMarker(VkLatencyMarkerNV marker, uint64_t index) {
 	std::lock_guard lock(g_reflex_mutex);
@@ -227,7 +244,12 @@ void OnPresent(uint64_t frame_index) {
 	if (mode == Mode::Amd) Mark(kStagePresent, frame_index);
 	if (mode == Mode::Reflex) {
 		ReflexMarker(VK_LATENCY_MARKER_RENDERSUBMIT_END_NV, frame_index);
-		ReflexMarker(VK_LATENCY_MARKER_PRESENT_START_NV, frame_index);
+		bool fsr3 = false;
+		{
+			std::lock_guard lock(g_reflex_mutex);
+			fsr3 = g_fsr3_real;
+		}
+		if (!fsr3) ReflexMarker(VK_LATENCY_MARKER_PRESENT_START_NV, frame_index);
 	}
 	{
 		std::lock_guard lock(g_mutex);
@@ -240,8 +262,9 @@ bool ReflexActive() {
 	return g_mode.load(std::memory_order_relaxed) == Mode::Reflex;
 }
 
-void* ChainSwapchain(void* next) {
+void* ChainSwapchain(void* next, bool fsr3) {
 	if (!ReflexActive()) return next;
+	if (fsr3 && Fsr3RealSwapchain() == nullptr) return next; // (AMD's signed DLL refuses unknown structures)
 	g_latency_create                    = {};
 	g_latency_create.sType              = VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV;
 	g_latency_create.latencyModeEnable  = VK_TRUE;
@@ -253,15 +276,23 @@ void OnSwapchain(VkSwapchainKHR swapchain, bool fsr3) {
 	if (!ReflexActive()) return;
 	std::lock_guard lock(g_reflex_mutex);
 	g_swapchain = VK_NULL_HANDLE;
+	g_fsr3_real = false;
 	if (swapchain == VK_NULL_HANDLE) return;
 	if (fsr3) {
-		// (FSR 3's handle is its frame interpolation swapchain, not a driver swapchain: Reflex cannot be set on it.)
+		// FSR 3's handle is its frame interpolation swapchain: the patched DLL gives the driver swapchain behind it (made
+		// with latency mode), whose real-frame presents it marks PRESENT_START / END with our frame index.
+		const auto            get  = Fsr3RealSwapchain();
+		const VkSwapchainKHR  real = get != nullptr ? get(swapchain) : VK_NULL_HANDLE;
 		if (!g_fsr3_logged.exchange(true)) {
-			std::printf("Anti-Lag: NVIDIA Reflex off for the FSR 3 frame generation swapchain (its real swapchain is AMD's, "
-			            "not reachable for vkSetLatencySleepModeNV): no sleep, no markers\n");
+			std::printf(real != VK_NULL_HANDLE
+			                ? "Anti-Lag: NVIDIA Reflex on FSR 3 frame generation's real swapchain (patched FidelityFX DLL)\n"
+			                : "Anti-Lag: NVIDIA Reflex off for the FSR 3 frame generation swapchain (its real swapchain is AMD's: "
+			                  "this amd_fidelityfx_vk.dll does not give it, the patched one does): no sleep, no markers\n");
 			std::fflush(stdout);
 		}
-		return;
+		if (real == VK_NULL_HANDLE) return;
+		swapchain   = real;
+		g_fsr3_real = true;
 	}
 	VkLatencySleepModeInfoNV info {};
 	info.sType             = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV;
@@ -272,13 +303,19 @@ void OnSwapchain(VkSwapchainKHR swapchain, bool fsr3) {
 	if (result == VK_SUCCESS) {
 		g_swapchain = swapchain;
 	} else {
+		g_fsr3_real = false;
 		std::printf("Anti-Lag: vkSetLatencySleepModeNV failed (%d): Reflex off for this swapchain\n", static_cast<int>(result));
 		std::fflush(stdout);
 	}
 }
 
 void AfterPresent(uint64_t frame_index) {
-	if (ReflexActive()) ReflexMarker(VK_LATENCY_MARKER_PRESENT_END_NV, frame_index);
+	if (!ReflexActive()) return;
+	{
+		std::lock_guard lock(g_reflex_mutex);
+		if (g_fsr3_real) return; // (the DLL's present thread marks the real frame's present)
+	}
+	ReflexMarker(VK_LATENCY_MARKER_PRESENT_END_NV, frame_index);
 }
 
 uint64_t PresentId(uint64_t frame_index) {

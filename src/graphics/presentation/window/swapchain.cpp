@@ -1000,8 +1000,11 @@ void Swapchain::Create() {
 	// (The chain lives until the swapchain is made: Streamline's vkCreateSwapchainKHR and AMD's frame interpolation
 	// swapchain pass it on to the driver's; AMD's copies VkSurfaceFullScreenExclusive[Win32]InfoEXT, FFX 1.1.4.)
 	if (exclusive) create_info.pNext = &exclusive_info;
+	// KYTY_ANTILAG (Reflex): the latency mode for the swapchain (FSR 3's: its real one, with the patched DLL only).
+	const void* chain_base = create_info.pNext;
+	if (Fsr3::Requested()) create_info.pNext = AntiLag::ChainSwapchain(const_cast<void*>(chain_base), true);
 	m_fsr3 = Fsr3::CreateSwapchain(graphics, create_info, &m_handle);
-	if (!m_fsr3) create_info.pNext = AntiLag::ChainSwapchain(const_cast<void*>(create_info.pNext)); // KYTY_ANTILAG: Reflex
+	if (!m_fsr3) create_info.pNext = AntiLag::ChainSwapchain(const_cast<void*>(chain_base), false);
 	if (!m_fsr3) {
 		if (exclusive && !FrameGen::StreamlineLoaded() && exclusive_info.fullScreenExclusive != kFullScreenExclusiveApplicationControlled) {
 			// (FSR 3 asked for but its swapchain not made: the plain one, application controlled.)
@@ -1011,7 +1014,7 @@ void Swapchain::Create() {
 		if (result != vk::Result::eSuccess && exclusive) {
 			LogExclusive("not supported (vkCreateSwapchainKHR with it: " + vk::to_string(result) + "): borderless full screen");
 			exclusive         = false;
-			create_info.pNext = AntiLag::ChainSwapchain(nullptr);
+			create_info.pNext = AntiLag::ChainSwapchain(nullptr, false);
 			m_handle          = nullptr;
 			result            = graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle);
 		}
@@ -1374,7 +1377,7 @@ Swapchain::Status Swapchain::Present() {
 	present.waitSemaphoreCount = 1;
 	// KYTY_ANTILAG (NVIDIA Reflex): the frame index as the present's id, as its latency markers have it.
 	vk::PresentIdKHR present_id {};
-	if (m_present_id != 0 && !m_fsr3) {
+	if (m_present_id != 0) { // (FSR 3: the patched DLL passes it to the real frame's present)
 		present_id.swapchainCount = 1;
 		present_id.pPresentIds    = &m_present_id;
 		present.pNext             = &present_id;

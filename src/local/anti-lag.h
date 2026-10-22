@@ -11,7 +11,8 @@
 //  - NVIDIA (VK_NV_low_latency2 + VK_KHR_present_id, no Streamline): Reflex. vkLatencySleepNV waited for at the same
 //    controller read, SIMULATION_START / INPUT_SAMPLE there, SIMULATION_END / RENDERSUBMIT_START at the flip,
 //    RENDERSUBMIT_END / PRESENT_START / PRESENT_END around the present, whose VkPresentIdKHR is the frame index.
-//    Not on FSR 3's frame generation swapchain (its real swapchain is AMD's): off there, logged.
+//    With FSR 3 frame generation: on its real swapchain through the patched amd_fidelityfx_vk.dll
+//    (kytyFfxGetRealSwapchainVK; its present thread chains the id and marks PRESENT_START / END on real frames), else off.
 // Off when Streamline (DLSS / DLSS-G) is loaded: Reflex is then active.
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -29,7 +30,7 @@ void OnDevice(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool extensio
 // NVIDIA Reflex (VK_NV_low_latency2, KYTY_ANTILAG=1 without Streamline): the swapchain's VkSwapchainLatencyCreateInfoNV
 // chained before `next`; the swapchain made (sleep mode on) or about to go (VK_NULL_HANDLE); FSR 3's: none (logged).
 [[nodiscard]] bool ReflexActive();
-void*              ChainSwapchain(void* next);
+void*              ChainSwapchain(void* next, bool fsr3);
 void               OnSwapchain(VkSwapchainKHR swapchain, bool fsr3);
 // The present's VkPresentIdKHR (0: none) and its PRESENT_END marker.
 [[nodiscard]] uint64_t PresentId(uint64_t frame_index);
