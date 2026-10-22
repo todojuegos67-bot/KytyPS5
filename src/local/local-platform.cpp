@@ -1584,9 +1584,11 @@ inline size_t Hash(uint64_t address) {
 } // namespace MemoryTags
 
 bool MemoryTagsEnabled() {
+	// KYTY_MEMORY_TAGS=1 (default off): a regression (black screen after the intro video on an RTX) followed the
+	// hooks being on by default; off, operator new/delete are plain malloc/free and Vulkan memory is not wrapped.
 	static const bool on = [] {
-		const char* text = std::getenv("KYTY_MEMORY_BREAKDOWN_SECONDS");
-		return text == nullptr || std::strtoul(text, nullptr, 10) != 0;
+		const char* text = std::getenv("KYTY_MEMORY_TAGS");
+		return text != nullptr && text[0] == '1';
 	}();
 	return on;
 }
@@ -1771,7 +1773,8 @@ void StartMemoryBreakdown() {
 				for (size_t i = 0; i < top.size() && i < 8; i++) top_bases.insert(top[i].second);
 				char        tags[1024];
 				std::string annotations;
-				if (FormatMemoryTags(tags, sizeof(tags), top_bases, &annotations) <= 0) tags[0] = '\0';
+				tags[0] = '\0';
+				if (MemoryTagsEnabled() && FormatMemoryTags(tags, sizeof(tags), top_bases, &annotations) <= 0) tags[0] = '\0';
 				std::printf("%s; by allocation size: <1 MiB %llu MiB, 1-64 MiB %llu MiB, >=64 MiB %llu MiB%s%s%s\n", line,
 				            static_cast<unsigned long long>(small_b >> 20u), static_cast<unsigned long long>(mid_b >> 20u),
 				            static_cast<unsigned long long>(large_b >> 20u), tags,
@@ -2344,7 +2347,7 @@ static void* KytyNew(size_t size, void* caller, bool nothrow) {
 }
 static void KytyDelete(void* memory) {
 	if (memory == nullptr) return;
-	if (!LocalPlatform::LargeNewFree(memory)) std::free(memory);
+	if (!LocalPlatform::MemoryTagsEnabled() || !LocalPlatform::LargeNewFree(memory)) std::free(memory);
 }
 
 void* operator new(size_t size) { return KytyNew(size, _ReturnAddress(), false); }
