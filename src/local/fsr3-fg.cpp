@@ -228,7 +228,8 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
 		const int    maxm      = cinematic ? std::min(3, g_mfg.max) : g_mfg.max;
 		g_mfg.smooth           = g_mfg.smooth <= 0.0 ? real : 0.5 * g_mfg.smooth + 0.5 * real;
 		// 10-22: decided on the free rate (src/local/dyn-multiplier.h; see there for the rules).
-		const int next = std::clamp(g_mfg.dm.Window(g_mfg.current, real, T, maxm), 2, std::max(maxm, 2));
+		const int next = std::clamp(g_mfg.dm.Window(g_mfg.current, real, T, maxm,
+		                                               cinematic || Libs::VideoOut::CutsceneHeld() || Libs::VideoOut::MoviePlaying()), 2, std::max(maxm, 2));
 		(void)free;
 		if (next != g_mfg.current) {
 			g_mfg.current  = next;

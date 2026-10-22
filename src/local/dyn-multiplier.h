@@ -43,7 +43,13 @@ struct DynMultiplier {
 
 	// Once a second. m: current multiplier (>= 2), real: this window's real fps, T: shown target, maxm: the largest
 	// multiplier allowed now (cinematics pass 3). Returns the multiplier for the next window.
-	int Window(int m, double real, double T, int maxm) {
+	// hold: a cinematic, held cutscene or movie (real frames held to 60/30): nothing learned or blocked, all state reset
+	// so the levels and estimates start fresh when it ends.
+	int Window(int m, double real, double T, int maxm, bool hold = false) {
+		if (hold) {
+			*this = DynMultiplier {};
+			return std::clamp(std::min(m, maxm), 2, kMax);
+		}
 		for (auto& b: block) b = std::max(b - 1, 0);
 		for (auto& a: age) ++a;
 		if (noup > 0) --noup;

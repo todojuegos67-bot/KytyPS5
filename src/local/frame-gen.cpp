@@ -1549,7 +1549,8 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 				const double T         = static_cast<double>(g_dlssg_target_fps);
 				const bool   cinematic = VideoOut::CinematicPlaying();
 				const int    maxgen    = cinematic ? std::min(2, g_dyn_max) : g_dyn_max;
-				int          next      = std::clamp(g_dyn_dm.Window(g_dyn_gen + 1, real, T, maxgen + 1) - 1, 1, std::max(maxgen, 1));
+				int          next      = std::clamp(g_dyn_dm.Window(g_dyn_gen + 1, real, T, maxgen + 1,
+				                                                      cinematic || VideoOut::CutsceneHeld() || VideoOut::MoviePlaying()) - 1, 1, std::max(maxgen, 1));
 				if (next != g_dyn_gen) {
 					g_dyn_gen      = next;
 					g_options_set  = false; // send numFramesToGenerate again
