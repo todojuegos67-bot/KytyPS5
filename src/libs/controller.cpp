@@ -187,7 +187,8 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	}
 	// The player's first button (the world gate in videoOut.cpp starts from it).
 	if (connected && data->buttons != 0) Libs::VideoOut::NotePlayerInput();
-	if (connected && (data->buttons != 0 || std::abs(data->left_stick_x - 128) > 48 || std::abs(data->left_stick_y - 128) > 48 ||
+	// (10-22) Only a stick ends a cutscene's hold (a button, X skipping included, keeps it until the player moves).
+	if (connected && (std::abs(data->left_stick_x - 128) > 48 || std::abs(data->left_stick_y - 128) > 48 ||
 	                  std::abs(data->right_stick_x - 128) > 48 || std::abs(data->right_stick_y - 128) > 48))
 		Libs::VideoOut::NotePlayerActivity();
 	data->connected              = connected;

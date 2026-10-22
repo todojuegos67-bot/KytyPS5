@@ -711,7 +711,7 @@ bool CinematicPlaying() noexcept {
 	return cinematic != 0 && std::chrono::steady_clock::now().time_since_epoch().count() - cinematic < hold;
 }
 // KYTY_CUTSCENE_HOLD (default 1; 0: CinematicPlaying's 2 s only): an in-engine cinematic counts as playing from its
-// files' first read until the player's input (a button or a stick off centre, NotePlayerActivity) more than 1.5 s
+// files' first read until the player moves a stick (off centre, NotePlayerActivity) more than 1.5 s
 // after its last file read - a skip, or the play after it - or 15 minutes. Its files are read only while it loads
 // (log 20261022-022146: scn080000_voidwalk read for ~2 s, then played for minutes at 60 flips, twice too fast in the
 // Cinematic mode); the game's own playing state is not known.
