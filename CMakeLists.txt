@@ -391,6 +391,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${taa_bypass_header}")
 
+# KYTY_SSGI: screen-space GI before the PS5 Pro path's upscaler (src/local/frame-gen.cpp).
+set(ssgi_source "${KYTY_SOURCE_DIR}/local/ssgi.comp")
+set(ssgi_spv "${gpu_tiler_generated_dir}/ssgi.spv")
+set(ssgi_header "${gpu_tiler_generated_dir}/ssgi_spv.h")
+add_custom_command(
+	OUTPUT "${ssgi_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${ssgi_spv}" "${ssgi_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${ssgi_spv} -DOUTPUT=${ssgi_header}
+	        -DSYMBOL=SSGI_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${ssgi_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${ssgi_header}")
+
 # FSR 3 frame generation's HUD layer (src/local/fsr3-fg.cpp).
 set(hud_split_source "${KYTY_SOURCE_DIR}/local/hud-split.comp")
 set(hud_split_spv "${gpu_tiler_generated_dir}/hud_split.spv")

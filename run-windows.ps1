@@ -91,6 +91,7 @@ param(
 	[switch]$Ram16,
 	[switch]$GentlePrecompile,
 	[ValidateSet('', 'dlss', 'xess', 'fsr')][string]$Upscaler = '',
+	[ValidateSet(-1, 0, 1, 2)][int]$Ssgi = -1, # KYTY_SSGI: screen-space GI before the upscaler (0 off, 1 medium, 2 high)
 	[string]$StreamlineDir = '',
 	[string]$Affinity = '',
 	[switch]$AllCcds,
@@ -508,6 +509,7 @@ elseif ($Turbo) {
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
 # -Upscaler dlss: src/loader/demonsSoulsSuperResolution.h.
 if ($Upscaler) { $environment['KYTY_UPSCALER'] = $Upscaler }
+if ($Ssgi -ge 0) { $environment['KYTY_SSGI'] = "$Ssgi" }
 # Without -StreamlineDir, the Streamline folder chosen in the launcher (launcher-settings.json), as the launcher passes
 # it: run.cmd -FrameGen 1 had started with frame generation off, its runtime not found (issue #38).
 if (!$StreamlineDir -and (Test-Path "$PSScriptRoot\launcher-settings.json")) {

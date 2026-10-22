@@ -19,6 +19,7 @@
 #include "local/vulkan-recording.h"
 #include "gpu_tiler_shaders/taa_bypass_spv.h"
 #include "gpu_tiler_shaders/sharpen_spv.h"
+#include "gpu_tiler_shaders/ssgi_spv.h"
 #endif
 
 #include <algorithm>
@@ -3593,7 +3594,336 @@ void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float
 }
 } // namespace
 
-bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
+namespace {
+// KYTY_SSGI=0|1|2 (ssgi.comp): screen-space ray-traced GI + AO on the PS5 Pro path's render-resolution color, recorded
+// right before the upscaler (DLSS / XeSS / FSR), which then reads our composited copy in place of the game's color, so
+// the upscaler and frame generation see it. 1: half-resolution trace, 2: full. KYTY_SSGI_INTENSITY (0.6), KYTY_SSGI_AO
+// (0.5). Normals from depth derivatives; view positions from the game's view_to_clip (handles reverse-Z).
+struct SsgiImage {
+	VulkanImage   image;
+	vk::ImageView view = nullptr;
+};
+struct SsgiPass {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	vk::Sampler             point      = nullptr;
+	vk::Sampler             linear     = nullptr;
+	bool                    failed     = false;
+	vk::Extent2D            render {}, trace {};
+	SsgiImage               raw, tmp_a, tmp_b, out;
+	SsgiImage               history[2], gbuf[2];
+	uint32_t                frame         = 0;
+	bool                    history_valid = false;
+	// GPU time: two timestamps a frame, a ring of 8, read 4 frames later.
+	vk::QueryPool           pool      = nullptr;
+	double                  period_ns = 1.0;
+	uint64_t                written = 0, read = 0;
+	double                  sum_ms  = 0.0;
+	uint32_t                samples = 0;
+	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+} g_ssgi;
+
+struct SsgiPush {
+	float   proj[4];
+	float   depth_map[4];
+	float   motion[4];
+	float   trace[4];
+	int32_t misc[4];
+	float   extra[4];
+};
+static_assert(sizeof(SsgiPush) == 96);
+
+int SsgiQuality() {
+	static const int quality = [] {
+		const char* value = std::getenv("KYTY_SSGI");
+		return value != nullptr ? std::clamp(std::atoi(value), 0, 2) : 0;
+	}();
+	return quality;
+}
+float SsgiEnv(const char* name, float fallback, float hi) {
+	const char* value = std::getenv(name);
+	return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, hi) : fallback;
+}
+
+bool SsgiMakeImage(GraphicContext& graphics, SsgiImage& img, vk::Extent2D extent) {
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = vk::Format::eR16G16B16A16Sfloat;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+	               vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+	create.sharingMode = vk::SharingMode::eExclusive;
+	create.samples     = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, img.image)) {
+		img.image.image = nullptr;
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = img.image.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = vk::Format::eR16G16B16A16Sfloat;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (graphics.device.createImageView(&view_info, nullptr, &img.view) != vk::Result::eSuccess) return false;
+	img.image.state = {};
+	return true;
+}
+void SsgiFreeImage(GraphicContext& graphics, SsgiImage& img) {
+	if (img.view != nullptr) graphics.device.destroyImageView(img.view, nullptr);
+	img.view = nullptr;
+	if (img.image.image != nullptr) graphics.DeleteImage(img.image);
+	img.image.image = nullptr;
+}
+
+bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
+	const auto device = graphics.device;
+	if (g_ssgi.pipeline == nullptr) {
+		if (g_ssgi.failed) return false;
+		g_ssgi.failed = true;
+		std::array<vk::DescriptorSetLayoutBinding, 9> bindings {};
+		for (uint32_t i = 0; i < 9; ++i) {
+			bindings[i].binding         = i;
+			bindings[i].descriptorType  = i < 7 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorCount = 1;
+			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+		}
+		vk::DescriptorSetLayoutCreateInfo set_info {};
+		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+		set_info.pBindings    = bindings.data();
+		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_ssgi.set_layout) != vk::Result::eSuccess) return false;
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(SsgiPush)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = 1;
+		layout_info.pSetLayouts            = &g_ssgi.set_layout;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push;
+		if (device.createPipelineLayout(&layout_info, nullptr, &g_ssgi.layout) != vk::Result::eSuccess) return false;
+		vk::ShaderModuleCreateInfo module_info {};
+		module_info.codeSize    = sizeof(SSGI_SPV);
+		module_info.pCode       = SSGI_SPV;
+		vk::ShaderModule module = nullptr;
+		if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		pipeline_info.stage.module = module;
+		pipeline_info.stage.pName  = "main";
+		pipeline_info.layout       = g_ssgi.layout;
+		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_ssgi.pipeline);
+		device.destroyShaderModule(module, nullptr);
+		if (created != vk::Result::eSuccess) {
+			g_ssgi.pipeline = nullptr;
+			return false;
+		}
+		for (int i = 0; i < 2; ++i) {
+			vk::SamplerCreateInfo sampler {};
+			sampler.magFilter    = i == 0 ? vk::Filter::eNearest : vk::Filter::eLinear;
+			sampler.minFilter    = sampler.magFilter;
+			sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+			sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+			sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+			if (device.createSampler(&sampler, nullptr, i == 0 ? &g_ssgi.point : &g_ssgi.linear) != vk::Result::eSuccess) return false;
+		}
+		vk::QueryPoolCreateInfo query {};
+		query.queryType  = vk::QueryType::eTimestamp;
+		query.queryCount = 16;
+		if (device.createQueryPool(&query, nullptr, &g_ssgi.pool) != vk::Result::eSuccess) g_ssgi.pool = nullptr;
+		g_ssgi.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		g_ssgi.failed    = false;
+	}
+	if (g_ssgi.out.image.image != nullptr && g_ssgi.render == render) return true;
+	device.waitIdle();
+	for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.out, &g_ssgi.history[0], &g_ssgi.history[1], &g_ssgi.gbuf[0],
+	                  &g_ssgi.gbuf[1]})
+		SsgiFreeImage(graphics, *img);
+	const vk::Extent2D trace = quality >= 2 ? render : vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
+	bool ok = SsgiMakeImage(graphics, g_ssgi.out, render);
+	for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.history[0], &g_ssgi.history[1], &g_ssgi.gbuf[0], &g_ssgi.gbuf[1]})
+		ok = ok && SsgiMakeImage(graphics, *img, trace);
+	if (!ok) {
+		for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.out, &g_ssgi.history[0], &g_ssgi.history[1],
+		                  &g_ssgi.gbuf[0], &g_ssgi.gbuf[1]})
+			SsgiFreeImage(graphics, *img);
+		g_ssgi.failed = true;
+		return false;
+	}
+	g_ssgi.render        = render;
+	g_ssgi.trace         = trace;
+	g_ssgi.history_valid = false;
+	return true;
+}
+
+void SsgiReadTiming() {
+	if (g_ssgi.pool == nullptr || g_graphics_ctx == nullptr) return;
+	while (g_ssgi.read + 4 <= g_ssgi.written) {
+		const auto entry = static_cast<uint32_t>(g_ssgi.read % 8);
+		std::array<uint64_t, 2> stamps {};
+		if (g_graphics_ctx->device.getQueryPoolResults(g_ssgi.pool, entry * 2, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		                                               vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
+			break;
+		g_ssgi.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_ssgi.period_ns / 1e6;
+		++g_ssgi.samples;
+		++g_ssgi.read;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_ssgi.last_log >= std::chrono::seconds(5) && g_ssgi.samples > 0) {
+		std::printf("SSGI: GPU %.3f ms (mean of %u frames)\n", g_ssgi.sum_ms / g_ssgi.samples, g_ssgi.samples);
+		std::fflush(stdout);
+		g_ssgi.sum_ms   = 0.0;
+		g_ssgi.samples  = 0;
+		g_ssgi.last_log = now;
+	}
+}
+
+// Records the effect; on success `color` is replaced by our composited rgba16f image (general layout).
+bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
+	const int quality = SsgiQuality();
+	if (quality == 0 || g_graphics_ctx == nullptr) return false;
+	if (VideoOut::MoviePlaying()) {
+		g_ssgi.history_valid = false;
+		return false;
+	}
+	const auto& color = inputs.color;
+	if (color.view == nullptr || inputs.depth.view == nullptr || inputs.motion.view == nullptr || color.extent.width < 16 ||
+	    color.extent.height < 16)
+		return false;
+	if (!SsgiEnsure(*g_graphics_ctx, color.extent, quality)) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("SSGI: off (could not create its pipeline or images)\n");
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	const float intensity = SsgiEnv("KYTY_SSGI_INTENSITY", 0.6f, 4.0f);
+	const float ao        = SsgiEnv("KYTY_SSGI_AO", 0.5f, 1.0f);
+	const auto& m         = inputs.view_to_clip;
+	SsgiPush    push {};
+	const bool  have_proj = m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f);
+	if (have_proj) {
+		push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
+		push.depth_map[0] = m[10], push.depth_map[1] = m[14], push.depth_map[2] = m[11], push.depth_map[3] = m[15];
+	} else {
+		// No projection: a 60 degree vertical FOV, reverse-Z infinite (d = near / z), the render's aspect.
+		const float f  = 1.0f / std::tan(0.5f * 1.0472f);
+		const float ar = static_cast<float>(color.extent.width) / static_cast<float>(color.extent.height);
+		push.proj[0] = f / ar, push.proj[1] = f, push.proj[2] = 0.0f, push.proj[3] = 0.0f;
+		push.depth_map[0] = 0.0f, push.depth_map[1] = inputs.near_plane, push.depth_map[2] = 1.0f, push.depth_map[3] = 0.0f;
+	}
+	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
+	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
+	push.trace[0] = static_cast<float>(g_ssgi.trace.width), push.trace[1] = static_cast<float>(g_ssgi.trace.height);
+	push.trace[2] = intensity, push.trace[3] = ao;
+	push.extra[1] = 2.0f, push.extra[2] = 0.5f; // ray length / thickness at 1 m, grown with distance
+	{
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("SSGI: on (quality %d, %ux%u, intensity %g, ao %g)%s\n", quality, g_ssgi.trace.width, g_ssgi.trace.height,
+			            intensity, ao, have_proj ? "" : " (no projection: 60 deg FOV assumed)");
+			std::printf("SSGI: color format %d, depth format %d, view_to_clip z terms %g %g %g %g\n", static_cast<int>(color.format),
+			            static_cast<int>(inputs.depth.format), m[10], m[14], m[11], m[15]);
+			std::fflush(stdout);
+		}
+	}
+	SsgiReadTiming();
+	const auto     entry = static_cast<uint32_t>(g_ssgi.written % 8);
+	const bool     timed = g_ssgi.pool != nullptr;
+	if (timed) {
+		command.resetQueryPool(g_ssgi.pool, entry * 2, 2);
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_ssgi.pool, entry * 2);
+	}
+	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
+	                        vk::AccessFlags2 dst) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = src_stage;
+		barrier.srcAccessMask = src;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	// Our images general throughout (the first use from undefined).
+	for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.out, &g_ssgi.history[0], &g_ssgi.history[1], &g_ssgi.gbuf[0],
+	                  &g_ssgi.gbuf[1]})
+		if (img->image.state.layout != vk::ImageLayout::eGeneral)
+			Transition(command, img->image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+			           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	// Earlier uses of our images (the previous frame's upscaler read of `out`) before this frame's writes.
+	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+	       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	const uint32_t cur  = g_ssgi.frame & 1u;
+	const uint32_t prev = cur ^ 1u;
+	push.misc[1] = static_cast<int32_t>(g_ssgi.frame);
+	push.misc[2] = quality;
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g_ssgi.history_valid ? 2 : 0);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_ssgi.pipeline);
+	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout, float step,
+	                     vk::Extent2D size) {
+		const vk::Sampler       lin = g_ssgi.linear, pt = g_ssgi.point;
+		vk::DescriptorImageInfo infos[9] {};
+		infos[0] = {lin, color.view, color.layout};
+		infos[1] = {pt, inputs.depth.view, inputs.depth.layout};
+		infos[2] = {pt, inputs.motion.view, inputs.motion.layout};
+		infos[3] = {lin, a.view, vk::ImageLayout::eGeneral};
+		infos[4] = {lin, b.view, vk::ImageLayout::eGeneral};
+		infos[5] = {pt, g_ssgi.gbuf[cur].view, vk::ImageLayout::eGeneral};
+		infos[6] = {pt, g_ssgi.gbuf[prev].view, vk::ImageLayout::eGeneral};
+		infos[7] = {nullptr, out.view, vk::ImageLayout::eGeneral};
+		infos[8] = {nullptr, gout.view, vk::ImageLayout::eGeneral};
+		vk::WriteDescriptorSet writes[9] {};
+		for (uint32_t i = 0; i < 9; ++i) {
+			writes[i].dstBinding      = i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType  = i < 7 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			writes[i].pImageInfo      = &infos[i];
+		}
+		push.misc[0] = mode;
+		push.extra[0] = step;
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_ssgi.layout, 0, 9, writes);
+		command.pushConstants(g_ssgi.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	};
+	// (Bindings a mode does not write still need a valid storage image: tmp_b, written later anyway.)
+	run(0, g_ssgi.tmp_a, g_ssgi.tmp_b, g_ssgi.raw, g_ssgi.gbuf[cur], 0.0f, g_ssgi.trace);
+	run(1, g_ssgi.raw, g_ssgi.history[prev], g_ssgi.history[cur], g_ssgi.tmp_b, 0.0f, g_ssgi.trace);
+	run(2, g_ssgi.history[cur], g_ssgi.tmp_b, g_ssgi.tmp_a, g_ssgi.raw, 1.0f, g_ssgi.trace);
+	run(3, g_ssgi.tmp_a, g_ssgi.raw, g_ssgi.tmp_b, g_ssgi.raw, 2.0f, g_ssgi.trace);
+	run(4, g_ssgi.tmp_b, g_ssgi.raw, g_ssgi.out, g_ssgi.raw, 0.0f, g_ssgi.render);
+	// The composite's writes before the upscaler reads.
+	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
+	       vk::AccessFlagBits2::eMemoryRead);
+	if (timed) {
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_ssgi.pool, entry * 2 + 1);
+		++g_ssgi.written;
+	}
+	++g_ssgi.frame;
+	g_ssgi.history_valid = true;
+	inputs.color.image  = g_ssgi.out.image.image;
+	inputs.color.view   = g_ssgi.out.view;
+	inputs.color.layout = vk::ImageLayout::eGeneral;
+	inputs.color.format = vk::Format::eR16G16B16A16Sfloat;
+	inputs.color.usage  = g_ssgi.out.image.usage;
+	inputs.color.level  = 0;
+	inputs.color.layer  = 0;
+	return true;
+}
+} // namespace
+
+bool SsgiWanted() { return SsgiQuality() > 0; }
+
+bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
+	UpscaleInputs inputs = inputs_in;
+	SsgiApply(command, inputs); // (KYTY_SSGI: inputs.color becomes the composited copy)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
 	const bool  fsr  = g_sr_kind == 3;

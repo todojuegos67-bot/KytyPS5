@@ -466,6 +466,11 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		buffer.InvalidateGraphicsState(); // (what DLSS bound)
 	} else {
 		// No DLSS: the input stretched to the output (no anti-aliasing), then the exposure.
+		if (static bool said = false; !said && FrameGen::SsgiWanted()) {
+			said = true;
+			std::printf("SSGI: skipped (no upscaler active: it runs only before DLSS / XeSS / FSR)\n");
+			std::fflush(stdout);
+		}
 		color.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range(bindings[0]), vk_buffer);
 		output.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, range(bindings[3]), vk_buffer);
 		vk::ImageBlit blit {};

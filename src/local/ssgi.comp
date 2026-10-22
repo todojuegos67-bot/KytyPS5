@@ -1,0 +1,224 @@
+#version 450
+// KYTY_SSGI (ssgi.cpp): screen-space ray-traced GI + AO on the PS5 Pro path's render-resolution color, before the
+// upscaler. One module, five modes (push.mode):
+//   0 trace:     cosine hemisphere rays marched in the depth buffer -> raw (rgb bounce, a visibility) + gbuf_out
+//                (view normal xyz, view depth) at the trace resolution (half for quality 1, full for 2)
+//   1 temporal:  raw blended with the reprojected history (motion vectors), rejected on depth/normal change
+//   2,3 a-trous: edge-aware 5x5 spatial filter, step 1 then 2
+//   4 composite: color += albedo * indirect * intensity; color *= mix(1, ao, ao_strength) -> out (full render res)
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;   // the game's lit HDR color (render res)
+layout(binding = 1) uniform sampler2D depth_tex;   // the game's depth (render res)
+layout(binding = 2) uniform sampler2D motion_tex;  // motion vectors (render res): * motion_scale = pixels to previous
+layout(binding = 3) uniform sampler2D src_a;       // mode-dependent input (raw / history / filtered)
+layout(binding = 4) uniform sampler2D src_b;       // previous history (temporal)
+layout(binding = 5) uniform sampler2D gbuf_cur;    // this frame's normal+depth (trace res)
+layout(binding = 6) uniform sampler2D gbuf_prev;   // last frame's normal+depth (trace res)
+layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
+layout(binding = 8, rgba16f) uniform writeonly image2D gbuf_out;
+
+layout(push_constant) uniform Push {
+	// Projection terms (row vectors, p' = p * M): x scale, y scale, x/y offsets from z (jitter, off-centre),
+	// and the depth mapping d = (z*A + B) / (z*C + D).
+	vec4  proj;      // M[0], M[5], M[8], M[9]
+	vec4  depth_map; // A = M[10], B = M[14], C = M[11], D = M[15]
+	vec4  motion;    // motion_scale.xy, render size.xy
+	vec4  trace;     // trace size.xy, intensity, ao strength
+	ivec4 misc;      // mode, frame index, quality, flags (bit0 reset, bit1 history valid)
+	vec4  extra;     // a-trous step, ray length (view units), thickness, unused
+} push;
+
+const float PI = 3.14159265;
+
+vec2 RenderSize() { return push.motion.zw; }
+vec2 TraceSize() { return push.trace.xy; }
+
+float ViewZ(float d) {
+	// z from the depth mapping; |z| as the distance along the view axis. Handles reverse-Z, infinite far and
+	// either handedness because it inverts the game's own matrix terms.
+	float den = d * push.depth_map.z - push.depth_map.x;
+	return abs(den) > 1e-12 ? (push.depth_map.y - d * push.depth_map.w) / den : 1e6;
+}
+
+// uv in [0,1] -> view-space position (in the game's view space, sign of z as the matrix has it).
+vec3 ViewPos(vec2 uv, float d) {
+	float z  = ViewZ(d);
+	float w  = z * push.depth_map.z + push.depth_map.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	float x  = (nd.x * w - z * push.proj.z) / push.proj.x;
+	float y  = (nd.y * w - z * push.proj.w) / push.proj.y;
+	return vec3(x, y, z);
+}
+
+vec3 Project(vec3 p) { // -> (uv, depth)
+	float w = p.z * push.depth_map.z + push.depth_map.w;
+	vec2  nd = vec2(p.x * push.proj.x + p.z * push.proj.z, p.y * push.proj.y + p.z * push.proj.w) / w;
+	float d  = (p.z * push.depth_map.x + push.depth_map.y) / w;
+	return vec3(nd * 0.5 + 0.5, d);
+}
+
+bool IsSky(float d) {
+	// The far plane in either convention: far maps to the larger |z|.
+	return ViewZ(d) > 5e4 || abs(ViewZ(d)) > 5e4;
+}
+
+float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+
+vec3 NormalAt(vec2 uv, vec3 p) {
+	vec2 t  = 1.0 / RenderSize();
+	vec3 px = ViewPos(uv + vec2(t.x, 0), textureLod(depth_tex, uv + vec2(t.x, 0), 0).r);
+	vec3 nx = ViewPos(uv - vec2(t.x, 0), textureLod(depth_tex, uv - vec2(t.x, 0), 0).r);
+	vec3 py = ViewPos(uv + vec2(0, t.y), textureLod(depth_tex, uv + vec2(0, t.y), 0).r);
+	vec3 ny = ViewPos(uv - vec2(0, t.y), textureLod(depth_tex, uv - vec2(0, t.y), 0).r);
+	// The smaller derivative on each axis (no normals bent across silhouettes).
+	vec3 dx = abs(px.z - p.z) < abs(p.z - nx.z) ? px - p : p - nx;
+	vec3 dy = abs(py.z - p.z) < abs(p.z - ny.z) ? py - p : p - ny;
+	vec3 n  = normalize(cross(dx, dy));
+	if (dot(n, -p) < 0.0) n = -n; // towards the camera
+	return n;
+}
+
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+void Trace(ivec2 pixel) {
+	vec2  uv = (vec2(pixel) + 0.5) / TraceSize();
+	float d  = textureLod(depth_tex, uv, 0).r;
+	if (IsSky(d)) {
+		imageStore(out_img, pixel, vec4(0, 0, 0, 1));
+		imageStore(gbuf_out, pixel, vec4(0, 0, 1, 1e6));
+		return;
+	}
+	vec3 p = ViewPos(uv, d);
+	vec3 n = NormalAt(uv, p);
+	imageStore(gbuf_out, pixel, vec4(n, abs(p.z)));
+	vec3 t = normalize(abs(n.z) < 0.999 ? cross(n, vec3(0, 0, 1)) : cross(n, vec3(1, 0, 0)));
+	vec3 b = cross(n, t);
+
+	int   rays  = push.misc.z >= 2 ? 4 : 3;
+	int   steps = push.misc.z >= 2 ? 16 : 10;
+	float len   = push.extra.y * max(1.0, abs(p.z) * 0.05);
+	float thick = push.extra.z * max(1.0, abs(p.z) * 0.02);
+	float noise = Ign(vec2(pixel) + float(push.misc.y % 64) * 5.588238);
+	float jit   = Ign(vec2(pixel.yx) + float(push.misc.y % 64) * 7.123);
+
+	vec3  bounce = vec3(0);
+	float vis    = 0.0;
+	for (int r = 0; r < rays; ++r) {
+		// Cosine-weighted hemisphere, the sequence rotated per pixel and frame.
+		float u1  = fract((float(r) + noise) / float(rays));
+		float u2  = fract(float(r) * 0.618034 + jit);
+		float rr  = sqrt(u1);
+		float phi = 2.0 * PI * u2;
+		vec3  dir = normalize(t * (rr * cos(phi)) + b * (rr * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
+		float occl = 0.0;
+		vec3  hit_c = vec3(0);
+		vec3  origin = p + n * (0.01 * abs(p.z) + 0.01);
+		for (int s = 1; s <= steps; ++s) {
+			float k  = (float(s) - 0.5 + jit) / float(steps);
+			vec3  q  = origin + dir * (len * k * k); // denser near the surface
+			vec3  pr = Project(q);
+			if (any(lessThan(pr.xy, vec2(0))) || any(greaterThan(pr.xy, vec2(1)))) break;
+			float sd = textureLod(depth_tex, pr.xy, 0).r;
+			float sz = abs(ViewZ(sd));
+			float qz = abs(q.z);
+			float delta = qz - sz; // > 0: the ray is behind the surface there
+			if (delta > 0.0 && delta < thick) {
+				// Hit: the surface's color as bounce light, weighted by distance falloff.
+				float fall = 1.0 - k * k;
+				occl  = fall;
+				hit_c = textureLod(color_tex, pr.xy, 0).rgb * fall;
+				break;
+			}
+		}
+		bounce += hit_c;
+		vis += 1.0 - occl;
+	}
+	bounce /= float(rays);
+	vis /= float(rays);
+	// (Fireflies: bright hits clamped.)
+	float l = Luma(bounce);
+	if (l > 8.0) bounce *= 8.0 / l;
+	imageStore(out_img, pixel, vec4(max(bounce, vec3(0)), vis));
+}
+
+void Temporal(ivec2 pixel) {
+	vec2 uv   = (vec2(pixel) + 0.5) / TraceSize();
+	vec4 cur  = textureLod(src_a, uv, 0);
+	vec4 g    = textureLod(gbuf_cur, uv, 0);
+	vec2 mv   = textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();
+	vec2 puv  = uv + mv;
+	float w   = 0.0;
+	vec4 hist = cur;
+	if ((push.misc.w & 1) == 0 && (push.misc.w & 2) != 0 && all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1))) &&
+	    g.w < 1e5) {
+		vec4  pg = textureLod(gbuf_prev, puv, 0);
+		float dz = abs(pg.w - g.w) / max(g.w, 1e-3);
+		float dn = dot(pg.xyz, g.xyz);
+		if (dz < 0.1 && dn > 0.8) {
+			hist = textureLod(src_b, puv, 0);
+			float count = min(hist.a > 0.0 ? 1.0 : 0.0, 1.0);
+			w = push.misc.z >= 2 ? 0.9 : 0.92;
+			w *= count;
+		}
+	}
+	// (Visibility in a; history's a is the blended visibility too.)
+	vec4 res = mix(cur, hist, w);
+	imageStore(out_img, pixel, res);
+}
+
+void Atrous(ivec2 pixel) {
+	vec2  ts   = 1.0 / TraceSize();
+	vec2  uv   = (vec2(pixel) + 0.5) * ts;
+	vec4  g    = textureLod(gbuf_cur, uv, 0);
+	vec4  c    = textureLod(src_a, uv, 0);
+	if (g.w > 1e5) {
+		imageStore(out_img, pixel, c);
+		return;
+	}
+	const float kern[3] = float[](0.375, 0.25, 0.0625);
+	vec4  sum  = vec4(0);
+	float wsum = 0.0;
+	float step = push.extra.x;
+	for (int y = -2; y <= 2; ++y)
+		for (int x = -2; x <= 2; ++x) {
+			vec2  suv = uv + vec2(x, y) * step * ts;
+			vec4  sg  = textureLod(gbuf_cur, suv, 0);
+			vec4  sc  = textureLod(src_a, suv, 0);
+			float wn  = pow(max(dot(sg.xyz, g.xyz), 0.0), 16.0);
+			float wz  = exp(-abs(sg.w - g.w) / max(g.w * 0.02, 1e-3));
+			float w   = kern[abs(x)] * kern[abs(y)] * wn * wz;
+			sum += sc * w;
+			wsum += w;
+		}
+	imageStore(out_img, pixel, wsum > 1e-5 ? sum / wsum : c);
+}
+
+void Composite(ivec2 pixel) {
+	vec2 uv  = (vec2(pixel) + 0.5) / RenderSize();
+	vec4 col = texelFetch(color_tex, pixel, 0);
+	float d  = texelFetch(depth_tex, pixel, 0).r;
+	if (IsSky(d)) {
+		imageStore(out_img, pixel, col);
+		return;
+	}
+	vec4 gi = textureLod(src_a, uv, 0);
+	// Albedo approximation: the lit color's chroma at a fixed mid reflectance (no G-buffer albedo here).
+	float l      = Luma(col.rgb);
+	vec3  albedo = clamp(col.rgb / max(l, 1e-3), vec3(0), vec3(2)) * 0.35;
+	albedo       = mix(vec3(0.35), albedo, 0.6);
+	vec3  rgb    = col.rgb + albedo * gi.rgb * push.trace.z;
+	rgb *= mix(1.0, clamp(gi.a, 0.0, 1.0), push.trace.w);
+	imageStore(out_img, pixel, vec4(max(rgb, vec3(0)), col.a));
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	int   mode  = push.misc.x;
+	ivec2 size  = ivec2(mode == 4 ? RenderSize() : TraceSize());
+	if (pixel.x >= size.x || pixel.y >= size.y) return;
+	if (mode == 0) Trace(pixel);
+	else if (mode == 1) Temporal(pixel);
+	else if (mode == 4) Composite(pixel);
+	else Atrous(pixel);
+}

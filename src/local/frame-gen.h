@@ -232,6 +232,8 @@ struct UpscaleInputs {
 [[nodiscard]] bool UpscalerReady();
 // Records DLSS into `command` (outside a render pass; the images in their `layout`s): false when it could not.
 [[nodiscard]] bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs);
+// KYTY_SSGI=1|2: screen-space GI on the color before the upscaler (in Upscale).
+[[nodiscard]] bool SsgiWanted();
 
 } // namespace FrameGen
 } // namespace Libs::Graphics
