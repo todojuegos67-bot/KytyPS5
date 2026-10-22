@@ -1630,11 +1630,11 @@ void StartMemoryBreakdown() {
 					                     static_cast<unsigned long long>(top[i].first >> 20u),
 					                     heaps.count(top[i].second) != 0 ? "(heap)" : "");
 				// Size buckets of the allocations: many mid-size ones are a pool or the driver, one huge one a store.
-				uint64_t small = 0, mid = 0, large = 0;
-				for (const auto& [committed, base]: top) (committed < (1u << 20u) ? small : committed < (64u << 20u) ? mid : large) += committed;
+				uint64_t small_b = 0, mid_b = 0, large_b = 0;
+				for (const auto& [committed, base]: top) (committed < (1u << 20u) ? small_b : committed < (64u << 20u) ? mid_b : large_b) += committed;
 				std::printf("%s; by allocation size: <1 MiB %llu MiB, 1-64 MiB %llu MiB, >=64 MiB %llu MiB\n", line,
-				            static_cast<unsigned long long>(small >> 20u), static_cast<unsigned long long>(mid >> 20u),
-				            static_cast<unsigned long long>(large >> 20u));
+				            static_cast<unsigned long long>(small_b >> 20u), static_cast<unsigned long long>(mid_b >> 20u),
+				            static_cast<unsigned long long>(large_b >> 20u));
 				std::fflush(stdout);
 			}
 		}).detach();
