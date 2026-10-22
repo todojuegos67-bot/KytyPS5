@@ -3621,8 +3621,9 @@ void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float
 namespace {
 // KYTY_SSGI=0|1|2 (ssgi.comp): screen-space ray-traced GI + AO on the PS5 Pro path's render-resolution color, recorded
 // right before the upscaler (DLSS / XeSS / FSR), which then reads our composited copy in place of the game's color, so
-// the upscaler and frame generation see it. 1: half-resolution trace, 2: full. KYTY_SSGI_INTENSITY (1.0), KYTY_SSGI_AO
-// (0.6). Normals from depth derivatives; view positions from the game's view_to_clip (handles reverse-Z).
+// the upscaler and frame generation see it. Half-resolution trace (1: 1 ray/px, 2: 2 rays/px), temporal (alpha 0.1, clamped),
+// 2 a-trous passes, bilateral upsample. KYTY_SSGI_INTENSITY (0.6), KYTY_SSGI_AO (0.25).
+// Normals from depth derivatives; view positions from the game's view_to_clip (handles reverse-Z).
 struct SsgiImage {
 	VulkanImage   image;
 	vk::ImageView view = nullptr;
@@ -3764,7 +3765,7 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 	for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.out, &g_ssgi.history[0], &g_ssgi.history[1], &g_ssgi.gbuf[0],
 	                  &g_ssgi.gbuf[1]})
 		SsgiFreeImage(graphics, *img);
-	const vk::Extent2D trace = quality >= 2 ? render : vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
+	const vk::Extent2D trace = vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
 	bool ok = SsgiMakeImage(graphics, g_ssgi.out, render);
 	for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.history[0], &g_ssgi.history[1], &g_ssgi.gbuf[0], &g_ssgi.gbuf[1]})
 		ok = ok && SsgiMakeImage(graphics, *img, trace);
@@ -3833,8 +3834,8 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 		return false;
 	}
-	const float intensity = SsgiEnv("KYTY_SSGI_INTENSITY", 1.0f, 4.0f);
-	const float ao        = SsgiEnv("KYTY_SSGI_AO", 0.6f, 1.0f);
+	const float intensity = SsgiEnv("KYTY_SSGI_INTENSITY", 0.6f, 4.0f);
+	const float ao        = SsgiEnv("KYTY_SSGI_AO", 0.25f, 1.0f);
 	const auto& m         = inputs.view_to_clip;
 	SsgiPush    push {};
 	const bool  have_proj = m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f);
