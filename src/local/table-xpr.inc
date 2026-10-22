@@ -2638,6 +2638,9 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	// (RenderExecutor::DispatchDirect, FrameGen::OnDispatch): one dispatch a frame.
 	if (FrameGen::Capturing() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
 		return m_dispatch_declined = "table: frame generation (TAA)", false;
+	// (KYTY_CONTACT_SHADOWS: the sun-shadow consumers' matrices are read on the normal path, FrameGen::OnShadowConsumer.)
+	if (FrameGen::ContactShadowsWanted() && pair.programs[0] != nullptr && FrameGen::IsShadowConsumer(pair.programs[0]->shader_hash))
+		return m_dispatch_declined = "table: contact shadows (sun matrices)", false;
 	TablePrefetchPair(pair);
 	if (Role() == 0) pair.used_frame = m_context.FrameNumber();
 	if (Role() == 0) TablePrefetchNext(OwnTable().previous_dispatch, pair);

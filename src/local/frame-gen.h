@@ -236,6 +236,20 @@ struct UpscaleInputs {
 [[nodiscard]] bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs);
 // KYTY_SSGI=1|2: screen-space GI on the color before the upscaler (in Upscale).
 [[nodiscard]] bool SsgiWanted();
+// KYTY_CONTACT_SHADOWS=1|2|3 ("Sombras RT"): screen-space contact shadows toward the sun before the upscaler (in Upscale).
+[[nodiscard]] bool ContactShadowsWanted();
+// The sun's direction for it: a dispatch that samples a shadow-map array (a square, layered, depth-like image) is a
+// sun-shadow consumer; its flattened SRT and small constant buffers are searched for the cascades' orthographic
+// matrices (renderCompute.cpp, only while ContactShadowsWanted()).
+struct ShadowConsumer {
+	uint64_t shadow_address = 0;
+	uint32_t shadow_size = 0, shadow_layers = 0;
+	uint32_t buffers = 0;
+	std::array<uint64_t, 16> buffer_address {};
+	std::array<uint64_t, 16> buffer_size {};
+};
+void OnShadowConsumer(uint64_t cs_hash, const ShadowConsumer& consumer, std::span<const uint32_t> flattened_srt);
+[[nodiscard]] bool IsShadowConsumer(uint64_t cs_hash);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

@@ -21,6 +21,9 @@
 #include "gpu_tiler_shaders/taa_bypass_spv.h"
 #include "gpu_tiler_shaders/sharpen_spv.h"
 #include "gpu_tiler_shaders/ssgi_spv.h"
+#include "gpu_tiler_shaders/cshadow_spv.h"
+#include "kernel/memory.h"
+#include <string>
 #endif
 
 #include <algorithm>
@@ -934,6 +937,7 @@ void Initialize() {
 	{
 		const char* ssgi = std::getenv("KYTY_SSGI");
 		std::printf("SSGI: KYTY_SSGI=%s read (quality %d)\n", ssgi != nullptr ? ssgi : "(unset)", SsgiQuality());
+		(void)ContactShadowsWanted(); // (its "CSHADOW: KYTY_CONTACT_SHADOWS=" line)
 		std::fflush(stdout);
 	}
 	const char* value = std::getenv("KYTY_FRAMEGEN");
@@ -4109,6 +4113,626 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 }
 } // namespace
 
+namespace {
+// KYTY_CONTACT_SHADOWS=0|1|2|3 ("Sombras RT": No / Normal / Alta / Ultra; cshadow.comp): screen-space contact shadows
+// toward the sun, recorded after SSGI and before the upscaler. 1: half-res trace, 16 steps, temporal + a-trous 1, 2;
+// 2: full res, 24 steps, a-trous 1, 2, 4; 3: full res, 56 steps, longest ray (x1.5), binary-search hit refine, temporal
+// alpha 0.05, a-trous 1, 2, 4, 8 (SSGI Ultra's denoise). KYTY_CONTACT_SHADOWS_STRENGTH (0.7: how dark a contact shadow
+// gets, 0..1), KYTY_CONTACT_SHADOWS_LENGTH (1.0: ray length scale, 0.25..4).
+//
+// The sun's direction (no fixed guess; off while unknown):
+//  1. OnShadowConsumer (renderCompute.cpp): a dispatch that samples a square, layered (>= 4), depth-like image of
+//     >= 512 px (the sun cascades' shadow-map array; Demon's Souls: 1024x1024x80 at 0x102a400000) is a shadow
+//     consumer (the deferred sun lighting / shadow resolve). Its flattened SRT and its constant buffers (<= 64 KiB, the
+//     first 4 KiB) are searched for orthographic matrices: 4x4 (either major) with a (0, 0, 0, 1) projective row, or
+//     3x4 rows, whose 3x3 rows are mutually orthogonal (|cos| < 0.01), x and y scales equal (a square map) and the
+//     depth scale different (so no rigid view / object matrix passes); the camera's own forward is refused. The depth
+//     row is the light axis; the cascades must agree (2 degrees), else the axis seen in 3 frames running.
+//  2. The axis is in the matrix's input space (world, or view) with an unknown sign: four view-space candidates
+//     (world through the camera's view = P^-1 * view_proj (g_camera, P the upscaler's view_to_clip), and as-is; each
+//     sign). A vote pass (mode 5, every frame until settled, then every 16th) compares the game's own lit luma of
+//     pixels facing each candidate (n.l > 0.5) with that of pixels facing away (< -0.2); the candidate whose ratio
+//     (EMA of the log) is >= 1.2 and beats the others' axis wins. None (an interior, no sun) -> no contact shadows.
+struct CShadowPass {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	bool                    failed     = false;
+	vk::Extent2D            render {}, trace {};
+	SsgiImage               raw, tmp_a, tmp_b, out;
+	SsgiImage               history[2], gbuf[2];
+	SsgiImage               moments[2], var_a, var_b;
+	uint32_t                frame         = 0;
+	int                     quality       = 0;
+	bool                    history_valid = false;
+	VkBuffer                vote          = VK_NULL_HANDLE;
+	VmaAllocation           vote_mem      = nullptr;
+	const uint32_t*         vote_mapped   = nullptr;
+	bool                    slot_voted[4] {};
+	float                   ema[4] {};
+	uint32_t                votes = 0;
+	int                     chosen = -1;
+	vk::QueryPool           pool      = nullptr;
+	double                  period_ns = 1.0;
+	uint64_t                written = 0, read = 0;
+	double                  sum_ms  = 0.0;
+	uint32_t                samples = 0;
+	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+} g_cs;
+
+struct CShadowPush {
+	float   proj[4];
+	float   depth_map[4];
+	float   motion[4];
+	float   trace[4];
+	int32_t misc[4];
+	float   extra[4];
+	float   cand[4][4];
+};
+static_assert(sizeof(CShadowPush) == 160);
+
+int ContactQuality() {
+	static const int quality = [] {
+		const char* value = std::getenv("KYTY_CONTACT_SHADOWS");
+		const int   q     = value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
+		std::printf("CSHADOW: KYTY_CONTACT_SHADOWS=%s read (level %d)\n", value != nullptr ? value : "(unset)", q);
+		std::fflush(stdout);
+		return q;
+	}();
+	return quality;
+}
+
+// The probe's findings (any recording thread writes, the upscaler's reads).
+struct SunProbe {
+	std::mutex              mutex;
+	std::array<float, 3>    axis {};    // the light axis in the matrices' input space, sign canonical (largest > 0)
+	uint64_t                flip = 0;   // the guest flip it was last seen in
+	uint32_t                agree = 0;  // matrices agreeing in that dispatch
+	uint32_t                stable = 0; // flips in a row with the same axis
+	bool                    valid = false;
+	std::array<float, 16>   view_proj {}; // the camera's (g_camera) when it was seen
+	bool                    have_camera = false;
+	std::array<std::atomic<uint64_t>, 8> consumers {};
+	std::array<uint64_t, 8> scanned_flip {};
+} g_sun;
+
+bool Orthonormalish(const float* r0, const float* r1, const float* r2, std::array<float, 3>& axis) {
+	const auto dot  = [](const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+	const float n0 = std::sqrt(dot(r0, r0)), n1 = std::sqrt(dot(r1, r1)), n2 = std::sqrt(dot(r2, r2));
+	if (!(n0 > 1e-6f && n1 > 1e-6f && n2 > 1e-7f) || !(n0 < 1e4f && n1 < 1e4f && n2 < 1e4f)) return false;
+	if (std::abs(dot(r0, r1)) > 0.01f * n0 * n1 || std::abs(dot(r0, r2)) > 0.01f * n0 * n2 || std::abs(dot(r1, r2)) > 0.01f * n1 * n2)
+		return false;
+	if (std::abs(n0 - n1) > 0.02f * std::max(n0, n1)) return false;  // a square shadow map
+	if (std::abs(n2 - n0) < 0.05f * std::max(n0, n2)) return false;  // rigid / uniformly scaled: no projection
+	axis = {r2[0] / n2, r2[1] / n2, r2[2] / n2};
+	// Exactly axis-aligned rows are identity-like constants, not a sun.
+	if (std::max({std::abs(axis[0]), std::abs(axis[1]), std::abs(axis[2])}) > 0.9999f) return false;
+	int big = 0;
+	for (int i = 1; i < 3; ++i)
+		if (std::abs(axis[i]) > std::abs(axis[big])) big = i;
+	if (axis[big] < 0.0f) axis = {-axis[0], -axis[1], -axis[2]};
+	return true;
+}
+
+// Orthographic matrices among the words: their light axes.
+void FindOrthoAxes(const std::vector<float>& f, std::vector<std::array<float, 3>>& axes) {
+	const auto finite = [&](size_t o, size_t n) {
+		for (size_t i = 0; i < n; ++i)
+			if (!std::isfinite(f[o + i])) return false;
+		return true;
+	};
+	std::array<float, 3> axis {};
+	for (size_t o = 0; o + 12 <= f.size() && axes.size() < 16; ++o) {
+		if (!finite(o, 12)) continue;
+		const float* m = &f[o];
+		if (o + 16 <= f.size() && finite(o, 16)) {
+			// Row-major (clip = M * p): the w row (0, 0, 0, 1).
+			if (m[12] == 0.0f && m[13] == 0.0f && m[14] == 0.0f && m[15] == 1.0f && Orthonormalish(m, m + 4, m + 8, axis)) {
+				axes.push_back(axis);
+				o += 15;
+				continue;
+			}
+			// Column-major: the w column.
+			if (m[3] == 0.0f && m[7] == 0.0f && m[11] == 0.0f && m[15] == 1.0f) {
+				const float c0[3] {m[0], m[4], m[8]}, c1[3] {m[1], m[5], m[9]}, c2[3] {m[2], m[6], m[10]};
+				if (Orthonormalish(c0, c1, c2, axis)) {
+					axes.push_back(axis);
+					o += 15;
+					continue;
+				}
+			}
+		}
+		// 3x4 rows (the projective row left out), 16-byte aligned only: fewer chance matches.
+		// (A perspective matrix's w row, along the depth row, follows a spot light's: refused.)
+		const bool perspective = o + 16 <= f.size() && finite(o, 16) &&
+		                         std::abs(m[12] * m[8] + m[13] * m[9] + m[14] * m[10]) >
+		                             0.5f * std::sqrt((m[12] * m[12] + m[13] * m[13] + m[14] * m[14]) * (m[8] * m[8] + m[9] * m[9] + m[10] * m[10])) &&
+		                         (m[12] * m[12] + m[13] * m[13] + m[14] * m[14]) > 1e-8f;
+		if ((o & 3u) == 0 && !perspective && Orthonormalish(m, m + 4, m + 8, axis)) {
+			axes.push_back(axis);
+			o += 11;
+		}
+	}
+}
+
+int CameraForwardReject(const std::array<float, 3>& axis, const std::array<float, 16>& vp) {
+	// The camera's w row's spatial part is its forward (perspective): a camera matrix, not a light one.
+	const float n = std::sqrt(vp[12] * vp[12] + vp[13] * vp[13] + vp[14] * vp[14]);
+	if (n < 1e-6f) return 0;
+	return std::abs(axis[0] * vp[12] + axis[1] * vp[13] + axis[2] * vp[14]) / n > 0.9994f ? 1 : 0;
+}
+
+bool Inverse4(const std::array<float, 16>& m, std::array<double, 16>& inv) {
+	// (Row-major, m[i*4+j]; the classic cofactor expansion.)
+	double a[16];
+	for (int i = 0; i < 16; ++i) a[i] = m[i];
+	inv[0]  = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] + a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
+	inv[4]  = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] - a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
+	inv[8]  = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] + a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
+	inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14] - a[8] * a[6] * a[13] - a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
+	inv[1]  = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15] - a[9] * a[3] * a[14] - a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
+	inv[5]  = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15] + a[8] * a[3] * a[14] + a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
+	inv[9]  = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15] - a[8] * a[3] * a[13] - a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
+	inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14] + a[8] * a[2] * a[13] + a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
+	inv[2]  = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15] + a[5] * a[3] * a[14] + a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
+	inv[6]  = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15] - a[4] * a[3] * a[14] - a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
+	inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15] + a[4] * a[3] * a[13] + a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
+	inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14] - a[4] * a[2] * a[13] - a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
+	inv[3]  = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11] - a[5] * a[3] * a[10] - a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
+	inv[7]  = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] + a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
+	inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] - a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
+	inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
+	const double det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
+	if (!(std::abs(det) > 1e-30)) return false;
+	for (auto& v: inv) v /= det;
+	return true;
+}
+} // namespace
+
+bool ContactShadowsWanted() { return ContactQuality() > 0; }
+
+bool IsShadowConsumer(uint64_t cs_hash) {
+	for (const auto& h: g_sun.consumers)
+		if (h.load(std::memory_order_relaxed) == cs_hash) return true;
+	return false;
+}
+
+void OnShadowConsumer(uint64_t cs_hash, const ShadowConsumer& consumer, std::span<const uint32_t> srt) {
+	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
+	std::lock_guard lock(g_sun.mutex);
+	size_t slot = g_sun.consumers.size();
+	bool   first = false;
+	for (size_t i = 0; i < g_sun.consumers.size(); ++i) {
+		const uint64_t h = g_sun.consumers[i].load(std::memory_order_relaxed);
+		if (h == cs_hash) { slot = i; break; }
+		if (h == 0) {
+			g_sun.consumers[i].store(cs_hash, std::memory_order_relaxed);
+			g_sun.scanned_flip[i] = ~0ull;
+			slot  = i;
+			first = true;
+			break;
+		}
+	}
+	if (slot == g_sun.consumers.size() || g_sun.scanned_flip[slot] == flip) return; // (once a flip per program)
+	g_sun.scanned_flip[slot] = flip;
+	std::vector<float> words(srt.size());
+	std::memcpy(words.data(), srt.data(), srt.size() * 4u);
+	std::vector<std::array<float, 3>> axes;
+	FindOrthoAxes(words, axes);
+	for (uint32_t i = 0; i < consumer.buffers; ++i) {
+		const uint64_t bytes = std::min<uint64_t>(consumer.buffer_size[i], 4096) & ~uint64_t {3};
+		words.assign(bytes / 4, 0.0f);
+		if (bytes == 0 || !Libs::LibKernel::Memory::TryReadBackingToHost(consumer.buffer_address[i], words.data(), bytes)) continue;
+		FindOrthoAxes(words, axes);
+	}
+	const bool camera = g_camera.valid;
+	if (camera) g_sun.view_proj = g_camera.view_proj, g_sun.have_camera = true;
+	if (g_sun.have_camera)
+		axes.erase(std::remove_if(axes.begin(), axes.end(), [&](const auto& a) { return CameraForwardReject(a, g_sun.view_proj) != 0; }),
+		           axes.end());
+	// The largest group agreeing within 2 degrees.
+	uint32_t best = 0, best_n = 0;
+	for (uint32_t i = 0; i < axes.size(); ++i) {
+		uint32_t n = 0;
+		for (const auto& b: axes)
+			n += std::abs(axes[i][0] * b[0] + axes[i][1] * b[1] + axes[i][2] * b[2]) > 0.9994f ? 1u : 0u;
+		if (n > best_n) best = i, best_n = n;
+	}
+	static uint32_t reports = 0;
+	if (first || (reports < 64 && flip % 600 == 0)) {
+		++reports;
+		std::printf("CSHADOW: sun-shadow consumer CS %016llx (shadow array 0x%llx %ux%u x%u layers, SRT %zu words, %u constant "
+		            "buffers): %zu orthographic matrices, axis (%.4f %.4f %.4f) agreed by %u%s\n",
+		            static_cast<unsigned long long>(cs_hash), static_cast<unsigned long long>(consumer.shadow_address),
+		            consumer.shadow_size, consumer.shadow_size, consumer.shadow_layers, srt.size(), consumer.buffers, axes.size(),
+		            best_n > 0 ? axes[best][0] : 0.0f, best_n > 0 ? axes[best][1] : 0.0f, best_n > 0 ? axes[best][2] : 0.0f, best_n,
+		            camera ? "" : " (no camera this frame)");
+		std::fflush(stdout);
+	}
+	if (best_n == 0) return;
+	const auto& a    = axes[best];
+	const bool  same = g_sun.valid && std::abs(a[0] * g_sun.axis[0] + a[1] * g_sun.axis[1] + a[2] * g_sun.axis[2]) > 0.9994f;
+	g_sun.stable = same ? (g_sun.flip == flip ? g_sun.stable : g_sun.stable + 1) : 1;
+	g_sun.agree  = std::max(best_n, g_sun.flip == flip && same ? g_sun.agree : 0u);
+	g_sun.axis   = a;
+	g_sun.flip   = flip;
+	g_sun.valid  = true;
+}
+
+namespace {
+bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
+	const auto device = graphics.device;
+	if (g_cs.pipeline == nullptr) {
+		if (g_cs.failed) return false;
+		g_cs.failed = true;
+		if (graphics.GetPhysicalDeviceProperties().limits.maxPushConstantsSize < sizeof(CShadowPush)) return false;
+		if (g_ssgi.point == nullptr) {
+			for (int i = 0; i < 2; ++i) {
+				vk::SamplerCreateInfo sampler {};
+				sampler.magFilter    = i == 0 ? vk::Filter::eNearest : vk::Filter::eLinear;
+				sampler.minFilter    = sampler.magFilter;
+				sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+				sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+				sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+				if (device.createSampler(&sampler, nullptr, i == 0 ? &g_ssgi.point : &g_ssgi.linear) != vk::Result::eSuccess) return false;
+			}
+		}
+		std::array<vk::DescriptorSetLayoutBinding, 12> bindings {};
+		for (uint32_t i = 0; i < 12; ++i) {
+			bindings[i].binding         = i;
+			bindings[i].descriptorType  = i == 11 ? vk::DescriptorType::eStorageBuffer
+			                              : i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler
+			                                                : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorCount = 1;
+			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+		}
+		vk::DescriptorSetLayoutCreateInfo set_info {};
+		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+		set_info.pBindings    = bindings.data();
+		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_cs.set_layout) != vk::Result::eSuccess) return false;
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(CShadowPush)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = 1;
+		layout_info.pSetLayouts            = &g_cs.set_layout;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push;
+		if (device.createPipelineLayout(&layout_info, nullptr, &g_cs.layout) != vk::Result::eSuccess) return false;
+		vk::ShaderModuleCreateInfo module_info {};
+		module_info.codeSize    = sizeof(CSHADOW_SPV);
+		module_info.pCode       = CSHADOW_SPV;
+		vk::ShaderModule module = nullptr;
+		if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		pipeline_info.stage.module = module;
+		pipeline_info.stage.pName  = "main";
+		pipeline_info.layout       = g_cs.layout;
+		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_cs.pipeline);
+		device.destroyShaderModule(module, nullptr);
+		if (created != vk::Result::eSuccess) {
+			g_cs.pipeline = nullptr;
+			return false;
+		}
+		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		create.size  = 4 * 16 * sizeof(uint32_t);
+		create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocate.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VmaAllocationInfo mapped {};
+		if (vmaCreateBuffer(graphics.allocator, &create, &allocate, &g_cs.vote, &g_cs.vote_mem, &mapped) != VK_SUCCESS) return false;
+		g_cs.vote_mapped = static_cast<const uint32_t*>(mapped.pMappedData);
+		vk::QueryPoolCreateInfo query {};
+		query.queryType  = vk::QueryType::eTimestamp;
+		query.queryCount = 16;
+		if (device.createQueryPool(&query, nullptr, &g_cs.pool) != vk::Result::eSuccess) g_cs.pool = nullptr;
+		g_cs.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		g_cs.failed    = false;
+	}
+	if (g_cs.out.image.image != nullptr && g_cs.render == render && g_cs.quality == quality) return true;
+	device.waitIdle();
+	SsgiImage* all[] {&g_cs.raw, &g_cs.tmp_a, &g_cs.tmp_b, &g_cs.out, &g_cs.history[0], &g_cs.history[1], &g_cs.gbuf[0],
+	                  &g_cs.gbuf[1], &g_cs.moments[0], &g_cs.moments[1], &g_cs.var_a, &g_cs.var_b};
+	for (auto* img : all)
+		SsgiFreeImage(graphics, *img);
+	const vk::Extent2D trace = quality >= 2 ? render : vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
+	bool ok = SsgiMakeImage(graphics, g_cs.out, render);
+	for (auto* img : all)
+		if (img != &g_cs.out) ok = ok && SsgiMakeImage(graphics, *img, trace);
+	if (!ok) {
+		for (auto* img : all)
+			SsgiFreeImage(graphics, *img);
+		g_cs.failed = true;
+		return false;
+	}
+	g_cs.render        = render;
+	g_cs.quality       = quality;
+	g_cs.trace         = trace;
+	g_cs.history_valid = false;
+	return true;
+}
+
+void CShadowReadTiming() {
+	if (g_cs.pool == nullptr || g_graphics_ctx == nullptr) return;
+	while (g_cs.read + 4 <= g_cs.written) {
+		const auto entry = static_cast<uint32_t>(g_cs.read % 8);
+		std::array<uint64_t, 2> stamps {};
+		if (g_graphics_ctx->device.getQueryPoolResults(g_cs.pool, entry * 2, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		                                               vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
+			break;
+		g_cs.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_cs.period_ns / 1e6;
+		++g_cs.samples;
+		++g_cs.read;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_cs.last_log >= std::chrono::seconds(5) && g_cs.samples > 0) {
+		std::printf("CSHADOW: GPU %.3f ms (mean of %u frames; light candidate %d, vote log-ratios %.2f %.2f %.2f %.2f)\n",
+		            g_cs.sum_ms / g_cs.samples, g_cs.samples, g_cs.chosen, g_cs.ema[0], g_cs.ema[1], g_cs.ema[2], g_cs.ema[3]);
+		std::fflush(stdout);
+		g_cs.sum_ms   = 0.0;
+		g_cs.samples  = 0;
+		g_cs.last_log = now;
+	}
+}
+
+// The vote read back (4 frames late) into the per-candidate EMAs; the choice made again with hysteresis.
+void CShadowTakeVote(uint32_t slot) {
+	if (!g_cs.slot_voted[slot] || g_cs.vote_mapped == nullptr) return;
+	g_cs.slot_voted[slot] = false;
+	(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_cs.vote_mem, 0, VK_WHOLE_SIZE);
+	const uint32_t* v = g_cs.vote_mapped + slot * 16;
+	float score[4];
+	bool  any = false;
+	for (int k = 0; k < 4; ++k) {
+		const uint32_t lit_n = v[k * 4 + 1], away_n = v[k * 4 + 3];
+		if (lit_n < 200 || away_n < 200) {
+			score[k] = -1e9f;
+			continue;
+		}
+		const double lit = (static_cast<double>(v[k * 4]) + 1.0) / lit_n, away = (static_cast<double>(v[k * 4 + 2]) + 1.0) / away_n;
+		score[k] = static_cast<float>(std::log(lit / away));
+		any      = true;
+	}
+	if (!any) return;
+	++g_cs.votes;
+	const float a = g_cs.votes == 1 ? 1.0f : 0.25f;
+	for (int k = 0; k < 4; ++k)
+		g_cs.ema[k] = score[k] < -1e8f ? g_cs.ema[k] * (1.0f - a) : g_cs.ema[k] + (score[k] - g_cs.ema[k]) * a;
+	int best = 0;
+	for (int k = 1; k < 4; ++k)
+		if (g_cs.ema[k] > g_cs.ema[best]) best = k;
+	const float other = std::max(g_cs.ema[best < 2 ? 2 : 0], g_cs.ema[best < 2 ? 3 : 1]); // the other interpretation's axis
+	const float keep  = std::log(1.12f), take = std::log(1.2f);
+	const int   was   = g_cs.chosen;
+	if (g_cs.votes >= 4) {
+		if (g_cs.chosen >= 0 && g_cs.ema[g_cs.chosen] < keep) g_cs.chosen = -1;
+		if (g_cs.ema[best] >= take && g_cs.ema[best] - other > 0.08f && (g_cs.chosen < 0 || g_cs.ema[best] > g_cs.ema[g_cs.chosen] + 0.1f))
+			g_cs.chosen = best;
+	}
+	if (was != g_cs.chosen) {
+		static const char* names[] {"world axis +", "world axis -", "view axis +", "view axis -"};
+		std::printf("CSHADOW: light %s (vote log-ratios %.3f %.3f %.3f %.3f after %u votes)\n",
+		            g_cs.chosen >= 0 ? names[g_cs.chosen] : "none: contact shadows paused (no sunlit agreement)", g_cs.ema[0],
+		            g_cs.ema[1], g_cs.ema[2], g_cs.ema[3], g_cs.votes);
+		std::fflush(stdout);
+	}
+}
+
+bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
+	const int quality = ContactQuality();
+	const auto said_once = [](const char* why) {
+		static std::string said;
+		if (said != why) {
+			said = why;
+			std::printf("CSHADOW: off for now (%s)\n", why);
+			std::fflush(stdout);
+		}
+	};
+	if (quality == 0 || g_graphics_ctx == nullptr) return false;
+	if (VideoOut::MoviePlaying()) return g_cs.history_valid = false, false;
+	const auto& color = inputs.color;
+	if (color.view == nullptr || inputs.depth.view == nullptr || inputs.motion.view == nullptr || color.extent.width < 16 ||
+	    color.extent.height < 16)
+		return said_once("missing color/depth/motion view"), false;
+	const auto& m = inputs.view_to_clip;
+	if (!(m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f)))
+		return said_once("no camera projection (view_to_clip)"), false;
+	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality)) return said_once("could not create its pipeline or images"), false;
+
+	// The light candidates in view space.
+	std::array<float, 3>  axis {};
+	std::array<float, 16> vp {};
+	bool                  have_axis = false, have_camera = false;
+	uint64_t              seen_flip = 0;
+	{
+		std::lock_guard lock(g_sun.mutex);
+		have_axis   = g_sun.valid && (g_sun.agree >= 2 || g_sun.stable >= 3);
+		axis        = g_sun.axis;
+		vp          = g_sun.view_proj;
+		have_camera = g_sun.have_camera;
+		seen_flip   = g_sun.flip;
+	}
+	if (have_axis && g_flips_taken.load(std::memory_order_relaxed) > seen_flip + 120) have_axis = false; // (stale: 2 s unseen)
+	if (!have_axis) return g_cs.history_valid = false, said_once("no sun direction: no shadow-map consumer with orthographic cascades"), false;
+	float cand[4][4] {};
+	cand[2][0] = axis[0], cand[2][1] = axis[1], cand[2][2] = axis[2], cand[2][3] = 1.0f;
+	cand[3][0] = -axis[0], cand[3][1] = -axis[1], cand[3][2] = -axis[2], cand[3][3] = 1.0f;
+	if (have_camera) {
+		// View = P^-1 * view_proj (column vectors): P's column form is the transpose of the row-vector view_to_clip.
+		std::array<float, 16> pc {};
+		for (int i = 0; i < 4; ++i)
+			for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
+		std::array<double, 16> pinv {};
+		if (Inverse4(pc, pinv)) {
+			double d[3] {};
+			for (int i = 0; i < 3; ++i)
+				for (int j = 0; j < 3; ++j) {
+					double vij = 0.0;
+					for (int k = 0; k < 4; ++k) vij += pinv[i * 4 + k] * vp[k * 4 + j];
+					d[i] += vij * axis[j];
+				}
+			const double n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+			if (n > 1e-9 && std::isfinite(n))
+				for (int i = 0; i < 3; ++i) cand[0][i] = static_cast<float>(d[i] / n), cand[1][i] = -cand[0][i];
+			cand[0][3] = cand[1][3] = n > 1e-9 && std::isfinite(n) ? 1.0f : 0.0f;
+		}
+	}
+
+	const float strength = SsgiEnv("KYTY_CONTACT_SHADOWS_STRENGTH", 0.7f, 1.0f);
+	const float length   = std::max(SsgiEnv("KYTY_CONTACT_SHADOWS_LENGTH", 1.0f, 4.0f), 0.25f);
+	CShadowPush push {};
+	push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
+	push.depth_map[0] = m[10], push.depth_map[1] = m[14], push.depth_map[2] = m[11], push.depth_map[3] = m[15];
+	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
+	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
+	push.trace[0] = static_cast<float>(g_cs.trace.width), push.trace[1] = static_cast<float>(g_cs.trace.height);
+	push.trace[2] = strength, push.trace[3] = length;
+	std::memcpy(push.cand, cand, sizeof(cand));
+
+	CShadowReadTiming();
+	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
+	                        vk::AccessFlags2 dst) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = src_stage;
+		barrier.srcAccessMask = src;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	SsgiImage* all[] {&g_cs.raw, &g_cs.tmp_a, &g_cs.tmp_b, &g_cs.out, &g_cs.history[0], &g_cs.history[1], &g_cs.gbuf[0],
+	                  &g_cs.gbuf[1], &g_cs.moments[0], &g_cs.moments[1], &g_cs.var_a, &g_cs.var_b};
+	for (auto* img : all)
+		if (img->image.state.layout != vk::ImageLayout::eGeneral)
+			Transition(command, img->image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+			           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+	       vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
+	       vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite);
+	const uint32_t cur  = g_cs.frame & 1u;
+	const uint32_t prev = cur ^ 1u;
+	push.misc[1] = static_cast<int32_t>(g_cs.frame);
+	push.misc[2] = quality;
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_cs.pipeline);
+	const SsgiImage* aux_in  = &g_cs.moments[prev];
+	const SsgiImage* aux_out = &g_cs.moments[cur];
+	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout, float step,
+	                     vk::Extent2D size) {
+		const vk::Sampler       lin = g_ssgi.linear, pt = g_ssgi.point;
+		vk::DescriptorImageInfo infos[11] {};
+		infos[0]  = {lin, color.view, color.layout};
+		infos[1]  = {pt, inputs.depth.view, inputs.depth.layout};
+		infos[2]  = {pt, inputs.motion.view, inputs.motion.layout};
+		infos[3]  = {lin, a.view, vk::ImageLayout::eGeneral};
+		infos[4]  = {lin, b.view, vk::ImageLayout::eGeneral};
+		infos[5]  = {pt, g_cs.gbuf[cur].view, vk::ImageLayout::eGeneral};
+		infos[6]  = {pt, g_cs.gbuf[prev].view, vk::ImageLayout::eGeneral};
+		infos[7]  = {nullptr, out.view, vk::ImageLayout::eGeneral};
+		infos[8]  = {nullptr, gout.view, vk::ImageLayout::eGeneral};
+		infos[9]  = {lin, aux_in->view, vk::ImageLayout::eGeneral};
+		infos[10] = {nullptr, aux_out->view, vk::ImageLayout::eGeneral};
+		vk::DescriptorBufferInfo vote_info {vk::Buffer(g_cs.vote), 0, VK_WHOLE_SIZE};
+		vk::WriteDescriptorSet   writes[12] {};
+		for (uint32_t i = 0; i < 12; ++i) {
+			writes[i].dstBinding      = i;
+			writes[i].descriptorCount = 1;
+			if (i == 11) {
+				writes[i].descriptorType = vk::DescriptorType::eStorageBuffer;
+				writes[i].pBufferInfo    = &vote_info;
+			} else {
+				writes[i].descriptorType = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+				writes[i].pImageInfo     = &infos[i];
+			}
+		}
+		push.misc[0]  = mode;
+		push.extra[0] = step;
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_cs.layout, 0, 12, writes);
+		command.pushConstants(g_cs.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	};
+
+	// The vote: every frame until a light is chosen, then every 16th (the scene, an interior, may change).
+	const uint32_t slot = g_cs.frame % 4;
+	CShadowTakeVote(slot);
+	if (g_cs.chosen < 0 || g_cs.frame % 16 == 0) {
+		command.fillBuffer(vk::Buffer(g_cs.vote), slot * 64, 64, 0);
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+		       vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
+		push.misc[3] = static_cast<int32_t>(slot << 8);
+		run(5, g_cs.tmp_a, g_cs.tmp_b, g_cs.raw, g_cs.gbuf[cur], 0.0f, vk::Extent2D {(color.extent.width + 3) / 4, (color.extent.height + 3) / 4});
+		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eHost,
+		       vk::AccessFlagBits2::eHostRead);
+		g_cs.slot_voted[slot] = true;
+	}
+	if (g_cs.chosen < 0) {
+		++g_cs.frame;
+		g_cs.history_valid = false;
+		return said_once("sun axis found, waiting for the lighting vote to agree on its space and sign"), false;
+	}
+	push.extra[1] = cand[g_cs.chosen][0], push.extra[2] = cand[g_cs.chosen][1], push.extra[3] = cand[g_cs.chosen][2];
+	if (cand[g_cs.chosen][3] < 0.5f) {
+		++g_cs.frame;
+		return said_once("the chosen world-space light has no camera this frame"), false;
+	}
+	{
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("CSHADOW: on (level %d, trace %ux%u, strength %g, length %g, light view dir %.3f %.3f %.3f)\n", quality,
+			            g_cs.trace.width, g_cs.trace.height, strength, length, push.extra[1], push.extra[2], push.extra[3]);
+			std::fflush(stdout);
+		}
+	}
+	const auto entry = static_cast<uint32_t>(g_cs.written % 8);
+	const bool timed = g_cs.pool != nullptr;
+	if (timed) {
+		command.resetQueryPool(g_cs.pool, entry * 2, 2);
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_cs.pool, entry * 2);
+	}
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g_cs.history_valid ? 2 : 0);
+	run(0, g_cs.tmp_a, g_cs.tmp_b, g_cs.raw, g_cs.gbuf[cur], 0.0f, g_cs.trace);
+	run(1, g_cs.raw, g_cs.history[prev], g_cs.tmp_a, g_cs.tmp_b, 0.0f, g_cs.trace);
+	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_a;
+	run(2, g_cs.tmp_a, g_cs.raw, g_cs.history[cur], g_cs.tmp_b, 1.0f, g_cs.trace);
+	aux_in = &g_cs.var_a, aux_out = &g_cs.var_b;
+	run(2, g_cs.history[cur], g_cs.raw, g_cs.tmp_b, g_cs.raw, 2.0f, g_cs.trace);
+	const SsgiImage* final_vis = &g_cs.tmp_b;
+	if (quality >= 2) {
+		aux_in = &g_cs.var_b, aux_out = &g_cs.var_a;
+		run(2, g_cs.tmp_b, g_cs.raw, g_cs.tmp_a, g_cs.raw, 4.0f, g_cs.trace);
+		final_vis = &g_cs.tmp_a;
+	}
+	if (quality >= 3) {
+		aux_in = &g_cs.var_a, aux_out = &g_cs.var_b;
+		run(2, g_cs.tmp_a, g_cs.raw, g_cs.tmp_b, g_cs.raw, 8.0f, g_cs.trace);
+		final_vis = &g_cs.tmp_b;
+	}
+	aux_in = &g_cs.var_a, aux_out = &g_cs.var_b;
+	run(4, *final_vis, g_cs.raw, g_cs.out, g_cs.raw, 0.0f, g_cs.render);
+	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
+	       vk::AccessFlagBits2::eMemoryRead);
+	if (timed) {
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_cs.pool, entry * 2 + 1);
+		++g_cs.written;
+	}
+	++g_cs.frame;
+	g_cs.history_valid = true;
+	inputs.color.image  = g_cs.out.image.image;
+	inputs.color.view   = g_cs.out.view;
+	inputs.color.layout = vk::ImageLayout::eGeneral;
+	inputs.color.format = vk::Format::eR16G16B16A16Sfloat;
+	inputs.color.usage  = g_cs.out.image.usage;
+	inputs.color.level  = 0;
+	inputs.color.layer  = 0;
+	return true;
+}
+} // namespace
+
 bool SsgiWanted() { return SsgiQuality() > 0; }
 
 bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
@@ -4116,6 +4740,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	// (The DLSS-G hudless path sets the context in PrepareInputs; the PS5 Pro path alone needs the renderer's.)
 	if (g_graphics_ctx == nullptr && inputs.graphics != nullptr) g_graphics_ctx = inputs.graphics;
 	SsgiApply(command, inputs); // (KYTY_SSGI: inputs.color becomes the composited copy)
+	CShadowApply(command, inputs); // (KYTY_CONTACT_SHADOWS: likewise, after SSGI)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
 	const bool  fsr  = g_sr_kind == 3;

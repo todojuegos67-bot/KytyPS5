@@ -407,6 +407,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${ssgi_header}")
 
+# KYTY_CONTACT_SHADOWS: screen-space contact shadows before the upscaler (src/local/frame-gen.cpp).
+set(cshadow_source "${KYTY_SOURCE_DIR}/local/cshadow.comp")
+set(cshadow_spv "${gpu_tiler_generated_dir}/cshadow.spv")
+set(cshadow_header "${gpu_tiler_generated_dir}/cshadow_spv.h")
+add_custom_command(
+	OUTPUT "${cshadow_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${cshadow_spv}" "${cshadow_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${cshadow_spv} -DOUTPUT=${cshadow_header}
+	        -DSYMBOL=CSHADOW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${cshadow_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${cshadow_header}")
+
 # FSR 3 frame generation's HUD layer (src/local/fsr3-fg.cpp).
 set(hud_split_source "${KYTY_SOURCE_DIR}/local/hud-split.comp")
 set(hud_split_spv "${gpu_tiler_generated_dir}/hud_split.spv")
