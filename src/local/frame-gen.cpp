@@ -959,7 +959,6 @@ void Initialize() {
 	{
 		const char* ssgi = std::getenv("KYTY_SSGI");
 		std::printf("SSGI: KYTY_SSGI=%s read (quality %d)\n", ssgi != nullptr ? ssgi : "(unset)", SsgiQuality());
-		(void)ContactShadowsWanted(); // (its "CSHADOW: KYTY_CONTACT_SHADOWS=" line)
 		std::fflush(stdout);
 	}
 	const char* value = std::getenv("KYTY_FRAMEGEN");
@@ -1995,7 +1994,7 @@ void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt, char path) {
 	}
 	g_camera.jitter_ndc = {AsFloat(srt[SrtJitter]), AsFloat(srt[SrtJitter + 1])};
 	g_camera.valid      = true;
-	{
+	if (ContactShadowsWanted()) {
 		std::lock_guard lock(g_last_vp_mutex);
 		g_last_vp = g_camera.view_proj, g_have_last_vp = true;
 	}
