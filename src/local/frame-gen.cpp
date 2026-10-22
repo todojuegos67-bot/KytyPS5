@@ -1762,7 +1762,10 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		g_options_format     = format;
 	}
 
-	++g_frame_index;
+	// 10-23: a frame begun at the guest flip (ReflexGuestFlip) keeps its index; others (menus, a repeated image)
+	// take a new one with all markers here, as before.
+	const uint32_t guest_index = g_rx_present.exchange(0, std::memory_order_relaxed);
+	g_frame_index              = guest_index != 0 ? guest_index : g_rx_counter.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (g_api.get_new_frame_token(g_token, &g_frame_index) != sl::Result::eOk || g_token == nullptr) {
 		g_token = nullptr;
 		return;
@@ -1772,10 +1775,12 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		const char* value = std::getenv("KYTY_DLSSG_SLEEP");
 		return value == nullptr || *value != '0';
 	}();
-	if (sleep && g_api.reflex_sleep != nullptr) g_api.reflex_sleep(token);
-	g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, token);
-	g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, token);
-	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, token);
+	if (guest_index == 0) {
+		if (sleep && g_api.reflex_sleep != nullptr && !ReflexGuestMarkers()) g_api.reflex_sleep(token);
+		g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, token);
+		g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, token);
+		g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, token);
+	}
 
 	sl::Constants constants = MakeConstants(usable, usable ? inputs->camera : Camera {}, usable ? inputs->render_extent : vk::Extent2D {});
 	if (const auto result = g_api.set_constants(constants, token, viewport); result != sl::Result::eOk) {
@@ -1886,7 +1891,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		};
 		g_api.set_tag_for_frame(token, viewport, tags, static_cast<uint32_t>(std::size(tags)), nullptr);
 	}
-	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, token);
+	if (guest_index == 0) g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, token);
 	g_api.pcl_set_marker(sl::PCLMarker::ePresentStart, token);
 	g_present_begin = std::chrono::steady_clock::now();
 #else
@@ -2070,6 +2075,57 @@ void NoteShader(uint64_t hash, char stage) {
 		            static_cast<unsigned long long>(v.first), static_cast<unsigned long long>(v.last),
 		            static_cast<unsigned long long>(v.count));
 	std::fflush(stdout);
+}
+
+// 10-23: KYTY_DLSSG_MARKERS=guest (default) | present. Before, every Reflex marker and slReflexSleep came at the
+// present: the simulation marked as taking no time, and Reflex's sleep delayed the present itself (the driver's
+// pacing then saw a frame of ~0 ms simulation and a variable wait before each present). Now at the guest flip on the
+// render thread: render submit end for the frame that ends there, then for the next one Reflex's sleep (it paces the
+// game's frames, not the presents), simulation start/end and render submit start; present start/end at the present
+// with the same frame index. present: all at the present (the old placement).
+bool ReflexGuestMarkers() {
+	static const bool guest = [] {
+		const char* v = std::getenv("KYTY_DLSSG_MARKERS");
+		return v == nullptr || std::strcmp(v, "present") != 0;
+	}();
+	return guest;
+}
+std::atomic<uint32_t> g_rx_counter {0};   // Reflex frame indices (guest and present paths)
+uint32_t              g_rx_open = 0;      // render thread: the frame begun at the last guest flip
+std::atomic<uint32_t> g_rx_present {0};   // the index BeforePresent presents next (SetPresentReflexIndex)
+
+void ReflexGuestFlip(FrameInputs& fg) {
+	fg.reflex_index = 0;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_ready || !ReflexGuestMarkers() || g_api.pcl_set_marker == nullptr) return;
+	sl::FrameToken* token = nullptr;
+	if (g_rx_open != 0) {
+		uint32_t index = g_rx_open;
+		if (g_api.get_new_frame_token(token, &index) == sl::Result::eOk && token != nullptr) {
+			g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, *token);
+			fg.reflex_index = g_rx_open;
+		}
+	}
+	uint32_t next = g_rx_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+	token         = nullptr;
+	if (g_api.get_new_frame_token(token, &next) != sl::Result::eOk || token == nullptr) {
+		g_rx_open = 0;
+		return;
+	}
+	static const bool sleep = [] {
+		const char* value = std::getenv("KYTY_DLSSG_SLEEP");
+		return value == nullptr || *value != '0';
+	}();
+	if (sleep && g_api.reflex_sleep != nullptr) g_api.reflex_sleep(*token);
+	g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, *token);
+	g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, *token);
+	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, *token);
+	g_rx_open = next;
+#endif
+}
+
+void SetPresentReflexIndex(uint32_t index) {
+	g_rx_present.store(index, std::memory_order_relaxed);
 }
 
 void NoteScene() {

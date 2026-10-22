@@ -76,6 +76,7 @@ struct FrameInputs {
 	vk::ImageView hudless_display_view = nullptr;
 	bool          has_hudless_display  = false;
 	bool          valid       = false;
+	uint32_t      reflex_index = 0; // 10-23: DLSS-G's Reflex frame index, begun at the guest frame's start (0: none)
 };
 
 // Process start, before the window: loads Streamline when KYTY_FRAMEGEN or KYTY_UPSCALER=dlss is set (it then
@@ -139,6 +140,11 @@ void SetStaticRect(float x0, float y0, float x1, float y1);
 // (Presenter::PrepareFrame): above 60 Hz the other frames keep 60 (videoOut.cpp).
 void NoteScene();
 [[nodiscard]] bool TakeScene();
+// 10-23: the guest flip on the render thread (Presenter::PrepareFrame): DLSS-G's Reflex markers for the frame that ends
+// (render submit end; its index into `fg`) and the next (Reflex sleep, simulation, render submit start).
+void ReflexGuestFlip(FrameInputs& fg);
+// The Reflex index of the frame BeforePresent presents next (0: none, the markers at the present as before).
+void SetPresentReflexIndex(uint32_t index);
 // The current guest frame ran the TAA pass so far, or the last one flipped did (HudAnchor: the game queues a frame's
 // interface before the flip of the one before).
 [[nodiscard]] bool SceneNoted();

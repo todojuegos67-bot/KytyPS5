@@ -1469,6 +1469,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(),
 		                        buffer, frame->fg, image_id, image);
 	}
+	FrameGen::ReflexGuestFlip(frame->fg); // 10-23: DLSS-G's Reflex markers at the guest frame boundary
 	return *frame;
 }
 
@@ -1477,6 +1478,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(producer == nullptr || producer->IsInvalid());
 	auto*           frame = m_impl->frames.Acquire();
+	frame->fg.reflex_index = 0; // (a blank frame: its Reflex markers at the present)
 	RenderLockGuard render_lock(m_impl->renderer.GetMutex());
 	m_impl->ClearFrame(*frame, width, height, opaque, producer);
 	return *frame;
@@ -1722,6 +1724,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		const bool generate = FrameGen::Enabled();
 		if (generate) {
 			const auto before_begin = std::chrono::steady_clock::now();
+			FrameGen::SetPresentReflexIndex(frame.reusing_last ? 0u : frame.fg.reflex_index);
 			FrameGen::BeforePresent(frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
 			                        swapchain.Extent(), swapchain.PresentRegion(), swapchain.Format(),
 			                        swapchain.ImageCount());
