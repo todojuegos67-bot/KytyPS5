@@ -148,7 +148,7 @@ bool GraphicContext::CreateAllocator() {
 	// the game's streaming left 21 blocks of 256 MiB with 2.7 GB free inside them at Boletaria (11.9 GB held of
 	// which 8.9 in use); smaller blocks hold less around each straggler. KYTY_VMA_BLOCK_MB=<n> for an A/B.
 	{
-		uint64_t block_mb = 64;
+		uint64_t block_mb = LocalPlatform::LowMemVram() ? 32 : 64;
 		if (const char* text = std::getenv("KYTY_VMA_BLOCK_MB"); text != nullptr && std::strtoull(text, nullptr, 10) > 0)
 			block_mb = std::strtoull(text, nullptr, 10);
 		info.preferredLargeHeapBlockSize = block_mb << 20u;
@@ -207,6 +207,7 @@ bool GraphicContext::CreateAllocator() {
 			left -= chunk;
 		}
 		g_tag_ballast = false;
+		LocalPlatform::SetSimulationBallast(simulation_ballast_bytes);
 		std::printf("Simulated video memory: %" PRIu64 " MiB of heap %u (%" PRIu64 " MiB) taken, priorities %s\n",
 		            simulation_ballast_bytes >> 20u, heap, size >> 20u, memory_priority_enabled ? "on" : "off");
 	}
@@ -246,7 +247,7 @@ bool GraphicContext::CreateAllocator() {
 	g_report_allocator          = allocator;
 	g_report_context            = this;
 	LiveCounters::g_vma_report = WriteVmaReport;
-	g_image_pool_limit         = std::min<uint64_t>(1024ull << 20, GetTotalMemoryBudget() / 32);
+	g_image_pool_limit         = std::min<uint64_t>(LocalPlatform::LowMemVram() ? 256ull << 20 : 1024ull << 20, GetTotalMemoryBudget() / 32);
 	{
 		// The caches' video memory budget, in the run log with the build (to tell builds apart in a log).
 		uint64_t local = 0;
@@ -447,6 +448,9 @@ uint64_t GraphicContext::GetTotalMemoryBudget(bool capped) const {
 		constexpr uint64_t GiB = 1024ull * 1024 * 1024;
 		// 8 GB at most: a 16 GB card with the desktop, an overlay and a browser stayed near 15 GB in use at 10 GB.
 		if (local > 4 * GiB) result = std::min(result, std::min(local - 3 * GiB, 8 * GiB));
+		// KYTY_LOWMEM_VRAM=1: at most 6 GB, the GPU's memory less 4 GB (not below 3 GB).
+		if (LocalPlatform::LowMemVram() && local > 4 * GiB)
+			result = std::min(result, std::max(std::min(local - 4 * GiB, 6 * GiB), 3 * GiB));
 		return result;
 	}
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;

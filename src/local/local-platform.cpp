@@ -70,6 +70,14 @@ static uint64_t CpuListMask(const char* list) {
 	return mask;
 }
 
+bool LowMemVram() {
+	static const bool on = [] {
+		const char* text = std::getenv("KYTY_LOWMEM_VRAM");
+		return text != nullptr && text[0] == '1';
+	}();
+	return on;
+}
+
 #if defined(_WIN32)
 
 static double FileTimeSeconds(const FILETIME& time) {
@@ -1583,6 +1591,9 @@ inline size_t Hash(uint64_t address) {
 }
 } // namespace MemoryTags
 
+static std::atomic<uint64_t> g_simulation_ballast {0};
+void SetSimulationBallast(uint64_t bytes) { g_simulation_ballast = bytes; }
+
 bool MemoryTagsEnabled() {
 	// KYTY_MEMORY_TAGS=1 (default off): a regression (black screen after the intro video on an RTX) followed the
 	// hooks being on by default; off, operator new/delete are plain malloc/free and Vulkan memory is not wrapped.
@@ -1775,6 +1786,13 @@ void StartMemoryBreakdown() {
 				std::string annotations;
 				tags[0] = '\0';
 				if (MemoryTagsEnabled() && FormatMemoryTags(tags, sizeof(tags), top_bases, &annotations) <= 0) tags[0] = '\0';
+				if (const uint64_t ballast = g_simulation_ballast.load(); ballast != 0) {
+					const size_t used = std::strlen(tags);
+					std::snprintf(tags + used, sizeof(tags) - used,
+					              "; KYTY_SIMULATE_VRAM_MB ballast %llu MiB of video memory held (its driver commit is the "
+					              "test's: not a measurement of a real card)",
+					              static_cast<unsigned long long>(ballast >> 20u));
+				}
 				std::printf("%s; by allocation size: <1 MiB %llu MiB, 1-64 MiB %llu MiB, >=64 MiB %llu MiB%s%s%s\n", line,
 				            static_cast<unsigned long long>(small_b >> 20u), static_cast<unsigned long long>(mid_b >> 20u),
 				            static_cast<unsigned long long>(large_b >> 20u), tags,
@@ -2258,6 +2276,7 @@ MemoryUse ProcessMemory() {
 void StartWorkingSetTrim() {}
 void KeepResident() {}
 void StartMemoryBreakdown() {}
+void SetSimulationBallast(uint64_t) {}
 bool MemoryTagsEnabled() { return false; }
 void MemoryTagAdd(int, int64_t, int64_t) {}
 void SetTrimRunner(void (*)(void (*)())) {}

@@ -124,6 +124,12 @@ enum MemoryTag : int {
 	MemoryTagCount
 };
 bool MemoryTagsEnabled();
+// KYTY_LOWMEM_VRAM=1 (default off; the launcher's "Equipo de 16 GB RAM"): less video memory held, for PCs whose
+// commit runs out: VMA blocks of 32 MiB, an upload ring of 256 MiB, the caches' budget at most 6 GB (the GPU's
+// memory less 4 GB), a freed-image pool of at most 256 MiB.
+bool LowMemVram();
+// KYTY_SIMULATE_VRAM_MB's ballast (bytes): the breakdown line says that much of its commit is the test's.
+void SetSimulationBallast(uint64_t bytes);
 void MemoryTagAdd(int tag, int64_t requested, int64_t committed);
 uint64_t  PhysicalMemory();
 // KYTY_TRIM_RAM_SECONDS=<n>: every n seconds the process's working set is emptied (Windows: the pages go to the
