@@ -568,7 +568,11 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	// 22 fps, textures yielding: ~45). It counts that type under the video memory heap: on 8 GB, half is reached
 	// before the first texture.
 	const bool texture = IsTextureUsage(image_info.usage);
-	if (texture && small_video_memory && GetDeviceMemoryUsage() >= GetTotalMemoryBudget(false) / 2) {
+	// KYTY_LOWMEM_VRAM=1: no redirect. The plain type's allocations are a second pool outside the caches' budget
+	// (2593 MiB of it at 4096 budget on a simulated 8 GB card, the process's private commit +4.6 GB, NVIDIA charging
+	// it to commit); device-local textures stay under the budget the caches collect to.
+	if (texture && small_video_memory && !LocalPlatform::LowMemVram() &&
+	    GetDeviceMemoryUsage() >= GetTotalMemoryBudget(false) / 2) {
 		alloc_info.requiredFlags = 0;
 		alloc_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	}
