@@ -1286,6 +1286,21 @@ sl::Constants MakeConstants(bool usable, const Camera& camera_in, vk::Extent2D r
 	constants.orthographicProjection = sl::Boolean::eFalse;
 	constants.motionVectorsDilated   = sl::Boolean::eFalse;
 	constants.motionVectorsJittered  = sl::Boolean::eFalse;
+	{
+		// The vectors' scale and sign whether the camera was captured or not (it was set only with the camera: without
+		// it the game's vectors went in as +1, pointing the wrong way).
+		static const float sign = [] {
+			const char* value = std::getenv("KYTY_FRAMEGEN_MV_SIGN");
+			return value != nullptr && std::atof(value) > 0 ? 1.0f : -1.0f;
+		}();
+		static const bool px = [] {
+			const char* mv = std::getenv("KYTY_FRAMEGEN_MV");
+			return mv != nullptr && std::string(mv) == "px";
+		}();
+		if (usable && render.width != 0 && render.height != 0)
+			constants.mvecScale = px ? sl::float2(sign / static_cast<float>(render.width), sign / static_cast<float>(render.height))
+			                         : sl::float2(sign, sign);
+	}
 	if (usable && camera.valid) {
 		// Projection in view space: x' = sx*x + cx*z, y' = sy*y + cy*z, z' = near, w' = z.
 		Mat4 projection;
@@ -1897,8 +1912,18 @@ void SetStaticRect(float x0, float y0, float x1, float y1) {
 	g_static_rect.store(pack(x0, 0) | pack(y0, 1) | pack(x1, 2) | pack(y1, 3), std::memory_order_relaxed);
 }
 
-void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
-	if (g_camera.valid || srt.size() < SrtJitter + 2 || !IsGbufferVertexShader(vs_hash)) {
+// The camera's capture, per guest frame window (the "[dlssg] camera valid" line): G-buffer draws seen by path, those
+// whose SRT was too short to hold the camera.
+std::atomic<uint32_t> g_cam_seen[3] {}; // normal, table, native record
+std::atomic<uint32_t> g_cam_short {};
+
+void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt, char path) {
+	if (g_camera.valid || !IsGbufferVertexShader(vs_hash)) {
+		return;
+	}
+	g_cam_seen[path == 't' ? 1 : path == 'r' ? 2 : 0].fetch_add(1, std::memory_order_relaxed);
+	if (srt.size() < SrtJitter + 2) {
+		g_cam_short.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 	for (uint32_t i = 0; i < 16; ++i) {
@@ -3292,10 +3317,45 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	// take the table path, which does not report it, and generation went on and off from frame to frame.)
 	const bool ready = g_sources.valid;
 	const auto sources = g_sources;
-	const auto camera  = g_camera;
+	auto camera        = g_camera;
 	g_sources.valid    = false;
 	g_camera.valid     = false;
 	++g_guest_frame;
+	{
+		// A guest frame whose G-buffer draws did not give the camera: the last captured one, for up to
+		// KYTY_DLSSG_CAMERA_HOLD (2) frames, its previous matrix the same (no camera motion assumed: the vectors carry it),
+		// in place of identity matrices and a reset (DLSS-G then interpolated as from the image alone).
+		static const uint32_t hold_frames = [] {
+			const char* value = std::getenv("KYTY_DLSSG_CAMERA_HOLD");
+			return value != nullptr ? static_cast<uint32_t>(std::atoi(value)) : 2u;
+		}();
+		static Camera   last {};
+		static uint32_t since = ~0u;
+		static uint32_t window = 0, valid = 0, held = 0;
+		if (camera.valid) {
+			last  = camera;
+			since = 0;
+			++valid;
+		} else if (last.valid && since < hold_frames) {
+			++since;
+			camera                = last;
+			camera.prev_view_proj = last.view_proj;
+			++held;
+		} else if (since != ~0u) {
+			since = hold_frames + 1;
+		}
+		if (++window == 600) {
+			const auto seen = [](uint32_t i) { return g_cam_seen[i].exchange(0, std::memory_order_relaxed); };
+			const uint32_t normal = seen(0), table = seen(1), record = seen(2);
+			const uint32_t shorter = g_cam_short.exchange(0, std::memory_order_relaxed);
+			LOGF("[dlssg] camera valid %u of 600 (held %u; G-buffer draws before capture: normal %u, table %u, record %u, SRT "
+			     "too short %u)\n", valid, held, normal, table, record, shorter);
+			std::printf("[dlssg] camera valid %u of 600 (held %u; G-buffer draws before capture: normal %u, table %u, record "
+			            "%u, SRT too short %u)\n", valid, held, normal, table, record, shorter);
+			std::fflush(stdout);
+			window = valid = held = 0;
+		}
+	}
 	if (!ready) {
 		return;
 	}

@@ -3332,7 +3332,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	// shader's SRT. Without it frames drawn from records had no generated frames (and were not
 	// capped by KYTY_FLIP_RATE).
 	if (FrameGen::Enabled() && record.stage_count > 0 && record.stages[0].program != nullptr) {
-		FrameGen::OnDraw(record.stages[0].program->shader_hash, record.stages[0].flattened);
+		FrameGen::OnDraw(record.stages[0].program->shader_hash, record.stages[0].flattened, 'r');
 	}
 	return true;
 }
