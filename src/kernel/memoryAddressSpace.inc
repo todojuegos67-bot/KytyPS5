@@ -149,6 +149,10 @@ public:
 		// cannot be made or its drive has less than the store's size + 4 GiB free.
 		m_file = OpenBackingFile(m_size);
 		if (m_file != INVALID_HANDLE_VALUE) m_on_demand = false; // (SEC_RESERVE is for page-file sections only)
+		// KYTY_GUEST_LAZY_COMMIT=1 (guest-lazy-commit.h): reserved too, but each granule committed at its first touch
+		// (a fault) or protection change, not when a mapping covers it.
+		m_lazy = m_file == INVALID_HANDLE_VALUE && GuestLazyCommit::Requested();
+		if (m_lazy) m_on_demand = true;
 		m_handle = CreateFileMappingA(
 		    m_file, nullptr,
 		    PAGE_EXECUTE_READWRITE | (m_on_demand ? SEC_RESERVE : SEC_COMMIT),
@@ -165,6 +169,7 @@ public:
 		}
 		std::printf("Guest memory: %llu MiB backing store %s\n", static_cast<unsigned long long>(m_size >> 20u),
 		            m_file != INVALID_HANDLE_VALUE ? "in a sparse file on disk (KYTY_BACKING_FILE: no commit charge)"
+		            : m_lazy      ? "in the page file, reserved: committed at first touch (KYTY_GUEST_LAZY_COMMIT)"
 		            : m_on_demand ? "in the page file, committed on demand (KYTY_BACKING_ON_DEMAND)"
 		                          : "in the page file, all committed at launch");
 		std::fflush(stdout);
@@ -183,6 +188,7 @@ public:
 			CloseHandle(m_handle);
 			m_handle = nullptr;
 		}
+		if (m_lazy && m_backing_base != nullptr) GuestLazyCommit::Start(reinterpret_cast<uint64_t>(m_backing_base), m_size);
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #if defined(__APPLE__)
 		{
@@ -287,6 +293,7 @@ public:
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool   m_on_demand = false;
+	bool   m_lazy      = false;
 	HANDLE m_file      = INVALID_HANDLE_VALUE;
 
 	// The sparse backing file (KYTY_BACKING_FILE), or INVALID_HANDLE_VALUE (off, or not possible: the page file).
@@ -1656,7 +1663,8 @@ private:
 	static bool ApplyProtection(void* ptr, uint64_t size, VirtualMemory::Mode mode) {
 		LiveTrace::SlowOsCallScope slow(LiveTrace::OsProtect, reinterpret_cast<uint64_t>(ptr), size);
 		DWORD old_protect = 0;
-		return VirtualProtect(ptr, size, GetProtect(mode), &old_protect) != 0;
+		// (Lazy commit: a reserved page cannot be protected; its granule is committed first.)
+		return GuestLazyCommit::Protect(ptr, size, GetProtect(mode), &old_protect);
 	}
 
 	static bool SplitPlaceholder(uint64_t vaddr, uint64_t size) {
@@ -1693,7 +1701,7 @@ private:
 		    mode == VirtualMemory::Mode::NoAccess ? PAGE_READWRITE : GetProtect(mode);
 		void* ptr = nullptr;
 		// Committing through the writable alias commits the section's pages for every view of them.
-		if (m_on_demand &&
+		if (m_on_demand && !m_lazy &&
 		    VirtualAlloc(m_backing_base + backing_offset, size, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
 			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: commit of %" PRIu64 " bytes failed: 0x%08" PRIx32 "\n",
 			           size, static_cast<uint32_t>(GetLastError()));

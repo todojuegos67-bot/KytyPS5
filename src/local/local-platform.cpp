@@ -1,4 +1,5 @@
 #include "local-platform.h"
+#include "guest-lazy-commit.h"
 
 #include <algorithm>
 #include <chrono>
@@ -691,6 +692,7 @@ uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t s
 	at.Offset     = static_cast<DWORD>(offset);
 	at.OffsetHigh = static_cast<DWORD>(offset >> 32u);
 	DWORD got     = 0;
+	GuestLazyCommit::Prefault(buffer, size); // (KYTY_GUEST_LAZY_COMMIT: the kernel's write would fail on a reserved page)
 	if (ReadFile(reinterpret_cast<HANDLE>(file), buffer, size, &got, &at) == 0) return 0;
 	return got;
 }

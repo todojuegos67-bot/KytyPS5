@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 #include "fresh-memory.h"
+#include "guest-lazy-commit.h"
 #include "texture-offload.h"
 #include "async-upload.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -5027,7 +5028,12 @@ void TextureCache::RunGarbageCollector() {
 			            static_cast<unsigned long long>(m_graphics.GetHostMemoryUsage() >> 20u),
 			            static_cast<unsigned long long>(m_buffer_cache.CacheBytes() >> 20u),
 			            in_file ? "file (see the Guest memory line at launch)"
+			            : GuestLazyCommit::Enabled() ? "page file, committed at first touch (KYTY_GUEST_LAZY_COMMIT)"
 			            : (demand != nullptr && demand[0] == '1') ? "page file, on demand" : "page file, all committed");
+			// KYTY_GUEST_LAZY_COMMIT: the store's committed share, its commit calls and their time.
+			if (const auto* fresh = FreshMemory::Get())
+				GuestLazyCommit::Report(fresh->faults.load() + fresh->marked.load(), fresh->watched_bytes.load());
+			else GuestLazyCommit::Report(0, 0);
 		}
 		m_graphics.LogVideoMemory("30 s");
 		std::fflush(stdout);

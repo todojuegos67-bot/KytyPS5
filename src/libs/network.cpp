@@ -19,6 +19,7 @@
 #include <sys/select.h>
 #include <unistd.h>
 #endif
+#include "../local/guest-lazy-commit.h"
 
 #include "common/assert.h"
 #include "common/byteBuffer.h"
@@ -1973,6 +1974,7 @@ int64_t KYTY_SYSV_ABI Sendto(int s, const void* buf, uint64_t len, int flags, co
 	const auto host_len = static_cast<SocketIoLength>(
 	    std::min<uint64_t>(len, std::numeric_limits<SocketIoLength>::max()));
 	int64_t result = 0;
+	GuestLazyCommit::Prefault(buf, host_len); // (the system reads the guest buffer: KYTY_GUEST_LAZY_COMMIT)
 	if (addr == nullptr) {
 		result = ::send(socket, static_cast<const char*>(buf), host_len, host_flags);
 	} else {
@@ -2029,6 +2031,7 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	int64_t result = 0;
 	// (The system writes the guest buffer itself: a page a tracker write-protects would fail the call, not fault.)
 	LibKernel::Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), host_len);
+	GuestLazyCommit::Prefault(buf, host_len); // (likewise a reserved page: KYTY_GUEST_LAZY_COMMIT)
 	if (addr == nullptr) {
 		result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
 	} else {
