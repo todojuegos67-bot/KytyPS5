@@ -21,9 +21,17 @@
 //   224: x4 at 56 real, kept when it shows >= 97% of the target).
 // - The cap (real <= target / m) binds only when real * m would pass the target; when real sits on it for 2 windows
 //   and the lower multiplier's free rate also reaches the target, one step down (no step up for 10 s).
+// - 10-23 quality rule (KYTY_DYN_QUALITY=<fraction of the target>, default 0.7; 0 = off, the rules above only):
+//   fewer generated frames when the GPU has headroom (better image, less input lag). Down one level when
+//   real * (m - 1) >= q * target for 2 windows (x4 held at 56 on 224: 168 >= 157 -> x3, real let up to 74.7);
+//   on the cap target / m for 3 windows without that, a probe one level down (reverted when real * (m - 1) shows
+//   < q * target, then not again for 30 s doubling to 4 min). Up only when the shown rate is under (q - 0.05) *
+//   target for 3 windows in a row (hysteresis: x3 at 54-60 real stays x3 on 224; x2 kept from 78 real).
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace Kyty::Local {
 
@@ -41,6 +49,17 @@ struct DynMultiplier {
 	double prev_real = 0.0;                // the window before (hitch test)
 	int    down_from = 0, nodown = 0, nodown_len = 15, free_n = 0; // a step down off the cap under test; probes paused; windows free
 	int    low_n = 0, short_n = 0;         // windows in a row under the level's minimum / under 90% of the target
+	int    qdown_n = 0, qup_n = 0;         // quality rule: windows in a row a lower level fits / shown under (q - 0.05) T
+
+	static double Quality() {
+		static const double q = [] {
+			const char* v = std::getenv("KYTY_DYN_QUALITY");
+			const double r = v != nullptr && *v != '\0' ? std::atof(v) : 0.7;
+			std::printf("[dyn] quality rule: %s (KYTY_DYN_QUALITY=%.2f of the target)\n", r > 0.0 ? "on" : "off", r);
+			return std::clamp(r, 0.0, 1.0);
+		}();
+		return q;
+	}
 
 	static double MinReal(int m) { return m <= 2 ? 30.0 : m == 3 ? 40.0 : m == 4 ? 45.0 : 50.0; }
 
@@ -97,6 +116,8 @@ struct DynMultiplier {
 			pinned  = 0;
 			low_n   = 0;
 			short_n = 0;
+			qdown_n = 0;
+			qup_n   = 0;
 			return to;
 		};
 		// A step up under test: kept with >= 5% more shown (or >= 97% of the target) and real at the level's minimum.
@@ -125,12 +146,46 @@ struct DynMultiplier {
 		if (down_from != 0) {
 			const int from = down_from;
 			down_from      = 0;
-			if (std::min(real * m, T) < 0.97 * T && from <= maxm) {
+			const double keep = Quality() > 0.0 ? Quality() * T : 0.97 * T;
+			if (std::min(real * m, T) < keep && from <= maxm) {
+				std::printf("[dyn] step down to x%d reverted: shown %.1f < %.1f\n", m, std::min(real * m, T), keep);
 				nodown_len = std::min(nodown_len * 2, 240);
 				nodown     = nodown_len;
 				return go(from);
 			}
 			nodown_len = 15;
+		}
+		// 10-23 quality rule: the lowest multiplier that still shows q * target, with hysteresis (see the top).
+		if (const double q = Quality(); q > 0.0) {
+			const double shown = std::min(real * m, T);
+			qup_n              = shown < (q - 0.05) * T ? qup_n + 1 : 0;
+			if (m > 2 && nodown == 0) {
+				const bool fits = real * (m - 1) >= q * T;
+				qdown_n         = fits ? qdown_n + 1 : 0;
+				if (qdown_n >= 2) {
+					std::printf("[dyn] headroom: x%d -> x%d (real %.1f, x%d shows %.1f >= %.1f)\n", m, m - 1, real, m - 1,
+					            real * (m - 1), q * T);
+					noup = 5;
+					return go(m - 1);
+				}
+				if (!fits && pinned >= 3) { // held on target / m: the game may run faster with fewer generated frames
+					std::printf("[dyn] headroom probe: x%d -> x%d (real %.1f held at the cap %.1f)\n", m, m - 1, real, cap);
+					noup      = 5;
+					down_from = m;
+					return go(m - 1);
+				}
+			} else {
+				qdown_n = 0;
+			}
+			const int up = m + 1;
+			if (up <= maxm && block[up] == 0 && noup == 0 && qup_n >= 3 && real >= MinReal(up)) {
+				std::printf("[dyn] x%d shows %.1f < %.1f for 3 s: up to x%d\n", m, shown, (q - 0.05) * T, up);
+				check_from  = m;
+				check_real  = real;
+				check_shown = shown;
+				return go(up);
+			}
+			return m;
 		}
 		// On the cap (the game runs faster than target / m, unlocked above 60): the lowest m whose free rate reaches
 		// target / m. With a measured free rate (FSR3's limiter) down when it is >= 1.05 target / (m - 1) for 2 windows;
