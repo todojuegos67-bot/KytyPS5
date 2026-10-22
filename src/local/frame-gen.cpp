@@ -1543,6 +1543,23 @@ bool TaaReplaceWanted() {
 }
 
 
+// 10-23: KYTY_DLSSG_MARKERS=guest (default) | present. Before, every Reflex marker and slReflexSleep came at the
+// present: the simulation marked as taking no time, and Reflex's sleep delayed the present itself (the driver's
+// pacing then saw a frame of ~0 ms simulation and a variable wait before each present). Now at the guest flip on the
+// render thread: render submit end for the frame that ends there, then for the next one Reflex's sleep (it paces the
+// game's frames, not the presents), simulation start/end and render submit start; present start/end at the present
+// with the same frame index. present: all at the present (the old placement).
+bool ReflexGuestMarkers() {
+	static const bool guest = [] {
+		const char* v = std::getenv("KYTY_DLSSG_MARKERS");
+		return v == nullptr || std::strcmp(v, "present") != 0;
+	}();
+	return guest;
+}
+std::atomic<uint32_t> g_rx_counter {0};   // Reflex frame indices (guest and present paths)
+uint32_t              g_rx_open = 0;      // render thread: the frame begun at the last guest flip
+std::atomic<uint32_t> g_rx_present {0};   // the index BeforePresent presents next (SetPresentReflexIndex)
+
 // 10-22: real frames are paced by one limiter only: VideoOut's flip pacer (RealFrameInterval, the vblank grid, as
 // FSR3's) holds them to target / m; Reflex stays for latency without a frame limit (two limiters at 56 beat against
 // the game's 60: flip->present sd 1.90 ms vs FSR3's 0.55). KYTY_DLSSG_REFLEX_LIMIT=1: Reflex's limit too (old);
@@ -2087,22 +2104,6 @@ void NoteShader(uint64_t hash, char stage) {
 	std::fflush(stdout);
 }
 
-// 10-23: KYTY_DLSSG_MARKERS=guest (default) | present. Before, every Reflex marker and slReflexSleep came at the
-// present: the simulation marked as taking no time, and Reflex's sleep delayed the present itself (the driver's
-// pacing then saw a frame of ~0 ms simulation and a variable wait before each present). Now at the guest flip on the
-// render thread: render submit end for the frame that ends there, then for the next one Reflex's sleep (it paces the
-// game's frames, not the presents), simulation start/end and render submit start; present start/end at the present
-// with the same frame index. present: all at the present (the old placement).
-bool ReflexGuestMarkers() {
-	static const bool guest = [] {
-		const char* v = std::getenv("KYTY_DLSSG_MARKERS");
-		return v == nullptr || std::strcmp(v, "present") != 0;
-	}();
-	return guest;
-}
-std::atomic<uint32_t> g_rx_counter {0};   // Reflex frame indices (guest and present paths)
-uint32_t              g_rx_open = 0;      // render thread: the frame begun at the last guest flip
-std::atomic<uint32_t> g_rx_present {0};   // the index BeforePresent presents next (SetPresentReflexIndex)
 
 void ReflexGuestFlip(FrameInputs& fg) {
 	fg.reflex_index = 0;
