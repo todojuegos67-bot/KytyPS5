@@ -5087,8 +5087,9 @@ bool SsrMaterial(SsrTarget& target, int& channel, bool& gloss) {
 namespace {
 // KYTY_CONTACT_SHADOWS=0|1|2|3 ("Sombras RT": No / Normal / Alta / Ultra; cshadow.comp): screen-space contact shadows
 // toward the sun, recorded after SSGI and before the upscaler. 1: half-res trace, 16 steps, temporal + a-trous 1, 2;
-// 2: full res, 24 steps, a-trous 1, 2, 4; 3: full res, 56 steps, longest ray (x1.5), binary-search hit refine, temporal
-// alpha 0.05, a-trous 1, 2, 4, 8 (SSGI Ultra's denoise). KYTY_CONTACT_SHADOWS_STRENGTH (0.7: how dark a contact shadow
+// 2: full res, 24 steps, a-trous 1, 2, 4; 3: full res, 56 steps, a little longer ray (x1.15), binary-search hit refine,
+// temporal alpha 0.05, a-trous 1, 2, 4 (as 2: no wider blur), strength x0.9. The composite only darkens (color *
+// factor, factor in [1 - strength, 1], min'd with the input), skips sky and > 80 m, and is masked by the history count. KYTY_CONTACT_SHADOWS_STRENGTH (0.7: how dark a contact shadow
 // gets, 0..1), KYTY_CONTACT_SHADOWS_LENGTH (1.0: ray length scale, 0.25..4).
 //
 // The sun's direction (no fixed guess; off while unknown):
@@ -5122,7 +5123,11 @@ struct CShadowPass {
 	bool                    slot_voted[4] {};
 	float                   ema[4] {};
 	uint32_t                votes = 0;
-	int                     chosen = -1;
+	int                     chosen = -1, last_chosen = -1;
+	bool                    latched = false, switching = false, have_dir = false;
+	std::array<float, 3>    latch_axis {}, switch_axis {}, last_dir {};
+	float                   fade = 0.0f;
+	std::chrono::steady_clock::time_point latch_time {}, last_fresh {};
 	vk::QueryPool           pool      = nullptr;
 	double                  period_ns = 1.0;
 	uint64_t                written = 0, read = 0;
@@ -5578,28 +5583,73 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const auto& m = inputs.view_to_clip;
 	if (!(m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f)))
 		return said_once("no camera projection (view_to_clip)"), false;
-	{
-		// No light known: nothing recorded at all (no images made, no writes, no history).
-		std::lock_guard lock(g_sun.mutex);
-		if (!g_sun.valid) return g_cs.history_valid = false, said_once("no sun direction yet: the pass is skipped"), false;
-	}
-	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality)) return said_once("could not create its pipeline or images"), false;
-
-	// The light candidates in view space.
+	// The sun latch: the last good axis is kept (slowly smoothed) across frames that lack it; dropped only after a long
+	// absence (KYTY_CONTACT_SHADOWS_HOLD seconds, default 20) or a scene change (a jump > 10 degrees), and then faded
+	// out / in over 0.5 s instead of popping.
+	const auto now = std::chrono::steady_clock::now();
+	const float dt = g_cs.latch_time.time_since_epoch().count() == 0
+	                     ? 0.0f
+	                     : std::clamp(std::chrono::duration<float>(now - g_cs.latch_time).count(), 0.0f, 0.25f);
+	g_cs.latch_time = now;
+	const float hold = std::max(SsgiEnv("KYTY_CONTACT_SHADOWS_HOLD", 20.0f, 600.0f), 1.0f);
 	std::array<float, 3>  axis {};
 	std::array<float, 16> vp {};
-	bool                  have_axis = false, have_camera = false;
-	uint64_t              seen_flip = 0;
+	bool                  fresh = false, have_camera = false;
 	{
 		std::lock_guard lock(g_sun.mutex);
-		have_axis   = g_sun.valid && (g_sun.agree >= 2 || g_sun.stable >= 3);
+		fresh       = g_sun.valid && (g_sun.agree >= 2 || g_sun.stable >= 3) &&
+		              g_flips_taken.load(std::memory_order_relaxed) <= g_sun.flip + 120;
 		axis        = g_sun.axis;
 		vp          = g_sun.view_proj;
 		have_camera = g_sun.have_camera;
-		seen_flip   = g_sun.flip;
 	}
-	if (have_axis && g_flips_taken.load(std::memory_order_relaxed) > seen_flip + 120) have_axis = false; // (stale: 2 s unseen)
-	if (!have_axis) return g_cs.history_valid = false, said_once("no sun direction: no shadow-map consumer with orthographic cascades"), false;
+	{
+		// The camera now (the axis's camera is stale once latched).
+		std::lock_guard vp_lock(g_last_vp_mutex);
+		if (g_have_last_vp) vp = g_last_vp, have_camera = true;
+	}
+	if (fresh) {
+		if (!g_cs.latched) {
+			g_cs.latched = true, g_cs.latch_axis = axis, g_cs.switching = false;
+			std::printf("CSHADOW: sun latched, axis (%.4f %.4f %.4f)\n", axis[0], axis[1], axis[2]);
+			std::fflush(stdout);
+		} else {
+			const auto& l = g_cs.latch_axis;
+			const float c = axis[0] * l[0] + axis[1] * l[1] + axis[2] * l[2];
+			const float s = c < 0.0f ? -1.0f : 1.0f;
+			if (std::abs(c) >= 0.9848f) { // (within 10 degrees: the same sun, smoothed over ~1 s)
+				const float a = 1.0f - std::exp(-dt / 1.0f);
+				std::array<float, 3> n {l[0] + (s * axis[0] - l[0]) * a, l[1] + (s * axis[1] - l[1]) * a, l[2] + (s * axis[2] - l[2]) * a};
+				const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+				if (len > 1e-6f) g_cs.latch_axis = {n[0] / len, n[1] / len, n[2] / len};
+				g_cs.switching = false;
+			} else if (!g_cs.switching) {
+				g_cs.switching = true; // (a scene change: fade out, then take the new axis)
+				std::printf("CSHADOW: sun changed (axis (%.4f %.4f %.4f), was (%.4f %.4f %.4f)): fading out, then re-latching\n", axis[0],
+				            axis[1], axis[2], l[0], l[1], l[2]);
+				std::fflush(stdout);
+			}
+			g_cs.switch_axis = axis;
+		}
+		g_cs.last_fresh = now;
+	}
+	if (g_cs.latched && g_cs.switching && g_cs.fade <= 0.0f) {
+		g_cs.latch_axis = g_cs.switch_axis, g_cs.switching = false;
+		g_cs.votes = 0, g_cs.chosen = -1, g_cs.last_chosen = -1;
+		for (auto& e: g_cs.ema) e = 0.0f;
+		g_cs.history_valid = false;
+	}
+	const bool absent = g_cs.latched && now - g_cs.last_fresh > std::chrono::duration<float>(hold);
+	if (absent && g_cs.fade <= 0.0f) {
+		g_cs.latched = false;
+		std::printf("CSHADOW: sun unseen for %g s: dropped (faded out)\n", hold);
+		std::fflush(stdout);
+	}
+	if (!g_cs.latched) return g_cs.history_valid = false, g_cs.fade = 0.0f, said_once("no sun direction yet: the pass is skipped"), false;
+	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality)) return said_once("could not create its pipeline or images"), false;
+	axis = g_cs.latch_axis;
+
+	// The light candidates in view space.
 	float cand[4][4] {};
 	cand[2][0] = axis[0], cand[2][1] = axis[1], cand[2][2] = axis[2], cand[2][3] = 1.0f;
 	cand[3][0] = -axis[0], cand[3][1] = -axis[1], cand[3][2] = -axis[2], cand[3][3] = 1.0f;
@@ -5624,7 +5674,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 	}
 
-	const float strength = SsgiEnv("KYTY_CONTACT_SHADOWS_STRENGTH", 0.7f, 1.0f);
+	const float strength = SsgiEnv("KYTY_CONTACT_SHADOWS_STRENGTH", 0.7f, 1.0f) * (quality >= 3 ? 0.9f : 1.0f);
 	const float length   = std::max(SsgiEnv("KYTY_CONTACT_SHADOWS_LENGTH", 1.0f, 4.0f), 0.25f);
 	CShadowPush push {};
 	push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
@@ -5714,15 +5764,34 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		       vk::AccessFlagBits2::eHostRead);
 		g_cs.slot_voted[slot] = true;
 	}
-	if (g_cs.chosen < 0) {
+	// The fade: toward 1 while a sun is latched, agreed by the vote and not switching / absent; 0.5 s each way.
+	if (g_cs.chosen >= 0) g_cs.last_chosen = g_cs.chosen;
+	const int  use    = g_cs.chosen >= 0 ? g_cs.chosen : g_cs.last_chosen;
+	const bool target = g_cs.chosen >= 0 && !g_cs.switching && !absent;
+	g_cs.fade         = std::clamp(g_cs.fade + (target ? dt : -dt) / 0.5f, 0.0f, 1.0f);
+	if (use < 0 || g_cs.fade <= 0.0f) {
 		++g_cs.frame;
 		g_cs.history_valid = false;
-		return said_once("sun axis found, waiting for the lighting vote to agree on its space and sign"), false;
+		return said_once(use < 0 ? "sun axis found, waiting for the lighting vote to agree on its space and sign"
+		                         : "faded out (sun absent, changed or not agreed by the vote)"),
+		       false;
 	}
-	push.extra[1] = cand[g_cs.chosen][0], push.extra[2] = cand[g_cs.chosen][1], push.extra[3] = cand[g_cs.chosen][2];
-	if (cand[g_cs.chosen][3] < 0.5f) {
+	if (cand[use][3] >= 0.5f) g_cs.last_dir = {cand[use][0], cand[use][1], cand[use][2]}, g_cs.have_dir = true;
+	if (!g_cs.have_dir) {
 		++g_cs.frame;
-		return said_once("the chosen world-space light has no camera this frame"), false;
+		return said_once("the chosen world-space light has no camera yet"), false;
+	}
+	push.extra[1] = g_cs.last_dir[0], push.extra[2] = g_cs.last_dir[1], push.extra[3] = g_cs.last_dir[2];
+	push.trace[2] = strength * g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade); // (smoothstep fade)
+	{
+		static float said_fade = -1.0f;
+		const float  f         = g_cs.fade >= 1.0f ? 1.0f : g_cs.fade <= 0.0f ? 0.0f : 0.5f;
+		if (f != said_fade && f != 0.5f) {
+			said_fade = f;
+			std::printf("CSHADOW: fade %s (light %d, sun %s)\n", f >= 1.0f ? "in complete" : "out complete", use,
+			            fresh ? "seen this frame" : "latched");
+			std::fflush(stdout);
+		}
 	}
 	{
 		static bool said = false;
@@ -5752,12 +5821,8 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		run(2, g_cs.tmp_b, g_cs.raw, g_cs.tmp_a, g_cs.raw, 4.0f, g_cs.trace);
 		final_vis = &g_cs.tmp_a;
 	}
-	if (quality >= 3) {
-		aux_in = &g_cs.var_a, aux_out = &g_cs.var_b;
-		run(2, g_cs.tmp_a, g_cs.raw, g_cs.tmp_b, g_cs.raw, 8.0f, g_cs.trace);
-		final_vis = &g_cs.tmp_b;
-	}
-	aux_in = &g_cs.var_a, aux_out = &g_cs.var_b;
+	// (Level 3: no a-trous 8 any more: its wide grey halos read as haze; Ultra's extra is the longer, refined trace.)
+	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_b; // (the composite's stability mask: the history count in .z)
 	run(4, *final_vis, g_cs.raw, g_cs.out, g_cs.raw, 0.0f, g_cs.render);
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
