@@ -755,11 +755,21 @@ bool Requested() {
 //   grid (default): the flip pacer at target / m only. Adaptive is held to at most 1.15 target / m and reset in
 //   cutscenes, cinematics, movies and with DLSS-G off (it learned a 30 fps phase and held its own 36 ms after it).
 //   reflex: Streamline's Reflex limit at target / m and our pacer off.
+//   reflexfree (default with KYTY_FRAMEGEN_BASE=0, the game unlocked): as FSR3 unlocked (log 20261022-193327: smooth
+//     at 45-60 real, present interval sd 1.08, flip->present 33.6 ms; DLSS-G fixed x4 locked, 193116: sd 1.74,
+//     flip->present 48.7, 11.9 frames over 25 ms a window): no flip pacer and no flip floor on real frames, the only
+//     limit Reflex's frameLimitUs = 1e6 m / target (its sleep, at the guest frame start, holds the game), flips when
+//     ready; the game's own variable step above 60.
 int DlssgPaceMode() {
 	static const int mode = [] {
 		const char* v = std::getenv("KYTY_DLSSG_PACE");
 		if (v != nullptr && std::strcmp(v, "adaptive") == 0) return 0;
+		if (v != nullptr && std::strcmp(v, "grid") == 0) return 1;
 		if (v != nullptr && std::strcmp(v, "reflex") == 0) return 2;
+		if (v != nullptr && std::strcmp(v, "reflexfree") == 0) return 3;
+		// 10-23: the game unlocked (KYTY_FRAMEGEN_BASE=0): reflexfree, as FSR3 unlocked runs.
+		const char* base = std::getenv("KYTY_FRAMEGEN_BASE");
+		if (base != nullptr && std::strcmp(base, "0") == 0) return 3;
 		return 1; // grid (10-22: adaptive locked at 36 ms after a 30 fps phase, log 20261022-175339)
 	}();
 	return mode;
@@ -767,7 +777,7 @@ int DlssgPaceMode() {
 std::atomic<double> g_pace_adapt {0.0}; // adaptive: the steady interval from the present interval statistics
 
 double RealFrameInterval() {
-	if (!g_ready || DlssgPaceMode() == 2) return 0.0;
+	if (!g_ready || DlssgPaceMode() >= 2) return 0.0;
 	const double base = g_real_interval.load();
 	return base > 0.0 && DlssgPaceMode() == 0 ? std::clamp(g_pace_adapt.load(), base, 1.15 * base) : base;
 }
@@ -1543,7 +1553,7 @@ uint32_t DlssgReflexLimitUs(double interval) {
 		const char* v = std::getenv("KYTY_DLSSG_REFLEX_LIMIT");
 		return v != nullptr && *v == '1';
 	}();
-	return (force || DlssgPaceMode() == 2) && interval > 0.0 ? static_cast<uint32_t>(1000000.0 * interval) : 0u;
+	return (force || DlssgPaceMode() >= 2) && interval > 0.0 ? static_cast<uint32_t>(1000000.0 * interval) : 0u;
 }
 
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -1559,7 +1569,7 @@ void DynApplyReflexLimit(int gen) {
 		const char* v = std::getenv("KYTY_DLSSG_FLIP_FLOOR");
 		return v == nullptr || *v != '0';
 	}();
-	if (floor_on && gen >= 0 && !VideoOut::CinematicPlaying() && !VideoOut::CutsceneHeld()) {
+	if (floor_on && DlssgPaceMode() < 2 && gen >= 0 && !VideoOut::CinematicPlaying() && !VideoOut::CutsceneHeld()) {
 		DynApplyFlipFloor(gen);
 	} else if (g_dyn_flip_fps != 0) {
 		VideoOut::SetDynamicFlipFps(0);
@@ -1646,7 +1656,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 				g_pace_adapt      = prev <= 0.0 ? want : 0.7 * prev + 0.3 * want;
 				std::printf("[dlssg] present interval sd %.2f ms (mean %.2f, %.0f frames); pacer %.2f ms (%s)\n", sd * 1e3, mean * 1e3,
 				            g_pace_n, RealFrameInterval() * 1e3,
-				            DlssgPaceMode() == 0 ? "adaptive" : DlssgPaceMode() == 1 ? "grid" : "reflex");
+				            DlssgPaceMode() == 0 ? "adaptive" : DlssgPaceMode() == 1 ? "grid" : DlssgPaceMode() == 2 ? "reflex" : "reflexfree");
 			} else {
 				g_pace_adapt = 0.0;
 			}
