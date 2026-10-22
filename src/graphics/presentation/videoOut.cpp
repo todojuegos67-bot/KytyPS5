@@ -710,6 +710,37 @@ bool CinematicPlaying() noexcept {
 	const auto cinematic = g_cinematic_ns.load(std::memory_order_relaxed);
 	return cinematic != 0 && std::chrono::steady_clock::now().time_since_epoch().count() - cinematic < hold;
 }
+// KYTY_CUTSCENE_HOLD (default 1; 0: CinematicPlaying's 2 s only): an in-engine cinematic counts as playing from its
+// files' first read until the player's input (a button or a stick off centre, NotePlayerActivity) more than 1.5 s
+// after its last file read - a skip, or the play after it - or 15 minutes. Its files are read only while it loads
+// (log 20261022-022146: scn080000_voidwalk read for ~2 s, then played for minutes at 60 flips, twice too fast in the
+// Cinematic mode); the game's own playing state is not known.
+static std::atomic<int64_t> g_activity_ns {0};
+static std::atomic<bool>    g_cutscene_held {false};
+void NotePlayerActivity() noexcept {
+	g_activity_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+}
+bool CutsceneHeld() noexcept {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CUTSCENE_HOLD");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	const auto cinematic = g_cinematic_ns.load(std::memory_order_relaxed);
+	if (!on || cinematic == 0) return CinematicPlaying();
+	using namespace std::chrono;
+	const auto now      = steady_clock::now().time_since_epoch().count();
+	const auto activity = g_activity_ns.load(std::memory_order_relaxed);
+	const bool ended    = (activity > cinematic + duration_cast<steady_clock::duration>(milliseconds(1500)).count() &&
+                        activity <= now) ||
+	                   now - cinematic > duration_cast<steady_clock::duration>(minutes(15)).count();
+	const bool held = !ended;
+	if (g_cutscene_held.exchange(held, std::memory_order_relaxed) != held) {
+		std::printf("Cutscene: %s (KYTY_CUTSCENE_HOLD)\n", held ? "playing, flips at the game's own rate"
+		                                                         : "ended (the player's input), flips as before");
+		std::fflush(stdout);
+	}
+	return held;
+}
 bool MoviePlaying() noexcept {
 	const auto last = g_movie_frame_ns.load(std::memory_order_relaxed);
 	if (last == 0) return false;
@@ -1676,7 +1707,7 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 		// 30 fps): its sequencer advances a fixed 1/30 s a frame (fixedDt), so on a virtual vblank (360-960 Hz) the
 		// game's "every 2nd vblank" and SceneFreeFloor's 60 played it twice too fast (10-22). Kept at the console's
 		// time: (flip_rate + 1) / 60 s between flips. KYTY_CINEMATIC_FLIP_RATE=0 turns it off.
-		if (CinematicFlipRateEnabled() && r.cfg->flip_rate > 0 && CinematicPlaying()) {
+		if (CinematicFlipRateEnabled() && r.cfg->flip_rate > 0 && CutsceneHeld()) {
 			floor = std::max(floor, CinematicFlipRateFloor(r.cfg->flip_rate));
 		}
 	}
