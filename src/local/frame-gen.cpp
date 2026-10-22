@@ -21,6 +21,7 @@
 #include "gpu_tiler_shaders/taa_bypass_spv.h"
 #include "gpu_tiler_shaders/sharpen_spv.h"
 #include "gpu_tiler_shaders/ssgi_spv.h"
+#include "gpu_tiler_shaders/gtao_spv.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
 #include "kernel/memory.h"
 #include <string>
@@ -4175,6 +4176,296 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 } // namespace
 
 namespace {
+// KYTY_GTAO=0|1|2|3 ("advanced ambient occlusion": off / Normal / Alta / Ultra; gtao.comp): GTAO ported from Intel
+// XeGTAO (MIT, attribution in gtao.comp), recorded right before the upscaler after SSGI, with SSGI's inputs (depth,
+// motion vectors, color, the upscaler's view_to_clip). Normals from depth; horizon search with cosine-weighted
+// slices (1: half res, 2 slices x 8 steps; 2: full res, 3 x 12; 3: full res, 4 x 16); SSGI-style temporal
+// (motion-vector reprojection, depth/normal disocclusion reset) + edge-aware a-trous (1, 2 / 1, 2, 4 / 1, 2, 4, 8);
+// composite: a soft darkening multiplied into the color, faded with distance, sky skipped. KYTY_GTAO_STRENGTH (0.6),
+// KYTY_GTAO_RADIUS (metres, 1.0), KYTY_GTAO_BENT (0: the extra multiplier on dark, ambient-dominated pixels, 0..1).
+// Off (the default): nothing created, nothing recorded.
+struct GtaoPass {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	vk::Sampler             point      = nullptr;
+	vk::Sampler             linear     = nullptr;
+	bool                    failed     = false;
+	vk::Extent2D            render {}, trace {};
+	SsgiImage               raw, tmp_a, tmp_b, out;
+	SsgiImage               history[2], gbuf[2], count[2];
+	uint32_t                frame         = 0;
+	int                     level         = 0;
+	bool                    history_valid = false;
+	vk::QueryPool           pool      = nullptr;
+	double                  period_ns = 1.0;
+	uint64_t                written = 0, read = 0;
+	double                  sum_ms  = 0.0;
+	uint32_t                samples = 0;
+	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+} g_gtao;
+
+int GtaoLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_GTAO");
+		const int   l     = value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
+		if (l > 0) {
+			std::printf("GTAO: level %d\n", l);
+			std::fflush(stdout);
+		}
+		return l;
+	}();
+	return level;
+}
+
+std::array<SsgiImage*, 10> GtaoAll() {
+	return {&g_gtao.raw,     &g_gtao.tmp_a,   &g_gtao.tmp_b,    &g_gtao.out,      &g_gtao.history[0],
+	        &g_gtao.history[1], &g_gtao.gbuf[0], &g_gtao.gbuf[1], &g_gtao.count[0], &g_gtao.count[1]};
+}
+
+bool GtaoEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
+	const auto device = graphics.device;
+	if (g_gtao.pipeline == nullptr) {
+		if (g_gtao.failed) return false;
+		g_gtao.failed = true;
+		std::array<vk::DescriptorSetLayoutBinding, 11> bindings {};
+		for (uint32_t i = 0; i < 11; ++i) {
+			bindings[i].binding         = i;
+			bindings[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorCount = 1;
+			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+		}
+		vk::DescriptorSetLayoutCreateInfo set_info {};
+		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+		set_info.pBindings    = bindings.data();
+		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_gtao.set_layout) != vk::Result::eSuccess) return false;
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(SsgiPush)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = 1;
+		layout_info.pSetLayouts            = &g_gtao.set_layout;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push;
+		if (device.createPipelineLayout(&layout_info, nullptr, &g_gtao.layout) != vk::Result::eSuccess) return false;
+		vk::ShaderModuleCreateInfo module_info {};
+		module_info.codeSize    = sizeof(GTAO_SPV);
+		module_info.pCode       = GTAO_SPV;
+		vk::ShaderModule module = nullptr;
+		if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		pipeline_info.stage.module = module;
+		pipeline_info.stage.pName  = "main";
+		pipeline_info.layout       = g_gtao.layout;
+		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_gtao.pipeline);
+		device.destroyShaderModule(module, nullptr);
+		if (created != vk::Result::eSuccess) {
+			g_gtao.pipeline = nullptr;
+			return false;
+		}
+		for (int i = 0; i < 2; ++i) {
+			vk::SamplerCreateInfo sampler {};
+			sampler.magFilter    = i == 0 ? vk::Filter::eNearest : vk::Filter::eLinear;
+			sampler.minFilter    = sampler.magFilter;
+			sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+			sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+			sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+			if (device.createSampler(&sampler, nullptr, i == 0 ? &g_gtao.point : &g_gtao.linear) != vk::Result::eSuccess) return false;
+		}
+		vk::QueryPoolCreateInfo query {};
+		query.queryType  = vk::QueryType::eTimestamp;
+		query.queryCount = 16;
+		if (device.createQueryPool(&query, nullptr, &g_gtao.pool) != vk::Result::eSuccess) g_gtao.pool = nullptr;
+		g_gtao.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		g_gtao.failed    = false;
+	}
+	if (g_gtao.out.image.image != nullptr && g_gtao.render == render && g_gtao.level == level) return true;
+	const vk::Extent2D trace = level >= 2 ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
+	for (auto* img : GtaoAll())
+		SsgiFreeImage(graphics, *img);
+	bool ok = SsgiMakeImage(graphics, g_gtao.out, render);
+	for (auto* img : {&g_gtao.raw, &g_gtao.tmp_a, &g_gtao.tmp_b, &g_gtao.history[0], &g_gtao.history[1], &g_gtao.gbuf[0], &g_gtao.gbuf[1],
+	                  &g_gtao.count[0], &g_gtao.count[1]})
+		ok = ok && SsgiMakeImage(graphics, *img, trace);
+	if (!ok) {
+		for (auto* img : GtaoAll())
+			SsgiFreeImage(graphics, *img);
+		g_gtao.failed = true;
+		return false;
+	}
+	g_gtao.render        = render;
+	g_gtao.level         = level;
+	g_gtao.trace         = trace;
+	g_gtao.history_valid = false;
+	return true;
+}
+
+void GtaoReadTiming() {
+	if (g_gtao.pool == nullptr || g_graphics_ctx == nullptr) return;
+	while (g_gtao.read + 4 <= g_gtao.written) {
+		const auto entry = static_cast<uint32_t>(g_gtao.read % 8);
+		std::array<uint64_t, 2> stamps {};
+		if (g_graphics_ctx->device.getQueryPoolResults(g_gtao.pool, entry * 2, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		                                               vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
+			break;
+		g_gtao.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_gtao.period_ns / 1e6;
+		++g_gtao.samples;
+		++g_gtao.read;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_gtao.last_log >= std::chrono::seconds(5) && g_gtao.samples > 0) {
+		std::printf("GTAO: GPU %.3f ms (mean of %u frames)\n", g_gtao.sum_ms / g_gtao.samples, g_gtao.samples);
+		std::fflush(stdout);
+		g_gtao.sum_ms   = 0.0;
+		g_gtao.samples  = 0;
+		g_gtao.last_log = now;
+	}
+}
+
+bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
+	const int level = GtaoLevel();
+	if (level == 0) return false; // off: nothing created or recorded
+	if (g_graphics_ctx == nullptr) return false;
+	if (VideoOut::MoviePlaying()) {
+		g_gtao.history_valid = false;
+		return false;
+	}
+	const auto& color = inputs.color;
+	if (color.view == nullptr || inputs.depth.view == nullptr || inputs.motion.view == nullptr || color.extent.width < 16 ||
+	    color.extent.height < 16)
+		return false;
+	if (!GtaoEnsure(*g_graphics_ctx, color.extent, level)) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("GTAO: off (could not create its pipeline or images)\n");
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	const float strength = SsgiEnv("KYTY_GTAO_STRENGTH", 0.6f, 1.0f);
+	const float radius   = std::max(SsgiEnv("KYTY_GTAO_RADIUS", 1.0f, 8.0f), 0.05f);
+	const float bent     = SsgiEnv("KYTY_GTAO_BENT", 0.0f, 1.0f);
+	const auto& m        = inputs.view_to_clip;
+	SsgiPush    push {};
+	const bool  have_proj = m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f);
+	if (have_proj) {
+		push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
+		push.depth_map[0] = m[10], push.depth_map[1] = m[14], push.depth_map[2] = m[11], push.depth_map[3] = m[15];
+	} else {
+		const float f  = 1.0f / std::tan(0.5f * 1.0472f);
+		const float ar = static_cast<float>(color.extent.width) / static_cast<float>(color.extent.height);
+		push.proj[0] = f / ar, push.proj[1] = f, push.proj[2] = 0.0f, push.proj[3] = 0.0f;
+		push.depth_map[0] = 0.0f, push.depth_map[1] = inputs.near_plane, push.depth_map[2] = 1.0f, push.depth_map[3] = 0.0f;
+	}
+	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
+	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
+	push.trace[0] = static_cast<float>(g_gtao.trace.width), push.trace[1] = static_cast<float>(g_gtao.trace.height);
+	push.trace[2] = strength, push.trace[3] = radius;
+	push.extra[1] = bent;
+	{
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("GTAO: on (level %d, %ux%u, strength %g, radius %g m, bent %g)%s\n", level, g_gtao.trace.width,
+			            g_gtao.trace.height, strength, radius, bent, have_proj ? "" : " (no projection: 60 deg FOV assumed)");
+			std::fflush(stdout);
+		}
+	}
+	GtaoReadTiming();
+	const auto entry = static_cast<uint32_t>(g_gtao.written % 8);
+	const bool timed = g_gtao.pool != nullptr;
+	if (timed) {
+		command.resetQueryPool(g_gtao.pool, entry * 2, 2);
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_gtao.pool, entry * 2);
+	}
+	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
+	                        vk::AccessFlags2 dst) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = src_stage;
+		barrier.srcAccessMask = src;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	for (auto* img : GtaoAll())
+		if (img->image.state.layout != vk::ImageLayout::eGeneral)
+			Transition(command, img->image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+			           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+	       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	const uint32_t cur  = g_gtao.frame & 1u;
+	const uint32_t prev = cur ^ 1u;
+	push.misc[1] = static_cast<int32_t>(g_gtao.frame);
+	push.misc[2] = level;
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g_gtao.history_valid ? 2 : 0);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_gtao.pipeline);
+	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout,
+	                     const SsgiImage& aux_in, const SsgiImage& aux_out, float step, vk::Extent2D size) {
+		const vk::Sampler       lin = g_gtao.linear, pt = g_gtao.point;
+		vk::DescriptorImageInfo infos[11] {};
+		infos[0]  = {lin, color.view, color.layout};
+		infos[1]  = {pt, inputs.depth.view, inputs.depth.layout};
+		infos[2]  = {pt, inputs.motion.view, inputs.motion.layout};
+		infos[3]  = {lin, a.view, vk::ImageLayout::eGeneral};
+		infos[4]  = {lin, b.view, vk::ImageLayout::eGeneral};
+		infos[5]  = {pt, g_gtao.gbuf[cur].view, vk::ImageLayout::eGeneral};
+		infos[6]  = {pt, g_gtao.gbuf[prev].view, vk::ImageLayout::eGeneral};
+		infos[7]  = {nullptr, out.view, vk::ImageLayout::eGeneral};
+		infos[8]  = {nullptr, gout.view, vk::ImageLayout::eGeneral};
+		infos[9]  = {pt, aux_in.view, vk::ImageLayout::eGeneral};
+		infos[10] = {nullptr, aux_out.view, vk::ImageLayout::eGeneral};
+		vk::WriteDescriptorSet writes[11] {};
+		for (uint32_t i = 0; i < 11; ++i) {
+			writes[i].dstBinding      = i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			writes[i].pImageInfo      = &infos[i];
+		}
+		push.misc[0]  = mode;
+		push.extra[0] = step;
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_gtao.layout, 0, 11, writes);
+		command.pushConstants(g_gtao.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	};
+	// (Bindings a mode does not write still need a valid storage image: tmp_b is the scratch target.)
+	auto& g = g_gtao;
+	run(0, g.tmp_a, g.tmp_b, g.raw, g.gbuf[cur], g.count[prev], g.tmp_b, 0.0f, g.trace);                     // GTAO
+	run(1, g.raw, g.history[prev], g.history[cur], g.tmp_b, g.count[prev], g.count[cur], 0.0f, g.trace);      // temporal
+	const SsgiImage* src = &g.history[cur];
+	const SsgiImage* ping[2] = {&g.tmp_a, &g.raw};
+	const int        passes  = level >= 3 ? 4 : level >= 2 ? 3 : 2;
+	for (int i = 0; i < passes; ++i) {
+		const SsgiImage* dst = ping[i & 1];
+		run(2, *src, g.tmp_b, *dst, g.tmp_b, g.count[cur], g.tmp_b, static_cast<float>(1 << i), g.trace);
+		src = dst;
+	}
+	run(4, *src, g.tmp_b, g.out, g.tmp_b, g.count[cur], g.tmp_b, 0.0f, g.render);                            // composite
+	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
+	       vk::AccessFlagBits2::eMemoryRead);
+	if (timed) {
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_gtao.pool, entry * 2 + 1);
+		++g_gtao.written;
+	}
+	++g_gtao.frame;
+	g_gtao.history_valid = true;
+	inputs.color.image  = g_gtao.out.image.image;
+	inputs.color.view   = g_gtao.out.view;
+	inputs.color.layout = vk::ImageLayout::eGeneral;
+	inputs.color.format = vk::Format::eR16G16B16A16Sfloat;
+	inputs.color.usage  = g_gtao.out.image.usage;
+	inputs.color.level  = 0;
+	inputs.color.layer  = 0;
+	return true;
+}
+} // namespace
+
+namespace {
 // KYTY_CONTACT_SHADOWS=0|1|2|3 ("Sombras RT": No / Normal / Alta / Ultra; cshadow.comp): screen-space contact shadows
 // toward the sun, recorded after SSGI and before the upscaler. 1: half-res trace, 16 steps, temporal + a-trous 1, 2;
 // 2: full res, 24 steps, a-trous 1, 2, 4; 3: full res, 56 steps, longest ray (x1.5), binary-search hit refine, temporal
@@ -4875,6 +5166,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	// (The DLSS-G hudless path sets the context in PrepareInputs; the PS5 Pro path alone needs the renderer's.)
 	if (g_graphics_ctx == nullptr && inputs.graphics != nullptr) g_graphics_ctx = inputs.graphics;
 	SsgiApply(command, inputs); // (KYTY_SSGI: inputs.color becomes the composited copy)
+	GtaoApply(command, inputs); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
 	CShadowApply(command, inputs); // (KYTY_CONTACT_SHADOWS: likewise, after SSGI)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);

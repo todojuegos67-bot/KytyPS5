@@ -407,6 +407,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${ssgi_header}")
 
+# KYTY_GTAO: GTAO ambient occlusion before the PS5 Pro path's upscaler (src/local/frame-gen.cpp).
+set(gtao_source "${KYTY_SOURCE_DIR}/local/gtao.comp")
+set(gtao_spv "${gpu_tiler_generated_dir}/gtao.spv")
+set(gtao_header "${gpu_tiler_generated_dir}/gtao_spv.h")
+add_custom_command(
+	OUTPUT "${gtao_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gtao_spv}" "${gtao_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gtao_spv} -DOUTPUT=${gtao_header}
+	        -DSYMBOL=GTAO_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gtao_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gtao_header}")
+
 # KYTY_CONTACT_SHADOWS: screen-space contact shadows before the upscaler (src/local/frame-gen.cpp).
 set(cshadow_source "${KYTY_SOURCE_DIR}/local/cshadow.comp")
 set(cshadow_spv "${gpu_tiler_generated_dir}/cshadow.spv")

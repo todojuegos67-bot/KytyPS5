@@ -1,0 +1,320 @@
+#version 450
+// KYTY_GTAO (frame-gen.cpp, GtaoApply): "advanced ambient occlusion", ground-truth AO (GTAO, Jimenez et al. 2016)
+// on the PS5 Pro path's render-resolution color, recorded right before the upscaler, in the SSGI pass's place and with
+// its inputs (the game's depth, motion vectors and color; the upscaler's view_to_clip).
+//
+// The horizon search and the cosine-weighted slice integral are ported from Intel XeGTAO
+// (https://github.com/GameTechDev/XeGTAO, XeGTAO.hlsli):
+//   Copyright (C) 2016-2021, Intel Corporation. SPDX-License-Identifier: MIT
+//   Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+//   documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+//   the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+//   permit persons to whom the Software is furnished to do so, subject to the following conditions: The above copyright
+//   notice and this permission notice shall be included in all copies or substantial portions of the Software.
+//   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+//   THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+//   TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//   SOFTWARE.
+// Differences from XeGTAO: no depth MIP chain (point samples of the full-res depth), normals from depth derivatives,
+// the view vector / slice basis from the game's own projection (any handedness, reverse-Z), our own denoise (SSGI's
+// temporal + edge-aware a-trous) instead of XeGTAO's.
+//
+// Modes (push.misc.x):
+//   0 gtao:      slices x steps horizon search -> raw (visibility in .r, .g; .a 1) + gbuf_out (view normal, view depth)
+//                at the trace resolution (half for level 1, full for 2 and 3)
+//   1 temporal:  reprojected history (motion vectors), alpha max(1/count, 0.1 or 0.05 at 3), clamped to the 3x3
+//                neighbourhood, reset on depth/normal disocclusion -> out + count in aux_out
+//   2 a-trous:   5x5 edge-aware (depth, normal) blur, steps 1, 2 (, 4 at 2, 8 at 3)
+//   4 composite: depth-aware upsample; soft darkening with distance fade, sky skipped -> out (render res)
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2) uniform sampler2D motion_tex;
+layout(binding = 3) uniform sampler2D src_a;
+layout(binding = 4) uniform sampler2D src_b;
+layout(binding = 5) uniform sampler2D gbuf_cur;
+layout(binding = 6) uniform sampler2D gbuf_prev;
+layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
+layout(binding = 8, rgba16f) uniform writeonly image2D gbuf_out;
+layout(binding = 9) uniform sampler2D aux_tex;
+layout(binding = 10, rgba16f) uniform writeonly image2D aux_out;
+
+layout(push_constant) uniform Push {
+	vec4  proj;      // M[0], M[5], M[8], M[9]
+	vec4  depth_map; // A = M[10], B = M[14], C = M[11], D = M[15]
+	vec4  motion;    // motion_scale.xy, render size.xy
+	vec4  trace;     // trace size.xy, strength, radius (view units, metres)
+	ivec4 misc;      // mode, frame index, level, flags (bit0 reset, bit1 history valid)
+	vec4  extra;     // a-trous step, bent strength, unused, unused
+} push;
+
+const float PI      = 3.14159265;
+const float HALF_PI = 1.5707963;
+
+vec2 RenderSize() { return push.motion.zw; }
+vec2 TraceSize() { return push.trace.xy; }
+
+float ViewZ(float d) {
+	float den = d * push.depth_map.z - push.depth_map.x;
+	return abs(den) > 1e-12 ? (push.depth_map.y - d * push.depth_map.w) / den : 1e6;
+}
+vec3 ViewPos(vec2 uv, float d) {
+	float z  = ViewZ(d);
+	float w  = z * push.depth_map.z + push.depth_map.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	return vec3((nd.x * w - z * push.proj.z) / push.proj.x, (nd.y * w - z * push.proj.w) / push.proj.y, z);
+}
+vec3 ViewPosZ(vec2 uv, float z) {
+	float w  = z * push.depth_map.z + push.depth_map.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	return vec3((nd.x * w - z * push.proj.z) / push.proj.x, (nd.y * w - z * push.proj.w) / push.proj.y, z);
+}
+bool IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e3; }
+float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+float FastAcos(float x) { // XeGTAO_FastACos
+	float r = -0.156583 * abs(x) + HALF_PI;
+	r *= sqrt(max(1.0 - abs(x), 0.0));
+	return x >= 0.0 ? r : PI - r;
+}
+
+vec3 NormalAt(vec2 uv, vec3 p) {
+	vec2 t  = 1.0 / RenderSize();
+	vec3 px = ViewPos(uv + vec2(t.x, 0), textureLod(depth_tex, uv + vec2(t.x, 0), 0).r);
+	vec3 nx = ViewPos(uv - vec2(t.x, 0), textureLod(depth_tex, uv - vec2(t.x, 0), 0).r);
+	vec3 py = ViewPos(uv + vec2(0, t.y), textureLod(depth_tex, uv + vec2(0, t.y), 0).r);
+	vec3 ny = ViewPos(uv - vec2(0, t.y), textureLod(depth_tex, uv - vec2(0, t.y), 0).r);
+	vec3 dx = abs(px.z - p.z) < abs(p.z - nx.z) ? px - p : p - nx;
+	vec3 dy = abs(py.z - p.z) < abs(p.z - ny.z) ? py - p : p - ny;
+	vec3 n  = normalize(cross(dx, dy));
+	if (dot(n, -p) < 0.0) n = -n;
+	return n;
+}
+
+void Gtao(ivec2 pixel) {
+	vec2  uv = (vec2(pixel) + 0.5) / TraceSize();
+	float d  = textureLod(depth_tex, uv, 0).r;
+	if (IsSky(d)) {
+		imageStore(out_img, pixel, vec4(1));
+		imageStore(gbuf_out, pixel, vec4(0, 0, 1, 1e6));
+		return;
+	}
+	vec3  P = ViewPos(uv, d);
+	vec3  N = NormalAt(uv, P);
+	float z = abs(P.z);
+	imageStore(gbuf_out, pixel, vec4(N, z));
+	vec3 V = normalize(-P);
+
+	int   q      = push.misc.z;
+	int   slices = q >= 3 ? 4 : q >= 2 ? 3 : 2;
+	int   steps  = q >= 3 ? 16 : q >= 2 ? 12 : 8;
+	float radius = push.trace.w;
+	// XeGTAO falloff: the last 61.5% of the radius fades the horizon contribution to the low horizon.
+	float falloff_range = 0.615 * radius;
+	float falloff_from  = radius * (1.0 - 0.615);
+	float falloff_mul   = -1.0 / falloff_range;
+	float falloff_add   = falloff_from / falloff_range + 1.0;
+
+	// The radius on screen (uv units, along y): r * proj_y / (2 w).
+	float w_clip    = abs(P.z * push.depth_map.z + push.depth_map.w);
+	float screen_r  = radius * abs(push.proj.y) * 0.5 / max(w_clip, 1e-4);
+	vec2  aspect    = vec2(TraceSize().y / TraceSize().x, 1.0);
+	float min_s     = 1.3 / TraceSize().y; // XeGTAO's pixel-too-close skip
+	if (screen_r * TraceSize().y < 1.0) {
+		imageStore(out_img, pixel, vec4(1));
+		return;
+	}
+	float f      = float(push.misc.y % 64);
+	float noise_slice = Ign(vec2(pixel) + f * 5.588238);
+	float noise_step  = Ign(vec2(pixel) + vec2(47.0, 17.0) + f * 7.123);
+
+	float vis = 0.0;
+	for (int s = 0; s < slices; ++s) {
+		float phi   = (float(s) + noise_slice) / float(slices) * PI;
+		vec2  omega = vec2(cos(phi), sin(phi));
+		vec2  dir   = omega * aspect; // uv-space direction, isotropic in pixels
+		// The slice basis in view space from the projection itself (no assumption on axis signs).
+		vec3 dvec  = ViewPosZ(uv + dir * 1e-3, P.z) - P;
+		vec3 ortho = dvec - dot(dvec, V) * V;
+		float ol   = length(ortho);
+		if (ol < 1e-8) continue;
+		ortho /= ol;
+		vec3  axis   = normalize(cross(ortho, V));
+		vec3  pn     = N - axis * dot(N, axis);
+		float pn_len = length(pn);
+		if (pn_len < 1e-5) continue;
+		float sign_n   = sign(dot(ortho, pn));
+		float cos_n    = clamp(dot(pn, V) / pn_len, 0.0, 1.0);
+		float n        = sign_n * FastAcos(cos_n);
+		float low0     = cos(n + HALF_PI);
+		float low1     = cos(n - HALF_PI);
+		float hc0 = low0, hc1 = low1;
+		for (int k = 0; k < steps; ++k) {
+			float t  = (float(k) + fract(noise_step + float(k + s * steps) * 0.618034)) / float(steps);
+			t        = t * t; // denser near the centre
+			float so = max(t * screen_r, min_s);
+			vec2  o  = dir * so;
+			vec2  uv0 = uv + o, uv1 = uv - o;
+			if (all(greaterThanEqual(uv0, vec2(0))) && all(lessThanEqual(uv0, vec2(1)))) {
+				float sd = textureLod(depth_tex, uv0, 0).r;
+				if (!IsSky(sd)) {
+					vec3  dl  = ViewPos(uv0, sd) - P;
+					float len = length(dl);
+					float shc = dot(dl / max(len, 1e-6), V);
+					float wgt = clamp(len * falloff_mul + falloff_add, 0.0, 1.0);
+					hc0 = max(hc0, mix(low0, shc, wgt));
+				}
+			}
+			if (all(greaterThanEqual(uv1, vec2(0))) && all(lessThanEqual(uv1, vec2(1)))) {
+				float sd = textureLod(depth_tex, uv1, 0).r;
+				if (!IsSky(sd)) {
+					vec3  dl  = ViewPos(uv1, sd) - P;
+					float len = length(dl);
+					float shc = dot(dl / max(len, 1e-6), V);
+					float wgt = clamp(len * falloff_mul + falloff_add, 0.0, 1.0);
+					hc1 = max(hc1, mix(low1, shc, wgt));
+				}
+			}
+		}
+		// XeGTAO: the horizon angles clamped to the normal's hemisphere, then the cosine-weighted arc integral.
+		float h0 = -FastAcos(hc1);
+		float h1 = FastAcos(hc0);
+		h0 = n + clamp(h0 - n, -HALF_PI, HALF_PI);
+		h1 = n + clamp(h1 - n, -HALF_PI, HALF_PI);
+		float sin_n = sin(n);
+		float iarc0 = (cos_n + 2.0 * h0 * sin_n - cos(2.0 * h0 - n)) * 0.25;
+		float iarc1 = (cos_n + 2.0 * h1 * sin_n - cos(2.0 * h1 - n)) * 0.25;
+		vis += pn_len * (iarc0 + iarc1);
+	}
+	vis = clamp(vis / float(slices), 0.0, 1.0);
+	vis = pow(vis, 1.5); // XeGTAO's final value power (2.2 default), gentler
+	imageStore(out_img, pixel, vec4(vis, vis, vis, 1.0));
+}
+
+// SSGI's temporal scheme, scalar.
+void Temporal(ivec2 pixel) {
+	vec2 ts  = 1.0 / TraceSize();
+	vec2 uv  = (vec2(pixel) + 0.5) * ts;
+	vec4 cur = textureLod(src_a, uv, 0);
+	vec4 g   = textureLod(gbuf_cur, uv, 0);
+	if (g.w > 1e5) {
+		imageStore(out_img, pixel, vec4(1));
+		imageStore(aux_out, pixel, vec4(0));
+		return;
+	}
+	float m1 = 0.0, m2 = 0.0, wn = 0.0;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			vec2  suv = uv + vec2(x, y) * ts;
+			vec4  sg  = textureLod(gbuf_cur, suv, 0);
+			float w   = (abs(sg.w - g.w) < 0.05 * g.w && dot(sg.xyz, g.xyz) > 0.8) ? 1.0 : 0.0;
+			float sv  = textureLod(src_a, suv, 0).r;
+			m1 += sv * w;
+			m2 += sv * sv * w;
+			wn += w;
+		}
+	wn = max(wn, 1.0);
+	m1 /= wn, m2 /= wn;
+	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
+	float a_min = push.misc.z >= 3 ? 0.05 : 0.1;
+	float count = 1.0;
+	float res   = cur.r;
+	vec2  puv   = uv + textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();
+	if ((push.misc.w & 1) == 0 && (push.misc.w & 2) != 0 && all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
+		vec4  pg = textureLod(gbuf_prev, puv, 0);
+		float dz = abs(pg.w - g.w) / max(g.w, 1e-3);
+		if (dz < 0.05 && dot(pg.xyz, g.xyz) > 0.9) {
+			count       = min(max(textureLod(aux_tex, puv, 0).z, 1.0) + 1.0, 64.0);
+			float alpha = max(1.0 / count, a_min);
+			float k     = mix(1.25, 3.0, clamp(count / 32.0, 0.0, 1.0));
+			float hist  = clamp(textureLod(src_b, puv, 0).r, m1 - k * sigma - 0.02, m1 + k * sigma + 0.02);
+			res         = mix(hist, cur.r, alpha);
+		}
+	}
+	imageStore(out_img, pixel, vec4(res, res, res, 1.0));
+	imageStore(aux_out, pixel, vec4(0, 0, count, 0));
+}
+
+void Atrous(ivec2 pixel) {
+	vec2  ts = 1.0 / TraceSize();
+	vec2  uv = (vec2(pixel) + 0.5) * ts;
+	vec4  g  = textureLod(gbuf_cur, uv, 0);
+	vec4  c  = textureLod(src_a, uv, 0);
+	if (g.w > 1e5) {
+		imageStore(out_img, pixel, c);
+		return;
+	}
+	const float kern[3] = float[](0.375, 0.25, 0.0625);
+	float sum = 0.0, wsum = 0.0;
+	float step = push.extra.x;
+	for (int y = -2; y <= 2; ++y)
+		for (int x = -2; x <= 2; ++x) {
+			vec2  suv = uv + vec2(x, y) * step * ts;
+			vec4  sg  = textureLod(gbuf_cur, suv, 0);
+			float sc  = textureLod(src_a, suv, 0).r;
+			float wn  = pow(max(dot(sg.xyz, g.xyz), 0.0), 32.0);
+			float wz  = exp(-abs(sg.w - g.w) / max(g.w * 0.02 * step, 1e-3));
+			float wl  = exp(-abs(sc - c.r) * 4.0);
+			float w   = kern[abs(x)] * kern[abs(y)] * wn * wz * wl;
+			sum += sc * w;
+			wsum += w;
+		}
+	float r = wsum > 1e-5 ? sum / wsum : c.r;
+	imageStore(out_img, pixel, vec4(r, r, r, 1.0));
+}
+
+float Upsample(vec2 uv, float z) {
+	vec2  tc = uv * TraceSize() - 0.5;
+	vec2  f  = fract(tc);
+	ivec2 b  = ivec2(floor(tc));
+	ivec2 mx = ivec2(TraceSize()) - 1;
+	float sum = 0.0, wsum = 0.0;
+	for (int i = 0; i < 4; ++i) {
+		ivec2 o  = ivec2(i & 1, i >> 1);
+		ivec2 q  = clamp(b + o, ivec2(0), mx);
+		float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+		float tz = texelFetch(gbuf_cur, q, 0).w;
+		float w  = (bw + 1e-3) / (1e-3 + abs(tz - z) / max(z * 0.02, 1e-3));
+		sum += texelFetch(src_a, q, 0).r * w;
+		wsum += w;
+	}
+	return sum / max(wsum, 1e-6);
+}
+
+void Composite(ivec2 pixel) {
+	vec2  uv  = (vec2(pixel) + 0.5) / RenderSize();
+	vec4  col = texelFetch(color_tex, pixel, 0);
+	float d   = texelFetch(depth_tex, pixel, 0).r;
+	if (IsSky(d)) {
+		imageStore(out_img, pixel, col);
+		return;
+	}
+	float z    = abs(ViewZ(d));
+	float fade = 1.0 - smoothstep(30.0, 90.0, z);
+	if (fade <= 0.0) {
+		imageStore(out_img, pixel, col);
+		return;
+	}
+	float ao = clamp(Upsample(uv, z), 0.0, 1.0);
+	ao       = smoothstep(0.0, 1.0, ao);
+	// Soft darkening: at most half of the occlusion at strength 1 (the game has its own SSAO), floored.
+	float k   = max(mix(1.0, ao, 0.5 * push.trace.z * fade), 0.55);
+	// Optional bent multiplier: the remaining occlusion only where the pixel is dark (ambient-dominated).
+	float l   = Luma(col.rgb);
+	float amb = 1.0 - smoothstep(0.03, 0.35, l);
+	k *= mix(1.0, ao, push.extra.y * amb * fade * 0.5);
+	imageStore(out_img, pixel, vec4(max(col.rgb * k, vec3(0)), col.a));
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	int   mode  = push.misc.x;
+	ivec2 size  = ivec2(mode == 4 ? RenderSize() : TraceSize());
+	if (pixel.x >= size.x || pixel.y >= size.y) return;
+	if (mode == 0) Gtao(pixel);
+	else if (mode == 1) Temporal(pixel);
+	else if (mode == 4) Composite(pixel);
+	else Atrous(pixel);
+}
