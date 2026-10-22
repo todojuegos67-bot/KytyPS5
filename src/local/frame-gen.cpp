@@ -75,9 +75,10 @@ struct Sources {
 int      g_generate    = 0;     // frames to generate per rendered frame (0 = off)
 // KYTY_DLSSG_DYNAMIC=1: an app-side dynamic multiplier. Streamline's eDynamic is D3D12 only (not on Vulkan, and it
 // ignores numFramesToGenerate), so DLSS-G stays eOn and the emulator picks numFramesToGenerate itself, once a second:
-// gen = clamp(floor(target / real) - 1, 1, KYTY_FRAMEGEN (default 3), numFramesToGenerateMax), changed only when the new
-// value held for two windows in a row. Target: KYTY_DLSSG_TARGET_FPS, default refresh - refresh^2 / 3600 (224 on
-// 240 Hz). No Reflex frame limit from the multiplier: the real rate stays the game's own pacing.
+// m = gen + 1 = the largest in [1, min(KYTY_FRAMEGEN (default 5), numFramesToGenerateMax (3 until known)) + 1] with
+// real * m <= target (10-22; up after real * (m + 1) <= 0.97 target for ~1 s, down at once past 1.02 target). The real
+// rate is never held to reach a multiplier; Reflex caps it at target / m. Target: KYTY_DLSSG_TARGET_FPS, default
+// refresh - refresh^2 / 3600 (224 on 240 Hz).
 bool     g_dlssg_dynamic   = false;
 float    g_dlssg_target_fps = 0.0f;
 int      g_dyn_gen         = 1;   // the current generated frame count in dynamic mode (g_generate is its maximum)
@@ -91,6 +92,10 @@ bool     g_dyn_stretch     = true;
 uint32_t g_dyn_limit_us    = 0;
 double   g_dyn_slept       = 0.0; // seconds our limiter waited in this window
 int      g_dyn_block_s     = 0;   // seconds left without taking the extra frame (it cost too much real fps)
+int      g_dyn_max         = 3;   // 10-22: the largest generated count in use (min(KYTY_FRAMEGEN, GPU max), 3 until known)
+int      g_dyn_up_s        = 0;   // windows in a row the next multiplier fit under target * 0.97
+int      g_dyn_pinned_s    = 0;   // windows in a row the real rate sat at our Reflex cap
+int      g_dyn_noup_s      = 0;   // windows left without switching up (after a step down off the cap)
 int      g_dyn_flip_fps    = 0;   // 10-21: the game's own flip floor held for the extra frame (VideoOut::SetDynamicFlipFps)
 
 // The flip floor for `gen` generated frames: the reach rate when gen + 1 at 60 passes the target, else none.
@@ -927,7 +932,7 @@ void Initialize() {
 	g_generate        = value != nullptr ? std::clamp(std::atoi(value), 0, 5) : 0;
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	if (const char* dyn = std::getenv("KYTY_DLSSG_DYNAMIC"); dyn != nullptr && *dyn == '1') {
-		if (value == nullptr) g_generate = 3; // KYTY_FRAMEGEN is the maximum (default 3: x4)
+		if (value == nullptr) g_generate = 5; // KYTY_FRAMEGEN is the maximum (default 5: x6, capped by the GPU)
 	}
 	if (const char* dyn = std::getenv("KYTY_DLSSG_DYNAMIC"); dyn != nullptr && *dyn == '1' && g_generate > 0) {
 		g_dlssg_dynamic = true;
@@ -944,7 +949,8 @@ void Initialize() {
 		}
 		if (g_dlssg_target_fps <= 0.0f) g_dlssg_target_fps = 224.0f;
 		// First guess: the game's usual 60 real fps.
-		g_dyn_gen = std::clamp(static_cast<int>(std::floor(g_dlssg_target_fps / 60.0)) - 1, 1, g_generate);
+		g_dyn_max = std::min(g_generate, 3); // until Streamline reports numFramesToGenerateMax
+		g_dyn_gen = std::clamp(static_cast<int>(std::floor(g_dlssg_target_fps / 60.0)) - 1, 1, g_dyn_max);
 	}
 #endif
 	{
@@ -1202,10 +1208,13 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 			const char* v = std::getenv("KYTY_DLSSG_REFLEX_LIMIT");
 			return v != nullptr && *v == '1';
 		}();
-		if (cap != 0 && g_dlssg_dynamic) {
-			std::printf("Frame generation: dynamic multiplier: no Reflex frame limit (KYTY_VRR_CAP_FPS %u ignored; target %.0f)\n",
-			            cap, static_cast<double>(g_dlssg_target_fps));
-			cap = 0;
+		if (g_dlssg_dynamic) {
+			// 10-22: Reflex holds real <= target / multiplier, set again on every change (KYTY_VRR_CAP_FPS not used).
+			cap                 = 0;
+			reflex.frameLimitUs = static_cast<uint32_t>(1000000.0 * (g_dyn_gen + 1) / static_cast<double>(g_dlssg_target_fps));
+			g_real_interval     = static_cast<double>(g_dyn_gen + 1) / static_cast<double>(g_dlssg_target_fps);
+			std::printf("Frame generation: dynamic multiplier, target %.0f fps: Reflex limit %u us (x%d)\n",
+			            static_cast<double>(g_dlssg_target_fps), reflex.frameLimitUs, g_dyn_gen + 1);
 		}
 		if (cap != 0 && g_generate > 0 && flip_fps > 0 && !force_reflex &&
 		    static_cast<double>(flip_fps) * (g_generate + 1) <= cap + 0.5 &&
@@ -1464,6 +1473,18 @@ bool TaaReplaceWanted() {
 }
 
 
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+// 10-22: the dynamic multiplier's Reflex cap: real <= target / (gen + 1), so shown <= target (G-Sync range).
+void DynApplyReflexLimit(int gen) {
+	const uint32_t us = static_cast<uint32_t>(1000000.0 * (gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0));
+	if (g_reflex_opts.frameLimitUs == us) return;
+	g_reflex_opts.frameLimitUs = us;
+	g_real_interval            = static_cast<double>(gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0);
+	if (const auto result = g_api.reflex_set_options(g_reflex_opts); result != sl::Result::eOk)
+		LOGF("frame generation: slReflexSetOptions (dynamic limit) failed (%d)\n", static_cast<int>(result));
+}
+#endif
+
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2D region,
                    vk::Format format, uint32_t image_count) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -1480,6 +1501,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		g_options_set   = false;
 		VideoOut::SetDynamicFlipFps(0);
 		g_dyn_flip_fps = 0;
+		DynApplyReflexLimit(g_dyn_gen);
 		std::printf("[dyn] cinematic: back to 60, x%d\n", g_dyn_gen + 1);
 		std::fflush(stdout);
 	}
@@ -1509,52 +1531,47 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 				const double freer = g_stat_real / std::max(window - g_dyn_slept, 0.05);
 				g_dyn_slept       = 0.0;
 				g_dyn_real_fps    = g_dyn_real_fps <= 0.0 ? freer : 0.5 * g_dyn_real_fps + 0.5 * freer;
-				int limit         = g_generate;
-				// Real rate the game would run at without our limit: when we hold it, the measured rate is our cap.
-				const double free_real = g_dyn_real_fps;
-				int cand    = std::clamp(
-				    static_cast<int>(std::floor(static_cast<double>(g_dlssg_target_fps) / std::max(free_real, 1.0))) - 1, 1,
-				    std::max(limit, 1));
-				if (g_dyn_block_s > 0) --g_dyn_block_s;
-				// The game's flip floor holds the real rate (no limiter of ours: it beat against the game's 60 Hz pacing,
-				// a 4 Hz judder): `held` as the limiter was.
-				const bool   held      = g_dyn_limit_us != 0 || g_dyn_flip_fps != 0;
+				// 10-22: no flip floor (the game's real rate is not held to reach a multiplier). The largest m with
+				// real * m <= target; up only after real * (m + 1) <= 0.97 target held 2 windows (EMA ~1 s), down at once
+				// when real * m > 1.02 target. Reflex caps real at target / m: when the real rate sits on that cap for
+				// 2 windows the game may run faster, so one step down (and no step up for 10 s).
+				(void)freer;
+				const double T       = static_cast<double>(g_dlssg_target_fps);
 				const bool   cinematic = VideoOut::CinematicPlaying();
-				// The extra frame taken but the game fell well under its limit (DLSS-G x4 costing GPU time): back one,
-				// and no extra frame for 60 s.
-				if (g_dyn_stretch && held && g_dyn_pending_n == 0 &&
-				    free_real < 0.9 * static_cast<double>(g_dlssg_target_fps) / (g_dyn_gen + 1)) {
-					g_dyn_block_s = 60;
-					std::printf("[dlssg] dynamic x%d cost too much (free %.1f fps): back to x%d for 60 s\n", g_dyn_gen + 1, free_real,
-					            g_dyn_gen);
-				}
-				// The extra frame only where the vblank gives an even rate for it (840 Hz: 56 for x4); else x3 at 60.
-				if (g_dyn_stretch && !cinematic && g_dyn_block_s == 0 && cand + 1 <= limit) {
-					const int reach = VideoOut::ReachFps(static_cast<double>(g_dlssg_target_fps), cand + 2);
-					if (reach > 0 && reach >= free_real * 0.9) cand += 1;
-				}
-				// While the limit holds the real rate, keep the stretched choice unless the game falls clearly below it.
-				if (g_dyn_block_s == 60) cand = std::max(g_dyn_gen - 1, 1);
-				else if (g_dyn_stretch && held && !cinematic && cand < g_dyn_gen &&
-				    free_real >= 0.95 * static_cast<double>(g_dlssg_target_fps) / (g_dyn_gen + 1)) {
-					cand = g_dyn_gen;
-				}
-				if (cinematic) cand = std::min(cand, std::min(2, std::max(limit, 1)));
-				if (cand == g_dyn_gen) {
-					g_dyn_pending_n = 0;
-				} else if (cand == g_dyn_pending) {
-					if (++g_dyn_pending_n >= 2) {
-						g_dyn_gen       = cand;
-						g_dyn_pending_n = 0;
-						g_options_set   = false; // send numFramesToGenerate again
-						// 10-21: no limiter of ours (it beat against the game's own 60 Hz flips: a 4 Hz judder); the game's
-						// flip floor (on an 840 Hz vblank 56 = every 15 vblanks) holds the real rate for the extra frame.
-						g_dyn_limit_us = 0;
-						DynApplyFlipFloor(cinematic ? std::min(g_dyn_gen, 2) : g_dyn_gen);
+				const int    maxgen  = cinematic ? std::min(2, g_dyn_max) : g_dyn_max;
+				int          next    = std::min(g_dyn_gen, maxgen);
+				if (g_dyn_noup_s > 0) --g_dyn_noup_s;
+				const double cap_real = T / (g_dyn_gen + 1);
+				g_dyn_pinned_s = real >= 0.98 * cap_real ? g_dyn_pinned_s + 1 : 0;
+				if (real * (next + 1) > 1.02 * T) {
+					// Down at once, to the largest that fits.
+					next = std::clamp(static_cast<int>(std::floor(T / std::max(real, 1.0))) - 1, 1, next);
+					g_dyn_up_s = 0;
+				} else if (g_dyn_pinned_s >= 2 && next > 1 && !cinematic) {
+					next           = next - 1;
+					g_dyn_pinned_s = 0;
+					g_dyn_noup_s   = 10;
+					g_dyn_up_s     = 0;
+				} else if (next < maxgen && g_dyn_noup_s == 0 && g_dyn_real_fps * (next + 2) <= 0.97 * T) {
+					if (++g_dyn_up_s >= 2) {
+						next = std::clamp(static_cast<int>(std::floor(0.97 * T / std::max(g_dyn_real_fps, 1.0))) - 1, next + 1, maxgen);
+						g_dyn_up_s = 0;
 					}
 				} else {
-					g_dyn_pending   = cand;
-					g_dyn_pending_n = 1;
+					g_dyn_up_s = 0;
+				}
+				if (next != g_dyn_gen) {
+					g_dyn_gen      = next;
+					g_options_set  = false; // send numFramesToGenerate again
+					g_dyn_limit_us = 0;
+					g_dyn_pinned_s = 0;
+					if (g_dyn_flip_fps != 0) {
+						VideoOut::SetDynamicFlipFps(0);
+						g_dyn_flip_fps = 0;
+					}
+					DynApplyReflexLimit(g_dyn_gen);
+					std::printf("[dyn] x%d: real %.1f fps, shown %.1f (target %.0f)\n", g_dyn_gen + 1, real,
+					            std::min(real * (g_dyn_gen + 1), T), T);
 				}
 				std::printf("[dlssg] dynamic x%d; real %.1f fps (smoothed %.1f), shown %.1f, target %.0f\n", g_dyn_gen + 1, real,
 				            g_dyn_real_fps, real * (g_dyn_gen + 1), static_cast<double>(g_dlssg_target_fps));
@@ -1758,6 +1775,19 @@ void AfterPresent() {
 		            state.numFramesToGenerateMax);
 		g_generate    = static_cast<int>(state.numFramesToGenerateMax);
 		g_options_set = false;
+	}
+	if (g_dlssg_dynamic && state.numFramesToGenerateMax != 0) {
+		const int max = std::min(g_generate, static_cast<int>(state.numFramesToGenerateMax));
+		if (max != g_dyn_max) {
+			std::printf("[dyn] up to x%d (GPU makes up to %u generated)\n", max + 1, state.numFramesToGenerateMax);
+			std::fflush(stdout);
+			g_dyn_max = max;
+			if (g_dyn_gen > max) {
+				g_dyn_gen     = max;
+				g_options_set = false;
+				DynApplyReflexLimit(g_dyn_gen);
+			}
+		}
 	}
 	if (presents % 600 == 1) {
 		LOGF("frame generation: status=0x%x presented=%u max_generated=%u vram=%" PRIu64 " MiB\n",
