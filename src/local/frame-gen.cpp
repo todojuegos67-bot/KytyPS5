@@ -1675,9 +1675,12 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, token);
 
 	sl::Constants constants = MakeConstants(usable, usable ? inputs->camera : Camera {}, usable ? inputs->render_extent : vk::Extent2D {});
-	if (const auto result = g_api.set_constants(constants, token, viewport); result != sl::Result::eOk &&
-	                                                                          g_presents < 8) {
-		LOGF("frame generation: slSetConstants failed (%d)\n", static_cast<int>(result));
+	if (const auto result = g_api.set_constants(constants, token, viewport); result != sl::Result::eOk) {
+		static uint32_t failures = 0;
+		if (failures++ < 8 || failures % 600 == 0) {
+			LOGF("frame generation: slSetConstants failed (%d), %u time(s)\n", static_cast<int>(result), failures);
+			std::printf("[dlssg] slSetConstants failed (%d), %u time(s)\n", static_cast<int>(result), failures);
+		}
 	}
 
 	if (usable) {
@@ -1734,9 +1737,43 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		    inputs->hudless_display.extent.height == backbuffer.height)
 			tags.emplace_back(&hudless, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent,
 			                  &hudless_extent);
-		if (const auto result = g_api.set_tag_for_frame(token, viewport, tags.data(), static_cast<uint32_t>(tags.size()), nullptr);
-		    result != sl::Result::eOk && g_presents < 8) {
-			LOGF("frame generation: slSetTagForFrame failed (%d)\n", static_cast<int>(result));
+		const auto tag_result = g_api.set_tag_for_frame(token, viewport, tags.data(), static_cast<uint32_t>(tags.size()), nullptr);
+		static uint32_t tag_failures = 0;
+		if (tag_result != sl::Result::eOk && (tag_failures++ < 8 || tag_failures % 600 == 0)) {
+			LOGF("frame generation: slSetTagForFrame failed (%d), %u time(s)\n", static_cast<int>(tag_result), tag_failures);
+			std::printf("[dlssg] slSetTagForFrame failed (%d), %u time(s)\n", static_cast<int>(tag_result), tag_failures);
+		}
+		// Once: what DLSS-G is given (its constants, the tags' extents and formats), to check against FSR 3's inputs.
+		static bool dumped = false;
+		if (!dumped) {
+			dumped = true;
+			const auto m = [](const Mat4& a) {
+				char text[320];
+				std::snprintf(text, sizeof(text), "[%.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g]",
+				              a[0].x, a[0].y, a[0].z, a[0].w, a[1].x, a[1].y, a[1].z, a[1].w, a[2].x, a[2].y, a[2].z, a[2].w,
+				              a[3].x, a[3].y, a[3].z, a[3].w);
+				return std::string(text);
+			};
+			char text[2048];
+			std::snprintf(text, sizeof(text),
+			              "[dlssg] constants: frame %u camera %s viewToClip %s clipToPrevClip %s mvecScale %.6g %.6g jitter %.4g %.4g "
+			              "near %.4g far %.4g fov %.4g aspect %.4g depthInverted %d cameraMotionIncluded %d mv3D %d dilated %d "
+			              "jittered %d ortho %d reset %d | depth %ux%u fmt %u, motion %ux%u fmt %u, tag extent %ux%u, hudless %s %ux%u, "
+			              "backbuffer %ux%u, region %d,%d %ux%u, setTag %d\n",
+			              g_frame_index, inputs->camera.valid ? "valid" : "INVALID", m(constants.cameraViewToClip).c_str(),
+			              m(constants.clipToPrevClip).c_str(), constants.mvecScale.x, constants.mvecScale.y, constants.jitterOffset.x,
+			              constants.jitterOffset.y, constants.cameraNear, constants.cameraFar, constants.cameraFOV,
+			              constants.cameraAspectRatio, static_cast<int>(constants.depthInverted),
+			              static_cast<int>(constants.cameraMotionIncluded), static_cast<int>(constants.motionVectors3D),
+			              static_cast<int>(constants.motionVectorsDilated), static_cast<int>(constants.motionVectorsJittered),
+			              static_cast<int>(constants.orthographicProjection), static_cast<int>(constants.reset), depth.width,
+			              depth.height, depth.nativeFormat, motion.width, motion.height, motion.nativeFormat, full.width, full.height,
+			              tags.size() > 2 && tags.back().type == sl::kBufferTypeHUDLessColor ? "tagged" : "not tagged",
+			              hudless.width, hudless.height, backbuffer.width, backbuffer.height, region.offset.x, region.offset.y,
+			              region.extent.width, region.extent.height, static_cast<int>(tag_result));
+			LOGF("%s", text);
+			std::printf("%s", text);
+			std::fflush(stdout);
 		}
 	} else {
 		// Menus, movies, loading: no valid depth and motion (DLSS-G then presents the frame as is).
@@ -1774,8 +1811,21 @@ void AfterPresent() {
 		return;
 	}
 	sl::DLSSGState state {};
-	if (g_api.dlssg_get_state(sl::ViewportHandle {0}, state, nullptr) != sl::Result::eOk) {
+	if (const auto result = g_api.dlssg_get_state(sl::ViewportHandle {0}, state, nullptr); result != sl::Result::eOk) {
+		if (presents < 300) std::printf("[dlssg] slDLSSGGetState failed (%d)\n", static_cast<int>(result));
 		return;
+	}
+	{
+		// DLSS-G's own verdict on its inputs (eFailResolutionTooLow, eFailCommonConstantsInvalid, ... as flags).
+		static uint32_t last_status = ~0u;
+		const auto      status      = static_cast<uint32_t>(state.status);
+		if (status != last_status || presents < 120) {
+			last_status = status;
+			LOGF("frame generation: DLSS-G state: status 0x%x, presented %u, generate max %u\n", status,
+			     state.numFramesActuallyPresented, state.numFramesToGenerateMax);
+			std::printf("[dlssg] state: status 0x%x, presented %u, generate max %u\n", status, state.numFramesActuallyPresented,
+			            state.numFramesToGenerateMax);
+		}
 	}
 	g_presented_frames.store(std::max(state.numFramesActuallyPresented, 1u), std::memory_order_relaxed);
 	// More generated frames asked for than the GPU makes (the launcher's 3x and up): as many as it makes.
