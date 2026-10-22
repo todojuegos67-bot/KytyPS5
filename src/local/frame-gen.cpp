@@ -1123,6 +1123,8 @@ void Initialize() {
 #endif
 }
 
+uint32_t DlssgReflexLimitUs(double interval);
+
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device) {
 	(void)instance;
 	(void)device;
@@ -1219,8 +1221,8 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 		if (g_dlssg_dynamic) {
 			// 10-22: Reflex holds real <= target / multiplier, set again on every change (KYTY_VRR_CAP_FPS not used).
 			cap                 = 0;
-			reflex.frameLimitUs = static_cast<uint32_t>(1000000.0 * (g_dyn_gen + 1) / static_cast<double>(g_dlssg_target_fps));
 			g_real_interval     = static_cast<double>(g_dyn_gen + 1) / static_cast<double>(g_dlssg_target_fps);
+			reflex.frameLimitUs = DlssgReflexLimitUs(g_real_interval);
 			std::printf("Frame generation: dynamic multiplier, target %.0f fps: Reflex limit %u us (x%d)\n",
 			            static_cast<double>(g_dlssg_target_fps), reflex.frameLimitUs, g_dyn_gen + 1);
 		}
@@ -1232,8 +1234,8 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 			cap = 0;
 		}
 		if (cap != 0 && g_generate > 0) {
-			reflex.frameLimitUs = static_cast<uint32_t>(1000000.0 * (g_generate + 1) / cap);
 			g_real_interval     = static_cast<double>(g_generate + 1) / cap;
+			reflex.frameLimitUs = DlssgReflexLimitUs(g_real_interval);
 			std::printf("Frame generation: shown frames held under %u fps (rendered at most %.1f, Reflex limit %u us)\n", cap,
 			            static_cast<double>(cap) / (g_generate + 1), reflex.frameLimitUs);
 		}
@@ -1481,14 +1483,26 @@ bool TaaReplaceWanted() {
 }
 
 
+// 10-22: real frames are paced by one limiter only: VideoOut's flip pacer (RealFrameInterval, the vblank grid, as
+// FSR3's) holds them to target / m; Reflex stays for latency without a frame limit (two limiters at 56 beat against
+// the game's 60: flip->present sd 1.90 ms vs FSR3's 0.55). KYTY_DLSSG_REFLEX_LIMIT=1: Reflex's limit too (old).
+uint32_t DlssgReflexLimitUs(double interval) {
+	static const bool force = [] {
+		const char* v = std::getenv("KYTY_DLSSG_REFLEX_LIMIT");
+		return v != nullptr && *v == '1';
+	}();
+	return force && interval > 0.0 ? static_cast<uint32_t>(1000000.0 * interval) : 0u;
+}
+
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 // 10-22: the dynamic multiplier's Reflex cap: real <= target / (gen + 1), so shown <= target (G-Sync range).
 // gen < 0: no limit (DLSS-G off: menus, movies, loading; x1 is not held to the last multiplier's target / m).
 void DynApplyReflexLimit(int gen) {
-	const uint32_t us = gen < 0 ? 0u : static_cast<uint32_t>(1000000.0 * (gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0));
+	const double interval = gen < 0 ? 0.0 : static_cast<double>(gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0);
+	g_real_interval       = interval; // the flip pacer (VideoOut, as FSR3's) holds real frames to it on the vblank grid
+	const uint32_t us     = DlssgReflexLimitUs(interval);
 	if (g_reflex_opts.frameLimitUs == us) return;
 	g_reflex_opts.frameLimitUs = us;
-	g_real_interval            = gen < 0 ? 0.0 : static_cast<double>(gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0);
 	if (const auto result = g_api.reflex_set_options(g_reflex_opts); result != sl::Result::eOk)
 		LOGF("frame generation: slReflexSetOptions (dynamic limit) failed (%d)\n", static_cast<int>(result));
 }
