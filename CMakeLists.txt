@@ -468,6 +468,7 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
 	"${KYTY_SOURCE_DIR}/local/local-platform.h"
 	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
+	"${KYTY_SOURCE_DIR}/local/dyn-multiplier.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"

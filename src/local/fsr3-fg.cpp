@@ -32,6 +32,7 @@
 #include "gpu_tiler_shaders/hud_split_spv.h"
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 #include "local/vulkan-recording.h"
+#include "local/dyn-multiplier.h"
 #endif
 #endif
 
@@ -153,6 +154,7 @@ struct Mfg {
 	double slept  = 0.0;  // seconds the limiter waited in this window
 	double smooth = 0.0;  // 10-22: smoothed real fps
 	int    up_n = 0, pinned_n = 0, noup_s = 0; // 10-22: hysteresis windows (as DLSS-G's dynamic multiplier)
+	Kyty::Local::DynMultiplier dm; // 10-22: the free-rate multiplier choice
 	int    flip_fps = 0;  // 10-21: the game's own flip floor for this multiplier (VideoOut::SetDynamicFlipFps)
 } g_mfg;
 
@@ -220,33 +222,13 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
 	const double free = frames / busy;
 	g_mfg.slept       = 0.0;
 	if (g_mfg.dynamic && frames > 0) {
-		// 10-22: no flip floor (the real rate is never held to reach a multiplier). The largest m (2..max; the patched
-		// DLL holds at most 3 generated frames, x4) with real * m <= target: up after real * (m + 1) <= 0.97 target for
-		// 2 windows (smoothed), down at once past 1.02 target; real capped at target / m (CapInterval). Sitting on that
-		// cap 2 windows: one step down (the game may run faster), no step up for 10 s.
+		// 10-22: no flip floor; the multiplier from the free rate (dyn-multiplier.h), real capped at target / m.
 		const bool   cinematic = Libs::VideoOut::CinematicPlaying();
 		const double T         = g_mfg.target;
 		const int    maxm      = cinematic ? std::min(3, g_mfg.max) : g_mfg.max;
 		g_mfg.smooth           = g_mfg.smooth <= 0.0 ? real : 0.5 * g_mfg.smooth + 0.5 * real;
-		if (g_mfg.noup_s > 0) --g_mfg.noup_s;
-		int next       = std::min(g_mfg.current, maxm);
-		g_mfg.pinned_n = real >= 0.98 * T / g_mfg.current ? g_mfg.pinned_n + 1 : 0;
-		if (real * next > 1.02 * T) {
-			next       = std::clamp(static_cast<int>(std::floor(T / std::max(real, 1.0))), 2, next);
-			g_mfg.up_n = 0;
-		} else if (g_mfg.pinned_n >= 2 && next > 2 && !cinematic) {
-			next           = next - 1;
-			g_mfg.pinned_n = 0;
-			g_mfg.noup_s   = 10;
-			g_mfg.up_n     = 0;
-		} else if (next < maxm && g_mfg.noup_s == 0 && g_mfg.smooth * (next + 1) <= 0.97 * T) {
-			if (++g_mfg.up_n >= 2) {
-				next       = std::clamp(static_cast<int>(std::floor(0.97 * T / std::max(g_mfg.smooth, 1.0))), next + 1, maxm);
-				g_mfg.up_n = 0;
-			}
-		} else {
-			g_mfg.up_n = 0;
-		}
+		// 10-22: decided on the free rate (src/local/dyn-multiplier.h; see there for the rules).
+		const int next = std::clamp(g_mfg.dm.Window(g_mfg.current, real, T, maxm), 2, std::max(maxm, 2));
 		(void)free;
 		if (next != g_mfg.current) {
 			g_mfg.current  = next;
@@ -256,7 +238,8 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
 				Libs::VideoOut::SetDynamicFlipFps(0);
 				g_mfg.flip_fps = 0;
 			}
-			std::printf("[dyn] x%d: real %.1f fps, shown %.1f (target %.0f)\n", next, real, std::min(real * next, T), T);
+			std::printf("[dyn] x%d: real %.1f fps, shown %.1f (target %.0f), free %.1f\n", next, real, std::min(real * next, T), T,
+			            g_mfg.dm.last_free);
 		}
 	}
 	std::printf("[fsr3-mfg] x%d%s; real %.1f fps (free %.1f), shown %.1f fps\n", g_mfg.current, g_mfg.dynamic ? " dynamic" : "",

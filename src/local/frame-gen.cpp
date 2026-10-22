@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 #include "local/vulkan-recording.h"
+#include "local/dyn-multiplier.h"
 #include "gpu_tiler_shaders/taa_bypass_spv.h"
 #include "gpu_tiler_shaders/sharpen_spv.h"
 #include "gpu_tiler_shaders/ssgi_spv.h"
@@ -96,6 +97,7 @@ int      g_dyn_max         = 3;   // 10-22: the largest generated count in use (
 int      g_dyn_up_s        = 0;   // windows in a row the next multiplier fit under target * 0.97
 int      g_dyn_pinned_s    = 0;   // windows in a row the real rate sat at our Reflex cap
 int      g_dyn_noup_s      = 0;   // windows left without switching up (after a step down off the cap)
+Kyty::Local::DynMultiplier g_dyn_dm; // 10-22: the free-rate multiplier choice
 int      g_dyn_flip_fps    = 0;   // 10-21: the game's own flip floor held for the extra frame (VideoOut::SetDynamicFlipFps)
 
 // The flip floor for `gen` generated frames: the reach rate when gen + 1 at 60 passes the target, else none.
@@ -1542,30 +1544,12 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 				// when real * m > 1.02 target. Reflex caps real at target / m: when the real rate sits on that cap for
 				// 2 windows the game may run faster, so one step down (and no step up for 10 s).
 				(void)freer;
-				const double T       = static_cast<double>(g_dlssg_target_fps);
+				// 10-22: decided on the free rate (src/local/dyn-multiplier.h): per-level minimum real fps, one step up
+				// at a time with a revert + 10 s block when it shows < 5% more, cap target / m only binding past it.
+				const double T         = static_cast<double>(g_dlssg_target_fps);
 				const bool   cinematic = VideoOut::CinematicPlaying();
-				const int    maxgen  = cinematic ? std::min(2, g_dyn_max) : g_dyn_max;
-				int          next    = std::min(g_dyn_gen, maxgen);
-				if (g_dyn_noup_s > 0) --g_dyn_noup_s;
-				const double cap_real = T / (g_dyn_gen + 1);
-				g_dyn_pinned_s = real >= 0.98 * cap_real ? g_dyn_pinned_s + 1 : 0;
-				if (real * (next + 1) > 1.02 * T) {
-					// Down at once, to the largest that fits.
-					next = std::clamp(static_cast<int>(std::floor(T / std::max(real, 1.0))) - 1, 1, next);
-					g_dyn_up_s = 0;
-				} else if (g_dyn_pinned_s >= 2 && next > 1 && !cinematic) {
-					next           = next - 1;
-					g_dyn_pinned_s = 0;
-					g_dyn_noup_s   = 10;
-					g_dyn_up_s     = 0;
-				} else if (next < maxgen && g_dyn_noup_s == 0 && g_dyn_real_fps * (next + 2) <= 0.97 * T) {
-					if (++g_dyn_up_s >= 2) {
-						next = std::clamp(static_cast<int>(std::floor(0.97 * T / std::max(g_dyn_real_fps, 1.0))) - 1, next + 1, maxgen);
-						g_dyn_up_s = 0;
-					}
-				} else {
-					g_dyn_up_s = 0;
-				}
+				const int    maxgen    = cinematic ? std::min(2, g_dyn_max) : g_dyn_max;
+				int          next      = std::clamp(g_dyn_dm.Window(g_dyn_gen + 1, real, T, maxgen + 1) - 1, 1, std::max(maxgen, 1));
 				if (next != g_dyn_gen) {
 					g_dyn_gen      = next;
 					g_options_set  = false; // send numFramesToGenerate again
@@ -1576,8 +1560,8 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 						g_dyn_flip_fps = 0;
 					}
 					DynApplyReflexLimit(g_dyn_gen);
-					std::printf("[dyn] x%d: real %.1f fps, shown %.1f (target %.0f)\n", g_dyn_gen + 1, real,
-					            std::min(real * (g_dyn_gen + 1), T), T);
+					std::printf("[dyn] x%d: real %.1f fps, shown %.1f (target %.0f), free %.1f\n", g_dyn_gen + 1, real,
+					            std::min(real * (g_dyn_gen + 1), T), T, g_dyn_dm.last_free);
 				}
 				std::printf("[dlssg] dynamic x%d; real %.1f fps (smoothed %.1f), shown %.1f, target %.0f\n", g_dyn_gen + 1, real,
 				            g_dyn_real_fps, real * (g_dyn_gen + 1), static_cast<double>(g_dlssg_target_fps));
