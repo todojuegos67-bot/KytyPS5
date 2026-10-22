@@ -103,6 +103,7 @@ int      g_dyn_up_s        = 0;   // windows in a row the next multiplier fit un
 int      g_dyn_pinned_s    = 0;   // windows in a row the real rate sat at our Reflex cap
 int      g_dyn_noup_s      = 0;   // windows left without switching up (after a step down off the cap)
 Kyty::Local::DynMultiplier g_dyn_dm; // 10-22: the free-rate multiplier choice
+bool     g_fixed_floor     = false; // 10-23: fixed DLSS-G under a cap: the same flip floor / pacer choice per present
 int      g_dyn_flip_asked  = -1;  // the last rate asked of SetDynamicFlipFps (-1: none since a clear)
 int      g_dyn_flip_fps    = 0;   // 10-21: the game's own flip floor held for the extra frame (VideoOut::SetDynamicFlipFps)
 
@@ -1266,6 +1267,8 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 			cap = 0;
 		}
 		if (cap != 0 && g_generate > 0) {
+			g_dlssg_target_fps  = static_cast<float>(cap); // 10-23: fixed too: the flip floor (DynApplyReflexLimit per present)
+			g_fixed_floor       = true;
 			g_real_interval     = static_cast<double>(g_generate + 1) / cap;
 			reflex.frameLimitUs = DlssgReflexLimitUs(g_real_interval);
 			std::printf("Frame generation: shown frames held under %u fps (rendered at most %.1f, Reflex limit %u us)\n", cap,
@@ -1549,7 +1552,8 @@ uint32_t DlssgReflexLimitUs(double interval) {
 // 10-23: where the game's 60 would pass the target (x4 on 224), the game's own flips are held to the vblank's reach
 // rate (840 Hz: 56, DynApplyFlipFloor) and our pacer is off: the pacer at 56 against the game's 60 queued a frame
 // (log 20261022-190358, dynamic x4 at 55 real: flip->present mean 43.7 ms sd 3.9 vs 24.1 / 1.4 on fixed x4 at 45 real).
-// Not in cinematics or held cutscenes, nor with DLSS-G off. KYTY_DLSSG_FLIP_FLOOR=0: the pacer only.
+// Not in cinematics or held cutscenes, nor with DLSS-G off. KYTY_DLSSG_FLIP_FLOOR=0: the pacer only. Fixed DLSS-G under
+// a cap (KYTY_VRR_CAP_FPS) likewise (10-23); it needs a vblank that 56 divides (840 Hz; 360 Hz refuses it: the pacer).
 void DynApplyReflexLimit(int gen) {
 	static const bool floor_on = [] {
 		const char* v = std::getenv("KYTY_DLSSG_FLIP_FLOOR");
@@ -1707,6 +1711,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	const bool mode_on = g_mode_set == 1 ? run_without < 30 : run_with >= 10;
 	// 10-22: the dynamic Reflex limit is target / m of the current m while DLSS-G is on, none while it is off.
 	if (g_dlssg_dynamic) DynApplyReflexLimit(mode_on ? g_dyn_gen : -1);
+	else if (g_fixed_floor) DynApplyReflexLimit(mode_on ? g_generate : -1); // 10-23: fixed x4 likewise (flip floor 56)
 	// DLSS-G options; sizes are hints for its allocations.
 	if (!g_options_set || g_mode_set != (mode_on ? 1 : 0) || g_options_format != format ||
 	    (usable && (g_options_backbuffer != backbuffer || g_options_render != inputs->render_extent))) {
