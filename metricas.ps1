@@ -30,6 +30,25 @@ if (-not $smi) {
 	}
 } else { $smi = $smi.Source }
 
+
+# (10-22) Nitido en 4K y 1440p: el proceso trabaja en pixeles reales (sin el escalado borroso de Windows, que
+# ademas agrandaba las letras pero no los huecos y las metricas se pisaban). Solo afecta a esta ventana.
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+public static class DpiFix { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }
+"@
+try { [void][DpiFix]::SetProcessDPIAware() } catch { }
+$scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+# Tamano segun la altura de la pantalla: 1 en 1080p, 1.33 en 1440p, 2 en 4K.
+$S = [Math]::Max(1.0, [Math]::Min(2.5, $scr.Height / 1080.0))
+function Px([double]$v) { [int][Math]::Round($v * $S) }
+$fontRow   = New-Object System.Drawing.Font("Consolas", [single](15 * $S), [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+$fontTitle = New-Object System.Drawing.Font("Consolas", [single](16 * $S), [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+$fontFps   = New-Object System.Drawing.Font("Consolas", [single](34 * $S), [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+$fontSmall = New-Object System.Drawing.Font("Consolas", [single](10 * $S), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+$DOT = ' ' + [char]0x00B7 + ' '   # separador (punto medio)
+$ARROW = [string][char]0x2192     # flecha "->"
+
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Metricas"
 $form.FormBorderStyle = 'None'
@@ -38,54 +57,86 @@ $form.ShowInTaskbar = $false
 $form.BackColor = [System.Drawing.Color]::Black
 $form.Opacity = 0.8
 $form.StartPosition = 'Manual'
-$form.Location = New-Object System.Drawing.Point(10, 10)
-$form.Size = New-Object System.Drawing.Size(560, 465)
+$form.AutoScaleMode = 'None'
+$form.Location = New-Object System.Drawing.Point((Px 10), (Px 10))
+$form.Size = New-Object System.Drawing.Size((Px 420), (Px 400))
 
-$label = New-Object System.Windows.Forms.Label
-$label.Dock = 'Top'; $label.Height = 200
-$title = New-Object System.Windows.Forms.Label
-$title.Dock = 'Top'; $title.Height = 30; $title.TextAlign = 'MiddleCenter'
-$title.ForeColor = [System.Drawing.Color]::White
-$title.Font = New-Object System.Drawing.Font("Consolas", 14, [System.Drawing.FontStyle]::Bold)
-$title.Text = $Titulo
-$label.ForeColor = [System.Drawing.Color]::Orange
-$label.Font = New-Object System.Drawing.Font("Consolas", 14, [System.Drawing.FontStyle]::Bold)
-$label.Text = "Cargando..."
-# Reescalador en su color: DLSS (NVIDIA) verde, FSR (AMD) rojo, XeSS (Intel) azul.
-$scaleLabel = New-Object System.Windows.Forms.Label
-$scaleLabel.Dock = 'Top'; $scaleLabel.Height = 28; $scaleLabel.Text = ''
-$scaleLabel.Font = New-Object System.Drawing.Font("Consolas", 14, [System.Drawing.FontStyle]::Bold)
-# Opciones graficas del lanzador que no estan en Maximo (debajo del frame generation).
-$gfxLabel = New-Object System.Windows.Forms.Label
-$gfxLabel.Dock = 'Top'; $gfxLabel.Height = 24; $gfxLabel.Text = ''
-$gfxLabel.ForeColor = [System.Drawing.Color]::Khaki
-$gfxLabel.Font = New-Object System.Drawing.Font("Consolas", 11, [System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($gfxLabel)
-# Frame generation: el modo del lanzador y el multiplicador que lleva ahora (DLSS verde, AMD rojo).
-$fgLabel = New-Object System.Windows.Forms.Label
-$fgLabel.Dock = 'Top'; $fgLabel.Height = 28; $fgLabel.Text = ''
-$fgLabel.Font = New-Object System.Drawing.Font("Consolas", 12, [System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($fgLabel)
-$fgLabel.Add_DoubleClick({ $form.Close() })
-$form.Controls.Add($scaleLabel)
-$scaleLabel.Add_DoubleClick({ $form.Close() })
-$form.Controls.Add($label)
-$form.Controls.Add($title)
+# Todas las metricas se dibujan en una sola superficie, en dos columnas (nombre | valor) de ancho fijo:
+# una fila por metrica, alto de fila medido con la fuente, sin controles apilados que se pisen.
+# Cada fila: @(nombre, valor, color). Nombre vacio: el valor ocupa las dos columnas (titulo, modo FG...).
+$script:rows = @(,@('', 'Cargando...', [System.Drawing.Color]::Orange))
+$script:fpsText = ''; $script:fpsColor = [System.Drawing.Color]::White
+$label = New-Object System.Windows.Forms.PictureBox
+$label.Dock = 'Fill'; $label.BackColor = [System.Drawing.Color]::Black
+$colName = [System.Drawing.Color]::FromArgb(150, 150, 150)
+$fmtEll = New-Object System.Drawing.StringFormat
+$fmtEll.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
+$fmtEll.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+$fmtCenter = New-Object System.Drawing.StringFormat
+$fmtCenter.Alignment = 'Center'; $fmtCenter.Trimming = 'EllipsisCharacter'; $fmtCenter.FormatFlags = 'NoWrap'
+$script:layout = @{ nameW = 0; rowH = 0 }
+function Measure-Layout {
+	# Ancho de cada columna: el texto mas largo (con un minimo, para que no baile cada segundo).
+	$g = $label.CreateGraphics()
+	try {
+		$rowH = [Math]::Ceiling($fontRow.GetHeight($g) * 1.12)
+		$nameW = (Px 90); $valW = (Px 230); $wideW = 0
+		foreach ($r in $script:rows) {
+			$w = [Math]::Ceiling($g.MeasureString($r[1], $fontRow).Width)
+			if ($r[0]) { $nameW = [Math]::Max($nameW, [Math]::Ceiling($g.MeasureString($r[0], $fontRow).Width) + (Px 10)); $valW = [Math]::Max($valW, $w) }
+			else { $wideW = [Math]::Max($wideW, $w) }
+		}
+		$titleH = [Math]::Ceiling($fontTitle.GetHeight($g) * 1.4)
+		$fpsH = if ($script:fpsText) { [Math]::Ceiling($fontFps.GetHeight($g) * 1.1) } else { 0 }
+		$pad = (Px 8)
+		$W = [Math]::Max($nameW + $valW, $wideW) + 2 * $pad
+		$W = [int][Math]::Min($W, $scr.Width * 0.4)
+		$H = [int]($titleH + $script:rows.Count * $rowH + $fpsH + $graph.Height + 2 * $pad)
+		$script:layout = @{ nameW = $nameW; rowH = $rowH; titleH = $titleH; fpsH = $fpsH; pad = $pad }
+		# Solo se redimensiona si cambia de verdad (sin parpadeo).
+		if ([Math]::Abs($form.Width - $W) -gt (Px 6) -or $form.Height -ne $H) { $form.Size = New-Object System.Drawing.Size($W, $H) }
+	} finally { $g.Dispose() }
+}
+$label.Add_Paint({ param($s, $e)
+	$g = $e.Graphics; $L = $script:layout; if (-not $L.rowH) { return }
+	$g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+	$pad = $L.pad; $w = $label.Width - 2 * $pad
+	$b = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+	$g.DrawString($Titulo, $fontTitle, $b, (New-Object System.Drawing.RectangleF([single]$pad, [single]$pad, [single]$w, [single]$L.titleH)), $fmtCenter)
+	$y = $pad + $L.titleH
+	$bn = New-Object System.Drawing.SolidBrush($colName)
+	foreach ($r in $script:rows) {
+		$bv = New-Object System.Drawing.SolidBrush($r[2])
+		if ($r[0]) {
+			$g.DrawString($r[0], $fontRow, $bn, (New-Object System.Drawing.RectangleF([single]$pad, [single]$y, [single]$L.nameW, [single]$L.rowH)), $fmtEll)
+			$g.DrawString($r[1], $fontRow, $bv, (New-Object System.Drawing.RectangleF([single]($pad + $L.nameW), [single]$y, [single]($w - $L.nameW), [single]$L.rowH)), $fmtEll)
+		} else {
+			$g.DrawString($r[1], $fontRow, $bv, (New-Object System.Drawing.RectangleF([single]$pad, [single]$y, [single]$w, [single]$L.rowH)), $fmtEll)
+		}
+		$bv.Dispose(); $y += $L.rowH
+	}
+	if ($script:fpsText) {
+		$bf = New-Object System.Drawing.SolidBrush($script:fpsColor)
+		$g.DrawString($script:fpsText, $fontFps, $bf, (New-Object System.Drawing.RectangleF([single]$pad, [single]$y, [single]$w, [single]$L.fpsH)), $fmtEll)
+		$bf.Dispose()
+	}
+	$b.Dispose(); $bn.Dispose()
+})
+
 $script:ft = New-Object System.Collections.Generic.List[double]
 $script:ftMax = New-Object System.Collections.Generic.List[double]
 $graph = New-Object System.Windows.Forms.PictureBox
-$graph.Dock = 'Bottom'; $graph.Height = 100; $graph.BackColor = [System.Drawing.Color]::Black
+$graph.Dock = 'Bottom'; $graph.Height = (Px 90); $graph.BackColor = [System.Drawing.Color]::Black
 $graph.Add_Paint({ param($s, $e)
 	$g = $e.Graphics; $w = $graph.Width; $h = $graph.Height
 	$top = 40.0
 	$grid = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(60, 60, 60))
 	foreach ($ms in @(8.3, 16.7, 33.3)) { $y = $h - ($ms / $top) * $h; $g.DrawLine($grid, [single]0, [single]$y, [single]$w, [single]$y) }
-	$f = New-Object System.Drawing.Font("Consolas", 7)
-	$g.DrawString("frametime (ms)  40", $f, [System.Drawing.Brushes]::Gray, [single]0, [single]0)
-	$g.DrawString("16.7", $f, [System.Drawing.Brushes]::Gray, [single]0, [single]($h - (16.7 / $top) * $h - 10))
+	$g.DrawString("frametime (ms)  40", $fontSmall, [System.Drawing.Brushes]::Gray, [single]0, [single]0)
+	$g.DrawString("16.7", $fontSmall, [System.Drawing.Brushes]::Gray, [single]0, [single]($h - (16.7 / $top) * $h - $fontSmall.Height))
 	foreach ($pair in @(,@($script:ft, [System.Drawing.Color]::Lime))) {
 		$list = $pair[0]; if ($list.Count -lt 2) { continue }
-		$pen = New-Object System.Drawing.Pen($pair[1], [single]1.5)
+		$pen = New-Object System.Drawing.Pen($pair[1], [single](1.5 * $S))
 		$step = $w / 59.0; $x0 = $w - ($list.Count - 1) * $step
 		for ($i = 1; $i -lt $list.Count; $i++) {
 			$y1 = $h - [Math]::Min($list[$i-1], $top) / $top * $h; $y2 = $h - [Math]::Min($list[$i], $top) / $top * $h
@@ -93,16 +144,38 @@ $graph.Add_Paint({ param($s, $e)
 		}
 	}
 })
+$form.Controls.Add($label)
 $form.Controls.Add($graph)
-# FPS aparte: grandes y en rojo, encima de la grafica.
-$fpsLabel = New-Object System.Windows.Forms.Label
-$fpsLabel.Dock = 'Bottom'; $fpsLabel.Height = 56; $fpsLabel.TextAlign = 'MiddleLeft'
-$fpsLabel.ForeColor = [System.Drawing.Color]::Red
-$fpsLabel.Font = New-Object System.Drawing.Font("Consolas", 28, [System.Drawing.FontStyle]::Bold)
-$fpsLabel.Text = ''
-$form.Controls.Add($fpsLabel)
-$fpsLabel.Add_DoubleClick({ $form.Close() })
 $graph.Add_DoubleClick({ $form.Close() })
+
+# Relojes (MHz) de GPU y CPU: sin instalar nada y sin administrador, como mucho una vez por segundo y guardados.
+# GPU: nvidia-smi (clocks.gr, en la misma consulta de siempre). Sin NVIDIA: el uso con los contadores de Windows
+# "GPU Engine" (no dan reloj); AMD sale "n/a", otras graficas sin linea de reloj.
+# CPU: "% Processor Performance" x MaxClockSpeed / 100 = MHz efectivos (turbo incluido).
+$script:gpuVendor = ''
+try { $vc = Get-CimInstance Win32_VideoController -ErrorAction Stop | Select-Object -First 1; $script:gpuVendor = "$($vc.Name) $($vc.AdapterCompatibility)" } catch { }
+$script:isAmd = $script:gpuVendor -match 'AMD|Radeon|Advanced Micro'
+$script:cpuMaxMHz = 0
+try { $script:cpuMaxMHz = [int](Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1).MaxClockSpeed } catch { }
+$script:cpuPerfCtr = $null
+try { $script:cpuPerfCtr = New-Object System.Diagnostics.PerformanceCounter('Processor Information', '% Processor Performance', '_Total', $true); [void]$script:cpuPerfCtr.NextValue() } catch { $script:cpuPerfCtr = $null }
+$script:clk = @{ stamp = [datetime]::MinValue; cpuMHz = $null; gpuUse = $null }
+function Update-Clocks {
+	if (((Get-Date) - $script:clk.stamp).TotalMilliseconds -lt 950) { return }
+	$script:clk.stamp = Get-Date
+	if ($script:cpuMaxMHz -gt 0) {
+		$perf = $null
+		if ($script:cpuPerfCtr) { try { $perf = [double]$script:cpuPerfCtr.NextValue() } catch { $script:cpuPerfCtr = $null } }
+		if (-not $perf) { try { $perf = [double](Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -Filter "Name='_Total'" -ErrorAction Stop).PercentProcessorPerformance } catch { } }
+		$script:clk.cpuMHz = if ($perf) { [int][Math]::Round($perf * $script:cpuMaxMHz / 100.0) } else { $null }
+	}
+	if (-not $smi) {
+		try {
+			$eng = Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -ErrorAction Stop | Where-Object { $_.Name -like '*engtype_3D' }
+			$script:clk.gpuUse = [int][Math]::Min(100, ($eng | Measure-Object -Property UtilizationPercentage -Sum).Sum)
+		} catch { $script:clk.gpuUse = $null }
+	}
+}
 
 # Lossless Scaling: FPS medidos con PresentMon (si PresentMon.exe esta junto a este script).
 $script:lsFps = $null; $script:lsTimes = New-Object System.Collections.Generic.Queue[double]; $script:lsCol = -1
@@ -187,64 +260,106 @@ function Get-Fps {
 }
 $script:lastKey = -1; $script:lastLog = ''
 
-# Reescalado en uso: la ultima linea del log con "<NNN>x<NNN> -> <NNN>x<NNN>" de DLSS, XeSS o FSR (se ignoran las
-# imagenes pequenas de los menus).
-$script:scaleText = $null; $script:scaleLog = ''; $script:scalePos = 0; $script:outH = 0; $script:force4k = $false
-function Get-ScaleMode {
-	# El modo elegido en el lanzador (launcher.ini, scalelabel), con su nombre completo.
+# launcher.ini una vez por segundo, como tabla (antes se leia cuatro veces por tick).
+function Read-Ini {
+	$h = @{}
 	try {
-		$ini = Join-Path (Split-Path $LogDir -Parent) 'launcher.ini'
-		$line = Get-Content $ini -ErrorAction Stop | Where-Object { $_ -like 'scalelabel=*' } | Select-Object -First 1
-		if (-not $line) { return '' }
-		$label = $line.Substring(11)
-		$mode = ($label -split ' ', 2)[1]
-		if (-not $mode) { return '' }
-		$mode = $mode -replace 'U\.cal\.\+', 'Ultra calidad+' -replace 'U\.calidad', 'Ultra calidad' -replace 'Equilib\.', 'Equilibrado' -replace 'U\.rendim\.', 'Ultra rendimiento' -replace 'Rendim\.', 'Rendimiento'
-		return ' ' + $mode
-	} catch { return '' }
+		foreach ($l in (Get-Content (Join-Path (Split-Path $LogDir -Parent) 'launcher.ini') -ErrorAction Stop)) {
+			$i = $l.IndexOf('='); if ($i -gt 0) { $h[$l.Substring(0, $i).Trim()] = $l.Substring($i + 1).Trim() }
+		}
+	} catch { }
+	return $h
 }
-function Get-Scale {
-	if (-not $LogDir -or -not (Test-Path $LogDir)) { return $null }
+
+# Reescalado en uso. Del log del emulador (leido por partes, solo lo nuevo):
+#  "<kind> ... WxH -> WxH" (DLSS, XeSS, FSR 3.1; se ignoran las imagenes pequenas de los menus),
+#  "render size: KYTY_UPSCALE_RATIO=3 on a 2160 high display: 720", "DLSS super resolution ...: ready",
+#  "XeSS: libxess.dll 2.0.2 loaded". Si el log aun no lo dice: el modo del lanzador (scalelabel, dlsspreset).
+# (10-22) Antes el modelo no salia: el texto solo se formaba con la linea "WxH -> WxH", el "Nativo" iba dentro
+# del bucle (llave mal puesta) y la fila de 28 px cortaba el texto largo en la 2a linea, que quedaba tapada.
+$script:sc = @{ log = ''; pos = 0 }
+function Reset-Scale { $script:sc = @{ log = ''; pos = 0; kind = ''; inH = 0; outH = 0; ratio = ''; xessVer = ''; dlssReady = $false; force4k = $false; native = 0; logPreset = '' } }
+Reset-Scale
+function Get-ScaleModeName([string]$label) {
+	$mode = ($label -split ' ', 2)[1]
+	if (-not $mode) { return '' }
+	return ($mode -replace 'U\.cal\.\+', 'Ultra calidad+' -replace 'U\.calidad', 'Ultra calidad' -replace 'Equilib\.', 'Equilibrado' -replace 'U\.rendim\.', 'Ultra rendimiento' -replace 'Rendim\.', 'Rendimiento')
+}
+function Update-ScaleLog {
+	if (-not $LogDir -or -not (Test-Path $LogDir)) { return }
 	$log = Get-ChildItem -Path $LogDir -Filter "*.out.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-	if (-not $log) { return $null }
-	if ($log.FullName -ne $script:scaleLog) { $script:scaleLog = $log.FullName; $script:scalePos = 0; $script:scaleText = $null; $script:outH = 0; $script:force4k = $false }
+	if (-not $log) { return }
+	if ($log.FullName -ne $script:sc.log) { Reset-Scale; $script:sc.log = $log.FullName }
 	try {
 		$fs = [System.IO.File]::Open($log.FullName, 'Open', 'Read', 'ReadWrite')
-		if ($fs.Length -lt $script:scalePos) { $script:scalePos = 0 }
-		$fs.Seek($script:scalePos, 'Begin') | Out-Null
-		$take = [Math]::Min($fs.Length - $script:scalePos, 8MB)
+		if ($fs.Length -lt $script:sc.pos) { $script:sc.pos = 0 }
+		$fs.Seek($script:sc.pos, 'Begin') | Out-Null
+		$take = [int][Math]::Min($fs.Length - $script:sc.pos, 8MB)
 		$buf = New-Object byte[] $take
-		$n = $fs.Read($buf, 0, $take); $script:scalePos += $n
+		$n = $fs.Read($buf, 0, $take); $script:sc.pos += $n
 		$fs.Close()
+		if ($n -le 0) { return }
 		$text = [System.Text.Encoding]::UTF8.GetString($buf, 0, $n)
-		# (10-22) Modo 4K: la salida es 2160 (KYTY_DISPLAY_HEIGHT), no la altura del monitor.
-		$d = [regex]::Matches($text, 'on a (\d{3,4}) high display')
-		if ($d.Count -gt 0) { $script:outH = [int]$d[$d.Count - 1].Groups[1].Value }
-		if ($text -match 'starts in its cinematic mode \(KYTY_DS_FORCE_MODE') { $script:force4k = $true; if (-not $script:outH) { $script:outH = 2160 } }
+		$m = [regex]::Matches($text, 'KYTY_UPSCALE_RATIO=([0-9.]+) on a (\d{3,4}) high display: (\d{3,4})')
+		if ($m.Count -gt 0) { $l = $m[$m.Count - 1]; $script:sc.ratio = $l.Groups[1].Value; $script:sc.outH = [int]$l.Groups[2].Value; $script:sc.inH = [int]$l.Groups[3].Value }
+		else {
+			# (10-22) Modo 4K: la salida es 2160 (KYTY_DISPLAY_HEIGHT), no la altura del monitor.
+			$d = [regex]::Matches($text, 'on a (\d{3,4}) high display')
+			if ($d.Count -gt 0) { $script:sc.outH = [int]$d[$d.Count - 1].Groups[1].Value }
+		}
+		if ($text -match 'starts in its cinematic mode \(KYTY_DS_FORCE_MODE') { $script:sc.force4k = $true; if (-not $script:sc.outH) { $script:sc.outH = 2160 } }
+		if ($text -match 'DLSS super resolution[^\r\n]*ready') { $script:sc.dlssReady = $true; $script:sc.kind = 'DLSS' }
+		$x = [regex]::Match($text, 'XeSS: libxess\.dll ([0-9.]+) loaded')
+		if ($x.Success) { $script:sc.xessVer = $x.Groups[1].Value; if (-not $script:sc.kind) { $script:sc.kind = 'XeSS' } }
+		$p = [regex]::Matches($text, 'DLSS[^\r\n]*?(?:preset|model[o]?)[ =:]+([A-Z])\b')
+		if ($p.Count -gt 0) { $script:sc.logPreset = $p[$p.Count - 1].Groups[1].Value }
 		$m = [regex]::Matches($text, '(DLSS|XeSS|FSR 3\.1)[^\r\n]*?(\d{3,4})x(\d{3,4}) -> (\d{3,4})x(\d{3,4})')
 		for ($i = $m.Count - 1; $i -ge 0; $i--) {
 			$h = [int]$m[$i].Groups[3].Value
-			if ($h -ge 600) {
-				$kind = $m[$i].Groups[1].Value -replace ' 3\.1', ''
-				if (-not $script:screenH) { $script:screenH = (Get-CimInstance Win32_VideoController | Where-Object { $_.CurrentVerticalResolution } | Select-Object -First 1).CurrentVerticalResolution;  }
-				$screen = $(if ($script:outH) { $script:outH } else { $script:screenH })  # (resolucion real: Screen.Bounds daba 960 con el escalado de Windows al 150 %)
-				$script:scaleText = ("{0}{1} {2}p -> {3}p" -f $kind, (Get-ScaleMode), $h, $screen)
-				break
-			}
-		if (-not $script:scaleText -and $script:force4k) { $script:scaleText = 'Nativo 2160p (4K)' }
-		if (-not $script:scaleText) {
-			# Sin reescalador: la resolucion a la que dibuja el juego (con TURBO, 1080 aunque pongas 1440).
-			$n = [regex]::Matches($text, 'performance mode renders (\d{3,4})x(\d{3,4})')
-			if ($n.Count -gt 0) {
-				if (-not $script:screenH) { $script:screenH = (Get-CimInstance Win32_VideoController | Where-Object { $_.CurrentVerticalResolution } | Select-Object -First 1).CurrentVerticalResolution;  }
-				$script:scaleText = ("Nativo {0}p -> {1}p" -f $n[$n.Count - 1].Groups[2].Value, $script:screenH)
-			}
+			if ($h -ge 600) { $script:sc.kind = $m[$i].Groups[1].Value -replace ' 3\.1', ''; $script:sc.inH = $h; if (-not $script:sc.outH) { $script:sc.outH = [int]$m[$i].Groups[5].Value }; break }
 		}
-		}
+		# Sin reescalador: la resolucion a la que dibuja el juego (con TURBO, 1080 aunque pongas 1440).
+		$r = [regex]::Matches($text, 'performance mode renders (\d{3,4})x(\d{3,4})')
+		if ($r.Count -gt 0) { $script:sc.native = [int]$r[$r.Count - 1].Groups[2].Value }
 	} catch { }
-	return $script:scaleText
+}
+# Devuelve @{ kind; mode; res; model } para las filas Reescalado / Resolucion / Modelo.
+function Get-Scale($ini) {
+	Update-ScaleLog
+	$s = $script:sc
+	$lbl = "$($ini['scalelabel'])"
+	$lk = ($lbl -split ' ', 2)[0]
+	$kind = $s.kind
+	if (-not $kind -and $lk -in 'DLSS', 'XeSS', 'FSR') { $kind = $lk }
+	if (-not $script:screenH) { try { $script:screenH = (Get-CimInstance Win32_VideoController | Where-Object { $_.CurrentVerticalResolution } | Select-Object -First 1).CurrentVerticalResolution } catch { } ; if (-not $script:screenH) { $script:screenH = $scr.Height } }
+	$outH = if ($s.outH) { $s.outH } else { $script:screenH }
+	$r = @{ kind = ''; mode = ''; res = ''; model = '' }
+	if ($kind) {
+		$r.kind = $kind
+		if ($lk -eq $kind) { $r.mode = Get-ScaleModeName $lbl }
+		$inH = $s.inH
+		if (-not $inH -and $lk -eq $kind -and $s.ratio) { $inH = [int][Math]::Round($outH / [double]::Parse($s.ratio, [System.Globalization.CultureInfo]::InvariantCulture)) }
+		$ratio = if ($s.ratio) { " (x$($s.ratio))" } elseif ($inH) { " (x{0:0.##})" -f ($outH / [double]$inH) } else { '' }
+		$r.res = if ($inH) { "{0}p $ARROW {1}p{2}" -f $inH, $outH, $ratio } else { "$ARROW ${outH}p" }
+		switch ($kind) {
+			'DLSS' {
+				$pk = $s.logPreset
+				if (-not $pk) { $pi2 = 0; [void][int]::TryParse("$($ini['dlsspreset'])", [ref]$pi2); $pk = @('', 'K', 'L', 'M')[[Math]::Min([Math]::Max(0, $pi2), 3)] }
+				$r.model = switch ($pk) { 'K' { 'K (Transformer, DLSS 4)' } 'L' { 'L (Transformer, DLSS 4.5)' } 'M' { 'M (Transformer, DLSS 4.5)' } '' { 'auto (NVIDIA)' } default { "$pk" } }
+				if (-not $s.dlssReady -and -not $s.inH) { $r.model += ' ...' }
+			}
+			'XeSS' { $r.model = if ($s.xessVer) { "XeSS $($s.xessVer)" } else { 'XeSS' } }
+			'FSR'  { $r.model = 'FSR 3.1' }
+		}
+	} elseif ($s.force4k) { $r.kind = 'Nativo'; $r.res = '2160p (4K)' }
+	elseif ($lbl -like '*juego*') { $h = ($lbl -split 'p', 2)[0]; $r.kind = 'Juego'; $r.res = "{0}p $ARROW {1}p" -f $h, $outH; $r.model = 'reescalado del juego' }
+	elseif ($s.native) { $r.kind = 'Nativo'; $r.res = "{0}p $ARROW {1}p" -f $s.native, $outH }
+	elseif ($lbl) { $r.kind = $lbl }
+	return $r
 }
 
+$cGreen = [System.Drawing.Color]::LimeGreen; $cRed = [System.Drawing.Color]::Red; $cBlue = [System.Drawing.Color]::DeepSkyBlue
+$cOrange = [System.Drawing.Color]::Orange; $cWhite = [System.Drawing.Color]::White; $cKhaki = [System.Drawing.Color]::Khaki
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
 $timer.Add_Tick({
@@ -252,9 +367,8 @@ $timer.Add_Tick({
 	$emu = Get-Process -Name 'kyty_emulator*' -ErrorAction SilentlyContinue
 	$emuWin = $emu | Where-Object { $_.MainWindowHandle -ne 0 }
 	# (Despues de que salga la ventana del juego: antes reserva su memoria de golpe, y con el limite ya puesto fallaba.)
-	$emuW = $emu | Where-Object { $_.MainWindowHandle -ne 0 }
-	if ($RamGB -gt 0 -and $emuW) {
-		$p = $emuW | Select-Object -First 1
+	if ($RamGB -gt 0 -and $emuWin) {
+		$p = $emuWin | Select-Object -First 1
 		if ($p.Id -ne $script:limitedPid) {
 			$max = [uint64](($RamGB - 4) * 1GB)
 			$ok = [RamLimit]::SetProcessWorkingSetSizeEx($p.Handle, [UIntPtr][uint64]200MB, [UIntPtr]$max, 6)
@@ -263,34 +377,41 @@ $timer.Add_Tick({
 	}
 	if ($emuWin) { $script:emuSeen = $true; $script:emuGone = 0 }
 	elseif ($script:emuSeen) { $script:emuGone++; if ($script:emuGone -ge 2) { $form.Close(); return } }
-	$lines = @()
+	Update-Clocks
+	$ini = Read-Ini
+	$rows = New-Object System.Collections.Generic.List[object]
 	if ($smi) {
-		$q = & $smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>$null | Select-Object -First 1
+		$q = & $smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,clocks.gr --format=csv,noheader,nounits 2>$null | Select-Object -First 1
 		if ($q) {
 			$v = $q -split ',\s*'
 			$gpu = [int]$v[0]; $used = [int]$v[1]; $total = [int]$v[2]; $temp = [int]$v[3]
+			$gclk = 0; if ($v.Count -gt 4) { [void][int]::TryParse($v[4], [ref]$gclk) }
 			if ($VramMB -gt 0 -and $VramMB -lt $total) {
 				$reserved = $total - $VramMB
 				$shown = [Math]::Max(0, $used - $reserved)
 				$max = $VramMB
 			} elseif ($MaxMB -gt 0) { $shown = $used; $max = $MaxMB } else { $shown = $used; $max = $total }
-			$lines += ("GPU   {0,3} %  {1} C" -f $gpu, $temp)
-			$lines += ("VRAM  {0:N1} / {1:N0} GB" -f ($shown / 1024.0), ($max / 1024.0))
-			if ($shown -gt $max) { $label.ForeColor = [System.Drawing.Color]::Red } else { $label.ForeColor = [System.Drawing.Color]::Orange }
+			$rows.Add(@('GPU', ("{0,3} %   {1} C" -f $gpu, $temp), $cOrange))
+			if ($gclk -gt 0) { $rows.Add(@('GPU reloj', ("{0,4} MHz" -f $gclk), $cOrange)) }
+			$rows.Add(@('VRAM', ("{0:N1} / {1:N0} GB" -f ($shown / 1024.0), ($max / 1024.0)), $(if ($shown -gt $max) { $cRed } else { $cOrange })))
 		}
-	} else { $lines += "GPU   (sin nvidia-smi)" }
+	} else {
+		$rows.Add(@('GPU', $(if ($script:clk.gpuUse -ne $null) { "{0,3} %" -f $script:clk.gpuUse } else { '(sin nvidia-smi)' }), $cOrange))
+		if ($script:isAmd) { $rows.Add(@('GPU reloj', 'n/a', $cOrange)) }
+	}
 	try {
 		$cpu = (Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'").PercentProcessorTime
 		$os = Get-CimInstance Win32_OperatingSystem
 		$ramUsed = ($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB
 		$ramTotal = $os.TotalVisibleMemorySize / 1MB
-		$lines += ("CPU   {0,3} %" -f $cpu)
+		$rows.Add(@('CPU', ("{0,3} %" -f $cpu), $cOrange))
+		if ($script:clk.cpuMHz) { $rows.Add(@('CPU reloj', ("{0,4} MHz" -f $script:clk.cpuMHz), $cOrange)) }
 		if ($RamGB -gt 0) {
-			$ws = 0; $e2 = Get-Process -Name 'kyty_emulator*' -ErrorAction SilentlyContinue | Select-Object -First 1
+			$ws = 0; $e2 = $emu | Select-Object -First 1
 			if ($e2) { $ws = $e2.WorkingSet64 / 1GB }
-			$lines += ("RAM   {0:N1} / {1} GB{2}" -f ($ws + 4), $RamGB, $(if ($script:limitedPid -and -not $script:limitOk) { ' (sin limite!)' } else { '' }))
+			$rows.Add(@('RAM', ("{0:N1} / {1} GB{2}" -f ($ws + 4), $RamGB, $(if ($script:limitedPid -and -not $script:limitOk) { ' (sin limite!)' } else { '' })), $cOrange))
 		} else {
-			$lines += ("RAM   {0:N1} / {1:N0} GB" -f $ramUsed, $ramTotal)
+			$rows.Add(@('RAM', ("{0:N1} / {1:N0} GB" -f $ramUsed, $ramTotal), $cOrange))
 		}
 	} catch { }
 	$shownFps = $null
@@ -298,7 +419,7 @@ $timer.Add_Tick({
 	if ($fps) {
 		$shownFps = if ($fps.fgShown) { $fps.fgShown } elseif ($fps.fps) { $fps.fps } else { $null }
 		if ($fps.mean) {
-			$lines += ("Frame {0:N1} ms" -f $fps.mean)
+			$rows.Add(@('Frame', ("{0:N1} ms" -f $fps.mean), $cOrange))
 			if ($fps.key -ne $script:lastKey) {
 				$script:lastKey = $fps.key
 				$script:ft.Add($fps.mean); $script:ftMax.Add($fps.max)
@@ -306,43 +427,41 @@ $timer.Add_Tick({
 			}
 		}
 	}
-	$sc = Get-Scale
-	if ($sc) {
-		# (10-22) Modelo de DLSS elegido en el lanzador (dlsspreset: 0 auto, 1 K, 2 L, 3 M).
-		$model = ''
-		if ($sc -like 'DLSS*') {
-			try { $pl = Get-Content (Join-Path (Split-Path $LogDir -Parent) 'launcher.ini') -ErrorAction Stop | Where-Object { $_ -like 'dlsspreset=*' } | Select-Object -First 1; $pi = if ($pl) { [int]$pl.Substring(11) } else { 0 } } catch { $pi = 0 }
-			$model = ' (modelo ' + @('auto', 'K', 'L', 'M')[[math]::Min([math]::Max(0, $pi), 3)] + ')'
-		}
-		$scaleLabel.Text = "Escala $sc$model"
-		$scaleLabel.ForeColor = if ($sc -like 'DLSS*') { [System.Drawing.Color]::LimeGreen } elseif ($sc -like 'FSR*') { [System.Drawing.Color]::Red } elseif ($sc -like 'XeSS*') { [System.Drawing.Color]::DeepSkyBlue } else { [System.Drawing.Color]::Orange }
-	} else { $scaleLabel.Text = '' }
-	$fgName = ''
-	try { $l = Get-Content (Join-Path (Split-Path $LogDir -Parent) 'launcher.ini') -ErrorAction Stop | Where-Object { $_ -like 'fglabel=*' } | Select-Object -First 1; if ($l) { $fgName = $l.Substring(8) } } catch { }
-	if ($fgName -and $fgName -ne 'Sin frame generation') {
-		$mult = if ($fps -and $fps.fgMult) { " (ahora x$($fps.fgMult))" } else { '' }
-		$fgModel = if ($fgName -match 'DLSS|Nvidia') { ' (modelo C)' } else { '' }
-		$fgLabel.Text = $(if ($fgName -like 'MODO *') { $fgName } else { "FG $fgName$fgModel$mult" })
-		$fgLabel.ForeColor = if ($fgName -match 'DLSS|Nvidia') { [System.Drawing.Color]::LimeGreen } else { [System.Drawing.Color]::Red }
-	} else { $fgLabel.Text = '' }
-	$gfx = @()
-	try {
-		$ini = Get-Content (Join-Path (Split-Path $LogDir -Parent) 'launcher.ini') -ErrorAction Stop
-		$names = @('Maximo', 'Medio', 'Bajo')
-		foreach ($pair in @(@('gfxtex', 'Texturas'), @('gfxdist', 'Distancia de dibujado'), @('gfxshadow', 'Sombras'))) {
-			$l = $ini | Where-Object { $_ -like "$($pair[0])=*" } | Select-Object -First 1
-			$v = 0; if ($l) { [void][int]::TryParse($l.Substring($pair[0].Length + 1), [ref]$v) }
-			$gfx += "$($pair[1]) $($names[[math]::Min([math]::Max($v, 0), 2)])"
-		}
-	} catch { }
-	$gfxLabel.Text = ($gfx -join ', ')
 	Update-Ls
-	if ($script:lsFps) { $lines += ("FPS LS {0}" -f $script:lsFps) }
-	$graph.Invalidate()
-	$label.Text = ($lines -join "`n")
-	$fpsLabel.Text = $(if ($fps -and $shownFps) { "FPS $shownFps" } else { '' })
+	if ($script:lsFps) { $rows.Add(@('FPS LS', "$($script:lsFps)", $cOrange)) }
+	# Reescalador en su color: DLSS (NVIDIA) verde, FSR (AMD) rojo, XeSS (Intel) azul.
+	$sc = Get-Scale $ini
+	if ($sc.kind) {
+		$col = switch ($sc.kind) { 'DLSS' { $cGreen } 'FSR' { $cRed } 'XeSS' { $cBlue } default { $cOrange } }
+		$rows.Add(@('Escala', ($(if ($sc.mode) { $sc.kind + $DOT + $sc.mode } else { $sc.kind })), $col))
+		if ($sc.res) { $rows.Add(@('Resol.', $sc.res, $col)) }
+		if ($sc.model) { $rows.Add(@('Modelo', $sc.model, $col)) }
+	}
+	# Frame generation: el modo del lanzador y el multiplicador que lleva ahora (DLSS verde, AMD rojo).
+	$fgName = "$($ini['fglabel'])"
+	$fgNv = $fgName -match 'DLSS|Nvidia'
+	if ($fgName -and $fgName -ne 'Sin frame generation') {
+		$fgCol = if ($fgNv) { $cGreen } else { $cRed }
+		if ($fgName -like 'MODO *') { $rows.Add(@('', $fgName, $fgCol)) }
+		else {
+			$rows.Add(@('FG', ($fgName + $(if ($fgNv) { ' (modelo C)' } else { '' })), $fgCol))
+			if ($fps -and $fps.fgMult) { $rows.Add(@('FG ahora', "x$($fps.fgMult)", $fgCol)) }
+		}
+	}
+	# Opciones graficas del lanzador (Maximo / Medio / Bajo).
+	$names = @('Maximo', 'Medio', 'Bajo')
+	foreach ($pair in @(@('gfxtex', 'Texturas'), @('gfxdist', 'Distancia'), @('gfxshadow', 'Sombras'))) {
+		if (-not $ini.ContainsKey($pair[0]) -and $ini.Count -eq 0) { continue }
+		$v = 0; [void][int]::TryParse("$($ini[$pair[0]])", [ref]$v)
+		$rows.Add(@($pair[1], $names[[math]::Min([math]::Max($v, 0), 2)], $cKhaki))
+	}
+	$script:rows = $rows.ToArray()
+	$script:fpsText = $(if ($fps -and $shownFps) { "FPS $shownFps" } else { '' })
 	# FPS en el color del frame generation: verde NVIDIA, rojo AMD, blanco sin frame generation.
-	$fpsLabel.ForeColor = if ($fgName -and $fgName -ne 'Sin frame generation') { if ($fgName -match 'DLSS|Nvidia') { [System.Drawing.Color]::LimeGreen } else { [System.Drawing.Color]::Red } } else { [System.Drawing.Color]::White }
+	$script:fpsColor = if ($fgName -and $fgName -ne 'Sin frame generation') { if ($fgNv) { $cGreen } else { $cRed } } else { $cWhite }
+	Measure-Layout
+	$label.Invalidate(); $graph.Invalidate()
 })
+$form.Add_Shown({ Measure-Layout; $label.Invalidate() })
 $timer.Start()
 [System.Windows.Forms.Application]::Run($form)
