@@ -115,7 +115,7 @@ void StartMemoryBreakdown();
 // Tagged commit (shown in the "Private breakdown:" line as "tagged:"): what the emulator's big allocation sites
 // asked for and how much the process's private commit grew across each call (a delta of PrivateUsage, so other
 // threads' allocations meanwhile are noise). Vulkan memory (vma.cpp wraps vkAllocateMemory/vkFreeMemory) by kind,
-// C++ new of 1 MiB or more by caller. On with the breakdown (KYTY_MEMORY_BREAKDOWN_SECONDS != 0).
+// C++ new of 1 MiB or more by caller. Only with KYTY_MEMORY_TAGS=1 (default off).
 enum MemoryTag : int {
 	MemoryTagVulkanDeviceLocal = 0, // device-local types (what NVIDIA's Windows driver may also charge to commit)
 	MemoryTagVulkanHost,            // host-visible types without device-local (staging rings, readback)
