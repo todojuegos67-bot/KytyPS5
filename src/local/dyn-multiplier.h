@@ -7,8 +7,11 @@
 // - free[m]: the real rate last measured at multiplier m (EMA, not sitting on the target / m cap); the rate at m + 1
 //   is estimated as 1 / (1 / free[m] + cost), cost = measured seconds per extra generated frame (from switches),
 //   8% of the frame until one was measured.
-// - Minimum real fps per multiplier: x2 30, x3 40, x4 45, x5/x6 50; never up when the estimate for m + 1 is below its
-//   minimum, down at once when real falls below the current one's; m only where target / m >= its minimum.
+// - Minimum real fps per multiplier: x2 30, x3 40, x4 45, x5/x6 50; never up when real (or the estimate) is below the
+//   next one's, down after 2 windows in a row below the current one's; m only where target / m >= its minimum. A
+//   window under 60% of the one before (hitch, loading) is ignored.
+// - Up at once when real * (m + 1) <= 1.03 target (the game's own 56-60 cap keeps real), or after 5 s under 90% of
+//   the target (a probe; the check below reverts it); otherwise on the estimate.
 // - Up one level at a time, only when it shows >= 5% more (min(real * m, target)); 2 windows after a step up, the
 //   shown rate is checked against the one before: not >= 5% higher (or real under the minimum) -> back down and that
 //   level blocked for 10 s. The level that reaches the target with real capped by <= 10% is preferred (60 real on
@@ -32,6 +35,8 @@ struct DynMultiplier {
 	double check_real = 0.0, check_shown = 0.0;
 	int    pinned = 0, noup = 0, up_n = 0;
 	double last_free = 0.0;                // the free estimate of the current level (log)
+	double prev_real = 0.0;                // the window before (hitch test)
+	int    low_n = 0, short_n = 0;         // windows in a row under the level's minimum / under 90% of the target
 
 	static double MinReal(int m) { return m <= 2 ? 30.0 : m == 3 ? 40.0 : m == 4 ? 45.0 : 50.0; }
 
@@ -63,6 +68,13 @@ struct DynMultiplier {
 			last_free = Estimate(m, real, m);
 			return m;
 		}
+		// A hitch or loading (real under 60% of the window before): nothing learned or decided on it.
+		const double before = prev_real;
+		prev_real           = real;
+		if (before > 0.0 && real < 0.6 * before) {
+			last_free = Estimate(m, before, m);
+			return m;
+		}
 		// Measure: an EMA of the free rate (a window on the cap is only a lower bound).
 		if (!on_cap || free[m] < real) free[m] = (free[m] > 0.0 && age[m] < 30 && !on_cap) ? 0.5 * free[m] + 0.5 * real : real;
 		age[m]    = 0;
@@ -70,28 +82,33 @@ struct DynMultiplier {
 		for (int k = m + 1; k <= kMax; ++k)
 			if (free[k] > 0.0 && free[k] < 0.75 * real) free[k] = 0.0;
 		last_free = free[m];
+		low_n     = real < MinReal(m) ? low_n + 1 : 0;
+		short_n   = std::min(real * m, T) < 0.9 * T ? short_n + 1 : 0;
 		auto go = [&](int to) {
-			settle = 1;
-			up_n   = 0;
-			pinned = 0;
+			settle  = 1;
+			up_n    = 0;
+			pinned  = 0;
+			low_n   = 0;
+			short_n = 0;
 			return to;
 		};
-		// A step up under test: keep it only with >= 5% more shown and real at the level's minimum.
+		// A step up under test: kept with >= 5% more shown (or >= 97% of the target) and real at the level's minimum.
 		if (check_from != 0) {
 			const int from = check_from;
 			check_from     = 0;
 			const double shown = std::min(real * m, T);
-			if (real > 0.0 && check_real > 0.0) {
+			if (real > 0.0 && check_real > 0.0 && real >= 0.7 * check_real) { // (a larger drop is not a frame's cost)
 				const double c = (1.0 / real - 1.0 / check_real) / std::max(m - from, 1);
 				if (c > 0.0) cost = cost > 0.0 ? 0.5 * cost + 0.5 * c : c;
 			}
 			if ((shown < 1.05 * check_shown && shown < 0.97 * T) || real < MinReal(m)) {
 				block[m] = 10;
+				free[m]  = 0.0;
 				return go(from);
 			}
 		}
-		// Down at once below the level's minimum (to the largest lower level whose known rate meets its own).
-		if (m > 2 && (real < MinReal(m) || m > maxm)) {
+		// Down after 2 windows in a row below the level's minimum (to the largest lower level whose known rate meets its own).
+		if (m > 2 && (low_n >= 2 || m > maxm)) {
 			int to = std::min(m - 1, maxm);
 			while (to > 2 && free[to] > 0.0 && age[to] < 30 && free[to] < MinReal(to)) --to;
 			return go(to);
@@ -101,19 +118,23 @@ struct DynMultiplier {
 			noup = 10;
 			return go(m - 1);
 		}
-		// Up one level: room under the target, the estimate meets the minimum and shows >= 5% more.
 		const int up = m + 1;
-		if (up <= maxm && noup == 0 && block[up] == 0 && real * m < 0.97 * T) {
-			const double est = Estimate(up, real, m);
-			// Reaching the target with real capped by at most ~10% (60 -> 56 for x4 = 224) is preferred.
-			const bool reach = real * up >= T && T / up >= 0.9 * real;
-			if (est >= MinReal(up) && (reach || std::min(est * up, T) >= 1.05 * std::min(real * m, T))) {
-				if (++up_n >= 2) {
-					check_from  = m;
-					check_real  = real;
-					check_shown = std::min(real * m, T);
-					return go(up);
-				}
+		if (up <= maxm && block[up] == 0 && real * m < 0.97 * T && real >= MinReal(up)) {
+			auto take = [&] {
+				check_from  = m;
+				check_real  = real;
+				check_shown = std::min(real * m, T);
+				return go(up);
+			};
+			// The real rate is the game's own cap (56-60): the next level within target * 1.03 keeps it, so no estimate.
+			// Under 90% of the target for 5 s with real meeting the next level's minimum: probe it (the check reverts).
+			if (real * up <= 1.03 * T || (short_n >= 5 && noup == 0)) return take();
+			// Otherwise the estimate: meets the minimum and shows >= 5% more, or reaches the target with real capped by
+			// at most ~10% (60 -> 56 for x4 = 224).
+			const double est   = Estimate(up, real, m);
+			const bool   reach = real * up >= T && T / up >= 0.9 * real;
+			if (noup == 0 && est >= MinReal(up) && (reach || std::min(est * up, T) >= 1.05 * std::min(real * m, T))) {
+				if (++up_n >= 2) return take();
 				return m;
 			}
 		}
