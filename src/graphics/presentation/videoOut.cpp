@@ -28,6 +28,7 @@
 #include "loader/systemContent.h"
 #include "local/fsr3-fg.h"
 #include "local/frame-gen.h"
+#include "local/anti-lag.h"
 
 #include <algorithm>
 #include <array>
@@ -238,6 +239,7 @@ private:
 		FlipRequestSource           source;
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
+		uint64_t                    latency_index; // KYTY_ANTILAG: the frame's index (local/anti-lag.h), 0 none
 	};
 
 	Graphics::Presenter& m_presenter;
@@ -1295,6 +1297,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	r.submit_time = std::chrono::steady_clock::now();
 	r.source     = source;
 	r.state      = RequestState::Reserved;
+	r.latency_index = Graphics::AntiLag::OnFlipReserved(); // KYTY_ANTILAG (local/anti-lag.h)
 
 	pending.push_back(r);
 	request_id = r.id;
@@ -1783,6 +1786,7 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	r.cfg->mutex.Unlock();
 
 	NoteFlipSubmitted(r.submit_time);
+	Graphics::Presenter::SetLatencyIndex(*r.frame, r.latency_index);
 	m_presenter.Submit(*r.frame);
 
 	r.cfg->mutex.Lock();

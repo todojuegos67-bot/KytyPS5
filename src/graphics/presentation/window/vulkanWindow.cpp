@@ -43,6 +43,7 @@
 #include "frame-gen.h"
 #include "local/xess-sr.h"
 #include "local/fsr3-fg.h"
+#include "local/anti-lag.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -1065,6 +1066,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		fault_features.pNext       = const_cast<void*>(create_info.pNext);
 		create_info.pNext          = &fault_features;
 	}
+	const bool anti_lag_extension = HasExtension(device_extensions, Libs::Graphics::AntiLag::ExtensionName());
+	create_info.pNext = Libs::Graphics::AntiLag::ChainDeviceFeatures(anti_lag_extension, const_cast<void*>(create_info.pNext));
 	// XeSS (KYTY_UPSCALE=xess): its mutableDescriptorType feature, with its extension.
 	create_info.pNext = Libs::Graphics::Xess::ChainDeviceFeatures(device_extensions, const_cast<void*>(create_info.pNext));
 	create_info.flags                   = {};
@@ -1097,6 +1100,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		return nullptr;
 	}
 	if (fault_extension) DeviceFault::Enable(device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+	Libs::Graphics::AntiLag::OnDevice(device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr, anti_lag_extension);
 
 	return device;
 }
@@ -1595,6 +1599,9 @@ void WindowContext::CreateVulkan() {
 			                                          device_extensions);
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
+		// KYTY_ANTILAG=1: AMD Anti-Lag 2 where the device has it (local/anti-lag.h).
+		if (Libs::Graphics::AntiLag::Requested() && HasExtension(available_extensions, Libs::Graphics::AntiLag::ExtensionName()))
+			device_extensions.push_back(Libs::Graphics::AntiLag::ExtensionName());
 	}
 
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
@@ -1777,6 +1784,9 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 		}
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
+		// KYTY_ANTILAG=1: AMD Anti-Lag 2 where the device has it (local/anti-lag.h).
+		if (Libs::Graphics::AntiLag::Requested() && HasExtension(available_extensions, Libs::Graphics::AntiLag::ExtensionName()))
+			device_extensions.push_back(Libs::Graphics::AntiLag::ExtensionName());
 	}
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
 	const VulkanExtensions no_layers {};

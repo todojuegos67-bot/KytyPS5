@@ -85,6 +85,7 @@ param(
 	[switch]$NoAsyncShaders,
 	[switch]$FlipWhenReady,
 	[switch]$Fsr3FrameGen,
+	[switch]$AntiLag,
 	[switch]$Turbo,
 	[switch]$Turbo2,
 	[switch]$ExclusiveFullscreen,
@@ -470,6 +471,10 @@ if ($FlipWhenReady) { $environment['KYTY_FLIP_WHEN_READY'] = '1' }
 # -Fsr3FrameGen: AMD FSR 3 frame generation x2 (src/local/fsr3-fg.cpp; amd_fidelityfx_vk.dll next to the emulator), on
 # only while the game renders its 3D scene (its TAA pass); movies, menus and loading screens are shown as they are.
 if ($Fsr3FrameGen) { $environment['KYTY_FSR3_FG'] = '1' }
+# -AntiLag: low latency (src/local/anti-lag.h): AMD Anti-Lag 2 where the driver has VK_AMD_anti_lag, else the
+# emulator's limiter (one frame queued). Works with -Fsr3FrameGen and KYTY_FLIP_FPS (8 GB mode: 30 real x2); off with
+# DLSS / DLSS-G (Reflex).
+if ($AntiLag) { $environment['KYTY_ANTILAG'] = '1' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 # Async shaders (renderDraw.cpp, KYTY_ASYNC_DRAW_PIPELINES): a draw whose pipeline is not compiled yet does
 # not stop the frame; a worker compiles it and the object appears a few frames later. -NoAsyncShaders: off.

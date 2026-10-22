@@ -19,6 +19,7 @@
 #endif
 #include "frame-gen.h"
 #include "local/fsr3-fg.h"
+#include "local/anti-lag.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
 #if defined(_WIN32)
@@ -61,6 +62,7 @@ struct Presenter::Frame {
 	bool                   hdr          = false; // BT.2100 PQ pixels
 	bool                   blank        = false; // a cleared frame (no guest picture)
 	bool                   scene        = false; // the game's 3D view (FrameGen::TakeScene)
+	uint64_t               latency_index = 0;    // KYTY_ANTILAG (local/anti-lag.h)
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -1601,6 +1603,10 @@ bool Presenter::IsSceneFrame(const Frame& frame) noexcept {
 	return frame.scene;
 }
 
+void Presenter::SetLatencyIndex(Frame& frame, uint64_t index) noexcept {
+	frame.latency_index = index;
+}
+
 bool Presenter::GeneratesFrames() noexcept {
 	return FrameGen::Enabled() || Fsr3::Active();
 }
@@ -1711,6 +1717,12 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			// refresh of the last frame; generation off for it).
 			Fsr3::BeforePresent(m_impl->window.graphic_ctx, frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
 			                    swapchain.Handle(), swapchain.Extent(), swapchain.Format());
+		}
+		// KYTY_ANTILAG: the frame's PRESENT mark (a new guest frame only; with FSR 3 frame generation this is the real
+		// frame going to its swapchain, never one it generates).
+		if (!reuse && !frame.reusing_last) {
+			AntiLag::OnPresent(frame.latency_index);
+			frame.latency_index = 0;
 		}
 		status = swapchain.Present();
 		if (generate) {

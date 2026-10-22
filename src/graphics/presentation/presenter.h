@@ -61,6 +61,8 @@ public:
 	[[nodiscard]] static bool IsSceneFrame(const Frame& frame) noexcept;
 	// Frame generation is on: it paces the frames it makes from the intervals between the game's (videoOut.cpp).
 	[[nodiscard]] static bool GeneratesFrames() noexcept;
+	// KYTY_ANTILAG: the guest frame's index (its flip), for its PRESENT mark.
+	static void               SetLatencyIndex(Frame& frame, uint64_t index) noexcept;
 	void                         Discard(Frame& frame);
 
 private:
