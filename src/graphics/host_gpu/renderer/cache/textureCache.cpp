@@ -5012,6 +5012,23 @@ void TextureCache::RunGarbageCollector() {
 		// Where the video memory goes (VMA's allocations by memory kind, the driver's own) and the buffer cache's
 		// share: on a 16 GB card the use climbed past the 10 GB budget while the texture collector deleted images.
 		std::printf("Buffer cache: %llu MiB registered\n", static_cast<unsigned long long>(m_buffer_cache.CacheBytes() >> 20u));
+		// The commit side (16 GB PCs rebooted at the commit limit, not at full RAM): the system's charge and limit,
+		// and the guest backing store's share of it (0 when it is file-backed: KYTY_BACKING_FILE).
+		{
+			const auto commit  = LocalPlatform::SystemCommit();
+			const char* file   = std::getenv("KYTY_BACKING_FILE");
+			const char* demand = std::getenv("KYTY_BACKING_ON_DEMAND");
+			const bool  in_file = file != nullptr && file[0] != '\0' && !(file[0] == '0' && file[1] == '\0');
+			std::printf("Commit: system %llu of %llu MiB; emulator private %llu MiB, working set %llu MiB, Vulkan system "
+			            "RAM %llu MiB, buffer cache %llu MiB; guest backing %s (13824 MiB store)\n",
+			            static_cast<unsigned long long>(commit.total >> 20u),
+			            static_cast<unsigned long long>(commit.limit >> 20u),
+			            static_cast<unsigned long long>(private_bytes >> 20u), static_cast<unsigned long long>(working_set >> 20u),
+			            static_cast<unsigned long long>(m_graphics.GetHostMemoryUsage() >> 20u),
+			            static_cast<unsigned long long>(m_buffer_cache.CacheBytes() >> 20u),
+			            in_file ? "file (see the Guest memory line at launch)"
+			            : (demand != nullptr && demand[0] == '1') ? "page file, on demand" : "page file, all committed");
+		}
 		m_graphics.LogVideoMemory("30 s");
 		std::fflush(stdout);
 	}

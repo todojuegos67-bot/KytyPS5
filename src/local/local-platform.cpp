@@ -1545,6 +1545,13 @@ bool WriteAllocTrace(const char* path) {
 	return true;
 }
 
+CommitUse SystemCommit() {
+	PERFORMANCE_INFORMATION info {};
+	info.cb = sizeof(info);
+	if (K32GetPerformanceInfo(&info, sizeof(info)) == 0) return {};
+	return {static_cast<uint64_t>(info.CommitTotal) * info.PageSize, static_cast<uint64_t>(info.CommitLimit) * info.PageSize};
+}
+
 MemoryUse ProcessMemory() {
 	PROCESS_MEMORY_COUNTERS_EX counters {};
 	counters.cb = sizeof(counters);
@@ -2003,6 +2010,10 @@ bool StartAllocTrace(const char*) {
 
 bool WriteAllocTrace(const char*) {
 	return false;
+}
+
+CommitUse SystemCommit() {
+	return {};
 }
 
 MemoryUse ProcessMemory() {

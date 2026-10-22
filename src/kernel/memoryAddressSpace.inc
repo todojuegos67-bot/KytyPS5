@@ -141,10 +141,33 @@ public:
 			const char* v = std::getenv("KYTY_BACKING_ON_DEMAND");
 			return v != nullptr && v[0] == '1';
 		}();
+		// KYTY_BACKING_FILE=1 (or a folder): the section backed by a sparse, delete-on-close file on disk (the
+		// emulator's folder by default) instead of the page file. File-backed pages are not charged to the commit
+		// limit at all (13.5 GiB less commit charge: 16 GB PCs bug-checked / rebooted at the limit), and under memory
+		// pressure Windows writes the cold ones to that file and drops them instead of failing. Same bytes, same
+		// zero-filled pages, same views: nothing the game reads changes. Falls back to the page file when the file
+		// cannot be made or its drive has less than the store's size + 4 GiB free.
+		m_file = OpenBackingFile(m_size);
+		if (m_file != INVALID_HANDLE_VALUE) m_on_demand = false; // (SEC_RESERVE is for page-file sections only)
 		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr,
+		    m_file, nullptr,
 		    PAGE_EXECUTE_READWRITE | (m_on_demand ? SEC_RESERVE : SEC_COMMIT),
 		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
+		if (m_handle == nullptr && m_file != INVALID_HANDLE_VALUE) {
+			std::printf("Guest memory: file backing refused (CreateFileMapping 0x%08x), the page file instead\n",
+			            static_cast<unsigned>(GetLastError()));
+			CloseHandle(m_file);
+			m_file   = INVALID_HANDLE_VALUE;
+			m_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr,
+			                              PAGE_EXECUTE_READWRITE | (m_on_demand ? SEC_RESERVE : SEC_COMMIT),
+			                              static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu),
+			                              nullptr);
+		}
+		std::printf("Guest memory: %llu MiB backing store %s\n", static_cast<unsigned long long>(m_size >> 20u),
+		            m_file != INVALID_HANDLE_VALUE ? "in a sparse file on disk (KYTY_BACKING_FILE: no commit charge)"
+		            : m_on_demand ? "in the page file, committed on demand (KYTY_BACKING_ON_DEMAND)"
+		                          : "in the page file, all committed at launch");
+		std::fflush(stdout);
 		if (m_handle == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
 			           "\t direct-memory backing: CreateFileMapping failed: 0x%08" PRIx32 "\n",
@@ -212,6 +235,9 @@ public:
 		if (m_handle != nullptr) {
 			CloseHandle(m_handle);
 		}
+		if (m_file != INVALID_HANDLE_VALUE) {
+			CloseHandle(m_file); // (delete on close: the file goes with the process)
+		}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		for (const auto& [_, entry]: m_maps) {
 			EXIT_IF(
@@ -260,7 +286,56 @@ public:
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	bool m_on_demand = false;
+	bool   m_on_demand = false;
+	HANDLE m_file      = INVALID_HANDLE_VALUE;
+
+	// The sparse backing file (KYTY_BACKING_FILE), or INVALID_HANDLE_VALUE (off, or not possible: the page file).
+	static HANDLE OpenBackingFile(uint64_t size) {
+		const char* v = std::getenv("KYTY_BACKING_FILE");
+		if (v == nullptr || v[0] == '\0' || (v[0] == '0' && v[1] == '\0')) return INVALID_HANDLE_VALUE;
+		std::wstring folder;
+		if (v[0] == '1' && v[1] == '\0') {
+			wchar_t exe[MAX_PATH] {};
+			const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+			folder.assign(exe, n);
+			const auto slash = folder.find_last_of(L"\\/");
+			folder = slash == std::wstring::npos ? L"." : folder.substr(0, slash);
+		} else {
+			const int n = MultiByteToWideChar(CP_UTF8, 0, v, -1, nullptr, 0);
+			folder.resize(n > 0 ? n - 1 : 0);
+			if (n > 0) MultiByteToWideChar(CP_UTF8, 0, v, -1, folder.data(), n);
+		}
+		ULARGE_INTEGER free_bytes {};
+		if (GetDiskFreeSpaceExW(folder.c_str(), &free_bytes, nullptr, nullptr) == 0 ||
+		    free_bytes.QuadPart < size + (uint64_t {4} << 30u)) {
+			std::printf("Guest memory: KYTY_BACKING_FILE needs %llu MiB free on its drive (%llu MiB): the page file instead\n",
+			            static_cast<unsigned long long>((size >> 20u) + 4096),
+			            static_cast<unsigned long long>(free_bytes.QuadPart >> 20u));
+			return INVALID_HANDLE_VALUE;
+		}
+		const std::wstring path = folder + L"\\kyty-guest-memory-" + std::to_wstring(GetCurrentProcessId()) + L".tmp";
+		// Temporary + delete on close: Windows keeps its pages in RAM while there is room (no lazy write-back of a
+		// temporary file's pages) and removes the file when the process ends, however it ends.
+		HANDLE file = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE, 0, nullptr, CREATE_ALWAYS,
+		                          FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_FLAG_DELETE_ON_CLOSE,
+		                          nullptr);
+		if (file == INVALID_HANDLE_VALUE) {
+			std::printf("Guest memory: KYTY_BACKING_FILE could not create its file (0x%08x): the page file instead\n",
+			            static_cast<unsigned>(GetLastError()));
+			return INVALID_HANDLE_VALUE;
+		}
+		DWORD returned = 0;
+		const bool sparse = DeviceIoControl(file, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr) != 0;
+		LARGE_INTEGER end {};
+		end.QuadPart = static_cast<LONGLONG>(size);
+		if (!sparse || SetFilePointerEx(file, end, nullptr, FILE_BEGIN) == 0 || SetEndOfFile(file) == 0) {
+			std::printf("Guest memory: KYTY_BACKING_FILE could not size its sparse file (0x%08x): the page file instead\n",
+			            static_cast<unsigned>(GetLastError()));
+			CloseHandle(file);
+			return INVALID_HANDLE_VALUE;
+		}
+		return file;
+	}
 #endif
 
 	// Locking: m_mutex (shared) keeps the mappings stable; mapping changes take it exclusively.

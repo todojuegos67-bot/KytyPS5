@@ -484,7 +484,13 @@ if (!$NoAsyncShaders -and !$Baseline -and !$environment.Contains('KYTY_ASYNC_DRA
 if ($Ram16) {
 	if (!$environment.Contains('KYTY_RESIDENT_MB')) { $environment['KYTY_RESIDENT_MB'] = '6144' }
 	if (!$environment.Contains('KYTY_PREFETCH_MIN_AVAIL_MB')) { $environment['KYTY_PREFETCH_MIN_AVAIL_MB'] = '3072' }
-	Write-Host 'memory:   16 GB profile: 6 GB kept in RAM, the shader prefetch waits under 3 GB free'
+	# The guest's 13.5 GiB backing store in a sparse, delete-on-close file next to the emulator (KYTY_BACKING_FILE):
+	# no commit charge for it (the page-file section charged all 13.5 GiB at launch: ~20 GB committed on a 16 GB PC,
+	# the commit limit that reboots/crashes them); its cold pages go to that file under pressure, not the page file.
+	# Needs 17.5 GB free on the emulator's drive, else the page file, committed on demand (KYTY_BACKING_ON_DEMAND).
+	if (!$environment.Contains('KYTY_BACKING_FILE')) { $environment['KYTY_BACKING_FILE'] = '1' }
+	if (!$environment.Contains('KYTY_BACKING_ON_DEMAND')) { $environment['KYTY_BACKING_ON_DEMAND'] = '1' }
+	Write-Host 'memory:   16 GB profile: 6 GB kept in RAM, the shader prefetch waits under 3 GB free, guest memory file-backed (no commit charge)'
 }
 # -Turbo2: PCs with 8-12 GB of RAM and graphics cards of 4-6 GB: the caches' video memory at 2.5 GB, textures a quarter
 # of their size, the game's lowest detail, the working set past 3 GB emptied every 15 s (each empty stalls ~140 ms) (with the guest memory quiet

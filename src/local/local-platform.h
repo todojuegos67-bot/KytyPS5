@@ -104,6 +104,12 @@ struct MemoryUse {
 	uint64_t working_set   = 0;
 };
 MemoryUse ProcessMemory();
+// The system's commit charge and commit limit (bytes; zeros when unknown): what a 16 GB PC runs out of.
+struct CommitUse {
+	uint64_t total = 0;
+	uint64_t limit = 0;
+};
+CommitUse SystemCommit();
 uint64_t  PhysicalMemory();
 // KYTY_TRIM_RAM_SECONDS=<n>: every n seconds the process's working set is emptied (Windows: the pages go to the
 // standby list or the page file and come back on use), so the RAM in use is what the game touches in n seconds.
