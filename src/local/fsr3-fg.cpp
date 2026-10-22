@@ -232,15 +232,16 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
 		                                               cinematic || Libs::VideoOut::CutsceneHeld() || Libs::VideoOut::MoviePlaying(), free), 2, std::max(maxm, 2));
 		(void)free;
 		if (next != g_mfg.current) {
-			g_mfg.current  = next;
+			const int from = g_mfg.current;
+			g_mfg.current  = next; // (CapInterval reads it: the pacer's target / m changes with it)
 			g_mfg.pinned_n = 0;
 			MfgSetActive(next);
 			if (g_mfg.flip_fps != 0) {
 				Libs::VideoOut::SetDynamicFlipFps(0);
 				g_mfg.flip_fps = 0;
 			}
-			std::printf("[dyn] x%d: real %.1f fps, shown %.1f (target %.0f), free %.1f\n", next, real, std::min(real * next, T), T,
-			            g_mfg.dm.last_free);
+			std::printf("[dyn] x%d (from x%d): real %.1f fps, shown %.1f (target %.0f), free %.1f; pacer interval %.0f us for x%d\n",
+			            next, from, real, std::min(real * from, T), T, g_mfg.dm.last_free, 1e6 * next / T, next);
 		}
 	}
 	std::printf("[fsr3-mfg] x%d%s; real %.1f fps (free %.1f), shown %.1f fps\n", g_mfg.current, g_mfg.dynamic ? " dynamic" : "",

@@ -133,7 +133,7 @@ bool g_taa_bypass_copy = false;
 // Default: the TAA's output is left to the game (its exposure, bloom and the rest see what they always saw) and only
 // the upscaler takes the raw frame, a copy made right after the TAA (UpscaleComposite).
 bool g_taa_bypass_match = false;
-double g_real_interval = 0.0; // DLSS-G under the G-SYNC cap: the real frames' least interval (seconds)
+std::atomic<double> g_real_interval {0.0}; // DLSS-G under the G-SYNC cap: the real frames' least interval (seconds)
 bool g_sr_ready = false;
 bool     g_ready       = false; // Streamline loaded and the feature available
 bool     g_upscale     = false; // KYTY_UPSCALER=dlss: DLSS super resolution asked for (Streamline loaded for it)
@@ -736,7 +736,7 @@ bool Requested() {
 }
 
 double RealFrameInterval() {
-	return g_ready ? g_real_interval : 0.0;
+	return g_ready ? g_real_interval.load() : 0.0;
 }
 
 std::string SupportProblem(vk::PhysicalDevice physical_device) {
@@ -1499,6 +1499,8 @@ uint32_t DlssgReflexLimitUs(double interval) {
 // gen < 0: no limit (DLSS-G off: menus, movies, loading; x1 is not held to the last multiplier's target / m).
 void DynApplyReflexLimit(int gen) {
 	const double interval = gen < 0 ? 0.0 : static_cast<double>(gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0);
+	if (g_real_interval.load() != interval)
+		std::printf("[dyn] pacer interval %.0f us for x%d\n", interval * 1e6, gen + 1);
 	g_real_interval       = interval; // the flip pacer (VideoOut, as FSR3's) holds real frames to it on the vblank grid
 	const uint32_t us     = DlssgReflexLimitUs(interval);
 	if (g_reflex_opts.frameLimitUs == us) return;
@@ -1567,6 +1569,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 				int          next      = std::clamp(g_dyn_dm.Window(g_dyn_gen + 1, real, T, maxgen + 1,
 				                                                      cinematic || VideoOut::CutsceneHeld() || VideoOut::MoviePlaying()) - 1, 1, std::max(maxgen, 1));
 				if (next != g_dyn_gen) {
+					const int from_m = g_dyn_gen + 1;
 					g_dyn_gen      = next;
 					g_options_set  = false; // send numFramesToGenerate again
 					g_dyn_limit_us = 0;
@@ -1576,8 +1579,8 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 						g_dyn_flip_fps = 0;
 					}
 					DynApplyReflexLimit(g_dyn_gen);
-					std::printf("[dyn] x%d: real %.1f fps, shown %.1f (target %.0f), free %.1f\n", g_dyn_gen + 1, real,
-					            std::min(real * (g_dyn_gen + 1), T), T, g_dyn_dm.last_free);
+					std::printf("[dyn] x%d (from x%d): real %.1f fps, shown %.1f (target %.0f), free %.1f\n", g_dyn_gen + 1, from_m,
+					            real, std::min(real * from_m, T), T, g_dyn_dm.last_free);
 				}
 				std::printf("[dlssg] dynamic x%d; real %.1f fps (smoothed %.1f), shown %.1f, target %.0f\n", g_dyn_gen + 1, real,
 				            g_dyn_real_fps, real * (g_dyn_gen + 1), static_cast<double>(g_dlssg_target_fps));

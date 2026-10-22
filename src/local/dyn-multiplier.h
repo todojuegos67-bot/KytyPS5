@@ -13,8 +13,8 @@
 // - Up at once when real * (m + 1) <= 1.03 target (the game's own 56-60 cap keeps real), or after 5 s under 90% of
 //   the target (a probe; the check below reverts it); otherwise on the estimate.
 // - Unlocked (real above 60): real <= target / m; on that cap the lowest m whose free rate reaches target / m (down
-//   one step when free >= 1.05 target / (m - 1) for 2 windows; with Reflex, no free rate: a probe, reverted when it
-//   shows < 97% of the target, then no probe for 30 s doubling to 4 min). Never above the target.
+//   one step when a measured free rate >= 1.1 target / (m - 1) for 2 windows, else stay; reverted when it shows < 97%
+//   of the target, then not again for 30 s doubling to 4 min). Never above the target. Each level held >= 3 s.
 // - Up one level at a time, only when it shows >= 5% more (min(real * m, target)); 2 windows after a step up, the
 //   shown rate is checked against the one before: not >= 5% higher (or real under the minimum) -> back down and that
 //   level blocked for 10 s. The level that reaches the target with real capped by <= 10% is preferred (60 real on
@@ -69,8 +69,9 @@ struct DynMultiplier {
 		const double cap = T / m;
 		const bool   on_cap = real >= 0.98 * cap;
 		pinned = on_cap ? pinned + 1 : 0;
-		if (settle > 0) {
+		if (settle > 0) { // (at least 3 s per level: the switch's window and the next are not decided on)
 			--settle;
+			prev_real = real;
 			last_free = Estimate(m, real, m);
 			return m;
 		}
@@ -91,7 +92,7 @@ struct DynMultiplier {
 		low_n     = real < MinReal(m) ? low_n + 1 : 0;
 		short_n   = std::min(real * m, T) < 0.9 * T ? short_n + 1 : 0;
 		auto go = [&](int to) {
-			settle  = 1;
+			settle  = 2;
 			up_n    = 0;
 			pinned  = 0;
 			low_n   = 0;
@@ -137,9 +138,11 @@ struct DynMultiplier {
 		if (m > 2 && !on_cap) free_n = 0;
 		if (m > 2 && on_cap && nodown == 0) {
 			const bool known = free_real > 0.0;
-			free_n           = !known || free_real >= 1.05 * T / (m - 1) ? free_n + 1 : 0;
-			const bool lower = free[m - 1] > 0.0 && age[m - 1] < 30;
-			if (free_n >= 2 && (known || !lower || free[m - 1] * (m - 1) >= 0.98 * T)) {
+			// Measured only: free >= 1.1 target / (m - 1) (FSR3's free rate, or a recent rate at m - 1); else stay.
+			const double need = 1.1 * T / (m - 1);
+			const bool   lower = free[m - 1] > 0.0 && age[m - 1] < 30 && free[m - 1] >= need;
+			free_n             = (known && free_real >= need) || (!known && lower) ? free_n + 1 : 0;
+			if (free_n >= 2) {
 				noup      = 10;
 				down_from = m;
 				free_n    = 0;
