@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__clang__)
@@ -56,6 +57,69 @@ static void WriteVmaReport(const char* path) {
 	vmaFreeStatsString(g_report_allocator, json);
 }
 
+// Tagged commit of Vulkan memory (LocalPlatform::MemoryTagAdd): every vkAllocateMemory (VMA's, the ballast's, the
+// stream buffers') with the process's private commit before and after it, serialized so that the delta is its own
+// (other threads' allocations meanwhile still add noise). NVIDIA's Windows driver can charge device-local memory to
+// the process's commit as well: this tells how much, by kind, in the "Private breakdown:" line.
+namespace {
+PFN_vkAllocateMemory           g_real_allocate = nullptr;
+PFN_vkFreeMemory               g_real_free     = nullptr;
+VkPhysicalDeviceMemoryProperties g_memory_properties {};
+std::mutex                     g_tag_mutex;
+std::atomic<bool>              g_tag_ballast {false};
+struct TaggedMemory {
+	int     tag;
+	int64_t requested, committed;
+};
+std::unordered_map<uint64_t, TaggedMemory>* g_tagged = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL TaggedAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info,
+                                                    const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+	std::lock_guard lock(g_tag_mutex);
+	const auto before = LocalPlatform::ProcessMemory().private_bytes;
+	const auto result = g_real_allocate(device, info, callbacks, memory);
+	const auto after  = LocalPlatform::ProcessMemory().private_bytes;
+	if (result == VK_SUCCESS && memory != nullptr && *memory != VK_NULL_HANDLE && info != nullptr) {
+		const auto flags = info->memoryTypeIndex < g_memory_properties.memoryTypeCount
+		                       ? g_memory_properties.memoryTypes[info->memoryTypeIndex].propertyFlags
+		                       : 0u;
+		const int tag = g_tag_ballast.load() ? LocalPlatform::MemoryTagVulkanBallast
+		                : (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? LocalPlatform::MemoryTagVulkanDeviceLocal
+		                                                                     : LocalPlatform::MemoryTagVulkanHost;
+		const TaggedMemory entry {tag, static_cast<int64_t>(info->allocationSize),
+		                          after > before ? static_cast<int64_t>(after - before) : 0};
+		if (g_tagged == nullptr) g_tagged = new std::unordered_map<uint64_t, TaggedMemory>();
+		(*g_tagged)[reinterpret_cast<uint64_t>(*memory)] = entry;
+		LocalPlatform::MemoryTagAdd(entry.tag, entry.requested, entry.committed);
+	}
+	return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL TaggedFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* callbacks) {
+	{
+		std::lock_guard lock(g_tag_mutex);
+		if (g_tagged != nullptr && memory != VK_NULL_HANDLE) {
+			if (auto it = g_tagged->find(reinterpret_cast<uint64_t>(memory)); it != g_tagged->end()) {
+				LocalPlatform::MemoryTagAdd(it->second.tag, -it->second.requested, -it->second.committed);
+				g_tagged->erase(it);
+			}
+		}
+	}
+	g_real_free(device, memory, callbacks);
+}
+
+void InstallMemoryTags(VkPhysicalDevice physical_device) {
+	if (!LocalPlatform::MemoryTagsEnabled() || g_real_allocate != nullptr) return;
+	auto& dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+	if (dispatcher.vkAllocateMemory == nullptr || dispatcher.vkFreeMemory == nullptr) return;
+	dispatcher.vkGetPhysicalDeviceMemoryProperties(physical_device, &g_memory_properties);
+	g_real_allocate             = dispatcher.vkAllocateMemory;
+	g_real_free                 = dispatcher.vkFreeMemory;
+	dispatcher.vkAllocateMemory = TaggedAllocateMemory;
+	dispatcher.vkFreeMemory     = TaggedFreeMemory;
+}
+} // namespace
+
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(instance == nullptr || physical_device == nullptr || device == nullptr ||
@@ -64,6 +128,11 @@ bool GraphicContext::CreateAllocator() {
 	VmaVulkanFunctions functions {};
 	functions.vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
 	functions.vkGetDeviceProcAddr   = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+	InstallMemoryTags(static_cast<VkPhysicalDevice>(physical_device));
+	if (g_real_allocate != nullptr) {
+		functions.vkAllocateMemory = TaggedAllocateMemory;
+		functions.vkFreeMemory     = TaggedFreeMemory;
+	}
 
 	VmaAllocatorCreateInfo info {};
 	info.instance         = instance;
@@ -122,6 +191,7 @@ bool GraphicContext::CreateAllocator() {
 			if (candidate.heapIndex == heap && candidate.propertyFlags == vk::MemoryPropertyFlagBits::eDeviceLocal) type = i;
 		}
 		const uint64_t size = physical_device_memory_properties.memoryHeaps[heap].size;
+		g_tag_ballast = true;
 		for (uint64_t left = simulated > 0 && simulated < size ? size - simulated : 0; left > 0 && type != UINT32_MAX;) {
 			const uint64_t                    chunk = std::min<uint64_t>(left, uint64_t {1} << 30u);
 			vk::MemoryPriorityAllocateInfoEXT priority {};
@@ -136,6 +206,7 @@ bool GraphicContext::CreateAllocator() {
 			simulation_ballast_bytes += chunk;
 			left -= chunk;
 		}
+		g_tag_ballast = false;
 		std::printf("Simulated video memory: %" PRIu64 " MiB of heap %u (%" PRIu64 " MiB) taken, priorities %s\n",
 		            simulation_ballast_bytes >> 20u, heap, size >> 20u, memory_priority_enabled ? "on" : "off");
 	}

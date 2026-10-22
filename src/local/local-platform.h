@@ -112,6 +112,19 @@ struct CommitUse {
 CommitUse SystemCommit();
 // KYTY_MEMORY_BREAKDOWN_SECONDS (default 60): a periodic "Private breakdown:" log line.
 void StartMemoryBreakdown();
+// Tagged commit (shown in the "Private breakdown:" line as "tagged:"): what the emulator's big allocation sites
+// asked for and how much the process's private commit grew across each call (a delta of PrivateUsage, so other
+// threads' allocations meanwhile are noise). Vulkan memory (vma.cpp wraps vkAllocateMemory/vkFreeMemory) by kind,
+// C++ new of 1 MiB or more by caller. On with the breakdown (KYTY_MEMORY_BREAKDOWN_SECONDS != 0).
+enum MemoryTag : int {
+	MemoryTagVulkanDeviceLocal = 0, // device-local types (what NVIDIA's Windows driver may also charge to commit)
+	MemoryTagVulkanHost,            // host-visible types without device-local (staging rings, readback)
+	MemoryTagVulkanBallast,         // KYTY_SIMULATE_VRAM_MB's ballast
+	MemoryTagLargeNew,              // C++ new >= 1 MiB (by caller in the line)
+	MemoryTagCount
+};
+bool MemoryTagsEnabled();
+void MemoryTagAdd(int tag, int64_t requested, int64_t committed);
 uint64_t  PhysicalMemory();
 // KYTY_TRIM_RAM_SECONDS=<n>: every n seconds the process's working set is emptied (Windows: the pages go to the
 // standby list or the page file and come back on use), so the RAM in use is what the game touches in n seconds.
