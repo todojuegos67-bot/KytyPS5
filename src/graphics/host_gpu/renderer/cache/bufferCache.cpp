@@ -1400,6 +1400,7 @@ static BufferCache* g_sync_cache = nullptr;
 // the first copies before it could reuse the ring (60-80 ms of gpu_wait in those frames, Boletaria).
 static uint64_t StagingRingSize() {
 	const uint64_t     ram = LocalPlatform::PhysicalMemory();
+	if (LocalPlatform::LowMemVram()) return 256 * MiB; // KYTY_LOWMEM_VRAM=1
 	return ram >= (uint64_t {32} << 30u) ? 1024 * MiB : 512 * MiB;
 }
 
