@@ -209,7 +209,7 @@ function Start-Game {
 	if ($chkPc16.Checked) { $sets += 'KYTY_LOWMEM_VRAM=1' }  # (10-22) menos memoria de video retenida (el driver la cuenta como RAM)
 	$sets += 'KYTY_FAULT_STATS=1'
 	if ($fgConfig -eq 'fsr3-x4.json') { $sets += 'KYTY_VRR_CAP_FPS=224' }  # (10-22 d) en DLSS el tope se aplicaba dos veces: 14 reales x4 = 56
-	if ($fgConfig -like '*dyn*') { $sets += 'KYTY_DYN_QUALITY=0.6' }  # (10-22 f) x2 se mantenia justo por debajo (144 < 146) y saltaba a x3
+	if ($fgConfig -like '*dyn*') { $sets += 'KYTY_DYN_QUALITY=0.95' }  # (10-22 g) llenar el monitor: el menor multiplicador que llega a ~224 (80 reales = x3, 120 = x2)
 	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
