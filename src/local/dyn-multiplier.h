@@ -12,6 +12,9 @@
 //   window under 60% of the one before (hitch, loading) is ignored.
 // - Up at once when real * (m + 1) <= 1.03 target (the game's own 56-60 cap keeps real), or after 5 s under 90% of
 //   the target (a probe; the check below reverts it); otherwise on the estimate.
+// - Unlocked (real above 60): real <= target / m; on that cap the lowest m whose free rate reaches target / m (down
+//   one step when free >= 1.05 target / (m - 1) for 2 windows; with Reflex, no free rate: a probe, reverted when it
+//   shows < 97% of the target, then no probe for 30 s doubling to 4 min). Never above the target.
 // - Up one level at a time, only when it shows >= 5% more (min(real * m, target)); 2 windows after a step up, the
 //   shown rate is checked against the one before: not >= 5% higher (or real under the minimum) -> back down and that
 //   level blocked for 10 s. The level that reaches the target with real capped by <= 10% is preferred (60 real on
@@ -36,6 +39,7 @@ struct DynMultiplier {
 	int    pinned = 0, noup = 0, up_n = 0;
 	double last_free = 0.0;                // the free estimate of the current level (log)
 	double prev_real = 0.0;                // the window before (hitch test)
+	int    down_from = 0, nodown = 0, nodown_len = 15, free_n = 0; // a step down off the cap under test; probes paused; windows free
 	int    low_n = 0, short_n = 0;         // windows in a row under the level's minimum / under 90% of the target
 
 	static double MinReal(int m) { return m <= 2 ? 30.0 : m == 3 ? 40.0 : m == 4 ? 45.0 : 50.0; }
@@ -50,7 +54,8 @@ struct DynMultiplier {
 	// multiplier allowed now (cinematics pass 3). Returns the multiplier for the next window.
 	// hold: a cinematic, held cutscene or movie (real frames held to 60/30): nothing learned or blocked, all state reset
 	// so the levels and estimates start fresh when it ends.
-	int Window(int m, double real, double T, int maxm, bool hold = false) {
+	// free_real: the rate without our limiter when measured (FSR3), 0 when not (Reflex).
+	int Window(int m, double real, double T, int maxm, bool hold = false, double free_real = 0.0) {
 		if (hold) {
 			*this = DynMultiplier {};
 			return std::clamp(std::min(m, maxm), 2, kMax);
@@ -58,6 +63,7 @@ struct DynMultiplier {
 		for (auto& b: block) b = std::max(b - 1, 0);
 		for (auto& a: age) ++a;
 		if (noup > 0) --noup;
+		if (nodown > 0) --nodown;
 		while (maxm > 2 && T / maxm < MinReal(maxm)) --maxm;
 		maxm = std::clamp(maxm, 2, kMax);
 		const double cap = T / m;
@@ -113,10 +119,32 @@ struct DynMultiplier {
 			while (to > 2 && free[to] > 0.0 && age[to] < 30 && free[to] < MinReal(to)) --to;
 			return go(to);
 		}
-		// On the cap: the lower multiplier also reaches the target -> fewer generated frames for the same shown rate.
-		if (pinned >= 2 && m > 2 && free[m - 1] > 0.0 && age[m - 1] < 30 && free[m - 1] * (m - 1) >= 0.98 * T) {
-			noup = 10;
-			return go(m - 1);
+		// A step down off the cap under test: kept when it still shows >= 97% of the target, else back up and no
+		// step-down probe for 30 s, doubling per failed probe up to 4 min (a game held at 60 is not probed often).
+		if (down_from != 0) {
+			const int from = down_from;
+			down_from      = 0;
+			if (std::min(real * m, T) < 0.97 * T && from <= maxm) {
+				nodown_len = std::min(nodown_len * 2, 240);
+				nodown     = nodown_len;
+				return go(from);
+			}
+			nodown_len = 15;
+		}
+		// On the cap (the game runs faster than target / m, unlocked above 60): the lowest m whose free rate reaches
+		// target / m. With a measured free rate (FSR3's limiter) down when it is >= 1.05 target / (m - 1) for 2 windows;
+		// without one (Reflex) a probe one step down after 2 windows on the cap (the check above reverts it).
+		if (m > 2 && !on_cap) free_n = 0;
+		if (m > 2 && on_cap && nodown == 0) {
+			const bool known = free_real > 0.0;
+			free_n           = !known || free_real >= 1.05 * T / (m - 1) ? free_n + 1 : 0;
+			const bool lower = free[m - 1] > 0.0 && age[m - 1] < 30;
+			if (free_n >= 2 && (known || !lower || free[m - 1] * (m - 1) >= 0.98 * T)) {
+				noup      = 10;
+				down_from = m;
+				free_n    = 0;
+				return go(m - 1);
+			}
 		}
 		const int up = m + 1;
 		if (up <= maxm && block[up] == 0 && real * m < 0.97 * T && real >= MinReal(up)) {
@@ -128,7 +156,7 @@ struct DynMultiplier {
 			};
 			// The real rate is the game's own cap (56-60): the next level within target * 1.03 keeps it, so no estimate.
 			// Under 90% of the target for 5 s with real meeting the next level's minimum: probe it (the check reverts).
-			if (real * up <= 1.03 * T || (short_n >= 5 && noup == 0)) return take();
+			if (noup == 0 && (real * up <= 1.03 * T || short_n >= 5)) return take();
 			// Otherwise the estimate: meets the minimum and shows >= 5% more, or reaches the target with real capped by
 			// at most ~10% (60 -> 56 for x4 = 224).
 			const double est   = Estimate(up, real, m);
