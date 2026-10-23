@@ -5168,7 +5168,8 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		dependency.imageMemoryBarrierCount = 1;
 		dependency.pImageMemoryBarriers    = &barrier;
 		command.pipelineBarrier2(dependency);
-		const vk::ClearColorValue       zero {std::array<uint32_t, 4> {0, 0, 0, 0}};
+		vk::ClearColorValue             zero {};
+		zero.uint32 = std::array<uint32_t, 4> {0, 0, 0, 0};
 		const vk::ImageSubresourceRange whole {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
 		command.clearColorImage(vk::Image(g.dummy_image), vk::ImageLayout::eGeneral, &zero, 1, &whole);
 		command.fillBuffer(vk::Buffer(g.calib), 0, VK_WHOLE_SIZE, 0);
