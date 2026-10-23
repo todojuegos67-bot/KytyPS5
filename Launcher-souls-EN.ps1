@@ -899,7 +899,12 @@ foreach ($m in @($chkSoulsUltra, $chkSoulsExt)) {
 foreach ($m in @($chkLowEnd, $chkLowEnd45)) { $m.Add_CheckedChanged({ param($sender, $e) if ($sender.Checked) { $chkSoulsUltra.Checked = $false; $chkSoulsExt.Checked = $false; $chkSoulsLow.Checked = $false } }) }
 $chkGpu8.Add_CheckedChanged({ if ($chkGpu8.Checked) { Set-PresetLight } else { Set-PresetMax } })
 # (10-23) Modo Souls ligero y PC low profile: resolucion fija (no se puede cambiar el reescalado).
-function Update-ResLock { $lock = $chkLowEnd.Checked -or $chkSoulsLow.Checked; if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'No upscaling (1080p native)' }; $cmbRes.Enabled = -not $lock }
+function Update-ResLock { $lock = $chkLowEnd.Checked -or $chkSoulsLow.Checked; if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'No upscaling (1080p native)' }; $cmbRes.Enabled = -not $lock 
+	# (10-23) PC low profile: todo fijo (salida, graficos y casillas), nada se puede cambiar.
+	$low = $chkSoulsLow.Checked
+	foreach ($c in @($cmbOut, $cmbTex, $cmbDist, $cmbShadow, $cmbDet, $cmbRefl, $cmbFade, $cmbAaS, $cmbRt, $cmbAo, $chkAf16, $chkLod)) { if ($c) { $c.Enabled = -not $low } }
+	foreach ($p in @($script:postChecks)) { if ($p -and $p[0]) { $p[0].Enabled = -not $low } }
+}
 $chkLowEnd.Add_CheckedChanged({ Update-ResLock })
 $chkSoulsLow.Add_CheckedChanged({ Update-ResLock })
 $form.Add_Shown({ Update-ResLock })
