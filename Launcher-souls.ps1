@@ -996,7 +996,9 @@ $chkGpu8.Add_CheckedChanged({ if ($chkGpu8.Checked) { Set-PresetLight } else { S
 function Update-ResLock { $lock = $chkSoulsLow.Checked; if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'Sin reescalado (1080p nativo)' }; $cmbRes.Enabled = -not $lock 
 	# (10-23) PC low profile: todo fijo (salida, graficos y casillas), nada se puede cambiar.
 	$low = $chkSoulsLow.Checked
-	foreach ($c in @($cmbSharp, $cmbFg, $cmbOut, $cmbTex, $cmbDist, $cmbShadow, $cmbDet, $cmbRefl, $cmbFade, $cmbAaS, $cmbRt, $cmbAo, $chkAf16, $chkLod)) { if ($c) { $c.Enabled = -not $low } }
+	$cmbFg.Enabled = -not (Is-FixedFg)  # (10-23) ligero / equilibrado / low profile: FG fija (antes esta funcion la volvia a activar)
+	if ($cmbOut) { $cmbOut.Enabled = -not (Is-FixedFg) }
+	foreach ($c in @($cmbSharp, $cmbTex, $cmbDist, $cmbShadow, $cmbDet, $cmbRefl, $cmbFade, $cmbAaS, $cmbRt, $cmbAo, $chkAf16, $chkLod)) { if ($c) { $c.Enabled = -not $low } }
 	foreach ($p in @($script:postChecks)) { if ($p -and $p[0]) { $p[0].Enabled = -not $low } }
 }
 $chkLowEnd.Add_CheckedChanged({ Update-ResLock })
