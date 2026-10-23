@@ -30,6 +30,7 @@ struct OwnState {
 		}
 	}
 };
+std::atomic<PFN_vkWaitSemaphores> g_own_wait {nullptr};
 const OwnState& Own() {
 	static const OwnState state;
 	return state;
@@ -202,7 +203,6 @@ namespace {
 constexpr uint64_t           kOwnRing = 16;
 std::atomic<VkDevice>        g_own_device {VK_NULL_HANDLE};
 std::atomic<VkSemaphore>     g_own_timeline {VK_NULL_HANDLE};
-std::atomic<PFN_vkWaitSemaphores> g_own_wait {nullptr};
 std::atomic<uint64_t>        g_own_ticks[kOwnRing] {};
 std::atomic<uint64_t>        g_own_frames {0}; // guest frames recorded
 std::atomic<uint64_t>        g_own_waited {0}; // the frame count the last controller read saw
