@@ -5085,6 +5085,16 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 				std::printf("SSR: decode from the environment (normal %d, roughness %d, metal %d)\n", env_normal, env_rough, env_metal);
 		}
 	}
+	if (packed_count == 0 && !have_material && g_ssr.copy_flip.load(std::memory_order_relaxed) != ~0ull) {
+		// (the copy worked before but not this frame or the last: no G-buffer this frame, SSR skipped rather than
+		// traced from stale or missing layers)
+		static uint32_t skips = 0;
+		if (skips++ < 4) {
+			std::printf("SSR: skipped this frame (no G-buffer copy)\n");
+			std::fflush(stdout);
+		}
+		return false;
+	}
 	const bool use_packed = packed_count > 0 && !have_material;
 	const bool calibrate  = use_packed && from_copy && !g_ssr.calib_done && g_ssr.calib_runs < SsrCalibRuns && (g_ssr.frame & 3u) == 0;
 	if (use_packed && !g_ssr.calib_done && g_ssr.calib_runs >= SsrCalibRuns && ++g_ssr.calib_wait > 8) {
@@ -5151,9 +5161,9 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.dec[0] = (dec_normal & 32) != 0 && !have_rows ? -1 : dec_normal;
 	push.dec[1] = dec_rough, push.dec[2] = dec_metal, push.dec[3] = static_cast<int32_t>(packed_count);
 	{
-		static bool said = false;
-		if (!said) {
-			said = true;
+		static uint32_t said_layers = ~0u;
+		if (said_layers != packed_count) {
+			said_layers = packed_count;
 			std::printf("SSR: on (level %d, trace %ux%u, strength %g, thickness %g, up %s, packed G-buffer layers %u%s)\n", level,
 			            g_ssr.trace.width, g_ssr.trace.height, strength, thick,
 			            have_up ? "from the camera" : "unknown (|view y| assumed until the G-buffer normals are decoded)", packed_count,
@@ -5370,7 +5380,9 @@ void SsrCaptureGbuffer(vk::CommandBuffer command, std::span<const TextureBinding
 	{
 		std::lock_guard lock(g_ssr_gb.mutex);
 		if (!g_ssr_gb.valid || g_ssr_gb.count < 1 || g_ssr_gb.targets[0].view.format != vk::Format::eR32Uint) return;
-		if (flip > g_ssr_gb.flip + 1) return; // (no G-buffer pass this frame)
+		// (this frame's G-buffer pass seen already: a dispatch before it, reading last frame's layers, must not take
+		// the frame's one copy)
+		if (g_ssr_gb.flip != flip) return;
 		address = g_ssr_gb.targets[0].address, width = g_ssr_gb.targets[0].width, height = g_ssr_gb.targets[0].height;
 	}
 	const TextureBinding* binding = nullptr;
