@@ -218,7 +218,11 @@ function Start-Game {
 	# no mejoraba y quitaba FPS.
 	# (10-23 noche) Anti-Lag solo con graficas AMD (AMD Anti-Lag 2) en Souls ligero y PC low profile. En NVIDIA no: Reflex
 	# sobre la frame generation de AMD cerro el juego (20261023-205956, en Fsr3::QueuePresent).
-	if ((-not $script:isNvidia) -and ($chkLowEnd.Checked -or $chkSoulsLow.Checked)) {
+	# NVIDIA + frame generation de AMD: casilla "Anti-Lag (experimental)", solo sin reescalado DLSS (con DLSS cargado fue
+	# el crash); usa Reflex por Vulkan, el camino anterior a hoy.
+	$resNow = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
+	$nvAmd  = $script:isNvidia -and $chkAntiLag.Checked -and $config -like 'fsr3*' -and $resNow[2] -notlike '*dlss'
+	if ($nvAmd -or ((-not $script:isNvidia) -and ($chkLowEnd.Checked -or $chkSoulsLow.Checked))) {
 		$psargs += '-AntiLag'
 		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y
 		# con DLSS Frame Generation, Reflex en modo Boost.
@@ -850,7 +854,9 @@ Move-To $cmbFg $gFg 12 24 396
 Move-To $chkUnlock $gFg 12 60 200
 $chkUnlock.Visible = $false  # (10-22) sin casilla: siempre desbloqueados salvo DLSS y modos Souls
 Move-To $chkAntiLag $gFg 222 60 186
-$chkAntiLag.Visible = $false  # (10-23) automatico en Souls ligero y PC low profile
+# (10-23 noche) Visible solo con NVIDIA: "Anti-Lag (experimental)" para la frame generation de AMD sin DLSS.
+$chkAntiLag.Visible = $script:isNvidia; $chkAntiLag.Text = 'Anti-Lag (experimental)'
+$tips.SetToolTip($chkAntiLag, 'Solo NVIDIA con la frame generation de AMD y reescalado XeSS, FSR o nativo (con DLSS no hace nada): NVIDIA Reflex para menos retraso. Experimental: si el juego se cierra, quitala.')
 # Calidad grafica: texturas, distancia, sombras, Luz RT y filtrado x16 ($script:gfxTop: etiqueta y desplegable de Texturas, Sombras, Distancia).
 Move-To $script:gfxTop[0] $gGfx 10 26 98; Move-To $cmbTex $gGfx 110 24 296
 Move-To $script:gfxTop[4] $gGfx 10 58 98; Move-To $cmbDist $gGfx 110 56 296
