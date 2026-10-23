@@ -1589,8 +1589,10 @@ void WindowContext::CreateVulkan() {
 			}
 		}
 		// KYTY_FSR3_FG: the FidelityFX backend calls vkGetBufferMemoryRequirements2KHR (the extension's name,
-		// null on a device without the extension even though the function is core).
-		if (Libs::Graphics::Fsr3::Requested()) {
+		// null on a device without the extension even though the function is core). FSR 3.1 upscaling alone
+		// (KYTY_UPSCALER=fsr, KYTY_UPSCALE=fsr) uses the same backend: without the extensions its context creation called a
+		// null pointer (10-23, FSR SR without frame generation).
+		if (Libs::Graphics::Fsr3::Requested() || Libs::Graphics::Fsr3::SrPathWanted() || Libs::Graphics::Fsr3::UpscaleWanted()) {
 			for (const char* name: {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME}) {
 				if (HasExtension(available_extensions, name) && !HasExtension(device_extensions, name))
 					device_extensions.push_back(name);
