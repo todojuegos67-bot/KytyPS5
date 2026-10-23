@@ -1,0 +1,50 @@
+#version 450
+// KYTY_KBM_WARP (kbm-warp.cpp): late reprojection of the pending mouse turn, the HUD left where it is.
+// mode 0 (color): `a` the game's final image F (HUD composited), `b` the same composite drawn without its HUD texture H,
+//   both at the output's size. The HUD is where F and H differ (as hud-split.comp finds it); there F is kept, unmoved,
+//   elsewhere H is sampled `shift` pixels away (clamped: the uncovered strip repeats the edge). out0 = that, out1 = the
+//   shifted H alone (FSR 3's HUD-less input, consistent with the backbuffer).
+// mode 1 (motion): `a` the motion vectors; out0 = a at the integer-shifted pixel (clamped), plus `add` (the shift's
+//   change since the previous real frame, in the vectors' units), so the vectors stay those of the shifted image.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D a;
+layout(binding = 1) uniform sampler2D b;
+layout(binding = 2, rgba16f) uniform writeonly image2D out0;
+layout(binding = 3, rgba16f) uniform writeonly image2D out1;
+
+layout(push_constant) uniform Push {
+	vec2  shift;     // pixels of the output: out(p) = in(p + shift)
+	vec2  add;       // mode 1
+	float threshold; // mode 0: a difference above it (any channel) is HUD
+	int   radius;    // mode 0: the HUD's edges widened by it (pixels)
+	int   mode;
+	int   write1;    // mode 0: out1 written too (a separate image)
+} push;
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size  = imageSize(out0);
+	if (pixel.x >= size.x || pixel.y >= size.y) return;
+	if (push.mode == 1) {
+		ivec2 at = clamp(pixel + ivec2(round(push.shift)), ivec2(0), textureSize(a, 0) - 1);
+		vec4  mv = texelFetch(a, at, 0);
+		imageStore(out0, pixel, vec4(mv.xy + push.add, mv.zw));
+		return;
+	}
+	ivec2 source = textureSize(a, 0);
+	float difference = 0.0;
+	for (int dy = -push.radius; dy <= push.radius; ++dy) {
+		for (int dx = -push.radius; dx <= push.radius; ++dx) {
+			ivec2 at = clamp(pixel + ivec2(dx, dy), ivec2(0), source - 1);
+			vec3  d  = abs(texelFetch(a, at, 0).rgb - texelFetch(b, at, 0).rgb);
+			difference = max(difference, max(d.r, max(d.g, d.b)));
+		}
+	}
+	float coverage = smoothstep(push.threshold, push.threshold * 2.0, difference);
+	vec2  uv       = (vec2(pixel) + 0.5 + push.shift) / vec2(source);
+	vec4  moved    = textureLod(b, uv, 0.0);
+	vec4  frame    = texelFetch(a, clamp(pixel, ivec2(0), source - 1), 0);
+	imageStore(out0, pixel, vec4(mix(moved.rgb, frame.rgb, coverage), 1.0));
+	if (push.write1 != 0) imageStore(out1, pixel, vec4(moved.rgb, 1.0));
+}

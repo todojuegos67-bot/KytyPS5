@@ -1,4 +1,5 @@
 #include "frame-gen.h"
+#include "kbm-warp.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "fsr3-fg.h"
 #include "xess-sr.h"
@@ -747,8 +748,9 @@ bool Enabled() {
 bool DlssUpscaleWanted();
 bool TaaReplaceWanted();
 bool Capturing() {
+	// (KYTY_KBM_WARP: the frame's HUD-less composite, so that only the 3D is reprojected; kbm-warp.h.)
 	return Enabled() || Fsr3::Active() || Fsr3::UpscaleWanted() || DlssUpscaleWanted() || Xess::Wanted() ||
-	       TaaReplaceWanted();
+	       TaaReplaceWanted() || KbmWarp::HudlessWanted();
 }
 
 bool Requested() {
@@ -2405,7 +2407,7 @@ int FlipSlot(std::span<const ImageId> targets) {
 
 void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageId target, uint32_t slot,
                     std::span<const TextureBinding> images, const std::function<void()>& redraw) {
-	if (!Enabled() && !Fsr3::Active()) return; // (capturing for upscaling only: no HUD-less image wanted)
+	if (!Enabled() && !Fsr3::Active() && !KbmWarp::HudlessWanted()) return; // (capturing for upscaling only: no HUD-less image wanted)
 	if (g_hudless_taken || slot >= rendering.num_color_attachments || FlipOf(target) == nullptr) return;
 	auto& flip = g_cache->GetImage(target);
 	// The HUD texture: of the full-screen-ish color images the composite samples, an 8-bit (or 10-bit) one with alpha

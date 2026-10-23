@@ -470,6 +470,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${hud_split_header}")
+# KYTY_KBM_WARP's late reprojection under a still HUD (src/local/kbm-warp.cpp).
+set(kbm_warp_source "${KYTY_SOURCE_DIR}/local/kbm-warp.comp")
+set(kbm_warp_spv "${gpu_tiler_generated_dir}/kbm_warp.spv")
+set(kbm_warp_header "${gpu_tiler_generated_dir}/kbm_warp_spv.h")
+add_custom_command(
+	OUTPUT "${kbm_warp_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${kbm_warp_spv}" "${kbm_warp_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${kbm_warp_spv} -DOUTPUT=${kbm_warp_header}
+	        -DSYMBOL=KBM_WARP_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${kbm_warp_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${kbm_warp_header}")
 # The game's exposure on the upscaled image of its super resolution path (renderSuperResolution.cpp).
 set(sr_exposure_source "${KYTY_SOURCE_DIR}/local/sr-exposure.comp")
 set(sr_exposure_spv "${gpu_tiler_generated_dir}/sr_exposure.spv")
@@ -521,6 +536,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.cpp"
+	"${KYTY_SOURCE_DIR}/local/kbm-warp.h"
+	"${KYTY_SOURCE_DIR}/local/kbm-warp.cpp"
 	"${KYTY_SOURCE_DIR}/local/anti-lag.h"
 	"${KYTY_SOURCE_DIR}/local/anti-lag.cpp"
 	"${KYTY_SOURCE_DIR}/local/xess-sr.cpp"
