@@ -885,9 +885,13 @@ $chkAntiLag.Text = 'Anti-Lag'
 $cmbAl = New-Object System.Windows.Forms.ComboBox
 $cmbAl.DropDownStyle = 'DropDownList'; $cmbAl.Font = $smallFont
 foreach ($l in 'Anti-Lag: off', 'Anti-Lag', 'Anti-Lag Ultra') { [void]$cmbAl.Items.Add($l) }
-$ai2 = 0; [void][int]::TryParse((Get-IniValue 'antilagmode' '0'), [ref]$ai2); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $ai2), 2)
-$cmbAl.Add_SelectedIndexChanged({ Set-IniValue 'antilagmode' "$($cmbAl.SelectedIndex)" })
+$ai2 = 1; [void][int]::TryParse((Get-IniValue 'antilagmode2' '1'), [ref]$ai2); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $ai2), 2)  # (10-24) activado por defecto
+$cmbAl.Add_SelectedIndexChanged({ Set-IniValue 'antilagmode2' "$($cmbAl.SelectedIndex)" })
 $gFg.Controls.Add($cmbAl); $cmbAl.Location = $chkAntiLag.Location; $cmbAl.Size = New-Object System.Drawing.Size(186, 26)
+# (10-24) Con la frame generation de NVIDIA (DLSS-G) va siempre NVIDIA Reflex: se muestra para que se sepa.
+$lbReflex = New-Label 'Reflex: on (DLSS-G)' $smallFont ([System.Drawing.Color]::FromArgb(120, 210, 120)) 0 0 186 24
+$lbReflex.TextAlign = 'MiddleLeft'; $gFg.Controls.Add($lbReflex); $lbReflex.Location = $chkAntiLag.Location; $lbReflex.Visible = $false
+$tips.SetToolTip($lbReflex, 'NVIDIA frame generation (DLSS-G) always runs with NVIDIA Reflex on: lower latency automatically.')
 # Solo se puede marcar con la frame generation de AMD (con la de NVIDIA ya va Reflex); fuera de ella se desmarca.
 function Update-AntiLagBox {
 	$cfgNow = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
@@ -900,6 +904,7 @@ function Update-AntiLagBox {
 	$chkAntiLag.Enabled = $true
 	if (-not $ok) { $chkAntiLag.Checked = $false }
 	$chkAntiLag.Visible = $false; $cmbAl.Visible = $ok
+	$lbReflex.Visible = (-not $ok) -and $cfgNow -like 'dlss*'
 }
 $cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $cmbRes.Add_SelectedIndexChanged({ Update-AntiLagBox })
