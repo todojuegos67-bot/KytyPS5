@@ -214,7 +214,9 @@ function Start-Game {
 	# (10-23) Modo GPU seguro retirado del launcher
 	# Graficos: texturas (0 entera, 1 mitad, 2 cuarto) y distancia de dibujado (-Quality low/lowest: solo el LOD).
 	$psargs += @('-TextureReduce', @('0', 'h', '1', '2')[$cmbTex.SelectedIndex])  # (10-23) Alto = h
-	if ($chkAntiLag.Checked) {
+	# (10-23) Anti-Lag solo en los modos Souls ligero y PC low profile (frame generation de AMD + Reflex); en los demas
+	# no mejoraba y quitaba FPS.
+	if ($chkLowEnd.Checked -or $chkSoulsLow.Checked) {
 		$psargs += '-AntiLag'
 		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y
 		# con DLSS Frame Generation, Reflex en modo Boost.
@@ -846,6 +848,7 @@ Move-To $cmbFg $gFg 12 24 396
 Move-To $chkUnlock $gFg 12 60 200
 $chkUnlock.Visible = $false  # (10-22) sin casilla: siempre desbloqueados salvo DLSS y modos Souls
 Move-To $chkAntiLag $gFg 222 60 186
+$chkAntiLag.Visible = $false  # (10-23) automatico en Souls ligero y PC low profile
 # Calidad grafica: texturas, distancia, sombras, Luz RT y filtrado x16 ($script:gfxTop: etiqueta y desplegable de Texturas, Sombras, Distancia).
 Move-To $script:gfxTop[0] $gGfx 10 26 98; Move-To $cmbTex $gGfx 110 24 296
 Move-To $script:gfxTop[4] $gGfx 10 58 98; Move-To $cmbDist $gGfx 110 56 296
