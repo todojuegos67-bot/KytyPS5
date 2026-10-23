@@ -1704,7 +1704,8 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				                     swapchain.PresentRegion(), frame.image,
 				                     frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr);
 			if (FrameGen::Enabled() && frame.fg.valid && !frame.reusing_last)
-				FrameGen::ScaleHudless(m_impl->window.graphic_ctx, command.Handle(), frame.fg, swapchain.Extent(), swapchain.Format());
+				FrameGen::ScaleHudless(m_impl->window.graphic_ctx, command.Handle(), frame.fg, swapchain.Extent(),
+				                       swapchain.PresentRegion(), swapchain.Format());
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 			if (timed) FrameGen::NoteSubmitMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_begin).count());
 		}
