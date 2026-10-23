@@ -222,7 +222,9 @@ function Start-Game {
 	# el crash); usa Reflex por Vulkan, el camino anterior a hoy.
 	$resNow = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
 	$nvAmd  = $script:isNvidia -and $chkAntiLag.Checked -and $config -like 'fsr3*' -and $resNow[2] -in 'xess', 'fsr'
-	if ($nvAmd -or ((-not $script:isNvidia) -and ($chkLowEnd.Checked -or $chkSoulsLow.Checked))) {
+	# Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag automatico en AMD, y en NVIDIA solo con XeSS o FSR.
+	$fixedAl = (Is-FixedFg) -and ((-not $script:isNvidia) -or $resNow[2] -in 'xess', 'fsr')
+	if ($nvAmd -or $fixedAl) {
 		$psargs += '-AntiLag'
 		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y
 		# con DLSS Frame Generation, Reflex en modo Boost.
