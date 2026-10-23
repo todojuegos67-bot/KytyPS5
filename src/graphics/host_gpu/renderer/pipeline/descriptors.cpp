@@ -579,7 +579,7 @@ static uint32_t TextureReduceLevels(bool small_video_memory) {
 	static const uint32_t levels = [&] {
 		const char*    value  = std::getenv("KYTY_TEXTURE_REDUCE");
 		const uint32_t chosen = value != nullptr && value[0] != '\0'
-		                            ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2))
+		                            ? (value[0] == 'h' ? 1u : static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2)))
 		                            : (small_video_memory ? 1u : 0u);
 		if (chosen != 0) {
 			std::printf("Textures: large block-compressed textures held without their %u largest level(s) "
@@ -592,6 +592,15 @@ static uint32_t TextureReduceLevels(bool small_video_memory) {
 	return levels;
 }
 
+// KYTY_TEXTURE_REDUCE=h (launcher "Alto"): one level left out, only of textures of at least 2048 texels on a side.
+static uint32_t TextureReduceMinSize() {
+	static const uint32_t size = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_REDUCE");
+		return (value != nullptr && value[0] == 'h') ? 2048u : 1024u;
+	}();
+	return size;
+}
+
 static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc, bool small_video_memory) {
 	const auto  base = desc.view_info.base_level;
 	const auto  last = base + desc.view_info.level_count - 1u;
@@ -599,7 +608,7 @@ static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc
 	// The levels left out of a large BC texture (none where the view reads only those, nor of one the GPU wrote: the
 	// character creator compresses faces on the GPU through texel views of the same memory, which must stay whole).
 	const auto reduce = TextureReduceLevels(small_video_memory);
-	const auto drop   = reduce != 0 && full.IsBlock() && std::max(full.extent.width, full.extent.height) >= 1024u &&
+	const auto drop   = reduce != 0 && full.IsBlock() && std::max(full.extent.width, full.extent.height) >= TextureReduceMinSize() &&
 	                          full.resources.levels > reduce && last >= reduce &&
 	                          !cache.IsRegionGpuModified(full.data.address, full.data.size) &&
 	                          !cache.HasGpuWrittenImageOverlap(full.data.address, full.data.size)
