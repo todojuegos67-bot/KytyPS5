@@ -1,0 +1,44 @@
+DEMON'S SOULS (PS5) EN PC - NOVEDADES / WHAT'S NEW
+==================================================
+
+Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
+
+
+1. LAUNCHER EN ESPANOL E INGLES / SPANISH AND ENGLISH LAUNCHER
+--------------------------------------------------------------
+Dos columnas, todo agrupado. Two columns, everything grouped.
+
+
+2. MODOS SOULS / SOULS MODES
+----------------------------
+- Ligero / Light: graficas de 8 GB, 16 GB de RAM.
+- Equilibrado / Balanced: RTX 3080, RX 6800 / 6900.
+- Ultra: RTX 5060 - 5070 Ti, RX 9070 / 9070 XT.
+- Extremo / Extreme: RTX 5080, 5090 o superior. Para enfermos de Souls.
+Los FPS dependen de tu GPU y tu CPU. FPS depend on your GPU and CPU.
+
+
+3. OPCIONES DEL PROPIO JUEGO / THE GAME'S OWN SETTINGS
+------------------------------------------------------
+- Detail: Ultra / Very High (cine) / High (PS5) / Normal / Low:
+  sombras, iluminacion y relieve (teselado).
+- Reflections, Object Fade y AA Sharpness: Ultra a Low.
+- Texturas, Distancia y Sombras con nivel nuevo "Alto".
+- Motion Blur, Depth of Field, Vignette, Bloom, Eye Adaptation (si/no).
+- Texturas nitidas con DLSS/XeSS/FSR, sin estropear la niebla.
+
+
+4. RENDIMIENTO / PERFORMANCE
+----------------------------
+- DLSS frame generation x4 suave; modo dinamico que llena el monitor.
+- DLSS tambien con el frame generation de AMD.
+- Optimizacion para graficas de 8 GB (casilla).
+- Aviso de RAM libre al jugar: te dice que cerrar si vas justo.
+
+
+5. CONTROLES / CONTROLS
+-----------------------
+- Mapear mando (PS5 / Xbox / 8BitDo) y teclado y raton.
+
+
+Donaciones / Donations: PayPal todojuegos67@gmail.com  -  Dona tu alma.

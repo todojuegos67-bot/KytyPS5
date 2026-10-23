@@ -413,6 +413,7 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 	for (uint32_t i = 0; i < 16; i++) inputs.view_to_clip[i] = Word(packet, ViewToClipWord + i);
 	inputs.near_plane = Word(packet, NearWord);
 	inputs.far_plane  = Word(packet, FarWord);
+	inputs.graphics   = &m_context.GetGraphics();
 	// The exposure: the float the 1x1 32-bit float texture of slot 5 holds (the game's constants), read as a buffer.
 	ShaderTextureResource exposure_texture {};
 	std::memcpy(exposure_texture.fields, packet.textures[SlotExposure], sizeof(exposure_texture.fields));
@@ -450,8 +451,93 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		record.timing       = timing;
 		record.timing_entry = static_cast<uint32_t>(timing->written++ % Timing::Entries);
 	}
+	// KYTY_SSR with KYTY_SSR_GBUF: the G-buffer target holding roughness, sampled read only (its contents untouched).
+	Image*                 ssr_material = nullptr;
+	ImageSubresourceRange  ssr_range {};
+	if (dlss && FrameGen::SsrWanted()) {
+		FrameGen::SsrTarget target;
+		int                 channel = -1;
+		bool                gloss   = false;
+		if (FrameGen::SsrMaterial(target, channel, gloss)) {
+			Image* image = cache.TryGetImage(target.id);
+			if (image != nullptr && image->info.data.address == target.address && target.width == inputs.color.extent.width &&
+			    target.height == inputs.color.extent.height && image != &color && image != &depth && image != &motion &&
+			    image != &output && !image->info.IsDepth()) {
+				auto view_info        = target.view;
+				view_info.usage       = vk::ImageUsageFlagBits::eSampled;
+				view_info.mapping     = {};
+				view_info.level_count = 1;
+				view_info.layer_count = 1;
+				view_info.type        = vk::ImageViewType::e2D;
+				vk::ImageView view    = nullptr;
+				{
+					std::scoped_lock view_lock {cache.m_lock};
+					view = image->FindView(view_info);
+				}
+				if (view != nullptr) {
+					inputs.material.image   = image->backing.image;
+					inputs.material.view    = view;
+					inputs.material.layout  = vk::ImageLayout::eShaderReadOnlyOptimal;
+					inputs.material.format  = view_info.format;
+					inputs.material.extent  = {target.width, target.height};
+					inputs.material.usage   = image->backing.usage;
+					inputs.material.level   = view_info.base_level;
+					inputs.material.layer   = view_info.base_layer;
+					inputs.material_channel = channel;
+					inputs.material_gloss   = gloss;
+					ssr_material            = image;
+					ssr_range               = ImageSubresourceRange {view_info.base_level, 1, view_info.base_layer, 1};
+				}
+			}
+		}
+	}
+	// KYTY_SSR: the packed (R32_UINT) G-buffer layers, sampled read only (normals / roughness decoded in ssr.comp).
+	std::array<Image*, 4>                packed_images {};
+	std::array<ImageSubresourceRange, 4> packed_ranges {};
+	if (dlss && FrameGen::SsrWanted()) {
+		std::array<FrameGen::SsrTarget, 4> targets {};
+		const uint32_t                     n = FrameGen::SsrPackedTargets(targets);
+		for (uint32_t i = 0; i < n; ++i) {
+			const auto& target = targets[i];
+			Image*      image  = cache.TryGetImage(target.id);
+			if (image == nullptr || image->info.data.address != target.address || target.width != inputs.color.extent.width ||
+			    target.height != inputs.color.extent.height || image == &color || image == &depth || image == &motion ||
+			    image == &output || image->info.IsDepth() || image == ssr_material)
+				break;
+			auto view_info        = target.view;
+			view_info.format      = vk::Format::eR32Uint;
+			view_info.usage       = vk::ImageUsageFlagBits::eSampled;
+			view_info.mapping     = {};
+			view_info.level_count = 1;
+			view_info.layer_count = 1;
+			view_info.type        = vk::ImageViewType::e2D;
+			vk::ImageView view    = nullptr;
+			{
+				std::scoped_lock view_lock {cache.m_lock};
+				view = image->FindView(view_info);
+			}
+			if (view == nullptr) break;
+			auto& p    = inputs.packed[i];
+			p.image    = image->backing.image;
+			p.view     = view;
+			p.layout   = vk::ImageLayout::eShaderReadOnlyOptimal;
+			p.format   = vk::Format::eR32Uint;
+			p.extent   = {target.width, target.height};
+			p.usage    = image->backing.usage;
+			p.level    = view_info.base_level;
+			p.layer    = view_info.base_layer;
+			packed_images[i]    = image;
+			packed_ranges[i]    = ImageSubresourceRange {view_info.base_level, 1, view_info.base_layer, 1};
+			inputs.packed_count = i + 1;
+		}
+	}
 	if (dlss) {
 		color.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, range(bindings[0]), vk_buffer);
+		for (uint32_t i = 0; i < inputs.packed_count; ++i)
+			packed_images[i]->Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, packed_ranges[i],
+			                          vk_buffer);
+		if (ssr_material != nullptr)
+			ssr_material->Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, ssr_range, vk_buffer);
 		motion.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, range(bindings[1]), vk_buffer);
 		depth.Transit(depth_layout, vk::AccessFlagBits2::eShaderRead, range(bindings[2]), vk_buffer);
 		output.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
@@ -466,6 +552,11 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		buffer.InvalidateGraphicsState(); // (what DLSS bound)
 	} else {
 		// No DLSS: the input stretched to the output (no anti-aliasing), then the exposure.
+		if (static bool said = false; !said && FrameGen::SsgiWanted()) {
+			said = true;
+			std::printf("SSGI: skipped (no upscaler active: it runs only before DLSS / XeSS / FSR)\n");
+			std::fflush(stdout);
+		}
 		color.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range(bindings[0]), vk_buffer);
 		output.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, range(bindings[3]), vk_buffer);
 		vk::ImageBlit blit {};

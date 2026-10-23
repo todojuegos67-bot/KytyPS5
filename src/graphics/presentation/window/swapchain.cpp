@@ -20,6 +20,7 @@
 #endif
 #include "frame-gen.h"
 #include "local/fsr3-fg.h"
+#include "local/anti-lag.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
 #if defined(_WIN32)
@@ -62,6 +63,7 @@ struct Presenter::Frame {
 	bool                   hdr          = false; // BT.2100 PQ pixels
 	bool                   blank        = false; // a cleared frame (no guest picture)
 	bool                   scene        = false; // the game's 3D view (FrameGen::TakeScene)
+	uint64_t               latency_index = 0;    // KYTY_ANTILAG (local/anti-lag.h)
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -325,6 +327,7 @@ public:
 	                                           bool draw_system_overlay, bool scene);
 	uint64_t             Submit(CommandScheduler& scheduler);
 	[[nodiscard]] Status Present();
+	void                 SetPresentId(uint64_t id) noexcept { m_present_id = id; }
 
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
 		return static_cast<uint32_t>(m_images.size());
@@ -381,6 +384,7 @@ private:
 	uint32_t                    m_frame_index = 0;
 	vk::Rect2D                  m_present_region {};
 	bool                        m_fsr3 = false;
+	uint64_t                    m_present_id = 0; // KYTY_ANTILAG: VkPresentIdKHR (0 none)
 	bool                        m_exclusive_app      = false; // application controlled exclusive full screen
 	bool                        m_exclusive_acquired = false;
 	std::chrono::steady_clock::time_point m_exclusive_retry {};
@@ -997,7 +1001,11 @@ void Swapchain::Create() {
 	// (The chain lives until the swapchain is made: Streamline's vkCreateSwapchainKHR and AMD's frame interpolation
 	// swapchain pass it on to the driver's; AMD's copies VkSurfaceFullScreenExclusive[Win32]InfoEXT, FFX 1.1.4.)
 	if (exclusive) create_info.pNext = &exclusive_info;
+	// KYTY_ANTILAG (Reflex): the latency mode for the swapchain (FSR 3's: its real one, with the patched DLL only).
+	const void* chain_base = create_info.pNext;
+	if (Fsr3::Requested()) create_info.pNext = AntiLag::ChainSwapchain(const_cast<void*>(chain_base), true);
 	m_fsr3 = Fsr3::CreateSwapchain(graphics, create_info, &m_handle);
+	if (!m_fsr3) create_info.pNext = AntiLag::ChainSwapchain(const_cast<void*>(chain_base), false);
 	if (!m_fsr3) {
 		if (exclusive && !FrameGen::StreamlineLoaded() && exclusive_info.fullScreenExclusive != kFullScreenExclusiveApplicationControlled) {
 			// (FSR 3 asked for but its swapchain not made: the plain one, application controlled.)
@@ -1007,13 +1015,14 @@ void Swapchain::Create() {
 		if (result != vk::Result::eSuccess && exclusive) {
 			LogExclusive("not supported (vkCreateSwapchainKHR with it: " + vk::to_string(result) + "): borderless full screen");
 			exclusive         = false;
-			create_info.pNext = nullptr;
+			create_info.pNext = AntiLag::ChainSwapchain(nullptr, false);
 			m_handle          = nullptr;
 			result            = graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle);
 		}
 		RequireVulkanSuccess(result, "vkCreateSwapchainKHR");
 	}
 	EXIT_IF(m_handle == nullptr);
+	AntiLag::OnSwapchain(static_cast<VkSwapchainKHR>(m_handle), m_fsr3);
 	if (exclusive) {
 		if (!m_fsr3 && FrameGen::StreamlineLoaded()) {
 			LogExclusive("left to the driver (Streamline / DLSS-G frame generation: not application controlled)");
@@ -1115,6 +1124,7 @@ void Swapchain::Destroy() {
 	ReleaseExclusive("swapchain made again");
 	m_exclusive_app = false;
 	if (m_handle != nullptr) {
+		AntiLag::OnSwapchain(VK_NULL_HANDLE, false);
 		if (m_fsr3) {
 			Fsr3::DestroySwapchain(graphics, m_handle);
 		} else {
@@ -1368,6 +1378,13 @@ Swapchain::Status Swapchain::Present() {
 	present.pImageIndices      = &m_image_index;
 	present.pWaitSemaphores    = &ready;
 	present.waitSemaphoreCount = 1;
+	// KYTY_ANTILAG (NVIDIA Reflex): the frame index as the present's id, as its latency markers have it.
+	vk::PresentIdKHR present_id {};
+	if (m_present_id != 0) { // (FSR 3: the patched DLL passes it to the real frame's present)
+		present_id.swapchainCount = 1;
+		present_id.pPresentIds    = &m_present_id;
+		present.pNext             = &present_id;
+	}
 
 	UpdateExclusive();
 	if (const double cap = FpsCapInterval(m_window.window); cap > 0.0) {
@@ -1455,6 +1472,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(),
 		                        buffer, frame->fg, image_id, image);
 	}
+	FrameGen::ReflexGuestFlip(frame->fg); // 10-23: DLSS-G's Reflex markers at the guest frame boundary
 	return *frame;
 }
 
@@ -1463,6 +1481,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(producer == nullptr || producer->IsInvalid());
 	auto*           frame = m_impl->frames.Acquire();
+	frame->fg.reflex_index = 0; // (a blank frame: its Reflex markers at the present)
 	RenderLockGuard render_lock(m_impl->renderer.GetMutex());
 	m_impl->ClearFrame(*frame, width, height, opaque, producer);
 	return *frame;
@@ -1604,6 +1623,10 @@ bool Presenter::IsSceneFrame(const Frame& frame) noexcept {
 	return frame.scene;
 }
 
+void Presenter::SetLatencyIndex(Frame& frame, uint64_t index) noexcept {
+	frame.latency_index = index;
+}
+
 bool Presenter::GeneratesFrames() noexcept {
 	return FrameGen::Enabled() || Fsr3::Active();
 }
@@ -1707,6 +1730,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		const bool generate = FrameGen::Enabled();
 		if (generate) {
 			const auto before_begin = std::chrono::steady_clock::now();
+			FrameGen::SetPresentReflexIndex(frame.reusing_last ? 0u : frame.fg.reflex_index);
 			FrameGen::BeforePresent(frame.fg.valid && !frame.reusing_last && !port_menu ? &frame.fg : nullptr,
 			                        swapchain.Extent(), swapchain.PresentRegion(), swapchain.Format(),
 			                        swapchain.ImageCount());
@@ -1718,7 +1742,17 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			Fsr3::BeforePresent(m_impl->window.graphic_ctx, frame.fg.valid && !frame.reusing_last && !port_menu ? &frame.fg : nullptr,
 			                    swapchain.Handle(), swapchain.Extent(), swapchain.Format());
 		}
+		// KYTY_ANTILAG: the frame's PRESENT mark (a new guest frame only; with FSR 3 frame generation this is the real
+		// frame going to its swapchain, never one it generates).
+		const uint64_t latency_index = !reuse && !frame.reusing_last ? frame.latency_index : 0;
+		if (latency_index != 0) {
+			AntiLag::OnPresent(latency_index);
+			frame.latency_index = 0;
+		}
+		swapchain.SetPresentId(AntiLag::PresentId(latency_index));
 		status = swapchain.Present();
+		swapchain.SetPresentId(0);
+		AntiLag::AfterPresent(latency_index);
 		if (generate) {
 			FrameGen::AfterPresent();
 			FrameGen::NoteFlipPresentMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - flip_begin).count());

@@ -28,6 +28,7 @@
 #include "loader/systemContent.h"
 #include "local/fsr3-fg.h"
 #include "local/frame-gen.h"
+#include "local/anti-lag.h"
 
 #include <algorithm>
 #include <array>
@@ -234,9 +235,11 @@ private:
 		int64_t                     flip_arg;
 		uint64_t                    submit_ptc;
 		std::chrono::steady_clock::time_point submit_time;
+		std::chrono::steady_clock::time_point ready_time; // GPU work done (Complete): KYTY_FG_PACING's measure
 		FlipRequestSource           source;
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
+		uint64_t                    latency_index; // KYTY_ANTILAG: the frame's index (local/anti-lag.h), 0 none
 	};
 
 	Graphics::Presenter& m_presenter;
@@ -535,6 +538,24 @@ static int Unlock30Floor() {
 	return Unlock30() ? SceneFreeFloor() : 0;
 }
 
+// KYTY_CINEMATIC_FLIP_RATE (default 1): in-engine cinematics keep the game's own flip rate in real time (see Flip).
+static bool CinematicFlipRateEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CINEMATIC_FLIP_RATE");
+		const bool  r     = value == nullptr || std::strcmp(value, "0") != 0;
+		std::printf("Flips: in-engine cinematics keep the game's flip rate in real time (KYTY_CINEMATIC_FLIP_RATE=%d)\n", r ? 1 : 0);
+		std::fflush(stdout);
+		return r;
+	}();
+	return on;
+}
+
+// Vblanks - 1 between flips for the game's flip rate (1: 30 fps, 2: 20 fps) on this vblank frequency.
+static int CinematicFlipRateFloor(int flip_rate) {
+	const double vblanks = static_cast<double>(Config::GetVblankFrequency()) * (flip_rate + 1) / 60.0;
+	return std::max(0, static_cast<int>(std::lround(vblanks)) - 1);
+}
+
 // Frame generation above 60 Hz: the game's frames too keep 60 (KYTY_FRAMEGEN_BASE=<Hz>: another rate, 0: none). DLSS-G
 // paces the frames it generates from the intervals between the game's own; on the 120 Hz vblanks a game between 60 and
 // 120 fps flipped after one vblank or two by turns (8.3 or 16.7 ms, 3-25 ms with late vblanks; at 60 Hz 16.7 +- 0.3 ms),
@@ -690,6 +711,37 @@ bool CinematicPlaying() noexcept {
 	}())).count();
 	const auto cinematic = g_cinematic_ns.load(std::memory_order_relaxed);
 	return cinematic != 0 && std::chrono::steady_clock::now().time_since_epoch().count() - cinematic < hold;
+}
+// KYTY_CUTSCENE_HOLD (default 1; 0: CinematicPlaying's 2 s only): an in-engine cinematic counts as playing from its
+// files' first read until the player moves a stick (off centre, NotePlayerActivity) more than 1.5 s
+// after its last file read - a skip, or the play after it - or 15 minutes. Its files are read only while it loads
+// (log 20261022-022146: scn080000_voidwalk read for ~2 s, then played for minutes at 60 flips, twice too fast in the
+// Cinematic mode); the game's own playing state is not known.
+static std::atomic<int64_t> g_activity_ns {0};
+static std::atomic<bool>    g_cutscene_held {false};
+void NotePlayerActivity() noexcept {
+	g_activity_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+}
+bool CutsceneHeld() noexcept {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CUTSCENE_HOLD");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	const auto cinematic = g_cinematic_ns.load(std::memory_order_relaxed);
+	if (!on || cinematic == 0) return CinematicPlaying();
+	using namespace std::chrono;
+	const auto now      = steady_clock::now().time_since_epoch().count();
+	const auto activity = g_activity_ns.load(std::memory_order_relaxed);
+	const bool ended    = (activity > cinematic + duration_cast<steady_clock::duration>(milliseconds(1500)).count() &&
+                        activity <= now) ||
+	                   now - cinematic > duration_cast<steady_clock::duration>(minutes(15)).count();
+	const bool held = !ended;
+	if (g_cutscene_held.exchange(held, std::memory_order_relaxed) != held) {
+		std::printf("Cutscene: %s (KYTY_CUTSCENE_HOLD)\n", held ? "playing, flips at the game's own rate"
+		                                                         : "ended (the player's input), flips as before");
+		std::fflush(stdout);
+	}
+	return held;
 }
 bool MoviePlaying() noexcept {
 	const auto last = g_movie_frame_ns.load(std::memory_order_relaxed);
@@ -1245,6 +1297,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	r.submit_time = std::chrono::steady_clock::now();
 	r.source     = source;
 	r.state      = RequestState::Reserved;
+	r.latency_index = Graphics::AntiLag::OnFlipReserved(); // KYTY_ANTILAG (local/anti-lag.h)
 
 	pending.push_back(r);
 	request_id = r.id;
@@ -1450,7 +1503,8 @@ void FlipQueue::Complete(uint64_t request_id) {
 			m_mutex.Unlock();
 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
 		}
-		request->state = RequestState::Ready;
+		request->state      = RequestState::Ready;
+		request->ready_time = std::chrono::steady_clock::now();
 		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
 		return;
@@ -1490,6 +1544,109 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	};
 	while (has_request()) {
 		m_done_cond_var.Wait(&m_mutex);
+	}
+}
+
+// KYTY_FG_PACING (default on with frame generation, =0 off): below the flip floor (60, or SetDynamicFlipFps) the real
+// frames landed on the vblank grid wherever they finished (35-55 fps: present interval sd 2-7 ms), a judder frame
+// generation multiplies. Then each 3D flip is released instead at the last release + a smoothed target interval with
+// a precise wait, so the real frames are evenly spaced. The target follows the measured frame cost (ready time since
+// the later of the previous frame's ready and release) + 4%, rising fast and falling slowly, in [floor, 1/20 s];
+// it engages only above floor + 5% and lets go below floor + 1%: at the floor the grid as before. Not
+// KYTY_FLIP_WHEN_READY (an unpaced present: ghosting with FG). The game's clock is untouched (flips only wait).
+namespace {
+struct FgPacing {
+	bool                                  active = false;
+	double                                cost   = 0.0; // smoothed frame cost, s
+	double                                target = 0.0; // release interval while active, s
+	std::chrono::steady_clock::time_point last_ready {};
+	std::chrono::steady_clock::time_point last_release {};
+	// Per-second stats of the release intervals while active.
+	std::chrono::steady_clock::time_point stats_start {};
+	uint32_t                              n = 0;
+	double                                sum = 0.0, sum2 = 0.0;
+};
+FgPacing g_fg_pacing; // (FlipQueue::Flip runs on the vblank thread only)
+} // namespace
+
+static bool FgPacingEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_FG_PACING");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
+// A frame's measure; true when it is to be released on time (not on the vblank grid).
+// Off (vblank grid, nothing held by us): the ready-to-ready interval is the real cost; engage above floor + 5%.
+// On: never a cost measured through our own hold (that ratcheted to 1/20 s, 10-21). Instead the frame's slack against
+// its scheduled release (last release + target): blocked behind our release, the game's next frame is ready at
+// release + cost, so slack = target - cost exactly. Late: up by most of the lateness; early by more than the 4%
+// headroom: down by half the slack (fast, and the hold never exceeds the cost by much). Off below floor + 1%.
+static bool FgPacingUpdate(std::chrono::steady_clock::time_point ready, double floor_interval) {
+	auto&      p    = g_fg_pacing;
+	const bool have = p.last_ready != std::chrono::steady_clock::time_point {};
+	if (!p.active) {
+		const double sample =
+		    have ? std::clamp(std::chrono::duration<double>(ready - p.last_ready).count(), 0.0, 0.1) : floor_interval;
+		if (p.cost <= 0.0) p.cost = floor_interval;
+		p.cost += (sample - p.cost) * 0.25;
+		p.last_ready = ready;
+		if (p.cost * 1.04 > floor_interval * 1.05) {
+			p.active = true;
+			p.target = std::clamp(p.cost * 1.04, floor_interval, 1.0 / 20.0);
+		}
+		return p.active;
+	}
+	p.last_ready          = ready;
+	const auto   scheduled = p.last_release + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+	                                            std::chrono::duration<double>(p.target));
+	const double slack     = std::chrono::duration<double>(scheduled - ready).count(); // > 0: early
+	if (slack < 0.0) {
+		p.target += std::min(-slack, 0.1) * 0.75;
+	} else if (slack > p.target * 0.04) {
+		p.target -= (slack - p.target * 0.04) * 0.5;
+	}
+	p.target = std::clamp(p.target, floor_interval, 1.0 / 20.0);
+	p.cost   = p.target / 1.04;
+	if (p.target < floor_interval * 1.01) {
+		p.active = false;
+		p.cost   = floor_interval;
+		std::printf("[pacing] off: real frames at the floor (%.1f fps), vblank grid\n", 1.0 / floor_interval);
+		std::fflush(stdout);
+	}
+	return p.active;
+}
+
+// Movies, cinematics, menus, before the first input: nothing paced, and the state starts over afterwards.
+static void FgPacingReset() {
+	g_fg_pacing.active     = false;
+	g_fg_pacing.cost       = 0.0;
+	g_fg_pacing.last_ready = {};
+}
+
+static void FgPacingNoteRelease(std::chrono::steady_clock::time_point now, bool paced) {
+	auto& p = g_fg_pacing;
+	if (paced && p.last_release != std::chrono::steady_clock::time_point {}) {
+		const double iv = std::chrono::duration<double>(now - p.last_release).count();
+		if (iv < 0.1) {
+			p.n++;
+			p.sum += iv;
+			p.sum2 += iv * iv;
+		}
+	}
+	p.last_release = now;
+	if (p.stats_start == std::chrono::steady_clock::time_point {}) p.stats_start = now;
+	if (std::chrono::duration<double>(now - p.stats_start).count() >= 1.0) {
+		if (p.n > 0) {
+			const double mean = p.sum / p.n;
+			const double sd   = std::sqrt(std::max(0.0, p.sum2 / p.n - mean * mean));
+			std::printf("[pacing] target %.2f ms (real %.1f fps), sd %.2f ms\n", p.target * 1000.0, 1.0 / mean, sd * 1000.0);
+			std::fflush(stdout);
+		}
+		p.stats_start = now;
+		p.n           = 0;
+		p.sum = p.sum2 = 0.0;
 	}
 }
 
@@ -1549,6 +1706,13 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 				floor = std::max(floor, g_dyn_flip_floor.load(std::memory_order_relaxed));
 			}
 		}
+		// An in-engine cinematic with the game's own flip rate (Demon's Souls' Cinematic mode: sceVideoOutSetFlipRate(1),
+		// 30 fps): its sequencer advances a fixed 1/30 s a frame (fixedDt), so on a virtual vblank (360-960 Hz) the
+		// game's "every 2nd vblank" and SceneFreeFloor's 60 played it twice too fast (10-22). Kept at the console's
+		// time: (flip_rate + 1) / 60 s between flips. KYTY_CINEMATIC_FLIP_RATE=0 turns it off.
+		if (CinematicFlipRateEnabled() && r.cfg->flip_rate > 0 && CutsceneHeld()) {
+			floor = std::max(floor, CinematicFlipRateFloor(r.cfg->flip_rate));
+		}
 	}
 	// FSR 3 under the G-SYNC cap (Fsr3::RealFrameInterval: 1/56 s at x4 on 240 Hz, KYTY_VRR_CAP_FPS): the game's own
 	// flips keep to that grid, as Reflex holds the game for DLSS-G. Held only at the present, the game made 60 and 4
@@ -1562,8 +1726,43 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	                                  std::chrono::duration<double>(paced_interval));
 	const auto   paced_slack    = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
 	                                  std::chrono::duration<double>(0.5 / std::max(Config::GetVblankFrequency(), 1u)));
-	const bool   paced_wait     = paced_interval > 0.0 && paced_now + paced_slack < s_paced_next;
-	const bool due = when_ready ? IsFlipDueReadyLocked(*r.cfg, r.generation, floor) : IsFlipDueLocked(*r.cfg, r.generation, floor);
+	bool         paced_wait     = paced_interval > 0.0 && paced_now + paced_slack < s_paced_next;
+	bool due = when_ready ? IsFlipDueReadyLocked(*r.cfg, r.generation, floor) : IsFlipDueLocked(*r.cfg, r.generation, floor);
+	// KYTY_FG_PACING: a frame slower than the floor is released at last release + target, not on a vblank tick.
+	// Within a vblank of that time it is waited for precisely here (the port unlocked: the game reserves its next
+	// flip meanwhile; m_processing keeps this request at the front).
+	const uint32_t vblank_hz = std::max(Config::GetVblankFrequency(), 1u);
+	const bool     fg_paced  = !when_ready && FgPacingEnabled() && r.frame != nullptr && !fg_off && !MoviePlaying() && !CinematicPlaying() &&
+	                      Graphics::Presenter::GeneratesFrames() && Graphics::Presenter::IsSceneFrame(*r.frame) &&
+	                      Graphics::Presenter::IsGameView(*r.frame) && r.ready_time != g_fg_pacing.last_ready &&
+	                      FgPacingUpdate(r.ready_time, std::max(static_cast<double>(floor + 1) / vblank_hz, 1.0 / 60.0));
+	if (r.frame != nullptr && (fg_off || MoviePlaying() || CinematicPlaying() || !Graphics::Presenter::IsSceneFrame(*r.frame))) {
+		FgPacingReset();
+	}
+	static bool s_fg_paced = false; // this request's decision, kept while it waits for its time (vblank to vblank)
+	static uint64_t s_fg_id = 0;
+	if (s_fg_id != r.id) {
+		s_fg_id    = r.id;
+		s_fg_paced = fg_paced;
+	}
+	if (s_fg_paced) {
+		const auto release = g_fg_pacing.last_release + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+		                                                    std::chrono::duration<double>(g_fg_pacing.target));
+		const auto period  = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+		    std::chrono::duration<double>(1.0 / vblank_hz));
+		auto now = std::chrono::steady_clock::now();
+		due      = now + period >= release && IsFlipDueReadyLocked(*r.cfg, r.generation, 0);
+		if (due && now < release) {
+			r.cfg->mutex.Unlock();
+			std::this_thread::sleep_until(release - std::chrono::microseconds(500));
+			while (std::chrono::steady_clock::now() < release) std::this_thread::yield();
+			r.cfg->mutex.Lock();
+			due = IsFlipDueReadyLocked(*r.cfg, r.generation, 0);
+		}
+		// The FSR 3 / DLSS-G cap interval (RealFrameInterval) is at most the floor, so under the target: this replaces it.
+		// (Reflex's DLSS-G frame limit is that same cap or none, never above the floor: it never holds a paced frame.)
+		if (g_fg_pacing.target >= paced_interval) paced_wait = false;
+	}
 	if (paced_wait || !due) {
 		r.cfg->mutex.Unlock();
 		Common::LockGuard queue_lock(m_mutex);
@@ -1573,6 +1772,7 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	}
 
 	if (paced_interval > 0.0) s_paced_next = std::max(s_paced_next, paced_now - paced_step) + paced_step;
+	FgPacingNoteRelease(std::chrono::steady_clock::now(), s_fg_paced);
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
 	    m_requests.front().state != RequestState::Ready || !m_processing) {
@@ -1586,6 +1786,7 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	r.cfg->mutex.Unlock();
 
 	NoteFlipSubmitted(r.submit_time);
+	Graphics::Presenter::SetLatencyIndex(*r.frame, r.latency_index);
 	m_presenter.Submit(*r.frame);
 
 	r.cfg->mutex.Lock();

@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -579,7 +580,7 @@ static uint32_t TextureReduceLevels(bool small_video_memory) {
 	static const uint32_t levels = [&] {
 		const char*    value  = std::getenv("KYTY_TEXTURE_REDUCE");
 		const uint32_t chosen = value != nullptr && value[0] != '\0'
-		                            ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2))
+		                            ? (value[0] == 'h' ? 1u : static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2)))
 		                            : (small_video_memory ? 1u : 0u);
 		if (chosen != 0) {
 			std::printf("Textures: large block-compressed textures held without their %u largest level(s) "
@@ -592,6 +593,15 @@ static uint32_t TextureReduceLevels(bool small_video_memory) {
 	return levels;
 }
 
+// KYTY_TEXTURE_REDUCE=h (launcher "Alto"): one level left out, only of textures of at least 2048 texels on a side.
+static uint32_t TextureReduceMinSize() {
+	static const uint32_t size = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_REDUCE");
+		return (value != nullptr && value[0] == 'h') ? 2048u : 1024u;
+	}();
+	return size;
+}
+
 static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc, bool small_video_memory) {
 	const auto  base = desc.view_info.base_level;
 	const auto  last = base + desc.view_info.level_count - 1u;
@@ -599,7 +609,7 @@ static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc
 	// The levels left out of a large BC texture (none where the view reads only those, nor of one the GPU wrote: the
 	// character creator compresses faces on the GPU through texel views of the same memory, which must stay whole).
 	const auto reduce = TextureReduceLevels(small_video_memory);
-	const auto drop   = reduce != 0 && full.IsBlock() && std::max(full.extent.width, full.extent.height) >= 1024u &&
+	const auto drop   = reduce != 0 && full.IsBlock() && std::max(full.extent.width, full.extent.height) >= TextureReduceMinSize() &&
 	                          full.resources.levels > reduce && last >= reduce &&
 	                          !cache.IsRegionGpuModified(full.data.address, full.data.size) &&
 	                          !cache.HasGpuWrittenImageOverlap(full.data.address, full.data.size)
@@ -1107,7 +1117,7 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 static vk::Sampler NativeSampler(RenderContext&                       context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                  uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+                                 const ShaderRecompiler::IR::DescriptorValue& value, bool lod_bias = false) {
 	auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	if (!program.info.samplers[index].depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
@@ -1115,7 +1125,78 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	if (program.info.samplers[index].force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor);
+	return context.GetSamplerCache().GetSampler(descriptor, lod_bias);
+}
+
+// KYTY_TEXTURE_LOD_BIAS: decided per bound IMAGE + sampler pair (the sampler cache never sees the image). A sampler
+// gets the biased variant only when every image the shader samples with it is a 2D (not 3D, cube or array of more
+// than 6 layers) block-compressed color texture of at least 512 texels on a side and 8 mips that the GPU never wrote
+// (no render target, nothing IsRegionGpuModified / HasGpuWrittenImageOverlap), and the sampler passes the scene-texture
+// test. Demon's Souls' volumetric fog/smoke/noise is 3D, small, uncompressed or GPU-written: a negative bias sharpened
+// its blurred low mips into hard, bright puffs. Counts logged once and every 30 s.
+enum LodBiasReason : uint32_t { LbBiased, Lb3d, LbSmall, LbFewMips, LbNotBc, LbGpuWritten, LbSampler, LbCount };
+
+static uint32_t LodBiasImageReason(TextureCache& cache, const ShaderRecompiler::IR::ImageResource& resource,
+                                   const TextureBinding& binding) {
+	const auto& info = binding.desc.info;
+	if (info.IsVolume() || resource.cube || info.type == Prospero::ImageType::kCube ||
+	    info.type == Prospero::ImageType::kColor1D || info.type == Prospero::ImageType::kColor1DArray ||
+	    info.resources.layers > 6 || binding.desc.type == TextureCache::BindingType::Storage) {
+		return Lb3d;
+	}
+	if (!info.IsBlock() || info.IsDepth() || info.samples != 1) return LbNotBc;
+	if (std::max(info.extent.width, info.extent.height) < 512u) return LbSmall;
+	if (info.resources.levels < 8u) return LbFewMips;
+	auto* image = binding.image_id ? cache.TryGetImage(binding.image_id) : nullptr;
+	if (image == nullptr || image->binding.is_target || info.tile_mode == Prospero::TileMode::kRenderTarget ||
+	    info.tile_mode == Prospero::TileMode::kDepth || cache.IsRegionGpuModified(info.data.address, info.data.size) ||
+	    cache.HasGpuWrittenImageOverlap(info.data.address, info.data.size)) {
+		return LbGpuWritten;
+	}
+	return LbBiased;
+}
+
+static bool LodBiasForSampler(TextureCache& cache, const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                              const PreparedBindings& prepared, uint32_t index,
+                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	const float extra = SamplerCache::TextureLodBias();
+	if (extra == 0.0f || SamplerCache::LodBiasLegacyAll()) return false;
+	uint32_t reason = LbCount;
+	bool     paired = false;
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.sampler != index || pair.image >= prepared.images.size()) continue;
+		paired = true;
+		const auto r = LodBiasImageReason(cache, program.info.images[pair.image], prepared.images[pair.image]);
+		if (r != LbBiased) {
+			reason = r;
+			break;
+		}
+	}
+	if (!paired) return false; // no image known for it: plain sampler, not counted
+	if (reason == LbCount) {
+		auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
+		reason          = SamplerCache::IsSceneSampler(descriptor) ? LbBiased : LbSampler;
+	}
+	static std::atomic<uint64_t> counts[LbCount] {};
+	static std::atomic<int64_t>  next_log {0};
+	counts[reason].fetch_add(1, std::memory_order_relaxed);
+	const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	int64_t due = next_log.load(std::memory_order_relaxed);
+	if (now >= due && next_log.compare_exchange_strong(due, now + 30)) {
+		std::printf("Texture LOD bias %.3f (image+sampler): biased %llu, skipped: 3d %llu, small %llu, few-mips %llu, "
+		            "not-bc %llu, gpu-written %llu, sampler %llu\n",
+		            extra, static_cast<unsigned long long>(counts[LbBiased].load()),
+		            static_cast<unsigned long long>(counts[Lb3d].load()),
+		            static_cast<unsigned long long>(counts[LbSmall].load()),
+		            static_cast<unsigned long long>(counts[LbFewMips].load()),
+		            static_cast<unsigned long long>(counts[LbNotBc].load()),
+		            static_cast<unsigned long long>(counts[LbGpuWritten].load()),
+		            static_cast<unsigned long long>(counts[LbSampler].load()));
+		std::fflush(stdout);
+	}
+	return reason == LbBiased;
 }
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
@@ -1200,7 +1281,9 @@ void RenderExecutor::PrepareBindingsInto(const ShaderStageRuntime& runtime,
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
+		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i],
+		                                          LodBiasForSampler(m_context.GetTextureCache(), program, prepared, i,
+		                                                            snapshot.samplers[i])));
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.bindings.user_data_registers) {

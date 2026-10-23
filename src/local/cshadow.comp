@@ -1,0 +1,310 @@
+#version 450
+// KYTY_CONTACT_SHADOWS (frame-gen.cpp, "Sombras RT"): screen-space ray-marched contact shadows toward the sun on the
+// render-resolution color, before the upscaler (after SSGI when both are on). No scene geometry: short rays from each
+// pixel toward the light, marched against the game's depth buffer. One module, modes (push.misc.x):
+//   0 trace:     16 / 24 / 56 steps (levels 1 / 2 / 3), ray 0.5..2 m grown with depth (x1.15 at 3), thickness test,
+//                per-frame IGN jitter, binary-search hit refine at 3 -> raw (visibility in rgba) + gbuf_out (normal, z)
+//                at the trace resolution (half for level 1, full for 2 and 3)
+//   1 temporal:  SVGF-style reprojection as ssgi.comp (alpha max(1/count, 0.1; 0.05 at 3), clamp, disocclusion)
+//   2 a-trous:   5x5 SVGF edge stops; steps 1, 2 (, 4 at 2 and 3)
+//   4 composite: joint bilateral upsample; color *= mix(1, vis, strength * fade) on lit, opaque, non-sky pixels
+//   5 vote:      which of up to 4 candidate light directions the game's own lighting agrees with: the mean luma of
+//                pixels facing each candidate against those facing away (atomics into vote_buf; the CPU reads them)
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2) uniform sampler2D motion_tex;
+layout(binding = 3) uniform sampler2D src_a;
+layout(binding = 4) uniform sampler2D src_b;
+layout(binding = 5) uniform sampler2D gbuf_cur;
+layout(binding = 6) uniform sampler2D gbuf_prev;
+layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
+layout(binding = 8, rgba16f) uniform writeonly image2D gbuf_out;
+layout(binding = 9) uniform sampler2D aux_tex;
+layout(binding = 10, rgba16f) uniform writeonly image2D aux_out;
+layout(binding = 11, std430) buffer VoteBuf { uint v[]; } vote_buf; // per slot 16 words: candidate k: lit sum, lit n, away sum, away n
+
+layout(push_constant) uniform Push {
+	vec4  proj;      // M[0], M[5], M[8], M[9] (row vectors)
+	vec4  depth_map; // A = M[10], B = M[14], C = M[11], D = M[15]
+	vec4  motion;    // motion_scale.xy, render size.xy
+	vec4  trace;     // trace size.xy, strength, length scale
+	ivec4 misc;      // mode, frame, level, flags (bit0 reset, bit1 history valid); vote: slot in misc.w >> 8
+	vec4  extra;     // a-trous step; light direction in view space (toward the light) in yzw
+	vec4  cand[4];   // vote: candidate view-space directions (w 1 = in use)
+} push;
+
+vec2 RenderSize() { return push.motion.zw; }
+vec2 TraceSize() { return push.trace.xy; }
+
+float ViewZ(float d) {
+	float den = d * push.depth_map.z - push.depth_map.x;
+	return abs(den) > 1e-12 ? (push.depth_map.y - d * push.depth_map.w) / den : 1e6;
+}
+vec3 ViewPos(vec2 uv, float d) {
+	float z  = ViewZ(d);
+	float w  = z * push.depth_map.z + push.depth_map.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	return vec3((nd.x * w - z * push.proj.z) / push.proj.x, (nd.y * w - z * push.proj.w) / push.proj.y, z);
+}
+vec3 Project(vec3 p) {
+	float w  = p.z * push.depth_map.z + push.depth_map.w;
+	vec2  nd = vec2(p.x * push.proj.x + p.z * push.proj.z, p.y * push.proj.y + p.z * push.proj.w) / w;
+	return vec3(nd * 0.5 + 0.5, (p.z * push.depth_map.x + push.depth_map.y) / w);
+}
+bool IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e3; }
+float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+vec3 NormalAt(vec2 uv, vec3 p) {
+	vec2 t  = 1.0 / RenderSize();
+	vec3 px = ViewPos(uv + vec2(t.x, 0), textureLod(depth_tex, uv + vec2(t.x, 0), 0).r);
+	vec3 nx = ViewPos(uv - vec2(t.x, 0), textureLod(depth_tex, uv - vec2(t.x, 0), 0).r);
+	vec3 py = ViewPos(uv + vec2(0, t.y), textureLod(depth_tex, uv + vec2(0, t.y), 0).r);
+	vec3 ny = ViewPos(uv - vec2(0, t.y), textureLod(depth_tex, uv - vec2(0, t.y), 0).r);
+	vec3 dx = abs(px.z - p.z) < abs(p.z - nx.z) ? px - p : p - nx;
+	vec3 dy = abs(py.z - p.z) < abs(p.z - ny.z) ? py - p : p - ny;
+	vec3 n  = normalize(cross(dx, dy));
+	if (dot(n, -p) < 0.0) n = -n;
+	return n;
+}
+
+// The march: visibility toward the light (1 lit, 0 occluded by something in the depth buffer).
+float March(vec3 p, vec3 n, vec3 l, ivec2 pixel) {
+	int   q     = push.misc.z;
+	int   steps = q >= 3 ? 56 : q >= 2 ? 24 : 16;
+	float z     = abs(p.z);
+	// 0.5 m near, 2 m by 40 m (x1.5 at Ultra), times KYTY_CONTACT_SHADOWS_LENGTH.
+	float len   = mix(0.5, 2.0, smoothstep(2.0, 40.0, z)) * (q >= 3 ? 1.15 : 1.0) * push.trace.w;
+	// Thickness: what is behind a surface by more than this is not taken as an occluder (thin-object leak guard).
+	float thick = 0.08 + 0.015 * z;
+	float jit   = Ign(vec2(pixel) + float(push.misc.y % 64) * 5.588238);
+	vec3  o     = p + n * (0.004 * z + 0.005) + l * (0.002 * z);
+	float k_prev = 0.0;
+	for (int s = 1; s <= steps; ++s) {
+		float k  = (float(s) - 1.0 + jit) / float(steps);
+		float t  = len * k * k; // denser near the surface: contact detail
+		vec3  qp = o + l * t;
+		vec3  pr = Project(qp);
+		if (any(lessThan(pr.xy, vec2(0))) || any(greaterThan(pr.xy, vec2(1)))) break;
+		float sd = textureLod(depth_tex, pr.xy, 0).r;
+		if (IsSky(sd)) { k_prev = k; continue; }
+		float delta = abs(qp.z) - abs(ViewZ(sd)); // > 0: the ray point is behind the depth surface there
+		if (delta > 0.0 && delta < thick) {
+			float kh = k;
+			if (q >= 3) {
+				float lo = k_prev, hi = k;
+				for (int i = 0; i < 5; ++i) {
+					float mid = 0.5 * (lo + hi);
+					vec3  mq  = o + l * (len * mid * mid);
+					float md  = abs(mq.z) - abs(ViewZ(textureLod(depth_tex, Project(mq).xy, 0).r));
+					if (md > 0.0) hi = mid; else lo = mid;
+				}
+				kh = hi;
+				vec3  hq = o + l * (len * kh * kh);
+				float hd = abs(hq.z) - abs(ViewZ(textureLod(depth_tex, Project(hq).xy, 0).r));
+				if (hd < 0.0 || hd > thick) { k_prev = k; continue; }
+			}
+			// Screen-edge and ray-end fade (no hard cut where the ray leaves what the screen knows).
+			vec2  e    = min(pr.xy, 1.0 - pr.xy);
+			float edge = smoothstep(0.0, 0.05, min(e.x, e.y));
+			return 1.0 - edge * (1.0 - smoothstep(0.7, 1.0, kh));
+		}
+		k_prev = k;
+	}
+	return 1.0;
+}
+
+void Trace(ivec2 pixel) {
+	vec2  uv = (vec2(pixel) + 0.5) / TraceSize();
+	float d  = textureLod(depth_tex, uv, 0).r;
+	if (IsSky(d)) {
+		imageStore(out_img, pixel, vec4(1));
+		imageStore(gbuf_out, pixel, vec4(0, 0, 1, 1e6));
+		return;
+	}
+	vec3 p = ViewPos(uv, d);
+	vec3 n = NormalAt(uv, p);
+	imageStore(gbuf_out, pixel, vec4(n, abs(p.z)));
+	vec3  l   = normalize(push.extra.yzw);
+	float ndl = dot(n, l);
+	// Surfaces facing away are the game's own lighting's business (no contact shadow there), and far ones fade out.
+	float v = (ndl <= 0.02 || abs(p.z) > 90.0) ? 1.0 : March(p, n, l, pixel);
+	imageStore(out_img, pixel, vec4(isnan(v) ? 1.0 : clamp(v, 0.0, 1.0)));
+}
+
+void Temporal(ivec2 pixel) {
+	vec2 ts  = 1.0 / TraceSize();
+	vec2 uv  = (vec2(pixel) + 0.5) * ts;
+	vec4 cur = textureLod(src_a, uv, 0);
+	vec4 g   = textureLod(gbuf_cur, uv, 0);
+	if (g.w > 1e5) {
+		imageStore(out_img, pixel, cur);
+		imageStore(aux_out, pixel, vec4(0));
+		return;
+	}
+	vec4  m1 = vec4(0), m2 = vec4(0);
+	float l1 = 0.0, l2 = 0.0, wn = 0.0;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			vec2  suv = uv + vec2(x, y) * ts;
+			vec4  sg  = textureLod(gbuf_cur, suv, 0);
+			float w   = (abs(sg.w - g.w) < 0.05 * g.w && dot(sg.xyz, g.xyz) > 0.8) ? 1.0 : 0.0;
+			vec4  sv  = textureLod(src_a, suv, 0);
+			m1 += sv * w;
+			m2 += sv * sv * w;
+			l1 += sv.r * w;
+			l2 += sv.r * sv.r * w;
+			wn += w;
+		}
+	wn = max(wn, 1.0);
+	m1 /= wn, m2 /= wn, l1 /= wn, l2 /= wn;
+	vec4  sigma = sqrt(max(m2 - m1 * m1, vec4(0)));
+	float a_min = push.misc.z >= 3 ? 0.05 : 0.1;
+	float count = 1.0;
+	vec4  res   = mix(m1, cur, 0.5);
+	vec2  mom   = vec2(l1, l2);
+	vec2  puv   = uv + textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();
+	if ((push.misc.w & 1) == 0 && (push.misc.w & 2) != 0 && all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
+		vec4 pg = textureLod(gbuf_prev, puv, 0);
+		if (abs(pg.w - g.w) / max(g.w, 1e-3) < 0.05 && dot(pg.xyz, g.xyz) > 0.9) {
+			vec4  pm    = textureLod(aux_tex, puv, 0);
+			count       = min(max(pm.z, 1.0) + 1.0, 64.0);
+			float alpha = max(1.0 / count, a_min);
+			float k     = mix(1.25, 3.0, clamp(count / 32.0, 0.0, 1.0));
+			vec4  hist  = clamp(textureLod(src_b, puv, 0), m1 - k * sigma - 0.02, m1 + k * sigma + 0.02);
+			res         = mix(hist, cur, alpha);
+			mom         = mix(pm.xy, vec2(cur.r, cur.r * cur.r), alpha);
+		}
+	}
+	float var = count < 4.0 ? max(l2 - l1 * l1, 0.0) * (4.0 / count) : max(mom.y - mom.x * mom.x, 0.0);
+	imageStore(out_img, pixel, res);
+	imageStore(aux_out, pixel, vec4(mom, count, var));
+}
+
+void Atrous(ivec2 pixel) {
+	vec2 ts = 1.0 / TraceSize();
+	vec2 uv = (vec2(pixel) + 0.5) * ts;
+	vec4 g  = textureLod(gbuf_cur, uv, 0);
+	vec4 c  = textureLod(src_a, uv, 0);
+	if (g.w > 1e5) {
+		imageStore(out_img, pixel, c);
+		imageStore(aux_out, pixel, vec4(0));
+		return;
+	}
+	float vb = 0.0, gw = 0.0;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			float w = (x == 0 && y == 0) ? 0.25 : abs(x) + abs(y) == 1 ? 0.125 : 0.0625;
+			vb += textureLod(aux_tex, uv + vec2(x, y) * ts, 0).w * w;
+			gw += w;
+		}
+	vb /= gw;
+	float lden = 4.0 * sqrt(max(vb, 0.0)) + 0.05;
+	const float kern[3] = float[](0.375, 0.25, 0.0625);
+	vec4  sum = vec4(0);
+	float vsum = 0.0, wsum = 0.0, step = push.extra.x;
+	for (int y = -2; y <= 2; ++y)
+		for (int x = -2; x <= 2; ++x) {
+			vec2  suv = uv + vec2(x, y) * step * ts;
+			vec4  sg  = textureLod(gbuf_cur, suv, 0);
+			vec4  sc  = textureLod(src_a, suv, 0);
+			float w   = kern[abs(x)] * kern[abs(y)] * pow(max(dot(sg.xyz, g.xyz), 0.0), 32.0) *
+			          exp(-abs(sg.w - g.w) / max(g.w * 0.02 * step, 1e-3)) * exp(-abs(sc.r - c.r) / lden);
+			sum += sc * w;
+			vsum += textureLod(aux_tex, suv, 0).w * w * w;
+			wsum += w;
+		}
+	bool ok = wsum > 1e-5;
+	imageStore(out_img, pixel, ok ? sum / wsum : c);
+	imageStore(aux_out, pixel, vec4(0, 0, 0, ok ? vsum / (wsum * wsum) : vb));
+}
+
+float Upsample(vec2 uv, float z) {
+	vec2  tc = uv * TraceSize() - 0.5;
+	vec2  f  = fract(tc);
+	ivec2 b  = ivec2(floor(tc));
+	ivec2 mx = ivec2(TraceSize()) - 1;
+	float sum = 0.0, wsum = 0.0;
+	for (int i = 0; i < 4; ++i) {
+		ivec2 o  = ivec2(i & 1, i >> 1);
+		ivec2 q  = clamp(b + o, ivec2(0), mx);
+		float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+		float w  = (bw + 1e-3) / (1e-3 + abs(texelFetch(gbuf_cur, q, 0).w - z) / max(z * 0.02, 1e-3));
+		sum += texelFetch(src_a, q, 0).r * w;
+		wsum += w;
+	}
+	return sum / max(wsum, 1e-6);
+}
+
+void Composite(ivec2 pixel) {
+	vec2  uv  = (vec2(pixel) + 0.5) / RenderSize();
+	vec4  col = texelFetch(color_tex, pixel, 0);
+	float d   = texelFetch(depth_tex, pixel, 0).r;
+	float z   = abs(ViewZ(d));
+	// Sky, far geometry / fog, and unlit pixels (nothing a sun shadow could darken) unchanged.
+	float fade = IsSky(d) ? 0.0 : 1.0 - smoothstep(40.0, 80.0, z);
+	float l    = Luma(col.rgb);
+	float lit  = smoothstep(0.01, 0.06, l);
+	float amt  = push.trace.z * fade * lit;
+	if (amt <= 0.0) {
+		imageStore(out_img, pixel, col);
+		return;
+	}
+	float vis = Upsample(uv, z);
+	vis = (isnan(vis) || isinf(vis)) ? 1.0 : clamp(vis, 0.0, 1.0);
+	// Partial visibility near 1 (blur tails, jitter noise) is not a shadow: no grey veil.
+	vis = clamp(vis / 0.9, 0.0, 1.0);
+	// Temporal-stable mask: newly disoccluded / reset pixels (low history count) ramp in instead of flickering.
+	float count  = textureLod(aux_tex, uv, 0).z;
+	float stable = smoothstep(1.5, 6.0, count);
+	// Multiply only, in the input's own space: factor in [1 - strength, 1]; never above the input (no lightening).
+	float factor = mix(1.0, vis, clamp(amt * stable, 0.0, 1.0));
+	vec3  rgb    = min(col.rgb * factor, col.rgb);
+	if (any(isnan(rgb)) || any(isinf(rgb))) rgb = col.rgb;
+	imageStore(out_img, pixel, vec4(rgb, col.a));
+}
+
+shared uint s_vote[16];
+void VotePass(ivec2 pixel) {
+	uint li = gl_LocalInvocationIndex;
+	if (li < 16u) s_vote[li] = 0u;
+	barrier();
+	// Every 4th pixel each way of the render (dispatched at render / 4).
+	ivec2 rp = pixel * 4 + 2;
+	if (rp.x < int(RenderSize().x) && rp.y < int(RenderSize().y)) {
+		vec2  uv = (vec2(rp) + 0.5) / RenderSize();
+		float d  = texelFetch(depth_tex, rp, 0).r;
+		if (!IsSky(d) && abs(ViewZ(d)) < 60.0) {
+			vec3 p   = ViewPos(uv, d);
+			vec3 n   = NormalAt(uv, p);
+			uint lum = uint(clamp(Luma(texelFetch(color_tex, rp, 0).rgb), 0.0, 8.0) * 256.0);
+			for (int k = 0; k < 4; ++k) {
+				if (push.cand[k].w < 0.5) continue;
+				float c = dot(n, normalize(push.cand[k].xyz));
+				if (c > 0.5) {
+					atomicAdd(s_vote[k * 4 + 0], lum);
+					atomicAdd(s_vote[k * 4 + 1], 1u);
+				} else if (c < -0.2) {
+					atomicAdd(s_vote[k * 4 + 2], lum);
+					atomicAdd(s_vote[k * 4 + 3], 1u);
+				}
+			}
+		}
+	}
+	barrier();
+	if (li < 16u && s_vote[li] != 0u) atomicAdd(vote_buf.v[uint(push.misc.w >> 8) * 16u + li], s_vote[li]);
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	int   mode  = push.misc.x;
+	if (mode == 5) { VotePass(pixel); return; } // (all invocations reach its barriers)
+	ivec2 size = ivec2(mode == 4 ? RenderSize() : TraceSize());
+	if (pixel.x >= size.x || pixel.y >= size.y) return;
+	if (mode == 0) Trace(pixel);
+	else if (mode == 1) Temporal(pixel);
+	else if (mode == 4) Composite(pixel);
+	else Atrous(pixel);
+}

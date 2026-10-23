@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <system_error>
 #include <vector>
+#include "../../local/guest-lazy-commit.h"
 
 // A path of MAX_PATH characters or more opens only in the extended-length form (\\?\, \\?\UNC\ for a share), which
 // takes no relative path, "." or "..", nor forward slashes: a game folder deep in a user's documents (issue #13, a
@@ -85,6 +86,7 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
+		GuestLazyCommit::Prefault(data, size); // (a kernel-mode write into a reserved guest page fails, not faults)
 		if (ReadFile(f.handle, data, size, &w, nullptr) == 0) {
 			// Shown: a failed read used to pass as a short one.
 			static std::atomic<uint32_t> logged {0};
@@ -130,6 +132,7 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_written) {
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
+		GuestLazyCommit::Prefault(data, size);
 		if (WriteFile(f.handle, data, size, &w, nullptr) == 0) g_last_error = GetLastError();
 		if (bytes_written != nullptr) {
 			*bytes_written = w;

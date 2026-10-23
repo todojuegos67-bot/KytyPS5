@@ -391,6 +391,70 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${taa_bypass_header}")
 
+# KYTY_SSGI: screen-space GI before the PS5 Pro path's upscaler (src/local/frame-gen.cpp).
+set(ssgi_source "${KYTY_SOURCE_DIR}/local/ssgi.comp")
+set(ssgi_spv "${gpu_tiler_generated_dir}/ssgi.spv")
+set(ssgi_header "${gpu_tiler_generated_dir}/ssgi_spv.h")
+add_custom_command(
+	OUTPUT "${ssgi_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${ssgi_spv}" "${ssgi_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${ssgi_spv} -DOUTPUT=${ssgi_header}
+	        -DSYMBOL=SSGI_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${ssgi_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${ssgi_header}")
+
+# KYTY_GTAO: GTAO ambient occlusion before the PS5 Pro path's upscaler (src/local/frame-gen.cpp).
+set(gtao_source "${KYTY_SOURCE_DIR}/local/gtao.comp")
+set(gtao_spv "${gpu_tiler_generated_dir}/gtao.spv")
+set(gtao_header "${gpu_tiler_generated_dir}/gtao_spv.h")
+add_custom_command(
+	OUTPUT "${gtao_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gtao_spv}" "${gtao_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gtao_spv} -DOUTPUT=${gtao_header}
+	        -DSYMBOL=GTAO_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gtao_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gtao_header}")
+
+# KYTY_SSR: screen-space reflections before the PS5 Pro path's upscaler (src/local/frame-gen.cpp).
+set(ssr_source "${KYTY_SOURCE_DIR}/local/ssr.comp")
+set(ssr_spv "${gpu_tiler_generated_dir}/ssr.spv")
+set(ssr_header "${gpu_tiler_generated_dir}/ssr_spv.h")
+add_custom_command(
+	OUTPUT "${ssr_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${ssr_spv}" "${ssr_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${ssr_spv} -DOUTPUT=${ssr_header}
+	        -DSYMBOL=SSR_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${ssr_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${ssr_header}")
+
+# KYTY_CONTACT_SHADOWS: screen-space contact shadows before the upscaler (src/local/frame-gen.cpp).
+set(cshadow_source "${KYTY_SOURCE_DIR}/local/cshadow.comp")
+set(cshadow_spv "${gpu_tiler_generated_dir}/cshadow.spv")
+set(cshadow_header "${gpu_tiler_generated_dir}/cshadow_spv.h")
+add_custom_command(
+	OUTPUT "${cshadow_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${cshadow_spv}" "${cshadow_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${cshadow_spv} -DOUTPUT=${cshadow_header}
+	        -DSYMBOL=CSHADOW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${cshadow_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${cshadow_header}")
+
 # FSR 3 frame generation's HUD layer (src/local/fsr3-fg.cpp).
 set(hud_split_source "${KYTY_SOURCE_DIR}/local/hud-split.comp")
 set(hud_split_spv "${gpu_tiler_generated_dir}/hud_split.spv")
@@ -452,10 +516,13 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
 	"${KYTY_SOURCE_DIR}/local/local-platform.h"
 	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
+	"${KYTY_SOURCE_DIR}/local/dyn-multiplier.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.cpp"
+	"${KYTY_SOURCE_DIR}/local/anti-lag.h"
+	"${KYTY_SOURCE_DIR}/local/anti-lag.cpp"
 	"${KYTY_SOURCE_DIR}/local/xess-sr.cpp"
 	"${KYTY_SOURCE_DIR}/local/sync-stats.h"
 	"${KYTY_SOURCE_DIR}/local/sync-stats.cpp"
@@ -463,6 +530,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/debug-snapshot.cpp"
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.h"
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.cpp"
+	"${KYTY_SOURCE_DIR}/local/soft-release.h"
+	"${KYTY_SOURCE_DIR}/local/soft-release.cpp"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.h"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.cpp"
 	"${KYTY_SOURCE_DIR}/local/jit-arena.h"

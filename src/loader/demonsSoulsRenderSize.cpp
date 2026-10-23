@@ -126,7 +126,91 @@ bool InstallWideOutput(const Program& program, int mode, uint32_t width) {
 	return true;
 }
 
+// The save's graphics mode read: call (read int); mov r13d, [rbp - 0x218]; mov rdi, r12; call; xor eax, eax;
+// cmp r13d, 1; mov edi, 4; mov [r15 + 0x64], r13d.
+constexpr std::string_view SavedModeRead =
+    "e8 ?? ?? ?? ?? 44 8b ad e8 fd ff ff 4c 89 e7 e8 ?? ?? ?? ?? 31 c0 41 83 fd 01 bf 04 00 00 00 45 89 6f 64";
+// The default from the system's game preset: mov r12d, 2; call IsTrinity; test al, al; jne store; mov eax, [rbp-0x54];
+// test; je; xor r12d, r12d; cmp eax, 1; setne r12b; store: mov [r14 + 0x64], r12d.
+constexpr std::string_view PresetMode =
+    "41 bc 02 00 00 00 e8 ?? ?? ?? ?? 84 c0 75 11 8b 45 ac 85 c0 74 1a 45 31 e4 83 f8 01 41 0f 95 c4 45 89 66 64";
+
 } // namespace
+
+void InstallForcedMode(Program* program) {
+	const char* setting = std::getenv("KYTY_DS_FORCE_MODE");
+	if (setting == nullptr || *setting == 0 || program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() ||
+	    program->file_name.filename() != "eboot.bin")
+		return;
+	const std::string_view name(setting);
+	uint32_t               value = 0;
+	if (name == "cinematic") {
+		value = 1;
+	} else if (name != "performance") {
+		std::printf("Demon's Souls mode: KYTY_DS_FORCE_MODE=%s is not cinematic or performance; the game's choice kept\n",
+		            setting);
+		return;
+	}
+	const auto saved  = GuestCode::FindUnique(*program, GuestCode::Pattern(SavedModeRead));
+	const auto preset = GuestCode::FindUnique(*program, GuestCode::Pattern(PresetMode));
+	if (!saved || !preset) {
+		std::printf("Demon's Souls mode: the graphics mode's boot reads of a known build not found; the game's choice kept\n");
+		return;
+	}
+	// mov r13d, value; nop (the 7-byte load from the save).
+	uint8_t from_save[7] {0x41, 0xbd, 0, 0, 0, 0, 0x90};
+	std::memcpy(from_save + 2, &value, sizeof(value));
+	std::memcpy(reinterpret_cast<void*>(*saved + 5), from_save, sizeof(from_save));
+	// mov r12d, value; jmp store (over the preset's mapping).
+	uint8_t from_preset[8] {0x41, 0xbc, 0, 0, 0, 0, 0xeb, 0x18};
+	std::memcpy(from_preset + 2, &value, sizeof(value));
+	std::memcpy(reinterpret_cast<void*>(*preset), from_preset, sizeof(from_preset));
+	const char* ratio = std::getenv("KYTY_UPSCALE_RATIO");
+	std::printf("Demon's Souls mode: the game starts in its %s mode (KYTY_DS_FORCE_MODE; still changeable in its options)%s\n",
+	            value == 1 ? "cinematic" : "performance",
+	            value == 1 && (ratio == nullptr || *ratio == 0) ? ", native 3840x2160" : "");
+}
+
+// KYTY_DS_SIXTY_STEP (default on, =0 the game's): the per-mode render setter (01.007.000 eboot 0x90090b3a0) reads a
+// frame rate {59.94, 59.94, 29.97, 19.98} (render setup +0x28: the time step 1/rate, eboot 0x900b280e0, that the logo,
+// menus, movies and cutscene sequencers advance by each frame) and a flip rate {0, 0, 1, 2} (sceVideoOutSetFlipRate)
+// by mode. On the emulator's virtual vblank the flips stay at 60, so Cinematic's 1/30 step ran them twice too fast:
+// every mode gets the performance mode's 59.94 and flip rate 0 (Cinematic keeps its 4K picture).
+void InstallSixtyStep(Program* program) {
+	const char* setting = std::getenv("KYTY_DS_SIXTY_STEP");
+	if ((setting != nullptr && std::strcmp(setting, "0") == 0) || program == nullptr ||
+	    !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin")
+		return;
+	const auto site = GuestCode::FindUnique(
+	    *program, GuestCode::Pattern("48 8d 0d ?? ?? ?? ?? c5 fa 10 04 81 48 8d 0d ?? ?? ?? ?? 8b 34 81 c5 fa 11 47 28"));
+	if (!site) {
+		std::printf("Demon's Souls step: the render setter of a known build not found; the game's step kept\n");
+		return;
+	}
+	const uint64_t rates_at = RipTarget(*site, 3, 7);
+	const uint64_t flips_at = RipTarget(*site, 15, 19);
+	float          rates[4] {};
+	int32_t        flips[4] {};
+	if (!Readable(rates_at, sizeof(rates)) || !Readable(flips_at, sizeof(flips))) {
+		std::printf("Demon's Souls step: the mode tables are not readable; the game's step kept\n");
+		return;
+	}
+	std::memcpy(rates, reinterpret_cast<const void*>(rates_at), sizeof(rates));
+	std::memcpy(flips, reinterpret_cast<const void*>(flips_at), sizeof(flips));
+	if (rates[0] < 59.0f || rates[0] > 60.5f || flips[0] != 0 || flips[2] != 1) {
+		std::printf("Demon's Souls step: unexpected mode tables (%.2f, flip %d/%d); the game's step kept\n",
+		            static_cast<double>(rates[0]), flips[0], flips[2]);
+		return;
+	}
+	for (int i = 1; i < 4; i++) {
+		rates[i] = rates[0];
+		flips[i] = 0;
+	}
+	std::memcpy(reinterpret_cast<void*>(rates_at), rates, sizeof(rates));
+	std::memcpy(reinterpret_cast<void*>(flips_at), flips, sizeof(flips));
+	std::printf("Demon's Souls step: every graphics mode at the 59.94 fps step and flip rate 0 (Cinematic's 1/30 step "
+	            "and 30 fps flips off; KYTY_DS_SIXTY_STEP=0: the game's)\n");
+}
 
 double WideAspect() {
 	return g_wide_aspect;
@@ -165,6 +249,8 @@ void Install(Program* program) {
 		if (ratio >= 1.0 && ratio <= 4.0) {
 			const auto height = static_cast<uint32_t>(std::lround(display / ratio));
 			requested         = std::clamp<uint32_t>(height, 720, OutputHeight);
+			g_lod_render_height  = requested;
+			g_lod_display_height = display;
 			std::printf("Demon's Souls render size: KYTY_UPSCALE_RATIO=%s on a %u high display: %u%s\n", ratio_s, display,
 			            requested, requested != height ? " (720-2160)" : "");
 		} else {
@@ -181,7 +267,20 @@ void Install(Program* program) {
 		            requested);
 		requested = SuperResolutionLeastHeight;
 	}
-	if (requested == game_height && aspect == 0.0) return;
+	// The Cinematic mode (display mode 4: 3840x2160 natively, no upscaler) with KYTY_UPSCALE_RATIO: its config asks for
+	// display mode 5 as the performance mode's does (loader/gameArgs.cpp), so it renders at this same size (within
+	// the same 1080 least / 720 and render target memory limits) and goes through the upscaler.
+	const auto cinematic_note = [&](uint32_t width, uint32_t height) {
+		if (trinity && by_ratio)
+			std::printf("Demon's Souls render size: cinematic mode renders %ux%u instead of %ux%u (output %ux%u, through the "
+			            "upscaler)\n",
+			            width, height, OutputWidth, OutputHeight, g_wide_output != 0 ? g_wide_output : OutputWidth,
+			            OutputHeight);
+	};
+	if (requested == game_height && aspect == 0.0) {
+		cinematic_note(game_width, game_height);
+		return;
+	}
 	auto size = RenderSizeFor(requested, aspect != 0.0 ? aspect : GameAspect);
 	if (const auto most = MaxRenderHeight(aspect != 0.0 ? aspect : GameAspect); size.height > most) {
 		const auto lower = RenderSizeFor(most, aspect != 0.0 ? aspect : GameAspect);
@@ -235,6 +334,7 @@ void Install(Program* program) {
 	std::printf("Demon's Souls render size: performance mode renders %ux%u instead of %ux%u (output %ux%u)%s\n", size.width,
 	            size.height, game_width, game_height, g_wide_output != 0 ? g_wide_output : OutputWidth, OutputHeight,
 	            g_wide_output != 0 ? ", its projection and the output as wide" : aspect_store ? ", its projection as wide" : "");
+	cinematic_note(size.width, size.height);
 }
 
 } // namespace Loader::DemonsSoulsRenderSize

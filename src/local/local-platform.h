@@ -104,6 +104,33 @@ struct MemoryUse {
 	uint64_t working_set   = 0;
 };
 MemoryUse ProcessMemory();
+// The system's commit charge and commit limit (bytes; zeros when unknown): what a 16 GB PC runs out of.
+struct CommitUse {
+	uint64_t total = 0;
+	uint64_t limit = 0;
+};
+CommitUse SystemCommit();
+// KYTY_MEMORY_BREAKDOWN_SECONDS (default 60): a periodic "Private breakdown:" log line.
+void StartMemoryBreakdown();
+// Tagged commit (shown in the "Private breakdown:" line as "tagged:"): what the emulator's big allocation sites
+// asked for and how much the process's private commit grew across each call (a delta of PrivateUsage, so other
+// threads' allocations meanwhile are noise). Vulkan memory (vma.cpp wraps vkAllocateMemory/vkFreeMemory) by kind,
+// C++ new of 1 MiB or more by caller. Only with KYTY_MEMORY_TAGS=1 (default off).
+enum MemoryTag : int {
+	MemoryTagVulkanDeviceLocal = 0, // device-local types (what NVIDIA's Windows driver may also charge to commit)
+	MemoryTagVulkanHost,            // host-visible types without device-local (staging rings, readback)
+	MemoryTagVulkanBallast,         // KYTY_SIMULATE_VRAM_MB's ballast
+	MemoryTagLargeNew,              // C++ new >= 1 MiB (by caller in the line)
+	MemoryTagCount
+};
+bool MemoryTagsEnabled();
+// KYTY_LOWMEM_VRAM=1 (default off; the launcher's "Equipo de 16 GB RAM"): less video memory held, for PCs whose
+// commit runs out: VMA blocks of 32 MiB, an upload ring of 256 MiB, the caches' budget at most 6 GB (the GPU's
+// memory less 4 GB), a freed-image pool of at most 256 MiB.
+bool LowMemVram();
+// KYTY_SIMULATE_VRAM_MB's ballast (bytes): the breakdown line says that much of its commit is the test's.
+void SetSimulationBallast(uint64_t bytes);
+void MemoryTagAdd(int tag, int64_t requested, int64_t committed);
 uint64_t  PhysicalMemory();
 // KYTY_TRIM_RAM_SECONDS=<n>: every n seconds the process's working set is emptied (Windows: the pages go to the
 // standby list or the page file and come back on use), so the RAM in use is what the game touches in n seconds.

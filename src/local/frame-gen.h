@@ -76,6 +76,7 @@ struct FrameInputs {
 	vk::ImageView hudless_display_view = nullptr;
 	bool          has_hudless_display  = false;
 	bool          valid       = false;
+	uint32_t      reflex_index = 0; // 10-23: DLSS-G's Reflex frame index, begun at the guest frame's start (0: none)
 };
 
 // Process start, before the window: loads Streamline when KYTY_FRAMEGEN or KYTY_UPSCALER=dlss is set (it then
@@ -139,6 +140,11 @@ void SetStaticRect(float x0, float y0, float x1, float y1);
 // (Presenter::PrepareFrame): above 60 Hz the other frames keep 60 (videoOut.cpp).
 void NoteScene();
 [[nodiscard]] bool TakeScene();
+// 10-23: the guest flip on the render thread (Presenter::PrepareFrame): DLSS-G's Reflex markers for the frame that ends
+// (render submit end; its index into `fg`) and the next (Reflex sleep, simulation, render submit start).
+void ReflexGuestFlip(FrameInputs& fg);
+// The Reflex index of the frame BeforePresent presents next (0: none, the markers at the present as before).
+void SetPresentReflexIndex(uint32_t index);
 // The current guest frame ran the TAA pass so far, or the last one flipped did (HudAnchor: the game queues a frame's
 // interface before the flip of the one before).
 [[nodiscard]] bool SceneNoted();
@@ -150,7 +156,8 @@ void NoteScene();
 // The current guest frame has DLSS-G's inputs so far (the camera, the TAA pass's or the upscale's depth and motion),
 // which its flip takes (PrepareInputs).
 [[nodiscard]] bool InputsGathered();
-void OnDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt);
+// `path`: 'n' the normal draw, 't' a table draw, 'r' a native record (the camera counters).
+void OnDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt, char path = 'n');
 // KYTY_SHADER_CENSUS=1 (frame-gen.cpp): a program the game ran (stage v, p or c).
 void NoteShader(uint64_t hash, char stage);
 void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId motion,
@@ -227,11 +234,67 @@ struct UpscaleInputs {
 	bool         reset = false;                           // no history (a cut, a level load)
 	std::array<float, 16> view_to_clip {};                // row vectors (p' = p * M)
 	float        near_plane = 0.1f, far_plane = 3000.0f;
+	GraphicContext* graphics = nullptr;                    // the renderer's (SSGI, FSR, sharpening when nothing else set it)
+	// KYTY_SSR with KYTY_SSR_GBUF: the game's G-buffer target holding roughness / gloss (read only; no view: none),
+	// the channel (0..3) and whether it is gloss (1 - roughness).
+	UpscaleImage material;
+	int32_t      material_channel = -1;
+	bool         material_gloss   = false;
+	// KYTY_SSR: the game's packed G-buffer layers (R32_UINT render targets at the render size, read only; Demon's Souls:
+	// RT0..RT3, one 4-layer image), decoded by ssr.comp after its calibration.
+	std::array<UpscaleImage, 4> packed {};
+	uint32_t                    packed_count = 0;
 };
 // Streamline offers DLSS super resolution on this device.
 [[nodiscard]] bool UpscalerReady();
 // Records DLSS into `command` (outside a render pass; the images in their `layout`s): false when it could not.
 [[nodiscard]] bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs);
+// KYTY_SSGI=1|2: screen-space GI on the color before the upscaler (in Upscale).
+[[nodiscard]] bool SsgiWanted();
+// KYTY_CONTACT_SHADOWS=1|2|3 ("Sombras RT"): screen-space contact shadows toward the sun before the upscaler (in Upscale).
+[[nodiscard]] bool ContactShadowsWanted();
+// The sun's direction for it: a dispatch that samples a shadow-map array (a square, layered, depth-like image) is a
+// sun-shadow consumer; its flattened SRT and small constant buffers are searched for the cascades' orthographic
+// matrices (renderCompute.cpp, only while ContactShadowsWanted()).
+struct ShadowConsumer {
+	uint64_t shadow_address = 0;
+	uint32_t shadow_size = 0, shadow_layers = 0;
+	uint32_t buffers = 0;
+	std::array<uint64_t, 16> buffer_address {};
+	std::array<uint64_t, 16> buffer_size {};
+};
+void OnShadowConsumer(uint64_t cs_hash, const ShadowConsumer& consumer, std::span<const uint32_t> flattened_srt);
+[[nodiscard]] bool IsShadowConsumer(uint64_t cs_hash);
+// A draw's vertex SRT, read only, while ContactShadowsWanted(): `shadow_target` (normal path) when its depth target is a
+// layer of a shadow-map array (square, >= 512, >= 4 layers) and it has no color target; such vertex shaders are learned,
+// and the table / native-record paths' draws of them read too. Their orthographic view-projection's depth row is the sun.
+void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt, bool shadow_target);
+
+// KYTY_SSR=1|2|3 ("Reflejos RT": Normal / Alta / Ultra): screen-space reflections before the upscaler (in Upscale).
+// Everything below runs only while SsrWanted() (KYTY_SSR > 0), and only reads.
+[[nodiscard]] bool SsrWanted();
+// A G-buffer draw's vertex SRT (any path): the camera's view-projection for the up direction of the heuristic mask.
+void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt);
+// A G-buffer vertex shader's draw on the normal path: its color targets (the G-buffer layout, logged; the one
+// KYTY_SSR_GBUF names is the roughness source).
+struct SsrTarget {
+	ImageId       id;
+	uint64_t      address = 0;
+	uint32_t      width = 0, height = 0;
+	ImageViewInfo view;
+};
+void OnSsrGbuffer(uint64_t vs_hash, uint64_t ps_hash, std::span<const SsrTarget> targets);
+// A dispatch's sampled / storage images (renderCompute.cpp): one reading the G-buffer targets is logged (the deferred
+// lighting's consumer: which of its slots reads which target).
+void OnSsrDispatch(uint64_t cs_hash, std::span<const uint64_t> addresses, std::span<const vk::Format> formats);
+// The roughness source for this frame (renderSuperResolution.cpp): false = the heuristic mask.
+[[nodiscard]] bool SsrMaterial(SsrTarget& target, int& channel, bool& gloss);
+// The packed (R32_UINT) G-buffer targets of this frame, in render target order (renderSuperResolution.cpp): 0 = none.
+[[nodiscard]] uint32_t SsrPackedTargets(std::array<SsrTarget, 4>& targets);
+// Before a G-buffer consumer dispatch (renderCompute.cpp; the deferred lighting: the G-buffer complete, nothing else
+// written over it yet): the packed layers copied once a frame into SSR's own image, the source ssr.comp decodes.
+void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                       std::span<const TextureBinding> images);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

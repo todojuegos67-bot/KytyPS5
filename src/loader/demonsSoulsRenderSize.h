@@ -28,7 +28,19 @@ struct Program;
 // The game finishes its frame at that size (bloom, depth of field, the HUD); it lays its interface out at 3840x2160
 // against the left edge, which src/local/hud-anchor.h places (the HUD at its sides, the rest widened as before).
 namespace DemonsSoulsRenderSize {
+// What KYTY_UPSCALE_RATIO resolved to (Install): the 3D's render height and the display height it is upscaled to, 0 when
+// no ratio was applied. Read by KYTY_TEXTURE_LOD_BIAS=auto (graphics/host_gpu/renderer/cache/samplerCache.cpp).
+inline uint32_t g_lod_render_height = 0, g_lod_display_height = 0;
 void Install(Program* program);
+// KYTY_DS_FORCE_MODE=cinematic|performance (run-windows.ps1 -ForceMode): the game's graphics mode (its option 0
+// performance, 1 cinematic) as the profile's saved one is read at boot (01.007.000 eboot+0x22cc1, the save's value
+// before the render config index 1 Perf / 2 High is picked from it), and as the default with no save (the system's
+// game preset, eboot+0x7c91f2). The option menu's handler is kept, so the mode can still be changed in game (and that
+// choice is saved, but the next boot is forced again). Cinematic without KYTY_UPSCALE_RATIO: RenderConfig_PS5_High
+// as shipped (display mode 4, native 3840x2160, no upscaler).
+void InstallForcedMode(Program* program);
+// KYTY_DS_SIXTY_STEP (default on): every graphics mode at the performance mode's 59.94 fps step and flip rate 0.
+void InstallSixtyStep(Program* program);
 // The aspect the 3D is rendered at when KYTY_RENDER_ASPECT took effect (Install), else 0 (the game's 16:9).
 [[nodiscard]] double WideAspect();
 // The game's output's width when the wide output took effect (Install), else 0 (the game's 3840).

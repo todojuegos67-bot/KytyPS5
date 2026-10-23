@@ -24,10 +24,17 @@ public:
 	~SamplerCache();
 	KYTY_CLASS_NO_COPY(SamplerCache);
 
-	vk::Sampler GetSampler(const ShaderSamplerResource& r);
+	// lod_bias: the KYTY_TEXTURE_LOD_BIAS variant (descriptors.cpp decides it per image + sampler pair).
+	vk::Sampler GetSampler(const ShaderSamplerResource& r, bool lod_bias = false);
+
+	// KYTY_TEXTURE_LOD_BIAS (auto|float), 0 when off; process-constant.
+	static float TextureLodBias();
+	// KYTY_TEXTURE_LOD_BIAS_ALL=1: legacy sampler-level selection.
+	static bool LodBiasLegacyAll();
+	static bool IsSceneSampler(const ShaderSamplerResource& r);
 
 private:
-	using SamplerKey = std::array<uint32_t, 4>;
+	using SamplerKey = std::array<uint32_t, 5>;
 
 	struct SamplerKeyHash {
 		std::size_t operator()(const SamplerKey& key) const {

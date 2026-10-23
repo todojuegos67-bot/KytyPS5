@@ -24,6 +24,8 @@
 // unmap (normal context); after one by the emulator's own code the fault handler only gives the pages a protection that
 // lets the access through, and the render thread removes them (Drain).
 
+#include "guest-lazy-commit.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -155,7 +157,7 @@ inline State& Get() {
 #if defined(_WIN32)
 inline bool Protect(uint64_t address, uint64_t size, DWORD protection) {
 	DWORD old = 0;
-	return VirtualProtect(reinterpret_cast<void*>(address), size, protection, &old) != 0;
+	return GuestLazyCommit::Protect(reinterpret_cast<void*>(address), size, protection, &old); // (reserved pages first)
 }
 
 inline bool IsHostCode(uint64_t rip) {

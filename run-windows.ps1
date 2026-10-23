@@ -7,8 +7,6 @@
 #   .\run-windows.ps1 -Width 1920 -Height 1080 -Fullscreen
 #   .\run-windows.ps1 -NoRedZone             without guest red-zone protection
 #   .\run-windows.ps1 -Patch <cheat.json>    apply an etaHEN-style game patch
-#   .\run-windows.ps1 -ExclusiveFullscreen   classic exclusive full screen (KYTY_EXCLUSIVE_FULLSCREEN=1;
-#                                            VK_EXT_full_screen_exclusive), not the borderless desktop one
 #   .\run-windows.ps1 -Fullscreen -AspectFit keep the game's 16:9 (black bars) instead of stretching
 #   .\run-windows.ps1 -Hdr                   HDR10 output when Windows HDR is on for the display (the game is
 #                                            told the TV takes HDR and outputs it; SDR otherwise)
@@ -60,7 +58,6 @@ param(
 	[int]$Width = 0,
 	[int]$Height = 0,
 	[switch]$Fullscreen,
-	[switch]$ExclusiveFullscreen,
 	[switch]$Hdr,
 	[switch]$Baseline,
 	[switch]$Precompile,
@@ -72,6 +69,19 @@ param(
 	[switch]$Fps120,
 	[int]$RenderHeight = 0,
 	[double]$UpscaleRatio = 0,
+	[string]$ForceMode = '',
+	[int]$Shadows = 0,
+	[ValidateSet('', 'Ultra', 'VeryHigh', 'High', 'Normal', 'Low')][string]$Detail = '',  # (10-23) preset de detalle del juego
+	[string]$PostOff = '',
+	[string]$Reflections = '',  # (10-23) SSR del juego: Ultra|Normal|Low (High = de fabrica)
+	[string]$ObjectFade = '',   # (10-23) fundido de objetos lejanos: Ultra|Normal|Low
+	[string]$AaSharp = '',      # (10-23) nitidez del antialiasing del juego: Ultra|High|Low|Off (Normal = de fabrica)
+  # (10-23) efectos a quitar, p.ej. 'motionblur,dof,vignette,bloom,eyeadapt'
+	[switch]$DetailUltra,  # (10-23) detalle por encima del modo cine: iluminacion completa, mas teselado y mas lejos
+	[switch]$ShadowsUltra,  # (10-23) sombras del juego por encima de Maximo (mas distancia y cascadas, sombras de contacto del juego)
+	[switch]$AntiLag,
+	[ValidateSet(-1, 0, 1, 2, 3)][int]$ContactShadows = -1, # KYTY_CONTACT_SHADOWS: sombras de contacto por rayos
+	[ValidateSet(-1, 0, 1, 2, 3)][int]$Ssgi = -1, # KYTY_SSGI: iluminacion por rayos en pantalla antes del reescalador
 	[string]$Upscale = '',
 	[int]$UpscaleHeight = 0,
 	[string]$DlssPreset = '',
@@ -89,6 +99,7 @@ param(
 	[switch]$Fsr3FrameGen,
 	[switch]$Turbo,
 	[switch]$Turbo2,
+	[switch]$ExclusiveFullscreen,
 	[switch]$Ram16,
 	[switch]$GentlePrecompile,
 	[ValidateSet('', 'dlss', 'xess', 'fsr')][string]$Upscaler = '',
@@ -219,6 +230,8 @@ for ($i = $start; $i -lt $command.Count; $i++) {
 	if ($command[$i] -eq '--game') { $i++; continue }
 	$options.Add($command[$i])
 }
+# -ExclusiveFullscreen: the window opens full screen and the swapchain takes the display exclusively.
+if ($ExclusiveFullscreen) { $env:KYTY_EXCLUSIVE_FULLSCREEN = '1'; if (-not $options.Contains('--fullscreen')) { $options.Add('--fullscreen') } }
 function Set-Option([string]$name, [string]$value) {
 	$at = $options.IndexOf($name)
 	if ($at -ge 0) { $options[$at + 1] = $value } else { $options.Add($name); $options.Add($value) }
@@ -226,8 +239,6 @@ function Set-Option([string]$name, [string]$value) {
 if ($Width -gt 0) { Set-Option '--screen-width' "$Width" }
 if ($Height -gt 0) { Set-Option '--screen-height' "$Height" }
 if ($Fullscreen) { $options.Add('--fullscreen') }
-# -ExclusiveFullscreen: the window opens full screen and the swapchain takes the display exclusively.
-if ($ExclusiveFullscreen) { $env:KYTY_EXCLUSIVE_FULLSCREEN = '1'; if (-not $options.Contains('--fullscreen')) { $options.Add('--fullscreen') } }
 if ($Hdr) { $options.Add('--hdr') }
 if ($PresentMode) { Set-Option '--present-mode' $PresentMode }
 if ($Language -ge 0) { Set-Option '--console-language' "$Language" }
@@ -381,12 +392,17 @@ if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -m
 # the game upscales it to its 3840x2160 output as it does 1440 (a laptop's RTX 3080 at Boletaria 1-1: standing
 # 20.7 -> 24.5 fps at 1080, walking 18.7 -> 22.2).
 # -Turbo2: the 3D at 1080 at most (its render targets ~45% of 1440's video memory; with an upscaler it stayed under 6 GB).
-if ($Turbo2 -and ($RenderHeight -le 0 -or $RenderHeight -gt 1080)) { $RenderHeight = 1080 }
+# (With an upscaler's ratio Turbo keeps the mode's own size, only no finer than ratio 1.5: Rendimiento stays 720 at 1440.)
+# TURBO juega a 1080p de salida: los modos del reescalador se calculan sobre 1080 (Calidad 720), no sobre el monitor.
+# (10-21) TURBO ya no baja la resolucion (el usuario: "no bajes la resolucion").
 if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
 # -UpscaleRatio <1..4> (with -Upscaler and no -RenderHeight): the 3D at the monitor's height over the ratio (DLAA 1.0,
 # Quality 1.5, Balanced 1.72, Performance 2.0, Ultra Performance 3.0; the monitor detected by the emulator,
 # KYTY_DISPLAY_HEIGHT overrides it), 720-2160.
 if ($UpscaleRatio -gt 0 -and $RenderHeight -le 0) { $environment['KYTY_UPSCALE_RATIO'] = $UpscaleRatio.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
+# -ForceMode cinematic|performance: el juego arranca en ese modo grafico (KYTY_DS_FORCE_MODE), se puede cambiar en sus opciones.
+if ($ForceMode -eq 'cinematic' -or $ForceMode -eq 'performance') { $environment['KYTY_DS_FORCE_MODE'] = $ForceMode }
+elseif ($ForceMode -ne '') { Write-Warning "-ForceMode $ForceMode is not cinematic or performance; ignored" }
 # -Upscale fsr: the 3D image (at -RenderHeight) upscaled to 1440 by FSR 3.1 before the game's composite (frame-gen.h
 # UpscaleComposite), instead of the game's own scaling in that composite.
 # One upscaler: -Upscale (the old path after the game's TAA) goes to the PS5 Pro path (-Upscaler) with the same upscaler.
@@ -409,8 +425,10 @@ if ($Aspect -and $Aspect -ne '16:9') { $environment['KYTY_RENDER_ASPECT'] = $Asp
 # standard 21.9 fps, lowest 25.6. Not r_forceShadowLOD (until 10-17 in both): it draws objects with their shadow
 # meshes, and objects without one vanish (carts and barricades at the Gates of Boletaria; issue #40), for 6% more.
 $qualityConvars = @{
-	low    = 'r_forceViewportHeightForPixelSizeCalc=720;sunShadowMaxDistance=125'
-	lowest = 'r_forceViewportHeightForPixelSizeCalc=480;sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false'
+	# (10-21) Sin tocar las sombras: acortar su distancia hacia que fueran apareciendo (popping) en TURBO.
+	high   = 'r_forceViewportHeightForPixelSizeCalc=1080'  # (10-23) Alto
+	low    = 'r_forceViewportHeightForPixelSizeCalc=720'
+	lowest = 'r_forceViewportHeightForPixelSizeCalc=480'
 }
 if ($Quality -and $Quality -ne 'standard') {
 	if (!$qualityConvars.Contains($Quality)) { throw "-Quality takes low or lowest (or standard), not '$Quality'" }
@@ -418,11 +436,60 @@ if ($Quality -and $Quality -ne 'standard') {
 		$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars[$Quality]) | Where-Object { $_ }) -join ';'
 	}
 }
+# (10-22) -AntiLag: AMD Anti-Lag 2 si el driver lo tiene; si no, limitador del emulador (1 frame en cola). No con DLSS (Reflex).
+if ($AntiLag) { $environment['KYTY_ANTILAG'] = '1' }
+if ($Ssgi -ge 0) { $environment['KYTY_SSGI'] = "$Ssgi" }
+if ($ContactShadows -ge 0) { $environment['KYTY_CONTACT_SHADOWS'] = "$ContactShadows" }
+# (10-22) -Shadows 0|1|2: sombras Maximo (las del juego), Medio (sol hasta 125 m), Bajo (sol hasta 60 m, sin sombreado
+# ambiental ni sombras de focos). A menos nivel pueden aparecer de golpe al acercarse (popping).
+$detailConvars = @{
+	'Ultra'    = 'r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=400;r_contactShadowsEnabled=true;r_iblResolution=Full;r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.015;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0'
+	'VeryHigh' = 'r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=250;r_iblResolution=Full;r_tessellationDensity=18.0;r_tessellationSmallestEdgeLength=0.02;r_tessellationFadeOutStart=15.0;r_tessellationFadeOutRange=3.0'
+	'High'     = ''
+	'Normal'   = 'r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=180;r_iblResolution=HalfResX;r_tessellationDensity=6.0;r_tessellationSmallestEdgeLength=0.06;r_tessellationFadeOutStart=9.0;r_tessellationFadeOutRange=3.0'
+	'Low'      = 'r_virtualGeometryNumShadowCascades=1;sunShadowMaxDistance=125;r_iblResolution=HalfResX;r_tessellationDensity=4.0;r_tessellationSmallestEdgeLength=0.08;r_tessellationFadeOutStart=6.0;r_tessellationFadeOutRange=2.0'
+}
+# (10-23) Valores de fabrica sacados del eboot: r_ssrMaxIterations 128 (1-256), r_ssrMaxRayLength 1000 (0-1600),
+# r_ssrCutoffDistance 1000 (0-5000); r_fadeOutInstanceOverDistance 15 (0-200); r_aaSharpenStrengthStatic/Motion 2.5 (0-10),
+# r_aaHistorySharpeningStrength 0.8 (0-1).
+$gfxExtra = @{
+	'refl_Ultra'  = 'r_ssrEnableOverrides=true;r_ssrMaxIterations=192;r_ssrMaxRayLength=1400;r_ssrCutoffDistance=1500'
+	'refl_Normal' = 'r_ssrEnableOverrides=true;r_ssrMaxIterations=64;r_ssrMaxRayLength=600;r_ssrCutoffDistance=500'
+	'refl_Low'    = 'r_ssrEnableOverrides=true;r_ssrMaxIterations=32;r_ssrMaxRayLength=300;r_ssrCutoffDistance=250'
+	'fade_Ultra'  = 'r_fadeOutInstanceOverDistance=35'
+	'fade_Normal' = 'r_fadeOutInstanceOverDistance=10'
+	'fade_Low'    = 'r_fadeOutInstanceOverDistance=6'
+	'aa_Ultra'    = 'r_aaSharpenStrengthStatic=5;r_aaSharpenStrengthMotion=5;r_aaHistorySharpeningStrength=1.0'
+	'aa_High'     = 'r_aaSharpenStrengthStatic=3.5;r_aaSharpenStrengthMotion=3.5;r_aaHistorySharpeningStrength=0.9'
+	'aa_Low'      = 'r_aaSharpenStrengthStatic=1.2;r_aaSharpenStrengthMotion=1.2;r_aaHistorySharpeningStrength=0.5'
+	'aa_Off'      = 'r_aaSharpenStrengthStatic=0;r_aaSharpenStrengthMotion=0;r_aaHistorySharpeningStrength=0'
+}
+foreach ($k in @("refl_$Reflections", "fade_$ObjectFade", "aa_$AaSharp")) {
+	if ($gfxExtra.Contains($k) -and $titleId -match '^PPSA0134[0-2]$') { $environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $gfxExtra[$k]) | Where-Object { $_ }) -join ';' }
+}
+if ($PostOff -and $titleId -match '^PPSA0134[0-2]$') {
+	$postMap = @{ 'motionblur' = 'r_motionBlurEnable=false'; 'dof' = 'r_dofEnable=false'; 'vignette' = 'r_vignetteEnable=false'; 'bloom' = 'r_bloomEnable=false'; 'eyeadapt' = 'r_exposureEyeAdaptEnable=false' }
+	$postConvars = @($PostOff -split '[,;]' | ForEach-Object { $postMap[$_.Trim().ToLower()] } | Where-Object { $_ }) -join ';'
+	if ($postConvars) { $environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $postConvars) | Where-Object { $_ }) -join ';' }
+}
+if ($Detail -and $detailConvars[$Detail] -and $titleId -match '^PPSA0134[0-2]$') {
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $detailConvars[$Detail]) | Where-Object { $_ }) -join ';'
+}
+if ($DetailUltra -and $titleId -match '^PPSA0134[0-2]$') {
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'r_iblResolution=Full;r_tessellationDensity=20.0;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0;r_tessellationSmallestEdgeLength=0.015') | Where-Object { $_ }) -join ';'
+}
+if ($ShadowsUltra -and $Shadows -eq 0 -and $titleId -match '^PPSA0134[0-2]$') {
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'sunShadowMaxDistance=400;r_virtualGeometryNumShadowCascades=4;r_contactShadowsEnabled=true') | Where-Object { $_ }) -join ';'
+}
+if ($Shadows -gt 0 -and $titleId -match '^PPSA0134[0-2]$') {
+	$shadowConvars = if ($Shadows -eq 3) { 'sunShadowMaxDistance=190' } elseif ($Shadows -eq 1) { 'sunShadowMaxDistance=125' } else { 'sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false' }
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $shadowConvars) | Where-Object { $_ }) -join ';'
+}
 # -TextureReduce 0|1|2: large block-compressed textures held without their 1 or 2 largest levels (KYTY_TEXTURE_REDUCE;
 # without it the emulator takes 1 below 12 GB of video memory, else 0). A simulated 8 GB card at Boletaria 1-1: textures
 # 4.1 -> 2.8 GiB, 1% low 37-49 -> 53-58 fps; close surfaces a little softer.
 if ($TextureReduce -ne '') {
-	if ($TextureReduce -notin '0', '1', '2') { throw "-TextureReduce takes 0, 1 or 2, not '$TextureReduce'" }
+	if ($TextureReduce -notin '0', 'h', '1', '2') { throw "-TextureReduce takes 0, h, 1 or 2, not '$TextureReduce'" }
 	$environment['KYTY_TEXTURE_REDUCE'] = $TextureReduce
 }
 # Memory the game releases (texture pool layers, 64 KiB mappings each) is not unprotected mapping
@@ -477,18 +544,20 @@ if (!$NoAsyncShaders -and !$Baseline -and !$environment.Contains('KYTY_ASYNC_DRA
 if ($Ram16) {
 	if (!$environment.Contains('KYTY_RESIDENT_MB')) { $environment['KYTY_RESIDENT_MB'] = '6144' }
 	if (!$environment.Contains('KYTY_PREFETCH_MIN_AVAIL_MB')) { $environment['KYTY_PREFETCH_MIN_AVAIL_MB'] = '3072' }
-	Write-Host 'memory:   16 GB profile: 6 GB kept in RAM, the shader prefetch waits under 3 GB free'
+	# (10-22) Memoria del juego en un archivo del disco (KYTY_BACKING_FILE): no cuenta para el limite de memoria de Windows.
+	# (10-22) Desactivado: no bajo la memoria privada y el juego se colgaba.
+	if (!$environment.Contains('KYTY_BACKING_FILE')) { $environment['KYTY_BACKING_FILE'] = '0' }
+	Write-Host 'memory:   16 GB profile: 6 GB kept in RAM, the shader prefetch waits under 3 GB free, guest memory file-backed (no commit charge)'
 }
 # -Turbo2: PCs with 8-12 GB of RAM and graphics cards of 4-6 GB: the caches' video memory at 2.5 GB, textures a quarter
 # of their size, the game's lowest detail, the working set past 3 GB emptied every 15 s (each empty stalls ~140 ms) (with the guest memory quiet
 # meanwhile: no 0x1A), smaller shader and draw stores.
 if ($Turbo2) {
-	$turboSet = [ordered]@{ KYTY_VRAM_BUDGET_MB = '2560'; KYTY_GC_BUDGET_CAP_MB = '2560'; KYTY_SMALL_VRAM = '1'
+	$turboSet = [ordered]@{ KYTY_VRAM_BUDGET_MB = '2048'; KYTY_GC_BUDGET_CAP_MB = '2048'; KYTY_SMALL_VRAM = '1'
 		KYTY_TEXTURE_REDUCE = '2'; KYTY_TRIM_RAM_SECONDS = '0'; KYTY_IMAGE_POOL = '0'
-		KYTY_NATIVE_XPR_STORE_BUDGET = '64'; KYTY_TABLE_STORE_BUDGET = '4'; KYTY_SIMULATE_RAM_MB = '8192'
-		KYTY_RAM_DIET = '1' }
+		KYTY_NATIVE_XPR_STORE_BUDGET = '64'; KYTY_TABLE_STORE_BUDGET = '4'; KYTY_SIMULATE_RAM_MB = '10240'; KYTY_RAM_DIET = '1' }
 	foreach ($key in $turboSet.Keys) { $environment[$key] = $turboSet[$key] }
-	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars['lowest']) | Where-Object { $_ }) -join ';'
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars['low']) | Where-Object { $_ }) -join ';'
 	Write-Host 'memory:   turbo 2.0 (8-12 GB PCs, 4-6 GB GPUs): video memory caches 2.5 GB, textures a quarter, no RAM trim'
 }
 elseif ($Turbo) {
@@ -524,6 +593,13 @@ foreach ($pair in ($Set | ForEach-Object { $_ -split ',(?=[A-Za-z_][A-Za-z0-9_]*
 $vblankHz = if ($Vblank -gt 0) { $Vblank } elseif ($Fps120) { 120 } else { 60 }
 if ($vblankHz -gt 60 -and $titleId -match '^PPSA0134[0-2]$' -and "$($environment['KYTY_GAME_CONVARS'])" -notmatch 'gameMinDeltaTime') {
 	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'gameMinDeltaTime=0.004') | Where-Object { $_ }) -join ';'
+}
+# (10-21) KYTY_DS_VARIABLE_STEP=1: la fisica de Demon's Souls avanza con el tiempo real de cada frame, no a pasos fijos
+# de 1/60 (rendimiento) o 1/30 (cinematico) segun el modo (eboot 0x900bdd620 / 0x900bdc730).
+if ("$($environment['KYTY_DS_VARIABLE_STEP'])" -eq '1' -and $titleId -match '^PPSA0134[0-2]$' -and "$($environment['KYTY_GAME_CONVARS'])" -notmatch 'physicsUseFixedTimestep') {
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'physicsUseFixedTimestep=false;gameDeltaTimeCorrectionTolorance=0.01') | Where-Object { $_ }) -join ';'
+	# Sin esto, en cinematico (paso base 1/30) cada frame de 60 del logo/menus contaba como 1/30: el doble de rapido.
+	if ("$($environment['KYTY_GAME_CONVARS'])" -notmatch 'gameMinDeltaTime') { $environment['KYTY_GAME_CONVARS'] += ';gameMinDeltaTime=0.004' }
 }
 
 # The performance cores of a hybrid CPU (Windows' CPU set efficiency classes: an Intel Core with
@@ -576,6 +652,21 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 Write-Host "game:     $(if ($titleName) { "$titleName, " })$version$(if (!$tested) { " (untested: the emulator is tested with $($testedVersions -join ' and '))" })"
 Write-Host "config:   $Config$(if ($Baseline) { ' (baseline: no switches)' })$(if ($Precompile) { ' (precompile)' })"
 Write-Host ("affinity: 0x{0:X} ({1} CPUs){2}" -f $mask, $cpus, $(if ($environment['KYTY_RENDER_CPUS']) { "; render threads on CPUs $($environment['KYTY_RENDER_CPUS'])" }))
+# Keyboard and mouse (KYTY_KBM*, KYTY_PAD_MAP, set by the launcher): named to the emulator explicitly (the dry run
+# lists them) and said here, so a run log without "KYTY_KBM" lines can be told apart from one where it was not asked.
+foreach ($item in Get-ChildItem env: | Where-Object { $_.Name -like 'KYTY_KBM*' -or $_.Name -eq 'KYTY_PAD_MAP' }) {
+	if (!$environment.Contains($item.Name)) { $environment[$item.Name] = $item.Value }
+}
+$kbmCurve = Join-Path (Split-Path -Parent $Exe) 'kbm_curve.txt'
+if ($environment['KYTY_KBM'] -eq '1' -or $environment['KYTY_KBM_CALIBRATE'] -eq '1') {
+	Write-Host ("KBM: on (sens {0}, antideadzone {1}{2}; camera curve: {3}{4})" -f $(if ($environment['KYTY_KBM_SENS']) { $environment['KYTY_KBM_SENS'] } else { '1' }),
+		$(if ($environment['KYTY_KBM_ANTIDZ']) { $environment['KYTY_KBM_ANTIDZ'] } else { '0.15' }),
+		$(if ($environment['KYTY_KBM_MAP']) { '; custom keys' } else { '' }),
+		$(if (Test-Path -LiteralPath $kbmCurve) { 'kbm_curve.txt' } else { 'none, linear' }),
+		$(if ($environment['KYTY_KBM_CALIBRATE'] -eq '1') { '; CALIBRATING: stand still in an open area, hands off the mouse and right stick' } else { '' }))
+} else {
+	Write-Host "KBM: off$(if ($environment['KYTY_PAD_MAP']) { ' (pad remap on)' })"
+}
 Write-Host "switches: $($environment.Count)"
 Write-Host "command:  $Exe $($quoted -join ' ')"
 if ($DryRun) { $environment.GetEnumerator() | ForEach-Object { "  $($_.Key)=$($_.Value)" }; return }

@@ -1,5 +1,6 @@
 #include "local/port-live.h"
 #include "frame-gen.h"
+#include "graphics/presentation/window/hostInput.h"
 #include "fsr3-fg.h"
 #include "xess-sr.h"
 #include "graphics/presentation/videoOut.h"
@@ -18,8 +19,15 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 #include "local/vulkan-recording.h"
+#include "local/dyn-multiplier.h"
 #include "gpu_tiler_shaders/taa_bypass_spv.h"
 #include "gpu_tiler_shaders/sharpen_spv.h"
+#include "gpu_tiler_shaders/ssgi_spv.h"
+#include "gpu_tiler_shaders/gtao_spv.h"
+#include "gpu_tiler_shaders/ssr_spv.h"
+#include "gpu_tiler_shaders/cshadow_spv.h"
+#include "kernel/memory.h"
+#include <string>
 #endif
 
 #include <algorithm>
@@ -75,9 +83,10 @@ struct Sources {
 int      g_generate    = 0;     // frames to generate per rendered frame (0 = off)
 // KYTY_DLSSG_DYNAMIC=1: an app-side dynamic multiplier. Streamline's eDynamic is D3D12 only (not on Vulkan, and it
 // ignores numFramesToGenerate), so DLSS-G stays eOn and the emulator picks numFramesToGenerate itself, once a second:
-// gen = clamp(floor(target / real) - 1, 1, KYTY_FRAMEGEN (default 3), numFramesToGenerateMax), changed only when the new
-// value held for two windows in a row. Target: KYTY_DLSSG_TARGET_FPS, default refresh - refresh^2 / 3600 (224 on
-// 240 Hz). No Reflex frame limit from the multiplier: the real rate stays the game's own pacing.
+// m = gen + 1 = the largest in [1, min(KYTY_FRAMEGEN (default 5), numFramesToGenerateMax (3 until known)) + 1] with
+// real * m <= target (10-22; up after real * (m + 1) <= 0.97 target for ~1 s, down at once past 1.02 target). The real
+// rate is never held to reach a multiplier; Reflex caps it at target / m. Target: KYTY_DLSSG_TARGET_FPS, default
+// refresh - refresh^2 / 3600 (224 on 240 Hz).
 bool     g_dlssg_dynamic   = false;
 float    g_dlssg_target_fps = 0.0f;
 int      g_dyn_gen         = 1;   // the current generated frame count in dynamic mode (g_generate is its maximum)
@@ -91,6 +100,13 @@ bool     g_dyn_stretch     = true;
 uint32_t g_dyn_limit_us    = 0;
 double   g_dyn_slept       = 0.0; // seconds our limiter waited in this window
 int      g_dyn_block_s     = 0;   // seconds left without taking the extra frame (it cost too much real fps)
+int      g_dyn_max         = 3;   // 10-22: the largest generated count in use (min(KYTY_FRAMEGEN, GPU max), 3 until known)
+int      g_dyn_up_s        = 0;   // windows in a row the next multiplier fit under target * 0.97
+int      g_dyn_pinned_s    = 0;   // windows in a row the real rate sat at our Reflex cap
+int      g_dyn_noup_s      = 0;   // windows left without switching up (after a step down off the cap)
+Kyty::Local::DynMultiplier g_dyn_dm; // 10-22: the free-rate multiplier choice
+bool     g_fixed_floor     = false; // 10-23: fixed DLSS-G under a cap: the same flip floor / pacer choice per present
+int      g_dyn_flip_asked  = -1;  // the last rate asked of SetDynamicFlipFps (-1: none since a clear)
 int      g_dyn_flip_fps    = 0;   // 10-21: the game's own flip floor held for the extra frame (VideoOut::SetDynamicFlipFps)
 
 // The flip floor for `gen` generated frames: the reach rate when gen + 1 at 60 passes the target, else none.
@@ -99,7 +115,10 @@ void DynApplyFlipFloor(int gen) {
 	const int want = 60.0 * n > static_cast<double>(g_dlssg_target_fps) + 0.5
 	                     ? VideoOut::ReachFps(static_cast<double>(g_dlssg_target_fps), n)
 	                     : 0;
-	const int fps  = VideoOut::SetDynamicFlipFps(want >= 60 ? 0 : want);
+	// (asked again only on a change: a refusal is printed once, not per present)
+	if ((want >= 60 ? 0 : want) == g_dyn_flip_asked) return;
+	g_dyn_flip_asked = want >= 60 ? 0 : want;
+	const int fps    = VideoOut::SetDynamicFlipFps(g_dyn_flip_asked);
 	if (fps != g_dyn_flip_fps) {
 		if (fps > 0) std::printf("[dyn] x%d: game flips at %d (gameplay)\n", n, fps);
 		else std::printf("[dyn] x%d: game flips at 60\n", n);
@@ -129,7 +148,9 @@ bool g_taa_bypass_copy = false;
 // Default: the TAA's output is left to the game (its exposure, bloom and the rest see what they always saw) and only
 // the upscaler takes the raw frame, a copy made right after the TAA (UpscaleComposite).
 bool g_taa_bypass_match = false;
-double g_real_interval = 0.0; // DLSS-G under the G-SYNC cap: the real frames' least interval (seconds)
+// DLSS-G under the G-SYNC cap: the real frames' least interval (seconds)
+std::atomic<double> g_real_interval {0.0};
+double g_pace_n = 0.0, g_pace_sum = 0.0, g_pace_sq = 0.0; // real present intervals this window
 bool g_sr_ready = false;
 bool     g_ready       = false; // Streamline loaded and the feature available
 bool     g_upscale     = false; // KYTY_UPSCALER=dlss: DLSS super resolution asked for (Streamline loaded for it)
@@ -731,8 +752,39 @@ bool Requested() {
 	return g_generate > 0;
 }
 
+// 10-22: KYTY_DLSSG_PACE: how real frames are paced for DLSS-G.
+//   adaptive (opt-in): VideoOut's flip pacer at max(target / m, mean + 0.75 sd of the last windows' present
+//     intervals). Below the cap (log 20261022-103006: 43-51 real, 21 ms mean) nothing held the frames, so the game's
+//     own frame-time spread reached DLSS-G (present interval sd 1.1-1.9 ms; FSR3's 0.37 was at a held 60); a steady
+//     interval just above the typical frame evens it for a few % of real rate.
+//   grid (default): the flip pacer at target / m only. Adaptive is held to at most 1.15 target / m and reset in
+//   cutscenes, cinematics, movies and with DLSS-G off (it learned a 30 fps phase and held its own 36 ms after it).
+//   reflex: Streamline's Reflex limit at target / m and our pacer off.
+//   reflexfree (default with KYTY_FRAMEGEN_BASE=0, the game unlocked): as FSR3 unlocked (log 20261022-193327: smooth
+//     at 45-60 real, present interval sd 1.08, flip->present 33.6 ms; DLSS-G fixed x4 locked, 193116: sd 1.74,
+//     flip->present 48.7, 11.9 frames over 25 ms a window): no flip pacer and no flip floor on real frames, the only
+//     limit Reflex's frameLimitUs = 1e6 m / target (its sleep, at the guest frame start, holds the game), flips when
+//     ready; the game's own variable step above 60.
+int DlssgPaceMode() {
+	static const int mode = [] {
+		const char* v = std::getenv("KYTY_DLSSG_PACE");
+		if (v != nullptr && std::strcmp(v, "adaptive") == 0) return 0;
+		if (v != nullptr && std::strcmp(v, "grid") == 0) return 1;
+		if (v != nullptr && std::strcmp(v, "reflex") == 0) return 2;
+		if (v != nullptr && std::strcmp(v, "reflexfree") == 0) return 3;
+		// 10-23: the game unlocked (KYTY_FRAMEGEN_BASE=0): reflexfree, as FSR3 unlocked runs.
+		const char* base = std::getenv("KYTY_FRAMEGEN_BASE");
+		if (base != nullptr && std::strcmp(base, "0") == 0) return 3;
+		return 1; // grid (10-22: adaptive locked at 36 ms after a 30 fps phase, log 20261022-175339)
+	}();
+	return mode;
+}
+std::atomic<double> g_pace_adapt {0.0}; // adaptive: the steady interval from the present interval statistics
+
 double RealFrameInterval() {
-	return g_ready ? g_real_interval : 0.0;
+	if (!g_ready || DlssgPaceMode() >= 2) return 0.0;
+	const double base = g_real_interval.load();
+	return base > 0.0 && DlssgPaceMode() == 0 ? std::clamp(g_pace_adapt.load(), base, 1.15 * base) : base;
 }
 
 std::string SupportProblem(vk::PhysicalDevice physical_device) {
@@ -925,12 +977,18 @@ void BypassCommandHooks(vk::Device device) {
 #endif
 }
 
+namespace { int SsgiQuality(); }
 void Initialize() {
+	{
+		const char* ssgi = std::getenv("KYTY_SSGI");
+		std::printf("SSGI: KYTY_SSGI=%s read (quality %d)\n", ssgi != nullptr ? ssgi : "(unset)", SsgiQuality());
+		std::fflush(stdout);
+	}
 	const char* value = std::getenv("KYTY_FRAMEGEN");
 	g_generate        = value != nullptr ? std::clamp(std::atoi(value), 0, 5) : 0;
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	if (const char* dyn = std::getenv("KYTY_DLSSG_DYNAMIC"); dyn != nullptr && *dyn == '1') {
-		if (value == nullptr) g_generate = 3; // KYTY_FRAMEGEN is the maximum (default 3: x4)
+		if (value == nullptr) g_generate = 5; // KYTY_FRAMEGEN is the maximum (default 5: x6, capped by the GPU)
 	}
 	if (const char* dyn = std::getenv("KYTY_DLSSG_DYNAMIC"); dyn != nullptr && *dyn == '1' && g_generate > 0) {
 		g_dlssg_dynamic = true;
@@ -947,7 +1005,8 @@ void Initialize() {
 		}
 		if (g_dlssg_target_fps <= 0.0f) g_dlssg_target_fps = 224.0f;
 		// First guess: the game's usual 60 real fps.
-		g_dyn_gen = std::clamp(static_cast<int>(std::floor(g_dlssg_target_fps / 60.0)) - 1, 1, g_generate);
+		g_dyn_max = std::min(g_generate, 3); // until Streamline reports numFramesToGenerateMax
+		g_dyn_gen = std::clamp(static_cast<int>(std::floor(g_dlssg_target_fps / 60.0)) - 1, 1, g_dyn_max);
 	}
 #endif
 	{
@@ -1112,6 +1171,8 @@ void Initialize() {
 #endif
 }
 
+uint32_t DlssgReflexLimitUs(double interval);
+
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device) {
 	(void)instance;
 	(void)device;
@@ -1205,10 +1266,13 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 			const char* v = std::getenv("KYTY_DLSSG_REFLEX_LIMIT");
 			return v != nullptr && *v == '1';
 		}();
-		if (cap != 0 && g_dlssg_dynamic) {
-			std::printf("Frame generation: dynamic multiplier: no Reflex frame limit (KYTY_VRR_CAP_FPS %u ignored; target %.0f)\n",
-			            cap, static_cast<double>(g_dlssg_target_fps));
-			cap = 0;
+		if (g_dlssg_dynamic) {
+			// 10-22: Reflex holds real <= target / multiplier, set again on every change (KYTY_VRR_CAP_FPS not used).
+			cap                 = 0;
+			g_real_interval     = static_cast<double>(g_dyn_gen + 1) / static_cast<double>(g_dlssg_target_fps);
+			reflex.frameLimitUs = DlssgReflexLimitUs(g_real_interval);
+			std::printf("Frame generation: dynamic multiplier, target %.0f fps: Reflex limit %u us (x%d)\n",
+			            static_cast<double>(g_dlssg_target_fps), reflex.frameLimitUs, g_dyn_gen + 1);
 		}
 		if (cap != 0 && g_generate > 0 && flip_fps > 0 && !force_reflex &&
 		    static_cast<double>(flip_fps) * (g_generate + 1) <= cap + 0.5 &&
@@ -1218,8 +1282,10 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 			cap = 0;
 		}
 		if (cap != 0 && g_generate > 0) {
-			reflex.frameLimitUs = static_cast<uint32_t>(1000000.0 * (g_generate + 1) / cap);
+			g_dlssg_target_fps  = static_cast<float>(cap); // 10-23: fixed too: the flip floor (DynApplyReflexLimit per present)
+			g_fixed_floor       = true;
 			g_real_interval     = static_cast<double>(g_generate + 1) / cap;
+			reflex.frameLimitUs = DlssgReflexLimitUs(g_real_interval);
 			std::printf("Frame generation: shown frames held under %u fps (rendered at most %.1f, Reflex limit %u us)\n", cap,
 			            static_cast<double>(cap) / (g_generate + 1), reflex.frameLimitUs);
 		}
@@ -1270,6 +1336,21 @@ sl::Constants MakeConstants(bool usable, const Camera& camera_in, vk::Extent2D r
 	constants.orthographicProjection = sl::Boolean::eFalse;
 	constants.motionVectorsDilated   = sl::Boolean::eFalse;
 	constants.motionVectorsJittered  = sl::Boolean::eFalse;
+	{
+		// The vectors' scale and sign whether the camera was captured or not (it was set only with the camera: without
+		// it the game's vectors went in as +1, pointing the wrong way).
+		static const float sign = [] {
+			const char* value = std::getenv("KYTY_FRAMEGEN_MV_SIGN");
+			return value != nullptr && std::atof(value) > 0 ? 1.0f : -1.0f;
+		}();
+		static const bool px = [] {
+			const char* mv = std::getenv("KYTY_FRAMEGEN_MV");
+			return mv != nullptr && std::string(mv) == "px";
+		}();
+		if (usable && render.width != 0 && render.height != 0)
+			constants.mvecScale = px ? sl::float2(sign / static_cast<float>(render.width), sign / static_cast<float>(render.height))
+			                         : sl::float2(sign, sign);
+	}
 	if (usable && camera.valid) {
 		// Projection in view space: x' = sx*x + cx*z, y' = sy*y + cy*z, z' = near, w' = z.
 		Mat4 projection;
@@ -1467,6 +1548,71 @@ bool TaaReplaceWanted() {
 }
 
 
+// 10-23: KYTY_DLSSG_MARKERS=guest (default) | present. Before, every Reflex marker and slReflexSleep came at the
+// present: the simulation marked as taking no time, and Reflex's sleep delayed the present itself (the driver's
+// pacing then saw a frame of ~0 ms simulation and a variable wait before each present). Now at the guest flip on the
+// render thread: render submit end for the frame that ends there, then for the next one Reflex's sleep (it paces the
+// game's frames, not the presents), simulation start/end and render submit start; present start/end at the present
+// with the same frame index. present: all at the present (the old placement).
+bool ReflexGuestMarkers() {
+	static const bool guest = [] {
+		const char* v = std::getenv("KYTY_DLSSG_MARKERS");
+		return v == nullptr || std::strcmp(v, "present") != 0;
+	}();
+	return guest;
+}
+std::atomic<uint32_t> g_rx_counter {0};   // Reflex frame indices (guest and present paths)
+uint32_t              g_rx_open = 0;      // render thread: the frame begun at the last guest flip
+std::atomic<uint32_t> g_rx_present {0};   // the index BeforePresent presents next (SetPresentReflexIndex)
+
+// 10-22: real frames are paced by one limiter only: VideoOut's flip pacer (RealFrameInterval, the vblank grid, as
+// FSR3's) holds them to target / m; Reflex stays for latency without a frame limit (two limiters at 56 beat against
+// the game's 60: flip->present sd 1.90 ms vs FSR3's 0.55). KYTY_DLSSG_REFLEX_LIMIT=1: Reflex's limit too (old);
+// KYTY_DLSSG_PACE=reflex: Reflex's limit only (DlssgPaceMode).
+int DlssgPaceMode();
+uint32_t DlssgReflexLimitUs(double interval) {
+	static const bool force = [] {
+		const char* v = std::getenv("KYTY_DLSSG_REFLEX_LIMIT");
+		return v != nullptr && *v == '1';
+	}();
+	return (force || DlssgPaceMode() >= 2) && interval > 0.0 ? static_cast<uint32_t>(1000000.0 * interval) : 0u;
+}
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+// 10-22: the dynamic multiplier's Reflex cap: real <= target / (gen + 1), so shown <= target (G-Sync range).
+// gen < 0: no limit (DLSS-G off: menus, movies, loading; x1 is not held to the last multiplier's target / m).
+// 10-23: where the game's 60 would pass the target (x4 on 224), the game's own flips are held to the vblank's reach
+// rate (840 Hz: 56, DynApplyFlipFloor) and our pacer is off: the pacer at 56 against the game's 60 queued a frame
+// (log 20261022-190358, dynamic x4 at 55 real: flip->present mean 43.7 ms sd 3.9 vs 24.1 / 1.4 on fixed x4 at 45 real).
+// Not in cinematics or held cutscenes, nor with DLSS-G off. KYTY_DLSSG_FLIP_FLOOR=0: the pacer only. Fixed DLSS-G under
+// a cap (KYTY_VRR_CAP_FPS) likewise (10-23); it needs a vblank that 56 divides (840 Hz; 360 Hz refuses it: the pacer).
+void DynApplyReflexLimit(int gen) {
+	static const bool floor_on = [] {
+		const char* v = std::getenv("KYTY_DLSSG_FLIP_FLOOR");
+		return v == nullptr || *v != '0';
+	}();
+	if (floor_on && DlssgPaceMode() < 2 && gen >= 0 && !VideoOut::CinematicPlaying() && !VideoOut::CutsceneHeld()) {
+		DynApplyFlipFloor(gen);
+	} else if (g_dyn_flip_fps != 0) {
+		VideoOut::SetDynamicFlipFps(0);
+		g_dyn_flip_asked = -1;
+		g_dyn_flip_fps = 0;
+		std::printf("[dyn] game flips at 60\n");
+	}
+	const double interval = gen < 0 || g_dyn_flip_fps != 0
+	                            ? 0.0
+	                            : static_cast<double>(gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0);
+	if (g_real_interval.load() != interval)
+		std::printf("[dyn] pacer interval %.0f us for x%d%s\n", interval * 1e6, gen + 1, g_dyn_flip_fps != 0 ? " (game flips held instead)" : "");
+	g_real_interval       = interval; // the flip pacer (VideoOut, as FSR3's) holds real frames to it on the vblank grid
+	const uint32_t us     = DlssgReflexLimitUs(interval);
+	if (g_reflex_opts.frameLimitUs == us) return;
+	g_reflex_opts.frameLimitUs = us;
+	if (const auto result = g_api.reflex_set_options(g_reflex_opts); result != sl::Result::eOk)
+		LOGF("frame generation: slReflexSetOptions (dynamic limit) failed (%d)\n", static_cast<int>(result));
+}
+#endif
+
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2D region,
                    vk::Format format, uint32_t image_count) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -1482,7 +1628,9 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		g_dyn_pending_n = 0;
 		g_options_set   = false;
 		VideoOut::SetDynamicFlipFps(0);
+		g_dyn_flip_asked = -1;
 		g_dyn_flip_fps = 0;
+		DynApplyReflexLimit(g_dyn_gen);
 		std::printf("[dyn] cinematic: back to 60, x%d\n", g_dyn_gen + 1);
 		std::fflush(stdout);
 	}
@@ -1503,61 +1651,70 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		if (g_stat_start == std::chrono::steady_clock::time_point {}) g_stat_start = now;
 		++g_stat_real;
 		if (usable) ++g_stat_on;
+		{
+			static std::chrono::steady_clock::time_point prev {};
+			const double dt = prev == std::chrono::steady_clock::time_point {} ? 0.0 : std::chrono::duration<double>(now - prev).count();
+			prev            = now;
+			if (usable && dt > 0.0 && dt < 0.1) {
+				g_pace_n += 1.0;
+				g_pace_sum += dt;
+				g_pace_sq += dt * dt;
+			}
+		}
 		const double window = std::chrono::duration<double>(now - g_stat_start).count();
 		if (window >= 1.0) {
 			const double n = g_stat_real != 0 ? static_cast<double>(g_stat_real) : 1.0;
+			if (VideoOut::CinematicPlaying() || VideoOut::CutsceneHeld() || VideoOut::MoviePlaying() || g_mode_set != 1) {
+				g_pace_adapt = 0.0; // (nothing learned from held or ungenerated phases)
+				g_pace_n     = 0.0;
+			}
+			if (g_pace_n >= 10.0) {
+				const double mean = g_pace_sum / g_pace_n;
+				const double sd   = std::sqrt(std::max(g_pace_sq / g_pace_n - mean * mean, 0.0));
+				// Adaptive pacing: 0.98 mean + 0.75 sd, smoothed (the 2% lets it come down: held frames' mean is the pacer's
+				// own interval, so mean + sd alone would only ever grow). At the cap target / m wins (max).
+				const double want = 0.98 * mean + 0.75 * sd;
+				const double prev = g_pace_adapt.load();
+				g_pace_adapt      = prev <= 0.0 ? want : 0.7 * prev + 0.3 * want;
+				std::printf("[dlssg] present interval sd %.2f ms (mean %.2f, %.0f frames); pacer %.2f ms (%s)\n", sd * 1e3, mean * 1e3,
+				            g_pace_n, RealFrameInterval() * 1e3,
+				            DlssgPaceMode() == 0 ? "adaptive" : DlssgPaceMode() == 1 ? "grid" : DlssgPaceMode() == 2 ? "reflex" : "reflexfree");
+			} else {
+				g_pace_adapt = 0.0;
+			}
+			g_pace_n = g_pace_sum = g_pace_sq = 0.0;
 			if (g_dlssg_dynamic && g_mode_set == 1) {
 				const double real = g_stat_real / window;
 				// Free rate: frames over the time not spent in our limiter (what the game would do unlimited).
 				const double freer = g_stat_real / std::max(window - g_dyn_slept, 0.05);
 				g_dyn_slept       = 0.0;
 				g_dyn_real_fps    = g_dyn_real_fps <= 0.0 ? freer : 0.5 * g_dyn_real_fps + 0.5 * freer;
-				int limit         = g_generate;
-				// Real rate the game would run at without our limit: when we hold it, the measured rate is our cap.
-				const double free_real = g_dyn_real_fps;
-				int cand    = std::clamp(
-				    static_cast<int>(std::floor(static_cast<double>(g_dlssg_target_fps) / std::max(free_real, 1.0))) - 1, 1,
-				    std::max(limit, 1));
-				if (g_dyn_block_s > 0) --g_dyn_block_s;
-				// The game's flip floor holds the real rate (no limiter of ours: it beat against the game's 60 Hz pacing,
-				// a 4 Hz judder): `held` as the limiter was.
-				const bool   held      = g_dyn_limit_us != 0 || g_dyn_flip_fps != 0;
+				// 10-22: no flip floor (the game's real rate is not held to reach a multiplier). The largest m with
+				// real * m <= target; up only after real * (m + 1) <= 0.97 target held 2 windows (EMA ~1 s), down at once
+				// when real * m > 1.02 target. Reflex caps real at target / m: when the real rate sits on that cap for
+				// 2 windows the game may run faster, so one step down (and no step up for 10 s).
+				(void)freer;
+				// 10-22: decided on the free rate (src/local/dyn-multiplier.h): per-level minimum real fps, one step up
+				// at a time with a revert + 10 s block when it shows < 5% more, cap target / m only binding past it.
+				const double T         = static_cast<double>(g_dlssg_target_fps);
 				const bool   cinematic = VideoOut::CinematicPlaying();
-				// The extra frame taken but the game fell well under its limit (DLSS-G x4 costing GPU time): back one,
-				// and no extra frame for 60 s.
-				if (g_dyn_stretch && held && g_dyn_pending_n == 0 &&
-				    free_real < 0.9 * static_cast<double>(g_dlssg_target_fps) / (g_dyn_gen + 1)) {
-					g_dyn_block_s = 60;
-					std::printf("[dlssg] dynamic x%d cost too much (free %.1f fps): back to x%d for 60 s\n", g_dyn_gen + 1, free_real,
-					            g_dyn_gen);
-				}
-				// The extra frame only where the vblank gives an even rate for it (840 Hz: 56 for x4); else x3 at 60.
-				if (g_dyn_stretch && !cinematic && g_dyn_block_s == 0 && cand + 1 <= limit) {
-					const int reach = VideoOut::ReachFps(static_cast<double>(g_dlssg_target_fps), cand + 2);
-					if (reach > 0 && reach >= free_real * 0.9) cand += 1;
-				}
-				// While the limit holds the real rate, keep the stretched choice unless the game falls clearly below it.
-				if (g_dyn_block_s == 60) cand = std::max(g_dyn_gen - 1, 1);
-				else if (g_dyn_stretch && held && !cinematic && cand < g_dyn_gen &&
-				    free_real >= 0.95 * static_cast<double>(g_dlssg_target_fps) / (g_dyn_gen + 1)) {
-					cand = g_dyn_gen;
-				}
-				if (cinematic) cand = std::min(cand, std::min(2, std::max(limit, 1)));
-				if (cand == g_dyn_gen) {
-					g_dyn_pending_n = 0;
-				} else if (cand == g_dyn_pending) {
-					if (++g_dyn_pending_n >= 2) {
-						g_dyn_gen       = cand;
-						g_dyn_pending_n = 0;
-						g_options_set   = false; // send numFramesToGenerate again
-						// 10-21: no limiter of ours (it beat against the game's own 60 Hz flips: a 4 Hz judder); the game's
-						// flip floor (on an 840 Hz vblank 56 = every 15 vblanks) holds the real rate for the extra frame.
-						g_dyn_limit_us = 0;
-						DynApplyFlipFloor(cinematic ? std::min(g_dyn_gen, 2) : g_dyn_gen);
+				const int    maxgen    = cinematic ? std::min(2, g_dyn_max) : g_dyn_max;
+				int          next      = std::clamp(g_dyn_dm.Window(g_dyn_gen + 1, real, T, maxgen + 1,
+				                                                      cinematic || VideoOut::CutsceneHeld() || VideoOut::MoviePlaying()) - 1, 1, std::max(maxgen, 1));
+				if (next != g_dyn_gen) {
+					const int from_m = g_dyn_gen + 1;
+					g_dyn_gen      = next;
+					g_options_set  = false; // send numFramesToGenerate again
+					g_dyn_limit_us = 0;
+					g_dyn_pinned_s = 0;
+					if (g_dyn_flip_fps != 0) {
+						VideoOut::SetDynamicFlipFps(0);
+		g_dyn_flip_asked = -1;
+						g_dyn_flip_fps = 0;
 					}
-				} else {
-					g_dyn_pending   = cand;
-					g_dyn_pending_n = 1;
+					DynApplyReflexLimit(g_dyn_gen);
+					std::printf("[dyn] x%d (from x%d): real %.1f fps, shown %.1f (target %.0f), free %.1f\n", g_dyn_gen + 1, from_m,
+					            real, std::min(real * from_m, T), T, g_dyn_dm.last_free);
 				}
 				std::printf("[dlssg] dynamic x%d; real %.1f fps (smoothed %.1f), shown %.1f, target %.0f\n", g_dyn_gen + 1, real,
 				            g_dyn_real_fps, real * (g_dyn_gen + 1), static_cast<double>(g_dlssg_target_fps));
@@ -1584,6 +1741,9 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	run_with           = usable ? run_with + 1 : 0;
 	run_without        = usable ? 0 : run_without + 1;
 	const bool mode_on = g_mode_set == 1 ? run_without < 30 : run_with >= 10;
+	// 10-22: the dynamic Reflex limit is target / m of the current m while DLSS-G is on, none while it is off.
+	if (g_dlssg_dynamic) DynApplyReflexLimit(mode_on ? g_dyn_gen : -1);
+	else if (g_fixed_floor) DynApplyReflexLimit(mode_on ? g_generate : -1); // 10-23: fixed x4 likewise (flip floor 56)
 	// DLSS-G options; sizes are hints for its allocations.
 	if (!g_options_set || g_mode_set != (mode_on ? 1 : 0) || g_options_format != format ||
 	    (usable && (g_options_backbuffer != backbuffer || g_options_render != inputs->render_extent))) {
@@ -1635,7 +1795,10 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		g_options_format     = format;
 	}
 
-	++g_frame_index;
+	// 10-23: a frame begun at the guest flip (ReflexGuestFlip) keeps its index; others (menus, a repeated image)
+	// take a new one with all markers here, as before.
+	const uint32_t guest_index = g_rx_present.exchange(0, std::memory_order_relaxed);
+	g_frame_index              = guest_index != 0 ? guest_index : g_rx_counter.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (g_api.get_new_frame_token(g_token, &g_frame_index) != sl::Result::eOk || g_token == nullptr) {
 		g_token = nullptr;
 		return;
@@ -1645,15 +1808,20 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		const char* value = std::getenv("KYTY_DLSSG_SLEEP");
 		return value == nullptr || *value != '0';
 	}();
-	if (sleep && g_api.reflex_sleep != nullptr) g_api.reflex_sleep(token);
-	g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, token);
-	g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, token);
-	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, token);
+	if (guest_index == 0) {
+		if (sleep && g_api.reflex_sleep != nullptr && !ReflexGuestMarkers()) g_api.reflex_sleep(token);
+		g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, token);
+		g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, token);
+		g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, token);
+	}
 
 	sl::Constants constants = MakeConstants(usable, usable ? inputs->camera : Camera {}, usable ? inputs->render_extent : vk::Extent2D {});
-	if (const auto result = g_api.set_constants(constants, token, viewport); result != sl::Result::eOk &&
-	                                                                          g_presents < 8) {
-		LOGF("frame generation: slSetConstants failed (%d)\n", static_cast<int>(result));
+	if (const auto result = g_api.set_constants(constants, token, viewport); result != sl::Result::eOk) {
+		static uint32_t failures = 0;
+		if (failures++ < 8 || failures % 600 == 0) {
+			LOGF("frame generation: slSetConstants failed (%d), %u time(s)\n", static_cast<int>(result), failures);
+			std::printf("[dlssg] slSetConstants failed (%d), %u time(s)\n", static_cast<int>(result), failures);
+		}
 	}
 
 	if (usable) {
@@ -1710,9 +1878,43 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		    inputs->hudless_display.extent.height == backbuffer.height)
 			tags.emplace_back(&hudless, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent,
 			                  &hudless_extent);
-		if (const auto result = g_api.set_tag_for_frame(token, viewport, tags.data(), static_cast<uint32_t>(tags.size()), nullptr);
-		    result != sl::Result::eOk && g_presents < 8) {
-			LOGF("frame generation: slSetTagForFrame failed (%d)\n", static_cast<int>(result));
+		const auto tag_result = g_api.set_tag_for_frame(token, viewport, tags.data(), static_cast<uint32_t>(tags.size()), nullptr);
+		static uint32_t tag_failures = 0;
+		if (tag_result != sl::Result::eOk && (tag_failures++ < 8 || tag_failures % 600 == 0)) {
+			LOGF("frame generation: slSetTagForFrame failed (%d), %u time(s)\n", static_cast<int>(tag_result), tag_failures);
+			std::printf("[dlssg] slSetTagForFrame failed (%d), %u time(s)\n", static_cast<int>(tag_result), tag_failures);
+		}
+		// Once: what DLSS-G is given (its constants, the tags' extents and formats), to check against FSR 3's inputs.
+		static bool dumped = false;
+		if (!dumped) {
+			dumped = true;
+			const auto m = [](const Mat4& a) {
+				char text[320];
+				std::snprintf(text, sizeof(text), "[%.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g]",
+				              a[0].x, a[0].y, a[0].z, a[0].w, a[1].x, a[1].y, a[1].z, a[1].w, a[2].x, a[2].y, a[2].z, a[2].w,
+				              a[3].x, a[3].y, a[3].z, a[3].w);
+				return std::string(text);
+			};
+			char text[2048];
+			std::snprintf(text, sizeof(text),
+			              "[dlssg] constants: frame %u camera %s viewToClip %s clipToPrevClip %s mvecScale %.6g %.6g jitter %.4g %.4g "
+			              "near %.4g far %.4g fov %.4g aspect %.4g depthInverted %d cameraMotionIncluded %d mv3D %d dilated %d "
+			              "jittered %d ortho %d reset %d | depth %ux%u fmt %u, motion %ux%u fmt %u, tag extent %ux%u, hudless %s %ux%u, "
+			              "backbuffer %ux%u, region %d,%d %ux%u, setTag %d\n",
+			              g_frame_index, inputs->camera.valid ? "valid" : "INVALID", m(constants.cameraViewToClip).c_str(),
+			              m(constants.clipToPrevClip).c_str(), constants.mvecScale.x, constants.mvecScale.y, constants.jitterOffset.x,
+			              constants.jitterOffset.y, constants.cameraNear, constants.cameraFar, constants.cameraFOV,
+			              constants.cameraAspectRatio, static_cast<int>(constants.depthInverted),
+			              static_cast<int>(constants.cameraMotionIncluded), static_cast<int>(constants.motionVectors3D),
+			              static_cast<int>(constants.motionVectorsDilated), static_cast<int>(constants.motionVectorsJittered),
+			              static_cast<int>(constants.orthographicProjection), static_cast<int>(constants.reset), depth.width,
+			              depth.height, depth.nativeFormat, motion.width, motion.height, motion.nativeFormat, full.width, full.height,
+			              tags.size() > 2 && tags.back().type == sl::kBufferTypeHUDLessColor ? "tagged" : "not tagged",
+			              hudless.width, hudless.height, backbuffer.width, backbuffer.height, region.offset.x, region.offset.y,
+			              region.extent.width, region.extent.height, static_cast<int>(tag_result));
+			LOGF("%s", text);
+			std::printf("%s", text);
+			std::fflush(stdout);
 		}
 	} else {
 		// Menus, movies, loading: no valid depth and motion (DLSS-G then presents the frame as is).
@@ -1722,7 +1924,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		};
 		g_api.set_tag_for_frame(token, viewport, tags, static_cast<uint32_t>(std::size(tags)), nullptr);
 	}
-	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, token);
+	if (guest_index == 0) g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, token);
 	g_api.pcl_set_marker(sl::PCLMarker::ePresentStart, token);
 	g_present_begin = std::chrono::steady_clock::now();
 #else
@@ -1750,8 +1952,21 @@ void AfterPresent() {
 		return;
 	}
 	sl::DLSSGState state {};
-	if (g_api.dlssg_get_state(sl::ViewportHandle {0}, state, nullptr) != sl::Result::eOk) {
+	if (const auto result = g_api.dlssg_get_state(sl::ViewportHandle {0}, state, nullptr); result != sl::Result::eOk) {
+		if (presents < 300) std::printf("[dlssg] slDLSSGGetState failed (%d)\n", static_cast<int>(result));
 		return;
+	}
+	{
+		// DLSS-G's own verdict on its inputs (eFailResolutionTooLow, eFailCommonConstantsInvalid, ... as flags).
+		static uint32_t last_status = ~0u;
+		const auto      status      = static_cast<uint32_t>(state.status);
+		if (status != last_status || presents < 120) {
+			last_status = status;
+			LOGF("frame generation: DLSS-G state: status 0x%x, presented %u, generate max %u\n", status,
+			     state.numFramesActuallyPresented, state.numFramesToGenerateMax);
+			std::printf("[dlssg] state: status 0x%x, presented %u, generate max %u\n", status, state.numFramesActuallyPresented,
+			            state.numFramesToGenerateMax);
+		}
 	}
 	g_presented_frames.store(std::max(state.numFramesActuallyPresented, 1u), std::memory_order_relaxed);
 	// More generated frames asked for than the GPU makes (the launcher's 3x and up): as many as it makes.
@@ -1762,6 +1977,19 @@ void AfterPresent() {
 		            state.numFramesToGenerateMax);
 		g_generate    = static_cast<int>(state.numFramesToGenerateMax);
 		g_options_set = false;
+	}
+	if (g_dlssg_dynamic && state.numFramesToGenerateMax != 0) {
+		const int max = std::min(g_generate, static_cast<int>(state.numFramesToGenerateMax));
+		if (max != g_dyn_max) {
+			std::printf("[dyn] up to x%d (GPU makes up to %u generated)\n", max + 1, state.numFramesToGenerateMax);
+			std::fflush(stdout);
+			g_dyn_max = max;
+			if (g_dyn_gen > max) {
+				g_dyn_gen     = max;
+				g_options_set = false;
+				DynApplyReflexLimit(g_dyn_gen);
+			}
+		}
 	}
 	if (presents % 600 == 1) {
 		LOGF("frame generation: status=0x%x presented=%u max_generated=%u vram=%" PRIu64 " MiB\n",
@@ -1811,8 +2039,22 @@ void SetStaticRect(float x0, float y0, float x1, float y1) {
 	g_static_rect.store(pack(x0, 0) | pack(y0, 1) | pack(x1, 2) | pack(y1, 3), std::memory_order_relaxed);
 }
 
-void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
-	if (g_camera.valid || srt.size() < SrtJitter + 2 || !IsGbufferVertexShader(vs_hash)) {
+// The camera's capture, per guest frame window (the "[dlssg] camera valid" line): G-buffer draws seen by path, those
+// whose SRT was too short to hold the camera.
+std::atomic<uint32_t> g_cam_seen[3] {}; // normal, table, native record
+std::atomic<uint32_t> g_cam_short {};
+
+std::mutex            g_last_vp_mutex; // (KYTY_CONTACT_SHADOWS: the last captured camera, any frame)
+std::array<float, 16> g_last_vp {};
+bool                  g_have_last_vp = false;
+
+void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt, char path) {
+	if (g_camera.valid || !IsGbufferVertexShader(vs_hash)) {
+		return;
+	}
+	g_cam_seen[path == 't' ? 1 : path == 'r' ? 2 : 0].fetch_add(1, std::memory_order_relaxed);
+	if (srt.size() < SrtJitter + 2) {
+		g_cam_short.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 	for (uint32_t i = 0; i < 16; ++i) {
@@ -1827,6 +2069,12 @@ void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 	}
 	g_camera.jitter_ndc = {AsFloat(srt[SrtJitter]), AsFloat(srt[SrtJitter + 1])};
 	g_camera.valid      = true;
+	// (The KYTY_KBM mouse: the camera's yaw, from the forward row.)
+	::Libs::Graphics::HostInputCameraForward(g_camera.view_proj[12], g_camera.view_proj[13], g_camera.view_proj[14]);
+	if (ContactShadowsWanted()) {
+		std::lock_guard lock(g_last_vp_mutex);
+		g_last_vp = g_camera.view_proj, g_have_last_vp = true;
+	}
 }
 
 // KYTY_SHADER_CENSUS=1: every program the game runs (vertex, pixel, compute) with the first and last guest flip it ran
@@ -1863,6 +2111,41 @@ void NoteShader(uint64_t hash, char stage) {
 		            static_cast<unsigned long long>(v.first), static_cast<unsigned long long>(v.last),
 		            static_cast<unsigned long long>(v.count));
 	std::fflush(stdout);
+}
+
+
+void ReflexGuestFlip(FrameInputs& fg) {
+	fg.reflex_index = 0;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_ready || !ReflexGuestMarkers() || g_api.pcl_set_marker == nullptr) return;
+	sl::FrameToken* token = nullptr;
+	if (g_rx_open != 0) {
+		uint32_t index = g_rx_open;
+		if (g_api.get_new_frame_token(token, &index) == sl::Result::eOk && token != nullptr) {
+			g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, *token);
+			fg.reflex_index = g_rx_open;
+		}
+	}
+	uint32_t next = g_rx_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+	token         = nullptr;
+	if (g_api.get_new_frame_token(token, &next) != sl::Result::eOk || token == nullptr) {
+		g_rx_open = 0;
+		return;
+	}
+	static const bool sleep = [] {
+		const char* value = std::getenv("KYTY_DLSSG_SLEEP");
+		return value == nullptr || *value != '0';
+	}();
+	if (sleep && g_api.reflex_sleep != nullptr) g_api.reflex_sleep(*token);
+	g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, *token);
+	g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, *token);
+	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, *token);
+	g_rx_open = next;
+#endif
+}
+
+void SetPresentReflexIndex(uint32_t index) {
+	g_rx_present.store(index, std::memory_order_relaxed);
 }
 
 void NoteScene() {
@@ -3207,10 +3490,45 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	// take the table path, which does not report it, and generation went on and off from frame to frame.)
 	const bool ready = g_sources.valid;
 	const auto sources = g_sources;
-	const auto camera  = g_camera;
+	auto camera        = g_camera;
 	g_sources.valid    = false;
 	g_camera.valid     = false;
 	++g_guest_frame;
+	{
+		// A guest frame whose G-buffer draws did not give the camera: the last captured one, for up to
+		// KYTY_DLSSG_CAMERA_HOLD (2) frames, its previous matrix the same (no camera motion assumed: the vectors carry it),
+		// in place of identity matrices and a reset (DLSS-G then interpolated as from the image alone).
+		static const uint32_t hold_frames = [] {
+			const char* value = std::getenv("KYTY_DLSSG_CAMERA_HOLD");
+			return value != nullptr ? static_cast<uint32_t>(std::atoi(value)) : 2u;
+		}();
+		static Camera   last {};
+		static uint32_t since = ~0u;
+		static uint32_t window = 0, valid = 0, held = 0;
+		if (camera.valid) {
+			last  = camera;
+			since = 0;
+			++valid;
+		} else if (last.valid && since < hold_frames) {
+			++since;
+			camera                = last;
+			camera.prev_view_proj = last.view_proj;
+			++held;
+		} else if (since != ~0u) {
+			since = hold_frames + 1;
+		}
+		if (++window == 600) {
+			const auto seen = [](uint32_t i) { return g_cam_seen[i].exchange(0, std::memory_order_relaxed); };
+			const uint32_t normal = seen(0), table = seen(1), record = seen(2);
+			const uint32_t shorter = g_cam_short.exchange(0, std::memory_order_relaxed);
+			LOGF("[dlssg] camera valid %u of 600 (held %u; G-buffer draws before capture: normal %u, table %u, record %u, SRT "
+			     "too short %u)\n", valid, held, normal, table, record, shorter);
+			std::printf("[dlssg] camera valid %u of 600 (held %u; G-buffer draws before capture: normal %u, table %u, record "
+			            "%u, SRT too short %u)\n", valid, held, normal, table, record, shorter);
+			std::fflush(stdout);
+			window = valid = held = 0;
+		}
+	}
 	if (!ready) {
 		return;
 	}
@@ -3600,7 +3918,2418 @@ void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float
 }
 } // namespace
 
-bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
+namespace {
+// KYTY_SSGI=0|1|2 (ssgi.comp): screen-space ray-traced GI + AO on the PS5 Pro path's render-resolution color, recorded
+// right before the upscaler (DLSS / XeSS / FSR), which then reads our composited copy in place of the game's color, so
+// the upscaler and frame generation see it. Trace (1: half res, 1 ray/px; 2 "Alto": full res, 3 rays/px; 3 "Ultra": full res, 5 rays/px, 28 steps + refine),
+// SVGF-style variance-guided temporal + a-trous (3 passes, 4 at Ultra), Ultra anti-flicker, temporal (alpha 0.1, clamped),
+// 2 a-trous passes, bilateral upsample. KYTY_SSGI_INTENSITY (0.6), KYTY_SSGI_AO (0.25).
+// Normals from depth derivatives; view positions from the game's view_to_clip (handles reverse-Z).
+struct SsgiImage {
+	VulkanImage   image;
+	vk::ImageView view = nullptr;
+};
+struct SsgiPass {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	vk::Sampler             point      = nullptr;
+	vk::Sampler             linear     = nullptr;
+	bool                    failed     = false;
+	vk::Extent2D            render {}, trace {};
+	SsgiImage               raw, tmp_a, tmp_b, out;
+	SsgiImage               history[2], gbuf[2];
+	SsgiImage               moments[2], var_a, var_b; // (luma m1, m2, count, variance) / filtered variance (trace res)
+	SsgiImage               gihist[2];                // the composited GI (render res), level 3's anti-flicker
+	uint32_t                frame         = 0;
+	int                     quality       = 0;
+	bool                    history_valid = false;
+	// GPU time: two timestamps a frame, a ring of 8, read 4 frames later.
+	vk::QueryPool           pool      = nullptr;
+	double                  period_ns = 1.0;
+	uint64_t                written = 0, read = 0;
+	double                  sum_ms  = 0.0;
+	uint32_t                samples = 0;
+	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+} g_ssgi;
+
+struct SsgiPush {
+	float   proj[4];
+	float   depth_map[4];
+	float   motion[4];
+	float   trace[4];
+	int32_t misc[4];
+	float   extra[4];
+};
+static_assert(sizeof(SsgiPush) == 96);
+
+int SsgiQuality() {
+	static const int quality = [] {
+		const char* value = std::getenv("KYTY_SSGI");
+		return value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
+	}();
+	return quality;
+}
+float SsgiEnv(const char* name, float fallback, float hi) {
+	const char* value = std::getenv(name);
+	return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, hi) : fallback;
+}
+
+bool SsgiMakeImage(GraphicContext& graphics, SsgiImage& img, vk::Extent2D extent) {
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = vk::Format::eR16G16B16A16Sfloat;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+	               vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+	create.sharingMode = vk::SharingMode::eExclusive;
+	create.samples     = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, img.image)) {
+		img.image.image = nullptr;
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = img.image.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = vk::Format::eR16G16B16A16Sfloat;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (graphics.device.createImageView(&view_info, nullptr, &img.view) != vk::Result::eSuccess) return false;
+	img.image.state = {};
+	return true;
+}
+void SsgiFreeImage(GraphicContext& graphics, SsgiImage& img) {
+	if (img.view != nullptr) graphics.device.destroyImageView(img.view, nullptr);
+	img.view = nullptr;
+	if (img.image.image != nullptr) graphics.DeleteImage(img.image);
+	img.image.image = nullptr;
+}
+
+std::array<SsgiImage*, 14> SsgiAll() {
+	return {&g_ssgi.raw,        &g_ssgi.tmp_a,      &g_ssgi.tmp_b,      &g_ssgi.out,   &g_ssgi.history[0],
+	        &g_ssgi.history[1], &g_ssgi.gbuf[0],    &g_ssgi.gbuf[1],    &g_ssgi.moments[0], &g_ssgi.moments[1],
+	        &g_ssgi.var_a,      &g_ssgi.var_b,      &g_ssgi.gihist[0],  &g_ssgi.gihist[1]};
+}
+
+bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
+	const auto device = graphics.device;
+	if (g_ssgi.pipeline == nullptr) {
+		if (g_ssgi.failed) return false;
+		g_ssgi.failed = true;
+		std::array<vk::DescriptorSetLayoutBinding, 11> bindings {};
+		for (uint32_t i = 0; i < 11; ++i) {
+			bindings[i].binding         = i;
+			bindings[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorCount = 1;
+			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+		}
+		vk::DescriptorSetLayoutCreateInfo set_info {};
+		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+		set_info.pBindings    = bindings.data();
+		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_ssgi.set_layout) != vk::Result::eSuccess) return false;
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(SsgiPush)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = 1;
+		layout_info.pSetLayouts            = &g_ssgi.set_layout;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push;
+		if (device.createPipelineLayout(&layout_info, nullptr, &g_ssgi.layout) != vk::Result::eSuccess) return false;
+		vk::ShaderModuleCreateInfo module_info {};
+		module_info.codeSize    = sizeof(SSGI_SPV);
+		module_info.pCode       = SSGI_SPV;
+		vk::ShaderModule module = nullptr;
+		if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		pipeline_info.stage.module = module;
+		pipeline_info.stage.pName  = "main";
+		pipeline_info.layout       = g_ssgi.layout;
+		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_ssgi.pipeline);
+		device.destroyShaderModule(module, nullptr);
+		if (created != vk::Result::eSuccess) {
+			g_ssgi.pipeline = nullptr;
+			return false;
+		}
+		for (int i = 0; i < 2; ++i) {
+			vk::SamplerCreateInfo sampler {};
+			sampler.magFilter    = i == 0 ? vk::Filter::eNearest : vk::Filter::eLinear;
+			sampler.minFilter    = sampler.magFilter;
+			sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+			sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+			sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+			if (device.createSampler(&sampler, nullptr, i == 0 ? &g_ssgi.point : &g_ssgi.linear) != vk::Result::eSuccess) return false;
+		}
+		vk::QueryPoolCreateInfo query {};
+		query.queryType  = vk::QueryType::eTimestamp;
+		query.queryCount = 16;
+		if (device.createQueryPool(&query, nullptr, &g_ssgi.pool) != vk::Result::eSuccess) g_ssgi.pool = nullptr;
+		g_ssgi.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		g_ssgi.failed    = false;
+	}
+	if (g_ssgi.out.image.image != nullptr && g_ssgi.render == render && g_ssgi.quality == quality) return true;
+	device.waitIdle();
+	for (auto* img : SsgiAll())
+		SsgiFreeImage(graphics, *img);
+	const vk::Extent2D trace = quality >= 2 ? render : vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
+	bool ok = SsgiMakeImage(graphics, g_ssgi.out, render);
+	for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.history[0], &g_ssgi.history[1], &g_ssgi.gbuf[0], &g_ssgi.gbuf[1],
+	                  &g_ssgi.moments[0], &g_ssgi.moments[1], &g_ssgi.var_a, &g_ssgi.var_b})
+		ok = ok && SsgiMakeImage(graphics, *img, trace);
+	for (auto* img : {&g_ssgi.gihist[0], &g_ssgi.gihist[1]})
+		ok = ok && SsgiMakeImage(graphics, *img, render);
+	if (!ok) {
+		for (auto* img : SsgiAll())
+			SsgiFreeImage(graphics, *img);
+		g_ssgi.failed = true;
+		return false;
+	}
+	g_ssgi.render        = render;
+	g_ssgi.quality       = quality;
+	g_ssgi.trace         = trace;
+	g_ssgi.history_valid = false;
+	return true;
+}
+
+void SsgiReadTiming() {
+	if (g_ssgi.pool == nullptr || g_graphics_ctx == nullptr) return;
+	while (g_ssgi.read + 4 <= g_ssgi.written) {
+		const auto entry = static_cast<uint32_t>(g_ssgi.read % 8);
+		std::array<uint64_t, 2> stamps {};
+		if (g_graphics_ctx->device.getQueryPoolResults(g_ssgi.pool, entry * 2, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		                                               vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
+			break;
+		g_ssgi.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_ssgi.period_ns / 1e6;
+		++g_ssgi.samples;
+		++g_ssgi.read;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_ssgi.last_log >= std::chrono::seconds(5) && g_ssgi.samples > 0) {
+		std::printf("SSGI: GPU %.3f ms (mean of %u frames)\n", g_ssgi.sum_ms / g_ssgi.samples, g_ssgi.samples);
+		std::fflush(stdout);
+		g_ssgi.sum_ms   = 0.0;
+		g_ssgi.samples  = 0;
+		g_ssgi.last_log = now;
+	}
+}
+
+// Records the effect; on success `color` is replaced by our composited rgba16f image (general layout).
+bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
+	const int quality = SsgiQuality();
+	const auto skip = [](const char* why) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("SSGI: skipped at the first upscaler frame (%s)\n", why);
+			std::fflush(stdout);
+		}
+	};
+	if (quality == 0) return skip("KYTY_SSGI is 0 or unset"), false;
+	if (g_graphics_ctx == nullptr) return skip("no graphics context"), false;
+	if (VideoOut::MoviePlaying()) {
+		g_ssgi.history_valid = false;
+		return false;
+	}
+	const auto& color = inputs.color;
+	if (color.view == nullptr || inputs.depth.view == nullptr || inputs.motion.view == nullptr || color.extent.width < 16 ||
+	    color.extent.height < 16)
+		return skip("missing color/depth/motion view"), false;
+	if (!SsgiEnsure(*g_graphics_ctx, color.extent, quality)) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("SSGI: off (could not create its pipeline or images)\n");
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	const float intensity = SsgiEnv("KYTY_SSGI_INTENSITY", 0.6f, 4.0f);
+	const float ao        = SsgiEnv("KYTY_SSGI_AO", 0.25f, 1.0f);
+	const auto& m         = inputs.view_to_clip;
+	SsgiPush    push {};
+	const bool  have_proj = m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f);
+	if (have_proj) {
+		push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
+		push.depth_map[0] = m[10], push.depth_map[1] = m[14], push.depth_map[2] = m[11], push.depth_map[3] = m[15];
+	} else {
+		// No projection: a 60 degree vertical FOV, reverse-Z infinite (d = near / z), the render's aspect.
+		const float f  = 1.0f / std::tan(0.5f * 1.0472f);
+		const float ar = static_cast<float>(color.extent.width) / static_cast<float>(color.extent.height);
+		push.proj[0] = f / ar, push.proj[1] = f, push.proj[2] = 0.0f, push.proj[3] = 0.0f;
+		push.depth_map[0] = 0.0f, push.depth_map[1] = inputs.near_plane, push.depth_map[2] = 1.0f, push.depth_map[3] = 0.0f;
+	}
+	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
+	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
+	push.trace[0] = static_cast<float>(g_ssgi.trace.width), push.trace[1] = static_cast<float>(g_ssgi.trace.height);
+	push.trace[2] = intensity, push.trace[3] = ao;
+	push.extra[1] = 2.0f, push.extra[2] = 0.5f; // ray length / thickness at 1 m, grown with distance
+	{
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("SSGI: on (quality %d, %ux%u, intensity %g, ao %g)%s\n", quality, g_ssgi.trace.width, g_ssgi.trace.height,
+			            intensity, ao, have_proj ? "" : " (no projection: 60 deg FOV assumed)");
+			std::printf("SSGI: color format %d, depth format %d, view_to_clip z terms %g %g %g %g\n", static_cast<int>(color.format),
+			            static_cast<int>(inputs.depth.format), m[10], m[14], m[11], m[15]);
+			std::fflush(stdout);
+		}
+	}
+	SsgiReadTiming();
+	const auto     entry = static_cast<uint32_t>(g_ssgi.written % 8);
+	const bool     timed = g_ssgi.pool != nullptr;
+	if (timed) {
+		command.resetQueryPool(g_ssgi.pool, entry * 2, 2);
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_ssgi.pool, entry * 2);
+	}
+	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
+	                        vk::AccessFlags2 dst) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = src_stage;
+		barrier.srcAccessMask = src;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	// Our images general throughout (the first use from undefined).
+	for (auto* img : SsgiAll())
+		if (img->image.state.layout != vk::ImageLayout::eGeneral)
+			Transition(command, img->image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+			           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	// Earlier uses of our images (the previous frame's upscaler read of `out`) before this frame's writes.
+	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+	       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	const uint32_t cur  = g_ssgi.frame & 1u;
+	const uint32_t prev = cur ^ 1u;
+	push.misc[1] = static_cast<int32_t>(g_ssgi.frame);
+	push.misc[2] = quality;
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g_ssgi.history_valid ? 2 : 0);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_ssgi.pipeline);
+	const SsgiImage* aux_in  = &g_ssgi.moments[prev];
+	const SsgiImage* aux_out = &g_ssgi.moments[cur];
+	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout, float step,
+	                     vk::Extent2D size) {
+		const vk::Sampler       lin = g_ssgi.linear, pt = g_ssgi.point;
+		vk::DescriptorImageInfo infos[11] {};
+		infos[0]  = {lin, color.view, color.layout};
+		infos[1]  = {pt, inputs.depth.view, inputs.depth.layout};
+		infos[2]  = {pt, inputs.motion.view, inputs.motion.layout};
+		infos[3]  = {lin, a.view, vk::ImageLayout::eGeneral};
+		infos[4]  = {lin, b.view, vk::ImageLayout::eGeneral};
+		infos[5]  = {pt, g_ssgi.gbuf[cur].view, vk::ImageLayout::eGeneral};
+		infos[6]  = {pt, g_ssgi.gbuf[prev].view, vk::ImageLayout::eGeneral};
+		infos[7]  = {nullptr, out.view, vk::ImageLayout::eGeneral};
+		infos[8]  = {nullptr, gout.view, vk::ImageLayout::eGeneral};
+		infos[9]  = {lin, aux_in->view, vk::ImageLayout::eGeneral};
+		infos[10] = {nullptr, aux_out->view, vk::ImageLayout::eGeneral};
+		vk::WriteDescriptorSet writes[11] {};
+		for (uint32_t i = 0; i < 11; ++i) {
+			writes[i].dstBinding      = i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			writes[i].pImageInfo      = &infos[i];
+		}
+		push.misc[0] = mode;
+		push.extra[0] = step;
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_ssgi.layout, 0, 11, writes);
+		command.pushConstants(g_ssgi.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	};
+	// SVGF order: trace; temporal (variance-guided count, moments) -> tmp_a; a-trous step 1 -> the colour history;
+	// a-trous 2, 4 (, 8 at level 3) ping-ponging tmp_b / tmp_a with the filtered variance in var_a / var_b; composite
+	// (bilateral upsample, level 3 anti-flicker against gihist[prev]) -> out.
+	// (Bindings a mode does not write still need a valid storage image.)
+	run(0, g_ssgi.tmp_a, g_ssgi.tmp_b, g_ssgi.raw, g_ssgi.gbuf[cur], 0.0f, g_ssgi.trace);
+	run(1, g_ssgi.raw, g_ssgi.history[prev], g_ssgi.tmp_a, g_ssgi.tmp_b, 0.0f, g_ssgi.trace);
+	aux_in = &g_ssgi.moments[cur], aux_out = &g_ssgi.var_a;
+	run(2, g_ssgi.tmp_a, g_ssgi.raw, g_ssgi.history[cur], g_ssgi.tmp_b, 1.0f, g_ssgi.trace);
+	aux_in = &g_ssgi.var_a, aux_out = &g_ssgi.var_b;
+	run(2, g_ssgi.history[cur], g_ssgi.raw, g_ssgi.tmp_b, g_ssgi.raw, 2.0f, g_ssgi.trace);
+	aux_in = &g_ssgi.var_b, aux_out = &g_ssgi.var_a;
+	run(2, g_ssgi.tmp_b, g_ssgi.raw, g_ssgi.tmp_a, g_ssgi.raw, 4.0f, g_ssgi.trace);
+	const SsgiImage* final_gi = &g_ssgi.tmp_a;
+	if (quality >= 3) {
+		aux_in = &g_ssgi.var_a, aux_out = &g_ssgi.var_b;
+		run(2, g_ssgi.tmp_a, g_ssgi.raw, g_ssgi.tmp_b, g_ssgi.raw, 8.0f, g_ssgi.trace);
+		final_gi = &g_ssgi.tmp_b;
+	}
+	aux_in = &g_ssgi.var_a, aux_out = &g_ssgi.var_b;
+	run(4, *final_gi, g_ssgi.gihist[prev], g_ssgi.out, g_ssgi.gihist[cur], 0.0f, g_ssgi.render);
+	// The composite's writes before the upscaler reads.
+	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
+	       vk::AccessFlagBits2::eMemoryRead);
+	if (timed) {
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_ssgi.pool, entry * 2 + 1);
+		++g_ssgi.written;
+	}
+	++g_ssgi.frame;
+	g_ssgi.history_valid = true;
+	inputs.color.image  = g_ssgi.out.image.image;
+	inputs.color.view   = g_ssgi.out.view;
+	inputs.color.layout = vk::ImageLayout::eGeneral;
+	inputs.color.format = vk::Format::eR16G16B16A16Sfloat;
+	inputs.color.usage  = g_ssgi.out.image.usage;
+	inputs.color.level  = 0;
+	inputs.color.layer  = 0;
+	return true;
+}
+} // namespace
+
+namespace {
+// KYTY_GTAO=0|1|2|3 ("advanced ambient occlusion": off / Normal / Alta / Ultra; gtao.comp): GTAO ported from Intel
+// XeGTAO (MIT, attribution in gtao.comp), recorded right before the upscaler after SSGI, with SSGI's inputs (depth,
+// motion vectors, color, the upscaler's view_to_clip). Normals from depth; horizon search with cosine-weighted
+// slices (1: half res, 2 slices x 8 steps; 2: full res, 3 x 12; 3: full res, 4 x 16); SSGI-style temporal
+// (motion-vector reprojection, depth/normal disocclusion reset) + edge-aware a-trous (1, 2 / 1, 2, 4 / 1, 2, 4, 8);
+// composite: a soft darkening multiplied into the color, faded with distance, sky skipped. KYTY_GTAO_STRENGTH (0.6),
+// KYTY_GTAO_RADIUS (metres, 1.0), KYTY_GTAO_BENT (0: the extra multiplier on dark, ambient-dominated pixels, 0..1).
+// Off (the default): nothing created, nothing recorded.
+struct GtaoPass {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	vk::Sampler             point      = nullptr;
+	vk::Sampler             linear     = nullptr;
+	bool                    failed     = false;
+	vk::Extent2D            render {}, trace {};
+	SsgiImage               raw, tmp_a, tmp_b, out;
+	SsgiImage               history[2], gbuf[2], count[2];
+	uint32_t                frame         = 0;
+	int                     level         = 0;
+	bool                    history_valid = false;
+	vk::QueryPool           pool      = nullptr;
+	double                  period_ns = 1.0;
+	uint64_t                written = 0, read = 0;
+	double                  sum_ms  = 0.0;
+	uint32_t                samples = 0;
+	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+} g_gtao;
+
+int GtaoLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_GTAO");
+		const int   l     = value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
+		if (l > 0) {
+			std::printf("GTAO: level %d\n", l);
+			std::fflush(stdout);
+		}
+		return l;
+	}();
+	return level;
+}
+
+std::array<SsgiImage*, 10> GtaoAll() {
+	return {&g_gtao.raw,     &g_gtao.tmp_a,   &g_gtao.tmp_b,    &g_gtao.out,      &g_gtao.history[0],
+	        &g_gtao.history[1], &g_gtao.gbuf[0], &g_gtao.gbuf[1], &g_gtao.count[0], &g_gtao.count[1]};
+}
+
+bool GtaoEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
+	const auto device = graphics.device;
+	if (g_gtao.pipeline == nullptr) {
+		if (g_gtao.failed) return false;
+		g_gtao.failed = true;
+		std::array<vk::DescriptorSetLayoutBinding, 11> bindings {};
+		for (uint32_t i = 0; i < 11; ++i) {
+			bindings[i].binding         = i;
+			bindings[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorCount = 1;
+			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+		}
+		vk::DescriptorSetLayoutCreateInfo set_info {};
+		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+		set_info.pBindings    = bindings.data();
+		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_gtao.set_layout) != vk::Result::eSuccess) return false;
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(SsgiPush)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = 1;
+		layout_info.pSetLayouts            = &g_gtao.set_layout;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push;
+		if (device.createPipelineLayout(&layout_info, nullptr, &g_gtao.layout) != vk::Result::eSuccess) return false;
+		vk::ShaderModuleCreateInfo module_info {};
+		module_info.codeSize    = sizeof(GTAO_SPV);
+		module_info.pCode       = GTAO_SPV;
+		vk::ShaderModule module = nullptr;
+		if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		pipeline_info.stage.module = module;
+		pipeline_info.stage.pName  = "main";
+		pipeline_info.layout       = g_gtao.layout;
+		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_gtao.pipeline);
+		device.destroyShaderModule(module, nullptr);
+		if (created != vk::Result::eSuccess) {
+			g_gtao.pipeline = nullptr;
+			return false;
+		}
+		for (int i = 0; i < 2; ++i) {
+			vk::SamplerCreateInfo sampler {};
+			sampler.magFilter    = i == 0 ? vk::Filter::eNearest : vk::Filter::eLinear;
+			sampler.minFilter    = sampler.magFilter;
+			sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+			sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+			sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+			if (device.createSampler(&sampler, nullptr, i == 0 ? &g_gtao.point : &g_gtao.linear) != vk::Result::eSuccess) return false;
+		}
+		vk::QueryPoolCreateInfo query {};
+		query.queryType  = vk::QueryType::eTimestamp;
+		query.queryCount = 16;
+		if (device.createQueryPool(&query, nullptr, &g_gtao.pool) != vk::Result::eSuccess) g_gtao.pool = nullptr;
+		g_gtao.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		g_gtao.failed    = false;
+	}
+	if (g_gtao.out.image.image != nullptr && g_gtao.render == render && g_gtao.level == level) return true;
+	const vk::Extent2D trace = level >= 2 ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
+	for (auto* img : GtaoAll())
+		SsgiFreeImage(graphics, *img);
+	bool ok = SsgiMakeImage(graphics, g_gtao.out, render);
+	for (auto* img : {&g_gtao.raw, &g_gtao.tmp_a, &g_gtao.tmp_b, &g_gtao.history[0], &g_gtao.history[1], &g_gtao.gbuf[0], &g_gtao.gbuf[1],
+	                  &g_gtao.count[0], &g_gtao.count[1]})
+		ok = ok && SsgiMakeImage(graphics, *img, trace);
+	if (!ok) {
+		for (auto* img : GtaoAll())
+			SsgiFreeImage(graphics, *img);
+		g_gtao.failed = true;
+		return false;
+	}
+	g_gtao.render        = render;
+	g_gtao.level         = level;
+	g_gtao.trace         = trace;
+	g_gtao.history_valid = false;
+	return true;
+}
+
+void GtaoReadTiming() {
+	if (g_gtao.pool == nullptr || g_graphics_ctx == nullptr) return;
+	while (g_gtao.read + 4 <= g_gtao.written) {
+		const auto entry = static_cast<uint32_t>(g_gtao.read % 8);
+		std::array<uint64_t, 2> stamps {};
+		if (g_graphics_ctx->device.getQueryPoolResults(g_gtao.pool, entry * 2, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		                                               vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
+			break;
+		g_gtao.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_gtao.period_ns / 1e6;
+		++g_gtao.samples;
+		++g_gtao.read;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_gtao.last_log >= std::chrono::seconds(5) && g_gtao.samples > 0) {
+		std::printf("GTAO: GPU %.3f ms (mean of %u frames)\n", g_gtao.sum_ms / g_gtao.samples, g_gtao.samples);
+		std::fflush(stdout);
+		g_gtao.sum_ms   = 0.0;
+		g_gtao.samples  = 0;
+		g_gtao.last_log = now;
+	}
+}
+
+bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
+	const int level = GtaoLevel();
+	if (level == 0) return false; // off: nothing created or recorded
+	if (g_graphics_ctx == nullptr) return false;
+	if (VideoOut::MoviePlaying()) {
+		g_gtao.history_valid = false;
+		return false;
+	}
+	const auto& color = inputs.color;
+	if (color.view == nullptr || inputs.depth.view == nullptr || inputs.motion.view == nullptr || color.extent.width < 16 ||
+	    color.extent.height < 16)
+		return false;
+	if (!GtaoEnsure(*g_graphics_ctx, color.extent, level)) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("GTAO: off (could not create its pipeline or images)\n");
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	const float strength = SsgiEnv("KYTY_GTAO_STRENGTH", 0.6f, 1.0f);
+	const float radius   = std::max(SsgiEnv("KYTY_GTAO_RADIUS", 1.0f, 8.0f), 0.05f);
+	const float bent     = SsgiEnv("KYTY_GTAO_BENT", 0.0f, 1.0f);
+	const auto& m        = inputs.view_to_clip;
+	SsgiPush    push {};
+	const bool  have_proj = m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f);
+	if (have_proj) {
+		push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
+		push.depth_map[0] = m[10], push.depth_map[1] = m[14], push.depth_map[2] = m[11], push.depth_map[3] = m[15];
+	} else {
+		const float f  = 1.0f / std::tan(0.5f * 1.0472f);
+		const float ar = static_cast<float>(color.extent.width) / static_cast<float>(color.extent.height);
+		push.proj[0] = f / ar, push.proj[1] = f, push.proj[2] = 0.0f, push.proj[3] = 0.0f;
+		push.depth_map[0] = 0.0f, push.depth_map[1] = inputs.near_plane, push.depth_map[2] = 1.0f, push.depth_map[3] = 0.0f;
+	}
+	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
+	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
+	push.trace[0] = static_cast<float>(g_gtao.trace.width), push.trace[1] = static_cast<float>(g_gtao.trace.height);
+	push.trace[2] = strength, push.trace[3] = radius;
+	push.extra[1] = bent;
+	{
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("GTAO: on (level %d, %ux%u, strength %g, radius %g m, bent %g)%s\n", level, g_gtao.trace.width,
+			            g_gtao.trace.height, strength, radius, bent, have_proj ? "" : " (no projection: 60 deg FOV assumed)");
+			std::fflush(stdout);
+		}
+	}
+	GtaoReadTiming();
+	const auto entry = static_cast<uint32_t>(g_gtao.written % 8);
+	const bool timed = g_gtao.pool != nullptr;
+	if (timed) {
+		command.resetQueryPool(g_gtao.pool, entry * 2, 2);
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_gtao.pool, entry * 2);
+	}
+	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
+	                        vk::AccessFlags2 dst) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = src_stage;
+		barrier.srcAccessMask = src;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	for (auto* img : GtaoAll())
+		if (img->image.state.layout != vk::ImageLayout::eGeneral)
+			Transition(command, img->image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+			           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+	       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	const uint32_t cur  = g_gtao.frame & 1u;
+	const uint32_t prev = cur ^ 1u;
+	push.misc[1] = static_cast<int32_t>(g_gtao.frame);
+	push.misc[2] = level;
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g_gtao.history_valid ? 2 : 0);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_gtao.pipeline);
+	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout,
+	                     const SsgiImage& aux_in, const SsgiImage& aux_out, float step, vk::Extent2D size) {
+		const vk::Sampler       lin = g_gtao.linear, pt = g_gtao.point;
+		vk::DescriptorImageInfo infos[11] {};
+		infos[0]  = {lin, color.view, color.layout};
+		infos[1]  = {pt, inputs.depth.view, inputs.depth.layout};
+		infos[2]  = {pt, inputs.motion.view, inputs.motion.layout};
+		infos[3]  = {lin, a.view, vk::ImageLayout::eGeneral};
+		infos[4]  = {lin, b.view, vk::ImageLayout::eGeneral};
+		infos[5]  = {pt, g_gtao.gbuf[cur].view, vk::ImageLayout::eGeneral};
+		infos[6]  = {pt, g_gtao.gbuf[prev].view, vk::ImageLayout::eGeneral};
+		infos[7]  = {nullptr, out.view, vk::ImageLayout::eGeneral};
+		infos[8]  = {nullptr, gout.view, vk::ImageLayout::eGeneral};
+		infos[9]  = {pt, aux_in.view, vk::ImageLayout::eGeneral};
+		infos[10] = {nullptr, aux_out.view, vk::ImageLayout::eGeneral};
+		vk::WriteDescriptorSet writes[11] {};
+		for (uint32_t i = 0; i < 11; ++i) {
+			writes[i].dstBinding      = i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			writes[i].pImageInfo      = &infos[i];
+		}
+		push.misc[0]  = mode;
+		push.extra[0] = step;
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_gtao.layout, 0, 11, writes);
+		command.pushConstants(g_gtao.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	};
+	// (Bindings a mode does not write still need a valid storage image: tmp_b is the scratch target.)
+	auto& g = g_gtao;
+	run(0, g.tmp_a, g.tmp_b, g.raw, g.gbuf[cur], g.count[prev], g.tmp_b, 0.0f, g.trace);                     // GTAO
+	run(1, g.raw, g.history[prev], g.history[cur], g.tmp_b, g.count[prev], g.count[cur], 0.0f, g.trace);      // temporal
+	const SsgiImage* src = &g.history[cur];
+	const SsgiImage* ping[2] = {&g.tmp_a, &g.raw};
+	const int        passes  = level >= 3 ? 4 : level >= 2 ? 3 : 2;
+	for (int i = 0; i < passes; ++i) {
+		const SsgiImage* dst = ping[i & 1];
+		run(2, *src, g.tmp_b, *dst, g.tmp_b, g.count[cur], g.tmp_b, static_cast<float>(1 << i), g.trace);
+		src = dst;
+	}
+	run(4, *src, g.tmp_b, g.out, g.tmp_b, g.count[cur], g.tmp_b, 0.0f, g.render);                            // composite
+	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
+	       vk::AccessFlagBits2::eMemoryRead);
+	if (timed) {
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_gtao.pool, entry * 2 + 1);
+		++g_gtao.written;
+	}
+	++g_gtao.frame;
+	g_gtao.history_valid = true;
+	inputs.color.image  = g_gtao.out.image.image;
+	inputs.color.view   = g_gtao.out.view;
+	inputs.color.layout = vk::ImageLayout::eGeneral;
+	inputs.color.format = vk::Format::eR16G16B16A16Sfloat;
+	inputs.color.usage  = g_gtao.out.image.usage;
+	inputs.color.level  = 0;
+	inputs.color.layer  = 0;
+	return true;
+}
+} // namespace
+
+namespace {
+bool Inverse4(const std::array<float, 16>& m, std::array<double, 16>& inv); // (defined with the contact shadows)
+
+// KYTY_SSR=0|1|2|3 ("Reflejos RT": off / Normal / Alta / Ultra; ssr.comp): screen-space reflections, mainly for water,
+// puddles and wet floors, recorded right before the upscaler after SSGI and GTAO, with their inputs (depth, motion
+// vectors, the pre-upscale color, the upscaler's view_to_clip). 1: half-res trace, 24 steps + 4 binary refinements,
+// a-trous 1, 2; 2: full res, 40 + 6, a-trous 1, 2, 4; 3: full res, 64 + 8, longer rays, a-trous 1, 2, 4, 8.
+// Rough surfaces: GGX importance-sampled jitter (IGN per frame); temporal accumulation reprojecting by the surface's and
+// the hit's motion; a-trous by roughness / depth / normal; composite with Schlick Fresnel x a smoothness mask, faded at
+// the screen edges and by ray length; no hit = the game's own image (its own reflections stay).
+// Roughness source: KYTY_SSR_GBUF=<render target slot>.<channel r|g|b|a>[g] (g: the channel is gloss) names a channel
+// of the G-buffer draws' color targets (logged as "SSR: G-buffer draw ..."); unset, or the target not usable this
+// frame: a heuristic mask (depth-derived normals facing up, low local variance, darker than the surroundings).
+// KYTY_SSR_STRENGTH (1.0, 0..2), KYTY_SSR_THICKNESS (view units, 0.25), KYTY_SSR_UP (world up axis for the heuristic:
+// y (default), z or x; "-y" etc. for the negative one). Off (the default): nothing created, nothing recorded, no hooks.
+//
+// Packed G-buffer (Demon's Souls: RT0..RT3 R32_UINT, logged as one image's layers 0..3 at the same address, read by the
+// deferred lighting CS as one slot): bound as R32_UINT views (bindings 14..17). The first frames run a calibration (mode
+// 5): every layer x 5 normal layouts (oct 16:16, oct 12:12 low / high, oct 11:11, 10:10:10) is scored against the
+// depth-derived normal in view and world space, and the 16 byte fields' statistics are gathered; the best layout (mean
+// |cos| >= 0.85) becomes the normal source (logged "SSR: G-buffer normal ..."), and the up direction is no longer
+// needed. Roughness / metal: KYTY_SSR_ROUGH / KYTY_SSR_METAL = <layer>:<shift>:<bits>[g] (g: gloss / inverted); unset:
+// the 8-bit field left in the normal's word when its layout leaves one (oct 12:12 -> the other byte), else the
+// heuristic mask (logged as a GUESS). KYTY_SSR_NORMAL = <layer>:<layout>[w][n] (w world space, n negated) overrides the
+// calibration. Composite: a convex mix (reflection replaces a share of the color), Schlick-with-roughness Fresnel, f0
+// 0.04 (0.6 metal), the reflection's brightness capped at 4x the surface's, the sky never a hit.
+struct SsrPass {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	vk::Sampler             point      = nullptr;
+	vk::Sampler             linear     = nullptr;
+	bool                    failed     = false;
+	vk::Extent2D            render {}, trace {};
+	SsgiImage               raw, tmp_a, tmp_b, out, mat, hit;
+	SsgiImage               history[2], gbuf[2];
+	uint32_t                frame         = 0;
+	int                     level         = 0;
+	bool                    history_valid = false;
+	int                     source        = -2; // the roughness source last logged (-1 heuristic, else slot*4+channel)
+	vk::QueryPool           pool      = nullptr;
+	double                  period_ns = 1.0;
+	uint64_t                written = 0, read = 0;
+	double                  sum_ms  = 0.0;
+	uint32_t                samples = 0;
+	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+	// Packed G-buffer: a 1x1 R32_UINT stand-in for unbound layers, the calibration / camera buffer, the chosen decode.
+	VkImage                 dummy_image = VK_NULL_HANDLE;
+	VmaAllocation           dummy_mem   = nullptr;
+	vk::ImageView           dummy_view  = nullptr;
+	bool                    dummy_ready = false;
+	VkBuffer                calib       = VK_NULL_HANDLE;
+	VmaAllocation           calib_mem   = nullptr;
+	const int32_t*          calib_mapped = nullptr;
+	uint32_t                calib_runs  = 0, calib_wait = 0;
+	bool                    calib_done  = false;
+	int32_t                 dec_normal = -1, dec_rough = -1, dec_metal = -1;
+	// The G-buffer's copy (SsrCaptureGbuffer): 4 layers R32_UINT, one view per layer, the flip it was taken in.
+	VkImage                 copy_image = VK_NULL_HANDLE;
+	VmaAllocation           copy_mem   = nullptr;
+	vk::ImageView           copy_views[4] {};
+	vk::Extent2D            copy_extent {};
+	vk::ImageLayout         copy_layout = vk::ImageLayout::eUndefined;
+	std::atomic<uint64_t>   copy_flip {~0ull};
+	bool                    copy_failed = false;
+	uint32_t                packed_logged = ~0u;
+} g_ssr;
+constexpr uint32_t SsrCalibRuns  = 24;  // calibration frames (one every 4th)
+constexpr uint32_t SsrCalibInts  = 41 + 16 * 3;
+constexpr uint32_t SsrCalibBytes = 48 + SsrCalibInts * 4;
+
+struct SsrPush {
+	float   proj[4];
+	float   depth_map[4];
+	float   motion[4];
+	float   trace[4];
+	int32_t misc[4];
+	float   extra[4];
+	float   up[4];
+	int32_t dec[4];
+};
+static_assert(sizeof(SsrPush) == 128);
+
+constexpr uint32_t SsrBindings = 19;
+vk::DescriptorType SsrType(uint32_t i) {
+	return i == 18 ? vk::DescriptorType::eStorageBuffer
+	               : (i == 7 || i == 8 || i == 10 || i == 13) ? vk::DescriptorType::eStorageImage
+	                                                          : vk::DescriptorType::eCombinedImageSampler;
+}
+// "<layer>:<shift>:<bits>[g]" -> the shader's field code (-1: unset or malformed).
+int32_t SsrFieldEnv(const char* name) {
+	const char* value = std::getenv(name);
+	if (value == nullptr) return -1;
+	int layer = -1, shift = -1, bits = -1;
+	char flag = 0;
+	if (std::sscanf(value, "%d:%d:%d%c", &layer, &shift, &bits, &flag) < 3) return -1;
+	if (layer < 0 || layer > 3 || shift < 0 || bits < 1 || bits > 16 || shift + bits > 32) return -1;
+	return layer | (shift << 2) | (bits << 7) | (flag == 'g' ? 4096 : 0);
+}
+// "<layer>:<layout>[w][n]" -> the shader's normal code (-1: unset or malformed).
+int32_t SsrNormalEnv() {
+	const char* value = std::getenv("KYTY_SSR_NORMAL");
+	if (value == nullptr) return -1;
+	int layer = -1, layout = -1;
+	if (std::sscanf(value, "%d:%d", &layer, &layout) < 2 || layer < 0 || layer > 3 || layout < 0 || layout > 4) return -1;
+	const std::string v = value;
+	return layer | (layout << 2) | (v.find('w') != std::string::npos ? 32 : 0) | (v.find('n') != std::string::npos ? 64 : 0);
+}
+
+int SsrLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_SSR");
+		return value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
+	}();
+	return level;
+}
+
+// KYTY_SSR_GBUF: slot, channel, gloss (slot -1: unset or malformed).
+struct SsrGbufChoice {
+	int  slot = -1, channel = 0;
+	bool gloss = false;
+};
+const SsrGbufChoice& SsrChoice() {
+	static const SsrGbufChoice choice = [] {
+		SsrGbufChoice c;
+		const char*   value = std::getenv("KYTY_SSR_GBUF");
+		if (value == nullptr || value[0] < '0' || value[0] > '7' || value[1] != '.') return c;
+		const char ch = value[2];
+		const int  channel = ch == 'r' || ch == 'x' ? 0 : ch == 'g' || ch == 'y' ? 1 : ch == 'b' || ch == 'z' ? 2 : ch == 'a' || ch == 'w' ? 3 : -1;
+		if (channel < 0) return c;
+		c.slot    = value[0] - '0';
+		c.channel = channel;
+		c.gloss   = value[3] == 'g';
+		return c;
+	}();
+	return choice;
+}
+
+const char* SsrFormatName(vk::Format f) {
+	switch (f) {
+		case vk::Format::eR8G8B8A8Unorm: return "RGBA8_UNORM";
+		case vk::Format::eR8G8B8A8Srgb: return "RGBA8_SRGB";
+		case vk::Format::eB8G8R8A8Unorm: return "BGRA8_UNORM";
+		case vk::Format::eA2B10G10R10UnormPack32: return "A2B10G10R10_UNORM";
+		case vk::Format::eA2R10G10B10UnormPack32: return "A2R10G10B10_UNORM";
+		case vk::Format::eR16G16B16A16Sfloat: return "RGBA16F";
+		case vk::Format::eR16G16B16A16Unorm: return "RGBA16_UNORM";
+		case vk::Format::eB10G11R11UfloatPack32: return "R11G11B10F";
+		case vk::Format::eR16G16Sfloat: return "RG16F";
+		case vk::Format::eR16G16Unorm: return "RG16_UNORM";
+		case vk::Format::eR8G8Unorm: return "RG8_UNORM";
+		case vk::Format::eR8Unorm: return "R8_UNORM";
+		case vk::Format::eR16Sfloat: return "R16F";
+		case vk::Format::eR32Sfloat: return "R32F";
+		case vk::Format::eR32Uint: return "R32_UINT";
+		case vk::Format::eR32G32Uint: return "RG32_UINT";
+		case vk::Format::eR16G16B16A16Uint: return "RGBA16_UINT";
+		case vk::Format::eR8G8B8A8Uint: return "RGBA8_UINT";
+		default: return "other";
+	}
+}
+// Filterable, normalized or float: a channel the shader can read as a 0..1 value.
+bool SsrFormatUsable(vk::Format f) {
+	switch (f) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eR16G16Sfloat:
+		case vk::Format::eR16G16Unorm:
+		case vk::Format::eR8G8Unorm:
+		case vk::Format::eR8Unorm:
+		case vk::Format::eR16Sfloat: return true;
+		default: return false;
+	}
+}
+
+// The G-buffer as its draws on the normal path bind it (any recording thread writes, the upscale reads).
+struct SsrGbuffer {
+	std::mutex                  mutex;
+	std::array<SsrTarget, 8>    targets {};
+	uint32_t                    count   = 0;
+	uint64_t                    flip    = 0;
+	bool                        valid   = false;
+	std::vector<std::pair<uint64_t, uint64_t>> logged; // (vs, ps) layouts logged
+	std::vector<uint64_t>       consumers;              // compute programs logged as reading it
+	std::array<float, 16>       view_proj {};
+	bool                        have_vp = false;
+	uint64_t                    vp_flip = ~0ull;
+	std::array<uint64_t, 2>     packed_addresses {};   // the packed layers' last two addresses (double-buffered)
+} g_ssr_gb;
+
+bool SsrEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
+	const auto device = graphics.device;
+	if (g_ssr.pipeline == nullptr) {
+		if (g_ssr.failed) return false;
+		g_ssr.failed = true;
+		std::array<vk::DescriptorSetLayoutBinding, SsrBindings> bindings {};
+		for (uint32_t i = 0; i < SsrBindings; ++i) {
+			bindings[i].binding         = i;
+			bindings[i].descriptorType  = SsrType(i);
+			bindings[i].descriptorCount = 1;
+			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+		}
+		vk::DescriptorSetLayoutCreateInfo set_info {};
+		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+		set_info.pBindings    = bindings.data();
+		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_ssr.set_layout) != vk::Result::eSuccess) return false;
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(SsrPush)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = 1;
+		layout_info.pSetLayouts            = &g_ssr.set_layout;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push;
+		if (device.createPipelineLayout(&layout_info, nullptr, &g_ssr.layout) != vk::Result::eSuccess) return false;
+		vk::ShaderModuleCreateInfo module_info {};
+		module_info.codeSize    = sizeof(SSR_SPV);
+		module_info.pCode       = SSR_SPV;
+		vk::ShaderModule module = nullptr;
+		if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		pipeline_info.stage.module = module;
+		pipeline_info.stage.pName  = "main";
+		pipeline_info.layout       = g_ssr.layout;
+		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_ssr.pipeline);
+		device.destroyShaderModule(module, nullptr);
+		if (created != vk::Result::eSuccess) {
+			g_ssr.pipeline = nullptr;
+			return false;
+		}
+		for (int i = 0; i < 2; ++i) {
+			vk::SamplerCreateInfo sampler {};
+			sampler.magFilter    = i == 0 ? vk::Filter::eNearest : vk::Filter::eLinear;
+			sampler.minFilter    = sampler.magFilter;
+			sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+			sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+			sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+			if (device.createSampler(&sampler, nullptr, i == 0 ? &g_ssr.point : &g_ssr.linear) != vk::Result::eSuccess) return false;
+		}
+		vk::QueryPoolCreateInfo query {};
+		query.queryType  = vk::QueryType::eTimestamp;
+		query.queryCount = 16;
+		if (device.createQueryPool(&query, nullptr, &g_ssr.pool) != vk::Result::eSuccess) g_ssr.pool = nullptr;
+		g_ssr.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		{
+			VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+			create.imageType   = VK_IMAGE_TYPE_2D;
+			create.format      = VK_FORMAT_R32_UINT;
+			create.extent      = {1, 1, 1};
+			create.mipLevels   = 1;
+			create.arrayLayers = 1;
+			create.samples     = VK_SAMPLE_COUNT_1_BIT;
+			create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+			create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+			VmaAllocationCreateInfo allocate {};
+			allocate.usage = VMA_MEMORY_USAGE_AUTO;
+			if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_ssr.dummy_image, &g_ssr.dummy_mem, nullptr) != VK_SUCCESS)
+				return false;
+			vk::ImageViewCreateInfo view_info {};
+			view_info.image            = vk::Image(g_ssr.dummy_image);
+			view_info.viewType         = vk::ImageViewType::e2D;
+			view_info.format           = vk::Format::eR32Uint;
+			view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			if (device.createImageView(&view_info, nullptr, &g_ssr.dummy_view) != vk::Result::eSuccess) return false;
+			VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+			buffer.size  = SsrCalibBytes;
+			buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+			VmaAllocationCreateInfo host {};
+			host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+			VmaAllocationInfo mapped {};
+			if (vmaCreateBuffer(graphics.allocator, &buffer, &host, &g_ssr.calib, &g_ssr.calib_mem, &mapped) != VK_SUCCESS) return false;
+			g_ssr.calib_mapped = static_cast<const int32_t*>(mapped.pMappedData);
+		}
+		g_ssr.failed    = false;
+	}
+	if (g_ssr.out.image.image != nullptr && g_ssr.render == render && g_ssr.level == level) return true;
+	const vk::Extent2D trace = level >= 2 ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
+	const std::array<SsgiImage*, 10> all {&g_ssr.raw, &g_ssr.tmp_a, &g_ssr.tmp_b, &g_ssr.out, &g_ssr.mat, &g_ssr.hit,
+	                                      &g_ssr.history[0], &g_ssr.history[1], &g_ssr.gbuf[0], &g_ssr.gbuf[1]};
+	for (auto* img : all)
+		SsgiFreeImage(graphics, *img);
+	bool ok = SsgiMakeImage(graphics, g_ssr.out, render);
+	for (auto* img : all)
+		if (img != &g_ssr.out) ok = ok && SsgiMakeImage(graphics, *img, trace);
+	if (!ok) {
+		for (auto* img : all)
+			SsgiFreeImage(graphics, *img);
+		g_ssr.failed = true;
+		return false;
+	}
+	g_ssr.render        = render;
+	g_ssr.level         = level;
+	g_ssr.trace         = trace;
+	g_ssr.history_valid = false;
+	return true;
+}
+
+void SsrReadTiming() {
+	if (g_ssr.pool == nullptr || g_graphics_ctx == nullptr) return;
+	while (g_ssr.read + 4 <= g_ssr.written) {
+		const auto entry = static_cast<uint32_t>(g_ssr.read % 8);
+		std::array<uint64_t, 2> stamps {};
+		if (g_graphics_ctx->device.getQueryPoolResults(g_ssr.pool, entry * 2, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		                                               vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
+			break;
+		g_ssr.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_ssr.period_ns / 1e6;
+		++g_ssr.samples;
+		++g_ssr.read;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_ssr.last_log >= std::chrono::seconds(5) && g_ssr.samples > 0) {
+		std::printf("SSR: GPU %.3f ms (mean of %u frames)\n", g_ssr.sum_ms / g_ssr.samples, g_ssr.samples);
+		std::fflush(stdout);
+		g_ssr.sum_ms   = 0.0;
+		g_ssr.samples  = 0;
+		g_ssr.last_log = now;
+	}
+}
+
+// World up (KYTY_SSR_UP) in view space: View = P^-1 * view_proj (column vectors; P's column form is the transpose of
+// the row-vector view_to_clip).
+// The camera's world -> view matrix (rows of the 3x3), as above.
+bool SsrViewRotation(const std::array<float, 16>& m, std::array<float, 12>& rows) {
+	std::array<float, 16> vp {};
+	{
+		std::lock_guard lock(g_ssr_gb.mutex);
+		if (!g_ssr_gb.have_vp || g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.vp_flip + 4) return false;
+		vp = g_ssr_gb.view_proj;
+	}
+	std::array<float, 16> pc {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
+	std::array<double, 16> pinv {};
+	if (!Inverse4(pc, pinv)) return false;
+	for (int i = 0; i < 3; ++i) {
+		for (int j = 0; j < 3; ++j) {
+			double d = 0.0;
+			for (int k = 0; k < 4; ++k) d += pinv[i * 4 + k] * vp[k * 4 + j];
+			if (!std::isfinite(d)) return false;
+			rows[i * 4 + j] = static_cast<float>(d);
+		}
+		rows[i * 4 + 3] = 0.0f;
+	}
+	return true;
+}
+
+// The calibration's verdict (after its frames are done): the normal layout, the roughness field; logged with the scores.
+void SsrAnalyze(uint32_t packed_count) {
+	if (g_ssr.calib_mapped == nullptr || g_graphics_ctx == nullptr) return;
+	(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_ssr.calib_mem, 0, VK_WHOLE_SIZE);
+	const int32_t* c = g_ssr.calib_mapped + 12;
+	const double   n = static_cast<double>(c[0]);
+	static const char* const layouts[5] = {"oct 16:16", "oct 12:12 bits 0..23", "oct 12:12 bits 8..31", "oct 11:11 bits 0..21",
+	                                       "xyz 10:10:10"};
+	std::printf("SSR: G-buffer calibration: %.0f samples over %u frames, %u packed layers\n", n, g_ssr.calib_runs, packed_count);
+	int    best       = -1;
+	double best_score = 0.0;
+	if (n >= 200.0) {
+		for (uint32_t layer = 0; layer < packed_count; ++layer) {
+			std::string line;
+			char        buf[96];
+			for (int l = 0; l < 5; ++l)
+				for (int space = 0; space < 2; ++space) {
+					const double score = c[1 + (layer * 5 + l) * 2 + space] / 1000.0 / n;
+					std::snprintf(buf, sizeof(buf), " %s/%s %+.3f;", layouts[l], space ? "world" : "view", score);
+					line += buf;
+					if (std::abs(score) > std::abs(best_score))
+						best_score = score, best = static_cast<int>(layer) | (l << 2) | (space << 5);
+				}
+			std::printf("SSR: G-buffer layer %u normal fit (mean cos vs depth normal):%s\n", layer, line.c_str());
+			line.clear();
+			for (int b = 0; b < 4; ++b) {
+				const int    f    = static_cast<int>(layer) * 4 + b;
+				const double mean = c[41 + f * 3] / 1000.0 / n, sq = c[42 + f * 3] / 1000.0 / n, nov = c[43 + f * 3] / 1000.0 / n;
+				std::snprintf(buf, sizeof(buf), " bits %d..%d mean %.3f sd %.3f cov(1-NoV) %+.3f;", b * 8, b * 8 + 7, mean,
+				              std::sqrt(std::max(sq - mean * mean, 0.0)), nov);
+				line += buf;
+			}
+			std::printf("SSR: G-buffer layer %u byte fields:%s\n", layer, line.c_str());
+		}
+	}
+	if (best >= 0 && std::abs(best_score) >= 0.85) {
+		if (best_score < 0.0) best |= 64;
+		if (g_ssr.dec_normal < 0) g_ssr.dec_normal = best;
+		std::printf("SSR: G-buffer normal = layer %d, %s, %s space%s (mean cos %.3f)\n", best & 3, layouts[(best >> 2) & 7],
+		            (best & 32) ? "world" : "view", (best & 64) ? ", negated" : "", std::abs(best_score));
+		// Roughness: the byte the normal's layout leaves free in its word, when it varies (else unknown).
+		const int layout = (best >> 2) & 7, layer = best & 3;
+		const int shift  = layout == 1 ? 24 : layout == 2 ? 0 : -1;
+		if (g_ssr.dec_rough < 0 && shift >= 0) {
+			const int    f    = layer * 4 + shift / 8;
+			const double mean = c[41 + f * 3] / 1000.0 / n, sq = c[42 + f * 3] / 1000.0 / n;
+			if (std::sqrt(std::max(sq - mean * mean, 0.0)) > 0.02) {
+				g_ssr.dec_rough = layer | (shift << 2) | (8 << 7);
+				std::printf("SSR: roughness = layer %d bits %d..%d (the normal word's free byte; GUESS, set KYTY_SSR_ROUGH to "
+				            "override)\n",
+				            layer, shift, shift + 7);
+			}
+		}
+	} else {
+		std::printf("SSR: G-buffer normal not identified (best |mean cos| %.3f < 0.85): depth-derived normals stay\n",
+		            std::abs(best_score));
+	}
+	if (g_ssr.dec_rough < 0)
+		std::printf("SSR: roughness unknown (set KYTY_SSR_ROUGH=<layer>:<shift>:<bits>[g] from the byte fields above): "
+		            "heuristic mask with the G-buffer normals\n");
+	std::fflush(stdout);
+}
+
+bool SsrUpInView(const std::array<float, 16>& m, std::array<float, 3>& up) {
+	std::array<float, 16> vp {};
+	{
+		std::lock_guard lock(g_ssr_gb.mutex);
+		if (!g_ssr_gb.have_vp || g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.vp_flip + 4) return false;
+		vp = g_ssr_gb.view_proj;
+	}
+	static const std::pair<int, float> axis = [] {
+		const char* value = std::getenv("KYTY_SSR_UP");
+		std::string v     = value != nullptr ? value : "y";
+		float       sign  = 1.0f;
+		if (!v.empty() && v[0] == '-') sign = -1.0f, v.erase(0, 1);
+		const int a = v == "x" ? 0 : v == "z" ? 2 : 1;
+		return std::pair<int, float> {a, sign};
+	}();
+	std::array<float, 16> pc {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
+	std::array<double, 16> pinv {};
+	if (!Inverse4(pc, pinv)) return false;
+	double d[3] {};
+	for (int i = 0; i < 3; ++i)
+		for (int k = 0; k < 4; ++k) d[i] += pinv[i * 4 + k] * vp[k * 4 + axis.first];
+	const double n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+	if (!(n > 1e-9) || !std::isfinite(n)) return false;
+	for (int i = 0; i < 3; ++i) up[i] = static_cast<float>(axis.second * d[i] / n);
+	return true;
+}
+
+bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
+	const int level = SsrLevel();
+	if (level == 0) return false; // off: nothing created or recorded
+	if (g_graphics_ctx == nullptr) return false;
+	if (VideoOut::MoviePlaying()) {
+		g_ssr.history_valid = false;
+		return false;
+	}
+	const auto& color = inputs.color;
+	if (color.view == nullptr || inputs.depth.view == nullptr || inputs.motion.view == nullptr || color.extent.width < 16 ||
+	    color.extent.height < 16)
+		return false;
+	const auto& m = inputs.view_to_clip;
+	if (!(m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f))) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("SSR: skipped (no camera projection from the upscaler)\n");
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	if (!SsrEnsure(*g_graphics_ctx, color.extent, level)) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("SSR: off (could not create its pipeline or images)\n");
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	const bool have_material = inputs.material.view != nullptr && inputs.material_channel >= 0 && inputs.material_channel < 4 &&
+	                           inputs.material.extent == color.extent;
+	uint32_t packed_count = 0;
+	bool     from_copy    = false;
+	{
+		// The copy taken at the deferred lighting this flip or the last (else the live image, which later passes may
+		// have overwritten by now).
+		const uint64_t copied = g_ssr.copy_flip.load(std::memory_order_acquire);
+		const uint64_t flips  = g_flips_taken.load(std::memory_order_relaxed);
+		if (copied != ~0ull && flips <= copied + 1 && g_ssr.copy_extent == color.extent) {
+			for (uint32_t i = 0; i < 4; ++i) {
+				auto& p  = inputs.packed[i];
+				p.view   = g_ssr.copy_views[i];
+				p.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+				p.extent = g_ssr.copy_extent;
+				p.format = vk::Format::eR32Uint;
+			}
+			inputs.packed_count = 4;
+			from_copy           = true;
+		}
+	}
+	while (packed_count < inputs.packed_count && packed_count < 4 && inputs.packed[packed_count].view != nullptr &&
+	       inputs.packed[packed_count].extent == color.extent)
+		++packed_count;
+	if (const uint32_t key = packed_count * 2 + (from_copy ? 1 : 0); key != g_ssr.packed_logged) {
+		static uint32_t reports = 0;
+		if (reports++ < 8) {
+			std::printf("SSR: packed G-buffer source: %u layers, %s\n", packed_count,
+			            packed_count == 0 ? "none this frame"
+			            : from_copy       ? "copied before the deferred lighting"
+			                              : "the live image at the upscaler (may be overwritten)");
+			std::fflush(stdout);
+		}
+		g_ssr.packed_logged = key;
+	}
+	{
+		static const int32_t env_normal = SsrNormalEnv(), env_rough = SsrFieldEnv("KYTY_SSR_ROUGH"),
+		                     env_metal = SsrFieldEnv("KYTY_SSR_METAL");
+		static bool          said      = false;
+		if (!said) {
+			said = true;
+			if (env_normal >= 0) g_ssr.dec_normal = env_normal, g_ssr.calib_done = true;
+			if (env_rough >= 0) g_ssr.dec_rough = env_rough;
+			if (env_metal >= 0) g_ssr.dec_metal = env_metal;
+			if (env_normal >= 0 || env_rough >= 0 || env_metal >= 0)
+				std::printf("SSR: decode from the environment (normal %d, roughness %d, metal %d)\n", env_normal, env_rough, env_metal);
+		}
+	}
+	if (packed_count == 0 && !have_material && g_ssr.copy_flip.load(std::memory_order_relaxed) != ~0ull) {
+		// (the copy worked before but not this frame or the last: no G-buffer this frame, SSR skipped rather than
+		// traced from stale or missing layers)
+		static uint32_t skips = 0;
+		if (skips++ < 4) {
+			std::printf("SSR: skipped this frame (no G-buffer copy)\n");
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	const bool use_packed = packed_count > 0 && !have_material;
+	static uint32_t live_frames = 0;
+	if (use_packed && !from_copy && live_frames < 100000) ++live_frames;
+	if (live_frames == 600 && g_ssr.copy_flip.load(std::memory_order_relaxed) == ~0ull) {
+		std::printf("SSR: no G-buffer copy after 600 frames: calibrating on the live image\n");
+		std::fflush(stdout);
+	}
+	const bool calib_live = live_frames >= 600 && g_ssr.copy_flip.load(std::memory_order_relaxed) == ~0ull;
+	// (every 4th eligible frame, not every 4th frame: a source present every other frame would never line up)
+	static uint32_t calib_tick = 0;
+	const bool      eligible   = use_packed && (from_copy || calib_live) && !g_ssr.calib_done && g_ssr.calib_runs < SsrCalibRuns;
+	const bool      calibrate  = eligible && (calib_tick++ & 3u) == 0;
+	if (use_packed && !g_ssr.calib_done && g_ssr.calib_runs >= SsrCalibRuns && ++g_ssr.calib_wait > 8) {
+		g_ssr.calib_done = true;
+		SsrAnalyze(packed_count);
+	}
+	const auto usable = [&](int32_t code) { return use_packed && code >= 0 && (code & 3) < static_cast<int32_t>(packed_count) ? code : -1; };
+	const int32_t dec_normal = usable(g_ssr.dec_normal), dec_rough = usable(g_ssr.dec_rough), dec_metal = usable(g_ssr.dec_metal);
+	std::array<float, 12> view_rows {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+	const bool            have_rows = SsrViewRotation(inputs.view_to_clip, view_rows);
+	{
+		static int32_t logged = -2;
+		const int32_t  key    = dec_normal * 7919 + dec_rough * 31 + dec_metal;
+		if (key != logged && dec_normal >= 0) {
+			logged = key;
+			std::printf("SSR: decoding the packed G-buffer: normal code %d%s, roughness %s, metal %s\n", dec_normal,
+			            (dec_normal & 32) != 0 && !have_rows ? " (world space, camera not seen yet)" : "",
+			            dec_rough >= 0 ? "from the G-buffer" : "heuristic", dec_metal >= 0 ? "from the G-buffer" : "none");
+			std::fflush(stdout);
+		}
+	}
+	const int source = have_material ? SsrChoice().slot * 4 + inputs.material_channel : dec_rough >= 0 ? 1000 + dec_rough : -1;
+	if (source != g_ssr.source) {
+		static uint32_t reports = 0;
+		if (reports++ < 16) {
+			static const char channels[] = "rgba";
+			if (!have_material && dec_rough >= 0)
+				std::printf("SSR: level %d, roughness source packed G-buffer layer %d bits %d..%d%s\n", level, dec_rough & 3,
+				            (dec_rough >> 2) & 31, ((dec_rough >> 2) & 31) + ((dec_rough >> 7) & 31) - 1,
+				            (dec_rough & 4096) != 0 ? " (gloss)" : "");
+			else if (have_material)
+				std::printf("SSR: level %d, roughness source G-buffer RT%d.%c (%s, %s)\n", level, SsrChoice().slot,
+				            channels[inputs.material_channel], SsrFormatName(inputs.material.format),
+				            inputs.material_gloss ? "gloss: roughness = 1 - value" : "roughness");
+			else
+				std::printf("SSR: level %d, roughness source heuristic (depth-derived up-facing normals + low local variance + low "
+				            "luminance; HEURISTIC)%s\n",
+				            level, SsrChoice().slot >= 0 ? " - KYTY_SSR_GBUF target not usable this frame" : "");
+			std::fflush(stdout);
+		}
+		g_ssr.source = source;
+	}
+	std::array<float, 3> up {};
+	const bool           have_up = SsrUpInView(m, up);
+	if (static bool said_up = false; have_up && !said_up) {
+		said_up = true;
+		std::printf("SSR: camera seen (up direction and world -> view rotation known)\n");
+		std::fflush(stdout);
+	}
+
+	const float strength = SsgiEnv("KYTY_SSR_STRENGTH", 0.8f, 2.0f);
+	const float thick    = std::max(SsgiEnv("KYTY_SSR_THICKNESS", 0.25f, 4.0f), 0.01f);
+	SsrPush     push {};
+	push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
+	push.depth_map[0] = m[10], push.depth_map[1] = m[14], push.depth_map[2] = m[11], push.depth_map[3] = m[15];
+	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
+	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
+	push.trace[0] = static_cast<float>(g_ssr.trace.width), push.trace[1] = static_cast<float>(g_ssr.trace.height);
+	push.trace[2] = strength, push.trace[3] = level >= 3 ? 60.0f : level >= 2 ? 40.0f : 25.0f;
+	push.extra[1] = static_cast<float>(std::max(inputs.material_channel, 0));
+	push.extra[2] = inputs.material_gloss ? 1.0f : 0.0f;
+	push.extra[3] = thick;
+	push.up[0] = up[0], push.up[1] = up[1], push.up[2] = up[2];
+	push.dec[0] = (dec_normal & 32) != 0 && !have_rows ? -1 : dec_normal;
+	push.dec[1] = dec_rough, push.dec[2] = dec_metal, push.dec[3] = static_cast<int32_t>(packed_count);
+	{
+		// (on a change of the layer count, held for 120 frames: no line per frame when the source flickers)
+		static uint32_t said_layers = ~0u, pending = ~0u, held = 0, lines = 0;
+		if (packed_count != pending) pending = packed_count, held = 0;
+		else if (held < 1000) ++held;
+		if (said_layers != pending && (said_layers == ~0u || held == 120) && lines < 16) {
+			said_layers = pending;
+			++lines;
+			std::printf("SSR: on (level %d, trace %ux%u, strength %g, thickness %g, up %s, packed G-buffer layers %u%s)\n", level,
+			            g_ssr.trace.width, g_ssr.trace.height, strength, thick,
+			            have_up ? "from the camera" : "unknown (|view y| assumed until the G-buffer normals are decoded)", packed_count,
+			            use_packed && !g_ssr.calib_done ? ", calibrating" : "");
+			std::fflush(stdout);
+		}
+	}
+	SsrReadTiming();
+	const auto entry = static_cast<uint32_t>(g_ssr.written % 8);
+	const bool timed = g_ssr.pool != nullptr;
+	if (timed) {
+		command.resetQueryPool(g_ssr.pool, entry * 2, 2);
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_ssr.pool, entry * 2);
+	}
+	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
+	                        vk::AccessFlags2 dst) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = src_stage;
+		barrier.srcAccessMask = src;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	auto& g = g_ssr;
+	for (auto* img : {&g.raw, &g.tmp_a, &g.tmp_b, &g.out, &g.mat, &g.hit, &g.history[0], &g.history[1], &g.gbuf[0], &g.gbuf[1]})
+		if (img->image.state.layout != vk::ImageLayout::eGeneral)
+			Transition(command, img->image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+			           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+	       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	const uint32_t cur  = g.frame & 1u;
+	const uint32_t prev = cur ^ 1u;
+	push.misc[1] = static_cast<int32_t>(g.frame);
+	push.misc[2] = level;
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g.history_valid ? 2 : 0) | (have_material ? 4 : 0) | (have_up ? 8 : 0);
+	if (!g.dummy_ready) {
+		g.dummy_ready = true;
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask     = vk::PipelineStageFlagBits2::eNone;
+		barrier.dstStageMask     = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.dstAccessMask    = vk::AccessFlagBits2::eTransferWrite;
+		barrier.oldLayout        = vk::ImageLayout::eUndefined;
+		barrier.newLayout        = vk::ImageLayout::eGeneral;
+		barrier.image            = vk::Image(g.dummy_image);
+		barrier.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+		vk::ClearColorValue             zero {};
+		zero.uint32 = std::array<uint32_t, 4> {0, 0, 0, 0};
+		const vk::ImageSubresourceRange whole {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.clearColorImage(vk::Image(g.dummy_image), vk::ImageLayout::eGeneral, &zero, 1, &whole);
+		command.fillBuffer(vk::Buffer(g.calib), 0, VK_WHOLE_SIZE, 0);
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer,
+		       vk::AccessFlagBits2::eTransferWrite);
+	}
+	command.updateBuffer(vk::Buffer(g.calib), 0, sizeof(float) * view_rows.size(), view_rows.data());
+	global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+	       vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
+	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout,
+	                     const SsgiImage& aux_in, const SsgiImage& aux_out, const SsgiImage& mat_in, const SsgiImage& mat_out,
+	                     float step, vk::Extent2D size) {
+		const vk::Sampler       lin = g.linear, pt = g.point;
+		vk::DescriptorImageInfo infos[SsrBindings] {};
+		infos[0]  = {lin, color.view, color.layout};
+		infos[1]  = {pt, inputs.depth.view, inputs.depth.layout};
+		infos[2]  = {pt, inputs.motion.view, inputs.motion.layout};
+		infos[3]  = {lin, a.view, vk::ImageLayout::eGeneral};
+		infos[4]  = {lin, b.view, vk::ImageLayout::eGeneral};
+		infos[5]  = {pt, g.gbuf[cur].view, vk::ImageLayout::eGeneral};
+		infos[6]  = {pt, g.gbuf[prev].view, vk::ImageLayout::eGeneral};
+		infos[7]  = {nullptr, out.view, vk::ImageLayout::eGeneral};
+		infos[8]  = {nullptr, gout.view, vk::ImageLayout::eGeneral};
+		infos[9]  = {pt, aux_in.view, vk::ImageLayout::eGeneral};
+		infos[10] = {nullptr, aux_out.view, vk::ImageLayout::eGeneral};
+		infos[11] = have_material ? vk::DescriptorImageInfo {pt, inputs.material.view, inputs.material.layout}
+		                          : vk::DescriptorImageInfo {pt, color.view, color.layout};
+		infos[12] = {pt, mat_in.view, vk::ImageLayout::eGeneral};
+		infos[13] = {nullptr, mat_out.view, vk::ImageLayout::eGeneral};
+		for (uint32_t i = 0; i < 4; ++i)
+			infos[14 + i] = use_packed && i < packed_count
+			                    ? vk::DescriptorImageInfo {pt, inputs.packed[i].view, inputs.packed[i].layout}
+			                    : vk::DescriptorImageInfo {pt, g.dummy_view, vk::ImageLayout::eGeneral};
+		const vk::DescriptorBufferInfo calib_info {vk::Buffer(g.calib), 0, VK_WHOLE_SIZE};
+		vk::WriteDescriptorSet writes[SsrBindings] {};
+		for (uint32_t i = 0; i < SsrBindings; ++i) {
+			writes[i].dstBinding      = i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType  = SsrType(i);
+			if (i == 18) writes[i].pBufferInfo = &calib_info;
+			else writes[i].pImageInfo = &infos[i];
+		}
+		push.misc[0]  = mode;
+		push.extra[0] = step;
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, SsrBindings, writes);
+		command.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	};
+	// (Bindings a mode does not write still need a valid storage image: tmp_b is the scratch target; tmp_a the unread
+	// sampled one.)
+	if (calibrate) {
+		run(5, g.tmp_a, g.tmp_a, g.tmp_b, g.tmp_b, g.tmp_a, g.tmp_b, g.tmp_a, g.tmp_b, 0.0f, vk::Extent2D {160, 90});
+		++g.calib_runs;
+	}
+	run(0, g.tmp_a, g.tmp_a, g.raw, g.gbuf[cur], g.tmp_a, g.hit, g.tmp_a, g.mat, 0.0f, g.trace);                 // trace
+	run(1, g.raw, g.history[prev], g.history[cur], g.tmp_b, g.hit, g.tmp_b, g.mat, g.tmp_b, 0.0f, g.trace);      // temporal
+	const SsgiImage* src     = &g.history[cur];
+	const SsgiImage* ping[2] = {&g.tmp_a, &g.raw};
+	const int        passes  = level >= 3 ? 4 : level >= 2 ? 3 : 2;
+	for (int i = 0; i < passes; ++i) {
+		const SsgiImage* dst = ping[i & 1];
+		run(2, *src, g.tmp_b, *dst, g.tmp_b, g.hit, g.tmp_b, g.mat, g.tmp_b, static_cast<float>(1 << i), g.trace);
+		src = dst;
+	}
+	run(4, *src, g.tmp_b, g.out, g.tmp_b, g.hit, g.tmp_b, g.mat, g.tmp_b, 0.0f, g.render);                       // composite
+	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
+	       vk::AccessFlagBits2::eMemoryRead);
+	if (timed) {
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g.pool, entry * 2 + 1);
+		++g.written;
+	}
+	++g.frame;
+	g.history_valid = true;
+	inputs.color.image  = g.out.image.image;
+	inputs.color.view   = g.out.view;
+	inputs.color.layout = vk::ImageLayout::eGeneral;
+	inputs.color.format = vk::Format::eR16G16B16A16Sfloat;
+	inputs.color.usage  = g.out.image.usage;
+	inputs.color.level  = 0;
+	inputs.color.layer  = 0;
+	return true;
+}
+} // namespace
+
+bool SsrWanted() { return SsrLevel() > 0; }
+
+void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
+	if (!IsGbufferVertexShader(vs_hash) || srt.size() < SrtViewProj + 16) return;
+	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
+	std::lock_guard lock(g_ssr_gb.mutex);
+	if (g_ssr_gb.vp_flip == flip) return; // (the frame's first G-buffer draw)
+	std::array<float, 16> vp {};
+	for (uint32_t i = 0; i < 16; ++i) {
+		vp[i] = AsFloat(srt[SrtViewProj + i]);
+		if (!std::isfinite(vp[i])) return;
+	}
+	g_ssr_gb.view_proj = vp;
+	g_ssr_gb.have_vp   = true;
+	g_ssr_gb.vp_flip   = flip;
+}
+
+void OnSsrGbuffer(uint64_t vs_hash, uint64_t ps_hash, std::span<const SsrTarget> targets) {
+	if (targets.empty()) return;
+	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
+	std::lock_guard lock(g_ssr_gb.mutex);
+	const uint32_t n = static_cast<uint32_t>(std::min<size_t>(targets.size(), g_ssr_gb.targets.size()));
+	// The layout with the most targets wins (the main G-buffer pass; the decals bind fewer).
+	if (!(g_ssr_gb.valid && g_ssr_gb.flip == flip && g_ssr_gb.count > n)) {
+		for (uint32_t i = 0; i < n; ++i) g_ssr_gb.targets[i] = targets[i];
+		g_ssr_gb.count = n;
+		g_ssr_gb.flip  = flip;
+		g_ssr_gb.valid = true;
+		if (const uint64_t a = targets[0].address; a != 0 && targets[0].view.format == vk::Format::eR32Uint &&
+		                                           g_ssr_gb.packed_addresses[0] != a) {
+			g_ssr_gb.packed_addresses[1] = g_ssr_gb.packed_addresses[0];
+			g_ssr_gb.packed_addresses[0] = a;
+		}
+	}
+	const auto key = std::make_pair(vs_hash, ps_hash);
+	if (g_ssr_gb.logged.size() >= 24 || std::find(g_ssr_gb.logged.begin(), g_ssr_gb.logged.end(), key) != g_ssr_gb.logged.end()) return;
+	g_ssr_gb.logged.push_back(key);
+	std::string line;
+	char        buf[160];
+	for (uint32_t i = 0; i < n; ++i) {
+		const auto& t = targets[i];
+		std::snprintf(buf, sizeof(buf), " RT%u %s(%d) %ux%u @0x%llx layer %u;", i, SsrFormatName(t.view.format),
+		              static_cast<int>(t.view.format), t.width, t.height, static_cast<unsigned long long>(t.address), t.view.base_layer);
+		line += buf;
+	}
+	std::printf("SSR: G-buffer draw VS %016llx PS %016llx:%s\n", static_cast<unsigned long long>(vs_hash),
+	            static_cast<unsigned long long>(ps_hash), line.c_str());
+	std::fflush(stdout);
+}
+
+void OnSsrDispatch(uint64_t cs_hash, std::span<const uint64_t> addresses, std::span<const vk::Format> formats) {
+	std::lock_guard lock(g_ssr_gb.mutex);
+	if (!g_ssr_gb.valid || g_ssr_gb.consumers.size() >= 32) return;
+	if (std::find(g_ssr_gb.consumers.begin(), g_ssr_gb.consumers.end(), cs_hash) != g_ssr_gb.consumers.end()) return;
+	std::string line;
+	char        buf[128];
+	uint32_t    hits = 0;
+	for (size_t s = 0; s < addresses.size(); ++s)
+		for (uint32_t i = 0; i < g_ssr_gb.count; ++i)
+			if (addresses[s] != 0 && addresses[s] == g_ssr_gb.targets[i].address) {
+				std::snprintf(buf, sizeof(buf), " slot %zu <- RT%u (%s);", s, i, SsrFormatName(s < formats.size() ? formats[s] : vk::Format::eUndefined));
+				line += buf;
+				++hits;
+			}
+	if (hits < 2) return; // (a consumer of the G-buffer reads several of its targets: the deferred lighting)
+	g_ssr_gb.consumers.push_back(cs_hash);
+	std::printf("SSR: G-buffer consumer CS %016llx (%u of %u targets):%s\n", static_cast<unsigned long long>(cs_hash), hits,
+	            g_ssr_gb.count, line.c_str());
+	std::fflush(stdout);
+}
+
+// Why the copy was not taken (each reason logged the first time, then every 600th time).
+void SsrCaptureSkip(const char* reason, uint64_t cs_hash) {
+	static std::mutex                              mutex;
+	static std::vector<std::pair<std::string, uint32_t>> seen;
+	std::lock_guard lock(mutex);
+	for (auto& [r, n]: seen)
+		if (r == reason) {
+			if (++n % 600 == 0) std::printf("SSR: G-buffer copy not taken (CS %016llx): %s (x%u)\n", static_cast<unsigned long long>(cs_hash), reason, n);
+			return;
+		}
+	if (seen.size() >= 32) return;
+	seen.emplace_back(reason, 1);
+	std::printf("SSR: G-buffer copy not taken (CS %016llx): %s\n", static_cast<unsigned long long>(cs_hash), reason);
+	std::fflush(stdout);
+}
+
+void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                       std::span<const TextureBinding> images) {
+	if (SsrLevel() == 0 || g_ssr.copy_failed) return;
+	if (g_graphics_ctx == nullptr) g_graphics_ctx = &graphics;
+	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
+	if (g_ssr.copy_flip.load(std::memory_order_relaxed) == flip) return; // (once a frame: the first consumer)
+	uint32_t width = 0, height = 0;
+	std::array<uint64_t, 2> addresses {};
+	{
+		std::lock_guard lock(g_ssr_gb.mutex);
+		if (!g_ssr_gb.valid || g_ssr_gb.count < 1) return;
+		// (a known consumer only: a dispatch before the G-buffer pass must not take the frame's copy)
+		if (std::find(g_ssr_gb.consumers.begin(), g_ssr_gb.consumers.end(), cs_hash) == g_ssr_gb.consumers.end()) return;
+		if (g_ssr_gb.targets[0].view.format != vk::Format::eR32Uint) return SsrCaptureSkip("RT0 not R32_UINT", cs_hash);
+		if (flip > g_ssr_gb.flip + 1) return SsrCaptureSkip("no G-buffer pass this frame or the last", cs_hash);
+		addresses = g_ssr_gb.packed_addresses;
+		width = g_ssr_gb.targets[0].width, height = g_ssr_gb.targets[0].height;
+	}
+	const TextureBinding* binding = nullptr;
+	for (const auto& b: images)
+		if (b.desc.info.data.address != 0 && (b.desc.info.data.address == addresses[0] || b.desc.info.data.address == addresses[1])) {
+			binding = &b;
+			break;
+		}
+	if (binding == nullptr) return SsrCaptureSkip("the consumer binds neither G-buffer address", cs_hash);
+	if (!binding->image_id) return SsrCaptureSkip("binding without a cache image", cs_hash);
+	const uint64_t address = binding->desc.info.data.address;
+	auto& image = cache.GetImage(binding->image_id);
+	if (image.backing.image == nullptr) return SsrCaptureSkip("no backing image", cs_hash);
+	if (image.backing.format != vk::Format::eR32Uint) return SsrCaptureSkip("backing not R32_UINT", cs_hash);
+	if (image.backing.layers < 4) return SsrCaptureSkip("backing has < 4 layers", cs_hash);
+	if (image.backing.extent.width < width || image.backing.extent.height < height)
+		return SsrCaptureSkip("backing smaller than the G-buffer", cs_hash);
+	const vk::Extent2D extent {width, height};
+	if (g_ssr.copy_image != VK_NULL_HANDLE && g_ssr.copy_extent != extent) return SsrCaptureSkip("size changed", cs_hash);
+	if (g_ssr.copy_image == VK_NULL_HANDLE) {
+		g_ssr.copy_failed = true;
+		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		create.imageType   = VK_IMAGE_TYPE_2D;
+		create.format      = VK_FORMAT_R32_UINT;
+		create.extent      = {width, height, 1};
+		create.mipLevels   = 1;
+		create.arrayLayers = 4;
+		create.samples     = VK_SAMPLE_COUNT_1_BIT;
+		create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO;
+		if (vmaCreateImage(g_graphics_ctx->allocator, &create, &allocate, &g_ssr.copy_image, &g_ssr.copy_mem, nullptr) != VK_SUCCESS) {
+			g_ssr.copy_image = VK_NULL_HANDLE;
+			std::printf("SSR: G-buffer copy image could not be created\n");
+			return;
+		}
+		for (uint32_t i = 0; i < 4; ++i) {
+			vk::ImageViewCreateInfo view_info {};
+			view_info.image            = vk::Image(g_ssr.copy_image);
+			view_info.viewType         = vk::ImageViewType::e2D;
+			view_info.format           = vk::Format::eR32Uint;
+			view_info.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, i, 1};
+			if (g_graphics_ctx->device.createImageView(&view_info, nullptr, &g_ssr.copy_views[i]) != vk::Result::eSuccess) return;
+		}
+		g_ssr.copy_extent = extent;
+		g_ssr.copy_failed = false;
+	}
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+	LocalVulkanRecording::Drain();
+#endif
+	const ImageSubresourceRange range {0, 1, 0, 4};
+	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range, command);
+	const auto copy_barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::PipelineStageFlags2 src_stage,
+	                              vk::AccessFlags2 src_access, vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask        = src_stage;
+		barrier.srcAccessMask       = src_access;
+		barrier.dstStageMask        = dst_stage;
+		barrier.dstAccessMask       = dst_access;
+		barrier.oldLayout           = from;
+		barrier.newLayout           = to;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image               = vk::Image(g_ssr.copy_image);
+		barrier.subresourceRange    = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 4};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	copy_barrier(g_ssr.copy_layout, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllCommands,
+	             vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 4};
+	copy.dstSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 4};
+	copy.extent         = vk::Extent3D {width, height, 1};
+	command.copyImage(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, vk::Image(g_ssr.copy_image),
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+	copy_barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
+	             vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+	g_ssr.copy_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	const vk::ImageLayout back = binding->layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding->layout;
+	image.Transit(back, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range, command);
+	g_ssr.copy_flip.store(flip, std::memory_order_release);
+	static bool said = false;
+	if (!said) {
+		said = true;
+		std::printf("SSR: G-buffer copied before the deferred lighting (%ux%u x4 R32_UINT @0x%llx)\n", width, height,
+		            static_cast<unsigned long long>(address));
+		std::fflush(stdout);
+	}
+}
+
+uint32_t SsrPackedTargets(std::array<SsrTarget, 4>& targets) {
+	std::lock_guard lock(g_ssr_gb.mutex);
+	if (!g_ssr_gb.valid || g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.flip + 4) return 0;
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < g_ssr_gb.count && n < 4; ++i) {
+		const auto& t = g_ssr_gb.targets[i];
+		if (t.view.format != vk::Format::eR32Uint || t.address == 0) break; // (the packed targets lead: RT0..RT3)
+		targets[n++] = t;
+	}
+	return n;
+}
+
+bool SsrMaterial(SsrTarget& target, int& channel, bool& gloss) {
+	const auto& choice = SsrChoice();
+	if (choice.slot < 0) return false;
+	std::lock_guard lock(g_ssr_gb.mutex);
+	if (!g_ssr_gb.valid || static_cast<uint32_t>(choice.slot) >= g_ssr_gb.count) return false;
+	if (g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.flip + 600) return false; // (not seen for ~10 s)
+	const auto& t = g_ssr_gb.targets[choice.slot];
+	if (!SsrFormatUsable(t.view.format) || t.address == 0) return false;
+	target  = t;
+	channel = choice.channel;
+	gloss   = choice.gloss;
+	return true;
+}
+
+namespace {
+// KYTY_CONTACT_SHADOWS=0|1|2|3 ("Sombras RT": No / Normal / Alta / Ultra; cshadow.comp): screen-space contact shadows
+// toward the sun, recorded after SSGI and before the upscaler. 1: half-res trace, 16 steps, temporal + a-trous 1, 2;
+// 2: full res, 24 steps, a-trous 1, 2, 4; 3: full res, 56 steps, a little longer ray (x1.15), binary-search hit refine,
+// temporal alpha 0.05, a-trous 1, 2, 4 (as 2: no wider blur), strength x0.9. The composite only darkens (color *
+// factor, factor in [1 - strength, 1], min'd with the input), skips sky and > 80 m, and is masked by the history count. KYTY_CONTACT_SHADOWS_STRENGTH (0.7: how dark a contact shadow
+// gets, 0..1), KYTY_CONTACT_SHADOWS_LENGTH (1.0: ray length scale, 0.25..4).
+//
+// The sun's direction (no fixed guess; off while unknown):
+//  1. OnShadowConsumer (renderCompute.cpp): a dispatch that samples a square, layered (>= 4), depth-like image of
+//     >= 512 px (the sun cascades' shadow-map array; Demon's Souls: 1024x1024x80 at 0x102a400000) is a shadow
+//     consumer (the deferred sun lighting / shadow resolve). Its flattened SRT and its constant buffers (<= 64 KiB, the
+//     first 4 KiB) are searched for orthographic matrices: 4x4 (either major) with a (0, 0, 0, 1) projective row, or
+//     3x4 rows, whose 3x3 rows are mutually orthogonal (|cos| < 0.01), x and y scales equal (a square map) and the
+//     depth scale different (so no rigid view / object matrix passes); the camera's own forward is refused. The depth
+//     row is the light axis; the cascades must agree (2 degrees), else the axis seen in 3 frames running.
+//  2. The axis is in the matrix's input space (world, or view) with an unknown sign: four view-space candidates
+//     (world through the camera's view = P^-1 * view_proj (g_camera, P the upscaler's view_to_clip), and as-is; each
+//     sign). A vote pass (mode 5, every frame until settled, then every 16th) compares the game's own lit luma of
+//     pixels facing each candidate (n.l > 0.5) with that of pixels facing away (< -0.2); the candidate whose ratio
+//     (EMA of the log) is >= 1.2 and beats the others' axis wins. None (an interior, no sun) -> no contact shadows.
+struct CShadowPass {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	bool                    failed     = false;
+	vk::Extent2D            render {}, trace {};
+	SsgiImage               raw, tmp_a, tmp_b, out;
+	SsgiImage               history[2], gbuf[2];
+	SsgiImage               moments[2], var_a, var_b;
+	uint32_t                frame         = 0;
+	int                     quality       = 0;
+	bool                    history_valid = false;
+	VkBuffer                vote          = VK_NULL_HANDLE;
+	VmaAllocation           vote_mem      = nullptr;
+	const uint32_t*         vote_mapped   = nullptr;
+	bool                    slot_voted[4] {};
+	float                   ema[4] {};
+	uint32_t                votes = 0;
+	int                     chosen = -1, last_chosen = -1, lead = -1;
+	uint32_t                lead_n = 0;
+	bool                    locked = false; // (the vote agreed once for this latched sun: space and sign fixed)
+	bool                    latched = false, switching = false, have_dir = false;
+	std::array<float, 3>    latch_axis {}, switch_axis {}, last_dir {};
+	float                   fade = 0.0f;
+	std::chrono::steady_clock::time_point latch_time {}, last_fresh {};
+	vk::QueryPool           pool      = nullptr;
+	double                  period_ns = 1.0;
+	uint64_t                written = 0, read = 0;
+	double                  sum_ms  = 0.0;
+	uint32_t                samples = 0;
+	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+} g_cs;
+
+struct CShadowPush {
+	float   proj[4];
+	float   depth_map[4];
+	float   motion[4];
+	float   trace[4];
+	int32_t misc[4];
+	float   extra[4];
+	float   cand[4][4];
+};
+static_assert(sizeof(CShadowPush) == 160);
+
+int ContactQuality() {
+	static const int quality = [] {
+		const char* value = std::getenv("KYTY_CONTACT_SHADOWS");
+		const int   q     = value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
+		std::printf("CSHADOW: KYTY_CONTACT_SHADOWS=%s read (level %d)\n", value != nullptr ? value : "(unset)", q);
+		std::fflush(stdout);
+		return q;
+	}();
+	return quality;
+}
+
+// The probe's findings (any recording thread writes, the upscaler's reads).
+struct SunProbe {
+	std::mutex              mutex;
+	std::array<float, 3>    axis {};    // the light axis in the matrices' input space, sign canonical (largest > 0)
+	uint64_t                flip = 0;   // the guest flip it was last seen in
+	uint32_t                agree = 0;  // matrices agreeing in that dispatch
+	uint32_t                stable = 0; // flips in a row with the same axis
+	bool                    valid = false;
+	std::array<float, 16>   view_proj {}; // the camera's (g_camera) when it was seen
+	bool                    have_camera = false;
+	std::array<std::atomic<uint64_t>, 8> consumers {};
+	std::array<uint64_t, 8> scanned_flip {};
+} g_sun;
+
+bool Orthonormalish(const float* r0, const float* r1, const float* r2, std::array<float, 3>& axis) {
+	const auto dot  = [](const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+	const float n0 = std::sqrt(dot(r0, r0)), n1 = std::sqrt(dot(r1, r1)), n2 = std::sqrt(dot(r2, r2));
+	if (!(n0 > 1e-6f && n1 > 1e-6f && n2 > 1e-7f) || !(n0 < 1e4f && n1 < 1e4f && n2 < 1e4f)) return false;
+	if (std::abs(dot(r0, r1)) > 0.01f * n0 * n1 || std::abs(dot(r0, r2)) > 0.01f * n0 * n2 || std::abs(dot(r1, r2)) > 0.01f * n1 * n2)
+		return false;
+	if (std::abs(n0 - n1) > 0.02f * std::max(n0, n1)) return false;  // a square shadow map
+	if (std::abs(n2 - n0) < 0.05f * std::max(n0, n2)) return false;  // rigid / uniformly scaled: no projection
+	axis = {r2[0] / n2, r2[1] / n2, r2[2] / n2};
+	// Exactly axis-aligned rows are identity-like constants, not a sun.
+	if (std::max({std::abs(axis[0]), std::abs(axis[1]), std::abs(axis[2])}) > 0.9999f) return false;
+	int big = 0;
+	for (int i = 1; i < 3; ++i)
+		if (std::abs(axis[i]) > std::abs(axis[big])) big = i;
+	if (axis[big] < 0.0f) axis = {-axis[0], -axis[1], -axis[2]};
+	return true;
+}
+
+// Orthographic matrices among the words: their light axes.
+void FindOrthoAxes(const std::vector<float>& f, std::vector<std::array<float, 3>>& axes) {
+	const auto finite = [&](size_t o, size_t n) {
+		for (size_t i = 0; i < n; ++i)
+			if (!std::isfinite(f[o + i])) return false;
+		return true;
+	};
+	std::array<float, 3> axis {};
+	for (size_t o = 0; o + 12 <= f.size() && axes.size() < 16; ++o) {
+		if (!finite(o, 12)) continue;
+		const float* m = &f[o];
+		if (o + 16 <= f.size() && finite(o, 16)) {
+			// Row-major (clip = M * p): the w row (0, 0, 0, 1).
+			if (m[12] == 0.0f && m[13] == 0.0f && m[14] == 0.0f && m[15] == 1.0f && Orthonormalish(m, m + 4, m + 8, axis)) {
+				axes.push_back(axis);
+				o += 15;
+				continue;
+			}
+			// Column-major: the w column.
+			if (m[3] == 0.0f && m[7] == 0.0f && m[11] == 0.0f && m[15] == 1.0f) {
+				const float c0[3] {m[0], m[4], m[8]}, c1[3] {m[1], m[5], m[9]}, c2[3] {m[2], m[6], m[10]};
+				if (Orthonormalish(c0, c1, c2, axis)) {
+					axes.push_back(axis);
+					o += 15;
+					continue;
+				}
+			}
+		}
+		// 3x4 rows (the projective row left out), 16-byte aligned only: fewer chance matches.
+		// (A perspective matrix's w row, along the depth row, follows a spot light's: refused.)
+		const bool perspective = o + 16 <= f.size() && finite(o, 16) &&
+		                         std::abs(m[12] * m[8] + m[13] * m[9] + m[14] * m[10]) >
+		                             0.5f * std::sqrt((m[12] * m[12] + m[13] * m[13] + m[14] * m[14]) * (m[8] * m[8] + m[9] * m[9] + m[10] * m[10])) &&
+		                         (m[12] * m[12] + m[13] * m[13] + m[14] * m[14]) > 1e-8f;
+		if ((o & 3u) == 0 && !perspective && Orthonormalish(m, m + 4, m + 8, axis)) {
+			axes.push_back(axis);
+			o += 11;
+		}
+	}
+}
+
+int CameraForwardReject(const std::array<float, 3>& axis, const std::array<float, 16>& vp) {
+	// The camera's w row's spatial part is its forward (perspective): a camera matrix, not a light one.
+	const float n = std::sqrt(vp[12] * vp[12] + vp[13] * vp[13] + vp[14] * vp[14]);
+	if (n < 1e-6f) return 0;
+	return std::abs(axis[0] * vp[12] + axis[1] * vp[13] + axis[2] * vp[14]) / n > 0.9994f ? 1 : 0;
+}
+
+bool Inverse4(const std::array<float, 16>& m, std::array<double, 16>& inv) {
+	// (Row-major, m[i*4+j]; the classic cofactor expansion.)
+	double a[16];
+	for (int i = 0; i < 16; ++i) a[i] = m[i];
+	inv[0]  = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] + a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
+	inv[4]  = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] - a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
+	inv[8]  = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] + a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
+	inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14] - a[8] * a[6] * a[13] - a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
+	inv[1]  = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15] - a[9] * a[3] * a[14] - a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
+	inv[5]  = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15] + a[8] * a[3] * a[14] + a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
+	inv[9]  = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15] - a[8] * a[3] * a[13] - a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
+	inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14] + a[8] * a[2] * a[13] + a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
+	inv[2]  = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15] + a[5] * a[3] * a[14] + a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
+	inv[6]  = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15] - a[4] * a[3] * a[14] - a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
+	inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15] + a[4] * a[3] * a[13] + a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
+	inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14] - a[4] * a[2] * a[13] - a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
+	inv[3]  = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11] - a[5] * a[3] * a[10] - a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
+	inv[7]  = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] + a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
+	inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] - a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
+	inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
+	const double det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
+	if (!(std::abs(det) > 1e-30)) return false;
+	for (auto& v: inv) v /= det;
+	return true;
+}
+} // namespace
+
+bool ContactShadowsWanted() { return ContactQuality() > 0; }
+
+bool IsShadowConsumer(uint64_t cs_hash) {
+	for (const auto& h: g_sun.consumers)
+		if (h.load(std::memory_order_relaxed) == cs_hash) return true;
+	return false;
+}
+
+void OnShadowConsumer(uint64_t cs_hash, const ShadowConsumer& consumer, std::span<const uint32_t> srt) {
+	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
+	std::lock_guard lock(g_sun.mutex);
+	size_t slot = g_sun.consumers.size();
+	bool   first = false;
+	for (size_t i = 0; i < g_sun.consumers.size(); ++i) {
+		const uint64_t h = g_sun.consumers[i].load(std::memory_order_relaxed);
+		if (h == cs_hash) { slot = i; break; }
+		if (h == 0) {
+			g_sun.consumers[i].store(cs_hash, std::memory_order_relaxed);
+			g_sun.scanned_flip[i] = ~0ull;
+			slot  = i;
+			first = true;
+			break;
+		}
+	}
+	if (slot == g_sun.consumers.size() || g_sun.scanned_flip[slot] == flip) return; // (once a flip per program)
+	g_sun.scanned_flip[slot] = flip;
+	std::vector<float> words(srt.size());
+	std::memcpy(words.data(), srt.data(), srt.size() * 4u);
+	std::vector<std::array<float, 3>> axes;
+	FindOrthoAxes(words, axes);
+	for (uint32_t i = 0; i < consumer.buffers; ++i) {
+		const uint64_t bytes = std::min<uint64_t>(consumer.buffer_size[i], 4096) & ~uint64_t {3};
+		words.assign(bytes / 4, 0.0f);
+		if (bytes == 0 || !Libs::LibKernel::Memory::TryReadBackingToHost(consumer.buffer_address[i], words.data(), bytes)) continue;
+		FindOrthoAxes(words, axes);
+	}
+	bool camera = false;
+	{
+		std::lock_guard vp_lock(g_last_vp_mutex);
+		if (g_have_last_vp) g_sun.view_proj = g_last_vp, g_sun.have_camera = camera = true;
+	}
+	if (g_sun.have_camera)
+		axes.erase(std::remove_if(axes.begin(), axes.end(), [&](const auto& a) { return CameraForwardReject(a, g_sun.view_proj) != 0; }),
+		           axes.end());
+	// The largest group agreeing within 2 degrees.
+	uint32_t best = 0, best_n = 0;
+	for (uint32_t i = 0; i < axes.size(); ++i) {
+		uint32_t n = 0;
+		for (const auto& b: axes)
+			n += std::abs(axes[i][0] * b[0] + axes[i][1] * b[1] + axes[i][2] * b[2]) > 0.9994f ? 1u : 0u;
+		if (n > best_n) best = i, best_n = n;
+	}
+	static uint32_t reports = 0;
+	if (first || (reports < 64 && flip % 600 == 0)) {
+		++reports;
+		std::printf("CSHADOW: sun-shadow consumer CS %016llx (shadow array 0x%llx %ux%u x%u layers, SRT %zu words, %u constant "
+		            "buffers): %zu orthographic matrices, axis (%.4f %.4f %.4f) agreed by %u%s\n",
+		            static_cast<unsigned long long>(cs_hash), static_cast<unsigned long long>(consumer.shadow_address),
+		            consumer.shadow_size, consumer.shadow_size, consumer.shadow_layers, srt.size(), consumer.buffers, axes.size(),
+		            best_n > 0 ? axes[best][0] : 0.0f, best_n > 0 ? axes[best][1] : 0.0f, best_n > 0 ? axes[best][2] : 0.0f, best_n,
+		            camera ? "" : " (no camera this frame)");
+		std::fflush(stdout);
+	}
+	if (best_n == 0) return;
+	const auto& a    = axes[best];
+	const bool  same = g_sun.valid && std::abs(a[0] * g_sun.axis[0] + a[1] * g_sun.axis[1] + a[2] * g_sun.axis[2]) > 0.9994f;
+	g_sun.stable = same ? (g_sun.flip == flip ? g_sun.stable : g_sun.stable + 1) : 1;
+	g_sun.agree  = std::max(best_n, g_sun.flip == flip && same ? g_sun.agree : 0u);
+	g_sun.axis   = a;
+	g_sun.flip   = flip;
+	g_sun.valid  = true;
+}
+
+void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> srt, bool shadow_target) {
+	if (srt.empty()) return;
+	static std::mutex                             mutex;
+	static std::unordered_map<uint64_t, uint64_t> learned;  // shadow-pass vertex shaders -> the flip last learned
+	static std::unordered_map<uint64_t, uint64_t> probed;   // others: the flip last scanned (every 300 flips at most)
+	static std::vector<std::array<float, 3>>      axes;     // this flip's
+	static uint64_t                               flip_of = ~0ull;
+	static uint32_t                               draws = 0;
+	static bool                                   said = false;
+	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
+	std::lock_guard lock(mutex);
+	if (flip != flip_of) {
+		// The last flip's axes: the largest group agreeing within 2 degrees becomes the sun.
+		uint32_t best = 0, best_n = 0;
+		for (uint32_t i = 0; i < axes.size(); ++i) {
+			uint32_t n = 0;
+			for (const auto& b: axes) n += std::abs(axes[i][0] * b[0] + axes[i][1] * b[1] + axes[i][2] * b[2]) > 0.9994f ? 1u : 0u;
+			if (n > best_n) best = i, best_n = n;
+		}
+		if (best_n >= 2 || (best_n == 1 && axes.size() == 1)) {
+			const auto a = axes[best];
+			std::lock_guard sun(g_sun.mutex);
+			const bool same = g_sun.valid && std::abs(a[0] * g_sun.axis[0] + a[1] * g_sun.axis[1] + a[2] * g_sun.axis[2]) > 0.9994f;
+			g_sun.stable = same ? g_sun.stable + 1 : 1;
+			g_sun.agree  = best_n;
+			g_sun.axis   = a;
+			g_sun.flip   = flip_of;
+			g_sun.valid  = true;
+			std::lock_guard vp_lock(g_last_vp_mutex);
+			if (g_have_last_vp) g_sun.view_proj = g_last_vp, g_sun.have_camera = true;
+		}
+		axes.clear();
+		flip_of = flip;
+		draws   = 0;
+	}
+	if (draws >= 64) return; // (a sample of a flip's shadow draws)
+	const auto known = learned.find(vs_hash);
+	if (!shadow_target && known == learned.end()) {
+		auto& last = probed[vs_hash];
+		if (last != 0 && flip < last + 300) return;
+		last = flip + 1;
+	}
+	std::vector<float> words(std::min<size_t>(srt.size(), 160));
+	std::memcpy(words.data(), srt.data(), words.size() * 4u);
+	std::vector<std::array<float, 3>> found;
+	FindOrthoAxes(words, found);
+	{
+		std::lock_guard vp_lock(g_last_vp_mutex);
+		if (g_have_last_vp)
+			found.erase(std::remove_if(found.begin(), found.end(), [&](const auto& a) { return CameraForwardReject(a, g_last_vp) != 0; }),
+			            found.end());
+	}
+	if (found.empty()) return;
+	++draws;
+	if (shadow_target || known != learned.end()) learned[vs_hash] = flip;
+	else if (learned.size() < 64) learned[vs_hash] = flip; // (an ortho matrix in an unknown VS: kept as a candidate)
+	axes.push_back(found[0]);
+	if (!said) {
+		said = true;
+		std::printf("CSHADOW: sun matrix from a shadow draw (VS %016llx, %s, SRT %zu words): light axis (%.4f %.4f %.4f)\n",
+		            static_cast<unsigned long long>(vs_hash), shadow_target ? "depth target a shadow-map layer" : "table/record path",
+		            srt.size(), found[0][0], found[0][1], found[0][2]);
+		std::fflush(stdout);
+	}
+}
+
+namespace {
+bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
+	const auto device = graphics.device;
+	if (g_cs.pipeline == nullptr) {
+		if (g_cs.failed) return false;
+		g_cs.failed = true;
+		if (graphics.GetPhysicalDeviceProperties().limits.maxPushConstantsSize < sizeof(CShadowPush)) return false;
+		if (g_ssgi.point == nullptr) {
+			for (int i = 0; i < 2; ++i) {
+				vk::SamplerCreateInfo sampler {};
+				sampler.magFilter    = i == 0 ? vk::Filter::eNearest : vk::Filter::eLinear;
+				sampler.minFilter    = sampler.magFilter;
+				sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+				sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+				sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+				if (device.createSampler(&sampler, nullptr, i == 0 ? &g_ssgi.point : &g_ssgi.linear) != vk::Result::eSuccess) return false;
+			}
+		}
+		std::array<vk::DescriptorSetLayoutBinding, 12> bindings {};
+		for (uint32_t i = 0; i < 12; ++i) {
+			bindings[i].binding         = i;
+			bindings[i].descriptorType  = i == 11 ? vk::DescriptorType::eStorageBuffer
+			                              : i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler
+			                                                : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorCount = 1;
+			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+		}
+		vk::DescriptorSetLayoutCreateInfo set_info {};
+		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+		set_info.pBindings    = bindings.data();
+		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_cs.set_layout) != vk::Result::eSuccess) return false;
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(CShadowPush)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = 1;
+		layout_info.pSetLayouts            = &g_cs.set_layout;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push;
+		if (device.createPipelineLayout(&layout_info, nullptr, &g_cs.layout) != vk::Result::eSuccess) return false;
+		vk::ShaderModuleCreateInfo module_info {};
+		module_info.codeSize    = sizeof(CSHADOW_SPV);
+		module_info.pCode       = CSHADOW_SPV;
+		vk::ShaderModule module = nullptr;
+		if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		pipeline_info.stage.module = module;
+		pipeline_info.stage.pName  = "main";
+		pipeline_info.layout       = g_cs.layout;
+		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_cs.pipeline);
+		device.destroyShaderModule(module, nullptr);
+		if (created != vk::Result::eSuccess) {
+			g_cs.pipeline = nullptr;
+			return false;
+		}
+		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		create.size  = 4 * 16 * sizeof(uint32_t);
+		create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocate.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VmaAllocationInfo mapped {};
+		if (vmaCreateBuffer(graphics.allocator, &create, &allocate, &g_cs.vote, &g_cs.vote_mem, &mapped) != VK_SUCCESS) return false;
+		g_cs.vote_mapped = static_cast<const uint32_t*>(mapped.pMappedData);
+		vk::QueryPoolCreateInfo query {};
+		query.queryType  = vk::QueryType::eTimestamp;
+		query.queryCount = 16;
+		if (device.createQueryPool(&query, nullptr, &g_cs.pool) != vk::Result::eSuccess) g_cs.pool = nullptr;
+		g_cs.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		g_cs.failed    = false;
+	}
+	if (g_cs.out.image.image != nullptr && g_cs.render == render && g_cs.quality == quality) return true;
+	device.waitIdle();
+	SsgiImage* all[] {&g_cs.raw, &g_cs.tmp_a, &g_cs.tmp_b, &g_cs.out, &g_cs.history[0], &g_cs.history[1], &g_cs.gbuf[0],
+	                  &g_cs.gbuf[1], &g_cs.moments[0], &g_cs.moments[1], &g_cs.var_a, &g_cs.var_b};
+	for (auto* img : all)
+		SsgiFreeImage(graphics, *img);
+	const vk::Extent2D trace = quality >= 2 ? render : vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
+	bool ok = SsgiMakeImage(graphics, g_cs.out, render);
+	for (auto* img : all)
+		if (img != &g_cs.out) ok = ok && SsgiMakeImage(graphics, *img, trace);
+	if (!ok) {
+		for (auto* img : all)
+			SsgiFreeImage(graphics, *img);
+		g_cs.failed = true;
+		return false;
+	}
+	g_cs.render        = render;
+	g_cs.quality       = quality;
+	g_cs.trace         = trace;
+	g_cs.history_valid = false;
+	return true;
+}
+
+void CShadowReadTiming() {
+	if (g_cs.pool == nullptr || g_graphics_ctx == nullptr) return;
+	while (g_cs.read + 4 <= g_cs.written) {
+		const auto entry = static_cast<uint32_t>(g_cs.read % 8);
+		std::array<uint64_t, 2> stamps {};
+		if (g_graphics_ctx->device.getQueryPoolResults(g_cs.pool, entry * 2, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		                                               vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
+			break;
+		g_cs.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_cs.period_ns / 1e6;
+		++g_cs.samples;
+		++g_cs.read;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_cs.last_log >= std::chrono::seconds(5) && g_cs.samples > 0) {
+		std::printf("CSHADOW: GPU %.3f ms (mean of %u frames; light candidate %d, vote log-ratios %.2f %.2f %.2f %.2f)\n",
+		            g_cs.sum_ms / g_cs.samples, g_cs.samples, g_cs.chosen, g_cs.ema[0], g_cs.ema[1], g_cs.ema[2], g_cs.ema[3]);
+		std::fflush(stdout);
+		g_cs.sum_ms   = 0.0;
+		g_cs.samples  = 0;
+		g_cs.last_log = now;
+	}
+}
+
+// The vote read back (4 frames late) into the per-candidate EMAs; the choice made again with hysteresis.
+void CShadowTakeVote(uint32_t slot) {
+	if (!g_cs.slot_voted[slot] || g_cs.vote_mapped == nullptr) return;
+	g_cs.slot_voted[slot] = false;
+	(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_cs.vote_mem, 0, VK_WHOLE_SIZE);
+	const uint32_t* v = g_cs.vote_mapped + slot * 16;
+	float score[4];
+	bool  any = false;
+	for (int k = 0; k < 4; ++k) {
+		const uint32_t lit_n = v[k * 4 + 1], away_n = v[k * 4 + 3];
+		if (lit_n < 200 || away_n < 200) {
+			score[k] = -1e9f;
+			continue;
+		}
+		const double lit = (static_cast<double>(v[k * 4]) + 1.0) / lit_n, away = (static_cast<double>(v[k * 4 + 2]) + 1.0) / away_n;
+		score[k] = static_cast<float>(std::log(lit / away));
+		any      = true;
+	}
+	if (!any) return;
+	++g_cs.votes;
+	const float a = g_cs.votes == 1 ? 1.0f : 0.25f;
+	for (int k = 0; k < 4; ++k)
+		g_cs.ema[k] = score[k] < -1e8f ? g_cs.ema[k] * (1.0f - a) : g_cs.ema[k] + (score[k] - g_cs.ema[k]) * a;
+	int best = 0;
+	for (int k = 1; k < 4; ++k)
+		if (g_cs.ema[k] > g_cs.ema[best]) best = k;
+	const float other = std::max(g_cs.ema[best < 2 ? 2 : 0], g_cs.ema[best < 2 ? 3 : 1]); // the other interpretation's axis
+	const float keep  = std::log(1.12f), take = std::log(1.2f);
+	const int   was   = g_cs.chosen;
+	(void)keep;
+	// Hysteresis: the same leader, clear of the rest, for 6 votes running; then locked (no pause, no flip) until the
+	// latched sun changes by > 10 degrees.
+	const bool clear = g_cs.ema[best] >= take && g_cs.ema[best] - other > 0.15f;
+	if (clear && best == g_cs.lead) ++g_cs.lead_n;
+	else g_cs.lead = clear ? best : -1, g_cs.lead_n = clear ? 1u : 0u;
+	if (!g_cs.locked && g_cs.votes >= 4 && g_cs.lead >= 0 && g_cs.lead_n >= 6) {
+		g_cs.chosen = g_cs.lead;
+		g_cs.locked = true;
+		std::printf("CSHADOW: light locked (candidate %d) for this sun: no re-vote until it changes\n", g_cs.chosen);
+	}
+	if (was != g_cs.chosen) {
+		static const char* names[] {"world axis +", "world axis -", "view axis +", "view axis -"};
+		std::printf("CSHADOW: light %s (vote log-ratios %.3f %.3f %.3f %.3f after %u votes)\n",
+		            g_cs.chosen >= 0 ? names[g_cs.chosen] : "none: contact shadows paused (no sunlit agreement)", g_cs.ema[0],
+		            g_cs.ema[1], g_cs.ema[2], g_cs.ema[3], g_cs.votes);
+		std::fflush(stdout);
+	}
+}
+
+bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
+	const int quality = ContactQuality();
+	const auto said_once = [](const char* why) {
+		static std::string said;
+		if (said != why) {
+			said = why;
+			std::printf("CSHADOW: off for now (%s)\n", why);
+			std::fflush(stdout);
+		}
+	};
+	if (quality == 0 || g_graphics_ctx == nullptr) return false;
+	if (VideoOut::MoviePlaying()) return g_cs.history_valid = false, false;
+	const auto& color = inputs.color;
+	if (color.view == nullptr || inputs.depth.view == nullptr || inputs.motion.view == nullptr || color.extent.width < 16 ||
+	    color.extent.height < 16)
+		return said_once("missing color/depth/motion view"), false;
+	const auto& m = inputs.view_to_clip;
+	if (!(m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f)))
+		return said_once("no camera projection (view_to_clip)"), false;
+	// The sun latch: the last good axis is kept (slowly smoothed) across frames that lack it; dropped only after a long
+	// absence (KYTY_CONTACT_SHADOWS_HOLD seconds, default 20) or a scene change (a jump > 10 degrees), and then faded
+	// out / in over 0.5 s instead of popping.
+	const auto now = std::chrono::steady_clock::now();
+	const float dt = g_cs.latch_time.time_since_epoch().count() == 0
+	                     ? 0.0f
+	                     : std::clamp(std::chrono::duration<float>(now - g_cs.latch_time).count(), 0.0f, 0.25f);
+	g_cs.latch_time = now;
+	const float hold = std::max(SsgiEnv("KYTY_CONTACT_SHADOWS_HOLD", 20.0f, 600.0f), 1.0f);
+	std::array<float, 3>  axis {};
+	std::array<float, 16> vp {};
+	bool                  fresh = false, have_camera = false;
+	{
+		std::lock_guard lock(g_sun.mutex);
+		fresh       = g_sun.valid && (g_sun.agree >= 2 || g_sun.stable >= 3) &&
+		              g_flips_taken.load(std::memory_order_relaxed) <= g_sun.flip + 120;
+		axis        = g_sun.axis;
+		vp          = g_sun.view_proj;
+		have_camera = g_sun.have_camera;
+	}
+	{
+		// The camera now (the axis's camera is stale once latched).
+		std::lock_guard vp_lock(g_last_vp_mutex);
+		if (g_have_last_vp) vp = g_last_vp, have_camera = true;
+	}
+	if (fresh) {
+		if (!g_cs.latched) {
+			g_cs.latched = true, g_cs.latch_axis = axis, g_cs.switching = false;
+			std::printf("CSHADOW: sun latched, axis (%.4f %.4f %.4f)\n", axis[0], axis[1], axis[2]);
+			std::fflush(stdout);
+		} else {
+			const auto& l = g_cs.latch_axis;
+			const float c = axis[0] * l[0] + axis[1] * l[1] + axis[2] * l[2];
+			const float s = c < 0.0f ? -1.0f : 1.0f;
+			if (std::abs(c) >= 0.9848f) { // (within 10 degrees: the same sun, smoothed over ~1 s)
+				const float a = 1.0f - std::exp(-dt / 1.0f);
+				std::array<float, 3> n {l[0] + (s * axis[0] - l[0]) * a, l[1] + (s * axis[1] - l[1]) * a, l[2] + (s * axis[2] - l[2]) * a};
+				const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+				if (len > 1e-6f) g_cs.latch_axis = {n[0] / len, n[1] / len, n[2] / len};
+				g_cs.switching = false;
+			} else if (!g_cs.switching) {
+				g_cs.switching = true; // (a scene change: fade out, then take the new axis)
+				std::printf("CSHADOW: sun changed (axis (%.4f %.4f %.4f), was (%.4f %.4f %.4f)): fading out, then re-latching\n", axis[0],
+				            axis[1], axis[2], l[0], l[1], l[2]);
+				std::fflush(stdout);
+			}
+			g_cs.switch_axis = axis;
+		}
+		g_cs.last_fresh = now;
+	}
+	if (g_cs.latched && g_cs.switching && g_cs.fade <= 0.0f) {
+		g_cs.latch_axis = g_cs.switch_axis, g_cs.switching = false;
+		g_cs.votes = 0, g_cs.chosen = -1, g_cs.last_chosen = -1, g_cs.lead = -1, g_cs.lead_n = 0, g_cs.locked = false;
+		for (auto& e: g_cs.ema) e = 0.0f;
+		g_cs.history_valid = false;
+	}
+	const bool absent = g_cs.latched && now - g_cs.last_fresh > std::chrono::duration<float>(hold);
+	if (absent && g_cs.fade <= 0.0f) {
+		g_cs.latched = false;
+		std::printf("CSHADOW: sun unseen for %g s: dropped (faded out)\n", hold);
+		std::fflush(stdout);
+	}
+	if (!g_cs.latched) return g_cs.history_valid = false, g_cs.fade = 0.0f, said_once("no sun direction yet: the pass is skipped"), false;
+	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality)) return said_once("could not create its pipeline or images"), false;
+	axis = g_cs.latch_axis;
+
+	// The light candidates in view space.
+	float cand[4][4] {};
+	cand[2][0] = axis[0], cand[2][1] = axis[1], cand[2][2] = axis[2], cand[2][3] = 1.0f;
+	cand[3][0] = -axis[0], cand[3][1] = -axis[1], cand[3][2] = -axis[2], cand[3][3] = 1.0f;
+	if (have_camera) {
+		// View = P^-1 * view_proj (column vectors): P's column form is the transpose of the row-vector view_to_clip.
+		std::array<float, 16> pc {};
+		for (int i = 0; i < 4; ++i)
+			for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
+		std::array<double, 16> pinv {};
+		if (Inverse4(pc, pinv)) {
+			double d[3] {};
+			for (int i = 0; i < 3; ++i)
+				for (int j = 0; j < 3; ++j) {
+					double vij = 0.0;
+					for (int k = 0; k < 4; ++k) vij += pinv[i * 4 + k] * vp[k * 4 + j];
+					d[i] += vij * axis[j];
+				}
+			const double n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+			if (n > 1e-9 && std::isfinite(n))
+				for (int i = 0; i < 3; ++i) cand[0][i] = static_cast<float>(d[i] / n), cand[1][i] = -cand[0][i];
+			cand[0][3] = cand[1][3] = n > 1e-9 && std::isfinite(n) ? 1.0f : 0.0f;
+		}
+	}
+
+	const float strength = SsgiEnv("KYTY_CONTACT_SHADOWS_STRENGTH", 0.7f, 1.0f) * (quality >= 3 ? 0.9f : 1.0f);
+	const float length   = std::max(SsgiEnv("KYTY_CONTACT_SHADOWS_LENGTH", 1.0f, 4.0f), 0.25f);
+	CShadowPush push {};
+	push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
+	push.depth_map[0] = m[10], push.depth_map[1] = m[14], push.depth_map[2] = m[11], push.depth_map[3] = m[15];
+	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
+	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
+	push.trace[0] = static_cast<float>(g_cs.trace.width), push.trace[1] = static_cast<float>(g_cs.trace.height);
+	push.trace[2] = strength, push.trace[3] = length;
+	std::memcpy(push.cand, cand, sizeof(cand));
+
+	CShadowReadTiming();
+	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
+	                        vk::AccessFlags2 dst) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = src_stage;
+		barrier.srcAccessMask = src;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	SsgiImage* all[] {&g_cs.raw, &g_cs.tmp_a, &g_cs.tmp_b, &g_cs.out, &g_cs.history[0], &g_cs.history[1], &g_cs.gbuf[0],
+	                  &g_cs.gbuf[1], &g_cs.moments[0], &g_cs.moments[1], &g_cs.var_a, &g_cs.var_b};
+	for (auto* img : all)
+		if (img->image.state.layout != vk::ImageLayout::eGeneral)
+			Transition(command, img->image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+			           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+	       vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
+	       vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite);
+	const uint32_t cur  = g_cs.frame & 1u;
+	const uint32_t prev = cur ^ 1u;
+	push.misc[1] = static_cast<int32_t>(g_cs.frame);
+	push.misc[2] = quality;
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_cs.pipeline);
+	const SsgiImage* aux_in  = &g_cs.moments[prev];
+	const SsgiImage* aux_out = &g_cs.moments[cur];
+	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout, float step,
+	                     vk::Extent2D size) {
+		const vk::Sampler       lin = g_ssgi.linear, pt = g_ssgi.point;
+		vk::DescriptorImageInfo infos[11] {};
+		infos[0]  = {lin, color.view, color.layout};
+		infos[1]  = {pt, inputs.depth.view, inputs.depth.layout};
+		infos[2]  = {pt, inputs.motion.view, inputs.motion.layout};
+		infos[3]  = {lin, a.view, vk::ImageLayout::eGeneral};
+		infos[4]  = {lin, b.view, vk::ImageLayout::eGeneral};
+		infos[5]  = {pt, g_cs.gbuf[cur].view, vk::ImageLayout::eGeneral};
+		infos[6]  = {pt, g_cs.gbuf[prev].view, vk::ImageLayout::eGeneral};
+		infos[7]  = {nullptr, out.view, vk::ImageLayout::eGeneral};
+		infos[8]  = {nullptr, gout.view, vk::ImageLayout::eGeneral};
+		infos[9]  = {lin, aux_in->view, vk::ImageLayout::eGeneral};
+		infos[10] = {nullptr, aux_out->view, vk::ImageLayout::eGeneral};
+		vk::DescriptorBufferInfo vote_info {vk::Buffer(g_cs.vote), 0, VK_WHOLE_SIZE};
+		vk::WriteDescriptorSet   writes[12] {};
+		for (uint32_t i = 0; i < 12; ++i) {
+			writes[i].dstBinding      = i;
+			writes[i].descriptorCount = 1;
+			if (i == 11) {
+				writes[i].descriptorType = vk::DescriptorType::eStorageBuffer;
+				writes[i].pBufferInfo    = &vote_info;
+			} else {
+				writes[i].descriptorType = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+				writes[i].pImageInfo     = &infos[i];
+			}
+		}
+		push.misc[0]  = mode;
+		push.extra[0] = step;
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_cs.layout, 0, 12, writes);
+		command.pushConstants(g_cs.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	};
+
+	// The vote: every frame until a light is chosen, then every 16th (the scene, an interior, may change).
+	const uint32_t slot = g_cs.frame % 4;
+	CShadowTakeVote(slot);
+	if (!g_cs.locked) {
+		command.fillBuffer(vk::Buffer(g_cs.vote), slot * 64, 64, 0);
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+		       vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
+		push.misc[3] = static_cast<int32_t>(slot << 8);
+		run(5, g_cs.tmp_a, g_cs.tmp_b, g_cs.raw, g_cs.gbuf[cur], 0.0f, vk::Extent2D {(color.extent.width + 3) / 4, (color.extent.height + 3) / 4});
+		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eHost,
+		       vk::AccessFlagBits2::eHostRead);
+		g_cs.slot_voted[slot] = true;
+	}
+	// The fade: toward 1 while a sun is latched, agreed by the vote and not switching / absent; 0.5 s each way.
+	if (g_cs.chosen >= 0) g_cs.last_chosen = g_cs.chosen;
+	const int  use    = g_cs.chosen >= 0 ? g_cs.chosen : g_cs.last_chosen;
+	const bool target = g_cs.chosen >= 0 && !g_cs.switching && !absent;
+	g_cs.fade         = std::clamp(g_cs.fade + (target ? dt : -dt) / 0.5f, 0.0f, 1.0f);
+	if (use < 0 || g_cs.fade <= 0.0f) {
+		++g_cs.frame;
+		g_cs.history_valid = false;
+		return said_once(use < 0 ? "sun axis found, waiting for the lighting vote to agree on its space and sign"
+		                         : "faded out (sun absent, changed or not agreed by the vote)"),
+		       false;
+	}
+	if (cand[use][3] >= 0.5f) g_cs.last_dir = {cand[use][0], cand[use][1], cand[use][2]}, g_cs.have_dir = true;
+	if (!g_cs.have_dir) {
+		++g_cs.frame;
+		return said_once("the chosen world-space light has no camera yet"), false;
+	}
+	push.extra[1] = g_cs.last_dir[0], push.extra[2] = g_cs.last_dir[1], push.extra[3] = g_cs.last_dir[2];
+	push.trace[2] = strength * g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade); // (smoothstep fade)
+	{
+		static float said_fade = -1.0f;
+		const float  f         = g_cs.fade >= 1.0f ? 1.0f : g_cs.fade <= 0.0f ? 0.0f : 0.5f;
+		if (f != said_fade && f != 0.5f) {
+			said_fade = f;
+			std::printf("CSHADOW: fade %s (light %d, sun %s)\n", f >= 1.0f ? "in complete" : "out complete", use,
+			            fresh ? "seen this frame" : "latched");
+			std::fflush(stdout);
+		}
+	}
+	{
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("CSHADOW: on (level %d, trace %ux%u, strength %g, length %g, light view dir %.3f %.3f %.3f)\n", quality,
+			            g_cs.trace.width, g_cs.trace.height, strength, length, push.extra[1], push.extra[2], push.extra[3]);
+			std::fflush(stdout);
+		}
+	}
+	const auto entry = static_cast<uint32_t>(g_cs.written % 8);
+	const bool timed = g_cs.pool != nullptr;
+	if (timed) {
+		command.resetQueryPool(g_cs.pool, entry * 2, 2);
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_cs.pool, entry * 2);
+	}
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g_cs.history_valid ? 2 : 0);
+	run(0, g_cs.tmp_a, g_cs.tmp_b, g_cs.raw, g_cs.gbuf[cur], 0.0f, g_cs.trace);
+	run(1, g_cs.raw, g_cs.history[prev], g_cs.tmp_a, g_cs.tmp_b, 0.0f, g_cs.trace);
+	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_a;
+	run(2, g_cs.tmp_a, g_cs.raw, g_cs.history[cur], g_cs.tmp_b, 1.0f, g_cs.trace);
+	aux_in = &g_cs.var_a, aux_out = &g_cs.var_b;
+	run(2, g_cs.history[cur], g_cs.raw, g_cs.tmp_b, g_cs.raw, 2.0f, g_cs.trace);
+	const SsgiImage* final_vis = &g_cs.tmp_b;
+	if (quality >= 2) {
+		aux_in = &g_cs.var_b, aux_out = &g_cs.var_a;
+		run(2, g_cs.tmp_b, g_cs.raw, g_cs.tmp_a, g_cs.raw, 4.0f, g_cs.trace);
+		final_vis = &g_cs.tmp_a;
+	}
+	// (Level 3: no a-trous 8 any more: its wide grey halos read as haze; Ultra's extra is the longer, refined trace.)
+	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_b; // (the composite's stability mask: the history count in .z)
+	run(4, *final_vis, g_cs.raw, g_cs.out, g_cs.raw, 0.0f, g_cs.render);
+	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
+	       vk::AccessFlagBits2::eMemoryRead);
+	if (timed) {
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_cs.pool, entry * 2 + 1);
+		++g_cs.written;
+	}
+	++g_cs.frame;
+	g_cs.history_valid = true;
+	inputs.color.image  = g_cs.out.image.image;
+	inputs.color.view   = g_cs.out.view;
+	inputs.color.layout = vk::ImageLayout::eGeneral;
+	inputs.color.format = vk::Format::eR16G16B16A16Sfloat;
+	inputs.color.usage  = g_cs.out.image.usage;
+	inputs.color.level  = 0;
+	inputs.color.layer  = 0;
+	return true;
+}
+} // namespace
+
+bool SsgiWanted() { return SsgiQuality() > 0; }
+
+bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
+	UpscaleInputs inputs = inputs_in;
+	// (The DLSS-G hudless path sets the context in PrepareInputs; the PS5 Pro path alone needs the renderer's.)
+	if (g_graphics_ctx == nullptr && inputs.graphics != nullptr) g_graphics_ctx = inputs.graphics;
+	SsgiApply(command, inputs); // (KYTY_SSGI: inputs.color becomes the composited copy)
+	GtaoApply(command, inputs); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
+	SsrApply(command, inputs); // (KYTY_SSR: likewise, after GTAO; nothing when off)
+	CShadowApply(command, inputs); // (KYTY_CONTACT_SHADOWS: likewise, after SSGI)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
 	const bool  fsr  = g_sr_kind == 3;

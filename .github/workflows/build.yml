@@ -18,6 +18,10 @@ on:
         description: 'FSR 3 frame generation x3: build amd_fidelityfx_vk.dll from the patched SDK (always on the fg/x3 branch)'
         type: boolean
         default: false
+      publish:
+        description: 'Publish the release (not a draft) and mark it as the latest'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -271,7 +275,7 @@ jobs:
             run-windows.ps1, precompile-windows.ps1, launcher.ps1, launcher.cmd, LICENSE $out
           Copy-Item LICENSES $out -Recurse
           # Demon's Souls launcher (window with frame generation choice) and its two configs.
-          Copy-Item Launcher-souls.ps1, Launcher-souls.cmd, fondo-souls.jpg, LEEME-souls.txt $out
+          Copy-Item Launcher-souls.ps1, Launcher-souls-EN.ps1, Launcher-souls.cmd, 'Jugar (Espanol).cmd', 'Play (English).cmd', fondo-souls.jpg, LEEME-souls.txt, metricas.ps1, NOVEDADES.txt $out
           Copy-Item config "$out\config" -Recurse
           Copy-Item run-windows.json "$out\launch.json"
           Copy-Item docs\PORTABLE-README.md "$out\README.md"
@@ -374,6 +378,8 @@ jobs:
             gh release upload "$tag" "$PACKAGE.zip" --clobber --repo "$GITHUB_REPOSITORY"
           else
             draft=""; [[ "$PACKAGE" == *-dlss || "$PACKAGE" == DemonsSoulsPC-* ]] && draft="--draft"
+            latest=$([[ "$PACKAGE" == *-pgogen || "$PACKAGE" == *-fsr3 || "$PACKAGE" == *-dlss || "$PACKAGE" == *-fgx3 || "$PACKAGE" == DemonsSoulsPC-* ]] && echo --latest=false || echo --latest)
+            if [ "${{ inputs.publish }}" = "true" ]; then draft=""; latest="--latest"; [ -s "package/$PACKAGE/NOVEDADES.txt" ] && notes="$(cat "package/$PACKAGE/NOVEDADES.txt")"; fi
             gh release create "$tag" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" $draft \
-              --title "$PACKAGE" --notes "$notes" $([[ "$PACKAGE" == *-pgogen || "$PACKAGE" == *-fsr3 || "$PACKAGE" == *-dlss || "$PACKAGE" == *-fgx3 || "$PACKAGE" == DemonsSoulsPC-* ]] && echo --latest=false || echo --latest)
+              --title "$PACKAGE" --notes "$notes" $latest
           fi

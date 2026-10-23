@@ -17,6 +17,7 @@
 #include "loader/demonsSoulsWarp.h"
 #include "loader/gameArgs.h"
 #include "graphics/presentation/videoOut.h"
+#include "local/soft-release.h"
 
 #include <algorithm>
 #include <atomic>
@@ -653,7 +654,9 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 // ReadFile stop short, and the short count went to the game as the read's result.
 static uint32_t ReadIntoGuest(Common::File& f, void* buf, uint32_t nbytes) {
 	constexpr uint32_t                 Chunk = 4u << 20u;
-	thread_local std::vector<uint8_t> bounce;
+	thread_local SoftRelease::Scratch bounce_scratch("guest read bounce");
+	const auto                        bounce_hold = bounce_scratch.Use();
+	auto&                             bounce      = bounce_scratch.bytes;
 	uint32_t                          total = 0;
 	while (total < nbytes) {
 		const uint32_t want = std::min(nbytes - total, Chunk);

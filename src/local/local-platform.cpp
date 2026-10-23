@@ -1,4 +1,5 @@
 #include "local-platform.h"
+#include "guest-lazy-commit.h"
 
 #include <algorithm>
 #include <chrono>
@@ -68,6 +69,14 @@ static uint64_t CpuListMask(const char* list) {
 		p = (*end == ',') ? end + 1 : end;
 	}
 	return mask;
+}
+
+bool LowMemVram() {
+	static const bool on = [] {
+		const char* text = std::getenv("KYTY_LOWMEM_VRAM");
+		return text != nullptr && text[0] == '1';
+	}();
+	return on;
 }
 
 #if defined(_WIN32)
@@ -683,6 +692,7 @@ uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t s
 	at.Offset     = static_cast<DWORD>(offset);
 	at.OffsetHigh = static_cast<DWORD>(offset >> 32u);
 	DWORD got     = 0;
+	GuestLazyCommit::Prefault(buffer, size); // (KYTY_GUEST_LAZY_COMMIT: the kernel's write would fail on a reserved page)
 	if (ReadFile(reinterpret_cast<HANDLE>(file), buffer, size, &got, &at) == 0) return 0;
 	return got;
 }
@@ -1545,6 +1555,13 @@ bool WriteAllocTrace(const char* path) {
 	return true;
 }
 
+CommitUse SystemCommit() {
+	PERFORMANCE_INFORMATION info {};
+	info.cb = sizeof(info);
+	if (K32GetPerformanceInfo(&info, sizeof(info)) == 0) return {};
+	return {static_cast<uint64_t>(info.CommitTotal) * info.PageSize, static_cast<uint64_t>(info.CommitLimit) * info.PageSize};
+}
+
 MemoryUse ProcessMemory() {
 	PROCESS_MEMORY_COUNTERS_EX counters {};
 	counters.cb = sizeof(counters);
@@ -1552,6 +1569,327 @@ MemoryUse ProcessMemory() {
 	                            sizeof(counters)) == 0)
 		return {};
 	return {counters.PrivateUsage, counters.WorkingSetSize};
+}
+
+// Tagged commit (local-platform.h MemoryTag): totals per tag, and the live C++ new blocks of 1 MiB or more (in
+// pages of their own, VirtualAlloc'd as the heap would for that size) by caller.
+namespace MemoryTags {
+std::atomic<int64_t> g_requested[MemoryTagCount] {};
+std::atomic<int64_t> g_committed[MemoryTagCount] {};
+std::atomic<int64_t> g_count[MemoryTagCount] {};
+
+struct Block {
+	uint64_t address; // 0 empty, 1 tombstone
+	uint64_t size;
+	void*    caller;
+};
+constexpr size_t Slots = size_t {1} << 16u;
+SRWLOCK          g_lock   = SRWLOCK_INIT;
+Block*           g_blocks = nullptr;
+size_t           g_used   = 0;
+
+inline size_t Hash(uint64_t address) {
+	return static_cast<size_t>((address >> 4u) * 0x9E3779B97F4A7C15ull >> 48u) & (Slots - 1);
+}
+} // namespace MemoryTags
+
+static std::atomic<uint64_t> g_simulation_ballast {0};
+void SetSimulationBallast(uint64_t bytes) { g_simulation_ballast = bytes; }
+
+bool MemoryTagsEnabled() {
+	// KYTY_MEMORY_TAGS=1 (default off): a regression (black screen after the intro video on an RTX) followed the
+	// hooks being on by default; off, operator new/delete are plain malloc/free and Vulkan memory is not wrapped.
+	static const bool on = [] {
+		const char* text = std::getenv("KYTY_MEMORY_TAGS");
+		return text != nullptr && text[0] == '1';
+	}();
+	return on;
+}
+
+void MemoryTagAdd(int tag, int64_t requested, int64_t committed) {
+	if (tag < 0 || tag >= MemoryTagCount) return;
+	MemoryTags::g_requested[tag].fetch_add(requested, std::memory_order_relaxed);
+	MemoryTags::g_committed[tag].fetch_add(committed, std::memory_order_relaxed);
+	MemoryTags::g_count[tag].fetch_add(requested >= 0 ? 1 : -1, std::memory_order_relaxed);
+}
+
+// (Called by the replaced operator new/delete below.) The block comes from malloc as without tags, only recorded
+// here: a block of 1 MiB or more given by VirtualAlloc (as before 53e9bfe8's fix) was invalid wherever free(),
+// realloc() or another module's allocator released it (a black screen after the intro video on an RTX). A block that
+// free() released stays in the table until its address is recorded again (the summary may then overstate it).
+void* LargeNewAllocate(size_t size, void* caller) {
+	using namespace MemoryTags;
+	void* memory = std::malloc(size);
+	if (memory == nullptr) return nullptr;
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	AcquireSRWLockExclusive(&g_lock);
+	if (g_blocks == nullptr)
+		g_blocks = static_cast<Block*>(VirtualAlloc(nullptr, Slots * sizeof(Block), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	uint64_t replaced = 0;
+	bool     recorded = false;
+	if (g_blocks != nullptr) {
+		size_t tombstone = Slots;
+		size_t i         = Hash(address);
+		for (size_t n = 0; n < Slots; n++, i = (i + 1) & (Slots - 1)) {
+			if (g_blocks[i].address == address) {
+				replaced           = g_blocks[i].size; // (a stale entry: its block was released by free())
+				g_blocks[i]        = {address, size, caller};
+				recorded           = true;
+				break;
+			}
+			if (g_blocks[i].address == 1 && tombstone == Slots) tombstone = i;
+			if (g_blocks[i].address == 0) {
+				if (tombstone == Slots && g_used >= Slots / 2) break; // full: not tracked
+				if (tombstone == Slots) {
+					tombstone = i;
+					g_used++;
+				}
+				g_blocks[tombstone] = {address, size, caller};
+				recorded            = true;
+				break;
+			}
+		}
+	}
+	ReleaseSRWLockExclusive(&g_lock);
+	if (recorded) {
+		if (replaced != 0) MemoryTagAdd(MemoryTagLargeNew, -static_cast<int64_t>(replaced), -static_cast<int64_t>(replaced));
+		MemoryTagAdd(MemoryTagLargeNew, static_cast<int64_t>(size), static_cast<int64_t>(size));
+	}
+	return memory;
+}
+
+// Forgets a recorded block (the caller frees it with free() either way).
+bool LargeNewFree(void* memory) {
+	using namespace MemoryTags;
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	if (address <= 1 || g_blocks == nullptr) return false;
+	// (Most deletes are of small blocks never recorded: a shared look first, so threads do not queue on it.)
+	bool found = false;
+	AcquireSRWLockShared(&g_lock);
+	for (size_t i = Hash(address), n = 0; n < Slots && g_blocks[i].address != 0; i = (i + 1) & (Slots - 1), n++) {
+		if (g_blocks[i].address == address) {
+			found = true;
+			break;
+		}
+	}
+	ReleaseSRWLockShared(&g_lock);
+	if (!found) return false;
+	uint64_t size = 0;
+	AcquireSRWLockExclusive(&g_lock);
+	for (size_t i = Hash(address), n = 0; n < Slots && g_blocks[i].address != 0; i = (i + 1) & (Slots - 1), n++) {
+		if (g_blocks[i].address == address) {
+			size                = g_blocks[i].size;
+			g_blocks[i].address = 1;
+			break;
+		}
+	}
+	ReleaseSRWLockExclusive(&g_lock);
+	if (size == 0) return false;
+	MemoryTagAdd(MemoryTagLargeNew, -static_cast<int64_t>(size), -static_cast<int64_t>(size));
+	return true;
+}
+
+// The module+offset of a code address ("kyty_emulator.exe+0x1c0482"), to look up in the build's .map/.pdb.
+static std::string CallerName(void* caller) {
+	HMODULE module = nullptr;
+	char    name[MAX_PATH] = "?";
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       static_cast<LPCSTR>(caller), &module) != 0 && module != nullptr) {
+		char path[MAX_PATH] {};
+		if (GetModuleFileNameA(module, path, MAX_PATH) != 0) {
+			const char* slash = std::strrchr(path, '\\');
+			std::snprintf(name, sizeof(name), "%s", slash != nullptr ? slash + 1 : path);
+		}
+	}
+	char text[MAX_PATH + 32];
+	std::snprintf(text, sizeof(text), "%s+0x%llx", name,
+	              static_cast<unsigned long long>(reinterpret_cast<uint64_t>(caller) - reinterpret_cast<uint64_t>(module)));
+	return text;
+}
+
+// Live large new blocks summed by caller, largest first; the allocation bases among top_bases annotated.
+static std::vector<std::pair<uint64_t, void*>> LargeNewCallers(const std::set<uint64_t>& top_bases, std::string* annotations) {
+	using namespace MemoryTags;
+	std::vector<std::pair<uint64_t, void*>> callers; // bytes, caller
+	std::unordered_map<void*, uint64_t>     sums;
+	// (Copied out under the lock into room reserved before it: no new or delete while it is held, as those take it.)
+	std::vector<Block> live;
+	live.reserve(Slots / 2 + 1);
+	AcquireSRWLockShared(&g_lock);
+	if (g_blocks != nullptr)
+		for (size_t i = 0; i < Slots && live.size() < live.capacity(); i++)
+			if (g_blocks[i].address > 1) live.push_back(g_blocks[i]);
+	ReleaseSRWLockShared(&g_lock);
+	std::vector<std::pair<uint64_t, void*>> blocks; // address, caller (for the annotations)
+	for (const auto& block: live) {
+		sums[block.caller] += block.size;
+		if (annotations != nullptr && block.size >= (uint64_t {64} << 20u)) blocks.emplace_back(block.address, block.caller);
+	}
+	for (const auto& [address, caller]: blocks) {
+		// (malloc's block sits inside the heap's VirtualAlloc of it: the breakdown lists that allocation's base.)
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != sizeof(info)) continue;
+		const auto base = reinterpret_cast<uint64_t>(info.AllocationBase);
+		if (top_bases.count(base) == 0) continue;
+		*annotations += " 0x";
+		char hex[24];
+		std::snprintf(hex, sizeof(hex), "%llx", static_cast<unsigned long long>(base));
+		*annotations += hex;
+		*annotations += "=new@" + CallerName(caller);
+	}
+	for (const auto& [caller, bytes]: sums) callers.emplace_back(bytes, caller);
+	std::sort(callers.begin(), callers.end(), std::greater<>());
+	return callers;
+}
+
+// " tagged: vulkan device-local N MiB (commit +M MiB, k), ...; new>=1MiB by caller: module+0xrva=N MiB ..."
+static int FormatMemoryTags(char* out, size_t room, const std::set<uint64_t>& top_bases, std::string* annotations) {
+	using namespace MemoryTags;
+	int len = std::snprintf(out, room, "; tagged:");
+	for (int t = 0; t < MemoryTagCount && len > 0 && static_cast<size_t>(len) < room; t++)
+		len += std::snprintf(out + len, room - len, "%s %lld MiB (commit %+lld MiB, %lld)", t == 0 ? "" : ",",
+		                     static_cast<long long>(g_requested[t].load() >> 20), static_cast<long long>(g_committed[t].load() >> 20),
+		                     static_cast<long long>(g_count[t].load()));
+	const auto callers = LargeNewCallers(top_bases, annotations);
+	if (!callers.empty() && len > 0 && static_cast<size_t>(len) < room) len += std::snprintf(out + len, room - len, "; new>=1MiB by caller:");
+	for (size_t i = 0; i < callers.size() && i < 6 && len > 0 && static_cast<size_t>(len) < room - 96; i++)
+		len += std::snprintf(out + len, room - len, " %s=%lluMiB", CallerName(callers[i].second).c_str(),
+		                     static_cast<unsigned long long>(callers[i].first >> 20u));
+	return len;
+}
+
+// KYTY_MEMORY_TAGS=1: one line a report, "Memory tags (30 s): private P MiB = tagged T + untagged U; top callers:
+// name=N MiB ..." - the ten largest holders of private commit known by caller: the Vulkan memory kinds (what their
+// vkAllocateMemory calls added to commit, as one caller each) and the call sites of C++ new of 1 MiB or more (live
+// bytes). "untagged" is the rest: the driver's own pools (pipelines), heap blocks under 1 MiB, malloc/VirtualAlloc.
+static void PrintMemoryTagSummary(unsigned long seconds) {
+	using namespace MemoryTags;
+	static const char* const names[MemoryTagCount] = {"vulkan-device-local", "vulkan-host", "vulkan-ballast", "new>=1MiB"};
+	const uint64_t private_bytes = ProcessMemory().private_bytes;
+	std::vector<std::pair<uint64_t, std::string>> top; // bytes, name
+	int64_t tagged = 0;
+	for (int t = 0; t < MemoryTagCount; t++) {
+		const int64_t committed = std::max<int64_t>(g_committed[t].load(), 0);
+		tagged += committed;
+		if (t != MemoryTagLargeNew && committed > 0) {
+			char label[96];
+			std::snprintf(label, sizeof(label), "%s(%lld allocations, %lld MiB asked)", names[t],
+			              static_cast<long long>(g_count[t].load()), static_cast<long long>(g_requested[t].load() >> 20));
+			top.emplace_back(static_cast<uint64_t>(committed), label);
+		}
+	}
+	for (const auto& [bytes, caller]: LargeNewCallers({}, nullptr)) top.emplace_back(bytes, "new@" + CallerName(caller));
+	std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+	std::string line;
+	char        head[256];
+	const auto  untagged = static_cast<int64_t>(private_bytes) - tagged;
+	std::snprintf(head, sizeof(head), "Memory tags (%lu s): private %llu MiB = tagged %lld MiB + untagged %lld MiB; top callers:", seconds,
+	              static_cast<unsigned long long>(private_bytes >> 20u), static_cast<long long>(tagged >> 20),
+	              static_cast<long long>(untagged / (1 << 20)));
+	line = head;
+	for (size_t i = 0; i < top.size() && i < 10; i++) {
+		char tail[48];
+		std::snprintf(tail, sizeof(tail), "=%lluMiB", static_cast<unsigned long long>(top[i].first >> 20u));
+		line += " " + top[i].second + tail;
+	}
+	std::printf("%s\n", line.c_str());
+	std::fflush(stdout);
+}
+
+// KYTY_MEMORY_BREAKDOWN_SECONDS (default 60, 0 off): where the process's private commit is, from a walk of its
+// address space on a low-priority thread (a few ms per walk, off the game's threads): private committed by kind
+// (process heaps, executable, read-write), mapped (sections: the guest store), and the largest allocations.
+void StartMemoryBreakdown() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		const char* text    = std::getenv("KYTY_MEMORY_BREAKDOWN_SECONDS");
+		// (30 s by default with KYTY_MEMORY_TAGS=1, the tagged summary's period.)
+		const auto  seconds = text != nullptr ? std::strtoul(text, nullptr, 10) : MemoryTagsEnabled() ? 30ul : 60ul;
+		if (seconds == 0) return;
+		std::thread([seconds] {
+			SetThreadDescription(GetCurrentThread(), L"Kyty.MemoryBreakdown");
+			SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+			for (;;) {
+				std::this_thread::sleep_for(std::chrono::seconds(seconds));
+				std::set<uint64_t> heaps;
+				{
+					HANDLE handles[256];
+					const DWORD n = GetProcessHeaps(256, handles);
+					for (DWORD i = 0; i < n && i < 256; i++) {
+						MEMORY_BASIC_INFORMATION h {};
+						if (VirtualQuery(handles[i], &h, sizeof(h)) == sizeof(h))
+							heaps.insert(reinterpret_cast<uint64_t>(h.AllocationBase));
+					}
+				}
+				std::map<uint64_t, std::pair<uint64_t, DWORD>> bases; // allocation base -> committed private, its protection
+				uint64_t heap = 0, exec = 0, rw = 0, other = 0, mapped = 0, image = 0, regions = 0;
+				MEMORY_BASIC_INFORMATION info {};
+				for (uint64_t at = 0x10000; VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) == sizeof(info);) {
+					const uint64_t size = info.RegionSize;
+					regions++;
+					if (info.State == MEM_COMMIT) {
+						if (info.Type == MEM_PRIVATE) {
+							const auto base = reinterpret_cast<uint64_t>(info.AllocationBase);
+							auto&      entry = bases[base];
+							entry.first += size;
+							entry.second = info.AllocationProtect;
+							if (heaps.count(base) != 0) heap += size;
+							else if ((info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) exec += size;
+							else if ((info.Protect & PAGE_READWRITE) != 0) rw += size;
+							else other += size;
+						} else if (info.Type == MEM_MAPPED) {
+							mapped += size;
+						} else if (info.Type == MEM_IMAGE) {
+							image += size;
+						}
+					}
+					const uint64_t next = reinterpret_cast<uint64_t>(info.BaseAddress) + size;
+					if (next <= at) break;
+					at = next;
+				}
+				std::vector<std::pair<uint64_t, uint64_t>> top; // committed, base
+				top.reserve(bases.size());
+				for (const auto& [base, entry]: bases) top.emplace_back(entry.first, base);
+				std::sort(top.begin(), top.end(), std::greater<>());
+				char line[1024];
+				int  len = std::snprintf(line, sizeof(line),
+				                         "Private breakdown: heaps %llu MiB, executable %llu MiB, read-write %llu MiB, other %llu "
+				                         "MiB (%zu allocations, %llu regions); mapped views %llu MiB (guest store, not commit "
+				                         "when file-backed), images %llu MiB; largest:",
+				                         static_cast<unsigned long long>(heap >> 20u), static_cast<unsigned long long>(exec >> 20u),
+				                         static_cast<unsigned long long>(rw >> 20u), static_cast<unsigned long long>(other >> 20u),
+				                         bases.size(), static_cast<unsigned long long>(regions),
+				                         static_cast<unsigned long long>(mapped >> 20u), static_cast<unsigned long long>(image >> 20u));
+				for (size_t i = 0; i < top.size() && i < 8 && len > 0 && len < static_cast<int>(sizeof(line)) - 64; i++)
+					len += std::snprintf(line + len, sizeof(line) - len, " 0x%llx=%lluMiB%s",
+					                     static_cast<unsigned long long>(top[i].second),
+					                     static_cast<unsigned long long>(top[i].first >> 20u),
+					                     heaps.count(top[i].second) != 0 ? "(heap)" : "");
+				// Size buckets of the allocations: many mid-size ones are a pool or the driver, one huge one a store.
+				uint64_t small_b = 0, mid_b = 0, large_b = 0;
+				for (const auto& [committed, base]: top) (committed < (1u << 20u) ? small_b : committed < (64u << 20u) ? mid_b : large_b) += committed;
+				std::set<uint64_t> top_bases;
+				for (size_t i = 0; i < top.size() && i < 8; i++) top_bases.insert(top[i].second);
+				char        tags[1024];
+				std::string annotations;
+				tags[0] = '\0';
+				if (MemoryTagsEnabled() && FormatMemoryTags(tags, sizeof(tags), top_bases, &annotations) <= 0) tags[0] = '\0';
+				if (const uint64_t ballast = g_simulation_ballast.load(); ballast != 0) {
+					const size_t used = std::strlen(tags);
+					std::snprintf(tags + used, sizeof(tags) - used,
+					              "; KYTY_SIMULATE_VRAM_MB ballast %llu MiB of video memory held (its driver commit is the "
+					              "test's: not a measurement of a real card)",
+					              static_cast<unsigned long long>(ballast >> 20u));
+				}
+				std::printf("%s; by allocation size: <1 MiB %llu MiB, 1-64 MiB %llu MiB, >=64 MiB %llu MiB%s%s%s\n", line,
+				            static_cast<unsigned long long>(small_b >> 20u), static_cast<unsigned long long>(mid_b >> 20u),
+				            static_cast<unsigned long long>(large_b >> 20u), tags,
+				            annotations.empty() ? "" : "; largest that are new:", annotations.c_str());
+				std::fflush(stdout);
+				if (MemoryTagsEnabled()) PrintMemoryTagSummary(seconds);
+			}
+		}).detach();
+	});
 }
 
 static std::atomic<void (*)(void (*)())> g_trim_runner {nullptr};
@@ -1583,6 +1921,12 @@ void StartWorkingSetTrim() {
 		const char* text    = std::getenv("KYTY_TRIM_RAM_SECONDS");
 		const auto  seconds = text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul;
 		if (seconds == 0) return;
+		// KYTY_SOFT_RELEASE=1: no working set trim at all (it pages out; soft-release.cpp gives RAM back without it).
+		if (const char* soft = std::getenv("KYTY_SOFT_RELEASE"); soft != nullptr && soft[0] == '1') {
+			std::printf("RAM trim: off (KYTY_SOFT_RELEASE=1)\n");
+			std::fflush(stdout);
+			return;
+		}
 		// KYTY_TRIM_RAM_MB (default 8192): only a working set past it is emptied. Emptying it every minute
 		// regardless re-faulted the 4-5 GB the game touches in a minute each time (10-10, 1-1 to the boss).
 		const char* limit_text = std::getenv("KYTY_TRIM_RAM_MB");
@@ -2005,6 +2349,10 @@ bool WriteAllocTrace(const char*) {
 	return false;
 }
 
+CommitUse SystemCommit() {
+	return {};
+}
+
 MemoryUse ProcessMemory() {
 	// statm: total, resident, shared pages; private resident = resident - shared.
 	MemoryUse use;
@@ -2022,6 +2370,10 @@ MemoryUse ProcessMemory() {
 
 void StartWorkingSetTrim() {}
 void KeepResident() {}
+void StartMemoryBreakdown() {}
+void SetSimulationBallast(uint64_t) {}
+bool MemoryTagsEnabled() { return false; }
+void MemoryTagAdd(int, int64_t, int64_t) {}
 void SetTrimRunner(void (*)(void (*)())) {}
 
 uint64_t PhysicalMemory() {
@@ -2081,3 +2433,58 @@ size_t ReadableBytes(const void* address, size_t size) noexcept {
 #endif
 }
 } // namespace LocalPlatform
+
+#if defined(_WIN32)
+// C++ new of 1 MiB or more, tracked by caller for the breakdown (LocalPlatform::MemoryTagAdd): its own pages, as the
+// heap gives a block that big anyway (a VirtualAlloc per block); delete tells such a block by its 64 KiB alignment
+// and the table. The aligned forms are left to the runtime.
+#include <intrin.h>
+#include <new>
+namespace LocalPlatform {
+void* LargeNewAllocate(size_t size, void* caller);
+bool  LargeNewFree(void* memory);
+} // namespace LocalPlatform
+
+static void* KytyNew(size_t size, void* caller, bool nothrow) {
+	if (size >= (size_t {1} << 20u) && LocalPlatform::MemoryTagsEnabled()) {
+		if (void* memory = LocalPlatform::LargeNewAllocate(size, caller); memory != nullptr) return memory;
+	}
+	for (;;) {
+		if (void* memory = std::malloc(size != 0 ? size : 1); memory != nullptr) return memory;
+		std::new_handler handler = std::get_new_handler();
+		if (handler == nullptr) {
+			if (nothrow) return nullptr;
+			throw std::bad_alloc();
+		}
+		handler();
+	}
+}
+static void KytyDelete(void* memory) {
+	if (memory == nullptr) return;
+	if (LocalPlatform::MemoryTagsEnabled()) (void)LocalPlatform::LargeNewFree(memory);
+	std::free(memory);
+}
+
+void* operator new(size_t size) { return KytyNew(size, _ReturnAddress(), false); }
+void* operator new[](size_t size) { return KytyNew(size, _ReturnAddress(), false); }
+void* operator new(size_t size, const std::nothrow_t&) noexcept {
+	try {
+		return KytyNew(size, _ReturnAddress(), true);
+	} catch (...) {
+		return nullptr;
+	}
+}
+void* operator new[](size_t size, const std::nothrow_t&) noexcept {
+	try {
+		return KytyNew(size, _ReturnAddress(), true);
+	} catch (...) {
+		return nullptr;
+	}
+}
+void operator delete(void* memory) noexcept { KytyDelete(memory); }
+void operator delete[](void* memory) noexcept { KytyDelete(memory); }
+void operator delete(void* memory, size_t) noexcept { KytyDelete(memory); }
+void operator delete[](void* memory, size_t) noexcept { KytyDelete(memory); }
+void operator delete(void* memory, const std::nothrow_t&) noexcept { KytyDelete(memory); }
+void operator delete[](void* memory, const std::nothrow_t&) noexcept { KytyDelete(memory); }
+#endif

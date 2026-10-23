@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 #include "fresh-memory.h"
+#include "guest-lazy-commit.h"
 #include "texture-offload.h"
 #include "async-upload.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -44,6 +45,7 @@
 #include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 #include "speculation-state.h"
+#include "soft-release.h"
 
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_image_granules_mode {0};
@@ -2369,7 +2371,10 @@ void DirtyRowBands(const std::vector<std::pair<uint64_t, uint64_t>>& dirty, uint
 	if (const auto* data = LibKernel::Memory::TryGetBackingPointer(vaddr, size)) {
 		return XXH3_64bits(data, static_cast<size_t>(size));
 	}
-	thread_local std::vector<uint8_t> bytes;
+	// (A copy of the texture's guest bytes, up to hundreds of MiB, kept by the thread: KYTY_SOFT_RELEASE frees it idle.)
+	thread_local SoftRelease::Scratch scratch("texture hash copy");
+	const auto                        hold  = scratch.Use();
+	auto&                             bytes = scratch.bytes;
 	bytes.resize(size);
 	if (!LibKernel::Memory::TryReadBacking(vaddr, bytes.data(), size) &&
 	    !LibKernel::Memory::TryReadPrtBacking(vaddr, bytes.data(), size)) {
@@ -5012,6 +5017,28 @@ void TextureCache::RunGarbageCollector() {
 		// Where the video memory goes (VMA's allocations by memory kind, the driver's own) and the buffer cache's
 		// share: on a 16 GB card the use climbed past the 10 GB budget while the texture collector deleted images.
 		std::printf("Buffer cache: %llu MiB registered\n", static_cast<unsigned long long>(m_buffer_cache.CacheBytes() >> 20u));
+		// The commit side (16 GB PCs rebooted at the commit limit, not at full RAM): the system's charge and limit,
+		// and the guest backing store's share of it (0 when it is file-backed: KYTY_BACKING_FILE).
+		{
+			const auto commit  = LocalPlatform::SystemCommit();
+			const char* file   = std::getenv("KYTY_BACKING_FILE");
+			const char* demand = std::getenv("KYTY_BACKING_ON_DEMAND");
+			const bool  in_file = file != nullptr && file[0] != '\0' && !(file[0] == '0' && file[1] == '\0');
+			std::printf("Commit: system %llu of %llu MiB; emulator private %llu MiB, working set %llu MiB, Vulkan system "
+			            "RAM %llu MiB, buffer cache %llu MiB; guest backing %s (13824 MiB store)\n",
+			            static_cast<unsigned long long>(commit.total >> 20u),
+			            static_cast<unsigned long long>(commit.limit >> 20u),
+			            static_cast<unsigned long long>(private_bytes >> 20u), static_cast<unsigned long long>(working_set >> 20u),
+			            static_cast<unsigned long long>(m_graphics.GetHostMemoryUsage() >> 20u),
+			            static_cast<unsigned long long>(m_buffer_cache.CacheBytes() >> 20u),
+			            in_file ? "file (see the Guest memory line at launch)"
+			            : GuestLazyCommit::Enabled() ? "page file, committed at first touch (KYTY_GUEST_LAZY_COMMIT)"
+			            : (demand != nullptr && demand[0] == '1') ? "page file, on demand" : "page file, all committed");
+			// KYTY_GUEST_LAZY_COMMIT: the store's committed share, its commit calls and their time.
+			if (const auto* fresh = FreshMemory::Get())
+				GuestLazyCommit::Report(fresh->faults.load() + fresh->marked.load(), fresh->watched_bytes.load());
+			else GuestLazyCommit::Report(0, 0);
+		}
 		m_graphics.LogVideoMemory("30 s");
 		std::fflush(stdout);
 	}

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__clang__)
@@ -28,6 +29,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "live-counters.h"
 #include "local-platform.h"
+#include "soft-release.h"
 
 #include <cstdio>
 #include "kytyGitVersion.h"
@@ -44,6 +46,8 @@ static VmaAllocator          g_report_allocator = nullptr;
 static const GraphicContext* g_report_context   = nullptr;
 // Freed images kept for reuse (KYTY_IMAGE_POOL): at most 1 GiB, and a 16th of the GPU's memory budget.
 static uint64_t g_image_pool_limit = 1024ull << 20;
+static std::mutex g_image_pool_mutex;
+static uint64_t   g_image_pool_bytes = 0;
 static void WriteVmaReport(const char* path) {
 	if (g_report_allocator == nullptr) return;
 	if (g_report_context != nullptr) g_report_context->LogVideoMemory("live");
@@ -56,6 +60,69 @@ static void WriteVmaReport(const char* path) {
 	vmaFreeStatsString(g_report_allocator, json);
 }
 
+// Tagged commit of Vulkan memory (LocalPlatform::MemoryTagAdd): every vkAllocateMemory (VMA's, the ballast's, the
+// stream buffers') with the process's private commit before and after it, serialized so that the delta is its own
+// (other threads' allocations meanwhile still add noise). NVIDIA's Windows driver can charge device-local memory to
+// the process's commit as well: this tells how much, by kind, in the "Private breakdown:" line.
+namespace {
+PFN_vkAllocateMemory           g_real_allocate = nullptr;
+PFN_vkFreeMemory               g_real_free     = nullptr;
+VkPhysicalDeviceMemoryProperties g_memory_properties {};
+std::mutex                     g_tag_mutex;
+std::atomic<bool>              g_tag_ballast {false};
+struct TaggedMemory {
+	int     tag;
+	int64_t requested, committed;
+};
+std::unordered_map<uint64_t, TaggedMemory>* g_tagged = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL TaggedAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info,
+                                                    const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+	std::lock_guard lock(g_tag_mutex);
+	const auto before = LocalPlatform::ProcessMemory().private_bytes;
+	const auto result = g_real_allocate(device, info, callbacks, memory);
+	const auto after  = LocalPlatform::ProcessMemory().private_bytes;
+	if (result == VK_SUCCESS && memory != nullptr && *memory != VK_NULL_HANDLE && info != nullptr) {
+		const auto flags = info->memoryTypeIndex < g_memory_properties.memoryTypeCount
+		                       ? g_memory_properties.memoryTypes[info->memoryTypeIndex].propertyFlags
+		                       : 0u;
+		const int tag = g_tag_ballast.load() ? LocalPlatform::MemoryTagVulkanBallast
+		                : (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? LocalPlatform::MemoryTagVulkanDeviceLocal
+		                                                                     : LocalPlatform::MemoryTagVulkanHost;
+		const TaggedMemory entry {tag, static_cast<int64_t>(info->allocationSize),
+		                          after > before ? static_cast<int64_t>(after - before) : 0};
+		if (g_tagged == nullptr) g_tagged = new std::unordered_map<uint64_t, TaggedMemory>();
+		(*g_tagged)[reinterpret_cast<uint64_t>(*memory)] = entry;
+		LocalPlatform::MemoryTagAdd(entry.tag, entry.requested, entry.committed);
+	}
+	return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL TaggedFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* callbacks) {
+	{
+		std::lock_guard lock(g_tag_mutex);
+		if (g_tagged != nullptr && memory != VK_NULL_HANDLE) {
+			if (auto it = g_tagged->find(reinterpret_cast<uint64_t>(memory)); it != g_tagged->end()) {
+				LocalPlatform::MemoryTagAdd(it->second.tag, -it->second.requested, -it->second.committed);
+				g_tagged->erase(it);
+			}
+		}
+	}
+	g_real_free(device, memory, callbacks);
+}
+
+void InstallMemoryTags(VkPhysicalDevice physical_device) {
+	if (!LocalPlatform::MemoryTagsEnabled() || g_real_allocate != nullptr) return;
+	auto& dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+	if (dispatcher.vkAllocateMemory == nullptr || dispatcher.vkFreeMemory == nullptr) return;
+	dispatcher.vkGetPhysicalDeviceMemoryProperties(physical_device, &g_memory_properties);
+	g_real_allocate             = dispatcher.vkAllocateMemory;
+	g_real_free                 = dispatcher.vkFreeMemory;
+	dispatcher.vkAllocateMemory = TaggedAllocateMemory;
+	dispatcher.vkFreeMemory     = TaggedFreeMemory;
+}
+} // namespace
+
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(instance == nullptr || physical_device == nullptr || device == nullptr ||
@@ -64,6 +131,11 @@ bool GraphicContext::CreateAllocator() {
 	VmaVulkanFunctions functions {};
 	functions.vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
 	functions.vkGetDeviceProcAddr   = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+	InstallMemoryTags(static_cast<VkPhysicalDevice>(physical_device));
+	if (g_real_allocate != nullptr) {
+		functions.vkAllocateMemory = TaggedAllocateMemory;
+		functions.vkFreeMemory     = TaggedFreeMemory;
+	}
 
 	VmaAllocatorCreateInfo info {};
 	info.instance         = instance;
@@ -79,7 +151,7 @@ bool GraphicContext::CreateAllocator() {
 	// the game's streaming left 21 blocks of 256 MiB with 2.7 GB free inside them at Boletaria (11.9 GB held of
 	// which 8.9 in use); smaller blocks hold less around each straggler. KYTY_VMA_BLOCK_MB=<n> for an A/B.
 	{
-		uint64_t block_mb = 64;
+		uint64_t block_mb = LocalPlatform::LowMemVram() ? 32 : 64;
 		if (const char* text = std::getenv("KYTY_VMA_BLOCK_MB"); text != nullptr && std::strtoull(text, nullptr, 10) > 0)
 			block_mb = std::strtoull(text, nullptr, 10);
 		info.preferredLargeHeapBlockSize = block_mb << 20u;
@@ -122,6 +194,7 @@ bool GraphicContext::CreateAllocator() {
 			if (candidate.heapIndex == heap && candidate.propertyFlags == vk::MemoryPropertyFlagBits::eDeviceLocal) type = i;
 		}
 		const uint64_t size = physical_device_memory_properties.memoryHeaps[heap].size;
+		g_tag_ballast = true;
 		for (uint64_t left = simulated > 0 && simulated < size ? size - simulated : 0; left > 0 && type != UINT32_MAX;) {
 			const uint64_t                    chunk = std::min<uint64_t>(left, uint64_t {1} << 30u);
 			vk::MemoryPriorityAllocateInfoEXT priority {};
@@ -136,6 +209,8 @@ bool GraphicContext::CreateAllocator() {
 			simulation_ballast_bytes += chunk;
 			left -= chunk;
 		}
+		g_tag_ballast = false;
+		LocalPlatform::SetSimulationBallast(simulation_ballast_bytes);
 		std::printf("Simulated video memory: %" PRIu64 " MiB of heap %u (%" PRIu64 " MiB) taken, priorities %s\n",
 		            simulation_ballast_bytes >> 20u, heap, size >> 20u, memory_priority_enabled ? "on" : "off");
 	}
@@ -151,7 +226,9 @@ bool GraphicContext::CreateAllocator() {
 	const char* small_env = std::getenv("KYTY_SMALL_VRAM");
 	small_video_memory = GetTotalMemoryBudget(false) < (uint64_t {12} << 30u) || (small_env != nullptr && *small_env == '1');
 	LocalPlatform::StartWorkingSetTrim();
+	SoftRelease::Start();
 	LocalPlatform::KeepResident();
+	LocalPlatform::StartMemoryBreakdown();
 	// The game buffers' pool (graphicContext.h): VMA's device-local type for them, VMA's block sizes (dedicated memory
 	// for big ones, as in the default pools).
 	if (const char* defrag = std::getenv("KYTY_BUFFER_DEFRAG");
@@ -174,7 +251,7 @@ bool GraphicContext::CreateAllocator() {
 	g_report_allocator          = allocator;
 	g_report_context            = this;
 	LiveCounters::g_vma_report = WriteVmaReport;
-	g_image_pool_limit         = std::min<uint64_t>(1024ull << 20, GetTotalMemoryBudget() / 32);
+	g_image_pool_limit         = std::min<uint64_t>(LocalPlatform::LowMemVram() ? 256ull << 20 : 1024ull << 20, GetTotalMemoryBudget() / 32);
 	{
 		// The caches' video memory budget, in the run log with the build (to tell builds apart in a log).
 		uint64_t local = 0;
@@ -271,6 +348,32 @@ void GraphicContext::LogVideoMemory(const char* label) const {
 	            " MiB, host-visible %" PRIu64 " MiB)\n",
 	            label, video >> 20u, budget >> 20u, local >> 20u, plain_in_video >> 20u, driver >> 20u, shared >> 20u,
 	            plain_in_system >> 20u, host >> 20u);
+	if (std::strcmp(label, "30 s") == 0) {
+		// By category: the freed images kept for reuse, the game buffers' own pool, the rest of VMA's device-local
+		// memory (textures and render targets of the texture cache, effect and upscaler images, stream rings).
+		uint64_t pool_bytes = 0;
+		{
+			std::scoped_lock lock(g_image_pool_mutex);
+			pool_bytes = g_image_pool_bytes;
+		}
+		VmaStatistics buffers {};
+		if (game_buffer_pool != nullptr) vmaGetPoolStatistics(allocator, game_buffer_pool, &buffers);
+		const uint64_t used_local = [&] {
+			uint64_t used = 0;
+			for (uint32_t type = 0; type < properties.memoryTypeCount; type++)
+				if (properties.memoryTypes[type].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)
+					used += statistics.memoryType[type].statistics.allocationBytes;
+			return used;
+		}();
+		const uint64_t other = used_local - std::min(used_local, pool_bytes + buffers.allocationBytes);
+		std::printf("Video memory by category (30 s): game buffer pool %" PRIu64 " MiB (blocks %" PRIu64
+		            "), image reuse pool %" PRIu64 " MiB, images and other device-local %" PRIu64
+		            " MiB, free inside VMA blocks %" PRIu64 " MiB, driver %" PRIu64 " MiB, room under the budget %" PRId64
+		            " MiB\n",
+		            buffers.allocationBytes >> 20u, buffers.blockBytes >> 20u, pool_bytes >> 20u, other >> 20u,
+		            (local - std::min(local, used_local)) >> 20u, driver >> 20u,
+		            (static_cast<int64_t>(budget) - static_cast<int64_t>(video)) / (1 << 20));
+	}
 	std::fflush(stdout);
 }
 
@@ -375,6 +478,11 @@ uint64_t GraphicContext::GetTotalMemoryBudget(bool capped) const {
 		constexpr uint64_t GiB = 1024ull * 1024 * 1024;
 		// 8 GB at most: a 16 GB card with the desktop, an overlay and a browser stayed near 15 GB in use at 10 GB.
 		if (local > 4 * GiB) result = std::min(result, std::min(local - 3 * GiB, 8 * GiB));
+		// KYTY_LOWMEM_VRAM=1: at most 6 GB, the GPU's memory less 4 GB (not below 3 GB), only on cards above 8.5 GB.
+		// On 8 GB it gave 4096 instead of the default 5120 and hitched far more (simulated 8 GB: 25-97 hitch windows
+		// at 4096 against 3-17 in most runs at 5120): the collector then deletes and re-uploads textures mid-play.
+		if (LocalPlatform::LowMemVram() && local > 8 * GiB + GiB / 2)
+			result = std::min(result, std::max(std::min(local - 4 * GiB, 6 * GiB), 3 * GiB));
 		return result;
 	}
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
@@ -398,9 +506,7 @@ struct PooledImage {
 	VmaAllocation            allocation = nullptr;
 	uint64_t                 bytes      = 0;
 };
-std::mutex               g_image_pool_mutex;
 std::vector<PooledImage> g_image_pool;
-uint64_t                 g_image_pool_bytes = 0;
 
 std::array<uint32_t, 10> ImagePoolKey(const vk::ImageCreateInfo& info) {
 	return {static_cast<uint32_t>(static_cast<VkImageCreateFlags>(info.flags)), static_cast<uint32_t>(info.imageType),
@@ -492,7 +598,11 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	// 22 fps, textures yielding: ~45). It counts that type under the video memory heap: on 8 GB, half is reached
 	// before the first texture.
 	const bool texture = IsTextureUsage(image_info.usage);
-	if (texture && small_video_memory && GetDeviceMemoryUsage() >= GetTotalMemoryBudget(false) / 2) {
+	// KYTY_LOWMEM_VRAM=1: no redirect. The plain type's allocations are a second pool outside the caches' budget
+	// (2593 MiB of it at 4096 budget on a simulated 8 GB card, the process's private commit +4.6 GB, NVIDIA charging
+	// it to commit); device-local textures stay under the budget the caches collect to.
+	if (texture && small_video_memory && !LocalPlatform::LowMemVram() &&
+	    GetDeviceMemoryUsage() >= GetTotalMemoryBudget(false) / 2) {
 		alloc_info.requiredFlags = 0;
 		alloc_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	}

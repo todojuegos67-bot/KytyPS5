@@ -1514,6 +1514,37 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.vs_input_info.stage.program != nullptr) FrameGen::NoteShader(state.vs_input_info.stage.program->shader_hash, 'v');
 	if (state.ps_active && state.ps_input_info.stage.program != nullptr)
 		FrameGen::NoteShader(state.ps_input_info.stage.program->shader_hash, 'p');
+	if (FrameGen::ContactShadowsWanted() && state.vs_input_info.stage.program != nullptr) {
+		const auto& info   = state.depth_info.desc.info;
+		const bool  target = state.depth_info.image_id && state.color_count == 0 && info.resources.layers >= 4 &&
+		                    info.extent.width == info.extent.height && info.extent.width >= 512;
+		FrameGen::OnShadowDraw(state.vs_input_info.stage.program->shader_hash, state.vs_input_info.stage.resources.flattened_srt,
+		                       target);
+	}
+	if (FrameGen::SsrWanted() && state.vs_input_info.stage.program != nullptr) {
+		// (KYTY_SSR, read only: the camera for its up direction, and the G-buffer draws' color targets.)
+		const uint64_t vs_hash = state.vs_input_info.stage.program->shader_hash;
+		FrameGen::OnSsrDraw(vs_hash, state.vs_input_info.stage.resources.flattened_srt);
+		if (FrameGen::IsGbufferVertexShader(vs_hash) && state.color_count > 0) {
+			std::array<FrameGen::SsrTarget, RENDER_COLOR_ATTACHMENTS_MAX> targets {};
+			uint32_t                                                     n = 0;
+			for (uint32_t i = 0; i < state.color_count && i < RENDER_COLOR_ATTACHMENTS_MAX; ++i) {
+				const auto& color = state.color_info[i];
+				auto&       t     = targets[n++];
+				const auto  ext   = color.Extent();
+				t.id      = color.image_id;
+				t.address = color.desc.info.data.address;
+				t.width   = ext.width;
+				t.height  = ext.height;
+				t.view    = color.desc.view_info;
+			}
+			FrameGen::OnSsrGbuffer(vs_hash,
+			                       state.ps_active && state.ps_input_info.stage.program != nullptr
+			                           ? state.ps_input_info.stage.program->shader_hash
+			                           : 0,
+			                       std::span<const FrameGen::SsrTarget>(targets.data(), n));
+		}
+	}
 	if (FrameGen::Capturing() && state.vs_input_info.stage.program != nullptr) {
 		FrameGen::OnDraw(state.vs_input_info.stage.program->shader_hash,
 		                 state.vs_input_info.stage.resources.flattened_srt);
