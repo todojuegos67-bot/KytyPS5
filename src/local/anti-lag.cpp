@@ -102,6 +102,12 @@ void Mark(int32_t stage, uint64_t index) {
 }
 } // namespace
 
+bool StreamlineReflex() {
+	// Streamline configures Reflex only for DLSS-G; with DLSS super resolution alone (FSR 3 frame generation or none)
+	// nothing would limit the queue: VK_NV_low_latency2 is used directly then.
+	return FrameGen::StreamlineLoaded() && FrameGen::GeneratedFrames() > 0;
+}
+
 bool Requested() {
 	static const bool requested = [] {
 		const char* v = std::getenv("KYTY_ANTILAG");
@@ -128,8 +134,8 @@ void OnDevice(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool extensio
 	const char* text   = nullptr;
 	if (!Requested()) {
 		text = "Anti-Lag: off (KYTY_ANTILAG=0)";
-	} else if (FrameGen::StreamlineLoaded()) {
-		text = "Anti-Lag: off (NVIDIA Streamline loaded: Reflex is active)";
+	} else if (StreamlineReflex()) {
+		text = "Anti-Lag: off (NVIDIA Streamline DLSS-G loaded: its Reflex is active)";
 	} else {
 		if (extension_enabled && get_proc != nullptr)
 			g_update = reinterpret_cast<UpdateFn>(get_proc(static_cast<VkDevice>(device), "vkAntiLagUpdateAMD"));

@@ -1614,10 +1614,11 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(Libs::Graphics::AntiLag::ExtensionName());
 		// KYTY_ANTILAG=1 on NVIDIA without Streamline (whose Reflex is then active): VK_NV_low_latency2 and the
 		// present-id extension it needs.
-		if (Libs::Graphics::AntiLag::Requested() && !FrameGen::StreamlineLoaded() &&
+		if (Libs::Graphics::AntiLag::Requested() && !Libs::Graphics::AntiLag::StreamlineReflex() &&
 		    HasExtension(available_extensions, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
-			device_extensions.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+			if (!HasExtension(device_extensions, VK_NV_LOW_LATENCY_2_EXTENSION_NAME))
+				device_extensions.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
 			if (!HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME))
 				device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
 		}
@@ -1808,10 +1809,11 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 			device_extensions.push_back(Libs::Graphics::AntiLag::ExtensionName());
 		// KYTY_ANTILAG=1 on NVIDIA without Streamline (whose Reflex is then active): VK_NV_low_latency2 and the
 		// present-id extension it needs.
-		if (Libs::Graphics::AntiLag::Requested() && !FrameGen::StreamlineLoaded() &&
+		if (Libs::Graphics::AntiLag::Requested() && !Libs::Graphics::AntiLag::StreamlineReflex() &&
 		    HasExtension(available_extensions, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
-			device_extensions.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+			if (!HasExtension(device_extensions, VK_NV_LOW_LATENCY_2_EXTENSION_NAME))
+				device_extensions.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
 			if (!HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME))
 				device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
 		}

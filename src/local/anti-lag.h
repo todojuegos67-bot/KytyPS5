@@ -21,6 +21,7 @@
 namespace Libs::Graphics::AntiLag {
 
 [[nodiscard]] bool        Requested();           // KYTY_ANTILAG=1 (and no Streamline)
+[[nodiscard]] bool        StreamlineReflex();    // Streamline DLSS-G owns Reflex (Anti-Lag then off)
 [[nodiscard]] const char* ExtensionName();        // "VK_AMD_anti_lag"
 // Device creation: its feature structure chained before `next` when `enabled` (the extension in the list).
 void* ChainDeviceFeatures(bool enabled, void* next);
