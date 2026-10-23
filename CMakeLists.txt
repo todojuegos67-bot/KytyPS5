@@ -439,6 +439,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${ssr_header}")
 
+# KYTY_RT_REFLECTIONS: screen-space ray-traced reflections with denoising before the upscaler (src/local/rt-reflections.cpp).
+set(rt_reflections_source "${KYTY_SOURCE_DIR}/local/rt-reflections.comp")
+set(rt_reflections_spv "${gpu_tiler_generated_dir}/rt_reflections.spv")
+set(rt_reflections_header "${gpu_tiler_generated_dir}/rt_reflections_spv.h")
+add_custom_command(
+	OUTPUT "${rt_reflections_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rt_reflections_spv}" "${rt_reflections_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_reflections_spv} -DOUTPUT=${rt_reflections_header}
+	        -DSYMBOL=RT_REFLECTIONS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rt_reflections_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rt_reflections_header}")
+
 # KYTY_CONTACT_SHADOWS: screen-space contact shadows before the upscaler (src/local/frame-gen.cpp).
 set(cshadow_source "${KYTY_SOURCE_DIR}/local/cshadow.comp")
 set(cshadow_spv "${gpu_tiler_generated_dir}/cshadow.spv")
@@ -519,6 +535,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/dyn-multiplier.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-reflections.h"
+	"${KYTY_SOURCE_DIR}/local/rt-reflections.cpp"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.cpp"
 	"${KYTY_SOURCE_DIR}/local/anti-lag.h"

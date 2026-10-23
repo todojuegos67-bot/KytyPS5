@@ -24,6 +24,7 @@
 #include "gpu_tiler_shaders/ssgi_spv.h"
 #include "gpu_tiler_shaders/gtao_spv.h"
 #include "gpu_tiler_shaders/ssr_spv.h"
+#include "local/rt-reflections.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
 #include "kernel/memory.h"
 #include <string>
@@ -4797,6 +4798,8 @@ struct SsrGbuffer {
 	bool                        have_vp = false;
 	uint64_t                    vp_flip = ~0ull;
 	std::array<uint64_t, 2>     packed_addresses {};   // the packed layers' last two addresses (double-buffered)
+	std::array<float, 16>       prev_view_proj {};     // the previous frame's (rows x, y, w; z from the current)
+	bool                        have_prev = false;
 } g_ssr_gb;
 
 bool SsrEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
@@ -5361,7 +5364,8 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 }
 } // namespace
 
-bool SsrWanted() { return SsrLevel() > 0; }
+bool SsrWanted() { return SsrLevel() > 0 || RtReflectionsWanted(); }
+bool SsrPassWanted() { return SsrLevel() > 0; }
 
 void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 	if (!IsGbufferVertexShader(vs_hash) || srt.size() < SrtViewProj + 16) return;
@@ -5376,6 +5380,21 @@ void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 	g_ssr_gb.view_proj = vp;
 	g_ssr_gb.have_vp   = true;
 	g_ssr_gb.vp_flip   = flip;
+	// (KYTY_RT_REFLECTIONS: the previous frame's rows x, y and w for the reflections' reprojection)
+	g_ssr_gb.have_prev = false;
+	if (srt.size() >= SrtPrevViewProj + 12) {
+		std::array<float, 16> pv {};
+		for (uint32_t i = 0; i < 4; ++i) {
+			pv[i]      = AsFloat(srt[SrtPrevViewProj + i]);
+			pv[4 + i]  = AsFloat(srt[SrtPrevViewProj + 4 + i]);
+			pv[8 + i]  = vp[8 + i];
+			pv[12 + i] = AsFloat(srt[SrtPrevViewProj + 8 + i]);
+		}
+		if (std::all_of(pv.begin(), pv.end(), [](float v) { return std::isfinite(v); })) {
+			g_ssr_gb.prev_view_proj = pv;
+			g_ssr_gb.have_prev      = true;
+		}
+	}
 }
 
 void OnSsrGbuffer(uint64_t vs_hash, uint64_t ps_hash, std::span<const SsrTarget> targets) {
@@ -5450,7 +5469,7 @@ void SsrCaptureSkip(const char* reason, uint64_t cs_hash) {
 
 void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
                        std::span<const TextureBinding> images) {
-	if (SsrLevel() == 0 || g_ssr.copy_failed) return;
+	if (!SsrWanted() || g_ssr.copy_failed) return;
 	if (g_graphics_ctx == nullptr) g_graphics_ctx = &graphics;
 	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
 	if (g_ssr.copy_flip.load(std::memory_order_relaxed) == flip) return; // (once a frame: the first consumer)
@@ -5582,6 +5601,44 @@ bool SsrMaterial(SsrTarget& target, int& channel, bool& gloss) {
 	channel = choice.channel;
 	gloss   = choice.gloss;
 	return true;
+}
+
+// KYTY_RT_REFLECTIONS (rt-reflections.cpp): the G-buffer copy and the camera.
+bool RtReflGetGbuffer(RtReflGbuffer& out) {
+	const uint64_t copied = g_ssr.copy_flip.load(std::memory_order_acquire);
+	const uint64_t flips  = g_flips_taken.load(std::memory_order_relaxed);
+	if (copied == ~0ull || flips > copied + 1 || g_ssr.copy_image == VK_NULL_HANDLE) return false;
+	for (uint32_t i = 0; i < 4; ++i) {
+		if (g_ssr.copy_views[i] == nullptr) return false;
+		out.views[i] = g_ssr.copy_views[i];
+	}
+	out.extent = g_ssr.copy_extent;
+	return true;
+}
+
+void RtReflGetCamera(const std::array<float, 16>& view_to_clip, RtReflCamera& out) {
+	out.rows     = SsrViewRotation(view_to_clip, out.view_rows);
+	out.up_valid = SsrUpInView(view_to_clip, out.up);
+	out.prev     = false;
+	std::array<float, 16> vp {}, pv {};
+	{
+		std::lock_guard lock(g_ssr_gb.mutex);
+		if (!g_ssr_gb.have_vp || !g_ssr_gb.have_prev || g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.vp_flip + 2) return;
+		vp = g_ssr_gb.view_proj, pv = g_ssr_gb.prev_view_proj;
+	}
+	// Current clip -> previous clip = VP_prev * VP^-1 (row-major, column vectors: clip = M * world).
+	std::array<double, 16> inv {};
+	if (!Inverse4(vp, inv)) return;
+	std::array<float, 16> c {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j) {
+			double d = 0.0;
+			for (int k = 0; k < 4; ++k) d += static_cast<double>(pv[i * 4 + k]) * inv[k * 4 + j];
+			if (!std::isfinite(d)) return;
+			c[i * 4 + j] = static_cast<float>(d);
+		}
+	out.clip_to_prev = c;
+	out.prev         = true;
 }
 
 namespace {
@@ -6360,6 +6417,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	SsgiApply(command, inputs); // (KYTY_SSGI: inputs.color becomes the composited copy)
 	GtaoApply(command, inputs); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
 	SsrApply(command, inputs); // (KYTY_SSR: likewise, after GTAO; nothing when off)
+	RtReflectionsApply(command, inputs); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
 	CShadowApply(command, inputs); // (KYTY_CONTACT_SHADOWS: likewise, after SSGI)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);

@@ -245,6 +245,11 @@ struct UpscaleInputs {
 	// RT0..RT3, one 4-layer image), decoded by ssr.comp after its calibration.
 	std::array<UpscaleImage, 4> packed {};
 	uint32_t                    packed_count = 0;
+	// The game's exposure (applied after the upscale; KYTY_RT_REFLECTIONS reads it): its float at exposure_index of the
+	// buffer range (none: no buffer).
+	vk::Buffer                  exposure_buffer = nullptr;
+	vk::DeviceSize              exposure_base = 0, exposure_range = 0;
+	uint32_t                    exposure_index = 0;
 };
 // Streamline offers DLSS super resolution on this device.
 [[nodiscard]] bool UpscalerReady();
@@ -273,7 +278,10 @@ void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt, boo
 
 // KYTY_SSR=1|2|3 ("Reflejos RT": Normal / Alta / Ultra): screen-space reflections before the upscaler (in Upscale).
 // Everything below runs only while SsrWanted() (KYTY_SSR > 0), and only reads.
+// (also while KYTY_RT_REFLECTIONS > 0: rt-reflections.cpp reads the G-buffer copy and the camera these hooks take)
 [[nodiscard]] bool SsrWanted();
+// KYTY_SSR's own pass (its roughness target and live packed layers at the upscaler): KYTY_SSR > 0 only.
+[[nodiscard]] bool SsrPassWanted();
 // A G-buffer draw's vertex SRT (any path): the camera's view-projection for the up direction of the heuristic mask.
 void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt);
 // A G-buffer vertex shader's draw on the normal path: its color targets (the G-buffer layout, logged; the one
