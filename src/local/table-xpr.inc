@@ -959,8 +959,12 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 			// normal path's lookup takes the set's image back (TakeParkedImage: the same id and serial, its views kept, the
 			// other form's bytes copied in): the set then binds what that lookup and its acquisition bind. (The lookup is
 			// the proof for a depth-tiled view too, which IsSampledImageCurrent declines: the surface's storage use.)
+			// (A view the set's lookup moved into a larger image, its first layer in that image (on AMD GPUs a texture in the
+			// layers a texture pool's views hold), is no request of its own: looked up again it ended the emulator (issue
+			// #102, an RX 9070 XT). Its image is the one the set holds, and the checks below are its proof.)
 			auto       desc  = dep.desc;
-			const bool taken = textures.FindImage(desc) == dep.id && desc.view_info == dep.desc.view_info;
+			const bool taken = !TextureCache::ViewFitsImage(desc) ||
+			                   (textures.FindImage(desc) == dep.id && desc.view_info == dep.desc.view_info);
 			image            = textures.m_slot_images.try_get(dep.id); // (the lookup may have moved the slots)
 			if (taken && image != nullptr && image->serial == dep.serial && image->registered && !image->depth_id &&
 			    !image->binding.needs_rebind) {

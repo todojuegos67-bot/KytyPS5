@@ -33,6 +33,17 @@ constexpr int PAD_ERROR_INVALID_HANDLE = -2137915389; /* 0x80920003 */
 
 constexpr uint32_t RUMBLE_DURATION_MS = 0xffff;
 constexpr uint32_t RELEASE_FLUSH_MS   = 50;
+constexpr uint64_t DROP_REPORT_MS     = 5000;
+
+// The newest unread input state takes an event that changes no button and no touch (GameController::AddState).
+// KYTY_PAD_STATE_COALESCE=0: every input event a state of its own, as before.
+static bool StateCoalescing() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PAD_STATE_COALESCE");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	return on;
+}
 
 struct PadControllerInformation {
 	float    touch_pixel_density;
@@ -124,6 +135,8 @@ private:
 
 	void CheckActive();
 	void AddState();
+	void CountDroppedState();
+	void ReportDroppedStates();
 
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
@@ -139,6 +152,12 @@ private:
 	// Every effect the game set, whether or not the host pad could reproduce it:
 	// scePadGetTriggerEffectState answers from it (m_trigger_sent keeps the sent one only).
 	PadTriggerEffectParam m_state_effect {};
+	// Input states dropped from the history before a read took them (AddState): in all, since the last report, and when
+	// that was (SDL ticks; none yet: m_dropped_reported).
+	uint64_t         m_dropped_states     = 0;
+	uint64_t         m_dropped_unreported = 0;
+	uint64_t         m_dropped_report_ms  = 0;
+	bool             m_dropped_reported   = false;
 };
 
 static GameController* g_controller = nullptr;
@@ -377,8 +396,30 @@ void GameController::CheckActive() {
 	m_next_touch_id = 1;
 }
 
+// The history scePadRead returns, oldest unread first: a state per input event. Demon's Souls reads 64 each tick and
+// takes the presses and releases of every one, the last as the pad's state (its pad update, eboot 0xb933a0), so a press
+// is lost only when it leaves the STATES_MAX states unread. An event that changes no button and no touch (a stick or
+// trigger step, a finger moving) updates the newest state instead while no read has taken it (StateCoalescing): every
+// press and release keeps a state of its own, and a burst of axis events between two reads (a frame hitch: 5-43 of
+// 100 ms or more a session in the logs, one of 18.5 s) no longer pushes an unread press out.
 void GameController::AddState() {
+	if (m_states_num != 0 && StateCoalescing()) {
+		const auto  newest = (m_first_state + m_states_num - 1) % STATES_MAX;
+		const auto& last   = m_states[newest];
+		if (!m_obtained[newest] && last.buttons == m_state.buttons &&
+		    std::equal(std::begin(last.touch), std::end(last.touch), std::begin(m_state.touch),
+		               [](const ControllerState::Touch& a, const ControllerState::Touch& b) {
+			               return a.down == b.down && a.id == b.id;
+		               })) {
+			m_states[newest] = m_state;
+			return;
+		}
+	}
+
 	if (m_states_num >= STATES_MAX) {
+		if (!m_obtained[m_first_state]) {
+			CountDroppedState();
+		}
 		m_states_num  = STATES_MAX - 1;
 		m_first_state = (m_first_state + 1) % STATES_MAX;
 	}
@@ -387,6 +428,28 @@ void GameController::AddState() {
 	m_states[index]   = m_state;
 	m_obtained[index] = false;
 	m_states_num++;
+}
+
+// A state dropped before a read took it: in the log (stdout) at most every DROP_REPORT_MS, the count since the last line.
+void GameController::CountDroppedState() {
+	m_dropped_states++;
+	m_dropped_unreported++;
+	if (const auto now = SDL_GetTicks64(); !m_dropped_reported || now - m_dropped_report_ms >= DROP_REPORT_MS) {
+		m_dropped_reported  = true;
+		m_dropped_report_ms = now;
+		ReportDroppedStates();
+	}
+}
+
+void GameController::ReportDroppedStates() {
+	if (m_dropped_unreported == 0) {
+		return;
+	}
+	std::printf("Pad: %llu input states dropped unread (the %u-state history was full; %llu in all)\n",
+	            static_cast<unsigned long long>(m_dropped_unreported), STATES_MAX,
+	            static_cast<unsigned long long>(m_dropped_states));
+	std::fflush(stdout);
+	m_dropped_unreported = 0;
 }
 
 void GameController::Button(int id, uint32_t button, bool down) {
@@ -504,6 +567,7 @@ void GameController::ReleaseHostPads() {
 	}
 
 	m_connected_ids.clear();
+	ReportDroppedStates();
 }
 
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {

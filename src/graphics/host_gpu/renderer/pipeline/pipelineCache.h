@@ -166,7 +166,8 @@ public:
 		// wave64 programs natively (AMD RDNA3) gets.
 		uint32_t              host_subgroup_size = 0;
 	};
-	// left_out: pipelines whose binaries were left out (PipelineBinaryWriter), for a smaller shard.
+	// left_out: pipelines whose binaries were left out (PipelineBinaryWriter) and work items a shard left at its capture
+	// cap (KYTY_PRECOMPILE_SHARD_CAP), for a smaller shard.
 	static bool Precompile(GraphicContext& graphics, const PrecompileOptions& options, size_t& left_out);
 	// The shader prefetch's inputs (--static-inputs) are this GPU's and driver's, newer than the seeds;
 	// the static pipeline cache is this GPU's and driver's and, unless seeds is empty, newer than the seeds too (a

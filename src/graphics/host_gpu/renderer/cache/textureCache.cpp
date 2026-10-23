@@ -27,6 +27,7 @@
 #include "live-counters.h"
 #include "local-platform.h"
 #include "native-resource-state.h"
+#include "scene-tags.h"
 
 #include <algorithm>
 #include <array>
@@ -1090,9 +1091,12 @@ bool TextureCache::PartialDirtyCandidate(const Image& image) {
 bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
                                         uint64_t granule) {
 	const auto& info = image.info;
+	// (With GPU buffer writes over known ranges of it too: a refresh uploads those with the dirty ranges, InitializeImage.
+	// One written all over, or where not known, goes up whole anyway.)
 	if (!PartialDirtyCandidate(image) || !image.registered || !image.IsTracked() ||
 	    image.track_addr != info.data.address || image.track_addr_end != info.data.End() ||
-	    !image.CanTakePartialDirty() || image.IsBufferModified() || image.IsStencilModified()) {
+	    !image.CanTakePartialDirty() || (image.IsBufferModified() && image.BufferModifiedRanges().empty()) ||
+	    image.IsStencilModified()) {
 		return false;
 	}
 	const auto base  = info.data.address;
@@ -1261,15 +1265,18 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	return id;
 }
 
+bool TextureCache::ViewFitsImage(const ImageDesc& desc) {
+	const auto& view      = desc.view_info;
+	const auto& resources = desc.info.resources;
+	return view.level_count != 0 && view.layer_count != 0 && view.base_level < resources.levels &&
+	       view.level_count <= resources.levels - view.base_level &&
+	       (desc.info.IsVolume() ||
+	        (view.base_layer < resources.layers && view.layer_count <= resources.layers - view.base_layer));
+}
+
 void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
 	ImageOps::Validate(desc.info);
-	if (desc.view_info.format == vk::Format::eUndefined || desc.view_info.level_count == 0 ||
-	    desc.view_info.layer_count == 0 ||
-	    desc.view_info.base_level >= desc.info.resources.levels ||
-	    desc.view_info.level_count > desc.info.resources.levels - desc.view_info.base_level ||
-	    (!desc.info.IsVolume() &&
-	     (desc.view_info.base_layer >= desc.info.resources.layers ||
-	      desc.view_info.layer_count > desc.info.resources.layers - desc.view_info.base_layer))) {
+	if (desc.view_info.format == vk::Format::eUndefined || !ViewFitsImage(desc)) {
 		EXIT("TextureCache: invalid image view description\n");
 	}
 	if (desc.type == BindingType::DepthTarget && !IsSupportedDepthTargetFormat(desc.info)) {
@@ -2143,10 +2150,13 @@ void TextureCache::InitializeImage(ImageId id) {
 	LiveCounters::ScopedUs timed(LiveCounters::ImageInitUs);
 	auto&             image = m_slot_images[id];
 	Clock::time_point marks[3] {Clock::now()};
-	const char*       kind = image.IsPartiallyCpuDirty() ? "partial"
-	                         : image.IsBufferModified()  ? "buffer"
-	                         : image.IsCpuDirty()        ? "cpu"
-	                                                     : "clean";
+	// (buffer: GPU buffer writes over known ranges; buffer-all: over all of it or where not known; +cpu: and CPU writes)
+	const bool        buffer_all = image.IsBufferModified() && image.BufferModifiedRanges().empty();
+	const bool        cpu        = image.IsCpuDirty();
+	const char*       kind = image.IsPartiallyCpuDirty() ? (image.IsBufferModified() ? "partial+buffer" : "partial")
+	                         : !image.IsBufferModified() ? (cpu ? "cpu" : "clean")
+	                         : buffer_all                ? (cpu ? "buffer-all+cpu" : "buffer-all")
+	                                                     : (cpu ? "buffer+cpu" : "buffer");
 	SlowLog::Scope    slow([&](double ms) {
         const auto at = [&](int i) {
             return marks[i] == Clock::time_point {}
@@ -3113,11 +3123,19 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		EXIT("TextureCache: stencil association requires a depth/stencil image\n");
 	}
 
+	// (Not an image the GPU draws or writes to at that address: memory it shares with the stencil plane (a pool of
+	// targets reused while an area loads) made it the depth image's from then on, and the next draw to it ended the
+	// emulator, "color target requires rediscovery before final acquisition" (issue #94, fast travel to 1-1). A record of
+	// its own beside it.)
 	ImageId association {};
 	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
 		const auto owner = m_slot_images.try_get(id);
-		if (owner != nullptr && owner->info.data.address == stencil.address) {
+		if (owner == nullptr || owner->info.data.address != stencil.address) continue;
+		if (!owner->usage.render_target && !owner->usage.depth_target && !owner->usage.storage) {
 			association = id;
+		} else if (static std::atomic<uint32_t> reports {0}; reports.fetch_add(1, std::memory_order_relaxed) < 4) {
+			std::printf("TextureCache: a %s target at 0x%llx shares its memory with a depth image's stencil: kept apart\n",
+			            owner->usage.depth_target ? "depth" : "color", static_cast<unsigned long long>(stencil.address));
 		}
 	}
 	if (!association) {
@@ -4657,6 +4675,36 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	return false;
 }
 
+namespace {
+
+// KYTY_SLOW_LOG_MS: a large image a CPU write or a map made dirty whole, or a partial unmap deleted, and why it took no
+// partial dirty state (TextureCache::TryInvalidatePartial).
+void LogFullDirty(const char* why, const Image& image, uint64_t address, uint64_t size, bool candidate) {
+	if (SlowLog::Threshold() <= 0.0 || image.info.data.size < PartialDirtyMinSize || !image.IsTracked() ||
+	    kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	const auto& info = image.info;
+	std::printf("[tsc %llu] FULL-DIRTY %s addr=0x%llx size=0x%llx write=0x%llx+0x%llx candidate=%d "
+	            "(depth_id=%d backing=%d samples=%u volume=%d depth=%d stencil_plane=%d compression=%u) "
+	            "registered=%d tracked=%d whole=%d take=%d maybe=%d cpu=%d partial=%d gpu=%d buffer=%d "
+	            "buffer_ranges=%zu stencil=%d\n",
+	            static_cast<unsigned long long>(__rdtsc()), why, static_cast<unsigned long long>(info.data.address),
+	            static_cast<unsigned long long>(info.data.size), static_cast<unsigned long long>(address),
+	            static_cast<unsigned long long>(size), candidate ? 1 : 0, image.depth_id ? 1 : 0,
+	            image.backing.image != nullptr ? 1 : 0, info.samples, info.IsVolume() ? 1 : 0, info.IsDepth() ? 1 : 0,
+	            info.HasStencil() ? 1 : 0, static_cast<uint32_t>(info.metadata.compression), image.registered ? 1 : 0,
+	            image.IsTracked() ? 1 : 0,
+	            image.track_addr == info.data.address && image.track_addr_end == info.data.End() ? 1 : 0,
+	            image.CanTakePartialDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
+	            image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsPartiallyCpuDirty() ? 1 : 0,
+	            image.IsGpuModified() ? 1 : 0, image.IsBufferModified() ? 1 : 0, image.BufferModifiedRanges().size(),
+	            image.IsStencilModified() ? 1 : 0);
+	std::fflush(stdout);
+}
+
+} // namespace
+
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	const auto page_begin = address & ~(TRACKER_PAGE_SIZE - 1);
 	const auto page_end   = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
@@ -4669,33 +4717,7 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			if (TryInvalidatePartial(*owner, address, size, PartialDirtyGranule)) {
 				continue;
 			}
-			if (SlowLog::Threshold() > 0.0 && owner->info.data.size >= PartialDirtyMinSize &&
-			    owner->IsTracked() &&
-			    kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) != 0) {
-				std::printf("[tsc %llu] FULL-DIRTY addr=0x%llx size=0x%llx write=0x%llx+0x%llx candidate=%d "
-				            "(depth_id=%d backing=%d samples=%u volume=%d depth=%d stencil_plane=%d compression=%u) "
-				            "registered=%d tracked=%d whole=%d take=%d maybe=%d cpu=%d partial=%d gpu=%d buffer=%d "
-				            "stencil=%d\n",
-				            static_cast<unsigned long long>(__rdtsc()),
-				            static_cast<unsigned long long>(owner->info.data.address),
-				            static_cast<unsigned long long>(owner->info.data.size),
-				            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
-				            PartialDirtyCandidate(*owner) ? 1 : 0, owner->depth_id ? 1 : 0,
-			            owner->backing.image != nullptr ? 1 : 0, owner->info.samples,
-			            owner->info.IsVolume() ? 1 : 0, owner->info.IsDepth() ? 1 : 0,
-			            owner->info.HasStencil() ? 1 : 0,
-			            static_cast<uint32_t>(owner->info.metadata.compression), owner->registered ? 1 : 0,
-				            owner->IsTracked() ? 1 : 0,
-				            owner->track_addr == owner->info.data.address &&
-				                    owner->track_addr_end == owner->info.data.End()
-				                ? 1
-				                : 0,
-				            owner->CanTakePartialDirty() ? 1 : 0, owner->IsMaybeCpuDirty() ? 1 : 0,
-				            owner->IsDefinitelyCpuDirty() ? 1 : 0, owner->IsPartiallyCpuDirty() ? 1 : 0,
-				            owner->IsGpuModified() ? 1 : 0, owner->IsBufferModified() ? 1 : 0,
-				            owner->IsStencilModified() ? 1 : 0);
-				std::fflush(stdout);
-			}
+			LogFullDirty("write", *owner, address, size, PartialDirtyCandidate(*owner));
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id, "cpu-write");
 			continue;
@@ -4843,6 +4865,7 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 		if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
 			continue;
 		}
+		LogFullDirty("map", *owner, address, size, PartialDirtyCandidate(*owner));
 		owner->InvalidateCpuWrite(address, size);
 		UntrackImage(id, "map");
 	}
@@ -4901,11 +4924,13 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		// layer's memory at a time. The unmapped span becomes dirty (read back as it is when
 		// the image is next used) and stays unwatched until then; MapMemory marks it again
 		// when memory returns there.
-		if ((address > owner->info.data.address || address + size < owner->info.data.End()) &&
-		    TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
-			LiveCounters::Add(LiveCounters::PartialUnmaps);
-			++slow_partial;
-			continue;
+		if (address > owner->info.data.address || address + size < owner->info.data.End()) {
+			if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
+				LiveCounters::Add(LiveCounters::PartialUnmaps);
+				++slow_partial;
+				continue;
+			}
+			LogFullDirty("unmap", *owner, address, size, PartialDirtyCandidate(*owner));
 		}
 		++slow_deleted;
 		slow_bytes += owner->info.data.size;
@@ -4936,16 +4961,33 @@ void TextureCache::EraseRetired() {
 // faults 73 -> 232), and they held their video memory for good. One the game draws again is made again from its bytes.
 // Passed over (to the back of the list): images whose bytes only the GPU has (no download here), depth images with a
 // stencil association (deleting depth deletes it too), unregistered ones.
+// Texture pools of the world the game is in stay where the budget is 12 GiB or more (the collector below takes them,
+// oldest first, when it runs): one-level arrays of ChunkedUploadMin and up that shaders only sample. The game samples a
+// pool through views from a few first layers to a last one that moves as it streams, and leaves one for minutes as the
+// camera moves on: retired, the next view made it again whole from guest memory (2-2 and 5-2 tours: 1.3-2 GB, 150-460
+// ms frames, 2-3 times a map), where the image kept serves it or gives its layers on the GPU (HoldLayers). A kept
+// pool's watchers take a fault per MiB the game writes at most (partial dirty state). One last used before the game
+// entered its world (SceneTags) goes as before: the memory of the worlds left comes back.
 void TextureCache::RetireStaleImages(uint64_t tick) {
 	constexpr uint64_t RetireTicks    = 1200;
 	constexpr size_t   MaxRetirements = 16;
+	if (const auto generation = SceneTags::Generation(); generation != m_scene_generation) {
+		m_scene_generation = generation;
+		m_scene_tick       = tick;
+	}
 	if (tick <= RetireTicks) return;
 	thread_local std::vector<ImageId> stale, kept;
 	stale.clear();
 	kept.clear();
+	const bool keep_pools = !m_graphics.small_video_memory;
 	m_lru_cache.ForEachItemBelow(tick - RetireTicks, [&](ImageId id) {
 		const auto* owner = m_slot_images.try_get(id);
 		if (owner == nullptr || !owner->registered) return false;
+		// (Left at its age: the collector's.)
+		if (keep_pools && owner->info.resources.levels == 1 && owner->info.resources.layers > 1 &&
+		    owner->info.data.size >= ChunkedUploadMin && GuestTexture(*owner) &&
+		    m_lru_cache.TickOf(owner->lru_id) >= m_scene_tick)
+			return false;
 		if (owner->depth_id || owner->IsGpuModified())
 			kept.push_back(id);
 		else

@@ -170,6 +170,11 @@ private:
 	uint64_t              m_wait_bound  = 0;
 };
 
+// The buffer reclaimer frees no memory from HoldBufferFrees (false: a free runs now) to ReleaseBufferFrees: a defragmentation
+// pass's moves must stay allocated until it ends (BufferCache::Defragment; streamBuffer.cpp).
+[[nodiscard]] bool HoldBufferFrees();
+void               ReleaseBufferFrees();
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_STREAMBUFFER_H_
