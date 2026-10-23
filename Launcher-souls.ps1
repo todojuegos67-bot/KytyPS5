@@ -224,6 +224,8 @@ function Start-Game {
 	$nvAmd  = $script:isNvidia -and $chkAntiLag.Checked -and $config -like 'fsr3*' -and $resNow[2] -in 'xess', 'fsr'
 	# Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag automatico en AMD, y en NVIDIA solo con XeSS o FSR.
 	$fixedAl = (Is-FixedFg) -and ((-not $script:isNvidia) -or $resNow[2] -in 'xess', 'fsr')
+	# (10-23) Para las metricas: si va Anti-Lag y cual.
+	Set-IniValue 'antilagon' $(if ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
 	if ($nvAmd -or $fixedAl) {
 		$psargs += '-AntiLag'
 		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y

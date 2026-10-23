@@ -455,6 +455,9 @@ $timer.Add_Tick({
 		}
 	}
 	# (10-23) Solo el modo grafico elegido en el lanzador (Modo Souls o Personalizado).
+	# (10-23) Anti-Lag que se pidio al arrancar (Reflex / Anti-Lag 2 / No).
+	$al = "$($ini['antilagon'])"
+	if ($al) { $rows.Add(@('Anti-Lag', $al, $(if ($al -eq 'No') { $cKhaki } else { $cGreen }))) }
 	$modo = "$($ini['soulsmodo'])"
 	if ($modo) { $rows.Add(@('', $modo, $cKhaki)) }
 	$script:rows = $rows.ToArray()
