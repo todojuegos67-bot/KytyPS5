@@ -9,6 +9,7 @@
 #include "local/local-platform.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -257,8 +258,25 @@ void Install(Program* program) {
 			std::printf("Demon's Souls render size: KYTY_UPSCALE_RATIO=%s is not 1-4; ignored\n", ratio_s);
 		}
 	}
-	const auto aspect    = wide != nullptr && *wide != 0 ? ParseAspect(wide) : 0.0;
-	if (wide != nullptr && *wide != 0 && aspect == 0.0)
+	// KYTY_RENDER_ASPECT=auto: the primary display's own aspect (its current mode's width over its height); within 2% of
+	// 16:9 (or the display not known) as with no aspect at all, wider than 32:9 at 32:9.
+	const bool by_display = wide != nullptr && std::strcmp(wide, "auto") == 0;
+	double     detected   = 0.0;
+	if (by_display) {
+		const uint32_t display_w = LocalPlatform::DisplayWidth(nullptr), display_h = LocalPlatform::DisplayHeight(nullptr);
+		const double   display_a = display_h != 0 ? static_cast<double>(display_w) / display_h : 0.0;
+		if (display_w == 0 || display_h == 0 || std::fabs(display_a / GameAspect - 1.0) < 0.02 || display_a < GameAspect) {
+			std::printf("Demon's Souls render size: KYTY_RENDER_ASPECT=auto on a %ux%u display: 16:9 kept\n", display_w,
+			            display_h);
+		} else {
+			detected = std::min(display_a, WidestAspect);
+			std::printf("Demon's Souls render size: KYTY_RENDER_ASPECT=auto on a %ux%u display: aspect %.3f%s\n", display_w,
+			            display_h, detected, display_a > WidestAspect ? " (at most 32:9)" : "");
+		}
+		if (detected == 0.0 && (setting == nullptr || *setting == 0) && !by_ratio) return;
+	}
+	const auto aspect    = by_display ? detected : wide != nullptr && *wide != 0 ? ParseAspect(wide) : 0.0;
+	if (!by_display && wide != nullptr && *wide != 0 && aspect == 0.0)
 		std::printf("Demon's Souls render size: KYTY_RENDER_ASPECT=%s is not wider than 16:9 and at most 32:9; 16:9 kept\n",
 		            wide);
 	if (trinity && !DemonsSoulsSuperResolution::AnyHeight() && requested >= 720 && requested < SuperResolutionLeastHeight) {
