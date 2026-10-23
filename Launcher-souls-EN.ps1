@@ -221,9 +221,10 @@ function Start-Game {
 	# NVIDIA + frame generation de AMD: casilla "Anti-Lag (experimental)", solo sin reescalado DLSS (con DLSS cargado fue
 	# el crash); usa Reflex por Vulkan, el camino anterior a hoy.
 	$resNow = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
-	$nvAmd  = $script:isNvidia -and $chkAntiLag.Checked -and $config -like 'fsr3*' -and $resNow[2] -in 'xess', 'fsr'
+	# (10-23 21:30) NVIDIA Reflex sobre la frame generation de AMD crashea tambien sin DLSS (20261023-213004, Fsr3::QueuePresent): nunca.
+	$nvAmd  = $false
 	# Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag automatico en AMD, y en NVIDIA solo con XeSS o FSR.
-	$fixedAl = (Is-FixedFg) -and ((-not $script:isNvidia) -or $resNow[2] -in 'xess', 'fsr')
+	$fixedAl = (Is-FixedFg) -and (-not $script:isNvidia)
 	# (10-23) Para las metricas: si va Anti-Lag y cual.
 	Set-IniValue 'antilagon' $(if ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
 	if ($nvAmd -or $fixedAl) {
@@ -867,19 +868,19 @@ Move-To $chkUnlock $gFg 12 60 200
 $chkUnlock.Visible = $false  # (10-22) sin casilla: siempre desbloqueados salvo DLSS y modos Souls
 Move-To $chkAntiLag $gFg 222 60 186
 # (10-23 noche) Visible solo con NVIDIA: "Anti-Lag (experimental)" para la frame generation de AMD sin DLSS.
-$chkAntiLag.Visible = $script:isNvidia; $chkAntiLag.Text = 'Anti-Lag (experimental)'
+$chkAntiLag.Visible = $false; $chkAntiLag.Checked = $false; $chkAntiLag.Text = 'Anti-Lag (experimental)'
 # Solo se puede marcar con la frame generation de AMD (con la de NVIDIA ya va Reflex); fuera de ella se desmarca.
 function Update-AntiLagBox {
 	$cfgNow = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	$resSel = if ($script:resShown.Count) { $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)] } else { $null }
 	$ok = $cfgNow -like 'fsr3*' -and -not (Is-FixedFg) -and $resSel -and $resSel[2] -in 'xess', 'fsr'  # (10-23) solo con XeSS o FSR
 	# (10-23) Modos Souls con FG fija: se ve marcada y gris cuando se activa sola (AMD siempre; NVIDIA con XeSS o FSR).
-	$autoAl = (Is-FixedFg) -and ((-not $script:isNvidia) -or ($resSel -and $resSel[2] -in 'xess', 'fsr'))
+	$autoAl = $false
 	if ($autoAl) { $chkAntiLag.Checked = $true; $chkAntiLag.Enabled = $false; $chkAntiLag.Visible = $true; $script:alAuto = $true; return }
 	if ($script:alAuto) { $chkAntiLag.Checked = $false; $script:alAuto = $false }
 	$chkAntiLag.Enabled = $true
 	if (-not $ok) { $chkAntiLag.Checked = $false }
-	$chkAntiLag.Visible = $ok -and $script:isNvidia  # (10-23) oculta si no se puede usar
+	$chkAntiLag.Visible = $false  # (10-23 21:30) retirada: Reflex + FG de AMD crashea en NVIDIA
 }
 $cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $cmbRes.Add_SelectedIndexChanged({ Update-AntiLagBox })
