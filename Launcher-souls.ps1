@@ -1630,9 +1630,16 @@ $btnSave.Add_Click({
 	if (-not $p -or -not (Test-Path -LiteralPath $p)) { $status.Text = 'Esa carpeta (o ese .zar) no existe.'; return }
 	Set-GamePath $p
 	$status.Text = 'Guardado en game-path.txt'
+	$settings.Visible = $false
 })
 $settings.Controls.Add($btnSave)
 $btnSettings.Add_Click({ $settings.Visible = -not $settings.Visible })
+# (10-23) Cruz para cerrar Settings; al guardar bien tambien se cierra.
+$btnCloseSet = New-Button ([string][char]0x2715) 572 6 32 30 $false
+$btnCloseSet.Font = $smallFont
+$tips.SetToolTip($btnCloseSet, 'Cerrar')
+$btnCloseSet.Add_Click({ $settings.Visible = $false })
+$settings.Controls.Add($btnCloseSet); $btnCloseSet.BringToFront()
 
 # (10-23) Aviso del archivo de paginacion: solo lo LEE; nunca cambia ajustes de Windows. Abre la ventana de Windows
 # para que el usuario lo cambie el mismo si quiere. No vuelve a avisar si se pulsa "No volver a avisar".
