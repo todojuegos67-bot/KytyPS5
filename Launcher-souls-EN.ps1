@@ -33,6 +33,31 @@ $fgModes = @(
 	@('   Frame generation DLSS x4',                    'dlss-x4.json'),
 	@('   DLSS MFG dynamic (x2-x4 automatic)',         'dlss-dynamic.json')
 )
+# (10-23) Grafica y equipo: con una grafica que no es NVIDIA no se ofrece nada de DLSS (ni reescalado ni frame generation).
+$script:gpuName = ''; $script:pcInfo = ''
+try {
+	$vcs = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object { $_.Name })
+	$pick = $vcs | Where-Object { $_.Name -match 'NVIDIA|GeForce|Radeon|AMD|Arc' } | Select-Object -First 1
+	if (-not $pick) { $pick = $vcs | Select-Object -First 1 }
+	if ($pick) { $script:gpuName = "$($pick.Name)".Trim() }
+	$cpu = (Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1).Name
+	$ram = [math]::Round((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1GB)
+	$script:pcInfo = "$($cpu -replace '\s+', ' ')".Trim() + "  |  $ram GB RAM"
+} catch { }
+$script:isNvidia = (-not $script:gpuName) -or ($script:gpuName -match 'NVIDIA|GeForce|RTX|GTX|Quadro')
+# (10-23) Base de datos de graficas: el modo recomendado y lo que se puede esperar. Medido en una RTX 5080 (1440p:
+# ~75 reales, 224 en pantalla con frame generation dinamico; 4K cine ~40-48 reales) y en una de 8 GB simulada; el
+# resto es una ESTIMACION por potencia relativa (el emulador tambien depende mucho de la CPU).
+$script:gpuDb = @(
+	@('RTX 509|RTX 508|RTX 409|RTX 408|RX 7900 XTX', 'Souls extreme mode', '4K cinematic: ~40-50 real FPS (150-224 on screen with FG). 1440p: 60-75 real'),
+	@('RTX 507|RTX 4070 Ti|RTX 4070 SUPER|RTX 309|RTX 3080 Ti|RX 907|RX 7900 XT|RX 7900 GRE|RX 6950', 'Souls ultra mode', '1440p: ~50-65 real FPS (150-224 on screen with FG)'),
+	@('RTX 4070|RTX 4060 Ti 16|RTX 3080|RTX 506|RX 6800|RX 6900|RX 7800|RX 7700|Arc.*B5[78]0', 'Souls balanced mode', '1440p: fixed 45 real FPS (90 on screen with AMD x2)'),
+	@('RTX 4060|RTX 3070|RTX 3060|RTX 207|RTX 208|RTX 2060|RX 66|RX 7600|RX 6700|Arc.*A7', 'Souls light mode', '1080p: fixed 30 real FPS (60 on screen with AMD x2); 8 GB of VRAM is tight'),
+	@('GTX|RX 5[0-9]|RX 6500|RX 6400|Arc.*A[35]|Radeon\(TM\) Graphics|Iris|UHD', 'Souls PC low profile mode', '900p: fixed 30 real FPS (60 with AMD x2); may not be smooth')
+)
+$script:gpuRec = $null
+foreach ($row in $script:gpuDb) { if ($script:gpuName -match $row[0]) { $script:gpuRec = $row; break } }
+if (-not $script:isNvidia) { $fgModes = @($fgModes | Where-Object { $_[1] -notlike 'dlss*' -and $_[0] -notmatch 'NVIDIA' }) }
 # Reescalado: texto -> altura del 3D (run-windows.ps1 -RenderHeight), reescalador (-Upscale) y altura de salida
 # (-UpscaleHeight; 0 = 1440). DLSS (NVIDIA RTX): DLAA 1x, Ultra calidad 1.3x, Calidad 1.5x, Equilibrado 1.72x,
 # Rendimiento 2x, Ultra rendimiento 3x (720 -> 2160). XeSS 3 (todas las graficas): AA 1x, Ultra calidad plus 1.3x,
@@ -582,7 +607,9 @@ function Fill-Res {
 		# PC bajos requisitos: sin DLSS (usa el frame generation de AMD x2; solo XeSS, FSR o nativo).
 		# (10-22) DLSS Equilibrado y Ultra rendimiento solo a 4K: sobre 1440 caen por debajo de lo que acepta DLSS.
 		# Modo graficas de 8 GB: frame generation de AMD, asi que sin DLSS (todos los de XeSS y FSR).
-		if ($chkLowEnd -and $chkLowEnd.Checked -and $family -ne 'dlss') { $modes = @($modes | Where-Object { $_[0] -in 'XeSS AA', 'FSR AA native' }) }
+		if ($family -eq 'dlss' -and -not $script:isNvidia) { continue }  # (10-23) sin NVIDIA no hay DLSS
+		# (10-23) Modo Souls ligero: solo el antialiasing de cada uno (DLSS DLAA, XeSS AA, FSR AA) o nativo.
+		if ($chkLowEnd -and $chkLowEnd.Checked) { $modes = @($modes | Where-Object { $_[0] -in 'DLSS DLAA', 'XeSS AA', 'FSR AA native' }) }
 		# (10-22) Modo graficas de 8 GB: tambien sin reescalado (1080p nativo, sin XeSS ni FSR), lo primero de la lista.
 		if ($chkLowEnd -and $chkLowEnd.Checked -and $family -eq 'xess') { $shown += , @('No upscaling (1080p native)', 1080, '', 0) }
 		$outH = Get-OutHeight
@@ -636,7 +663,7 @@ $cmbFg.Add_SelectedIndexChanged({ Update-UnlockForFg })
 Update-UnlockForFg
 $chkTurbo2.Add_CheckedChanged({ Fill-Res })
 # PC bajos requisitos: la lista de frame generation bloqueada (va con AMD x2) y sin modos DLSS.
-function Update-LowEnd { $low = Is-FixedFg; $cmbFg.Enabled = -not $low; if ($cmbOut) { if ($chkLowEnd45.Checked) { $cmbOut.SelectedIndex = 0 }; $cmbOut.Enabled = -not $low; $chk4K.Checked = (-not $low) -and $cmbOut.SelectedIndex -eq 1 }; if ($cmbPreset) { $cmbPreset.Enabled = $true }; Fill-Res }
+function Update-LowEnd { $low = Is-FixedFg; $cmbFg.Enabled = -not $low; if ($cmbOut) { if ($chkLowEnd45.Checked) { $cmbOut.SelectedIndex = 0 }; $cmbOut.Enabled = -not $low; $chk4K.Checked = (-not $low) -and $cmbOut.SelectedIndex -eq 1 }; if ($cmbPreset) { $cmbPreset.Enabled = $script:isNvidia }; Fill-Res }
 $chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { $chkLowEnd45.Checked = $false }; Update-LowEnd })
 $chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { $chkLowEnd.Checked = $false }; Update-LowEnd })
 $cmbFg.Enabled = -not (Is-FixedFg)
@@ -654,7 +681,7 @@ $cmbPreset.SelectedIndex = [math]::Min([math]::Max(0, $presetIndex), $dlssPreset
 $cmbPreset.Add_SelectedIndexChanged({ Set-IniValue 'dlsspreset' "$($cmbPreset.SelectedIndex)" })
 $tips.SetToolTip($cmbPreset, 'DLSS model: auto (NVIDIA default), K = DLSS 4, L and M = DLSS 4.5 (sharper, a bit slower)')
 $panel.Controls.Add($cmbPreset)
-$cmbPreset.Enabled = $true  # (10-23) modos Souls: tambien con DLSS
+$cmbPreset.Enabled = $script:isNvidia  # (10-23) modos Souls: tambien con DLSS (solo NVIDIA)
 
 # Nitidez del reescalado: Auto (FSR 0.3, DLSS y XeSS sin nada) o un nivel fijo para todos.
 $sharpLevels = @(@('Sharpness: auto', ''), @('Sharpness: 0', '0'), @('Sharpness: 25%', '0.25'), @('Sharpness: 50%', '0.5'),
@@ -729,6 +756,16 @@ $btnX.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(180, 
 $btnX.Size = New-Object System.Drawing.Size(48, 40); $btnX.Location = New-Object System.Drawing.Point(($W - $panelW - 56), 8)  # a la izquierda del panel: no tapa nada
 $btnX.Add_Click({ $form.Close() })
 $form.Controls.Add($btnX); $btnX.BringToFront()
+# (10-23) Abajo: la grafica y el equipo detectados.
+$lbPc = New-Object System.Windows.Forms.Label
+$lbPc.AutoSize = $false; $lbPc.TextAlign = 'MiddleLeft'
+$lbPc.Font = $smallFont; $lbPc.ForeColor = [System.Drawing.Color]::FromArgb(222, 196, 140)
+$lbPc.BackColor = [System.Drawing.Color]::FromArgb(170, 14, 16, 22)
+$lbPc.Text = "  GPU: $(if ($script:gpuName) { $script:gpuName } else { 'not detected' })$(if (-not $script:isNvidia) { '  (no DLSS: NVIDIA only)' })     PC: $($script:pcInfo)" +
+	$(if ($script:gpuRec) { "`n  Recommended: $($script:gpuRec[1]).  Expected (estimate): $($script:gpuRec[2])" } else { "`n  GPU not in the list: start with the Souls balanced mode and watch the metrics." })
+$lbPc.Location = New-Object System.Drawing.Point(16, ($H - 60)); $lbPc.Size = New-Object System.Drawing.Size(($W - $panelW - 32), 48)
+$form.Controls.Add($lbPc); $lbPc.BringToFront()
+if ($cmbPreset -and -not $script:isNvidia) { $cmbPreset.Enabled = $false }
 $panel.Controls.Add($btnExit)
 $chk4K.Visible = $false
 # (10-22) Salida: 1440p (el monitor), 4K (modo cinematico del juego), 1080p y 720p (graficas mas modestas). Los
@@ -912,7 +949,7 @@ foreach ($m in @($chkSoulsUltra, $chkSoulsExt)) {
 foreach ($m in @($chkLowEnd, $chkLowEnd45)) { $m.Add_CheckedChanged({ param($sender, $e) if ($sender.Checked) { $chkSoulsUltra.Checked = $false; $chkSoulsExt.Checked = $false; $chkSoulsLow.Checked = $false } }) }
 $chkGpu8.Add_CheckedChanged({ if ($chkGpu8.Checked) { Set-PresetLight } else { Set-PresetMax } })
 # (10-23) Modo Souls ligero y PC low profile: resolucion fija (no se puede cambiar el reescalado).
-function Update-ResLock { $lock = $chkLowEnd.Checked -or $chkSoulsLow.Checked; if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'No upscaling (1080p native)' }; $cmbRes.Enabled = -not $lock 
+function Update-ResLock { $lock = $chkSoulsLow.Checked; if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'No upscaling (1080p native)' }; $cmbRes.Enabled = -not $lock 
 	# (10-23) PC low profile: todo fijo (salida, graficos y casillas), nada se puede cambiar.
 	$low = $chkSoulsLow.Checked
 	foreach ($c in @($cmbFg, $cmbOut, $cmbTex, $cmbDist, $cmbShadow, $cmbDet, $cmbRefl, $cmbFade, $cmbAaS, $cmbRt, $cmbAo, $chkAf16, $chkLod)) { if ($c) { $c.Enabled = -not $low } }
