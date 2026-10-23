@@ -216,8 +216,9 @@ function Start-Game {
 	$psargs += @('-TextureReduce', @('0', 'h', '1', '2')[$cmbTex.SelectedIndex])  # (10-23) Alto = h
 	# (10-23) Anti-Lag solo en los modos Souls ligero y PC low profile (frame generation de AMD + Reflex); en los demas
 	# no mejoraba y quitaba FPS.
-	# (10-23 noche) Anti-Lag desactivado del todo: Reflex sobre la frame generation de AMD cerro el juego (20261023-205956).
-	if ($false) {
+	# (10-23 noche) Anti-Lag solo con graficas AMD (AMD Anti-Lag 2) en Souls ligero y PC low profile. En NVIDIA no: Reflex
+	# sobre la frame generation de AMD cerro el juego (20261023-205956, en Fsr3::QueuePresent).
+	if ((-not $script:isNvidia) -and ($chkLowEnd.Checked -or $chkSoulsLow.Checked)) {
 		$psargs += '-AntiLag'
 		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y
 		# con DLSS Frame Generation, Reflex en modo Boost.
