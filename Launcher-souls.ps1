@@ -854,6 +854,7 @@ $chkGpu8 = New-Check 'Optimizacion tarjetas 8 GB' 0 0 206 'gpu8opt'
 $tips.SetToolTip($chkGpu8, 'Graficas de 8 GB: pone texturas en Bajo y distancia y sombras en Medio para que el juego quepa en la memoria de la grafica.')
 $panel.Controls.Add($chkGpu8)
 Move-To $chkGpu8 $gPc 202 24 206
+$chkGpu8.Visible = $false; $chkGpu8.Checked = $false  # (10-23) retirada: hacia lo mismo que los graficos del Modo Souls ligero
 # (10-23) Presets: Souls ligero = Optimizacion 8 GB (texturas bajo, distancia y sombras medio, Luz RT no, Detail Normal,
 # Oclusion Normal); Souls equilibrado (todo Maximo, Luz RT no, Detail High, Oclusion Alta). Al quitarlos: todo Maximo.
 function Set-PresetLight { $cmbTex.SelectedIndex = 3; $cmbDist.SelectedIndex = 2; $cmbShadow.SelectedIndex = 2; $cmbRt.SelectedIndex = 0; $cmbDet.SelectedIndex = 3; $cmbAo.SelectedIndex = 1; $cmbAaS.SelectedIndex = 1; $cmbFade.SelectedIndex = 2; $cmbRefl.SelectedIndex = 2 }
