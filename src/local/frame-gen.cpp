@@ -6397,7 +6397,7 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 }
 
 void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,
-                  vk::Format format) {
+                  vk::Rect2D region, vk::Format format) {
 	inputs.has_hudless_display = false;
 	if (!inputs.valid || !inputs.has_hudless || inputs.hudless.image == nullptr) return;
 	ConfigureAs(graphics, inputs.hudless_display, inputs.hudless_display_view, format,
@@ -6406,14 +6406,30 @@ void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInpu
 	           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
 	Transition(command, inputs.hudless_display, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
 	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
-	vk::ImageBlit region {};
-	region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-	region.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-	region.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(inputs.hudless.extent.width),
-                                         static_cast<int32_t>(inputs.hudless.extent.height), 1};
-	region.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(backbuffer.width), static_cast<int32_t>(backbuffer.height), 1};
+	// Where RecordPresentCommands put the frame image (its present region: black bars at another aspect or with
+	// KYTY_PRESENT_ASPECT=fit), black around it as there; the whole backbuffer otherwise, as before.
+	const bool partial = region.extent.width != 0 && region.extent.height != 0 &&
+	                     (region.offset.x != 0 || region.offset.y != 0 || region.extent != backbuffer);
+	if (partial) {
+		const vk::ClearColorValue       black {std::array<float, 4> {0.0f, 0.0f, 0.0f, 1.0f}};
+		const vk::ImageSubresourceRange whole {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.clearColorImage(inputs.hudless_display.image, vk::ImageLayout::eTransferDstOptimal, &black, 1, &whole);
+		Transition(command, inputs.hudless_display, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+		           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	}
+	vk::ImageBlit blit {};
+	blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(inputs.hudless.extent.width),
+                                       static_cast<int32_t>(inputs.hudless.extent.height), 1};
+	blit.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(backbuffer.width), static_cast<int32_t>(backbuffer.height), 1};
+	if (partial) {
+		blit.dstOffsets[0] = vk::Offset3D {region.offset.x, region.offset.y, 0};
+		blit.dstOffsets[1] = vk::Offset3D {region.offset.x + static_cast<int32_t>(region.extent.width),
+		                                   region.offset.y + static_cast<int32_t>(region.extent.height), 1};
+	}
 	command.blitImage(inputs.hudless.image, vk::ImageLayout::eTransferSrcOptimal, inputs.hudless_display.image,
-	                  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eLinear);
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &blit, vk::Filter::eLinear);
 	for (auto* image: {&inputs.hudless, &inputs.hudless_display})
 		Transition(command, *image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
 		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
