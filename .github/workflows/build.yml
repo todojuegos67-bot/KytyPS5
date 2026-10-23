@@ -48,7 +48,7 @@ jobs:
             "KytyPS5-$((Get-Date).ToUniversalTime().ToString('yyyyMMdd'))-$($env:GITHUB_SHA.Substring(0, 8))" }
           if ('${{ inputs.pgo_generate }}' -eq 'true') { $name = "$name-pgogen" }
           if ($env:GITHUB_REF_NAME -eq 'fsr3-prueba') { $name = "$name-fsr3" }
-          if ($env:GITHUB_REF_NAME -in @('dlss-prueba','dlssg-decouple','dlss-release','lowmem-16gb','merge-1016','upscale','merge-1019','upstream-1023')) { $name = "$name-dlss" }
+          if ($env:GITHUB_REF_NAME -in @('dlss-prueba','dlssg-decouple','dlss-release','lowmem-16gb','merge-1016','upscale','merge-1019','upstream-1023','combined-1023')) { $name = "$name-dlss" }
           if ($env:GITHUB_REF_NAME -eq 'fg/x3') { $name = "$name-fgx3" }
           "package=$name" >> $env:GITHUB_OUTPUT
 
