@@ -473,7 +473,7 @@ $cmbFg.Add_SelectedIndexChanged({
 		$cmbFg.SelectedIndex = [math]::Min($cmbFg.SelectedIndex + 1, $fgModes.Count - 1)
 		return
 	}
-	Set-FgIndex $cmbFg.SelectedIndex
+	if (-not $script:fgNoSave) { Set-FgIndex $cmbFg.SelectedIndex }
 })
 $panel.Controls.Add($cmbFg)
 
@@ -684,7 +684,15 @@ $cmbFg.Add_SelectedIndexChanged({ Update-UnlockForFg })
 Update-UnlockForFg
 $chkTurbo2.Add_CheckedChanged({ Fill-Res })
 # PC bajos requisitos: la lista de frame generation bloqueada (va con AMD x2) y sin modos DLSS.
-function Update-LowEnd { $low = Is-FixedFg; $cmbFg.Enabled = -not $low; if ($cmbOut) { if ($chkLowEnd45.Checked) { $cmbOut.SelectedIndex = 0 }; $cmbOut.Enabled = -not $low; $chk4K.Checked = (-not $low) -and $cmbOut.SelectedIndex -eq 1 }; if ($cmbPreset) { $cmbPreset.Enabled = $script:isNvidia }; Fill-Res }
+function Update-LowEnd { $low = Is-FixedFg; $cmbFg.Enabled = -not $low
+	# (10-23) Con un modo de FG fija (Souls ligero, equilibrado, low profile) el desplegable muestra AMD x2; al quitarlo vuelve
+	# el que habia (sin guardarlo en launcher.ini).
+	$fixIdx = -1; for ($q = 0; $q -lt $fgModes.Count; $q++) { if ($fgModes[$q][1] -eq 'fsr3.json') { $fixIdx = $q } }
+	$script:fgNoSave = $true
+	if ($low -and $fixIdx -ge 0) { if ($null -eq $script:fgBefore) { $script:fgBefore = $cmbFg.SelectedIndex }; $cmbFg.SelectedIndex = $fixIdx }
+	elseif (-not $low -and $null -ne $script:fgBefore) { $cmbFg.SelectedIndex = $script:fgBefore; $script:fgBefore = $null }
+	$script:fgNoSave = $false
+	; if ($cmbOut) { if ($chkLowEnd45.Checked) { $cmbOut.SelectedIndex = 0 }; $cmbOut.Enabled = -not $low; $chk4K.Checked = (-not $low) -and $cmbOut.SelectedIndex -eq 1 }; if ($cmbPreset) { $cmbPreset.Enabled = $script:isNvidia }; Fill-Res }
 $chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { $chkLowEnd45.Checked = $false }; Update-LowEnd })
 $chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { $chkLowEnd.Checked = $false }; Update-LowEnd })
 $cmbFg.Enabled = -not (Is-FixedFg)
@@ -982,7 +990,7 @@ function Update-ResLock { $lock = $chkSoulsLow.Checked; if ($lock -and $chkLowEn
 }
 $chkLowEnd.Add_CheckedChanged({ Update-ResLock })
 $chkSoulsLow.Add_CheckedChanged({ Update-ResLock; Update-LowEnd })
-$form.Add_Shown({ Update-ResLock })
+$form.Add_Shown({ Update-ResLock; Update-LowEnd })
 $chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { Set-PresetLight } elseif (-not $chkLowEnd45.Checked) { Set-PresetMax } })
 $chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { Set-PresetMax; $cmbTex.SelectedIndex = 1; $cmbDist.SelectedIndex = 1; $cmbShadow.SelectedIndex = 1; $cmbRt.SelectedIndex = 0; $cmbAo.SelectedIndex = 2; $cmbAaS.SelectedIndex = 1 } elseif (-not $chkLowEnd.Checked) { Set-PresetMax } })
 Move-To $chkTurbo2 $gPc 202 54 206
