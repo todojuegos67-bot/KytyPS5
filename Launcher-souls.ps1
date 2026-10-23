@@ -229,9 +229,9 @@ function Start-Game {
 	$fixedAl = (Is-FixedFg) -and (-not $script:isNvidia)
 	# (10-23 noche) Anti-Lag propio del emulador (KYTY_LOWLAT): sin Reflex ni FSR3 tocado; con la frame generation de AMD.
 	$ownLat = $chkAntiLag.Checked -and $config -like 'fsr3*'
-	if ($ownLat) { $sets += 'KYTY_LOWLAT=1' }
+	if ($ownLat) { $sets += 'KYTY_LOWLAT=1'; $sets += 'KYTY_LOWLAT_QUEUE=1' }  # (10-23) Ultra: 1 frame en cola
 	# (10-23) Para las metricas: si va Anti-Lag y cual.
-	Set-IniValue 'antilagon' $(if ($ownLat) { 'Propio (emulador)' } elseif ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
+	Set-IniValue 'antilagon' $(if ($ownLat) { 'Ultra' } elseif ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
 	if ($nvAmd -or $fixedAl) {
 		$psargs += '-AntiLag'
 		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y
@@ -876,7 +876,7 @@ Move-To $chkUnlock $gFg 12 60 200
 $chkUnlock.Visible = $false  # (10-22) sin casilla: siempre desbloqueados salvo DLSS y modos Souls
 Move-To $chkAntiLag $gFg 222 60 186
 # (10-23 noche) Visible solo con NVIDIA: "Anti-Lag (experimental)" para la frame generation de AMD sin DLSS.
-$chkAntiLag.Text = 'Anti-Lag propio (emulador)'
+$chkAntiLag.Text = 'Anti-Lag Ultra'
 # Solo se puede marcar con la frame generation de AMD (con la de NVIDIA ya va Reflex); fuera de ella se desmarca.
 function Update-AntiLagBox {
 	$cfgNow = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
@@ -893,7 +893,7 @@ function Update-AntiLagBox {
 $cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $cmbRes.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $form.Add_Shown({ Update-AntiLagBox })
-$tips.SetToolTip($chkAntiLag, 'Con la frame generation de AMD: el emulador no deja que se acumulen mas de 2 frames antes de leer el mando (menos retraso). Sin Reflex, en cualquier grafica. Experimental.')
+$tips.SetToolTip($chkAntiLag, 'Con la frame generation de AMD: el emulador no deja que se acumule mas de 1 frame antes de leer el mando (menos retraso). Sin Reflex, en cualquier grafica. Puede bajar algun FPS real.')
 # Calidad grafica: texturas, distancia, sombras, Luz RT y filtrado x16 ($script:gfxTop: etiqueta y desplegable de Texturas, Sombras, Distancia).
 Move-To $script:gfxTop[0] $gGfx 10 26 98; Move-To $cmbTex $gGfx 110 24 296
 Move-To $script:gfxTop[4] $gGfx 10 58 98; Move-To $cmbDist $gGfx 110 56 296
