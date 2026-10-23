@@ -113,7 +113,7 @@ function Set-IniValue([string]$key, [string]$value) {
 function Set-FgIndex([int]$i) { Set-IniValue 'fgmode' "$i"; if ($i -ge 0 -and $i -lt $fgModes.Count -and $fgModes[$i][1]) { Set-IniValue 'fgcfg' $fgModes[$i][1] } }
 # (10-22) Frame generation fijo (AMD x2): Modo graficas de 8 GB (30 FPS, 1080p, solo AA) o Modo 45 FPS (1440p, reescalado
 # normal). Lo de 1080p y el filtro de AA siguen mirando solo chkLowEnd.
-function Is-FixedFg { return ($chkLowEnd -and $chkLowEnd.Checked) -or ($chkLowEnd45 -and $chkLowEnd45.Checked) }
+function Is-FixedFg { return ($chkLowEnd -and $chkLowEnd.Checked) -or ($chkLowEnd45 -and $chkLowEnd45.Checked) -or ($chkSoulsLow -and $chkSoulsLow.Checked) }  # (10-23) low profile: 30 reales con AMD x2
 # (10-22) FPS desbloqueados siempre, salvo DLSS frame generation (Reflex) y los modos Souls ligero / equilibrado.
 function Is-Unlocked { if (Is-FixedFg) { return $false }; $c = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]; return $true }  # (10-22 d) DLSS tambien desbloqueado: reflexfree (Reflex como unico limite)
 
@@ -219,7 +219,7 @@ function Start-Game {
 	# Nombre del modo de frame generation para las metricas.
 	# (10-23) El modo grafico para las metricas.
 	Set-IniValue 'soulsmodo' $(if ($chkLowEnd.Checked) { 'Souls light mode' } elseif ($chkLowEnd45.Checked) { 'Souls balanced mode' } elseif ($chkSoulsUltra.Checked) { 'Souls ultra mode' } elseif ($chkSoulsExt.Checked) { 'Souls extreme mode' } elseif ($chkSoulsLow.Checked) { 'Souls PC low profile mode' } else { 'Custom' })
-	if ($chkLowEnd45.Checked) { Set-IniValue 'fglabel' 'MODE SOULS BALANCED' } elseif ($chkLowEnd.Checked) { Set-IniValue 'fglabel' 'MODE SOULS LIGHT' } else { Set-IniValue 'fglabel' ($fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][0].Trim()) }
+	if ($chkLowEnd45.Checked) { Set-IniValue 'fglabel' 'MODE SOULS BALANCED' } elseif ($chkLowEnd.Checked) { Set-IniValue 'fglabel' 'MODE SOULS LIGHT' } elseif ($chkSoulsLow.Checked) { Set-IniValue 'fglabel' 'Souls PC low profile mode' } else { Set-IniValue 'fglabel' ($fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][0].Trim()) }
 	# (10-22) FPS desbloqueados solo sin frame generation: con frame generation el juego se queda en su base (60) y el
 	# multiplicador llega al monitor; desbloqueado (110 reales x3 = 330) se pasaba de los 240 Hz y salia de G-Sync.
 	# AMD x4: 56 FPS reales (224 mostrados), por debajo de 240 Hz para que G-SYNC vaya suave.
@@ -882,7 +882,7 @@ function Set-PresetExtreme { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex =
 	if ($cmbOut) { $cmbOut.SelectedIndex = 1 }; $chk4K.Checked = $true }  # (10-23) extremo: modo cinematico del juego a 4K
 # (10-23) Modo Souls PC low profile: 900p y todo en bajo, para PCs modestos.
 $chkSoulsLow = New-Check 'Souls PC low profile (900p, all low)' 0 0 396 'soulslow'
-$tips.SetToolTip($chkSoulsLow, 'For modest PCs: the game at 900p with every graphics option on low (textures, distance, shadows, detail, reflections, objects and sharpness). Unticking it puts everything back to Max and 1440p.')
+$tips.SetToolTip($chkSoulsLow, 'For modest PCs: 30 real FPS with AMD frame generation x2 (60 on screen), the game at 900p with every graphics option on low (textures, distance, shadows, detail, reflections, objects and sharpness). Unticking it puts everything back to Max and 1440p.')
 $panel.Controls.Add($chkSoulsLow); Move-To $chkSoulsLow $gModes 12 84 396
 function Set-ResByName([string]$name) {
 	for ($i = 0; $i -lt $script:resShown.Count; $i++) { if ($script:resShown[$i][0] -eq $name) { $cmbRes.SelectedIndex = $i; Set-IniValue 'scalelabel' $name; return } }
@@ -915,11 +915,11 @@ $chkGpu8.Add_CheckedChanged({ if ($chkGpu8.Checked) { Set-PresetLight } else { S
 function Update-ResLock { $lock = $chkLowEnd.Checked -or $chkSoulsLow.Checked; if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'No upscaling (1080p native)' }; $cmbRes.Enabled = -not $lock 
 	# (10-23) PC low profile: todo fijo (salida, graficos y casillas), nada se puede cambiar.
 	$low = $chkSoulsLow.Checked
-	foreach ($c in @($cmbOut, $cmbTex, $cmbDist, $cmbShadow, $cmbDet, $cmbRefl, $cmbFade, $cmbAaS, $cmbRt, $cmbAo, $chkAf16, $chkLod)) { if ($c) { $c.Enabled = -not $low } }
+	foreach ($c in @($cmbFg, $cmbOut, $cmbTex, $cmbDist, $cmbShadow, $cmbDet, $cmbRefl, $cmbFade, $cmbAaS, $cmbRt, $cmbAo, $chkAf16, $chkLod)) { if ($c) { $c.Enabled = -not $low } }
 	foreach ($p in @($script:postChecks)) { if ($p -and $p[0]) { $p[0].Enabled = -not $low } }
 }
 $chkLowEnd.Add_CheckedChanged({ Update-ResLock })
-$chkSoulsLow.Add_CheckedChanged({ Update-ResLock })
+$chkSoulsLow.Add_CheckedChanged({ Update-ResLock; Update-LowEnd })
 $form.Add_Shown({ Update-ResLock })
 $chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { Set-PresetLight } elseif (-not $chkLowEnd45.Checked) { Set-PresetMax } })
 $chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { Set-PresetMax; $cmbTex.SelectedIndex = 1; $cmbDist.SelectedIndex = 1; $cmbShadow.SelectedIndex = 1; $cmbRt.SelectedIndex = 0; $cmbAo.SelectedIndex = 2; $cmbAaS.SelectedIndex = 1 } elseif (-not $chkLowEnd.Checked) { Set-PresetMax } })
