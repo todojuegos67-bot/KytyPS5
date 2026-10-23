@@ -285,6 +285,7 @@ private:
 	uint64_t                       m_defrag_next_check = 0;
 	uint64_t                       m_defrag_free_after = 0; // the pool's free bytes after the last compaction
 	uint32_t                       m_defrag_passes     = 0;
+	uint32_t                       m_defrag_ignored    = 0; // (moves of allocations no buffer holds: Defragment)
 	double                         m_defrag_ms = 0, m_defrag_max_ms = 0; // the GPU thread's time in its passes
 
 	using BufferMap = std::map<uint64_t, BufferId>;

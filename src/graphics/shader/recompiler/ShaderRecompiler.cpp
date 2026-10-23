@@ -796,6 +796,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		IR::EnterTableMode(ir);
 		ir.table_slots_at_use = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureTableSlotsAtUse) != 0;
 	}
+	ir.native_float_min_max =
+	    (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureNativeFloatMinMax) != 0;
 	IR::AllocateBindings(ir, push_data_start_dword, options.enable_lod_stats);
 	DumpShaderIr(options, ir);
 	Spirv::AnalyzeProgramRequirements(ir);

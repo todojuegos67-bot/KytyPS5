@@ -292,6 +292,12 @@ uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	if (state.program.native_float_min_max) {
+		const auto ret = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpExtInst, TypeF32(state), ret, GlslStd450(state), max_value ? GlslNMax : GlslNMin, lhs, rhs});
+		return ret;
+	}
 	const auto lhs_class = EmitClassifyF32(state, lhs);
 	const auto rhs_class = EmitClassifyF32(state, rhs);
 

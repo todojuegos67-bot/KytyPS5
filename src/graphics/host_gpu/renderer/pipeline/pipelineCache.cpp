@@ -3173,7 +3173,7 @@ static std::filesystem::path StaticCachePath() {
 // then those the last precompile translated with: _PipelineCache/static/<title>_<version>.features. The first are written
 // by a precompile whose last merge made the store of its own pipelines alone (--merge --prune), the second by the last
 // merge of any precompile (--stamp: with recorded play lost, or -Quick, some pipelines stay as they were: another run
-// would not make them, so the store is not out of date for that). None (an older store, none at all): 0.
+// would not make them, so the store is not out of date for that). None (an older store): 0.
 static std::filesystem::path StaticFeaturesPath() {
 	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".features");
 }
@@ -3304,7 +3304,13 @@ void PipelineCache::InitializeStaticCache(bool create) {
 	// features it translated with, and offers itself again until then (StaticCacheCurrent).
 	if (!create) {
 		namespace Translate = ShaderRecompiler::Frontend;
-		Translate::SetTranslatorFeatures(ReadStaticFeatures());
+		// No store at all (none of its files): no pipeline of one to miss, the translation keeps all of this GPU's
+		// features, as the precompile translates.
+		std::error_code error;
+		const auto      exists = [&](const std::filesystem::path& path) { return std::filesystem::exists(path, error); };
+		if (exists(StaticFeaturesPath()) || exists(StaticCachePath()) || exists(StaticBinariesPath()) ||
+		    exists(StaticBlobsPath()))
+			Translate::SetTranslatorFeatures(ReadStaticFeatures());
 		if (const auto off = Translate::TranslatorDeviceFeatures() & ~Translate::TranslatorFeatureSet(); off != 0)
 			PipelineCacheLog("Translation features {:#x} off: the static pipeline store was made without them (precompile "
 			                 "again to use them)",

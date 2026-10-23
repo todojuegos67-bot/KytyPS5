@@ -275,6 +275,6 @@ int main(int argc, char* argv[]) {
 	                            : PipelineCache::Precompile(graphics, options, left_out);
 	std::printf("Shader precompile: %s\n", !done ? "failed" : left_out != 0 ? "partial" : "complete");
 	std::fflush(nullptr);
-	// 3: pipelines' binaries were left out (PipelineBinaryWriter): run this shard as two.
+	// 3: pipelines' binaries were left out (PipelineBinaryWriter), or the shard stopped at its capture cap: run it as two.
 	std::_Exit(!done ? 1 : left_out != 0 ? 3 : 0);
 }

@@ -628,13 +628,18 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	// XT (RDNA4, Linux RADV: page faults or a ring timeout) at their first dispatches; with them loaded at use, or those
 	// 4 on the normal path, the fight passed (issue #51). A store made without it is out of date there (precompile
 	// again); until then its table mode pipelines are compiled at their first use.
+	// Float min/max as host instructions only on AMD GPUs (Translate::TranslatorFeatureNativeFloatMinMax).
 	namespace Translate = ShaderRecompiler::Frontend;
+	const bool     amd      = device_properties.vendorID == 0x1002u;
+	const uint32_t features = amd ? Translate::TranslatorFeatures
+	                              : Translate::TranslatorFeatures & ~Translate::TranslatorFeatureNativeFloatMinMax;
 	if (device_properties.vendorID != 0x10deu) {
-		const bool amd = device_properties.vendorID == 0x1002u;
-		Translate::SetTranslatorDeviceFeatures(Translate::TranslatorFeatures & ~Translate::TranslatorFeatureCooperativeHalves,
+		Translate::SetTranslatorDeviceFeatures(features & ~Translate::TranslatorFeatureCooperativeHalves,
 		                                       amd ? Translate::TranslatorFeatureTableSlotsAtUse : 0u);
 		std::printf("Cooperative halves: off on this GPU (tested on NVIDIA GPUs; KYTY_LANE_LOCAL_COOP=1 forces them)%s\n",
-		            amd ? "; table mode slots loaded at use" : "");
+		            amd ? "; table mode slots loaded at use, float min/max native" : "");
+	} else {
+		Translate::SetTranslatorDeviceFeatures(features);
 	}
 	std::fflush(stdout);
 

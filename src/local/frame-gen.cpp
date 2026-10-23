@@ -456,8 +456,15 @@ CameraFrame Decompose(const std::array<float, 16>& m) {
 	return c;
 }
 
+// DLSS evaluations NGX refused (Streamline's slEvaluateFeature says eOk all the same; its log has them): its output
+// image is then never written, the game black (issue #87).
+std::atomic<uint32_t> g_dlss_refusals {0};
+
 void LogMessage(sl::LogType type, const char* message) {
 	LOGF("Streamline[%d]: %s", static_cast<int>(type), message);
+	if (type == sl::LogType::eError && message != nullptr && std::strstr(message, "[sl.dlss]") != nullptr &&
+	    std::strstr(message, "evaluate feature failed") != nullptr)
+		g_dlss_refusals.fetch_add(1, std::memory_order_relaxed);
 	// KYTY_FRAMEGEN_VERBOSE: every message on stdout (the run log), not only errors.
 	static const bool verbose = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr;
 	if (type == sl::LogType::eError || verbose) {
@@ -3656,6 +3663,19 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 	if (!g_upscale_ready) return false;
 	// Its own viewport: DLSS-G's (0) takes its constants and tags at the present.
 	const sl::ViewportHandle viewport {1};
+	// DLSS given up (the game's image stretched instead, renderSuperResolution.cpp): an input outside the sizes the
+	// mode takes (the NVIDIA app's DLSS override of the program can ask for another scale: 3802x2138-3840x2160 for a
+	// 1920x1080 input, issue #87), or NGX refusing its evaluations.
+	static bool given_up = false;
+	if (given_up) return false;
+	if (g_dlss_refusals.load(std::memory_order_relaxed) >= 3) {
+		given_up = true;
+		std::printf("DLSS super resolution: NGX refused it %u times (Streamline errors above): the game's image is "
+		            "upscaled without it from here on\n",
+		            g_dlss_refusals.load(std::memory_order_relaxed));
+		std::fflush(stdout);
+		return false;
+	}
 	static vk::Extent2D options_render {}, options_output {};
 	if (options_render != inputs.color.extent || options_output != inputs.output.extent) {
 		// The mode by the input's share of the output's height (DLSS takes any input size; the mode picks its model and
@@ -3691,6 +3711,17 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 		            static_cast<uint32_t>(options.mode), settings.renderWidthMin, settings.renderHeightMin,
 		            settings.renderWidthMax, settings.renderHeightMax);
 		std::fflush(stdout);
+		if (settings.renderWidthMax != 0 && settings.renderHeightMax != 0 &&
+		    (inputs.color.extent.width < settings.renderWidthMin || inputs.color.extent.width > settings.renderWidthMax ||
+		     inputs.color.extent.height < settings.renderHeightMin || inputs.color.extent.height > settings.renderHeightMax)) {
+			given_up = true;
+			std::printf("DLSS super resolution: the game renders %ux%u, outside what DLSS takes in this mode: the game's "
+			            "image is upscaled without it. A DLSS override for this program in the NVIDIA app (Super Resolution "
+			            "mode or scaling ratio) does this; set it back to the default for kyty_emulator.exe\n",
+			            inputs.color.extent.width, inputs.color.extent.height);
+			std::fflush(stdout);
+			return false;
+		}
 		options_render = inputs.color.extent;
 		options_output = inputs.output.extent;
 	}
@@ -3791,8 +3822,15 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 		return false;
 	}
 	const sl::BaseStructure* evaluate_inputs[] {&viewport};
+	// (Result::eWarnOutOfVRAM is not a failure: Streamline returns it in place of eOk, DLSS recorded, while the process
+	// uses all the video memory Windows budgets it - issue #85: an RTX 2060 at 5030 of 5187 MiB had DLSS's image
+	// stretched over from then on.)
 	if (const auto result = g_api.evaluate(sl::kFeatureDLSS, *token, evaluate_inputs, 1, command_buffer);
-	    result != sl::Result::eOk) {
+	    result == sl::Result::eWarnOutOfVRAM) {
+		static std::atomic<bool> reported {false};
+		if (!reported.exchange(true, std::memory_order_relaxed))
+			std::printf("DLSS super resolution: the video memory budget is used up (Streamline's warning); DLSS still runs\n");
+	} else if (result != sl::Result::eOk) {
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
 			std::printf("DLSS super resolution: slEvaluateFeature failed (%s)\n", sl::getResultAsStr(result));
@@ -6359,7 +6397,7 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 }
 
 void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,
-                  vk::Format format) {
+                  vk::Rect2D region, vk::Format format) {
 	inputs.has_hudless_display = false;
 	if (!inputs.valid || !inputs.has_hudless || inputs.hudless.image == nullptr) return;
 	ConfigureAs(graphics, inputs.hudless_display, inputs.hudless_display_view, format,
@@ -6368,14 +6406,30 @@ void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInpu
 	           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
 	Transition(command, inputs.hudless_display, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
 	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
-	vk::ImageBlit region {};
-	region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-	region.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-	region.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(inputs.hudless.extent.width),
-                                         static_cast<int32_t>(inputs.hudless.extent.height), 1};
-	region.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(backbuffer.width), static_cast<int32_t>(backbuffer.height), 1};
+	// Where RecordPresentCommands put the frame image (its present region: black bars at another aspect or with
+	// KYTY_PRESENT_ASPECT=fit), black around it as there; the whole backbuffer otherwise, as before.
+	const bool partial = region.extent.width != 0 && region.extent.height != 0 &&
+	                     (region.offset.x != 0 || region.offset.y != 0 || region.extent != backbuffer);
+	if (partial) {
+		const vk::ClearColorValue       black {std::array<float, 4> {0.0f, 0.0f, 0.0f, 1.0f}};
+		const vk::ImageSubresourceRange whole {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.clearColorImage(inputs.hudless_display.image, vk::ImageLayout::eTransferDstOptimal, &black, 1, &whole);
+		Transition(command, inputs.hudless_display, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+		           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	}
+	vk::ImageBlit blit {};
+	blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(inputs.hudless.extent.width),
+                                       static_cast<int32_t>(inputs.hudless.extent.height), 1};
+	blit.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(backbuffer.width), static_cast<int32_t>(backbuffer.height), 1};
+	if (partial) {
+		blit.dstOffsets[0] = vk::Offset3D {region.offset.x, region.offset.y, 0};
+		blit.dstOffsets[1] = vk::Offset3D {region.offset.x + static_cast<int32_t>(region.extent.width),
+		                                   region.offset.y + static_cast<int32_t>(region.extent.height), 1};
+	}
 	command.blitImage(inputs.hudless.image, vk::ImageLayout::eTransferSrcOptimal, inputs.hudless_display.image,
-	                  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eLinear);
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &blit, vk::Filter::eLinear);
 	for (auto* image: {&inputs.hudless, &inputs.hudless_display})
 		Transition(command, *image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
 		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
