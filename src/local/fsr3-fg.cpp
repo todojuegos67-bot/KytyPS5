@@ -1,6 +1,7 @@
 #include "fsr3-fg.h"
 
 #include "frame-gen.h"
+#include "anti-lag.h"
 #include "graphics/presentation/videoOut.h"
 
 #include <algorithm>
@@ -1077,7 +1078,10 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	// for real x (1 + generated) to stay under the cap, as Reflex does for DLSS-G (x4 at 60 real sent 240 to a 224 cap:
 	// 16 frames a second dropped or held, a stutter at a steady 60). Only while generating; movies and menus untouched.
 	const double interval = CapInterval();
-	if (interval > 0.0 && inputs != nullptr && inputs->valid && !VideoOut::MoviePlaying() && VideoOut::PlayerInputSeen()) {
+	const bool capping = interval > 0.0 && inputs != nullptr && inputs->valid && !VideoOut::MoviePlaying() && VideoOut::PlayerInputSeen();
+	// KYTY_ANTILAG=1 with Reflex on the real swapchain: the wait moves to the input read (before the frame's input).
+	const bool reflex_cap = Libs::Graphics::AntiLag::Requested() && Libs::Graphics::AntiLag::SetFrameLimit(capping ? interval : 0.0);
+	if (capping && !reflex_cap) {
 		static std::chrono::steady_clock::time_point next {};
 		const auto step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(interval));
 		auto       now  = std::chrono::steady_clock::now();

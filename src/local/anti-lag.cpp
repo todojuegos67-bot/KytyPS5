@@ -102,6 +102,8 @@ void Mark(int32_t stage, uint64_t index) {
 }
 } // namespace
 
+uint32_t g_limit_us = UINT32_MAX; // Reflex's minimumIntervalUs set for FSR 3's cap (UINT32_MAX: never set), under g_reflex_mutex
+
 bool StreamlineReflex() {
 	// Streamline configures Reflex only for DLSS-G; with DLSS super resolution alone (FSR 3 frame generation or none)
 	// nothing would limit the queue: VK_NV_low_latency2 is used directly then.
@@ -300,6 +302,7 @@ void OnSwapchain(VkSwapchainKHR swapchain, bool fsr3) {
 		swapchain   = real;
 		g_fsr3_real = true;
 	}
+	if (g_limit_us != UINT32_MAX) g_limit_us = 0; // (a new swapchain: SetFrameLimit sets it again)
 	VkLatencySleepModeInfoNV info {};
 	info.sType             = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV;
 	info.lowLatencyMode    = VK_TRUE;
@@ -313,6 +316,27 @@ void OnSwapchain(VkSwapchainKHR swapchain, bool fsr3) {
 		std::printf("Anti-Lag: vkSetLatencySleepModeNV failed (%d): Reflex off for this swapchain\n", static_cast<int>(result));
 		std::fflush(stdout);
 	}
+}
+
+bool SetFrameLimit(double interval_s) {
+	if (!ReflexActive()) return false;
+	std::lock_guard lock(g_reflex_mutex);
+	if (g_swapchain == VK_NULL_HANDLE || !g_fsr3_real) return false; // (only FSR 3's real swapchain, whose presents are marked)
+	const uint32_t us = interval_s > 0.0 ? static_cast<uint32_t>(interval_s * 1e6) : 0;
+	if (us != g_limit_us) {
+		VkLatencySleepModeInfoNV info {};
+		info.sType             = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV;
+		info.lowLatencyMode    = VK_TRUE;
+		info.lowLatencyBoost   = VK_FALSE;
+		info.minimumIntervalUs = us;
+		if (g_sleep_mode(g_device, g_swapchain, &info) != VK_SUCCESS) return false;
+		if (g_limit_us == UINT32_MAX) {
+			std::printf("Anti-Lag: FSR 3 frame generation cap by Reflex's limiter at the input read (%u us), not at the present\n", us);
+			std::fflush(stdout);
+		}
+		g_limit_us = us;
+	}
+	return true;
 }
 
 void AfterPresent(uint64_t frame_index) {

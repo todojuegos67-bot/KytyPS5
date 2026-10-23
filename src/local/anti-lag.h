@@ -44,6 +44,9 @@ void OnInput();
 // Right before the frame's present (a new frame, not a repeat): its PRESENT mark.
 void OnPresent(uint64_t frame_index);
 
+// FSR 3 frame generation's cap: Reflex's limiter (its sleep at the controller read) holds real frames to interval_s
+// instead of a wait at the present; false when Reflex is not on FSR 3's real swapchain (the caller waits itself).
+[[nodiscard]] bool SetFrameLimit(double interval_s);
 } // namespace Libs::Graphics::AntiLag
 
 #endif
