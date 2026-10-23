@@ -864,6 +864,14 @@ $chkUnlock.Visible = $false  # (10-22) sin casilla: siempre desbloqueados salvo 
 Move-To $chkAntiLag $gFg 222 60 186
 # (10-23 noche) Visible solo con NVIDIA: "Anti-Lag (experimental)" para la frame generation de AMD sin DLSS.
 $chkAntiLag.Visible = $script:isNvidia; $chkAntiLag.Text = 'Anti-Lag (experimental)'
+# Solo se puede marcar con la frame generation de AMD (con la de NVIDIA ya va Reflex); fuera de ella se desmarca.
+function Update-AntiLagBox {
+	$cfgNow = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
+	$ok = $cfgNow -like 'fsr3*' -and -not (Is-FixedFg)
+	$chkAntiLag.Enabled = $ok; if (-not $ok) { $chkAntiLag.Checked = $false }
+}
+$cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
+$form.Add_Shown({ Update-AntiLagBox })
 $tips.SetToolTip($chkAntiLag, 'Solo NVIDIA con la frame generation de AMD y reescalado XeSS, FSR o nativo (con DLSS no hace nada): NVIDIA Reflex para menos retraso. Experimental: si el juego se cierra, quitala.')
 # Calidad grafica: texturas, distancia, sombras, Luz RT y filtrado x16 ($script:gfxTop: etiqueta y desplegable de Texturas, Sombras, Distancia).
 Move-To $script:gfxTop[0] $gGfx 10 26 98; Move-To $cmbTex $gGfx 110 24 296
