@@ -1282,7 +1282,9 @@ function Show-PadMapper {
 			if ($v -lt 0) { continue }
 			$names += "XInput $($i + 1)"
 			$prev = if ($script:pmXiPrev.ContainsKey($i)) { $script:pmXiPrev[$i] } else { $v }
-			foreach ($bit in $script:xiBits.Keys) { if ((($v -band $bit) -ne 0) -and (($prev -band $bit) -eq 0)) { $pressed = $script:xiBits[$bit] } }
+			# (10-23) Por pares clave/valor: un diccionario [ordered] indexado con un numero devuelve por POSICION (0x1000 = A
+			# daba nada y la cruceta daba botones cambiados): solo funcionaba la cruceta.
+			foreach ($kv in $script:xiBits.GetEnumerator()) { $bit = [int]$kv.Key; if ((($v -band $bit) -ne 0) -and (($prev -band $bit) -eq 0)) { $pressed = $kv.Value } }
 			$script:pmXiPrev[$i] = $v
 		}
 		if ($script:pmSdlOk) {
