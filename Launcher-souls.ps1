@@ -769,8 +769,8 @@ $gImg = New-Group 'Imagen' 10 8 420 152
 $gFg  = New-Group 'Frame generation' 450 8 420 94
 $gGfx = New-Group 'Calidad grafica' 10 168 420 410
 $gScr = New-Group 'Pantalla y otros' 450 110 420 56
-$gModes = New-Group 'Modos Souls' 450 174 420 86
-$gPc  = New-Group 'Rendimiento / PC' 450 268 420 116
+$gModes = New-Group 'Modos Souls' 450 174 420 114
+$gPc  = New-Group 'Rendimiento / PC' 450 294 420 90
 # Imagen: salida, reescalado, preset y nitidez.
 Move-To $lbOut $gImg 10 26 98
 Move-To $cmbOut $gImg 110 24 296
@@ -868,7 +868,25 @@ $panel.Controls.Add($chkSoulsExt); Move-To $chkSoulsExt $gModes 202 54 206
 function Set-PresetUltra { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex = 0; $cmbShadow.SelectedIndex = 0; $cmbDet.SelectedIndex = 1; $cmbRt.SelectedIndex = 2; $cmbAo.SelectedIndex = 2; $cmbRefl.SelectedIndex = 1; $cmbFade.SelectedIndex = 1; $cmbAaS.SelectedIndex = 2 }
 function Set-PresetExtreme { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex = 0; $cmbShadow.SelectedIndex = 0; $cmbDet.SelectedIndex = 0; $cmbRt.SelectedIndex = 3; $cmbAo.SelectedIndex = 3; $cmbRefl.SelectedIndex = 0; $cmbFade.SelectedIndex = 0; $cmbAaS.SelectedIndex = 0; $chkAf16.Checked = $true; $chkLod.Checked = $true
 	if ($cmbOut) { $cmbOut.SelectedIndex = 1 }; $chk4K.Checked = $true }  # (10-23) extremo: modo cinematico del juego a 4K
-$script:soulsModes = @($chkLowEnd, $chkLowEnd45, $chkSoulsUltra, $chkSoulsExt)
+# (10-23) Modo Souls PC low profile: 900p y todo en bajo, para PCs modestos.
+$chkSoulsLow = New-Check 'Modo Souls PC low profile (900p, todo en bajo)' 0 0 396 'soulslow'
+$tips.SetToolTip($chkSoulsLow, 'Para PCs modestos: el juego a 900p y todos los graficos en bajo (texturas, distancia, sombras, detalle, reflejos, objetos y nitidez). Al quitarlo vuelve todo a Maximo y a 1440p.')
+$panel.Controls.Add($chkSoulsLow); Move-To $chkSoulsLow $gModes 12 84 396
+function Set-ResByName([string]$name) {
+	for ($i = 0; $i -lt $script:resShown.Count; $i++) { if ($script:resShown[$i][0] -eq $name) { $cmbRes.SelectedIndex = $i; Set-IniValue 'scalelabel' $name; return } }
+}
+function Set-PresetLowProfile {
+	$cmbTex.SelectedIndex = 3; $cmbDist.SelectedIndex = 3; $cmbShadow.SelectedIndex = 3; $cmbDet.SelectedIndex = 4
+	$cmbRefl.SelectedIndex = 3; $cmbFade.SelectedIndex = 3; $cmbAaS.SelectedIndex = 3; $cmbRt.SelectedIndex = 0; $cmbAo.SelectedIndex = 0
+	$chkAf16.Checked = $false; $chkLod.Checked = $false
+	if ($cmbOut) { $cmbOut.SelectedIndex = 0 }; $chk4K.Checked = $false
+	Fill-Res; Set-ResByName '900p juego'
+}
+$script:soulsModes = @($chkLowEnd, $chkLowEnd45, $chkSoulsUltra, $chkSoulsExt, $chkSoulsLow)
+$chkSoulsLow.Add_CheckedChanged({
+	if ($chkSoulsLow.Checked) { foreach ($o in $script:soulsModes) { if ($o -ne $chkSoulsLow -and $o.Checked) { $o.Checked = $false } }; Set-PresetLowProfile }
+	else { if (-not (@($script:soulsModes | Where-Object { $_.Checked }).Count)) { Set-PresetMax }; Fill-Res; Set-ResByName '1440p nativo' }
+})
 foreach ($m in @($chkSoulsUltra, $chkSoulsExt)) {
 	$m.Add_CheckedChanged({ param($sender, $e)
 		if ($sender.Checked) {
@@ -877,7 +895,7 @@ foreach ($m in @($chkSoulsUltra, $chkSoulsExt)) {
 		} elseif (-not (@($script:soulsModes | Where-Object { $_.Checked }).Count)) { Set-PresetMax; if ($sender -eq $chkSoulsExt -and $cmbOut -and $cmbOut.SelectedIndex -eq 1) { $cmbOut.SelectedIndex = 0; $chk4K.Checked = $false } }
 	})
 }
-foreach ($m in @($chkLowEnd, $chkLowEnd45)) { $m.Add_CheckedChanged({ param($sender, $e) if ($sender.Checked) { $chkSoulsUltra.Checked = $false; $chkSoulsExt.Checked = $false } }) }
+foreach ($m in @($chkLowEnd, $chkLowEnd45)) { $m.Add_CheckedChanged({ param($sender, $e) if ($sender.Checked) { $chkSoulsUltra.Checked = $false; $chkSoulsExt.Checked = $false; $chkSoulsLow.Checked = $false } }) }
 $chkGpu8.Add_CheckedChanged({ if ($chkGpu8.Checked) { Set-PresetLight } else { Set-PresetMax } })
 $chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { Set-PresetLight } elseif (-not $chkLowEnd45.Checked) { Set-PresetMax } })
 $chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { Set-PresetMax; $cmbTex.SelectedIndex = 1; $cmbDist.SelectedIndex = 1; $cmbShadow.SelectedIndex = 1; $cmbRt.SelectedIndex = 0; $cmbAo.SelectedIndex = 2 } elseif (-not $chkLowEnd.Checked) { Set-PresetMax } })
