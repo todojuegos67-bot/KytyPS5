@@ -221,7 +221,7 @@ function Start-Game {
 	# NVIDIA + frame generation de AMD: casilla "Anti-Lag (experimental)", solo sin reescalado DLSS (con DLSS cargado fue
 	# el crash); usa Reflex por Vulkan, el camino anterior a hoy.
 	$resNow = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
-	$nvAmd  = $script:isNvidia -and $chkAntiLag.Checked -and $config -like 'fsr3*' -and $resNow[2] -notlike '*dlss'
+	$nvAmd  = $script:isNvidia -and $chkAntiLag.Checked -and $config -like 'fsr3*' -and $resNow[2] -in 'xess', 'fsr'
 	if ($nvAmd -or ((-not $script:isNvidia) -and ($chkLowEnd.Checked -or $chkSoulsLow.Checked))) {
 		$psargs += '-AntiLag'
 		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y
@@ -868,14 +868,14 @@ $chkAntiLag.Visible = $script:isNvidia; $chkAntiLag.Text = 'Anti-Lag (experiment
 function Update-AntiLagBox {
 	$cfgNow = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	$resSel = if ($script:resShown.Count) { $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)] } else { $null }
-	$ok = $cfgNow -like 'fsr3*' -and -not (Is-FixedFg) -and -not ($resSel -and $resSel[2] -like '*dlss')  # (10-23) con DLSS tampoco
+	$ok = $cfgNow -like 'fsr3*' -and -not (Is-FixedFg) -and $resSel -and $resSel[2] -in 'xess', 'fsr'  # (10-23) solo con XeSS o FSR
 	if (-not $ok) { $chkAntiLag.Checked = $false }
 	$chkAntiLag.Visible = $ok -and $script:isNvidia  # (10-23) oculta si no se puede usar
 }
 $cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $cmbRes.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $form.Add_Shown({ Update-AntiLagBox })
-$tips.SetToolTip($chkAntiLag, 'Solo NVIDIA con la frame generation de AMD y reescalado XeSS, FSR o nativo (con DLSS no hace nada): NVIDIA Reflex para menos retraso. Experimental: si el juego se cierra, quitala.')
+$tips.SetToolTip($chkAntiLag, 'Solo NVIDIA con la frame generation de AMD y reescalado XeSS o FSR: NVIDIA Reflex para menos retraso. Experimental: si el juego se cierra, quitala.')
 # Calidad grafica: texturas, distancia, sombras, Luz RT y filtrado x16 ($script:gfxTop: etiqueta y desplegable de Texturas, Sombras, Distancia).
 Move-To $script:gfxTop[0] $gGfx 10 26 98; Move-To $cmbTex $gGfx 110 24 296
 Move-To $script:gfxTop[4] $gGfx 10 58 98; Move-To $cmbDist $gGfx 110 56 296
