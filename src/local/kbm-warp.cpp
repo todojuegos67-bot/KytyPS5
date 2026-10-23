@@ -153,11 +153,10 @@ bool EnsurePipeline(GraphicContext& graphics) {
 }
 
 vk::ImageView FrameView(GraphicContext& graphics, const VulkanImage& image) {
-	for (const auto& view: g.views)
-		if (view.image == image.image && view.format == image.format && view.view != nullptr) return view.view;
+	// A view made for each frame, kept for the next few (a frame image remade may reuse a handle: no lookup by it). A
+	// slot is reused 6 frames later, long after its present finished (the presenter waits for each present's work).
 	auto& slot  = g.views[g.next_view];
 	g.next_view = (g.next_view + 1) % static_cast<uint32_t>(g.views.size());
-	// (A frame image replaced since: its view's last use was a present long finished, the presenter waits for each.)
 	if (slot.view != nullptr) graphics.device.destroyImageView(slot.view, nullptr);
 	slot = {};
 	vk::ImageViewCreateInfo view {};
