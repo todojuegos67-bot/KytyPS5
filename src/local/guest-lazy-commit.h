@@ -157,7 +157,9 @@ inline bool Prefault(const void* address, uint64_t size) {
 // A VirtualProtect that commits the reserved pages first.
 inline bool Protect(void* address, uint64_t size, DWORD protect, DWORD* old_protect) {
 	if (Get().enabled) Prefault(address, size);
-	return VirtualProtect(address, size, protect, old_protect) != 0;
+	if (VirtualProtect(address, size, protect, old_protect) != 0) return true;
+	// (Refused: a page committed between the walk's look and the call's, or a region the quick look missed.)
+	return Get().enabled && Prefault(address, size) && VirtualProtect(address, size, protect, old_protect) != 0;
 }
 
 inline LONG CALLBACK Handler(EXCEPTION_POINTERS* pointers) {
