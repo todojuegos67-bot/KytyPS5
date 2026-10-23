@@ -888,7 +888,9 @@ function Set-ResByName([string]$name) {
 function Set-PresetLowProfile {
 	$cmbTex.SelectedIndex = 3; $cmbDist.SelectedIndex = 3; $cmbShadow.SelectedIndex = 3; $cmbDet.SelectedIndex = 4
 	$cmbRefl.SelectedIndex = 3; $cmbFade.SelectedIndex = 3; $cmbAaS.SelectedIndex = 3; $cmbRt.SelectedIndex = 0; $cmbAo.SelectedIndex = 0
-	$chkAf16.Checked = $false; $chkLod.Checked = $false
+	# (10-23) Lo que casi no cuesta, al maximo: filtrado x16, texturas nitidas y el postprocesado del juego.
+	$chkAf16.Checked = $true; $chkLod.Checked = $true
+	foreach ($pc in @($script:postChecks)) { if ($pc -and $pc[0]) { $pc[0].Checked = $true } }
 	if ($cmbOut) { $cmbOut.SelectedIndex = 0 }; $chk4K.Checked = $false
 	Fill-Res; Set-ResByName '900p juego'
 }
