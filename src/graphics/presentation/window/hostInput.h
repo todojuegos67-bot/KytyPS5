@@ -13,6 +13,9 @@ void               HostInputMouseButton(uint8_t mouse_button, bool down);
 void               HostInputToggleMouseToJoystick();
 // KYTY_KBM=1: keyboard and mouse play (hostInput.cpp). The motion/wheel calls return true when they took the event.
 [[nodiscard]] bool HostInputKbmEnabled();
+// KYTY_KBM_WARP: the mouse turn (degrees, +x right, +y as the mouse's y) the game has not shown yet: counts not read
+// plus the degrees the camera still owes. False without KYTY_KBM or with the mouse released.
+bool               HostInputKbmWarpDegrees(double* yaw, double* pitch);
 void               HostInputFocus(bool focused);
 bool               HostInputMouseMotion(int dx, int dy);
 bool               HostInputMouseWheel(int y);

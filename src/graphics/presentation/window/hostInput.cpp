@@ -558,6 +558,8 @@ struct KbmState {
 	std::atomic<int64_t>    received {0};
 	std::atomic<int64_t>    applied {0};
 	std::atomic<int64_t>    wheel_release_ns {0};
+	std::atomic<double>     warp_debt_x {0.0}; // KYTY_KBM_WARP: degrees owed after the last read (curve mapping)
+	std::atomic<double>     warp_debt_y {0.0};
 	std::atomic<uint32_t>   wheel_control {0};
 	// Guest pad thread only:
 	int64_t last_ns = 0;
@@ -893,6 +895,9 @@ bool KbmProvide(int* x, int* y) {
 		}
 	}
 
+	k.warp_debt_x.store(k.curve.valid ? k.debt_x : 0.0, std::memory_order_relaxed);
+	k.warp_debt_y.store(k.curve.valid ? k.debt_y : 0.0, std::memory_order_relaxed);
+
 	if (k.log_ns == 0) k.log_ns = now;
 	if (now - k.log_ns >= 1000000000) {
 		const double secs = (now - k.log_ns) * 1e-9;
@@ -1042,6 +1047,17 @@ void HostInputCameraForward(float fx, float fy, float fz) {
 void HostInputInit() {
 	KbmInit();
 	if (!g_kbm.enabled) GetInputMap();
+}
+
+bool HostInputKbmWarpDegrees(double* yaw, double* pitch) {
+	auto& k = g_kbm;
+	if (!k.enabled || !k.captured) return false;
+	const double dpc = k.dpc * k.sens;
+	*yaw   = static_cast<double>(k.acc_x.load(std::memory_order_relaxed)) / KBM_ONE * dpc +
+	       k.warp_debt_x.load(std::memory_order_relaxed);
+	*pitch = static_cast<double>(k.acc_y.load(std::memory_order_relaxed)) / KBM_ONE * dpc +
+	         k.warp_debt_y.load(std::memory_order_relaxed);
+	return std::isfinite(*yaw) && std::isfinite(*pitch);
 }
 
 bool HostInputKbmEnabled() {
