@@ -959,6 +959,25 @@ static uint32_t g_test_physical_memory_unmaps_before_failure = UINT32_MAX;
 static bool     g_test_fail_next_fixed_reserve_range_add     = false;
 #endif
 
+// Bytes of the guest backing store allocated (direct + flexible); the peak is logged every 30 s.
+static std::atomic<int64_t> g_guest_store_used {0};
+static std::atomic<int64_t> g_guest_store_peak {0};
+static void GuestStoreUsage(int64_t delta) {
+	const int64_t used = g_guest_store_used.fetch_add(delta, std::memory_order_relaxed) + delta;
+	int64_t       peak = g_guest_store_peak.load(std::memory_order_relaxed);
+	while (used > peak && !g_guest_store_peak.compare_exchange_weak(peak, used, std::memory_order_relaxed)) {
+	}
+	using Clock = std::chrono::steady_clock;
+	static std::atomic<int64_t> last {0};
+	const int64_t now  = std::chrono::duration_cast<std::chrono::seconds>(Clock::now().time_since_epoch()).count();
+	int64_t       prev = last.load(std::memory_order_relaxed);
+	if (now - prev >= 30 && last.compare_exchange_strong(prev, now, std::memory_order_relaxed)) {
+		std::printf("Guest store: %lld MiB allocated now, peak %lld MiB\n", static_cast<long long>(used >> 20),
+		            static_cast<long long>(g_guest_store_peak.load(std::memory_order_relaxed) >> 20));
+	}
+}
+static void GuestStoreTooSmall(const char* what, uint64_t len);
+
 class PhysicalMemory {
 public:
 	struct AllocatedBlock {
@@ -984,7 +1003,27 @@ public:
 
 	KYTY_CLASS_NO_COPY(PhysicalMemory);
 
-	static constexpr uint64_t TotalSize() { return static_cast<uint64_t>(13824) * 1024 * 1024; }
+	// The guest backing store: 13824 MiB (direct memory + flexible memory), or KYTY_GUEST_STORE_MB (at least 11264).
+	// The direct-memory size the game is told (sceKernelGetDirectMemorySize) shrinks with it.
+	static uint64_t TotalSize() {
+		static const uint64_t total = [] {
+			constexpr uint64_t Default = 13824;
+			constexpr uint64_t Minimum = 11264;
+			uint64_t           mib     = Default;
+			if (const char* v = std::getenv("KYTY_GUEST_STORE_MB"); v != nullptr && *v != 0) {
+				const uint64_t asked = std::strtoull(v, nullptr, 10);
+				mib = std::min(Default, std::max(Minimum, asked));
+				std::printf("Guest store: KYTY_GUEST_STORE_MB=%s -> %llu MiB (clamped to %llu..%llu)\n", v,
+				            static_cast<unsigned long long>(mib), static_cast<unsigned long long>(Minimum),
+				            static_cast<unsigned long long>(Default));
+			} else {
+				std::printf("Guest store: %llu MiB (KYTY_GUEST_STORE_MB not set)\n", static_cast<unsigned long long>(mib));
+			}
+			std::fflush(stdout);
+			return mib * 1024 * 1024;
+		}();
+		return total;
+	}
 	static uint64_t           Size() {
 		EXIT_IF(g_flexible_memory_size >= TotalSize());
 		return TotalSize() - g_flexible_memory_size;
@@ -1863,6 +1902,7 @@ bool PhysicalMemory::Available(uint64_t search_start, uint64_t search_end, size_
 
 void PhysicalMemory::ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator range, uint64_t start,
                                       uint64_t size) {
+	GuestStoreUsage(static_cast<int64_t>(size));
 	const auto range_start = range->first;
 	const auto range_end   = range->first + range->second;
 	m_free.erase(range);
@@ -1875,6 +1915,7 @@ void PhysicalMemory::ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator ran
 }
 
 void PhysicalMemory::AddFreeRange(uint64_t start, uint64_t size) {
+	GuestStoreUsage(-static_cast<int64_t>(size));
 	auto end  = start + size;
 	auto next = m_free.lower_bound(start);
 	if (next != m_free.begin()) {
@@ -2486,6 +2527,7 @@ bool FlexibleMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 
 void FlexibleMemory::ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator range, uint64_t start,
                                       uint64_t size) {
+	GuestStoreUsage(static_cast<int64_t>(size));
 	const auto range_start = range->first;
 	const auto range_end   = range->first + range->second;
 	m_free.erase(range);
@@ -2498,6 +2540,7 @@ void FlexibleMemory::ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator ran
 }
 
 void FlexibleMemory::AddFreeRange(uint64_t start, uint64_t size) {
+	GuestStoreUsage(-static_cast<int64_t>(size));
 	auto end  = start + size;
 	auto next = m_free.lower_bound(start);
 	if (next != m_free.begin()) {
@@ -3479,6 +3522,7 @@ int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t searc
 
 	uint64_t addr = 0;
 	if (!g_physical_memory->Alloc(search_start, search_end, len, alignment, &addr, memory_type)) {
+		GuestStoreTooSmall("direct memory", len);
 		LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
 		return KERNEL_ERROR_EAGAIN;
 	}
