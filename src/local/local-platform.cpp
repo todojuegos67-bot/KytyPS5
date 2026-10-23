@@ -1589,7 +1589,7 @@ Block*           g_blocks = nullptr;
 size_t           g_used   = 0;
 
 inline size_t Hash(uint64_t address) {
-	return static_cast<size_t>((address >> 16u) * 0x9E3779B97F4A7C15ull >> 48u) & (Slots - 1);
+	return static_cast<size_t>((address >> 4u) * 0x9E3779B97F4A7C15ull >> 48u) & (Slots - 1);
 }
 } // namespace MemoryTags
 
@@ -1613,39 +1613,67 @@ void MemoryTagAdd(int tag, int64_t requested, int64_t committed) {
 	MemoryTags::g_count[tag].fetch_add(requested >= 0 ? 1 : -1, std::memory_order_relaxed);
 }
 
-// (Called by the replaced operator new/delete below; nullptr: not tracked, the caller uses malloc.)
+// (Called by the replaced operator new/delete below.) The block comes from malloc as without tags, only recorded
+// here: a block of 1 MiB or more given by VirtualAlloc (as before 53e9bfe8's fix) was invalid wherever free(),
+// realloc() or another module's allocator released it (a black screen after the intro video on an RTX). A block that
+// free() released stays in the table until its address is recorded again (the summary may then overstate it).
 void* LargeNewAllocate(size_t size, void* caller) {
 	using namespace MemoryTags;
-	AcquireSRWLockExclusive(&g_lock);
-	if (g_blocks == nullptr)
-		g_blocks = static_cast<Block*>(VirtualAlloc(nullptr, Slots * sizeof(Block), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-	if (g_blocks == nullptr || g_used >= Slots / 2) {
-		ReleaseSRWLockExclusive(&g_lock);
-		return nullptr;
-	}
-	ReleaseSRWLockExclusive(&g_lock);
-	void* memory = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	void* memory = std::malloc(size);
 	if (memory == nullptr) return nullptr;
 	const auto address = reinterpret_cast<uint64_t>(memory);
 	AcquireSRWLockExclusive(&g_lock);
-	for (size_t i = Hash(address);; i = (i + 1) & (Slots - 1)) {
-		if (g_blocks[i].address <= 1) {
-			if (g_blocks[i].address == 0) g_used++;
-			g_blocks[i] = {address, size, caller};
-			break;
+	if (g_blocks == nullptr)
+		g_blocks = static_cast<Block*>(VirtualAlloc(nullptr, Slots * sizeof(Block), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	uint64_t replaced = 0;
+	bool     recorded = false;
+	if (g_blocks != nullptr) {
+		size_t tombstone = Slots;
+		size_t i         = Hash(address);
+		for (size_t n = 0; n < Slots; n++, i = (i + 1) & (Slots - 1)) {
+			if (g_blocks[i].address == address) {
+				replaced           = g_blocks[i].size; // (a stale entry: its block was released by free())
+				g_blocks[i]        = {address, size, caller};
+				recorded           = true;
+				break;
+			}
+			if (g_blocks[i].address == 1 && tombstone == Slots) tombstone = i;
+			if (g_blocks[i].address == 0) {
+				if (tombstone == Slots && g_used >= Slots / 2) break; // full: not tracked
+				if (tombstone == Slots) {
+					tombstone = i;
+					g_used++;
+				}
+				g_blocks[tombstone] = {address, size, caller};
+				recorded            = true;
+				break;
+			}
 		}
 	}
 	ReleaseSRWLockExclusive(&g_lock);
-	const auto bytes = static_cast<int64_t>((size + 4095u) & ~size_t {4095});
-	MemoryTagAdd(MemoryTagLargeNew, static_cast<int64_t>(size), bytes);
+	if (recorded) {
+		if (replaced != 0) MemoryTagAdd(MemoryTagLargeNew, -static_cast<int64_t>(replaced), -static_cast<int64_t>(replaced));
+		MemoryTagAdd(MemoryTagLargeNew, static_cast<int64_t>(size), static_cast<int64_t>(size));
+	}
 	return memory;
 }
 
-// True when it was a tracked block (now freed).
+// Forgets a recorded block (the caller frees it with free() either way).
 bool LargeNewFree(void* memory) {
 	using namespace MemoryTags;
 	const auto address = reinterpret_cast<uint64_t>(memory);
-	if (address == 0 || (address & 0xFFFFu) != 0 || g_blocks == nullptr) return false;
+	if (address <= 1 || g_blocks == nullptr) return false;
+	// (Most deletes are of small blocks never recorded: a shared look first, so threads do not queue on it.)
+	bool found = false;
+	AcquireSRWLockShared(&g_lock);
+	for (size_t i = Hash(address), n = 0; n < Slots && g_blocks[i].address != 0; i = (i + 1) & (Slots - 1), n++) {
+		if (g_blocks[i].address == address) {
+			found = true;
+			break;
+		}
+	}
+	ReleaseSRWLockShared(&g_lock);
+	if (!found) return false;
 	uint64_t size = 0;
 	AcquireSRWLockExclusive(&g_lock);
 	for (size_t i = Hash(address), n = 0; n < Slots && g_blocks[i].address != 0; i = (i + 1) & (Slots - 1), n++) {
@@ -1657,58 +1685,115 @@ bool LargeNewFree(void* memory) {
 	}
 	ReleaseSRWLockExclusive(&g_lock);
 	if (size == 0) return false;
-	VirtualFree(memory, 0, MEM_RELEASE);
-	MemoryTagAdd(MemoryTagLargeNew, -static_cast<int64_t>(size), -static_cast<int64_t>((size + 4095u) & ~uint64_t {4095}));
+	MemoryTagAdd(MemoryTagLargeNew, -static_cast<int64_t>(size), -static_cast<int64_t>(size));
 	return true;
+}
+
+// The module+offset of a code address ("kyty_emulator.exe+0x1c0482"), to look up in the build's .map/.pdb.
+static std::string CallerName(void* caller) {
+	HMODULE module = nullptr;
+	char    name[MAX_PATH] = "?";
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       static_cast<LPCSTR>(caller), &module) != 0 && module != nullptr) {
+		char path[MAX_PATH] {};
+		if (GetModuleFileNameA(module, path, MAX_PATH) != 0) {
+			const char* slash = std::strrchr(path, '\\');
+			std::snprintf(name, sizeof(name), "%s", slash != nullptr ? slash + 1 : path);
+		}
+	}
+	char text[MAX_PATH + 32];
+	std::snprintf(text, sizeof(text), "%s+0x%llx", name,
+	              static_cast<unsigned long long>(reinterpret_cast<uint64_t>(caller) - reinterpret_cast<uint64_t>(module)));
+	return text;
+}
+
+// Live large new blocks summed by caller, largest first; the allocation bases among top_bases annotated.
+static std::vector<std::pair<uint64_t, void*>> LargeNewCallers(const std::set<uint64_t>& top_bases, std::string* annotations) {
+	using namespace MemoryTags;
+	std::vector<std::pair<uint64_t, void*>> callers; // bytes, caller
+	std::unordered_map<void*, uint64_t>     sums;
+	// (Copied out under the lock into room reserved before it: no new or delete while it is held, as those take it.)
+	std::vector<Block> live;
+	live.reserve(Slots / 2 + 1);
+	AcquireSRWLockShared(&g_lock);
+	if (g_blocks != nullptr)
+		for (size_t i = 0; i < Slots && live.size() < live.capacity(); i++)
+			if (g_blocks[i].address > 1) live.push_back(g_blocks[i]);
+	ReleaseSRWLockShared(&g_lock);
+	std::vector<std::pair<uint64_t, void*>> blocks; // address, caller (for the annotations)
+	for (const auto& block: live) {
+		sums[block.caller] += block.size;
+		if (annotations != nullptr && block.size >= (uint64_t {64} << 20u)) blocks.emplace_back(block.address, block.caller);
+	}
+	for (const auto& [address, caller]: blocks) {
+		// (malloc's block sits inside the heap's VirtualAlloc of it: the breakdown lists that allocation's base.)
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != sizeof(info)) continue;
+		const auto base = reinterpret_cast<uint64_t>(info.AllocationBase);
+		if (top_bases.count(base) == 0) continue;
+		*annotations += " 0x";
+		char hex[24];
+		std::snprintf(hex, sizeof(hex), "%llx", static_cast<unsigned long long>(base));
+		*annotations += hex;
+		*annotations += "=new@" + CallerName(caller);
+	}
+	for (const auto& [caller, bytes]: sums) callers.emplace_back(bytes, caller);
+	std::sort(callers.begin(), callers.end(), std::greater<>());
+	return callers;
 }
 
 // " tagged: vulkan device-local N MiB (commit +M MiB, k), ...; new>=1MiB by caller: module+0xrva=N MiB ..."
 static int FormatMemoryTags(char* out, size_t room, const std::set<uint64_t>& top_bases, std::string* annotations) {
 	using namespace MemoryTags;
-	static const char* const names[MemoryTagCount] = {"vulkan device-local", "vulkan host", "vulkan ballast", "new>=1MiB"};
 	int len = std::snprintf(out, room, "; tagged:");
 	for (int t = 0; t < MemoryTagCount && len > 0 && static_cast<size_t>(len) < room; t++)
 		len += std::snprintf(out + len, room - len, "%s %lld MiB (commit %+lld MiB, %lld)", t == 0 ? "" : ",",
 		                     static_cast<long long>(g_requested[t].load() >> 20), static_cast<long long>(g_committed[t].load() >> 20),
 		                     static_cast<long long>(g_count[t].load()));
-	// Live large new blocks by caller.
-	std::vector<std::pair<uint64_t, void*>> callers; // bytes, caller
-	{
-		std::unordered_map<void*, uint64_t> sums;
-		AcquireSRWLockShared(&g_lock);
-		if (g_blocks != nullptr)
-			for (size_t i = 0; i < Slots; i++)
-				if (g_blocks[i].address > 1) {
-					sums[g_blocks[i].caller] += g_blocks[i].size;
-					if (annotations != nullptr && top_bases.count(g_blocks[i].address) != 0) {
-						char tag[96];
-						std::snprintf(tag, sizeof(tag), " 0x%llx=new@%p", static_cast<unsigned long long>(g_blocks[i].address),
-						              g_blocks[i].caller);
-						*annotations += tag;
-					}
-				}
-		ReleaseSRWLockShared(&g_lock);
-		for (const auto& [caller, bytes]: sums) callers.emplace_back(bytes, caller);
-	}
-	std::sort(callers.begin(), callers.end(), std::greater<>());
+	const auto callers = LargeNewCallers(top_bases, annotations);
 	if (!callers.empty() && len > 0 && static_cast<size_t>(len) < room) len += std::snprintf(out + len, room - len, "; new>=1MiB by caller:");
-	for (size_t i = 0; i < callers.size() && i < 6 && len > 0 && static_cast<size_t>(len) < room - 96; i++) {
-		HMODULE module = nullptr;
-		char    name[MAX_PATH] = "?";
-		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-		                       static_cast<LPCSTR>(callers[i].second), &module) != 0 && module != nullptr) {
-			char path[MAX_PATH] {};
-			if (GetModuleFileNameA(module, path, MAX_PATH) != 0) {
-				const char* slash = std::strrchr(path, '\\');
-				std::snprintf(name, sizeof(name), "%s", slash != nullptr ? slash + 1 : path);
-			}
-		}
-		len += std::snprintf(out + len, room - len, " %s+0x%llx=%lluMiB", name,
-		                     static_cast<unsigned long long>(reinterpret_cast<uint64_t>(callers[i].second) -
-		                                                     reinterpret_cast<uint64_t>(module)),
+	for (size_t i = 0; i < callers.size() && i < 6 && len > 0 && static_cast<size_t>(len) < room - 96; i++)
+		len += std::snprintf(out + len, room - len, " %s=%lluMiB", CallerName(callers[i].second).c_str(),
 		                     static_cast<unsigned long long>(callers[i].first >> 20u));
-	}
 	return len;
+}
+
+// KYTY_MEMORY_TAGS=1: one line a report, "Memory tags (30 s): private P MiB = tagged T + untagged U; top callers:
+// name=N MiB ..." - the ten largest holders of private commit known by caller: the Vulkan memory kinds (what their
+// vkAllocateMemory calls added to commit, as one caller each) and the call sites of C++ new of 1 MiB or more (live
+// bytes). "untagged" is the rest: the driver's own pools (pipelines), heap blocks under 1 MiB, malloc/VirtualAlloc.
+static void PrintMemoryTagSummary(unsigned long seconds) {
+	using namespace MemoryTags;
+	static const char* const names[MemoryTagCount] = {"vulkan-device-local", "vulkan-host", "vulkan-ballast", "new>=1MiB"};
+	const uint64_t private_bytes = ProcessMemory().private_bytes;
+	std::vector<std::pair<uint64_t, std::string>> top; // bytes, name
+	int64_t tagged = 0;
+	for (int t = 0; t < MemoryTagCount; t++) {
+		const int64_t committed = std::max<int64_t>(g_committed[t].load(), 0);
+		tagged += committed;
+		if (t != MemoryTagLargeNew && committed > 0) {
+			char label[96];
+			std::snprintf(label, sizeof(label), "%s(%lld allocations, %lld MiB asked)", names[t],
+			              static_cast<long long>(g_count[t].load()), static_cast<long long>(g_requested[t].load() >> 20));
+			top.emplace_back(static_cast<uint64_t>(committed), label);
+		}
+	}
+	for (const auto& [bytes, caller]: LargeNewCallers({}, nullptr)) top.emplace_back(bytes, "new@" + CallerName(caller));
+	std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+	std::string line;
+	char        head[256];
+	const auto  untagged = static_cast<int64_t>(private_bytes) - tagged;
+	std::snprintf(head, sizeof(head), "Memory tags (%lu s): private %llu MiB = tagged %lld MiB + untagged %lld MiB; top callers:", seconds,
+	              static_cast<unsigned long long>(private_bytes >> 20u), static_cast<long long>(tagged >> 20),
+	              static_cast<long long>(untagged / (1 << 20)));
+	line = head;
+	for (size_t i = 0; i < top.size() && i < 10; i++) {
+		char tail[48];
+		std::snprintf(tail, sizeof(tail), "=%lluMiB", static_cast<unsigned long long>(top[i].first >> 20u));
+		line += " " + top[i].second + tail;
+	}
+	std::printf("%s\n", line.c_str());
+	std::fflush(stdout);
 }
 
 // KYTY_MEMORY_BREAKDOWN_SECONDS (default 60, 0 off): where the process's private commit is, from a walk of its
@@ -1718,7 +1803,8 @@ void StartMemoryBreakdown() {
 	static std::once_flag once;
 	std::call_once(once, [] {
 		const char* text    = std::getenv("KYTY_MEMORY_BREAKDOWN_SECONDS");
-		const auto  seconds = text != nullptr ? std::strtoul(text, nullptr, 10) : 60ul;
+		// (30 s by default with KYTY_MEMORY_TAGS=1, the tagged summary's period.)
+		const auto  seconds = text != nullptr ? std::strtoul(text, nullptr, 10) : MemoryTagsEnabled() ? 30ul : 60ul;
 		if (seconds == 0) return;
 		std::thread([seconds] {
 			SetThreadDescription(GetCurrentThread(), L"Kyty.MemoryBreakdown");
@@ -1800,6 +1886,7 @@ void StartMemoryBreakdown() {
 				            static_cast<unsigned long long>(large_b >> 20u), tags,
 				            annotations.empty() ? "" : "; largest that are new:", annotations.c_str());
 				std::fflush(stdout);
+				if (MemoryTagsEnabled()) PrintMemoryTagSummary(seconds);
 			}
 		}).detach();
 	});
@@ -2368,7 +2455,8 @@ static void* KytyNew(size_t size, void* caller, bool nothrow) {
 }
 static void KytyDelete(void* memory) {
 	if (memory == nullptr) return;
-	if (!LocalPlatform::MemoryTagsEnabled() || !LocalPlatform::LargeNewFree(memory)) std::free(memory);
+	if (LocalPlatform::MemoryTagsEnabled()) (void)LocalPlatform::LargeNewFree(memory);
+	std::free(memory);
 }
 
 void* operator new(size_t size) { return KytyNew(size, _ReturnAddress(), false); }
