@@ -144,7 +144,7 @@ jobs:
       # build time from NVIDIA's public release, never committed. CMakeLists.txt enables KYTY_FRAMEGEN_STREAMLINE when
       # _Build/deps/streamline/sdk/include/sl.h exists. Its packages are draft releases (they hold NVIDIA's DLLs).
       - name: Streamline SDK
-        if: ${{ github.ref_name == 'dlss-prueba' || github.ref_name == 'dlssg-decouple' || github.ref_name == 'dlss-release' || github.ref_name == 'lowmem-16gb' || github.ref_name == 'merge-1016' || github.ref_name == 'upscale' || github.ref_name == 'merge-1019' || github.ref_name == 'release-1023' }}
+        if: ${{ github.ref_name == 'dlss-prueba' || github.ref_name == 'dlssg-decouple' || github.ref_name == 'dlss-release' || github.ref_name == 'lowmem-16gb' || github.ref_name == 'merge-1016' || github.ref_name == 'upscale' || github.ref_name == 'merge-1019' || github.ref_name == 'release-1023' || inputs.publish == true }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -188,7 +188,7 @@ jobs:
       # Intel XeSS SDK (super resolution, src/local/xess-sr.cpp; the upscale branch): its headers and libxess.dll
       # (Intel's redistributable binary) from Intel's public repository, never committed.
       - name: XeSS SDK
-        if: ${{ github.ref_name == 'upscale' || github.ref_name == 'merge-1019' || github.ref_name == 'release-1023' }}
+        if: ${{ github.ref_name == 'upscale' || github.ref_name == 'merge-1019' || github.ref_name == 'release-1023' || inputs.publish == true }}
         shell: pwsh
         env:
           XESS_VERSION: v3.0.2
@@ -246,6 +246,8 @@ jobs:
             New-Item -ItemType Directory -Force "$out\LICENSES" | Out-Null
             Copy-Item _Build\deps\xess\LICENSE.txt "$out\LICENSES\XeSS-LICENSE.txt"
           }
+          # Una release publica siempre lleva DLSS, DLSS-G (Streamline) y XeSS: sin ellos no se publica.
+          if ('${{ inputs.publish }}' -eq 'true' -and (!(Test-Path _Build\deps\streamline\sdk\bin\x64\sl.interposer.dll) -or !(Test-Path _Build\deps\xess\bin\libxess.dll))) { throw 'publish: Streamline o XeSS no estan; la release no se publica sin ellos' }
           if (Test-Path _Build\deps\streamline\sdk\bin\x64) {
             New-Item -ItemType Directory -Force "$out\streamline" | Out-Null
             Copy-Item _Build\deps\streamline\sdk\bin\x64\*.dll "$out\streamline"
