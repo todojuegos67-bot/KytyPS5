@@ -877,7 +877,7 @@ $panel.Controls.Add($chkSoulsUltra); Move-To $chkSoulsUltra $gModes 12 54 186
 $chkSoulsExt = New-Check 'Souls Extreme mode' 0 0 206 'soulsext'
 $tips.SetToolTip($chkSoulsExt, 'For Souls addicts. RTX 5080, RTX 5090 or better: the game''s 4K cinematic mode and absolutely everything maxed (Ultra on everything, x16 filtering and sharp textures). FPS depends on how powerful your GPU and CPU are.')
 $panel.Controls.Add($chkSoulsExt); Move-To $chkSoulsExt $gModes 202 54 206
-function Set-PresetUltra { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex = 0; $cmbShadow.SelectedIndex = 0; $cmbDet.SelectedIndex = 1; $cmbRt.SelectedIndex = 2; $cmbAo.SelectedIndex = 2; $cmbRefl.SelectedIndex = 1; $cmbFade.SelectedIndex = 1; $cmbAaS.SelectedIndex = 2 }
+function Set-PresetUltra { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex = 0; $cmbShadow.SelectedIndex = 0; $cmbDet.SelectedIndex = 1; $cmbRt.SelectedIndex = 2; $cmbAo.SelectedIndex = 2; $cmbRefl.SelectedIndex = 1; $cmbFade.SelectedIndex = 1; $cmbAaS.SelectedIndex = 0 }  # (10-23) nitidez del AA al maximo (no cuesta)
 function Set-PresetExtreme { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex = 0; $cmbShadow.SelectedIndex = 0; $cmbDet.SelectedIndex = 0; $cmbRt.SelectedIndex = 3; $cmbAo.SelectedIndex = 3; $cmbRefl.SelectedIndex = 0; $cmbFade.SelectedIndex = 0; $cmbAaS.SelectedIndex = 0; $chkAf16.Checked = $true; $chkLod.Checked = $true
 	if ($cmbOut) { $cmbOut.SelectedIndex = 1 }; $chk4K.Checked = $true }  # (10-23) extremo: modo cinematico del juego a 4K
 # (10-23) Modo Souls PC low profile: 900p y todo en bajo, para PCs modestos.
