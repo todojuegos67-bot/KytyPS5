@@ -240,6 +240,9 @@ function Start-Game {
 		if ($config -like 'dlss*') { $sets += 'KYTY_DLSSG_REFLEX=boost' }
 	}
 	if ($cmbRt.SelectedIndex -gt 0) { $psargs += @('-Ssgi', "$($cmbRt.SelectedIndex)") }
+	foreach ($n in 'KYTY_RT_SHADOWS', 'KYTY_RT_REFLECTIONS') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }  # (10-24) RT beta
+	if ($cmbRtSh -and $cmbRtSh.SelectedIndex -gt 0) { $env:KYTY_RT_SHADOWS = "$($cmbRtSh.SelectedIndex)" }
+	if ($cmbRtRf -and $cmbRtRf.SelectedIndex -gt 0) { $env:KYTY_RT_REFLECTIONS = "$($cmbRtRf.SelectedIndex)" }
 	# (10-23) Sombras RT retiradas: el juego tiene las suyas (Sombras Ultra)
 	if ($cmbShadow.SelectedIndex -gt 0) { $psargs += @('-Shadows', @('0', '3', '1', '2')[$cmbShadow.SelectedIndex]) }  # (10-23) Alto = 3
 	$rN = @('Ultra', '', 'Normal', 'Low'); if ($rN[$cmbRefl.SelectedIndex]) { $psargs += @('-Reflections', $rN[$cmbRefl.SelectedIndex]) }
@@ -341,7 +344,7 @@ function Start-Game {
 	# Cinematico a 60 quitado (no funcionaba): el modo cinematico queda como en PS5.
 	$env:KYTY_UNLOCK_30 = '0'
 	# (10-23) Mando remapeado (KYTY_PAD_MAP) y teclado y raton (KYTY_KBM): ver "Mapear mando". Sin nada, como siempre.
-	foreach ($n in 'KYTY_PAD_MAP', 'KYTY_KBM', 'KYTY_KBM_MAP', 'KYTY_KBM_SENS', 'KYTY_KBM_ANTIDZ', 'KYTY_KBM_CALIBRATE') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
+	foreach ($n in 'KYTY_PAD_MAP', 'KYTY_KBM', 'KYTY_KBM_MAP', 'KYTY_KBM_SENS', 'KYTY_KBM_ANTIDZ', 'KYTY_KBM_CALIBRATE', 'KYTY_KBM_WARP') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 	$padMap = Get-IniValue 'padmap' ''; if ($padMap) { $env:KYTY_PAD_MAP = $padMap }
 	# (10-23) "Calibrar camara": el emulador mide cuanto gira la camara del juego con cada posicion del stick y lo guarda
 	# en kbm_curve.txt junto al exe; desde entonces el raton gira la camara exactamente lo que se mueve.
@@ -351,6 +354,7 @@ function Start-Game {
 		$kbmMap = Get-IniValue 'kbmmap' ''; if ($kbmMap) { $env:KYTY_KBM_MAP = $kbmMap }
 		$env:KYTY_KBM_SENS   = ($trkSens.Value / 100).ToString([System.Globalization.CultureInfo]::InvariantCulture)
 		$env:KYTY_KBM_ANTIDZ = ($trkAdz.Value / 100).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+		if ($chkWarp.Checked) { $env:KYTY_KBM_WARP = '1' } else { Remove-Item Env:KYTY_KBM_WARP -ErrorAction SilentlyContinue }
 	}
 	foreach ($n in 'KYTY_VSYNC_LOCK', 'KYTY_FPS_CAP', 'KYTY_FLIP_WHEN_READY') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 	# G-Sync: reloj del emulador suelto del monitor. Mostrar cada frame al momento solo con FPS desbloqueados y sin
@@ -1650,6 +1654,22 @@ foreach ($pp in @(@('Motion Blur', 'motionblur'), @('Depth of Field', 'dof'), @(
 	$script:postChecks += ,@($c, $pp[1])
 	$px += 134; if ($px -gt 300) { $px = 12; $py += 30 }
 }
+# (10-24) Ray tracing en pantalla (beta): sombras del sol y reflejos con denoise. Solo con DLSS, XeSS o FSR.
+$gRt = New-Group 'Ray tracing (beta)' 10 586 420 92
+function New-RtCombo([string]$label, [string]$key, $y, [string]$tip) {
+	$lb = New-Label $label $smallFont $ink 0 0 98 22; $panel.Controls.Add($lb)
+	$c = New-Object System.Windows.Forms.ComboBox
+	$c.DropDownStyle = 'DropDownList'; $c.Font = $smallFont; $c.Tag = $key
+	foreach ($it in 'No', 'Bajo', 'Alto', 'Ultra') { [void]$c.Items.Add($it) }
+	$v = 0; [void][int]::TryParse((Get-IniValue $key '0'), [ref]$v); $c.SelectedIndex = [math]::Min([math]::Max(0, $v), 3)
+	$c.Add_SelectedIndexChanged({ param($sender, $e) Set-IniValue $sender.Tag "$($sender.SelectedIndex)" })
+	$tips.SetToolTip($c, $tip); $panel.Controls.Add($c)
+	Move-To $lb $gRt 10 ($y + 2) 98; Move-To $c $gRt 110 $y 296
+	return $c
+}
+$cmbRtSh = New-RtCombo 'Sombras RT' 'rtshadow' 24 'Sombras del sol trazadas por rayos sobre la imagen, con denoise. Solo con DLSS, XeSS o FSR. Bajo ~0,3 ms, Alto ~1 ms, Ultra ~1,5 ms. Beta.'
+$cmbRtRf = New-RtCombo 'Reflejos RT' 'rtrefl' 56 'Reflejos trazados por rayos sobre la imagen (agua, charcos, suelos), con denoise. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Alto ~1 ms, Ultra ~2 ms. Beta.'
+
 $gCtl = New-Group 'Controles' 450 604 420 214
 # (10-23) Controles en un desplegable: el boton los muestra u oculta.
 $gCtl.Visible = $false
@@ -1706,7 +1726,11 @@ $tips.SetToolTip($trkSens, 'Cuanto gira la camara por cada movimiento del raton 
 $trkCam = New-Slider 'kbmcam' 1 10 10 12 116 { param($v) "Velocidad de camara (raton): $v" }
 $tips.SetToolTip($trkCam, 'Solo con teclado y raton: la velocidad maxima de giro de la camara del juego. 10 = giros grandes rapidos. Al quitar teclado y raton vuelve la del menu del juego.')
 $tips.SetToolTip($trkAdz, 'Salta la zona muerta del stick del juego: con mas, un movimiento pequeno del raton ya gira la camara. Si la camara se mueve sola, bajalo.')
-function Update-KbmEnabled { $trkSens.Enabled = $chkKbm.Checked; $trkAdz.Enabled = $chkKbm.Checked; $trkCam.Enabled = $chkKbm.Checked }
+# (10-24) Frame warp: la camara del raton desplaza el 3D al momento (HUD quieto), tambien con la frame generation de AMD.
+$chkWarp = New-Check 'Camara instantanea (frame warp)' 0 0 300 'kbmwarp'
+$tips.SetToolTip($chkWarp, 'Solo con teclado y raton: justo antes de mostrar cada imagen, el 3D se desplaza lo que has movido el raton (el HUD no se mueve). Funciona sin frame generation y con la de AMD; con la de NVIDIA no hace nada. Experimental.')
+$panel.Controls.Add($chkWarp); Move-To $chkWarp $gCtl 222 120 186
+function Update-KbmEnabled { $trkSens.Enabled = $chkKbm.Checked; $trkAdz.Enabled = $chkKbm.Checked; $trkCam.Enabled = $chkKbm.Checked; $chkWarp.Enabled = $chkKbm.Checked }
 $chkKbm.Add_CheckedChanged({ Update-KbmEnabled })
 Update-KbmEnabled
 # (10-23) Calibrar la camara para el raton: arranca el juego con KYTY_KBM_CALIBRATE=1 (y teclado y raton).
