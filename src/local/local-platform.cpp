@@ -1900,6 +1900,12 @@ void KeepResident() {
 		const char* text = std::getenv("KYTY_RESIDENT_MB");
 		const auto  mb   = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
 		if (mb == 0) return;
+		// KYTY_SOFT_RELEASE=1: no SetProcessWorkingSetSize of any kind (the working set left to Windows).
+		if (const char* soft = std::getenv("KYTY_SOFT_RELEASE"); soft != nullptr && soft[0] == '1') {
+			std::printf("Memory: KYTY_RESIDENT_MB ignored (KYTY_SOFT_RELEASE=1)\n");
+			std::fflush(stdout);
+			return;
+		}
 		const SIZE_T minimum = static_cast<SIZE_T>(mb << 20u);
 		// (The maximum soft: the process may grow past it; the minimum hard: Windows keeps that much in RAM.)
 		const SIZE_T maximum = minimum + (SIZE_T {512} << 20u);
@@ -1921,6 +1927,12 @@ void StartWorkingSetTrim() {
 		const char* text    = std::getenv("KYTY_TRIM_RAM_SECONDS");
 		const auto  seconds = text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul;
 		if (seconds == 0) return;
+		// KYTY_SOFT_RELEASE=1: no working set trim at all (it pages out; soft-release.cpp gives RAM back without it).
+		if (const char* soft = std::getenv("KYTY_SOFT_RELEASE"); soft != nullptr && soft[0] == '1') {
+			std::printf("RAM trim: off (KYTY_SOFT_RELEASE=1)\n");
+			std::fflush(stdout);
+			return;
+		}
 		// KYTY_TRIM_RAM_MB (default 8192): only a working set past it is emptied. Emptying it every minute
 		// regardless re-faulted the 4-5 GB the game touches in a minute each time (10-10, 1-1 to the boss).
 		const char* limit_text = std::getenv("KYTY_TRIM_RAM_MB");

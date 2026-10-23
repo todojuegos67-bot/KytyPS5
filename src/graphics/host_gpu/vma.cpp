@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "live-counters.h"
 #include "local-platform.h"
+#include "soft-release.h"
 
 #include <cstdio>
 #include "kytyGitVersion.h"
@@ -225,6 +226,7 @@ bool GraphicContext::CreateAllocator() {
 	const char* small_env = std::getenv("KYTY_SMALL_VRAM");
 	small_video_memory = GetTotalMemoryBudget(false) < (uint64_t {12} << 30u) || (small_env != nullptr && *small_env == '1');
 	LocalPlatform::StartWorkingSetTrim();
+	SoftRelease::Start();
 	LocalPlatform::KeepResident();
 	LocalPlatform::StartMemoryBreakdown();
 	// The game buffers' pool (graphicContext.h): VMA's device-local type for them, VMA's block sizes (dedicated memory
