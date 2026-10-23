@@ -570,6 +570,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->shadows           = "alto";
 		s->rt_light          = "0";
 		s->ambient_occlusion = "2";
+		s->aa_sharp          = "alto";
 	} else if (preset == "ultra") {
 		max();
 		s->detail            = "muy-alto";
