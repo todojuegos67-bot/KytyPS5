@@ -40,6 +40,7 @@ struct DynMultiplier {
 	std::array<double, kMax + 1> free {};  // real fps measured at m (0 = unknown)
 	std::array<int, kMax + 1>    age {};   // windows since free[m] was measured
 	std::array<int, kMax + 1>    block {}; // windows left with level m blocked
+	std::array<int, kMax + 1>    reverts {}; // step-up reverts of level m (each doubles its block)
 	double cost       = 0.0;               // seconds per extra generated frame (0 = unknown)
 	int    settle     = 0;                 // windows left before measuring after a switch
 	int    check_from = 0;                 // after a step up: the level we came from (0 = none)
@@ -140,10 +141,14 @@ struct DynMultiplier {
 				if (c > 0.0) cost = cost > 0.0 ? 0.5 * cost + 0.5 * c : c;
 			}
 			if ((shown < 1.05 * check_shown && shown < 0.97 * T) || real < MinReal(m)) {
-				block[m] = 10;
+				// 10-23: each revert of the same level blocks it twice as long (30 s, 60, 120, up to 4 min): x4/x5 every
+				// ~5 s changed the pacing each time (a hitch per switch, 20261023-205449).
+				reverts[m] = std::min(reverts[m] + 1, 4);
+				block[m]   = 30 << (reverts[m] - 1);
 				free[m]  = 0.0;
 				return go(from);
 			}
+			reverts[m] = 0; // kept
 		}
 		// Down after 2 windows in a row below the level's minimum (to the largest lower level whose known rate meets its own).
 		if (m > 2 && (low_n >= 2 || m > maxm)) {
