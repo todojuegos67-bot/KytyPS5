@@ -27,6 +27,7 @@
 #include "live-counters.h"
 #include "local-platform.h"
 #include "native-resource-state.h"
+#include "scene-tags.h"
 
 #include <algorithm>
 #include <array>
@@ -4960,16 +4961,33 @@ void TextureCache::EraseRetired() {
 // faults 73 -> 232), and they held their video memory for good. One the game draws again is made again from its bytes.
 // Passed over (to the back of the list): images whose bytes only the GPU has (no download here), depth images with a
 // stencil association (deleting depth deletes it too), unregistered ones.
+// Texture pools of the world the game is in stay where the budget is 12 GiB or more (the collector below takes them,
+// oldest first, when it runs): one-level arrays of ChunkedUploadMin and up that shaders only sample. The game samples a
+// pool through views from a few first layers to a last one that moves as it streams, and leaves one for minutes as the
+// camera moves on: retired, the next view made it again whole from guest memory (2-2 and 5-2 tours: 1.3-2 GB, 150-460
+// ms frames, 2-3 times a map), where the image kept serves it or gives its layers on the GPU (HoldLayers). A kept
+// pool's watchers take a fault per MiB the game writes at most (partial dirty state). One last used before the game
+// entered its world (SceneTags) goes as before: the memory of the worlds left comes back.
 void TextureCache::RetireStaleImages(uint64_t tick) {
 	constexpr uint64_t RetireTicks    = 1200;
 	constexpr size_t   MaxRetirements = 16;
+	if (const auto generation = SceneTags::Generation(); generation != m_scene_generation) {
+		m_scene_generation = generation;
+		m_scene_tick       = tick;
+	}
 	if (tick <= RetireTicks) return;
 	thread_local std::vector<ImageId> stale, kept;
 	stale.clear();
 	kept.clear();
+	const bool keep_pools = !m_graphics.small_video_memory;
 	m_lru_cache.ForEachItemBelow(tick - RetireTicks, [&](ImageId id) {
 		const auto* owner = m_slot_images.try_get(id);
 		if (owner == nullptr || !owner->registered) return false;
+		// (Left at its age: the collector's.)
+		if (keep_pools && owner->info.resources.levels == 1 && owner->info.resources.layers > 1 &&
+		    owner->info.data.size >= ChunkedUploadMin && GuestTexture(*owner) &&
+		    m_lru_cache.TickOf(owner->lru_id) >= m_scene_tick)
+			return false;
 		if (owner->depth_id || owner->IsGpuModified())
 			kept.push_back(id);
 		else

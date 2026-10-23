@@ -430,6 +430,8 @@ private:
 	uint64_t                                          m_logged_private       = 0;
 	bool                                              m_logged_short_of_ram  = false;
 	uint64_t         m_gc_tick                = 0;
+	uint64_t         m_scene_generation       = 0; // RetireStaleImages: the world the game is in (SceneTags), entered
+	uint64_t         m_scene_tick             = 0; // at this tick
 	std::atomic<uint64_t> m_frame {0};
 	struct PendingDownload {
 		uint64_t address = 0, size = 0, tick = 0;
