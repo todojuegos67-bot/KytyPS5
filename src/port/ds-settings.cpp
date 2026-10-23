@@ -575,6 +575,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->detail            = "muy-alto";
 		s->rt_light          = "2";
 		s->ambient_occlusion = "2";
+		s->aa_sharp          = "ultra"; // (10-23) costs nothing
 	} else if (preset == "extremo") {
 		max();
 		s->detail            = "ultra";
