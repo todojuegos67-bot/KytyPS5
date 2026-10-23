@@ -81,7 +81,9 @@ param(
 	[switch]$ShadowsUltra,
 	[string]$ExtraConvars = '',  # (10-23) convars del juego extra (KYTY_GAME_CONVARS), p. ej. la velocidad de camara con raton  # (10-23) sombras del juego por encima de Maximo (mas distancia y cascadas, sombras de contacto del juego)
 	[switch]$AntiLag,
-	[ValidateSet(-1, 0, 1, 2, 3)][int]$ContactShadows = -1, # KYTY_CONTACT_SHADOWS: sombras de contacto por rayos
+	[ValidateSet(-1, 0, 1, 2, 3)][int]$ContactShadows = -1, # (alias de -RtShadows)
+	[ValidateSet(-1, 0, 1, 2, 3)][int]$RtShadows = -1, # KYTY_RT_SHADOWS: sombras RT del sol en pantalla con denoise (0 no, 1 bajo, 2 alto, 3 ultra; solo DLSS/XeSS/FSR)
+	[double]$RtShadowsStrength = -1, # KYTY_RT_SHADOWS_STRENGTH (0..1, 0.6 por defecto)
 	[ValidateSet(-1, 0, 1, 2, 3)][int]$Ssgi = -1, # KYTY_SSGI: iluminacion por rayos en pantalla antes del reescalador
 	[string]$Upscale = '',
 	[int]$UpscaleHeight = 0,
@@ -440,7 +442,9 @@ if ($Quality -and $Quality -ne 'standard') {
 # (10-22) -AntiLag: AMD Anti-Lag 2 si el driver lo tiene; si no, limitador del emulador (1 frame en cola). No con DLSS (Reflex).
 if ($AntiLag) { $environment['KYTY_ANTILAG'] = '1' }
 if ($Ssgi -ge 0) { $environment['KYTY_SSGI'] = "$Ssgi" }
-if ($ContactShadows -ge 0) { $environment['KYTY_CONTACT_SHADOWS'] = "$ContactShadows" }
+if ($RtShadows -lt 0 -and $ContactShadows -ge 0) { $RtShadows = $ContactShadows }
+if ($RtShadows -ge 0) { $environment['KYTY_RT_SHADOWS'] = "$RtShadows" }
+if ($RtShadowsStrength -ge 0) { $environment['KYTY_RT_SHADOWS_STRENGTH'] = $RtShadowsStrength.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
 # (10-22) -Shadows 0|1|2: sombras Maximo (las del juego), Medio (sol hasta 125 m), Bajo (sol hasta 60 m, sin sombreado
 # ambiental ni sombras de focos). A menos nivel pueden aparecer de golpe al acercarse (popping).
 $detailConvars = @{

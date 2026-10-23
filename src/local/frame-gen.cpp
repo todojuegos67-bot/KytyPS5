@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -5585,26 +5586,37 @@ bool SsrMaterial(SsrTarget& target, int& channel, bool& gloss) {
 }
 
 namespace {
-// KYTY_CONTACT_SHADOWS=0|1|2|3 ("Sombras RT": No / Normal / Alta / Ultra; cshadow.comp): screen-space contact shadows
-// toward the sun, recorded after SSGI and before the upscaler. 1: half-res trace, 16 steps, temporal + a-trous 1, 2;
-// 2: full res, 24 steps, a-trous 1, 2, 4; 3: full res, 56 steps, a little longer ray (x1.15), binary-search hit refine,
-// temporal alpha 0.05, a-trous 1, 2, 4 (as 2: no wider blur), strength x0.9. The composite only darkens (color *
-// factor, factor in [1 - strength, 1], min'd with the input), skips sky and > 80 m, and is masked by the history count. KYTY_CONTACT_SHADOWS_STRENGTH (0.7: how dark a contact shadow
-// gets, 0..1), KYTY_CONTACT_SHADOWS_LENGTH (1.0: ray length scale, 0.25..4).
+// KYTY_RT_SHADOWS=0|1|2|3 ("Sombras RT": off / Low / High / Ultra; cshadow.comp; KYTY_CONTACT_SHADOWS, the old name,
+// is read when it is unset): screen-space ray-traced sun shadows on the PS5 Pro path's linear HDR color (before the
+// game's exposure, the upscaler and its TAA), recorded first in Upscale (before SSGI / GTAO / SSR). 1: half-res trace,
+// 12 steps, temporal + a-trous 1, 2; 2: full res, 20 steps, a-trous 1, 2, 4; 3: full res, 32 steps, rays x1.25,
+// slower temporal alpha. The composite only darkens: color * (1 - strength * fade * (1 - visibility)), nothing on the
+// sky, faded out between KYTY_RT_SHADOWS_FADE (25 m) and twice that. KYTY_RT_SHADOWS_STRENGTH (0.6, 0..1),
+// KYTY_RT_SHADOWS_LENGTH (1.0: world ray length in m, 0.25..4), KYTY_RT_SHADOWS_HOLD (20 s: a sun unseen is kept).
 //
-// The sun's direction (no fixed guess; off while unknown):
+// Why the first version looked wrong: its depth reconstruction took the render's row 0 as NDC y -1, while the game's
+// viewport (GNM, yscale < 0) puts NDC y +1 there: the scene it marched was mirrored vertically against the light it
+// was given (shadows cast "upward", lit floors left alone, a lighting vote picking a flipped or view-space axis to
+// compensate); its lit mask and light vote used luma thresholds that mean nothing in the pre-exposure HDR range; its
+// rays reached 2 m (doubling the game's own shadow-map shadows, grey far away) and its fade followed vote locks
+// (popping).
+//
+// The sun's direction:
 //  1. OnShadowConsumer (renderCompute.cpp): a dispatch that samples a square, layered (>= 4), depth-like image of
 //     >= 512 px (the sun cascades' shadow-map array; Demon's Souls: 1024x1024x80 at 0x102a400000) is a shadow
 //     consumer (the deferred sun lighting / shadow resolve). Its flattened SRT and its constant buffers (<= 64 KiB, the
 //     first 4 KiB) are searched for orthographic matrices: 4x4 (either major) with a (0, 0, 0, 1) projective row, or
 //     3x4 rows, whose 3x3 rows are mutually orthogonal (|cos| < 0.01), x and y scales equal (a square map) and the
 //     depth scale different (so no rigid view / object matrix passes); the camera's own forward is refused. The depth
-//     row is the light axis; the cascades must agree (2 degrees), else the axis seen in 3 frames running.
-//  2. The axis is in the matrix's input space (world, or view) with an unknown sign: four view-space candidates
-//     (world through the camera's view = P^-1 * view_proj (g_camera, P the upscaler's view_to_clip), and as-is; each
-//     sign). A vote pass (mode 5, every frame until settled, then every 16th) compares the game's own lit luma of
-//     pixels facing each candidate (n.l > 0.5) with that of pixels facing away (< -0.2); the candidate whose ratio
-//     (EMA of the log) is >= 1.2 and beats the others' axis wins. None (an interior, no sun) -> no contact shadows.
+//     row is the light axis; the cascades must agree (2 degrees), else the axis seen in 3 frames running. The draws
+//     into that array (OnShadowDraw) are the fallback source while no consumer is seen.
+//  2. The axis is in the matrices' input space (world, or the camera's view) with an unknown sign. Space: the reading
+//     that stays put while the camera turns (> 15 degrees) is the right one (2 agreeing turns decide; the draws'
+//     matrices are world; KYTY_RT_SHADOWS_SPACE=world|view forces it). Sign: the sun is above the horizon.
+//  3. World up and the screen's y convention: a calibration pass (mode 5) counts the depth buffer's floors (normals
+//     within 14 degrees of an axis) along each world axis, both signs, in both conventions; the winner (2x the next)
+//     decides; priors +y up, row 0 = NDC y +1 (KYTY_RT_SHADOWS_UP=y|-y|z|..., KYTY_RT_SHADOWS_FLIPY=1|0 force them).
+// The view-space light is the world sun through the current camera every frame; the pass is off while any is unknown.
 struct CShadowPass {
 	vk::DescriptorSetLayout set_layout = nullptr;
 	vk::PipelineLayout      layout     = nullptr;
@@ -5621,13 +5633,17 @@ struct CShadowPass {
 	VmaAllocation           vote_mem      = nullptr;
 	const uint32_t*         vote_mapped   = nullptr;
 	bool                    slot_voted[4] {};
-	float                   ema[4] {};
-	uint32_t                votes = 0;
-	int                     chosen = -1, last_chosen = -1, lead = -1;
-	uint32_t                lead_n = 0;
-	bool                    locked = false; // (the vote agreed once for this latched sun: space and sign fixed)
-	bool                    latched = false, switching = false, have_dir = false;
-	std::array<float, 3>    latch_axis {}, switch_axis {}, last_dir {};
+	// Calibration: floors per hypothesis (convention c (0 row 0 = NDC +1, 1 mirrored) * 6 + axis * 2 + negative).
+	double                  calib[12] {};
+	int                     hyp = -1; // the decided hypothesis (-1: none yet)
+	// The sun's space: 0 unknown, 1 world, 2 view; turns that voted for each.
+	int                     space = 0, world_votes = 0, view_votes = 0;
+	bool                    space_ref = false;
+	std::array<double, 3>   ref_axis {}, ref_vw {}, ref_fwd {};
+	uint64_t                space_flip = ~0ull;
+	// The latched world-space sun (toward the light).
+	bool                    latched = false, switching = false, said_on = false;
+	std::array<double, 3>   latch_axis {}, switch_axis {};
 	float                   fade = 0.0f;
 	std::chrono::steady_clock::time_point latch_time {}, last_fresh {};
 	vk::QueryPool           pool      = nullptr;
@@ -5651,13 +5667,23 @@ static_assert(sizeof(CShadowPush) == 160);
 
 int ContactQuality() {
 	static const int quality = [] {
-		const char* value = std::getenv("KYTY_CONTACT_SHADOWS");
-		const int   q     = value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
-		std::printf("CSHADOW: KYTY_CONTACT_SHADOWS=%s read (level %d)\n", value != nullptr ? value : "(unset)", q);
-		std::fflush(stdout);
+		const char* name  = "KYTY_RT_SHADOWS";
+		const char* value = std::getenv(name);
+		if (value == nullptr || *value == '\0') name = "KYTY_CONTACT_SHADOWS", value = std::getenv(name);
+		const int q = value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
+		if (q > 0) {
+			std::printf("RTSHADOW: %s=%s read (level %d)\n", name, value, q);
+			std::fflush(stdout);
+		}
 		return q;
 	}();
 	return quality;
+}
+
+float RtShadowEnv(const char* name, const char* old_name, float fallback, float hi) {
+	const char* value = std::getenv(name);
+	if ((value == nullptr || *value == '\0') && old_name != nullptr) value = std::getenv(old_name);
+	return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, hi) : fallback;
 }
 
 // The probe's findings (any recording thread writes, the upscaler's reads).
@@ -5668,6 +5694,8 @@ struct SunProbe {
 	uint32_t                agree = 0;  // matrices agreeing in that dispatch
 	uint32_t                stable = 0; // flips in a row with the same axis
 	bool                    valid = false;
+	int                     source = 0; // 1 a shadow consumer dispatch, 2 shadow-map draws
+	uint64_t                consumer_flip = 0;
 	std::array<float, 16>   view_proj {}; // the camera's (g_camera) when it was seen
 	bool                    have_camera = false;
 	std::array<std::atomic<uint64_t>, 8> consumers {};
@@ -5822,7 +5850,7 @@ void OnShadowConsumer(uint64_t cs_hash, const ShadowConsumer& consumer, std::spa
 	static uint32_t reports = 0;
 	if (first || (reports < 64 && flip % 600 == 0)) {
 		++reports;
-		std::printf("CSHADOW: sun-shadow consumer CS %016llx (shadow array 0x%llx %ux%u x%u layers, SRT %zu words, %u constant "
+		std::printf("RTSHADOW: sun-shadow consumer CS %016llx (shadow array 0x%llx %ux%u x%u layers, SRT %zu words, %u constant "
 		            "buffers): %zu orthographic matrices, axis (%.4f %.4f %.4f) agreed by %u%s\n",
 		            static_cast<unsigned long long>(cs_hash), static_cast<unsigned long long>(consumer.shadow_address),
 		            consumer.shadow_size, consumer.shadow_size, consumer.shadow_layers, srt.size(), consumer.buffers, axes.size(),
@@ -5838,6 +5866,8 @@ void OnShadowConsumer(uint64_t cs_hash, const ShadowConsumer& consumer, std::spa
 	g_sun.axis   = a;
 	g_sun.flip   = flip;
 	g_sun.valid  = true;
+	g_sun.source = 1;
+	g_sun.consumer_flip = flip;
 }
 
 void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> srt, bool shadow_target) {
@@ -5862,14 +5892,18 @@ void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> srt, bool shadow_t
 		if (best_n >= 2 || (best_n == 1 && axes.size() == 1)) {
 			const auto a = axes[best];
 			std::lock_guard sun(g_sun.mutex);
-			const bool same = g_sun.valid && std::abs(a[0] * g_sun.axis[0] + a[1] * g_sun.axis[1] + a[2] * g_sun.axis[2]) > 0.9994f;
-			g_sun.stable = same ? g_sun.stable + 1 : 1;
-			g_sun.agree  = best_n;
-			g_sun.axis   = a;
-			g_sun.flip   = flip_of;
-			g_sun.valid  = true;
-			std::lock_guard vp_lock(g_last_vp_mutex);
-			if (g_have_last_vp) g_sun.view_proj = g_last_vp, g_sun.have_camera = true;
+			// (A shadow consumer seen lately is the better source: its matrices are the cascades' own, no object's.)
+			if (!(g_sun.source == 1 && flip_of <= g_sun.consumer_flip + 120)) {
+				const bool same = g_sun.valid && std::abs(a[0] * g_sun.axis[0] + a[1] * g_sun.axis[1] + a[2] * g_sun.axis[2]) > 0.9994f;
+				g_sun.stable = same ? g_sun.stable + 1 : 1;
+				g_sun.agree  = best_n;
+				g_sun.axis   = a;
+				g_sun.flip   = flip_of;
+				g_sun.valid  = true;
+				g_sun.source = 2;
+				std::lock_guard vp_lock(g_last_vp_mutex);
+				if (g_have_last_vp) g_sun.view_proj = g_last_vp, g_sun.have_camera = true;
+			}
 		}
 		axes.clear();
 		flip_of = flip;
@@ -5899,7 +5933,7 @@ void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> srt, bool shadow_t
 	axes.push_back(found[0]);
 	if (!said) {
 		said = true;
-		std::printf("CSHADOW: sun matrix from a shadow draw (VS %016llx, %s, SRT %zu words): light axis (%.4f %.4f %.4f)\n",
+		std::printf("RTSHADOW: sun matrix from a shadow draw (VS %016llx, %s, SRT %zu words): light axis (%.4f %.4f %.4f)\n",
 		            static_cast<unsigned long long>(vs_hash), shadow_target ? "depth target a shadow-map layer" : "table/record path",
 		            srt.size(), found[0][0], found[0][1], found[0][2]);
 		std::fflush(stdout);
@@ -6013,9 +6047,8 @@ void CShadowReadTiming() {
 		++g_cs.read;
 	}
 	const auto now = std::chrono::steady_clock::now();
-	if (now - g_cs.last_log >= std::chrono::seconds(5) && g_cs.samples > 0) {
-		std::printf("CSHADOW: GPU %.3f ms (mean of %u frames; light candidate %d, vote log-ratios %.2f %.2f %.2f %.2f)\n",
-		            g_cs.sum_ms / g_cs.samples, g_cs.samples, g_cs.chosen, g_cs.ema[0], g_cs.ema[1], g_cs.ema[2], g_cs.ema[3]);
+	if (now - g_cs.last_log >= std::chrono::seconds(30) && g_cs.samples > 0) {
+		std::printf("RTSHADOW: GPU %.3f ms (mean of %u frames)\n", g_cs.sum_ms / g_cs.samples, g_cs.samples);
 		std::fflush(stdout);
 		g_cs.sum_ms   = 0.0;
 		g_cs.samples  = 0;
@@ -6023,53 +6056,100 @@ void CShadowReadTiming() {
 	}
 }
 
-// The vote read back (4 frames late) into the per-candidate EMAs; the choice made again with hysteresis.
-void CShadowTakeVote(uint32_t slot) {
+using Rows3 = std::array<std::array<double, 3>, 3>;
+
+// The camera's world -> view rotation (rows: the view axes in world): View = P^-1 * view_proj (column vectors; P's
+// column form is the transpose of the row-vector view_to_clip). Rows normalized; false when degenerate.
+bool CShadowView(const std::array<float, 16>& m, const std::array<float, 16>& vp, Rows3& v) {
+	std::array<float, 16> pc {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
+	std::array<double, 16> pinv {};
+	if (!Inverse4(pc, pinv)) return false;
+	for (int i = 0; i < 3; ++i) {
+		double n = 0.0;
+		for (int j = 0; j < 3; ++j) {
+			double d = 0.0;
+			for (int k = 0; k < 4; ++k) d += pinv[i * 4 + k] * vp[k * 4 + j];
+			v[i][j] = d;
+			n += d * d;
+		}
+		n = std::sqrt(n);
+		if (!(n > 1e-9) || !std::isfinite(n)) return false;
+		for (int j = 0; j < 3; ++j) v[i][j] /= n;
+	}
+	return true;
+}
+
+std::array<double, 3> Norm3(const std::array<double, 3>& a) {
+	const double n = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+	return n > 1e-12 ? std::array<double, 3> {a[0] / n, a[1] / n, a[2] / n} : std::array<double, 3> {0.0, 0.0, 0.0};
+}
+double Dot3(const std::array<double, 3>& a, const std::array<double, 3>& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+std::array<double, 3> ToView(const Rows3& v, const std::array<double, 3>& w) {
+	return Norm3({Dot3(v[0], w), Dot3(v[1], w), Dot3(v[2], w)});
+}
+std::array<double, 3> ToWorld(const Rows3& v, const std::array<double, 3>& d) {
+	std::array<double, 3> w {};
+	for (int j = 0; j < 3; ++j) w[j] = v[0][j] * d[0] + v[1][j] * d[1] + v[2][j] * d[2];
+	return Norm3(w);
+}
+
+// The hypotheses the switches leave (KYTY_RT_SHADOWS_UP, KYTY_RT_SHADOWS_FLIPY) as a 12-bit mask.
+uint32_t CShadowAllowed() {
+	static const uint32_t mask = [] {
+		uint32_t    m  = 0xfffu;
+		const char* up = std::getenv("KYTY_RT_SHADOWS_UP");
+		if (up != nullptr && *up != '\0') {
+			std::string v   = up;
+			int         neg = 0;
+			if (v[0] == '-') neg = 1, v.erase(0, 1);
+			else if (v[0] == '+') v.erase(0, 1);
+			const int axis = v == "x" ? 0 : v == "z" ? 2 : 1;
+			m &= (1u << (axis * 2 + neg)) | (1u << (6 + axis * 2 + neg));
+		}
+		const char* flip = std::getenv("KYTY_RT_SHADOWS_FLIPY");
+		if (flip != nullptr && *flip == '1') m &= 0x03fu;
+		if (flip != nullptr && *flip == '0') m &= 0xfc0u;
+		return m;
+	}();
+	return mask;
+}
+
+// The calibration read back (4 frames late) and the decision made (again).
+void CShadowTakeCalib(uint32_t slot) {
 	if (!g_cs.slot_voted[slot] || g_cs.vote_mapped == nullptr) return;
 	g_cs.slot_voted[slot] = false;
 	(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_cs.vote_mem, 0, VK_WHOLE_SIZE);
-	const uint32_t* v = g_cs.vote_mapped + slot * 16;
-	float score[4];
-	bool  any = false;
-	for (int k = 0; k < 4; ++k) {
-		const uint32_t lit_n = v[k * 4 + 1], away_n = v[k * 4 + 3];
-		if (lit_n < 200 || away_n < 200) {
-			score[k] = -1e9f;
-			continue;
-		}
-		const double lit = (static_cast<double>(v[k * 4]) + 1.0) / lit_n, away = (static_cast<double>(v[k * 4 + 2]) + 1.0) / away_n;
-		score[k] = static_cast<float>(std::log(lit / away));
-		any      = true;
+	const uint32_t* v   = g_cs.vote_mapped + slot * 16;
+	double          sum = 0.0;
+	for (int i = 0; i < 12; ++i) g_cs.calib[i] += v[i], sum += g_cs.calib[i];
+	if (sum > 4e6)
+		for (auto& c: g_cs.calib) c *= 0.5; // (a window: old views fade)
+	const uint32_t allowed = CShadowAllowed();
+	int            best = -1, second = -1;
+	for (int i = 0; i < 12; ++i) {
+		if ((allowed & (1u << i)) == 0) continue;
+		if (best < 0 || g_cs.calib[i] > g_cs.calib[best]) second = best, best = i;
+		else if (second < 0 || g_cs.calib[i] > g_cs.calib[second]) second = i;
 	}
-	if (!any) return;
-	++g_cs.votes;
-	const float a = g_cs.votes == 1 ? 1.0f : 0.25f;
-	for (int k = 0; k < 4; ++k)
-		g_cs.ema[k] = score[k] < -1e8f ? g_cs.ema[k] * (1.0f - a) : g_cs.ema[k] + (score[k] - g_cs.ema[k]) * a;
-	int best = 0;
-	for (int k = 1; k < 4; ++k)
-		if (g_cs.ema[k] > g_cs.ema[best]) best = k;
-	const float other = std::max(g_cs.ema[best < 2 ? 2 : 0], g_cs.ema[best < 2 ? 3 : 1]); // the other interpretation's axis
-	const float keep  = std::log(1.12f), take = std::log(1.2f);
-	const int   was   = g_cs.chosen;
-	(void)keep;
-	// Hysteresis: the same leader, clear of the rest, for 6 votes running; then locked (no pause, no flip) until the
-	// latched sun changes by > 10 degrees.
-	const bool clear = g_cs.ema[best] >= take && g_cs.ema[best] - other > 0.15f;
-	if (clear && best == g_cs.lead) ++g_cs.lead_n;
-	else g_cs.lead = clear ? best : -1, g_cs.lead_n = clear ? 1u : 0u;
-	if (!g_cs.locked && g_cs.votes >= 4 && g_cs.lead >= 0 && g_cs.lead_n >= 6) {
-		g_cs.chosen = g_cs.lead;
-		g_cs.locked = true;
-		std::printf("CSHADOW: light locked (candidate %d) for this sun: no re-vote until it changes\n", g_cs.chosen);
-	}
-	if (was != g_cs.chosen) {
-		static const char* names[] {"world axis +", "world axis -", "view axis +", "view axis -"};
-		std::printf("CSHADOW: light %s (vote log-ratios %.3f %.3f %.3f %.3f after %u votes)\n",
-		            g_cs.chosen >= 0 ? names[g_cs.chosen] : "none: contact shadows paused (no sunlit agreement)", g_cs.ema[0],
-		            g_cs.ema[1], g_cs.ema[2], g_cs.ema[3], g_cs.votes);
-		std::fflush(stdout);
-	}
+	if (best < 0) return;
+	const double b = g_cs.calib[best], s = second >= 0 ? g_cs.calib[second] : 0.0;
+	int          pick = -1;
+	if (std::popcount(allowed) == 1) pick = best;
+	else if (b >= 2000.0 && b >= 2.0 * s) pick = best;
+	// A level camera cannot tell (+y up, row 0 = NDC +1) from its mirror twin (-y up, mirrored): the prior.
+	else if (b >= 2000.0 && ((best == 2 && second == 9) || (best == 9 && second == 2)) && (allowed & 4u) != 0) pick = 2;
+	if (pick < 0 || pick == g_cs.hyp) return;
+	// A decided hypothesis changes only on clear evidence (3x).
+	if (g_cs.hyp >= 0 && g_cs.calib[pick] < 3.0 * g_cs.calib[g_cs.hyp]) return;
+	const int was = g_cs.hyp;
+	g_cs.hyp      = pick;
+	static const char* axes[] {"+x", "-x", "+y", "-y", "+z", "-z"};
+	std::printf("RTSHADOW: calibration: world up %s, render row 0 = NDC y %s (floors %.0f vs next %.0f)%s\n", axes[pick % 6],
+	            pick < 6 ? "+1 (GNM viewport)" : "-1 (mirrored)", b, s, was >= 0 ? " (changed)" : "");
+	std::fflush(stdout);
+	g_cs.history_valid = false;
 }
 
 bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
@@ -6078,7 +6158,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		static std::string said;
 		if (said != why) {
 			said = why;
-			std::printf("CSHADOW: off for now (%s)\n", why);
+			std::printf("RTSHADOW: off for now (%s)\n", why);
 			std::fflush(stdout);
 		}
 	};
@@ -6091,107 +6171,90 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const auto& m = inputs.view_to_clip;
 	if (!(m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f)))
 		return said_once("no camera projection (view_to_clip)"), false;
-	// The sun latch: the last good axis is kept (slowly smoothed) across frames that lack it; dropped only after a long
-	// absence (KYTY_CONTACT_SHADOWS_HOLD seconds, default 20) or a scene change (a jump > 10 degrees), and then faded
-	// out / in over 0.5 s instead of popping.
+	std::array<float, 16> vp {};
+	{
+		std::lock_guard vp_lock(g_last_vp_mutex);
+		if (!g_have_last_vp) return said_once("no camera matrix captured yet"), false;
+		vp = g_last_vp;
+	}
+	Rows3 view {};
+	if (!CShadowView(m, vp, view)) return said_once("the camera matrix is degenerate"), false;
+	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality)) return said_once("could not create its pipeline or images"), false;
+
 	const auto now = std::chrono::steady_clock::now();
 	const float dt = g_cs.latch_time.time_since_epoch().count() == 0
 	                     ? 0.0f
 	                     : std::clamp(std::chrono::duration<float>(now - g_cs.latch_time).count(), 0.0f, 0.25f);
-	g_cs.latch_time = now;
-	const float hold = std::max(SsgiEnv("KYTY_CONTACT_SHADOWS_HOLD", 20.0f, 600.0f), 1.0f);
-	std::array<float, 3>  axis {};
-	std::array<float, 16> vp {};
-	bool                  fresh = false, have_camera = false;
+	g_cs.latch_time  = now;
+	const float hold = std::max(RtShadowEnv("KYTY_RT_SHADOWS_HOLD", "KYTY_CONTACT_SHADOWS_HOLD", 20.0f, 600.0f), 1.0f);
+
+	// The sun probe's axis (fresh: seen in the last 2 s of flips, by agreeing cascades or 3 flips running).
+	std::array<double, 3> raw {};
+	bool                  fresh = false, recent = false;
+	int                   source = 0;
+	const uint64_t        flips  = g_flips_taken.load(std::memory_order_relaxed);
 	{
 		std::lock_guard lock(g_sun.mutex);
-		fresh       = g_sun.valid && (g_sun.agree >= 2 || g_sun.stable >= 3) &&
-		              g_flips_taken.load(std::memory_order_relaxed) <= g_sun.flip + 120;
-		axis        = g_sun.axis;
-		vp          = g_sun.view_proj;
-		have_camera = g_sun.have_camera;
+		fresh  = g_sun.valid && (g_sun.agree >= 2 || g_sun.stable >= 3) && flips <= g_sun.flip + 120;
+		recent = fresh && flips <= g_sun.flip + 2;
+		raw    = {g_sun.axis[0], g_sun.axis[1], g_sun.axis[2]};
+		source = g_sun.source;
 	}
-	{
-		// The camera now (the axis's camera is stale once latched).
-		std::lock_guard vp_lock(g_last_vp_mutex);
-		if (g_have_last_vp) vp = g_last_vp, have_camera = true;
-	}
-	if (fresh) {
-		if (!g_cs.latched) {
-			g_cs.latched = true, g_cs.latch_axis = axis, g_cs.switching = false;
-			std::printf("CSHADOW: sun latched, axis (%.4f %.4f %.4f)\n", axis[0], axis[1], axis[2]);
-			std::fflush(stdout);
-		} else {
-			const auto& l = g_cs.latch_axis;
-			const float c = axis[0] * l[0] + axis[1] * l[1] + axis[2] * l[2];
-			const float s = c < 0.0f ? -1.0f : 1.0f;
-			if (std::abs(c) >= 0.9848f) { // (within 10 degrees: the same sun, smoothed over ~1 s)
-				const float a = 1.0f - std::exp(-dt / 1.0f);
-				std::array<float, 3> n {l[0] + (s * axis[0] - l[0]) * a, l[1] + (s * axis[1] - l[1]) * a, l[2] + (s * axis[2] - l[2]) * a};
-				const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-				if (len > 1e-6f) g_cs.latch_axis = {n[0] / len, n[1] / len, n[2] / len};
-				g_cs.switching = false;
-			} else if (!g_cs.switching) {
-				g_cs.switching = true; // (a scene change: fade out, then take the new axis)
-				std::printf("CSHADOW: sun changed (axis (%.4f %.4f %.4f), was (%.4f %.4f %.4f)): fading out, then re-latching\n", axis[0],
-				            axis[1], axis[2], l[0], l[1], l[2]);
+	raw = Norm3(raw);
+
+	// The space: which reading of the axis stays put while the camera turns.
+	static const int forced_space = [] {
+		const char* value = std::getenv("KYTY_RT_SHADOWS_SPACE");
+		const std::string v = value != nullptr ? value : "";
+		return v == "world" ? 1 : v == "view" ? 2 : 0;
+	}();
+	if (recent && forced_space == 0 && g_cs.space_flip != flips) {
+		g_cs.space_flip = flips;
+		const std::array<double, 3> fwd = view[2];
+		const std::array<double, 3> vw  = ToWorld(view, raw);
+		if (!g_cs.space_ref) {
+			g_cs.space_ref = true, g_cs.ref_axis = raw, g_cs.ref_vw = vw, g_cs.ref_fwd = fwd;
+		} else if (Dot3(fwd, g_cs.ref_fwd) < 0.9659) { // (15 degrees)
+			const double dr = std::abs(Dot3(raw, g_cs.ref_axis)), dv = std::abs(Dot3(vw, g_cs.ref_vw));
+			if (dr > 0.9986 && dv < 0.9903) ++g_cs.world_votes; // (3 / 8 degrees)
+			else if (dv > 0.9986 && dr < 0.9903) ++g_cs.view_votes;
+			g_cs.ref_axis = raw, g_cs.ref_vw = vw, g_cs.ref_fwd = fwd;
+			const int was = g_cs.space, was_used = was != 0 ? was : source == 2 ? 1 : 0;
+			if (g_cs.world_votes >= g_cs.view_votes + 2) g_cs.space = 1;
+			else if (g_cs.view_votes >= g_cs.world_votes + 2) g_cs.space = 2;
+			if (was != g_cs.space) {
+				std::printf("RTSHADOW: the sun axis is in %s space (camera turns: %d world, %d view)\n", g_cs.space == 1 ? "world" : "view",
+				            g_cs.world_votes, g_cs.view_votes);
 				std::fflush(stdout);
+				if (was_used != 0 && was_used != g_cs.space) g_cs.latched = false, g_cs.fade = 0.0f; // (the other reading was in use)
 			}
-			g_cs.switch_axis = axis;
-		}
-		g_cs.last_fresh = now;
-	}
-	if (g_cs.latched && g_cs.switching && g_cs.fade <= 0.0f) {
-		g_cs.latch_axis = g_cs.switch_axis, g_cs.switching = false;
-		g_cs.votes = 0, g_cs.chosen = -1, g_cs.last_chosen = -1, g_cs.lead = -1, g_cs.lead_n = 0, g_cs.locked = false;
-		for (auto& e: g_cs.ema) e = 0.0f;
-		g_cs.history_valid = false;
-	}
-	const bool absent = g_cs.latched && now - g_cs.last_fresh > std::chrono::duration<float>(hold);
-	if (absent && g_cs.fade <= 0.0f) {
-		g_cs.latched = false;
-		std::printf("CSHADOW: sun unseen for %g s: dropped (faded out)\n", hold);
-		std::fflush(stdout);
-	}
-	if (!g_cs.latched) return g_cs.history_valid = false, g_cs.fade = 0.0f, said_once("no sun direction yet: the pass is skipped"), false;
-	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality)) return said_once("could not create its pipeline or images"), false;
-	axis = g_cs.latch_axis;
-
-	// The light candidates in view space.
-	float cand[4][4] {};
-	cand[2][0] = axis[0], cand[2][1] = axis[1], cand[2][2] = axis[2], cand[2][3] = 1.0f;
-	cand[3][0] = -axis[0], cand[3][1] = -axis[1], cand[3][2] = -axis[2], cand[3][3] = 1.0f;
-	if (have_camera) {
-		// View = P^-1 * view_proj (column vectors): P's column form is the transpose of the row-vector view_to_clip.
-		std::array<float, 16> pc {};
-		for (int i = 0; i < 4; ++i)
-			for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
-		std::array<double, 16> pinv {};
-		if (Inverse4(pc, pinv)) {
-			double d[3] {};
-			for (int i = 0; i < 3; ++i)
-				for (int j = 0; j < 3; ++j) {
-					double vij = 0.0;
-					for (int k = 0; k < 4; ++k) vij += pinv[i * 4 + k] * vp[k * 4 + j];
-					d[i] += vij * axis[j];
-				}
-			const double n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-			if (n > 1e-9 && std::isfinite(n))
-				for (int i = 0; i < 3; ++i) cand[0][i] = static_cast<float>(d[i] / n), cand[1][i] = -cand[0][i];
-			cand[0][3] = cand[1][3] = n > 1e-9 && std::isfinite(n) ? 1.0f : 0.0f;
 		}
 	}
+	const int space = forced_space != 0 ? forced_space : g_cs.space != 0 ? g_cs.space : source == 2 ? 1 : 0;
 
-	const float strength = SsgiEnv("KYTY_CONTACT_SHADOWS_STRENGTH", 0.7f, 1.0f) * (quality >= 3 ? 0.9f : 1.0f);
-	const float length   = std::max(SsgiEnv("KYTY_CONTACT_SHADOWS_LENGTH", 1.0f, 4.0f), 0.25f);
+	// The calibration (world up, the screen's y convention): every frame until decided, then every 16th.
+	const uint32_t slot = g_cs.frame % 4;
+	CShadowTakeCalib(slot);
+	const bool calibrate = g_cs.hyp < 0 || g_cs.frame % 16 == 0;
+
 	CShadowPush push {};
 	push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
 	push.depth_map[0] = m[10], push.depth_map[1] = m[14], push.depth_map[2] = m[11], push.depth_map[3] = m[15];
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
 	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
 	push.trace[0] = static_cast<float>(g_cs.trace.width), push.trace[1] = static_cast<float>(g_cs.trace.height);
+	const float strength = RtShadowEnv("KYTY_RT_SHADOWS_STRENGTH", "KYTY_CONTACT_SHADOWS_STRENGTH", 0.6f, 1.0f);
+	const float length   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_LENGTH", "KYTY_CONTACT_SHADOWS_LENGTH", 1.0f, 4.0f), 0.25f);
+	const float fade_m   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_FADE", nullptr, 25.0f, 200.0f), 2.0f);
 	push.trace[2] = strength, push.trace[3] = length;
-	std::memcpy(push.cand, cand, sizeof(cand));
+	for (int k = 0; k < 3; ++k) {
+		const auto c = ToView(view, {k == 0 ? 1.0 : 0.0, k == 1 ? 1.0 : 0.0, k == 2 ? 1.0 : 0.0});
+		push.cand[k][0] = static_cast<float>(c[0]), push.cand[k][1] = static_cast<float>(c[1]), push.cand[k][2] = static_cast<float>(c[2]);
+		push.cand[k][3] = 1.0f;
+	}
+	push.cand[3][0] = quality >= 3 ? 160.0f : quality >= 2 ? 96.0f : 48.0f; // (screen cap, px at 1440p)
+	push.cand[3][1] = 1.0f;
+	push.cand[3][2] = fade_m, push.cand[3][3] = fade_m * 2.0f;
 
 	CShadowReadTiming();
 	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
@@ -6258,11 +6321,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	};
-
-	// The vote: every frame until a light is chosen, then every 16th (the scene, an interior, may change).
-	const uint32_t slot = g_cs.frame % 4;
-	CShadowTakeVote(slot);
-	if (!g_cs.locked) {
+	if (calibrate) {
 		command.fillBuffer(vk::Buffer(g_cs.vote), slot * 64, 64, 0);
 		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
 		       vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
@@ -6272,43 +6331,71 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		       vk::AccessFlagBits2::eHostRead);
 		g_cs.slot_voted[slot] = true;
 	}
-	// The fade: toward 1 while a sun is latched, agreed by the vote and not switching / absent; 0.5 s each way.
-	if (g_cs.chosen >= 0) g_cs.last_chosen = g_cs.chosen;
-	const int  use    = g_cs.chosen >= 0 ? g_cs.chosen : g_cs.last_chosen;
-	const bool target = g_cs.chosen >= 0 && !g_cs.switching && !absent;
-	g_cs.fade         = std::clamp(g_cs.fade + (target ? dt : -dt) / 0.5f, 0.0f, 1.0f);
-	if (use < 0 || g_cs.fade <= 0.0f) {
-		++g_cs.frame;
+	++g_cs.frame;
+
+	// World up (the calibration's, +y until then) and the world-space sun toward the light, latched.
+	const int hyp = g_cs.hyp;
+	std::array<double, 3> up {};
+	up[hyp >= 0 ? (hyp % 6) / 2 : 1] = hyp >= 0 && (hyp & 1) != 0 ? -1.0 : 1.0;
+	if (fresh && space != 0) {
+		std::array<double, 3> sun = space == 1 ? raw : ToWorld(view, raw);
+		const double          h   = Dot3(sun, up);
+		if (h < 0.0) sun = {-sun[0], -sun[1], -sun[2]};
+		// (A sun on the horizon has no reliable sign: kept from the latch when there is one.)
+		if (std::abs(h) < 0.03 && g_cs.latched && Dot3(sun, g_cs.latch_axis) < 0.0) sun = {-sun[0], -sun[1], -sun[2]};
+		if (!g_cs.latched) {
+			g_cs.latched = true, g_cs.latch_axis = sun, g_cs.switching = false;
+			std::printf("RTSHADOW: sun latched, world direction to the light (%.4f %.4f %.4f), elevation %.1f deg\n", sun[0], sun[1],
+			            sun[2], std::asin(std::clamp(std::abs(h), 0.0, 1.0)) * 57.29578);
+			std::fflush(stdout);
+		} else {
+			const double c = Dot3(sun, g_cs.latch_axis);
+			if (c >= 0.9848) { // (within 10 degrees: the same sun, smoothed over ~1 s)
+				const double a = 1.0 - std::exp(-dt / 1.0);
+				const auto&  l = g_cs.latch_axis;
+				g_cs.latch_axis = Norm3({l[0] + (sun[0] - l[0]) * a, l[1] + (sun[1] - l[1]) * a, l[2] + (sun[2] - l[2]) * a});
+				g_cs.switching  = false;
+			} else if (!g_cs.switching) {
+				g_cs.switching = true; // (a scene change: fade out, then take the new sun)
+				std::printf("RTSHADOW: sun changed to (%.4f %.4f %.4f) from (%.4f %.4f %.4f): fading over\n", sun[0], sun[1], sun[2],
+				            g_cs.latch_axis[0], g_cs.latch_axis[1], g_cs.latch_axis[2]);
+				std::fflush(stdout);
+			}
+			g_cs.switch_axis = sun;
+		}
+		g_cs.last_fresh = now;
+	}
+	if (g_cs.latched && g_cs.switching && g_cs.fade <= 0.0f) g_cs.latch_axis = g_cs.switch_axis, g_cs.switching = false;
+	const bool absent = g_cs.latched && now - g_cs.last_fresh > std::chrono::duration<float>(hold);
+	if (absent && g_cs.fade <= 0.0f) {
+		g_cs.latched = false;
+		std::printf("RTSHADOW: sun unseen for %g s: dropped\n", hold);
+		std::fflush(stdout);
+	}
+	// The fade: in over 1 s once everything is known, out over 0.3 s on a change or an absence.
+	const bool target = g_cs.latched && !g_cs.switching && !absent && hyp >= 0 && space != 0;
+	g_cs.fade         = std::clamp(g_cs.fade + (target ? dt / 1.0f : -dt / 0.3f), 0.0f, 1.0f);
+	if (!g_cs.latched || g_cs.fade <= 0.0f) {
 		g_cs.history_valid = false;
-		return said_once(use < 0 ? "sun axis found, waiting for the lighting vote to agree on its space and sign"
-		                         : "faded out (sun absent, changed or not agreed by the vote)"),
+		return said_once(!g_cs.latched ? (space == 0 && fresh ? "sun axis found; turn the camera to tell its space (world / view)"
+		                                                      : "no sun direction yet")
+		                 : hyp < 0 ? "calibrating the screen's up (look at some floor)"
+		                           : "faded out (sun changed or absent)"),
 		       false;
 	}
-	if (cand[use][3] >= 0.5f) g_cs.last_dir = {cand[use][0], cand[use][1], cand[use][2]}, g_cs.have_dir = true;
-	if (!g_cs.have_dir) {
-		++g_cs.frame;
-		return said_once("the chosen world-space light has no camera yet"), false;
-	}
-	push.extra[1] = g_cs.last_dir[0], push.extra[2] = g_cs.last_dir[1], push.extra[3] = g_cs.last_dir[2];
+	const auto l_view = ToView(view, g_cs.latch_axis);
+	push.extra[1] = static_cast<float>(l_view[0]), push.extra[2] = static_cast<float>(l_view[1]), push.extra[3] = static_cast<float>(l_view[2]);
 	push.trace[2] = strength * g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade); // (smoothstep fade)
-	{
-		static float said_fade = -1.0f;
-		const float  f         = g_cs.fade >= 1.0f ? 1.0f : g_cs.fade <= 0.0f ? 0.0f : 0.5f;
-		if (f != said_fade && f != 0.5f) {
-			said_fade = f;
-			std::printf("CSHADOW: fade %s (light %d, sun %s)\n", f >= 1.0f ? "in complete" : "out complete", use,
-			            fresh ? "seen this frame" : "latched");
-			std::fflush(stdout);
-		}
-	}
-	{
-		static bool said = false;
-		if (!said) {
-			said = true;
-			std::printf("CSHADOW: on (level %d, trace %ux%u, strength %g, length %g, light view dir %.3f %.3f %.3f)\n", quality,
-			            g_cs.trace.width, g_cs.trace.height, strength, length, push.extra[1], push.extra[2], push.extra[3]);
-			std::fflush(stdout);
-		}
+	if (!g_cs.said_on) {
+		g_cs.said_on = true;
+		static const char* axes[] {"+x", "-x", "+y", "-y", "+z", "-z"};
+		std::printf("RTSHADOW: on (level %d, trace %ux%u of %ux%u, strength %g, length %g m, fade %g-%g m; light from %s, %s space; "
+		            "world dir to the sun (%.4f %.4f %.4f), up %s, row 0 = NDC y %s; view dir now (%.3f %.3f %.3f))\n",
+		            quality, g_cs.trace.width, g_cs.trace.height, color.extent.width, color.extent.height, strength, length, fade_m,
+		            fade_m * 2.0f, source == 1 ? "the sun-shadow consumer's cascades" : "the shadow-map draws",
+		            space == 1 ? "world" : "view", g_cs.latch_axis[0], g_cs.latch_axis[1], g_cs.latch_axis[2], axes[hyp % 6],
+		            hyp < 6 ? "+1" : "-1", l_view[0], l_view[1], l_view[2]);
+		std::fflush(stdout);
 	}
 	const auto entry = static_cast<uint32_t>(g_cs.written % 8);
 	const bool timed = g_cs.pool != nullptr;
@@ -6316,21 +6403,20 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		command.resetQueryPool(g_cs.pool, entry * 2, 2);
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_cs.pool, entry * 2);
 	}
-	push.misc[3] = (inputs.reset ? 1 : 0) | (g_cs.history_valid ? 2 : 0);
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g_cs.history_valid ? 2 : 0) | (hyp < 6 ? 4 : 0);
+	// trace -> raw (+ gbuf[cur]); temporal (raw, history[prev]) -> tmp_a, count -> moments[cur]; a-trous 1 -> history[cur]
+	// (next frame's history); a-trous 2 -> tmp_b; (a-trous 4 -> tmp_a); composite -> out.
 	run(0, g_cs.tmp_a, g_cs.tmp_b, g_cs.raw, g_cs.gbuf[cur], 0.0f, g_cs.trace);
 	run(1, g_cs.raw, g_cs.history[prev], g_cs.tmp_a, g_cs.tmp_b, 0.0f, g_cs.trace);
 	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_a;
 	run(2, g_cs.tmp_a, g_cs.raw, g_cs.history[cur], g_cs.tmp_b, 1.0f, g_cs.trace);
-	aux_in = &g_cs.var_a, aux_out = &g_cs.var_b;
 	run(2, g_cs.history[cur], g_cs.raw, g_cs.tmp_b, g_cs.raw, 2.0f, g_cs.trace);
 	const SsgiImage* final_vis = &g_cs.tmp_b;
 	if (quality >= 2) {
-		aux_in = &g_cs.var_b, aux_out = &g_cs.var_a;
 		run(2, g_cs.tmp_b, g_cs.raw, g_cs.tmp_a, g_cs.raw, 4.0f, g_cs.trace);
 		final_vis = &g_cs.tmp_a;
 	}
-	// (Level 3: no a-trous 8 any more: its wide grey halos read as haze; Ultra's extra is the longer, refined trace.)
-	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_b; // (the composite's stability mask: the history count in .z)
+	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_b; // (the composite's stability mask: the history count in .x)
 	run(4, *final_vis, g_cs.raw, g_cs.out, g_cs.raw, 0.0f, g_cs.render);
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
@@ -6338,7 +6424,6 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_cs.pool, entry * 2 + 1);
 		++g_cs.written;
 	}
-	++g_cs.frame;
 	g_cs.history_valid = true;
 	inputs.color.image  = g_cs.out.image.image;
 	inputs.color.view   = g_cs.out.view;
@@ -6357,10 +6442,10 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	UpscaleInputs inputs = inputs_in;
 	// (The DLSS-G hudless path sets the context in PrepareInputs; the PS5 Pro path alone needs the renderer's.)
 	if (g_graphics_ctx == nullptr && inputs.graphics != nullptr) g_graphics_ctx = inputs.graphics;
-	SsgiApply(command, inputs); // (KYTY_SSGI: inputs.color becomes the composited copy)
+	CShadowApply(command, inputs); // (KYTY_RT_SHADOWS: direct-sun shadows first; inputs.color becomes the composited copy)
+	SsgiApply(command, inputs); // (KYTY_SSGI: likewise; nothing when off)
 	GtaoApply(command, inputs); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
 	SsrApply(command, inputs); // (KYTY_SSR: likewise, after GTAO; nothing when off)
-	CShadowApply(command, inputs); // (KYTY_CONTACT_SHADOWS: likewise, after SSGI)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
 	const bool  fsr  = g_sr_kind == 3;
