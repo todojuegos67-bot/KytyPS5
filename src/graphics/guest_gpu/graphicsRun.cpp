@@ -1,6 +1,7 @@
 #include "local/skip-shader.h"
 #include "local/sync-stats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "local/anti-lag.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -1229,6 +1230,12 @@ bool GuestGpu::Process(Submission& submission) {
 		}
 		case SubmissionType::FlipPreparation:
 			m_renderer.GetGpuResources().EndSubmission();
+			if (AntiLag::OwnLowLatencyOn()) { // KYTY_LOWLAT: this frame's last host GPU tick (local/anti-lag.h)
+				auto& master = m_renderer.GetCommandScheduler().GetMasterSemaphore();
+				AntiLag::OnFrameSubmitted(static_cast<VkDevice>(m_renderer.GetGraphics().device),
+				                          static_cast<VkSemaphore>(master.Handle(0)),
+				                          master.LanesOn() ? master.LastTick(0) : master.CurrentTick() - 1);
+			}
 			m_renderer.GetGpuResources().AdvanceFrame();
 			m_renderer.GetPipelineCache().PromoteFinished();
 			cp.PrepareCpuFlip(submission.flip_request_id);
