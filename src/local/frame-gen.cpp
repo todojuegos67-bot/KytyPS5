@@ -6303,15 +6303,15 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
 	push.trace[0] = static_cast<float>(g_cs.trace.width), push.trace[1] = static_cast<float>(g_cs.trace.height);
 	const float strength = RtShadowEnv("KYTY_RT_SHADOWS_STRENGTH", "KYTY_CONTACT_SHADOWS_STRENGTH", 0.6f, 1.0f);
-	const float length   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_LENGTH", "KYTY_CONTACT_SHADOWS_LENGTH", 1.0f, 4.0f), 0.25f);
-	const float fade_m   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_FADE", nullptr, 25.0f, 200.0f), 2.0f);
+	const float length   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_LENGTH", "KYTY_CONTACT_SHADOWS_LENGTH", 3.0f, 10.0f), 0.25f); // (10-24) 3 m (1 m was too short)
+	const float fade_m   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_FADE", nullptr, 60.0f, 300.0f), 2.0f); // (10-24) 60 m (25 cut them close by)
 	push.trace[2] = strength, push.trace[3] = length;
 	for (int k = 0; k < 3; ++k) {
 		const auto c = ToView(view, {k == 0 ? 1.0 : 0.0, k == 1 ? 1.0 : 0.0, k == 2 ? 1.0 : 0.0});
 		push.cand[k][0] = static_cast<float>(c[0]), push.cand[k][1] = static_cast<float>(c[1]), push.cand[k][2] = static_cast<float>(c[2]);
 		push.cand[k][3] = 1.0f;
 	}
-	push.cand[3][0] = quality >= 3 ? 160.0f : quality >= 2 ? 96.0f : 48.0f; // (screen cap, px at 1440p)
+	push.cand[3][0] = quality >= 3 ? 400.0f : quality >= 2 ? 280.0f : 160.0f; // (screen cap, px at 1440p; 10-24: longer)
 	push.cand[3][1] = 1.0f;
 	push.cand[3][2] = fade_m, push.cand[3][3] = fade_m * 2.0f;
 

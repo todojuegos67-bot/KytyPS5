@@ -85,7 +85,7 @@ vec3 NormalAt(vec2 uv, vec3 p) { return NormalAtY(uv, p, YSign()); }
 // The march: occlusion toward the light (0 lit, 1 occluded by something in the depth buffer).
 float March(vec3 p, vec3 n, vec3 l, ivec2 pixel) {
 	int   q     = push.misc.z;
-	int   steps = q >= 3 ? 32 : q >= 2 ? 20 : 12;
+	int   steps = q >= 3 ? 48 : q >= 2 ? 28 : 16; // (10-24) more: the rays are longer
 	float z     = abs(p.z);
 	// World length, capped to a screen length (the detail scale Bend's shadows work at; long rays are the shadow
 	// maps' business and only double them).
@@ -113,7 +113,7 @@ float March(vec3 p, vec3 n, vec3 l, ivec2 pixel) {
 			// hit near the thickness limit.
 			vec2  e    = min(pr.xy, 1.0 - pr.xy);
 			float edge = smoothstep(0.0, 0.04, min(e.x, e.y));
-			float end  = 1.0 - smoothstep(0.65, 1.0, k);
+			float end  = 1.0 - smoothstep(0.85, 1.0, k); // (10-24) only the last stretch (was 0.65: rays felt short)
 			float soft = 1.0 - smoothstep(0.6 * thick, thick, delta);
 			return edge * end * soft;
 		}
