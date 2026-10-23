@@ -180,6 +180,15 @@ void OnDevice(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool extensio
 	if (!logged) {
 		logged = true;
 		std::printf("%s\n", text);
+		const char* path = mode == Mode::Reflex  ? "VK_NV_low_latency2 Reflex (sleep at the controller read)"
+		                   : mode == Mode::Amd     ? "AMD Anti-Lag 2"
+		                   : mode == Mode::Limiter ? "emulator limiter"
+		                   : StreamlineReflex()    ? "Streamline Reflex (DLSS-G)"
+		                                           : "none";
+		std::printf("Latency path: %s; Streamline %s, DLSS-G %s, FSR 3 FG cap %s\n", path,
+		            FrameGen::StreamlineLoaded() ? "loaded" : "not loaded", FrameGen::GeneratedFrames() > 0 ? "on" : "off",
+		            mode == Mode::Reflex ? "by Reflex at the input read (patched FidelityFX DLL) or at the present"
+		                                 : "at the present");
 		std::fflush(stdout);
 	}
 }
