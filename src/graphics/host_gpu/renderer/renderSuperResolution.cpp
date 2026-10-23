@@ -428,6 +428,10 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 			record.exposure_range  = offset - base + sizeof(float);
 			record.exposure_index  = static_cast<uint32_t>((offset - base) / sizeof(float));
 			record.exposure_pass   = Exposure(m_context.GetGraphics());
+			inputs.exposure_buffer = record.exposure_buffer;
+			inputs.exposure_base   = record.exposure_base;
+			inputs.exposure_range  = record.exposure_range;
+			inputs.exposure_index  = record.exposure_index;
 			// (A view the pass samples: the output's own, the image's to keep and destroy.)
 			auto view_info    = bindings[3].desc.view_info;
 			view_info.usage   = vk::ImageUsageFlagBits::eSampled;
@@ -454,7 +458,7 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 	// KYTY_SSR with KYTY_SSR_GBUF: the G-buffer target holding roughness, sampled read only (its contents untouched).
 	Image*                 ssr_material = nullptr;
 	ImageSubresourceRange  ssr_range {};
-	if (dlss && FrameGen::SsrWanted()) {
+	if (dlss && FrameGen::SsrPassWanted()) {
 		FrameGen::SsrTarget target;
 		int                 channel = -1;
 		bool                gloss   = false;
@@ -494,7 +498,7 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 	// KYTY_SSR: the packed (R32_UINT) G-buffer layers, sampled read only (normals / roughness decoded in ssr.comp).
 	std::array<Image*, 4>                packed_images {};
 	std::array<ImageSubresourceRange, 4> packed_ranges {};
-	if (dlss && FrameGen::SsrWanted()) {
+	if (dlss && FrameGen::SsrPassWanted()) {
 		std::array<FrameGen::SsrTarget, 4> targets {};
 		const uint32_t                     n = FrameGen::SsrPackedTargets(targets);
 		for (uint32_t i = 0; i < n; ++i) {
