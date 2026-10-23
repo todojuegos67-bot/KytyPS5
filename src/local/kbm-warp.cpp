@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -95,7 +96,12 @@ struct State {
 	};
 	std::array<View, 6> views {}; // the presenter's frame images
 	uint32_t            next_view = 0;
-	int32_t             prev_x = 0, prev_y = 0; // FSR 3: the last real frame's input shift (render pixels)
+	float               prev_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // FSR 3: the last real frame's source rectangle (UV)
+	// (10-24) The edge zoom: the fraction of each half-size kept free around the source rectangle, so the pending turn
+	// never uncovers an edge. Rises at once to what the shift needs (up to KYTY_KBM_WARP_ZOOM), holds, then eases back.
+	float               zoom      = 0.0f;
+	double              zoom_hold = 0.0; // seconds since the shift last needed the present zoom
+	std::chrono::steady_clock::time_point zoom_last {};
 	uint32_t            logs = 0;
 } g;
 
@@ -116,7 +122,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	set_info.bindingCount = static_cast<uint32_t>(bindings.size());
 	set_info.pBindings    = bindings.data();
 	if (device.createDescriptorSetLayout(&set_info, nullptr, &g.set_layout) != vk::Result::eSuccess) return false;
-	vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, 32};
+	vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, 64};
 	vk::PipelineLayoutCreateInfo layout_info {};
 	layout_info.setLayoutCount         = 1;
 	layout_info.pSetLayouts            = &g.set_layout;
@@ -193,14 +199,20 @@ void Barriers(vk::CommandBuffer command, std::initializer_list<vk::ImageMemoryBa
 }
 
 struct Push {
-	float   shift[2];
-	float   add[2];
+	float   rect[4];
+	float   prev[4];
 	float   threshold;
 	int32_t radius;
 	int32_t mode;
 	int32_t write1;
+	float   mv_sign;
+	float   pad[3];
 };
-static_assert(sizeof(Push) == 32);
+static_assert(sizeof(Push) == 64);
+
+bool Identity(const float* r) {
+	return r[0] == 0.0f && r[1] == 0.0f && r[2] == 1.0f && r[3] == 1.0f;
+}
 
 void Dispatch(vk::CommandBuffer command, vk::ImageView a, vk::ImageView b, vk::ImageView out0, vk::ImageView out1,
               const Push& push, vk::Extent3D size) {
@@ -222,21 +234,6 @@ void Dispatch(vk::CommandBuffer command, vk::ImageView a, vk::ImageView b, vk::I
 	command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 }
 
-// Up to two pieces per axis: the shifted image and the edge strip (one source pixel repeated) it uncovers.
-struct Piece {
-	int s0, s1, d0, d1;
-};
-int Pieces(int size, int shift, Piece* out) {
-	if (shift == 0 || std::abs(shift) >= size) {
-		out[0] = {0, size, 0, size};
-		return 1;
-	}
-	const int a0 = std::max(0, shift), a1 = std::min(size, size + shift);
-	out[0] = {a0, a1, a0 - shift, a1 - shift};
-	if (shift > 0) out[1] = {size - 1, size, a1 - shift, size};
-	else out[1] = {0, 1, 0, a0 - shift};
-	return 2;
-}
 
 } // namespace
 
@@ -253,10 +250,11 @@ bool Fsr3Wanted() {
 	return wanted;
 }
 bool InputsShifted() {
-	return g.prev_x != 0 || g.prev_y != 0;
+	return !Identity(g.prev_rect) || g.zoom > 0.0f;
 }
 void NoteUnshifted() {
-	g.prev_x = g.prev_y = 0;
+	g.prev_rect[0] = g.prev_rect[1] = 0.0f;
+	g.prev_rect[2] = g.prev_rect[3] = 1.0f;
 }
 
 VulkanImage* Record(GraphicContext& graphics, vk::CommandBuffer command, VulkanImage& final_image,
@@ -277,7 +275,6 @@ VulkanImage* Record(GraphicContext& graphics, vk::CommandBuffer command, VulkanI
 	if (final_view == nullptr) return nullptr;
 
 	// FSR 3: the inputs too (render pixels), or nothing.
-	int32_t ix = 0, iy = 0;
 	if (fsr3) {
 		auto& depth  = inputs->depth;
 		auto& motion = inputs->motion;
@@ -297,11 +294,53 @@ VulkanImage* Record(GraphicContext& graphics, vk::CommandBuffer command, VulkanI
 		    !Ensure(graphics, g.depth, depth.format, render,
 		            vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst))
 			return nullptr;
-		ix = static_cast<int32_t>(std::lround(shift_x * static_cast<float>(render.width) / static_cast<float>(size.width)));
-		iy = static_cast<int32_t>(std::lround(shift_y * static_cast<float>(render.height) / static_cast<float>(size.height)));
-		// (The image by the same whole render pixels: the inputs stay exactly on it.)
-		shift_x = static_cast<float>(ix) * static_cast<float>(size.width) / static_cast<float>(render.width);
-		shift_y = static_cast<float>(iy) * static_cast<float>(size.height) / static_cast<float>(render.height);
+	}
+
+	// (10-24) The edge zoom and the source rectangle.
+	{
+		static const float zoom_max  = std::clamp(EnvNum("KYTY_KBM_WARP_ZOOM", 0.05f), 0.0f, 0.25f);
+		static const float hold_s    = std::clamp(EnvNum("KYTY_KBM_WARP_ZOOM_HOLD", 0.35f), 0.0f, 5.0f);
+		static const float release_s = std::clamp(EnvNum("KYTY_KBM_WARP_ZOOM_RELEASE", 0.8f), 0.05f, 10.0f);
+		const auto   now = std::chrono::steady_clock::now();
+		const double dt  = g.zoom_last.time_since_epoch().count() == 0
+		                       ? 0.0
+		                       : std::clamp(std::chrono::duration<double>(now - g.zoom_last).count(), 0.0, 0.25);
+		g.zoom_last      = now;
+		const float hw = 0.5f * static_cast<float>(size.width), hh = 0.5f * static_cast<float>(size.height);
+		const float need = std::min(zoom_max, std::max(std::fabs(shift_x) / hw, std::fabs(shift_y) / hh));
+		if (need >= g.zoom * 0.95f) {
+			g.zoom      = std::max(g.zoom, need);
+			g.zoom_hold = 0.0;
+		} else if ((g.zoom_hold += dt) > hold_s) {
+			// Eased back toward what is needed (exponential, release_s to about a third).
+			const float k = static_cast<float>(1.0 - std::exp(-dt / release_s));
+			g.zoom += (need - g.zoom) * k;
+			if (g.zoom < 0.002f && need == 0.0f) g.zoom = 0.0f;
+		}
+		// The shift held inside the free margin (softly near its end).
+		auto keep = [](float v, float m) {
+			if (m <= 0.0f) return 0.0f;
+			return m * std::tanh(v / m);
+		};
+		shift_x = keep(shift_x, g.zoom * hw);
+		shift_y = keep(shift_y, g.zoom * hh);
+	}
+	const float scale = 1.0f - g.zoom;
+	float       rect[4] = {0.5f - 0.5f * scale + shift_x / static_cast<float>(size.width),
+	                       0.5f - 0.5f * scale + shift_y / static_cast<float>(size.height), scale, scale};
+	int32_t     rx0 = 0, ry0 = 0, rw = 0, rh = 0; // FSR 3: the rectangle in whole render pixels (the depth blit)
+	if (fsr3) {
+		const auto& motion = inputs->motion;
+		const int   W = static_cast<int>(motion.extent.width), H = static_cast<int>(motion.extent.height);
+		rw  = std::clamp(static_cast<int32_t>(std::lround(static_cast<float>(W) * scale)), 1, W);
+		rh  = std::clamp(static_cast<int32_t>(std::lround(static_cast<float>(H) * scale)), 1, H);
+		rx0 = std::clamp(static_cast<int32_t>(std::lround(rect[0] * static_cast<float>(W))), 0, W - rw);
+		ry0 = std::clamp(static_cast<int32_t>(std::lround(rect[1] * static_cast<float>(H))), 0, H - rh);
+		// (The image through the same whole render pixels: the inputs stay exactly on it.)
+		rect[0] = static_cast<float>(rx0) / static_cast<float>(W);
+		rect[1] = static_cast<float>(ry0) / static_cast<float>(H);
+		rect[2] = static_cast<float>(rw) / static_cast<float>(W);
+		rect[3] = static_cast<float>(rh) / static_cast<float>(H);
 	}
 
 	// The color: F where it differs from H (the HUD), H shifted elsewhere.
@@ -317,7 +356,7 @@ VulkanImage* Record(GraphicContext& graphics, vk::CommandBuffer command, VulkanI
 		FrameGen::Transition(command, g.hudless.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
 		                     vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
 	{
-		Push push {{shift_x, shift_y}, {0.0f, 0.0f}, threshold, radius, 0, fsr3 ? 1 : 0};
+		Push push {{rect[0], rect[1], rect[2], rect[3]}, {0.0f, 0.0f, 1.0f, 1.0f}, threshold, radius, 0, fsr3 ? 1 : 0, 1.0f, {}};
 		Dispatch(command, final_view, inputs->hudless_view, g.color.view, hudless_out->view, push, size);
 	}
 	Barriers(command, {Barrier(final_image.image, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageLayout::eTransferSrcOptimal,
@@ -332,14 +371,14 @@ VulkanImage* Record(GraphicContext& graphics, vk::CommandBuffer command, VulkanI
 		// The vectors (UV units; FSR 3 takes vector * mv_sign * size as pixels to the previous position): the warped
 		// pixel's previous position moved by the shift's change, in the vectors' units.
 		static const float mv_sign = EnvNum("KYTY_FSR3_MV_SIGN", -1.0f) >= 0.0f ? 1.0f : -1.0f;
-		const float        add_x   = static_cast<float>(ix - g.prev_x) / (mv_sign * static_cast<float>(render.width));
-		const float        add_y   = static_cast<float>(iy - g.prev_y) / (mv_sign * static_cast<float>(render.height));
 		FrameGen::Transition(command, g.motion.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
 		                     vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
 		FrameGen::Transition(command, motion, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
 		                     vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader);
 		{
-			Push push {{static_cast<float>(ix), static_cast<float>(iy)}, {add_x, add_y}, 0.0f, 0, 1, 0};
+			Push push {{rect[0], rect[1], rect[2], rect[3]},
+			           {g.prev_rect[0], g.prev_rect[1], g.prev_rect[2], g.prev_rect[3]},
+			           0.0f, 0, 1, 0, mv_sign, {}};
 			Dispatch(command, inputs->motion_view, inputs->motion_view, g.motion.view, g.motion.view, push, render);
 		}
 		// Back into the frame's own copies (FSR 3's prepare and HUD-less blit read them after this command buffer).
@@ -375,24 +414,15 @@ VulkanImage* Record(GraphicContext& graphics, vk::CommandBuffer command, VulkanI
 		FrameGen::Transition(command, g.depth.image, vk::ImageAspectFlagBits::eDepth, vk::ImageLayout::eTransferDstOptimal,
 		                     vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
 		{
-			Piece px[2], py[2];
-			const int nx = Pieces(static_cast<int>(render.width), ix, px);
-			const int ny = Pieces(static_cast<int>(render.height), iy, py);
-			vk::ImageBlit regions[4] {};
-			uint32_t      count = 0;
-			for (int x = 0; x < nx; ++x)
-				for (int y = 0; y < ny; ++y) {
-					if (px[x].d1 <= px[x].d0 || py[y].d1 <= py[y].d0) continue;
-					auto& r          = regions[count++];
-					r.srcSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1};
-					r.dstSubresource = r.srcSubresource;
-					r.srcOffsets[0]  = vk::Offset3D {px[x].s0, py[y].s0, 0};
-					r.srcOffsets[1]  = vk::Offset3D {px[x].s1, py[y].s1, 1};
-					r.dstOffsets[0]  = vk::Offset3D {px[x].d0, py[y].d0, 0};
-					r.dstOffsets[1]  = vk::Offset3D {px[x].d1, py[y].d1, 1};
-				}
+			// (10-24) The source rectangle scaled onto the whole image (nearest), as the color and the vectors.
+			vk::ImageBlit r {};
+			r.srcSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1};
+			r.dstSubresource = r.srcSubresource;
+			r.srcOffsets[0]  = vk::Offset3D {rx0, ry0, 0};
+			r.srcOffsets[1]  = vk::Offset3D {rx0 + rw, ry0 + rh, 1};
+			r.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(render.width), static_cast<int32_t>(render.height), 1};
 			command.blitImage(depth.image, vk::ImageLayout::eTransferSrcOptimal, g.depth.image.image,
-			                  vk::ImageLayout::eTransferDstOptimal, count, regions, vk::Filter::eNearest);
+			                  vk::ImageLayout::eTransferDstOptimal, 1, &r, vk::Filter::eNearest);
 		}
 		FrameGen::Transition(command, g.depth.image, vk::ImageAspectFlagBits::eDepth, vk::ImageLayout::eTransferSrcOptimal,
 		                     vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
@@ -413,13 +443,12 @@ VulkanImage* Record(GraphicContext& graphics, vk::CommandBuffer command, VulkanI
 		                     vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
 		FrameGen::Transition(command, inputs->hudless, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
 		                     vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
-		g.prev_x = ix;
-		g.prev_y = iy;
+		for (int i = 0; i < 4; ++i) g.prev_rect[i] = rect[i];
 	}
 	if (g.logs < 3) {
 		++g.logs;
-		std::printf("KBM warp: 3D shifted %.1f,%.1f px under a still HUD (HUD-less composite %ux%u)%s\n", shift_x, shift_y,
-		            size.width, size.height, fsr3 ? "; FSR 3 inputs (HUD-less, depth, motion) shifted alike" : "");
+		std::printf("KBM warp: 3D shifted %.1f,%.1f px under a still HUD, edge zoom %.1f%% (HUD-less composite %ux%u)%s\n",
+		            shift_x, shift_y, g.zoom * 100.0f, size.width, size.height, fsr3 ? "; FSR 3 inputs (HUD-less, depth, motion) shifted alike" : "");
 		std::fflush(stdout);
 	}
 	return &g.color.image;

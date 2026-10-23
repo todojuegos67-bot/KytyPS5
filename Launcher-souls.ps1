@@ -1723,8 +1723,8 @@ $trkAdz = New-Slider 'kbmadz' 0 50 15 218 62 { param($v) "Anti-zona muerta: $v%"
 $tips.SetToolTip($trkSens, 'Cuanto gira la camara por cada movimiento del raton (1.00 = normal).')
 # (10-23) Velocidad de camara del juego con teclado y raton (cp11_Setting_CameraSpeed): mas alta = los giros grandes del
 # raton no se quedan en el tope del stick. Sin teclado y raton, la del juego (la de su menu).
-$trkCam = New-Slider 'kbmcam' 1 10 10 12 116 { param($v) "Velocidad de camara (raton): $v" }
-$tips.SetToolTip($trkCam, 'Solo con teclado y raton: la velocidad maxima de giro de la camara del juego. 10 = giros grandes rapidos. Al quitar teclado y raton vuelve la del menu del juego.')
+$trkCam = New-Slider 'kbmcam' 1 15 10 12 116 { param($v) "Velocidad de camara (raton): $v$(if ($v -gt 10) { ' (extra)' })" }  # (10-24) 11-15: por encima del menu del juego
+$tips.SetToolTip($trkCam, 'Solo con teclado y raton: la velocidad maxima de giro de la camara del juego. 10 = el maximo del menu del juego. 11-15 (extra, experimental): mas rapido que el menu; si la camara hace cosas raras, vuelve a 10. Al quitar teclado y raton vuelve la del menu del juego.')
 $tips.SetToolTip($trkAdz, 'Salta la zona muerta del stick del juego: con mas, un movimiento pequeno del raton ya gira la camara. Si la camara se mueve sola, bajalo.')
 # (10-24) Frame warp: la camara del raton desplaza el 3D al momento (HUD quieto), tambien con la frame generation de AMD.
 $chkWarp = New-Check 'Camara instantanea (frame warp)' 0 0 300 'kbmwarp'

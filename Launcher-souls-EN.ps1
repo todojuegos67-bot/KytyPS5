@@ -1723,8 +1723,8 @@ $trkAdz = New-Slider 'kbmadz' 0 50 15 218 62 { param($v) "Anti-deadzone: $v%" }
 $tips.SetToolTip($trkSens, 'How much the camera turns per mouse movement (1.00 = normal).')
 # (10-23) Velocidad de camara del juego con teclado y raton (cp11_Setting_CameraSpeed): mas alta = los giros grandes del
 # raton no se quedan en el tope del stick. Sin teclado y raton, la del juego (la de su menu).
-$trkCam = New-Slider 'kbmcam' 1 10 10 12 116 { param($v) "Camera speed (mouse): $v" }
-$tips.SetToolTip($trkCam, 'Keyboard and mouse only: the game camera''s maximum turn speed. 10 = fast big turns. Without keyboard and mouse the game menu''s value is used.')
+$trkCam = New-Slider 'kbmcam' 1 15 10 12 116 { param($v) "Camera speed (mouse): $v$(if ($v -gt 10) { ' (extra)' })" }  # (10-24) 11-15: por encima del menu del juego
+$tips.SetToolTip($trkCam, 'Keyboard and mouse only: the game camera''s maximum turn speed. 10 = the game menu''s maximum. 11-15 (extra, experimental): faster than the menu; if the camera acts strange, go back to 10. Without keyboard and mouse the game menu''s value is used.')
 $tips.SetToolTip($trkAdz, 'Skips the game''s stick deadzone: higher means a small mouse movement already turns the camera. If the camera moves by itself, lower it.')
 # (10-24) Frame warp: la camara del raton desplaza el 3D al momento (HUD quieto), tambien con la frame generation de AMD.
 $chkWarp = New-Check 'Instant camera (frame warp)' 0 0 300 'kbmwarp'

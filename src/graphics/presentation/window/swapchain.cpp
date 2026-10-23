@@ -1348,12 +1348,15 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 				                         moving ? fy : 0.0f, true);
 			if (warped != nullptr) blit_source = warped;
 			else KbmWarp::NoteUnshifted();
-		} else if (moving) {
+		} else if (moving || (cfg.on && usable && KbmWarp::InputsShifted())) {
+			// (10-24) Also while the edge zoom eases back after a turn (else it would snap off).
 			VulkanImage* warped =
-			    usable ? KbmWarp::Record(m_window.graphic_ctx, command.Handle(), source, fg, fx, fy, false) : nullptr;
+			    usable ? KbmWarp::Record(m_window.graphic_ctx, command.Handle(), source, fg, moving ? fx : 0.0f,
+			                             moving ? fy : 0.0f, false)
+			           : nullptr;
 			if (warped != nullptr) {
 				blit_source = warped;
-			} else {
+			} else if (moving) {
 				shift_x = static_cast<int>(std::lround(fx)); // (no HUD-less image: the whole image, as before)
 				shift_y = static_cast<int>(std::lround(fy));
 			}
