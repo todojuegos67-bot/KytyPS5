@@ -65,12 +65,12 @@ inline constexpr Pair kAmdX4[] = {{"KYTY_VRR_CAP_FPS", "auto"}, {"KYTY_FSR3_FG",
 inline constexpr Pair kAmd120[] = {{"KYTY_VRR_CAP_FPS", "auto"}, {"KYTY_FSR3_FG", "1"}, {"KYTY_FSR3_FG_FRAMES", "2"}, {"KYTY_FSR3_HUD_LAYER", "0"}, {"KYTY_FLIP_FPS", "40"}, {nullptr, nullptr}};
 inline constexpr Pair kAmdDinamico[] = {{"KYTY_FSR3_FG", "1"}, {"KYTY_FSR3_HUD_LAYER", "0"}, {"KYTY_FSR3_MFG", "4"}, {"KYTY_FSR3_DYNAMIC", "1"}, {nullptr, nullptr}};
 inline constexpr Pair kDlssX2[] = {{"KYTY_VRR_CAP_FPS", "auto"}, {"KYTY_FRAMEGEN", "1"}, {"KYTY_FLIP_DECOUPLE", "1"}, {nullptr, nullptr}};
-inline constexpr Pair kDlssX3[] = {{"KYTY_VRR_CAP_FPS", "auto"}, {"KYTY_FRAMEGEN", "2"}, {"KYTY_FLIP_DECOUPLE", "1"}, {nullptr, nullptr}};
+inline constexpr Pair kDlssX3[] = {{"KYTY_FRAMEGEN", "2"}, {"KYTY_FLIP_DECOUPLE", "1"}, {nullptr, nullptr}};
 inline constexpr Pair kDlssX4[] = {{"KYTY_VRR_CAP_FPS", "auto"}, {"KYTY_FRAMEGEN", "3"}, {"KYTY_FLIP_DECOUPLE", "1"}, {nullptr, nullptr}};
 inline constexpr Pair kDlssX5[] = {{"KYTY_VRR_CAP_FPS", "auto"}, {"KYTY_FRAMEGEN", "4"}, {"KYTY_FLIP_DECOUPLE", "1"}, {"KYTY_FLIP_FPS", "40"}, {nullptr, nullptr}};
 inline constexpr Pair kDlssX6[] = {{"KYTY_VRR_CAP_FPS", "auto"}, {"KYTY_FRAMEGEN", "5"}, {"KYTY_FLIP_DECOUPLE", "1"}, {"KYTY_FLIP_FPS", "36"}, {nullptr, nullptr}};
 inline constexpr Pair kDlss120[] = {{"KYTY_VRR_CAP_FPS", "auto"}, {"KYTY_FRAMEGEN", "2"}, {"KYTY_FLIP_DECOUPLE", "1"}, {"KYTY_FLIP_FPS", "40"}, {nullptr, nullptr}};
-inline constexpr Pair kDlssDinamico[] = {{"KYTY_FRAMEGEN", "3"}, {"KYTY_FLIP_DECOUPLE", "1"}, {"KYTY_DLSSG_DYNAMIC", "1"}, {nullptr, nullptr}};
+inline constexpr Pair kDlssDinamico[] = {{"KYTY_FRAMEGEN", "5"}, {"KYTY_FLIP_DECOUPLE", "1"}, {"KYTY_DLSSG_DYNAMIC", "1"}, {nullptr, nullptr}};
 inline constexpr FgMode kFgModes[] = {
 	{"sin-fg", "Sin frame generation", "sin-fg.json", kSinFg, 0},
 	{"amd-x2", "AMD x2", "fsr3.json", kAmdX2, 3},
@@ -79,7 +79,7 @@ inline constexpr FgMode kFgModes[] = {
 	{"amd-120", "120 FPS AMD Smooth Souls", "fsr3-x3-120.json", kAmd120, 5},
 	{"amd-dinamico", "AMD MFG dinamico (x2-x4)", "fsr3-mfg-dynamic.json", kAmdDinamico, 4},
 	{"dlss-x2", "DLSS x2", "dlss-x2.json", kDlssX2, 3},
-	{"dlss-x3", "DLSS x3", "dlss-x3.json", kDlssX3, 3},
+	{"dlss-x3", "DLSS x3", "dlss-x3.json", kDlssX3, 2},
 	{"dlss-x4", "DLSS x4", "dlss-x4.json", kDlssX4, 3},
 	{"dlss-x5", "200 FPS Nvidia Smooth x5", "dlss-x5.json", kDlssX5, 4},
 	{"dlss-x6", "216 FPS Nvidia Smooth x6", "dlss-x6.json", kDlssX6, 4},

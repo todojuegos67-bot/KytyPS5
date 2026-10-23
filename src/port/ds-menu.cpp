@@ -54,6 +54,7 @@ std::mutex               g_mutex;
 std::deque<Input>        g_inputs;
 int                      g_passthrough = 0; // window thread: zeroed axes sent to the game as the menu opened
 int                      g_cursor_before = -1;
+constexpr int            kTabCount = 6;
 int                      g_tab = 0, g_tab_request = -1;
 int                      g_fg_live = 0;
 std::string              g_status;
@@ -246,7 +247,7 @@ void DrainInputs() {
 			case Input::MousePos: io.AddMousePosEvent(in.x, in.y); break;
 			case Input::MouseButton: io.AddMouseButtonEvent(in.key, in.down); break;
 			case Input::Wheel: io.AddMouseWheelEvent(in.x, in.y); break;
-			case Input::Tab: g_tab_request = (g_tab + in.key + 5) % 5; break;
+			case Input::Tab: g_tab_request = (g_tab + in.key + kTabCount) % kTabCount; break;
 		}
 	}
 }
@@ -422,10 +423,10 @@ void Draw(float width, float height) {
 
 	Settings&  s       = g_edit;
 	bool live_changed = false;
-	const char* tabs[5] = {"Pantalla", "Reescalado", "Frame generation", "Rendimiento", "Juego"};
+	const char* tabs[kTabCount] = {"Pantalla", "Reescalado", "Frame generation", "Rendimiento", "Calidad grafica", "Juego"};
 	const float footer  = 150 * unit;
 	if (ImGui::BeginTabBar("##tabs")) {
-		for (int t = 0; t < 5; t++) {
+		for (int t = 0; t < kTabCount; t++) {
 			const ImGuiTabItemFlags flags = g_tab_request == t ? ImGuiTabItemFlags_SetSelected : 0;
 			if (!ImGui::BeginTabItem(tabs[t], nullptr, flags)) continue;
 			g_tab = t;
@@ -435,9 +436,6 @@ void Draw(float width, float height) {
 					CheckRow("Pantalla completa", true, s.fullscreen);
 					CheckRow("HDR", true, s.hdr, "HDR10: solo con \"Usar HDR\" activado en Windows");
 					CheckRow("VSync", true, s.vsync);
-					if (CheckRow("Modo graficas de 8 GB", true, s.low_end, "Adaptado para graficas de 8 GB como RTX 3060, RTX 3060 Ti, RTX 3070, RTX 2070/2080, RX 6600, RX 6600 XT o RX 6650 XT: el juego a 30 FPS estables y frame generation de AMD x2 (60 en pantalla). Reescalado solo con XeSS o FSR.") &&
-					    s.low_end && s.res.rfind("dlss", 0) == 0)
-						s.res = "nativo";
 					CheckRow("G-Sync / FreeSync", true, s.gsync, "El reloj del emulador no se ata a los Hz del monitor");
 					CheckRow("FPS desbloqueados (experimental)", true, s.unlock_fps,
 					         "El juego pasa de 60 FPS reales; videos, menus y cargas siguen a 60");
@@ -456,20 +454,13 @@ void Draw(float width, float height) {
 					break;
 				}
 				case 1: {
-					if (s.low_end && s.res.rfind("dlss", 0) == 0) s.res = "nativo";
-					static std::vector<ResMode> shown;
-					shown.clear();
-					for (int i = 0; i < kResModeCount; i++)
-						if (!s.low_end || std::string(kResModes[i].upscaler) != "dlss") shown.push_back(kResModes[i]);
-					ComboRow("Reescalado", true, static_cast<int>(shown.size()), shown.data(), s.res, [](const ResMode& m) { return m.id; },
+					ComboRow("Reescalado", true, kResModeCount, kResModes, s.res, [](const ResMode& m) { return m.id; },
 					         [](const ResMode& m) { return m.label; },
 					         "DLSS: NVIDIA RTX. XeSS: todas las graficas. FSR: graficas de bajo rendimiento");
 					if (ChoiceRow("Nitidez", (s.sharpness == "auto") != (g_rt.launched.sharpness == "auto"), kSharpness,
 					              kSharpnessCount, s.sharpness))
 						live_changed = true;
 					ChoiceRow("Preset DLSS", true, kDlssPresets, kDlssPresetCount, s.dlss_preset);
-					if (s.res.rfind("dlss", 0) == 0 && s.framegen.rfind("amd", 0) == 0)
-						ImGui::TextColored(kWarn, "DLSS no va con la frame generation de AMD: se usara FSR.");
 					break;
 				}
 				case 2: {
@@ -479,13 +470,16 @@ void Draw(float width, float height) {
 						                      "dlss-x3", "dlss-x4", "dlss-x5", "dlss-x6", "dlss-120", "dlss-dinamico"})
 							modes.push_back({id, FrameGenLabel(id)});
 					}
-					if (s.low_end) ImGui::TextColored(kWarn, "Modo graficas de 8 GB: frame generation fija en AMD x2 (30 reales, 60 en pantalla).");
-					ImGui::BeginDisabled(s.low_end);
+					const bool fixed = FixedFg(s);
+					if (fixed)
+						ImGui::TextColored(kWarn, "%s", s.souls_mode == "equilibrado" ? "Modo Souls equilibrado: frame generation fija en AMD x2 (45 reales, 90 en pantalla)."
+						                                                              : "Modo Souls ligero: frame generation fija en AMD x2 (30 reales, 60 en pantalla).");
+					ImGui::BeginDisabled(fixed);
 					std::string locked = "amd-x2";
-					ChoiceRow("Modo", true, modes.data(), static_cast<int>(modes.size()), s.low_end ? locked : s.framegen,
-					          "AMD: todas las graficas. DLSS: NVIDIA RTX 40/50");
+					ChoiceRow("Modo", true, modes.data(), static_cast<int>(modes.size()), fixed ? locked : s.framegen,
+					          "AMD: todas las graficas (tambien con reescalado DLSS). DLSS: NVIDIA RTX 40/50");
 					ImGui::EndDisabled();
-					const int max_gen = g_rt.launched.low_end ? 0 : FixedDlssGenerated(g_rt.launched.framegen);
+					const int max_gen = FixedFg(g_rt.launched) ? 0 : FixedDlssGenerated(g_rt.launched.framegen);
 					if (max_gen > 1 && s.framegen == g_rt.launched.framegen) {
 						if (g_fg_live == 0) g_fg_live = max_gen;
 						ImGui::AlignTextToFramePadding();
@@ -504,13 +498,46 @@ void Draw(float width, float height) {
 				case 3: {
 					CheckRow("Equipo de 16 GB RAM", true, s.profile16, "6 GB del juego fijos en RAM; la precarga espera con poca RAM libre");
 					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para graficas que se cuelgan: mas estable, ~37% menos FPS");
-					ChoiceRow("Texturas", true, kTextureReduce, kTextureReduceCount, s.texture_reduce);
-					ChoiceRow("Distancia de dibujado", true, kQualities, kQualityCount, s.quality, "Solo el detalle lejano (LOD); Maximo = el juego tal cual");
-					CheckRow("Simular grafica de 8 GB", true, s.simulate_vram8);
+					CheckRow("Simular grafica de 8 GB", true, s.simulate_vram8, "Para ver como va en una grafica de 8 GB");
 					CheckRow("Usar todos los CCD (Ryzen de dos CCD)", true, s.all_ccds);
+					CheckRow("Anti-Lag", true, s.antilag, "AMD Anti-Lag 2 si el driver lo tiene; con DLSS, NVIDIA Reflex");
 					break;
 				}
 				case 4: {
+					// (10-23) Launcher-souls.ps1's "Modos Souls" and "Calidad grafica".
+					std::string mode = s.souls_mode;
+					if (ChoiceRow("Modo Souls", true, kSoulsModes, kSoulsModeCount, mode,
+					              "Ligero: graficas de 8 GB. Equilibrado: como el modo rendimiento de PS5. Ultra: RTX 5060-5070 Ti, RX 9070. "
+					              "Extremo: para enfermos de Souls (RTX 5080 / 5090). Los FPS dependen de tu GPU y tu CPU.")) {
+						s.souls_mode = mode;
+						ApplyPreset(&s, mode == "ninguno" ? std::string("maximo") : mode);
+						if (mode != "ligero") s.gpu8 = false;
+					}
+					if (CheckRow("Optimizacion tarjetas 8 GB", true, s.gpu8,
+					             "Graficas de 8 GB: texturas en Bajo y distancia y sombras en Medio. Al quitarla, todo vuelve a Maximo."))
+						ApplyPreset(&s, s.gpu8 ? "ligero" : "maximo");
+					ImGui::Separator();
+					ChoiceRow("Texturas", true, kTextureReduce, kTextureReduceCount, s.texture_reduce, "Alto: sin el nivel mas grande en texturas de 2048+. Medio: mitad. Bajo: un cuarto");
+					ChoiceRow("Distancia de dibujado", true, kQualities, kQualityCount, s.quality, "Solo el detalle lejano (LOD); Maximo = el juego tal cual");
+					ChoiceRow("Sombras", true, kShadows, kShadowCount, s.shadows, "Alto: sol hasta 190 m. Medio: 125 m. Bajo: 60 m sin focos ni ambientales");
+					ChoiceRow("Detalle", true, kDetails, kDetailCount, s.detail, "Teselado, cascadas de sombra e iluminacion del juego. Alto = rendimiento de PS5, Muy alto = cine");
+					ChoiceRow("Reflejos", true, kReflections, kReflectionCount, s.reflections, "Reflejos del juego (SSR). Alto = PS5");
+					ChoiceRow("Distancia de los objetos", true, kReflections, kReflectionCount, s.object_fade, "A que distancia se desvanecen los objetos lejanos. Alto = PS5");
+					ChoiceRow("Nitidez del antialiasing", true, kAaSharp, kAaSharpCount, s.aa_sharp, "Normal = PS5");
+					ChoiceRow("Luz RT", true, kRtLight, kRtLightCount, s.rt_light, "Luz rebotada por rayos en pantalla. Solo con DLSS, XeSS o FSR. Cuesta FPS. Experimental");
+					ChoiceRow("Oclusion ambiental", true, kAmbientOcclusion, kAmbientOcclusionCount, s.ambient_occlusion, "GTAO: rincones y contactos mas realistas. Solo con DLSS, XeSS o FSR. Cuesta FPS");
+					CheckRow("Filtrado x16", true, s.af16, "Filtrado anisotropico x16 en las superficies de la escena");
+					CheckRow("Texturas nitidas", true, s.sharp_textures, "Con reescalado: las texturas con el detalle de la resolucion final (no toca la niebla)");
+					ImGui::Spacing();
+					ImGui::TextColored(kDim, "Postprocesado:");
+					CheckRow("Desenfoque de movimiento", true, s.motion_blur);
+					CheckRow("Profundidad de campo", true, s.dof);
+					CheckRow("Vineteado", true, s.vignette);
+					CheckRow("Resplandor (bloom)", true, s.bloom);
+					CheckRow("Adaptacion del ojo", true, s.eye_adapt);
+					break;
+				}
+				case 5: {
 					std::string lang = std::to_string(s.language);
 					if (ChoiceRow("Idioma", true, kLanguages, kLanguageCount, lang)) s.language = std::atoi(lang.c_str());
 					if (CheckRow("Vibracion", false, s.rumble)) live_changed = true;
@@ -520,6 +547,22 @@ void Draw(float width, float height) {
 					ImGui::SetNextItemWidth(-1);
 					if (ImGui::SliderFloat("##gain", &s.rumble_gain, 1.0f, 8.0f, "%.1f")) live_changed = true;
 					CheckRow("Copia de las partidas al arrancar", false, s.backup_saves);
+					ImGui::Spacing();
+					ImGui::TextColored(kDim, "Controles:");
+					CheckRow("Teclado y raton", true, s.kbm, "Raton para la camara, teclas estilo Souls (mapa_teclado en settings.ini). F7: solo el raton en vivo");
+					ImGui::BeginDisabled(!s.kbm);
+					ImGui::AlignTextToFramePadding();
+					ImGui::TextUnformatted("Sensibilidad del raton");
+					ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.42f + ImGui::GetCursorStartPos().x);
+					ImGui::SetNextItemWidth(-1);
+					ImGui::SliderFloat("##sens", &s.kbm_sens, 0.1f, 5.0f, "%.2f");
+					ImGui::AlignTextToFramePadding();
+					ImGui::TextUnformatted("Antizona muerta");
+					ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.42f + ImGui::GetCursorStartPos().x);
+					ImGui::SetNextItemWidth(-1);
+					ImGui::SliderFloat("##adz", &s.kbm_antidz, 0.0f, 0.6f, "%.2f");
+					ImGui::EndDisabled();
+					if (!s.pad_map.empty()) ImGui::TextColored(kDim, "Mando remapeado (mapa_mando en settings.ini).");
 					ImGui::Spacing();
 					ImGui::TextColored(kDim, "Carpeta del juego:");
 					ImGui::TextWrapped("%s", s.game.c_str());
@@ -616,10 +659,11 @@ void InstallMenu(const Runtime& runtime) {
 	g_saved = runtime.launched;
 	g_edit  = runtime.launched;
 	ApplyLive(runtime.launched);
-	const std::string fg = runtime.launched.low_end ? std::string("amd-x2") : runtime.launched.framegen;
+	const bool        fixed = FixedFg(runtime.launched);
+	const std::string fg    = fixed ? std::string("amd-x2") : runtime.launched.framegen;
 	if (fg != "sin-fg" && !fg.empty()) {
-		PortLive::fg_label  = runtime.launched.low_end ? "MODO PC BAJOS REQUISITOS" : FrameGenLabel(fg);
-		PortLive::fg_plain  = runtime.launched.low_end;
+		PortLive::fg_label  = fixed ? (runtime.launched.souls_mode == "equilibrado" ? "MODO SOULS EQUILIBRADO" : "MODO SOULS LIGERO") : FrameGenLabel(fg);
+		PortLive::fg_plain  = fixed;
 		PortLive::fg_vendor = fg.rfind("dlss", 0) == 0 ? 1 : 2;
 		PortLive::fg_now    = fg == "amd-x2" ? 2 : (fg == "amd-x3" || fg == "amd-120") ? 3 : fg == "amd-x4" ? 4 : 0;
 	}
@@ -631,7 +675,8 @@ void InstallMenu(const Runtime& runtime) {
             return items[0].label;
 		};
 		gfx = std::string("Texturas ") + level(kTextureReduce, kTextureReduceCount, runtime.launched.texture_reduce) +
-		      ", Distancia de dibujado " + level(kQualities, kQualityCount, runtime.launched.quality);
+		      ", Distancia de dibujado " + level(kQualities, kQualityCount, runtime.launched.quality) + ", Sombras " +
+		      level(kShadows, kShadowCount, runtime.launched.shadows) + ", Detalle " + level(kDetails, kDetailCount, runtime.launched.detail);
 		PortLive::gfx_line = gfx.c_str();
 	}
 	PortLive::g_hooks = &kHooks;

@@ -43,18 +43,39 @@ Esta junto al exe y tiene comentarios en cada opcion. Equivalencias con el lanza
   fps_desbloqueados = FPS desbloqueados (experimental; sin FG: reloj a 960 Hz).
   perfil_16gb       = Equipo de 16 GB RAM: 6 GB fijos en RAM, la precarga de shaders espera con poca RAM
                       libre (no cambia los graficos).
-  gama_baja         = Modo graficas de 8 GB: adaptado para graficas de 8 GB como RTX 3060, RTX 3060 Ti,
-                      RTX 3070, RTX 2070/2080, RX 6600, RX 6600 XT o RX 6650 XT: el juego a 30 FPS estables y
-                      frame generation de AMD x2 (60 en pantalla), fija. Reescalado solo con XeSS o FSR
-                      (un modo DLSS guardado pasa a nativo).
   gpu_seguro        = Modo GPU seguro.     simular_vram_8gb = Simular grafica 8 GB.
-  reducir_texturas  = Texturas: 0 Maximo, 1 Medio (mitad), 2 Bajo (un cuarto).
-  calidad           = Distancia de dibujado: standard Maximo (el juego tal cual), low Medio, lowest Bajo
-                      (solo el detalle lejano).
   metricas          = panel de FPS dentro del juego (0 / 1 / 2), con el modo de frame generation y su
                       multiplicador actual (verde NVIDIA, rojo AMD; los FPS en blanco sin frame generation) y
                       el nivel de Texturas y Distancia de dibujado (antes: Metricas abria metricas.ps1).
   vibracion, vibracion_fuerza = vibracion del mando desde el audio haptico (KYTY_HAPTIC_RUMBLE / _GAIN).
+  antilag           = Anti-Lag (AMD Anti-Lag 2; con DLSS, NVIDIA Reflex).
+
+  [Graficos] (pestana "Calidad grafica" del menu, como en el lanzador)
+  modo_souls        = ninguno / ligero / equilibrado / ultra / extremo:
+                      ligero: graficas de 8 GB (RTX 3060-3070, RX 6600...): 30 FPS reales x2 AMD (60 en pantalla),
+                              texturas bajo, distancia y sombras medio.
+                      equilibrado: 45 reales x2 AMD (90), texturas, distancia y sombras alto (rendimiento de PS5).
+                      ultra: RTX 5060 / 5060 Ti / 5070 / 5070 Ti, RX 9070 / 9070 XT (detalle muy alto, luz RT y oclusion alta).
+                      extremo: para enfermos de Souls, RTX 5080 / 5090: todo en Ultra, filtrado x16, texturas nitidas.
+                      Los FPS dependen de tu GPU y tu CPU. En ligero y equilibrado el reescalado DLSS tambien vale.
+                      Desde el menu, elegir un modo pone sus ajustes (despues se pueden cambiar uno a uno).
+  optimizacion_8gb  = Optimizacion tarjetas 8 GB: texturas bajo, distancia y sombras medio; quitarla vuelve a Maximo.
+  reducir_texturas  = Texturas: 0 Maximo, h Alto (sin el nivel mayor en texturas de 2048+), 1 Medio, 2 Bajo.
+  calidad           = Distancia de dibujado: standard Maximo, high Alto, low Medio, lowest Bajo (solo el detalle lejano).
+  sombras           = maximo (las del juego), alto (sol 190 m), medio (125 m), bajo (60 m).
+  detalle           = ultra, muy-alto (cine), alto (rendimiento de PS5), normal, bajo: teselado, cascadas, iluminacion.
+  reflejos, distancia_objetos = ultra, alto (PS5), normal, bajo (los reflejos y el fundido de objetos del juego).
+  nitidez_aa        = nitidez del antialiasing del juego: ultra, alto, normal (PS5), bajo, no.
+  luz_rt, oclusion_ambiental = 0-3 (solo con DLSS, XeSS o FSR; cuestan FPS).
+  desenfoque_movimiento, profundidad_campo, vineteado, resplandor, adaptacion_ojo = postprocesado (1 como en PS5).
+  filtrado_x16      = filtrado anisotropico x16.   texturas_nitidas = el detalle de la resolucion final (no toca la niebla).
+
+  [Mandos]
+  teclado_raton, raton_sensibilidad, raton_antizona, mapa_teclado = teclado y raton (KYTY_KBM*).
+  mapa_mando        = mando remapeado (KYTY_PAD_MAP: a=Cross;b=Circle;...).
+
+  Al darle a jugar, si quedan menos de 10 GB de RAM libres sale un aviso con los programas que mas usan.
+
   extra             = interruptores del emulador (KYTY_X=1;KYTY_Y=2), como -Set de run-windows.ps1.
 
 Carpetas

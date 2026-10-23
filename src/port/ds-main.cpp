@@ -16,14 +16,18 @@
 #include <windows.h>
 #include <shobjidl.h>
 #include <shlobj.h>
+#include <psapi.h>
+#include <tlhelp32.h>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <io.h>
 #include <iterator>
+#include <map>
 #include <algorithm>
 #include <mutex>
 #include <string>
@@ -65,6 +69,55 @@ void Message(const std::string& text, UINT flags = MB_ICONWARNING) {
 std::string ReadText(const fs::path& path) {
 	std::ifstream in(path, std::ios::binary);
 	return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+// (10-23) Launcher-souls.ps1 Start-Game: with under 10 GB of free RAM, the five programs using the most (only read:
+// nothing is closed or emptied). false: the player chose to go back.
+bool RamWarning() {
+	MEMORYSTATUSEX m {};
+	m.dwLength = sizeof(m);
+	if (!GlobalMemoryStatusEx(&m)) return true;
+	const double free_gb = static_cast<double>(m.ullAvailPhys) / (1024.0 * 1024.0 * 1024.0);
+	const double total   = static_cast<double>(m.ullTotalPhys) / (1024.0 * 1024.0 * 1024.0);
+	if (free_gb >= 10.0) return true;
+	static const char* const kSkip[] = {"system", "idle", "memory compression", "registry", "csrss.exe", "wininit.exe",
+	                                    "winlogon.exe", "services.exe", "lsass.exe", "smss.exe", "svchost.exe", "dwm.exe",
+	                                    "explorer.exe", "secure system"};
+	using MemInfo = BOOL(WINAPI*)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
+	const auto mem_info = reinterpret_cast<MemInfo>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32GetProcessMemoryInfo")));
+	std::map<std::string, uint64_t> by_name;
+	if (HANDLE snap = mem_info != nullptr ? CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) : INVALID_HANDLE_VALUE; snap != INVALID_HANDLE_VALUE) {
+		PROCESSENTRY32W e {};
+		e.dwSize = sizeof(e);
+		for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e)) {
+			if (e.th32ProcessID == GetCurrentProcessId() || e.th32ProcessID == 0) continue;
+			std::string name = Utf8(e.szExeFile);
+			std::string lower = name;
+			std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			if (std::any_of(std::begin(kSkip), std::end(kSkip), [&](const char* k) { return lower == k; })) continue;
+			HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, e.th32ProcessID);
+			if (p == nullptr) continue;
+			PROCESS_MEMORY_COUNTERS c {};
+			if (mem_info(p, &c, sizeof(c))) by_name[name.size() > 4 && lower.substr(lower.size() - 4) == ".exe" ? name.substr(0, name.size() - 4) : name] += c.WorkingSetSize;
+			CloseHandle(p);
+		}
+		CloseHandle(snap);
+	}
+	std::vector<std::pair<uint64_t, std::string>> top;
+	for (const auto& [name, bytes]: by_name) top.emplace_back(bytes, name);
+	std::sort(top.rbegin(), top.rend());
+	char head[256];
+	std::snprintf(head, sizeof(head), "Solo quedan %.1f GB de RAM libres (de %.0f GB). El juego necesita unos 12 GB y puede ir a tirones o cerrarse.\n\n",
+	              free_gb, total);
+	std::string text = std::string(head) + "Los programas que mas RAM usan ahora:\n";
+	for (size_t i = 0; i < top.size() && i < 5; i++) {
+		char line[200];
+		std::snprintf(line, sizeof(line), "   - %s: %.1f GB\n", top[i].second.c_str(), static_cast<double>(top[i].first) / (1024.0 * 1024.0 * 1024.0));
+		text += line;
+	}
+	text += "\nCierralos si puedes (navegador, Discord, etc.).\n\nAceptar: jugar igualmente    Cancelar: salir";
+	std::printf("[port] RAM: %.1f GB free of %.0f GB (warned)\n", free_gb, total);
+	return MessageBoxW(nullptr, Wide(text).c_str(), L"Memoria RAM", MB_OKCANCEL | MB_ICONWARNING | MB_TOPMOST) == IDOK;
 }
 
 // ---- The splash screen: fondo-souls.jpg, a status line under it, until the game's first frame. ----
@@ -448,6 +501,7 @@ int main(int argc, char* argv[]) {
 		}
 		settings.profile16 = fs::exists(root / L"ram16.txt", ec);
 	}
+	if (!restarted && !RamWarning()) return 0;
 	ShowSplash(image);
 	while (!IsGame(settings.game)) {
 		if (!settings.game.empty())

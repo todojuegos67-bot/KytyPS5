@@ -38,6 +38,21 @@ extern const Choice  kMetrics[];
 extern const int     kMetricsCount;
 extern const Choice  kLanguages[];
 extern const int     kLanguageCount;
+// (10-23) Calidad grafica (Launcher-souls.ps1's graphics group): the game's own settings (KYTY_GAME_CONVARS).
+extern const Choice  kShadows[];
+extern const int     kShadowCount;
+extern const Choice  kDetails[];
+extern const int     kDetailCount;
+extern const Choice  kReflections[];  // also the object fade's levels
+extern const int     kReflectionCount;
+extern const Choice  kAaSharp[];
+extern const int     kAaSharpCount;
+extern const Choice  kRtLight[];      // KYTY_SSGI 0-3
+extern const int     kRtLightCount;
+extern const Choice  kAmbientOcclusion[]; // KYTY_GTAO 0-3
+extern const int     kAmbientOcclusionCount;
+extern const Choice  kSoulsModes[];
+extern const int     kSoulsModeCount;
 
 struct Settings {
 	// [Juego]
@@ -62,12 +77,31 @@ struct Settings {
 	std::string framegen = "sin-fg";
 	// [Rendimiento]
 	bool        profile16 = false;  // run-windows -Ram16 (ram16.txt): memory only
-	bool        low_end = false;    // "Modo graficas de 8 GB": AMD x2 + KYTY_FLIP_FPS=30
 	bool        safe_gpu = false;   // KYTY_COMPUTE_CHAIN=0
 	std::string quality = "standard";
 	std::string texture_reduce = "0";
 	bool        simulate_vram8 = false;
 	bool        all_ccds = false;
+	bool        antilag = false;     // KYTY_ANTILAG
+	// [Graficos] (10-23, the launcher's "Calidad grafica" and "Modos Souls")
+	std::string souls_mode = "ninguno"; // ninguno, ligero (30 x2 AMD), equilibrado (45 x2 AMD), ultra, extremo
+	bool        gpu8 = false;        // Optimizacion tarjetas 8 GB (the menu sets the light preset)
+	std::string shadows = "maximo";  // maximo, alto (190 m), medio (125 m), bajo (60 m)
+	std::string detail = "alto";     // ultra, muy-alto, alto (the game's), normal, bajo
+	std::string reflections = "alto"; // ultra, alto (the game's), normal, bajo
+	std::string object_fade = "alto";
+	std::string aa_sharp = "normal"; // ultra, alto, normal (the game's), bajo, no
+	std::string rt_light = "0";      // KYTY_SSGI
+	std::string ambient_occlusion = "0"; // KYTY_GTAO
+	bool        motion_blur = true, dof = true, vignette = true, bloom = true, eye_adapt = true;
+	bool        af16 = false;        // KYTY_FORCE_AF=16
+	bool        sharp_textures = false; // KYTY_TEXTURE_LOD_BIAS=auto
+	// [Mandos] (10-23: Launcher-souls.ps1 "Controles")
+	bool        kbm = false;         // KYTY_KBM: keyboard and mouse
+	float       kbm_sens = 1.0f;     // KYTY_KBM_SENS
+	float       kbm_antidz = 0.15f;  // KYTY_KBM_ANTIDZ
+	std::string kbm_map;             // KYTY_KBM_MAP
+	std::string pad_map;             // KYTY_PAD_MAP
 	// [Interfaz]
 	std::string metrics = "0"; // KYTY_FPS_HUD 0/1/2
 	bool        rumble = true;
@@ -95,6 +129,11 @@ LaunchPlan BuildLaunch(const Settings& settings, const std::string& title_id);
 
 // Settings whose change needs a restart (everything the menu does not apply live).
 bool NeedsRestart(const Settings& launched, const Settings& now);
+
+// The launcher's presets (Set-PresetLight / Max / Ultra / Extreme and Souls equilibrado) on the graphics settings.
+void ApplyPreset(Settings* settings, const std::string& preset); // ligero, maximo, equilibrado, ultra, extremo
+// Souls ligero / equilibrado: frame generation fixed at AMD x2, the game at 30 / 45.
+bool FixedFg(const Settings& settings);
 
 } // namespace Port
 
