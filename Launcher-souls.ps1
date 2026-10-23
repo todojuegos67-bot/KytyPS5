@@ -217,6 +217,8 @@ function Start-Game {
 	$fgConfig = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	if (Is-FixedFg) { $fgConfig = 'fsr3.json'; $sets += $(if ($chkLowEnd45.Checked) { 'KYTY_FLIP_FPS=45' } else { 'KYTY_FLIP_FPS=30' }) }
 	# Nombre del modo de frame generation para las metricas.
+	# (10-23) El modo grafico para las metricas.
+	Set-IniValue 'soulsmodo' $(if ($chkLowEnd.Checked) { 'Modo Souls ligero' } elseif ($chkLowEnd45.Checked) { 'Modo Souls equilibrado' } elseif ($chkSoulsUltra.Checked) { 'Modo Souls ultra' } elseif ($chkSoulsExt.Checked) { 'Modo Souls extremo' } elseif ($chkSoulsLow.Checked) { 'Modo Souls PC low profile' } else { 'Personalizado' })
 	if ($chkLowEnd45.Checked) { Set-IniValue 'fglabel' 'Modo Souls equilibrado' } elseif ($chkLowEnd.Checked) { Set-IniValue 'fglabel' 'Modo Souls ligero' } else { Set-IniValue 'fglabel' ($fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][0].Trim()) }
 	# (10-22) FPS desbloqueados solo sin frame generation: con frame generation el juego se queda en su base (60) y el
 	# multiplicador llega al monitor; desbloqueado (110 reales x3 = 330) se pasaba de los 240 Hz y salia de G-Sync.
@@ -718,6 +720,15 @@ $panel.Controls.Add($btnSettings)
 
 $btnExit = New-Button 'Salir' ($W - 190) 46 140 58 $false
 $btnExit.Add_Click({ $form.Close() })
+# (10-23) Cruz arriba a la derecha para cerrar el launcher.
+$btnX = New-Object System.Windows.Forms.Button
+$btnX.Text = [string][char]0x2715; $btnX.Font = New-Object System.Drawing.Font('Segoe UI Symbol', 14, [System.Drawing.FontStyle]::Bold)
+$btnX.FlatStyle = 'Flat'; $btnX.FlatAppearance.BorderSize = 0
+$btnX.BackColor = [System.Drawing.Color]::FromArgb(14, 16, 22); $btnX.ForeColor = [System.Drawing.Color]::FromArgb(222, 196, 140)
+$btnX.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(180, 40, 40)
+$btnX.Size = New-Object System.Drawing.Size(48, 40); $btnX.Location = New-Object System.Drawing.Point(($W - $panelW - 56), 8)  # a la izquierda del panel: no tapa nada
+$btnX.Add_Click({ $form.Close() })
+$form.Controls.Add($btnX); $btnX.BringToFront()
 $panel.Controls.Add($btnExit)
 $chk4K.Visible = $false
 # (10-22) Salida: 1440p (el monitor), 4K (modo cinematico del juego), 1080p y 720p (graficas mas modestas). Los
@@ -866,7 +877,7 @@ $panel.Controls.Add($chkSoulsUltra); Move-To $chkSoulsUltra $gModes 12 54 186
 $chkSoulsExt = New-Check 'Modo Souls extremo' 0 0 206 'soulsext'
 $tips.SetToolTip($chkSoulsExt, 'Para enfermos de Souls. RTX 5080, RTX 5090 o superior: modo cinematico del juego a 4K y absolutamente todo al maximo (Ultra en todo, filtrado x16 y texturas nitidas). Los FPS dependen de la potencia de tu GPU y tu CPU.')
 $panel.Controls.Add($chkSoulsExt); Move-To $chkSoulsExt $gModes 202 54 206
-function Set-PresetUltra { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex = 0; $cmbShadow.SelectedIndex = 0; $cmbDet.SelectedIndex = 1; $cmbRt.SelectedIndex = 2; $cmbAo.SelectedIndex = 2; $cmbRefl.SelectedIndex = 1; $cmbFade.SelectedIndex = 1; $cmbAaS.SelectedIndex = 2 }
+function Set-PresetUltra { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex = 0; $cmbShadow.SelectedIndex = 0; $cmbDet.SelectedIndex = 1; $cmbRt.SelectedIndex = 2; $cmbAo.SelectedIndex = 2; $cmbRefl.SelectedIndex = 1; $cmbFade.SelectedIndex = 1; $cmbAaS.SelectedIndex = 0 }  # (10-23) nitidez del AA al maximo (no cuesta)
 function Set-PresetExtreme { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex = 0; $cmbShadow.SelectedIndex = 0; $cmbDet.SelectedIndex = 0; $cmbRt.SelectedIndex = 3; $cmbAo.SelectedIndex = 3; $cmbRefl.SelectedIndex = 0; $cmbFade.SelectedIndex = 0; $cmbAaS.SelectedIndex = 0; $chkAf16.Checked = $true; $chkLod.Checked = $true
 	if ($cmbOut) { $cmbOut.SelectedIndex = 1 }; $chk4K.Checked = $true }  # (10-23) extremo: modo cinematico del juego a 4K
 # (10-23) Modo Souls PC low profile: 900p y todo en bajo, para PCs modestos.
@@ -879,7 +890,9 @@ function Set-ResByName([string]$name) {
 function Set-PresetLowProfile {
 	$cmbTex.SelectedIndex = 3; $cmbDist.SelectedIndex = 3; $cmbShadow.SelectedIndex = 3; $cmbDet.SelectedIndex = 4
 	$cmbRefl.SelectedIndex = 3; $cmbFade.SelectedIndex = 3; $cmbAaS.SelectedIndex = 3; $cmbRt.SelectedIndex = 0; $cmbAo.SelectedIndex = 0
-	$chkAf16.Checked = $false; $chkLod.Checked = $false
+	# (10-23) Lo que casi no cuesta, al maximo: filtrado x16, texturas nitidas y el postprocesado del juego.
+	$chkAf16.Checked = $true; $chkLod.Checked = $true
+	foreach ($pc in @($script:postChecks)) { if ($pc -and $pc[0]) { $pc[0].Checked = $true } }
 	if ($cmbOut) { $cmbOut.SelectedIndex = 0 }; $chk4K.Checked = $false
 	Fill-Res; Set-ResByName '900p juego'
 }
@@ -899,7 +912,12 @@ foreach ($m in @($chkSoulsUltra, $chkSoulsExt)) {
 foreach ($m in @($chkLowEnd, $chkLowEnd45)) { $m.Add_CheckedChanged({ param($sender, $e) if ($sender.Checked) { $chkSoulsUltra.Checked = $false; $chkSoulsExt.Checked = $false; $chkSoulsLow.Checked = $false } }) }
 $chkGpu8.Add_CheckedChanged({ if ($chkGpu8.Checked) { Set-PresetLight } else { Set-PresetMax } })
 # (10-23) Modo Souls ligero y PC low profile: resolucion fija (no se puede cambiar el reescalado).
-function Update-ResLock { $lock = $chkLowEnd.Checked -or $chkSoulsLow.Checked; if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'Sin reescalado (1080p nativo)' }; $cmbRes.Enabled = -not $lock }
+function Update-ResLock { $lock = $chkLowEnd.Checked -or $chkSoulsLow.Checked; if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'Sin reescalado (1080p nativo)' }; $cmbRes.Enabled = -not $lock 
+	# (10-23) PC low profile: todo fijo (salida, graficos y casillas), nada se puede cambiar.
+	$low = $chkSoulsLow.Checked
+	foreach ($c in @($cmbOut, $cmbTex, $cmbDist, $cmbShadow, $cmbDet, $cmbRefl, $cmbFade, $cmbAaS, $cmbRt, $cmbAo, $chkAf16, $chkLod)) { if ($c) { $c.Enabled = -not $low } }
+	foreach ($p in @($script:postChecks)) { if ($p -and $p[0]) { $p[0].Enabled = -not $low } }
+}
 $chkLowEnd.Add_CheckedChanged({ Update-ResLock })
 $chkSoulsLow.Add_CheckedChanged({ Update-ResLock })
 $form.Add_Shown({ Update-ResLock })
