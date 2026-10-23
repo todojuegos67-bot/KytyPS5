@@ -245,7 +245,7 @@ function Get-Fps {
 			$last = $m[$m.Count - 1]
 			$r.mean = [double]::Parse($last.Groups[1].Value, $inv); $r.max = [double]::Parse($last.Groups[2].Value, $inv)
 			if ($r.mean -gt 0) { $r.fps = [Math]::Round(1000.0 / $r.mean) }
-			$r.key = $last.Index
+			$r.key = ($len - $take) + $last.Index  # (10-23) posicion absoluta en el log: la relativa se repetia y la grafica no avanzaba
 		} else {
 			$m = [regex]::Matches($text, 'Frames \(5 s\): ([0-9.]+) fps')
 			if ($m.Count -gt 0) { $r.fps = [Math]::Round([double]::Parse($m[$m.Count - 1].Groups[1].Value, $inv)) }
