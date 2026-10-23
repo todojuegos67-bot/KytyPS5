@@ -45,6 +45,8 @@ static VmaAllocator          g_report_allocator = nullptr;
 static const GraphicContext* g_report_context   = nullptr;
 // Freed images kept for reuse (KYTY_IMAGE_POOL): at most 1 GiB, and a 16th of the GPU's memory budget.
 static uint64_t g_image_pool_limit = 1024ull << 20;
+static std::mutex g_image_pool_mutex;
+static uint64_t   g_image_pool_bytes = 0;
 static void WriteVmaReport(const char* path) {
 	if (g_report_allocator == nullptr) return;
 	if (g_report_context != nullptr) g_report_context->LogVideoMemory("live");
@@ -344,6 +346,32 @@ void GraphicContext::LogVideoMemory(const char* label) const {
 	            " MiB, host-visible %" PRIu64 " MiB)\n",
 	            label, video >> 20u, budget >> 20u, local >> 20u, plain_in_video >> 20u, driver >> 20u, shared >> 20u,
 	            plain_in_system >> 20u, host >> 20u);
+	if (std::strcmp(label, "30 s") == 0) {
+		// By category: the freed images kept for reuse, the game buffers' own pool, the rest of VMA's device-local
+		// memory (textures and render targets of the texture cache, effect and upscaler images, stream rings).
+		uint64_t pool_bytes = 0;
+		{
+			std::scoped_lock lock(g_image_pool_mutex);
+			pool_bytes = g_image_pool_bytes;
+		}
+		VmaStatistics buffers {};
+		if (game_buffer_pool != nullptr) vmaGetPoolStatistics(allocator, game_buffer_pool, &buffers);
+		const uint64_t used_local = [&] {
+			uint64_t used = 0;
+			for (uint32_t type = 0; type < properties.memoryTypeCount; type++)
+				if (properties.memoryTypes[type].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)
+					used += statistics.memoryType[type].statistics.allocationBytes;
+			return used;
+		}();
+		const uint64_t other = used_local - std::min(used_local, pool_bytes + buffers.allocationBytes);
+		std::printf("Video memory by category (30 s): game buffer pool %" PRIu64 " MiB (blocks %" PRIu64
+		            "), image reuse pool %" PRIu64 " MiB, images and other device-local %" PRIu64
+		            " MiB, free inside VMA blocks %" PRIu64 " MiB, driver %" PRIu64 " MiB, room under the budget %" PRId64
+		            " MiB\n",
+		            buffers.allocationBytes >> 20u, buffers.blockBytes >> 20u, pool_bytes >> 20u, other >> 20u,
+		            (local - std::min(local, used_local)) >> 20u, driver >> 20u,
+		            (static_cast<int64_t>(budget) - static_cast<int64_t>(video)) / (1 << 20));
+	}
 	std::fflush(stdout);
 }
 
@@ -448,8 +476,10 @@ uint64_t GraphicContext::GetTotalMemoryBudget(bool capped) const {
 		constexpr uint64_t GiB = 1024ull * 1024 * 1024;
 		// 8 GB at most: a 16 GB card with the desktop, an overlay and a browser stayed near 15 GB in use at 10 GB.
 		if (local > 4 * GiB) result = std::min(result, std::min(local - 3 * GiB, 8 * GiB));
-		// KYTY_LOWMEM_VRAM=1: at most 6 GB, the GPU's memory less 4 GB (not below 3 GB).
-		if (LocalPlatform::LowMemVram() && local > 4 * GiB)
+		// KYTY_LOWMEM_VRAM=1: at most 6 GB, the GPU's memory less 4 GB (not below 3 GB), only on cards above 8.5 GB.
+		// On 8 GB it gave 4096 instead of the default 5120 and hitched far more (simulated 8 GB: 25-97 hitch windows
+		// at 4096 against 3-17 in most runs at 5120): the collector then deletes and re-uploads textures mid-play.
+		if (LocalPlatform::LowMemVram() && local > 8 * GiB + GiB / 2)
 			result = std::min(result, std::max(std::min(local - 4 * GiB, 6 * GiB), 3 * GiB));
 		return result;
 	}
@@ -474,9 +504,7 @@ struct PooledImage {
 	VmaAllocation            allocation = nullptr;
 	uint64_t                 bytes      = 0;
 };
-std::mutex               g_image_pool_mutex;
 std::vector<PooledImage> g_image_pool;
-uint64_t                 g_image_pool_bytes = 0;
 
 std::array<uint32_t, 10> ImagePoolKey(const vk::ImageCreateInfo& info) {
 	return {static_cast<uint32_t>(static_cast<VkImageCreateFlags>(info.flags)), static_cast<uint32_t>(info.imageType),
