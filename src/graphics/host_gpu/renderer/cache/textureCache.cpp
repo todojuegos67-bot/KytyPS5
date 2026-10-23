@@ -1090,9 +1090,12 @@ bool TextureCache::PartialDirtyCandidate(const Image& image) {
 bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
                                         uint64_t granule) {
 	const auto& info = image.info;
+	// (With GPU buffer writes over known ranges of it too: a refresh uploads those with the dirty ranges, InitializeImage.
+	// One written all over, or where not known, goes up whole anyway.)
 	if (!PartialDirtyCandidate(image) || !image.registered || !image.IsTracked() ||
 	    image.track_addr != info.data.address || image.track_addr_end != info.data.End() ||
-	    !image.CanTakePartialDirty() || image.IsBufferModified() || image.IsStencilModified()) {
+	    !image.CanTakePartialDirty() || (image.IsBufferModified() && image.BufferModifiedRanges().empty()) ||
+	    image.IsStencilModified()) {
 		return false;
 	}
 	const auto base  = info.data.address;
@@ -2146,10 +2149,13 @@ void TextureCache::InitializeImage(ImageId id) {
 	LiveCounters::ScopedUs timed(LiveCounters::ImageInitUs);
 	auto&             image = m_slot_images[id];
 	Clock::time_point marks[3] {Clock::now()};
-	const char*       kind = image.IsPartiallyCpuDirty() ? "partial"
-	                         : image.IsBufferModified()  ? "buffer"
-	                         : image.IsCpuDirty()        ? "cpu"
-	                                                     : "clean";
+	// (buffer: GPU buffer writes over known ranges; buffer-all: over all of it or where not known; +cpu: and CPU writes)
+	const bool        buffer_all = image.IsBufferModified() && image.BufferModifiedRanges().empty();
+	const bool        cpu        = image.IsCpuDirty();
+	const char*       kind = image.IsPartiallyCpuDirty() ? (image.IsBufferModified() ? "partial+buffer" : "partial")
+	                         : !image.IsBufferModified() ? (cpu ? "cpu" : "clean")
+	                         : buffer_all                ? (cpu ? "buffer-all+cpu" : "buffer-all")
+	                                                     : (cpu ? "buffer+cpu" : "buffer");
 	SlowLog::Scope    slow([&](double ms) {
         const auto at = [&](int i) {
             return marks[i] == Clock::time_point {}
@@ -4668,6 +4674,36 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	return false;
 }
 
+namespace {
+
+// KYTY_SLOW_LOG_MS: a large image a CPU write or a map made dirty whole, or a partial unmap deleted, and why it took no
+// partial dirty state (TextureCache::TryInvalidatePartial).
+void LogFullDirty(const char* why, const Image& image, uint64_t address, uint64_t size, bool candidate) {
+	if (SlowLog::Threshold() <= 0.0 || image.info.data.size < PartialDirtyMinSize || !image.IsTracked() ||
+	    kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	const auto& info = image.info;
+	std::printf("[tsc %llu] FULL-DIRTY %s addr=0x%llx size=0x%llx write=0x%llx+0x%llx candidate=%d "
+	            "(depth_id=%d backing=%d samples=%u volume=%d depth=%d stencil_plane=%d compression=%u) "
+	            "registered=%d tracked=%d whole=%d take=%d maybe=%d cpu=%d partial=%d gpu=%d buffer=%d "
+	            "buffer_ranges=%zu stencil=%d\n",
+	            static_cast<unsigned long long>(__rdtsc()), why, static_cast<unsigned long long>(info.data.address),
+	            static_cast<unsigned long long>(info.data.size), static_cast<unsigned long long>(address),
+	            static_cast<unsigned long long>(size), candidate ? 1 : 0, image.depth_id ? 1 : 0,
+	            image.backing.image != nullptr ? 1 : 0, info.samples, info.IsVolume() ? 1 : 0, info.IsDepth() ? 1 : 0,
+	            info.HasStencil() ? 1 : 0, static_cast<uint32_t>(info.metadata.compression), image.registered ? 1 : 0,
+	            image.IsTracked() ? 1 : 0,
+	            image.track_addr == info.data.address && image.track_addr_end == info.data.End() ? 1 : 0,
+	            image.CanTakePartialDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
+	            image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsPartiallyCpuDirty() ? 1 : 0,
+	            image.IsGpuModified() ? 1 : 0, image.IsBufferModified() ? 1 : 0, image.BufferModifiedRanges().size(),
+	            image.IsStencilModified() ? 1 : 0);
+	std::fflush(stdout);
+}
+
+} // namespace
+
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	const auto page_begin = address & ~(TRACKER_PAGE_SIZE - 1);
 	const auto page_end   = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
@@ -4680,33 +4716,7 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			if (TryInvalidatePartial(*owner, address, size, PartialDirtyGranule)) {
 				continue;
 			}
-			if (SlowLog::Threshold() > 0.0 && owner->info.data.size >= PartialDirtyMinSize &&
-			    owner->IsTracked() &&
-			    kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) != 0) {
-				std::printf("[tsc %llu] FULL-DIRTY addr=0x%llx size=0x%llx write=0x%llx+0x%llx candidate=%d "
-				            "(depth_id=%d backing=%d samples=%u volume=%d depth=%d stencil_plane=%d compression=%u) "
-				            "registered=%d tracked=%d whole=%d take=%d maybe=%d cpu=%d partial=%d gpu=%d buffer=%d "
-				            "stencil=%d\n",
-				            static_cast<unsigned long long>(__rdtsc()),
-				            static_cast<unsigned long long>(owner->info.data.address),
-				            static_cast<unsigned long long>(owner->info.data.size),
-				            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
-				            PartialDirtyCandidate(*owner) ? 1 : 0, owner->depth_id ? 1 : 0,
-			            owner->backing.image != nullptr ? 1 : 0, owner->info.samples,
-			            owner->info.IsVolume() ? 1 : 0, owner->info.IsDepth() ? 1 : 0,
-			            owner->info.HasStencil() ? 1 : 0,
-			            static_cast<uint32_t>(owner->info.metadata.compression), owner->registered ? 1 : 0,
-				            owner->IsTracked() ? 1 : 0,
-				            owner->track_addr == owner->info.data.address &&
-				                    owner->track_addr_end == owner->info.data.End()
-				                ? 1
-				                : 0,
-				            owner->CanTakePartialDirty() ? 1 : 0, owner->IsMaybeCpuDirty() ? 1 : 0,
-				            owner->IsDefinitelyCpuDirty() ? 1 : 0, owner->IsPartiallyCpuDirty() ? 1 : 0,
-				            owner->IsGpuModified() ? 1 : 0, owner->IsBufferModified() ? 1 : 0,
-				            owner->IsStencilModified() ? 1 : 0);
-				std::fflush(stdout);
-			}
+			LogFullDirty("write", *owner, address, size, PartialDirtyCandidate(*owner));
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id, "cpu-write");
 			continue;
@@ -4854,6 +4864,7 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 		if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
 			continue;
 		}
+		LogFullDirty("map", *owner, address, size, PartialDirtyCandidate(*owner));
 		owner->InvalidateCpuWrite(address, size);
 		UntrackImage(id, "map");
 	}
@@ -4912,11 +4923,13 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		// layer's memory at a time. The unmapped span becomes dirty (read back as it is when
 		// the image is next used) and stays unwatched until then; MapMemory marks it again
 		// when memory returns there.
-		if ((address > owner->info.data.address || address + size < owner->info.data.End()) &&
-		    TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
-			LiveCounters::Add(LiveCounters::PartialUnmaps);
-			++slow_partial;
-			continue;
+		if (address > owner->info.data.address || address + size < owner->info.data.End()) {
+			if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
+				LiveCounters::Add(LiveCounters::PartialUnmaps);
+				++slow_partial;
+				continue;
+			}
+			LogFullDirty("unmap", *owner, address, size, PartialDirtyCandidate(*owner));
 		}
 		++slow_deleted;
 		slow_bytes += owner->info.data.size;
