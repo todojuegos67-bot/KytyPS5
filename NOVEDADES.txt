@@ -1,74 +1,44 @@
-DEMON'S SOULS (PS5) EN PC - NOVEDADES DE ESTA VERSION
-======================================================
+DEMON'S SOULS (PS5) EN PC - NOVEDADES / WHAT'S NEW
+==================================================
 
-Que hay de nuevo, explicado sin tecnicismos.
-
-
-1. MULTI FRAME GENERATION (MAS FPS EN PANTALLA)
------------------------------------------------
-El juego va a 60 FPS. Con frame generation, la grafica se inventa
-fotogramas intermedios y en pantalla se ven muchos mas.
-
-- NVIDIA (RTX 40 y 50): x2, x3 y x4.
-- AMD / cualquier grafica: ahora tambien x3 y x4, no solo x2.
-- Modo DINAMICO (NVIDIA y AMD): elige solo el multiplicador para
-  acercarse al maximo de tu monitor sin pasarse.
-  Ejemplo: en un monitor de 240 Hz, unos 180 FPS en pantalla.
-- NVIDIA usa automaticamente el "Preset C", la version nueva y mas
-  rapida del frame generation.
+Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
 
 
-2. VIBRACION EN CUALQUIER MANDO
--------------------------------
-Demon's Souls solo vibraba con un DualSense conectado por cable.
-Ahora la vibracion funciona tambien con mandos de Xbox, 8BitDo,
-GameSir y el DualSense por Bluetooth.
+1. LAUNCHER EN ESPANOL E INGLES / SPANISH AND ENGLISH LAUNCHER
+--------------------------------------------------------------
+Dos columnas, todo agrupado. Two columns, everything grouped.
 
 
-3. REESCALADO (DLSS, XeSS y FSR)
---------------------------------
-- Arreglada la pantalla negra que salia con algunos modos de DLSS.
-- Los modos de DLSS son ahora: DLAA, Ultra calidad, Calidad y
-  Rendimiento (todos funcionan).
-- Nuevo "FSR AA nativo": suaviza los bordes sin bajar la resolucion.
-- Ajuste de nitidez para que la imagen no se vea borrosa.
+2. MODOS SOULS / SOULS MODES
+----------------------------
+- Ligero / Light: graficas de 8 GB, 16 GB de RAM.
+- Equilibrado / Balanced: RTX 3080, RX 6800 / 6900.
+- Ultra: RTX 5060 - 5070 Ti, RX 9070 / 9070 XT.
+- Extremo / Extreme: RTX 5080, 5090 o superior. Para enfermos de Souls.
+Los FPS dependen de tu GPU y tu CPU. FPS depend on your GPU and CPU.
 
 
-4. MODO TURBO (PCs MAS MODESTOS)
---------------------------------
-Pensado para graficas de 8 GB o menos y PCs de 16 GB de RAM:
-el juego usa unos 5,5-6 GB de VRAM y menos RAM.
+3. OPCIONES DEL PROPIO JUEGO / THE GAME'S OWN SETTINGS
+------------------------------------------------------
+- Detail: Ultra / Very High (cine) / High (PS5) / Normal / Low:
+  sombras, iluminacion y relieve (teselado).
+- Reflections, Object Fade y AA Sharpness: Ultra a Low.
+- Texturas, Distancia y Sombras con nivel nuevo "Alto".
+- Motion Blur, Depth of Field, Vignette, Bloom, Eye Adaptation (si/no).
+- Texturas nitidas con DLSS/XeSS/FSR, sin estropear la niebla.
 
-- Arreglado: zonas y texturas que se veian muy oscuras de lejos.
-- Arreglado: texturas oscuras al reaparecer despues de morir.
-- En Turbo solo se ofrecen los modos de antialiasing (DLAA, XeSS AA
-  y FSR AA): reescalar desde menos resolucion se veia peor.
+
+4. RENDIMIENTO / PERFORMANCE
+----------------------------
+- DLSS frame generation x4 suave; modo dinamico que llena el monitor.
+- DLSS tambien con el frame generation de AMD.
+- Optimizacion para graficas de 8 GB (casilla).
+- Aviso de RAM libre al jugar: te dice que cerrar si vas justo.
 
 
-5. METRICAS EN PANTALLA
+5. CONTROLES / CONTROLS
 -----------------------
-Casilla "Metricas": GPU, VRAM, CPU, RAM, FPS y grafica de tiempos
-de fotograma. Ahora tambien muestra:
-- El reescalado en uso (por ejemplo "DLSS Calidad 1080p -> 1440p").
-- El frame generation en uso y su multiplicador actual
-  (verde = NVIDIA, rojo = AMD).
+- Mapear mando (PS5 / Xbox / 8BitDo) y teclado y raton.
 
 
-6. LANZADOR
------------
-- Nueva imagen de fondo.
-- Opciones mas claras: se han quitado las que no servian.
-
-
-RECOMENDACIONES
----------------
-- Monitor G-Sync / FreeSync: desmarca VSync en el lanzador y activa
-  la Sincronizacion vertical en el panel de NVIDIA (o AMD).
-- Si tienes una grafica potente, no uses TURBO: esta pensado para
-  equipos mas modestos.
-- La primera vez, usa "Precompilar shaders" para evitar tirones al
-  empezar.
-
-
-Necesitas tu propia copia del juego. El emulador no incluye ningun
-archivo del juego.
+Donaciones / Donations: PayPal todojuegos67@gmail.com  -  Dona tu alma.

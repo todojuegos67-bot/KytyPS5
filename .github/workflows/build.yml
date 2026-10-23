@@ -232,7 +232,7 @@ jobs:
             run-windows.ps1, precompile-windows.ps1, launcher.ps1, launcher.cmd, LICENSE $out
           Copy-Item LICENSES $out -Recurse
           # Demon's Souls launcher (window with frame generation choice) and its two configs.
-          Copy-Item Launcher-souls.ps1, Launcher-souls.cmd, fondo-souls.jpg, LEEME-souls.txt, metricas.ps1, NOVEDADES.txt $out
+          Copy-Item Launcher-souls.ps1, Launcher-souls-EN.ps1, Launcher-souls.cmd, 'Jugar (Espanol).cmd', 'Play (English).cmd', fondo-souls.jpg, LEEME-souls.txt, metricas.ps1, NOVEDADES.txt $out
           Copy-Item config "$out\config" -Recurse
           Copy-Item run-windows.json "$out\launch.json"
           Copy-Item docs\PORTABLE-README.md "$out\README.md"
