@@ -7,8 +7,47 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "loader/demonsSoulsRenderSize.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 
 namespace Libs::Graphics {
+
+// KYTY_TEXTURE_LOD_BIAS=<float|auto> (default off): an extra mip LOD bias for scene textures when the 3D renders below
+// the display and an upscaler (DLSS/XeSS/FSR) makes the display image - the vendors' log2(render/display), so the mips
+// are picked for the output's resolution, not the render's. "auto": log2(render height / display height) from what
+// KYTY_UPSCALE_RATIO resolved to (loader/demonsSoulsRenderSize), clamped to [-2, 0]; a number: that bias exactly
+// (e.g. -1 more for DLSS). Process-constant, so the guest-field sampler key stays valid.
+static float TextureLodBias() {
+	static const float bias = [] {
+		const char* e = std::getenv("KYTY_TEXTURE_LOD_BIAS");
+		if (e == nullptr || *e == 0) return 0.0f;
+		float v = 0.0f;
+		if (std::strcmp(e, "auto") == 0) {
+			uint32_t render  = Loader::DemonsSoulsRenderSize::g_lod_render_height;
+			uint32_t display = Loader::DemonsSoulsRenderSize::g_lod_display_height;
+			if (render == 0 || display == 0) {
+				const char* r = std::getenv("KYTY_UPSCALE_RATIO");
+				const double ratio = r != nullptr ? std::strtod(r, nullptr) : 0.0;
+				if (ratio >= 1.0) {
+					display = 2160;
+					render  = static_cast<uint32_t>(std::lround(display / ratio));
+				}
+			}
+			if (render != 0 && display != 0)
+				v = std::clamp(static_cast<float>(std::log2(static_cast<double>(render) / display)), -2.0f, 0.0f);
+			std::printf("Texture LOD bias: %.3f (auto from render %u / display %u)\n", v, render, display);
+		} else {
+			v = static_cast<float>(std::atof(e));
+			std::printf("Texture LOD bias: %.3f (KYTY_TEXTURE_LOD_BIAS)\n", v);
+		}
+		std::fflush(stdout);
+		return v;
+	}();
+	return bias;
+}
 
 SamplerCache::~SamplerCache() {
 	for (const auto& [key, sampler]: m_samplers) {
@@ -179,6 +218,16 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 			sampler_info.anisotropyEnable = VK_TRUE;
 			sampler_info.maxAnisotropy    = force_af;
 		}
+	}
+	// KYTY_TEXTURE_LOD_BIAS: scene textures only - mipmapped (mip filter on, a max LOD of at least 1), linear, not
+	// depth-compare (shadow maps) nor unnormalized: render targets and post-process buffers are sampled with no mips
+	// (max LOD 0) and keep the guest's bias. Added to the guest's own, clamped to the device limit.
+	if (const float extra = TextureLodBias();
+	    extra != 0.0f && sampler_info.mipmapMode == vk::SamplerMipmapMode::eLinear && sampler_info.minFilter == vk::Filter::eLinear &&
+	    r.DepthCompareFunc() == 0 && !r.ForceUnormCoords() && max_lod >= 1.0f && max_lod > min_lod)
+	{
+		static const float limit = m_graphics.physical_device_properties.limits.maxSamplerLodBias;
+		sampler_info.mipLodBias = std::clamp(sampler_info.mipLodBias + extra, -limit, limit);
 	}
 	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);
 	sampler_info.compareOp               = static_cast<vk::CompareOp>(r.DepthCompareFunc());

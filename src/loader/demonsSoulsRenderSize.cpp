@@ -249,6 +249,8 @@ void Install(Program* program) {
 		if (ratio >= 1.0 && ratio <= 4.0) {
 			const auto height = static_cast<uint32_t>(std::lround(display / ratio));
 			requested         = std::clamp<uint32_t>(height, 720, OutputHeight);
+			g_lod_render_height  = requested;
+			g_lod_display_height = display;
 			std::printf("Demon's Souls render size: KYTY_UPSCALE_RATIO=%s on a %u high display: %u%s\n", ratio_s, display,
 			            requested, requested != height ? " (720-2160)" : "");
 		} else {

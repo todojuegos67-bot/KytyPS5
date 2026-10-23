@@ -28,6 +28,9 @@ struct Program;
 // The game finishes its frame at that size (bloom, depth of field, the HUD); it lays its interface out at 3840x2160
 // against the left edge, which src/local/hud-anchor.h places (the HUD at its sides, the rest widened as before).
 namespace DemonsSoulsRenderSize {
+// What KYTY_UPSCALE_RATIO resolved to (Install): the 3D's render height and the display height it is upscaled to, 0 when
+// no ratio was applied. Read by KYTY_TEXTURE_LOD_BIAS=auto (graphics/host_gpu/renderer/cache/samplerCache.cpp).
+inline uint32_t g_lod_render_height = 0, g_lod_display_height = 0;
 void Install(Program* program);
 // KYTY_DS_FORCE_MODE=cinematic|performance (run-windows.ps1 -ForceMode): the game's graphics mode (its option 0
 // performance, 1 cinematic) as the profile's saved one is read at boot (01.007.000 eboot+0x22cc1, the save's value
