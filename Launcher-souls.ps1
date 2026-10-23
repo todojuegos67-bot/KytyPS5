@@ -286,6 +286,11 @@ function Start-Game {
 	# (Desbloqueado sin frame generation: vblank virtual de 360 Hz y cada frame se muestra en cuanto esta listo
 	# (-FlipWhenReady), no al siguiente tick de 120 Hz: a ~80 FPS los frames alternaban 8 y 17 ms (tirones).)
 	elseif ((Is-Unlocked)) { $psargs += @('-Vblank', '960') }
+	# (10-23) 900 en cualquier monitor: la altura REAL del monitor (con el escalado de Windows al 150 % la de la ventana
+	# sale 960 y daba 1350 lineas).
+	$realH = 0; try { $realH = [int](@(Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object { $_.CurrentVerticalResolution } | Sort-Object CurrentVerticalResolution -Descending)[0].CurrentVerticalResolution) } catch { }
+	if ($realH -le 0) { $realH = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height }
+	foreach ($rm in $resModes) { if ($rm[0] -eq 'FSR 900p (AA)') { $rm[1] = [math]::Max(1.0, [math]::Round($realH / 900.0, 4)) } }
 	$res    = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
 	if ($res[1] -eq 0) { $res = $resModes[0] }
 	# (10-22) Modo 4K: el modo cinematico del juego a 4K nativo (sin reescalado).
@@ -939,7 +944,6 @@ function Set-PresetLowProfile {
 	$chkAf16.Checked = $true; $chkLod.Checked = $true
 	foreach ($pc in @($script:postChecks)) { if ($pc -and $pc[0]) { $pc[0].Checked = $true } }
 	if ($cmbOut) { $cmbOut.SelectedIndex = 0 }; $chk4K.Checked = $false
-	foreach ($rm in $resModes) { if ($rm[0] -eq 'FSR 900p (AA)') { $rm[1] = [math]::Max(1.0, [math]::Round($H / 900.0, 3)) } }  # (10-23) 900 en cualquier monitor
 	Fill-Res; Set-ResByName 'FSR 900p (AA)'
 	$cmbSharp.SelectedIndex = 3  # (10-23) FSR con nitidez al 50 %, fija
 }
