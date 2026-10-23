@@ -287,6 +287,8 @@ function Start-Game {
 	$sets += 'KYTY_ALIAS_STATS=0'  # (10-23) el diagnostico de alias recorria todos los mapeos en cada map: tirones al cambiar de zona que empeoraban con la sesion
 	if ($fgConfig -eq 'fsr3-x4.json') { $sets += 'KYTY_VRR_CAP_FPS=224' }  # (10-22 d) en DLSS el tope se aplicaba dos veces: 14 reales x4 = 56
 	if ($fgConfig -like '*dyn*') { $sets += 'KYTY_DYN_QUALITY=0.95' }  # (10-22 g) llenar el monitor: el menor multiplicador que llega a ~224 (80 reales = x3, 120 = x2)
+	# (10-23) Teclado y raton: velocidad de camara del juego (sin teclado y raton no se toca: la del menu del juego).
+	if ($chkKbm.Checked) { $psargs += @('-ExtraConvars', "cp11_Setting_CameraSpeed=$($trkCam.Value)") }
 	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
@@ -1641,7 +1643,7 @@ foreach ($pp in @(@('Motion Blur', 'motionblur'), @('Depth of Field', 'dof'), @(
 	$script:postChecks += ,@($c, $pp[1])
 	$px += 134; if ($px -gt 300) { $px = 12; $py += 30 }
 }
-$gCtl = New-Group 'Controls' 450 604 420 168
+$gCtl = New-Group 'Controls' 450 604 420 214
 # (10-23) Controles en un desplegable: el boton los muestra u oculta.
 $gCtl.Visible = $false
 $btnCtl = New-Button 'Controls  v' 450 566 420 32 $false
@@ -1653,14 +1655,14 @@ $lnkDon = New-Object System.Windows.Forms.LinkLabel
 $lnkDon.Text = ([string][char]0x2665) + '  Donate your soul  -  PayPal: todojuegos67@gmail.com'
 $lnkDon.Font = $boldSmall; $lnkDon.LinkColor = $gold; $lnkDon.ActiveLinkColor = [System.Drawing.Color]::White
 $lnkDon.BackColor = [System.Drawing.Color]::Transparent
-$lnkDon.Location = New-Object System.Drawing.Point(450, 790); $lnkDon.Size = New-Object System.Drawing.Size(420, 28)
+$lnkDon.Location = New-Object System.Drawing.Point(450, 830); $lnkDon.Size = New-Object System.Drawing.Size(420, 28)
 $lnkDon.TextAlign = 'MiddleCenter'
 $lnkDon.Add_LinkClicked({ Start-Process 'https://www.paypal.com/donate?business=todojuegos67%40gmail.com&currency_code=EUR' })
 $tips.SetToolTip($lnkDon, 'If you enjoy the project, you can donate via PayPal. Thank you, bearer of the curse.')
 $panel.Controls.Add($lnkDon)
 # (10-23) Boton oficial 'Donar' de PayPal, servido por PayPal (paypalobjects.com); si no hay internet, solo queda el texto.
 $picDon = New-Object System.Windows.Forms.PictureBox
-$picDon.Size = New-Object System.Drawing.Size(92, 26); $picDon.Location = New-Object System.Drawing.Point(614, 822)
+$picDon.Size = New-Object System.Drawing.Size(92, 26); $picDon.Location = New-Object System.Drawing.Point(614, 862)
 $picDon.BackColor = [System.Drawing.Color]::Transparent; $picDon.Cursor = [System.Windows.Forms.Cursors]::Hand
 $picDon.SizeMode = 'Zoom'; $picDon.WaitOnLoad = $false
 try { $picDon.LoadAsync('https://www.paypalobjects.com/en_US/i/btn/btn_donate_LG.gif') } catch { }
@@ -1692,8 +1694,12 @@ function New-Slider([string]$key, [int]$min, [int]$max, [int]$def, $x, $y, [scri
 $trkSens = New-Slider 'kbmsens' 5 400 100 12 62 { param($v) 'Mouse sensitivity: ' + ($v / 100).ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture) }
 $trkAdz = New-Slider 'kbmadz' 0 50 15 218 62 { param($v) "Anti-deadzone: $v%" }
 $tips.SetToolTip($trkSens, 'How much the camera turns per mouse movement (1.00 = normal).')
+# (10-23) Velocidad de camara del juego con teclado y raton (cp11_Setting_CameraSpeed): mas alta = los giros grandes del
+# raton no se quedan en el tope del stick. Sin teclado y raton, la del juego (la de su menu).
+$trkCam = New-Slider 'kbmcam' 1 10 10 12 116 { param($v) "Camera speed (mouse): $v" }
+$tips.SetToolTip($trkCam, 'Keyboard and mouse only: the game camera''s maximum turn speed. 10 = fast big turns. Without keyboard and mouse the game menu''s value is used.')
 $tips.SetToolTip($trkAdz, 'Skips the game''s stick deadzone: higher means a small mouse movement already turns the camera. If the camera moves by itself, lower it.')
-function Update-KbmEnabled { $trkSens.Enabled = $chkKbm.Checked; $trkAdz.Enabled = $chkKbm.Checked }
+function Update-KbmEnabled { $trkSens.Enabled = $chkKbm.Checked; $trkAdz.Enabled = $chkKbm.Checked; $trkCam.Enabled = $chkKbm.Checked }
 $chkKbm.Add_CheckedChanged({ Update-KbmEnabled })
 Update-KbmEnabled
 # (10-23) Calibrar la camara para el raton: arranca el juego con KYTY_KBM_CALIBRATE=1 (y teclado y raton).
@@ -1707,7 +1713,7 @@ $btnCal.Add_Click({
 	$script:kbmCalibrate = $true
 	try { Start-Game } finally { $script:kbmCalibrate = $false }
 })
-Move-To $btnCal $gCtl 12 124 396
+Move-To $btnCal $gCtl 12 170 396
 
 # ---- Settings (panel desplegable) ----
 $settings = New-Object System.Windows.Forms.Panel
