@@ -59,10 +59,16 @@ public:
 	// BufferCache::Defragment: no memory is freed here while a pass over the game buffers' pool is open; what is pushed
 	// meanwhile waits for its end. A pass names allocations of erased buffers waiting here, and VMA reads its moves till
 	// the pass ends: freed meanwhile, they were read freed (8 GB GPUs: access violations in vmaGetAllocationInfo from
-	// Defragment, its block gone, 10-23). False while a free runs: the pass waits for a later flip.
+	// Defragment, its block gone, 10-23). False while frees are queued or run: the pass waits for a later flip. (Begun
+	// over them, a pass lists allocations of erased buffers, which Defragment can only ignore: each takes a move of the
+	// pass's 64, and VMA counts its block as one it cannot empty.)
 	bool TryHold() {
 		const std::unique_lock freeing(m_free_mutex, std::try_to_lock);
 		if (!freeing.owns_lock()) return false;
+		{
+			const std::lock_guard lock(m_mutex);
+			if (!m_pending.empty() || m_busy) return false;
+		}
 		m_hold = true;
 		return true;
 	}
