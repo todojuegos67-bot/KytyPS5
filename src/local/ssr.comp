@@ -32,6 +32,17 @@ layout(binding = 10, rgba16f) uniform writeonly image2D aux_out;
 layout(binding = 11) uniform sampler2D material_tex; // the game's G-buffer target (or the color: unused)
 layout(binding = 12) uniform sampler2D mat_tex;
 layout(binding = 13, rgba16f) uniform writeonly image2D mat_out;
+// The game's packed G-buffer (R32_UINT; Demon's Souls: RT0..RT3 = layers 0..3 of one 1280x720x4 image at the render
+// size; unbound layers get a 1x1 dummy) and the calibration / camera buffer.
+layout(binding = 14) uniform usampler2D packed0;
+layout(binding = 15) uniform usampler2D packed1;
+layout(binding = 16) uniform usampler2D packed2;
+layout(binding = 17) uniform usampler2D packed3;
+layout(std430, binding = 18) buffer Calib {
+	vec4 view_rot[3]; // world -> view rotation rows (host-written each frame)
+	int  calib[];     // [0] samples; [1 + (layer * 5 + layout) * 2 + space] sum of dot * 1000 (space 0 view, 1 world);
+	                  // [41 + field * 3 + k] the 16 byte fields (layer * 4 + byte): sum v, sum v^2, sum v * (1 - N.V)
+};
 
 layout(push_constant) uniform Push {
 	vec4  proj;      // M[0], M[5], M[8], M[9]
@@ -41,6 +52,8 @@ layout(push_constant) uniform Push {
 	ivec4 misc;      // mode, frame index, level, flags (bit0 reset, bit1 history valid, bit2 material, bit3 up known)
 	vec4  extra;     // a-trous step, material channel, material is gloss, thickness (view units)
 	vec4  up;        // world up in view space (xyz), unused
+	ivec4 dec;       // normal (-1 none: layer | layout << 2 | world << 5 | negate << 6), roughness field, metal field
+	                 // (-1 none: layer | shift << 2 | bits << 7 | inverted << 12), packed layer count
 } push;
 
 const float PI = 3.14159265;
@@ -72,6 +85,53 @@ vec3  SafeColor(vec3 c) {
 	if (any(isnan(c)) || any(isinf(c))) return vec3(0);
 	return clamp(c, vec3(0), vec3(64.0));
 }
+uint Packed(int layer, ivec2 p) {
+	if (layer == 0) return texelFetch(packed0, p, 0).r;
+	if (layer == 1) return texelFetch(packed1, p, 0).r;
+	if (layer == 2) return texelFetch(packed2, p, 0).r;
+	return texelFetch(packed3, p, 0).r;
+}
+vec3 OctDecode(vec2 e) {
+	e     = e * 2.0 - 1.0;
+	vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+	float t = max(-n.z, 0.0);
+	n.x += n.x >= 0.0 ? -t : t;
+	n.y += n.y >= 0.0 ? -t : t;
+	return normalize(n);
+}
+float Bits(uint w, int shift, int bits) { return float((w >> uint(shift)) & ((1u << uint(bits)) - 1u)) / float((1u << uint(bits)) - 1u); }
+// Layouts: 0 oct 16:16 (x low), 1 oct 12:12 in bits 0..23, 2 oct 12:12 in bits 8..31, 3 oct 11:11 in bits 0..21,
+// 4 xyz 10:10:10 unorm in bits 0..29.
+vec3 DecodeNormal(uint w, int layout_) {
+	if (layout_ == 0) return OctDecode(vec2(Bits(w, 0, 16), Bits(w, 16, 16)));
+	if (layout_ == 1) return OctDecode(vec2(Bits(w, 0, 12), Bits(w, 12, 12)));
+	if (layout_ == 2) return OctDecode(vec2(Bits(w, 8, 12), Bits(w, 20, 12)));
+	if (layout_ == 3) return OctDecode(vec2(Bits(w, 0, 11), Bits(w, 11, 11)));
+	vec3 n = vec3(Bits(w, 0, 10), Bits(w, 10, 10), Bits(w, 20, 10)) * 2.0 - 1.0;
+	float l = length(n);
+	return l > 1e-4 ? n / l : vec3(0, 0, 1);
+}
+vec3 ToView(vec3 n) { return vec3(dot(view_rot[0].xyz, n), dot(view_rot[1].xyz, n), dot(view_rot[2].xyz, n)); }
+ivec2 RenderPixel(vec2 uv) { return clamp(ivec2(uv * RenderSize()), ivec2(0), ivec2(RenderSize()) - 1); }
+// The G-buffer's normal in view space (false: no decode chosen).
+bool GbufNormal(vec2 uv, out vec3 n) {
+	n = vec3(0, 0, 1);
+	int c = push.dec.x;
+	if (c < 0) return false;
+	vec3 d = DecodeNormal(Packed(c & 3, RenderPixel(uv)), (c >> 2) & 7);
+	if ((c & 32) != 0) d = ToView(d);
+	if ((c & 64) != 0) d = -d;
+	float l = length(d);
+	if (!(l > 1e-4)) return false;
+	n = d / l;
+	return true;
+}
+float Field(int f, vec2 uv) {
+	uint w = Packed(f & 3, RenderPixel(uv));
+	float v = Bits(w, (f >> 2) & 31, max((f >> 7) & 31, 1));
+	return (f & 4096) != 0 ? 1.0 - v : v;
+}
+
 bool InScreen(vec2 uv) { return all(greaterThanEqual(uv, vec2(0))) && all(lessThanEqual(uv, vec2(1))); }
 
 vec3 NormalAt(vec2 uv, vec3 p) {
@@ -91,7 +151,14 @@ vec3 NormalAt(vec2 uv, vec3 p) {
 }
 
 // Roughness and the reflection mask (how much this pixel is a candidate reflector).
+float RoughCut() { return push.misc.z >= 3 ? 0.7 : push.misc.z >= 2 ? 0.6 : 0.5; }
 vec2 Material(vec2 uv, vec3 N) {
+	if (push.dec.y >= 0) {
+		// The G-buffer's roughness: reflect only below the level's cutoff, faded toward it.
+		float r = clamp(Field(push.dec.y, uv), 0.0, 1.0);
+		float cut = RoughCut();
+		return vec2(r, 1.0 - smoothstep(cut * 0.55, cut, r));
+	}
 	if ((push.misc.w & 4) != 0) {
 		vec4  m = textureLod(material_tex, uv, 0);
 		int   c = int(push.extra.y + 0.5);
@@ -148,11 +215,14 @@ void Trace(ivec2 pixel) {
 		return;
 	}
 	vec3  P  = ViewPos(uv, d);
-	vec3  N  = NormalAt(uv, P);
+	vec3  N;
+	if (!GbufNormal(uv, N) || dot(N, normalize(-P)) < -0.2) N = NormalAt(uv, P);
+	else if (dot(N, normalize(-P)) < 0.02) N = normalize(N + normalize(-P) * 0.05); // (back-facing by a little: bent)
 	float z  = abs(P.z);
 	vec2  mt = Material(uv, N);
+	float cut = push.dec.y >= 0 ? RoughCut() : 0.8;
 	imageStore(gbuf_out, pixel, vec4(N, z));
-	if (mt.y < 0.02 || mt.x > 0.8) {
+	if (mt.y < 0.02 || mt.x > cut) {
 		imageStore(out_img, pixel, vec4(0));
 		imageStore(mat_out, pixel, vec4(mt, 0, 0));
 		return;
@@ -234,6 +304,11 @@ void Trace(ivec2 pixel) {
 	}
 	vec2  huv = uv0 + duv * hi;
 	float hd  = textureLod(depth_tex, huv, 0).r;
+	if (IsSky(hd)) { // (the sky is never a hit: the game's own sky reflection stays)
+		imageStore(out_img, pixel, vec4(0));
+		imageStore(mat_out, pixel, vec4(mt, 0, 0));
+		return;
+	}
 	vec3  HP  = ViewPos(huv, hd);
 	vec3  HN  = NormalAt(huv, HP);
 	// A surface seen from behind (the ray leaves through it) is no hit.
@@ -377,23 +452,81 @@ void Composite(ivec2 pixel) {
 		imageStore(out_img, pixel, col);
 		return;
 	}
-	vec3  N     = textureLod(gbuf_cur, uv, 0).xyz;
-	float nl    = length(N);
-	N           = nl > 1e-4 ? N / nl : normalize(-P);
+	vec3  N;
+	if (!GbufNormal(uv, N)) {
+		N        = textureLod(gbuf_cur, uv, 0).xyz;
+		float nl = length(N);
+		N        = nl > 1e-4 ? N / nl : normalize(-P);
+	}
 	float NoV   = clamp(dot(N, normalize(-P)), 0.0, 1.0);
-	float f0    = (push.misc.w & 4) != 0 ? 0.04 : 0.02;
-	float fres  = f0 + (1.0 - f0) * pow(1.0 - NoV, 5.0);
-	float smooth_ = clamp(mt.y, 0.0, 1.0) * (1.0 - smoothstep(0.4, 0.8, mt.x));
-	// Wet / water surfaces: the Fresnel floor raised a little so puddles seen from above still reflect.
-	float w = push.trace.z * smooth_ * clamp(rf.a, 0.0, 1.0) * clamp(fres * 1.5 + 0.08, 0.0, 1.0);
-	w       = clamp(isnan(w) ? 0.0 : w, 0.0, 0.85);
+	float metal = push.dec.z >= 0 ? clamp(Field(push.dec.z, uv), 0.0, 1.0) : 0.0;
+	float rough = clamp(mt.x, 0.0, 1.0);
+	// Schlick with roughness (Lagarde): rough surfaces lose the grazing peak. f0 0.04 dielectric, 0.6 metal (the lit color
+	// already carries the metal's tint and its diffuse is ~0, so most of it is the game's own specular).
+	float f0    = mix(0.04, 0.6, metal);
+	float fmax  = max(1.0 - rough, f0);
+	float fres  = f0 + (fmax - f0) * pow(1.0 - NoV, 5.0);
+	float smooth_ = clamp(mt.y, 0.0, 1.0);
+	if (push.dec.y < 0) {
+		// No roughness: the heuristic mask, the Fresnel floor raised a little so puddles seen from above still reflect.
+		smooth_ *= 1.0 - smoothstep(0.4, 0.8, rough);
+		fres = clamp(fres * 1.5 + 0.06, 0.0, 1.0);
+	}
+	float w = push.trace.z * smooth_ * clamp(rf.a, 0.0, 1.0) * fres;
+	w       = clamp(isnan(w) ? 0.0 : w, 0.0, mix(0.6, 0.9, metal));
 	vec3 refl = SafeColor(rf.rgb / max(rf.a, 1e-3)); // (stored premultiplied by the confidence)
+	// Energy: the reflection replaces a share of the color (a convex mix, never added) and is kept within a few times the
+	// surface's own brightness, so a bright sky or light seen in a dark floor does not wash it out.
+	float lc = Luma(col.rgb), lr = Luma(refl);
+	float cap = max(lc * 4.0, 0.05);
+	if (lr > cap) refl *= cap / lr;
 	vec3 outc = mix(col.rgb, refl, w);
 	if (any(isnan(outc)) || any(isinf(outc))) outc = col.rgb;
 	imageStore(out_img, pixel, vec4(max(outc, vec3(0)), col.a));
 }
 
+// Mode 5: calibration on a 160x90 grid (push.trace.xy unused): each packed layer and normal layout scored against the
+// depth-derived normal in view and in world space, and the byte fields' statistics.
+void Calibrate(ivec2 g) {
+	vec2  uv = (vec2(g) + 0.5) / vec2(160.0, 90.0);
+	float d  = textureLod(depth_tex, uv, 0).r;
+	if (IsSky(d)) return;
+	vec3 P  = ViewPos(uv, d);
+	vec3 Nd = NormalAt(uv, P);
+	// Only where the depth normal is trustworthy: the same within a pixel on both sides (no edge).
+	vec2 t  = 2.0 / RenderSize();
+	vec3 Na = NormalAt(uv + vec2(t.x, 0), ViewPos(uv + vec2(t.x, 0), textureLod(depth_tex, uv + vec2(t.x, 0), 0).r));
+	vec3 Nb = NormalAt(uv + vec2(0, t.y), ViewPos(uv + vec2(0, t.y), textureLod(depth_tex, uv + vec2(0, t.y), 0).r));
+	if (dot(Na, Nd) < 0.98 || dot(Nb, Nd) < 0.98) return;
+	atomicAdd(calib[0], 1);
+	ivec2 p   = RenderPixel(uv);
+	float nov = 1.0 - clamp(dot(Nd, normalize(-P)), 0.0, 1.0);
+	for (int layer = 0; layer < 4; ++layer) {
+		if (layer >= push.dec.w) break;
+		uint w = Packed(layer, p);
+		for (int l = 0; l < 5; ++l) {
+			vec3 n = DecodeNormal(w, l);
+			atomicAdd(calib[1 + (layer * 5 + l) * 2], int(dot(n, Nd) * 1000.0));
+			vec3 nw = ToView(n);
+			float ln = length(nw);
+			atomicAdd(calib[2 + (layer * 5 + l) * 2], ln > 1e-4 ? int(dot(nw / ln, Nd) * 1000.0) : 0);
+		}
+		for (int b = 0; b < 4; ++b) {
+			float v = Bits(w, b * 8, 8);
+			int   f = layer * 4 + b;
+			atomicAdd(calib[41 + f * 3], int(v * 1000.0));
+			atomicAdd(calib[42 + f * 3], int(v * v * 1000.0));
+			atomicAdd(calib[43 + f * 3], int(v * nov * 1000.0));
+		}
+	}
+}
+
 void main() {
+	if (push.misc.x == 5) {
+		ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+		if (g.x < 160 && g.y < 90) Calibrate(g);
+		return;
+	}
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	int   mode  = push.misc.x;
 	ivec2 size  = ivec2(mode == 4 ? RenderSize() : TraceSize());

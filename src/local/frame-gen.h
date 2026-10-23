@@ -240,6 +240,10 @@ struct UpscaleInputs {
 	UpscaleImage material;
 	int32_t      material_channel = -1;
 	bool         material_gloss   = false;
+	// KYTY_SSR: the game's packed G-buffer layers (R32_UINT render targets at the render size, read only; Demon's Souls:
+	// RT0..RT3, one 4-layer image), decoded by ssr.comp after its calibration.
+	std::array<UpscaleImage, 4> packed {};
+	uint32_t                    packed_count = 0;
 };
 // Streamline offers DLSS super resolution on this device.
 [[nodiscard]] bool UpscalerReady();
@@ -285,6 +289,8 @@ void OnSsrGbuffer(uint64_t vs_hash, uint64_t ps_hash, std::span<const SsrTarget>
 void OnSsrDispatch(uint64_t cs_hash, std::span<const uint64_t> addresses, std::span<const vk::Format> formats);
 // The roughness source for this frame (renderSuperResolution.cpp): false = the heuristic mask.
 [[nodiscard]] bool SsrMaterial(SsrTarget& target, int& channel, bool& gloss);
+// The packed (R32_UINT) G-buffer targets of this frame, in render target order (renderSuperResolution.cpp): 0 = none.
+[[nodiscard]] uint32_t SsrPackedTargets(std::array<SsrTarget, 4>& targets);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

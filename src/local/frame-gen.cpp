@@ -4577,6 +4577,17 @@ bool Inverse4(const std::array<float, 16>& m, std::array<double, 16>& inv); // (
 // frame: a heuristic mask (depth-derived normals facing up, low local variance, darker than the surroundings).
 // KYTY_SSR_STRENGTH (1.0, 0..2), KYTY_SSR_THICKNESS (view units, 0.25), KYTY_SSR_UP (world up axis for the heuristic:
 // y (default), z or x; "-y" etc. for the negative one). Off (the default): nothing created, nothing recorded, no hooks.
+//
+// Packed G-buffer (Demon's Souls: RT0..RT3 R32_UINT, logged as one image's layers 0..3 at the same address, read by the
+// deferred lighting CS as one slot): bound as R32_UINT views (bindings 14..17). The first frames run a calibration (mode
+// 5): every layer x 5 normal layouts (oct 16:16, oct 12:12 low / high, oct 11:11, 10:10:10) is scored against the
+// depth-derived normal in view and world space, and the 16 byte fields' statistics are gathered; the best layout (mean
+// |cos| >= 0.85) becomes the normal source (logged "SSR: G-buffer normal ..."), and the up direction is no longer
+// needed. Roughness / metal: KYTY_SSR_ROUGH / KYTY_SSR_METAL = <layer>:<shift>:<bits>[g] (g: gloss / inverted); unset:
+// the 8-bit field left in the normal's word when its layout leaves one (oct 12:12 -> the other byte), else the
+// heuristic mask (logged as a GUESS). KYTY_SSR_NORMAL = <layer>:<layout>[w][n] (w world space, n negated) overrides the
+// calibration. Composite: a convex mix (reflection replaces a share of the color), Schlick-with-roughness Fresnel, f0
+// 0.04 (0.6 metal), the reflection's brightness capped at 4x the surface's, the sky never a hit.
 struct SsrPass {
 	vk::DescriptorSetLayout set_layout = nullptr;
 	vk::PipelineLayout      layout     = nullptr;
@@ -4597,7 +4608,21 @@ struct SsrPass {
 	double                  sum_ms  = 0.0;
 	uint32_t                samples = 0;
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+	// Packed G-buffer: a 1x1 R32_UINT stand-in for unbound layers, the calibration / camera buffer, the chosen decode.
+	VkImage                 dummy_image = VK_NULL_HANDLE;
+	VmaAllocation           dummy_mem   = nullptr;
+	vk::ImageView           dummy_view  = nullptr;
+	bool                    dummy_ready = false;
+	VkBuffer                calib       = VK_NULL_HANDLE;
+	VmaAllocation           calib_mem   = nullptr;
+	const int32_t*          calib_mapped = nullptr;
+	uint32_t                calib_runs  = 0, calib_wait = 0;
+	bool                    calib_done  = false;
+	int32_t                 dec_normal = -1, dec_rough = -1, dec_metal = -1;
 } g_ssr;
+constexpr uint32_t SsrCalibRuns  = 24;  // calibration frames (one every 4th)
+constexpr uint32_t SsrCalibInts  = 41 + 16 * 3;
+constexpr uint32_t SsrCalibBytes = 48 + SsrCalibInts * 4;
 
 struct SsrPush {
 	float   proj[4];
@@ -4607,11 +4632,35 @@ struct SsrPush {
 	int32_t misc[4];
 	float   extra[4];
 	float   up[4];
+	int32_t dec[4];
 };
-static_assert(sizeof(SsrPush) == 112);
+static_assert(sizeof(SsrPush) == 128);
 
-constexpr uint32_t SsrBindings = 14;
-bool SsrSampled(uint32_t i) { return !(i == 7 || i == 8 || i == 10 || i == 13); }
+constexpr uint32_t SsrBindings = 19;
+vk::DescriptorType SsrType(uint32_t i) {
+	return i == 18 ? vk::DescriptorType::eStorageBuffer
+	               : (i == 7 || i == 8 || i == 10 || i == 13) ? vk::DescriptorType::eStorageImage
+	                                                          : vk::DescriptorType::eCombinedImageSampler;
+}
+// "<layer>:<shift>:<bits>[g]" -> the shader's field code (-1: unset or malformed).
+int32_t SsrFieldEnv(const char* name) {
+	const char* value = std::getenv(name);
+	if (value == nullptr) return -1;
+	int layer = -1, shift = -1, bits = -1;
+	char flag = 0;
+	if (std::sscanf(value, "%d:%d:%d%c", &layer, &shift, &bits, &flag) < 3) return -1;
+	if (layer < 0 || layer > 3 || shift < 0 || bits < 1 || bits > 16 || shift + bits > 32) return -1;
+	return layer | (shift << 2) | (bits << 7) | (flag == 'g' ? 4096 : 0);
+}
+// "<layer>:<layout>[w][n]" -> the shader's normal code (-1: unset or malformed).
+int32_t SsrNormalEnv() {
+	const char* value = std::getenv("KYTY_SSR_NORMAL");
+	if (value == nullptr) return -1;
+	int layer = -1, layout = -1;
+	if (std::sscanf(value, "%d:%d", &layer, &layout) < 2 || layer < 0 || layer > 3 || layout < 0 || layout > 4) return -1;
+	const std::string v = value;
+	return layer | (layout << 2) | (v.find('w') != std::string::npos ? 32 : 0) | (v.find('n') != std::string::npos ? 64 : 0);
+}
 
 int SsrLevel() {
 	static const int level = [] {
@@ -4707,7 +4756,7 @@ bool SsrEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
 		std::array<vk::DescriptorSetLayoutBinding, SsrBindings> bindings {};
 		for (uint32_t i = 0; i < SsrBindings; ++i) {
 			bindings[i].binding         = i;
-			bindings[i].descriptorType  = SsrSampled(i) ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorType  = SsrType(i);
 			bindings[i].descriptorCount = 1;
 			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
 		}
@@ -4753,6 +4802,36 @@ bool SsrEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
 		query.queryCount = 16;
 		if (device.createQueryPool(&query, nullptr, &g_ssr.pool) != vk::Result::eSuccess) g_ssr.pool = nullptr;
 		g_ssr.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		{
+			VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+			create.imageType   = VK_IMAGE_TYPE_2D;
+			create.format      = VK_FORMAT_R32_UINT;
+			create.extent      = {1, 1, 1};
+			create.mipLevels   = 1;
+			create.arrayLayers = 1;
+			create.samples     = VK_SAMPLE_COUNT_1_BIT;
+			create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+			create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+			VmaAllocationCreateInfo allocate {};
+			allocate.usage = VMA_MEMORY_USAGE_AUTO;
+			if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_ssr.dummy_image, &g_ssr.dummy_mem, nullptr) != VK_SUCCESS)
+				return false;
+			vk::ImageViewCreateInfo view_info {};
+			view_info.image            = vk::Image(g_ssr.dummy_image);
+			view_info.viewType         = vk::ImageViewType::e2D;
+			view_info.format           = vk::Format::eR32Uint;
+			view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			if (device.createImageView(&view_info, nullptr, &g_ssr.dummy_view) != vk::Result::eSuccess) return false;
+			VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+			buffer.size  = SsrCalibBytes;
+			buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+			VmaAllocationCreateInfo host {};
+			host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+			VmaAllocationInfo mapped {};
+			if (vmaCreateBuffer(graphics.allocator, &buffer, &host, &g_ssr.calib, &g_ssr.calib_mem, &mapped) != VK_SUCCESS) return false;
+			g_ssr.calib_mapped = static_cast<const int32_t*>(mapped.pMappedData);
+		}
 		g_ssr.failed    = false;
 	}
 	if (g_ssr.out.image.image != nullptr && g_ssr.render == render && g_ssr.level == level) return true;
@@ -4801,6 +4880,94 @@ void SsrReadTiming() {
 
 // World up (KYTY_SSR_UP) in view space: View = P^-1 * view_proj (column vectors; P's column form is the transpose of
 // the row-vector view_to_clip).
+// The camera's world -> view matrix (rows of the 3x3), as above.
+bool SsrViewRotation(const std::array<float, 16>& m, std::array<float, 12>& rows) {
+	std::array<float, 16> vp {};
+	{
+		std::lock_guard lock(g_ssr_gb.mutex);
+		if (!g_ssr_gb.have_vp || g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.vp_flip + 4) return false;
+		vp = g_ssr_gb.view_proj;
+	}
+	std::array<float, 16> pc {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
+	std::array<double, 16> pinv {};
+	if (!Inverse4(pc, pinv)) return false;
+	for (int i = 0; i < 3; ++i) {
+		for (int j = 0; j < 3; ++j) {
+			double d = 0.0;
+			for (int k = 0; k < 4; ++k) d += pinv[i * 4 + k] * vp[k * 4 + j];
+			if (!std::isfinite(d)) return false;
+			rows[i * 4 + j] = static_cast<float>(d);
+		}
+		rows[i * 4 + 3] = 0.0f;
+	}
+	return true;
+}
+
+// The calibration's verdict (after its frames are done): the normal layout, the roughness field; logged with the scores.
+void SsrAnalyze(uint32_t packed_count) {
+	if (g_ssr.calib_mapped == nullptr || g_graphics_ctx == nullptr) return;
+	(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_ssr.calib_mem, 0, VK_WHOLE_SIZE);
+	const int32_t* c = g_ssr.calib_mapped + 12;
+	const double   n = static_cast<double>(c[0]);
+	static const char* const layouts[5] = {"oct 16:16", "oct 12:12 bits 0..23", "oct 12:12 bits 8..31", "oct 11:11 bits 0..21",
+	                                       "xyz 10:10:10"};
+	std::printf("SSR: G-buffer calibration: %.0f samples over %u frames, %u packed layers\n", n, g_ssr.calib_runs, packed_count);
+	int    best       = -1;
+	double best_score = 0.0;
+	if (n >= 200.0) {
+		for (uint32_t layer = 0; layer < packed_count; ++layer) {
+			std::string line;
+			char        buf[96];
+			for (int l = 0; l < 5; ++l)
+				for (int space = 0; space < 2; ++space) {
+					const double score = c[1 + (layer * 5 + l) * 2 + space] / 1000.0 / n;
+					std::snprintf(buf, sizeof(buf), " %s/%s %+.3f;", layouts[l], space ? "world" : "view", score);
+					line += buf;
+					if (std::abs(score) > std::abs(best_score))
+						best_score = score, best = static_cast<int>(layer) | (l << 2) | (space << 5);
+				}
+			std::printf("SSR: G-buffer layer %u normal fit (mean cos vs depth normal):%s\n", layer, line.c_str());
+			line.clear();
+			for (int b = 0; b < 4; ++b) {
+				const int    f    = static_cast<int>(layer) * 4 + b;
+				const double mean = c[41 + f * 3] / 1000.0 / n, sq = c[42 + f * 3] / 1000.0 / n, nov = c[43 + f * 3] / 1000.0 / n;
+				std::snprintf(buf, sizeof(buf), " bits %d..%d mean %.3f sd %.3f cov(1-NoV) %+.3f;", b * 8, b * 8 + 7, mean,
+				              std::sqrt(std::max(sq - mean * mean, 0.0)), nov);
+				line += buf;
+			}
+			std::printf("SSR: G-buffer layer %u byte fields:%s\n", layer, line.c_str());
+		}
+	}
+	if (best >= 0 && std::abs(best_score) >= 0.85) {
+		if (best_score < 0.0) best |= 64;
+		if (g_ssr.dec_normal < 0) g_ssr.dec_normal = best;
+		std::printf("SSR: G-buffer normal = layer %d, %s, %s space%s (mean cos %.3f)\n", best & 3, layouts[(best >> 2) & 7],
+		            (best & 32) ? "world" : "view", (best & 64) ? ", negated" : "", std::abs(best_score));
+		// Roughness: the byte the normal's layout leaves free in its word, when it varies (else unknown).
+		const int layout = (best >> 2) & 7, layer = best & 3;
+		const int shift  = layout == 1 ? 24 : layout == 2 ? 0 : -1;
+		if (g_ssr.dec_rough < 0 && shift >= 0) {
+			const int    f    = layer * 4 + shift / 8;
+			const double mean = c[41 + f * 3] / 1000.0 / n, sq = c[42 + f * 3] / 1000.0 / n;
+			if (std::sqrt(std::max(sq - mean * mean, 0.0)) > 0.02) {
+				g_ssr.dec_rough = layer | (shift << 2) | (8 << 7);
+				std::printf("SSR: roughness = layer %d bits %d..%d (the normal word's free byte; GUESS, set KYTY_SSR_ROUGH to "
+				            "override)\n",
+				            layer, shift, shift + 7);
+			}
+		}
+	} else {
+		std::printf("SSR: G-buffer normal not identified (best |mean cos| %.3f < 0.85): depth-derived normals stay\n",
+		            std::abs(best_score));
+	}
+	if (g_ssr.dec_rough < 0)
+		std::printf("SSR: roughness unknown (set KYTY_SSR_ROUGH=<layer>:<shift>:<bits>[g] from the byte fields above): "
+		            "heuristic mask with the G-buffer normals\n");
+	std::fflush(stdout);
+}
+
 bool SsrUpInView(const std::array<float, 16>& m, std::array<float, 3>& up) {
 	std::array<float, 16> vp {};
 	{
@@ -4863,12 +5030,54 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	const bool have_material = inputs.material.view != nullptr && inputs.material_channel >= 0 && inputs.material_channel < 4 &&
 	                           inputs.material.extent == color.extent;
-	const int source = have_material ? SsrChoice().slot * 4 + inputs.material_channel : -1;
+	uint32_t packed_count = 0;
+	while (packed_count < inputs.packed_count && packed_count < 4 && inputs.packed[packed_count].view != nullptr &&
+	       inputs.packed[packed_count].extent == color.extent)
+		++packed_count;
+	{
+		static const int32_t env_normal = SsrNormalEnv(), env_rough = SsrFieldEnv("KYTY_SSR_ROUGH"),
+		                     env_metal = SsrFieldEnv("KYTY_SSR_METAL");
+		static bool          said      = false;
+		if (!said) {
+			said = true;
+			if (env_normal >= 0) g_ssr.dec_normal = env_normal, g_ssr.calib_done = true;
+			if (env_rough >= 0) g_ssr.dec_rough = env_rough;
+			if (env_metal >= 0) g_ssr.dec_metal = env_metal;
+			if (env_normal >= 0 || env_rough >= 0 || env_metal >= 0)
+				std::printf("SSR: decode from the environment (normal %d, roughness %d, metal %d)\n", env_normal, env_rough, env_metal);
+		}
+	}
+	const bool use_packed = packed_count > 0 && !have_material;
+	const bool calibrate  = use_packed && !g_ssr.calib_done && g_ssr.calib_runs < SsrCalibRuns && (g_ssr.frame & 3u) == 0;
+	if (use_packed && !g_ssr.calib_done && g_ssr.calib_runs >= SsrCalibRuns && ++g_ssr.calib_wait > 8) {
+		g_ssr.calib_done = true;
+		SsrAnalyze(packed_count);
+	}
+	const auto usable = [&](int32_t code) { return use_packed && code >= 0 && (code & 3) < static_cast<int32_t>(packed_count) ? code : -1; };
+	const int32_t dec_normal = usable(g_ssr.dec_normal), dec_rough = usable(g_ssr.dec_rough), dec_metal = usable(g_ssr.dec_metal);
+	std::array<float, 12> view_rows {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+	const bool            have_rows = SsrViewRotation(inputs.view_to_clip, view_rows);
+	{
+		static int32_t logged = -2;
+		const int32_t  key    = dec_normal * 7919 + dec_rough * 31 + dec_metal;
+		if (key != logged && dec_normal >= 0) {
+			logged = key;
+			std::printf("SSR: decoding the packed G-buffer: normal code %d%s, roughness %s, metal %s\n", dec_normal,
+			            (dec_normal & 32) != 0 && !have_rows ? " (world space, camera not seen yet)" : "",
+			            dec_rough >= 0 ? "from the G-buffer" : "heuristic", dec_metal >= 0 ? "from the G-buffer" : "none");
+			std::fflush(stdout);
+		}
+	}
+	const int source = have_material ? SsrChoice().slot * 4 + inputs.material_channel : dec_rough >= 0 ? 1000 + dec_rough : -1;
 	if (source != g_ssr.source) {
 		static uint32_t reports = 0;
 		if (reports++ < 16) {
 			static const char channels[] = "rgba";
-			if (have_material)
+			if (!have_material && dec_rough >= 0)
+				std::printf("SSR: level %d, roughness source packed G-buffer layer %d bits %d..%d%s\n", level, dec_rough & 3,
+				            (dec_rough >> 2) & 31, ((dec_rough >> 2) & 31) + ((dec_rough >> 7) & 31) - 1,
+				            (dec_rough & 4096) != 0 ? " (gloss)" : "");
+			else if (have_material)
 				std::printf("SSR: level %d, roughness source G-buffer RT%d.%c (%s, %s)\n", level, SsrChoice().slot,
 				            channels[inputs.material_channel], SsrFormatName(inputs.material.format),
 				            inputs.material_gloss ? "gloss: roughness = 1 - value" : "roughness");
@@ -4882,8 +5091,13 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	std::array<float, 3> up {};
 	const bool           have_up = SsrUpInView(m, up);
+	if (static bool said_up = false; have_up && !said_up) {
+		said_up = true;
+		std::printf("SSR: camera seen (up direction and world -> view rotation known)\n");
+		std::fflush(stdout);
+	}
 
-	const float strength = SsgiEnv("KYTY_SSR_STRENGTH", 1.0f, 2.0f);
+	const float strength = SsgiEnv("KYTY_SSR_STRENGTH", 0.8f, 2.0f);
 	const float thick    = std::max(SsgiEnv("KYTY_SSR_THICKNESS", 0.25f, 4.0f), 0.01f);
 	SsrPush     push {};
 	push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
@@ -4896,12 +5110,16 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.extra[2] = inputs.material_gloss ? 1.0f : 0.0f;
 	push.extra[3] = thick;
 	push.up[0] = up[0], push.up[1] = up[1], push.up[2] = up[2];
+	push.dec[0] = (dec_normal & 32) != 0 && !have_rows ? -1 : dec_normal;
+	push.dec[1] = dec_rough, push.dec[2] = dec_metal, push.dec[3] = static_cast<int32_t>(packed_count);
 	{
 		static bool said = false;
 		if (!said) {
 			said = true;
-			std::printf("SSR: on (level %d, trace %ux%u, strength %g, thickness %g, up %s)\n", level, g_ssr.trace.width,
-			            g_ssr.trace.height, strength, thick, have_up ? "from the camera" : "unknown (|view y| assumed)");
+			std::printf("SSR: on (level %d, trace %ux%u, strength %g, thickness %g, up %s, packed G-buffer layers %u%s)\n", level,
+			            g_ssr.trace.width, g_ssr.trace.height, strength, thick,
+			            have_up ? "from the camera" : "unknown (|view y| assumed until the G-buffer normals are decoded)", packed_count,
+			            use_packed && !g_ssr.calib_done ? ", calibrating" : "");
 			std::fflush(stdout);
 		}
 	}
@@ -4936,6 +5154,30 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.misc[1] = static_cast<int32_t>(g.frame);
 	push.misc[2] = level;
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g.history_valid ? 2 : 0) | (have_material ? 4 : 0) | (have_up ? 8 : 0);
+	if (!g.dummy_ready) {
+		g.dummy_ready = true;
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask     = vk::PipelineStageFlagBits2::eNone;
+		barrier.dstStageMask     = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.dstAccessMask    = vk::AccessFlagBits2::eTransferWrite;
+		barrier.oldLayout        = vk::ImageLayout::eUndefined;
+		barrier.newLayout        = vk::ImageLayout::eGeneral;
+		barrier.image            = vk::Image(g.dummy_image);
+		barrier.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+		const vk::ClearColorValue       zero {std::array<uint32_t, 4> {0, 0, 0, 0}};
+		const vk::ImageSubresourceRange whole {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.clearColorImage(vk::Image(g.dummy_image), vk::ImageLayout::eGeneral, &zero, 1, &whole);
+		command.fillBuffer(vk::Buffer(g.calib), 0, VK_WHOLE_SIZE, 0);
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer,
+		       vk::AccessFlagBits2::eTransferWrite);
+	}
+	command.updateBuffer(vk::Buffer(g.calib), 0, sizeof(float) * view_rows.size(), view_rows.data());
+	global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+	       vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
 	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout,
 	                     const SsgiImage& aux_in, const SsgiImage& aux_out, const SsgiImage& mat_in, const SsgiImage& mat_out,
@@ -4957,12 +5199,18 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		                          : vk::DescriptorImageInfo {pt, color.view, color.layout};
 		infos[12] = {pt, mat_in.view, vk::ImageLayout::eGeneral};
 		infos[13] = {nullptr, mat_out.view, vk::ImageLayout::eGeneral};
+		for (uint32_t i = 0; i < 4; ++i)
+			infos[14 + i] = use_packed && i < packed_count
+			                    ? vk::DescriptorImageInfo {pt, inputs.packed[i].view, inputs.packed[i].layout}
+			                    : vk::DescriptorImageInfo {pt, g.dummy_view, vk::ImageLayout::eGeneral};
+		const vk::DescriptorBufferInfo calib_info {vk::Buffer(g.calib), 0, VK_WHOLE_SIZE};
 		vk::WriteDescriptorSet writes[SsrBindings] {};
 		for (uint32_t i = 0; i < SsrBindings; ++i) {
 			writes[i].dstBinding      = i;
 			writes[i].descriptorCount = 1;
-			writes[i].descriptorType  = SsrSampled(i) ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
-			writes[i].pImageInfo      = &infos[i];
+			writes[i].descriptorType  = SsrType(i);
+			if (i == 18) writes[i].pBufferInfo = &calib_info;
+			else writes[i].pImageInfo = &infos[i];
 		}
 		push.misc[0]  = mode;
 		push.extra[0] = step;
@@ -4974,6 +5222,10 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	};
 	// (Bindings a mode does not write still need a valid storage image: tmp_b is the scratch target; tmp_a the unread
 	// sampled one.)
+	if (calibrate) {
+		run(5, g.tmp_a, g.tmp_a, g.tmp_b, g.tmp_b, g.tmp_a, g.tmp_b, g.tmp_a, g.tmp_b, 0.0f, vk::Extent2D {160, 90});
+		++g.calib_runs;
+	}
 	run(0, g.tmp_a, g.tmp_a, g.raw, g.gbuf[cur], g.tmp_a, g.hit, g.tmp_a, g.mat, 0.0f, g.trace);                 // trace
 	run(1, g.raw, g.history[prev], g.history[cur], g.tmp_b, g.hit, g.tmp_b, g.mat, g.tmp_b, 0.0f, g.trace);      // temporal
 	const SsgiImage* src     = &g.history[cur];
@@ -5040,8 +5292,8 @@ void OnSsrGbuffer(uint64_t vs_hash, uint64_t ps_hash, std::span<const SsrTarget>
 	char        buf[160];
 	for (uint32_t i = 0; i < n; ++i) {
 		const auto& t = targets[i];
-		std::snprintf(buf, sizeof(buf), " RT%u %s(%d) %ux%u @0x%llx;", i, SsrFormatName(t.view.format), static_cast<int>(t.view.format),
-		              t.width, t.height, static_cast<unsigned long long>(t.address));
+		std::snprintf(buf, sizeof(buf), " RT%u %s(%d) %ux%u @0x%llx layer %u;", i, SsrFormatName(t.view.format),
+		              static_cast<int>(t.view.format), t.width, t.height, static_cast<unsigned long long>(t.address), t.view.base_layer);
 		line += buf;
 	}
 	std::printf("SSR: G-buffer draw VS %016llx PS %016llx:%s\n", static_cast<unsigned long long>(vs_hash),
@@ -5068,6 +5320,18 @@ void OnSsrDispatch(uint64_t cs_hash, std::span<const uint64_t> addresses, std::s
 	std::printf("SSR: G-buffer consumer CS %016llx (%u of %u targets):%s\n", static_cast<unsigned long long>(cs_hash), hits,
 	            g_ssr_gb.count, line.c_str());
 	std::fflush(stdout);
+}
+
+uint32_t SsrPackedTargets(std::array<SsrTarget, 4>& targets) {
+	std::lock_guard lock(g_ssr_gb.mutex);
+	if (!g_ssr_gb.valid || g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.flip + 4) return 0;
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < g_ssr_gb.count && n < 4; ++i) {
+		const auto& t = g_ssr_gb.targets[i];
+		if (t.view.format != vk::Format::eR32Uint || t.address == 0) break; // (the packed targets lead: RT0..RT3)
+		targets[n++] = t;
+	}
+	return n;
 }
 
 bool SsrMaterial(SsrTarget& target, int& channel, bool& gloss) {

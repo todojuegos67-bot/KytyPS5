@@ -491,8 +491,51 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 			}
 		}
 	}
+	// KYTY_SSR: the packed (R32_UINT) G-buffer layers, sampled read only (normals / roughness decoded in ssr.comp).
+	std::array<Image*, 4>                packed_images {};
+	std::array<ImageSubresourceRange, 4> packed_ranges {};
+	if (dlss && FrameGen::SsrWanted()) {
+		std::array<FrameGen::SsrTarget, 4> targets {};
+		const uint32_t                     n = FrameGen::SsrPackedTargets(targets);
+		for (uint32_t i = 0; i < n; ++i) {
+			const auto& target = targets[i];
+			Image*      image  = cache.TryGetImage(target.id);
+			if (image == nullptr || image->info.data.address != target.address || target.width != inputs.color.extent.width ||
+			    target.height != inputs.color.extent.height || image == &color || image == &depth || image == &motion ||
+			    image == &output || image->info.IsDepth() || image == ssr_material)
+				break;
+			auto view_info        = target.view;
+			view_info.format      = vk::Format::eR32Uint;
+			view_info.usage       = vk::ImageUsageFlagBits::eSampled;
+			view_info.mapping     = {};
+			view_info.level_count = 1;
+			view_info.layer_count = 1;
+			view_info.type        = vk::ImageViewType::e2D;
+			vk::ImageView view    = nullptr;
+			{
+				std::scoped_lock view_lock {cache.m_lock};
+				view = image->FindView(view_info);
+			}
+			if (view == nullptr) break;
+			auto& p    = inputs.packed[i];
+			p.image    = image->backing.image;
+			p.view     = view;
+			p.layout   = vk::ImageLayout::eShaderReadOnlyOptimal;
+			p.format   = vk::Format::eR32Uint;
+			p.extent   = {target.width, target.height};
+			p.usage    = image->backing.usage;
+			p.level    = view_info.base_level;
+			p.layer    = view_info.base_layer;
+			packed_images[i]    = image;
+			packed_ranges[i]    = ImageSubresourceRange {view_info.base_level, 1, view_info.base_layer, 1};
+			inputs.packed_count = i + 1;
+		}
+	}
 	if (dlss) {
 		color.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, range(bindings[0]), vk_buffer);
+		for (uint32_t i = 0; i < inputs.packed_count; ++i)
+			packed_images[i]->Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, packed_ranges[i],
+			                          vk_buffer);
 		if (ssr_material != nullptr)
 			ssr_material->Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, ssr_range, vk_buffer);
 		motion.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, range(bindings[1]), vk_buffer);
