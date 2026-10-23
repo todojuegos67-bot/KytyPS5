@@ -867,11 +867,13 @@ $chkAntiLag.Visible = $script:isNvidia; $chkAntiLag.Text = 'Anti-Lag (experiment
 # Solo se puede marcar con la frame generation de AMD (con la de NVIDIA ya va Reflex); fuera de ella se desmarca.
 function Update-AntiLagBox {
 	$cfgNow = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
-	$ok = $cfgNow -like 'fsr3*' -and -not (Is-FixedFg)
+	$resSel = if ($script:resShown.Count) { $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)] } else { $null }
+	$ok = $cfgNow -like 'fsr3*' -and -not (Is-FixedFg) -and -not ($resSel -and $resSel[2] -like '*dlss')  # (10-23) con DLSS tampoco
 	if (-not $ok) { $chkAntiLag.Checked = $false }
 	$chkAntiLag.Visible = $ok -and $script:isNvidia  # (10-23) oculta si no se puede usar
 }
 $cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
+$cmbRes.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $form.Add_Shown({ Update-AntiLagBox })
 $tips.SetToolTip($chkAntiLag, 'Solo NVIDIA con la frame generation de AMD y reescalado XeSS, FSR o nativo (con DLSS no hace nada): NVIDIA Reflex para menos retraso. Experimental: si el juego se cierra, quitala.')
 # Calidad grafica: texturas, distancia, sombras, Luz RT y filtrado x16 ($script:gfxTop: etiqueta y desplegable de Texturas, Sombras, Distancia).
