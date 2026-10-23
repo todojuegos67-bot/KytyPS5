@@ -4,6 +4,16 @@ DEMON'S SOULS (PS5) EN PC - NOVEDADES / WHAT'S NEW
 Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
 
 
+000. NUEVO (24-10) / NEW (24-10)
+--------------------------------
+- Anti-Lag / Anti-Lag Ultra propios (con frame generation de AMD, cualquier grafica, sin
+  Reflex): menos retraso al pulsar y mas suave. Own Anti-Lag / Anti-Lag Ultra.
+- Monitores 21:9: videos centrados con bandas negras, nombres de zona bien y sin la linea
+  16:9 al girar rapido. Ultrawide: centred movies, area names fixed, no 16:9 edge.
+- Teclado y raton: velocidad de camara (giros grandes rapidos). Mouse camera speed slider.
+- Metricas: grafica de frametime arreglada. Frametime graph fixed.
+
+
 00. NUEVO (23-10 noche) / NEW (23-10 night)
 -------------------------------------------
 - Frame generation dinamico: llena el monitor aunque la grafica vaya justa (x3-x5) y ya
