@@ -78,7 +78,8 @@ param(
 	[string]$AaSharp = '',      # (10-23) nitidez del antialiasing del juego: Ultra|High|Low|Off (Normal = de fabrica)
   # (10-23) efectos a quitar, p.ej. 'motionblur,dof,vignette,bloom,eyeadapt'
 	[switch]$DetailUltra,  # (10-23) detalle por encima del modo cine: iluminacion completa, mas teselado y mas lejos
-	[switch]$ShadowsUltra,  # (10-23) sombras del juego por encima de Maximo (mas distancia y cascadas, sombras de contacto del juego)
+	[switch]$ShadowsUltra,
+	[string]$ExtraConvars = '',  # (10-23) convars del juego extra (KYTY_GAME_CONVARS), p. ej. la velocidad de camara con raton  # (10-23) sombras del juego por encima de Maximo (mas distancia y cascadas, sombras de contacto del juego)
 	[switch]$AntiLag,
 	[ValidateSet(-1, 0, 1, 2, 3)][int]$ContactShadows = -1, # KYTY_CONTACT_SHADOWS: sombras de contacto por rayos
 	[ValidateSet(-1, 0, 1, 2, 3)][int]$Ssgi = -1, # KYTY_SSGI: iluminacion por rayos en pantalla antes del reescalador
@@ -481,6 +482,7 @@ if ($DetailUltra -and $titleId -match '^PPSA0134[0-2]$') {
 if ($ShadowsUltra -and $Shadows -eq 0 -and $titleId -match '^PPSA0134[0-2]$') {
 	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'sunShadowMaxDistance=400;r_virtualGeometryNumShadowCascades=4;r_contactShadowsEnabled=true') | Where-Object { $_ }) -join ';'
 }
+if ($ExtraConvars -and $titleId -match '^PPSA0134[0-2]$') { $environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $ExtraConvars) | Where-Object { $_ }) -join ';' }
 if ($Shadows -gt 0 -and $titleId -match '^PPSA0134[0-2]$') {
 	$shadowConvars = if ($Shadows -eq 3) { 'sunShadowMaxDistance=190' } elseif ($Shadows -eq 1) { 'sunShadowMaxDistance=125' } else { 'sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false' }
 	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $shadowConvars) | Where-Object { $_ }) -join ';'
