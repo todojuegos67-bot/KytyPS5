@@ -724,7 +724,7 @@ $btnX.Text = [string][char]0x2715; $btnX.Font = New-Object System.Drawing.Font('
 $btnX.FlatStyle = 'Flat'; $btnX.FlatAppearance.BorderSize = 0
 $btnX.BackColor = [System.Drawing.Color]::FromArgb(14, 16, 22); $btnX.ForeColor = [System.Drawing.Color]::FromArgb(222, 196, 140)
 $btnX.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(180, 40, 40)
-$btnX.Size = New-Object System.Drawing.Size(48, 40); $btnX.Location = New-Object System.Drawing.Point(($W - 56), 8)
+$btnX.Size = New-Object System.Drawing.Size(48, 40); $btnX.Location = New-Object System.Drawing.Point(($W - $panelW - 56), 8)  # a la izquierda del panel: no tapa nada
 $btnX.Add_Click({ $form.Close() })
 $form.Controls.Add($btnX); $btnX.BringToFront()
 $panel.Controls.Add($btnExit)
