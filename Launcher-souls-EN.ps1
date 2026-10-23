@@ -232,6 +232,7 @@ function Start-Game {
 	# (10-23) KYTY_GUEST_LAZY_COMMIT retirado: bloqueaba el arranque y solo ahorraba ~0,5 GB
 	# (10-23) KYTY_LOWMEM_VRAM retirado: con graficas de 8 GB bajaba el presupuesto a 4 GB y daba tirones (13-47% de tramos frente a 2-7%)
 	$sets += 'KYTY_FAULT_STATS=1'
+	$sets += 'KYTY_ALIAS_STATS=0'  # (10-23) el diagnostico de alias recorria todos los mapeos en cada map: tirones al cambiar de zona que empeoraban con la sesion
 	if ($fgConfig -eq 'fsr3-x4.json') { $sets += 'KYTY_VRR_CAP_FPS=224' }  # (10-22 d) en DLSS el tope se aplicaba dos veces: 14 reales x4 = 56
 	if ($fgConfig -like '*dyn*') { $sets += 'KYTY_DYN_QUALITY=0.95' }  # (10-22 g) llenar el monitor: el menor multiplicador que llega a ~224 (80 reales = x3, 120 = x2)
 	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
