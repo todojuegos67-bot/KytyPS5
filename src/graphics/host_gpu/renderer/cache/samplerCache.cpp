@@ -20,7 +20,7 @@ namespace Libs::Graphics {
 // are picked for the output's resolution, not the render's. "auto": log2(render height / display height) from what
 // KYTY_UPSCALE_RATIO resolved to (loader/demonsSoulsRenderSize), clamped to [-2, 0]; a number: that bias exactly
 // (e.g. -1 more for DLSS). Process-constant, so the guest-field sampler key stays valid.
-static float TextureLodBias() {
+float SamplerCache::TextureLodBias() {
 	static const float bias = [] {
 		const char* e = std::getenv("KYTY_TEXTURE_LOD_BIAS");
 		if (e == nullptr || *e == 0) return 0.0f;
@@ -56,8 +56,30 @@ SamplerCache::~SamplerCache() {
 	}
 }
 
-vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
-	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3]};
+bool SamplerCache::LodBiasLegacyAll() {
+	static const bool all = [] {
+		const char* e = std::getenv("KYTY_TEXTURE_LOD_BIAS_ALL");
+		return e != nullptr && e[0] == '1';
+	}();
+	return all;
+}
+
+// The scene-texture test: linear min filter and linear mips, a max LOD of at least 1 above the min, no depth compare
+// (shadow maps), normalized coordinates. Render targets and post-process buffers are sampled with no mips.
+bool SamplerCache::IsSceneSampler(const ShaderSamplerResource& r) {
+	const auto min_filter = static_cast<Prospero::SamplerFilter>(r.XyMinFilter());
+	if (min_filter != Prospero::SamplerFilter::kBilinear && min_filter != Prospero::SamplerFilter::kAnisoLinear) return false;
+	if (static_cast<Prospero::SamplerMipFilter>(r.MipFilter()) != Prospero::SamplerMipFilter::kLinear) return false;
+	if (r.DepthCompareFunc() != 0 || r.ForceUnormCoords()) return false;
+	const float min_lod = static_cast<float>(r.MinLod()) / 256.0f;
+	const float max_lod = static_cast<float>(r.MaxLod()) / 256.0f;
+	return max_lod >= 1.0f && max_lod > min_lod;
+}
+
+vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool lod_bias) {
+	// The bias flag only splits the key when a bias is on and the legacy mode (sampler-level) is off.
+	lod_bias = lod_bias && TextureLodBias() != 0.0f && !LodBiasLegacyAll();
+	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], lod_bias ? 1u : 0u};
 	// Samplers live as long as the cache: a thread's recent lookups need neither the lock nor
 	// the map.
 	struct Recent {
@@ -260,50 +282,20 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 			}
 		}
 	}
-	// KYTY_TEXTURE_LOD_BIAS: scene textures only - mipmapped (mip filter on, a max LOD of at least 1), linear, not
-	// depth-compare (shadow maps) nor unnormalized: render targets and post-process buffers are sampled with no mips
-	// (max LOD 0) and keep the guest's bias. Added to the guest's own, clamped to the device limit.
-	// Also skipped: clamp-to-edge/border on both U and V - particle, smoke and decal sprites clamp while scene materials
-	// wrap or mirror; a negative bias sharpened the blurred low mips of Demon's Souls' ground mist into bright puffs.
-	// (The image's mip count/size is not known here - samplers are cached by descriptor alone.)
+	// KYTY_TEXTURE_LOD_BIAS: applied only to the variant the descriptor code asks for (lod_bias, keyed apart) - it
+	// decides per bound IMAGE + sampler pair (2D BC color textures of 512+ texels and 8+ mips that the GPU never
+	// wrote; pipeline/descriptors.cpp), so fog/smoke/noise volumes, small or uncompressed or GPU-written images keep
+	// the guest's bias. KYTY_TEXTURE_LOD_BIAS_ALL=1 (legacy): every scene sampler not clamped on both U and V.
 	if (const float extra = TextureLodBias(); extra != 0.0f) {
 		const auto clamps = [](vk::SamplerAddressMode m) {
 			return m == vk::SamplerAddressMode::eClampToEdge || m == vk::SamplerAddressMode::eClampToBorder;
 		};
-		// Default: only samplers where the guest asks for aniso (ratio > 1) - fog/noise textures wrap, so the clamp
-		// rule alone missed them. KYTY_TEXTURE_LOD_BIAS_ALL=1: the older selection (scene filter + not UV-clamped).
-		static const bool all = [] {
-			const char* e = std::getenv("KYTY_TEXTURE_LOD_BIAS_ALL");
-			return e != nullptr && e[0] == '1';
-		}();
-		// counters under m_mutex: 0 applied, 1 not linear min/mip, 2 depth compare, 3 unnormalized, 4 no mips,
-		// 5 clamped UV (ALL mode), 6 no guest aniso (default mode)
-		static uint32_t cnt[7] = {};
-		int reason = 0;
-		if (sampler_info.mipmapMode != vk::SamplerMipmapMode::eLinear || sampler_info.minFilter != vk::Filter::eLinear) {
-			reason = 1;
-		} else if (r.DepthCompareFunc() != 0) {
-			reason = 2;
-		} else if (r.ForceUnormCoords()) {
-			reason = 3;
-		} else if (!(max_lod >= 1.0f && max_lod > min_lod)) {
-			reason = 4;
-		} else if (!all && !guest_aniso) {
-			reason = 6;
-		} else if (all && clamps(sampler_info.addressModeU) && clamps(sampler_info.addressModeV)) {
-			reason = 5;
-		}
-		if (reason == 0) {
+		const bool apply = LodBiasLegacyAll()
+		                       ? IsSceneSampler(r) && !(clamps(sampler_info.addressModeU) && clamps(sampler_info.addressModeV))
+		                       : lod_bias && IsSceneSampler(r);
+		if (apply) {
 			static const float limit = m_graphics.physical_device_properties.limits.maxSamplerLodBias;
 			sampler_info.mipLodBias = std::clamp(sampler_info.mipLodBias + extra, -limit, limit);
-		}
-		cnt[reason]++;
-		const uint32_t total = cnt[0] + cnt[1] + cnt[2] + cnt[3] + cnt[4] + cnt[5] + cnt[6];
-		if (total <= 64 || (total & (total - 1)) == 0) {
-			std::printf("Texture LOD bias %.3f (%s): %u samplers - applied %u, skipped: filter-not-linear %u, "
-			            "depth-compare %u, unnormalized %u, no-mips %u, clamped-uv %u, no-guest-aniso %u\n",
-			            extra, all ? "all" : "guest-aniso", total, cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], cnt[5], cnt[6]);
-			std::fflush(stdout);
 		}
 	}
 	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);
