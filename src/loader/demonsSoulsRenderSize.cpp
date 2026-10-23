@@ -307,6 +307,28 @@ void Install(Program* program) {
 		            size.width, size.height, lower.width, lower.height);
 		size = lower;
 	}
+	// The super resolution path with a wider aspect: the upscaler makes the wide output (WideOutputWidth), at most
+	// MaxWideOutputWidth wide (32:9's 7680x2160 is no size the game's memory was made for: 5120x2160 at 21:9 is the
+	// widest seen working); a wider aspect is squeezed into it and widened by the presenter. The 3D is then no wider
+	// than that output (an upscaler's input wider than its output: 32:9's 5376x1512).
+	const char* wide_output   = std::getenv("KYTY_WIDE_OUTPUT");
+	const bool  wants_wide    = trinity && aspect != 0.0 && (wide_output == nullptr || std::strcmp(wide_output, "0") != 0);
+	const auto  natural_width = wants_wide ? RenderSizeFor(OutputHeight, aspect).width : 0u;
+	const auto  output_width  = std::min(natural_width, MaxWideOutputWidth);
+	if (wants_wide && natural_width > output_width) {
+		std::printf("Demon's Souls render size: the wide output %ux%u is wider than %u; %ux%u instead (the presenter widens "
+		            "it to the aspect)\n",
+		            natural_width, OutputHeight, MaxWideOutputWidth, output_width, OutputHeight);
+		if (size.width > output_width) {
+			auto narrower = size;
+			while (narrower.height > 720 && narrower.width > output_width)
+				narrower = RenderSizeFor(narrower.height - 8, aspect);
+			std::printf("Demon's Souls render size: %ux%u is wider than the %u wide output; %ux%u instead\n", size.width,
+			            size.height, output_width, narrower.width, narrower.height);
+			size = narrower;
+			if (g_lod_render_height != 0) g_lod_render_height = size.height;
+		}
+	}
 	if (size.height == 0) {
 		std::printf("Demon's Souls render size: KYTY_RENDER_HEIGHT=%s is not 720-2160; the game's %ux%u kept\n", setting,
 		            game_width, game_height);
@@ -338,12 +360,9 @@ void Install(Program* program) {
 		std::memcpy(reinterpret_cast<void*>(*aspect_store + 3), &value, sizeof(value));
 		g_wide_aspect = value;
 	}
-	// The super resolution path with a wider aspect: the upscaler makes the wide output (WideOutputWidth).
-	const char* wide_output = std::getenv("KYTY_WIDE_OUTPUT");
-	if (trinity && aspect != 0.0 && (wide_output == nullptr || std::strcmp(wide_output, "0") != 0)) {
-		const auto output = RenderSizeFor(OutputHeight, aspect);
-		if (InstallWideOutput(*program, mode, output.width)) {
-			g_wide_output = output.width;
+	if (wants_wide) {
+		if (InstallWideOutput(*program, mode, output_width)) {
+			g_wide_output = output_width;
 		} else {
 			std::printf("Demon's Souls render size: the wide output's settings of a known build not found; the 3D squeezed "
 			            "into the 3840x2160 output\n");
