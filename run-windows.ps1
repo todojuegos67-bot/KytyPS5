@@ -611,6 +611,21 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 Write-Host "game:     $(if ($titleName) { "$titleName, " })$version$(if (!$tested) { " (untested: the emulator is tested with $($testedVersions -join ' and '))" })"
 Write-Host "config:   $Config$(if ($Baseline) { ' (baseline: no switches)' })$(if ($Precompile) { ' (precompile)' })"
 Write-Host ("affinity: 0x{0:X} ({1} CPUs){2}" -f $mask, $cpus, $(if ($environment['KYTY_RENDER_CPUS']) { "; render threads on CPUs $($environment['KYTY_RENDER_CPUS'])" }))
+# Keyboard and mouse (KYTY_KBM*, KYTY_PAD_MAP, set by the launcher): named to the emulator explicitly (the dry run
+# lists them) and said here, so a run log without "KYTY_KBM" lines can be told apart from one where it was not asked.
+foreach ($item in Get-ChildItem env: | Where-Object { $_.Name -like 'KYTY_KBM*' -or $_.Name -eq 'KYTY_PAD_MAP' }) {
+	if (!$environment.Contains($item.Name)) { $environment[$item.Name] = $item.Value }
+}
+$kbmCurve = Join-Path (Split-Path -Parent $Exe) 'kbm_curve.txt'
+if ($environment['KYTY_KBM'] -eq '1' -or $environment['KYTY_KBM_CALIBRATE'] -eq '1') {
+	Write-Host ("KBM: on (sens {0}, antideadzone {1}{2}; camera curve: {3}{4})" -f $(if ($environment['KYTY_KBM_SENS']) { $environment['KYTY_KBM_SENS'] } else { '1' }),
+		$(if ($environment['KYTY_KBM_ANTIDZ']) { $environment['KYTY_KBM_ANTIDZ'] } else { '0.15' }),
+		$(if ($environment['KYTY_KBM_MAP']) { '; custom keys' } else { '' }),
+		$(if (Test-Path -LiteralPath $kbmCurve) { 'kbm_curve.txt' } else { 'none, linear' }),
+		$(if ($environment['KYTY_KBM_CALIBRATE'] -eq '1') { '; CALIBRATING: stand still in an open area, hands off the mouse and right stick' } else { '' }))
+} else {
+	Write-Host "KBM: off$(if ($environment['KYTY_PAD_MAP']) { ' (pad remap on)' })"
+}
 Write-Host "switches: $($environment.Count)"
 Write-Host "command:  $Exe $($quoted -join ' ')"
 if ($DryRun) { $environment.GetEnumerator() | ForEach-Object { "  $($_.Key)=$($_.Value)" }; return }

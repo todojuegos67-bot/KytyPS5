@@ -17,6 +17,9 @@ void               HostInputFocus(bool focused);
 bool               HostInputMouseMotion(int dx, int dy);
 bool               HostInputMouseWheel(int y);
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event);
+// The camera's forward direction in world space (FrameGen::OnDraw, render thread): the KYTY_KBM mouse mapping and its
+// calibration (KYTY_KBM_CALIBRATE=1) measure the game's yaw rate from it.
+void               HostInputCameraForward(float fx, float fy, float fz);
 
 } // namespace Libs::Graphics
 

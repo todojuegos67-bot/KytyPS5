@@ -1,4 +1,5 @@
 #include "frame-gen.h"
+#include "graphics/presentation/window/hostInput.h"
 #include "fsr3-fg.h"
 #include "xess-sr.h"
 #include "graphics/presentation/videoOut.h"
@@ -2062,6 +2063,8 @@ void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt, char path) {
 	}
 	g_camera.jitter_ndc = {AsFloat(srt[SrtJitter]), AsFloat(srt[SrtJitter + 1])};
 	g_camera.valid      = true;
+	// (The KYTY_KBM mouse: the camera's yaw, from the forward row.)
+	::Libs::Graphics::HostInputCameraForward(g_camera.view_proj[12], g_camera.view_proj[13], g_camera.view_proj[14]);
 	if (ContactShadowsWanted()) {
 		std::lock_guard lock(g_last_vp_mutex);
 		g_last_vp = g_camera.view_proj, g_have_last_vp = true;
