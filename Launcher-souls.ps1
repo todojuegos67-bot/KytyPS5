@@ -199,6 +199,7 @@ function Start-Game {
 	$detNames = @('Ultra', 'VeryHigh', 'High', 'Normal', 'Low'); if ($cmbDet.SelectedIndex -ne 2) { $psargs += @('-Detail', $detNames[$cmbDet.SelectedIndex]) }  # (10-23) preset de detalle
 	if ($cmbDist.SelectedIndex -ge 1) { $psargs += @('-Quality', @('', 'high', 'low', 'lowest')[$cmbDist.SelectedIndex]) }  # (10-23) Alto = high
 	if ($chkExcl.Checked) { $psargs += '-ExclusiveFullscreen' }
+	if ($cmbAspect.SelectedIndex -gt 0) { $psargs += @('-Aspect', @('16:9', '21:9', '32:9')[$cmbAspect.SelectedIndex]) }  # (10-23) ultrawide
 	# Preset C con la imagen sin HUD (hudless) daba pantalla negra con solo el HUD (10-21): sin ese buffer.
 	# (10-21) Preset C del frame generation de NVIDIA siempre (mas rapido; el emulador solo lo aplica a DLSS-G).
 	$sets += 'KYTY_DLSSG_PRESET=C'
@@ -885,9 +886,17 @@ $chkStore.Visible = $false; $chkStore.Checked = $false
 $chkRamOpt.Visible = $false
 # Pantalla y otros: HDR, VSync, Metricas en una fila (pantalla exclusiva, Modo 4K, Preset C y G-Sync siguen ocultas,
 # en el mismo sitio: no se ven).
-Move-To $chkHdr $gScr 12 24 120
-Move-To $chkVsync $gScr 142 24 120
-Move-To $chkMetricas $gScr 272 24 136
+Move-To $chkHdr $gScr 12 24 72
+Move-To $chkVsync $gScr 88 24 84
+Move-To $chkMetricas $gScr 176 24 100
+# (10-23) Monitores panoramicos: el 3D a 21:9 o 32:9 (run-windows -Aspect; con DLSS / XeSS / FSR la salida es ancha).
+$cmbAspect = New-Object System.Windows.Forms.ComboBox
+$cmbAspect.DropDownStyle = 'DropDownList'; $cmbAspect.Font = $smallFont
+foreach ($l in 'Monitor 16:9', 'Monitor 21:9', 'Monitor 32:9') { [void]$cmbAspect.Items.Add($l) }
+$ai = 0; [void][int]::TryParse((Get-IniValue 'aspect' '0'), [ref]$ai); $cmbAspect.SelectedIndex = [math]::Min([math]::Max(0, $ai), 2)
+$cmbAspect.Add_SelectedIndexChanged({ Set-IniValue 'aspect' "$($cmbAspect.SelectedIndex)" })
+$tips.SetToolTip($cmbAspect, 'Monitores panoramicos (ultrawide): el juego se dibuja a 21:9 o 32:9 en vez de estirarse. Funciona con DLSS, XeSS y FSR. Los videos y algunos menus se ven estirados.')
+$gScr.Controls.Add($cmbAspect); $cmbAspect.Location = New-Object System.Drawing.Point(280, 21); $cmbAspect.Size = New-Object System.Drawing.Size(130, 26)
 Move-To $chkExcl $gScr 12 24 120
 Move-To $chk4K $gScr 142 24 120
 Move-To $chkPresetC $gScr 272 24 136
@@ -1061,6 +1070,31 @@ function Show-PadMapper {
 		'dpup' = @(190, 198, 30, 30, 'r'); 'dpdown' = @(190, 258, 30, 30, 'r'); 'dpleft' = @(160, 228, 30, 30, 'r'); 'dpright' = @(220, 228, 30, 30, 'r')
 		'y' = @(384, 112, 34, 34, 'c'); 'a' = @(384, 182, 34, 34, 'c'); 'x' = @(349, 147, 34, 34, 'c'); 'b' = @(419, 147, 34, 34, 'c')
 		'back' = @(206, 138, 52, 18, 'r'); 'start' = @(282, 138, 52, 18, 'r') }
+	# (10-23) Fotos propias de los mandos (mando-ps5.png / mando-8bitdo.png junto al launcher; no van en la release):
+	# los botones se colocan sobre la foto (centros medidos en la foto a 350 de alto).
+	$script:pmPhotoPs = $null; $script:pmPhotoXb = $null
+	try {
+		$fp = Join-Path $root 'mando-ps5.png'; if (Test-Path -LiteralPath $fp) { $script:pmPhotoPs = [System.Drawing.Image]::FromFile($fp) }
+		$fx = Join-Path $root 'mando-8bitdo.png'; if (Test-Path -LiteralPath $fx) { $script:pmPhotoXb = [System.Drawing.Image]::FromFile($fx) }
+	} catch { $script:pmPhotoPs = $null; $script:pmPhotoXb = $null }
+	$photoTop = 84
+	if ($script:pmPhotoPs) {
+		$k = 350 / 371; $offX = (540 - $script:pmPhotoPs.Width) / 2
+		$c = @{ 'Up' = @(100, 72, 26); 'Down' = @(100, 132, 26); 'Left' = @(70, 102, 26); 'Right' = @(130, 102, 26)
+			'Triangle' = @(438, 62, 34); 'Circle' = @(478, 102, 34); 'Cross' = @(438, 142, 34); 'Square' = @(400, 102, 34)
+			'L3' = @(180, 175, 60); 'R3' = @(355, 175, 60); 'Options' = @(395, 42, 22); 'TouchPad' = @(270, 60, 90) }
+		foreach ($n in $c.Keys) { $v = $c[$n]; $d = $v[2] * $k; $h = if ($n -eq 'TouchPad') { 80 * $k } else { $d }
+			$ps[$n] = @(($offX + $v[0] * $k - $d / 2), ($photoTop + $v[1] * $k - $h / 2), $d, $h, $(if ($n -eq 'TouchPad') { 'r' } else { 'c' })) }
+	}
+	if ($script:pmPhotoXb) {
+		$k = 350 / 393; $offX = (540 - $script:pmPhotoXb.Width) / 2
+		$c = @{ 'y' = @(420, 70, 36); 'x' = @(380, 108, 36); 'b' = @(460, 108, 36); 'a' = @(420, 150, 36)
+			'leftstick' = @(97, 110, 76); 'rightstick' = @(337, 198, 76)
+			'dpup' = @(183, 170, 26); 'dpdown' = @(183, 226, 26); 'dpleft' = @(155, 198, 26); 'dpright' = @(211, 198, 26)
+			'back' = @(186, 62, 26); 'start' = @(332, 62, 26) }
+		foreach ($n in $c.Keys) { $v = $c[$n]; $d = $v[2] * $k
+			$xb[$n] = @(($offX + $v[0] * $k - $d / 2), ($photoTop + $v[1] * $k - $d / 2), $d, $d, 'c') }
+	}
 	$script:pmPsDef = $ps; $script:pmXbDef = $xb
 	$psX = 30; $xbX = 690; $padY = 60
 	foreach ($k in $ps.Keys) { $v = $ps[$k]; $script:pmRectPs[$k] = New-Object System.Drawing.RectangleF(($psX + $v[0]), ($padY + $v[1]), $v[2], $v[3]) }
@@ -1090,6 +1124,12 @@ function Show-PadMapper {
 		$trigFill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(26, 29, 38))
 		foreach ($ox in $psX, $xbX) {
 			$oy = $padY
+			$photo = if ($ox -eq $psX) { $script:pmPhotoPs } else { $script:pmPhotoXb }
+			if ($photo) {
+				foreach ($tx in ($ox + 70), ($ox + 340)) { $tp = & $rr $tx ($oy + 10) 130 74 26; $g.FillPath($trigFill, $tp); $g.DrawPath($bodyPen, $tp); $tp.Dispose() }
+				$g.DrawImage($photo, [float]($ox + (540 - $photo.Width) / 2), [float]($oy + 84), [float]$photo.Width, [float]$photo.Height)
+				continue
+			}
 			foreach ($tx in ($ox + 70), ($ox + 340)) { $tp = & $rr $tx ($oy + 10) 130 90 26; $g.FillPath($trigFill, $tp); $g.DrawPath($bodyPen, $tp); $tp.Dispose() }
 			$body = New-Object System.Drawing.Drawing2D.GraphicsPath
 			$pts = @(@(110, 84), @(160, 76), @(380, 76), @(430, 84), @(480, 92), @(505, 120), @(512, 170), @(525, 250), @(540, 330), @(520, 375),
@@ -1116,7 +1156,13 @@ function Show-PadMapper {
 			'Triangle' = [System.Drawing.Color]::FromArgb(80, 220, 170); 'Square' = [System.Drawing.Color]::FromArgb(240, 130, 210)
 			'y' = [System.Drawing.Color]::FromArgb(240, 210, 80); 'a' = [System.Drawing.Color]::FromArgb(110, 210, 110); 'x' = [System.Drawing.Color]::FromArgb(100, 160, 255); 'b' = [System.Drawing.Color]::FromArgb(255, 100, 100) }
 		$drawBtn = {
-			param($name, $rect, $shape, $text, $hot, $faded)
+			param($name, $rect, $shape, $text, $hot, $faded, $onPhoto)
+			if ($onPhoto) {
+				$ring = New-Object System.Drawing.Pen($(if ($hot) { [System.Drawing.Color]::FromArgb(255, 236, 200, 120) } else { [System.Drawing.Color]::FromArgb(110, 236, 200, 120) }), $(if ($hot) { 4 } else { 2 }))
+				if ($hot) { $hb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(110, 236, 200, 120)); if ($shape -eq 'c') { $g.FillEllipse($hb, $rect) } else { $g.FillRectangle($hb, $rect) }; $hb.Dispose() }
+				if ($shape -eq 'c') { $g.DrawEllipse($ring, $rect) } else { $g.DrawRectangle($ring, $rect.X, $rect.Y, $rect.Width, $rect.Height) }
+				$ring.Dispose(); return
+			}
 			$fill = if ($hot) { [System.Drawing.Color]::FromArgb(222, 196, 140) } elseif ($faded) { [System.Drawing.Color]::FromArgb(40, 44, 54) } else { [System.Drawing.Color]::FromArgb(58, 64, 80) }
 			$br = New-Object System.Drawing.SolidBrush($fill)
 			$pen = New-Object System.Drawing.Pen($(if ($hot) { [System.Drawing.Color]::White } else { [System.Drawing.Color]::FromArgb(110, 110, 100) }), $(if ($hot) { 2 } else { 1 }))
@@ -1154,17 +1200,19 @@ function Show-PadMapper {
 		if ($focus -and $script:padAction.ContainsKey($focus)) {
 			$cap = "$($script:padGlyph[$focus])  =  $($script:padAction[$focus])"
 			$cb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(230, 40, 34, 22))
-			$cr = New-Object System.Drawing.RectangleF(($psX + 110), ($padY + 410), 320, 30)
+			$cr = if ($script:pmPhotoPs) { New-Object System.Drawing.RectangleF(($psX + 110), ($padY + 84 + 290), 320, 30) } else { New-Object System.Drawing.RectangleF(($psX + 110), ($padY + 410), 320, 30) }
 			$g.FillRectangle($cb, $cr); $g.DrawString($cap, $script:pmFontTitle, $tb, $cr, $center); $cb.Dispose()
 		}
 		$capBr.Dispose()
 		foreach ($k in $script:pmRectPs.Keys) {
 			$hot = ($script:pmSel -eq $k) -or ($script:pmHover -eq $k)
-			& $drawBtn $k $script:pmRectPs[$k] $script:pmPsDef[$k][4] $script:padGlyph[$k] $hot (-not $used.ContainsKey($k))
+			$onP = $script:pmPhotoPs -and $k -notin 'L1', 'L2', 'R1', 'R2'
+			& $drawBtn $k $script:pmRectPs[$k] $script:pmPsDef[$k][4] $script:padGlyph[$k] $hot (-not $used.ContainsKey($k)) $onP
 		}
 		foreach ($k in $script:pmRectXb.Keys) {
 			$hot = ($script:pmHover -eq $k) -or ($script:pmFlash -eq $k) -or ($script:pmSel -and $script:pmMap[$k] -eq $script:pmSel)
-			& $drawBtn $k $script:pmRectXb[$k] $script:pmXbDef[$k][4] $script:xbLabel[$k] $hot $false
+			$onP = $script:pmPhotoXb -and $k -notin 'leftshoulder', 'rightshoulder', 'lefttrigger', 'righttrigger'
+			& $drawBtn $k $script:pmRectXb[$k] $script:pmXbDef[$k][4] $script:xbLabel[$k] $hot $false $onP
 			# Insignia con el control de PS5 que hace este boton.
 			$r = $script:pmRectXb[$k]; $t = $script:pmMap[$k]
 			$bb = New-Object System.Drawing.RectangleF(($r.Right - 6), ($r.Y - 12), 40, 18)
@@ -1320,16 +1368,20 @@ function Show-PadMapper {
 		$gold2 = New-Object System.Drawing.SolidBrush($gold); $txt = New-Object System.Drawing.SolidBrush($ink)
 		$f1 = New-Object System.Drawing.Font('Segoe UI Semibold', 9, [System.Drawing.FontStyle]::Bold); $f2 = New-Object System.Drawing.Font('Segoe UI Symbol', 9)
 		# Cuerpo: dos arcos y la base redondeada; botones izquierdo y derecho, rueda y dos laterales.
+		$mphoto = $null; $mp = Join-Path $root 'raton.png'
+		if (Test-Path -LiteralPath $mp) { try { $mphoto = [System.Drawing.Image]::FromFile($mp) } catch { $mphoto = $null } }
 		$cx = 90; $top = 10; $w = 130; $h = 214
 		$body = New-Object System.Drawing.Drawing2D.GraphicsPath
 		$body.AddArc(($cx - $w / 2), $top, $w, 120, 180, 180); $body.AddArc(($cx - $w / 2), ($top + $h - 140), $w, 140, 0, 180); $body.CloseFigure()
-		$g.FillPath($fill, $body); $g.DrawPath($pen, $body)
+		if ($mphoto) { $g.DrawImage($mphoto, 10, 8, $mphoto.Width, $mphoto.Height) } else { $g.FillPath($fill, $body); $g.DrawPath($pen, $body) }
 		$lb = New-Object System.Drawing.Drawing2D.GraphicsPath; $lb.AddArc(($cx - $w / 2 + 4), ($top + 4), ($w - 8), 112, 180, 90); $lb.AddLine(($cx - 2), ($top + 4), ($cx - 2), ($top + 80)); $lb.AddLine(($cx - 2), ($top + 80), ($cx - $w / 2 + 4), ($top + 80)); $lb.CloseFigure()
 		$rb = New-Object System.Drawing.Drawing2D.GraphicsPath; $rb.AddArc(($cx - $w / 2 + 4), ($top + 4), ($w - 8), 112, 270, 90); $rb.AddLine(($cx + $w / 2 - 4), ($top + 80), ($cx + 2), ($top + 80)); $rb.AddLine(($cx + 2), ($top + 80), ($cx + 2), ($top + 4)); $rb.CloseFigure()
-		$g.FillPath($btnFill, $lb); $g.DrawPath($thin, $lb); $g.FillPath($btnFill, $rb); $g.DrawPath($thin, $rb)
-		$wheel = New-Object System.Drawing.RectangleF(($cx - 9), ($top + 22), 18, 40); $g.FillRectangle($fill, $wheel); $g.DrawRectangle($thin, $wheel.X, $wheel.Y, $wheel.Width, $wheel.Height)
-		$x1r = New-Object System.Drawing.RectangleF(($cx - $w / 2 - 6), ($top + 104), 10, 26); $x2r = New-Object System.Drawing.RectangleF(($cx - $w / 2 - 6), ($top + 136), 10, 26)
-		foreach ($r in $x1r, $x2r) { $g.FillRectangle($btnFill, $r); $g.DrawRectangle($thin, $r.X, $r.Y, $r.Width, $r.Height) }
+		if (-not $mphoto) {
+			$g.FillPath($btnFill, $lb); $g.DrawPath($thin, $lb); $g.FillPath($btnFill, $rb); $g.DrawPath($thin, $rb)
+			$wheel = New-Object System.Drawing.RectangleF(($cx - 9), ($top + 22), 18, 40); $g.FillRectangle($fill, $wheel); $g.DrawRectangle($thin, $wheel.X, $wheel.Y, $wheel.Width, $wheel.Height)
+			$x1r = New-Object System.Drawing.RectangleF(($cx - $w / 2 - 6), ($top + 104), 10, 26); $x2r = New-Object System.Drawing.RectangleF(($cx - $w / 2 - 6), ($top + 136), 10, 26)
+			foreach ($r in $x1r, $x2r) { $g.FillRectangle($btnFill, $r); $g.DrawRectangle($thin, $r.X, $r.Y, $r.Width, $r.Height) }
+		}
 		# Que hace cada entrada del raton (de la lista).
 		$what = { param($inp)
 			$acts = @(); foreach ($r in $script:pmKbm) { if ($r.k -eq $inp -or $r.k -eq "Shift+$inp") { $n = if ($script:kbmNames.ContainsKey($r.c)) { $script:kbmNames[$r.c] } else { $r.c }; $acts += $(if ($r.k -like 'Shift+*') { "Mayus+: $n" } else { $n }) } }
@@ -1337,16 +1389,24 @@ function Show-PadMapper {
 		$rows = @(@('Clic izquierdo', 'Mouse:Left', ($cx - 34), ($top + 40)), @('Clic derecho', 'Mouse:Right', ($cx + 34), ($top + 40)),
 			@('Rueda (clic)', 'Mouse:Middle', $cx, ($top + 42)), @('Rueda arriba', 'Mouse:WheelUp', $cx, ($top + 26)), @('Rueda abajo', 'Mouse:WheelDown', $cx, ($top + 58)),
 			@('Lateral 1', 'Mouse:X1', ($cx - $w / 2 - 1), ($top + 117)), @('Lateral 2', 'Mouse:X2', ($cx - $w / 2 - 1), ($top + 149)))
+		$lx = 200
+		if ($mphoto) {
+			# Puntos medidos en la foto (raton.png a 220 de alto, dibujada en 10,8).
+			$pt = @{ 'Mouse:Left' = @(55, 83); 'Mouse:Right' = @(125, 78); 'Mouse:Middle' = @(85, 60); 'Mouse:WheelUp' = @(80, 54); 'Mouse:WheelDown' = @(90, 66); 'Mouse:X1' = @(52, 113); 'Mouse:X2' = @(58, 136) }
+			foreach ($row in $rows) { $row[2] = $pt[$row[1]][0]; $row[3] = $pt[$row[1]][1] }
+			$lx = 236
+		}
 		$y = 6
 		foreach ($row in $rows) {
 			$ly = $y + 12
-			$g.DrawLine($thin, [float]$row[2], [float]$row[3], 196, [float]$ly); $g.FillEllipse($gold2, ([float]$row[2] - 3), ([float]$row[3] - 3), 6, 6)
-			$g.DrawString($row[0], $f1, $gold2, 200, $y + 3)
-			$g.DrawString((& $what $row[1]), $f2, $txt, (New-Object System.Drawing.RectangleF(300, ($y + 3), 258, 30)))
+			$g.DrawLine($thin, [float]$row[2], [float]$row[3], [float]($lx - 4), [float]$ly); $g.FillEllipse($gold2, ([float]$row[2] - 3), ([float]$row[3] - 3), 6, 6)
+			$g.DrawString($row[0], $f1, $gold2, $lx, $y + 3)
+			$g.DrawString((& $what $row[1]), $f2, $txt, (New-Object System.Drawing.RectangleF(($lx + 100), ($y + 3), (558 - $lx - 100), 30)))
 			$y += 32
 		}
 		$g.DrawString('Mover el raton = camara', $f1, $gold2, 14, 216)
 		foreach ($o in $fill, $btnFill, $pen, $thin, $gold2, $txt, $f1, $f2, $body, $lb, $rb) { $o.Dispose() }
+		if ($mphoto) { $mphoto.Dispose() }
 	})
 	$script:pmStartWait = {
 		if ($lv.SelectedIndices.Count -eq 0) { $cap.Text = 'Elige primero una accion de la lista.'; return }
@@ -1526,13 +1586,45 @@ $btnBrowse.Add_Click({
 	if ($dialog.ShowDialog($form) -eq 'OK') { $pathBox.Text = $dialog.SelectedPath }
 })
 $settings.Controls.Add($btnBrowse)
+# (10-23) El juego comprimido en un solo archivo .zar (unos dos tercios del tamano): el emulador lo lee sin descomprimir.
+$btnZarPick = New-Button '.zar' 536 52 54 32 $false
+$btnZarPick.Font = $smallFont
+$tips.SetToolTip($btnZarPick, 'Elegir el juego comprimido (.zar) en vez de la carpeta')
+$btnZarPick.Add_Click({
+	$d = New-Object System.Windows.Forms.OpenFileDialog
+	$d.Filter = 'Juego comprimido (*.zar)|*.zar'; $d.Title = 'Elige el archivo .zar del juego'
+	if ($d.ShowDialog($form) -eq 'OK') { $pathBox.Text = $d.FileName }
+})
+$settings.Controls.Add($btnZarPick)
+$btnZarMake = New-Button 'Comprimir a .zar' 200 96 200 36 $false
+$btnZarMake.Font = $smallFont
+$tips.SetToolTip($btnZarMake, 'Crea un .zar con el juego (unos dos tercios de lo que ocupa la carpeta). La carpeta original no se borra.')
+$btnZarMake.Add_Click({
+	$src = $pathBox.Text.Trim()
+	$tool = Join-Path $root 'zarchive.exe'
+	if (-not (Test-Path -LiteralPath $tool)) { [System.Windows.Forms.MessageBox]::Show('Falta zarchive.exe junto al launcher (viene en la release).', 'Comprimir', 'OK', 'Warning') | Out-Null; return }
+	if (-not $src -or -not (Test-Path -LiteralPath $src -PathType Container) -or -not (Test-Path -LiteralPath (Join-Path $src 'eboot.bin'))) {
+		[System.Windows.Forms.MessageBox]::Show('Pon primero la carpeta del juego (la que tiene eboot.bin).', 'Comprimir', 'OK', 'Warning') | Out-Null; return }
+	$dst = $src.TrimEnd('\') + '.zar'
+	if (Test-Path -LiteralPath $dst) { [System.Windows.Forms.MessageBox]::Show("Ya existe:`n$dst", 'Comprimir', 'OK', 'Warning') | Out-Null; return }
+	$msg = "Se va a crear:`n$dst`n`nOcupara unos dos tercios de la carpeta del juego y tarda varios minutos. Necesitas ese espacio libre en el disco.`nLa carpeta original NO se borra: cuando compruebes que el .zar funciona, puedes borrarla tu.`n`nAl terminar, el launcher usara el .zar."
+	if ([System.Windows.Forms.MessageBox]::Show($msg, 'Comprimir a .zar', 'OKCancel', 'Information') -ne 'OK') { return }
+	$status.Text = 'Comprimiendo... (ventana aparte)'
+	$p = Start-Process -FilePath $tool -ArgumentList @("`"$src`"", "`"$dst`"") -PassThru -Wait
+	if ($p.ExitCode -eq 0 -and (Test-Path -LiteralPath $dst)) {
+		$pathBox.Text = $dst; Set-GamePath $dst
+		$gb = [math]::Round((Get-Item -LiteralPath $dst).Length / 1GB, 1)
+		$status.Text = "Hecho: $gb GB. El launcher usa ahora el .zar."
+	} else { $status.Text = "No se pudo comprimir (codigo $($p.ExitCode))."; Remove-Item -LiteralPath $dst -ErrorAction SilentlyContinue }
+})
+$settings.Controls.Add($btnZarMake)
 $status = New-Label '' $smallFont $ink 20 140 560 24
 $settings.Controls.Add($status)
 $btnSave = New-Button 'Guardar' 20 96 160 36 $true
 $btnSave.Font = $smallFont
 $btnSave.Add_Click({
 	$p = $pathBox.Text.Trim()
-	if (-not $p -or -not (Test-Path -LiteralPath $p)) { $status.Text = 'Esa carpeta no existe.'; return }
+	if (-not $p -or -not (Test-Path -LiteralPath $p)) { $status.Text = 'Esa carpeta (o ese .zar) no existe.'; return }
 	Set-GamePath $p
 	$status.Text = 'Guardado en game-path.txt'
 })

@@ -15,3 +15,8 @@ _DevLog/
 _SaveData/
 _DebugSnapshots/
 __pycache__/
+
+# Fotos propias de mandos y raton (solo para el PC de cada uno; no van en la release)
+mando-ps5.png
+mando-8bitdo.png
+raton.png

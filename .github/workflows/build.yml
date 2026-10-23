@@ -206,6 +206,8 @@ jobs:
         run: |
           call build-windows.cmd kyty_emulator > build.log 2>&1 || (type build.log & exit /b 1)
           call build-windows.cmd kyty_shader_precompile >> build.log 2>&1 || (type build.log & exit /b 1)
+          rem (10-23) zarchive.exe: packs the game folder into one .zar the emulator reads directly.
+          call build-windows.cmd zarchive_tool >> build.log 2>&1 || (type build.log & exit /b 1)
           type build.log
 
       - name: Build errors
@@ -231,6 +233,7 @@ jobs:
           Copy-Item "$build\kyty_emulator.exe", "$build\kyty_shader_precompile.exe", "$build\libwinpthread-1.dll",
             run-windows.ps1, precompile-windows.ps1, launcher.ps1, launcher.cmd, LICENSE $out
           Copy-Item LICENSES $out -Recurse
+          if (Test-Path "$build\3rdparty\zarchive.exe") { Copy-Item "$build\3rdparty\zarchive.exe" $out }
           # Demon's Souls launcher (window with frame generation choice) and its two configs.
           Copy-Item Launcher-souls.ps1, Launcher-souls-EN.ps1, Launcher-souls.cmd, 'Jugar (Espanol).cmd', 'Play (English).cmd', fondo-souls.jpg, LEEME-souls.txt, metricas.ps1, NOVEDADES.txt $out
           Copy-Item config "$out\config" -Recurse
