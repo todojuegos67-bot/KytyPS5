@@ -86,6 +86,7 @@ $resModes = @(
 	@('FSR Calidad',    1.5,  'fsr',  0),
 	@('FSR Equilib.',   1.72, 'fsr',  0),
 	@('FSR Rendim.',    2.0,  'fsr',  0),
+	@('FSR 900p (AA)',  1.6,  'fsr',  0),  # (10-23) PC low profile: el 3D a 900 (1440 / 1.6) con FSR y nitidez
 	@('1080p juego',    1080, '',     0),
 	@('900p juego',     900,  '',     0),
 	@('720p juego',     720,  '',     0)
@@ -608,6 +609,7 @@ function Fill-Res {
 		# (10-22) DLSS Equilibrado y Ultra rendimiento solo a 4K: sobre 1440 caen por debajo de lo que acepta DLSS.
 		# Modo graficas de 8 GB: frame generation de AMD, asi que sin DLSS (todos los de XeSS y FSR).
 		if ($family -eq 'dlss' -and -not $script:isNvidia) { continue }  # (10-23) sin NVIDIA no hay DLSS
+		$modes = @($modes | Where-Object { $_[0] -ne 'FSR 900p (AA)' -or ($chkSoulsLow -and $chkSoulsLow.Checked) })  # (10-23) solo en low profile
 		# (10-23) Modo Souls ligero: solo el antialiasing de cada uno (DLSS DLAA, XeSS AA, FSR AA) o nativo.
 		if ($chkLowEnd -and $chkLowEnd.Checked) { $modes = @($modes | Where-Object { $_[0] -in 'DLSS DLAA', 'XeSS AA', 'FSR AA nativo' }) }
 		# (10-22) Modo graficas de 8 GB: tambien sin reescalado (1080p nativo, sin XeSS ni FSR), lo primero de la lista.
@@ -919,7 +921,7 @@ function Set-PresetExtreme { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex =
 	if ($cmbOut) { $cmbOut.SelectedIndex = 1 }; $chk4K.Checked = $true }  # (10-23) extremo: modo cinematico del juego a 4K
 # (10-23) Modo Souls PC low profile: 900p y todo en bajo, para PCs modestos.
 $chkSoulsLow = New-Check 'Modo Souls PC low profile (900p, todo en bajo)' 0 0 396 'soulslow'
-$tips.SetToolTip($chkSoulsLow, 'Para PCs modestos: 30 FPS reales con frame generation de AMD x2 (60 en pantalla), el juego a 900p y todos los graficos en bajo (texturas, distancia, sombras, detalle, reflejos, objetos y nitidez). Al quitarlo vuelve todo a Maximo y a 1440p.')
+$tips.SetToolTip($chkSoulsLow, 'Para PCs modestos: 30 FPS reales con frame generation de AMD x2 (60 en pantalla), el juego a 900p reescalado con FSR (nitidez 50 %) y todos los graficos en bajo (texturas, distancia, sombras, detalle, reflejos, objetos y nitidez). Al quitarlo vuelve todo a Maximo y a 1440p.')
 $panel.Controls.Add($chkSoulsLow); Move-To $chkSoulsLow $gModes 12 84 396
 function Set-ResByName([string]$name) {
 	for ($i = 0; $i -lt $script:resShown.Count; $i++) { if ($script:resShown[$i][0] -eq $name) { $cmbRes.SelectedIndex = $i; Set-IniValue 'scalelabel' $name; return } }
@@ -931,7 +933,8 @@ function Set-PresetLowProfile {
 	$chkAf16.Checked = $true; $chkLod.Checked = $true
 	foreach ($pc in @($script:postChecks)) { if ($pc -and $pc[0]) { $pc[0].Checked = $true } }
 	if ($cmbOut) { $cmbOut.SelectedIndex = 0 }; $chk4K.Checked = $false
-	Fill-Res; Set-ResByName '900p juego'
+	Fill-Res; Set-ResByName 'FSR 900p (AA)'
+	$cmbSharp.SelectedIndex = 3  # (10-23) FSR con nitidez al 50 %, fija
 }
 $script:soulsModes = @($chkLowEnd, $chkLowEnd45, $chkSoulsUltra, $chkSoulsExt, $chkSoulsLow)
 $chkSoulsLow.Add_CheckedChanged({
@@ -952,7 +955,7 @@ $chkGpu8.Add_CheckedChanged({ if ($chkGpu8.Checked) { Set-PresetLight } else { S
 function Update-ResLock { $lock = $chkSoulsLow.Checked; if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'Sin reescalado (1080p nativo)' }; $cmbRes.Enabled = -not $lock 
 	# (10-23) PC low profile: todo fijo (salida, graficos y casillas), nada se puede cambiar.
 	$low = $chkSoulsLow.Checked
-	foreach ($c in @($cmbFg, $cmbOut, $cmbTex, $cmbDist, $cmbShadow, $cmbDet, $cmbRefl, $cmbFade, $cmbAaS, $cmbRt, $cmbAo, $chkAf16, $chkLod)) { if ($c) { $c.Enabled = -not $low } }
+	foreach ($c in @($cmbSharp, $cmbFg, $cmbOut, $cmbTex, $cmbDist, $cmbShadow, $cmbDet, $cmbRefl, $cmbFade, $cmbAaS, $cmbRt, $cmbAo, $chkAf16, $chkLod)) { if ($c) { $c.Enabled = -not $low } }
 	foreach ($p in @($script:postChecks)) { if ($p -and $p[0]) { $p[0].Enabled = -not $low } }
 }
 $chkLowEnd.Add_CheckedChanged({ Update-ResLock })
