@@ -297,6 +297,20 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 	// The lock-on reticle, drawn after the icon: a marker over the world as the ones before it (below).
 	if (state.icon_frame == frame && clip && hash == ClipShaders[1] && count == 4 && areas == Outside && IsReticle(vs, first))
 		return Marker;
+	// A title centred on the screen among the HUD's draws (the area's name on entering it, the user 10-23: corrupted):
+	// over the canvas between the areas, reaching into the items picked up (and the prompts) - split, one part moved to
+	// the right edge and the rest widened. Drawn whole, held to the centre as a marker (unstretched, where 16:9 had it).
+	constexpr uint32_t centre_areas = (1u << 3u) | (1u << 4u);
+	if (state.icon_frame == frame && (areas & Outside) != 0 && (areas & ~(Outside | centre_areas)) == 0 &&
+	    std::fabs(min_x + max_x) < 0.2f && max_x - min_x > 0.3f && min_x > -0.95f) {
+		static bool noted = false;
+		if (!noted) {
+			noted = true;
+			std::printf("HUD anchor: a title centred on the screen held to its centre (first at frame %llu)\n",
+			            static_cast<unsigned long long>(frame));
+		}
+		return Marker;
+	}
 	if (state.icon_frame == frame) return areas;
 	// The game places those markers with its own 16:9 projection of their targets: aspect / (16/9) times as far from the
 	// screen's centre as the wider 3D shows the targets (the lock-on and an enemy's health bar beside an enemy off the
