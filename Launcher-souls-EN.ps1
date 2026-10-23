@@ -922,7 +922,7 @@ $chkLowEnd.Add_CheckedChanged({ Update-ResLock })
 $chkSoulsLow.Add_CheckedChanged({ Update-ResLock })
 $form.Add_Shown({ Update-ResLock })
 $chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { Set-PresetLight } elseif (-not $chkLowEnd45.Checked) { Set-PresetMax } })
-$chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { Set-PresetMax; $cmbTex.SelectedIndex = 1; $cmbDist.SelectedIndex = 1; $cmbShadow.SelectedIndex = 1; $cmbRt.SelectedIndex = 0; $cmbAo.SelectedIndex = 2 } elseif (-not $chkLowEnd.Checked) { Set-PresetMax } })
+$chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { Set-PresetMax; $cmbTex.SelectedIndex = 1; $cmbDist.SelectedIndex = 1; $cmbShadow.SelectedIndex = 1; $cmbRt.SelectedIndex = 0; $cmbAo.SelectedIndex = 2; $cmbAaS.SelectedIndex = 1 } elseif (-not $chkLowEnd.Checked) { Set-PresetMax } })
 Move-To $chkTurbo2 $gPc 202 54 206
 $chkStore = New-Check 'Smaller PS5 memory reserve (12 GB)' 0 0 396 'guest12'
 $tips.SetToolTip($chkStore, 'Reserves 12 GB for the PS5 memory instead of 13.8 GB (the game uses about 10.7 at most). Helps on 16 GB PCs. If the game closes with a memory warning, untick it.')

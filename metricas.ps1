@@ -360,6 +360,12 @@ function Get-Scale($ini) {
 
 $cGreen = [System.Drawing.Color]::LimeGreen; $cRed = [System.Drawing.Color]::Red; $cBlue = [System.Drawing.Color]::DeepSkyBlue
 $cOrange = [System.Drawing.Color]::Orange; $cWhite = [System.Drawing.Color]::White; $cKhaki = [System.Drawing.Color]::Khaki
+# (10-23) Color segun lo lleno que este (RAM y VRAM): verde < 70 %, amarillo < 85 %, naranja < 95 %, rojo al limite.
+function Get-UseColor([double]$used, [double]$total) {
+	if ($total -le 0) { return $cOrange }
+	$f = $used / $total
+	if ($f -lt 0.70) { return $cGreen } elseif ($f -lt 0.85) { return [System.Drawing.Color]::Gold } elseif ($f -lt 0.95) { return $cOrange } else { return $cRed }
+}
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
 $timer.Add_Tick({
@@ -393,7 +399,7 @@ $timer.Add_Tick({
 			} elseif ($MaxMB -gt 0) { $shown = $used; $max = $MaxMB } else { $shown = $used; $max = $total }
 			$rows.Add(@('GPU', ("{0,3} %   {1} C" -f $gpu, $temp), $cOrange))
 			if ($gclk -gt 0) { $rows.Add(@('GPU reloj', ("{0,4} MHz" -f $gclk), $cOrange)) }
-			$rows.Add(@('VRAM', ("{0:N1} / {1:N0} GB" -f ($shown / 1024.0), ($max / 1024.0)), $(if ($shown -gt $max) { $cRed } else { $cOrange })))
+			$rows.Add(@('VRAM', ("{0:N1} / {1:N0} GB" -f ($shown / 1024.0), ($max / 1024.0)), (Get-UseColor $shown $max)))
 		}
 	} else {
 		$rows.Add(@('GPU', $(if ($script:clk.gpuUse -ne $null) { "{0,3} %" -f $script:clk.gpuUse } else { '(sin nvidia-smi)' }), $cOrange))
@@ -409,9 +415,9 @@ $timer.Add_Tick({
 		if ($RamGB -gt 0) {
 			$ws = 0; $e2 = $emu | Select-Object -First 1
 			if ($e2) { $ws = $e2.WorkingSet64 / 1GB }
-			$rows.Add(@('RAM', ("{0:N1} / {1} GB{2}" -f ($ws + 4), $RamGB, $(if ($script:limitedPid -and -not $script:limitOk) { ' (sin limite!)' } else { '' })), $cOrange))
+			$rows.Add(@('RAM', ("{0:N1} / {1} GB{2}" -f ($ws + 4), $RamGB, $(if ($script:limitedPid -and -not $script:limitOk) { ' (sin limite!)' } else { '' })), (Get-UseColor ($ws + 4) $RamGB)))
 		} else {
-			$rows.Add(@('RAM', ("{0:N1} / {1:N0} GB" -f $ramUsed, $ramTotal), $cOrange))
+			$rows.Add(@('RAM', ("{0:N1} / {1:N0} GB" -f $ramUsed, $ramTotal), (Get-UseColor $ramUsed $ramTotal)))
 		}
 	} catch { }
 	$shownFps = $null
@@ -448,13 +454,9 @@ $timer.Add_Tick({
 			if ($fps -and $fps.fgMult) { $rows.Add(@('FG ahora', "x$($fps.fgMult)", $fgCol)) }
 		}
 	}
-	# Opciones graficas del lanzador (Maximo / Medio / Bajo).
-	$names = @('Maximo', 'Alto', 'Medio', 'Bajo')
-	foreach ($pair in @(@('gfxtex', 'Texturas'), @('gfxdist', 'Distancia'), @('gfxshadow', 'Sombras'))) {
-		if (-not $ini.ContainsKey($pair[0]) -and $ini.Count -eq 0) { continue }
-		$v = 0; [void][int]::TryParse("$($ini[$pair[0]])", [ref]$v)
-		$rows.Add(@($pair[1], $names[[math]::Min([math]::Max($v, 0), 2)], $cKhaki))
-	}
+	# (10-23) Solo el modo grafico elegido en el lanzador (Modo Souls o Personalizado).
+	$modo = "$($ini['soulsmodo'])"
+	if ($modo) { $rows.Add(@('', $modo, $cKhaki)) }
 	$script:rows = $rows.ToArray()
 	$script:fpsText = $(if ($fps -and $shownFps) { "FPS $shownFps" } else { '' })
 	# FPS en el color del frame generation: verde NVIDIA, rojo AMD, blanco sin frame generation.
