@@ -7,7 +7,7 @@
 // - free[m]: the real rate last measured at multiplier m (EMA, not sitting on the target / m cap); the rate at m + 1
 //   is estimated as 1 / (1 / free[m] + cost), cost = measured seconds per extra generated frame (from switches),
 //   8% of the frame until one was measured.
-// - Minimum real fps per multiplier: x2 30, x3 40, x4 45, x5/x6 50; never up when real (or the estimate) is below the
+// - Minimum real fps per multiplier (10-23): x2 20, x3 26, x4 30, x5/x6 36; never up when real (or the estimate) is below the
 //   next one's, down after 2 windows in a row below the current one's; m only where target / m >= its minimum. A
 //   window under 60% of the one before (hitch, loading) is ignored.
 // - Up at once when real * (m + 1) <= 1.03 target (the game's own 56-60 cap keeps real), or after 5 s under 90% of
@@ -61,7 +61,17 @@ struct DynMultiplier {
 		return q;
 	}
 
-	static double MinReal(int m) { return m <= 2 ? 30.0 : m == 3 ? 40.0 : m == 4 ? 45.0 : 50.0; }
+	// 10-23: lower minimums (x2 20, x3 26, x4 30, x5+ 36): with a heavy load (4K cinematic, ~37-48 real) x3 fell
+	// to x2 under the old 40 and the screen showed 80-90 of 224, flipping x2/x3 every few seconds. The aim is the
+	// monitor's rate; fewer generated frames only when the GPU has headroom (the quality rule).
+	// KYTY_DYN_MIN_SCALE scales them (1 = these; 1.5 = the old ones).
+	static double MinReal(int m) {
+		static const double k = [] {
+			const char* v = std::getenv("KYTY_DYN_MIN_SCALE");
+			return v != nullptr && *v != '\0' ? std::clamp(std::atof(v), 0.25, 3.0) : 1.0;
+		}();
+		return k * (m <= 2 ? 20.0 : m == 3 ? 26.0 : m == 4 ? 30.0 : 36.0);
+	}
 
 	double Estimate(int m, double base_real, int base_m) const {
 		if (free[m] > 0.0 && age[m] < 10) return free[m]; // (recent only: the scene moves on)
