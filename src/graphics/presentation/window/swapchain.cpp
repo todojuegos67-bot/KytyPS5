@@ -1241,7 +1241,13 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	// the wide output, or a 16:9 image of its own) is shown centered at 16:9, pillarboxed, whatever the frame's tag.
 	const double wide  = Loader::DemonsSoulsRenderSize::WideAspect();
 	const bool   movie = wide > 0.0 && VideoOut::MoviePlaying();
-	if ((!scene || movie) && Loader::DemonsSoulsRenderSize::WideOutputWidth() != 0 && source.extent.height != 0)
+	// (A frame of the 3D whose TAA pass was noted after its flip took the tag - a busy frame, a fast turn of the camera:
+	// the user, 10-23, a 16:9 crop shown for a moment - is no menu: a frame is cropped as one only after a few untagged
+	// frames in a row.)
+	static uint32_t untagged = 0;
+	untagged                 = scene ? 0u : std::min(untagged + 1u, 1000u);
+	const bool cropped       = movie || (!scene && untagged >= 4u);
+	if (cropped && Loader::DemonsSoulsRenderSize::WideOutputWidth() != 0 && source.extent.height != 0)
 		src_w = std::min(src_w, (source.extent.height * 16u + 8u) / 9u);
 	const double frame_aspect = source.extent.height != 0 ? static_cast<double>(src_w) / source.extent.height : 0.0;
 	double       aspect       = movie ? 16.0 / 9.0 : wide > 0.0 ? wide : aspect_fit ? frame_aspect : 0.0;
