@@ -898,6 +898,11 @@ foreach ($m in @($chkSoulsUltra, $chkSoulsExt)) {
 }
 foreach ($m in @($chkLowEnd, $chkLowEnd45)) { $m.Add_CheckedChanged({ param($sender, $e) if ($sender.Checked) { $chkSoulsUltra.Checked = $false; $chkSoulsExt.Checked = $false; $chkSoulsLow.Checked = $false } }) }
 $chkGpu8.Add_CheckedChanged({ if ($chkGpu8.Checked) { Set-PresetLight } else { Set-PresetMax } })
+# (10-23) Modo Souls ligero y PC low profile: resolucion fija (no se puede cambiar el reescalado).
+function Update-ResLock { $lock = $chkLowEnd.Checked -or $chkSoulsLow.Checked; if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'No upscaling (1080p native)' }; $cmbRes.Enabled = -not $lock }
+$chkLowEnd.Add_CheckedChanged({ Update-ResLock })
+$chkSoulsLow.Add_CheckedChanged({ Update-ResLock })
+$form.Add_Shown({ Update-ResLock })
 $chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { Set-PresetLight } elseif (-not $chkLowEnd45.Checked) { Set-PresetMax } })
 $chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { Set-PresetMax; $cmbTex.SelectedIndex = 1; $cmbDist.SelectedIndex = 1; $cmbShadow.SelectedIndex = 1; $cmbRt.SelectedIndex = 0; $cmbAo.SelectedIndex = 2 } elseif (-not $chkLowEnd.Checked) { Set-PresetMax } })
 Move-To $chkTurbo2 $gPc 202 54 206
