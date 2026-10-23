@@ -106,7 +106,7 @@ vec3 YCoCg(vec3 c) { return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r 
 vec3 Rgb(vec3 y) { return vec3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z); }
 bool InScreen(vec2 uv) { return all(greaterThanEqual(uv, vec2(0))) && all(lessThanEqual(uv, vec2(1))); }
 
-float Exposure() {
+float GameExposure() {
 	float e = exposure_values[push.misc2.x];
 	return (e > 1e-12 && e < 1e12) ? e : 1.0;
 }
@@ -430,7 +430,7 @@ void Trace(ivec2 px) {
 	fade *= smoothstep(-0.7, -0.15, -dot(R, V));
 	fade = clamp(fade, 0.0, 1.0);
 	if (fade < 1e-3) { StoreMiss(px, s); return; }
-	vec3 c   = Tonemap(SafeColor(textureLod(color_tex, huv, 0).rgb * Exposure()));
+	vec3 c   = Tonemap(SafeColor(textureLod(color_tex, huv, 0).rgb * GameExposure()));
 	vec4 res = vec4(c * fade, fade);
 	if (Bad(res)) { StoreMiss(px, s); return; }
 	imageStore(out_a, px, res);
@@ -628,7 +628,7 @@ void Composite(ivec2 px) {
 		imageStore(out_a, px, col);
 		return;
 	}
-	float e     = Exposure();
+	float e     = GameExposure();
 	vec3  refl  = InvTonemap(clamp(rf.rgb / rf.a, vec3(0), vec3(1))) / e;
 	float NoV   = clamp(dot(s.N, normalize(-P)), 0.0, 1.0);
 	// Schlick with roughness (Lagarde), f0 0.04: the reflection replaces this share of the color.
