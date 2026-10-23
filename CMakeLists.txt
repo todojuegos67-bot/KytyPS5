@@ -439,7 +439,7 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${ssr_header}")
 
-# KYTY_CONTACT_SHADOWS: screen-space contact shadows before the upscaler (src/local/frame-gen.cpp).
+# KYTY_RT_SHADOWS: screen-space ray-traced sun shadows before the upscaler (src/local/frame-gen.cpp).
 set(cshadow_source "${KYTY_SOURCE_DIR}/local/cshadow.comp")
 set(cshadow_spv "${gpu_tiler_generated_dir}/cshadow.spv")
 set(cshadow_header "${gpu_tiler_generated_dir}/cshadow_spv.h")

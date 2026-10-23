@@ -227,8 +227,11 @@ function Start-Game {
 	$nvAmd  = $false
 	# Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag automatico en AMD, y en NVIDIA solo con XeSS o FSR.
 	$fixedAl = (Is-FixedFg) -and (-not $script:isNvidia)
+	# (10-23 noche) Anti-Lag propio del emulador (KYTY_LOWLAT): sin Reflex ni FSR3 tocado; con la frame generation de AMD.
+	$ownLat = $cmbAl.SelectedIndex -gt 0 -and $config -like 'fsr3*'
+	if ($ownLat) { $sets += 'KYTY_LOWLAT=1'; $sets += $(if ($cmbAl.SelectedIndex -eq 2) { 'KYTY_LOWLAT_QUEUE=1' } else { 'KYTY_LOWLAT_QUEUE=2' }) }  # (10-23) Anti-Lag: 2 frames en cola; Ultra: 1
 	# (10-23) Para las metricas: si va Anti-Lag y cual.
-	Set-IniValue 'antilagon' $(if ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
+	Set-IniValue 'antilagon' $(if ($ownLat) { $(if ($cmbAl.SelectedIndex -eq 2) { 'Ultra' } else { 'Normal' }) } elseif ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
 	if ($nvAmd -or $fixedAl) {
 		$psargs += '-AntiLag'
 		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y
@@ -284,6 +287,8 @@ function Start-Game {
 	$sets += 'KYTY_ALIAS_STATS=0'  # (10-23) el diagnostico de alias recorria todos los mapeos en cada map: tirones al cambiar de zona que empeoraban con la sesion
 	if ($fgConfig -eq 'fsr3-x4.json') { $sets += 'KYTY_VRR_CAP_FPS=224' }  # (10-22 d) en DLSS el tope se aplicaba dos veces: 14 reales x4 = 56
 	if ($fgConfig -like '*dyn*') { $sets += 'KYTY_DYN_QUALITY=0.95' }  # (10-22 g) llenar el monitor: el menor multiplicador que llega a ~224 (80 reales = x3, 120 = x2)
+	# (10-23) Teclado y raton: velocidad de camara del juego (sin teclado y raton no se toca: la del menu del juego).
+	if ($chkKbm.Checked) { $psargs += @('-ExtraConvars', "cp11_Setting_CameraSpeed=$($trkCam.Value)") }
 	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
@@ -638,7 +643,7 @@ function Fill-Res {
 		if ($family -eq 'dlss' -and -not $script:isNvidia) { continue }  # (10-23) sin NVIDIA no hay DLSS
 		$modes = @($modes | Where-Object { $_[0] -ne 'FSR 900p (AA)' })  # (10-23) ya no se usa: low profile = FSR AA nativo con salida de 900
 		# (10-23) Modo Souls ligero: solo el antialiasing de cada uno (DLSS DLAA, XeSS AA, FSR AA) o nativo.
-		if ($chkLowEnd -and $chkLowEnd.Checked) { $modes = @($modes | Where-Object { $_[0] -in 'DLSS DLAA', 'XeSS AA', 'FSR AA native' }) }
+		if (($chkLowEnd -and $chkLowEnd.Checked) -or ($chkSoulsLow -and $chkSoulsLow.Checked)) { $modes = @($modes | Where-Object { $_[0] -in 'DLSS DLAA', 'XeSS AA', 'FSR AA native' }) }
 		# (10-22) Modo graficas de 8 GB: tambien sin reescalado (1080p nativo, sin XeSS ni FSR), lo primero de la lista.
 		if ($chkLowEnd -and $chkLowEnd.Checked -and $family -eq 'xess') { $shown += , @('No upscaling (1080p native)', 1080, '', 0) }
 		$outH = Get-OutHeight
@@ -871,24 +876,31 @@ Move-To $chkUnlock $gFg 12 60 200
 $chkUnlock.Visible = $false  # (10-22) sin casilla: siempre desbloqueados salvo DLSS y modos Souls
 Move-To $chkAntiLag $gFg 222 60 186
 # (10-23 noche) Visible solo con NVIDIA: "Anti-Lag (experimental)" para la frame generation de AMD sin DLSS.
-$chkAntiLag.Visible = $false; $chkAntiLag.Checked = $false; $chkAntiLag.Text = 'Anti-Lag (experimental)'
+$chkAntiLag.Text = 'Anti-Lag'
+# (10-23) Desplegable Anti-Lag: No / Anti-Lag (2 frames en cola) / Anti-Lag Ultra (1), en el sitio de la casilla.
+$cmbAl = New-Object System.Windows.Forms.ComboBox
+$cmbAl.DropDownStyle = 'DropDownList'; $cmbAl.Font = $smallFont
+foreach ($l in 'Anti-Lag: off', 'Anti-Lag', 'Anti-Lag Ultra') { [void]$cmbAl.Items.Add($l) }
+$ai2 = 0; [void][int]::TryParse((Get-IniValue 'antilagmode' '0'), [ref]$ai2); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $ai2), 2)
+$cmbAl.Add_SelectedIndexChanged({ Set-IniValue 'antilagmode' "$($cmbAl.SelectedIndex)" })
+$gFg.Controls.Add($cmbAl); $cmbAl.Location = $chkAntiLag.Location; $cmbAl.Size = New-Object System.Drawing.Size(186, 26)
 # Solo se puede marcar con la frame generation de AMD (con la de NVIDIA ya va Reflex); fuera de ella se desmarca.
 function Update-AntiLagBox {
 	$cfgNow = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	$resSel = if ($script:resShown.Count) { $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)] } else { $null }
-	$ok = $cfgNow -like 'fsr3*' -and -not (Is-FixedFg) -and $resSel -and $resSel[2] -in 'xess', 'fsr'  # (10-23) solo con XeSS o FSR
+	$ok = $cfgNow -like 'fsr3*' -or (Is-FixedFg)  # (10-23 noche) anti-lag propio: con la frame generation de AMD, cualquier reescalado
 	# (10-23) Modos Souls con FG fija: se ve marcada y gris cuando se activa sola (AMD siempre; NVIDIA con XeSS o FSR).
 	$autoAl = $false
 	if ($autoAl) { $chkAntiLag.Checked = $true; $chkAntiLag.Enabled = $false; $chkAntiLag.Visible = $true; $script:alAuto = $true; return }
 	if ($script:alAuto) { $chkAntiLag.Checked = $false; $script:alAuto = $false }
 	$chkAntiLag.Enabled = $true
 	if (-not $ok) { $chkAntiLag.Checked = $false }
-	$chkAntiLag.Visible = $false  # (10-23 21:30) retirada: Reflex + FG de AMD crashea en NVIDIA
+	$chkAntiLag.Visible = $false; $cmbAl.Visible = $ok
 }
 $cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $cmbRes.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $form.Add_Shown({ Update-AntiLagBox })
-$tips.SetToolTip($chkAntiLag, 'NVIDIA only, with AMD frame generation and XeSS or FSR upscaling: NVIDIA Reflex for less lag. Experimental: if the game closes, untick it.')
+$tips.SetToolTip($cmbAl, 'With AMD frame generation. Anti-Lag: at most 2 frames queued before reading the controller. Ultra: 1 (even less lag, may cost a few real FPS). No Reflex, any GPU.')
 # Calidad grafica: texturas, distancia, sombras, Luz RT y filtrado x16 ($script:gfxTop: etiqueta y desplegable de Texturas, Sombras, Distancia).
 Move-To $script:gfxTop[0] $gGfx 10 26 98; Move-To $cmbTex $gGfx 110 24 296
 Move-To $script:gfxTop[4] $gGfx 10 58 98; Move-To $cmbDist $gGfx 110 56 296
@@ -1006,7 +1018,8 @@ foreach ($m in @($chkSoulsUltra, $chkSoulsExt)) {
 foreach ($m in @($chkLowEnd, $chkLowEnd45)) { $m.Add_CheckedChanged({ param($sender, $e) if ($sender.Checked) { $chkSoulsUltra.Checked = $false; $chkSoulsExt.Checked = $false; $chkSoulsLow.Checked = $false } }) }
 $chkGpu8.Add_CheckedChanged({ if ($chkGpu8.Checked) { Set-PresetLight } else { Set-PresetMax } })
 # (10-23) Modo Souls ligero y PC low profile: resolucion fija (no se puede cambiar el reescalado).
-function Update-ResLock { $lock = $chkSoulsLow.Checked; if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'No upscaling (1080p native)' }; $cmbRes.Enabled = -not $lock 
+function Update-ResLock { $lock = $false;  # (10-23) low profile: el AA se elige (solo modos AA a 900)
+ if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'No upscaling (1080p native)' }; $cmbRes.Enabled = -not $lock 
 	# (10-23) PC low profile: todo fijo (salida, graficos y casillas), nada se puede cambiar.
 	$low = $chkSoulsLow.Checked
 	$cmbFg.Enabled = -not (Is-FixedFg)  # (10-23) ligero / equilibrado / low profile: FG fija (antes esta funcion la volvia a activar)
@@ -1637,7 +1650,7 @@ foreach ($pp in @(@('Motion Blur', 'motionblur'), @('Depth of Field', 'dof'), @(
 	$script:postChecks += ,@($c, $pp[1])
 	$px += 134; if ($px -gt 300) { $px = 12; $py += 30 }
 }
-$gCtl = New-Group 'Controls' 450 604 420 168
+$gCtl = New-Group 'Controls' 450 604 420 214
 # (10-23) Controles en un desplegable: el boton los muestra u oculta.
 $gCtl.Visible = $false
 $btnCtl = New-Button 'Controls  v' 450 566 420 32 $false
@@ -1649,14 +1662,14 @@ $lnkDon = New-Object System.Windows.Forms.LinkLabel
 $lnkDon.Text = ([string][char]0x2665) + '  Donate your soul  -  PayPal: todojuegos67@gmail.com'
 $lnkDon.Font = $boldSmall; $lnkDon.LinkColor = $gold; $lnkDon.ActiveLinkColor = [System.Drawing.Color]::White
 $lnkDon.BackColor = [System.Drawing.Color]::Transparent
-$lnkDon.Location = New-Object System.Drawing.Point(450, 790); $lnkDon.Size = New-Object System.Drawing.Size(420, 28)
+$lnkDon.Location = New-Object System.Drawing.Point(450, 830); $lnkDon.Size = New-Object System.Drawing.Size(420, 28)
 $lnkDon.TextAlign = 'MiddleCenter'
 $lnkDon.Add_LinkClicked({ Start-Process 'https://www.paypal.com/donate?business=todojuegos67%40gmail.com&currency_code=EUR' })
 $tips.SetToolTip($lnkDon, 'If you enjoy the project, you can donate via PayPal. Thank you, bearer of the curse.')
 $panel.Controls.Add($lnkDon)
 # (10-23) Boton oficial 'Donar' de PayPal, servido por PayPal (paypalobjects.com); si no hay internet, solo queda el texto.
 $picDon = New-Object System.Windows.Forms.PictureBox
-$picDon.Size = New-Object System.Drawing.Size(92, 26); $picDon.Location = New-Object System.Drawing.Point(614, 822)
+$picDon.Size = New-Object System.Drawing.Size(92, 26); $picDon.Location = New-Object System.Drawing.Point(614, 862)
 $picDon.BackColor = [System.Drawing.Color]::Transparent; $picDon.Cursor = [System.Windows.Forms.Cursors]::Hand
 $picDon.SizeMode = 'Zoom'; $picDon.WaitOnLoad = $false
 try { $picDon.LoadAsync('https://www.paypalobjects.com/en_US/i/btn/btn_donate_LG.gif') } catch { }
@@ -1688,8 +1701,12 @@ function New-Slider([string]$key, [int]$min, [int]$max, [int]$def, $x, $y, [scri
 $trkSens = New-Slider 'kbmsens' 5 400 100 12 62 { param($v) 'Mouse sensitivity: ' + ($v / 100).ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture) }
 $trkAdz = New-Slider 'kbmadz' 0 50 15 218 62 { param($v) "Anti-deadzone: $v%" }
 $tips.SetToolTip($trkSens, 'How much the camera turns per mouse movement (1.00 = normal).')
+# (10-23) Velocidad de camara del juego con teclado y raton (cp11_Setting_CameraSpeed): mas alta = los giros grandes del
+# raton no se quedan en el tope del stick. Sin teclado y raton, la del juego (la de su menu).
+$trkCam = New-Slider 'kbmcam' 1 10 10 12 116 { param($v) "Camera speed (mouse): $v" }
+$tips.SetToolTip($trkCam, 'Keyboard and mouse only: the game camera''s maximum turn speed. 10 = fast big turns. Without keyboard and mouse the game menu''s value is used.')
 $tips.SetToolTip($trkAdz, 'Skips the game''s stick deadzone: higher means a small mouse movement already turns the camera. If the camera moves by itself, lower it.')
-function Update-KbmEnabled { $trkSens.Enabled = $chkKbm.Checked; $trkAdz.Enabled = $chkKbm.Checked }
+function Update-KbmEnabled { $trkSens.Enabled = $chkKbm.Checked; $trkAdz.Enabled = $chkKbm.Checked; $trkCam.Enabled = $chkKbm.Checked }
 $chkKbm.Add_CheckedChanged({ Update-KbmEnabled })
 Update-KbmEnabled
 # (10-23) Calibrar la camara para el raton: arranca el juego con KYTY_KBM_CALIBRATE=1 (y teclado y raton).
@@ -1703,7 +1720,7 @@ $btnCal.Add_Click({
 	$script:kbmCalibrate = $true
 	try { Start-Game } finally { $script:kbmCalibrate = $false }
 })
-Move-To $btnCal $gCtl 12 124 396
+Move-To $btnCal $gCtl 12 170 396
 
 # ---- Settings (panel desplegable) ----
 $settings = New-Object System.Windows.Forms.Panel

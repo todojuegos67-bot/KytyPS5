@@ -252,7 +252,8 @@ struct UpscaleInputs {
 [[nodiscard]] bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs);
 // KYTY_SSGI=1|2: screen-space GI on the color before the upscaler (in Upscale).
 [[nodiscard]] bool SsgiWanted();
-// KYTY_CONTACT_SHADOWS=1|2|3 ("Sombras RT"): screen-space contact shadows toward the sun before the upscaler (in Upscale).
+// KYTY_RT_SHADOWS=1|2|3 ("Sombras RT"; KYTY_CONTACT_SHADOWS the old name): screen-space ray-traced sun shadows with a
+// temporal + a-trous denoise on the PS5 Pro path's HDR color before the upscaler (in Upscale).
 [[nodiscard]] bool ContactShadowsWanted();
 // The sun's direction for it: a dispatch that samples a shadow-map array (a square, layered, depth-like image) is a
 // sun-shadow consumer; its flattened SRT and small constant buffers are searched for the cascades' orthographic

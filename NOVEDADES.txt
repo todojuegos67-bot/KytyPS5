@@ -4,6 +4,19 @@ DEMON'S SOULS (PS5) EN PC - NOVEDADES / WHAT'S NEW
 Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
 
 
+00. NUEVO (23-10 noche) / NEW (23-10 night)
+-------------------------------------------
+- Frame generation dinamico: llena el monitor aunque la grafica vaya justa (x3-x5) y ya
+  no salta entre multiplicadores (tirones). Dynamic FG fills the monitor, no flip-flopping.
+- 15 arreglos del emulador original: pantalla negra con la 1.05 y DLSS, crash en graficas
+  de 8 GB, DLSS ya no se apaga con poca VRAM, botones del mando que se perdian...
+- Ultrawide: deteccion del monitor, DLSS-G con bandas negras, 32:9 limitado.
+- Modo Souls PC low profile (900p, FSR AA, 30 x2 AMD) y Souls extremo en 4K cinematico.
+- Launcher: detecta tu grafica (sin DLSS si no es NVIDIA), recomienda modo y avisa si no es
+  compatible (GTX 10xx, RX 5000...). Metricas con modo, Anti-Lag y RAM/VRAM por colores.
+- Mapear mando arreglado (antes solo la cruceta). Cruz para cerrar el launcher.
+
+
 0. NUEVO (23-10 tarde) / NEW (23-10 evening)
 --------------------------------------------
 - ARREGLADOS los tirones al entrar y salir de zonas, que empeoraban cuanto mas
