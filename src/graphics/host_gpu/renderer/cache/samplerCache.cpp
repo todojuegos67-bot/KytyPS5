@@ -203,20 +203,49 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	    static_cast<float>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)) / 256.0f;
 	sampler_info.anisotropyEnable        = (aniso ? VK_TRUE : VK_FALSE);
 	sampler_info.maxAnisotropy           = aniso_ratio;
-	// KYTY_FORCE_AF=2..16: anisotropic filtering forced on mipmapped linear samplers (launcher "Filtrado x16").
-	// Never on depth-compare (shadow) samplers or point-sampled ones.
+	// KYTY_FORCE_AF=2..16 (launcher "Filtrado x16"): forced only on scene texture samplers - the same filter as
+	// KYTY_TEXTURE_LOD_BIAS: linear min filter + linear mips, MaxLod >= 1 and > MinLod, no depth compare, normalized
+	// coordinates. Point/nearest, unnormalized, shadow and no-mip (render target / post-process / fog lookup) samplers
+	// keep the guest's settings: forcing AF on them broke Demon's Souls' ground mist (white puffs along walls).
+	// The image (3D/volume or not) is not known here - samplers are cached by descriptor alone.
 	{
 		static const float force_af = []() {
 			const char* e = std::getenv("KYTY_FORCE_AF");
 			float v = (e != nullptr ? static_cast<float>(std::atof(e)) : 0.0f);
 			return (v >= 2.0f ? (v > 16.0f ? 16.0f : v) : 0.0f);
 		}();
-		if (force_af > 0.0f && sampler_info.minFilter == vk::Filter::eLinear && sampler_info.magFilter == vk::Filter::eLinear &&
-		    sampler_info.mipmapMode == vk::SamplerMipmapMode::eLinear && r.DepthCompareFunc() == 0 && max_lod > 0.0f &&
-		    force_af > sampler_info.maxAnisotropy)
-		{
-			sampler_info.anisotropyEnable = VK_TRUE;
-			sampler_info.maxAnisotropy    = force_af;
+		if (force_af > 0.0f) {
+			// counters under m_mutex: 0 applied, 1 min/mag not linear, 2 mip not linear, 3 depth compare,
+			// 4 unnormalized, 5 no mips (MaxLod < 1 or <= MinLod), 6 guest aniso already >= forced
+			static uint32_t cnt[7] = {};
+			static const char* const names[7] = {"applied", "filter-not-linear", "mip-not-linear", "depth-compare",
+			                                     "unnormalized", "no-mips", "guest-aniso"};
+			int reason = 0;
+			if (sampler_info.minFilter != vk::Filter::eLinear || sampler_info.magFilter != vk::Filter::eLinear) {
+				reason = 1;
+			} else if (sampler_info.mipmapMode != vk::SamplerMipmapMode::eLinear) {
+				reason = 2;
+			} else if (r.DepthCompareFunc() != 0) {
+				reason = 3;
+			} else if (r.ForceUnormCoords()) {
+				reason = 4;
+			} else if (!(max_lod >= 1.0f && max_lod > min_lod)) {
+				reason = 5;
+			} else if (!(force_af > sampler_info.maxAnisotropy)) {
+				reason = 6;
+			}
+			if (reason == 0) {
+				sampler_info.anisotropyEnable = VK_TRUE;
+				sampler_info.maxAnisotropy    = force_af;
+			}
+			const uint32_t total = 0u + cnt[0] + cnt[1] + cnt[2] + cnt[3] + cnt[4] + cnt[5] + cnt[6] + 1u;
+			cnt[reason]++;
+			if (total <= 64 || (total & (total - 1)) == 0) {
+				std::printf("Force AF x%.0f: %u samplers - %s %u, skipped: %s %u, %s %u, %s %u, %s %u, %s %u, %s %u\n",
+				            force_af, total, names[0], cnt[0], names[1], cnt[1], names[2], cnt[2], names[3], cnt[3],
+				            names[4], cnt[4], names[5], cnt[5], names[6], cnt[6]);
+				std::fflush(stdout);
+			}
 		}
 	}
 	// KYTY_TEXTURE_LOD_BIAS: scene textures only - mipmapped (mip filter on, a max LOD of at least 1), linear, not
