@@ -341,7 +341,7 @@ function Start-Game {
 	# Cinematico a 60 quitado (no funcionaba): el modo cinematico queda como en PS5.
 	$env:KYTY_UNLOCK_30 = '0'
 	# (10-23) Mando remapeado (KYTY_PAD_MAP) y teclado y raton (KYTY_KBM): ver "Mapear mando". Sin nada, como siempre.
-	foreach ($n in 'KYTY_PAD_MAP', 'KYTY_KBM', 'KYTY_KBM_MAP', 'KYTY_KBM_SENS', 'KYTY_KBM_ANTIDZ', 'KYTY_KBM_CALIBRATE') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
+	foreach ($n in 'KYTY_PAD_MAP', 'KYTY_KBM', 'KYTY_KBM_MAP', 'KYTY_KBM_SENS', 'KYTY_KBM_ANTIDZ', 'KYTY_KBM_CALIBRATE', 'KYTY_KBM_WARP') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 	$padMap = Get-IniValue 'padmap' ''; if ($padMap) { $env:KYTY_PAD_MAP = $padMap }
 	# (10-23) "Calibrar camara": el emulador mide cuanto gira la camara del juego con cada posicion del stick y lo guarda
 	# en kbm_curve.txt junto al exe; desde entonces el raton gira la camara exactamente lo que se mueve.
@@ -351,6 +351,7 @@ function Start-Game {
 		$kbmMap = Get-IniValue 'kbmmap' ''; if ($kbmMap) { $env:KYTY_KBM_MAP = $kbmMap }
 		$env:KYTY_KBM_SENS   = ($trkSens.Value / 100).ToString([System.Globalization.CultureInfo]::InvariantCulture)
 		$env:KYTY_KBM_ANTIDZ = ($trkAdz.Value / 100).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+		if ($chkWarp.Checked) { $env:KYTY_KBM_WARP = '1' } else { Remove-Item Env:KYTY_KBM_WARP -ErrorAction SilentlyContinue }
 	}
 	foreach ($n in 'KYTY_VSYNC_LOCK', 'KYTY_FPS_CAP', 'KYTY_FLIP_WHEN_READY') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 	# G-Sync: reloj del emulador suelto del monitor. Mostrar cada frame al momento solo con FPS desbloqueados y sin
@@ -1706,7 +1707,11 @@ $tips.SetToolTip($trkSens, 'How much the camera turns per mouse movement (1.00 =
 $trkCam = New-Slider 'kbmcam' 1 10 10 12 116 { param($v) "Camera speed (mouse): $v" }
 $tips.SetToolTip($trkCam, 'Keyboard and mouse only: the game camera''s maximum turn speed. 10 = fast big turns. Without keyboard and mouse the game menu''s value is used.')
 $tips.SetToolTip($trkAdz, 'Skips the game''s stick deadzone: higher means a small mouse movement already turns the camera. If the camera moves by itself, lower it.')
-function Update-KbmEnabled { $trkSens.Enabled = $chkKbm.Checked; $trkAdz.Enabled = $chkKbm.Checked; $trkCam.Enabled = $chkKbm.Checked }
+# (10-24) Frame warp: la camara del raton desplaza el 3D al momento (HUD quieto), tambien con la frame generation de AMD.
+$chkWarp = New-Check 'Instant camera (frame warp)' 0 0 300 'kbmwarp'
+$tips.SetToolTip($chkWarp, 'Keyboard and mouse only: right before each image is shown, the 3D is shifted by your mouse movement (the HUD stays still). Works without frame generation and with AMD; does nothing with NVIDIA. Experimental.')
+$panel.Controls.Add($chkWarp); Move-To $chkWarp $gCtl 222 120 186
+function Update-KbmEnabled { $trkSens.Enabled = $chkKbm.Checked; $trkAdz.Enabled = $chkKbm.Checked; $trkCam.Enabled = $chkKbm.Checked; $chkWarp.Enabled = $chkKbm.Checked }
 $chkKbm.Add_CheckedChanged({ Update-KbmEnabled })
 Update-KbmEnabled
 # (10-23) Calibrar la camara para el raton: arranca el juego con KYTY_KBM_CALIBRATE=1 (y teclado y raton).
