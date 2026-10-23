@@ -695,8 +695,8 @@ function Update-LowEnd { $low = Is-FixedFg; $cmbFg.Enabled = -not $low
 	elseif (-not $low -and $null -ne $script:fgBefore) { $cmbFg.SelectedIndex = $script:fgBefore; $script:fgBefore = $null }
 	$script:fgNoSave = $false
 	; if ($cmbOut) { if ($chkLowEnd45.Checked) { $cmbOut.SelectedIndex = 0 }; $cmbOut.Enabled = -not $low; $chk4K.Checked = (-not $low) -and $cmbOut.SelectedIndex -eq 1 }; if ($cmbPreset) { $cmbPreset.Enabled = $script:isNvidia }; Fill-Res }
-$chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { $chkLowEnd45.Checked = $false }; Update-LowEnd })
-$chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { $chkLowEnd.Checked = $false }; Update-LowEnd })
+$chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { $chkLowEnd45.Checked = $false }; Update-LowEnd; if (Get-Command Update-AntiLagBox -ErrorAction SilentlyContinue) { Update-AntiLagBox } })
+$chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { $chkLowEnd.Checked = $false }; Update-LowEnd; if (Get-Command Update-AntiLagBox -ErrorAction SilentlyContinue) { Update-AntiLagBox } })
 $cmbFg.Enabled = -not (Is-FixedFg)
 $cmbFg.Add_DrawItem({ param($sender, $e) Draw-ColoredItem $sender $e })
 
@@ -871,6 +871,11 @@ function Update-AntiLagBox {
 	$cfgNow = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	$resSel = if ($script:resShown.Count) { $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)] } else { $null }
 	$ok = $cfgNow -like 'fsr3*' -and -not (Is-FixedFg) -and $resSel -and $resSel[2] -in 'xess', 'fsr'  # (10-23) solo con XeSS o FSR
+	# (10-23) Modos Souls con FG fija: se ve marcada y gris cuando se activa sola (AMD siempre; NVIDIA con XeSS o FSR).
+	$autoAl = (Is-FixedFg) -and ((-not $script:isNvidia) -or ($resSel -and $resSel[2] -in 'xess', 'fsr'))
+	if ($autoAl) { $chkAntiLag.Checked = $true; $chkAntiLag.Enabled = $false; $chkAntiLag.Visible = $true; $script:alAuto = $true; return }
+	if ($script:alAuto) { $chkAntiLag.Checked = $false; $script:alAuto = $false }
+	$chkAntiLag.Enabled = $true
 	if (-not $ok) { $chkAntiLag.Checked = $false }
 	$chkAntiLag.Visible = $ok -and $script:isNvidia  # (10-23) oculta si no se puede usar
 }
@@ -1004,7 +1009,7 @@ function Update-ResLock { $lock = $chkSoulsLow.Checked; if ($lock -and $chkLowEn
 	foreach ($p in @($script:postChecks)) { if ($p -and $p[0]) { $p[0].Enabled = -not $low } }
 }
 $chkLowEnd.Add_CheckedChanged({ Update-ResLock })
-$chkSoulsLow.Add_CheckedChanged({ Update-ResLock; Update-LowEnd })
+$chkSoulsLow.Add_CheckedChanged({ Update-ResLock; Update-LowEnd; Update-AntiLagBox })
 $form.Add_Shown({ Update-ResLock; Update-LowEnd })
 $chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { Set-PresetLight } elseif (-not $chkLowEnd45.Checked) { Set-PresetMax } })
 $chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { Set-PresetMax; $cmbTex.SelectedIndex = 1; $cmbDist.SelectedIndex = 1; $cmbShadow.SelectedIndex = 1; $cmbRt.SelectedIndex = 0; $cmbAo.SelectedIndex = 2; $cmbAaS.SelectedIndex = 1 } elseif (-not $chkLowEnd.Checked) { Set-PresetMax } })
