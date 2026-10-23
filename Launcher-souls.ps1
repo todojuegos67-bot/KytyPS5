@@ -214,7 +214,13 @@ function Start-Game {
 	# (10-23) Modo GPU seguro retirado del launcher
 	# Graficos: texturas (0 entera, 1 mitad, 2 cuarto) y distancia de dibujado (-Quality low/lowest: solo el LOD).
 	$psargs += @('-TextureReduce', @('0', 'h', '1', '2')[$cmbTex.SelectedIndex])  # (10-23) Alto = h
-	if ($chkAntiLag.Checked) { $psargs += '-AntiLag' }
+	if ($chkAntiLag.Checked) {
+		$psargs += '-AntiLag'
+		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y
+		# con DLSS Frame Generation, Reflex en modo Boost.
+		$sets += 'KYTY_FRAME_PIPELINE=0'
+		if ($config -like 'dlss*') { $sets += 'KYTY_DLSSG_REFLEX=boost' }
+	}
 	if ($cmbRt.SelectedIndex -gt 0) { $psargs += @('-Ssgi', "$($cmbRt.SelectedIndex)") }
 	# (10-23) Sombras RT retiradas: el juego tiene las suyas (Sombras Ultra)
 	if ($cmbShadow.SelectedIndex -gt 0) { $psargs += @('-Shadows', @('0', '3', '1', '2')[$cmbShadow.SelectedIndex]) }  # (10-23) Alto = 3
@@ -531,7 +537,7 @@ $tips.SetToolTip($chkLowEnd45, 'Para graficas de la potencia de una RTX 3080: RT
 $panel.Controls.Add($chkLowEnd45)
 # (10-22) Solo uno de los dos modos a la vez (si ya estaban los dos en el ini, gana el de 30).
 if ($chkLowEnd.Checked -and $chkLowEnd45.Checked) { $chkLowEnd45.Checked = $false }
-$tips.SetToolTip($chkAntiLag, 'Menos retraso en los controles: AMD Anti-Lag 2 en graficas AMD, limitador del emulador en las demas. No hace nada con DLSS (ya usa Reflex).')
+$tips.SetToolTip($chkAntiLag, 'Menos retraso en los controles y el raton: sin frame preparado por adelantado (unos 18 ms menos, algo menos de FPS), AMD Anti-Lag 2 en graficas AMD y Reflex Boost con DLSS Frame Generation.')
 $panel.Controls.Add($chkAntiLag)
 $chk4K = New-Check 'Modo 4K' 0 0 120 'modo4k'
 $tips.SetToolTip($chk4K, 'El juego arranca en su modo cinematico a 4K (como en PS5). Con un reescalador, su resolucion se calcula para 4K.')
@@ -933,6 +939,7 @@ function Set-PresetLowProfile {
 	$chkAf16.Checked = $true; $chkLod.Checked = $true
 	foreach ($pc in @($script:postChecks)) { if ($pc -and $pc[0]) { $pc[0].Checked = $true } }
 	if ($cmbOut) { $cmbOut.SelectedIndex = 0 }; $chk4K.Checked = $false
+	foreach ($rm in $resModes) { if ($rm[0] -eq 'FSR 900p (AA)') { $rm[1] = [math]::Max(1.0, [math]::Round($H / 900.0, 3)) } }  # (10-23) 900 en cualquier monitor
 	Fill-Res; Set-ResByName 'FSR 900p (AA)'
 	$cmbSharp.SelectedIndex = 3  # (10-23) FSR con nitidez al 50 %, fija
 }
