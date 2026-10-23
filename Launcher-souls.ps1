@@ -868,7 +868,8 @@ $chkAntiLag.Visible = $script:isNvidia; $chkAntiLag.Text = 'Anti-Lag (experiment
 function Update-AntiLagBox {
 	$cfgNow = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	$ok = $cfgNow -like 'fsr3*' -and -not (Is-FixedFg)
-	$chkAntiLag.Enabled = $ok; if (-not $ok) { $chkAntiLag.Checked = $false }
+	if (-not $ok) { $chkAntiLag.Checked = $false }
+	$chkAntiLag.Visible = $ok -and $script:isNvidia  # (10-23) oculta si no se puede usar
 }
 $cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $form.Add_Shown({ Update-AntiLagBox })
