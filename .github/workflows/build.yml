@@ -323,6 +323,9 @@ jobs:
       - name: Publish
         shell: bash
         run: |
+          # (10-23) Ubuntu 26 runners may come without zip; any error goes to the run's annotations.
+          trap 'echo "::error::publish failed at line $LINENO: $BASH_COMMAND"' ERR
+          command -v zip > /dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zip; }
           (cd package && zip -qr "../$PACKAGE.zip" "$PACKAGE")
           # A tag's own release, else a new tag named after the package at this commit.
           tag="$GITHUB_REF_NAME"
@@ -337,5 +340,5 @@ jobs:
             latest=$([[ "$PACKAGE" == *-pgogen || "$PACKAGE" == *-fsr3 || "$PACKAGE" == *-dlss || "$PACKAGE" == *-fgx3 ]] && echo --latest=false || echo --latest)
             if [ "${{ inputs.publish }}" = "true" ]; then draft=""; latest="--latest"; [ -s "package/$PACKAGE/NOVEDADES.txt" ] && notes="$(cat "package/$PACKAGE/NOVEDADES.txt")"; fi
             gh release create "$tag" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" $draft \
-              --title "$PACKAGE" --notes "$notes" $latest
+              --title "$PACKAGE" --notes "$notes" $latest 2> gh-err.txt || { echo "::error::gh release create: $(tr '\n' ' ' < gh-err.txt)"; exit 1; }
           fi
