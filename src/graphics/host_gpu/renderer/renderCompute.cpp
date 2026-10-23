@@ -1181,13 +1181,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const bool        chain            = DemonsSouls::ComputeChains(program.shader_hash);
 	auto              vk_buffer        = chain ? buffer.ChainHandle() : buffer.Handle();
+	// (KYTY_SSR: before a G-buffer consumer, the packed layers copied; before the commit, the bindings intact.)
+	if (FrameGen::SsrWanted() && !bindings.images.empty())
+		FrameGen::SsrCaptureGbuffer(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
+		                            std::span<const TextureBinding> {bindings.images});
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u}, chain);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 9);
 	const bool continues_chain = chain && buffer.ComputeChainPending();
-	if (FrameGen::SsrWanted() && !bindings.images.empty())
-		FrameGen::SsrCaptureGbuffer(vk_buffer, std::span<const TextureBinding> {bindings.images});
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),

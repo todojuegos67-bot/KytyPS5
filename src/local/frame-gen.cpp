@@ -4758,6 +4758,7 @@ struct SsrGbuffer {
 	std::array<float, 16>       view_proj {};
 	bool                        have_vp = false;
 	uint64_t                    vp_flip = ~0ull;
+	std::array<uint64_t, 2>     packed_addresses {};   // the packed layers' last two addresses (double-buffered)
 } g_ssr_gb;
 
 bool SsrEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
@@ -5099,7 +5100,17 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		return false;
 	}
 	const bool use_packed = packed_count > 0 && !have_material;
-	const bool calibrate  = use_packed && from_copy && !g_ssr.calib_done && g_ssr.calib_runs < SsrCalibRuns && (g_ssr.frame & 3u) == 0;
+	static uint32_t live_frames = 0;
+	if (use_packed && !from_copy && live_frames < 100000) ++live_frames;
+	if (live_frames == 600 && g_ssr.copy_flip.load(std::memory_order_relaxed) == ~0ull) {
+		std::printf("SSR: no G-buffer copy after 600 frames: calibrating on the live image\n");
+		std::fflush(stdout);
+	}
+	const bool calib_live = live_frames >= 600 && g_ssr.copy_flip.load(std::memory_order_relaxed) == ~0ull;
+	// (every 4th eligible frame, not every 4th frame: a source present every other frame would never line up)
+	static uint32_t calib_tick = 0;
+	const bool      eligible   = use_packed && (from_copy || calib_live) && !g_ssr.calib_done && g_ssr.calib_runs < SsrCalibRuns;
+	const bool      calibrate  = eligible && (calib_tick++ & 3u) == 0;
 	if (use_packed && !g_ssr.calib_done && g_ssr.calib_runs >= SsrCalibRuns && ++g_ssr.calib_wait > 8) {
 		g_ssr.calib_done = true;
 		SsrAnalyze(packed_count);
@@ -5164,9 +5175,13 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.dec[0] = (dec_normal & 32) != 0 && !have_rows ? -1 : dec_normal;
 	push.dec[1] = dec_rough, push.dec[2] = dec_metal, push.dec[3] = static_cast<int32_t>(packed_count);
 	{
-		static uint32_t said_layers = ~0u;
-		if (said_layers != packed_count) {
-			said_layers = packed_count;
+		// (on a change of the layer count, held for 120 frames: no line per frame when the source flickers)
+		static uint32_t said_layers = ~0u, pending = ~0u, held = 0, lines = 0;
+		if (packed_count != pending) pending = packed_count, held = 0;
+		else if (held < 1000) ++held;
+		if (said_layers != pending && (said_layers == ~0u || held == 120) && lines < 16) {
+			said_layers = pending;
+			++lines;
 			std::printf("SSR: on (level %d, trace %ux%u, strength %g, thickness %g, up %s, packed G-buffer layers %u%s)\n", level,
 			            g_ssr.trace.width, g_ssr.trace.height, strength, thick,
 			            have_up ? "from the camera" : "unknown (|view y| assumed until the G-buffer normals are decoded)", packed_count,
@@ -5336,6 +5351,11 @@ void OnSsrGbuffer(uint64_t vs_hash, uint64_t ps_hash, std::span<const SsrTarget>
 		g_ssr_gb.count = n;
 		g_ssr_gb.flip  = flip;
 		g_ssr_gb.valid = true;
+		if (const uint64_t a = targets[0].address; a != 0 && targets[0].view.format == vk::Format::eR32Uint &&
+		                                           g_ssr_gb.packed_addresses[0] != a) {
+			g_ssr_gb.packed_addresses[1] = g_ssr_gb.packed_addresses[0];
+			g_ssr_gb.packed_addresses[0] = a;
+		}
 	}
 	const auto key = std::make_pair(vs_hash, ps_hash);
 	if (g_ssr_gb.logged.size() >= 24 || std::find(g_ssr_gb.logged.begin(), g_ssr_gb.logged.end(), key) != g_ssr_gb.logged.end()) return;
@@ -5374,33 +5394,57 @@ void OnSsrDispatch(uint64_t cs_hash, std::span<const uint64_t> addresses, std::s
 	std::fflush(stdout);
 }
 
-void SsrCaptureGbuffer(vk::CommandBuffer command, std::span<const TextureBinding> images) {
-	if (SsrLevel() == 0 || g_cache == nullptr || g_graphics_ctx == nullptr || g_ssr.copy_failed) return;
+// Why the copy was not taken (each reason logged the first time, then every 600th time).
+void SsrCaptureSkip(const char* reason, uint64_t cs_hash) {
+	static std::mutex                              mutex;
+	static std::vector<std::pair<std::string, uint32_t>> seen;
+	std::lock_guard lock(mutex);
+	for (auto& [r, n]: seen)
+		if (r == reason) {
+			if (++n % 600 == 0) std::printf("SSR: G-buffer copy not taken (CS %016llx): %s (x%u)\n", static_cast<unsigned long long>(cs_hash), reason, n);
+			return;
+		}
+	if (seen.size() >= 32) return;
+	seen.emplace_back(reason, 1);
+	std::printf("SSR: G-buffer copy not taken (CS %016llx): %s\n", static_cast<unsigned long long>(cs_hash), reason);
+	std::fflush(stdout);
+}
+
+void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                       std::span<const TextureBinding> images) {
+	if (SsrLevel() == 0 || g_ssr.copy_failed) return;
+	if (g_graphics_ctx == nullptr) g_graphics_ctx = &graphics;
 	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
 	if (g_ssr.copy_flip.load(std::memory_order_relaxed) == flip) return; // (once a frame: the first consumer)
-	uint64_t address = 0;
 	uint32_t width = 0, height = 0;
+	std::array<uint64_t, 2> addresses {};
 	{
 		std::lock_guard lock(g_ssr_gb.mutex);
-		if (!g_ssr_gb.valid || g_ssr_gb.count < 1 || g_ssr_gb.targets[0].view.format != vk::Format::eR32Uint) return;
-		// (this frame's G-buffer pass seen already: a dispatch before it, reading last frame's layers, must not take
-		// the frame's one copy)
-		if (g_ssr_gb.flip != flip) return;
-		address = g_ssr_gb.targets[0].address, width = g_ssr_gb.targets[0].width, height = g_ssr_gb.targets[0].height;
+		if (!g_ssr_gb.valid || g_ssr_gb.count < 1) return;
+		// (a known consumer only: a dispatch before the G-buffer pass must not take the frame's copy)
+		if (std::find(g_ssr_gb.consumers.begin(), g_ssr_gb.consumers.end(), cs_hash) == g_ssr_gb.consumers.end()) return;
+		if (g_ssr_gb.targets[0].view.format != vk::Format::eR32Uint) return SsrCaptureSkip("RT0 not R32_UINT", cs_hash);
+		if (flip > g_ssr_gb.flip + 1) return SsrCaptureSkip("no G-buffer pass this frame or the last", cs_hash);
+		addresses = g_ssr_gb.packed_addresses;
+		width = g_ssr_gb.targets[0].width, height = g_ssr_gb.targets[0].height;
 	}
 	const TextureBinding* binding = nullptr;
 	for (const auto& b: images)
-		if (b.image_id && b.desc.info.data.address == address) {
+		if (b.desc.info.data.address != 0 && (b.desc.info.data.address == addresses[0] || b.desc.info.data.address == addresses[1])) {
 			binding = &b;
 			break;
 		}
-	if (binding == nullptr) return;
-	auto& image = g_cache->GetImage(binding->image_id);
-	if (image.backing.image == nullptr || image.backing.format != vk::Format::eR32Uint || image.backing.layers < 4 ||
-	    image.backing.extent.width != width || image.backing.extent.height != height)
-		return;
+	if (binding == nullptr) return SsrCaptureSkip("the consumer binds neither G-buffer address", cs_hash);
+	if (!binding->image_id) return SsrCaptureSkip("binding without a cache image", cs_hash);
+	const uint64_t address = binding->desc.info.data.address;
+	auto& image = cache.GetImage(binding->image_id);
+	if (image.backing.image == nullptr) return SsrCaptureSkip("no backing image", cs_hash);
+	if (image.backing.format != vk::Format::eR32Uint) return SsrCaptureSkip("backing not R32_UINT", cs_hash);
+	if (image.backing.layers < 4) return SsrCaptureSkip("backing has < 4 layers", cs_hash);
+	if (image.backing.extent.width < width || image.backing.extent.height < height)
+		return SsrCaptureSkip("backing smaller than the G-buffer", cs_hash);
 	const vk::Extent2D extent {width, height};
-	if (g_ssr.copy_image != VK_NULL_HANDLE && g_ssr.copy_extent != extent) return; // (one size: the first seen)
+	if (g_ssr.copy_image != VK_NULL_HANDLE && g_ssr.copy_extent != extent) return SsrCaptureSkip("size changed", cs_hash);
 	if (g_ssr.copy_image == VK_NULL_HANDLE) {
 		g_ssr.copy_failed = true;
 		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -5416,6 +5460,7 @@ void SsrCaptureGbuffer(vk::CommandBuffer command, std::span<const TextureBinding
 		allocate.usage = VMA_MEMORY_USAGE_AUTO;
 		if (vmaCreateImage(g_graphics_ctx->allocator, &create, &allocate, &g_ssr.copy_image, &g_ssr.copy_mem, nullptr) != VK_SUCCESS) {
 			g_ssr.copy_image = VK_NULL_HANDLE;
+			std::printf("SSR: G-buffer copy image could not be created\n");
 			return;
 		}
 		for (uint32_t i = 0; i < 4; ++i) {
