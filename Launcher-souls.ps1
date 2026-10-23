@@ -614,6 +614,7 @@ function Get-ResFamilies {
 }
 function Get-OutHeight {
 	# (10-22) Modo graficas de 8 GB: siempre 1080p.
+	if ($chkSoulsLow -and $chkSoulsLow.Checked) { return 900 }  # (10-23) PC low profile: salida de 900, FSR 3.1 AA nativo a 900
 	if ($chkLowEnd -and $chkLowEnd.Checked) { return 1080 }
 	# (10-22) Modo 45 FPS: siempre 1440p.
 	if ($chkLowEnd45 -and $chkLowEnd45.Checked) { return 1440 }
@@ -635,7 +636,7 @@ function Fill-Res {
 		# (10-22) DLSS Equilibrado y Ultra rendimiento solo a 4K: sobre 1440 caen por debajo de lo que acepta DLSS.
 		# Modo graficas de 8 GB: frame generation de AMD, asi que sin DLSS (todos los de XeSS y FSR).
 		if ($family -eq 'dlss' -and -not $script:isNvidia) { continue }  # (10-23) sin NVIDIA no hay DLSS
-		$modes = @($modes | Where-Object { $_[0] -ne 'FSR 900p (AA)' -or ($chkSoulsLow -and $chkSoulsLow.Checked) })  # (10-23) solo en low profile
+		$modes = @($modes | Where-Object { $_[0] -ne 'FSR 900p (AA)' })  # (10-23) ya no se usa: low profile = FSR AA nativo con salida de 900
 		# (10-23) Modo Souls ligero: solo el antialiasing de cada uno (DLSS DLAA, XeSS AA, FSR AA) o nativo.
 		if ($chkLowEnd -and $chkLowEnd.Checked) { $modes = @($modes | Where-Object { $_[0] -in 'DLSS DLAA', 'XeSS AA', 'FSR AA nativo' }) }
 		# (10-22) Modo graficas de 8 GB: tambien sin reescalado (1080p nativo, sin XeSS ni FSR), lo primero de la lista.
@@ -986,7 +987,7 @@ function Set-PresetLowProfile {
 	$chkAf16.Checked = $true; $chkLod.Checked = $true
 	foreach ($pc in @($script:postChecks)) { if ($pc -and $pc[0]) { $pc[0].Checked = $true } }
 	if ($cmbOut) { $cmbOut.SelectedIndex = 0 }; $chk4K.Checked = $false
-	Fill-Res; Set-ResByName 'FSR 900p (AA)'
+	Fill-Res; Set-ResByName 'FSR AA nativo'
 	$cmbSharp.SelectedIndex = 3  # (10-23) FSR con nitidez al 50 %, fija
 }
 $script:soulsModes = @($chkLowEnd, $chkLowEnd45, $chkSoulsUltra, $chkSoulsExt, $chkSoulsLow)
