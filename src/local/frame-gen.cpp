@@ -5123,7 +5123,9 @@ struct CShadowPass {
 	bool                    slot_voted[4] {};
 	float                   ema[4] {};
 	uint32_t                votes = 0;
-	int                     chosen = -1, last_chosen = -1;
+	int                     chosen = -1, last_chosen = -1, lead = -1;
+	uint32_t                lead_n = 0;
+	bool                    locked = false; // (the vote agreed once for this latched sun: space and sign fixed)
 	bool                    latched = false, switching = false, have_dir = false;
 	std::array<float, 3>    latch_axis {}, switch_axis {}, last_dir {};
 	float                   fade = 0.0f;
@@ -5550,10 +5552,16 @@ void CShadowTakeVote(uint32_t slot) {
 	const float other = std::max(g_cs.ema[best < 2 ? 2 : 0], g_cs.ema[best < 2 ? 3 : 1]); // the other interpretation's axis
 	const float keep  = std::log(1.12f), take = std::log(1.2f);
 	const int   was   = g_cs.chosen;
-	if (g_cs.votes >= 4) {
-		if (g_cs.chosen >= 0 && g_cs.ema[g_cs.chosen] < keep) g_cs.chosen = -1;
-		if (g_cs.ema[best] >= take && g_cs.ema[best] - other > 0.08f && (g_cs.chosen < 0 || g_cs.ema[best] > g_cs.ema[g_cs.chosen] + 0.1f))
-			g_cs.chosen = best;
+	(void)keep;
+	// Hysteresis: the same leader, clear of the rest, for 6 votes running; then locked (no pause, no flip) until the
+	// latched sun changes by > 10 degrees.
+	const bool clear = g_cs.ema[best] >= take && g_cs.ema[best] - other > 0.15f;
+	if (clear && best == g_cs.lead) ++g_cs.lead_n;
+	else g_cs.lead = clear ? best : -1, g_cs.lead_n = clear ? 1u : 0u;
+	if (!g_cs.locked && g_cs.votes >= 4 && g_cs.lead >= 0 && g_cs.lead_n >= 6) {
+		g_cs.chosen = g_cs.lead;
+		g_cs.locked = true;
+		std::printf("CSHADOW: light locked (candidate %d) for this sun: no re-vote until it changes\n", g_cs.chosen);
 	}
 	if (was != g_cs.chosen) {
 		static const char* names[] {"world axis +", "world axis -", "view axis +", "view axis -"};
@@ -5635,7 +5643,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	if (g_cs.latched && g_cs.switching && g_cs.fade <= 0.0f) {
 		g_cs.latch_axis = g_cs.switch_axis, g_cs.switching = false;
-		g_cs.votes = 0, g_cs.chosen = -1, g_cs.last_chosen = -1;
+		g_cs.votes = 0, g_cs.chosen = -1, g_cs.last_chosen = -1, g_cs.lead = -1, g_cs.lead_n = 0, g_cs.locked = false;
 		for (auto& e: g_cs.ema) e = 0.0f;
 		g_cs.history_valid = false;
 	}
@@ -5754,7 +5762,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// The vote: every frame until a light is chosen, then every 16th (the scene, an interior, may change).
 	const uint32_t slot = g_cs.frame % 4;
 	CShadowTakeVote(slot);
-	if (g_cs.chosen < 0 || g_cs.frame % 16 == 0) {
+	if (!g_cs.locked) {
 		command.fillBuffer(vk::Buffer(g_cs.vote), slot * 64, 64, 0);
 		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
 		       vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
