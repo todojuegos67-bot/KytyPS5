@@ -1730,6 +1730,19 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 
+static void GuestStoreTooSmall(const char* what, uint64_t len) {
+	if (PhysicalMemory::TotalSize() >= static_cast<uint64_t>(13824) * 1024 * 1024) {
+		return; // full-size store: the game's own failure, not a shrunken store
+	}
+	std::printf("Guest store too small: raise KYTY_GUEST_STORE_MB (a %s allocation of %llu MiB did not fit in a %llu MiB "
+	            "store; %lld MiB allocated, peak %lld MiB)\n",
+	            what, static_cast<unsigned long long>(len >> 20),
+	            static_cast<unsigned long long>(PhysicalMemory::TotalSize() >> 20),
+	            static_cast<long long>(g_guest_store_used.load() >> 20),
+	            static_cast<long long>(g_guest_store_peak.load() >> 20));
+	std::fflush(stdout);
+}
+
 void Initialize() {
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
