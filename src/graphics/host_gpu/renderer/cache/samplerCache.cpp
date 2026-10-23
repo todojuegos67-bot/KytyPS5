@@ -251,12 +251,39 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	// KYTY_TEXTURE_LOD_BIAS: scene textures only - mipmapped (mip filter on, a max LOD of at least 1), linear, not
 	// depth-compare (shadow maps) nor unnormalized: render targets and post-process buffers are sampled with no mips
 	// (max LOD 0) and keep the guest's bias. Added to the guest's own, clamped to the device limit.
-	if (const float extra = TextureLodBias();
-	    extra != 0.0f && sampler_info.mipmapMode == vk::SamplerMipmapMode::eLinear && sampler_info.minFilter == vk::Filter::eLinear &&
-	    r.DepthCompareFunc() == 0 && !r.ForceUnormCoords() && max_lod >= 1.0f && max_lod > min_lod)
-	{
-		static const float limit = m_graphics.physical_device_properties.limits.maxSamplerLodBias;
-		sampler_info.mipLodBias = std::clamp(sampler_info.mipLodBias + extra, -limit, limit);
+	// Also skipped: clamp-to-edge/border on both U and V - particle, smoke and decal sprites clamp while scene materials
+	// wrap or mirror; a negative bias sharpened the blurred low mips of Demon's Souls' ground mist into bright puffs.
+	// (The image's mip count/size is not known here - samplers are cached by descriptor alone.)
+	if (const float extra = TextureLodBias(); extra != 0.0f) {
+		const auto clamps = [](vk::SamplerAddressMode m) {
+			return m == vk::SamplerAddressMode::eClampToEdge || m == vk::SamplerAddressMode::eClampToBorder;
+		};
+		// counters under m_mutex: 0 applied, 1 not linear min/mip, 2 depth compare, 3 unnormalized, 4 no mips, 5 clamped UV
+		static uint32_t cnt[6] = {};
+		int reason = 0;
+		if (sampler_info.mipmapMode != vk::SamplerMipmapMode::eLinear || sampler_info.minFilter != vk::Filter::eLinear) {
+			reason = 1;
+		} else if (r.DepthCompareFunc() != 0) {
+			reason = 2;
+		} else if (r.ForceUnormCoords()) {
+			reason = 3;
+		} else if (!(max_lod >= 1.0f && max_lod > min_lod)) {
+			reason = 4;
+		} else if (clamps(sampler_info.addressModeU) && clamps(sampler_info.addressModeV)) {
+			reason = 5;
+		}
+		if (reason == 0) {
+			static const float limit = m_graphics.physical_device_properties.limits.maxSamplerLodBias;
+			sampler_info.mipLodBias = std::clamp(sampler_info.mipLodBias + extra, -limit, limit);
+		}
+		cnt[reason]++;
+		const uint32_t total = cnt[0] + cnt[1] + cnt[2] + cnt[3] + cnt[4] + cnt[5];
+		if (total <= 64 || (total & (total - 1)) == 0) {
+			std::printf("Texture LOD bias %.3f: %u samplers - applied %u, skipped: filter-not-linear %u, depth-compare %u, "
+			            "unnormalized %u, no-mips %u, clamped-uv %u\n",
+			            extra, total, cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], cnt[5]);
+			std::fflush(stdout);
+		}
 	}
 	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);
 	sampler_info.compareOp               = static_cast<vk::CompareOp>(r.DepthCompareFunc());
