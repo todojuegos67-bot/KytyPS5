@@ -476,7 +476,9 @@ std::string KbmCurvePath() {
 		dir = base;
 		SDL_free(base);
 	}
-	return dir + "kbm_curve.txt";
+	// KYTY_KBM_FASTTURN=1 raises the game's camera speed (loader/gameArgs.cpp): its own measured curve.
+	const char* fast = std::getenv("KYTY_KBM_FASTTURN");
+	return dir + (fast != nullptr && std::string_view(fast) == "1" ? "kbm_curve_fast.txt" : "kbm_curve.txt");
 }
 
 bool KbmLoadCurve(KbmCurve* c) {

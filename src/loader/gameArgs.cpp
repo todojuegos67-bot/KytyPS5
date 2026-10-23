@@ -33,6 +33,16 @@ const std::string& ExtraLines() {
 			if (first != std::string::npos && first < end && last >= first) out += "+" + list.substr(first, last - first + 1) + "\n";
 			at = end + 1;
 		}
+		// KYTY_KBM=1 with KYTY_KBM_FASTTURN=1: the camera speed option raised (KYTY_KBM_CAMSPEED, default 10) so a
+		// full-tilt stick turns faster and big mouse flicks saturate later; the KBM curve (kbm_curve_fast.txt,
+		// recalibrated with KYTY_KBM_CALIBRATE=1 under this setting) keeps small movements at the same degrees per count.
+		const char* kbm  = std::getenv("KYTY_KBM");
+		const char* fast = std::getenv("KYTY_KBM_FASTTURN");
+		if (kbm != nullptr && std::string(kbm) == "1" && fast != nullptr && std::string(fast) == "1" &&
+		    list.find("cp11_Setting_CameraSpeed") == std::string::npos) {
+			const char* speed = std::getenv("KYTY_KBM_CAMSPEED");
+			out += std::string("+cp11_Setting_CameraSpeed=") + (speed != nullptr && *speed != 0 ? speed : "10") + "\n";
+		}
 		return out;
 	}();
 	return lines;
