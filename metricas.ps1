@@ -448,13 +448,9 @@ $timer.Add_Tick({
 			if ($fps -and $fps.fgMult) { $rows.Add(@('FG ahora', "x$($fps.fgMult)", $fgCol)) }
 		}
 	}
-	# Opciones graficas del lanzador (Maximo / Medio / Bajo).
-	$names = @('Maximo', 'Alto', 'Medio', 'Bajo')
-	foreach ($pair in @(@('gfxtex', 'Texturas'), @('gfxdist', 'Distancia'), @('gfxshadow', 'Sombras'))) {
-		if (-not $ini.ContainsKey($pair[0]) -and $ini.Count -eq 0) { continue }
-		$v = 0; [void][int]::TryParse("$($ini[$pair[0]])", [ref]$v)
-		$rows.Add(@($pair[1], $names[[math]::Min([math]::Max($v, 0), 2)], $cKhaki))
-	}
+	# (10-23) Solo el modo grafico elegido en el lanzador (Modo Souls o Personalizado).
+	$modo = "$($ini['soulsmodo'])"
+	if ($modo) { $rows.Add(@('', $modo, $cKhaki)) }
 	$script:rows = $rows.ToArray()
 	$script:fpsText = $(if ($fps -and $shownFps) { "FPS $shownFps" } else { '' })
 	# FPS en el color del frame generation: verde NVIDIA, rojo AMD, blanco sin frame generation.

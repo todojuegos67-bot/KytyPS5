@@ -217,6 +217,8 @@ function Start-Game {
 	$fgConfig = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	if (Is-FixedFg) { $fgConfig = 'fsr3.json'; $sets += $(if ($chkLowEnd45.Checked) { 'KYTY_FLIP_FPS=45' } else { 'KYTY_FLIP_FPS=30' }) }
 	# Nombre del modo de frame generation para las metricas.
+	# (10-23) El modo grafico para las metricas.
+	Set-IniValue 'soulsmodo' $(if ($chkLowEnd.Checked) { 'Souls light mode' } elseif ($chkLowEnd45.Checked) { 'Souls balanced mode' } elseif ($chkSoulsUltra.Checked) { 'Souls ultra mode' } elseif ($chkSoulsExt.Checked) { 'Souls extreme mode' } elseif ($chkSoulsLow.Checked) { 'Souls PC low profile mode' } else { 'Custom' })
 	if ($chkLowEnd45.Checked) { Set-IniValue 'fglabel' 'MODE SOULS BALANCED' } elseif ($chkLowEnd.Checked) { Set-IniValue 'fglabel' 'MODE SOULS LIGHT' } else { Set-IniValue 'fglabel' ($fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][0].Trim()) }
 	# (10-22) FPS desbloqueados solo sin frame generation: con frame generation el juego se queda en su base (60) y el
 	# multiplicador llega al monitor; desbloqueado (110 reales x3 = 330) se pasaba de los 240 Hz y salia de G-Sync.
