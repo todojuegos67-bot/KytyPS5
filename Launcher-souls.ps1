@@ -218,7 +218,7 @@ function Start-Game {
 		$psargs += '-AntiLag'
 		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y
 		# con DLSS Frame Generation, Reflex en modo Boost.
-		$sets += 'KYTY_FRAME_PIPELINE=0'
+		# (10-23 tarde) KYTY_FRAME_PIPELINE=0 quitado: a 4K bajaba de ~45 a 35 reales (y x3 a 20): limitaba los FPS.
 		if ($config -like 'dlss*') { $sets += 'KYTY_DLSSG_REFLEX=boost' }
 	}
 	if ($cmbRt.SelectedIndex -gt 0) { $psargs += @('-Ssgi', "$($cmbRt.SelectedIndex)") }
@@ -542,7 +542,7 @@ $tips.SetToolTip($chkLowEnd45, 'Para graficas de la potencia de una RTX 3080: RT
 $panel.Controls.Add($chkLowEnd45)
 # (10-22) Solo uno de los dos modos a la vez (si ya estaban los dos en el ini, gana el de 30).
 if ($chkLowEnd.Checked -and $chkLowEnd45.Checked) { $chkLowEnd45.Checked = $false }
-$tips.SetToolTip($chkAntiLag, 'Menos retraso en los controles y el raton: sin frame preparado por adelantado (unos 18 ms menos, algo menos de FPS), AMD Anti-Lag 2 en graficas AMD y Reflex Boost con DLSS Frame Generation.')
+$tips.SetToolTip($chkAntiLag, 'Menos retraso en los controles y el raton: AMD Anti-Lag 2 en graficas AMD y Reflex Boost con DLSS Frame Generation.')
 $panel.Controls.Add($chkAntiLag)
 $chk4K = New-Check 'Modo 4K' 0 0 120 'modo4k'
 $tips.SetToolTip($chk4K, 'El juego arranca en su modo cinematico a 4K (como en PS5). Con un reescalador, su resolucion se calcula para 4K.')
