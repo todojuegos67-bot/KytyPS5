@@ -638,7 +638,7 @@ function Fill-Res {
 		if ($family -eq 'dlss' -and -not $script:isNvidia) { continue }  # (10-23) sin NVIDIA no hay DLSS
 		$modes = @($modes | Where-Object { $_[0] -ne 'FSR 900p (AA)' })  # (10-23) ya no se usa: low profile = FSR AA nativo con salida de 900
 		# (10-23) Modo Souls ligero: solo el antialiasing de cada uno (DLSS DLAA, XeSS AA, FSR AA) o nativo.
-		if ($chkLowEnd -and $chkLowEnd.Checked) { $modes = @($modes | Where-Object { $_[0] -in 'DLSS DLAA', 'XeSS AA', 'FSR AA native' }) }
+		if (($chkLowEnd -and $chkLowEnd.Checked) -or ($chkSoulsLow -and $chkSoulsLow.Checked)) { $modes = @($modes | Where-Object { $_[0] -in 'DLSS DLAA', 'XeSS AA', 'FSR AA native' }) }
 		# (10-22) Modo graficas de 8 GB: tambien sin reescalado (1080p nativo, sin XeSS ni FSR), lo primero de la lista.
 		if ($chkLowEnd -and $chkLowEnd.Checked -and $family -eq 'xess') { $shown += , @('No upscaling (1080p native)', 1080, '', 0) }
 		$outH = Get-OutHeight
@@ -1006,7 +1006,8 @@ foreach ($m in @($chkSoulsUltra, $chkSoulsExt)) {
 foreach ($m in @($chkLowEnd, $chkLowEnd45)) { $m.Add_CheckedChanged({ param($sender, $e) if ($sender.Checked) { $chkSoulsUltra.Checked = $false; $chkSoulsExt.Checked = $false; $chkSoulsLow.Checked = $false } }) }
 $chkGpu8.Add_CheckedChanged({ if ($chkGpu8.Checked) { Set-PresetLight } else { Set-PresetMax } })
 # (10-23) Modo Souls ligero y PC low profile: resolucion fija (no se puede cambiar el reescalado).
-function Update-ResLock { $lock = $chkSoulsLow.Checked; if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'No upscaling (1080p native)' }; $cmbRes.Enabled = -not $lock 
+function Update-ResLock { $lock = $false;  # (10-23) low profile: el AA se elige (solo modos AA a 900)
+ if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'No upscaling (1080p native)' }; $cmbRes.Enabled = -not $lock 
 	# (10-23) PC low profile: todo fijo (salida, graficos y casillas), nada se puede cambiar.
 	$low = $chkSoulsLow.Checked
 	$cmbFg.Enabled = -not (Is-FixedFg)  # (10-23) ligero / equilibrado / low profile: FG fija (antes esta funcion la volvia a activar)
