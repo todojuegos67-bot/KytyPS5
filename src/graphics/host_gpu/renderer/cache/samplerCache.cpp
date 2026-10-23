@@ -102,6 +102,9 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	};
 
 	const bool aniso = is_aniso_filter(mag_filter) || is_aniso_filter(min_filter);
+	// set below: the guest itself asks for anisotropic filtering (ratio > 1) - Demon's Souls' surface materials do,
+	// its fog/noise/particle textures don't
+	bool guest_aniso = false;
 	if (aniso) {
 		switch (static_cast<Prospero::SamplerAnisoRatio>(r.MaxAnisoRatio())) {
 			case Prospero::SamplerAnisoRatio::kOne: aniso_ratio = 1.0f; break;
@@ -201,6 +204,7 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	sampler_info.addressModeW = to_vk_address_mode(r.ClampZ());
 	sampler_info.mipLodBias =
 	    static_cast<float>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)) / 256.0f;
+	guest_aniso = aniso && aniso_ratio > 1.0f;
 	sampler_info.anisotropyEnable        = (aniso ? VK_TRUE : VK_FALSE);
 	sampler_info.maxAnisotropy           = aniso_ratio;
 	// KYTY_FORCE_AF=2..16 (launcher "Filtrado x16"): forced only on scene texture samplers - the same filter as
@@ -216,10 +220,15 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		}();
 		if (force_af > 0.0f) {
 			// counters under m_mutex: 0 applied, 1 min/mag not linear, 2 mip not linear, 3 depth compare,
-			// 4 unnormalized, 5 no mips (MaxLod < 1 or <= MinLod), 6 guest aniso already >= forced
-			static uint32_t cnt[7] = {};
-			static const char* const names[7] = {"applied", "filter-not-linear", "mip-not-linear", "depth-compare",
-			                                     "unnormalized", "no-mips", "guest-aniso"};
+			// 4 unnormalized, 5 no mips (MaxLod < 1 or <= MinLod), 6 guest aniso already >= forced,
+			// 7 KYTY_FORCE_AF_STRICT=1 and the guest asks for no aniso
+			static const bool strict = [] {
+				const char* e = std::getenv("KYTY_FORCE_AF_STRICT");
+				return e != nullptr && e[0] == '1';
+			}();
+			static uint32_t cnt[8] = {};
+			static const char* const names[8] = {"applied", "filter-not-linear", "mip-not-linear", "depth-compare",
+			                                     "unnormalized", "no-mips", "guest-aniso", "no-guest-aniso"};
 			int reason = 0;
 			if (sampler_info.minFilter != vk::Filter::eLinear || sampler_info.magFilter != vk::Filter::eLinear) {
 				reason = 1;
@@ -231,6 +240,8 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 				reason = 4;
 			} else if (!(max_lod >= 1.0f && max_lod > min_lod)) {
 				reason = 5;
+			} else if (strict && !guest_aniso) {
+				reason = 7;
 			} else if (!(force_af > sampler_info.maxAnisotropy)) {
 				reason = 6;
 			}
@@ -238,12 +249,13 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 				sampler_info.anisotropyEnable = VK_TRUE;
 				sampler_info.maxAnisotropy    = force_af;
 			}
-			const uint32_t total = 0u + cnt[0] + cnt[1] + cnt[2] + cnt[3] + cnt[4] + cnt[5] + cnt[6] + 1u;
+			const uint32_t total = 0u + cnt[0] + cnt[1] + cnt[2] + cnt[3] + cnt[4] + cnt[5] + cnt[6] + cnt[7] + 1u;
 			cnt[reason]++;
 			if (total <= 64 || (total & (total - 1)) == 0) {
-				std::printf("Force AF x%.0f: %u samplers - %s %u, skipped: %s %u, %s %u, %s %u, %s %u, %s %u, %s %u\n",
-				            force_af, total, names[0], cnt[0], names[1], cnt[1], names[2], cnt[2], names[3], cnt[3],
-				            names[4], cnt[4], names[5], cnt[5], names[6], cnt[6]);
+				std::printf("Force AF x%.0f%s: %u samplers - %s %u, skipped: %s %u, %s %u, %s %u, %s %u, %s %u, %s %u, "
+				            "%s %u\n",
+				            force_af, strict ? " strict" : "", total, names[0], cnt[0], names[1], cnt[1], names[2], cnt[2],
+				            names[3], cnt[3], names[4], cnt[4], names[5], cnt[5], names[6], cnt[6], names[7], cnt[7]);
 				std::fflush(stdout);
 			}
 		}
@@ -258,8 +270,15 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		const auto clamps = [](vk::SamplerAddressMode m) {
 			return m == vk::SamplerAddressMode::eClampToEdge || m == vk::SamplerAddressMode::eClampToBorder;
 		};
-		// counters under m_mutex: 0 applied, 1 not linear min/mip, 2 depth compare, 3 unnormalized, 4 no mips, 5 clamped UV
-		static uint32_t cnt[6] = {};
+		// Default: only samplers where the guest asks for aniso (ratio > 1) - fog/noise textures wrap, so the clamp
+		// rule alone missed them. KYTY_TEXTURE_LOD_BIAS_ALL=1: the older selection (scene filter + not UV-clamped).
+		static const bool all = [] {
+			const char* e = std::getenv("KYTY_TEXTURE_LOD_BIAS_ALL");
+			return e != nullptr && e[0] == '1';
+		}();
+		// counters under m_mutex: 0 applied, 1 not linear min/mip, 2 depth compare, 3 unnormalized, 4 no mips,
+		// 5 clamped UV (ALL mode), 6 no guest aniso (default mode)
+		static uint32_t cnt[7] = {};
 		int reason = 0;
 		if (sampler_info.mipmapMode != vk::SamplerMipmapMode::eLinear || sampler_info.minFilter != vk::Filter::eLinear) {
 			reason = 1;
@@ -269,7 +288,9 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 			reason = 3;
 		} else if (!(max_lod >= 1.0f && max_lod > min_lod)) {
 			reason = 4;
-		} else if (clamps(sampler_info.addressModeU) && clamps(sampler_info.addressModeV)) {
+		} else if (!all && !guest_aniso) {
+			reason = 6;
+		} else if (all && clamps(sampler_info.addressModeU) && clamps(sampler_info.addressModeV)) {
 			reason = 5;
 		}
 		if (reason == 0) {
@@ -277,11 +298,11 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 			sampler_info.mipLodBias = std::clamp(sampler_info.mipLodBias + extra, -limit, limit);
 		}
 		cnt[reason]++;
-		const uint32_t total = cnt[0] + cnt[1] + cnt[2] + cnt[3] + cnt[4] + cnt[5];
+		const uint32_t total = cnt[0] + cnt[1] + cnt[2] + cnt[3] + cnt[4] + cnt[5] + cnt[6];
 		if (total <= 64 || (total & (total - 1)) == 0) {
-			std::printf("Texture LOD bias %.3f: %u samplers - applied %u, skipped: filter-not-linear %u, depth-compare %u, "
-			            "unnormalized %u, no-mips %u, clamped-uv %u\n",
-			            extra, total, cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], cnt[5]);
+			std::printf("Texture LOD bias %.3f (%s): %u samplers - applied %u, skipped: filter-not-linear %u, "
+			            "depth-compare %u, unnormalized %u, no-mips %u, clamped-uv %u, no-guest-aniso %u\n",
+			            extra, all ? "all" : "guest-aniso", total, cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], cnt[5], cnt[6]);
 			std::fflush(stdout);
 		}
 	}
