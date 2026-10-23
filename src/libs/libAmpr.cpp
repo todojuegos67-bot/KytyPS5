@@ -15,6 +15,7 @@
 #include "local-platform.h"
 #include "scene-tags.h"
 #include "slow-log.h"
+#include "soft-release.h"
 
 #include <algorithm>
 #include <array>
@@ -1613,7 +1614,9 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		// waited 330 ms behind the write-back of a store just precompiled).
 		if (readable <= APR_STREAM_PIECE_SIZE && kept_size >= APR_PREFETCH_MIN_FILE_SIZE && kept_size <= APR_PREFETCH_MAX_FILE_SIZE)
 			LocalPlatform::PrefetchKeptFile(host_path);
-		thread_local std::vector<uint8_t> kept_buffer;
+		thread_local SoftRelease::Scratch kept_scratch("file read buffer");
+		const auto                        kept_hold   = kept_scratch.Use();
+		auto&                             kept_buffer = kept_scratch.bytes;
 		kept_buffer.resize(static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
 		const bool prepared = LibKernel::Memory::PrepareHostOverwrite(destination, readable);
 		while (*bytes_read < readable) {

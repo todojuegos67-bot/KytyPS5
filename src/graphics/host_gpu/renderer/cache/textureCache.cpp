@@ -45,6 +45,7 @@
 #include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 #include "speculation-state.h"
+#include "soft-release.h"
 
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_image_granules_mode {0};
@@ -2370,7 +2371,10 @@ void DirtyRowBands(const std::vector<std::pair<uint64_t, uint64_t>>& dirty, uint
 	if (const auto* data = LibKernel::Memory::TryGetBackingPointer(vaddr, size)) {
 		return XXH3_64bits(data, static_cast<size_t>(size));
 	}
-	thread_local std::vector<uint8_t> bytes;
+	// (A copy of the texture's guest bytes, up to hundreds of MiB, kept by the thread: KYTY_SOFT_RELEASE frees it idle.)
+	thread_local SoftRelease::Scratch scratch("texture hash copy");
+	const auto                        hold  = scratch.Use();
+	auto&                             bytes = scratch.bytes;
 	bytes.resize(size);
 	if (!LibKernel::Memory::TryReadBacking(vaddr, bytes.data(), size) &&
 	    !LibKernel::Memory::TryReadPrtBacking(vaddr, bytes.data(), size)) {

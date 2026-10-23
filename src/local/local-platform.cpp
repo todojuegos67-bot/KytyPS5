@@ -1900,12 +1900,6 @@ void KeepResident() {
 		const char* text = std::getenv("KYTY_RESIDENT_MB");
 		const auto  mb   = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
 		if (mb == 0) return;
-		// KYTY_SOFT_RELEASE=1: no SetProcessWorkingSetSize of any kind (the working set left to Windows).
-		if (const char* soft = std::getenv("KYTY_SOFT_RELEASE"); soft != nullptr && soft[0] == '1') {
-			std::printf("Memory: KYTY_RESIDENT_MB ignored (KYTY_SOFT_RELEASE=1)\n");
-			std::fflush(stdout);
-			return;
-		}
 		const SIZE_T minimum = static_cast<SIZE_T>(mb << 20u);
 		// (The maximum soft: the process may grow past it; the minimum hard: Windows keeps that much in RAM.)
 		const SIZE_T maximum = minimum + (SIZE_T {512} << 20u);

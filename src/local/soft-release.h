@@ -9,7 +9,10 @@
 //   - each registered source's free memory dropped (MEM_RESET / DiscardVirtualMemory / MEM_DECOMMIT, its own choice).
 // It runs at low memory priority (its own thread only; the process's priority is left alone). Each pass logs the
 // MiB released (private bytes before less after) and the total. The guest's memory is never touched.
+#include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <vector>
 
 namespace SoftRelease {
 
@@ -26,6 +29,28 @@ void LowerThreadMemoryPriority();
 // Helpers for sources: drop the pages of [address, address + size) whose contents are no longer needed (they stay
 // committed; the next write gets zero or old bytes). Page-aligned inside; returns the bytes covered.
 uint64_t DiscardPages(void* address, uint64_t size);
+
+// A thread's reusable byte buffer (one per thread: `thread_local SoftRelease::Scratch s("name")`), which otherwise keeps
+// its largest size for good. With KYTY_SOFT_RELEASE=1 the release thread frees one idle for 10 s or more, under its own
+// lock (try_lock: one in use is skipped), and logs the MiB by source; the heap compaction after gives the pages back.
+// Off: the lock is a no-op.
+class Scratch {
+public:
+	explicit Scratch(const char* source);
+	~Scratch();
+	Scratch(const Scratch&)            = delete;
+	Scratch& operator=(const Scratch&) = delete;
+	// Held while `bytes` is used (the buffer may be freed between uses).
+	[[nodiscard]] std::unique_lock<std::mutex> Use();
+	std::vector<uint8_t> bytes;
+
+	// (The release thread's.)
+	uint64_t ReleaseIfIdle(int64_t now_ns);
+	const char* const     source;
+	std::mutex            mutex;
+	std::atomic<int64_t>  last_use_ns {0};
+	bool                  registered = false;
+};
 
 } // namespace SoftRelease
 

@@ -7,6 +7,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <map>
+#include <string>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -26,6 +29,12 @@ namespace SoftRelease {
 namespace {
 std::mutex                                               g_mutex;
 std::vector<std::pair<const char*, uint64_t (*)()>>      g_sources;
+std::mutex                                               g_scratch_mutex;
+std::vector<Scratch*>                                    g_scratches;
+
+int64_t NowNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 #if defined(_WIN32)
 // (private bytes, working set)
@@ -74,6 +83,35 @@ void Register(const char* name, uint64_t (*release)()) {
 	g_sources.emplace_back(name, release);
 }
 
+Scratch::Scratch(const char* name): source(name) {
+	if (!Enabled()) return;
+	std::lock_guard lock(g_scratch_mutex);
+	g_scratches.push_back(this);
+	registered = true;
+}
+
+Scratch::~Scratch() {
+	if (!registered) return;
+	std::lock_guard lock(g_scratch_mutex);
+	g_scratches.erase(std::remove(g_scratches.begin(), g_scratches.end(), this), g_scratches.end());
+}
+
+std::unique_lock<std::mutex> Scratch::Use() {
+	if (!registered) return {};
+	last_use_ns.store(NowNs(), std::memory_order_relaxed);
+	return std::unique_lock<std::mutex>(mutex);
+}
+
+uint64_t Scratch::ReleaseIfIdle(int64_t now_ns) {
+	if (now_ns - last_use_ns.load(std::memory_order_relaxed) < 10'000'000'000ll) return 0;
+	std::unique_lock lock(mutex, std::try_to_lock);
+	if (!lock.owns_lock()) return 0;
+	const uint64_t capacity = bytes.capacity();
+	if (capacity < (64u << 10u)) return 0;
+	std::vector<uint8_t>().swap(bytes);
+	return capacity;
+}
+
 void LowerThreadMemoryPriority() {
 #if defined(_WIN32)
 	MEMORY_PRIORITY_INFORMATION info {};
@@ -115,6 +153,7 @@ void Start() {
 			SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 			LowerThreadMemoryPriority();
 			uint64_t total = 0, passes = 0, skipped = 0;
+			std::map<std::string, uint64_t> scratch_total;
 			for (;;) {
 				std::this_thread::sleep_for(std::chrono::seconds(seconds));
 				// (Busy: retried every 5 s, up to one more interval, then the next interval.)
@@ -141,6 +180,28 @@ void Start() {
 					}
 					for (const auto& [name, release]: list) sources += release();
 				}
+				// Idle scratch buffers, by source.
+				std::string by_source;
+				{
+					std::vector<std::pair<const char*, uint64_t>> freed;
+					const auto now = NowNs();
+					std::lock_guard lock(g_scratch_mutex);
+					for (auto* scratch: g_scratches) {
+						const uint64_t bytes = scratch->ReleaseIfIdle(now);
+						if (bytes == 0) continue;
+						auto it = std::find_if(freed.begin(), freed.end(),
+						                       [&](const auto& e) { return std::strcmp(e.first, scratch->source) == 0; });
+						if (it == freed.end()) freed.emplace_back(scratch->source, bytes);
+						else it->second += bytes;
+					}
+					for (const auto& [name, bytes]: freed) {
+						char piece[160];
+						std::snprintf(piece, sizeof(piece), "%s%s %.1f MiB", by_source.empty() ? "" : ", ", name,
+						              static_cast<double>(bytes) / 1048576.0);
+						by_source += piece;
+						scratch_total[name] += bytes;
+					}
+				}
 				const size_t   heaps    = CompactHeaps();
 				const auto [after, ws_after] = Usage();
 				// (Released: the commit dropped, or the resident pages dropped by discards, whichever is more.)
@@ -148,6 +209,16 @@ void Start() {
 				                                             ws_before > ws_after ? ws_before - ws_after : 0);
 				total += released;
 				++passes;
+				if (!by_source.empty()) {
+					std::string totals;
+					for (const auto& [name, bytes]: scratch_total) {
+						char piece[160];
+						std::snprintf(piece, sizeof(piece), "%s%s %llu MiB", totals.empty() ? "" : ", ", name.c_str(),
+						              static_cast<unsigned long long>(bytes >> 20u));
+						totals += piece;
+					}
+					std::printf("Soft release: idle scratch freed: %s (in all: %s)\n", by_source.c_str(), totals.c_str());
+				}
 				if (passes <= 8 || released >= (16ull << 20u) || passes % 20 == 0) {
 					std::printf("Soft release: pass %llu released %llu MiB (heaps %zu, sources discarded %llu MiB), "
 					            "%llu MiB in all; private %llu MiB, working set %llu MiB\n",
