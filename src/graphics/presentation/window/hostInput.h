@@ -11,6 +11,11 @@ void               HostInputInit();
 void               HostInputKey(int key_code, bool down);
 void               HostInputMouseButton(uint8_t mouse_button, bool down);
 void               HostInputToggleMouseToJoystick();
+// KYTY_KBM=1: keyboard and mouse play (hostInput.cpp). The motion/wheel calls return true when they took the event.
+[[nodiscard]] bool HostInputKbmEnabled();
+void               HostInputFocus(bool focused);
+bool               HostInputMouseMotion(int dx, int dy);
+bool               HostInputMouseWheel(int y);
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event);
 
 } // namespace Libs::Graphics

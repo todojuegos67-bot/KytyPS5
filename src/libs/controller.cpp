@@ -150,6 +150,21 @@ struct ScriptedInput {
 	std::atomic<uint32_t>               buttons {0};
 };
 static ScriptedInput g_scripted;
+static std::atomic<RightStickProvider> g_right_stick_provider {nullptr};
+
+// Once per guest read: the mouse's stick (KYTY_KBM) over every state this read returns.
+static void ApplyRightStickProvider(ControllerState* states, int num) {
+	const auto provider = g_right_stick_provider.load(std::memory_order_acquire);
+	int        x        = 128;
+	int        y        = 128;
+	if (provider == nullptr || !provider(&x, &y)) {
+		return;
+	}
+	for (int i = 0; i < num; i++) {
+		states[i].axes[static_cast<int>(Axis::RightX)] = x;
+		states[i].axes[static_cast<int>(Axis::RightY)] = y;
+	}
+}
 
 static int64_t SteadyNanoseconds() {
 	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -696,6 +711,10 @@ void SetScriptedInput(int left_x, int left_y, int right_x, int right_y, uint32_t
 	}
 }
 
+void SetRightStickProvider(RightStickProvider provider) {
+	g_right_stick_provider.store(provider, std::memory_order_release);
+}
+
 void ResetInputState() {
 	g_controller->ResetInputState();
 }
@@ -835,6 +854,7 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	ControllerState state;
 
 	g_controller->ReadState(&state, &connected, &connected_count);
+	ApplyRightStickProvider(&state, 1);
 
 	pad_fill_data(data, state, connected, connected_count);
 
@@ -867,6 +887,7 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 		}
 		ret_num = 1;
 	}
+	ApplyRightStickProvider(states, ret_num);
 
 	for (int i = 0; i < ret_num; i++) {
 		pad_fill_data(&data[i], states[i], connected, connected_count);

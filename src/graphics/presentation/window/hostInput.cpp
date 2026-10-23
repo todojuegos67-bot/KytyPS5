@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <vector>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -345,13 +347,315 @@ bool SetRelativeMouseMode(bool enabled) {
 	LOGF("Mouse-to-joystick relative mode failed: %s\n", SDL_GetError());
 	return false;
 }
+
+// ---- KYTY_KBM=1: keyboard and mouse play (opt-in; without it nothing below runs) ----
+// The mouse: relative mode (SDL reads Windows Raw Input, WM_INPUT, unaccelerated counts), the cursor hidden and
+// confined (window grab, ClipCursor); Esc or losing focus releases it, a click takes it again. Counts accumulate
+// (1/65536 count fixed point) and become the right stick once per guest pad read: deflection = sensitivity *
+// rate / KBM_FULL_RATE, curve ^exponent, an anti-deadzone floor, the counts a saturated stick cannot show yet carried
+// to the next read. Without counts the stick decays to centre (KYTY_KBM_DECAY_MS). Once a second the log has the
+// counts received, applied and pending.
+constexpr double KBM_FULL_RATE = 2000.0; // counts/s for a full deflection at sensitivity 1
+constexpr int64_t KBM_ONE      = 65536;
+
+enum KbmPseudo : std::size_t { KBM_WALK = CONTROL_INFO.size() + 1 };
+
+struct KbmBinding {
+	SDL_Keycode key          = SDLK_UNKNOWN;
+	uint8_t     mouse_button = 0;  // SDL_BUTTON_*; 100/101: wheel up/down
+	bool        shift        = false;
+	std::size_t control      = INVALID_CONTROL;
+};
+
+struct KbmState {
+	bool                    enabled  = false;
+	float                   sens     = 1.0f;
+	float                   expo     = 1.0f;
+	float                   adz      = 0.15f;
+	float                   decay_ms = 25.0f;
+	float                   walk     = 0.5f;
+	std::vector<KbmBinding> bindings;
+	bool                    captured = false;
+	bool                    walking  = false;
+	std::array<std::size_t, 8> held_mouse {}; // the control each mouse button pressed (released with it)
+	std::array<bool, 4>     stick_keys {};    // left, right, up, down
+	std::atomic<int64_t>    acc_x {0};
+	std::atomic<int64_t>    acc_y {0};
+	std::atomic<int64_t>    received {0};
+	std::atomic<int64_t>    applied {0};
+	std::atomic<int64_t>    wheel_release_ns {0};
+	std::atomic<uint32_t>   wheel_control {0};
+	// Guest pad thread only:
+	int64_t last_ns = 0;
+	int64_t log_ns  = 0;
+	int     polls   = 0;
+	double  out_x   = 0.0;
+	double  out_y   = 0.0;
+};
+
+KbmState g_kbm;
+
+int64_t KbmNow() {
+	return static_cast<int64_t>(SDL_GetPerformanceCounter() * 1e9 / static_cast<double>(SDL_GetPerformanceFrequency()));
+}
+
+float EnvFloat(const char* name, float def, float lo, float hi) {
+	const char* v = std::getenv(name);
+	if (v == nullptr || *v == '\0') return def;
+	const float f = std::strtof(v, nullptr);
+	return std::isfinite(f) ? std::clamp(f, lo, hi) : def;
+}
+
+bool KbmParse(std::string_view entry, KbmBinding* out) {
+	const auto split = entry.find('=');
+	if (split == std::string_view::npos) return false;
+	const auto control = entry.substr(0, split);
+	auto       host    = entry.substr(split + 1);
+	KbmBinding b;
+	b.control = control == "Walk" ? static_cast<std::size_t>(KBM_WALK) : ControlFromName(control);
+	if (b.control == INVALID_CONTROL) return false;
+	if (host == "None" || host.empty()) {
+		b.key = SDLK_UNKNOWN;
+		*out  = b;
+		return true;
+	}
+	if (host.starts_with("Shift+")) {
+		b.shift = true;
+		host    = host.substr(6);
+	}
+	if (host == "Mouse:WheelUp") {
+		b.mouse_button = 100;
+	} else if (host == "Mouse:WheelDown") {
+		b.mouse_button = 101;
+	} else {
+		b.mouse_button = MouseButtonFromName(host);
+	}
+	if (b.mouse_button == 0) {
+		b.key = NormalizeKey(SDL_GetKeyFromName(std::string(host).c_str()));
+		if (b.key == SDLK_UNKNOWN) return false;
+	}
+	*out = b;
+	return true;
+}
+
+constexpr std::string_view KBM_DEFAULTS =
+    "LeftStickUp=W;LeftStickDown=S;LeftStickLeft=A;LeftStickRight=D;Walk=Left Ctrl;"
+    "R1=Mouse:Left;L1=Mouse:Right;R2=Shift+Mouse:Left;L2=Shift+Mouse:Right;"
+    "R3=Mouse:Middle;R3=Mouse:WheelUp;R3=Mouse:WheelDown;"
+    "Circle=Space;Square=E;Cross=F;Triangle=G;Left=Q;Right=R;"
+    "Up=1;Down=2;Left=3;Right=4;Options=Tab;TouchPad=Backspace";
+
+void KbmAddList(std::string_view list, bool user) {
+	std::vector<std::size_t> replaced;
+	while (!list.empty()) {
+		const auto end   = list.find(';');
+		const auto entry = list.substr(0, end);
+		list             = end == std::string_view::npos ? std::string_view {} : list.substr(end + 1);
+		if (entry.empty()) continue;
+		KbmBinding b;
+		if (!KbmParse(entry, &b)) {
+			LOGF("KYTY_KBM: ignored mapping '%s'\n", std::string(entry).c_str());
+			continue;
+		}
+		if (user && std::find(replaced.begin(), replaced.end(), b.control) == replaced.end()) {
+			// A control the user maps loses its default inputs; an input the user takes leaves its default control.
+			replaced.push_back(b.control);
+			std::erase_if(g_kbm.bindings, [&](const auto& o) { return o.control == b.control; });
+		}
+		if (user && (b.key != SDLK_UNKNOWN || b.mouse_button != 0)) {
+			std::erase_if(g_kbm.bindings, [&](const auto& o) {
+				return o.control != b.control && o.key == b.key && o.mouse_button == b.mouse_button && o.shift == b.shift;
+			});
+		}
+		if (b.key != SDLK_UNKNOWN || b.mouse_button != 0) g_kbm.bindings.push_back(b);
+	}
+}
+
+void KbmInit() {
+	const char* on = std::getenv("KYTY_KBM");
+	if (on == nullptr || std::string_view(on) != "1") return;
+	g_kbm.enabled  = true;
+	g_kbm.sens     = EnvFloat("KYTY_KBM_SENS", 1.0f, 0.05f, 20.0f);
+	g_kbm.expo     = EnvFloat("KYTY_KBM_EXP", 1.0f, 0.3f, 3.0f);
+	g_kbm.adz      = EnvFloat("KYTY_KBM_ANTIDZ", 0.15f, 0.0f, 0.6f);
+	g_kbm.decay_ms = EnvFloat("KYTY_KBM_DECAY_MS", 25.0f, 0.0f, 500.0f);
+	g_kbm.walk     = EnvFloat("KYTY_KBM_WALK", 0.5f, 0.1f, 1.0f);
+	KbmAddList(KBM_DEFAULTS, false);
+	if (const char* map = std::getenv("KYTY_KBM_MAP"); map != nullptr) KbmAddList(map, true);
+	LOGF("KYTY_KBM: keyboard and mouse on (sens %.2f, exp %.2f, antideadzone %.2f, decay %.0f ms, %zu bindings)\n",
+	     g_kbm.sens, g_kbm.expo, g_kbm.adz, g_kbm.decay_ms, g_kbm.bindings.size());
+	Controller::SetRightStickProvider(+[](int* x, int* y) -> bool {
+		auto&         k   = g_kbm;
+		const int64_t now = KbmNow();
+		double        dt  = k.last_ns == 0 ? 1.0 / 60.0 : static_cast<double>(now - k.last_ns) * 1e-9;
+		dt                = std::clamp(dt, 0.001, 0.1);
+		k.last_ns         = now;
+		k.polls++;
+
+		if (const auto rel = k.wheel_release_ns.load(std::memory_order_acquire); rel != 0 && now >= rel) {
+			k.wheel_release_ns.store(0, std::memory_order_relaxed);
+			SetButton(k.wheel_control.load(std::memory_order_relaxed), false);
+		}
+
+		const int64_t ax  = k.acc_x.load(std::memory_order_acquire);
+		const int64_t ay  = k.acc_y.load(std::memory_order_acquire);
+		const double  cx  = static_cast<double>(ax) / KBM_ONE;
+		const double  cy  = static_cast<double>(ay) / KBM_ONE;
+		const double  mag = std::hypot(cx, cy) / dt * k.sens / KBM_FULL_RATE;
+		if (mag > 0.0) {
+			// A saturated stick shows part of the counts now; the rest stays for the next read (none is dropped).
+			const double  f    = mag > 1.0 ? 1.0 / mag : 1.0;
+			const int64_t used_x = f >= 1.0 ? ax : static_cast<int64_t>(std::llround(static_cast<double>(ax) * f));
+			const int64_t used_y = f >= 1.0 ? ay : static_cast<int64_t>(std::llround(static_cast<double>(ay) * f));
+			k.acc_x.fetch_sub(used_x, std::memory_order_acq_rel);
+			k.acc_y.fetch_sub(used_y, std::memory_order_acq_rel);
+			k.applied.fetch_add(std::llabs(used_x) + std::llabs(used_y), std::memory_order_relaxed);
+			const double m   = std::min(mag, 1.0);
+			const double out = k.adz + (1.0 - k.adz) * std::pow(m, static_cast<double>(k.expo));
+			const double len = std::hypot(cx, cy);
+			k.out_x          = cx / len * out;
+			k.out_y          = cy / len * out;
+		} else if (k.decay_ms <= 0.0f) {
+			k.out_x = k.out_y = 0.0;
+		} else {
+			const double d = std::exp(-dt * 1000.0 / k.decay_ms);
+			k.out_x *= d;
+			k.out_y *= d;
+			if (std::hypot(k.out_x, k.out_y) < k.adz * 0.5 + 0.01) k.out_x = k.out_y = 0.0;
+		}
+
+		if (k.log_ns == 0) k.log_ns = now;
+		if (now - k.log_ns >= 1000000000) {
+			const auto rec = k.received.exchange(0, std::memory_order_relaxed);
+			const auto app = k.applied.exchange(0, std::memory_order_relaxed);
+			const auto pend = std::llabs(k.acc_x.load(std::memory_order_relaxed)) +
+			                  std::llabs(k.acc_y.load(std::memory_order_relaxed));
+			if (rec != 0 || app != 0) {
+				LOGF("KYTY_KBM mouse: received %.0f applied %.2f pending %.2f counts in %.2f s, %d pad reads\n",
+				     static_cast<double>(rec) / KBM_ONE, static_cast<double>(app) / KBM_ONE,
+				     static_cast<double>(pend) / KBM_ONE, (now - k.log_ns) * 1e-9, k.polls);
+			}
+			k.log_ns = now;
+			k.polls  = 0;
+		}
+
+		if (!k.captured && k.out_x == 0.0 && k.out_y == 0.0) return false;
+		if (k.out_x == 0.0 && k.out_y == 0.0) return false; // centred: the host pad's stick stays usable
+		*x = std::clamp(static_cast<int>(std::lround(128.0 + k.out_x * 127.5)), 0, 255);
+		*y = std::clamp(static_cast<int>(std::lround(128.0 + k.out_y * 127.5)), 0, 255);
+		return true;
+	});
+}
+
+void KbmCapture(bool on) {
+	if (!g_kbm.enabled || g_kbm.captured == on) return;
+	SDL_Window* window = SDL_GetKeyboardFocus();
+	if (on && window == nullptr) return;
+	if (SDL_SetRelativeMouseMode(on ? SDL_TRUE : SDL_FALSE) != 0) {
+		LOGF("KYTY_KBM: relative mouse mode failed: %s\n", SDL_GetError());
+		return;
+	}
+	if (window != nullptr) SDL_SetWindowGrab(window, on ? SDL_TRUE : SDL_FALSE);
+	g_kbm.captured = on;
+	if (!on) {
+		g_kbm.acc_x.store(0);
+		g_kbm.acc_y.store(0);
+	}
+	LOGF("KYTY_KBM: mouse %s\n", on ? "captured (Esc releases)" : "released (click to capture)");
+}
+
+void KbmLeftStick() {
+	const auto& s     = g_kbm.stick_keys;
+	const int   reach = g_kbm.walking ? static_cast<int>(std::lround(127.0f * g_kbm.walk)) : 127;
+	const auto  value = [reach](bool neg, bool pos) { return neg == pos ? 128 : (neg ? 128 - reach - 1 : 128 + reach); };
+	Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, Controller::Axis::LeftX,
+	                    std::clamp(value(s[0], s[1]), 0, 255));
+	Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, Controller::Axis::LeftY,
+	                    std::clamp(value(s[2], s[3]), 0, 255));
+}
+
+void KbmControl(std::size_t control, bool down) {
+	if (control == KBM_WALK) {
+		g_kbm.walking = down;
+		KbmLeftStick();
+		return;
+	}
+	if (control >= CONTROL_INFO.size()) return;
+	const auto& info = CONTROL_INFO[control];
+	if (info.axis == Controller::Axis::LeftX || info.axis == Controller::Axis::LeftY) {
+		const std::size_t i = (info.axis == Controller::Axis::LeftX ? 0 : 2) + (info.positive ? 1 : 0);
+		g_kbm.stick_keys[i] = down;
+		KbmLeftStick();
+		return;
+	}
+	SetControl(control, down);
+}
+
+const KbmBinding* KbmFind(SDL_Keycode key, uint8_t mouse_button, bool shift) {
+	const KbmBinding* plain = nullptr;
+	for (const auto& b: g_kbm.bindings) {
+		if (b.key == key && b.mouse_button == mouse_button) {
+			if (b.shift == shift) return &b;
+			if (!b.shift) plain = &b;
+		}
+	}
+	return plain;
+}
 } // namespace
 
 void HostInputInit() {
-	GetInputMap();
+	KbmInit();
+	if (!g_kbm.enabled) GetInputMap();
+}
+
+bool HostInputKbmEnabled() {
+	return g_kbm.enabled;
+}
+
+void HostInputFocus(bool focused) {
+	if (!g_kbm.enabled) return;
+	if (focused) {
+		KbmCapture(true);
+	} else {
+		KbmCapture(false);
+		Controller::ResetInputState();
+	}
+}
+
+bool HostInputMouseMotion(int dx, int dy) {
+	if (!g_kbm.enabled) return false;
+	if (g_kbm.captured) {
+		g_kbm.acc_x.fetch_add(static_cast<int64_t>(dx) * KBM_ONE, std::memory_order_acq_rel);
+		g_kbm.acc_y.fetch_add(static_cast<int64_t>(dy) * KBM_ONE, std::memory_order_acq_rel);
+		g_kbm.received.fetch_add((std::llabs(dx) + std::llabs(dy)) * KBM_ONE, std::memory_order_relaxed);
+	}
+	return true;
+}
+
+bool HostInputMouseWheel(int y) {
+	if (!g_kbm.enabled) return false;
+	if (!g_kbm.captured || y == 0) return true;
+	const auto* b = KbmFind(SDLK_UNKNOWN, y > 0 ? 100 : 101, (SDL_GetModState() & KMOD_SHIFT) != 0);
+	if (b != nullptr && b->control < CONTROL_INFO.size() && CONTROL_INFO[b->control].button != 0) {
+		// A notch is a short press: down now, up about 80 ms later (at a guest pad read).
+		g_kbm.wheel_control.store(CONTROL_INFO[b->control].button, std::memory_order_relaxed);
+		SetButton(CONTROL_INFO[b->control].button, true);
+		g_kbm.wheel_release_ns.store(KbmNow() + 80000000, std::memory_order_release);
+	}
+	return true;
 }
 
 void HostInputKey(int key_code, bool down) {
+	if (g_kbm.enabled) {
+		const auto key = NormalizeKey(static_cast<SDL_Keycode>(key_code));
+		if (key == SDLK_ESCAPE && g_kbm.captured) {
+			if (down) KbmCapture(false);
+			return;
+		}
+		const auto* b = KbmFind(key == SDLK_ESCAPE ? SDLK_TAB : key, 0, false); // Esc, released: Options' key
+		if (b != nullptr) KbmControl(b->control, down);
+		return;
+	}
 	const auto& map = GetInputMap();
 	if (map.Custom()) {
 		SetControl(map.FindKey(key_code), down);
@@ -361,6 +665,23 @@ void HostInputKey(int key_code, bool down) {
 }
 
 void HostInputMouseButton(uint8_t mouse_button, bool down) {
+	if (g_kbm.enabled) {
+		if (mouse_button == 0 || mouse_button >= g_kbm.held_mouse.size()) return;
+		if (!g_kbm.captured) {
+			if (down) KbmCapture(true); // the capturing click goes no further
+			return;
+		}
+		auto& held = g_kbm.held_mouse[mouse_button];
+		if (down) {
+			const auto* b = KbmFind(SDLK_UNKNOWN, mouse_button, (SDL_GetModState() & KMOD_SHIFT) != 0);
+			held          = b != nullptr ? b->control + 1 : 0;
+			if (held != 0) KbmControl(held - 1, true);
+		} else if (held != 0) {
+			KbmControl(held - 1, false);
+			held = 0;
+		}
+		return;
+	}
 	const auto& map = GetInputMap();
 	if (map.Custom() && mouse_button != 0) {
 		SetControl(map.FindMouseButton(mouse_button), down);
@@ -368,6 +689,10 @@ void HostInputMouseButton(uint8_t mouse_button, bool down) {
 }
 
 void HostInputToggleMouseToJoystick() {
+	if (g_kbm.enabled) {
+		KbmCapture(!g_kbm.captured);
+		return;
+	}
 	if (g_mouse.enabled) {
 		SetRelativeMouseMode(false);
 		CenterMouseStick();

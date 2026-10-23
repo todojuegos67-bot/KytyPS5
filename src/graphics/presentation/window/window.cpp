@@ -39,6 +39,9 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/startupProgress.h"
+#include <cstdlib>
+#include <string>
+#include <string_view>
 #include "graphics/presentation/window/windowInternal.h"
 #include "frame-gen.h"
 #include "kytyGitVersion.h"
@@ -93,6 +96,84 @@ static uint32_t ControllerButtonToPadButton(int button) {
 		case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
 		case SDL_CONTROLLER_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
 		default: return 0;
+	}
+}
+
+// KYTY_PAD_MAP (opt-in; unset: the table above): "a=Cross;b=Circle;lefttrigger=L2;back=TouchPad;...". The left side
+// is SDL's gamecontroller name (a b x y back guide start leftstick rightstick leftshoulder rightshoulder dpup dpdown
+// dpleft dpright misc1 paddle1..4 touchpad, and lefttrigger/righttrigger); the right side the PS5 control (Cross
+// Circle Square Triangle L1 R1 L2 R2 L3 R3 Options TouchPad Up Down Left Right) or None. Unlisted inputs keep theirs.
+struct PadRemap {
+	bool     active = false;
+	uint32_t button[SDL_CONTROLLER_BUTTON_MAX] {};
+	uint32_t trigger[2] {Controller::PAD_BUTTON_L2, Controller::PAD_BUTTON_R2};
+	bool     trigger_down[2] {};
+};
+
+static uint32_t PadTargetFromName(std::string_view name, bool* ok) {
+	static constexpr std::pair<std::string_view, uint32_t> names[] = {
+	    {"Cross", Controller::PAD_BUTTON_CROSS},       {"Circle", Controller::PAD_BUTTON_CIRCLE},
+	    {"Square", Controller::PAD_BUTTON_SQUARE},     {"Triangle", Controller::PAD_BUTTON_TRIANGLE},
+	    {"L1", Controller::PAD_BUTTON_L1},             {"R1", Controller::PAD_BUTTON_R1},
+	    {"L2", Controller::PAD_BUTTON_L2},             {"R2", Controller::PAD_BUTTON_R2},
+	    {"L3", Controller::PAD_BUTTON_L3},             {"R3", Controller::PAD_BUTTON_R3},
+	    {"Options", Controller::PAD_BUTTON_OPTIONS},   {"TouchPad", Controller::PAD_BUTTON_TOUCH_PAD},
+	    {"Up", Controller::PAD_BUTTON_UP},             {"Down", Controller::PAD_BUTTON_DOWN},
+	    {"Left", Controller::PAD_BUTTON_LEFT},         {"Right", Controller::PAD_BUTTON_RIGHT},
+	    {"None", 0},
+	};
+	for (const auto& [n, v]: names) {
+		if (n == name) {
+			*ok = true;
+			return v;
+		}
+	}
+	*ok = false;
+	return 0;
+}
+
+static PadRemap& GetPadRemap() {
+	static PadRemap remap = [] {
+		PadRemap r;
+		for (int i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++) r.button[i] = ControllerButtonToPadButton(i);
+		const char* env = std::getenv("KYTY_PAD_MAP");
+		if (env == nullptr || *env == '\0') return r;
+		r.active              = true;
+		std::string_view list = env;
+		while (!list.empty()) {
+			const auto end   = list.find(';');
+			const auto entry = list.substr(0, end);
+			list             = end == std::string_view::npos ? std::string_view {} : list.substr(end + 1);
+			const auto eq    = entry.find('=');
+			if (eq == std::string_view::npos) continue;
+			const std::string source(entry.substr(0, eq));
+			bool              ok     = false;
+			const uint32_t    target = PadTargetFromName(entry.substr(eq + 1), &ok);
+			if (!ok) {
+				LOGF("KYTY_PAD_MAP: unknown target in '%s'\n", std::string(entry).c_str());
+			} else if (source == "lefttrigger" || source == "righttrigger") {
+				r.trigger[source == "lefttrigger" ? 0 : 1] = target;
+			} else if (const auto b = SDL_GameControllerGetButtonFromString(source.c_str());
+			           b != SDL_CONTROLLER_BUTTON_INVALID) {
+				r.button[b] = target;
+			} else {
+				LOGF("KYTY_PAD_MAP: unknown input in '%s'\n", std::string(entry).c_str());
+			}
+		}
+		LOGF("KYTY_PAD_MAP: %s\n", env);
+		return r;
+	}();
+	return remap;
+}
+
+// A remapped press: L2/R2 as a full trigger pull (the game reads the analog value too).
+static void PadRemapPress(int id, uint32_t target, bool down) {
+	if (target == Controller::PAD_BUTTON_L2) {
+		Controller::SetAxis(id, Controller::Axis::TriggerLeft, down ? 255 : 0);
+	} else if (target == Controller::PAD_BUTTON_R2) {
+		Controller::SetAxis(id, Controller::Axis::TriggerRight, down ? 255 : 0);
+	} else if (target != 0) {
+		Controller::SetButton(id, target, down);
 	}
 }
 
@@ -248,7 +329,10 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key.down) {
 		switch (key.key_code) {
-			case SDLK_SPACE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
+			case SDLK_SPACE:
+				// KYTY_KBM: Space is a game key (roll), not pause.
+				if (!HostInputKbmEnabled()) SetPause(game, !game.paused.load(std::memory_order_acquire));
+				break;
 			// F9: a debug snapshot of the picture shown (src/local/debug-snapshot.h), the game paused; F9 again resumes.
 			case SDLK_F9:
 				if (!key.repeat) {
@@ -298,6 +382,9 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 }
 
 static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
+	// KYTY_KBM: motion and wheel go to the mouse stick (and are not logged: a 1000 Hz mouse would flood the log).
+	if (mb.motion && HostInputMouseMotion(mb.motion_x, mb.motion_y)) return;
+	if (mb.wheel && HostInputMouseWheel(mb.y)) return;
 #ifdef KYTY_DBG_INPUT
 	if (mb.wheel) {
 		LOGF("Mouse wheel: time = %.04f, %s[%d, %d]\n", mb.timestamp_seconds,
@@ -386,14 +473,34 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		SDL_GameControllerClose(SDL_GameControllerFromInstanceID(f.id));
 	}
 
-	if (f.down || f.up) {
+	if ((f.down || f.up) && GetPadRemap().active) {
+		if (f.button >= 0 && f.button < SDL_CONTROLLER_BUTTON_MAX) {
+			PadRemapPress(f.id, GetPadRemap().button[f.button], f.down);
+		}
+	} else if (f.down || f.up) {
 		const auto button = ControllerButtonToPadButton(f.button);
 		if (button != 0) {
 			Controller::SetButton(f.id, button, f.down);
 		}
 	}
 
-	if (f.axis) {
+	if (f.axis && GetPadRemap().active && ControllerAxisIsTrigger(f.axis_id)) {
+		auto&      remap    = GetPadRemap();
+		const int  side     = f.axis_id == SDL_CONTROLLER_AXIS_TRIGGERLEFT ? 0 : 1;
+		const auto natural  = side == 0 ? Controller::PAD_BUTTON_L2 : Controller::PAD_BUTTON_R2;
+		const auto target   = remap.trigger[side];
+		if (target == natural) {
+			Controller::SetAxis(f.id, ControllerAxisFromSdl(f.axis_id), ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+		} else {
+			// A trigger on another control: a press past 30%, released below 20%.
+			const int  value = ControllerAxisValueFromSdl(f.axis_id, f.axis_value);
+			const bool down  = remap.trigger_down[side] ? value > 51 : value > 76;
+			if (down != remap.trigger_down[side]) {
+				remap.trigger_down[side] = down;
+				PadRemapPress(f.id, target, down);
+			}
+		}
+	} else if (f.axis) {
 		const auto axis = ControllerAxisFromSdl(f.axis_id);
 		if (axis != Controller::Axis::AxisMax) {
 			Controller::SetAxis(f.id, axis,
@@ -491,10 +598,12 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 		case SDL_WINDOWEVENT_FOCUS_GAINED:
 			ExclusiveFullscreen::g_wanted.store(true);
 			LOGF("Window %" PRIu32 " gained keyboard focus\n", window_event.windowID);
+			HostInputFocus(true);
 			break;
 		case SDL_WINDOWEVENT_FOCUS_LOST:
 			ExclusiveFullscreen::g_wanted.store(false);
 			LOGF("Window %" PRIu32 " lost keyboard focus\n", window_event.windowID);
+			HostInputFocus(false);
 			break;
 		case SDL_WINDOWEVENT_CLOSE:
 			LOGF("Window %" PRIu32 " closed\n", window_event.windowID);
