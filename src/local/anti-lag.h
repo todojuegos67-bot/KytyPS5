@@ -43,6 +43,13 @@ void OnInput();
 // Right before the frame's present (a new frame, not a repeat): its PRESENT mark.
 void OnPresent(uint64_t frame_index);
 
+// KYTY_LOWLAT=1: the emulator's own latency limiter (no Reflex / Anti-Lag / Streamline, nothing on any swapchain or
+// present). Each guest flip records the host GPU timeline tick (MasterSemaphore, lane 0) of its frame's last submission;
+// at the controller read of the next frame the game's thread waits (vkWaitSemaphores, at most 50 ms, no lock held)
+// until no more than KYTY_LOWLAT_QUEUE (1|2, default 2) real frames are still on the GPU.
+[[nodiscard]] bool OwnLowLatencyOn();
+void               OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick);
+
 } // namespace Libs::Graphics::AntiLag
 
 #endif

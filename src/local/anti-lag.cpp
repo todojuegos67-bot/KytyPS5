@@ -17,6 +17,26 @@ namespace Libs::Graphics::AntiLag {
 
 // VK_AMD_anti_lag, declared here (older Vulkan headers do not have it; the values are the registry's).
 namespace {
+struct OwnState {
+	bool     on    = false;
+	uint32_t queue = 2;
+	OwnState() {
+		const char* v = std::getenv("KYTY_LOWLAT");
+		on            = v != nullptr && v[0] == '1';
+		if (const char* q = std::getenv("KYTY_LOWLAT_QUEUE"); q != nullptr && q[0] == '1') queue = 1;
+		if (on) {
+			std::printf("Low latency (own): on, max %u frames queued at the controller read\n", queue);
+			std::fflush(stdout);
+		}
+	}
+};
+std::atomic<PFN_vkWaitSemaphores> g_own_wait {nullptr};
+const OwnState& Own() {
+	static const OwnState state;
+	return state;
+}
+}
+namespace {
 constexpr VkStructureType kFeaturesType     = static_cast<VkStructureType>(1000476000); // ..._ANTI_LAG_FEATURES_AMD
 constexpr VkStructureType kDataType         = static_cast<VkStructureType>(1000476001); // ..._ANTI_LAG_DATA_AMD
 constexpr VkStructureType kPresentationType = static_cast<VkStructureType>(1000476002); // ..._PRESENTATION_INFO_AMD
@@ -124,6 +144,9 @@ void* ChainDeviceFeatures(bool enabled, void* next) {
 
 void OnDevice(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool extension_enabled, bool reflex_enabled) {
 	static bool logged = false;
+	if (Own().on && get_proc != nullptr) // KYTY_LOWLAT: core 1.2 (the emulator's timelines need it)
+		g_own_wait.store(reinterpret_cast<PFN_vkWaitSemaphores>(get_proc(static_cast<VkDevice>(device), "vkWaitSemaphores")),
+		                 std::memory_order_release);
 	Mode        mode   = Mode::Off;
 	const char* text   = nullptr;
 	if (!Requested()) {
@@ -176,7 +199,53 @@ void OnDevice(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool extensio
 	}
 }
 
+namespace {
+constexpr uint64_t           kOwnRing = 16;
+std::atomic<VkDevice>        g_own_device {VK_NULL_HANDLE};
+std::atomic<VkSemaphore>     g_own_timeline {VK_NULL_HANDLE};
+std::atomic<uint64_t>        g_own_ticks[kOwnRing] {};
+std::atomic<uint64_t>        g_own_frames {0}; // guest frames recorded
+std::atomic<uint64_t>        g_own_waited {0}; // the frame count the last controller read saw
+
+// The game's thread at its controller read, once per new frame: the GPU work of frame (frames - queue + 1) must be
+// complete. Only a host GPU timeline is waited for (never a present, swapchain or a lock), with a 50 ms cap.
+void OwnLimit() {
+	const uint64_t frames = g_own_frames.load(std::memory_order_acquire);
+	uint64_t       seen   = g_own_waited.load(std::memory_order_relaxed);
+	if (frames == seen || !g_own_waited.compare_exchange_strong(seen, frames, std::memory_order_acq_rel)) return;
+	const uint64_t queue = Own().queue;
+	if (frames < queue) return;
+	const uint64_t frame = frames - queue; // 0-based: frames - 1 is the newest
+	if (frames - frame > kOwnRing) return;
+	const uint64_t tick     = g_own_ticks[frame % kOwnRing].load(std::memory_order_acquire);
+	VkDevice       device   = g_own_device.load(std::memory_order_acquire);
+	VkSemaphore    timeline = g_own_timeline.load(std::memory_order_acquire);
+	auto           wait     = g_own_wait.load(std::memory_order_acquire);
+	if (tick == 0 || device == VK_NULL_HANDLE || timeline == VK_NULL_HANDLE || wait == nullptr) return;
+	VkSemaphoreWaitInfo info {};
+	info.sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+	info.semaphoreCount = 1;
+	info.pSemaphores    = &timeline;
+	info.pValues        = &tick;
+	(void)wait(device, &info, 50'000'000ull); // (timeout / device lost: the game simply goes on)
+}
+} // namespace
+
+bool OwnLowLatencyOn() {
+	return Own().on;
+}
+
+void OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick) {
+	if (!Own().on || device == VK_NULL_HANDLE || timeline == VK_NULL_HANDLE || tick == 0) return;
+	g_own_device.store(device, std::memory_order_release);
+	g_own_timeline.store(timeline, std::memory_order_release);
+	const uint64_t frame = g_own_frames.load(std::memory_order_relaxed);
+	g_own_ticks[frame % kOwnRing].store(tick, std::memory_order_release);
+	g_own_frames.store(frame + 1, std::memory_order_release);
+}
+
 void OnInput() {
+	if (Own().on) OwnLimit();
 	const Mode mode = g_mode.load(std::memory_order_relaxed);
 	if (mode == Mode::Off) return;
 	// Once per flip: the first controller read after the game flipped its last frame starts the next one.
