@@ -2914,7 +2914,13 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 	// chain makes every frame, on the frame's critical path: 0.39 ms on this thread alone, 0.24 ms shared at Latria).
 	const auto page_of = [&](uint64_t at) { return (dst_vaddr + at) / TRACKER_PAGE_SIZE - dst_vaddr / TRACKER_PAGE_SIZE; };
 	thread_local std::vector<uint8_t> differs;
-	const bool parallel = size >= ParallelCompareBytes;
+	// (Helpers only over pages no read faults on: a helper's fault waits for this thread's
+	// readback, which waits for the helpers. CopyBuffer left out GPU-modified memory, so these are
+	// the pages the texture and file offloads hold; this thread compares such a copy alone, its own
+	// faults are served here. Only this thread adds holds.)
+	const bool parallel = size >= ParallelCompareBytes &&
+	                      !Libs::LibKernel::Memory::ReadFaults(dst_vaddr, size) &&
+	                      !Libs::LibKernel::Memory::ReadFaults(src_vaddr, size);
 	if (parallel) {
 		struct Compare {
 			uint64_t dst, src, size;
