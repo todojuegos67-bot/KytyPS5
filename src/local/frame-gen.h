@@ -291,6 +291,9 @@ void OnSsrDispatch(uint64_t cs_hash, std::span<const uint64_t> addresses, std::s
 [[nodiscard]] bool SsrMaterial(SsrTarget& target, int& channel, bool& gloss);
 // The packed (R32_UINT) G-buffer targets of this frame, in render target order (renderSuperResolution.cpp): 0 = none.
 [[nodiscard]] uint32_t SsrPackedTargets(std::array<SsrTarget, 4>& targets);
+// Before a G-buffer consumer dispatch (renderCompute.cpp; the deferred lighting: the G-buffer complete, nothing else
+// written over it yet): the packed layers copied once a frame into SSR's own image, the source ssr.comp decodes.
+void SsrCaptureGbuffer(vk::CommandBuffer command, std::span<const TextureBinding> images);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

@@ -1186,6 +1186,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	               std::span {&descriptor_stage, 1u}, chain);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 9);
 	const bool continues_chain = chain && buffer.ComputeChainPending();
+	if (FrameGen::SsrWanted() && !bindings.images.empty())
+		FrameGen::SsrCaptureGbuffer(vk_buffer, std::span<const TextureBinding> {bindings.images});
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),

@@ -4619,6 +4619,15 @@ struct SsrPass {
 	uint32_t                calib_runs  = 0, calib_wait = 0;
 	bool                    calib_done  = false;
 	int32_t                 dec_normal = -1, dec_rough = -1, dec_metal = -1;
+	// The G-buffer's copy (SsrCaptureGbuffer): 4 layers R32_UINT, one view per layer, the flip it was taken in.
+	VkImage                 copy_image = VK_NULL_HANDLE;
+	VmaAllocation           copy_mem   = nullptr;
+	vk::ImageView           copy_views[4] {};
+	vk::Extent2D            copy_extent {};
+	vk::ImageLayout         copy_layout = vk::ImageLayout::eUndefined;
+	std::atomic<uint64_t>   copy_flip {~0ull};
+	bool                    copy_failed = false;
+	uint32_t                packed_logged = ~0u;
 } g_ssr;
 constexpr uint32_t SsrCalibRuns  = 24;  // calibration frames (one every 4th)
 constexpr uint32_t SsrCalibInts  = 41 + 16 * 3;
@@ -5031,9 +5040,38 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const bool have_material = inputs.material.view != nullptr && inputs.material_channel >= 0 && inputs.material_channel < 4 &&
 	                           inputs.material.extent == color.extent;
 	uint32_t packed_count = 0;
+	bool     from_copy    = false;
+	{
+		// The copy taken at the deferred lighting this flip or the last (else the live image, which later passes may
+		// have overwritten by now).
+		const uint64_t copied = g_ssr.copy_flip.load(std::memory_order_acquire);
+		const uint64_t flips  = g_flips_taken.load(std::memory_order_relaxed);
+		if (copied != ~0ull && flips <= copied + 1 && g_ssr.copy_extent == color.extent) {
+			for (uint32_t i = 0; i < 4; ++i) {
+				auto& p  = inputs.packed[i];
+				p.view   = g_ssr.copy_views[i];
+				p.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+				p.extent = g_ssr.copy_extent;
+				p.format = vk::Format::eR32Uint;
+			}
+			inputs.packed_count = 4;
+			from_copy           = true;
+		}
+	}
 	while (packed_count < inputs.packed_count && packed_count < 4 && inputs.packed[packed_count].view != nullptr &&
 	       inputs.packed[packed_count].extent == color.extent)
 		++packed_count;
+	if (const uint32_t key = packed_count * 2 + (from_copy ? 1 : 0); key != g_ssr.packed_logged) {
+		static uint32_t reports = 0;
+		if (reports++ < 8) {
+			std::printf("SSR: packed G-buffer source: %u layers, %s\n", packed_count,
+			            packed_count == 0 ? "none this frame"
+			            : from_copy       ? "copied before the deferred lighting"
+			                              : "the live image at the upscaler (may be overwritten)");
+			std::fflush(stdout);
+		}
+		g_ssr.packed_logged = key;
+	}
 	{
 		static const int32_t env_normal = SsrNormalEnv(), env_rough = SsrFieldEnv("KYTY_SSR_ROUGH"),
 		                     env_metal = SsrFieldEnv("KYTY_SSR_METAL");
@@ -5048,7 +5086,7 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 	}
 	const bool use_packed = packed_count > 0 && !have_material;
-	const bool calibrate  = use_packed && !g_ssr.calib_done && g_ssr.calib_runs < SsrCalibRuns && (g_ssr.frame & 3u) == 0;
+	const bool calibrate  = use_packed && from_copy && !g_ssr.calib_done && g_ssr.calib_runs < SsrCalibRuns && (g_ssr.frame & 3u) == 0;
 	if (use_packed && !g_ssr.calib_done && g_ssr.calib_runs >= SsrCalibRuns && ++g_ssr.calib_wait > 8) {
 		g_ssr.calib_done = true;
 		SsrAnalyze(packed_count);
@@ -5321,6 +5359,105 @@ void OnSsrDispatch(uint64_t cs_hash, std::span<const uint64_t> addresses, std::s
 	std::printf("SSR: G-buffer consumer CS %016llx (%u of %u targets):%s\n", static_cast<unsigned long long>(cs_hash), hits,
 	            g_ssr_gb.count, line.c_str());
 	std::fflush(stdout);
+}
+
+void SsrCaptureGbuffer(vk::CommandBuffer command, std::span<const TextureBinding> images) {
+	if (SsrLevel() == 0 || g_cache == nullptr || g_graphics_ctx == nullptr || g_ssr.copy_failed) return;
+	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
+	if (g_ssr.copy_flip.load(std::memory_order_relaxed) == flip) return; // (once a frame: the first consumer)
+	uint64_t address = 0;
+	uint32_t width = 0, height = 0;
+	{
+		std::lock_guard lock(g_ssr_gb.mutex);
+		if (!g_ssr_gb.valid || g_ssr_gb.count < 1 || g_ssr_gb.targets[0].view.format != vk::Format::eR32Uint) return;
+		if (flip > g_ssr_gb.flip + 1) return; // (no G-buffer pass this frame)
+		address = g_ssr_gb.targets[0].address, width = g_ssr_gb.targets[0].width, height = g_ssr_gb.targets[0].height;
+	}
+	const TextureBinding* binding = nullptr;
+	for (const auto& b: images)
+		if (b.image_id && b.desc.info.data.address == address) {
+			binding = &b;
+			break;
+		}
+	if (binding == nullptr) return;
+	auto& image = g_cache->GetImage(binding->image_id);
+	if (image.backing.image == nullptr || image.backing.format != vk::Format::eR32Uint || image.backing.layers < 4 ||
+	    image.backing.extent.width != width || image.backing.extent.height != height)
+		return;
+	const vk::Extent2D extent {width, height};
+	if (g_ssr.copy_image != VK_NULL_HANDLE && g_ssr.copy_extent != extent) return; // (one size: the first seen)
+	if (g_ssr.copy_image == VK_NULL_HANDLE) {
+		g_ssr.copy_failed = true;
+		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		create.imageType   = VK_IMAGE_TYPE_2D;
+		create.format      = VK_FORMAT_R32_UINT;
+		create.extent      = {width, height, 1};
+		create.mipLevels   = 1;
+		create.arrayLayers = 4;
+		create.samples     = VK_SAMPLE_COUNT_1_BIT;
+		create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO;
+		if (vmaCreateImage(g_graphics_ctx->allocator, &create, &allocate, &g_ssr.copy_image, &g_ssr.copy_mem, nullptr) != VK_SUCCESS) {
+			g_ssr.copy_image = VK_NULL_HANDLE;
+			return;
+		}
+		for (uint32_t i = 0; i < 4; ++i) {
+			vk::ImageViewCreateInfo view_info {};
+			view_info.image            = vk::Image(g_ssr.copy_image);
+			view_info.viewType         = vk::ImageViewType::e2D;
+			view_info.format           = vk::Format::eR32Uint;
+			view_info.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, i, 1};
+			if (g_graphics_ctx->device.createImageView(&view_info, nullptr, &g_ssr.copy_views[i]) != vk::Result::eSuccess) return;
+		}
+		g_ssr.copy_extent = extent;
+		g_ssr.copy_failed = false;
+	}
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+	LocalVulkanRecording::Drain();
+#endif
+	const ImageSubresourceRange range {0, 1, 0, 4};
+	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range, command);
+	const auto copy_barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::PipelineStageFlags2 src_stage,
+	                              vk::AccessFlags2 src_access, vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask        = src_stage;
+		barrier.srcAccessMask       = src_access;
+		barrier.dstStageMask        = dst_stage;
+		barrier.dstAccessMask       = dst_access;
+		barrier.oldLayout           = from;
+		barrier.newLayout           = to;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image               = vk::Image(g_ssr.copy_image);
+		barrier.subresourceRange    = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 4};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	copy_barrier(g_ssr.copy_layout, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllCommands,
+	             vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 4};
+	copy.dstSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 4};
+	copy.extent         = vk::Extent3D {width, height, 1};
+	command.copyImage(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, vk::Image(g_ssr.copy_image),
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+	copy_barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
+	             vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+	g_ssr.copy_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	const vk::ImageLayout back = binding->layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding->layout;
+	image.Transit(back, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range, command);
+	g_ssr.copy_flip.store(flip, std::memory_order_release);
+	static bool said = false;
+	if (!said) {
+		said = true;
+		std::printf("SSR: G-buffer copied before the deferred lighting (%ux%u x4 R32_UINT @0x%llx)\n", width, height,
+		            static_cast<unsigned long long>(address));
+		std::fflush(stdout);
+	}
 }
 
 uint32_t SsrPackedTargets(std::array<SsrTarget, 4>& targets) {
