@@ -942,14 +942,21 @@ public static class PadSdl {
 }
 "@
 }
+# (10-23) Lo que hace cada control en Demon's Souls (para el mapeo).
+$script:padAction = @{
+	'R1' = 'Ataque'; 'R2' = 'Ataque fuerte'; 'L1' = 'Bloquear'; 'L2' = 'Parry'; 'L3' = 'Pulsar stick izquierdo'; 'R3' = 'Fijar objetivo'
+	'Cross' = 'Interactuar'; 'Circle' = 'Rodar / correr'; 'Square' = 'Usar objeto'; 'Triangle' = 'Arma a dos manos'
+	'Up' = 'Cambiar magia'; 'Down' = 'Cambiar objeto'; 'Left' = 'Arma mano izquierda'; 'Right' = 'Arma mano derecha'
+	'Options' = 'Menu'; 'TouchPad' = 'Gestos'
+}
 $script:padGlyph = @{
 	'Cross' = [string][char]0x2715; 'Circle' = [string][char]0x25CB; 'Triangle' = [string][char]0x25B3; 'Square' = [string][char]0x25A1
 	'L1' = 'L1'; 'R1' = 'R1'; 'L2' = 'L2'; 'R2' = 'R2'; 'L3' = 'L3'; 'R3' = 'R3'; 'Options' = 'Options'; 'TouchPad' = 'Touchpad'
 	'Up' = [string][char]0x25B2; 'Down' = [string][char]0x25BC; 'Left' = [string][char]0x25C0; 'Right' = [string][char]0x25B6; 'None' = '-'
 }
 $script:xbLabel = @{
-	'a' = 'A'; 'b' = 'B'; 'x' = 'X'; 'y' = 'Y'; 'leftshoulder' = 'LB'; 'rightshoulder' = 'RB'; 'lefttrigger' = 'LT'; 'righttrigger' = 'RT'
-	'leftstick' = 'LS'; 'rightstick' = 'RS'; 'start' = 'Start'; 'back' = 'Select'
+	'a' = "A $([char]0x2715)"; 'b' = "B $([char]0x25CB)"; 'x' = "X $([char]0x25A1)"; 'y' = "Y $([char]0x25B3)"; 'leftshoulder' = 'LB / L1'; 'rightshoulder' = 'RB / R1'; 'lefttrigger' = 'LT / L2'; 'righttrigger' = 'RT / R2'
+	'leftstick' = 'LS L3'; 'rightstick' = 'RS R3'; 'start' = 'Start'; 'back' = 'Select'
 	'dpup' = [string][char]0x25B2; 'dpdown' = [string][char]0x25BC; 'dpleft' = [string][char]0x25C0; 'dpright' = [string][char]0x25B6
 }
 $script:xbSources = @('a', 'b', 'x', 'y', 'leftshoulder', 'rightshoulder', 'lefttrigger', 'righttrigger', 'leftstick', 'rightstick', 'start', 'back', 'dpup', 'dpdown', 'dpleft', 'dpright')
@@ -1029,7 +1036,7 @@ function Show-PadMapper {
 	$script:pmRectPs = @{}; $script:pmRectXb = @{}
 	$script:pmAll = (Get-IniValue 'padlines' '0') -eq '1'
 
-	$info = New-Label '1. Haz clic en un boton del mando de PlayStation (izquierda).   2. Pulsa el boton de tu mando o haz clic en el de la derecha.' $smallFont $gold 12 8 1220 24
+	$info = New-Label 'Paso 1: haz clic en el boton del juego que quieres mover (izquierda).   Paso 2: pulsa ese boton en tu mando, o haz clic en el de la derecha.   Las flechas doradas son los cambios.' $smallFont $gold 12 8 1220 24
 	$tPad.Controls.Add($info)
 	$canvas = New-Object System.Windows.Forms.PictureBox
 	$canvas.Location = New-Object System.Drawing.Point(8, 36); $canvas.Size = New-Object System.Drawing.Size(1236, 500); $canvas.BackColor = $back
@@ -1079,16 +1086,26 @@ function Show-PadMapper {
 		}
 		$bodyFill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(34, 38, 50))
 		$bodyPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, 222, 196, 140), 2)
-		# Cuerpos genericos: un rectangulo redondeado con dos empunaduras.
+		# (10-23) Silueta de mando con empunaduras (dibujada; un contorno continuo) y gatillos detras.
+		$trigFill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(26, 29, 38))
 		foreach ($ox in $psX, $xbX) {
-			$body = & $rr ($ox + 40) ($padY + 84) 460 200 70
-			$g.FillEllipse($bodyFill, ($ox + 44), ($padY + 200), 150, 190); $g.DrawEllipse($bodyPen, ($ox + 44), ($padY + 200), 150, 190)
-			$g.FillEllipse($bodyFill, ($ox + 346), ($padY + 200), 150, 190); $g.DrawEllipse($bodyPen, ($ox + 346), ($padY + 200), 150, 190)
-			$g.FillPath($bodyFill, $body); $g.DrawPath($bodyPen, $body)
+			$oy = $padY
+			foreach ($tx in ($ox + 70), ($ox + 340)) { $tp = & $rr $tx ($oy + 10) 130 90 26; $g.FillPath($trigFill, $tp); $g.DrawPath($bodyPen, $tp); $tp.Dispose() }
+			$body = New-Object System.Drawing.Drawing2D.GraphicsPath
+			$pts = @(@(110, 84), @(160, 76), @(380, 76), @(430, 84), @(480, 92), @(505, 120), @(512, 170), @(525, 250), @(540, 330), @(520, 375),
+				@(505, 405), @(460, 410), @(440, 385), @(420, 360), @(400, 310), @(370, 295), @(330, 285), @(210, 285), @(170, 295),
+				@(140, 310), @(120, 360), @(100, 385), @(80, 410), @(35, 405), @(20, 375), @(0, 330), @(15, 250), @(28, 170),
+				@(35, 120), @(60, 92), @(110, 84))
+			$pf = New-Object 'System.Drawing.PointF[]' $pts.Count
+			for ($q = 0; $q -lt $pts.Count; $q++) { $pf[$q] = New-Object System.Drawing.PointF(($ox + $pts[$q][0]), ($oy + $pts[$q][1])) }
+			$body.AddBeziers($pf); $body.CloseFigure()
+			$g.FillPath($bodyFill, $body); $g.DrawPath($bodyPen, $body); $body.Dispose()
 		}
+		$trigFill.Dispose()
 		$tb = New-Object System.Drawing.SolidBrush($gold)
-		$g.DrawString('Mando del juego (PS5)', $script:pmFontTitle, $tb, ($psX + 270), 22, $center)
-		$g.DrawString('Tu mando (8BitDo / Xbox)', $script:pmFontTitle, $tb, ($xbX + 270), 22, $center)
+		$g.DrawString('1. Boton del juego (mando de PS5)', $script:pmFontTitle, $tb, ($psX + 270), 22, $center)
+		$g.DrawString('2. Tu mando (Xbox, 8BitDo o DualSense)', $script:pmFontTitle, $tb, ($xbX + 270), 22, $center)
+		$g.DrawString([string][char]0x2192, $script:pmFontTitle, $tb, 630, 22, $center)
 		$g.FillEllipse($bodyFill, ($xbX + 250), ($padY + 96), 40, 40)
 		$g.DrawEllipse($bodyPen, ($xbX + 250), ($padY + 96), 40, 40)
 		$dim = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(120, 120, 120))
@@ -1127,6 +1144,20 @@ function Show-PadMapper {
 			$g.DrawBezier($pen, $x1, $y1, ($x1 - 160), ($y1 - 60), ($x2 + 160), ($y2 - 60), $x2, $y2)
 			$pen.Dispose()
 		}
+		# (10-23) Que hace cada control en Demon's Souls: los gatillos al lado, el resto al pasar el raton (abajo).
+		$capBr = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(190, 190, 180))
+		$capL = New-Object System.Drawing.StringFormat; $capL.Alignment = 'Far'; $capL.LineAlignment = 'Center'
+		$capR = New-Object System.Drawing.StringFormat; $capR.Alignment = 'Near'; $capR.LineAlignment = 'Center'
+		foreach ($k in 'L1', 'L2') { $r = $script:pmRectPs[$k]; $g.DrawString($script:padAction[$k], $script:pmFontTiny, $capBr, (New-Object System.Drawing.RectangleF(($r.X - 82), $r.Y, 78, $r.Height)), $capL) }
+		foreach ($k in 'R1', 'R2') { $r = $script:pmRectPs[$k]; $g.DrawString($script:padAction[$k], $script:pmFontTiny, $capBr, (New-Object System.Drawing.RectangleF(($r.Right + 4), $r.Y, 90, $r.Height)), $capR) }
+		$focus = if ($script:pmSel) { $script:pmSel } elseif ($script:pmHover -and $script:pmRectPs.ContainsKey($script:pmHover)) { $script:pmHover } elseif ($script:pmHover) { $script:pmMap[$script:pmHover] } else { $null }
+		if ($focus -and $script:padAction.ContainsKey($focus)) {
+			$cap = "$($script:padGlyph[$focus])  =  $($script:padAction[$focus])"
+			$cb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(230, 40, 34, 22))
+			$cr = New-Object System.Drawing.RectangleF(($psX + 110), ($padY + 410), 320, 30)
+			$g.FillRectangle($cb, $cr); $g.DrawString($cap, $script:pmFontTitle, $tb, $cr, $center); $cb.Dispose()
+		}
+		$capBr.Dispose()
 		foreach ($k in $script:pmRectPs.Keys) {
 			$hot = ($script:pmSel -eq $k) -or ($script:pmHover -eq $k)
 			& $drawBtn $k $script:pmRectPs[$k] $script:pmPsDef[$k][4] $script:padGlyph[$k] $hot (-not $used.ContainsKey($k))
@@ -1161,7 +1192,7 @@ function Show-PadMapper {
 		# Intercambio: el boton que tenia este control se queda con el que tenia el nuevo (nada se queda sin hacer).
 		foreach ($k in @($script:pmMap.Keys)) { if ($k -ne $src -and $script:pmMap[$k] -eq $script:pmSel) { $script:pmMap[$k] = $old } }
 		$script:pmMap[$src] = $script:pmSel
-		$status.Text = "Hecho: $($script:padGlyph[$script:pmSel]) del juego = boton $($script:xbLabel[$src]) de tu mando."
+		$status.Text = "Hecho: $($script:padGlyph[$script:pmSel]) ($($script:padAction[$script:pmSel])) = boton $($script:xbLabel[$src]) de tu mando."
 		$script:pmFlash = $src; $script:pmSel = $null
 		$canvas.Invalidate()
 	}
@@ -1177,7 +1208,7 @@ function Show-PadMapper {
 		if (-not $h) { $script:pmSel = $null; $status.Text = ''; $canvas.Invalidate(); return }
 		if ($h[0] -eq 'ps') {
 			$script:pmSel = $h[1]; $script:pmFlash = $null
-			$status.Text = "Elegido $($script:padGlyph[$h[1]]). Pulsa ahora el boton de tu mando (o haz clic en el de la derecha)."
+			$status.Text = "Elegido $($script:padGlyph[$h[1]]) ($($script:padAction[$h[1]])). Pulsa ahora el boton de tu mando (o haz clic en el de la derecha)."
 			$canvas.Invalidate()
 		} else { & $script:pmAssign $h[1] }
 	})
@@ -1260,6 +1291,7 @@ function Show-PadMapper {
 		}
 		if ($sel -ge 0 -and $sel -lt $lv.Items.Count) { $lv.Items[$sel].Selected = $true }
 		$lv.EndUpdate()
+		if ($mouseBox) { $mouseBox.Invalidate() }
 	}
 	& $script:pmFillLv
 	$cap = New-Object System.Windows.Forms.Button
@@ -1273,6 +1305,49 @@ function Show-PadMapper {
 	$btnClear = New-Button 'Quitar tecla' 960 250 270 44 $false; $btnClear.Font = $boldSmall
 	$tKbm.Controls.Add($btnChange); $tKbm.Controls.Add($btnClear)
 	$tKbm.Controls.Add((New-Label ("Raton: mueve la camara (stick derecho). Mayus + clic: ataques fuertes (R2 / L2).`nEn el juego: Esc suelta el raton y un clic lo vuelve a capturar. F7 tambien lo suelta o lo captura.`nLa sensibilidad y la anti-zona muerta estan en el lanzador (apartado Controles).") $smallFont ([System.Drawing.Color]::FromArgb(190, 190, 190)) 670 310 560 90 'TopLeft'))
+	# (10-23) Dibujo del raton con lo que hace cada boton (se actualiza al cambiar la lista).
+	$mouseBox = New-Object System.Windows.Forms.PictureBox
+	$mouseBox.Location = New-Object System.Drawing.Point(670, 404); $mouseBox.Size = New-Object System.Drawing.Size(560, 236); $mouseBox.BackColor = $back
+	$tKbm.Controls.Add($mouseBox)
+	$mouseBox.Add_Paint({
+		param($s, $e)
+		$g = $e.Graphics; $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+		$g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+		$fill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(34, 38, 50))
+		$btnFill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(58, 64, 80))
+		$pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, 222, 196, 140), 2)
+		$thin = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(120, 222, 196, 140), 1)
+		$gold2 = New-Object System.Drawing.SolidBrush($gold); $txt = New-Object System.Drawing.SolidBrush($ink)
+		$f1 = New-Object System.Drawing.Font('Segoe UI Semibold', 9, [System.Drawing.FontStyle]::Bold); $f2 = New-Object System.Drawing.Font('Segoe UI Symbol', 9)
+		# Cuerpo: dos arcos y la base redondeada; botones izquierdo y derecho, rueda y dos laterales.
+		$cx = 90; $top = 10; $w = 130; $h = 214
+		$body = New-Object System.Drawing.Drawing2D.GraphicsPath
+		$body.AddArc(($cx - $w / 2), $top, $w, 120, 180, 180); $body.AddArc(($cx - $w / 2), ($top + $h - 140), $w, 140, 0, 180); $body.CloseFigure()
+		$g.FillPath($fill, $body); $g.DrawPath($pen, $body)
+		$lb = New-Object System.Drawing.Drawing2D.GraphicsPath; $lb.AddArc(($cx - $w / 2 + 4), ($top + 4), ($w - 8), 112, 180, 90); $lb.AddLine(($cx - 2), ($top + 4), ($cx - 2), ($top + 80)); $lb.AddLine(($cx - 2), ($top + 80), ($cx - $w / 2 + 4), ($top + 80)); $lb.CloseFigure()
+		$rb = New-Object System.Drawing.Drawing2D.GraphicsPath; $rb.AddArc(($cx - $w / 2 + 4), ($top + 4), ($w - 8), 112, 270, 90); $rb.AddLine(($cx + $w / 2 - 4), ($top + 80), ($cx + 2), ($top + 80)); $rb.AddLine(($cx + 2), ($top + 80), ($cx + 2), ($top + 4)); $rb.CloseFigure()
+		$g.FillPath($btnFill, $lb); $g.DrawPath($thin, $lb); $g.FillPath($btnFill, $rb); $g.DrawPath($thin, $rb)
+		$wheel = New-Object System.Drawing.RectangleF(($cx - 9), ($top + 22), 18, 40); $g.FillRectangle($fill, $wheel); $g.DrawRectangle($thin, $wheel.X, $wheel.Y, $wheel.Width, $wheel.Height)
+		$x1r = New-Object System.Drawing.RectangleF(($cx - $w / 2 - 6), ($top + 104), 10, 26); $x2r = New-Object System.Drawing.RectangleF(($cx - $w / 2 - 6), ($top + 136), 10, 26)
+		foreach ($r in $x1r, $x2r) { $g.FillRectangle($btnFill, $r); $g.DrawRectangle($thin, $r.X, $r.Y, $r.Width, $r.Height) }
+		# Que hace cada entrada del raton (de la lista).
+		$what = { param($inp)
+			$acts = @(); foreach ($r in $script:pmKbm) { if ($r.k -eq $inp -or $r.k -eq "Shift+$inp") { $n = if ($script:kbmNames.ContainsKey($r.c)) { $script:kbmNames[$r.c] } else { $r.c }; $acts += $(if ($r.k -like 'Shift+*') { "Mayus+: $n" } else { $n }) } }
+			if ($acts.Count) { return ($acts -join '   ') } else { return '(sin asignar)' } }
+		$rows = @(@('Clic izquierdo', 'Mouse:Left', ($cx - 34), ($top + 40)), @('Clic derecho', 'Mouse:Right', ($cx + 34), ($top + 40)),
+			@('Rueda (clic)', 'Mouse:Middle', $cx, ($top + 42)), @('Rueda arriba', 'Mouse:WheelUp', $cx, ($top + 26)), @('Rueda abajo', 'Mouse:WheelDown', $cx, ($top + 58)),
+			@('Lateral 1', 'Mouse:X1', ($cx - $w / 2 - 1), ($top + 117)), @('Lateral 2', 'Mouse:X2', ($cx - $w / 2 - 1), ($top + 149)))
+		$y = 6
+		foreach ($row in $rows) {
+			$ly = $y + 12
+			$g.DrawLine($thin, [float]$row[2], [float]$row[3], 196, [float]$ly); $g.FillEllipse($gold2, ([float]$row[2] - 3), ([float]$row[3] - 3), 6, 6)
+			$g.DrawString($row[0], $f1, $gold2, 200, $y + 3)
+			$g.DrawString((& $what $row[1]), $f2, $txt, (New-Object System.Drawing.RectangleF(300, ($y + 3), 258, 30)))
+			$y += 32
+		}
+		$g.DrawString('Mover el raton = camara', $f1, $gold2, 14, 216)
+		foreach ($o in $fill, $btnFill, $pen, $thin, $gold2, $txt, $f1, $f2, $body, $lb, $rb) { $o.Dispose() }
+	})
 	$script:pmStartWait = {
 		if ($lv.SelectedIndices.Count -eq 0) { $cap.Text = 'Elige primero una accion de la lista.'; return }
 		$script:pmWait = $lv.SelectedIndices[0]
