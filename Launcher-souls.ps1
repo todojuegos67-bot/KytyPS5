@@ -227,8 +227,11 @@ function Start-Game {
 	$nvAmd  = $false
 	# Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag automatico en AMD, y en NVIDIA solo con XeSS o FSR.
 	$fixedAl = (Is-FixedFg) -and (-not $script:isNvidia)
+	# (10-23 noche) Anti-Lag propio del emulador (KYTY_LOWLAT): sin Reflex ni FSR3 tocado; con la frame generation de AMD.
+	$ownLat = $chkAntiLag.Checked -and $config -like 'fsr3*'
+	if ($ownLat) { $sets += 'KYTY_LOWLAT=1' }
 	# (10-23) Para las metricas: si va Anti-Lag y cual.
-	Set-IniValue 'antilagon' $(if ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
+	Set-IniValue 'antilagon' $(if ($ownLat) { 'Propio (emulador)' } elseif ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
 	if ($nvAmd -or $fixedAl) {
 		$psargs += '-AntiLag'
 		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y
@@ -871,24 +874,24 @@ Move-To $chkUnlock $gFg 12 60 200
 $chkUnlock.Visible = $false  # (10-22) sin casilla: siempre desbloqueados salvo DLSS y modos Souls
 Move-To $chkAntiLag $gFg 222 60 186
 # (10-23 noche) Visible solo con NVIDIA: "Anti-Lag (experimental)" para la frame generation de AMD sin DLSS.
-$chkAntiLag.Visible = $false; $chkAntiLag.Checked = $false; $chkAntiLag.Text = 'Anti-Lag (experimental)'
+$chkAntiLag.Text = 'Anti-Lag propio (emulador)'
 # Solo se puede marcar con la frame generation de AMD (con la de NVIDIA ya va Reflex); fuera de ella se desmarca.
 function Update-AntiLagBox {
 	$cfgNow = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	$resSel = if ($script:resShown.Count) { $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)] } else { $null }
-	$ok = $cfgNow -like 'fsr3*' -and -not (Is-FixedFg) -and $resSel -and $resSel[2] -in 'xess', 'fsr'  # (10-23) solo con XeSS o FSR
+	$ok = $cfgNow -like 'fsr3*' -or (Is-FixedFg)  # (10-23 noche) anti-lag propio: con la frame generation de AMD, cualquier reescalado
 	# (10-23) Modos Souls con FG fija: se ve marcada y gris cuando se activa sola (AMD siempre; NVIDIA con XeSS o FSR).
 	$autoAl = $false
 	if ($autoAl) { $chkAntiLag.Checked = $true; $chkAntiLag.Enabled = $false; $chkAntiLag.Visible = $true; $script:alAuto = $true; return }
 	if ($script:alAuto) { $chkAntiLag.Checked = $false; $script:alAuto = $false }
 	$chkAntiLag.Enabled = $true
 	if (-not $ok) { $chkAntiLag.Checked = $false }
-	$chkAntiLag.Visible = $false  # (10-23 21:30) retirada: Reflex + FG de AMD crashea en NVIDIA
+	$chkAntiLag.Visible = $ok
 }
 $cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $cmbRes.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $form.Add_Shown({ Update-AntiLagBox })
-$tips.SetToolTip($chkAntiLag, 'Solo NVIDIA con la frame generation de AMD y reescalado XeSS o FSR: NVIDIA Reflex para menos retraso. Experimental: si el juego se cierra, quitala.')
+$tips.SetToolTip($chkAntiLag, 'Con la frame generation de AMD: el emulador no deja que se acumulen mas de 2 frames antes de leer el mando (menos retraso). Sin Reflex, en cualquier grafica. Experimental.')
 # Calidad grafica: texturas, distancia, sombras, Luz RT y filtrado x16 ($script:gfxTop: etiqueta y desplegable de Texturas, Sombras, Distancia).
 Move-To $script:gfxTop[0] $gGfx 10 26 98; Move-To $cmbTex $gGfx 110 24 296
 Move-To $script:gfxTop[4] $gGfx 10 58 98; Move-To $cmbDist $gGfx 110 56 296
