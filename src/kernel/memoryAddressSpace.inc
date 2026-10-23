@@ -740,13 +740,14 @@ public:
 #endif
 	}
 
-	// KYTY_ALIAS_STATS (default on): whether the physical memory a view maps is mapped at another address too (the PS5's
+	// KYTY_ALIAS_STATS (default off since 10-23: it walks every mapping on each map under the lock; with ~40k mappings
+	// late in a session every area change stalled the render thread, 38-56 fps instead of 75): whether the physical memory a view maps is mapped at another address too (the PS5's
 	// aliases: what makes the backing a shared section, the first ingredient of bug check 0x1A/0x41202). Counted per map,
 	// the first ones logged; the totals every 512 maps: whether the guest memory could be private memory instead.
 	void NoteAliasesUnlocked(uint64_t vaddr, uint64_t size, uint64_t backing_offset) {
 		static const bool on = [] {
 			const char* value = std::getenv("KYTY_ALIAS_STATS");
-			return value == nullptr || *value != '0';
+			return value != nullptr && *value == '1';
 		}();
 		if (!on) return;
 		static uint64_t maps = 0, aliased_maps = 0, aliased_bytes = 0, mapped_bytes = 0;
