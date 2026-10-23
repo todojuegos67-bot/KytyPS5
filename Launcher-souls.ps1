@@ -49,6 +49,8 @@ $script:isNvidia = (-not $script:gpuName) -or ($script:gpuName -match 'NVIDIA|Ge
 # ~75 reales, 224 en pantalla con frame generation dinamico; 4K cine ~40-48 reales) y en una de 8 GB simulada; el
 # resto es una ESTIMACION por potencia relativa (el emulador tambien depende mucho de la CPU).
 $script:gpuDb = @(
+	# (10-23) Sin VK_KHR_fragment_shader_barycentric (lo exige el emulador para los shaders del juego): no arrancan.
+	@('GTX (9|10)[0-9]{2}|GTX TITAN|RX (4|5)[0-9]{2}\b|RX 5[0-9]{3}|Vega|Radeon VII', 'NO COMPATIBLE', 'tu grafica no tiene fragmentShaderBarycentric (hace falta NVIDIA RTX 20 / GTX 16 o AMD RX 6000 o mas nuevas)'),
 	@('RTX 509|RTX 508|RTX 409|RTX 408|RX 7900 XTX', 'Modo Souls extremo', '4K cine: ~40-50 FPS reales (150-224 en pantalla con FG). 1440p: 60-75 reales'),
 	@('RTX 507|RTX 4070 Ti|RTX 4070 SUPER|RTX 309|RTX 3080 Ti|RX 907|RX 7900 XT|RX 7900 GRE|RX 6950', 'Modo Souls ultra', '1440p: ~50-65 FPS reales (150-224 en pantalla con FG)'),
 	@('RTX 4070|RTX 4060 Ti 16|RTX 3080|RTX 506|RX 6800|RX 6900|RX 7800|RX 7700|Arc.*B5[78]0', 'Modo Souls equilibrado', '1440p: 45 FPS reales fijos (90 en pantalla con AMD x2)'),
