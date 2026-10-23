@@ -4,6 +4,20 @@ DEMON'S SOULS (PS5) EN PC - NOVEDADES / WHAT'S NEW
 Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
 
 
+0. NUEVO (23-10 tarde) / NEW (23-10 evening)
+--------------------------------------------
+- ARREGLADOS los tirones al entrar y salir de zonas, que empeoraban cuanto mas
+  tiempo jugabas (38-56 FPS en vez de 75). FIXED stutter on area changes that got
+  worse the longer you played.
+- Monitores panoramicos / Ultrawide: Monitor 16:9 / 21:9 / 32:9 en "Pantalla y otros".
+  Con DLSS, XeSS o FSR la imagen sale ancha de verdad. Real wide image with upscalers.
+- Juego comprimido / Compressed game (.zar): en Settings, "Comprimir a .zar"
+  (unos dos tercios del tamano) y ".zar" para elegirlo. About two thirds of the size.
+- Mapear mando mas claro: que hace cada boton en el juego, mando y raton dibujados.
+  Clearer controller mapping with each button's action and a mouse diagram.
+- DLSS, DLSS Frame Generation y XeSS incluidos (carpeta streamline y libxess.dll).
+
+
 1. LAUNCHER EN ESPANOL E INGLES / SPANISH AND ENGLISH LAUNCHER
 --------------------------------------------------------------
 Dos columnas, todo agrupado. Two columns, everything grouped.
