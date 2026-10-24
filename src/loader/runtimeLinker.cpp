@@ -47,6 +47,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <intrin.h>
 #else
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -2219,7 +2220,19 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const bool         use_red_zone_protection  = Config::RedZoneProtectionEnabled();
+	// --redzone: memory instructions over a live red zone. A host without SSE4a (CPUID 0x80000001 ECX bit 6; every Intel
+	// CPU) traps and emulates EXTRQ/INSERTQ: those sites are protected always (KYTY_SSE4A_REDZONE=0: not).
+	const bool         protect_memory_faults    = Config::RedZoneProtectionEnabled();
+	const bool         protect_sse4a            = [] {
+		const char* value = std::getenv("KYTY_SSE4A_REDZONE");
+		if (value != nullptr && *value == '0') return false;
+		int regs[4] {};
+		__cpuid(regs, static_cast<int>(0x80000000u));
+		if (static_cast<unsigned>(regs[0]) < 0x80000001u) return true;
+		__cpuid(regs, static_cast<int>(0x80000001u));
+		return (regs[2] & (1 << 6)) == 0;
+	}();
+	const bool         use_red_zone_protection  = protect_memory_faults || protect_sse4a;
 	constexpr uint64_t RED_ZONE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (use_red_zone_protection) {
 		EXIT_IF(RED_ZONE_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
@@ -2360,7 +2373,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			            static_cast<uint64_t>(segment_addr), static_cast<uint64_t>(segment_size));
 			std::fflush(stdout);
 			const auto result =
-			    PatchRedZoneMemoryInstructions(segment_addr, segment_size, function_starts);
+			    PatchRedZoneMemoryInstructions(segment_addr, segment_size, function_starts, protect_memory_faults,
+			                                   protect_sse4a);
 			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
 			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
@@ -2372,7 +2386,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     result.unrelocatable_memory_instruction_count);
 			std::printf("Red-zone patching %s: functions=%" PRIu64 " red_zone=%" PRIu64 " memory=%" PRIu64
 			            " patched=%" PRIu64 " stack=%" PRIu64 " control=%" PRIu64 " unrelocatable=%" PRIu64
-			            " indirect=%" PRIu64 " swept=%" PRIu64 " calls=%" PRIu64 "\n",
+			            " indirect=%" PRIu64 " swept=%" PRIu64 " calls=%" PRIu64 " sse4a=%" PRIu64 "\n",
 			            Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
 			            result.red_zone_function_count, result.memory_instruction_count,
 			            result.patched_memory_instruction_count,
@@ -2380,7 +2394,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			            result.control_flow_memory_instruction_count,
 			            result.unrelocatable_memory_instruction_count,
 			            result.indirect_red_zone_function_count, result.swept_instruction_count,
-			            result.live_call_count);
+			            result.live_call_count, result.host_emulated_instruction_count);
 			Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
 		}
 		Common::VirtualMemory::FlushInstructionCache(program->red_zone_trampoline_vaddr,

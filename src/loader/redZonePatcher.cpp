@@ -1064,8 +1064,19 @@ static void PrintRedZoneProbe(const PatchModule& module, u64 probe, uintptr_t fu
 	std::fflush(stdout);
 }
 
+static bool IsHostEmulatedAmdInstruction(const ZydisDecodedInstruction& instruction) {
+	switch (instruction.mnemonic) {
+		case ZYDIS_MNEMONIC_EXTRQ:
+		case ZYDIS_MNEMONIC_INSERTQ:
+		case ZYDIS_MNEMONIC_MONITORX:
+		case ZYDIS_MNEMONIC_MWAITX: return true;
+		default: return false;
+	}
+}
+
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
-                                                  std::span<const uintptr_t> function_starts) {
+                                                  std::span<const uintptr_t> function_starts, bool protect_memory,
+                                                  bool protect_sse4a) {
 	RedZonePatchResult result {};
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
 	if (module == nullptr || function_starts.empty()) {
@@ -1108,6 +1119,13 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 			++result.red_zone_function_count;
 			result.indirect_red_zone_function_count += function.has_indirect_branch;
 			for (const auto& [address, decoded]: function.instructions) {
+				if (protect_sse4a && decoded.red_zone_live.any() && !rewrite_sites.contains(address) &&
+				    IsHostEmulatedAmdInstruction(decoded.instruction)) {
+					++result.host_emulated_instruction_count;
+					rewrite_sites[address].protect_red_zone = true;
+					continue;
+				}
+				if (!protect_memory) continue;
 				if (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL &&
 				    !decoded.accesses_memory && decoded.red_zone_live.any() &&
 				    GetRelativeTarget(decoded) != 0 && !rewrite_sites.contains(address)) {
@@ -1607,7 +1625,7 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 
 #else
 
-RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uintptr_t>) {
+RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uintptr_t>, bool, bool) {
 	return {};
 }
 
