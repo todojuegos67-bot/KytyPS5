@@ -27,6 +27,7 @@
 #include "gpu_tiler_shaders/ssr_spv.h"
 #include "local/rt-reflections.h"
 #include "local/shine.h"
+#include "local/godrays.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
 #include "kernel/memory.h"
 #include <string>
@@ -6804,6 +6805,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	const auto l_view = ToView(view, g_cs.latch_axis);
 	ShineSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor)); // (KYTY_SHINE: shine.cpp)
+	GodraysSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor)); // (KYTY_GODRAYS: godrays.cpp)
 	push.extra[1] = static_cast<float>(l_view[0]), push.extra[2] = static_cast<float>(l_view[1]), push.extra[3] = static_cast<float>(l_view[2]);
 	push.trace[2] = strength * g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade) * static_cast<float>(g_cs.sun_factor); // (smoothstep fade; overcast)
 	push.tune[0]  = g_cs.log_k >= 0.0 ? static_cast<float>(1.0 / std::max(std::exp2(g_cs.log_k), 1.25)) : 0.0f;
@@ -6883,6 +6885,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	SsrApply(command, inputs); // (KYTY_SSR: likewise, after GTAO; nothing when off)
 	RtReflectionsApply(command, inputs); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
 	ShineApply(command, inputs); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
+	GodraysApply(command, inputs); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
 	const bool  fsr  = g_sr_kind == 3;
