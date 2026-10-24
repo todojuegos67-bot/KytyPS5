@@ -23,8 +23,12 @@
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
+#include "local/frame-gen.h"
+#include "local/fsr3-fg.h"
+#include "local/xess-sr.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -441,6 +445,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	}
 }
 
+// bruno-astro-1025 (KYTY_FSR3_FG): the frame generation swapchain's queues (src/local/fsr3-fg.h), fetched after the
+// device.
+static Libs::Graphics::Fsr3::QueuePlan g_fsr3_plan;
+
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                 const std::vector<const char*>& device_extensions) {
 	const auto physical_device = graphics.physical_device;
@@ -448,11 +456,27 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
+	const float               queue_priorities[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+	const float&              queue_priority      = queue_priorities[0];
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = 1;
 	queue_create_info.pQueuePriorities = &queue_priority;
+	// KYTY_FSR3_FG: one more graphics-family queue for its presents, and two of an async compute family (its
+	// interpolation and its image acquire).
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {queue_create_info, queue_create_info};
+	uint32_t                                 queue_create_count = 1;
+#if defined(_WIN32)
+	g_fsr3_plan = {};
+	if (Libs::Graphics::Fsr3::Requested() &&
+	    Libs::Graphics::Fsr3::PlanQueues(physical_device, queue_family, 1, g_fsr3_plan)) {
+		queue_create_infos[0].queueCount       = g_fsr3_plan.graphics_index + 1;
+		queue_create_infos[1].queueFamilyIndex = g_fsr3_plan.compute_family;
+		queue_create_infos[1].queueCount       = g_fsr3_plan.compute_count;
+		queue_create_count                     = 2;
+	}
+#endif
+	(void)queue_priority;
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -774,8 +798,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	// XeSS (KYTY_UPSCALE=xess): its mutableDescriptorType feature, with its extension.
+	create_info.pNext = Libs::Graphics::Xess::ChainDeviceFeatures(device_extensions,
+	                                                              const_cast<void*>(create_info.pNext));
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1168,15 +1195,51 @@ void WindowContext::CreateVulkan() {
 				    VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 			}
 		}
+		// bruno-astro-1025 (KYTY_FRAMEGEN, DLSS): Streamline enables VK_NV_low_latency2 (Reflex) without the
+		// present-id extension it requires; current drivers then refuse the device.
+		if (FrameGen::StreamlineLoaded() &&
+		    HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
+		    !HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+		}
+		// KYTY_FSR3_FG, KYTY_UPSCALE=fsr: the FidelityFX backend calls vkGetBufferMemoryRequirements2KHR by the
+		// extension's name (null without the extension even though the function is core).
+		if (Libs::Graphics::Fsr3::Requested() || Libs::Graphics::Fsr3::SrPathWanted() ||
+		    Libs::Graphics::Fsr3::UpscaleWanted()) {
+			for (const char* name: {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
+			                        VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME}) {
+				if (HasExtension(available_extensions, name) && !HasExtension(device_extensions, name)) {
+					device_extensions.push_back(name);
+				}
+			}
+		}
+		// KYTY_UPSCALE=xess: what XeSS's Vulkan backend asks for.
+		if (Libs::Graphics::Xess::Wanted() || Libs::Graphics::Xess::SrPathWanted()) {
+			Libs::Graphics::Xess::AddDeviceExtensions(graphic_ctx.instance, graphic_ctx.physical_device,
+			                                          available_extensions, device_extensions);
+		}
 	}
 
+	// (Streamline's own answer whether DLSS-G can run here, asked before the device: the refusal below gives it.)
+	const std::string frame_gen_problem = FrameGen::SupportProblem(graphic_ctx.physical_device);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
 	if (graphic_ctx.device == nullptr) {
+		if (FrameGen::StreamlineLoaded()) {
+			EXIT("Could not create the Vulkan device with NVIDIA Streamline (DLSS / DLSS-G)%s%s: start without "
+			     "it (launcher: Frame generation -> Off). KYTY_FRAMEGEN_VERBOSE=1 logs why the driver refused it.%s\n",
+			     frame_gen_problem.empty() ? "" : ": ", frame_gen_problem.c_str(),
+			     FrameGen::RefusedDeviceAdvice().c_str());
+		}
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	// (Before the command hooks copy the dispatcher: the per-command calls skip Streamline's wrappers.)
+	FrameGen::BypassCommandHooks(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	Libs::Graphics::Fsr3::OnDevice(graphic_ctx, g_fsr3_plan);
+	Libs::Graphics::FrameGen::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);
+	Libs::Graphics::Xess::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

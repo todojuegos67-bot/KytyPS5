@@ -357,6 +357,43 @@ foreach(shader_source IN LISTS gpu_blit_shader_sources)
 endforeach()
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
+# bruno-astro-1025: the todojuegos67-bot fork's upscaling and frame generation (src/local): DLSS / DLSS-G through
+# NVIDIA Streamline, XeSS, FSR 3.1 upscaling and FSR 3 frame generation through the FidelityFX API swapchain.
+foreach(local_shader IN ITEMS sharpen taa-bypass hud-split)
+	string(REPLACE "-" "_" local_shader_name "${local_shader}")
+	set(local_shader_source "${KYTY_SOURCE_DIR}/local/${local_shader}.comp")
+	set(local_shader_spv "${gpu_tiler_generated_dir}/${local_shader_name}.spv")
+	set(local_shader_header "${gpu_tiler_generated_dir}/${local_shader_name}_spv.h")
+	string(TOUPPER "${local_shader_name}_SPV" local_shader_symbol)
+	add_custom_command(
+		OUTPUT "${local_shader_header}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+		        -o "${local_shader_spv}" "${local_shader_source}"
+		COMMAND ${CMAKE_COMMAND} -DINPUT=${local_shader_spv} -DOUTPUT=${local_shader_header}
+		        -DSYMBOL=${local_shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		DEPENDS "${local_shader_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		VERBATIM
+	)
+	list(APPEND kyty_emulator_src "${local_shader_header}")
+endforeach()
+list(APPEND kyty_emulator_src
+	"${KYTY_SOURCE_DIR}/local/local-platform.h"
+	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
+	"${KYTY_SOURCE_DIR}/local/live-census.h"
+	"${KYTY_SOURCE_DIR}/local/title-state.h"
+	"${KYTY_SOURCE_DIR}/local/title-state.cpp"
+	"${KYTY_SOURCE_DIR}/local/dyn-multiplier.h"
+	"${KYTY_SOURCE_DIR}/local/fg-discover.h"
+	"${KYTY_SOURCE_DIR}/local/fg-discover.cpp"
+	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
+	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
+	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"
+	"${KYTY_SOURCE_DIR}/local/fsr3-fg.cpp"
+	"${KYTY_SOURCE_DIR}/local/xess-sr.h"
+	"${KYTY_SOURCE_DIR}/local/xess-sr.cpp"
+)
+
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
@@ -846,6 +883,29 @@ if (CLANG AND NOT KYTY_CLANG_CL)
 endif()
 # dlopen/dlsym/dladdr for RenderDoc.
 target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
+
+# Intel XeSS super resolution (src/local/xess-sr.cpp): the XeSS SDK's headers when they were fetched beside the
+# build (_Build/deps/xess, the CI's builds); libxess.dll is loaded at run time.
+set(KYTY_XESS_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/xess" CACHE PATH "Intel XeSS SDK (inc/xess/xess_vk.h)")
+if (WIN32 AND EXISTS "${KYTY_XESS_SDK}/inc/xess/xess_vk.h")
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/local/xess-sr.cpp" APPEND PROPERTY INCLUDE_DIRECTORIES "${KYTY_XESS_SDK}/inc")
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/local/xess-sr.cpp" APPEND PROPERTY COMPILE_DEFINITIONS KYTY_XESS=1)
+	message(STATUS "XeSS SDK: ${KYTY_XESS_SDK}")
+endif()
+
+# DLSS and DLSS-G (src/local/frame-gen.cpp): the NVIDIA Streamline SDK when it was unpacked under _Build/deps (never
+# part of the repository; the CI's builds fetch it). Its DLLs are loaded at run time.
+if (WIN32)
+	set(KYTY_STREAMLINE_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/streamline/sdk" CACHE PATH
+	    "NVIDIA Streamline SDK for KYTY_FRAMEGEN")
+	if (EXISTS "${KYTY_STREAMLINE_SDK}/include/sl.h")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
+		             INCLUDE_DIRECTORIES "${KYTY_STREAMLINE_SDK}/include")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
+		             COMPILE_DEFINITIONS KYTY_FRAMEGEN_STREAMLINE=1)
+		message(STATUS "Streamline SDK: ${KYTY_STREAMLINE_SDK}")
+	endif()
+endif()
 target_include_directories(kyty_emulator PRIVATE ${inc_headers})
 
 clang_tidy_check(kyty_emulator "" "${check_headers}" "${inc_headers}")

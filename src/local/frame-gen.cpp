@@ -1,0 +1,4158 @@
+#include "frame-gen.h"
+#include "graphics/presentation/window/hostInput.h"
+#include "fsr3-fg.h"
+#include "xess-sr.h"
+#include "graphics/presentation/videoOut.h"
+#include "local/title-state.h"
+#include <chrono>
+
+#include "common/logging/log.h"
+#include "local/local-platform.h"
+#include "local/live-census.h"
+#include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/commandHooks.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include <tuple>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
+#include "graphics/host_gpu/renderer/renderTarget.h"
+#include "local/dyn-multiplier.h"
+#include "gpu_tiler_shaders/taa_bypass_spv.h"
+#include "gpu_tiler_shaders/sharpen_spv.h"
+#include "kernel/memory.h"
+#include <string>
+
+#include <algorithm>
+#include <atomic>
+#include <bit>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <intrin.h>
+#undef min
+#undef max
+// NVIDIA Streamline SDK headers (_Build/deps/streamline/sdk/include, see CMakeLists.txt).
+#include <sl.h>
+#include <sl_consts.h>
+#include <sl_dlss.h>
+#include <sl_dlss_g.h>
+#include <sl_helpers.h>
+#include <sl_pcl.h>
+#include <sl_reflex.h>
+#include <thread>
+
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <string>
+#include <vector>
+#endif
+
+extern "C" {
+// DLSS-G frames' Reflex sleep (slReflexSleep, every present): 0 skips it (KYTY_FRAMEGEN_SLEEP=0).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_framegen_sleep {1};
+}
+
+namespace Libs::Graphics::FrameGen {
+
+namespace {
+
+struct Sources {
+	ImageId  depth, motion;
+	uint64_t depth_address = 0, motion_address = 0;
+	bool     valid = false;
+};
+
+int      g_generate    = 0;     // frames to generate per rendered frame (0 = off)
+// KYTY_DLSSG_DYNAMIC=1: an app-side dynamic multiplier. Streamline's eDynamic is D3D12 only (not on Vulkan, and it
+// ignores numFramesToGenerate), so DLSS-G stays eOn and the emulator picks numFramesToGenerate itself, once a second:
+// m = gen + 1 = the largest in [1, min(KYTY_FRAMEGEN (default 5), numFramesToGenerateMax (3 until known)) + 1] with
+// real * m <= target (10-22; up after real * (m + 1) <= 0.97 target for ~1 s, down at once past 1.02 target). The real
+// rate is never held to reach a multiplier; Reflex caps it at target / m. Target: KYTY_DLSSG_TARGET_FPS, default
+// refresh - refresh^2 / 3600 (224 on 240 Hz).
+bool     g_dlssg_dynamic   = false;
+float    g_dlssg_target_fps = 0.0f;
+int      g_dyn_gen         = 1;   // the current generated frame count in dynamic mode (g_generate is its maximum)
+int      g_dyn_pending     = 0;   // a candidate value and how many windows in a row it came out
+int      g_dyn_pending_n   = 0;
+double   g_dyn_real_fps    = 0.0; // smoothed real fps
+// 10-21: when one more generated frame would pass the target but costs at most ~10% of the real rate (60 real on
+// 224: x4 at 56 real = 224 instead of x3 = 180), that multiplier is taken and Reflex holds the real rate at
+// target / (gen + 1). KYTY_DLSSG_DYN_STRETCH=0: the old floor choice (no limit).
+bool     g_dyn_stretch     = true;
+uint32_t g_dyn_limit_us    = 0;
+double   g_dyn_slept       = 0.0; // seconds our limiter waited in this window
+int      g_dyn_block_s     = 0;   // seconds left without taking the extra frame (it cost too much real fps)
+int      g_dyn_max         = 3;   // 10-22: the largest generated count in use (min(KYTY_FRAMEGEN, GPU max), 3 until known)
+int      g_dyn_up_s        = 0;   // windows in a row the next multiplier fit under target * 0.97
+int      g_dyn_pinned_s    = 0;   // windows in a row the real rate sat at our Reflex cap
+int      g_dyn_noup_s      = 0;   // windows left without switching up (after a step down off the cap)
+Kyty::Local::DynMultiplier g_dyn_dm; // 10-22: the free-rate multiplier choice
+bool     g_fixed_floor     = false; // 10-23: fixed DLSS-G under a cap: the same flip floor / pacer choice per present
+int      g_dyn_flip_asked  = -1;  // the last rate asked of SetDynamicFlipFps (-1: none since a clear)
+int      g_dyn_flip_fps    = 0;   // 10-21: the game's own flip floor held for the extra frame (VideoOut::SetDynamicFlipFps)
+
+// The flip floor for `gen` generated frames: the reach rate when gen + 1 at 60 passes the target, else none.
+void DynApplyFlipFloor(int gen) {
+	const int n    = gen + 1;
+	const int want = 60.0 * n > static_cast<double>(g_dlssg_target_fps) + 0.5
+	                     ? VideoOut::ReachFps(static_cast<double>(g_dlssg_target_fps), n)
+	                     : 0;
+	// (asked again only on a change: a refusal is printed once, not per present)
+	if ((want >= 60 ? 0 : want) == g_dyn_flip_asked) return;
+	g_dyn_flip_asked = want >= 60 ? 0 : want;
+	const int fps    = VideoOut::SetDynamicFlipFps(g_dyn_flip_asked);
+	if (fps != g_dyn_flip_fps) {
+		if (fps > 0) std::printf("[dyn] x%d: game flips at %d (gameplay)\n", n, fps);
+		else std::printf("[dyn] x%d: game flips at 60\n", n);
+		std::fflush(stdout);
+	}
+	g_dyn_flip_fps = fps;
+}
+
+int CurrentGenerate() {
+	return g_dlssg_dynamic ? std::min(g_dyn_gen, g_generate) : g_generate;
+}
+bool g_dlss_sr = false; // KYTY_UPSCALE=dlss: DLSS super resolution (Streamline's DLSS plugin)
+bool g_taa_dlss = false; // KYTY_TAA_REPLACE=dlss: DLSS (DLAA) in place of the game's TAA
+// KYTY_TAA_REPLACE=upscaler (with KYTY_UPSCALE dlss|fsr|xess): the game's TAA skipped, its jittered image copied to
+// the TAA's output, so the composite's upscaler gets the raw frame and does the anti-aliasing itself (on the TAA's
+// output it ran a second temporal filter: smeared, "watercolor" images and ghosting).
+bool g_taa_bypass = false;
+// KYTY_TAA_BYPASS_MODE=copy: the first bypass (the TAA dispatch skipped, its output a copy of the raw frame: its alpha,
+// which later passes read, lost: darker zones). Default: the TAA runs, then its color is replaced by the raw frame's
+// (AfterTaa), its alpha kept. KYTY_TAA_BYPASS_GAIN=<f>: the raw frame times f there.
+bool g_taa_bypass_copy = false;
+// KYTY_TAA_BYPASS_MODE=match: the TAA's output replaced by the raw frame scaled to its mean brightness (10-17: the
+// gain came out ~0.38 and the picture still darker: the raw frame's bright specks inflate the game's auto exposure).
+// Default: the TAA's output is left to the game (its exposure, bloom and the rest see what they always saw) and only
+// the upscaler takes the raw frame, a copy made right after the TAA (UpscaleComposite).
+bool g_taa_bypass_match = false;
+// DLSS-G under the G-SYNC cap: the real frames' least interval (seconds)
+std::atomic<double> g_real_interval {0.0};
+double g_pace_n = 0.0, g_pace_sum = 0.0, g_pace_sq = 0.0; // real present intervals this window
+bool g_sr_ready = false;
+bool     g_ready       = false; // Streamline loaded and the feature available
+bool     g_upscale     = false; // KYTY_UPSCALER=dlss: DLSS super resolution asked for (Streamline loaded for it)
+bool     g_upscale_ready = false; // ... and available on the device
+// KYTY_UPSCALER=xess|fsr: the PS5 Pro path (renderSuperResolution.cpp) upscaled by our XeSS or FSR 3.1 instead of DLSS.
+int      g_sr_kind = 0; // 0 none, 1 DLSS, 2 XeSS, 3 FSR
+Camera   g_camera;              // Kyty.Gpu: the current guest frame
+Sources  g_sources;             // Kyty.Gpu: the current guest frame
+uint64_t g_guest_frame = 0;     // Kyty.Gpu
+std::atomic<bool> g_scene {false}; // the current guest frame ran the TAA pass
+std::atomic<bool> g_last_scene {false}; // ... the last one the guest flipped
+std::atomic<uint64_t> g_flips_taken {0}; // TakeScene calls (guest flips)
+
+float AsFloat(uint32_t word) {
+	float value = 0.0f;
+	std::memcpy(&value, &word, sizeof(value));
+	return value;
+}
+
+bool IsDepthFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eD16Unorm:
+		case vk::Format::eD16UnormS8Uint:
+		case vk::Format::eD24UnormS8Uint:
+		case vk::Format::eD32Sfloat:
+		case vk::Format::eD32SfloatS8Uint:
+		case vk::Format::eX8D24UnormPack32: return true;
+		default: return false;
+	}
+}
+
+} // namespace
+
+void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFlags aspect,
+                vk::ImageLayout layout, vk::AccessFlags2 access, vk::PipelineStageFlags2 stage) {
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = image.state.pl_stage;
+	barrier.srcAccessMask       = image.state.access_mask;
+	barrier.dstStageMask        = stage;
+	barrier.dstAccessMask       = access;
+	barrier.oldLayout           = image.state.layout;
+	barrier.newLayout           = layout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = image.image;
+	barrier.subresourceRange    = {aspect, 0, 1, 0, 1};
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency);
+	image.state = {stage, access, layout};
+}
+
+// (Re)create `image` as a sampled copy target like `source`; with `attachment`, a color
+// attachment too where the format allows it (*attachment tells).
+void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view,
+               const VulkanImage& source, bool* attachment) {
+	if (image.image != nullptr && image.format == source.format &&
+	    image.extent.width == source.extent.width && image.extent.height == source.extent.height) {
+		return;
+	}
+	if (view != nullptr) {
+		graphics.device.destroyImageView(view, nullptr);
+		view = nullptr;
+	}
+	if (image.image != nullptr) {
+		graphics.DeleteImage(image);
+	}
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {source.extent.width, source.extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = source.format;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled;
+	if (attachment != nullptr) {
+		*attachment = !IsDepthFormat(source.format) &&
+		              static_cast<bool>(graphics.physical_device.getFormatProperties(source.format).optimalTilingFeatures &
+		                                vk::FormatFeatureFlagBits::eColorAttachment);
+		if (*attachment) {
+			create.usage |= vk::ImageUsageFlagBits::eColorAttachment;
+		}
+	}
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.samples       = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, image)) {
+		EXIT("frame generation: cannot allocate a %ux%u input image\n", source.extent.width,
+		     source.extent.height);
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = image.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = source.format;
+	view_info.subresourceRange = {IsDepthFormat(source.format) ? vk::ImageAspectFlagBits::eDepth
+	                                                           : vk::ImageAspectFlagBits::eColor,
+	                              0, 1, 0, 1};
+	RequireVulkanSuccess(graphics.device.createImageView(&view_info, nullptr, &view),
+	                     "frame generation input view");
+}
+
+namespace {
+
+void CopyInto(vk::CommandBuffer command, Image& source, VulkanImage& target) {
+	const auto aspect = IsDepthFormat(source.backing.format) ? vk::ImageAspectFlagBits::eDepth
+	                                                         : vk::ImageAspectFlagBits::eColor;
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	               command);
+	Transition(command, target, aspect, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {aspect, 0, 0, 1};
+	copy.dstSubresource = {aspect, 0, 0, 1};
+	copy.extent         = target.extent;
+	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, target.image,
+	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	Transition(command, target, aspect, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+}
+
+// KYTY_FPS_HUD: frames shown per presented frame, and the panel's normalized rectangle (16 bits
+// per coordinate: x0, y0, x1, y1; 0 = none).
+std::atomic<uint32_t> g_presented_frames {1};
+std::atomic<uint64_t> g_static_rect {0};
+
+// No motion under the KYTY_FPS_HUD panel: DLSS-G would move it with the scene behind it.
+void ZeroStaticRect(vk::CommandBuffer command, VulkanImage& motion, vk::ImageView view) {
+	const auto packed = g_static_rect.load(std::memory_order_relaxed);
+	if (packed == 0) {
+		return;
+	}
+	const auto coordinate = [&](uint32_t index, uint32_t size) {
+		return static_cast<int32_t>(((packed >> (16u * index)) & 0xffffu) * size / 0xffffu);
+	};
+	const int32_t x0 = coordinate(0, motion.extent.width), y0 = coordinate(1, motion.extent.height);
+	const int32_t x1 = coordinate(2, motion.extent.width), y1 = coordinate(3, motion.extent.height);
+	if (x1 <= x0 || y1 <= y0) {
+		return;
+	}
+	Transition(command, motion, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eColorAttachmentOptimal,
+	           vk::AccessFlagBits2::eColorAttachmentWrite, vk::PipelineStageFlagBits2::eColorAttachmentOutput);
+	vk::RenderingAttachmentInfo color {};
+	color.imageView   = view;
+	color.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	color.loadOp      = vk::AttachmentLoadOp::eLoad;
+	color.storeOp     = vk::AttachmentStoreOp::eStore;
+	vk::RenderingInfo rendering {};
+	rendering.renderArea.extent    = vk::Extent2D {motion.extent.width, motion.extent.height};
+	rendering.layerCount           = 1;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &color;
+	command.beginRendering(rendering);
+	vk::ClearAttachment clear {};
+	clear.aspectMask       = vk::ImageAspectFlagBits::eColor;
+	clear.colorAttachment  = 0;
+	clear.clearValue.color = vk::ClearColorValue {std::array<float, 4> {0.0f, 0.0f, 0.0f, 0.0f}};
+	vk::ClearRect rect {};
+	rect.rect       = vk::Rect2D {{x0, y0}, {static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)}};
+	rect.layerCount = 1;
+	command.clearAttachments(1, &clear, 1, &rect);
+	command.endRendering();
+	Transition(command, motion, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+}
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+// Streamline entry points (sl.interposer.dll, loaded at run time) and feature functions.
+struct Api {
+	PFun_slInit*                 init                = nullptr;
+	PFun_slIsFeatureSupported*   is_feature_supported = nullptr;
+	PFun_slIsFeatureLoaded*      is_feature_loaded   = nullptr;
+	PFun_slGetFeatureFunction*   get_feature_function = nullptr;
+	PFun_slGetNewFrameToken*     get_new_frame_token = nullptr;
+	PFun_slSetConstants*         set_constants       = nullptr;
+	PFun_slSetTagForFrame*       set_tag_for_frame   = nullptr;
+	PFun_slDLSSGSetOptions*      dlssg_set_options   = nullptr;
+	PFun_slDLSSGGetState*        dlssg_get_state     = nullptr;
+	PFun_slReflexSetOptions*     reflex_set_options  = nullptr;
+	PFun_slReflexSleep*          reflex_sleep        = nullptr;
+	PFun_slPCLSetMarker*         pcl_set_marker      = nullptr;
+	PFun_slEvaluateFeature*      evaluate            = nullptr;
+	PFun_slDLSSSetOptions*       dlss_set_options    = nullptr;
+	PFun_slDLSSGetOptimalSettings* dlss_get_optimal_settings = nullptr;
+};
+sl::ReflexOptions g_reflex_opts {}; // kept for the dynamic multiplier's limit changes
+Api              g_api;
+sl::FrameToken*  g_token = nullptr; // present thread: the frame being presented
+uint32_t         g_frame_index = 0;
+bool             g_options_set = false;
+vk::Extent2D     g_options_backbuffer {};
+vk::Extent2D     g_options_render {};
+vk::Format       g_options_format = vk::Format::eUndefined; // SDR or HDR10 swapchain
+uint64_t         g_presents = 0;
+int              g_mode_set = -1; // the DLSS-G mode last set (1 on, 0 off)
+std::atomic<bool> g_discontinuity {false}; // a frame with inputs left unshown (NoteDroppedFrame): the next resets
+std::chrono::steady_clock::time_point g_stat_start {};
+uint32_t         g_stat_real = 0, g_stat_on = 0;
+double           g_stat_present_ms = 0, g_stat_present_max = 0;
+double           g_stat_acquire_ms = 0, g_stat_acquire_max = 0, g_stat_gpuwait_ms = 0, g_stat_gpuwait_max = 0,
+                 g_stat_flip_ms = 0, g_stat_flip_max = 0, g_stat_submit_ms = 0, g_stat_submit_max = 0,
+                 g_stat_before_ms = 0, g_stat_before_max = 0;
+std::chrono::steady_clock::time_point g_present_begin {};
+
+// Matrices in Streamline's convention: row-major, row vectors (p' = p * M).
+using Mat4 = sl::float4x4;
+
+Mat4 Transposed(const std::array<float, 16>& m) { // our column-vector matrix -> SL
+	Mat4 r;
+	for (uint32_t i = 0; i < 4; ++i) {
+		r[i] = sl::float4(m[i], m[4 + i], m[8 + i], m[12 + i]);
+	}
+	return r;
+}
+
+float At(const sl::float4& v, uint32_t i) {
+	return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
+}
+
+Mat4 Multiply(const Mat4& a, const Mat4& b) {
+	Mat4 r;
+	for (uint32_t i = 0; i < 4; ++i) {
+		float row[4] {};
+		for (uint32_t j = 0; j < 4; ++j) {
+			for (uint32_t k = 0; k < 4; ++k) row[j] += At(a[i], k) * At(b[k], j);
+		}
+		r[i] = sl::float4(row[0], row[1], row[2], row[3]);
+	}
+	return r;
+}
+
+bool Inverted(const Mat4& m, Mat4& out) {
+	double a[4][8] {};
+	for (uint32_t i = 0; i < 4; ++i) {
+		for (uint32_t j = 0; j < 4; ++j) a[i][j] = At(m[i], j);
+		a[i][4 + i] = 1.0;
+	}
+	for (uint32_t c = 0; c < 4; ++c) {
+		uint32_t pivot = c;
+		for (uint32_t r = c + 1; r < 4; ++r) {
+			if (std::fabs(a[r][c]) > std::fabs(a[pivot][c])) pivot = r;
+		}
+		if (std::fabs(a[pivot][c]) < 1e-12) return false;
+		for (uint32_t j = 0; j < 8; ++j) std::swap(a[c][j], a[pivot][j]);
+		const double scale = 1.0 / a[c][c];
+		for (uint32_t j = 0; j < 8; ++j) a[c][j] *= scale;
+		for (uint32_t r = 0; r < 4; ++r) {
+			if (r == c) continue;
+			const double f = a[r][c];
+			for (uint32_t j = 0; j < 8; ++j) a[r][j] -= f * a[c][j];
+		}
+	}
+	for (uint32_t i = 0; i < 4; ++i) {
+		out[i] = sl::float4(static_cast<float>(a[i][4]), static_cast<float>(a[i][5]),
+		                    static_cast<float>(a[i][6]), static_cast<float>(a[i][7]));
+	}
+	return true;
+}
+
+// The game's world->clip matrix is P * V with a perspective P whose w row is (0, 0, 1, 0) (w =
+// view depth) and whose z row is constant (reversed-Z, infinite far). Split it into camera
+// axes, position and projection terms.
+struct CameraFrame {
+	sl::float3 right, up, forward, position;
+	float      sx = 1.0f, sy = 1.0f, cx = 0.0f, cy = 0.0f, z_near = 0.1f;
+	bool       valid = false;
+};
+
+CameraFrame Decompose(const std::array<float, 16>& m) {
+	CameraFrame c;
+	const auto row = [&](uint32_t i) { return std::array<double, 4> {m[i * 4], m[i * 4 + 1], m[i * 4 + 2], m[i * 4 + 3]}; };
+	const auto r0 = row(0), r1 = row(1), r2 = row(2), r3 = row(3);
+	const double flen = std::sqrt(r3[0] * r3[0] + r3[1] * r3[1] + r3[2] * r3[2]);
+	if (flen < 1e-6) return c;
+	const double f[3] {r3[0] / flen, r3[1] / flen, r3[2] / flen};
+	const double tf = r3[3] / flen;
+	const auto split = [&](const std::array<double, 4>& r, double& s, double& off, double axis[3], double& t) {
+		off = (r[0] * f[0] + r[1] * f[1] + r[2] * f[2]) / flen;
+		double v[3] {r[0] / flen - off * f[0], r[1] / flen - off * f[1], r[2] / flen - off * f[2]};
+		s = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+		if (s < 1e-9) return false;
+		for (int i = 0; i < 3; ++i) axis[i] = v[i] / s;
+		t = (r[3] / flen - off * tf) / s;
+		return true;
+	};
+	double sx = 0, cx = 0, sy = 0, cy = 0, x[3] {}, y[3] {}, tx = 0, ty = 0;
+	if (!split(r0, sx, cx, x, tx) || !split(r1, sy, cy, y, ty)) return c;
+	// Up = forward x right (Streamline's convention); a flipped clip y shows up as a negative sy.
+	const double up[3] {f[1] * x[2] - f[2] * x[1], f[2] * x[0] - f[0] * x[2], f[0] * x[1] - f[1] * x[0]};
+	if (up[0] * y[0] + up[1] * y[1] + up[2] * y[2] < 0) {
+		sy = -sy;
+		ty = -ty;
+	}
+	c.right    = sl::float3(float(x[0]), float(x[1]), float(x[2]));
+	c.up       = sl::float3(float(up[0]), float(up[1]), float(up[2]));
+	c.forward  = sl::float3(float(f[0]), float(f[1]), float(f[2]));
+	// View translation (tx, ty, tf) = -axes . position.
+	const double pos[3] {-(tx * x[0] + ty * up[0] + tf * f[0]), -(tx * x[1] + ty * up[1] + tf * f[1]),
+	                     -(tx * x[2] + ty * up[2] + tf * f[2])};
+	c.position = sl::float3(float(pos[0]), float(pos[1]), float(pos[2]));
+	c.sx       = float(sx);
+	c.sy       = float(sy);
+	c.cx       = float(cx);
+	c.cy       = float(cy);
+	c.z_near   = float(r2[3] / flen);
+	c.valid    = true;
+	return c;
+}
+
+// DLSS evaluations NGX refused (Streamline's slEvaluateFeature says eOk all the same; its log has them): its output
+// image is then never written, the game black (issue #87).
+std::atomic<uint32_t> g_dlss_refusals {0};
+
+void LogMessage(sl::LogType type, const char* message) {
+	LOGF("Streamline[%d]: %s", static_cast<int>(type), message);
+	if (type == sl::LogType::eError && message != nullptr && std::strstr(message, "[sl.dlss]") != nullptr &&
+	    std::strstr(message, "evaluate feature failed") != nullptr)
+		g_dlss_refusals.fetch_add(1, std::memory_order_relaxed);
+	// KYTY_FRAMEGEN_VERBOSE: every message on stdout (the run log), not only errors.
+	static const bool verbose = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr;
+	if (type == sl::LogType::eError || verbose) {
+		std::printf("Streamline %s: %s", type == sl::LogType::eError ? "error" : "log", message);
+		std::fflush(stdout);
+	}
+}
+
+template <typename F>
+bool FeatureFunction(sl::Feature feature, const char* name, F*& function) {
+	void* pointer = nullptr;
+	if (g_api.get_feature_function(feature, name, pointer) != sl::Result::eOk || pointer == nullptr) {
+		LOGF("frame generation: %s is unavailable\n", name);
+		return false;
+	}
+	function = reinterpret_cast<F*>(pointer);
+	return true;
+}
+
+// KYTY_DLSSG_PRESET=A|B|C|0: the DLSS Frame Generation preset, for this process only (the driver profile is not
+// touched). nvngx_dlssg.dll reads it through NVAPI DRS GetSetting (nvapi_QueryInterface 0x73BF8338), setting
+// 0x10E41DF1: 0 game/driver, 1 A, 2 B, 3 C ("Performance mode": a lighter model, DLSS-G >= 310.9.16; earlier
+// builds ignore the value, so C is then left to the driver). The provider caches its answer once per process,
+// so the hook must be in place before Streamline loads the provider: nvapi64.dll's nvapi_QueryInterface export
+// is redirected (export table, a jump stub next to the image) before sl.interposer.dll loads, and its answer for
+// 0x73BF8338 is wrapped. Everything else is forwarded unchanged.
+// Approach and NVAPI ABI after MFG-Unlocker (github.com/dashdogy/MFG-Unlocker, source/native/dlssg_preset*,
+// dlssg_provider_policy*), MIT, Copyright (c) 2026 Michael Robles (LICENSES/MFG-Unlocker-MIT.txt).
+namespace DlssgPreset {
+
+constexpr uint32_t kGetSettingInterface = 0x73BF8338u;
+constexpr uint32_t kSettingId           = 0x10E41DF1u;
+constexpr int32_t  kOk                  = 0;
+constexpr int32_t  kSettingNotFound     = -160;
+
+#pragma pack(push, 4)
+union SettingValue {
+	uint32_t dword;
+	struct {
+		uint32_t length;
+		uint8_t  data[4096];
+	} binary;
+	uint16_t text[2048];
+	uint64_t qword;
+};
+struct Setting { // NVDRS_SETTING_V1
+	uint32_t     version;
+	uint16_t     name[2048];
+	uint32_t     id;
+	uint32_t     type;
+	uint32_t     location;
+	uint32_t     current_predefined;
+	uint32_t     predefined_valid;
+	SettingValue predefined;
+	SettingValue current;
+};
+#pragma pack(pop)
+static_assert(sizeof(Setting) == 12320);
+constexpr uint32_t kSettingVersion = sizeof(Setting) | (1u << 16);
+
+using QueryInterfaceFn = void*(__cdecl*)(uint32_t);
+using GetSettingFn     = int32_t(__cdecl*)(void*, void*, uint32_t, Setting*);
+
+uint32_t                  g_preset = 0; // 0 off, else 1..3
+std::atomic<QueryInterfaceFn> g_query {nullptr};
+std::atomic<GetSettingFn>     g_get_setting {nullptr};
+std::atomic<uint64_t>         g_reads {0};
+std::atomic<uint64_t>         g_applied {0};
+std::atomic<int>              g_provider_c {-1}; // -1 unknown, 0 lacks C, 1 has C
+std::mutex                    g_log_mutex;
+
+// The module's VS_FIXEDFILEINFO (from its own resources: no version.dll).
+bool ModuleVersion(HMODULE module, uint16_t v[4]) {
+	HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16));
+	if (resource == nullptr) return false;
+	HGLOBAL     handle = LoadResource(module, resource);
+	const DWORD size   = SizeofResource(module, resource);
+	const auto* bytes  = handle != nullptr ? static_cast<const uint8_t*>(LockResource(handle)) : nullptr;
+	if (bytes == nullptr) return false;
+	for (DWORD i = 0; i + 52 <= size; i += 4) {
+		uint32_t signature = 0;
+		std::memcpy(&signature, bytes + i, 4);
+		if (signature != 0xFEEF04BDu) continue;
+		uint32_t ms = 0, ls = 0;
+		std::memcpy(&ms, bytes + i + 8, 4);
+		std::memcpy(&ls, bytes + i + 12, 4);
+		v[0] = static_cast<uint16_t>(ms >> 16);
+		v[1] = static_cast<uint16_t>(ms);
+		v[2] = static_cast<uint16_t>(ls >> 16);
+		v[3] = static_cast<uint16_t>(ls);
+		return true;
+	}
+	return false;
+}
+
+char Letter(uint32_t preset) { return preset == 0 ? '0' : static_cast<char>('A' + preset - 1); }
+
+// Whether the reading module (nvngx_dlssg.dll) implements Preset C; logs once.
+bool ProviderHasC(const void* caller) {
+	int known = g_provider_c.load(std::memory_order_acquire);
+	if (known >= 0) return known == 1;
+	std::lock_guard lock(g_log_mutex);
+	known = g_provider_c.load(std::memory_order_acquire);
+	if (known >= 0) return known == 1;
+	HMODULE module = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                   static_cast<LPCWSTR>(caller), &module);
+	char     name[MAX_PATH] = "?";
+	uint16_t v[4] {};
+	const bool versioned = module != nullptr && ModuleVersion(module, v);
+	if (module != nullptr && GetModuleFileNameA(module, name, MAX_PATH) != 0) {
+		if (const char* slash = std::strrchr(name, '\\'); slash != nullptr) std::memmove(name, slash + 1, std::strlen(slash));
+	}
+	const uint64_t version = versioned ? (uint64_t(v[0]) << 32) | (uint64_t(v[1]) << 16) | v[2] : 0;
+	const bool     has_c   = versioned && version >= ((uint64_t(310) << 32) | (uint64_t(9) << 16) | 16);
+	if (g_preset == 3) {
+		LOGF("[dlssg] preset C requested; provider %s %u.%u.%u: %s\n", name, v[0], v[1], v[2],
+		     has_c ? "applied" : "not supported (needs >= 310.9.16), left to the driver");
+		std::printf("[dlssg] preset C requested; provider %s %u.%u.%u: %s\n", name, v[0], v[1], v[2],
+		            has_c ? "applied" : "not supported (needs >= 310.9.16)");
+	} else {
+		LOGF("[dlssg] preset %c requested; provider %s %u.%u.%u: applied\n", Letter(g_preset), name, v[0], v[1], v[2]);
+		std::printf("[dlssg] preset %c requested; provider %s %u.%u.%u: applied\n", Letter(g_preset), name, v[0], v[1],
+		            v[2]);
+	}
+	std::fflush(stdout);
+	g_provider_c.store(has_c ? 1 : 0, std::memory_order_release);
+	return has_c;
+}
+
+__declspec(noinline) int32_t __cdecl GetSettingHook(void* session, void* profile, uint32_t id, Setting* setting) {
+	const GetSettingFn original = g_get_setting.load(std::memory_order_acquire);
+	const int32_t      result   = original(session, profile, id, setting);
+	if (id != kSettingId || setting == nullptr || setting->version != kSettingVersion) return result;
+	if (!(result == kSettingNotFound || (result == kOk && setting->id == id && setting->type == 0))) return result;
+	// Only nvngx_dlssg*.dll's own reads are answered (as MFG-Unlocker does: its override is limited to the
+	// retained DLSS-G provider); other readers of the key (NGX core, Streamline, the driver) keep the driver's
+	// value. Each distinct reader is logged once, to see who reads the key. KYTY_DLSSG_PRESET_ALL=1: every reader.
+	{
+		HMODULE caller = nullptr;
+		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                   static_cast<LPCWSTR>(_ReturnAddress()), &caller);
+		char path[MAX_PATH] = "?";
+		if (caller != nullptr) GetModuleFileNameA(caller, path, MAX_PATH);
+		const char* slash = std::strrchr(path, '\\');
+		const char* name  = slash != nullptr ? slash + 1 : path;
+		const bool  provider = _strnicmp(name, "nvngx_dlssg", 11) == 0;
+		static const bool all = [] {
+			const char* v = std::getenv("KYTY_DLSSG_PRESET_ALL");
+			return v != nullptr && *v != '\0' && *v != '0';
+		}();
+		{
+			static HMODULE seen[16] {};
+			std::lock_guard lock(g_log_mutex);
+			bool known = false;
+			for (HMODULE& m: seen) {
+				if (m == caller) { known = true; break; }
+				if (m == nullptr) { m = caller; break; }
+			}
+			if (!known) {
+				LOGF("[dlssg] FG preset key read by %s (driver %s %u): %s\n", name, result == kOk ? "value" : "none",
+				     result == kOk ? setting->current.dword : 0u, provider || all ? "overridden" : "left as is");
+				std::printf("[dlssg] FG preset key read by %s (driver %s %u): %s\n", name,
+				            result == kOk ? "value" : "none", result == kOk ? setting->current.dword : 0u,
+				            provider || all ? "overridden" : "left as is");
+				std::fflush(stdout);
+			}
+		}
+		if (!provider && !all) return result;
+	}
+	const uint64_t reads = g_reads.fetch_add(1, std::memory_order_relaxed) + 1;
+	const uint32_t was   = result == kOk ? setting->current.dword : 0;
+	const bool has_c = ProviderHasC(_ReturnAddress()); // (Also logs the provider once.)
+	if (g_preset == 3 && !has_c) return result;
+	if (result == kSettingNotFound) {
+		std::memset(setting, 0, sizeof(*setting));
+		setting->version = kSettingVersion;
+		setting->id      = id;
+		constexpr char label[] = "Override DLSS-FG preset";
+		for (size_t i = 0; i < sizeof(label); ++i) setting->name[i] = static_cast<uint16_t>(label[i]);
+	}
+	setting->location           = 0;
+	setting->current_predefined = 0;
+	std::memset(&setting->current, 0, sizeof(setting->current));
+	setting->current.dword = g_preset;
+	const uint64_t applied = g_applied.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((reads & (reads - 1)) == 0) {
+		LOGF("[dlssg] FG preset read #%llu by the provider (driver %s %u, answered %c, %llu overridden)\n",
+		     static_cast<unsigned long long>(reads), result == kOk ? "value" : "none", was, Letter(g_preset),
+		     static_cast<unsigned long long>(applied));
+	}
+	return kOk;
+}
+
+void* __cdecl QueryInterfaceHook(uint32_t id) {
+	void* function = g_query.load(std::memory_order_acquire)(id);
+	if (id != kGetSettingInterface || function == nullptr) return function;
+	GetSettingFn expected = nullptr;
+	if (!g_get_setting.compare_exchange_strong(expected, reinterpret_cast<GetSettingFn>(function)) &&
+	    expected != reinterpret_cast<GetSettingFn>(function)) {
+		return function; // (A second, different implementation: left alone.)
+	}
+	return reinterpret_cast<void*>(&GetSettingHook);
+}
+
+// Points nvapi64.dll's nvapi_QueryInterface export at QueryInterfaceHook (later GetProcAddress calls and imports
+// resolve to it). Before sl.interposer.dll loads.
+void Install() {
+	const char* value = std::getenv("KYTY_DLSSG_PRESET");
+	if (value == nullptr || *value == '\0') return;
+	switch (*value) {
+		case 'A': case 'a': case '1': g_preset = 1; break;
+		case 'B': case 'b': case '2': g_preset = 2; break;
+		case 'C': case 'c': case '3': g_preset = 3; break;
+		case '0': return; // game / driver
+		default: LOGF("[dlssg] KYTY_DLSSG_PRESET=%s: not A, B, C or 0, ignored\n", value); return;
+	}
+	const auto fail = [](const char* why) {
+		LOGF("[dlssg] preset %c requested: not applied (%s)\n", Letter(g_preset), why);
+		std::printf("[dlssg] preset %c requested: not applied (%s)\n", Letter(g_preset), why);
+		g_preset = 0;
+	};
+	HMODULE nvapi = LoadLibraryExW(L"nvapi64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+	if (nvapi == nullptr) return fail("no nvapi64.dll");
+	HMODULE pinned = nullptr; // (Never unloaded: the export now points into our stub.)
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+	                   reinterpret_cast<LPCWSTR>(nvapi), &pinned);
+	auto*       base = reinterpret_cast<uint8_t*>(nvapi);
+	const auto* dos  = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+	const auto* nt   = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+	const auto& dir  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+	if (dir.VirtualAddress == 0) return fail("nvapi64.dll has no exports");
+	const auto* exports   = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
+	const auto* names     = reinterpret_cast<const DWORD*>(base + exports->AddressOfNames);
+	const auto* ordinals  = reinterpret_cast<const WORD*>(base + exports->AddressOfNameOrdinals);
+	auto*       functions = reinterpret_cast<DWORD*>(base + exports->AddressOfFunctions);
+	DWORD*      slot      = nullptr;
+	for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
+		if (std::strcmp(reinterpret_cast<const char*>(base + names[i]), "nvapi_QueryInterface") == 0) {
+			slot = &functions[ordinals[i]];
+			break;
+		}
+	}
+	if (slot == nullptr) return fail("no nvapi_QueryInterface");
+	auto* original = reinterpret_cast<QueryInterfaceFn>(GetProcAddress(nvapi, "nvapi_QueryInterface"));
+	if (original == nullptr || reinterpret_cast<uint8_t*>(original) != base + *slot) return fail("unexpected export");
+	// A jump stub above the image, within the 32-bit export RVA range.
+	const uintptr_t image_end = reinterpret_cast<uintptr_t>(base) + nt->OptionalHeader.SizeOfImage;
+	uint8_t*        stub      = nullptr;
+	for (uintptr_t at = (image_end + 0xFFFF) & ~uintptr_t(0xFFFF);
+	     stub == nullptr && at < reinterpret_cast<uintptr_t>(base) + 0x7FFF0000u; at += 0x10000) {
+		stub = static_cast<uint8_t*>(
+		    VirtualAlloc(reinterpret_cast<void*>(at), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	}
+	if (stub == nullptr) return fail("no memory near nvapi64.dll");
+	const uint64_t target = reinterpret_cast<uint64_t>(&QueryInterfaceHook);
+	stub[0] = 0xFF; stub[1] = 0x25; std::memset(stub + 2, 0, 4); // jmp [rip+0]
+	std::memcpy(stub + 6, &target, 8);
+	DWORD protection = 0;
+	VirtualProtect(stub, 4096, PAGE_EXECUTE_READ, &protection);
+	FlushInstructionCache(GetCurrentProcess(), stub, 14);
+	g_query.store(original, std::memory_order_release);
+	if (!VirtualProtect(slot, sizeof(DWORD), PAGE_READWRITE, &protection)) return fail("export table is read-only");
+	*slot = static_cast<DWORD>(reinterpret_cast<uintptr_t>(stub) - reinterpret_cast<uintptr_t>(base));
+	VirtualProtect(slot, sizeof(DWORD), protection, &protection);
+	LOGF("[dlssg] preset %c requested: NVAPI DRS read hook installed (driver profile untouched)\n", Letter(g_preset));
+	if (GetModuleHandleW(L"nvngx_dlssg.dll") != nullptr) LOGF("[dlssg] warning: nvngx_dlssg.dll was already loaded\n");
+}
+
+} // namespace DlssgPreset
+
+#endif
+
+} // namespace
+
+bool Enabled() {
+	return g_ready;
+}
+
+bool DlssUpscaleWanted();
+bool TaaReplaceWanted();
+bool Capturing() {
+	// (KYTY_KBM_WARP: the frame's HUD-less composite, so that only the 3D is reprojected; kbm-warp.h.)
+	return Enabled() || Fsr3::Active() || Fsr3::UpscaleWanted() || DlssUpscaleWanted() || Xess::Wanted() ||
+	       TaaReplaceWanted();
+}
+
+bool Requested() {
+	return g_generate > 0;
+}
+
+// 10-22: KYTY_DLSSG_PACE: how real frames are paced for DLSS-G.
+//   adaptive (opt-in): VideoOut's flip pacer at max(target / m, mean + 0.75 sd of the last windows' present
+//     intervals). Below the cap (log 20261022-103006: 43-51 real, 21 ms mean) nothing held the frames, so the game's
+//     own frame-time spread reached DLSS-G (present interval sd 1.1-1.9 ms; FSR3's 0.37 was at a held 60); a steady
+//     interval just above the typical frame evens it for a few % of real rate.
+//   grid (default): the flip pacer at target / m only. Adaptive is held to at most 1.15 target / m and reset in
+//   cutscenes, cinematics, movies and with DLSS-G off (it learned a 30 fps phase and held its own 36 ms after it).
+//   reflex: Streamline's Reflex limit at target / m and our pacer off.
+//   reflexfree (default with KYTY_FRAMEGEN_BASE=0, the game unlocked): as FSR3 unlocked (log 20261022-193327: smooth
+//     at 45-60 real, present interval sd 1.08, flip->present 33.6 ms; DLSS-G fixed x4 locked, 193116: sd 1.74,
+//     flip->present 48.7, 11.9 frames over 25 ms a window): no flip pacer and no flip floor on real frames, the only
+//     limit Reflex's frameLimitUs = 1e6 m / target (its sleep, at the guest frame start, holds the game), flips when
+//     ready; the game's own variable step above 60.
+int DlssgPaceMode() {
+	static const int mode = [] {
+		const char* v = std::getenv("KYTY_DLSSG_PACE");
+		if (v != nullptr && std::strcmp(v, "adaptive") == 0) return 0;
+		if (v != nullptr && std::strcmp(v, "grid") == 0) return 1;
+		if (v != nullptr && std::strcmp(v, "reflex") == 0) return 2;
+		if (v != nullptr && std::strcmp(v, "reflexfree") == 0) return 3;
+		// 10-23: the game unlocked (KYTY_FRAMEGEN_BASE=0): reflexfree, as FSR3 unlocked runs.
+		const char* base = std::getenv("KYTY_FRAMEGEN_BASE");
+		if (base != nullptr && std::strcmp(base, "0") == 0) return 3;
+		return 1; // grid (10-22: adaptive locked at 36 ms after a 30 fps phase, log 20261022-175339)
+	}();
+	return mode;
+}
+std::atomic<double> g_pace_adapt {0.0}; // adaptive: the steady interval from the present interval statistics
+
+double RealFrameInterval() {
+	if (!g_ready || DlssgPaceMode() >= 2) return 0.0;
+	const double base = g_real_interval.load();
+	return base > 0.0 && DlssgPaceMode() == 0 ? std::clamp(g_pace_adapt.load(), base, 1.15 * base) : base;
+}
+
+std::string SupportProblem(vk::PhysicalDevice physical_device) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (g_upscale) {
+		sl::AdapterInfo adapter {};
+		adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
+		const auto result        = g_api.is_feature_supported(sl::kFeatureDLSS, adapter);
+		std::printf("DLSS super resolution: %s\n", result == sl::Result::eOk
+		                                               ? "Streamline offers it with this GPU and driver"
+		                                               : (std::string("not offered here (") + sl::getResultAsStr(result) +
+		                                                  "; an NVIDIA RTX GPU and a recent driver)")
+		                                                     .c_str());
+		std::fflush(stdout);
+	}
+#endif
+	if (g_generate == 0) {
+		return {};
+	}
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// (Streamline answers before the device too: its programming guide asks while the adapters are enumerated. Issue
+	// #45: a device refused with no word why; the driver's own refusal says nothing either.)
+	sl::AdapterInfo adapter {};
+	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
+	const auto  result       = g_api.is_feature_supported(sl::kFeatureDLSS_G, adapter);
+	std::string problem;
+	switch (result) {
+		case sl::Result::eOk: break;
+		case sl::Result::eErrorOSDisabledHWS:
+			problem = "Windows' hardware-accelerated GPU scheduling is off (Settings > System > Display > Graphics > "
+			          "Advanced graphics settings; then restart the PC)";
+			break;
+		case sl::Result::eErrorOSOutOfDate: problem = "this Windows version is too old for DLSS frame generation"; break;
+		case sl::Result::eErrorDriverOutOfDate: problem = "the NVIDIA driver is too old for DLSS frame generation"; break;
+		case sl::Result::eErrorNoSupportedAdapterFound:
+		case sl::Result::eErrorAdapterNotSupported:
+			problem = "this graphics card has no DLSS frame generation (NVIDIA RTX 40 or newer)";
+			break;
+		default: problem = std::string("Streamline does not offer DLSS frame generation here (") + sl::getResultAsStr(result) + ")"; break;
+	}
+	if (problem.empty()) {
+		LOGF("frame generation: Streamline offers DLSS-G with this GPU, driver and Windows\n");
+		std::printf("Frame generation: Streamline offers DLSS-G with this GPU, driver and Windows\n");
+	} else {
+		LOGF("frame generation: %s\n", problem.c_str());
+		std::printf("Frame generation: %s\n", problem.c_str());
+	}
+	// (Where the driver's reservations go, for a refused device's log: RefusedDeviceAdvice.)
+	PROCESS_MITIGATION_ASLR_POLICY aslr {};
+	if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessASLRPolicy, &aslr, sizeof(aslr))) {
+		std::printf("Frame generation: bottom-up ASLR %s for the emulator\n", aslr.EnableBottomUpRandomization != 0 ? "on" : "off");
+	}
+	std::fflush(stdout);
+	return problem;
+#else
+	(void)physical_device;
+	return {};
+#endif
+}
+
+std::string RefusedDeviceAdvice() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// (The emulator is built with fixed addresses, so without bottom-up ASLR its host allocations pack upward from the
+	// guest's ceiling; an RTX 5080's driver refused the device until Exploit protection forced it on for the emulator.)
+	PROCESS_MITIGATION_ASLR_POLICY aslr {};
+	if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessASLRPolicy, &aslr, sizeof(aslr)) &&
+	    aslr.EnableBottomUpRandomization == 0) {
+		return " If it keeps failing, in Windows Security: App & browser control > Exploit protection > Program settings > "
+		       "add kyty_emulator.exe > Randomize memory allocations (Bottom-up ASLR): Override system settings, On "
+		       "(issue #45).";
+	}
+#endif
+	return {};
+}
+
+bool StreamlineLoaded() {
+	return g_generate > 0 || g_dlss_sr || g_taa_dlss || g_upscale;
+}
+
+int GeneratedFrames() {
+	return g_generate;
+}
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+void NoteAcquireMs(double ms) {
+	g_stat_acquire_ms += ms;
+	g_stat_acquire_max = std::max(g_stat_acquire_max, ms);
+}
+void NoteGpuWaitMs(double ms) {
+	g_stat_gpuwait_ms += ms;
+	g_stat_gpuwait_max = std::max(g_stat_gpuwait_max, ms);
+}
+void NoteFlipPresentMs(double ms) {
+	g_stat_flip_ms += ms;
+	g_stat_flip_max = std::max(g_stat_flip_max, ms);
+}
+void NoteSubmitMs(double ms) {
+	g_stat_submit_ms += ms;
+	g_stat_submit_max = std::max(g_stat_submit_max, ms);
+}
+void NoteBeforePresentMs(double ms) {
+	g_stat_before_ms += ms;
+	g_stat_before_max = std::max(g_stat_before_max, ms);
+}
+#else
+void NoteSubmitMs(double) {}
+void NoteBeforePresentMs(double) {}
+void NoteAcquireMs(double) {}
+void NoteGpuWaitMs(double) {}
+void NoteFlipPresentMs(double) {}
+#endif
+
+bool WantsCamera() {
+	return g_ready && !g_camera.valid;
+}
+
+bool InputsGathered() {
+	// (GenericInputs: the frame's own are made at its flip.)
+	return (g_sources.valid && g_camera.valid) || GenericInputs();
+}
+
+void BypassCommandHooks(vk::Device device) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// KYTY_FRAMEGEN_HOOKS=1 keeps Streamline's wrappers (for comparison).
+	if ((g_generate == 0 && !g_dlss_sr && !g_taa_dlss && !g_upscale) || std::getenv("KYTY_FRAMEGEN_HOOKS") != nullptr) {
+		return;
+	}
+	// The real loader: Streamline itself forwards to it.
+	HMODULE loader = GetModuleHandleW(L"vulkan-1.dll");
+	auto*   get_device_proc = loader != nullptr ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+	                                                reinterpret_cast<void*>(GetProcAddress(loader, "vkGetDeviceProcAddr")))
+	                                          : nullptr;
+	if (get_device_proc == nullptr) {
+		return;
+	}
+	auto&      dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+	const auto native     = static_cast<VkDevice>(device);
+	uint32_t   replaced   = 0;
+	const auto direct     = [&](auto& function, const char* name) {
+        if (auto* pointer = get_device_proc(native, name); pointer != nullptr) {
+            function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(pointer);
+            ++replaced;
+        }
+	};
+	// Every per-command entry point the translation uses (10 000 draws and 3 000 dispatches a frame at the dragon's
+	// path, each with its push constants, barriers and bindings): Streamline's wrappers only track state the emulator
+	// does not need (eDisableCLStateTracking). Queue submission, presentation and the swapchain stay hooked.
+	direct(dispatcher.vkBeginCommandBuffer, "vkBeginCommandBuffer");
+	direct(dispatcher.vkEndCommandBuffer, "vkEndCommandBuffer");
+	direct(dispatcher.vkCmdBindPipeline, "vkCmdBindPipeline");
+	direct(dispatcher.vkCmdBindDescriptorSets, "vkCmdBindDescriptorSets");
+	direct(dispatcher.vkCmdPipelineBarrier, "vkCmdPipelineBarrier");
+	direct(dispatcher.vkCmdPipelineBarrier2, "vkCmdPipelineBarrier2");
+	direct(dispatcher.vkCmdPushConstants, "vkCmdPushConstants");
+	direct(dispatcher.vkCmdBindIndexBuffer, "vkCmdBindIndexBuffer");
+	direct(dispatcher.vkCmdBindVertexBuffers, "vkCmdBindVertexBuffers");
+	direct(dispatcher.vkCmdDraw, "vkCmdDraw");
+	direct(dispatcher.vkCmdDrawIndexed, "vkCmdDrawIndexed");
+	direct(dispatcher.vkCmdDrawIndirect, "vkCmdDrawIndirect");
+	direct(dispatcher.vkCmdDrawIndexedIndirect, "vkCmdDrawIndexedIndirect");
+	direct(dispatcher.vkCmdDispatch, "vkCmdDispatch");
+	direct(dispatcher.vkCmdDispatchIndirect, "vkCmdDispatchIndirect");
+	direct(dispatcher.vkCmdCopyBuffer, "vkCmdCopyBuffer");
+	direct(dispatcher.vkCmdCopyBufferToImage, "vkCmdCopyBufferToImage");
+	direct(dispatcher.vkCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer");
+	direct(dispatcher.vkCmdCopyImage, "vkCmdCopyImage");
+	direct(dispatcher.vkCmdBlitImage, "vkCmdBlitImage");
+	direct(dispatcher.vkCmdFillBuffer, "vkCmdFillBuffer");
+	direct(dispatcher.vkCmdUpdateBuffer, "vkCmdUpdateBuffer");
+	direct(dispatcher.vkCmdClearColorImage, "vkCmdClearColorImage");
+	direct(dispatcher.vkCmdClearDepthStencilImage, "vkCmdClearDepthStencilImage");
+	direct(dispatcher.vkCmdClearAttachments, "vkCmdClearAttachments");
+	direct(dispatcher.vkCmdBeginRendering, "vkCmdBeginRendering");
+	direct(dispatcher.vkCmdEndRendering, "vkCmdEndRendering");
+	direct(dispatcher.vkCmdSetViewport, "vkCmdSetViewport");
+	direct(dispatcher.vkCmdSetScissor, "vkCmdSetScissor");
+	direct(dispatcher.vkCmdSetDepthBias, "vkCmdSetDepthBias");
+	direct(dispatcher.vkCmdSetStencilReference, "vkCmdSetStencilReference");
+	direct(dispatcher.vkCmdSetBlendConstants, "vkCmdSetBlendConstants");
+	direct(dispatcher.vkCmdSetEvent, "vkCmdSetEvent");
+	direct(dispatcher.vkCmdWaitEvents, "vkCmdWaitEvents");
+	direct(dispatcher.vkCmdWriteTimestamp, "vkCmdWriteTimestamp");
+	direct(dispatcher.vkCmdResetQueryPool, "vkCmdResetQueryPool");
+	direct(dispatcher.vkCmdBeginQuery, "vkCmdBeginQuery");
+	direct(dispatcher.vkCmdEndQuery, "vkCmdEndQuery");
+	direct(dispatcher.vkCmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults");
+	direct(dispatcher.vkCmdExecuteCommands, "vkCmdExecuteCommands");
+	std::printf("Frame generation: %u command-buffer calls bypass Streamline\n", replaced);
+#else
+	(void)device;
+#endif
+}
+
+void Initialize() {
+	const char* value = std::getenv("KYTY_FRAMEGEN");
+	g_generate        = value != nullptr ? std::clamp(std::atoi(value), 0, 5) : 0;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (const char* dyn = std::getenv("KYTY_DLSSG_DYNAMIC"); dyn != nullptr && *dyn == '1') {
+		if (value == nullptr) g_generate = 5; // KYTY_FRAMEGEN is the maximum (default 5: x6, capped by the GPU)
+	}
+	if (const char* dyn = std::getenv("KYTY_DLSSG_DYNAMIC"); dyn != nullptr && *dyn == '1' && g_generate > 0) {
+		g_dlssg_dynamic = true;
+		if (const char* st = std::getenv("KYTY_DLSSG_DYN_STRETCH"); st != nullptr && *st == '0') g_dyn_stretch = false;
+		if (const char* t = std::getenv("KYTY_DLSSG_TARGET_FPS"); t != nullptr && std::atof(t) > 0) {
+			g_dlssg_target_fps = static_cast<float>(std::atof(t));
+		} else {
+			DEVMODEA dm {};
+			dm.dmSize = sizeof(dm);
+			if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm) != 0 && dm.dmDisplayFrequency > 30) {
+				const double hz    = dm.dmDisplayFrequency;
+				g_dlssg_target_fps = static_cast<float>(std::floor(hz - hz * hz / 3600.0));
+			}
+		}
+		if (g_dlssg_target_fps <= 0.0f) g_dlssg_target_fps = 224.0f;
+		// First guess: the game's usual 60 real fps.
+		g_dyn_max = std::min(g_generate, 3); // until Streamline reports numFramesToGenerateMax
+		g_dyn_gen = std::clamp(static_cast<int>(std::floor(g_dlssg_target_fps / 60.0)) - 1, 1, g_dyn_max);
+	}
+#endif
+	{
+		const char* upscale = std::getenv("KYTY_UPSCALE");
+		g_dlss_sr           = upscale != nullptr && std::string(upscale) == "dlss";
+		const char* taa     = std::getenv("KYTY_TAA_REPLACE");
+		g_taa_dlss          = taa != nullptr && std::string(taa) == "dlss";
+		g_taa_bypass        = taa != nullptr && std::string(taa) == "upscaler";
+		if (const char* mode = std::getenv("KYTY_TAA_BYPASS_MODE"); mode != nullptr && std::string(mode) == "copy")
+			g_taa_bypass_copy = true;
+		// (Default: match. KYTY_TAA_BYPASS_MODE=raw: the TAA's output left to the game and the raw frame to the
+		// upscaler alone: 10-17 the Nexus went black and lost the ghosts and glowing runes, drawn after the TAA.)
+		g_taa_bypass_match = !(std::getenv("KYTY_TAA_BYPASS_MODE") != nullptr &&
+		                       std::string(std::getenv("KYTY_TAA_BYPASS_MODE")) == "raw");
+		// KYTY_UPSCALER: the game's PS5 Pro path (its upscaler in place of the TAA) with DLSS, XeSS or FSR.
+		const char* upscaler = std::getenv("KYTY_UPSCALER");
+		const std::string kind = upscaler != nullptr ? upscaler : "";
+		g_sr_kind = kind == "dlss" ? 1 : kind == "xess" ? 2 : kind == "fsr" ? 3 : 0;
+		g_upscale = g_sr_kind == 1;
+	}
+	if (g_generate == 0 && !g_dlss_sr && !g_taa_dlss && !g_upscale) {
+		return;
+	}
+	// (Every way out without Streamline turns both off.)
+	struct Off {
+		bool done = false;
+		~Off() {
+			if (!done) {
+				g_generate = 0;
+				g_upscale  = false;
+			}
+		}
+	} off;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// NVIDIA's Streamline runtime, which no release ships (the user's own copy: the Streamline SDK's bin\x64):
+	// KYTY_STREAMLINE_DIR (the launcher's "Streamline..." folder, run-windows -StreamlineDir), else a "streamline"
+	// folder next to the emulator, else the SDK unpacked beside the build (_Build\deps\streamline\sdk). A folder
+	// may be the SDK's own (its bin\x64 is taken).
+	std::vector<std::filesystem::path> candidates;
+	wchar_t                            exe[MAX_PATH] {};
+	GetModuleFileNameW(nullptr, exe, MAX_PATH);
+	const auto exe_dir = std::filesystem::path(exe).parent_path();
+	// (Wide: a folder's name in any language.)
+	if (const wchar_t* env = _wgetenv(L"KYTY_STREAMLINE_DIR"); env != nullptr && *env != L'\0') {
+		candidates.emplace_back(env);
+	} else {
+		candidates.push_back(exe_dir / "streamline");
+		candidates.push_back(exe_dir.parent_path() / "deps" / "streamline" / "sdk");
+	}
+	std::filesystem::path dir;
+	for (const auto& candidate: candidates) {
+		for (const auto& folder: {candidate, candidate / "bin" / "x64"}) {
+			std::error_code error;
+			if (dir.empty() && std::filesystem::exists(folder / "sl.interposer.dll", error)) dir = folder;
+		}
+	}
+	if (dir.empty()) {
+		LOGF("frame generation: no sl.interposer.dll (KYTY_STREAMLINE_DIR or a streamline folder next to the emulator)\n");
+		std::printf("Frame generation: NVIDIA's Streamline runtime was not found (choose its folder in the launcher)\n");
+		g_generate = 0;
+		g_dlss_sr  = false;
+		g_taa_dlss = false;
+		return;
+	}
+	const auto interposer = dir / "sl.interposer.dll";
+	// Only NVIDIA's own (Streamline then checks its plugins' signatures itself).
+	if (!LocalPlatform::IsNvidiaSigned(interposer.wstring())) {
+		LOGF("frame generation: %s is not signed by NVIDIA: not loaded\n", interposer.string().c_str());
+		std::printf("Frame generation: %s is not signed by NVIDIA, not loaded\n", interposer.string().c_str());
+		g_generate = 0;
+		g_dlss_sr  = false;
+		g_taa_dlss = false;
+		return;
+	}
+	if (std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr) {
+		// Graphics modules already loaded before Streamline (it must come first).
+		for (const char* name: {"vulkan-1.dll", "nvoglv64.dll", "opengl32.dll", "dxgi.dll", "d3d11.dll", "d3d12.dll",
+		                        "d3d9.dll", "nvapi64.dll", "nvcuda.dll", "nvofapi64.dll", "sl.interposer.dll"}) {
+			if (GetModuleHandleA(name) != nullptr) std::printf("Frame generation: %s already loaded\n", name);
+		}
+	}
+	DlssgPreset::Install(); // (Before Streamline loads nvngx_dlssg.dll.)
+	HMODULE    module     = LoadLibraryW(interposer.c_str());
+	if (module == nullptr) {
+		LOGF("frame generation: cannot load %s\n", interposer.string().c_str());
+		std::printf("Frame generation: cannot load %s\n", interposer.string().c_str());
+		g_generate = 0;
+		g_dlss_sr  = false;
+		g_taa_dlss = false;
+		return;
+	}
+	const auto load = [&](auto& function, const char* name) {
+		function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(
+		    reinterpret_cast<void*>(GetProcAddress(module, name)));
+		return function != nullptr;
+	};
+	if (!load(g_api.init, "slInit") || !load(g_api.is_feature_supported, "slIsFeatureSupported") ||
+	    !load(g_api.is_feature_loaded, "slIsFeatureLoaded") ||
+	    !load(g_api.get_feature_function, "slGetFeatureFunction") ||
+	    !load(g_api.get_new_frame_token, "slGetNewFrameToken") ||
+	    !load(g_api.set_constants, "slSetConstants") ||
+	    !load(g_api.set_tag_for_frame, "slSetTagForFrame") || !load(g_api.evaluate, "slEvaluateFeature")) {
+		LOGF("frame generation: sl.interposer.dll lacks an entry point\n");
+		g_generate = 0;
+		g_dlss_sr  = false;
+		g_taa_dlss = false;
+		return;
+	}
+	static const std::wstring plugin_dir = dir.wstring();
+	static const std::wstring log_dir    = (dir.parent_path() / "logs").wstring();
+	static const wchar_t*     plugin_paths[] {plugin_dir.c_str()};
+	// KYTY_FRAMEGEN_FEATURES=dlssg,reflex,pcl: the plugins to load (a diagnostic subset).
+	static std::vector<sl::Feature> features;
+	if (g_generate > 0) features = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
+	if (const char* list = std::getenv("KYTY_FRAMEGEN_FEATURES"); list != nullptr && g_generate > 0) {
+		const std::string text = list;
+		features.clear();
+		if (text.find("dlssg") != std::string::npos) features.push_back(sl::kFeatureDLSS_G);
+		if (text.find("reflex") != std::string::npos) features.push_back(sl::kFeatureReflex);
+		if (text.find("pcl") != std::string::npos) features.push_back(sl::kFeaturePCL);
+	}
+	// DLSS super resolution (KYTY_UPSCALE=dlss, KYTY_TAA_REPLACE=dlss): its plugin too. Without frame generation the
+	// same plugins are loaded all the same (DLSS-G then stays off): with only the DLSS plugin the emulator closed as the
+	// Vulkan device was made (logs 005353, 013603), with the frame generation set it ran.
+	if (g_dlss_sr || g_taa_dlss || g_upscale) features.push_back(sl::kFeatureDLSS);
+	sl::Preferences           preferences {};
+	preferences.showConsole        = false;
+	preferences.logLevel           = std::getenv("KYTY_FRAMEGEN_VERBOSE") ? sl::LogLevel::eVerbose
+	                                                                      : sl::LogLevel::eDefault;
+	preferences.pathsToPlugins     = plugin_paths;
+	preferences.numPathsToPlugins  = 1;
+	preferences.pathToLogsAndData  = nullptr;
+	preferences.logMessageCallback = LogMessage;
+	preferences.flags              = sl::PreferenceFlags::eDisableCLStateTracking |
+	                    sl::PreferenceFlags::eUseFrameBasedResourceTagging;
+	preferences.featuresToLoad    = features.data();
+	preferences.numFeaturesToLoad = static_cast<uint32_t>(features.size());
+	preferences.engine            = sl::EngineType::eCustom;
+	preferences.engineVersion     = "1.0";
+	preferences.projectId         = "6a3f1d5e-4b7c-4f2a-9d8e-1c2b3a4d5e6f";
+	preferences.renderAPI         = sl::RenderAPI::eVulkan;
+	if (const auto result = g_api.init(preferences, sl::kSDKVersion); result != sl::Result::eOk) {
+		LOGF("frame generation: slInit failed (%d)\n", static_cast<int>(result));
+		std::printf("Frame generation: slInit failed (%d)\n", static_cast<int>(result));
+		g_generate = 0;
+		g_dlss_sr  = false;
+		g_taa_dlss = false;
+		return;
+	}
+	// SDL loads the interposer as the Vulkan loader: every instance/device/swapchain call then
+	// goes through Streamline, which adds what DLSS-G needs.
+	SetEnvironmentVariableW(L"SDL_VULKAN_LIBRARY", interposer.c_str());
+	_putenv_s("SDL_VULKAN_LIBRARY", interposer.string().c_str());
+	LOGF("frame generation: Streamline loaded from %s, %d generated frame(s), DLSS super resolution %s\n",
+	     dir.string().c_str(), g_generate, g_upscale ? "asked for" : "off");
+	off.done = true;
+#else
+	LOGF("frame generation: this build has no Streamline support\n");
+	g_generate = 0;
+		g_dlss_sr  = false;
+		g_taa_dlss = false;
+#endif
+}
+
+uint32_t DlssgReflexLimitUs(double interval);
+
+void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device) {
+	(void)instance;
+	(void)device;
+	if (g_generate == 0 && !g_dlss_sr && !g_taa_dlss && !g_upscale) {
+		return;
+	}
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	sl::AdapterInfo adapter {};
+	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
+	bool loaded              = false;
+	if (g_upscale) {
+		bool dlss_loaded = false;
+		if (g_api.is_feature_supported(sl::kFeatureDLSS, adapter) == sl::Result::eOk &&
+		    g_api.is_feature_loaded(sl::kFeatureDLSS, dlss_loaded) == sl::Result::eOk && dlss_loaded &&
+		    FeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", g_api.dlss_set_options) &&
+		    FeatureFunction(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", g_api.dlss_get_optimal_settings)) {
+			g_upscale_ready = true;
+			std::printf("DLSS super resolution (PS5 Pro path): ready\n");
+		} else {
+			std::printf("DLSS super resolution (PS5 Pro path): not available on this device\n");
+		}
+		std::fflush(stdout);
+	}
+	if (g_dlss_sr || g_taa_dlss) {
+		bool dlss_loaded = false;
+		if (g_api.is_feature_supported(sl::kFeatureDLSS, adapter) != sl::Result::eOk ||
+		    g_api.is_feature_loaded(sl::kFeatureDLSS, dlss_loaded) != sl::Result::eOk || !dlss_loaded ||
+		    !FeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", g_api.dlss_set_options)) {
+			std::printf("Upscaling: DLSS is not supported on this device: upscaling off\n");
+		} else {
+			g_sr_ready = true;
+			std::printf("Upscaling: DLSS super resolution ready\n");
+		}
+		std::fflush(stdout);
+	}
+	if (g_generate == 0) {
+		return;
+	}
+	if (g_api.is_feature_supported(sl::kFeatureDLSS_G, adapter) != sl::Result::eOk ||
+	    g_api.is_feature_loaded(sl::kFeatureDLSS_G, loaded) != sl::Result::eOk || !loaded) {
+		LOGF("frame generation: DLSS-G is not supported on this device\n");
+		std::printf("Frame generation: DLSS-G is not supported on this device\n");
+		return;
+	}
+	if (!FeatureFunction(sl::kFeatureDLSS_G, "slDLSSGSetOptions", g_api.dlssg_set_options) ||
+	    !FeatureFunction(sl::kFeatureDLSS_G, "slDLSSGGetState", g_api.dlssg_get_state) ||
+	    !FeatureFunction(sl::kFeatureReflex, "slReflexSetOptions", g_api.reflex_set_options) ||
+	    !FeatureFunction(sl::kFeaturePCL, "slPCLSetMarker", g_api.pcl_set_marker)) {
+		return;
+	}
+	// slReflexSleep each frame (KYTY_DLSSG_SLEEP=0: not): Reflex is then active, as DLSS-G requires; without it its
+	// pacer held every present ~25 ms (the game at ~37 fps), and with Reflex off the game reached ~56 but DLSS-G
+	// reported Reflex missing (a tinted picture).
+	FeatureFunction(sl::kFeatureReflex, "slReflexSleep", g_api.reflex_sleep);
+	sl::ReflexOptions& reflex = g_reflex_opts;
+	reflex = {};
+	reflex.mode = sl::ReflexMode::eLowLatency;
+	// KYTY_DLSSG_REFLEX=off|low|boost (a comparison of DLSS-G's pacing).
+	if (const char* mode = std::getenv("KYTY_DLSSG_REFLEX"); mode != nullptr) {
+		if (std::string(mode) == "off") reflex.mode = sl::ReflexMode::eOff;
+		if (std::string(mode) == "boost") reflex.mode = sl::ReflexMode::eLowLatencyWithBoost;
+	}
+	// G-SYNC: the frames shown (rendered x (1 + generated)) must stay under the monitor's refresh, or the ones past it
+	// leave the variable refresh range (a doubled / jumping picture at 227-228 of 240 Hz). Reflex's limiter holds the
+	// rendered frames to cap / (1 + generated), the way NVIDIA's own G-SYNC + Reflex cap does (240 Hz: 224 shown,
+	// 56 rendered at x4). KYTY_VRR_CAP_FPS=<shown fps> or auto (refresh - refresh^2 / 3600); unset: off.
+	{
+		uint32_t cap = 0;
+		const char* text = std::getenv("KYTY_VRR_CAP_FPS");
+		if (text == nullptr || *text == '\0') {
+			cap = 0; // off unless asked for: no frame limit by default
+		} else if (std::string(text) != "auto") {
+			cap = static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
+		} else {
+			DEVMODEA mode {};
+			mode.dmSize = sizeof(mode);
+			if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) != 0 && mode.dmDisplayFrequency > 30) {
+				const double hz = mode.dmDisplayFrequency;
+				cap             = static_cast<uint32_t>(hz - hz * hz / 3600.0);
+			}
+		}
+		// With KYTY_FLIP_FPS already holding the game at or under cap / (1 + generated) (x4: 56 on a 224 Hz vblank,
+		// Reflex's limit 56 too) the emulator's flip pacing alone holds it: two limiters at the same rate beat against
+		// each other (x4 uneven at 56, 10-19; x3 and x5, whose Reflex limit is above their flip rate, were smooth).
+		// KYTY_DLSSG_REFLEX_LIMIT=1: Reflex's limit kept anyway.
+		const int  flip_fps     = [] {
+			const char* v = std::getenv("KYTY_FLIP_FPS");
+			return v != nullptr ? std::atoi(v) : 0;
+		}();
+		const bool force_reflex = [] {
+			const char* v = std::getenv("KYTY_DLSSG_REFLEX_LIMIT");
+			return v != nullptr && *v == '1';
+		}();
+		if (g_dlssg_dynamic) {
+			// 10-22: Reflex holds real <= target / multiplier, set again on every change (KYTY_VRR_CAP_FPS not used).
+			cap                 = 0;
+			g_real_interval     = static_cast<double>(g_dyn_gen + 1) / static_cast<double>(g_dlssg_target_fps);
+			reflex.frameLimitUs = DlssgReflexLimitUs(g_real_interval);
+			std::printf("Frame generation: dynamic multiplier, target %.0f fps: Reflex limit %u us (x%d)\n",
+			            static_cast<double>(g_dlssg_target_fps), reflex.frameLimitUs, g_dyn_gen + 1);
+		}
+		if (cap != 0 && g_generate > 0 && flip_fps > 0 && !force_reflex &&
+		    static_cast<double>(flip_fps) * (g_generate + 1) <= cap + 0.5 &&
+		    static_cast<double>(cap) / (g_generate + 1) <= flip_fps * 1.03) { // (only where both bind: x4; others as they were)
+			std::printf("Frame generation: shown frames %d x %d = %d (KYTY_FLIP_FPS), under %u: no Reflex limit\n",
+			            flip_fps, g_generate + 1, flip_fps * (g_generate + 1), cap);
+			cap = 0;
+		}
+		if (cap != 0 && g_generate > 0) {
+			g_dlssg_target_fps  = static_cast<float>(cap); // 10-23: fixed too: the flip floor (DynApplyReflexLimit per present)
+			g_fixed_floor       = true;
+			g_real_interval     = static_cast<double>(g_generate + 1) / cap;
+			reflex.frameLimitUs = DlssgReflexLimitUs(g_real_interval);
+			std::printf("Frame generation: shown frames held under %u fps (rendered at most %.1f, Reflex limit %u us)\n", cap,
+			            static_cast<double>(cap) / (g_generate + 1), reflex.frameLimitUs);
+		}
+	}
+	std::printf("Frame generation: Reflex mode %d\n", static_cast<int>(reflex.mode));
+	if (const auto result = g_api.reflex_set_options(reflex); result != sl::Result::eOk) {
+		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
+	}
+	g_ready = true;
+	LOGF("frame generation: DLSS-G ready\n");
+	std::printf("Frame generation: DLSS-G ready (%d generated frame(s) per frame)\n", g_generate);
+	std::fflush(stdout);
+#endif
+}
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+sl::Constants MakeConstants(bool usable, const Camera& camera_in, vk::Extent2D render) {
+	sl::Constants constants {};
+	const auto    camera = usable ? Decompose(camera_in.view_proj) : CameraFrame {};
+	Mat4          identity;
+	for (uint32_t i = 0; i < 4; ++i) {
+		identity[i] = sl::float4(i == 0, i == 1, i == 2, i == 3);
+	}
+	constants.cameraViewToClip = identity;
+	constants.clipToCameraView = identity;
+	constants.clipToLensClip   = identity;
+	constants.clipToPrevClip   = identity;
+	constants.prevClipToClip   = identity;
+	constants.jitterOffset     = sl::float2(0.0f, 0.0f);
+	constants.mvecScale        = sl::float2(1.0f, 1.0f);
+	constants.cameraPinholeOffset = sl::float2(0.0f, 0.0f);
+	constants.cameraPos        = sl::float3(0, 0, 0);
+	constants.cameraUp         = sl::float3(0, 1, 0);
+	constants.cameraRight      = sl::float3(1, 0, 0);
+	constants.cameraFwd        = sl::float3(0, 0, 1);
+	constants.cameraNear       = 0.1f;
+	constants.cameraFar        = 10000.0f;
+	constants.cameraFOV        = 1.0f;
+	constants.cameraAspectRatio = 16.0f / 9.0f;
+	constants.motionVectorsInvalidValue = sl::INVALID_FLOAT;
+	constants.depthInverted       = sl::Boolean::eTrue;
+	constants.cameraMotionIncluded = sl::Boolean::eTrue;
+	constants.motionVectors3D     = sl::Boolean::eFalse;
+	// (A frame left unshown before this one: its motion and matrices are to the game's previous frame, not to the one
+	// presented last.)
+	const bool discontinuity      = g_discontinuity.exchange(false, std::memory_order_relaxed);
+	constants.reset               = usable && !discontinuity ? sl::Boolean::eFalse : sl::Boolean::eTrue;
+	constants.orthographicProjection = sl::Boolean::eFalse;
+	constants.motionVectorsDilated   = sl::Boolean::eFalse;
+	constants.motionVectorsJittered  = sl::Boolean::eFalse;
+	{
+		// The vectors' scale and sign whether the camera was captured or not (it was set only with the camera: without
+		// it the game's vectors went in as +1, pointing the wrong way).
+		static const float sign = [] {
+			const char* value = std::getenv("KYTY_FRAMEGEN_MV_SIGN");
+			return value != nullptr && std::atof(value) > 0 ? 1.0f : -1.0f;
+		}();
+		static const bool px = [] {
+			const char* mv = std::getenv("KYTY_FRAMEGEN_MV");
+			return mv != nullptr && std::string(mv) == "px";
+		}();
+		if (usable && render.width != 0 && render.height != 0)
+			constants.mvecScale = px ? sl::float2(sign / static_cast<float>(render.width), sign / static_cast<float>(render.height))
+			                         : sl::float2(sign, sign);
+	}
+	if (usable && camera.valid) {
+		// Projection in view space: x' = sx*x + cx*z, y' = sy*y + cy*z, z' = near, w' = z.
+		Mat4 projection;
+		projection[0] = sl::float4(camera.sx, 0, 0, 0);
+		projection[1] = sl::float4(0, camera.sy, 0, 0);
+		projection[2] = sl::float4(camera.cx, camera.cy, 0, 1);
+		projection[3] = sl::float4(0, 0, camera.z_near, 0);
+		constants.cameraViewToClip = projection;
+		Inverted(projection, constants.clipToCameraView);
+		const auto current  = Transposed(camera_in.view_proj);
+		const auto previous = Transposed(camera_in.prev_view_proj);
+		Mat4       clip_to_world;
+		if (Inverted(current, clip_to_world)) {
+			constants.clipToPrevClip = Multiply(clip_to_world, previous);
+			Inverted(constants.clipToPrevClip, constants.prevClipToClip);
+		}
+		const float width  = static_cast<float>(render.width);
+		const float height = static_cast<float>(render.height);
+		constants.jitterOffset = sl::float2(camera_in.jitter_ndc[0] * width * 0.5f,
+		                                    -camera_in.jitter_ndc[1] * height * 0.5f);
+		static const bool pixels_mv = [] {
+			const char* mv = std::getenv("KYTY_FRAMEGEN_MV");
+			return mv != nullptr && std::string(mv) == "px";
+		}();
+		// The game's vectors point along the motion, in UV units: its TAA reads the history at
+		// uv - mv. DLSS wants them towards the previous position (uv + mv = previous uv), so they
+		// are negated; with them as they were, generated frames moved the scene the wrong way
+		// when the camera turned. KYTY_FRAMEGEN_MV_SIGN=1 keeps the game's sign (a comparison).
+		static const float mv_sign = [] {
+			const char* sign = std::getenv("KYTY_FRAMEGEN_MV_SIGN");
+			return sign != nullptr && std::atof(sign) > 0 ? 1.0f : -1.0f;
+		}();
+		constants.mvecScale = pixels_mv ? sl::float2(mv_sign / width, mv_sign / height) : sl::float2(mv_sign, mv_sign);
+		constants.cameraPos   = camera.position;
+		constants.cameraUp    = camera.up;
+		constants.cameraRight = camera.right;
+		constants.cameraFwd   = camera.forward;
+		constants.cameraNear  = camera.z_near;
+		constants.cameraFar   = 100000.0f;
+		constants.cameraFOV   = 2.0f * std::atan(1.0f / std::fabs(camera.sy));
+		constants.cameraAspectRatio = std::fabs(camera.sy / camera.sx);
+	}
+	return constants;
+}
+
+// DLSS super resolution of the composite's 3D image (UpscaleComposite): viewport 1, its own frame indices.
+// The images' layouts as given (the composite path: color, depth and motion SHADER_READ_ONLY, output GENERAL; the TAA
+// path: as the TAA dispatch's descriptors have them). `taa`: in place of the game's TAA (viewport 2): its color is
+// jittered (the camera's jitter given), its output the TAA's.
+struct DlssLayouts {
+	vk::ImageLayout color  = vk::ImageLayout::eShaderReadOnlyOptimal;
+	vk::ImageLayout depth  = vk::ImageLayout::eShaderReadOnlyOptimal;
+	vk::ImageLayout motion = vk::ImageLayout::eShaderReadOnlyOptimal;
+	vk::ImageLayout output = vk::ImageLayout::eGeneral;
+};
+bool DlssEvaluate(VkCommandBuffer command, const VulkanImage& color, vk::ImageView color_view, const VulkanImage& depth,
+                  vk::ImageView depth_view, const VulkanImage& motion, vk::ImageView motion_view, const VulkanImage& output,
+                  vk::ImageView output_view, vk::Extent2D render, vk::Extent2D upscale, const Camera& camera, bool reset,
+                  bool taa, const DlssLayouts& layouts, bool composite = false);
+bool DlssUpscale(VkCommandBuffer command, const VulkanImage& color, vk::ImageView color_view, const VulkanImage& depth,
+                 vk::ImageView depth_view, const VulkanImage& motion, vk::ImageView motion_view, const VulkanImage& output,
+                 vk::ImageView output_view, vk::Extent2D render, vk::Extent2D upscale, const Camera& camera, bool reset) {
+	// (KYTY_TAA_REPLACE=upscaler: the color is the raw jittered frame: the camera's jitter given, as in the TAA's slot.)
+	return DlssEvaluate(command, color, color_view, depth, depth_view, motion, motion_view, output, output_view, render,
+	                    upscale, camera, reset, g_taa_bypass, DlssLayouts {}, true);
+}
+bool DlssEvaluate(VkCommandBuffer command, const VulkanImage& color, vk::ImageView color_view, const VulkanImage& depth,
+                  vk::ImageView depth_view, const VulkanImage& motion, vk::ImageView motion_view, const VulkanImage& output,
+                  vk::ImageView output_view, vk::Extent2D render, vk::Extent2D upscale, const Camera& camera, bool reset,
+                  bool taa, const DlssLayouts& layouts, bool composite) {
+	if (!g_sr_ready || g_api.dlss_set_options == nullptr || g_api.evaluate == nullptr) return false;
+	// `taa`: the color is jittered (the camera's jitter given); `composite`: the composite's upscale (viewport 1).
+	const bool               taa_slot = taa && !composite;
+	const sl::ViewportHandle viewport {taa_slot ? 2u : 1u};
+	static vk::Extent2D      set_render[2] {}, set_output[2] {};
+	const int                slot = taa_slot ? 1 : 0;
+	if (set_render[slot] != render || set_output[slot] != upscale) {
+		const double ratio = static_cast<double>(upscale.height) / render.height;
+		sl::DLSSOptions options {};
+		// (NGX refuses DLSS's ultra quality mode, 0xbad00010 "unsupported parameter" on every evaluate: 1.3x renders
+		// in the quality mode, whose render size range reaches up to the output size.)
+		options.mode = ratio < 1.05   ? sl::DLSSMode::eDLAA
+		               : ratio < 1.6  ? sl::DLSSMode::eMaxQuality
+		               : ratio < 1.85 ? sl::DLSSMode::eBalanced
+		               : ratio < 2.5  ? sl::DLSSMode::eMaxPerformance
+		                              : sl::DLSSMode::eUltraPerformance;
+		options.outputWidth     = upscale.width;
+		options.outputHeight    = upscale.height;
+		options.colorBuffersHDR = sl::Boolean::eTrue;
+		options.useAutoExposure = sl::Boolean::eTrue;
+		// KYTY_DLSS_PRESET=K (DLSS 4, transformer), L or M (DLSS 4.5), J; default: NVIDIA's choice per mode.
+		sl::DLSSPreset preset = sl::DLSSPreset::eDefault;
+		if (const char* text = std::getenv("KYTY_DLSS_PRESET"); text != nullptr && *text != '\0') {
+			switch (*text) {
+				case 'J': case 'j': preset = sl::DLSSPreset::ePresetJ; break;
+				case 'K': case 'k': preset = sl::DLSSPreset::ePresetK; break;
+				case 'L': case 'l': preset = sl::DLSSPreset::ePresetL; break;
+				case 'M': case 'm': preset = sl::DLSSPreset::ePresetM; break;
+				default: break;
+			}
+		}
+		options.dlaaPreset = options.qualityPreset = options.balancedPreset = options.performancePreset =
+		    options.ultraPerformancePreset = options.ultraQualityPreset = preset;
+		if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk) {
+			std::printf("Upscaling: slDLSSSetOptions failed (%d): upscaling off\n", static_cast<int>(result));
+			std::fflush(stdout);
+			g_sr_ready = false;
+			return false;
+		}
+		set_render[slot] = render;
+		set_output[slot] = upscale;
+		std::printf("Upscaling: DLSS %ux%u -> %ux%u, mode %u, preset %u\n", render.width, render.height, upscale.width,
+		            upscale.height, static_cast<uint32_t>(options.mode), static_cast<uint32_t>(preset));
+		std::fflush(stdout);
+	}
+	static uint32_t indices[2] {};
+	uint32_t        index = ++indices[slot];
+	sl::FrameToken* token = nullptr;
+	if (g_api.get_new_frame_token(token, &index) != sl::Result::eOk || token == nullptr) return false;
+	auto constants = MakeConstants(camera.valid, camera, render);
+	// After the game's TAA its jitter is resolved in the image; in its place the color is jittered (MakeConstants: the
+	// camera's, KYTY_TAA_JITTER_SIGN=-1 the other way round).
+	if (!taa) {
+		constants.jitterOffset = sl::float2(0.0f, 0.0f);
+	} else {
+		static const float jitter_sign = [] {
+			const char* value = std::getenv("KYTY_TAA_JITTER_SIGN");
+			return value != nullptr && std::atof(value) < 0 ? -1.0f : 1.0f;
+		}();
+		constants.jitterOffset = sl::float2(jitter_sign * constants.jitterOffset.x, jitter_sign * constants.jitterOffset.y);
+	}
+	constants.reset        = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+	if (!camera.valid) {
+		// (No camera this frame: the vectors as they are, in UV units towards the motion.)
+		static const float mv_sign = [] {
+			const char* sign = std::getenv("KYTY_FRAMEGEN_MV_SIGN");
+			return sign != nullptr && std::atof(sign) > 0 ? 1.0f : -1.0f;
+		}();
+		constants.mvecScale = sl::float2(mv_sign, mv_sign);
+	}
+	if (g_api.set_constants(constants, *token, viewport) != sl::Result::eOk) return false;
+	const auto resource = [](const VulkanImage& image, vk::ImageView view, vk::ImageLayout layout) {
+		sl::Resource r(sl::ResourceType::eTex2d, static_cast<VkImage>(image.image), nullptr, static_cast<VkImageView>(view),
+		               static_cast<uint32_t>(layout));
+		r.width        = image.extent.width;
+		r.height       = image.extent.height;
+		r.nativeFormat = static_cast<uint32_t>(image.format);
+		r.mipLevels    = 1;
+		r.arrayLayers  = 1;
+		r.flags        = 0;
+		r.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.usage));
+		return r;
+	};
+	auto in_color  = resource(color, color_view, layouts.color);
+	auto in_depth  = resource(depth, depth_view, layouts.depth);
+	auto in_motion = resource(motion, motion_view, layouts.motion);
+	auto out_color = resource(output, output_view, layouts.output);
+	const sl::Extent render_extent {0, 0, render.width, render.height};
+	const sl::Extent output_extent {0, 0, upscale.width, upscale.height};
+	const sl::ResourceTag tags[] {
+	    sl::ResourceTag(&in_color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &render_extent),
+	    sl::ResourceTag(&in_depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &render_extent),
+	    sl::ResourceTag(&in_motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &render_extent),
+	    sl::ResourceTag(&out_color, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &output_extent),
+	};
+	auto* cmd = reinterpret_cast<sl::CommandBuffer*>(command);
+	if (g_api.set_tag_for_frame(*token, viewport, tags, static_cast<uint32_t>(std::size(tags)), cmd) != sl::Result::eOk)
+		return false;
+	const sl::BaseStructure* inputs[] {&viewport};
+	static uint32_t failures = 0;
+	DrainGpuThreadCommands(); // (Streamline records straight into the command buffer)
+	if (const auto result = g_api.evaluate(sl::kFeatureDLSS, *token, inputs, 1, cmd); result != sl::Result::eOk) {
+		if (failures < 4) {
+			std::printf("Upscaling: DLSS evaluate failed (%d)\n", static_cast<int>(result));
+			std::fflush(stdout);
+		}
+		// Each failed evaluate tries to create the NGX feature again (slow): off after 30 in a row.
+		if (++failures >= 30) {
+			std::printf("Upscaling: DLSS keeps failing: off (the game scales its 3D image itself)\n");
+			std::fflush(stdout);
+			g_sr_ready = false;
+		}
+		return false;
+	}
+	failures = 0;
+	return true;
+}
+#endif
+
+bool DlssUpscaleWanted() {
+	return g_dlss_sr;
+}
+
+bool TaaReplaceWanted() {
+	return g_taa_dlss || g_taa_bypass;
+}
+
+
+// 10-23: KYTY_DLSSG_MARKERS=guest (default) | present. Before, every Reflex marker and slReflexSleep came at the
+// present: the simulation marked as taking no time, and Reflex's sleep delayed the present itself (the driver's
+// pacing then saw a frame of ~0 ms simulation and a variable wait before each present). Now at the guest flip on the
+// render thread: render submit end for the frame that ends there, then for the next one Reflex's sleep (it paces the
+// game's frames, not the presents), simulation start/end and render submit start; present start/end at the present
+// with the same frame index. present: all at the present (the old placement).
+bool ReflexGuestMarkers() {
+	static const bool guest = [] {
+		const char* v = std::getenv("KYTY_DLSSG_MARKERS");
+		return v == nullptr || std::strcmp(v, "present") != 0;
+	}();
+	return guest;
+}
+std::atomic<uint32_t> g_rx_counter {0};   // Reflex frame indices (guest and present paths)
+uint32_t              g_rx_open = 0;      // render thread: the frame begun at the last guest flip
+std::atomic<uint32_t> g_rx_present {0};   // the index BeforePresent presents next (SetPresentReflexIndex)
+
+// 10-22: real frames are paced by one limiter only: VideoOut's flip pacer (RealFrameInterval, the vblank grid, as
+// FSR3's) holds them to target / m; Reflex stays for latency without a frame limit (two limiters at 56 beat against
+// the game's 60: flip->present sd 1.90 ms vs FSR3's 0.55). KYTY_DLSSG_REFLEX_LIMIT=1: Reflex's limit too (old);
+// KYTY_DLSSG_PACE=reflex: Reflex's limit only (DlssgPaceMode).
+int DlssgPaceMode();
+uint32_t DlssgReflexLimitUs(double interval) {
+	static const bool force = [] {
+		const char* v = std::getenv("KYTY_DLSSG_REFLEX_LIMIT");
+		return v != nullptr && *v == '1';
+	}();
+	return (force || DlssgPaceMode() >= 2) && interval > 0.0 ? static_cast<uint32_t>(1000000.0 * interval) : 0u;
+}
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+// 10-22: the dynamic multiplier's Reflex cap: real <= target / (gen + 1), so shown <= target (G-Sync range).
+// gen < 0: no limit (DLSS-G off: menus, movies, loading; x1 is not held to the last multiplier's target / m).
+// 10-23: where the game's 60 would pass the target (x4 on 224), the game's own flips are held to the vblank's reach
+// rate (840 Hz: 56, DynApplyFlipFloor) and our pacer is off: the pacer at 56 against the game's 60 queued a frame
+// (log 20261022-190358, dynamic x4 at 55 real: flip->present mean 43.7 ms sd 3.9 vs 24.1 / 1.4 on fixed x4 at 45 real).
+// Not in cinematics or held cutscenes, nor with DLSS-G off. KYTY_DLSSG_FLIP_FLOOR=0: the pacer only. Fixed DLSS-G under
+// a cap (KYTY_VRR_CAP_FPS) likewise (10-23); it needs a vblank that 56 divides (840 Hz; 360 Hz refuses it: the pacer).
+void DynApplyReflexLimit(int gen) {
+	static const bool floor_on = [] {
+		const char* v = std::getenv("KYTY_DLSSG_FLIP_FLOOR");
+		return v == nullptr || *v != '0';
+	}();
+	if (floor_on && DlssgPaceMode() < 2 && gen >= 0 && !VideoOut::CinematicPlaying() && !VideoOut::CutsceneHeld()) {
+		DynApplyFlipFloor(gen);
+	} else if (g_dyn_flip_fps != 0) {
+		VideoOut::SetDynamicFlipFps(0);
+		g_dyn_flip_asked = -1;
+		g_dyn_flip_fps = 0;
+		std::printf("[dyn] game flips at 60\n");
+	}
+	const double interval = gen < 0 || g_dyn_flip_fps != 0
+	                            ? 0.0
+	                            : static_cast<double>(gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0);
+	if (g_real_interval.load() != interval)
+		std::printf("[dyn] pacer interval %.0f us for x%d%s\n", interval * 1e6, gen + 1, g_dyn_flip_fps != 0 ? " (game flips held instead)" : "");
+	g_real_interval       = interval; // the flip pacer (VideoOut, as FSR3's) holds real frames to it on the vblank grid
+	const uint32_t us     = DlssgReflexLimitUs(interval);
+	if (g_reflex_opts.frameLimitUs == us) return;
+	g_reflex_opts.frameLimitUs = us;
+	if (const auto result = g_api.reflex_set_options(g_reflex_opts); result != sl::Result::eOk)
+		LOGF("frame generation: slReflexSetOptions (dynamic limit) failed (%d)\n", static_cast<int>(result));
+}
+#endif
+
+void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2D region,
+                   vk::Format format, uint32_t image_count) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_ready) {
+		return;
+	}
+	const sl::ViewportHandle viewport {0};
+	// Movies, menus and loading screens (no TAA pass) are presented as they are: DLSS-G off for them.
+	const bool               usable = inputs != nullptr && inputs->valid && !VideoOut::MoviePlaying() && VideoOut::PlayerInputSeen();
+	// 10-21: an in-engine cinematic keeps 60 real: x3 at most, no flip floor, at once (not after two windows).
+	if (g_dlssg_dynamic && VideoOut::CinematicPlaying() && (g_dyn_gen > 2 || g_dyn_flip_fps != 0)) {
+		g_dyn_gen       = std::min(g_dyn_gen, std::min(2, std::max(g_generate, 1)));
+		g_dyn_pending_n = 0;
+		g_options_set   = false;
+		VideoOut::SetDynamicFlipFps(0);
+		g_dyn_flip_asked = -1;
+		g_dyn_flip_fps = 0;
+		DynApplyReflexLimit(g_dyn_gen);
+		std::printf("[dyn] cinematic: back to 60, x%d\n", g_dyn_gen + 1);
+		std::fflush(stdout);
+	}
+	if (g_dlssg_dynamic && g_dyn_limit_us != 0 && usable) {
+		static std::chrono::steady_clock::time_point next {};
+		const auto step = std::chrono::microseconds(g_dyn_limit_us);
+		auto       t    = std::chrono::steady_clock::now();
+		if (next > t) {
+			g_dyn_slept += std::chrono::duration<double>(next - t).count();
+			std::this_thread::sleep_until(next - std::chrono::milliseconds(1));
+			while (std::chrono::steady_clock::now() < next) std::this_thread::yield();
+			t = next;
+		}
+		next = std::max(next, t - step) + step;
+	}
+	{
+		const auto now = std::chrono::steady_clock::now();
+		if (g_stat_start == std::chrono::steady_clock::time_point {}) g_stat_start = now;
+		++g_stat_real;
+		if (usable) ++g_stat_on;
+		{
+			static std::chrono::steady_clock::time_point prev {};
+			const double dt = prev == std::chrono::steady_clock::time_point {} ? 0.0 : std::chrono::duration<double>(now - prev).count();
+			prev            = now;
+			if (usable && dt > 0.0 && dt < 0.1) {
+				g_pace_n += 1.0;
+				g_pace_sum += dt;
+				g_pace_sq += dt * dt;
+			}
+		}
+		const double window = std::chrono::duration<double>(now - g_stat_start).count();
+		if (window >= 1.0) {
+			const double n = g_stat_real != 0 ? static_cast<double>(g_stat_real) : 1.0;
+			if (VideoOut::CinematicPlaying() || VideoOut::CutsceneHeld() || VideoOut::MoviePlaying() || g_mode_set != 1) {
+				g_pace_adapt = 0.0; // (nothing learned from held or ungenerated phases)
+				g_pace_n     = 0.0;
+			}
+			if (g_pace_n >= 10.0) {
+				const double mean = g_pace_sum / g_pace_n;
+				const double sd   = std::sqrt(std::max(g_pace_sq / g_pace_n - mean * mean, 0.0));
+				// Adaptive pacing: 0.98 mean + 0.75 sd, smoothed (the 2% lets it come down: held frames' mean is the pacer's
+				// own interval, so mean + sd alone would only ever grow). At the cap target / m wins (max).
+				const double want = 0.98 * mean + 0.75 * sd;
+				const double prev = g_pace_adapt.load();
+				g_pace_adapt      = prev <= 0.0 ? want : 0.7 * prev + 0.3 * want;
+				std::printf("[dlssg] present interval sd %.2f ms (mean %.2f, %.0f frames); pacer %.2f ms (%s)\n", sd * 1e3, mean * 1e3,
+				            g_pace_n, RealFrameInterval() * 1e3,
+				            DlssgPaceMode() == 0 ? "adaptive" : DlssgPaceMode() == 1 ? "grid" : DlssgPaceMode() == 2 ? "reflex" : "reflexfree");
+			} else {
+				g_pace_adapt = 0.0;
+			}
+			g_pace_n = g_pace_sum = g_pace_sq = 0.0;
+			if (g_dlssg_dynamic && g_mode_set == 1) {
+				const double real = g_stat_real / window;
+				// Free rate: frames over the time not spent in our limiter (what the game would do unlimited).
+				const double freer = g_stat_real / std::max(window - g_dyn_slept, 0.05);
+				g_dyn_slept       = 0.0;
+				g_dyn_real_fps    = g_dyn_real_fps <= 0.0 ? freer : 0.5 * g_dyn_real_fps + 0.5 * freer;
+				// 10-22: no flip floor (the game's real rate is not held to reach a multiplier). The largest m with
+				// real * m <= target; up only after real * (m + 1) <= 0.97 target held 2 windows (EMA ~1 s), down at once
+				// when real * m > 1.02 target. Reflex caps real at target / m: when the real rate sits on that cap for
+				// 2 windows the game may run faster, so one step down (and no step up for 10 s).
+				(void)freer;
+				// 10-22: decided on the free rate (src/local/dyn-multiplier.h): per-level minimum real fps, one step up
+				// at a time with a revert + 10 s block when it shows < 5% more, cap target / m only binding past it.
+				const double T         = static_cast<double>(g_dlssg_target_fps);
+				const bool   cinematic = VideoOut::CinematicPlaying();
+				const int    maxgen    = cinematic ? std::min(2, g_dyn_max) : g_dyn_max;
+				int          next      = std::clamp(g_dyn_dm.Window(g_dyn_gen + 1, real, T, maxgen + 1,
+				                                                      cinematic || VideoOut::CutsceneHeld() || VideoOut::MoviePlaying()) - 1, 1, std::max(maxgen, 1));
+				if (next != g_dyn_gen) {
+					const int from_m = g_dyn_gen + 1;
+					g_dyn_gen      = next;
+					g_options_set  = false; // send numFramesToGenerate again
+					g_dyn_limit_us = 0;
+					g_dyn_pinned_s = 0;
+					if (g_dyn_flip_fps != 0) {
+						VideoOut::SetDynamicFlipFps(0);
+		g_dyn_flip_asked = -1;
+						g_dyn_flip_fps = 0;
+					}
+					DynApplyReflexLimit(g_dyn_gen);
+					std::printf("[dyn] x%d (from x%d): real %.1f fps, shown %.1f (target %.0f), free %.1f\n", g_dyn_gen + 1, from_m,
+					            real, std::min(real * from_m, T), T, g_dyn_dm.last_free);
+				}
+				std::printf("[dlssg] dynamic x%d; real %.1f fps (smoothed %.1f), shown %.1f, target %.0f\n", g_dyn_gen + 1, real,
+				            g_dyn_real_fps, real * (g_dyn_gen + 1), static_cast<double>(g_dlssg_target_fps));
+			}
+			std::printf("[dlssg] %s x%u; real %.1f fps, shown %.1f fps; generation on %u of %u frames; present call %.2f ms (max %.1f); "
+			            "acquire %.2f (max %.1f), record+submit %.2f (max %.1f), gpu wait %.2f (max %.1f), before %.2f (max %.1f), flip present %.2f (max %.1f)\n",
+			            g_dlssg_dynamic ? "dynamic" : "fixed", PresentedFrames(),
+			            g_stat_real / window, g_stat_real / window * static_cast<double>(PresentedFrames()), g_stat_on,
+			            g_stat_real, g_stat_present_ms / n, g_stat_present_max, g_stat_acquire_ms / n, g_stat_acquire_max,
+			            g_stat_submit_ms / n, g_stat_submit_max, g_stat_gpuwait_ms / n, g_stat_gpuwait_max, g_stat_before_ms / n,
+			            g_stat_before_max, g_stat_flip_ms / n, g_stat_flip_max);
+			std::fflush(stdout);
+			g_stat_start = now;
+			g_stat_real  = 0;
+			g_stat_on    = 0;
+			g_stat_present_ms = g_stat_present_max = 0;
+			g_stat_acquire_ms = g_stat_acquire_max = g_stat_gpuwait_ms = g_stat_gpuwait_max = g_stat_flip_ms = g_stat_flip_max = 0;
+			g_stat_submit_ms = g_stat_submit_max = g_stat_before_ms = g_stat_before_max = 0;
+		}
+	}
+	// DLSS-G on or off (its resources kept, eRetainResourcesWhenOff): off after 30 presents in a row without inputs
+	// (menus, movies, loading), on after 10 with them, so a fade or a cut does not flap it (chenxiao07 d672b238).
+	static uint32_t run_with = 0, run_without = 0;
+	run_with           = usable ? run_with + 1 : 0;
+	run_without        = usable ? 0 : run_without + 1;
+	const bool mode_on = g_mode_set == 1 ? run_without < 30 : run_with >= 10;
+	// 10-22: the dynamic Reflex limit is target / m of the current m while DLSS-G is on, none while it is off.
+	if (g_dlssg_dynamic) DynApplyReflexLimit(mode_on ? g_dyn_gen : -1);
+	else if (g_fixed_floor) DynApplyReflexLimit(mode_on ? g_generate : -1); // 10-23: fixed x4 likewise (flip floor 56)
+	// DLSS-G options; sizes are hints for its allocations.
+	if (!g_options_set || g_mode_set != (mode_on ? 1 : 0) || g_options_format != format ||
+	    (usable && (g_options_backbuffer != backbuffer || g_options_render != inputs->render_extent))) {
+		sl::DLSSGOptions options {};
+		options.mode                = mode_on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+		options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
+		{
+			static bool once = false;
+			if (!once) {
+				once = true;
+				if (g_dlssg_dynamic)
+					std::printf("[dlssg] mode: app-side dynamic multiplier (eOn; eDynamic is D3D12 only), up to %d generated, "
+					            "target %.0f fps, starting x%d\n", g_generate, static_cast<double>(g_dlssg_target_fps), g_dyn_gen + 1);
+				else
+					std::printf("[dlssg] mode: fixed x%d (eOn)\n", g_generate + 1);
+				std::fflush(stdout);
+			}
+		}
+		if (g_mode_set != (mode_on ? 1 : 0)) {
+			std::printf("DLSS-G: %s\n", mode_on ? "on (TAA pass)" : "off (no TAA pass: menu, loading or movie)");
+			std::fflush(stdout);
+		}
+		g_mode_set = mode_on ? 1 : 0;
+		options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
+		// KYTY_DLSSG_PARALLEL=1: DLSS-G's work blocks none of the emulator's queues (a comparison: by default it
+		// blocks the presenting queue while it works).
+		static const bool parallel = [] {
+			const char* value = std::getenv("KYTY_DLSSG_PARALLEL");
+			return value != nullptr && *value == '1';
+		}();
+		if (parallel) options.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockNoClientQueues;
+		options.numBackBuffers      = image_count;
+		options.colorWidth          = backbuffer.width;
+		options.colorHeight         = backbuffer.height;
+		options.colorBufferFormat   = static_cast<uint32_t>(format);
+		if (usable) {
+			options.mvecDepthWidth    = inputs->render_extent.width;
+			options.mvecDepthHeight   = inputs->render_extent.height;
+			options.mvecBufferFormat  = static_cast<uint32_t>(inputs->motion.format);
+			options.depthBufferFormat = static_cast<uint32_t>(inputs->depth.format);
+			g_options_render          = inputs->render_extent;
+		}
+		if (const auto result = g_api.dlssg_set_options(viewport, options); result != sl::Result::eOk) {
+			LOGF("frame generation: slDLSSGSetOptions failed (%d)\n", static_cast<int>(result));
+		}
+		g_options_set        = true;
+		g_options_backbuffer = backbuffer;
+		g_options_format     = format;
+	}
+
+	// 10-23: a frame begun at the guest flip (ReflexGuestFlip) keeps its index; others (menus, a repeated image)
+	// take a new one with all markers here, as before.
+	const uint32_t guest_index = g_rx_present.exchange(0, std::memory_order_relaxed);
+	g_frame_index              = guest_index != 0 ? guest_index : g_rx_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (g_api.get_new_frame_token(g_token, &g_frame_index) != sl::Result::eOk || g_token == nullptr) {
+		g_token = nullptr;
+		return;
+	}
+	auto& token = *g_token;
+	static const bool sleep = [] {
+		const char* value = std::getenv("KYTY_DLSSG_SLEEP");
+		return value == nullptr || *value != '0';
+	}();
+	if (guest_index == 0) {
+		if (sleep && g_api.reflex_sleep != nullptr && !ReflexGuestMarkers()) g_api.reflex_sleep(token);
+		g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, token);
+		g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, token);
+		g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, token);
+	}
+
+	sl::Constants constants = MakeConstants(usable, usable ? inputs->camera : Camera {}, usable ? inputs->render_extent : vk::Extent2D {});
+	if (const auto result = g_api.set_constants(constants, token, viewport); result != sl::Result::eOk) {
+		static uint32_t failures = 0;
+		if (failures++ < 8 || failures % 600 == 0) {
+			LOGF("frame generation: slSetConstants failed (%d), %u time(s)\n", static_cast<int>(result), failures);
+			std::printf("[dlssg] slSetConstants failed (%d), %u time(s)\n", static_cast<int>(result), failures);
+		}
+	}
+
+	if (usable) {
+		sl::Resource depth(sl::ResourceType::eTex2d, static_cast<VkImage>(inputs->depth.image), nullptr,
+		                   static_cast<VkImageView>(inputs->depth_view),
+		                   static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+		depth.width        = inputs->depth.extent.width;
+		depth.height       = inputs->depth.extent.height;
+		depth.nativeFormat = static_cast<uint32_t>(inputs->depth.format);
+		depth.mipLevels    = 1;
+		depth.arrayLayers  = 1;
+		depth.flags        = 0;
+		depth.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(inputs->depth.usage));
+		sl::Resource motion(sl::ResourceType::eTex2d, static_cast<VkImage>(inputs->motion.image), nullptr,
+		                    static_cast<VkImageView>(inputs->motion_view),
+		                    static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+		motion.width        = inputs->motion.extent.width;
+		motion.height       = inputs->motion.extent.height;
+		motion.nativeFormat = static_cast<uint32_t>(inputs->motion.format);
+		motion.mipLevels    = 1;
+		motion.arrayLayers  = 1;
+		motion.flags        = 0;
+		motion.usage = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(inputs->motion.usage));
+		const sl::Extent full {0, 0, inputs->render_extent.width, inputs->render_extent.height};
+		const sl::Extent game {static_cast<uint32_t>(region.offset.y), static_cast<uint32_t>(region.offset.x),
+		                       region.extent.width, region.extent.height};
+		// The backbuffer is tagged only when the game image covers part of it (KYTY_PRESENT_ASPECT).
+		const bool      partial = region.offset.x != 0 || region.offset.y != 0 ||
+		                     region.extent.width != backbuffer.width || region.extent.height != backbuffer.height;
+		// The HUD-less image (the flip image before the HUD), at the game image's size: DLSS-G keeps the HUD out.
+		sl::Resource hudless(sl::ResourceType::eTex2d, static_cast<VkImage>(inputs->hudless_display.image), nullptr,
+		                     static_cast<VkImageView>(inputs->hudless_display_view),
+		                     static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+		hudless.width        = inputs->hudless_display.extent.width;
+		hudless.height       = inputs->hudless_display.extent.height;
+		hudless.nativeFormat = static_cast<uint32_t>(inputs->hudless_display.format);
+		hudless.mipLevels    = 1;
+		hudless.arrayLayers  = 1;
+		hudless.flags        = 0;
+		hudless.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(inputs->hudless_display.usage));
+		const sl::Extent hudless_extent {0, 0, inputs->hudless_display.extent.width, inputs->hudless_display.extent.height};
+		std::vector<sl::ResourceTag> tags {
+		    sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &full),
+		    sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent,
+		                    &full),
+		};
+		if (partial)
+			tags.emplace_back(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &game);
+		static const bool hudless_tag = [] {
+			const char* value = std::getenv("KYTY_FRAMEGEN_HUDLESS");
+			return value == nullptr || *value != '0';
+		}();
+		if (hudless_tag && inputs->has_hudless_display && inputs->hudless_display.extent.width == backbuffer.width &&
+		    inputs->hudless_display.extent.height == backbuffer.height)
+			tags.emplace_back(&hudless, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent,
+			                  &hudless_extent);
+		const auto tag_result = g_api.set_tag_for_frame(token, viewport, tags.data(), static_cast<uint32_t>(tags.size()), nullptr);
+		static uint32_t tag_failures = 0;
+		if (tag_result != sl::Result::eOk && (tag_failures++ < 8 || tag_failures % 600 == 0)) {
+			LOGF("frame generation: slSetTagForFrame failed (%d), %u time(s)\n", static_cast<int>(tag_result), tag_failures);
+			std::printf("[dlssg] slSetTagForFrame failed (%d), %u time(s)\n", static_cast<int>(tag_result), tag_failures);
+		}
+		// Once: what DLSS-G is given (its constants, the tags' extents and formats), to check against FSR 3's inputs.
+		static bool dumped = false;
+		if (!dumped) {
+			dumped = true;
+			const auto m = [](const Mat4& a) {
+				char text[320];
+				std::snprintf(text, sizeof(text), "[%.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g]",
+				              a[0].x, a[0].y, a[0].z, a[0].w, a[1].x, a[1].y, a[1].z, a[1].w, a[2].x, a[2].y, a[2].z, a[2].w,
+				              a[3].x, a[3].y, a[3].z, a[3].w);
+				return std::string(text);
+			};
+			char text[2048];
+			std::snprintf(text, sizeof(text),
+			              "[dlssg] constants: frame %u camera %s viewToClip %s clipToPrevClip %s mvecScale %.6g %.6g jitter %.4g %.4g "
+			              "near %.4g far %.4g fov %.4g aspect %.4g depthInverted %d cameraMotionIncluded %d mv3D %d dilated %d "
+			              "jittered %d ortho %d reset %d | depth %ux%u fmt %u, motion %ux%u fmt %u, tag extent %ux%u, hudless %s %ux%u, "
+			              "backbuffer %ux%u, region %d,%d %ux%u, setTag %d\n",
+			              g_frame_index, inputs->camera.valid ? "valid" : "INVALID", m(constants.cameraViewToClip).c_str(),
+			              m(constants.clipToPrevClip).c_str(), constants.mvecScale.x, constants.mvecScale.y, constants.jitterOffset.x,
+			              constants.jitterOffset.y, constants.cameraNear, constants.cameraFar, constants.cameraFOV,
+			              constants.cameraAspectRatio, static_cast<int>(constants.depthInverted),
+			              static_cast<int>(constants.cameraMotionIncluded), static_cast<int>(constants.motionVectors3D),
+			              static_cast<int>(constants.motionVectorsDilated), static_cast<int>(constants.motionVectorsJittered),
+			              static_cast<int>(constants.orthographicProjection), static_cast<int>(constants.reset), depth.width,
+			              depth.height, depth.nativeFormat, motion.width, motion.height, motion.nativeFormat, full.width, full.height,
+			              tags.size() > 2 && tags.back().type == sl::kBufferTypeHUDLessColor ? "tagged" : "not tagged",
+			              hudless.width, hudless.height, backbuffer.width, backbuffer.height, region.offset.x, region.offset.y,
+			              region.extent.width, region.extent.height, static_cast<int>(tag_result));
+			LOGF("%s", text);
+			std::printf("%s", text);
+			std::fflush(stdout);
+		}
+	} else {
+		// Menus, movies, loading: no valid depth and motion (DLSS-G then presents the frame as is).
+		sl::ResourceTag tags[] {
+		    sl::ResourceTag(nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent),
+		    sl::ResourceTag(nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent),
+		};
+		g_api.set_tag_for_frame(token, viewport, tags, static_cast<uint32_t>(std::size(tags)), nullptr);
+	}
+	if (guest_index == 0) g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, token);
+	g_api.pcl_set_marker(sl::PCLMarker::ePresentStart, token);
+	g_present_begin = std::chrono::steady_clock::now();
+#else
+	(void)inputs;
+	(void)backbuffer;
+	(void)region;
+	(void)format;
+	(void)image_count;
+#endif
+}
+
+void AfterPresent() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (g_present_begin != std::chrono::steady_clock::time_point {}) {
+		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_present_begin).count();
+		g_stat_present_ms += ms;
+		g_stat_present_max = std::max(g_stat_present_max, ms);
+	}
+	if (!g_ready || g_token == nullptr) {
+		return;
+	}
+	g_api.pcl_set_marker(sl::PCLMarker::ePresentEnd, *g_token);
+	const auto presents = ++g_presents;
+	if (presents % 30 != 1) {
+		return;
+	}
+	sl::DLSSGState state {};
+	if (const auto result = g_api.dlssg_get_state(sl::ViewportHandle {0}, state, nullptr); result != sl::Result::eOk) {
+		if (presents < 300) std::printf("[dlssg] slDLSSGGetState failed (%d)\n", static_cast<int>(result));
+		return;
+	}
+	{
+		// DLSS-G's own verdict on its inputs (eFailResolutionTooLow, eFailCommonConstantsInvalid, ... as flags).
+		static uint32_t last_status = ~0u;
+		const auto      status      = static_cast<uint32_t>(state.status);
+		if (status != last_status || presents < 120) {
+			last_status = status;
+			LOGF("frame generation: DLSS-G state: status 0x%x, presented %u, generate max %u\n", status,
+			     state.numFramesActuallyPresented, state.numFramesToGenerateMax);
+			std::printf("[dlssg] state: status 0x%x, presented %u, generate max %u\n", status, state.numFramesActuallyPresented,
+			            state.numFramesToGenerateMax);
+		}
+	}
+	g_presented_frames.store(std::max(state.numFramesActuallyPresented, 1u), std::memory_order_relaxed);
+	// More generated frames asked for than the GPU makes (the launcher's 3x and up): as many as it makes.
+	if (state.numFramesToGenerateMax != 0 && static_cast<uint32_t>(g_generate) > state.numFramesToGenerateMax) {
+		LOGF("frame generation: %d generated frames asked for, the GPU makes up to %u\n", g_generate,
+		     state.numFramesToGenerateMax);
+		std::printf("Frame generation: %d generated frame(s) asked for, the GPU makes up to %u\n", g_generate,
+		            state.numFramesToGenerateMax);
+		g_generate    = static_cast<int>(state.numFramesToGenerateMax);
+		g_options_set = false;
+	}
+	if (g_dlssg_dynamic && state.numFramesToGenerateMax != 0) {
+		const int max = std::min(g_generate, static_cast<int>(state.numFramesToGenerateMax));
+		if (max != g_dyn_max) {
+			std::printf("[dyn] up to x%d (GPU makes up to %u generated)\n", max + 1, state.numFramesToGenerateMax);
+			std::fflush(stdout);
+			g_dyn_max = max;
+			if (g_dyn_gen > max) {
+				g_dyn_gen     = max;
+				g_options_set = false;
+				DynApplyReflexLimit(g_dyn_gen);
+			}
+		}
+	}
+	if (presents % 600 == 1) {
+		LOGF("frame generation: status=0x%x presented=%u max_generated=%u vram=%" PRIu64 " MiB\n",
+		     static_cast<uint32_t>(state.status), state.numFramesActuallyPresented,
+		     state.numFramesToGenerateMax, state.estimatedVRAMUsageInBytes >> 20u);
+		std::printf("Frame generation: status=0x%x presented=%u max_generated=%u\n",
+		            static_cast<uint32_t>(state.status), state.numFramesActuallyPresented,
+		            state.numFramesToGenerateMax);
+		std::fflush(stdout);
+	}
+#endif
+}
+
+void SwapchainChanging() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// Off before the swapchain is made again (DLSS-G guide: before a resize or a full screen change).
+	if (!g_ready || g_mode_set != 1) return;
+	sl::DLSSGOptions options {};
+	options.mode                = sl::DLSSGMode::eOff;
+	options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
+	options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
+	if (const auto result = g_api.dlssg_set_options(sl::ViewportHandle {0}, options); result != sl::Result::eOk)
+		LOGF("frame generation: slDLSSGSetOptions (off) failed (%d)\n", static_cast<int>(result));
+	g_mode_set    = 0;
+	g_options_set = false; // (the next present sends its sizes again)
+#endif
+}
+
+void NoteDroppedFrame() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	g_discontinuity.store(true, std::memory_order_relaxed);
+#endif
+	static std::atomic<uint32_t> dropped {0};
+	if (const auto count = dropped.fetch_add(1, std::memory_order_relaxed) + 1; count <= 8 || count % 600 == 0)
+		LOGF("frame generation: %u frame(s) with inputs left unshown (the next resets DLSS-G's history)\n", count);
+}
+
+uint32_t PresentedFrames() {
+	return g_presented_frames.load(std::memory_order_relaxed);
+}
+
+void SetStaticRect(float x0, float y0, float x1, float y1) {
+	const auto pack = [](float value, uint32_t index) {
+		return static_cast<uint64_t>(std::lround(std::clamp(value, 0.0f, 1.0f) * 65535.0f)) << (16u * index);
+	};
+	g_static_rect.store(pack(x0, 0) | pack(y0, 1) | pack(x1, 2) | pack(y1, 3), std::memory_order_relaxed);
+}
+
+// The camera's capture, per guest frame window (the "[dlssg] camera valid" line): G-buffer draws seen by path, those
+// whose SRT was too short to hold the camera.
+std::atomic<uint32_t> g_cam_seen[3] {}; // normal, table, native record
+std::atomic<uint32_t> g_cam_short {};
+
+std::mutex            g_last_vp_mutex; // (KYTY_CONTACT_SHADOWS: the last captured camera, any frame)
+std::array<float, 16> g_last_vp {};
+bool                  g_have_last_vp = false;
+
+void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt, char path) {
+	if (g_camera.valid || !IsGbufferVertexShader(vs_hash)) {
+		return;
+	}
+	g_cam_seen[path == 't' ? 1 : path == 'r' ? 2 : 0].fetch_add(1, std::memory_order_relaxed);
+	if (srt.size() < SrtJitter + 2) {
+		g_cam_short.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	for (uint32_t i = 0; i < 16; ++i) {
+		g_camera.view_proj[i] = AsFloat(srt[SrtViewProj + i]);
+	}
+	// The previous matrix has rows x, y, w; its z row is taken from the current one.
+	for (uint32_t i = 0; i < 4; ++i) {
+		g_camera.prev_view_proj[i]      = AsFloat(srt[SrtPrevViewProj + i]);
+		g_camera.prev_view_proj[4 + i]  = AsFloat(srt[SrtPrevViewProj + 4 + i]);
+		g_camera.prev_view_proj[8 + i]  = g_camera.view_proj[8 + i];
+		g_camera.prev_view_proj[12 + i] = AsFloat(srt[SrtPrevViewProj + 8 + i]);
+	}
+	g_camera.jitter_ndc = {AsFloat(srt[SrtJitter]), AsFloat(srt[SrtJitter + 1])};
+	g_camera.valid      = true;
+}
+
+// KYTY_SHADER_CENSUS=1: every program the game runs (vertex, pixel, compute) with the first and last guest flip it ran
+// in and how many draws or dispatches, printed every 10 s ("[census]" lines; the full list each time): the PlayStation
+// Studios logo's programs are those it alone uses (10-18: to hold it at 60 without frame generation).
+void NoteShader(uint64_t hash, char stage) {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_SHADER_CENSUS");
+		return value != nullptr && *value == '1';
+	}();
+	if (!on || hash == 0) return;
+	struct Entry {
+		uint64_t first = 0, last = 0, count = 0;
+		char     stage = '?';
+	};
+	static std::mutex                             mutex;
+	static std::unordered_map<uint64_t, Entry>    seen;
+	static auto                                   printed = std::chrono::steady_clock::now();
+	const uint64_t                                flip    = g_flips_taken.load(std::memory_order_relaxed);
+	std::lock_guard                               lock(mutex);
+	auto& e = seen[hash];
+	if (e.count == 0) {
+		e.first = flip;
+		e.stage = stage;
+	}
+	e.last = flip;
+	e.count++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - printed < std::chrono::seconds(10)) return;
+	printed = now;
+	std::printf("[census] flip %llu: %zu programs\n", static_cast<unsigned long long>(flip), seen.size());
+	for (const auto& [h, v]: seen)
+		std::printf("[census] %c %016llx first %llu last %llu count %llu\n", v.stage, static_cast<unsigned long long>(h),
+		            static_cast<unsigned long long>(v.first), static_cast<unsigned long long>(v.last),
+		            static_cast<unsigned long long>(v.count));
+	std::fflush(stdout);
+}
+
+
+void ReflexGuestFlip(FrameInputs& fg) {
+	fg.reflex_index = 0;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_ready || !ReflexGuestMarkers() || g_api.pcl_set_marker == nullptr) return;
+	sl::FrameToken* token = nullptr;
+	if (g_rx_open != 0) {
+		uint32_t index = g_rx_open;
+		if (g_api.get_new_frame_token(token, &index) == sl::Result::eOk && token != nullptr) {
+			g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, *token);
+			fg.reflex_index = g_rx_open;
+		}
+	}
+	uint32_t next = g_rx_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+	token         = nullptr;
+	if (g_api.get_new_frame_token(token, &next) != sl::Result::eOk || token == nullptr) {
+		g_rx_open = 0;
+		return;
+	}
+	static const bool sleep = [] {
+		const char* value = std::getenv("KYTY_DLSSG_SLEEP");
+		return value == nullptr || *value != '0';
+	}();
+	if (sleep && g_api.reflex_sleep != nullptr) g_api.reflex_sleep(*token);
+	g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, *token);
+	g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, *token);
+	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, *token);
+	g_rx_open = next;
+#endif
+}
+
+void SetPresentReflexIndex(uint32_t index) {
+	g_rx_present.store(index, std::memory_order_relaxed);
+}
+
+bool DemonsSoulsHashes() {
+	static const bool ds = false; // (bruno-astro-1025: Demon's Souls' built-in passes are not carried over)
+	return ds;
+}
+
+std::vector<uint64_t> HashList(const char* env) {
+	std::vector<uint64_t> out;
+	const char*           value = std::getenv(env);
+	if (value == nullptr) return out;
+	const std::string text(value);
+	for (size_t at = 0; at <= text.size();) {
+		auto end = text.find_first_of(";, ", at);
+		if (end == std::string::npos) end = text.size();
+		if (end > at) {
+			const uint64_t hash = std::strtoull(text.substr(at, end - at).c_str(), nullptr, 16);
+			if (hash != 0) out.push_back(hash);
+		}
+		at = end + 1;
+	}
+	if (!out.empty()) {
+		std::printf("Frame generation: %s = %zu shader(s) for this title\n", env, out.size());
+		std::fflush(stdout);
+	}
+	return out;
+}
+
+const std::vector<uint64_t>& TaaShaderList() {
+	static const std::vector<uint64_t> list = [] {
+		std::vector<uint64_t> v;
+		if (DemonsSoulsHashes()) v.assign(TaaShaders.begin(), TaaShaders.end());
+		for (auto hash: HashList("KYTY_FG_TAA_SHADERS")) v.push_back(hash);
+		return v;
+	}();
+	return list;
+}
+
+const std::vector<uint64_t>& GbufferShaderList() {
+	static const std::vector<uint64_t> list = [] {
+		std::vector<uint64_t> v;
+		if (DemonsSoulsHashes()) v.assign(GbufferVertexShaders.begin(), GbufferVertexShaders.end());
+		for (auto hash: HashList("KYTY_FG_GBUFFER_VS")) v.push_back(hash);
+		return v;
+	}();
+	return list;
+}
+
+namespace {
+const std::array<uint32_t, 7>& TaaSlotMap() {
+	static const std::array<uint32_t, 7> map = [] {
+		std::array<uint32_t, 7> m {0, 1, 2, 3, 4, 5, 6};
+		if (const char* value = std::getenv("KYTY_FG_TAA_SLOTS"); value != nullptr && *value != '\0') {
+			// color, depth, motion, history, output
+			constexpr std::array<uint32_t, 5> ds {0, 1, 3, 4, 6};
+			uint32_t                          field = 0;
+			for (const char* p = value; *p != '\0' && field < ds.size();) {
+				char* end = nullptr;
+				const long slot = std::strtol(p, &end, 10);
+				if (end == p) break;
+				if (slot >= 0 && slot < 64) m[ds[field]] = static_cast<uint32_t>(slot);
+				++field;
+				p = *end != '\0' ? end + 1 : end;
+			}
+			std::printf("Frame generation: KYTY_FG_TAA_SLOTS color %u depth %u motion %u history %u output %u\n", m[0], m[1],
+			            m[3], m[4], m[6]);
+			std::fflush(stdout);
+		}
+		return m;
+	}();
+	return map;
+}
+} // namespace
+
+uint32_t TaaSlot(uint32_t ds) {
+	return ds < 7 ? TaaSlotMap()[ds] : ds;
+}
+
+uint32_t TaaSlots() {
+	const auto& m = TaaSlotMap();
+	return *std::max_element(m.begin(), m.end()) + 1;
+}
+
+uint32_t SrtIndex(int which) {
+	static constexpr std::array<const char*, 3> names {"KYTY_FG_SRT_VIEWPROJ", "KYTY_FG_SRT_PREV", "KYTY_FG_SRT_JITTER"};
+	static constexpr std::array<uint32_t, 3>    ds {29, 45, 57};
+	const auto                                  i = static_cast<size_t>(std::clamp(which, 0, 2));
+	const char*                                 value = std::getenv(names[i]);
+	return value != nullptr && *value != '\0' ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : ds[i];
+}
+
+bool GenericInputs() {
+	static const bool generic = [] {
+		if (DemonsSoulsHashes() || !TaaShaderList().empty()) return false;
+		const char* value = std::getenv("KYTY_FG_GENERIC");
+		const bool  on    = value == nullptr || *value != '0';
+		std::printf("Frame generation inputs: %s\n",
+		            on ? "this title's passes are not known (KYTY_FG_TAA_SHADERS): every frame but a movie's, with zero "
+		                 "motion vectors (the images alone)"
+		               : "off for this title (KYTY_FG_GENERIC=0)");
+		std::fflush(stdout);
+		return on;
+	}();
+	return generic;
+}
+
+void NoteScene() {
+	g_scene.store(true, std::memory_order_relaxed);
+}
+
+bool TakeScene() {
+	// (GenericInputs: every frame but a movie's is the game's view.)
+	const bool scene = g_scene.exchange(false, std::memory_order_relaxed) || (Capturing() && GenericInputs() && !VideoOut::MoviePlaying());
+	g_last_scene.store(scene, std::memory_order_relaxed);
+	g_flips_taken.fetch_add(1, std::memory_order_relaxed);
+	return scene;
+}
+
+uint64_t GuestFlips() {
+	return g_flips_taken.load(std::memory_order_relaxed);
+}
+
+bool SceneNoted() {
+	return g_scene.load(std::memory_order_relaxed) || g_last_scene.load(std::memory_order_relaxed);
+}
+
+void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId motion,
+                uint64_t motion_address) {
+	if (!IsTaaShader(cs_hash)) {
+		return;
+	}
+	g_sources = {depth, motion, depth_address, motion_address, true};
+}
+
+void OnUpscale(ImageId depth, uint64_t depth_address, ImageId motion, uint64_t motion_address) {
+	g_sources = {depth, motion, depth_address, motion_address, true};
+}
+
+namespace {
+
+// FSR 3's HUD-less image: the flip image before the game draws its HUD on it. The 3D scene reaches it in the first
+// render pass of the frame into it (KYTY_FSR3_HUDLESS_PASS: the pass before which it is copied, 2 by default: the
+// scene's full-screen pass is the first, the HUD's draws come after); the copy is taken as that pass begins.
+struct FlipTarget {
+	ImageId                    id;
+	vk::Image                  image   = nullptr;
+	uint64_t                   address = 0;
+	std::vector<vk::ImageView> views;
+};
+std::array<FlipTarget, 4> g_flips {};
+uint32_t                  g_flip_next    = 0;
+TextureCache*             g_cache        = nullptr;
+GraphicContext*           g_graphics_ctx = nullptr;
+VulkanImage               g_hudless;
+vk::ImageView             g_hudless_view = nullptr;
+uint32_t                  g_flip_renders = 0;
+bool                      g_hudless_taken = false;
+uint32_t                  g_hudless_logs  = 0;
+
+bool HudlessWanted() {
+	// (Another title: off unless asked, KYTY_FSR3_HUDLESS=1 with KYTY_FSR3_HUDLESS_PASS / _DRAW naming where its HUD
+	// starts; the default, the copy after the flip image's first draw, is Demon's Souls' composite.)
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_FSR3_HUDLESS");
+		if (value == nullptr || *value == '\0') return DemonsSoulsHashes();
+		return *value != '0';
+	}();
+	return wanted;
+}
+vk::Format UnormOf(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Srgb: return vk::Format::eR8G8B8A8Unorm;
+		case vk::Format::eB8G8R8A8Srgb: return vk::Format::eB8G8R8A8Unorm;
+		default: return format;
+	}
+}
+// `image` as a sampled copy target of that format and size.
+void ConfigureAs(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view, vk::Format format, vk::Extent3D extent) {
+	if (image.image != nullptr && image.format == format && image.extent.width == extent.width &&
+	    image.extent.height == extent.height)
+		return;
+	VulkanImage source {};
+	source.format = format;
+	source.extent = extent;
+	Configure(graphics, image, view, source);
+}
+// A raw copy between two images of one size (formats of one class).
+void CopyRaw(vk::CommandBuffer command, VulkanImage& source, VulkanImage& target) {
+	Transition(command, source, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+	           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+	Transition(command, target, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = target.extent;
+	command.copyImage(source.image, vk::ImageLayout::eTransferSrcOptimal, target.image,
+	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	for (auto* image: {&source, &target})
+		Transition(command, *image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+}
+
+} // namespace
+
+namespace {
+// The flip image's render pass in progress (renderer thread).
+bool              g_flip_pass       = false;
+const FlipTarget* g_flip_target     = nullptr;
+uint32_t          g_flip_attachment = 0;
+uint32_t          g_flip_draws      = 0;
+uint32_t          g_flip_max_draws  = 0;
+RenderState       g_flip_state {};
+bool              g_resuming        = false;
+uint32_t HudlessDraw() {
+	static const uint32_t draw = [] {
+		const char* value = std::getenv("KYTY_FSR3_HUDLESS_DRAW");
+		const int   n     = value != nullptr ? std::atoi(value) : 1;
+		return static_cast<uint32_t>(std::clamp(n, 1, 1000));
+	}();
+	return draw;
+}
+} // namespace
+
+void OnBeginRendering(CommandBuffer& command, const RenderState& state) {
+	(void)command;
+	if (g_resuming || !LiveCensus::g_render || !Capturing() || !HudlessWanted() || g_cache == nullptr ||
+	    g_graphics_ctx == nullptr)
+		return;
+	g_flip_pass   = false;
+	g_flip_target = nullptr;
+	for (uint32_t i = 0; i < state.num_color_attachments && g_flip_target == nullptr; ++i) {
+		const auto view = state.color_attachments[i].image_view;
+		if (view == nullptr) continue;
+		for (const auto& target: g_flips)
+			if (std::find(target.views.begin(), target.views.end(), view) != target.views.end()) {
+				g_flip_target     = &target;
+				g_flip_attachment = i;
+				break;
+			}
+	}
+	if (g_flip_target == nullptr) return;
+	g_flip_pass  = true;
+	g_flip_draws = 0;
+	g_flip_state = state;
+	++g_flip_renders;
+}
+
+void AfterDraw(CommandBuffer& command) {
+	if (!g_flip_pass || !LiveCensus::g_render) return;
+	++g_flip_draws;
+	g_flip_max_draws = std::max(g_flip_max_draws, g_flip_draws);
+	if (g_hudless_taken || g_flip_draws != HudlessDraw() || g_flip_target == nullptr) return;
+	auto& image = g_cache->GetImage(g_flip_target->id);
+	if (image.backing.image != g_flip_target->image || image.info.data.address != g_flip_target->address) return;
+	ConfigureAs(*g_graphics_ctx, g_hudless, g_hudless_view, UnormOf(image.backing.format), image.backing.extent);
+	command.EndRendering();
+	auto vk_command = command.Handle();
+	CopyInto(vk_command, image, g_hudless);
+	image.Transit(g_flip_state.color_attachments[g_flip_attachment].image_layout,
+	              vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite, {}, vk_command);
+	g_resuming = true;
+	command.ResumeRendering(g_flip_state);
+	g_resuming      = false;
+	g_hudless_taken = true;
+}
+
+namespace {
+std::unordered_map<uint64_t, uint32_t> g_target_draws; // this frame's normal-path draws per color target
+VulkanImage                            g_flip_backup;
+vk::ImageView                          g_flip_backup_view = nullptr;
+VulkanImage                            g_ui_backup;
+vk::ImageView                          g_ui_backup_view = nullptr;
+bool                                   g_composite      = false; // this frame's HUD-less image is a composite without HUD
+uint32_t                               g_composite_logs = 0;
+uint32_t                               g_flip_slot_hits = 0;
+uint64_t KeyOf(ImageId id) { return (uint64_t {id.index} << 32u) | id.generation; }
+// KYTY_FSR3_UI_IMAGE=n: the HUD texture is the composite's n-th candidate (the log lists them), not the guess.
+int UiOverride() {
+	static const int value = [] {
+		const char* text = std::getenv("KYTY_FSR3_UI_IMAGE");
+		return text != nullptr && *text != '\0' ? std::atoi(text) : -1;
+	}();
+	return value;
+}
+bool UiDebug() {
+	static const bool value = [] {
+		const char* text = std::getenv("KYTY_FSR3_UI_DEBUG");
+		return text != nullptr && *text == '1';
+	}();
+	return value;
+}
+bool Rgba8(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32: return true;
+		default: return false;
+	}
+}
+const FlipTarget* FlipOf(ImageId id) {
+	if (!id || g_cache == nullptr) return nullptr;
+	// (A table draw state's target id may name an image erased since: NativeXprTargetsCurrent asks before it checks
+	// the ids are live. GetImage asserted on one at the dragon's path, 2026-10-11.)
+	const auto* image = g_cache->TryGetImage(id);
+	if (image == nullptr) return nullptr;
+	for (const auto& target: g_flips)
+		if (target.image != nullptr && image->backing.image == target.image && image->info.data.address == target.address)
+			return &target;
+	return nullptr;
+}
+// `backup` into `image` (mip 0, layer 0).
+void CopyBack(vk::CommandBuffer command, VulkanImage& backup, Image& image) {
+	Transition(command, backup, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+	           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = backup.extent;
+	command.copyImage(backup.image, vk::ImageLayout::eTransferSrcOptimal, image.backing.image,
+	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	Transition(command, backup, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+}
+} // namespace
+
+namespace {
+// IsFlipImage's answers per image id (direct-mapped), valid while g_flip_epoch holds (it moves when a flip image changes).
+struct FlipAnswer {
+	ImageId  id;
+	uint64_t epoch  = 0;
+	bool     answer = false;
+};
+std::array<FlipAnswer, 512> g_flip_answers {};
+uint64_t                    g_flip_epoch = 1;
+} // namespace
+
+bool IsFlipImage(ImageId id) {
+	if (!id || g_cache == nullptr || !LiveCensus::g_render) return false;
+	auto& cached = g_flip_answers[id.index & (g_flip_answers.size() - 1)];
+	if (cached.epoch == g_flip_epoch && cached.id == id) return cached.answer;
+	cached = {id, g_flip_epoch, FlipOf(id) != nullptr};
+	return cached.answer;
+}
+
+void NoteDraw(ImageId target) {
+	if (target && LiveCensus::g_render) ++g_target_draws[KeyOf(target)];
+}
+
+int FlipSlot(std::span<const ImageId> targets) {
+	if (!LiveCensus::g_render || !HudlessWanted() || g_cache == nullptr || g_graphics_ctx == nullptr || g_hudless_taken)
+		return -1;
+	for (size_t i = 0; i < targets.size(); ++i)
+		if (FlipOf(targets[i]) != nullptr) {
+			++g_flip_slot_hits;
+			return static_cast<int>(i);
+		}
+	return -1;
+}
+
+void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageId target, uint32_t slot,
+                    std::span<const TextureBinding> images, const std::function<void()>& redraw) {
+	if (!Enabled() && !Fsr3::Active()) return; // (capturing for upscaling only: no HUD-less image wanted)
+	if (g_hudless_taken || slot >= rendering.num_color_attachments || FlipOf(target) == nullptr) return;
+	auto& flip = g_cache->GetImage(target);
+	// The HUD texture: of the full-screen-ish color images the composite samples, an 8-bit (or 10-bit) one with alpha
+	// that the most draws went to this frame (the HUD's sprites and text; the scene's last passes are one draw each).
+	struct Candidate {
+		size_t   binding;
+		ImageId  id;
+		uint32_t draws;
+		bool     rgba8;
+	};
+	std::vector<Candidate> candidates;
+	for (size_t i = 0; i < images.size(); ++i) {
+		const auto id = images[i].image_id;
+		if (!id || id == target) continue;
+		if (std::any_of(candidates.begin(), candidates.end(), [&](const Candidate& c) { return c.id == id; })) continue;
+		auto& image = g_cache->GetImage(id);
+		if (IsDepthFormat(image.backing.format) || image.backing.image == flip.backing.image) continue;
+		if (image.backing.extent.width * 2 < flip.backing.extent.width ||
+		    image.backing.extent.height * 2 < flip.backing.extent.height)
+			continue;
+		const auto found = g_target_draws.find(KeyOf(id));
+		candidates.push_back({i, id, found != g_target_draws.end() ? found->second : 0u, Rgba8(image.backing.format)});
+	}
+	int chosen = -1;
+	if (const int forced = UiOverride(); forced >= 0) {
+		if (forced < static_cast<int>(candidates.size())) chosen = forced;
+	} else {
+		// Demon's Souls: the composite samples the scene at the internal resolution (2560x1440, upscaled by the draw)
+		// and the HUD layer at the output resolution (3840x2160, RGBA16F, drawn on paths that are not counted). So the
+		// HUD is first the image of the flip image's size, then the one with the most draws.
+		const auto rank = [&](const Candidate& c) {
+			auto& image = g_cache->GetImage(c.id);
+			const bool full = image.backing.extent.width == flip.backing.extent.width &&
+			                  image.backing.extent.height == flip.backing.extent.height;
+			return std::tuple {full, c.draws > 0, c.rgba8, c.draws};
+		};
+		for (size_t i = 0; i < candidates.size(); ++i) {
+			const auto& c = candidates[i];
+			if (!std::get<0>(rank(c)) && c.draws == 0) continue;
+			if (chosen < 0 || rank(c) > rank(candidates[chosen])) chosen = static_cast<int>(i);
+		}
+	}
+	if (g_composite_logs < 8 || (UiDebug() && g_composite_logs < 200 && (++g_composite_logs % 20) == 0)) {
+		++g_composite_logs;
+		std::printf("HUD-less: the flip image's draw (%ux%u format %d) samples %zu images, candidates:",
+		            flip.backing.extent.width, flip.backing.extent.height, static_cast<int>(flip.backing.format),
+		            images.size());
+		for (size_t i = 0; i < candidates.size(); ++i) {
+			const auto& image = g_cache->GetImage(candidates[i].id);
+			std::printf(" [%zu] binding %zu %ux%u format %d draws %u%s", i, candidates[i].binding, image.backing.extent.width,
+			            image.backing.extent.height, static_cast<int>(image.backing.format), candidates[i].draws,
+			            static_cast<int>(i) == chosen ? " (HUD)" : "");
+		}
+		std::printf("\n");
+		std::fflush(stdout);
+	}
+	if (chosen < 0) return;
+	const auto& binding = images[candidates[chosen].binding];
+	auto&       ui      = g_cache->GetImage(candidates[chosen].id);
+	const auto  ui_layout    = binding.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eShaderReadOnlyOptimal
+	                                                                         : binding.layout;
+	const auto  flip_layout  = rendering.color_attachments[slot].image_layout;
+	const auto  flip_access  = vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+	const bool  in_pass      = command.RenderingWith(rendering);
+	auto        vk_command   = command.Handle();
+	command.EndRendering();
+	// Both as they are now.
+	ConfigureAs(*g_graphics_ctx, g_flip_backup, g_flip_backup_view, flip.backing.format, flip.backing.extent);
+	CopyInto(vk_command, flip, g_flip_backup);
+	ConfigureAs(*g_graphics_ctx, g_ui_backup, g_ui_backup_view, ui.backing.format, ui.backing.extent);
+	CopyInto(vk_command, ui, g_ui_backup);
+	// No HUD.
+	ui.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, vk_command);
+	vk::ClearColorValue             transparent {};
+	transparent.uint32 = std::array<uint32_t, 4> {0u, 0u, 0u, 0u};
+	const vk::ImageSubresourceRange level {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk_command.clearColorImage(ui.backing.image, vk::ImageLayout::eTransferDstOptimal, &transparent, 1, &level);
+	ui.Transit(ui_layout, vk::AccessFlagBits2::eShaderRead, {}, vk_command);
+	flip.Transit(flip_layout, flip_access, {}, vk_command);
+	// The draw without it (the pass as the game began it: cleared, unless it was already in progress).
+	g_resuming = true;
+	if (in_pass) command.ResumeRendering(rendering);
+	else command.BeginRendering(rendering);
+	redraw();
+	command.EndRendering();
+	ConfigureAs(*g_graphics_ctx, g_hudless, g_hudless_view, UnormOf(flip.backing.format), flip.backing.extent);
+	CopyInto(vk_command, flip, g_hudless);
+	// Everything back.
+	CopyBack(vk_command, g_flip_backup, flip);
+	// KYTY_FSR3_UI_DEBUG=1: the HUD texture is left cleared, so the game's own draw shows the picture without what
+	// was taken as the HUD (everything that vanishes from the screen is what frame generation keeps out).
+	if (!UiDebug()) CopyBack(vk_command, g_ui_backup, ui);
+	ui.Transit(ui_layout, vk::AccessFlagBits2::eShaderRead, {}, vk_command);
+	flip.Transit(flip_layout, flip_access, {}, vk_command);
+	if (in_pass) command.ResumeRendering(rendering);
+	g_resuming      = false;
+	g_hudless_taken = true;
+	g_composite     = true;
+}
+
+namespace {
+VulkanImage   g_up_depth, g_up_motion, g_up_output;
+vk::ImageView g_up_depth_view = nullptr, g_up_motion_view = nullptr, g_up_output_view = nullptr;
+bool          g_up_reset = true;
+std::chrono::steady_clock::time_point g_up_last {};
+uint32_t      g_up_logs  = 0;
+uint64_t      g_up_count = 0, g_up_missed = 0;
+
+uint32_t UpscaleHeight() {
+	static const uint32_t height = [] {
+		const char* value = std::getenv("KYTY_UPSCALE_HEIGHT");
+		const auto  h     = value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 1440u;
+		return std::clamp(h, 720u, 2160u);
+	}();
+	return height;
+}
+
+
+// KYTY_UPSCALE_SHARPNESS=<0..1> after DLSS or XeSS (sharpen.comp): g_up_output into g_sharp, which the composite reads.
+struct SharpenPass {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	vk::Sampler             sampler    = nullptr;
+	VulkanImage             image;
+	vk::ImageView           view   = nullptr;
+	bool                    failed = false;
+	// The PS5 Pro path when the output's format has no storage support: sharpen.comp into this rgba16f image, then
+	// blitted back into the output.
+	VulkanImage             out16;
+	vk::ImageView           out16_view = nullptr;
+} g_sharp;
+
+bool StorageFormat(GraphicContext& graphics, vk::Format format) {
+	return static_cast<bool>(graphics.physical_device.getFormatProperties(format).optimalTilingFeatures &
+	                         vk::FormatFeatureFlagBits::eStorageImage);
+}
+
+bool EnsureSharpenOut16(GraphicContext& graphics, vk::Extent3D extent) {
+	const auto device = graphics.device;
+	if (g_sharp.out16.image != nullptr && g_sharp.out16.extent.width == extent.width && g_sharp.out16.extent.height == extent.height)
+		return true;
+	if (g_sharp.out16_view != nullptr) {
+		device.waitIdle();
+		device.destroyImageView(g_sharp.out16_view, nullptr);
+		g_sharp.out16_view = nullptr;
+	}
+	if (g_sharp.out16.image != nullptr) graphics.DeleteImage(g_sharp.out16);
+	g_sharp.out16.image = nullptr;
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = vk::Format::eR16G16B16A16Sfloat;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc;
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.samples       = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, g_sharp.out16)) {
+		g_sharp.out16.image = nullptr;
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = g_sharp.out16.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = vk::Format::eR16G16B16A16Sfloat;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (device.createImageView(&view_info, nullptr, &g_sharp.out16_view) != vk::Result::eSuccess) return false;
+	g_sharp.out16.state = {};
+	return true;
+}
+
+bool EnsureSharpen(GraphicContext& graphics, const VulkanImage& like) {
+	const auto device = graphics.device;
+	if (g_sharp.pipeline == nullptr) {
+		if (g_sharp.failed) return false;
+		g_sharp.failed = true;
+		std::array<vk::DescriptorSetLayoutBinding, 2> bindings {};
+		for (uint32_t i = 0; i < 2; ++i) {
+			bindings[i].binding         = i;
+			bindings[i].descriptorType  = i == 0 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorCount = 1;
+			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+		}
+		vk::DescriptorSetLayoutCreateInfo set_info {};
+		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		set_info.bindingCount = 2;
+		set_info.pBindings    = bindings.data();
+		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_sharp.set_layout) != vk::Result::eSuccess) return false;
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, 4};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = 1;
+		layout_info.pSetLayouts            = &g_sharp.set_layout;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push;
+		if (device.createPipelineLayout(&layout_info, nullptr, &g_sharp.layout) != vk::Result::eSuccess) return false;
+		vk::ShaderModuleCreateInfo module_info {};
+		module_info.codeSize    = sizeof(SHARPEN_SPV);
+		module_info.pCode       = SHARPEN_SPV;
+		vk::ShaderModule module = nullptr;
+		if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		pipeline_info.stage.module = module;
+		pipeline_info.stage.pName  = "main";
+		pipeline_info.layout       = g_sharp.layout;
+		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_sharp.pipeline);
+		device.destroyShaderModule(module, nullptr);
+		if (created != vk::Result::eSuccess) {
+			g_sharp.pipeline = nullptr;
+			return false;
+		}
+		vk::SamplerCreateInfo sampler {};
+		sampler.magFilter    = vk::Filter::eNearest;
+		sampler.minFilter    = vk::Filter::eNearest;
+		sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+		if (device.createSampler(&sampler, nullptr, &g_sharp.sampler) != vk::Result::eSuccess) return false;
+		g_sharp.failed = false;
+	}
+	if (g_sharp.image.image != nullptr && g_sharp.image.format == like.format &&
+	    g_sharp.image.extent.width == like.extent.width && g_sharp.image.extent.height == like.extent.height)
+		return true;
+	if (g_sharp.view != nullptr) {
+		device.waitIdle();
+		device.destroyImageView(g_sharp.view, nullptr);
+		g_sharp.view = nullptr;
+	}
+	if (g_sharp.image.image != nullptr) graphics.DeleteImage(g_sharp.image);
+	g_sharp.image.image = nullptr;
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {like.extent.width, like.extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = like.format;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
+	// (Storage only where the format has it: B10G11R11 may not.)
+	if (StorageFormat(graphics, like.format)) create.usage |= vk::ImageUsageFlagBits::eStorage;
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.samples       = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, g_sharp.image)) {
+		g_sharp.image.image = nullptr;
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = g_sharp.image.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = like.format;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (device.createImageView(&view_info, nullptr, &g_sharp.view) != vk::Result::eSuccess) return false;
+	g_sharp.image.state = {};
+	return true;
+}
+
+float SharpenAmount() {
+	static const float amount = [] {
+		const char* value = std::getenv("KYTY_UPSCALE_SHARPNESS");
+		return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f) : 0.0f;
+	}();
+	return amount;
+}
+
+void ConfigureOutput(GraphicContext& graphics, vk::Format format, vk::Extent2D extent) {
+	if (g_up_output.image != nullptr && g_up_output.format == format && g_up_output.extent.width == extent.width &&
+	    g_up_output.extent.height == extent.height)
+		return;
+	if (g_up_output_view != nullptr) {
+		graphics.device.waitIdle();
+		graphics.device.destroyImageView(g_up_output_view, nullptr);
+		g_up_output_view = nullptr;
+	}
+	if (g_up_output.image != nullptr) graphics.DeleteImage(g_up_output);
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = format;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc |
+	               vk::ImageUsageFlagBits::eTransferDst;
+	create.sharingMode = vk::SharingMode::eExclusive;
+	create.samples     = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, g_up_output)) {
+		EXIT("upscaling: cannot allocate a %ux%u output image\n", extent.width, extent.height);
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = g_up_output.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = format;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	RequireVulkanSuccess(graphics.device.createImageView(&view_info, nullptr, &g_up_output_view), "upscaling output view");
+}
+} // namespace
+
+namespace {
+// KYTY_TAA_REPLACE=upscaler: the TAA dispatch's jittered color (image 0) copied to its output (image 6), each image
+// back in the layout the dispatch bound it in.
+bool BypassTaa(vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
+	if (g_cache == nullptr || images.size() < TaaSlots()) return false;
+	if (!Fsr3::UpscaleWanted() && !g_dlss_sr && !Xess::Wanted()) return false; // (no upscaler: the game's TAA)
+	const auto& color_b = images[TaaSlot(0)];
+	const auto& out_b   = images[TaaSlot(6)];
+	if (!color_b.image_id || !out_b.image_id) return false;
+	auto& color  = g_cache->GetImage(color_b.image_id);
+	auto& output = g_cache->GetImage(out_b.image_id);
+	static uint32_t logs = 0;
+	if (color.backing.extent.width != output.backing.extent.width ||
+	    color.backing.extent.height != output.backing.extent.height || color.backing.image == output.backing.image) {
+		if (logs < 2) {
+			++logs;
+			std::printf("TAA: not skipped (color %ux%u, output %ux%u)\n", color.backing.extent.width,
+			            color.backing.extent.height, output.backing.extent.width, output.backing.extent.height);
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	DrainGpuThreadCommands(); // (bruno-astro-1025: the deferred recording's queued commands first)
+	const vk::ImageSubresourceLayers layers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	color.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, vk_command);
+	output.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, vk_command);
+	if (color.backing.format == output.backing.format) {
+		vk::ImageCopy copy {};
+		copy.srcSubresource = layers;
+		copy.dstSubresource = layers;
+		copy.extent         = vk::Extent3D {color.backing.extent.width, color.backing.extent.height, 1};
+		vk_command.copyImage(color.backing.image, vk::ImageLayout::eTransferSrcOptimal, output.backing.image,
+		                     vk::ImageLayout::eTransferDstOptimal, copy);
+	} else {
+		vk::ImageBlit blit {};
+		blit.srcSubresource = layers;
+		blit.dstSubresource = layers;
+		blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(color.backing.extent.width),
+		                                    static_cast<int32_t>(color.backing.extent.height), 1};
+		blit.dstOffsets[1]  = blit.srcOffsets[1];
+		vk_command.blitImage(color.backing.image, vk::ImageLayout::eTransferSrcOptimal, output.backing.image,
+		                     vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+	}
+	const auto shader = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+	color.Transit(color_b.layout, shader, {}, vk_command);
+	output.Transit(out_b.layout, shader, {}, vk_command);
+	if (logs < 2) {
+		++logs;
+		std::printf("TAA: skipped, the upscaler takes the raw %ux%u frame (format %d -> %d)\n", color.backing.extent.width,
+		            color.backing.extent.height, static_cast<int>(color.backing.format),
+		            static_cast<int>(output.backing.format));
+		std::fflush(stdout);
+	}
+	return true;
+}
+} // namespace
+
+namespace {
+struct TaaBypassPipeline {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	vk::Sampler             sampler    = nullptr;
+	VkBuffer                stats      = VK_NULL_HANDLE; // (taa-bypass.comp's Stats: sums, the gain)
+	VmaAllocation           stats_mem  = nullptr;
+	VkBuffer                readback   = VK_NULL_HANDLE; // (a copy of it for the log)
+	VmaAllocation           readback_mem = nullptr;
+	const float*            readback_mapped = nullptr;
+	VulkanImage             dlaa;                        // KYTY_TAA_REPLACE=dlss: DLAA's output, then into the TAA's
+	vk::ImageView           dlaa_view = nullptr;
+	uint64_t                raw_frame = UINT64_MAX;      // the guest frame whose raw color `dlaa` holds (bypass)
+	// The TAA's own output (before the raw frame replaced it), put back as its history before its next dispatch: the
+	// TAA then blends with its own past as on the console, and its output, compared with the raw frame, gives the
+	// brightness the raw frame needs (10-17: with the replaced frame as its history the comparison fed on itself
+	// and the gain ran to the 8x clamp).
+	VulkanImage             truth;
+	uint64_t                truth_frame = UINT64_MAX;
+	bool                    failed     = false;
+} g_bypass;
+
+bool EnsureBypassPipeline(GraphicContext& graphics) {
+	if (g_bypass.pipeline != nullptr) return true;
+	if (g_bypass.failed) return false;
+	g_bypass.failed   = true; // until it is made
+	const auto device = graphics.device;
+	std::array<vk::DescriptorSetLayoutBinding, 3> bindings {};
+	for (uint32_t i = 0; i < 3; ++i) {
+		bindings[i].binding         = i;
+		bindings[i].descriptorType  = i == 0   ? vk::DescriptorType::eCombinedImageSampler
+		                              : i == 1 ? vk::DescriptorType::eStorageImage
+		                                       : vk::DescriptorType::eStorageBuffer;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+	}
+	vk::DescriptorSetLayoutCreateInfo set_info {};
+	set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+	set_info.pBindings    = bindings.data();
+	if (device.createDescriptorSetLayout(&set_info, nullptr, &g_bypass.set_layout) != vk::Result::eSuccess) return false;
+	vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, 24};
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount         = 1;
+	layout_info.pSetLayouts            = &g_bypass.set_layout;
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges    = &push;
+	if (device.createPipelineLayout(&layout_info, nullptr, &g_bypass.layout) != vk::Result::eSuccess) return false;
+	vk::ShaderModuleCreateInfo module_info {};
+	module_info.codeSize    = sizeof(TAA_BYPASS_SPV);
+	module_info.pCode       = TAA_BYPASS_SPV;
+	vk::ShaderModule module = nullptr;
+	if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+	vk::ComputePipelineCreateInfo pipeline_info {};
+	pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	pipeline_info.stage.module = module;
+	pipeline_info.stage.pName  = "main";
+	pipeline_info.layout       = g_bypass.layout;
+	const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_bypass.pipeline);
+	device.destroyShaderModule(module, nullptr);
+	if (created != vk::Result::eSuccess) {
+		g_bypass.pipeline = nullptr;
+		return false;
+	}
+	vk::SamplerCreateInfo sampler {};
+	sampler.magFilter    = vk::Filter::eNearest;
+	sampler.minFilter    = vk::Filter::eNearest;
+	sampler.mipmapMode   = vk::SamplerMipmapMode::eNearest;
+	sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+	sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+	sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+	sampler.maxLod       = 0.0f;
+	if (device.createSampler(&sampler, nullptr, &g_bypass.sampler) != vk::Result::eSuccess) return false;
+	{
+		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		create.size  = 1u << 20; // (the header and a ratio per 8x8 block, up to 3840x2160)
+		create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+		if (vmaCreateBuffer(graphics.allocator, &create, &allocate, &g_bypass.stats, &g_bypass.stats_mem, nullptr) != VK_SUCCESS)
+			return false;
+		create.usage   = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocate.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VmaAllocationInfo mapped {};
+		if (vmaCreateBuffer(graphics.allocator, &create, &allocate, &g_bypass.readback, &g_bypass.readback_mem, &mapped) ==
+		    VK_SUCCESS)
+			g_bypass.readback_mapped = static_cast<const float*>(mapped.pMappedData);
+	}
+	g_bypass.failed = false;
+	return true;
+}
+
+bool EnsureDlaaImage(GraphicContext& graphics, vk::Extent2D extent) {
+	if (g_bypass.dlaa.image != nullptr && g_bypass.dlaa.extent.width == extent.width &&
+	    g_bypass.dlaa.extent.height == extent.height)
+		return true;
+	if (g_bypass.dlaa_view != nullptr) {
+		graphics.device.waitIdle();
+		graphics.device.destroyImageView(g_bypass.dlaa_view, nullptr);
+		g_bypass.dlaa_view = nullptr;
+	}
+	if (g_bypass.dlaa.image != nullptr) graphics.DeleteImage(g_bypass.dlaa);
+	g_bypass.dlaa.image = nullptr;
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = vk::Format::eR16G16B16A16Sfloat;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+	               vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+	create.sharingMode = vk::SharingMode::eExclusive;
+	create.samples     = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, g_bypass.dlaa)) {
+		g_bypass.dlaa.image = nullptr;
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = g_bypass.dlaa.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = create.format;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (graphics.device.createImageView(&view_info, nullptr, &g_bypass.dlaa_view) != vk::Result::eSuccess) {
+		graphics.DeleteImage(g_bypass.dlaa);
+		g_bypass.dlaa.image = nullptr;
+		g_bypass.dlaa_view  = nullptr;
+		return false;
+	}
+	g_bypass.dlaa.state = {};
+	return true;
+}
+
+
+// A raw copy between a cache image and one of ours (one size and format), the cache image back in `layout`.
+void CopyWithCacheImage(vk::CommandBuffer vk_command, Image& cache_image, vk::ImageLayout layout, VulkanImage& ours,
+                        bool to_ours) {
+	const vk::ImageSubresourceLayers layers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	vk::ImageCopy copy {};
+	copy.srcSubresource = layers;
+	copy.dstSubresource = layers;
+	copy.extent         = vk::Extent3D {ours.extent.width, ours.extent.height, 1};
+	if (to_ours) {
+		cache_image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, vk_command);
+		Transition(vk_command, ours, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+		           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+		vk_command.copyImage(cache_image.backing.image, vk::ImageLayout::eTransferSrcOptimal, ours.image,
+		                     vk::ImageLayout::eTransferDstOptimal, copy);
+	} else {
+		Transition(vk_command, ours, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+		           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+		cache_image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, vk_command);
+		vk_command.copyImage(ours.image, vk::ImageLayout::eTransferSrcOptimal, cache_image.backing.image,
+		                     vk::ImageLayout::eTransferDstOptimal, copy);
+	}
+	cache_image.Transit(layout, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, {}, vk_command);
+}
+
+bool EnsureTruthImage(GraphicContext& graphics, vk::Extent2D extent) {
+	auto& t = g_bypass.truth;
+	if (t.image != nullptr && t.extent.width == extent.width && t.extent.height == extent.height) return true;
+	if (t.image != nullptr) {
+		graphics.device.waitIdle();
+		graphics.DeleteImage(t);
+		t.image = nullptr;
+	}
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = vk::Format::eR16G16B16A16Sfloat;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.samples       = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, t)) {
+		t.image = nullptr;
+		return false;
+	}
+	t.state             = {};
+	g_bypass.truth_frame = UINT64_MAX;
+	return true;
+}
+
+float EnvFloatOr(const char* name, float fallback) {
+	const char* value = std::getenv(name);
+	return value != nullptr && *value != '\0' ? static_cast<float>(std::atof(value)) : fallback;
+}
+} // namespace
+
+bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
+	const bool bypass = g_taa_bypass && !g_taa_bypass_copy;
+	if ((!bypass && !g_taa_dlss) || g_cache == nullptr || g_graphics_ctx == nullptr || images.size() < TaaSlots()) return false;
+	if (bypass && !Fsr3::UpscaleWanted() && !g_dlss_sr && !Xess::Wanted()) return false; // (no upscaler: the TAA's)
+	const auto& color_b = images[TaaSlot(0)];
+	const auto& out_b   = images[TaaSlot(6)];
+	if (!color_b.image_id || !out_b.image_id || color_b.image_view == nullptr || out_b.image_view == nullptr) return false;
+	auto&           color  = g_cache->GetImage(color_b.image_id);
+	auto&           output = g_cache->GetImage(out_b.image_id);
+	const vk::Extent2D render {color.backing.extent.width, color.backing.extent.height};
+	static uint32_t logs   = 0;
+	if (output.backing.extent.width != render.width || output.backing.extent.height != render.height ||
+	    color.backing.image == output.backing.image || output.backing.format != vk::Format::eR16G16B16A16Sfloat ||
+	    !EnsureBypassPipeline(*g_graphics_ctx)) {
+		if (logs < 2) {
+			++logs;
+			std::printf("TAA: kept (color %ux%u, output %ux%u format %d)\n", render.width, render.height,
+			            output.backing.extent.width, output.backing.extent.height, static_cast<int>(output.backing.format));
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	DrainGpuThreadCommands(); // (bruno-astro-1025: the deferred recording's queued commands first)
+	// The TAA's writes (and its reads) before what follows.
+	const auto compute_barrier = [&](vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst_access;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		vk_command.pipelineBarrier2(dependency);
+	};
+	compute_barrier(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+
+	if (bypass && !g_taa_bypass_match) {
+		// The raw jittered frame kept for the upscaler (UpscaleComposite); the TAA's output stays the game's.
+		if (color.backing.format != vk::Format::eR16G16B16A16Sfloat || !EnsureDlaaImage(*g_graphics_ctx, render)) return false;
+		color.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, vk_command);
+		Transition(vk_command, g_bypass.dlaa, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+		           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+		vk::ImageCopy copy {};
+		copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.extent         = vk::Extent3D {render.width, render.height, 1};
+		vk_command.copyImage(color.backing.image, vk::ImageLayout::eTransferSrcOptimal, g_bypass.dlaa.image,
+		                     vk::ImageLayout::eTransferDstOptimal, copy);
+		Transition(vk_command, g_bypass.dlaa, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader);
+		color.Transit(color_b.layout, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, {}, vk_command);
+		g_bypass.raw_frame = g_guest_frame;
+		if (logs < 2) {
+			++logs;
+			std::printf("TAA: ran for the game; its raw %ux%u frame kept for the upscaler\n", render.width, render.height);
+			std::fflush(stdout);
+		}
+		return true;
+	}
+
+	// The source of the color: the raw jittered frame, or DLAA's output (KYTY_TAA_REPLACE=dlss).
+	vk::ImageView   source_view   = color_b.image_view;
+	vk::ImageLayout source_layout = color_b.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : color_b.layout;
+	if (!bypass) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+		const auto& depth_b = images[TaaSlot(1)];
+		const auto& mv_b    = images[TaaSlot(3)];
+		if (!g_sr_ready || !depth_b.image_id || !mv_b.image_id || depth_b.image_view == nullptr ||
+		    mv_b.image_view == nullptr || !EnsureDlaaImage(*g_graphics_ctx, render))
+			return false;
+		auto& depth  = g_cache->GetImage(depth_b.image_id);
+		auto& motion = g_cache->GetImage(mv_b.image_id);
+		if (depth.backing.extent.width != render.width || motion.backing.extent.width != render.width) return false;
+		static bool     reset = true;
+		static uint64_t last  = 0;
+		const uint64_t  frame = g_guest_frame;
+		reset = reset || frame > last + 2; // (a gap: menus, loading screens or movies in between)
+		last  = frame;
+		Transition(vk_command, g_bypass.dlaa, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+		           vk::PipelineStageFlagBits2::eComputeShader);
+		DlssLayouts layouts;
+		layouts.color  = color_b.layout;
+		layouts.depth  = depth_b.layout;
+		layouts.motion = mv_b.layout;
+		layouts.output = vk::ImageLayout::eGeneral;
+		const bool done = DlssEvaluate(static_cast<VkCommandBuffer>(vk_command), color.backing, color_b.image_view,
+		                               depth.backing, depth_b.image_view, motion.backing, mv_b.image_view, g_bypass.dlaa,
+		                               g_bypass.dlaa_view, render, render, g_camera, reset, true, layouts);
+		command.InvalidateGraphicsState();
+		if (!done) return false; // (the TAA's output stays)
+		reset = false;
+		Transition(vk_command, g_bypass.dlaa, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader);
+		source_view   = g_bypass.dlaa_view;
+		source_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+#else
+		return false;
+#endif
+	}
+
+	// The TAA's own output kept, for its history next frame (ReplaceTaa: RestoreTaaHistory).
+	if (EnsureTruthImage(*g_graphics_ctx, render)) {
+		CopyWithCacheImage(vk_command, output, out_b.layout, g_bypass.truth, true);
+		g_bypass.truth_frame = g_guest_frame;
+		compute_barrier(vk::PipelineStageFlagBits2::eAllCommands,
+		                vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+	}
+
+	vk::DescriptorImageInfo  infos[2] {};
+	infos[0] = {g_bypass.sampler, source_view, source_layout};
+	infos[1] = {nullptr, out_b.image_view, vk::ImageLayout::eGeneral};
+	vk::DescriptorBufferInfo stats {g_bypass.stats, 0, VK_WHOLE_SIZE};
+	vk::WriteDescriptorSet   writes[3] {};
+	for (uint32_t i = 0; i < 3; ++i) {
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = i == 0   ? vk::DescriptorType::eCombinedImageSampler
+		                            : i == 1 ? vk::DescriptorType::eStorageImage
+		                                     : vk::DescriptorType::eStorageBuffer;
+		if (i < 2) writes[i].pImageInfo = &infos[i];
+		else writes[i].pBufferInfo = &stats;
+	}
+	const bool out_general = out_b.layout == vk::ImageLayout::eGeneral;
+	if (!out_general)
+		output.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, {}, vk_command);
+	vk_command.bindPipeline(vk::PipelineBindPoint::eCompute, g_bypass.pipeline);
+	vk_command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bypass.layout, 0, 3, writes);
+	// KYTY_TAA_MATCH=0: no luminance match (the raw frame as it is); KYTY_TAA_MATCH_SMOOTH: this frame's weight.
+	static const float scale     = std::max(EnvFloatOr("KYTY_TAA_BYPASS_GAIN", 1.0f), 0.01f);
+	static const bool  match     = EnvFloatOr("KYTY_TAA_MATCH", 1.0f) != 0.0f;
+	static const float smoothing = std::clamp(EnvFloatOr("KYTY_TAA_MATCH_SMOOTH", 0.25f), 0.001f, 1.0f);
+	const uint32_t groups_x = (render.width + 7) / 8, groups_y = (render.height + 7) / 8;
+	struct {
+		float   scale;
+		int32_t mode;
+		float   smoothing;
+		int32_t match;
+		int32_t blocks_x;
+		int32_t blocks_y;
+	} push {scale, 0, smoothing, match ? 1 : 0, static_cast<int32_t>(groups_x), static_cast<int32_t>(groups_y)};
+	// (The block ratios start at 0, "none yet", and again after a size change.)
+	static uint32_t cleared_for = 0;
+	if (cleared_for != groups_x * 65536u + groups_y) {
+		cleared_for = groups_x * 65536u + groups_y;
+		vk_command.fillBuffer(g_bypass.stats, 0, VK_WHOLE_SIZE, 0u);
+		vk::MemoryBarrier2 filled {};
+		filled.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		filled.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		filled.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+		filled.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+		vk::DependencyInfo filled_dep {};
+		filled_dep.memoryBarrierCount = 1;
+		filled_dep.pMemoryBarriers    = &filled;
+		vk_command.pipelineBarrier2(filled_dep);
+	}
+	for (int32_t mode = 0; mode < 3; ++mode) {
+		push.mode = mode;
+		vk_command.pushConstants(g_bypass.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		if (mode == 1) vk_command.dispatch(1, 1, 1);
+		else vk_command.dispatch(groups_x, groups_y, 1);
+		compute_barrier(vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
+		                vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferRead);
+	}
+	if (g_bypass.readback_mapped != nullptr) {
+		const vk::BufferCopy copy {0, 0, 16};
+		vk_command.copyBuffer(g_bypass.stats, g_bypass.readback, 1, &copy);
+	}
+	compute_barrier(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+	if (!out_general)
+		output.Transit(out_b.layout, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, {}, vk_command);
+	command.InvalidateGraphicsState(); // (this pass bound its own pipeline and descriptors)
+	static uint64_t calls = 0;
+	if (logs < 2 || (calls++ % 600 == 0 && g_bypass.readback_mapped != nullptr)) {
+		const bool first = logs < 2;
+		if (first) ++logs;
+		float gain = 0.0f, measured = 0.0f;
+		if (g_bypass.readback_mapped != nullptr) {
+			(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_bypass.readback_mem, 0, VK_WHOLE_SIZE);
+			gain     = g_bypass.readback_mapped[2]; // (the mean of the block ratios)
+			measured = gain;
+		}
+		if (first)
+			std::printf("TAA: ran, then its color replaced by %s %ux%u (its alpha kept, brightness matched to the TAA's: %s)\n",
+			            bypass ? "the raw frame for the upscaler" : "DLAA's", render.width, render.height,
+			            match ? "on" : "off");
+		(void)measured;
+		std::printf("TAA: brightness per 8x8 block, mean gain %.3f (fixed factor %.3f)\n", static_cast<double>(gain),
+		            static_cast<double>(scale));
+		std::fflush(stdout);
+	}
+	return true;
+}
+
+// Before the TAA dispatch (AfterTaa replaces its output): its history image (binding 4) gets back the TAA's own
+// output of the frame before, when that is the previous frame and the sizes match.
+void RestoreTaaHistory(vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
+	static const bool off = std::getenv("KYTY_TAA_TRUE_HISTORY") != nullptr && *std::getenv("KYTY_TAA_TRUE_HISTORY") == '0';
+	if (off || g_cache == nullptr || images.size() < TaaSlots() || g_bypass.truth.image == nullptr) return;
+	if (g_bypass.truth_frame == UINT64_MAX || g_guest_frame != g_bypass.truth_frame + 1) return;
+	const auto& hist_b = images[TaaSlot(4)];
+	const auto& out_b  = images[TaaSlot(6)];
+	if (!hist_b.image_id || !out_b.image_id) return;
+	auto& history = g_cache->GetImage(hist_b.image_id);
+	auto& output  = g_cache->GetImage(out_b.image_id);
+	static uint32_t logs = 0;
+	if (history.backing.image == output.backing.image || history.backing.format != vk::Format::eR16G16B16A16Sfloat ||
+	    history.backing.extent.width != g_bypass.truth.extent.width ||
+	    history.backing.extent.height != g_bypass.truth.extent.height) {
+		if (logs < 2) {
+			++logs;
+			std::printf("TAA: history not restored (history %ux%u format %d)\n", history.backing.extent.width,
+			            history.backing.extent.height, static_cast<int>(history.backing.format));
+			std::fflush(stdout);
+		}
+		return;
+	}
+	DrainGpuThreadCommands(); // (bruno-astro-1025: the deferred recording's queued commands first)
+	const auto layout = hist_b.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eShaderReadOnlyOptimal : hist_b.layout;
+	CopyWithCacheImage(vk_command, history, layout, g_bypass.truth, false);
+	if (logs < 2) {
+		++logs;
+		std::printf("TAA: its history is its own output (the raw frame went only to what follows)\n");
+		std::fflush(stdout);
+	}
+}
+
+bool ReplaceTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
+	if ((g_taa_bypass && !g_taa_bypass_copy && g_taa_bypass_match) || (g_taa_dlss && !g_taa_bypass_copy))
+		RestoreTaaHistory(vk_command, images);
+	if (g_taa_bypass) return g_taa_bypass_copy && BypassTaa(vk_command, images);
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_taa_dlss || !g_taa_bypass_copy || !g_sr_ready || g_cache == nullptr || images.size() < TaaSlots()) return false;
+	const auto& color_b = images[TaaSlot(0)];
+	const auto& depth_b = images[TaaSlot(1)];
+	const auto& mv_b    = images[TaaSlot(3)];
+	const auto& out_b   = images[TaaSlot(6)];
+	if (!color_b.image_id || !depth_b.image_id || !mv_b.image_id || !out_b.image_id || color_b.image_view == nullptr ||
+	    depth_b.image_view == nullptr || mv_b.image_view == nullptr || out_b.image_view == nullptr)
+		return false;
+	auto& color  = g_cache->GetImage(color_b.image_id);
+	auto& depth  = g_cache->GetImage(depth_b.image_id);
+	auto& motion = g_cache->GetImage(mv_b.image_id);
+	auto& output = g_cache->GetImage(out_b.image_id);
+	const vk::Extent2D render {color.backing.extent.width, color.backing.extent.height};
+	if (output.backing.extent.width != render.width || output.backing.extent.height != render.height ||
+	    depth.backing.extent.width != render.width || motion.backing.extent.width != render.width)
+		return false;
+	static bool                  reset   = true;
+	static uint64_t              last    = 0;
+	const uint64_t               frame   = g_guest_frame;
+	reset = reset || frame > last + 2; // (a gap: menus, loading screens or movies in between)
+	last  = frame;
+	DrainGpuThreadCommands(); // (bruno-astro-1025: the deferred recording's queued commands first)
+	DlssLayouts layouts;
+	layouts.color  = color_b.layout;
+	layouts.depth  = depth_b.layout;
+	layouts.motion = mv_b.layout;
+	layouts.output = out_b.layout;
+	const bool done = DlssEvaluate(static_cast<VkCommandBuffer>(vk_command), color.backing, color_b.image_view, depth.backing,
+	                               depth_b.image_view, motion.backing, mv_b.image_view, output.backing, out_b.image_view,
+	                               render, render, g_camera, reset, true, layouts);
+	command.InvalidateGraphicsState();
+	static uint32_t logs = 0;
+	if (done && logs < 2) {
+		++logs;
+		std::printf("TAA: replaced by DLSS (DLAA %ux%u, camera %s)\n", render.width, render.height,
+		            g_camera.valid ? "valid" : "none");
+		std::fflush(stdout);
+	}
+	if (done) reset = false;
+	return done;
+#else
+	(void)command;
+	(void)vk_command;
+	(void)images;
+	return false;
+#endif
+}
+
+namespace {
+std::atomic<uint64_t> g_taa_diag_count {0};
+bool                  g_taa_diag_now = false; // this frame's TAA dispatch was logged: its composite is too
+} // namespace
+
+bool TaaDiagFrame() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TAA_DIAG");
+		return value != nullptr && *value == '1';
+	}();
+	if (!on) return false;
+	const auto n   = g_taa_diag_count.fetch_add(1, std::memory_order_relaxed);
+	g_taa_diag_now = n < 6 || n % 600 == 0;
+	if (g_taa_diag_now) {
+		const auto& c = g_camera;
+		std::printf("[taa] frame %" PRIu64 ": camera %s, jitter ndc %.6f %.6f\n", n, c.valid ? "valid" : "none",
+		            c.jitter_ndc[0], c.jitter_ndc[1]);
+		std::fflush(stdout);
+	}
+	return g_taa_diag_now;
+}
+
+void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std::span<TextureBinding> images) {
+	if (g_taa_diag_now && g_cache != nullptr) {
+		g_taa_diag_now = false;
+		std::printf("[taa] composite samples %zu images:", images.size());
+		for (size_t i = 0; i < images.size(); ++i) {
+			const auto& b = images[i];
+			if (!b.image_id) continue;
+			const auto& image = g_cache->GetImage(b.image_id);
+			std::printf(" [%zu] 0x%" PRIx64 " fmt %d %ux%u", i, b.desc.info.data.address,
+			            static_cast<int>(image.backing.format), image.backing.extent.width, image.backing.extent.height);
+		}
+		std::printf("\n");
+		std::fflush(stdout);
+	}
+	const bool dlss = DlssUpscaleWanted();
+	const bool xess = Xess::Wanted();
+	if ((!Fsr3::UpscaleWanted() && !dlss && !xess) || g_cache == nullptr || g_graphics_ctx == nullptr) return;
+	if (!g_sources.valid) {
+		g_up_reset = true; // menus, loading screens and movies: no TAA pass, the history starts again after them
+		return;
+	}
+	auto& depth  = g_cache->GetImage(g_sources.depth);
+	auto& motion = g_cache->GetImage(g_sources.motion);
+	if (depth.info.data.address != g_sources.depth_address || motion.info.data.address != g_sources.motion_address ||
+	    depth.backing.extent.width != motion.backing.extent.width ||
+	    depth.backing.extent.height != motion.backing.extent.height) {
+		g_up_reset = true;
+		return;
+	}
+	const vk::Extent2D render {depth.backing.extent.width, depth.backing.extent.height};
+	// The 3D image: the composite's RGBA16F image of the render size.
+	TextureBinding* scene = nullptr;
+	for (auto& binding: images) {
+		if (!binding.image_id || !binding.mip_views.empty() || binding.image_view == nullptr) continue;
+		auto& image = g_cache->GetImage(binding.image_id);
+		if (image.backing.format == vk::Format::eR16G16B16A16Sfloat && image.backing.extent.width == render.width &&
+		    image.backing.extent.height == render.height) {
+			scene = &binding;
+			break;
+		}
+	}
+	if (scene == nullptr) {
+		if (g_up_missed++ < 4) {
+			std::printf("Upscaling: the composite samples no %ux%u RGBA16F image (%zu images): not upscaled\n", render.width,
+			            render.height, images.size());
+			std::fflush(stdout);
+		}
+		return;
+	}
+	const uint32_t out_height = UpscaleHeight();
+	if (out_height < render.height) return;
+	const auto out_width =
+	    static_cast<uint32_t>(std::lround(static_cast<double>(render.width) * out_height / render.height / 2.0)) * 2u;
+	const vk::Extent2D output {out_width, out_height};
+	auto&              color = g_cache->GetImage(scene->image_id);
+	ConfigureOutput(*g_graphics_ctx, color.backing.format, output);
+
+	const bool in_pass    = command.RenderingWith(rendering);
+	command.EndRendering();
+	auto vk_command = command.Handle();
+	Configure(*g_graphics_ctx, g_up_depth, g_up_depth_view, depth.backing);
+	Configure(*g_graphics_ctx, g_up_motion, g_up_motion_view, motion.backing);
+	CopyInto(vk_command, depth, g_up_depth);
+	CopyInto(vk_command, motion, g_up_motion);
+	color.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {}, vk_command);
+	Transition(vk_command, g_up_output, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+	           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	// FSR records straight into the command buffer: what this thread queued so far goes first.
+	DrainGpuThreadCommands();
+	const auto now   = std::chrono::steady_clock::now();
+	const auto delta = g_up_last == std::chrono::steady_clock::time_point {}
+	                       ? 16.7f
+	                       : std::chrono::duration<float, std::milli>(now - g_up_last).count();
+	g_up_last = now;
+	// KYTY_TAA_REPLACE=upscaler: the raw frame kept right after the TAA (AfterTaa), not the TAA's output.
+	const VulkanImage* in_color = &color.backing;
+	vk::ImageView      in_view  = scene->image_view;
+	if (g_taa_bypass && !g_taa_bypass_copy && !g_taa_bypass_match && g_bypass.dlaa.image != nullptr &&
+	    g_bypass.raw_frame == g_guest_frame && g_bypass.dlaa.extent.width == render.width &&
+	    g_bypass.dlaa.extent.height == render.height) {
+		in_color = &g_bypass.dlaa;
+		in_view  = g_bypass.dlaa_view;
+	} else if (g_taa_bypass && !g_taa_bypass_copy && !g_taa_bypass_match) {
+		static uint32_t misses = 0;
+		if (misses++ < 4) {
+			std::printf("Upscaling: no raw frame of this frame kept (frame %llu, kept %llu): the TAA's output upscaled\n",
+			            static_cast<unsigned long long>(g_guest_frame), static_cast<unsigned long long>(g_bypass.raw_frame));
+			std::fflush(stdout);
+		}
+	}
+	Fsr3::UpscaleDesc desc;
+	desc.command  = static_cast<VkCommandBuffer>(vk_command);
+	desc.color    = in_color;
+	desc.depth    = &g_up_depth;
+	desc.motion   = &g_up_motion;
+	desc.output   = &g_up_output;
+	desc.render   = render;
+	desc.upscale  = output;
+	desc.camera   = &g_camera;
+	desc.reset    = g_up_reset;
+	desc.delta_ms = delta;
+	// KYTY_TAA_REPLACE=upscaler: the color is the raw jittered frame: the upscaler needs the camera's jitter, in pixels
+	// (as DLSS takes it; KYTY_UPSCALE_JITTER_SIGN=-1 the other way round). After the game's TAA: none left.
+	if (g_taa_bypass && g_camera.valid) {
+		static const float sign = [] {
+			const char* value = std::getenv("KYTY_UPSCALE_JITTER_SIGN");
+			return value != nullptr && std::atof(value) < 0 ? -1.0f : 1.0f;
+		}();
+		desc.jitter[0] = sign * g_camera.jitter_ndc[0] * static_cast<float>(render.width) * 0.5f;
+		desc.jitter[1] = sign * -g_camera.jitter_ndc[1] * static_cast<float>(render.height) * 0.5f;
+	}
+	bool done = false;
+	if (dlss) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+		done = DlssUpscale(desc.command, *in_color, in_view, g_up_depth, g_up_depth_view, g_up_motion,
+		                   g_up_motion_view, g_up_output, g_up_output_view, render, output, g_camera, g_up_reset);
+#endif
+	} else if (xess) {
+		Xess::UpscaleDesc x;
+		x.command     = desc.command;
+		x.color       = in_color;
+		x.color_view  = in_view;
+		x.depth       = &g_up_depth;
+		x.depth_view  = g_up_depth_view;
+		x.motion      = &g_up_motion;
+		x.motion_view = g_up_motion_view;
+		x.output      = &g_up_output;
+		x.output_view = g_up_output_view;
+		x.render      = render;
+		x.upscale     = output;
+		x.reset       = g_up_reset;
+		x.jitter[0]   = desc.jitter[0];
+		x.jitter[1]   = desc.jitter[1];
+		done          = Xess::Upscale(x);
+	} else {
+		done = Fsr3::Upscale(*g_graphics_ctx, desc);
+	}
+	command.InvalidateGraphicsState(); // (the upscaler bound its own pipelines and descriptors)
+	Transition(vk_command, g_up_output, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+	// Sharpening after DLSS or XeSS (FSR sharpens itself: KYTY_UPSCALE_SHARPNESS goes to its RCAS).
+	bool sharpened = false;
+	if (done && (dlss || xess) && SharpenAmount() > 0.0f && EnsureSharpen(*g_graphics_ctx, g_up_output)) {
+		Transition(vk_command, g_sharp.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+		vk::DescriptorImageInfo infos[2] {};
+		infos[0] = {g_sharp.sampler, g_up_output_view, vk::ImageLayout::eShaderReadOnlyOptimal};
+		infos[1] = {nullptr, g_sharp.view, vk::ImageLayout::eGeneral};
+		vk::WriteDescriptorSet writes[2] {};
+		for (uint32_t i = 0; i < 2; ++i) {
+			writes[i].dstBinding      = i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType  = i == 0 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			writes[i].pImageInfo      = &infos[i];
+		}
+		vk_command.bindPipeline(vk::PipelineBindPoint::eCompute, g_sharp.pipeline);
+		vk_command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_sharp.layout, 0, 2, writes);
+		const float amount = SharpenAmount();
+		vk_command.pushConstants(g_sharp.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(amount), &amount);
+		vk_command.dispatch((g_up_output.extent.width + 7) / 8, (g_up_output.extent.height + 7) / 8, 1);
+		Transition(vk_command, g_sharp.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+		command.InvalidateGraphicsState();
+		sharpened = true;
+	}
+	if (in_pass) command.ResumeRendering(rendering);
+	if (!done) return;
+	scene->image_view = sharpened ? g_sharp.view : g_up_output_view;
+	scene->layout     = vk::ImageLayout::eShaderReadOnlyOptimal;
+	g_up_reset        = false;
+	++g_up_count;
+	if (g_up_logs < 2 || g_up_count % 3600 == 0) {
+		++g_up_logs;
+		std::printf("Upscaling: %ux%u -> %ux%u (%" PRIu64 " frames)\n", render.width, render.height, output.width,
+		            output.height, g_up_count);
+		std::fflush(stdout);
+	}
+}
+
+void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
+                   FrameInputs& inputs, ImageId flip_id, Image& flip) {
+	inputs.valid       = false;
+	inputs.has_hudless = false;
+	inputs.hudless_composite = false;
+	g_cache            = &cache;
+	g_graphics_ctx     = &graphics;
+	// The flip images (two or three alternate): their views as render targets.
+	{
+		FlipTarget* target = nullptr;
+		for (auto& candidate: g_flips)
+			if (candidate.image == flip.backing.image && candidate.address == flip.info.data.address) target = &candidate;
+		if (target == nullptr) {
+			target  = &g_flips[g_flip_next];
+			g_flip_next = (g_flip_next + 1) % static_cast<uint32_t>(g_flips.size());
+		}
+		if (target->image != flip.backing.image || target->address != flip.info.data.address || !(target->id == flip_id))
+			++g_flip_epoch;
+		target->id      = flip_id;
+		target->image   = flip.backing.image;
+		target->address = flip.info.data.address;
+		target->views.clear();
+		for (const auto& view: flip.views)
+			if (view.view != nullptr) target->views.push_back(view.view);
+	}
+	const bool hudless       = g_hudless_taken && g_hudless.image != nullptr;
+	const auto flip_renders  = g_flip_renders;
+	const auto flip_draws    = g_flip_max_draws;
+	g_hudless_taken          = false;
+	const bool composite     = std::exchange(g_composite, false);
+	g_target_draws.clear();
+	g_flip_renders           = 0;
+	g_flip_max_draws         = 0;
+	g_flip_pass              = false;
+	// (DLSS-G needs the camera; FSR 3 only the TAA pass's images: the G-buffer draws that hold the camera mostly
+	// take the table path, which does not report it, and generation went on and off from frame to frame.)
+	const bool ready = g_sources.valid;
+	const auto sources = g_sources;
+	auto camera        = g_camera;
+	g_sources.valid    = false;
+	g_camera.valid     = false;
+	++g_guest_frame;
+	{
+		// A guest frame whose G-buffer draws did not give the camera: the last captured one, for up to
+		// KYTY_DLSSG_CAMERA_HOLD (2) frames, its previous matrix the same (no camera motion assumed: the vectors carry it),
+		// in place of identity matrices and a reset (DLSS-G then interpolated as from the image alone).
+		static const uint32_t hold_frames = [] {
+			const char* value = std::getenv("KYTY_DLSSG_CAMERA_HOLD");
+			return value != nullptr ? static_cast<uint32_t>(std::atoi(value)) : 2u;
+		}();
+		static Camera   last {};
+		static uint32_t since = ~0u;
+		static uint32_t window = 0, valid = 0, held = 0;
+		if (camera.valid) {
+			last  = camera;
+			since = 0;
+			++valid;
+		} else if (last.valid && since < hold_frames) {
+			++since;
+			camera                = last;
+			camera.prev_view_proj = last.view_proj;
+			++held;
+		} else if (since != ~0u) {
+			since = hold_frames + 1;
+		}
+		if (++window == 600) {
+			const auto seen = [](uint32_t i) { return g_cam_seen[i].exchange(0, std::memory_order_relaxed); };
+			const uint32_t normal = seen(0), table = seen(1), record = seen(2);
+			const uint32_t shorter = g_cam_short.exchange(0, std::memory_order_relaxed);
+			LOGF("[dlssg] camera valid %u of 600 (held %u; G-buffer draws before capture: normal %u, table %u, record %u, SRT "
+			     "too short %u)\n", valid, held, normal, table, record, shorter);
+			std::printf("[dlssg] camera valid %u of 600 (held %u; G-buffer draws before capture: normal %u, table %u, record "
+			            "%u, SRT too short %u)\n", valid, held, normal, table, record, shorter);
+			std::fflush(stdout);
+			window = valid = held = 0;
+		}
+	}
+	if (!ready && GenericInputs() && !VideoOut::MoviePlaying()) {
+		// No vectors of the game's: zero motion and a far depth (reversed: 0) at the flip image's size, cleared here
+		// (each presented frame owns its pair). FSR 3 / DLSS-G interpolate from the images (optical flow).
+		const vk::Extent3D extent {flip.backing.extent.width, flip.backing.extent.height, 1};
+		if (extent.width == 0 || extent.height == 0) return;
+		ConfigureAs(graphics, inputs.depth, inputs.depth_view, vk::Format::eR32Sfloat, extent);
+		ConfigureAs(graphics, inputs.motion, inputs.motion_view, vk::Format::eR16G16Sfloat, extent);
+		inputs.motion_attachment = false;
+		command.EndRendering();
+		auto vk_command = command.Handle();
+		for (auto* image: {&inputs.depth, &inputs.motion}) {
+			Transition(vk_command, *image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+			           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+			const vk::ClearColorValue       zero {std::array<float, 4> {0.0f, 0.0f, 0.0f, 0.0f}};
+			const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			vk_command.clearColorImage(image->image, vk::ImageLayout::eTransferDstOptimal, &zero, 1, &range);
+			Transition(vk_command, *image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+			           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+		}
+		static bool logged = false;
+		if (!std::exchange(logged, true)) {
+			std::printf("Frame generation inputs: generic, %ux%u (zero motion vectors, far depth)\n", extent.width,
+			            extent.height);
+			std::fflush(stdout);
+		}
+		// The HUD-less image as for Demon's Souls (KYTY_FSR3_HUDLESS=1 with the title's composite or HUD pass named:
+		// KYTY_FSR3_HUDLESS_PASS / _DRAW, KYTY_FSR3_UI).
+		if (hudless && HudlessWanted()) {
+			ConfigureAs(graphics, inputs.hudless, inputs.hudless_view, g_hudless.format,
+			            vk::Extent3D {g_hudless.extent.width, g_hudless.extent.height, 1});
+			CopyRaw(vk_command, g_hudless, inputs.hudless);
+			inputs.has_hudless       = true;
+			inputs.hudless_composite = composite;
+		}
+		inputs.render_extent = {extent.width, extent.height};
+		inputs.camera        = camera;
+		inputs.guest_frame   = g_guest_frame;
+		inputs.valid         = true;
+		return;
+	}
+	if (!ready) {
+		return;
+	}
+	auto& depth  = cache.GetImage(sources.depth);
+	auto& motion = cache.GetImage(sources.motion);
+	if (depth.info.data.address != sources.depth_address ||
+	    motion.info.data.address != sources.motion_address ||
+	    depth.backing.extent.width != motion.backing.extent.width ||
+	    depth.backing.extent.height != motion.backing.extent.height) {
+		return; // the images were replaced after the TAA pass
+	}
+	Configure(graphics, inputs.depth, inputs.depth_view, depth.backing);
+	Configure(graphics, inputs.motion, inputs.motion_view, motion.backing, &inputs.motion_attachment);
+	command.EndRendering();
+	auto vk_command = command.Handle();
+	CopyInto(vk_command, depth, inputs.depth);
+	CopyInto(vk_command, motion, inputs.motion);
+	if (inputs.motion_attachment) {
+		ZeroStaticRect(vk_command, inputs.motion, inputs.motion_view);
+	}
+	if (hudless && HudlessWanted()) {
+		ConfigureAs(graphics, inputs.hudless, inputs.hudless_view, g_hudless.format, vk::Extent3D {g_hudless.extent.width, g_hudless.extent.height, 1});
+		CopyRaw(vk_command, g_hudless, inputs.hudless);
+		inputs.has_hudless       = true;
+		inputs.hudless_composite = composite;
+	}
+	{
+		// Every 600 frames with the TAA pass: how the HUD-less image was had (the composite without its HUD is the
+		// good one; with the HUD, the frame's HUD is interpolated).
+		static uint32_t frames = 0, composites = 0, with_hud = 0, flip_draws_seen = 0;
+		++frames;
+		composites += composite ? 1u : 0u;
+		with_hud += hudless && !composite ? 1u : 0u;
+		flip_draws_seen += std::exchange(g_flip_slot_hits, 0u) != 0 ? 1u : 0u;
+		if (frames == 600) {
+			std::printf("[hudless] 600 frames: composite without HUD %u, copy with HUD %u, none %u; flip draw on the normal path %u\n",
+			            composites, with_hud, frames - composites - with_hud, flip_draws_seen);
+			std::fflush(stdout);
+			frames = composites = with_hud = flip_draws_seen = 0;
+		}
+	}
+	if (g_hudless_logs < 12) {
+		++g_hudless_logs;
+		std::printf("HUD-less: %u render passes into the flip image this frame (most draws in one: %u), %s\n",
+		            flip_renders, flip_draws, !hudless ? "none" : composite ? "the composite drawn without its HUD" : "copy after the first draw (with the HUD)");
+		std::fflush(stdout);
+	}
+	inputs.render_extent = {motion.backing.extent.width, motion.backing.extent.height};
+	inputs.camera        = camera;
+	inputs.guest_frame   = g_guest_frame;
+	inputs.valid         = true;
+}
+
+bool UpscalerReady() {
+	if (g_sr_kind == 2) return Xess::Ready();
+	if (g_sr_kind == 3) return Fsr3::SrReady();
+	return g_upscale_ready;
+}
+
+namespace {
+// The PS5 Pro path's images as our upscalers take them.
+void AsVulkanImage(const UpscaleImage& in, VulkanImage& out) {
+	out.format = in.format;
+	out.extent = vk::Extent3D {in.extent.width, in.extent.height, 1};
+	out.usage  = in.usage;
+	out.image  = in.image;
+}
+bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
+	VulkanImage color, depth, motion, output;
+	AsVulkanImage(inputs.color, color);
+	AsVulkanImage(inputs.depth, depth);
+	AsVulkanImage(inputs.motion, motion);
+	AsVulkanImage(inputs.output, output);
+	const float fov = inputs.view_to_clip[5] != 0.0f ? 2.0f * std::atan(1.0f / std::fabs(inputs.view_to_clip[5])) : 1.0f;
+	bool done = false;
+	if (g_sr_kind == 2) {
+		Xess::UpscaleDesc x;
+		x.command     = static_cast<VkCommandBuffer>(command);
+		x.color       = &color;
+		x.color_view  = inputs.color.view;
+		x.depth       = &depth;
+		x.depth_view  = inputs.depth.view;
+		x.motion      = &motion;
+		x.motion_view = inputs.motion.view;
+		x.output      = &output;
+		x.output_view = inputs.output.view;
+		x.render      = inputs.color.extent;
+		x.upscale     = inputs.output.extent;
+		x.reset       = inputs.reset;
+		x.jitter[0]   = inputs.jitter_x;
+		x.jitter[1]   = inputs.jitter_y;
+		x.mv_scale[0] = inputs.motion_scale_x;
+		x.mv_scale[1] = inputs.motion_scale_y;
+		done          = Xess::Upscale(x);
+	} else if (g_graphics_ctx != nullptr) {
+		static auto last = std::chrono::steady_clock::now();
+		const auto  now  = std::chrono::steady_clock::now();
+		const float delta = std::chrono::duration<float, std::milli>(now - last).count();
+		last              = now;
+		Fsr3::UpscaleDesc desc;
+		desc.command     = static_cast<VkCommandBuffer>(command);
+		desc.color       = &color;
+		desc.depth       = &depth;
+		desc.motion      = &motion;
+		desc.output      = &output;
+		desc.render      = inputs.color.extent;
+		desc.upscale     = inputs.output.extent;
+		desc.reset       = inputs.reset;
+		desc.delta_ms    = delta;
+		desc.jitter[0]   = inputs.jitter_x;
+		desc.jitter[1]   = inputs.jitter_y;
+		desc.mv_scale[0] = inputs.motion_scale_x;
+		desc.mv_scale[1] = inputs.motion_scale_y;
+		desc.fov         = fov;
+		desc.z_near      = inputs.near_plane;
+		done             = Fsr3::Upscale(*g_graphics_ctx, desc);
+	}
+	static bool said = false;
+	if (!said) {
+		said = true;
+		std::printf("Super resolution (PS5 Pro path): %s %ux%u -> %ux%u%s\n", g_sr_kind == 2 ? "XeSS" : "FSR 3.1",
+		            inputs.color.extent.width, inputs.color.extent.height, inputs.output.extent.width,
+		            inputs.output.extent.height, done ? "" : " (failed: stretched)");
+		std::fflush(stdout);
+	}
+	return done;
+}
+} // namespace
+
+static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& inputs) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_upscale_ready) return false;
+	// Its own viewport: DLSS-G's (0) takes its constants and tags at the present.
+	const sl::ViewportHandle viewport {1};
+	// DLSS given up (the game's image stretched instead, renderSuperResolution.cpp): an input outside the sizes the
+	// mode takes (the NVIDIA app's DLSS override of the program can ask for another scale: 3802x2138-3840x2160 for a
+	// 1920x1080 input, issue #87), or NGX refusing its evaluations.
+	static bool given_up = false;
+	if (given_up) return false;
+	if (g_dlss_refusals.load(std::memory_order_relaxed) >= 3) {
+		given_up = true;
+		std::printf("DLSS super resolution: NGX refused it %u times (Streamline errors above): the game's image is "
+		            "upscaled without it from here on\n",
+		            g_dlss_refusals.load(std::memory_order_relaxed));
+		std::fflush(stdout);
+		return false;
+	}
+	static vk::Extent2D options_render {}, options_output {};
+	if (options_render != inputs.color.extent || options_output != inputs.output.extent) {
+		// The mode by the input's share of the output's height (DLSS takes any input size; the mode picks its model and
+		// limits): PS5 Pro's 1512 of 2160 and 1440 are quality, 1080 performance, the output's own DLAA; below half
+		// the output (performance's least, 1080 of 2160) ultra performance, down to its third (720).
+		const double share = static_cast<double>(inputs.color.extent.height) / inputs.output.extent.height;
+		sl::DLSSOptions options {};
+		options.mode = share >= 0.95   ? sl::DLSSMode::eDLAA
+		               : share >= 0.62 ? sl::DLSSMode::eMaxQuality
+		               : share >= 0.55 ? sl::DLSSMode::eBalanced
+		               : share >= 0.495 ? sl::DLSSMode::eMaxPerformance // (10-21: 1079 of 2160 from a 1.334 ratio fell
+		                                                                // to ultra performance, which takes 720 only: black)
+		                               : sl::DLSSMode::eUltraPerformance;
+		options.outputWidth     = inputs.output.extent.width;
+		options.outputHeight    = inputs.output.extent.height;
+		options.colorBuffersHDR = sl::Boolean::eTrue; // (the game's linear HDR scene, before its tone mapping)
+		options.useAutoExposure = sl::Boolean::eTrue;
+		// KYTY_DLSS_PRESET=<letter> (a test): that DLSS model for every mode instead of the mode's default.
+		if (const char* preset = std::getenv("KYTY_DLSS_PRESET"); preset != nullptr && *preset >= 'A' && *preset <= 'O') {
+			const auto value = static_cast<sl::DLSSPreset>(*preset - 'A' + 1);
+			options.dlaaPreset = options.qualityPreset = options.balancedPreset = options.performancePreset =
+			    options.ultraPerformancePreset = options.ultraQualityPreset = value;
+		}
+		if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk) {
+			std::printf("DLSS super resolution: slDLSSSetOptions failed (%s)\n", sl::getResultAsStr(result));
+			std::fflush(stdout);
+			return false;
+		}
+		sl::DLSSOptimalSettings settings {};
+		(void)g_api.dlss_get_optimal_settings(options, settings);
+		std::printf("DLSS super resolution: %ux%u -> %ux%u, mode %u (its range %ux%u-%ux%u)\n", inputs.color.extent.width,
+		            inputs.color.extent.height, inputs.output.extent.width, inputs.output.extent.height,
+		            static_cast<uint32_t>(options.mode), settings.renderWidthMin, settings.renderHeightMin,
+		            settings.renderWidthMax, settings.renderHeightMax);
+		std::fflush(stdout);
+		if (settings.renderWidthMax != 0 && settings.renderHeightMax != 0 &&
+		    (inputs.color.extent.width < settings.renderWidthMin || inputs.color.extent.width > settings.renderWidthMax ||
+		     inputs.color.extent.height < settings.renderHeightMin || inputs.color.extent.height > settings.renderHeightMax)) {
+			given_up = true;
+			std::printf("DLSS super resolution: the game renders %ux%u, outside what DLSS takes in this mode: the game's "
+			            "image is upscaled without it. A DLSS override for this program in the NVIDIA app (Super Resolution "
+			            "mode or scaling ratio) does this; set it back to the default for kyty_emulator.exe\n",
+			            inputs.color.extent.width, inputs.color.extent.height);
+			std::fflush(stdout);
+			return false;
+		}
+		options_render = inputs.color.extent;
+		options_output = inputs.output.extent;
+	}
+	static uint32_t frame = 0;
+	++frame;
+	sl::FrameToken* token = nullptr;
+	if (g_api.get_new_frame_token(token, &frame) != sl::Result::eOk || token == nullptr) return false;
+
+	sl::Constants constants {};
+	Mat4          identity;
+	for (uint32_t i = 0; i < 4; ++i) {
+		identity[i] = sl::float4(i == 0, i == 1, i == 2, i == 3);
+	}
+	Mat4 view_to_clip;
+	for (uint32_t i = 0; i < 4; ++i) {
+		view_to_clip[i] = sl::float4(inputs.view_to_clip[i * 4], inputs.view_to_clip[i * 4 + 1], inputs.view_to_clip[i * 4 + 2],
+		                             inputs.view_to_clip[i * 4 + 3]);
+	}
+	constants.cameraViewToClip = view_to_clip;
+	if (!Inverted(view_to_clip, constants.clipToCameraView)) constants.clipToCameraView = identity;
+	constants.clipToLensClip      = identity;
+	constants.clipToPrevClip      = identity;
+	constants.prevClipToClip      = identity;
+	constants.jitterOffset        = sl::float2(inputs.jitter_x, inputs.jitter_y);
+	// (Streamline's motion vectors are in render-size UV units: its scale makes them so from the game's pixels.)
+	constants.mvecScale = sl::float2(inputs.motion_scale_x / static_cast<float>(inputs.color.extent.width),
+	                                 inputs.motion_scale_y / static_cast<float>(inputs.color.extent.height));
+	constants.cameraPinholeOffset = sl::float2(0.0f, 0.0f);
+	constants.cameraPos           = sl::float3(0, 0, 0);
+	constants.cameraUp            = sl::float3(0, 1, 0);
+	constants.cameraRight         = sl::float3(1, 0, 0);
+	constants.cameraFwd           = sl::float3(0, 0, 1);
+	constants.cameraNear          = inputs.near_plane;
+	constants.cameraFar           = inputs.far_plane;
+	constants.cameraFOV           = inputs.view_to_clip[5] != 0.0f ? 2.0f * std::atan(1.0f / std::fabs(inputs.view_to_clip[5])) : 1.0f;
+	constants.cameraAspectRatio   = static_cast<float>(inputs.color.extent.width) / static_cast<float>(inputs.color.extent.height);
+	constants.motionVectorsInvalidValue = sl::INVALID_FLOAT;
+	constants.depthInverted             = sl::Boolean::eTrue;
+	constants.cameraMotionIncluded      = sl::Boolean::eTrue;
+	constants.motionVectors3D           = sl::Boolean::eFalse;
+	constants.reset                     = inputs.reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+	constants.orthographicProjection    = sl::Boolean::eFalse;
+	constants.motionVectorsDilated      = sl::Boolean::eFalse;
+	constants.motionVectorsJittered     = sl::Boolean::eFalse;
+	if (const auto result = g_api.set_constants(constants, *token, viewport); result != sl::Result::eOk) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("DLSS super resolution: slSetConstants failed (%s)\n", sl::getResultAsStr(result));
+		return false;
+	}
+	const auto resource = [](const UpscaleImage& image) {
+		sl::Resource r(sl::ResourceType::eTex2d, static_cast<VkImage>(image.image), nullptr, static_cast<VkImageView>(image.view),
+		               static_cast<uint32_t>(static_cast<VkImageLayout>(image.layout)));
+		r.width        = image.extent.width;
+		r.height       = image.extent.height;
+		r.nativeFormat = static_cast<uint32_t>(static_cast<VkFormat>(image.format));
+		r.mipLevels    = 1;
+		r.arrayLayers  = 1;
+		r.flags        = 0;
+		r.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.usage));
+		return r;
+	};
+	auto             color  = resource(inputs.color);
+	auto             depth  = resource(inputs.depth);
+	auto             motion = resource(inputs.motion);
+	auto             output = resource(inputs.output);
+	// (KYTY_SR_LOG: the first two evaluations' images and constants.)
+	static const bool describe = std::getenv("KYTY_SR_LOG") != nullptr;
+	if (static std::atomic<uint32_t> described {0}; describe && described.fetch_add(1, std::memory_order_relaxed) < 2) {
+		const std::pair<const char*, const UpscaleImage*> images[] {
+		    {"color", &inputs.color}, {"depth", &inputs.depth}, {"motion", &inputs.motion}, {"output", &inputs.output}};
+		for (const auto& [name, image]: images) {
+			std::printf("DLSS super resolution: %s image %p view %p layout %d format %d %ux%u usage 0x%x\n", name,
+			            static_cast<void*>(static_cast<VkImage>(image->image)),
+			            static_cast<void*>(static_cast<VkImageView>(image->view)), static_cast<int>(image->layout),
+			            static_cast<int>(image->format), image->extent.width, image->extent.height,
+			            static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image->usage)));
+		}
+		std::printf("DLSS super resolution: jitter %g %g, motion scale %g %g, reset %d, near %g far %g\n", inputs.jitter_x,
+		            inputs.jitter_y, inputs.motion_scale_x, inputs.motion_scale_y, inputs.reset ? 1 : 0, inputs.near_plane,
+		            inputs.far_plane);
+		std::fflush(stdout);
+	}
+	const sl::Extent render {0, 0, inputs.color.extent.width, inputs.color.extent.height};
+	const sl::Extent full {0, 0, inputs.output.extent.width, inputs.output.extent.height};
+	const sl::ResourceTag tags[] {
+	    sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
+	    sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &full),
+	    sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
+	    sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
+	};
+	auto* command_buffer = reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(command));
+	if (const auto result = g_api.set_tag_for_frame(*token, viewport, tags, static_cast<uint32_t>(std::size(tags)), command_buffer);
+	    result != sl::Result::eOk) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("DLSS super resolution: slSetTagForFrame failed (%s)\n", sl::getResultAsStr(result));
+		return false;
+	}
+	const sl::BaseStructure* evaluate_inputs[] {&viewport};
+	// (Result::eWarnOutOfVRAM is not a failure: Streamline returns it in place of eOk, DLSS recorded, while the process
+	// uses all the video memory Windows budgets it - issue #85: an RTX 2060 at 5030 of 5187 MiB had DLSS's image
+	// stretched over from then on.)
+	DrainGpuThreadCommands(); // (Streamline records straight into the command buffer)
+	if (const auto result = g_api.evaluate(sl::kFeatureDLSS, *token, evaluate_inputs, 1, command_buffer);
+	    result == sl::Result::eWarnOutOfVRAM) {
+		static std::atomic<bool> reported {false};
+		if (!reported.exchange(true, std::memory_order_relaxed))
+			std::printf("DLSS super resolution: the video memory budget is used up (Streamline's warning); DLSS still runs\n");
+	} else if (result != sl::Result::eOk) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("DLSS super resolution: slEvaluateFeature failed (%s)\n", sl::getResultAsStr(result));
+		return false;
+	}
+	return true;
+#else
+	(void)command;
+	(void)inputs;
+	return false;
+#endif
+}
+
+namespace {
+// KYTY_UPSCALE_SHARPNESS on the PS5 Pro path after DLSS or XeSS (FSR's RCAS takes it itself): the output (general)
+// copied into g_sharp, then sharpen.comp from it back into the output, which the game's composite reads.
+void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float amount) {
+	const auto& out = inputs.output;
+	// Any float color format (sharpen.comp writes without a format qualifier): in place where the output takes storage
+	// writes, else into an rgba16f image blitted back (needs transfer dst).
+	const bool float_format = out.format == vk::Format::eR16G16B16A16Sfloat || out.format == vk::Format::eB10G11R11UfloatPack32 ||
+	                          out.format == vk::Format::eR32G32B32A32Sfloat || out.format == vk::Format::eA2B10G10R10UnormPack32 ||
+	                          out.format == vk::Format::eR8G8B8A8Unorm || out.format == vk::Format::eB8G8R8A8Unorm;
+	const bool direct = g_graphics_ctx != nullptr && (out.usage & vk::ImageUsageFlagBits::eStorage) &&
+	                    StorageFormat(*g_graphics_ctx, out.format);
+	const bool via16 = !direct && (out.usage & vk::ImageUsageFlagBits::eTransferDst);
+	if (g_graphics_ctx == nullptr || out.view == nullptr || !float_format || !(out.usage & vk::ImageUsageFlagBits::eTransferSrc) ||
+	    (!direct && !via16)) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("Super resolution sharpening: skipped (output format %d usage 0x%x)\n", static_cast<int>(out.format),
+			            static_cast<uint32_t>(static_cast<VkImageUsageFlags>(out.usage)));
+			std::fflush(stdout);
+		}
+		return;
+	}
+	VulkanImage like;
+	like.format = out.format;
+	like.extent = vk::Extent3D {out.extent.width, out.extent.height, 1};
+	if (!EnsureSharpen(*g_graphics_ctx, like)) return;
+	if (via16 && !EnsureSharpenOut16(*g_graphics_ctx, like.extent)) return;
+	{
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("Super resolution sharpening: output format %d %ux%u, %s\n", static_cast<int>(out.format), out.extent.width,
+			            out.extent.height, direct ? "in place" : "via rgba16f + blit");
+			std::fflush(stdout);
+		}
+	}
+	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
+	                        vk::AccessFlags2 dst) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = src_stage;
+		barrier.srcAccessMask = src;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	// The upscaler's writes before the copy.
+	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite, vk::PipelineStageFlagBits2::eCopy,
+	       vk::AccessFlagBits2::eTransferRead);
+	Transition(command, g_sharp.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eCopy);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, out.level, out.layer, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = vk::Extent3D {out.extent.width, out.extent.height, 1};
+	command.copyImage(out.image, vk::ImageLayout::eGeneral, g_sharp.image.image, vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+	Transition(command, g_sharp.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderSampledRead, vk::PipelineStageFlagBits2::eComputeShader);
+	// The copy's reads of the output before the pass writes it.
+	global(vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eComputeShader,
+	       vk::AccessFlagBits2::eShaderStorageWrite);
+	vk::DescriptorImageInfo infos[2] {};
+	infos[0] = {g_sharp.sampler, g_sharp.view, vk::ImageLayout::eShaderReadOnlyOptimal};
+	if (via16)
+		Transition(command, g_sharp.out16, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	infos[1] = {nullptr, via16 ? g_sharp.out16_view : out.view, vk::ImageLayout::eGeneral};
+	vk::WriteDescriptorSet writes[2] {};
+	for (uint32_t i = 0; i < 2; ++i) {
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = i == 0 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+		writes[i].pImageInfo      = &infos[i];
+	}
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_sharp.pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_sharp.layout, 0, 2, writes);
+	command.pushConstants(g_sharp.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(amount), &amount);
+	command.dispatch((out.extent.width + 7) / 8, (out.extent.height + 7) / 8, 1);
+	if (via16) {
+		Transition(command, g_sharp.out16, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+		           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eBlit);
+		global(vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eCopy,
+		       vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eBlit,
+		       vk::AccessFlagBits2::eTransferWrite);
+		vk::ImageBlit blit {};
+		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, out.level, out.layer, 1};
+		blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(out.extent.width), static_cast<int32_t>(out.extent.height), 1};
+		blit.dstOffsets[1]  = blit.srcOffsets[1];
+		command.blitImage(g_sharp.out16.image, vk::ImageLayout::eTransferSrcOptimal, out.image, vk::ImageLayout::eGeneral, 1, &blit,
+		                  vk::Filter::eNearest);
+		global(vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands,
+		       vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+		return;
+	}
+	// The pass's writes before whatever reads or writes the output next (the exposure pass, the composite).
+	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+	       vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+}
+} // namespace
+
+
+bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
+	UpscaleInputs inputs = inputs_in;
+	// (The DLSS-G hudless path sets the context in PrepareInputs; the PS5 Pro path alone needs the renderer's.)
+	if (g_graphics_ctx == nullptr && inputs.graphics != nullptr) g_graphics_ctx = inputs.graphics;
+	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
+	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
+	const bool  fsr  = g_sr_kind == 3;
+	// (FSR: its RCAS, KYTY_UPSCALE_SHARPNESS defaulting to 0.3 in Fsr3::Upscale; DLSS and XeSS: 0 unless set.)
+	const float amount = fsr ? [] {
+		const char* value = std::getenv("KYTY_UPSCALE_SHARPNESS");
+		return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f) : 0.3f;
+	}()
+	                         : SharpenAmount();
+	static bool said = false;
+	if (!said) {
+		said = true;
+		std::printf("Super resolution sharpening: %g (%s)\n", amount,
+		            fsr ? "FSR RCAS" : g_sr_kind == 2 ? "XeSS + sharpen.comp" : "DLSS + sharpen.comp");
+		std::fflush(stdout);
+	}
+	if (done && !fsr && amount > 0.0f) SharpenOutput(command, inputs, amount);
+	return done;
+}
+
+void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
+	for (auto* view: {&inputs.depth_view, &inputs.motion_view, &inputs.hudless_view, &inputs.hudless_display_view}) {
+		if (*view != nullptr) {
+			graphics.device.destroyImageView(*view, nullptr);
+			*view = nullptr;
+		}
+	}
+	for (auto* image: {&inputs.depth, &inputs.motion, &inputs.hudless, &inputs.hudless_display}) {
+		if (image->image != nullptr) {
+			graphics.DeleteImage(*image);
+		}
+	}
+	inputs.valid = false;
+}
+
+void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,
+                  vk::Rect2D region, vk::Format format) {
+	inputs.has_hudless_display = false;
+	if (!inputs.valid || !inputs.has_hudless || inputs.hudless.image == nullptr) return;
+	ConfigureAs(graphics, inputs.hudless_display, inputs.hudless_display_view, format,
+	            vk::Extent3D {backbuffer.width, backbuffer.height, 1});
+	Transition(command, inputs.hudless, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+	           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+	Transition(command, inputs.hudless_display, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	// Where RecordPresentCommands put the frame image (its present region: black bars at another aspect or with
+	// KYTY_PRESENT_ASPECT=fit), black around it as there; the whole backbuffer otherwise, as before.
+	const bool partial = region.extent.width != 0 && region.extent.height != 0 &&
+	                     (region.offset.x != 0 || region.offset.y != 0 || region.extent != backbuffer);
+	if (partial) {
+		const vk::ClearColorValue       black {std::array<float, 4> {0.0f, 0.0f, 0.0f, 1.0f}};
+		const vk::ImageSubresourceRange whole {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.clearColorImage(inputs.hudless_display.image, vk::ImageLayout::eTransferDstOptimal, &black, 1, &whole);
+		Transition(command, inputs.hudless_display, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+		           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	}
+	vk::ImageBlit blit {};
+	blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(inputs.hudless.extent.width),
+                                       static_cast<int32_t>(inputs.hudless.extent.height), 1};
+	blit.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(backbuffer.width), static_cast<int32_t>(backbuffer.height), 1};
+	if (partial) {
+		blit.dstOffsets[0] = vk::Offset3D {region.offset.x, region.offset.y, 0};
+		blit.dstOffsets[1] = vk::Offset3D {region.offset.x + static_cast<int32_t>(region.extent.width),
+		                                   region.offset.y + static_cast<int32_t>(region.extent.height), 1};
+	}
+	command.blitImage(inputs.hudless.image, vk::ImageLayout::eTransferSrcOptimal, inputs.hudless_display.image,
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &blit, vk::Filter::eLinear);
+	for (auto* image: {&inputs.hudless, &inputs.hudless_display})
+		Transition(command, *image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+	inputs.has_hudless_display = true;
+}
+
+} // namespace Libs::Graphics::FrameGen

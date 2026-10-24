@@ -128,6 +128,7 @@ public:
 	// IsDepthTargetCurrent), else no image.
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc,
 	                                            ImageId* stencil = nullptr);
+	[[nodiscard]] Image*        TryGetImage(ImageId id) noexcept { return m_slot_images.try_get(id); }
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);

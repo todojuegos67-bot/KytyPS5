@@ -143,6 +143,10 @@ public:
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
+	// bruno-astro-1025 (frame generation, src/local/frame-gen.cpp): `state`'s render pass begun again after an
+	// interruption, its attachments loaded (no clears); and whether the pass in progress is `state`'s.
+	void ResumeRendering(const RenderState& state) const;
+	[[nodiscard]] bool RenderingWith(const RenderState& state) const;
 	// Ends the rendering instance, then records the barrier of any deferred shader writes.
 	void EndRendering() const;
 	// A draw whose shaders wrote buffers leaves the barrier that makes the writes visible pending

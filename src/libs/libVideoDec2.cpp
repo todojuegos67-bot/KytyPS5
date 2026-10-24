@@ -2,6 +2,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/videoDec2Decoder.h"
+#include "local/title-state.h"
 #include "loader/symbolDatabase.h"
 
 #include <cstddef>
@@ -461,6 +462,7 @@ static int32_t KYTY_SYSV_ABI Decode(Videodec2Decoder decoder, const Videodec2Inp
                                     Videodec2FrameBuffer* frame_buffer,
                                     Videodec2OutputInfo*  output_info) {
 	PRINT_NAME();
+	VideoOut::NoteMovieFrame(); // (bruno-astro-1025: frame generation is off for movies)
 
 	auto* state = GetDecoder(decoder);
 	if (state == nullptr) {

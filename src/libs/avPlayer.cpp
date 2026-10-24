@@ -5,6 +5,7 @@
 #include "kernel/pthread.h"
 #include "libs/audio.h"
 #include "libs/libs.h"
+#include "local/title-state.h"
 
 #include <algorithm>
 #include <atomic>
@@ -2017,6 +2018,7 @@ Bool KYTY_SYSV_ABI AvPlayerGetVideoData(AvPlayerInternal* h, AvPlayerFrameInfo* 
 		pump_warnings(h);
 		return 0;
 	}
+	VideoOut::NoteMovieFrame(); // (bruno-astro-1025: frame generation is off for movies)
 	std::memset(video_info, 0, sizeof(*video_info));
 	video_info->data                       = ex.data;
 	video_info->time_stamp                 = ex.time_stamp;
@@ -2033,6 +2035,9 @@ Bool KYTY_SYSV_ABI AvPlayerGetVideoDataEx(AvPlayerInternal* h, AvPlayerFrameInfo
 		return 0;
 	}
 	auto ok = h->source->Video(video_info) ? 1 : 0;
+	if (ok != 0) {
+		VideoOut::NoteMovieFrame();
+	}
 	pump_warnings(h);
 	return ok;
 }

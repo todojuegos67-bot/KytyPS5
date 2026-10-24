@@ -1,0 +1,784 @@
+diff --git a/ffx-api/src/ffx_provider_framegeneration.cpp b/ffx-api/src/ffx_provider_framegeneration.cpp
+index 5b6e9d7..3c2cc15 100644
+--- a/ffx-api/src/ffx_provider_framegeneration.cpp
++++ b/ffx-api/src/ffx_provider_framegeneration.cpp
+@@ -451,6 +451,12 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
+             fiDispatchDesc.renderSize.width  = prepDesc->renderSize.width;
+             fiDispatchDesc.renderSize.height = prepDesc->renderSize.height;
+             fiDispatchDesc.output = Convert(desc->outputs[0]);
++            // Kyty multi frame generation: outputs[k] receives generated frame k of numGeneratedFrames
++            fiDispatchDesc.numInterpolatedFrames = desc->numGeneratedFrames;
++            for (uint32_t i = 1; i < desc->numGeneratedFrames && i < 4; ++i)
++            {
++                fiDispatchDesc.additionalOutputs[i - 1] = Convert(desc->outputs[i]);
++            }
+             fiDispatchDesc.opticalFlowVector = internal_context->backendInterfaceShared.fpGetResource(&internal_context->backendInterfaceShared, internal_context->sharedResources[FFX_FSR3_RESOURCE_IDENTIFIER_OPTICAL_FLOW_VECTOR]);
+             fiDispatchDesc.opticalFlowSceneChangeDetection = internal_context->backendInterfaceShared.fpGetResource(&internal_context->backendInterfaceShared, internal_context->sharedResources[FFX_FSR3_RESOURCE_IDENTIFIER_OPTICAL_FLOW_SCD_OUTPUT]);
+             fiDispatchDesc.opticalFlowBlockSize = 8;
+diff --git a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation.h b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation.h
+index ccf2e23..598e0b1 100644
+--- a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation.h
++++ b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation.h
+@@ -99,10 +99,10 @@ void computeInterpolatedColor(FfxUInt32x2 iPxPos, out FfxFloat32x3 fInterpolated
+     // Binarize disucclusion factor
+     FfxFloat32x2 fDisocclusionFactor = FfxFloat32x2(FFX_EQUAL(ffxSaturate(SampleDisocclusionMask(fLrUvInInterpolationRect).xy), FfxFloat32x2(1.0, 1.0)));
+ 
+-    InterpolationSourceColor fPrevColorGame = SampleTextureBilinear(false, fUvInScreenSpace, +gameMv.fMotionVector * fUvLetterBoxScale, DisplaySize()); // Get in previous frame buffer, the color of interpolated pixel
++    InterpolationSourceColor fPrevColorGame = SampleTextureBilinear(false, fUvInScreenSpace, +gameMv.fMotionVector * PreviousVectorScale() * fUvLetterBoxScale, DisplaySize()); // Get in previous frame buffer, the color of interpolated pixel
+     InterpolationSourceColor fCurrColorGame = SampleTextureBilinear(true, fUvInScreenSpace, -gameMv.fMotionVector * fUvLetterBoxScale, DisplaySize()); // Get color in current framebuffer, of color of interpolated pixel
+ 
+-    InterpolationSourceColor fPrevColorOF = SampleTextureBilinear(false, fUvInScreenSpace, +ofMv.fMotionVector * fUvLetterBoxScale, DisplaySize());
++    InterpolationSourceColor fPrevColorOF = SampleTextureBilinear(false, fUvInScreenSpace, +ofMv.fMotionVector * PreviousVectorScale() * fUvLetterBoxScale, DisplaySize());
+     InterpolationSourceColor fCurrColorOF = SampleTextureBilinear(true, fUvInScreenSpace, -ofMv.fMotionVector * fUvLetterBoxScale, DisplaySize());
+ 
+     FfxFloat32 fDisoccludedFactor = 0.0f;
+@@ -115,9 +115,10 @@ void computeInterpolatedColor(FfxUInt32x2 iPxPos, out FfxFloat32x3 fInterpolated
+         // Inpaint in bi-directional disocclusion areas
+         updateInPaintingWeight(fInPaintingWeight, FfxFloat32(length(fDisocclusionFactor) <= FFX_FRAMEINTERPOLATION_EPSILON));
+ 
+-        FfxFloat32 t = 0.5f;
+-        t += 0.5f * (1 - (fDisocclusionFactor.x));
+-        t -= 0.5f * (1 - (fDisocclusionFactor.y));
++        const FfxFloat32 fT = InterpolationFactor();
++        FfxFloat32 t = fT;
++        t += (1.0f - fT) * (1 - (fDisocclusionFactor.x));
++        t -= fT * (1 - (fDisocclusionFactor.y));
+         // Say if fDisocclusionFactor.x is 1 and fDisocclusionFactor.y = 0, then t will be 0. fInterpolatedColor will be entirely from fPrevColorGame 
+         fInterpolatedColor = ffxLerp(fPrevColorGame.fRaw, fCurrColorGame.fRaw, ffxSaturate(t));
+         fDisoccludedFactor = ffxSaturate(1 - ffxMin(fDisocclusionFactor.x, fDisocclusionFactor.y));
+@@ -138,11 +139,11 @@ void computeInterpolatedColor(FfxUInt32x2 iPxPos, out FfxFloat32x3 fInterpolated
+ 
+     {
+ 
+-        FfxFloat32 ofT = 0.5f;
++        FfxFloat32 ofT = InterpolationFactor();
+ 
+         if (fPrevColorOF.fBilinearWeightSum > 0 && fCurrColorOF.fBilinearWeightSum > 0)
+         {
+-            ofT = 0.5f;
++            ofT = InterpolationFactor();
+         }
+         else if (fPrevColorOF.fBilinearWeightSum > 0)
+         {
+diff --git a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h
+index 20c5c29..b41750c 100644
+--- a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h
++++ b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h
+@@ -65,12 +65,25 @@
+ 
+         FfxFloat32x2    minMaxLuminance;
+         FfxFloat32      fTanHalfFOV;
+-        FfxInt32        _pad1;
++        FfxFloat32      interpolationFactor;
+ 
+         FfxFloat32x2    fJitter;
+         FfxFloat32x2    fMotionVectorScale;
+     } cbFI;
+ 
++    // Kyty MFG: interpolated time t (0 = previous frame, 1 = current frame); stock FSR 3.1 is always 0.5
++    FfxFloat32 InterpolationFactor()
++    {
++        return cbFI.interpolationFactor;
++    }
++
++    // Vector fields store the offset from the interpolated pixel towards the current frame, (1 - t) * motion vector.
++    // The offset towards the previous frame is that vector times t / (1 - t), exactly 1 at t = 0.5.
++    FfxFloat32 PreviousVectorScale()
++    {
++        return InterpolationFactor() / (1.0f - InterpolationFactor());
++    }
++
+     FfxFloat32x2 Jitter()
+     {
+         return cbFI.fJitter;
+diff --git a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_hlsl.h b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_hlsl.h
+index a58743d..9430b41 100644
+--- a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_hlsl.h
++++ b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_callbacks_hlsl.h
+@@ -77,12 +77,25 @@
+ 
+         FfxFloat32x2    minMaxLuminance;
+         FfxFloat32      fTanHalfFOV;
+-        FfxInt32        _pad1;
++        FfxFloat32      interpolationFactor;
+ 
+         FfxFloat32x2    fJitter;
+         FfxFloat32x2    fMotionVectorScale;
+     }
+ 
++    // Kyty MFG: interpolated time t (0 = previous frame, 1 = current frame); stock FSR 3.1 is always 0.5
++    FfxFloat32 InterpolationFactor()
++    {
++        return interpolationFactor;
++    }
++
++    // Vector fields store the offset from the interpolated pixel towards the current frame, (1 - t) * motion vector.
++    // The offset towards the previous frame is that vector times t / (1 - t), exactly 1 at t = 0.5.
++    FfxFloat32 PreviousVectorScale()
++    {
++        return InterpolationFactor() / (1.0f - InterpolationFactor());
++    }
++
+     const FfxFloat32x2 Jitter()
+     {
+         return fJitter;
+diff --git a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_common.h b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_common.h
+index 8206bf4..233e592 100644
+--- a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_common.h
++++ b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_common.h
+@@ -363,7 +363,7 @@ void LoadInpaintedGameFieldMv(FfxFloat32x2 fUv, out VectorFieldEntry vfElement)
+     }
+ 
+     vfElement.bNegOutside = !IsUvInside(fUv - vfElement.fMotionVector);
+-    vfElement.bPosOutside = !IsUvInside(fUv + vfElement.fMotionVector);
++    vfElement.bPosOutside = !IsUvInside(fUv + vfElement.fMotionVector * PreviousVectorScale());
+     vfElement.fVelocity   = length(vfElement.fMotionVector);
+ }
+ #endif
+@@ -410,7 +410,7 @@ void SampleOpticalFlowMotionVectorField(FfxFloat32x2 fUv, out VectorFieldEntry v
+     }
+ 
+     vfElement.bNegOutside = !IsUvInside(fUv - vfElement.fMotionVector);
+-    vfElement.bPosOutside = !IsUvInside(fUv + vfElement.fMotionVector);
++    vfElement.bPosOutside = !IsUvInside(fUv + vfElement.fMotionVector * PreviousVectorScale());
+     vfElement.fVelocity   = length(vfElement.fMotionVector);
+ }
+ #endif
+diff --git a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_disocclusion_mask.h b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_disocclusion_mask.h
+index 03adc96..04dcf1d 100644
+--- a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_disocclusion_mask.h
++++ b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_disocclusion_mask.h
+@@ -125,7 +125,7 @@ void computeDisocclusionMask(FfxInt32x2 iPxPos)
+     VectorFieldEntry gameMv;
+     LoadInpaintedGameFieldMv(fDepthUv, gameMv);
+ 
+-    const FfxFloat32 fDepthClipInterpolatedToPrevious   = 1.0f - ComputeDepthClip(0, fDepthUv + gameMv.fMotionVector, fDilatedDepth);
++    const FfxFloat32 fDepthClipInterpolatedToPrevious   = 1.0f - ComputeDepthClip(0, fDepthUv + gameMv.fMotionVector * PreviousVectorScale(), fDilatedDepth);
+     const FfxFloat32 fDepthClipInterpolatedToCurrent    = 1.0f - ComputeDepthClip(1, fDepthUv - gameMv.fMotionVector, fDilatedDepth);
+     FfxFloat32x2 fDisocclusionMask = FfxFloat32x2(fDepthClipInterpolatedToPrevious, fDepthClipInterpolatedToCurrent);
+ 
+@@ -133,7 +133,7 @@ void computeDisocclusionMask(FfxInt32x2 iPxPos)
+ 
+     // Avoid false disocclusion if primary game vector pointer outside screen area
+     const FfxFloat32x2 fSrcMotionVector   = gameMv.fMotionVector * 2.0f;
+-    const FfxInt32x2   iSamplePosPrevious = FfxInt32x2((fDepthUv + fSrcMotionVector) * RenderSize());
++    const FfxInt32x2   iSamplePosPrevious = FfxInt32x2((fDepthUv + fSrcMotionVector * PreviousVectorScale()) * RenderSize());
+     fDisocclusionMask.x = ffxSaturate(fDisocclusionMask.x + FfxFloat32(!IsOnScreen(iSamplePosPrevious, RenderSize())));
+ 
+     const FfxInt32x2 iSamplePosCurrent = FfxInt32x2((fDepthUv - fSrcMotionVector) * RenderSize());
+diff --git a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_game_motion_vector_field.h b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_game_motion_vector_field.h
+index 574e3df..2392bd7 100644
+--- a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_game_motion_vector_field.h
++++ b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_game_motion_vector_field.h
+@@ -45,7 +45,7 @@ void computeGameFieldMvs(FfxInt32x2 iPxPos)
+ 
+     const FfxFloat32 fDepthSample = LoadDilatedDepth(iPxPos + iDistortionPixelOffset);
+     const FfxFloat32x2 fGameMotionVector = LoadDilatedMotionVector(iPxPos + iDistortionPixelOffset);
+-    const FfxFloat32x2 fMotionVectorHalf = fGameMotionVector * 0.5f;
++    const FfxFloat32x2 fMotionVectorHalf = fGameMotionVector * (1.0f - InterpolationFactor());
+     const FfxFloat32x2 fInterpolatedLocationUv = fUvInScreenSpace + fMotionVectorHalf;
+ 
+     const FfxFloat32 fViewSpaceDepth = ConvertFromDeviceDepthToViewSpace(fDepthSample);
+diff --git a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_optical_flow_vector_field.h b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_optical_flow_vector_field.h
+index 8432132..0a0aeb3 100644
+--- a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_optical_flow_vector_field.h
++++ b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_optical_flow_vector_field.h
+@@ -28,7 +28,7 @@ void computeOpticalFlowFieldMvs(FfxUInt32x2 dtID, FfxFloat32x2 fOpticalFlowVecto
+     FfxFloat32x2 fUv = FfxFloat32x2(FfxFloat32x2(dtID)+0.5f) / GetOpticalFlowSize2();
+ 
+     const FfxFloat32 scaleFactor = 1.0f;
+-    FfxFloat32x2 fMotionVectorHalf = fOpticalFlowVector * 0.5f;
++    FfxFloat32x2 fMotionVectorHalf = fOpticalFlowVector * (1.0f - InterpolationFactor());
+ 
+     // pixel position in current frame + fOpticalFlowVector-> pixel position in previous frame
+     FfxFloat32x3 prevBackbufferCol = SamplePreviousBackbuffer(fUv + fOpticalFlowVector).xyz; // returns previous backbuffer color of current frame pixel position in previous frame
+diff --git a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_reconstruct_previous_depth.h b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_reconstruct_previous_depth.h
+index d85f673..6359e01 100644
+--- a/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_reconstruct_previous_depth.h
++++ b/sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_reconstruct_previous_depth.h
+@@ -57,7 +57,7 @@ void reconstructPreviousDepth(FfxInt32x2 iPxPos)
+     FfxFloat32x2 fMotionVector = LoadDilatedMotionVector(iPxPos + iDistortionPixelOffset);
+     FfxFloat32   fDilatedDepth = LoadDilatedDepth(iPxPos + iDistortionPixelOffset);
+ 
+-    ReconstructPrevDepth(iPxPos, 1, fDilatedDepth, fMotionVector * 0.5f, RenderSize());
++    ReconstructPrevDepth(iPxPos, 1, fDilatedDepth, fMotionVector * (1.0f - InterpolationFactor()), RenderSize());
+ }
+ 
+ #endif // FFX_FRAMEINTERPOLATION_RECONSTRUCT_PREVIOUS_DEPTH_H
+diff --git a/sdk/include/FidelityFX/host/ffx_frameinterpolation.h b/sdk/include/FidelityFX/host/ffx_frameinterpolation.h
+index 2340d04..b5fdf33 100644
+--- a/sdk/include/FidelityFX/host/ffx_frameinterpolation.h
++++ b/sdk/include/FidelityFX/host/ffx_frameinterpolation.h
+@@ -279,6 +279,11 @@ typedef struct FfxFrameInterpolationDispatchDescription {
+     FfxResource                         reconstructedPrevDepth;             ///< The reconstructed depth buffer data
+ 
+     FfxResource                         distortionField;                    ///< A resource containing distortion offset data used when distortion post effects are enabled.
++
++    // Kyty multi frame generation: when numInterpolatedFrames > 1, frame k (0-based) is generated at t = (k + 1) / (numInterpolatedFrames + 1)
++    // into output (k == 0) or additionalOutputs[k - 1]. 0 or 1 keeps the stock single frame at t = 0.5.
++    uint32_t                            numInterpolatedFrames;
++    FfxResource                         additionalOutputs[3];
+ } FfxFrameInterpolationDispatchDescription;
+ 
+ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext* context, const FfxFrameInterpolationDispatchDescription* params);
+diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
+index 5c47b25..85a5762 100644
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
+@@ -22,6 +22,7 @@
+ 
+ #pragma once
+ 
++#include <cstdlib>
+ #include "FrameInterpolationSwapchainVK.h"
+ #include "FrameInterpolationSwapchainVK_UiComposition.h"
+ #include "FrameInterpolationSwapchainVK_DebugPacing.h"
+@@ -760,11 +761,77 @@ FfxErrorCode ffxFrameInterpolationSwapchainGetGpuMemoryUsageVK(FfxSwapchain game
+ //////////////////////////////////////////////
+ /// Present
+ //////////////////////////////////////////////
+-VkResult presentToSwapChain(FrameinterpolationPresentInfo* pPresenter, uint32_t imageIndex, uint32_t semaphoreIndex = 0)
++// Kyty Reflex (VK_NV_low_latency2, declared here: the build's Vulkan headers may predate it). The emulator passes its
++// frame index as the game present's VkPresentIdKHR; the real frame's present to the driver swapchain carries it, between
++// PRESENT_START and PRESENT_END markers. Generated frames have none.
++namespace
++{
++struct KytySetLatencyMarkerInfoNV
++{
++    VkStructureType sType;
++    const void*     pNext;
++    uint64_t        presentID;
++    int32_t         marker;
++};
++typedef void(VKAPI_PTR* KytyPfnSetLatencyMarkerNV)(VkDevice, VkSwapchainKHR, const KytySetLatencyMarkerInfoNV*);
++constexpr VkStructureType kKytySetLatencyMarkerInfoNV      = static_cast<VkStructureType>(1000505002);
++constexpr VkStructureType kKytySwapchainLatencyCreateInfoNV = static_cast<VkStructureType>(1000505007);
++struct KytySwapchainLatencyCreateInfoNV
++{
++    VkStructureType sType;
++    const void*     pNext;
++    VkBool32        latencyModeEnable;
++};
++
++void kytyLatencyMarker(FrameinterpolationPresentInfo* pPresenter, uint64_t presentId, int32_t marker)
++{
++    static KytyPfnSetLatencyMarkerNV fn     = nullptr;
++    static bool                      looked = false;
++    if (!looked)
++    {
++        fn     = reinterpret_cast<KytyPfnSetLatencyMarkerNV>(vkGetDeviceProcAddr(pPresenter->device, "vkSetLatencyMarkerNV"));
++        looked = true;
++    }
++    if (fn == nullptr)
++        return;
++    KytySetLatencyMarkerInfoNV info = {kKytySetLatencyMarkerInfoNV, nullptr, presentId, marker};
++    fn(pPresenter->device, pPresenter->realSwapchain, &info);
++}
++
++uint64_t kytyPresentIdOf(const VkPresentInfoKHR* pPresentInfo)
++{
++    for (const VkBaseInStructure* p = reinterpret_cast<const VkBaseInStructure*>(pPresentInfo->pNext); p != nullptr; p = p->pNext)
++    {
++        if (p->sType == VK_STRUCTURE_TYPE_PRESENT_ID_KHR)
++        {
++            const VkPresentIdKHR* id = reinterpret_cast<const VkPresentIdKHR*>(p);
++            return id->swapchainCount > 0 && id->pPresentIds != nullptr ? id->pPresentIds[0] : 0;
++        }
++    }
++    return 0;
++}
++}  // namespace
++
++// Kyty Reflex: the driver swapchain behind a frame interpolation swapchain (null: none).
++extern "C" __declspec(dllexport) VkSwapchainKHR kytyFfxGetRealSwapchainVK(VkSwapchainKHR swapchain)
++{
++    FrameInterpolationSwapChainVK* pSwapChainVK = reinterpret_cast<FrameInterpolationSwapChainVK*>(swapchain);
++    return pSwapChainVK != nullptr ? pSwapChainVK->kytyRealSwapchain() : VK_NULL_HANDLE;
++}
++
++VkResult presentToSwapChain(FrameinterpolationPresentInfo* pPresenter, uint32_t imageIndex, uint32_t semaphoreIndex = 0, uint64_t kytyPresentId = 0)
+ {
+     VkPresentInfoKHR presentInfoKHR   = {};
+     presentInfoKHR.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+     presentInfoKHR.pNext              = nullptr;
++    VkPresentIdKHR kytyId             = {};
++    if (kytyPresentId != 0)
++    {
++        kytyId.sType          = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
++        kytyId.swapchainCount = 1;
++        kytyId.pPresentIds    = &kytyPresentId;
++        presentInfoKHR.pNext  = &kytyId;
++    }
+     presentInfoKHR.waitSemaphoreCount = 1;
+     presentInfoKHR.pWaitSemaphores    = &pPresenter->frameRenderedSemaphores[semaphoreIndex];
+     presentInfoKHR.swapchainCount     = 1;
+@@ -773,7 +840,11 @@ VkResult presentToSwapChain(FrameinterpolationPresentInfo* pPresenter, uint32_t
+     presentInfoKHR.pResults           = nullptr;  // Optional
+ 
+     EnterCriticalSection(&pPresenter->swapchainCriticalSection);
++    if (kytyPresentId != 0)
++        kytyLatencyMarker(pPresenter, kytyPresentId, 4);  // VK_LATENCY_MARKER_PRESENT_START_NV
+     VkResult res = vkQueuePresentKHR(pPresenter->presentQueue.queue, &presentInfoKHR);
++    if (kytyPresentId != 0)
++        kytyLatencyMarker(pPresenter, kytyPresentId, 5);  // VK_LATENCY_MARKER_PRESENT_END_NV
+     LeaveCriticalSection(&pPresenter->swapchainCriticalSection);
+ 
+     ++(pPresenter->realPresentCount);
+@@ -847,7 +918,7 @@ VkResult compositeSwapChainFrame(FrameinterpolationPresentInfo* pPresenter,
+         ImageBarrierHelper preCallbackBarriers;
+         if (pPresenter->interpolationQueue.familyIndex != compositionQueue.familyIndex)
+         {
+-            if (frameType == PacingData::FrameType::Interpolated_1)
++            if (frameType != PacingData::FrameType::Real)
+             {
+                 // this is the interpolation buffer
+                 preCallbackBarriers.add(static_cast<VkImage>(frameInfo.resource.resource),
+@@ -1051,7 +1122,7 @@ DWORD WINAPI copyAndPresent_presenterThread(LPVOID pParam)
+                                 waitForPerformanceCount(previousPresentQpc + frameInfo.presentQpcDelta);
+                                 QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&previousPresentQpc));
+ 
+-                                res = presentToSwapChain(presenter, imageIndex, imageIndex);
++                                res = presentToSwapChain(presenter, imageIndex, imageIndex, frameType == PacingData::FrameType::Real ? entry.kytyPresentId : 0);
+                                 // VK_SUBOPTIMAL_KHR & VK_ERROR_OUT_OF_DATE_KHR: the swapchain has been recreated
+                                 FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR || res == VK_ERROR_OUT_OF_DATE_KHR,
+                                                           "presentToSwapChain failed with error %d",
+@@ -1163,7 +1234,7 @@ DWORD WINAPI composeAndPresent_presenterThread(LPVOID pParam)
+                                 waitForPerformanceCount(previousPresentQpc + frameInfo.presentQpcDelta);
+                                 QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&previousPresentQpc));
+ 
+-                                res = presentToSwapChain(presenter, realSwapchainImageIndex);
++                                res = presentToSwapChain(presenter, realSwapchainImageIndex, 0, frameType == PacingData::FrameType::Real ? entry.kytyPresentId : 0);
+                                 // VK_SUBOPTIMAL_KHR & VK_ERROR_OUT_OF_DATE_KHR: the swapchain has been recreated
+                                 FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR || res == VK_ERROR_OUT_OF_DATE_KHR,
+                                                           "presentToSwapChain failed with error %d",
+@@ -1224,6 +1295,23 @@ DWORD WINAPI interpolationThread(LPVOID param)
+             SimpleMovingAverage<10, double> frameTime{};
+             int64_t previousQpc = 0;
+ 
++            // Kyty: KYTY_FSR3_PACING_FLOOR_US (set by the emulator: the display's refresh period, KYTY_FSR3_PACING_FLOOR=0 off):
++            // no present spaced closer than it, whatever the current multiplier (KYTY_FSR3_FG_ACTIVE). Below it a present
++            // reaches a G-SYNC display above its maximum refresh, the VRR ceiling (V-Sync takes over: held or torn frames).
++            int64_t qpcPacingFloor = 0;
++            {
++                char  floorEnv[32] = {};
++                DWORD floorLen     = GetEnvironmentVariableA("KYTY_FSR3_PACING_FLOOR_US", floorEnv, sizeof(floorEnv));
++                if (floorLen > 0 && floorLen < sizeof(floorEnv))
++                {
++                    int64_t qpcFrequencyFloor = 0;
++                    QueryPerformanceFrequency(reinterpret_cast<LARGE_INTEGER*>(&qpcFrequencyFloor));
++                    const double floorUs = atof(floorEnv);
++                    if (floorUs > 0.0 && floorUs < 100000.0)
++                        qpcPacingFloor = int64_t(double(qpcFrequencyFloor) * floorUs / 1000000.0);
++                }
++            }
++
+             while (!presenter->shutdown)
+             {
+                 WaitForSingleObject(presenter->presentEvent, INFINITE);
+@@ -1264,9 +1352,15 @@ DWORD WINAPI interpolationThread(LPVOID param)
+ 
+                     // set presentation time: reduce based on variance and subract safety margin so we don't lock on a framerate lower than necessary
+                     int64_t qpcSafetyMargin         = int64_t(qpcFrequency * presenter->safetyMarginInSec);
+-                    const int64_t conservativeAvg   = int64_t(frameTime.getAverage() * 0.5 - frameTime.getVariance() * presenter->varianceFactor);
+-                    const int64_t deltaToUse        = conservativeAvg > qpcSafetyMargin ? (conservativeAvg - qpcSafetyMargin) : 0;
++                    // Kyty MFG: with N generated frames per real frame, presents are spaced 1 / (N + 1) of the real frame time
++                    const uint32_t numGenerated     = entry.frames[PacingData::FrameType::Interpolated_3].doPresent ? 3 : entry.frames[PacingData::FrameType::Interpolated_2].doPresent ? 2 : 1;
++                    const double   pacingFraction   = (numGenerated > 1) ? (1.0 / double(numGenerated + 1)) : 0.5;
++                    const int64_t conservativeAvg   = int64_t(frameTime.getAverage() * pacingFraction - frameTime.getVariance() * presenter->varianceFactor);
++                    int64_t       deltaToUse        = conservativeAvg > qpcSafetyMargin ? (conservativeAvg - qpcSafetyMargin) : 0;
++                    deltaToUse                      = deltaToUse < qpcPacingFloor ? qpcPacingFloor : deltaToUse;  // Kyty: refresh period floor
+                     entry.frames[PacingData::FrameType::Interpolated_1].presentQpcDelta = deltaToUse;
++                    entry.frames[PacingData::FrameType::Interpolated_2].presentQpcDelta = deltaToUse;
++                    entry.frames[PacingData::FrameType::Interpolated_3].presentQpcDelta = deltaToUse;
+                     entry.frames[PacingData::FrameType::Real].presentQpcDelta           = deltaToUse;
+ 
+                     // schedule presents
+@@ -1362,6 +1456,7 @@ struct SwapchainCreationInfo
+     VkSwapchainCounterCreateInfoEXT          swapchainCounter;
+     VkSwapchainDisplayNativeHdrCreateInfoAMD swapchainDisplayNativeHdr;
+     VkSwapchainPresentModesCreateInfoEXT     swapchainPresentModes;
++    KytySwapchainLatencyCreateInfoNV         kytySwapchainLatency;  // Kyty Reflex
+ };
+ 
+ #define FFX_USE_PNEXT_AS_IS(name, type) \
+@@ -1409,6 +1504,11 @@ VkResult getRealSwapchainCreateInfo(const VkSwapchainCreateInfoKHR* pCreateInfo,
+         case VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT:
+             FFX_USE_PNEXT_AS_IS(swapchainPresentModes, VkSwapchainPresentModesCreateInfoEXT);
+             break;
++        case kKytySwapchainLatencyCreateInfoNV:  // Kyty Reflex: the real swapchain made with latency mode
++            realSwapchainCreateInfo.kytySwapchainLatency       = *reinterpret_cast<const KytySwapchainLatencyCreateInfoNV*>(pCurrent);
++            realSwapchainCreateInfo.kytySwapchainLatency.pNext = realSwapchainCreateInfo.swapchain.pNext;
++            realSwapchainCreateInfo.swapchain.pNext            = &realSwapchainCreateInfo.kytySwapchainLatency;
++            break;
+         default:
+             FFX_ASSERT_MESSAGE_FORMAT(false, "Swapchain creation structure extension %d not supported", pCurrent->sType);
+             return VK_ERROR_INITIALIZATION_FAILED;
+@@ -1688,8 +1788,18 @@ VkResult FrameInterpolationSwapChainVK::init(const VkSwapchainCreateInfoKHR* pCr
+     }
+     // No need to set the layout of the images as vulkan API states that a presentable image starts out at an undefined layout.
+ 
++    // Kyty MFG: KYTY_FSR3_FG_FRAMES=2 or 3 generates two (x3) or three (x4) frames per real frame; anything else keeps the stock single frame (x2)
++    {
++        char     framesEnv[16] = {};
++        DWORD    framesLen     = GetEnvironmentVariableA("KYTY_FSR3_FG_FRAMES", framesEnv, sizeof(framesEnv));
++        const int framesValue  = (framesLen > 0 && framesLen < sizeof(framesEnv)) ? atoi(framesEnv) : 1;
++        numGeneratedFrames     = framesValue >= 3 ? 3 : framesValue == 2 ? 2 : 1;
++    }
++
+     for (uint32_t i = 0; i < _countof(interpolationOutputs); ++i)
+     {
++        if ((i % 3) >= numGeneratedFrames)
++            continue;  // second / third generated frame images of each slot only for x3 / x4
+         res = createImage(interpolationOutputs[i],
+                           info,
+                           presentInfo.realSwapchainImageDescription.format,
+@@ -1942,18 +2052,19 @@ bool FrameInterpolationSwapChainVK::waitForPresents()
+ 
+ FfxResource FrameInterpolationSwapChainVK::interpolationOutput(int index)
+ {
+-    index = interpolationBufferIndex;
++    index = interpolationBufferIndex * 3 + ((index > 0 && uint32_t(index) < numGeneratedFrames) ? index : 0);
+ 
+     FfxResourceDescription interpolateDesc = interpolationOutputs[index].description;
+     return ffxGetResourceVK(interpolationOutputs[index].image, interpolateDesc, nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+ }
+ 
+ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t              currentBackBufferIndex,
+-                                                                  FfxResource*          pInterpolatedFrame,
++                                                                  FfxResource*          pInterpolatedFrames,
+                                                                   FfxResource*          pRealFrame,
+                                                                   SubmissionSemaphores& semaphoresToWait)
+ {
+-    FFX_ASSERT(pInterpolatedFrame);
++    FFX_ASSERT(pInterpolatedFrames);
++    FfxResource* pInterpolatedFrame = &pInterpolatedFrames[0];
+     FFX_ASSERT(pRealFrame);
+ 
+     VkImage                currentBackBuffer      = replacementSwapBuffers[currentBackBufferIndex].image;
+@@ -1962,16 +2073,27 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
+ 
+     *pRealFrame = backbuffer;
+ 
++    // Kyty MFG: generated frames this present (registered command lists only support one)
++    // (KYTY_FSR3_FG_ACTIVE, set by the emulator at run time: generated frames this present, 1..numGeneratedFrames; dynamic multiplier)
++    const uint32_t numFrames = (registeredInterpolationCommandLists[currentBackBufferIndex] != nullptr) ? 1 : [this] { char v[8] = {}; const DWORD n = GetEnvironmentVariableA("KYTY_FSR3_FG_ACTIVE", v, sizeof(v)); const uint32_t a = (n > 0 && n < sizeof(v)) ? uint32_t(atoi(v)) : numGeneratedFrames; return a < 1u ? 1u : (a > numGeneratedFrames ? numGeneratedFrames : a); }();
++
+     // interpolation queue must wait for output resource to become available
++    // (Kyty MFG: wait for the latest release among the slot's generated frame images)
++    uint64_t outputAvailabilityValue = 0;
++    for (uint32_t k = 0; k < numFrames; ++k)
++    {
++        const uint64_t value    = interpolationOutputs[interpolationBufferIndex * 3 + k].availabilitySemaphoreValue;
++        outputAvailabilityValue = value > outputAvailabilityValue ? value : outputAvailabilityValue;
++    }
+     if (presentInfo.compositionMode == FGSwapchainCompositionMode::eComposeOnPresentQueue)
+     {
+         // in those cases, interpolation output is available after composition
+-        semaphoresToWait.add(presentInfo.compositionSemaphore, interpolationOutputs[interpolationBufferIndex].availabilitySemaphoreValue);
++        semaphoresToWait.add(presentInfo.compositionSemaphore, outputAvailabilityValue);
+     }
+     else if (presentInfo.compositionMode == FGSwapchainCompositionMode::eComposeOnGameQueue)
+     {
+         // when there is a copy on the present queue from the present thread, the interpolation output will be available when the present semaphore is signaled
+-        semaphoresToWait.add(presentInfo.presentSemaphore, interpolationOutputs[interpolationBufferIndex].availabilitySemaphoreValue);
++        semaphoresToWait.add(presentInfo.presentSemaphore, outputAvailabilityValue);
+     }
+ 
+     // check necessary transitions
+@@ -1988,8 +2110,11 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
+     }
+ 
+     // interpolation texture previous content doesn't matter here so we can use an undefined source layout
+-    preInterpolationBarriers.add(
+-        interpolationOutputs[interpolationBufferIndex].image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
++    for (uint32_t k = 0; k < numFrames; ++k)
++    {
++        preInterpolationBarriers.add(
++            interpolationOutputs[interpolationBufferIndex * 3 + k].image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
++    }
+     
+     auto pRegisteredCommandList = registeredInterpolationCommandLists[currentBackBufferIndex];
+     if (pRegisteredCommandList != nullptr)
+@@ -2026,14 +2151,18 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
+         FfxResource interpolatedResource = interpolationOutput();
+         VkImage     interpolatedImage    = static_cast<VkImage>(interpolatedResource.resource);
+ 
+-        FFX_ASSERT_MESSAGE(interpolationOutputs[interpolationBufferIndex].image == interpolatedImage, "Error when querying interpolation output");
++        FFX_ASSERT_MESSAGE(interpolationOutputs[interpolationBufferIndex * 3].image == interpolatedImage, "Error when querying interpolation output");
+ 
+         FfxFrameGenerationDispatchDescription desc{};
+         desc.commandList                = ffxGetCommandListVK(interpolationCommandBuffer);
+         desc.outputs[0]                 = interpolatedResource;
+         desc.presentColor               = backbuffer;
+         desc.reset                      = frameInterpolationResetCondition;
+-        desc.numInterpolatedFrames      = 1;
++        desc.numInterpolatedFrames      = numFrames;
++        for (uint32_t k = 1; k < numFrames; ++k)
++        {
++            desc.outputs[k] = interpolationOutput(int(k));
++        }
+         desc.backBufferTransferFunction = static_cast<FfxBackbufferTransferFunction>(backBufferTransferFunction);
+         desc.minMaxLuminance[0]         = minLuminance;
+         desc.minMaxLuminance[1]         = maxLuminance;
+@@ -2062,13 +2191,16 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
+             if (presentInfo.interpolationQueue.familyIndex != compositionQueueFamily)
+             {
+                 // interpolation output queue family ownership transfer
+-                postInterpolationBarriers.add(interpolatedImage,
+-                                              InterpolationBufferTransferState.accessMask,
+-                                              InterpolationBufferTransferState.accessMask,
+-                                              InterpolationBufferTransferState.layout,
+-                                              InterpolationBufferTransferState.layout,
+-                                              presentInfo.interpolationQueue.familyIndex,
+-                                              compositionQueueFamily);
++                for (uint32_t k = 0; k < numFrames; ++k)
++                {
++                    postInterpolationBarriers.add(interpolationOutputs[interpolationBufferIndex * 3 + k].image,
++                                                  InterpolationBufferTransferState.accessMask,
++                                                  InterpolationBufferTransferState.accessMask,
++                                                  InterpolationBufferTransferState.layout,
++                                                  InterpolationBufferTransferState.layout,
++                                                  presentInfo.interpolationQueue.familyIndex,
++                                                  compositionQueueFamily);
++                }
+ 
+                 // backbuffer queue family ownership transfer
+                 if (!presentInterpolatedOnly)
+@@ -2099,6 +2231,10 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
+         {
+             frameInterpolationResetCondition = false;
+             *pInterpolatedFrame              = interpolationOutput();
++            for (uint32_t k = 1; k < desc.numInterpolatedFrames; ++k)
++            {
++                pInterpolatedFrames[k] = interpolationOutput(int(k));
++            }
+         }
+     }
+ }
+@@ -2174,9 +2310,10 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
+     SubmissionSemaphores ToWaitInterpolationQueue;
+     ToWaitInterpolationQueue.add(presentInfo.gameSemaphore, gameSemaphoreValue);
+ 
+-    FfxResource interpolatedFrame{}, realFrame{};
++    FfxResource interpolatedFrames[3]{}, realFrame{};
+     dispatchInterpolationCommands(
+-        currentBackBufferIndex, &interpolatedFrame, &realFrame, ToWaitInterpolationQueue);
++        currentBackBufferIndex, interpolatedFrames, &realFrame, ToWaitInterpolationQueue);
++    const FfxResource& interpolatedFrame = interpolatedFrames[0];
+ 
+     EnterCriticalSection(&presentInfo.scheduledFrameCriticalSection);
+ 
+@@ -2197,6 +2334,7 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
+     entry.gameSemaphoreValue               = gameSemaphoreValue;
+     entry.usePremulAlphaComposite          = (presentInfo.uiCompositionFlags & FFX_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA) != 0;
+     entry.currentFrameID                   = currentFrameID;
++    entry.kytyPresentId                    = kytyPendingPresentId;
+ 
+     // interpolated
+     PacingData::FrameInfo& fiInterpolated = entry.frames[PacingData::FrameType::Interpolated_1];
+@@ -2208,6 +2346,26 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
+         fiInterpolated.presentIndex                         = ++framesSentForPresentation;
+     }
+ 
++    // Kyty MFG: second generated frame (t = 2/3), presented between the first one and the real frame
++    PacingData::FrameInfo& fiInterpolated2 = entry.frames[PacingData::FrameType::Interpolated_2];
++    if (interpolatedFrames[1].resource != nullptr)
++    {
++        fiInterpolated2.doPresent                            = true;
++        fiInterpolated2.resource                             = interpolatedFrames[1];
++        fiInterpolated2.interpolationCompletedSemaphoreValue = interpolationSemaphoreValue;
++        fiInterpolated2.presentIndex                         = ++framesSentForPresentation;
++    }
++
++    // Kyty MFG: third generated frame (t = 3/4, x4), presented between the second one and the real frame
++    PacingData::FrameInfo& fiInterpolated3 = entry.frames[PacingData::FrameType::Interpolated_3];
++    if (interpolatedFrames[2].resource != nullptr)
++    {
++        fiInterpolated3.doPresent                            = true;
++        fiInterpolated3.resource                             = interpolatedFrames[2];
++        fiInterpolated3.interpolationCompletedSemaphoreValue = interpolationSemaphoreValue;
++        fiInterpolated3.presentIndex                         = ++framesSentForPresentation;
++    }
++
+     // real
+     if (!presentInterpolatedOnly)
+     {
+@@ -2224,7 +2382,15 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
+     entry.replacementBufferSemaphoreSignal = framesSentForPresentation;
+     entry.numFramesToPresent               = static_cast<uint32_t>(framesSentForPresentation - entry.numFramesSentForPresentationBase);
+ 
+-    interpolationOutputs[interpolationBufferIndex].availabilitySemaphoreValue = entry.numFramesSentForPresentationBase + fiInterpolated.doPresent;
++    interpolationOutputs[interpolationBufferIndex * 3].availabilitySemaphoreValue = entry.numFramesSentForPresentationBase + fiInterpolated.doPresent;
++    if (fiInterpolated2.doPresent)
++    {
++        interpolationOutputs[interpolationBufferIndex * 3 + 1].availabilitySemaphoreValue = fiInterpolated2.presentIndex;
++    }
++    if (fiInterpolated3.doPresent)
++    {
++        interpolationOutputs[interpolationBufferIndex * 3 + 2].availabilitySemaphoreValue = fiInterpolated3.presentIndex;
++    }
+ 
+     if (presentInfo.compositionMode == FGSwapchainCompositionMode::eComposeOnGameQueue)
+     {
+@@ -2283,7 +2449,7 @@ VkResult FrameInterpolationSwapChainVK::queuePresentNonInterpolated(VkCommands*
+ 
+     pCommands->execute(semaphoresToWait, semaphoresToSignal);
+ 
+-    VkResult presentRes = presentToSwapChain(&presentInfo, imageIndex, imageIndex);
++    VkResult presentRes = presentToSwapChain(&presentInfo, imageIndex, imageIndex, kytyPendingPresentId);
+     FFX_ASSERT_MESSAGE_FORMAT(presentRes == VK_SUCCESS || presentRes == VK_SUBOPTIMAL_KHR || presentRes == VK_ERROR_OUT_OF_DATE_KHR,
+                               "[queuePresentNonInterpolated] present failed with error %d",
+                               presentRes);
+@@ -2552,7 +2718,7 @@ VkResult FrameInterpolationSwapChainVK::presentNonInterpolatedWithUiCompositionO
+         FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS, "[queuePresentNonInterpolated] queue family ownership transfer to present queue failed with error %d", res);
+     }
+ 
+-    VkResult presentRes = presentToSwapChain(&presentInfo, imageIndex, imageIndex);
++    VkResult presentRes = presentToSwapChain(&presentInfo, imageIndex, imageIndex, kytyPendingPresentId);
+     FFX_ASSERT_MESSAGE_FORMAT(presentRes == VK_SUCCESS || presentRes == VK_SUBOPTIMAL_KHR || presentRes == VK_ERROR_OUT_OF_DATE_KHR,
+                               "[queuePresentNonInterpolated] present failed with error %d",
+                               presentRes);
+@@ -2594,6 +2760,7 @@ VkResult FrameInterpolationSwapChainVK::queuePresent(VkQueue queue, const VkPres
+ 
+     VkResult res = VK_SUCCESS;
+ 
++    kytyPendingPresentId = kytyPresentIdOf(pPresentInfo);  // Kyty Reflex
+     setFrameGenerationConfig(&nextFrameGenerationConfig);
+ 
+     EnterCriticalSection(&criticalSection);
+@@ -2645,7 +2812,7 @@ VkResult FrameInterpolationSwapChainVK::queuePresent(VkQueue queue, const VkPres
+         presentQueueWait.add(presentInfo.gameSemaphore, gameSemaphoreValue);
+ 
+         // fails 
+-        FFX_ASSERT_MESSAGE(pPresentInfo->pNext == nullptr, "VkPresentInfoKHR::pNext not yet supported.");
++        // (Kyty Reflex: a VkPresentIdKHR may be chained; read in queuePresent.)
+ 
+         uint32_t imageIndex = 0;
+         VkSemaphore acquireSemaphore = VK_NULL_HANDLE;
+@@ -2695,7 +2862,7 @@ VkResult FrameInterpolationSwapChainVK::queuePresent(VkQueue queue, const VkPres
+     // Unregister any potential command list
+     registeredInterpolationCommandLists[currentBackBufferIndex] = nullptr;
+     presentCount++;
+-    interpolationBufferIndex = presentCount % _countof(interpolationOutputs);
++    interpolationBufferIndex = presentCount % 2;  // Kyty MFG: two slots (outputs are [slot * 3 + generated frame])
+ 
+     // update active backbuffer and block when no buffer is available
+     replacementSwapBufferIndex = presentCount % gameBufferCount;
+diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
+index 0218ade..249085b 100644
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
+@@ -113,10 +113,13 @@ typedef struct PacingData
+     uint64_t numFramesSentForPresentationBase;
+     uint32_t numFramesToPresent;
+     UINT64   currentFrameID;
++    uint64_t kytyPresentId;  // Kyty Reflex: the real frame's VkPresentIdKHR (0 none), from the game's present
+ 
+     typedef enum FrameType
+     {
+         Interpolated_1,
++        Interpolated_2,  // Kyty multi frame generation: second generated frame (x3), presented after Interpolated_1
++        Interpolated_3,  // Kyty multi frame generation: third generated frame (x4), presented after Interpolated_2
+         Real,
+         Count
+     } FrameType;
+@@ -244,6 +247,9 @@ public:  // vulkan functions reimplementation
+ 
+     uint64_t getLastPresentCount();
+ 
++    // Kyty Reflex: the driver swapchain this one presents to (for VK_NV_low_latency2's sleep mode and markers).
++    VkSwapchainKHR kytyRealSwapchain() const { return presentInfo.realSwapchain; }
++
+ public:
+     void            setFrameGenerationConfig(FfxFrameGenerationConfig const* config);
+     void            setFramePacingTuning(const FfxSwapchainFramePacingTuning* framePacingTuning);
+@@ -276,7 +282,7 @@ private:
+     VkResult queuePresentNonInterpolated(VkCommands* pCommands, uint32_t imageIndex, SubmissionSemaphores& semaphoresToWait);
+ 
+     void     dispatchInterpolationCommands(uint32_t              currentBackBufferIndex,
+-                                           FfxResource*          pInterpolatedFrame,
++                                           FfxResource*          pInterpolatedFrames,
+                                            FfxResource*          pRealFrame,
+                                            SubmissionSemaphores& semaphoresToWait);
+     void     discardOutstandingInterpolationCommandLists();
+@@ -316,7 +322,8 @@ private:
+     
+     uint32_t            gameBufferCount                                                             = 0;
+     ReplacementResource replacementSwapBuffers[FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT] = {};
+-    ReplacementResource interpolationOutputs[2]                                                     = {};
++    ReplacementResource interpolationOutputs[6]                                                     = {};  // Kyty MFG: [slot * 3 + generated frame index]
++    uint32_t            numGeneratedFrames                                                          = 1;   // Kyty MFG: KYTY_FSR3_FG_FRAMES (1, 2 or 3)
+     ReplacementResource uiReplacementBuffer                                                         = {};
+     uint32_t            replacementSwapBufferIndex                                                  = 0;
+     uint32_t            interpolationBufferIndex                                                    = 0;
+@@ -335,6 +342,7 @@ private:
+     bool drawDebugPacingLines           = false;
+ 
+     UINT64        currentFrameID = 0;
++    uint64_t      kytyPendingPresentId = 0;  // Kyty Reflex: VkPresentIdKHR of the game's present being handled
+ 
+     LARGE_INTEGER lastTimestamp = {};
+     LARGE_INTEGER currTimestamp = {};
+diff --git a/sdk/src/components/frameinterpolation/ffx_frameinterpolation.cpp b/sdk/src/components/frameinterpolation/ffx_frameinterpolation.cpp
+index a60ff6a..ceedf7f 100644
+--- a/sdk/src/components/frameinterpolation/ffx_frameinterpolation.cpp
++++ b/sdk/src/components/frameinterpolation/ffx_frameinterpolation.cpp
+@@ -999,6 +999,10 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
+     contextPrivate->renderDescription.upscaleSize               = params->displaySize;
+     setupDeviceDepthToViewSpaceDepthParams(contextPrivate, renderDesc, &contextPrivate->constants);
+ 
++    // Kyty multi frame generation: frame k of N is interpolated at t = (k + 1) / (N + 1); N <= 1 is the stock midpoint
++    const uint32_t numInterpolatedFrames = (params->numInterpolatedFrames > 1) ? (params->numInterpolatedFrames < 4u ? params->numInterpolatedFrames : 4u) : 1u;
++    contextPrivate->constants.interpolationFactor = (numInterpolatedFrames > 1) ? (1.0f / float(numInterpolatedFrames + 1)) : 0.5f;
++
+     contextPrivate->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
+         &contextPrivate->contextDescription.backendInterface,
+         &contextPrivate->constants,
+@@ -1088,7 +1092,24 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
+     const bool bExecutePreparationPasses = (false == contextPrivate->constants.Reset);
+ 
+     // Schedule work for the interpolation command list
++    for (uint32_t interpolatedFrameIndex = 0; interpolatedFrameIndex < numInterpolatedFrames; ++interpolatedFrameIndex)
+     {
++        if (interpolatedFrameIndex > 0)
++        {
++            // Kyty MFG: next generated frame, same inputs, later time and its own output image
++            contextPrivate->constants.interpolationFactor = float(interpolatedFrameIndex + 1) / float(numInterpolatedFrames + 1);
++            contextPrivate->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
++                &contextPrivate->contextDescription.backendInterface,
++                &contextPrivate->constants,
++                sizeof(contextPrivate->constants),
++                &contextPrivate->constantBuffers[FFX_FRAMEINTERPOLATION_CONSTANTBUFFER_IDENTIFIER]);
++            contextPrivate->contextDescription.backendInterface.fpRegisterResource(&contextPrivate->contextDescription.backendInterface,
++                                                                                   &params->additionalOutputs[interpolatedFrameIndex - 1],
++                                                                                   contextPrivate->effectContextId,
++                                                                                   &contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT]);
++            contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT] = contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT];
++        }
++
+         FfxResourceInternal aliasableResources[] = {
+             contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_RECONSTRUCTED_DEPTH_INTERPOLATED_FRAME],
+             contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_GAME_MOTION_VECTOR_FIELD_X],
+@@ -1194,7 +1215,9 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
+             scheduleDispatchGameVectorFieldInpaintingPyramid();
+             scheduleDispatch(contextPrivate, &contextPrivate->pipelineDebugView, displayDispatchSizeX, displayDispatchSizeY);
+         }
++    }
+ 
++    {
+         // store current buffer
+         {
+             FfxGpuJobDescription copyJobs[] = { {FFX_GPU_JOB_COPY} };
+diff --git a/sdk/src/components/frameinterpolation/ffx_frameinterpolation_private.h b/sdk/src/components/frameinterpolation/ffx_frameinterpolation_private.h
+index e4c67e8..396b701 100644
+--- a/sdk/src/components/frameinterpolation/ffx_frameinterpolation_private.h
++++ b/sdk/src/components/frameinterpolation/ffx_frameinterpolation_private.h
+@@ -76,7 +76,7 @@ typedef struct FrameInterpolationConstants
+ 
+     float    minMaxLuminance[2];
+     float    fTanHalfFOV;
+-    float   _pad1;
++    float   interpolationFactor; // Kyty MFG: was _pad1, 0.5 = midpoint
+ 
+     float   jitter[2];
+     float   motionVectorScale[2];

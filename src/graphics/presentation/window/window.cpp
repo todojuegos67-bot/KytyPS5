@@ -21,6 +21,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "local/frame-gen.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -764,6 +765,17 @@ static void WindowCreate(WindowContext& context) {
 	// RenderDoc can hide Wayland Vulkan surface support; prefer X11 for captures.
 	if (Config::RenderDocEnabled()) {
 		SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
+	}
+#endif
+#if defined(_WIN32)
+	// bruno-astro-1025 (KYTY_FRAMEGEN, KYTY_UPSCALE=dlss, KYTY_TAA_REPLACE=dlss): NVIDIA Streamline is initialized
+	// before SDL loads Vulkan with the window, and becomes that loader (sl.interposer.dll: the instance, device and
+	// swapchain are created through it). SDL 3 reads its hint, set here as well as the environment variable.
+	Libs::Graphics::FrameGen::Initialize();
+	if (Libs::Graphics::FrameGen::StreamlineLoaded()) {
+		if (const char* loader = std::getenv("SDL_VULKAN_LIBRARY"); loader != nullptr) {
+			SDL_SetHint(SDL_HINT_VULKAN_LIBRARY, loader);
+		}
 	}
 #endif
 	if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {

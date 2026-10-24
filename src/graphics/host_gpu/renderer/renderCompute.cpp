@@ -11,6 +11,8 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "local/fg-discover.h"
+#include "local/frame-gen.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -473,6 +475,28 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		               input_info.stage.program->shader_hash);
 	}
 	RebindBuffers(bindings);
+	// bruno-astro-1025 (src/local/frame-gen.h): a title's TAA pass named by KYTY_FG_TAA_SHADERS is the game's
+	// view (frame generation and the HUD-less copy), and its depth and motion vectors are frame generation's and the
+	// upscalers' inputs (KYTY_FG_TAA_SLOTS); KYTY_SHADER_CENSUS lists the programs run.
+	{
+		const uint64_t taa_hash = program.shader_hash;
+		if (FrameGen::IsTaaShader(taa_hash)) {
+			FrameGen::NoteScene();
+		}
+		FrameGen::NoteShader(taa_hash, 'c');
+		if (FgDiscover::Recording()) {
+			FgDiscover::OnDispatch(taa_hash, std::span<const TextureBinding> {bindings.images}, thread_group_x,
+			                       thread_group_y);
+		}
+		if (FrameGen::Capturing() && FrameGen::IsTaaShader(taa_hash) &&
+		    bindings.images.size() > std::max(FrameGen::TaaSlot(1), FrameGen::TaaSlot(3))) {
+			const auto depth = FrameGen::TaaSlot(1), motion = FrameGen::TaaSlot(3);
+			FrameGen::OnDispatch(taa_hash, bindings.images[depth].image_id,
+			                     bindings.images[depth].desc.info.data.address,
+			                     bindings.images[motion].image_id,
+			                     bindings.images[motion].desc.info.data.address);
+		}
+	}
 
 	auto              vk_buffer        = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
@@ -565,7 +589,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	GpuZones::Mark(vk_buffer, DrainStats::Zone::GameDispatch, input_info.stage.program->shader_hash);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	{
+		// bruno-astro-1025: KYTY_TAA_REPLACE=dlss (DLSS/DLAA in place of the title's TAA, on its own images) or
+		// =upscaler (the raw frame kept for the upscaler): the TAA pass named by KYTY_FG_TAA_SHADERS only.
+		const bool taa = FrameGen::IsTaaShader(program.shader_hash) && FrameGen::TaaReplaceWanted();
+		const bool taa_replaced =
+		    taa && FrameGen::ReplaceTaa(buffer, vk_buffer, std::span<const TextureBinding> {bindings.images});
+		if (!taa_replaced) {
+			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		}
+		if (taa && !taa_replaced) {
+			(void)FrameGen::AfterTaa(buffer, vk_buffer, std::span<const TextureBinding> {bindings.images});
+		}
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	if (!overlap) {

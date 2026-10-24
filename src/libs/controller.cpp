@@ -1,4 +1,5 @@
 #include "libs/controller.h"
+#include "local/title-state.h"
 
 #include <SDL3/SDL.h>
 #include "common/assert.h"
@@ -503,6 +504,10 @@ void GameController::AddState() {
 
 void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
+	// bruno-astro-1025: the player's first button (frame generation stays off until then: logos, intro, title).
+	if (down) {
+		VideoOut::NotePlayerInput();
+	}
 
 	// The keyboard shares the player-1 pad with the active gamepad.
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {

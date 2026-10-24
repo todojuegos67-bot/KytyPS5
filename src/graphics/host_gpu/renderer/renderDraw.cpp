@@ -1,3 +1,5 @@
+#include "local/fg-discover.h"
+#include "local/frame-gen.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
@@ -2353,6 +2355,58 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			} else {
 				m_mesh_indirect->Record(vk_buffer, *gpu_arguments.first, gpu_arguments.second,
 				                        records, gpu_output, {.index_limit = index_limit, .plain = true});
+			}
+		}
+	}
+	// bruno-astro-1025 (src/local/frame-gen.h): the programs run (KYTY_SHADER_CENSUS), the camera from a title's
+	// G-buffer vertex shaders named by KYTY_FG_GBUFFER_VS (DLSS-G, DLSS), the draws into each target counted and, for
+	// the game's composite into a recent flip image, its 3D image upscaled (KYTY_UPSCALE=dlss|xess|fsr with the TAA
+	// pass named) before its descriptors are written. (The HUD-less redraw of the fork, BeforeFlipDraw / AfterDraw,
+	// is not wired on this tree.)
+	if (state.vertex_info[0].stage.program != nullptr) {
+		const auto& vs = state.vertex_info[0].stage;
+		FrameGen::NoteShader(vs.program->shader_hash, 'v');
+		if (FrameGen::Capturing() && vs.resources != nullptr) {
+			FrameGen::OnDraw(vs.program->shader_hash, vs.resources->flattened_srt);
+		}
+	}
+	if (state.ps_active && state.ps_input_info.stage.program != nullptr) {
+		FrameGen::NoteShader(state.ps_input_info.stage.program->shader_hash, 'p');
+	}
+	if (FgDiscover::Recording()) {
+		// KYTY_FG_DISCOVER: this draw's targets and sampled images for the frame's [fgdisc] summary.
+		std::array<FgDiscover::Target, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
+		const uint32_t count = std::min<uint32_t>(state.color_count, RENDER_COLOR_ATTACHMENTS_MAX);
+		for (uint32_t i = 0; i < count; ++i) {
+			const auto& c = state.color_info[i];
+			const auto  e = c.Extent();
+			colors[i]     = {c.desc.info.data.address, static_cast<uint32_t>(c.desc.info.pixel_format), e.width,
+			                 e.height};
+		}
+		FgDiscover::Target depth {};
+		if (state.depth_info.image_id) {
+			const auto& d = state.depth_info.desc.info;
+			depth = {d.data.address, static_cast<uint32_t>(d.pixel_format), d.extent.width, d.extent.height};
+		}
+		const uint64_t vs = state.vertex_info[0].stage.program != nullptr ? state.vertex_info[0].stage.program->shader_hash : 0;
+		const uint64_t ps = state.ps_active && state.ps_input_info.stage.program != nullptr
+		                        ? state.ps_input_info.stage.program->shader_hash
+		                        : 0;
+		FgDiscover::OnDraw(vs, ps, std::span<const FgDiscover::Target> {colors.data(), count}, depth,
+		                   bindings.pixel.has_value() ? std::span<const TextureBinding> {bindings.pixel->images}
+		                                              : std::span<const TextureBinding> {});
+	}
+	if (FrameGen::Capturing() && state.color_count > 0) {
+		std::array<ImageId, RENDER_COLOR_ATTACHMENTS_MAX> targets {};
+		for (uint32_t i = 0; i < state.color_count && i < RENDER_COLOR_ATTACHMENTS_MAX; ++i) {
+			targets[i] = state.color_info[i].image_id;
+		}
+		FrameGen::NoteDraw(targets[0]);
+		if (!mesh_active && bindings.pixel.has_value()) {
+			const int flip_slot = FrameGen::FlipSlot(std::span {
+			    targets.data(), std::min<size_t>(state.color_count, RENDER_COLOR_ATTACHMENTS_MAX)});
+			if (flip_slot >= 0) {
+				FrameGen::UpscaleComposite(buffer, rendering, std::span<TextureBinding> {bindings.pixel->images});
 			}
 		}
 	}

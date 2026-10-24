@@ -1,0 +1,43 @@
+#version 450
+// FSR 3 frame generation's HUD layer (fsr3-fg.cpp, RecordHudSplit): the game's final image (F, its HUD composited) and
+// the same draw without the HUD texture (H), both at the game's output size. The HUD is where they differ; the layer
+// holds F there (premultiplied by its coverage), transparent elsewhere, at the backbuffer's size. FSR 3 interpolates
+// the backbuffer holding H (no HUD) and composites this layer over every frame shown, real or generated: the HUD and
+// its texts are never interpolated.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D final_image;   // F
+layout(binding = 1) uniform sampler2D hudless_image; // H
+layout(binding = 2, rgba16f) uniform writeonly image2D hud_layer;
+
+layout(push_constant) uniform Push {
+	ivec2 region_offset; // the game image's place in the backbuffer (the presenter's blit)
+	ivec2 region_size;
+	float threshold;     // a difference above it (any channel) is HUD
+	int   radius;        // in source pixels: the HUD's edges widened by it
+} push;
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size  = imageSize(hud_layer);
+	if (pixel.x >= size.x || pixel.y >= size.y) return;
+	ivec2 local = pixel - push.region_offset;
+	if (local.x < 0 || local.y < 0 || local.x >= push.region_size.x || local.y >= push.region_size.y) {
+		imageStore(hud_layer, pixel, vec4(0.0));
+		return;
+	}
+	vec2  uv     = (vec2(local) + 0.5) / vec2(push.region_size);
+	ivec2 source = textureSize(final_image, 0);
+	ivec2 center = ivec2(uv * vec2(source));
+	float       difference = 0.0;
+	for (int dy = -push.radius; dy <= push.radius; ++dy) {
+		for (int dx = -push.radius; dx <= push.radius; ++dx) {
+			ivec2 at = clamp(center + ivec2(dx, dy), ivec2(0), source - 1);
+			vec3  d  = abs(texelFetch(final_image, at, 0).rgb - texelFetch(hudless_image, at, 0).rgb);
+			difference     = max(difference, max(d.r, max(d.g, d.b)));
+		}
+	}
+	float coverage = smoothstep(push.threshold, push.threshold * 2.0, difference);
+	vec3  color    = textureLod(final_image, uv, 0.0).rgb;
+	imageStore(hud_layer, pixel, vec4(color * coverage, coverage));
+}

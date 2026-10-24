@@ -20,6 +20,10 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/frameGeneration.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "local/fg-discover.h"
+#include "local/frame-gen.h"
+#include "local/title-state.h"
+#include "local/fsr3-fg.h"
 
 #include <algorithm>
 #include <array>
@@ -52,6 +56,10 @@ struct Presenter::Frame {
 	vk::ImageView mips_view    = nullptr;
 	uint64_t      present_tick = 0;
 	bool          busy         = false;
+	// bruno-astro-1025: frame generation's inputs for this frame (src/local/frame-gen.h: DLSS-G, FSR 3 frame
+	// generation), copied at the guest flip; `scene`: the guest frame was the game's view (FrameGen::TakeScene).
+	FrameGen::FrameInputs fg;
+	bool                  scene = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -66,6 +74,7 @@ public:
 	~FramePool() {
 		m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
 		for (auto& frame: m_frames) {
+			FrameGen::DestroyInputs(m_window.graphic_ctx, frame->fg);
 			m_window.graphic_ctx.device.destroyImageView(frame->view, nullptr);
 			m_window.graphic_ctx.device.destroyImageView(frame->mips_view, nullptr);
 			if (frame->image.image != nullptr) {
@@ -706,6 +715,9 @@ public:
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
 	[[nodiscard]] vk::Extent2D Extent() const noexcept { return m_extent; }
+	// bruno-astro-1025 (KYTY_FSR3_FG): the swapchain is the FidelityFX frame generation swapchain.
+	[[nodiscard]] bool             IsFsr3() const noexcept { return m_fsr3; }
+	[[nodiscard]] vk::SwapchainKHR Handle() const noexcept { return m_handle; }
 
 private:
 	void Destroy();
@@ -730,6 +742,7 @@ private:
 	PresentFsr                     m_fsr;
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
+	bool                           m_fsr3                = false;
 };
 
 struct Presenter::Impl {
@@ -739,7 +752,9 @@ struct Presenter::Impl {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
-		if (Config::FrameGenerationEnabled()) {
+		// (bruno-astro-1025: brunoKytyPs5's own FSR 3 interpolation stays off while the todojuegos67-bot frame
+		// generation is asked for: DLSS-G (KYTY_FRAMEGEN) or the FSR 3 frame generation swapchain (KYTY_FSR3_FG).)
+		if (Config::FrameGenerationEnabled() && !FrameGen::Requested() && !Fsr3::Requested()) {
 			frame_generation = std::make_unique<FrameGeneration>(owner.graphic_ctx);
 			held_thread      = std::jthread([this](std::stop_token stop) { HeldThread(stop); });
 		}
@@ -760,7 +775,7 @@ struct Presenter::Impl {
 		frames.SetFormat(swapchain.Format());
 	}
 
-	Image& ResolveSurface(const ImageInfo& info) {
+	Image& ResolveSurface(const ImageInfo& info, ImageId* id_out = nullptr) {
 		TextureCache::ImageDesc desc {};
 		desc.info                  = info;
 		desc.view_info.format      = info.pixel_format;
@@ -778,6 +793,9 @@ struct Presenter::Impl {
 		auto&      image      = cache.GetImage(image_id);
 		image.usage.video_out = true;
 		cache.UpdateImage(image_id);
+		if (id_out != nullptr) {
+			*id_out = image_id;
+		}
 		return image;
 	}
 	// new_frame is false when the last frame is shown again (the title counts only new ones).
@@ -907,13 +925,25 @@ void Swapchain::Create() {
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
 	create_info.clipped = VK_TRUE;
-	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
-	                     "vkCreateSwapchainKHR");
+	// bruno-astro-1025 (KYTY_FSR3_FG): the FidelityFX frame generation swapchain in place of the driver's (false:
+	// not asked for, or not made: the driver's).
+	m_fsr3 = Fsr3::CreateSwapchain(graphics, create_info, &m_handle);
+	if (!m_fsr3) {
+		RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
+		                     "vkCreateSwapchainKHR");
+	}
 	EXIT_IF(m_handle == nullptr);
+	if (FrameGen::Requested() || m_fsr3) {
+		std::printf("Swapchain: %ux%u, present mode %d, %u images%s\n", m_extent.width, m_extent.height,
+		            static_cast<int>(create_info.presentMode), image_count,
+		            m_fsr3 ? " (FSR 3 frame generation)" : " (DLSS-G through Streamline)");
+		std::fflush(stdout);
+	}
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
-		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
+		    return m_fsr3 ? Fsr3::GetSwapchainImages(graphics, m_handle, count, images)
+		                  : graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
 
@@ -996,8 +1026,13 @@ void Swapchain::Destroy() {
 		}
 	}
 	if (m_handle != nullptr) {
-		graphics.device.destroySwapchainKHR(m_handle, nullptr);
+		if (m_fsr3) {
+			Fsr3::DestroySwapchain(graphics, m_handle);
+		} else {
+			graphics.device.destroySwapchainKHR(m_handle, nullptr);
+		}
 	}
+	m_fsr3 = false;
 
 	m_handle        = nullptr;
 	m_format        = vk::Format::eUndefined;
@@ -1012,6 +1047,9 @@ void Swapchain::Destroy() {
 }
 
 void Swapchain::Recreate(bool surface_lost) {
+	if (FrameGen::Enabled()) {
+		FrameGen::SwapchainChanging();
+	}
 	Destroy();
 	if (surface_lost) {
 #if defined(__APPLE__)
@@ -1036,9 +1074,12 @@ bool Swapchain::NeedsResize() const {
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
+	const auto result =
+	    m_fsr3 ? Fsr3::AcquireNextImage(m_window.graphic_ctx, m_handle, m_image_acquired[m_frame_index],
+	                                    &m_image_index)
+	           : m_window.graphic_ctx.device.acquireNextImageKHR(
+	                 m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index],
+	                 nullptr, &m_image_index);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -1317,7 +1358,11 @@ Swapchain::Status Swapchain::Present() {
 	present.waitSemaphoreCount = 1;
 
 	vk::Result result;
-	{
+	if (m_fsr3) {
+		// The frame generation swapchain queues it (its threads pace and present; its submissions take the
+		// graphics queue's lock themselves, Fsr3::GameQueueSubmit).
+		result = Fsr3::QueuePresent(m_window.graphic_ctx, present);
+	} else {
 		DrainStats::ReasonScope reason(DrainStats::Reason::PresentFrame);
 		DrainStats::WaitTimer   held(DrainStats::Kind::Submit);
 		Common::LockGuard       lock(m_window.graphic_ctx.queue_mutex);
@@ -1559,13 +1604,25 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-	auto&             image = m_impl->ResolveSurface(info);
+	ImageId           image_id;
+	auto&             image = m_impl->ResolveSurface(info, &image_id);
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	// bruno-astro-1025: frame generation's inputs, in the guest frame's command buffer (a title whose passes are not
+	// named: zero motion vectors and a far depth at the flip image's size, FrameGen::GenericInputs).
+	FgDiscover::OnFlip(image.info.data.address, image.backing.extent.width, image.backing.extent.height,
+	                   static_cast<uint32_t>(image.backing.format), VideoOut::PlayerButtonSeen());
+	frame->scene    = FrameGen::TakeScene();
+	frame->fg.valid = false;
+	if (FrameGen::Capturing()) {
+		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(), buffer,
+		                        frame->fg, image_id, image);
+	}
+	FrameGen::ReflexGuestFlip(frame->fg);
 	if (auto* watch = FrameWatch::Get()) [[unlikely]] {
 		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
 		               vk::AccessFlagBits2::eTransferRead);
@@ -1750,7 +1807,8 @@ bool Presenter::Impl::PresentOnce(bool new_frame, float generate_ms) {
 	if (swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
-	bool generated = false;
+	bool                   generated = false;
+	FrameGen::FrameInputs* fg_inputs = nullptr;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
@@ -1784,6 +1842,17 @@ bool Presenter::Impl::PresentOnce(bool new_frame, float generate_ms) {
 			generated = generated_image != nullptr;
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay, generated_image);
+			// bruno-astro-1025: this present's frame generation inputs (a new frame of the game's only: an
+			// idle refresh of the last frame, a menu or a movie has none; generation is off for it).
+			fg_inputs = nullptr;
+			if (new_frame && layers[0].frame != nullptr && layers[0].frame->fg.valid &&
+			    (FrameGen::Enabled() || swapchain.IsFsr3())) {
+				fg_inputs = &layers[0].frame->fg;
+			}
+			if (FrameGen::Enabled() && fg_inputs != nullptr) {
+				FrameGen::ScaleHudless(window.graphic_ctx, command.Handle(), *fg_inputs, swapchain.Extent(),
+				                       vk::Rect2D {{0, 0}, swapchain.Extent()}, swapchain.Format());
+			}
 			const auto tick = swapchain.Submit(present_scheduler);
 			for (const auto& layer: layers) {
 				if (layer.frame != nullptr) {
@@ -1791,7 +1860,22 @@ bool Presenter::Impl::PresentOnce(bool new_frame, float generate_ms) {
 				}
 			}
 		}
+		// KYTY_FRAMEGEN: Streamline takes the present (vkQueuePresentKHR is its hook) and adds the generated
+		// frames; KYTY_FSR3_FG: the frame generation swapchain gets this frame's inputs.
+		const bool generate = FrameGen::Enabled();
+		if (generate) {
+			FrameGen::SetPresentReflexIndex(fg_inputs != nullptr ? fg_inputs->reflex_index : 0u);
+			FrameGen::BeforePresent(fg_inputs, swapchain.Extent(), vk::Rect2D {{0, 0}, swapchain.Extent()},
+			                        swapchain.Format(), swapchain.ImageCount());
+		}
+		if (swapchain.IsFsr3()) {
+			Fsr3::BeforePresent(window.graphic_ctx, fg_inputs, swapchain.Handle(), swapchain.Extent(),
+			                    swapchain.Format());
+		}
 		status = swapchain.Present();
+		if (generate) {
+			FrameGen::AfterPresent();
+		}
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
