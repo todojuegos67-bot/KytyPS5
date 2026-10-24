@@ -1505,6 +1505,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 		}
 		request->state      = RequestState::Ready;
 		request->ready_time = std::chrono::steady_clock::now();
+		Graphics::AntiLag::OnFlipReady(request->latency_index); // KYTY_LOWLAT pacing / [lat] stages
 		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
 		return;
@@ -1786,6 +1787,7 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	r.cfg->mutex.Unlock();
 
 	NoteFlipSubmitted(r.submit_time);
+	Graphics::AntiLag::OnFlipReleased(r.latency_index); // KYTY_LOWLAT pacing / [lat] stages
 	Graphics::Presenter::SetLatencyIndex(*r.frame, r.latency_index);
 	m_presenter.Submit(*r.frame);
 

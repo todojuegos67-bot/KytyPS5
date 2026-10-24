@@ -40,6 +40,12 @@ void                   AfterPresent(uint64_t frame_index);
 void OnInput();
 // A guest flip reserved: the frame's index (0: none).
 [[nodiscard]] uint64_t OnFlipReserved();
+// The flip's GPU work done (FlipQueue::Complete) / the flip released to the presenter (FlipQueue::Flip): stage stamps
+// for KYTY_LOWLAT_PACE_BEFORE_INPUT (default on with KYTY_LOWLAT=1: the game's thread sleeps at its controller read
+// until the latest moment its frame is still ready for its release slot, so frames no longer queue behind the cap)
+// and the [lat] stages line.
+void OnFlipReady(uint64_t frame_index);
+void OnFlipReleased(uint64_t frame_index);
 // Right before the frame's present (a new frame, not a repeat): its PRESENT mark.
 void OnPresent(uint64_t frame_index);
 
