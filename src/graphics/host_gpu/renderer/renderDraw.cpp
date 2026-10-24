@@ -1,5 +1,6 @@
 #include "local/skip-shader.h"
 #include "local/sync-stats.h"
+#include "local/hw-rt.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "live-trace-gpu.h"
 
@@ -1699,12 +1700,45 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
-	auto& pipeline = async_pipeline != nullptr
+	auto& base_pipeline = async_pipeline != nullptr
 	                     ? *async_pipeline
 	                     : m_context.GetPipelineCache().CreateGraphicsPipeline(
 	                           std::span {state.color_info, state.color_count}, state.depth_info,
 	                           state.vs_input_info, buffer, state.ps_active ? &state.ps_input_info : nullptr,
 	                           topology, primitive_restart_enable, state.programs.vertex, state.programs.pixel);
+	// KYTY_RT_SHADOWS_HW=1 (local/hw-rt.h): a sun shadow-map draw (depth only, into a square layered >= 512 px target)
+	// takes its vertex shader's capturing variant: gl_Position stored for the ray tracing acceleration structure.
+	PipelineCache::Pipeline* hwrt_pipeline = nullptr;
+	uint32_t                 hwrt_cursor   = 0;
+	if (HwRt::CaptureWanted() && !mesh_active && emit.gpu_args == 0 && emit.direct_run.empty() && draw.instance_count == 1 &&
+	    topology == vk::PrimitiveTopology::eTriangleList && !primitive_restart_enable && state.color_count == 0 &&
+	    state.depth_info.image_id && state.vs_input_info.stage.program != nullptr) {
+		const auto& info = state.depth_info.desc.info;
+		const bool shadow_target = info.resources.layers >= 4 && info.extent.width == info.extent.height && info.extent.width >= 512;
+		if (shadow_target) HwRt::NoteShadowVs(state.vs_input_info.stage.program->shader_hash);
+		if (shadow_target &&
+		    (!emit.indexed || index_source.host_data != nullptr || index_source.address != 0)) {
+			const auto module = HwRt::CaptureModule(m_context.GetGraphics(), state.programs.vertex.module);
+			if (module) {
+				const void*    indices = !emit.indexed ? nullptr
+				                         : index_source.host_data != nullptr ? index_source.host_data
+				                                                             : reinterpret_cast<const void*>(index_source.address);
+				const uint32_t element = index_source.host_data != nullptr ? 2u : index_source.guest_element_size;
+				if (!emit.indexed || element == 2 || element == 4) {
+					const ShaderProgram variant {HwRt::VariantId(state.programs.vertex.id), module};
+					auto& made = m_context.GetPipelineCache().CreateGraphicsPipeline(
+					    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
+					    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable, variant,
+					    state.programs.pixel);
+					if (made.pipeline_layout == base_pipeline.pipeline_layout &&
+					    HwRt::PrepareDraw(m_context.GetGraphics(), state.vs_input_info.stage.resources.flattened_srt, indices, element,
+					                      draw.index_count, emit.vertex_offset, emit.first_vertex, &hwrt_cursor))
+						hwrt_pipeline = &made;
+				}
+			}
+		}
+	}
+	auto& pipeline = hwrt_pipeline != nullptr ? *hwrt_pipeline : base_pipeline;
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1734,6 +1768,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	     primitive == Prospero::PrimitiveType::kRectList);
 #endif
 	if (flip_slot >= 0) record_draw = false;
+	if (hwrt_pipeline != nullptr) record_draw = false; // (KYTY_RT_SHADOWS_HW: the capture's cursor is set just before it)
 	// Upscaling (KYTY_UPSCALE): the game's 3D image upscaled before the composite's descriptors are written.
 	if (flip_slot >= 0 && bindings.pixel.has_value())
 		FrameGen::UpscaleComposite(buffer, rendering, std::span<TextureBinding> {bindings.pixel->images});
@@ -1813,6 +1848,11 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (flip_slot >= 0) {
 		FrameGen::BeforeFlipDraw(buffer, rendering, state.color_info[flip_slot].image_id, static_cast<uint32_t>(flip_slot),
 		                         std::span<const TextureBinding> {bindings.pixel->images}, emit_draw);
+	}
+	if (hwrt_pipeline != nullptr) {
+		// (KYTY_RT_SHADOWS_HW: the capture's cursor, set outside rendering.)
+		m_context.GetCommandScheduler().EndRendering();
+		HwRt::RecordCursor(vk_buffer, hwrt_cursor);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	if (!record_draw) {

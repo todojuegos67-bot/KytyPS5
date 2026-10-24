@@ -3205,6 +3205,9 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	if (upload.Handle() != record.upload) {
 		return false;
 	}
+	// KYTY_RT_SHADOWS_HW: the sun shadow-map draws go the normal way, where their geometry is captured.
+	if (record.stage_count > 0 && record.stages[0].program != nullptr && HwRt::IsShadowVs(record.stages[0].program->shader_hash))
+		return false;
 	// Constants into the ring; dynamic offsets follow binding order (vertex
 	// flattened SRT, vertex shader data, pixel ...), as the bindings are numbered.
 	const auto& limits    = m_context.GetGraphics().physical_device_properties.limits;

@@ -470,6 +470,20 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${cshadow_header}")
+# KYTY_RT_SHADOWS_HW: the same pass with hardware ray queries (src/local/hw-rt.cpp).
+set(cshadow_rt_spv "${gpu_tiler_generated_dir}/cshadow_rt.spv")
+set(cshadow_rt_header "${gpu_tiler_generated_dir}/cshadow_rt_spv.h")
+add_custom_command(
+	OUTPUT "${cshadow_rt_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_HW_RT
+	        -o "${cshadow_rt_spv}" "${cshadow_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${cshadow_rt_spv} -DOUTPUT=${cshadow_rt_header}
+	        -DSYMBOL=CSHADOW_RT_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${cshadow_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${cshadow_rt_header}")
 
 # FSR 3 frame generation's HUD layer (src/local/fsr3-fg.cpp).
 set(hud_split_source "${KYTY_SOURCE_DIR}/local/hud-split.comp")
@@ -552,6 +566,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.h"
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.cpp"
+	"${KYTY_SOURCE_DIR}/local/hw-rt.h"
+	"${KYTY_SOURCE_DIR}/local/hw-rt.cpp"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.cpp"
 	"${KYTY_SOURCE_DIR}/local/kbm-warp.h"

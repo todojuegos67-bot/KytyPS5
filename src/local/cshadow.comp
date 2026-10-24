@@ -1,4 +1,7 @@
-#version 450
+#version 460
+#ifdef KYTY_HW_RT
+#extension GL_EXT_ray_query : require
+#endif
 // KYTY_RT_SHADOWS (frame-gen.cpp, "Sombras RT"; KYTY_CONTACT_SHADOWS is the old name): screen-space ray-traced sun
 // shadows on the PS5 Pro path's render-resolution HDR color (linear, before the game's exposure, the upscaler and
 // its TAA). Short rays from each pixel toward the sun, marched against the game's depth buffer (Bend Studio style:
@@ -22,6 +25,11 @@
 // Statistics (misc.w bit 3, composite): pixels with occlusion (fade * stable * (1 - vis)) > 0.1, their occlusion * 256
 // and depth * 2 (m), summed.
 layout(local_size_x = 8, local_size_y = 8) in;
+#ifdef KYTY_HW_RT
+// KYTY_RT_SHADOWS_HW=1 (local/hw-rt.cpp): the sun shadow-map draws' own triangles in the camera's view space (one BLAS
+// a frame, one TLAS instance). Trace: a ray query per pixel toward the jittered sun (misc.w bit 4 set), up to tune.y m.
+layout(binding = 12) uniform accelerationStructureEXT tlas;
+#endif
 
 layout(binding = 0) uniform sampler2D color_tex;
 layout(binding = 1) uniform sampler2D depth_tex;
@@ -179,7 +187,27 @@ void Trace(ivec2 pixel) {
 	vec3  b2  = cross(l, b1);
 	float ang = 6.2831853 * u2, rad = 0.05 * sqrt(u1);
 	vec3  lj  = normalize(l + (b1 * cos(ang) + b2 * sin(ang)) * rad);
+#ifdef KYTY_HW_RT
+	float occ = 0.0;
+	if ((push.misc.w & 16) != 0) {
+		// Hardware: the occluders are the shadow pass's triangles, on screen or not, at any distance up to tune.y. The
+		// start is offset along the normal and the ray begins a little out (shadow LODs are coarser than what is seen:
+		// no self-shadowing on the receiver's own, simpler mesh).
+		float off = 0.02 + 0.004 * z;
+		vec3  o   = p + n * off;
+		float tn  = off * 2.0 / max(ndl, 0.15);
+		if (w > 0.0) {
+			rayQueryEXT rq;
+			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF, o, tn, lj, push.tune.y);
+			while (rayQueryProceedEXT(rq)) {}
+			occ = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT ? w : 0.0;
+		}
+	} else {
+		occ = w > 0.0 ? March(p, n, lj, ndl, pixel) * w : 0.0;
+	}
+#else
 	float occ = w > 0.0 ? March(p, n, lj, ndl, pixel) * w : 0.0;
+#endif
 	float v   = 1.0 - occ;
 	imageStore(out_img, pixel, vec4(isnan(v) ? 1.0 : clamp(v, 0.0, 1.0)));
 }

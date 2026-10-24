@@ -27,6 +27,8 @@
 #include "gpu_tiler_shaders/ssr_spv.h"
 #include "local/rt-reflections.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
+#include "gpu_tiler_shaders/cshadow_rt_spv.h"
+#include "local/hw-rt.h"
 #include "kernel/memory.h"
 #include <string>
 #endif
@@ -5899,6 +5901,11 @@ struct CShadowPass {
 	vk::Pipeline            pipeline   = nullptr;
 	bool                    failed     = false;
 	vk::Extent2D            render {}, trace {};
+	// KYTY_RT_SHADOWS_HW: the trace with ray queries (cshadow.comp with KYTY_HW_RT; binding 12 the TLAS).
+	vk::DescriptorSetLayout rt_set_layout = nullptr;
+	vk::PipelineLayout      rt_layout     = nullptr;
+	vk::Pipeline            rt_pipeline   = nullptr;
+	bool                    rt_failed     = false;
 	SsgiImage               raw, tmp_a, tmp_b, out;
 	SsgiImage               history[2], gbuf[2];
 	SsgiImage               moments[2], var_a, var_b;
@@ -6300,6 +6307,48 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		g_cs.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
 		g_cs.failed    = false;
 	}
+	if (g_cs.rt_pipeline == nullptr && !g_cs.rt_failed && HwRt::CaptureWanted()) {
+		g_cs.rt_failed = true;
+		std::array<vk::DescriptorSetLayoutBinding, 13> bindings {};
+		for (uint32_t i = 0; i < 13; ++i) {
+			bindings[i].binding         = i;
+			bindings[i].descriptorType  = i == 12   ? vk::DescriptorType::eAccelerationStructureKHR
+			                              : i == 11 ? vk::DescriptorType::eStorageBuffer
+			                              : i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler
+			                                                : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorCount = 1;
+			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+		}
+		vk::DescriptorSetLayoutCreateInfo set_info {};
+		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+		set_info.pBindings    = bindings.data();
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(CShadowPush)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = 1;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push;
+		vk::ShaderModuleCreateInfo module_info {};
+		module_info.codeSize    = sizeof(CSHADOW_RT_SPV);
+		module_info.pCode       = CSHADOW_RT_SPV;
+		vk::ShaderModule module = nullptr;
+		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_cs.rt_set_layout) == vk::Result::eSuccess &&
+		    (layout_info.pSetLayouts = &g_cs.rt_set_layout,
+		     device.createPipelineLayout(&layout_info, nullptr, &g_cs.rt_layout) == vk::Result::eSuccess) &&
+		    device.createShaderModule(&module_info, nullptr, &module) == vk::Result::eSuccess) {
+			vk::ComputePipelineCreateInfo pipeline_info {};
+			pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+			pipeline_info.stage.module = module;
+			pipeline_info.stage.pName  = "main";
+			pipeline_info.layout       = g_cs.rt_layout;
+			if (device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_cs.rt_pipeline) != vk::Result::eSuccess)
+				g_cs.rt_pipeline = nullptr;
+			device.destroyShaderModule(module, nullptr);
+		}
+		g_cs.rt_failed = g_cs.rt_pipeline == nullptr;
+		std::printf("RTSHADOW HW: ray query trace pipeline %s\n", g_cs.rt_failed ? "could not be made: screen-space only" : "ready");
+		std::fflush(stdout);
+	}
 	if (g_cs.out.image.image != nullptr && g_cs.render == render && g_cs.quality == quality) return true;
 	device.waitIdle();
 	SsgiImage* all[] {&g_cs.raw, &g_cs.tmp_a, &g_cs.tmp_b, &g_cs.out, &g_cs.history[0], &g_cs.history[1], &g_cs.gbuf[0],
@@ -6366,6 +6415,7 @@ void CShadowTakeStats() {
 	if (now - g_cs.last_log < std::chrono::seconds(10)) return;
 	if (g_cs.st_samples > 0 || g_cs.samples > 0) {
 		const double n = g_cs.st_n, px = std::max(g_cs.st_pixels, 1.0);
+		HwRt::NoteShadowed(100.0 * n / px);
 		std::printf("RTSHADOW: stats: %.1f %% of pixels shadowed (occlusion > 0.1), mean occlusion %.3f (%.3f on those), their "
 		            "mean depth %.1f m; sun lit/ambient K %.2f -> overcast factor %.2f; GPU %.3f ms (%u samples, %u frames)\n",
 		            100.0 * n / px, g_cs.st_occ / px, n > 0.0 ? g_cs.st_occ / n : 0.0, n > 0.0 ? g_cs.st_depth / n : 0.0,
@@ -6641,6 +6691,30 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	const int space = forced_space != 0 ? forced_space : g_cs.space != 0 ? g_cs.space : source == 2 ? 1 : 0;
 
+	// KYTY_RT_SHADOWS_HW: this frame's captured shadow-map triangles into the acceleration structure, in the view space the
+	// trace reconstructs (view = P^-1 * view_proj; the light matrices' input taken as world unless it is the view's).
+	vk::AccelerationStructureKHR tlas = nullptr;
+	if (g_cs.rt_pipeline != nullptr) {
+		std::array<double, 12> w2v {};
+		std::array<float, 16>  pc {};
+		for (int i = 0; i < 4; ++i)
+			for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
+		std::array<double, 16> pinv {};
+		bool ok = Inverse4(pc, pinv);
+		if (space == 2) {
+			w2v = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+		} else {
+			for (int i = 0; i < 3 && ok; ++i)
+				for (int j = 0; j < 4; ++j) {
+					double d = 0.0;
+					for (int k = 0; k < 4; ++k) d += pinv[i * 4 + k] * vp[k * 4 + j];
+					w2v[i * 4 + j] = d;
+					ok = ok && std::isfinite(d);
+				}
+		}
+		if (ok) tlas = HwRt::Build(*g_graphics_ctx, command, w2v);
+	}
+
 	// The calibration (world up, the screen's y convention): every frame until decided, then every 16th.
 	const uint32_t slot = g_cs.frame % 4;
 	CShadowTakeCalib(slot);
@@ -6664,6 +6738,13 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.cand[3][0] = quality >= 3 ? 400.0f : quality >= 2 ? 280.0f : 160.0f; // (screen cap, px at 1440p; 10-24: longer)
 	push.cand[3][1] = 1.0f;
 	push.cand[3][2] = fade_m, push.cand[3][3] = fade_m * 2.0f;
+	if (tlas) {
+		// (Hardware rays: no screen-space limits; the shadows reach KYTY_RT_SHADOWS_HW_FADE (150 m), rays
+		// KYTY_RT_SHADOWS_HW_LENGTH (250 m).)
+		const float hw_fade = std::max(RtShadowEnv("KYTY_RT_SHADOWS_HW_FADE", nullptr, 150.0f, 1000.0f), 2.0f);
+		push.cand[3][2] = hw_fade, push.cand[3][3] = hw_fade * 1.5f;
+		push.tune[1]    = std::max(RtShadowEnv("KYTY_RT_SHADOWS_HW_LENGTH", nullptr, 250.0f, 2000.0f), 1.0f);
+	}
 
 	CShadowReadTiming();
 	CShadowTakeStats();
@@ -6725,9 +6806,31 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 		push.misc[0]  = mode;
 		push.extra[0] = step;
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_cs.layout, 0, 12, writes);
-		command.pushConstants(g_cs.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+		if (mode == 0 && tlas) {
+			// (KYTY_RT_SHADOWS_HW: the trace with ray queries; the rest of the passes as before.)
+			vk::WriteDescriptorSetAccelerationStructureKHR as_write {};
+			as_write.accelerationStructureCount = 1;
+			as_write.pAccelerationStructures    = &tlas;
+			vk::WriteDescriptorSet all_writes[13] {};
+			for (uint32_t i = 0; i < 12; ++i) all_writes[i] = writes[i];
+			all_writes[12].dstBinding      = 12;
+			all_writes[12].descriptorCount = 1;
+			all_writes[12].descriptorType  = vk::DescriptorType::eAccelerationStructureKHR;
+			all_writes[12].pNext           = &as_write;
+			CShadowPush rt_push = push;
+			rt_push.misc[3] |= 16;
+			command.bindPipeline(vk::PipelineBindPoint::eCompute, g_cs.rt_pipeline);
+			command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_cs.rt_layout, 0, 13, all_writes);
+			command.pushConstants(g_cs.rt_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(rt_push), &rt_push);
+			HwRt::TraceBegin(command);
+			command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+			HwRt::TraceEnd(command);
+			command.bindPipeline(vk::PipelineBindPoint::eCompute, g_cs.pipeline);
+		} else {
+			command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_cs.layout, 0, 12, writes);
+			command.pushConstants(g_cs.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+			command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+		}
 		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	};

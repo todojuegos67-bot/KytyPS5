@@ -558,6 +558,9 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	if (FrameGen::Enabled() && pair.programs[0] != nullptr &&
 	    FrameGen::IsGbufferVertexShader(pair.programs[0]->shader_hash) && (Role() != 0 || FrameGen::WantsCamera()))
 		return Spec::Refuse("table: frame generation camera"), TableResult::Native;
+	// KYTY_RT_SHADOWS_HW: the sun shadow-map draws go the normal way, where their geometry is captured.
+	if (pair.programs[0] != nullptr && HwRt::IsShadowVs(pair.programs[0]->shader_hash))
+		return Spec::Refuse("table: hardware RT capture"), TableResult::Native;
 	// A store at most once a frame per pair and draw state, within the frame's budget (kyty_local_table_store_budget):
 	// while its programs and pipeline compile, the pair's draws take the normal path (Deferred). (Once a frame per pair
 	// kept its other states' draws on the native path, storing native records, until a later frame.) Those draws
