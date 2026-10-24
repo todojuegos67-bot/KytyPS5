@@ -6754,8 +6754,8 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
 	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
 	push.trace[0] = static_cast<float>(g_cs.trace.width), push.trace[1] = static_cast<float>(g_cs.trace.height);
-	const float strength = RtShadowEnv("KYTY_RT_SHADOWS_STRENGTH", "KYTY_CONTACT_SHADOWS_STRENGTH", 0.75f, 1.0f) /* (10-24 r3: 0.6 looked thin) */;
-	const float length   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_LENGTH", "KYTY_CONTACT_SHADOWS_LENGTH", 3.0f, 10.0f), 0.25f); // (10-24) 3 m (1 m was too short)
+	const float strength = RtShadowEnv("KYTY_RT_SHADOWS_STRENGTH", "KYTY_CONTACT_SHADOWS_STRENGTH", 0.5f, 1.0f) /* (10-24 r3: 0.6 looked thin) */;
+	const float length   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_LENGTH", "KYTY_CONTACT_SHADOWS_LENGTH", 1.5f, 10.0f), 0.25f); // (rtsart: 1.5 m: contact shadows; long rays only doubled the game's) // (10-24) 3 m (1 m was too short)
 	const float fade_m   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_FADE", nullptr, 100.0f, 600.0f), 2.0f); // (10-24) 100-200 m by default; far (dist-1023): up to 600
 	push.trace[2] = strength, push.trace[3] = length;
 	for (int k = 0; k < 3; ++k) {

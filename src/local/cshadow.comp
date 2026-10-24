@@ -123,27 +123,49 @@ float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 	// (10-24 far) plus ~2 pixels' footprint far away (0 m at 50 m, ~0.4 m at 300 m): the depth buffer's own steps,
 	// not a fixed metre that let rays pass behind cliffs; the bias adds a slope term (half a pixel, more when grazing).
 	float foot  = 1.0 / px_m;
-	float thick = (clamp(0.2 + 0.006 * z, 0.2, 0.45) + farx * 1.5 * foot) * push.cand[3].y;
-	float bias  = 0.0015 * z + 0.002 + farx * foot * mix(0.5, 1.5, 1.0 - ndl);
+	// (rtsart 10-24: a narrower band; rays that dip far behind a depth step (a pillar's edge, a foreground body)
+	// are not occluded by it, and an occluder must be confirmed by two consecutive samples.)
+	float thick = (clamp(0.12 + 0.004 * z, 0.12, 0.3) + farx * 1.0 * foot) * push.cand[3].y;
+	float bias  = 0.004 * z + 0.01 + farx * foot * mix(0.5, 1.5, 1.0 - ndl);
 	// The occluder must stand clear of the receiver's own plane: a ray over a low-poly surface (a cliff's flat facets
 	// in the depth buffer, smooth in the game's shading) hits the next facet of a crease within decimetres. The
 	// height of the ray over that plane is t * N.L: a least distance, a few cm near, ~0.25 m at 50 m.
-	float t_min = (0.015 + 0.004 * z) / max(ndl, 0.1);
+	float t_min = (0.04 + 0.008 * z) / max(ndl, 0.3);
 	float jit   = Ign(vec2(pixel) + float(push.misc.y % 64) * 5.588238);
-	vec3  o     = p + n * (0.002 * z + 0.003);
+	vec3  o     = p + n * (0.006 * z + 0.02); // (normal bias: no self-hits at grazing angles)
 	// The first sample one pixel out (no self-hit on the start texel).
 	float t0    = 1.0 / px_m;
 	if (t0 >= len) return 0.0;
+	int hits = 0;
 	for (int s = 0; s < steps; ++s) {
 		float k  = (float(s) + jit) / float(steps);
 		float t  = t0 + (len - t0) * k * k; // denser near the surface: contact detail
 		vec3  qp = o + l * t;
 		vec3  pr = Project(qp);
-		if (any(lessThan(pr.xy, vec2(0))) || any(greaterThan(pr.xy, vec2(1)))) break;
+		// Off screen or near the edge: unknown, never an occluder (fail safe: no shadow).
+		if (any(lessThan(pr.xy, vec2(0.01))) || any(greaterThan(pr.xy, vec2(0.99)))) break;
 		float sd = textureLod(depth_tex, pr.xy, 0).r;
-		if (IsSky(sd)) continue;
-		float delta = abs(qp.z) - abs(ViewZ(sd)); // > 0: the ray point is behind the depth surface there
-		if (delta > bias && delta < thick && t > t_min) {
+		if (IsSky(sd)) { hits = 0; continue; }
+		float oz    = abs(ViewZ(sd));
+		float delta = abs(qp.z) - oz; // > 0: the ray point is behind the depth surface there
+		// A ray far behind a depth step has left the occluder's volume: stop (a foreground object, not a caster).
+		if (delta > 4.0 * thick) break;
+		bool cand = delta > bias && delta < thick && t > t_min;
+		if (cand) {
+			// The occluder must be solid: its depth-buffer neighbours agree (alpha-tested foliage, grass, ivy and
+			// silhouettes are noisy there and are no occluders).
+			vec2  rs = 1.5 / RenderSize();
+			float a0 = abs(ViewZ(textureLod(depth_tex, pr.xy + vec2(rs.x, 0), 0).r));
+			float a1 = abs(ViewZ(textureLod(depth_tex, pr.xy - vec2(rs.x, 0), 0).r));
+			float a2 = abs(ViewZ(textureLod(depth_tex, pr.xy + vec2(0, rs.y), 0).r));
+			float a3 = abs(ViewZ(textureLod(depth_tex, pr.xy - vec2(0, rs.y), 0).r));
+			float tol = 0.02 * oz + 0.05;
+			// A plane passes through: a0 - oz ~ oz - a1 (and y likewise); anything else is broken depth.
+			bool solid = abs(a0 + a1 - 2.0 * oz) < tol && abs(a2 + a3 - 2.0 * oz) < tol;
+			cand = solid;
+		}
+		hits = cand ? hits + 1 : 0;
+		if (hits >= 2) {
 			// Screen-edge and ray-end fades (no hard cut where the ray leaves what the screen knows), a softer hit
 			// near the thickness limit and near the least distance.
 			vec2  e    = min(pr.xy, 1.0 - pr.xy);
@@ -151,7 +173,9 @@ float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 			float end  = 1.0 - smoothstep(0.85, 1.0, k); // (10-24) only the last stretch (was 0.65: rays felt short)
 			float soft = 1.0 - smoothstep(0.5 * thick, thick, delta);
 			float near = smoothstep(t_min, 2.0 * t_min, t);
-			return edge * end * soft * near;
+			// Softer with the distance to the occluder: contact dark, longer ones faint.
+			float dist = mix(1.0, 0.35, clamp(t / len, 0.0, 1.0));
+			return edge * end * soft * near * dist;
 		}
 	}
 	return 0.0;
@@ -174,7 +198,15 @@ void Trace(ivec2 pixel) {
 	// Surfaces facing away get no direct sun: the game's own lighting has them dark already (nothing to add);
 	// grazing ones fade in (their depth-buffer self-hits are noise; far away the facets are coarse: a wider ramp).
 	float nw  = NearW(z);
-	float g0  = mix(0.2, 0.04, nw), g1 = mix(0.45, 0.22, nw);
+	float g0  = mix(0.3, 0.15, nw), g1 = mix(0.6, 0.4, nw); // (rtsart: walls at grazing angles to the sun: none)
+	{
+		// A receiver whose depth is not locally planar (foliage, grass, a silhouette) gets none (fail safe).
+		vec2  rs = 1.0 / RenderSize();
+		float a0 = abs(ViewZ(textureLod(depth_tex, uv + vec2(rs.x, 0), 0).r)), a1 = abs(ViewZ(textureLod(depth_tex, uv - vec2(rs.x, 0), 0).r));
+		float a2 = abs(ViewZ(textureLod(depth_tex, uv + vec2(0, rs.y), 0).r)), a3 = abs(ViewZ(textureLod(depth_tex, uv - vec2(0, rs.y), 0).r));
+		float tol = 0.01 * z + 0.03;
+		if (abs(a0 + a1 - 2.0 * z) > tol || abs(a2 + a3 - 2.0 * z) > tol) g0 = 2.0, g1 = 3.0;
+	}
 	float w   = smoothstep(g0, g1, ndl) * (1.0 - smoothstep(push.cand[3].w, push.cand[3].w * 1.2, z));
 	// The penumbra: each frame's ray a different direction within a ~3 degree cone around the sun (per-pixel IGN,
 	// rotated per frame); the temporal filter and the a-trous average them into a soft edge that widens with the
@@ -330,14 +362,17 @@ void Composite(ivec2 pixel, out float dark, out float zout) {
 		float sz = abs(ViewZ(texelFetch(depth_tex, sp, 0).r));
 		if (abs(sz - z) < 0.08 * z + 0.2) lref = max(lref, dot(texelFetch(color_tex, sp, 0).rgb, vec3(0.2126, 0.7152, 0.0722)));
 	}
-	float inv_k = clamp(push.tune.x, 0.0, 0.8);
+	// (rtsart: unknown sun strength: assume a strong one, so shadowed pixels read as shadowed.)
+	float inv_k = push.tune.x > 0.0 ? clamp(push.tune.x, 0.0, 0.8) : 0.5;
 	float rel   = lc / max(0.85 * lref, 1e-8);
 	// (10-24 r3: looser and never below 0.4: it suppressed too much, the shadows looked thin.)
-	float lit   = mix(0.4, 1.0, smoothstep(-0.05, 0.35, (rel - inv_k) / (1.0 - inv_k)));
+	// (rtsart 10-24: only where the game's own lighting shows sun; pixels it already shadows get nothing: no doubled
+	// shadows, no black interiors.)
+	float lit   = smoothstep(0.55, 0.9, (rel - inv_k) / (1.0 - inv_k));
 	// Generous near (x1.25), conservative far (x0.45); never darker than 0.25 of the input: no near-black patches.
-	float near  = mix(0.8, 1.3, 1.0 - smoothstep(6.0, 80.0, z)); // (10-24 r3: stronger at mid distance; was x0.45 from 40 m)
+	float near  = mix(0.6, 1.0, 1.0 - smoothstep(6.0, 60.0, z)); // (10-24 r3: stronger at mid distance; was x0.45 from 40 m)
 	// Multiply only, in the linear HDR input: factor in [1 - strength, 1]; never above the input (no lightening).
-	float factor = 1.0 - clamp(amt * near * stable * occ * lit, 0.0, 0.85);
+	float factor = 1.0 - clamp(amt * near * stable * occ * lit, 0.0, 0.5);
 	dark         = clamp(fade * stable * occ * lit, 0.0, 1.0); // (the statistics' occlusion: before the strength)
 	vec3  rgb    = min(col.rgb * factor, col.rgb);
 	if (any(isnan(rgb)) || any(isinf(rgb))) rgb = col.rgb;
