@@ -159,6 +159,7 @@ private:
 	std::mutex                 m_scratch_mutex;
 	std::vector<PooledScratch> m_scratch_pool;
 	uint64_t                   m_scratch_pool_bytes = 0;
+	int                        m_mem_guard_id       = 0; // MemGuard releaser: the pooled scratch goes when memory runs out
 	uint64_t                   m_scratch_pool_budget = 0; // ScratchPoolBudget, at most a 32nd of the GPU's memory budget
 	// Detile's reuse_scratch buffer (its capacity) and the tick it was taken in.
 	Result                     m_reused_scratch {};

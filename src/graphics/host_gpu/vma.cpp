@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "local/mem-guard.h"
 
 #include <array>
 #include <atomic>
@@ -30,6 +31,7 @@
 #include "live-counters.h"
 #include "local-platform.h"
 #include "soft-release.h"
+#include "ram-guard.h"
 
 #include <cstdio>
 #include "kytyGitVersion.h"
@@ -48,6 +50,8 @@ static const GraphicContext* g_report_context   = nullptr;
 static uint64_t g_image_pool_limit = 1024ull << 20;
 static std::mutex g_image_pool_mutex;
 static uint64_t   g_image_pool_bytes = 0;
+static int        g_image_pool_releaser = 0; // MemGuard's id
+static void       DestroyImagePool(VmaAllocator allocator);
 static void WriteVmaReport(const char* path) {
 	if (g_report_allocator == nullptr) return;
 	if (g_report_context != nullptr) g_report_context->LogVideoMemory("live");
@@ -227,6 +231,7 @@ bool GraphicContext::CreateAllocator() {
 	small_video_memory = GetTotalMemoryBudget(false) < (uint64_t {12} << 30u) || (small_env != nullptr && *small_env == '1');
 	LocalPlatform::StartWorkingSetTrim();
 	SoftRelease::Start();
+	RamGuard::Start();
 	LocalPlatform::KeepResident();
 	LocalPlatform::StartMemoryBreakdown();
 	// The game buffers' pool (graphicContext.h): VMA's device-local type for them, VMA's block sizes (dedicated memory
@@ -252,6 +257,17 @@ bool GraphicContext::CreateAllocator() {
 	g_report_context            = this;
 	LiveCounters::g_vma_report = WriteVmaReport;
 	g_image_pool_limit         = std::min<uint64_t>(LocalPlatform::LowMemVram() ? 256ull << 20 : 1024ull << 20, GetTotalMemoryBudget() / 32);
+	// Out of memory (MemGuard): the freed images kept for reuse go (made again when needed). A system-memory image's
+	// pages are commit on NVIDIA.
+	g_image_pool_releaser = MemGuard::RegisterReleaser("image reuse pool", [vma = allocator] {
+		uint64_t bytes = 0;
+		{
+			std::scoped_lock lock(g_image_pool_mutex);
+			bytes = g_image_pool_bytes;
+		}
+		DestroyImagePool(vma);
+		return bytes;
+	});
 	{
 		// The caches' video memory budget, in the run log with the build (to tell builds apart in a log).
 		uint64_t local = 0;
@@ -278,6 +294,8 @@ void GraphicContext::DestroyAllocator() {
 	g_report_allocator         = nullptr;
 	g_report_context           = nullptr;
 	FlushBufferReclaimer();
+	if (g_image_pool_releaser != 0) MemGuard::UnregisterReleaser(g_image_pool_releaser);
+	g_image_pool_releaser = 0;
 	DestroyImagePool(allocator);
 	if (game_buffer_pool != nullptr) {
 		// (Only empty: a buffer still alive frees its memory into it later.)
@@ -622,9 +640,15 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		if (!create()) {
 			alloc_info.requiredFlags  = 0;
 			alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-			const bool created        = create();
+			bool created              = create();
 			VmaAllocationInfo allocated {};
 			if (created) vmaGetAllocationInfo(allocator, image.allocation, &allocated);
+			// Refused even in system memory: one release pass (MemGuard: caches, pools, the heaps) and a last try.
+			if (!created && MemGuard::ShouldRetry("an image (vmaCreateImage)", 0, 0)) {
+				TrimImagePool();
+				created = create();
+				if (created) vmaGetAllocationInfo(allocator, image.allocation, &allocated);
+			}
 			if (created) {
 				ReportMemoryFallback("an image is in system memory", allocated.size);
 			} else {

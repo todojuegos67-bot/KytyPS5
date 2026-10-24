@@ -132,11 +132,14 @@ $graph.Add_Paint({ param($s, $e)
 	$top = 40.0
 	$grid = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(60, 60, 60))
 	foreach ($ms in @(8.3, 16.7, 33.3)) { $y = $h - ($ms / $top) * $h; $g.DrawLine($grid, [single]0, [single]$y, [single]$w, [single]$y) }
-	$g.DrawString("frametime (ms)  40", $fontSmall, [System.Drawing.Brushes]::Gray, [single]0, [single]0)
+	$g.DrawString("frametime (ms)  40   verde media, naranja picos", $fontSmall, [System.Drawing.Brushes]::Gray, [single]0, [single]0)
 	$g.DrawString("16.7", $fontSmall, [System.Drawing.Brushes]::Gray, [single]0, [single]($h - (16.7 / $top) * $h - $fontSmall.Height))
-	foreach ($pair in @(,@($script:ft, [System.Drawing.Color]::Lime))) {
+	# (10-24) Dos lineas: el peor frame de cada segundo (picos, naranja) y la media (verde). Antes solo la media: con
+	# 30 FPS fijos quedaba encima de la raya de 33.3 y no se veia.
+	$sc = if ($S) { [double]$S } else { 1.0 }
+	foreach ($pair in @(@($script:ftMax, [System.Drawing.Color]::FromArgb(255, 150, 40)), @($script:ft, [System.Drawing.Color]::Lime))) {
 		$list = $pair[0]; if ($list.Count -lt 2) { continue }
-		$pen = New-Object System.Drawing.Pen($pair[1], [single](1.5 * $S))
+		$pen = New-Object System.Drawing.Pen($pair[1], [single](2.0 * $sc))
 		$step = $w / 59.0; $x0 = $w - ($list.Count - 1) * $step
 		for ($i = 1; $i -lt $list.Count; $i++) {
 			$y1 = $h - [Math]::Min($list[$i-1], $top) / $top * $h; $y2 = $h - [Math]::Min($list[$i], $top) / $top * $h
@@ -254,6 +257,16 @@ function Get-Fps {
 		$x = [regex]::Matches($text, '\[(dlssg|fsr3-mfg)\][^\r\n]*?x(\d)')
 		if ($x.Count -gt 0) { $r.fgMult = [int]$x[$x.Count - 1].Groups[2].Value }
 		if ($m.Count -gt 0) { $r.fgShown = [Math]::Round([double]::Parse($m[$m.Count - 1].Groups[2].Value, $inv)); $r.fgReal = [Math]::Round([double]::Parse($m[$m.Count - 1].Groups[1].Value, $inv)) }
+		# (lat-1023) Latencia (KYTY_LATENCY=1): la ultima linea [lat]. total = mando leido -> present + scanout (estimado)
+		# + retencion del frame generation (estimada); sin 'total' (version vieja): media + scanout + fg.
+		$m = [regex]::Matches($text, '\[lat\] input->present mean ([0-9.]+) ms, p95 ([0-9.]+), max ([0-9.]+); \+scanout ([0-9.]+); fg \+([0-9.]+) \(n (\d+)\)(?:; total ([0-9.]+), p95 ([0-9.]+))?')
+		if ($m.Count -gt 0) {
+			$q = $m[$m.Count - 1].Groups
+			$lm = [double]::Parse($q[1].Value, $inv); $lp = [double]::Parse($q[2].Value, $inv)
+			$add = [double]::Parse($q[4].Value, $inv) + [double]::Parse($q[5].Value, $inv)
+			$r.latMean = if ($q[7].Success) { [double]::Parse($q[7].Value, $inv) } else { $lm + $add }
+			$r.latP95 = if ($q[8].Success) { [double]::Parse($q[8].Value, $inv) } else { $lp + $add }
+		}
 		return $r
 	} catch { }
 	return $null
@@ -419,6 +432,24 @@ $timer.Add_Tick({
 		} else {
 			$rows.Add(@('RAM', ("{0:N1} / {1:N0} GB" -f $ramUsed, $ramTotal), (Get-UseColor $ramUsed $ramTotal)))
 		}
+		# (10-24) Commit (memoria comprometida / limite de Windows = RAM + archivo de paginacion), de la misma consulta
+		# de Win32_OperatingSystem (nada mas que leer). Al limite Windows niega memoria y el juego se cierra: rojo por
+		# encima del 90 %. Con -RamGB (simular un PC de N GB): el emulador + 4 GB de Windows contra N GB + la paginacion.
+		$commitLimit = [double]$os.TotalVirtualMemorySize / 1MB
+		$commitUsed = $commitLimit - [double]$os.FreeVirtualMemory / 1MB
+		$commitSim = ''
+		if ($RamGB -gt 0) {
+			$pageFile = [Math]::Max(0.0, $commitLimit - $ramTotal)
+			$commitLimit = $RamGB + $pageFile
+			$priv = 0; $e3 = $emu | Select-Object -First 1
+			if ($e3) { $priv = $e3.PrivateMemorySize64 / 1GB }
+			$commitUsed = $priv + 4
+			$commitSim = ' (simulado)'
+		}
+		if ($commitLimit -gt 0) {
+			$cc = if ($commitUsed / $commitLimit -gt 0.90) { $cRed } else { Get-UseColor $commitUsed $commitLimit }
+			$rows.Add(@('Commit', ("{0:N1} / {1:N0} GB{2}" -f $commitUsed, $commitLimit, $commitSim), $cc))
+		}
 	} catch { }
 	$shownFps = $null
 	$fps = Get-Fps
@@ -432,6 +463,11 @@ $timer.Add_Tick({
 				while ($script:ft.Count -gt 60) { $script:ft.RemoveAt(0); $script:ftMax.RemoveAt(0) }
 			}
 		}
+	}
+	# (lat-1023) Latencia: verde < 40 ms, oro < 60, naranja < 80, rojo el resto.
+	if ($fps -and $fps.latMean) {
+		$lc = if ($fps.latMean -lt 40) { $cGreen } elseif ($fps.latMean -lt 60) { [System.Drawing.Color]::Gold } elseif ($fps.latMean -lt 80) { $cOrange } else { $cRed }
+		$rows.Add(@('Latencia', ("{0:N0} ms (p95 {1:N0})" -f $fps.latMean, $fps.latP95), $lc))
 	}
 	Update-Ls
 	if ($script:lsFps) { $rows.Add(@('FPS LS', "$($script:lsFps)", $cOrange)) }
