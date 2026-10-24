@@ -11,9 +11,10 @@
 //                depth tolerance follows the surface's own depth slope per pixel: far, grazing ground keeps its
 //                history), neighbourhood clamp (3x3, edge-aware), alpha max(1 / count, 0.1 (0.08 at 3)); count in aux .x
 //   2 a-trous:   5x5 B3 kernel with depth / normal / visibility edge stops; steps 1, 2 (, 4 at 2 and 3)
-//   4 composite: joint bilateral upsample; color *= 1 - strength * fade * stable * (1 - vis); fade 0 on the sky and
+//   4 composite: joint bilateral upsample; color *= 1 - strength * near * fade * stable * lit * (1 - vis) (<= 75 %); fade 0 on the sky and
 //                beyond KYTY_RT_SHADOWS fade distance; stable ramps with the history count from 0.4 (no popping noise,
 //                no shadow held back until the camera comes close); misc.w bit 3: statistics into vote_buf[64 + slot * 4]
+//   6 probe:     the game's sun strength (lit vs facing-away luminance; overcast scales the strength down on the CPU)
 //   5 calibrate: the depth buffer's floors against the world axes (the camera's view of world X, Y, Z in cand[0..2]),
 //                both signs, both screen y conventions: which world axis is up and whether the screen's y is mirrored
 //                (12 counters per slot into vote_buf; the CPU reads them back)
@@ -44,6 +45,7 @@ layout(push_constant) uniform Push {
 	vec4  extra;     // a-trous step; light direction in view space (toward the light) in yzw
 	vec4  cand[4];   // calibrate: world X, Y, Z in view space (w 1 = in use); cand[3]: screen cap px, thickness
 	                 // scale, fade start, fade end (m)
+	vec4  tune;      // x: 1 / K, K the game's sun-lit to ambient luminance ratio (the light probe's, >= 1.25)
 } push;
 
 vec2 RenderSize() { return push.motion.zw; }
@@ -95,23 +97,37 @@ vec3 NormalAtY(vec2 uv, vec3 p, float ys) {
 }
 vec3 NormalAt(vec2 uv, vec3 p) { return NormalAtY(uv, p, YSign()); }
 
+// How near the pixel is (1 within 6 m, 0 beyond 40 m): rays, strength and trust are generous near the camera
+// (contact shadows under the character, barrels, battlements) and conservative far away, where a pixel spans
+// decimetres, depth normals are the mesh's flat facets, and the game's shadow maps already have the shapes.
+float NearW(float z) { return 1.0 - smoothstep(6.0, 40.0, z); }
+
 // The march: occlusion toward the light (0 lit, 1 occluded by something in the depth buffer).
-float March(vec3 p, vec3 n, vec3 l, ivec2 pixel) {
+// l: the ray's direction (jittered within the sun's penumbra cone); ndl: the receiver's facing to the true sun.
+float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 	int   q     = push.misc.z;
 	int   steps = q >= 3 ? 48 : q >= 2 ? 28 : 16; // (10-24) more: the rays are longer
 	float z     = abs(p.z);
-	// World length, capped to a screen length (the detail scale Bend's shadows work at; long rays are the shadow
-	// maps' business and only double them).
+	float nw    = NearW(z);
+	// World length (full near, 30 % far), capped to a screen length (the detail scale Bend's shadows work at; long
+	// rays are the shadow maps' business and only double them).
 	float px_m  = abs(push.proj.y) * 0.5 * RenderSize().y / max(z, 1e-3);
 	float cap   = push.cand[3].x * RenderSize().y / 1440.0;
-	float len   = min((q >= 3 ? 1.25 : 1.0) * push.trace.w, cap / px_m);
-	// Thickness: an occluder is taken as this deep behind its depth-buffer surface (thin-object leak guard).
-	float thick = clamp(0.06 + 0.02 * z, 0.06, 1.0) * push.cand[3].y;
+	float len   = min((q >= 3 ? 1.25 : 1.0) * push.trace.w * mix(0.3, 1.0, nw), cap / px_m);
+	// Thickness: an occluder is taken as this deep behind its depth-buffer surface (thin-object leak guard). (10-24:
+	// 0.2 m near to 0.45 m far; it grew to 1 m at 47 m, and rays passing up to 1 m behind a cliff's front faces
+	// made hard dark shards there.)
+	float thick = clamp(0.2 + 0.006 * z, 0.2, 0.45) * push.cand[3].y;
 	float bias  = 0.0015 * z + 0.002;
+	// The occluder must stand clear of the receiver's own plane: a ray over a low-poly surface (a cliff's flat facets
+	// in the depth buffer, smooth in the game's shading) hits the next facet of a crease within decimetres. The
+	// height of the ray over that plane is t * N.L: a least distance, a few cm near, ~0.25 m at 50 m.
+	float t_min = (0.015 + 0.004 * z) / max(ndl, 0.1);
 	float jit   = Ign(vec2(pixel) + float(push.misc.y % 64) * 5.588238);
 	vec3  o     = p + n * (0.002 * z + 0.003);
 	// The first sample one pixel out (no self-hit on the start texel).
 	float t0    = 1.0 / px_m;
+	if (t0 >= len) return 0.0;
 	for (int s = 0; s < steps; ++s) {
 		float k  = (float(s) + jit) / float(steps);
 		float t  = t0 + (len - t0) * k * k; // denser near the surface: contact detail
@@ -121,14 +137,15 @@ float March(vec3 p, vec3 n, vec3 l, ivec2 pixel) {
 		float sd = textureLod(depth_tex, pr.xy, 0).r;
 		if (IsSky(sd)) continue;
 		float delta = abs(qp.z) - abs(ViewZ(sd)); // > 0: the ray point is behind the depth surface there
-		if (delta > bias && delta < thick) {
-			// Screen-edge and ray-end fades (no hard cut where the ray leaves what the screen knows), and a softer
-			// hit near the thickness limit.
+		if (delta > bias && delta < thick && t > t_min) {
+			// Screen-edge and ray-end fades (no hard cut where the ray leaves what the screen knows), a softer hit
+			// near the thickness limit and near the least distance.
 			vec2  e    = min(pr.xy, 1.0 - pr.xy);
 			float edge = smoothstep(0.0, 0.04, min(e.x, e.y));
 			float end  = 1.0 - smoothstep(0.85, 1.0, k); // (10-24) only the last stretch (was 0.65: rays felt short)
-			float soft = 1.0 - smoothstep(0.6 * thick, thick, delta);
-			return edge * end * soft;
+			float soft = 1.0 - smoothstep(0.5 * thick, thick, delta);
+			float near = smoothstep(t_min, 2.0 * t_min, t);
+			return edge * end * soft * near;
 		}
 	}
 	return 0.0;
@@ -147,10 +164,22 @@ void Trace(ivec2 pixel) {
 	imageStore(gbuf_out, pixel, vec4(n, abs(p.z)));
 	vec3  l   = normalize(push.extra.yzw);
 	float ndl = dot(n, l);
+	float z   = abs(p.z);
 	// Surfaces facing away get no direct sun: the game's own lighting has them dark already (nothing to add);
-	// grazing ones fade in (their depth-buffer self-hits are noise).
-	float w   = smoothstep(0.04, 0.22, ndl) * (1.0 - smoothstep(push.cand[3].w, push.cand[3].w * 1.2, abs(p.z)));
-	float occ = w > 0.0 ? March(p, n, l, pixel) * w : 0.0;
+	// grazing ones fade in (their depth-buffer self-hits are noise; far away the facets are coarse: a wider ramp).
+	float nw  = NearW(z);
+	float g0  = mix(0.2, 0.04, nw), g1 = mix(0.45, 0.22, nw);
+	float w   = smoothstep(g0, g1, ndl) * (1.0 - smoothstep(push.cand[3].w, push.cand[3].w * 1.2, z));
+	// The penumbra: each frame's ray a different direction within a ~3 degree cone around the sun (per-pixel IGN,
+	// rotated per frame); the temporal filter and the a-trous average them into a soft edge that widens with the
+	// distance to the occluder (contact-hardening), instead of a hard binary edge.
+	float f   = float(push.misc.y % 64);
+	float u1  = Ign(vec2(pixel) + f * 7.123 + 13.0), u2 = Ign(vec2(pixel.y, pixel.x) + f * 3.731 + 71.0);
+	vec3  b1  = normalize(cross(l, abs(l.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+	vec3  b2  = cross(l, b1);
+	float ang = 6.2831853 * u2, rad = 0.05 * sqrt(u1);
+	vec3  lj  = normalize(l + (b1 * cos(ang) + b2 * sin(ang)) * rad);
+	float occ = w > 0.0 ? March(p, n, lj, ndl, pixel) * w : 0.0;
 	float v   = 1.0 - occ;
 	imageStore(out_img, pixel, vec4(isnan(v) ? 1.0 : clamp(v, 0.0, 1.0)));
 }
@@ -223,8 +252,9 @@ void Atrous(ivec2 pixel) {
 	float step = push.extra.x;
 	// Depth stop: relative, plus the surface's own slope (far grazing ground is still one surface).
 	float zden = max((g.w * 0.015 + 1.5 * DepthSlope(uv, g.w)) * step, 1e-3);
-	// Visibility edge stop: loose on the first pass (noise), tighter after (keeps the contact line crisp).
-	float sv_den = step <= 1.0 ? 0.6 : 0.35;
+	// Visibility edge stop: loose on the first passes (noise, and the penumbra's jitter to average into a soft edge),
+	// moderate after. (10-24: was 0.6 / 0.35: it kept the binary edges of each frame's rays: hard shards.)
+	float sv_den = step <= 2.0 ? 0.9 : 0.5;
 	float sum = 0.0, wsum = 0.0;
 	for (int y = -2; y <= 2; ++y)
 		for (int x = -2; x <= 2; ++x) {
@@ -281,9 +311,27 @@ void Composite(ivec2 pixel, out float dark, out float zout) {
 	// angle never got: shadows showed only once the camera came close.)
 	float count  = textureLod(aux_tex, uv, 0).x;
 	float stable = mix(0.4, 1.0, smoothstep(1.0, 4.0, count));
+	// How lit the pixel is by the sun in the game's own image: its luminance against the brightest of the same surface
+	// around it (8 taps, 6 and 14 px) on the scale from the shadow level (1 / K of lit) to lit. A pixel the game's
+	// shadow maps already darken gets no second shadow; one they missed (a contact) gets all of it.
+	float lc   = dot(col.rgb, vec3(0.2126, 0.7152, 0.0722));
+	float lref = lc;
+	const ivec2 taps[8] = ivec2[](ivec2(6, 0), ivec2(-6, 0), ivec2(0, 6), ivec2(0, -6), ivec2(10, 10), ivec2(-10, 10),
+	                              ivec2(10, -10), ivec2(-10, -10));
+	ivec2 rmax = ivec2(RenderSize()) - 1;
+	for (int i = 0; i < 8; ++i) {
+		ivec2 sp = clamp(pixel + taps[i], ivec2(0), rmax);
+		float sz = abs(ViewZ(texelFetch(depth_tex, sp, 0).r));
+		if (abs(sz - z) < 0.08 * z + 0.2) lref = max(lref, dot(texelFetch(color_tex, sp, 0).rgb, vec3(0.2126, 0.7152, 0.0722)));
+	}
+	float inv_k = clamp(push.tune.x, 0.0, 0.8);
+	float rel   = lc / max(0.85 * lref, 1e-8);
+	float lit   = smoothstep(0.1, 0.55, (rel - inv_k) / (1.0 - inv_k));
+	// Generous near (x1.25), conservative far (x0.45); never darker than 0.25 of the input: no near-black patches.
+	float near  = mix(0.45, 1.25, NearW(z));
 	// Multiply only, in the linear HDR input: factor in [1 - strength, 1]; never above the input (no lightening).
-	float factor = 1.0 - clamp(amt * stable * occ, 0.0, 0.95);
-	dark         = clamp(fade * stable * occ, 0.0, 1.0); // (the statistics' occlusion: before the strength)
+	float factor = 1.0 - clamp(amt * near * stable * occ * lit, 0.0, 0.75);
+	dark         = clamp(fade * stable * occ * lit, 0.0, 1.0); // (the statistics' occlusion: before the strength)
 	vec3  rgb    = min(col.rgb * factor, col.rgb);
 	if (any(isnan(rgb)) || any(isinf(rgb))) rgb = col.rgb;
 	imageStore(out_img, pixel, vec4(rgb, col.a));
@@ -309,6 +357,31 @@ void CompositeStats(ivec2 pixel) {
 	}
 	barrier();
 	if (li < 3u && s_stat[li] != 0u) atomicAdd(vote_buf.v[64u + uint(push.misc.w >> 8) * 4u + li], s_stat[li]);
+}
+
+// The light probe (mode 6, at render / 4, on the statistics frames): log2 luminance of the pixels facing the sun
+// (N.L > 0.5) and of those facing away (N.L < -0.15, ambient only), within 60 m: their geometric means' ratio K is how
+// strong the sun is in the game's own lighting (overcast: ~1). Words 68..71: count lit, sum lit, count away, sum away.
+shared uint s_probe[4];
+void Probe(ivec2 pixel) {
+	uint li = gl_LocalInvocationIndex;
+	if (li < 4u) s_probe[li] = 0u;
+	barrier();
+	ivec2 rp = pixel * 4 + 2;
+	if (rp.x < int(RenderSize().x) && rp.y < int(RenderSize().y)) {
+		vec2  uv = (vec2(rp) + 0.5) / RenderSize();
+		float d  = texelFetch(depth_tex, rp, 0).r;
+		float l  = dot(texelFetch(color_tex, rp, 0).rgb, vec3(0.2126, 0.7152, 0.0722));
+		if (!IsSky(d) && abs(ViewZ(d)) < 60.0 && l > 0.0 && !isinf(l)) {
+			vec3  p    = ViewPos(uv, d);
+			float ndl  = dot(NormalAt(uv, p), normalize(push.extra.yzw));
+			uint  code = uint(clamp((log2(l) + 40.0) * 32.0, 0.0, 4095.0));
+			if (ndl > 0.5) atomicAdd(s_probe[0], 1u), atomicAdd(s_probe[1], code);
+			else if (ndl < -0.15) atomicAdd(s_probe[2], 1u), atomicAdd(s_probe[3], code);
+		}
+	}
+	barrier();
+	if (li < 4u && s_probe[li] != 0u) atomicAdd(vote_buf.v[68u + li], s_probe[li]);
 }
 
 shared uint s_vote[12];
@@ -346,6 +419,7 @@ void main() {
 	int   mode  = push.misc.x;
 	if (mode == 5) { Calibrate(pixel); return; } // (all invocations reach its barriers)
 	if (mode == 4) { CompositeStats(pixel); return; } // (likewise)
+	if (mode == 6) { Probe(pixel); return; } // (likewise)
 	ivec2 size = ivec2(TraceSize());
 	if (pixel.x >= size.x || pixel.y >= size.y) return;
 	if (mode == 0) Trace(pixel);
