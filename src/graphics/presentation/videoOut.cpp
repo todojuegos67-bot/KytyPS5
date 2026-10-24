@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/presentation/window/hostInput.h"
 #include "kernel/pthread.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "libs/errno.h"
@@ -240,6 +241,7 @@ private:
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
 		uint64_t                    latency_index; // KYTY_ANTILAG: the frame's index (local/anti-lag.h), 0 none
+		uint64_t                    kbm_seq;       // KYTY_KBM: the game-frame pad reads this frame shows (HostInputKbmOnFlip)
 	};
 
 	Graphics::Presenter& m_presenter;
@@ -1298,6 +1300,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	r.source     = source;
 	r.state      = RequestState::Reserved;
 	r.latency_index = Graphics::AntiLag::OnFlipReserved(); // KYTY_ANTILAG (local/anti-lag.h)
+	r.kbm_seq       = Graphics::HostInputKbmOnFlip();     // KYTY_KBM: one stick per game frame; the warp's shown reads
 
 	pending.push_back(r);
 	request_id = r.id;
@@ -1805,6 +1808,7 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 		                                    ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r.ready_time).count()
 		                                    : -1.0);
 	Graphics::Presenter::SetLatencyIndex(*r.frame, r.latency_index);
+	Graphics::Presenter::SetKbmSeq(*r.frame, r.kbm_seq);
 	m_presenter.Submit(*r.frame);
 
 	r.cfg->mutex.Lock();

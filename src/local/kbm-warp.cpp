@@ -97,11 +97,11 @@ struct State {
 	std::array<View, 6> views {}; // the presenter's frame images
 	uint32_t            next_view = 0;
 	float               prev_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // FSR 3: the last real frame's source rectangle (UV)
-	// (10-24) The edge zoom: the fraction of each half-size kept free around the source rectangle, so the pending turn
-	// never uncovers an edge. Rises at once to what the shift needs (up to KYTY_KBM_WARP_ZOOM), holds, then eases back.
+	// The edge zoom: the fraction of each half-size kept free around the source rectangle, so the pending turn never
+	// uncovers an edge. (10-25) Constant (KYTY_KBM_WARP_ZOOM) from the first warped frame: before, it rose at once to what
+	// a turn needed and eased back 0.35 s later, so the 3D's scale pumped by up to 5% at every turn (the background
+	// "breathing", one of the dizziness reports).
 	float               zoom      = 0.0f;
-	double              zoom_hold = 0.0; // seconds since the shift last needed the present zoom
-	std::chrono::steady_clock::time_point zoom_last {};
 	uint32_t            logs = 0;
 } g;
 
@@ -246,11 +246,18 @@ bool HudlessWanted() {
 	return wanted;
 }
 bool Fsr3Wanted() {
-	static const bool wanted = HudlessWanted() && !EnvIs("KYTY_KBM_WARP_FSR3", "0");
+	// (10-25) Opt-in (KYTY_KBM_WARP_FSR3=1): FSR 3 interpolating warped frames gave double images (the HUD mask's edge,
+	// the character against the shifted background), and frame generation already halves the step the eye sees.
+	static const bool wanted = HudlessWanted() && EnvIs("KYTY_KBM_WARP_FSR3", "1");
 	return wanted;
 }
+float ZoomMax() {
+	static const float zoom_max = std::clamp(EnvNum("KYTY_KBM_WARP_ZOOM", 0.05f), 0.0f, 0.25f);
+	return zoom_max;
+}
 bool InputsShifted() {
-	return !Identity(g.prev_rect) || g.zoom > 0.0f;
+	// (A constant zoom: every frame goes through the warp, moving or not, so its scale never pops in or out.)
+	return !Identity(g.prev_rect) || (On() && ZoomMax() > 0.0f);
 }
 void NoteUnshifted() {
 	g.prev_rect[0] = g.prev_rect[1] = 0.0f;
@@ -296,27 +303,10 @@ VulkanImage* Record(GraphicContext& graphics, vk::CommandBuffer command, VulkanI
 			return nullptr;
 	}
 
-	// (10-24) The edge zoom and the source rectangle.
+	// The edge zoom (constant, 10-25) and the source rectangle.
 	{
-		static const float zoom_max  = std::clamp(EnvNum("KYTY_KBM_WARP_ZOOM", 0.05f), 0.0f, 0.25f);
-		static const float hold_s    = std::clamp(EnvNum("KYTY_KBM_WARP_ZOOM_HOLD", 0.35f), 0.0f, 5.0f);
-		static const float release_s = std::clamp(EnvNum("KYTY_KBM_WARP_ZOOM_RELEASE", 0.8f), 0.05f, 10.0f);
-		const auto   now = std::chrono::steady_clock::now();
-		const double dt  = g.zoom_last.time_since_epoch().count() == 0
-		                       ? 0.0
-		                       : std::clamp(std::chrono::duration<double>(now - g.zoom_last).count(), 0.0, 0.25);
-		g.zoom_last      = now;
+		g.zoom         = ZoomMax();
 		const float hw = 0.5f * static_cast<float>(size.width), hh = 0.5f * static_cast<float>(size.height);
-		const float need = std::min(zoom_max, std::max(std::fabs(shift_x) / hw, std::fabs(shift_y) / hh));
-		if (need >= g.zoom * 0.95f) {
-			g.zoom      = std::max(g.zoom, need);
-			g.zoom_hold = 0.0;
-		} else if ((g.zoom_hold += dt) > hold_s) {
-			// Eased back toward what is needed (exponential, release_s to about a third).
-			const float k = static_cast<float>(1.0 - std::exp(-dt / release_s));
-			g.zoom += (need - g.zoom) * k;
-			if (g.zoom < 0.002f && need == 0.0f) g.zoom = 0.0f;
-		}
 		// The shift held inside the free margin (softly near its end).
 		auto keep = [](float v, float m) {
 			if (m <= 0.0f) return 0.0f;
