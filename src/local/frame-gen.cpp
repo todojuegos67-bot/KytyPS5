@@ -5863,7 +5863,7 @@ namespace {
 // penumbra cone jittered per frame and a wider, softer a-trous (no binary edges), a cap of 75 % darkening; pixels the
 // game already shadows (dark against the same surface around them, on the scale its sun gives) get no second shadow;
 // and an overcast factor (KYTY_RT_SHADOWS_OVERCAST=0 turns it off): the light probe compares the luminance of what
-// faces the sun with what faces away (K, the sun-lit to ambient ratio): K <= 1.4 scales the strength to 0.15.
+// faces the sun with what faces away (K, the sun-lit to ambient ratio): K <= 1.3 scales the strength to 0.15, full from 2.4.
 //
 // Why the first version looked wrong: its depth reconstruction took the render's row 0 as NDC y -1, while the game's
 // viewport (GNM, yscale < 0) puts NDC y +1 there: the scene it marched was mirrored vertically against the light it
@@ -6351,13 +6351,14 @@ void CShadowTakeStats() {
 			const double lk = std::clamp((static_cast<double>(v[5]) / v[4] - static_cast<double>(v[7]) / v[6]) / 32.0, 0.0, 6.0);
 			g_cs.log_k      = g_cs.log_k < 0.0 ? lk : g_cs.log_k + (lk - g_cs.log_k) * 0.2; // (~1.3 s at 60 fps)
 		}
-		// K 1.4 or less: overcast (the sun barely lights what faces it): 0.15; K 3 or more: full.
+		// K 1.3 or less: overcast (the sun barely lights what faces it): 0.15; K 2.4 or more: full (sun-facing pixels in
+		// the game's own shadows pull K down in full sun too).
 		static const bool auto_sun = [] {
 			const char* value = std::getenv("KYTY_RT_SHADOWS_OVERCAST");
 			return !(value != nullptr && *value == '0');
 		}();
 		if (auto_sun && g_cs.log_k >= 0.0) {
-			const double k = std::exp2(g_cs.log_k), x = std::clamp((k - 1.4) / (3.0 - 1.4), 0.0, 1.0);
+			const double k = std::exp2(g_cs.log_k), x = std::clamp((k - 1.3) / (2.4 - 1.3), 0.0, 1.0);
 			g_cs.sun_factor = 0.15 + 0.85 * x * x * (3.0 - 2.0 * x);
 		}
 	}
