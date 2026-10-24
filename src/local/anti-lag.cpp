@@ -342,6 +342,13 @@ void PaceLogOnce(const char* what, double ms) {
 double   g_lead_ring[64] {};
 uint32_t g_lead_n = 0, g_k_hold = 0;
 int      g_k = 1; // under g_pace_mutex
+// k = 1 starving the game (20261024-212307, combo11: FSR 3 FG, cap 33.3 ms): the read of frame N waited for frame
+// N - 1's release, which here only comes after the game has gone past that read (its render thread flips N - 1 after
+// the main thread starts N), so each wait ran into its timeout (2 caps + 10 ms): 83 / 113 ms frames, 18 real fps for
+// 73 s, where k = 2 made 30-31. A healthy k = 1 wait is under one cap (N - 1 leaves one cap after N - 2). Three waits
+// of over a cap (or timed out) within 32 frames under k = 1: one frame queued (k = 2) for the rest of the session.
+uint32_t g_k1_strikes = 0, g_k1_window = 0;
+bool     g_k1_refused = false; // under g_pace_mutex
 
 int PaceDepthMode() { // KYTY_LOWLAT_PACE_DEPTH: auto (default), 0 (never a frame queued), 1 (always one)
 	static const int mode = [] {
@@ -360,6 +367,8 @@ void PaceBeforeInput(uint64_t index) {
 	if (cap < 4.0 || cap > 70.0 || g_rel_index == 0 || index < 3) return;
 	if (PaceDepthMode() >= 0) {
 		g_k = PaceDepthMode() + 1;
+	} else if (g_k1_refused) {
+		g_k = 2;
 	} else if (g_lead_n >= 16) {
 		const uint32_t n = std::min<uint32_t>(g_lead_n, 64);
 		double         v[64];
@@ -383,12 +392,29 @@ void PaceBeforeInput(uint64_t index) {
 	const uint64_t target = index - static_cast<uint64_t>(k);
 	if (g_rel_index >= target) return;
 	const int64_t start = LatNow();
-	g_pace_cond.wait_for(lock, std::chrono::microseconds(static_cast<int64_t>((cap * (k + 1) + 10.0) * 1000.0)),
-	                     [target] { return g_rel_index >= target; });
+	const bool released = g_pace_cond.wait_for(lock, std::chrono::microseconds(static_cast<int64_t>((cap * (k + 1) + 10.0) * 1000.0)),
+	                                           [target] { return g_rel_index >= target; });
 	const double waited = static_cast<double>(LatNow() - start) / per_ms;
 	g_pace_drain_sum.store(g_pace_drain_sum.load(std::memory_order_relaxed) + waited, std::memory_order_relaxed);
 	g_pace_drain_n.fetch_add(1, std::memory_order_relaxed);
+	bool refused_now = false;
+	if (k == 1 && PaceDepthMode() < 0 && !g_k1_refused) {
+		if (!released || waited >= cap + 2.0) g_k1_strikes++; // (2 ms: release jitter on the vblank grid)
+		if (g_k1_strikes >= 3) {
+			g_k1_refused = true;
+			g_k          = 2;
+			refused_now  = true;
+		} else if (++g_k1_window >= 32) {
+			g_k1_window = g_k1_strikes = 0;
+		}
+	}
 	lock.unlock();
+	if (refused_now) {
+		std::printf("[pace] no frame queued (k 1) starved the game: 3 waits for the previous frame's release of over a cap (%.1f ms) "
+		            "+ 2 ms (last %.1f ms%s); one frame queued (k 2) from here on (KYTY_LOWLAT_PACE_DEPTH=0 forces k 1)\n",
+		            cap, waited, released ? "" : ", timed out");
+		std::fflush(stdout);
+	}
 	PaceLogOnce("drain wait", waited);
 }
 } // namespace
