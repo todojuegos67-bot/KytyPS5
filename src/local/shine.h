@@ -2,7 +2,7 @@
 #define EMULATOR_SRC_LOCAL_SHINE_H_
 // KYTY_SHINE=0|1|2|3 (off / sun only / + 2 local lights / + 4 local lights; shine.cpp, shine.comp): specular highlights
 // and material-aware sharpening for metal and smooth surfaces (armour, shields, props) on the PS5 Pro path's HDR color,
-// right before the upscaler. KYTY_SHINE_STRENGTH (1.0, 0..3), KYTY_SHINE_SHARPEN (0.4, 0..1). Off: nothing created.
+// right before the upscaler. KYTY_SHINE_STRENGTH (1.25, 0..3), KYTY_SHINE_SHARPEN (0.58, 0..1). Off: nothing created.
 #include "local/frame-gen.h"
 
 #include <array>

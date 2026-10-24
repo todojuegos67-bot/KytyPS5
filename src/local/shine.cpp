@@ -417,8 +417,8 @@ bool ShineApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		const char* y = std::getenv("KYTY_SHINE_FLIPY");
 		return y == nullptr || *y == '\0' || *y != '0';
 	}();
-	const float strength = EnvFloat("KYTY_SHINE_STRENGTH", 1.0f, 0.0f, 3.0f);
-	const float sharpen  = EnvFloat("KYTY_SHINE_SHARPEN", 0.4f, 0.0f, 1.0f);
+	const float strength = EnvFloat("KYTY_SHINE_STRENGTH", 1.25f, 0.0f, 3.0f);
+	const float sharpen  = EnvFloat("KYTY_SHINE_SHARPEN", 0.58f, 0.0f, 1.0f);
 	const bool  normals  = have_gbuf && ((normal_code & 64) == 0 || camera.rows);
 
 	std::array<float, 3> sun {};
