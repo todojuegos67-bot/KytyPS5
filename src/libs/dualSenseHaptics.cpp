@@ -25,9 +25,8 @@ namespace {
 constexpr PROPERTYKEY PKEY_INTERFACE_FRIENDLY_NAME = {
     {0xb3f8fa53, 0x0004, 0x438e, {0x90, 0x03, 0x51, 0xa4, 0x6e, 0x13, 0x9b, 0xfc}}, 2};
 
-// The pad's USB interface path, as both the audio driver and the registry report it: a DualSense's, or a DualSense
-// Edge's (the same four channels; matched on Bluetooth already, while wired it vibrated nowhere).
-constexpr const char* PAD_DEVICE_PATHS[] = {"VID_054C&PID_0CE6", "VID_054C&PID_0DF2"};
+// The pad's USB interface path, as both the audio driver and the registry report it.
+constexpr const char* PAD_DEVICE_PATH = "VID_054C&PID_0CE6";
 
 // The endpoint's four channels: 0-1 play on the pad's speaker, 2-3 drive its haptic actuators.
 constexpr uint32_t SPEAKER_FIRST_CHANNEL = 0;
@@ -308,8 +307,7 @@ IMMDevice* FindEndpoint() {
 			if (SUCCEEDED(store->GetValue(PKEY_INTERFACE_FRIENDLY_NAME, &value)) &&
 			    value.vt == VT_LPWSTR && value.pwszVal != nullptr) {
 				const auto path = Narrow(value.pwszVal);
-				is_pad          = std::ranges::any_of(PAD_DEVICE_PATHS,
-				                                      [&](const char* pad) { return path.find(pad) != std::string::npos; });
+				is_pad          = path.find(PAD_DEVICE_PATH) != std::string::npos;
 				if (g_log) {
 					std::printf("DualSense: endpoint %u: %s%s\n", i, path.c_str(),
 					            is_pad ? "  <- the pad" : "");
