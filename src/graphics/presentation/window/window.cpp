@@ -1,3 +1,4 @@
+#include "local/frame-capture.h"
 #include "graphics/presentation/window.h"
 
 #include "SDL.h"
@@ -345,6 +346,17 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 					} else {
 						SetPause(game, false);
 					}
+				}
+				break;
+			// F10: frame-generation discovery: a debug snapshot (the picture shown, with its HUD) and the next two frames'
+			// draws and dispatches recorded into its folder, summarized in the log ([fgdisc] lines; frame-capture.h).
+			case SDLK_F10:
+				if (!key.repeat) {
+					static int manual = 0;
+					auto       folder = DebugSnapshot::Take(g_window != nullptr ? g_window->window : nullptr);
+					if (folder.empty()) folder = "_DebugSnapshots/fgdisc-key-" + std::to_string(++manual);
+					const bool armed = FrameCapture::ArmAsync(folder, 2);
+					Loader::DemonsSoulsWarp::ShowNotice(armed ? "Frame capture: " + folder : "Frame capture busy or failed", 4);
 				}
 				break;
 			// F8: the emulator's overlay off, the frame rate, detailed, off... (it starts as the launcher's Overlay).

@@ -2782,6 +2782,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 
 void CommandProcessor::Flip() {
 	LiveControl::Flip();
+	FrameCapture::AutoTick(VideoOut::PlayerButtonSeen());
 	FrameCapture::OnFlip();
 	CheckBuffer();
 	// (As a CPU flip's preparation does: optimized builds in place, idle shader plans out of memory.)

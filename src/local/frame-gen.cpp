@@ -1,4 +1,5 @@
 #include "frame-gen.h"
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "kbm-warp.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "fsr3-fg.h"
@@ -911,7 +912,8 @@ bool WantsCamera() {
 }
 
 bool InputsGathered() {
-	return g_sources.valid && g_camera.valid;
+	// (GenericInputs: the frame's own are made at its flip.)
+	return (g_sources.valid && g_camera.valid) || GenericInputs();
 }
 
 void BypassCommandHooks(vk::Device device) {
@@ -2155,12 +2157,117 @@ void SetPresentReflexIndex(uint32_t index) {
 	g_rx_present.store(index, std::memory_order_relaxed);
 }
 
+bool DemonsSoulsHashes() {
+	static const bool ds = DemonsSouls::IsSupportedGame();
+	return ds;
+}
+
+std::vector<uint64_t> HashList(const char* env) {
+	std::vector<uint64_t> out;
+	const char*           value = std::getenv(env);
+	if (value == nullptr) return out;
+	const std::string text(value);
+	for (size_t at = 0; at <= text.size();) {
+		auto end = text.find_first_of(";, ", at);
+		if (end == std::string::npos) end = text.size();
+		if (end > at) {
+			const uint64_t hash = std::strtoull(text.substr(at, end - at).c_str(), nullptr, 16);
+			if (hash != 0) out.push_back(hash);
+		}
+		at = end + 1;
+	}
+	if (!out.empty()) {
+		std::printf("Frame generation: %s = %zu shader(s) for this title\n", env, out.size());
+		std::fflush(stdout);
+	}
+	return out;
+}
+
+const std::vector<uint64_t>& TaaShaderList() {
+	static const std::vector<uint64_t> list = [] {
+		std::vector<uint64_t> v;
+		if (DemonsSoulsHashes()) v.assign(TaaShaders.begin(), TaaShaders.end());
+		for (auto hash: HashList("KYTY_FG_TAA_SHADERS")) v.push_back(hash);
+		return v;
+	}();
+	return list;
+}
+
+const std::vector<uint64_t>& GbufferShaderList() {
+	static const std::vector<uint64_t> list = [] {
+		std::vector<uint64_t> v;
+		if (DemonsSoulsHashes()) v.assign(GbufferVertexShaders.begin(), GbufferVertexShaders.end());
+		for (auto hash: HashList("KYTY_FG_GBUFFER_VS")) v.push_back(hash);
+		return v;
+	}();
+	return list;
+}
+
+namespace {
+const std::array<uint32_t, 7>& TaaSlotMap() {
+	static const std::array<uint32_t, 7> map = [] {
+		std::array<uint32_t, 7> m {0, 1, 2, 3, 4, 5, 6};
+		if (const char* value = std::getenv("KYTY_FG_TAA_SLOTS"); value != nullptr && *value != '\0') {
+			// color, depth, motion, history, output
+			constexpr std::array<uint32_t, 5> ds {0, 1, 3, 4, 6};
+			uint32_t                          field = 0;
+			for (const char* p = value; *p != '\0' && field < ds.size();) {
+				char* end = nullptr;
+				const long slot = std::strtol(p, &end, 10);
+				if (end == p) break;
+				if (slot >= 0 && slot < 64) m[ds[field]] = static_cast<uint32_t>(slot);
+				++field;
+				p = *end != '\0' ? end + 1 : end;
+			}
+			std::printf("Frame generation: KYTY_FG_TAA_SLOTS color %u depth %u motion %u history %u output %u\n", m[0], m[1],
+			            m[3], m[4], m[6]);
+			std::fflush(stdout);
+		}
+		return m;
+	}();
+	return map;
+}
+} // namespace
+
+uint32_t TaaSlot(uint32_t ds) {
+	return ds < 7 ? TaaSlotMap()[ds] : ds;
+}
+
+uint32_t TaaSlots() {
+	const auto& m = TaaSlotMap();
+	return *std::max_element(m.begin(), m.end()) + 1;
+}
+
+uint32_t SrtIndex(int which) {
+	static constexpr std::array<const char*, 3> names {"KYTY_FG_SRT_VIEWPROJ", "KYTY_FG_SRT_PREV", "KYTY_FG_SRT_JITTER"};
+	static constexpr std::array<uint32_t, 3>    ds {29, 45, 57};
+	const auto                                  i = static_cast<size_t>(std::clamp(which, 0, 2));
+	const char*                                 value = std::getenv(names[i]);
+	return value != nullptr && *value != '\0' ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : ds[i];
+}
+
+bool GenericInputs() {
+	static const bool generic = [] {
+		if (DemonsSoulsHashes() || !TaaShaderList().empty()) return false;
+		const char* value = std::getenv("KYTY_FG_GENERIC");
+		const bool  on    = value == nullptr || *value != '0';
+		std::printf("Frame generation inputs: %s\n",
+		            on ? "this title's passes are not known (KYTY_FG_TAA_SHADERS): every frame but a movie's, with zero "
+		                 "motion vectors (the images alone)"
+		               : "off for this title (KYTY_FG_GENERIC=0)");
+		std::fflush(stdout);
+		return on;
+	}();
+	return generic;
+}
+
 void NoteScene() {
 	g_scene.store(true, std::memory_order_relaxed);
 }
 
 bool TakeScene() {
-	const bool scene = g_scene.exchange(false, std::memory_order_relaxed);
+	// (GenericInputs: every frame but a movie's is the game's view.)
+	const bool scene = g_scene.exchange(false, std::memory_order_relaxed) || (Capturing() && GenericInputs() && !VideoOut::MoviePlaying());
 	g_last_scene.store(scene, std::memory_order_relaxed);
 	g_flips_taken.fetch_add(1, std::memory_order_relaxed);
 	return scene;
@@ -2208,9 +2315,12 @@ bool                      g_hudless_taken = false;
 uint32_t                  g_hudless_logs  = 0;
 
 bool HudlessWanted() {
+	// (Another title: off unless asked, KYTY_FSR3_HUDLESS=1 with KYTY_FSR3_HUDLESS_PASS / _DRAW naming where its HUD
+	// starts; the default, the copy after the flip image's first draw, is Demon's Souls' composite.)
 	static const bool wanted = [] {
 		const char* value = std::getenv("KYTY_FSR3_HUDLESS");
-		return value == nullptr || *value == '\0' || *value != '0';
+		if (value == nullptr || *value == '\0') return DemonsSoulsHashes();
+		return *value != '0';
 	}();
 	return wanted;
 }
@@ -2718,10 +2828,10 @@ namespace {
 // KYTY_TAA_REPLACE=upscaler: the TAA dispatch's jittered color (image 0) copied to its output (image 6), each image
 // back in the layout the dispatch bound it in.
 bool BypassTaa(vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
-	if (g_cache == nullptr || images.size() < 7) return false;
+	if (g_cache == nullptr || images.size() < TaaSlots()) return false;
 	if (!Fsr3::UpscaleWanted() && !g_dlss_sr && !Xess::Wanted()) return false; // (no upscaler: the game's TAA)
-	const auto& color_b = images[0];
-	const auto& out_b   = images[6];
+	const auto& color_b = images[TaaSlot(0)];
+	const auto& out_b   = images[TaaSlot(6)];
 	if (!color_b.image_id || !out_b.image_id) return false;
 	auto& color  = g_cache->GetImage(color_b.image_id);
 	auto& output = g_cache->GetImage(out_b.image_id);
@@ -2970,10 +3080,10 @@ float EnvFloatOr(const char* name, float fallback) {
 
 bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
 	const bool bypass = g_taa_bypass && !g_taa_bypass_copy;
-	if ((!bypass && !g_taa_dlss) || g_cache == nullptr || g_graphics_ctx == nullptr || images.size() < 7) return false;
+	if ((!bypass && !g_taa_dlss) || g_cache == nullptr || g_graphics_ctx == nullptr || images.size() < TaaSlots()) return false;
 	if (bypass && !Fsr3::UpscaleWanted() && !g_dlss_sr && !Xess::Wanted()) return false; // (no upscaler: the TAA's)
-	const auto& color_b = images[0];
-	const auto& out_b   = images[6];
+	const auto& color_b = images[TaaSlot(0)];
+	const auto& out_b   = images[TaaSlot(6)];
 	if (!color_b.image_id || !out_b.image_id || color_b.image_view == nullptr || out_b.image_view == nullptr) return false;
 	auto&           color  = g_cache->GetImage(color_b.image_id);
 	auto&           output = g_cache->GetImage(out_b.image_id);
@@ -3036,8 +3146,8 @@ bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<co
 	vk::ImageLayout source_layout = color_b.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : color_b.layout;
 	if (!bypass) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
-		const auto& depth_b = images[1];
-		const auto& mv_b    = images[3];
+		const auto& depth_b = images[TaaSlot(1)];
+		const auto& mv_b    = images[TaaSlot(3)];
 		if (!g_sr_ready || !depth_b.image_id || !mv_b.image_id || depth_b.image_view == nullptr ||
 		    mv_b.image_view == nullptr || !EnsureDlaaImage(*g_graphics_ctx, render))
 			return false;
@@ -3169,10 +3279,10 @@ bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<co
 // output of the frame before, when that is the previous frame and the sizes match.
 void RestoreTaaHistory(vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
 	static const bool off = std::getenv("KYTY_TAA_TRUE_HISTORY") != nullptr && *std::getenv("KYTY_TAA_TRUE_HISTORY") == '0';
-	if (off || g_cache == nullptr || images.size() < 7 || g_bypass.truth.image == nullptr) return;
+	if (off || g_cache == nullptr || images.size() < TaaSlots() || g_bypass.truth.image == nullptr) return;
 	if (g_bypass.truth_frame == UINT64_MAX || g_guest_frame != g_bypass.truth_frame + 1) return;
-	const auto& hist_b = images[4];
-	const auto& out_b  = images[6];
+	const auto& hist_b = images[TaaSlot(4)];
+	const auto& out_b  = images[TaaSlot(6)];
 	if (!hist_b.image_id || !out_b.image_id) return;
 	auto& history = g_cache->GetImage(hist_b.image_id);
 	auto& output  = g_cache->GetImage(out_b.image_id);
@@ -3205,11 +3315,11 @@ bool ReplaceTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<
 		RestoreTaaHistory(vk_command, images);
 	if (g_taa_bypass) return g_taa_bypass_copy && BypassTaa(vk_command, images);
 #ifdef KYTY_FRAMEGEN_STREAMLINE
-	if (!g_taa_dlss || !g_taa_bypass_copy || !g_sr_ready || g_cache == nullptr || images.size() < 7) return false;
-	const auto& color_b = images[0];
-	const auto& depth_b = images[1];
-	const auto& mv_b    = images[3];
-	const auto& out_b   = images[6];
+	if (!g_taa_dlss || !g_taa_bypass_copy || !g_sr_ready || g_cache == nullptr || images.size() < TaaSlots()) return false;
+	const auto& color_b = images[TaaSlot(0)];
+	const auto& depth_b = images[TaaSlot(1)];
+	const auto& mv_b    = images[TaaSlot(3)];
+	const auto& out_b   = images[TaaSlot(6)];
 	if (!color_b.image_id || !depth_b.image_id || !mv_b.image_id || !out_b.image_id || color_b.image_view == nullptr ||
 	    depth_b.image_view == nullptr || mv_b.image_view == nullptr || out_b.image_view == nullptr)
 		return false;
@@ -3534,6 +3644,46 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 			std::fflush(stdout);
 			window = valid = held = 0;
 		}
+	}
+	if (!ready && GenericInputs() && !VideoOut::MoviePlaying()) {
+		// No vectors of the game's: zero motion and a far depth (reversed: 0) at the flip image's size, cleared here
+		// (each presented frame owns its pair). FSR 3 / DLSS-G interpolate from the images (optical flow).
+		const vk::Extent3D extent {flip.backing.extent.width, flip.backing.extent.height, 1};
+		if (extent.width == 0 || extent.height == 0) return;
+		ConfigureAs(graphics, inputs.depth, inputs.depth_view, vk::Format::eR32Sfloat, extent);
+		ConfigureAs(graphics, inputs.motion, inputs.motion_view, vk::Format::eR16G16Sfloat, extent);
+		inputs.motion_attachment = false;
+		command.EndRendering();
+		auto vk_command = command.Handle();
+		for (auto* image: {&inputs.depth, &inputs.motion}) {
+			Transition(vk_command, *image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+			           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+			const vk::ClearColorValue       zero {std::array<float, 4> {0.0f, 0.0f, 0.0f, 0.0f}};
+			const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			vk_command.clearColorImage(image->image, vk::ImageLayout::eTransferDstOptimal, &zero, 1, &range);
+			Transition(vk_command, *image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+			           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+		}
+		static bool logged = false;
+		if (!std::exchange(logged, true)) {
+			std::printf("Frame generation inputs: generic, %ux%u (zero motion vectors, far depth)\n", extent.width,
+			            extent.height);
+			std::fflush(stdout);
+		}
+		// The HUD-less image as for Demon's Souls (KYTY_FSR3_HUDLESS=1 with the title's composite or HUD pass named:
+		// KYTY_FSR3_HUDLESS_PASS / _DRAW, KYTY_FSR3_UI).
+		if (hudless && HudlessWanted()) {
+			ConfigureAs(graphics, inputs.hudless, inputs.hudless_view, g_hudless.format,
+			            vk::Extent3D {g_hudless.extent.width, g_hudless.extent.height, 1});
+			CopyRaw(vk_command, g_hudless, inputs.hudless);
+			inputs.has_hudless       = true;
+			inputs.hudless_composite = composite;
+		}
+		inputs.render_extent = {extent.width, extent.height};
+		inputs.camera        = camera;
+		inputs.guest_frame   = g_guest_frame;
+		inputs.valid         = true;
+		return;
 	}
 	if (!ready) {
 		return;
