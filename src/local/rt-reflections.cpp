@@ -125,6 +125,7 @@ struct RtPass {
 	// The material field (wet below lo, dry from hi; scale): from KYTY_RT_REFLECTIONS_ROUGH / _WET or the calibration.
 	float                   mat_lo = 0.15f, mat_hi = 0.30f, mat_scale = 1.0f;
 	bool                    mat_auto = false, mat_forced = false;
+	float                   wet_cap = 1.0f;
 	const int32_t*          mapped    = nullptr;
 	bool                    frame_cleared = false;
 	uint64_t                frame = 0;
@@ -511,6 +512,12 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	            static_cast<unsigned long long>(copies - g_rt.stat_copies0), static_cast<unsigned long long>(g_rt.stat_frames),
 	            100.0 * sm[6] / px, g_rt.dec_normal >= 0 ? "decoded" : "not identified: depth normals",
 	            g_rt.row0_up ? "row 0 = NDC +1" : "row 0 = NDC -1", g_rt.samples > 0 ? g_rt.sum_ms / g_rt.samples : 0.0);
+	{
+		// (the wet cap for the next 10 s: material-wet on more than 40 % of the pixels scales it down)
+		const double wet = static_cast<double>(sm[9]) / px;
+		g_rt.wet_cap     = wet > 0.4 ? static_cast<float>(0.4 / wet) : 1.0f;
+		if (wet > 0.4) std::printf("RT reflections: material wet on %.0f%% of the pixels: wet strength x%.2f\n", 100.0 * wet, g_rt.wet_cap);
+	}
 	std::string passes;
 	for (uint32_t st = 0; st < 9; ++st) {
 		if (g_rt.stage_frames[st] == 0) continue;
@@ -860,7 +867,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		header[33] = min_refl; // (fparams.y)
 		header[34] = cap_px;   // (fparams.z)
 		header[35] = have_mat ? 0.0f : guess; // (fparams.w: the puddle guess's scale; off with a material field)
-		header[36] = g_rt.mat_lo, header[37] = g_rt.mat_hi, header[38] = g_rt.mat_scale; // (mparams)
+		header[36] = g_rt.mat_lo, header[37] = g_rt.mat_hi, header[38] = g_rt.mat_scale;
+		header[39] = g_rt.wet_cap; // (mparams.w: 1, or 0.4 / the wet share when more than 40 % of the pixels are wet) // (mparams)
 		command.updateBuffer(vk::Buffer(g_rt.frame_buf), 0, HeaderBytes, header.data());
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
