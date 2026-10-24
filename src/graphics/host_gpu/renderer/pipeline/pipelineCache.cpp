@@ -2443,10 +2443,33 @@ void PipelineCache::EvictIdlePipelines() {
 	const bool scene_left = SweepsWorldsLeft() && !m_scene_swept && now - m_scene_since >= SceneSettle;
 	uint64_t video = 0, budget = 0;
 	const bool known = m_graphics.QueryLocalVideoMemory(&video, &budget);
+	m_evict_pressure = known && (settings.always || video + EvictMargin >= budget);
+	// Pipelines evicted while idle that keep coming back cost their remakes and give nothing back: issue #85's RTX 2060
+	// (6 GB), played from Boletaria's start to the dragon, evicted 11,721 and made 5,599 of them again (9.3 s of the
+	// render thread, up to 66 ms each) while the driver's share of the video memory stayed at 830 MiB. Past
+	// MinIdleSample evicted while idle, with a quarter of them or more made again (the worlds left's remakes counted
+	// too), none is evicted while idle for the rest of the session (KYTY_PIPELINE_EVICT=2, a test, still evicts); the
+	// worlds left still go (SweepsWorldsLeft).
+	constexpr uint64_t MinIdleSample = 512;
+	if (m_evict_pressure && !settings.always && !m_idle_evict_off) {
+		const auto idle_evicted = g_pipeline_evictions.evicted.load(std::memory_order_relaxed) -
+		                          g_pipeline_evictions.scene.load(std::memory_order_relaxed);
+		const auto remade = g_pipeline_evictions.remade.load(std::memory_order_relaxed);
+		if (idle_evicted >= MinIdleSample && remade * 4 >= idle_evicted) {
+			m_idle_evict_off = true;
+			std::printf("Pipelines out of video memory while idle: %llu of the %llu evicted made again (%.0f ms): none "
+			            "evicted while idle from here on\n",
+			            static_cast<unsigned long long>(remade), static_cast<unsigned long long>(idle_evicted),
+			            static_cast<double>(g_pipeline_evictions.remake_us.load(std::memory_order_relaxed)) / 1000.0);
+			std::fflush(stdout);
+		}
+	}
+	if (m_idle_evict_off) m_evict_pressure = false;
+	// Our RAM guard / RAM diet still evicts under RAM pressure, whatever the idle-evict cut-off above.
 	// RAM pressure (ram-guard.h): pipelines idle 60 s (20 s when critical) leave too, whatever the video memory; each
 	// held ~220 KB of the driver's RAM and is made again from the static store at its next binding.
 	const int ram_pressure = RamGuard::PressureLevel();
-	m_evict_pressure = (known && (settings.always || video + EvictMargin >= budget)) || RamDietEnabled() || ram_pressure != 0;
+	m_evict_pressure = m_evict_pressure || RamDietEnabled() || ram_pressure != 0;
 	if (RamDietEnabled()) {
 		// Replaced unoptimized pipelines past RamDietReplacedSeconds (pushed in time order).
 		const auto old = (now - std::chrono::seconds(RamDietReplacedSeconds)).time_since_epoch().count();

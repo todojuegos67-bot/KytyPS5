@@ -482,9 +482,11 @@ private:
 	// (EvictIdlePipelines) A graphics pipeline's inputs, as its remake keeps them.
 	struct GraphicsMakeInputs;
 	std::shared_ptr<const std::function<void(Pipeline&)>> GraphicsRemake(GraphicsMakeInputs inputs);
-	// (EvictIdlePipelines) When each recent flip began (steady clock, by flip % size), and the video memory pressure.
+	// (EvictIdlePipelines) When each recent flip began (steady clock, by flip % size), the video memory pressure, and
+	// whether the pipelines evicted while idle came back too often for more of it.
 	std::array<int64_t, 32768> m_flip_times {};
 	bool                      m_evict_pressure = false;
+	bool                      m_idle_evict_off = false;
 	// (EvictIdlePipelines) The world the game is in: its SceneTags generation, the flip and time it began (and the flip
 	// the world before it began), and whether the pipelines of the worlds before those two went.
 	uint64_t                              m_scene_generation = 0;
