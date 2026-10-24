@@ -8,6 +8,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "local/mem-guard.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
 #include "local-platform.h"
@@ -357,6 +358,9 @@ int main(int argc, char* argv[]) {
 #endif
 	VirtualMemory::Init();
 	InitializeThreads();
+	// Out of memory without a crash: the release-and-retry guard's thread and operator new's handler (mem-guard.h).
+	MemGuard::Start();
+	MemGuard::LogState("start");
 
 	RunOptions options;
 	bool       show_help = false;

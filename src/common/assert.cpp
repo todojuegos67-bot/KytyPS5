@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "kytyGitVersion.h"
+#include "local/mem-guard.h"
 
 #include <atomic>
 #include <chrono>
@@ -56,8 +57,11 @@ static void WriteFatalBacktrace() {
 
 static std::string BuildFatalReport(const char* title, std::string_view text, const char* file,
                                     int line) {
-	return fmt::format("--- Build ---\n{}\n{}\n{} in {}:{}\n", KYTY_BUILD_LABEL, title, text, file,
-	                   line);
+	// The memory state too (16 GB PCs: a fatal error at the commit limit reads as RAM, not as a bug).
+	char memory[256];
+	MemGuard::FormatState(memory, sizeof(memory));
+	return fmt::format("--- Build ---\n{}\n{}\n{} in {}:{}\n--- Memory ---\n{}\n", KYTY_BUILD_LABEL, title, text,
+	                   file, line, memory);
 }
 
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
@@ -129,6 +133,8 @@ void DbgExit(int status) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
+	// (System nearly out of memory: a message box says RAM is the likely cause.)
+	MemGuard::NoteFatalExit();
 	RunExitDrain();
 #if defined(_WIN32)
 	// Not ExitProcess (std::_Exit): it kills the other threads wherever they are and then runs the DLLs'

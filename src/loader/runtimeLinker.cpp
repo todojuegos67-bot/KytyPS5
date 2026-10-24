@@ -1,4 +1,5 @@
 #include "loader/runtimeLinker.h"
+#include "local/mem-guard.h"
 #include "loader/gameArgs.h"
 
 #include "common/assert.h"
@@ -993,6 +994,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			            page.Protect, page.Type, page.BaseAddress, page.RegionSize);
 		}
 #endif
+		MemGuard::LogState("at the fault");
+		if (MemGuard::SystemNearlyOut())
+			std::printf("The system is nearly out of memory (RAM or commit): the likely cause of this fault.\n");
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64 " (%s)"

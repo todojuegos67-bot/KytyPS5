@@ -7,6 +7,7 @@
 #include "writeback-verify.h"
 #include "fresh-memory.h"
 #include "guest-lazy-commit.h"
+#include "mem-guard.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"

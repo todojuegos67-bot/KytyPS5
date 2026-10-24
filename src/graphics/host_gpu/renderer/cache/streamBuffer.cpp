@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "device-fault.h"
+#include "local/mem-guard.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -319,7 +320,16 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	if (!created) {
 		graphics.TrimImagePool();
 		allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-		if (!create()) graphics.ReportMemoryFallback("a buffer could not be created", size);
+		created = create();
+		if (!created) graphics.ReportMemoryFallback("a buffer could not be created", size);
+	}
+	// Still refused: release passes (MemGuard: caches, pools, the heaps) and more tries; then the clear out-of-memory
+	// message instead of an exit with no word on the cause.
+	for (int attempt = 0; !created; ++attempt) {
+		if (!MemGuard::ShouldRetry("a GPU buffer (vmaCreateBuffer)", size, attempt))
+			MemGuard::FatalOutOfMemory("a GPU buffer (vmaCreateBuffer)", size);
+		graphics.TrimImagePool();
+		created = create();
 	}
 	EXIT_NOT_IMPLEMENTED(native_buffer == VK_NULL_HANDLE);
 
@@ -551,8 +561,13 @@ void Buffer::MakeResident(uint64_t offset, uint64_t size) {
 			allocate.allocationSize  = sparse.page_size * SparseChunkPages;
 			allocate.memoryTypeIndex = sparse.memory_type;
 			VkDeviceMemory chunk     = VK_NULL_HANDLE;
-			EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(static_cast<VkDevice>(m_graphics->device), &allocate, nullptr, &chunk) !=
-			                     VK_SUCCESS);
+			// (Refused: release passes and more tries, then the clear out-of-memory message, MemGuard.)
+			for (int attempt = 0; VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(static_cast<VkDevice>(m_graphics->device),
+			                                                                     &allocate, nullptr, &chunk) != VK_SUCCESS;
+			     ++attempt) {
+				if (!MemGuard::ShouldRetry("sparse buffer memory (vkAllocateMemory)", allocate.allocationSize, attempt))
+					MemGuard::FatalOutOfMemory("sparse buffer memory (vkAllocateMemory)", allocate.allocationSize);
+			}
 			sparse.chunks.push_back(chunk);
 			sparse.free_in_chunk = SparseChunkPages;
 		}

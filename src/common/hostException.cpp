@@ -1,6 +1,7 @@
 #include "common/hostException.h"
 
 #include "common/guardedCopy.h"
+#include "local/mem-guard.h"
 
 #include <atomic>
 #include <cstdio>
@@ -188,6 +189,10 @@ static void ReportFatal(const char* what) {
 			DescribeAddress(reinterpret_cast<uint64_t>(frames[i]), where, sizeof(where));
 			std::fprintf(stream, "  #%u %s\n", static_cast<unsigned>(i), where);
 		}
+		char memory[256];
+		MemGuard::FormatState(memory, sizeof(memory));
+		std::fprintf(stream, "Memory: %s%s\n", memory,
+		             MemGuard::SystemNearlyOut() ? " (the system is nearly out of memory: the likely cause)" : "");
 		std::fflush(stream);
 	}
 }
@@ -201,6 +206,7 @@ static LONG WINAPI OnUnhandledException(PEXCEPTION_POINTERS exception) {
 	std::snprintf(what, sizeof(what), "an exception nothing handled, code 0x%08lx at %s%s%s", record->ExceptionCode,
 	              where, *type != '\0' ? ", C++ type " : "", type);
 	ReportFatal(what);
+	MemGuard::NoteFatalExit();
 	return g_previous_unhandled_filter != nullptr ? g_previous_unhandled_filter(exception) : EXCEPTION_CONTINUE_SEARCH;
 }
 

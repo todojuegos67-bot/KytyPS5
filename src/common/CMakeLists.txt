@@ -6,6 +6,11 @@ file(GLOB common_src CONFIGURE_DEPENDS
 
 file(GLOB_RECURSE common_headers CONFIGURE_DEPENDS "*.h")
 
+# The memory guard (release on allocation failure, the clear out-of-memory message) lives with the fork's local code
+# but the platform layer and the tests call it: it is part of this library.
+list(APPEND common_src "${KYTY_SOURCE_DIR}/local/mem-guard.cpp")
+list(APPEND common_headers "${KYTY_SOURCE_DIR}/local/mem-guard.h")
+
 if(KYTY_CLANG_CL)
 	set_source_files_properties(${common_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack")
 endif()
