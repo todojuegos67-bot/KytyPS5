@@ -9,6 +9,7 @@
 #include "common/virtualMemory.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
+#include "local/ram-guard.h"
 
 #include <atomic>
 #include <charconv>
@@ -831,6 +832,10 @@ static int Main(int argc, char* argv[]) {
 		PrintUsage();
 		return 0;
 	}
+
+	// bruno-astro-1025: the RAM guard (local/ram-guard.h): the low-RAM profile logged, the pressure watcher started.
+	RamGuard::ApplyLowRamDefaults();
+	RamGuard::Start();
 
 	Run(options);
 
