@@ -2,16 +2,22 @@
 // volumetric halos around torches and fires, on Demon's Souls' PS5 Pro path. Recorded in FrameGen::Upscale after the other
 // screen-space passes (last, after shine), on the pre-exposure HDR color, before the upscaler.
 //
-// Per frame (compute, one pipeline, push descriptors), four dispatches:
+// Per frame (compute, one pipeline, push descriptors), six dispatches:
 //   lights    a 16x9 grid of cells, 64 fixed taps a cell: the brightest emissive tap (KYTY_GODRAYS_LIGHT, exposed 3.0)
 //   track     one thread: up to 2 / 4 / 8 lights tracked across frames (motion-reprojected, matched, faded in / out)
 //   volume    quarter resolution: the occlusion-aware radial march toward the sun on screen (32 / 48 / 64 taps) and,
 //             level >= 2, the view-ray march shadowed toward the sun against the depth (12 / 16 steps x 5 taps);
-//             jittered, accumulated over frames
+//             jittered (IGN + golden-ratio rotation per frame), raw
+//   temporal  quarter resolution: reprojected history (depth-tested), length up to 20 / 32 (dark) frames when still,
+//             ~10 on motion, clamped to the raw neighbourhood (10-25: the old 0.1 EMA of a jittered, sub-texel-moved
+//             sample left a visible dither when standing still, worst in dark fog)
+//   spatial   quarter resolution: a depth-aware 3x3 bilateral blur before the composite
 //   composite full resolution: the volume x the sun's hue + the lights' analytic halos; added display-referred
 //             (x the game's exposure), hue-preserving, soft-capped (0.10 / 0.18 / 0.28 x strength exposed luminance)
 // The sun direction comes from KYTY_RT_SHADOWS (CShadowApply's latched sun): without it, lights only. The sun on screen
 // fades in / out over ~0.5 s as it crosses the frame edge (+-25 %); at level 1 the shafts go with it.
+// Bajo / Medio (1 / 2): the in-scattering boosted where light is actually visible (the sky mask of the radial march,
+// partly lit view rays = shafts through gaps), halos and the cap raised a little. KYTY_GODRAYS_DEBUG=1: our light only.
 // Every 10 s: "GODRAYS: stats" with the GPU ms, the sun on / off screen and the lights used.
 #include "local/godrays.h"
 
@@ -30,7 +36,7 @@
 namespace Libs::Graphics::FrameGen {
 namespace {
 
-constexpr uint32_t Bindings    = 8;
+constexpr uint32_t Bindings    = 10;
 constexpr uint32_t StatsWord   = 4;
 constexpr uint32_t StatsCount  = 16;
 constexpr uint32_t Cells       = 16 * 9;
@@ -63,6 +69,7 @@ struct {
 	bool                    failed = false;
 	Img                     out;
 	std::array<Img, 2>      vol;
+	Img                     raw, filt; // (quarter: this frame's raw volume, the filtered one)
 	vk::Extent2D            extent {}, qextent {};
 	bool                    ready = false, history_valid = false;
 	VkBuffer                frame_buf = VK_NULL_HANDLE, read_buf = VK_NULL_HANDLE;
@@ -176,7 +183,7 @@ void FreeRetired(GraphicContext& graphics) {
 
 vk::DescriptorType DescType(uint32_t i) {
 	return (i == 6 || i == 7) ? vk::DescriptorType::eStorageBuffer
-	       : (i == 4 || i == 5) ? vk::DescriptorType::eStorageImage
+	       : (i == 4 || i == 5 || i == 9) ? vk::DescriptorType::eStorageImage
 	                            : vk::DescriptorType::eCombinedImageSampler;
 }
 
@@ -265,12 +272,16 @@ bool EnsureImages(GraphicContext& graphics, vk::Extent2D extent) {
 	Retire(graphics, g_gr.out);
 	Retire(graphics, g_gr.vol[0]);
 	Retire(graphics, g_gr.vol[1]);
+	Retire(graphics, g_gr.raw);
+	Retire(graphics, g_gr.filt);
 	g_gr.ready = false, g_gr.history_valid = false;
 	g_gr.extent  = extent;
 	g_gr.qextent = vk::Extent2D {(extent.width + 3) / 4, (extent.height + 3) / 4};
 	return MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, extent, g_gr.out) &&
 	       MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, g_gr.qextent, g_gr.vol[0]) &&
-	       MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, g_gr.qextent, g_gr.vol[1]);
+	       MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, g_gr.qextent, g_gr.vol[1]) &&
+	       MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, g_gr.qextent, g_gr.raw) &&
+	       MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, g_gr.qextent, g_gr.filt);
 }
 
 void ReadTiming(GraphicContext& graphics) {
@@ -403,9 +414,14 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const int   slots  = level >= 3 ? 8 : level == 2 ? 4 : 2;
 	const int   taps   = level >= 3 ? 64 : level == 2 ? 48 : 32;
 	const int   steps  = level >= 3 ? 16 : level == 2 ? 12 : 0;
-	const float cap    = (level >= 3 ? 0.28f : level == 2 ? 0.18f : 0.10f) * strength;
-	const float lstr   = (level >= 3 ? 1.0f : level == 2 ? 0.75f : 0.5f) * strength;
-	const float sstr   = (level >= 3 ? 1.0f : level == 2 ? 0.7f : 0.45f) * strength;
+	// (10-25: Bajo / Medio raised a little: 0.10 / 0.18 cap, 0.5 / 0.75 halos, 0.45 / 0.7 sun before)
+	const float cap    = (level >= 3 ? 0.28f : level == 2 ? 0.22f : 0.14f) * strength;
+	const float lstr   = (level >= 3 ? 1.0f : level == 2 ? 0.95f : 0.7f) * strength;
+	const float sstr   = (level >= 3 ? 1.0f : level == 2 ? 0.85f : 0.6f) * strength;
+	static const bool debug = [] {
+		const char* v = std::getenv("KYTY_GODRAYS_DEBUG");
+		return v != nullptr && *v == '1';
+	}();
 
 	GodraysPush push {};
 	push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
@@ -420,10 +436,11 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.motion[3] = static_cast<float>(steps);
 	const bool game_exposure = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
 	push.misc[1] = static_cast<int32_t>(g_gr.frame & 0x7fffffff);
-	push.misc[2] = row0_up ? 1 : 0;
+	push.misc[2] = (row0_up ? 1 : 0) | (debug ? 2 : 0);
 	push.misc[3] = game_exposure ? static_cast<int32_t>(inputs.exposure_index) : static_cast<int32_t>(ExposureIdx);
 	push.extra[0] = static_cast<float>(g_gr.qextent.width), push.extra[1] = static_cast<float>(g_gr.qextent.height);
 	push.extra[2] = lstr;
+	push.extra[3] = level <= 2 ? 1.0f : 0.0f; // (the visibility boost)
 
 	const auto entry = static_cast<uint32_t>(g_gr.written % 8);
 	const bool timed = g_gr.pool != nullptr && g_gr.written < g_gr.read + 8;
@@ -436,6 +453,7 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite);
 	if (!g_gr.ready) {
 		ToGeneral(command, g_gr.out.image), ToGeneral(command, g_gr.vol[0].image), ToGeneral(command, g_gr.vol[1].image);
+		ToGeneral(command, g_gr.raw.image), ToGeneral(command, g_gr.filt.image);
 		g_gr.ready = true;
 	}
 	if (!g_gr.cleared) {
@@ -463,6 +481,8 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	infos[3] = {g_gr.linear, g_gr.vol[cur ^ 1u].view, gen};
 	infos[4] = {nullptr, g_gr.vol[cur].view, gen};
 	infos[5] = {nullptr, g_gr.out.view, gen};
+	infos[8] = {g_gr.point, g_gr.filt.view, gen}; // (lights / track / volume: not read)
+	infos[9] = {nullptr, g_gr.raw.view, gen};     // volume: the raw scatter
 	const vk::DescriptorBufferInfo frame_info {vk::Buffer(g_gr.frame_buf), 0, VK_WHOLE_SIZE};
 	const vk::DescriptorBufferInfo exposure_info =
 	    game_exposure ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range} : frame_info;
@@ -490,9 +510,23 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	run(0, 16, 9);
 	run(1, 1, 1);
 	run(2, (g_gr.qextent.width + 7) / 8, (g_gr.qextent.height + 7) / 8);
-	// The composite reads this frame's volume (binding 3 becomes it; binding 4 is not used there).
-	infos[3] = {g_gr.linear, g_gr.vol[cur].view, gen};
+	const uint32_t qx = (g_gr.qextent.width + 7) / 8, qy = (g_gr.qextent.height + 7) / 8;
+	// Temporal: raw (8) + last frame's history (3) -> this frame's (4).
+	infos[8] = {g_gr.point, g_gr.raw.view, gen};
+	infos[9] = {nullptr, g_gr.filt.view, gen}; // (not written)
+	push_set();
+	run(4, qx, qy);
+	// Spatial: this frame's history (8) -> filtered (9).
+	infos[8] = {g_gr.point, g_gr.vol[cur].view, gen};
+	infos[9] = {nullptr, g_gr.filt.view, gen};
+	infos[4] = {nullptr, g_gr.raw.view, gen}; // (not written)
+	push_set();
+	run(5, qx, qy);
+	// The composite reads the filtered volume (binding 3 becomes it; 4 and 9 are not used there).
+	infos[3] = {g_gr.linear, g_gr.filt.view, gen};
 	infos[4] = {nullptr, g_gr.vol[cur ^ 1u].view, gen};
+	infos[8] = {g_gr.point, g_gr.vol[cur].view, gen};
+	infos[9] = {nullptr, g_gr.raw.view, gen};
 	push_set();
 	run(3, (color.extent.width + 7) / 8, (color.extent.height + 7) / 8);
 	Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,

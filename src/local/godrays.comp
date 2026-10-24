@@ -12,8 +12,17 @@
 //   2 volume:    quarter resolution: (a) the sun on screen: an occlusion-aware radial march toward it over the depth
 //                (sky / very far = light, the rest occludes), 32..64 jittered taps; (b) level >= 2: a raymarch along
 //                the view ray (12 / 16 steps up to 60 m), every step tested toward the sun against the depth buffer
-//                (5 taps, a thickness test), Henyey-Greenstein phase: shafts even when the sun is off screen. The
-//                jittered result is accumulated over frames (reprojected, depth-rejected).
+//                (5 taps, a thickness test), Henyey-Greenstein phase: shafts even when the sun is off screen. At the
+//                quarter texel's centre (a stable depth); the jitter (the march's start) is interleaved-gradient noise
+//                in space rotated by the golden ratio each frame, so every texel walks a low-discrepancy sequence and
+//                the accumulation converges instead of leaving a fixed pattern. -> raw (aux_out)
+//   4 temporal:  quarter resolution: the raw value accumulated with the reprojected history (bilinear, each tap
+//                depth-tested); the history length rises to 20 (32 in dark pixels: weight ~0.95-0.97) where the camera
+//                and the pixel are still, to ~10 (as before) on motion, to 1 on disocclusion; the history clamped to the
+//                raw 3x3 neighbourhood's mean +- k sigma (depth-aware; k wider when still) against ghosting.
+//                -> vol_out (scatter, |view z|, history length)
+//   5 spatial:   quarter resolution: a depth-aware 3x3 bilateral blur of the accumulated volume (dilated x2 while the
+//                history is short) -> aux_out; the history itself stays unblurred.
 //   3 composite: full resolution: the volume upsampled depth-aware, x the sun's colour; the lights' analytic in-scatter
 //                along the view ray (closed-form 1/r^2 integral, cut at the surface: walls in front occlude); capped.
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -24,6 +33,8 @@ layout(binding = 2) uniform sampler2D motion_tex;
 layout(binding = 3) uniform sampler2D vol_hist;                    // last frame's volume (quarter res): (scatter, |view z|)
 layout(binding = 4, rgba16f) uniform writeonly image2D vol_out;    // this frame's
 layout(binding = 5, rgba16f) uniform writeonly image2D out_img;    // the composited color (render size)
+layout(binding = 8) uniform sampler2D aux_tex;                     // temporal: raw; spatial: accumulated
+layout(binding = 9, rgba16f) uniform writeonly image2D aux_out;    // volume: raw; spatial: filtered
 layout(std430, binding = 6) buffer Frame {
 	vec4 hdr;        // x: 1.0 (exposure fallback), y: light threshold (exposed luminance), z: light slots, w: light radius (m)
 	uint stats[16];  // 0 frames, 1 lights in use summed, 2 sun on screen frames
@@ -42,8 +53,8 @@ layout(push_constant) uniform Push {
 	vec4  sun;       // view-space direction to the sun, weight (0: no sun)
 	vec4  sun_uv;    // the sun's uv (x, y), on-screen factor (0..1), radial taps
 	vec4  motion;    // motion scale x, y, history valid (1), view-ray steps (0: off)
-	ivec4 misc;      // mode, frame, flags (1 row 0 = NDC y +1), exposure index
-	vec4  extra;     // quarter w, h, light strength, -
+	ivec4 misc;      // mode, frame, flags (1 row 0 = NDC y +1, 2 debug: our light only), exposure index
+	vec4  extra;     // quarter w, h, light strength, visibility boost (0..1: Bajo / Medio)
 } push;
 
 const int CW = 16;
@@ -230,9 +241,9 @@ float Hg(float c, float g) {
 void Volume(ivec2 q) {
 	vec2 qs = push.extra.xy;
 	if (q.x >= int(qs.x) || q.y >= int(qs.y)) return;
-	float j  = fract(Ign(vec2(q) + float(push.misc.y % 64) * vec2(5.588, 7.31)));
-	vec2  sj = vec2(fract(j * 7.13), fract(j * 3.71));
-	vec2  uv = (vec2(q) + sj) / qs;
+	// (spatial IGN + a golden-ratio rotation per frame: an R1 sequence per texel, decorrelated between neighbours)
+	float j  = fract(Ign(vec2(q) + 0.5) + float(push.misc.y & 1023) * 0.61803399);
+	vec2  uv = (vec2(q) + 0.5) / qs;
 	float d  = DepthAt(uv);
 	bool  sky = IsSky(d);
 	float vz  = sky ? 2e3 : abs(ViewZ(d));
@@ -256,7 +267,8 @@ void Volume(ivec2 q) {
 		}
 		float lit = wsum > 0.0 ? acc / wsum : 0.0;
 		float fall = exp(-dist * 2.2);
-		scatter += lit * fall * push.sun_uv.z * (sky ? 0.35 : 1.0);
+		// (the sky mask is real visibility through openings: boosted at Bajo / Medio)
+		scatter += lit * fall * push.sun_uv.z * (sky ? 0.35 : 1.0) * (1.0 + 0.5 * push.extra.w);
 	}
 	// (b) the raymarch along the view ray, each step shadowed toward the sun against the depth buffer.
 	int steps = int(push.motion.w);
@@ -289,21 +301,90 @@ void Volume(ivec2 q) {
 		}
 		float phase = clamp(Hg(dot(dir, L), 0.55) / 1.0, 0.0, 6.0) / 6.0; // (1 toward the sun, ~0.03 away)
 		// The shafts' contrast, not a uniform haze: lit length / 60 m, weighted by the phase.
-		scatter += (lit / 60.0) * phase * 0.35;
+		// Boost by the shaft-ness of the ray: partly lit rays (light through gaps) gain, fully lit or fully shadowed
+		// ones (a uniform haze indoors / outdoors) do not.
+		float fr = tmax > 0.0 ? clamp(lit / tmax, 0.0, 1.0) : 0.0;
+		scatter += (lit / 60.0) * phase * 0.35 * (1.0 + push.extra.w * (0.15 + 2.4 * fr * (1.0 - fr)));
 	}
 	scatter *= push.sun.w;
-	// Temporal accumulation (the jitter converges; depth-rejected on disocclusion).
-	if (push.motion.z > 0.0) {
-		vec2 mv  = textureLod(motion_tex, uv, 0).xy * push.motion.xy;
-		vec2 puv = uv + mv / RenderSize();
-		if (all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
-			vec2  h  = textureLod(vol_hist, puv, 0).rg;
-			float rz = abs(h.y - min(vz, 2e3)) / max(min(vz, 2e3), 1.0);
-			if (!isnan(h.x) && rz < 0.15) scatter = mix(h.x, scatter, 0.1);
-			else scatter = mix(h.x, scatter, 0.5);
+	imageStore(aux_out, q, vec4(isnan(scatter) ? 0.0 : clamp(scatter, 0.0, 4.0), min(vz, 2e3), 0, 1));
+}
+
+bool SameDepth(float a, float b, float tol) { return abs(a - b) < tol * max(b, 1.0); }
+
+void Temporal(ivec2 q) {
+	vec2 qs = push.extra.xy;
+	if (q.x >= int(qs.x) || q.y >= int(qs.y)) return;
+	ivec2 qm = ivec2(qs) - 1;
+	vec2  c0 = texelFetch(aux_tex, q, 0).rg;
+	float vz = c0.y;
+	// The raw neighbourhood (depth-aware moments).
+	float m1 = 0.0, m2 = 0.0, wn = 0.0;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			vec2 t = texelFetch(aux_tex, clamp(q + ivec2(x, y), ivec2(0), qm), 0).rg;
+			if (!SameDepth(t.y, vz, 0.15)) continue;
+			m1 += t.x, m2 += t.x * t.x, wn += 1.0;
 		}
+	m1 /= wn, m2 /= wn; // (wn >= 1: the centre)
+	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
+	float cur = c0.x;
+	float acc = cur, n = 1.0;
+	if (push.motion.z > 0.0) {
+		vec2  uv  = (vec2(q) + 0.5) / qs;
+		vec2  mv  = textureLod(motion_tex, uv, 0).xy * push.motion.xy; // (render pixels)
+		vec2  pq  = (uv + mv / RenderSize()) * qs - 0.5;
+		ivec2 p0  = ivec2(floor(pq));
+		vec2  f   = pq - vec2(p0);
+		float hs = 0.0, hn = 0.0, hw = 0.0;
+		for (int k = 0; k < 4; ++k) {
+			ivec2 o  = ivec2(k & 1, k >> 1);
+			ivec2 pp = p0 + o;
+			if (any(lessThan(pp, ivec2(0))) || any(greaterThan(pp, qm))) continue;
+			vec4  h  = texelFetch(vol_hist, pp, 0);
+			float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+			if (isnan(h.x) || !SameDepth(h.y, vz, 0.1)) continue;
+			hs += h.x * bw, hn += h.z * bw, hw += bw;
+		}
+		if (hw > 0.3) {
+			float h  = hs / hw;
+			float hl = hn / hw;
+			// Still = the camera and this pixel: the history may grow long (more in dark pixels, where the tonemap
+			// shows the noise most); moving: ~10 frames, as before.
+			float mpix  = length(mv);
+			float still = 1.0 - smoothstep(0.1, 1.5, mpix);
+			float e     = GameExposure();
+			float dark  = 1.0 - smoothstep(0.03, 0.3, Luma(Safe(textureLod(color_tex, uv, 0).rgb)) * e);
+			float nmax  = mix(10.0, mix(20.0, 32.0, dark), still);
+			float k     = mix(1.25, 3.0, still);
+			h  = clamp(h, m1 - k * sigma - 1e-3, m1 + k * sigma + 1e-3);
+			n  = min(hl * hw + 1.0, nmax); // (partly rejected history: shorter)
+			acc = mix(h, cur, 1.0 / n);
+		} else {
+			// Disocclusion: start from the neighbourhood's mean (less noisy than one sample).
+			acc = mix(cur, m1, 0.5);
+		}
+	} else {
+		acc = mix(cur, m1, 0.5);
 	}
-	imageStore(vol_out, q, vec4(isnan(scatter) ? 0.0 : clamp(scatter, 0.0, 4.0), min(vz, 2e3), 0, 1));
+	imageStore(vol_out, q, vec4(isnan(acc) ? 0.0 : clamp(acc, 0.0, 4.0), vz, n, 1));
+}
+
+void Spatial(ivec2 q) {
+	vec2 qs = push.extra.xy;
+	if (q.x >= int(qs.x) || q.y >= int(qs.y)) return;
+	ivec2 qm = ivec2(qs) - 1;
+	vec4  c  = texelFetch(aux_tex, q, 0);
+	int   st = c.z < 4.0 ? 2 : 1; // (a short history: wider)
+	float s = 0.0, w = 0.0;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			vec2  t  = texelFetch(aux_tex, clamp(q + ivec2(x, y) * st, ivec2(0), qm), 0).rg;
+			float gw = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
+			float dw = exp(-abs(t.y - c.y) / max(0.04 * c.y, 0.05));
+			s += t.x * gw * dw, w += gw * dw;
+		}
+	imageStore(aux_out, q, vec4(w > 0.0 ? s / w : c.x, c.y, c.z, 1));
 }
 
 void Composite(ivec2 p) {
@@ -370,6 +451,7 @@ void Composite(ivec2 p) {
 		float nl = cap * (1.0 - exp(-al / cap)) / (1.0 + 0.5 * bl);
 		add *= nl / al;
 	}
+	if ((push.misc.z & 2) != 0) c = vec3(0); // (KYTY_GODRAYS_DEBUG=1: our light alone, on black)
 	imageStore(out_img, p, vec4(Safe(c + add / e), 1.0));
 }
 
@@ -378,5 +460,7 @@ void main() {
 	else if (push.misc.x == 1) {
 		if (gl_GlobalInvocationID.xy == uvec2(0)) Track();
 	} else if (push.misc.x == 2) Volume(ivec2(gl_GlobalInvocationID.xy));
+	else if (push.misc.x == 4) Temporal(ivec2(gl_GlobalInvocationID.xy));
+	else if (push.misc.x == 5) Spatial(ivec2(gl_GlobalInvocationID.xy));
 	else Composite(ivec2(gl_GlobalInvocationID.xy));
 }
