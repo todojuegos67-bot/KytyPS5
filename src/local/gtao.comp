@@ -40,6 +40,7 @@ layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
 layout(binding = 8, rgba16f) uniform writeonly image2D gbuf_out;
 layout(binding = 9) uniform sampler2D aux_tex;
 layout(binding = 10, rgba16f) uniform writeonly image2D aux_out;
+layout(binding = 11) uniform usampler2D gb_normal; // the packed G-buffer's normal layer (RtReflGetGbuffer), or a 1x1 dummy
 
 layout(push_constant) uniform Push {
 	vec4  proj;      // M[0], M[5], M[8], M[9]
@@ -47,7 +48,10 @@ layout(push_constant) uniform Push {
 	vec4  motion;    // motion_scale.xy, render size.xy
 	vec4  trace;     // trace size.xy, strength, radius (view units, metres)
 	ivec4 misc;      // mode, frame index, level, flags (bit0 reset, bit1 history valid)
-	vec4  extra;     // a-trous step, bent strength, unused, unused
+	vec4  extra;     // a-trous step, bent strength, thickness (m), max screen radius (fraction of the height)
+	vec4  rot[2];    // world -> view rotation rows 0 and 1 packed (r00 r01 r02 r10, r11 r12 r20 r21) and r22 in misc.w
+                     // via the flags: misc.w bit 2 G-buffer normal, bit 3 y flip; row 2 = cross(row 0, row 1) * (bit 4 ? -1 : 1)
+                     // (128 bytes: the guaranteed push constant size)
 } push;
 
 const float PI      = 3.14159265;
@@ -93,6 +97,40 @@ vec3 NormalAt(vec2 uv, vec3 p) {
 	return n;
 }
 
+// The G-buffer normal (Demon's Souls: layer 3, oct 8:8 bits 0..15, world space), into this shader's view space (its
+// ViewPos does not flip y, the G-buffer camera's rows do: y negated when flag 2). Used only where it agrees with the
+// depth normal (water, particles and edges drawn after the copy keep the depth normal); smooth, so flat walls do not
+// self-occlude from 720p depth-derivative noise.
+float Bits8(uint w, int sh) { return float((w >> uint(sh)) & 255u) / 255.0; }
+vec3 OctDec(vec2 e) {
+	e       = e * 2.0 - 1.0;
+	vec3  n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+	float t = max(-n.z, 0.0);
+	n.x += n.x >= 0.0 ? -t : t;
+	n.y += n.y >= 0.0 ? -t : t;
+	return normalize(n);
+}
+vec3 SurfaceNormal(vec2 uv, vec3 P, vec3 Ng) {
+	int flags = push.misc.w >> 2;
+	if ((flags & 1) == 0) return Ng;
+	ivec2 gs = textureSize(gb_normal, 0);
+	ivec2 q  = clamp(ivec2(uv * vec2(gs)), ivec2(0), gs - 1);
+	uint  w  = texelFetch(gb_normal, q, 0).r;
+	if (w == 0u) return Ng;
+	vec3 nw = OctDec(vec2(Bits8(w, 0), Bits8(w, 8)));
+	vec3 r0 = push.rot[0].xyz, r1 = vec3(push.rot[0].w, push.rot[1].xy);
+	vec3 r2 = cross(r0, r1) * ((flags & 4) != 0 ? -1.0 : 1.0);
+	vec3 n  = vec3(dot(r0, nw), dot(r1, nw), dot(r2, nw));
+	if ((flags & 2) != 0) n.y = -n.y;
+	float l = length(n);
+	if (!(l > 1e-3)) return Ng;
+	n /= l;
+	if (dot(n, -P) < 0.0) n = -n;
+	float a = dot(n, Ng);
+	// agreeing: the G-buffer's; a bit off: blended toward it; disagreeing: the geometric one
+	return normalize(mix(Ng, n, smoothstep(0.5, 0.8, a)));
+}
+
 void Gtao(ivec2 pixel) {
 	vec2  uv = (vec2(pixel) + 0.5) / TraceSize();
 	float d  = textureLod(depth_tex, uv, 0).r;
@@ -102,7 +140,7 @@ void Gtao(ivec2 pixel) {
 		return;
 	}
 	vec3  P = ViewPos(uv, d);
-	vec3  N = NormalAt(uv, P);
+	vec3  N = SurfaceNormal(uv, P, NormalAt(uv, P));
 	float z = abs(P.z);
 	imageStore(gbuf_out, pixel, vec4(N, z));
 	vec3 V = normalize(-P);
@@ -120,6 +158,9 @@ void Gtao(ivec2 pixel) {
 	// The radius on screen (uv units, along y): r * proj_y / (2 w).
 	float w_clip    = abs(P.z * push.depth_map.z + push.depth_map.w);
 	float screen_r  = radius * abs(push.proj.y) * 0.5 / max(w_clip, 1e-4);
+	// Clamped on screen (close-ups: a 1 m radius on a face 0.5 m away spanned the screen, darkening it by the wall behind).
+	screen_r        = min(screen_r, push.extra.w);
+	float thickness = push.extra.z;
 	vec2  aspect    = vec2(TraceSize().y / TraceSize().x, 1.0);
 	float min_s     = 1.3 / TraceSize().y; // XeGTAO's pixel-too-close skip
 	if (screen_r * TraceSize().y < 1.0) {
@@ -164,7 +205,13 @@ void Gtao(ivec2 pixel) {
 					float len = length(dl);
 					float shc = dot(dl / max(len, 1e-6), V);
 					float wgt = clamp(len * falloff_mul + falloff_add, 0.0, 1.0);
-					hc0 = max(hc0, mix(low0, shc, wgt));
+					// thin-object heuristic: an occluder standing far in front (along the view) of the surface is
+					// probably thin (a character, a bar, hair), not a wall: it counts less, and a sample under the
+					// horizon lets the horizon fall back a little (Activision / XeGTAO thin occluder compensation).
+					float front = dot(dl, V);
+					wgt *= 1.0 - smoothstep(thickness, thickness * 3.0, front);
+					float cand = mix(low0, shc, wgt);
+					hc0 = cand > hc0 ? cand : mix(hc0, cand, 0.06);
 				}
 			}
 			if (all(greaterThanEqual(uv1, vec2(0))) && all(lessThanEqual(uv1, vec2(1)))) {
@@ -174,7 +221,13 @@ void Gtao(ivec2 pixel) {
 					float len = length(dl);
 					float shc = dot(dl / max(len, 1e-6), V);
 					float wgt = clamp(len * falloff_mul + falloff_add, 0.0, 1.0);
-					hc1 = max(hc1, mix(low1, shc, wgt));
+					// thin-object heuristic: an occluder standing far in front (along the view) of the surface is
+					// probably thin (a character, a bar, hair), not a wall: it counts less, and a sample under the
+					// horizon lets the horizon fall back a little (Activision / XeGTAO thin occluder compensation).
+					float front = dot(dl, V);
+					wgt *= 1.0 - smoothstep(thickness, thickness * 3.0, front);
+					float cand = mix(low1, shc, wgt);
+					hc1 = cand > hc1 ? cand : mix(hc1, cand, 0.06);
 				}
 			}
 		}
@@ -189,7 +242,11 @@ void Gtao(ivec2 pixel) {
 		vis += pn_len * (iarc0 + iarc1);
 	}
 	vis = clamp(vis / float(slices), 0.0, 1.0);
-	vis = pow(vis, 1.5); // XeGTAO's final value power (2.2 default), gentler
+	// Dead zone: a flat or convex surface integrates to ~1 but noise and normal error leave 0.9-0.97, which read as
+	// blotches on walls and faces: the first 12% of occlusion is dropped, so only creases and contacts darken.
+	float occ = max(1.0 - vis, 0.0);
+	occ       = max(occ - 0.12, 0.0) / 0.88;
+	vis       = 1.0 - occ * sqrt(occ); // occ^1.5: soft in the middle, full in deep creases
 	imageStore(out_img, pixel, vec4(vis, vis, vis, 1.0));
 }
 
@@ -270,17 +327,21 @@ float Upsample(vec2 uv, float z) {
 	vec2  f  = fract(tc);
 	ivec2 b  = ivec2(floor(tc));
 	ivec2 mx = ivec2(TraceSize()) - 1;
-	float sum = 0.0, wsum = 0.0;
+	float sum = 0.0, wsum = 0.0, best = 1.0, best_dz = 1e30;
 	for (int i = 0; i < 4; ++i) {
 		ivec2 o  = ivec2(i & 1, i >> 1);
 		ivec2 q  = clamp(b + o, ivec2(0), mx);
 		float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
 		float tz = texelFetch(gbuf_cur, q, 0).w;
-		float w  = (bw + 1e-3) / (1e-3 + abs(tz - z) / max(z * 0.02, 1e-3));
-		sum += texelFetch(src_a, q, 0).r * w;
+		float dz = abs(tz - z) / max(z * 0.015, 1e-3);
+		float w  = max(bw, 1e-4) * exp(-dz * dz);
+		float v  = texelFetch(src_a, q, 0).r;
+		sum += v * w;
 		wsum += w;
+		if (dz < best_dz) best_dz = dz, best = v;
 	}
-	return sum / max(wsum, 1e-6);
+	// no tap on this surface (a silhouette): the nearest-depth tap, no bleeding across the edge
+	return wsum > 1e-4 ? sum / wsum : best;
 }
 
 void Composite(ivec2 pixel) {
@@ -292,19 +353,20 @@ void Composite(ivec2 pixel) {
 		return;
 	}
 	float z    = abs(ViewZ(d));
-	float fade = 1.0 - smoothstep(60.0, 300.0, z); // (10-24 far: was 30..90 m)
+	// (10-24 far had 60..300 m: at 720p the far radius is sub-pixel noise; back to a close-range effect)
+	float fade = 1.0 - smoothstep(25.0, 90.0, z);
 	if (fade <= 0.0) {
 		imageStore(out_img, pixel, col);
 		return;
 	}
 	float ao = Upsample(uv, z);
 	ao       = (isnan(ao) || isinf(ao)) ? 1.0 : clamp(ao, 0.0, 1.0); // (a NaN through clamp is undefined: could lighten)
-	ao       = smoothstep(0.0, 1.0, ao);
-	// Soft darkening: at most half of the occlusion at strength 1 (the game has its own SSAO), floored.
-	float k   = max(mix(1.0, ao, 0.5 * push.trace.z * fade), 0.55);
-	// Optional bent multiplier: the remaining occlusion only where the pixel is dark (ambient-dominated).
+	// AO belongs on ambient / indirect light only, but this is the lit HDR color: a bright pixel is mostly direct sun or
+	// emissive, so it gets a third of the effect; dark (ambient-dominated) ones the full amount. Floored at 0.7.
 	float l   = Luma(col.rgb);
-	float amb = 1.0 - smoothstep(0.03, 0.35, l);
+	float amb = 1.0 - smoothstep(0.05, 0.6, l);
+	float k   = max(mix(1.0, ao, push.trace.z * fade * mix(0.35, 1.0, amb)), 0.7);
+	// Optional bent multiplier: the remaining occlusion only where the pixel is dark (ambient-dominated).
 	k *= mix(1.0, ao, push.extra.y * amb * fade * 0.5);
 	// Multiply only, in the input's own space: k in [0, 1], the result never above the input (no lift, no max(0)
 	// raising negative values, no normalization).
