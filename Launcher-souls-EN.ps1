@@ -46,6 +46,7 @@ try {
 	$script:ramGB = [int]$ram
 } catch { }
 $script:isNvidia = (-not $script:gpuName) -or ($script:gpuName -match 'NVIDIA|GeForce|RTX|GTX|Quadro')
+$script:isAmd = [bool]($script:gpuName -match 'AMD|Radeon')  # (10-24) AMD: su Anti-Lag 2 de serie
 # (10-23) Base de datos de graficas: el modo recomendado y lo que se puede esperar. Medido en una RTX 5080 (1440p:
 # ~75 reales, 224 en pantalla con frame generation dinamico; 4K cine ~40-48 reales) y en una de 8 GB simulada; el
 # resto es una ESTIMACION por potencia relativa (el emulador tambien depende mucho de la CPU).
@@ -232,10 +233,11 @@ function Start-Game {
 	# (10-23 21:30) NVIDIA Reflex sobre la frame generation de AMD crashea tambien sin DLSS (20261023-213004, Fsr3::QueuePresent): nunca.
 	$nvAmd  = $false
 	# Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag automatico en AMD, y en NVIDIA solo con XeSS o FSR.
-	$fixedAl = $false  # (10-24) modos fijos: Anti-Lag Ultra propio en cualquier grafica (no dos anti-lag a la vez)
+	# (10-24) Graficas AMD: su Anti-Lag 2 de serie con la frame generation de AMD (y nada mas); NVIDIA / Intel: el propio.
+	$fixedAl = $script:isAmd -and ($config -like 'fsr3*')
 	# (10-23 noche) Anti-Lag propio del emulador (KYTY_LOWLAT): sin Reflex ni FSR3 tocado; con la frame generation de AMD.
 	if (Is-FixedFg) { $cmbAl.SelectedIndex = 2 }  # (10-24) siempre Ultra en los modos fijos
-	$ownLat = $cmbAl.SelectedIndex -gt 0 -and $config -like 'fsr3*'
+	$ownLat = $cmbAl.SelectedIndex -gt 0 -and $config -like 'fsr3*' -and -not $script:isAmd
 	if ($ownLat) { $sets += 'KYTY_LOWLAT=1'; $sets += $(if ($cmbAl.SelectedIndex -eq 2) { 'KYTY_LOWLAT_QUEUE=1' } else { 'KYTY_LOWLAT_QUEUE=2' }) }  # (10-23) Anti-Lag: 2 frames en cola; Ultra: 1
 	# (10-23) Para las metricas: si va Anti-Lag y cual.
 	Set-IniValue 'antilagon' $(if ($ownLat) { $(if ($cmbAl.SelectedIndex -eq 2) { 'Ultra' } else { 'Normal' }) } elseif ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
@@ -910,7 +912,7 @@ function Update-AntiLagBox {
 	if ($script:alAuto) { $chkAntiLag.Checked = $false; $script:alAuto = $false }
 	$chkAntiLag.Enabled = $true
 	if (-not $ok) { $chkAntiLag.Checked = $false }
-	$chkAntiLag.Visible = $false; $cmbAl.Visible = $ok
+	$chkAntiLag.Visible = $false; $cmbAl.Visible = $ok -and -not $script:isAmd
 	# (10-24) Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag Ultra siempre, sin poder cambiarlo.
 	if (Is-FixedFg) {
 		if (-not $script:alLocked) { $script:alLocked = $true; $cmbAl.SelectedIndex = 2 }
@@ -919,7 +921,8 @@ function Update-AntiLagBox {
 		$script:alLocked = $false; $cmbAl.Enabled = $true
 		$v = 1; [void][int]::TryParse((Get-IniValue 'antilagmode2' '1'), [ref]$v); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $v), 2)
 	}
-	$lbReflex.Visible = (-not $ok) -and $cfgNow -like 'dlss*'
+	$lbReflex.Visible = ((-not $ok) -and $cfgNow -like 'dlss*') -or ($ok -and $script:isAmd)
+	$lbReflex.Text = if ($ok -and $script:isAmd) { 'Anti-Lag 2 (AMD): on' } else { 'Reflex: on (DLSS-G)' }
 }
 $cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $cmbRes.Add_SelectedIndexChanged({ Update-AntiLagBox })
@@ -1700,19 +1703,19 @@ foreach ($pp in @(@('Motion Blur', 'motionblur'), @('Depth of Field', 'dof'), @(
 }
 # (10-24) Ray tracing en pantalla (beta): sombras del sol y reflejos con denoise. Solo con DLSS, XeSS o FSR.
 $gRt = New-Group 'Ray tracing (beta)' 10 586 420 92
-function New-RtCombo([string]$label, [string]$key, $y, [string]$tip) {
+function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @('Off', 'Low', 'High', 'Ultra')) {
 	$lb = New-Label $label $smallFont $ink 0 0 98 22; $panel.Controls.Add($lb)
 	$c = New-Object System.Windows.Forms.ComboBox
 	$c.DropDownStyle = 'DropDownList'; $c.Font = $smallFont; $c.Tag = $key
-	foreach ($it in 'Off', 'Low', 'High', 'Ultra') { [void]$c.Items.Add($it) }
-	$v = 0; [void][int]::TryParse((Get-IniValue $key '0'), [ref]$v); $c.SelectedIndex = [math]::Min([math]::Max(0, $v), 3)
+	foreach ($it in $items) { [void]$c.Items.Add($it) }
+	$v = 0; [void][int]::TryParse((Get-IniValue $key '0'), [ref]$v); $c.SelectedIndex = [math]::Min([math]::Max(0, $v), $items.Count - 1)
 	$c.Add_SelectedIndexChanged({ param($sender, $e) Set-IniValue $sender.Tag "$($sender.SelectedIndex)" })
 	$tips.SetToolTip($c, $tip); $panel.Controls.Add($c)
 	Move-To $lb $gRt 10 ($y + 2) 98; Move-To $c $gRt 110 $y 296
 	return $c
 }
 $cmbRtSh = New-RtCombo 'RT Shadows' 'rtshadow' 24 'Ray-traced sun shadows on the image, with denoising. Only with DLSS, XeSS or FSR. Low ~0.3 ms, High ~1 ms, Ultra ~1.5 ms. Beta.'
-$cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl' 56 'Ray-traced reflections on the image (water, puddles, floors), with denoising. Only with DLSS, XeSS or FSR. Low ~0.4 ms, High ~1 ms, Ultra ~2 ms. Beta.'
+$cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl2' 56 'Ray-traced reflections on water, puddles and wet surfaces, with denoising. Only with DLSS, XeSS or FSR. Low ~0.6 ms, Medium ~1 ms, High ~2 ms, Ultra ~4.5 ms. Beta.' @('Off', 'Low', 'Medium', 'High', 'Ultra')
 
 # (10-24) Tu equipo: tarjeta con el caballero senalando la grafica y el equipo detectados (antes, una linea abajo).
 function New-PcCard {
