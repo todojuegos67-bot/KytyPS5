@@ -64,6 +64,15 @@ void OnPresent(uint64_t frame_index);
 // The flip queue limit (KYTY_FLIP_QUEUE_LIMIT, default on; KYTY_LOWLAT_PACE_BEFORE_INPUT=0 also turns it off): under a
 // flip rate (the game's own, KYTY_FLIP_FPS) the controller read of frame N waits for frame N - k's release (k 1 or 2).
 [[nodiscard]] bool PaceOn();
+// KYTY_PHASE_PACE (default on with KYTY_LOWLAT=1; =0 off, =1 on): under a flip rate or cap (SetPaceCap), each game step
+// (the first controller read after a flip) waits until a fixed phase of the smoothed flip grid (period = cap x the
+// game's cadence, releases per step over 2 s); the phase moves at most 0.5 ms a step toward a queue target (gpu done ->
+// flip of the released frames, FlipQueue's stamps: a margin, + one cap of cushion while a frame was late in the last
+// 5 s, dropped after 10 s), and no step is made longer than period + 1 ms by the wait: even steps, no event wait. Off
+// with DLSS-G; Reflex's / the limiter's sleep is skipped while it is active. [phase] line once a second.
+[[nodiscard]] bool PhaseOn();
+void               PhaseRelease(double queued_ms); // a flip released: its gpu done -> flip, ms
+void               NoteFlipDepth(int depth);       // FlipQueue's requests after a reserve / release
 void               OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick);
 
 // KYTY_LATENCY=1 (the launcher sets it with the metrics overlay): input -> present latency, any Anti-Lag mode or none.

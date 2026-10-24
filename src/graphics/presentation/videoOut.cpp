@@ -1301,6 +1301,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 
 	pending.push_back(r);
 	request_id = r.id;
+	Graphics::AntiLag::NoteFlipDepth(static_cast<int>(m_requests.size() + m_cpu_requests.size()));
 
 	cfg.flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
@@ -1787,8 +1788,8 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	r.cfg->mutex.Unlock();
 
 	NoteFlipSubmitted(r.submit_time);
-	if (Graphics::AntiLag::PaceOn()) {
-		// KYTY_LOWLAT_PACE_BEFORE_INPUT: the configured cap of a game-view frame (never a movie, menu, cinematic, loading
+	if (Graphics::AntiLag::PaceOn() || Graphics::AntiLag::PhaseOn()) {
+		// KYTY_LOWLAT_PACE_BEFORE_INPUT / KYTY_PHASE_PACE: the configured cap of a game-view frame (never a movie, menu, cinematic, loading
 		// screen, or FG pacing's own release), else 0 (the pacing off).
 		const bool capped = r.frame != nullptr && !scene_free && !fg_off && !s_fg_paced && !MoviePlaying() && !CinematicPlaying() &&
 		                    Graphics::Presenter::IsSceneFrame(*r.frame) &&
@@ -1799,6 +1800,10 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 		                              1000.0 / vblank_hz);
 	}
 	Graphics::AntiLag::OnFlipReleased(r.latency_index); // KYTY_LOWLAT pacing / [lat] stages
+	if (Graphics::AntiLag::PhaseOn())
+		Graphics::AntiLag::PhaseRelease(r.ready_time != std::chrono::steady_clock::time_point {}
+		                                    ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r.ready_time).count()
+		                                    : -1.0);
 	Graphics::Presenter::SetLatencyIndex(*r.frame, r.latency_index);
 	m_presenter.Submit(*r.frame);
 
@@ -1809,6 +1814,7 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 		EXIT("video-out flip queue changed while processing its front request\n");
 	}
 	m_requests.pop_front();
+	Graphics::AntiLag::NoteFlipDepth(static_cast<int>(m_requests.size() + m_cpu_requests.size()));
 
 	if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
 		r.cfg->flip_status.count++;

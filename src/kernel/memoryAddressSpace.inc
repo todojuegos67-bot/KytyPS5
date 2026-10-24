@@ -2583,6 +2583,23 @@ public:
 		m_busy_done.notify_all();
 		return true;
 	}
+	// The same for a callable (the periodic RAM flush's trim, ram-guard.h).
+	template <typename F>
+	bool RunQuietWith(F&& call) {
+		{
+			ExclusiveLock lock(m_mutex);
+			if (!m_busy_done.wait_for(lock.Lock(), std::chrono::milliseconds(200), [&] { return m_busy.empty(); }))
+				return false;
+			m_busy.emplace_back(0, uint64_t {1} << 47u);
+		}
+		call();
+		{
+			ExclusiveLock lock(m_mutex);
+			EraseBusyUnlocked(0, uint64_t {1} << 47u);
+		}
+		m_busy_done.notify_all();
+		return true;
+	}
 
 private:
 

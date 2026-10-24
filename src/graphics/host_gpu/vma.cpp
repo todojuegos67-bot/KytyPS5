@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -50,6 +51,7 @@ static const GraphicContext* g_report_context   = nullptr;
 static uint64_t g_image_pool_limit = 1024ull << 20;
 static std::mutex g_image_pool_mutex;
 static uint64_t   g_image_pool_bytes = 0;
+static uint64_t   FlushImagePool(uint64_t budget, uint64_t* held_us);
 static int        g_image_pool_releaser = 0; // MemGuard's id
 static void       DestroyImagePool(VmaAllocator allocator);
 static void WriteVmaReport(const char* path) {
@@ -259,6 +261,12 @@ bool GraphicContext::CreateAllocator() {
 	g_image_pool_limit         = std::min<uint64_t>(LocalPlatform::LowMemVram() ? 256ull << 20 : 1024ull << 20, GetTotalMemoryBudget() / 32);
 	// Out of memory (MemGuard): the freed images kept for reuse go (made again when needed). A system-memory image's
 	// pages are commit on NVIDIA.
+	// The periodic RAM flush (ram-guard.h, KYTY_RAM_FLUSH_SECONDS): the same images, a budget's worth, destroyed outside
+	// the pool's lock.
+	{
+		static std::once_flag once;
+		std::call_once(once, [] { RamGuard::RegisterBudgetFlush("image reuse pool", RamGuard::FlushCaches, FlushImagePool); });
+	}
 	g_image_pool_releaser = MemGuard::RegisterReleaser("image reuse pool", [vma = allocator] {
 		uint64_t bytes = 0;
 		{
@@ -523,6 +531,8 @@ struct PooledImage {
 	VkImage                  image      = VK_NULL_HANDLE;
 	VmaAllocation            allocation = nullptr;
 	uint64_t                 bytes      = 0;
+	// (When it was pooled: the periodic RAM flush takes only images no CreateImage reused for a while.)
+	std::chrono::steady_clock::time_point pooled_at = std::chrono::steady_clock::now();
 };
 std::vector<PooledImage> g_image_pool;
 
@@ -555,6 +565,38 @@ static void DestroyImagePool(VmaAllocator allocator) {
 	}
 	g_image_pool.clear();
 	g_image_pool_bytes = 0;
+}
+
+// The periodic RAM flush's share (ram-guard.h): up to `budget` bytes of the images pooled 5 s ago or more; the pool's lock is
+// held only to take them out (CreateImage takes it), the images are destroyed after (the GPU is done with them).
+static uint64_t FlushImagePool(uint64_t budget, uint64_t* held_us) {
+	std::vector<PooledImage> taken;
+	uint64_t                 bytes     = 0;
+	VmaAllocator             allocator = nullptr;
+	{
+		const auto start = std::chrono::steady_clock::now();
+		std::scoped_lock lock(g_image_pool_mutex);
+		allocator = g_report_allocator;
+		if (allocator == nullptr) return 0;
+		// (Pooled 5 s ago or more and not reused since: not one of the transient targets the game makes every frame,
+		// which would only be made again at once.)
+		const auto old = start - std::chrono::seconds(5);
+		for (auto it = g_image_pool.begin(); it != g_image_pool.end() && bytes < budget;) {
+			if (it->pooled_at > old) {
+				++it;
+				continue;
+			}
+			bytes += it->bytes;
+			taken.push_back(*it);
+			it = g_image_pool.erase(it);
+		}
+		g_image_pool_bytes -= std::min(g_image_pool_bytes, bytes);
+		if (held_us != nullptr)
+			*held_us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+	}
+	for (const auto& pooled: taken) vmaDestroyImage(allocator, pooled.image, pooled.allocation);
+	return bytes;
 }
 
 void GraphicContext::TrimImagePool() {
