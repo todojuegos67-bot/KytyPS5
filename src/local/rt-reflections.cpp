@@ -515,8 +515,8 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	{
 		// (the wet cap for the next 10 s: material-wet on more than 40 % of the pixels scales it down)
 		const double wet = static_cast<double>(sm[9]) / px;
-		g_rt.wet_cap     = wet > 0.4 ? static_cast<float>(0.4 / wet) : 1.0f;
-		if (wet > 0.4) std::printf("RT reflections: material wet on %.0f%% of the pixels: wet strength x%.2f\n", 100.0 * wet, g_rt.wet_cap);
+		g_rt.wet_cap     = wet > 0.7 ? std::max(static_cast<float>(0.7 / wet), 0.6f) : 1.0f;
+		if (wet > 0.7) std::printf("RT reflections: material wet on %.0f%% of the pixels: wet strength x%.2f\n", 100.0 * wet, g_rt.wet_cap);
 	}
 	std::string passes;
 	for (uint32_t st = 0; st < 9; ++st) {
@@ -791,7 +791,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const bool use_normal = dec_normal >= 0 && ((dec_normal & 64) == 0 || camera.rows);
 
 	const float strength = EnvFloat("KYTY_RT_REFLECTIONS_STRENGTH", 1.0f, 0.0f, 3.0f);
-	const float min_refl = EnvFloat("KYTY_RT_REFLECTIONS_MIN", 0.35f, 0.0f, 0.8f);
+	const float min_refl = EnvFloat("KYTY_RT_REFLECTIONS_MIN", 0.4f, 0.0f, 0.8f);
 	const float guess    = EnvFloat("KYTY_RT_REFLECTIONS_GUESS", 0.2f, 0.0f, 1.0f);
 	const auto& cfg      = Cfg(level);
 	const int   iters    = cfg.iters;

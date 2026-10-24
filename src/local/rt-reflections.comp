@@ -319,7 +319,7 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 		// The material field (roughness units: low = smooth / wet): wet below mparams.x, dry from mparams.y; walls half.
 		float r = clamp(Field(push.dec.y, rp), 0.0, 1.0);
 		mat     = (1.0 - smoothstep(mparams.x, mparams.y, r)) * mix(0.5, 1.0, UpFacing(Nd)) * mparams.z;
-		mat_r   = mix(0.08, 0.32, smoothstep(0.0, mparams.y, r)); // (wet ground blurrier than water's 0.03)
+		mat_r   = mix(0.05, 0.20, smoothstep(0.0, mparams.y, r)); // (wet ground blurrier than water's 0.03)
 		mat    *= mparams.w; // (the wet cap: the CPU scales it down when most of the floor is wet)
 	}
 	float guess = water > 0.0 ? 0.0 : PuddleGuess(ruv, Nd) * fparams.w;
@@ -544,7 +544,7 @@ void Trace(ivec2 px, bool march) {
 		if (tmax < 0.999) {
 			vec2  euv = clamp((r.p0 + r.dp * tmax) / rs, vec2(0.002), vec2(0.998));
 			float ed  = DepthAt(euv);
-			float cf  = 0.35 * smoothstep(0.0, 0.25, tmax) * (1.0 - smoothstep(0.1, 0.4, s.rough));
+			float cf  = 0.5 * smoothstep(0.0, 0.25, tmax) * (1.0 - smoothstep(0.1, 0.4, s.rough));
 			if (!IsSky(ed) && cf > 1e-3) {
 				vec3 c = Tonemap(SafeColor(textureLod(color_tex, euv, 0).rgb * GameExposure()));
 				imageStore(out_a, px, vec4(c * cf, cf));
@@ -671,7 +671,7 @@ void Temporal(ivec2 px) {
 		float amin  = mix(0.15, 0.04, smoothstep(0.02, 0.3, rough)) * push.motion.w;
 		float alpha = max(1.0 / len, amin);
 		// (a miss this frame against a held reflection: the history fades slowly instead of popping)
-		if (fresh && cur.a < hist.a * 0.5) alpha *= 0.25;
+		if (fresh && cur.a < hist.a * 0.5) alpha *= 0.5;
 		if (!fresh) {
 			// (no sample of its own this frame: the history, nudged toward the traced neighbours)
 			len   = max(meta.x, 1.0);
