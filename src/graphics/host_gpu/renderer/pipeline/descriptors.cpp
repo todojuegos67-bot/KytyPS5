@@ -702,6 +702,18 @@ static void HoldLayerRange(TextureCache& cache, TextureCache::ImageDesc& desc, u
 	desc.view_info.base_layer = held_first;
 }
 
+// A sampled array's view: its layers from the base, no more than the shader can reach (ImageResource::max_array_index).
+// The texture-pool views of 1-1 and Stonefang read 256 of up to 2,255 layers; held whole they were images of up to
+// 1 GiB, uploaded in seconds (issue #174, an 8 GB card that then lost the device). KYTY_TEXTURE_LAYER_BOUND=0: every
+// layer to the T#'s last, as before.
+static uint32_t ArrayViewLayers(const ShaderRecompiler::IR::ImageResource& resource, uint32_t layers) {
+	static const bool bound = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_LAYER_BOUND");
+		return value == nullptr || value[0] != '0';
+	}();
+	return bound && resource.max_array_index < layers ? resource.max_array_index + 1u : layers;
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -731,7 +743,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			if (view.base_layer >= image_layers) {
 				EXIT("texture array base layer is out of bounds\n");
 			}
-			view.layer_count = image_layers - view.base_layer;
+			view.layer_count = ArrayViewLayers(resource, image_layers - view.base_layer);
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
 			view.type        = vk::ImageViewType::e3D;
@@ -745,7 +757,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			if (view.base_layer >= image_layers) {
 				EXIT("texture array base layer is out of bounds\n");
 			}
-			view.layer_count = image_layers - view.base_layer;
+			view.layer_count = ArrayViewLayers(resource, image_layers - view.base_layer);
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
@@ -1052,10 +1064,11 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	if (size.size >= (uint64_t {1} << 30u)) {
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
-			std::printf("TextureCache: large texture view addr=0x%llx size=0x%llx %ux%u layers=%u levels=%u base_array=%u "
+			std::printf("TextureCache: large texture view addr=0x%llx size=0x%llx %ux%u layers=%u levels=%u base_array=%u view_layers=%u "
 			            "fmt=%u tile=%u type=%u storage=%d pc=0x%x dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
 			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size.size), width, height,
-			            image_layers, levels, static_cast<uint32_t>(descriptor.BaseArray5()), static_cast<uint32_t>(format),
+			            image_layers, levels, static_cast<uint32_t>(descriptor.BaseArray5()), desc.view_info.layer_count,
+			            static_cast<uint32_t>(format),
 			            static_cast<uint32_t>(tile), static_cast<uint32_t>(type), storage ? 1 : 0, resource.first_use_pc,
 			            descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
 			            descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);

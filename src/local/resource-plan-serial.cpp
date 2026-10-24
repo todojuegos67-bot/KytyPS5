@@ -21,7 +21,7 @@ constexpr uint32_t Magic = 0x4e4c5052u; // "RPLN"
 #if defined(_MSC_VER) || defined(_WIN32)
 static_assert(sizeof(void*) != 8 || sizeof(IR::ResourcePlan) == 496, "ResourcePlan changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::ShaderInfo) == 192, "ShaderInfo changed: update resource-plan-serial");
-static_assert(sizeof(void*) != 8 || sizeof(IR::ImageResource) == 80, "ImageResource changed: update resource-plan-serial");
+static_assert(sizeof(void*) != 8 || sizeof(IR::ImageResource) == 88, "ImageResource changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::StageInput) == 56, "StageInput changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::StageOutput) == 48, "StageOutput changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::DescriptorSource) == 184, "DescriptorSource changed: update resource-plan-serial");
@@ -164,6 +164,7 @@ void PutInfo(Writer& w, const IR::ShaderInfo& info) {
 		w.Put(image.indirect_root);
 		w.Put(image.indirect_mapping_offset);
 		w.Put(image.indirect_search_iterations);
+		w.Put(image.max_array_index);
 		w.PutVector(image.indirect_resources);
 	}
 	w.PutVector(info.samplers);
@@ -200,7 +201,7 @@ bool GetInfo(Reader& r, IR::ShaderInfo& info) {
 		    !r.Get(image.numeric_class) || !r.Get(image.dimension) || !r.Get(image.mip_mode) || !r.Get(image.mip_count) ||
 		    !r.Get(image.conversion_format) || !r.Get(image.shader_swizzle) || !r.Get(bits) || !r.Get(image.indirect_root) ||
 		    !r.Get(image.indirect_mapping_offset) || !r.Get(image.indirect_search_iterations) ||
-		    !r.GetVector(image.indirect_resources))
+		    !r.Get(image.max_array_index) || !r.GetVector(image.indirect_resources))
 			return false;
 		image.read          = (bits & 1u) != 0;
 		image.written       = (bits & 2u) != 0;

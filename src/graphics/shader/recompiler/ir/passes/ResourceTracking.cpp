@@ -1,10 +1,14 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <bit>
+#include <cmath>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <fmt/format.h>
@@ -1464,7 +1468,7 @@ private:
 		                           memory.kind == ResourceKind::ScalarBuffer;
 	}
 
-	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
+	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc, uint32_t array_index_bound) {
 		const auto resource_class = ImageOpcodeInfoOf(op).resource_class;
 		const auto mip   = resource_class == ImageResourceClass::Storage && memory.image_has_mip
 		                       ? ImageMipMode::DynamicStorage
@@ -1475,7 +1479,8 @@ private:
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
 			    image.depth_compare == depth && image.r128 == memory.image_r128) {
-				image.cube = image.cube || memory.image_cube;
+				image.cube            = image.cube || memory.image_cube;
+				image.max_array_index = std::max(image.max_array_index, array_index_bound);
 				Merge(image, op, pc);
 				return i;
 			}
@@ -1493,9 +1498,304 @@ private:
 		image.mip_mode       = mip;
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
+		image.max_array_index = array_index_bound;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
+	}
+
+	// The bound of the layer coordinate of a sample or gather of a sampled array image (ImageResource::max_array_index):
+	// the layer it reads is the coordinate rounded to the nearest, clamped to the view's layers (the hardware's rule and
+	// Vulkan's), so a coordinate of a known range reaches no layer past its rounded maximum. The game's texture pools
+	// are sampled through views of a few thousand layers whose shaders take the layer from a byte: 256 of them (a
+	// 1,023-layer image of 1 GiB on an 8 GB card, issue #174). Any other operation on the image, a cube, a 16-bit
+	// coordinate or an operand of unknown range: no bound.
+	// Only the lanes whose result the shader keeps count (ResultLanes): the translator writes a register as
+	// select(exec, new, old) and the old value of a lane the exec leaves out is the register's earlier use (an
+	// interpolated value, a product). Another lane's layer is clamped to the view as well, its texel never seen.
+	uint32_t ArrayIndexBound(const Inst& inst, const MemoryInfo& memory, ValueOpcode op) {
+		const auto dimension = memory.image_dimension;
+		if ((op != ValueOpcode::ImageSampleRaw && op != ValueOpcode::ImageGatherRaw) || memory.image_cube ||
+		    (dimension != Decoder::ImageDimension::Dim1DArray && dimension != Decoder::ImageDimension::Dim2DArray) ||
+		    inst.NumArgs() < 3)
+			return ImageResource::NoArrayIndexBound;
+		const auto* address = inst.Arg(2).Resolve().TryInstruction();
+		if (address == nullptr || address->GetOpcode() != ValueOpcode::MakeImageAddress)
+			return ImageResource::NoArrayIndexBound;
+		// The address's components in SpirvEmitter's order (Layout): offset, bias, compare, derivatives, the coordinates
+		// (the layer after the spatial ones).
+		const uint32_t flags   = memory.image_sample_flags;
+		const uint32_t spatial = dimension == Decoder::ImageDimension::Dim1DArray ? 1u : 2u;
+		uint32_t       layer   = spatial;
+		if ((flags & Decoder::ImageSampleFlagOffset) != 0u) layer++;
+		if ((flags & Decoder::ImageSampleFlagBias) != 0u) layer++;
+		if ((flags & Decoder::ImageSampleFlagCompare) != 0u) layer++;
+		if ((flags & Decoder::ImageSampleFlagDerivative) != 0u) layer += 2u * spatial;
+		const auto component = Decoder::ImageAddressComponentLayout(flags, layer);
+		if (component.bit_width != 32u) return ImageResource::NoArrayIndexBound;
+		// (A component past the address's words reads 0: SpirvEmitter's AddressU32.)
+		const auto word = component.bit_offset / 32u;
+		if (word >= address->NumArgs()) return 0;
+		m_float_bounds.clear();
+		m_int_bounds.clear();
+		m_bound_steps    = 0;
+		m_lanes          = ResultLanes(inst);
+		const auto bound = FloatBound(address->Arg(word), true, 0);
+		if (!bound || *bound >= 65536.0) return ImageResource::NoArrayIndexBound;
+		return static_cast<uint32_t>(std::floor(*bound + 0.5));
+	}
+
+	// The lanes an image operation's result is kept for: every component of it taken out and written to a register by
+	// a select on one condition (the exec mask the translator gives the operation's destination registers), that
+	// condition. None (an empty value: every lane) when a use is anything else or the conditions differ.
+	static Value ResultLanes(const Inst& image) {
+		Value lanes;
+		for (const auto& use: image.Uses()) {
+			const auto* extract = use.user;
+			if (extract == nullptr || extract->GetOpcode() != ValueOpcode::CompositeExtractU32x4) return {};
+			for (const auto& kept: extract->Uses()) {
+				const auto* select = kept.user;
+				if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32 || kept.operand != 1) return {};
+				const auto condition = select->Arg(0).Resolve();
+				if (lanes.IsEmpty()) {
+					lanes = condition;
+				} else if (!(lanes == condition)) {
+					return {};
+				}
+			}
+		}
+		return lanes;
+	}
+
+	// Whether `condition` holds in every lane `lanes` holds in: the same value, or a term of an and of it.
+	static bool Implies(Value lanes, Value condition, uint32_t depth) {
+		lanes     = lanes.Resolve();
+		condition = condition.Resolve();
+		if (lanes.IsEmpty() || depth > 16) return false;
+		if (lanes == condition) return true;
+		if (const auto* term = condition.TryInstruction(); term != nullptr && term->GetOpcode() == ValueOpcode::LogicalAnd)
+			return Implies(lanes, term->Arg(0), depth + 1) && Implies(lanes, term->Arg(1), depth + 1);
+		const auto* inst = lanes.TryInstruction();
+		return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalAnd &&
+		       (Implies(inst->Arg(0), condition, depth + 1) || Implies(inst->Arg(1), condition, depth + 1));
+	}
+
+	// Whether `condition` fails in every lane `lanes` holds in: its not, or a not of it among the terms of an and (or of
+	// a term of the condition's own and).
+	static bool Excludes(Value lanes, Value condition, uint32_t depth) {
+		lanes     = lanes.Resolve();
+		condition = condition.Resolve();
+		if (lanes.IsEmpty() || depth > 16) return false;
+		if (const auto* term = condition.TryInstruction(); term != nullptr) {
+			if (term->GetOpcode() == ValueOpcode::LogicalNot && Implies(lanes, term->Arg(0), depth + 1)) return true;
+			if (term->GetOpcode() == ValueOpcode::LogicalAnd &&
+			    (Excludes(lanes, term->Arg(0), depth + 1) || Excludes(lanes, term->Arg(1), depth + 1)))
+				return true;
+		}
+		const auto* inst = lanes.TryInstruction();
+		if (inst == nullptr) return false;
+		if (inst->GetOpcode() == ValueOpcode::LogicalNot) return inst->Arg(0).Resolve() == condition;
+		return inst->GetOpcode() == ValueOpcode::LogicalAnd &&
+		       (Excludes(inst->Arg(0), condition, depth + 1) || Excludes(inst->Arg(1), condition, depth + 1));
+	}
+
+	static constexpr uint32_t MaxBoundDepth = 48;
+	static constexpr uint32_t MaxBoundSteps = 100000;
+
+	// A 32-bit value's bits read as a float: a negative one counts as 0 (the first layer), an infinity or NaN as no bound.
+	static std::optional<double> FloatOfBits(uint32_t bits) {
+		if ((bits & 0x7f800000u) == 0x7f800000u) return std::nullopt;
+		if ((bits & 0x80000000u) != 0u) return 0.0;
+		return static_cast<double>(std::bit_cast<float>(bits));
+	}
+
+	static std::optional<double> Larger(std::optional<double> a, std::optional<double> b) {
+		if (!a || !b) return std::nullopt;
+		return std::max(*a, *b);
+	}
+
+	// (The bounds' keys: a value, and whether the result's lanes still select its operands. Past a loop's phi they do
+	// not: it holds values of other iterations, whose conditions are not the ones the lanes are made of.)
+	static uintptr_t BoundKey(const Inst* inst, bool lanes) {
+		return reinterpret_cast<uintptr_t>(inst) | (lanes ? 1u : 0u);
+	}
+
+	// Whether a phi may take a value along a back edge: a predecessor that is not before its block (the blocks are in
+	// the order of their code; an unknown one counts as such).
+	bool IsLoopPhi(const Inst& phi) {
+		if (m_block_order.empty())
+			for (size_t i = 0; i < m_program.blocks.size(); i++) m_block_order[m_program.blocks[i]] = i;
+		const auto block = m_block_order.find(phi.Parent());
+		if (block == m_block_order.end()) return true;
+		for (size_t i = 0; i < phi.NumPhiBlocks(); i++) {
+			const auto from = m_block_order.find(phi.PhiBlock(i));
+			if (from == m_block_order.end() || from->second >= block->second) return true;
+		}
+		return false;
+	}
+
+	// An upper bound of a 32-bit value read as a float (none: not shown).
+	std::optional<double> FloatBound(Value value, bool lanes, uint32_t depth) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			if (value.GetType() == Type::F32) return FloatOfBits(std::bit_cast<uint32_t>(value.F32Value()));
+			if (value.GetType() == Type::U32) return FloatOfBits(value.U32());
+			return std::nullopt;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || depth > MaxBoundDepth || ++m_bound_steps > MaxBoundSteps) return std::nullopt;
+		const auto key = BoundKey(inst, lanes);
+		if (const auto known = m_float_bounds.find(key); known != m_float_bounds.end()) return known->second;
+		if (inst->GetOpcode() == ValueOpcode::Phi) {
+			const bool through = lanes && !IsLoopPhi(*inst);
+			return PhiBound(m_float_bounds, key, [&] { return FloatBoundOf(*inst, through, depth + 1); });
+		}
+		m_float_bounds[key] = std::nullopt; // (a cycle not through a phi: no bound)
+		const auto bound    = FloatBoundOf(*inst, lanes, depth + 1);
+		m_float_bounds[key] = bound;
+		return bound;
+	}
+
+	// A phi's bound, a loop's too: its back edges first taken as 0, then the bound found checked, the phi assumed within
+	// it (every operation here grows with its operands, so a bound the loop's values keep holds for every iteration).
+	// The values found on the way go: they were bounds under an assumption.
+	template <typename Bound, typename Of>
+	std::optional<Bound> PhiBound(std::unordered_map<uintptr_t, std::optional<Bound>>& bounds, uintptr_t key, Of&& of) {
+		auto saved  = bounds;
+		bounds[key] = Bound {};
+		auto bound  = of();
+		if (bound) {
+			bounds      = saved;
+			bounds[key] = bound;
+			if (const auto check = of(); !check || *check > *bound) bound = std::nullopt;
+		}
+		bounds      = std::move(saved);
+		bounds[key] = bound;
+		return bound;
+	}
+
+	std::optional<double> FloatBoundOf(const Inst& inst, bool lanes, uint32_t depth) {
+		const auto arg = [&](size_t index) { return FloatBound(inst.Arg(index), lanes, depth); };
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::BitCastU32F32:
+			case ValueOpcode::BitCastF32U32: return arg(0);
+			case ValueOpcode::SelectU32:
+			case ValueOpcode::SelectF32:
+				if (lanes && Implies(m_lanes, inst.Arg(0), 0)) return arg(1);
+				if (lanes && Excludes(m_lanes, inst.Arg(0), 0)) return arg(2);
+				return Larger(arg(1), arg(2));
+			case ValueOpcode::Phi: {
+				std::optional<double> bound = 0.0;
+				for (size_t i = 0; i < inst.NumArgs() && bound; i++) bound = Larger(bound, arg(i));
+				return bound;
+			}
+			case ValueOpcode::FPRoundEven32: {
+				const auto bound = arg(0);
+				return bound ? std::optional<double>(std::floor(*bound + 0.5)) : std::nullopt;
+			}
+			case ValueOpcode::FPFloor32:
+			case ValueOpcode::FPTrunc32: {
+				const auto bound = arg(0);
+				return bound ? std::optional<double>(std::floor(*bound)) : std::nullopt;
+			}
+			case ValueOpcode::FPCeil32: {
+				const auto bound = arg(0);
+				return bound ? std::optional<double>(std::ceil(*bound)) : std::nullopt;
+			}
+			case ValueOpcode::FPMax32: return Larger(arg(0), arg(1));
+			case ValueOpcode::FPMaxTri32: return Larger(Larger(arg(0), arg(1)), arg(2));
+			case ValueOpcode::FPMin32:
+			case ValueOpcode::FPMinTri32: {
+				// (No larger than any operand of a known bound: a NaN operand gives the other one.)
+				std::optional<double> bound;
+				for (size_t i = 0; i < inst.NumArgs(); i++)
+					if (const auto b = arg(i); b && (!bound || *b < *bound)) bound = b;
+				return bound;
+			}
+			case ValueOpcode::ConvertF32U32: {
+				const auto bound = IntBound(inst.Arg(0), lanes, depth);
+				return bound ? std::optional<double>(static_cast<double>(*bound)) : std::nullopt;
+			}
+			case ValueOpcode::ConvertF32S32: {
+				const auto bound = IntBound(inst.Arg(0), lanes, depth);
+				return bound && *bound <= 0x7fffffffu ? std::optional<double>(static_cast<double>(*bound)) : std::nullopt;
+			}
+			default: {
+				// An integer's bits read as a float: below the sign bit, a larger integer is a larger float.
+				const auto bound = IntBoundOf(inst, lanes, depth);
+				return bound && *bound <= 0x7f7fffffu ? FloatOfBits(*bound) : std::nullopt;
+			}
+		}
+	}
+
+	// An upper bound of a 32-bit value read as an unsigned integer (none: not shown).
+	std::optional<uint32_t> IntBound(Value value, bool lanes, uint32_t depth) {
+		value = value.Resolve();
+		if (value.IsImmediate()) return value.GetType() == Type::U32 ? std::optional<uint32_t>(value.U32()) : std::nullopt;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || depth > MaxBoundDepth || ++m_bound_steps > MaxBoundSteps) return std::nullopt;
+		const auto key = BoundKey(inst, lanes);
+		if (const auto known = m_int_bounds.find(key); known != m_int_bounds.end()) return known->second;
+		if (inst->GetOpcode() == ValueOpcode::Phi) {
+			const bool through = lanes && !IsLoopPhi(*inst);
+			return PhiBound(m_int_bounds, key, [&] { return IntBoundOf(*inst, through, depth + 1); });
+		}
+		m_int_bounds[key] = std::nullopt;
+		const auto bound  = IntBoundOf(*inst, lanes, depth + 1);
+		m_int_bounds[key] = bound;
+		return bound;
+	}
+
+	std::optional<uint32_t> IntBoundOf(const Inst& inst, bool lanes, uint32_t depth) {
+		const auto arg      = [&](size_t index) { return IntBound(inst.Arg(index), lanes, depth); };
+		const auto constant = [&](size_t index) -> std::optional<uint32_t> {
+			const auto value = inst.Arg(index).Resolve();
+			return value.IsImmediate() && value.GetType() == Type::U32 ? std::optional<uint32_t>(value.U32()) : std::nullopt;
+		};
+		const auto larger = [](std::optional<uint32_t> a, std::optional<uint32_t> b) -> std::optional<uint32_t> {
+			if (!a || !b) return std::nullopt;
+			return std::max(*a, *b);
+		};
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::UMin32: {
+				// (No larger than either operand.)
+				const auto a = arg(0), b = arg(1);
+				if (a && b) return std::min(*a, *b);
+				return a ? a : b;
+			}
+			case ValueOpcode::ShiftRightLogical32: {
+				const auto shift = constant(1);
+				const auto value = arg(0);
+				if (!shift) return value;
+				return value.value_or(UINT32_MAX) >> (*shift & 31u);
+			}
+			case ValueOpcode::BitFieldUExtract: {
+				const auto offset = constant(1), count = constant(2);
+				std::optional<uint32_t> bound = arg(0);
+				if (bound && offset) bound = *bound >> (*offset & 31u);
+				if (count && *count < 32u) bound = std::min(bound.value_or(UINT32_MAX), (1u << *count) - 1u);
+				return bound;
+			}
+			case ValueOpcode::UMax32: return larger(arg(0), arg(1));
+			case ValueOpcode::SelectU32:
+				if (lanes && Implies(m_lanes, inst.Arg(0), 0)) return arg(1);
+				if (lanes && Excludes(m_lanes, inst.Arg(0), 0)) return arg(2);
+				return larger(arg(1), arg(2));
+			case ValueOpcode::Phi: {
+				std::optional<uint32_t> bound = 0u;
+				for (size_t i = 0; i < inst.NumArgs() && bound; i++) bound = larger(bound, arg(i));
+				return bound;
+			}
+			case ValueOpcode::ConvertU32U8: return 0xffu;
+			case ValueOpcode::ConvertU32U16: return 0xffffu;
+			case ValueOpcode::ConvertU32F32: {
+				const auto bound = FloatBound(inst.Arg(0), lanes, depth);
+				if (!bound) return std::nullopt;
+				return *bound >= 4294967295.0 ? UINT32_MAX : static_cast<uint32_t>(std::floor(*bound));
+			}
+			default: return std::nullopt;
+		}
 	}
 
 	static void Merge(ImageResource& image, ValueOpcode op, uint32_t pc) {
@@ -1632,7 +1932,7 @@ private:
 		} else {
 			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle, source);
 		}
-		resource = AddImage(source, memory, op, flags.pc);
+		resource = AddImage(source, memory, op, flags.pc, ArrayIndexBound(inst, memory, op));
 		if (resource == UINT32_MAX) {
 			Fail(flags.pc, "image resource limit exceeded");
 		}
@@ -1689,6 +1989,12 @@ private:
 
 	Program&                       m_program;
 	ShaderInfo                     m_info;
+	// (ArrayIndexBound's, per call: the bounds of the values met, the lanes whose result counts.)
+	std::unordered_map<uintptr_t, std::optional<double>>   m_float_bounds;
+	std::unordered_map<uintptr_t, std::optional<uint32_t>> m_int_bounds;
+	uint32_t                                               m_bound_steps = 0;
+	Value                                                  m_lanes;
+	std::unordered_map<const Block*, size_t>               m_block_order;
 	std::vector<DescriptorSource>  m_sources;
 	std::vector<HandlePatch>       m_handle_patches;
 	std::vector<MemoryPatch>       m_memory_patches;
