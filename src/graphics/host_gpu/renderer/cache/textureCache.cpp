@@ -1431,6 +1431,9 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
+// (Defined with UploadDepthPartial's helpers below.)
+static void DepthArrayEvent(const char* what, const Image& image, uint64_t address, uint64_t size, const char* detail);
+
 static bool GrowImageToLayers(ImageInfo& info, uint32_t layers) {
 	const auto current = info.resources.layers;
 	if (info.resources.levels != 1 || current == 0 || layers <= current ||
@@ -1515,6 +1518,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	LiveCounters::Add(LiveCounters::DepthOverlaps);
 	LiveCounters::Add(LiveCounters::DepthOverlapBytes, cached.info.data.size);
+	DepthArrayEvent(binding == BindingType::DepthTarget ? "a recreation for a depth target" : "a recreation for another use", cached,
+	                requested.data.address, requested.data.size, nullptr);
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
@@ -2116,6 +2121,41 @@ static bool PartialFail(const char* why) {
 	return false;
 }
 
+// KYTY_DEPTH_ARRAY_GUARD (on unless 0): a layered depth image the GPU rendered into (the game's 80-layer shadow-map
+// pool, 320 MiB, whose free layers its texture streamer borrows from the CPU) refreshes only its dirty layers, however
+// many, never all of it from guest memory (see UploadDepthPartial). KYTY_DEPTH_ARRAY_LOG=1: every event that still
+// drops such an image's rendered layers (a whole upload, a whole CPU-dirty state, a recreation, an unmap), not only
+// the first 16.
+static bool DepthArrayGuardOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_DEPTH_ARRAY_GUARD");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+static bool DepthArrayGuarded(const Image& image) {
+	return DepthArrayGuardOn() && image.IsGpuModified() && image.info.IsDepth() && image.info.resources.layers > 1;
+}
+static void DepthArrayEvent(const char* what, const Image& image, uint64_t address, uint64_t size, const char* detail) {
+	if (!image.info.IsDepth() || image.info.resources.layers < 2 || !image.IsGpuModified()) return;
+	static const bool all = [] {
+		const char* value = std::getenv("KYTY_DEPTH_ARRAY_LOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	static std::atomic<uint32_t> reports {0};
+	if (!all && reports.fetch_add(1, std::memory_order_relaxed) >= 16) return;
+	std::printf("Depth array: %s (its rendered layers at risk): image 0x%llx+0x%llx (%u layers, %ux%u) at 0x%llx+0x%llx "
+	            "cpu=%d partial=%d maybe=%d buffer=%d buffer_ranges=%zu tracked_whole=%d %s (KYTY_DEPTH_ARRAY_LOG=1: all)\n",
+	            what, static_cast<unsigned long long>(image.info.data.address),
+	            static_cast<unsigned long long>(image.info.data.size), image.info.resources.layers, image.info.extent.width,
+	            image.info.extent.height, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+	            image.IsCpuDirty() ? 1 : 0, image.IsPartiallyCpuDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
+	            image.IsBufferModified() ? 1 : 0, image.BufferModifiedRanges().size(),
+	            image.track_addr == image.info.data.address && image.track_addr_end == image.info.data.End() ? 1 : 0,
+	            detail != nullptr ? detail : "");
+	std::fflush(stdout);
+}
+
 // A texture the game writes while draws sample it (mip streaming: its threads write the levels while the frame is
 // translated) was dirty again at each draw, and each uploaded all of it: 6-14 times in a millisecond for one 2.75 MiB
 // texture, 1.5 GB of the 2.85 GB uploaded in a 10 s walk. While the command buffer that recorded its last whole upload
@@ -2283,6 +2323,7 @@ void TextureCache::InitializeImage(ImageId id) {
 			}
 		}
 		if (!uploaded) {
+			DepthArrayEvent("whole upload", image, image.info.data.address, image.info.data.size, kind);
 			bool refillable = false;
 			const auto [source, source_offset] =
 			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size, &refillable);
@@ -2476,7 +2517,10 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 		LiveCounters::Add(LiveCounters::PartialUploads);
 		return true;
 	}
-	if (slice * picked.size() > info.data.size / PartialUploadMaxShare) {
+	// (The share is a cost limit: past it a whole upload is cheaper. Not for an array the GPU rendered into: a whole
+	// upload replaces its rendered layers with guest memory, which never held them - the shadow-map pool's spot shadows,
+	// kept from frame to frame, came back as stale depth: black shapes on lit floors, DepthArrayGuard.)
+	if (slice * picked.size() > info.data.size / PartialUploadMaxShare && !DepthArrayGuarded(image)) {
 		return PartialFail("depth_share");
 	}
 	// Runs of consecutive layers stage as one piece each.
@@ -4718,6 +4762,7 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 				continue;
 			}
 			LogFullDirty("write", *owner, address, size, PartialDirtyCandidate(*owner));
+			DepthArrayEvent("a CPU write (whole image dirty)", *owner, address, size, nullptr);
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id, "cpu-write");
 			continue;
@@ -4866,6 +4911,7 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 			continue;
 		}
 		LogFullDirty("map", *owner, address, size, PartialDirtyCandidate(*owner));
+		DepthArrayEvent("a map (whole image dirty)", *owner, address, size, nullptr);
 		owner->InvalidateCpuWrite(address, size);
 		UntrackImage(id, "map");
 	}
@@ -4932,6 +4978,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 			}
 			LogFullDirty("unmap", *owner, address, size, PartialDirtyCandidate(*owner));
 		}
+		DepthArrayEvent("an unmap (image deleted)", *owner, address, size, nullptr);
 		++slow_deleted;
 		slow_bytes += owner->info.data.size;
 		if (owner->info.data.size > slow_largest) {
