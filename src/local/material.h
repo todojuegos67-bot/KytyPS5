@@ -25,8 +25,11 @@ struct MaterialDecode {
 	std::array<int32_t, MatFields>     code {-1, -1, -1, -1, -1};   // (material.glsl's codes; -1 none)
 	std::array<int, MatFields>         confidence {};               // 0 none, 1 low, 2 medium, 3 high
 	std::array<std::string, MatFields> source {};                   // where each came from (logged)
-	float                              smooth_lo = 0.25f, smooth_hi = 0.50f; // roughness: smooth / wet below lo, rough from hi
-	float                              wet_lo = 0.6f, wet_hi = 0.95f;        // wet field: dry at lo, wet at hi
+	// Roughness: smooth / wet below lo, rough from hi (the log's L2.b0: 0.40 overall, 0.01 on puddles). Wet field: dry
+	// up to lo, wet at hi (the log's L1.b2: 0.60 overall, 0.96 on puddles: lo 60 % of the way up, so ordinary dry
+	// surfaces around the mean never count as wet).
+	float                              smooth_lo = 0.15f, smooth_hi = 0.35f;
+	float                              wet_lo = 0.82f, wet_hi = 0.96f;
 	uint32_t                           version = 0;                 // bumped on every change (the composite fades over)
 };
 

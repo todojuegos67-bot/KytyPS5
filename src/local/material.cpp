@@ -188,7 +188,7 @@ bool MaterialRefresh() {
 		std::snprintf(buf, sizeof(buf), "rt-reflections' byte table: mean %.2f overall, %.2f on puddle-looking samples, %.1f sd apart",
 		              t.mean[wet], t.puddle[wet], wet_sep);
 		Set(MatWet, (wet / 4) | (((wet % 4) * 8) << 2) | (8 << 7), conf(wet_sep), buf);
-		g_dec.wet_lo = static_cast<float>(t.mean[wet] + (t.puddle[wet] - t.mean[wet]) * 0.3);
+		g_dec.wet_lo = static_cast<float>(t.mean[wet] + (t.puddle[wet] - t.mean[wet]) * 0.6);
 		g_dec.wet_hi = static_cast<float>(t.puddle[wet]);
 	}
 	std::printf("Material: rt-reflections' byte table attempt %u (%.0f samples, %.0f puddle-looking, %.0f water): roughness %s, "
