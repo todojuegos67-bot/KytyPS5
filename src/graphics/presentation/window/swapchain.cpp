@@ -1867,6 +1867,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		status = swapchain.Present();
 		swapchain.SetPresentId(0);
 		AntiLag::AfterPresent(latency_index);
+		if (status == Swapchain::Status::Success) AntiLag::OnPresented(latency_index); // KYTY_LATENCY: input -> present
 		if (generate) {
 			FrameGen::AfterPresent();
 			FrameGen::NoteFlipPresentMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - flip_begin).count());

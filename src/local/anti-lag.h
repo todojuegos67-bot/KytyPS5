@@ -50,6 +50,21 @@ void OnPresent(uint64_t frame_index);
 [[nodiscard]] bool OwnLowLatencyOn();
 void               OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick);
 
+// KYTY_LATENCY=1 (the launcher sets it with the metrics overlay): input -> present latency, any Anti-Lag mode or none.
+// The game's controller read that starts frame N (the first scePadRead / scePadReadState after its last flip, after any
+// Reflex / Anti-Lag 2 / KYTY_LOWLAT wait: the same point as Reflex's INPUT_SAMPLE) is stamped with
+// QueryPerformanceCounter; the frame id goes with the guest flip (OnFlipReserved) to the present thread, and
+// OnPresented(id) right after vkQueuePresentKHR of that real frame returned (the GPU work done: the present thread
+// waited for it; with DLSS-G / FSR 3 frame generation this is the real frame handed to the generating swapchain, never a
+// generated one) takes the difference. Once a second, on stdout (parsed by the metrics overlay, metricas.ps1):
+//   [lat] input->present mean 38.2 ms, p95 45.1, max 52.0; +scanout 2.1; fg +16.7 (n 60); total 57.0, p95 63.9; mode reflex
+// +scanout: an estimate, half the display's refresh interval (present -> the middle of the screen scanned out), not
+// measured; fg: the frame generation hold of the real frame, estimated as real interval x g / (g + 1) for g generated
+// frames per real one (x2: half a real frame), 0 without frame generation; total = input->present + scanout + fg.
+// Off: one cached flag test per controller read / flip / present.
+[[nodiscard]] bool LatencyOn();
+void               OnPresented(uint64_t frame_index);
+
 } // namespace Libs::Graphics::AntiLag
 
 #endif
