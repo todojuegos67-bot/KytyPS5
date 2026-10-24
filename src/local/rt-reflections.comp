@@ -319,7 +319,8 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 		// The material field (roughness units: low = smooth / wet): wet below mparams.x, dry from mparams.y; walls half.
 		float r = clamp(Field(push.dec.y, rp), 0.0, 1.0);
 		mat     = (1.0 - smoothstep(mparams.x, mparams.y, r)) * mix(0.5, 1.0, UpFacing(Nd)) * mparams.z;
-		mat_r   = mix(0.02, 0.25, smoothstep(0.0, mparams.y, r));
+		mat_r   = mix(0.08, 0.32, smoothstep(0.0, mparams.y, r)); // (wet ground blurrier than water's 0.03)
+		mat    *= mparams.w; // (the wet cap: the CPU scales it down when most of the floor is wet)
 	}
 	float guess = water > 0.0 ? 0.0 : PuddleGuess(ruv, Nd) * fparams.w;
 	s.mask  = max(water, max(mat, guess));
@@ -537,7 +538,23 @@ void Trace(ivec2 px, bool march) {
 	// (rough rays get fewer iterations: their result is blurred anyway)
 	int   iters = max(int(float(push.misc2.z) * mix(1.0, 0.5, smoothstep(0.15, 0.45, s.rough))), 8);
 	float th    = HizTrace(r, t0, tmax, iters, hit_z);
-	if (th < 0.0) { StoreMiss(px, s); return; }
+	if (th < 0.0) {
+		// A ray that leaves the screen: the color where it leaves, faded by how short the on-screen part was and by
+		// roughness, at a low confidence (a plausible tint, not a drop to nothing when the camera pitches down).
+		if (tmax < 0.999) {
+			vec2  euv = clamp((r.p0 + r.dp * tmax) / rs, vec2(0.002), vec2(0.998));
+			float ed  = DepthAt(euv);
+			float cf  = 0.35 * smoothstep(0.0, 0.25, tmax) * (1.0 - smoothstep(0.1, 0.4, s.rough));
+			if (!IsSky(ed) && cf > 1e-3) {
+				vec3 c = Tonemap(SafeColor(textureLod(color_tex, euv, 0).rgb * GameExposure()));
+				imageStore(out_a, px, vec4(c * cf, cf));
+				imageStore(out_c, px, vec4(s.rough, s.mask, 0, 0));
+				return;
+			}
+		}
+		StoreMiss(px, s);
+		return;
+	}
 	vec2  huv = (r.p0 + r.dp * th) / rs;
 	float hd  = DepthAt(huv);
 	if (IsSky(hd)) { StoreMiss(px, s); return; } // (the sky is never a hit: the game's own sky reflection stays)
@@ -653,6 +670,8 @@ void Temporal(ivec2 px) {
 		// Mirrors follow quickly (a parallax error would ghost); rough surfaces average longer.
 		float amin  = mix(0.15, 0.04, smoothstep(0.02, 0.3, rough)) * push.motion.w;
 		float alpha = max(1.0 / len, amin);
+		// (a miss this frame against a held reflection: the history fades slowly instead of popping)
+		if (fresh && cur.a < hist.a * 0.5) alpha *= 0.25;
 		if (!fresh) {
 			// (no sample of its own this frame: the history, nudged toward the traced neighbours)
 			len   = max(meta.x, 1.0);
@@ -690,6 +709,8 @@ void Atrous(ivec2 px) {
 	float var  = texelFetch(meta_tex, px, 0).w;
 	float step = push.params.w * mix(0.35, 1.0, smoothstep(0.05, 0.45, rough));
 	// Contact reflections (a short hit distance) stay sharp: the blur grows with the hit distance.
+	// (far away the same pixel radius covers far more surface: the radius shrinks with distance; grazing, sharper)
+	step *= clamp(25.0 / max(g.w, 1e-3), 0.3, 1.0);
 	if (ax.z > 0.0) step *= clamp(ax.z / max(g.w * 0.1, 1e-3), 0.3, 1.0);
 	step           = max(step, 1.0);
 	const float kern[3] = float[](0.375, 0.25, 0.0625);
