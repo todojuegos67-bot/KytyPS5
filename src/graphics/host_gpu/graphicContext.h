@@ -14,6 +14,9 @@
 
 namespace Libs::Graphics {
 
+// GraphicContext::draw_indirect_count_enabled for the command processor (set once at device creation).
+inline bool g_draw_indirect_count = false;
+
 struct VulkanImage;
 class PipelineBinaries;
 class PipelineBinaryWriter;
@@ -60,6 +63,9 @@ struct GraphicContext {
 	bool                               maintenance5_enabled                  = false;
 	// VK_NV_copy_memory_indirect: an upload prologue's copies are one command (BufferCache::UploadDirtyRanges).
 	bool                               copy_memory_indirect_enabled          = false;
+	// Vulkan 1.2 drawIndirectCount: a DRAW_INDIRECT_MULTI whose count the GPU wrote is drawn with the GPU reading it
+	// (vkCmdDrawIndexedIndirectCount) instead of the CPU waiting for that work (g_draw_indirect_count too).
+	bool                               draw_indirect_count_enabled           = false;
 	// False (the emulator): the driver keeps no copy of its own of the pipelines it makes (the
 	// precompile's captures of static cache hits come from that copy).
 	bool                               pipeline_binary_internal_cache        = true;

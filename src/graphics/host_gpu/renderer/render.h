@@ -74,6 +74,9 @@ struct DrawIndexArgs {
 	uint64_t gpu_args        = 0;
 	uint32_t gpu_args_count  = 0;
 	uint32_t gpu_args_stride = 0;
+	// With gpu_args: the guest address of a GPU-written draw count (DRAW_INDIRECT_MULTI) the GPU reads, clamped to
+	// gpu_args_count (vkCmdDraw[Indexed]IndirectCount); 0: gpu_args_count draws.
+	uint64_t gpu_count_addr  = 0;
 };
 
 struct DrawAutoArgs {
@@ -87,6 +90,9 @@ struct DrawAutoArgs {
 	uint64_t gpu_args        = 0;
 	uint32_t gpu_args_count  = 0;
 	uint32_t gpu_args_stride = 0;
+	// With gpu_args: the guest address of a GPU-written draw count (DRAW_INDIRECT_MULTI) the GPU reads, clamped to
+	// gpu_args_count (vkCmdDraw[Indexed]IndirectCount); 0: gpu_args_count draws.
+	uint64_t gpu_count_addr  = 0;
 };
 
 struct SubmitInfo {

@@ -16,6 +16,7 @@
 #include "graphics/guest_gpu/speculation.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -47,6 +48,7 @@
 #include <bit>
 #include <x86intrin.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -1740,7 +1742,7 @@ bool CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	return m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 }
 
-bool CommandProcessor::TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_t stride, bool indexed) {
+bool CommandProcessor::TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_t stride, bool indexed, uint64_t count_addr) {
 	// Reading GPU-written arguments on the CPU waits for the GPU to finish all work queued so
 	// far (0.1-0.3 ms). The draw uses them on the GPU instead, as native XPR runs do: an indexed
 	// triangle list over the whole index buffer (primitive restart with a custom index scans the
@@ -1757,7 +1759,10 @@ bool CommandProcessor::TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_
 		return false;
 	const uint64_t bytes     = uint64_t {count - 1u} * stride + size;
 	auto&          resources = GetGpuResources();
-	if (!resources.IsMapped(args, bytes) || !resources.GetBufferCache().HasGpuDirtyBytes(args, bytes) ||
+	// With a GPU count (its own checks in DrawIndirectMulti) the arguments are read on the GPU whoever wrote them: the
+	// buffer cache's copy of CPU-written ones is current (ObtainBuffer uploads it).
+	if (!resources.IsMapped(args, bytes) ||
+	    (count_addr == 0 && !resources.GetBufferCache().HasGpuDirtyBytes(args, bytes)) ||
 	    resources.GetTextureCache().IsRegionGpuModified(args, bytes))
 		return false;
 	if (!indexed)
@@ -1766,14 +1771,16 @@ bool CommandProcessor::TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_
 		                      .offset_source   = DrawOffsetSource::IndirectArgs,
 		                      .gpu_args        = args,
 		                      .gpu_args_count  = count,
-		                      .gpu_args_stride = stride});
+		                      .gpu_args_stride = stride,
+		                      .gpu_count_addr  = count_addr});
 	return DrawIndex({.index_count     = m_index_buffer_size,
 	                  .index_addr      = reinterpret_cast<const void*>(m_index_base_addr),
 	                  .instance_count  = 1,
 	                  .offset_source   = DrawOffsetSource::IndirectArgs,
 	                  .gpu_args        = args,
 	                  .gpu_args_count  = count,
-	                  .gpu_args_stride = stride});
+	                  .gpu_args_stride = stride,
+	                  .gpu_count_addr  = count_addr});
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -2109,6 +2116,26 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
+		// A count the GPU wrote (GPU-driven culling: Astro Bot) made this CPU read wait for all the work queued so far.
+		// With drawIndirectCount the GPU reads it and clamps it to the packet's max itself (after
+		// serbru20066666/brunoKytyPs5 7f2b1b54). KYTY_GPU_INDIRECT_COUNT=0: the CPU read as before.
+		static const bool gpu_count = [] {
+			const char* value = std::getenv("KYTY_GPU_INDIRECT_COUNT");
+			return value == nullptr || *value != '0';
+		}();
+		const auto count_vaddr = reinterpret_cast<uint64_t>(count_addr);
+		const auto args_size   = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+		if (gpu_count && g_draw_indirect_count && max_count_or_count > 1 && stride_in_bytes >= args_size &&
+		    (count_vaddr & 3u) == 0 && GetGpuResources().IsMapped(count_vaddr, sizeof(uint32_t)) &&
+		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(count_vaddr, sizeof(uint32_t)) &&
+		    !GetGpuResources().GetTextureCache().IsRegionGpuModified(count_vaddr, sizeof(uint32_t)) &&
+		    TryGpuIndirectDraw(m_draw_indirect_args_base_addr + data_offset, max_count_or_count, stride_in_bytes, indexed,
+		                       count_vaddr)) {
+			static std::atomic<uint32_t> logs {0};
+			if (logs.fetch_add(1, std::memory_order_relaxed) == 0)
+				std::printf("DrawIndirectMulti: GPU-written draw counts read on the GPU (drawIndirectCount)\n");
+			return;
+		}
 		if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(reinterpret_cast<uint64_t>(count_addr),
 		                                                  sizeof(uint32_t))) {
 			static std::atomic<uint32_t> sync_fallback_logs {0};

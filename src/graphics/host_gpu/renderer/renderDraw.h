@@ -40,6 +40,7 @@ struct DrawEmitInfo {
 	uint64_t gpu_args        = 0;
 	uint32_t gpu_args_count  = 0;
 	uint32_t gpu_args_stride = 0;
+	uint64_t gpu_count_addr  = 0; // DrawIndexArgs::gpu_count_addr
 };
 
 struct DrawIndexBufferSource {

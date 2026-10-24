@@ -839,6 +839,11 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		supported_features2.pNext     = &supported_copy_indirect;
 	}
 	physical_device.getFeatures2(&supported_features2);
+	// drawIndirectCount (Vulkan 1.2, optional; every desktop driver has it): GPU-written multi-draw counts read on the GPU.
+	graphics.draw_indirect_count_enabled = supported_features12.drawIndirectCount == VK_TRUE;
+	features12.drawIndirectCount         = graphics.draw_indirect_count_enabled ? VK_TRUE : VK_FALSE;
+	g_draw_indirect_count                = graphics.draw_indirect_count_enabled;
+	LOGF("Vulkan drawIndirectCount: %s\n", graphics.draw_indirect_count_enabled ? "true" : "false");
 	graphics.copy_memory_indirect_enabled = copy_indirect_extension && supported_copy_indirect.indirectCopy;
 	LOGF("Vulkan indirect memory copies: %s\n", graphics.copy_memory_indirect_enabled ? "true" : "false");
 	graphics.maintenance5_enabled      = maintenance5_extension && supported_maintenance5.maintenance5;
