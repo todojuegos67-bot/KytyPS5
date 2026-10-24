@@ -17,6 +17,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace Libs::Graphics {
 struct RenderState;
@@ -28,18 +29,42 @@ namespace FrameGen {
 // The TAA compute shader, and the G-buffer vertex shaders sharing the constant layout below (flattened SRT
 // words), of 01.007.000 and of 01.005.000: the same shaders recompiled (KYTY_SHADER_DUMP: the same resources,
 // the vertex shaders the same translated program; the TAA images are what is read from its dispatch).
+// Demon's Souls' own: on any other title they are not used (DemonsSoulsHashes), and the title's passes are named by
+// the per-title switches below, read once (the launcher sets them per title):
+//   KYTY_FG_TAA_SHADERS=<hash>[;<hash>...]   the compute pass reading the jittered color, depth and motion vectors
+//   KYTY_FG_TAA_SLOTS=c,d,m,h,o               its image slots: color, depth, motion, history, output (0,1,3,4,6)
+//   KYTY_FG_GBUFFER_VS=<hash>[;<hash>...]     vertex shaders whose flattened SRT holds the camera
+//   KYTY_FG_SRT_VIEWPROJ / _PREV / _JITTER    the word index of its matrices and jitter (29, 45, 57)
+// With none (another title), frame generation takes the frames without the game's vectors (GenericInputs).
 constexpr std::array<uint64_t, 2> TaaShaders {0xa44e580f4f0cfb2bULL, 0x934a6e1197b99148ULL};
 constexpr std::array<uint64_t, 6> GbufferVertexShaders {0xf4d2e78cd1769fc7ULL, 0x08e16923875aa8e9ULL, 0x0ffcbf08be26e74eULL,
                                                         0x1d69b5d27198446aULL, 0x5931e753b757f3bcULL, 0xa97f610824942162ULL};
+// The title is Demon's Souls (its built-in hashes and passes apply).
+[[nodiscard]] bool DemonsSoulsHashes();
+// A per-title list of shader hashes from `env` (hex, ';' or ',' between them; empty: none).
+[[nodiscard]] std::vector<uint64_t> HashList(const char* env);
+[[nodiscard]] const std::vector<uint64_t>& TaaShaderList();
+[[nodiscard]] const std::vector<uint64_t>& GbufferShaderList();
 inline bool IsTaaShader(uint64_t hash) {
-	return std::find(TaaShaders.begin(), TaaShaders.end(), hash) != TaaShaders.end();
+	const auto& list = TaaShaderList();
+	return !list.empty() && std::find(list.begin(), list.end(), hash) != list.end();
 }
 inline bool IsGbufferVertexShader(uint64_t hash) {
-	return std::find(GbufferVertexShaders.begin(), GbufferVertexShaders.end(), hash) != GbufferVertexShaders.end();
+	const auto& list = GbufferShaderList();
+	return !list.empty() && std::find(list.begin(), list.end(), hash) != list.end();
 }
-constexpr uint32_t SrtViewProj     = 29; // 16 floats, row-major, clip = M * world
-constexpr uint32_t SrtPrevViewProj = 45; // 12 floats: the previous frame's rows x, y and w
-constexpr uint32_t SrtJitter       = 57; // 2 floats: clip-space offset (NDC units)
+// The TAA dispatch's image slot for Demon's Souls' slot `ds` (0 color, 1 depth, 3 motion, 4 history, 6 output).
+[[nodiscard]] uint32_t TaaSlot(uint32_t ds);
+// Its highest slot + 1 (a dispatch with fewer images is not read).
+[[nodiscard]] uint32_t TaaSlots();
+[[nodiscard]] uint32_t SrtIndex(int which); // 0 view-proj, 1 previous, 2 jitter
+inline const uint32_t SrtViewProj     = SrtIndex(0); // 16 floats, row-major, clip = M * world
+inline const uint32_t SrtPrevViewProj = SrtIndex(1); // 12 floats: the previous frame's rows x, y and w
+inline const uint32_t SrtJitter       = SrtIndex(2); // 2 floats: clip-space offset (NDC units)
+// Another title without its TAA pass named (KYTY_FG_TAA_SHADERS): every frame not a movie is a frame of the game's view
+// for frame generation, with zero motion vectors and a far depth at the flip image's size (FSR 3 and DLSS-G then
+// interpolate from the images alone: optical flow). KYTY_FG_GENERIC=0: off (frame generation never on there).
+[[nodiscard]] bool GenericInputs();
 
 struct Camera {
 	std::array<float, 16> view_proj {};

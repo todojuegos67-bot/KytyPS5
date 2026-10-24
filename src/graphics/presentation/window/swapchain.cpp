@@ -20,6 +20,7 @@
 #endif
 #include "frame-gen.h"
 #include "local/fsr3-fg.h"
+#include "local/frame-capture.h"
 #include "local/kbm-warp.h"
 #include "local/anti-lag.h"
 #include "local-platform.h"
@@ -1587,6 +1588,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	FrameCapture::NoteFlipImage(image.info.data.address, image.backing.extent.width, image.backing.extent.height,
+	                            static_cast<uint32_t>(image.backing.format)); // (frame-generation discovery)
 	frame->scene    = FrameGen::TakeScene();
 	frame->fg.valid = false;
 	if (FrameGen::Capturing()) {

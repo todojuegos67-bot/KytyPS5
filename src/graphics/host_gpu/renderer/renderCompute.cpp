@@ -1133,11 +1133,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	if (FrameGen::Capturing() && FrameGen::IsTaaShader(program.shader_hash) &&
-	    bindings.images.size() > 3) {
-		// TAA inputs (docs/RE-DEMONS-SOULS.md): slot 1 depth, slot 3 motion vectors.
-		FrameGen::OnDispatch(program.shader_hash, bindings.images[1].image_id,
-		                     bindings.images[1].desc.info.data.address, bindings.images[3].image_id,
-		                     bindings.images[3].desc.info.data.address);
+	    bindings.images.size() > std::max(FrameGen::TaaSlot(1), FrameGen::TaaSlot(3))) {
+		// TAA inputs (docs/RE-DEMONS-SOULS.md): slot 1 depth, slot 3 motion vectors (another title: KYTY_FG_TAA_SLOTS).
+		const auto depth = FrameGen::TaaSlot(1), motion = FrameGen::TaaSlot(3);
+		FrameGen::OnDispatch(program.shader_hash, bindings.images[depth].image_id,
+		                     bindings.images[depth].desc.info.data.address, bindings.images[motion].image_id,
+		                     bindings.images[motion].desc.info.data.address);
 	}
 	// KYTY_TAA_DIAG=1: the TAA dispatch's images (slot, guest address, format, size, storage), the first frames and
 	// every 600th (the plan to put DLSS in its place: which image its output is, and what reads it after).

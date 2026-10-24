@@ -105,17 +105,220 @@ inline void AddGuest(std::string name, uint64_t address, uint64_t size) {
 	g_call.blobs.push_back({std::move(name), address, std::move(words)});
 }
 
+// Frame-generation discovery (KYTY_FG_DISCOVER, F10): a summary of each recorded frame in the log ([fgdisc] lines), to
+// find a title's scene color, depth and motion vectors, its TAA-like pass and its final composite (the flip image's
+// draws and what they sample: the 3D scene and the HUD layer). The full calls are in the frame's .jsonl.
+struct SummaryTarget {
+	uint64_t address = 0;
+	uint32_t format = 0, width = 0, height = 0, layers = 0;
+	uint32_t calls = 0, first = 0, last = 0;
+	uint64_t last_shader = 0;
+	uint8_t  kind = 0; // ColorTarget, DepthTarget, or Texture for a storage image a dispatch writes
+};
+struct SummaryCandidate {
+	uint32_t    index = 0;
+	uint64_t    shader = 0;
+	bool        dispatch = false;
+	std::string images;
+};
+inline std::vector<SummaryTarget>    g_sum_targets;
+inline std::vector<SummaryCandidate> g_sum_taa, g_sum_composite;
+inline uint32_t                      g_sum_draws = 0, g_sum_dispatches = 0;
+// The flip images seen (guest address, size, format), from the presenter (any thread).
+inline std::atomic<uint64_t> g_flip_address[4] {};
+inline std::atomic<uint32_t> g_flip_w {0}, g_flip_h {0}, g_flip_format {0};
+inline void NoteFlipImage(uint64_t address, uint32_t width, uint32_t height, uint32_t format) {
+	for (auto& slot: g_flip_address)
+		if (slot.load(std::memory_order_relaxed) == address) return;
+	static std::atomic<uint32_t> next {0};
+	g_flip_address[next.fetch_add(1, std::memory_order_relaxed) % 4].store(address, std::memory_order_relaxed);
+	g_flip_w.store(width, std::memory_order_relaxed);
+	g_flip_h.store(height, std::memory_order_relaxed);
+	g_flip_format.store(format, std::memory_order_relaxed);
+}
+[[nodiscard]] inline bool IsFlipAddress(uint64_t address) {
+	if (address == 0) return false;
+	for (auto& slot: g_flip_address)
+		if (slot.load(std::memory_order_relaxed) == address) return true;
+	return false;
+}
+// VkFormat names of the formats render targets usually have.
+[[nodiscard]] inline const char* FormatName(uint32_t f) {
+	switch (f) {
+		case 9: return "R8";
+		case 16: return "RG8";
+		case 17: return "RG8_SNORM";
+		case 37: return "RGBA8";
+		case 38: return "RGBA8_SNORM";
+		case 43: return "RGBA8_SRGB";
+		case 44: return "BGRA8";
+		case 50: return "BGRA8_SRGB";
+		case 58: return "A2R10G10B10";
+		case 64: return "A2B10G10R10";
+		case 70: return "R16";
+		case 76: return "R16F";
+		case 77: return "RG16";
+		case 78: return "RG16_SNORM";
+		case 81: return "RG16_UINT";
+		case 83: return "RG16F";
+		case 91: return "RGBA16";
+		case 92: return "RGBA16_SNORM";
+		case 97: return "RGBA16F";
+		case 98: return "R32_UINT";
+		case 100: return "R32F";
+		case 101: return "RG32_UINT";
+		case 103: return "RG32F";
+		case 109: return "RGBA32F";
+		case 122: return "R11G11B10F";
+		case 124: return "D16";
+		case 125: return "X8D24";
+		case 126: return "D32F";
+		case 129: return "D24S8";
+		case 130: return "D32FS8";
+		default: return "?";
+	}
+}
+[[nodiscard]] inline bool DepthLike(uint32_t f) { return f == 124 || f == 125 || f == 126 || f == 129 || f == 130; }
+[[nodiscard]] inline bool MotionLike(uint32_t f) { return f == 16 || f == 17 || f == 77 || f == 78 || f == 83 || f == 103; }
+
+inline void SummaryReset() {
+	g_sum_targets.clear();
+	g_sum_taa.clear();
+	g_sum_composite.clear();
+	g_sum_draws = g_sum_dispatches = 0;
+}
+
+inline std::string DescribeImages(const std::vector<Image>& images) {
+	std::string out;
+	char        text[160];
+	for (const auto& m: images) {
+		const char* kind = m.kind == ColorTarget ? "rt" : m.kind == DepthTarget ? "ds" : m.storage ? (m.written ? "uav-w" : "uav") : "tex";
+		std::snprintf(text, sizeof(text), " %s%u:%" PRIx64 ":%s:%ux%u%s", kind, m.slot, m.address, FormatName(m.format),
+		              m.width, m.height, IsFlipAddress(m.address) ? ":FLIP" : "");
+		out += text;
+	}
+	return out;
+}
+
+inline void SummaryAdd(const Call& call, uint32_t index) {
+	(call.dispatch ? g_sum_dispatches : g_sum_draws)++;
+	const auto note = [&](const Image& m, uint8_t kind) {
+		for (auto& t: g_sum_targets)
+			if (t.address == m.address && t.kind == kind && t.format == m.format && t.width == m.width) {
+				++t.calls;
+				t.last        = index;
+				t.last_shader = call.dispatch ? call.cs : call.ps;
+				return;
+			}
+		if (g_sum_targets.size() >= 512) return;
+		g_sum_targets.push_back({m.address, m.format, m.width, m.height, m.layers, 1, index, index,
+		                         call.dispatch ? call.cs : call.ps, kind});
+	};
+	bool                     flip = false;
+	uint32_t                 out_w = 0, out_h = 0;
+	for (const auto& m: call.images) {
+		if (m.kind == ColorTarget || m.kind == DepthTarget) note(m, m.kind);
+		else if (m.storage && m.written) note(m, Texture);
+		if (m.kind == ColorTarget && IsFlipAddress(m.address)) flip = true;
+		if ((m.kind == ColorTarget || (m.storage && m.written)) && out_w == 0) out_w = m.width, out_h = m.height;
+	}
+	// A TAA-like pass: it samples a depth-like and a motion-like image of the size it writes.
+	bool depth = false, motion = false;
+	for (const auto& m: call.images) {
+		if (m.kind != Texture || (m.storage && m.written)) continue;
+		if (out_w != 0 && (m.width != out_w || m.height != out_h)) continue;
+		depth  = depth || DepthLike(m.format) || m.format == 100;
+		motion = motion || MotionLike(m.format);
+	}
+	if (depth && motion && g_sum_taa.size() < 16)
+		g_sum_taa.push_back({index, call.dispatch ? call.cs : call.ps, call.dispatch, DescribeImages(call.images)});
+	if (flip && g_sum_composite.size() < 16)
+		g_sum_composite.push_back({index, call.ps, false, DescribeImages(call.images)});
+}
+
+inline void SummaryPrint(uint32_t frame, uint32_t calls) {
+	std::printf("[fgdisc] frame %u: %u calls (%u draws, %u dispatches); flip image %ux%u %s at", frame, calls, g_sum_draws,
+	            g_sum_dispatches, g_flip_w.load(), g_flip_h.load(), FormatName(g_flip_format.load()));
+	for (auto& slot: g_flip_address)
+		if (const auto a = slot.load(std::memory_order_relaxed); a != 0) std::printf(" %" PRIx64, a);
+	std::printf("\n");
+	auto targets = g_sum_targets;
+	std::sort(targets.begin(), targets.end(), [](const auto& a, const auto& b) { return a.calls > b.calls; });
+	uint32_t shown = 0;
+	for (const auto& t: targets) {
+		if (shown++ == 40) break;
+		std::printf("[fgdisc]  %s %" PRIx64 " %s %ux%u%s: %u calls (#%u..#%u), last %s %016" PRIx64 "%s%s\n",
+		            t.kind == ColorTarget ? "RT " : t.kind == DepthTarget ? "DS " : "UAV", t.address, FormatName(t.format),
+		            t.width, t.height, t.layers > 1 ? " (layers)" : "", t.calls, t.first, t.last,
+		            t.kind == Texture ? "cs" : "ps", t.last_shader, IsFlipAddress(t.address) ? "  <- FLIP IMAGE" : "",
+		            MotionLike(t.format) ? "  <- motion-like" : DepthLike(t.format) ? "  <- depth" : "");
+	}
+	for (const auto& c: g_sum_taa)
+		std::printf("[fgdisc]  TAA-like %s #%u %s %016" PRIx64 ":%s\n", c.dispatch ? "dispatch" : "draw", c.index,
+		            c.dispatch ? "cs" : "ps", c.shader, c.images.c_str());
+	for (const auto& c: g_sum_composite)
+		std::printf("[fgdisc]  into the flip image: draw #%u ps %016" PRIx64 ":%s\n", c.index, c.shader, c.images.c_str());
+	std::fflush(stdout);
+}
+
+// Live thread or the F10 key: record the next `frames` frames into `dir` without waiting (false: one is in progress).
+[[nodiscard]] inline bool ArmAsync(const std::string& dir, int frames) {
+	if (g_active.load() || g_pending.load() > 0) return false;
+	{
+		const std::lock_guard lock(g_mutex);
+		g_dir = dir;
+	}
+	g_data_hashes.clear();
+	g_data_counts.clear();
+	g_done.store(0);
+	g_pending.store(frames, std::memory_order_release);
+	std::printf("[fgdisc] recording %d frame(s) into %s\n", frames, dir.c_str());
+	std::fflush(stdout);
+	return true;
+}
+
 inline void OpenFrame() {
 	const std::string path = g_dir + "/frame-" + std::to_string(g_frame) + ".jsonl";
 	g_file = std::fopen(path.c_str(), "wb");
 	g_seq  = 0;
+	SummaryReset();
 	std::fill(g_data_counts.begin(), g_data_counts.end(), 0u);
 	if (g_file != nullptr) std::fprintf(g_file, "{\"t\":\"frame\",\"frame\":%u}\n", g_frame);
+}
+
+
+// KYTY_FG_DISCOVER=1: two frames recorded 20, 60 and 180 s after the frame-generation gate opened (`ready`: the
+// player's first button), into _DebugSnapshots/fgdisc-<n> (KYTY_FG_DISCOVER_AT=<s>,<s>,...: other times). Kyty.Gpu.
+inline void AutoTick(bool ready) {
+	static const std::vector<double> at = [] {
+		std::vector<double> v;
+		const char*         on = std::getenv("KYTY_FG_DISCOVER");
+		if (on == nullptr || *on == '\0' || *on == '0') return v;
+		const char* list = std::getenv("KYTY_FG_DISCOVER_AT");
+		std::string text = list != nullptr && *list != '\0' ? list : "20,60,180";
+		for (size_t begin = 0; begin < text.size();) {
+			const auto end = std::min(text.find(',', begin), text.size());
+			if (end > begin) v.push_back(std::atof(text.substr(begin, end - begin).c_str()));
+			begin = end + 1;
+		}
+		std::printf("[fgdisc] on: frames recorded %zu time(s) after the first button (F10: now)\n", v.size());
+		std::fflush(stdout);
+		return v;
+	}();
+	if (at.empty() || !ready) return;
+	static std::chrono::steady_clock::time_point start {};
+	static size_t                                next = 0;
+	const auto                                   now  = std::chrono::steady_clock::now();
+	if (start == std::chrono::steady_clock::time_point {}) start = now;
+	if (next >= at.size() || std::chrono::duration<double>(now - start).count() < at[next]) return;
+	const auto dir = std::filesystem::absolute(std::filesystem::path("_DebugSnapshots") / ("fgdisc-" + std::to_string(next + 1)));
+	if (ArmAsync(dir.string(), 2)) ++next;
 }
 
 // Kyty.Gpu, at every guest flip.
 inline void OnFlip() {
 	if (g_active.load(std::memory_order_relaxed)) {
+		SummaryPrint(g_frame, g_seq);
 		if (g_file != nullptr) {
 			std::fprintf(g_file, "{\"t\":\"flip\",\"frame\":%u,\"calls\":%u}\n", g_frame, g_seq);
 			std::fclose(g_file);
@@ -199,6 +402,7 @@ inline void Append(std::string& out, const char* format, auto... args) {
 
 inline void Write(const Call& call, double microseconds) {
 	if (g_file == nullptr) return;
+	SummaryAdd(call, g_seq);
 	std::string line;
 	line.reserve(512 + call.images.size() * 160 + call.buffers.size() * 64);
 	Append(line, "{\"i\":%u,\"t\":\"%s\",\"us\":%.2f,\"prep\":%d", g_seq++, call.name ? call.name : "?",
