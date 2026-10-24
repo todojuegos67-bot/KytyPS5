@@ -232,8 +232,9 @@ function Start-Game {
 	# (10-23 21:30) NVIDIA Reflex sobre la frame generation de AMD crashea tambien sin DLSS (20261023-213004, Fsr3::QueuePresent): nunca.
 	$nvAmd  = $false
 	# Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag automatico en AMD, y en NVIDIA solo con XeSS o FSR.
-	$fixedAl = (Is-FixedFg) -and (-not $script:isNvidia)
+	$fixedAl = $false  # (10-24) modos fijos: Anti-Lag Ultra propio en cualquier grafica (no dos anti-lag a la vez)
 	# (10-23 noche) Anti-Lag propio del emulador (KYTY_LOWLAT): sin Reflex ni FSR3 tocado; con la frame generation de AMD.
+	if (Is-FixedFg) { $cmbAl.SelectedIndex = 2 }  # (10-24) siempre Ultra en los modos fijos
 	$ownLat = $cmbAl.SelectedIndex -gt 0 -and $config -like 'fsr3*'
 	if ($ownLat) { $sets += 'KYTY_LOWLAT=1'; $sets += $(if ($cmbAl.SelectedIndex -eq 2) { 'KYTY_LOWLAT_QUEUE=1' } else { 'KYTY_LOWLAT_QUEUE=2' }) }  # (10-23) Anti-Lag: 2 frames en cola; Ultra: 1
 	# (10-23) Para las metricas: si va Anti-Lag y cual.
@@ -892,7 +893,7 @@ $cmbAl = New-Object System.Windows.Forms.ComboBox
 $cmbAl.DropDownStyle = 'DropDownList'; $cmbAl.Font = $smallFont
 foreach ($l in 'Anti-Lag: no', 'Anti-Lag', 'Anti-Lag Ultra') { [void]$cmbAl.Items.Add($l) }
 $ai2 = 1; [void][int]::TryParse((Get-IniValue 'antilagmode2' '1'), [ref]$ai2); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $ai2), 2)  # (10-24) activado por defecto
-$cmbAl.Add_SelectedIndexChanged({ Set-IniValue 'antilagmode2' "$($cmbAl.SelectedIndex)" })
+$cmbAl.Add_SelectedIndexChanged({ if (-not $script:alLocked) { Set-IniValue 'antilagmode2' "$($cmbAl.SelectedIndex)" } })
 $gFg.Controls.Add($cmbAl); $cmbAl.Location = $chkAntiLag.Location; $cmbAl.Size = New-Object System.Drawing.Size(186, 26)
 # (10-24) Con la frame generation de NVIDIA (DLSS-G) va siempre NVIDIA Reflex: se muestra para que se sepa.
 $lbReflex = New-Label 'Reflex: activado (DLSS-G)' $smallFont ([System.Drawing.Color]::FromArgb(120, 210, 120)) 0 0 186 24
@@ -910,6 +911,14 @@ function Update-AntiLagBox {
 	$chkAntiLag.Enabled = $true
 	if (-not $ok) { $chkAntiLag.Checked = $false }
 	$chkAntiLag.Visible = $false; $cmbAl.Visible = $ok
+	# (10-24) Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag Ultra siempre, sin poder cambiarlo.
+	if (Is-FixedFg) {
+		if (-not $script:alLocked) { $script:alLocked = $true; $cmbAl.SelectedIndex = 2 }
+		$cmbAl.Enabled = $false
+	} elseif ($script:alLocked) {
+		$script:alLocked = $false; $cmbAl.Enabled = $true
+		$v = 1; [void][int]::TryParse((Get-IniValue 'antilagmode2' '1'), [ref]$v); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $v), 2)
+	}
 	$lbReflex.Visible = (-not $ok) -and $cfgNow -like 'dlss*'
 }
 $cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
