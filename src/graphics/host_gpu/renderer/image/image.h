@@ -396,6 +396,9 @@ public:
 	const Buffer*    staged_ring        = nullptr;
 	uint64_t         staged_offset      = 0;
 	uint64_t         staged_serial      = 0;
+	// A colour (or other) image that took over a GPU-rendered layered depth image's memory (the spot-shadow pool
+	// recreated for a storage/target use): guarded like the depth array (DepthArrayGuarded).
+	bool             depth_array_alias  = false;
 	// The barrier state (backing.state, backing.subresource_states, transit_group): changed under this lock, which a
 	// speculative translation's thread reads it under (SpeculativeEntry).
 	struct StateLock {

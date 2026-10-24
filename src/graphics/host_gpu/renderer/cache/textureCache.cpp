@@ -1519,8 +1519,23 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	LiveCounters::Add(LiveCounters::DepthOverlaps);
 	LiveCounters::Add(LiveCounters::DepthOverlapBytes, cached.info.data.size);
+	static const char* const binding_names[] = {"texture", "storage", "render_target", "depth_target", "video_out"};
+	const auto binding_index = static_cast<uint32_t>(binding);
+	char detail[256];
+	std::snprintf(detail, sizeof(detail),
+	              "binding=%s requested: depth=%d fmt=%u guest_fmt=%u layers=%u levels=%u type=%u tile=%u cached: fmt=%u levels=%u",
+	              binding_index < 5 ? binding_names[binding_index] : "?", requested.IsDepth() ? 1 : 0,
+	              static_cast<uint32_t>(requested.pixel_format), static_cast<uint32_t>(requested.guest_format),
+	              requested.resources.layers, requested.resources.levels, static_cast<uint32_t>(requested.type),
+	              static_cast<uint32_t>(requested.tile_mode), static_cast<uint32_t>(cached.info.pixel_format),
+	              cached.info.resources.levels);
 	DepthArrayEvent(binding == BindingType::DepthTarget ? "a recreation for a depth target" : "a recreation for another use", cached,
-	                requested.data.address, requested.data.size, nullptr);
+	                requested.data.address, requested.data.size, detail);
+	// The spot-shadow pool (a GPU-rendered layered depth image) taken over by another use keeps its guard: the texture
+	// streamer's CPU writes to its free layers then refresh only those layers, never all of it from guest memory,
+	// which never held the rendered shadows (they vanished until the lights were rendered again).
+	const bool alias_guard = (cached.info.IsDepth() || cached.depth_array_alias) && cached.IsGpuModified() &&
+	                         cached.info.resources.layers > 1;
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
@@ -1538,6 +1553,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (!replacement_id) replacement_id = InsertImage(info);
 	auto& replacement = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
+	replacement.depth_array_alias = alias_guard && !replacement.info.IsDepth() &&
+	                                replacement.info.resources.layers == cached.info.resources.layers;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
 	}
@@ -1593,6 +1610,7 @@ void TextureCache::ParkImage(ImageId id) {
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
 	}
+	image.depth_array_alias = false;
 	const auto address = image.info.data.address;
 	if (!DetachImage(id)) return;
 	auto& parked = m_parked[address];
@@ -2135,10 +2153,11 @@ static bool DepthArrayGuardOn() {
 	return on;
 }
 static bool DepthArrayGuarded(const Image& image) {
-	return DepthArrayGuardOn() && image.IsGpuModified() && image.info.IsDepth() && image.info.resources.layers > 1;
+	return DepthArrayGuardOn() && image.IsGpuModified() && (image.info.IsDepth() || image.depth_array_alias) &&
+	       image.info.resources.layers > 1;
 }
 static void DepthArrayEvent(const char* what, const Image& image, uint64_t address, uint64_t size, const char* detail) {
-	if (!image.info.IsDepth() || image.info.resources.layers < 2 || !image.IsGpuModified()) return;
+	if (!(image.info.IsDepth() || image.depth_array_alias) || image.info.resources.layers < 2 || !image.IsGpuModified()) return;
 	static const bool all = [] {
 		const char* value = std::getenv("KYTY_DEPTH_ARRAY_LOG");
 		return value != nullptr && value[0] == '1';
@@ -2842,7 +2861,8 @@ bool TextureCache::UploadImagePartial(Image& image, uint64_t window_begin, uint6
 		picked += tile.tiled_size;
 	}
 	// (A window's refresh leaves the rest dirty: no whole upload instead.)
-	if (window_begin == 0 && window_end == UINT64_MAX && picked > info.data.size / PartialUploadMaxShare) {
+	if (window_begin == 0 && window_end == UINT64_MAX && picked > info.data.size / PartialUploadMaxShare &&
+	    !DepthArrayGuarded(image)) {
 		return PartialFail("share");
 	}
 	if (picks.empty()) {
