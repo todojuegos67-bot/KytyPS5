@@ -310,6 +310,22 @@ vec3 WaterNormal(vec3 Nd) {
 	float c  = dot(Nd, up);
 	return c > 0.97 ? up : normalize(mix(Nd, up, smoothstep(0.85, 0.97, c)));
 }
+// (refl5) Puddles from the game's G-buffer: Demon's Souls writes its wet / puddle material with the roughness byte
+// (layer 2 bits 0..7) at ~0 and the gloss byte (layer 1 bits 16..23) near 1 (20261024-205122 log: L2.b0 0.24 overall /
+// 0.00 on puddle-looking pixels, L1.b2 0.61 / 0.96). Gloss alone marked half of the screen (dry polished stone too): both
+// are required, tight (push.dec.w: max roughness x255 in bits 0..7, min gloss x255 in bits 8..15), plus a flat floor.
+float Puddle(ivec2 rp, vec3 Nd, vec2 ruv, out float r) {
+	r = 1.0;
+	if ((push.misc.w & 128) == 0 || push.dec.z < 3) return 0.0;
+	float rmax = float(push.dec.w & 255) / 255.0, gmin = float((push.dec.w >> 8) & 255) / 255.0;
+	r       = Bits(Packed(2, rp), 0, 8);
+	float g = Bits(Packed(1, rp), 16, 8);
+	float w = (1.0 - smoothstep(rmax, rmax + 0.015, r)) * smoothstep(gmin - 0.015, gmin, g);
+	if (w <= 0.0) return 0.0;
+	w *= smoothstep(0.85, 0.95, (push.misc.w & 8) != 0 ? dot(Nd, up_view.xyz) : abs(Nd.y));
+	if (w <= 0.0) return 0.0;
+	return w * Flatness(ruv, Nd, 0.97, 0.995);
+}
 Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	Surf s;
 	vec3 Nd = NormalAt(ruv, P);
@@ -333,6 +349,9 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 		mat_r   = mix(0.02, 0.15, smoothstep(0.0, mparams.y, r)); // (wet ground blurrier than water's 0.03)
 		mat    *= mparams.w; // (the wet cap: the CPU scales it down when most of the floor is wet)
 	}
+	float pr  = 1.0;
+	float pud = match ? Puddle(rp, Nd, ruv, pr) : 0.0;
+	if (pud > mat) mat = pud, mat_r = pr < 0.008 ? 0.0 : 0.02; // (puddles: mirrors)
 	float guess = water > 0.0 ? 0.0 : PuddleGuess(ruv, Nd) * fparams.w;
 	s.mask  = max(water, max(mat, guess));
 	s.rough = water >= mat && water >= guess ? 0.0 : mat >= guess ? mat_r : 0.12; // (water: a mirror, no lobe)
@@ -814,6 +833,10 @@ void Composite(ivec2 px) {
 		if (abs(z0 - z) > 0.02 * z) Stat(8, 1);
 	}
 	if (st && match && push.dec.y >= 0 && Field(push.dec.y, px) < mparams.x) Stat(9, 1);
+	if (st && match) {
+		float pr;
+		if (Puddle(px, Nd, uv, pr) > 0.5) Stat(10, 1);
+	}
 	vec4 rf, ax;
 	if (all(equal(ivec2(TraceSize()), ivec2(RenderSize())))) {
 		rf = texelFetch(src_a, px, 0);

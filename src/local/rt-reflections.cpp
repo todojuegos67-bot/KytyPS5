@@ -68,7 +68,7 @@ constexpr uint32_t CalibFloors   = CalibBytes + 16 * 3;
 constexpr uint32_t CalibWet      = CalibFloors + 2; // puddle guess: count + 16 byte sums; water: the same
 constexpr uint32_t CalibHist     = 300;             // 16 byte fields x 16 bins
 constexpr uint32_t StatsIndex    = 560;
-constexpr uint32_t StatsCount    = 10;
+constexpr uint32_t StatsCount    = 11;
 constexpr uint32_t FrameBytes    = 4096;          // header + calibration + stats
 constexpr uint32_t ExposureIndex = 128 / 4;       // fparams.x (1.0) when the game gives no exposure
 constexpr uint32_t CalibRuns     = 24;
@@ -124,6 +124,8 @@ struct RtPass {
 	VmaAllocation           frame_mem = nullptr;
 	// The material field (wet below lo, dry from hi; scale): from KYTY_RT_REFLECTIONS_ROUGH / _WET or the calibration.
 	float                   mat_lo = 0.15f, mat_hi = 0.30f, mat_scale = 1.0f;
+	float                   pud_r = 0.02f, pud_g = 0.94f; // (refl5: the puddle signal; KYTY_RT_REFLECTIONS_PUDDLE=r:g, 0 off)
+	bool                    pud_on = true;
 	bool                    mat_auto = false, mat_forced = false;
 	float                   wet_cap = 1.0f;
 	const int32_t*          mapped    = nullptr;
@@ -501,6 +503,8 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	                                            : (g_rt.rough_trusted ? "material field (env)" : "material field (auto)"))
 	                     : g_rt.have_water ? "water (depth after the G-buffer) + faint puddle guess"
 	                                       : "faint puddle guess only (no depth copy)";
+	std::printf("RT reflections: last %.0f s: puddle (G-buffer L2.b0 <= %.3f and L1.b2 >= %.3f, flat floor) on %.1f%% of the pixels\n",
+	            std::chrono::duration<double>(now - g_rt.stat_time).count(), g_rt.pud_r, g_rt.pud_g, 100.0 * sm[10] / px);
 	std::printf("RT reflections: last %.0f s: mask %s marks %.1f%% of the pixels reflective (water %.1f%%, material wet %.1f%%, "
 	            "depth changed after the G-buffer %.1f%%); weight > 0.05 on "
 	            "%.1f%% of the pixels, mean weight %.3f (%.3f on reflective surfaces), rays on %.1f%%, hit rate %.0f%%, "
@@ -738,6 +742,11 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 					g_rt.mat_lo = lo, g_rt.mat_hi = hi, g_rt.mat_forced = true;
 			}
 			// (refl4: the auto-picked material field marked dry stone floors wet (10-24 video): off unless asked or given a trusted field)
+			if (const char* pz = std::getenv("KYTY_RT_REFLECTIONS_PUDDLE"); pz != nullptr && *pz != '\0') {
+				float pr = 0.0f, pg = 0.0f;
+				if (std::sscanf(pz, "%f:%f", &pr, &pg) == 2 && pr >= 0.0f && pr < 1.0f && pg > 0.0f && pg <= 1.0f) g_rt.pud_r = pr, g_rt.pud_g = pg;
+				else if (*pz == '0') g_rt.pud_on = false;
+			}
 			g_rt.mat_scale = EnvFloat("KYTY_RT_REFLECTIONS_MATERIAL", r >= 0 ? 1.0f : 0.0f, 0.0f, 1.0f);
 			if (const char* y = std::getenv("KYTY_RT_REFLECTIONS_FLIPY"); y != nullptr && *y != '\0')
 				g_rt.row0_up = *y != '0', g_rt.row0_forced = true;
@@ -824,7 +833,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.misc[1] = static_cast<int32_t>(g_rt.frame & 0x7fffffff);
 	push.misc[2] = level;
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0) |
-	               (g_rt.row0_up ? 16 : 0) | (cfg.checker ? 32 : 0) | (have_water ? 64 : 0);
+	               (g_rt.row0_up ? 16 : 0) | (cfg.checker ? 32 : 0) | (have_water ? 64 : 0) |
+	               (g_rt.pud_on && use_normal && packed_count >= 3 ? 128 : 0);
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
 	push.dec[2] = static_cast<int32_t>(packed_count), push.dec[3] = 0;
 	const bool game_exposure = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
@@ -939,7 +949,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		push.dec[3] = static_cast<int32_t>(mip);
 		run(7, s, MipExtent(g.hiz, mip));
 	}
-	push.dec[3] = 0;
+	push.dec[3] = static_cast<int32_t>(std::lround(g_rt.pud_r * 255.0f)) | (static_cast<int32_t>(std::lround(g_rt.pud_g * 255.0f)) << 8);
 	stamp(StHiz);
 	if (calibrate) {
 		push.dec[2] = static_cast<int32_t>(g_rt.calib_packed);
