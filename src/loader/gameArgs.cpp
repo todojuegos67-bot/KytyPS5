@@ -19,12 +19,20 @@
 namespace Loader::GameArgs {
 namespace {
 
-// One "+name=value" line per entry of KYTY_GAME_CONVARS (';' or ',' between entries).
+// One "+name=value" line per entry of KYTY_GAME_CONVARS (';' or ',' between entries), then of
+// KYTY_GAME_CONVARS_EXTRA: the launcher sets KYTY_GAME_CONVARS itself, the extra list (a user environment variable) is
+// read after it, so its values win (A/B tests of single engine settings, e.g. r_enableSpotShadows=false).
 const std::string& ExtraLines() {
 	static const std::string lines = [] {
 		std::string out;
 		const char* value = std::getenv("KYTY_GAME_CONVARS");
-		const std::string list = value != nullptr ? value : "";
+		const char* extra = std::getenv("KYTY_GAME_CONVARS_EXTRA");
+		std::string list  = value != nullptr ? value : "";
+		if (extra != nullptr && *extra != '\0') {
+			list += std::string(";") + extra;
+			std::printf("Game convars: KYTY_GAME_CONVARS_EXTRA=%s (after the launcher's)\n", extra);
+			std::fflush(stdout);
+		}
 		for (size_t at = 0; at < list.size();) {
 			auto end = list.find_first_of(";,", at);
 			if (end == std::string::npos) end = list.size();
