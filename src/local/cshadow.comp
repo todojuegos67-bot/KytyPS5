@@ -3,19 +3,23 @@
 // shadows on the PS5 Pro path's render-resolution HDR color (linear, before the game's exposure, the upscaler and
 // its TAA). Short rays from each pixel toward the sun, marched against the game's depth buffer (Bend Studio style:
 // contact detail the shadow maps miss), then denoised and multiplied into the color (darken only). Modes (misc.x):
-//   0 trace:     12 / 20 / 32 steps (levels 1 / 2 / 3; half res at 1), ray <= 1 m (x1.25 at 3) and <= a screen
-//                length (48 / 96 / 160 px at 1440p), thickness test, per-frame IGN jitter, soft ends; the result is
+//   0 trace:     16 / 28 / 48 steps (levels 1 / 2 / 3; half res at 1), ray <= KYTY_RT_SHADOWS_LENGTH (3 m; x1.25 at
+//                3) and <= a screen length (160 / 280 / 400 px at 1440p), thickness test, per-frame IGN jitter, soft ends; the result is
 //                weighted by the surface's facing to the sun (N.L: back-facing surfaces untouched, grazing ones fade)
 //                -> raw (visibility in .r) + gbuf_out (view normal, linear depth)
-//   1 temporal:  reprojection by the game's motion vectors, history rejected on depth / normal discontinuity,
-//                neighbourhood clamp (3x3, edge-aware), alpha max(1 / count, 0.1 (0.07 at 3)); count in aux .x
+//   1 temporal:  reprojection by the game's motion vectors, history rejected on depth / normal discontinuity (the
+//                depth tolerance follows the surface's own depth slope per pixel: far, grazing ground keeps its
+//                history), neighbourhood clamp (3x3, edge-aware), alpha max(1 / count, 0.1 (0.08 at 3)); count in aux .x
 //   2 a-trous:   5x5 B3 kernel with depth / normal / visibility edge stops; steps 1, 2 (, 4 at 2 and 3)
 //   4 composite: joint bilateral upsample; color *= 1 - strength * fade * stable * (1 - vis); fade 0 on the sky and
-//                beyond KYTY_RT_SHADOWS fade distance; stable ramps with the history count (no popping noise)
+//                beyond KYTY_RT_SHADOWS fade distance; stable ramps with the history count from 0.4 (no popping noise,
+//                no shadow held back until the camera comes close); misc.w bit 3: statistics into vote_buf[64 + slot * 4]
 //   5 calibrate: the depth buffer's floors against the world axes (the camera's view of world X, Y, Z in cand[0..2]),
 //                both signs, both screen y conventions: which world axis is up and whether the screen's y is mirrored
 //                (12 counters per slot into vote_buf; the CPU reads them back)
 // Screen y convention (misc.w bit 2): set = the render's row 0 is NDC y +1 (the GNM / D3D viewport, the default).
+// Statistics (misc.w bit 3, composite): pixels with occlusion (fade * stable * (1 - vis)) > 0.1, their occlusion * 256
+// and depth * 2 (m), summed.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D color_tex;
@@ -29,7 +33,7 @@ layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
 layout(binding = 8, rgba16f) uniform writeonly image2D gbuf_out;
 layout(binding = 9) uniform sampler2D aux_tex;
 layout(binding = 10, rgba16f) uniform writeonly image2D aux_out;
-layout(binding = 11, std430) buffer VoteBuf { uint v[]; } vote_buf; // per slot 16 words
+layout(binding = 11, std430) buffer VoteBuf { uint v[]; } vote_buf; // per slot 16 words; statistics from word 64
 
 layout(push_constant) uniform Push {
 	vec4  proj;      // M[0], M[5], M[8], M[9] (row vectors)
@@ -64,6 +68,15 @@ vec3 Project(vec3 p) {
 }
 bool IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e3; }
 float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+// The linear depth's change per trace pixel on this surface (gbuf .w; the smaller side each way, sky excluded): a
+// ground plane seen at a grazing angle 50 m away changes ~5 % per pixel, so relative depth tests alone reject it.
+float DepthSlope(vec2 uv, float z) {
+	vec2  ts = 1.0 / TraceSize();
+	float xp = textureLod(gbuf_cur, uv + vec2(ts.x, 0), 0).w, xn = textureLod(gbuf_cur, uv - vec2(ts.x, 0), 0).w;
+	float yp = textureLod(gbuf_cur, uv + vec2(0, ts.y), 0).w, yn = textureLod(gbuf_cur, uv - vec2(0, ts.y), 0).w;
+	float gx = min(abs(xp - z), abs(xn - z)), gy = min(abs(yp - z), abs(yn - z));
+	return min(gx + gy, 0.25 * z); // (a silhouette both ways: no plane to follow)
+}
 
 vec3 NormalAtY(vec2 uv, vec3 p, float ys) {
 	vec2 t  = 1.0 / RenderSize();
@@ -152,13 +165,19 @@ void Temporal(ivec2 pixel) {
 		imageStore(aux_out, pixel, vec4(0));
 		return;
 	}
+	// Depth tolerances that follow the surface's slope (far grazing ground) and the camera's own motion between
+	// frames (the previous depth is not reprojected: walking forward changes it by ~0.1 m a frame).
+	float slope = DepthSlope(uv, g.w);
+	float far_k = smoothstep(10.0, 60.0, g.w);
 	// The 3x3 neighbourhood of the same surface: mean and deviation (the history's clamp box).
 	float m1 = 0.0, m2 = 0.0, wn = 0.0;
+	float ntol = 0.03 * g.w + 2.0 * slope;
+	float ndot = mix(0.8, 0.65, far_k);
 	for (int y = -1; y <= 1; ++y)
 		for (int x = -1; x <= 1; ++x) {
 			vec2  suv = uv + vec2(x, y) * ts;
 			vec4  sg  = textureLod(gbuf_cur, suv, 0);
-			float w   = (abs(sg.w - g.w) < 0.05 * g.w && dot(sg.xyz, g.xyz) > 0.8) ? 1.0 : 0.0;
+			float w   = (abs(sg.w - g.w) < ntol && dot(sg.xyz, g.xyz) > ndot) ? 1.0 : 0.0;
 			float sv  = textureLod(src_a, suv, 0).r;
 			m1 += sv * w;
 			m2 += sv * sv * w;
@@ -167,19 +186,22 @@ void Temporal(ivec2 pixel) {
 	wn = max(wn, 1.0);
 	m1 /= wn, m2 /= wn;
 	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
-	float a_min = push.misc.z >= 3 ? 0.07 : 0.1;
+	float a_min = push.misc.z >= 3 ? 0.08 : 0.1;
 	float count = 1.0;
 	float res   = mix(m1, cur, 0.5);
 	vec2  puv   = uv + textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();
 	if ((push.misc.w & 1) == 0 && (push.misc.w & 2) != 0 && all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
 		vec4 pg = textureLod(gbuf_prev, puv, 0);
-		// History rejection: another surface there last frame (depth > 5 % off, or the normal turned > 25 degrees).
-		if (pg.w < 1e5 && abs(pg.w - g.w) / max(g.w, 1e-3) < 0.05 && dot(pg.xyz, g.xyz) > 0.9) {
+		// History rejection: another surface there last frame (depth off by more than 4 % + 1.5 pixels of its slope +
+		// 0.15 m of camera motion, or the normal turned > 25 degrees near, > 45 far where depth normals are noisy).
+		float ptol = 0.04 * g.w + 1.5 * slope + 0.15;
+		if (pg.w < 1e5 && abs(pg.w - g.w) < ptol && dot(pg.xyz, g.xyz) > mix(0.9, 0.7, far_k)) {
 			float pc    = textureLod(aux_tex, puv, 0).x;
 			count       = min(max(pc, 1.0) + 1.0, 32.0);
 			float alpha = max(1.0 / count, a_min);
-			float k     = mix(1.0, 2.5, clamp(count / 16.0, 0.0, 1.0));
-			float hist  = clamp(textureLod(src_b, puv, 0).r, m1 - k * sigma - 0.05, m1 + k * sigma + 0.05);
+			// (A tighter box than before (2.5 sigma + 0.05): a moved occluder's old shadow does not linger.)
+			float k     = mix(1.0, 2.0, clamp(count / 16.0, 0.0, 1.0));
+			float hist  = clamp(textureLod(src_b, puv, 0).r, m1 - k * sigma - 0.03, m1 + k * sigma + 0.03);
 			res         = mix(hist, cur, alpha);
 		}
 	}
@@ -199,6 +221,8 @@ void Atrous(ivec2 pixel) {
 	}
 	const float kern[3] = float[](0.375, 0.25, 0.0625);
 	float step = push.extra.x;
+	// Depth stop: relative, plus the surface's own slope (far grazing ground is still one surface).
+	float zden = max((g.w * 0.015 + 1.5 * DepthSlope(uv, g.w)) * step, 1e-3);
 	// Visibility edge stop: loose on the first pass (noise), tighter after (keeps the contact line crisp).
 	float sv_den = step <= 1.0 ? 0.6 : 0.35;
 	float sum = 0.0, wsum = 0.0;
@@ -208,7 +232,7 @@ void Atrous(ivec2 pixel) {
 			vec4  sg  = textureLod(gbuf_cur, suv, 0);
 			float sc  = textureLod(src_a, suv, 0).r;
 			float w   = kern[abs(x)] * kern[abs(y)] * pow(max(dot(sg.xyz, g.xyz), 0.0), 16.0) *
-			          exp(-abs(sg.w - g.w) / max(g.w * 0.015 * step, 1e-3)) * exp(-abs(sc - c) / sv_den);
+			          exp(-abs(sg.w - g.w) / zden) * exp(-abs(sc - c) / sv_den);
 			w = sg.w > 1e5 ? 0.0 : w;
 			sum += sc * w;
 			wsum += w;
@@ -234,11 +258,13 @@ float Upsample(vec2 uv, float z) {
 	return sum / max(wsum, 1e-6);
 }
 
-void Composite(ivec2 pixel) {
+void Composite(ivec2 pixel, out float dark, out float zout) {
+	dark = 0.0;
 	vec2  uv  = (vec2(pixel) + 0.5) / RenderSize();
 	vec4  col = texelFetch(color_tex, pixel, 0);
 	float d   = texelFetch(depth_tex, pixel, 0).r;
 	float z   = abs(ViewZ(d));
+	zout = z;
 	// Sky and far geometry / fog unchanged: screen-space data is only reliable near.
 	float fade = IsSky(d) ? 0.0 : 1.0 - smoothstep(push.cand[3].z, push.cand[3].w, z);
 	float amt  = push.trace.z * fade;
@@ -251,13 +277,38 @@ void Composite(ivec2 pixel) {
 	// A tiny partial occlusion (blur tails, jitter noise) is not a shadow: no grey veil.
 	float occ = clamp((1.0 - vis - 0.04) / 0.96, 0.0, 1.0);
 	// Temporal-stable mask: newly disoccluded / reset pixels ramp in over a few frames instead of flickering.
+	// (10-24: from 0.4, over 4 frames; it started at 0 and needed 5 accepted frames, which far ground at a grazing
+	// angle never got: shadows showed only once the camera came close.)
 	float count  = textureLod(aux_tex, uv, 0).x;
-	float stable = smoothstep(1.0, 5.0, count);
+	float stable = mix(0.4, 1.0, smoothstep(1.0, 4.0, count));
 	// Multiply only, in the linear HDR input: factor in [1 - strength, 1]; never above the input (no lightening).
 	float factor = 1.0 - clamp(amt * stable * occ, 0.0, 0.95);
+	dark         = clamp(fade * stable * occ, 0.0, 1.0); // (the statistics' occlusion: before the strength)
 	vec3  rgb    = min(col.rgb * factor, col.rgb);
 	if (any(isnan(rgb)) || any(isinf(rgb))) rgb = col.rgb;
 	imageStore(out_img, pixel, vec4(rgb, col.a));
+}
+
+// The composite with its statistics (every invocation reaches the barriers: misc is uniform).
+shared uint s_stat[3];
+void CompositeStats(ivec2 pixel) {
+	bool  inb  = pixel.x < int(RenderSize().x) && pixel.y < int(RenderSize().y);
+	float dark = 0.0, z = 0.0;
+	if ((push.misc.w & 8) == 0) {
+		if (inb) Composite(pixel, dark, z);
+		return;
+	}
+	uint li = gl_LocalInvocationIndex;
+	if (li < 3u) s_stat[li] = 0u;
+	barrier();
+	if (inb) Composite(pixel, dark, z);
+	if (inb && dark > 0.1) {
+		atomicAdd(s_stat[0], 1u);
+		atomicAdd(s_stat[1], uint(clamp(dark, 0.0, 1.0) * 256.0 + 0.5));
+		atomicAdd(s_stat[2], uint(clamp(z * 2.0, 0.0, 400.0) + 0.5));
+	}
+	barrier();
+	if (li < 3u && s_stat[li] != 0u) atomicAdd(vote_buf.v[64u + uint(push.misc.w >> 8) * 4u + li], s_stat[li]);
 }
 
 shared uint s_vote[12];
@@ -294,10 +345,10 @@ void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	int   mode  = push.misc.x;
 	if (mode == 5) { Calibrate(pixel); return; } // (all invocations reach its barriers)
-	ivec2 size = ivec2(mode == 4 ? RenderSize() : TraceSize());
+	if (mode == 4) { CompositeStats(pixel); return; } // (likewise)
+	ivec2 size = ivec2(TraceSize());
 	if (pixel.x >= size.x || pixel.y >= size.y) return;
 	if (mode == 0) Trace(pixel);
 	else if (mode == 1) Temporal(pixel);
-	else if (mode == 4) Composite(pixel);
 	else Atrous(pixel);
 }
