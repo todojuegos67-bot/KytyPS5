@@ -234,10 +234,12 @@ function Start-Game {
 	$nvAmd  = $false
 	# Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag automatico en AMD, y en NVIDIA solo con XeSS o FSR.
 	# (10-24) Graficas AMD: su Anti-Lag 2 de serie con la frame generation de AMD (y nada mas); NVIDIA / Intel: el propio.
-	$fixedAl = $script:isAmd -and ($config -like 'fsr3*')
+	# (10-24) Se elige en el desplegable: en AMD, Anti-Lag 2 de serie (por defecto) o el nuestro; en NVIDIA el nuestro
+	# (Reflex sobre la frame generation de AMD se cerraba). Modos Souls fijos: el nuestro en Ultra.
+	$fixedAl = $script:isAmd -and ($config -like 'fsr3*') -and $cmbAl.SelectedIndex -eq 0 -and -not (Is-FixedFg)
 	# (10-23 noche) Anti-Lag propio del emulador (KYTY_LOWLAT): sin Reflex ni FSR3 tocado; con la frame generation de AMD.
 	if (Is-FixedFg) { $cmbAl.SelectedIndex = 2 }  # (10-24) siempre Ultra en los modos fijos
-	$ownLat = $cmbAl.SelectedIndex -gt 0 -and $config -like 'fsr3*' -and -not $script:isAmd
+	$ownLat = ($cmbAl.SelectedIndex -eq 1 -or $cmbAl.SelectedIndex -eq 2) -and $config -like 'fsr3*'
 	if ($ownLat) { $sets += 'KYTY_LOWLAT=1'; $sets += $(if ($cmbAl.SelectedIndex -eq 2) { 'KYTY_LOWLAT_QUEUE=1' } else { 'KYTY_LOWLAT_QUEUE=2' }) }  # (10-23) Anti-Lag: 2 frames en cola; Ultra: 1
 	# (10-23) Para las metricas: si va Anti-Lag y cual.
 	Set-IniValue 'antilagon' $(if ($ownLat) { $(if ($cmbAl.SelectedIndex -eq 2) { 'Ultra' } else { 'Normal' }) } elseif ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
@@ -893,9 +895,12 @@ $chkAntiLag.Text = 'Anti-Lag'
 # (10-23) Desplegable Anti-Lag: No / Anti-Lag (2 frames en cola) / Anti-Lag Ultra (1), en el sitio de la casilla.
 $cmbAl = New-Object System.Windows.Forms.ComboBox
 $cmbAl.DropDownStyle = 'DropDownList'; $cmbAl.Font = $smallFont
-foreach ($l in 'Anti-Lag: off', 'Anti-Lag', 'Anti-Lag Ultra') { [void]$cmbAl.Items.Add($l) }
-$ai2 = 1; [void][int]::TryParse((Get-IniValue 'antilagmode2' '1'), [ref]$ai2); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $ai2), 2)  # (10-24) activado por defecto
-$cmbAl.Add_SelectedIndexChanged({ if (-not $script:alLocked) { Set-IniValue 'antilagmode2' "$($cmbAl.SelectedIndex)" } })
+# (10-24) AMD: Anti-Lag 2 de serie (por defecto), el nuestro, el nuestro Ultra o ninguno. NVIDIA: ninguno / el nuestro / Ultra.
+$script:alKey = if ($script:isAmd) { 'antilagamd' } else { 'antilagmode2' }
+$alItems = if ($script:isAmd) { @('Anti-Lag 2 (AMD)', 'Anti-Lag', 'Anti-Lag Ultra', 'Anti-Lag: off') } else { @('Anti-Lag: off', 'Anti-Lag', 'Anti-Lag Ultra') }
+foreach ($l in $alItems) { [void]$cmbAl.Items.Add($l) }
+$ai2 = if ($script:isAmd) { 0 } else { 1 }; [void][int]::TryParse((Get-IniValue $script:alKey "$ai2"), [ref]$ai2); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $ai2), $cmbAl.Items.Count - 1)
+$cmbAl.Add_SelectedIndexChanged({ if (-not $script:alLocked) { Set-IniValue $script:alKey "$($cmbAl.SelectedIndex)" } })
 $gFg.Controls.Add($cmbAl); $cmbAl.Location = $chkAntiLag.Location; $cmbAl.Size = New-Object System.Drawing.Size(186, 26)
 # (10-24) Con la frame generation de NVIDIA (DLSS-G) va siempre NVIDIA Reflex: se muestra para que se sepa.
 $lbReflex = New-Label 'Reflex: on (DLSS-G)' $smallFont ([System.Drawing.Color]::FromArgb(120, 210, 120)) 0 0 186 24
@@ -912,22 +917,21 @@ function Update-AntiLagBox {
 	if ($script:alAuto) { $chkAntiLag.Checked = $false; $script:alAuto = $false }
 	$chkAntiLag.Enabled = $true
 	if (-not $ok) { $chkAntiLag.Checked = $false }
-	$chkAntiLag.Visible = $false; $cmbAl.Visible = $ok -and -not $script:isAmd
+	$chkAntiLag.Visible = $false; $cmbAl.Visible = $ok
 	# (10-24) Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag Ultra siempre, sin poder cambiarlo.
 	if (Is-FixedFg) {
 		if (-not $script:alLocked) { $script:alLocked = $true; $cmbAl.SelectedIndex = 2 }
 		$cmbAl.Enabled = $false
 	} elseif ($script:alLocked) {
 		$script:alLocked = $false; $cmbAl.Enabled = $true
-		$v = 1; [void][int]::TryParse((Get-IniValue 'antilagmode2' '1'), [ref]$v); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $v), 2)
+		$v = if ($script:isAmd) { 0 } else { 1 }; [void][int]::TryParse((Get-IniValue $script:alKey "$v"), [ref]$v); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $v), $cmbAl.Items.Count - 1)
 	}
-	$lbReflex.Visible = ((-not $ok) -and $cfgNow -like 'dlss*') -or ($ok -and $script:isAmd)
-	$lbReflex.Text = if ($ok -and $script:isAmd) { 'Anti-Lag 2 (AMD): on' } else { 'Reflex: on (DLSS-G)' }
+	$lbReflex.Visible = (-not $ok) -and $cfgNow -like 'dlss*'
 }
 $cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $cmbRes.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $form.Add_Shown({ Update-AntiLagBox })
-$tips.SetToolTip($cmbAl, 'With AMD frame generation. Anti-Lag: at most 2 frames queued before reading the controller. Ultra: 1 (even less lag, may cost a few real FPS). No Reflex, any GPU.')
+$tips.SetToolTip($cmbAl, 'With AMD frame generation. Anti-Lag 2 (AMD): AMD GPUs'' built-in one. Anti-Lag: ours, at most 2 frames queued before reading the controller. Ultra: 1 (even less lag). The Souls light, balanced and low profile modes always use ours on Ultra.')
 # Calidad grafica: texturas, distancia, sombras, Luz RT y filtrado x16 ($script:gfxTop: etiqueta y desplegable de Texturas, Sombras, Distancia).
 Move-To $script:gfxTop[0] $gGfx 10 26 98; Move-To $cmbTex $gGfx 110 24 296
 Move-To $script:gfxTop[4] $gGfx 10 58 98; Move-To $cmbDist $gGfx 110 56 296
