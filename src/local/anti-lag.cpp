@@ -135,6 +135,20 @@ void Mark(int32_t stage, uint64_t index) {
 }
 } // namespace
 
+bool PaceOn() {
+	static const bool on = [] {
+		const char* off = std::getenv("KYTY_LOWLAT_PACE_BEFORE_INPUT");
+		const char* q   = std::getenv("KYTY_FLIP_QUEUE_LIMIT");
+		const bool  r   = !(off != nullptr && off[0] == '0') && (Own().on || q == nullptr || q[0] != '0');
+		std::printf("Flip queue limit: %s (the game's controller read waits for frame N - 1's release under a flip rate or "
+		            "cap; KYTY_FLIP_QUEUE_LIMIT=0 / KYTY_LOWLAT_PACE_BEFORE_INPUT=0 off)\n",
+		            r ? "on" : "off");
+		std::fflush(stdout);
+		return r;
+	}();
+	return on;
+}
+
 bool AutoReflex() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_LOWLAT_REFLEX");
@@ -302,13 +316,11 @@ struct PaceCap {
 };
 PaceCap g_pace; // under g_pace_mutex
 
+// Every mode but DLSS-G (Streamline's frame generation paces itself): 202407 (DLSS SR, Streamline Reflex on, the game's
+// own 30 fps flip rate) kept two frames between GPU done and flip (65.9 ms) like our 30 cap with FSR 3: Reflex's sleep
+// does not see a queue in front of a flip rate. The wait only ever holds the game for frame N - k's release.
 bool PaceAllowed() {
-	if (!Own().pace || FrameGen::StreamlineLoaded() || FrameGen::Enabled()) return false;
-	const Mode mode = g_mode.load(std::memory_order_relaxed);
-	if (mode == Mode::Off) return true;
-	if (mode != Mode::Reflex) return false;
-	std::lock_guard lock(g_reflex_mutex); // (Reflex without a swapchain, e.g. FSR 3's unpatched DLL: our pacer)
-	return g_swapchain == VK_NULL_HANDLE;
+	return PaceOn() && !FrameGen::Enabled();
 }
 
 const char*       g_pace_site = "scePadRead";
@@ -355,7 +367,7 @@ void PaceBeforeInput(uint64_t index) {
 		const uint32_t q = std::min<uint32_t>(n - 1, static_cast<uint32_t>(n * 0.99));
 		std::nth_element(v, v + q, v + n);
 		const double p99 = v[q];
-		const double vb  = g_pace.vblank_ms > 0.0 ? g_pace.vblank_ms : 2.8;
+		const double vb  = 2.0; // (headroom before the slot; not a 60 Hz vblank: a ready frame flips when due)
 		if (g_k == 1 && p99 > cap - vb) {
 			g_k      = 2;
 			g_k_hold = 0;
@@ -382,7 +394,7 @@ void PaceBeforeInput(uint64_t index) {
 } // namespace
 
 void SetPaceCap(double cap_ms, double vblank_ms) {
-	if (!Own().pace) return;
+	if (!PaceOn()) return;
 	std::lock_guard lock(g_pace_mutex);
 	if (cap_ms <= 0.0) { // (not a capped game-view frame: off, and start over)
 		g_pace.cap_ms = 0.0;
@@ -398,7 +410,7 @@ void OnFlipReady(uint64_t frame_index) {
 	if (st == nullptr) return;
 	const int64_t now = LatNow();
 	st->ready.store(now, std::memory_order_relaxed);
-	if (!Own().pace) return;
+	if (!PaceOn()) return;
 	const int64_t in = st->input.load(std::memory_order_relaxed);
 	if (in == 0 || now <= in) return;
 	const double sample = static_cast<double>(now - in) / LatTicksPerMs();
@@ -595,7 +607,7 @@ void OnPresented(uint64_t frame_index) {
 			std::printf("[lat] stages: input->submit %.1f ms, submit->gpu done %.1f, gpu done->flip %.1f, flip->present %.1f "
 			            "(n %u); pace %s: drain %.1f ms (n %u), sleep %.1f ms (n %u), lead %.1f + margin %.1f, cap %.1f, k %d, late %u\n",
 			            g_lat.st_sum[0] / d, g_lat.st_sum[1] / d, g_lat.st_sum[2] / d, g_lat.st_sum[3] / d, g_lat.st_n,
-			            !Own().pace ? "off" : (PaceAllowed() && iv > 0.0 ? "on" : "idle"), dn > 0 ? ds / dn : 0.0, dn,
+			            !PaceOn() ? "off" : (PaceAllowed() && iv > 0.0 ? "on" : "idle"), dn > 0 ? ds / dn : 0.0, dn,
 			            sn > 0 ? ss / sn : 0.0, sn, lead, margin, iv, g_pace_k.load(std::memory_order_relaxed), misses);
 			std::fflush(stdout);
 		}
@@ -619,7 +631,7 @@ void OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick) {
 void OnInput(const char* site) {
 	if (Own().on) OwnLimit();
 	const Mode mode = g_mode.load(std::memory_order_relaxed);
-	if (mode == Mode::Off && !LatencyOn() && !Own().pace) return;
+	if (mode == Mode::Off && !LatencyOn() && !PaceOn()) return;
 	// Once per flip: the first controller read after the game flipped its last frame starts the next one.
 	const uint64_t flips = g_flips.load(std::memory_order_acquire);
 	uint64_t       seen  = g_flips_at_input.load(std::memory_order_relaxed);
@@ -679,7 +691,7 @@ void OnInput(const char* site) {
 }
 
 uint64_t OnFlipReserved() {
-	if (g_mode.load(std::memory_order_relaxed) == Mode::Off && !LatencyOn() && !Own().pace) return 0;
+	if (g_mode.load(std::memory_order_relaxed) == Mode::Off && !LatencyOn() && !PaceOn()) return 0;
 	g_flips.fetch_add(1, std::memory_order_acq_rel);
 	const uint64_t index  = g_input_index.load(std::memory_order_acquire);
 	uint64_t       tagged = g_tagged_index.load(std::memory_order_relaxed);

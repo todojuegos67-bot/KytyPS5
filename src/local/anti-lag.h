@@ -61,6 +61,9 @@ void OnPresent(uint64_t frame_index);
 // real swapchain as with KYTY_ANTILAG=1 (the same sleep and markers Streamline's Reflex gives the plain 30 fps path),
 // our own pacer off while that swapchain has it. KYTY_LOWLAT_REFLEX=0 off.
 [[nodiscard]] bool AutoReflex();
+// The flip queue limit (KYTY_FLIP_QUEUE_LIMIT, default on; KYTY_LOWLAT_PACE_BEFORE_INPUT=0 also turns it off): under a
+// flip rate (the game's own, KYTY_FLIP_FPS) the controller read of frame N waits for frame N - k's release (k 1 or 2).
+[[nodiscard]] bool PaceOn();
 void               OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick);
 
 // KYTY_LATENCY=1 (the launcher sets it with the metrics overlay): input -> present latency, any Anti-Lag mode or none.
