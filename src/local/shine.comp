@@ -24,9 +24,10 @@ layout(binding = 11, rgba16f) uniform writeonly image2D hist_out;  // this frame
 layout(std430, binding = 7) buffer Frame {
 	vec4 view_rot[3]; // world -> view rotation rows (words 0..11)
 	vec4 hparams;     // x: 1.0 (exposure when the game gives none), y: light threshold, z: light radius (view units), w: lights wanted
-	uint stats[16];   // 16..31 cumulative counters (1/16 of the pixels): 0 pixels, 1 highlighted, 2 sharpened, 3 lights sum
-	vec4 lights[8];   // 32..63: 4 lights x (view pos xyz, weight), (display color rgb, -)
-	vec4 cand[];      // 64..: 32x18 cells x (exposed luminance, uv x, uv y, -)
+	uint stats[16];   // 16..31 cumulative counters (1/16 of the pixels): 0 pixels, 1 highlighted, 2 sharpened, 3 lights
+	                  // sum, 4 highlighted metal, 5 highlighted other smooth, 6 with a torch glint, 7 rejected as planar
+	vec4 lights[12];  // 32..79: 4 tracks x (view pos xyz, weight), (display color rgb, target), (uv xy, missing s, -)
+	vec4 cand[];      // 80..: 32x18 cells x (exposed luminance, uv x, uv y, -)
 };
 layout(std430, binding = 8) readonly buffer Exposure {
 	float exposure_values[];
@@ -38,9 +39,9 @@ layout(push_constant) uniform Push {
 	vec4  size;      // render w, h, strength, sharpen
 	vec4  sun;       // view-space direction to the sun, intensity (0: none)
 	vec4  fill;      // view-space world up, intensity of the sky fill highlight
-	vec4  motion;    // motion scale x, y, history valid (1), -
-	ivec4 misc;      // mode, frame, flags (1 row 0 = NDC y +1, 2 normals usable), exposure index
-	ivec4 dec;       // normal code, roughness field, gloss field (-1 none), level
+	vec4  motion;    // motion scale x, y, history valid (1), frame dt (s)
+	ivec4 misc;      // mode, frame, flags (1 row 0 = NDC y +1, 2 normals usable, 4 motion bound), exposure index
+	ivec4 dec;       // normal code, roughness field, gloss field (-1 none), metal field (-1 none: the heuristic)
 } push;
 
 const float PI    = 3.14159265;
@@ -123,61 +124,104 @@ void Lights(ivec2 cell) {
 			float l = Luma(Safe(textureLod(color_tex, uv, 0).rgb) * e);
 			if (l > best) best = l, buv = uv;
 		}
-	cand[cell.y * CW + cell.x] = vec4(best >= hparams.y ? best : 0.0, buv, 0.0);
+	cand[cell.y * CW + cell.x] = vec4(best >= hparams.y * 0.5 ? best : 0.0, buv, 0.0); // (half the threshold: tracks keep going)
 }
 
-// ---- 1: the dominant lights ----
+// ---- 1: the light tracks ----
+// 10-24 (8b30ae6b): lights found 0.01-0.84 a frame, so the glints switched on and off. Now 4 persistent tracks: a
+// candidate continues the track whose last screen position it came from (its motion vector back to the last frame,
+// within 4 % of the screen and 35 % in distance) at half the threshold (hysteresis); a new track needs the full
+// threshold. Weight fades toward 1 over ~0.3 s while seen; a track unseen for 0.2 s fades out over 0.3 s; the color
+// is smoothed over ~0.25 s.
+vec3 LightColor(vec2 uv, float e) {
+	vec2 t = 2.0 / RenderSize();
+	vec3 s = Safe(textureLod(color_tex, uv, 0).rgb) + Safe(textureLod(color_tex, uv + vec2(t.x, 0), 0).rgb) +
+	         Safe(textureLod(color_tex, uv - vec2(t.x, 0), 0).rgb) + Safe(textureLod(color_tex, uv + vec2(0, t.y), 0).rgb) +
+	         Safe(textureLod(color_tex, uv - vec2(0, t.y), 0).rgb);
+	vec3 dc = s * (0.2 * e);
+	return dc * min(1.0, 4.0 / max(Max3(dc), 1e-4));
+}
 void Select() {
 	int   want = int(hparams.w);
-	vec4  old[8];
-	for (int k = 0; k < 8; ++k) old[k] = lights[k];
-	int   picked[4] = int[4](-1, -1, -1, -1);
-	float e         = GameExposure();
-	for (int n = 0; n < want; ++n) {
+	float thr  = hparams.y;
+	float dt   = clamp(push.motion.w, 0.001, 0.1);
+	float e    = GameExposure();
+	bool  mv_ok = (push.misc.z & 4) != 0;
+	bool  used[4]  = bool[4](false, false, false, false);
+	int   taken[4] = int[4](-1, -1, -1, -1);
+	// Continue the tracks: for each live track, the strongest candidate whose previous position is near it.
+	for (int k = 0; k < 4; ++k) {
+		if (k >= want || (lights[k * 3].w <= 0.0 && lights[k * 3 + 1].w <= 0.0)) continue;
+		vec2  tuv  = lights[k * 3 + 2].xy;
+		float tz   = abs(lights[k * 3].z);
 		float best = 0.0;
 		int   bi   = -1;
 		for (int c = 0; c < CW * CH; ++c) {
 			float l = cand[c].x;
 			if (l <= best) continue;
+			bool dup = false;
+			for (int j = 0; j < k; ++j) dup = dup || taken[j] == c;
+			if (dup) continue;
+			vec2 uv  = cand[c].yz;
+			vec2 puv = uv;
+			if (mv_ok) puv += texelFetch(motion_tex, ivec2(uv * RenderSize()), 0).xy * push.motion.xy / RenderSize();
+			if (length(puv - tuv) > 0.04) continue;
+			float z = abs(ViewZ(textureLod(depth_tex, uv, 0).r));
+			if (abs(z - tz) > 0.35 * max(tz, 0.5)) continue;
+			best = l, bi = c;
+		}
+		taken[k] = bi;
+	}
+	// New tracks in free slots from the strongest remaining candidates (full threshold, >= 3 cells from any track).
+	for (int k = 0; k < 4; ++k) {
+		if (k >= want || lights[k * 3].w > 0.0 || lights[k * 3 + 1].w > 0.0 || taken[k] >= 0) continue;
+		float best = thr;
+		int   bi   = -1;
+		for (int c = 0; c < CW * CH; ++c) {
+			float l = cand[c].x;
+			if (l < best) continue;
 			bool near = false;
-			for (int k = 0; k < n; ++k) {
-				ivec2 a = ivec2(picked[k] % CW, picked[k] / CW), b = ivec2(c % CW, c / CW);
-				if (max(abs(a.x - b.x), abs(a.y - b.y)) < 3) near = true;
-			}
+			for (int j = 0; j < 4; ++j)
+				if (taken[j] >= 0) {
+					ivec2 a = ivec2(taken[j] % CW, taken[j] / CW), b = ivec2(c % CW, c / CW);
+					near = near || max(abs(a.x - b.x), abs(a.y - b.y)) < 3;
+				}
 			if (!near) best = l, bi = c;
 		}
-		picked[n] = bi;
+		if (bi >= 0) {
+			taken[k] = bi;
+			vec2 uv  = cand[bi].yz;
+			lights[k * 3]     = vec4(0, 0, 0, 0);
+			lights[k * 3 + 1] = vec4(LightColor(uv, e), 1.0);
+			lights[k * 3 + 2] = vec4(uv, 0.0, 0.0);
+		}
 	}
-	uint count = 0u;
-	for (int n = 0; n < 4; ++n) {
-		vec4 pw = vec4(0), col = vec4(0);
-		int  c  = n < want ? picked[n] : -1;
+	uint  count = 0u;
+	float fade  = dt / 0.3;
+	float ca    = 1.0 - exp(-dt / 0.25);
+	for (int k = 0; k < 4; ++k) {
+		vec4 pw = lights[k * 3], col = lights[k * 3 + 1], tr = lights[k * 3 + 2];
+		if (k >= want) {
+			lights[k * 3] = vec4(0), lights[k * 3 + 1] = vec4(0), lights[k * 3 + 2] = vec4(0);
+			continue;
+		}
+		int c = taken[k];
 		if (c >= 0) {
 			vec2 uv  = cand[c].yz;
 			vec3 pos = ViewPos(uv, textureLod(depth_tex, uv, 0).r);
 			pos -= normalize(pos) * 0.3; // (the flame in front of what it is drawn on)
-			// The light's display color: a small blur around the tap, capped (a torch, not the sun).
-			vec2 t = 2.0 / RenderSize();
-			vec3 s = Safe(textureLod(color_tex, uv, 0).rgb) + Safe(textureLod(color_tex, uv + vec2(t.x, 0), 0).rgb) +
-			         Safe(textureLod(color_tex, uv - vec2(t.x, 0), 0).rgb) + Safe(textureLod(color_tex, uv + vec2(0, t.y), 0).rgb) +
-			         Safe(textureLod(color_tex, uv - vec2(0, t.y), 0).rgb);
-			vec3 dc = s * (0.2 * e);
-			dc *= min(1.0, 4.0 / max(Max3(dc), 1e-4));
-			// Smoothed against the nearest of the last frame's lights (fade in, flicker kept mild).
-			float ow = 0.0;
-			vec3  oc = dc;
-			float bd = 2.25;
-			for (int k = 0; k < 4; ++k) {
-				vec3  d2 = old[k * 2].xyz - pos;
-				float dd = dot(d2, d2);
-				if (old[k * 2].w > 0.0 && dd < bd) bd = dd, ow = old[k * 2].w, oc = old[k * 2 + 1].rgb;
-			}
-			pw  = vec4(pos, mix(ow, 1.0, 0.25));
-			col = vec4(mix(oc, dc, 0.35), 0.0);
-			++count;
+			pw.xyz   = pos;
+			col.rgb  = pw.w > 0.0 ? mix(col.rgb, LightColor(uv, e), ca) : col.rgb;
+			col.w    = 1.0;
+			tr       = vec4(uv, 0.0, 0.0);
+		} else {
+			tr.z += dt;
+			if (tr.z > 0.2) col.w = 0.0;
 		}
-		lights[n * 2]     = pw;
-		lights[n * 2 + 1] = col;
+		pw.w = clamp(pw.w + (col.w > 0.5 ? fade : -fade), 0.0, 1.0);
+		if (pw.w <= 0.0 && col.w < 0.5) pw = vec4(0), col = vec4(0), tr = vec4(0);
+		if (pw.w > 0.0) ++count;
+		lights[k * 3] = pw, lights[k * 3 + 1] = col, lights[k * 3 + 2] = tr;
 	}
 	atomicAdd(stats[3], count);
 }
@@ -227,12 +271,14 @@ void Composite(ivec2 p) {
 	float gloss  = push.dec.z >= 0 ? Field(push.dec.z, p) : 0.0;
 	uint  a0     = Packed(0, p);
 	vec3  albedo = vec3(Bits(a0, 0, 8), Bits(a0, 8, 8), Bits(a0, 16, 8));
-	float smooth_ = 1.0 - smoothstep(0.12, 0.55, rough);
+	float smooth_ = 1.0 - smoothstep(0.08, 0.35, rough); // (10-24: stricter; grey stone walls passed at 0.12..0.55)
 	smooth_       = max(smooth_, gloss * 0.6);
 	float al      = Luma(albedo);
 	float sat     = (Max3(albedo) - min(albedo.r, min(albedo.g, albedo.b))) / max(Max3(albedo), 1e-3);
-	// Armour / metal: smooth, little saturation, mid-bright albedo (bronze / gold allowed some warmth).
-	float metal = smooth_ * (1.0 - smoothstep(0.25, 0.7, sat)) * smoothstep(0.06, 0.3, al);
+	// Armour / metal: the metal field when given (KYTY_SHINE_METAL), else smooth with a metal's signature: a dark,
+	// little-saturated diffuse albedo (metals keep their color in the specular). Grey mid-bright stone is no longer metal.
+	float metal = push.dec.w >= 0 ? smooth_ * Field(push.dec.w, p)
+	                              : smooth_ * (1.0 - smoothstep(0.3, 0.65, sat)) * (1.0 - smoothstep(0.12, 0.3, al)) * step(0.015, al);
 	// Neighbours: normals (foliage-like noise, specular anti-aliasing) and depth (edges).
 	vec3     n = vec3(0, 0, 1);
 	bool     have_n = (push.misc.z & 2) != 0;
@@ -253,9 +299,19 @@ void Composite(ivec2 p) {
 		}
 	}
 	nvar *= 0.25;
+	// Large planar surfaces (walls, floors): the normal hardly changes 12 px around and next to the pixel. Hard-excluded
+	// (10-24: the torch flashes were on walls).
+	float planar = 0.0;
+	if (have_n && smooth_ > 0.01) {
+		ivec2 w4[4] = ivec2[4](ivec2(12, 0), ivec2(-12, 0), ivec2(0, 12), ivec2(0, -12));
+		float wvar = 0.0;
+		for (int k = 0; k < 4; ++k) wvar += 1.0 - clamp(dot(n, NormalAt(clamp(p + w4[k], ivec2(0), sz - 1), pos)), 0.0, 1.0);
+		planar = (1.0 - smoothstep(0.004, 0.012, wvar * 0.25)) * (1.0 - smoothstep(0.002, 0.006, nvar));
+		if (stat && planar > 0.5) atomicAdd(stats[7], 1u);
+	}
 	// Foliage / noise: green-dominant rough-ish albedo, or a normal that changes wildly pixel to pixel.
 	float foliage = smoothstep(0.08, 0.25, nvar) + step(albedo.r + albedo.b, albedo.g * 1.6) * step(0.06, albedo.g) * (1.0 - metal);
-	float mask    = smooth_ * far * (1.0 - clamp(foliage, 0.0, 1.0));
+	float mask    = smooth_ * far * (1.0 - clamp(foliage, 0.0, 1.0)) * (1.0 - planar);
 	float e       = GameExposure();
 
 	// Sharpen (CAS-like, in the exposed, tonemapped space), only where the material is smooth / metal and flat.
@@ -292,9 +348,11 @@ void Composite(ivec2 p) {
 		float lit  = smoothstep(0.12, 0.6, Luma(c * e) / max(al, 0.05));
 		if (push.sun.w > 0.0) add += Spec(n, v, normalize(push.sun.xyz), a2, base) * push.sun.w * lit;
 		if (push.fill.w > 0.0) add += Spec(n, v, normalize(push.fill.xyz), max(a2 * 4.0, 0.02), base) * push.fill.w * (0.3 + 0.7 * lit);
-		// Local lights (torches, fire): distance-attenuated, windowed to zero at 4 radii.
-		for (int k = 0; k < 4; ++k) {
-			vec4 lp = lights[k * 2];
+		// Local lights (torches, fire): distance-attenuated, windowed to zero at 4 radii; only where the metal check
+		// passes, at most 0.5x (metal) / 0.3x (other) the local luminance.
+		vec3 ladd = vec3(0);
+		for (int k = 0; k < 4 && metal > 0.05; ++k) {
+			vec4 lp = lights[k * 3];
 			if (lp.w <= 0.0) continue;
 			vec3  ld  = lp.xyz - pos;
 			float dl2 = dot(ld, ld);
@@ -302,9 +360,14 @@ void Composite(ivec2 p) {
 			float win = 1.0 - smoothstep(rad * 2.0, rad * 4.0, sqrt(dl2));
 			if (win <= 0.0) continue;
 			float att = win / (1.0 + dl2 / (rad * rad));
-			add += Spec(n, v, ld * inversesqrt(max(dot(ld, ld), 1e-6)), a2l, base) * lights[k * 2 + 1].rgb * (att * lp.w * 0.5);
+			ladd += Spec(n, v, ld * inversesqrt(max(dot(ld, ld), 1e-6)), a2l, base) * lights[k * 3 + 1].rgb * (att * lp.w * 0.5);
 		}
+		ladd *= push.size.z * mask * metal;
+		float llim = mix(0.3, 0.5, smoothstep(0.3, 0.7, metal)) * lmean;
+		if (Luma(ladd) > llim) ladd *= llim / max(Luma(ladd), 1e-5);
+		if (stat && Max3(ladd) > 0.02) atomicAdd(stats[6], 1u);
 		add *= push.size.z * mask * (0.35 + 0.65 * metal);
+		add += ladd;
 		float cap = 3.0 * push.size.z;
 		add       = add / (1.0 + Max3(add) / cap); // (soft cap: highlights, not blown-out blobs)
 		// Hard firefly clamp: never more than 1.5x the local mean luminance.
@@ -320,7 +383,7 @@ void Composite(ivec2 p) {
 				add    = mix(h, add, 0.3);
 			}
 		}
-		if (stat && Max3(add) > 0.02) atomicAdd(stats[1], 1u);
+		if (stat && Max3(add) > 0.02) atomicAdd(stats[1], 1u), atomicAdd(stats[metal > 0.5 ? 4 : 5], 1u);
 	}
 	imageStore(hist_out, p, vec4(Safe(add), 1.0));
 	imageStore(out_img, p, vec4(Safe(out_c + add / e), 1.0));
