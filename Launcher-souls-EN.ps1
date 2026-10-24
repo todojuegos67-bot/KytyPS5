@@ -1913,7 +1913,7 @@ $script:testModes = @(
 	@('Test: none', ''), @('No async compute', 'enableAsyncCompute=false'), @('No spot shadows', 'r_enableSpotShadows=false'),
 	@('No ambient shadowing', 'r_enableAmbientShadowing=false'), @('No game SSR', 'r_ssrCutoffDistance=0'),
 	@('Emu: fresh memory off', 'KYTY_FRESH_MEMORY=0'), @('Emu: partial dirty off', 'KYTY_PARTIAL_IMAGE_DIRTY=0'),
-	@('Emu: resolve pages off', 'KYTY_TEXTURE_RESOLVE_PAGES=0'), @('Emu: image pool off', 'KYTY_IMAGE_POOL=0'), @('Emu: texture reduce off', 'KYTY_TEXTURE_REDUCE=0'))
+	@('Emu: resolve pages off', 'KYTY_TEXTURE_RESOLVE_PAGES=0'), @('Emu: image pool off', 'KYTY_IMAGE_POOL=0'), @('Emu: texture reduce off', 'KYTY_TEXTURE_REDUCE=0'), @('Emu: sin arreglo focos', 'KYTY_DEPTH_ARRAY_GUARD=0'))
 $cmbTest = New-Object System.Windows.Forms.ComboBox
 $cmbTest.DropDownStyle = 'DropDownList'; $cmbTest.Font = $smallFont
 foreach ($t in $script:testModes) { [void]$cmbTest.Items.Add($t[0]) }

@@ -89,6 +89,8 @@ layout(push_constant) uniform Push {
 
 const float PI  = 3.14159265;
 const float FAR = 1.0e5;
+// The composite's largest darkening of the game's color (a share of its luminance; see Composite).
+const float MaxDarken = 0.25;
 
 vec2 RenderSize() { return push.size.xy; }
 // The screen's y convention: the game's viewport (GNM, yscale < 0) puts NDC y +1 on the render's row 0 (RT shadows
@@ -792,6 +794,11 @@ void Composite(ivec2 px) {
 	float lc = Luma(max(col.rgb, vec3(0))), lr = Luma(refl);
 	w *= 1.0 - smoothstep(4.0, 12.0, lc / max(lr, lc * 1e-4 + 1e-30));
 	w = clamp(isnan(w) ? 0.0 : w, 0.0, 0.9);
+	// (10-24 puddles) Never darken the game's pixel by more than MaxDarken of its luminance. The game's color already
+	// holds its own reflection (its SSR, else its probes, which see what is off screen: the bright gate of a hall); a
+	// screen-space hit on a dark on-screen wall replaced up to 90 % of it, so puddles (the wet mask's plain, dark, flat
+	// pixels) turned into flat near-black shapes that came and went as the walls entered and left the screen.
+	if (lr < lc) w = min(w, MaxDarken * lc / max(lc - lr, 1e-30));
 	if (st) {
 		if (w > 0.05) Stat(1, 1);
 		Stat(2, int(w * 1000.0));
