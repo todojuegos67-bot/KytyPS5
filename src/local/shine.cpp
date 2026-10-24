@@ -13,6 +13,7 @@
 //             where the normal varies (temporally stable). Sky and fog (beyond ~35..110 m) are untouched.
 // Decode overrides: KYTY_SHINE_NORMAL ("<layer>:<layout>[w][n]", default 3:9w), KYTY_SHINE_ROUGH ("<layer>:<shift>:<bits>[g]",
 // default 2:0:8), KYTY_SHINE_GLOSS (same syntax, default none; e.g. 1:16:8g), KYTY_SHINE_FLIPY (1: row 0 = NDC y +1, default).
+// KYTY_SHINE_METAL (a metal field, same syntax; default none: the dark-albedo heuristic), KYTY_SHINE_LIGHTS=0 (sun only).
 // Every 10 s: "SHINE: stats" with the share of pixels highlighted / sharpened, the mean lights found and the GPU ms.
 #include "local/shine.h"
 
@@ -38,7 +39,7 @@ constexpr uint32_t HeaderWords = 16;
 constexpr uint32_t StatsWord   = 16;
 constexpr uint32_t StatsCount  = 16;
 constexpr uint32_t Cells       = 32 * 18;
-constexpr uint32_t FrameBytes  = (64 + Cells * 4) * 4;
+constexpr uint32_t FrameBytes  = (80 + Cells * 4) * 4;
 constexpr uint32_t ExposureIdx = 12; // hparams.x (1.0) when the game gives no exposure
 
 struct ShinePush {
@@ -342,9 +343,9 @@ void Log(bool have_gbuf, bool have_sun, int level) {
 	for (uint32_t i = 0; i < StatsCount; ++i) d[i] = cur[i] - g_sh.stat_last[i];
 	g_sh.stat_last  = cur;
 	const double px = std::max<double>(d[0], 1.0);
-	std::printf("SHINE: stats (level %d) highlighted %.1f %% of pixels, sharpened %.1f %%, lights %.2f a frame, sun %s, G-buffer %llu/%llu "
-	            "frames, GPU %.3f ms\n",
-	            level, 100.0 * d[1] / px, 100.0 * d[2] / px, static_cast<double>(d[3]) / std::max<double>(static_cast<double>(g_sh.frames), 1.0),
+	std::printf("SHINE: stats (level %d) highlighted %.1f %% of pixels (metal %.1f %%, other smooth %.1f %%, torch glint %.1f %%; planar "
+	            "rejected %.1f %%), sharpened %.1f %%, lights %.2f a frame, sun %s, G-buffer %llu/%llu frames, GPU %.3f ms\n",
+	            level, 100.0 * d[1] / px, 100.0 * d[4] / px, 100.0 * d[5] / px, 100.0 * d[6] / px, 100.0 * d[7] / px, 100.0 * d[2] / px, static_cast<double>(d[3]) / std::max<double>(static_cast<double>(g_sh.frames), 1.0),
 	            have_sun ? "yes" : "no (sky fill)", static_cast<unsigned long long>(g_sh.gbuf_frames), static_cast<unsigned long long>(g_sh.frames),
 	            g_sh.samples > 0 ? g_sh.sum_ms / g_sh.samples : 0.0);
 	std::fflush(stdout);
@@ -407,6 +408,11 @@ bool ShineApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	static const int32_t normal_code = NormalEnv("KYTY_SHINE_NORMAL", 3 | (9 << 2) | 64);
 	static const int32_t rough_code  = FieldEnv("KYTY_SHINE_ROUGH", 2 | (0 << 2) | (8 << 7));
 	static const int32_t gloss_code  = FieldEnv("KYTY_SHINE_GLOSS", -1);
+	static const int32_t metal_code  = FieldEnv("KYTY_SHINE_METAL", -1);
+	static const bool    local_lights = [] {
+		const char* v = std::getenv("KYTY_SHINE_LIGHTS");
+		return v == nullptr || *v == '\0' || *v != '0';
+	}();
 	static const bool    row0_up     = [] {
 		const char* y = std::getenv("KYTY_SHINE_FLIPY");
 		return y == nullptr || *y == '\0' || *y != '0';
@@ -427,9 +433,9 @@ bool ShineApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		static bool said = false;
 		if (!said) {
 			said = true;
-			std::printf("SHINE: on (level %d, %ux%u, strength %g, sharpen %g, normal code %d, roughness %d, gloss %d, G-buffer %s, "
+			std::printf("SHINE: on (level %d, %ux%u, strength %g, sharpen %g, normal code %d, roughness %d, gloss %d, metal %d, local lights %s, G-buffer %s, "
 			            "sun %s, exposure %s)\n",
-			            level, color.extent.width, color.extent.height, strength, sharpen, normal_code, rough_code, gloss_code,
+			            level, color.extent.width, color.extent.height, strength, sharpen, normal_code, rough_code, gloss_code, metal_code, local_lights ? "on" : "off (KYTY_SHINE_LIGHTS=0)",
 			            have_gbuf ? "found" : "not yet", have_sun ? "from RT shadows" : "unknown (KYTY_RT_SHADOWS gives it; sky fill until then)",
 			            inputs.exposure_buffer != nullptr ? "the game's" : "1.0");
 			std::fflush(stdout);
@@ -449,13 +455,19 @@ bool ShineApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.sun[0] = sun[0], push.sun[1] = sun[1], push.sun[2] = sun[2], push.sun[3] = have_sun ? 1.2f * sun_w : 0.0f;
 	push.fill[0] = camera.up[0], push.fill[1] = camera.up[1], push.fill[2] = camera.up[2];
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
+	{
+		static auto last = std::chrono::steady_clock::now();
+		const auto  now  = std::chrono::steady_clock::now();
+		push.motion[3]   = std::clamp(std::chrono::duration<float>(now - last).count(), 0.001f, 0.1f);
+		last             = now;
+	}
 	push.motion[2] = (g_sh.history_valid && !inputs.reset && inputs.motion.view != nullptr) ? 1.0f : 0.0f;
 	push.fill[3] = camera.up_valid ? (have_sun ? 0.1f : 0.35f) : 0.0f;
 	const bool game_exposure = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
 	push.misc[1] = static_cast<int32_t>(g_sh.frame & 0x7fffffff);
-	push.misc[2] = (row0_up ? 1 : 0) | (normals ? 2 : 0);
+	push.misc[2] = (row0_up ? 1 : 0) | (normals ? 2 : 0) | (inputs.motion.view != nullptr ? 4 : 0);
 	push.misc[3] = game_exposure ? static_cast<int32_t>(inputs.exposure_index) : static_cast<int32_t>(ExposureIdx);
-	push.dec[0] = normal_code, push.dec[1] = rough_code, push.dec[2] = gloss_code, push.dec[3] = level;
+	push.dec[0] = normal_code, push.dec[1] = rough_code, push.dec[2] = gloss_code, push.dec[3] = metal_code;
 
 	const auto entry = static_cast<uint32_t>(g_sh.written % 8);
 	const bool timed = g_sh.pool != nullptr && g_sh.written < g_sh.read + 8;
@@ -481,7 +493,7 @@ bool ShineApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		header[12] = 1.0f;                                             // (ExposureIdx)
 		header[13] = EnvFloat("KYTY_SHINE_LIGHT", 3.0f, 0.5f, 100.0f); // the emissive threshold (exposed luminance)
 		header[14] = EnvFloat("KYTY_SHINE_LIGHT_RADIUS", 3.0f, 0.5f, 20.0f);
-		header[15] = level >= 3 ? 4.0f : level == 2 ? 2.0f : 0.0f;
+		header[15] = !local_lights ? 0.0f : level >= 3 ? 4.0f : level == 2 ? 2.0f : 0.0f;
 		command.updateBuffer(vk::Buffer(g_sh.frame_buf), 0, sizeof(header), header.data());
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
@@ -523,8 +535,9 @@ bool ShineApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	};
 	// (level 1: no light search; select still runs once to clear the lights, then never again)
 	static bool lights_cleared = false;
-	if (level >= 2) run(0, 4, 3);
-	if (level >= 2 || !lights_cleared) run(1, 1, 1), lights_cleared = true;
+	const bool lights_on = level >= 2 && local_lights;
+	if (lights_on) run(0, 4, 3);
+	if (lights_on || !lights_cleared) run(1, 1, 1), lights_cleared = true;
 	run(2, (color.extent.width + 7) / 8, (color.extent.height + 7) / 8);
 	Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 	        vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eMemoryRead);
