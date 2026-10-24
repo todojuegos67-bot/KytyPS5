@@ -737,7 +737,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 				if (std::sscanf(w, "%f:%f", &lo, &hi) == 2 && lo >= 0.0f && hi > lo && hi <= 1.0f)
 					g_rt.mat_lo = lo, g_rt.mat_hi = hi, g_rt.mat_forced = true;
 			}
-			g_rt.mat_scale = EnvFloat("KYTY_RT_REFLECTIONS_MATERIAL", 1.0f, 0.0f, 1.0f);
+			// (refl4: the auto-picked material field marked dry stone floors wet (10-24 video): off unless asked or given a trusted field)
+			g_rt.mat_scale = EnvFloat("KYTY_RT_REFLECTIONS_MATERIAL", r >= 0 ? 1.0f : 0.0f, 0.0f, 1.0f);
 			if (const char* y = std::getenv("KYTY_RT_REFLECTIONS_FLIPY"); y != nullptr && *y != '\0')
 				g_rt.row0_up = *y != '0', g_rt.row0_forced = true;
 			// (a normal given and the convention forced: nothing left to calibrate)
