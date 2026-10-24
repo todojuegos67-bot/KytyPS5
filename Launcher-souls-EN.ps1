@@ -34,7 +34,7 @@ $fgModes = @(
 	@('   DLSS MFG dynamic (x2-x4 automatic)',         'dlss-dynamic.json')
 )
 # (10-23) Grafica y equipo: con una grafica que no es NVIDIA no se ofrece nada de DLSS (ni reescalado ni frame generation).
-$script:gpuName = ''; $script:pcInfo = ''
+$script:gpuName = ''; $script:pcInfo = ''; $script:ramGB = 0
 try {
 	$vcs = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object { $_.Name })
 	$pick = $vcs | Where-Object { $_.Name -match 'NVIDIA|GeForce|Radeon|AMD|Arc' } | Select-Object -First 1
@@ -43,8 +43,10 @@ try {
 	$cpu = (Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1).Name
 	$ram = [math]::Round((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1GB)
 	$script:pcInfo = "$($cpu -replace '\s+', ' ')".Trim() + "  |  $ram GB RAM"
+	$script:ramGB = [int]$ram
 } catch { }
 $script:isNvidia = (-not $script:gpuName) -or ($script:gpuName -match 'NVIDIA|GeForce|RTX|GTX|Quadro')
+$script:isAmd = [bool]($script:gpuName -match 'AMD|Radeon')  # (10-24) AMD: su Anti-Lag 2 de serie
 # (10-23) Base de datos de graficas: el modo recomendado y lo que se puede esperar. Medido en una RTX 5080 (1440p:
 # ~75 reales, 224 en pantalla con frame generation dinamico; 4K cine ~40-48 reales) y en una de 8 GB simulada; el
 # resto es una ESTIMACION por potencia relativa (el emulador tambien depende mucho de la CPU).
@@ -196,6 +198,11 @@ function Start-Game {
 	$psargs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $root 'run-windows.ps1')`"",
 	          '-Exe', "`"$(Join-Path $root $exeName)`"", '-Config', "`"$(Join-Path $root "config\$config")`"", '-Fullscreen')
 	if ($ram16 -or $chkPc16.Checked) { $psargs += '-Ram16' }
+	# (10-24) Perfil seguro de 16 GB (Update-LowRam: 20 GB de RAM o menos, o "Simular 16 GB RAM"): -Ram16 de siempre y
+	# KYTY_LOWRAM=1 (los limites de memoria del emulador para 16 GB). Con la simulacion, el emulador cree tener 16 GB.
+	$lowRamSets = @()
+	if ($ram16 -or $chkPc16.Checked -or (Test-LowRam)) { $lowRamSets += 'KYTY_LOWRAM=1' }
+	if ($chkRam16.Checked) { $lowRamSets += 'KYTY_SIMULATE_RAM_MB=16384' }
 	# HDR10 (solo si "Usar HDR" esta activado en la pantalla de Windows) y VSync (modo FIFO: sin tearing).
 	if ($chkHdr.Checked)   { $psargs += '-Hdr' }
 	if ($chkVsync.Checked) { $psargs += @('-PresentMode', 'Fifo') }
@@ -207,12 +214,12 @@ function Start-Game {
 	# juego y Windows usan aparte, por debajo de 8 GB) y texturas a la mitad y sombras mas cortas (-Quality low).
 	# Modo GPU seguro: el trabajo de compute del juego sin solaparse (KYTY_COMPUTE_CHAIN=0), para graficas que se
 	# cuelgan o dan pantallazo azul (~37% menos FPS).
-	$sets = @()
+	$sets = @() + $lowRamSets
 	# (10-23) Reserva PS5 reducida retirada: el juego pide unos 11,8 GB fijos y con 12 GB fallaban asignaciones  # (10-23) reserva de memoria PS5 reducida
 	# Modo TURBO (run-windows -Turbo): caches de video a 4.5 GB (unos 6 GB en total), texturas a un cuarto, detalle bajo
 	# del juego y la RAM vaciada cada 15 s por encima de 5 GB: para PCs de 16 GB que se cerraban en zonas pesadas.
 	if ($chkTurbo2.Checked) { $psargs += @('-Turbo2', '-Quality', 'low', '-TextureReduce', '2') }
-	elseif ($chkLowPc.Checked) { $sets += 'KYTY_SIMULATE_RAM_MB=16384'; $psargs += @('-Turbo', '-Quality', 'low', '-TextureReduce', '2') }
+	elseif ($chkLowPc.Checked) { if ($sets -notcontains 'KYTY_SIMULATE_RAM_MB=16384') { $sets += 'KYTY_SIMULATE_RAM_MB=16384' }; $psargs += @('-Turbo', '-Quality', 'low', '-TextureReduce', '2') }
 	# (10-23) Modo GPU seguro retirado del launcher
 	# Graficos: texturas (0 entera, 1 mitad, 2 cuarto) y distancia de dibujado (-Quality low/lowest: solo el LOD).
 	$psargs += @('-TextureReduce', @('0', 'h', '1', '2')[$cmbTex.SelectedIndex])  # (10-23) Alto = h
@@ -226,12 +233,22 @@ function Start-Game {
 	# (10-23 21:30) NVIDIA Reflex sobre la frame generation de AMD crashea tambien sin DLSS (20261023-213004, Fsr3::QueuePresent): nunca.
 	$nvAmd  = $false
 	# Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag automatico en AMD, y en NVIDIA solo con XeSS o FSR.
-	$fixedAl = (Is-FixedFg) -and (-not $script:isNvidia)
+	# (10-24) Graficas AMD: su Anti-Lag 2 de serie con la frame generation de AMD (y nada mas); NVIDIA / Intel: el propio.
+	# (10-24) Se elige en el desplegable: en AMD, Anti-Lag 2 de serie (por defecto) o el nuestro; en NVIDIA el nuestro
+	# (Reflex sobre la frame generation de AMD se cerraba). Modos Souls fijos: el nuestro en Ultra.
+	$fixedAl = $script:isAmd -and ($config -like 'fsr3*') -and $cmbAl.SelectedIndex -eq 0 -and -not (Is-FixedFg)
 	# (10-23 noche) Anti-Lag propio del emulador (KYTY_LOWLAT): sin Reflex ni FSR3 tocado; con la frame generation de AMD.
-	$ownLat = $cmbAl.SelectedIndex -gt 0 -and $config -like 'fsr3*'
+	if (Is-FixedFg) { $cmbAl.SelectedIndex = 2 }  # (10-24) siempre Ultra en los modos fijos
+	$ownLat = ($cmbAl.SelectedIndex -eq 1 -or $cmbAl.SelectedIndex -eq 2) -and $config -like 'fsr3*'
+	# (10-24) Frame generation de NVIDIA (DLSS-G): Reflex (por defecto) o el nuestro; con el nuestro Reflex se apaga.
+	$dgOwn = $config -like 'dlss*' -and $cmbAlNv.SelectedIndex -gt 0
+	if ($dgOwn) {
+		$sets += 'KYTY_DLSSG_REFLEX=off'; $sets += 'KYTY_LOWLAT=1'
+		$sets += $(if ($cmbAlNv.SelectedIndex -eq 2) { 'KYTY_LOWLAT_QUEUE=1' } else { 'KYTY_LOWLAT_QUEUE=2' })
+	}
 	if ($ownLat) { $sets += 'KYTY_LOWLAT=1'; $sets += $(if ($cmbAl.SelectedIndex -eq 2) { 'KYTY_LOWLAT_QUEUE=1' } else { 'KYTY_LOWLAT_QUEUE=2' }) }  # (10-23) Anti-Lag: 2 frames en cola; Ultra: 1
 	# (10-23) Para las metricas: si va Anti-Lag y cual.
-	Set-IniValue 'antilagon' $(if ($ownLat) { $(if ($cmbAl.SelectedIndex -eq 2) { 'Ultra' } else { 'Normal' }) } elseif ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
+	Set-IniValue 'antilagon' $(if ($dgOwn) { $(if ($cmbAlNv.SelectedIndex -eq 2) { 'Ultra (Reflex off)' } else { 'Normal (Reflex off)' }) } elseif ($ownLat) { $(if ($cmbAl.SelectedIndex -eq 2) { 'Ultra' } else { 'Normal' }) } elseif ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
 	if ($nvAmd -or $fixedAl) {
 		$psargs += '-AntiLag'
 		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y
@@ -291,7 +308,12 @@ function Start-Game {
 	if ($fgConfig -eq 'fsr3-x4.json') { $sets += 'KYTY_VRR_CAP_FPS=224' }  # (10-22 d) en DLSS el tope se aplicaba dos veces: 14 reales x4 = 56
 	if ($fgConfig -like '*dyn*') { $sets += 'KYTY_DYN_QUALITY=0.95' }  # (10-22 g) llenar el monitor: el menor multiplicador que llega a ~224 (80 reales = x3, 120 = x2)
 	# (10-23) Teclado y raton: velocidad de camara del juego (sin teclado y raton no se toca: la del menu del juego).
-	if ($chkKbm.Checked) { $psargs += @('-ExtraConvars', "cp11_Setting_CameraSpeed=$($trkCam.Value)") }
+	# (10-24) Convars extra: velocidad de camara (raton) y la prueba elegida en Ajustes (manchas negras).
+	$extraCv = @()
+	if ($chkKbm.Checked) { $extraCv += "cp11_Setting_CameraSpeed=$($trkCam.Value)" }
+	$tsel = if ($cmbTest) { $script:testModes[[math]::Max(0, $cmbTest.SelectedIndex)][1] } else { '' }
+	if ($tsel -like 'KYTY_*') { $sets += $tsel } elseif ($tsel) { $extraCv += $tsel }  # (KYTY_*: por -Set, que manda sobre la config)
+	if ($extraCv.Count) { $psargs += @('-ExtraConvars', ($extraCv -join ';')) }
 	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
@@ -884,14 +906,25 @@ $chkAntiLag.Text = 'Anti-Lag'
 # (10-23) Desplegable Anti-Lag: No / Anti-Lag (2 frames en cola) / Anti-Lag Ultra (1), en el sitio de la casilla.
 $cmbAl = New-Object System.Windows.Forms.ComboBox
 $cmbAl.DropDownStyle = 'DropDownList'; $cmbAl.Font = $smallFont
-foreach ($l in 'Anti-Lag: off', 'Anti-Lag', 'Anti-Lag Ultra') { [void]$cmbAl.Items.Add($l) }
-$ai2 = 1; [void][int]::TryParse((Get-IniValue 'antilagmode2' '1'), [ref]$ai2); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $ai2), 2)  # (10-24) activado por defecto
-$cmbAl.Add_SelectedIndexChanged({ Set-IniValue 'antilagmode2' "$($cmbAl.SelectedIndex)" })
+# (10-24) AMD: Anti-Lag 2 de serie (por defecto), el nuestro, el nuestro Ultra o ninguno. NVIDIA: ninguno / el nuestro / Ultra.
+$script:alKey = if ($script:isAmd) { 'antilagamd' } else { 'antilagmode2' }
+$alItems = if ($script:isAmd) { @('Anti-Lag 2 (AMD)', 'Anti-Lag', 'Anti-Lag Ultra', 'Anti-Lag: off') } else { @('Anti-Lag: off', 'Anti-Lag', 'Anti-Lag Ultra') }
+foreach ($l in $alItems) { [void]$cmbAl.Items.Add($l) }
+$ai2 = if ($script:isAmd) { 0 } else { 1 }; [void][int]::TryParse((Get-IniValue $script:alKey "$ai2"), [ref]$ai2); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $ai2), $cmbAl.Items.Count - 1)
+$cmbAl.Add_SelectedIndexChanged({ if (-not $script:alLocked) { Set-IniValue $script:alKey "$($cmbAl.SelectedIndex)" } })
 $gFg.Controls.Add($cmbAl); $cmbAl.Location = $chkAntiLag.Location; $cmbAl.Size = New-Object System.Drawing.Size(186, 26)
 # (10-24) Con la frame generation de NVIDIA (DLSS-G) va siempre NVIDIA Reflex: se muestra para que se sepa.
 $lbReflex = New-Label 'Reflex: on (DLSS-G)' $smallFont ([System.Drawing.Color]::FromArgb(120, 210, 120)) 0 0 186 24
 $lbReflex.TextAlign = 'MiddleLeft'; $gFg.Controls.Add($lbReflex); $lbReflex.Location = $chkAntiLag.Location; $lbReflex.Visible = $false
 $tips.SetToolTip($lbReflex, 'NVIDIA frame generation (DLSS-G) always runs with NVIDIA Reflex on: lower latency automatically.')
+# (10-24) Con DLSS-G: elegir Reflex (por defecto) o nuestro Anti-Lag (Reflex apagado), para comparar.
+$cmbAlNv = New-Object System.Windows.Forms.ComboBox
+$cmbAlNv.DropDownStyle = 'DropDownList'; $cmbAlNv.Font = $smallFont
+foreach ($l in 'Reflex (NVIDIA)', 'Anti-Lag', 'Anti-Lag Ultra') { [void]$cmbAlNv.Items.Add($l) }
+$an = 0; [void][int]::TryParse((Get-IniValue 'antilagdlssg' '0'), [ref]$an); $cmbAlNv.SelectedIndex = [math]::Min([math]::Max(0, $an), 2)
+$cmbAlNv.Add_SelectedIndexChanged({ Set-IniValue 'antilagdlssg' "$($cmbAlNv.SelectedIndex)" })
+$gFg.Controls.Add($cmbAlNv); $cmbAlNv.Location = $chkAntiLag.Location; $cmbAlNv.Size = New-Object System.Drawing.Size(186, 26); $cmbAlNv.Visible = $false
+$tips.SetToolTip($cmbAlNv, 'With NVIDIA frame generation (DLSS-G). Reflex: NVIDIA''s (recommended). Anti-Lag / Ultra: ours with Reflex off, to compare which feels better. Without Reflex, DLSS-G may pace differently or warn that Reflex is missing.')
 # Solo se puede marcar con la frame generation de AMD (con la de NVIDIA ya va Reflex); fuera de ella se desmarca.
 function Update-AntiLagBox {
 	$cfgNow = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
@@ -904,12 +937,21 @@ function Update-AntiLagBox {
 	$chkAntiLag.Enabled = $true
 	if (-not $ok) { $chkAntiLag.Checked = $false }
 	$chkAntiLag.Visible = $false; $cmbAl.Visible = $ok
-	$lbReflex.Visible = (-not $ok) -and $cfgNow -like 'dlss*'
+	# (10-24) Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag Ultra siempre, sin poder cambiarlo.
+	if (Is-FixedFg) {
+		if (-not $script:alLocked) { $script:alLocked = $true; $cmbAl.SelectedIndex = 2 }
+		$cmbAl.Enabled = $false
+	} elseif ($script:alLocked) {
+		$script:alLocked = $false; $cmbAl.Enabled = $true
+		$v = if ($script:isAmd) { 0 } else { 1 }; [void][int]::TryParse((Get-IniValue $script:alKey "$v"), [ref]$v); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $v), $cmbAl.Items.Count - 1)
+	}
+	$lbReflex.Visible = $false
+	$cmbAlNv.Visible = (-not $ok) -and $cfgNow -like 'dlss*'
 }
 $cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $cmbRes.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $form.Add_Shown({ Update-AntiLagBox })
-$tips.SetToolTip($cmbAl, 'With AMD frame generation. Anti-Lag: at most 2 frames queued before reading the controller. Ultra: 1 (even less lag, may cost a few real FPS). No Reflex, any GPU.')
+$tips.SetToolTip($cmbAl, 'With AMD frame generation. Anti-Lag 2 (AMD): AMD GPUs'' built-in one. Anti-Lag: ours, at most 2 frames queued before reading the controller. Ultra: 1 (even less lag). The Souls light, balanced and low profile modes always use ours on Ultra.')
 # Calidad grafica: texturas, distancia, sombras, Luz RT y filtrado x16 ($script:gfxTop: etiqueta y desplegable de Texturas, Sombras, Distancia).
 Move-To $script:gfxTop[0] $gGfx 10 26 98; Move-To $cmbTex $gGfx 110 24 296
 Move-To $script:gfxTop[4] $gGfx 10 58 98; Move-To $cmbDist $gGfx 110 56 296
@@ -974,6 +1016,29 @@ Move-To $chkPc16 $gPc 12 24 190
 $chkSafeGpu.Visible = $false; $chkSafeGpu.Checked = $false
 Move-To $chkRam16 $gPc 12 54 190
 Move-To $chkVram8 $gPc 202 54 206
+# (10-24) PCs de 20 GB de RAM o menos (o con "Simular 16 GB RAM"): el perfil seguro de 16 GB solo (la casilla del equipo
+# de 16 GB marcada y fija, KYTY_LOWRAM=1) y un aviso de una linea. Lo que el usuario tenia marcado se guarda aparte: al
+# quitar la simulacion vuelve tal cual (mientras esta forzada la casilla escribe en otra clave del ini).
+function Test-LowRam { return ($chkRam16.Checked -or ($script:ramGB -gt 0 -and $script:ramGB -le 20)) }
+$script:pc16User = $chkPc16.Checked
+$lbRamNote = New-Label '' (New-Object System.Drawing.Font('Segoe UI', 8.25)) $gold 0 0 212 34
+$panel.Controls.Add($lbRamNote)
+Move-To $lbRamNote $gPc 202 19 212  # (hasta dos lineas cortas, sin tapar la fila de abajo)
+$tips.SetToolTip($lbRamNote, 'With 16 GB of RAM the game is tight on memory: the launcher uses the safe 16 GB profile (less kept in RAM, resolution unchanged). Close your browser (Chrome, Edge, Firefox), Discord and other launchers before playing.')
+function Update-LowRam {
+	if (Test-LowRam) {
+		if ($chkPc16.Enabled) { $script:pc16User = $chkPc16.Checked }
+		$chkPc16.Tag = 'pc16forced'; $chkPc16.Checked = $true; $chkPc16.Enabled = $false
+		$ramTxt = if ($chkRam16.Checked) { '16 GB (simulated)' } else { "$($script:ramGB) GB" }
+		$lbRamNote.Text = "RAM $($ramTxt): safe profile. Close browsers"
+		$lbRamNote.Visible = $true
+	} else {
+		if (-not $chkPc16.Enabled) { $chkPc16.Enabled = $true; $chkPc16.Checked = [bool]$script:pc16User; $chkPc16.Tag = 'pc16' }
+		$lbRamNote.Visible = $false
+	}
+}
+Update-LowRam
+$chkRam16.Add_CheckedChanged({ Update-LowRam })
 # (10-23) Optimizacion tarjetas de 8 GB: texturas bajo, distancia y sombras medio (7,4 -> 6,3 GB de VRAM, tirones 26% -> 4%).
 $chkGpu8 = New-Check '8 GB GPU optimization' 0 0 206 'gpu8opt'
 $tips.SetToolTip($chkGpu8, '8 GB GPUs: sets textures to Low and distance and shadows to Medium so the game fits in the GPU memory.')
@@ -1662,19 +1727,19 @@ foreach ($pp in @(@('Motion Blur', 'motionblur'), @('Depth of Field', 'dof'), @(
 }
 # (10-24) Ray tracing en pantalla (beta): sombras del sol y reflejos con denoise. Solo con DLSS, XeSS o FSR.
 $gRt = New-Group 'Ray tracing (beta)' 10 586 420 92
-function New-RtCombo([string]$label, [string]$key, $y, [string]$tip) {
+function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @('Off', 'Low', 'High', 'Ultra')) {
 	$lb = New-Label $label $smallFont $ink 0 0 98 22; $panel.Controls.Add($lb)
 	$c = New-Object System.Windows.Forms.ComboBox
 	$c.DropDownStyle = 'DropDownList'; $c.Font = $smallFont; $c.Tag = $key
-	foreach ($it in 'Off', 'Low', 'High', 'Ultra') { [void]$c.Items.Add($it) }
-	$v = 0; [void][int]::TryParse((Get-IniValue $key '0'), [ref]$v); $c.SelectedIndex = [math]::Min([math]::Max(0, $v), 3)
+	foreach ($it in $items) { [void]$c.Items.Add($it) }
+	$v = 0; [void][int]::TryParse((Get-IniValue $key '0'), [ref]$v); $c.SelectedIndex = [math]::Min([math]::Max(0, $v), $items.Count - 1)
 	$c.Add_SelectedIndexChanged({ param($sender, $e) Set-IniValue $sender.Tag "$($sender.SelectedIndex)" })
 	$tips.SetToolTip($c, $tip); $panel.Controls.Add($c)
 	Move-To $lb $gRt 10 ($y + 2) 98; Move-To $c $gRt 110 $y 296
 	return $c
 }
 $cmbRtSh = New-RtCombo 'RT Shadows' 'rtshadow' 24 'Ray-traced sun shadows on the image, with denoising. Only with DLSS, XeSS or FSR. Low ~0.3 ms, High ~1 ms, Ultra ~1.5 ms. Beta.'
-$cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl' 56 'Ray-traced reflections on the image (water, puddles, floors), with denoising. Only with DLSS, XeSS or FSR. Low ~0.4 ms, High ~1 ms, Ultra ~2 ms. Beta.'
+$cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl2' 56 'Ray-traced reflections on water, puddles and wet surfaces, with denoising. Only with DLSS, XeSS or FSR. Low ~0.6 ms, Medium ~1 ms, High ~2 ms, Ultra ~4.5 ms. Beta.' @('Off', 'Low', 'Medium', 'High', 'Ultra')
 
 # (10-24) Tu equipo: tarjeta con el caballero senalando la grafica y el equipo detectados (antes, una linea abajo).
 function New-PcCard {
@@ -1871,6 +1936,20 @@ $btnSave.Add_Click({
 	$settings.Visible = $false
 })
 $settings.Controls.Add($btnSave)
+# (10-24) Prueba para las manchas negras del suelo mojado: una cosa cada vez (se guarda; 'Ninguna' para volver).
+$script:testModes = @(
+	@('Test: none', ''), @('No async compute', 'enableAsyncCompute=false'), @('No spot shadows', 'r_enableSpotShadows=false'),
+	@('No ambient shadowing', 'r_enableAmbientShadowing=false'), @('No game SSR', 'r_ssrCutoffDistance=0'),
+	@('Emu: fresh memory off', 'KYTY_FRESH_MEMORY=0'), @('Emu: partial dirty off', 'KYTY_PARTIAL_IMAGE_DIRTY=0'),
+	@('Emu: resolve pages off', 'KYTY_TEXTURE_RESOLVE_PAGES=0'), @('Emu: image pool off', 'KYTY_IMAGE_POOL=0'), @('Emu: texture reduce off', 'KYTY_TEXTURE_REDUCE=0'))
+$cmbTest = New-Object System.Windows.Forms.ComboBox
+$cmbTest.DropDownStyle = 'DropDownList'; $cmbTest.Font = $smallFont
+foreach ($t in $script:testModes) { [void]$cmbTest.Items.Add($t[0]) }
+$tv = 0; [void][int]::TryParse((Get-IniValue 'pruebamanchas' '0'), [ref]$tv); $cmbTest.SelectedIndex = [math]::Min([math]::Max(0, $tv), $script:testModes.Count - 1)
+$cmbTest.Add_SelectedIndexChanged({ Set-IniValue 'pruebamanchas' "$($cmbTest.SelectedIndex)" })
+$cmbTest.Location = New-Object System.Drawing.Point(410, 100); $cmbTest.Size = New-Object System.Drawing.Size(180, 26)
+$tips.SetToolTip($cmbTest, 'Testing only: turns off one game or emulator feature to find the black-patch bug. Leave Test: none for normal play.')
+$settings.Controls.Add($cmbTest)
 $btnSettings.Add_Click({ $settings.Visible = -not $settings.Visible })
 # (10-23) Cruz para cerrar Settings; al guardar bien tambien se cierra.
 $btnCloseSet = New-Button ([string][char]0x2715) 572 6 32 30 $false

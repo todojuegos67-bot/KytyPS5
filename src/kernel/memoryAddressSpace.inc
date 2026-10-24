@@ -1709,8 +1709,11 @@ private:
 		    mode == VirtualMemory::Mode::NoAccess ? PAGE_READWRITE : GetProtect(mode);
 		void* ptr = nullptr;
 		// Committing through the writable alias commits the section's pages for every view of them.
+		// (Refused for lack of memory: a release pass and another try, MemGuard.)
 		if (m_on_demand && !m_lazy &&
-		    VirtualAlloc(m_backing_base + backing_offset, size, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+		    MemGuard::RetryOs("direct-memory commit", size, [&] {
+			    return VirtualAlloc(m_backing_base + backing_offset, size, MEM_COMMIT, PAGE_READWRITE);
+		    }) == nullptr) {
 			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: commit of %" PRIu64 " bytes failed: 0x%08" PRIx32 "\n",
 			           size, static_cast<uint32_t>(GetLastError()));
 			SetFailure(failure_reason, FailureReason::PlaceholderMapFailed);
@@ -1718,8 +1721,10 @@ private:
 		}
 		{
 			LiveTrace::SlowOsCallScope slow(LiveTrace::OsMapView, vaddr, size);
-			ptr = MapViewOfFile3(m_handle, GetCurrentProcess(), reinterpret_cast<void*>(vaddr), backing_offset, size,
-			                     MEM_REPLACE_PLACEHOLDER, map_protect, nullptr, 0);
+			ptr = MemGuard::RetryOs("MapViewOfFile3", size, [&] {
+				return MapViewOfFile3(m_handle, GetCurrentProcess(), reinterpret_cast<void*>(vaddr), backing_offset, size,
+				                      MEM_REPLACE_PLACEHOLDER, map_protect, nullptr, 0);
+			});
 		}
 		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
 			if (ptr != nullptr) {
@@ -2260,9 +2265,12 @@ public:
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		LiveTrace::SlowOsCallScope slow(LiveTrace::OsAlloc, vaddr, size);
-		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
-		                          MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
-		                          GetProtect(host_mode), nullptr, 0);
+		// (Refused for lack of commit: a release pass and another try, MemGuard; the guard's releasers never take
+		// this lock.)
+		auto* ptr = MemGuard::RetryOs("guest private commit", size, [&] {
+			return VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
+			                     MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, GetProtect(host_mode), nullptr, 0);
+		});
 		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
 			if (ptr != nullptr) {
 				VirtualFree(ptr, 0, MEM_RELEASE);
