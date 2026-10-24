@@ -26,6 +26,7 @@
 #include "gpu_tiler_shaders/gtao_spv.h"
 #include "gpu_tiler_shaders/ssr_spv.h"
 #include "local/rt-reflections.h"
+#include "local/gbuf-view.h"
 #include "local/shine.h"
 #include "local/godrays.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
@@ -5482,7 +5483,7 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 }
 } // namespace
 
-bool SsrWanted() { return SsrLevel() > 0 || RtReflectionsWanted() || ShineWanted() || GtaoLevel() > 0; }
+bool SsrWanted() { return SsrLevel() > 0 || RtReflectionsWanted() || ShineWanted() || GtaoLevel() > 0 || GbufViewWanted(); }
 bool SsrPassWanted() { return SsrLevel() > 0; }
 
 void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
@@ -5866,6 +5867,220 @@ void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::Comman
 		            static_cast<unsigned long long>(address));
 		std::fflush(stdout);
 	}
+}
+
+// KYTY_GBUF_VIEW / KYTY_GBUF_TAP (gbuf-view.h, refl7): after a dispatch (renderCompute.cpp, outside a compute chain's
+// middle): a dispatch reading the G-buffer logs once what it writes (its outputs: which image holds the game's SSR or
+// specular IBL); the KYTY_GBUF_TAP dispatch's written image is copied for the tap view (every time it runs: the last
+// one in the frame stays).
+namespace {
+struct GbufTapState {
+	bool                  parsed = false, failed = false;
+	uint64_t              hash = 0;
+	int                   slot = -1;
+	VkImage               image = VK_NULL_HANDLE;
+	VmaAllocation         mem   = nullptr;
+	vk::ImageView         view  = nullptr;
+	vk::Extent2D          extent {};
+	vk::Format            format = vk::Format::eUndefined;
+	vk::ImageLayout       layout = vk::ImageLayout::eUndefined;
+	std::atomic<uint64_t> flip {~0ull};
+	std::vector<std::pair<uint64_t, uint64_t>> logged; // (hash, written mask) logged already
+	std::vector<SsrPass::RetiredCopy>          retired;
+} g_tap;
+
+bool GbufTapFormat(vk::Format f) {
+	switch (f) {
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat:
+		case vk::Format::eR16G16Sfloat:
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR16Sfloat:
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eR8Unorm:
+		case vk::Format::eR8G8Unorm:
+		case vk::Format::eR16Unorm:
+		case vk::Format::eR16G16B16A16Unorm: return true;
+		default: return false;
+	}
+}
+} // namespace
+
+void GbufTapAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                          std::span<const TextureBinding> images, uint64_t written_mask) {
+	if (!GbufViewWanted()) return;
+	if (g_graphics_ctx == nullptr) g_graphics_ctx = &graphics;
+	if (!g_tap.parsed) {
+		g_tap.parsed = true;
+		if (const char* v = std::getenv("KYTY_GBUF_TAP"); v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0) {
+			unsigned long long h    = 0;
+			int                slot = -1;
+			if (std::sscanf(v, "%llx:%d", &h, &slot) >= 1) g_tap.hash = h, g_tap.slot = slot;
+			std::printf("GBUF: tap CS %016llx slot %s\n", h, slot >= 0 ? std::to_string(slot).c_str() : "(first written)");
+			std::fflush(stdout);
+		}
+	}
+	// (what a G-buffer reader writes: logged once per shader and written set)
+	{
+		std::array<uint64_t, 2> packed {};
+		{
+			std::lock_guard lock(g_ssr_gb.mutex);
+			packed = g_ssr_gb.packed_addresses;
+		}
+		bool reads = false;
+		for (const auto& b: images)
+			if (b.desc.info.data.address != 0 && (b.desc.info.data.address == packed[0] || b.desc.info.data.address == packed[1])) reads = true;
+		const auto key = std::make_pair(cs_hash, written_mask);
+		if ((reads || cs_hash == g_tap.hash) && g_tap.logged.size() < 128 &&
+		    std::find(g_tap.logged.begin(), g_tap.logged.end(), key) == g_tap.logged.end()) {
+			g_tap.logged.push_back(key);
+			std::string line;
+			char        buf[200];
+			for (size_t i = 0; i < images.size() && i < 32; ++i) {
+				const auto& b = images[i];
+				if (!b.image_id) continue;
+				auto& im = cache.GetImage(b.image_id);
+				std::snprintf(buf, sizeof(buf), " %zu%s %s %ux%ux%u mip %u layer %u @0x%llx;", i, (written_mask >> i) & 1u ? " WRITES" : "",
+				              SsrFormatName(im.backing.format), im.backing.extent.width, im.backing.extent.height, im.backing.layers,
+				              b.desc.view_info.base_level, b.desc.view_info.base_layer, static_cast<unsigned long long>(b.desc.info.data.address));
+				line += buf;
+			}
+			std::printf("GBUF: %s CS %016llx images:%s\n", reads ? "G-buffer reader" : "tap", static_cast<unsigned long long>(cs_hash), line.c_str());
+			std::fflush(stdout);
+		}
+	}
+	if (g_tap.failed || g_tap.hash == 0 || cs_hash != g_tap.hash) return;
+	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
+	int slot = g_tap.slot;
+	if (slot < 0)
+		for (size_t i = 0; i < images.size() && i < 64; ++i)
+			if ((written_mask >> i) & 1u) {
+				slot = static_cast<int>(i);
+				break;
+			}
+	if (slot < 0 || static_cast<size_t>(slot) >= images.size() || !images[slot].image_id) return;
+	const auto& binding = images[slot];
+	auto&       image   = cache.GetImage(binding.image_id);
+	if (image.backing.image == nullptr) return;
+	const vk::Format fmt = image.backing.format;
+	if (!GbufTapFormat(fmt)) {
+		g_tap.failed = true;
+		std::printf("GBUF: tap slot %d is %s: not a color format the view can show\n", slot, SsrFormatName(fmt));
+		std::fflush(stdout);
+		return;
+	}
+	const uint32_t   level = binding.desc.view_info.base_level, layer = binding.desc.view_info.base_layer;
+	const vk::Extent2D extent {std::max(1u, image.backing.extent.width >> level), std::max(1u, image.backing.extent.height >> level)};
+	for (size_t i = 0; i < g_tap.retired.size();) {
+		auto& r = g_tap.retired[i];
+		if (flip < r.flip + 8) {
+			++i;
+			continue;
+		}
+		if (r.views[0] != nullptr) graphics.device.destroyImageView(r.views[0], nullptr);
+		if (r.image != VK_NULL_HANDLE) vmaDestroyImage(graphics.allocator, r.image, r.mem);
+		r = g_tap.retired.back();
+		g_tap.retired.pop_back();
+	}
+	if (g_tap.image != VK_NULL_HANDLE && (g_tap.extent != extent || g_tap.format != fmt)) {
+		SsrPass::RetiredCopy r;
+		r.image = g_tap.image, r.mem = g_tap.mem, r.flip = flip, r.views[0] = g_tap.view;
+		g_tap.retired.push_back(r);
+		g_tap.image = VK_NULL_HANDLE, g_tap.mem = nullptr, g_tap.view = nullptr, g_tap.layout = vk::ImageLayout::eUndefined;
+	}
+	if (g_tap.image == VK_NULL_HANDLE) {
+		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		create.imageType   = VK_IMAGE_TYPE_2D;
+		create.format      = static_cast<VkFormat>(fmt);
+		create.extent      = {extent.width, extent.height, 1};
+		create.mipLevels   = 1;
+		create.arrayLayers = 1;
+		create.samples     = VK_SAMPLE_COUNT_1_BIT;
+		create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO;
+		if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_tap.image, &g_tap.mem, nullptr) != VK_SUCCESS) {
+			g_tap.image  = VK_NULL_HANDLE;
+			g_tap.failed = true;
+			return;
+		}
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = vk::Image(g_tap.image);
+		view_info.viewType         = vk::ImageViewType::e2D;
+		view_info.format           = fmt;
+		view_info.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		if (graphics.device.createImageView(&view_info, nullptr, &g_tap.view) != vk::Result::eSuccess) {
+			g_tap.view   = nullptr;
+			g_tap.failed = true;
+			return;
+		}
+		g_tap.extent = extent, g_tap.format = fmt;
+		std::printf("GBUF: tap image %ux%u %s from CS %016llx slot %d (mip %u layer %u @0x%llx)\n", extent.width, extent.height,
+		            SsrFormatName(fmt), static_cast<unsigned long long>(cs_hash), slot, level, layer,
+		            static_cast<unsigned long long>(binding.desc.info.data.address));
+		std::fflush(stdout);
+	}
+	const ImageSubresourceRange range {level, 1, layer, 1};
+	{
+		// (the dispatch's storage writes before the copy, also inside a compute chain, whose dispatches have no barriers)
+		vk::MemoryBarrier2 mb {};
+		mb.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+		mb.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite;
+		mb.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		mb.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &mb;
+		command.pipelineBarrier2(dependency);
+	}
+	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range, command);
+	const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+	                         vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::ImageMemoryBarrier2 b {};
+		b.srcStageMask        = src_stage;
+		b.srcAccessMask       = src_access;
+		b.dstStageMask        = dst_stage;
+		b.dstAccessMask       = dst_access;
+		b.oldLayout           = from;
+		b.newLayout           = to;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image               = vk::Image(g_tap.image);
+		b.subresourceRange    = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &b;
+		command.pipelineBarrier2(dependency);
+	};
+	barrier(g_tap.layout, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+	        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, level, layer, 1};
+	copy.dstSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = vk::Extent3D {extent.width, extent.height, 1};
+	command.copyImage(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, vk::Image(g_tap.image), vk::ImageLayout::eTransferDstOptimal, 1,
+	                  &copy);
+	barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
+	        vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+	g_tap.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	const vk::ImageLayout back = binding.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding.layout;
+	image.Transit(back, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range, command);
+	g_tap.flip.store(flip, std::memory_order_release);
+}
+
+bool GbufTapGet(GbufTapImage& out) {
+	const uint64_t taken = g_tap.flip.load(std::memory_order_acquire);
+	const uint64_t flips = g_flips_taken.load(std::memory_order_relaxed);
+	if (taken == ~0ull || flips > taken + 1 || g_tap.view == nullptr) return false;
+	out.view    = g_tap.view;
+	out.extent  = g_tap.extent;
+	out.integer = false;
+	return true;
 }
 
 uint32_t SsrPackedTargets(std::array<SsrTarget, 4>& targets) {
@@ -6986,6 +7201,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	RtReflectionsApply(command, inputs); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
 	ShineApply(command, inputs); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
 	GodraysApply(command, inputs); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off)
+	GbufViewApply(command, inputs); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
 	const bool  fsr  = g_sr_kind == 3;
