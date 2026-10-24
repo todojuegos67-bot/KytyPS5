@@ -455,6 +455,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${rt_reflections_header}")
 
+# KYTY_REALISM: the realism composite before the upscaler (src/local/realism.cpp; includes src/local/material.glsl).
+set(realism_source "${KYTY_SOURCE_DIR}/local/realism.comp")
+set(realism_spv "${gpu_tiler_generated_dir}/realism.spv")
+set(realism_header "${gpu_tiler_generated_dir}/realism_spv.h")
+add_custom_command(
+	OUTPUT "${realism_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        "-I${KYTY_SOURCE_DIR}/local" -o "${realism_spv}" "${realism_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${realism_spv} -DOUTPUT=${realism_header}
+	        -DSYMBOL=REALISM_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${realism_source}" "${KYTY_SOURCE_DIR}/local/material.glsl" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${realism_header}")
+
 # KYTY_RT_SHADOWS: screen-space ray-traced sun shadows before the upscaler (src/local/frame-gen.cpp).
 set(cshadow_source "${KYTY_SOURCE_DIR}/local/cshadow.comp")
 set(cshadow_spv "${gpu_tiler_generated_dir}/cshadow.spv")
@@ -552,6 +568,10 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.h"
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.cpp"
+	"${KYTY_SOURCE_DIR}/local/realism.h"
+	"${KYTY_SOURCE_DIR}/local/realism.cpp"
+	"${KYTY_SOURCE_DIR}/local/material.h"
+	"${KYTY_SOURCE_DIR}/local/material.cpp"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.cpp"
 	"${KYTY_SOURCE_DIR}/local/kbm-warp.h"

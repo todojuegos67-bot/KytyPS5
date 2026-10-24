@@ -40,6 +40,7 @@
 // zero on floors); the mask needed flat AND plain AND up-facing at once (textured wet stone failed "plain"); and the
 // composite weight was a dry dielectric's Fresnel (~0.02 seen from above).
 #include "local/rt-reflections.h"
+#include "local/realism.h"
 
 #include "graphics/presentation/videoOut.h"
 #include "gpu_tiler_shaders/rt_reflections_spv.h"
@@ -459,6 +460,7 @@ void ReadTiming(GraphicContext& graphics) {
 			break;
 		if (n >= 2 && stamps[n - 1] > stamps[0]) {
 			g_rt.sum_ms += static_cast<double>(stamps[n - 1] - stamps[0]) * g_rt.period_ns / 1e6;
+			RealismNoteGpuMs(RealismPass::RtReflections, static_cast<double>(stamps[n - 1] - stamps[0]) * g_rt.period_ns / 1e6);
 			++g_rt.samples;
 			std::array<bool, 9> seen {};
 			for (uint32_t k = 1; k < n; ++k) {
@@ -534,6 +536,23 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 // world space x screen y convention; the convention it implies is adopted) and, when its layout leaves a byte free in
 // the word, that byte as roughness (a guess: only modulating the wet-surface mask in the shader). Without a normal, the
 // floor votes (world up known) decide the y convention. True: a normal identified.
+// The byte table for the material decode (RtReflGetByteTable), from the calibration sums Analyze reads.
+RtReflByteTable g_table;
+void KeepByteTable(const int32_t* c, double n, uint32_t packed_count, double normal_fit) {
+	if (packed_count == 0 || n < 200.0) return;
+	RtReflByteTable& t = g_table;
+	t.valid = true, ++t.attempt;
+	t.samples = n, t.puddles = c[CalibWet], t.water = c[CalibWet + 17];
+	for (uint32_t f = 0; f < 16; ++f) {
+		const double m = c[CalibBytes + f * 3] / 1000.0 / n, sq = c[CalibBytes + f * 3 + 1] / 1000.0 / n;
+		t.mean[f] = m, t.sd[f] = std::sqrt(std::max(sq - m * m, 0.0));
+		t.puddle[f]     = t.puddles >= 20 ? c[CalibWet + 1 + f] / 1000.0 / t.puddles : -1.0;
+		t.water_mean[f] = t.water >= 20 ? c[CalibWet + 18 + f] / 1000.0 / t.water : -1.0;
+		for (uint32_t b = 0; b < 16; ++b) t.hist[f][b] = static_cast<uint32_t>(c[CalibHist + f * 16 + b]);
+	}
+	if (normal_fit > 0.0) t.normal_fit = normal_fit;
+}
+
 bool Analyze(GraphicContext& graphics, uint32_t packed_count) {
 	if (g_rt.mapped == nullptr) return false;
 	(void)vmaInvalidateAllocation(graphics.allocator, g_rt.frame_mem, 0, VK_WHOLE_SIZE);
@@ -568,6 +587,7 @@ bool Analyze(GraphicContext& graphics, uint32_t packed_count) {
 	            "floors %.0f (screen y as is) vs %.0f (mirrored)\n",
 	            g_rt.calib_attempts + 1, n, packed_count, std::abs(best_score), second, floors_cur, floors_mirror);
 	const bool identified = best >= 0 && std::abs(best_score) >= 0.8;
+	KeepByteTable(c, n, packed_count, identified ? std::abs(best_score) : 0.0); // (the material decode's table)
 	if (identified) {
 		if (best_score < 0.0) best |= 128;
 		if (g_rt.dec_normal < 0) g_rt.dec_normal = best;
@@ -676,6 +696,17 @@ int RtReflectionsLevel() {
 	return level;
 }
 bool RtReflectionsWanted() { return RtReflectionsLevel() > 0; }
+
+bool RtReflGetByteTable(RtReflByteTable& out) {
+	out               = g_table;
+	out.dec_normal    = g_rt.dec_normal;
+	out.dec_rough     = g_rt.dec_rough;
+	out.rough_trusted = g_rt.rough_trusted;
+	out.mat_auto      = g_rt.mat_auto;
+	out.row0_up       = g_rt.row0_up;
+	out.mat_lo = g_rt.mat_lo, out.mat_hi = g_rt.mat_hi;
+	return g_table.valid;
+}
 
 bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const int level = RtReflectionsLevel();

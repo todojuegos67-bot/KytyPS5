@@ -39,6 +39,23 @@ struct RtReflCamera {
 };
 void RtReflGetCamera(const std::array<float, 16>& view_to_clip, RtReflCamera& out);
 
+// The calibration's byte table (16 fields, index layer * 4 + byte, 8 bits each) and its decode, shared with the
+// material decode (material.cpp, KYTY_REALISM) so the statistics are taken once: mean / sd over all calibration samples,
+// the mean on puddle-looking pixels and on water (count < 20: not measured), the 16-bin histograms. Kept from the last
+// calibration attempt that had the G-buffer copy (valid false: none yet, or KYTY_RT_REFLECTIONS off).
+struct RtReflByteTable {
+	bool                                   valid = false;
+	uint32_t                               attempt = 0;
+	double                                 samples = 0.0, puddles = 0.0, water = 0.0;
+	std::array<double, 16>                 mean {}, sd {}, puddle {}, water_mean {};
+	std::array<std::array<uint32_t, 16>, 16> hist {};
+	int32_t                                dec_normal = -1, dec_rough = -1; // (the shader's codes; -1 none)
+	bool                                   rough_trusted = false, mat_auto = false, row0_up = true;
+	float                                  mat_lo = 0.15f, mat_hi = 0.30f;
+	double                                 normal_fit = 0.0; // (the decoded normal's mean cos against depth normals)
+};
+[[nodiscard]] bool RtReflGetByteTable(RtReflByteTable& out);
+
 } // namespace Libs::Graphics::FrameGen
 
 #endif // EMULATOR_SRC_LOCAL_RT_REFLECTIONS_H_

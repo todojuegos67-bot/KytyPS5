@@ -1,0 +1,447 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// KYTY_REALISM (realism.cpp, "Modo Souls realista"): a modest, physically motivated composite on the PS5 Pro path's
+// render-resolution HDR color (before the game's exposure and the upscaler), last after RT shadows, SSGI, GTAO, SSR and
+// RT reflections. It never invents detail: every term is computed from what the game already drew and stored (its lit
+// color, depth, the packed G-buffer's normal / roughness / wetness / albedo / metal (material.glsl), the RT shadow
+// pass's latched sun, the game's exposure) and is bounded, faded with distance and absent on the sky.
+//
+// Modes (push.misc.x):
+//   0 lum:       quarter-resolution local luminance (log2 mean, view depth mean, linear mean, non-sky share) of 4x4
+//                render pixels: the baseline for "what highlight the game already shows" and the local contrast
+//   1 calib:     160x90 grid on pixels whose G-buffer normal matches the depth normal: per byte of the 4 layers its
+//                correlation sums with the lit chroma, the lit luma and the roughness, its share at 0 or 1, the
+//                brightness / roughness of its set pixels (material.cpp decides albedo, metal, wetness vs gloss)
+//   2 composite: (a) sun specular on smooth / wet surfaces: GGX (correlated Smith, Schlick), the roughness widened by the
+//                G-buffer normals' local variance (specular anti-aliasing: no sparkle), the sun's irradiance from a
+//                frame-wide estimate (mode 3) times this pixel's visibility estimated from its own lit color (shadowed
+//                pixels get none); only the part above what the pixel already shows over its local baseline (the
+//                game's own highlight is not doubled), capped in display-referred units
+//                (b) GTAO's occlusion (handed over by GtaoApply) on the ambient share of the light only: none on the
+//                sun-lit share, on water, on emissive / over-white pixels; floored as GTAO's own composite
+//                (c) optional (push.params.z): gentle local contrast against an edge-aware baseline (halo guard: big
+//                steps untouched) and a filmic toe (deeper shadows below middle grey); brightening <= +0.15 stop
+//                Sky: untouched. Distance: every term fades out (fog guard). Statistics on 1 pixel in 256 every 4th frame.
+//   3 resolve:   one thread: the sun irradiance estimate (85th percentile of the sun-facing, dry, dielectric samples'
+//                implied irradiance, exposed units), smoothed (EMA in log space); the histogram cleared
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2) uniform sampler2D gdepth;   // the depth the deferred lighting read (misc.z & 2): water detection
+layout(binding = 3) uniform usampler2D packed0;
+layout(binding = 4) uniform usampler2D packed1;
+layout(binding = 5) uniform usampler2D packed2;
+layout(binding = 6) uniform usampler2D packed3;
+layout(binding = 7) uniform sampler2D ao_tex;   // GTAO's denoised visibility (.r), its trace resolution (misc.z & 16)
+layout(binding = 8) uniform sampler2D ao_geom;  // GTAO's view normal + view distance (.w) at the same resolution
+layout(binding = 9) uniform sampler2D lum_tex;  // mode 0's output
+layout(binding = 10, rgba16f) uniform writeonly image2D out_img;
+layout(binding = 11, rgba16f) uniform writeonly image2D lum_out;
+layout(std430, binding = 12) buffer Frame {
+	vec4  view_rot[3]; // world -> view rows (CPU)
+	vec4  up_view;     // world up in view space, w 1 = known (CPU)
+	ivec4 cpu_i;       // metal field code, AO trace w, h, unused (CPU)
+	vec4  cpu_f;       // sun estimate EMA alpha, ambient / sun irradiance ratio, fade start, fade end (m) (CPU)
+	vec4  gpu_state;   // sun irradiance estimate (exposed units; 0 none yet), frames without samples, last raw, samples
+	uint  hist[32];    // the estimate's histogram (half stops from 2^-6)
+	uint  stats[16];   // cumulative counters (realism.cpp reads the differences)
+	int   calib[];     // material.h MatCal* layout
+};
+layout(std430, binding = 13) readonly buffer Exposure {
+	float exposure_values[];
+};
+
+layout(push_constant) uniform Push {
+	vec4  proj;      // M[0], M[5], M[8], M[9]
+	vec4  depth_map; // A = M[10], B = M[14], C = M[11], D = M[15]
+	vec4  size;      // render w, h, lum w, h
+	vec4  sun;       // toward the sun in view space, its fade (0 none)
+	vec4  params;    // specular strength, AO strength, tone intensity, material fade (decode changes ramp in)
+	vec4  params2;   // smooth below, rough from (roughness), wet from, wet at (wet field)
+	ivec4 misc;      // mode, frame, flags (1 G-buffer, 2 water depth, 4 row 0 = NDC y +1, 8 sun, 16 AO, 32 stats frame), exposure index
+	ivec4 dec;       // normal, roughness, wetness, albedo codes (material.glsl; -1 none)
+} push;
+
+const float PI = 3.14159265;
+// (material.h's MatCal* layout)
+const int MatCalN      = 0;
+const int MatCalChroma = 1;
+const int MatCalField  = 9;
+const int MatCalPer    = 11;
+const int MatCalRough  = MatCalField + 16 * MatCalPer;
+
+uint Packed(int layer, ivec2 p) {
+	if (layer == 0) return texelFetch(packed0, p, 0).r;
+	if (layer == 1) return texelFetch(packed1, p, 0).r;
+	if (layer == 2) return texelFetch(packed2, p, 0).r;
+	return texelFetch(packed3, p, 0).r;
+}
+#include "material.glsl"
+
+vec2  RenderSize() { return push.size.xy; }
+vec2  LumSize() { return push.size.zw; }
+bool  Flag(int f) { return (push.misc.z & f) != 0; }
+float YS() { return Flag(4) ? -1.0 : 1.0; }
+float ViewZ(float d) {
+	float den = d * push.depth_map.z - push.depth_map.x;
+	return abs(den) > 1e-12 ? (push.depth_map.y - d * push.depth_map.w) / den : 1e6;
+}
+vec3 ViewPos(vec2 uv, float d) {
+	float z  = ViewZ(d);
+	float w  = z * push.depth_map.z + push.depth_map.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	nd.y *= YS();
+	return vec3((nd.x * w - z * push.proj.z) / push.proj.x, (nd.y * w - z * push.proj.w) / push.proj.y, z);
+}
+bool  IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e3; }
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+bool  BadV(vec3 v) { return any(isnan(v)) || any(isinf(v)); }
+vec3  SafeColor(vec3 c) { return BadV(c) ? vec3(0) : clamp(c, vec3(0), vec3(6.0e4)); }
+float GameExposure() {
+	float e = exposure_values[push.misc.w];
+	return (e > 1e-12 && e < 1e12) ? e : 1.0;
+}
+ivec2 RenderPixel(vec2 uv) { return clamp(ivec2(uv * RenderSize()), ivec2(0), ivec2(RenderSize()) - 1); }
+float DepthAt(vec2 uv) { return texelFetch(depth_tex, RenderPixel(uv), 0).r; }
+vec3  ToView(vec3 n) { return MatUnit(vec3(dot(view_rot[0].xyz, n), dot(view_rot[1].xyz, n), dot(view_rot[2].xyz, n))); }
+
+// The depth normal facing the camera (the smaller step each way: no smearing across silhouettes).
+vec3 NormalAt(vec2 uv, vec3 p) {
+	vec2  t  = 1.0 / RenderSize();
+	vec3  px = ViewPos(uv + vec2(t.x, 0), DepthAt(uv + vec2(t.x, 0)));
+	vec3  nx = ViewPos(uv - vec2(t.x, 0), DepthAt(uv - vec2(t.x, 0)));
+	vec3  py = ViewPos(uv + vec2(0, t.y), DepthAt(uv + vec2(0, t.y)));
+	vec3  ny = ViewPos(uv - vec2(0, t.y), DepthAt(uv - vec2(0, t.y)));
+	vec3  dx = abs(px.z - p.z) < abs(p.z - nx.z) ? px - p : p - nx;
+	vec3  dy = abs(py.z - p.z) < abs(p.z - ny.z) ? py - p : p - ny;
+	vec3  n  = cross(dx, dy);
+	float l  = length(n);
+	if (!(l > 1e-12)) return normalize(-p);
+	n /= l;
+	if (dot(n, -p) < 0.0) n = -n;
+	return n;
+}
+// The G-buffer's shading normal in view space at a pixel (false: none decoded).
+bool GbufNormal(ivec2 p, out vec3 n) {
+	bool world;
+	if (!Flag(1) || !MatNormalRaw(push.dec.x, p, n, world)) return false;
+	if (world) n = ToView(n);
+	return true;
+}
+float UpFacing(vec3 Nd) {
+	if (up_view.w > 0.5) return smoothstep(0.80, 0.95, dot(Nd, up_view.xyz));
+	return smoothstep(0.80, 0.95, abs(Nd.y));
+}
+// Water (or anything drawn after the G-buffer on an up-facing surface): the final depth nearer by >= 2 %.
+float WaterMask(ivec2 p, float d, vec3 Nd) {
+	if (!Flag(2)) return 0.0;
+	float d0 = texelFetch(gdepth, p, 0).r;
+	float z = abs(ViewZ(d)), z0 = IsSky(d0) ? 1e5 : abs(ViewZ(d0));
+	return smoothstep(0.02, 0.05, (z0 - z) / max(z, 1e-3)) * UpFacing(Nd);
+}
+
+// ---- statistics (subgroup-reduced) ----
+void Stat(int k, uint v) {
+	uint s = subgroupAdd(v);
+	if (subgroupElect() && s != 0u) atomicAdd(stats[k], s);
+}
+void Acc(int i, float v) {
+	int s = subgroupAdd(int(v * 1000.0));
+	if (subgroupElect() && s != 0) atomicAdd(calib[i], s);
+}
+void AccN(int i, bool on) {
+	int s = subgroupAdd(on ? 1 : 0);
+	if (subgroupElect() && s != 0) atomicAdd(calib[i], s);
+}
+
+// ---- mode 0: local luminance ----
+void Lum(ivec2 q) {
+	float lsum = 0.0, zsum = 0.0, ysum = 0.0, n = 0.0;
+	ivec2 base = q * 4, mx = ivec2(RenderSize()) - 1;
+	for (int y = 0; y < 4; ++y)
+		for (int x = 0; x < 4; ++x) {
+			ivec2 p = min(base + ivec2(x, y), mx);
+			float d = texelFetch(depth_tex, p, 0).r;
+			if (IsSky(d)) continue;
+			float l = Luma(SafeColor(texelFetch(color_tex, p, 0).rgb));
+			lsum += log2(max(l, 1e-8));
+			ysum += l;
+			zsum += abs(ViewZ(d));
+			n += 1.0;
+		}
+	imageStore(lum_out, q, n > 0.0 ? vec4(lsum / n, zsum / n, ysum / n, n / 16.0) : vec4(-30.0, 1e5, 0.0, 0.0));
+}
+
+// ---- mode 1: calibration ----
+void Calibrate(ivec2 gp) {
+	bool  ok = gp.x < 160 && gp.y < 90 && Flag(1);
+	vec2  uv = (vec2(gp) + 0.5) / vec2(160.0, 90.0);
+	ivec2 p  = RenderPixel(uv);
+	float d  = DepthAt(uv);
+	ok       = ok && !IsSky(d);
+	vec3 c   = vec3(0);
+	float Yt = 0.0, rough = 0.5;
+	if (ok) {
+		vec3 P  = ViewPos(uv, d);
+		vec3 Nd = NormalAt(uv, P), Ng;
+		ok      = GbufNormal(p, Ng) && dot(Ng, Nd) > 0.9 && WaterMask(p, d, Nd) < 0.5;
+		c       = SafeColor(texelFetch(color_tex, p, 0).rgb);
+		float Ye = Luma(c) * GameExposure();
+		ok       = ok && Ye > 0.01 && Ye < 8.0; // (too dark: chroma is noise; over white: lights)
+		Yt       = Ye / (1.0 + Ye);
+		if (push.dec.y >= 0) rough = clamp(MatField(push.dec.y, p), 0.0, 1.0);
+	}
+	float s   = ok ? 1.0 : 0.0;
+	vec3  chr = ok ? c / max(c.r + c.g + c.b, 1e-8) : vec3(0);
+	Acc(MatCalN, s);
+	Acc(MatCalChroma + 0, chr.r), Acc(MatCalChroma + 1, chr.g), Acc(MatCalChroma + 2, chr.b);
+	Acc(MatCalChroma + 3, chr.r * chr.r), Acc(MatCalChroma + 4, chr.g * chr.g), Acc(MatCalChroma + 5, chr.b * chr.b);
+	Acc(MatCalChroma + 6, s * Yt), Acc(MatCalChroma + 7, s * Yt * Yt);
+	Acc(MatCalRough, s * rough), Acc(MatCalRough + 1, s * rough * rough);
+	for (int layer = 0; layer < 4; ++layer) {
+		uint w = ok ? Packed(layer, p) : 0u;
+		for (int b = 0; b < 4; ++b) {
+			float v  = MatBits(w, b * 8, 8) * s;
+			int   o  = MatCalField + (layer * 4 + b) * MatCalPer;
+			float hi = v > 0.5 ? s : 0.0;
+			Acc(o + 0, v), Acc(o + 1, v * v);
+			Acc(o + 2, v * chr.r), Acc(o + 3, v * chr.g), Acc(o + 4, v * chr.b);
+			Acc(o + 5, v * Yt);
+			AccN(o + 6, ok && (v < 0.08 || v > 0.92)); // (counts)
+			AccN(o + 7, ok && v > 0.5);
+			Acc(o + 8, hi * Yt), Acc(o + 9, hi * rough), Acc(o + 10, v * rough);
+		}
+	}
+}
+
+// ---- mode 2: composite ----
+float D_Ggx(float nh, float a2) {
+	float k = nh * nh * (a2 - 1.0) + 1.0;
+	return a2 / max(PI * k * k, 1e-8);
+}
+float V_SmithCorrelated(float nv, float nl, float a2) {
+	float gv = nl * sqrt(nv * nv * (1.0 - a2) + a2);
+	float gl = nv * sqrt(nl * nl * (1.0 - a2) + a2);
+	return 0.5 / max(gv + gl, 1e-6);
+}
+float AoUpsample(vec2 uv, float z) {
+	vec2  ts = vec2(cpu_i.yz);
+	vec2  tc = uv * ts - 0.5;
+	vec2  f  = fract(tc);
+	ivec2 b  = ivec2(floor(tc)), mx = ivec2(ts) - 1;
+	float sum = 0.0, wsum = 0.0;
+	for (int i = 0; i < 4; ++i) {
+		ivec2 o  = ivec2(i & 1, i >> 1);
+		ivec2 q  = clamp(b + o, ivec2(0), mx);
+		float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+		float tz = texelFetch(ao_geom, q, 0).w;
+		float w  = (bw + 1e-3) / (1e-3 + abs(tz - z) / max(z * 0.02, 1e-3));
+		sum += texelFetch(ao_tex, q, 0).r * w;
+		wsum += w;
+	}
+	float ao = sum / max(wsum, 1e-6);
+	return (isnan(ao) || isinf(ao)) ? 1.0 : clamp(ao, 0.0, 1.0);
+}
+
+void Composite(ivec2 px) {
+	vec4  col     = texelFetch(color_tex, px, 0);
+	bool  sampled = Flag(32) && ((px.x | px.y) & 15) == 0; // (1 pixel in 256, on stats frames)
+	float d       = texelFetch(depth_tex, px, 0).r;
+	vec3  c       = SafeColor(col.rgb);
+	vec2  uv      = (vec2(px) + 0.5) / RenderSize();
+	float z       = abs(ViewZ(d));
+	// Sky and far geometry / fog: untouched (fade start / end in cpu_f.zw).
+	float fade = IsSky(d) ? 0.0 : 1.0 - smoothstep(cpu_f.z, cpu_f.w, z);
+	if (fade <= 0.0 || BadV(col.rgb)) {
+		imageStore(out_img, px, col);
+		Stat(10, sampled && IsSky(d) ? 1u : 0u);
+		return;
+	}
+	float E  = GameExposure();
+	vec3  P  = ViewPos(uv, d);
+	vec3  V  = normalize(-P);
+	vec3  Nd = NormalAt(uv, P);
+	vec3  N  = Nd, Ng;
+	bool  match = GbufNormal(px, Ng) && dot(Ng, Nd) > 0.6;
+	float water = WaterMask(px, d, Nd);
+	if (water > 0.5) match = false; // (the G-buffer holds the bed under the water)
+	if (match) N = Ng;
+	float nv = dot(N, V);
+	if (nv < 0.02) N = normalize(N + V * (0.03 - nv)), nv = dot(N, V);
+	nv = clamp(nv, 1e-3, 1.0);
+
+	// Material (material.glsl codes; without a match: a rough dielectric, nothing smooth).
+	float rough = 1.0, wet = 0.0, metal = 0.0;
+	vec3  alb   = vec3(-1.0);
+	if (match) {
+		rough = push.dec.y >= 0 ? clamp(MatField(push.dec.y, px), 0.0, 1.0) : 1.0;
+		wet   = push.dec.z >= 0 ? smoothstep(push.params2.z, push.params2.w, MatField(push.dec.z, px)) : 0.0;
+		alb   = MatAlbedo(push.dec.w, px);
+		metal = cpu_i.x >= 0 ? step(0.5, MatField(cpu_i.x, px)) : 0.0;
+	}
+	rough        = mix(rough, 0.05, water);
+	wet          = max(wet, water);
+	metal       *= 1.0 - water;
+	float smooth_ = max(1.0 - smoothstep(push.params2.x, push.params2.y, rough), wet) * push.params.w;
+
+	// The pixel's incident irradiance (sun + ambient), from its own lit color and its albedo (the G-buffer's; without
+	// one, the lit chroma at a mid reflectance, as SSGI assumes).
+	// (A metal's diffuse is black: its stored colour stands in, a conservative visibility proxy: dark in shadow.)
+	float Ly   = Luma(c);
+	vec3  dalb = alb.x >= 0.0 ? alb : clamp(c / max(Ly, 1e-8), vec3(0), vec3(2)) * 0.3;
+	float ay   = max(Luma(dalb), 0.04);
+	float Iy   = PI * Ly / ay;
+	float amb  = cpu_f.y; // (ambient irradiance as a share of the sun's)
+	bool  sun  = Flag(8) && push.sun.w > 0.0;
+	float nl   = sun ? dot(N, push.sun.xyz) : 0.0;
+	float Es   = gpu_state.x > 0.0 ? gpu_state.x / E : 0.0; // (HDR units)
+	// Visibility of the sun at this pixel (0: in shadow), from the irradiance it shows: E = Es (N.L vis + amb).
+	float vis  = sun && Es > 0.0 && nl > 0.0 ? clamp((Iy / Es - amb) / max(nl, 0.05), 0.0, 1.0) : 0.0;
+	// The estimate's samples: sun-facing, dry, rough dielectrics matched to the G-buffer.
+	bool  est  = sampled && sun && match && nl > 0.5 && water <= 0.0 && metal < 0.5 && smooth_ < 0.2 && Ly > 0.0;
+	if (est) {
+		float s = Iy / (nl + amb) * E;
+		atomicAdd(hist[clamp(int((log2(max(s, 1e-8)) + 6.0) * 2.0), 0, 31)], 1u);
+	}
+
+	// (b) occlusion: GTAO's, on the ambient share only.
+	float k = 1.0;
+	if (Flag(16)) {
+		float ao       = smoothstep(0.0, 1.0, AoUpsample(uv, z));
+		float ambient  = sun && Es > 0.0 ? amb / (max(nl, 0.0) * vis + amb) : 1.0;
+		float emissive = smoothstep(1.5, 4.0, Ly * E); // (over white: lights, fire, glints)
+		float w        = (1.0 - smoothstep(30.0, 90.0, z)) * ambient * (1.0 - water) * (1.0 - emissive) * (1.0 - 0.5 * smooth_);
+		k              = max(mix(1.0, ao, 0.5 * push.params.y * w), 0.55);
+		k              = (isnan(k) || isinf(k)) ? 1.0 : clamp(k, 0.0, 1.0);
+	}
+	vec3 rgb = c * k;
+
+	// (c) local contrast + filmic toe (before the highlight, so the highlight is not changed by it).
+	float tone_d = 0.0;
+	vec4  lc0    = textureLod(lum_tex, uv, 0);
+	if (push.params.z > 0.0) {
+		vec2  lt = 2.0 / LumSize();
+		float bsum = 0.0, bw = 0.0;
+		for (int i = 0; i < 5; ++i) {
+			vec2  o = i == 0 ? vec2(0) : vec2(i == 1 ? lt.x : i == 2 ? -lt.x : 0.0, i == 3 ? lt.y : i == 4 ? -lt.y : 0.0);
+			vec4  s = i == 0 ? lc0 : textureLod(lum_tex, uv + o, 0);
+			float w = s.w * exp(-abs(s.y - z) / max(0.05 * z, 0.05)); // (edge-aware: the same surface's depth)
+			bsum += s.x * w;
+			bw += w;
+		}
+		if (bw > 1e-3) {
+			vec2  h  = 0.5 / RenderSize();
+			float ys = 0.25 * (Luma(SafeColor(textureLod(color_tex, uv + vec2(h.x, h.y), 0).rgb)) +
+			                   Luma(SafeColor(textureLod(color_tex, uv + vec2(-h.x, h.y), 0).rgb)) +
+			                   Luma(SafeColor(textureLod(color_tex, uv + vec2(h.x, -h.y), 0).rgb)) +
+			                   Luma(SafeColor(textureLod(color_tex, uv + vec2(-h.x, -h.y), 0).rgb)));
+			float detail = clamp(log2(max(ys * k, 1e-8)) - bsum / bw, -2.0, 2.0);
+			float t      = push.params.z;
+			float lcd    = 0.25 * t * (1.0 - smoothstep(25.0, 80.0, z)) * exp(-0.5 * detail * detail) * detail;
+			float x      = log2(max(Ly * k * E, 1e-8) / 0.18); // (stops from middle grey, display-referred)
+			float toe    = 0.08 * t * x * (1.0 - smoothstep(-2.0, 0.0, x)) * smoothstep(-8.0, -5.0, x);
+			tone_d       = clamp((lcd + toe) * fade, -0.35, 0.15);
+			rgb *= exp2(tone_d);
+		}
+	}
+
+	// (a) the sun's specular on smooth / wet surfaces, only what is missing.
+	float added = 0.0;
+	if (sun && nl > 0.0 && vis > 0.0 && smooth_ > 0.0 && push.params.x > 0.0) {
+		// Specular anti-aliasing: the G-buffer normals' spread around (Toksvig-style) widens the lobe.
+		vec3  ns = N;
+		ivec2 mx = ivec2(RenderSize()) - 1;
+		for (int i = 0; i < 4; ++i) {
+			ivec2 q = clamp(px + ivec2(i == 0 ? 1 : i == 1 ? -1 : 0, i == 2 ? 1 : i == 3 ? -1 : 0), ivec2(0), mx);
+			vec3  n2;
+			ns += match && GbufNormal(q, n2) && dot(n2, N) > 0.3 ? n2 : N;
+		}
+		float len = length(ns) / 5.0;
+		float var = (1.0 - len) / max(len, 1e-3);
+		// (A floor of 0.2: a sharper lobe than the sun disk plus a pixel's normal spread would only sparkle.)
+		float pr  = max(rough, 0.2);
+		float a2  = clamp(pr * pr * pr * pr + min(2.0 * var, 0.18), 1e-4, 1.0);
+		vec3  L   = push.sun.xyz;
+		vec3  H   = normalize(L + V);
+		float nh  = clamp(dot(N, H), 0.0, 1.0), vh = clamp(dot(V, H), 0.0, 1.0);
+		vec3  f0  = mix(vec3(water > 0.5 ? 0.02 : 0.04), alb.x >= 0.0 ? alb : vec3(0.56), metal);
+		vec3  F   = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
+		vec3  spec = D_Ggx(nh, a2) * V_SmithCorrelated(nv, nl, a2) * F * nl * Es * vis;
+		// The light's colour: the pixel's incident light chroma when the albedo is known, else white.
+		vec3  lc   = alb.x >= 0.0 ? clamp(c / max(dalb, vec3(0.02)), vec3(0), vec3(1e6)) : vec3(1);
+		lc        /= max(Luma(lc), 1e-8);
+		lc         = mix(vec3(1), clamp(lc, vec3(0), vec3(3)), 0.5);
+		lc        *= F / max(Luma(F), 1e-6); // (a metal's highlight takes its colour)
+		lc        /= max(Luma(lc), 1e-6);
+		float want = Luma(spec) * push.params.x * smooth_ * fade * push.sun.w;
+		// What the game already shows: the pixel above its local mean (its own highlight is not doubled).
+		float have = max(Ly - 1.25 * lc0.z, 0.0);
+		float addy = max(want - have, 0.0);
+		addy       = min(addy, min(4.0 * Ly + 0.02 / E, 1.5 / E)); // (bounded: <= 1.5 display-referred)
+		added      = (isnan(addy) || isinf(addy)) ? 0.0 : addy;
+		rgb += lc * added;
+	}
+	if (BadV(rgb)) rgb = c;
+	imageStore(out_img, px, vec4(clamp(rgb, vec3(0), vec3(6.0e4)), col.a));
+
+	uint sm = sampled ? 1u : 0u;
+	Stat(0, sm);
+	Stat(1, match ? sm : 0u);
+	Stat(2, water > 0.5 ? sm : 0u);
+	Stat(3, metal > 0.5 ? sm : 0u);
+	Stat(4, smooth_ > 0.5 ? sm : 0u);
+	Stat(5, added * E > 0.01 ? sm : 0u);
+	Stat(6, sampled ? uint(min(added * E, 10.0) * 1000.0) : 0u);
+	Stat(7, sampled ? uint((1.0 - k) * 1000.0) : 0u);
+	Stat(8, sampled ? uint(abs(tone_d) * 1000.0) : 0u);
+	Stat(9, est ? 1u : 0u);
+	Stat(11, sampled && vis > 0.5 ? 1u : 0u);
+}
+
+// ---- mode 3: the sun irradiance estimate ----
+void Resolve() {
+	uint total = 0u;
+	for (int i = 0; i < 32; ++i) total += hist[i];
+	if (total >= 48u) {
+		uint want = (total * 85u) / 100u, acc = 0u;
+		int  bin  = 31;
+		for (int i = 0; i < 32; ++i) {
+			acc += hist[i];
+			if (acc >= want) {
+				bin = i;
+				break;
+			}
+		}
+		float s    = exp2((float(bin) + 0.5) * 0.5 - 6.0);
+		float prev = gpu_state.x;
+		gpu_state.x = prev > 0.0 ? exp2(mix(log2(prev), log2(s), cpu_f.x)) : s;
+		gpu_state.y = 0.0;
+		gpu_state.z = s;
+		gpu_state.w = float(total);
+	} else {
+		gpu_state.y += 1.0;
+		// (no sun-facing samples for ~20 s of resolves (every 4th frame): the estimate is dropped, the highlight with it)
+		if (gpu_state.y > 300.0) gpu_state.x = 0.0;
+	}
+	for (int i = 0; i < 32; ++i) hist[i] = 0u;
+}
+
+void main() {
+	ivec2 p    = ivec2(gl_GlobalInvocationID.xy);
+	int   mode = push.misc.x;
+	if (mode == 1) {
+		Calibrate(p);
+		return;
+	}
+	if (mode == 3) {
+		if (p.x == 0 && p.y == 0) Resolve();
+		return;
+	}
+	ivec2 size = ivec2(mode == 0 ? LumSize() : RenderSize());
+	if (p.x >= size.x || p.y >= size.y) return;
+	if (mode == 0) Lum(p);
+	else Composite(p);
+}

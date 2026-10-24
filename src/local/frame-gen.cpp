@@ -26,6 +26,7 @@
 #include "gpu_tiler_shaders/gtao_spv.h"
 #include "gpu_tiler_shaders/ssr_spv.h"
 #include "local/rt-reflections.h"
+#include "local/realism.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
 #include "kernel/memory.h"
 #include <string>
@@ -4138,6 +4139,7 @@ void SsgiReadTiming() {
 		                                               vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
 			break;
 		g_ssgi.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_ssgi.period_ns / 1e6;
+		RealismNoteGpuMs(RealismPass::Ssgi, static_cast<double>(stamps[1] - stamps[0]) * g_ssgi.period_ns / 1e6);
 		++g_ssgi.samples;
 		++g_ssgi.read;
 	}
@@ -4451,6 +4453,7 @@ void GtaoReadTiming() {
 		                                               vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
 			break;
 		g_gtao.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_gtao.period_ns / 1e6;
+		RealismNoteGpuMs(RealismPass::Gtao, static_cast<double>(stamps[1] - stamps[0]) * g_gtao.period_ns / 1e6);
 		++g_gtao.samples;
 		++g_gtao.read;
 	}
@@ -4587,7 +4590,9 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		run(2, *src, g.tmp_b, *dst, g.tmp_b, g.count[cur], g.tmp_b, static_cast<float>(1 << i), g.trace);
 		src = dst;
 	}
-	run(4, *src, g.tmp_b, g.out, g.tmp_b, g.count[cur], g.tmp_b, 0.0f, g.render);                            // composite
+	// KYTY_REALISM: the occlusion handed to its composite (on the ambient share of the light only), not composited here.
+	const bool handoff = RealismTakesAo();
+	if (!handoff) run(4, *src, g.tmp_b, g.out, g.tmp_b, g.count[cur], g.tmp_b, 0.0f, g.render); // composite
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
 	if (timed) {
@@ -4596,6 +4601,16 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	++g_gtao.frame;
 	g_gtao.history_valid = true;
+	if (handoff) {
+		RealismSetAo({src->view, g.gbuf[cur].view, g.trace, strength});
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("GTAO: occlusion handed to KYTY_REALISM's composite (ambient share only)\n");
+			std::fflush(stdout);
+		}
+		return true;
+	}
 	inputs.color.image  = g_gtao.out.image.image;
 	inputs.color.view   = g_gtao.out.view;
 	inputs.color.layout = vk::ImageLayout::eGeneral;
@@ -4946,6 +4961,7 @@ void SsrReadTiming() {
 		                                               vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
 			break;
 		g_ssr.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_ssr.period_ns / 1e6;
+		RealismNoteGpuMs(RealismPass::Ssr, static_cast<double>(stamps[1] - stamps[0]) * g_ssr.period_ns / 1e6);
 		++g_ssr.samples;
 		++g_ssr.read;
 	}
@@ -5391,7 +5407,7 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 }
 } // namespace
 
-bool SsrWanted() { return SsrLevel() > 0 || RtReflectionsWanted(); }
+bool SsrWanted() { return SsrLevel() > 0 || RtReflectionsWanted() || RealismWanted(); } // (KYTY_REALISM: the G-buffer copy)
 bool SsrPassWanted() { return SsrLevel() > 0; }
 
 void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
@@ -5509,7 +5525,7 @@ bool SsrIsDepthFormat(vk::Format f) {
 // size) copied right after the G-buffer layers, in the same command buffer.
 void SsrCaptureDepth(TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash, std::span<const TextureBinding> images,
                      uint32_t width, uint32_t height, uint64_t flip) {
-	if (!RtReflectionsWanted() || g_ssr.depth_failed || g_graphics_ctx == nullptr) return;
+	if ((!RtReflectionsWanted() && !RealismWanted()) || g_ssr.depth_failed || g_graphics_ctx == nullptr) return;
 	static bool listed = false;
 	if (!listed) {
 		// (once: what the consumer binds, for the next look at its inputs)
@@ -6320,6 +6336,7 @@ void CShadowReadTiming() {
 		                                               vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
 			break;
 		g_cs.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_cs.period_ns / 1e6;
+		RealismNoteGpuMs(RealismPass::RtShadows, static_cast<double>(stamps[1] - stamps[0]) * g_cs.period_ns / 1e6);
 		++g_cs.samples;
 		++g_cs.read;
 	}
@@ -6776,6 +6793,9 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const auto l_view = ToView(view, g_cs.latch_axis);
 	push.extra[1] = static_cast<float>(l_view[0]), push.extra[2] = static_cast<float>(l_view[1]), push.extra[3] = static_cast<float>(l_view[2]);
 	push.trace[2] = strength * g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade); // (smoothstep fade)
+	// (KYTY_REALISM: the same sun, in the same view space and screen y convention, for its specular)
+	RealismSetSun({true, {static_cast<float>(l_view[0]), static_cast<float>(l_view[1]), static_cast<float>(l_view[2])},
+	               g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade), hyp < 6});
 	if (!g_cs.said_on) {
 		g_cs.said_on = true;
 		static const char* axes[] {"+x", "-x", "+y", "-y", "+z", "-z"};
@@ -6845,6 +6865,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	GtaoApply(command, inputs); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
 	SsrApply(command, inputs); // (KYTY_SSR: likewise, after GTAO; nothing when off)
 	RtReflectionsApply(command, inputs); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
+	RealismApply(command, inputs); // (KYTY_REALISM: last, realism.cpp: sun specular, GTAO on the ambient share, tone; nothing when off)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
 	const bool  fsr  = g_sr_kind == 3;
