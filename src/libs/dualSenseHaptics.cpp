@@ -21,9 +21,12 @@ namespace Libs::Controller::DualSenseHaptics {
 namespace {
 
 // PKEY_DeviceInterface_FriendlyName: the device's own name, "USB\VID_054C&PID_0CE6&MI_00" for the
-// pad's audio interface. The endpoint's own name (PKEY_Device_FriendlyName) is just "Speakers".
+// pad's audio interface. The endpoint's own name (PKEY_Device_DeviceDesc) is just "Speakers".
 constexpr PROPERTYKEY PKEY_INTERFACE_FRIENDLY_NAME = {
     {0xb3f8fa53, 0x0004, 0x438e, {0x90, 0x03, 0x51, 0xa4, 0x6e, 0x13, 0x9b, 0xfc}}, 2};
+// PKEY_Device_FriendlyName: the endpoint's whole name, "Speakers (DualSense Wireless Controller)".
+constexpr PROPERTYKEY PKEY_DEVICE_FRIENDLY_NAME = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
 
 // The pad's USB interface path, as both the audio driver and the registry report it: a DualSense's, or a DualSense
 // Edge's (the same four channels; matched on Bluetooth already, while wired it vibrated nowhere).
@@ -56,6 +59,11 @@ uint32_t   g_channel_count = 2;
 uint32_t   g_speaker_first_channel = 0;
 uint32_t   g_speaker_channel_count = 2;
 float      g_speaker_gain          = 8.0f;
+
+std::string Lower(std::string text) {
+	for (auto& c: text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	return text;
+}
 
 std::string Narrow(const wchar_t* text) {
 	std::string out;
@@ -293,7 +301,12 @@ IMMDevice* FindEndpoint() {
 	UINT  count   = 0;
 	collection->GetCount(&count);
 
-	IMMDevice* matched = nullptr;
+	// By its interface path (any case), else by its name: issue #146's wired pad was listed by SDL as "Speakers
+	// (DualSense Wireless Controller)" while no path here named its USB id, and it never vibrated.
+	IMMDevice*  matched = nullptr;
+	IMMDevice*  by_name = nullptr;
+	uint32_t    names   = 0;
+	std::string named;
 	for (UINT i = 0; i < count; i++) {
 		IMMDevice* device = nullptr;
 		if (FAILED(collection->Item(i, &device)) || device == nullptr) {
@@ -301,22 +314,30 @@ IMMDevice* FindEndpoint() {
 		}
 
 		IPropertyStore* store = nullptr;
-		bool            is_pad = false;
+		bool            is_pad = false, has_name = false;
+		std::string     path, name;
 		if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &store)) && store != nullptr) {
 			PROPVARIANT value;
 			PropVariantInit(&value);
 			if (SUCCEEDED(store->GetValue(PKEY_INTERFACE_FRIENDLY_NAME, &value)) &&
 			    value.vt == VT_LPWSTR && value.pwszVal != nullptr) {
-				const auto path = Narrow(value.pwszVal);
-				is_pad          = std::ranges::any_of(PAD_DEVICE_PATHS,
-				                                      [&](const char* pad) { return path.find(pad) != std::string::npos; });
-				if (g_log) {
-					std::printf("DualSense: endpoint %u: %s%s\n", i, path.c_str(),
-					            is_pad ? "  <- the pad" : "");
-				}
+				path   = Lower(Narrow(value.pwszVal));
+				is_pad = std::ranges::any_of(PAD_DEVICE_PATHS,
+				                             [&](const char* pad) { return path.find(Lower(pad)) != std::string::npos; });
+			}
+			PropVariantClear(&value);
+			PropVariantInit(&value);
+			if (SUCCEEDED(store->GetValue(PKEY_DEVICE_FRIENDLY_NAME, &value)) && value.vt == VT_LPWSTR &&
+			    value.pwszVal != nullptr) {
+				name     = Narrow(value.pwszVal);
+				has_name = Lower(name).find("dualsense") != std::string::npos;
 			}
 			PropVariantClear(&value);
 			store->Release();
+		}
+		if (g_log) {
+			std::printf("DualSense: endpoint %u: %s (%s)%s\n", i, path.c_str(), name.c_str(),
+			            is_pad ? "  <- the pad" : has_name ? "  <- named the pad" : "");
 		}
 
 		if (is_pad) {
@@ -332,7 +353,22 @@ IMMDevice* FindEndpoint() {
 			matched = device;
 			continue;
 		}
+		if (has_name && names++ == 0) {
+			by_name = device;
+			named   = path + " (" + name + ")";
+			continue;
+		}
 		device->Release();
+	}
+	if (matched == nullptr && by_name != nullptr && names == 1) {
+		std::printf("DualSense: the pad's endpoint found by its name, not its USB id: %s\n", named.c_str());
+		matched = by_name;
+		by_name = nullptr;
+	} else if (names > 1 && matched == nullptr) {
+		std::printf("DualSense: %u endpoints named like the pad and none by its USB id, none is used\n", names);
+	}
+	if (by_name != nullptr) {
+		by_name->Release();
 	}
 
 	collection->Release();

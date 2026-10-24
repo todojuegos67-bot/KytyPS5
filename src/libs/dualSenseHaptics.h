@@ -11,9 +11,10 @@
 // emulator never opened it, so the guest's vibration port (AUDIO_OUT_PORT_TYPE_VIBRATION) went
 // nowhere and the pad never vibrated.
 //
-// This is the Windows implementation (WASAPI, through the endpoint the pad's USB ID names). The
-// endpoint cannot be picked by name: Windows calls the pad's endpoint and the machine's speakers
-// both "Speakers"/"扬声器" (see the notes). Linux keeps using SDL's device list.
+// This is the Windows implementation (WASAPI, through the endpoint the pad's USB ID names, or, where no
+// endpoint's path holds it, the one whose whole name names the pad: "扬声器 (DualSense Wireless
+// Controller)"; the short name is "Speakers"/"扬声器" for the machine's speakers too). Linux keeps
+// using SDL's device list.
 //
 // Environment and dualsense-haptics.txt (the file wins; both optional):
 //   KYTY_DUALSENSE_HAPTICS=0|1     off when 0 (default: on)
