@@ -112,7 +112,7 @@ void Trace(ivec2 pixel) {
 
 	int   q     = push.misc.z;
 	int   rays  = q >= 3 ? 5 : q >= 2 ? 3 : 1;
-	int   steps = q >= 3 ? 28 : q >= 2 ? 16 : 10;
+	int   steps = q >= 3 ? 32 : q >= 2 ? 22 : 12;
 	// World radius grown with view depth (distant pixels keep a radius of a few screen pixels, not a tiny noisy one).
 	float len   = push.extra.y * max(1.0, abs(p.z) * 0.08);
 	float thick = push.extra.z * max(1.0, abs(p.z) * 0.02);
@@ -159,9 +159,16 @@ void Trace(ivec2 pixel) {
 					float hd = abs(hq.z) - abs(ViewZ(textureLod(depth_tex, pr.xy, 0).r));
 					if (hd < 0.0 || hd > thick) { k_prev = k; continue; } // thin-object miss
 				}
+				// Leak guard: a hit surface facing away from the ray (its back, seen through a thin object) gives no light.
+				vec3 hp = ViewPos(pr.xy, textureLod(depth_tex, pr.xy, 0).r);
+				if (dot(NormalAt(pr.xy, hp), dir) > 0.2) { k_prev = k; continue; }
 				float fall = 1.0 - kh * kh;
 				occl  = fall;
-				hit_c = textureLod(color_tex, pr.xy, 0).rgb * fall;
+				// Bounce falls off more gently than AO so lit walls and fire reach further; faded near the screen edges
+				// (no halo where the hit is about to leave the view).
+				vec2  e    = min(pr.xy, 1.0 - pr.xy);
+				float edge = smoothstep(0.0, 0.06, min(e.x, e.y));
+				hit_c = textureLod(color_tex, pr.xy, 0).rgb * (1.0 - kh * kh * kh * kh) * edge;
 				break;
 			}
 			k_prev = k;
@@ -173,7 +180,7 @@ void Trace(ivec2 pixel) {
 	vis /= float(rays);
 	// Fireflies: hits clamped in luminance before anything accumulates them.
 	float l = Luma(bounce);
-	if (l > 2.0) bounce *= 2.0 / l;
+	if (l > 3.0) bounce *= 3.0 / l;
 	imageStore(out_img, pixel, vec4(max(bounce, vec3(0)), vis));
 }
 
@@ -313,7 +320,7 @@ void Composite(ivec2 pixel) {
 	}
 	float z  = abs(ViewZ(d));
 	// Distance fade (linear view depth): no GI or AO on far geometry / fog, which it only washes out.
-	float fade = 1.0 - smoothstep(30.0, 90.0, z);
+	float fade = 1.0 - smoothstep(40.0, 120.0, z);
 	if (fade <= 0.0) {
 		imageStore(out_img, pixel, col);
 		imageStore(gbuf_out, pixel, vec4(0, 0, 0, 1));
@@ -335,17 +342,22 @@ void Composite(ivec2 pixel) {
 	}
 	float l  = Luma(col.rgb);
 	// Albedo approximation: the lit color's chroma at a fixed mid reflectance (no G-buffer albedo here).
-	vec3 albedo = clamp(col.rgb / max(l, 1e-3), vec3(0), vec3(2)) * 0.3;
+	vec3 albedo = clamp(col.rgb / max(l, 1e-3), vec3(0), vec3(2)) * 0.45;
+	// Colored bounce: the GI's own chroma kept (slightly saturated) so torches and fire tint what they light.
+	vec3 gic = max(gi.rgb, vec3(0));
+	gic = max(mix(vec3(Luma(gic)), gic, 1.15), vec3(0));
 	// Tint by the surface's own color: energy only where a lit bounce exists, no constant ambient.
-	vec3 bounce = albedo * max(gi.rgb, vec3(0)) * push.trace.z * fade;
+	vec3 bounce = albedo * gic * push.trace.z * fade;
 	// The added light bounded relative to the pixel's own: a subtle bounce that cannot lift the frame's average
 	// or the auto exposure.
 	float bl  = Luma(bounce);
-	float cap = 0.25 * l;
+	float cap = 0.6 * l + 0.004;
 	if (bl > cap) bounce *= cap / max(bl, 1e-6);
 	// Soft AO: only the occluded part of the visibility, smoothed, at a modest strength.
 	float ao  = smoothstep(0.0, 1.0, clamp(gi.a, 0.0, 1.0));
-	vec3  rgb = (col.rgb + bounce) * mix(1.0, ao, push.trace.w * fade);
+	// Never more than 15% darker (no blotches on faces or walls), and the AO applies to the base color only.
+	float aom = max(mix(1.0, ao, push.trace.w * fade), 0.85);
+	vec3  rgb = col.rgb * aom + bounce;
 	imageStore(out_img, pixel, vec4(max(rgb, vec3(0)), col.a));
 }
 
