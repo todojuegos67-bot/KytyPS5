@@ -11,6 +11,7 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 #include "local-platform.h"
+#include "ram-guard.h"
 
 #include <charconv>
 #include <cstdio>
@@ -355,6 +356,8 @@ int main(int argc, char* argv[]) {
 	std::atexit(LocalPlatform::DrainStdout);
 	std::at_quick_exit(LocalPlatform::DrainStdout);
 #endif
+	// (Before anything reads the switches it sets: the low-RAM profile's defaults, ram-guard.h.)
+	RamGuard::ApplyLowRamDefaults();
 	VirtualMemory::Init();
 	InitializeThreads();
 
