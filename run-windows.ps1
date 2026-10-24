@@ -447,15 +447,19 @@ if ($RtShadows -ge 0) { $environment['KYTY_RT_SHADOWS'] = "$RtShadows" }
 if ($RtShadowsStrength -ge 0) { $environment['KYTY_RT_SHADOWS_STRENGTH'] = $RtShadowsStrength.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
 # (10-22) -Shadows 0|1|2: sombras Maximo (las del juego), Medio (sol hasta 125 m), Bajo (sol hasta 60 m, sin sombreado
 # ambiental ni sombras de focos). A menos nivel pueden aparecer de golpe al acercarse (popping).
+# (10-24) Rangos del registro del eboot 1.07: sunShadowMaxDistance, sunShadowLightDistance y sunShadowCascadeDistance0..3
+# 0-1000 (m), r_virtualGeometryNumShadowCascades 0-4, r_ambientShadowCutoffDistance / FadeDistance 0-1000. Subir la
+# distancia o las cascadas sin repartir los cortes dejaba lo lejano fuera de la ultima cascada / del rango de profundidad
+# de la luz: pintado de negro hasta acercarse. Cortes: 75 % logaritmico + 25 % lineal desde 0,5 m; la ultima = la maxima.
 $detailConvars = @{
 	# (10-24) Lejana: Ultra con sombras del sol hasta 1000 m (4 cascadas), objetos que se desvanecen mucho mas lejos y SSR a
 	# todo el rango (techos del eboot: ray 1600, cutoff 5000, 256 iteraciones). Coste estimado -10..15 % fps vs Ultra.
-	'Lejana'   = 'r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=1000;r_contactShadowsEnabled=true;r_fadeOutInstanceOverDistance=60;r_ssrEnableOverrides=true;r_ssrMaxIterations=256;r_ssrMaxRayLength=1600;r_ssrCutoffDistance=5000;r_iblResolution=Full;r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.015;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0'
-	'Ultra'    = 'r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=400;r_contactShadowsEnabled=true;r_iblResolution=Full;r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.015;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0'
-	'VeryHigh' = 'r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=250;r_iblResolution=Full;r_tessellationDensity=18.0;r_tessellationSmallestEdgeLength=0.02;r_tessellationFadeOutStart=15.0;r_tessellationFadeOutRange=3.0'
+	'Lejana'   = 'r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=1000;sunShadowCascadeDistance0=65;sunShadowCascadeDistance1=142;sunShadowCascadeDistance2=300;sunShadowCascadeDistance3=1000;sunShadowLightDistance=1000;r_contactShadowsEnabled=true;r_fadeOutInstanceOverDistance=60;r_ssrEnableOverrides=true;r_ssrMaxIterations=256;r_ssrMaxRayLength=1600;r_ssrCutoffDistance=5000;r_iblResolution=Full;r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.015;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0'
+	'Ultra'    = 'r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=400;sunShadowCascadeDistance0=27;sunShadowCascadeDistance1=61;sunShadowCascadeDistance2=131;sunShadowCascadeDistance3=400;sunShadowLightDistance=1000;r_contactShadowsEnabled=true;r_iblResolution=Full;r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.015;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0'
+	'VeryHigh' = 'r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=250;sunShadowCascadeDistance0=40;sunShadowCascadeDistance1=250;r_iblResolution=Full;r_tessellationDensity=18.0;r_tessellationSmallestEdgeLength=0.02;r_tessellationFadeOutStart=15.0;r_tessellationFadeOutRange=3.0'
 	'High'     = ''
-	'Normal'   = 'r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=180;r_iblResolution=HalfResX;r_tessellationDensity=6.0;r_tessellationSmallestEdgeLength=0.06;r_tessellationFadeOutStart=9.0;r_tessellationFadeOutRange=3.0'
-	'Low'      = 'r_virtualGeometryNumShadowCascades=1;sunShadowMaxDistance=125;r_iblResolution=HalfResX;r_tessellationDensity=4.0;r_tessellationSmallestEdgeLength=0.08;r_tessellationFadeOutStart=6.0;r_tessellationFadeOutRange=2.0'
+	'Normal'   = 'r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=180;sunShadowCascadeDistance0=30;sunShadowCascadeDistance1=180;r_iblResolution=HalfResX;r_tessellationDensity=6.0;r_tessellationSmallestEdgeLength=0.06;r_tessellationFadeOutStart=9.0;r_tessellationFadeOutRange=3.0'
+	'Low'      = 'r_virtualGeometryNumShadowCascades=1;sunShadowMaxDistance=125;sunShadowCascadeDistance0=125;r_iblResolution=HalfResX;r_tessellationDensity=4.0;r_tessellationSmallestEdgeLength=0.08;r_tessellationFadeOutStart=6.0;r_tessellationFadeOutRange=2.0'
 }
 # (10-23) Valores de fabrica sacados del eboot: r_ssrMaxIterations 128 (1-256), r_ssrMaxRayLength 1000 (0-1600),
 # r_ssrCutoffDistance 1000 (0-5000); r_fadeOutInstanceOverDistance 15 (0-200); r_aaSharpenStrengthStatic/Motion 2.5 (0-10),
@@ -491,11 +495,11 @@ if ($DetailUltra -and $titleId -match '^PPSA0134[0-2]$') {
 	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'r_iblResolution=Full;r_tessellationDensity=20.0;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0;r_tessellationSmallestEdgeLength=0.015') | Where-Object { $_ }) -join ';'
 }
 if ($ShadowsUltra -and $Shadows -eq 0 -and $titleId -match '^PPSA0134[0-2]$') {
-	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'sunShadowMaxDistance=400;r_virtualGeometryNumShadowCascades=4;r_contactShadowsEnabled=true') | Where-Object { $_ }) -join ';'
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'sunShadowMaxDistance=400;r_virtualGeometryNumShadowCascades=4;sunShadowCascadeDistance0=27;sunShadowCascadeDistance1=61;sunShadowCascadeDistance2=131;sunShadowCascadeDistance3=400;sunShadowLightDistance=1000;r_contactShadowsEnabled=true') | Where-Object { $_ }) -join ';'
 }
 if ($ExtraConvars -and $titleId -match '^PPSA0134[0-2]$') { $environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $ExtraConvars) | Where-Object { $_ }) -join ';' }
 if ($Shadows -gt 0 -and $titleId -match '^PPSA0134[0-2]$') {
-	$shadowConvars = if ($Shadows -eq 4) { 'sunShadowMaxDistance=1000;r_virtualGeometryNumShadowCascades=4' } elseif ($Shadows -eq 3) { 'sunShadowMaxDistance=190' } elseif ($Shadows -eq 1) { 'sunShadowMaxDistance=125' } else { 'sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false' }
+	$shadowConvars = if ($Shadows -eq 4) { 'sunShadowMaxDistance=1000;r_virtualGeometryNumShadowCascades=4;sunShadowCascadeDistance0=65;sunShadowCascadeDistance1=142;sunShadowCascadeDistance2=300;sunShadowCascadeDistance3=1000;sunShadowLightDistance=1000' } elseif ($Shadows -eq 3) { 'sunShadowMaxDistance=190' } elseif ($Shadows -eq 1) { 'sunShadowMaxDistance=125' } else { 'sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false' }
 	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $shadowConvars) | Where-Object { $_ }) -join ';'
 }
 # -TextureReduce 0|1|2: large block-compressed textures held without their 1 or 2 largest levels (KYTY_TEXTURE_REDUCE;
