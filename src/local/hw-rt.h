@@ -20,6 +20,11 @@
 #include <span>
 #include <vector>
 
+// (<windows.h>, through vk_mem_alloc.h, defines MemoryBarrier; vk::MemoryBarrier is meant everywhere here.)
+#ifdef MemoryBarrier
+#undef MemoryBarrier
+#endif
+
 namespace Libs::Graphics::HwRt {
 
 // KYTY_RT_SHADOWS_HW=1 (read once).
