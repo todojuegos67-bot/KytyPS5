@@ -110,11 +110,14 @@ void DumpShaderIr(const CompileOptions& options, const IR::Program& ir) {
 	for (size_t i = 0; i < ir.info.images.size(); ++i) {
 		const auto& image = ir.info.images[i];
 		text += fmt::format("image[{}] source={} class={} numeric={} dim={} mips={} read={} written={} "
-		                    "atomic={} depth_compare={} cube={} first_pc=0x{:x}\n",
+		                    "atomic={} depth_compare={} cube={} first_pc=0x{:x} max_layer={}\n",
 		                    i, image.source, static_cast<int>(image.resource_class),
 		                    static_cast<int>(image.numeric_class), static_cast<int>(image.dimension),
 		                    image.mip_count, image.read, image.written, image.atomic,
-		                    image.depth_compare, image.cube, image.first_use_pc);
+		                    image.depth_compare, image.cube, image.first_use_pc,
+		                    image.max_array_index == IR::ImageResource::NoArrayIndexBound
+		                        ? std::string("-")
+		                        : std::to_string(image.max_array_index));
 	}
 	for (size_t i = 0; i < ir.info.buffers.size(); ++i) {
 		const auto& buffer = ir.info.buffers[i];

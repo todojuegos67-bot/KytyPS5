@@ -523,8 +523,10 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 
 // The guest texture of the levels `first`.. of `full`, its larger levels left out: the tiled layout puts the mip tail
 // first and then the levels from the smallest up, so a 2D texture's levels from `first` on are the first bytes of its
-// memory, laid out as the texture of its size >> first with that many fewer levels. False where that does not hold
-// byte for byte (every level's offset, size and padding is compared).
+// memory, laid out as the texture of its size >> first with that many fewer levels. An array's layers lie one after
+// another, each with all its levels (TextureCalcUploadLayout's slice stride, the data's size over the layers): the
+// smaller array keeps the whole memory, so that stride stays, each layer's kept levels the first bytes of its own.
+// False where that does not hold byte for byte (every level's offset, size and padding is compared).
 static bool TextureFromLevel(const ImageInfo& full, uint32_t first, ImageInfo& out) {
 	if (first == 0 || first >= full.resources.levels || full.resources.levels > full.mip_layout.size()) return false;
 	const auto shift = [&](uint32_t value) { return std::max((value + (1u << first) - 1u) >> first, 1u); };
@@ -548,7 +550,9 @@ static bool TextureFromLevel(const ImageInfo& full, uint32_t first, ImageInfo& o
 	    size.size == 0 || size.size >= full.data.size || size.align == 0 || full.data.address % size.align != 0) {
 		return false;
 	}
-	out.data       = {full.data.address, size.size};
+	const auto layers = full.resources.layers;
+	if (layers > 1 && (full.data.size % layers != 0 || size.size > full.data.size / layers)) return false;
+	out.data       = {full.data.address, layers > 1 ? full.data.size : size.size};
 	out.mip_layout = {};
 	PopulateTextureMipLayout(out);
 	for (uint32_t level = 0; level < out.resources.levels; ++level) {
@@ -574,8 +578,11 @@ static bool TexturePrefixEnabled(bool small_video_memory) {
 // texture of at least 1024 texels on a side is held without its 1 or 2 largest levels, as a T# from that level would be
 // (TextureFromLevel): its kept levels are the first bytes of its memory, so the left-out ones take no video memory and
 // are not uploaded when the game writes them. One level left out is a quarter of the texture: at 1-1 its BC textures
-// took 3.7 GiB (0.9 reduced), on cards whose budget held about 10 of the 11 GB the level wanted. Shaders sample the
-// smaller texture (half the texels across); size queries, explicit levels and texel loads see it too (a little blur).
+// took 3.7 GiB (0.9 reduced), on cards whose budget held about 10 of the 11 GB the level wanted. Arrays too, each
+// layer's kept levels the first bytes of its own (the game's writes to the left-out ones then count as the array's: its
+// range takes them in): the texture pools' 1024x1024 arrays at 1-1 (256 and 64 layers) took 470 of the 1,313 MiB left
+// with one level out. Shaders sample the smaller texture (half the texels across); size queries, explicit levels and
+// texel loads see it too (a little blur).
 static uint32_t TextureReduceLevels(bool small_video_memory) {
 	static const uint32_t levels = [&] {
 		const char*    value  = std::getenv("KYTY_TEXTURE_REDUCE");
@@ -617,11 +624,12 @@ static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc
 	                        : 0u;
 	// The first level held: the T#'s base, or past the levels left out.
 	const auto first_held = std::max(base, drop);
-	if (first_held == 0 || (drop == 0 && !TexturePrefixEnabled(small_video_memory)) || full.resources.layers != 1 ||
-	    full.samples != 1 || full.type != Prospero::ImageType::kColor2D || full.IsVolume() || full.IsDepth() ||
-	    full.HasMetadata() || full.HasStencil() || full.tile_mode == Prospero::TileMode::kLinear ||
-	    full.tile_mode == Prospero::TileMode::kDepth || full.tile_mode == Prospero::TileMode::kRenderTarget ||
-	    cache.HoldsImage(full)) {
+	// (An array only for the levels left out: one held from its T#'s later base level is not tried.)
+	if (first_held == 0 || (drop == 0 && (!TexturePrefixEnabled(small_video_memory) || full.resources.layers > 1)) ||
+	    full.resources.layers == 0 || full.samples != 1 || full.type != Prospero::ImageType::kColor2D ||
+	    full.IsVolume() || full.IsDepth() || full.HasMetadata() || full.HasStencil() ||
+	    full.tile_mode == Prospero::TileMode::kLinear || full.tile_mode == Prospero::TileMode::kDepth ||
+	    full.tile_mode == Prospero::TileMode::kRenderTarget || cache.HoldsImage(full)) {
 		return;
 	}
 	ImageInfo from {};
@@ -702,6 +710,18 @@ static void HoldLayerRange(TextureCache& cache, TextureCache::ImageDesc& desc, u
 	desc.view_info.base_layer = held_first;
 }
 
+// A sampled array's view: its layers from the base, no more than the shader can reach (ImageResource::max_array_index).
+// The texture-pool views of 1-1 and Stonefang read 256 of up to 2,255 layers; held whole they were images of up to
+// 1 GiB, uploaded in seconds (issue #174, an 8 GB card that then lost the device). KYTY_TEXTURE_LAYER_BOUND=0: every
+// layer to the T#'s last, as before.
+static uint32_t ArrayViewLayers(const ShaderRecompiler::IR::ImageResource& resource, uint32_t layers) {
+	static const bool bound = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_LAYER_BOUND");
+		return value == nullptr || value[0] != '0';
+	}();
+	return bound && resource.max_array_index < layers ? resource.max_array_index + 1u : layers;
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -731,7 +751,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			if (view.base_layer >= image_layers) {
 				EXIT("texture array base layer is out of bounds\n");
 			}
-			view.layer_count = image_layers - view.base_layer;
+			view.layer_count = ArrayViewLayers(resource, image_layers - view.base_layer);
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
 			view.type        = vk::ImageViewType::e3D;
@@ -745,7 +765,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			if (view.base_layer >= image_layers) {
 				EXIT("texture array base layer is out of bounds\n");
 			}
-			view.layer_count = image_layers - view.base_layer;
+			view.layer_count = ArrayViewLayers(resource, image_layers - view.base_layer);
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
@@ -1052,10 +1072,11 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	if (size.size >= (uint64_t {1} << 30u)) {
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
-			std::printf("TextureCache: large texture view addr=0x%llx size=0x%llx %ux%u layers=%u levels=%u base_array=%u "
+			std::printf("TextureCache: large texture view addr=0x%llx size=0x%llx %ux%u layers=%u levels=%u base_array=%u view_layers=%u "
 			            "fmt=%u tile=%u type=%u storage=%d pc=0x%x dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
 			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size.size), width, height,
-			            image_layers, levels, static_cast<uint32_t>(descriptor.BaseArray5()), static_cast<uint32_t>(format),
+			            image_layers, levels, static_cast<uint32_t>(descriptor.BaseArray5()), desc.view_info.layer_count,
+			            static_cast<uint32_t>(format),
 			            static_cast<uint32_t>(tile), static_cast<uint32_t>(type), storage ? 1 : 0, resource.first_use_pc,
 			            descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
 			            descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
@@ -1063,7 +1084,7 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		}
 	}
 
-	if (!storage && type == Prospero::ImageType::kColor2D) {
+	if (!storage && (type == Prospero::ImageType::kColor2D || type == Prospero::ImageType::kColor2DArray)) {
 		HoldFromBaseLevel(texture_cache, desc, m_context.GetGraphics().small_video_memory);
 	}
 	// KYTY_TEST_MAX_ARRAY_LAYERS=<n>: textures held as if the GPU's images held no more than n layers. 2048 = NVIDIA's: an

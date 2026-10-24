@@ -2326,13 +2326,26 @@ const EvictSettings& PipelineEvictSettings() {
 	return settings;
 }
 
+// Whether the worlds the game left take their pipelines along (EvictIdlePipelines): with 20 GiB of RAM or less, where
+// the NVIDIA driver's ~220 KB of RAM a pipeline counts (16 GB, six worlds: its pools 2.0 GB kept, 1.0 GB swept), or
+// KYTY_PIPELINE_EVICT set. With more RAM the sweep saved nothing needed and cost its remakes: an RTX 2080 Ti (32 GB)
+// remade 1,096 of them from the static store at 4.8 ms each, up to 137 ms (issue #129), not the 0.4 ms of a 5090.
+bool SweepsWorldsLeft() {
+	static const bool sweeps = [] {
+		const auto ram = LocalPlatform::PhysicalMemory();
+		return PipelineEvictSettings().set || (ram != 0 && ram <= (uint64_t {20} << 30u));
+	}();
+	return sweeps;
+}
+
 // A pipeline made now: the flip it was made at as its last use (not idle before a first binding); and whether it keeps
 // how to make it again (made of the static store's, where it may be evicted: only there, for the inputs it keeps).
 bool KeepsRemake(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, bool from_store) {
 	const auto& settings = PipelineEvictSettings();
 	pipeline.last_flip   = g_pipeline_flip.load(std::memory_order_relaxed);
-	// (Where the game reports its worlds, on any GPU: the worlds it leaves take their pipelines along.)
-	const bool scenes = SceneTags::Generation() != 0;
+	// (Where the game reports its worlds and they are swept (SweepsWorldsLeft), on any GPU: the worlds it leaves take
+	// their pipelines along.)
+	const bool scenes = SceneTags::Generation() != 0 && SweepsWorldsLeft();
 	if (!settings.on || (!settings.set && !graphics.small_video_memory && !scenes) || !from_store) return false;
 	g_pipeline_evictions.kept.fetch_add(1, std::memory_order_relaxed);
 	return true;
@@ -2407,28 +2420,56 @@ void PipelineCache::EvictIdlePipelines() {
 	const uint32_t     flip         = g_pipeline_flip.fetch_add(1, std::memory_order_relaxed) + 1;
 	const auto         now          = std::chrono::steady_clock::now();
 	m_flip_times[flip % m_flip_times.size()] = now.time_since_epoch().count();
-	// A world the game left (SceneTags::Enter): once the one it went to was played for SceneSettle, the pipelines no
+	// A world the game left (SceneTags::Enter; with 20 GiB of RAM or less, SweepsWorldsLeft): once the one it went to was
+	// played for SceneSettle, the pipelines no
 	// binding used since the change - and none of the new world's recorded ones, which the warmup made for its places not
 	// reached yet - leave whatever the video memory, a pass a check until one finds none. Each held ~220 KB of the NVIDIA
 	// driver's RAM and video memory for its code, until the session ended. 16 GB policy, 1-1 -> five worlds -> 1-1, 60 s
 	// in each: the driver's pools 0.87 -> 2.01 GB kept, 0.84 -> 0.98 GB with those pipelines evicted (private 4.2 -> 2.8
 	// GB more); a pipeline evicted and bound again is made from the static store (~0.4 ms there). Where the warmup made
 	// every recorded pipeline (a world it did not know yet), those of the other worlds go too.
+	// The world just left keeps its pipelines (those bound since the world before it began): players go back through
+	// the Nexus, and its sweep made each return remake them all (issue #85, an RTX 2060 back in Boletaria: 3,858 made
+	// again at ~1.7 ms, 6.5 s of compiles in 64 s). Worlds further back go as before.
 	constexpr auto SceneSettle = std::chrono::seconds(60);
 	if (const auto generation = SceneTags::Generation(); generation != m_scene_generation) {
 		m_scene_generation = generation;
+		m_prev_scene_flip  = m_scene_flip;
 		m_scene_flip       = flip;
 		m_scene_since      = now;
 		m_scene_swept      = false;
 	}
 	if (!settings.on || flip % CheckFlips != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) return;
-	const bool scene_left = !m_scene_swept && now - m_scene_since >= SceneSettle;
+	const bool scene_left = SweepsWorldsLeft() && !m_scene_swept && now - m_scene_since >= SceneSettle;
 	uint64_t video = 0, budget = 0;
 	const bool known = m_graphics.QueryLocalVideoMemory(&video, &budget);
+	m_evict_pressure = known && (settings.always || video + EvictMargin >= budget);
+	// Pipelines evicted while idle that keep coming back cost their remakes and give nothing back: issue #85's RTX 2060
+	// (6 GB), played from Boletaria's start to the dragon, evicted 11,721 and made 5,599 of them again (9.3 s of the
+	// render thread, up to 66 ms each) while the driver's share of the video memory stayed at 830 MiB. Past
+	// MinIdleSample evicted while idle, with a quarter of them or more made again (the worlds left's remakes counted
+	// too), none is evicted while idle for the rest of the session (KYTY_PIPELINE_EVICT=2, a test, still evicts); the
+	// worlds left still go (SweepsWorldsLeft).
+	constexpr uint64_t MinIdleSample = 512;
+	if (m_evict_pressure && !settings.always && !m_idle_evict_off) {
+		const auto idle_evicted = g_pipeline_evictions.evicted.load(std::memory_order_relaxed) -
+		                          g_pipeline_evictions.scene.load(std::memory_order_relaxed);
+		const auto remade = g_pipeline_evictions.remade.load(std::memory_order_relaxed);
+		if (idle_evicted >= MinIdleSample && remade * 4 >= idle_evicted) {
+			m_idle_evict_off = true;
+			std::printf("Pipelines out of video memory while idle: %llu of the %llu evicted made again (%.0f ms): none "
+			            "evicted while idle from here on\n",
+			            static_cast<unsigned long long>(remade), static_cast<unsigned long long>(idle_evicted),
+			            static_cast<double>(g_pipeline_evictions.remake_us.load(std::memory_order_relaxed)) / 1000.0);
+			std::fflush(stdout);
+		}
+	}
+	if (m_idle_evict_off) m_evict_pressure = false;
+	// Our RAM guard / RAM diet still evicts under RAM pressure, whatever the idle-evict cut-off above.
 	// RAM pressure (ram-guard.h): pipelines idle 60 s (20 s when critical) leave too, whatever the video memory; each
 	// held ~220 KB of the driver's RAM and is made again from the static store at its next binding.
 	const int ram_pressure = RamGuard::PressureLevel();
-	m_evict_pressure = (known && (settings.always || video + EvictMargin >= budget)) || RamDietEnabled() || ram_pressure != 0;
+	m_evict_pressure = m_evict_pressure || RamDietEnabled() || ram_pressure != 0;
 	if (RamDietEnabled()) {
 		// Replaced unoptimized pipelines past RamDietReplacedSeconds (pushed in time order).
 		const auto old = (now - std::chrono::seconds(RamDietReplacedSeconds)).time_since_epoch().count();
@@ -2472,7 +2513,7 @@ void PipelineCache::EvictIdlePipelines() {
 		    pipeline.optimized != nullptr)
 			return;
 		const bool idle  = pipeline.last_flip < below;
-		const bool other = scene_left && pipeline.last_flip < m_scene_flip && !scene_recipes.contains(pipeline.recipe);
+		const bool other = scene_left && pipeline.last_flip < m_prev_scene_flip && !scene_recipes.contains(pipeline.recipe);
 		if (!idle && !other) return;
 		DeviceFault::ForgetPipeline(static_cast<VkPipeline>(pipeline.pipeline));
 		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
