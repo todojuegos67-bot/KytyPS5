@@ -10,7 +10,11 @@
 //
 // KYTY_KBM_WARP_HUDLESS=0: no HUD-less image (the whole frame moves, the HUD too; and, without frame generation, the
 // HUD-less capture is not turned on for the warp alone).
-// KYTY_KBM_WARP_FSR3=0: no warp with FSR 3 frame generation.
+// KYTY_KBM_WARP_FSR3=1: warp with FSR 3 frame generation too (10-25: off by default, double images; DLSS-G: never).
+// KYTY_KBM_WARP_ZOOM (0.05): the constant edge crop (fraction of each half-size), the most the 3D can be shifted.
+// The shift itself (swapchain.cpp, HostInputKbmWarpDegrees): what the pad reads after the presented frame's flip sent
+// plus the counts not read yet, in the camera's degrees as learned from the camera: it hands over to the game's own
+// turn the frame that has it is presented, so it does not jump back and forth.
 // KYTY_KBM_WARP_THRESHOLD / KYTY_KBM_WARP_RADIUS: the HUD mask (as KYTY_FSR3_HUD_THRESHOLD / _RADIUS).
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -32,7 +36,8 @@ namespace KbmWarp {
 // Returns the image to blit instead of `final_image` (TRANSFER_SRC, `final_image`'s size), or null: nothing recorded.
 [[nodiscard]] VulkanImage* Record(GraphicContext& graphics, vk::CommandBuffer command, VulkanImage& final_image,
                                   FrameGen::FrameInputs* inputs, float shift_x, float shift_y, bool fsr3);
-// FSR 3: the last real frame's input shift (render pixels) is not zero: the next frame's vectors need the change back.
+// The warp should run this frame though nothing moves: the edge zoom is constant (KYTY_KBM_WARP_ZOOM), or (FSR 3) the
+// last real frame's input shift is not zero and the next frame's vectors need the change back.
 [[nodiscard]] bool InputsShifted();
 // FSR 3: a real frame whose inputs were not shifted (none, or generation off): the next starts from no shift.
 void NoteUnshifted();
