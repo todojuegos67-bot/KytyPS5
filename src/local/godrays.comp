@@ -26,7 +26,8 @@ layout(binding = 4, rgba16f) uniform writeonly image2D vol_out;    // this frame
 layout(binding = 5, rgba16f) uniform writeonly image2D out_img;    // the composited color (render size)
 layout(std430, binding = 6) buffer Frame {
 	vec4 hdr;        // x: 1.0 (exposure fallback), y: light threshold (exposed luminance), z: light slots, w: light radius (m)
-	uint stats[16];  // 0 frames, 1 lights in use summed, 2 sun on screen frames
+	uint stats[16];  // 0 frames, 1 lights in use summed, 2 sun on screen frames, 4 sky taps this frame (lights -> track),
+	                 // 5 openness (float bits, smoothed sky fraction -> 0..1: indoors 0)
 	vec4 sunc;       // the sun's hue (rgb, luminance 1), w: valid
 	vec4 lights[16]; // 8 slots x (uv x, uv y, depth, weight), (exposed rgb, age)
 	vec4 cand[];     // 16x9 cells x (exposed luminance, uv x, uv y, depth), (exposed rgb, -)
@@ -101,6 +102,10 @@ vec3 Hue(vec3 c) {
 }
 
 shared uint s_best[64];
+shared uint s_sky;
+
+// How open the scene is to the sky (0 indoors .. 1 outdoors), from the sky fraction of the light taps, smoothed.
+float Openness() { return clamp(uintBitsToFloat(stats[5]), 0.0, 1.0); }
 
 void Lights(uvec3 wg, uint li) {
 	uvec2 cell = wg.xy;
@@ -109,6 +114,9 @@ void Lights(uvec3 wg, uint li) {
 	vec3  c    = Safe(textureLod(color_tex, uv, 0).rgb) * e;
 	float d    = DepthAt(uv);
 	float l    = Luma(c);
+	if (li == 0u) s_sky = 0u;
+	barrier();
+	if (IsSky(d)) atomicAdd(s_sky, 1u);
 	// (nearer than 6 m: the player's own lantern, a torch held in front of the camera: a halo there is a haze over
 	// the whole character, not a shaft; rejected here so it never takes a slot)
 	bool  ok   = !IsSky(d) && abs(ViewZ(d)) < 45.0 && abs(ViewZ(d)) > 6.0 && l > hdr.y;
@@ -120,6 +128,7 @@ void Lights(uvec3 wg, uint li) {
 		barrier();
 	}
 	if (li == 0u) {
+		if (s_sky > 0u) atomicAdd(stats[4], s_sky);
 		uint  b    = s_best[0];
 		uint  idx  = (cell.y * uint(CW) + cell.x) * 2u;
 		if (b == 0u) {
@@ -128,6 +137,18 @@ void Lights(uvec3 wg, uint li) {
 			uint t   = b & 63u;
 			vec2 tuv = (vec2(cell) + (vec2(t % 8u, t / 8u) + 0.5) / 8.0) / vec2(CW, CH);
 			vec3 tc  = Safe(textureLod(color_tex, tuv, 0).rgb) * e;
+			// A light is a bright blob, not thin bright geometry (a lit chandelier ring, a metal rim, a candle wick):
+			// >= 3 of 4 taps 2 px away must be bright too.
+			vec2 px = 2.0 / RenderSize();
+			int  nb = 0;
+			for (int k = 0; k < 4; ++k) {
+				vec2 o = k == 0 ? vec2(px.x, 0) : k == 1 ? vec2(-px.x, 0) : k == 2 ? vec2(0, px.y) : vec2(0, -px.y);
+				if (Luma(Safe(textureLod(color_tex, tuv + o, 0).rgb) * e) > 0.5 * hdr.y) ++nb;
+			}
+			if (nb < 3) {
+				cand[idx] = vec4(0), cand[idx + 1u] = vec4(0);
+				return;
+			}
 			cand[idx]      = vec4(Luma(tc), tuv, DepthAt(tuv));
 			cand[idx + 1u] = vec4(tc, 0);
 		}
@@ -159,6 +180,14 @@ void Track() {
 		} else if (sunc.w < 0.5) {
 			sunc = vec4(warm, 1.0);
 		}
+	}
+	{
+		// Openness: the sky fraction of the 16x9x64 light taps; ~1 % sky (a doorway) is indoors, >= 12 % open.
+		float frac = float(stats[4]) / float(CW * CH * 64);
+		stats[4]   = 0u;
+		float o    = smoothstep(0.01, 0.12, frac);
+		float prev = uintBitsToFloat(stats[5]);
+		stats[5]   = floatBitsToUint(stats[0] == 0u ? o : mix(prev, o, 0.03));
 	}
 	atomicAdd(stats[0], 1u);
 	if (push.sun_uv.z > 0.5) atomicAdd(stats[2], 1u);
@@ -265,11 +294,14 @@ void Volume(ivec2 q) {
 		float tmax = sky ? 60.0 : min(length(ViewPos(uv, d)), 60.0);
 		vec3  L    = normalize(push.sun.xyz);
 		float lit  = 0.0;
+		float open = Openness();
 		float dt   = tmax / float(steps);
 		for (int i = 0; i < steps; ++i) {
 			float t = (float(i) + j) * dt;
 			vec3  x = dir * t;
-			float vis = 1.0;
+			// (a step whose sun taps leave the screen proves nothing: indoors the ceiling toward the sun is usually off
+			// screen. Such a step is lit only as much as the scene is open; all 5 taps on screen and clear: lit)
+			float vis = open;
 			float s   = 0.6;
 			for (int k = 0; k < 5; ++k) {
 				vec3 y = x + L * s;
@@ -278,6 +310,7 @@ void Volume(ivec2 q) {
 				if (!Project(y, yuv)) break;
 				if (any(lessThan(yuv, vec2(0.0))) || any(greaterThan(yuv, vec2(1.0)))) break;
 				float sd = DepthAt(yuv);
+				if (k == 4) vis = 1.0;
 				if (IsSky(sd)) continue;
 				float sz = abs(ViewZ(sd)), yz = abs(y.z);
 				if (sz < yz - 0.25 && yz - sz < 4.0 + 0.1 * yz) {
@@ -289,7 +322,8 @@ void Volume(ivec2 q) {
 		}
 		float phase = clamp(Hg(dot(dir, L), 0.55) / 1.0, 0.0, 6.0) / 6.0; // (1 toward the sun, ~0.03 away)
 		// The shafts' contrast, not a uniform haze: lit length / 60 m, weighted by the phase.
-		scatter += (lit / 60.0) * phase * 0.35;
+		// x the openness: an interior gets a faint haze, not a fog bank.
+		scatter += (lit / 60.0) * phase * 0.35 * mix(0.15, 1.0, open);
 	}
 	scatter *= push.sun.w;
 	// Temporal accumulation (the jitter converges; depth-rejected on disocclusion).
@@ -320,7 +354,7 @@ void Composite(ivec2 p) {
 	vec2  qp = uv * qs - 0.5;
 	ivec2 q0 = ivec2(floor(qp));
 	vec2  f  = qp - vec2(q0);
-	float vs = 0.0, ws = 0.0;
+	float vs = 0.0, ws = 0.0, dws = 0.0, vmin = 4.0;
 	for (int k = 0; k < 4; ++k) {
 		ivec2 o  = ivec2(k & 1, k >> 1);
 		ivec2 qq = clamp(q0 + o, ivec2(0), ivec2(qs) - 1);
@@ -328,12 +362,18 @@ void Composite(ivec2 p) {
 		float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
 		float dw = exp(-abs(v.y - vz) / max(0.05 * vz, 0.05));
 		float w  = bw * dw + 1e-4 * bw;
-		vs += v.x * w, ws += w;
+		vs += v.x * w, ws += w, dws += bw * dw;
+		vmin = min(vmin, v.x);
 	}
 	float vol = ws > 0.0 ? vs / ws : 0.0;
+	// Thin geometry no quarter texel matches (a chandelier in front of the hall): the bilinear fallback pasted the
+	// background's in-scatter over it in quarter-res blocks (bright stripes). The fog in front of a near surface is
+	// at most the least of its neighbours.
+	vol = mix(vmin, vol, smoothstep(0.02, 0.2, dws));
 	// (the far backdrop already carries the game's fog: half there)
 	vol *= mix(1.0, 0.5, smoothstep(80.0, 300.0, vz));
 	vec3 add = vol * sunc.rgb * push.size.z * 0.6;
+	float open = Openness();
 	// The lights' halos: in-scatter of a point light along the view ray up to the surface.
 	int slots = int(hdr.z);
 	if (slots > 0) {
@@ -364,7 +404,7 @@ void Composite(ivec2 p) {
 	}
 	// Hue-preserving soft cap on the added (exposed) luminance, less over already bright pixels.
 	float al  = Luma(add);
-	float cap = push.size.w;
+	float cap = push.size.w * mix(0.4, 1.0, open); // (indoors: a lower ceiling on the added light)
 	if (al > 1e-6) {
 		float bl = Luma(c) * e;
 		float nl = cap * (1.0 - exp(-al / cap)) / (1.0 + 0.5 * bl);

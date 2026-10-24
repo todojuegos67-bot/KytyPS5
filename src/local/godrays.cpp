@@ -400,12 +400,13 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 	}
 
+	// Ultra (3) = quality (more taps, steps, light slots), not denser fog: the same strength and cap as level 2.
 	const int   slots  = level >= 3 ? 8 : level == 2 ? 4 : 2;
 	const int   taps   = level >= 3 ? 64 : level == 2 ? 48 : 32;
 	const int   steps  = level >= 3 ? 16 : level == 2 ? 12 : 0;
-	const float cap    = (level >= 3 ? 0.28f : level == 2 ? 0.18f : 0.10f) * strength;
-	const float lstr   = (level >= 3 ? 1.0f : level == 2 ? 0.75f : 0.5f) * strength;
-	const float sstr   = (level >= 3 ? 1.0f : level == 2 ? 0.7f : 0.45f) * strength;
+	const float cap    = (level >= 3 ? 0.18f : level == 2 ? 0.18f : 0.10f) * strength;
+	const float lstr   = (level >= 3 ? 0.75f : level == 2 ? 0.75f : 0.5f) * strength;
+	const float sstr   = (level >= 3 ? 0.7f : level == 2 ? 0.7f : 0.45f) * strength;
 
 	GodraysPush push {};
 	push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
