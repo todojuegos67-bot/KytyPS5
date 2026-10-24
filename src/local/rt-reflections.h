@@ -3,7 +3,8 @@
 // KYTY_RT_REFLECTIONS=0|1|2|3 (off / low / high / ultra; rt-reflections.cpp, rt-reflections.comp): screen-space
 // ray-traced reflections with denoising on the PS5 Pro path's render-resolution color, right before the upscaler
 // (KYTY_UPSCALER: DLSS / XeSS / FSR; without an upscaler there is no such point and nothing runs).
-// KYTY_RT_REFLECTIONS_STRENGTH (1.0, 0..2). Off (the default): nothing created, nothing recorded.
+// KYTY_RT_REFLECTIONS_STRENGTH (1.0, 0..3), KYTY_RT_REFLECTIONS_MIN (0.3, 0..0.8: the wet surfaces' minimum
+// reflectance). Off (the default): nothing created, nothing recorded.
 #include "local/frame-gen.h"
 
 #include <array>
@@ -23,6 +24,8 @@ struct RtReflGbuffer {
 	vk::Extent2D                 extent {};
 };
 [[nodiscard]] bool RtReflGetGbuffer(RtReflGbuffer& out);
+// The number of G-buffer copies taken so far (the periodic stats line: copies per frame).
+[[nodiscard]] uint64_t RtReflCopies();
 // The camera from the G-buffer draws' constants, with the upscaler's view_to_clip: the world -> view rotation rows, world
 // up in view space, the current clip -> previous clip matrix (row-major, column vectors; x, y and w rows meaningful).
 struct RtReflCamera {

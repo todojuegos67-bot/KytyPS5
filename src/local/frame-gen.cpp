@@ -4673,6 +4673,16 @@ struct SsrPass {
 	std::atomic<uint64_t>   copy_flip {~0ull};
 	bool                    copy_failed = false;
 	uint32_t                packed_logged = ~0u;
+	std::atomic<uint64_t>   copies {0};       // copies taken (KYTY_RT_REFLECTIONS' periodic line)
+	vk::Extent2D            resize_to {};     // a new G-buffer size seen on consecutive attempts (resize after 30)
+	uint32_t                resize_seen = 0;
+	struct RetiredCopy {
+		VkImage       image = VK_NULL_HANDLE;
+		VmaAllocation mem   = nullptr;
+		vk::ImageView views[4] {};
+		uint64_t      flip  = 0;
+	};
+	std::vector<RetiredCopy> retired_copies; // (frames in flight may still read them: destroyed 8 flips later)
 } g_ssr;
 constexpr uint32_t SsrCalibRuns  = 24;  // calibration frames (one every 4th)
 constexpr uint32_t SsrCalibInts  = 41 + 16 * 3;
@@ -5374,6 +5384,12 @@ void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 	if (!IsGbufferVertexShader(vs_hash) || srt.size() < SrtViewProj + 16) return;
 	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
 	std::lock_guard lock(g_ssr_gb.mutex);
+	// The G-buffer pass is drawn this frame. Its targets are known from a normal-path draw (OnSsrGbuffer), but the
+	// G-buffer draws almost all take the table path (table-xpr.inc) or records (native-xpr.inc), which call only this
+	// hook: without this the targets' flip went stale after the first frames and SsrCaptureGbuffer refused the copy
+	// ("no G-buffer pass this frame or the last") nearly every frame. (The copy still proves the consumer binds the same
+	// address with a 4-layer R32_UINT backing large enough.)
+	if (g_ssr_gb.valid && g_ssr_gb.count > 0 && g_ssr_gb.flip != flip) g_ssr_gb.flip = flip;
 	if (g_ssr_gb.vp_flip == flip) return; // (the frame's first G-buffer draw)
 	std::array<float, 16> vp {};
 	for (uint32_t i = 0; i < 16; ++i) {
@@ -5504,7 +5520,35 @@ void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::Comman
 	if (image.backing.extent.width < width || image.backing.extent.height < height)
 		return SsrCaptureSkip("backing smaller than the G-buffer", cs_hash);
 	const vk::Extent2D extent {width, height};
-	if (g_ssr.copy_image != VK_NULL_HANDLE && g_ssr.copy_extent != extent) return SsrCaptureSkip("size changed", cs_hash);
+	// (copies replaced at a size change: destroyed once no frame in flight can read them)
+	for (size_t i = 0; i < g_ssr.retired_copies.size();) {
+		auto& r = g_ssr.retired_copies[i];
+		if (flip < r.flip + 8) {
+			++i;
+			continue;
+		}
+		for (auto& v: r.views)
+			if (v != nullptr) g_graphics_ctx->device.destroyImageView(v, nullptr);
+		if (r.image != VK_NULL_HANDLE) vmaDestroyImage(g_graphics_ctx->allocator, r.image, r.mem);
+		r = g_ssr.retired_copies.back();
+		g_ssr.retired_copies.pop_back();
+	}
+	if (g_ssr.copy_image != VK_NULL_HANDLE && g_ssr.copy_extent != extent) {
+		// A new size on 30 consecutive attempts (a resolution change, not a second view in the frame): a new copy.
+		if (g_ssr.resize_to != extent) g_ssr.resize_to = extent, g_ssr.resize_seen = 0;
+		if (++g_ssr.resize_seen < 30) return SsrCaptureSkip("size changed", cs_hash);
+		std::printf("SSR: G-buffer copy resized %ux%u -> %ux%u\n", g_ssr.copy_extent.width, g_ssr.copy_extent.height, width, height);
+		std::fflush(stdout);
+		SsrPass::RetiredCopy r;
+		r.image = g_ssr.copy_image, r.mem = g_ssr.copy_mem, r.flip = flip;
+		for (uint32_t i = 0; i < 4; ++i) r.views[i] = g_ssr.copy_views[i], g_ssr.copy_views[i] = nullptr;
+		g_ssr.retired_copies.push_back(r);
+		g_ssr.copy_image  = VK_NULL_HANDLE;
+		g_ssr.copy_mem    = nullptr;
+		g_ssr.copy_layout = vk::ImageLayout::eUndefined;
+		g_ssr.copy_extent = {};
+	}
+	g_ssr.resize_seen = 0;
 	if (g_ssr.copy_image == VK_NULL_HANDLE) {
 		g_ssr.copy_failed = true;
 		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -5571,6 +5615,7 @@ void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::Comman
 	const vk::ImageLayout back = binding->layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding->layout;
 	image.Transit(back, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range, command);
 	g_ssr.copy_flip.store(flip, std::memory_order_release);
+	g_ssr.copies.fetch_add(1, std::memory_order_relaxed);
 	static bool said = false;
 	if (!said) {
 		said = true;
@@ -5618,6 +5663,8 @@ bool RtReflGetGbuffer(RtReflGbuffer& out) {
 	out.extent = g_ssr.copy_extent;
 	return true;
 }
+
+uint64_t RtReflCopies() { return g_ssr.copies.load(std::memory_order_relaxed); }
 
 void RtReflGetCamera(const std::array<float, 16>& view_to_clip, RtReflCamera& out) {
 	out.rows     = SsrViewRotation(view_to_clip, out.view_rows);

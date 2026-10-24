@@ -16,9 +16,19 @@
 // it, depth normals and the heuristic. The game's exposure (its upscaler path's slot 5 buffer) is read so the filters
 // work on display-referred values.
 //
-// KYTY_RT_REFLECTIONS_STRENGTH (1.0, 0..2): the reflection's share scale. KYTY_RT_REFLECTIONS_NORMAL =
-// <layer>:<layout>[w][n] and KYTY_RT_REFLECTIONS_ROUGH = <layer>:<shift>:<bits>[g] override the calibration (as
-// KYTY_SSR_NORMAL / KYTY_SSR_ROUGH). KYTY_RT_REFLECTIONS_TIMING=1: the GPU time every 10 s.
+// KYTY_RT_REFLECTIONS_STRENGTH (1.0, 0..3): the reflection's share scale. KYTY_RT_REFLECTIONS_MIN (0.3, 0..0.8): the
+// minimum reflectance of wet surfaces (water films, puddles: far above a dry dielectric's 4 %). KYTY_RT_REFLECTIONS_NORMAL
+// = <layer>:<layout 0..12>[w][n] and KYTY_RT_REFLECTIONS_ROUGH = <layer>:<shift>:<bits>[g] override the calibration
+// (layouts: the shader's DecodeNormal), KYTY_RT_REFLECTIONS_FLIPY=1|0 forces the screen y convention (1: the render's row
+// 0 is NDC y +1, the default). Every 10 s one line: the share of pixels the reflections change, the mean weight, the
+// hit rate, the G-buffer copy's frames, the GPU time (timestamps, always on; KYTY_RT_REFLECTIONS_TIMING is not needed).
+//
+// Why the first version showed nothing (log of 2026-10-24): the G-buffer copy was refused nearly every frame (the
+// G-buffer draws take the table path, which did not refresh the G-buffer pass's flip, frame-gen.cpp OnSsrDraw); the
+// depth reconstruction mirrored the screen vertically against the game's (GNM) viewport, so the depth normals
+// disagreed with the G-buffer's (calibration 0.654) and with world up (floors read as ceilings: the wet-surface mask was
+// zero on floors); the mask needed flat AND plain AND up-facing at once (textured wet stone failed "plain"); and the
+// composite weight was a dry dielectric's Fresnel (~0.02 seen from above).
 #include "local/rt-reflections.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -39,12 +49,20 @@ namespace {
 
 constexpr uint32_t Bindings      = 20;
 constexpr uint32_t HeaderBytes   = 144;           // view_rot[3], clip_prev[4], up_view, fparams
-constexpr uint32_t CalibInts     = 41 + 16 * 3;
-constexpr uint32_t FrameBytes    = 512;           // header + calibration
+// calib[] (after the header; the shader's CALIB_* / STATS): samples, normal sums per layer x layout x space x screen
+// y convention, byte statistics, floor votes, then the cumulative stats counters (never cleared).
+constexpr uint32_t NLayouts      = 13;
+constexpr uint32_t CalibNormal   = 1;
+constexpr uint32_t CalibBytes    = CalibNormal + 4 * NLayouts * 4;
+constexpr uint32_t CalibFloors   = CalibBytes + 16 * 3;
+constexpr uint32_t StatsIndex    = 272;
+constexpr uint32_t StatsCount    = 7;
+constexpr uint32_t FrameBytes    = 2048;          // header + calibration + stats
 constexpr uint32_t ExposureIndex = 128 / 4;       // fparams.x (1.0) when the game gives no exposure
 constexpr uint32_t CalibRuns     = 24;
 constexpr uint32_t MaxMips       = 12;
-static_assert(HeaderBytes + CalibInts * 4 <= FrameBytes);
+static_assert(CalibFloors + 2 <= StatsIndex);
+static_assert(HeaderBytes + (StatsIndex + StatsCount) * 4 <= FrameBytes);
 
 struct RtPush {
 	float   proj[4];
@@ -94,12 +112,20 @@ struct RtPass {
 	bool                    frame_cleared = false;
 	uint64_t                frame = 0;
 	bool                    history_valid = false;
-	// Calibration and the chosen decode.
-	uint32_t                calib_runs = 0, calib_wait = 0, calib_tick = 0;
-	bool                    calib_done = false;
+	// Calibration (up to 3 attempts, the first once the G-buffer copy has been there 60 frames running) and the
+	// chosen decode; the screen's y convention (true: the render's row 0 is NDC y +1, the GNM viewport).
+	uint32_t                calib_runs = 0, calib_wait = 0, calib_tick = 0, calib_attempts = 0, calib_packed = 0;
+	bool                    calib_done = false, calib_active = false, calib_clear = false;
+	uint64_t                calib_next = 0, gb_streak = 0;
 	int32_t                 dec_normal = -1, dec_rough = -1;
 	bool                    rough_trusted = false;
-	// KYTY_RT_REFLECTIONS_TIMING.
+	bool                    row0_up = true, row0_forced = false;
+	// The periodic line (every 10 s): the stats counters' last values and the sums since the last line.
+	std::array<uint32_t, StatsCount> stat_last {};
+	std::array<uint64_t, StatsCount> stat_sum {};
+	uint64_t                stat_frames = 0, stat_gbuf_frames = 0, stat_copies0 = 0;
+	std::chrono::steady_clock::time_point stat_time = std::chrono::steady_clock::now();
+	// The GPU time (timestamps, always: two a frame).
 	vk::QueryPool           pool = nullptr;
 	double                  period_ns = 1.0;
 	uint64_t                written = 0, read = 0;
@@ -133,9 +159,11 @@ int32_t NormalEnv(const char* name) {
 	const char* value = std::getenv(name);
 	if (value == nullptr) return -1;
 	int layer = -1, layout = -1;
-	if (std::sscanf(value, "%d:%d", &layer, &layout) < 2 || layer < 0 || layer > 3 || layout < 0 || layout > 4) return -1;
+	if (std::sscanf(value, "%d:%d", &layer, &layout) < 2 || layer < 0 || layer > 3 || layout < 0 ||
+	    layout >= static_cast<int>(NLayouts))
+		return -1;
 	const std::string v = value;
-	return layer | (layout << 2) | (v.find('w') != std::string::npos ? 32 : 0) | (v.find('n') != std::string::npos ? 64 : 0);
+	return layer | (layout << 2) | (v.find('w') != std::string::npos ? 64 : 0) | (v.find('n') != std::string::npos ? 128 : 0);
 }
 
 void FreeImage(GraphicContext& graphics, RtImage& img) {
@@ -296,7 +324,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	}
 	g_rt.mapped = static_cast<const int32_t*>(mapped.pMappedData);
 	if (!MakeImage(graphics, g_rt.dummy, vk::Format::eR32Uint, {1, 1}, 1, false)) return false;
-	if (EnvOn("KYTY_RT_REFLECTIONS_TIMING")) {
+	{
 		vk::QueryPoolCreateInfo query {};
 		query.queryType  = vk::QueryType::eTimestamp;
 		query.queryCount = 16;
@@ -375,64 +403,132 @@ void ReadTiming(GraphicContext& graphics) {
 		if (graphics.device.getQueryPoolResults(g_rt.pool, entry * 2, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
 		                                        vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
 			break;
-		g_rt.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_rt.period_ns / 1e6;
-		++g_rt.samples;
+		if (stamps[1] > stamps[0]) {
+			g_rt.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_rt.period_ns / 1e6;
+			++g_rt.samples;
+		}
 		++g_rt.read;
-	}
-	const auto now = std::chrono::steady_clock::now();
-	if (now - g_rt.last_log >= std::chrono::seconds(10) && g_rt.samples > 0) {
-		std::printf("RT reflections: GPU %.3f ms (mean of %u frames)\n", g_rt.sum_ms / g_rt.samples, g_rt.samples);
-		std::fflush(stdout);
-		g_rt.sum_ms   = 0.0;
-		g_rt.samples  = 0;
-		g_rt.last_log = now;
 	}
 }
 
-// The calibration's verdict: the normal layout (mean |cos| vs depth normals >= 0.85) and, when its layout leaves a byte
-// free in the word, that byte as roughness (a guess: weighed by the heuristic in the shader).
-void Analyze(GraphicContext& graphics, uint32_t packed_count) {
+// The stats counters (the shader's atomics on 1 pixel in 16, cumulative: the difference since the last frame, modulo
+// 2^32) and, every 10 s, one line that says whether the reflections show: the share of pixels with a weight > 0.05, the
+// mean weight, the rays' hit rate, the G-buffer's state, the GPU time.
+void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	if (g_rt.mapped == nullptr) return;
+	(void)vmaInvalidateAllocation(graphics.allocator, g_rt.frame_mem, 0, VK_WHOLE_SIZE);
+	const auto* c = reinterpret_cast<const uint32_t*>(g_rt.mapped + HeaderBytes / 4 + StatsIndex);
+	for (uint32_t k = 0; k < StatsCount; ++k) {
+		const uint32_t v = c[k];
+		// (the first frames: the buffer's clear may not have run yet, its contents are a baseline only)
+		if (g_rt.frame > 8) g_rt.stat_sum[k] += static_cast<uint32_t>(v - g_rt.stat_last[k]);
+		g_rt.stat_last[k] = v;
+	}
+	++g_rt.stat_frames;
+	if (have_gbuf) ++g_rt.stat_gbuf_frames;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_rt.stat_time < std::chrono::seconds(10)) return;
+	const auto&    sm     = g_rt.stat_sum;
+	const double   px     = static_cast<double>(std::max<uint64_t>(sm[0], 1));
+	const double   area   = level >= 2 ? 1.0 : 0.25; // (trace pixels per render pixel)
+	const uint64_t copies = RtReflCopies();
+	std::printf("RT reflections: last %.0f s: weight > 0.05 on %.1f%% of the pixels, mean weight %.3f (%.3f on reflective "
+	            "surfaces, %.1f%% of the pixels), rays on %.1f%%, hit rate %.0f%%, G-buffer copy %llu of %llu frames, its "
+	            "normal used on %.1f%% (%s), screen y %s, GPU %.3f ms\n",
+	            std::chrono::duration<double>(now - g_rt.stat_time).count(), 100.0 * sm[1] / px, sm[2] / 1000.0 / px,
+	            sm[3] > 0 ? sm[2] / 1000.0 / static_cast<double>(sm[3]) : 0.0, 100.0 * sm[3] / px,
+	            100.0 * sm[4] / (px * area), sm[4] > 0 ? 100.0 * sm[5] / static_cast<double>(sm[4]) : 0.0,
+	            static_cast<unsigned long long>(copies - g_rt.stat_copies0), static_cast<unsigned long long>(g_rt.stat_frames),
+	            100.0 * sm[6] / px, g_rt.dec_normal >= 0 ? "decoded" : "not identified: depth normals",
+	            g_rt.row0_up ? "row 0 = NDC +1" : "row 0 = NDC -1", g_rt.samples > 0 ? g_rt.sum_ms / g_rt.samples : 0.0);
+	std::fflush(stdout);
+	g_rt.stat_sum.fill(0);
+	g_rt.stat_frames = 0, g_rt.stat_gbuf_frames = 0, g_rt.stat_copies0 = copies;
+	g_rt.sum_ms = 0.0, g_rt.samples = 0;
+	g_rt.stat_time = now;
+}
+
+// The calibration's verdict: the normal layout (mean cos vs depth normals >= 0.8, best of layer x layout x view /
+// world space x screen y convention; the convention it implies is adopted) and, when its layout leaves a byte free in
+// the word, that byte as roughness (a guess: only modulating the wet-surface mask in the shader). Without a normal, the
+// floor votes (world up known) decide the y convention. True: a normal identified.
+bool Analyze(GraphicContext& graphics, uint32_t packed_count) {
+	if (g_rt.mapped == nullptr) return false;
 	(void)vmaInvalidateAllocation(graphics.allocator, g_rt.frame_mem, 0, VK_WHOLE_SIZE);
 	const int32_t* c = g_rt.mapped + HeaderBytes / 4;
 	const double   n = static_cast<double>(c[0]);
-	static const char* const layouts[5] = {"oct 16:16", "oct 12:12 bits 0..23", "oct 12:12 bits 8..31", "oct 11:11 bits 0..21",
-	                                       "xyz 10:10:10"};
-	int    best       = -1;
-	double best_score = 0.0;
+	static const char* const layouts[NLayouts] = {"oct 16:16",         "oct 12:12 bits 0..23", "oct 12:12 bits 8..31",
+	                                              "oct 11:11 bits 0..21", "xyz 10:10:10",       "oct 16:16 swapped",
+	                                              "oct 16:16 snorm",   "spheremap 16:16",      "xyz 11:11:10",
+	                                              "oct 8:8 bits 0..15", "oct 8:8 bits 16..31", "hemi-oct 16:16",
+	                                              "xyz 10:10:10 bits 2..31"};
+	int    best = -1, best_conv = 0;
+	double best_score = 0.0, second = 0.0;
 	if (n >= 200.0) {
+		std::array<double, 4 * NLayouts> per {}; // (the best |score| of each layer x layout: the runner-up's margin)
 		for (uint32_t layer = 0; layer < packed_count && layer < 4; ++layer)
-			for (int l = 0; l < 5; ++l)
-				for (int space = 0; space < 2; ++space) {
-					const double score = c[1 + (layer * 5 + l) * 2 + space] / 1000.0 / n;
-					if (std::abs(score) > std::abs(best_score)) best_score = score, best = static_cast<int>(layer) | (l << 2) | (space << 5);
-				}
+			for (uint32_t l = 0; l < NLayouts; ++l)
+				for (int space = 0; space < 2; ++space)
+					for (int conv = 0; conv < 2; ++conv) {
+						const double score = c[CalibNormal + (layer * NLayouts + l) * 4 + space * 2 + conv] / 1000.0 / n;
+						per[layer * NLayouts + l] = std::max(per[layer * NLayouts + l], std::abs(score));
+						if (std::abs(score) > std::abs(best_score)) {
+							best_score = score, best_conv = conv;
+							best       = static_cast<int>(layer | (l << 2)) | (space << 6);
+						}
+					}
+		for (uint32_t k = 0; k < per.size(); ++k)
+			if (best >= 0 && static_cast<int>(k) != (best & 3) * static_cast<int>(NLayouts) + ((best >> 2) & 15))
+				second = std::max(second, per[k]);
 	}
-	if (best >= 0 && std::abs(best_score) >= 0.85) {
-		if (best_score < 0.0) best |= 64;
+	const double floors_cur = c[CalibFloors], floors_mirror = c[CalibFloors + 1];
+	std::printf("RT reflections: calibration %u: %.0f samples, %u packed layers, best normal fit %.3f (next layout %.3f), "
+	            "floors %.0f (screen y as is) vs %.0f (mirrored)\n",
+	            g_rt.calib_attempts + 1, n, packed_count, std::abs(best_score), second, floors_cur, floors_mirror);
+	const bool identified = best >= 0 && std::abs(best_score) >= 0.8;
+	if (identified) {
+		if (best_score < 0.0) best |= 128;
 		if (g_rt.dec_normal < 0) g_rt.dec_normal = best;
-		std::printf("RT reflections: G-buffer normal = layer %d, %s, %s space%s (mean cos %.3f vs depth normals, %.0f samples)\n",
-		            best & 3, layouts[(best >> 2) & 7], (best & 32) ? "world" : "view", (best & 64) ? ", negated" : "",
-		            std::abs(best_score), n);
-		const int layout = (best >> 2) & 7, layer = best & 3;
-		const int shift  = layout == 1 ? 24 : layout == 2 ? 0 : -1;
-		if (g_rt.dec_rough < 0 && shift >= 0) {
-			const int    f    = layer * 4 + shift / 8;
-			const double mean = c[41 + f * 3] / 1000.0 / n, sq = c[42 + f * 3] / 1000.0 / n;
+		if (best_conv == 1 && !g_rt.row0_forced) g_rt.row0_up = !g_rt.row0_up, g_rt.history_valid = false;
+		const int layout = (best >> 2) & 15, layer = best & 3;
+		std::printf("RT reflections: G-buffer normal = layer %d, %s, %s space%s (mean cos %.3f vs depth normals); screen row 0 "
+		            "= NDC y %s\n",
+		            layer, layouts[layout], (best & 64) ? "world" : "view", (best & 128) ? ", negated" : "", std::abs(best_score),
+		            g_rt.row0_up ? "+1" : "-1");
+		// The word's free byte(s) as roughness: the candidate with the widest spread.
+		int cands[2] = {-1, -1};
+		if (layout == 1 || layout == 3) cands[0] = 3;
+		if (layout == 2) cands[0] = 0;
+		if (layout == 9) cands[0] = 2, cands[1] = 3;
+		if (layout == 10) cands[0] = 0, cands[1] = 1;
+		double best_sd = 0.03;
+		int    pick    = -1;
+		for (int b: cands) {
+			if (b < 0) continue;
+			const int    f    = CalibBytes + (layer * 4 + b) * 3;
+			const double mean = c[f] / 1000.0 / n, sq = c[f + 1] / 1000.0 / n;
 			const double sd   = std::sqrt(std::max(sq - mean * mean, 0.0));
-			if (sd > 0.03 && mean > 0.03 && mean < 0.97) {
-				g_rt.dec_rough = layer | (shift << 2) | (8 << 7);
-				std::printf("RT reflections: roughness = layer %d bits %d..%d (mean %.2f, sd %.2f; a GUESS weighed by the "
-				            "wet-surface heuristic; KYTY_RT_REFLECTIONS_ROUGH overrides)\n",
-				            layer, shift, shift + 7, mean, sd);
-			}
+			if (sd > best_sd && mean > 0.03 && mean < 0.97) best_sd = sd, pick = b;
+		}
+		if (g_rt.dec_rough < 0 && pick >= 0) {
+			g_rt.dec_rough = layer | ((pick * 8) << 2) | (8 << 7);
+			std::printf("RT reflections: roughness = layer %d bits %d..%d (sd %.2f; a GUESS that only modulates the wet-surface "
+			            "mask; KYTY_RT_REFLECTIONS_ROUGH overrides)\n",
+			            layer, pick * 8, pick * 8 + 7, best_sd);
 		}
 	} else {
-		std::printf("RT reflections: G-buffer normal not identified (best |mean cos| %.3f, %.0f samples): depth normals\n",
+		std::printf("RT reflections: G-buffer normal not identified (best |mean cos| %.3f, %.0f samples): depth normals and "
+		            "the wet-surface mask\n",
 		            std::abs(best_score), n);
+		if (!g_rt.row0_forced && floors_mirror >= 300.0 && floors_mirror > 2.0 * floors_cur) {
+			g_rt.row0_up       = !g_rt.row0_up;
+			g_rt.history_valid = false;
+			std::printf("RT reflections: screen row 0 = NDC y %s (the floor votes)\n", g_rt.row0_up ? "+1" : "-1");
+		}
 	}
-	if (g_rt.dec_rough < 0) std::printf("RT reflections: roughness from the wet-surface heuristic (up-facing, flat, plain, dark)\n");
+	if (g_rt.dec_rough < 0) std::printf("RT reflections: roughness from the wet-surface mask (up-facing, flat, plain, dark)\n");
 	std::fflush(stdout);
+	return identified;
 }
 
 } // namespace
@@ -486,32 +582,52 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	RtReflGbuffer gbuf;
 	const bool    have_gbuf    = RtReflGetGbuffer(gbuf) && gbuf.extent == color.extent;
 	const uint32_t packed_count = have_gbuf ? 4u : 0u;
+	ReadStats(*graphics, have_gbuf, level);
 	{
 		static bool said = false;
 		if (!said) {
 			said = true;
 			const int32_t n = NormalEnv("KYTY_RT_REFLECTIONS_NORMAL"), r = FieldEnv("KYTY_RT_REFLECTIONS_ROUGH");
-			if (n >= 0) g_rt.dec_normal = n, g_rt.calib_done = true;
+			if (n >= 0) g_rt.dec_normal = n;
 			if (r >= 0) g_rt.dec_rough = r, g_rt.rough_trusted = true;
-			if (n >= 0 || r >= 0) {
-				std::printf("RT reflections: decode from the environment (normal %d, roughness %d)\n", n, r);
+			if (const char* y = std::getenv("KYTY_RT_REFLECTIONS_FLIPY"); y != nullptr && *y != '\0')
+				g_rt.row0_up = *y != '0', g_rt.row0_forced = true;
+			// (a normal given and the convention forced: nothing left to calibrate)
+			if (n >= 0 && g_rt.row0_forced) g_rt.calib_done = true;
+			if (n >= 0 || r >= 0 || g_rt.row0_forced) {
+				std::printf("RT reflections: decode from the environment (normal %d, roughness %d, screen y %s)\n", n, r,
+				            g_rt.row0_forced ? (g_rt.row0_up ? "row 0 = NDC +1" : "row 0 = NDC -1") : "calibrated");
 				std::fflush(stdout);
 			}
 		}
 	}
-	const bool calibrate = have_gbuf && !g_rt.calib_done && g_rt.calib_runs < CalibRuns && (g_rt.calib_tick++ & 3u) == 0;
-	if (have_gbuf && !g_rt.calib_done && g_rt.calib_runs >= CalibRuns && ++g_rt.calib_wait > 8) {
-		g_rt.calib_done = true;
-		Analyze(*graphics, packed_count);
+	// The calibration: once the copy has been there 60 frames running (a scene, not the first loading frames), or with
+	// no copy at all after 600 frames (then only the floor votes); up to 3 attempts a minute apart until a normal fits.
+	g_rt.gb_streak = have_gbuf ? g_rt.gb_streak + 1 : 0;
+	if (!g_rt.calib_done && !g_rt.calib_active && g_rt.frame >= g_rt.calib_next &&
+	    (g_rt.gb_streak >= 60 || (g_rt.frame >= 600 && RtReflCopies() == 0))) {
+		g_rt.calib_active = true, g_rt.calib_clear = true;
+		g_rt.calib_runs = 0, g_rt.calib_wait = 0;
+		g_rt.calib_packed = have_gbuf ? 4u : 0u;
+	}
+	const bool calibrate = g_rt.calib_active && g_rt.calib_runs < CalibRuns && (g_rt.calib_tick++ & 3u) == 0 &&
+	                       (g_rt.calib_packed == 0 || have_gbuf);
+	if (g_rt.calib_active && g_rt.calib_runs >= CalibRuns && ++g_rt.calib_wait > 8) {
+		g_rt.calib_active      = false;
+		const bool identified = Analyze(*graphics, g_rt.calib_packed);
+		++g_rt.calib_attempts;
+		if (identified || g_rt.dec_normal >= 0 || g_rt.calib_attempts >= 3) g_rt.calib_done = true;
+		else g_rt.calib_next = g_rt.frame + 3600;
 	}
 	const int32_t dec_normal = have_gbuf ? g_rt.dec_normal : -1;
 	const int32_t dec_rough  = have_gbuf && dec_normal >= 0 ? g_rt.dec_rough : -1;
 
 	RtReflCamera camera;
 	RtReflGetCamera(m, camera);
-	const bool use_normal = dec_normal >= 0 && ((dec_normal & 32) == 0 || camera.rows);
+	const bool use_normal = dec_normal >= 0 && ((dec_normal & 64) == 0 || camera.rows);
 
-	const float strength = EnvFloat("KYTY_RT_REFLECTIONS_STRENGTH", 1.0f, 0.0f, 2.0f);
+	const float strength = EnvFloat("KYTY_RT_REFLECTIONS_STRENGTH", 1.0f, 0.0f, 3.0f);
+	const float min_refl = EnvFloat("KYTY_RT_REFLECTIONS_MIN", 0.3f, 0.0f, 0.8f);
 	const int   iters    = level >= 3 ? 112 : level >= 2 ? 72 : 48;
 	const float cutoff   = level >= 3 ? 0.65f : level >= 2 ? 0.55f : 0.45f;
 	const int   passes   = level >= 3 ? 4 : level >= 2 ? 3 : 2;
@@ -521,9 +637,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			said = true;
 			static const char* const names[4] = {"off", "low", "high", "ultra"};
 			std::printf("RT reflections: on (%s: trace %ux%u of %ux%u, hi-z %u mips, %d iterations, %d a-trous passes, strength %g, "
-			            "G-buffer %s, exposure %s, camera %s)\n",
+			            "wet minimum reflectance %g, G-buffer %s, exposure %s, camera %s)\n",
 			            names[level], g_rt.trace.width, g_rt.trace.height, color.extent.width, color.extent.height, g_rt.hiz.levels,
-			            iters, passes, strength, have_gbuf ? "copy found (calibrating)" : "not found yet (depth normals, heuristic)",
+			            iters, passes, strength, min_refl, have_gbuf ? "copy found (calibrating)" : "not found yet (depth normals, heuristic)",
 			            inputs.exposure_buffer != nullptr ? "the game's" : "1.0", camera.prev ? "matrices" : "motion vectors only");
 			std::fflush(stdout);
 		}
@@ -540,14 +656,15 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.motion[2] = cutoff, push.motion[3] = level >= 3 ? 0.8f : 1.0f;
 	push.misc[1] = static_cast<int32_t>(g_rt.frame & 0x7fffffff);
 	push.misc[2] = level;
-	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0);
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0) |
+	               (g_rt.row0_up ? 16 : 0);
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
 	push.dec[2] = static_cast<int32_t>(packed_count), push.dec[3] = 0;
 	const bool game_exposure = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
 	push.misc2[0] = game_exposure ? static_cast<int32_t>(inputs.exposure_index) : static_cast<int32_t>(ExposureIndex);
 	push.misc2[1] = static_cast<int32_t>(g_rt.hiz.levels), push.misc2[2] = iters, push.misc2[3] = g_rt.rough_trusted ? 1 : 0;
 
-	const bool timed = g_rt.pool != nullptr;
+	const bool timed = g_rt.pool != nullptr && g_rt.written < g_rt.read + 8; // (a ring of 8 frames)
 	const auto entry = static_cast<uint32_t>(g_rt.written % 8);
 	if (timed) {
 		command.resetQueryPool(g_rt.pool, entry * 2, 2);
@@ -563,13 +680,20 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		command.fillBuffer(vk::Buffer(g_rt.frame_buf), 0, VK_WHOLE_SIZE, 0);
 		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer,
 		        vk::AccessFlagBits2::eTransferWrite);
+	} else if (g_rt.calib_clear) {
+		// (a new calibration attempt: its sums from zero, the stats counters kept)
+		command.fillBuffer(vk::Buffer(g_rt.frame_buf), HeaderBytes, StatsIndex * 4, 0);
+		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer,
+		        vk::AccessFlagBits2::eTransferWrite);
 	}
+	g_rt.calib_clear = false;
 	{
 		std::array<float, HeaderBytes / 4> header {};
 		std::copy(camera.view_rows.begin(), camera.view_rows.end(), header.begin());
 		std::copy(camera.clip_to_prev.begin(), camera.clip_to_prev.end(), header.begin() + 12);
 		header[28] = camera.up[0], header[29] = camera.up[1], header[30] = camera.up[2], header[31] = camera.up_valid ? 1.0f : 0.0f;
-		header[32] = 1.0f; // (ExposureIndex: the exposure when the game gives none)
+		header[32] = 1.0f;     // (ExposureIndex: the exposure when the game gives none)
+		header[33] = min_refl; // (fparams.y)
 		command.updateBuffer(vk::Buffer(g_rt.frame_buf), 0, HeaderBytes, header.data());
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
@@ -639,7 +763,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	push.dec[3] = 0;
 	if (calibrate) {
+		push.dec[2] = static_cast<int32_t>(g_rt.calib_packed);
 		run(5, base, vk::Extent2D {160, 90});
+		push.dec[2] = static_cast<int32_t>(packed_count);
 		++g.calib_runs;
 	}
 	// Trace, temporal, a-trous, composite.
