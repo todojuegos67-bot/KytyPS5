@@ -300,7 +300,7 @@ float WaterMask(ivec2 rp, float d, vec2 uv, vec3 Nd) {
 	if (nearer <= 0.0) return 0.0;
 	float upf = UpFacing(Nd);
 	if (upf <= 0.0) return 0.0;
-	return nearer * upf * mix(0.6, 1.0, Flatness(uv, Nd, 0.90, 0.98));
+	return nearer * upf * Flatness(uv, Nd, 0.93, 0.985); // (refl4: must be flat: never a character or a particle)
 }
 // Flat water reflects as a mirror: its depth normal (noisy from the depth's precision far away) snapped to world up
 // when it is close to it; waves (normals further off) keep their own.
@@ -328,13 +328,15 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	if (match && push.dec.y >= 0) {
 		// The material field (roughness units: low = smooth / wet): wet below mparams.x, dry from mparams.y; walls half.
 		float r = clamp(Field(push.dec.y, rp), 0.0, 1.0);
-		mat     = (1.0 - smoothstep(mparams.x, mparams.y, r)) * mix(0.15, 1.0, UpFacing(Nd)) * mparams.z; // (refl3: walls 0.15, was 0.5)
+		mat     = (1.0 - smoothstep(mparams.x, mparams.y, r)) * UpFacing(Nd) * mparams.z; // (refl4: floors only)
+		if (mat > 0.0) mat *= Flatness(ruv, Nd, 0.97, 0.995);
 		mat_r   = mix(0.02, 0.15, smoothstep(0.0, mparams.y, r)); // (wet ground blurrier than water's 0.03)
 		mat    *= mparams.w; // (the wet cap: the CPU scales it down when most of the floor is wet)
 	}
 	float guess = water > 0.0 ? 0.0 : PuddleGuess(ruv, Nd) * fparams.w;
 	s.mask  = max(water, max(mat, guess));
 	s.rough = water >= mat && water >= guess ? 0.0 : mat >= guess ? mat_r : 0.12; // (water: a mirror, no lobe)
+	if (UpFacing(Nd) < 0.5) s.mask = 0.0; // (refl4: never on walls, characters or anything not facing up)
 	if (s.mask < 0.15) s.mask = 0.0; // (refl3: faint wet guesses reflect nothing)
 	return s;
 }
@@ -826,6 +828,11 @@ void Composite(ivec2 px) {
 	}
 	if (st && mask > 0.05) Stat(3, 1);
 	float water = WaterMask(px, d, uv, Nd);
+	// (refl4) Final gate per render pixel: only up-facing surfaces (the trace's mask is upsampled from half resolution
+	// and could bleed onto a character standing on water).
+	float upg = UpFacing(Nd);
+	if (upg <= 0.0) { imageStore(out_a, px, col); return; }
+	mask *= upg;
 	if (st && mask > 0.5 && water > 0.5) Stat(7, 1);
 	if (water > 0.0) N = WaterNormal(Nd); // (the G-buffer holds the bed under the water)
 	// (refl3) Water and near-mirrors with a half-resolution trace: their own mirror ray at the render resolution, so
