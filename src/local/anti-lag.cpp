@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -260,6 +261,8 @@ double                  g_pace_lead = 0.0; // smoothed input -> GPU done, ms
 std::atomic<double>     g_pace_slept_sum {0.0};
 std::atomic<uint32_t>   g_pace_slept_n {0};
 std::atomic<int>        g_pace_k {0};
+std::atomic<double>     g_pace_drain_sum {0.0};
+std::atomic<uint32_t>   g_pace_drain_n {0};
 
 StageStamp* StageFor(uint64_t index) {
 	if (index == 0) return nullptr;
@@ -291,6 +294,19 @@ bool PaceAllowed() {
 	       !FrameGen::Enabled();
 }
 
+const char*       g_pace_site = "scePadRead";
+std::atomic<bool> g_pace_logged {false};
+void PaceLogOnce(const char* what, double ms) {
+	if (g_pace_logged.exchange(true)) return;
+#if defined(_WIN32)
+	const unsigned long tid = GetCurrentThreadId();
+#else
+	const unsigned long tid = static_cast<unsigned long>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
+#endif
+	std::printf("[pace] first %s (%.1f ms) on thread %lu at %s (the game's controller read)\n", what, ms, tid, g_pace_site);
+	std::fflush(stdout);
+}
+
 void PaceBeforeInput(uint64_t index) {
 	if (!PaceAllowed()) return;
 	const double per_ms = LatTicksPerMs();
@@ -302,22 +318,41 @@ void PaceBeforeInput(uint64_t index) {
 	g_pace_k.store(1, std::memory_order_relaxed);
 	if (cap < 4.0 || cap > 70.0 || lead <= 0.0 || g_rel_index == 0 || index < 2) return;
 	if (g_pace.skip > 0) return; // (a late frame: no sleep for a while)
-	// Only right after the previous frame's release (a frame still queued: the game is behind, no sleep).
-	if (g_rel_index + 1 != index) return;
-	const int64_t rel = g_rel_ticks;
+	// Frames queued behind the cap (the steady state without pacing: 2, gpu done -> flip 65.8 ms, lat3): throttle the
+	// producer. The read of frame `index` waits until frame index - k has left (k = 1, or 2 when lead + margin is over
+	// one cap): each such read removes one queued frame, then the slot-based sleep below takes over.
+	const int k = lead > cap ? 2 : 1;
+	g_pace_k.store(k, std::memory_order_relaxed);
+	if (index <= static_cast<uint64_t>(k)) return;
+	const uint64_t target = index - static_cast<uint64_t>(k);
+	if (g_rel_index < target) {
+		const int64_t drain_start = LatNow();
+		g_pace_cond.wait_for(lock, std::chrono::microseconds(static_cast<int64_t>((cap * (k + 1) + 10.0) * 1000.0)),
+		                     [target] { return g_rel_index >= target; });
+		const double drained = static_cast<double>(LatNow() - drain_start) / per_ms;
+		g_pace_drain_sum.store(g_pace_drain_sum.load(std::memory_order_relaxed) + drained, std::memory_order_relaxed);
+		g_pace_drain_n.fetch_add(1, std::memory_order_relaxed);
+		PaceLogOnce("drain wait", drained);
+		if (g_rel_index < target) return; // (timed out: a pause / loading; nothing more)
+	}
+	if (g_rel_index != target) return; // (the game is behind: frame index - k left long ago, no sleep)
+	const auto* tst = StageFor(target);
+	const int64_t rel = tst != nullptr && tst->release.load(std::memory_order_relaxed) != 0 ? tst->release.load(std::memory_order_relaxed)
+	                                                                                        : g_rel_ticks;
 	lock.unlock();
 	const int64_t now     = LatNow();
 	const double  since   = static_cast<double>(now - rel) / per_ms;
-	if (since > cap) return; // (a pause, a loading screen, or already late)
-	// Wake by the slot - lead - margin, never later than leaves lead + margin before the slot.
-	double wait_ms = cap - since - lead;
+	if (since > cap * k) return; // (already late)
+	// Wake by the slot (release of index - k + k caps) - lead - margin; never more than that (no over-sleep).
+	double wait_ms = cap * k - since - lead;
 	if (wait_ms <= 0.5) return;
-	wait_ms             = std::min(wait_ms, cap - lead);
+	wait_ms             = std::min(wait_ms, cap * k - lead);
 	const int64_t until = now + static_cast<int64_t>(wait_ms * per_ms);
 	if (wait_ms > 1.5) std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>((wait_ms - 1.0) * 1000.0)));
 	while (LatNow() < until) std::this_thread::yield();
 	g_pace_slept_sum.store(g_pace_slept_sum.load(std::memory_order_relaxed) + wait_ms, std::memory_order_relaxed);
 	g_pace_slept_n.fetch_add(1, std::memory_order_relaxed);
+	PaceLogOnce("slot sleep", wait_ms);
 }
 } // namespace
 
@@ -519,6 +554,8 @@ void OnPresented(uint64_t frame_index) {
 			const double d   = static_cast<double>(g_lat.st_n);
 			const uint32_t sn = g_pace_slept_n.exchange(0, std::memory_order_relaxed);
 			const double   ss = g_pace_slept_sum.exchange(0.0, std::memory_order_relaxed);
+			const uint32_t dn = g_pace_drain_n.exchange(0, std::memory_order_relaxed);
+			const double   ds = g_pace_drain_sum.exchange(0.0, std::memory_order_relaxed);
 			double         lead = 0.0, iv = 0.0, margin = 0.0;
 			uint32_t       misses = 0;
 			{
@@ -530,10 +567,10 @@ void OnPresented(uint64_t frame_index) {
 				g_pace.misses = 0;
 			}
 			std::printf("[lat] stages: input->submit %.1f ms, submit->gpu done %.1f, gpu done->flip %.1f, flip->present %.1f "
-			            "(n %u); pace %s: sleep %.1f ms (n %u), lead %.1f + margin %.1f, cap %.1f, late %u\n",
+			            "(n %u); pace %s: drain %.1f ms (n %u), sleep %.1f ms (n %u), lead %.1f + margin %.1f, cap %.1f, k %d, late %u\n",
 			            g_lat.st_sum[0] / d, g_lat.st_sum[1] / d, g_lat.st_sum[2] / d, g_lat.st_sum[3] / d, g_lat.st_n,
-			            !Own().pace ? "off" : (PaceAllowed() && iv > 0.0 ? "on" : "idle"), sn > 0 ? ss / sn : 0.0, sn, lead,
-			            margin, iv, misses);
+			            !Own().pace ? "off" : (PaceAllowed() && iv > 0.0 ? "on" : "idle"), dn > 0 ? ds / dn : 0.0, dn,
+			            sn > 0 ? ss / sn : 0.0, sn, lead, margin, iv, g_pace_k.load(std::memory_order_relaxed), misses);
 			std::fflush(stdout);
 		}
 	}
@@ -553,7 +590,7 @@ void OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick) {
 	g_own_frames.store(frame + 1, std::memory_order_release);
 }
 
-void OnInput() {
+void OnInput(const char* site) {
 	if (Own().on) OwnLimit();
 	const Mode mode = g_mode.load(std::memory_order_relaxed);
 	if (mode == Mode::Off && !LatencyOn() && !Own().pace) return;
@@ -596,6 +633,7 @@ void OnInput() {
 		ReflexMarker(VK_LATENCY_MARKER_SIMULATION_START_NV, index);
 		ReflexMarker(VK_LATENCY_MARKER_INPUT_SAMPLE_NV, index);
 	}
+	g_pace_site = site;
 	PaceBeforeInput(index); // KYTY_LOWLAT_PACE_BEFORE_INPUT: sleep before the sample, not after
 	{
 		auto& st = g_stage[index % kStageRing];
