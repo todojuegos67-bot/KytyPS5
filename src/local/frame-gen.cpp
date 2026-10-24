@@ -5855,7 +5855,15 @@ namespace {
 // slower temporal alpha. The composite only darkens: color * (1 - strength * fade * (1 - visibility)), nothing on the
 // sky, faded out between KYTY_RT_SHADOWS_FADE (60 m) and twice that. KYTY_RT_SHADOWS_STRENGTH (0.6, 0..1),
 // KYTY_RT_SHADOWS_LENGTH (3.0: world ray length in m, 0.25..10), KYTY_RT_SHADOWS_HOLD (20 s: a sun unseen is kept).
-// Every 10 s a "RTSHADOW: stats" line: the share of pixels shadowed, mean occlusion, their depth, the GPU time.
+// Every 10 s a "RTSHADOW: stats" line: the share of pixels shadowed, mean occlusion, their depth, the sun's K and the
+// overcast factor, the GPU time.
+// (10-24, second round) Hard near-black shards on far cliffs (Boletaria, overcast): rays 3.75 m long at 50 m with a
+// 1 m thickness hit the next flat facet of the cliff's mesh. Now: rays, strength and thickness scale with distance
+// (generous within 6 m, conservative beyond 40 m), a least occluder distance over the receiver's plane, a ~3 degree
+// penumbra cone jittered per frame and a wider, softer a-trous (no binary edges), a cap of 75 % darkening; pixels the
+// game already shadows (dark against the same surface around them, on the scale its sun gives) get no second shadow;
+// and an overcast factor (KYTY_RT_SHADOWS_OVERCAST=0 turns it off): the light probe compares the luminance of what
+// faces the sun with what faces away (K, the sun-lit to ambient ratio): K <= 1.4 scales the strength to 0.15.
 //
 // Why the first version looked wrong: its depth reconstruction took the render's row 0 as NDC y -1, while the game's
 // viewport (GNM, yscale < 0) puts NDC y +1 there: the scene it marched was mirrored vertically against the light it
@@ -5913,6 +5921,9 @@ struct CShadowPass {
 	int64_t                 stat_frame = -1;
 	double                  st_pixels = 0.0, st_n = 0.0, st_occ = 0.0, st_depth = 0.0;
 	uint32_t                st_samples = 0;
+	// The light probe: log2 K smoothed (K the game's sun-lit to facing-away luminance ratio; -1 none yet) and the
+	// overcast factor it gives the strength (1 full sun .. 0.15 overcast).
+	double                  log_k = -1.0, sun_factor = 1.0;
 	// The sun's space: 0 unknown, 1 world, 2 view; turns that voted for each.
 	int                     space = 0, world_votes = 0, view_votes = 0;
 	bool                    space_ref = false;
@@ -5939,8 +5950,9 @@ struct CShadowPush {
 	int32_t misc[4];
 	float   extra[4];
 	float   cand[4][4];
+	float   tune[4]; // x: 1 / K (the light probe's sun-lit to ambient ratio)
 };
-static_assert(sizeof(CShadowPush) == 160);
+static_assert(sizeof(CShadowPush) == 176);
 
 int ContactQuality() {
 	static const int quality = [] {
@@ -6334,14 +6346,29 @@ void CShadowTakeStats() {
 		g_cs.st_pixels += static_cast<double>(g_cs.render.width) * g_cs.render.height;
 		g_cs.st_n += v[0], g_cs.st_occ += v[1] / 256.0, g_cs.st_depth += v[2] / 2.0;
 		++g_cs.st_samples;
+		// The light probe: geometric means of the sun-facing and facing-away luminance (log2 * 32 + 40 * 32 codes).
+		if (v[4] >= 200 && v[6] >= 200) {
+			const double lk = std::clamp((static_cast<double>(v[5]) / v[4] - static_cast<double>(v[7]) / v[6]) / 32.0, 0.0, 6.0);
+			g_cs.log_k      = g_cs.log_k < 0.0 ? lk : g_cs.log_k + (lk - g_cs.log_k) * 0.2; // (~1.3 s at 60 fps)
+		}
+		// K 1.4 or less: overcast (the sun barely lights what faces it): 0.15; K 3 or more: full.
+		static const bool auto_sun = [] {
+			const char* value = std::getenv("KYTY_RT_SHADOWS_OVERCAST");
+			return !(value != nullptr && *value == '0');
+		}();
+		if (auto_sun && g_cs.log_k >= 0.0) {
+			const double k = std::exp2(g_cs.log_k), x = std::clamp((k - 1.4) / (3.0 - 1.4), 0.0, 1.0);
+			g_cs.sun_factor = 0.15 + 0.85 * x * x * (3.0 - 2.0 * x);
+		}
 	}
 	const auto now = std::chrono::steady_clock::now();
 	if (now - g_cs.last_log < std::chrono::seconds(10)) return;
 	if (g_cs.st_samples > 0 || g_cs.samples > 0) {
 		const double n = g_cs.st_n, px = std::max(g_cs.st_pixels, 1.0);
 		std::printf("RTSHADOW: stats: %.1f %% of pixels shadowed (occlusion > 0.1), mean occlusion %.3f (%.3f on those), their "
-		            "mean depth %.1f m; GPU %.3f ms (%u samples, %u frames)\n",
+		            "mean depth %.1f m; sun lit/ambient K %.2f -> overcast factor %.2f; GPU %.3f ms (%u samples, %u frames)\n",
 		            100.0 * n / px, g_cs.st_occ / px, n > 0.0 ? g_cs.st_occ / n : 0.0, n > 0.0 ? g_cs.st_depth / n : 0.0,
+		            g_cs.log_k >= 0.0 ? std::exp2(g_cs.log_k) : 0.0, g_cs.sun_factor,
 		            g_cs.samples > 0 ? g_cs.sum_ms / g_cs.samples : 0.0, g_cs.st_samples, g_cs.samples);
 		std::fflush(stdout);
 	}
@@ -6716,7 +6743,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// The statistics on every 16th frame (one in flight).
 	const bool stats = g_cs.stat_frame < 0 && g_cs.frame % 16 == 8;
 	if (stats) {
-		command.fillBuffer(vk::Buffer(g_cs.vote), 64 * 4, 4 * 4, 0);
+		command.fillBuffer(vk::Buffer(g_cs.vote), 64 * 4, 8 * 4, 0); // (statistics 64..66, light probe 68..71)
 		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
 		       vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
 	}
@@ -6775,7 +6802,8 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	const auto l_view = ToView(view, g_cs.latch_axis);
 	push.extra[1] = static_cast<float>(l_view[0]), push.extra[2] = static_cast<float>(l_view[1]), push.extra[3] = static_cast<float>(l_view[2]);
-	push.trace[2] = strength * g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade); // (smoothstep fade)
+	push.trace[2] = strength * g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade) * static_cast<float>(g_cs.sun_factor); // (smoothstep fade; overcast)
+	push.tune[0]  = g_cs.log_k >= 0.0 ? static_cast<float>(1.0 / std::max(std::exp2(g_cs.log_k), 1.25)) : 0.0f;
 	if (!g_cs.said_on) {
 		g_cs.said_on = true;
 		static const char* axes[] {"+x", "-x", "+y", "-y", "+z", "-z"};
@@ -6807,6 +6835,12 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		run(2, g_cs.tmp_b, g_cs.raw, g_cs.tmp_a, g_cs.raw, 4.0f, g_cs.trace);
 		final_vis = &g_cs.tmp_a;
 	}
+	if (quality >= 3) { // (10-24: a wider pass: the penumbra soft, no hard shards)
+		run(2, g_cs.tmp_a, g_cs.raw, g_cs.tmp_b, g_cs.raw, 8.0f, g_cs.trace);
+		final_vis = &g_cs.tmp_b;
+	}
+	if (stats) // (the light probe: the game's sun strength; push.extra holds this frame's light)
+		run(6, g_cs.tmp_a, g_cs.tmp_b, g_cs.raw, g_cs.gbuf[cur], 0.0f, vk::Extent2D {(color.extent.width + 3) / 4, (color.extent.height + 3) / 4});
 	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_b; // (the composite's stability mask: the history count in .x)
 	if (stats) push.misc[3] |= 8;
 	run(4, *final_vis, g_cs.raw, g_cs.out, g_cs.raw, 0.0f, g_cs.render);
