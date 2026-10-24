@@ -72,17 +72,6 @@
           <property name="toolTip"><string>Language</string></property>
          </widget>
         </item>
-        <item row="3" column="0">
-         <widget class="QLabel" name="label_entitlements">
-          <property name="text"><string>Add-on content (private):</string></property>
-         </widget>
-        </item>
-        <item row="3" column="1">
-         <widget class="QLineEdit" name="lineEdit_entitlements">
-          <property name="toolTip"><string>Private build only: entitlement labels, separated by commas, passed to the emulator as KYTY_ENTITLEMENTS</string></property>
-          <property name="clearButtonEnabled"><bool>true</bool></property>
-         </widget>
-        </item>
        </layout>
       </widget>
      </item>

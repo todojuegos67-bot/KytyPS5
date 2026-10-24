@@ -454,13 +454,6 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	process->setArguments(args);
 #endif
 	process->setWorkingDirectory(dir.path());
-	// Private build only: the game's entitlement labels reach the emulator through its
-	// development option.
-	if (!info.entitlements.isEmpty()) {
-		auto environment = QProcessEnvironment::systemEnvironment();
-		environment.insert(QStringLiteral("KYTY_ENTITLEMENTS"), info.entitlements);
-		process->setProcessEnvironment(environment);
-	}
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);

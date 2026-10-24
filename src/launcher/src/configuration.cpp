@@ -5,7 +5,6 @@ QVariantMap Configuration::GameSettings() const {
 #define KYTY_CFG_SET(n) values.insert(QStringLiteral(#n), QVariant::fromValue(n).toString())
 	KYTY_CFG_SET(screen_resolution);
 	KYTY_CFG_SET(user_name);
-	KYTY_CFG_SET(entitlements);
 	KYTY_CFG_SET(user_id);
 	KYTY_CFG_SET(audio_input_device);
 	KYTY_CFG_SET(present_mode);
@@ -47,7 +46,6 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 #define KYTY_CFG_GET(n) n = s.value(QStringLiteral(#n)).template value<decltype(n)>()
 	KYTY_CFG_GET(screen_resolution);
 	user_name          = s.value("user_name", user_name).toString();
-	entitlements       = s.value("entitlements", entitlements).toString();
 	bool user_id_ok    = false;
 	auto saved_user_id = s.value("user_id", user_id).toInt(&user_id_ok);
 	user_id            = user_id_ok && Config::IsConfiguredUserIdValid(saved_user_id)

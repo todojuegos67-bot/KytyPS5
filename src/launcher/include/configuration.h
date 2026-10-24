@@ -112,8 +112,6 @@ public:
 
 	Resolution             screen_resolution           = Resolution::R1280X720;
 	QString                user_name                   = "Kyty";
-	// Private build only: entitlement labels for KYTY_ENTITLEMENTS, comma separated.
-	QString                entitlements;
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
@@ -152,7 +150,6 @@ public:
 	void CopyEmulatorSettingsFrom(const Configuration& other) {
 		screen_resolution           = other.screen_resolution;
 		user_name                   = other.user_name;
-		entitlements                = other.entitlements;
 		user_id                     = other.user_id;
 		audio_input_device          = other.audio_input_device;
 		present_mode                = other.present_mode;

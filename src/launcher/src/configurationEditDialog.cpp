@@ -208,7 +208,6 @@ static void ListInit(QComboBox* combo, T value) {
 void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
 	m_ui->lineEdit_user_name->setText(info.user_name);
-	m_ui->lineEdit_entitlements->setText(info.entitlements);
 	m_ui->spinBox_user_id->setValue(info.user_id);
 	UpdateControllerColorButton(m_ui->button_controller_color, info.controller.color);
 	m_ui->slider_controller_vibration->setValue(info.controller.vibration_intensity);
@@ -429,7 +428,6 @@ void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
 
 static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, bool global_settings) {
 	info.user_name = ui.lineEdit_user_name->text().trimmed();
-	info.entitlements = ui.lineEdit_entitlements->text().trimmed();
 	info.user_id   = ui.spinBox_user_id->value();
 	info.audio_input_device = ui.comboBox_audio_input_device->currentData().toString();
 	if (global_settings) {
