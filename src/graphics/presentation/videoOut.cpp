@@ -599,6 +599,21 @@ void NotePlayerInput() noexcept {
 }
 static void NoteFrameForWorld(bool scene) {
 	if (g_world_ready.load(std::memory_order_relaxed) || !g_player_input.load(std::memory_order_relaxed)) return;
+	// Another title (its worlds' files and loading screens are not known): the gate opens at the first flip after
+	// the player's first button (KYTY_WORLD_GATE_S: that many seconds after it, default 0).
+	if (!Libs::Graphics::DemonsSouls::IsSupportedGame()) {
+		static const int64_t wait_ms = [] {
+			const char* value = std::getenv("KYTY_WORLD_GATE_S");
+			return value != nullptr ? std::max<int64_t>(0, static_cast<int64_t>(std::atof(value) * 1000.0)) : int64_t {0};
+		}();
+		const int64_t since = std::chrono::steady_clock::now().time_since_epoch().count() - g_input_ns.load(std::memory_order_relaxed);
+		if (since >= std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(wait_ms)).count()) {
+			g_world_ready.store(true, std::memory_order_relaxed);
+			std::printf("World: the player's first button (this title): frame generation and frames above 60 allowed from here\n");
+			std::fflush(stdout);
+		}
+		return;
+	}
 	using namespace std::chrono;
 	static int64_t nonscene_since = 0;
 	static bool    loading_seen   = false;
@@ -691,6 +706,9 @@ void NotePace(int kind) noexcept {
 }
 bool PlayerInputSeen() noexcept {
 	return g_world_ready.load(std::memory_order_relaxed);
+}
+bool PlayerButtonSeen() noexcept {
+	return g_player_input.load(std::memory_order_relaxed);
 }
 static std::atomic<int64_t> g_cinematic_ns {0};
 void NoteCinematic(const char* name) noexcept {

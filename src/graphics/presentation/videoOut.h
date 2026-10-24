@@ -42,6 +42,8 @@ void NotePlayerInput() noexcept;
 // Any button or a stick off centre (controller.cpp): ends a held cutscene (CutsceneHeld).
 void NotePlayerActivity() noexcept;
 bool PlayerInputSeen() noexcept;
+// The player's first button was pressed (NotePlayerInput), whatever the world gate.
+bool PlayerButtonSeen() noexcept;
 // KYTY_PACE_STATS (default 1): every 5 s in a world, how evenly the game asks for flips (kind 0) and how evenly
 // they reach the screen (kind 1), and how far the two disagree frame by frame (what the eye sees as roughness).
 void NotePace(int kind) noexcept;

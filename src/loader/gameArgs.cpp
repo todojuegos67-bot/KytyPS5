@@ -1,4 +1,5 @@
 #include "loader/gameArgs.h"
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 
 #include "common/file.h"
 #include "graphics/host_gpu/hostMemory.h"
@@ -58,6 +59,9 @@ bool CinematicByRatio() {
 // The engine opens them as "$/packagecmdlineargs.txt" and "$/misc/renderconfig_ps5_perf.txt" (lower case): the
 // names are compared without case.
 Kind KindOf(const std::filesystem::path& real) {
+	// (Demon's Souls' files: another title's file of one of these names is its own.)
+	static const bool ds = Libs::Graphics::DemonsSouls::IsSupportedGame();
+	if (!ds) return Kind::None;
 	auto name = real.filename().string();
 	for (auto& c: name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 	if (name == "packagecmdlineargs.txt" && !ExtraLines().empty()) return Kind::Args;

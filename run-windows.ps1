@@ -574,14 +574,14 @@ if ($Turbo2) {
 		KYTY_TEXTURE_REDUCE = '2'; KYTY_TRIM_RAM_SECONDS = '0'; KYTY_IMAGE_POOL = '0'
 		KYTY_NATIVE_XPR_STORE_BUDGET = '64'; KYTY_TABLE_STORE_BUDGET = '4'; KYTY_SIMULATE_RAM_MB = '10240'; KYTY_RAM_DIET = '1' }
 	foreach ($key in $turboSet.Keys) { $environment[$key] = $turboSet[$key] }
-	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars['low']) | Where-Object { $_ }) -join ';'
+	if ($titleId -match '^PPSA0134[0-2]$') { $environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars['low']) | Where-Object { $_ }) -join ';' }
 	Write-Host 'memory:   turbo 2.0 (8-12 GB PCs, 4-6 GB GPUs): video memory caches 2.5 GB, textures a quarter, no RAM trim'
 }
 elseif ($Turbo) {
 	$turboSet = [ordered]@{ KYTY_VRAM_BUDGET_MB = '4608'; KYTY_GC_BUDGET_CAP_MB = '4608'; KYTY_SMALL_VRAM = '1'
 		KYTY_TEXTURE_REDUCE = '1'; KYTY_TRIM_RAM_SECONDS = '0'; KYTY_IMAGE_POOL = '0' }
 	foreach ($key in $turboSet.Keys) { $environment[$key] = $turboSet[$key] }
-	if (!$Quality) {
+	if (!$Quality -and $titleId -match '^PPSA0134[0-2]$') {
 		$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars['low']) | Where-Object { $_ }) -join ';'
 	}
 	Write-Host 'memory:   turbo (16 GB PCs): video memory caches 4.5 GB, textures reduced, no RAM trim'
