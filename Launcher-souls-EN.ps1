@@ -240,9 +240,15 @@ function Start-Game {
 	# (10-23 noche) Anti-Lag propio del emulador (KYTY_LOWLAT): sin Reflex ni FSR3 tocado; con la frame generation de AMD.
 	if (Is-FixedFg) { $cmbAl.SelectedIndex = 2 }  # (10-24) siempre Ultra en los modos fijos
 	$ownLat = ($cmbAl.SelectedIndex -eq 1 -or $cmbAl.SelectedIndex -eq 2) -and $config -like 'fsr3*'
+	# (10-24) Frame generation de NVIDIA (DLSS-G): Reflex (por defecto) o el nuestro; con el nuestro Reflex se apaga.
+	$dgOwn = $config -like 'dlss*' -and $cmbAlNv.SelectedIndex -gt 0
+	if ($dgOwn) {
+		$sets += 'KYTY_DLSSG_REFLEX=off'; $sets += 'KYTY_LOWLAT=1'
+		$sets += $(if ($cmbAlNv.SelectedIndex -eq 2) { 'KYTY_LOWLAT_QUEUE=1' } else { 'KYTY_LOWLAT_QUEUE=2' })
+	}
 	if ($ownLat) { $sets += 'KYTY_LOWLAT=1'; $sets += $(if ($cmbAl.SelectedIndex -eq 2) { 'KYTY_LOWLAT_QUEUE=1' } else { 'KYTY_LOWLAT_QUEUE=2' }) }  # (10-23) Anti-Lag: 2 frames en cola; Ultra: 1
 	# (10-23) Para las metricas: si va Anti-Lag y cual.
-	Set-IniValue 'antilagon' $(if ($ownLat) { $(if ($cmbAl.SelectedIndex -eq 2) { 'Ultra' } else { 'Normal' }) } elseif ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
+	Set-IniValue 'antilagon' $(if ($dgOwn) { $(if ($cmbAlNv.SelectedIndex -eq 2) { 'Ultra (Reflex off)' } else { 'Normal (Reflex off)' }) } elseif ($ownLat) { $(if ($cmbAl.SelectedIndex -eq 2) { 'Ultra' } else { 'Normal' }) } elseif ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
 	if ($nvAmd -or $fixedAl) {
 		$psargs += '-AntiLag'
 		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y
@@ -906,6 +912,14 @@ $gFg.Controls.Add($cmbAl); $cmbAl.Location = $chkAntiLag.Location; $cmbAl.Size =
 $lbReflex = New-Label 'Reflex: on (DLSS-G)' $smallFont ([System.Drawing.Color]::FromArgb(120, 210, 120)) 0 0 186 24
 $lbReflex.TextAlign = 'MiddleLeft'; $gFg.Controls.Add($lbReflex); $lbReflex.Location = $chkAntiLag.Location; $lbReflex.Visible = $false
 $tips.SetToolTip($lbReflex, 'NVIDIA frame generation (DLSS-G) always runs with NVIDIA Reflex on: lower latency automatically.')
+# (10-24) Con DLSS-G: elegir Reflex (por defecto) o nuestro Anti-Lag (Reflex apagado), para comparar.
+$cmbAlNv = New-Object System.Windows.Forms.ComboBox
+$cmbAlNv.DropDownStyle = 'DropDownList'; $cmbAlNv.Font = $smallFont
+foreach ($l in 'Reflex (NVIDIA)', 'Anti-Lag', 'Anti-Lag Ultra') { [void]$cmbAlNv.Items.Add($l) }
+$an = 0; [void][int]::TryParse((Get-IniValue 'antilagdlssg' '0'), [ref]$an); $cmbAlNv.SelectedIndex = [math]::Min([math]::Max(0, $an), 2)
+$cmbAlNv.Add_SelectedIndexChanged({ Set-IniValue 'antilagdlssg' "$($cmbAlNv.SelectedIndex)" })
+$gFg.Controls.Add($cmbAlNv); $cmbAlNv.Location = $chkAntiLag.Location; $cmbAlNv.Size = New-Object System.Drawing.Size(186, 26); $cmbAlNv.Visible = $false
+$tips.SetToolTip($cmbAlNv, 'With NVIDIA frame generation (DLSS-G). Reflex: NVIDIA''s (recommended). Anti-Lag / Ultra: ours with Reflex off, to compare which feels better. Without Reflex, DLSS-G may pace differently or warn that Reflex is missing.')
 # Solo se puede marcar con la frame generation de AMD (con la de NVIDIA ya va Reflex); fuera de ella se desmarca.
 function Update-AntiLagBox {
 	$cfgNow = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
@@ -926,7 +940,8 @@ function Update-AntiLagBox {
 		$script:alLocked = $false; $cmbAl.Enabled = $true
 		$v = if ($script:isAmd) { 0 } else { 1 }; [void][int]::TryParse((Get-IniValue $script:alKey "$v"), [ref]$v); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $v), $cmbAl.Items.Count - 1)
 	}
-	$lbReflex.Visible = (-not $ok) -and $cfgNow -like 'dlss*'
+	$lbReflex.Visible = $false
+	$cmbAlNv.Visible = (-not $ok) -and $cfgNow -like 'dlss*'
 }
 $cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
 $cmbRes.Add_SelectedIndexChanged({ Update-AntiLagBox })
