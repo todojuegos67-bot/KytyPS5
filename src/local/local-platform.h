@@ -132,6 +132,8 @@ bool MemoryTagsEnabled();
 bool LowMemVram();
 // KYTY_SIMULATE_VRAM_MB's ballast (bytes): the breakdown line says that much of its commit is the test's.
 void SetSimulationBallast(uint64_t bytes);
+// The KYTY_SIMULATE_VRAM_MB ballast held (its driver commit shows in the private bytes: the test's, not the game's).
+uint64_t SimulationBallast();
 void MemoryTagAdd(int tag, int64_t requested, int64_t committed);
 uint64_t  PhysicalMemory();
 // KYTY_TRIM_RAM_SECONDS=<n>: every n seconds the process's working set is emptied (Windows: the pages go to the

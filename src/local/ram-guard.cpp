@@ -239,8 +239,11 @@ Sample Take(const Settings& s, HANDLE low_memory, bool walk_store, uint64_t last
 		out.available  = std::min(out.real_available, s.sim_ram > used ? s.sim_ram - used : 0);
 	}
 	if (s.sim_commit_limit != 0) {
-		out.simulated           = true;
-		const uint64_t charged  = s.sim_os_commit + out.private_bytes + out.store_committed;
+		out.simulated = true;
+		// (Not the KYTY_SIMULATE_VRAM_MB ballast's driver commit: 7.8 GB of the private bytes in a simulated 8 GB card
+		// run, 10-24, which a real 8 GB card does not have.)
+		const uint64_t ballast  = LocalPlatform::SimulationBallast();
+		const uint64_t charged  = s.sim_os_commit + (out.private_bytes - std::min(out.private_bytes, ballast)) + out.store_committed;
 		const uint64_t headroom = std::min(out.real_headroom, s.sim_commit_limit > charged ? s.sim_commit_limit - charged : 0);
 		out.commit_limit        = s.sim_commit_limit;
 		out.commit_total        = s.sim_commit_limit - std::min(s.sim_commit_limit, headroom);
@@ -262,10 +265,14 @@ int LevelOf(const Settings& s, const Sample& sample) {
 }
 
 std::string Figures(const Sample& sample) {
-	char line[512];
+	char       ballast_text[96] = "";
+	if (const uint64_t ballast = LocalPlatform::SimulationBallast(); ballast != 0)
+		std::snprintf(ballast_text, sizeof(ballast_text), " (%llu MiB of the private: the KYTY_SIMULATE_VRAM_MB ballast, not counted)",
+		              static_cast<unsigned long long>(ballast / MiB));
+	char line[640];
 	std::snprintf(line, sizeof(line),
 	              "available %llu of %llu MiB, commit %llu of %llu MiB (headroom %llu MiB)%s%s; emulator private %llu MiB, "
-	              "working set %llu MiB, guest store committed %llu MiB",
+	              "working set %llu MiB, guest store committed %llu MiB%s",
 	              static_cast<unsigned long long>(sample.available / MiB),
 	              static_cast<unsigned long long>(sample.total_phys / MiB),
 	              static_cast<unsigned long long>(sample.commit_total / MiB),
@@ -274,7 +281,7 @@ std::string Figures(const Sample& sample) {
 	              sample.simulated ? " (simulated: KYTY_SIMULATE_RAM_MB / KYTY_SIMULATE_COMMIT_MB)" : "",
 	              static_cast<unsigned long long>(sample.private_bytes / MiB),
 	              static_cast<unsigned long long>(sample.working_set / MiB),
-	              static_cast<unsigned long long>(sample.store_committed / MiB));
+	              static_cast<unsigned long long>(sample.store_committed / MiB), ballast_text);
 	return line;
 }
 

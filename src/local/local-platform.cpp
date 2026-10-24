@@ -1607,6 +1607,7 @@ inline size_t Hash(uint64_t address) {
 
 static std::atomic<uint64_t> g_simulation_ballast {0};
 void SetSimulationBallast(uint64_t bytes) { g_simulation_ballast = bytes; }
+uint64_t SimulationBallast() { return g_simulation_ballast.load(); }
 
 bool MemoryTagsEnabled() {
 	// KYTY_MEMORY_TAGS=1 (default off): a regression (black screen after the intro video on an RTX) followed the
@@ -2388,6 +2389,7 @@ void StartWorkingSetTrim() {}
 void KeepResident() {}
 void StartMemoryBreakdown() {}
 void SetSimulationBallast(uint64_t) {}
+uint64_t SimulationBallast() { return 0; }
 bool MemoryTagsEnabled() { return false; }
 void MemoryTagAdd(int, int64_t, int64_t) {}
 void SetTrimRunner(void (*)(void (*)())) {}
