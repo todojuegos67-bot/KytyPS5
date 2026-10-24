@@ -4057,12 +4057,6 @@ int KYTY_SYSV_ABI NpRegisterNpReachabilityStateCallback(void* /*callback*/, void
 	return OK;
 }
 
-int KYTY_SYSV_ABI NpUnregisterNpReachabilityStateCallback(void* /*callback*/, void* /*userdata*/) {
-	PRINT_NAME();
-
-	return OK;
-}
-
 int KYTY_SYSV_ABI NpGetNpId(int user_id, NpId* np_id) {
 	PRINT_NAME();
 

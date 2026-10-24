@@ -2159,20 +2159,7 @@ int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
 	}
 }
 
-static int KYTY_SYSV_ABI posix_kqueue() {
-	PRINT_NAME();
-	return 0;
-}
-
-static int KYTY_SYSV_ABI posix_kevent(int /*kq*/, const void* /*changelist*/, int /*nchanges*/,
-                                     void* /*eventlist*/, int /*nevents*/, const void* /*timeout*/) {
-	PRINT_NAME();
-	return 0;
-}
-
 LIB_DEFINE(InitLibKernel_1_Posix) {
-	LIB_FUNC("nh2IFMgKTv8", Posix::posix_kqueue);
-	LIB_FUNC("RW-GEfpnsqg", Posix::posix_kevent);
 	LIB_FUNC("k+AXqu2-eBc", getpagesize);
 	LIB_FUNC("lLMT9vJAck0", clock_gettime);
 	LIB_FUNC("smIj7eqzZE8", clock_getres);

@@ -700,42 +700,6 @@ static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare
 	return 0;
 }
 
-static int KYTY_SYSV_ABI HttpSetRedirectCallback(int /*id*/, void* /*cbfunc*/, void* /*userArg*/) {
-	PRINT_NAME();
-	return 0;
-}
-
-static int KYTY_SYSV_ABI HttpSetCookieRecvCallback(int /*id*/, void* /*cbfunc*/, void* /*userArg*/) {
-	PRINT_NAME();
-	return 0;
-}
-
-static int KYTY_SYSV_ABI HttpSetInflateGZIPEnabled(int /*id*/, int /*isEnable*/) {
-	PRINT_NAME();
-	return 0;
-}
-
-static int KYTY_SYSV_ABI HttpsLoadCert(int /*id*/, int /*caCertNum*/, const void** /*caList*/,
-                                      const void* /*cert*/, const void* /*privKey*/) {
-	PRINT_NAME();
-	return 0;
-}
-
-static int KYTY_SYSV_ABI HttpsUnloadCert(int /*id*/) {
-	PRINT_NAME();
-	return 0;
-}
-
-static int KYTY_SYSV_ABI HttpSetRequestStatusCallback(int /*id*/, void* /*cbfunc*/, void* /*userArg*/) {
-	PRINT_NAME();
-	return 0;
-}
-
-static int KYTY_SYSV_ABI HttpSetChunkedTransferEnabled(int /*id*/, int /*isEnable*/) {
-	PRINT_NAME();
-	return 0;
-}
-
 LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("A9cVMUtEp4Y", Http::HttpInit);
 	LIB_FUNC("Ik-KpLTlf7Q", Http::HttpTerm);
@@ -777,13 +741,6 @@ LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("IWalAn-guFs", LibHttp::HttpUriParse);
 	LIB_FUNC("YuOW3dDAKYc", LibHttp::HttpUriEscape);
 	LIB_FUNC("5LZA+KPISVA", LibHttp::HttpUriBuild);
-	LIB_FUNC("h9wmFZX4i-4", LibHttp::HttpSetRedirectCallback);
-	LIB_FUNC("Kh6bS2HQKbo", LibHttp::HttpSetCookieRecvCallback);
-	LIB_FUNC("i9mhafzkEi8", LibHttp::HttpSetInflateGZIPEnabled);
-	LIB_FUNC("DK+GoXCNT04", LibHttp::HttpsLoadCert);
-	LIB_FUNC("zXqcE0fizz0", LibHttp::HttpsUnloadCert);
-	LIB_FUNC("vO4B-42ef-k", LibHttp::HttpSetRequestStatusCallback);
-	LIB_FUNC("PDxS48xGQLs", LibHttp::HttpSetChunkedTransferEnabled);
 }
 
 } // namespace LibHttp
@@ -1669,7 +1626,6 @@ LIB_DEFINE(InitNet_1_NpManager) {
 	LIB_FUNC("GImICnh+boA", NpManager::NpRegisterPlusEventCallback);
 	LIB_FUNC("+yqjab2fUJA", NpManager::NpRegisterPremiumEventCallback);
 	LIB_FUNC("hw5KNqAAels", NpManager::NpRegisterNpReachabilityStateCallback);
-	LIB_FUNC("cRILAEvn+9M", NpManager::NpUnregisterNpReachabilityStateCallback);
 	LIB_FUNC("p-o74CnoNzY", NpManager::NpGetNpId);
 	LIB_FUNC("XDncXQIJUSk", NpManager::NpGetOnlineId);
 	LIB_FUNC("rbknaUjpqWo", NpManager::NpGetAccountIdA);
@@ -1690,42 +1646,6 @@ LIB_DEFINE(InitNet_1_NpManager) {
 }
 
 } // namespace LibNpManager
-
-namespace LibNpPartner001 {
-
-LIB_VERSION("NpPartner001", 1, "NpPartner001", 1, 1);
-
-static int KYTY_SYSV_ABI NpEAAccessInitialize() {
-	PRINT_NAME();
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpEAAccessTerminate() {
-	PRINT_NAME();
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpHasEAAccessSubscriptionAbortRequest() {
-	PRINT_NAME();
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpHasEAAccessSubscription(int /*user_id*/, bool* result) {
-	PRINT_NAME();
-	if (result != nullptr) {
-		*result = false;
-	}
-	return 0;
-}
-
-LIB_DEFINE(InitNet_1_NpPartner001) {
-	LIB_FUNC("7CxI50-xlCk", LibNpPartner001::NpEAAccessInitialize);
-	LIB_FUNC("pMxXhNozUX8", LibNpPartner001::NpEAAccessTerminate);
-	LIB_FUNC("pQfYTZHznMc", LibNpPartner001::NpHasEAAccessSubscriptionAbortRequest);
-	LIB_FUNC("+OnbUs1CV0M", LibNpPartner001::NpHasEAAccessSubscription);
-}
-
-} // namespace LibNpPartner001
 
 namespace LibNpSessionSignaling {
 
@@ -1835,35 +1755,6 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfoList(
 	return 0;
 }
 
-// Local entitlements support for offline / private mode (e.g. KYTY_ENTITLEMENTS=<label>,...)
-// By default, recognizes "FULLGAMEUNLOCK00" as installed so titles run in full-game offline mode
-// without prompting for server connection or license verification. Supports wildcard "*"
-// to grant any queried entitlement.
-static bool LocalEntitlement(const char* label) {
-	static const std::vector<std::string> labels = [] {
-		std::vector<std::string> list;
-		if (const char* value = std::getenv("KYTY_ENTITLEMENTS"); value != nullptr) {
-			const std::string text = value;
-			for (size_t begin = 0; begin <= text.size();) {
-				const auto end = std::min(text.find(',', begin), text.size());
-				if (end > begin) {
-					list.push_back(text.substr(begin, end - begin));
-				}
-				begin = end + 1;
-			}
-		}
-		if (list.empty()) {
-			list.push_back("FULLGAMEUNLOCK00");
-		}
-		return list;
-	}();
-	if (std::ranges::find(labels, "*") != labels.end()) {
-		return true;
-	}
-	const std::string wanted(label, strnlen(label, sizeof(NpUnifiedEntitlementLabel::data)));
-	return std::ranges::find(labels, wanted) != labels.end();
-}
-
 static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
     uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
     NpEntitlementAccessAddcontEntitlementInfo* info) {
@@ -1879,18 +1770,6 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 	}
 
 	memset(info, 0, sizeof(*info));
-
-	if (std::getenv("KYTY_DEBUG_ENTITLEMENTS") != nullptr) {
-		std::printf("entitlement query: %.16s\n", entitlement_label->data);
-		std::fflush(stdout);
-	}
-
-	if (LocalEntitlement(entitlement_label->data)) {
-		info->entitlement_label = *entitlement_label;
-		info->package_type      = 3; // Addcont
-		info->download_status   = 4; // Downloaded & installed
-		return 0;
-	}
 
 	for (const auto& entitlement: NP_ENTITLEMENT_ACCESS_ADDON_LIST) {
 		if (strncmp(entitlement_label->data, entitlement.entitlement_label.data,
@@ -1916,11 +1795,6 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetEntitlementKey(
 
 	if (entitlement_label == nullptr || key == nullptr) {
 		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
-	}
-
-	if (LocalEntitlement(entitlement_label->data)) {
-		std::memset(key, 0, sizeof(*key));
-		return 0;
 	}
 
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
@@ -3124,7 +2998,6 @@ LIB_DEFINE(InitNet_1) {
 	LibNetCtl::InitNet_1_NetCtl(s);
 	LibNpCommerce::InitNet_1_NpCommerce(s);
 	LibNpManager::InitNet_1_NpManager(s);
-	LibNpPartner001::InitNet_1_NpPartner001(s);
 	LibNpSessionSignaling::InitNet_1_NpSessionSignaling(s);
 	LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(s);
 	LibNpEntitlementAccessPft::InitNet_1_NpEntitlementAccessPft(s);
