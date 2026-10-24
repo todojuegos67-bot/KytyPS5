@@ -1241,19 +1241,20 @@ function Show-PadMapper {
 	} catch { $script:pmPhotoPs = $null; $script:pmPhotoXb = $null }
 	$photoTop = 84
 	if ($script:pmPhotoPs) {
-		$k = 350 / 371; $offX = (540 - $script:pmPhotoPs.Width) / 2
-		$c = @{ 'Up' = @(100, 72, 26); 'Down' = @(100, 132, 26); 'Left' = @(70, 102, 26); 'Right' = @(130, 102, 26)
-			'Triangle' = @(438, 62, 34); 'Circle' = @(478, 102, 34); 'Cross' = @(438, 142, 34); 'Square' = @(400, 102, 34)
-			'L3' = @(180, 175, 60); 'R3' = @(355, 175, 60); 'Options' = @(395, 42, 22); 'TouchPad' = @(270, 60, 90) }
+		# (10-24) Dibujo del mando (sin logos, va en la release), 350 de alto: centros medidos en el.
+		$k = 1.0; $offX = (540 - $script:pmPhotoPs.Width) / 2
+		$c = @{ 'Up' = @(96, 62, 29); 'Down' = @(96, 126, 29); 'Left' = @(65, 93, 29); 'Right' = @(128, 93, 29)
+			'Triangle' = @(435, 60, 38); 'Circle' = @(472, 94, 38); 'Cross' = @(435, 131, 38); 'Square' = @(398, 94, 38)
+			'L3' = @(178, 160, 67); 'R3' = @(346, 160, 67); 'Options' = @(389, 32, 20); 'TouchPad' = @(265, 52, 150) }
 		foreach ($n in $c.Keys) { $v = $c[$n]; $d = $v[2] * $k; $h = if ($n -eq 'TouchPad') { 80 * $k } else { $d }
 			$ps[$n] = @(($offX + $v[0] * $k - $d / 2), ($photoTop + $v[1] * $k - $h / 2), $d, $h, $(if ($n -eq 'TouchPad') { 'r' } else { 'c' })) }
 	}
 	if ($script:pmPhotoXb) {
-		$k = 350 / 393; $offX = (540 - $script:pmPhotoXb.Width) / 2
-		$c = @{ 'y' = @(420, 70, 36); 'x' = @(380, 108, 36); 'b' = @(460, 108, 36); 'a' = @(420, 150, 36)
-			'leftstick' = @(97, 110, 76); 'rightstick' = @(337, 198, 76)
-			'dpup' = @(183, 170, 26); 'dpdown' = @(183, 226, 26); 'dpleft' = @(155, 198, 26); 'dpright' = @(211, 198, 26)
-			'back' = @(186, 62, 26); 'start' = @(332, 62, 26) }
+		$k = 1.0; $offX = (540 - $script:pmPhotoXb.Width) / 2
+		$c = @{ 'y' = @(416, 58, 38); 'x' = @(377, 95, 38); 'b' = @(456, 95, 38); 'a' = @(416, 132, 38)
+			'leftstick' = @(125, 86, 72); 'rightstick' = @(339, 156, 72)
+			'dpup' = @(193, 140, 25); 'dpdown' = @(193, 192, 25); 'dpleft' = @(167, 166, 25); 'dpright' = @(219, 166, 25)
+			'back' = @(226, 89, 22); 'start' = @(312, 89, 22) }
 		foreach ($n in $c.Keys) { $v = $c[$n]; $d = $v[2] * $k
 			$xb[$n] = @(($offX + $v[0] * $k - $d / 2), ($photoTop + $v[1] * $k - $d / 2), $d, $d, 'c') }
 	}
