@@ -810,7 +810,7 @@ $lbPc.BackColor = [System.Drawing.Color]::FromArgb(170, 14, 16, 22)
 $lbPc.Text = "  GPU: $(if ($script:gpuName) { $script:gpuName } else { 'not detected' })$(if (-not $script:isNvidia) { '  (no DLSS: NVIDIA only)' })     PC: $($script:pcInfo)" +
 	$(if ($script:gpuRec) { "`n  Recommended: $($script:gpuRec[1]).  Expected (estimate): $($script:gpuRec[2])" } else { "`n  GPU not in the list: start with the Souls balanced mode and watch the metrics." })
 $lbPc.Location = New-Object System.Drawing.Point(16, ($H - 60)); $lbPc.Size = New-Object System.Drawing.Size(($W - $panelW - 32), 48)
-$form.Controls.Add($lbPc); $lbPc.BringToFront()
+$form.Controls.Add($lbPc); $lbPc.BringToFront(); $lbPc.Visible = $false  # (10-24) ahora en la tarjeta 'Tu equipo'
 if ($cmbPreset -and -not $script:isNvidia) { $cmbPreset.Enabled = $false }
 $panel.Controls.Add($btnExit)
 $chk4K.Visible = $false
@@ -1676,6 +1676,58 @@ function New-RtCombo([string]$label, [string]$key, $y, [string]$tip) {
 $cmbRtSh = New-RtCombo 'RT Shadows' 'rtshadow' 24 'Ray-traced sun shadows on the image, with denoising. Only with DLSS, XeSS or FSR. Low ~0.3 ms, High ~1 ms, Ultra ~1.5 ms. Beta.'
 $cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl' 56 'Ray-traced reflections on the image (water, puddles, floors), with denoising. Only with DLSS, XeSS or FSR. Low ~0.4 ms, High ~1 ms, Ultra ~2 ms. Beta.'
 
+# (10-24) Tu equipo: tarjeta con el caballero senalando la grafica y el equipo detectados (antes, una linea abajo).
+function New-PcCard {
+	$cw = 420; $ch = 262
+	$bmp = New-Object System.Drawing.Bitmap($cw, $ch, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+	$gc = [System.Drawing.Graphics]::FromImage($bmp)
+	$gc.SmoothingMode = 'AntiAlias'; $gc.TextRenderingHint = 'AntiAliasGridFit'; $gc.InterpolationMode = 'HighQualityBicubic'
+	$path = New-Object System.Drawing.Drawing2D.GraphicsPath; $r = 14
+	$path.AddArc(0, 0, $r * 2, $r * 2, 180, 90); $path.AddArc($cw - 1 - $r * 2, 0, $r * 2, $r * 2, 270, 90)
+	$path.AddArc($cw - 1 - $r * 2, $ch - 1 - $r * 2, $r * 2, $r * 2, 0, 90); $path.AddArc(0, $ch - 1 - $r * 2, $r * 2, $r * 2, 90, 90); $path.CloseFigure()
+	$fill = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-Object System.Drawing.Point(0, 0)), (New-Object System.Drawing.Point($cw, $ch)),
+		[System.Drawing.Color]::FromArgb(215, 30, 26, 20), [System.Drawing.Color]::FromArgb(215, 12, 13, 18))
+	$gc.FillPath($fill, $path)
+	$pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, 222, 196, 140), 1.5); $gc.DrawPath($pen, $path)
+	$knight = $null; $kp = Join-Path $root 'caballero.png'
+	try { if (Test-Path -LiteralPath $kp) { $knight = [System.Drawing.Image]::FromFile($kp) } } catch { $knight = $null }
+	if ($knight) { $gc.DrawImage($knight, [float]($cw - $knight.Width - 6), [float]($ch - $knight.Height - 6), [float]$knight.Width, [float]$knight.Height) }
+	$goldB = New-Object System.Drawing.SolidBrush($gold); $inkB = New-Object System.Drawing.SolidBrush($ink)
+	$dimB = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(160, 150, 140))
+	$redB = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(235, 90, 80))
+	$fHead = New-Object System.Drawing.Font('Segoe UI Black', 13, [System.Drawing.FontStyle]::Bold)
+	$fCap = New-Object System.Drawing.Font('Segoe UI', 8.5); $fVal = New-Object System.Drawing.Font('Segoe UI Semibold', 10, [System.Drawing.FontStyle]::Bold)
+	$fTxt = New-Object System.Drawing.Font('Segoe UI', 9)
+	$tw = 232; $x = 16; $y = 14
+	$gc.DrawString('YOUR PC', $fHead, $goldB, [float]$x, [float]$y); $y += 34
+	$put = {
+		param($cap, $val, $font, $brush)
+		$gc.DrawString($cap, $fCap, $dimB, [float]$x, [float]$y); $script:pcY = $y + 16
+		$sz = $gc.MeasureString($val, $font, $tw)
+		$gc.DrawString($val, $font, $brush, (New-Object System.Drawing.RectangleF($x, ($y + 16), $tw, ($sz.Height + 2))))
+		return ($y + 18 + $sz.Height + 6)
+	}
+	$gpu = if ($script:gpuName) { $script:gpuName } else { 'not detected' }
+	if (-not $script:isNvidia -and $script:gpuName) { $gpu += '  (no DLSS: NVIDIA only)' }
+	$y = & $put 'Graphics card' $gpu $fVal $inkB
+	$y = & $put 'Processor and RAM' "$($script:pcInfo)" $fTxt $inkB
+	if ($script:gpuRec) {
+		$bad = $script:gpuRec[1] -eq 'NOT COMPATIBLE'
+		$y = & $put 'Recommended mode' "$($script:gpuRec[1])" $fVal $(if ($bad) { $redB } else { $goldB })
+		[void](& $put 'Expected (estimate)' "$($script:gpuRec[2])" $fTxt $(if ($bad) { $redB } else { $inkB }))
+	} else {
+		[void](& $put 'Recommended mode' 'GPU not in the list: start with the Souls balanced mode and watch the metrics.' $fTxt $inkB)
+	}
+	foreach ($o in $fill, $pen, $goldB, $inkB, $dimB, $redB, $fHead, $fCap, $fVal, $fTxt, $path) { $o.Dispose() }
+	if ($knight) { $knight.Dispose() }
+	$gc.Dispose()
+	$pb = New-Object System.Windows.Forms.PictureBox
+	$pb.BackColor = [System.Drawing.Color]::Transparent; $pb.Image = $bmp
+	$pb.Location = New-Object System.Drawing.Point(10, 688); $pb.Size = New-Object System.Drawing.Size($cw, $ch)
+	$panel.Controls.Add($pb)
+	return $pb
+}
+$pcCard = New-PcCard
 $gCtl = New-Group 'Controls' 450 604 420 214
 # (10-23) Controles en un desplegable: el boton los muestra u oculta.
 $gCtl.Visible = $false
