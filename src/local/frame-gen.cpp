@@ -5650,8 +5650,9 @@ namespace {
 // game's exposure, the upscaler and its TAA), recorded first in Upscale (before SSGI / GTAO / SSR). 1: half-res trace,
 // 12 steps, temporal + a-trous 1, 2; 2: full res, 20 steps, a-trous 1, 2, 4; 3: full res, 32 steps, rays x1.25,
 // slower temporal alpha. The composite only darkens: color * (1 - strength * fade * (1 - visibility)), nothing on the
-// sky, faded out between KYTY_RT_SHADOWS_FADE (25 m) and twice that. KYTY_RT_SHADOWS_STRENGTH (0.6, 0..1),
-// KYTY_RT_SHADOWS_LENGTH (1.0: world ray length in m, 0.25..4), KYTY_RT_SHADOWS_HOLD (20 s: a sun unseen is kept).
+// sky, faded out between KYTY_RT_SHADOWS_FADE (60 m) and twice that. KYTY_RT_SHADOWS_STRENGTH (0.6, 0..1),
+// KYTY_RT_SHADOWS_LENGTH (3.0: world ray length in m, 0.25..10), KYTY_RT_SHADOWS_HOLD (20 s: a sun unseen is kept).
+// Every 10 s a "RTSHADOW: stats" line: the share of pixels shadowed, mean occlusion, their depth, the GPU time.
 //
 // Why the first version looked wrong: its depth reconstruction took the render's row 0 as NDC y -1, while the game's
 // viewport (GNM, yscale < 0) puts NDC y +1 there: the scene it marched was mirrored vertically against the light it
@@ -5675,6 +5676,11 @@ namespace {
 //  3. World up and the screen's y convention: a calibration pass (mode 5) counts the depth buffer's floors (normals
 //     within 14 degrees of an axis) along each world axis, both signs, in both conventions; the winner (2x the next)
 //     decides; priors +y up, row 0 = NDC y +1 (KYTY_RT_SHADOWS_UP=y|-y|z|..., KYTY_RT_SHADOWS_FLIPY=1|0 force them).
+//     (10-24) The camera narrows it first: a game camera does not roll, so world up is the axis its right vector stays
+//     perpendicular to while it turns (and its screen-up row stays within 70 degrees of), with the sign that puts up at
+//     the top of the screen (row 0) in each convention: the floors only choose between the two mirror twins left. The
+//     floors alone picked -z in Boletaria (walls facing a camera that looked along +z outnumbered the grazing ground;
+//     the game is +y up, as the KBM camera's yaw from x / z assumes), which flips any sun with z > 0 below the horizon.
 // The view-space light is the world sun through the current camera every frame; the pass is off while any is unknown.
 struct CShadowPass {
 	vk::DescriptorSetLayout set_layout = nullptr;
@@ -5695,6 +5701,15 @@ struct CShadowPass {
 	// Calibration: floors per hypothesis (convention c (0 row 0 = NDC +1, 1 mirrored) * 6 + axis * 2 + negative).
 	double                  calib[12] {};
 	int                     hyp = -1; // the decided hypothesis (-1: none yet)
+	// The camera's evidence on world up (frames; per axis: frames its right row is perpendicular to it and its up row
+	// leans toward it, the signed lean summed); the axis it decided (-1: none yet); the hypotheses it leaves.
+	double                  cam_frames = 0.0, cam_ok[3] {}, cam_lean[3] {};
+	int                     cam_axis = -1;
+	uint32_t                cam_mask = 0xfffu;
+	// Statistics (every 16th frame, read back 4 frames late; logged every 10 s with the GPU time).
+	int64_t                 stat_frame = -1;
+	double                  st_pixels = 0.0, st_n = 0.0, st_occ = 0.0, st_depth = 0.0;
+	uint32_t                st_samples = 0;
 	// The sun's space: 0 unknown, 1 world, 2 view; turns that voted for each.
 	int                     space = 0, world_votes = 0, view_votes = 0;
 	bool                    space_ref = false;
@@ -6055,7 +6070,7 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 			return false;
 		}
 		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-		create.size  = 4 * 16 * sizeof(uint32_t);
+		create.size  = (4 * 16 + 4 * 4) * sizeof(uint32_t); // (calibration slots, then statistics)
 		create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 		VmaAllocationCreateInfo allocate {};
 		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
@@ -6105,14 +6120,33 @@ void CShadowReadTiming() {
 		++g_cs.samples;
 		++g_cs.read;
 	}
-	const auto now = std::chrono::steady_clock::now();
-	if (now - g_cs.last_log >= std::chrono::seconds(30) && g_cs.samples > 0) {
-		std::printf("RTSHADOW: GPU %.3f ms (mean of %u frames)\n", g_cs.sum_ms / g_cs.samples, g_cs.samples);
-		std::fflush(stdout);
-		g_cs.sum_ms   = 0.0;
-		g_cs.samples  = 0;
-		g_cs.last_log = now;
+}
+
+// The statistics read back (4 frames after the composite wrote them) and, every 10 s, the log line.
+void CShadowTakeStats() {
+	if (g_cs.stat_frame >= 0 && static_cast<int64_t>(g_cs.frame) >= g_cs.stat_frame + 4 && g_cs.vote_mapped != nullptr) {
+		g_cs.stat_frame = -1;
+		(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_cs.vote_mem, 0, VK_WHOLE_SIZE);
+		const uint32_t* v = g_cs.vote_mapped + 64;
+		g_cs.st_pixels += static_cast<double>(g_cs.render.width) * g_cs.render.height;
+		g_cs.st_n += v[0], g_cs.st_occ += v[1] / 256.0, g_cs.st_depth += v[2] / 2.0;
+		++g_cs.st_samples;
 	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_cs.last_log < std::chrono::seconds(10)) return;
+	if (g_cs.st_samples > 0 || g_cs.samples > 0) {
+		const double n = g_cs.st_n, px = std::max(g_cs.st_pixels, 1.0);
+		std::printf("RTSHADOW: stats: %.1f %% of pixels shadowed (occlusion > 0.1), mean occlusion %.3f (%.3f on those), their "
+		            "mean depth %.1f m; GPU %.3f ms (%u samples, %u frames)\n",
+		            100.0 * n / px, g_cs.st_occ / px, n > 0.0 ? g_cs.st_occ / n : 0.0, n > 0.0 ? g_cs.st_depth / n : 0.0,
+		            g_cs.samples > 0 ? g_cs.sum_ms / g_cs.samples : 0.0, g_cs.st_samples, g_cs.samples);
+		std::fflush(stdout);
+	}
+	g_cs.st_pixels = g_cs.st_n = g_cs.st_occ = g_cs.st_depth = 0.0;
+	g_cs.st_samples = 0;
+	g_cs.sum_ms     = 0.0;
+	g_cs.samples    = 0;
+	g_cs.last_log   = now;
 }
 
 using Rows3 = std::array<std::array<double, 3>, 3>;
@@ -6136,6 +6170,12 @@ bool CShadowView(const std::array<float, 16>& m, const std::array<float, 16>& vp
 		n = std::sqrt(n);
 		if (!(n > 1e-9) || !std::isfinite(n)) return false;
 		for (int j = 0; j < 3; ++j) v[i][j] /= n;
+	}
+	// (A view-projection of another camera than the projection's (a shadow cascade, a reflection) leaves no rotation.)
+	for (int i = 0; i < 3; ++i) {
+		const auto& a = v[i];
+		const auto& b = v[(i + 1) % 3];
+		if (std::abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) > 0.05) return false;
 	}
 	return true;
 }
@@ -6175,6 +6215,70 @@ uint32_t CShadowAllowed() {
 	return mask;
 }
 
+bool CShadowUpForced() {
+	static const bool forced = [] {
+		const char* up = std::getenv("KYTY_RT_SHADOWS_UP");
+		return up != nullptr && *up != '\0';
+	}();
+	return forced;
+}
+
+// The camera's evidence on world up, every frame (view: the world -> view rows; m: view_to_clip, row vectors): a game
+// camera does not roll, so its right row stays perpendicular to world up while it turns; its screen-up row (view y
+// times the sign of m[5], which maps it to NDC y) leans toward up unless it looks > 70 degrees up or down.
+void CShadowCamera(const Rows3& view, const std::array<float, 16>& m) {
+	const double ys = m[5] < 0.0f ? -1.0 : 1.0;
+	g_cs.cam_frames += 1.0;
+	for (int k = 0; k < 3; ++k) {
+		const double r = std::abs(view[0][k]), u = view[1][k] * ys;
+		if (r < 0.1 && std::abs(u) > 0.35) g_cs.cam_ok[k] += 1.0, g_cs.cam_lean[k] += u;
+	}
+	if (g_cs.cam_frames > 4000.0) { // (a window: old views fade)
+		g_cs.cam_frames *= 0.5;
+		for (int k = 0; k < 3; ++k) g_cs.cam_ok[k] *= 0.5, g_cs.cam_lean[k] *= 0.5;
+	}
+	const double f = g_cs.cam_frames;
+	// The axis: plausible in >= 90 % of >= 120 frames, every other in <= 75 % (the camera turned enough to tell).
+	int axis = -1;
+	for (int k = 0; k < 3 && f >= 120.0; ++k) {
+		bool others = true;
+		for (int j = 0; j < 3; ++j)
+			if (j != k && g_cs.cam_ok[j] > 0.75 * f) others = false;
+		if (g_cs.cam_ok[k] >= 0.9 * f && others) axis = k;
+	}
+	if (axis >= 0 && axis != g_cs.cam_axis) {
+		static const char* names[] {"x", "y", "z"};
+		std::printf("RTSHADOW: camera: world up is the %s axis (its right row perpendicular to it in %.0f %% of %.0f frames; "
+		            "x %.0f %%, y %.0f %%, z %.0f %%)%s\n",
+		            names[axis], 100.0 * g_cs.cam_ok[axis] / f, f, 100.0 * g_cs.cam_ok[0] / f, 100.0 * g_cs.cam_ok[1] / f,
+		            100.0 * g_cs.cam_ok[2] / f, g_cs.cam_axis >= 0 ? " (changed)" : "");
+		std::fflush(stdout);
+		g_cs.cam_axis = axis;
+	}
+	// The hypotheses left: the decided axis (else every axis still plausible in >= 85 % of the frames), and for an
+	// axis whose lean is clear the sign that puts up at the top of the screen (row 0) in each convention.
+	uint32_t mask = 0;
+	for (int k = 0; k < 3; ++k) {
+		if (g_cs.cam_axis >= 0 ? k != g_cs.cam_axis : f >= 30.0 && g_cs.cam_ok[k] < 0.85 * f) continue;
+		uint32_t bits = (3u << (k * 2)) | (3u << (6 + k * 2));
+		const double lean = g_cs.cam_ok[k] > 0.0 ? g_cs.cam_lean[k] / g_cs.cam_ok[k] : 0.0;
+		if (g_cs.cam_ok[k] >= 30.0 && std::abs(lean) > 0.3) {
+			// Row 0 = NDC y +1 (hypotheses 0..5): up leans to NDC +y; mirrored (6..11): to NDC -y.
+			bits = lean > 0.0 ? (1u << (k * 2)) | (1u << (6 + k * 2 + 1)) : (1u << (k * 2 + 1)) | (1u << (6 + k * 2));
+		}
+		mask |= bits;
+	}
+	g_cs.cam_mask = mask != 0 ? mask : 0xfffu;
+}
+
+// The hypotheses left by the switches and the camera (the switch alone when KYTY_RT_SHADOWS_UP is set or they disagree).
+uint32_t CShadowLeft() {
+	const uint32_t env = CShadowAllowed();
+	if (CShadowUpForced()) return env;
+	const uint32_t both = env & g_cs.cam_mask;
+	return both != 0 ? both : env;
+}
+
 // The calibration read back (4 frames late) and the decision made (again).
 void CShadowTakeCalib(uint32_t slot) {
 	if (!g_cs.slot_voted[slot] || g_cs.vote_mapped == nullptr) return;
@@ -6185,7 +6289,7 @@ void CShadowTakeCalib(uint32_t slot) {
 	for (int i = 0; i < 12; ++i) g_cs.calib[i] += v[i], sum += g_cs.calib[i];
 	if (sum > 4e6)
 		for (auto& c: g_cs.calib) c *= 0.5; // (a window: old views fade)
-	const uint32_t allowed = CShadowAllowed();
+	const uint32_t allowed = CShadowLeft();
 	int            best = -1, second = -1;
 	for (int i = 0; i < 12; ++i) {
 		if ((allowed & (1u << i)) == 0) continue;
@@ -6195,18 +6299,25 @@ void CShadowTakeCalib(uint32_t slot) {
 	if (best < 0) return;
 	const double b = g_cs.calib[best], s = second >= 0 ? g_cs.calib[second] : 0.0;
 	int          pick = -1;
+	// A level camera cannot tell (up, row 0 = NDC +1) from its mirror twin (-up, mirrored): the GNM viewport's prior.
+	const auto twin = [](int i) { return (i < 6 ? 6 : 0) + ((i % 6) / 2) * 2 + (1 - (i & 1)); };
+	const int  gnm  = best < 6 ? best : twin(best);
 	if (std::popcount(allowed) == 1) pick = best;
 	else if (b >= 2000.0 && b >= 2.0 * s) pick = best;
-	// A level camera cannot tell (+y up, row 0 = NDC +1) from its mirror twin (-y up, mirrored): the prior.
-	else if (b >= 2000.0 && ((best == 2 && second == 9) || (best == 9 && second == 2)) && (allowed & 4u) != 0) pick = 2;
+	else if (b >= 2000.0 && second == twin(best) && (allowed & (1u << gnm)) != 0) pick = gnm;
+	// The camera left only a twin pair: the prior unless the mirrored one has twice the floors.
+	else if (g_cs.cam_axis >= 0 && std::popcount(allowed) == 2 && (allowed & (1u << twin(best))) != 0 && (allowed & (1u << gnm)) != 0)
+		pick = gnm;
 	if (pick < 0 || pick == g_cs.hyp) return;
 	// A decided hypothesis changes only on clear evidence (3x).
 	if (g_cs.hyp >= 0 && g_cs.calib[pick] < 3.0 * g_cs.calib[g_cs.hyp]) return;
 	const int was = g_cs.hyp;
 	g_cs.hyp      = pick;
 	static const char* axes[] {"+x", "-x", "+y", "-y", "+z", "-z"};
-	std::printf("RTSHADOW: calibration: world up %s, render row 0 = NDC y %s (floors %.0f vs next %.0f)%s\n", axes[pick % 6],
-	            pick < 6 ? "+1 (GNM viewport)" : "-1 (mirrored)", b, s, was >= 0 ? " (changed)" : "");
+	std::printf("RTSHADOW: calibration: world up %s, render row 0 = NDC y %s (floors %.0f vs next %.0f; camera %s)%s\n", axes[pick % 6],
+	            pick < 6 ? "+1 (GNM viewport)" : "-1 (mirrored)", g_cs.calib[pick], s,
+	            CShadowUpForced() ? "not asked (KYTY_RT_SHADOWS_UP)" : g_cs.cam_axis >= 0 ? "agrees" : "undecided, axis among those left",
+	            was >= 0 ? " (changed)" : "");
 	std::fflush(stdout);
 	g_cs.history_valid = false;
 }
@@ -6239,6 +6350,14 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	Rows3 view {};
 	if (!CShadowView(m, vp, view)) return said_once("the camera matrix is degenerate"), false;
 	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality)) return said_once("could not create its pipeline or images"), false;
+	CShadowCamera(view, m);
+	if (g_cs.hyp >= 0 && (CShadowLeft() & (1u << g_cs.hyp)) == 0) {
+		static const char* names[] {"+x", "-x", "+y", "-y", "+z", "-z"};
+		std::printf("RTSHADOW: calibration: world up %s (row 0 = NDC y %s) does not fit the camera: calibrating again\n",
+		            names[g_cs.hyp % 6], g_cs.hyp < 6 ? "+1" : "-1");
+		std::fflush(stdout);
+		g_cs.hyp = -1, g_cs.history_valid = false;
+	}
 
 	const auto now = std::chrono::steady_clock::now();
 	const float dt = g_cs.latch_time.time_since_epoch().count() == 0
@@ -6316,6 +6435,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.cand[3][2] = fade_m, push.cand[3][3] = fade_m * 2.0f;
 
 	CShadowReadTiming();
+	CShadowTakeStats();
 	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
 	                        vk::AccessFlags2 dst) {
 		vk::MemoryBarrier2 barrier {};
@@ -6390,13 +6510,21 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		       vk::AccessFlagBits2::eHostRead);
 		g_cs.slot_voted[slot] = true;
 	}
+	// The statistics on every 16th frame (one in flight).
+	const bool stats = g_cs.stat_frame < 0 && g_cs.frame % 16 == 8;
+	if (stats) {
+		command.fillBuffer(vk::Buffer(g_cs.vote), 64 * 4, 4 * 4, 0);
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+		       vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
+	}
+	const int64_t this_frame = g_cs.frame;
 	++g_cs.frame;
 
 	// World up (the calibration's, +y until then) and the world-space sun toward the light, latched.
 	const int hyp = g_cs.hyp;
 	std::array<double, 3> up {};
 	up[hyp >= 0 ? (hyp % 6) / 2 : 1] = hyp >= 0 && (hyp & 1) != 0 ? -1.0 : 1.0;
-	if (fresh && space != 0) {
+	if (fresh && space != 0 && hyp >= 0) { // (10-24: once up is known: its sign and the logged elevation are up's)
 		std::array<double, 3> sun = space == 1 ? raw : ToWorld(view, raw);
 		const double          h   = Dot3(sun, up);
 		if (h < 0.0) sun = {-sun[0], -sun[1], -sun[2]};
@@ -6436,10 +6564,10 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	g_cs.fade         = std::clamp(g_cs.fade + (target ? dt / 1.0f : -dt / 0.3f), 0.0f, 1.0f);
 	if (!g_cs.latched || g_cs.fade <= 0.0f) {
 		g_cs.history_valid = false;
-		return said_once(!g_cs.latched ? (space == 0 && fresh ? "sun axis found; turn the camera to tell its space (world / view)"
-		                                                      : "no sun direction yet")
-		                 : hyp < 0 ? "calibrating the screen's up (look at some floor)"
-		                           : "faded out (sun changed or absent)"),
+		return said_once(hyp < 0 ? "calibrating world up (turn the camera; look at some floor)"
+		                 : !g_cs.latched ? (space == 0 && fresh ? "sun axis found; turn the camera to tell its space (world / view)"
+		                                                        : "no sun direction yet")
+		                                 : "faded out (sun changed or absent)"),
 		       false;
 	}
 	const auto l_view = ToView(view, g_cs.latch_axis);
@@ -6449,11 +6577,12 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		g_cs.said_on = true;
 		static const char* axes[] {"+x", "-x", "+y", "-y", "+z", "-z"};
 		std::printf("RTSHADOW: on (level %d, trace %ux%u of %ux%u, strength %g, length %g m, fade %g-%g m; light from %s, %s space; "
-		            "world dir to the sun (%.4f %.4f %.4f), up %s, row 0 = NDC y %s; view dir now (%.3f %.3f %.3f))\n",
+		            "world dir to the sun (%.4f %.4f %.4f), up %s, row 0 = NDC y %s; the light in view space now (%.3f %.3f %.3f), elevation %.1f deg)\n",
 		            quality, g_cs.trace.width, g_cs.trace.height, color.extent.width, color.extent.height, strength, length, fade_m,
 		            fade_m * 2.0f, source == 1 ? "the sun-shadow consumer's cascades" : "the shadow-map draws",
 		            space == 1 ? "world" : "view", g_cs.latch_axis[0], g_cs.latch_axis[1], g_cs.latch_axis[2], axes[hyp % 6],
-		            hyp < 6 ? "+1" : "-1", l_view[0], l_view[1], l_view[2]);
+		            hyp < 6 ? "+1" : "-1", l_view[0], l_view[1], l_view[2],
+		            std::asin(std::clamp(std::abs(Dot3(g_cs.latch_axis, up)), 0.0, 1.0)) * 57.29578);
 		std::fflush(stdout);
 	}
 	const auto entry = static_cast<uint32_t>(g_cs.written % 8);
@@ -6462,7 +6591,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		command.resetQueryPool(g_cs.pool, entry * 2, 2);
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_cs.pool, entry * 2);
 	}
-	push.misc[3] = (inputs.reset ? 1 : 0) | (g_cs.history_valid ? 2 : 0) | (hyp < 6 ? 4 : 0);
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g_cs.history_valid ? 2 : 0) | (hyp < 6 ? 4 : 0); // (slot 0: statistics at word 64)
 	// trace -> raw (+ gbuf[cur]); temporal (raw, history[prev]) -> tmp_a, count -> moments[cur]; a-trous 1 -> history[cur]
 	// (next frame's history); a-trous 2 -> tmp_b; (a-trous 4 -> tmp_a); composite -> out.
 	run(0, g_cs.tmp_a, g_cs.tmp_b, g_cs.raw, g_cs.gbuf[cur], 0.0f, g_cs.trace);
@@ -6476,7 +6605,14 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		final_vis = &g_cs.tmp_a;
 	}
 	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_b; // (the composite's stability mask: the history count in .x)
+	if (stats) push.misc[3] |= 8;
 	run(4, *final_vis, g_cs.raw, g_cs.out, g_cs.raw, 0.0f, g_cs.render);
+	if (stats) {
+		push.misc[3] &= ~8;
+		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eHost,
+		       vk::AccessFlagBits2::eHostRead);
+		g_cs.stat_frame = this_frame;
+	}
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
 	if (timed) {
