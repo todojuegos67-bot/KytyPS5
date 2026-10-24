@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TILER_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TILER_H_
 
+#include <chrono>
 #include "common/common.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -155,7 +156,11 @@ private:
 		vk::Buffer    buffer     = nullptr;
 		VmaAllocation allocation = nullptr;
 		uint64_t      capacity   = 0;
+		// (When it was pooled: the periodic RAM flush takes only buffers no detile reused for 30 s.)
+		std::chrono::steady_clock::time_point pooled_at = std::chrono::steady_clock::now();
 	};
+	// The periodic RAM flush's share (ram-guard.h): pooled buffers idle 30 s, up to `budget` bytes.
+	static uint64_t            FlushScratchPool(uint64_t budget, uint64_t* held_us);
 	std::mutex                 m_scratch_mutex;
 	std::vector<PooledScratch> m_scratch_pool;
 	uint64_t                   m_scratch_pool_bytes = 0;

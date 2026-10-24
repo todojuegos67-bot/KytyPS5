@@ -2,6 +2,7 @@
 
 #include "guest-lazy-commit.h"
 #include "local-platform.h"
+#include "mem-guard.h"
 #include "soft-release.h"
 
 #include <algorithm>
@@ -46,6 +47,13 @@ std::atomic<int>         g_store_charge {static_cast<int>(StoreCharge::AllCommit
 
 std::mutex                                           g_flush_mutex;
 std::vector<std::pair<const char*, uint64_t (*)(int)>> g_flushes;
+struct BudgetFlush {
+	const char*   name;
+	FlushClass    kind;
+	BudgetFlushFn fn;
+};
+std::vector<BudgetFlush> g_budget_flushes;
+std::atomic<bool>        g_periodic {false};
 
 const char* Env(const char* name) {
 	const char* value = std::getenv(name);
@@ -147,6 +155,16 @@ void RegisterFlush(const char* name, uint64_t (*flush)(int level)) {
 	g_flushes.emplace_back(name, flush);
 }
 
+void RegisterBudgetFlush(const char* name, FlushClass kind, BudgetFlushFn flush) {
+	if (flush == nullptr || kind < 0 || kind >= FlushClasses) return;
+	std::lock_guard lock(g_flush_mutex);
+	g_budget_flushes.push_back({name, kind, flush});
+}
+
+bool PeriodicFlush() {
+	return g_periodic.load(std::memory_order_relaxed);
+}
+
 #if defined(_WIN32)
 namespace {
 
@@ -192,6 +210,10 @@ struct Sample {
 struct Settings {
 	uint64_t sim_ram = 0, sim_commit_limit = 0, sim_os = 0, sim_os_commit = 0;
 	uint64_t low_avail = 0, low_commit = 0;
+	bool     sim_abort = false;                      // the simulated PC's end when its commit is used up
+	int64_t  flush_seconds = 0;                      // KYTY_RAM_FLUSH_SECONDS: the periodic flush (0 off)
+	uint64_t flush_bytes   = 0;                      // KYTY_RAM_FLUSH_MB
+	bool     flush_trim    = false;                  // KYTY_RAM_FLUSH_TRIM=1: the working set trim too
 };
 
 Settings ReadSettings() {
@@ -208,6 +230,15 @@ Settings ReadSettings() {
 	const uint64_t ram = s.sim_ram != 0 ? s.sim_ram : real_ram;
 	s.low_avail  = EnvMiB("KYTY_RAM_LOW_AVAIL_MB", std::max<uint64_t>(GiB, ram / 16));
 	s.low_commit = EnvMiB("KYTY_RAM_LOW_COMMIT_MB", 2 * GiB);
+	{
+		const char* abort_text = Env("KYTY_SIMULATE_RAM_ABORT");
+		s.sim_abort            = s.sim_commit_limit != 0 && !(abort_text != nullptr && abort_text[0] == '0');
+		const char* seconds    = Env("KYTY_RAM_FLUSH_SECONDS");
+		s.flush_seconds        = seconds != nullptr ? std::max<int64_t>(0, std::strtoll(seconds, nullptr, 10)) : 0;
+		s.flush_bytes          = std::max<uint64_t>(MiB, EnvMiB("KYTY_RAM_FLUSH_MB", 1024 * MiB));
+		const char* trim       = Env("KYTY_RAM_FLUSH_TRIM");
+		s.flush_trim           = trim != nullptr && trim[0] == '1';
+	}
 	return s;
 }
 
@@ -298,6 +329,120 @@ std::string TakeReleased(uint64_t* bytes) {
 	return out;
 }
 
+using Clock = std::chrono::steady_clock;
+
+double MsSince(Clock::time_point start) {
+	return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+
+// The simulated PC ran out of commit: the run ends as it would have there (an allocation refused, the game closed).
+[[noreturn]] void SimulatedOutOfMemory(const Settings& s, const Sample& sample) {
+	char pc[64];
+	if (s.sim_ram != 0)
+		std::snprintf(pc, sizeof(pc), "un PC de %llu GB", static_cast<unsigned long long>((s.sim_ram + GiB / 2) / GiB));
+	else
+		std::snprintf(pc, sizeof(pc), "un PC con %llu MiB de commit", static_cast<unsigned long long>(s.sim_commit_limit / MiB));
+	std::printf("RAM simulada agotada: en %s el juego se habria cerrado (simulated RAM used up: on that PC the game "
+	            "would have closed; KYTY_SIMULATE_RAM_ABORT=0 keeps running on the real memory). %s\n",
+	            pc, Figures(sample).c_str());
+	std::fflush(stdout);
+	std::fflush(stderr);
+	// (No exit handlers: the game's threads are running; STATUS_NO_MEMORY, as a refused allocation's end would be.)
+	TerminateProcess(GetCurrentProcess(), 0xC0000017u);
+	for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+}
+
+struct FlushState {
+	uint64_t passes = 0;
+	uint64_t released_total[FlushClasses] {};
+	double   ms_total = 0.0, ms_max = 0.0;
+	double   heaps_ms_last = 0.0;
+	Clock::time_point heaps_last {};
+};
+
+// One periodic flush pass (ram-guard.h): the sources by class, in order, until s.flush_bytes are released.
+void FlushPass(const Settings& s, HANDLE low_memory, uint64_t store, FlushState* state) {
+	const auto   start  = Clock::now();
+	const Sample before = Take(s, low_memory, false, store);
+	std::vector<BudgetFlush> list;
+	{
+		std::lock_guard lock(g_flush_mutex);
+		list = g_budget_flushes;
+	}
+	uint64_t    remaining = s.flush_bytes;
+	uint64_t    released[FlushClasses] {};
+	uint64_t    held_us = 0;
+	std::string parts[FlushClasses];
+	const auto  add_part = [&](int kind, const char* name, uint64_t bytes, double ms) {
+		char piece[160];
+		std::snprintf(piece, sizeof(piece), "%s%s %.1f MiB %.1f ms", parts[kind].empty() ? "" : ", ", name,
+		              static_cast<double>(bytes) / 1048576.0, ms);
+		parts[kind] += piece;
+	};
+	for (int kind = 0; kind < FlushClasses; kind++) {
+		if (kind == FlushTrim && !s.flush_trim) break;
+		const auto use_before = LocalPlatform::ProcessMemory();
+		uint64_t   reported   = 0;
+		for (const auto& source: list) {
+			if (source.kind != kind || remaining <= reported) continue;
+			uint64_t   held = 0;
+			const auto t0   = Clock::now();
+			const auto b    = source.fn(remaining - reported, &held);
+			held_us         = std::max(held_us, held);
+			reported += b;
+			add_part(kind, source.name, b, MsSince(t0));
+		}
+		if (kind == FlushCaches && remaining > reported) {
+			// Idle scratch buffers and the heaps' free blocks (soft-release.h). The compaction holds each heap's lock: when
+			// it took more than 5 ms, it runs at most every 30 s.
+			const auto t0 = Clock::now();
+			if (state->heaps_ms_last <= 5.0 || t0 - state->heaps_last >= std::chrono::seconds(30)) {
+				char detail[192];
+				(void)SoftRelease::FlushNow(10'000, detail, sizeof(detail));
+				state->heaps_ms_last = MsSince(t0);
+				state->heaps_last    = t0;
+				held_us              = std::max(held_us, static_cast<uint64_t>(state->heaps_ms_last * 1000.0));
+				char piece[256];
+				std::snprintf(piece, sizeof(piece), "%s%s %.1f ms", parts[kind].empty() ? "" : ", ", detail, state->heaps_ms_last);
+				parts[kind] += piece;
+			} else {
+				parts[kind] += parts[kind].empty() ? "heaps skipped (slow last time)" : ", heaps skipped (slow last time)";
+			}
+		}
+		// Caches: what the commit dropped (or the sources said); guest memory and the trim: what the working set dropped
+		// (their commit stays).
+		const auto use_after = LocalPlatform::ProcessMemory();
+		const auto dropped   = kind == FlushCaches ? (use_before.private_bytes > use_after.private_bytes
+		                                                  ? use_before.private_bytes - use_after.private_bytes : 0)
+		                                           : (use_before.working_set > use_after.working_set
+		                                                  ? use_before.working_set - use_after.working_set : 0);
+		released[kind] = kind == FlushCaches ? std::max(reported, dropped) : dropped;
+		remaining -= std::min(remaining, std::max(released[kind], kind == FlushCaches ? 0 : reported));
+		state->released_total[kind] += released[kind];
+		if (remaining == 0) break;
+	}
+	const double ms    = MsSince(start);
+	const Sample after = Take(s, low_memory, false, store);
+	state->passes++;
+	state->ms_total += ms;
+	state->ms_max = std::max(state->ms_max, ms);
+	const auto mb = [](uint64_t b) { return static_cast<unsigned long long>(b / 1000000u); };
+	const auto mi = [](uint64_t b) { return static_cast<unsigned long long>(b / MiB); };
+	std::printf("RAM flush #%llu (every %lld s, up to %llu MB): released %llu MB: caches %llu MB [%s], freed guest memory "
+	            "%llu MB of RAM [%s], trim %s%llu MB%s%s%s; %.1f ms (longest lock a game thread could wait on %.2f ms); "
+	            "private %llu -> %llu MiB, working set %llu -> %llu MiB, commit %llu -> %llu of %llu MiB, available %llu -> "
+	            "%llu MiB%s\n",
+	            static_cast<unsigned long long>(state->passes), static_cast<long long>(s.flush_seconds), mb(s.flush_bytes),
+	            mb(released[0] + released[1] + released[2]), mb(released[0]), parts[0].c_str(), mb(released[1]),
+	            parts[1].empty() ? "none" : parts[1].c_str(), s.flush_trim ? "" : "off ", mb(released[2]),
+	            s.flush_trim ? " [" : "", s.flush_trim ? (parts[2].empty() ? "none" : parts[2].c_str()) : "",
+	            s.flush_trim ? "] (no commit change)" : "", ms, static_cast<double>(held_us) / 1000.0,
+	            mi(before.private_bytes), mi(after.private_bytes), mi(before.working_set), mi(after.working_set),
+	            mi(before.commit_total), mi(after.commit_total), mi(after.commit_limit), mi(before.available),
+	            mi(after.available), after.simulated ? " (simulated)" : "");
+	std::fflush(stdout);
+}
+
 void Watch() {
 	SetThreadDescription(GetCurrentThread(), L"Kyty.RamGuard");
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -317,8 +462,20 @@ void Watch() {
 		            static_cast<unsigned long long>(s.sim_ram / MiB), static_cast<unsigned long long>(s.sim_os / MiB),
 		            static_cast<unsigned long long>(s.sim_commit_limit / MiB),
 		            static_cast<unsigned long long>(s.sim_os_commit / MiB));
+	if (s.sim_abort)
+		std::printf("RAM guard: the simulated PC's end is simulated too: with no commit headroom left the run is closed "
+		            "(\"RAM simulada agotada\"; KYTY_SIMULATE_RAM_ABORT=0 keeps running)\n");
+	if (s.flush_seconds > 0)
+		std::printf("RAM flush (vaciado): every %lld s up to %llu MB: caches (re-creatable), guest memory the game released%s "
+		            "(KYTY_RAM_FLUSH_SECONDS / KYTY_RAM_FLUSH_MB / KYTY_RAM_FLUSH_TRIM)\n",
+		            static_cast<long long>(s.flush_seconds), static_cast<unsigned long long>(s.flush_bytes / 1000000u),
+		            s.flush_trim ? ", then the working set trim of cold guest pages" : "; no working set trim");
 	std::fflush(stdout);
-	using Clock = std::chrono::steady_clock;
+	g_periodic.store(s.flush_seconds > 0, std::memory_order_relaxed);
+	FlushState flush_state;
+	auto       next_periodic = Clock::now() + std::chrono::seconds(std::max<int64_t>(s.flush_seconds, 1));
+	uint64_t   seconds_under_1g = 0, seconds_under_512 = 0;
+	int        sim_exhausted = 0;
 	auto     next_log   = Clock::now() + std::chrono::seconds(std::max<int64_t>(log_period, 1));
 	auto     next_flush = Clock::now();
 	auto     next_walk  = Clock::now();
@@ -333,8 +490,28 @@ void Watch() {
 		const Sample sample = Take(s, low_memory, walk, store);
 		store               = sample.store_committed;
 		g_available.store(sample.available, std::memory_order_relaxed);
+		// (The simulated commit used up: as on that PC, a release pass first - what MemGuard does when an allocation is
+		// refused - and the end only when a second later there is still none.)
+		if (s.sim_abort && sample.commit_limit != 0 && sample.Headroom() == 0) {
+			if (sim_exhausted++ != 0) SimulatedOutOfMemory(s, sample);
+			std::printf("RAM simulada: sin commit libre (no simulated commit headroom left): a release pass, the run ends if "
+			            "there is still none; %s\n",
+			            Figures(sample).c_str());
+			std::fflush(stdout);
+			(void)MemGuard::ReleaseNow("simulated commit used up", 500);
+		} else {
+			sim_exhausted = 0;
+		}
+		if (s.sim_ram != 0) {
+			seconds_under_1g += sample.available < GiB ? 1 : 0;
+			seconds_under_512 += sample.available < GiB / 2 ? 1 : 0;
+		}
 		const int level = LevelOf(s, sample);
 		g_level.store(level, std::memory_order_relaxed);
+		if (s.flush_seconds > 0 && now >= next_periodic) {
+			FlushPass(s, low_memory, store, &flush_state);
+			next_periodic = Clock::now() + std::chrono::seconds(s.flush_seconds);
+		}
 		if (level != logged && level == None) {
 			uint64_t    bytes    = 0;
 			const auto  released = TakeReleased(&bytes);
@@ -394,6 +571,18 @@ void Watch() {
 			            static_cast<unsigned long long>(g_released_count_total[Pipelines].load(std::memory_order_relaxed)),
 			            static_cast<unsigned long long>(g_released_count_total[Images].load(std::memory_order_relaxed)),
 			            static_cast<unsigned long long>(g_released_bytes_total[Images].load(std::memory_order_relaxed) / MiB));
+			if (s.flush_seconds > 0 || s.sim_ram != 0) {
+				std::printf("RAM (%lld s): flush passes %llu (caches %llu MB, freed guest memory %llu MB, trim %llu MB; %.1f ms "
+				            "a pass on average, at most %.1f ms); simulated PC under 1 GiB available %llu s, under 512 MiB "
+				            "%llu s (a real one pages there: stutter)\n",
+				            static_cast<long long>(log_period), static_cast<unsigned long long>(flush_state.passes),
+				            static_cast<unsigned long long>(flush_state.released_total[0] / 1000000u),
+				            static_cast<unsigned long long>(flush_state.released_total[1] / 1000000u),
+				            static_cast<unsigned long long>(flush_state.released_total[2] / 1000000u),
+				            flush_state.passes != 0 ? flush_state.ms_total / static_cast<double>(flush_state.passes) : 0.0,
+				            flush_state.ms_max, static_cast<unsigned long long>(seconds_under_1g),
+				            static_cast<unsigned long long>(seconds_under_512));
+			}
 			std::fflush(stdout);
 		}
 	}

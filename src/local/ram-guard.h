@@ -34,6 +34,24 @@
 // grew to the RAM's size) MiB charged with the emulator's
 // private bytes, the guest store's commit and KYTY_SIMULATE_OS_COMMIT_MB (default 4096). KYTY_SIMULATE_COMMIT_MB=<m>
 // sets that commit limit alone (also without KYTY_SIMULATE_RAM_MB). The real figures still count when lower.
+// In a simulation the run ends as that PC's would: when the simulated commit is used up (no headroom left) the
+// process is closed with "RAM simulada agotada: en un PC de 16 GB el juego se habria cerrado" in the log
+// (KYTY_SIMULATE_RAM_ABORT=0 keeps it running on the real memory). The periodic line also counts the seconds the
+// simulated PC spent under 1 GiB / 512 MiB of available RAM (where a real one pages: stutter).
+//
+// Periodic flush ("vaciado", KYTY_RAM_FLUSH_SECONDS=<n>, default 0 = off; the launcher's test uses 5): every n
+// seconds, whatever the pressure, up to KYTY_RAM_FLUSH_MB (default 1024) are released, in order of safety, on the
+// guard's thread, stopping when the amount is reached:
+//   1. caches: emulator memory that holds nothing in use and is made again when needed (freed images kept for reuse,
+//      pooled tiling scratch buffers, idle scratch buffers, the heaps' free blocks). Lowers the commit.
+//   2. guest memory the game has released (direct memory released, flexible memory unmapped) whose pages are still
+//      committed: dropped (DiscardVirtualMemory). The game's data is not touched (no mapping of it is left), the
+//      commit stays (a page-file section's pages cannot be decommitted): it lowers the RAM in use only.
+//   3. KYTY_RAM_FLUSH_TRIM=1 only: pages of the guest store's emulator-side alias taken out of the working set,
+//      a few MiB at a time with the address space quiet (VirtualUnlock): pages the game's own views still use stay in
+//      RAM; the others go to the standby list (or the page file). No commit change, and may cost page faults.
+// One line a pass: MB per category, the time it took and the longest lock a game thread could wait on, private
+// bytes, working set and commit (simulated when so) before and after.
 #include <cstdint>
 
 namespace RamGuard {
@@ -62,6 +80,15 @@ void NoteReleased(Released kind, uint64_t count, uint64_t bytes);
 // A source of re-creatable or free memory called on each pressure pass (on the watcher's thread) with the level;
 // returns the bytes it dropped. It must drop nothing in use.
 void RegisterFlush(const char* name, uint64_t (*flush)(int level));
+
+// A source for the periodic flush (KYTY_RAM_FLUSH_SECONDS): called on the guard's thread with the bytes still wanted;
+// drops at most about that much and returns the bytes it dropped (the time it holds a lock a game thread takes, at
+// most `*held_us`, the longest such hold in microseconds). It must drop nothing in use.
+enum FlushClass : int { FlushCaches = 0, FlushGuestFreed = 1, FlushTrim = 2, FlushClasses = 3 };
+using BudgetFlushFn = uint64_t (*)(uint64_t budget_bytes, uint64_t* held_us);
+void RegisterBudgetFlush(const char* name, FlushClass kind, BudgetFlushFn flush);
+// The periodic flush is on (KYTY_RAM_FLUSH_SECONDS > 0 and the guard on).
+[[nodiscard]] bool PeriodicFlush();
 
 } // namespace RamGuard
 

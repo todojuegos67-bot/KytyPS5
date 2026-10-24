@@ -1058,6 +1058,22 @@ public:
 		return m_physical;
 	}
 	[[nodiscard]] const std::map<uint64_t, AllocatedBlock>& GetMappings() const { return m_mappings; }
+	// (The periodic RAM flush, ram-guard.h: the free ranges as backing offsets, and whether a range is all free.)
+	void FreeRanges(std::vector<std::pair<uint64_t, uint64_t>>* out) {
+		Common::LockGuard lock(m_mutex);
+		for (const auto& [start, size]: m_free) out->emplace_back(start, size);
+	}
+	// `call` with [start, start + size) free all along (no allocation can take it meanwhile: Alloc waits).
+	template <typename F>
+	bool WhileFree(uint64_t start, uint64_t size, F&& call) {
+		Common::LockGuard lock(m_mutex);
+		auto it = m_free.upper_bound(start);
+		if (it == m_free.begin()) return false;
+		--it;
+		if (!(it->first <= start && it->first + it->second >= start + size)) return false;
+		call();
+		return true;
+	}
 
 private:
 	void ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator range, uint64_t start,
@@ -1122,6 +1138,27 @@ public:
 
 	[[nodiscard]] Common::Mutex&                     GetMutex() { return m_mutex; }
 	[[nodiscard]] const std::vector<AllocatedBlock>& GetBlocks() const { return m_allocated; }
+	// (The periodic RAM flush, ram-guard.h: the free backing below the high-water mark - above it the section's pages
+	// were never written - and whether a range is all free.)
+	void FreeRanges(std::vector<std::pair<uint64_t, uint64_t>>* out) {
+		Common::LockGuard lock(m_mutex);
+		for (const auto& [start, size]: m_free) {
+			const uint64_t end = std::min(start + size, m_backing_high_water);
+			if (start < end) out->emplace_back(start, end - start);
+		}
+	}
+	// `call` with [start, start + size) free all along (Map, which zeroes reused backing, waits).
+	template <typename F>
+	bool WhileFree(uint64_t start, uint64_t size, F&& call) {
+		Common::LockGuard lock(m_mutex);
+		auto it = m_free.upper_bound(start);
+		if (it == m_free.begin()) return false;
+		--it;
+		if (!(it->first <= start && it->first + it->second >= start + size && start + size <= m_backing_high_water))
+			return false;
+		call();
+		return true;
+	}
 
 private:
 	void ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator range, uint64_t start,
@@ -1745,6 +1782,128 @@ static void GuestStoreTooSmall(const char* what, uint64_t len) {
 	std::fflush(stdout);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// The periodic RAM flush (ram-guard.h, KYTY_RAM_FLUSH_SECONDS), guest side.
+namespace RamFlushGuest {
+
+constexpr uint64_t Chunk = uint64_t {8} << 20u;
+
+uint64_t Micros(std::chrono::steady_clock::time_point start) {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+// Guest memory the game released (direct memory released, flexible memory unmapped) still committed in the store:
+// its pages dropped (DiscardVirtualMemory: their contents are no one's - no mapping of them is left - and the next
+// owner gets them as an allocation does: flexible memory zeroed by Map, direct memory as it was). Each chunk under the
+// owner's lock with the range checked free, so an allocation of it waits for the drop to end. The commit stays (a
+// page-file section's pages cannot be decommitted): the RAM in use drops. Ranges dropped are not looked at again
+// while they stay free. (Guard thread only.)
+uint64_t FlushFreed(uint64_t budget, uint64_t* held_us) {
+	static std::vector<std::pair<uint64_t, uint64_t>> done; // backing offsets [begin, end) dropped or not committed
+	static uint64_t                                   failures = 0, passes = 0;
+	if (g_guest_address_space == nullptr || g_physical_memory == nullptr || g_flexible_memory == nullptr) return 0;
+	auto* base = reinterpret_cast<uint8_t*>(g_guest_address_space->GetBackingBase());
+	if (base == nullptr) return 0;
+	std::vector<std::pair<uint64_t, uint64_t>> physical, flexible;
+	g_physical_memory->FreeRanges(&physical);
+	g_flexible_memory->FreeRanges(&flexible);
+	const auto inside = [](const std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t b, uint64_t e) {
+		auto it = std::upper_bound(ranges.begin(), ranges.end(), std::pair<uint64_t, uint64_t> {b, UINT64_MAX});
+		if (it == ranges.begin()) return false;
+		--it;
+		return it->first <= b && it->first + it->second >= e;
+	};
+	// (What was taken again since is looked at anew.)
+	std::erase_if(done, [&](const auto& r) { return !inside(physical, r.first, r.second) && !inside(flexible, r.first, r.second); });
+	std::sort(done.begin(), done.end());
+	uint64_t dropped = 0, held = 0;
+	const auto walk  = [&](const std::vector<std::pair<uint64_t, uint64_t>>& ranges, bool is_physical) {
+		for (const auto& [start, size]: ranges) {
+			for (uint64_t at = start, end = start + size; at < end && dropped < budget;) {
+				// (Past what was done already.)
+				auto d = std::upper_bound(done.begin(), done.end(), std::pair<uint64_t, uint64_t> {at, UINT64_MAX});
+				if (d != done.begin() && std::prev(d)->second > at) {
+					at = std::prev(d)->second;
+					continue;
+				}
+				uint64_t stop = std::min(end, (at & ~(Chunk - 1u)) + Chunk);
+				if (d != done.end() && d->first < stop) stop = d->first;
+				MEMORY_BASIC_INFORMATION info {};
+				if (VirtualQuery(base + at, &info, sizeof(info)) != sizeof(info)) return;
+				const uint64_t region_end = static_cast<uint64_t>(static_cast<uint8_t*>(info.BaseAddress) - base) + info.RegionSize;
+				stop = std::min(stop, std::max(region_end, at + 1));
+				if (info.State == MEM_COMMIT) {
+					const auto t0   = std::chrono::steady_clock::now();
+					const auto drop = [&] {
+						if (DiscardVirtualMemory(base + at, stop - at) != ERROR_SUCCESS &&
+						    VirtualAlloc(base + at, stop - at, MEM_RESET, PAGE_READWRITE) == nullptr)
+							failures++;
+					};
+					const bool free_now = is_physical ? g_physical_memory->WhileFree(at, stop - at, drop)
+					                                  : g_flexible_memory->WhileFree(at, stop - at, drop);
+					held = std::max(held, Micros(t0));
+					if (!free_now) {
+						at = stop;
+						continue;
+					}
+					dropped += stop - at;
+				}
+				done.emplace_back(at, stop);
+				std::sort(done.begin(), done.end());
+				at = stop;
+			}
+		}
+	};
+	walk(physical, true);
+	walk(flexible, false);
+	if (held_us != nullptr) *held_us = held;
+	if (++passes == 1 || (passes % 60) == 0)
+		std::printf("RAM flush: released guest memory, pass %llu: %llu MiB of it committed and dropped (free: direct %zu "
+		            "ranges, flexible %zu ranges below the high-water mark), %llu drops refused by Windows in all\n",
+		            static_cast<unsigned long long>(passes),
+		            static_cast<unsigned long long>(dropped >> 20u), physical.size(), flexible.size(),
+		            static_cast<unsigned long long>(failures));
+	std::fflush(stdout);
+	return dropped;
+}
+
+// KYTY_RAM_FLUSH_TRIM=1: the store's alias (the emulator's view of all guest memory) taken out of the working set, a
+// chunk at a time from where the last pass stopped, with the guest's address space quiet (no map, unmap or protection
+// change meanwhile: paging a page while its protection changes is the bug check 0x1A/0x41202 reproducer). A page the
+// game's own views hold stays in RAM; one only the alias held goes to the standby list (or, written, the page file).
+uint64_t FlushTrim(uint64_t budget, uint64_t* held_us) {
+	static uint64_t cursor = 0;
+	if (g_guest_address_space == nullptr) return 0;
+	auto* base = reinterpret_cast<uint8_t*>(g_guest_address_space->GetBackingBase());
+	if (base == nullptr) return 0;
+	constexpr uint64_t Piece = uint64_t {4} << 20u;
+	const uint64_t     size  = PhysicalMemory::TotalSize();
+	uint64_t           done = 0, walked = 0, held = 0;
+	while (done < budget && walked < size) {
+		if (cursor >= size) cursor = 0;
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(base + cursor, &info, sizeof(info)) != sizeof(info)) break;
+		const uint64_t region_end = static_cast<uint64_t>(static_cast<uint8_t*>(info.BaseAddress) - base) + info.RegionSize;
+		const uint64_t stop       = std::min({size, std::max(region_end, cursor + 1), (cursor & ~(Piece - 1u)) + Piece});
+		if (info.State == MEM_COMMIT) {
+			const auto t0 = std::chrono::steady_clock::now();
+			if (!g_guest_address_space->RunQuietWith([&] { (void)VirtualUnlock(base + cursor, stop - cursor); })) break;
+			held = std::max(held, Micros(t0));
+			done += stop - cursor;
+			// (Spread: the game's maps and protection changes get the address space between pieces.)
+			std::this_thread::sleep_for(std::chrono::microseconds(200));
+		}
+		walked += stop - cursor;
+		cursor = stop;
+	}
+	if (held_us != nullptr) *held_us = held;
+	return done;
+}
+
+} // namespace RamFlushGuest
+#endif
+
 void Initialize() {
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
@@ -1759,6 +1918,10 @@ void Initialize() {
 	g_virtual_ranges      = std::make_unique<VirtualRanges>();
 	EXIT_IF(!g_guest_address_space->SelfTest());
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RamGuard::RegisterBudgetFlush("released guest memory", RamGuard::FlushGuestFreed, RamFlushGuest::FlushFreed);
+	RamGuard::RegisterBudgetFlush("guest store alias", RamGuard::FlushTrim, RamFlushGuest::FlushTrim);
+#endif
 }
 
 void Shutdown() {
