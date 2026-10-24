@@ -308,7 +308,12 @@ function Start-Game {
 	if ($fgConfig -eq 'fsr3-x4.json') { $sets += 'KYTY_VRR_CAP_FPS=224' }  # (10-22 d) en DLSS el tope se aplicaba dos veces: 14 reales x4 = 56
 	if ($fgConfig -like '*dyn*') { $sets += 'KYTY_DYN_QUALITY=0.95' }  # (10-22 g) llenar el monitor: el menor multiplicador que llega a ~224 (80 reales = x3, 120 = x2)
 	# (10-23) Teclado y raton: velocidad de camara del juego (sin teclado y raton no se toca: la del menu del juego).
-	if ($chkKbm.Checked) { $psargs += @('-ExtraConvars', "cp11_Setting_CameraSpeed=$($trkCam.Value)") }
+	# (10-24) Convars extra: velocidad de camara (raton) y la prueba elegida en Ajustes (manchas negras).
+	$extraCv = @()
+	if ($chkKbm.Checked) { $extraCv += "cp11_Setting_CameraSpeed=$($trkCam.Value)" }
+	$tsel = if ($cmbTest) { $script:testModes[[math]::Max(0, $cmbTest.SelectedIndex)][1] } else { '' }
+	if ($tsel -like 'KYTY_*') { $sets += $tsel } elseif ($tsel) { $extraCv += $tsel }  # (KYTY_*: por -Set, que manda sobre la config)
+	if ($extraCv.Count) { $psargs += @('-ExtraConvars', ($extraCv -join ';')) }
 	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
@@ -1931,6 +1936,20 @@ $btnSave.Add_Click({
 	$settings.Visible = $false
 })
 $settings.Controls.Add($btnSave)
+# (10-24) Prueba para las manchas negras del suelo mojado: una cosa cada vez (se guarda; 'Ninguna' para volver).
+$script:testModes = @(
+	@('Prueba: ninguna', ''), @('Sin compute asincrono', 'enableAsyncCompute=false'), @('Sin sombras de focos', 'r_enableSpotShadows=false'),
+	@('Sin ambient shadowing', 'r_enableAmbientShadowing=false'), @('Sin SSR del juego', 'r_ssrCutoffDistance=0'),
+	@('Emu: fresh memory off', 'KYTY_FRESH_MEMORY=0'), @('Emu: partial dirty off', 'KYTY_PARTIAL_IMAGE_DIRTY=0'),
+	@('Emu: resolve pages off', 'KYTY_TEXTURE_RESOLVE_PAGES=0'), @('Emu: image pool off', 'KYTY_IMAGE_POOL=0'), @('Emu: texture reduce off', 'KYTY_TEXTURE_REDUCE=0'))
+$cmbTest = New-Object System.Windows.Forms.ComboBox
+$cmbTest.DropDownStyle = 'DropDownList'; $cmbTest.Font = $smallFont
+foreach ($t in $script:testModes) { [void]$cmbTest.Items.Add($t[0]) }
+$tv = 0; [void][int]::TryParse((Get-IniValue 'pruebamanchas' '0'), [ref]$tv); $cmbTest.SelectedIndex = [math]::Min([math]::Max(0, $tv), $script:testModes.Count - 1)
+$cmbTest.Add_SelectedIndexChanged({ Set-IniValue 'pruebamanchas' "$($cmbTest.SelectedIndex)" })
+$cmbTest.Location = New-Object System.Drawing.Point(410, 100); $cmbTest.Size = New-Object System.Drawing.Size(180, 26)
+$tips.SetToolTip($cmbTest, 'Solo para pruebas: quita una cosa del juego o del emulador para encontrar el fallo de las manchas negras. Deja Prueba: ninguna para jugar normal.')
+$settings.Controls.Add($cmbTest)
 $btnSettings.Add_Click({ $settings.Visible = -not $settings.Visible })
 # (10-23) Cruz para cerrar Settings; al guardar bien tambien se cierra.
 $btnCloseSet = New-Button ([string][char]0x2715) 572 6 32 30 $false
