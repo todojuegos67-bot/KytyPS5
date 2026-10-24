@@ -339,7 +339,7 @@ jobs:
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$tag" "$PACKAGE.zip" --clobber --repo "$GITHUB_REPOSITORY"
           else
-            draft=""; [[ "$PACKAGE" == *-dlss ]] && draft="--draft"
+            draft="--draft"  # (10-24) siempre borrador salvo publish=true
             latest=$([[ "$PACKAGE" == *-pgogen || "$PACKAGE" == *-fsr3 || "$PACKAGE" == *-dlss || "$PACKAGE" == *-fgx3 ]] && echo --latest=false || echo --latest)
             if [ "${{ inputs.publish }}" = "true" ]; then draft=""; latest="--latest"; [ -s "package/$PACKAGE/NOVEDADES.txt" ] && notes="$(cat "package/$PACKAGE/NOVEDADES.txt")"; fi
             gh release create "$tag" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" $draft \
