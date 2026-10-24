@@ -102,12 +102,8 @@ void ApplyLowRamDefaults() {
 		SetDefault("KYTY_SOFT_RELEASE", "1", &set);
 		SetDefault("KYTY_RAM_DIET", "1", &set);
 		SetDefault("KYTY_PREFETCH_MIN_AVAIL_MB", "3072", &set);
-		// The video memory caches' budget: the process's private commit follows the video memory in use (a simulated
-		// 16 GB PC, 10-24: private = video memory + ~5 GB, 9.5 GB of video memory at an 8192 MiB budget, 1.1 GB of
-		// commit headroom left). 5120 MiB (4096 with 12 GiB of RAM or less), the default of 8 GB cards; the collector
-		// takes only images no draw used for ~10 s, uploaded again from guest memory. Never the resolution.
-		SetDefault("KYTY_VRAM_BUDGET_MB", ram != 0 && ram <= 12 * GiB ? "4096" : "5120", &set);
-		SetDefault("KYTY_GC_BUDGET_CAP_MB", ram != 0 && ram <= 12 * GiB ? "4096" : "5120", &set);
+		// (No video memory budget of its own: 5120 MiB, 10-24, left the video memory in use at 9.1-9.4 GB anyway - what
+		// holds it is not the collector's images - and only made the collector and pipeline eviction churn.)
 		// The guest store committed as it is mapped (the game maps ~11.3 of its 13.5 GiB): only for the page-file
 		// section committed at launch, the default.
 		const char* file     = Env("KYTY_BACKING_FILE");

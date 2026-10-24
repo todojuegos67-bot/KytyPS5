@@ -8,8 +8,6 @@
 //   KYTY_SOFT_RELEASE=1          heaps compacted and idle scratch buffers freed on quiet frames (no working set trim)
 //   KYTY_RAM_DIET=1              driver pipelines idle 180 s released, replaced unoptimized ones after 60 s
 //   KYTY_PREFETCH_MIN_AVAIL_MB=3072  the shader prefetch waits while less RAM than that is left
-//   KYTY_VRAM_BUDGET_MB, KYTY_GC_BUDGET_CAP_MB=5120 (4096 with 12 GiB or less)  the video memory caches' budget:
-//                                the private commit follows the video memory in use
 //   KYTY_BACKING_ON_DEMAND=1     the guest store's page-file section committed as the game maps it, not 13.5 GiB at
 //                                launch (KYTY_LOWRAM_ON_DEMAND=0 keeps it all committed; never with KYTY_BACKING_FILE or
 //                                KYTY_GUEST_LAZY_COMMIT)
@@ -20,10 +18,10 @@
 //   low       available < KYTY_RAM_LOW_AVAIL_MB (default 1/16 of the RAM, at least 1024) or headroom <
 //             KYTY_RAM_LOW_COMMIT_MB (default 2048) or Windows signals low memory
 //   critical  under half of either
-// (Images are collected only when critical; pipelines idle 60 s when low, 20 s when critical.)
+// (Images are collected and pipelines idle 60 s released only when critical.)
 // Under pressure it releases only memory that holds nothing in use or can be made again, logging each pass
 // ("RAM: pressure ..., freed N MB"): the heaps' free blocks decommitted, idle scratch buffers freed, registered free
-// pools discarded (soft-release.h), and, read by their owners: driver pipelines idle 60 s (critical 20 s) destroyed
+// pools discarded (soft-release.h), and, read by their owners: driver pipelines idle 60 s destroyed when critical
 // (made again from the static store at their next binding), images no draw used for 600 flips collected from video
 // memory (uploaded again from guest memory when used; GPU-written ones only after their download, as the collector
 // does), the shader prefetch held. Never the working set (no EmptyWorkingSet / SetProcessWorkingSetSize), never the
