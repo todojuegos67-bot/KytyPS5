@@ -57,6 +57,13 @@ void OnPresent(uint64_t frame_index);
 // at the controller read of the next frame the game's thread waits (vkWaitSemaphores, at most 50 ms, no lock held)
 // until no more than KYTY_LOWLAT_QUEUE (1|2, default 2) real frames are still on the GPU.
 [[nodiscard]] bool OwnLowLatencyOn();
+// KYTY_LOWLAT=1 with FSR 3 frame generation on NVIDIA (VK_NV_low_latency2, no Streamline): NVIDIA Reflex on FSR 3's
+// real swapchain as with KYTY_ANTILAG=1 (the same sleep and markers Streamline's Reflex gives the plain 30 fps path),
+// our own pacer off while that swapchain has it. KYTY_LOWLAT_REFLEX=0 off.
+[[nodiscard]] bool AutoReflex();
+// The flip queue limit (KYTY_FLIP_QUEUE_LIMIT, default on; KYTY_LOWLAT_PACE_BEFORE_INPUT=0 also turns it off): under a
+// flip rate (the game's own, KYTY_FLIP_FPS) the controller read of frame N waits for frame N - k's release (k 1 or 2).
+[[nodiscard]] bool PaceOn();
 void               OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick);
 
 // KYTY_LATENCY=1 (the launcher sets it with the metrics overlay): input -> present latency, any Anti-Lag mode or none.

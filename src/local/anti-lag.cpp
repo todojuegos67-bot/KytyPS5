@@ -135,6 +135,28 @@ void Mark(int32_t stage, uint64_t index) {
 }
 } // namespace
 
+bool PaceOn() {
+	static const bool on = [] {
+		const char* off = std::getenv("KYTY_LOWLAT_PACE_BEFORE_INPUT");
+		const char* q   = std::getenv("KYTY_FLIP_QUEUE_LIMIT");
+		const bool  r   = !(off != nullptr && off[0] == '0') && (Own().on || q == nullptr || q[0] != '0');
+		std::printf("Flip queue limit: %s (the game's controller read waits for frame N - 1's release under a flip rate or "
+		            "cap; KYTY_FLIP_QUEUE_LIMIT=0 / KYTY_LOWLAT_PACE_BEFORE_INPUT=0 off)\n",
+		            r ? "on" : "off");
+		std::fflush(stdout);
+		return r;
+	}();
+	return on;
+}
+
+bool AutoReflex() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_LOWLAT_REFLEX");
+		return Own().on && Fsr3::Requested() && (v == nullptr || v[0] != '0');
+	}();
+	return on;
+}
+
 bool Requested() {
 	static const bool requested = [] {
 		const char* v = std::getenv("KYTY_ANTILAG");
@@ -162,12 +184,13 @@ void OnDevice(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool extensio
 		                 std::memory_order_release);
 	Mode        mode   = Mode::Off;
 	const char* text   = nullptr;
-	if (!Requested()) {
+	const bool auto_reflex = !Requested() && AutoReflex(); // (NVIDIA Reflex only: AMD / Intel keep our pacer)
+	if (!Requested() && !auto_reflex) {
 		text = "Anti-Lag: off (KYTY_ANTILAG=0)";
 	} else if (FrameGen::StreamlineLoaded()) {
 		text = "Anti-Lag: off (NVIDIA Streamline loaded: Reflex is active)";
 	} else {
-		if (extension_enabled && get_proc != nullptr)
+		if (extension_enabled && get_proc != nullptr && !auto_reflex)
 			g_update = reinterpret_cast<UpdateFn>(get_proc(static_cast<VkDevice>(device), "vkAntiLagUpdateAMD"));
 		if (reflex_enabled && get_proc != nullptr) {
 			const auto dev = static_cast<VkDevice>(device);
@@ -190,11 +213,15 @@ void OnDevice(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool extensio
 		if (g_update == nullptr && g_semaphore != VK_NULL_HANDLE) {
 			g_device = static_cast<VkDevice>(device);
 			mode     = Mode::Reflex;
-			text     = "Anti-Lag: NVIDIA Reflex (VK_NV_low_latency2; low latency on, boost off, no frame limit)";
+			text     = auto_reflex ? "Anti-Lag: NVIDIA Reflex for FSR 3 frame generation (KYTY_LOWLAT; VK_NV_low_latency2, low latency on, "
+			                         "boost off, no frame limit; our pacer only without it)"
+			                       : "Anti-Lag: NVIDIA Reflex (VK_NV_low_latency2; low latency on, boost off, no frame limit)";
 		} else if (g_update != nullptr) {
 			g_device = static_cast<VkDevice>(device);
 			mode     = Mode::Amd;
 			text     = "Anti-Lag: AMD Anti-Lag 2 (VK_AMD_anti_lag)";
+		} else if (auto_reflex) {
+			text = "Anti-Lag: no NVIDIA Reflex here (KYTY_LOWLAT: our own pacer)";
 		} else if (const char* v = std::getenv("KYTY_ANTILAG"); v == nullptr || v[0] != '2') {
 			// (The limiter's wait in the controller read corrupted the picture in a test on NVIDIA: opt-in only.)
 			text = "Anti-Lag: off (neither VK_AMD_anti_lag nor VK_NV_low_latency2; KYTY_ANTILAG=2 for the experimental "
@@ -289,9 +316,11 @@ struct PaceCap {
 };
 PaceCap g_pace; // under g_pace_mutex
 
+// Every mode but DLSS-G (Streamline's frame generation paces itself): 202407 (DLSS SR, Streamline Reflex on, the game's
+// own 30 fps flip rate) kept two frames between GPU done and flip (65.9 ms) like our 30 cap with FSR 3: Reflex's sleep
+// does not see a queue in front of a flip rate. The wait only ever holds the game for frame N - k's release.
 bool PaceAllowed() {
-	return Own().pace && g_mode.load(std::memory_order_relaxed) == Mode::Off && !FrameGen::StreamlineLoaded() &&
-	       !FrameGen::Enabled();
+	return PaceOn() && !FrameGen::Enabled();
 }
 
 const char*       g_pace_site = "scePadRead";
@@ -307,57 +336,65 @@ void PaceLogOnce(const char* what, double ms) {
 	std::fflush(stdout);
 }
 
+// The last 64 input -> GPU done samples (the game's frame lead): k = 2 (one frame queued) while their p99 exceeds the
+// cap minus a vblank, back to k = 1 (none queued) after 60 frames under it. Modelled on 195625 (tools sim depth.py):
+// a slot sleep on top (v3) made frames late and the back-off then turned the pacer off on most frames.
+double   g_lead_ring[64] {};
+uint32_t g_lead_n = 0, g_k_hold = 0;
+int      g_k = 1; // under g_pace_mutex
+
+int PaceDepthMode() { // KYTY_LOWLAT_PACE_DEPTH: auto (default), 0 (never a frame queued), 1 (always one)
+	static const int mode = [] {
+		const char* v = std::getenv("KYTY_LOWLAT_PACE_DEPTH");
+		return v == nullptr ? -1 : (v[0] == '0' ? 0 : (v[0] == '1' ? 1 : -1));
+	}();
+	return mode;
+}
+
 void PaceBeforeInput(uint64_t index) {
 	if (!PaceAllowed()) return;
 	const double per_ms = LatTicksPerMs();
 	std::unique_lock lock(g_pace_mutex);
-	const double cap  = g_pace.cap_ms;
-	if (g_pace.margin <= 0.0) g_pace.margin = Own().margin;
-	const double lead = g_pace_lead > 0.0 ? g_pace_lead + g_pace.margin : 0.0;
-	g_pace_iv         = cap;
-	g_pace_k.store(1, std::memory_order_relaxed);
-	if (cap < 4.0 || cap > 70.0 || lead <= 0.0 || g_rel_index == 0 || index < 2) return;
-	if (g_pace.skip > 0) return; // (a late frame: no sleep for a while)
-	// Frames queued behind the cap (the steady state without pacing: 2, gpu done -> flip 65.8 ms, lat3): throttle the
-	// producer. The read of frame `index` waits until frame index - k has left (k = 1, or 2 when lead + margin is over
-	// one cap): each such read removes one queued frame, then the slot-based sleep below takes over.
-	const int k = lead > cap ? 2 : 1;
-	g_pace_k.store(k, std::memory_order_relaxed);
-	if (index <= static_cast<uint64_t>(k)) return;
-	const uint64_t target = index - static_cast<uint64_t>(k);
-	if (g_rel_index < target) {
-		const int64_t drain_start = LatNow();
-		g_pace_cond.wait_for(lock, std::chrono::microseconds(static_cast<int64_t>((cap * (k + 1) + 10.0) * 1000.0)),
-		                     [target] { return g_rel_index >= target; });
-		const double drained = static_cast<double>(LatNow() - drain_start) / per_ms;
-		g_pace_drain_sum.store(g_pace_drain_sum.load(std::memory_order_relaxed) + drained, std::memory_order_relaxed);
-		g_pace_drain_n.fetch_add(1, std::memory_order_relaxed);
-		PaceLogOnce("drain wait", drained);
-		if (g_rel_index < target) return; // (timed out: a pause / loading; nothing more)
+	const double cap = g_pace.cap_ms;
+	g_pace_iv        = cap;
+	if (cap < 4.0 || cap > 70.0 || g_rel_index == 0 || index < 3) return;
+	if (PaceDepthMode() >= 0) {
+		g_k = PaceDepthMode() + 1;
+	} else if (g_lead_n >= 16) {
+		const uint32_t n = std::min<uint32_t>(g_lead_n, 64);
+		double         v[64];
+		std::copy(g_lead_ring, g_lead_ring + n, v);
+		const uint32_t q = std::min<uint32_t>(n - 1, static_cast<uint32_t>(n * 0.99));
+		std::nth_element(v, v + q, v + n);
+		const double p99 = v[q];
+		const double vb  = 2.0; // (headroom before the slot; not a 60 Hz vblank: a ready frame flips when due)
+		if (g_k == 1 && p99 > cap - vb) {
+			g_k      = 2;
+			g_k_hold = 0;
+		} else if (g_k == 2) {
+			g_k_hold = p99 <= cap - vb ? g_k_hold + 1 : 0;
+			if (g_k_hold >= 60) g_k = 1;
+		}
 	}
-	if (g_rel_index != target) return; // (the game is behind: frame index - k left long ago, no sleep)
-	const auto* tst = StageFor(target);
-	const int64_t rel = tst != nullptr && tst->release.load(std::memory_order_relaxed) != 0 ? tst->release.load(std::memory_order_relaxed)
-	                                                                                        : g_rel_ticks;
+	const int k = g_k;
+	g_pace_k.store(k, std::memory_order_relaxed);
+	// Frames queued behind the cap: the read of frame `index` waits until frame index - k has been released (at most
+	// (k + 1) caps + 10 ms). The game then has a whole cap for its frame before that slot; no other sleep.
+	const uint64_t target = index - static_cast<uint64_t>(k);
+	if (g_rel_index >= target) return;
+	const int64_t start = LatNow();
+	g_pace_cond.wait_for(lock, std::chrono::microseconds(static_cast<int64_t>((cap * (k + 1) + 10.0) * 1000.0)),
+	                     [target] { return g_rel_index >= target; });
+	const double waited = static_cast<double>(LatNow() - start) / per_ms;
+	g_pace_drain_sum.store(g_pace_drain_sum.load(std::memory_order_relaxed) + waited, std::memory_order_relaxed);
+	g_pace_drain_n.fetch_add(1, std::memory_order_relaxed);
 	lock.unlock();
-	const int64_t now     = LatNow();
-	const double  since   = static_cast<double>(now - rel) / per_ms;
-	if (since > cap * k) return; // (already late)
-	// Wake by the slot (release of index - k + k caps) - lead - margin; never more than that (no over-sleep).
-	double wait_ms = cap * k - since - lead;
-	if (wait_ms <= 0.5) return;
-	wait_ms             = std::min(wait_ms, cap * k - lead);
-	const int64_t until = now + static_cast<int64_t>(wait_ms * per_ms);
-	if (wait_ms > 1.5) std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>((wait_ms - 1.0) * 1000.0)));
-	while (LatNow() < until) std::this_thread::yield();
-	g_pace_slept_sum.store(g_pace_slept_sum.load(std::memory_order_relaxed) + wait_ms, std::memory_order_relaxed);
-	g_pace_slept_n.fetch_add(1, std::memory_order_relaxed);
-	PaceLogOnce("slot sleep", wait_ms);
+	PaceLogOnce("drain wait", waited);
 }
 } // namespace
 
 void SetPaceCap(double cap_ms, double vblank_ms) {
-	if (!Own().pace) return;
+	if (!PaceOn()) return;
 	std::lock_guard lock(g_pace_mutex);
 	if (cap_ms <= 0.0) { // (not a capped game-view frame: off, and start over)
 		g_pace.cap_ms = 0.0;
@@ -373,12 +410,13 @@ void OnFlipReady(uint64_t frame_index) {
 	if (st == nullptr) return;
 	const int64_t now = LatNow();
 	st->ready.store(now, std::memory_order_relaxed);
-	if (!Own().pace) return;
+	if (!PaceOn()) return;
 	const int64_t in = st->input.load(std::memory_order_relaxed);
 	if (in == 0 || now <= in) return;
 	const double sample = static_cast<double>(now - in) / LatTicksPerMs();
 	if (sample > 100.0) return;
 	std::lock_guard lock(g_pace_mutex);
+	g_lead_ring[g_lead_n++ % 64] = sample;
 	if (g_pace_lead <= 0.0) g_pace_lead = sample;
 	else g_pace_lead += (sample - g_pace_lead) * (sample > g_pace_lead ? 0.5 : 0.05); // up fast, down slowly
 }
@@ -569,7 +607,7 @@ void OnPresented(uint64_t frame_index) {
 			std::printf("[lat] stages: input->submit %.1f ms, submit->gpu done %.1f, gpu done->flip %.1f, flip->present %.1f "
 			            "(n %u); pace %s: drain %.1f ms (n %u), sleep %.1f ms (n %u), lead %.1f + margin %.1f, cap %.1f, k %d, late %u\n",
 			            g_lat.st_sum[0] / d, g_lat.st_sum[1] / d, g_lat.st_sum[2] / d, g_lat.st_sum[3] / d, g_lat.st_n,
-			            !Own().pace ? "off" : (PaceAllowed() && iv > 0.0 ? "on" : "idle"), dn > 0 ? ds / dn : 0.0, dn,
+			            !PaceOn() ? "off" : (PaceAllowed() && iv > 0.0 ? "on" : "idle"), dn > 0 ? ds / dn : 0.0, dn,
 			            sn > 0 ? ss / sn : 0.0, sn, lead, margin, iv, g_pace_k.load(std::memory_order_relaxed), misses);
 			std::fflush(stdout);
 		}
@@ -593,7 +631,7 @@ void OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick) {
 void OnInput(const char* site) {
 	if (Own().on) OwnLimit();
 	const Mode mode = g_mode.load(std::memory_order_relaxed);
-	if (mode == Mode::Off && !LatencyOn() && !Own().pace) return;
+	if (mode == Mode::Off && !LatencyOn() && !PaceOn()) return;
 	// Once per flip: the first controller read after the game flipped its last frame starts the next one.
 	const uint64_t flips = g_flips.load(std::memory_order_acquire);
 	uint64_t       seen  = g_flips_at_input.load(std::memory_order_relaxed);
@@ -653,7 +691,7 @@ void OnInput(const char* site) {
 }
 
 uint64_t OnFlipReserved() {
-	if (g_mode.load(std::memory_order_relaxed) == Mode::Off && !LatencyOn() && !Own().pace) return 0;
+	if (g_mode.load(std::memory_order_relaxed) == Mode::Off && !LatencyOn() && !PaceOn()) return 0;
 	g_flips.fetch_add(1, std::memory_order_acq_rel);
 	const uint64_t index  = g_input_index.load(std::memory_order_acquire);
 	uint64_t       tagged = g_tagged_index.load(std::memory_order_relaxed);
