@@ -148,6 +148,10 @@ private:
 	int CheckPortHandleLocked(int handle) const;
 
 	void CheckActive();
+	// bruno-astro-1025 (pad-1024): input on a connected pad other than player 1's (a press, or a stick or trigger
+	// past half) makes it player 1; the others' input is dropped. Logged with its name and XInput slot.
+	bool Claim(int id, bool significant);
+	void LogActive(const char* why);
 	void AddState();
 	// Apply cached output without changing its game-requested lifetime; caller holds m_mutex.
 	void ApplyVibration();
@@ -489,6 +493,50 @@ void GameController::CheckActive() {
 	m_vibration_until    = 0;
 	m_trigger_effect     = {};
 	m_trigger_state      = {};
+	LogActive("connected pads changed");
+}
+
+// The player-1 pad, its name and its XInput slot (SDL's player index: 0-3 for an XInput pad, whichever slot Windows
+// gave it; -1 for a HIDAPI pad such as a DualSense).
+void GameController::LogActive(const char* why) {
+	if (m_active_id < 0 || m_active_id == HOST_INPUT_CONTROLLER_ID) {
+		std::printf("Pad: player 1 = %s (%s, %d connected)\n", m_active_id < 0 ? "none" : "keyboard", why,
+		            static_cast<int>(m_connected_ids.size()));
+	} else {
+		auto*       pad  = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+		const char* name = pad != nullptr ? SDL_GetGamepadName(pad) : nullptr;
+		const int   slot = pad != nullptr ? SDL_GetGamepadPlayerIndex(pad) : -1;
+		const bool  ps5  = pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5;
+		if (slot >= 0 && !ps5) {
+			std::printf("Pad: player 1 = '%s' (id %d, XInput slot %d) (%s, %d connected)\n", name != nullptr ? name : "?",
+			            m_active_id, slot + 1, why, static_cast<int>(m_connected_ids.size()));
+		} else {
+			std::printf("Pad: player 1 = '%s' (id %d%s) (%s, %d connected)\n", name != nullptr ? name : "?", m_active_id,
+			            ps5 ? ", DualSense" : "", why, static_cast<int>(m_connected_ids.size()));
+		}
+	}
+	std::fflush(stdout);
+}
+
+// Last-used pad wins. Windows can put the player's pad in any XInput slot (2-4 while another device, a virtual or
+// idle pad, holds slot 1), and a DualSense and an XInput pad can both be connected: the first connected one was
+// player 1 for good and the other's input was dropped. Input from the pads that are not player 1 is still ignored, so
+// two pads never mix in one state.
+bool GameController::Claim(int id, bool significant) {
+	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+		return true;
+	}
+	if (!significant || std::find(m_connected_ids.begin(), m_connected_ids.end(), id) == m_connected_ids.end()) {
+		return false;
+	}
+	m_active_id          = id;
+	m_state              = {};
+	m_gyro_time          = 0;
+	m_up_reference_valid = false;
+	m_next_touch_id      = 1;
+	LogActive("input on it");
+	ApplyVibration();
+	return true;
 }
 
 void GameController::AddState() {
@@ -511,7 +559,7 @@ void GameController::Button(int id, uint32_t button, bool down) {
 	}
 
 	// The keyboard shares the player-1 pad with the active gamepad.
-	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+	if (Claim(id, down)) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
 		m_state.buttons = down ? m_state.buttons | button : m_state.buttons & ~button;
@@ -523,7 +571,8 @@ void GameController::Button(int id, uint32_t button, bool down) {
 void GameController::Axis(int id, Controller::Axis axis, int value) {
 	Common::LockGuard lock(m_mutex);
 
-	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+	const bool trigger_axis = axis == Controller::Axis::TriggerLeft || axis == Controller::Axis::TriggerRight;
+	if (Claim(id, trigger_axis ? value > 128 : (value < 64 || value > 192))) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
 		int axis_id = static_cast<int>(axis);
