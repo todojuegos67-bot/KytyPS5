@@ -189,6 +189,13 @@ public:
 			m_handle = nullptr;
 		}
 		if (m_lazy && m_backing_base != nullptr) GuestLazyCommit::Start(reinterpret_cast<uint64_t>(m_backing_base), m_size);
+		// (The RAM guard counts the store's commit charge: all of it, what is committed of it, or none.)
+		if (m_backing_base != nullptr)
+			RamGuard::NoteGuestStore(m_backing_base, m_size,
+			                         m_file != INVALID_HANDLE_VALUE ? RamGuard::StoreCharge::File
+			                         : m_lazy                       ? RamGuard::StoreCharge::Lazy
+			                         : m_on_demand                  ? RamGuard::StoreCharge::OnDemand
+			                                                        : RamGuard::StoreCharge::AllCommitted);
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #if defined(__APPLE__)
 		{

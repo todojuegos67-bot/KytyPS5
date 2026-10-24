@@ -30,6 +30,7 @@
 #include "live-counters.h"
 #include "local-platform.h"
 #include "soft-release.h"
+#include "ram-guard.h"
 
 #include <cstdio>
 #include "kytyGitVersion.h"
@@ -227,6 +228,7 @@ bool GraphicContext::CreateAllocator() {
 	small_video_memory = GetTotalMemoryBudget(false) < (uint64_t {12} << 30u) || (small_env != nullptr && *small_env == '1');
 	LocalPlatform::StartWorkingSetTrim();
 	SoftRelease::Start();
+	RamGuard::Start();
 	LocalPlatform::KeepResident();
 	LocalPlatform::StartMemoryBreakdown();
 	// The game buffers' pool (graphicContext.h): VMA's device-local type for them, VMA's block sizes (dedicated memory
