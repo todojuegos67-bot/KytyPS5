@@ -37,7 +37,7 @@ void               OnSwapchain(VkSwapchainKHR swapchain, bool fsr3);
 void                   AfterPresent(uint64_t frame_index);
 
 // The game reads its controller (scePadRead / scePadReadState): once per flip, the frame's INPUT mark (or the limiter).
-void OnInput();
+void OnInput(const char* site = "scePadRead");
 // A guest flip reserved: the frame's index (0: none).
 [[nodiscard]] uint64_t OnFlipReserved();
 // The flip's GPU work done (FlipQueue::Complete) / the flip released to the presenter (FlipQueue::Flip): stage stamps

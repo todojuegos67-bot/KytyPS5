@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -293,6 +294,19 @@ bool PaceAllowed() {
 	       !FrameGen::Enabled();
 }
 
+const char*       g_pace_site = "scePadRead";
+std::atomic<bool> g_pace_logged {false};
+void PaceLogOnce(const char* what, double ms) {
+	if (g_pace_logged.exchange(true)) return;
+#if defined(_WIN32)
+	const unsigned long tid = GetCurrentThreadId();
+#else
+	const unsigned long tid = static_cast<unsigned long>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
+#endif
+	std::printf("[pace] first %s (%.1f ms) on thread %lu at %s (the game's controller read)\n", what, ms, tid, g_pace_site);
+	std::fflush(stdout);
+}
+
 void PaceBeforeInput(uint64_t index) {
 	if (!PaceAllowed()) return;
 	const double per_ms = LatTicksPerMs();
@@ -318,6 +332,7 @@ void PaceBeforeInput(uint64_t index) {
 		const double drained = static_cast<double>(LatNow() - drain_start) / per_ms;
 		g_pace_drain_sum.store(g_pace_drain_sum.load(std::memory_order_relaxed) + drained, std::memory_order_relaxed);
 		g_pace_drain_n.fetch_add(1, std::memory_order_relaxed);
+		PaceLogOnce("drain wait", drained);
 		if (g_rel_index < target) return; // (timed out: a pause / loading; nothing more)
 	}
 	if (g_rel_index != target) return; // (the game is behind: frame index - k left long ago, no sleep)
@@ -337,6 +352,7 @@ void PaceBeforeInput(uint64_t index) {
 	while (LatNow() < until) std::this_thread::yield();
 	g_pace_slept_sum.store(g_pace_slept_sum.load(std::memory_order_relaxed) + wait_ms, std::memory_order_relaxed);
 	g_pace_slept_n.fetch_add(1, std::memory_order_relaxed);
+	PaceLogOnce("slot sleep", wait_ms);
 }
 } // namespace
 
@@ -574,7 +590,7 @@ void OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick) {
 	g_own_frames.store(frame + 1, std::memory_order_release);
 }
 
-void OnInput() {
+void OnInput(const char* site) {
 	if (Own().on) OwnLimit();
 	const Mode mode = g_mode.load(std::memory_order_relaxed);
 	if (mode == Mode::Off && !LatencyOn() && !Own().pace) return;
@@ -617,6 +633,7 @@ void OnInput() {
 		ReflexMarker(VK_LATENCY_MARKER_SIMULATION_START_NV, index);
 		ReflexMarker(VK_LATENCY_MARKER_INPUT_SAMPLE_NV, index);
 	}
+	g_pace_site = site;
 	PaceBeforeInput(index); // KYTY_LOWLAT_PACE_BEFORE_INPUT: sleep before the sample, not after
 	{
 		auto& st = g_stage[index % kStageRing];
