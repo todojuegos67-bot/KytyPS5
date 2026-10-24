@@ -109,7 +109,9 @@ void Lights(uvec3 wg, uint li) {
 	vec3  c    = Safe(textureLod(color_tex, uv, 0).rgb) * e;
 	float d    = DepthAt(uv);
 	float l    = Luma(c);
-	bool  ok   = !IsSky(d) && abs(ViewZ(d)) < 45.0 && l > hdr.y;
+	// (nearer than 6 m: the player's own lantern, a torch held in front of the camera: a halo there is a haze over
+	// the whole character, not a shaft; rejected here so it never takes a slot)
+	bool  ok   = !IsSky(d) && abs(ViewZ(d)) < 45.0 && abs(ViewZ(d)) > 6.0 && l > hdr.y;
 	// (luminance in the high 26 bits, the tap in the low 6: the max picks the brightest)
 	s_best[li] = ok ? ((min(uint(l * 1024.0), 0x3ffffffu) << 6) | li) : 0u;
 	barrier();
@@ -343,13 +345,18 @@ void Composite(ivec2 p) {
 			if (a.w <= 0.0) continue;
 			vec3  lp = ViewPos(a.xy, a.z);
 			float ld = length(lp);
-			float fade = smoothstep(45.0, 12.0, ld) * smoothstep(0.0, 1.0, a.w);
+			float fade = smoothstep(45.0, 12.0, ld) * smoothstep(6.0, 14.0, ld) * smoothstep(0.0, 1.0, a.w);
+			// Fade by the halo's size on screen (its 4 R cut as a fraction of the screen height): a near, small light
+			// would cover a large part of the image with a milky haze.
+			float scr = 2.0 * R * abs(push.proj.y) / max(ld, 1e-3);
+			fade *= smoothstep(0.45, 0.2, scr);
 			if (fade <= 0.0) continue;
 			float t0 = dot(lp, dir);
 			float h  = max(length(lp - dir * t0), 0.3 * R);
 			// The closed-form integral of R / (h^2 + (t - t0)^2) over t in [0, tmax] (dimensionless), x a soft radius cut.
 			float I  = (atan((tmax - t0) / h) - atan(-t0 / h)) * (R / h);
 			I *= smoothstep(4.0 * R, 0.5 * R, h);
+			I = min(I, 2.0); // (clamp: the core of a light the ray grazes stays a glow, not a flare)
 			vec3  lc = lights[k * 2 + 1].rgb;
 			float ll = min(Luma(lc), 12.0);
 			add += Hue(lc) * (ll * 0.01 * I * fade * push.extra.z);
