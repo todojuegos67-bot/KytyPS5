@@ -8,10 +8,12 @@
 //   KYTY_SOFT_RELEASE=1          heaps compacted and idle scratch buffers freed on quiet frames (no working set trim)
 //   KYTY_RAM_DIET=1              driver pipelines idle 180 s released, replaced unoptimized ones after 60 s
 //   KYTY_PREFETCH_MIN_AVAIL_MB=3072  the shader prefetch waits while less RAM than that is left
+//   KYTY_VRAM_BUDGET_MB, KYTY_GC_BUDGET_CAP_MB=5120 (4096 with 12 GiB or less)  the video memory caches' budget:
+//                                the private commit follows the video memory in use
 //   KYTY_BACKING_ON_DEMAND=1     the guest store's page-file section committed as the game maps it, not 13.5 GiB at
 //                                launch (KYTY_LOWRAM_ON_DEMAND=0 keeps it all committed; never with KYTY_BACKING_FILE or
 //                                KYTY_GUEST_LAZY_COMMIT)
-// Nothing of the render resolution, the game's detail or the video memory budget changes.
+// Nothing of the render resolution or the game's detail changes.
 //
 // Pressure watcher (KYTY_RAM_GUARD=0 turns it off; Windows): a thread checks every second the physical memory left,
 // the commit headroom (commit limit less charge) and Windows' low-memory signal (CreateMemoryResourceNotification).
