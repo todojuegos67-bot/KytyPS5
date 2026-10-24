@@ -107,7 +107,9 @@ public:
 	void SetNumInstances(uint32_t num_instances);
 	bool DrawIndex(DrawIndexArgs args);
 	// An indirect draw whose arguments the GPU wrote, drawn from them on the GPU.
-	[[nodiscard]] bool TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_t stride, bool indexed);
+	// `count_addr` (DRAW_INDIRECT_MULTI): a GPU-written draw count the GPU reads, `count` then the packet's max.
+	[[nodiscard]] bool TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_t stride, bool indexed,
+	                                      uint64_t count_addr = 0);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	bool DrawIndexAuto(DrawAutoArgs args);
 	// Native XPR draws (kyty_local_native_xpr_mode): packets consumed, 0 = normal path.

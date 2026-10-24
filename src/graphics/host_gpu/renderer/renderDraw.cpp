@@ -1660,6 +1660,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	std::pair<Buffer*, uint64_t> gpu_args {};
+	std::pair<Buffer*, uint64_t> gpu_count {}; // emit.gpu_count_addr's
 	auto&    buffer_cache = m_context.GetBufferCache();
 	uint64_t unregistered = buffer_cache.UnregisterEpoch();
 	const auto acquire_buffers = [&] {
@@ -1673,6 +1674,10 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			gpu_args = buffer_cache.ObtainBuffer(
 			    emit.gpu_args, uint64_t {emit.gpu_args_count - 1u} * emit.gpu_args_stride + size, false);
 			EXIT_IF(gpu_args.first == nullptr);
+			if (emit.gpu_count_addr != 0) {
+				gpu_count = buffer_cache.ObtainBuffer(emit.gpu_count_addr, sizeof(uint32_t), false);
+				EXIT_IF(gpu_count.first == nullptr);
+			}
 		}
 	};
 	acquire_buffers();
@@ -1800,6 +1805,14 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto emit_draw = [&] {
 		if (mesh_active) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		} else if (emit.gpu_args != 0 && gpu_count.first != nullptr) {
+			// The count stays on the GPU (it wrote it): no CPU wait for that work; the GPU clamps it to the packet's max.
+			if (emit.indexed)
+				vk_buffer.drawIndexedIndirectCount(gpu_args.first->Handle(), gpu_args.second, gpu_count.first->Handle(),
+				                                   gpu_count.second, emit.gpu_args_count, emit.gpu_args_stride);
+			else
+				vk_buffer.drawIndirectCount(gpu_args.first->Handle(), gpu_args.second, gpu_count.first->Handle(),
+				                            gpu_count.second, emit.gpu_args_count, emit.gpu_args_stride);
 		} else if (emit.gpu_args != 0 && emit.indexed) {
 			vk_buffer.drawIndexedIndirect(gpu_args.first->Handle(), gpu_args.second, emit.gpu_args_count,
 			                              emit.gpu_args_stride);
@@ -2439,6 +2452,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	emit.gpu_args        = args.gpu_args;
 	emit.gpu_args_count  = args.gpu_args_count;
 	emit.gpu_args_stride = args.gpu_args_stride;
+	emit.gpu_count_addr  = args.gpu_count_addr;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart, true, true, false);
@@ -2553,6 +2567,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	emit.gpu_args        = args.gpu_args;
 	emit.gpu_args_count  = args.gpu_args_count;
 	emit.gpu_args_stride = args.gpu_args_stride;
+	emit.gpu_count_addr  = args.gpu_count_addr;
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false, false,
