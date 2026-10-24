@@ -315,6 +315,8 @@ function Start-Game {
 	if ($tsel -like 'KYTY_*') { $sets += $tsel } elseif ($tsel) { $extraCv += $tsel }  # (KYTY_*: por -Set, que manda sobre la config)
 	if ($extraCv.Count) { $psargs += @('-ExtraConvars', ($extraCv -join ';')) }
 	if ($chkMetricas.Checked) { $sets += 'KYTY_LATENCY=1' }
+	$sets += 'KYTY_LOWLAT_PACE_BEFORE_INPUT=0'  # (10-24) ritmo antes del mando: bajaba los FPS en videos y menus; apagado hasta arreglarlo
+	if ($cmbRays -and $cmbRays.SelectedIndex -gt 0) { $sets += "KYTY_GODRAYS=$($cmbRays.SelectedIndex)" }  # (10-24) rayos de luz
 	if ($cmbShine -and $cmbShine.SelectedIndex -gt 0) { $sets += "KYTY_SHINE=$($cmbShine.SelectedIndex)" }  # (10-24) brillo de metales
 	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
@@ -1728,7 +1730,7 @@ foreach ($pp in @(@('Motion Blur', 'motionblur'), @('Depth of Field', 'dof'), @(
 	$px += 134; if ($px -gt 300) { $px = 12; $py += 30 }
 }
 # (10-24) Ray tracing en pantalla (beta): sombras del sol y reflejos con denoise. Solo con DLSS, XeSS o FSR.
-$gRt = New-Group 'Ray tracing (beta)' 10 586 420 124
+$gRt = New-Group 'Ray tracing (beta)' 10 586 420 156
 function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @('Off', 'Low', 'High', 'Ultra')) {
 	$lb = New-Label $label $smallFont $ink 0 0 98 22; $panel.Controls.Add($lb)
 	$c = New-Object System.Windows.Forms.ComboBox
@@ -1743,6 +1745,7 @@ function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @(
 $cmbRtSh = New-RtCombo 'RT Shadows' 'rtshadow' 24 'Ray-traced sun shadows on the image, with denoising. Only with DLSS, XeSS or FSR. Low ~0.3 ms, High ~1 ms, Ultra ~1.5 ms. Beta.'
 $cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl2' 56 'Ray-traced reflections on water, puddles and wet surfaces, with denoising. Only with DLSS, XeSS or FSR. Low ~0.6 ms, Medium ~1 ms, High ~2 ms, Ultra ~4.5 ms. Beta.' @('Off', 'Low', 'Medium', 'High', 'Ultra')
 $cmbShine = New-RtCombo 'Metal shine' 'shine' 88 'Armour, shields and metal: highlights from the sun and from torches and fires, plus a bit more sharpness. Only with DLSS, XeSS or FSR. Best with RT Shadows on. Beta.' @('Off', 'Sun', 'Sun + 2 lights', 'Sun + 4 lights')
+$cmbRays = New-RtCombo 'Light shafts' 'godrays' 120 'Crepuscular sun rays and a light halo around torches and fires. Only with DLSS, XeSS or FSR. Sun rays need RT Shadows on. Soft ~0.3 ms, Strong ~1 ms. Beta.' @('Off', 'Soft', 'Medium', 'Strong')
 
 # (10-24) Tu equipo: tarjeta con el caballero senalando la grafica y el equipo detectados (antes, una linea abajo).
 function New-PcCard {
@@ -1791,7 +1794,7 @@ function New-PcCard {
 	$gc.Dispose()
 	$pb = New-Object System.Windows.Forms.PictureBox
 	$pb.BackColor = [System.Drawing.Color]::Transparent; $pb.Image = $bmp
-	$pb.Location = New-Object System.Drawing.Point(10, 718); $pb.Size = New-Object System.Drawing.Size($cw, $ch)
+	$pb.Location = New-Object System.Drawing.Point(10, 750); $pb.Size = New-Object System.Drawing.Size($cw, $ch)
 	$panel.Controls.Add($pb)
 	return $pb
 }
@@ -1941,7 +1944,7 @@ $btnSave.Add_Click({
 $settings.Controls.Add($btnSave)
 # (10-24) Prueba para las manchas negras del suelo mojado: una cosa cada vez (se guarda; 'Ninguna' para volver).
 $script:testModes = @(
-	@('Test: none', ''), @('No async compute', 'enableAsyncCompute=false'), @('No spot shadows', 'r_enableSpotShadows=false'),
+	@('Test: none', ''), @('Hardware RT shadows', 'KYTY_RT_SHADOWS_HW=1'), @('No async compute', 'enableAsyncCompute=false'), @('No spot shadows', 'r_enableSpotShadows=false'),
 	@('No ambient shadowing', 'r_enableAmbientShadowing=false'), @('No game SSR', 'r_ssrCutoffDistance=0'),
 	@('Emu: fresh memory off', 'KYTY_FRESH_MEMORY=0'), @('Emu: partial dirty off', 'KYTY_PARTIAL_IMAGE_DIRTY=0'),
 	@('Emu: resolve pages off', 'KYTY_TEXTURE_RESOLVE_PAGES=0'), @('Emu: image pool off', 'KYTY_IMAGE_POOL=0'), @('Emu: texture reduce off', 'KYTY_TEXTURE_REDUCE=0'), @('Emu: sin arreglo focos', 'KYTY_DEPTH_ARRAY_GUARD=0'),

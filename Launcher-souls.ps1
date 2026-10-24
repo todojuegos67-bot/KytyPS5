@@ -315,6 +315,8 @@ function Start-Game {
 	if ($tsel -like 'KYTY_*') { $sets += $tsel } elseif ($tsel) { $extraCv += $tsel }  # (KYTY_*: por -Set, que manda sobre la config)
 	if ($extraCv.Count) { $psargs += @('-ExtraConvars', ($extraCv -join ';')) }
 	if ($chkMetricas.Checked) { $sets += 'KYTY_LATENCY=1' }
+	$sets += 'KYTY_LOWLAT_PACE_BEFORE_INPUT=0'  # (10-24) ritmo antes del mando: bajaba los FPS en videos y menus; apagado hasta arreglarlo
+	if ($cmbRays -and $cmbRays.SelectedIndex -gt 0) { $sets += "KYTY_GODRAYS=$($cmbRays.SelectedIndex)" }  # (10-24) rayos de luz
 	if ($cmbShine -and $cmbShine.SelectedIndex -gt 0) { $sets += "KYTY_SHINE=$($cmbShine.SelectedIndex)" }  # (10-24) brillo de metales
 	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
@@ -1728,7 +1730,7 @@ foreach ($pp in @(@('Motion Blur', 'motionblur'), @('Depth of Field', 'dof'), @(
 	$px += 134; if ($px -gt 300) { $px = 12; $py += 30 }
 }
 # (10-24) Ray tracing en pantalla (beta): sombras del sol y reflejos con denoise. Solo con DLSS, XeSS o FSR.
-$gRt = New-Group 'Ray tracing (beta)' 10 586 420 124
+$gRt = New-Group 'Ray tracing (beta)' 10 586 420 156
 function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @('No', 'Bajo', 'Alto', 'Ultra')) {
 	$lb = New-Label $label $smallFont $ink 0 0 98 22; $panel.Controls.Add($lb)
 	$c = New-Object System.Windows.Forms.ComboBox
@@ -1743,6 +1745,7 @@ function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @(
 $cmbRtSh = New-RtCombo 'Sombras RT' 'rtshadow' 24 'Sombras del sol trazadas por rayos sobre la imagen, con denoise. Solo con DLSS, XeSS o FSR. Bajo ~0,3 ms, Alto ~1 ms, Ultra ~1,5 ms. Beta.'
 $cmbRtRf = New-RtCombo 'Reflejos RT' 'rtrefl2' 56 'Reflejos trazados por rayos en agua, charcos y superficies mojadas, con denoise. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~4,5 ms. Beta.' @('No', 'Bajo', 'Medio', 'Alto', 'Ultra')
 $cmbShine = New-RtCombo 'Brillo metales' 'shine' 88 'Armaduras, escudos y metales: brillos del sol y de antorchas y fuegos, y algo mas de nitidez. Solo con DLSS, XeSS o FSR. Mejor con Sombras RT activadas. Beta.' @('No', 'Sol', 'Sol + 2 luces', 'Sol + 4 luces')
+$cmbRays = New-RtCombo 'Rayos de luz' 'godrays' 120 'Rayos de sol crepusculares y halo de luz alrededor de antorchas y fuegos. Solo con DLSS, XeSS o FSR. Los rayos de sol necesitan Sombras RT activadas. Suave ~0,3 ms, Fuerte ~1 ms. Beta.' @('No', 'Suave', 'Medio', 'Fuerte')
 
 # (10-24) Tu equipo: tarjeta con el caballero senalando la grafica y el equipo detectados (antes, una linea abajo).
 function New-PcCard {
@@ -1791,7 +1794,7 @@ function New-PcCard {
 	$gc.Dispose()
 	$pb = New-Object System.Windows.Forms.PictureBox
 	$pb.BackColor = [System.Drawing.Color]::Transparent; $pb.Image = $bmp
-	$pb.Location = New-Object System.Drawing.Point(10, 718); $pb.Size = New-Object System.Drawing.Size($cw, $ch)
+	$pb.Location = New-Object System.Drawing.Point(10, 750); $pb.Size = New-Object System.Drawing.Size($cw, $ch)
 	$panel.Controls.Add($pb)
 	return $pb
 }
@@ -1941,7 +1944,7 @@ $btnSave.Add_Click({
 $settings.Controls.Add($btnSave)
 # (10-24) Prueba para las manchas negras del suelo mojado: una cosa cada vez (se guarda; 'Ninguna' para volver).
 $script:testModes = @(
-	@('Prueba: ninguna', ''), @('Sin compute asincrono', 'enableAsyncCompute=false'), @('Sin sombras de focos', 'r_enableSpotShadows=false'),
+	@('Prueba: ninguna', ''), @('Sombras RT por hardware', 'KYTY_RT_SHADOWS_HW=1'), @('Sin compute asincrono', 'enableAsyncCompute=false'), @('Sin sombras de focos', 'r_enableSpotShadows=false'),
 	@('Sin ambient shadowing', 'r_enableAmbientShadowing=false'), @('Sin SSR del juego', 'r_ssrCutoffDistance=0'),
 	@('Emu: fresh memory off', 'KYTY_FRESH_MEMORY=0'), @('Emu: partial dirty off', 'KYTY_PARTIAL_IMAGE_DIRTY=0'),
 	@('Emu: resolve pages off', 'KYTY_TEXTURE_RESOLVE_PAGES=0'), @('Emu: image pool off', 'KYTY_IMAGE_POOL=0'), @('Emu: texture reduce off', 'KYTY_TEXTURE_REDUCE=0'), @('Emu: sin arreglo focos', 'KYTY_DEPTH_ARRAY_GUARD=0'),
