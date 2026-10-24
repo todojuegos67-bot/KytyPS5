@@ -471,6 +471,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${shine_header}")
 
+# KYTY_GODRAYS: sun shafts + light halos before the upscaler (src/local/godrays.cpp).
+set(godrays_source "${KYTY_SOURCE_DIR}/local/godrays.comp")
+set(godrays_spv "${gpu_tiler_generated_dir}/godrays.spv")
+set(godrays_header "${gpu_tiler_generated_dir}/godrays_spv.h")
+add_custom_command(
+	OUTPUT "${godrays_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${godrays_spv}" "${godrays_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${godrays_spv} -DOUTPUT=${godrays_header}
+	        -DSYMBOL=GODRAYS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${godrays_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${godrays_header}")
+
 # KYTY_RT_SHADOWS: screen-space ray-traced sun shadows before the upscaler (src/local/frame-gen.cpp).
 set(cshadow_source "${KYTY_SOURCE_DIR}/local/cshadow.comp")
 set(cshadow_spv "${gpu_tiler_generated_dir}/cshadow.spv")
@@ -570,6 +586,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.cpp"
 	"${KYTY_SOURCE_DIR}/local/shine.h"
 	"${KYTY_SOURCE_DIR}/local/shine.cpp"
+	"${KYTY_SOURCE_DIR}/local/godrays.h"
+	"${KYTY_SOURCE_DIR}/local/godrays.cpp"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.cpp"
 	"${KYTY_SOURCE_DIR}/local/kbm-warp.h"
