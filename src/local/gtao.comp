@@ -292,7 +292,7 @@ void Composite(ivec2 pixel) {
 		return;
 	}
 	float z    = abs(ViewZ(d));
-	float fade = 1.0 - smoothstep(30.0, 90.0, z);
+	float fade = 1.0 - smoothstep(60.0, 300.0, z); // (10-24 far: was 30..90 m)
 	if (fade <= 0.0) {
 		imageStore(out_img, pixel, col);
 		return;

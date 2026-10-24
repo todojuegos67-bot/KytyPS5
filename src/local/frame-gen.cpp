@@ -6654,7 +6654,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.trace[0] = static_cast<float>(g_cs.trace.width), push.trace[1] = static_cast<float>(g_cs.trace.height);
 	const float strength = RtShadowEnv("KYTY_RT_SHADOWS_STRENGTH", "KYTY_CONTACT_SHADOWS_STRENGTH", 0.6f, 1.0f);
 	const float length   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_LENGTH", "KYTY_CONTACT_SHADOWS_LENGTH", 3.0f, 10.0f), 0.25f); // (10-24) 3 m (1 m was too short)
-	const float fade_m   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_FADE", nullptr, 60.0f, 300.0f), 2.0f); // (10-24) 60 m (25 cut them close by)
+	const float fade_m   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_FADE", nullptr, 60.0f, 600.0f), 2.0f); // (10-24) 60 m (25 cut them close by); far: up to 600 (fade to 1200 m)
 	push.trace[2] = strength, push.trace[3] = length;
 	for (int k = 0; k < 3; ++k) {
 		const auto c = ToView(view, {k == 0 ? 1.0 : 0.0, k == 1 ? 1.0 : 0.0, k == 2 ? 1.0 : 0.0});

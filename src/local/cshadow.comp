@@ -113,12 +113,18 @@ float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 	// rays are the shadow maps' business and only double them).
 	float px_m  = abs(push.proj.y) * 0.5 * RenderSize().y / max(z, 1e-3);
 	float cap   = push.cand[3].x * RenderSize().y / 1440.0;
-	float len   = min((q >= 3 ? 1.25 : 1.0) * push.trace.w * mix(0.3, 1.0, nw), cap / px_m);
+	// (10-24 far) Past 60 m, with a fade beyond 120 m (KYTY_RT_SHADOWS_FADE > 60), the world length grows again with
+	// the distance (geometry there is metres across: a 0.9 m ray finds nothing), still capped to the screen length.
+	float farx  = push.cand[3].w > 121.0 ? smoothstep(60.0, max(push.cand[3].w * 0.5, 61.0), z) : 0.0;
+	float len   = min((q >= 3 ? 1.25 : 1.0) * push.trace.w * mix(0.3, 1.0, nw) + farx * 0.03 * z, cap / px_m);
 	// Thickness: an occluder is taken as this deep behind its depth-buffer surface (thin-object leak guard). (10-24:
 	// 0.2 m near to 0.45 m far; it grew to 1 m at 47 m, and rays passing up to 1 m behind a cliff's front faces
 	// made hard dark shards there.)
-	float thick = clamp(0.2 + 0.006 * z, 0.2, 0.45) * push.cand[3].y;
-	float bias  = 0.0015 * z + 0.002;
+	// (10-24 far) plus ~2 pixels' footprint far away (0 m at 50 m, ~0.4 m at 300 m): the depth buffer's own steps,
+	// not a fixed metre that let rays pass behind cliffs; the bias adds a slope term (half a pixel, more when grazing).
+	float foot  = 1.0 / px_m;
+	float thick = (clamp(0.2 + 0.006 * z, 0.2, 0.45) + farx * 1.5 * foot) * push.cand[3].y;
+	float bias  = 0.0015 * z + 0.002 + farx * foot * mix(0.5, 1.5, 1.0 - ndl);
 	// The occluder must stand clear of the receiver's own plane: a ray over a low-poly surface (a cliff's flat facets
 	// in the depth buffer, smooth in the game's shading) hits the next facet of a crease within decimetres. The
 	// height of the ray over that plane is t * N.L: a least distance, a few cm near, ~0.25 m at 50 m.

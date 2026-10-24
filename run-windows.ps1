@@ -71,7 +71,7 @@ param(
 	[double]$UpscaleRatio = 0,
 	[string]$ForceMode = '',
 	[int]$Shadows = 0,
-	[ValidateSet('', 'Ultra', 'VeryHigh', 'High', 'Normal', 'Low')][string]$Detail = '',  # (10-23) preset de detalle del juego
+	[ValidateSet('', 'Lejana', 'Ultra', 'VeryHigh', 'High', 'Normal', 'Low')][string]$Detail = '',  # (10-23) preset de detalle del juego
 	[string]$PostOff = '',
 	[string]$Reflections = '',  # (10-23) SSR del juego: Ultra|Normal|Low (High = de fabrica)
 	[string]$ObjectFade = '',   # (10-23) fundido de objetos lejanos: Ultra|Normal|Low
@@ -448,6 +448,9 @@ if ($RtShadowsStrength -ge 0) { $environment['KYTY_RT_SHADOWS_STRENGTH'] = $RtSh
 # (10-22) -Shadows 0|1|2: sombras Maximo (las del juego), Medio (sol hasta 125 m), Bajo (sol hasta 60 m, sin sombreado
 # ambiental ni sombras de focos). A menos nivel pueden aparecer de golpe al acercarse (popping).
 $detailConvars = @{
+	# (10-24) Lejana: Ultra con sombras del sol hasta 1000 m (4 cascadas), objetos que se desvanecen mucho mas lejos y SSR a
+	# todo el rango (techos del eboot: ray 1600, cutoff 5000, 256 iteraciones). Coste estimado -10..15 % fps vs Ultra.
+	'Lejana'   = 'r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=1000;r_contactShadowsEnabled=true;r_fadeOutInstanceOverDistance=60;r_ssrEnableOverrides=true;r_ssrMaxIterations=256;r_ssrMaxRayLength=1600;r_ssrCutoffDistance=5000;r_iblResolution=Full;r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.015;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0'
 	'Ultra'    = 'r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=400;r_contactShadowsEnabled=true;r_iblResolution=Full;r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.015;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0'
 	'VeryHigh' = 'r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=250;r_iblResolution=Full;r_tessellationDensity=18.0;r_tessellationSmallestEdgeLength=0.02;r_tessellationFadeOutStart=15.0;r_tessellationFadeOutRange=3.0'
 	'High'     = ''
@@ -458,9 +461,11 @@ $detailConvars = @{
 # r_ssrCutoffDistance 1000 (0-5000); r_fadeOutInstanceOverDistance 15 (0-200); r_aaSharpenStrengthStatic/Motion 2.5 (0-10),
 # r_aaHistorySharpeningStrength 0.8 (0-1).
 $gfxExtra = @{
+	'refl_Lejana' = 'r_ssrEnableOverrides=true;r_ssrMaxIterations=256;r_ssrMaxRayLength=1600;r_ssrCutoffDistance=5000'
 	'refl_Ultra'  = 'r_ssrEnableOverrides=true;r_ssrMaxIterations=192;r_ssrMaxRayLength=1400;r_ssrCutoffDistance=1500'
 	'refl_Normal' = 'r_ssrEnableOverrides=true;r_ssrMaxIterations=64;r_ssrMaxRayLength=600;r_ssrCutoffDistance=500'
 	'refl_Low'    = 'r_ssrEnableOverrides=true;r_ssrMaxIterations=32;r_ssrMaxRayLength=300;r_ssrCutoffDistance=250'
+	'fade_Lejana' = 'r_fadeOutInstanceOverDistance=60'
 	'fade_Ultra'  = 'r_fadeOutInstanceOverDistance=35'
 	'fade_Normal' = 'r_fadeOutInstanceOverDistance=10'
 	'fade_Low'    = 'r_fadeOutInstanceOverDistance=6'
@@ -477,6 +482,8 @@ if ($PostOff -and $titleId -match '^PPSA0134[0-2]$') {
 	$postConvars = @($PostOff -split '[,;]' | ForEach-Object { $postMap[$_.Trim().ToLower()] } | Where-Object { $_ }) -join ';'
 	if ($postConvars) { $environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $postConvars) | Where-Object { $_ }) -join ';' }
 }
+# (10-24) Lejana / -Shadows 4: las sombras RT tambien llegan lejos (fade 250 m -> 0 a 500 m) salvo que se pase KYTY_RT_SHADOWS_FADE.
+if (($Detail -eq 'Lejana' -or $Shadows -eq 4) -and !$environment.Contains('KYTY_RT_SHADOWS_FADE') -and !$env:KYTY_RT_SHADOWS_FADE) { $environment['KYTY_RT_SHADOWS_FADE'] = '250' }
 if ($Detail -and $detailConvars[$Detail] -and $titleId -match '^PPSA0134[0-2]$') {
 	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $detailConvars[$Detail]) | Where-Object { $_ }) -join ';'
 }
@@ -488,7 +495,7 @@ if ($ShadowsUltra -and $Shadows -eq 0 -and $titleId -match '^PPSA0134[0-2]$') {
 }
 if ($ExtraConvars -and $titleId -match '^PPSA0134[0-2]$') { $environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $ExtraConvars) | Where-Object { $_ }) -join ';' }
 if ($Shadows -gt 0 -and $titleId -match '^PPSA0134[0-2]$') {
-	$shadowConvars = if ($Shadows -eq 3) { 'sunShadowMaxDistance=190' } elseif ($Shadows -eq 1) { 'sunShadowMaxDistance=125' } else { 'sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false' }
+	$shadowConvars = if ($Shadows -eq 4) { 'sunShadowMaxDistance=1000;r_virtualGeometryNumShadowCascades=4' } elseif ($Shadows -eq 3) { 'sunShadowMaxDistance=190' } elseif ($Shadows -eq 1) { 'sunShadowMaxDistance=125' } else { 'sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false' }
 	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $shadowConvars) | Where-Object { $_ }) -join ';'
 }
 # -TextureReduce 0|1|2: large block-compressed textures held without their 1 or 2 largest levels (KYTY_TEXTURE_REDUCE;

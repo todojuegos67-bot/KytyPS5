@@ -380,8 +380,8 @@ constexpr LevelCfg Levels[5] = {
     {"off", false, false, 0, 0.0f, 0, 0.0f, 0.0f, 1.0f},
     {"low", false, true, 24, 0.45f, 1, 200.0f, 0.30f, 1.0f},
     {"medium", false, false, 32, 0.55f, 2, 300.0f, 0.45f, 1.0f},
-    {"high", false, false, 48, 0.60f, 3, 400.0f, 0.65f, 0.9f},
-    {"ultra", true, true, 64, 0.65f, 3, 600.0f, 0.90f, 0.8f},
+    {"high", false, false, 48, 0.60f, 3, 800.0f, 0.75f, 0.9f}, // (10-24 far: 400 m / 0.65)
+    {"ultra", true, true, 72, 0.65f, 3, 1600.0f, 1.00f, 0.8f}, // (10-24 far: 64 / 600 m / 0.90)
 };
 const LevelCfg& Cfg(int level) { return Levels[std::clamp(level, 0, 4)]; }
 
