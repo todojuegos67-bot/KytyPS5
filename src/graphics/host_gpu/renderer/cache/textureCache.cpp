@@ -1550,7 +1550,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	info.htile_clear_mask = 0;
 	auto replacement_id   = TakeParkedImage(info);
+	const bool from_parked = static_cast<bool>(replacement_id);
 	if (!replacement_id) replacement_id = InsertImage(info);
+	const auto copy_start = std::chrono::steady_clock::now();
 	auto& replacement = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
 	replacement.depth_array_alias = alias_guard && !replacement.info.IsDepth() &&
@@ -1599,6 +1601,22 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		cached.untracked_holes.clear();
 		cached.track_addr     = 0;
 		cached.track_addr_end = 0;
+	}
+	if (alias_guard) {
+		// KYTY_DEPTH_ARRAY_LOG: what the switch did (the copy keeps the rendered layers; a replacement that is not
+		// GPU-modified afterwards, or a skipped copy, loses them).
+		static std::atomic<uint32_t> switch_reports {0};
+		if (switch_reports.fetch_add(1, std::memory_order_relaxed) < 64) {
+			std::printf("Depth array switch: %s -> %s replacement=%s copied_samples=%u/%u gpu_after=%d cpu_after=%d "
+			            "partial_after=%d buffer_after=%d copy_ms=%.2f frame=%llu\n",
+			            cached.info.IsDepth() ? "depth" : "color", replacement.info.IsDepth() ? "depth" : "color",
+			            from_parked ? "parked" : "new", cached.backing.samples, replacement.backing.samples,
+			            replacement.IsGpuModified() ? 1 : 0, replacement.IsCpuDirty() ? 1 : 0,
+			            replacement.IsPartiallyCpuDirty() ? 1 : 0, replacement.IsBufferModified() ? 1 : 0,
+			            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copy_start).count(),
+			            static_cast<unsigned long long>(m_frame.load(std::memory_order_relaxed)));
+			std::fflush(stdout);
+		}
 	}
 	ParkImage(cached_id);
 	return replacement_id;
