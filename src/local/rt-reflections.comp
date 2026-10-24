@@ -1,4 +1,6 @@
 #version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 // KYTY_RT_REFLECTIONS (rt-reflections.cpp): screen-space ray-traced reflections with denoising on the PS5 Pro path's
 // render-resolution color, recorded right before the upscaler (DLSS / XeSS / FSR) with its inputs: the game's depth,
 // motion vectors, the pre-exposure lit HDR color (the game's exposure is applied after the upscale; read here from its
@@ -47,7 +49,8 @@ layout(std430, binding = 18) buffer Frame {
 	vec4 clip_prev[4]; // rows of the current clip -> previous clip matrix (column vectors)
 	vec4 up_view;      // world up in view space
 	vec4 fparams;      // x: 1.0 (the exposure when the game gives none), y: wet surfaces' minimum reflectance,
-	                   // z: the longest ray on screen (render pixels; 0 none)
+	                   // z: the longest ray on screen (render pixels; 0 none), w: the puddle guess's scale
+	vec4 mparams;      // the material field: x, y wet below x, dry above y (roughness units), z its scale
 	int  calib[];      // see CALIB_* below (calibration sums, then the cumulative stats counters)
 };
 // calib[] layout (ints): [0] samples; [CALIB_NORMAL + ((layer * NLAYOUTS + layout) * 2 + space) * 2 + convention] sum of
@@ -55,13 +58,17 @@ layout(std430, binding = 18) buffer Frame {
 // [CALIB_FLOORS + convention] up-facing depth normals (world up known); [CALIB_WET] puddle-guess pixels, then 16 byte
 // field sums there, [CALIB_WET + 17] water pixels, then 16 byte field sums there (to find a material field);
 // [STATS + k] cumulative counters, never cleared (1/16 of the pixels: 0 composite pixels (not sky), 1 weight > 0.05,
-// 2 sum of weight * 1000, 3 reflective mask > 0.05, 4 rays traced, 5 ray hits, 6 G-buffer normal used, 7 water).
+// 2 sum of weight * 1000, 3 reflective mask > 0.05, 4 rays traced, 5 ray hits, 6 G-buffer normal used, 7 water,
+// 8 final depth != the G-buffer-time depth by > 2 %, 9 material wet); [CALIB_HIST + field * 16 + bin] byte histograms.
+// (The buffer is device-local, copied to a host buffer once a frame: atomics on host memory cross PCIe one by one, which
+// made the composite cost 3-4 ms in the 10-24 b7dd0fe6 build.)
 const int NLAYOUTS     = 13;
 const int CALIB_NORMAL = 1;
 const int CALIB_BYTES  = CALIB_NORMAL + 4 * NLAYOUTS * 4;
 const int CALIB_FLOORS = CALIB_BYTES + 16 * 3;
 const int CALIB_WET    = CALIB_FLOORS + 2;
-const int STATS        = 300;
+const int CALIB_HIST   = 300;
+const int STATS        = 560;
 layout(std430, binding = 19) readonly buffer Exposure {
 	float exposure_values[];
 };
@@ -305,11 +312,12 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	s.Ng = Nd;
 	s.gb = match ? 1.0 : 0.0;
 	if (dot(s.N, V) < 0.02) s.N = normalize(s.N + V * (0.02 - dot(s.N, V) + 0.01)); // (back-facing by a little: bent)
-	float cut = push.motion.z;
 	float mat = 0.0, mat_r = 1.0;
-	if (match && push.dec.y >= 0 && push.misc2.w != 0) {
-		mat_r = clamp(Field(push.dec.y, rp), 0.0, 1.0);
-		mat   = 1.0 - smoothstep(cut * 0.6, cut, mat_r);
+	if (match && push.dec.y >= 0) {
+		// The material field (roughness units: low = smooth / wet): wet below mparams.x, dry from mparams.y; walls half.
+		float r = clamp(Field(push.dec.y, rp), 0.0, 1.0);
+		mat     = (1.0 - smoothstep(mparams.x, mparams.y, r)) * mix(0.5, 1.0, UpFacing(Nd)) * mparams.z;
+		mat_r   = mix(0.02, 0.25, smoothstep(0.0, mparams.y, r));
 	}
 	float guess = water > 0.0 ? 0.0 : PuddleGuess(ruv, Nd) * fparams.w;
 	s.mask  = max(water, max(mat, guess));
@@ -428,7 +436,11 @@ vec3 SampleGgxVndf(vec3 N, vec3 V, float alpha, vec2 u) {
 }
 
 bool Sampled(ivec2 p) { return ((p.x | p.y) & 3) == 0; } // (the stats: 1 pixel in 16)
-void Stat(int k, int v) { atomicAdd(calib[STATS + k], v); }
+// (one atomic per subgroup: the lanes active here summed first)
+void Stat(int k, int v) {
+	int sum = subgroupAdd(v);
+	if (subgroupElect()) atomicAdd(calib[STATS + k], sum);
+}
 
 void StoreMiss(ivec2 px, Surf s) {
 	imageStore(out_a, px, vec4(0));
@@ -745,6 +757,12 @@ void Composite(ivec2 px) {
 	bool  match = GbufNormal(px, Ng) && dot(Ng, Nd) > 0.6;
 	vec3  N     = match ? Ng : Nd;
 	if (st && match) Stat(6, 1);
+	if (st && (push.misc.w & 64) != 0) {
+		float d0 = texelFetch(gdepth, px, 0).r;
+		float z0 = IsSky(d0) ? FAR : abs(ViewZ(d0));
+		if (abs(z0 - z) > 0.02 * z) Stat(8, 1);
+	}
+	if (st && match && push.dec.y >= 0 && Field(push.dec.y, px) < mparams.x) Stat(9, 1);
 	vec4 rf, ax;
 	if (all(equal(ivec2(TraceSize()), ivec2(RenderSize())))) {
 		rf = texelFetch(src_a, px, 0);
@@ -768,7 +786,8 @@ void Composite(ivec2 px) {
 	vec3  V     = normalize(-P);
 	if (dot(N, V) < 0.02) N = normalize(N + V * (0.02 - dot(N, V) + 0.01));
 	float NoV   = clamp(dot(N, V), 0.0, 1.0);
-	float w     = push.params.x * mask * clamp(rf.a, 0.0, 1.0) * Spec(mask, rough, NoV);
+	// (the confidence through a square root: a 60 % hit rate averaged in should not cut the reflection to 60 %)
+	float w     = push.params.x * mask * sqrt(clamp(rf.a, 0.0, 1.0)) * Spec(mask, rough, NoV);
 	// The game's own highlights (lights, emissives: far brighter than what a screen-space ray can find) stay.
 	float lc = Luma(max(col.rgb, vec3(0))), lr = Luma(refl);
 	w *= 1.0 - smoothstep(4.0, 12.0, lc / max(lr, lc * 1e-4 + 1e-30));
@@ -827,6 +846,7 @@ void Calibrate(ivec2 gp) {
 			atomicAdd(calib[f + 1], int(v * v * 1000.0));
 			atomicAdd(calib[f + 2], int(v * nov * 1000.0));
 			if (pud) atomicAdd(calib[CALIB_WET + 1 + layer * 4 + b], int(v * 1000.0));
+			atomicAdd(calib[CALIB_HIST + (layer * 4 + b) * 16 + min(int(v * 16.0), 15)], 1);
 			if (wat) atomicAdd(calib[CALIB_WET + 18 + layer * 4 + b], int(v * 1000.0));
 		}
 	}

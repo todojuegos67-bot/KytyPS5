@@ -17,7 +17,11 @@
 // it, depth normals and the heuristic. The game's exposure (its upscaler path's slot 5 buffer) is read so the filters
 // work on display-referred values.
 //
-// KYTY_RT_REFLECTIONS_STRENGTH (1.0, 0..3): the reflection's share scale. KYTY_RT_REFLECTIONS_MIN (0.3, 0..0.8): the
+// Material field: picked by the calibration (the byte that separates puddle-looking pixels most), or
+// KYTY_RT_REFLECTIONS_ROUGH; KYTY_RT_REFLECTIONS_WET=lo:hi (wet below lo, dry from hi, roughness units),
+// KYTY_RT_REFLECTIONS_MATERIAL (1.0: its scale), KYTY_RT_REFLECTIONS_DEPTH=<n> (the lighting's n-th depth binding as the
+// pre-water depth), KYTY_RT_REFLECTIONS_GUESS (0.2: the puddle guess without a material field).
+// KYTY_RT_REFLECTIONS_STRENGTH (1.0, 0..3): the reflection's share scale. KYTY_RT_REFLECTIONS_MIN (0.35, 0..0.8): the
 // minimum reflectance of wet surfaces (water films, puddles: far above a dry dielectric's 4 %). KYTY_RT_REFLECTIONS_NORMAL
 // = <layer>:<layout 0..12>[w][n] and KYTY_RT_REFLECTIONS_ROUGH = <layer>:<shift>:<bits>[g] override the calibration
 // (layouts: the shader's DecodeNormal), KYTY_RT_REFLECTIONS_FLIPY=1|0 forces the screen y convention (1: the render's row
@@ -54,7 +58,7 @@ namespace Libs::Graphics::FrameGen {
 namespace {
 
 constexpr uint32_t Bindings      = 21;
-constexpr uint32_t HeaderBytes   = 144;           // view_rot[3], clip_prev[4], up_view, fparams
+constexpr uint32_t HeaderBytes   = 160;           // view_rot[3], clip_prev[4], up_view, fparams, mparams
 // calib[] (after the header; the shader's CALIB_* / STATS): samples, normal sums per layer x layout x space x screen
 // y convention, byte statistics, floor votes, then the cumulative stats counters (never cleared).
 constexpr uint32_t NLayouts      = 13;
@@ -62,13 +66,14 @@ constexpr uint32_t CalibNormal   = 1;
 constexpr uint32_t CalibBytes    = CalibNormal + 4 * NLayouts * 4;
 constexpr uint32_t CalibFloors   = CalibBytes + 16 * 3;
 constexpr uint32_t CalibWet      = CalibFloors + 2; // puddle guess: count + 16 byte sums; water: the same
-constexpr uint32_t StatsIndex    = 300;
-constexpr uint32_t StatsCount    = 8;
-constexpr uint32_t FrameBytes    = 2048;          // header + calibration + stats
+constexpr uint32_t CalibHist     = 300;             // 16 byte fields x 16 bins
+constexpr uint32_t StatsIndex    = 560;
+constexpr uint32_t StatsCount    = 10;
+constexpr uint32_t FrameBytes    = 4096;          // header + calibration + stats
 constexpr uint32_t ExposureIndex = 128 / 4;       // fparams.x (1.0) when the game gives no exposure
 constexpr uint32_t CalibRuns     = 24;
 constexpr uint32_t MaxMips       = 12;
-static_assert(CalibWet + 34 <= StatsIndex);
+static_assert(CalibWet + 34 <= CalibHist && CalibHist + 256 <= StatsIndex);
 static_assert(HeaderBytes + (StatsIndex + StatsCount) * 4 <= FrameBytes);
 
 struct RtPush {
@@ -113,8 +118,13 @@ struct RtPass {
 	RtImage                 gb[2], hist[2], meta[2];
 	RtImage                 dummy; // 1x1 R32_UINT stand-in for absent G-buffer layers
 	std::vector<Retired>    retired;
-	VkBuffer                frame_buf = VK_NULL_HANDLE;
+	VkBuffer                frame_buf = VK_NULL_HANDLE; // device-local: the shader's header, sums and counters
+	VmaAllocation           frame_dev_mem = nullptr;
+	VkBuffer                read_buf = VK_NULL_HANDLE;  // host: its copy after every frame (what the CPU reads)
 	VmaAllocation           frame_mem = nullptr;
+	// The material field (wet below lo, dry from hi; scale): from KYTY_RT_REFLECTIONS_ROUGH / _WET or the calibration.
+	float                   mat_lo = 0.15f, mat_hi = 0.30f, mat_scale = 1.0f;
+	bool                    mat_auto = false, mat_forced = false;
 	const int32_t*          mapped    = nullptr;
 	bool                    frame_cleared = false;
 	uint64_t                frame = 0;
@@ -322,13 +332,20 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	}
 	VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
 	buffer.size  = FrameBytes;
-	buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	VmaAllocationCreateInfo dev {};
+	dev.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+	if (vmaCreateBuffer(graphics.allocator, &buffer, &dev, &g_rt.frame_buf, &g_rt.frame_dev_mem, nullptr) != VK_SUCCESS) {
+		g_rt.frame_buf = VK_NULL_HANDLE;
+		return false;
+	}
+	buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 	VmaAllocationCreateInfo host {};
 	host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
 	VmaAllocationInfo mapped {};
-	if (vmaCreateBuffer(graphics.allocator, &buffer, &host, &g_rt.frame_buf, &g_rt.frame_mem, &mapped) != VK_SUCCESS) {
-		g_rt.frame_buf = VK_NULL_HANDLE;
+	if (vmaCreateBuffer(graphics.allocator, &buffer, &host, &g_rt.read_buf, &g_rt.frame_mem, &mapped) != VK_SUCCESS) {
+		g_rt.read_buf = VK_NULL_HANDLE;
 		return false;
 	}
 	g_rt.mapped = static_cast<const int32_t*>(mapped.pMappedData);
@@ -478,13 +495,17 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	const double   px     = static_cast<double>(std::max<uint64_t>(sm[0], 1));
 	const double   area   = (Cfg(level).full ? 1.0 : 0.25) * (Cfg(level).checker ? 0.5 : 1.0); // (rays per render pixel)
 	const uint64_t copies = RtReflCopies();
-	const char* source = g_rt.rough_trusted ? (g_rt.have_water ? "water + material field" : "material field")
-	                     : g_rt.have_water  ? "water (depth after the G-buffer) + faint puddle guess"
-	                                        : "faint puddle guess only (no depth copy)";
-	std::printf("RT reflections: last %.0f s: mask %s marks %.1f%% of the pixels reflective (water %.1f%%); weight > 0.05 on "
+	const bool  mat    = g_rt.rough_trusted || g_rt.mat_auto;
+	const char* source = mat ? (g_rt.have_water ? (g_rt.rough_trusted ? "material field (env) + water" : "material field (auto) + water")
+	                                            : (g_rt.rough_trusted ? "material field (env)" : "material field (auto)"))
+	                     : g_rt.have_water ? "water (depth after the G-buffer) + faint puddle guess"
+	                                       : "faint puddle guess only (no depth copy)";
+	std::printf("RT reflections: last %.0f s: mask %s marks %.1f%% of the pixels reflective (water %.1f%%, material wet %.1f%%, "
+	            "depth changed after the G-buffer %.1f%%); weight > 0.05 on "
 	            "%.1f%% of the pixels, mean weight %.3f (%.3f on reflective surfaces), rays on %.1f%%, hit rate %.0f%%, "
 	            "G-buffer copy %llu of %llu frames, its normal used on %.1f%% (%s), screen y %s, GPU %.3f ms\n",
 	            std::chrono::duration<double>(now - g_rt.stat_time).count(), source, 100.0 * sm[3] / px, 100.0 * sm[7] / px,
+	            100.0 * sm[9] / px, 100.0 * sm[8] / px,
 	            100.0 * sm[1] / px, sm[2] / 1000.0 / px, sm[3] > 0 ? sm[2] / 1000.0 / static_cast<double>(sm[3]) : 0.0,
 	            100.0 * sm[4] / (px * area), sm[4] > 0 ? 100.0 * sm[5] / static_cast<double>(sm[4]) : 0.0,
 	            static_cast<unsigned long long>(copies - g_rt.stat_copies0), static_cast<unsigned long long>(g_rt.stat_frames),
@@ -556,27 +577,6 @@ bool Analyze(GraphicContext& graphics, uint32_t packed_count) {
 		            "= NDC y %s\n",
 		            layer, layouts[layout], (best & 64) ? "world" : "view", (best & 128) ? ", negated" : "", std::abs(best_score),
 		            g_rt.row0_up ? "+1" : "-1");
-		// The word's free byte(s) as roughness: the candidate with the widest spread.
-		int cands[2] = {-1, -1};
-		if (layout == 1 || layout == 3) cands[0] = 3;
-		if (layout == 2) cands[0] = 0;
-		if (layout == 9) cands[0] = 2, cands[1] = 3;
-		if (layout == 10) cands[0] = 0, cands[1] = 1;
-		double best_sd = 0.03;
-		int    pick    = -1;
-		for (int b: cands) {
-			if (b < 0) continue;
-			const int    f    = CalibBytes + (layer * 4 + b) * 3;
-			const double mean = c[f] / 1000.0 / n, sq = c[f + 1] / 1000.0 / n;
-			const double sd   = std::sqrt(std::max(sq - mean * mean, 0.0));
-			if (sd > best_sd && mean > 0.03 && mean < 0.97) best_sd = sd, pick = b;
-		}
-		if (g_rt.dec_rough < 0 && pick >= 0) {
-			g_rt.dec_rough = layer | ((pick * 8) << 2) | (8 << 7);
-			std::printf("RT reflections: roughness = layer %d bits %d..%d (sd %.2f; a GUESS, not used: set "
-			            "KYTY_RT_REFLECTIONS_ROUGH to use a field)\n",
-			            layer, pick * 8, pick * 8 + 7, best_sd);
-		}
 	} else {
 		std::printf("RT reflections: G-buffer normal not identified (best |mean cos| %.3f, %.0f samples): depth normals and "
 		            "the wet-surface mask\n",
@@ -602,9 +602,66 @@ bool Analyze(GraphicContext& graphics, uint32_t packed_count) {
 		}
 		std::printf("RT reflections: G-buffer byte fields, mean all / puddle-looking (%.0f) / water (%.0f):%s\n", pud, wat, line.c_str());
 	}
-	if (!g_rt.rough_trusted)
-		std::printf("RT reflections: reflectivity from water (depth drawn after the G-buffer) and a faint puddle guess; no material "
-		            "field (KYTY_RT_REFLECTIONS_ROUGH)\n");
+	// The material field, automatically: the byte (outside the decoded normal's bits) that separates the puddle-looking
+	// pixels from all the others the most (>= 1 standard deviation and 0.2 apart). Below the overall mean on puddles:
+	// roughness (low = wet / smooth); above: gloss (inverted). Wet below a quarter of the way from the puddles' mean to
+	// the overall mean, dry from halfway (in roughness units). The 10-24 log: L2.b0 0.40 overall / 0.01 on puddles,
+	// L1.b2 0.60 / 0.96.
+	if (!g_rt.rough_trusted && g_rt.dec_rough < 0 && packed_count > 0 && n >= 200.0 && c[CalibWet] >= 100 && g_rt.dec_normal >= 0) {
+		const int    nlayer = g_rt.dec_normal & 3, nlayout = (g_rt.dec_normal >> 2) & 15;
+		const auto   in_normal = [&](int layer, int b) {
+			if (layer != nlayer) return false;
+			switch (nlayout) {
+				case 1: case 3: return b <= 2;
+				case 2: return b >= 1;
+				case 9: return b <= 1;
+				case 10: return b >= 2;
+				default: return true;
+			}
+		};
+		const double pud = c[CalibWet];
+		int          pick = -1;
+		double       best_sep = 0.0, pick_all = 0.0, pick_pud = 0.0;
+		for (int f = 0; f < 16; ++f) {
+			if (in_normal(f / 4, f % 4)) continue;
+			const double all = c[CalibBytes + f * 3] / 1000.0 / n, sq = c[CalibBytes + f * 3 + 1] / 1000.0 / n;
+			const double sd  = std::sqrt(std::max(sq - all * all, 0.0));
+			const double mp  = c[CalibWet + 1 + f] / 1000.0 / pud;
+			if (sd < 0.05) continue;
+			const double sep = std::abs(mp - all) / sd;
+			if (sep >= 1.0 && std::abs(mp - all) >= 0.2 && sep > best_sep) best_sep = sep, pick = f, pick_all = all, pick_pud = mp;
+		}
+		if (pick >= 0) {
+			const bool   gloss = pick_pud > pick_all;
+			const double rp = gloss ? 1.0 - pick_pud : pick_pud, ra = gloss ? 1.0 - pick_all : pick_all;
+			g_rt.dec_rough = (pick / 4) | (((pick % 4) * 8) << 2) | (8 << 7) | (gloss ? 4096 : 0);
+			if (!g_rt.mat_forced) {
+				g_rt.mat_lo = static_cast<float>(rp + (ra - rp) * 0.25);
+				g_rt.mat_hi = static_cast<float>(rp + (ra - rp) * 0.5);
+			}
+			g_rt.mat_auto = true;
+			// (the share of all pixels it marks wet, from the field's histogram)
+			double wet = 0.0, total = 0.0;
+			for (int b = 0; b < 16; ++b) {
+				const double v  = (b + 0.5) / 16.0, r = gloss ? 1.0 - v : v;
+				const double hc = c[CalibHist + pick * 16 + b];
+				total += hc;
+				if (r < g_rt.mat_hi) wet += hc * (r < g_rt.mat_lo ? 1.0 : 0.5);
+			}
+			std::printf("RT reflections: material field = layer %d bits %d..%d%s (mean %.2f overall, %.2f on puddle-looking pixels, "
+			            "%.1f sd apart): wet below %.2f, dry from %.2f (roughness units), about %.1f%% of the samples wet "
+			            "(KYTY_RT_REFLECTIONS_ROUGH=%d:%d:8%s and KYTY_RT_REFLECTIONS_WET=lo:hi override)\n",
+			            pick / 4, (pick % 4) * 8, (pick % 4) * 8 + 7, gloss ? " (gloss: inverted)" : " (roughness)", pick_all, pick_pud,
+			            best_sep, g_rt.mat_lo, g_rt.mat_hi, total > 0 ? 100.0 * wet / total : 0.0, pick / 4, (pick % 4) * 8,
+			            gloss ? "g" : "");
+		} else {
+			std::printf("RT reflections: no material field separates the puddle-looking pixels (>= 1 sd): water and the faint "
+			            "puddle guess\n");
+		}
+	} else if (!g_rt.rough_trusted && g_rt.dec_rough < 0 && packed_count > 0) {
+		std::printf("RT reflections: material field not looked for (%s): water and the faint puddle guess\n",
+		            g_rt.dec_normal < 0 ? "no G-buffer normal" : "too few puddle-looking samples");
+	}
 	std::fflush(stdout);
 	return identified;
 }
@@ -668,6 +725,12 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			const int32_t n = NormalEnv("KYTY_RT_REFLECTIONS_NORMAL"), r = FieldEnv("KYTY_RT_REFLECTIONS_ROUGH");
 			if (n >= 0) g_rt.dec_normal = n;
 			if (r >= 0) g_rt.dec_rough = r, g_rt.rough_trusted = true;
+			if (const char* w = std::getenv("KYTY_RT_REFLECTIONS_WET"); w != nullptr) {
+				float lo = 0.0f, hi = 0.0f;
+				if (std::sscanf(w, "%f:%f", &lo, &hi) == 2 && lo >= 0.0f && hi > lo && hi <= 1.0f)
+					g_rt.mat_lo = lo, g_rt.mat_hi = hi, g_rt.mat_forced = true;
+			}
+			g_rt.mat_scale = EnvFloat("KYTY_RT_REFLECTIONS_MATERIAL", 1.0f, 0.0f, 1.0f);
 			if (const char* y = std::getenv("KYTY_RT_REFLECTIONS_FLIPY"); y != nullptr && *y != '\0')
 				g_rt.row0_up = *y != '0', g_rt.row0_forced = true;
 			// (a normal given and the convention forced: nothing left to calibrate)
@@ -701,13 +764,18 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		const bool identified = Analyze(*graphics, g_rt.calib_packed);
 		if (g_rt.calib_packed > 0) {
 			++g_rt.calib_attempts;
-			if (identified || g_rt.dec_normal >= 0 || g_rt.calib_attempts >= 3) g_rt.calib_done = true;
+			// (done once the normal and a material field are known; else again ~30 s later, up to 6 attempts: the
+			// material needs puddle-looking pixels in view)
+			const bool material = g_rt.dec_rough >= 0 || g_rt.rough_trusted;
+			if ((g_rt.dec_normal >= 0 && material) || g_rt.calib_attempts >= 6) g_rt.calib_done = true;
 			else g_rt.calib_next = g_rt.frame + 1800;
+			(void)identified;
 		}
 	}
 	const int32_t dec_normal = have_gbuf ? g_rt.dec_normal : -1;
 	// (a roughness field is used only when trusted, from KYTY_RT_REFLECTIONS_ROUGH: a guess made dry stone shine)
-	const int32_t dec_rough  = have_gbuf && dec_normal >= 0 && g_rt.rough_trusted ? g_rt.dec_rough : -1;
+	const int32_t dec_rough  = have_gbuf && dec_normal >= 0 && (g_rt.rough_trusted || g_rt.mat_auto) ? g_rt.dec_rough : -1;
+	const bool    have_mat   = dec_rough >= 0;
 	const bool    have_water = have_gbuf && gbuf.depth != nullptr;
 	g_rt.have_water          = have_water;
 
@@ -716,7 +784,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const bool use_normal = dec_normal >= 0 && ((dec_normal & 64) == 0 || camera.rows);
 
 	const float strength = EnvFloat("KYTY_RT_REFLECTIONS_STRENGTH", 1.0f, 0.0f, 3.0f);
-	const float min_refl = EnvFloat("KYTY_RT_REFLECTIONS_MIN", 0.3f, 0.0f, 0.8f);
+	const float min_refl = EnvFloat("KYTY_RT_REFLECTIONS_MIN", 0.35f, 0.0f, 0.8f);
 	const float guess    = EnvFloat("KYTY_RT_REFLECTIONS_GUESS", 0.2f, 0.0f, 1.0f);
 	const auto& cfg      = Cfg(level);
 	const int   iters    = cfg.iters;
@@ -791,7 +859,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		header[32] = 1.0f;     // (ExposureIndex: the exposure when the game gives none)
 		header[33] = min_refl; // (fparams.y)
 		header[34] = cap_px;   // (fparams.z)
-		header[35] = guess;    // (fparams.w: the puddle guess's scale)
+		header[35] = have_mat ? 0.0f : guess; // (fparams.w: the puddle guess's scale; off with a material field)
+		header[36] = g_rt.mat_lo, header[37] = g_rt.mat_hi, header[38] = g_rt.mat_scale; // (mparams)
 		command.updateBuffer(vk::Buffer(g_rt.frame_buf), 0, HeaderBytes, header.data());
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
@@ -906,6 +975,13 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 	        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
+	{
+		// The sums and counters to the host (the CPU reads them a few frames late; the copy is 2.3 KB).
+		vk::BufferCopy region {HeaderBytes, HeaderBytes, (StatsIndex + StatsCount) * 4};
+		command.copyBuffer(vk::Buffer(g.frame_buf), vk::Buffer(g.read_buf), 1, &region);
+		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
+		        vk::AccessFlagBits2::eHostRead);
+	}
 	if (timed) {
 		g.stamps_in[entry] = stamp_n;
 		++g.written;

@@ -5527,14 +5527,22 @@ void SsrCaptureDepth(TextureCache& cache, vk::CommandBuffer command, uint64_t cs
 		std::printf("SSR: G-buffer consumer CS %016llx binds:%s\n", static_cast<unsigned long long>(cs_hash), line.c_str());
 		std::fflush(stdout);
 	}
+	// (KYTY_RT_REFLECTIONS_DEPTH=<n>: the n-th depth binding of the consumer; Demon's Souls' lighting binds two
+	// D32F_S8 images of the render size, the first is the default)
+	static const int which = [] {
+		const char* v = std::getenv("KYTY_RT_REFLECTIONS_DEPTH");
+		return v != nullptr ? std::clamp(std::atoi(v), 0, 7) : 0;
+	}();
 	const TextureBinding* binding = nullptr;
+	int                   seen    = 0;
 	for (const auto& b: images) {
 		if (!b.image_id) continue;
 		auto& im = cache.GetImage(b.image_id);
 		if (im.backing.image == nullptr || !SsrIsDepthFormat(im.backing.format)) continue;
 		if (im.backing.extent.width < width || im.backing.extent.height < height) continue;
+		if (seen++ < which) continue;
 		binding = &b;
-		if (im.backing.extent.width == width && im.backing.extent.height == height) break;
+		break;
 	}
 	if (binding == nullptr) {
 		static bool said = false;
