@@ -33,7 +33,7 @@
 namespace Libs::Graphics::FrameGen {
 namespace {
 
-constexpr uint32_t Bindings    = 9;
+constexpr uint32_t Bindings    = 12;
 constexpr uint32_t HeaderWords = 16;
 constexpr uint32_t StatsWord   = 16;
 constexpr uint32_t StatsCount  = 16;
@@ -47,10 +47,11 @@ struct ShinePush {
 	float   size[4];
 	float   sun[4];
 	float   fill[4];
+	float   motion[4];
 	int32_t misc[4];
 	int32_t dec[4];
 };
-static_assert(sizeof(ShinePush) == 112);
+static_assert(sizeof(ShinePush) == 128);
 
 struct {
 	vk::DescriptorSetLayout set_layout = nullptr;
@@ -63,6 +64,11 @@ struct {
 	vk::ImageView           view   = nullptr;
 	vk::Extent2D            extent {};
 	bool                    image_ready = false;
+	// The highlight history (ping-pong, display-referred) for the temporal clamp.
+	std::array<VkImage, 2>       hist {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	std::array<VmaAllocation, 2> hist_mem {};
+	std::array<vk::ImageView, 2> hist_view {};
+	bool                         hist_ready = false, history_valid = false;
 	VkImage                 dummy = VK_NULL_HANDLE;
 	VmaAllocation           dummy_mem = nullptr;
 	vk::ImageView           dummy_view = nullptr;
@@ -73,7 +79,7 @@ struct {
 	bool                    cleared = false;
 	uint64_t                frame = 0;
 	// Retired output images (a size change; frames in flight may still read them).
-	std::array<std::pair<std::pair<VkImage, VmaAllocation>, std::pair<vk::ImageView, uint64_t>>, 4> retired {};
+	std::array<std::pair<std::pair<VkImage, VmaAllocation>, std::pair<vk::ImageView, uint64_t>>, 8> retired {};
 	vk::QueryPool           pool = nullptr;
 	double                  period_ns = 1.0;
 	uint64_t                written = 0, read = 0;
@@ -181,6 +187,12 @@ bool MakeImage(GraphicContext& graphics, vk::Format format, vk::Extent2D extent,
 	return true;
 }
 
+vk::DescriptorType DescType(uint32_t i) {
+	return (i == 7 || i == 8) ? vk::DescriptorType::eStorageBuffer
+	       : (i == 6 || i == 11) ? vk::DescriptorType::eStorageImage
+	                             : vk::DescriptorType::eCombinedImageSampler;
+}
+
 bool EnsurePipeline(GraphicContext& graphics) {
 	if (g_sh.pipeline != nullptr) return true;
 	if (g_sh.failed) return false;
@@ -189,9 +201,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	std::array<vk::DescriptorSetLayoutBinding, Bindings> bindings {};
 	for (uint32_t i = 0; i < Bindings; ++i) {
 		bindings[i].binding         = i;
-		bindings[i].descriptorType  = i >= 7 ? vk::DescriptorType::eStorageBuffer
-		                              : i == 6 ? vk::DescriptorType::eStorageImage
-		                                       : vk::DescriptorType::eCombinedImageSampler;
+		bindings[i].descriptorType  = DescType(i);
 		bindings[i].descriptorCount = 1;
 		bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
 	}
@@ -278,6 +288,21 @@ bool EnsureImage(GraphicContext& graphics, vk::Extent2D extent) {
 	}
 	g_sh.image_ready = false;
 	g_sh.extent      = extent;
+	for (int i = 0; i < 2; ++i) {
+		if (g_sh.hist[i] != VK_NULL_HANDLE) {
+			// (retired with the color image: frames in flight may still read it)
+			auto& slot = g_sh.retired[(g_sh.frame + 1 + i) % g_sh.retired.size()];
+			if (slot.first.first != VK_NULL_HANDLE) {
+				graphics.device.destroyImageView(slot.second.first, nullptr);
+				vmaDestroyImage(graphics.allocator, slot.first.first, slot.first.second);
+			}
+			slot = {{g_sh.hist[i], g_sh.hist_mem[i]}, {g_sh.hist_view[i], g_sh.frame}};
+			g_sh.hist[i] = VK_NULL_HANDLE, g_sh.hist_mem[i] = nullptr, g_sh.hist_view[i] = nullptr;
+		}
+		if (!MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, extent, true, g_sh.hist[i], g_sh.hist_mem[i], g_sh.hist_view[i]))
+			return false;
+	}
+	g_sh.hist_ready = false, g_sh.history_valid = false;
 	return MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, extent, true, g_sh.image, g_sh.memory, g_sh.view);
 }
 void FreeRetired(GraphicContext& graphics) {
@@ -350,7 +375,11 @@ bool ShineApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const int level = ShineLevel();
 	if (level == 0) return false;
 	GraphicContext* graphics = inputs.graphics;
-	if (graphics == nullptr || command == nullptr || VideoOut::MoviePlaying()) return false;
+	if (graphics == nullptr || command == nullptr) return false;
+	if (VideoOut::MoviePlaying()) {
+		g_sh.history_valid = false;
+		return false;
+	}
 	const auto& color = inputs.color;
 	if (color.view == nullptr || inputs.depth.view == nullptr || color.extent.width < 16 || color.extent.height < 16 ||
 	    inputs.depth.extent != color.extent)
@@ -407,7 +436,10 @@ bool ShineApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 	}
 	// Without the G-buffer there is no material: nothing to gate on, so the game's color stays as it is.
-	if (!have_gbuf) return false;
+	if (!have_gbuf) {
+		g_sh.history_valid = false;
+		return false;
+	}
 
 	ShinePush push {};
 	push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
@@ -416,6 +448,8 @@ bool ShineApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.size[2] = strength, push.size[3] = sharpen;
 	push.sun[0] = sun[0], push.sun[1] = sun[1], push.sun[2] = sun[2], push.sun[3] = have_sun ? 1.2f * sun_w : 0.0f;
 	push.fill[0] = camera.up[0], push.fill[1] = camera.up[1], push.fill[2] = camera.up[2];
+	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
+	push.motion[2] = (g_sh.history_valid && !inputs.reset && inputs.motion.view != nullptr) ? 1.0f : 0.0f;
 	push.fill[3] = camera.up_valid ? (have_sun ? 0.1f : 0.35f) : 0.0f;
 	const bool game_exposure = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
 	push.misc[1] = static_cast<int32_t>(g_sh.frame & 0x7fffffff);
@@ -434,6 +468,7 @@ bool ShineApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite);
 	if (!g_sh.image_ready) ToGeneral(command, g_sh.image), g_sh.image_ready = true;
 	if (!g_sh.dummy_ready) ToGeneral(command, g_sh.dummy), g_sh.dummy_ready = true;
+	if (!g_sh.hist_ready) ToGeneral(command, g_sh.hist[0]), ToGeneral(command, g_sh.hist[1]), g_sh.hist_ready = true;
 	if (!g_sh.cleared) {
 		g_sh.cleared = true;
 		command.fillBuffer(vk::Buffer(g_sh.frame_buf), 0, VK_WHOLE_SIZE, 0);
@@ -461,6 +496,11 @@ bool ShineApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		infos[2 + i] = gbuf.views[i] != nullptr ? vk::DescriptorImageInfo {g_sh.point, gbuf.views[i], vk::ImageLayout::eShaderReadOnlyOptimal}
 		                                        : vk::DescriptorImageInfo {g_sh.point, g_sh.dummy_view, gen};
 	infos[6] = {nullptr, g_sh.view, gen};
+	const uint32_t cur = static_cast<uint32_t>(g_sh.frame & 1u);
+	infos[9]  = {g_sh.linear, g_sh.hist_view[cur ^ 1u], gen};
+	infos[10] = inputs.motion.view != nullptr ? vk::DescriptorImageInfo {g_sh.point, inputs.motion.view, inputs.motion.layout}
+	                                          : vk::DescriptorImageInfo {g_sh.point, g_sh.hist_view[cur ^ 1u], gen};
+	infos[11] = {nullptr, g_sh.hist_view[cur], gen};
 	const vk::DescriptorBufferInfo frame_info {vk::Buffer(g_sh.frame_buf), 0, VK_WHOLE_SIZE};
 	const vk::DescriptorBufferInfo exposure_info =
 	    game_exposure ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range} : frame_info;
@@ -468,9 +508,7 @@ bool ShineApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	for (uint32_t i = 0; i < Bindings; ++i) {
 		writes[i].dstBinding      = i;
 		writes[i].descriptorCount = 1;
-		writes[i].descriptorType  = i >= 7 ? vk::DescriptorType::eStorageBuffer
-		                            : i == 6 ? vk::DescriptorType::eStorageImage
-		                                     : vk::DescriptorType::eCombinedImageSampler;
+		writes[i].descriptorType  = DescType(i);
 		if (i == 7) writes[i].pBufferInfo = &frame_info;
 		else if (i == 8) writes[i].pBufferInfo = &exposure_info;
 		else writes[i].pImageInfo = &infos[i];
@@ -501,6 +539,7 @@ bool ShineApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		++g_sh.written;
 	}
 	++g_sh.frame;
+	g_sh.history_valid  = true;
 	inputs.color.image  = vk::Image(g_sh.image);
 	inputs.color.view   = g_sh.view;
 	inputs.color.layout = gen;
