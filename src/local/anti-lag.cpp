@@ -1,13 +1,16 @@
 #include "local/anti-lag.h"
 
 #include "local/frame-gen.h"
+#include "local/fsr3-fg.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -235,6 +238,136 @@ bool OwnLowLatencyOn() {
 	return Own().on;
 }
 
+// KYTY_LATENCY (anti-lag.h): the input stamps by frame index, and the present thread's one-second window.
+namespace {
+int64_t LatNow() {
+#if defined(_WIN32)
+	LARGE_INTEGER v;
+	QueryPerformanceCounter(&v);
+	return v.QuadPart;
+#else
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
+}
+double LatTicksPerMs() {
+	static const double per_ms = [] {
+#if defined(_WIN32)
+		LARGE_INTEGER f;
+		QueryPerformanceFrequency(&f);
+		return static_cast<double>(f.QuadPart) / 1000.0;
+#else
+		return 1e6;
+#endif
+	}();
+	return per_ms;
+}
+constexpr uint64_t kLatRing = 64;
+struct LatStamp {
+	std::atomic<uint64_t> index {0};
+	std::atomic<int64_t>  ticks {0};
+};
+LatStamp g_lat_stamps[kLatRing];
+struct LatWindow {
+	std::mutex          mutex;
+	std::vector<double> ms;
+	int64_t             start = 0, first_present = 0, last_present = 0;
+	uint32_t            presents = 0;
+} g_lat;
+
+const char* LatModeName(Mode mode) {
+	if (FrameGen::StreamlineLoaded()) return "reflex-sl"; // (Streamline's Reflex with DLSS / DLSS-G)
+	switch (mode) {
+		case Mode::Amd: return "antilag2";
+		case Mode::Reflex: return "reflex";
+		case Mode::Limiter: return "limiter";
+		default: break;
+	}
+	return Own().on ? "lowlat" : "off";
+}
+// Generated frames per real one right now (0: no frame generation).
+int LatGenerated() {
+	if (FrameGen::Enabled()) return std::max(FrameGen::GeneratedFrames(), 0);
+	if (Fsr3::Active()) {
+#if defined(_WIN32)
+		char text[8] {};
+		if (GetEnvironmentVariableA("KYTY_FSR3_FG_ACTIVE", text, sizeof(text)) > 0) return std::clamp(std::atoi(text), 1, 7);
+#endif
+		return 1;
+	}
+	return 0;
+}
+double LatRefreshMs() {
+#if defined(_WIN32)
+	DEVMODEA mode {};
+	mode.dmSize = sizeof(mode);
+	if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) != 0 && mode.dmDisplayFrequency > 1)
+		return 1000.0 / static_cast<double>(mode.dmDisplayFrequency);
+#endif
+	return 0.0;
+}
+} // namespace
+
+bool LatencyOn() {
+	static const bool on = [] {
+		const char* v       = std::getenv("KYTY_LATENCY");
+		const bool  enabled = v != nullptr && v[0] == '1';
+		if (enabled) {
+			std::printf("[lat] on: input (controller read) -> present of that real frame, once a second\n");
+			std::fflush(stdout);
+		}
+		return enabled;
+	}();
+	return on;
+}
+
+void OnPresented(uint64_t frame_index) {
+	if (!LatencyOn() || frame_index == 0) return;
+	const int64_t now  = LatNow();
+	auto&         slot = g_lat_stamps[frame_index % kLatRing];
+	if (slot.index.load(std::memory_order_acquire) != frame_index) return;
+	const int64_t at = slot.ticks.load(std::memory_order_relaxed);
+	if (at == 0 || now <= at) return;
+	const double per_ms = LatTicksPerMs();
+	const double ms     = static_cast<double>(now - at) / per_ms;
+	std::lock_guard lock(g_lat.mutex);
+	if (g_lat.start == 0) {
+		g_lat.start = now;
+		g_lat.ms.reserve(512);
+	}
+	if (ms < 1000.0) g_lat.ms.push_back(ms); // (a pause / loading screen: not a frame's latency)
+	if (g_lat.presents == 0) g_lat.first_present = now;
+	g_lat.last_present = now;
+	g_lat.presents++;
+	if (static_cast<double>(now - g_lat.start) / per_ms < 1000.0) return;
+	auto&        v = g_lat.ms;
+	const size_t n = v.size();
+	if (n > 0) {
+		double sum = 0.0, max = 0.0;
+		for (double x : v) {
+			sum += x;
+			max = std::max(max, x);
+		}
+		const double mean = sum / static_cast<double>(n);
+		const size_t k    = std::min(n - 1, static_cast<size_t>(static_cast<double>(n) * 0.95));
+		std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
+		const double p95      = v[k];
+		const double scanout  = LatRefreshMs() * 0.5;
+		const int    g        = LatGenerated();
+		const double interval = g_lat.presents > 1 ? static_cast<double>(g_lat.last_present - g_lat.first_present) / per_ms /
+		                                                 static_cast<double>(g_lat.presents - 1)
+		                                           : 0.0;
+		const double fg = g > 0 ? interval * g / (g + 1.0) : 0.0;
+		std::printf("[lat] input->present mean %.1f ms, p95 %.1f, max %.1f; +scanout %.1f; fg +%.1f (n %u); total %.1f, p95 %.1f; "
+		            "mode %s, fg x%d\n",
+		            mean, p95, max, scanout, fg, static_cast<unsigned>(n), mean + scanout + fg, p95 + scanout + fg,
+		            LatModeName(g_mode.load(std::memory_order_relaxed)), g + 1);
+		std::fflush(stdout);
+	}
+	v.clear();
+	g_lat.start    = now;
+	g_lat.presents = 0;
+}
+
 void OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick) {
 	if (!Own().on || device == VK_NULL_HANDLE || timeline == VK_NULL_HANDLE || tick == 0) return;
 	g_own_device.store(device, std::memory_order_release);
@@ -247,7 +380,7 @@ void OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick) {
 void OnInput() {
 	if (Own().on) OwnLimit();
 	const Mode mode = g_mode.load(std::memory_order_relaxed);
-	if (mode == Mode::Off) return;
+	if (mode == Mode::Off && !LatencyOn()) return;
 	// Once per flip: the first controller read after the game flipped its last frame starts the next one.
 	const uint64_t flips = g_flips.load(std::memory_order_acquire);
 	uint64_t       seen  = g_flips_at_input.load(std::memory_order_relaxed);
@@ -287,11 +420,16 @@ void OnInput() {
 		ReflexMarker(VK_LATENCY_MARKER_SIMULATION_START_NV, index);
 		ReflexMarker(VK_LATENCY_MARKER_INPUT_SAMPLE_NV, index);
 	}
+	if (LatencyOn()) { // KYTY_LATENCY: the input sample, after any wait above
+		auto& slot = g_lat_stamps[index % kLatRing];
+		slot.ticks.store(LatNow(), std::memory_order_relaxed);
+		slot.index.store(index, std::memory_order_release);
+	}
 	g_input_index.store(index, std::memory_order_release);
 }
 
 uint64_t OnFlipReserved() {
-	if (g_mode.load(std::memory_order_relaxed) == Mode::Off) return 0;
+	if (g_mode.load(std::memory_order_relaxed) == Mode::Off && !LatencyOn()) return 0;
 	g_flips.fetch_add(1, std::memory_order_acq_rel);
 	const uint64_t index  = g_input_index.load(std::memory_order_acquire);
 	uint64_t       tagged = g_tagged_index.load(std::memory_order_relaxed);
