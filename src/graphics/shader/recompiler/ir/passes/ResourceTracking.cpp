@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -1536,13 +1537,11 @@ private:
 		// (A component past the address's words reads 0: SpirvEmitter's AddressU32.)
 		const auto word = component.bit_offset / 32u;
 		if (word >= address->NumArgs()) return 0;
-		m_float_bounds.clear();
-		m_int_bounds.clear();
-		m_bound_steps    = 0;
 		m_lanes          = ResultLanes(inst);
-		const auto bound = FloatBound(address->Arg(word), true, 0);
-		if (!bound || *bound >= 65536.0) return ImageResource::NoArrayIndexBound;
-		return static_cast<uint32_t>(std::floor(*bound + 0.5));
+		CollectLaneTerms();
+		const auto bound = SolveBound(address->Arg(word));
+		if (!(bound < 65536.0)) return ImageResource::NoArrayIndexBound;
+		return static_cast<uint32_t>(std::floor(bound + 0.5));
 	}
 
 	// The lanes an image operation's result is kept for: every component of it taken out and written to a register by
@@ -1567,61 +1566,109 @@ private:
 		return lanes;
 	}
 
-	// Whether `condition` holds in every lane `lanes` holds in: the same value, or a term of an and of it.
-	static bool Implies(Value lanes, Value condition, uint32_t depth) {
-		lanes     = lanes.Resolve();
-		condition = condition.Resolve();
-		if (lanes.IsEmpty() || depth > 16) return false;
-		if (lanes == condition) return true;
-		if (const auto* term = condition.TryInstruction(); term != nullptr && term->GetOpcode() == ValueOpcode::LogicalAnd)
-			return Implies(lanes, term->Arg(0), depth + 1) && Implies(lanes, term->Arg(1), depth + 1);
-		const auto* inst = lanes.TryInstruction();
-		return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalAnd &&
-		       (Implies(inst->Arg(0), condition, depth + 1) || Implies(inst->Arg(1), condition, depth + 1));
-	}
-
-	// Whether `condition` fails in every lane `lanes` holds in: its not, or a not of it among the terms of an and (or of
-	// a term of the condition's own and).
-	static bool Excludes(Value lanes, Value condition, uint32_t depth) {
-		lanes     = lanes.Resolve();
-		condition = condition.Resolve();
-		if (lanes.IsEmpty() || depth > 16) return false;
-		if (const auto* term = condition.TryInstruction(); term != nullptr) {
-			if (term->GetOpcode() == ValueOpcode::LogicalNot && Implies(lanes, term->Arg(0), depth + 1)) return true;
-			if (term->GetOpcode() == ValueOpcode::LogicalAnd &&
-			    (Excludes(lanes, term->Arg(0), depth + 1) || Excludes(lanes, term->Arg(1), depth + 1)))
-				return true;
+	// The terms of the result's lanes (ResultLanes), each true in all of them: the condition and the operands of its ands;
+	// and the values a term is the not of, false in all of them. Per ArrayIndexBound call, as the answers below.
+	void CollectLaneTerms() {
+		m_lane_terms.clear();
+		m_lane_negated.clear();
+		m_lanes_imply.clear();
+		m_lanes_exclude.clear();
+		if (m_lanes.IsEmpty()) return;
+		std::vector<Value> pending {m_lanes};
+		while (!pending.empty()) {
+			const auto* term = pending.back().Resolve().TryInstruction();
+			pending.pop_back();
+			if (term == nullptr || !m_lane_terms.insert(term).second) continue;
+			if (term->GetOpcode() == ValueOpcode::LogicalAnd) {
+				pending.push_back(term->Arg(0));
+				pending.push_back(term->Arg(1));
+			} else if (term->GetOpcode() == ValueOpcode::LogicalNot) {
+				if (const auto* negated = term->Arg(0).Resolve().TryInstruction(); negated != nullptr)
+					m_lane_negated.insert(negated);
+			}
 		}
-		const auto* inst = lanes.TryInstruction();
-		if (inst == nullptr) return false;
-		if (inst->GetOpcode() == ValueOpcode::LogicalNot) return inst->Arg(0).Resolve() == condition;
-		return inst->GetOpcode() == ValueOpcode::LogicalAnd &&
-		       (Excludes(inst->Arg(0), condition, depth + 1) || Excludes(inst->Arg(1), condition, depth + 1));
 	}
 
-	static constexpr uint32_t MaxBoundDepth = 48;
-	static constexpr uint32_t MaxBoundSteps = 100000;
+	// Whether `condition` holds in every lane the result is kept for: the lanes' condition, a term of it, or an and of
+	// such. (Each and answered once: the conditions share their terms, the exec masks of nested branches.)
+	bool LanesImply(Value condition, uint32_t depth) {
+		condition = condition.Resolve();
+		if (m_lanes.IsEmpty() || depth > 16) return false;
+		if (condition == m_lanes.Resolve()) return true;
+		const auto* inst = condition.TryInstruction();
+		if (inst == nullptr) return false;
+		if (m_lane_terms.contains(inst)) return true;
+		if (inst->GetOpcode() != ValueOpcode::LogicalAnd) return false;
+		if (const auto known = m_lanes_imply.find(inst); known != m_lanes_imply.end()) return known->second;
+		const bool implied   = LanesImply(inst->Arg(0), depth + 1) && LanesImply(inst->Arg(1), depth + 1);
+		m_lanes_imply[inst] = implied;
+		return implied;
+	}
+
+	// Whether `condition` fails in every lane the result is kept for: a term of the lanes is its not, it is the not of a
+	// condition they imply, or an and with such an operand.
+	bool LanesExclude(Value condition, uint32_t depth) {
+		condition = condition.Resolve();
+		if (m_lanes.IsEmpty() || depth > 16) return false;
+		const auto* inst = condition.TryInstruction();
+		if (inst == nullptr) return false;
+		if (m_lane_negated.contains(inst)) return true;
+		if (inst->GetOpcode() == ValueOpcode::LogicalNot) return LanesImply(inst->Arg(0), depth + 1);
+		if (inst->GetOpcode() != ValueOpcode::LogicalAnd) return false;
+		if (const auto known = m_lanes_exclude.find(inst); known != m_lanes_exclude.end()) return known->second;
+		const bool excluded   = LanesExclude(inst->Arg(0), depth + 1) || LanesExclude(inst->Arg(1), depth + 1);
+		m_lanes_exclude[inst] = excluded;
+		return excluded;
+	}
+
+	// The bound analysis: each value it meets, read as a float or as an unsigned integer, for the lanes the result is
+	// kept for or for any lane (past a loop's phi), is a node whose bound follows from its operands' by a rule. Every
+	// rule grows with its operands, so the bounds, all 0 at first and recomputed in rounds until none grows, are the
+	// least ones the rules allow for every value a loop's iterations give as well. (A value read as a float may also be
+	// negative: the first layer. NoBound: none.)
+	enum class BoundRule : uint8_t {
+		Constant,        // its value
+		Copy,            // its operand's
+		Max,             // its largest operand's (0 without one)
+		Min,             // its smallest operand's (an operand of no bound gives the others')
+		RoundEven,       // to the nearest integer
+		Floor,           // (a truncation too: the bounds are not negative)
+		Ceil,
+		SignedToFloat,   // an integer below the sign bit
+		BitsToFloat,     // an integer's bits: below the sign bit, a larger integer is a larger float
+		FloatToUnsigned, // a float's integer part
+		ShiftRight,      // by `shift`
+		BitField,        // `bits` bits from bit `shift` (32: all there are)
+	};
+	struct BoundNode {
+		BoundRule rule  = BoundRule::Constant;
+		uint8_t   shift = 0;
+		uint8_t   bits  = 32;
+		uint32_t  first = 0; // its operands: m_bound_operands[first, first + count), met as m_bound_specs
+		uint32_t  count = 0;
+		double    value = 0.0;
+	};
+	struct BoundOperand {
+		Value value;
+		bool  is_float = false;
+		bool  lanes    = false;
+	};
+
+	static constexpr double NoBound = std::numeric_limits<double>::infinity();
+	// (A shader of more values than that, or whose bounds still grow after that many rounds: no bound.)
+	static constexpr uint32_t MaxBoundNodes  = 4096;
+	static constexpr uint32_t MaxBoundRounds = 16;
 
 	// A 32-bit value's bits read as a float: a negative one counts as 0 (the first layer), an infinity or NaN as no bound.
-	static std::optional<double> FloatOfBits(uint32_t bits) {
-		if ((bits & 0x7f800000u) == 0x7f800000u) return std::nullopt;
+	static double FloatOfBits(uint32_t bits) {
+		if ((bits & 0x7f800000u) == 0x7f800000u) return NoBound;
 		if ((bits & 0x80000000u) != 0u) return 0.0;
 		return static_cast<double>(std::bit_cast<float>(bits));
 	}
 
-	static std::optional<double> Larger(std::optional<double> a, std::optional<double> b) {
-		if (!a || !b) return std::nullopt;
-		return std::max(*a, *b);
-	}
-
-	// (The bounds' keys: a value, and whether the result's lanes still select its operands. Past a loop's phi they do
-	// not: it holds values of other iterations, whose conditions are not the ones the lanes are made of.)
-	static uintptr_t BoundKey(const Inst* inst, bool lanes) {
-		return reinterpret_cast<uintptr_t>(inst) | (lanes ? 1u : 0u);
-	}
-
 	// Whether a phi may take a value along a back edge: a predecessor that is not before its block (the blocks are in
-	// the order of their code; an unknown one counts as such).
+	// the order of their code; an unknown one counts as such). Past one the result's lanes no longer select the values:
+	// they are other iterations', whose conditions are not the ones the lanes are made of.
 	bool IsLoopPhi(const Inst& phi) {
 		if (m_block_order.empty())
 			for (size_t i = 0; i < m_program.blocks.size(); i++) m_block_order[m_program.blocks[i]] = i;
@@ -1634,168 +1681,192 @@ private:
 		return false;
 	}
 
-	// An upper bound of a 32-bit value read as a float (none: not shown).
-	std::optional<double> FloatBound(Value value, bool lanes, uint32_t depth) {
-		value = value.Resolve();
-		if (value.IsImmediate()) {
-			if (value.GetType() == Type::F32) return FloatOfBits(std::bit_cast<uint32_t>(value.F32Value()));
-			if (value.GetType() == Type::U32) return FloatOfBits(value.U32());
-			return std::nullopt;
+	// The bound of `root`, a 32-bit value read as a float, for the result's lanes (m_lanes): the nodes of the values it
+	// is made of, each after its operands' (but around a loop), then the rounds.
+	double SolveBound(Value root) {
+		m_bound_nodes.clear();
+		m_bound_specs.clear();
+		m_bound_operands.clear();
+		m_bound_order.clear();
+		m_bound_index.clear();
+		m_bound_stack.clear();
+		bool       fresh = false;
+		const auto top   = BoundNodeOf({root, true, true}, fresh);
+		if (!top) return NoBound;
+		if (fresh) m_bound_stack.emplace_back(*top, 0u);
+		while (!m_bound_stack.empty()) {
+			const auto [id, next] = m_bound_stack.back();
+			if (next == m_bound_nodes[id].count) {
+				m_bound_order.push_back(id);
+				m_bound_stack.pop_back();
+				continue;
+			}
+			m_bound_stack.back().second++;
+			const uint32_t     slot    = m_bound_nodes[id].first + next;
+			const BoundOperand operand = m_bound_specs[slot];
+			const auto         node    = BoundNodeOf(operand, fresh);
+			if (!node) return NoBound;
+			m_bound_operands[slot] = *node;
+			if (fresh) m_bound_stack.emplace_back(*node, 0u);
 		}
-		const auto* inst = value.TryInstruction();
-		if (inst == nullptr || depth > MaxBoundDepth || ++m_bound_steps > MaxBoundSteps) return std::nullopt;
-		const auto key = BoundKey(inst, lanes);
-		if (const auto known = m_float_bounds.find(key); known != m_float_bounds.end()) return known->second;
-		if (inst->GetOpcode() == ValueOpcode::Phi) {
-			const bool through = lanes && !IsLoopPhi(*inst);
-			return PhiBound(m_float_bounds, key, [&] { return FloatBoundOf(*inst, through, depth + 1); });
+		for (uint32_t round = 0; round < MaxBoundRounds; round++) {
+			bool grew = false;
+			for (const auto id: m_bound_order) {
+				auto& node = m_bound_nodes[id];
+				if (node.rule == BoundRule::Constant) continue;
+				if (const double bound = BoundOf(node); bound != node.value) {
+					node.value = bound;
+					grew       = true;
+				}
+			}
+			if (!grew) return m_bound_nodes[*top].value;
 		}
-		m_float_bounds[key] = std::nullopt; // (a cycle not through a phi: no bound)
-		const auto bound    = FloatBoundOf(*inst, lanes, depth + 1);
-		m_float_bounds[key] = bound;
-		return bound;
+		return NoBound;
 	}
 
-	// A phi's bound, a loop's too: its back edges first taken as 0, then the bound found checked, the phi assumed within
-	// it (every operation here grows with its operands, so a bound the loop's values keep holds for every iteration).
-	// The values found on the way go: they were bounds under an assumption.
-	template <typename Bound, typename Of>
-	std::optional<Bound> PhiBound(std::unordered_map<uintptr_t, std::optional<Bound>>& bounds, uintptr_t key, Of&& of) {
-		auto saved  = bounds;
-		bounds[key] = Bound {};
-		auto bound  = of();
-		if (bound) {
-			bounds      = saved;
-			bounds[key] = bound;
-			if (const auto check = of(); !check || *check > *bound) bound = std::nullopt;
+	// The node of a value read as a float or as an integer for the lanes or not: the one it has, or a new one (`fresh`,
+	// its operands still to meet). None past MaxBoundNodes.
+	std::optional<uint32_t> BoundNodeOf(const BoundOperand& operand, bool& fresh) {
+		fresh            = false;
+		const auto value = operand.value.Resolve();
+		if (m_bound_nodes.size() >= MaxBoundNodes) return std::nullopt;
+		const auto* inst = value.IsImmediate() ? nullptr : value.TryInstruction();
+		if (inst == nullptr) {
+			BoundNode node;
+			node.value = NoBound;
+			if (value.IsImmediate() && operand.is_float && value.GetType() == Type::F32)
+				node.value = FloatOfBits(std::bit_cast<uint32_t>(value.F32Value()));
+			else if (value.IsImmediate() && value.GetType() == Type::U32)
+				node.value = operand.is_float ? FloatOfBits(value.U32()) : static_cast<double>(value.U32());
+			m_bound_nodes.push_back(node);
+			return static_cast<uint32_t>(m_bound_nodes.size() - 1);
 		}
-		bounds      = std::move(saved);
-		bounds[key] = bound;
-		return bound;
+		const auto key = reinterpret_cast<uintptr_t>(inst) | (operand.is_float ? 2u : 0u) | (operand.lanes ? 1u : 0u);
+		const auto id  = static_cast<uint32_t>(m_bound_nodes.size());
+		if (const auto [known, added] = m_bound_index.try_emplace(key, id); !added) return known->second;
+		BoundNode node;
+		node.first = static_cast<uint32_t>(m_bound_specs.size());
+		MakeBoundRule(node, *inst, operand.is_float, operand.lanes);
+		node.count = static_cast<uint32_t>(m_bound_specs.size()) - node.first;
+		m_bound_operands.resize(m_bound_specs.size());
+		m_bound_nodes.push_back(node);
+		fresh = true;
+		return id;
 	}
 
-	std::optional<double> FloatBoundOf(const Inst& inst, bool lanes, uint32_t depth) {
-		const auto arg = [&](size_t index) { return FloatBound(inst.Arg(index), lanes, depth); };
-		switch (inst.GetOpcode()) {
-			case ValueOpcode::BitCastU32F32:
-			case ValueOpcode::BitCastF32U32: return arg(0);
-			case ValueOpcode::SelectU32:
-			case ValueOpcode::SelectF32:
-				if (lanes && Implies(m_lanes, inst.Arg(0), 0)) return arg(1);
-				if (lanes && Excludes(m_lanes, inst.Arg(0), 0)) return arg(2);
-				return Larger(arg(1), arg(2));
-			case ValueOpcode::Phi: {
-				std::optional<double> bound = 0.0;
-				for (size_t i = 0; i < inst.NumArgs() && bound; i++) bound = Larger(bound, arg(i));
-				return bound;
-			}
-			case ValueOpcode::FPRoundEven32: {
-				const auto bound = arg(0);
-				return bound ? std::optional<double>(std::floor(*bound + 0.5)) : std::nullopt;
-			}
-			case ValueOpcode::FPFloor32:
-			case ValueOpcode::FPTrunc32: {
-				const auto bound = arg(0);
-				return bound ? std::optional<double>(std::floor(*bound)) : std::nullopt;
-			}
-			case ValueOpcode::FPCeil32: {
-				const auto bound = arg(0);
-				return bound ? std::optional<double>(std::ceil(*bound)) : std::nullopt;
-			}
-			case ValueOpcode::FPMax32: return Larger(arg(0), arg(1));
-			case ValueOpcode::FPMaxTri32: return Larger(Larger(arg(0), arg(1)), arg(2));
-			case ValueOpcode::FPMin32:
-			case ValueOpcode::FPMinTri32: {
-				// (No larger than any operand of a known bound: a NaN operand gives the other one.)
-				std::optional<double> bound;
-				for (size_t i = 0; i < inst.NumArgs(); i++)
-					if (const auto b = arg(i); b && (!bound || *b < *bound)) bound = b;
-				return bound;
-			}
-			case ValueOpcode::ConvertF32U32: {
-				const auto bound = IntBound(inst.Arg(0), lanes, depth);
-				return bound ? std::optional<double>(static_cast<double>(*bound)) : std::nullopt;
-			}
-			case ValueOpcode::ConvertF32S32: {
-				const auto bound = IntBound(inst.Arg(0), lanes, depth);
-				return bound && *bound <= 0x7fffffffu ? std::optional<double>(static_cast<double>(*bound)) : std::nullopt;
-			}
-			default: {
-				// An integer's bits read as a float: below the sign bit, a larger integer is a larger float.
-				const auto bound = IntBoundOf(inst, lanes, depth);
-				return bound && *bound <= 0x7f7fffffu ? FloatOfBits(*bound) : std::nullopt;
-			}
-		}
-	}
-
-	// An upper bound of a 32-bit value read as an unsigned integer (none: not shown).
-	std::optional<uint32_t> IntBound(Value value, bool lanes, uint32_t depth) {
-		value = value.Resolve();
-		if (value.IsImmediate()) return value.GetType() == Type::U32 ? std::optional<uint32_t>(value.U32()) : std::nullopt;
-		const auto* inst = value.TryInstruction();
-		if (inst == nullptr || depth > MaxBoundDepth || ++m_bound_steps > MaxBoundSteps) return std::nullopt;
-		const auto key = BoundKey(inst, lanes);
-		if (const auto known = m_int_bounds.find(key); known != m_int_bounds.end()) return known->second;
-		if (inst->GetOpcode() == ValueOpcode::Phi) {
-			const bool through = lanes && !IsLoopPhi(*inst);
-			return PhiBound(m_int_bounds, key, [&] { return IntBoundOf(*inst, through, depth + 1); });
-		}
-		m_int_bounds[key] = std::nullopt;
-		const auto bound  = IntBoundOf(*inst, lanes, depth + 1);
-		m_int_bounds[key] = bound;
-		return bound;
-	}
-
-	std::optional<uint32_t> IntBoundOf(const Inst& inst, bool lanes, uint32_t depth) {
-		const auto arg      = [&](size_t index) { return IntBound(inst.Arg(index), lanes, depth); };
+	// The rule of `inst` read as a float (is_float) or as an unsigned integer for the lanes or not, its operands added
+	// to m_bound_specs. Any other operation: no bound.
+	void MakeBoundRule(BoundNode& node, const Inst& inst, bool is_float, bool lanes) {
+		const auto add = [&](Value value, bool as_float, bool for_lanes) {
+			m_bound_specs.push_back({value, as_float, for_lanes});
+		};
+		const auto args = [&](size_t count, bool as_float, BoundRule rule) {
+			for (size_t i = 0; i < count; i++) add(inst.Arg(i), as_float, lanes);
+			node.rule = rule;
+		};
 		const auto constant = [&](size_t index) -> std::optional<uint32_t> {
 			const auto value = inst.Arg(index).Resolve();
 			return value.IsImmediate() && value.GetType() == Type::U32 ? std::optional<uint32_t>(value.U32()) : std::nullopt;
 		};
-		const auto larger = [](std::optional<uint32_t> a, std::optional<uint32_t> b) -> std::optional<uint32_t> {
-			if (!a || !b) return std::nullopt;
-			return std::max(*a, *b);
-		};
-		switch (inst.GetOpcode()) {
-			case ValueOpcode::BitwiseAnd32:
-			case ValueOpcode::UMin32: {
-				// (No larger than either operand.)
-				const auto a = arg(0), b = arg(1);
-				if (a && b) return std::min(*a, *b);
-				return a ? a : b;
+		const auto op = inst.GetOpcode();
+		// A select of a condition the lanes decide: the operand they take.
+		if (op == ValueOpcode::SelectU32 || (is_float && op == ValueOpcode::SelectF32)) {
+			node.rule = BoundRule::Copy;
+			if (lanes && LanesImply(inst.Arg(0), 0)) return add(inst.Arg(1), is_float, lanes);
+			if (lanes && LanesExclude(inst.Arg(0), 0)) return add(inst.Arg(2), is_float, lanes);
+			node.rule = BoundRule::Max;
+			add(inst.Arg(1), is_float, lanes);
+			return add(inst.Arg(2), is_float, lanes);
+		}
+		if (op == ValueOpcode::Phi) {
+			const bool through = lanes && !IsLoopPhi(inst);
+			for (size_t i = 0; i < inst.NumArgs(); i++) add(inst.Arg(i), is_float, through);
+			node.rule = BoundRule::Max;
+			return;
+		}
+		if (is_float) {
+			switch (op) {
+				case ValueOpcode::BitCastU32F32:
+				case ValueOpcode::BitCastF32U32: return args(1, true, BoundRule::Copy);
+				case ValueOpcode::FPRoundEven32: return args(1, true, BoundRule::RoundEven);
+				case ValueOpcode::FPFloor32:
+				case ValueOpcode::FPTrunc32: return args(1, true, BoundRule::Floor);
+				case ValueOpcode::FPCeil32: return args(1, true, BoundRule::Ceil);
+				case ValueOpcode::FPMax32: return args(2, true, BoundRule::Max);
+				case ValueOpcode::FPMaxTri32: return args(3, true, BoundRule::Max);
+				// (No larger than any operand of a bound: a NaN operand gives the other one, and no value of a bound
+				// here is a NaN.)
+				case ValueOpcode::FPMin32: return args(2, true, BoundRule::Min);
+				case ValueOpcode::FPMinTri32: return args(3, true, BoundRule::Min);
+				case ValueOpcode::ConvertF32U32: return args(1, false, BoundRule::Copy);
+				case ValueOpcode::ConvertF32S32: return args(1, false, BoundRule::SignedToFloat);
+				default:
+					// The instruction read as an integer.
+					node.rule = BoundRule::BitsToFloat;
+					return add(Value(const_cast<Inst*>(&inst)), false, lanes);
 			}
+		}
+		switch (op) {
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::UMin32: return args(2, false, BoundRule::Min);
+			case ValueOpcode::UMax32: return args(2, false, BoundRule::Max);
 			case ValueOpcode::ShiftRightLogical32: {
 				const auto shift = constant(1);
-				const auto value = arg(0);
-				if (!shift) return value;
-				return value.value_or(UINT32_MAX) >> (*shift & 31u);
+				node.shift       = static_cast<uint8_t>(shift.value_or(0) & 31u);
+				return args(1, false, shift ? BoundRule::ShiftRight : BoundRule::Copy);
 			}
 			case ValueOpcode::BitFieldUExtract: {
 				const auto offset = constant(1), count = constant(2);
-				std::optional<uint32_t> bound = arg(0);
-				if (bound && offset) bound = *bound >> (*offset & 31u);
-				if (count && *count < 32u) bound = std::min(bound.value_or(UINT32_MAX), (1u << *count) - 1u);
-				return bound;
+				node.shift        = static_cast<uint8_t>(offset.value_or(0) & 31u);
+				node.bits         = static_cast<uint8_t>(count && *count < 32u ? *count : 32u);
+				return args(1, false, BoundRule::BitField);
 			}
-			case ValueOpcode::UMax32: return larger(arg(0), arg(1));
-			case ValueOpcode::SelectU32:
-				if (lanes && Implies(m_lanes, inst.Arg(0), 0)) return arg(1);
-				if (lanes && Excludes(m_lanes, inst.Arg(0), 0)) return arg(2);
-				return larger(arg(1), arg(2));
-			case ValueOpcode::Phi: {
-				std::optional<uint32_t> bound = 0u;
-				for (size_t i = 0; i < inst.NumArgs() && bound; i++) bound = larger(bound, arg(i));
-				return bound;
-			}
-			case ValueOpcode::ConvertU32U8: return 0xffu;
-			case ValueOpcode::ConvertU32U16: return 0xffffu;
-			case ValueOpcode::ConvertU32F32: {
-				const auto bound = FloatBound(inst.Arg(0), lanes, depth);
-				if (!bound) return std::nullopt;
-				return *bound >= 4294967295.0 ? UINT32_MAX : static_cast<uint32_t>(std::floor(*bound));
-			}
-			default: return std::nullopt;
+			case ValueOpcode::ConvertU32U8: node.value = 0xffu; return;
+			case ValueOpcode::ConvertU32U16: node.value = 0xffffu; return;
+			case ValueOpcode::ConvertU32F32: return args(1, true, BoundRule::FloatToUnsigned);
+			default: node.value = NoBound; return;
 		}
+	}
+
+	// A node's bound from its operands' now.
+	double BoundOf(const BoundNode& node) const {
+		const auto operand = [&](uint32_t index) { return m_bound_nodes[m_bound_operands[node.first + index]].value; };
+		switch (node.rule) {
+			case BoundRule::Constant: return node.value;
+			case BoundRule::Copy: return operand(0);
+			case BoundRule::Max: {
+				double bound = 0.0;
+				for (uint32_t i = 0; i < node.count; i++) bound = std::max(bound, operand(i));
+				return bound;
+			}
+			case BoundRule::Min: {
+				double bound = NoBound;
+				for (uint32_t i = 0; i < node.count; i++) bound = std::min(bound, operand(i));
+				return bound;
+			}
+			case BoundRule::RoundEven: return std::floor(operand(0) + 0.5);
+			case BoundRule::Floor: return std::floor(operand(0));
+			case BoundRule::Ceil: return std::ceil(operand(0));
+			case BoundRule::SignedToFloat: return operand(0) <= 2147483647.0 ? operand(0) : NoBound;
+			case BoundRule::BitsToFloat:
+				return operand(0) <= 2139095039.0 ? FloatOfBits(static_cast<uint32_t>(operand(0))) : NoBound;
+			case BoundRule::FloatToUnsigned: {
+				const double bound = operand(0);
+				if (bound == NoBound) return NoBound;
+				return bound >= 4294967295.0 ? 4294967295.0 : std::floor(bound);
+			}
+			case BoundRule::ShiftRight: {
+				const double bound = operand(0);
+				return static_cast<double>((bound == NoBound ? UINT32_MAX : static_cast<uint32_t>(bound)) >> node.shift);
+			}
+			case BoundRule::BitField: {
+				double bound = operand(0);
+				if (bound != NoBound) bound = static_cast<double>(static_cast<uint32_t>(bound) >> node.shift);
+				if (node.bits < 32u) bound = std::min(bound, static_cast<double>((1u << node.bits) - 1u));
+				return bound;
+			}
+		}
+		return NoBound;
 	}
 
 	static void Merge(ImageResource& image, ValueOpcode op, uint32_t pc) {
@@ -1989,12 +2060,19 @@ private:
 
 	Program&                       m_program;
 	ShaderInfo                     m_info;
-	// (ArrayIndexBound's, per call: the bounds of the values met, the lanes whose result counts.)
-	std::unordered_map<uintptr_t, std::optional<double>>   m_float_bounds;
-	std::unordered_map<uintptr_t, std::optional<uint32_t>> m_int_bounds;
-	uint32_t                                               m_bound_steps = 0;
-	Value                                                  m_lanes;
-	std::unordered_map<const Block*, size_t>               m_block_order;
+	// (ArrayIndexBound's, per call: the nodes of the values met (SolveBound), the lanes whose result counts.)
+	std::vector<BoundNode>                     m_bound_nodes;
+	std::vector<BoundOperand>                  m_bound_specs;
+	std::vector<uint32_t>                      m_bound_operands;
+	std::vector<uint32_t>                      m_bound_order;
+	std::vector<std::pair<uint32_t, uint32_t>> m_bound_stack;
+	std::unordered_map<uintptr_t, uint32_t>    m_bound_index;
+	Value                                      m_lanes;
+	std::unordered_set<const Inst*>            m_lane_terms;
+	std::unordered_set<const Inst*>            m_lane_negated;
+	std::unordered_map<const Inst*, bool>      m_lanes_imply;
+	std::unordered_map<const Inst*, bool>      m_lanes_exclude;
+	std::unordered_map<const Block*, size_t>   m_block_order;
 	std::vector<DescriptorSource>  m_sources;
 	std::vector<HandlePatch>       m_handle_patches;
 	std::vector<MemoryPatch>       m_memory_patches;
