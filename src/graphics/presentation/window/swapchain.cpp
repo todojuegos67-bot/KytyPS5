@@ -22,6 +22,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 #include "local/fg-discover.h"
 #include "local/frame-gen.h"
+#include "local/metrics.h"
 #include "local/title-state.h"
 #include "local/fsr3-fg.h"
 
@@ -60,6 +61,8 @@ struct Presenter::Frame {
 	// generation), copied at the guest flip; `scene`: the guest frame was the game's view (FrameGen::TakeScene).
 	FrameGen::FrameInputs fg;
 	bool                  scene = false;
+	// KYTY_FPS_LOG / KYTY_LATENCY (local/metrics.h): its guest flip's time and the input read before it.
+	Kyty::Metrics::FrameStamp stamp;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -1614,6 +1617,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->CopyFrom(buffer, image);
 	// bruno-astro-1025: frame generation's inputs, in the guest frame's command buffer (a title whose passes are not
 	// named: zero motion vectors and a far depth at the flip image's size, FrameGen::GenericInputs).
+	frame->stamp = Kyty::Metrics::OnGuestFlip();
 	FgDiscover::OnFlip(image.info.data.address, image.backing.extent.width, image.backing.extent.height,
 	                   static_cast<uint32_t>(image.backing.format), VideoOut::PlayerButtonSeen());
 	frame->scene    = FrameGen::TakeScene();
@@ -1882,6 +1886,20 @@ bool Presenter::Impl::PresentOnce(bool new_frame, float generate_ms) {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
+		// KYTY_FPS_LOG / KYTY_LATENCY: a new frame of the game reached vkQueuePresentKHR (not a generated one).
+		if (new_frame && !generated && layers[0].frame != nullptr && layers[0].frame->stamp.flip_ns != 0) {
+			int frames_generated = 0;
+			if (FrameGen::Enabled()) {
+				frames_generated = FrameGen::GeneratedFrames();
+			} else if (swapchain.IsFsr3()) {
+				const char* text = std::getenv("KYTY_FSR3_FG_FRAMES");
+				frames_generated = text != nullptr && std::atoi(text) >= 2 ? std::min(std::atoi(text), 3) : 1;
+			} else if (frame_generation != nullptr && frame_generation->Available()) {
+				frames_generated = 1;
+			}
+			Kyty::Metrics::OnPresented(layers[0].frame->stamp, frames_generated);
+			layers[0].frame->stamp = {};
+		}
 		if (frame_generation != nullptr && std::getenv("KYTY_DEBUG_FRAME_PACING") != nullptr) {
 			static auto last = std::chrono::steady_clock::now();
 			const auto  now  = std::chrono::steady_clock::now();

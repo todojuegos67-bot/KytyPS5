@@ -381,6 +381,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/local-platform.h"
 	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
 	"${KYTY_SOURCE_DIR}/local/live-census.h"
+	"${KYTY_SOURCE_DIR}/local/metrics.h"
+	"${KYTY_SOURCE_DIR}/local/metrics.cpp"
 	"${KYTY_SOURCE_DIR}/local/title-state.h"
 	"${KYTY_SOURCE_DIR}/local/title-state.cpp"
 	"${KYTY_SOURCE_DIR}/local/dyn-multiplier.h"

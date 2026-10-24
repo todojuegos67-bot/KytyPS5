@@ -1,4 +1,5 @@
 #include "libs/controller.h"
+#include "local/metrics.h"
 #include "local/title-state.h"
 
 #include <SDL3/SDL.h>
@@ -1120,6 +1121,7 @@ int KYTY_SYSV_ABI PadIsRemoteController(int handle, bool* is_remote) {
 }
 
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
+	Kyty::Metrics::OnPadRead(); // (KYTY_LATENCY: the input sample of the next frame)
 	PRINT_NAME();
 
 	if (const auto error = PadCheckHandle(handle); error != OK) {
@@ -1141,6 +1143,7 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 }
 
 int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
+	Kyty::Metrics::OnPadRead(); // (KYTY_LATENCY: the input sample of the next frame)
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(num < 1 || num > 64);
