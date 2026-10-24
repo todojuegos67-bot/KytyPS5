@@ -548,6 +548,7 @@ struct KbmState {
 	float                   adz      = 0.15f;
 	float                   decay_ms = 25.0f;
 	float                   walk     = 0.5f;
+	float                   carry_ms = 200.0f; // (10-24) the most a saturated stick still owes the mouse (KYTY_KBM_CARRY_MS)
 	std::vector<KbmBinding> bindings;
 	bool                    captured = false;
 	bool                    walking  = false;
@@ -804,7 +805,8 @@ bool KbmProvide(int* x, int* y) {
 	auto&         k   = g_kbm;
 	const int64_t now = KbmNow();
 	double        dt  = k.last_ns == 0 ? 1.0 / 60.0 : static_cast<double>(now - k.last_ns) * 1e-9;
-	dt                = std::clamp(dt, 0.001, 0.1);
+	// (10-24) Two guest reads in one frame (a few us apart) no longer read as a huge counts/s: floor at 4 ms.
+	dt                = std::clamp(dt, 0.004, 0.1);
 	k.last_ns         = now;
 	k.polls++;
 
@@ -823,10 +825,10 @@ bool KbmProvide(int* x, int* y) {
 
 	const bool calibrating = KbmCalibStep(k, now, dt);
 	if (!calibrating) {
-		const int64_t ax = k.acc_x.load(std::memory_order_acquire);
-		const int64_t ay = k.acc_y.load(std::memory_order_acquire);
-		const double  cx = static_cast<double>(ax) / KBM_ONE;
-		const double  cy = static_cast<double>(ay) / KBM_ONE;
+		int64_t       ax = k.acc_x.load(std::memory_order_acquire);
+		int64_t       ay = k.acc_y.load(std::memory_order_acquire);
+		double        cx = static_cast<double>(ax) / KBM_ONE;
+		double        cy = static_cast<double>(ay) / KBM_ONE;
 		if (ax != 0 || ay != 0) {
 			if (now - k.last_motion_ns > 150000000 && std::abs(cx) >= std::abs(cy) && have_cam) {
 				k.lat_pending = true, k.lat_t0 = now, k.lat_reads = 0, k.lat_yaw0 = cam.yaw;
@@ -851,7 +853,11 @@ bool KbmProvide(int* x, int* y) {
 			k.debt_x += cx * dpc, k.debt_y += cy * dpc;
 			k.desired_deg += std::hypot(cx, cy) * dpc;
 			double L = std::hypot(k.debt_x, k.debt_y);
-			if (L > 180.0) k.debt_x *= 180.0 / L, k.debt_y *= 180.0 / L, L = 180.0;
+			// (10-24) Owed degrees capped at carry_ms of the camera's top rate (was 180 deg): a flick beyond the game's
+			// speed turns at full tilt for at most carry_ms after the hand stops, not seconds (the late drift, and the
+			// warp's -230 px clamp from it).
+			const double cap = std::max(k.curve.MaxRate() * k.carry_ms * 1e-3, 1.0);
+			if (L > cap) k.debt_x *= cap / L, k.debt_y *= cap / L, L = cap;
 			const double tau = k.curve.tau_ms * 1e-3;
 			const double a   = tau > 1e-4 ? 1.0 - std::exp(-dt / tau) : 1.0;
 			if (L < 0.01) {
@@ -870,7 +876,19 @@ bool KbmProvide(int* x, int* y) {
 			}
 		} else {
 			// No kbm_curve.txt: the linear mapping (counts/s -> deflection), a saturated stick's excess carried.
-			const double mag = std::hypot(cx, cy) / dt * k.sens / KBM_FULL_RATE;
+			double mag = std::hypot(cx, cy) / dt * k.sens / KBM_FULL_RATE;
+			// (10-24) The pending counts capped at full tilt for dt + carry_ms (was unbounded: with a slow game camera
+			// speed a flick kept the stick at full for seconds after the mouse stopped, and the warp showed it all).
+			if (const double lim = 1.0 + k.carry_ms * 1e-3 / dt; mag > lim) {
+				const double  f  = lim / mag;
+				const int64_t dx = ax - static_cast<int64_t>(std::llround(static_cast<double>(ax) * f));
+				const int64_t dy = ay - static_cast<int64_t>(std::llround(static_cast<double>(ay) * f));
+				k.acc_x.fetch_sub(dx, std::memory_order_acq_rel);
+				k.acc_y.fetch_sub(dy, std::memory_order_acq_rel);
+				ax -= dx, ay -= dy;
+				cx = static_cast<double>(ax) / KBM_ONE, cy = static_cast<double>(ay) / KBM_ONE;
+				mag = lim;
+			}
 			if (mag > 0.0) {
 				const double  f      = mag > 1.0 ? 1.0 / mag : 1.0;
 				const int64_t used_x = f >= 1.0 ? ax : static_cast<int64_t>(std::llround(static_cast<double>(ax) * f));
@@ -964,6 +982,7 @@ void KbmInit() {
 	g_kbm.adz      = EnvFloat("KYTY_KBM_ANTIDZ", 0.15f, 0.0f, 0.6f);
 	g_kbm.decay_ms = EnvFloat("KYTY_KBM_DECAY_MS", 0.0f, 0.0f, 500.0f);
 	g_kbm.walk     = EnvFloat("KYTY_KBM_WALK", 0.5f, 0.1f, 1.0f);
+	g_kbm.carry_ms = EnvFloat("KYTY_KBM_CARRY_MS", 200.0f, 0.0f, 2000.0f);
 	KbmAddList(KBM_DEFAULTS, false);
 	if (const char* map = std::getenv("KYTY_KBM_MAP"); map != nullptr) KbmAddList(map, true);
 	LOGF("KYTY_KBM: keyboard and mouse on (sens %.2f, exp %.2f, antideadzone %.2f, decay %.0f ms, %zu bindings)\n",
