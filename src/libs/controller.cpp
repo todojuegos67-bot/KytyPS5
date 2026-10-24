@@ -134,6 +134,8 @@ private:
 	static constexpr uint32_t STATES_MAX = 64;
 
 	void CheckActive();
+	bool Claim(int id, bool significant);
+	void LogActive(const char* why);
 	void AddState();
 	void CountDroppedState();
 	void ReportDroppedStates();
@@ -394,6 +396,47 @@ void GameController::CheckActive() {
 	m_states_num    = 0;
 	m_first_state   = 0;
 	m_next_touch_id = 1;
+	LogActive("connected pads changed");
+}
+
+// pad-1024: the player-1 pad, its name and its XInput slot (SDL player index: 0-3 for an XInput pad, whatever slot
+// Windows gave it; -1 for a HIDAPI pad such as a DualSense).
+void GameController::LogActive(const char* why) {
+	if (m_active_id < 0 || m_active_id == HOST_INPUT_CONTROLLER_ID) {
+		std::printf("Pad: player 1 = %s (%s, %d connected)\n", m_active_id < 0 ? "none" : "keyboard", why,
+		            static_cast<int>(m_connected_ids.size()));
+	} else {
+		auto*       pad   = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
+		const char* name  = pad != nullptr ? SDL_GameControllerName(pad) : nullptr;
+		const int   slot  = pad != nullptr ? SDL_GameControllerGetPlayerIndex(pad) : -1;
+		const bool  ps5   = pad != nullptr && SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5;
+		if (slot >= 0 && !ps5) {
+			std::printf("Pad: player 1 = '%s' (id %d, XInput slot %d) (%s, %d connected)\n", name ? name : "?",
+			            m_active_id, slot + 1, why, static_cast<int>(m_connected_ids.size()));
+		} else {
+			std::printf("Pad: player 1 = '%s' (id %d%s) (%s, %d connected)\n", name ? name : "?", m_active_id,
+			            ps5 ? ", DualSense" : "", why, static_cast<int>(m_connected_ids.size()));
+		}
+	}
+	std::fflush(stdout);
+}
+
+// pad-1024: last-used pad wins. Windows can put the user's pad in any XInput slot (2-4 while another device, a
+// virtual or idle pad, holds slot 1), and a DualSense and an XInput pad can both be connected: the first connected one
+// was player 1 for good and the other's input was dropped. Now a press (or a stick/trigger past half) on another
+// connected pad makes it player 1; input from the others is ignored, so two pads never mix in one state.
+bool GameController::Claim(int id, bool significant) {
+	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+		return true;
+	}
+	if (!significant || std::find(m_connected_ids.begin(), m_connected_ids.end(), id) == m_connected_ids.end()) {
+		return false;
+	}
+	m_active_id     = id;
+	m_state         = {};
+	m_next_touch_id = 1;
+	LogActive("input on it");
+	return true;
 }
 
 // The history scePadRead returns, oldest unread first: a state per input event. Demon's Souls reads 64 each tick and
@@ -456,7 +499,7 @@ void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
 
 	// The keyboard shares the player-1 pad with the active gamepad.
-	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+	if (Claim(id, down)) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
 		m_state.buttons = down ? m_state.buttons | button : m_state.buttons & ~button;
@@ -468,7 +511,8 @@ void GameController::Button(int id, uint32_t button, bool down) {
 void GameController::Axis(int id, Controller::Axis axis, int value) {
 	Common::LockGuard lock(m_mutex);
 
-	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+	const bool trigger_axis = axis == Controller::Axis::TriggerLeft || axis == Controller::Axis::TriggerRight;
+	if (Claim(id, trigger_axis ? value > 128 : (value < 64 || value > 192))) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
 		int axis_id = static_cast<int>(axis);
