@@ -340,7 +340,7 @@ jobs:
             gh release upload "$tag" "$PACKAGE.zip" --clobber --repo "$GITHUB_REPOSITORY"
           else
             draft="--draft"  # (10-24) siempre borrador salvo publish=true
-            latest=$([[ "$PACKAGE" == *-pgogen || "$PACKAGE" == *-fsr3 || "$PACKAGE" == *-dlss || "$PACKAGE" == *-fgx3 ]] && echo --latest=false || echo --latest)
+            latest="--latest=false"  # (10-24) solo la que autorice el usuario (publish=true) pasa a ser la ultima
             if [ "${{ inputs.publish }}" = "true" ]; then draft=""; latest="--latest"; [ -s "package/$PACKAGE/NOVEDADES.txt" ] && notes="$(cat "package/$PACKAGE/NOVEDADES.txt")"; fi
             gh release create "$tag" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" $draft \
               --title "$PACKAGE" --notes "$notes" $latest 2> gh-err.txt || { echo "::error::gh release create: $(tr '\n' ' ' < gh-err.txt)"; exit 1; }
