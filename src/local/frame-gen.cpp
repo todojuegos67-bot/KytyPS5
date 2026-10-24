@@ -3960,7 +3960,7 @@ namespace {
 // right before the upscaler (DLSS / XeSS / FSR), which then reads our composited copy in place of the game's color, so
 // the upscaler and frame generation see it. Trace (1: half res, 1 ray/px; 2 "Alto": full res, 3 rays/px; 3 "Ultra": full res, 5 rays/px, 28 steps + refine),
 // SVGF-style variance-guided temporal + a-trous (3 passes, 4 at Ultra), Ultra anti-flicker, temporal (alpha 0.1, clamped),
-// 2 a-trous passes, bilateral upsample. KYTY_SSGI_INTENSITY (0.6), KYTY_SSGI_AO (0.25).
+// 2 a-trous passes, bilateral upsample. KYTY_SSGI_INTENSITY (0.85 / 1.1 / 1.25 by quality), KYTY_SSGI_AO (0.25).
 // Normals from depth derivatives; view positions from the game's view_to_clip (handles reverse-Z).
 struct SsgiImage {
 	VulkanImage   image;
@@ -4183,7 +4183,7 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 		return false;
 	}
-	const float intensity = SsgiEnv("KYTY_SSGI_INTENSITY", 0.6f, 4.0f);
+	const float intensity = SsgiEnv("KYTY_SSGI_INTENSITY", quality >= 3 ? 1.25f : quality >= 2 ? 1.1f : 0.85f, 4.0f);
 	const float ao        = SsgiEnv("KYTY_SSGI_AO", 0.25f, 1.0f);
 	const auto& m         = inputs.view_to_clip;
 	SsgiPush    push {};
@@ -4202,7 +4202,7 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
 	push.trace[0] = static_cast<float>(g_ssgi.trace.width), push.trace[1] = static_cast<float>(g_ssgi.trace.height);
 	push.trace[2] = intensity, push.trace[3] = ao;
-	push.extra[1] = 2.0f, push.extra[2] = 0.5f; // ray length / thickness at 1 m, grown with distance
+	push.extra[1] = quality >= 3 ? 4.0f : 3.5f, push.extra[2] = 0.45f; // ray length / thickness at 1 m, grown with distance
 	{
 		static bool said = false;
 		if (!said) {
