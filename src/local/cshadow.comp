@@ -125,7 +125,7 @@ float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 	float foot  = 1.0 / px_m;
 	// (rtsart 10-24: a narrower band; rays that dip far behind a depth step (a pillar's edge, a foreground body)
 	// are not occluded by it, and an occluder must be confirmed by two consecutive samples.)
-	float thick = (clamp(0.12 + 0.004 * z, 0.12, 0.3) + farx * 1.0 * foot) * push.cand[3].y;
+	float thick = (clamp(0.15 + 0.005 * z, 0.15, 0.35) + farx * 1.0 * foot) * push.cand[3].y;
 	float bias  = 0.004 * z + 0.01 + farx * foot * mix(0.5, 1.5, 1.0 - ndl);
 	// The occluder must stand clear of the receiver's own plane: a ray over a low-poly surface (a cliff's flat facets
 	// in the depth buffer, smooth in the game's shading) hits the next facet of a crease within decimetres. The
@@ -159,9 +159,11 @@ float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 			float a1 = abs(ViewZ(textureLod(depth_tex, pr.xy - vec2(rs.x, 0), 0).r));
 			float a2 = abs(ViewZ(textureLod(depth_tex, pr.xy + vec2(0, rs.y), 0).r));
 			float a3 = abs(ViewZ(textureLod(depth_tex, pr.xy - vec2(0, rs.y), 0).r));
-			float tol = 0.02 * oz + 0.05;
+			float tol = 0.03 * oz + 0.08; // (rtsart2: looser: rubble, stair and pillar edges count)
 			// A plane passes through: a0 - oz ~ oz - a1 (and y likewise); anything else is broken depth.
-			bool solid = abs(a0 + a1 - 2.0 * oz) < tol && abs(a2 + a3 - 2.0 * oz) < tol;
+			float ex = abs(a0 + a1 - 2.0 * oz), ey = abs(a2 + a3 - 2.0 * oz);
+			// One axis planar and the other not wildly broken (an edge or a corner); foliage fails both.
+			bool solid = min(ex, ey) < tol && max(ex, ey) < 3.0 * tol;
 			cand = solid;
 		}
 		hits = cand ? hits + 1 : 0;
@@ -174,7 +176,7 @@ float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 			float soft = 1.0 - smoothstep(0.5 * thick, thick, delta);
 			float near = smoothstep(t_min, 2.0 * t_min, t);
 			// Softer with the distance to the occluder: contact dark, longer ones faint.
-			float dist = mix(1.0, 0.35, clamp(t / len, 0.0, 1.0));
+			float dist = mix(1.0, 0.5, clamp(t / len, 0.0, 1.0));
 			return edge * end * soft * near * dist;
 		}
 	}
@@ -198,7 +200,7 @@ void Trace(ivec2 pixel) {
 	// Surfaces facing away get no direct sun: the game's own lighting has them dark already (nothing to add);
 	// grazing ones fade in (their depth-buffer self-hits are noise; far away the facets are coarse: a wider ramp).
 	float nw  = NearW(z);
-	float g0  = mix(0.3, 0.15, nw), g1 = mix(0.6, 0.4, nw); // (rtsart: walls at grazing angles to the sun: none)
+	float g0  = mix(0.25, 0.1, nw), g1 = mix(0.5, 0.3, nw); // (rtsart: walls at grazing angles to the sun: none)
 	{
 		// A receiver whose depth is not locally planar (foliage, grass, a silhouette) gets none (fail safe).
 		vec2  rs = 1.0 / RenderSize();
@@ -368,11 +370,11 @@ void Composite(ivec2 pixel, out float dark, out float zout) {
 	// (10-24 r3: looser and never below 0.4: it suppressed too much, the shadows looked thin.)
 	// (rtsart 10-24: only where the game's own lighting shows sun; pixels it already shadows get nothing: no doubled
 	// shadows, no black interiors.)
-	float lit   = smoothstep(0.55, 0.9, (rel - inv_k) / (1.0 - inv_k));
+	float lit   = smoothstep(0.25, 0.7, (rel - inv_k) / (1.0 - inv_k)); // (rtsart2: relaxed from 0.55-0.9: contacts appeared too rarely)
 	// Generous near (x1.25), conservative far (x0.45); never darker than 0.25 of the input: no near-black patches.
-	float near  = mix(0.6, 1.0, 1.0 - smoothstep(6.0, 60.0, z)); // (10-24 r3: stronger at mid distance; was x0.45 from 40 m)
+	float near  = mix(0.75, 1.1, 1.0 - smoothstep(6.0, 60.0, z)); // (10-24 r3: stronger at mid distance; was x0.45 from 40 m)
 	// Multiply only, in the linear HDR input: factor in [1 - strength, 1]; never above the input (no lightening).
-	float factor = 1.0 - clamp(amt * near * stable * occ * lit, 0.0, 0.5);
+	float factor = 1.0 - clamp(amt * near * stable * occ * lit, 0.0, 0.68);
 	dark         = clamp(fade * stable * occ * lit, 0.0, 1.0); // (the statistics' occlusion: before the strength)
 	vec3  rgb    = min(col.rgb * factor, col.rgb);
 	if (any(isnan(rgb)) || any(isinf(rgb))) rgb = col.rgb;
