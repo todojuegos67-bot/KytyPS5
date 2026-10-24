@@ -419,6 +419,24 @@ $timer.Add_Tick({
 		} else {
 			$rows.Add(@('RAM', ("{0:N1} / {1:N0} GB" -f $ramUsed, $ramTotal), (Get-UseColor $ramUsed $ramTotal)))
 		}
+		# (10-24) Commit (memoria comprometida / limite de Windows = RAM + archivo de paginacion), de la misma consulta
+		# de Win32_OperatingSystem (nada mas que leer). Al limite Windows niega memoria y el juego se cierra: rojo por
+		# encima del 90 %. Con -RamGB (simular un PC de N GB): el emulador + 4 GB de Windows contra N GB + la paginacion.
+		$commitLimit = [double]$os.TotalVirtualMemorySize / 1MB
+		$commitUsed = $commitLimit - [double]$os.FreeVirtualMemory / 1MB
+		$commitSim = ''
+		if ($RamGB -gt 0) {
+			$pageFile = [Math]::Max(0.0, $commitLimit - $ramTotal)
+			$commitLimit = $RamGB + $pageFile
+			$priv = 0; $e3 = $emu | Select-Object -First 1
+			if ($e3) { $priv = $e3.PrivateMemorySize64 / 1GB }
+			$commitUsed = $priv + 4
+			$commitSim = ' (simulado)'
+		}
+		if ($commitLimit -gt 0) {
+			$cc = if ($commitUsed / $commitLimit -gt 0.90) { $cRed } else { Get-UseColor $commitUsed $commitLimit }
+			$rows.Add(@('Commit', ("{0:N1} / {1:N0} GB{2}" -f $commitUsed, $commitLimit, $commitSim), $cc))
+		}
 	} catch { }
 	$shownFps = $null
 	$fps = Get-Fps

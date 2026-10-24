@@ -34,7 +34,7 @@ $fgModes = @(
 	@('   DLSS MFG dynamic (x2-x4 automatic)',         'dlss-dynamic.json')
 )
 # (10-23) Grafica y equipo: con una grafica que no es NVIDIA no se ofrece nada de DLSS (ni reescalado ni frame generation).
-$script:gpuName = ''; $script:pcInfo = ''
+$script:gpuName = ''; $script:pcInfo = ''; $script:ramGB = 0
 try {
 	$vcs = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object { $_.Name })
 	$pick = $vcs | Where-Object { $_.Name -match 'NVIDIA|GeForce|Radeon|AMD|Arc' } | Select-Object -First 1
@@ -43,6 +43,7 @@ try {
 	$cpu = (Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1).Name
 	$ram = [math]::Round((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1GB)
 	$script:pcInfo = "$($cpu -replace '\s+', ' ')".Trim() + "  |  $ram GB RAM"
+	$script:ramGB = [int]$ram
 } catch { }
 $script:isNvidia = (-not $script:gpuName) -or ($script:gpuName -match 'NVIDIA|GeForce|RTX|GTX|Quadro')
 # (10-23) Base de datos de graficas: el modo recomendado y lo que se puede esperar. Medido en una RTX 5080 (1440p:
@@ -196,6 +197,11 @@ function Start-Game {
 	$psargs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $root 'run-windows.ps1')`"",
 	          '-Exe', "`"$(Join-Path $root $exeName)`"", '-Config', "`"$(Join-Path $root "config\$config")`"", '-Fullscreen')
 	if ($ram16 -or $chkPc16.Checked) { $psargs += '-Ram16' }
+	# (10-24) Perfil seguro de 16 GB (Update-LowRam: 20 GB de RAM o menos, o "Simular 16 GB RAM"): -Ram16 de siempre y
+	# KYTY_LOWRAM=1 (los limites de memoria del emulador para 16 GB). Con la simulacion, el emulador cree tener 16 GB.
+	$lowRamSets = @()
+	if ($ram16 -or $chkPc16.Checked -or (Test-LowRam)) { $lowRamSets += 'KYTY_LOWRAM=1' }
+	if ($chkRam16.Checked) { $lowRamSets += 'KYTY_SIMULATE_RAM_MB=16384' }
 	# HDR10 (solo si "Usar HDR" esta activado en la pantalla de Windows) y VSync (modo FIFO: sin tearing).
 	if ($chkHdr.Checked)   { $psargs += '-Hdr' }
 	if ($chkVsync.Checked) { $psargs += @('-PresentMode', 'Fifo') }
@@ -207,12 +213,12 @@ function Start-Game {
 	# juego y Windows usan aparte, por debajo de 8 GB) y texturas a la mitad y sombras mas cortas (-Quality low).
 	# Modo GPU seguro: el trabajo de compute del juego sin solaparse (KYTY_COMPUTE_CHAIN=0), para graficas que se
 	# cuelgan o dan pantallazo azul (~37% menos FPS).
-	$sets = @()
+	$sets = @() + $lowRamSets
 	# (10-23) Reserva PS5 reducida retirada: el juego pide unos 11,8 GB fijos y con 12 GB fallaban asignaciones  # (10-23) reserva de memoria PS5 reducida
 	# Modo TURBO (run-windows -Turbo): caches de video a 4.5 GB (unos 6 GB en total), texturas a un cuarto, detalle bajo
 	# del juego y la RAM vaciada cada 15 s por encima de 5 GB: para PCs de 16 GB que se cerraban en zonas pesadas.
 	if ($chkTurbo2.Checked) { $psargs += @('-Turbo2', '-Quality', 'low', '-TextureReduce', '2') }
-	elseif ($chkLowPc.Checked) { $sets += 'KYTY_SIMULATE_RAM_MB=16384'; $psargs += @('-Turbo', '-Quality', 'low', '-TextureReduce', '2') }
+	elseif ($chkLowPc.Checked) { if ($sets -notcontains 'KYTY_SIMULATE_RAM_MB=16384') { $sets += 'KYTY_SIMULATE_RAM_MB=16384' }; $psargs += @('-Turbo', '-Quality', 'low', '-TextureReduce', '2') }
 	# (10-23) Modo GPU seguro retirado del launcher
 	# Graficos: texturas (0 entera, 1 mitad, 2 cuarto) y distancia de dibujado (-Quality low/lowest: solo el LOD).
 	$psargs += @('-TextureReduce', @('0', 'h', '1', '2')[$cmbTex.SelectedIndex])  # (10-23) Alto = h
@@ -974,6 +980,29 @@ Move-To $chkPc16 $gPc 12 24 190
 $chkSafeGpu.Visible = $false; $chkSafeGpu.Checked = $false
 Move-To $chkRam16 $gPc 12 54 190
 Move-To $chkVram8 $gPc 202 54 206
+# (10-24) PCs de 20 GB de RAM o menos (o con "Simular 16 GB RAM"): el perfil seguro de 16 GB solo (la casilla del equipo
+# de 16 GB marcada y fija, KYTY_LOWRAM=1) y un aviso de una linea. Lo que el usuario tenia marcado se guarda aparte: al
+# quitar la simulacion vuelve tal cual (mientras esta forzada la casilla escribe en otra clave del ini).
+function Test-LowRam { return ($chkRam16.Checked -or ($script:ramGB -gt 0 -and $script:ramGB -le 20)) }
+$script:pc16User = $chkPc16.Checked
+$lbRamNote = New-Label '' (New-Object System.Drawing.Font('Segoe UI', 8.25)) $gold 0 0 212 34
+$panel.Controls.Add($lbRamNote)
+Move-To $lbRamNote $gPc 202 19 212  # (hasta dos lineas cortas, sin tapar la fila de abajo)
+$tips.SetToolTip($lbRamNote, 'With 16 GB of RAM the game is tight on memory: the launcher uses the safe 16 GB profile (less kept in RAM, resolution unchanged). Close your browser (Chrome, Edge, Firefox), Discord and other launchers before playing.')
+function Update-LowRam {
+	if (Test-LowRam) {
+		if ($chkPc16.Enabled) { $script:pc16User = $chkPc16.Checked }
+		$chkPc16.Tag = 'pc16forced'; $chkPc16.Checked = $true; $chkPc16.Enabled = $false
+		$ramTxt = if ($chkRam16.Checked) { '16 GB (simulated)' } else { "$($script:ramGB) GB" }
+		$lbRamNote.Text = "RAM $($ramTxt): safe profile. Close browsers"
+		$lbRamNote.Visible = $true
+	} else {
+		if (-not $chkPc16.Enabled) { $chkPc16.Enabled = $true; $chkPc16.Checked = [bool]$script:pc16User; $chkPc16.Tag = 'pc16' }
+		$lbRamNote.Visible = $false
+	}
+}
+Update-LowRam
+$chkRam16.Add_CheckedChanged({ Update-LowRam })
 # (10-23) Optimizacion tarjetas de 8 GB: texturas bajo, distancia y sombras medio (7,4 -> 6,3 GB de VRAM, tirones 26% -> 4%).
 $chkGpu8 = New-Check '8 GB GPU optimization' 0 0 206 'gpu8opt'
 $tips.SetToolTip($chkGpu8, '8 GB GPUs: sets textures to Low and distance and shadows to Medium so the game fits in the GPU memory.')

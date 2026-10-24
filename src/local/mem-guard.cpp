@@ -238,10 +238,10 @@ void ShowBox(const wchar_t* text) {
 constexpr const wchar_t* OutOfMemoryText =
     L"No hay suficiente memoria RAM: el emulador se ha quedado sin memoria.\n"
     L"Cierra otros programas (navegadores, Discord, launchers) y vuelve a jugar.\n"
-    L"En el launcher: marca \"Equipo de 16 GB RAM\" / reserva PS5 reducida.\n\n"
+    L"En el launcher: marca \"Equipo de 16 GB RAM\" (con 16 GB se marca solo).\n\n"
     L"Not enough RAM: the emulator ran out of memory.\n"
     L"Close other programs (browsers, Discord, launchers) and start the game again.\n"
-    L"In the launcher: tick the 16 GB RAM PC option / reduced PS5 reserve.";
+    L"In the launcher: tick \"16 GB RAM PC\" (on 16 GB PCs it is ticked for you).";
 constexpr const wchar_t* NearlyOutText =
     L"El emulador se ha cerrado con la memoria RAM casi llena: lo mas probable es que falte memoria.\n"
     L"Cierra otros programas (navegadores, Discord, launchers) y vuelve a jugar.\n\n"
@@ -373,7 +373,7 @@ void FatalOutOfMemory(const char* what, uint64_t bytes) {
 	             state);
 	std::printf("Memory guard: OUT OF MEMORY: %s (%llu MiB) still failed after %d release passes; %s\n"
 	            "Not enough RAM: close other programs (browsers, Discord) and start the game again "
-	            "(launcher: 16 GB RAM PC / reduced PS5 reserve).\n",
+	            "(launcher: the 16 GB RAM PC profile).\n",
 	            what != nullptr ? what : "an allocation", static_cast<unsigned long long>(bytes >> 20u), MaxRetries,
 	            state);
 	std::fflush(nullptr);
