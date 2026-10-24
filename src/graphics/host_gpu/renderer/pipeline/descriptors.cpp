@@ -1058,6 +1058,17 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
+	// Shadow-map arrays (a depth-compare sample, a depth image, or memory the GPU renders into: the 80-layer spot-light
+	// shadow pool) keep every layer to the T#'s last: the layer bound solved from the shader can miss the light's layer,
+	// which then reads a clamped, wrong layer (spot-shadow artifacts, as with the depth-array full re-upload).
+	if (desc.info.resources.layers > 1 && desc.view_info.base_layer < desc.info.resources.layers &&
+	    (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
+	     resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray) &&
+	    (resource.depth_compare || desc.info.IsDepth() ||
+	     texture_cache.IsRegionGpuModified(desc.info.data.address, desc.info.data.size) ||
+	     texture_cache.HasGpuWrittenImageOverlap(desc.info.data.address, desc.info.data.size))) {
+		desc.view_info.layer_count = desc.info.resources.layers - desc.view_info.base_layer;
+	}
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	if (static const bool log_views = std::getenv("KYTY_UPLOAD_LOG") != nullptr; log_views && levels > 1 && !storage) {
 		std::printf("[tsc %llu] TSHARP addr=0x%llx size=0x%llx fmt=%u %ux%u levels=%u base=%u last=%u min_lod=%u warn=%u "
