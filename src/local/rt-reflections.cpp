@@ -643,8 +643,8 @@ bool Analyze(GraphicContext& graphics, uint32_t packed_count) {
 			const double rp = gloss ? 1.0 - pick_pud : pick_pud, ra = gloss ? 1.0 - pick_all : pick_all;
 			g_rt.dec_rough = (pick / 4) | (((pick % 4) * 8) << 2) | (8 << 7) | (gloss ? 4096 : 0);
 			if (!g_rt.mat_forced) {
-				g_rt.mat_lo = static_cast<float>(rp + (ra - rp) * 0.25);
-				g_rt.mat_hi = static_cast<float>(rp + (ra - rp) * 0.5);
+				g_rt.mat_lo = static_cast<float>(rp + (ra - rp) * 0.15); // (refl3: tighter, was 0.25 / 0.5)
+				g_rt.mat_hi = static_cast<float>(rp + (ra - rp) * 0.35);
 			}
 			g_rt.mat_auto = true;
 			// (the share of all pixels it marks wet, from the field's histogram)
@@ -792,7 +792,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 
 	const float strength = EnvFloat("KYTY_RT_REFLECTIONS_STRENGTH", 1.0f, 0.0f, 3.0f);
 	const float min_refl = EnvFloat("KYTY_RT_REFLECTIONS_MIN", 0.4f, 0.0f, 0.8f);
-	const float guess    = EnvFloat("KYTY_RT_REFLECTIONS_GUESS", 0.2f, 0.0f, 1.0f);
+	const float guess    = EnvFloat("KYTY_RT_REFLECTIONS_GUESS", 0.0f, 0.0f, 1.0f);
 	const auto& cfg      = Cfg(level);
 	const int   iters    = cfg.iters;
 	const float cutoff   = cfg.cutoff;

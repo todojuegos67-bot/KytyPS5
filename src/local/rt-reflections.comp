@@ -11,6 +11,7 @@
 //   7 hi-z down: mip push.dec.w = min (closest) of the 2x2 below it (odd sizes: the edge texel kept)
 //   5 calib:     160x90 grid: every packed G-buffer layer x 5 normal layouts scored against the depth normal (view and
 //                world space), byte field statistics (the CPU picks the decode, rt-reflections.cpp)
+//   (refl3: no edge stretching, hits validated by depth / silhouette / facing, water a mirror at full resolution)
 //   0 trace:     GGX VNDF-sampled reflection ray (the surface's roughness), hierarchical-Z march over the closest-depth
 //                pyramid (thickness slab, sub-pixel hit), confidence = screen-edge fade x back-face x toward-camera fade;
 //                misses and the sky give confidence 0 (the game's own reflection stays). Out: premultiplied
@@ -294,11 +295,20 @@ float WaterMask(ivec2 rp, float d, vec2 uv, vec3 Nd) {
 	float d0 = texelFetch(gdepth, rp, 0).r;
 	float z  = abs(ViewZ(d));
 	float z0 = IsSky(d0) ? FAR : abs(ViewZ(d0));
-	float nearer = smoothstep(0.02, 0.05, (z0 - z) / max(z, 1e-3));
+	// (refl3: 0.5 % of the distance and 3 cm, was 2 %: far and shallow water was lost)
+	float nearer = smoothstep(0.004, 0.015, (z0 - z) / max(z, 1e-3)) * smoothstep(0.02, 0.06, z0 - z);
 	if (nearer <= 0.0) return 0.0;
 	float upf = UpFacing(Nd);
 	if (upf <= 0.0) return 0.0;
-	return nearer * upf * mix(0.3, 1.0, Flatness(uv, Nd, 0.90, 0.98));
+	return nearer * upf * mix(0.6, 1.0, Flatness(uv, Nd, 0.90, 0.98));
+}
+// Flat water reflects as a mirror: its depth normal (noisy from the depth's precision far away) snapped to world up
+// when it is close to it; waves (normals further off) keep their own.
+vec3 WaterNormal(vec3 Nd) {
+	if ((push.misc.w & 8) == 0) return Nd;
+	vec3  up = normalize(up_view.xyz);
+	float c  = dot(Nd, up);
+	return c > 0.97 ? up : normalize(mix(Nd, up, smoothstep(0.85, 0.97, c)));
 }
 Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	Surf s;
@@ -310,7 +320,7 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	vec3 V     = normalize(-P);
 	float water = WaterMask(rp, d, ruv, Nd);
 	if (water > 0.0) match = false; // (the G-buffer holds the bed under the water)
-	s.N  = match ? Ng : Nd;
+	s.N  = match ? Ng : (water > 0.0 ? WaterNormal(Nd) : Nd);
 	s.Ng = Nd;
 	s.gb = match ? 1.0 : 0.0;
 	if (dot(s.N, V) < 0.02) s.N = normalize(s.N + V * (0.02 - dot(s.N, V) + 0.01)); // (back-facing by a little: bent)
@@ -318,13 +328,14 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	if (match && push.dec.y >= 0) {
 		// The material field (roughness units: low = smooth / wet): wet below mparams.x, dry from mparams.y; walls half.
 		float r = clamp(Field(push.dec.y, rp), 0.0, 1.0);
-		mat     = (1.0 - smoothstep(mparams.x, mparams.y, r)) * mix(0.5, 1.0, UpFacing(Nd)) * mparams.z;
-		mat_r   = mix(0.05, 0.20, smoothstep(0.0, mparams.y, r)); // (wet ground blurrier than water's 0.03)
+		mat     = (1.0 - smoothstep(mparams.x, mparams.y, r)) * mix(0.15, 1.0, UpFacing(Nd)) * mparams.z; // (refl3: walls 0.15, was 0.5)
+		mat_r   = mix(0.02, 0.15, smoothstep(0.0, mparams.y, r)); // (wet ground blurrier than water's 0.03)
 		mat    *= mparams.w; // (the wet cap: the CPU scales it down when most of the floor is wet)
 	}
 	float guess = water > 0.0 ? 0.0 : PuddleGuess(ruv, Nd) * fparams.w;
 	s.mask  = max(water, max(mat, guess));
-	s.rough = water >= mat && water >= guess ? 0.03 : mat >= guess ? mat_r : 0.12;
+	s.rough = water >= mat && water >= guess ? 0.0 : mat >= guess ? mat_r : 0.12; // (water: a mirror, no lobe)
+	if (s.mask < 0.15) s.mask = 0.0; // (refl3: faint wet guesses reflect nothing)
 	return s;
 }
 // The share of the reflection in the composite (and the trace's early out): Fresnel (Schlick with roughness, f0 0.04)
@@ -408,7 +419,7 @@ float HizTrace(Ray r, float t, float t_end, int max_iter, out float hit_z) {
 			continue;
 		}
 		// One pixel: a hit when the ray's span here overlaps the surface slab [zmin, zmin + thickness].
-		float thick = push.params.y * (1.0 + zmin * 0.03);
+		float thick = push.params.y * (1.0 + zmin * 0.01); // (refl3: was 3 %/m: thick slabs smeared objects behind edges)
 		if (dlo <= zmin + thick && dhi >= zmin) {
 			float th = t;
 			if (d0 < zmin) {
@@ -448,6 +459,87 @@ void Stat(int k, int v) {
 void StoreMiss(ivec2 px, Surf s) {
 	imageStore(out_a, px, vec4(0));
 	imageStore(out_c, px, vec4(s.rough, s.mask, 0, 0));
+}
+
+// The march and the hit's validation (refl3). A ray that leaves the screen or finds nothing is a miss (the game's own
+// reflection stays): nothing is ever stretched from the screen's edge. A hit is kept only when the surface there agrees
+// with the ray: depth within the slab at the full-resolution pixel, not a silhouette (a depth jump next to it: the ray
+// passed behind an object's edge, the streaks), facing the ray, not on the reflector's own plane; then faded smoothly
+// by its distance to the screen's edges and by how much the ray turns toward the camera. Out: premultiplied
+// (tonemapped exposed color x confidence, confidence) and the hit distance.
+bool March(vec3 P, vec3 N, vec3 R, vec3 V, int iters, out vec4 res, out float hdist) {
+	res   = vec4(0);
+	hdist = 0.0;
+	// Rays toward the camera see what the screen does not hold: faded out early, and not marched when gone.
+	float toward = 1.0 - smoothstep(0.05, 0.45, dot(R, V));
+	if (toward < 1e-3) return false;
+	float dist = abs(P.z);
+	float sgn  = P.z >= 0.0 ? 1.0 : -1.0;
+	vec3  P0   = P + N * (0.002 * dist + 0.002);
+	float len  = push.params.z;
+	float fwd  = R.z * sgn;
+	float d0   = abs(P0.z);
+	if (fwd < 0.0) len = min(len, max((d0 - 0.2) / -fwd, 0.0));
+	if (len < 0.02) return false;
+	vec3  P1 = P0 + R * len;
+	float w0 = ClipW(P0), w1 = ClipW(P1);
+	if (!(abs(w0) > 1e-8 && abs(w1) > 1e-8) || w0 * w1 <= 0.0) return false;
+	vec2 rs  = RenderSize();
+	vec2 sp0 = Project(P0) * rs, sp1 = Project(P1) * rs;
+	vec2 dp  = sp1 - sp0;
+	if (BadV(vec3(sp0, sp1.x)) || isnan(sp1.y)) return false;
+	float tmax = 1.0;
+	if (dp.x > 1e-6) tmax = min(tmax, (rs.x - 0.5 - sp0.x) / dp.x);
+	if (dp.x < -1e-6) tmax = min(tmax, (0.5 - sp0.x) / dp.x);
+	if (dp.y > 1e-6) tmax = min(tmax, (rs.y - 0.5 - sp0.y) / dp.y);
+	if (dp.y < -1e-6) tmax = min(tmax, (0.5 - sp0.y) / dp.y);
+	if (fparams.z > 0.0) tmax = min(tmax, fparams.z / max(length(dp), 1e-6));
+	tmax = clamp(tmax, 0.0, 1.0);
+	if (length(dp) * tmax < 1.0) return false;
+	Ray r;
+	r.p0  = sp0;
+	r.dp  = dp;
+	r.h0  = 1.0 / w0;
+	r.h1  = 1.0 / w1;
+	r.a   = P0 * r.h0;
+	r.b   = P1 * r.h1;
+	r.sgn = sgn;
+	float t0    = min(1.5 / length(dp), tmax);
+	float hit_z = 0.0;
+	float th    = HizTrace(r, t0, tmax, iters, hit_z);
+	if (th < 0.0) return false;
+	vec2  hp  = r.p0 + r.dp * th;
+	vec2  huv = hp / rs;
+	if (!InScreen(huv)) return false;
+	float hd  = DepthAt(huv);
+	if (IsSky(hd)) return false; // (the sky is never a hit: the game's own sky reflection stays)
+	vec3  HP = ViewPos(huv, hd);
+	float zs = abs(HP.z);
+	// Depth agreement at the full-resolution pixel: the ray within [surface - a little, surface + thickness].
+	float zr    = RayDist(r, th);
+	float thick = push.params.y * (1.0 + zs * 0.01);
+	if (zr < zs - 0.05 * zs - 0.05 || zr > zs + thick) return false;
+	// Silhouettes: a large depth jump next to the hit pixel (the ray slid behind an edge).
+	// (1 / distance is linear across a plane on screen: its second difference is ~0 on any surface, large on an edge)
+	vec2  t1 = 1.0 / rs;
+	float iz = 1.0 / max(zs, 1e-3);
+	float ixp = 1.0 / max(abs(ViewZ(DepthAt(huv + vec2(t1.x, 0)))), 1e-3), ixm = 1.0 / max(abs(ViewZ(DepthAt(huv - vec2(t1.x, 0)))), 1e-3);
+	float iyp = 1.0 / max(abs(ViewZ(DepthAt(huv + vec2(0, t1.y)))), 1e-3), iym = 1.0 / max(abs(ViewZ(DepthAt(huv - vec2(0, t1.y)))), 1e-3);
+	float j   = max(abs(ixp + ixm - 2.0 * iz), abs(iyp + iym - 2.0 * iz)) / iz;
+	float sil = 1.0 - smoothstep(0.03, 0.10, j);
+	vec3  HN   = NormalAt(huv, HP);
+	float face = smoothstep(0.0, 0.25, dot(HN, -R));
+	// (the reflector's own plane: a hit a short way off on a surface parallel to it is self-intersection)
+	float self_ = (dot(HN, N) > 0.97 && length(HP - P) < 0.05 * dist + 0.1) ? 0.0 : 1.0;
+	vec2  edge  = min(huv, 1.0 - huv);
+	float fade  = smoothstep(0.0, 0.10, edge.x) * smoothstep(0.0, 0.10, edge.y);
+	float conf  = clamp(fade * face * sil * self_ * toward, 0.0, 1.0);
+	if (conf < 1e-3) return false;
+	vec3 c = Tonemap(SafeColor(textureLod(color_tex, huv, 0).rgb * GameExposure()));
+	res    = vec4(c * conf, conf);
+	if (Bad(res)) return false;
+	hdist = length(HP - P);
+	return true;
 }
 
 // `march`: false on the checkerboard's other half this frame: the surface is written, the reflection marked absent
@@ -500,79 +592,13 @@ void Trace(ivec2 px, bool march) {
 	R = normalize(R);
 	if (BadV(R)) { StoreMiss(px, s); return; }
 
-	// The segment: off the surface a little, clipped to the near side and to the screen.
-	float sgn  = P.z >= 0.0 ? 1.0 : -1.0;
-	vec3  P0   = P + s.N * (0.002 * dist + 0.002);
-	float len  = push.params.z;
-	float fwd  = R.z * sgn;
-	float d0   = abs(P0.z);
-	if (fwd < 0.0) len = min(len, max((d0 - 0.2) / -fwd, 0.0));
-	if (len < 0.02) { StoreMiss(px, s); return; }
-	vec3  P1 = P0 + R * len;
-	float w0 = ClipW(P0), w1 = ClipW(P1);
-	if (!(abs(w0) > 1e-8 && abs(w1) > 1e-8) || w0 * w1 <= 0.0) { StoreMiss(px, s); return; }
-	vec2 rs  = RenderSize();
-	vec2 sp0 = Project(P0) * rs, sp1 = Project(P1) * rs;
-	vec2 dp  = sp1 - sp0;
-	if (BadV(vec3(sp0, sp1.x)) || isnan(sp1.y)) { StoreMiss(px, s); return; }
-	float tmax = 1.0;
-	if (dp.x > 1e-6) tmax = min(tmax, (rs.x - 0.5 - sp0.x) / dp.x);
-	if (dp.x < -1e-6) tmax = min(tmax, (0.5 - sp0.x) / dp.x);
-	if (dp.y > 1e-6) tmax = min(tmax, (rs.y - 0.5 - sp0.y) / dp.y);
-	if (dp.y < -1e-6) tmax = min(tmax, (0.5 - sp0.y) / dp.y);
-	// (the screen length cap: long rays cost the most iterations and find the least that is right)
-	if (fparams.z > 0.0) tmax = min(tmax, fparams.z / max(length(dp), 1e-6));
-	tmax = clamp(tmax, 0.0, 1.0);
-	float pix = length(dp) * tmax;
-	if (pix < 1.0) { StoreMiss(px, s); return; }
-	Ray r;
-	r.p0  = sp0;
-	r.dp  = dp;
-	r.h0  = 1.0 / w0;
-	r.h1  = 1.0 / w1;
-	r.a   = P0 * r.h0;
-	r.b   = P1 * r.h1;
-	r.sgn = sgn;
-	float t0    = min(1.5 / length(dp), tmax);
-	float hit_z = 0.0;
-	// (rough rays get fewer iterations: their result is blurred anyway)
+	vec4 hc;
+	float hdist;
 	int   iters = max(int(float(push.misc2.z) * mix(1.0, 0.5, smoothstep(0.15, 0.45, s.rough))), 8);
-	float th    = HizTrace(r, t0, tmax, iters, hit_z);
-	if (th < 0.0) {
-		// A ray that leaves the screen: the color where it leaves, faded by how short the on-screen part was and by
-		// roughness, at a low confidence (a plausible tint, not a drop to nothing when the camera pitches down).
-		if (tmax < 0.999) {
-			vec2  euv = clamp((r.p0 + r.dp * tmax) / rs, vec2(0.002), vec2(0.998));
-			float ed  = DepthAt(euv);
-			float cf  = 0.5 * smoothstep(0.0, 0.25, tmax) * (1.0 - smoothstep(0.1, 0.4, s.rough));
-			if (!IsSky(ed) && cf > 1e-3) {
-				vec3 c = Tonemap(SafeColor(textureLod(color_tex, euv, 0).rgb * GameExposure()));
-				imageStore(out_a, px, vec4(c * cf, cf));
-				imageStore(out_c, px, vec4(s.rough, s.mask, 0, 0));
-				return;
-			}
-		}
-		StoreMiss(px, s);
-		return;
-	}
-	vec2  huv = (r.p0 + r.dp * th) / rs;
-	float hd  = DepthAt(huv);
-	if (IsSky(hd)) { StoreMiss(px, s); return; } // (the sky is never a hit: the game's own sky reflection stays)
-	vec3  HP = ViewPos(huv, hd);
-	vec3  HN = NormalAt(huv, HP);
-	// A surface seen from behind (the ray leaves through it) is no hit; rays toward the camera see what it cannot.
-	float face = smoothstep(-0.05, 0.2, dot(HN, -R));
-	vec2  edge = min(huv, 1.0 - huv);
-	float fade = smoothstep(0.0, 0.06, min(edge.x, edge.y)) * face;
-	fade *= smoothstep(-0.7, -0.15, -dot(R, V));
-	fade = clamp(fade, 0.0, 1.0);
-	if (fade < 1e-3) { StoreMiss(px, s); return; }
-	vec3 c   = Tonemap(SafeColor(textureLod(color_tex, huv, 0).rgb * GameExposure()));
-	vec4 res = vec4(c * fade, fade);
-	if (Bad(res)) { StoreMiss(px, s); return; }
+	if (!March(P, s.N, R, V, iters, hc, hdist)) { StoreMiss(px, s); return; }
 	if (st) Stat(5, 1);
-	imageStore(out_a, px, res);
-	imageStore(out_c, px, vec4(s.rough, s.mask, length(HP - P), 1));
+	imageStore(out_a, px, hc);
+	imageStore(out_c, px, vec4(s.rough, s.mask, hdist, 1));
 }
 
 // The previous frame's uv of a view-space point through clip -> previous clip (`flip`: the clip's y the other way).
@@ -662,13 +688,13 @@ void Temporal(ivec2 px) {
 	if (valid) {
 		vec4  hist = textureLod(src_b, puv, 0);
 		if (Bad(hist)) hist = cur;
-		float k    = mix(1.0, 2.5, smoothstep(0.05, 0.4, rough));
+		float k    = mix(0.75, 2.5, smoothstep(0.05, 0.4, rough)); // (refl3: mirrors clamped tighter: no ghosts)
 		vec3  hy   = clamp(YCoCg(hist.rgb), m1 - k * sig - 1e-4, m1 + k * sig + 1e-4);
 		hist.rgb   = max(Rgb(hy), vec3(0));
 		hist.a     = clamp(hist.a, a1 - k * asig - 0.02, a1 + k * asig + 0.02);
 		len        = min(meta.x + 1.0, 32.0);
 		// Mirrors follow quickly (a parallax error would ghost); rough surfaces average longer.
-		float amin  = mix(0.15, 0.04, smoothstep(0.02, 0.3, rough)) * push.motion.w;
+		float amin  = mix(0.25, 0.04, smoothstep(0.02, 0.3, rough)) * push.motion.w; // (refl3: mirrors 0.25, was 0.15)
 		float alpha = max(1.0 / len, amin);
 		// (a miss this frame against a held reflection: the history fades slowly instead of popping)
 		if (fresh && cur.a < hist.a * 0.5) alpha *= 0.5;
@@ -799,7 +825,24 @@ void Composite(ivec2 px) {
 		return;
 	}
 	if (st && mask > 0.05) Stat(3, 1);
-	if (st && mask > 0.5 && (push.misc.w & 64) != 0 && WaterMask(px, d, uv, Nd) > 0.5) Stat(7, 1);
+	float water = WaterMask(px, d, uv, Nd);
+	if (st && mask > 0.5 && water > 0.5) Stat(7, 1);
+	if (water > 0.0) N = WaterNormal(Nd); // (the G-buffer holds the bed under the water)
+	// (refl3) Water and near-mirrors with a half-resolution trace: their own mirror ray at the render resolution, so
+	// the reflection keeps every pixel of detail (the upsampled, filtered one is the fallback where it finds nothing).
+	if (rough < 0.04 && mask > 0.3 && !all(equal(ivec2(TraceSize()), ivec2(RenderSize())))) {
+		vec3 Vf = normalize(-P);
+		vec3 Rf = reflect(-Vf, N);
+		float rg = dot(Rf, Nd);
+		if (rg < 0.01) Rf = normalize(Rf + Nd * (0.01 - rg));
+		vec4  hc;
+		float hd;
+		if (!BadV(Rf) && March(P, N, Rf, Vf, push.misc2.z, hc, hd)) {
+			// (a little of the temporal result where it agrees: steadier under sub-pixel camera motion)
+			bool agree = rf.a > 1e-3 && !Bad(rf) && distance(rf.rgb / rf.a, hc.rgb / hc.a) < 0.1;
+			rf = agree ? mix(hc, rf, 0.25) : hc;
+		}
+	}
 	if (Bad(rf) || rf.a < 1e-3) {
 		imageStore(out_a, px, col);
 		return;
