@@ -4347,6 +4347,11 @@ struct GtaoPass {
 	double                  sum_ms  = 0.0;
 	uint32_t                samples = 0;
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+	VkImage       dummy_image    = VK_NULL_HANDLE;
+	VmaAllocation dummy_mem      = nullptr;
+	vk::ImageView dummy_view     = nullptr;
+	bool          dummy_ready    = false;
+	bool          normals_logged = false;
 } g_gtao;
 
 int GtaoLevel() {
@@ -4362,6 +4367,11 @@ int GtaoLevel() {
 	return level;
 }
 
+struct GtaoPush : SsgiPush {
+	float rot[8]; // gtao.comp's rot[2]
+};
+static_assert(sizeof(GtaoPush) == 128);
+
 std::array<SsgiImage*, 10> GtaoAll() {
 	return {&g_gtao.raw,     &g_gtao.tmp_a,   &g_gtao.tmp_b,    &g_gtao.out,      &g_gtao.history[0],
 	        &g_gtao.history[1], &g_gtao.gbuf[0], &g_gtao.gbuf[1], &g_gtao.count[0], &g_gtao.count[1]};
@@ -4372,10 +4382,10 @@ bool GtaoEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
 	if (g_gtao.pipeline == nullptr) {
 		if (g_gtao.failed) return false;
 		g_gtao.failed = true;
-		std::array<vk::DescriptorSetLayoutBinding, 11> bindings {};
-		for (uint32_t i = 0; i < 11; ++i) {
+		std::array<vk::DescriptorSetLayoutBinding, 12> bindings {};
+		for (uint32_t i = 0; i < 12; ++i) {
 			bindings[i].binding         = i;
-			bindings[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorType  = i < 7 || (i >= 9 && i != 10) ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
 			bindings[i].descriptorCount = 1;
 			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
 		}
@@ -4421,6 +4431,27 @@ bool GtaoEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
 		query.queryCount = 16;
 		if (device.createQueryPool(&query, nullptr, &g_gtao.pool) != vk::Result::eSuccess) g_gtao.pool = nullptr;
 		g_gtao.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		{ // a 1x1 R32_UINT stand-in for the G-buffer normal layer when there is no copy (binding 11)
+			VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+			create.imageType   = VK_IMAGE_TYPE_2D;
+			create.format      = VK_FORMAT_R32_UINT;
+			create.extent      = {1, 1, 1};
+			create.mipLevels   = 1;
+			create.arrayLayers = 1;
+			create.samples     = VK_SAMPLE_COUNT_1_BIT;
+			create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+			create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+			VmaAllocationCreateInfo allocate {};
+			allocate.usage = VMA_MEMORY_USAGE_AUTO;
+			if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_gtao.dummy_image, &g_gtao.dummy_mem, nullptr) != VK_SUCCESS)
+				return false;
+			vk::ImageViewCreateInfo view_info {};
+			view_info.image            = vk::Image(g_gtao.dummy_image);
+			view_info.viewType         = vk::ImageViewType::e2D;
+			view_info.format           = vk::Format::eR32Uint;
+			view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			if (device.createImageView(&view_info, nullptr, &g_gtao.dummy_view) != vk::Result::eSuccess) return false;
+		}
 		g_gtao.failed    = false;
 	}
 	if (g_gtao.out.image.image != nullptr && g_gtao.render == render && g_gtao.level == level) return true;
@@ -4487,11 +4518,14 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 		return false;
 	}
-	const float strength = SsgiEnv("KYTY_GTAO_STRENGTH", 0.6f, 1.0f);
-	const float radius   = std::max(SsgiEnv("KYTY_GTAO_RADIUS", 1.0f, 8.0f), 0.05f);
+	// (10-24 ao: subtle defaults; strength 0.6 -> 0.5, radius 1.0 -> 0.6 m, clamped to 10% of the screen height)
+	const float strength  = SsgiEnv("KYTY_GTAO_STRENGTH", 0.5f, 1.0f);
+	const float radius    = std::max(SsgiEnv("KYTY_GTAO_RADIUS", 0.6f, 8.0f), 0.05f);
+	const float thickness = std::max(SsgiEnv("KYTY_GTAO_THICKNESS", 0.35f, 4.0f), 0.02f);
+	const float max_r     = std::max(SsgiEnv("KYTY_GTAO_MAXSCREEN", 0.1f, 0.5f), 0.01f);
 	const float bent     = SsgiEnv("KYTY_GTAO_BENT", 0.0f, 1.0f);
 	const auto& m        = inputs.view_to_clip;
-	SsgiPush    push {};
+	GtaoPush    push {};
 	const bool  have_proj = m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f);
 	if (have_proj) {
 		push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
@@ -4507,12 +4541,44 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.trace[0] = static_cast<float>(g_gtao.trace.width), push.trace[1] = static_cast<float>(g_gtao.trace.height);
 	push.trace[2] = strength, push.trace[3] = radius;
 	push.extra[1] = bent;
+	push.extra[2] = thickness;
+	push.extra[3] = max_r;
+	// The G-buffer normal (as SHINE reads it: layer 3, oct 8:8, world space, the G-buffer camera's rotation).
+	RtReflGbuffer gbuf;
+	const bool    have_gbuf = have_proj && RtReflGetGbuffer(gbuf) && gbuf.extent == color.extent && gbuf.views[3] != nullptr;
+	RtReflCamera  camera;
+	if (have_gbuf) RtReflGetCamera(m, camera);
+	static const bool use_gbuf = [] {
+		const char* v = std::getenv("KYTY_GTAO_GBUFFER");
+		return v == nullptr || *v != '0';
+	}();
+	static const bool flip_y = [] {
+		const char* v = std::getenv("KYTY_GTAO_FLIPY");
+		return v == nullptr || *v == '\0' || *v != '0';
+	}();
+	const bool normals = use_gbuf && have_gbuf && camera.rows;
+	int32_t    nflags  = 0;
+	if (normals) {
+		const auto& r = camera.view_rows; // 3 rows x 4
+		push.rot[0] = r[0], push.rot[1] = r[1], push.rot[2] = r[2], push.rot[3] = r[4];
+		push.rot[4] = r[5], push.rot[5] = r[6], push.rot[6] = r[8], push.rot[7] = r[9];
+		// row 2 = cross(row 0, row 1) * sign: the sign from the real row 2
+		const float cx = r[1] * r[6] - r[2] * r[5], cy = r[2] * r[4] - r[0] * r[6], cz = r[0] * r[5] - r[1] * r[4];
+		const bool  neg = cx * r[8] + cy * r[9] + cz * r[10] < 0.0f;
+		nflags = 1 | (flip_y ? 2 : 0) | (neg ? 4 : 0);
+	}
+	if (normals != g_gtao.normals_logged) {
+		g_gtao.normals_logged = normals;
+		std::printf("GTAO: normals from %s\n", normals ? "the G-buffer (layer 3, oct 8:8, world)" : "depth");
+		std::fflush(stdout);
+	}
 	{
 		static bool said = false;
 		if (!said) {
 			said = true;
-			std::printf("GTAO: on (level %d, %ux%u, strength %g, radius %g m, bent %g)%s\n", level, g_gtao.trace.width,
-			            g_gtao.trace.height, strength, radius, bent, have_proj ? "" : " (no projection: 60 deg FOV assumed)");
+			std::printf("GTAO: on (level %d, %ux%u, strength %g, radius %g m, thickness %g m, max %g of the height, bent %g)%s\n",
+			            level, g_gtao.trace.width, g_gtao.trace.height, strength, radius, thickness, max_r, bent,
+			            have_proj ? "" : " (no projection: 60 deg FOV assumed)");
 			std::fflush(stdout);
 		}
 	}
@@ -4545,12 +4611,33 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const uint32_t prev = cur ^ 1u;
 	push.misc[1] = static_cast<int32_t>(g_gtao.frame);
 	push.misc[2] = level;
-	push.misc[3] = (inputs.reset ? 1 : 0) | (g_gtao.history_valid ? 2 : 0);
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g_gtao.history_valid ? 2 : 0) | (nflags << 2);
+	if (!g_gtao.dummy_ready) {
+		g_gtao.dummy_ready = true;
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask     = vk::PipelineStageFlagBits2::eNone;
+		barrier.dstStageMask     = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.dstAccessMask    = vk::AccessFlagBits2::eTransferWrite;
+		barrier.oldLayout        = vk::ImageLayout::eUndefined;
+		barrier.newLayout        = vk::ImageLayout::eGeneral;
+		barrier.image            = vk::Image(g_gtao.dummy_image);
+		barrier.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+		vk::ClearColorValue             zero {};
+		zero.uint32 = std::array<uint32_t, 4> {0, 0, 0, 0};
+		const vk::ImageSubresourceRange whole {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.clearColorImage(vk::Image(g_gtao.dummy_image), vk::ImageLayout::eGeneral, &zero, 1, &whole);
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+		       vk::AccessFlagBits2::eShaderRead);
+	}
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_gtao.pipeline);
 	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout,
 	                     const SsgiImage& aux_in, const SsgiImage& aux_out, float step, vk::Extent2D size) {
 		const vk::Sampler       lin = g_gtao.linear, pt = g_gtao.point;
-		vk::DescriptorImageInfo infos[11] {};
+		vk::DescriptorImageInfo infos[12] {};
 		infos[0]  = {lin, color.view, color.layout};
 		infos[1]  = {pt, inputs.depth.view, inputs.depth.layout};
 		infos[2]  = {pt, inputs.motion.view, inputs.motion.layout};
@@ -4562,16 +4649,18 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		infos[8]  = {nullptr, gout.view, vk::ImageLayout::eGeneral};
 		infos[9]  = {pt, aux_in.view, vk::ImageLayout::eGeneral};
 		infos[10] = {nullptr, aux_out.view, vk::ImageLayout::eGeneral};
-		vk::WriteDescriptorSet writes[11] {};
-		for (uint32_t i = 0; i < 11; ++i) {
+		infos[11] = normals ? vk::DescriptorImageInfo {pt, gbuf.views[3], vk::ImageLayout::eShaderReadOnlyOptimal}
+		                    : vk::DescriptorImageInfo {pt, g_gtao.dummy_view, vk::ImageLayout::eGeneral};
+		vk::WriteDescriptorSet writes[12] {};
+		for (uint32_t i = 0; i < 12; ++i) {
 			writes[i].dstBinding      = i;
 			writes[i].descriptorCount = 1;
-			writes[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			writes[i].descriptorType  = i < 7 || (i >= 9 && i != 10) ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
 			writes[i].pImageInfo      = &infos[i];
 		}
 		push.misc[0]  = mode;
 		push.extra[0] = step;
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_gtao.layout, 0, 11, writes);
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_gtao.layout, 0, 12, writes);
 		command.pushConstants(g_gtao.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
@@ -5393,7 +5482,7 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 }
 } // namespace
 
-bool SsrWanted() { return SsrLevel() > 0 || RtReflectionsWanted() || ShineWanted(); }
+bool SsrWanted() { return SsrLevel() > 0 || RtReflectionsWanted() || ShineWanted() || GtaoLevel() > 0; }
 bool SsrPassWanted() { return SsrLevel() > 0; }
 
 void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
