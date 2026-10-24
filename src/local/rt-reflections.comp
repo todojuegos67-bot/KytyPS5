@@ -51,7 +51,8 @@ layout(std430, binding = 18) buffer Frame {
 	vec4 up_view;      // world up in view space
 	vec4 fparams;      // x: 1.0 (the exposure when the game gives none), y: wet surfaces' minimum reflectance,
 	                   // z: the longest ray on screen (render pixels; 0 none), w: the puddle guess's scale
-	vec4 mparams;      // the material field: x, y wet below x, dry above y (roughness units), z its scale
+	vec4 mparams;      // the material roughness: x mirror below, y nothing from (perceptual roughness), z the material's
+	                   // strength scale (refl6)
 	int  calib[];      // see CALIB_* below (calibration sums, then the cumulative stats counters)
 };
 // calib[] layout (ints): [0] samples; [CALIB_NORMAL + ((layer * NLAYOUTS + layout) * 2 + space) * 2 + convention] sum of
@@ -60,7 +61,9 @@ layout(std430, binding = 18) buffer Frame {
 // field sums there, [CALIB_WET + 17] water pixels, then 16 byte field sums there (to find a material field);
 // [STATS + k] cumulative counters, never cleared (1/16 of the pixels: 0 composite pixels (not sky), 1 weight > 0.05,
 // 2 sum of weight * 1000, 3 reflective mask > 0.05, 4 rays traced, 5 ray hits, 6 G-buffer normal used, 7 water,
-// 8 final depth != the G-buffer-time depth by > 2 %, 9 material wet); [CALIB_HIST + field * 16 + bin] byte histograms.
+// 8 final depth != the G-buffer-time depth by > 2 %, 9..12 material roughness (the rougher of the roughness and 1 - gloss
+// fields) < 0.1, 0.1..0.25, 0.25..0.4, >= 0.4, 13..16 the same for the roughness field alone, 17 moving (a character), 18
+// metal > 0.5, 19 weight > 0.05 where the roughness < 0.1); [CALIB_HIST + field * 16 + bin] byte histograms.
 // (The buffer is device-local, copied to a host buffer once a frame: atomics on host memory cross PCIe one by one, which
 // made the composite cost 3-4 ms in the 10-24 b7dd0fe6 build.)
 const int NLAYOUTS     = 13;
@@ -83,9 +86,10 @@ layout(push_constant) uniform Push {
 	vec4  motion;    // motion scale x, y, roughness cutoff, temporal minimum alpha scale
 	ivec4 misc;      // mode, frame, level, flags (1 reset, 2 history valid, 4 camera matrices, 8 up known, 16 row 0 = NDC y +1,
 	                 // 32 checkerboard trace: half the trace pixels march each frame, the others keep their history,
-	                 // 64 the G-buffer-time depth is bound: water detection)
-	ivec4 dec;       // normal code (-1: depth normals), roughness field (-1: heuristic), packed layers, hi-z mip
-	ivec4 misc2;     // exposure index, hi-z levels, max iterations, roughness trusted (1: from the environment)
+	                 // 64 the G-buffer-time depth is bound: water detection, 128 moving objects (characters) skipped)
+	ivec4 dec;       // normal code (-1: depth normals), roughness field (-1: heuristic), packed layers, mode 7: the hi-z mip,
+	                 // else the gloss field (-1 none; its code inverts it: 1 - gloss)
+	ivec4 misc2;     // exposure index, hi-z levels, max iterations, metal field + 1 (0: none, f0 0.04)
 } push;
 
 const float PI  = 3.14159265;
@@ -241,18 +245,34 @@ vec3 NormalAt(vec2 uv, vec3 p) {
 struct Surf {
 	vec3  N;  // shading normal (the G-buffer's when it matches)
 	vec3  Ng; // geometric normal (depth)
-	float rough;
+	float rough;  // the lobe the ray samples (0: a mirror)
+	float prough; // the material's perceptual roughness (Fresnel)
 	float mask;
+	float metal;
+	float water;
 	float gb; // 1: the G-buffer normal was used
 };
-// Reflectivity comes from material data, never from geometry alone (a floor-wide sheen on dry dirt and stone was the
-// previous version's look). Sources, the strongest wins:
+// (refl6) Reflectivity follows the material's roughness per pixel, as light does: smooth surfaces (polished stone,
+// metal, wet floors, water) reflect, rough dry stone does not; walls and metal too, not only floors. Sources:
+//   material: the G-buffer's roughness (L2.b0) and gloss (L1.b2, as 1 - gloss), the rougher of the two (either alone
+//             marked dry stone smooth in the 10-24 logs): full strength and a mirror below mparams.x (0.1), weaker and
+//             blurrier (the GGX lobe widens) up to mparams.y (0.4), nothing from there
 //   water:    the final depth nearer than the depth the deferred lighting read (drawn after the G-buffer), up-facing
-//   material: the roughness field from KYTY_RT_REFLECTIONS_ROUGH (trusted)
-//   guess:    up-facing, very flat, plain, darker than around it (a puddle's look), scaled to a faint at most
-//             (fparams.w, 0.2): only its Fresnel, no minimum reflectance, so it shows at grazing angles at most
-// The geometric factors only scale a source down. The minimum reflectance (fparams.y) is earned by a mask above 0.5:
-// only water and smooth material reach it.
+//             (the only source restricted to floors), a mirror with the minimum reflectance fparams.y
+//   guess:    without a material field only: up-facing, flat, plain, darker than around it, faint (fparams.w, 0 default)
+// The share is a Fresnel (Schlick with roughness; f0 0.04, from the metal field when one is given): a smooth dry stone
+// floor seen from above barely changes, the same floor at a grazing angle mirrors the hall. Moving objects (characters:
+// their motion vector disagrees with the camera's) and the sky never get a reflection.
+float RoughFade(float r) { return 1.0 - smoothstep(mparams.x, mparams.y, r); }
+float LobeRough(float r) { return mparams.y * smoothstep(mparams.x, mparams.y, r); }
+// The material's roughness at a G-buffer pixel (r0: the roughness field alone, for the stats).
+float GbufRough(ivec2 p, out float r0) {
+	r0      = push.dec.y >= 0 ? clamp(Field(push.dec.y, p), 0.0, 1.0) : 1.0;
+	float r = r0;
+	if (push.misc.x != 7 && push.dec.w >= 0) r = max(r, clamp(Field(push.dec.w, p), 0.0, 1.0));
+	return r;
+}
+float GbufMetal(ivec2 p) { return push.misc2.w > 0 ? clamp(Field(push.misc2.w - 1, p), 0.0, 1.0) : 0.0; }
 float UpFacing(vec3 Nd) {
 	if ((push.misc.w & 8) != 0) return smoothstep(0.80, 0.95, dot(Nd, up_view.xyz));
 	return smoothstep(0.80, 0.95, abs(Nd.y));
@@ -310,6 +330,35 @@ vec3 WaterNormal(vec3 Nd) {
 	float c  = dot(Nd, up);
 	return c > 0.97 ? up : normalize(mix(Nd, up, smoothstep(0.85, 0.97, c)));
 }
+// The previous frame's uv of a view-space point through clip -> previous clip (`flip`: the clip's y the other way).
+vec2 PrevUv(vec3 X, bool flip) {
+	vec4 c = Clip(X);
+	if (flip) c.y = -c.y;
+	vec4 p = vec4(dot(clip_prev[0], c), dot(clip_prev[1], c), 0.0, dot(clip_prev[3], c));
+	if (!(abs(p.w) > 1e-8)) return vec2(-10.0);
+	vec2 nd = p.xy / p.w;
+	if (flip) nd.y = -nd.y;
+	nd.y *= YS();
+	return nd * 0.5 + 0.5;
+}
+
+// (refl6) Moving objects: the pixel's motion vector against the camera's own reprojection of its point (both screen y
+// conventions of the previous clip, as the temporal pass); a character the camera follows moves on screen by much less
+// than the camera alone would move it, or the other way round. 1: moving. Needs the camera matrices (misc.w & 4).
+float MovingRaw(vec2 uv, vec3 P) {
+	if ((push.misc.w & 4) == 0) return 0.0;
+	vec2  rs  = RenderSize();
+	vec2  mv  = texelFetch(motion_tex, RenderPixel(uv), 0).xy * push.motion.xy; // (render pixels)
+	vec2  s0  = PrevUv(P, false), s1 = PrevUv(P, true);
+	vec2  e0  = (s0 - uv) * rs - mv, e1 = (s1 - uv) * rs - mv;
+	bool  fl  = dot(e1, e1) < dot(e0, e0);
+	float e   = sqrt(min(dot(e0, e0), dot(e1, e1)));
+	float cam = length(((fl ? s1 : s0) - uv) * rs);
+	if (isnan(e) || isnan(cam)) return 0.0;
+	return smoothstep(2.0, 4.0, e) * smoothstep(0.25, 0.45, e / max(max(length(mv), cam), 1e-3));
+}
+float Moving(vec2 uv, vec3 P) { return (push.misc.w & 128) != 0 ? MovingRaw(uv, P) : 0.0; }
+
 Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	Surf s;
 	vec3 Nd = NormalAt(ruv, P);
@@ -324,27 +373,32 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	s.Ng = Nd;
 	s.gb = match ? 1.0 : 0.0;
 	if (dot(s.N, V) < 0.02) s.N = normalize(s.N + V * (0.02 - dot(s.N, V) + 0.01)); // (back-facing by a little: bent)
-	float mat = 0.0, mat_r = 1.0;
-	if (match && push.dec.y >= 0) {
-		// The material field (roughness units: low = smooth / wet): wet below mparams.x, dry from mparams.y; walls half.
-		float r = clamp(Field(push.dec.y, rp), 0.0, 1.0);
-		mat     = (1.0 - smoothstep(mparams.x, mparams.y, r)) * UpFacing(Nd) * mparams.z; // (refl4: floors only)
-		if (mat > 0.0) mat *= Flatness(ruv, Nd, 0.97, 0.995);
-		mat_r   = mix(0.02, 0.15, smoothstep(0.0, mparams.y, r)); // (wet ground blurrier than water's 0.03)
-		mat    *= mparams.w; // (the wet cap: the CPU scales it down when most of the floor is wet)
+	bool  have_mat = push.dec.y >= 0;
+	float mat = 0.0, mat_r = 1.0, mat_pr = 1.0, metal = 0.0;
+	if (match && have_mat) {
+		float r0;
+		mat_pr = GbufRough(rp, r0);
+		mat    = RoughFade(mat_pr) * mparams.z;
+		mat_r  = LobeRough(mat_pr);
+		metal  = GbufMetal(rp);
 	}
-	float guess = water > 0.0 ? 0.0 : PuddleGuess(ruv, Nd) * fparams.w;
-	s.mask  = max(water, max(mat, guess));
-	s.rough = water >= mat && water >= guess ? 0.0 : mat >= guess ? mat_r : 0.12; // (water: a mirror, no lobe)
-	if (UpFacing(Nd) < 0.5) s.mask = 0.0; // (refl4: never on walls, characters or anything not facing up)
-	if (s.mask < 0.15) s.mask = 0.0; // (refl3: faint wet guesses reflect nothing)
+	float guess = (water > 0.0 || have_mat) ? 0.0 : PuddleGuess(ruv, Nd) * fparams.w;
+	s.mask   = max(water, max(mat, guess));
+	bool wat = water > 0.0 && water >= mat && water >= guess;
+	s.water  = wat ? water : 0.0;
+	s.rough  = wat ? 0.0 : mat >= guess ? mat_r : 0.12; // (water: a mirror, no lobe)
+	s.prough = wat ? 0.0 : mat >= guess ? mat_pr : 0.12;
+	s.metal  = wat ? 0.0 : metal;
+	if (s.mask > 0.0 && Moving(ruv, P) > 0.5) s.mask = 0.0; // (characters: never)
+	if (s.mask < 0.05) s.mask = 0.0;
 	return s;
 }
-// The share of the reflection in the composite (and the trace's early out): Fresnel (Schlick with roughness, f0 0.04)
-// and, for a mask above 0.5 (water, smooth material), the minimum reflectance.
-float Spec(float mask, float rough, float nv) {
-	float fr = 0.04 + (max(1.0 - rough, 0.04) - 0.04) * pow(1.0 - nv, 5.0);
-	return max(fr, fparams.y * smoothstep(0.5, 0.9, mask) * (1.0 - smoothstep(0.1, 0.5, rough)));
+// The share of the reflection in the composite (and the trace's early out): Fresnel (Schlick with roughness; f0 0.04
+// for dielectrics, toward 0.75 for metal) and, on water only, the minimum reflectance.
+float Spec(float rough, float nv, float metal, float water) {
+	float f0 = mix(0.04, 0.75, clamp(metal, 0.0, 1.0));
+	float fr = f0 + (max(1.0 - rough, f0) - f0) * pow(1.0 - nv, 5.0);
+	return max(fr, fparams.y * smoothstep(0.3, 0.8, water));
 }
 
 // ---- Hi-Z ----
@@ -565,7 +619,7 @@ void Trace(ivec2 px, bool march) {
 	vec3 V = normalize(-P);
 	// Early out: the composite's weight (below) would stay under 0.02: no ray, and no reflection downstream.
 	{
-		float west = push.params.x * s.mask * Spec(s.mask, s.rough, clamp(dot(s.N, V), 0.0, 1.0));
+		float west = push.params.x * s.mask * Spec(s.prough, clamp(dot(s.N, V), 0.0, 1.0), s.metal, s.water);
 		if (west < 0.02) {
 			s.mask = 0.0;
 			StoreMiss(px, s);
@@ -601,18 +655,6 @@ void Trace(ivec2 px, bool march) {
 	if (st) Stat(5, 1);
 	imageStore(out_a, px, hc);
 	imageStore(out_c, px, vec4(s.rough, s.mask, hdist, 1));
-}
-
-// The previous frame's uv of a view-space point through clip -> previous clip (`flip`: the clip's y the other way).
-vec2 PrevUv(vec3 X, bool flip) {
-	vec4 c = Clip(X);
-	if (flip) c.y = -c.y;
-	vec4 p = vec4(dot(clip_prev[0], c), dot(clip_prev[1], c), 0.0, dot(clip_prev[3], c));
-	if (!(abs(p.w) > 1e-8)) return vec2(-10.0);
-	vec2 nd = p.xy / p.w;
-	if (flip) nd.y = -nd.y;
-	nd.y *= YS();
-	return nd * 0.5 + 0.5;
 }
 
 void Temporal(ivec2 px) {
@@ -813,7 +855,23 @@ void Composite(ivec2 px) {
 		float z0 = IsSky(d0) ? FAR : abs(ViewZ(d0));
 		if (abs(z0 - z) > 0.02 * z) Stat(8, 1);
 	}
-	if (st && match && push.dec.y >= 0 && Field(push.dec.y, px) < mparams.x) Stat(9, 1);
+	// (refl6) The material at this render pixel: roughness (the rougher of the two fields), the roughness field alone,
+	// metal; the per-bucket stats (to tune the fade from the logs).
+	bool  have_mat = push.dec.y >= 0;
+	float rm = 1.0, r0 = 1.0, metal = 0.0;
+	if (match && have_mat) {
+		rm    = GbufRough(px, r0);
+		metal = GbufMetal(px);
+		if (st) {
+			// (Stat sums the active lanes into one counter: one call per bucket, every lane)
+			Stat(9, rm < 0.1 ? 1 : 0), Stat(10, rm >= 0.1 && rm < 0.25 ? 1 : 0), Stat(11, rm >= 0.25 && rm < 0.4 ? 1 : 0);
+			Stat(12, rm >= 0.4 ? 1 : 0);
+			Stat(13, r0 < 0.1 ? 1 : 0), Stat(14, r0 >= 0.1 && r0 < 0.25 ? 1 : 0), Stat(15, r0 >= 0.25 && r0 < 0.4 ? 1 : 0);
+			Stat(16, r0 >= 0.4 ? 1 : 0);
+			Stat(18, metal > 0.5 ? 1 : 0);
+		}
+	}
+	if (st) Stat(17, MovingRaw(uv, P) > 0.5 ? 1 : 0);
 	vec4 rf, ax;
 	if (all(equal(ivec2(TraceSize()), ivec2(RenderSize())))) {
 		rf = texelFetch(src_a, px, 0);
@@ -828,13 +886,22 @@ void Composite(ivec2 px) {
 	}
 	if (st && mask > 0.05) Stat(3, 1);
 	float water = WaterMask(px, d, uv, Nd);
-	// (refl4) Final gate per render pixel: only up-facing surfaces (the trace's mask is upsampled from half resolution
-	// and could bleed onto a character standing on water).
-	float upg = UpFacing(Nd);
-	if (upg <= 0.0) { imageStore(out_a, px, col); return; }
-	mask *= upg;
+	// (refl6) Final gate per render pixel (the trace's mask is upsampled from half resolution and could bleed onto a
+	// character or a rough neighbour): water (up-facing by its own mask), else this pixel's own material roughness, else
+	// (no material field) the up-facing guess; never on moving objects.
+	float fr_rough = rm;
+	if (water > 0.0) {
+		fr_rough = 0.0, metal = 0.0;
+		N        = WaterNormal(Nd); // (the G-buffer holds the bed under the water)
+	} else if (have_mat) {
+		mask = match ? min(mask, RoughFade(rm) * mparams.z) : 0.0;
+	} else {
+		mask *= UpFacing(Nd);
+		fr_rough = 0.12;
+	}
+	if (mask > 0.0 && Moving(uv, P) > 0.5) mask = 0.0;
+	if (mask < 0.01) { imageStore(out_a, px, col); return; }
 	if (st && mask > 0.5 && water > 0.5) Stat(7, 1);
-	if (water > 0.0) N = WaterNormal(Nd); // (the G-buffer holds the bed under the water)
 	// (refl3) Water and near-mirrors with a half-resolution trace: their own mirror ray at the render resolution, so
 	// the reflection keeps every pixel of detail (the upsampled, filtered one is the fallback where it finds nothing).
 	if (rough < 0.04 && mask > 0.3 && !all(equal(ivec2(TraceSize()), ivec2(RenderSize())))) {
@@ -860,7 +927,7 @@ void Composite(ivec2 px) {
 	if (dot(N, V) < 0.02) N = normalize(N + V * (0.02 - dot(N, V) + 0.01));
 	float NoV   = clamp(dot(N, V), 0.0, 1.0);
 	// (the confidence through a square root: a 60 % hit rate averaged in should not cut the reflection to 60 %)
-	float w     = push.params.x * mask * sqrt(clamp(rf.a, 0.0, 1.0)) * Spec(mask, rough, NoV);
+	float w     = push.params.x * mask * sqrt(clamp(rf.a, 0.0, 1.0)) * Spec(fr_rough, NoV, metal, water);
 	// The game's own highlights (lights, emissives: far brighter than what a screen-space ray can find) stay.
 	float lc = Luma(max(col.rgb, vec3(0))), lr = Luma(refl);
 	w *= 1.0 - smoothstep(4.0, 12.0, lc / max(lr, lc * 1e-4 + 1e-30));
@@ -872,6 +939,7 @@ void Composite(ivec2 px) {
 	if (lr < lc) w = min(w, MaxDarken * lc / max(lc - lr, 1e-30));
 	if (st) {
 		if (w > 0.05) Stat(1, 1);
+		if (w > 0.05 && match && have_mat && rm < 0.1) Stat(19, 1);
 		Stat(2, int(w * 1000.0));
 	}
 	vec3 outc = mix(col.rgb, refl, w);
