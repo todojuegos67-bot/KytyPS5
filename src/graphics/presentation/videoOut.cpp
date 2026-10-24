@@ -1787,6 +1787,14 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	r.cfg->mutex.Unlock();
 
 	NoteFlipSubmitted(r.submit_time);
+	if (Graphics::AntiLag::OwnLowLatencyOn()) {
+		// KYTY_LOWLAT_PACE_BEFORE_INPUT: the configured cap of a game-view frame (never a movie, menu, cinematic, loading
+		// screen, or FG pacing's own release), else 0 (the pacing off).
+		const bool capped = r.frame != nullptr && !scene_free && !fg_off && !s_fg_paced && !MoviePlaying() && !CinematicPlaying() &&
+		                    Graphics::Presenter::IsSceneFrame(*r.frame) && Graphics::Presenter::IsGameView(*r.frame) &&
+		                    (FlipFpsFloor() > 0 || g_dyn_flip_floor.load(std::memory_order_relaxed) > 0) && floor > 0;
+		Graphics::AntiLag::SetPaceCap(capped ? 1000.0 * static_cast<double>(floor + 1) / vblank_hz : 0.0, 1000.0 / vblank_hz);
+	}
 	Graphics::AntiLag::OnFlipReleased(r.latency_index); // KYTY_LOWLAT pacing / [lat] stages
 	Graphics::Presenter::SetLatencyIndex(*r.frame, r.latency_index);
 	m_presenter.Submit(*r.frame);

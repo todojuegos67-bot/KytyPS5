@@ -46,6 +46,9 @@ void OnInput();
 // and the [lat] stages line.
 void OnFlipReady(uint64_t frame_index);
 void OnFlipReleased(uint64_t frame_index);
+// Before OnFlipReleased: the configured release interval of that frame (the cap: KYTY_FLIP_FPS / the vblank floor, ms)
+// when it is a game-view frame under a cap, else 0 (movie, menu, cinematic, loading, no cap: the pacing is off).
+void SetPaceCap(double cap_ms, double vblank_ms);
 // Right before the frame's present (a new frame, not a repeat): its PRESENT mark.
 void OnPresent(uint64_t frame_index);
 

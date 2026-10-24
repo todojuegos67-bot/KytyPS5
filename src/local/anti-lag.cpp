@@ -267,44 +267,71 @@ StageStamp* StageFor(uint64_t index) {
 	return s.index.load(std::memory_order_acquire) == index ? &s : nullptr;
 }
 
-// Reflex-style sleep before the input sample: the cap (KYTY_FLIP_FPS / the vblank floor) releases a flip at a fixed
-// interval; a game faster than that runs ahead and its frames wait in the flip queue (2 frames, ~67 ms at 30 fps).
-// Here, at the first controller read of frame `index`, the game's thread sleeps until (release of frame index - k) +
-// k x interval - lead, lead = the measured input -> GPU done of recent frames + a margin: the frame is sampled as late
-// as still lets it be ready for its release slot. Nothing waits on the GPU or a lock here; at most one interval.
+// Reflex-style sleep before the input sample: the cap (KYTY_FLIP_FPS, a whole number of vblanks) releases a game-view
+// flip at most every `cap` ms; a game faster than that ran ahead and its frames waited in the flip queue (2 frames,
+// ~67 ms at 30 fps). Here, at the first controller read of frame `index`, the game's thread sleeps until
+// (release of frame index - 1) + cap - (lead + margin), lead = the measured input -> GPU done.
+//  - The interval is the configured cap (videoOut's floor for this frame, SetPaceCap), never a measured one (that
+//    drifted to 39 ms: every late frame made the next sleep longer, 20261024-072608).
+//  - Only own low latency: never with Reflex / Anti-Lag 2 / the limiter, Streamline (DLSS-G) or our frame generation,
+//    and only while game-view frames under a cap are being flipped (no movie, menu, cinematic, loading screen).
+//  - A late frame (released over half a vblank after its slot) grows the margin by 2 ms (max 16) and turns the sleep
+//    off for the next 8 frames; the margin comes back down by 0.05 ms per frame on time (no fps lost to the pacer).
+struct PaceCap {
+	double   cap_ms    = 0.0; // the configured interval of the frame just released (0: no pacing)
+	double   vblank_ms = 0.0;
+	double   margin    = 0.0; // the adaptive margin, ms (from Own().margin)
+	uint32_t skip      = 0;   // frames left without a sleep after a late one
+	uint32_t misses    = 0;   // late frames this window (the [lat] line)
+};
+PaceCap g_pace; // under g_pace_mutex
+
+bool PaceAllowed() {
+	return Own().pace && g_mode.load(std::memory_order_relaxed) == Mode::Off && !FrameGen::StreamlineLoaded() &&
+	       !FrameGen::Enabled();
+}
+
 void PaceBeforeInput(uint64_t index) {
+	if (!PaceAllowed()) return;
 	const double per_ms = LatTicksPerMs();
 	std::unique_lock lock(g_pace_mutex);
-	const double iv   = g_pace_iv;
-	const double lead = g_pace_lead > 0.0 ? g_pace_lead + Own().margin : 0.0;
-	if (iv < 4.0 || iv > 70.0 || lead <= 0.0 || g_rel_index == 0) return;
-	if (static_cast<double>(LatNow() - g_rel_ticks) / per_ms > 200.0) return; // (a pause, a loading screen)
-	const int k = std::clamp(static_cast<int>(std::ceil(lead / iv)), 1, 3);
-	g_pace_k.store(k, std::memory_order_relaxed);
-	if (index <= static_cast<uint64_t>(k)) return;
-	const uint64_t target = index - static_cast<uint64_t>(k);
-	if (g_rel_index < target) {
-		g_pace_cond.wait_for(lock, std::chrono::microseconds(static_cast<int64_t>(std::min(iv * 2.0 + 10.0, 80.0) * 1000.0)),
-		                     [target] { return g_rel_index >= target; });
-		if (g_rel_index < target) return;
-	}
-	const auto* st = StageFor(target);
-	if (st == nullptr) return;
-	const int64_t rel = st->release.load(std::memory_order_relaxed);
+	const double cap  = g_pace.cap_ms;
+	if (g_pace.margin <= 0.0) g_pace.margin = Own().margin;
+	const double lead = g_pace_lead > 0.0 ? g_pace_lead + g_pace.margin : 0.0;
+	g_pace_iv         = cap;
+	g_pace_k.store(1, std::memory_order_relaxed);
+	if (cap < 4.0 || cap > 70.0 || lead <= 0.0 || g_rel_index == 0 || index < 2) return;
+	if (g_pace.skip > 0) return; // (a late frame: no sleep for a while)
+	// Only right after the previous frame's release (a frame still queued: the game is behind, no sleep).
+	if (g_rel_index + 1 != index) return;
+	const int64_t rel = g_rel_ticks;
 	lock.unlock();
-	if (rel == 0) return;
-	const int64_t deadline = rel + static_cast<int64_t>((k * iv - lead) * per_ms);
-	const int64_t start    = LatNow();
-	double        wait_ms  = static_cast<double>(deadline - start) / per_ms;
-	if (wait_ms <= 0.0) return;
-	wait_ms = std::min(wait_ms, iv);
-	const int64_t until = start + static_cast<int64_t>(wait_ms * per_ms);
+	const int64_t now     = LatNow();
+	const double  since   = static_cast<double>(now - rel) / per_ms;
+	if (since > cap) return; // (a pause, a loading screen, or already late)
+	// Wake by the slot - lead - margin, never later than leaves lead + margin before the slot.
+	double wait_ms = cap - since - lead;
+	if (wait_ms <= 0.5) return;
+	wait_ms             = std::min(wait_ms, cap - lead);
+	const int64_t until = now + static_cast<int64_t>(wait_ms * per_ms);
 	if (wait_ms > 1.5) std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>((wait_ms - 1.0) * 1000.0)));
 	while (LatNow() < until) std::this_thread::yield();
 	g_pace_slept_sum.store(g_pace_slept_sum.load(std::memory_order_relaxed) + wait_ms, std::memory_order_relaxed);
 	g_pace_slept_n.fetch_add(1, std::memory_order_relaxed);
 }
 } // namespace
+
+void SetPaceCap(double cap_ms, double vblank_ms) {
+	if (!Own().pace) return;
+	std::lock_guard lock(g_pace_mutex);
+	if (cap_ms <= 0.0) { // (not a capped game-view frame: off, and start over)
+		g_pace.cap_ms = 0.0;
+		g_pace.skip   = 8;
+		return;
+	}
+	g_pace.cap_ms    = cap_ms;
+	g_pace.vblank_ms = vblank_ms;
+}
 
 void OnFlipReady(uint64_t frame_index) {
 	auto* st = StageFor(frame_index);
@@ -315,10 +342,10 @@ void OnFlipReady(uint64_t frame_index) {
 	const int64_t in = st->input.load(std::memory_order_relaxed);
 	if (in == 0 || now <= in) return;
 	const double sample = static_cast<double>(now - in) / LatTicksPerMs();
-	if (sample > 200.0) return;
+	if (sample > 100.0) return;
 	std::lock_guard lock(g_pace_mutex);
 	if (g_pace_lead <= 0.0) g_pace_lead = sample;
-	else g_pace_lead += (sample - g_pace_lead) * (sample > g_pace_lead ? 0.5 : 0.1); // up fast, down slowly
+	else g_pace_lead += (sample - g_pace_lead) * (sample > g_pace_lead ? 0.5 : 0.05); // up fast, down slowly
 }
 
 void OnFlipReleased(uint64_t frame_index) {
@@ -328,9 +355,18 @@ void OnFlipReleased(uint64_t frame_index) {
 	st->release.store(now, std::memory_order_relaxed);
 	{
 		std::lock_guard lock(g_pace_mutex);
-		if (g_rel_index != 0 && frame_index == g_rel_index + 1) {
-			const double dt = static_cast<double>(now - g_rel_ticks) / LatTicksPerMs();
-			if (dt > 0.0 && dt < 100.0) g_pace_iv = g_pace_iv <= 0.0 ? dt : g_pace_iv + (dt - g_pace_iv) * 0.1;
+		if (g_pace.margin <= 0.0) g_pace.margin = Own().margin;
+		if (g_rel_index != 0 && frame_index == g_rel_index + 1 && g_pace.cap_ms > 0.0) {
+			const double dt   = static_cast<double>(now - g_rel_ticks) / LatTicksPerMs();
+			const bool   late = dt > g_pace.cap_ms + g_pace.vblank_ms * 0.5 && dt < 200.0;
+			if (late) {
+				g_pace.margin = std::min(g_pace.margin + 2.0, 16.0);
+				g_pace.skip   = 8;
+				g_pace.misses++;
+			} else {
+				if (g_pace.skip > 0) g_pace.skip--;
+				g_pace.margin = std::max(g_pace.margin - 0.05, Own().margin);
+			}
 		}
 		if (frame_index > g_rel_index) {
 			g_rel_index = frame_index;
@@ -483,17 +519,21 @@ void OnPresented(uint64_t frame_index) {
 			const double d   = static_cast<double>(g_lat.st_n);
 			const uint32_t sn = g_pace_slept_n.exchange(0, std::memory_order_relaxed);
 			const double   ss = g_pace_slept_sum.exchange(0.0, std::memory_order_relaxed);
-			double         lead = 0.0, iv = 0.0;
+			double         lead = 0.0, iv = 0.0, margin = 0.0;
+			uint32_t       misses = 0;
 			{
 				std::lock_guard pl(g_pace_mutex);
-				lead = g_pace_lead;
-				iv   = g_pace_iv;
+				lead   = g_pace_lead;
+				iv     = g_pace.cap_ms;
+				margin = g_pace.margin;
+				misses = g_pace.misses;
+				g_pace.misses = 0;
 			}
 			std::printf("[lat] stages: input->submit %.1f ms, submit->gpu done %.1f, gpu done->flip %.1f, flip->present %.1f "
-			            "(n %u); pace %s: sleep %.1f ms (n %u), lead %.1f + %.1f, interval %.1f, k %d\n",
+			            "(n %u); pace %s: sleep %.1f ms (n %u), lead %.1f + margin %.1f, cap %.1f, late %u\n",
 			            g_lat.st_sum[0] / d, g_lat.st_sum[1] / d, g_lat.st_sum[2] / d, g_lat.st_sum[3] / d, g_lat.st_n,
-			            Own().pace ? "on" : "off", sn > 0 ? ss / sn : 0.0, sn, lead, Own().margin, iv,
-			            g_pace_k.load(std::memory_order_relaxed));
+			            !Own().pace ? "off" : (PaceAllowed() && iv > 0.0 ? "on" : "idle"), sn > 0 ? ss / sn : 0.0, sn, lead,
+			            margin, iv, misses);
 			std::fflush(stdout);
 		}
 	}
@@ -556,7 +596,7 @@ void OnInput() {
 		ReflexMarker(VK_LATENCY_MARKER_SIMULATION_START_NV, index);
 		ReflexMarker(VK_LATENCY_MARKER_INPUT_SAMPLE_NV, index);
 	}
-	if (Own().pace) PaceBeforeInput(index); // KYTY_LOWLAT_PACE_BEFORE_INPUT: sleep before the sample, not after
+	PaceBeforeInput(index); // KYTY_LOWLAT_PACE_BEFORE_INPUT: sleep before the sample, not after
 	{
 		auto& st = g_stage[index % kStageRing];
 		st.index.store(0, std::memory_order_release);
