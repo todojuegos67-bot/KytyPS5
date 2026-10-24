@@ -1,537 +1,334 @@
-name: Build and Release brunoKytyPs5
+name: Build KytyPS5 (Windows)
 
-# Releases are cut by hand (Actions > Build and Release brunoKytyPs5 > Run workflow), so only work
-# has been chosen for publishing is released, and pushes cost no build minutes.
+# This branch (bruno-astro, 10-25): brunoKytyPs5 0.5.5 (its license bypass removed) with the todojuegos67-bot features, for ASTRO BOT;
+# the same steps as the fork's other branches, the Build and Package steps adjusted to brunoKytyPs5's tree (no
+# kyty_shader_precompile, no Demon's Souls launcher; its assets and _Patches packaged).
+# This fork's Windows build (Demon's Souls, see README.md): a manual run (Actions > Build KytyPS5 (Windows) >
+# Run workflow) or a pushed v* tag builds the release package and publishes it as a GitHub release, marked
+# latest (README.md links to the latest one). Pushes build nothing.
 on:
+  push:
+    tags: [ 'v*' ]
+    # This fork: every push to the shaders branch builds it.
+    branches: [ shaders ]
   workflow_dispatch:
     inputs:
-      publish:
-        description: "Publish the build as a release (off: only build, test and keep the artifact)"
+      pgo_generate:
+        description: 'Instrumented build for a PGO training run (the live command `pgo <file>` writes the profile)'
         type: boolean
-        default: true
+        default: false
+      ffx_mfg:
+        description: 'FSR 3 frame generation x3: build amd_fidelityfx_vk.dll from the patched SDK (always on the fg/x3 branch)'
+        type: boolean
+        default: false
+      publish:
+        description: 'Publish the release (not a draft) and mark it as the latest'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  SCCACHE_GHA_ENABLED: "true"
-  # Official (release-tagged) builds only in the public brunoKytyPs5 repository; copies build as forks.
-  KYTY_BUILD_ORIGIN: ${{ github.repository == 'serbru20066666/brunoKytyPs5' && 'Official' || 'Fork' }}
-  KYTY_BUILD_REPOSITORY: ${{ github.repository }}
-
 jobs:
-  metadata:
-    name: Prepare build metadata
-    runs-on: ubuntu-latest
-    outputs:
-      release_tag: ${{ steps.release_tag.outputs.value }}
-
-    steps:
-      - name: Generate release tag
-        id: release_tag
-        shell: bash
-        run: |
-          echo "value=brunoKytyPs5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-
   windows:
-    name: Build KytyPS5 (Windows)
-    needs: metadata
+    name: Build (Windows x64)
     runs-on: windows-2022
+    outputs:
+      package: ${{ steps.name.outputs.package }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Setup Visual Studio environment
-        uses: ilammy/msvc-dev-cmd@v1
+      - name: Package name
+        id: name
+        shell: pwsh
+        run: |
+          $name = if ($env:GITHUB_REF_TYPE -eq 'tag') { "KytyPS5-$env:GITHUB_REF_NAME" } else {
+            "KytyPS5-$((Get-Date).ToUniversalTime().ToString('yyyyMMdd'))-$($env:GITHUB_SHA.Substring(0, 8))" }
+          if ('${{ inputs.pgo_generate }}' -eq 'true') { $name = "$name-pgogen" }
+          if ($env:GITHUB_REF_NAME -eq 'fsr3-prueba') { $name = "$name-fsr3" }
+          if ($env:GITHUB_REF_NAME -in @('dlss-prueba','dlssg-decouple','dlss-release','lowmem-16gb','merge-1016','upscale','merge-1019','upstream-1023','combined-1023','ownlat-1023','warp-1023','rtshadow-1023','rtrefl-1023','rtall-1023','bruno-astro-1025','astro-1024','spot5-1024','spot4-1024','spot3-1024','lat3-1024','combo13-1024','combo12-1024','combo11-1024','spot2-1024','refl4-1024','rtsart-1024','combo10-1024','combo9-1024','combo8-1024','combo7-1024','combo6-1024','combo5-1024','ram4-1024','ssgi3-1024','refl3-1024','rtsfix-1024','shine3-1024','combo4-1024','combo3-1024','godfix-1024','combo2-1024','pad-1024','combo-1024','upstream2-1024','ao-1023','godrays-1023','lat2-1023','shine-1023','mouse-1023','dist-1023','puddle-1023','lat-1023','ram2-1023','ram1-1023','rtshadow2-1023','rtrefl2-1023')) { $name = "$name-dlss" }
+          if ($env:GITHUB_REF_NAME -eq 'fg/x3') { $name = "$name-fgx3" }
+          "package=$name" >> $env:GITHUB_OUTPUT
 
+      # The tested compiler (LLVM 23.1.2 crashed compiling agc.cpp; others are untested).
+      - name: Install LLVM 19.1.7
+        shell: pwsh
+        run: choco upgrade llvm --version=19.1.7 --allow-downgrade --no-progress -y
+
+      # glslangValidator: the runner has no Vulkan SDK.
       - name: Locate vcpkg
         id: vcpkg
         shell: pwsh
         run: |
-          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
-          $portHash = (Get-FileHash "$vcpkgRoot\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash
-          "root=$vcpkgRoot" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "port_hash=$($portHash.ToLowerInvariant())" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $root = Split-Path (Get-Command vcpkg).Source
+          $hash = (Get-FileHash "$root\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "root=$root" >> $env:GITHUB_OUTPUT
+          "port_hash=$hash" >> $env:GITHUB_OUTPUT
 
       - name: Cache glslang
-        id: glslang_cache
+        id: glslang
         uses: actions/cache@v4
         with:
           path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
-          key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
+          key: glslang-${{ runner.os }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
 
       - name: Install glslang
         shell: pwsh
         run: |
-          $vcpkgRoot = "${{ steps.vcpkg.outputs.root }}"
-          if ("${{ steps.glslang_cache.outputs.cache-hit }}" -ne "true") {
-            vcpkg install glslang[tools,opt]:x64-windows
-          }
-          "$vcpkgRoot\installed\x64-windows\tools\glslang" |
-            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          if ('${{ steps.glslang.outputs.cache-hit }}' -ne 'true') { vcpkg install 'glslang[tools,opt]:x64-windows' }
+          "${{ steps.vcpkg.outputs.root }}\installed\x64-windows\tools\glslang" >> $env:GITHUB_PATH
 
-      - name: Install Qt 6.10.3
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.10.3"
-          host: windows
-          target: desktop
-          arch: win64_msvc2022_64
-          cache: true
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-
-      - name: Verify toolchain
-        shell: cmd
+      # PGO training runs (tools/pgo/raw/*.profraw, written by an instrumented build of this source with the live
+      # command `pgo <file>` while playing) merged into the release profile, weighted over the older one: the
+      # functions changed since it was trained get their profile back. The merged profile goes into the package
+      # (kyty.profdata) to be committed as tools/pgo/kyty.profdata.
+      - name: PGO profile
+        if: ${{ inputs.pgo_generate != true && hashFiles('tools/pgo/kyty.profdata') != '' }}
+        shell: pwsh
         run: |
-          git --version
-          cmake --version
-          ninja --version
-          clang-cl --version
-          glslangValidator --version
-          echo Qt6_DIR=%Qt6_DIR%
+          $raw = @(Get-ChildItem tools\pgo\raw\*.profraw -ErrorAction SilentlyContinue)
+          if ($raw.Count -eq 0) { 'no training runs: tools\pgo\kyty.profdata as it is'; exit 0 }
+          $profdata = 'C:\Program Files\LLVM\bin\llvm-profdata.exe'
+          $inputs = @('--weighted-input=1,tools\pgo\kyty.profdata') + ($raw | ForEach-Object { "--weighted-input=4,$($_.FullName)" })
+          & $profdata merge -o tools\pgo\kyty-merged.profdata @inputs
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & $profdata show tools\pgo\kyty-merged.profdata | Select-Object -First 6
+          Move-Item -Force tools\pgo\kyty-merged.profdata tools\pgo\kyty.profdata
 
-      - name: Configure
-        shell: cmd
+      # AMD FidelityFX API, FSR 3.1.4 frame generation (src/local/fsr3-fg.cpp, KYTY_FSR3_FG): AMD's prebuilt,
+      # signed amd_fidelityfx_vk.dll (MIT license) from the SDK's v1.1.4 tag, packaged next to the emulator.
+      - name: FidelityFX DLL
+        if: ${{ inputs.ffx_mfg != true && github.ref_name != 'fg/x3' }}
+        shell: pwsh
         run: |
-          cmake -S . -B _Build/windows ^
-            -G Ninja ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
-            -DKYTY_BUILD_ORIGIN=%KYTY_BUILD_ORIGIN% ^
-            -DKYTY_BUILD_REPOSITORY=%KYTY_BUILD_REPOSITORY% ^
-            -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
-            -DCMAKE_C_COMPILER=clang-cl ^
-            -DCMAKE_CXX_COMPILER=clang-cl ^
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          New-Item -ItemType Directory -Force _Build\deps\ffx | Out-Null
+          $base = 'https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v1.1.4'
+          Invoke-WebRequest "$base/PrebuiltSignedDLL/amd_fidelityfx_vk.dll" -OutFile _Build\deps\ffx\amd_fidelityfx_vk.dll
+          Invoke-WebRequest "$base/LICENSE.txt" -OutFile _Build\deps\ffx\FidelityFX-LICENSE.txt
+          Get-ChildItem _Build\deps\ffx | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.Name }
 
-      - name: Build
-        shell: cmd
-        run: |
-          cmake --build _Build/windows --target launcher ^
-            audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
-            shader_recompiler_compute_tests ^
-            resource_tracking_tests scalar_provenance_tests ^
-            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
-
-      - name: Test
-        shell: cmd
-        run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
-
-      - name: Install
-        shell: cmd
-        run: |
-          cmake --install _Build/windows --prefix _Build/windows/install
-
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: KytyPS5-Windows-x64
-          path: _Build/windows/install/**
-          if-no-files-found: error
-
-  macos:
-    name: Build KytyPS5 (macOS)
-    # This fork is developed and tested on Windows only.
-    if: false
-    needs: metadata
-    runs-on: macos-15
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Select Xcode 26
-        shell: bash
-        run: |
-          xcode_path="$(ls -d /Applications/Xcode_26*.app | tail -n 1)"
-          test -n "$xcode_path"
-          sudo xcode-select --switch "$xcode_path/Contents/Developer"
-          xcodebuild -version
-
-      - name: Install build dependencies
-        shell: bash
-        run: brew install glslang
-
-      - name: Install Qt 6.10.3
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.10.3"
-          host: mac
-          target: desktop
-          arch: clang_64
-          cache: true
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-
-      - name: Verify toolchain
-        shell: bash
-        run: |
-          git --version
-          cmake --version
-          ninja --version
-          clang++ --version
-          glslangValidator --version
-          echo "Host architecture: $(uname -m)"
-          echo "QT_ROOT_DIR=$QT_ROOT_DIR"
-
-      - name: Configure
-        shell: bash
-        run: |
-          cmake -S . -B _Build/macos \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
-            -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
-            -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
-            -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
-
-      - name: Build
-        shell: bash
-        run: |
-          cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
-              memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
-              resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
-            --parallel
-
-      - name: Test
-        shell: bash
-        run: |
-          ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
-
-      - name: Install
-        shell: bash
-        run: |
-          cmake --install _Build/macos --prefix _Build/macos/install
-
-      - name: Bundle MoltenVK
-        shell: bash
+      # FSR 3 frame generation x3 (KYTY_FSR3_FG_FRAMES=2): the same SDK tag built from source with
+      # tools/local/fsr3-mfg/ffx-sdk-v1.1.4-mfg.patch (interpolation factor t in the frame interpolation shaders, N
+      # generated frames per real frame in the Vulkan frame generation swapchain). Unsigned; replaces AMD's DLL.
+      # Needs the Vulkan SDK (headers + vulkan-1.lib, >= 1.3.250); shaders use the SDK's own FidelityFX_SC/glslang.
+      - name: FidelityFX DLL (patched, multi frame generation)
+        if: ${{ inputs.ffx_mfg == true || github.ref_name == 'fg/x3' }}
+        shell: pwsh
         env:
-          MOLTENVK_VERSION: v1.4.2
-          MOLTENVK_SHA256: f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
+          VULKAN_VERSION: 1.3.296.0
         run: |
-          archive="$RUNNER_TEMP/MoltenVK-macos.tar"
-          package="$RUNNER_TEMP/MoltenVK"
-          install_dir="_Build/macos/install"
-          app_dir="$install_dir/KytyPS5.app"
-          moltenvk="$install_dir/libMoltenVK.dylib"
-          curl --fail --location --retry 3 \
-            --output "$archive" \
-            "https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_VERSION/MoltenVK-macos.tar"
-          echo "$MOLTENVK_SHA256  $archive" | shasum -a 256 --check
-          tar -xf "$archive" -C "$RUNNER_TEMP"
-          test -d "$app_dir"
-          install -m 755 \
-            "$package/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib" \
-            "$moltenvk"
-          install -m 644 "$package/LICENSE" "$install_dir/LICENSE.MoltenVK"
-          codesign --force --sign - --timestamp=none "$moltenvk"
-          install -d -m 755 "$app_dir/Contents/Frameworks" "$app_dir/Contents/Resources"
-          install -m 755 "$moltenvk" "$app_dir/Contents/Frameworks/libMoltenVK.dylib"
-          install -m 644 "$package/LICENSE" "$app_dir/Contents/Resources/LICENSE.MoltenVK"
-          codesign --force --sign - --timestamp=none "$app_dir"
+          $vk = "C:\VulkanSDK\$env:VULKAN_VERSION"
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/VulkanSDK-$env:VULKAN_VERSION-Installer.exe" -OutFile "$env:RUNNER_TEMP\vksdk.exe"
+          Start-Process -Wait -FilePath "$env:RUNNER_TEMP\vksdk.exe" -ArgumentList '--root', $vk, '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+          if (!(Test-Path "$vk\Lib\vulkan-1.lib")) { Get-ChildItem $vk -ErrorAction SilentlyContinue; throw 'Vulkan SDK install failed' }
+          $env:VULKAN_SDK = $vk
+          $src = "$env:RUNNER_TEMP\ffx"
+          git -c core.autocrlf=false clone --depth 1 --branch v1.1.4 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK $src
+          if ($LASTEXITCODE) { throw 'SDK clone failed' }
+          git -C $src apply --verbose "$env:GITHUB_WORKSPACE\tools\local\fsr3-mfg\ffx-sdk-v1.1.4-mfg.patch"
+          if ($LASTEXITCODE) { throw 'SDK patch failed' }
+          cmake -S "$src\ffx-api" -B "$src\ffx-api\build" -G 'Visual Studio 17 2022' -A x64 -DFFX_API_BACKEND=VK_X64 "-DVulkan_INCLUDE_DIR=$vk\Include" "-DVulkan_LIBRARY=$vk\Lib\vulkan-1.lib"
+          if ($LASTEXITCODE) { throw 'SDK configure failed' }
+          cmake --build "$src\ffx-api\build" --config Release --target amd_fidelityfx_vk --parallel 4 -- /p:CL_MPcount=4 /v:minimal
+          if ($LASTEXITCODE) { throw 'SDK build failed' }
+          New-Item -ItemType Directory -Force _Build\deps\ffx | Out-Null
+          $dll = Get-ChildItem "$src\ffx-api" -Recurse -Filter amd_fidelityfx_vk.dll | Where-Object FullName -notmatch 'PrebuiltSignedDLL' | Select-Object -First 1
+          if (!$dll) { throw 'amd_fidelityfx_vk.dll not built' }
+          Copy-Item $dll.FullName _Build\deps\ffx\amd_fidelityfx_vk.dll
+          Copy-Item "$src\LICENSE.txt" _Build\deps\ffx\FidelityFX-LICENSE.txt
+          Get-ChildItem _Build\deps\ffx | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.Name }
 
-      - name: Verify artifacts
-        shell: bash
+      # NVIDIA Streamline SDK (DLSS Frame Generation, src/local/frame-gen.cpp; the dlss-prueba branch only): downloaded at
+      # build time from NVIDIA's public release, never committed. CMakeLists.txt enables KYTY_FRAMEGEN_STREAMLINE when
+      # _Build/deps/streamline/sdk/include/sl.h exists. Its packages are draft releases (they hold NVIDIA's DLLs).
+      - name: Streamline SDK
+        if: ${{ github.ref_name == 'dlss-prueba' || github.ref_name == 'dlssg-decouple' || github.ref_name == 'dlss-release' || github.ref_name == 'lowmem-16gb' || github.ref_name == 'merge-1016' || github.ref_name == 'upscale' || github.ref_name == 'merge-1019' || github.ref_name == 'release-1023' || github.ref_name == 'combined-1023' || github.ref_name == 'ownlat-1023' || github.ref_name == 'warp-1023' || github.ref_name == 'rtshadow-1023' || github.ref_name == 'rtrefl-1023' || github.ref_name == 'rtall-1023' || github.ref_name == 'bruno-astro-1025' || github.ref_name == 'astro-1024' || github.ref_name == 'spot5-1024' || github.ref_name == 'spot4-1024' || github.ref_name == 'spot3-1024' || github.ref_name == 'lat3-1024' || github.ref_name == 'combo13-1024' || github.ref_name == 'combo12-1024' || github.ref_name == 'combo11-1024' || github.ref_name == 'spot2-1024' || github.ref_name == 'refl4-1024' || github.ref_name == 'rtsart-1024' || github.ref_name == 'combo10-1024' || github.ref_name == 'combo9-1024' || github.ref_name == 'combo8-1024' || github.ref_name == 'combo7-1024' || github.ref_name == 'combo6-1024' || github.ref_name == 'combo5-1024' || github.ref_name == 'ram4-1024' || github.ref_name == 'ssgi3-1024' || github.ref_name == 'refl3-1024' || github.ref_name == 'rtsfix-1024' || github.ref_name == 'shine3-1024' || github.ref_name == 'combo4-1024' || github.ref_name == 'combo3-1024' || github.ref_name == 'godfix-1024' || github.ref_name == 'combo2-1024' || github.ref_name == 'pad-1024' || github.ref_name == 'combo-1024' || github.ref_name == 'upstream2-1024' || github.ref_name == 'ao-1023' || github.ref_name == 'godrays-1023' || github.ref_name == 'lat2-1023' || github.ref_name == 'shine-1023' || github.ref_name == 'mouse-1023' || github.ref_name == 'dist-1023' || github.ref_name == 'puddle-1023' || github.ref_name == 'lat-1023' || github.ref_name == 'ram2-1023' || github.ref_name == 'ram1-1023' || github.ref_name == 'rtshadow2-1023' || github.ref_name == 'rtrefl2-1023' || github.ref_name == 'upstream-1023' || inputs.publish == true }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STREAMLINE_VERSION: v2.14.16
+          DLSS_VERSION: v310.9.16
         run: |
-          install_dir="_Build/macos/install"
-          app_dir="$install_dir/KytyPS5.app"
-          test -d "$app_dir"
-          for binary in \
-            "$install_dir/kyty_emulator" \
-            "$install_dir/libMoltenVK.dylib" \
-            "$app_dir/Contents/MacOS/KytyPS5" \
-            "$app_dir/Contents/MacOS/kyty_emulator" \
-            "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
-            file "$binary"
-            lipo "$binary" -verify_arch x86_64
-          done
-          for binary in \
-            "$install_dir/kyty_emulator" \
-            "$install_dir/libMoltenVK.dylib" \
-            "$app_dir/Contents/MacOS/KytyPS5" \
-            "$app_dir/Contents/MacOS/kyty_emulator" \
-            "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
-            codesign --verify --strict "$binary"
-          done
-          codesign --verify --deep --strict --verbose=2 "$app_dir"
+          $zips = '_Build\deps\streamline-zip'
+          $unpacked = '_Build\deps\streamline-unpacked'
+          New-Item -ItemType Directory -Force $zips, $unpacked | Out-Null
+          gh release download $env:STREAMLINE_VERSION --repo NVIDIA-RTX/Streamline --pattern '*.zip' --dir $zips
+          if ($LASTEXITCODE -or !(Get-ChildItem $zips -Filter *.zip)) {
+            Write-Host 'no release zip; cloning the tag'
+            git lfs install
+            git clone --depth 1 --branch $env:STREAMLINE_VERSION https://github.com/NVIDIA-RTX/Streamline "$unpacked\repo"
+            if ($LASTEXITCODE) { throw 'Streamline clone failed' }
+            git -C "$unpacked\repo" lfs pull
+            $global:LASTEXITCODE = 0
+          }
+          Get-ChildItem $zips -Filter *.zip | ForEach-Object { Write-Host "unpacking $($_.Name)"; Expand-Archive $_.FullName (Join-Path $unpacked $_.BaseName) -Force }
+          $header = Get-ChildItem $unpacked -Recurse -Filter sl.h | Where-Object { $_.Directory.Name -eq 'include' } |
+            Where-Object { Test-Path (Join-Path $_.Directory.Parent.FullName 'bin\x64\sl.interposer.dll') } | Select-Object -First 1
+          if (!$header) { Get-ChildItem $unpacked -Recurse -Depth 3 | ForEach-Object FullName; throw 'no include\sl.h with bin\x64\sl.interposer.dll' }
+          New-Item -ItemType Directory -Force _Build\deps\streamline | Out-Null
+          Move-Item $header.Directory.Parent.FullName _Build\deps\streamline\sdk
+          Get-ChildItem _Build\deps\streamline\sdk\bin\x64 -File | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.Name }
+          # DLSS-G Preset C (KYTY_DLSSG_PRESET=C) needs nvngx_dlssg.dll >= 310.9.16: when Streamline's is older, take
+          # NVIDIA's from the official DLSS SDK release (github.com/NVIDIA/DLSS, redistributable like Streamline's).
+          $dlssg = '_Build\deps\streamline\sdk\bin\x64\nvngx_dlssg.dll'
+          $have = if (Test-Path $dlssg) { [version](Get-Item $dlssg).VersionInfo.FileVersion.Replace(',', '.').Split(' ')[0] } else { [version]'0.0' }
+          Write-Host "Streamline's nvngx_dlssg.dll: $have"
+          if ($have -lt [version]'310.9.16') {
+            git clone --depth 1 --branch $env:DLSS_VERSION --filter=blob:none --sparse https://github.com/NVIDIA/DLSS _Build\deps\dlss
+            if ($LASTEXITCODE) { throw 'DLSS SDK clone failed' }
+            git -C _Build\deps\dlss sparse-checkout set --no-cone /lib/Windows_x86_64/rel/nvngx_dlssg.dll /LICENSE.txt
+            $new = '_Build\deps\dlss\lib\Windows_x86_64\rel\nvngx_dlssg.dll'
+            if (!(Test-Path $new)) { throw 'no nvngx_dlssg.dll in the DLSS SDK' }
+            Copy-Item $new $dlssg -Force
+            Write-Host "nvngx_dlssg.dll from DLSS ${env:DLSS_VERSION}: $((Get-Item $dlssg).VersionInfo.FileVersion)"
+          }
 
-      - name: Package macOS artifacts
-        shell: bash
+      # Intel XeSS SDK (super resolution, src/local/xess-sr.cpp; the upscale branch): its headers and libxess.dll
+      # (Intel's redistributable binary) from Intel's public repository, never committed.
+      - name: XeSS SDK
+        if: ${{ github.ref_name == 'upscale' || github.ref_name == 'merge-1019' || github.ref_name == 'release-1023' || github.ref_name == 'combined-1023' || github.ref_name == 'ownlat-1023' || github.ref_name == 'warp-1023' || github.ref_name == 'rtshadow-1023' || github.ref_name == 'rtrefl-1023' || github.ref_name == 'rtall-1023' || github.ref_name == 'bruno-astro-1025' || github.ref_name == 'astro-1024' || github.ref_name == 'spot5-1024' || github.ref_name == 'spot4-1024' || github.ref_name == 'spot3-1024' || github.ref_name == 'lat3-1024' || github.ref_name == 'combo13-1024' || github.ref_name == 'combo12-1024' || github.ref_name == 'combo11-1024' || github.ref_name == 'spot2-1024' || github.ref_name == 'refl4-1024' || github.ref_name == 'rtsart-1024' || github.ref_name == 'combo10-1024' || github.ref_name == 'combo9-1024' || github.ref_name == 'combo8-1024' || github.ref_name == 'combo7-1024' || github.ref_name == 'combo6-1024' || github.ref_name == 'combo5-1024' || github.ref_name == 'ram4-1024' || github.ref_name == 'ssgi3-1024' || github.ref_name == 'refl3-1024' || github.ref_name == 'rtsfix-1024' || github.ref_name == 'shine3-1024' || github.ref_name == 'combo4-1024' || github.ref_name == 'combo3-1024' || github.ref_name == 'godfix-1024' || github.ref_name == 'combo2-1024' || github.ref_name == 'pad-1024' || github.ref_name == 'combo-1024' || github.ref_name == 'upstream2-1024' || github.ref_name == 'ao-1023' || github.ref_name == 'godrays-1023' || github.ref_name == 'lat2-1023' || github.ref_name == 'shine-1023' || github.ref_name == 'mouse-1023' || github.ref_name == 'dist-1023' || github.ref_name == 'puddle-1023' || github.ref_name == 'lat-1023' || github.ref_name == 'ram2-1023' || github.ref_name == 'ram1-1023' || github.ref_name == 'rtshadow2-1023' || github.ref_name == 'rtrefl2-1023' || github.ref_name == 'upstream-1023' || inputs.publish == true }}
+        shell: pwsh
+        env:
+          XESS_VERSION: v3.0.2
         run: |
-          install_dir="_Build/macos/install"
-          archive="$RUNNER_TEMP/KytyPS5-macOS-x86_64.zip"
-          (
-            cd "$install_dir"
-            zip -qry "$archive" .
-          )
-          unzip -t "$archive"
+          git clone --depth 1 --branch $env:XESS_VERSION https://github.com/intel/xess _Build\deps\xess
+          if ($LASTEXITCODE) { throw 'XeSS clone failed' }
+          if (!(Test-Path _Build\deps\xess\inc\xess\xess_vk.h) -or !(Test-Path _Build\deps\xess\bin\libxess.dll)) { throw 'no xess_vk.h or libxess.dll' }
+          Get-Item _Build\deps\xess\bin\libxess.dll | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.Name }
 
-      - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: KytyPS5-macOS-x86_64
-          path: ${{ runner.temp }}/KytyPS5-macOS-x86_64.zip
-          if-no-files-found: error
-
-  linux:
-    name: Build KytyPS5 (Linux)
-    # This fork is developed and tested on Windows only.
-    if: false
-    needs: metadata
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install build dependencies
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes \
-            clang \
-            glslang-tools \
-            libasound2-dev \
-            libdbus-1-dev \
-            libgl1-mesa-dev \
-            libpulse-dev \
-            libudev-dev \
-            libwayland-dev \
-            libx11-dev \
-            libxcursor-dev \
-            libxext-dev \
-            libxfixes-dev \
-            libxi-dev \
-            libxkbcommon-dev \
-            libxrandr-dev \
-            libxss-dev \
-            libxtst-dev \
-            lld \
-            pkg-config \
-            wayland-protocols
-
-      - name: Install Qt 6.10.3
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.10.3"
-          host: linux
-          target: desktop
-          arch: linux_gcc_64
-          cache: true
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-
-      - name: Verify toolchain
-        shell: bash
-        run: |
-          git --version
-          cmake --version
-          ninja --version
-          clang++ --version
-          ld.lld --version
-          glslangValidator --version
-          echo "Qt6_DIR=$Qt6_DIR"
-
-      - name: Configure
-        shell: bash
-        run: |
-          mkdir -p _Build
-          cmake -S . -B _Build/linux \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
-            -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
-            -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
-            -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
-          exit "${PIPESTATUS[0]}"
-
-      - name: Verify SDL3 backends
-        shell: bash
-        run: |
-          status=0
-          for feature in SDL_ALSA SDL_PULSEAUDIO SDL_WAYLAND SDL_X11 SDL_LIBUDEV SDL_DBUS; do
-            if grep -qE "^--   ${feature} +\\(Wanted: ON\\): ON" _Build/configure.log; then
-              echo "ok   ${feature}"
-            else
-              echo "FAIL ${feature} is not enabled"
-              status=1
-            fi
-          done
-          exit "$status"
-
+      # For other PCs: x86-64-v3 (AVX2), not the runner CPU's -march=native.
       - name: Build
-        shell: bash
+        shell: cmd
+        env:
+          KYTY_CMAKE_ARGS: -DKYTY_MARCH=x86-64-v3 ${{ inputs.pgo_generate == true && '-DKYTY_PGO_GENERATE=ON' || '' }}
         run: |
-          cmake --build _Build/linux \
-            --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
-              resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
-            --parallel
+          call build-windows.cmd kyty_emulator > build.log 2>&1 || (type build.log & exit /b 1)
+          rem (10-23) zarchive.exe: packs the game folder into one .zar the emulator reads directly.
+          call build-windows.cmd zarchive_tool >> build.log 2>&1 || (type build.log & exit /b 1)
+          type build.log
 
-      - name: Test
-        shell: bash
+      - name: Build errors
+        if: failure()
+        shell: pwsh
         run: |
-          ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+          # The compiler's errors as annotations (readable through the API when the log is not).
+          if (Test-Path build.log) {
+            Select-String -Path build.log -Pattern 'error' | Select-Object -First 10 | ForEach-Object {
+              $line = $_.Line -replace '[\r\n]', ' '
+              Write-Output "::error::$line"
+            }
+          }
 
-      - name: Install
-        shell: bash
+      - name: Package
+        shell: pwsh
+        env:
+          PACKAGE: ${{ steps.name.outputs.package }}
         run: |
-          cmake --install _Build/linux --prefix _Build/linux/install
+          $build = '_Build\windows'
+          $out = "_Build\package\$env:PACKAGE"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item "$build\kyty_emulator.exe", "$build\libwinpthread-1.dll", run-windows.ps1, LICENSE $out
+          Copy-Item LICENSES $out -Recurse
+          if (Test-Path "$build\3rdparty\zarchive.exe") { Copy-Item "$build\3rdparty\zarchive.exe" $out }
+          # brunoKytyPs5's assets (trophy sound and image) and its game patches (_Patches\<title id>.json).
+          Copy-Item assets "$out\assets" -Recurse
+          Copy-Item patches "$out\_Patches" -Recurse
+          if (Test-Path metricas.ps1) { Copy-Item metricas.ps1 $out }
+          Copy-Item config "$out\config" -Recurse
+          Copy-Item run-windows.json "$out\launch.json"
+          # The linker map of this exact build: render-thread profiles (live `prof`) are symbolized against it.
+          Get-ChildItem "$build\kyty_emulator_*.map" -ErrorAction SilentlyContinue | Select-Object -First 1 |
+            ForEach-Object { Copy-Item $_.FullName "$out\kyty_emulator.map" }
+          # DLSS Frame Generation (KYTY_FRAMEGEN): Streamline's production DLLs (bin\x64), dlss-prueba builds only.
+          # XeSS super resolution: libxess.dll next to the emulator, with Intel's license.
+          if (Test-Path _Build\deps\xess\bin\libxess.dll) {
+            Copy-Item _Build\deps\xess\bin\libxess.dll $out
+            New-Item -ItemType Directory -Force "$out\LICENSES" | Out-Null
+            Copy-Item _Build\deps\xess\LICENSE.txt "$out\LICENSES\XeSS-LICENSE.txt"
+          }
+          # Una release publica siempre lleva DLSS, DLSS-G (Streamline) y XeSS: sin ellos no se publica.
+          if ('${{ inputs.publish }}' -eq 'true' -and (!(Test-Path _Build\deps\streamline\sdk\bin\x64\sl.interposer.dll) -or !(Test-Path _Build\deps\xess\bin\libxess.dll))) { throw 'publish: Streamline o XeSS no estan; la release no se publica sin ellos' }
+          if (Test-Path _Build\deps\streamline\sdk\bin\x64) {
+            New-Item -ItemType Directory -Force "$out\streamline" | Out-Null
+            Copy-Item _Build\deps\streamline\sdk\bin\x64\*.dll "$out\streamline"
+            Get-ChildItem _Build\deps\streamline\sdk -File | Where-Object Name -match 'license' | Copy-Item -Destination "$out\streamline"
+          }
+          # FSR 3 frame generation (KYTY_FSR3_FG): AMD's FidelityFX API DLL and its license.
+          Copy-Item _Build\deps\ffx\amd_fidelityfx_vk.dll, _Build\deps\ffx\FidelityFX-LICENSE.txt $out
+          # The profile this build was optimized with (merged with the training runs, see "PGO profile").
+          if (Test-Path tools\pgo\kyty.profdata) { Copy-Item tools\pgo\kyty.profdata "$out\kyty.profdata" }
+          # The VC++ runtime next to the exe (Microsoft's redistributable files): nothing to install.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-Item "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" | Where-Object { $_.Parent.Parent.Name -match '^\d+\.' } |
+            Sort-Object { [version]$_.Parent.Parent.Name } | Select-Object -Last 1
+          Copy-Item "$($crt.FullName)\msvcp140*.dll", "$($crt.FullName)\vcruntime140*.dll" $out
+          # Double-click to play or to precompile (PowerShell's script policy would stop the scripts themselves).
+          Set-Content "$out\run.cmd" -Encoding ASCII -Value @(
+            '@echo off',
+            'rem Starts the game; the options are those of run-windows.ps1 (e.g. run.cmd -Fullscreen).',
+            '"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Prompt -Follow %*',
+            'if %errorlevel% neq 0 pause')
+          $root = (Resolve-Path $out).Path
+          Get-ChildItem $out -Recurse -File | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($root.Length + 1) }
 
-      - name: Verify artifacts
-        shell: bash
-        run: |
-          file _Build/linux/install/launcher
-          file _Build/linux/install/kyty_emulator
-          file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
-          ldd _Build/linux/install/kyty_emulator > /dev/null
-          readelf -d _Build/linux/install/launcher | grep -q 'RPATH.*\$ORIGIN/lib'
-          while IFS= read -r -d '' binary; do
-            while read -r dependency; do
-              test -e "_Build/linux/install/lib/$dependency"
-            done < <(
-              readelf -d "$binary" |
-                sed -n 's/.*Shared library: \[\(libQt6[^]]*\|libicu[^]]*\)\].*/\1/p'
-            )
-          done < <(
-            find _Build/linux/install/launcher _Build/linux/install/plugins \
-              -type f \( -name launcher -o -name '*.so' \) -print0
-          )
-          _Build/linux/install/kyty_emulator --help > /dev/null
-
-      - name: Upload Linux artifacts
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Linux-x86_64
-          path: _Build/linux/install/**
+          name: ${{ steps.name.outputs.package }}
+          path: _Build/package/
           if-no-files-found: error
 
   release:
-    name: Release brunoKytyPs5
-    if: >-
-      always() &&
-      github.event_name == 'workflow_dispatch' &&
-      inputs.publish &&
-      github.repository == 'serbru20066666/brunoKytyPs5' &&
-      (needs.windows.result == 'success' ||
-       needs.macos.result == 'success' ||
-       needs.linux.result == 'success')
-    needs: [metadata, windows, macos, linux]
+    name: Publish release
+    needs: windows
+    # Local test branches: the package stays an Actions artifact, nothing is published.
+    if: ${{ github.ref_name != 'dlssg-decouple' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      RELEASE_NAME: ${{ needs.metadata.outputs.release_tag }}
+      PACKAGE: ${{ needs.windows.outputs.package }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
-      - name: Download Windows build
-        if: needs.windows.result == 'success'
+      - name: Download
         uses: actions/download-artifact@v4
         with:
-          name: KytyPS5-Windows-x64
-          path: artifacts/KytyPS5-Windows-x64
+          name: ${{ needs.windows.outputs.package }}
+          path: package
 
-      - name: Download macOS build
-        if: needs.macos.result == 'success'
-        uses: actions/download-artifact@v4
+      - name: Release notes
+        uses: actions/checkout@v4
         with:
-          name: KytyPS5-macOS-x86_64
-          path: artifacts/KytyPS5-macOS-x86_64
+          path: notes
+          sparse-checkout: docs/RELEASE-NOTES.md
+          sparse-checkout-cone-mode: false
 
-      - name: Download Linux build
-        if: needs.linux.result == 'success'
-        uses: actions/download-artifact@v4
-        with:
-          name: KytyPS5-Linux-x86_64
-          path: artifacts/KytyPS5-Linux-x86_64
-
-      - name: Package Windows build
-        if: needs.windows.result == 'success'
+      - name: Publish
         shell: bash
         run: |
-          windows_dir="artifacts/KytyPS5-Windows-x64"
-          test -d "$windows_dir"
-          (
-            cd "$windows_dir"
-            zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-Windows-x64.zip" .
-          )
-
-      - name: Package macOS build
-        if: needs.macos.result == 'success'
-        shell: bash
-        run: |
-          macos_archive="artifacts/KytyPS5-macOS-x86_64/KytyPS5-macOS-x86_64.zip"
-          test -f "$macos_archive"
-          cp "$macos_archive" "$RELEASE_NAME-macOS-x86_64.zip"
-
-      - name: Package Linux build
-        if: needs.linux.result == 'success'
-        shell: bash
-        run: |
-          linux_dir="artifacts/KytyPS5-Linux-x86_64"
-          test -d "$linux_dir"
-          chmod a+x \
-            "$linux_dir/launcher" \
-            "$linux_dir/kyty_emulator"
-          tar -C "$linux_dir" -czf \
-            "$GITHUB_WORKSPACE/$RELEASE_NAME-Linux-x86_64.tar.gz" .
-
-      - name: Create release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          assets=()
-          for artifact in \
-            "$RELEASE_NAME-Windows-x64.zip" \
-            "$RELEASE_NAME-macOS-x86_64.zip" \
-            "$RELEASE_NAME-Linux-x86_64.tar.gz"; do
-            if [[ -f "$artifact" ]]; then
-              assets+=("$artifact")
-            fi
-          done
-          test "${#assets[@]}" -gt 0
-          if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$RELEASE_NAME" "${assets[@]}" \
-              --clobber \
-              --repo "$GITHUB_REPOSITORY"
+          # (10-23) Ubuntu 26 runners may come without zip; any error goes to the run's annotations.
+          trap 'echo "::error::publish failed at line $LINENO: $BASH_COMMAND"' ERR
+          command -v zip > /dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zip; }
+          (cd package && zip -qr "../$PACKAGE.zip" "$PACKAGE")
+          # A tag's own release, else a new tag named after the package at this commit.
+          tag="$GITHUB_REF_NAME"
+          [ "$GITHUB_REF_TYPE" = tag ] || tag="$PACKAGE"
+          notes="Windows x64 build of ${GITHUB_SHA::8} (todojuegos67-bot fork)."
+          if [[ "$GITHUB_REF_NAME" == bruno-astro-* ]]; then notes="Windows x64 build of ${GITHUB_SHA::8}: brunoKytyPs5 0.5.5 (its license bypass removed) with the todojuegos67-bot frame generation, upscaling, metrics, pad and RAM guard, for ASTRO BOT (PPSA21567). Draft: test build."; fi
+          # The notes of this build (what changed, the per-PC shader caches, frame rates), when the commit has them.
+          if [ -s notes/docs/RELEASE-NOTES.md ]; then notes="$(printf '%s\n\n%s' "$notes" "$(cat notes/docs/RELEASE-NOTES.md)")"; fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$tag" "$PACKAGE.zip" --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_NAME" "${assets[@]}" \
-              --generate-notes \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "$RELEASE_NAME"
+            draft="--draft"  # (10-24) siempre borrador salvo publish=true
+            latest="--latest=false"  # (10-24) solo la que autorice el usuario (publish=true) pasa a ser la ultima
+            if [ "${{ inputs.publish }}" = "true" ]; then draft=""; latest="--latest"; [ -s "package/$PACKAGE/NOVEDADES.txt" ] && notes="$(cat "package/$PACKAGE/NOVEDADES.txt")"; fi
+            gh release create "$tag" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" $draft \
+              --title "$PACKAGE" --notes "$notes" $latest 2> gh-err.txt || { echo "::error::gh release create: $(tr '\n' ' ' < gh-err.txt)"; exit 1; }
           fi

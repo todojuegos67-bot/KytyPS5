@@ -93,6 +93,17 @@ else()
 	target_compile_options(zarchive PRIVATE -w)
 endif()
 
+# bruno-astro-1025: zarchive_tool (not built by default) packs a game folder into a .zar (the launcher's "Comprimir").
+add_executable(zarchive_tool EXCLUDE_FROM_ALL "${zarchive_source_SOURCE_DIR}/src/main.cpp")
+target_link_libraries(zarchive_tool PRIVATE zarchive)
+target_compile_features(zarchive_tool PRIVATE cxx_std_20)
+set_target_properties(zarchive_tool PROPERTIES OUTPUT_NAME zarchive)
+if(MSVC)
+	target_compile_options(zarchive_tool PRIVATE /W0)
+else()
+	target_compile_options(zarchive_tool PRIVATE -w)
+endif()
+
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 if(APPLE)
 	# SDL's built-in iconv fallback does not support CP932.
