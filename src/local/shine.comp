@@ -271,14 +271,14 @@ void Composite(ivec2 p) {
 	float gloss  = push.dec.z >= 0 ? Field(push.dec.z, p) : 0.0;
 	uint  a0     = Packed(0, p);
 	vec3  albedo = vec3(Bits(a0, 0, 8), Bits(a0, 8, 8), Bits(a0, 16, 8));
-	float smooth_ = 1.0 - smoothstep(0.08, 0.35, rough); // (10-24: stricter; grey stone walls passed at 0.12..0.55)
+	float smooth_ = 1.0 - smoothstep(0.10, 0.42, rough); // (10-24: stricter; grey stone walls passed at 0.12..0.55; shine3: a little looser)
 	smooth_       = max(smooth_, gloss * 0.6);
 	float al      = Luma(albedo);
 	float sat     = (Max3(albedo) - min(albedo.r, min(albedo.g, albedo.b))) / max(Max3(albedo), 1e-3);
 	// Armour / metal: the metal field when given (KYTY_SHINE_METAL), else smooth with a metal's signature: a dark,
 	// little-saturated diffuse albedo (metals keep their color in the specular). Grey mid-bright stone is no longer metal.
 	float metal = push.dec.w >= 0 ? smooth_ * Field(push.dec.w, p)
-	                              : smooth_ * (1.0 - smoothstep(0.3, 0.65, sat)) * (1.0 - smoothstep(0.12, 0.3, al)) * step(0.015, al);
+	                              : smooth_ * (1.0 - smoothstep(0.35, 0.7, sat)) * (1.0 - smoothstep(0.16, 0.38, al)) * step(0.015, al);
 	// Neighbours: normals (foliage-like noise, specular anti-aliasing) and depth (edges).
 	vec3     n = vec3(0, 0, 1);
 	bool     have_n = (push.misc.z & 2) != 0;
@@ -306,7 +306,7 @@ void Composite(ivec2 p) {
 		ivec2 w4[4] = ivec2[4](ivec2(12, 0), ivec2(-12, 0), ivec2(0, 12), ivec2(0, -12));
 		float wvar = 0.0;
 		for (int k = 0; k < 4; ++k) wvar += 1.0 - clamp(dot(n, NormalAt(clamp(p + w4[k], ivec2(0), sz - 1), pos)), 0.0, 1.0);
-		planar = (1.0 - smoothstep(0.004, 0.012, wvar * 0.25)) * (1.0 - smoothstep(0.002, 0.006, nvar));
+		planar = (1.0 - smoothstep(0.003, 0.010, wvar * 0.25)) * (1.0 - smoothstep(0.0015, 0.005, nvar));
 		if (stat && planar > 0.5) atomicAdd(stats[7], 1u);
 	}
 	// Foliage / noise: green-dominant rough-ish albedo, or a normal that changes wildly pixel to pixel.
@@ -345,13 +345,13 @@ void Composite(ivec2 p) {
 		float a2l  = rl * rl * rl * rl + nvar * 0.5;
 		vec3  base = mix(vec3(0.04), clamp(albedo * 1.4, 0.0, 1.0), metal);
 		// Sun (and a soft sky fill when the sun is unknown), visible only where the game itself lit the pixel well.
-		float lit  = smoothstep(0.12, 0.6, Luma(c * e) / max(al, 0.05));
+		float lit  = smoothstep(0.10, 0.5, Luma(c * e) / max(al, 0.05));
 		if (push.sun.w > 0.0) add += Spec(n, v, normalize(push.sun.xyz), a2, base) * push.sun.w * lit;
 		if (push.fill.w > 0.0) add += Spec(n, v, normalize(push.fill.xyz), max(a2 * 4.0, 0.02), base) * push.fill.w * (0.3 + 0.7 * lit);
 		// Local lights (torches, fire): distance-attenuated, windowed to zero at 4 radii; only where the metal check
 		// passes, at most 0.5x (metal) / 0.3x (other) the local luminance.
 		vec3 ladd = vec3(0);
-		for (int k = 0; k < 4 && metal > 0.05; ++k) {
+		for (int k = 0; k < 4 && metal > 0.04; ++k) {
 			vec4 lp = lights[k * 3];
 			if (lp.w <= 0.0) continue;
 			vec3  ld  = lp.xyz - pos;
@@ -360,18 +360,18 @@ void Composite(ivec2 p) {
 			float win = 1.0 - smoothstep(rad * 2.0, rad * 4.0, sqrt(dl2));
 			if (win <= 0.0) continue;
 			float att = win / (1.0 + dl2 / (rad * rad));
-			ladd += Spec(n, v, ld * inversesqrt(max(dot(ld, ld), 1e-6)), a2l, base) * lights[k * 3 + 1].rgb * (att * lp.w * 0.5);
+			ladd += Spec(n, v, ld * inversesqrt(max(dot(ld, ld), 1e-6)), a2l, base) * lights[k * 3 + 1].rgb * (att * lp.w * 0.6);
 		}
 		ladd *= push.size.z * mask * metal;
-		float llim = mix(0.3, 0.5, smoothstep(0.3, 0.7, metal)) * lmean;
+		float llim = mix(0.35, 0.6, smoothstep(0.3, 0.7, metal)) * lmean;
 		if (Luma(ladd) > llim) ladd *= llim / max(Luma(ladd), 1e-5);
 		if (stat && Max3(ladd) > 0.02) atomicAdd(stats[6], 1u);
 		add *= push.size.z * mask * (0.35 + 0.65 * metal);
 		add += ladd;
-		float cap = 3.0 * push.size.z;
+		float cap = 3.5 * push.size.z;
 		add       = add / (1.0 + Max3(add) / cap); // (soft cap: highlights, not blown-out blobs)
-		// Hard firefly clamp: never more than 1.5x the local mean luminance.
-		float lim = 1.5 * lmean;
+		// Hard firefly clamp: never more than 1.7x the local mean luminance.
+		float lim = 1.7 * lmean;
 		if (Luma(add) > lim) add *= lim / max(Luma(add), 1e-5);
 		// Temporal: the reprojected last highlight, clamped around this one, blended (nothing pops frame to frame).
 		if (push.motion.z > 0.0) {
