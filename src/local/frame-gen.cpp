@@ -6252,6 +6252,17 @@ void OnShadowConsumer(uint64_t cs_hash, const ShadowConsumer& consumer, std::spa
 
 void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> srt, bool shadow_target) {
 	if (srt.empty()) return;
+	// The RT shadows' camera on every draw path, whatever the upscaler or frame generation gate OnDraw on: a G-buffer
+	// draw's view-projection, only when finite and perspective (a w row with a spatial part); else it stays unknown.
+	if (IsGbufferVertexShader(vs_hash) && srt.size() >= SrtViewProj + 16) {
+		std::array<float, 16> vp {};
+		bool                  ok = true;
+		for (uint32_t i = 0; i < 16 && ok; ++i) ok = std::isfinite(vp[i] = AsFloat(srt[SrtViewProj + i]));
+		if (ok && std::abs(vp[12]) + std::abs(vp[13]) + std::abs(vp[14]) > 1e-6f) {
+			std::lock_guard vp_lock(g_last_vp_mutex);
+			g_last_vp = vp, g_have_last_vp = true;
+		}
+	}
 	static std::mutex                             mutex;
 	static std::unordered_map<uint64_t, uint64_t> learned;  // shadow-pass vertex shaders -> the flip last learned
 	static std::unordered_map<uint64_t, uint64_t> probed;   // others: the flip last scanned (every 300 flips at most)
