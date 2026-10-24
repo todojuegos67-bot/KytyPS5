@@ -1,4 +1,5 @@
 #include "kernel/fileSystem.h"
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 
 #include "common/archive.h"
 #include "common/assert.h"
@@ -514,10 +515,12 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	file->real_name = g_mount_points->ResolvePath(file->name);
 	// The game's in-engine cinematics (Demon's Souls: cinematics/scnNNNNNN_<name>/...): presented as a movie while
 	// their files are read (VideoOut::NoteCinematic).
-	file->cinematic = file->name.find("/cinematics/") != std::string::npos;
+	// (Demon's Souls' paths only: another title's /cinematics/ or /levels/ need not be these.)
+	static const bool ds_paths = Libs::Graphics::DemonsSouls::IsSupportedGame();
+	file->cinematic = ds_paths && file->name.find("/cinematics/") != std::string::npos;
 	if (file->cinematic) Libs::VideoOut::NoteCinematic(file->name.c_str());
 	// A world's files (Demon's Souls: levels/<world>/...): the world gate's signal (VideoOut::NoteWorldFile).
-	if (file->name.find("/levels/") != std::string::npos) Libs::VideoOut::NoteWorldFile(file->name.c_str());
+	if (ds_paths && file->name.find("/levels/") != std::string::npos) Libs::VideoOut::NoteWorldFile(file->name.c_str());
 
 	if (Common::IsArchivePath(file->real_name) && (rw_mode != Common::File::Mode::Read || trunc || creat)) {
 		g_files->DeleteDescriptor(descriptor);
