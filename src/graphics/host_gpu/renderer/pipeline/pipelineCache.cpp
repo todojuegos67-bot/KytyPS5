@@ -2326,13 +2326,26 @@ const EvictSettings& PipelineEvictSettings() {
 	return settings;
 }
 
+// Whether the worlds the game left take their pipelines along (EvictIdlePipelines): with 20 GiB of RAM or less, where
+// the NVIDIA driver's ~220 KB of RAM a pipeline counts (16 GB, six worlds: its pools 2.0 GB kept, 1.0 GB swept), or
+// KYTY_PIPELINE_EVICT set. With more RAM the sweep saved nothing needed and cost its remakes: an RTX 2080 Ti (32 GB)
+// remade 1,096 of them from the static store at 4.8 ms each, up to 137 ms (issue #129), not the 0.4 ms of a 5090.
+bool SweepsWorldsLeft() {
+	static const bool sweeps = [] {
+		const auto ram = LocalPlatform::PhysicalMemory();
+		return PipelineEvictSettings().set || (ram != 0 && ram <= (uint64_t {20} << 30u));
+	}();
+	return sweeps;
+}
+
 // A pipeline made now: the flip it was made at as its last use (not idle before a first binding); and whether it keeps
 // how to make it again (made of the static store's, where it may be evicted: only there, for the inputs it keeps).
 bool KeepsRemake(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, bool from_store) {
 	const auto& settings = PipelineEvictSettings();
 	pipeline.last_flip   = g_pipeline_flip.load(std::memory_order_relaxed);
-	// (Where the game reports its worlds, on any GPU: the worlds it leaves take their pipelines along.)
-	const bool scenes = SceneTags::Generation() != 0;
+	// (Where the game reports its worlds and they are swept (SweepsWorldsLeft), on any GPU: the worlds it leaves take
+	// their pipelines along.)
+	const bool scenes = SceneTags::Generation() != 0 && SweepsWorldsLeft();
 	if (!settings.on || (!settings.set && !graphics.small_video_memory && !scenes) || !from_store) return false;
 	g_pipeline_evictions.kept.fetch_add(1, std::memory_order_relaxed);
 	return true;
@@ -2407,7 +2420,8 @@ void PipelineCache::EvictIdlePipelines() {
 	const uint32_t     flip         = g_pipeline_flip.fetch_add(1, std::memory_order_relaxed) + 1;
 	const auto         now          = std::chrono::steady_clock::now();
 	m_flip_times[flip % m_flip_times.size()] = now.time_since_epoch().count();
-	// A world the game left (SceneTags::Enter): once the one it went to was played for SceneSettle, the pipelines no
+	// A world the game left (SceneTags::Enter; with 20 GiB of RAM or less, SweepsWorldsLeft): once the one it went to was
+	// played for SceneSettle, the pipelines no
 	// binding used since the change - and none of the new world's recorded ones, which the warmup made for its places not
 	// reached yet - leave whatever the video memory, a pass a check until one finds none. Each held ~220 KB of the NVIDIA
 	// driver's RAM and video memory for its code, until the session ended. 16 GB policy, 1-1 -> five worlds -> 1-1, 60 s
@@ -2426,7 +2440,7 @@ void PipelineCache::EvictIdlePipelines() {
 		m_scene_swept      = false;
 	}
 	if (!settings.on || flip % CheckFlips != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) return;
-	const bool scene_left = !m_scene_swept && now - m_scene_since >= SceneSettle;
+	const bool scene_left = SweepsWorldsLeft() && !m_scene_swept && now - m_scene_since >= SceneSettle;
 	uint64_t video = 0, budget = 0;
 	const bool known = m_graphics.QueryLocalVideoMemory(&video, &budget);
 	// RAM pressure (ram-guard.h): pipelines idle 60 s (20 s when critical) leave too, whatever the video memory; each
