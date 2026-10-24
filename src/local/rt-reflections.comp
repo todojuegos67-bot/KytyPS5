@@ -46,7 +46,8 @@ layout(std430, binding = 18) buffer Frame {
 	vec4 view_rot[3];  // world -> view rotation rows
 	vec4 clip_prev[4]; // rows of the current clip -> previous clip matrix (column vectors)
 	vec4 up_view;      // world up in view space
-	vec4 fparams;      // x: 1.0 (the exposure when the game gives none), y: wet surfaces' minimum reflectance
+	vec4 fparams;      // x: 1.0 (the exposure when the game gives none), y: wet surfaces' minimum reflectance,
+	                   // z: the longest ray on screen (render pixels; 0 none)
 	int  calib[];      // see CALIB_* below (calibration sums, then the cumulative stats counters)
 };
 // calib[] layout (ints): [0] samples; [CALIB_NORMAL + ((layer * NLAYOUTS + layout) * 2 + space) * 2 + convention] sum of
@@ -69,7 +70,8 @@ layout(push_constant) uniform Push {
 	vec4  size;      // render w, h, trace w, h
 	vec4  params;    // strength, thickness (view units), max ray length (view units), a-trous step
 	vec4  motion;    // motion scale x, y, roughness cutoff, temporal minimum alpha scale
-	ivec4 misc;      // mode, frame, level, flags (1 reset, 2 history valid, 4 camera matrices, 8 up known, 16 row 0 = NDC y +1)
+	ivec4 misc;      // mode, frame, level, flags (1 reset, 2 history valid, 4 camera matrices, 8 up known, 16 row 0 = NDC y +1,
+	                 // 32 checkerboard trace: half the trace pixels march each frame, the others keep their history)
 	ivec4 dec;       // normal code (-1: depth normals), roughness field (-1: heuristic), packed layers, hi-z mip
 	ivec4 misc2;     // exposure index, hi-z levels, max iterations, roughness trusted (1: from the environment)
 } push;
@@ -409,7 +411,9 @@ void StoreMiss(ivec2 px, Surf s) {
 	imageStore(out_c, px, vec4(s.rough, s.mask, 0, 0));
 }
 
-void Trace(ivec2 px) {
+// `march`: false on the checkerboard's other half this frame: the surface is written, the reflection marked absent
+// (alpha -1: the temporal pass keeps the history there).
+void Trace(ivec2 px, bool march) {
 	vec2  uv  = (vec2(px) + 0.5) / TraceSize();
 	ivec2 rp  = RenderPixel(uv);
 	vec2  ruv = (vec2(rp) + 0.5) / RenderSize();
@@ -425,9 +429,25 @@ void Trace(ivec2 px) {
 	Surf  s    = SurfaceAt(rp, ruv, P);
 	imageStore(out_b, px, vec4(s.N, dist));
 	if (s.mask < 0.01 || s.rough > push.motion.z) { StoreMiss(px, s); return; }
+	vec3 V = normalize(-P);
+	// Early out: the composite's weight (below) would stay under 0.02: no ray, and no reflection downstream.
+	{
+		float nv   = clamp(dot(s.N, V), 0.0, 1.0);
+		float fr   = 0.04 + (max(1.0 - s.rough, 0.04) - 0.04) * pow(1.0 - nv, 5.0);
+		float west = push.params.x * s.mask * max(fr, fparams.y * (1.0 - smoothstep(0.1, 0.5, s.rough)));
+		if (west < 0.02) {
+			s.mask = 0.0;
+			StoreMiss(px, s);
+			return;
+		}
+	}
+	if (!march) {
+		imageStore(out_a, px, vec4(0, 0, 0, -1));
+		imageStore(out_c, px, vec4(s.rough, s.mask, 0, 0));
+		return;
+	}
 	bool st = Sampled(px);
 	if (st) Stat(4, 1);
-	vec3  V  = normalize(-P);
 	float f  = float(push.misc.y & 1023);
 	vec2  xi = vec2(fract(Ign(vec2(px)) + f * 0.6180340), fract(Ign(vec2(px) + vec2(47.0, 17.0)) + f * 0.7548777));
 	vec3  R;
@@ -463,6 +483,8 @@ void Trace(ivec2 px) {
 	if (dp.x < -1e-6) tmax = min(tmax, (0.5 - sp0.x) / dp.x);
 	if (dp.y > 1e-6) tmax = min(tmax, (rs.y - 0.5 - sp0.y) / dp.y);
 	if (dp.y < -1e-6) tmax = min(tmax, (0.5 - sp0.y) / dp.y);
+	// (the screen length cap: long rays cost the most iterations and find the least that is right)
+	if (fparams.z > 0.0) tmax = min(tmax, fparams.z / max(length(dp), 1e-6));
 	tmax = clamp(tmax, 0.0, 1.0);
 	float pix = length(dp) * tmax;
 	if (pix < 1.0) { StoreMiss(px, s); return; }
@@ -476,7 +498,9 @@ void Trace(ivec2 px) {
 	r.sgn = sgn;
 	float t0    = min(1.5 / length(dp), tmax);
 	float hit_z = 0.0;
-	float th    = HizTrace(r, t0, tmax, push.misc2.z, hit_z);
+	// (rough rays get fewer iterations: their result is blurred anyway)
+	int   iters = max(int(float(push.misc2.z) * mix(1.0, 0.5, smoothstep(0.15, 0.45, s.rough))), 8);
+	float th    = HizTrace(r, t0, tmax, iters, hit_z);
 	if (th < 0.0) { StoreMiss(px, s); return; }
 	vec2  huv = (r.p0 + r.dp * th) / rs;
 	float hd  = DepthAt(huv);
@@ -516,6 +540,7 @@ void Temporal(ivec2 px) {
 	vec4  g   = texelFetch(gb_cur, px, 0);
 	vec4  ax  = texelFetch(aux_tex, px, 0);
 	vec4  cur = texelFetch(src_a, px, 0);
+	bool  fresh = cur.a >= 0.0; // (false: not traced this frame, the checkerboard)
 	if (g.w > 5e4 || ax.y < 0.01 || ax.x > push.motion.z) {
 		imageStore(out_a, px, vec4(0));
 		imageStore(out_b, px, vec4(0));
@@ -524,15 +549,15 @@ void Temporal(ivec2 px) {
 	float rough = ax.x;
 	// The 3x3 neighbourhood on the same surface (YCoCg of the premultiplied color, confidence).
 	vec3  m1 = vec3(0), m2 = vec3(0);
-	float a1 = 0.0, a2 = 0.0, l1 = 0.0, l2 = 0.0, wn = 0.0;
+	float a1 = 0.0, a2 = 0.0, l1 = 0.0, l2 = 0.0, wn = 0.0, wraw = 0.0;
 	vec4  mean = vec4(0);
 	ivec2 hi   = ivec2(ts) - 1;
 	for (int y = -1; y <= 1; ++y)
 		for (int x = -1; x <= 1; ++x) {
 			ivec2 q  = clamp(px + ivec2(x, y), ivec2(0), hi);
 			vec4  sg = texelFetch(gb_cur, q, 0);
-			float w  = (abs(sg.w - g.w) < 0.05 * g.w && dot(sg.xyz, g.xyz) > 0.8) ? 1.0 : 0.0;
 			vec4  sv = texelFetch(src_a, q, 0);
+			float w  = (abs(sg.w - g.w) < 0.05 * g.w && dot(sg.xyz, g.xyz) > 0.8 && sv.a >= 0.0) ? 1.0 : 0.0;
 			vec3  yc = YCoCg(sv.rgb);
 			float l  = Luma(sv.rgb);
 			m1 += yc * w, m2 += yc * yc * w;
@@ -541,8 +566,10 @@ void Temporal(ivec2 px) {
 			mean += sv * w;
 			wn += w;
 		}
-	wn = max(wn, 1.0);
+	wraw = wn;
+	wn   = max(wn, 1.0);
 	m1 /= wn, m2 /= wn, a1 /= wn, a2 /= wn, l1 /= wn, l2 /= wn, mean /= wn;
+	if (!fresh) cur = mean; // (the traced neighbours on the same surface; nothing: zero)
 	vec3  sig  = sqrt(max(m2 - m1 * m1, vec3(0)));
 	float asig = sqrt(max(a2 - a1 * a1, 0.0));
 	float svar = max(l2 - l1 * l1, 0.0);
@@ -590,6 +617,11 @@ void Temporal(ivec2 px) {
 		// Mirrors follow quickly (a parallax error would ghost); rough surfaces average longer.
 		float amin  = mix(0.15, 0.04, smoothstep(0.02, 0.3, rough)) * push.motion.w;
 		float alpha = max(1.0 / len, amin);
+		if (!fresh) {
+			// (no sample of its own this frame: the history, nudged toward the traced neighbours)
+			len   = max(meta.x, 1.0);
+			alpha = wraw > 0.0 ? alpha * 0.5 : 0.0;
+		}
 		res         = mix(hist, cur, alpha);
 		mo1         = mix(meta.y, lc, alpha);
 		mo2         = mix(meta.z, lc * lc, alpha);
@@ -650,13 +682,13 @@ void Atrous(ivec2 px) {
 	imageStore(out_a, px, r);
 }
 
-// Bilateral upsample of the trace-resolution reflection (distance and normal weights).
-vec4 Upsample(vec2 uv, float z, vec3 N) {
+// Bilateral upsample of the trace-resolution reflection and its surface (roughness, mask): distance and normal weights.
+void Upsample(vec2 uv, float z, vec3 N, out vec4 rf, out vec4 ax) {
 	vec2  tc   = uv * TraceSize() - 0.5;
 	vec2  f    = fract(tc);
 	ivec2 b    = ivec2(floor(tc));
 	ivec2 mx   = ivec2(TraceSize()) - 1;
-	vec4  sum  = vec4(0);
+	vec4  sum  = vec4(0), asum = vec4(0);
 	float wsum = 0.0;
 	for (int i = 0; i < 4; ++i) {
 		ivec2 o  = ivec2(i & 1, i >> 1);
@@ -665,11 +697,15 @@ vec4 Upsample(vec2 uv, float z, vec3 N) {
 		vec4  sg = texelFetch(gb_cur, q, 0);
 		float w  = (bw + 1e-3) * exp(-abs(sg.w - z) / max(z * 0.03, 1e-3)) * pow(max(dot(sg.xyz, N), 0.0), 16.0);
 		sum += texelFetch(src_a, q, 0) * w;
+		asum += texelFetch(aux_tex, q, 0) * w;
 		wsum += w;
 	}
-	return wsum > 1e-5 ? sum / wsum : vec4(0);
+	rf = wsum > 1e-5 ? sum / wsum : vec4(0);
+	ax = wsum > 1e-5 ? asum / wsum : vec4(1, 0, 0, 0);
 }
 
+// The surface comes from the trace's (its roughness and mask, upsampled when the trace is at half resolution): the
+// wet-surface mask is not evaluated a second time per render pixel.
 void Composite(ivec2 px) {
 	vec4  col = texelFetch(color_tex, px, 0);
 	float d   = texelFetch(depth_tex, px, 0).r;
@@ -679,31 +715,43 @@ void Composite(ivec2 px) {
 	}
 	bool st = Sampled(px);
 	if (st) Stat(0, 1);
-	vec2 uv = (vec2(px) + 0.5) / RenderSize();
-	vec3 P  = ViewPos(uv, d);
-	float z = abs(P.z);
-	Surf s  = SurfaceAt(px, uv, P);
-	if (st && s.gb > 0.5) Stat(6, 1);
-	if (s.mask < 0.01 || s.rough > push.motion.z) {
+	vec2  uv = (vec2(px) + 0.5) / RenderSize();
+	vec3  P  = ViewPos(uv, d);
+	float z  = abs(P.z);
+	vec3  Nd = NormalAt(uv, P);
+	vec3  Ng;
+	bool  match = GbufNormal(px, Ng) && dot(Ng, Nd) > 0.6;
+	vec3  N     = match ? Ng : Nd;
+	if (st && match) Stat(6, 1);
+	vec4 rf, ax;
+	if (all(equal(ivec2(TraceSize()), ivec2(RenderSize())))) {
+		rf = texelFetch(src_a, px, 0);
+		ax = texelFetch(aux_tex, px, 0);
+	} else {
+		Upsample(uv, z, N, rf, ax);
+	}
+	float rough = ax.x, mask = ax.y;
+	if (mask < 0.01 || rough > push.motion.z) {
 		imageStore(out_a, px, col);
 		return;
 	}
-	if (st && s.mask > 0.05) Stat(3, 1);
-	vec4 rf = all(equal(ivec2(TraceSize()), ivec2(RenderSize()))) ? texelFetch(src_a, px, 0) : Upsample(uv, z, s.N);
+	if (st && mask > 0.05) Stat(3, 1);
 	if (Bad(rf) || rf.a < 1e-3) {
 		imageStore(out_a, px, col);
 		return;
 	}
 	float e     = GameExposure();
 	vec3  refl  = InvTonemap(clamp(rf.rgb / rf.a, vec3(0), vec3(1))) / e;
-	float NoV   = clamp(dot(s.N, normalize(-P)), 0.0, 1.0);
+	vec3  V     = normalize(-P);
+	if (dot(N, V) < 0.02) N = normalize(N + V * (0.02 - dot(N, V) + 0.01));
+	float NoV   = clamp(dot(N, V), 0.0, 1.0);
 	// Schlick with roughness (Lagarde), f0 0.04; on wet surfaces at least fparams.y (a water film reflects far more than
 	// the dry dielectric's 4 % seen from above: the first version's weight was ~0.02 there, which nobody could see).
 	float f0    = 0.04;
-	float fmax  = max(1.0 - s.rough, f0);
+	float fmax  = max(1.0 - rough, f0);
 	float fres  = f0 + (fmax - f0) * pow(1.0 - NoV, 5.0);
-	float spec  = max(fres, fparams.y * (1.0 - smoothstep(0.1, 0.5, s.rough)));
-	float w     = push.params.x * s.mask * clamp(rf.a, 0.0, 1.0) * spec;
+	float spec  = max(fres, fparams.y * (1.0 - smoothstep(0.1, 0.5, rough)));
+	float w     = push.params.x * mask * clamp(rf.a, 0.0, 1.0) * spec;
 	// The game's own highlights (lights, emissives: far brighter than what a screen-space ray can find) stay.
 	float lc = Luma(max(col.rgb, vec3(0))), lr = Luma(refl);
 	w *= 1.0 - smoothstep(4.0, 12.0, lc / max(lr, lc * 1e-4 + 1e-30));
@@ -774,10 +822,25 @@ void main() {
 		if (p.x < ms.x && p.y < ms.y) HizDown(p);
 		return;
 	}
+	if (mode == 0 && (push.misc.w & 32) != 0) {
+		// Checkerboard: each thread owns two horizontal neighbours, marches one (alternating by row and frame) and only
+		// classifies the other, so every lane of a wave marches (no divergence from the pattern).
+		ivec2 ts = ivec2(TraceSize());
+		if (p.y >= ts.y || 2 * p.x >= ts.x) return;
+		int   k = (p.y + push.misc.y) & 1;
+		ivec2 a = ivec2(2 * p.x + k, p.y), b = ivec2(2 * p.x + (k ^ 1), p.y);
+		if (a.x >= ts.x) {
+			Trace(b, true);
+			return;
+		}
+		Trace(a, true);
+		if (b.x < ts.x) Trace(b, false);
+		return;
+	}
 	ivec2 size = ivec2(mode == 4 || mode == 6 ? RenderSize() : TraceSize());
 	if (p.x >= size.x || p.y >= size.y) return;
 	if (mode == 6) HizBase(p);
-	else if (mode == 0) Trace(p);
+	else if (mode == 0) Trace(p, true);
 	else if (mode == 1) Temporal(p);
 	else if (mode == 2) Atrous(p);
 	else if (mode == 4) Composite(p);

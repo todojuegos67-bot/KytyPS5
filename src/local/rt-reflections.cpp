@@ -1,4 +1,4 @@
-// KYTY_RT_REFLECTIONS=0|1|2|3 ("RT reflections": off / low / high / ultra; rt-reflections.comp): screen-space ray-traced
+// KYTY_RT_REFLECTIONS=0|1|2|3|4 ("RT reflections": off / low / medium / high / ultra; rt-reflections.comp): screen-space ray-traced
 // reflections with denoising for Demon's Souls' PS5 Pro path, recorded in FrameGen::Upscale right before the upscaler
 // (DLSS / XeSS / FSR), which then reads our composited copy of the game's color. Only there: it is the one point where
 // the game hands over its lit HDR color before anti-aliasing together with depth, motion vectors and the projection
@@ -6,7 +6,8 @@
 //
 // Per frame (all compute, one pipeline, push descriptors):
 //   hi-z:      the closest-distance pyramid of the depth (mip 0 at the render size, then 2x2 min down to 1x1)
-//   trace:     one GGX VNDF-sampled ray per pixel (1: half resolution, 2 and 3: full), hierarchical-Z march
+//   trace:     one GGX VNDF-sampled ray per trace pixel (low / medium / high: half resolution, ultra: full; low and
+//              ultra: checkerboard, half the trace pixels a frame), hierarchical-Z march (LevelCfg below)
 //   temporal:  reprojection by motion vector + reflection parallax, disocclusion rejection, neighbourhood clamp
 //   a-trous:   2 / 3 / 4 edge-aware passes (distance, normal, roughness, luminance variance)
 //   composite: bilateral upsample, Fresnel x mask x confidence convex mix over the game's color
@@ -115,7 +116,7 @@ struct RtPass {
 	// Calibration (up to 3 attempts, the first once the G-buffer copy has been there 60 frames running) and the
 	// chosen decode; the screen's y convention (true: the render's row 0 is NDC y +1, the GNM viewport).
 	uint32_t                calib_runs = 0, calib_wait = 0, calib_tick = 0, calib_attempts = 0, calib_packed = 0;
-	bool                    calib_done = false, calib_active = false, calib_clear = false;
+	bool                    calib_done = false, calib_active = false, calib_clear = false, floors_done = false;
 	uint64_t                calib_next = 0, gb_streak = 0;
 	int32_t                 dec_normal = -1, dec_rough = -1;
 	bool                    rough_trusted = false;
@@ -126,11 +127,16 @@ struct RtPass {
 	uint64_t                stat_frames = 0, stat_gbuf_frames = 0, stat_copies0 = 0;
 	std::chrono::steady_clock::time_point stat_time = std::chrono::steady_clock::now();
 	// The GPU time (timestamps, always: two a frame).
+	// Per pass: a timestamp before the first and after each pass; ring of 8 frames x 16 queries.
 	vk::QueryPool           pool = nullptr;
 	double                  period_ns = 1.0;
 	uint64_t                written = 0, read = 0;
 	double                  sum_ms = 0.0;
 	uint32_t                samples = 0;
+	std::array<std::array<uint8_t, 16>, 8> stage_of {}; // the pass each interval timed (Stage), per ring entry
+	std::array<uint32_t, 8>               stamps_in {};  // timestamps written per ring entry
+	std::array<double, 9>                 stage_ms {};   // sums since the last line
+	std::array<uint32_t, 9>               stage_frames {};
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 } g_rt;
 
@@ -327,7 +333,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	{
 		vk::QueryPoolCreateInfo query {};
 		query.queryType  = vk::QueryType::eTimestamp;
-		query.queryCount = 16;
+		query.queryCount = 8 * 16;
 		if (device.createQueryPool(&query, nullptr, &g_rt.pool) != vk::Result::eSuccess) g_rt.pool = nullptr;
 		g_rt.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
 	}
@@ -335,11 +341,34 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	return true;
 }
 
+// The quality levels (KYTY_RT_REFLECTIONS 1..4). Costs measured with the first version on an RTX 5080 at a 1080p render:
+// full-resolution trace, 72 iterations, 3 a-trous passes, every pixel = 8.5-10 ms; most of it the march, then the wet-
+// surface mask evaluated twice per pixel (trace and composite) and the full-resolution filters.
+struct LevelCfg {
+	const char* name;
+	bool        full;     // trace at the render resolution (else half: a quarter of the pixels)
+	bool        checker;  // half of the trace pixels march each frame (the temporal pass fills the others)
+	int         iters;    // hi-z iterations (rough rays: half)
+	float       cutoff;   // roughness above which nothing reflects
+	int         passes;   // a-trous passes
+	float       max_len;  // view-space ray length
+	float       cap;      // the longest ray on screen, x the render height
+	float       alpha;    // temporal minimum alpha scale
+};
+constexpr LevelCfg Levels[5] = {
+    {"off", false, false, 0, 0.0f, 0, 0.0f, 0.0f, 1.0f},
+    {"low", false, true, 24, 0.45f, 1, 200.0f, 0.30f, 1.0f},
+    {"medium", false, false, 32, 0.55f, 2, 300.0f, 0.45f, 1.0f},
+    {"high", false, false, 48, 0.60f, 3, 400.0f, 0.65f, 0.9f},
+    {"ultra", true, true, 64, 0.65f, 3, 600.0f, 0.90f, 0.8f},
+};
+const LevelCfg& Cfg(int level) { return Levels[std::clamp(level, 0, 4)]; }
+
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level) {
 	if (g_rt.out.image != VK_NULL_HANDLE && g_rt.render == render && g_rt.level == level) return true;
 	for (auto* img: Sized())
 		if (img != &g_rt.dummy) Retire(*img);
-	const vk::Extent2D trace = level >= 2 ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
+	const vk::Extent2D trace = Cfg(level).full ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
 	uint32_t levels = 1;
 	while (levels < MaxMips && ((render.width >> levels) > 0 || (render.height >> levels) > 0)) ++levels;
 	const auto f16 = vk::Format::eR16G16B16A16Sfloat;
@@ -395,17 +424,31 @@ void PrepareImages(vk::CommandBuffer command) {
 	}
 }
 
+enum Stage : uint8_t { StHiz, StCalib, StTrace, StTemporal, StAtrous0, StAtrous1, StAtrous2, StAtrous3, StComposite };
+const char* const StageNames[9] = {"hi-z", "calib", "trace", "temporal", "a-trous 1", "a-trous 2", "a-trous 3", "a-trous 4",
+                                   "composite"};
+
 void ReadTiming(GraphicContext& graphics) {
 	if (g_rt.pool == nullptr) return;
 	while (g_rt.read + 4 <= g_rt.written) {
-		const auto              entry = static_cast<uint32_t>(g_rt.read % 8);
-		std::array<uint64_t, 2> stamps {};
-		if (graphics.device.getQueryPoolResults(g_rt.pool, entry * 2, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
-		                                        vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
+		const auto     entry = static_cast<uint32_t>(g_rt.read % 8);
+		const uint32_t n     = g_rt.stamps_in[entry];
+		std::array<uint64_t, 16> stamps {};
+		if (n >= 2 && graphics.device.getQueryPoolResults(g_rt.pool, entry * 16, n, sizeof(uint64_t) * n, stamps.data(),
+		                                                  sizeof(uint64_t), vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
 			break;
-		if (stamps[1] > stamps[0]) {
-			g_rt.sum_ms += static_cast<double>(stamps[1] - stamps[0]) * g_rt.period_ns / 1e6;
+		if (n >= 2 && stamps[n - 1] > stamps[0]) {
+			g_rt.sum_ms += static_cast<double>(stamps[n - 1] - stamps[0]) * g_rt.period_ns / 1e6;
 			++g_rt.samples;
+			std::array<bool, 9> seen {};
+			for (uint32_t k = 1; k < n; ++k) {
+				const uint8_t st = g_rt.stage_of[entry][k];
+				if (st >= 9 || stamps[k] < stamps[k - 1]) continue;
+				g_rt.stage_ms[st] += static_cast<double>(stamps[k] - stamps[k - 1]) * g_rt.period_ns / 1e6;
+				seen[st] = true;
+			}
+			for (uint32_t st = 0; st < 9; ++st)
+				if (seen[st]) ++g_rt.stage_frames[st];
 		}
 		++g_rt.read;
 	}
@@ -430,7 +473,7 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	if (now - g_rt.stat_time < std::chrono::seconds(10)) return;
 	const auto&    sm     = g_rt.stat_sum;
 	const double   px     = static_cast<double>(std::max<uint64_t>(sm[0], 1));
-	const double   area   = level >= 2 ? 1.0 : 0.25; // (trace pixels per render pixel)
+	const double   area   = (Cfg(level).full ? 1.0 : 0.25) * (Cfg(level).checker ? 0.5 : 1.0); // (rays per render pixel)
 	const uint64_t copies = RtReflCopies();
 	std::printf("RT reflections: last %.0f s: weight > 0.05 on %.1f%% of the pixels, mean weight %.3f (%.3f on reflective "
 	            "surfaces, %.1f%% of the pixels), rays on %.1f%%, hit rate %.0f%%, G-buffer copy %llu of %llu frames, its "
@@ -441,7 +484,19 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	            static_cast<unsigned long long>(copies - g_rt.stat_copies0), static_cast<unsigned long long>(g_rt.stat_frames),
 	            100.0 * sm[6] / px, g_rt.dec_normal >= 0 ? "decoded" : "not identified: depth normals",
 	            g_rt.row0_up ? "row 0 = NDC +1" : "row 0 = NDC -1", g_rt.samples > 0 ? g_rt.sum_ms / g_rt.samples : 0.0);
+	std::string passes;
+	for (uint32_t st = 0; st < 9; ++st) {
+		if (g_rt.stage_frames[st] == 0) continue;
+		char buf[64];
+		// (calib: its mean over the frames that ran it; the others run every frame)
+		std::snprintf(buf, sizeof(buf), "%s%s %.3f", passes.empty() ? "" : ", ", StageNames[st],
+		              g_rt.stage_ms[st] / g_rt.stage_frames[st]);
+		passes += buf;
+	}
+	if (!passes.empty()) std::printf("RT reflections: GPU ms per pass (%s): %s\n", Cfg(level).name, passes.c_str());
 	std::fflush(stdout);
+	g_rt.stage_ms.fill(0.0);
+	g_rt.stage_frames.fill(0);
 	g_rt.stat_sum.fill(0);
 	g_rt.stat_frames = 0, g_rt.stat_gbuf_frames = 0, g_rt.stat_copies0 = copies;
 	g_rt.sum_ms = 0.0, g_rt.samples = 0;
@@ -536,7 +591,7 @@ bool Analyze(GraphicContext& graphics, uint32_t packed_count) {
 int RtReflectionsLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_RT_REFLECTIONS");
-		return value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
+		return value != nullptr ? std::clamp(std::atoi(value), 0, 4) : 0; // 0 off, 1 low, 2 medium, 3 high, 4 ultra
 	}();
 	return level;
 }
@@ -601,23 +656,31 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			}
 		}
 	}
-	// The calibration: once the copy has been there 60 frames running (a scene, not the first loading frames), or with
-	// no copy at all after 600 frames (then only the floor votes); up to 3 attempts a minute apart until a normal fits.
+	// The calibration. G-buffer attempts (the ones that count, up to 3, ~30 s apart until a normal fits): once the copy
+	// has been there 120 frames running, so a scene and not the first loading frames; its runs wait while the copy is
+	// missing. Before any copy, after 900 frames: one floor-vote run (packed layers 0, the y convention only), which
+	// does not count (the first version spent its attempt there when the copy came late: "0 packed layers").
 	g_rt.gb_streak = have_gbuf ? g_rt.gb_streak + 1 : 0;
-	if (!g_rt.calib_done && !g_rt.calib_active && g_rt.frame >= g_rt.calib_next &&
-	    (g_rt.gb_streak >= 60 || (g_rt.frame >= 600 && RtReflCopies() == 0))) {
-		g_rt.calib_active = true, g_rt.calib_clear = true;
-		g_rt.calib_runs = 0, g_rt.calib_wait = 0;
-		g_rt.calib_packed = have_gbuf ? 4u : 0u;
+	if (!g_rt.calib_done && !g_rt.calib_active && g_rt.frame >= g_rt.calib_next) {
+		if (g_rt.gb_streak >= 120) {
+			g_rt.calib_active = true, g_rt.calib_clear = true;
+			g_rt.calib_runs = 0, g_rt.calib_wait = 0, g_rt.calib_packed = 4;
+		} else if (!g_rt.floors_done && g_rt.gb_streak == 0 && g_rt.frame >= 900 && g_rt.calib_attempts == 0) {
+			g_rt.floors_done  = true;
+			g_rt.calib_active = true, g_rt.calib_clear = true;
+			g_rt.calib_runs = 0, g_rt.calib_wait = 0, g_rt.calib_packed = 0;
+		}
 	}
 	const bool calibrate = g_rt.calib_active && g_rt.calib_runs < CalibRuns && (g_rt.calib_tick++ & 3u) == 0 &&
 	                       (g_rt.calib_packed == 0 || have_gbuf);
 	if (g_rt.calib_active && g_rt.calib_runs >= CalibRuns && ++g_rt.calib_wait > 8) {
-		g_rt.calib_active      = false;
+		g_rt.calib_active     = false;
 		const bool identified = Analyze(*graphics, g_rt.calib_packed);
-		++g_rt.calib_attempts;
-		if (identified || g_rt.dec_normal >= 0 || g_rt.calib_attempts >= 3) g_rt.calib_done = true;
-		else g_rt.calib_next = g_rt.frame + 3600;
+		if (g_rt.calib_packed > 0) {
+			++g_rt.calib_attempts;
+			if (identified || g_rt.dec_normal >= 0 || g_rt.calib_attempts >= 3) g_rt.calib_done = true;
+			else g_rt.calib_next = g_rt.frame + 1800;
+		}
 	}
 	const int32_t dec_normal = have_gbuf ? g_rt.dec_normal : -1;
 	const int32_t dec_rough  = have_gbuf && dec_normal >= 0 ? g_rt.dec_rough : -1;
@@ -628,18 +691,19 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 
 	const float strength = EnvFloat("KYTY_RT_REFLECTIONS_STRENGTH", 1.0f, 0.0f, 3.0f);
 	const float min_refl = EnvFloat("KYTY_RT_REFLECTIONS_MIN", 0.3f, 0.0f, 0.8f);
-	const int   iters    = level >= 3 ? 112 : level >= 2 ? 72 : 48;
-	const float cutoff   = level >= 3 ? 0.65f : level >= 2 ? 0.55f : 0.45f;
-	const int   passes   = level >= 3 ? 4 : level >= 2 ? 3 : 2;
+	const auto& cfg      = Cfg(level);
+	const int   iters    = cfg.iters;
+	const float cutoff   = cfg.cutoff;
+	const int   passes   = cfg.passes;
+	const float cap_px   = cfg.cap * static_cast<float>(color.extent.height);
 	{
 		static bool said = false;
 		if (!said) {
 			said = true;
-			static const char* const names[4] = {"off", "low", "high", "ultra"};
-			std::printf("RT reflections: on (%s: trace %ux%u of %ux%u, hi-z %u mips, %d iterations, %d a-trous passes, strength %g, "
-			            "wet minimum reflectance %g, G-buffer %s, exposure %s, camera %s)\n",
-			            names[level], g_rt.trace.width, g_rt.trace.height, color.extent.width, color.extent.height, g_rt.hiz.levels,
-			            iters, passes, strength, min_refl, have_gbuf ? "copy found (calibrating)" : "not found yet (depth normals, heuristic)",
+			std::printf("RT reflections: on (level %d %s: trace %ux%u of %ux%u%s, hi-z %u mips, %d iterations, rays <= %.0f px, %d "
+			            "a-trous passes, strength %g, wet minimum reflectance %g, G-buffer %s, exposure %s, camera %s)\n",
+			            level, cfg.name, g_rt.trace.width, g_rt.trace.height, color.extent.width, color.extent.height,
+			            cfg.checker ? " checkerboard" : "", g_rt.hiz.levels, iters, cap_px, passes, strength, min_refl, have_gbuf ? "copy found (calibrating)" : "not found yet (depth normals, heuristic)",
 			            inputs.exposure_buffer != nullptr ? "the game's" : "1.0", camera.prev ? "matrices" : "motion vectors only");
 			std::fflush(stdout);
 		}
@@ -651,13 +715,13 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.size[0] = static_cast<float>(color.extent.width), push.size[1] = static_cast<float>(color.extent.height);
 	push.size[2] = static_cast<float>(g_rt.trace.width), push.size[3] = static_cast<float>(g_rt.trace.height);
 	push.params[0] = strength, push.params[1] = EnvFloat("KYTY_RT_REFLECTIONS_THICKNESS", 0.3f, 0.01f, 4.0f);
-	push.params[2] = level >= 3 ? 600.0f : 300.0f;
+	push.params[2] = cfg.max_len;
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
-	push.motion[2] = cutoff, push.motion[3] = level >= 3 ? 0.8f : 1.0f;
+	push.motion[2] = cutoff, push.motion[3] = cfg.alpha;
 	push.misc[1] = static_cast<int32_t>(g_rt.frame & 0x7fffffff);
 	push.misc[2] = level;
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0) |
-	               (g_rt.row0_up ? 16 : 0);
+	               (g_rt.row0_up ? 16 : 0) | (cfg.checker ? 32 : 0);
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
 	push.dec[2] = static_cast<int32_t>(packed_count), push.dec[3] = 0;
 	const bool game_exposure = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
@@ -666,10 +730,15 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 
 	const bool timed = g_rt.pool != nullptr && g_rt.written < g_rt.read + 8; // (a ring of 8 frames)
 	const auto entry = static_cast<uint32_t>(g_rt.written % 8);
-	if (timed) {
-		command.resetQueryPool(g_rt.pool, entry * 2, 2);
-		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_rt.pool, entry * 2);
-	}
+	uint32_t   stamp_n = 0;
+	const auto stamp   = [&](uint8_t stage) {
+		if (!timed || stamp_n >= 16) return;
+		g_rt.stage_of[entry][stamp_n] = stage;
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_rt.pool, entry * 16 + stamp_n);
+		++stamp_n;
+	};
+	if (timed) command.resetQueryPool(g_rt.pool, entry * 16, 16);
+	stamp(0xff); // (the start)
 	// (What wrote the game's images, and our last frame's reads of the buffer and images.)
 	Barrier(command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
 	        vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
@@ -694,6 +763,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		header[28] = camera.up[0], header[29] = camera.up[1], header[30] = camera.up[2], header[31] = camera.up_valid ? 1.0f : 0.0f;
 		header[32] = 1.0f;     // (ExposureIndex: the exposure when the game gives none)
 		header[33] = min_refl; // (fparams.y)
+		header[34] = cap_px;   // (fparams.z)
 		command.updateBuffer(vk::Buffer(g_rt.frame_buf), 0, HeaderBytes, header.data());
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
@@ -762,23 +832,28 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		run(7, s, MipExtent(g.hiz, mip));
 	}
 	push.dec[3] = 0;
+	stamp(StHiz);
 	if (calibrate) {
 		push.dec[2] = static_cast<int32_t>(g_rt.calib_packed);
 		run(5, base, vk::Extent2D {160, 90});
 		push.dec[2] = static_cast<int32_t>(packed_count);
 		++g.calib_runs;
+		stamp(StCalib);
 	}
 	// Trace, temporal, a-trous, composite.
 	{
 		Set s = base;
 		s.oa = &g.rad, s.ob = &g.gb[cur], s.oc = &g.aux;
-		run(0, s, g.trace);
+		// (checkerboard: a thread per pair of horizontal neighbours)
+		run(0, s, cfg.checker ? vk::Extent2D {(g.trace.width + 1) / 2, g.trace.height} : g.trace);
+		stamp(StTrace);
 	}
 	{
 		Set s = base;
 		s.a = &g.rad, s.b = &g.hist[prev], s.gcur = &g.gb[cur], s.gprev = &g.gb[prev], s.aux = &g.aux, s.meta = &g.meta[prev];
 		s.oa = &g.hist[cur], s.ob = &g.meta[cur], s.oc = &g.tmp_b;
 		run(1, s, g.trace);
+		stamp(StTemporal);
 	}
 	const RtImage* src     = &g.hist[cur];
 	const RtImage* ping[2] = {&g.tmp_a, &g.tmp_b};
@@ -789,6 +864,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		s.oa = dst, s.ob = &g.rad, s.oc = &g.rad;
 		push.params[3] = static_cast<float>(1 << i);
 		run(2, s, g.trace);
+		stamp(static_cast<uint8_t>(StAtrous0 + std::min(i, 3)));
 		src = dst;
 	}
 	{
@@ -796,11 +872,12 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		s.a = src, s.b = src, s.gcur = &g.gb[cur], s.gprev = &g.gb[cur], s.aux = &g.aux, s.meta = &g.meta[cur];
 		s.oa = &g.out, s.ob = &g.rad, s.oc = &g.rad;
 		run(4, s, g.render);
+		stamp(StComposite);
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 	        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
 	if (timed) {
-		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g.pool, entry * 2 + 1);
+		g.stamps_in[entry] = stamp_n;
 		++g.written;
 	}
 	++g.frame;
