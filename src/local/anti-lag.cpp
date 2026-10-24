@@ -135,13 +135,27 @@ void Mark(int32_t stage, uint64_t index) {
 }
 } // namespace
 
+bool PhaseOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_PHASE_PACE");
+		const bool  r = v != nullptr ? v[0] == '1' : Own().on;
+		std::printf("Phase pacing: %s (KYTY_PHASE_PACE: each game step starts at a fixed phase of the flip grid, the queue "
+		            "drained 1 ms a step; under a flip rate or cap only)\n",
+		            r ? "on" : "off");
+		std::fflush(stdout);
+		return r;
+	}();
+	return on;
+}
+
 bool PaceOn() {
 	static const bool on = [] {
 		const char* off = std::getenv("KYTY_LOWLAT_PACE_BEFORE_INPUT");
 		const char* q   = std::getenv("KYTY_FLIP_QUEUE_LIMIT");
-		const bool  r   = !(off != nullptr && off[0] == '0') && (Own().on || q == nullptr || q[0] != '0');
+		// (Off by default since the constant-phase pacer: its event wait made the game's steps uneven, 212307.)
+		const bool  r   = !(off != nullptr && off[0] == '0') && q != nullptr && q[0] == '1' && !PhaseOn();
 		std::printf("Flip queue limit: %s (the game's controller read waits for frame N - 1's release under a flip rate or "
-		            "cap; KYTY_FLIP_QUEUE_LIMIT=0 / KYTY_LOWLAT_PACE_BEFORE_INPUT=0 off)\n",
+		            "cap; KYTY_FLIP_QUEUE_LIMIT=1 on, off with KYTY_PHASE_PACE)\n",
 		            r ? "on" : "off");
 		std::fflush(stdout);
 		return r;
@@ -152,7 +166,7 @@ bool PaceOn() {
 bool AutoReflex() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_LOWLAT_REFLEX");
-		return Own().on && Fsr3::Requested() && (v == nullptr || v[0] != '0');
+		return Own().on && Fsr3::Requested() && v != nullptr && v[0] == '1'; // (opt-in: the phase pacer throttles)
 	}();
 	return on;
 }
@@ -394,7 +408,7 @@ void PaceBeforeInput(uint64_t index) {
 } // namespace
 
 void SetPaceCap(double cap_ms, double vblank_ms) {
-	if (!PaceOn()) return;
+	if (!PaceOn() && !PhaseOn()) return;
 	std::lock_guard lock(g_pace_mutex);
 	if (cap_ms <= 0.0) { // (not a capped game-view frame: off, and start over)
 		g_pace.cap_ms = 0.0;
@@ -628,17 +642,193 @@ void OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick) {
 	g_own_frames.store(frame + 1, std::memory_order_release);
 }
 
+
+// KYTY_PHASE_PACE (anti-lag.h): the constant-phase pacer, ported 1:1 from tools sim phase2.py (proved there on 212307 and
+// 202407: game steps sd <= 0.29 ms, screen sd <= 0.28 ms, input->present 100 -> 31-41 ms).
+namespace {
+struct Phase {
+	double   anchor = 0.0;  // a smoothed release time on the flip grid, ms (LatNow)
+	double   last_rel = 0.0;
+	bool     have_anchor = false;
+	double   phi = 0.0;     // the step phase on that grid, ms (unwrapped)
+	bool     have_phi = false;
+	double   qe = -1.0;     // EMA of gpu done -> flip (FlipQueue's stamps), ms
+	double   last_late = -1e12;
+	int      q = 1;         // frames of cushion (1 while late in the last 5 s, 0 after 10 s)
+	double   last_step = 0.0;
+	// cadence: releases per game step over 2 s windows
+	double   cad_start = 0.0;
+	uint32_t cad_steps = 0, cad_rel = 0;
+	int      cadence = 1;
+	// per-second stats
+	double   st_start = 0.0;
+	uint32_t st_steps = 0, st_waits = 0, st_rel = 0, st_late = 0, st_depth_n = 0;
+	double   st_wait = 0.0, st_sum = 0.0, st_sum2 = 0.0, st_max = 0.0, st_q = 0.0, st_depth = 0.0;
+	double   rs_sum = 0.0, rs_sum2 = 0.0;
+	uint32_t rs_n = 0;
+	bool     logged_thread = false;
+};
+Phase                g_phase;
+std::mutex           g_phase_mutex;
+std::atomic<int>     g_flip_depth {0};
+double NowMs() { return static_cast<double>(LatNow()) / LatTicksPerMs(); }
+
+bool PhaseActiveLocked() {
+	return PhaseOn() && !FrameGen::Enabled() && g_pace.cap_ms >= 4.0 && g_pace.cap_ms <= 70.0;
+}
+
+void PhaseStep(const char* site) {
+	if (!PhaseOn() || FrameGen::Enabled()) return;
+	double cap = 0.0, vb = 0.0;
+	{
+		std::lock_guard pl(g_pace_mutex);
+		cap = g_pace.cap_ms;
+		vb  = g_pace.vblank_ms;
+	}
+	const double now = NowMs();
+	std::unique_lock lock(g_phase_mutex);
+	auto& ph = g_phase;
+	ph.cad_steps++;
+	if (cap < 4.0 || cap > 70.0 || !ph.have_anchor || ph.qe < 0.0 || now - ph.last_rel > 200.0) {
+		ph.have_phi  = false;
+		ph.last_step = now;
+		return;
+	}
+	const double P = cap * ph.cadence;
+	if (now - ph.last_late < 5000.0) ph.q = 1;
+	else if (now - ph.last_late > 10000.0) ph.q = 0;
+	const double target = std::max(2.0, vb + 1.0) + ph.q * cap;
+	if (!ph.have_phi) {
+		ph.phi      = std::fmod(now - ph.anchor, P);
+		ph.have_phi = true;
+	}
+	ph.phi += std::clamp(0.1 * (ph.qe - target), -0.5, 0.5);
+	double x = std::fmod(now - ph.anchor - ph.phi, P);
+	if (x < 0.0) x += P;
+	double until = now + std::fmod(P - x, P);
+	if (ph.last_step > 0.0) until = std::min(until, std::max(now, ph.last_step + P + 1.0)); // (never a step over P + 1 ms)
+	const double wait = until - now;
+	lock.unlock();
+	if (wait > 0.05) {
+		if (wait > 1.5) std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>((wait - 1.0) * 1000.0)));
+		while (NowMs() < until) std::this_thread::yield();
+	}
+	const double t = NowMs();
+	lock.lock();
+	if (ph.last_step > 0.0 && t - ph.last_step < 200.0) {
+		const double iv = t - ph.last_step;
+		ph.st_steps++;
+		ph.st_sum += iv;
+		ph.st_sum2 += iv * iv;
+		ph.st_max = std::max(ph.st_max, iv);
+	}
+	if (wait > 0.05) {
+		ph.st_waits++;
+		ph.st_wait += wait;
+	}
+	ph.last_step = t;
+	if (!ph.logged_thread && wait > 0.05) {
+		ph.logged_thread = true;
+#if defined(_WIN32)
+		const unsigned long tid = GetCurrentThreadId();
+#else
+		const unsigned long tid = static_cast<unsigned long>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
+#endif
+		std::printf("[phase] first wait %.1f ms on thread %lu at %s (the game's controller read)\n", wait, tid, site);
+		std::fflush(stdout);
+	}
+}
+} // namespace
+
+void NoteFlipDepth(int depth) {
+	g_flip_depth.store(depth, std::memory_order_relaxed);
+}
+
+void PhaseRelease(double queued_ms) {
+	if (!PhaseOn()) return;
+	double cap = 0.0, vb = 0.0;
+	{
+		std::lock_guard pl(g_pace_mutex);
+		cap = g_pace.cap_ms;
+		vb  = g_pace.vblank_ms;
+	}
+	const double now = NowMs();
+	std::lock_guard lock(g_phase_mutex);
+	auto& ph = g_phase;
+	ph.cad_rel++;
+	if (ph.cad_start == 0.0) ph.cad_start = now;
+	if (now - ph.cad_start >= 2000.0) {
+		if (ph.cad_steps > 0) ph.cadence = std::clamp(static_cast<int>(std::lround(static_cast<double>(ph.cad_rel) / ph.cad_steps)), 1, 3);
+		ph.cad_start = now;
+		ph.cad_steps = ph.cad_rel = 0;
+	}
+	if (cap < 4.0 || cap > 70.0) {
+		ph.have_anchor = false;
+		ph.qe          = -1.0;
+		ph.last_rel    = now;
+		return;
+	}
+	if (ph.have_anchor && now - ph.last_rel < 200.0) {
+		const double iv = now - ph.last_rel;
+		if (iv > cap + std::max(vb * 0.5, 0.5)) {
+			ph.last_late = now;
+			ph.st_late++;
+		}
+		ph.rs_n++;
+		ph.rs_sum += iv;
+		ph.rs_sum2 += iv * iv;
+	}
+	if (!ph.have_anchor || now - ph.last_rel > 200.0) {
+		ph.anchor      = now;
+		ph.have_anchor = true;
+	} else {
+		double e = now - ph.anchor;
+		e -= std::round(e / cap) * cap;
+		ph.anchor += 0.1 * e;
+		ph.anchor += std::round((now - ph.anchor) / cap) * cap; // (kept near now: fmod stays precise)
+	}
+	ph.last_rel = now;
+	if (queued_ms >= 0.0 && queued_ms < 500.0) ph.qe = ph.qe < 0.0 ? queued_ms : ph.qe + (queued_ms - ph.qe) * 0.2;
+	ph.st_rel++;
+	ph.st_q += std::max(queued_ms, 0.0);
+	ph.st_depth += g_flip_depth.load(std::memory_order_relaxed);
+	ph.st_depth_n++;
+	if (ph.st_start == 0.0) ph.st_start = now;
+	if (now - ph.st_start >= 1000.0) {
+		auto sd = [](double sum, double sum2, uint32_t n) {
+			if (n == 0) return 0.0;
+			const double m = sum / n;
+			return std::sqrt(std::max(0.0, sum2 / n - m * m));
+		};
+		std::printf("[phase] %s: period %.1f ms (cap %.1f x cadence %d), cushion %d, phase %.1f, gpu done->flip %.1f ms, "
+		            "flip queue %.2f, waits %u (mean %.1f ms), game steps %u sd %.2f ms (max %.1f), screen sd %.2f ms, late %u\n",
+		            (cap >= 4.0 && cap <= 70.0 && !FrameGen::Enabled()) ? "on" : "idle", cap * ph.cadence, cap, ph.cadence, ph.q,
+		            std::fmod(ph.phi, cap * ph.cadence), ph.st_rel ? ph.st_q / ph.st_rel : 0.0,
+		            ph.st_depth_n ? ph.st_depth / ph.st_depth_n : 0.0, ph.st_waits, ph.st_waits ? ph.st_wait / ph.st_waits : 0.0,
+		            ph.st_steps, sd(ph.st_sum, ph.st_sum2, ph.st_steps), ph.st_max, sd(ph.rs_sum, ph.rs_sum2, ph.rs_n), ph.st_late);
+		std::fflush(stdout);
+		ph.st_start = now;
+		ph.st_steps = ph.st_waits = ph.st_rel = ph.st_late = ph.st_depth_n = ph.rs_n = 0;
+		ph.st_wait = ph.st_sum = ph.st_sum2 = ph.st_max = ph.st_q = ph.st_depth = ph.rs_sum = ph.rs_sum2 = 0.0;
+	}
+}
+
 void OnInput(const char* site) {
 	if (Own().on) OwnLimit();
 	const Mode mode = g_mode.load(std::memory_order_relaxed);
-	if (mode == Mode::Off && !LatencyOn() && !PaceOn()) return;
+	if (mode == Mode::Off && !LatencyOn() && !PaceOn() && !PhaseOn()) return;
 	// Once per flip: the first controller read after the game flipped its last frame starts the next one.
 	const uint64_t flips = g_flips.load(std::memory_order_acquire);
 	uint64_t       seen  = g_flips_at_input.load(std::memory_order_relaxed);
 	if (seen == flips) return;
 	if (!g_flips_at_input.compare_exchange_strong(seen, flips, std::memory_order_acq_rel)) return;
 	const uint64_t index = g_input_index.load(std::memory_order_relaxed) + 1;
-	if (mode == Mode::Limiter && index > 2) {
+	bool phase_active = false;
+	{
+		std::lock_guard pl(g_pace_mutex);
+		phase_active = PhaseActiveLocked();
+	}
+	if (mode == Mode::Limiter && index > 2 && !phase_active) {
 		// At most one frame (index - 1) between the game and the present: frame index - 2 must have been presented
 		// (the presenter waited for its GPU work first). A frame the flip pacing holds is the one queued: no judder.
 		std::unique_lock lock(g_mutex);
@@ -660,7 +850,7 @@ void OnInput(const char* site) {
 				if (g_sleep(g_device, g_swapchain, &info) == VK_SUCCESS) value = info.value;
 			}
 		}
-		if (value != 0) {
+		if (value != 0 && !phase_active) { // (the phase pacer's step wait instead: one sleeper)
 			VkSemaphoreWaitInfo wait {};
 			wait.sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
 			wait.semaphoreCount = 1;
@@ -673,6 +863,7 @@ void OnInput(const char* site) {
 	}
 	g_pace_site = site;
 	PaceBeforeInput(index); // KYTY_LOWLAT_PACE_BEFORE_INPUT: sleep before the sample, not after
+	PhaseStep(site);        // KYTY_PHASE_PACE: the step at its phase of the flip grid
 	{
 		auto& st = g_stage[index % kStageRing];
 		st.index.store(0, std::memory_order_release);
@@ -691,7 +882,7 @@ void OnInput(const char* site) {
 }
 
 uint64_t OnFlipReserved() {
-	if (g_mode.load(std::memory_order_relaxed) == Mode::Off && !LatencyOn() && !PaceOn()) return 0;
+	if (g_mode.load(std::memory_order_relaxed) == Mode::Off && !LatencyOn() && !PaceOn() && !PhaseOn()) return 0;
 	g_flips.fetch_add(1, std::memory_order_acq_rel);
 	const uint64_t index  = g_input_index.load(std::memory_order_acquire);
 	uint64_t       tagged = g_tagged_index.load(std::memory_order_relaxed);
