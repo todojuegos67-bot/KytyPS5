@@ -1,0 +1,307 @@
+#version 450
+// KYTY_SHINE (shine.cpp): specular boost + material-aware sharpening for metal and smooth surfaces (armour, shields,
+// props) on the PS5 Pro path's pre-exposure HDR color, after the other screen-space passes, before the upscaler.
+// Modes (push.misc.x):
+//   0 lights:    a 32x18 grid of cells over the frame, 16 taps each: the brightest emissive tap (exposed luminance
+//                above the threshold, not sky) -> candidates[cell]
+//   1 select:    one thread: the 4 strongest candidates with suppression (>= 3 cells apart), their view positions from
+//                the depth, smoothed against the last frame's lights (intensity only: positions follow the camera)
+//   2 composite: per pixel, G-buffer material (roughness byte, albedo, normal): a CAS-like sharpen gated by smooth /
+//                metal / no depth edge / no foliage-like normal noise, then a GGX highlight from the sun and the lights,
+//                display-referred (scaled by 1 / the game's exposure), soft-capped; sky and far fog untouched
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2) uniform usampler2D packed0;
+layout(binding = 3) uniform usampler2D packed1;
+layout(binding = 4) uniform usampler2D packed2;
+layout(binding = 5) uniform usampler2D packed3;
+layout(binding = 6, rgba16f) uniform writeonly image2D out_img;
+layout(std430, binding = 7) buffer Frame {
+	vec4 view_rot[3]; // world -> view rotation rows (words 0..11)
+	vec4 hparams;     // x: 1.0 (exposure when the game gives none), y: light threshold, z: light radius (view units), w: lights wanted
+	uint stats[16];   // 16..31 cumulative counters (1/16 of the pixels): 0 pixels, 1 highlighted, 2 sharpened, 3 lights sum
+	vec4 lights[8];   // 32..63: 4 lights x (view pos xyz, weight), (display color rgb, -)
+	vec4 cand[];      // 64..: 32x18 cells x (exposed luminance, uv x, uv y, -)
+};
+layout(std430, binding = 8) readonly buffer Exposure {
+	float exposure_values[];
+};
+
+layout(push_constant) uniform Push {
+	vec4  proj;      // M[0], M[5], M[8], M[9]
+	vec4  depth_map; // M[10], M[14], M[11], M[15]
+	vec4  size;      // render w, h, strength, sharpen
+	vec4  sun;       // view-space direction to the sun, intensity (0: none)
+	vec4  fill;      // view-space world up, intensity of the sky fill highlight
+	ivec4 misc;      // mode, frame, flags (1 row 0 = NDC y +1, 2 normals usable), exposure index
+	ivec4 dec;       // normal code, roughness field, gloss field (-1 none), level
+} push;
+
+const float PI    = 3.14159265;
+const int   CW    = 32;
+const int   CH    = 18;
+
+vec2  RenderSize() { return push.size.xy; }
+float YS() { return (push.misc.z & 1) != 0 ? -1.0 : 1.0; }
+float ViewZ(float d) {
+	float den = d * push.depth_map.z - push.depth_map.x;
+	return abs(den) > 1e-12 ? (push.depth_map.y - d * push.depth_map.w) / den : 1e6;
+}
+vec3 ViewPos(vec2 uv, float d) {
+	float z  = ViewZ(d);
+	float w  = z * push.depth_map.z + push.depth_map.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	nd.y *= YS();
+	return vec3((nd.x * w - z * push.proj.z) / push.proj.x, (nd.y * w - z * push.proj.w) / push.proj.y, z);
+}
+bool  IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e3; }
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+float Max3(vec3 c) { return max(c.r, max(c.g, c.b)); }
+vec3  Safe(vec3 c) { return (any(isnan(c)) || any(isinf(c))) ? vec3(0) : clamp(c, vec3(0), vec3(6.0e4)); }
+vec3  Tonemap(vec3 c) { return c / (1.0 + Max3(c)); }
+vec3  InvTonemap(vec3 t) { return t / max(1.0 - min(Max3(t), 0.999), 1e-3); }
+float GameExposure() {
+	float e = exposure_values[push.misc.w];
+	return (e > 1e-12 && e < 1e12) ? e : 1.0;
+}
+
+uint Packed(int layer, ivec2 p) {
+	if (layer == 0) return texelFetch(packed0, p, 0).r;
+	if (layer == 1) return texelFetch(packed1, p, 0).r;
+	if (layer == 2) return texelFetch(packed2, p, 0).r;
+	return texelFetch(packed3, p, 0).r;
+}
+float Bits(uint w, int shift, int bits) { return float((w >> uint(shift)) & ((1u << uint(bits)) - 1u)) / float((1u << uint(bits)) - 1u); }
+vec3  OctDecode(vec2 e) {
+	e       = e * 2.0 - 1.0;
+	vec3  n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+	float t = max(-n.z, 0.0);
+	n.x += n.x >= 0.0 ? -t : t;
+	n.y += n.y >= 0.0 ? -t : t;
+	return normalize(n);
+}
+// The layouts rt-reflections.comp knows that matter here: 0 oct 16:16, 5 oct 16:16 (x high), 9 oct 8:8 bits 0..15,
+// 10 oct 8:8 bits 16..31 (Demon's Souls: layer 3, layout 9, world space).
+vec3 DecodeNormal(uint w, int l) {
+	if (l == 0) return OctDecode(vec2(Bits(w, 0, 16), Bits(w, 16, 16)));
+	if (l == 5) return OctDecode(vec2(Bits(w, 16, 16), Bits(w, 0, 16)));
+	if (l == 10) return OctDecode(vec2(Bits(w, 16, 8), Bits(w, 24, 8)));
+	return OctDecode(vec2(Bits(w, 0, 8), Bits(w, 8, 8)));
+}
+vec3 ToView(vec3 n) { return vec3(dot(view_rot[0].xyz, n), dot(view_rot[1].xyz, n), dot(view_rot[2].xyz, n)); }
+vec3 NormalAt(ivec2 p, vec3 pos) {
+	int  c = push.dec.x;
+	vec3 n = DecodeNormal(Packed(c & 3, p), (c >> 2) & 15);
+	if ((c & 64) != 0) n = ToView(n);
+	if ((c & 128) != 0) n = -n;
+	if (dot(n, -pos) < 0.0) n = -n; // (facing the camera, whatever the decode's sign convention)
+	return normalize(n);
+}
+float Field(int f, ivec2 p) {
+	if (f < 0) return 0.0;
+	float v = Bits(Packed(f & 3, p), (f >> 2) & 31, max((f >> 7) & 31, 1));
+	return (f & 4096) != 0 ? 1.0 - v : v;
+}
+
+// ---- 0: emissive candidates per cell ----
+void Lights(ivec2 cell) {
+	if (cell.x >= CW || cell.y >= CH) return;
+	float e    = GameExposure();
+	float best = 0.0;
+	vec2  buv  = vec2(0);
+	for (int j = 0; j < 4; ++j)
+		for (int i = 0; i < 4; ++i) {
+			vec2  uv = (vec2(cell) + (vec2(i, j) + 0.5) / 4.0) / vec2(CW, CH);
+			float d  = textureLod(depth_tex, uv, 0).r;
+			if (IsSky(d) || abs(ViewZ(d)) > 60.0) continue;
+			float l = Luma(Safe(textureLod(color_tex, uv, 0).rgb) * e);
+			if (l > best) best = l, buv = uv;
+		}
+	cand[cell.y * CW + cell.x] = vec4(best >= hparams.y ? best : 0.0, buv, 0.0);
+}
+
+// ---- 1: the dominant lights ----
+void Select() {
+	int   want = int(hparams.w);
+	vec4  old[8];
+	for (int k = 0; k < 8; ++k) old[k] = lights[k];
+	int   picked[4] = int[4](-1, -1, -1, -1);
+	float e         = GameExposure();
+	for (int n = 0; n < want; ++n) {
+		float best = 0.0;
+		int   bi   = -1;
+		for (int c = 0; c < CW * CH; ++c) {
+			float l = cand[c].x;
+			if (l <= best) continue;
+			bool near = false;
+			for (int k = 0; k < n; ++k) {
+				ivec2 a = ivec2(picked[k] % CW, picked[k] / CW), b = ivec2(c % CW, c / CW);
+				if (max(abs(a.x - b.x), abs(a.y - b.y)) < 3) near = true;
+			}
+			if (!near) best = l, bi = c;
+		}
+		picked[n] = bi;
+	}
+	uint count = 0u;
+	for (int n = 0; n < 4; ++n) {
+		vec4 pw = vec4(0), col = vec4(0);
+		int  c  = n < want ? picked[n] : -1;
+		if (c >= 0) {
+			vec2 uv  = cand[c].yz;
+			vec3 pos = ViewPos(uv, textureLod(depth_tex, uv, 0).r);
+			pos -= normalize(pos) * 0.3; // (the flame in front of what it is drawn on)
+			// The light's display color: a small blur around the tap, capped (a torch, not the sun).
+			vec2 t = 2.0 / RenderSize();
+			vec3 s = Safe(textureLod(color_tex, uv, 0).rgb) + Safe(textureLod(color_tex, uv + vec2(t.x, 0), 0).rgb) +
+			         Safe(textureLod(color_tex, uv - vec2(t.x, 0), 0).rgb) + Safe(textureLod(color_tex, uv + vec2(0, t.y), 0).rgb) +
+			         Safe(textureLod(color_tex, uv - vec2(0, t.y), 0).rgb);
+			vec3 dc = s * (0.2 * e);
+			dc *= min(1.0, 4.0 / max(Max3(dc), 1e-4));
+			// Smoothed against the nearest of the last frame's lights (fade in, flicker kept mild).
+			float ow = 0.0;
+			vec3  oc = dc;
+			float bd = 2.25;
+			for (int k = 0; k < 4; ++k) {
+				vec3  d2 = old[k * 2].xyz - pos;
+				float dd = dot(d2, d2);
+				if (old[k * 2].w > 0.0 && dd < bd) bd = dd, ow = old[k * 2].w, oc = old[k * 2 + 1].rgb;
+			}
+			pw  = vec4(pos, mix(ow, 1.0, 0.25));
+			col = vec4(mix(oc, dc, 0.35), 0.0);
+			++count;
+		}
+		lights[n * 2]     = pw;
+		lights[n * 2 + 1] = col;
+	}
+	atomicAdd(stats[3], count);
+}
+
+// ---- 2: composite ----
+float DGgx(float nh, float a2) {
+	float d = nh * nh * (a2 - 1.0) + 1.0;
+	return a2 / (PI * d * d);
+}
+float VisSmith(float nl, float nv, float a) {
+	return 0.5 / max(nl * (nv * (1.0 - a) + a) + nv * (nl * (1.0 - a) + a), 1e-4);
+}
+vec3 Spec(vec3 n, vec3 v, vec3 l, float a2, vec3 f0) {
+	float nl = max(dot(n, l), 0.0);
+	if (nl <= 0.0) return vec3(0);
+	vec3  h  = normalize(v + l);
+	float nv = max(dot(n, v), 1e-3);
+	float nh = max(dot(n, h), 0.0);
+	float vh = max(dot(v, h), 0.0);
+	vec3  f  = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
+	return DGgx(nh, a2) * VisSmith(nl, nv, sqrt(a2)) * f * nl;
+}
+
+void Composite(ivec2 p) {
+	ivec2 sz = ivec2(RenderSize());
+	if (p.x >= sz.x || p.y >= sz.y) return;
+	vec3  c    = Safe(texelFetch(color_tex, p, 0).rgb);
+	float d    = texelFetch(depth_tex, p, 0).r;
+	bool  stat = ((p.x | p.y) & 3) == 0;
+	if (stat) atomicAdd(stats[0], 1u);
+	if (IsSky(d)) {
+		imageStore(out_img, p, vec4(c, 1.0));
+		return;
+	}
+	vec2  uv   = (vec2(p) + 0.5) / RenderSize();
+	vec3  pos  = ViewPos(uv, d);
+	float dist = length(pos);
+	float far  = 1.0 - smoothstep(35.0, 110.0, abs(pos.z)); // (fog and distant geometry stay as drawn)
+	if (far <= 0.0) {
+		imageStore(out_img, p, vec4(c, 1.0));
+		return;
+	}
+	// Material.
+	float rough  = Field(push.dec.y, p);
+	float gloss  = push.dec.z >= 0 ? Field(push.dec.z, p) : 0.0;
+	uint  a0     = Packed(0, p);
+	vec3  albedo = vec3(Bits(a0, 0, 8), Bits(a0, 8, 8), Bits(a0, 16, 8));
+	float smooth_ = 1.0 - smoothstep(0.12, 0.55, rough);
+	smooth_       = max(smooth_, gloss * 0.6);
+	float al      = Luma(albedo);
+	float sat     = (Max3(albedo) - min(albedo.r, min(albedo.g, albedo.b))) / max(Max3(albedo), 1e-3);
+	// Armour / metal: smooth, little saturation, mid-bright albedo (bronze / gold allowed some warmth).
+	float metal = smooth_ * (1.0 - smoothstep(0.25, 0.7, sat)) * smoothstep(0.06, 0.3, al);
+	// Neighbours: normals (foliage-like noise, specular anti-aliasing) and depth (edges).
+	vec3     n = vec3(0, 0, 1);
+	bool     have_n = (push.misc.z & 2) != 0;
+	ivec2    o[4]   = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+	float    nvar = 0.0, edge = 0.0;
+	vec3     nb[4];
+	for (int k = 0; k < 4; ++k) {
+		ivec2 q = clamp(p + o[k], ivec2(0), sz - 1);
+		nb[k]   = Safe(texelFetch(color_tex, q, 0).rgb);
+		float dz = ViewZ(texelFetch(depth_tex, q, 0).r);
+		edge     = max(edge, abs(dz - pos.z) / max(abs(pos.z), 1e-3));
+	}
+	if (have_n) {
+		n = NormalAt(p, pos);
+		for (int k = 0; k < 4; ++k) {
+			ivec2 q = clamp(p + o[k], ivec2(0), sz - 1);
+			nvar += 1.0 - clamp(dot(n, NormalAt(q, pos)), 0.0, 1.0);
+		}
+	}
+	nvar *= 0.25;
+	// Foliage / noise: green-dominant rough-ish albedo, or a normal that changes wildly pixel to pixel.
+	float foliage = smoothstep(0.08, 0.25, nvar) + step(albedo.r + albedo.b, albedo.g * 1.6) * step(0.06, albedo.g) * (1.0 - metal);
+	float mask    = smooth_ * far * (1.0 - clamp(foliage, 0.0, 1.0));
+	float e       = GameExposure();
+
+	// Sharpen (CAS-like, in the exposed, tonemapped space), only where the material is smooth / metal and flat.
+	float sw  = push.size.w * mask * (0.4 + 0.6 * metal) * (1.0 - smoothstep(0.01, 0.04, edge));
+	vec3  out_c = c;
+	if (sw > 0.01) {
+		vec3 t  = Tonemap(c * e);
+		vec3 t0 = Tonemap(nb[0] * e), t1 = Tonemap(nb[1] * e), t2 = Tonemap(nb[2] * e), t3 = Tonemap(nb[3] * e);
+		vec3 mn = min(t, min(min(t0, t1), min(t2, t3)));
+		vec3 mx = max(t, max(max(t0, t1), max(t2, t3)));
+		vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));
+		vec3 w   = amp * (-1.0 / mix(8.0, 5.0, clamp(sw, 0.0, 1.0)));
+		vec3 s   = clamp((t + w * (t0 + t1 + t2 + t3)) / (1.0 + 4.0 * w), mn, mx); // (never beyond the neighbourhood)
+		out_c    = InvTonemap(mix(t, s, clamp(sw, 0.0, 1.0))) / e;
+		if (stat && sw > 0.05) atomicAdd(stats[2], 1u);
+	}
+
+	// Highlights (display-referred, then / exposure).
+	vec3 add = vec3(0);
+	if (have_n && mask > 0.01 && push.size.z > 0.0) {
+		vec3  v    = -pos / max(dist, 1e-4);
+		float r    = mix(0.08, 0.6, clamp(rough, 0.0, 1.0));
+		float a2   = max(r * r * r * r + nvar * 0.5, 0.0025); // (wider where the normal varies: no sparkle)
+		vec3  base = mix(vec3(0.04), clamp(albedo * 1.4, 0.0, 1.0), metal);
+		// Sun (and a soft sky fill when the sun is unknown), visible only where the game itself lit the pixel well.
+		float lit  = smoothstep(0.12, 0.6, Luma(c * e) / max(al, 0.05));
+		if (push.sun.w > 0.0) add += Spec(n, v, normalize(push.sun.xyz), a2, base) * push.sun.w * lit;
+		if (push.fill.w > 0.0) add += Spec(n, v, normalize(push.fill.xyz), max(a2 * 4.0, 0.02), base) * push.fill.w * (0.3 + 0.7 * lit);
+		// Local lights (torches, fire): distance-attenuated, windowed to zero at 4 radii.
+		for (int k = 0; k < 4; ++k) {
+			vec4 lp = lights[k * 2];
+			if (lp.w <= 0.0) continue;
+			vec3  ld  = lp.xyz - pos;
+			float l2  = dot(ld, ld);
+			float rad = hparams.z;
+			float win = 1.0 - smoothstep(rad * 2.0, rad * 4.0, sqrt(l2));
+			if (win <= 0.0) continue;
+			float att = win / (1.0 + l2 / (rad * rad));
+			add += Spec(n, v, ld * inversesqrt(max(l2, 1e-6)), a2, base) * lights[k * 2 + 1].rgb * (att * lp.w * 0.5);
+		}
+		add *= push.size.z * mask * (0.35 + 0.65 * metal);
+		float cap = 3.0 * push.size.z;
+		add       = add / (1.0 + Max3(add) / cap); // (soft cap: highlights, not blown-out blobs)
+		if (stat && Max3(add) > 0.02) atomicAdd(stats[1], 1u);
+	}
+	imageStore(out_img, p, vec4(Safe(out_c + add / e), 1.0));
+}
+
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (push.misc.x == 0) Lights(p);
+	else if (push.misc.x == 1) {
+		if (p == ivec2(0)) Select();
+	} else Composite(p);
+}

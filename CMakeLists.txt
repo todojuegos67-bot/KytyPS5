@@ -455,6 +455,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${rt_reflections_header}")
 
+# KYTY_SHINE: specular highlights + material-aware sharpening before the upscaler (src/local/shine.cpp).
+set(shine_source "${KYTY_SOURCE_DIR}/local/shine.comp")
+set(shine_spv "${gpu_tiler_generated_dir}/shine.spv")
+set(shine_header "${gpu_tiler_generated_dir}/shine_spv.h")
+add_custom_command(
+	OUTPUT "${shine_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${shine_spv}" "${shine_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${shine_spv} -DOUTPUT=${shine_header}
+	        -DSYMBOL=SHINE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${shine_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${shine_header}")
+
 # KYTY_RT_SHADOWS: screen-space ray-traced sun shadows before the upscaler (src/local/frame-gen.cpp).
 set(cshadow_source "${KYTY_SOURCE_DIR}/local/cshadow.comp")
 set(cshadow_spv "${gpu_tiler_generated_dir}/cshadow.spv")
@@ -552,6 +568,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.h"
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.cpp"
+	"${KYTY_SOURCE_DIR}/local/shine.h"
+	"${KYTY_SOURCE_DIR}/local/shine.cpp"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.cpp"
 	"${KYTY_SOURCE_DIR}/local/kbm-warp.h"

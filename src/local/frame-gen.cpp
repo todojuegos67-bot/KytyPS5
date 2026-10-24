@@ -26,6 +26,7 @@
 #include "gpu_tiler_shaders/gtao_spv.h"
 #include "gpu_tiler_shaders/ssr_spv.h"
 #include "local/rt-reflections.h"
+#include "local/shine.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
 #include "kernel/memory.h"
 #include <string>
@@ -5391,7 +5392,7 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 }
 } // namespace
 
-bool SsrWanted() { return SsrLevel() > 0 || RtReflectionsWanted(); }
+bool SsrWanted() { return SsrLevel() > 0 || RtReflectionsWanted() || ShineWanted(); }
 bool SsrPassWanted() { return SsrLevel() > 0; }
 
 void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
@@ -6802,6 +6803,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		       false;
 	}
 	const auto l_view = ToView(view, g_cs.latch_axis);
+	ShineSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor)); // (KYTY_SHINE: shine.cpp)
 	push.extra[1] = static_cast<float>(l_view[0]), push.extra[2] = static_cast<float>(l_view[1]), push.extra[3] = static_cast<float>(l_view[2]);
 	push.trace[2] = strength * g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade) * static_cast<float>(g_cs.sun_factor); // (smoothstep fade; overcast)
 	push.tune[0]  = g_cs.log_k >= 0.0 ? static_cast<float>(1.0 / std::max(std::exp2(g_cs.log_k), 1.25)) : 0.0f;
@@ -6880,6 +6882,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	GtaoApply(command, inputs); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
 	SsrApply(command, inputs); // (KYTY_SSR: likewise, after GTAO; nothing when off)
 	RtReflectionsApply(command, inputs); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
+	ShineApply(command, inputs); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
 	const bool  fsr  = g_sr_kind == 3;
