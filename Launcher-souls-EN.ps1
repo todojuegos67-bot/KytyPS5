@@ -260,7 +260,7 @@ function Start-Game {
 	if ($rN[$cmbFade.SelectedIndex]) { $psargs += @('-ObjectFade', $rN[$cmbFade.SelectedIndex]) }
 	$aN = @('Ultra', 'High', '', 'Low', 'Off'); if ($aN[$cmbAaS.SelectedIndex]) { $psargs += @('-AaSharp', $aN[$cmbAaS.SelectedIndex]) }
 	$postOff = @($script:postChecks | Where-Object { -not $_[0].Checked } | ForEach-Object { $_[1] }) -join ','; if ($postOff) { $psargs += @('-PostOff', $postOff) }  # (10-23)
-	$detNames = @('Ultra', 'VeryHigh', 'High', 'Normal', 'Low'); if ($cmbDet.SelectedIndex -ne 2) { $psargs += @('-Detail', $detNames[$cmbDet.SelectedIndex]) }  # (10-23) preset de detalle
+	$detNames = @('Lejana', 'VeryHigh', 'High', 'Normal', 'Low')  # (10-24) Ultra = Lejana: sombras del juego a 1000 m, 4 cascadas, objetos lejanos, SSR largo; if ($cmbDet.SelectedIndex -ne 2) { $psargs += @('-Detail', $detNames[$cmbDet.SelectedIndex]) }  # (10-23) preset de detalle
 	if ($cmbDist.SelectedIndex -ge 1) { $psargs += @('-Quality', @('', 'high', 'low', 'lowest')[$cmbDist.SelectedIndex]) }  # (10-23) Alto = high
 	if ($chkExcl.Checked) { $psargs += '-ExclusiveFullscreen' }
 	if ($cmbAspect.SelectedIndex -gt 0) { $psargs += @('-Aspect', @('16:9', '21:9', '32:9')[$cmbAspect.SelectedIndex]) }  # (10-23) ultrawide
@@ -308,7 +308,8 @@ function Start-Game {
 	$tsel = if ($cmbTest) { $script:testModes[[math]::Max(0, $cmbTest.SelectedIndex)][1] } else { '' }
 	if ($tsel -like 'KYTY_*') { $sets += $tsel } elseif ($tsel) { $extraCv += $tsel }  # (KYTY_*: por -Set, que manda sobre la config)
 	if ($extraCv.Count) { $psargs += @('-ExtraConvars', ($extraCv -join ';')) }
-	if ($chkMetricas.Checked) { $sets += 'KYTY_LATENCY=1' }  # (10-24) fila Latencia de las metricas
+	if ($chkMetricas.Checked) { $sets += 'KYTY_LATENCY=1' }
+	if ($cmbShine -and $cmbShine.SelectedIndex -gt 0) { $sets += "KYTY_SHINE=$($cmbShine.SelectedIndex)" }  # (10-24) brillo de metales  # (10-24) fila Latencia de las metricas
 	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
@@ -1698,7 +1699,7 @@ foreach ($pp in @(@('Motion Blur', 'motionblur'), @('Depth of Field', 'dof'), @(
 	$px += 134; if ($px -gt 300) { $px = 12; $py += 30 }
 }
 # (10-24) Ray tracing en pantalla (beta): sombras del sol y reflejos con denoise. Solo con DLSS, XeSS o FSR.
-$gRt = New-Group 'Ray tracing (beta)' 10 586 420 92
+$gRt = New-Group 'Ray tracing (beta)' 10 586 420 124
 function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @('Off', 'Low', 'High', 'Ultra')) {
 	$lb = New-Label $label $smallFont $ink 0 0 98 22; $panel.Controls.Add($lb)
 	$c = New-Object System.Windows.Forms.ComboBox
@@ -1712,6 +1713,7 @@ function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @(
 }
 $cmbRtSh = New-RtCombo 'RT Shadows' 'rtshadow' 24 'Ray-traced sun shadows on the image, with denoising. Only with DLSS, XeSS or FSR. Low ~0.3 ms, High ~1 ms, Ultra ~1.5 ms. Beta.'
 $cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl2' 56 'Ray-traced reflections on water, puddles and wet surfaces, with denoising. Only with DLSS, XeSS or FSR. Low ~0.6 ms, Medium ~1 ms, High ~2 ms, Ultra ~4.5 ms. Beta.' @('Off', 'Low', 'Medium', 'High', 'Ultra')
+$cmbShine = New-RtCombo 'Metal shine' 'shine' 88 'Armour, shields and metal: highlights from the sun and from torches and fires, plus a bit more sharpness. Only with DLSS, XeSS or FSR. Best with RT Shadows on. Beta.' @('Off', 'Sun', 'Sun + 2 lights', 'Sun + 4 lights')
 
 # (10-24) Tu equipo: tarjeta con el caballero senalando la grafica y el equipo detectados (antes, una linea abajo).
 function New-PcCard {
@@ -1760,7 +1762,7 @@ function New-PcCard {
 	$gc.Dispose()
 	$pb = New-Object System.Windows.Forms.PictureBox
 	$pb.BackColor = [System.Drawing.Color]::Transparent; $pb.Image = $bmp
-	$pb.Location = New-Object System.Drawing.Point(10, 688); $pb.Size = New-Object System.Drawing.Size($cw, $ch)
+	$pb.Location = New-Object System.Drawing.Point(10, 718); $pb.Size = New-Object System.Drawing.Size($cw, $ch)
 	$panel.Controls.Add($pb)
 	return $pb
 }
@@ -1818,7 +1820,7 @@ $trkAdz = New-Slider 'kbmadz' 0 50 15 218 62 { param($v) "Anti-deadzone: $v%" }
 $tips.SetToolTip($trkSens, 'How much the camera turns per mouse movement (1.00 = normal).')
 # (10-23) Velocidad de camara del juego con teclado y raton (cp11_Setting_CameraSpeed): mas alta = los giros grandes del
 # raton no se quedan en el tope del stick. Sin teclado y raton, la del juego (la de su menu).
-$trkCam = New-Slider 'kbmcam' 1 15 10 12 116 { param($v) "Camera speed (mouse): $v$(if ($v -gt 10) { ' (extra)' })" }  # (10-24) 11-15: por encima del menu del juego
+$trkCam = New-Slider 'kbmcam2' 5 15 10 12 116 { param($v) "Camera speed (mouse): $v$(if ($v -gt 10) { ' (extra)' })" }  # (10-24) 11-15: por encima del menu del juego
 $tips.SetToolTip($trkCam, 'Keyboard and mouse only: the game camera''s maximum turn speed. 10 = the game menu''s maximum. 11-15 (extra, experimental): faster than the menu; if the camera acts strange, go back to 10. Without keyboard and mouse the game menu''s value is used.')
 $tips.SetToolTip($trkAdz, 'Skips the game''s stick deadzone: higher means a small mouse movement already turns the camera. If the camera moves by itself, lower it.')
 # (10-24) Frame warp: la camara del raton desplaza el 3D al momento (HUD quieto), tambien con la frame generation de AMD.
