@@ -2468,7 +2468,9 @@ void PipelineCache::EvictIdlePipelines() {
 	// Our RAM guard / RAM diet still evicts under RAM pressure, whatever the idle-evict cut-off above.
 	// RAM pressure (ram-guard.h): pipelines idle 60 s (20 s when critical) leave too, whatever the video memory; each
 	// held ~220 KB of the driver's RAM and is made again from the static store at its next binding.
-	const int ram_pressure = RamGuard::PressureLevel();
+	// (Critical only: at low pressure, 10-24, a 16 GB simulation evicted 3552 pipelines and made 1296 again for ~10-30 MB
+	// freed a pass.)
+	const int ram_pressure = RamGuard::PressureLevel() >= RamGuard::Critical ? RamGuard::Critical : 0;
 	m_evict_pressure = m_evict_pressure || RamDietEnabled() || ram_pressure != 0;
 	if (RamDietEnabled()) {
 		// Replaced unoptimized pipelines past RamDietReplacedSeconds (pushed in time order).
@@ -2492,8 +2494,7 @@ void PipelineCache::EvictIdlePipelines() {
 	if (m_evict_pressure) {
 		auto idle = settings.idle;
 		if (ram_pressure != 0)
-			idle = std::min<std::chrono::nanoseconds>(idle, ram_pressure >= RamGuard::Critical ? std::chrono::seconds(20)
-			                                                                                   : std::chrono::seconds(60));
+			idle = std::min<std::chrono::nanoseconds>(idle, std::chrono::seconds(60));
 		const auto horizon = (now - idle).time_since_epoch().count();
 		uint32_t   first   = flip - std::min<uint32_t>(flip - 1, static_cast<uint32_t>(m_flip_times.size() - 1)), last = flip;
 		if (m_flip_times[first % m_flip_times.size()] <= horizon) {
