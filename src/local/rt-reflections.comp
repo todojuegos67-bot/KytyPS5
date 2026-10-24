@@ -52,17 +52,20 @@ layout(std430, binding = 18) buffer Frame {
 };
 // calib[] layout (ints): [0] samples; [CALIB_NORMAL + ((layer * NLAYOUTS + layout) * 2 + space) * 2 + convention] sum of
 // cos * 1000 (convention 0: the screen y convention in use, 1: mirrored); [CALIB_BYTES + field * 3 + k] byte stats;
-// [CALIB_FLOORS + convention] up-facing depth normals (world up known); [STATS + k] cumulative counters, never cleared
-// (1/16 of the pixels: 0 composite pixels (not sky), 1 weight > 0.05, 2 sum of weight * 1000, 3 reflective mask > 0.05,
-// 4 rays traced, 5 ray hits, 6 G-buffer normal used).
+// [CALIB_FLOORS + convention] up-facing depth normals (world up known); [CALIB_WET] puddle-guess pixels, then 16 byte
+// field sums there, [CALIB_WET + 17] water pixels, then 16 byte field sums there (to find a material field);
+// [STATS + k] cumulative counters, never cleared (1/16 of the pixels: 0 composite pixels (not sky), 1 weight > 0.05,
+// 2 sum of weight * 1000, 3 reflective mask > 0.05, 4 rays traced, 5 ray hits, 6 G-buffer normal used, 7 water).
 const int NLAYOUTS     = 13;
 const int CALIB_NORMAL = 1;
 const int CALIB_BYTES  = CALIB_NORMAL + 4 * NLAYOUTS * 4;
 const int CALIB_FLOORS = CALIB_BYTES + 16 * 3;
-const int STATS        = 272;
+const int CALIB_WET    = CALIB_FLOORS + 2;
+const int STATS        = 300;
 layout(std430, binding = 19) readonly buffer Exposure {
 	float exposure_values[];
 };
+layout(binding = 20) uniform sampler2D gdepth; // the depth when the deferred lighting ran (misc.w & 64), before water
 
 layout(push_constant) uniform Push {
 	vec4  proj;      // M[0], M[5], M[8], M[9]
@@ -71,7 +74,8 @@ layout(push_constant) uniform Push {
 	vec4  params;    // strength, thickness (view units), max ray length (view units), a-trous step
 	vec4  motion;    // motion scale x, y, roughness cutoff, temporal minimum alpha scale
 	ivec4 misc;      // mode, frame, level, flags (1 reset, 2 history valid, 4 camera matrices, 8 up known, 16 row 0 = NDC y +1,
-	                 // 32 checkerboard trace: half the trace pixels march each frame, the others keep their history)
+	                 // 32 checkerboard trace: half the trace pixels march each frame, the others keep their history,
+	                 // 64 the G-buffer-time depth is bound: water detection)
 	ivec4 dec;       // normal code (-1: depth normals), roughness field (-1: heuristic), packed layers, hi-z mip
 	ivec4 misc2;     // exposure index, hi-z levels, max iterations, roughness trusted (1: from the environment)
 } push;
@@ -231,21 +235,31 @@ struct Surf {
 	float mask;
 	float gb; // 1: the G-buffer normal was used
 };
-// Wet surfaces (water, puddles, wet stone): up-facing, locally flat, rather plain and darker than the surroundings.
-// Demon's Souls' wet stone is textured and its depth normals are noisy far away, so flatness and plainness only scale
-// the mask (the first version required all four at once: about nothing passed).
-float HeuristicMask(vec2 uv, vec3 Nd, vec3 P) {
-	float upf;
-	if ((push.misc.w & 8) != 0) upf = smoothstep(0.72, 0.92, dot(Nd, up_view.xyz));
-	else upf = smoothstep(0.72, 0.92, abs(Nd.y));
-	if (upf <= 0.0) return 0.0;
-	vec2 t = 1.0 / RenderSize();
-	// Flat: the geometric normal about the same 3 pixels away on both axes.
+// Reflectivity comes from material data, never from geometry alone (a floor-wide sheen on dry dirt and stone was the
+// previous version's look). Sources, the strongest wins:
+//   water:    the final depth nearer than the depth the deferred lighting read (drawn after the G-buffer), up-facing
+//   material: the roughness field from KYTY_RT_REFLECTIONS_ROUGH (trusted)
+//   guess:    up-facing, very flat, plain, darker than around it (a puddle's look), scaled to a faint at most
+//             (fparams.w, 0.2): only its Fresnel, no minimum reflectance, so it shows at grazing angles at most
+// The geometric factors only scale a source down. The minimum reflectance (fparams.y) is earned by a mask above 0.5:
+// only water and smooth material reach it.
+float UpFacing(vec3 Nd) {
+	if ((push.misc.w & 8) != 0) return smoothstep(0.80, 0.95, dot(Nd, up_view.xyz));
+	return smoothstep(0.80, 0.95, abs(Nd.y));
+}
+float Flatness(vec2 uv, vec3 Nd, float lo, float hi) {
+	vec2  t  = 1.0 / RenderSize();
 	vec2  ua = uv + vec2(3.0 * t.x, 0), ub = uv + vec2(0, 3.0 * t.y);
 	vec3  Na = NormalAt(ua, ViewPos(ua, DepthAt(ua)));
 	vec3  Nb = NormalAt(ub, ViewPos(ub, DepthAt(ub)));
-	float flat_ = smoothstep(0.86, 0.97, min(dot(Na, Nd), dot(Nb, Nd)));
+	return smoothstep(lo, hi, min(dot(Na, Nd), dot(Nb, Nd)));
+}
+float PuddleGuess(vec2 uv, vec3 Nd) {
+	float upf = UpFacing(Nd);
+	if (upf <= 0.0) return 0.0;
+	float flat_ = Flatness(uv, Nd, 0.97, 0.995);
 	if (flat_ <= 0.0) return 0.0;
+	vec2  t  = 1.0 / RenderSize();
 	float m1 = 0.0, m2 = 0.0;
 	for (int y = -1; y <= 1; ++y)
 		for (int x = -1; x <= 1; ++x) {
@@ -254,49 +268,59 @@ float HeuristicMask(vec2 uv, vec3 Nd, vec3 P) {
 		}
 	m1 /= 9.0, m2 /= 9.0;
 	float cv    = sqrt(max(m2 - m1 * m1, 0.0)) / max(m1, 1e-12);
-	float plain = 1.0 - smoothstep(0.15, 0.70, cv);
+	float plain = 1.0 - smoothstep(0.06, 0.20, cv);
+	if (plain <= 0.0) return 0.0;
 	float ring  = 0.0;
 	for (int i = 0; i < 8; ++i) {
 		float a = float(i) * (PI * 0.25);
 		ring += Luma(SafeColor(textureLod(color_tex, uv + vec2(cos(a), sin(a)) * t * 24.0, 0).rgb));
 	}
 	ring /= 8.0;
-	float dark = 1.0 - smoothstep(0.70, 1.30, m1 / max(ring, 1e-12));
-	return upf * flat_ * mix(0.55, 1.0, plain) * mix(0.65, 1.0, dark);
+	float dark = 1.0 - smoothstep(0.65, 0.95, m1 / max(ring, 1e-12));
+	return upf * flat_ * plain * dark;
 }
-Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P) {
+// Water: something nearer than the G-buffer's surface (by 2 % of the distance or more), up-facing and flat.
+float WaterMask(ivec2 rp, float d, vec2 uv, vec3 Nd) {
+	if ((push.misc.w & 64) == 0) return 0.0;
+	float d0 = texelFetch(gdepth, rp, 0).r;
+	float z  = abs(ViewZ(d));
+	float z0 = IsSky(d0) ? FAR : abs(ViewZ(d0));
+	float nearer = smoothstep(0.02, 0.05, (z0 - z) / max(z, 1e-3));
+	if (nearer <= 0.0) return 0.0;
+	float upf = UpFacing(Nd);
+	if (upf <= 0.0) return 0.0;
+	return nearer * upf * mix(0.3, 1.0, Flatness(uv, Nd, 0.90, 0.98));
+}
+Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	Surf s;
 	vec3 Nd = NormalAt(ruv, P);
 	vec3 Ng;
 	// The G-buffer belongs to the visible surface only when its normal roughly agrees with the depth's (water or
-	// particles drawn after the G-buffer copy do not: depth normals and the heuristic there).
+	// particles drawn after the G-buffer copy do not: depth normals there).
 	bool match = GbufNormal(rp, Ng) && dot(Ng, Nd) > 0.6;
 	vec3 V     = normalize(-P);
-	s.N        = match ? Ng : Nd;
-	s.Ng       = Nd;
-	s.gb       = match ? 1.0 : 0.0;
+	float water = WaterMask(rp, d, ruv, Nd);
+	if (water > 0.0) match = false; // (the G-buffer holds the bed under the water)
+	s.N  = match ? Ng : Nd;
+	s.Ng = Nd;
+	s.gb = match ? 1.0 : 0.0;
 	if (dot(s.N, V) < 0.02) s.N = normalize(s.N + V * (0.02 - dot(s.N, V) + 0.01)); // (back-facing by a little: bent)
 	float cut = push.motion.z;
-	float m   = HeuristicMask(ruv, Nd, P);
-	float hr  = mix(0.30, 0.05, m); // (the more certainly wet, the smoother)
-	if (match && push.dec.y >= 0) {
-		float r = clamp(Field(push.dec.y, rp), 0.0, 1.0);
-		if (push.misc2.w != 0) {
-			// (a roughness from the environment: trusted, every smooth surface reflects)
-			s.rough = r;
-			s.mask  = 1.0 - smoothstep(cut * 0.6, cut, r);
-		} else {
-			// (the calibration's guess: it only modulates the wet-surface mask, never adds reflections of its own)
-			float gloss = 1.0 - smoothstep(cut * 0.4, cut, r);
-			s.rough     = mix(hr, min(r, hr), 0.5);
-			s.mask      = m * mix(0.5, 1.0, gloss);
-		}
-	} else {
-		s.rough = hr;
-		s.mask  = m;
+	float mat = 0.0, mat_r = 1.0;
+	if (match && push.dec.y >= 0 && push.misc2.w != 0) {
+		mat_r = clamp(Field(push.dec.y, rp), 0.0, 1.0);
+		mat   = 1.0 - smoothstep(cut * 0.6, cut, mat_r);
 	}
-	s.mask *= 1.0 - smoothstep(cut * 0.6, cut, s.rough);
+	float guess = water > 0.0 ? 0.0 : PuddleGuess(ruv, Nd) * fparams.w;
+	s.mask  = max(water, max(mat, guess));
+	s.rough = water >= mat && water >= guess ? 0.03 : mat >= guess ? mat_r : 0.12;
 	return s;
+}
+// The share of the reflection in the composite (and the trace's early out): Fresnel (Schlick with roughness, f0 0.04)
+// and, for a mask above 0.5 (water, smooth material), the minimum reflectance.
+float Spec(float mask, float rough, float nv) {
+	float fr = 0.04 + (max(1.0 - rough, 0.04) - 0.04) * pow(1.0 - nv, 5.0);
+	return max(fr, fparams.y * smoothstep(0.5, 0.9, mask) * (1.0 - smoothstep(0.1, 0.5, rough)));
 }
 
 // ---- Hi-Z ----
@@ -426,15 +450,13 @@ void Trace(ivec2 px, bool march) {
 	}
 	vec3  P    = ViewPos(ruv, d);
 	float dist = abs(P.z);
-	Surf  s    = SurfaceAt(rp, ruv, P);
+	Surf  s    = SurfaceAt(rp, ruv, P, d);
 	imageStore(out_b, px, vec4(s.N, dist));
 	if (s.mask < 0.01 || s.rough > push.motion.z) { StoreMiss(px, s); return; }
 	vec3 V = normalize(-P);
 	// Early out: the composite's weight (below) would stay under 0.02: no ray, and no reflection downstream.
 	{
-		float nv   = clamp(dot(s.N, V), 0.0, 1.0);
-		float fr   = 0.04 + (max(1.0 - s.rough, 0.04) - 0.04) * pow(1.0 - nv, 5.0);
-		float west = push.params.x * s.mask * max(fr, fparams.y * (1.0 - smoothstep(0.1, 0.5, s.rough)));
+		float west = push.params.x * s.mask * Spec(s.mask, s.rough, clamp(dot(s.N, V), 0.0, 1.0));
 		if (west < 0.02) {
 			s.mask = 0.0;
 			StoreMiss(px, s);
@@ -736,6 +758,7 @@ void Composite(ivec2 px) {
 		return;
 	}
 	if (st && mask > 0.05) Stat(3, 1);
+	if (st && mask > 0.5 && (push.misc.w & 64) != 0 && WaterMask(px, d, uv, Nd) > 0.5) Stat(7, 1);
 	if (Bad(rf) || rf.a < 1e-3) {
 		imageStore(out_a, px, col);
 		return;
@@ -745,13 +768,7 @@ void Composite(ivec2 px) {
 	vec3  V     = normalize(-P);
 	if (dot(N, V) < 0.02) N = normalize(N + V * (0.02 - dot(N, V) + 0.01));
 	float NoV   = clamp(dot(N, V), 0.0, 1.0);
-	// Schlick with roughness (Lagarde), f0 0.04; on wet surfaces at least fparams.y (a water film reflects far more than
-	// the dry dielectric's 4 % seen from above: the first version's weight was ~0.02 there, which nobody could see).
-	float f0    = 0.04;
-	float fmax  = max(1.0 - rough, f0);
-	float fres  = f0 + (fmax - f0) * pow(1.0 - NoV, 5.0);
-	float spec  = max(fres, fparams.y * (1.0 - smoothstep(0.1, 0.5, rough)));
-	float w     = push.params.x * mask * clamp(rf.a, 0.0, 1.0) * spec;
+	float w     = push.params.x * mask * clamp(rf.a, 0.0, 1.0) * Spec(mask, rough, NoV);
 	// The game's own highlights (lights, emissives: far brighter than what a screen-space ray can find) stay.
 	float lc = Luma(max(col.rgb, vec3(0))), lr = Luma(refl);
 	w *= 1.0 - smoothstep(4.0, 12.0, lc / max(lr, lc * 1e-4 + 1e-30));
@@ -786,6 +803,9 @@ void Calibrate(ivec2 gp) {
 	}
 	ivec2 p   = RenderPixel(uv);
 	float nov = 1.0 - clamp(dot(Nd, normalize(-P)), 0.0, 1.0);
+	bool  pud = PuddleGuess(uv, Nd) > 0.5, wat = WaterMask(p, d, uv, Nd) > 0.5;
+	if (pud) atomicAdd(calib[CALIB_WET], 1);
+	if (wat) atomicAdd(calib[CALIB_WET + 17], 1);
 	for (int layer = 0; layer < 4; ++layer) {
 		if (layer >= push.dec.z) break;
 		uint w = Packed(layer, p);
@@ -806,6 +826,8 @@ void Calibrate(ivec2 gp) {
 			atomicAdd(calib[f], int(v * 1000.0));
 			atomicAdd(calib[f + 1], int(v * v * 1000.0));
 			atomicAdd(calib[f + 2], int(v * nov * 1000.0));
+			if (pud) atomicAdd(calib[CALIB_WET + 1 + layer * 4 + b], int(v * 1000.0));
+			if (wat) atomicAdd(calib[CALIB_WET + 18 + layer * 4 + b], int(v * 1000.0));
 		}
 	}
 }

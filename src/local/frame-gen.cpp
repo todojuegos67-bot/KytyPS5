@@ -4683,6 +4683,16 @@ struct SsrPass {
 		uint64_t      flip  = 0;
 	};
 	std::vector<RetiredCopy> retired_copies; // (frames in flight may still read them: destroyed 8 flips later)
+	// KYTY_RT_REFLECTIONS: the depth as the deferred lighting reads it (before water and other forward passes draw):
+	// where the final depth is nearer, something was drawn after the G-buffer (water). Taken with the G-buffer copy.
+	VkImage                 depth_image = VK_NULL_HANDLE;
+	VmaAllocation           depth_mem   = nullptr;
+	vk::ImageView           depth_view  = nullptr;
+	vk::Extent2D            depth_extent {};
+	vk::Format              depth_format = vk::Format::eUndefined;
+	vk::ImageLayout         depth_layout = vk::ImageLayout::eUndefined;
+	uint64_t                depth_flip   = ~0ull;
+	bool                    depth_failed = false;
 } g_ssr;
 constexpr uint32_t SsrCalibRuns  = 24;  // calibration frames (one every 4th)
 constexpr uint32_t SsrCalibInts  = 41 + 16 * 3;
@@ -4775,6 +4785,10 @@ const char* SsrFormatName(vk::Format f) {
 		case vk::Format::eR32G32Uint: return "RG32_UINT";
 		case vk::Format::eR16G16B16A16Uint: return "RGBA16_UINT";
 		case vk::Format::eR8G8B8A8Uint: return "RGBA8_UINT";
+		case vk::Format::eD32Sfloat: return "D32F";
+		case vk::Format::eD32SfloatS8Uint: return "D32F_S8";
+		case vk::Format::eD24UnormS8Uint: return "D24_S8";
+		case vk::Format::eD16Unorm: return "D16";
 		default: return "other";
 	}
 }
@@ -5486,6 +5500,135 @@ void SsrCaptureSkip(const char* reason, uint64_t cs_hash) {
 	std::fflush(stdout);
 }
 
+bool SsrIsDepthFormat(vk::Format f) {
+	return f == vk::Format::eD32Sfloat || f == vk::Format::eD32SfloatS8Uint || f == vk::Format::eD24UnormS8Uint ||
+	       f == vk::Format::eX8D24UnormPack32 || f == vk::Format::eD16Unorm || f == vk::Format::eD16UnormS8Uint;
+}
+
+// KYTY_RT_REFLECTIONS' water detection: the consumer's depth binding (a depth-format backing at least the G-buffer's
+// size) copied right after the G-buffer layers, in the same command buffer.
+void SsrCaptureDepth(TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash, std::span<const TextureBinding> images,
+                     uint32_t width, uint32_t height, uint64_t flip) {
+	if (!RtReflectionsWanted() || g_ssr.depth_failed || g_graphics_ctx == nullptr) return;
+	static bool listed = false;
+	if (!listed) {
+		// (once: what the consumer binds, for the next look at its inputs)
+		listed = true;
+		std::string line;
+		char        buf[160];
+		for (size_t i = 0; i < images.size() && i < 24; ++i) {
+			const auto& b = images[i];
+			if (!b.image_id) continue;
+			auto& im = cache.GetImage(b.image_id);
+			std::snprintf(buf, sizeof(buf), " %zu: %s %ux%ux%u @0x%llx;", i, SsrFormatName(im.backing.format), im.backing.extent.width,
+			              im.backing.extent.height, im.backing.layers, static_cast<unsigned long long>(b.desc.info.data.address));
+			line += buf;
+		}
+		std::printf("SSR: G-buffer consumer CS %016llx binds:%s\n", static_cast<unsigned long long>(cs_hash), line.c_str());
+		std::fflush(stdout);
+	}
+	const TextureBinding* binding = nullptr;
+	for (const auto& b: images) {
+		if (!b.image_id) continue;
+		auto& im = cache.GetImage(b.image_id);
+		if (im.backing.image == nullptr || !SsrIsDepthFormat(im.backing.format)) continue;
+		if (im.backing.extent.width < width || im.backing.extent.height < height) continue;
+		binding = &b;
+		if (im.backing.extent.width == width && im.backing.extent.height == height) break;
+	}
+	if (binding == nullptr) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("SSR: the G-buffer consumer binds no depth image: no water detection\n");
+			std::fflush(stdout);
+		}
+		return;
+	}
+	auto&              image = cache.GetImage(binding->image_id);
+	const vk::Format   fmt   = image.backing.format;
+	const vk::Extent2D extent {width, height};
+	if (g_ssr.depth_image != VK_NULL_HANDLE && (g_ssr.depth_extent != extent || g_ssr.depth_format != fmt)) {
+		SsrPass::RetiredCopy r;
+		r.image = g_ssr.depth_image, r.mem = g_ssr.depth_mem, r.flip = flip, r.views[0] = g_ssr.depth_view;
+		g_ssr.retired_copies.push_back(r);
+		g_ssr.depth_image = VK_NULL_HANDLE, g_ssr.depth_mem = nullptr, g_ssr.depth_view = nullptr;
+		g_ssr.depth_layout = vk::ImageLayout::eUndefined;
+	}
+	if (g_ssr.depth_image == VK_NULL_HANDLE) {
+		g_ssr.depth_failed = true;
+		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		create.imageType   = VK_IMAGE_TYPE_2D;
+		create.format      = static_cast<VkFormat>(fmt);
+		create.extent      = {width, height, 1};
+		create.mipLevels   = 1;
+		create.arrayLayers = 1;
+		create.samples     = VK_SAMPLE_COUNT_1_BIT;
+		create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO;
+		if (vmaCreateImage(g_graphics_ctx->allocator, &create, &allocate, &g_ssr.depth_image, &g_ssr.depth_mem, nullptr) != VK_SUCCESS) {
+			g_ssr.depth_image = VK_NULL_HANDLE;
+			std::printf("SSR: depth copy image could not be created (%s)\n", SsrFormatName(fmt));
+			return;
+		}
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = vk::Image(g_ssr.depth_image);
+		view_info.viewType         = vk::ImageViewType::e2D;
+		view_info.format           = fmt;
+		view_info.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+		if (g_graphics_ctx->device.createImageView(&view_info, nullptr, &g_ssr.depth_view) != vk::Result::eSuccess) {
+			g_ssr.depth_view = nullptr;
+			return;
+		}
+		g_ssr.depth_extent = extent, g_ssr.depth_format = fmt;
+		g_ssr.depth_failed = false;
+		std::printf("SSR: depth copied with the G-buffer (%ux%u %s @0x%llx): water detection\n", width, height, SsrFormatName(fmt),
+		            static_cast<unsigned long long>(binding->desc.info.data.address));
+		std::fflush(stdout);
+	}
+	const ImageSubresourceRange range {0, 1, 0, 1};
+	// (layout transitions name every aspect of a depth / stencil image; the copy and the view only the depth)
+	const vk::ImageAspectFlags full_aspect =
+	    (fmt == vk::Format::eD32Sfloat || fmt == vk::Format::eD16Unorm || fmt == vk::Format::eX8D24UnormPack32)
+	        ? vk::ImageAspectFlags(vk::ImageAspectFlagBits::eDepth)
+	        : (vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil);
+	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range, command);
+	const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+	                         vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::ImageMemoryBarrier2 b {};
+		b.srcStageMask        = src_stage;
+		b.srcAccessMask       = src_access;
+		b.dstStageMask        = dst_stage;
+		b.dstAccessMask       = dst_access;
+		b.oldLayout           = from;
+		b.newLayout           = to;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image               = vk::Image(g_ssr.depth_image);
+		b.subresourceRange    = vk::ImageSubresourceRange {full_aspect, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &b;
+		command.pipelineBarrier2(dependency);
+	};
+	barrier(g_ssr.depth_layout, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllCommands,
+	        vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eDepth, 0, 0, 1};
+	copy.dstSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eDepth, 0, 0, 1};
+	copy.extent         = vk::Extent3D {width, height, 1};
+	command.copyImage(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, vk::Image(g_ssr.depth_image),
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+	barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
+	        vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+	g_ssr.depth_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	const vk::ImageLayout back = binding->layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding->layout;
+	image.Transit(back, vk::AccessFlagBits2::eShaderRead, range, command);
+	g_ssr.depth_flip = flip;
+}
+
 void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
                        std::span<const TextureBinding> images) {
 	if (!SsrWanted() || g_ssr.copy_failed) return;
@@ -5614,6 +5757,7 @@ void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::Comman
 	g_ssr.copy_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
 	const vk::ImageLayout back = binding->layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding->layout;
 	image.Transit(back, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range, command);
+	SsrCaptureDepth(cache, command, cs_hash, images, width, height, flip);
 	g_ssr.copy_flip.store(flip, std::memory_order_release);
 	g_ssr.copies.fetch_add(1, std::memory_order_relaxed);
 	static bool said = false;
@@ -5661,6 +5805,10 @@ bool RtReflGetGbuffer(RtReflGbuffer& out) {
 		out.views[i] = g_ssr.copy_views[i];
 	}
 	out.extent = g_ssr.copy_extent;
+	if (g_ssr.depth_view != nullptr && g_ssr.depth_flip == copied && g_ssr.depth_extent == g_ssr.copy_extent) {
+		out.depth        = g_ssr.depth_view;
+		out.depth_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	}
 	return true;
 }
 

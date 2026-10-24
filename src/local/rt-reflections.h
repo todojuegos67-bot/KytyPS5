@@ -22,6 +22,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs);
 struct RtReflGbuffer {
 	std::array<vk::ImageView, 4> views {};
 	vk::Extent2D                 extent {};
+	// The depth as the deferred lighting read it (taken with the layers; null: none bound): water detection.
+	vk::ImageView                depth = nullptr;
+	vk::ImageLayout              depth_layout = vk::ImageLayout::eUndefined;
 };
 [[nodiscard]] bool RtReflGetGbuffer(RtReflGbuffer& out);
 // The number of G-buffer copies taken so far (the periodic stats line: copies per frame).
