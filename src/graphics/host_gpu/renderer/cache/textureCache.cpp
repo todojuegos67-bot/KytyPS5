@@ -1461,12 +1461,47 @@ static bool GrowImageToLayers(ImageInfo& info, uint32_t layers) {
 	return true;
 }
 
+// KYTY_R32_SHADOW_POOL (on unless 0): the spot-shadow pool (a 360-layer 384x384 array at 0x3f...) is written by a
+// compute pass as an R32 float storage image and sampled by the lighting with a depth compare (D32). Each switch
+// recreated it (a 135 MiB copy each way, 7 pairs a session). Where the GPU compares depth on R32_SFLOAT
+// (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT, Vulkan 1.3; and linear filtering for PCF), the R32 image
+// is sampled with the compare as it is: the pool stays R32 and is never switched back to D32 for sampling.
+bool TextureCache::R32DepthCompareSupported() const {
+	static const bool supported = [this] {
+		const char* value = std::getenv("KYTY_R32_SHADOW_POOL");
+		if (value != nullptr && value[0] == '0') return false;
+		vk::FormatProperties3 properties3 {};
+		vk::FormatProperties2 properties2 {};
+		properties2.pNext = &properties3;
+		m_graphics.physical_device.getFormatProperties2(vk::Format::eR32Sfloat, &properties2);
+		const auto needed = vk::FormatFeatureFlagBits2::eSampledImageDepthComparison |
+		                    vk::FormatFeatureFlagBits2::eSampledImageFilterLinear |
+		                    vk::FormatFeatureFlagBits2::eSampledImage;
+		const bool ok = (properties3.optimalTilingFeatures & needed) == needed;
+		std::printf("Depth array: R32 float depth compare %s (KYTY_R32_SHADOW_POOL=0: off)\n",
+		            ok ? "supported: the shadow pool stays R32" : "unsupported: the shadow pool switches to D32 to be sampled");
+		std::fflush(stdout);
+		return ok;
+	}();
+	return supported;
+}
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
 	if (!cached.info.IsDepth() && !requested.IsDepth()) {
 		return {};
 	}
+	// (Defined here: a depth-compare texture of an R32 float array of the same layout samples it as it is.)
+	const auto R32ShadowPoolSample = [this](const ImageInfo& want, const Image& have) {
+		return want.pixel_format == vk::Format::eD32Sfloat && have.backing.format == vk::Format::eR32Sfloat &&
+		       have.info.pixel_format == vk::Format::eR32Sfloat && have.backing.samples == 1 && want.samples == 1 &&
+		       want.data == have.info.data && want.extent == have.info.extent &&
+		       want.resources == have.info.resources && want.resources.levels == 1 && want.resources.layers > 1 &&
+		       want.type == have.info.type && want.pitch == have.info.pitch && want.tile_mode == have.info.tile_mode &&
+		       !want.HasStencil() && !have.info.HasStencil() && !want.HasMetadata() && !have.info.HasMetadata() &&
+		       R32DepthCompareSupported();
+	};
 	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
 	const bool bpp_match     = requested.bytes_per_block == cached.info.bytes_per_block;
 	// PPSA04264
@@ -1503,6 +1538,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	bool recreate = !cached.info.resources.Contains(requested.resources);
 	switch (binding) {
 		case BindingType::Texture:
+			if (requested.IsDepth() && !cached.info.IsDepth() && R32ShadowPoolSample(requested, cached)) {
+				return cached_id;
+			}
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
 			recreate |= raw_d16_texture;
 			break;
@@ -1608,13 +1646,17 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		static std::atomic<uint32_t> switch_reports {0};
 		if (switch_reports.fetch_add(1, std::memory_order_relaxed) < 64) {
 			std::printf("Depth array switch: %s -> %s replacement=%s copied_samples=%u/%u gpu_after=%d cpu_after=%d "
-			            "partial_after=%d buffer_after=%d copy_ms=%.2f frame=%llu\n",
+			            "partial_after=%d buffer_after=%d copy_ms=%.2f frame=%llu command_serial=%llu tick=%llu speculative=%d "
+			            "packet_slot=%zu packet=%llu\n",
 			            cached.info.IsDepth() ? "depth" : "color", replacement.info.IsDepth() ? "depth" : "color",
 			            from_parked ? "parked" : "new", cached.backing.samples, replacement.backing.samples,
 			            replacement.IsGpuModified() ? 1 : 0, replacement.IsCpuDirty() ? 1 : 0,
 			            replacement.IsPartiallyCpuDirty() ? 1 : 0, replacement.IsBufferModified() ? 1 : 0,
 			            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copy_start).count(),
-			            static_cast<unsigned long long>(m_frame.load(std::memory_order_relaxed)));
+			            static_cast<unsigned long long>(m_frame.load(std::memory_order_relaxed)),
+			            static_cast<unsigned long long>(m_scheduler.CommandSerial()),
+			            static_cast<unsigned long long>(m_scheduler.CurrentTick()), Spec::t_effects != nullptr ? 1 : 0,
+			            Spec::t_packet_slot, static_cast<unsigned long long>(Spec::t_packets));
 			std::fflush(stdout);
 		}
 	}

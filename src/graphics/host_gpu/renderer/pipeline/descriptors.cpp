@@ -1139,6 +1139,13 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		}
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+	} else if (resource.depth_compare && image->info.pixel_format == vk::Format::eR32Sfloat &&
+	           desc.view_info.format == vk::Format::eD32Sfloat) {
+		// The spot-shadow pool kept as R32 float (TextureCache::R32DepthCompareSupported): its compare sample reads
+		// the R32 view, the reference compared by the sampler as on a D32 view.
+		desc.view_info.format  = vk::Format::eR32Sfloat;
+		desc.view_info.aspect  = vk::ImageAspectFlagBits::eColor;
+		desc.view_info.mapping = vk::ComponentMapping {};
 	} else {
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());

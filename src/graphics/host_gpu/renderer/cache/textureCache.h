@@ -50,6 +50,9 @@ public:
 		BindingType   type = BindingType::Texture;
 	};
 
+	// A depth-compare sample may read an R32 float image as it is (ResolveDepthOverlap: the spot-shadow pool).
+	[[nodiscard]] bool R32DepthCompareSupported() const;
+
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	             BufferCache& buffer_cache);
 	~TextureCache();
