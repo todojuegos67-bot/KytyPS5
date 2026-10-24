@@ -113,7 +113,7 @@ float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 	// rays are the shadow maps' business and only double them).
 	float px_m  = abs(push.proj.y) * 0.5 * RenderSize().y / max(z, 1e-3);
 	float cap   = push.cand[3].x * RenderSize().y / 1440.0;
-	float len   = min((q >= 3 ? 1.25 : 1.0) * push.trace.w * mix(0.3, 1.0, nw), cap / px_m);
+	float len   = min((q >= 3 ? 1.25 : 1.0) * push.trace.w * mix(0.45, 1.0, nw), cap / px_m);
 	// Thickness: an occluder is taken as this deep behind its depth-buffer surface (thin-object leak guard). (10-24:
 	// 0.2 m near to 0.45 m far; it grew to 1 m at 47 m, and rays passing up to 1 m behind a cliff's front faces
 	// made hard dark shards there.)
@@ -326,11 +326,12 @@ void Composite(ivec2 pixel, out float dark, out float zout) {
 	}
 	float inv_k = clamp(push.tune.x, 0.0, 0.8);
 	float rel   = lc / max(0.85 * lref, 1e-8);
-	float lit   = smoothstep(0.1, 0.55, (rel - inv_k) / (1.0 - inv_k));
+	// (10-24 r3: looser and never below 0.4: it suppressed too much, the shadows looked thin.)
+	float lit   = mix(0.4, 1.0, smoothstep(-0.05, 0.35, (rel - inv_k) / (1.0 - inv_k)));
 	// Generous near (x1.25), conservative far (x0.45); never darker than 0.25 of the input: no near-black patches.
-	float near  = mix(0.45, 1.25, NearW(z));
+	float near  = mix(0.8, 1.3, 1.0 - smoothstep(6.0, 80.0, z)); // (10-24 r3: stronger at mid distance; was x0.45 from 40 m)
 	// Multiply only, in the linear HDR input: factor in [1 - strength, 1]; never above the input (no lightening).
-	float factor = 1.0 - clamp(amt * near * stable * occ * lit, 0.0, 0.75);
+	float factor = 1.0 - clamp(amt * near * stable * occ * lit, 0.0, 0.85);
 	dark         = clamp(fade * stable * occ * lit, 0.0, 1.0); // (the statistics' occlusion: before the strength)
 	vec3  rgb    = min(col.rgb * factor, col.rgb);
 	if (any(isnan(rgb)) || any(isinf(rgb))) rgb = col.rgb;

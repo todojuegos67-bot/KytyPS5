@@ -83,7 +83,7 @@ param(
 	[switch]$AntiLag,
 	[ValidateSet(-1, 0, 1, 2, 3)][int]$ContactShadows = -1, # (alias de -RtShadows)
 	[ValidateSet(-1, 0, 1, 2, 3)][int]$RtShadows = -1, # KYTY_RT_SHADOWS: sombras RT del sol en pantalla con denoise (0 no, 1 bajo, 2 alto, 3 ultra; solo DLSS/XeSS/FSR)
-	[double]$RtShadowsStrength = -1, # KYTY_RT_SHADOWS_STRENGTH (0..1, 0.6 por defecto)
+	[double]$RtShadowsStrength = -1, # KYTY_RT_SHADOWS_STRENGTH (0..1, 0.75 por defecto)
 	[ValidateSet(-1, 0, 1, 2, 3)][int]$Ssgi = -1, # KYTY_SSGI: iluminacion por rayos en pantalla antes del reescalador
 	[string]$Upscale = '',
 	[int]$UpscaleHeight = 0,
