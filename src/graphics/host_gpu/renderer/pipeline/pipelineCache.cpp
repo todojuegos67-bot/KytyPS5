@@ -2414,9 +2414,13 @@ void PipelineCache::EvictIdlePipelines() {
 	// in each: the driver's pools 0.87 -> 2.01 GB kept, 0.84 -> 0.98 GB with those pipelines evicted (private 4.2 -> 2.8
 	// GB more); a pipeline evicted and bound again is made from the static store (~0.4 ms there). Where the warmup made
 	// every recorded pipeline (a world it did not know yet), those of the other worlds go too.
+	// The world just left keeps its pipelines (those bound since the world before it began): players go back through
+	// the Nexus, and its sweep made each return remake them all (issue #85, an RTX 2060 back in Boletaria: 3,858 made
+	// again at ~1.7 ms, 6.5 s of compiles in 64 s). Worlds further back go as before.
 	constexpr auto SceneSettle = std::chrono::seconds(60);
 	if (const auto generation = SceneTags::Generation(); generation != m_scene_generation) {
 		m_scene_generation = generation;
+		m_prev_scene_flip  = m_scene_flip;
 		m_scene_flip       = flip;
 		m_scene_since      = now;
 		m_scene_swept      = false;
@@ -2472,7 +2476,7 @@ void PipelineCache::EvictIdlePipelines() {
 		    pipeline.optimized != nullptr)
 			return;
 		const bool idle  = pipeline.last_flip < below;
-		const bool other = scene_left && pipeline.last_flip < m_scene_flip && !scene_recipes.contains(pipeline.recipe);
+		const bool other = scene_left && pipeline.last_flip < m_prev_scene_flip && !scene_recipes.contains(pipeline.recipe);
 		if (!idle && !other) return;
 		DeviceFault::ForgetPipeline(static_cast<VkPipeline>(pipeline.pipeline));
 		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
