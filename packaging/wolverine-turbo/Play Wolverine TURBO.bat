@@ -1,5 +1,5 @@
 @echo off
-rem Marvel's Wolverine en KytyPS5 - build TURBO (rama wolverine-turbo-1025, PRUEBA).
+rem Marvel's Wolverine en KytyPS5 - build TURBO (rama wolverine-turbo2-1025, PRUEBA).
 rem Motor del fork de Wolverine (wolverine-perf) + generacion de fotogramas FSR 3 (AMD).
 rem
 rem Uso: doble clic. Opcional desde una consola:
@@ -7,6 +7,8 @@ rem   "Play Wolverine TURBO.bat" x1   sin generacion de fotogramas (como antes)
 rem   "Play Wolverine TURBO.bat" x2   FSR 3 x2 (por defecto)
 rem   "Play Wolverine TURBO.bat" x3   FSR 3 x3 (DLL parcheada de emulator\fsr3-mfg, experimental)
 rem   "Play Wolverine TURBO.bat" x4   FSR 3 x4 (DLL parcheada de emulator\fsr3-mfg, experimental)
+rem   "Play Wolverine TURBO.bat" vrr  muestra cada fotograma en cuanto esta listo (pantallas G-Sync/FreeSync)
+rem   "Play Wolverine TURBO.bat" x1 vrr   se pueden combinar (primero x1..x4, luego vrr)
 rem
 rem Partidas, cache de shaders y logs van a la carpeta userdata junto a este archivo, nunca al juego.
 rem La primera vez COPIA (no mueve) la cache de shaders y las partidas de ..\userdata (el paquete v1),
@@ -25,6 +27,13 @@ if /i "%~1"=="x1" set "FG=1"
 if /i "%~1"=="x2" set "FG=2"
 if /i "%~1"=="x3" set "FG=3"
 if /i "%~1"=="x4" set "FG=4"
+
+rem VRR (KYTY_FLIP_WHEN_READY): por debajo de 60 fps el juego llega a la pantalla a su propio ritmo (p. ej. cada
+rem 21 ms) en vez de una mezcla de 16.7 y 33.3 ms. Nunca pasa de 60 por segundo. Solo sirve con G-Sync/FreeSync;
+rem apagado por defecto. Para dejarlo siempre encendido cambia VRR=0 por VRR=1.
+set "VRR=0"
+if /i "%~1"=="vrr" set "VRR=1"
+if /i "%~2"=="vrr" set "VRR=1"
 
 if not exist "%EMU%" (
   echo No encuentro emulator\kyty_emulator.exe junto a este archivo.
@@ -86,6 +95,12 @@ set KYTY_WRITE_WINDOW_KB=16
 rem Ordenes en vivo: escribe lineas NOMBRE=valor en este archivo mientras juegas.
 set "KYTY_LIVE_FILE=%USERDATA%\kyty_live.txt"
 if not exist "%KYTY_LIVE_FILE%" type nul > "%KYTY_LIVE_FILE%"
+set "KYTY_FLIP_WHEN_READY="
+set "VRRTEXT=apagado: 60 Hz fijo"
+if "%VRR%"=="1" (
+  set KYTY_FLIP_WHEN_READY=1
+  set "VRRTEXT=encendido: fotograma en cuanto esta listo, maximo 60 por segundo"
+)
 
 rem Generacion de fotogramas FSR 3 (AMD, funciona en NVIDIA). Sin vectores de movimiento del juego:
 rem interpola con el flujo optico de FSR 3, por eso el HUD y los bordes rapidos pueden verse con halos.
@@ -130,9 +145,11 @@ echo.
 echo Marvel's Wolverine - build TURBO (prueba)
 echo   Juego: %GAME%
 echo   Generacion de fotogramas: %FGTEXT%
+echo   VRR: %VRRTEXT%
 echo   Log: %LOG%
 echo No cambies el tamano de la ventana ni la minimices mientras juegas.
 echo Para jugar sin generacion de fotogramas: "Play Wolverine TURBO.bat" x1
+echo Con pantalla G-Sync/FreeSync prueba: "Play Wolverine TURBO.bat" x1 vrr
 echo.
 "%EMU%" --game "%GAME%" --console-language 3 --bindless --redzone --tessellation --readback-linear-images true %CPU_OPTS% %SKIP% > "%LOG%" 2>&1
 set CODE=%ERRORLEVEL%
@@ -148,5 +165,12 @@ if defined KYTY_FSR3_FG (
   echo.
   echo Lineas [fsr3] y FSR3 FG del log ^(fps reales y mostrados^):
   findstr /l /b /c:"[fsr3]" /c:"FSR3" "%LOG%"
+)
+rem [traps]: instrucciones emuladas con excepciones (cada una cuesta microsegundos); solo sale si hubo alguna.
+findstr /l /b /c:"[traps]" "%LOG%" >nul 2>&1
+if not errorlevel 1 (
+  echo.
+  echo Instrucciones emuladas ^(las 3 ultimas lineas [traps] del log^):
+  powershell -NoProfile -Command "Select-String -SimpleMatch -Pattern '[traps]' -Path $env:LOG | Select-Object -Last 3 | ForEach-Object { $_.Line }"
 )
 pause
