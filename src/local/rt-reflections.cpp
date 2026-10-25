@@ -1,4 +1,4 @@
-// KYTY_RT_REFLECTIONS=0|1|2|3|4 ("RT reflections": off / low / medium / high / ultra; rt-reflections.comp): screen-space ray-traced
+// KYTY_RT_REFLECTIONS=0|1|2|3|4|5 ("RT reflections": off / low / medium / high / ultra / extreme; rt-reflections.comp): screen-space ray-traced
 // reflections with denoising for Demon's Souls' PS5 Pro path, recorded in FrameGen::Upscale right before the upscaler
 // (DLSS / XeSS / FSR), which then reads our composited copy of the game's color. Only there: it is the one point where
 // the game hands over its lit HDR color before anti-aliasing together with depth, motion vectors and the projection
@@ -85,6 +85,22 @@
 // roughness of 0.25 (no filtered blur mixed in). Fireflies: the floor's reflection at most 3x (pools 6x) the pixel's
 // luminance, the temporal pass clamps a sample to its neighbourhood (mean + 2.5 sigma) and takes in a sample that differs
 // 2x from its history at half the rate.
+// (refl10, precision and depth; the user's Ultra: KYTY_RT_REFLECTIONS=4) What limited it, from the code and the logs:
+// mirrors at ultra came from the temporal history (a fifth of a fresh sample a frame through a bilinear fetch, half the
+// pixels traced per frame), and the composite's own sharp mirror ray (half-resolution levels only) never ran there,
+// pools' included: soft, lagging mirrors; the history of untraced (checkerboard) and missed pixels was reprojected by the
+// surface's motion, not the reflected hit's (virtual image), so the reflection slid with the floor (smear / ghost
+// trails); every pixel's hit was the entry of a flat screen-facing box (stepped edges); the G-buffer normal is
+// octahedral 8:8 (~0.45 degree steps: banding across flat puddles, ~0.4 m at 25 m); rays hit 36-58 % of the time.
+// Changes: KYTY_RT_REFLECTIONS_FRESH_MIRROR (ultra / extreme: this frame's mirror ray, the trace's or the composite's
+// own), KYTY_RT_REFLECTIONS_VIRTUAL (every level: the neighbours' hit distance for the virtual image),
+// KYTY_RT_REFLECTIONS_BICUBIC (ultra / extreme: Catmull-Rom history below a roughness of 0.3),
+// KYTY_RT_REFLECTIONS_REFINE (ultra / extreme: bisection on the bilinear surface), KYTY_RT_REFLECTIONS_NORMAL_SNAP
+// (degrees, 2; 0 off: on floors / ramps where the 8-bit G-buffer normal agrees with the depth's plane that closely, the
+// plane's exact normal),
+// KYTY_RT_REFLECTIONS_RPP (rays per glossy pixel, 1..4), KYTY_RT_REFLECTIONS_ITERS (8..256) / _CAP (x the render
+// height, 0.1..4) override a level's march; level 5 "extreme": every pixel every frame, 128 iterations, rays up to 2.5x
+// the render height, 2 rays per glossy pixel. A 10 s line "RT reflections: rays:" says why rays miss.
 #include "local/rt-reflections.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -114,7 +130,7 @@ constexpr uint32_t CalibFloors   = CalibBytes + 16 * 3;
 constexpr uint32_t CalibWet      = CalibFloors + 2; // puddle guess: count + 16 byte sums; water: the same
 constexpr uint32_t CalibHist     = 300;             // 16 byte fields x 16 bins
 constexpr uint32_t StatsIndex    = 560;
-constexpr uint32_t StatsCount    = 32;
+constexpr uint32_t StatsCount    = 34; // (refl10: 30..32 why rays miss, 33 the composite's mirror rays)
 // (refl9) The metal survey (the shader's SURVEY, mode 8; never cleared): static / moving sample counts, set-bit counts
 // per class x layer x bit, byte histograms per class x field x 16 bins.
 constexpr uint32_t SurveyIndex   = 600;
@@ -443,14 +459,18 @@ struct LevelCfg {
 	float       cap;      // the longest ray on screen, x the render height
 	float       alpha;    // temporal minimum alpha scale
 };
-constexpr LevelCfg Levels[5] = {
+constexpr LevelCfg Levels[6] = {
     {"off", false, false, 0, 0.0f, 0, 0.0f, 0.0f, 1.0f},
     {"low", false, true, 24, 0.45f, 1, 200.0f, 0.30f, 1.0f},
     {"medium", false, false, 32, 0.55f, 2, 300.0f, 0.45f, 1.0f},
     {"high", false, false, 48, 0.60f, 3, 800.0f, 0.75f, 0.9f}, // (10-24 far: 400 m / 0.65)
     {"ultra", true, true, 72, 0.65f, 3, 1600.0f, 1.00f, 0.8f}, // (10-24 far: 64 / 600 m / 0.90)
+    // (refl10) every pixel every frame (no checkerboard), longer rays (2.5 x the render height on screen: the whole
+    // screen; 128 iterations), 2 rays on glossy surfaces (KYTY_RT_REFLECTIONS_RPP). About 2-2.5x ultra's GPU time.
+    {"extreme", true, false, 128, 0.65f, 3, 3000.0f, 2.50f, 0.8f},
 };
-const LevelCfg& Cfg(int level) { return Levels[std::clamp(level, 0, 4)]; }
+constexpr int MaxLevel = 5;
+const LevelCfg& Cfg(int level) { return Levels[std::clamp(level, 0, MaxLevel)]; }
 
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level) {
 	if (g_rt.out.image != VK_NULL_HANDLE && g_rt.render == render && g_rt.level == level) return true;
@@ -616,6 +636,16 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		            "metal %g, glossy %g\n",
 		            std::chrono::duration<double>(now - g_rt.stat_time).count(), pc(25), mf, pc(26), pc(28), pc(29), sm[27] / 1000.0 / px,
 		            on > 0 ? sm[27] / 1000.0 / on : 0.0, g_rt.metal_strength, g_rt.glossy_strength);
+	}
+	if (sm[4] > 0) {
+		// (refl10) Why the rays miss: the depth limit (iterations: KYTY_RT_REFLECTIONS_ITERS), the screen or the ray's
+		// length (KYTY_RT_REFLECTIONS_CAP; off screen is what a screen-space ray cannot see), the hit's validation
+		// (silhouettes, back faces, the reflector's own plane, the screen-edge fade); the rest: rays toward the camera.
+		const double rays = static_cast<double>(sm[4]);
+		std::printf("RT reflections: rays: last %.0f s: hit %.1f%%, missed: out of iterations %.1f%%, off the screen / ray end %.1f%%, "
+		            "refused by the hit test %.1f%%; the composite's own mirror rays on %.2f%% of the pixels\n",
+		            std::chrono::duration<double>(now - g_rt.stat_time).count(), 100.0 * sm[5] / rays, 100.0 * sm[30] / rays,
+		            100.0 * sm[31] / rays, 100.0 * sm[32] / rays, 100.0 * sm[33] / px);
 	}
 	std::string passes;
 	for (uint32_t st = 0; st < NStages; ++st) {
@@ -936,7 +966,7 @@ void SurveyDecide(bool force) {
 int RtReflectionsLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_RT_REFLECTIONS");
-		return value != nullptr ? std::clamp(std::atoi(value), 0, 4) : 0; // 0 off, 1 low, 2 medium, 3 high, 4 ultra
+		return value != nullptr ? std::clamp(std::atoi(value), 0, MaxLevel) : 0; // 0 off, 1 low, 2 medium, 3 high, 4 ultra, 5 extreme
 	}();
 	return level;
 }
@@ -1117,27 +1147,46 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	if (g_rt.survey_on && !g_rt.survey_done) SurveyDecide(g_rt.survey_runs > 1100); // (~5 min of surveyed frames: the minimum)
 
 	// (refl6: per level by default, so the medium level shows: low 1.3, medium 1.6, high 1.8, ultra 2.0)
-	static constexpr float DefStrength[5] = {0.0f, 1.3f, 1.6f, 1.8f, 2.0f};
-	const float strength = EnvFloat("KYTY_RT_REFLECTIONS_STRENGTH", DefStrength[std::clamp(level, 0, 4)], 0.0f, 3.0f);
+	static constexpr float DefStrength[MaxLevel + 1] = {0.0f, 1.3f, 1.6f, 1.8f, 2.0f, 2.0f};
+	const float strength = EnvFloat("KYTY_RT_REFLECTIONS_STRENGTH", DefStrength[std::clamp(level, 0, MaxLevel)], 0.0f, 3.0f);
 	const float min_refl = EnvFloat("KYTY_RT_REFLECTIONS_MIN", 0.4f, 0.0f, 0.8f);
 	const float guess    = EnvFloat("KYTY_RT_REFLECTIONS_GUESS", 0.0f, 0.0f, 1.0f);
 	const auto& cfg      = Cfg(level);
-	const int   iters    = cfg.iters;
+	// (refl10) The march's depth: KYTY_RT_REFLECTIONS_ITERS (hi-z iterations, 8..256) and KYTY_RT_REFLECTIONS_CAP (the
+	// longest ray on screen x the render height, 0.1..4) override the level's.
+	const int   iters    = static_cast<int>(EnvFloat("KYTY_RT_REFLECTIONS_ITERS", static_cast<float>(cfg.iters), 8.0f, 256.0f));
 	const float cutoff   = cfg.cutoff;
 	const int   passes   = cfg.passes;
-	const float cap_px   = cfg.cap * static_cast<float>(color.extent.height);
+	const float cap_px   = EnvFloat("KYTY_RT_REFLECTIONS_CAP", cfg.cap, 0.1f, 4.0f) * static_cast<float>(color.extent.height);
+	// (refl10) Precision switches (1 on, 0 off; defaults per level): sub-pixel hit refinement, bicubic history and a fresh
+	// mirror every frame at the full-resolution trace (ultra and extreme), the virtual-image reprojection for pixels
+	// without their own hit (every level), floors' plane normal for the 8-bit G-buffer one (degrees, 2; 0 off), rays per pixel
+	// on glossy surfaces (extreme 2, else 1).
+	const auto  env_on   = [](const char* name, bool fallback) {
+		const char* v = std::getenv(name);
+		return v == nullptr || *v == '\0' ? fallback : *v != '0';
+	};
+	const bool  refine   = env_on("KYTY_RT_REFLECTIONS_REFINE", level >= 4);
+	const bool  bicubic  = env_on("KYTY_RT_REFLECTIONS_BICUBIC", level >= 4);
+	const bool  fresh    = env_on("KYTY_RT_REFLECTIONS_FRESH_MIRROR", level >= 4);
+	const bool  vfill    = env_on("KYTY_RT_REFLECTIONS_VIRTUAL", true);
+	const float snap_deg = EnvFloat("KYTY_RT_REFLECTIONS_NORMAL_SNAP", 2.0f, 0.0f, 10.0f);
+	const int   rpp      = static_cast<int>(EnvFloat("KYTY_RT_REFLECTIONS_RPP", level >= 5 ? 2.0f : 1.0f, 1.0f, 4.0f));
 	{
 		static bool said = false;
 		if (!said) {
 			said = true;
 			std::printf("RT reflections: on (level %d %s: trace %ux%u of %ux%u%s, hi-z %u mips, %d iterations, rays <= %.0f px, %d "
 			            "a-trous passes, strength %g, water minimum reflectance %g, roughness: a mirror below %.2f, nothing from %.2f, G-buffer %s, "
-			            "exposure %s, camera %s, %s)\n",
+			            "exposure %s, camera %s, %s; refl10: %d ray(s) per glossy pixel, hit refinement %s, bicubic history %s, "
+			            "fresh mirrors %s, virtual-image fill %s, floor normal snap %g deg)\n",
 			            level, cfg.name, g_rt.trace.width, g_rt.trace.height, color.extent.width, color.extent.height,
 			            cfg.checker ? " checkerboard" : "", g_rt.hiz.levels, iters, cap_px, passes, strength, min_refl, g_rt.mat_lo, g_rt.mat_hi, have_gbuf ? "copy found (calibrating)" : "not found yet (depth normals, heuristic)",
 			            inputs.exposure_buffer != nullptr ? "the game's" : "1.0", camera.prev ? "matrices" : "motion vectors only",
 			            guide_mode ? (have_guide ? "guided by the game's SSR (found)" : "guided by the game's SSR (not found yet: the material mask until it is)")
-			                       : "material mask (KYTY_RT_REFLECTIONS_GUIDE=0)");
+			                       : "material mask (KYTY_RT_REFLECTIONS_GUIDE=0)",
+			            rpp, refine ? "on" : "off", bicubic ? "on" : "off", fresh ? "on" : "off", vfill ? "on" : "off",
+			            static_cast<double>(snap_deg));
 			std::fflush(stdout);
 		}
 	}
@@ -1155,7 +1204,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.misc[2] = level;
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0) |
 	               (g_rt.row0_up ? 16 : 0) | (cfg.checker ? 32 : 0) | (have_water ? 64 : 0) |
-	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0);
+	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0) | (refine ? 1024 : 0) | (bicubic ? 2048 : 0) |
+	               (fresh ? 4096 : 0) | (vfill ? 8192 : 0);
 	// (combo19: guided only while the guide is there; without it the material mask, refl6, instead of water only: the
 	// guide never found in play was the whole reason nothing changed)
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
@@ -1212,6 +1262,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		// (refl9b, yparams) the minimum reflective area's radius in render pixels (KYTY_RT_REFLECTIONS_MIN_AREA, given at a
 		// 720-line render, scaled to this one) and the large pools' boost
 		header[48] = g_rt.min_area * static_cast<float>(color.extent.height) / 720.0f, header[49] = g_rt.pool_boost;
+		header[50] = static_cast<float>(rpp), header[51] = snap_deg; // (refl10, yparams.z / w)
 		command.updateBuffer(vk::Buffer(g_rt.frame_buf), 0, HeaderBytes, header.data());
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
@@ -1328,6 +1379,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	{
 		Set s = base;
 		s.a = src, s.b = src, s.gcur = &g.gb[cur], s.gprev = &g.gb[cur], s.aux = &g.aux, s.meta = &g.meta[cur];
+		s.b  = &g.rad; // (refl10: the trace's raw output: this frame's mirror hits at the full-resolution trace)
 		s.oa = &g.out, s.ob = &g.rad, s.oc = &g.rad;
 		run(4, s, g.render);
 		stamp(StComposite);

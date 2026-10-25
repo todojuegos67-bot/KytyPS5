@@ -1,6 +1,6 @@
 #ifndef EMULATOR_SRC_LOCAL_RT_REFLECTIONS_H_
 #define EMULATOR_SRC_LOCAL_RT_REFLECTIONS_H_
-// KYTY_RT_REFLECTIONS=0|1|2|3|4 (off / low / medium / high / ultra; rt-reflections.cpp, rt-reflections.comp): screen-space
+// KYTY_RT_REFLECTIONS=0|1|2|3|4|5 (off / low / medium / high / ultra / extreme (refl10); rt-reflections.cpp, rt-reflections.comp): screen-space
 // ray-traced reflections with denoising on the PS5 Pro path's render-resolution color, right before the upscaler
 // (KYTY_UPSCALER: DLSS / XeSS / FSR; without an upscaler there is no such point and nothing runs).
 // KYTY_RT_REFLECTIONS_STRENGTH (1.0, 0..3), KYTY_RT_REFLECTIONS_MIN (0.3, 0..0.8: the wet surfaces' minimum
