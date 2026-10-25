@@ -3319,6 +3319,8 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 			vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second,
 			                              group_sizes[group], static_cast<uint32_t>(stride));
 	}
+	if (FrameGen::RtParticlesDebug() && !draw_state.targets.empty()) // (rtparticles census: this path's draws by target)
+		FrameGen::NoteOtherPathDraw(draw_state.targets[0].requested.data.address, 0, false, 2);
 	if (FrameGen::Capturing()) FrameGen::AfterDraw(buffer); // (frame generation's HUD-less image)
 	emit.command     = vk_buffer;
 	emit.generation  = buffer.GraphicsGeneration();

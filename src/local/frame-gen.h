@@ -250,6 +250,11 @@ struct UpscaleInputs {
 	vk::Buffer                  exposure_buffer = nullptr;
 	vk::DeviceSize              exposure_base = 0, exposure_range = 0;
 	uint32_t                    exposure_index = 0;
+	// (rtparticles) The color image's guest address (the PS5 Pro path's slot 1: RtParticles matches the pre-particle copy
+	// to it), and the particle reactive mask KYTY_RT_PARTICLES=2 builds (R8_UNORM, render size; no view: none) for the
+	// upscaler (FSR 3.1 reactive, XeSS responsive pixels, DLSS bias-current-color hint).
+	uint64_t                    color_address = 0;
+	UpscaleImage                reactive;
 };
 // Streamline offers DLSS super resolution on this device.
 [[nodiscard]] bool UpscalerReady();
@@ -303,6 +308,31 @@ void OnSsrDispatch(uint64_t cs_hash, std::span<const uint64_t> addresses, std::s
 [[nodiscard]] uint32_t SsrPackedTargets(std::array<SsrTarget, 4>& targets);
 // Before a G-buffer consumer dispatch (renderCompute.cpp; the deferred lighting: the G-buffer complete, nothing else
 // written over it yet): the packed layers copied once a frame into SSR's own image, the source ssr.comp decodes.
+// (rtparticles) KYTY_RT_PARTICLES=0|1|2 ("Particulas RT", default 0) and KYTY_RT_PARTICLES_DEBUG=1 (census): see the
+// RtParticles section of frame-gen.cpp. Level 1: the scene color is copied right before the frame's first blended,
+// depth-write-off draw into it (the particle / transparent pass), and the SSGI emissive light takes the particles'
+// own emission (color - copy) as the emitters' radiance. Level 2: also a reactive mask of that emission for the
+// upscaler. The debug census logs, every 10 s, the ordered passes drawing into / dispatching onto the scene color.
+[[nodiscard]] bool RtParticlesWanted();
+[[nodiscard]] bool RtParticlesDebug();
+struct SceneDraw {
+	ImageId  target;
+	uint64_t address = 0;
+	uint32_t width = 0, height = 0;
+	int32_t  format = 0;
+	uint64_t vs = 0, ps = 0;
+	bool     blend = false, depth_test = false, depth_write = false, indirect = false;
+	uint8_t  src_blend = 0, dst_blend = 0, comb = 0;
+	uint32_t instances = 0, index_count = 0;
+};
+// Normal-path draw, right before its render pass begins (ExecutePreparedDraw): color target 0's draw state. May end the
+// pass in progress, copy the target and resume it (`layout`: the target's attachment layout).
+void BeforeSceneDraw(CommandBuffer& command, TextureCache& cache, const RenderState& rendering, vk::ImageLayout layout,
+                     const SceneDraw& draw);
+// Table / native-path draws (counted only: the copy is taken on the normal path).
+void NoteOtherPathDraw(uint64_t address, uint64_t vs, bool blend, int path);
+// A dispatch binding a storage image it writes (census only).
+void NoteSceneDispatch(uint64_t cs_hash, uint64_t address, uint32_t width, uint32_t height);
 void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
                        std::span<const TextureBinding> images);
 // After a dispatch (renderCompute.cpp, while GbufViewWanted(): KYTY_GBUF_VIEW / KYTY_GBUF_TAP, gbuf-view.h): a G-buffer

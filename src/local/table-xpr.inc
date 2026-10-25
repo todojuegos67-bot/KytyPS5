@@ -2295,6 +2295,8 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	for (uint32_t group = 0; group < groups; ++group)
 		vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second, group_sizes[group],
 		                              static_cast<uint32_t>(stride));
+	if (FrameGen::RtParticlesDebug() && !draw_state.targets.empty()) // (rtparticles census: this path's draws by target)
+		FrameGen::NoteOtherPathDraw(draw_state.targets[0].requested.data.address, 0, false, 1);
 	if (FrameGen::Capturing()) FrameGen::AfterDraw(buffer); // (frame generation's HUD-less image)
 	// As the normal path's: shaders that write buffers end the rendering, and a barrier orders their writes.
 	if (writes) {
