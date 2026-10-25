@@ -125,6 +125,9 @@ inline void StallWatchNoteFlip() noexcept {
 // loader stuck re-reading one file, or the stream that keeps the reads going while a load never finishes.
 // A short lock and a map update per read (reads are system calls); nothing when the watch is off.
 void StallWatchNoteFileRead(const std::filesystem::path& path, int64_t offset, uint64_t size) noexcept;
+// astro-tunnel-1025: a full STALLWATCH dump on the watch thread within half a second (F10 in the game window;
+// creating stalldump.txt in the emulator's folder does the same). Works with the watch on, up to 20 a run.
+void StallWatchRequestDump() noexcept;
 
 inline uint64_t StallWatchNoteAmprRejected() noexcept {
 	return StallWatchCounters::g_ampr_rejected.fetch_add(1, std::memory_order_relaxed) + 1;

@@ -346,6 +346,13 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 #endif
 
 struct PthreadMutexPrivate {
+	// astro-tunnel-1025 (upstream e87fb8c8): FIFO waiters; an unlock hands the mutex to the first one.
+	struct Waiter {
+		Pthread                 thread = nullptr;
+		std::condition_variable cv;
+		Waiter*                 previous = nullptr;
+		Waiter*                 next     = nullptr;
+	};
 	uint8_t                 reserved[256];
 	std::string             name;
 	std::mutex              m;
@@ -354,6 +361,8 @@ struct PthreadMutexPrivate {
 	uint32_t                count     = 0;
 	int                     type      = 1;
 	int                     pprotocol = PTHREAD_PRIO_NONE;
+	Waiter*                 first_waiter = nullptr;
+	Waiter*                 last_waiter  = nullptr;
 };
 
 struct PthreadMutexattrPrivate {
@@ -1247,6 +1256,87 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
                                   const char* name);
 static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 
+// astro-tunnel-1025 (upstream e87fb8c8, "hand guest mutex ownership directly to FIFO waiters"): a contended
+// guest mutex goes to its waiters in arrival order, handed over by the unlock. Before, an unlock only woke one
+// waiter (which polled every millisecond besides), and a thread that unlocked and locked again at once kept
+// winning: a waiter could starve for as long as that went on. KYTY_MUTEX_FIFO=0: the old behaviour.
+static bool MutexFifo() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_MUTEX_FIFO");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
+static void NativeMutexRemoveWaiter(PthreadMutexPrivate* mutex, PthreadMutexPrivate::Waiter* waiter) {
+	if (waiter->previous != nullptr) {
+		waiter->previous->next = waiter->next;
+	} else {
+		mutex->first_waiter = waiter->next;
+	}
+	if (waiter->next != nullptr) {
+		waiter->next->previous = waiter->previous;
+	} else {
+		mutex->last_waiter = waiter->previous;
+	}
+	waiter->previous = nullptr;
+	waiter->next     = nullptr;
+}
+
+// The contended part of a lock in FIFO mode: queued, until an unlock hands the mutex over or the time runs out.
+static int NativeMutexLockFifo(PthreadMutexPrivate* mutex, Pthread self, KernelUseconds* timeout_us,
+                               std::unique_lock<std::mutex>& lock) {
+	if (mutex->owner == nullptr && mutex->first_waiter == nullptr) {
+		mutex->owner = self;
+		mutex->count = 1;
+		return OK;
+	}
+	if (timeout_us != nullptr && *timeout_us == 0) {
+		return ETIMEDOUT;
+	}
+	const GuestWaitScope wait_scope(timeout_us != nullptr ? "mutex timed lock" : "mutex lock", mutex,
+	                                mutex->name.c_str());
+	PthreadMutexPrivate::Waiter waiter;
+	waiter.thread   = self;
+	waiter.previous = mutex->last_waiter;
+	if (mutex->last_waiter != nullptr) {
+		mutex->last_waiter->next = &waiter;
+	} else {
+		mutex->first_waiter = &waiter;
+	}
+	mutex->last_waiter = &waiter;
+	const auto deadline = timeout_us != nullptr
+	                          ? std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us)
+	                          : std::chrono::steady_clock::time_point::max();
+	for (;;) {
+		// (A free mutex with this thread first in line: an unlock that found no waiter queued yet.)
+		if (mutex->owner == nullptr && mutex->first_waiter == &waiter) {
+			NativeMutexRemoveWaiter(mutex, &waiter);
+			mutex->owner = self;
+			mutex->count = 1;
+		}
+		if (mutex->owner == self) {
+			return OK;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			NativeMutexRemoveWaiter(mutex, &waiter);
+			// The next in line may now be first while the mutex is free.
+			if (mutex->owner == nullptr && mutex->first_waiter != nullptr) {
+				mutex->first_waiter->cv.notify_one();
+			}
+			return ETIMEDOUT;
+		}
+		const auto poll = std::chrono::microseconds(SIGNAL_APC_POLL_MICROS);
+		waiter.cv.wait_until(lock, deadline - now < poll ? deadline : now + poll);
+		if (mutex->owner != self) {
+			lock.unlock();
+			KernelDispatchPendingSignalForCurrentThread();
+			lock.lock();
+		}
+	}
+}
+
 static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_us) {
 	EXIT_IF(mutex == nullptr);
 
@@ -1270,6 +1360,10 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 			return ETIMEDOUT;
 		}
 		return EDEADLK;
+	}
+
+	if (MutexFifo()) {
+		return NativeMutexLockFifo(mutex, self, timeout_us, lock);
 	}
 
 	if (timeout_us == nullptr) {
@@ -1336,7 +1430,7 @@ static int NativeMutexTrylock(PthreadMutexPrivate* mutex) {
 		return EBUSY;
 	}
 
-	if (mutex->owner != nullptr) {
+	if (mutex->owner != nullptr || (MutexFifo() && mutex->first_waiter != nullptr)) {
 		return EBUSY;
 	}
 
@@ -1364,6 +1458,20 @@ static int NativeMutexUnlock(PthreadMutexPrivate* mutex, uint32_t* recurse = nul
 
 	if (mutex->type == 2 && mutex->count > 1) {
 		mutex->count--;
+		return OK;
+	}
+
+	if (MutexFifo()) {
+		if (auto* waiter = mutex->first_waiter) {
+			// Ownership moves in FIFO order before the waiter wakes.
+			NativeMutexRemoveWaiter(mutex, waiter);
+			mutex->owner = waiter->thread;
+			mutex->count = 1;
+			waiter->cv.notify_one();
+		} else {
+			mutex->owner = nullptr;
+			mutex->count = 0;
+		}
 		return OK;
 	}
 

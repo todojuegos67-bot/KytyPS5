@@ -193,13 +193,30 @@ void LogZoneBufferWrite(const Image& image, uint64_t address, uint64_t size,
 
 } // namespace
 
+// astro-tunnel-1025: KYTY_READBACK_LINEAR=0/1 overrides --readback-linear-images (an A/B without editing the
+// launch config). In Astro Bot's loading tunnel it copies 6 linear images a frame back (2.6 GB/s, log 10-25 06:43).
+static bool ReadbackLinearImages() {
+	static const bool on = [] {
+		bool        value    = Config::ReadbackLinearImagesEnabled();
+		const char* override = std::getenv("KYTY_READBACK_LINEAR");
+		if (override != nullptr && (override[0] == '0' || override[0] == '1')) {
+			value = override[0] == '1';
+		}
+		std::printf("Linear image readback: %s (--readback-linear-images; KYTY_READBACK_LINEAR=0/1 overrides)\n",
+		            value ? "on" : "off");
+		std::fflush(stdout);
+		return value;
+	}();
+	return on;
+}
+
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache), m_dcc_resolver(graphics, scheduler),
-      m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
+      m_readback_linear_images(ReadbackLinearImages()) {
 	m_dcc_gpu_clear = Config::DccGpuClearEnabled() && m_dcc_resolver.Available();
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;

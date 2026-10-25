@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <list>
@@ -1447,6 +1448,15 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	}
 
 	Common::LockGuard lock(ctx->mutex);
+	// astro-tunnel-1025: a change of the game's flip rate in the console log (0 = 60, 1 = 30, 2 = 20 fps with a
+	// 60 Hz vblank), to see whether a game asks for 30 fps in its cutscenes. The first 32 changes.
+	if (ctx->flip_rate != rate) {
+		static std::atomic<int> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+			std::printf("VideoOut: flip rate %d -> %d (a flip every %d vblanks)\n", ctx->flip_rate, rate, rate + 1);
+			std::fflush(stdout);
+		}
+	}
 	ctx->flip_rate = rate;
 
 	return OK;

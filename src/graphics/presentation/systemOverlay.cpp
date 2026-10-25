@@ -16,6 +16,7 @@
 #include "libs/controller.h"
 #include "libs/dialog.h"
 #include "libs/ime.h"
+#include "kernel/stallWatch.h"
 #include "libs/imeDialog.h"
 #include "loader/systemContent.h"
 #include "stb_image.h"
@@ -613,6 +614,14 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 			QueueInput({InputKind::ResetController, g_input_session, 0, 0.0f, 0.0f});
 		}
 		return false;
+	}
+	// astro-tunnel-1025: F10 asks the stall watch for a full STALLWATCH dump in the log (what every guest thread
+	// waits on), for a game that hangs while it keeps drawing.
+	if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F10) {
+		Libs::LibKernel::StallWatchRequestDump();
+		std::printf("Stall watch: dump requested (F10)\n");
+		std::fflush(stdout);
+		return true;
 	}
 	// F2 opens and closes the emulator settings panel, unless a game dialog owns the overlay.
 	if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F2 &&

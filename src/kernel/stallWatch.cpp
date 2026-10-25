@@ -14,7 +14,10 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <system_error>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -56,6 +59,7 @@ struct FileReadState {
 	std::mutex                                 mutex;
 	std::unordered_map<std::string, FileReads> current;
 	std::unordered_map<std::string, FileReads> previous;
+	std::unordered_map<std::string, FileReads> ten; // since the last [loader] line
 };
 FileReadState* const g_file_reads = new FileReadState; // (never destroyed, as g_ranges)
 
@@ -337,6 +341,150 @@ void Dump(const char* reason, double seconds, double work_per_flip, double io_ag
 	std::fflush(stdout);
 }
 
+// astro-tunnel-1025: the game's loader threads (Team Asobi's engine: Astro Bot), for the [loader] line and the
+// "loaders idle in the same scene" dump. Matched by prefix of the guest thread name.
+constexpr const char* LoaderThreads[] = {"LevelTask_ATQT", "RoomLoad_ATQT", "OdxAsyncLoader", "ProductNextLoad_ATQT",
+                                         "ProductNextUnload_ATQT", "GfxTextureStreamerThread",
+                                         "GfxModelStreamerThread", "sndz_stream_task_service"};
+
+bool IsLoaderThread(const char* name) {
+	for (const char* loader: LoaderThreads) {
+		if (std::strncmp(name, loader, std::strlen(loader)) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Sum of the loader threads' finished waits (each wake-up of a loader is one): progress of the loaders.
+uint64_t LoaderProgress() {
+	uint64_t total = 0;
+	for (auto& slot: g_slots) {
+		auto* thread = static_cast<Pthread>(slot.thread.load(std::memory_order_acquire));
+		if (thread == nullptr) {
+			continue;
+		}
+		char name[32] {};
+		if (PthreadGetname(thread, name) == 0 && IsLoaderThread(name) &&
+		    std::strncmp(name, "Gfx", 3) != 0 && std::strncmp(name, "sndz", 4) != 0) {
+			total += slot.waits.load(std::memory_order_relaxed);
+		}
+	}
+	return total;
+}
+
+// Every 10 s with KYTY_FPS_LOG: the files read since the last line and the guest threads that wait longest, plus
+// each loader thread's wake-ups since the last line. No thread is stopped; slots are read with relaxed loads.
+void LoaderLine(double seconds) {
+	struct Row {
+		std::string name;
+		std::string text;
+		double      wait_s = 0.0;
+	};
+	static std::unordered_map<const void*, uint64_t> s_last_waits;
+	std::unordered_map<const void*, uint64_t>        waits_now;
+	std::vector<Row>                                 waiting;
+	std::string                                      loaders;
+	const int64_t                                    now = NowNs();
+	char                                             line[512];
+	for (auto& slot: g_slots) {
+		auto* thread = static_cast<Pthread>(slot.thread.load(std::memory_order_acquire));
+		if (thread == nullptr) {
+			continue;
+		}
+		char name[32] {};
+		if (PthreadGetname(thread, name) != 0) {
+			std::snprintf(name, sizeof(name), "?");
+		}
+		const auto  waits = slot.waits.load(std::memory_order_relaxed);
+		const char* what  = slot.what.load(std::memory_order_acquire);
+		const auto  since = slot.since.load(std::memory_order_relaxed);
+		const auto  key   = static_cast<const void*>(&slot);
+		waits_now[key]    = waits;
+		const auto  last  = s_last_waits.find(key);
+		const auto  delta = last == s_last_waits.end() ? waits : waits - last->second;
+		const double wait_s = what != nullptr ? static_cast<double>(now - since) / 1e9 : 0.0;
+		std::string  wait_text;
+		if (what != nullptr) {
+			const auto object_name = LoadName(slot);
+			std::snprintf(line, sizeof(line), "%s%s%s%s %.1fs", what, object_name.empty() ? "" : " '",
+			              object_name.c_str(), object_name.empty() ? "" : "'", wait_s);
+			wait_text = line;
+		} else {
+			wait_text = "running";
+		}
+		if (IsLoaderThread(name)) {
+			std::snprintf(line, sizeof(line), "%s%s +%" PRIu64 " (%s)", loaders.empty() ? "" : ", ", name, delta,
+			              wait_text.c_str());
+			loaders += line;
+		}
+		if (what != nullptr && wait_s >= 1.0) {
+			waiting.push_back({name, wait_text, wait_s});
+		}
+	}
+	s_last_waits = std::move(waits_now);
+	std::ranges::sort(waiting, [](const Row& a, const Row& b) { return a.wait_s > b.wait_s; });
+
+	std::unordered_map<std::string, FileReads> ten;
+	{
+		std::scoped_lock lock(g_file_reads->mutex);
+		ten.swap(g_file_reads->ten);
+	}
+	std::vector<std::pair<std::string, FileReads>> files(ten.begin(), ten.end());
+	std::ranges::sort(files, [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+	uint64_t reads = 0;
+	uint64_t bytes = 0;
+	for (const auto& [path, r]: files) {
+		reads += r.count;
+		bytes += r.bytes;
+	}
+	std::string out;
+	std::snprintf(line, sizeof(line), "[loader] %.0f s: file reads %" PRIu64 " (%.1f MB, %zu files)", seconds, reads,
+	              static_cast<double>(bytes) / 1e6, files.size());
+	out += line;
+	for (size_t i = 0; i < files.size() && i < 6; i++) {
+		auto path = files[i].first;
+		if (const auto cut = path.find_last_of("/\\"); cut != std::string::npos && path.size() - cut > 1) {
+			// The last two parts of the path are enough to name the file.
+			const auto cut2 = cut == 0 ? std::string::npos : path.find_last_of("/\\", cut - 1);
+			path            = path.substr(cut2 == std::string::npos ? 0 : cut2 + 1);
+		}
+		std::snprintf(line, sizeof(line), "%s %s x%" PRIu64 " %.1fMB", i == 0 ? ":" : ",", path.c_str(),
+		              files[i].second.count, static_cast<double>(files[i].second.bytes) / 1e6);
+		out += line;
+	}
+	out += "\n[loader] loaders: " + (loaders.empty() ? std::string("none") : loaders) + "\n[loader] longest waits:";
+	for (size_t i = 0; i < waiting.size() && i < 8; i++) {
+		out += (i == 0 ? " " : ", ") + waiting[i].name + " " + waiting[i].text;
+	}
+	out += "\n";
+	std::fputs(out.c_str(), stdout);
+	std::fflush(stdout);
+}
+
+bool FpsLogEnabled() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_FPS_LOG");
+		return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+	}();
+	return on;
+}
+
+std::atomic<bool> g_dump_requested {false};
+
+// A manual dump: F10 in the game window, or a file named stalldump.txt in the emulator's folder (removed then).
+bool TakeDumpRequest() {
+	if (g_dump_requested.exchange(false)) {
+		return true;
+	}
+	std::error_code error;
+	if (std::filesystem::exists("stalldump.txt", error)) {
+		std::filesystem::remove("stalldump.txt", error);
+		return true;
+	}
+	return false;
+}
+
 void Run(double threshold_s) {
 	constexpr double LightFrame = 300.0; // draws+dispatches a flip
 	constexpr int    MaxDumps   = 6;
@@ -352,11 +500,34 @@ void Run(double threshold_s) {
 	uint64_t last_flips    = 0;
 	uint64_t last_io       = 0;
 	int64_t  file_window   = NowNs();
+	int64_t  loader_line   = NowNs();
+	int      manual_dumps  = 0;
+	// Loaders idle in the same scene: the loaders' progress, when it last changed, and the draws per flip of
+	// the 10 s windows since (a loading tunnel draws the same each frame; play varies).
+	constexpr double LoaderIdleS   = 45.0;
+	uint64_t         loader_progress = LoaderProgress();
+	int64_t          loader_change   = 0; // 0: no loader activity seen since the last such dump
+	bool             armed_loader    = true;
 	for (;;) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(500));
 		if (NowNs() - file_window >= static_cast<int64_t>(FileWindowS * 1e9)) {
 			file_window = NowNs();
 			RotateFileReads();
+		}
+		if (NowNs() - loader_line >= 10'000'000'000LL) {
+			const double seconds = static_cast<double>(NowNs() - loader_line) / 1e9;
+			loader_line          = NowNs();
+			if (FpsLogEnabled()) {
+				LoaderLine(seconds);
+			}
+		}
+		if (TakeDumpRequest() && manual_dumps < 20) {
+			Dump("manual request (F10 or stalldump.txt)", 0.0, -1.0, -1.0, 100 + ++manual_dumps);
+		}
+		if (const auto progress = LoaderProgress(); progress != loader_progress) {
+			loader_progress = progress;
+			loader_change   = NowNs();
+			armed_loader    = true;
 		}
 		const Snapshot now {StallWatchCounters::g_flips.load(std::memory_order_relaxed),
 		                    StallWatchCounters::g_gpu_work.load(std::memory_order_relaxed),
@@ -394,7 +565,7 @@ void Run(double threshold_s) {
 			       static_cast<double>(now.flips - first->flips);
 		};
 		if (dumps >= MaxDumps) {
-			return;
+			continue; // (manual dumps and the [loader] line go on)
 		}
 		const double io_age = last_io_time == 0 ? -1.0 : static_cast<double>(now.time - last_io_time) / 1e9;
 		if (armed_flip && last_flips > 0 && now.time - last_flip_time >= threshold) {
@@ -410,6 +581,22 @@ void Run(double threshold_s) {
 			Dump("light frames (a loading screen or a menu) and no file read", io_age, light, io_age, ++dumps);
 			continue;
 		}
+		// The loaders woke up earlier, then none for 45 s, while flips go on and the scene draws the same: a level
+		// load that never ends behind a loading animation (Astro Bot's light tunnel), which the light-frame test
+		// misses (the tunnel is not light, and streamed audio keeps reading files).
+		if (armed_loader && loader_change != 0 && now.time - loader_change >= static_cast<int64_t>(LoaderIdleS * 1e9) &&
+		    now.time - last_flip_time < threshold) {
+			bool         full_a = false;
+			bool         full_b = false;
+			const double recent = per_flip(LoaderIdleS / 3.0, &full_a);
+			const double whole  = per_flip(LoaderIdleS, &full_b);
+			if (full_b && recent > 0.0 && whole > 0.0 && std::abs(recent - whole) <= 0.15 * whole) {
+				armed_loader = false;
+				Dump("loaders idle in the same scene (a load that never ends?)",
+				     static_cast<double>(now.time - loader_change) / 1e9, whole, io_age, ++dumps);
+				continue;
+			}
+		}
 		bool         long_full = false;
 		const double long_light = per_flip(threshold_s * 6.0, &long_full);
 		if (long_light >= LightFrame || long_light < 0.0) {
@@ -424,6 +611,10 @@ void Run(double threshold_s) {
 
 } // namespace
 
+void StallWatchRequestDump() noexcept {
+	g_dump_requested.store(true, std::memory_order_relaxed);
+}
+
 void StallWatchNoteFileRead(const std::filesystem::path& path, int64_t offset, uint64_t size) noexcept {
 	if (!g_enabled.load(std::memory_order_relaxed)) {
 		return;
@@ -434,12 +625,17 @@ void StallWatchNoteFileRead(const std::filesystem::path& path, int64_t offset, u
 		if (g_file_reads->current.size() >= 4096 && !g_file_reads->current.contains(name)) {
 			name = "(other files)";
 		}
-		auto& reads = g_file_reads->current[name];
-		reads.distinct += reads.count == 0 || reads.last_offset != offset ? 1 : 0;
-		reads.count++;
-		reads.bytes += size;
-		reads.last_offset = offset;
-		reads.last_size   = size;
+		for (auto* map: {&g_file_reads->current, &g_file_reads->ten}) {
+			if (map == &g_file_reads->ten && map->size() >= 1024 && !map->contains(name)) {
+				continue;
+			}
+			auto& reads = (*map)[name];
+			reads.distinct += reads.count == 0 || reads.last_offset != offset ? 1 : 0;
+			reads.count++;
+			reads.bytes += size;
+			reads.last_offset = offset;
+			reads.last_size   = size;
+		}
 	} catch (...) {
 	}
 }
