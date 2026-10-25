@@ -1,0 +1,203 @@
+#version 450
+// KYTY_GBUF_VIEW (gbuf-view.cpp, refl7): a diagnostic view of Demon's Souls' packed G-buffer (4 x R32_UINT layers,
+// copied before the deferred lighting by frame-gen.cpp SsrCaptureGbuffer), recorded right before the upscaler.
+// Nothing here changes the game's image unless a view is chosen; the stats run on the game's own color.
+//
+// Modes (push.mode):
+//   0 view:  the chosen view into out_img (see View below); a small crosshair marks the probe pixel (the centre)
+//   1 stats: a 256 x 144 sample grid over the render: per byte field (4 layers x 4 bytes) a 16-bin histogram, sum, sum
+//            of squares and sum of products with the game's color luminance (tonemapped to a byte: with the game's
+//            ShowRenderTarget debug view the color IS the engine's decoded field, so the field that correlates is it),
+//            the same sums on "forward" pixels (the final depth differs from the depth the deferred lighting read:
+//            drawn after the G-buffer, e.g. water), and the raw words at the probe pixel.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D color_tex;  // the game's color (render size, pre-exposure HDR)
+layout(binding = 1) uniform sampler2D depth_tex;  // the final depth
+layout(binding = 2) uniform usampler2D packed0;
+layout(binding = 3) uniform usampler2D packed1;
+layout(binding = 4) uniform usampler2D packed2;
+layout(binding = 5) uniform usampler2D packed3;
+layout(binding = 6) uniform sampler2D gdepth_tex; // the depth the deferred lighting read (flags & 2)
+layout(binding = 7) uniform sampler2D tap_tex;    // KYTY_GBUF_TAP's copy of a game image (flags & 4)
+layout(binding = 8, rgba16f) uniform writeonly image2D out_img;
+layout(std430, binding = 9) buffer Stats {
+	uint stats[];
+};
+layout(std430, binding = 10) readonly buffer ExposureBuf {
+	float exposure_values[]; // the game's exposure (applied after the upscale) at misc2.z; misc2.z < 0: none (1.0)
+};
+
+layout(push_constant) uniform Push {
+	ivec4 misc;   // x mode, y view, z field code (layer | shift << 2 | bits << 7), w flags (1 G-buffer, 2 pre-lighting depth, 4 tap)
+	ivec4 misc2;  // x stats slot base (uints), y tap kind (0 float color, 1 uint: its bits as a field), z exposure index, w unused
+	vec4  size;   // render width, height, 1 / width, 1 / height
+	vec4  params; // x unused, y the forward depth epsilon (relative), zw unused
+} push;
+
+// Stats layout (uints, at misc2.x): [0] samples, [1] sum y, [2] sum y^2, [3] forward samples,
+// [16 + f * 20 + b] byte field f histogram bin b (16), [+16] sum x, [+17] sum x^2, [+18] sum x*y, [+19] sum x on forward
+// pixels; [400 + i] the probe pixel: 4 raw words, final depth bits, pre-lighting depth bits, color r, g, b bits.
+const int ST_FIELDS = 16;
+const int ST_PROBE  = 400;
+
+// Views (push.misc.y): 0 the field (push.misc.z) as grayscale, 1 a 4 x 4 mosaic of the 16 byte fields (row = layer,
+// column = byte), 2 world normal from layer 3 (oct 8:8, the calibration's fit) as color, 3 forward pixels (drawn after the
+// G-buffer) in cyan over the dimmed image, 4 the tap image, 5 the game's image (stats only), 6 the 4 raw words' bits as
+// colors (layer 0..3 in quadrants).
+uint Packed(int layer, ivec2 p) {
+	if ((push.misc.w & 1) == 0) return 0u;
+	if (layer == 0) return texelFetch(packed0, p, 0).x;
+	if (layer == 1) return texelFetch(packed1, p, 0).x;
+	if (layer == 2) return texelFetch(packed2, p, 0).x;
+	return texelFetch(packed3, p, 0).x;
+}
+float Field(int code, ivec2 p) {
+	int  layer = code & 3, shift = (code >> 2) & 31, bits = (code >> 7) & 31;
+	uint w     = Packed(layer, p);
+	uint v     = bitfieldExtract(w, shift, bits);
+	return float(v) / float((1u << uint(bits)) - 1u);
+}
+float Exposure() {
+	if (push.misc2.z < 0) return 1.0;
+	float e = exposure_values[push.misc2.z];
+	return (e > 1e-8 && e < 1e8) ? e : 1.0;
+}
+float Luma(vec3 c) {
+	float l = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0) * Exposure();
+	return l / (1.0 + l);
+}
+vec3 OctDecode(vec2 e) {
+	vec2 f = e * 2.0 - 1.0;
+	vec3 n = vec3(f, 1.0 - abs(f.x) - abs(f.y));
+	float t = max(-n.z, 0.0);
+	n.x += n.x >= 0.0 ? -t : t;
+	n.y += n.y >= 0.0 ? -t : t;
+	return normalize(n);
+}
+bool Forward(ivec2 p) {
+	if ((push.misc.w & 2) == 0) return false;
+	float a = texelFetch(depth_tex, p, 0).x, b = texelFetch(gdepth_tex, p, 0).x;
+	return abs(a - b) > push.params.y * max(abs(b), 1e-6);
+}
+
+shared uint s_hist[ST_FIELDS * 16];
+shared uint s_sum[ST_FIELDS], s_sq[ST_FIELDS], s_xy[ST_FIELDS], s_fwd[ST_FIELDS];
+shared uint s_n, s_y, s_yy, s_fn;
+
+void RunStats() {
+	uint li = gl_LocalInvocationIndex;
+	if (li < ST_FIELDS * 16) s_hist[li] = 0u;
+	if (li < ST_FIELDS) { s_sum[li] = 0u; s_sq[li] = 0u; s_xy[li] = 0u; s_fwd[li] = 0u; }
+	if (li == 0u) { s_n = 0u; s_y = 0u; s_yy = 0u; s_fn = 0u; }
+	barrier();
+	// (256 x 144 samples: 16 x 9 groups of 16 x 16, each at the centre of its cell of the render)
+	ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 p = ivec2((vec2(g) + 0.5) * push.size.xy / vec2(256.0, 144.0));
+	uint w0 = Packed(0, p), w1 = Packed(1, p), w2 = Packed(2, p), w3 = Packed(3, p);
+	bool any = (w0 | w1 | w2 | w3) != 0u; // (an empty G-buffer texel: the sky or nothing drawn)
+	if (any) {
+		vec3 c  = texelFetch(color_tex, p, 0).rgb;
+		uint y  = uint(clamp(Luma(c), 0.0, 1.0) * 255.0 + 0.5);
+		bool fw = Forward(p);
+		atomicAdd(s_n, 1u);
+		atomicAdd(s_y, y);
+		atomicAdd(s_yy, y * y);
+		if (fw) atomicAdd(s_fn, 1u);
+		uint w[4] = uint[4](w0, w1, w2, w3);
+		for (int f = 0; f < ST_FIELDS; ++f) {
+			uint x = bitfieldExtract(w[f >> 2], (f & 3) * 8, 8);
+			atomicAdd(s_hist[f * 16 + int(x >> 4)], 1u);
+			atomicAdd(s_sum[f], x);
+			atomicAdd(s_sq[f], x * x);
+			atomicAdd(s_xy[f], x * y);
+			if (fw) atomicAdd(s_fwd[f], x);
+		}
+	}
+	barrier();
+	uint base = uint(push.misc2.x);
+	if (li < ST_FIELDS * 16 && s_hist[li] != 0u) atomicAdd(stats[base + 16u + (li >> 4) * 20u + (li & 15u)], s_hist[li]);
+	if (li < ST_FIELDS) {
+		uint o = base + 16u + li * 20u;
+		atomicAdd(stats[o + 16u], s_sum[li]);
+		atomicAdd(stats[o + 17u], s_sq[li]);
+		atomicAdd(stats[o + 18u], s_xy[li]);
+		atomicAdd(stats[o + 19u], s_fwd[li]);
+	}
+	if (li == 0u) {
+		atomicAdd(stats[base + 0u], s_n);
+		atomicAdd(stats[base + 1u], s_y);
+		atomicAdd(stats[base + 2u], s_yy);
+		atomicAdd(stats[base + 3u], s_fn);
+	}
+	if (gl_GlobalInvocationID.xy == uvec2(0u)) {
+		ivec2 q = ivec2(push.size.xy * 0.5);
+		vec3  c = texelFetch(color_tex, q, 0).rgb;
+		stats[base + ST_PROBE + 0] = Packed(0, q);
+		stats[base + ST_PROBE + 1] = Packed(1, q);
+		stats[base + ST_PROBE + 2] = Packed(2, q);
+		stats[base + ST_PROBE + 3] = Packed(3, q);
+		stats[base + ST_PROBE + 4] = floatBitsToUint(texelFetch(depth_tex, q, 0).x);
+		stats[base + ST_PROBE + 5] = (push.misc.w & 2) != 0 ? floatBitsToUint(texelFetch(gdepth_tex, q, 0).x) : 0u;
+		stats[base + ST_PROBE + 6] = floatBitsToUint(c.r);
+		stats[base + ST_PROBE + 7] = floatBitsToUint(c.g);
+		stats[base + ST_PROBE + 8] = floatBitsToUint(c.b);
+	}
+}
+
+vec3 View(ivec2 p) {
+	int  view = push.misc.y;
+	vec3 game = texelFetch(color_tex, p, 0).rgb;
+	if (view == 5) return game;
+	if (view == 4) {
+		if ((push.misc.w & 4) == 0) return vec3(1.0, 0.0, 1.0) * 0.25;
+		vec2 uv = (vec2(p) + 0.5) * push.size.zw;
+		vec4 t  = textureLod(tap_tex, uv, 0.0);
+		return push.misc2.y == 1 ? vec3(t.x) : t.rgb; // (shown pre-exposure, like the game's color: the upscaler and
+		                                              // the game's exposure after it still apply)
+	}
+	if ((push.misc.w & 1) == 0) return vec3(0.25, 0.0, 0.25); // (no G-buffer copy this frame: purple)
+	// (the field views are display values: undo the game's exposure, applied after the upscale)
+	float inv = 1.0 / Exposure();
+	if (view == 0) return vec3(Field(push.misc.z, p)) * inv;
+	if (view == 1) {
+		ivec2 tile = ivec2(vec2(p) * 4.0 * push.size.zw);
+		ivec2 q    = ivec2((vec2(p) - vec2(tile) * push.size.xy * 0.25) * 4.0);
+		q          = clamp(q, ivec2(0), ivec2(push.size.xy) - 1);
+		// (a 1-pixel dark border between tiles)
+		ivec2 in_tile = p - ivec2(vec2(tile) * push.size.xy * 0.25);
+		if (in_tile.x < 2 || in_tile.y < 2) return vec3(0.5, 0.0, 0.0) * inv;
+		return vec3(Field(tile.y | ((tile.x * 8) << 2) | (8 << 7), q)) * inv;
+	}
+	if (view == 2) {
+		uint w = Packed(3, p);
+		if (w == 0u) return vec3(0.0);
+		vec3 n = OctDecode(vec2(float(w & 255u), float((w >> 8) & 255u)) / 255.0);
+		return (n * 0.5 + 0.5) * inv;
+	}
+	if (view == 3) {
+		bool fw = Forward(p);
+		return fw ? vec3(0.0, 1.0, 1.0) * inv : game * 0.35;
+	}
+	if (view == 6) {
+		ivec2 tile = ivec2(vec2(p) * 2.0 * push.size.zw);
+		ivec2 q    = clamp(ivec2((vec2(p) - vec2(tile) * push.size.xy * 0.5) * 2.0), ivec2(0), ivec2(push.size.xy) - 1);
+		uint  w    = Packed(tile.y * 2 + tile.x, q);
+		return vec3(float(w & 255u), float((w >> 8) & 255u), float((w >> 16) & 255u)) / 255.0 * inv;
+	}
+	return game;
+}
+
+void main() {
+	if (push.misc.x == 1) {
+		RunStats();
+		return;
+	}
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (p.x >= int(push.size.x) || p.y >= int(push.size.y)) return;
+	vec3  c = View(p);
+	// (the probe pixel: a small red crosshair with a gap at its centre)
+	ivec2 d = abs(p - ivec2(push.size.xy * 0.5));
+	if ((d.x == 0 && d.y >= 3 && d.y <= 12) || (d.y == 0 && d.x >= 3 && d.x <= 12)) c = vec3(1.0, 0.0, 0.0) / Exposure();
+	imageStore(out_img, p, vec4(c, 1.0));
+}

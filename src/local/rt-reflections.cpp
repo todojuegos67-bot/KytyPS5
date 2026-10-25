@@ -46,6 +46,20 @@
 // disagreed with the G-buffer's (calibration 0.654) and with world up (floors read as ceilings: the wet-surface mask was
 // zero on floors); the mask needed flat AND plain AND up-facing at once (textured wet stone failed "plain"); and the
 // composite weight was a dry dielectric's Fresnel (~0.02 seen from above).
+//
+// (refl8) Guided by the game's own reflections (the default; KYTY_RT_REFLECTIONS_GUIDE=0: refl6's material mask): the
+// game's SSR result, a half-resolution RGBA16F input of its deferred lighting (CS 9fb5cc274b5e4f82, which also reads the
+// G-buffer, both depths and the 256x256 RG16F BRDF LUT), is copied after that dispatch (frame-gen.cpp
+// RtReflGuideAfterDispatch) and decides which surfaces reflect and how much: where its confidence (a) is high and our
+// sharper ray hits, the game's SSR color (rgb) is replaced by ours at the game's share (a x Fresnel x
+// KYTY_RT_REFLECTIONS_GUIDE_STRENGTH, 1.0); where our ray misses or leaves the screen, the game's pixel is unchanged. No
+// material guesses add a reflection; the roughness field only narrows the sharpening to mirror-like surfaces. Water (drawn
+// after the lighting, so not in the game's SSR) keeps its depth-detected mirror. KYTY_RT_REFLECTIONS_GUIDE_RANGE=lo:hi
+// (0.1:0.6, the confidence from which / to which the game reflects), KYTY_RT_REFLECTIONS_GUIDE_PREMUL=1 (its rgb is
+// premultiplied by a), KYTY_RT_REFLECTIONS_GUIDE_CS=<hash>, KYTY_RT_REFLECTIONS_GUIDE_SLOT=<n> (default: the first RGBA16F
+// input at half the written image's size). Logged: the lighting's images once, the dispatch that writes the guide (the
+// game's SSR pass) once, and every 10 s "RT reflections: guide:" with the share of pixels where the game reflects and
+// where we sharpened.
 #include "local/rt-reflections.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -64,8 +78,8 @@
 namespace Libs::Graphics::FrameGen {
 namespace {
 
-constexpr uint32_t Bindings      = 21;
-constexpr uint32_t HeaderBytes   = 160;           // view_rot[3], clip_prev[4], up_view, fparams, mparams
+constexpr uint32_t Bindings      = 22;
+constexpr uint32_t HeaderBytes   = 176;           // view_rot[3], clip_prev[4], up_view, fparams, mparams, gparams
 // calib[] (after the header; the shader's CALIB_* / STATS): samples, normal sums per layer x layout x space x screen
 // y convention, byte statistics, floor votes, then the cumulative stats counters (never cleared).
 constexpr uint32_t NLayouts      = 13;
@@ -75,7 +89,7 @@ constexpr uint32_t CalibFloors   = CalibBytes + 16 * 3;
 constexpr uint32_t CalibWet      = CalibFloors + 2; // puddle guess: count + 16 byte sums; water: the same
 constexpr uint32_t CalibHist     = 300;             // 16 byte fields x 16 bins
 constexpr uint32_t StatsIndex    = 560;
-constexpr uint32_t StatsCount    = 20;
+constexpr uint32_t StatsCount    = 25;
 constexpr uint32_t FrameBytes    = 4096;          // header + calibration + stats
 constexpr uint32_t ExposureIndex = 128 / 4;       // fparams.x (1.0) when the game gives no exposure
 constexpr uint32_t CalibRuns     = 24;
@@ -148,6 +162,11 @@ struct RtPass {
 	bool                    rough_trusted = false;
 	bool                    row0_up = true, row0_forced = false;
 	bool                    have_water = false; // (this frame: the G-buffer-time depth is bound)
+	// (refl8) The guide (the game's own SSR): its confidence range, rgb premultiplied, strength; the last one seen.
+	float                   guide_lo = 0.1f, guide_hi = 0.6f, guide_strength = 1.0f;
+	bool                    guide_premul = false, have_guide = false;
+	RtReflGuide             guide_last {};
+	uint64_t                stat_guide_frames = 0;
 	// The periodic line (every 10 s): the stats counters' last values and the sums since the last line.
 	std::array<uint32_t, StatsCount> stat_last {};
 	std::array<uint64_t, StatsCount> stat_sum {};
@@ -499,6 +518,7 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	}
 	++g_rt.stat_frames;
 	if (have_gbuf) ++g_rt.stat_gbuf_frames;
+	if (g_rt.have_guide) ++g_rt.stat_guide_frames;
 	const auto now = std::chrono::steady_clock::now();
 	if (now - g_rt.stat_time < std::chrono::seconds(10)) return;
 	const auto&    sm     = g_rt.stat_sum;
@@ -551,11 +571,26 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		passes += buf;
 	}
 	if (!passes.empty()) std::printf("RT reflections: GPU ms per pass (%s): %s\n", Cfg(level).name, passes.c_str());
+	if (RtReflGuideWanted()) {
+		// (refl8) The one line on the guide: where the game reflects (its SSR confident) and where we sharpened it.
+		const auto        pc = [&](uint32_t k) { return 100.0 * sm[k] / px; };
+		const RtReflGuide& gl = g_rt.guide_last;
+		char              producer[96];
+		if (gl.producer != 0) std::snprintf(producer, sizeof(producer), "CS %016llx", static_cast<unsigned long long>(gl.producer));
+		else std::snprintf(producer, sizeof(producer), "not seen (a draw, or not a G-buffer-time compute)");
+		std::printf("RT reflections: guide: last %.0f s: the game reflects (its SSR confidence > %.2f) on %.1f%% of the pixels, we "
+		            "sharpened %.1f%% (our hit replaced > 5%% of its SSR), water mirror %.1f%%; its mean confidence %.3f, rgb "
+		            "without confidence on %.1f%%; guide %llu of %llu frames (%ux%u from CS %016llx slot %d, written by %s)\n",
+		            std::chrono::duration<double>(now - g_rt.stat_time).count(), g_rt.guide_lo, pc(20), pc(21), pc(23),
+		            sm[22] / 1000.0 / px, pc(24), static_cast<unsigned long long>(g_rt.stat_guide_frames),
+		            static_cast<unsigned long long>(g_rt.stat_frames), gl.extent.width, gl.extent.height,
+		            static_cast<unsigned long long>(gl.cs), gl.slot, producer);
+	}
 	std::fflush(stdout);
 	g_rt.stage_ms.fill(0.0);
 	g_rt.stage_frames.fill(0);
 	g_rt.stat_sum.fill(0);
-	g_rt.stat_frames = 0, g_rt.stat_gbuf_frames = 0, g_rt.stat_copies0 = copies;
+	g_rt.stat_frames = 0, g_rt.stat_gbuf_frames = 0, g_rt.stat_guide_frames = 0, g_rt.stat_copies0 = copies;
 	g_rt.sum_ms = 0.0, g_rt.samples = 0;
 	g_rt.stat_time = now;
 }
@@ -717,6 +752,14 @@ int RtReflectionsLevel() {
 	return level;
 }
 bool RtReflectionsWanted() { return RtReflectionsLevel() > 0; }
+// (refl8) The game's SSR as the guide: on with the reflections unless KYTY_RT_REFLECTIONS_GUIDE=0.
+bool RtReflGuideWanted() {
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_RT_REFLECTIONS_GUIDE");
+		return RtReflectionsLevel() > 0 && !(value != nullptr && value[0] == '0');
+	}();
+	return wanted;
+}
 
 bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const int level = RtReflectionsLevel();
@@ -758,6 +801,12 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	RtReflGbuffer gbuf;
 	const bool    have_gbuf    = RtReflGetGbuffer(gbuf) && gbuf.extent == color.extent;
 	const uint32_t packed_count = have_gbuf ? 4u : 0u;
+	// (refl8) The game's own SSR result (the guide), taken in this flip or the last.
+	const bool  guide_mode = RtReflGuideWanted();
+	RtReflGuide guide;
+	const bool  have_guide = guide_mode && RtReflGetGuide(guide) && guide.view != nullptr;
+	if (have_guide) g_rt.guide_last = guide;
+	g_rt.have_guide = have_guide;
 	ReadStats(*graphics, have_gbuf, level);
 	{
 		static bool said = false;
@@ -787,6 +836,13 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			g_rt.dec_metal = FieldEnv("KYTY_RT_REFLECTIONS_METAL");
 			if (const char* mv = std::getenv("KYTY_RT_REFLECTIONS_MOVING"); mv != nullptr && *mv == '0') g_rt.moving_on = false;
 			g_rt.mat_scale = EnvFloat("KYTY_RT_REFLECTIONS_MATERIAL", 1.0f, 0.0f, 1.0f);
+			// (refl8) The guide's settings.
+			if (const char* w = std::getenv("KYTY_RT_REFLECTIONS_GUIDE_RANGE"); w != nullptr) {
+				float lo = 0.0f, hi = 0.0f;
+				if (std::sscanf(w, "%f:%f", &lo, &hi) == 2 && lo >= 0.0f && hi > lo && hi <= 1.0f) g_rt.guide_lo = lo, g_rt.guide_hi = hi;
+			}
+			if (const char* pm = std::getenv("KYTY_RT_REFLECTIONS_GUIDE_PREMUL"); pm != nullptr && *pm == '1') g_rt.guide_premul = true;
+			g_rt.guide_strength = EnvFloat("KYTY_RT_REFLECTIONS_GUIDE_STRENGTH", 1.0f, 0.0f, 4.0f);
 			if (const char* y = std::getenv("KYTY_RT_REFLECTIONS_FLIPY"); y != nullptr && *y != '\0')
 				g_rt.row0_up = *y != '0', g_rt.row0_forced = true;
 			// (a normal given and the convention forced: nothing left to calibrate)
@@ -859,10 +915,12 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			said = true;
 			std::printf("RT reflections: on (level %d %s: trace %ux%u of %ux%u%s, hi-z %u mips, %d iterations, rays <= %.0f px, %d "
 			            "a-trous passes, strength %g, water minimum reflectance %g, roughness: a mirror below %.2f, nothing from %.2f, G-buffer %s, "
-			            "exposure %s, camera %s)\n",
+			            "exposure %s, camera %s, %s)\n",
 			            level, cfg.name, g_rt.trace.width, g_rt.trace.height, color.extent.width, color.extent.height,
 			            cfg.checker ? " checkerboard" : "", g_rt.hiz.levels, iters, cap_px, passes, strength, min_refl, g_rt.mat_lo, g_rt.mat_hi, have_gbuf ? "copy found (calibrating)" : "not found yet (depth normals, heuristic)",
-			            inputs.exposure_buffer != nullptr ? "the game's" : "1.0", camera.prev ? "matrices" : "motion vectors only");
+			            inputs.exposure_buffer != nullptr ? "the game's" : "1.0", camera.prev ? "matrices" : "motion vectors only",
+			            guide_mode ? (have_guide ? "guided by the game's SSR (found)" : "guided by the game's SSR (not found yet: water only)")
+			                       : "material mask (KYTY_RT_REFLECTIONS_GUIDE=0)");
 			std::fflush(stdout);
 		}
 	}
@@ -880,7 +938,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.misc[2] = level;
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0) |
 	               (g_rt.row0_up ? 16 : 0) | (cfg.checker ? 32 : 0) | (have_water ? 64 : 0) |
-	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0);
+	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode ? 512 : 0);
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
 	push.dec[2] = static_cast<int32_t>(packed_count), push.dec[3] = 0;
 	const bool game_exposure = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
@@ -927,6 +985,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		header[35] = have_mat ? 0.0f : guess; // (fparams.w: the puddle guess's scale; off with a material field)
 		header[36] = g_rt.mat_lo, header[37] = g_rt.mat_hi, header[38] = g_rt.mat_scale; // (mparams)
 		header[39] = 0.0f;
+		header[40] = g_rt.guide_lo, header[41] = g_rt.guide_hi, header[42] = g_rt.guide_premul ? 1.0f : 0.0f; // (gparams)
+		header[43] = g_rt.guide_strength;
 		command.updateBuffer(vk::Buffer(g_rt.frame_buf), 0, HeaderBytes, header.data());
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
@@ -964,6 +1024,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			                                                      : vk::DescriptorImageInfo {pt, g.dummy.view, gen};
 		// (binding 20: the G-buffer-time depth; without it the hi-z stands in, never read: misc.w & 64 unset)
 		infos[20] = have_water ? vk::DescriptorImageInfo {pt, gbuf.depth, gbuf.depth_layout} : vk::DescriptorImageInfo {pt, g.hiz.view, gen};
+		// (binding 21, refl8: the game's SSR, linear; without it the hi-z stands in, never read: misc.w & 256 unset)
+		infos[21] = have_guide ? vk::DescriptorImageInfo {lin, guide.view, vk::ImageLayout::eShaderReadOnlyOptimal}
+		                       : vk::DescriptorImageInfo {pt, g.hiz.view, gen};
 		const vk::DescriptorBufferInfo frame_info {vk::Buffer(g.frame_buf), 0, VK_WHOLE_SIZE};
 		const vk::DescriptorBufferInfo exposure_info = game_exposure
 		                                                   ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range}

@@ -1743,7 +1743,7 @@ function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @(
 	return $c
 }
 $cmbRtSh = New-RtCombo 'Sombras RT' 'rtshadow' 24 'Sombras del sol trazadas por rayos sobre la imagen, con denoise. Solo con DLSS, XeSS o FSR. Bajo ~0,3 ms, Alto ~1 ms, Ultra ~1,5 ms. Beta.'
-$cmbRtRf = New-RtCombo 'Reflejos RT' 'rtrefl2' 56 'Reflejos trazados por rayos en agua, charcos y superficies mojadas, con denoise. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~4,5 ms. Beta.' @('No', 'Bajo', 'Medio', 'Alto', 'Ultra')
+$cmbRtRf = New-RtCombo 'Reflejos RT' 'rtrefl2' 56 'Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, mas nitidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms. Beta.' @('No', 'Bajo', 'Medio', 'Alto')
 $cmbShine = New-RtCombo 'Brillo metales' 'shine' 88 'Armaduras, escudos y metales: brillos del sol y de antorchas y fuegos, y algo mas de nitidez. Solo con DLSS, XeSS o FSR. Mejor con Sombras RT activadas. Beta.' @('No', 'Sol', 'Sol + 2 luces', 'Sol + 4 luces')
 $cmbRays = New-RtCombo 'Rayos de luz' 'godrays' 120 'Rayos de sol crepusculares y halo de luz alrededor de antorchas y fuegos. Solo con DLSS, XeSS o FSR. Los rayos de sol necesitan Sombras RT activadas. Suave ~0,3 ms, Fuerte ~1 ms. Beta.' @('No', 'Suave', 'Medio', 'Fuerte')
 

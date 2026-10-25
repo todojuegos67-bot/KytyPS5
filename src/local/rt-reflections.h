@@ -5,6 +5,8 @@
 // (KYTY_UPSCALER: DLSS / XeSS / FSR; without an upscaler there is no such point and nothing runs).
 // KYTY_RT_REFLECTIONS_STRENGTH (1.0, 0..3), KYTY_RT_REFLECTIONS_MIN (0.3, 0..0.8: the wet surfaces' minimum
 // reflectance). Off (the default): nothing created, nothing recorded.
+// (refl8) Guided by the game's own SSR (KYTY_RT_REFLECTIONS_GUIDE, default on; 0: refl6's material mask): it decides
+// which surfaces reflect and how much; our sharper ray only replaces its SSR color where ours hits (rt-reflections.cpp).
 #include "local/frame-gen.h"
 
 #include <array>
@@ -38,6 +40,17 @@ struct RtReflCamera {
 	bool                  rows = false, prev = false, up_valid = false;
 };
 void RtReflGetCamera(const std::array<float, 16>& view_to_clip, RtReflCamera& out);
+// (refl8) The guide: the game's own screen-space reflection result, a half-resolution RGBA16F input of its deferred
+// lighting / specular resolve (KYTY_RT_REFLECTIONS_GUIDE_CS, default 9fb5cc274b5e4f82; slot KYTY_RT_REFLECTIONS_GUIDE_SLOT,
+// default the first RGBA16F input at half its written image's size), copied right after that dispatch (frame-gen.cpp
+// RtReflGuideAfterDispatch) in this flip or the last: rgb its reflected color, a its confidence (where it hit).
+struct RtReflGuide {
+	vk::ImageView view = nullptr;
+	vk::Extent2D  extent {};
+	uint64_t      cs = 0, producer = 0; // (the lighting's hash; the dispatch that wrote the image, 0: not seen)
+	int           slot = -1;
+};
+[[nodiscard]] bool RtReflGetGuide(RtReflGuide& out);
 
 } // namespace Libs::Graphics::FrameGen
 

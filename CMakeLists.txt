@@ -455,6 +455,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${rt_reflections_header}")
 
+# KYTY_GBUF_VIEW / KYTY_GBUF_TAP: the G-buffer diagnostic view and statistics before the upscaler (src/local/gbuf-view.cpp).
+set(gbuf_view_source "${KYTY_SOURCE_DIR}/local/gbuf-view.comp")
+set(gbuf_view_spv "${gpu_tiler_generated_dir}/gbuf_view.spv")
+set(gbuf_view_header "${gpu_tiler_generated_dir}/gbuf_view_spv.h")
+add_custom_command(
+	OUTPUT "${gbuf_view_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gbuf_view_spv}" "${gbuf_view_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gbuf_view_spv} -DOUTPUT=${gbuf_view_header}
+	        -DSYMBOL=GBUF_VIEW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gbuf_view_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gbuf_view_header}")
+
 # KYTY_SHINE: specular highlights + material-aware sharpening before the upscaler (src/local/shine.cpp).
 set(shine_source "${KYTY_SOURCE_DIR}/local/shine.comp")
 set(shine_spv "${gpu_tiler_generated_dir}/shine.spv")
@@ -583,6 +599,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.h"
+	"${KYTY_SOURCE_DIR}/local/gbuf-view.h"
+	"${KYTY_SOURCE_DIR}/local/gbuf-view.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.cpp"
 	"${KYTY_SOURCE_DIR}/local/shine.h"
 	"${KYTY_SOURCE_DIR}/local/shine.cpp"
