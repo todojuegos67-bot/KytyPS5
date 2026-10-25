@@ -264,6 +264,7 @@ private:
 	struct ParkedImage {
 		ImageId  id;
 		uint64_t tick = 0;
+		uint64_t keep = 1; // collector runs it stays parked (KYTY_CUBE_SHADOW_FIX: a shadow pool's twin, longer)
 	};
 	std::unordered_map<uint64_t, ParkedImage> m_parked;
 	// Views of one allocation in shapes neither holds (a texture pool sampled as 256 layers of 11 levels and as 1649
@@ -276,7 +277,7 @@ private:
 	[[nodiscard]] static bool GuestTextureRequest(BindingType type, const ImageInfo& info);
 	void                      NoteGuestAlias(const ImageInfo& requested, Image& kept);
 	void                      FreeGuestAliases(ImageId written);
-	void                      ParkImage(ImageId id);
+	void                      ParkImage(ImageId id, uint64_t keep = 1);
 	[[nodiscard]] ImageId     TakeParkedImage(const ImageInfo& info);
 	void                      FreeImage(ImageId id, const char* site = "");
 	void                      TouchImage(Image& image);

@@ -28,6 +28,7 @@
 #include "local-platform.h"
 #include "native-resource-state.h"
 #include "scene-tags.h"
+#include "graphics/host_gpu/renderer/cache/shadowPoolTrace.h"
 
 #include <algorithm>
 #include <array>
@@ -579,6 +580,14 @@ size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
 	const uint64_t       goal  = all ? UINT64_MAX : std::max(bytes * 2, uint64_t {256} << 20u);
 	uint64_t             freed = 0;
 	std::vector<ImageId> victims;
+	// (KYTY_CUBE_SHADOW_FIX: a shadow pool's parked twin goes first; the next switch makes it again.)
+	std::vector<ImageId> twins;
+	std::erase_if(m_parked, [&](const auto& item) {
+		if (item.second.keep <= 1 || freed >= goal) return false;
+		if (const auto* twin = m_slot_images.try_get(item.second.id)) freed += twin->AccountedSize();
+		twins.push_back(item.second.id);
+		return true;
+	});
 	if (m_gc_tick >= UnusedTicks) {
 		m_lru_cache.ForEachItemBelow(m_gc_tick - UnusedTicks, [&](ImageId id) {
 			const auto* owner = m_slot_images.try_get(id);
@@ -589,6 +598,7 @@ size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
 		});
 	}
 	std::erase_if(victims, [&](ImageId id) { return !DetachImage(id); });
+	for (const auto id: twins) victims.push_back(id); // (parked: already out of every index)
 	if (!victims.empty()) {
 		m_scheduler.Wait(m_scheduler.CurrentTick());
 		// (Destroyed now, not after RetireImage's operation: the GPU is done with them.)
@@ -1486,6 +1496,21 @@ bool TextureCache::R32DepthCompareSupported() const {
 	return supported;
 }
 
+// KYTY_CUBE_SHADOW_FIX (on unless 0): a layered shadow pool the GPU rendered (the 384x384x360 D16 cube pool, written as
+// R16 storage by a compute pass and then sampled with a depth compare again) switches depth <-> colour with a full copy
+// both ways (bit-exact: D16 and R16 through a buffer). The image it leaves stayed parked one flip only: the next switch,
+// seconds later in a burst of them, made a new 135 MiB image (and its views) each time. Now the one it leaves stays
+// parked as its twin for CubeTwinKeep collector runs (taken back at the next switch, copied over whole as before;
+// freed first when video memory runs short). Contents are handled as before: only the image's lifetime changes.
+static bool CubeShadowFixOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CUBE_SHADOW_FIX");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+static constexpr uint64_t CubeTwinKeep = 1800;
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
@@ -1660,12 +1685,31 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 			std::fflush(stdout);
 		}
 	}
-	ParkImage(cached_id);
+	const bool keep_twin = alias_guard && CubeShadowFixOn() && cached.info.resources.levels == 1 &&
+	                       replacement.info.resources.layers == cached.info.resources.layers &&
+	                       replacement.info.data == cached.info.data && cached.backing.samples == 1;
+	if (alias_guard) {
+		ShadowPoolTrace::Count(ShadowPoolTrace::Find(cached.info.data.address, cached.info.resources.layers,
+		                                             cached.info.extent.width, cached.info.extent.height),
+		                       &ShadowPoolTrace::Pool::switches);
+		static std::atomic<bool> told {false};
+		if (keep_twin && !told.exchange(true)) {
+			std::printf("Cube shadow pool: 0x%llx+0x%llx (%u layers %ux%u) switches %s <-> %s; the image it leaves stays "
+			            "parked as its twin for %llu flips (KYTY_CUBE_SHADOW_FIX=0: one flip, then a new image)\n",
+			            static_cast<unsigned long long>(cached.info.data.address),
+			            static_cast<unsigned long long>(cached.info.data.size), cached.info.resources.layers,
+			            cached.info.extent.width, cached.info.extent.height,
+			            cached.info.IsDepth() ? "depth" : "color", replacement.info.IsDepth() ? "depth" : "color",
+			            static_cast<unsigned long long>(CubeTwinKeep));
+			std::fflush(stdout);
+		}
+	}
+	ParkImage(cached_id, keep_twin ? CubeTwinKeep : 1);
 	return replacement_id;
 }
 
 // (FreeImage's, but parked: TakeParkedImage takes it back for its description; the collector retires it a flip on.)
-void TextureCache::ParkImage(ImageId id) {
+void TextureCache::ParkImage(ImageId id, uint64_t keep) {
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
@@ -1675,7 +1719,7 @@ void TextureCache::ParkImage(ImageId id) {
 	if (!DetachImage(id)) return;
 	auto& parked = m_parked[address];
 	if (parked.id) RetireImage(parked.id);
-	parked = {id, m_gc_tick};
+	parked = {id, m_gc_tick, std::max<uint64_t>(keep, 1)};
 }
 
 // An image a depth overlap parked at `info`'s memory made for the same Vulkan image (all of its description but the
@@ -2223,6 +2267,11 @@ static void DepthArrayEvent(const char* what, const Image& image, uint64_t addre
 		return value != nullptr && value[0] == '1';
 	}();
 	static std::atomic<uint32_t> reports {0};
+	if (std::strncmp(what, "a recreation", 12) != 0) {
+		ShadowPoolTrace::Count(ShadowPoolTrace::Find(image.info.data.address, image.info.resources.layers,
+		                                             image.info.extent.width, image.info.extent.height),
+		                       &ShadowPoolTrace::Pool::whole_uploads);
+	}
 	if (!all && reports.fetch_add(1, std::memory_order_relaxed) >= 16) return;
 	std::printf("Depth array: %s (its rendered layers at risk): image 0x%llx+0x%llx (%u layers, %ux%u) at 0x%llx+0x%llx "
 	            "cpu=%d partial=%d maybe=%d buffer=%d buffer_ranges=%zu tracked_whole=%d %s (KYTY_DEPTH_ARRAY_LOG=1: all)\n",
@@ -2596,6 +2645,10 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 	if (picked.empty()) {
 		LiveCounters::Add(LiveCounters::PartialUploads);
 		return true;
+	}
+	if (image.IsGpuModified()) {
+		ShadowPoolTrace::Count(ShadowPoolTrace::Find(info.data.address, layers, info.extent.width, info.extent.height),
+		                       &ShadowPoolTrace::Pool::refreshed_layers, static_cast<uint32_t>(picked.size()));
 	}
 	// (The share is a cost limit: past it a whole upload is cheaper. Not for an array the GPU rendered into: a whole
 	// upload replaces its rendered layers with guest memory, which never held them - the shadow-map pool's spot shadows,
@@ -3768,6 +3821,12 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	                  image.IsCpuDirty() ? 1 : 0, image.IsBufferModified() ? 1 : 0, image.views.size());
     });
 	TouchImage(image);
+	if (image.info.resources.layers >= 6 && (image.info.IsDepth() || image.depth_array_alias)) {
+		ShadowPoolTrace::Count(ShadowPoolTrace::Find(image.info.data.address, image.info.resources.layers,
+		                                             image.info.extent.width, image.info.extent.height),
+		                       desc.type == BindingType::Storage ? &ShadowPoolTrace::Pool::storage
+		                                                         : &ShadowPoolTrace::Pool::samples);
+	}
 	if (!image.info.data.Empty()) {
 		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
@@ -3955,6 +4014,11 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
 	auto& image = m_slot_images[id];
+	if (image.info.resources.layers >= 6 && (image.info.IsDepth() || image.depth_array_alias)) {
+		ShadowPoolTrace::Count(ShadowPoolTrace::Find(image.info.data.address, image.info.resources.layers,
+		                                             image.info.extent.width, image.info.extent.height),
+		                       &ShadowPoolTrace::Pool::clears);
+	}
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
 	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
@@ -5025,6 +5089,12 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}, SlowLog::HitchThreshold());
 	std::scoped_lock lock {m_lock};
 	const auto       end = address + size;
+	// (KYTY_CUBE_SHADOW_FIX: a shadow pool's parked twin goes with its memory, not 1800 flips later.)
+	std::erase_if(m_parked, [&](const auto& item) {
+		if (item.second.keep <= 1 || item.first < address || item.first >= end) return false;
+		RetireImage(item.second.id);
+		return true;
+	});
 	bool             erased_metadata = false;
 	for (auto metadata = m_surface_metas.lower_bound(address);
 	     metadata != m_surface_metas.end() && metadata->first < end;) {
@@ -5163,11 +5233,12 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t   tick = m_gc_tick++;
 	// Parked images not taken back since the flip before: the game left that use of the memory.
 	std::erase_if(m_parked, [&](const auto& item) {
-		if (item.second.tick + 1 >= tick) return false;
+		if (item.second.tick + item.second.keep >= tick) return false;
 		RetireImage(item.second.id);
 		return true;
 	});
 	RetireStaleImages(tick);
+	ShadowPoolTrace::Flip(tick);
 	if (TextureOffload::Enabled()) OffloadScan(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
