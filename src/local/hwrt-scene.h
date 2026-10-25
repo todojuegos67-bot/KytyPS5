@@ -87,6 +87,12 @@ void NoteCamera(uint64_t vs_hash, std::span<const uint32_t> flattened_srt);
 // After the game's TAA dispatch (renderCompute.cpp, outside rendering): the frame's world-space gather, BLAS builds and
 // refits, the TLAS; KYTY_HWRT_DEBUG's view into the TAA's output (images[6]); the 10 s log.
 void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, std::span<const TextureBinding> images);
+// The same build where the game has no TAA pass: the PS5 Pro path's super-resolution packet (renderSuperResolution.cpp,
+// before the upscale; `where` names the hook in the log once). Commands go in order with the renderer's (a recording
+// packet with KYTY_VULKAN_RECORDING).
+void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* where);
+// KYTY_HWRT_DEBUG's view into an RGBA16F storage image in the GENERAL layout (the PS5 Pro path: the upscaled output).
+void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageView view, vk::Format format, vk::Extent2D extent);
 
 } // namespace HwScene
 } // namespace Libs::Graphics
