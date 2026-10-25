@@ -2177,6 +2177,10 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// Frame generation's camera (FrameGen::OnDraw: the G-buffer vertex shaders' view-projection, previous one and
 	// jitter), from the block's slots: dword s of the vertex stage's block is flattened SRT slot s, as the normal path's
 	// flattened_srt. Without it every frame of a session reported "camera default" (the G-buffer draws take this path).
+	// (KYTY_HWRT: the camera from any G-buffer draw of the frame, captured or not)
+	if (HwScene::Active() && Spec::Current() == nullptr)
+		HwScene::NoteCamera(pair.programs[0]->shader_hash,
+		                    std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
 	if (FrameGen::Capturing() && Spec::Current() == nullptr)
 		FrameGen::OnDraw(pair.programs[0]->shader_hash,
 		                 std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()), 't');
@@ -2663,8 +2667,31 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	}
 	// KYTY_HWRT (local/hwrt-scene.h): a G-buffer draw state (>= 3 colour targets, a single-layer depth target >= 1280 px
 	// wide it writes, a triangle list) gets the capturing variant of its pipeline too, compiled by a worker.
+	// (10-25 combo25: the G-buffer pass draws after the depth prepass with depth writes off - a depth-equal test - so
+	// depth writes alone found 5 states: a state that writes depth, tests it for equality, or is a known G-buffer
+	// vertex shader's qualifies; decals test without writing and are not equal tests.)
+	const bool hwrt_gbuffer_vs = vertex != nullptr && FrameGen::IsGbufferVertexShader(vertex->shader_hash);
+	const bool hwrt_depth      = state.depth_info.depth_write_enable ||
+	                        (state.depth_info.depth_test_enable && state.depth_info.depth_compare_op == vk::CompareOp::eEqual) ||
+	                        hwrt_gbuffer_vs;
 	if (HwScene::Active() && Role() == 0 && state.color_count >= 3 && state.depth_info.image_id &&
-	    state.depth_info.depth_write_enable && state.depth_info.desc.info.resources.layers == 1 &&
+	    state.depth_info.desc.info.resources.layers == 1 && state.depth_info.desc.info.extent.width >= 1280) {
+		static std::atomic<uint32_t> hwrt_reports {0};
+		if (hwrt_reports.fetch_add(1, std::memory_order_relaxed) < 48) {
+			std::printf("HWRT: G-buffer-like state VS %016llx PS %016llx: %u colours, depth %ux%u test %d write %d op %d, topology %d "
+			            "restart %d, known G-buffer VS %d -> %s\n",
+			            static_cast<unsigned long long>(vertex != nullptr ? vertex->shader_hash : 0),
+			            static_cast<unsigned long long>(pixel != nullptr ? pixel->shader_hash : 0), state.color_count,
+			            state.depth_info.desc.info.extent.width, state.depth_info.desc.info.extent.height,
+			            state.depth_info.depth_test_enable ? 1 : 0, state.depth_info.depth_write_enable ? 1 : 0,
+			            static_cast<int>(state.depth_info.depth_compare_op), static_cast<int>(topology), primitive_restart_enable ? 1 : 0,
+			            hwrt_gbuffer_vs ? 1 : 0,
+			            hwrt_depth && topology == vk::PrimitiveTopology::eTriangleList && !primitive_restart_enable ? "captured" : "not");
+			std::fflush(stdout);
+		}
+	}
+	if (HwScene::Active() && Role() == 0 && state.color_count >= 3 && state.depth_info.image_id && hwrt_depth &&
+	    state.depth_info.desc.info.resources.layers == 1 &&
 	    state.depth_info.desc.info.extent.width >= 1280 && topology == vk::PrimitiveTopology::eTriangleList &&
 	    !primitive_restart_enable) {
 		const auto module = HwScene::CaptureModule(m_context.GetGraphics(), table_state.programs.vertex.module);

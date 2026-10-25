@@ -1572,6 +1572,8 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			                       std::span<const FrameGen::SsrTarget>(targets.data(), n));
 		}
 	}
+	if (HwScene::Active() && state.vs_input_info.stage.program != nullptr) // (KYTY_HWRT: the camera)
+		HwScene::NoteCamera(state.vs_input_info.stage.program->shader_hash, state.vs_input_info.stage.resources.flattened_srt);
 	if (FrameGen::Capturing() && state.vs_input_info.stage.program != nullptr) {
 		FrameGen::OnDraw(state.vs_input_info.stage.program->shader_hash,
 		                 state.vs_input_info.stage.resources.flattened_srt);

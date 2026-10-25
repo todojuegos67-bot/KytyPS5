@@ -3338,6 +3338,8 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	if (FrameGen::Capturing() && record.stage_count > 0 && record.stages[0].program != nullptr) {
 		FrameGen::OnDraw(record.stages[0].program->shader_hash, record.stages[0].flattened, 'r');
 	}
+	if (HwScene::Active() && record.stage_count > 0 && record.stages[0].program != nullptr) // (KYTY_HWRT: the camera)
+		HwScene::NoteCamera(record.stages[0].program->shader_hash, record.stages[0].flattened);
 	if (FrameGen::SsrWanted() && record.stage_count > 0 && record.stages[0].program != nullptr)
 		FrameGen::OnSsrDraw(record.stages[0].program->shader_hash, record.stages[0].flattened);
 	if (FrameGen::ContactShadowsWanted() && record.stage_count > 0 && record.stages[0].program != nullptr)
