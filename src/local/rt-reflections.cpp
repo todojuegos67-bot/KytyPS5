@@ -56,10 +56,17 @@
 // material guesses add a reflection; the roughness field only narrows the sharpening to mirror-like surfaces. Water (drawn
 // after the lighting, so not in the game's SSR) keeps its depth-detected mirror. KYTY_RT_REFLECTIONS_GUIDE_RANGE=lo:hi
 // (0.1:0.6, the confidence from which / to which the game reflects), KYTY_RT_REFLECTIONS_GUIDE_PREMUL=1 (its rgb is
-// premultiplied by a), KYTY_RT_REFLECTIONS_GUIDE_CS=<hash>, KYTY_RT_REFLECTIONS_GUIDE_SLOT=<n> (default: the first RGBA16F
-// input at half the written image's size). Logged: the lighting's images once, the dispatch that writes the guide (the
+// premultiplied by a), KYTY_RT_REFLECTIONS_GUIDE_CS=<hash>, KYTY_RT_REFLECTIONS_GUIDE_SLOT=<n> (default: the slot found
+// before, else the first RGBA16F input at half the render (depth) size, else at half the written image's size). Logged: the lighting's images once, the dispatch that writes the guide (the
 // game's SSR pass) once, and every 10 s "RT reflections: guide:" with the share of pixels where the game reflects and
 // where we sharpened.
+//
+// Why refl8 showed nothing (logs of 2026-10-25): the guide slot was found once, on a 2560x1440 lighting run, and never
+// again: in play the lighting renders 1280x720 and writes a 640x720 image, so "half the written image" matched no input
+// (640x360) and the guide was copied in 0 frames; and while it was missing the guided mode masked everything but water
+// (0 % in Demon's Souls). Fixed: the slot by the render size and kept, the material mask while there is no guide, and the
+// guided composite also mixes our hit in up to the wet minimum reflectance on mirror-like up-facing pixels the game's SSR
+// is confident on (the game's own share alone, a dielectric's Fresnel, changed the pixel by ~1-4 %).
 #include "local/rt-reflections.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -526,7 +533,8 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	const double   area   = (Cfg(level).full ? 1.0 : 0.25) * (Cfg(level).checker ? 0.5 : 1.0); // (rays per render pixel)
 	const uint64_t copies = RtReflCopies();
 	const bool  mat    = g_rt.dec_rough >= 0 && g_rt.dec_normal >= 0;
-	const char* source = mat ? (g_rt.have_water ? "material roughness + water" : "material roughness")
+	const char* source = g_rt.stat_guide_frames > 0 ? (g_rt.have_water ? "the game's SSR (guide) + water" : "the game's SSR (guide)")
+	                     : mat ? (g_rt.have_water ? "material roughness + water" : "material roughness")
 	                     : g_rt.have_water ? "water (depth after the G-buffer) only"
 	                                       : "nothing (no G-buffer material, no depth copy)";
 	std::printf("RT reflections: last %.0f s: mask %s marks %.1f%% of the pixels reflective (water %.1f%%, "
@@ -580,11 +588,11 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		else std::snprintf(producer, sizeof(producer), "not seen (a draw, or not a G-buffer-time compute)");
 		std::printf("RT reflections: guide: last %.0f s: the game reflects (its SSR confidence > %.2f) on %.1f%% of the pixels, we "
 		            "sharpened %.1f%% (our hit replaced > 5%% of its SSR), water mirror %.1f%%; its mean confidence %.3f, rgb "
-		            "without confidence on %.1f%%; guide %llu of %llu frames (%ux%u from CS %016llx slot %d, written by %s)\n",
+		            "without confidence on %.1f%%; guide %llu of %llu frames (%ux%u from CS %016llx slot %d, written by %s; now: %s)\n",
 		            std::chrono::duration<double>(now - g_rt.stat_time).count(), g_rt.guide_lo, pc(20), pc(21), pc(23),
 		            sm[22] / 1000.0 / px, pc(24), static_cast<unsigned long long>(g_rt.stat_guide_frames),
 		            static_cast<unsigned long long>(g_rt.stat_frames), gl.extent.width, gl.extent.height,
-		            static_cast<unsigned long long>(gl.cs), gl.slot, producer);
+		            static_cast<unsigned long long>(gl.cs), gl.slot, producer, RtReflGuideStatus());
 	}
 	std::fflush(stdout);
 	g_rt.stage_ms.fill(0.0);
@@ -919,7 +927,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			            level, cfg.name, g_rt.trace.width, g_rt.trace.height, color.extent.width, color.extent.height,
 			            cfg.checker ? " checkerboard" : "", g_rt.hiz.levels, iters, cap_px, passes, strength, min_refl, g_rt.mat_lo, g_rt.mat_hi, have_gbuf ? "copy found (calibrating)" : "not found yet (depth normals, heuristic)",
 			            inputs.exposure_buffer != nullptr ? "the game's" : "1.0", camera.prev ? "matrices" : "motion vectors only",
-			            guide_mode ? (have_guide ? "guided by the game's SSR (found)" : "guided by the game's SSR (not found yet: water only)")
+			            guide_mode ? (have_guide ? "guided by the game's SSR (found)" : "guided by the game's SSR (not found yet: the material mask until it is)")
 			                       : "material mask (KYTY_RT_REFLECTIONS_GUIDE=0)");
 			std::fflush(stdout);
 		}
@@ -938,7 +946,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.misc[2] = level;
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0) |
 	               (g_rt.row0_up ? 16 : 0) | (cfg.checker ? 32 : 0) | (have_water ? 64 : 0) |
-	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode ? 512 : 0);
+	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0);
+	// (combo19: guided only while the guide is there; without it the material mask, refl6, instead of water only: the
+	// guide never found in play was the whole reason nothing changed)
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
 	push.dec[2] = static_cast<int32_t>(packed_count), push.dec[3] = 0;
 	const bool game_exposure = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);

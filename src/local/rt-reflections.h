@@ -51,6 +51,8 @@ struct RtReflGuide {
 	int           slot = -1;
 };
 [[nodiscard]] bool RtReflGetGuide(RtReflGuide& out);
+// (combo19) Why the guide is (not) there now: "copied", or the last reason it was not (a string literal).
+[[nodiscard]] const char* RtReflGuideStatus();
 
 } // namespace Libs::Graphics::FrameGen
 

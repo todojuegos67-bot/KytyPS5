@@ -1008,6 +1008,18 @@ void Composite(ivec2 px) {
 		float lc = Luma(max(col.rgb, vec3(0))), ld = Luma(dlt);
 		if (ld < 0.0) dlt *= min(1.0, MaxDarken * lc / max(-ld, 1e-30));
 		vec3 outg = col.rgb + dlt;
+		// (combo19) The replacement alone is at the game's share: a dielectric's Fresnel (~0.04 from above) of the game's
+		// confidence, an invisible change. Where the game's SSR is confident on a mirror-like, up-facing surface (puddles,
+		// wet and polished floors) our sharp hit is also mixed in up to the minimum reflectance (KYTY_RT_REFLECTIONS_MIN,
+		// as water), never over the game's highlights and never darker than MaxDarken of the pixel.
+		float smooth_ = 1.0 - smoothstep(0.06, 0.2, fr_rough);
+		float wm      = clamp(gparams.w * k * fparams.y * smooth_ * UpFacing(Nd), 0.0, 0.9);
+		float lo = Luma(max(outg, vec3(0))), lr = Luma(refl);
+		wm *= 1.0 - smoothstep(4.0, 12.0, lo / max(lr, lo * 1e-4 + 1e-30));
+		if (lr < lo) wm = min(wm, MaxDarken * lo / max(lo - lr, 1e-30));
+		wm   = clamp(isnan(wm) ? 0.0 : wm, 0.0, 0.9);
+		outg = mix(outg, refl, max(wm - wg, 0.0));
+		wg   = max(wg, wm);
 		if (BadV(outg)) outg = col.rgb;
 		if (st) {
 			Stat(21, ga * k > 0.05 ? 1 : 0);

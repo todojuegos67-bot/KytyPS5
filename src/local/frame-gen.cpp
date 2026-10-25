@@ -6101,6 +6101,8 @@ struct GuideState {
 	vk::ImageLayout       layout = vk::ImageLayout::eUndefined;
 	std::atomic<uint64_t> flip {~0ull};
 	uint32_t              misses = 0;
+	bool                  miss_logged = false, first_copy_logged = false;
+	std::atomic<const char*> status {"the lighting (guide CS) not seen yet"};
 	std::vector<SsrPass::RetiredCopy> retired;
 } g_guide;
 
@@ -6146,29 +6148,48 @@ void RtReflGuideAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk:
 		}
 	}
 	if (g_guide.failed || cs_hash != g_guide.hash) return;
-	// The slot: given, or the first RGBA16F input (not written) at half the first written image's size (+- 1).
-	vk::Extent2D out_extent {};
-	for (size_t i = 0; i < images.size() && i < 64; ++i)
-		if (((written_mask >> i) & 1u) != 0 && images[i].image_id) {
-			out_extent = BindingExtent(cache, images[i]);
-			break;
-		}
-	int slot = g_guide.slot;
-	if (slot < 0 && out_extent.width > 0) {
-		const auto near_half = [](uint32_t v, uint32_t full) { return v + 1 >= (full + 1) / 2 && v <= (full + 1) / 2 + 1; };
-		for (size_t i = 0; i < images.size() && i < 64; ++i) {
-			if (((written_mask >> i) & 1u) != 0 || !images[i].image_id) continue;
-			auto& im = cache.GetImage(images[i].image_id);
-			if (im.backing.format != vk::Format::eR16G16B16A16Sfloat) continue;
-			const vk::Extent2D e = BindingExtent(cache, images[i]);
-			if (near_half(e.width, out_extent.width) && near_half(e.height, out_extent.height)) {
-				slot = static_cast<int>(i);
-				break;
-			}
-		}
+	// The slot. (refl8 fix, combo19) The first version took the first RGBA16F input at half the size of the first
+	// image the lighting WRITES; that held only on the very first run (a 2560x1440 lighting writing 2560x1440, guide
+	// 1280x720). In play the PS5 Pro path renders 1280x720 and the lighting writes a 640x720 RGBA16F (half width), its
+	// guide input is 640x360: 640 is not half of 640, no slot ever again ("ran 600 times without a usable slot", the
+	// guide copied in 0 frames). Now, in order: KYTY_RT_REFLECTIONS_GUIDE_SLOT; the slot found before when it is still
+	// an RGBA float input no larger than the render size; the first RGBA16F input at half the render size (the largest
+	// depth binding: the G-buffer's size); the old rule (half the written image).
+	vk::Extent2D out_extent {}, ref_extent {};
+	for (size_t i = 0; i < images.size() && i < 64; ++i) {
+		if (!images[i].image_id) continue;
+		const vk::Extent2D e = BindingExtent(cache, images[i]);
+		if (((written_mask >> i) & 1u) != 0 && out_extent.width == 0) out_extent = e;
+		if (SsrIsDepthFormat(cache.GetImage(images[i].image_id).backing.format) &&
+		    uint64_t {e.width} * e.height > uint64_t {ref_extent.width} * ref_extent.height)
+			ref_extent = e;
 	}
-	if (!g_guide.logged) {
-		g_guide.logged = true;
+	if (ref_extent.width == 0) ref_extent = out_extent;
+	const auto is_rgba_float = [&](size_t i) {
+		if (i >= images.size() || !images[i].image_id || ((written_mask >> i) & 1u) != 0) return false;
+		const vk::Format f = cache.GetImage(images[i].image_id).backing.format;
+		return f == vk::Format::eR16G16B16A16Sfloat || f == vk::Format::eR32G32B32A32Sfloat;
+	};
+	const auto near_half = [](uint32_t v, uint32_t full) { return v + 1 >= (full + 1) / 2 && v <= (full + 1) / 2 + 1; };
+	const auto half_of   = [&](size_t i, vk::Extent2D full) {
+		if (full.width == 0 || !is_rgba_float(i)) return false;
+		const vk::Extent2D e = BindingExtent(cache, images[i]);
+		return near_half(e.width, full.width) && near_half(e.height, full.height);
+	};
+	int         slot = g_guide.slot;
+	const char* rule = "KYTY_RT_REFLECTIONS_GUIDE_SLOT";
+	if (slot < 0 && g_guide.used_slot >= 0 && is_rgba_float(static_cast<size_t>(g_guide.used_slot))) {
+		const vk::Extent2D e = BindingExtent(cache, images[g_guide.used_slot]);
+		// (no larger than the render size, no smaller than a quarter of it: not some other small RGBA float input)
+		if (ref_extent.width == 0 || (e.width <= ref_extent.width && e.height <= ref_extent.height && e.width * 4 >= ref_extent.width &&
+		                              e.height * 4 >= ref_extent.height))
+			slot = g_guide.used_slot, rule = "the slot found before";
+	}
+	for (size_t i = 0; slot < 0 && i < images.size() && i < 64; ++i)
+		if (half_of(i, ref_extent)) slot = static_cast<int>(i), rule = "half the render (depth) size";
+	for (size_t i = 0; slot < 0 && i < images.size() && i < 64; ++i)
+		if (half_of(i, out_extent)) slot = static_cast<int>(i), rule = "half the written image's size";
+	const auto bindings_line = [&] {
 		std::string line;
 		char        buf[200];
 		for (size_t i = 0; i < images.size() && i < 32; ++i) {
@@ -6180,24 +6201,46 @@ void RtReflGuideAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk:
 			              SsrFormatName(im.backing.format), e.width, e.height, static_cast<unsigned long long>(b.desc.info.data.address));
 			line += buf;
 		}
-		std::printf("RT reflections: guide CS %016llx images:%s -> guide slot %s\n", static_cast<unsigned long long>(g_guide.hash),
-		            line.c_str(), slot >= 0 ? std::to_string(slot).c_str() : "none (no half-resolution RGBA16F input): reflections on water only");
+		return line;
+	};
+	if (!g_guide.logged) {
+		g_guide.logged = true;
+		std::printf("RT reflections: guide CS %016llx images:%s (render size %ux%u, writes %ux%u) -> guide slot %s (%s)\n",
+		            static_cast<unsigned long long>(g_guide.hash), bindings_line().c_str(), ref_extent.width, ref_extent.height,
+		            out_extent.width, out_extent.height, slot >= 0 ? std::to_string(slot).c_str() : "none",
+		            slot >= 0 ? rule : "no RGBA float input at half the render size: the material mask until one is found");
 		std::fflush(stdout);
 	}
 	if (slot < 0 || static_cast<size_t>(slot) >= images.size() || !images[slot].image_id) {
-		if (++g_guide.misses == 600) {
-			std::printf("RT reflections: guide CS %016llx ran 600 times without a usable slot\n", static_cast<unsigned long long>(g_guide.hash));
+		++g_guide.misses;
+		if (!g_guide.miss_logged) {
+			// (one-shot: why this run found no guide, with what it bound)
+			g_guide.miss_logged = true;
+			std::printf("RT reflections: guide CS %016llx run without a usable slot (first time; %s): render size %ux%u, writes %ux%u, "
+			            "slot found before %d; images:%s\n",
+			            static_cast<unsigned long long>(g_guide.hash),
+			            slot >= 0 ? "the given slot is not bound" : "no RGBA float input at half the render or written size",
+			            ref_extent.width, ref_extent.height, out_extent.width, out_extent.height, g_guide.used_slot, bindings_line().c_str());
 			std::fflush(stdout);
 		}
+		g_guide.status.store("the lighting ran without a usable slot", std::memory_order_relaxed);
 		return;
+	}
+	if (slot != g_guide.used_slot && g_guide.used_slot >= 0) {
+		std::printf("RT reflections: guide slot %d -> %d (%s)\n", g_guide.used_slot, slot, rule);
+		std::fflush(stdout);
 	}
 	const auto& binding = images[slot];
 	auto&       image   = cache.GetImage(binding.image_id);
-	if (image.backing.image == nullptr) return;
+	if (image.backing.image == nullptr) {
+		g_guide.status.store("the guide slot's image has no backing", std::memory_order_relaxed);
+		return;
+	}
 	const vk::Format fmt = image.backing.format;
 	if (fmt != vk::Format::eR16G16B16A16Sfloat && fmt != vk::Format::eR32G32B32A32Sfloat) {
 		g_guide.failed = true;
-		std::printf("RT reflections: guide slot %d is %s, not RGBA float: reflections on water only\n", slot, SsrFormatName(fmt));
+		g_guide.status.store("the given guide slot is not RGBA float", std::memory_order_relaxed);
+		std::printf("RT reflections: guide slot %d is %s, not RGBA float: the material mask instead\n", slot, SsrFormatName(fmt));
 		std::fflush(stdout);
 		return;
 	}
@@ -6237,6 +6280,7 @@ void RtReflGuideAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk:
 		if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_guide.image, &g_guide.mem, nullptr) != VK_SUCCESS) {
 			g_guide.image  = VK_NULL_HANDLE;
 			g_guide.failed = true;
+			g_guide.status.store("the guide copy image could not be created", std::memory_order_relaxed);
 			return;
 		}
 		vk::ImageViewCreateInfo view_info {};
@@ -6247,11 +6291,13 @@ void RtReflGuideAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk:
 		if (graphics.device.createImageView(&view_info, nullptr, &g_guide.view) != vk::Result::eSuccess) {
 			g_guide.view   = nullptr;
 			g_guide.failed = true;
+			g_guide.status.store("the guide copy view could not be created", std::memory_order_relaxed);
 			return;
 		}
 		g_guide.extent = extent, g_guide.format = fmt, g_guide.used_slot = slot;
 		g_guide.address = binding.desc.info.data.address, g_guide.producer_logged = false;
-		std::printf("RT reflections: guide image %ux%u %s from CS %016llx slot %d (mip %u layer %u @0x%llx; the lighting writes %ux%u)\n",
+		static uint32_t created = 0;
+		if (++created <= 8) std::printf("RT reflections: guide image %ux%u %s from CS %016llx slot %d (mip %u layer %u @0x%llx; the lighting writes %ux%u)\n",
 		            extent.width, extent.height, SsrFormatName(fmt), static_cast<unsigned long long>(cs_hash), slot, level, layer,
 		            static_cast<unsigned long long>(g_guide.address), out_extent.width, out_extent.height);
 		std::fflush(stdout);
@@ -6301,13 +6347,29 @@ void RtReflGuideAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk:
 	g_guide.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
 	const vk::ImageLayout back = binding.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding.layout;
 	image.Transit(back, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range, command);
+	g_guide.used_slot = slot;
+	g_guide.status.store("copied", std::memory_order_relaxed);
 	g_guide.flip.store(flip, std::memory_order_release);
+	if (!g_guide.first_copy_logged) {
+		g_guide.first_copy_logged = true;
+		std::printf("RT reflections: guide copied (first time, flip %llu): %ux%u from CS %016llx slot %d @0x%llx, after %u runs without a slot\n",
+		            static_cast<unsigned long long>(flip), extent.width, extent.height, static_cast<unsigned long long>(cs_hash), slot,
+		            static_cast<unsigned long long>(binding.desc.info.data.address), g_guide.misses);
+		std::fflush(stdout);
+	}
 }
+
+const char* RtReflGuideStatus() { return g_guide.status.load(std::memory_order_relaxed); }
 
 bool RtReflGetGuide(RtReflGuide& out) {
 	const uint64_t taken = g_guide.flip.load(std::memory_order_acquire);
 	const uint64_t flips = g_flips_taken.load(std::memory_order_relaxed);
-	if (taken == ~0ull || flips > taken + 1 || g_guide.view == nullptr) return false;
+	if (taken == ~0ull || flips > taken + 1 || g_guide.view == nullptr) {
+		const char* st = g_guide.status.load(std::memory_order_relaxed);
+		if (taken != ~0ull && flips > taken + 1 && st != nullptr && std::strcmp(st, "copied") == 0)
+			g_guide.status.store("the last copy is older than one flip (the lighting did not run)", std::memory_order_relaxed);
+		return false;
+	}
 	out.view     = g_guide.view;
 	out.extent   = g_guide.extent;
 	out.cs       = g_guide.hash;
