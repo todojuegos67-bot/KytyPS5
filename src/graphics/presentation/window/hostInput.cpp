@@ -12,6 +12,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "libs/controller.h"
+#include "loader/gameArgs.h"
 
 #include <algorithm>
 #include <array>
@@ -354,11 +355,10 @@ bool SetRelativeMouseMode(bool enabled) {
 // ---- KYTY_KBM=1: keyboard and mouse play (opt-in; without it nothing below runs) ----
 // The mouse: relative mode (SDL reads Windows Raw Input, WM_INPUT, unaccelerated counts), the cursor hidden and
 // confined (window grab, ClipCursor); Esc or losing focus releases it, a click takes it again. Counts accumulate
-// (1/65536 count fixed point) and become the right stick once per guest pad read: deflection = sensitivity *
-// rate / KBM_FULL_RATE, curve ^exponent, an anti-deadzone floor, the counts a saturated stick cannot show yet carried
-// to the next read. Without counts the stick decays to centre (KYTY_KBM_DECAY_MS). Once a second the log has the
+// (1/65536 count fixed point) and become the right stick once per game frame: (10-25) deflection = counts/s * degrees
+// per count (KYTY_KBM_DEG_PER_COUNT * sensitivity) / the camera's top rate (learned from the camera), ^exponent, an
+// anti-deadzone floor; what a saturated stick cannot show is carried one frame at most, the rest dropped. Without counts the stick decays to centre (KYTY_KBM_DECAY_MS). Once a second the log has the
 // counts received, applied and pending.
-constexpr double KBM_FULL_RATE = 2000.0; // counts/s for a full deflection at sensitivity 1
 constexpr int64_t KBM_ONE      = 65536;
 
 enum KbmPseudo : std::size_t { KBM_WALK = CONTROL_INFO.size() + 1 };
@@ -426,6 +426,7 @@ struct KbmCurve {
 	double                onset_ms = 0; // stick -> first camera motion (pad reads, render, the game's own frames)
 	double                tau_ms   = 0; // the game's acceleration ramp as a first-order lag
 	double                sign     = 1; // yaw direction of +X stick
+	int                   camspeed = 0; // (10-25) the game camera speed it was measured at (0: not recorded)
 	std::vector<std::pair<double, double>> pts; // (stick, rate), monotonic, dead zone included
 
 	void Build() {
@@ -494,6 +495,8 @@ bool KbmLoadCurve(KbmCurve* c) {
 			c->onset_ms = v;
 		} else if (std::sscanf(line, "tau_ms %lf", &v) == 1) {
 			c->tau_ms = std::clamp(v, 0.0, 500.0);
+		} else if (int cs = 0; std::sscanf(line, "camspeed %d", &cs) == 1) {
+			c->camspeed = cs;
 		} else if (std::sscanf(line, "sign %lf", &v) == 1) {
 			c->sign = v < 0 ? -1 : 1;
 		}
@@ -514,6 +517,8 @@ void KbmSaveCurve(const KbmCurve& c) {
 	std::fprintf(f, "# Kyty KBM: Demon's Souls stick -> camera yaw (KYTY_KBM_CALIBRATE=1 rewrites it; delete to go back to the linear mapping)\n");
 	for (size_t i = 0; i < KBM_LEVELS.size(); ++i) std::fprintf(f, "stick %.2f rate %.2f\n", KBM_LEVELS[i], c.rate[i]);
 	std::fprintf(f, "onset_ms %.1f\ntau_ms %.1f\nsign %.0f\n", c.onset_ms, c.tau_ms, c.sign);
+	// (10-25) The camera speed it holds for (a curve measured at another one is not used).
+	if (c.camspeed > 0) std::fprintf(f, "camspeed %d\n", c.camspeed);
 	std::fclose(f);
 	LOGF("KYTY_KBM calibrate: curve written to %s\n", path.c_str());
 }
@@ -549,7 +554,10 @@ struct KbmState {
 	float                   adz      = 0.15f;
 	float                   decay_ms = 25.0f;
 	float                   walk     = 0.5f;
-	float                   carry_ms = 200.0f; // (10-24) the most a saturated stick still owes the mouse (KYTY_KBM_CARRY_MS)
+	// (10-25) The most a saturated stick still owes the mouse after this read (KYTY_KBM_CARRY_MS; 0, the default: one
+	// game frame of full tilt, the rest dropped). Was 200 ms: a flick beyond the camera's top speed kept turning for
+	// up to 200 ms after the hand stopped (the "holgura", worse with a higher sensitivity, which saturates sooner).
+	float                   carry_ms = 0.0f;
 	std::vector<KbmBinding> bindings;
 	bool                    captured = false;
 	bool                    walking  = false;
@@ -590,7 +598,12 @@ struct KbmState {
 	uint64_t last_flips = 0;     // flips seen at the last game-frame read
 	bool     last_ret   = false; // that read's answer (repeated by a read in the same frame)
 	int      last_x = 128, last_y = 128;
-	float    smooth_ms = 8.0f;   // (10-25) KYTY_KBM_SMOOTH_MS: the counts drained over this (sub-frame), 0 = all at once
+	float    smooth_ms = 2.0f;   // (10-25) KYTY_KBM_SMOOTH_MS: the counts drained over this (sub-frame), 0 = all at once
+	// (10-25) Linear mapping, linearized: the camera's degrees/s at full stick (rmax), learned from the camera; the
+	// stick then asks for counts/s * deg per count (KYTY_KBM_DEG_PER_COUNT * sens), whatever the game camera speed.
+	double   rmax         = 100.0;
+	bool     rmax_learned = false;
+	double   win_stick_x  = 0.0; // stick-seconds of x deflection (0..1, before the anti-deadzone) in the gain window
 	// The gain's window (game-frame reads): degrees the camera turned, units sent.
 	double   win_cam_x = 0.0, win_cam_y = 0.0, win_sent_x = 0.0, win_sent_y = 0.0;
 	double   cam_prev_pitch = 0.0;
@@ -759,6 +772,7 @@ void KbmCalibFinish(KbmState& k) {
 	curve.onset_ms = n_on > 0 ? on / n_on * 1000.0 : 0.0;
 	curve.tau_ms   = n_ta > 0 ? ta / n_ta * 1000.0 : 0.0;
 	curve.sign     = sg < 0 ? -1.0 : 1.0;
+	curve.camspeed = Loader::GameArgs::KbmCameraSpeed(); // (10-25) the speed it holds for
 	curve.Build();
 	if (!curve.valid) {
 		LOGF("KYTY_KBM calibrate: failed (the camera did not turn at any stick value); kbm_curve.txt unchanged\n");
@@ -852,6 +866,20 @@ void KbmLearnGain(KbmState& k) {
 			     curve ? "x the curve" : "deg per count", sent, curve ? "deg" : "counts", cam);
 		}
 	};
+	// (10-25) The linear mapping's top rate: the camera's turn over the stick-seconds asked of it.
+	if (!curve && k.win_stick_x >= 0.15 && k.win_cam_x >= 2.0) {
+		const double r = std::clamp(k.win_cam_x / k.win_stick_x, 20.0, 1500.0);
+		const double n = k.rmax_learned ? k.rmax + (std::clamp(r, k.rmax * 0.5, k.rmax * 2.0) - k.rmax) * 0.3
+		                                : 0.5 * (k.rmax + r);
+		static int said_rmax = 0;
+		if (!k.rmax_learned || said_rmax < 6) {
+			++said_rmax;
+			LOGF("KYTY_KBM: camera top rate %.0f deg/s at full stick (measured %.0f over %.2f stick-s): %.3f deg per count\n", n, r,
+			     k.win_stick_x, k.dpc * k.sens);
+		}
+		k.rmax = n, k.rmax_learned = true;
+	}
+	k.win_stick_x = 0.0;
 	learn(k.gain_x, k.win_cam_x, k.win_sent_x, "yaw");
 	learn(k.gain_y, k.win_cam_y, k.win_sent_y, "pitch");
 	k.win_cam_x = k.win_cam_y = k.win_sent_x = k.win_sent_y = 0.0;
@@ -931,7 +959,8 @@ bool KbmProvide(int* x, int* y) {
 			double L = std::hypot(k.debt_x, k.debt_y);
 			// (10-24) Owed degrees capped at carry_ms of the camera's top rate (was 180 deg): a flick beyond the game's
 			// speed turns at full tilt for at most carry_ms after the hand stops, not seconds.
-			const double cap = std::max(k.curve.MaxRate() * k.carry_ms * 1e-3, 1.0);
+			// (10-25) This read's and one more frame's worth by default (KYTY_KBM_CARRY_MS 0), the rest dropped.
+			const double cap = std::max(k.curve.MaxRate() * (k.carry_ms > 0.0f ? k.carry_ms * 1e-3 + dt : 2.0 * dt), 0.5);
 			if (L > cap) k.debt_x *= cap / L, k.debt_y *= cap / L, L = cap;
 			const double tau = k.curve.tau_ms * 1e-3;
 			const double a   = tau > 1e-4 ? 1.0 - std::exp(-dt / tau) : 1.0;
@@ -954,15 +983,17 @@ bool KbmProvide(int* x, int* y) {
 			// No kbm_curve.txt: the linear mapping (counts/s -> deflection). (10-25) The counts drained this read (a
 			// fraction, KYTY_KBM_SMOOTH_MS) over dt: the rate; a saturated stick's excess stays, capped at carry_ms of
 			// full tilt (was: the first read of a frame took every count, the counts/s noisy with the read's timing).
+			// (10-25) Linearized: full stick at rmax / (deg per count) counts/s, rmax learned from the camera.
+			const double cpf = std::max(k.rmax / std::max(dpc, 1e-6), 1.0); // counts/s at full stick
 			double ux = cx * drain, uy = cy * drain;
-			double mag = std::hypot(ux, uy) / dt * k.sens / KBM_FULL_RATE;
+			double mag = std::hypot(ux, uy) / dt / cpf;
 			if (mag > 1.0) ux /= mag, uy /= mag, mag = 1.0;
 			int64_t used_x = static_cast<int64_t>(std::llround(ux * KBM_ONE));
 			int64_t used_y = static_cast<int64_t>(std::llround(uy * KBM_ONE));
 			if (mag < 0.005) used_x = used_y = 0; // under a count or so a second: nothing sent
 			{
-				// The rest, capped (KYTY_KBM_CARRY_MS of full tilt).
-				const double  lim = std::max(k.carry_ms * 1e-3 * KBM_FULL_RATE / k.sens, 0.0) * KBM_ONE;
+				// The rest, capped: one game frame of full tilt (KYTY_KBM_CARRY_MS 0) or that many ms; beyond, dropped.
+				const double  lim = (k.carry_ms > 0.0f ? k.carry_ms * 1e-3 : dt) * cpf * KBM_ONE;
 				const double  rx = static_cast<double>(ax - used_x), ry = static_cast<double>(ay - used_y);
 				const double  rl = std::hypot(rx, ry);
 				int64_t       drop_x = 0, drop_y = 0;
@@ -984,6 +1015,7 @@ bool KbmProvide(int* x, int* y) {
 				k.out_x          = fx / len * out;
 				k.out_y          = fy / len * out;
 				sent_x = fx, sent_y = fy;
+				k.win_stick_x += mag * std::abs(fx) / len * dt;
 			} else if (k.decay_ms <= 0.0f) {
 				k.out_x = k.out_y = 0.0;
 			} else {
@@ -1045,12 +1077,32 @@ void KbmSetupMouse() {
 	if (k.provider_set) return;
 	k.provider_set = true;
 	k.dpc          = EnvFloat("KYTY_KBM_DEG_PER_COUNT", 0.05f, 0.001f, 2.0f);
-	if (KbmLoadCurve(&k.curve)) {
+	// (10-25) The camera's top rate until measured: ~18 deg/s per camera speed step (5: ~90 deg/s).
+	const int camspeed = Loader::GameArgs::KbmCameraSpeed();
+	k.rmax             = camspeed > 0 ? 18.0 * camspeed : 100.0;
+	const bool calibrate = [] {
+		const char* cal = std::getenv("KYTY_KBM_CALIBRATE");
+		return cal != nullptr && std::string_view(cal) == "1";
+	}();
+	if (!calibrate && KbmLoadCurve(&k.curve) && k.curve.camspeed > 0 && camspeed > 0 && k.curve.camspeed != camspeed) {
+		LOGF("KYTY_KBM: %s was measured at camera speed %d, the game runs at %d: not used (linear mapping); calibrate "
+		     "again at %d\n",
+		     KbmCurvePath().c_str(), k.curve.camspeed, camspeed, camspeed);
+		k.curve = KbmCurve {};
+	} else if (k.curve.valid) {
+		if (k.curve.camspeed == 0)
+			LOGF("KYTY_KBM: %s does not say its camera speed (older calibration): used as is; calibrate again if the camera "
+			     "speed changed\n",
+			     KbmCurvePath().c_str());
+	}
+	if (k.curve.valid) {
 		LOGF("KYTY_KBM: camera curve %s: 0.2 %.1f, 0.4 %.1f, 0.6 %.1f, 0.8 %.1f, 1.0 %.1f deg/s, ramp tau %.0f ms; %.3f deg per count\n",
 		     KbmCurvePath().c_str(), k.curve.rate[0], k.curve.rate[1], k.curve.rate[2], k.curve.rate[3], k.curve.rate[4],
 		     k.curve.tau_ms, k.dpc * k.sens);
 	} else {
-		LOGF("KYTY_KBM: no camera curve (%s): linear mapping; KYTY_KBM_CALIBRATE=1 measures it\n", KbmCurvePath().c_str());
+		LOGF("KYTY_KBM: no camera curve (%s): linear mapping, %.3f deg per count, camera speed %d (top rate %.0f deg/s until "
+		     "measured); KYTY_KBM_CALIBRATE=1 measures the curve\n",
+		     KbmCurvePath().c_str(), k.dpc * k.sens, camspeed, k.rmax);
 	}
 	if (const char* cal = std::getenv("KYTY_KBM_CALIBRATE"); cal != nullptr && std::string_view(cal) == "1") {
 		k.cal.phase = KbmCalib::Wait;
@@ -1072,8 +1124,8 @@ void KbmInit() {
 	g_kbm.adz      = EnvFloat("KYTY_KBM_ANTIDZ", 0.15f, 0.0f, 0.6f);
 	g_kbm.decay_ms = EnvFloat("KYTY_KBM_DECAY_MS", 0.0f, 0.0f, 500.0f);
 	g_kbm.walk     = EnvFloat("KYTY_KBM_WALK", 0.5f, 0.1f, 1.0f);
-	g_kbm.carry_ms = EnvFloat("KYTY_KBM_CARRY_MS", 200.0f, 0.0f, 2000.0f);
-	g_kbm.smooth_ms = EnvFloat("KYTY_KBM_SMOOTH_MS", 8.0f, 0.0f, 100.0f);
+	g_kbm.carry_ms = EnvFloat("KYTY_KBM_CARRY_MS", 0.0f, 0.0f, 2000.0f);
+	g_kbm.smooth_ms = EnvFloat("KYTY_KBM_SMOOTH_MS", 2.0f, 0.0f, 100.0f);
 	KbmAddList(KBM_DEFAULTS, false);
 	if (const char* map = std::getenv("KYTY_KBM_MAP"); map != nullptr) KbmAddList(map, true);
 	LOGF("KYTY_KBM: keyboard and mouse on (sens %.2f, exp %.2f, antideadzone %.2f, decay %.0f ms, smoothing %.0f ms, carry %.0f ms, "

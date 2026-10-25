@@ -19,6 +19,43 @@
 namespace Loader::GameArgs {
 namespace {
 
+struct CamSpeed {
+	int  speed  = 0;     // the effective cp11_Setting_CameraSpeed (0: not set)
+	int  asked  = 0;     // the launcher's (KYTY_GAME_CONVARS / _EXTRA, the last entry)
+	bool raised = false; // raised to KYTY_KBM_CAM_MIN
+};
+
+const CamSpeed& Cam() {
+	static const CamSpeed c = [] {
+		CamSpeed    r;
+		std::string list;
+		for (const char* name: {"KYTY_GAME_CONVARS", "KYTY_GAME_CONVARS_EXTRA"})
+			if (const char* v = std::getenv(name); v != nullptr) list += std::string(v) + ";";
+		const std::string key = "cp11_Setting_CameraSpeed=";
+		for (size_t at = list.find(key); at != std::string::npos; at = list.find(key, at + 1))
+			r.asked = std::atoi(list.c_str() + at + key.size());
+		r.speed = r.asked;
+		auto is1 = [](const char* name) {
+			const char* v = std::getenv(name);
+			return v != nullptr && v[0] == '1' && v[1] == '\0';
+		};
+		if (is1("KYTY_KBM") || is1("KYTY_KBM_CALIBRATE")) {
+			// The game's menu speeds 1-10 (11-15 above it): at 5 a full stick turns ~90 deg/s, so a mouse flick saturates
+			// it and is clipped. 10 by default; KYTY_KBM_CAM_MIN=0 keeps the launcher's.
+			const char* v     = std::getenv("KYTY_KBM_CAM_MIN");
+			const int   floor = std::clamp(v != nullptr && *v != '\0' ? std::atoi(v) : 10, 0, 15);
+			if (floor > 0 && r.speed < floor) r.speed = floor, r.raised = true;
+		}
+		if (r.raised) {
+			std::printf("Game convars: keyboard and mouse: camera speed %d (asked %d; KYTY_KBM_CAM_MIN, 0 keeps it)\n", r.speed,
+			            r.asked);
+			std::fflush(stdout);
+		}
+		return r;
+	}();
+	return c;
+}
+
 // One "+name=value" line per entry of KYTY_GAME_CONVARS (';' or ',' between entries), then of
 // KYTY_GAME_CONVARS_EXTRA: the launcher sets KYTY_GAME_CONVARS itself, the extra list (a user environment variable) is
 // read after it, so its values win (A/B tests of single engine settings, e.g. r_enableSpotShadows=false).
@@ -33,14 +70,22 @@ const std::string& ExtraLines() {
 			std::printf("Game convars: KYTY_GAME_CONVARS_EXTRA=%s (after the launcher's)\n", extra);
 			std::fflush(stdout);
 		}
+		// (10-25) Keyboard and mouse: the camera speed raised to KYTY_KBM_CAM_MIN (KbmCameraSpeed): its own entry,
+		// the launcher's dropped.
+		const int  cam      = KbmCameraSpeed();
+		const bool cam_mine = cam > 0 && KbmCameraSpeedRaised();
 		for (size_t at = 0; at < list.size();) {
 			auto end = list.find_first_of(";,", at);
 			if (end == std::string::npos) end = list.size();
 			const auto first = list.find_first_not_of(' ', at);
 			const auto last  = list.find_last_not_of(' ', end - 1);
-			if (first != std::string::npos && first < end && last >= first) out += "+" + list.substr(first, last - first + 1) + "\n";
+			if (first != std::string::npos && first < end && last >= first) {
+				const auto entry = list.substr(first, last - first + 1);
+				if (!(cam_mine && entry.rfind("cp11_Setting_CameraSpeed", 0) == 0)) out += "+" + entry + "\n";
+			}
 			at = end + 1;
 		}
+		if (cam_mine) out += "+cp11_Setting_CameraSpeed=" + std::to_string(cam) + "\n";
 		return out;
 	}();
 	return lines;
@@ -99,6 +144,13 @@ std::string Contents(const std::filesystem::path& real, Kind kind) {
 }
 
 } // namespace
+
+int KbmCameraSpeed() {
+	return Cam().speed;
+}
+bool KbmCameraSpeedRaised() {
+	return Cam().raised;
+}
 
 std::filesystem::path RedirectRead(const std::filesystem::path& real) {
 	const auto kind = KindOf(real);
