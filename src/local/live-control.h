@@ -66,6 +66,7 @@ extern "C" int  __llvm_profile_write_file(void);
 
 namespace Loader {
 std::string DescribeGuestAddressForDiagnostics(uint64_t vaddr);
+bool        SystemContentParamSfoGetString(const char* name, std::string* value);
 } // namespace Loader
 
 namespace LiveControl {
@@ -843,6 +844,74 @@ inline void StallWatch(int64_t threshold_ns) {
 		std::fflush(stdout);
 	}
 }
+
+// KYTY_BOOT_STALL_DUMP_S (astro-1025): no flip at all for that many seconds, from boot on (StallWatch above only
+// watches play, after 120 flips): every thread, the emulator's own too, is sampled up to 3 times 5 s apart per stall
+// and 9 times in all, to show where a boot hang waits (Astro Bot: the game stopped after its first controller read).
+// Default 20 s for Astro Bot (PPSA21567) only; 0 turns it off; any other title only when set.
+inline void BootWatch(int64_t threshold_ns, bool title_default) {
+	LocalPlatform::SetThreadName("Kyty.BootWatch");
+	using Clock = std::chrono::steady_clock;
+	if (title_default) {
+		// The title is known once the game's param.sfo is loaded (after Graphics starts).
+		std::string title;
+		for (int i = 0; i < 600 && !Loader::SystemContentParamSfoGetString("TITLE_ID", &title); i++)
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		if (title.rfind("PPSA21567", 0) != 0) return;
+		std::printf("Boot stall watch: on for %s (a thread dump after %.0f s without a flip; KYTY_BOOT_STALL_DUMP_S=0 off)\n",
+		            title.c_str(), static_cast<double>(threshold_ns) / 1e9);
+		std::fflush(stdout);
+	}
+	uint64_t last_flips  = g_flips.load(std::memory_order_acquire);
+	int64_t  last_change = Clock::now().time_since_epoch().count();
+	int      dumps = 0, total = 0;
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(250));
+		const auto    flips = g_flips.load(std::memory_order_acquire);
+		const int64_t now   = Clock::now().time_since_epoch().count();
+		if (flips != last_flips) {
+			last_flips  = flips;
+			last_change = now;
+			dumps       = 0;
+			continue;
+		}
+		if (total >= 9 || dumps >= 3 || now - last_change < threshold_ns + dumps * int64_t {5'000'000'000}) continue;
+		++dumps;
+		++total;
+		LocalPlatform::PrepareSampling();
+		const auto  self = LocalPlatform::ThreadId();
+		std::string out;
+		char        line[192];
+		const int64_t idle_since = g_render_idle_since.load(std::memory_order_relaxed);
+		std::snprintf(line, sizeof(line), "BOOTSTALL no flip for %.1f s (flips %llu, dump %d), render thread %s\n",
+		              static_cast<double>(now - last_change) / 1e9, static_cast<unsigned long long>(flips), dumps,
+		              idle_since != 0 ? "waiting for guest work" : "busy (or not started)");
+		out += line;
+		for (const auto& [tid, name]: LocalPlatform::ProcessThreads()) {
+			if (tid == self) continue;
+			const auto handle = LocalPlatform::OpenThreadForSampling(tid);
+			if (handle == 0) continue;
+			uint64_t   words[SampleWords] {};
+			const bool sampled = LocalPlatform::SampleThread(handle, 0, 0, words, SampleWords);
+			LocalPlatform::CloseThreadForSampling(handle);
+			if (!sampled) continue;
+			std::snprintf(line, sizeof(line), "BOOTSTALL   %u %s:", tid, name.empty() ? "-" : name.c_str());
+			out += line;
+			for (const auto word: words) {
+				if (word == 0) break;
+				const auto guest = Loader::DescribeGuestAddressForDiagnostics(word);
+				if (!guest.empty()) out += " " + guest;
+				else {
+					std::snprintf(line, sizeof(line), " %llx", static_cast<unsigned long long>(word));
+					out += line;
+				}
+			}
+			out += "\n";
+		}
+		std::fputs(out.c_str(), stdout);
+		std::fflush(stdout);
+	}
+}
 #endif
 
 inline void Start() {
@@ -855,6 +924,12 @@ inline void Start() {
 #if defined(_WIN32)
 	if (const char* stall = std::getenv("KYTY_STALL_DUMP_MS"); stall != nullptr && std::atoi(stall) > 0)
 		std::thread(StallWatch, int64_t {std::atoi(stall)} * 1'000'000).detach();
+	{
+		const char* boot = std::getenv("KYTY_BOOT_STALL_DUMP_S");
+		const double seconds = boot != nullptr ? std::atof(boot) : 20.0;
+		if (seconds > 0.0)
+			std::thread(BootWatch, static_cast<int64_t>(seconds * 1e9), boot == nullptr).detach();
+	}
 #endif
 	static const char* const path = std::getenv("KYTY_LIVE_FILE");
 	if (path == nullptr) return;
