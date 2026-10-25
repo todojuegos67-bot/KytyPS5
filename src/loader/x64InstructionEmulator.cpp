@@ -3,7 +3,11 @@
 #include "common/common.h"
 
 #include <Zydis/Zydis.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
+#include <vector>
 #include <cstring>
 #include <emmintrin.h>
 #include <xmmintrin.h>
@@ -799,6 +803,55 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 	return true;
 }
 
+// astro-perf-1025: the trap census (one relaxed add per emulated instruction, on an already slow path).
+namespace {
+constexpr size_t                                        TrapSiteSlots = 256;
+std::atomic<uint64_t>                                   g_trap_count {0};
+std::array<std::atomic<uint64_t>, TrapSiteSlots>        g_trap_site_rip {};
+std::array<std::atomic<uint64_t>, TrapSiteSlots>        g_trap_site_count {};
+
+void NoteTrap(uint64_t rip) noexcept {
+	g_trap_count.fetch_add(1, std::memory_order_relaxed);
+	const size_t start = static_cast<size_t>((rip * 0x9E3779B97F4A7C15ull) >> 56u);
+	for (size_t probe = 0; probe < 8; probe++) {
+		const size_t slot     = (start + probe) % TrapSiteSlots;
+		uint64_t     expected = g_trap_site_rip[slot].load(std::memory_order_relaxed);
+		if (expected == 0 &&
+		    g_trap_site_rip[slot].compare_exchange_strong(expected, rip, std::memory_order_relaxed)) {
+			expected = rip;
+		}
+		if (expected == rip) {
+			g_trap_site_count[slot].fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+	}
+}
+} // namespace
+
+uint64_t TrapCount() noexcept {
+	return g_trap_count.load(std::memory_order_relaxed);
+}
+
+std::string TakeTopTrapSites(int count) {
+	std::vector<std::pair<uint64_t, uint64_t>> sites;
+	for (size_t slot = 0; slot < TrapSiteSlots; slot++) {
+		const auto n = g_trap_site_count[slot].exchange(0, std::memory_order_relaxed);
+		if (n != 0) {
+			sites.emplace_back(n, g_trap_site_rip[slot].load(std::memory_order_relaxed));
+		}
+	}
+	std::sort(sites.begin(), sites.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+	std::string text;
+	char        item[64];
+	for (int i = 0; i < count && i < static_cast<int>(sites.size()); i++) {
+		std::snprintf(item, sizeof(item), "%srip=0x%llx n=%llu", text.empty() ? "" : ", ",
+		              static_cast<unsigned long long>(sites[i].second),
+		              static_cast<unsigned long long>(sites[i].first));
+		text += item;
+	}
+	return text;
+}
+
 bool TryEmulate(void* native_context) {
 	if (native_context == nullptr) {
 		return false;
@@ -814,12 +867,17 @@ bool TryEmulate(void* native_context) {
 #else
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
-	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
-	       TryEmulateSse4a(context) ||
+	const auto rip     = static_cast<uint64_t>(context.Rip());
+	const bool emulated = TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
+	                      TryEmulateSse4a(context) ||
 #if !defined(__APPLE__)
-	       TryEmulateShaNi(context) ||
+	                      TryEmulateShaNi(context) ||
 #endif
-	       TryEmulateCpuExtensions(context);
+	                      TryEmulateCpuExtensions(context);
+	if (emulated) {
+		NoteTrap(rip);
+	}
+	return emulated;
 }
 
 } // namespace Loader::X64InstructionEmulator

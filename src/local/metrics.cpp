@@ -1,5 +1,7 @@
 #include "local/metrics.h"
 
+#include "loader/x64InstructionEmulator.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -129,6 +131,26 @@ FrameStamp OnGuestFlip() {
 		std::printf("[fps] %u frames: mean %.1f ms, max %.1f; over 17 ms: %u, over 25 ms: %u; flip->present mean %.2f sd "
 		            "%.2f ms, present interval mean %.2f sd %.2f ms\n",
 		            w.frames, w.sum_ms / w.frames, w.max_ms, w.over17, w.over25, fp.Mean(), fp.Sd(), pi.Mean(), pi.Sd());
+		// astro-perf-1025: instructions emulated through host exceptions (--amd-cpu's trapped VRSQRTPS sites
+		// among them), every 10 s when there were any: each costs several microseconds on the guest thread.
+		static uint64_t trap_seconds = 0;
+		static uint64_t trap_frames  = 0;
+		static uint64_t trap_last    = 0;
+		trap_frames += w.frames;
+		if (++trap_seconds >= 10) {
+			const auto traps = Loader::X64InstructionEmulator::TrapCount();
+			if (traps != trap_last) {
+				std::printf("[traps] %llu emulated instructions in %llu s (%.0f/frame); busiest: %s\n",
+				            static_cast<unsigned long long>(traps - trap_last),
+				            static_cast<unsigned long long>(trap_seconds),
+				            static_cast<double>(traps - trap_last) /
+				                static_cast<double>(std::max<uint64_t>(trap_frames, 1)),
+				            Loader::X64InstructionEmulator::TakeTopTrapSites(6).c_str());
+			}
+			trap_last    = traps;
+			trap_seconds = 0;
+			trap_frames  = 0;
+		}
 		std::fflush(stdout);
 		w = {};
 		w.start = w.last = now;
