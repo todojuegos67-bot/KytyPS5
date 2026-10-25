@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -67,13 +68,27 @@ struct RenderDepthInfo {
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;
 };
 
+// KYTY_SPOT_FIX6 (on unless 0): a depth attachment cleared by its load (a DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE draw,
+// whose own depth writes are off, or a pending HTile clear) takes a writable layout, so its store is STORE. In a
+// read-only layout the store was STORE_OP_NONE (ef46df82): a load clear is a write, after which NONE leaves the
+// contents undefined - on NVIDIA the clear was dropped. The spot-shadow pool (1024x1024x80 D32, no HTile) is cleared
+// layer by layer with clear draws before the casters are drawn: its layers kept the depth of an earlier shadow, and
+// torch/chandelier shadows on the floor came and went with wrong shapes.
+inline bool DepthClearStoreFix() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_SPOT_FIX6");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
 inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {
 	const auto available     = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 	const auto writes        = depth.AttachmentWriteAspects();
 	const bool has_depth     = static_cast<bool>(available & vk::ImageAspectFlagBits::eDepth);
 	const bool has_stencil   = static_cast<bool>(available & vk::ImageAspectFlagBits::eStencil);
-	// LoadOp clears are separate from guest depth writes.
-	const bool depth_write   = depth.depth_write_enable;
+	// Guest depth writes, and (KYTY_SPOT_FIX6) a load clear: it writes the attachment too.
+	const bool depth_write   = depth.depth_write_enable || (DepthClearStoreFix() && depth.depth_load_clear_enable);
 	const bool stencil_write = static_cast<bool>(writes & vk::ImageAspectFlagBits::eStencil);
 	if (!has_stencil) {
 		return depth_write ? vk::ImageLayout::eDepthAttachmentOptimal

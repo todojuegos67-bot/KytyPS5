@@ -847,6 +847,18 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto writable = depth.AttachmentWriteAspects() & vk::ImageAspectFlagBits::eStencil;
 		if (depth.depth_write_enable) {
 			writable |= vk::ImageAspectFlagBits::eDepth;
+		} else if (depth.depth_load_clear_enable && DepthClearStoreFix()) {
+			// (KYTY_SPOT_FIX6: the load clear writes the depth; a read-only layout stored nothing, depthRenderTarget.h.)
+			writable |= vk::ImageAspectFlagBits::eDepth;
+			static std::atomic<uint32_t> cleared {0};
+			const uint32_t               n = cleared.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (n <= 4 || (n & (n - 1)) == 0) {
+				std::printf("Depth clears: %u cleared by a draw that writes no depth, stored (was dropped; last 0x%llx "
+				            "layer %u+%u %ux%u; KYTY_SPOT_FIX6=0: as before)\n",
+				            n, static_cast<unsigned long long>(image.info.data.address), depth.desc.view_info.base_layer,
+				            depth.desc.view_info.layer_count, depth.desc.info.extent.width, depth.desc.info.extent.height);
+				std::fflush(stdout);
+			}
 		}
 		const auto pixel_writable = feedback ? writable & ~vk::ImageAspectFlagBits::eDepth : writable;
 		if (static_cast<bool>(image.binding.pixel_sampled_aspects & pixel_writable) ||
