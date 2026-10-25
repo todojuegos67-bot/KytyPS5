@@ -1633,7 +1633,30 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		return true;
 	};
 	const bool full_screen_pass = full_screen && (AsyncDrawSyncSmall() || !targets_written());
-	if (AsyncDrawPipelines() && !full_screen_pass) {
+	// KYTY_ASYNC_SHADOW_SYNC (on unless 0): a depth-only draw into a layered depth array (the spot-shadow pool
+	// 1024x1024x80, the sun cascades) keeps the blocking compile. The game renders a static light's layer once and
+	// samples it for many frames after: an occluder dropped while its pipeline compiled (or was made again after an
+	// idle eviction, KYTY_RAM_DIET / KYTY_PIPELINE_EVICT_SECONDS) stays missing from that layer until the game
+	// re-renders it - sharp lit floor patches under the Boletaria hall lamps that come and go as the lights' layers
+	// are reassigned. Depth-only pipelines compile in a few ms.
+	const bool shadow_layer_pass = [&] {
+		static const bool on = [] {
+			const char* value = std::getenv("KYTY_ASYNC_SHADOW_SYNC");
+			return value == nullptr || value[0] != '0';
+		}();
+		return on && state.color_count == 0 && state.depth_info.image_id &&
+		       state.depth_info.desc.info.resources.layers >= 2 && state.depth_info.desc.info.IsDepth();
+	}();
+	if (shadow_layer_pass && AsyncDrawPipelines()) {
+		static std::atomic<uint64_t> shadow_sync {0};
+		const auto n = shadow_sync.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((n & (n - 1)) == 0 && n >= 1024 && n <= (uint64_t {1} << 20)) {
+			std::printf("Async draw pipelines: %llu shadow-layer draws kept the blocking compile (KYTY_ASYNC_SHADOW_SYNC=0: "
+			            "skipped while compiling)\n",
+			            static_cast<unsigned long long>(n));
+		}
+	}
+	if (AsyncDrawPipelines() && !full_screen_pass && !shadow_layer_pass) {
 		auto& cache    = m_context.GetPipelineCache();
 		const auto try_create = [&] {
 			return cache.TryCreateGraphicsPipeline(std::span {state.color_info, state.color_count}, state.depth_info,
