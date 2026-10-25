@@ -348,6 +348,7 @@ struct PipelineCache::ProgramCache {
 		if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
 			std::printf("Shader %016llx: unsupported resources, skipping its draws/dispatches\n",
 			            static_cast<unsigned long long>(hash));
+			std::fflush(stdout); // the launcher's log is a redirected (fully buffered) stdout
 		}
 		input_info.stage = {};
 		return {};
@@ -1346,6 +1347,7 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 		                    .count();
 		std::printf("Pipeline: async compute %016llx compiled in %lld ms\n",
 		            static_cast<unsigned long long>(id), static_cast<long long>(ms));
+		std::fflush(stdout);
 		std::lock_guard lock(m_async_compute->mutex);
 		m_async_compute->pending.erase(id);
 		m_async_compute->done.emplace(id, std::move(*pipeline));

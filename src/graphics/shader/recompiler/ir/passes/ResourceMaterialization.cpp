@@ -15,6 +15,8 @@
 #include <numeric>
 #include <unordered_set>
 
+#include <atomic>
+#include <cstdlib>
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
@@ -1013,9 +1015,38 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    (!storage_swizzle && image.shader_swizzle != image_class.shader_swizzle)) {
-				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+				// Ghost of Yotei CS 8968b4b53e5a246a: a runtime-selected texture table whose entries
+				// differ in mips/format/swizzle from the exemplar. Failing skipped the whole shader;
+				// now only the odd entries are bound as null images (reads return 0) and the shader
+				// runs. KYTY_STRICT_INDIRECT_IMAGES=1 restores the failure.
+				static const bool strict = [] {
+					const char* v = std::getenv("KYTY_STRICT_INDIRECT_IMAGES");
+					return v != nullptr && v[0] == '1';
+				}();
+				if (strict) {
+					return SpecializationFail(
+					    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
+					                program.info.images[root_index].first_use_pc));
+				}
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+					std::printf("ResourceMaterialization: indirect image table pc 0x%08x candidate %u "
+					            "incompatible (dim %u/%u mips %u/%u fmt %u/%u swz %u/%u), bound as null\n",
+					            program.info.images[root_index].first_use_pc, candidate,
+					            static_cast<uint32_t>(image.dimension), static_cast<uint32_t>(image_class.dimension),
+					            image.mip_count, image_class.mip_count,
+					            static_cast<uint32_t>(image.conversion_format),
+					            static_cast<uint32_t>(image_class.conversion_format),
+					            static_cast<uint32_t>(image.shader_swizzle != image_class.shader_swizzle), 0u);
+					std::fflush(stdout);
+				}
+				snapshot.images[candidate].dwords = {};
+				image.numeric_class     = image_class.numeric_class;
+				image.dimension         = image_class.dimension;
+				image.mip_count         = image_class.mip_count;
+				image.conversion_format = image_class.conversion_format;
+				image.shader_swizzle    = image_class.shader_swizzle;
+				image.cube              = image_class.cube;
 			}
 		}
 	}
