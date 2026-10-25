@@ -5086,7 +5086,11 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		run(2, *src, g.tmp_b, *dst, g.tmp_b, g.count[cur], g.tmp_b, static_cast<float>(1 << i), g.trace);
 		src = dst;
 	}
-	run(4, *src, g.tmp_b, g.out, g.tmp_b, g.count[cur], g.tmp_b, 0.0f, g.render);                            // composite
+	// (shadows-1025) KYTY_GTAO_FLOOR: the composite's darkest multiplier (gtao.comp Composite: 0.7 = at most 30 % off;
+	// "Sombras: profundidad" lowers it to 0.55 / 0.45 for deeper creases under tables, carts and feet). Rides in the
+	// composite's unused a-trous step slot.
+	static const float gtao_floor = std::clamp(SsgiEnv("KYTY_GTAO_FLOOR", 0.7f, 1.0f), 0.3f, 0.95f);
+	run(4, *src, g.tmp_b, g.out, g.tmp_b, g.count[cur], g.tmp_b, gtao_floor, g.render);                      // composite
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
 	if (so_stat) { // (specocc) this frame's stats into the host ring (read 4 frames later)
