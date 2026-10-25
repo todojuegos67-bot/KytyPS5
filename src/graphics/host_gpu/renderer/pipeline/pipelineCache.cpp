@@ -1,6 +1,7 @@
 #include "graphics/drawDiff.h"
 #include "graphics/frameCosts.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelinePrewarm.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -859,6 +860,9 @@ struct PipelineCache::ProgramCache {
 
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
+		if (std::strcmp(stage_name, "cs") == 0) {
+			Prewarm::NoteSpirv(module, result.spirv);
+		}
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -1172,6 +1176,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	Prewarm::Shutdown();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -1807,9 +1812,17 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	return iter->second.get();
 }
 
+void PipelineCache::StartPrewarm() {
+	if (!m_prewarm_started) {
+		m_prewarm_started = true;
+		Prewarm::EnsureStarted(m_graphics, PipelineCacheTitleId(), m_driver_cache);
+	}
+}
+
 PipelineCache::Pipeline&
 PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
                                   const ShaderProgram&          compute_program) {
+	StartPrewarm();
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(!compute_program);

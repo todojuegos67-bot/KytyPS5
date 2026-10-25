@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelinePrewarm.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -641,6 +642,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                  vk::ShaderStageFlagBits::eCompute);
 	pipeline.uses_bindless = UsesBindless(*input_info.stage.program);
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	const uint64_t prewarm_key = Prewarm::Register(
+	    compute_module, descriptor_bindings, comp_subgroup_size.requiredSubgroupSize,
+	    pipeline.uses_bindless ? Prewarm::FlagBindless : 0u);
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
@@ -671,6 +675,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.basePipelineIndex = -1;
 
 	EXIT_IF(pipeline.pipeline != nullptr);
+	if (auto prewarmed = Prewarm::Take(prewarm_key); prewarmed != nullptr) {
+		pipeline.pipeline = prewarmed;
+		return;
+	}
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
@@ -683,4 +691,57 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 }
 
+// Prewarm (pipelinePrewarm.h): a recorded compute pipeline with a layout of its own, built like the
+// compute CreatePipelineInternal but returning nullptr on any failure.
+vk::Pipeline Prewarm::BuildComputePipeline(GraphicContext& graphics, const Prewarm::Record& record,
+                                           vk::PipelineCache driver_cache) {
+	std::vector<vk::DescriptorSetLayoutBinding> bindings;
+	bindings.reserve(record.bindings.size());
+	for (const auto& b: record.bindings) {
+		bindings.emplace_back(b.binding, static_cast<vk::DescriptorType>(b.type), b.count,
+		                      static_cast<vk::ShaderStageFlags>(b.stages), nullptr);
+	}
+	PipelineCache::Pipeline layout_owner;
+	layout_owner.uses_bindless = (record.flags & Prewarm::FlagBindless) != 0;
+	if (layout_owner.uses_bindless && graphics.bindless_layout == nullptr) {
+		return nullptr;
+	}
+	CreateDescriptorLayout(graphics, layout_owner, bindings);
+	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
+	                                            ShaderRecompiler::IR::NativePushConstantSize};
+	std::array<vk::DescriptorSetLayout, 2> set_layouts {};
+	uint32_t                               set_layout_count = 0;
+	FillSetLayouts(graphics, layout_owner, set_layouts, set_layout_count);
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount         = set_layout_count;
+	layout_info.pSetLayouts            = set_layouts.data();
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges    = &push_constants;
+	if (graphics.device.createPipelineLayout(&layout_info, nullptr, &layout_owner.pipeline_layout) !=
+	    vk::Result::eSuccess) {
+		return nullptr;
+	}
+	// CompileSPV: the same module the game's own path gives the driver (function-array shrink included).
+	vk::ShaderModule module = CompileSPV(record.spirv, graphics.device);
+	vk::PipelineShaderStageCreateInfo                     stage {};
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup {};
+	stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	stage.module = module;
+	stage.pName  = "main";
+	if (record.required_subgroup_size != 0) {
+		subgroup.requiredSubgroupSize = record.required_subgroup_size;
+		stage.pNext                   = &subgroup;
+	}
+	vk::ComputePipelineCreateInfo info {};
+	info.stage             = stage;
+	info.layout            = layout_owner.pipeline_layout;
+	info.basePipelineIndex = -1;
+	vk::Pipeline pipeline  = nullptr;
+	const auto   result    = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline);
+	graphics.device.destroyShaderModule(module, nullptr);
+	// The layouts stay alive: the pipeline is used with gameplay's identically defined ones.
+	return result == vk::Result::eSuccess ? pipeline : nullptr;
+}
+
 } // namespace Libs::Graphics
+
