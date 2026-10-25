@@ -3340,6 +3340,14 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 		FrameGen::OnSsrDraw(record.stages[0].program->shader_hash, record.stages[0].flattened);
 	if (FrameGen::ContactShadowsWanted() && record.stage_count > 0 && record.stages[0].program != nullptr)
 		FrameGen::OnShadowDraw(record.stages[0].program->shader_hash, record.stages[0].flattened, false);
+	// (KYTY_RT_SUN: a sun cascade's draw, a depth-only draw into a layer of a square layered depth image)
+	if (FrameGen::RtSunWanted() && record.stage_count > 0 && record.stages[0].program != nullptr && draw_state.targets.size() == 1) {
+		const auto& t = draw_state.targets[0];
+		const auto& r = t.requested;
+		if (r.IsDepth() && r.resources.layers >= 4 && r.extent.width == r.extent.height && r.extent.width >= 512)
+			FrameGen::OnSunCascadeDraw(record.stages[0].program->shader_hash, record.stages[0].flattened, t.range.base_layer,
+			                           r.data.address);
+	}
 	return true;
 }
 

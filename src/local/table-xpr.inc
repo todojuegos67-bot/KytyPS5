@@ -2179,6 +2179,16 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (FrameGen::ContactShadowsWanted() && Spec::Current() == nullptr)
 		FrameGen::OnShadowDraw(pair.programs[0]->shader_hash,
 		                       std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()), false);
+	// (KYTY_RT_SUN: a sun cascade's draw, a depth-only draw into a layer of a square layered depth image: its layer and
+	// light matrix)
+	if (FrameGen::RtSunWanted() && Spec::Current() == nullptr && draw_state.targets.size() == 1) {
+		const auto& t = draw_state.targets[0];
+		const auto& r = t.requested;
+		if (r.IsDepth() && r.resources.layers >= 4 && r.extent.width == r.extent.height && r.extent.width >= 512)
+			FrameGen::OnSunCascadeDraw(pair.programs[0]->shader_hash,
+			                           std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()),
+			                           t.range.base_layer, r.data.address);
+	}
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
 	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;
