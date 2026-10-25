@@ -1,5 +1,6 @@
 // Sony's PS5 Pro super resolution as Demon's Souls dispatches it (graphics/guest_gpu/superResolution.h), done here:
 // DLSS (KYTY_UPSCALER=dlss, frame-gen.h) where Streamline offers it, else a linear stretch of the input.
+#include "local/hwrt-scene.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/superResolution.h"
@@ -357,6 +358,8 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		                    bindings[1].desc.info.data.address);
 	buffer.EndRendering();
 	const auto vk_buffer = buffer.Handle();
+	// (KYTY_HWRT: the frame's scene acceleration structures - the PS5 Pro path has no TAA dispatch)
+	if (HwScene::Active()) HwScene::EndFrame(m_context.GetGraphics(), vk_buffer, "the PS5 Pro super-resolution packet");
 	auto&      color     = cache.GetImage(bindings[0].image_id);
 	auto&      motion    = cache.GetImage(bindings[1].image_id);
 	auto&      depth     = cache.GetImage(bindings[2].image_id);
@@ -597,6 +600,9 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		               range(bindings[3]), vk_buffer);
 		ApplyExposure(record, VULKAN_HPP_DEFAULT_DISPATCHER);
 	}
+	// (KYTY_HWRT_DEBUG: the ray query view over the upscaled output)
+	if (HwScene::Active())
+		HwScene::DebugView(m_context.GetGraphics(), vk_buffer, bindings[3].image_view, output.backing.format, extent(bindings[3], output));
 	ResetBindings();
 }
 

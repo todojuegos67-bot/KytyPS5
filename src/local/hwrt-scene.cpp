@@ -163,6 +163,7 @@ struct State {
 	uint64_t draws_seen = 0, draws_captured = 0, draws_reused = 0, frames = 0, frames_no_camera = 0;
 	uint64_t skips[static_cast<uint32_t>(Skip::Count)] {};
 	uint64_t scene_states = 0, scene_states_capturable = 0, new_meshes = 0, rebuilt = 0, refits = 0, compares = 0, became_dynamic = 0;
+	uint64_t build_calls = 0, debug_calls = 0, notes = 0;
 	uint64_t evicted = 0, captured_vertices = 0, tlas_instances_sum = 0, patched = 0, patch_failed = 0;
 	double   build_ms = 0.0, cpu_note_ms = 0.0, cpu_after_ms = 0.0, gpu_ms_max = 0.0;
 	uint32_t timed = 0;
@@ -762,11 +763,15 @@ void MaybeLog() {
 	            static_cast<double>(g.tlas_instances_sum) / frames, static_cast<double>(g.captured_vertices) / frames,
 	            g.timed > 0 ? g.build_ms / g.timed : 0.0, g.gpu_ms_max, g.timed, (g.cpu_note_ms + g.cpu_after_ms) / frames,
 	            g.cpu_note_ms / frames, g.cpu_after_ms / frames);
+	std::printf("HWRT: 10 s: scene builds %llu (one a frame: at the TAA dispatch or the PS5 Pro upscale packet), debug views %llu%s\n",
+	            static_cast<unsigned long long>(g.build_calls), static_cast<unsigned long long>(g.debug_calls),
+	            g.build_calls == 0 ? " - NO BUILD HOOK RAN: no TAA dispatch / super-resolution packet reached the hook" : "");
 	std::fflush(stdout);
 	g.draws_seen = g.draws_captured = g.draws_reused = g.frames = g.frames_no_camera = 0;
 	std::fill(std::begin(g.skips), std::end(g.skips), 0);
 	g.scene_states = g.scene_states_capturable = g.new_meshes = g.rebuilt = g.refits = g.compares = g.became_dynamic = 0;
 	g.evicted = g.captured_vertices = g.tlas_instances_sum = 0;
+	g.build_calls = g.debug_calls = 0;
 	g.build_ms = g.cpu_note_ms = g.cpu_after_ms = g.gpu_ms_max = 0.0;
 	g.timed    = 0;
 	g.last_log = now;
@@ -919,6 +924,7 @@ uint64_t VariantId(uint64_t program_id) {
 
 void NoteSkip(Skip why, uint32_t draws) {
 	if (!Active()) return;
+	if ((++g.notes & 255u) == 0) MaybeLog(); // (the stats print even when no frame is built)
 	g.skips[static_cast<uint32_t>(why)] += draws;
 	g.draws_seen += draws;
 }
@@ -926,6 +932,7 @@ void NoteSkip(Skip why, uint32_t draws) {
 void NoteSceneState(bool capturable) {
 	if (!Active()) return;
 	++g.scene_states;
+	MaybeLog();
 	if (capturable) ++g.scene_states_capturable;
 }
 
@@ -943,6 +950,7 @@ uint32_t Reserve(uint32_t count) {
 void Note(uint32_t record, const Draw& d) {
 	if (!g.ready || g_graphics == nullptr) return;
 	const auto start = std::chrono::steady_clock::now();
+	if ((++g.notes & 255u) == 0) MaybeLog();
 	++g.draws_seen;
 	const uint32_t slot_base = g.slot * MaxRecords;
 	if (record >= MaxRecords * Slots || record < slot_base + NullRecords) {
@@ -1034,26 +1042,100 @@ void NoteCamera(uint64_t vs_hash, std::span<const uint32_t> srt) {
 	g.have_camera = std::all_of(g.view_proj.begin(), g.view_proj.end(), [](float f) { return std::isfinite(f); });
 }
 
-void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, std::span<const TextureBinding> images) {
+namespace {
+
+using Dispatch = vk::detail::DispatchLoaderDynamic;
+
+// Commands recorded in order with the renderer's own (KYTY_VULKAN_RECORDING: a packet the recording worker replays;
+// without it, now). The payload owns everything the commands point at.
+struct Work {
+	vk::CommandBuffer                                      command;
+	std::function<void(vk::CommandBuffer, const Dispatch&)> record;
+};
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+void ReplayWork(std::span<const LocalVulkanRecording::Segment> segments, const Dispatch& dispatch) {
+	const Work* work = nullptr;
+	std::memcpy(static_cast<void*>(&work), segments[0].data, sizeof(work));
+	work->record(work->command, dispatch);
+	LocalVulkanRecording::InvalidateReplayState(); // (our pipelines and descriptors)
+}
+#endif
+void Submit(vk::CommandBuffer command, std::function<void(vk::CommandBuffer, const Dispatch&)> record) {
+	auto work     = std::make_shared<Work>();
+	work->command = command;
+	work->record  = std::move(record);
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+	const Work*                          pointer = work.get();
+	const LocalVulkanRecording::Segment segment {&pointer, sizeof(pointer)};
+	if (!LocalVulkanRecording::EnqueuePacket(ReplayWork, {&segment, 1}, work)) LocalVulkanRecording::ReplayInline(ReplayWork, {&segment, 1});
+#else
+	work->record(work->command, VULKAN_HPP_DEFAULT_DISPATCHER);
+#endif
+}
+
+void BarrierD(vk::CommandBuffer command, const Dispatch& d, vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src,
+              vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst) {
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = src_stage;
+	barrier.srcAccessMask = src;
+	barrier.dstStageMask  = dst_stage;
+	barrier.dstAccessMask = dst;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(&dependency, d);
+}
+
+struct GatherPush {
+	float    inv[16];
+	float    cam[4];
+	uint32_t src_base, count, mode, result;
+	uint64_t src, dst, results;
+};
+static_assert(sizeof(GatherPush) <= 128);
+struct DebugPush {
+	float    inv[16];
+	float    cam[4];
+	uint32_t width, height, mode, pad;
+};
+
+// What one frame's build records (owned by its packet).
+struct FramePayload {
+	std::vector<GatherPush>                                        gathers;
+	std::vector<vk::AccelerationStructureGeometryKHR>              geometries;
+	std::vector<vk::AccelerationStructureBuildGeometryInfoKHR>     infos;
+	std::vector<vk::AccelerationStructureBuildRangeInfoKHR>        ranges;
+	std::vector<const vk::AccelerationStructureBuildRangeInfoKHR*> range_ptrs;
+	vk::AccelerationStructureGeometryKHR                           tlas_geometry {};
+	vk::AccelerationStructureBuildGeometryInfoKHR                  tlas_info {};
+	vk::AccelerationStructureBuildRangeInfoKHR                     tlas_range {};
+	bool                                                           tlas = false;
+	uint32_t                                                       slot = 0;
+};
+
+std::array<float, 16> g_inv {};
+std::array<float, 4>  g_cam {};
+bool                  g_frame_camera = false;
+
+} // namespace
+
+void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* where) {
 	if (!Active()) return;
 	std::lock_guard lock(g.mutex);
 	g_graphics = &graphics;
 	if (!Init(graphics)) return;
 	const auto start = std::chrono::steady_clock::now();
-#if defined(KYTY_LOCAL_VULKAN_RECORDING)
-	if (kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0) {
-		static bool said = false;
-		if (!said) said = true, Say("KYTY_VULKAN_RECORDING is on: hardware ray tracing needs it off (nothing built)");
-		g.jobs.clear();
-		g.disabled = true;
-		return;
+	++g.build_calls;
+	static bool said_where = false;
+	if (!said_where) {
+		said_where = true;
+		std::printf("HWRT: the scene is built at %s\n", where);
+		std::fflush(stdout);
 	}
-	LocalVulkanRecording::Drain();
-#endif
 	ReadTiming(graphics);
 	Collect(graphics, false);
 	const uint32_t slot = g.slot;
-	// The compare results of the frame that used this slot last (Slots frames ago: done on the GPU).
+	// The compare results of the frame that used the next slot last (Slots - 1 frames ago).
 	for (const auto& [key, index]: g.check_keys[(slot + 1) % Slots]) {
 		const auto found = g.entries.find(key);
 		if (found == g.entries.end()) continue;
@@ -1066,43 +1148,25 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 	}
 	g.check_keys[(slot + 1) % Slots].clear();
 	++g.frames;
-	// The inverse view-projection (clip -> world) and the camera's position.
 	std::array<double, 16> vp {}, inv {};
 	for (int i = 0; i < 16; ++i) vp[i] = g.view_proj[i];
 	const bool camera = g.have_camera && Invert4(vp, inv);
-	std::array<float, 16> inv_f {};
-	for (int i = 0; i < 16; ++i) inv_f[i] = static_cast<float>(inv[i]);
-	std::array<float, 4> cam {};
-	if (camera) {
-		// The centre of projection: x = y = w = 0 in clip space (any z): inv * (0, 0, 1, 0).
-		const double cw = inv[14];
-		if (std::abs(cw) > 1e-20)
-			for (int i = 0; i < 3; ++i) cam[i] = static_cast<float>(inv[i * 4 + 2] / cw);
-	}
+	for (int i = 0; i < 16; ++i) g_inv[i] = static_cast<float>(inv[i]);
+	g_cam = {};
+	if (camera && std::abs(inv[14]) > 1e-20)
+		for (int i = 0; i < 3; ++i) g_cam[i] = static_cast<float>(inv[i * 4 + 2] / inv[14]);
+	g_frame_camera = camera;
 	if (!camera) ++g.frames_no_camera;
 
+	auto             payload = std::make_shared<FramePayload>();
+	payload->slot            = slot;
 	std::vector<Job> jobs;
 	jobs.swap(g.jobs);
-	const bool any_work = camera && !jobs.empty();
-	if (g.pool != nullptr) {
-		command.resetQueryPool(g.pool, slot * 2, 2);
-		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g.pool, slot * 2);
-	}
-	if (any_work) {
-		// The draws' vertex-shader stores -> the gather's reads.
-		Barrier(command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite,
-		        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	if (camera && !jobs.empty()) {
 		auto* results = static_cast<uint32_t*>(g.results[slot].mapped);
-		command.bindPipeline(vk::PipelineBindPoint::eCompute, g.gather);
-		struct Push {
-			float    inv[16];
-			float    cam[4];
-			uint32_t src_base, count, mode, result;
-			uint64_t src, dst, results;
-		} push {};
-		static_assert(sizeof(Push) <= 128);
-		std::memcpy(push.inv, inv_f.data(), sizeof(push.inv));
-		std::memcpy(push.cam, cam.data(), sizeof(push.cam));
+		GatherPush push {};
+		std::memcpy(push.inv, g_inv.data(), sizeof(push.inv));
+		std::memcpy(push.cam, g_cam.data(), sizeof(push.cam));
 		push.src     = g.capture.address;
 		push.results = g.results[slot].address;
 		for (const auto& job: jobs) {
@@ -1118,24 +1182,12 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 				g.check_keys[slot].emplace_back(e.key, job.result);
 				++g.compares;
 			}
-			command.pushConstants(g.gather_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-			command.dispatch((push.count + 255) / 256, 1, 1);
+			payload->gathers.push_back(push);
 			g.captured_vertices += push.count;
 		}
-		Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
-		        vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR | vk::PipelineStageFlagBits2::eVertexShader |
-		            vk::PipelineStageFlagBits2::eHost,
-		        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eHostRead);
-		// BLAS builds (new meshes, a dynamic one's first build) and refits (dynamic ones).
-		std::vector<vk::AccelerationStructureGeometryKHR>             geometries;
-		std::vector<vk::AccelerationStructureBuildGeometryInfoKHR>    infos;
-		std::vector<vk::AccelerationStructureBuildRangeInfoKHR>       ranges;
-		std::vector<const vk::AccelerationStructureBuildRangeInfoKHR*> range_ptrs;
-		std::vector<vk::DeviceSize>                                   scratch_sizes;
-		geometries.reserve(jobs.size());
-		infos.reserve(jobs.size());
-		ranges.reserve(jobs.size());
-		vk::DeviceSize scratch_total = 0;
+		payload->geometries.reserve(jobs.size());
+		std::vector<vk::DeviceSize> scratch_sizes;
+		vk::DeviceSize              scratch_total = 0;
 		for (const auto& job: jobs) {
 			auto& e = *job.entry;
 			if (!e.created || job.mode == Mode::Compare || !(job.build || job.refit)) continue;
@@ -1151,7 +1203,7 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 			geometry.geometryType       = vk::GeometryTypeKHR::eTriangles;
 			geometry.geometry.triangles = tri;
 			geometry.flags              = vk::GeometryFlagBitsKHR::eOpaque;
-			geometries.push_back(geometry);
+			payload->geometries.push_back(geometry);
 			vk::AccelerationStructureBuildGeometryInfoKHR info {};
 			info.type  = vk::AccelerationStructureTypeKHR::eBottomLevel;
 			info.flags = e.dynamic ? vk::BuildAccelerationStructureFlagsKHR(vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild |
@@ -1159,12 +1211,11 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 			                       : vk::BuildAccelerationStructureFlagsKHR(vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace);
 			info.mode          = update ? vk::BuildAccelerationStructureModeKHR::eUpdate : vk::BuildAccelerationStructureModeKHR::eBuild;
 			info.geometryCount = 1;
-			info.pGeometries   = &geometries.back();
+			info.pGeometries   = &payload->geometries.back();
 			const uint32_t prims = e.tris;
 			vk::AccelerationStructureBuildSizesInfoKHR sizes {};
 			graphics.device.getAccelerationStructureBuildSizesKHR(vk::AccelerationStructureBuildTypeKHR::eDevice, &info, &prims, &sizes);
 			if (!update) {
-				// (A new one, or a static mesh found moving: built again, updatable.)
 				if (e.blas != nullptr) {
 					Pending p;
 					p.as    = e.blas;
@@ -1176,7 +1227,7 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 					++g.rebuilt;
 				}
 				if (!MakeAs(graphics, e.as_buf, e.blas, sizes.accelerationStructureSize, vk::AccelerationStructureTypeKHR::eBottomLevel)) {
-					geometries.pop_back();
+					payload->geometries.pop_back();
 					e.built = false;
 					continue;
 				}
@@ -1194,15 +1245,14 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 			                  g.scratch_align * g.scratch_align;
 			scratch_sizes.push_back(need);
 			scratch_total += need;
-			infos.push_back(info);
+			payload->infos.push_back(info);
 			vk::AccelerationStructureBuildRangeInfoKHR range {};
 			range.primitiveCount = prims;
-			ranges.push_back(range);
+			payload->ranges.push_back(range);
 			e.built = true;
 			++e.built_count;
 		}
-		if (!infos.empty()) {
-			// One scratch area per build (all built in one call).
+		if (!payload->infos.empty()) {
 			if (g.scratch.size < scratch_total + g.scratch_align) {
 				if (g.scratch.buffer != VK_NULL_HANDLE) {
 					Pending p;
@@ -1211,17 +1261,20 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 					g.graveyard.push_back(p);
 					g.scratch = {};
 				}
-				const vk::DeviceSize size = (scratch_total + g.scratch_align) * 3 / 2;
-				if (!MakeBuffer(graphics, g.scratch, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false)) infos.clear();
+				if (!MakeBuffer(graphics, g.scratch, (scratch_total + g.scratch_align) * 3 / 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false)) {
+					for (auto& info: payload->infos) {
+						(void)info;
+					}
+					payload->infos.clear();
+					payload->ranges.clear();
+				}
 			}
 			vk::DeviceAddress at = (g.scratch.address + g.scratch_align - 1) / g.scratch_align * g.scratch_align;
-			for (size_t i = 0; i < infos.size(); ++i) {
-				infos[i].scratchData.deviceAddress = at;
+			for (size_t i = 0; i < payload->infos.size(); ++i) {
+				payload->infos[i].scratchData.deviceAddress = at;
 				at += scratch_sizes[i];
-				range_ptrs.push_back(&ranges[i]);
 			}
-			if (!infos.empty())
-				command.buildAccelerationStructuresKHR(static_cast<uint32_t>(infos.size()), infos.data(), range_ptrs.data());
+			for (size_t i = 0; i < payload->ranges.size(); ++i) payload->range_ptrs.push_back(&payload->ranges[i]);
 		}
 	}
 	// The TLAS: every built mesh seen in the last KeepFrames() frames; meshes unseen for 4x that are freed.
@@ -1254,104 +1307,85 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 			}
 			++it;
 		}
-		vmaFlushAllocation(graphics.allocator, g.instances[slot].memory, 0, VK_WHOLE_SIZE);
-		vmaFlushAllocation(graphics.allocator, g.materials[slot].memory, 0, VK_WHOLE_SIZE);
 	}
 	g.tlas_instances_sum += instance_count;
-	g.tlas_built = false;
 	if (instance_count > 0) {
 		vk::AccelerationStructureGeometryInstancesDataKHR instances_data {};
-		instances_data.arrayOfPointers    = VK_FALSE;
-		instances_data.data.deviceAddress = g.instances[slot].address;
-		vk::AccelerationStructureGeometryKHR tlas_geometry {};
-		tlas_geometry.geometryType       = vk::GeometryTypeKHR::eInstances;
-		tlas_geometry.geometry.instances = instances_data;
-		vk::AccelerationStructureBuildGeometryInfoKHR tlas_info {};
+		instances_data.arrayOfPointers         = VK_FALSE;
+		instances_data.data.deviceAddress      = g.instances[slot].address;
+		payload->tlas_geometry.geometryType       = vk::GeometryTypeKHR::eInstances;
+		payload->tlas_geometry.geometry.instances = instances_data;
+		auto& tlas_info         = payload->tlas_info;
 		tlas_info.type          = vk::AccelerationStructureTypeKHR::eTopLevel;
 		tlas_info.flags         = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild;
 		tlas_info.mode          = vk::BuildAccelerationStructureModeKHR::eBuild;
 		tlas_info.geometryCount = 1;
-		tlas_info.pGeometries   = &tlas_geometry;
+		tlas_info.pGeometries   = &payload->tlas_geometry;
 		const uint32_t max_instances = MaxInstances;
 		vk::AccelerationStructureBuildSizesInfoKHR tlas_sizes {};
 		graphics.device.getAccelerationStructureBuildSizesKHR(vk::AccelerationStructureBuildTypeKHR::eDevice, &tlas_info, &max_instances,
 		                                                      &tlas_sizes);
 		bool ok = g.tlas != nullptr || MakeAs(graphics, g.tlas_buf, g.tlas, tlas_sizes.accelerationStructureSize,
 		                                      vk::AccelerationStructureTypeKHR::eTopLevel);
-		// The TLAS scratch, after the BLAS scratch areas of this frame (its own buffer, made once).
 		static Buffer tlas_scratch;
 		if (ok && tlas_scratch.buffer == VK_NULL_HANDLE)
 			ok = MakeBuffer(graphics, tlas_scratch, tlas_sizes.buildScratchSize + g.scratch_align, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
 		if (ok) {
-			// The BLAS builds -> the TLAS build's reads; the last frame's ray queries before it is written again.
-			Barrier(command, vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR | vk::PipelineStageFlagBits2::eComputeShader,
-			        vk::AccessFlagBits2::eAccelerationStructureWriteKHR | vk::AccessFlagBits2::eAccelerationStructureReadKHR,
-			        vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR,
-			        vk::AccessFlagBits2::eAccelerationStructureReadKHR | vk::AccessFlagBits2::eAccelerationStructureWriteKHR);
 			tlas_info.dstAccelerationStructure  = g.tlas;
 			tlas_info.scratchData.deviceAddress = (tlas_scratch.address + g.scratch_align - 1) / g.scratch_align * g.scratch_align;
-			vk::AccelerationStructureBuildRangeInfoKHR        tlas_range {};
-			tlas_range.primitiveCount                                   = instance_count;
-			const vk::AccelerationStructureBuildRangeInfoKHR* tlas_ranges = &tlas_range;
-			command.buildAccelerationStructuresKHR(1, &tlas_info, &tlas_ranges);
-			Barrier(command, vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR, vk::AccessFlagBits2::eAccelerationStructureWriteKHR,
-			        vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR,
-			        vk::AccessFlagBits2::eAccelerationStructureReadKHR);
-			g.tlas_built = true;
+			payload->tlas_range.primitiveCount  = instance_count;
+			payload->tlas                       = true;
 		}
 	}
-	if (g.pool != nullptr) {
-		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g.pool, slot * 2 + 1);
-		g.pending_query[slot] = true;
-	}
-	// KYTY_HWRT_DEBUG: the ray query view over the TAA's output.
-	if (DebugMode() != 0 && g.debug != nullptr && g.tlas_built && camera && images.size() >= 7 && images[6].image_id &&
-	    images[6].image_view != nullptr) {
-		auto& output = cache.GetImage(images[6].image_id);
-		if (output.backing.format == vk::Format::eR16G16B16A16Sfloat) {
-			Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead,
-			        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead);
-			vk::WriteDescriptorSetAccelerationStructureKHR as_write {};
-			as_write.accelerationStructureCount = 1;
-			as_write.pAccelerationStructures    = &g.tlas;
-			vk::DescriptorImageInfo image_info {};
-			image_info.imageView   = images[6].image_view;
-			image_info.imageLayout = vk::ImageLayout::eGeneral;
-			std::array<vk::WriteDescriptorSet, 2> writes {};
-			writes[0].pNext           = &as_write;
-			writes[0].dstBinding      = 0;
-			writes[0].descriptorCount = 1;
-			writes[0].descriptorType  = vk::DescriptorType::eAccelerationStructureKHR;
-			writes[1].dstBinding      = 1;
-			writes[1].descriptorCount = 1;
-			writes[1].descriptorType  = vk::DescriptorType::eStorageImage;
-			writes[1].pImageInfo      = &image_info;
-			struct DebugPush {
-				float    inv[16];
-				float    cam[4];
-				uint32_t width, height, mode, pad;
-			} push {};
-			std::memcpy(push.inv, inv_f.data(), sizeof(push.inv));
-			std::memcpy(push.cam, cam.data(), sizeof(push.cam));
-			push.width  = output.backing.extent.width;
-			push.height = output.backing.extent.height;
-			push.mode   = DebugMode();
-			command.bindPipeline(vk::PipelineBindPoint::eCompute, g.debug);
-			command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.debug_layout, 0, static_cast<uint32_t>(writes.size()),
-			                             writes.data());
-			command.pushConstants(g.debug_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-			command.dispatch((push.width + 7) / 8, (push.height + 7) / 8, 1);
-			Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
-			        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+	g.tlas_built = payload->tlas;
+	// The GPU side, in order with the frame's commands.
+	const bool       timed  = g.pool != nullptr;
+	const auto       pool   = g.pool;
+	const auto       gather = g.gather;
+	const auto       layout = g.gather_layout;
+	if (timed) g.pending_query[slot] = true;
+	Submit(command, [payload, timed, pool, gather, layout](vk::CommandBuffer cmd, const Dispatch& d) {
+		const uint32_t s = payload->slot;
+		if (timed) {
+			cmd.resetQueryPool(pool, s * 2, 2, d);
+			cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, s * 2, d);
 		}
-	}
+		if (!payload->gathers.empty()) {
+			// The draws' vertex-shader stores -> the gather's reads.
+			BarrierD(cmd, d, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite,
+			         vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+			cmd.bindPipeline(vk::PipelineBindPoint::eCompute, gather, d);
+			for (const auto& push: payload->gathers) {
+				cmd.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push, d);
+				cmd.dispatch((push.count + 255) / 256, 1, 1, d);
+			}
+			BarrierD(cmd, d, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+			         vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR | vk::PipelineStageFlagBits2::eVertexShader |
+			             vk::PipelineStageFlagBits2::eHost,
+			         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eHostRead);
+		}
+		if (!payload->infos.empty())
+			cmd.buildAccelerationStructuresKHR(static_cast<uint32_t>(payload->infos.size()), payload->infos.data(),
+			                                   payload->range_ptrs.data(), d);
+		if (payload->tlas) {
+			BarrierD(cmd, d, vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR | vk::PipelineStageFlagBits2::eComputeShader,
+			         vk::AccessFlagBits2::eAccelerationStructureWriteKHR | vk::AccessFlagBits2::eAccelerationStructureReadKHR,
+			         vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR,
+			         vk::AccessFlagBits2::eAccelerationStructureReadKHR | vk::AccessFlagBits2::eAccelerationStructureWriteKHR);
+			const vk::AccelerationStructureBuildRangeInfoKHR* tlas_ranges = &payload->tlas_range;
+			cmd.buildAccelerationStructuresKHR(1, &payload->tlas_info, &tlas_ranges, d);
+			BarrierD(cmd, d, vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR, vk::AccessFlagBits2::eAccelerationStructureWriteKHR,
+			         vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR,
+			         vk::AccessFlagBits2::eAccelerationStructureReadKHR);
+		}
+		if (timed) cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, s * 2 + 1, d);
+	});
 	static bool said = false;
 	if (!said && g.tlas_built) {
 		said = true;
 		std::printf("HWRT: first TLAS: %u instances (%zu meshes known)\n", instance_count, g.entries.size());
 		std::fflush(stdout);
 	}
-	// The next frame.
 	++g.frame;
 	g.slot        = (g.slot + 1) % Slots;
 	g.next_record = NullRecords;
@@ -1359,6 +1393,67 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 	g.have_camera = false;
 	g.cpu_after_ms += Ms(start);
 	MaybeLog();
+}
+
+void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageView view, vk::Format format, vk::Extent2D extent) {
+	if (!Active() || DebugMode() == 0) return;
+	std::lock_guard lock(g.mutex);
+	if (!g.ready || g.debug == nullptr || !g.tlas_built || !g_frame_camera || view == nullptr) return;
+	if (format != vk::Format::eR16G16B16A16Sfloat) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("HWRT: debug view target format %d is not RGBA16F: no debug view\n", static_cast<int>(format));
+			std::fflush(stdout);
+		}
+		return;
+	}
+	++g.debug_calls;
+	DebugPush push {};
+	std::memcpy(push.inv, g_inv.data(), sizeof(push.inv));
+	std::memcpy(push.cam, g_cam.data(), sizeof(push.cam));
+	push.width  = extent.width;
+	push.height = extent.height;
+	push.mode   = DebugMode();
+	const vk::Pipeline       pipeline = g.debug;
+	const vk::PipelineLayout layout   = g.debug_layout;
+	const auto tlas     = std::make_shared<vk::AccelerationStructureKHR>(g.tlas);
+	(void)graphics;
+	Submit(command, [push, pipeline, layout, tlas, view](vk::CommandBuffer cmd, const Dispatch& d) {
+		BarrierD(cmd, d, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead,
+		         vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead);
+		vk::WriteDescriptorSetAccelerationStructureKHR as_write {};
+		as_write.accelerationStructureCount = 1;
+		as_write.pAccelerationStructures    = tlas.get();
+		vk::DescriptorImageInfo image_info {};
+		image_info.imageView   = view;
+		image_info.imageLayout = vk::ImageLayout::eGeneral;
+		std::array<vk::WriteDescriptorSet, 2> writes {};
+		writes[0].pNext           = &as_write;
+		writes[0].dstBinding      = 0;
+		writes[0].descriptorCount = 1;
+		writes[0].descriptorType  = vk::DescriptorType::eAccelerationStructureKHR;
+		writes[1].dstBinding      = 1;
+		writes[1].descriptorCount = 1;
+		writes[1].descriptorType  = vk::DescriptorType::eStorageImage;
+		writes[1].pImageInfo      = &image_info;
+		cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline, d);
+		cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, static_cast<uint32_t>(writes.size()), writes.data(), d);
+		cmd.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push, d);
+		cmd.dispatch((push.width + 7) / 8, (push.height + 7) / 8, 1, d);
+		BarrierD(cmd, d, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+		         vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+	});
+}
+
+void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, std::span<const TextureBinding> images) {
+	if (!Active()) return;
+	EndFrame(graphics, command, "the TAA dispatch");
+	if (DebugMode() != 0 && images.size() >= 7 && images[6].image_id && images[6].image_view != nullptr) {
+		auto& output = cache.GetImage(images[6].image_id);
+		DebugView(graphics, command, images[6].image_view, output.backing.format,
+		          vk::Extent2D {output.backing.extent.width, output.backing.extent.height});
+	}
 }
 
 } // namespace Libs::Graphics::HwScene
