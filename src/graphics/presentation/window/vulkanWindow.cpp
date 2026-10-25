@@ -20,6 +20,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
+#include "graphics/presentation/window/fsr3FrameGen.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kernel/memory.h"
@@ -405,6 +406,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	}
 }
 
+static Fsr3::QueuePlan g_fsr3_plan;
+
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                 const std::vector<const char*>& device_extensions) {
 	const auto physical_device = graphics.physical_device;
@@ -416,13 +419,25 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// writers have finished without waiting behind the graphics queue (BufferCache,
 	// KYTY_COPY_QUEUE_READBACK). The same family needs no ownership transfers.
 	const auto                families            = physical_device.getQueueFamilyProperties();
-	const float               queue_priorities[2] = {1.0f, 1.0f};
-	vk::DeviceQueueCreateInfo queue_create_info {};
+	const float               queue_priorities[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+	vk::DeviceQueueCreateInfo queue_create_infos[2] {};
+	auto&                     queue_create_info = queue_create_infos[0];
+	uint32_t                  queue_create_count = 1;
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount =
 	    queue_family < families.size() && families[queue_family].queueCount >= 2 ? 2u : 1u;
 	queue_create_info.pQueuePriorities = queue_priorities;
 	graphics.queue_count               = queue_create_info.queueCount;
+	// KYTY_FSR3_FG (fsr3FrameGen.h): one more graphics queue for its presents, two compute queues.
+	g_fsr3_plan = {};
+	if (Fsr3::Requested() &&
+	    Fsr3::PlanQueues(physical_device, queue_family, queue_create_info.queueCount, g_fsr3_plan)) {
+		queue_create_info.queueCount              = g_fsr3_plan.graphics_index + 1;
+		queue_create_infos[1].queueFamilyIndex    = g_fsr3_plan.compute_family;
+		queue_create_infos[1].queueCount          = g_fsr3_plan.compute_count;
+		queue_create_infos[1].pQueuePriorities    = queue_priorities;
+		queue_create_count                        = 2;
+	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -756,8 +771,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos;
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1195,6 +1210,16 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
+		// KYTY_FSR3_FG: the FidelityFX backend calls vkGetBufferMemoryRequirements2KHR by the extension's
+		// name (null without the extension even though the function is core).
+		if (Fsr3::Requested()) {
+			for (const char* name: {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
+			                        VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME}) {
+				if (HasExtension(available_extensions, name) && !HasExtension(device_extensions, name)) {
+					device_extensions.push_back(name);
+				}
+			}
+		}
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
@@ -1207,6 +1232,7 @@ void WindowContext::CreateVulkan() {
 	if (graphic_ctx.queue_count >= 2) {
 		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
 	}
+	Fsr3::OnDevice(graphic_ctx, g_fsr3_plan);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

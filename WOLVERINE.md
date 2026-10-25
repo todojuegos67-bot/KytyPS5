@@ -108,3 +108,23 @@ LOD, 64-bit atomics). Kept or adjusted for Wolverine:
 - Moon tiled across the night sky.
 - Ray-traced effects are skipped.
 - Pixel shader 0x7dce3261e625949c can hang the GPU in the night scene (from PR #937).
+
+## wolverine-turbo-1025 (test build, untested on hardware)
+
+`wolverine-perf` (151be85, the engine last run in the unified launcher) plus:
+
+- **FSR 3 frame generation for any game** (`KYTY_FSR3_FG=1`, off unless set;
+  `src/graphics/presentation/window/fsr3FrameGen.cpp`), ported from the Demon's Souls fork's
+  `src/local/fsr3-fg.cpp`. That version feeds the game's TAA depth and motion vectors (found by
+  shader hash); Wolverine has no such inputs here, so this one gives FSR 3 a constant far depth and
+  zero motion vectors and relies on its optical flow. Generation only between new guest flips.
+  `KYTY_FSR3_MFG=3|4` with `KYTY_FSR3_DLL=<patched DLL>` (CI input `ffx_mfg=true`, packaged in
+  `emulator\fsr3-mfg\`) for x3/x4. `[fsr3]` lines every 5 s give real and shown fps.
+- `KYTY_ASYNC_WRITE_READBACK` default 1 and `KYTY_WRITE_WINDOW_KB` default 16 (same-process A/B of
+  10-15 in docs/EXPERIMENTS.md: -1.5 ms and -1.7 ms per frame).
+- `packaging/wolverine-turbo/Play Wolverine TURBO.bat` (Spanish), CI builds only the emulator.
+
+Not ported: DLSS-G/Streamline and DLSS/XeSS/FSR super resolution (all need the game's depth, motion
+vectors and camera, found per title), the Demon's Souls recorder (`KYTY_VULKAN_RECORDING`, ported
+in c13d6a0 and reverted in 470be8c), table mode and the static shader precompile (Demon's Souls
+tree only, not mergeable here: the trees diverged on 2026-09-10 by ~1,100 commits each side).

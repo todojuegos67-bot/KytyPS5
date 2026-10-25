@@ -378,6 +378,8 @@ set(inc_headers
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/renderdoc
 	${KYTY_THIRD_PARTY_DIR}/stb
+	# AMD FidelityFX API headers (MIT): FSR 3 frame generation, src/graphics/presentation/window/fsr3FrameGen.cpp.
+	${KYTY_THIRD_PARTY_DIR}/ffx_api/include
 )
 
 if (KYTY_CLANG_CL)

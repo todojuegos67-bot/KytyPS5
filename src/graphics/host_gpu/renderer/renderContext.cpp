@@ -137,13 +137,14 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		g_fault_stats.Add(access == PageFaultAccess::Write, fault_vaddr);
 	}
 	if (access == PageFaultAccess::Write) {
-		// KYTY_WRITE_WINDOW_KB=N (live, 0 = off): a CPU write fault invalidates the whole aligned
+		// KYTY_WRITE_WINDOW_KB=N (live, 0 = off, default 16): a CPU write fault invalidates the whole aligned
 		// N KiB window around it, as Demon's Souls' write window does (18e290f7), so the next
 		// writes of a sequential fill do not fault page by page. Only a window that is mapped,
 		// holds no GPU-written data and no image takes it; otherwise the faulting byte alone.
 		// The invalidation is the same call as for one byte: pages are only marked CPU-written
 		// earlier, so they upload again before the GPU reads them.
-		static auto&   window_kib = Common::LiveSwitches::Get("KYTY_WRITE_WINDOW_KB", 0);
+		// Default 16 on wolverine-turbo: same-process A/B 10-15 (docs/EXPERIMENTS.md), -1.7 ms per frame.
+		static auto&   window_kib = Common::LiveSwitches::Get("KYTY_WRITE_WINDOW_KB", 16);
 		const uint64_t window     = static_cast<uint64_t>(window_kib.load(std::memory_order_relaxed)) * 1024u;
 		if (window >= 8192u && (window & (window - 1)) == 0) {
 			const uint64_t begin = fault_vaddr & ~(window - 1);

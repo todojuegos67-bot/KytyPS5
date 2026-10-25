@@ -1,0 +1,36 @@
+MARVEL'S WOLVERINE - BUILD TURBO (PRUEBA, SIN PROBAR EN UN PC REAL)
+===================================================================
+
+Que es
+- El motor del fork de Wolverine (rama wolverine-perf, el mismo que usabas como
+  kyty_emulator-dev-151be85.exe en el Emulador PS5 Unico) con:
+  * Generacion de fotogramas AMD FSR 3 (funciona en NVIDIA), x2 por defecto.
+  * KYTY_ASYNC_WRITE_READBACK=1 y KYTY_WRITE_WINDOW_KB=16 encendidos por defecto
+    (medidos en Wolverine: -1.5 ms y -1.7 ms por frame).
+- No es el motor de Demon's Souls: con Wolverine ese motor se cuelga al arrancar
+  (logs del 15 y el 20 de octubre).
+
+Instalacion
+1. Descomprime el zip en una carpeta NUEVA, por ejemplo E:\Wolverine-KytyPS5-v1\TURBO
+   (dentro debe quedar "Play Wolverine TURBO.bat" y la carpeta emulator).
+2. Doble clic en "Play Wolverine TURBO.bat".
+   - Encuentra solo el juego en ..\wolverine (o E:\Wolverine-KytyPS5-v1\wolverine).
+   - La primera vez COPIA la cache de shaders y las partidas de ..\userdata.
+     Lo original no se toca. Si tus partidas mas nuevas estan en C:\EmuladorPS5Unico\_SaveData,
+     copia esa carpeta a TURBO\userdata\_SaveData antes de jugar.
+
+Generacion de fotogramas (FG)
+- Por defecto x2. Desde una consola: "Play Wolverine TURBO.bat" x1 (apagada), x2, x3 o x4.
+- x3/x4 usan una DLL de FidelityFX parcheada (emulator\fsr3-mfg) y son experimentales.
+- Importante: el juego no da sus vectores de movimiento al emulador, asi que FSR 3 interpola
+  solo con su flujo optico. Espera halos en el HUD y en bordes que se mueven rapido.
+- La FG no hace el juego mas rapido: dobla los fotogramas mostrados. Con 12-25 fps reales
+  la respuesta del mando sigue siendo la de 12-25 fps, y por debajo de ~30 fps reales la
+  imagen generada se ve peor. Si molesta, juega con x1.
+- En el log (userdata\logs\run_..._turbo.log) cada 5 s sale una linea:
+  [fsr3] real X fps, shown Y fps ...
+
+Si algo va mal
+- Pantalla negra, cuelgue o error al empezar: prueba con x1. Si con x1 funciona, el fallo
+  es de la FG: pasa el log.
+- No cambies el tamano de la ventana ni la minimices (fallo conocido de este motor).

@@ -13,6 +13,7 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/window/fsr3FrameGen.h"
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
@@ -274,6 +275,9 @@ public:
 		return static_cast<uint32_t>(m_images.size());
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
+	[[nodiscard]] vk::Extent2D     Extent() const noexcept { return m_extent; }
+	[[nodiscard]] vk::SwapchainKHR Handle() const noexcept { return m_handle; }
+	[[nodiscard]] bool             IsFsr3() const noexcept { return m_fsr3; }
 
 private:
 	void Destroy();
@@ -296,6 +300,7 @@ private:
 	vk::Sampler                    m_overlay_sampler     = nullptr;
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
+	bool                           m_fsr3                = false; // KYTY_FSR3_FG: AMD's frame generation swapchain
 };
 
 struct Presenter::Impl {
@@ -334,7 +339,8 @@ struct Presenter::Impl {
 		cache.UpdateImage(image_id);
 		return image;
 	}
-	void Present();
+	// new_frame: a flip of a new guest image (false: the last one shown again).
+	void Present(bool new_frame = true);
 
 	RenderContext&        renderer;
 	WindowContext&        window;
@@ -433,13 +439,18 @@ void Swapchain::Create() {
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
 	create_info.clipped = VK_TRUE;
-	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
-	                     "vkCreateSwapchainKHR");
+	// KYTY_FSR3_FG: AMD's frame generation swapchain in place of the driver's (false: the normal one).
+	m_fsr3 = Fsr3::CreateSwapchain(graphics, create_info, &m_handle);
+	if (!m_fsr3) {
+		RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
+		                     "vkCreateSwapchainKHR");
+	}
 	EXIT_IF(m_handle == nullptr);
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
-		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
+		    return m_fsr3 ? Fsr3::GetSwapchainImages(graphics, m_handle, count, images)
+		                  : graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
 
@@ -520,8 +531,14 @@ void Swapchain::Destroy() {
 		}
 	}
 	if (m_handle != nullptr) {
-		graphics.device.destroySwapchainKHR(m_handle, nullptr);
+		if (m_fsr3) {
+			// Destroying the frame generation swapchain's context destroys its swapchain.
+			Fsr3::DestroySwapchain(graphics, m_handle);
+		} else {
+			graphics.device.destroySwapchainKHR(m_handle, nullptr);
+		}
 	}
+	m_fsr3 = false;
 
 	m_handle        = nullptr;
 	m_format        = vk::Format::eUndefined;
@@ -560,9 +577,12 @@ bool Swapchain::NeedsResize() const {
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
+	const auto result =
+	    m_fsr3 ? Fsr3::AcquireNextImage(m_window.graphic_ctx, m_handle,
+	                                    m_image_acquired[m_frame_index], &m_image_index)
+	           : m_window.graphic_ctx.device.acquireNextImageKHR(
+	                 m_handle, std::numeric_limits<uint64_t>::max(),
+	                 m_image_acquired[m_frame_index], nullptr, &m_image_index);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -843,7 +863,11 @@ Swapchain::Status Swapchain::Present() {
 	present.waitSemaphoreCount = 1;
 
 	vk::Result result;
-	{
+	if (m_fsr3) {
+		// The frame generation swapchain queues it (its threads pace and present; its submissions
+		// take the graphics queue's lock themselves).
+		result = Fsr3::QueuePresent(m_window.graphic_ctx, present);
+	} else {
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
@@ -914,7 +938,7 @@ bool Presenter::PresentLastFrame() {
 	if (m_impl->layers[0].frame == nullptr && m_impl->layers[1].frame == nullptr) {
 		return false;
 	}
-	m_impl->Present();
+	m_impl->Present(false);
 	return true;
 }
 
@@ -963,7 +987,7 @@ void Presenter::ClearLayer(int bus) {
 	}
 }
 
-void Presenter::Impl::Present() {
+void Presenter::Impl::Present(bool new_frame) {
 	KYTY_PROFILER_FUNCTION();
 	KYTY_PROFILER_FRAME();
 	window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed);
@@ -992,6 +1016,11 @@ void Presenter::Impl::Present() {
 					layer.frame->present_tick = tick;
 				}
 			}
+		}
+		if (swapchain.IsFsr3()) {
+			// KYTY_FSR3_FG: generation only between new guest frames (not a repeat or a blank frame).
+			Fsr3::BeforePresent(window.graphic_ctx, swapchain.Handle(), swapchain.Extent(),
+			                    swapchain.Format(), new_frame && layers[0].frame != nullptr);
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {

@@ -291,7 +291,8 @@ bool DirectReadbackEnabled() {
 }
 
 bool AsyncWriteReadbackEnabled() {
-	static auto& enabled = Common::LiveSwitches::Get("KYTY_ASYNC_WRITE_READBACK", 0);
+	// Default 1 on wolverine-turbo: same-process A/B 10-15 (docs/EXPERIMENTS.md), -1.5 ms per frame, exact data.
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_ASYNC_WRITE_READBACK", 1);
 	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
