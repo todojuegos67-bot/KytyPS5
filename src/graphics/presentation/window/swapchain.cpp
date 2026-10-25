@@ -22,6 +22,7 @@
 #include "local/fsr3-fg.h"
 #include "local/kbm-warp.h"
 #include "local/anti-lag.h"
+#include "local/rt-local-lights.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
 #if defined(_WIN32)
@@ -551,6 +552,8 @@ struct Presenter::Impl {
 		const auto now   = std::chrono::steady_clock::now();
 		UpdateStatus(now);
 		hud.notice = Loader::DemonsSoulsWarp::HudText();
+		const bool markers = RtLocal::OverlayWanted(); // (KYTY_RTLS_DEBUG: drawn by PlaceHud)
+		if (!markers) hud.markers.clear();
 		if (level < 2) {
 			// (Switched down from detailed with F8: its rows go.)
 			hud.perf.rows.clear();
@@ -565,7 +568,7 @@ struct Presenter::Impl {
 			hud.perf.busy_ms.clear();
 			hud_window = {}; // (the count starts again when it is switched on)
 			hud_frames = 0;
-			return hud.status.empty() && hud.notice.empty() ? nullptr : PlaceHud();
+			return hud.status.empty() && hud.notice.empty() && !markers ? nullptr : PlaceHud();
 		}
 		if (level >= 2 && !machine_started) {
 			// The GPU NVML reports on: the Vulkan device's.
@@ -624,7 +627,7 @@ struct Presenter::Impl {
 			hud_window = now;
 			hud_frames = 0;
 		}
-		if (hud.title.empty() && hud.status.empty() && hud.notice.empty()) {
+		if (hud.title.empty() && hud.status.empty() && hud.notice.empty() && !markers) {
 			return nullptr;
 		}
 		return PlaceHud();
@@ -633,6 +636,13 @@ struct Presenter::Impl {
 		hud.region = swapchain.PresentRegion();
 		if (hud.region.extent.width == 0 || hud.region.extent.height == 0) {
 			hud.region = vk::Rect2D {{0, 0}, swapchain.Extent()};
+		}
+		if (RtLocal::OverlayWanted()) {
+			std::vector<RtLocal::Marker> found;
+			RtLocal::DebugMarkers(static_cast<float>(hud.region.offset.x), static_cast<float>(hud.region.offset.y),
+			                      static_cast<float>(hud.region.extent.width), static_cast<float>(hud.region.extent.height), found);
+			hud.markers.clear();
+			for (auto& m: found) hud.markers.push_back({m.x, m.y, m.radius, m.rgba, m.shape, std::move(m.label)});
 		}
 		return &hud;
 	}

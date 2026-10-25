@@ -602,6 +602,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/gbuf-view.h"
 	"${KYTY_SOURCE_DIR}/local/gbuf-view.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-local-lights.h"
+	"${KYTY_SOURCE_DIR}/local/rt-local-lights.cpp"
 	"${KYTY_SOURCE_DIR}/local/shine.h"
 	"${KYTY_SOURCE_DIR}/local/shine.cpp"
 	"${KYTY_SOURCE_DIR}/local/godrays.h"
