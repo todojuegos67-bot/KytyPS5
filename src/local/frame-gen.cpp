@@ -4329,6 +4329,15 @@ namespace {
 // composite: a soft darkening multiplied into the color, faded with distance, sky skipped. KYTY_GTAO_STRENGTH (0.6),
 // KYTY_GTAO_RADIUS (metres, 1.0), KYTY_GTAO_BENT (0: the extra multiplier on dark, ambient-dominated pixels, 0..1).
 // Off (the default): nothing created, nothing recorded.
+//
+// (specocc) KYTY_SPEC_OCCLUSION (strength 0..1, default 0.8 while KYTY_GTAO >= 1; 0 off): specular occlusion from the
+// same horizon search (gtao.comp: the reflection lobe against the slices' visible arcs), taking off only the estimated
+// environment-specular (IBL) share of the lit color, from the G-buffer material (KYTY_RT_REFLECTIONS' packed copy):
+// KYTY_SPEC_OCCLUSION_ROUGH (default 2:0:8, L2.b0), _GLOSS (default 1:16:8g, L1.b2 inverted; 0 none; the rougher wins),
+// _METAL (default none; e.g. the field refl9's survey logs), all "<layer>:<shift>:<bits>[g]". Not where the game's SSR
+// hit (its captured guide, while KYTY_RT_REFLECTIONS runs), not on bright pixels / local peaks (KYTY_SPEC_OCCLUSION_
+// HIGHLIGHT, display-referred, 0.8; _PEAK, ratio to the neighbourhood, 1.6), not on rough materials (_ROUGH_END, 0.7).
+// Every 10 s a "GTAO: specular occlusion:" line (a 1/16 pixel sample).
 struct GtaoPass {
 	vk::DescriptorSetLayout set_layout = nullptr;
 	vk::PipelineLayout      layout     = nullptr;
@@ -4353,7 +4362,77 @@ struct GtaoPass {
 	vk::ImageView dummy_view     = nullptr;
 	bool          dummy_ready    = false;
 	bool          normals_logged = false;
+	// (specocc) parameters + stats (device local, 128 bytes), its stats copied to a 4-slot host ring each frame
+	VkBuffer        so_dev = VK_NULL_HANDLE, so_host = VK_NULL_HANDLE;
+	VmaAllocation   so_dev_mem = nullptr, so_host_mem = nullptr;
+	const uint32_t* so_mapped  = nullptr;
+	uint64_t        so_written = 0;
+	std::array<double, 16> so_sum {};
+	uint32_t        so_frames = 0;
+	std::chrono::steady_clock::time_point so_last_log = std::chrono::steady_clock::now();
 } g_gtao;
+
+constexpr uint32_t GtaoBindings = 19;
+constexpr uint32_t GtaoSoHeader = 64, GtaoSoStats = 64;
+
+// "<layer>:<shift>:<bits>[g]" -> the shader's field code (layer | shift << 2 | bits << 7 | 4096 inverted); -1 none.
+int32_t GtaoFieldEnv(const char* name, int32_t fallback) {
+	const char* v = std::getenv(name);
+	if (v == nullptr || *v == '\0') return fallback;
+	int layer = 0, shift = 0, bits = 0;
+	if (std::sscanf(v, "%d:%d:%d", &layer, &shift, &bits) != 3 || layer < 0 || layer > 3 || shift < 0 || bits < 1 || shift + bits > 32 ||
+	    bits > 31)
+		return -1;
+	return layer | (shift << 2) | (bits << 7) | (std::strchr(v, 'g') != nullptr ? 4096 : 0);
+}
+struct GtaoSoConfig {
+	float   strength = 0.8f, highlight = 0.8f, peak = 1.6f, rough_end = 0.7f;
+	int32_t rough = 2 | (0 << 2) | (8 << 7), gloss = 1 | (16 << 2) | (8 << 7) | 4096, metal = -1;
+};
+const GtaoSoConfig& GtaoSo() {
+	static const GtaoSoConfig cfg = [] {
+		GtaoSoConfig c;
+		c.strength  = SsgiEnv("KYTY_SPEC_OCCLUSION", 0.8f, 1.0f);
+		c.highlight = std::max(SsgiEnv("KYTY_SPEC_OCCLUSION_HIGHLIGHT", 0.8f, 64.0f), 0.01f);
+		c.peak      = std::max(SsgiEnv("KYTY_SPEC_OCCLUSION_PEAK", 1.6f, 16.0f), 1.05f);
+		c.rough_end = std::clamp(SsgiEnv("KYTY_SPEC_OCCLUSION_ROUGH_END", 0.7f, 1.0f), 0.4f, 1.0f);
+		c.rough     = GtaoFieldEnv("KYTY_SPEC_OCCLUSION_ROUGH", c.rough);
+		c.gloss     = GtaoFieldEnv("KYTY_SPEC_OCCLUSION_GLOSS", c.gloss);
+		c.metal     = GtaoFieldEnv("KYTY_SPEC_OCCLUSION_METAL", -1);
+		if (c.rough < 0 && c.gloss >= 0) c.rough = c.gloss, c.gloss = -1;
+		if (c.rough < 0) c.strength = 0.0f; // (no roughness field: no material, nothing to do)
+		return c;
+	}();
+	return cfg;
+}
+
+// (specocc) The stats slot written 4 frames ago, summed; every 10 s one line.
+void GtaoSoStats() {
+	if (g_gtao.so_mapped == nullptr || g_graphics_ctx == nullptr) return;
+	if (g_gtao.so_written >= 4) {
+		const uint32_t slot = static_cast<uint32_t>(g_gtao.so_written % 4);
+		(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_gtao.so_host_mem, 0, VK_WHOLE_SIZE);
+		const uint32_t* c = g_gtao.so_mapped + slot * (GtaoSoStats / 4);
+		for (uint32_t i = 0; i < 16; ++i)
+			g_gtao.so_sum[i] += c[i];
+		++g_gtao.so_frames;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_gtao.so_last_log < std::chrono::seconds(10) || g_gtao.so_frames == 0) return;
+	const auto&  t   = g_gtao.so_sum;
+	const double n   = std::max(t[0], 1.0), mat = std::max(t[1], 1.0);
+	const auto   pct = [&](double v, double of) { return 100.0 * v / std::max(of, 1.0); };
+	std::printf("GTAO: specular occlusion: last %.0f s, %u frames: material %.1f%% of the pixels (water %.2f%%), occluded "
+	            "(spec visibility < 0.8) %.1f%% of those, reduced (> 5%%) %.2f%% of the pixels, mean reduction there %.1f%%; "
+	            "skipped: the game's SSR hit %.1f%%, highlights %.2f%%, not the G-buffer's surface %.1f%% (strength %g)\n",
+	            std::chrono::duration<double>(now - g_gtao.so_last_log).count(), g_gtao.so_frames, pct(t[1], n), pct(t[7], n),
+	            pct(t[6], mat), pct(t[2], n), t[2] > 0 ? t[3] / 10.0 / t[2] : 0.0, pct(t[4], mat), pct(t[5], mat), pct(t[8], n),
+	            GtaoSo().strength);
+	std::fflush(stdout);
+	g_gtao.so_sum.fill(0.0);
+	g_gtao.so_frames   = 0;
+	g_gtao.so_last_log = now;
+}
 
 int GtaoLevel() {
 	static const int level = [] {
@@ -4383,10 +4462,12 @@ bool GtaoEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
 	if (g_gtao.pipeline == nullptr) {
 		if (g_gtao.failed) return false;
 		g_gtao.failed = true;
-		std::array<vk::DescriptorSetLayoutBinding, 12> bindings {};
-		for (uint32_t i = 0; i < 12; ++i) {
+		std::array<vk::DescriptorSetLayoutBinding, GtaoBindings> bindings {};
+		for (uint32_t i = 0; i < GtaoBindings; ++i) {
 			bindings[i].binding         = i;
-			bindings[i].descriptorType  = i < 7 || (i >= 9 && i != 10) ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorType  = i >= 17 ? vk::DescriptorType::eStorageBuffer
+			                              : i < 7 || (i >= 9 && i != 10) ? vk::DescriptorType::eCombinedImageSampler
+			                                                             : vk::DescriptorType::eStorageImage;
 			bindings[i].descriptorCount = 1;
 			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
 		}
@@ -4452,6 +4533,24 @@ bool GtaoEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
 			view_info.format           = vk::Format::eR32Uint;
 			view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
 			if (device.createImageView(&view_info, nullptr, &g_gtao.dummy_view) != vk::Result::eSuccess) return false;
+		}
+		{ // (specocc) the parameters + stats buffer and its host ring
+			VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+			buffer.size  = GtaoSoHeader + GtaoSoStats;
+			buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+			VmaAllocationCreateInfo dev {};
+			dev.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+			if (vmaCreateBuffer(graphics.allocator, &buffer, &dev, &g_gtao.so_dev, &g_gtao.so_dev_mem, nullptr) != VK_SUCCESS) return false;
+			buffer.size  = GtaoSoStats * 4;
+			buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+			VmaAllocationCreateInfo host {};
+			host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+			VmaAllocationInfo mapped {};
+			if (vmaCreateBuffer(graphics.allocator, &buffer, &host, &g_gtao.so_host, &g_gtao.so_host_mem, &mapped) == VK_SUCCESS)
+				g_gtao.so_mapped = static_cast<const uint32_t*>(mapped.pMappedData);
+			else
+				g_gtao.so_host = VK_NULL_HANDLE; // (no stats line; the effect still runs)
 		}
 		g_gtao.failed    = false;
 	}
@@ -4583,6 +4682,53 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			std::fflush(stdout);
 		}
 	}
+	// (specocc) What the specular occlusion reads: the material layers (with the G-buffer normal: the same copy), the
+	// lighting's depth, the game's SSR guide, the exposure.
+	const auto& so_cfg  = GtaoSo();
+	const bool  so_mat  = normals && so_cfg.strength > 0.0f && gbuf.views[0] != nullptr && gbuf.views[1] != nullptr && gbuf.views[2] != nullptr;
+	const bool  so_dep  = so_mat && gbuf.depth != nullptr;
+	RtReflGuide guide;
+	const bool  so_gd   = so_mat && RtReflGetGuide(guide) && guide.view != nullptr;
+	const bool  so_exp  = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
+	const bool  so_stat = g_gtao.so_host != VK_NULL_HANDLE;
+	{
+		static int said = -1;
+		const int  now  = so_cfg.strength <= 0.0f ? 0 : !so_mat ? 1 : 2 + (so_gd ? 1 : 0) + (so_dep ? 2 : 0);
+		if (now != said) {
+			said = now;
+			if (now == 0) std::printf("GTAO: specular occlusion off (KYTY_SPEC_OCCLUSION=0 or no roughness field)\n");
+			else if (now == 1) std::printf("GTAO: specular occlusion waiting (no G-buffer material copy this frame)\n");
+			else
+				std::printf("GTAO: specular occlusion on (strength %g; roughness %d, gloss %d, metal %d; the game's SSR guide %s, the "
+				            "lighting's depth %s, exposure %s)\n",
+				            so_cfg.strength, so_cfg.rough, so_cfg.gloss, so_cfg.metal, so_gd ? "yes" : "no (KYTY_RT_REFLECTIONS off)",
+				            so_dep ? "yes" : "no", so_exp ? "the game's" : "1.0");
+			std::fflush(stdout);
+		}
+	}
+	GtaoSoStats();
+	{
+		std::array<uint32_t, GtaoSoHeader / 4> h {};
+		const auto fl = [&](uint32_t i, float v) { std::memcpy(&h[i], &v, sizeof(float)); };
+		h[0] = static_cast<uint32_t>(so_cfg.rough), h[1] = static_cast<uint32_t>(so_cfg.gloss), h[2] = static_cast<uint32_t>(so_cfg.metal);
+		h[3] = (so_mat ? 1u | 8u : 0u) | (so_gd ? 2u : 0u) | (so_dep ? 4u : 0u) | (so_mat && so_stat ? 16u : 0u);
+		h[4] = so_exp ? inputs.exposure_index : 12u;
+		fl(8, so_cfg.strength), fl(9, 0.1f), fl(10, 0.6f), fl(11, so_cfg.rough_end); // (guide range: RT reflections' defaults)
+		fl(12, 1.0f), fl(13, so_cfg.highlight), fl(14, so_cfg.peak);
+		{ // (the last frame's shader atomics and copy before these writes)
+			vk::MemoryBarrier2 mb {};
+			mb.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+			mb.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+			mb.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+			mb.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			vk::DependencyInfo dependency {};
+			dependency.memoryBarrierCount = 1;
+			dependency.pMemoryBarriers    = &mb;
+			command.pipelineBarrier2(dependency);
+		}
+		command.updateBuffer(vk::Buffer(g_gtao.so_dev), 0, sizeof(h), h.data());
+		command.fillBuffer(vk::Buffer(g_gtao.so_dev), GtaoSoHeader, GtaoSoStats, 0);
+	}
 	GtaoReadTiming();
 	const auto entry = static_cast<uint32_t>(g_gtao.written % 8);
 	const bool timed = g_gtao.pool != nullptr;
@@ -4638,7 +4784,7 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout,
 	                     const SsgiImage& aux_in, const SsgiImage& aux_out, float step, vk::Extent2D size) {
 		const vk::Sampler       lin = g_gtao.linear, pt = g_gtao.point;
-		vk::DescriptorImageInfo infos[12] {};
+		vk::DescriptorImageInfo infos[GtaoBindings] {};
 		infos[0]  = {lin, color.view, color.layout};
 		infos[1]  = {pt, inputs.depth.view, inputs.depth.layout};
 		infos[2]  = {pt, inputs.motion.view, inputs.motion.layout};
@@ -4652,16 +4798,31 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		infos[10] = {nullptr, aux_out.view, vk::ImageLayout::eGeneral};
 		infos[11] = normals ? vk::DescriptorImageInfo {pt, gbuf.views[3], vk::ImageLayout::eShaderReadOnlyOptimal}
 		                    : vk::DescriptorImageInfo {pt, g_gtao.dummy_view, vk::ImageLayout::eGeneral};
-		vk::WriteDescriptorSet writes[12] {};
-		for (uint32_t i = 0; i < 12; ++i) {
+		// (specocc) the material layers / lighting depth / guide, or stand-ins the flags tell the shader not to read
+		for (uint32_t l = 0; l < 3; ++l)
+			infos[12 + l] = so_mat ? vk::DescriptorImageInfo {pt, gbuf.views[l], vk::ImageLayout::eShaderReadOnlyOptimal}
+			                       : vk::DescriptorImageInfo {pt, g_gtao.dummy_view, vk::ImageLayout::eGeneral};
+		infos[15] = so_dep ? vk::DescriptorImageInfo {pt, gbuf.depth, gbuf.depth_layout} : infos[1];
+		infos[16] = so_gd ? vk::DescriptorImageInfo {lin, guide.view, vk::ImageLayout::eShaderReadOnlyOptimal}
+		                  : vk::DescriptorImageInfo {pt, g_gtao.history[prev].view, vk::ImageLayout::eGeneral};
+		const vk::DescriptorBufferInfo so_buf {vk::Buffer(g_gtao.so_dev), 0, GtaoSoHeader + GtaoSoStats};
+		const vk::DescriptorBufferInfo so_ex  = so_exp ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range}
+		                                               : so_buf;
+		vk::WriteDescriptorSet writes[GtaoBindings] {};
+		for (uint32_t i = 0; i < GtaoBindings; ++i) {
 			writes[i].dstBinding      = i;
 			writes[i].descriptorCount = 1;
+			if (i >= 17) {
+				writes[i].descriptorType = vk::DescriptorType::eStorageBuffer;
+				writes[i].pBufferInfo    = i == 17 ? &so_buf : &so_ex;
+				continue;
+			}
 			writes[i].descriptorType  = i < 7 || (i >= 9 && i != 10) ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
 			writes[i].pImageInfo      = &infos[i];
 		}
 		push.misc[0]  = mode;
 		push.extra[0] = step;
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_gtao.layout, 0, 12, writes);
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_gtao.layout, 0, GtaoBindings, writes);
 		command.pushConstants(g_gtao.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
@@ -4682,6 +4843,13 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	run(4, *src, g.tmp_b, g.out, g.tmp_b, g.count[cur], g.tmp_b, 0.0f, g.render);                            // composite
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
+	if (so_stat) { // (specocc) this frame's stats into the host ring (read 4 frames later)
+		const vk::BufferCopy copy {GtaoSoHeader, (g_gtao.so_written % 4) * GtaoSoStats, GtaoSoStats};
+		command.copyBuffer(vk::Buffer(g_gtao.so_dev), vk::Buffer(g_gtao.so_host), 1, &copy);
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
+		       vk::AccessFlagBits2::eHostRead);
+		++g_gtao.so_written;
+	}
 	if (timed) {
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_gtao.pool, entry * 2 + 1);
 		++g_gtao.written;

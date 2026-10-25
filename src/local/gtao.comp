@@ -27,6 +27,22 @@
 //                neighbourhood, reset on depth/normal disocclusion -> out + count in aux_out
 //   2 a-trous:   5x5 edge-aware (depth, normal) blur, steps 1, 2 (, 4 at 2, 8 at 3)
 //   4 composite: depth-aware upsample; soft darkening with distance fade, sky skipped -> out (render res)
+//
+// (specocc) KYTY_SPEC_OCCLUSION: specular occlusion from the same horizon search. Per slice, the reflection lobe (the
+// view vector mirrored about the normal, a cone of half-angle acos(exp2(-3.32 r^2)) from the G-buffer roughness r) is
+// projected into the slice plane and clipped to the normal's hemisphere; the part of it between the two horizons is
+// the slice's specular visibility (a horizon-based form of Jimenez et al. 2016's GTSO, cone vs visible arc). It rides
+// in the green channel through the temporal and a-trous passes (its own clamp / weights; the AO channel's math is the
+// same as without it). The composite then takes off only the estimated environment-specular share of the lit color:
+//   share = F / (F + diffuse (1 - F)) with F the split-sum environment BRDF (Karis' analytic fit) of the material
+//           (G-buffer: roughness L2.b0 and 1 - gloss L1.b2 (the rougher), albedo L0.b0..2, optional metal field), only
+//           on glossy materials (fading out by a roughness of 0.35..0.7); water (drawn after the G-buffer, up-facing)
+//           as a mirror with a Fresnel share
+//   not where the game's own SSR hit (the captured guide, when KYTY_RT_REFLECTIONS copies it: those reflections are
+//           of real on-screen geometry already), not on bright or locally peaking pixels (direct highlights: torches,
+//           the sun; display-referred through the game's exposure), not where the G-buffer is not this pixel's
+//           surface (particles / edges drawn after it), faded with distance like the AO
+//   the visibility relative to the AO already applied (no double darkening), at most 55 % off the pixel.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D color_tex;
@@ -41,6 +57,22 @@ layout(binding = 8, rgba16f) uniform writeonly image2D gbuf_out;
 layout(binding = 9) uniform sampler2D aux_tex;
 layout(binding = 10, rgba16f) uniform writeonly image2D aux_out;
 layout(binding = 11) uniform usampler2D gb_normal; // the packed G-buffer's normal layer (RtReflGetGbuffer), or a 1x1 dummy
+// (specocc) the packed G-buffer's material layers (or the 1x1 dummy), the depth the deferred lighting read (or the
+// game's depth: so_dec.w bit 2 says), the game's SSR guide (or a stand-in: bit 1 says), parameters + stats, exposure
+layout(binding = 12) uniform usampler2D gb_l0;
+layout(binding = 13) uniform usampler2D gb_l1;
+layout(binding = 14) uniform usampler2D gb_l2;
+layout(binding = 15) uniform sampler2D gdepth_tex;
+layout(binding = 16) uniform sampler2D guide_tex;
+layout(std430, binding = 17) buffer SoBuf {
+	ivec4 so_dec;  // roughness field, gloss field (-1 none), metal field (-1 none), flags: bit0 on, bit1 guide, bit2 the
+	               // lighting's depth, bit3 material layers, bit4 stats this frame
+	ivec4 so_dec2; // x the exposure's index (into binding 18)
+	vec4  so_par;  // x strength, y / z the guide's confidence range, w the glossy roughness limit (fade end)
+	vec4  so_par2; // x 1.0 (the fallback exposure, word 12), y the highlight level (display-referred), z the peak ratio
+	uint  so_stats[16];
+};
+layout(std430, binding = 18) readonly buffer SoExposure { float exposure_values[]; };
 
 layout(push_constant) uniform Push {
 	vec4  proj;      // M[0], M[5], M[8], M[9]
@@ -131,6 +163,81 @@ vec3 SurfaceNormal(vec2 uv, vec3 P, vec3 Ng) {
 	return normalize(mix(Ng, n, smoothstep(0.5, 0.8, a)));
 }
 
+// ---- (specocc) material, water, specular share ----
+bool  SoOn() { return (so_dec.w & 1) != 0; }
+uint  PackedL(int l, ivec2 p) {
+	if (l == 0) return texelFetch(gb_l0, p, 0).r;
+	if (l == 1) return texelFetch(gb_l1, p, 0).r;
+	if (l == 2) return texelFetch(gb_l2, p, 0).r;
+	return texelFetch(gb_normal, p, 0).r;
+}
+float FieldBits(uint w, int shift, int bits) { return float((w >> uint(shift)) & ((1u << uint(bits)) - 1u)) / float((1u << uint(bits)) - 1u); }
+float Field(int f, ivec2 p) {
+	float v = FieldBits(PackedL(f & 3, p), (f >> 2) & 31, clamp((f >> 7) & 31, 1, 31));
+	return (f & 4096) != 0 ? 1.0 - v : v;
+}
+ivec2 GbufPixel(vec2 uv) {
+	ivec2 gs = textureSize(gb_l2, 0);
+	return clamp(ivec2(uv * vec2(gs)), ivec2(0), gs - 1);
+}
+// The material at a G-buffer pixel: false when there is none (the dummy, an empty texel).
+bool  Material(ivec2 q, out float rough, out float metal, out vec3 albedo) {
+	rough = 1.0, metal = 0.0, albedo = vec3(0.5);
+	if ((so_dec.w & 8) == 0) return false;
+	uint w0 = texelFetch(gb_l0, q, 0).r, w1 = texelFetch(gb_l1, q, 0).r, w2 = texelFetch(gb_l2, q, 0).r;
+	if ((w0 | w1 | w2) == 0u) return false;
+	rough = so_dec.x >= 0 ? clamp(Field(so_dec.x, q), 0.0, 1.0) : 1.0;
+	if (so_dec.y >= 0) rough = max(rough, clamp(Field(so_dec.y, q), 0.0, 1.0));
+	metal  = so_dec.z >= 0 ? clamp(Field(so_dec.z, q), 0.0, 1.0) : 0.0;
+	albedo = vec3(FieldBits(w0, 0, 8), FieldBits(w0, 8, 8), FieldBits(w0, 16, 8));
+	albedo *= albedo; // (sRGB-ish to linear: close enough for an energy ratio)
+	return true;
+}
+// World up in this shader's view space (the G-buffer camera's rows; flags as SurfaceNormal).
+bool  UpView(out vec3 up) {
+	int flags = push.misc.w >> 2;
+	up        = vec3(0, 1, 0);
+	if ((flags & 1) == 0) return false;
+	vec3 r0 = push.rot[0].xyz, r1 = vec3(push.rot[0].w, push.rot[1].xy);
+	vec3 r2 = cross(r0, r1) * ((flags & 4) != 0 ? -1.0 : 1.0);
+	up      = vec3(r0.y, r1.y, r2.y);
+	if ((flags & 2) != 0) up.y = -up.y;
+	float l = length(up);
+	if (!(l > 1e-3)) return false;
+	up /= l;
+	return true;
+}
+// 1: the final depth is nearer than the depth the deferred lighting read (water, glass, particles drawn after the
+// G-buffer: its material is not this pixel's); 0: the G-buffer's surface (or no lighting depth: assumed).
+bool  Forward(vec2 uv, float d) {
+	if ((so_dec.w & 4) == 0) return false;
+	ivec2 gs = textureSize(gdepth_tex, 0);
+	float d0 = texelFetch(gdepth_tex, clamp(ivec2(uv * vec2(gs)), ivec2(0), gs - 1), 0).r;
+	if (IsSky(d0)) return true;
+	float z = abs(ViewZ(d)), z0 = abs(ViewZ(d0));
+	return z0 - z > 0.01 * z + 0.02;
+}
+// The lobe's roughness for the horizon pass (-1: no specular occlusion here).
+float LobeRoughness(vec2 uv, float d, vec3 N) {
+	if (!SoOn()) return -1.0;
+	if (Forward(uv, d)) {
+		vec3 up;
+		return (UpView(up) && dot(N, up) > 0.9) ? 0.03 : -1.0; // (water: a mirror; anything else drawn after: none)
+	}
+	float r, m;
+	vec3  a;
+	return Material(GbufPixel(uv), r, m, a) ? r : -1.0;
+}
+// Karis' analytic fit of the split-sum environment BRDF (scale, bias).
+vec2  EnvBrdf(float rough, float nv) {
+	const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+	const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+	vec4  r    = rough * c0 + c1;
+	float a004 = min(r.x * r.x, exp2(-9.28 * nv)) * r.x + r.y;
+	return vec2(-1.04, 1.04) * a004 + r.zw;
+}
+float Cdf(float x, float c, float a) { return smoothstep(c - a, c + a, x); }
+
 void Gtao(ivec2 pixel) {
 	vec2  uv = (vec2(pixel) + 0.5) / TraceSize();
 	float d  = textureLod(depth_tex, uv, 0).r;
@@ -144,6 +251,13 @@ void Gtao(ivec2 pixel) {
 	float z = abs(P.z);
 	imageStore(gbuf_out, pixel, vec4(N, z));
 	vec3 V = normalize(-P);
+	// (specocc) the reflection lobe: direction and half-angle (UE's specular cone: cos = exp2(-3.32193 r^2)), at least
+	// ~8.6 degrees (a pure mirror's single direction would flicker between slices)
+	float lobe_r = LobeRoughness(uv, d, N);
+	bool  so_px  = lobe_r >= 0.0;
+	vec3  R      = normalize(2.0 * dot(N, V) * N - V);
+	float lobe_a = so_px ? max(acos(clamp(exp2(-3.32193 * lobe_r * lobe_r), 0.0, 1.0)), 0.15) : 1.0;
+	float so_sum = 0.0, so_w = 0.0;
 
 	int   q      = push.misc.z;
 	int   slices = q >= 3 ? 4 : q >= 2 ? 3 : 2;
@@ -240,6 +354,24 @@ void Gtao(ivec2 pixel) {
 		float iarc0 = (cos_n + 2.0 * h0 * sin_n - cos(2.0 * h0 - n)) * 0.25;
 		float iarc1 = (cos_n + 2.0 * h1 * sin_n - cos(2.0 * h1 - n)) * 0.25;
 		vis += pn_len * (iarc0 + iarc1);
+		// (specocc) the lobe in this slice: angles from V, positive toward +ortho (as n, h0, h1), clipped to the
+		// normal's hemisphere (below the surface is the BRDF's business, not occlusion: a flat open floor stays 1)
+		if (so_px) {
+			vec3  Rp = R - axis * dot(R, axis);
+			float rl = length(Rp);
+			if (rl > 1e-3) {
+				float tr = atan(dot(Rp, ortho), dot(Rp, V));
+				float lo = max(tr - lobe_a, n - HALF_PI), hi = min(tr + lobe_a, n + HALF_PI);
+				if (hi > lo + 1e-4) {
+					float tot = Cdf(hi, tr, lobe_a) - Cdf(lo, tr, lobe_a);
+					float vsb = Cdf(clamp(h1, lo, hi), tr, lobe_a) - Cdf(clamp(h0, lo, hi), tr, lobe_a);
+					if (tot > 1e-4) {
+						so_sum += rl * clamp(vsb / tot, 0.0, 1.0);
+						so_w += rl;
+					}
+				}
+			}
+		}
 	}
 	vis = clamp(vis / float(slices), 0.0, 1.0);
 	// Dead zone: a flat or convex surface integrates to ~1 but noise and normal error leave 0.9-0.97, which read as
@@ -247,7 +379,14 @@ void Gtao(ivec2 pixel) {
 	float occ = max(1.0 - vis, 0.0);
 	occ       = max(occ - 0.12, 0.0) / 0.88;
 	vis       = 1.0 - occ * sqrt(occ); // occ^1.5: soft in the middle, full in deep creases
-	imageStore(out_img, pixel, vec4(vis, vis, vis, 1.0));
+	// (specocc) the same dead zone (10 %) so open surfaces stay exactly 1; no lobe in any slice: unoccluded
+	float so = 1.0;
+	if (so_px && so_w > 1e-3) {
+		float socc = max(1.0 - so_sum / so_w, 0.0);
+		socc       = max(socc - 0.10, 0.0) / 0.90;
+		so         = clamp(1.0 - socc, 0.0, 1.0);
+	}
+	imageStore(out_img, pixel, vec4(vis, so, vis, 1.0));
 }
 
 // SSGI's temporal scheme, scalar.
@@ -262,22 +401,29 @@ void Temporal(ivec2 pixel) {
 		return;
 	}
 	float m1 = 0.0, m2 = 0.0, wn = 0.0;
+	float s1 = 0.0, s2 = 0.0; // (specocc) the same moments of the specular visibility (green)
 	for (int y = -1; y <= 1; ++y)
 		for (int x = -1; x <= 1; ++x) {
 			vec2  suv = uv + vec2(x, y) * ts;
 			vec4  sg  = textureLod(gbuf_cur, suv, 0);
 			float w   = (abs(sg.w - g.w) < 0.05 * g.w && dot(sg.xyz, g.xyz) > 0.8) ? 1.0 : 0.0;
-			float sv  = textureLod(src_a, suv, 0).r;
+			vec2  sv2 = textureLod(src_a, suv, 0).rg;
+			float sv  = sv2.x;
 			m1 += sv * w;
 			m2 += sv * sv * w;
+			s1 += sv2.y * w;
+			s2 += sv2.y * sv2.y * w;
 			wn += w;
 		}
 	wn = max(wn, 1.0);
 	m1 /= wn, m2 /= wn;
+	s1 /= wn, s2 /= wn;
 	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
+	float ssig  = sqrt(max(s2 - s1 * s1, 0.0));
 	float a_min = push.misc.z >= 3 ? 0.05 : 0.1;
 	float count = 1.0;
 	float res   = cur.r;
+	float sres  = cur.g;
 	vec2  puv   = uv + textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();
 	if ((push.misc.w & 1) == 0 && (push.misc.w & 2) != 0 && all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
 		vec4  pg = textureLod(gbuf_prev, puv, 0);
@@ -286,11 +432,14 @@ void Temporal(ivec2 pixel) {
 			count       = min(max(textureLod(aux_tex, puv, 0).z, 1.0) + 1.0, 64.0);
 			float alpha = max(1.0 / count, a_min);
 			float k     = mix(1.25, 3.0, clamp(count / 32.0, 0.0, 1.0));
-			float hist  = clamp(textureLod(src_b, puv, 0).r, m1 - k * sigma - 0.02, m1 + k * sigma + 0.02);
+			vec2  h2    = textureLod(src_b, puv, 0).rg;
+			float hist  = clamp(h2.x, m1 - k * sigma - 0.02, m1 + k * sigma + 0.02);
 			res         = mix(hist, cur.r, alpha);
+			float shist = clamp(h2.y, s1 - k * ssig - 0.02, s1 + k * ssig + 0.02);
+			sres        = mix(shist, cur.g, alpha);
 		}
 	}
-	imageStore(out_img, pixel, vec4(res, res, res, 1.0));
+	imageStore(out_img, pixel, vec4(res, sres, res, 1.0));
 	imageStore(aux_out, pixel, vec4(0, 0, count, 0));
 }
 
@@ -305,29 +454,37 @@ void Atrous(ivec2 pixel) {
 	}
 	const float kern[3] = float[](0.375, 0.25, 0.0625);
 	float sum = 0.0, wsum = 0.0;
+	float ssum = 0.0, swsum = 0.0; // (specocc) green: the same kernel, its own value weight
 	float step = push.extra.x;
 	for (int y = -2; y <= 2; ++y)
 		for (int x = -2; x <= 2; ++x) {
 			vec2  suv = uv + vec2(x, y) * step * ts;
 			vec4  sg  = textureLod(gbuf_cur, suv, 0);
-			float sc  = textureLod(src_a, suv, 0).r;
+			vec2  sc2 = textureLod(src_a, suv, 0).rg;
+			float sc  = sc2.x;
 			float wn  = pow(max(dot(sg.xyz, g.xyz), 0.0), 32.0);
 			float wz  = exp(-abs(sg.w - g.w) / max(g.w * 0.02 * step, 1e-3));
 			float wl  = exp(-abs(sc - c.r) * 4.0);
-			float w   = kern[abs(x)] * kern[abs(y)] * wn * wz * wl;
+			float wb  = kern[abs(x)] * kern[abs(y)] * wn * wz;
+			float w   = wb * wl;
 			sum += sc * w;
 			wsum += w;
+			float ws = wb * exp(-abs(sc2.y - c.g) * 4.0);
+			ssum += sc2.y * ws;
+			swsum += ws;
 		}
-	float r = wsum > 1e-5 ? sum / wsum : c.r;
-	imageStore(out_img, pixel, vec4(r, r, r, 1.0));
+	float r  = wsum > 1e-5 ? sum / wsum : c.r;
+	float sr = swsum > 1e-5 ? ssum / swsum : c.g;
+	imageStore(out_img, pixel, vec4(r, sr, r, 1.0));
 }
 
-float Upsample(vec2 uv, float z) {
+vec2 Upsample(vec2 uv, float z) {
 	vec2  tc = uv * TraceSize() - 0.5;
 	vec2  f  = fract(tc);
 	ivec2 b  = ivec2(floor(tc));
 	ivec2 mx = ivec2(TraceSize()) - 1;
-	float sum = 0.0, wsum = 0.0, best = 1.0, best_dz = 1e30;
+	vec2  sum = vec2(0.0), best = vec2(1.0);
+	float wsum = 0.0, best_dz = 1e30;
 	for (int i = 0; i < 4; ++i) {
 		ivec2 o  = ivec2(i & 1, i >> 1);
 		ivec2 q  = clamp(b + o, ivec2(0), mx);
@@ -335,13 +492,88 @@ float Upsample(vec2 uv, float z) {
 		float tz = texelFetch(gbuf_cur, q, 0).w;
 		float dz = abs(tz - z) / max(z * 0.015, 1e-3);
 		float w  = max(bw, 1e-4) * exp(-dz * dz);
-		float v  = texelFetch(src_a, q, 0).r;
+		vec2  v  = texelFetch(src_a, q, 0).rg;
 		sum += v * w;
 		wsum += w;
 		if (dz < best_dz) best_dz = dz, best = v;
 	}
 	// no tap on this surface (a silhouette): the nearest-depth tap, no bleeding across the edge
 	return wsum > 1e-4 ? sum / wsum : best;
+}
+
+// (specocc) The multiplier taking the occluded part of the environment-specular share off this pixel (1: nothing).
+void  SoStat(int i, uint v) { atomicAdd(so_stats[i], v); }
+float SpecOcclusion(ivec2 pixel, vec2 uv, float d, vec3 col, float k_ao, float so, float fade) {
+	bool st = (so_dec.w & 16) != 0 && ((pixel.x | pixel.y) & 3) == 0;
+	if (st) SoStat(0, 1u);
+	vec3  P  = ViewPos(uv, d);
+	vec3  V  = normalize(-P);
+	vec3  Ng = NormalAt(uv, P);
+	float share;
+	if (Forward(uv, d)) {
+		vec3 up;
+		if (!(UpView(up) && dot(Ng, up) > 0.9)) {
+			if (st) SoStat(8, 1u);
+			return 1.0;
+		}
+		// water: a mirror; its reflection's share of the color by Fresnel against a dark body (~0.15)
+		float nv = clamp(dot(Ng, V), 0.0, 1.0);
+		float F  = 0.02 + 0.98 * pow(1.0 - nv, 5.0);
+		share    = F / (F + 0.15 * (1.0 - F));
+		if (st) SoStat(7, 1u);
+	} else {
+		float rough, metal;
+		vec3  albedo;
+		ivec2 q = GbufPixel(uv);
+		if (!Material(q, rough, metal, albedo)) return 1.0;
+		// the G-buffer must be this pixel's surface (its normal agrees with the depth's: not an edge, not drawn over)
+		vec3 N = SurfaceNormal(uv, P, Ng);
+		if (dot(N, Ng) < 0.6) {
+			if (st) SoStat(8, 1u);
+			return 1.0;
+		}
+		float nv  = clamp(dot(N, V), 0.0, 1.0);
+		vec2  ab  = EnvBrdf(rough, nv);
+		vec3  f0  = mix(vec3(0.04), albedo, metal);
+		float Fs  = Luma(f0 * ab.x + ab.y);
+		float Dd  = Luma(albedo * (1.0 - metal)) * (1.0 - Fs);
+		share     = Fs / max(Fs + Dd, 1e-4);
+		share    *= 1.0 - smoothstep(0.35, so_par.w, rough); // (rough materials: their sheen is the AO's business)
+		share     = min(share, mix(0.85, 0.95, metal));
+	}
+	if (st) SoStat(1, 1u);
+	if (share < 0.01) return 1.0;
+	// the game's own SSR hit here: its reflection is of on-screen geometry, already occluded by it
+	if ((so_dec.w & 2) != 0) {
+		float conf = textureLod(guide_tex, uv, 0).a;
+		conf       = (isnan(conf) || isinf(conf)) ? 0.0 : clamp(conf, 0.0, 1.0);
+		float ssr  = smoothstep(so_par.y, max(so_par.z, so_par.y + 1e-3), conf);
+		if (st && ssr > 0.5) SoStat(4, 1u);
+		share *= 1.0 - ssr;
+	}
+	// direct highlights (torches, the sun, emissives): bright pixels and local peaks keep everything
+	float e = exposure_values[so_dec2.x];
+	e       = (e > 1e-12 && e < 1e12) ? e : 1.0;
+	float l = Luma(col);
+	ivec2 rs = ivec2(RenderSize()) - 1;
+	float lm = 0.25 * (Luma(texelFetch(color_tex, clamp(pixel + ivec2(3, 0), ivec2(0), rs), 0).rgb) +
+	                   Luma(texelFetch(color_tex, clamp(pixel - ivec2(3, 0), ivec2(0), rs), 0).rgb) +
+	                   Luma(texelFetch(color_tex, clamp(pixel + ivec2(0, 3), ivec2(0), rs), 0).rgb) +
+	                   Luma(texelFetch(color_tex, clamp(pixel - ivec2(0, 3), ivec2(0), rs), 0).rgb));
+	float bright  = smoothstep(so_par2.y, so_par2.y * 2.5, l * e);
+	float peak    = smoothstep(so_par2.z, so_par2.z * 2.0, l / max(lm, 1e-6));
+	float protect = max(bright, peak);
+	if (st && protect > 0.5 && so < 0.9) SoStat(5, 1u);
+	share *= 1.0 - protect;
+	if (st && so < 0.8) SoStat(6, 1u);
+	// the specular visibility relative to what the AO multiplier already took off everything
+	float rel = clamp(so / max(k_ao, 1e-3), 0.0, 1.0);
+	float m   = 1.0 - so_par.x * share * (1.0 - rel) * fade;
+	if (st && m < 0.95) {
+		SoStat(2, 1u);
+		SoStat(3, uint((1.0 - m) * 1000.0 + 0.5));
+	}
+	return m;
 }
 
 void Composite(ivec2 pixel) {
@@ -359,8 +591,9 @@ void Composite(ivec2 pixel) {
 		imageStore(out_img, pixel, col);
 		return;
 	}
-	float ao = Upsample(uv, z);
-	ao       = (isnan(ao) || isinf(ao)) ? 1.0 : clamp(ao, 0.0, 1.0); // (a NaN through clamp is undefined: could lighten)
+	vec2  aso = Upsample(uv, z);
+	float ao  = aso.x;
+	ao        = (isnan(ao) || isinf(ao)) ? 1.0 : clamp(ao, 0.0, 1.0); // (a NaN through clamp is undefined: could lighten)
 	// AO belongs on ambient / indirect light only, but this is the lit HDR color: a bright pixel is mostly direct sun or
 	// emissive, so it gets a third of the effect; dark (ambient-dominated) ones the full amount. Floored at 0.7.
 	float l   = Luma(col.rgb);
@@ -371,6 +604,11 @@ void Composite(ivec2 pixel) {
 	// Multiply only, in the input's own space: k in [0, 1], the result never above the input (no lift, no max(0)
 	// raising negative values, no normalization).
 	k        = (isnan(k) || isinf(k)) ? 1.0 : clamp(k, 0.0, 1.0);
+	if (SoOn()) {
+		float so = (isnan(aso.y) || isinf(aso.y)) ? 1.0 : clamp(aso.y, 0.0, 1.0);
+		float m  = SpecOcclusion(pixel, uv, d, col.rgb, k, so, fade);
+		k *= (isnan(m) || isinf(m)) ? 1.0 : clamp(m, 0.45, 1.0);
+	}
 	vec3 rgb = min(col.rgb * k, col.rgb);
 	if (any(isnan(rgb)) || any(isinf(rgb))) rgb = col.rgb;
 	imageStore(out_img, pixel, vec4(rgb, col.a));
