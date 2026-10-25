@@ -65,6 +65,8 @@ layout(std430, binding = 18) buffer Frame {
 	vec4 xparams;      // (refl9) x the metal reflection's strength (KYTY_RT_REFLECTIONS_METAL), y the glossy surfaces'
 	                   // (KYTY_RT_REFLECTIONS_GLOSSY), z how much of the albedo's hue tints a metal's reflection, w the albedo
 	                   // layer (L0 bits 0..23 as sRGB rgb; < 0 none)
+	vec4 yparams;      // (refl9b) x the minimum reflective area's radius (render pixels; 0 off: KYTY_RT_REFLECTIONS_MIN_AREA),
+	                   // y the large pools' boost (KYTY_RT_REFLECTIONS_POOL_BOOST)
 	int  calib[];      // see CALIB_* below (calibration sums, then the cumulative stats counters)
 };
 // calib[] layout (ints): [0] samples; [CALIB_NORMAL + ((layer * NLAYOUTS + layout) * 2 + space) * 2 + convention] sum of
@@ -806,6 +808,12 @@ void Temporal(ivec2 px) {
 	vec3  sig  = sqrt(max(m2 - m1 * m1, vec3(0)));
 	float asig = sqrt(max(a2 - a1 * a1, 0.0));
 	float svar = max(l2 - l1 * l1, 0.0);
+	// (refl9b) Fireflies: this frame's sample at most the neighbourhood's mean luminance + 2.5 sigma (a lone bright hit on
+	// a noisy glossy pixel sparkled frame to frame)
+	if (fresh && wraw > 2.0) {
+		float lcur = Luma(cur.rgb), lim = l1 + 2.5 * sqrt(svar) + 0.02;
+		if (lcur > lim) cur.rgb *= lim / max(lcur, 1e-6);
+	}
 
 	// Reprojection: the surface by its motion vector; its reflection by the virtual image point behind the mirror.
 	vec2 mv    = texelFetch(motion_tex, RenderPixel(uv), 0).xy * push.motion.xy / RenderSize();
@@ -852,6 +860,11 @@ void Temporal(ivec2 px) {
 		float alpha = max(1.0 / len, amin);
 		// (a miss this frame against a held reflection: the history fades slowly instead of popping)
 		if (fresh && cur.a < hist.a * 0.5) alpha *= 0.5;
+		// (refl9b) a sample far brighter or darker than the history: taken in more slowly (per-pixel flicker)
+		{
+			float lh = Luma(hist.rgb), lf = Luma(cur.rgb);
+			if (fresh && (lf > 2.0 * lh + 0.02 || lh > 2.0 * lf + 0.02)) alpha *= 0.5;
+		}
 		if (!fresh) {
 			// (no sample of its own this frame: the history, nudged toward the traced neighbours)
 			len   = max(meta.x, 1.0);
@@ -939,6 +952,37 @@ void Upsample(vec2 uv, float z, vec3 N, out vec4 rf, out vec4 ax) {
 	}
 	rf = wsum > 1e-5 ? sum / wsum : vec4(0);
 	ax = wsum > 1e-5 ? asum / wsum : vec4(1, 0, 0, 0);
+}
+
+// (refl9b) How much of the floor around a pixel reflects too: 16 taps of the trace's mask (8 directions x half and the
+// whole of yparams.x render pixels) on the same surface (distance within 10 %, normal within ~35 degrees). Tiny puddles
+// and closely packed wet specks in mud (a few noisy glossy pixels: the floor sparkled, refl9 feedback) cover little of it
+// and are faded out; large puddles and water cover nearly all of it and are boosted (Pools). 1 when off.
+float Coverage(vec2 uv, float z, vec3 N) {
+	if (!(yparams.x > 0.5)) return 1.0;
+	vec2  ts = TraceSize();
+	ivec2 hi = ivec2(ts) - 1;
+	vec2  tc = uv * ts;
+	float r  = yparams.x * ts.y / RenderSize().y; // (trace pixels)
+	float c  = 0.0;
+	for (int i = 0; i < 16; ++i) {
+		float a  = (float(i & 7) + (i >= 8 ? 0.5 : 0.0)) * (PI * 0.25);
+		float rr = i >= 8 ? r : r * 0.5;
+		ivec2 q  = clamp(ivec2(tc + vec2(cos(a), sin(a)) * max(rr, 1.0)), ivec2(0), hi);
+		vec4  sg = texelFetch(gb_cur, q, 0);
+		float m  = texelFetch(aux_tex, q, 0).y;
+		bool  same = sg.w < 5e4 && abs(sg.w - z) < 0.1 * z + 0.05 && dot(sg.xyz, N) > 0.8;
+		c += same ? smoothstep(0.03, 0.15, m) : 0.0;
+	}
+	return c / 16.0;
+}
+float AreaFade(float cov) { return smoothstep(0.35, 0.7, cov); }
+float Pool(float cov) { return smoothstep(0.75, 0.95, cov); }
+// (refl9b) Fireflies: a floor's reflection at most (3 .. 6 in pools) x the pixel's own luminance (a lone bright hit on a
+// small wet speck was a glint that came and went).
+vec3 ClampEnergy(vec3 refl, float lc, float pool) {
+	float lr  = Luma(refl), cap = lc * mix(3.0, 6.0, pool) + 1e-4;
+	return lr > cap ? refl * (cap / lr) : refl;
 }
 
 // The surface comes from the trace's (its roughness and mask, upsampled when the trace is at half resolution): the
@@ -1040,10 +1084,25 @@ void Composite(ivec2 px) {
 		if (metal <= 0.5) ex = 0.0; // (refl9: a character's metal keeps the metal path)
 	}
 	if (mask < 0.01 && ex < 0.01) { imageStore(out_a, px, col); return; }
+	// (refl9b) Floors (up-facing, not metal) and water: the area test (tiny / speckled wet patches out, large pools up).
+	float upf_c = UpFacing(Nd);
+	bool  floor_ = (upf_c > 0.0 && metal <= 0.5) || water > 0.0;
+	float cov   = floor_ ? Coverage(uv, z, N) : 1.0;
+	float areaf = floor_ ? AreaFade(cov) : 1.0;
+	float pool  = floor_ ? Pool(cov) : 0.0;
+	if (floor_ && metal <= 0.5) {
+		float fl = water > 0.0 ? 1.0 : upf_c;
+		mask *= mix(1.0, areaf, fl);
+		ex *= mix(1.0, areaf, fl);
+		if (mask < 0.01 && ex < 0.01) { imageStore(out_a, px, col); return; }
+	}
 	if (st && mask > 0.5 && water > 0.5) Stat(7, 1);
 	// (refl3) Water and near-mirrors with a half-resolution trace: their own mirror ray at the render resolution, so
 	// the reflection keeps every pixel of detail (the upsampled, filtered one is the fallback where it finds nothing).
-	if (rough < 0.04 && mask > 0.3 && !all(equal(ivec2(TraceSize()), ivec2(RenderSize())))) {
+	// (refl9b) Large pools too (up to a roughness of 0.25: wet stone under a puddle reads rougher than its water): their
+	// own sharp mirror ray, the filtered result mixed in less.
+	bool pool_ray = pool > 0.5 && rough < 0.25 && (water > 0.0 || upf_c > 0.5) && mask > 0.1;
+	if (((rough < 0.04 && mask > 0.3) || pool_ray) && !all(equal(ivec2(TraceSize()), ivec2(RenderSize())))) {
 		vec3 Vf = normalize(-P);
 		vec3 Rf = reflect(-Vf, N);
 		float rg = dot(Rf, Nd);
@@ -1053,7 +1112,7 @@ void Composite(ivec2 px) {
 		if (!BadV(Rf) && March(P, N, Rf, Vf, push.misc2.z, hc, hd)) {
 			// (a little of the temporal result where it agrees: steadier under sub-pixel camera motion)
 			bool agree = rf.a > 1e-3 && !Bad(rf) && distance(rf.rgb / rf.a, hc.rgb / hc.a) < 0.1;
-			rf = agree ? mix(hc, rf, 0.25) : hc;
+			rf = agree ? mix(hc, rf, 0.25 * (1.0 - pool)) : hc;
 		}
 	}
 	if (Bad(rf) || rf.a < 1e-3) {
@@ -1065,6 +1124,8 @@ void Composite(ivec2 px) {
 	vec3  V     = normalize(-P);
 	if (dot(N, V) < 0.02) N = normalize(N + V * (0.02 - dot(N, V) + 0.01));
 	float NoV   = clamp(dot(N, V), 0.0, 1.0);
+	// (refl9b) Floors and water: the reflection's energy clamped (no fireflies)
+	vec3  reflf = floor_ && metal <= 0.5 ? ClampEnergy(refl, Luma(max(col.rgb, vec3(0))), pool) : refl;
 	if (GuideMode() && water <= 0.0) {
 		// (refl8) Only the game's SSR color is replaced, at the game's own share: its confidence a x the Fresnel x
 		// strength; ours' confidence (through a square root, as below) and the mirror-likeness (mask / the game's mask)
@@ -1083,12 +1144,13 @@ void Composite(ivec2 px) {
 		// wet and polished floors) our sharp hit is also mixed in up to the minimum reflectance (KYTY_RT_REFLECTIONS_MIN,
 		// as water), never over the game's highlights and never darker than MaxDarken of the pixel.
 		float smooth_ = 1.0 - smoothstep(0.06, 0.2, fr_rough);
-		float wm      = clamp(gparams.w * k * fparams.y * smooth_ * UpFacing(Nd), 0.0, 0.9);
-		float lo = Luma(max(outg, vec3(0))), lr = Luma(refl);
+		// (refl9b: large pools stronger, KYTY_RT_REFLECTIONS_POOL_BOOST)
+		float wm      = clamp(gparams.w * k * fparams.y * smooth_ * UpFacing(Nd) * (1.0 + yparams.y * pool), 0.0, 0.9);
+		float lo = Luma(max(outg, vec3(0))), lr = Luma(reflf);
 		wm *= 1.0 - smoothstep(4.0, 12.0, lo / max(lr, lo * 1e-4 + 1e-30));
 		if (lr < lo) wm = min(wm, MaxDarken * lo / max(lo - lr, 1e-30));
 		wm   = clamp(isnan(wm) ? 0.0 : wm, 0.0, 0.9);
-		outg = mix(outg, refl, max(wm - wg, 0.0));
+		outg = mix(outg, reflf, max(wm - wg, 0.0));
 		wg   = max(wg, wm);
 		// (refl9) Metals (armour, weapons, shields) and glossy dielectrics (polished / wet stone, marble, glass, polished
 		// wood), any orientation: our hit (its lobe by the roughness, ExtraLobe; blurred by the a-trous passes by roughness
@@ -1096,7 +1158,7 @@ void Composite(ivec2 px) {
 		// the game's pixel (its IBL) stays. The same limits: never over the game's highlights, never darker than MaxDarken.
 		float wx = 0.0;
 		if (ex > 0.0) {
-			vec3  tgt = refl * mix(vec3(1), MetalTint(GbufAlbedo(px)), clamp(metal, 0.0, 1.0));
+			vec3  tgt = reflf * mix(vec3(1), MetalTint(GbufAlbedo(px)), clamp(metal, 0.0, 1.0));
 			float lo2 = Luma(max(outg, vec3(0))), lt = Luma(tgt);
 			wx        = ex * sqrt(clamp(rf.a, 0.0, 1.0));
 			wx *= 1.0 - smoothstep(4.0, 12.0, lo2 / max(lt, lo2 * 1e-4 + 1e-30));
@@ -1128,6 +1190,8 @@ void Composite(ivec2 px) {
 	}
 	// (the confidence through a square root: a 60 % hit rate averaged in should not cut the reflection to 60 %)
 	float w     = push.params.x * mask * sqrt(clamp(rf.a, 0.0, 1.0)) * Spec(fr_rough, NoV, metal, water);
+	w *= 1.0 + yparams.y * pool; // (refl9b: large pools and water stronger)
+	refl = reflf;
 	// The game's own highlights (lights, emissives: far brighter than what a screen-space ray can find) stay.
 	float lc = Luma(max(col.rgb, vec3(0))), lr = Luma(refl);
 	w *= 1.0 - smoothstep(4.0, 12.0, lc / max(lr, lc * 1e-4 + 1e-30));

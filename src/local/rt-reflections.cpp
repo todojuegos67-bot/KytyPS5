@@ -78,6 +78,13 @@
 // only from 0.12 down (at 70 %). Both at 65 % where the game's own SSR is not confident, full where it is; a miss leaves the game's
 // pixel (its IBL); never over its highlights, never darker than 25 % of it in all. Every 10 s "RT reflections: metal /
 // glossy:" with the metal and glossy shares, where our hit was added and the mean added weight.
+// (refl9b, user feedback on combo20: tiny puddles and speckled wet mud sparkled; large puddles wanted stronger and
+// sharper) Floors and water pass an area test (Coverage: 16 taps of the trace's mask within KYTY_RT_REFLECTIONS_MIN_AREA
+// render pixels at 720p, 10; 0 off): a patch covering under ~35-70 % of that disc fades out, one covering over ~75-95 %
+// is a pool: its weight x (1 + KYTY_RT_REFLECTIONS_POOL_BOOST, 0.6) and its own full-resolution mirror ray up to a
+// roughness of 0.25 (no filtered blur mixed in). Fireflies: the floor's reflection at most 3x (pools 6x) the pixel's
+// luminance, the temporal pass clamps a sample to its neighbourhood (mean + 2.5 sigma) and takes in a sample that differs
+// 2x from its history at half the rate.
 #include "local/rt-reflections.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -97,7 +104,7 @@ namespace Libs::Graphics::FrameGen {
 namespace {
 
 constexpr uint32_t Bindings      = 22;
-constexpr uint32_t HeaderBytes   = 192;           // view_rot[3], clip_prev[4], up_view, fparams, mparams, gparams, xparams
+constexpr uint32_t HeaderBytes   = 208;           // view_rot[3], clip_prev[4], up_view, fparams, mparams, gparams, xparams, yparams
 // calib[] (after the header; the shader's CALIB_* / STATS): samples, normal sums per layer x layout x space x screen
 // y convention, byte statistics, floor votes, then the cumulative stats counters (never cleared).
 constexpr uint32_t NLayouts      = 13;
@@ -177,6 +184,7 @@ struct RtPass {
 	// (refl9) The metal / glossy paths' strengths (KYTY_RT_REFLECTIONS_METAL / _GLOSSY) and the metal survey (the field
 	// found from the G-buffer itself unless KYTY_RT_REFLECTIONS_METAL_FIELD gives it or turns it off).
 	float                   metal_strength = 0.35f, glossy_strength = 0.25f, metal_tint = 0.7f;
+	float                   min_area = 10.0f, pool_boost = 0.6f; // (refl9b: KYTY_RT_REFLECTIONS_MIN_AREA / _POOL_BOOST)
 	bool                    survey_on = false, survey_done = false;
 	uint64_t                survey_runs = 0, survey_next_log = 0;
 	bool                    moving_on = true, moving_auto_off = false;
@@ -1032,10 +1040,12 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			}
 			g_rt.glossy_strength = EnvFloat("KYTY_RT_REFLECTIONS_GLOSSY", 0.25f, 0.0f, 1.0f);
 			g_rt.metal_tint      = EnvFloat("KYTY_RT_REFLECTIONS_METAL_TINT", 0.7f, 0.0f, 1.0f);
+			g_rt.min_area        = EnvFloat("KYTY_RT_REFLECTIONS_MIN_AREA", 10.0f, 0.0f, 64.0f);
+			g_rt.pool_boost      = EnvFloat("KYTY_RT_REFLECTIONS_POOL_BOOST", 0.6f, 0.0f, 2.0f);
 			if (g_rt.dec_metal >= 0 && !g_rt.rough_trusted && FieldsOverlap(g_rt.dec_rough, g_rt.dec_metal) && g_rt.dec_gloss >= 0)
 				g_rt.dec_rough = g_rt.dec_gloss, g_rt.dec_gloss = -1; // (as SurveyDecide: a metal field is not a roughness)
-			std::printf("RT reflections: metal strength %g, glossy strength %g, metal tint %g, metal field %s\n", g_rt.metal_strength,
-			            g_rt.glossy_strength, g_rt.metal_tint, g_rt.survey_on ? "by the survey (auto)" : g_rt.dec_metal >= 0 ? "from the environment" : "none");
+			std::printf("RT reflections: metal strength %g, glossy strength %g, metal tint %g, minimum area radius %g px (720p), pool "
+			            "boost %g, metal field %s\n", g_rt.metal_strength, g_rt.glossy_strength, g_rt.metal_tint, g_rt.min_area, g_rt.pool_boost, g_rt.survey_on ? "by the survey (auto)" : g_rt.dec_metal >= 0 ? "from the environment" : "none");
 			if (const char* mv = std::getenv("KYTY_RT_REFLECTIONS_MOVING"); mv != nullptr && *mv == '0') g_rt.moving_on = false;
 			g_rt.mat_scale = EnvFloat("KYTY_RT_REFLECTIONS_MATERIAL", 1.0f, 0.0f, 1.0f);
 			// (refl8) The guide's settings.
@@ -1199,6 +1209,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		// (refl9, xparams) the metal / glossy paths; the albedo layer L0 (its bits 0..23) unless the normal lives there
 		header[44] = dec_metal >= 0 ? g_rt.metal_strength : 0.0f, header[45] = g_rt.glossy_strength, header[46] = g_rt.metal_tint;
 		header[47] = (packed_count > 0 && (dec_normal < 0 || (dec_normal & 3) != 0)) ? 0.0f : -1.0f;
+		// (refl9b, yparams) the minimum reflective area's radius in render pixels (KYTY_RT_REFLECTIONS_MIN_AREA, given at a
+		// 720-line render, scaled to this one) and the large pools' boost
+		header[48] = g_rt.min_area * static_cast<float>(color.extent.height) / 720.0f, header[49] = g_rt.pool_boost;
 		command.updateBuffer(vk::Buffer(g_rt.frame_buf), 0, HeaderBytes, header.data());
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
