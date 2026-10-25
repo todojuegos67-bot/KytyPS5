@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
@@ -14,6 +15,8 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <magic_enum.hpp>
@@ -22,6 +25,37 @@
 namespace Libs::Audio {
 
 namespace {
+
+// Diagnostics for wrong sounds (Wolverine's claw hits), default off:
+// - KYTY_AUDIO_TRACE=1 (environment): every port open prints its type, rate, channels and format.
+// - KYTY_AUDIO_MUTE_TYPES=<mask> (live): ports of the port types whose bit is set play silence
+//   (bit 0 MAIN, 1 BGM, 2 VOICE, 3 PERSONAL, 4 PADSPK, 10 VIBRATION, 30 AUDIO3D, 31 AUX), to hear
+//   in a running game which port carries a sound.
+// - KYTY_PADSPK_MAIN=0 (live, default 1): a pad speaker port that no DualSense takes is not played
+//   on the main output (the console plays it on the controller's small speaker only).
+bool AudioTraceEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AUDIO_TRACE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+int AudioTypeBit(int type) {
+	return type == 126 ? 30 : type == 127 ? 31 : (type >= 0 && type < 30 ? type : -1);
+}
+
+bool AudioTypeMuted(int type) {
+	static auto& mask = Common::LiveSwitches::Get("KYTY_AUDIO_MUTE_TYPES", 0);
+	const auto   bits = mask.load(std::memory_order_relaxed);
+	const auto   bit  = AudioTypeBit(type);
+	return bits != 0 && bit >= 0 && ((static_cast<uint64_t>(bits) >> static_cast<uint32_t>(bit)) & 1u) != 0;
+}
+
+bool PadSpeakerOnMain() {
+	static auto& on = Common::LiveSwitches::Get("KYTY_PADSPK_MAIN", 1);
+	return on.load(std::memory_order_relaxed) != 0;
+}
 
 constexpr int AUDIO_OUT_PORT_TYPE_MAIN      = 0;
 constexpr int AUDIO_OUT_PORT_TYPE_BGM       = 1;
@@ -475,6 +509,11 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 				port.haptics =
 				    Controller::DualSenseHaptics::Open(freq, type == AUDIO_OUT_PORT_TYPE_PADSPK);
 			}
+			if (AudioTraceEnabled()) {
+				::printf("Audio trace: port %d opened type=%d freq=%u samples=%u channels=%d format=%d\n", id,
+				         type, freq, samples_num, port.channels_num, static_cast<int>(format));
+				std::fflush(stdout);
+			}
 
 			return Id::Create(id);
 		}
@@ -586,6 +625,15 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		        ? Controller::GetSettingScale(Controller::Setting::VibrationIntensity)
 		        : 1.0f;
 
+		// KYTY_AUDIO_MUTE_TYPES (live): this port plays silence.
+		thread_local std::vector<uint8_t> silence;
+		if (AudioTypeMuted(port.type) && params[i].data != nullptr) {
+			silence.assign(static_cast<size_t>(port.samples_num) * static_cast<size_t>(port.channels_num) *
+			                   BytesPerSample(port.format),
+			               0);
+			params[i].data = silence.data();
+		}
+
 		uint64_t controller_queued_us = 0;
 		bool controller_uses_bluetooth = false;
 		if (port.haptics != nullptr) {
@@ -601,7 +649,10 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		if (controller_queued_us == 0) {
 			// No DualSense took it (e.g. it was unplugged); a pad speaker port plays on the main
 			// output instead, and a vibration port has none.
-			if (QueueSdlAudio(&port, params[i].data, blocking, gain)) {
+			if (port.type == AUDIO_OUT_PORT_TYPE_PADSPK && !PadSpeakerOnMain()) {
+				// KYTY_PADSPK_MAIN=0: the pad speaker's sound is dropped, paced by the sample clock.
+				port.queue_primed = false;
+			} else if (QueueSdlAudio(&port, params[i].data, blocking, gain)) {
 				any_device = true;
 				paced[i]   = port.queue_primed;
 			}

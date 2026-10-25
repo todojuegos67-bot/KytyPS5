@@ -787,12 +787,65 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	return {id, nullptr, std::move(desc)};
 }
 
+// Wolverine's moon (title workaround, live, default off). A sampler the recompiler could not
+// resolve gets the wrapping fallback S# (BindlessBindings.h); the night sky's moon then tiles.
+// KYTY_CLAMP_SAMPLER_SHADERS fixes the listed shaders at compile time, but a cutscene draws the
+// moon with another shader. These switches act at bind time, so they work in a running game:
+// - KYTY_FALLBACK_CLAMP_BITS=k / KYTY_FALLBACK_CLAMP_VALUE=v: shaders whose hash has v in its
+//   low k bits get a clamping fallback (k >= 64: every shader). 0 (default) = old behaviour.
+//   Bisect in the cutscene: k=1 v=0, then v=1; keep the half that fixes the moon; k=2 ...
+// - KYTY_FALLBACK_SAMPLER_LOG=N: prints the next N distinct shaders that bind the wrapping
+//   fallback (and whether the switch above clamps them), so the cutscene's candidates are known.
+// Only the exact wrapping fallback words are touched; a game-provided S# is never changed.
+static void ApplyFallbackSamplerClamp(uint64_t shader_hash, ShaderSamplerResource& descriptor) {
+	static auto& bits  = Common::LiveSwitches::Get("KYTY_FALLBACK_CLAMP_BITS", 0);
+	static auto& value = Common::LiveSwitches::Get("KYTY_FALLBACK_CLAMP_VALUE", 0);
+	static auto& log   = Common::LiveSwitches::Get("KYTY_FALLBACK_SAMPLER_LOG", 0);
+	const auto   k     = bits.load(std::memory_order_relaxed);
+	const auto   n     = log.load(std::memory_order_relaxed);
+	if (k <= 0 && n <= 0) {
+		return;
+	}
+	const auto& wrap = ShaderRecompiler::IR::BindlessDefaultSampler;
+	if (descriptor.fields[0] != wrap[0] || descriptor.fields[1] != wrap[1] ||
+	    descriptor.fields[2] != wrap[2] || descriptor.fields[3] != wrap[3]) {
+		return;
+	}
+	bool clamp = false;
+	if (k >= 64) {
+		clamp = true;
+	} else if (k > 0) {
+		const uint64_t mask = (uint64_t {1} << static_cast<uint32_t>(k)) - 1u;
+		clamp = (shader_hash & mask) == (static_cast<uint64_t>(value.load(std::memory_order_relaxed)) & mask);
+	}
+	if (n > 0) {
+		static std::mutex                   mutex;
+		static std::unordered_set<uint64_t> seen;
+		static int64_t                      last_n = 0;
+		std::lock_guard                     lock(mutex);
+		if (n > last_n) {
+			seen.clear(); // a new request lists from scratch
+		}
+		if (seen.insert(shader_hash).second) {
+			::printf("Fallback sampler: shader 0x%016llx%s\n", static_cast<unsigned long long>(shader_hash),
+			         clamp ? " -> clamped (live)" : "");
+			std::fflush(stdout);
+			log.fetch_sub(1, std::memory_order_relaxed);
+		}
+		last_n = log.load(std::memory_order_relaxed);
+	}
+	if (clamp) {
+		descriptor.fields[0] = (descriptor.fields[0] & ~0x1ffu) | (2u | (2u << 3u) | (2u << 6u));
+	}
+}
+
 static vk::Sampler NativeSampler(RenderContext&                       context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                  uint32_t index,
                                  const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	const auto& sampler = program.info.samplers[index];
+	ApplyFallbackSamplerClamp(program.shader_hash, descriptor);
 	if (!sampler.depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
 	}

@@ -429,7 +429,29 @@ bool SkipShaderRequested(uint64_t shader_hash) {
 		}
 		return result;
 	}();
-	return std::ranges::find(hashes, shader_hash) != hashes.end();
+	const auto found = std::ranges::find(hashes, shader_hash);
+	if (found == hashes.end()) {
+		return false;
+	}
+	// KYTY_SKIP_LIST_MASK=<mask> (live, diagnostic; default -1 = every listed shader skipped, as
+	// before): bit i clear runs the i-th shader of the skip list (--skip-shaders order, then
+	// KYTY_SKIP_SHADER_HASHES) again, to see in a running game whether a skipped shader is what
+	// leaves vegetation popping or lighting flickering. Re-enabled shaders compile on first use.
+	static auto& mask_switch = Common::LiveSwitches::Get("KYTY_SKIP_LIST_MASK", -1);
+	const auto   index       = static_cast<uint64_t>(found - hashes.begin());
+	const auto   mask        = static_cast<uint64_t>(mask_switch.load(std::memory_order_relaxed));
+	if (index < 64 && ((mask >> index) & 1u) == 0) {
+		static std::mutex                   mutex;
+		static std::unordered_set<uint64_t> printed;
+		std::lock_guard                     lock(mutex);
+		if (printed.insert(shader_hash).second) {
+			std::printf("SKIP-LIST: shader %016" PRIx64 " (entry %u) runs again (KYTY_SKIP_LIST_MASK)\n",
+			            shader_hash, static_cast<unsigned>(index));
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	return true;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,

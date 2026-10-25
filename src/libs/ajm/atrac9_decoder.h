@@ -5,6 +5,9 @@
 #include "libs/ajm/decoder.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -372,6 +375,18 @@ private:
 		     "frames\n",
 		     m_codec_info.samplingRate, m_codec_info.channels, m_codec_info.frameSamples,
 		     m_codec_info.superframeSize, m_codec_info.framesInSuperframe);
+		if (const char* trace = std::getenv("KYTY_AUDIO_TRACE"); trace != nullptr && trace[0] == '1') {
+			static std::atomic<uint32_t> traced {0};
+			if (traced.fetch_add(1, std::memory_order_relaxed) < 256) {
+				std::printf("Audio trace: ATRAC9 init %02x%02x%02x%02x: %d Hz, %d ch, frame_samples=%d, "
+				            "superframe=%d bytes/%d frames, encoding=%u\n",
+				            config_data[0], config_data[1], config_data[2], config_data[3],
+				            m_codec_info.samplingRate, m_codec_info.channels, m_codec_info.frameSamples,
+				            m_codec_info.superframeSize, m_codec_info.framesInSuperframe,
+				            static_cast<uint32_t>(m_sample_encoding));
+				std::fflush(stdout);
+			}
+		}
 
 		return true;
 	}
