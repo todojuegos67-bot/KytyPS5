@@ -3,6 +3,7 @@
 
 #include <Zydis/DecoderTypes.h>
 #include <cstdint>
+#include <string>
 
 namespace Loader::X64InstructionEmulator {
 
@@ -10,6 +11,11 @@ namespace Loader::X64InstructionEmulator {
                                          const ZydisDecodedOperand* operands);
 uint64_t           PatchReciprocalSquareRoots(uint64_t address, uint64_t size);
 [[nodiscard]] bool TryEmulate(void* native_context);
+// Instructions emulated through TryEmulate (each one a host exception, several microseconds; --amd-cpu's VRSQRTPS
+// sites that could not be relocated among them), counted since start, and the busiest guest addresses since the
+// last call ("rip=0x... n=..." pairs, then cleared). For the [traps] line of the frame stats (videoOut.cpp).
+[[nodiscard]] uint64_t    TrapCount() noexcept;
+[[nodiscard]] std::string TakeTopTrapSites(int count);
 
 // Reads [vaddr, vaddr + size) for a load that faulted at fault_vaddr; false to decline.
 using LoadReader = bool (*)(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);

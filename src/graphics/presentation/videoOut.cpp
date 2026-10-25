@@ -24,6 +24,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/systemContent.h"
+#include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
 #include <array>
@@ -1283,6 +1284,16 @@ static void NoteFrameStats() {
 	         static_cast<double>(intervals.size()) / seconds, sum / static_cast<double>(intervals.size()),
 	         static_cast<double>(p99), static_cast<double>(intervals.back()), static_cast<unsigned long long>(shaders),
 	         static_cast<double>(shader_us) / 1000.0, static_cast<unsigned long long>(waits), static_cast<double>(wait_us) / 1000.0);
+	// wolverine-turbo2-1025: instructions emulated through host exceptions (--amd-cpu's trapped VRSQRTPS sites among
+	// them), only when there were any: each one costs several microseconds on a guest thread.
+	static uint64_t trap_last = 0;
+	if (const auto traps = Loader::X64InstructionEmulator::TrapCount(); traps != trap_last) {
+		::printf("[traps] %llu emulated instructions in %.0f s (%.0f/frame); busiest: %s\n",
+		         static_cast<unsigned long long>(traps - trap_last), seconds,
+		         static_cast<double>(traps - trap_last) / static_cast<double>(intervals.size()),
+		         Loader::X64InstructionEmulator::TakeTopTrapSites(6).c_str());
+		trap_last = traps;
+	}
 	std::fflush(stdout);
 	intervals.clear();
 	window = now;
