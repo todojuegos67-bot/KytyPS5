@@ -1,5 +1,6 @@
 #include "local/skip-shader.h"
 #include "local/rt-local-lights.h"
+#include "local/hwrt-scene.h"
 #include "local/sync-stats.h"
 #include "common/assert.h"
 #include "live-trace-gpu.h"
@@ -1301,6 +1302,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (FrameGen::RtSunWanted() && !bindings.images.empty())
 		FrameGen::RtSunAfterDispatch(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
 		                             std::span<const TextureBinding> {bindings.images});
+	// (KYTY_HWRT: after the game's TAA, the frame's scene acceleration structures; its debug view over the TAA's output)
+	if (HwScene::Active() && !chain && FrameGen::IsTaaShader(program.shader_hash))
+		HwScene::AfterTaa(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer,
+		                  std::span<const TextureBinding> {bindings.images});
 	ResetBindings();
 	m_context.GetCommandScheduler().CompleteDispatch();
 	phase.reset();

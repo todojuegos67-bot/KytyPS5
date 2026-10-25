@@ -1,4 +1,5 @@
 #include "local/skip-shader.h"
+#include "local/hwrt-scene.h"
 #include "local/sync-stats.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "live-trace-gpu.h"

@@ -533,6 +533,24 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${rtsun_header}")
+# KYTY_HWRT (src/local/hwrt-scene.cpp): the scene capture's world-space gather and the ray query debug view.
+foreach(hwrt_shader gather debug)
+	string(TOUPPER "${hwrt_shader}" hwrt_upper)
+	set(hwrt_source "${KYTY_SOURCE_DIR}/local/hwrt-${hwrt_shader}.comp")
+	set(hwrt_spv "${gpu_tiler_generated_dir}/hwrt_${hwrt_shader}.spv")
+	set(hwrt_header "${gpu_tiler_generated_dir}/hwrt_${hwrt_shader}_spv.h")
+	add_custom_command(
+		OUTPUT "${hwrt_header}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+		        -o "${hwrt_spv}" "${hwrt_source}"
+		COMMAND ${CMAKE_COMMAND} -DINPUT=${hwrt_spv} -DOUTPUT=${hwrt_header}
+		        -DSYMBOL=HWRT_${hwrt_upper}_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		DEPENDS "${hwrt_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		VERBATIM
+	)
+	list(APPEND kyty_emulator_src "${hwrt_header}")
+endforeach()
 
 # FSR 3 frame generation's HUD layer (src/local/fsr3-fg.cpp).
 set(hud_split_source "${KYTY_SOURCE_DIR}/local/hud-split.comp")
@@ -617,6 +635,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/gbuf-view.h"
 	"${KYTY_SOURCE_DIR}/local/gbuf-view.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.cpp"
+	"${KYTY_SOURCE_DIR}/local/hwrt-scene.h"
+	"${KYTY_SOURCE_DIR}/local/hwrt-scene.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.h"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.cpp"
 	"${KYTY_SOURCE_DIR}/local/shine.h"

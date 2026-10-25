@@ -1,0 +1,45 @@
+#version 460
+// KYTY_HWRT_DEBUG=1|2 (+4: y flipped): a ray query per pixel of the TAA's output from the camera into the scene TLAS
+// (hwrt-scene.cpp): each mesh in its own colour, darker with distance; 2 blends it 50 % over the game's image. Misses
+// stay the game's. Geometry lining up with the image = capture and world transform right.
+#extension GL_EXT_ray_query : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+layout(set = 0, binding = 1, rgba16f) uniform image2D target;
+layout(push_constant) uniform Push {
+	vec4 r0, r1, r2, r3; // clip -> world rows
+	vec4 cam;
+	uint width, height, mode, pad;
+} p;
+
+vec3 Colour(uint id) {
+	uint h = id * 2654435761u;
+	h ^= h >> 15u;
+	h *= 2246822519u;
+	h ^= h >> 13u;
+	return vec3(float(h & 255u), float((h >> 8u) & 255u), float((h >> 16u) & 255u)) / 255.0 * 0.8 + 0.2;
+}
+
+void main() {
+	const uvec2 px = gl_GlobalInvocationID.xy;
+	if (px.x >= p.width || px.y >= p.height) return;
+	vec2 ndc = (vec2(px) + 0.5) / vec2(p.width, p.height) * 2.0 - 1.0;
+	if ((p.mode & 4u) != 0u) ndc.y = -ndc.y;
+	const vec4 c = vec4(ndc, 0.5, 1.0);
+	const vec4 h = vec4(dot(p.r0, c), dot(p.r1, c), dot(p.r2, c), dot(p.r3, c));
+	if (abs(h.w) < 1e-20) return;
+	const vec3 dir = normalize(h.xyz / h.w - p.cam.xyz);
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xff, p.cam.xyz, 0.05, dir, 100000.0);
+	while (rayQueryProceedEXT(rq)) {}
+	if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) return;
+	const float t   = rayQueryGetIntersectionTEXT(rq, true);
+	const uint  id  = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+	const vec3  col = Colour(id) * (0.35 + 0.65 * exp(-t / 60.0));
+	if ((p.mode & 3u) == 2u) {
+		const vec4 game = imageLoad(target, ivec2(px));
+		imageStore(target, ivec2(px), vec4(mix(game.rgb, col, 0.5), game.a));
+	} else {
+		imageStore(target, ivec2(px), vec4(col, 1.0));
+	}
+}
