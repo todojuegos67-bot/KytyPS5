@@ -810,11 +810,13 @@ void DestroySwapchain(GraphicContext& /*graphics*/, vk::SwapchainKHR /*swapchain
 }
 
 vk::Result GetSwapchainImages(GraphicContext& graphics, vk::SwapchainKHR swapchain, uint32_t* count, vk::Image* images) {
+	if (g_functions.pOutGetSwapchainImagesKHR == nullptr) return vk::Result::eErrorOutOfDateKHR;
 	return static_cast<vk::Result>(g_functions.pOutGetSwapchainImagesKHR(
 	    static_cast<VkDevice>(graphics.device), static_cast<VkSwapchainKHR>(swapchain), count, reinterpret_cast<VkImage*>(images)));
 }
 
 vk::Result AcquireNextImage(GraphicContext& graphics, vk::SwapchainKHR swapchain, vk::Semaphore semaphore, uint32_t* index) {
+	if (g_functions.pOutAcquireNextImageKHR == nullptr) return vk::Result::eErrorOutOfDateKHR;
 	return static_cast<vk::Result>(g_functions.pOutAcquireNextImageKHR(static_cast<VkDevice>(graphics.device),
 	                                                                   static_cast<VkSwapchainKHR>(swapchain), UINT64_MAX,
 	                                                                   static_cast<VkSemaphore>(semaphore), VK_NULL_HANDLE, index));
@@ -822,13 +824,43 @@ vk::Result AcquireNextImage(GraphicContext& graphics, vk::SwapchainKHR swapchain
 
 vk::Result QueuePresent(GraphicContext& graphics, const vk::PresentInfoKHR& info) {
 	std::lock_guard lock(g_mutex);
+	// 10-25: the swapchain released (resize, fullscreen, exit) between the presenter's acquire and this present: no
+	// call into a destroyed context; out of date makes the presenter create it again.
+	if (g_swapchain_context == nullptr || g_functions.pOutQueuePresentKHR == nullptr) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+			std::printf("FSR3 FG: present without a frame generation swapchain: skipped, swapchain made again\n");
+			std::fflush(stdout);
+		}
+		return vk::Result::eErrorOutOfDateKHR;
+	}
 	const auto      begin   = std::chrono::steady_clock::now();
 	VkPresentInfoKHR present = info;
 	present.pNext            = nullptr;
-	const auto result = g_functions.pOutQueuePresentKHR(static_cast<VkQueue>(graphics.queue), &present);
+	// (10-25: the crash minutes into play here, a write to 0x38 in amd_fidelityfx_vk.dll, was its command list pool
+	// running dry: VulkanCommandPool::get returned null with all 8 lists of the shared graphics family in flight.
+	// Fixed in the DLL, tools/local/fsr3-mfg/ffx-sdk-v1.1.4-mfg.patch; AMD's signed DLL keeps the 8-list pool.)
+	auto result = g_functions.pOutQueuePresentKHR(static_cast<VkQueue>(graphics.queue), &present);
 	const double ms   = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
 	g_stats.present_ms += ms;
 	g_stats.max_present_ms = std::max(g_stats.max_present_ms, ms);
+	if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+		// Out of memory inside FidelityFX: the swapchain (and with it the generation context) made again instead of
+		// the presenter's exit on an unexpected result.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+			std::printf("FSR3 FG: frame generation present out of %s memory (%d): swapchain and generation context made again\n",
+			            result == VK_ERROR_OUT_OF_DEVICE_MEMORY ? "video" : "host", static_cast<int>(result));
+			std::fflush(stdout);
+		}
+		result = VK_ERROR_OUT_OF_DATE_KHR;
+	} else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+			std::printf("FSR3 FG: frame generation present returned %d\n", static_cast<int>(result));
+			std::fflush(stdout);
+		}
+	}
 	return static_cast<vk::Result>(result);
 }
 
