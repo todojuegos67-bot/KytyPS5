@@ -1921,6 +1921,22 @@ void Initialize() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RamGuard::RegisterBudgetFlush("released guest memory", RamGuard::FlushGuestFreed, RamFlushGuest::FlushFreed);
 	RamGuard::RegisterBudgetFlush("guest store alias", RamGuard::FlushTrim, RamFlushGuest::FlushTrim);
+	// The census (ram-guard.h): what the game holds of the store, and what is free of it (the direct ranges never
+	// allocated or released, the flexible ones released): with the store all committed that is commit no one uses, and
+	// a page-file section's pages cannot be decommitted (the ceiling of a guest-side commit saving; KYTY_BACKING_ON_DEMAND
+	// commits only what was mapped).
+	RamGuard::RegisterFigure("guest memory allocated by the game (direct + flexible)", [] {
+		return static_cast<uint64_t>(std::max<int64_t>(g_guest_store_used.load(std::memory_order_relaxed), 0));
+	});
+	RamGuard::RegisterFigure("guest store free (direct ranges, never used or released; flexible released)", [] {
+		if (g_physical_memory == nullptr || g_flexible_memory == nullptr) return uint64_t {0};
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+		g_physical_memory->FreeRanges(&ranges);
+		g_flexible_memory->FreeRanges(&ranges);
+		uint64_t total = 0;
+		for (const auto& [start, size]: ranges) total += size;
+		return total;
+	});
 #endif
 }
 

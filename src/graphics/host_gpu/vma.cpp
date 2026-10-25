@@ -265,7 +265,22 @@ bool GraphicContext::CreateAllocator() {
 	// the pool's lock.
 	{
 		static std::once_flag once;
-		std::call_once(once, [] { RamGuard::RegisterBudgetFlush("image reuse pool", RamGuard::FlushCaches, FlushImagePool); });
+		std::call_once(once, [] {
+			RamGuard::RegisterBudgetFlush("image reuse pool", RamGuard::FlushCaches, FlushImagePool);
+			// The census (ram-guard.h). Device-local: on NVIDIA's Windows driver every such allocation is charged to the
+			// process's commit as well (a 7.8 GB ballast of it grew the private bytes 8.2 GB, 10-24): the video memory in
+			// use is that much of "private". Host: staging rings, readbacks, what the budget pushed out of video memory.
+			RamGuard::RegisterFigure("Vulkan device-local (video memory in use; NVIDIA charges it to commit too)", [] {
+				return g_report_context != nullptr ? g_report_context->GetDeviceMemoryUsage() : uint64_t {0};
+			});
+			RamGuard::RegisterFigure("Vulkan host memory (staging, readback, spilled)", [] {
+				return g_report_context != nullptr ? g_report_context->GetHostMemoryUsage() : uint64_t {0};
+			});
+			RamGuard::RegisterFigure("image reuse pool", [] {
+				std::scoped_lock lock(g_image_pool_mutex);
+				return g_image_pool_bytes;
+			});
+		});
 	}
 	g_image_pool_releaser = MemGuard::RegisterReleaser("image reuse pool", [vma = allocator] {
 		uint64_t bytes = 0;

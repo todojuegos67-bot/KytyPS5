@@ -5344,6 +5344,8 @@ void TextureCache::RetireStaleImages(uint64_t tick) {
 	std::fflush(stdout);
 }
 
+static std::atomic<const TextureCache*> g_census_texture_cache {nullptr};
+
 void TextureCache::RunGarbageCollector() {
 	EraseRetired();
 	std::scoped_lock lock {m_lock};
@@ -5357,6 +5359,17 @@ void TextureCache::RunGarbageCollector() {
 	RetireStaleImages(tick);
 	ShadowPoolTrace::Flip(tick);
 	if (TextureOffload::Enabled()) OffloadScan(tick);
+	{
+		// (The RAM census, ram-guard.h: the buffer cache's registered bytes.)
+		static std::once_flag once;
+		std::call_once(once, [this] {
+			g_census_texture_cache = this;
+			RamGuard::RegisterFigure("buffer cache registered", [] {
+				const auto* cache = g_census_texture_cache.load(std::memory_order_acquire);
+				return cache != nullptr ? cache->m_buffer_cache.CacheBytes() : uint64_t {0};
+			});
+		});
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
@@ -5478,9 +5491,19 @@ void TextureCache::RunGarbageCollector() {
 	} else {
 		ram_target = 0;
 	}
+	// The periodic flush's strong level (ram-guard.h, KYTY_RAM_FLUSH_IMAGE_IDLE_SECONDS; counted in flips at 60 a second):
+	// under the budget too, images no draw used for that long go, at most 40 a flip and never the GPU-written ones (their
+	// bytes are guest memory's: uploaded again at their next use). On NVIDIA's Windows driver every device-local allocation
+	// is charged to the process's commit as well, so this lowers the commit (and the private bytes), not the RAM.
+	const uint64_t flush_idle_flips = RamGuard::FlushImageIdleSeconds() * 60u;
+	bool           by_flush         = false;
+	if (flush_idle_flips != 0 && !by_ram && m_total_used_memory != 0 && m_total_used_memory < collect_above) {
+		by_flush      = true;
+		collect_above = 0;
+	}
 	const uint64_t     over          = m_total_used_memory > collect_above ? m_total_used_memory - collect_above : 0;
-	const uint64_t     StaleTicks    = by_ram ? 600 : over >= 2 * GiB ? 120 : over >= GiB ? 300 : 600;
-	const size_t       MaxDeletions  = by_ram ? 40 : over >= 2 * GiB ? 160 : over >= GiB ? 80 : 40;
+	const uint64_t     StaleTicks    = by_flush ? std::max<uint64_t>(flush_idle_flips, 600) : by_ram ? 600 : over >= 2 * GiB ? 120 : over >= GiB ? 300 : 600;
+	const size_t       MaxDeletions  = by_ram || by_flush ? 40 : over >= 2 * GiB ? 160 : over >= GiB ? 80 : 40;
 	// For a while after the GPU could not make an image (InsertImage), images unused for FailedRetryTicks go too: the
 	// superseded ones whose memory it needs (issue #49: a 16 GB GPU full of texture-pool images).
 	const bool     failing     = m_failed_tick != 0 && tick < m_failed_tick + 600;
@@ -5517,8 +5540,8 @@ void TextureCache::RunGarbageCollector() {
 		if (owner == nullptr || !owner->registered) {
 			continue;
 		}
-		// (For the RAM pressure only images whose bytes are guest memory's: none the GPU wrote.)
-		if (by_ram && owner->IsGpuModified()) {
+		// (For the RAM pressure and the flush only images whose bytes are guest memory's: none the GPU wrote.)
+		if ((by_ram || by_flush) && owner->IsGpuModified()) {
 			continue;
 		}
 		if (owner->IsGpuModified()) {
@@ -5535,7 +5558,7 @@ void TextureCache::RunGarbageCollector() {
 			            static_cast<unsigned long long>(m_total_used_memory));
 			std::fflush(stdout);
 		}
-		if (by_ram) RamGuard::NoteReleased(RamGuard::Images, 1, owner->info.data.size);
+		if (by_ram || by_flush) RamGuard::NoteReleased(RamGuard::Images, 1, owner->info.data.size);
 		DeleteImage(id);
 		LiveCounters::Add(LiveCounters::GcImageDeletes);
 	}

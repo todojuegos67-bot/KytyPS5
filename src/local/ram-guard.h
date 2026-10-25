@@ -52,6 +52,29 @@
 //      RAM; the others go to the standby list (or the page file). No commit change, and may cost page faults.
 // One line a pass: MB per category, the time it took and the longest lock a game thread could wait on, private
 // bytes, working set and commit (simulated when so) before and after.
+//
+// What the flush turns on with it (ApplyLowRamDefaults, where the environment does not set them; the switches it set
+// are logged on the "RAM flush (vaciado)" line), because the pass alone can only return what is free at that moment:
+//   KYTY_BACKING_ON_DEMAND=1   the guest store's page-file section committed as the game maps it (never with
+//                              KYTY_BACKING_FILE / KYTY_GUEST_LAZY_COMMIT): the game maps ~11.3 of the 13.5 GiB,
+//                              ~2.2-2.5 GiB less commit for the whole run. The 16 GB profile's default since 10-23.
+//   KYTY_RAM_DIET=1            driver pipelines idle 180 s destroyed (made again from the static store at their next
+//                              binding, ~0.4 ms on a 5090), the unoptimized ones a build replaced 60 s later: ~220 KB
+//                              of the driver's RAM and commit each. Counted on the flush line ("owners" part).
+//   KYTY_SOFT_RELEASE=1        idle scratch buffers registered (the pass frees those idle 10 s), heaps compacted.
+// KYTY_RAM_FLUSH_LEVEL=2 ("vaciado fuerte") adds:
+//   KYTY_TEXTURE_OFFLOAD=1     clean sampled-only textures' guest bytes dropped from RAM (texture-offload.h; the
+//                              16 GB default; 0.8-2 GB of RAM on a 5090 desktop, 1-1 -> Stonefang -> 1-1).
+//   KYTY_RAM_FLUSH_IMAGE_IDLE_SECONDS=120   images no draw used for that long (counted in flips at 60/s) leave video
+//                              memory whatever the budget (the texture collector, on the render thread, at most 40 a
+//                              flip; never the GPU-written ones): on NVIDIA every device-local allocation is charged
+//                              to the process's commit as well (private bytes), so it lowers commit, not RAM. 0 off.
+//                              Returning to a place after that long uploads its textures again (a few MB a frame for
+//                              some seconds): level 2 only.
+// A census line with the first pass and then every 12th ("RAM census:"): the figures the owners register
+// (RegisterFigure): guest store committed / mapped / freed by the game, Vulkan device-local (= driver commit on
+// NVIDIA) and host memory, image reuse pool, buffer cache, pipelines with driver handles. With
+// KYTY_MEMORY_BREAKDOWN_SECONDS / KYTY_MEMORY_TAGS=1 the "Private breakdown:" line tells the rest by caller.
 #include <cstdint>
 
 namespace RamGuard {
@@ -89,6 +112,15 @@ using BudgetFlushFn = uint64_t (*)(uint64_t budget_bytes, uint64_t* held_us);
 void RegisterBudgetFlush(const char* name, FlushClass kind, BudgetFlushFn flush);
 // The periodic flush is on (KYTY_RAM_FLUSH_SECONDS > 0 and the guard on).
 [[nodiscard]] bool PeriodicFlush();
+// KYTY_RAM_FLUSH_SECONDS as set (0 off), read once; and KYTY_RAM_FLUSH_LEVEL (1, or 2 for the strong flush).
+[[nodiscard]] int64_t FlushSeconds();
+[[nodiscard]] int     FlushLevel();
+// KYTY_RAM_FLUSH_IMAGE_IDLE_SECONDS: the texture collector drops images no draw used for this long (0: not for the
+// flush). Default 0 at level 1, 120 at level 2.
+[[nodiscard]] uint64_t FlushImageIdleSeconds();
+
+// A figure for the census line (bytes now; cheap and thread-safe: it runs on the guard's thread).
+void RegisterFigure(const char* name, uint64_t (*figure)());
 
 } // namespace RamGuard
 

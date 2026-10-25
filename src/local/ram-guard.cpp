@@ -54,6 +54,8 @@ struct BudgetFlush {
 };
 std::vector<BudgetFlush> g_budget_flushes;
 std::atomic<bool>        g_periodic {false};
+std::vector<std::pair<const char*, uint64_t (*)()>> g_figures;
+std::string                                         g_flush_defaults; // what the flush turned on (the log line)
 
 const char* Env(const char* name) {
 	const char* value = std::getenv(name);
@@ -95,9 +97,67 @@ bool LowRam() {
 	return on;
 }
 
+int64_t FlushSeconds() {
+	static const int64_t seconds = [] {
+		const char* value = Env("KYTY_RAM_FLUSH_SECONDS");
+		return value != nullptr ? std::max<int64_t>(0, std::strtoll(value, nullptr, 10)) : 0;
+	}();
+	return seconds;
+}
+
+int FlushLevel() {
+	static const int level = [] {
+		const char* value = Env("KYTY_RAM_FLUSH_LEVEL");
+		const long  n     = value != nullptr ? std::strtol(value, nullptr, 10) : 1;
+		return n >= 2 ? 2 : 1;
+	}();
+	return level;
+}
+
+uint64_t FlushImageIdleSeconds() {
+	static const uint64_t seconds = [] {
+		if (FlushSeconds() <= 0) return uint64_t {0};
+		const char* value = Env("KYTY_RAM_FLUSH_IMAGE_IDLE_SECONDS");
+		if (value != nullptr) return std::strtoull(value, nullptr, 10);
+		return FlushLevel() >= 2 ? uint64_t {120} : uint64_t {0};
+	}();
+	return seconds;
+}
+
+void RegisterFigure(const char* name, uint64_t (*figure)()) {
+	if (name == nullptr || figure == nullptr) return;
+	std::lock_guard lock(g_flush_mutex);
+	g_figures.emplace_back(name, figure);
+}
+
+namespace {
+// The switches the periodic flush turns on where the environment leaves them (ram-guard.h): the pass alone returns
+// only what is free at that moment; these lower what is held all along.
+void ApplyFlushDefaults() {
+	if (FlushSeconds() <= 0) return;
+	std::string set;
+	SetDefault("KYTY_RAM_DIET", "1", &set);
+	SetDefault("KYTY_SOFT_RELEASE", "1", &set);
+	{
+		const char* file    = Env("KYTY_BACKING_FILE");
+		const bool  in_file = file != nullptr && !(file[0] == '0' && file[1] == '\0');
+		const char* lazy    = Env("KYTY_GUEST_LAZY_COMMIT");
+		const char* demand  = Env("KYTY_LOWRAM_ON_DEMAND");
+		if (!in_file && !(lazy != nullptr && lazy[0] == '1') && !(demand != nullptr && demand[0] == '0'))
+			SetDefault("KYTY_BACKING_ON_DEMAND", "1", &set);
+	}
+	if (FlushLevel() >= 2) {
+		SetDefault("KYTY_TEXTURE_OFFLOAD", "1", &set);
+		SetDefault("KYTY_RAM_FLUSH_IMAGE_IDLE_SECONDS", "120", &set);
+	}
+	g_flush_defaults = set;
+}
+} // namespace
+
 void ApplyLowRamDefaults() {
 	static std::once_flag once;
 	std::call_once(once, [] {
+		ApplyFlushDefaults();
 		const uint64_t ram    = LocalPlatform::PhysicalMemory();
 		const char*    forced = Env("KYTY_LOWRAM");
 		if (!LowRam()) {
@@ -233,8 +293,7 @@ Settings ReadSettings() {
 	{
 		const char* abort_text = Env("KYTY_SIMULATE_RAM_ABORT");
 		s.sim_abort            = s.sim_commit_limit != 0 && !(abort_text != nullptr && abort_text[0] == '0');
-		const char* seconds    = Env("KYTY_RAM_FLUSH_SECONDS");
-		s.flush_seconds        = seconds != nullptr ? std::max<int64_t>(0, std::strtoll(seconds, nullptr, 10)) : 0;
+		s.flush_seconds        = FlushSeconds();
 		s.flush_bytes          = std::max<uint64_t>(MiB, EnvMiB("KYTY_RAM_FLUSH_MB", 1024 * MiB));
 		const char* trim       = Env("KYTY_RAM_FLUSH_TRIM");
 		s.flush_trim           = trim != nullptr && trim[0] == '1';
@@ -355,6 +414,7 @@ double MsSince(Clock::time_point start) {
 struct FlushState {
 	uint64_t passes = 0;
 	uint64_t released_total[FlushClasses] {};
+	uint64_t owners_total = 0;
 	double   ms_total = 0.0, ms_max = 0.0;
 	double   heaps_ms_last = 0.0;
 	Clock::time_point heaps_last {};
@@ -426,20 +486,52 @@ void FlushPass(const Settings& s, HANDLE low_memory, uint64_t store, FlushState*
 	state->passes++;
 	state->ms_total += ms;
 	state->ms_max = std::max(state->ms_max, ms);
+	// What the owners released on their own threads since the last pass (pipelines idle 180 s with KYTY_RAM_DIET, images
+	// the collector dropped for the flush): their commit went between the passes, not inside this one.
+	uint64_t    owners_bytes = 0;
+	std::string owners       = TakeReleased(&owners_bytes);
+	state->owners_total += owners_bytes;
 	const auto mb = [](uint64_t b) { return static_cast<unsigned long long>(b / 1000000u); };
 	const auto mi = [](uint64_t b) { return static_cast<unsigned long long>(b / MiB); };
-	std::printf("RAM flush #%llu (every %lld s, up to %llu MB): released %llu MB: caches %llu MB [%s], freed guest memory "
-	            "%llu MB of RAM [%s], trim %s%llu MB%s%s%s; %.1f ms (longest lock a game thread could wait on %.2f ms); "
-	            "private %llu -> %llu MiB, working set %llu -> %llu MiB, commit %llu -> %llu of %llu MiB, available %llu -> "
-	            "%llu MiB%s\n",
+	// The system's figures as the overlay shows them ("RAM x / y GB", "Commit x / y GB"): RAM in use = total less
+	// available; the commit charge of the whole PC. The process's own: private (its commit) and working set (its RAM).
+	const uint64_t sys_before = before.total_phys - std::min(before.total_phys, before.available);
+	const uint64_t sys_after  = after.total_phys - std::min(after.total_phys, after.available);
+	std::printf("RAM flush #%llu (every %lld s, up to %llu MB, level %d): released %llu MB: caches %llu MB [%s], freed guest "
+	            "memory %llu MB of RAM [%s], trim %s%llu MB%s%s%s; owners since the last pass %llu MB%s; %.1f ms (longest "
+	            "lock a game thread could wait on %.2f ms); process: private %llu -> %llu MiB, working set %llu -> %llu MiB; "
+	            "PC: RAM in use %llu -> %llu of %llu MiB, commit %llu -> %llu of %llu MiB%s\n",
 	            static_cast<unsigned long long>(state->passes), static_cast<long long>(s.flush_seconds), mb(s.flush_bytes),
-	            mb(released[0] + released[1] + released[2]), mb(released[0]), parts[0].c_str(), mb(released[1]),
+	            FlushLevel(), mb(released[0] + released[1] + released[2]), mb(released[0]), parts[0].c_str(), mb(released[1]),
 	            parts[1].empty() ? "none" : parts[1].c_str(), s.flush_trim ? "" : "off ", mb(released[2]),
 	            s.flush_trim ? " [" : "", s.flush_trim ? (parts[2].empty() ? "none" : parts[2].c_str()) : "",
-	            s.flush_trim ? "] (no commit change)" : "", ms, static_cast<double>(held_us) / 1000.0,
-	            mi(before.private_bytes), mi(after.private_bytes), mi(before.working_set), mi(after.working_set),
-	            mi(before.commit_total), mi(after.commit_total), mi(after.commit_limit), mi(before.available),
-	            mi(after.available), after.simulated ? " (simulated)" : "");
+	            s.flush_trim ? "] (no commit change)" : "", mb(owners_bytes), owners.c_str(), ms,
+	            static_cast<double>(held_us) / 1000.0, mi(before.private_bytes), mi(after.private_bytes),
+	            mi(before.working_set), mi(after.working_set), mi(sys_before), mi(sys_after), mi(after.total_phys),
+	            mi(before.commit_total), mi(after.commit_total), mi(after.commit_limit), after.simulated ? " (simulated)" : "");
+	// The census: where the memory the flush cannot touch is (the owners' figures), with the first pass and then every
+	// 12th (a minute at the launcher's 5 s).
+	if (state->passes == 1 || state->passes % 12 == 0) {
+		std::vector<std::pair<const char*, uint64_t (*)()>> figures;
+		{
+			std::lock_guard lock(g_flush_mutex);
+			figures = g_figures;
+		}
+		std::string line = "RAM census (what is held; the flush returns only what is free or re-creatable):";
+		char        piece[160];
+		std::snprintf(piece, sizeof(piece), " guest store committed %llu of %llu MiB,", mi(after.store_committed),
+		              mi(g_store_size.load(std::memory_order_relaxed)));
+		line += piece;
+		for (const auto& [name, figure]: figures) {
+			std::snprintf(piece, sizeof(piece), " %s %llu MiB,", name, mi(figure()));
+			line += piece;
+		}
+		std::snprintf(piece, sizeof(piece), " flush passes %llu: caches %llu MB, freed guest memory %llu MB, owners %llu MB in all",
+		              static_cast<unsigned long long>(state->passes), mb(state->released_total[0]), mb(state->released_total[1]),
+		              mb(state->owners_total));
+		line += piece;
+		std::printf("%s\n", line.c_str());
+	}
 	std::fflush(stdout);
 }
 
@@ -466,10 +558,14 @@ void Watch() {
 		std::printf("RAM guard: the simulated PC's end is simulated too: with no commit headroom left the run is closed "
 		            "(\"RAM simulada agotada\"; KYTY_SIMULATE_RAM_ABORT=0 keeps running)\n");
 	if (s.flush_seconds > 0)
-		std::printf("RAM flush (vaciado): every %lld s up to %llu MB: caches (re-creatable), guest memory the game released%s "
-		            "(KYTY_RAM_FLUSH_SECONDS / KYTY_RAM_FLUSH_MB / KYTY_RAM_FLUSH_TRIM)\n",
+		std::printf("RAM flush (vaciado): every %lld s up to %llu MB, level %d: caches (re-creatable), guest memory the game "
+		            "released%s (KYTY_RAM_FLUSH_SECONDS / KYTY_RAM_FLUSH_MB / KYTY_RAM_FLUSH_LEVEL / KYTY_RAM_FLUSH_TRIM); turned "
+		            "on with it: %s%s\n",
 		            static_cast<long long>(s.flush_seconds), static_cast<unsigned long long>(s.flush_bytes / 1000000u),
-		            s.flush_trim ? ", then the working set trim of cold guest pages" : "; no working set trim");
+		            FlushLevel(), s.flush_trim ? ", then the working set trim of cold guest pages" : "; no working set trim",
+		            g_flush_defaults.empty() ? "nothing (every switch already set)" : g_flush_defaults.c_str(),
+		            FlushImageIdleSeconds() != 0 ? "; images no draw used for KYTY_RAM_FLUSH_IMAGE_IDLE_SECONDS leave video memory"
+		                                         : "");
 	std::fflush(stdout);
 	g_periodic.store(s.flush_seconds > 0, std::memory_order_relaxed);
 	FlushState flush_state;
