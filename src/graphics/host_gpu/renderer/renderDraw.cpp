@@ -1,4 +1,5 @@
 #include "local/skip-shader.h"
+#include "local/hwrt-scene.h"
 #include "local/sync-stats.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "live-trace-gpu.h"
@@ -1933,6 +1934,10 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 }
 
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
+// (<windows.h> defines MemoryBarrier; the records use vk::MemoryBarrier.)
+#ifdef MemoryBarrier
+#undef MemoryBarrier
+#endif
 #include "native-xpr.inc"
 #include "table-xpr.inc"
 #endif

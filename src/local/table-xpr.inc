@@ -33,6 +33,12 @@ struct RenderExecutor::TableVariant {
 	bool                           refused        = false;   // another specialization than the pair's programs
 	// The pixel program's export mapping under this state (GetGraphicsPrograms).
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> mapping {};
+	// KYTY_HWRT (local/hwrt-scene.h): a G-buffer state's capturing pipeline (null: none, or a worker still compiles it:
+	// hwrt_make asks again, with the registers of a draw of this same state), and its pixel shader (the material hook).
+	const PipelineCache::Pipeline*                                                 hwrt_pipeline = nullptr;
+	std::shared_ptr<std::function<const PipelineCache::Pipeline*(CommandBuffer&)>> hwrt_make;
+	uint64_t                                                                       hwrt_ps    = 0;
+	bool                                                                           hwrt_scene = false;
 };
 
 // Words a draw writes whole after resizing (TableEvaluate's T#/S# words): resize leaves the new ones uninitialized. (With
@@ -624,7 +630,8 @@ bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64
 	auto&       variant = table.last_pair->variants[table.last_variant];
 	const auto& emit    = m_native_xpr->emit;
 	if (emit.command != buffer.Handle() || emit.generation != buffer.GraphicsGeneration() ||
-	    emit.state != table.last_state || emit.pipeline != variant.pipeline)
+	    emit.state != table.last_state ||
+	    (emit.pipeline != variant.pipeline && (variant.hwrt_pipeline == nullptr || emit.pipeline != variant.hwrt_pipeline)))
 		return false;
 	// (The GPU thread's: a speculation's thread does not take it.)
 	std::optional<RenderLockGuard> lock;
@@ -2255,7 +2262,25 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	    std::memcmp(&emit.state->dynamic, &draw_state.dynamic, sizeof(draw_state.dynamic)) == 0)
 		emit.state = &draw_state;
 	if (!same_command || emit.state != &draw_state) NativeXprEmitDynamic(cache, vk_buffer, draw_state, same_command);
-	const auto& pipeline = *variant.pipeline;
+	// KYTY_HWRT (local/hwrt-scene.h): a G-buffer state's draws take its capturing pipeline (same layout), on this
+	// render thread only; the first record of each draw call goes in push constant dword HwScene::CursorDword.
+	bool hwrt_capture = false;
+	if (variant.hwrt_scene && HwScene::Active()) {
+		const uint32_t draws = direct != nullptr ? 1u : static_cast<uint32_t>(commands.size());
+		if (Role() != 0 || Spec::Current() != nullptr) {
+			HwScene::NoteSkip(HwScene::Skip::Speculation, draws);
+		} else {
+			if (variant.hwrt_pipeline == nullptr && variant.hwrt_make) variant.hwrt_pipeline = (*variant.hwrt_make)(buffer);
+			if (variant.hwrt_pipeline == nullptr || variant.hwrt_pipeline->pipeline_layout != variant.pipeline->pipeline_layout)
+				HwScene::NoteSkip(HwScene::Skip::NoVariant, draws);
+			else
+				hwrt_capture = true;
+		}
+	}
+	if (hwrt_capture) HwScene::NoteCamera(pair.programs[0]->shader_hash,
+	                                      std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
+	const auto& pipeline = hwrt_capture ? *variant.hwrt_pipeline : *variant.pipeline;
+	const PipelineCache::Pipeline* bound_pipeline = &pipeline; // (the game's own after a capture's fallback below)
 	if (!same_command || emit.pipeline != &pipeline)
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, BindPipelineHandle(pipeline));
 	if (!same_command || emit.pipeline != &pipeline || table.last_set != set)
@@ -2284,6 +2309,54 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		                        vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 		                        push_dwords * sizeof(uint32_t), push_data.dwords.data());
 	if (!same_index) vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
+	if (hwrt_capture && push_dwords > HwScene::CursorDword) {
+		// (A program's push data reaches the cursor's dword: drawn uncaptured, with the game's pipeline.)
+		HwScene::NoteSkip(HwScene::Skip::PushData, direct != nullptr ? 1u : static_cast<uint32_t>(commands.size()));
+		hwrt_capture = false;
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, BindPipelineHandle(*variant.pipeline));
+		bound_pipeline = variant.pipeline;
+	}
+	// The draw's mesh for the capture: its first index in guest memory (within the bound index range), counts, offset.
+	const uint64_t hwrt_index_size = index_type == vk::IndexType::eUint32 ? 4u : 2u;
+	const auto     hwrt_note       = [&](uint32_t record, uint32_t index_count, uint32_t instance_count, uint32_t first_index,
+                                int32_t vertex_offset) {
+		HwScene::Draw d;
+		d.vs             = pair.programs[0]->shader_hash;
+		d.ps             = variant.hwrt_ps;
+		d.index_size     = static_cast<uint32_t>(hwrt_index_size);
+		d.index_count    = index_count;
+		d.instance_count = instance_count;
+		d.vertex_offset  = vertex_offset;
+		const uint64_t begin = index_base + uint64_t {first_index} * hwrt_index_size;
+		if (indexed && buffer_cache.IsRegionGpuModified(begin, uint64_t {index_count} * hwrt_index_size)) {
+			HwScene::NoteSkip(HwScene::Skip::GpuWritten);
+			return;
+		}
+		d.index_address      = indexed && index_base != 0 && begin + uint64_t {index_count} * hwrt_index_size <= index_base + index_bytes
+		                           ? begin
+		                           : 0;
+		HwScene::Note(record, d);
+	};
+	if (hwrt_capture) {
+		// The cursor of the draw call that follows (gl_DrawID counts from 0 in each call).
+		const auto push_cursor = [&](uint32_t cursor) {
+			vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+			                        HwScene::CursorDword * sizeof(uint32_t), sizeof(uint32_t), &cursor);
+		};
+		if (direct != nullptr) {
+			const uint32_t cursor = HwScene::Reserve(1);
+			push_cursor(cursor);
+			const auto& vertex = *pair.programs[0];
+			const auto  word   = [&](int32_t sgpr) {
+                const auto index = int64_t {sgpr} - vertex.user_data_base;
+                return index >= 0 && index < static_cast<int64_t>(user_data[0].size()) ? user_data[0][index] : 0u;
+			};
+			const uint32_t index_offset  = buffer.GetUserConfig().GetIndexOffset();
+			const uint32_t vertex_offset = variant.fetch_embedded && index_offset == 0 ? word(vertex.info.vertex_offset_sgpr) : index_offset;
+			if (indexed) hwrt_note(cursor, direct->index_count, direct->instance_count, 0, static_cast<int32_t>(vertex_offset));
+			else HwScene::NoteSkip(HwScene::Skip::Topology);
+		}
+	}
 	if (direct != nullptr) {
 		// This draw's offsets, as the normal path's ResolveVertexOffset/ResolveInstanceOffset give them: the index
 		// offset register, else (a vertex program that fetches) the user data its fetch adds.
@@ -2302,9 +2375,24 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		else
 			vk_buffer.draw(direct->index_count, direct->instance_count, vertex_offset, first_instance);
 	}
-	for (uint32_t group = 0; group < groups; ++group)
+	for (uint32_t group = 0, first_command = 0; group < groups; first_command += group_sizes[group], ++group) {
+		if (hwrt_capture) {
+			// Each indirect draw's arguments as the game's CPU wrote them (guest memory): the mesh's counts and offsets.
+			const uint32_t cursor = HwScene::Reserve(group_sizes[group]);
+			vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+			                        HwScene::CursorDword * sizeof(uint32_t), sizeof(uint32_t), &cursor);
+			for (uint32_t i = 0; i < group_sizes[group]; ++i) {
+				if (buffer_cache.IsRegionGpuModified(commands[first_command + i], stride)) {
+					HwScene::NoteSkip(HwScene::Skip::GpuWritten);
+					continue;
+				}
+				const auto* args = reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(commands[first_command + i]);
+				hwrt_note(cursor + i, args->indexCount, args->instanceCount, args->firstIndex, args->vertexOffset);
+			}
+		}
 		vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second, group_sizes[group],
 		                              static_cast<uint32_t>(stride));
+	}
 	if (FrameGen::RtParticlesDebug() && !draw_state.targets.empty()) // (rtparticles census: this path's draws by target)
 		FrameGen::NoteOtherPathDraw(draw_state.targets[0].requested.data.address, 0, false, 1);
 	if (FrameGen::Capturing()) FrameGen::AfterDraw(buffer); // (frame generation's HUD-less image)
@@ -2316,7 +2404,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	emit.command     = vk_buffer;
 	emit.generation  = buffer.GraphicsGeneration();
 	emit.state       = &draw_state;
-	emit.pipeline    = &pipeline;
+	emit.pipeline    = bound_pipeline;
 	draw_state.Use(m_context.FrameNumber());
 	if (indexed) {
 		emit.index_base  = index_base;
@@ -2573,6 +2661,34 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		variant->mapping        = mapping;
 		variant->fetch_embedded = table_state.vs_input_info.fetch_embedded;
 	}
+	// KYTY_HWRT (local/hwrt-scene.h): a G-buffer draw state (>= 3 colour targets, a single-layer depth target >= 1280 px
+	// wide it writes, a triangle list) gets the capturing variant of its pipeline too, compiled by a worker.
+	if (HwScene::Active() && Role() == 0 && state.color_count >= 3 && state.depth_info.image_id &&
+	    state.depth_info.depth_write_enable && state.depth_info.desc.info.resources.layers == 1 &&
+	    state.depth_info.desc.info.extent.width >= 1280 && topology == vk::PrimitiveTopology::eTriangleList &&
+	    !primitive_restart_enable) {
+		const auto module = HwScene::CaptureModule(m_context.GetGraphics(), table_state.programs.vertex.module);
+		HwScene::NoteSceneState(module != nullptr);
+		if (module) {
+			const ShaderProgram capture_program {HwScene::VariantId(table_state.programs.vertex.id), module};
+			auto make = std::make_shared<std::function<const PipelineCache::Pipeline*(CommandBuffer&)>>(
+			    [this, s = table_state, topology, primitive_restart_enable, capture_program](CommandBuffer& command) {
+				    return static_cast<const PipelineCache::Pipeline*>(m_context.GetPipelineCache().TryCreateGraphicsPipeline(
+				        std::span<const RenderColorInfo> {s.color_info, s.color_count}, s.depth_info, s.vs_input_info, command,
+				        s.ps_active ? &s.ps_input_info : nullptr, topology, primitive_restart_enable, capture_program,
+				        s.programs.pixel, true));
+			    });
+			const auto* made  = (*make)(buffer);
+			const auto  write = CatalogWrite();
+			auto variant = std::ranges::find(pair->variants, table.store_state, &TableXpr::Variant::state);
+			if (variant != pair->variants.end()) {
+				variant->hwrt_scene    = true;
+				variant->hwrt_ps       = pixel != nullptr ? pixel->shader_hash : 0;
+				variant->hwrt_make     = std::move(make);
+				variant->hwrt_pipeline = made;
+			}
+		}
+	}
 	NativeXprCaptureState(buffer, state, rendering, table.store_state);
 }
 
@@ -2660,6 +2776,9 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	// (RenderExecutor::DispatchDirect, FrameGen::OnDispatch): one dispatch a frame.
 	if (FrameGen::Capturing() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
 		return m_dispatch_declined = "table: frame generation (TAA)", false;
+	// (KYTY_HWRT: the TAA's dispatch is where the scene's acceleration structures are built, on the normal path.)
+	if (HwScene::Active() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
+		return m_dispatch_declined = "table: hardware ray tracing (TAA)", false;
 	TablePrefetchPair(pair);
 	if (Role() == 0) pair.used_frame = m_context.FrameNumber();
 	if (Role() == 0) TablePrefetchNext(OwnTable().previous_dispatch, pair);
