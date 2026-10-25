@@ -163,7 +163,7 @@ bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> v
 	if (capture.source.read_memory != nullptr) {
 		if (!capture.source.read_memory(capture.source.userdata, address, values)) return false;
 	} else {
-		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+		SrtCopyHostMemory(address, values);
 	}
 	capture.ranges.emplace_back(address, values.size_bytes());
 	return true;

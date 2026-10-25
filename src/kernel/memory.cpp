@@ -953,7 +953,30 @@ bool TryReadBufferBackingNoWait(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+// No guest or host mapping lives below 64 KiB (the Windows null region). A resource table read
+// from a zero or tiny base (an unbound SRT pair during pipeline creation, KytyPS5#1268) reads
+// zero there instead of faulting the GPU thread.
+static constexpr uint64_t NullRegionEnd = 0x10000;
+
+static bool InNullRegion(uint64_t vaddr, uint64_t size) {
+	return vaddr < NullRegionEnd || vaddr + size < vaddr;
+}
+
+static void ReadNullRegionAsZero(uint64_t vaddr, void* data, uint64_t size) {
+	static std::atomic<uint32_t> printed {0};
+	if (printed.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("Memory: GPU-thread read of null-region addr=0x%016" PRIx64 " size=0x%" PRIx64
+		     " reads zero\n",
+		     vaddr, size);
+	}
+	std::memset(data, 0, size);
+}
+
 void ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
+	if (InNullRegion(vaddr, size)) [[unlikely]] {
+		ReadNullRegionAsZero(vaddr, data, size);
+		return;
+	}
 	// A page holding GPU-written bytes is protected as a whole. Clean bytes on it come from the
 	// backing, so reading a game table that merely shares the page does not wait for a readback.
 	// The lock-free page hint keeps the common case a plain copy: a stale "clean" faults and
@@ -974,6 +997,9 @@ void ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
 }
 
 bool TryReadGuestPlainOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
+	if (InNullRegion(vaddr, size)) [[unlikely]] {
+		return false; // The exact reader (ReadGuestOnGpuThread) reads zero there.
+	}
 	if (size != 0 && g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread()) {
 		const auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.IsPageGpuDirtyHint(vaddr) || buffers.IsPageGpuDirtyHint(vaddr + size - 1)) {

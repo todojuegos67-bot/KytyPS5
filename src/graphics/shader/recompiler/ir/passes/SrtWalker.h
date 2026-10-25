@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <array>
+#include <cstring>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -49,6 +50,17 @@ struct SrtReadFlags {
 	uint32_t index = 0;
 	uint32_t clean = 0;
 };
+
+// The direct copy used when a runtime has no ordinary reader. Nothing is mapped below 64 KiB, so a
+// zero or tiny SRT base (an unbound pair, KytyPS5#1268) reads zero instead of faulting.
+inline void SrtCopyHostMemory(uint64_t address, std::span<uint32_t> values) {
+	constexpr uint64_t NullRegionEnd = 0x10000;
+	if (address < NullRegionEnd || address + values.size_bytes() < address) [[unlikely]] {
+		std::memset(values.data(), 0, values.size_bytes());
+		return;
+	}
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+}
 
 [[nodiscard]] inline void* SpecializationUserdata(const SrtRuntime& runtime) {
 	return runtime.specialization_userdata != nullptr ? runtime.specialization_userdata

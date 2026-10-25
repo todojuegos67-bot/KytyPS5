@@ -64,7 +64,7 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
 	} else {
-		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+		SrtCopyHostMemory(address, values);
 	}
 	capture.m_ranges.emplace_back(address, values.size_bytes());
 	return true;
@@ -595,7 +595,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		SrtCopyHostMemory(address, {&word, 1});
 	}
 	result = word;
 	return true;
@@ -1828,7 +1828,7 @@ bool SrtEvaluator::EvaluateRawRead(const ResourceNode& node, uint64_t& result) {
 			return false;
 		}
 	} else {
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		SrtCopyHostMemory(address, {&word, 1});
 	}
 	result = word;
 	return true;
@@ -2383,7 +2383,7 @@ bool SrtEvaluator::ReadFlatRun(const CompiledResourcePlan::FlatRun& run,
 				return false;
 			}
 		} else {
-			std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+			SrtCopyHostMemory(address, values);
 		}
 		done += static_cast<uint32_t>(count);
 	}
