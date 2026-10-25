@@ -1585,6 +1585,7 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 
 	*bytes_read = 0;
 	LibKernel::StallWatchNoteIo();
+	LibKernel::StallWatchNoteFileRead(host_path, static_cast<int64_t>(file_offset), size);
 	if (size == 0) {
 		return OK;
 	}

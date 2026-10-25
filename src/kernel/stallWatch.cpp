@@ -19,6 +19,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -41,6 +42,64 @@ constexpr size_t SlotCount = 1024;
 
 std::array<StallWatchSlot, SlotCount> g_slots;
 std::atomic<bool>                     g_enabled {true};
+
+// Files read, per window of FileWindowS seconds (the current and the previous one are printed).
+constexpr double FileWindowS = 30.0;
+struct FileReads {
+	uint64_t count       = 0;
+	uint64_t bytes       = 0;
+	int64_t  last_offset = 0;
+	uint64_t last_size   = 0;
+	uint64_t distinct    = 0; // Reads whose offset differed from the previous read's.
+};
+struct FileReadState {
+	std::mutex                                 mutex;
+	std::unordered_map<std::string, FileReads> current;
+	std::unordered_map<std::string, FileReads> previous;
+};
+FileReadState* const g_file_reads = new FileReadState; // (never destroyed, as g_ranges)
+
+void RotateFileReads() {
+	std::scoped_lock lock(g_file_reads->mutex);
+	g_file_reads->previous = std::move(g_file_reads->current);
+	g_file_reads->current.clear();
+}
+
+void DescribeFileReads(std::string* out) {
+	std::unordered_map<std::string, FileReads> merged;
+	{
+		std::scoped_lock lock(g_file_reads->mutex);
+		merged = g_file_reads->previous;
+		for (const auto& [path, reads]: g_file_reads->current) {
+			auto& m = merged[path];
+			m.count += reads.count;
+			m.bytes += reads.bytes;
+			m.distinct += reads.distinct;
+			m.last_offset = reads.last_offset;
+			m.last_size   = reads.last_size;
+		}
+	}
+	std::vector<std::pair<std::string, FileReads>> rows(merged.begin(), merged.end());
+	std::ranges::sort(rows, [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+	uint64_t total = 0;
+	for (const auto& row: rows) {
+		total += row.second.count;
+	}
+	char line[1024];
+	std::snprintf(line, sizeof(line),
+	              "STALLWATCH files read in the last %.0f-%.0f s: %" PRIu64 " reads of %zu files (most read first)\n",
+	              FileWindowS, FileWindowS * 2.0, total, rows.size());
+	*out += line;
+	for (size_t i = 0; i < rows.size() && i < 16; i++) {
+		const auto& [path, reads] = rows[i];
+		std::snprintf(line, sizeof(line),
+		              "STALLWATCH file %s: %" PRIu64 " reads, %.2f MB, %" PRIu64
+		              " at a new offset; last offset 0x%" PRIx64 " size 0x%" PRIx64 "\n",
+		              path.c_str(), reads.count, static_cast<double>(reads.bytes) / 1e6, reads.distinct,
+		              static_cast<uint64_t>(reads.last_offset), reads.last_size);
+		*out += line;
+	}
+}
 
 int64_t NowNs() {
 	return std::chrono::steady_clock::now().time_since_epoch().count();
@@ -266,6 +325,7 @@ void Dump(const char* reason, double seconds, double work_per_flip, double io_ag
 		out += "\n";
 	}
 	LibAmpr::DescribeStateForStallWatch(&out);
+	DescribeFileReads(&out);
 	std::fputs(out.c_str(), stdout);
 	std::fflush(stdout);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -291,8 +351,13 @@ void Run(double threshold_s) {
 	int64_t last_io_time   = 0;
 	uint64_t last_flips    = 0;
 	uint64_t last_io       = 0;
+	int64_t  file_window   = NowNs();
 	for (;;) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+		if (NowNs() - file_window >= static_cast<int64_t>(FileWindowS * 1e9)) {
+			file_window = NowNs();
+			RotateFileReads();
+		}
 		const Snapshot now {StallWatchCounters::g_flips.load(std::memory_order_relaxed),
 		                    StallWatchCounters::g_gpu_work.load(std::memory_order_relaxed),
 		                    StallWatchCounters::g_io.load(std::memory_order_relaxed), NowNs()};
@@ -358,6 +423,26 @@ void Run(double threshold_s) {
 }
 
 } // namespace
+
+void StallWatchNoteFileRead(const std::filesystem::path& path, int64_t offset, uint64_t size) noexcept {
+	if (!g_enabled.load(std::memory_order_relaxed)) {
+		return;
+	}
+	try {
+		auto             name = Common::PathToString(path);
+		std::scoped_lock lock(g_file_reads->mutex);
+		if (g_file_reads->current.size() >= 4096 && !g_file_reads->current.contains(name)) {
+			name = "(other files)";
+		}
+		auto& reads = g_file_reads->current[name];
+		reads.distinct += reads.count == 0 || reads.last_offset != offset ? 1 : 0;
+		reads.count++;
+		reads.bytes += size;
+		reads.last_offset = offset;
+		reads.last_size   = size;
+	} catch (...) {
+	}
+}
 
 void StallWatchRegisterThread(void* pthread, uint64_t host_tid, uint64_t /*stack_low*/,
                               uint64_t /*stack_high*/) noexcept {

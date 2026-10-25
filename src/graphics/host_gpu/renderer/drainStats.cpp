@@ -154,6 +154,7 @@ const char* ReasonName(Reason reason) {
 		case Reason::FaultBuffer: return "fault-buffer";
 		case Reason::PresentFrame: return "present-frame";
 		case Reason::EagerReadback: return "eager-readback";
+		case Reason::LinearImageReadback: return "linear-image";
 		case Reason::Count: break;
 	}
 	return "?";

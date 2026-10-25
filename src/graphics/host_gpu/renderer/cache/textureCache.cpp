@@ -2730,6 +2730,8 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		return false;
 	}
 	const auto range    = image.info.data;
+	// astro-sync-1025: image downloads in drain-stats' readback bytes too (they share the download ring).
+	DrainStats::Record(DrainStats::Kind::Readback, range.size);
 	auto&      staging  = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	auto [mapped, offset] =
 	    staging.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
@@ -3144,6 +3146,7 @@ bool TextureCache::CollectGarbage(bool pressure_only) {
 }
 
 void TextureCache::ProcessDownloadImages() {
+	DrainStats::ReasonScope reason(DrainStats::Reason::LinearImageReadback);
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {
 		const auto owner = m_slot_images.try_get(id);

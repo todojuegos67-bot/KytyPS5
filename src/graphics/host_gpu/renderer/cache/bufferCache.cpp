@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
+#include "local/ram-guard.h"
 
 #include <immintrin.h>
 #include <algorithm>
@@ -277,6 +278,26 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 // mostly by stalling the memory accesses after them; the GPU reads host copies about as fast (1%
 // more GPU time in the overworld, none measurable in Sky Garden). KYTY_DEBUG_STREAM_DEVICE=1
 // keeps the ring in device memory.
+// astro-sync-1025: the download ring (buffer readbacks, and every GPU-written linear image that
+// --readback-linear-images copies back each frame). At 64 MiB, Astro Bot's in-engine cinematics cycled it
+// within a frame: the next map waited for the copy just recorded (a submit and full drain) or one a few
+// submissions old, 2 full drains and ~2 tick waits a frame (log 10-25: ~8 ms a frame of 21 ms waiting on the
+// ring, the GPU idle 7.3 ms a frame meanwhile). Several frames of downloads fit in 512 MiB of host memory,
+// so a map waits only for copies the GPU finished long ago. Low-RAM profile: 128 MiB.
+// KYTY_DOWNLOAD_RING_MB=<n> (16-2048) sets it.
+static uint64_t DownloadRingSize() {
+	static const uint64_t size = [] {
+		uint64_t mb = RamGuard::LowRam() ? 128 : 512;
+		if (const char* value = std::getenv("KYTY_DOWNLOAD_RING_MB"); value != nullptr && *value != '\0') {
+			mb = std::clamp<uint64_t>(std::strtoull(value, nullptr, 10), 16, 2048);
+		}
+		std::printf("Download ring: %llu MiB (KYTY_DOWNLOAD_RING_MB)\n", static_cast<unsigned long long>(mb));
+		std::fflush(stdout);
+		return mb * MiB;
+	}();
+	return size;
+}
+
 static bool StreamRingInHostMemory() {
 	return std::getenv("KYTY_DEBUG_STREAM_DEVICE") == nullptr;
 }
@@ -291,7 +312,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB, {},
                       StreamRingInHostMemory()),
-      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
+      m_download_buffer(graphics, scheduler, MemoryUsage::Download, DownloadRingSize()),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_draw_record_buffer(graphics, scheduler, MemoryUsage::Stream, 4 * MiB,
                            vk::BufferUsageFlagBits::eShaderDeviceAddress),

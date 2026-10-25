@@ -32,6 +32,7 @@ enum class Reason : uint8_t {
 	FaultBuffer,
 	PresentFrame,
 	EagerReadback,
+	LinearImageReadback, // --readback-linear-images: a GPU-written linear image copied back after its frame.
 	Count,
 };
 

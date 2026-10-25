@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 
 namespace Libs::LibKernel {
@@ -120,6 +121,11 @@ inline void StallWatchNoteGpuWork() noexcept {
 inline void StallWatchNoteFlip() noexcept {
 	StallWatchCounters::g_flips.fetch_add(1, std::memory_order_relaxed);
 }
+// astro-sync-1025: which files are read (kernel reads and APR reads), for a dump's "files read" lines: a
+// loader stuck re-reading one file, or the stream that keeps the reads going while a load never finishes.
+// A short lock and a map update per read (reads are system calls); nothing when the watch is off.
+void StallWatchNoteFileRead(const std::filesystem::path& path, int64_t offset, uint64_t size) noexcept;
+
 inline uint64_t StallWatchNoteAmprRejected() noexcept {
 	return StallWatchCounters::g_ampr_rejected.fetch_add(1, std::memory_order_relaxed) + 1;
 }

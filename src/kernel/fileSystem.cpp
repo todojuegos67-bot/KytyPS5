@@ -658,6 +658,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 
 	bool       is_invalid = file->f.IsInvalid();
 	const auto pos        = file->f.Tell();
+	StallWatchNoteFileRead(file->real_name, static_cast<int64_t>(pos), nbytes);
 	const auto file_size  = file->f.Size();
 	const auto remaining  = pos < file_size ? file_size - pos : 0;
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
@@ -783,6 +784,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 
 	bool       is_invalid = file->f.IsInvalid();
 	auto       pos        = file->f.Tell();
+	StallWatchNoteFileRead(file->real_name, offset, nbytes);
 	const auto file_size  = file->f.Size();
 	const auto remaining =
 	    static_cast<uint64_t>(offset) < file_size ? file_size - static_cast<uint64_t>(offset) : 0;
@@ -874,6 +876,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 	if (file->f.IsInvalid()) {
 		return KERNEL_ERROR_EIO;
 	}
+	StallWatchNoteFileRead(file->real_name, offset, total);
 
 	const auto position  = file->f.Tell();
 	const auto file_size = file->f.Size();
