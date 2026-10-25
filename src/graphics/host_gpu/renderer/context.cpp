@@ -35,7 +35,10 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 
 CommandRecorder CommandBuffer::Recorder() const {
 	EXIT_IF(IsInvalid());
-	return m_threaded ? CommandRecorder(m_scheduler, nullptr) : CommandRecorder(m_buffer);
+	// The scheduler is passed in both modes so the GPU timers (KYTY_SHADER_GPU_TIME,
+	// KYTY_OP_GPU_TIME) also work when recording inline; Threaded() depends only on the buffer.
+	return m_threaded ? CommandRecorder(m_scheduler, nullptr)
+	                  : CommandRecorder(m_scheduler, m_buffer);
 }
 
 void CommandBuffer::Begin() {

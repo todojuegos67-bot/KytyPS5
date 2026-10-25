@@ -676,6 +676,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		const bool shader_time = CommandRecorder::ShaderTimeEnabled();
 		if (shader_time) {
+			CommandScheduler::NoteShape(program.shader_hash, 0, 0,
+			                            thread_group_x * thread_group_y * thread_group_z, 0, false);
 			vk_buffer.shaderTimeBegin(program.shader_hash, true);
 		}
 		DrawDiff::Note(program.shader_hash, 0, thread_group_x * thread_group_y * thread_group_z, 0, 2);

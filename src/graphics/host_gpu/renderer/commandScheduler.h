@@ -18,6 +18,7 @@
 #include <new>
 
 #include <queue>
+#include <string>
 
 #include <thread>
 #include <type_traits>
@@ -43,6 +44,18 @@ public:
 	// hash. Called on the thread that records the command buffer (CommandRecorder forwards it).
 	void ShaderTimeBegin(vk::CommandBuffer command, uint64_t hash, bool compute);
 	void ShaderTimeEnd(vk::CommandBuffer command);
+	// KYTY_OP_GPU_TIME (live, default 0): the same around copies, clears, barriers and
+	// dispatches recorded outside a shader tag, keyed by call site (OpSite).
+	void                      OpTimeBegin(vk::CommandBuffer command, uint32_t site, uint64_t bytes);
+	void                      OpTimeEnd(vk::CommandBuffer command);
+	[[nodiscard]] static bool OpTimeEnabled();
+	[[nodiscard]] static uint32_t    OpSite(const char* label, const std::source_location& where);
+	[[nodiscard]] static std::string OpSiteName(uint32_t site);
+	// With KYTY_SHADER_GPU_TIME: the last draw's render area and vertex/instance counts (or a
+	// dispatch's group count) per shader, printed next to the shader in the "GPU work" list.
+	static void NoteShape(uint64_t hash, uint32_t width, uint32_t height, uint32_t count,
+	                      uint32_t instances, bool pops);
+	[[nodiscard]] static std::string ShapeText(uint64_t hash);
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
