@@ -3606,11 +3606,13 @@ void AsVulkanImage(const UpscaleImage& in, VulkanImage& out) {
 	out.image  = in.image;
 }
 bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
-	VulkanImage color, depth, motion, output;
+	VulkanImage color, depth, motion, output, reactive;
 	AsVulkanImage(inputs.color, color);
 	AsVulkanImage(inputs.depth, depth);
 	AsVulkanImage(inputs.motion, motion);
 	AsVulkanImage(inputs.output, output);
+	const bool have_reactive = inputs.reactive.view != nullptr && inputs.reactive.image != nullptr; // (rtparticles)
+	if (have_reactive) AsVulkanImage(inputs.reactive, reactive);
 	const float fov = inputs.view_to_clip[5] != 0.0f ? 2.0f * std::atan(1.0f / std::fabs(inputs.view_to_clip[5])) : 1.0f;
 	bool done = false;
 	if (g_sr_kind == 2) {
@@ -3631,6 +3633,7 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		x.jitter[1]   = inputs.jitter_y;
 		x.mv_scale[0] = inputs.motion_scale_x;
 		x.mv_scale[1] = inputs.motion_scale_y;
+		if (have_reactive) x.mask = &reactive, x.mask_view = inputs.reactive.view;
 		done          = Xess::Upscale(x);
 	} else if (g_graphics_ctx != nullptr) {
 		static auto last = std::chrono::steady_clock::now();
@@ -3653,6 +3656,7 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		desc.mv_scale[1] = inputs.motion_scale_y;
 		desc.fov         = fov;
 		desc.z_near      = inputs.near_plane;
+		if (have_reactive) desc.reactive = &reactive;
 		done             = Fsr3::Upscale(*g_graphics_ctx, desc);
 	}
 	static bool said = false;
@@ -3816,14 +3820,20 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 	}
 	const sl::Extent render {0, 0, inputs.color.extent.width, inputs.color.extent.height};
 	const sl::Extent full {0, 0, inputs.output.extent.width, inputs.output.extent.height};
-	const sl::ResourceTag tags[] {
+	// (rtparticles) KYTY_RT_PARTICLES=2: the particle mask as DLSS's bias-current-color hint (trust the current frame
+	// where particles, drawn without motion vectors, are).
+	const bool have_reactive = inputs.reactive.view != nullptr && inputs.reactive.image != nullptr;
+	auto       reactive      = have_reactive ? resource(inputs.reactive) : sl::Resource {};
+	sl::ResourceTag tags[5] {
 	    sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
 	    sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &full),
 	    sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
 	    sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
+	    sl::ResourceTag(&reactive, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
 	};
+	const uint32_t tag_count = have_reactive ? 5u : 4u;
 	auto* command_buffer = reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(command));
-	if (const auto result = g_api.set_tag_for_frame(*token, viewport, tags, static_cast<uint32_t>(std::size(tags)), command_buffer);
+	if (const auto result = g_api.set_tag_for_frame(*token, viewport, tags, tag_count, command_buffer);
 	    result != sl::Result::eOk) {
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
@@ -3958,6 +3968,287 @@ void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float
 }
 } // namespace
 
+// ---- (rtparticles) KYTY_RT_PARTICLES: the particle pass's own emission for the RT "fire light", a reactive mask ----
+// How Demon's Souls draws particles (tools/local/static-precompile/files-PPSA01341_01.007.000.files, the engine's
+// coredata/enginesupport/shaders/_ps5/particle-*): 603 cooked particle compute shaders (one per emitter) simulate on
+// the GPU; particle-sort-prep / particle-sort (bitonic) order them; one engine pass, particle-translucent (main_vs +
+// 3 main_ps variants; ultralow / underwater / displacement / distortion / motionblur / fog / ui variants), draws them
+// blended onto the HDR scene color with the depth test on and depth writes off (they leave no depth, so the depth
+// buffer at a flame is the wall behind it); particle-lightmap-update lights them from the game's own lights;
+// particle-apply-distortion is a compute pass after them. The TAA / PS5 Pro super-resolution input (slot 1) is that
+// color after the pass: the SSGI emissive light already sees flames as bright pixels, but tells them from lit
+// surfaces only by lit-colour / G-buffer-albedo ratio and takes the whole pixel (flame + wall) as the radiance.
+//
+// Level 1 (KYTY_RT_PARTICLES=1): right before the frame's first blended, depth-write-off draw into the scene color
+// (the particle pass's first draw; KYTY_RT_PARTICLES_VS=<hex,...> pins the vertex shaders instead), the color is
+// copied (one render-size RGBA16F copy, ~0.05-0.1 ms on an RTX 5090 at 1440p, and a render-pass break). The SSGI
+// emissive light (ssgi.comp, binding 15) then takes color - copy, the particles' own emission, as the emitter
+// radiance: exact for additive particles (embers, sparks, flames, spell glow), alpha x (particle - background) for
+// alpha-blended ones; flames over bright lit surfaces are found too, lit stone is never a particle. Positions still
+// come from the depth buffer (the surface behind the flame): a particle depth would need the pass re-drawn with
+// depth writes, not done here.
+// Level 2 (KYTY_RT_PARTICLES=2): also an R8 reactive mask of that emission share (ssgi.comp mode 6, needs KYTY_SSGI
+// >= 1) for the upscaler: FSR 3.1's reactive + transparency-and-composition, XeSS's responsive pixels, DLSS's
+// bias-current-color hint - less ghosting / smearing of particles in the upscaler (frame generation takes no mask).
+// KYTY_RT_PARTICLES_REACTIVE (0..1, 0.8): the mask's strength.
+// KYTY_RT_PARTICLES_DEBUG=1: every 10 s the ordered passes of the last flip onto the scene color (draws by vertex /
+// pixel shader, blend, depth state, count; dispatches writing it; table / native-path draws), the copy's state, the
+// game's own reactive-mask slot (renderSuperResolution.cpp).
+namespace {
+struct RtPartCensusKey {
+	uint64_t vs = 0, ps = 0, address = 0;
+	uint32_t width = 0, height = 0;
+	int32_t  format = 0;
+	uint8_t  blend = 0, src = 0, dst = 0, comb = 0, zt = 0, zw = 0, indirect = 0, path = 0;
+	bool operator==(const RtPartCensusKey&) const = default;
+};
+uint64_t RtPartMix(uint64_t h, uint64_t v) {
+	h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+	return h * 0xff51afd7ed558ccdull;
+}
+struct RtPartCensusKeyHash {
+	size_t operator()(const RtPartCensusKey& k) const {
+		uint64_t h = RtPartMix(RtPartMix(RtPartMix(k.vs, k.ps), k.address), (uint64_t {k.width} << 32) | k.height);
+		h          = RtPartMix(h, static_cast<uint64_t>(static_cast<uint32_t>(k.format)));
+		h          = RtPartMix(h, uint64_t {k.blend} | (uint64_t {k.src} << 8) | (uint64_t {k.dst} << 16) | (uint64_t {k.comb} << 24) |
+		                              (uint64_t {k.zt} << 32) | (uint64_t {k.zw} << 40) | (uint64_t {k.indirect} << 48) | (uint64_t {k.path} << 56));
+		return static_cast<size_t>(h);
+	}
+};
+struct RtPartCensusEntry {
+	uint32_t order = 0, draws = 0, instances = 0, indices = 0;
+};
+struct RtPartDispatchKey {
+	uint64_t cs = 0, address = 0;
+	uint32_t width = 0, height = 0;
+	bool     operator==(const RtPartDispatchKey&) const = default;
+};
+struct RtPartDispatchKeyHash {
+	size_t operator()(const RtPartDispatchKey& k) const {
+		return static_cast<size_t>(RtPartMix(RtPartMix(k.cs, k.address), (uint64_t {k.width} << 32) | k.height));
+	}
+};
+struct RtPartState {
+	// The scene color images the upscaler read in the last flips (guest addresses; the game rotates them).
+	std::array<uint64_t, 4> colors {};
+	std::array<uint32_t, 4> color_w {}, color_h {};
+	uint32_t                color_next = 0;
+	// The pre-particle copy.
+	VulkanImage   pre;
+	vk::ImageView pre_view = nullptr;
+	uint64_t      pre_flip = UINT64_MAX, pre_address = 0;
+	bool          taken = false; // this flip
+	uint64_t      flip  = UINT64_MAX;
+	bool          resuming = false;
+	// Statistics: copies taken, flips with none, the copy's draw's shaders.
+	uint64_t copies = 0, flips_without = 0, uses = 0, misses = 0;
+	uint64_t copy_vs = 0, copy_ps = 0;
+	uint32_t copy_order = 0;
+	// Census (debug): the last flip's passes onto the scene color (and, in order, the first draw of each key).
+	std::unordered_map<RtPartCensusKey, RtPartCensusEntry, RtPartCensusKeyHash>       draws;
+	std::unordered_map<RtPartDispatchKey, RtPartCensusEntry, RtPartDispatchKeyHash>   dispatches;
+	uint32_t                                                                           order = 0;
+	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+};
+RtPartState g_rtpart;
+
+int RtParticlesLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_RT_PARTICLES");
+		return value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 2) : 0;
+	}();
+	return level;
+}
+bool RtPartColorKnown(uint64_t address, uint32_t width, uint32_t height, bool strict_size) {
+	for (uint32_t i = 0; i < g_rtpart.colors.size(); ++i)
+		if (g_rtpart.colors[i] != 0 && g_rtpart.colors[i] == address &&
+		    (!strict_size || (g_rtpart.color_w[i] == width && g_rtpart.color_h[i] == height)))
+			return true;
+	return false;
+}
+// A new flip: the census of the last one logged (every 10 s), everything reset.
+void RtPartNewFlip(uint64_t flip) {
+	if (g_rtpart.flip == flip) return;
+	if (g_rtpart.flip != UINT64_MAX && RtParticlesLevel() > 0 && !g_rtpart.taken) ++g_rtpart.flips_without;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_rtpart.last_log >= std::chrono::seconds(10) && g_rtpart.flip != UINT64_MAX) {
+		g_rtpart.last_log = now;
+		if (RtParticlesDebug()) {
+			std::vector<std::pair<RtPartCensusKey, RtPartCensusEntry>> list(g_rtpart.draws.begin(), g_rtpart.draws.end());
+			std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a.second.order < b.second.order; });
+			std::printf("RT particles census (flip %llu): %zu draw groups onto the upscaler's color images, %zu storage dispatches; "
+			            "copy taken %s (VS %016llx PS %016llx, pass #%u); %llu copies, %llu flips without, SSGI used %llu / missed %llu\n",
+			            static_cast<unsigned long long>(g_rtpart.flip), list.size(), g_rtpart.dispatches.size(),
+			            g_rtpart.taken ? "yes" : "no", static_cast<unsigned long long>(g_rtpart.copy_vs),
+			            static_cast<unsigned long long>(g_rtpart.copy_ps), g_rtpart.copy_order, static_cast<unsigned long long>(g_rtpart.copies),
+			            static_cast<unsigned long long>(g_rtpart.flips_without), static_cast<unsigned long long>(g_rtpart.uses),
+			            static_cast<unsigned long long>(g_rtpart.misses));
+			uint32_t shown = 0;
+			for (const auto& [k, e]: list) {
+				if (shown++ >= 48) break;
+				const char* path = k.path == 1 ? "table" : k.path == 2 ? "native" : "normal";
+				std::printf("  #%-3u %-6s VS %016llx PS %016llx -> 0x%llx %ux%u fmt %d %s%s%s: %u draws, %u inst, %u idx\n", e.order, path,
+				            static_cast<unsigned long long>(k.vs), static_cast<unsigned long long>(k.ps), static_cast<unsigned long long>(k.address),
+				            k.width, k.height, k.format, k.blend ? "blend" : "opaque", k.zw ? " zwrite" : (k.zt ? " ztest" : " nodepth"),
+				            k.indirect ? " indirect" : "", e.draws, e.instances, e.indices);
+				if (k.blend)
+					std::printf("        blend src %u dst %u fn %u\n", k.src, k.dst, k.comb);
+			}
+			std::vector<std::pair<RtPartDispatchKey, RtPartCensusEntry>> ds(g_rtpart.dispatches.begin(), g_rtpart.dispatches.end());
+			std::sort(ds.begin(), ds.end(), [](const auto& a, const auto& b) { return a.second.order < b.second.order; });
+			shown = 0;
+			for (const auto& [k, e]: ds) {
+				if (shown++ >= 24) break;
+				std::printf("  #%-3u CS %016llx writes 0x%llx %ux%u: %u dispatches\n", e.order, static_cast<unsigned long long>(k.cs),
+				            static_cast<unsigned long long>(k.address), k.width, k.height, e.draws);
+			}
+			std::fflush(stdout);
+		} else if (RtParticlesLevel() > 0) {
+			std::printf("RT particles: %llu pre-particle copies, %llu flips without one, SSGI used %llu / missed %llu (copy at VS %016llx PS %016llx)\n",
+			            static_cast<unsigned long long>(g_rtpart.copies), static_cast<unsigned long long>(g_rtpart.flips_without),
+			            static_cast<unsigned long long>(g_rtpart.uses), static_cast<unsigned long long>(g_rtpart.misses),
+			            static_cast<unsigned long long>(g_rtpart.copy_vs), static_cast<unsigned long long>(g_rtpart.copy_ps));
+			std::fflush(stdout);
+		}
+	}
+	g_rtpart.flip  = flip;
+	g_rtpart.taken = false;
+	g_rtpart.order = 0;
+	g_rtpart.draws.clear();
+	g_rtpart.dispatches.clear();
+}
+// The upscaler's color this frame (Upscale): remembered so the next frames' draws into it are known.
+void RtPartNoteColor(uint64_t address, vk::Extent2D extent) {
+	if (address == 0) return;
+	for (uint32_t i = 0; i < g_rtpart.colors.size(); ++i)
+		if (g_rtpart.colors[i] == address) {
+			g_rtpart.color_w[i] = extent.width, g_rtpart.color_h[i] = extent.height;
+			return;
+		}
+	const uint32_t at    = g_rtpart.color_next++ % g_rtpart.colors.size();
+	g_rtpart.colors[at]  = address;
+	g_rtpart.color_w[at] = extent.width;
+	g_rtpart.color_h[at] = extent.height;
+}
+// Level >= 1 and the copy of this flip's scene color exists and is the upscaler's color: its view (else null).
+vk::ImageView RtPartPreView(uint64_t color_address, vk::Extent2D extent) {
+	if (RtParticlesLevel() == 0) return nullptr;
+	const bool ok = g_rtpart.taken && g_rtpart.pre_view != nullptr && g_rtpart.pre_address == color_address &&
+	                g_rtpart.pre_flip == GuestFlips() && g_rtpart.pre.extent.width == extent.width &&
+	                g_rtpart.pre.extent.height == extent.height;
+	if (ok) ++g_rtpart.uses;
+	else ++g_rtpart.misses;
+	return ok ? g_rtpart.pre_view : nullptr;
+}
+} // namespace
+
+bool RtParticlesDebug() {
+	static const bool debug = [] {
+		const char* value = std::getenv("KYTY_RT_PARTICLES_DEBUG");
+		return value != nullptr && *value == '1';
+	}();
+	return debug;
+}
+bool RtParticlesWanted() { return RtParticlesLevel() > 0 || RtParticlesDebug(); }
+
+void NoteSceneDispatch(uint64_t cs_hash, uint64_t address, uint32_t width, uint32_t height) {
+	if (!RtParticlesDebug() || !RtPartColorKnown(address, width, height, false)) return;
+	RtPartNewFlip(GuestFlips());
+	auto& e = g_rtpart.dispatches[RtPartDispatchKey {cs_hash, address, width, height}];
+	if (e.draws == 0) e.order = ++g_rtpart.order;
+	++e.draws;
+}
+void NoteOtherPathDraw(uint64_t address, uint64_t vs, bool blend, int path) {
+	if (!RtParticlesDebug() || !RtPartColorKnown(address, 0, 0, false)) return;
+	RtPartNewFlip(GuestFlips());
+	RtPartCensusKey key;
+	key.vs = vs, key.address = address, key.blend = blend ? 1 : 0, key.path = static_cast<uint8_t>(path);
+	auto& e = g_rtpart.draws[key];
+	if (e.draws == 0) e.order = ++g_rtpart.order;
+	++e.draws;
+}
+void BeforeSceneDraw(CommandBuffer& command, TextureCache& cache, const RenderState& rendering, vk::ImageLayout layout,
+                     const SceneDraw& draw) {
+	if (g_rtpart.resuming || !RtParticlesWanted()) return;
+	// Only the images the upscaler reads (the scene color, one of a few the game rotates), at their size.
+	if (!RtPartColorKnown(draw.address, draw.width, draw.height, true)) return;
+	RtPartNewFlip(GuestFlips());
+	if (RtParticlesDebug()) {
+		RtPartCensusKey key;
+		key.vs = draw.vs, key.ps = draw.ps, key.address = draw.address, key.width = draw.width, key.height = draw.height;
+		key.format = draw.format, key.blend = draw.blend ? 1 : 0, key.src = draw.src_blend, key.dst = draw.dst_blend;
+		key.comb = draw.comb, key.zt = draw.depth_test ? 1 : 0, key.zw = draw.depth_write ? 1 : 0, key.indirect = draw.indirect ? 1 : 0;
+		auto& e = g_rtpart.draws[key];
+		if (e.draws == 0) e.order = ++g_rtpart.order;
+		++e.draws;
+		e.instances += draw.instances;
+		e.indices += draw.index_count;
+	}
+	if (RtParticlesLevel() == 0 || g_rtpart.taken) return;
+	// The particle pass's first draw: blended, depth test on, depth writes off (KYTY_RT_PARTICLES_VS pins the shaders).
+	static const std::vector<uint64_t> pinned = [] {
+		std::vector<uint64_t> out;
+		if (const char* v = std::getenv("KYTY_RT_PARTICLES_VS"); v != nullptr)
+			for (const char* at = v; *at != '\0';) {
+				char*                    end = nullptr;
+				const unsigned long long h   = std::strtoull(at, &end, 16);
+				if (end == at) break;
+				if (h != 0) out.push_back(h);
+				if (*end != ',' && *end != ';') break;
+				at = end + 1;
+			}
+		return out;
+	}();
+	// (KYTY_RT_PARTICLES_ANYDEPTH=1: a blended draw without the depth test counts too - a pass that fades its particles
+	// against a sampled depth instead of testing it.)
+	static const bool any_depth = [] {
+		const char* v = std::getenv("KYTY_RT_PARTICLES_ANYDEPTH");
+		return v != nullptr && *v == '1';
+	}();
+	const bool particle = pinned.empty() ? (draw.blend && !draw.depth_write && (draw.depth_test || any_depth))
+	                                     : std::find(pinned.begin(), pinned.end(), draw.vs) != pinned.end();
+	if (!particle) return;
+	auto& image = cache.GetImage(draw.target);
+	if (image.backing.image == nullptr || image.info.data.address != draw.address) return;
+	if (image.backing.extent.width != draw.width || image.backing.extent.height != draw.height) return;
+	if (image.backing.format != vk::Format::eR16G16B16A16Sfloat) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("RT particles: the scene color is not RGBA16F (format %d): no pre-particle copy\n",
+			            static_cast<int>(image.backing.format));
+			std::fflush(stdout);
+		}
+		return;
+	}
+	auto& graphics = command.GetGraphics();
+	ConfigureAs(graphics, g_rtpart.pre, g_rtpart.pre_view, image.backing.format, image.backing.extent);
+	command.EndRendering();
+	const auto vk_command = command.Handle();
+	CopyInto(vk_command, image, g_rtpart.pre); // (leaves the copy in SHADER_READ_ONLY_OPTIMAL)
+	image.Transit(layout, vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite, {}, vk_command);
+	g_rtpart.resuming = true;
+	command.ResumeRendering(rendering);
+	g_rtpart.resuming    = false;
+	g_rtpart.taken       = true;
+	g_rtpart.pre_flip    = g_rtpart.flip;
+	g_rtpart.pre_address = draw.address;
+	g_rtpart.copy_vs     = draw.vs;
+	g_rtpart.copy_ps     = draw.ps;
+	g_rtpart.copy_order  = g_rtpart.order;
+	++g_rtpart.copies;
+	static bool said = false;
+	if (!said) {
+		said = true;
+		std::printf("RT particles: level %d: the scene color (0x%llx, %ux%u) copied before its first blended depth-write-off draw "
+		            "(VS %016llx PS %016llx, blend src %u dst %u fn %u)%s\n",
+		            RtParticlesLevel(), static_cast<unsigned long long>(draw.address), draw.width, draw.height,
+		            static_cast<unsigned long long>(draw.vs), static_cast<unsigned long long>(draw.ps), draw.src_blend, draw.dst_blend,
+		            draw.comb, pinned.empty() ? "" : " (KYTY_RT_PARTICLES_VS)");
+		std::fflush(stdout);
+	}
+}
+
 namespace {
 // KYTY_SSGI=0|1|2 (ssgi.comp): screen-space ray-traced GI + AO on the PS5 Pro path's render-resolution color, recorded
 // right before the upscaler (DLSS / XeSS / FSR), which then reads our composited copy in place of the game's color, so
@@ -3990,6 +4281,8 @@ struct SsgiPass {
 	// (rtfire) Emissive light: its trace output, temporal/a-trous ping-pong, history and moments (trace res; only
 	// when KYTY_SSGI_EMISSIVE > 0), the light list + counters, their host copies (a ring of 4), a 1x1 R32_UINT stand-in.
 	SsgiImage               emi_raw, emi_tmp, emi_hist[2], emi_mom[2];
+	SsgiImage               reactive; // (rtparticles) KYTY_RT_PARTICLES=2: the particle reactive mask (R8_UNORM, render size)
+	bool                    reactive_failed = false;
 	VkBuffer                lights = VK_NULL_HANDLE, readback = VK_NULL_HANDLE;
 	VmaAllocation           lights_mem = VK_NULL_HANDLE, readback_mem = VK_NULL_HANDLE;
 	const uint32_t*         readback_map = nullptr;
@@ -4030,10 +4323,11 @@ static_assert(sizeof(SsgiPushE) == 128);
 constexpr uint32_t SsgiCells       = 32 * 18;
 constexpr uint32_t SsgiLightsBytes = 64 + SsgiCells * 4 + SsgiCells * 48; // hdr[16], list, 3 vec4 a cell
 constexpr uint32_t SsgiStatWords   = 8;
-constexpr uint32_t SsgiBindings    = 15;
+// (rtparticles) 15 the pre-particle scene color (sampled), 16 the reactive mask (R8 storage).
+constexpr uint32_t SsgiBindings    = 17;
 vk::DescriptorType SsgiDescType(uint32_t i) {
 	if (i == 13 || i == 14) return vk::DescriptorType::eStorageBuffer;
-	if (i == 7 || i == 8 || i == 10) return vk::DescriptorType::eStorageImage;
+	if (i == 7 || i == 8 || i == 10 || i == 16) return vk::DescriptorType::eStorageImage;
 	return vk::DescriptorType::eCombinedImageSampler;
 }
 
@@ -4130,13 +4424,14 @@ void SsgiEmisStats(bool have_gbuf) {
 	g_ssgi.em_last_log = now;
 }
 
-bool SsgiMakeImage(GraphicContext& graphics, SsgiImage& img, vk::Extent2D extent) {
+bool SsgiMakeImage(GraphicContext& graphics, SsgiImage& img, vk::Extent2D extent,
+                   vk::Format format = vk::Format::eR16G16B16A16Sfloat) {
 	vk::ImageCreateInfo create {};
 	create.imageType     = vk::ImageType::e2D;
 	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
 	create.mipLevels     = 1;
 	create.arrayLayers   = 1;
-	create.format        = vk::Format::eR16G16B16A16Sfloat;
+	create.format        = format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
 	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
@@ -4150,7 +4445,7 @@ bool SsgiMakeImage(GraphicContext& graphics, SsgiImage& img, vk::Extent2D extent
 	vk::ImageViewCreateInfo view_info {};
 	view_info.image            = img.image.image;
 	view_info.viewType         = vk::ImageViewType::e2D;
-	view_info.format           = vk::Format::eR16G16B16A16Sfloat;
+	view_info.format           = format;
 	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
 	if (graphics.device.createImageView(&view_info, nullptr, &img.view) != vk::Result::eSuccess) return false;
 	img.image.state = {};
@@ -4231,6 +4526,7 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		SsgiFreeImage(graphics, *img);
 	for (auto* img : SsgiEmisAll())
 		SsgiFreeImage(graphics, *img);
+	SsgiFreeImage(graphics, g_ssgi.reactive);
 	const vk::Extent2D trace = quality >= 2 ? render : vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
 	bool ok = SsgiMakeImage(graphics, g_ssgi.out, render);
 	for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.history[0], &g_ssgi.history[1], &g_ssgi.gbuf[0], &g_ssgi.gbuf[1],
@@ -4249,7 +4545,15 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 			std::fflush(stdout);
 		}
 	}
+	// (rtparticles) The reactive mask (level 2); without it the level stays 1.
+	if (ok && RtParticlesLevel() >= 2 && !g_ssgi.reactive_failed && !SsgiMakeImage(graphics, g_ssgi.reactive, render, vk::Format::eR8Unorm)) {
+		SsgiFreeImage(graphics, g_ssgi.reactive);
+		g_ssgi.reactive_failed = true;
+		std::printf("RT particles: no reactive mask (its image could not be created): level 1\n");
+		std::fflush(stdout);
+	}
 	if (!ok) {
+		SsgiFreeImage(graphics, g_ssgi.reactive);
 		for (auto* img : SsgiEmisAll())
 			SsgiFreeImage(graphics, *img);
 		for (auto* img : SsgiAll())
@@ -4347,13 +4651,29 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const float   em_ratio = SsgiEnv("KYTY_SSGI_EMISSIVE_RATIO", 12.0f, 1000.0f);
 	const float   em_range = std::max(SsgiEnv("KYTY_SSGI_EMISSIVE_RANGE", 8.0f, 50.0f), 0.5f);
 	static const int em_view = static_cast<int>(SsgiEnv("KYTY_SSGI_EMISSIVE_VIEW", 0.0f, 2.0f));
+	// (rtparticles) The pre-particle copy of this flip's scene color: the emitters' radiance is color - copy (flag 4);
+	// level 2 also writes the reactive mask (mode 6) the upscaler takes.
+	const vk::ImageView pre      = RtPartPreView(inputs.color_address, color.extent);
+	const bool          reactive = pre != nullptr && RtParticlesLevel() >= 2 && g_ssgi.reactive.view != nullptr;
+	static const float  reactive_strength = SsgiEnv("KYTY_RT_PARTICLES_REACTIVE", 0.8f, 1.0f);
+	push.extra[3]                         = reactive_strength;
 	if (emissive) {
 		// (3: the internal gain over the physical L x A x cos x cos / d^2: game flames are far dimmer than real fire)
 		push.emis[0] = SsgiEmissive() * 3.0f, push.emis[1] = std::max(em_lum, 0.05f), push.emis[2] = std::max(em_ratio, 1.0f);
 		push.emis[3]  = em_range;
-		push.emisc[0] = 1 | (have_albedo ? 2 : 0);
+		push.emisc[0] = 1 | (have_albedo ? 2 : 0) | (pre != nullptr ? 4 : 0);
 		push.emisc[1] = game_exposure ? static_cast<int32_t>(inputs.exposure_index) : 1;
 		push.emisc[2] = em_view;
+	}
+	if (pre != nullptr) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("RT particles: the SSGI %s takes the particles' own emission (level %d%s)\n",
+			            emissive ? "emissive light" : "pass (emissive light off: KYTY_SSGI_EMISSIVE=0 or quality 1)", RtParticlesLevel(),
+			            reactive ? ", reactive mask on" : RtParticlesLevel() >= 2 ? ", reactive mask off: no image" : "");
+			std::fflush(stdout);
+		}
 	}
 	{
 		static bool said = false;
@@ -4465,6 +4785,11 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		infos[11] = {lin, emissive ? g_ssgi.emi_tmp.view : a.view, vk::ImageLayout::eGeneral};
 		infos[12] = have_albedo ? vk::DescriptorImageInfo {pt, gbuf.views[0], vk::ImageLayout::eShaderReadOnlyOptimal}
 		                        : vk::DescriptorImageInfo {pt, g_ssgi.dummy_view, vk::ImageLayout::eGeneral};
+		// (rtparticles) 15 the pre-particle color (the color itself when there is none: read only with flag 4 / mode 6),
+		// 16 the reactive mask (a storage stand-in otherwise; written only by mode 6).
+		infos[15] = pre != nullptr ? vk::DescriptorImageInfo {pt, pre, vk::ImageLayout::eShaderReadOnlyOptimal}
+		                           : vk::DescriptorImageInfo {pt, color.view, color.layout};
+		infos[16] = {nullptr, reactive ? g_ssgi.reactive.view : out.view, vk::ImageLayout::eGeneral};
 		const vk::DescriptorBufferInfo lights_info {vk::Buffer(g_ssgi.lights), 0, VK_WHOLE_SIZE};
 		const vk::DescriptorBufferInfo exposure_info =
 		    emissive && game_exposure ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range}
@@ -4473,7 +4798,7 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		uint32_t               bound = 0;
 		for (uint32_t i = 0; i < SsgiBindings; ++i) {
 			// (emissive off: its bindings stay unwritten; the shader reads them only when push.emisc says it is on)
-			if (i >= 12 && !emissive) continue;
+			if (i >= 12 && i <= 14 && !emissive) continue;
 			auto& w           = writes[bound++];
 			w.dstBinding      = i;
 			w.descriptorCount = 1;
@@ -4527,6 +4852,20 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	aux_in = &g_ssgi.var_a, aux_out = &g_ssgi.var_b;
 	run(4, *final_gi, g_ssgi.gihist[prev], g_ssgi.out, g_ssgi.gihist[cur], 0.0f, g_ssgi.render);
+	if (reactive) {
+		// (rtparticles) The reactive mask from the particle emission share -> g_ssgi.reactive, left for the upscaler.
+		Transition(command, g_ssgi.reactive.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+		run(6, *final_gi, g_ssgi.gihist[prev], g_ssgi.raw, g_ssgi.raw, 0.0f, g_ssgi.render);
+		Transition(command, g_ssgi.reactive.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+		inputs.reactive.image  = g_ssgi.reactive.image.image;
+		inputs.reactive.view   = g_ssgi.reactive.view;
+		inputs.reactive.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+		inputs.reactive.format = vk::Format::eR8Unorm;
+		inputs.reactive.extent = g_ssgi.render;
+		inputs.reactive.usage  = g_ssgi.reactive.image.usage;
+	}
 	// The composite's writes before the upscaler reads.
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
@@ -8448,6 +8787,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	UpscaleInputs inputs = inputs_in;
 	// (The DLSS-G hudless path sets the context in PrepareInputs; the PS5 Pro path alone needs the renderer's.)
 	if (g_graphics_ctx == nullptr && inputs.graphics != nullptr) g_graphics_ctx = inputs.graphics;
+	RtPartNoteColor(inputs.color_address, inputs.color.extent); // (rtparticles: the scene color the draws are matched to)
 	CShadowApply(command, inputs); // (KYTY_RT_SHADOWS: direct-sun shadows first; inputs.color becomes the composited copy)
 	SsgiApply(command, inputs); // (KYTY_SSGI: likewise; nothing when off)
 	GtaoApply(command, inputs); // (KYTY_GTAO: likewise, after SSGI; nothing when off)

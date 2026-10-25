@@ -1088,6 +1088,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	if (FrameGen::IsTaaShader(program.shader_hash)) FrameGen::NoteScene(); // (the game's 3D view)
 	FrameGen::NoteShader(program.shader_hash, 'c');
+	if (FrameGen::RtParticlesDebug()) {
+		// (rtparticles census: the dispatches writing a storage image, matched to the scene color there.)
+		for (size_t i = 0; i < bindings.images.size() && i < program.info.images.size(); ++i) {
+			const auto& info = bindings.images[i].desc.info;
+			if (program.info.images[i].written && !info.data.Empty())
+				FrameGen::NoteSceneDispatch(program.shader_hash, info.data.address, info.extent.width, info.extent.height);
+		}
+	}
 	if (FrameGen::SsrWanted() && !bindings.images.empty()) {
 		// (KYTY_SSR, logging only: a dispatch reading the G-buffer targets, the deferred lighting.)
 		std::array<uint64_t, 32>   addresses {};

@@ -414,6 +414,26 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 	inputs.near_plane = Word(packet, NearWord);
 	inputs.far_plane  = Word(packet, FarWord);
 	inputs.graphics   = &m_context.GetGraphics();
+	// (rtparticles) The color's guest address (the pre-particle copy is matched to it); with KYTY_RT_PARTICLES_DEBUG the
+	// game's own reactive mask slot (6), as it describes it, once.
+	inputs.color_address = bindings[0].desc.info.data.address;
+	if (FrameGen::RtParticlesDebug()) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			constexpr uint32_t    slot_reactive = 6;
+			ShaderTextureResource reactive {};
+			std::memcpy(reactive.fields, packet.textures[slot_reactive], sizeof(reactive.fields));
+			if ((packet.textures_given & (1u << slot_reactive)) != 0 && !reactive.IsNull())
+				std::printf("RT particles: the game's super-resolution reactive mask: slot 6 at 0x%" PRIx64 ", %ux%u, format %u, type %u\n",
+				            reactive.Base40(), static_cast<uint32_t>(reactive.Width5()) + 1u, static_cast<uint32_t>(reactive.Height5()) + 1u,
+				            static_cast<uint32_t>(reactive.Format()), static_cast<uint32_t>(reactive.Type()));
+			else
+				std::printf("RT particles: the game's super-resolution packet gives no reactive mask (slot 6: given 0x%x)\n",
+				            packet.textures_given);
+			std::fflush(stdout);
+		}
+	}
 	// The exposure: the float the 1x1 32-bit float texture of slot 5 holds (the game's constants), read as a buffer.
 	ShaderTextureResource exposure_texture {};
 	std::memcpy(exposure_texture.fields, packet.textures[SlotExposure], sizeof(exposure_texture.fields));
