@@ -527,3 +527,28 @@ GPU 碰撞只给脚部 IK：`GpuCollisionManager::CastRay` 全镜像唯一调用
 - User: with the game's TAA the image is fine; without it (sin TAA) whole scenes are darker in some zones.
 - TAA shader a44e580f4f0cfb2b (dumped with KYTY_SHADER_DUMP): works in tonemapped space (c/(1+luma 0.3/0.59/0.11), inverse at the end); multiplies the history (5-tap bicubic of the previous output) by a constant (S_BUFFER_LOAD offset 24 of the buffer at s30+240), likely an exposure ratio. Steady state out = w*cur/(1-(1-w)K): brighter than the raw frame when K > 1. Skipping the TAA loses it.
 - Next: log that constant per frame in those zones; then apply the same factor before the upscaler. Also a bug found: DlssUpscale passes jitter 0 (meant for the TAA's resolved output), but with KYTY_TAA_REPLACE=upscaler the input is the raw jittered frame: it needs the camera jitter like the TAA path.
+
+## 2026-10-25 — RAM flush ("Vaciado RAM"): where the memory goes, what a flush can return (ramflush-1025)
+- Figures from the user's 64 GB / RTX 5090 log of 10-24 21:23 (c646a54, no flush): process private 12.2 GiB, working set
+  15.6 GiB, guest store 13824 MiB all committed (SEC_COMMIT; the game maps ~11.3 GiB), video memory in use 6.1 GiB (VMA
+  device-local 5.2, driver 0.9), Vulkan host memory 1.3 GiB, buffer cache 1.4-1.5 GiB registered, ~5.9K pipelines alive
+  (~220 KB of driver RAM each: ~1.3 GB). System: 29-35 GiB in use, commit 43-53 of 68 GiB; the emulator's own share is
+  ~15.6 GiB of RAM and ~26 GiB of commit (12.2 private + 13.8 store). The overlay's "RAM x / 64, Commit y / 68" are the
+  PC's figures, not the process's: the flush line now prints both.
+- Private bytes are mostly not RAM: NVIDIA's driver charges every device-local allocation to the process's commit (a 7.8 GB
+  video-memory ballast grew the private bytes 8.2 GB, 10-24): ~5-6 GiB of the 12.2 are the video memory in use. The
+  "Private breakdown" line showed 8.2 GiB in ~1600 allocations of 1-64 MiB (the driver's) and 3 GiB in >= 64 MiB blocks.
+- What a pass can decommit for real is small while the game plays: freed images kept for reuse (0.2-0.3 GiB), VMA free
+  blocks (0.2), idle scratch, heap free blocks; guest memory the game released is dropped (DiscardVirtualMemory: RAM, not
+  commit - a page-file section's pages cannot be decommitted; only a store of many sections, each closed and made again
+  when wholly free, could return that commit: not done, the "guest store free" census figure says what it would be worth).
+- So the flush option now turns on what lowers the held memory all along (ApplyFlushDefaults, ram-guard.h):
+  KYTY_BACKING_ON_DEMAND=1 (-2.2..2.5 GiB of commit: the 16 GB default since 10-23), KYTY_RAM_DIET=1 (pipelines idle
+  180 s: ~0.5-1.3 GB of RAM+commit after a world change), KYTY_SOFT_RELEASE=1; level 2 (KYTY_RAM_FLUSH_LEVEL=2) adds
+  KYTY_TEXTURE_OFFLOAD=1 (0.8-2 GB of RAM measured on a 5090, 10-20) and images idle 120 s out of video memory
+  (KYTY_RAM_FLUSH_IMAGE_IDLE_SECONDS: commit on NVIDIA, re-uploads on return). Rejected again: any working-set trim
+  (EmptyWorkingSet / SetProcessWorkingSetSize / VirtualUnlock: paging, 0x1A bug checks); KYTY_RAM_FLUSH_TRIM stays opt-in.
+- Expected on the user's PC: commit -3..4.5 GiB (store 2.5, pipelines 0.5-1.3, pools 0.3-0.5, idle images at level 2
+  up to the idle share of the 5 GiB of images), RAM -1..3 GB (offload, pipelines, freed guest pages). More than that
+  is the game's live data: not returnable without paging it out. Verify with "RAM flush #N" (PC: RAM in use / commit
+  before -> after) and "RAM census" lines.

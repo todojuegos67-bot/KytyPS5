@@ -2526,7 +2526,9 @@ void PipelineCache::EvictIdlePipelines() {
 	for (auto& [key, pipeline]: m_graphics_pipelines) evict(*pipeline);
 	for (auto& [id, pipeline]: m_compute_pipelines) evict(*pipeline);
 	if (scene_left && evicted < MaxEvictions) m_scene_swept = true;
-	if (ram_pressure != 0 && evicted != 0) RamGuard::NoteReleased(RamGuard::Pipelines, evicted, evicted * RamDietPipelineBytes);
+	// (Counted for the RAM guard's lines: the pressure response's, and the RAM diet's for the periodic flush's "owners".)
+	if ((ram_pressure != 0 || RamDietEnabled()) && evicted != 0)
+		RamGuard::NoteReleased(RamGuard::Pipelines, evicted, evicted * RamDietPipelineBytes);
 	g_pipeline_evictions.scene.fetch_add(left, std::memory_order_relaxed);
 	if (scene_left && m_scene_swept) {
 		std::printf("Pipelines of the worlds left (%s for %lld s): %llu evicted in all, %llu made again (%.0f ms)\n",
@@ -2686,6 +2688,14 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	LiveCounters::g_objects_report = [](uint64_t id) {
 		if (g_live_pipeline_cache != nullptr) g_live_pipeline_cache->ReportObjects(id);
 	};
+	// The RAM census (ram-guard.h): the store's pipelines holding a driver handle (kept, less evicted, plus made again),
+	// at the ~220 KB of the driver's RAM and commit each that the RAM diet counts (KYTY_RAM_DIET evicts those idle 180 s).
+	RamGuard::RegisterFigure("driver pipelines from the store with handles (~220 KB each)", [] {
+		const auto kept    = g_pipeline_evictions.kept.load(std::memory_order_relaxed);
+		const auto evicted = g_pipeline_evictions.evicted.load(std::memory_order_relaxed);
+		const auto remade  = g_pipeline_evictions.remade.load(std::memory_order_relaxed);
+		return (kept + remade - std::min(kept + remade, evicted)) * RamDietPipelineBytes;
+	});
 	m_program_cache->push_job = [this](std::function<void()> job) { TableWorkers().Push(std::move(job)); };
 	// (The static store first: whether it is there sets how much of the driver caches is loaded.)
 	StartupProgress::Report("Loading the pipeline cache", 0, 0);
