@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -22,6 +23,13 @@ class CommandBuffer;
 class CommandScheduler;
 struct StreamBufferTestAccess;
 struct GraphicContext;
+
+// KYTY_REBAR_STAGING=1: the next MemoryUsage::Upload buffer this thread makes goes in video memory the CPU writes
+// (DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT, a heap over 256 MiB: Resizable BAR) when the video memory budget has
+// room for it plus KYTY_REBAR_MARGIN_MB (512); otherwise, or when that fails, in system memory as before. Only for rings
+// the CPU only writes (BAR reads are uncached). TakeRebarReport: what the requests got, for one start-up line.
+void        RequestRebarPlacement(const char* name);
+std::string TakeRebarReport();
 
 enum class MemoryUsage : uint8_t {
 	DeviceLocal,

@@ -1504,17 +1504,24 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_lod_stats_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, 256 * 16),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, StagingRingSize(),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, (RequestRebarPlacement("image upload ring"), StagingRingSize()),
                        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-      m_host_shader_upload(graphics, scheduler, MemoryUsage::Upload, 64 * MiB),
-      m_table_upload(graphics, scheduler, MemoryUsage::Upload, 32 * MiB,
+      m_host_shader_upload(graphics, scheduler, MemoryUsage::Upload, (RequestRebarPlacement("shader upload ring"), 64 * MiB)),
+      m_table_upload(graphics, scheduler, MemoryUsage::Upload, (RequestRebarPlacement("table upload ring"), 32 * MiB),
                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_staging_device(graphics, scheduler, MemoryUsage::Stream, 64 * MiB,
                        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache), m_resources(resources) {
+	RequestRebarPlacement(nullptr);
+	if (const auto report = TakeRebarReport(); !report.empty()) {
+		std::printf("[rebar] KYTY_REBAR_STAGING: %s\n", report.c_str());
+		std::fflush(stdout);
+	} else if (const char* value = std::getenv("KYTY_REBAR_STAGING"); value != nullptr && value[0] == '1') {
+		std::printf("[rebar] KYTY_REBAR_STAGING: no ring requested\n");
+	}
 	{
 		const auto usage = PageTableUsage(graphics);
 		m_bda_tables.push_back(
