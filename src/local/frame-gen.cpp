@@ -4407,7 +4407,7 @@ const GtaoSoConfig& GtaoSo() {
 }
 
 // (specocc) The stats slot written 4 frames ago, summed; every 10 s one line.
-void GtaoSoStats() {
+void GtaoSoReadStats() {
 	if (g_gtao.so_mapped == nullptr || g_graphics_ctx == nullptr) return;
 	if (g_gtao.so_written >= 4) {
 		const uint32_t slot = static_cast<uint32_t>(g_gtao.so_written % 4);
@@ -4706,7 +4706,7 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			std::fflush(stdout);
 		}
 	}
-	GtaoSoStats();
+	GtaoSoReadStats();
 	{
 		std::array<uint32_t, GtaoSoHeader / 4> h {};
 		const auto fl = [&](uint32_t i, float v) { std::memcpy(&h[i], &v, sizeof(float)); };
