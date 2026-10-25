@@ -1,0 +1,2 @@
+# FidelityFX SDK patch: applied with git apply on the Windows runner, keep LF.
+*.patch text eol=lf
