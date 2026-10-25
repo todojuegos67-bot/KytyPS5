@@ -1542,6 +1542,10 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                    info.extent.width == info.extent.height && info.extent.width >= 512;
 		FrameGen::OnShadowDraw(state.vs_input_info.stage.program->shader_hash, state.vs_input_info.stage.resources.flattened_srt,
 		                       target);
+		// (KYTY_RT_SUN: a sun cascade's draw: its layer and light matrix)
+		if (target && FrameGen::RtSunWanted())
+			FrameGen::OnSunCascadeDraw(state.vs_input_info.stage.program->shader_hash, state.vs_input_info.stage.resources.flattened_srt,
+			                           state.depth_info.desc.view_info.base_layer, info.data.address);
 	}
 	if (FrameGen::SsrWanted() && state.vs_input_info.stage.program != nullptr) {
 		// (KYTY_SSR, read only: the camera for its up direction, and the G-buffer draws' color targets.)

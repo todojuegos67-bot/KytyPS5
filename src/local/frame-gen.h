@@ -317,6 +317,21 @@ void GbufTapAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::Com
 void RtReflGuideAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
                               std::span<const TextureBinding> images, uint64_t written_mask);
 
+// (rtsun) KYTY_RT_SUN=0|1|2|3 ("Sombras RT del sol": off / low / high / ultra; rt-sun.comp, frame-gen.cpp RtSun*): the
+// sun's visibility recomputed from the game's own cascaded shadow maps (contact-hardening PCSS, cascades blended, normal
+// offset) plus screen-space contact rays, and put in place of the game's own shadow-map lookup in its sun term: the
+// lit color is relit by (1 + R N.L V_new) / (1 + R N.L V_game) (R the sun / ambient ratio measured on the screen, V_game
+// the game's own lookup emulated on the same maps). Runs the KYTY_RT_SHADOWS plumbing (its hooks and the CShadowApply
+// pass, in Upscale) with another shader; KYTY_RT_SUN wins over KYTY_RT_SHADOWS when both are set. Off: nothing.
+[[nodiscard]] bool RtSunWanted();
+// A depth-only draw into a layer of a square layered depth image (>= 512 px, >= 4 layers): a sun cascade's draw (any
+// path). Its orthographic light matrix (found once per vertex shader in its flattened SRT) is noted for that layer.
+void OnSunCascadeDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt, uint32_t layer, uint64_t target_address);
+// After a dispatch (renderCompute.cpp): the first one of a flip that samples the cascades' array (the sun lighting)
+// copies the cascade layers into our own array, with the matrices that drew them.
+void RtSunAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                        std::span<const TextureBinding> images);
+
 } // namespace FrameGen
 } // namespace Libs::Graphics
 
