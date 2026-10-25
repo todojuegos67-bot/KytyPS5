@@ -18,7 +18,7 @@
 // work on display-referred values.
 //
 // Material roughness (refl6): KYTY_RT_REFLECTIONS_ROUGH (default 2:0:8, L2.b0), KYTY_RT_REFLECTIONS_GLOSS (default
-// 1:16:8g, L1.b2 inverted; 0 off), KYTY_RT_REFLECTIONS_METAL (default none), KYTY_RT_REFLECTIONS_RANGE=lo:hi (0.1:0.4;
+// 1:16:8g, L1.b2 inverted; 0 off), KYTY_RT_REFLECTIONS_METAL_FIELD (refl9: default found by the survey), KYTY_RT_REFLECTIONS_RANGE=lo:hi (0.1:0.4;
 // the older KYTY_RT_REFLECTIONS_WET=lo:hi is read the same way), KYTY_RT_REFLECTIONS_MATERIAL (1.0: its scale),
 // KYTY_RT_REFLECTIONS_DEPTH=<n> (the lighting's n-th depth binding as the pre-water depth), KYTY_RT_REFLECTIONS_GUESS
 // (0: the puddle guess, only without a material field).
@@ -67,6 +67,17 @@
 // (0 % in Demon's Souls). Fixed: the slot by the render size and kept, the material mask while there is no guide, and the
 // guided composite also mixes our hit in up to the wet minimum reflectance on mirror-like up-facing pixels the game's SSR
 // is confident on (the game's own share alone, a dielectric's Fresnel, changed the pixel by ~1-4 %).
+//
+// (refl9) Metals and glossy surfaces, any orientation (guided mode). Metal (armour, swords, shields): the G-buffer's metal
+// field, found at run time by the metal survey (SurveyDecide: the near-binary byte set on characters far more often than
+// on the static world; logged with its candidates; KYTY_RT_REFLECTIONS_METAL_FIELD=<layer>:<shift>:<bits>[g] sets it, 0
+// none), our hit through a sharper lobe than the material's (ExtraLobe, then the a-trous blur by roughness) mixed in up to
+// KYTY_RT_REFLECTIONS_METAL (0.35) fading out by a roughness of 0.65, tinted by the albedo's hue
+// (KYTY_RT_REFLECTIONS_METAL_TINT 0.7), on characters too. Glossy dielectrics (polished / wet stone, marble, glass,
+// polished wood): up to KYTY_RT_REFLECTIONS_GLOSSY (0.25) x a soft Fresnel, floors from a roughness of 0.30 down, walls
+// only from 0.12 down (at 70 %). Both at 65 % where the game's own SSR is not confident, full where it is; a miss leaves the game's
+// pixel (its IBL); never over its highlights, never darker than 25 % of it in all. Every 10 s "RT reflections: metal /
+// glossy:" with the metal and glossy shares, where our hit was added and the mean added weight.
 #include "local/rt-reflections.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -86,7 +97,7 @@ namespace Libs::Graphics::FrameGen {
 namespace {
 
 constexpr uint32_t Bindings      = 22;
-constexpr uint32_t HeaderBytes   = 176;           // view_rot[3], clip_prev[4], up_view, fparams, mparams, gparams
+constexpr uint32_t HeaderBytes   = 192;           // view_rot[3], clip_prev[4], up_view, fparams, mparams, gparams, xparams
 // calib[] (after the header; the shader's CALIB_* / STATS): samples, normal sums per layer x layout x space x screen
 // y convention, byte statistics, floor votes, then the cumulative stats counters (never cleared).
 constexpr uint32_t NLayouts      = 13;
@@ -96,13 +107,21 @@ constexpr uint32_t CalibFloors   = CalibBytes + 16 * 3;
 constexpr uint32_t CalibWet      = CalibFloors + 2; // puddle guess: count + 16 byte sums; water: the same
 constexpr uint32_t CalibHist     = 300;             // 16 byte fields x 16 bins
 constexpr uint32_t StatsIndex    = 560;
-constexpr uint32_t StatsCount    = 25;
-constexpr uint32_t FrameBytes    = 4096;          // header + calibration + stats
+constexpr uint32_t StatsCount    = 32;
+// (refl9) The metal survey (the shader's SURVEY, mode 8; never cleared): static / moving sample counts, set-bit counts
+// per class x layer x bit, byte histograms per class x field x 16 bins.
+constexpr uint32_t SurveyIndex   = 600;
+constexpr uint32_t SurveyBits    = 2;
+constexpr uint32_t SurveyHist    = 258;
+constexpr uint32_t SurveyCount   = 770;
+constexpr uint32_t FrameBytes    = 8192;          // header + calibration + stats + survey
 constexpr uint32_t ExposureIndex = 128 / 4;       // fparams.x (1.0) when the game gives no exposure
 constexpr uint32_t CalibRuns     = 24;
 constexpr uint32_t MaxMips       = 12;
 static_assert(CalibWet + 34 <= CalibHist && CalibHist + 256 <= StatsIndex);
 static_assert(HeaderBytes + (StatsIndex + StatsCount) * 4 <= FrameBytes);
+static_assert(StatsIndex + StatsCount <= SurveyIndex && HeaderBytes + (SurveyIndex + SurveyCount) * 4 <= FrameBytes);
+static_assert(SurveyHist == SurveyBits + 2 * 128 && SurveyHist + 2 * 256 == SurveyCount);
 
 struct RtPush {
 	float   proj[4];
@@ -155,6 +174,11 @@ struct RtPass {
 	bool                    mat_auto = false, mat_forced = false;
 	// (refl6) The gloss field (1 - gloss as a second roughness: the rougher wins) and the metal field (-1: none).
 	int32_t                 dec_gloss = -1, dec_metal = -1;
+	// (refl9) The metal / glossy paths' strengths (KYTY_RT_REFLECTIONS_METAL / _GLOSSY) and the metal survey (the field
+	// found from the G-buffer itself unless KYTY_RT_REFLECTIONS_METAL_FIELD gives it or turns it off).
+	float                   metal_strength = 0.35f, glossy_strength = 0.25f, metal_tint = 0.7f;
+	bool                    survey_on = false, survey_done = false;
+	uint64_t                survey_runs = 0, survey_next_log = 0;
 	bool                    moving_on = true, moving_auto_off = false;
 	const int32_t*          mapped    = nullptr;
 	bool                    frame_cleared = false;
@@ -188,8 +212,8 @@ struct RtPass {
 	uint32_t                samples = 0;
 	std::array<std::array<uint8_t, 16>, 8> stage_of {}; // the pass each interval timed (Stage), per ring entry
 	std::array<uint32_t, 8>               stamps_in {};  // timestamps written per ring entry
-	std::array<double, 9>                 stage_ms {};   // sums since the last line
-	std::array<uint32_t, 9>               stage_frames {};
+	std::array<double, 10>                stage_ms {};   // sums since the last line
+	std::array<uint32_t, 10>              stage_frames {};
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 } g_rt;
 
@@ -480,9 +504,10 @@ void PrepareImages(vk::CommandBuffer command) {
 	}
 }
 
-enum Stage : uint8_t { StHiz, StCalib, StTrace, StTemporal, StAtrous0, StAtrous1, StAtrous2, StAtrous3, StComposite };
-const char* const StageNames[9] = {"hi-z", "calib", "trace", "temporal", "a-trous 1", "a-trous 2", "a-trous 3", "a-trous 4",
-                                   "composite"};
+enum Stage : uint8_t { StHiz, StCalib, StTrace, StTemporal, StAtrous0, StAtrous1, StAtrous2, StAtrous3, StComposite, StSurvey };
+constexpr uint32_t NStages = 10;
+const char* const StageNames[NStages] = {"hi-z", "calib", "trace", "temporal", "a-trous 1", "a-trous 2", "a-trous 3", "a-trous 4",
+                                         "composite", "metal survey"};
 
 void ReadTiming(GraphicContext& graphics) {
 	if (g_rt.pool == nullptr) return;
@@ -496,14 +521,14 @@ void ReadTiming(GraphicContext& graphics) {
 		if (n >= 2 && stamps[n - 1] > stamps[0]) {
 			g_rt.sum_ms += static_cast<double>(stamps[n - 1] - stamps[0]) * g_rt.period_ns / 1e6;
 			++g_rt.samples;
-			std::array<bool, 9> seen {};
+			std::array<bool, NStages> seen {};
 			for (uint32_t k = 1; k < n; ++k) {
 				const uint8_t st = g_rt.stage_of[entry][k];
-				if (st >= 9 || stamps[k] < stamps[k - 1]) continue;
+				if (st >= NStages || stamps[k] < stamps[k - 1]) continue;
 				g_rt.stage_ms[st] += static_cast<double>(stamps[k] - stamps[k - 1]) * g_rt.period_ns / 1e6;
 				seen[st] = true;
 			}
-			for (uint32_t st = 0; st < 9; ++st)
+			for (uint32_t st = 0; st < NStages; ++st)
 				if (seen[st]) ++g_rt.stage_frames[st];
 		}
 		++g_rt.read;
@@ -569,8 +594,23 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		// the next 10 s)
 		if (g_rt.moving_on) g_rt.moving_auto_off = sm[0] > 100 && pc(17) > 35.0;
 	}
+	{
+		// (refl9) The metal / glossy paths: the share of the pixels that are metal / glossy (G-buffer surfaces), where our
+		// hit was added (> 5 %), the mean added weight over all pixels and over those two.
+		const auto pc  = [&](uint32_t k) { return 100.0 * sm[k] / px; };
+		const double on = static_cast<double>(sm[25] + sm[26]);
+		char         mf[64];
+		if (g_rt.dec_metal < 0) std::snprintf(mf, sizeof(mf), "%s", g_rt.survey_on && !g_rt.survey_done ? "none yet: surveying" : "none");
+		else std::snprintf(mf, sizeof(mf), "L%d bits %d..%d%s", g_rt.dec_metal & 3, (g_rt.dec_metal >> 2) & 31,
+		                   ((g_rt.dec_metal >> 2) & 31) + std::max((g_rt.dec_metal >> 7) & 31, 1) - 1, (g_rt.dec_metal & 4096) ? " inverted" : "");
+		std::printf("RT reflections: metal / glossy: last %.0f s: metal %.1f%% of the pixels (field %s), glossy %.1f%%; our hit "
+		            "added (> 5%%) on metal %.1f%%, glossy %.1f%%; mean added weight %.4f (%.3f on metal + glossy pixels); strengths "
+		            "metal %g, glossy %g\n",
+		            std::chrono::duration<double>(now - g_rt.stat_time).count(), pc(25), mf, pc(26), pc(28), pc(29), sm[27] / 1000.0 / px,
+		            on > 0 ? sm[27] / 1000.0 / on : 0.0, g_rt.metal_strength, g_rt.glossy_strength);
+	}
 	std::string passes;
-	for (uint32_t st = 0; st < 9; ++st) {
+	for (uint32_t st = 0; st < NStages; ++st) {
 		if (g_rt.stage_frames[st] == 0) continue;
 		char buf[64];
 		// (calib: its mean over the frames that ran it; the others run every frame)
@@ -750,6 +790,139 @@ bool Analyze(GraphicContext& graphics, uint32_t packed_count) {
 	return identified;
 }
 
+// (refl9) The decoded normal's bits (the survey never offers them as the metal field).
+bool InNormalBits(int layer, int bit) {
+	const int n = g_rt.dec_normal;
+	if (n < 0 || (n & 3) != layer) return false;
+	static constexpr int lo[NLayouts] = {0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 16, 0, 2};
+	static constexpr int hi[NLayouts] = {31, 23, 31, 21, 29, 31, 31, 31, 31, 15, 31, 31, 31};
+	const int l = (n >> 2) & 15;
+	return l < static_cast<int>(NLayouts) && bit >= lo[l] && bit <= hi[l];
+}
+// Two field codes share bits (same layer, overlapping ranges).
+bool FieldsOverlap(int32_t a, int32_t b) {
+	if (a < 0 || b < 0 || (a & 3) != (b & 3)) return false;
+	const int as = (a >> 2) & 31, ae = as + std::max((a >> 7) & 31, 1), bs = (b >> 2) & 31, be = bs + std::max((b >> 7) & 31, 1);
+	return as < be && bs < ae;
+}
+
+// (refl9) The metal field from the survey (mode 8): the game's G-buffer pack shader is not available here, so the field
+// is found the way the normal and the roughness were, statistically, against a ground truth the frame has: characters
+// (moving pixels: armour, swords, shields; also skin and cloth) against the static world (mostly stone and wood). A
+// metal field is near-binary (a metalness texture: >= 75 % of the samples in the end bins), set on a minority of the
+// static world (<= 30 %) and on clearly more of the characters (>= 12 %, >= 2x the static share + 5 points), but not on
+// nearly all of them (<= 85 %: that is an object / character flag, not a material). Candidates: the 16 bytes as unorm8
+// outside the decoded normal (single bits only logged); the polarity whichever side the characters favour.
+// Logged with the top candidates so a log is enough to check or override it (KYTY_RT_REFLECTIONS_METAL_FIELD).
+void SurveyDecide(bool force) {
+	if (g_rt.mapped == nullptr || g_rt.survey_done) return;
+	const int32_t* c  = g_rt.mapped + HeaderBytes / 4 + SurveyIndex;
+	const double   ns = c[0], nm = c[1];
+	const bool     enough = (nm >= 3000.0 && ns >= 30000.0) || (force && nm >= 1000.0 && ns >= 10000.0);
+	if (!enough) {
+		if (g_rt.frame >= g_rt.survey_next_log) {
+			g_rt.survey_next_log = g_rt.frame + 3600;
+			std::printf("RT reflections: metal survey: %.0f static / %.0f moving (character) G-buffer samples so far (deciding at "
+			            "30000 / 3000; characters count while they move against the camera)\n",
+			            ns, nm);
+			std::fflush(stdout);
+		}
+		return;
+	}
+	g_rt.survey_done = true;
+	struct Cand {
+		int32_t code;
+		double  ms, mm, bin, score;
+	};
+	std::vector<Cand> all;
+	const auto consider = [&](int32_t code, double hs, double hm, double bin) {
+		// (hs / hm: the shares of the static / moving samples on the "high" side)
+		const bool   inv = hm < hs;
+		const double ms = inv ? 1.0 - hs : hs, mm = inv ? 1.0 - hm : hm;
+		double       score = mm - ms;
+		const bool   ok = bin >= 0.75 && ms <= 0.30 && mm >= 0.12 && mm <= 0.85 && mm >= 2.0 * ms + 0.05;
+		if (!ok) score = -1.0 + score * 0.5; // (kept for the log, ranked below the passing ones)
+		all.push_back({code | (inv ? 4096 : 0), ms, mm, bin, score});
+	};
+	for (int f = 0; f < 16; ++f) {
+		const int layer = f / 4, b = f % 4;
+		if (InNormalBits(layer, b * 8) || InNormalBits(layer, b * 8 + 7)) continue;
+		double s_tot = 0, m_tot = 0, s_hi = 0, m_hi = 0, ends = 0;
+		for (int k = 0; k < 16; ++k) {
+			const double hs = c[SurveyHist + f * 16 + k], hm = c[SurveyHist + 256 + f * 16 + k];
+			s_tot += hs, m_tot += hm;
+			if (k >= 8) s_hi += hs, m_hi += hm;
+			if (k <= 1 || k >= 14) ends += hs + hm;
+		}
+		if (s_tot < 1 || m_tot < 1) continue;
+		consider(layer | ((b * 8) << 2) | (8 << 7), s_hi / s_tot, m_hi / m_tot, ends / (s_tot + m_tot));
+	}
+	// (single bits are logged, not picked: the top bit of any continuous value (an albedo channel) is "binary" too and
+	// can differ on characters; a 1-bit flag found in the log is set with KYTY_RT_REFLECTIONS_METAL_FIELD=<l>:<bit>:1)
+	std::vector<Cand> bits;
+	for (int layer = 0; layer < 4; ++layer)
+		for (int bit = 0; bit < 32; ++bit) {
+			if (InNormalBits(layer, bit)) continue;
+			const double ps = c[SurveyBits + layer * 32 + bit] / std::max(ns, 1.0), pm = c[SurveyBits + 128 + layer * 32 + bit] / std::max(nm, 1.0);
+			if (ps < 0.005 && pm < 0.005) continue;
+			const bool   inv = pm < ps;
+			const double a = inv ? 1.0 - ps : ps, b = inv ? 1.0 - pm : pm;
+			bits.push_back({layer | (bit << 2) | (1 << 7) | (inv ? 4096 : 0), a, b, 1.0, b - a});
+		}
+	std::sort(bits.begin(), bits.end(), [](const Cand& a, const Cand& b) { return a.score > b.score; });
+	std::sort(all.begin(), all.end(), [](const Cand& a, const Cand& b) { return a.score > b.score; });
+	const auto name = [](int32_t f) {
+		char buf[48];
+		const int sh = (f >> 2) & 31, bits = (f >> 7) & 31;
+		if (bits == 1) std::snprintf(buf, sizeof(buf), "L%d bit %d%s", f & 3, sh, (f & 4096) ? " clear" : "");
+		else std::snprintf(buf, sizeof(buf), "L%d bits %d..%d%s", f & 3, sh, sh + bits - 1, (f & 4096) ? " inverted" : "");
+		return std::string(buf);
+	};
+	std::string line;
+	for (size_t i = 0; i < all.size() && i < 6; ++i) {
+		char buf[128];
+		std::snprintf(buf, sizeof(buf), "%s %s static %.1f%% / characters %.1f%% (binary %.0f%%)%s", i ? ";" : "", name(all[i].code).c_str(),
+		              100.0 * all[i].ms, 100.0 * all[i].mm, 100.0 * all[i].bin, all[i].score >= 0.0 ? "" : " rejected");
+		line += buf;
+	}
+	std::printf("RT reflections: metal survey: %.0f static / %.0f moving samples; best candidates:%s\n", ns, nm, line.c_str());
+	const Cand* pick = nullptr;
+	for (const auto& a: all)
+		if (a.score >= 0.0) {
+			pick = &a;
+			break;
+		}
+	{
+		std::string bl;
+		for (size_t i = 0; i < bits.size() && i < 6; ++i) {
+			char buf[96];
+			std::snprintf(buf, sizeof(buf), "%s %s static %.1f%% / characters %.1f%%", i ? ";" : "", name(bits[i].code).c_str(),
+			              100.0 * bits[i].ms, 100.0 * bits[i].mm);
+			bl += buf;
+		}
+		std::printf("RT reflections: metal survey: single bits most set on characters (not picked):%s\n", bl.c_str());
+	}
+	if (pick == nullptr) {
+		std::printf("RT reflections: metal survey: no field separates the characters' metal (the glossy path alone: metals "
+		            "reflect by their roughness, at the glossy strength; KYTY_RT_REFLECTIONS_METAL_FIELD=<layer>:<shift>:<bits>[g] "
+		            "sets one)\n");
+	} else {
+		g_rt.dec_metal = pick->code;
+		std::printf("RT reflections: metal field = %s (static %.1f%%, characters %.1f%%; KYTY_RT_REFLECTIONS_METAL_FIELD=%d:%d:%d%s)\n",
+		            name(pick->code).c_str(), 100.0 * pick->ms, 100.0 * pick->mm, pick->code & 3, (pick->code >> 2) & 31,
+		            (pick->code >> 7) & 31, (pick->code & 4096) ? "g" : "");
+		// (the roughness field was a guess too: when it is the metal field, a metal read as rough and never reflected; the
+		// gloss field alone is the roughness then)
+		if (!g_rt.rough_trusted && FieldsOverlap(g_rt.dec_rough, pick->code)) {
+			std::printf("RT reflections: the roughness field %s is the metal field: roughness from the gloss field alone\n",
+			            name(g_rt.dec_rough).c_str());
+			g_rt.dec_rough = g_rt.dec_gloss >= 0 ? g_rt.dec_gloss : g_rt.dec_rough;
+			if (g_rt.dec_rough == g_rt.dec_gloss) g_rt.dec_gloss = -1;
+		}
+	}
+	std::fflush(stdout);
+}
+
 } // namespace
 
 int RtReflectionsLevel() {
@@ -841,7 +1014,28 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 				const int32_t gc = FieldEnv("KYTY_RT_REFLECTIONS_GLOSS");
 				g_rt.dec_gloss   = gc >= 0 ? gc : -1; // ("0" or anything malformed: no gloss field)
 			}
-			g_rt.dec_metal = FieldEnv("KYTY_RT_REFLECTIONS_METAL");
+			// (refl9) KYTY_RT_REFLECTIONS_METAL is the metal path's strength (0..1, 0.35); the older field syntax
+			// (<layer>:<shift>:<bits>[g]) is still read as the field. KYTY_RT_REFLECTIONS_METAL_FIELD: the field, "0" none,
+			// unset / "auto": the survey finds it. KYTY_RT_REFLECTIONS_GLOSSY: the glossy dielectrics' strength (0..1, 0.25).
+			g_rt.survey_on = true;
+			if (const char* mt = std::getenv("KYTY_RT_REFLECTIONS_METAL"); mt != nullptr && *mt != '\0') {
+				if (std::strchr(mt, ':') != nullptr) {
+					g_rt.dec_metal = FieldEnv("KYTY_RT_REFLECTIONS_METAL");
+					g_rt.survey_on = false;
+				} else {
+					g_rt.metal_strength = EnvFloat("KYTY_RT_REFLECTIONS_METAL", 0.35f, 0.0f, 1.0f);
+				}
+			}
+			if (const char* mf = std::getenv("KYTY_RT_REFLECTIONS_METAL_FIELD"); mf != nullptr && *mf != '\0' && std::strcmp(mf, "auto") != 0) {
+				g_rt.dec_metal = FieldEnv("KYTY_RT_REFLECTIONS_METAL_FIELD"); // ("0" or malformed: none)
+				g_rt.survey_on = false;
+			}
+			g_rt.glossy_strength = EnvFloat("KYTY_RT_REFLECTIONS_GLOSSY", 0.25f, 0.0f, 1.0f);
+			g_rt.metal_tint      = EnvFloat("KYTY_RT_REFLECTIONS_METAL_TINT", 0.7f, 0.0f, 1.0f);
+			if (g_rt.dec_metal >= 0 && !g_rt.rough_trusted && FieldsOverlap(g_rt.dec_rough, g_rt.dec_metal) && g_rt.dec_gloss >= 0)
+				g_rt.dec_rough = g_rt.dec_gloss, g_rt.dec_gloss = -1; // (as SurveyDecide: a metal field is not a roughness)
+			std::printf("RT reflections: metal strength %g, glossy strength %g, metal tint %g, metal field %s\n", g_rt.metal_strength,
+			            g_rt.glossy_strength, g_rt.metal_tint, g_rt.survey_on ? "by the survey (auto)" : g_rt.dec_metal >= 0 ? "from the environment" : "none");
 			if (const char* mv = std::getenv("KYTY_RT_REFLECTIONS_MOVING"); mv != nullptr && *mv == '0') g_rt.moving_on = false;
 			g_rt.mat_scale = EnvFloat("KYTY_RT_REFLECTIONS_MATERIAL", 1.0f, 0.0f, 1.0f);
 			// (refl8) The guide's settings.
@@ -906,6 +1100,11 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	RtReflCamera camera;
 	RtReflGetCamera(m, camera);
 	const bool use_normal = dec_normal >= 0 && ((dec_normal & 64) == 0 || camera.rows);
+	// (refl9) The metal survey: every 16th frame while undecided, with the G-buffer's normal (its surface test) and the
+	// camera's matrices (the moving test); decided once enough characters were seen (SurveyDecide).
+	const bool survey = g_rt.survey_on && !g_rt.survey_done && have_gbuf && use_normal && camera.prev && g_rt.moving_on &&
+	                    !g_rt.moving_auto_off && (g_rt.frame & 15u) == 7u;
+	if (g_rt.survey_on && !g_rt.survey_done) SurveyDecide(g_rt.survey_runs > 1100); // (~5 min of surveyed frames: the minimum)
 
 	// (refl6: per level by default, so the medium level shows: low 1.3, medium 1.6, high 1.8, ultra 2.0)
 	static constexpr float DefStrength[5] = {0.0f, 1.3f, 1.6f, 1.8f, 2.0f};
@@ -997,6 +1196,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		header[39] = 0.0f;
 		header[40] = g_rt.guide_lo, header[41] = g_rt.guide_hi, header[42] = g_rt.guide_premul ? 1.0f : 0.0f; // (gparams)
 		header[43] = g_rt.guide_strength;
+		// (refl9, xparams) the metal / glossy paths; the albedo layer L0 (its bits 0..23) unless the normal lives there
+		header[44] = dec_metal >= 0 ? g_rt.metal_strength : 0.0f, header[45] = g_rt.glossy_strength, header[46] = g_rt.metal_tint;
+		header[47] = (packed_count > 0 && (dec_normal < 0 || (dec_normal & 3) != 0)) ? 0.0f : -1.0f;
 		command.updateBuffer(vk::Buffer(g_rt.frame_buf), 0, HeaderBytes, header.data());
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
@@ -1078,6 +1280,11 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		++g.calib_runs;
 		stamp(StCalib);
 	}
+	if (survey) {
+		run(8, base, vk::Extent2D {160, 90});
+		++g.survey_runs;
+		stamp(StSurvey);
+	}
 	// Trace, temporal, a-trous, composite.
 	{
 		Set s = base;
@@ -1115,8 +1322,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 	        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
 	{
-		// The sums and counters to the host (the CPU reads them a few frames late; the copy is 2.3 KB).
-		vk::BufferCopy region {HeaderBytes, HeaderBytes, (StatsIndex + StatsCount) * 4};
+		// The sums, counters and the metal survey to the host (the CPU reads them a few frames late; the copy is 5.5 KB).
+		vk::BufferCopy region {HeaderBytes, HeaderBytes, (SurveyIndex + SurveyCount) * 4};
 		command.copyBuffer(vk::Buffer(g.frame_buf), vk::Buffer(g.read_buf), 1, &region);
 		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
 		        vk::AccessFlagBits2::eHostRead);

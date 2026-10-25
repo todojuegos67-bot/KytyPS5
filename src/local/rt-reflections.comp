@@ -62,6 +62,9 @@ layout(std430, binding = 18) buffer Frame {
 	                   // strength scale (refl6)
 	vec4 gparams;      // (refl8) the guide: x / y the game's SSR confidence from which / to which it counts as a reflection,
 	                   // z 1: its rgb premultiplied by a, w the guided strength (1: the game's own)
+	vec4 xparams;      // (refl9) x the metal reflection's strength (KYTY_RT_REFLECTIONS_METAL), y the glossy surfaces'
+	                   // (KYTY_RT_REFLECTIONS_GLOSSY), z how much of the albedo's hue tints a metal's reflection, w the albedo
+	                   // layer (L0 bits 0..23 as sRGB rgb; < 0 none)
 	int  calib[];      // see CALIB_* below (calibration sums, then the cumulative stats counters)
 };
 // calib[] layout (ints): [0] samples; [CALIB_NORMAL + ((layer * NLAYOUTS + layout) * 2 + space) * 2 + convention] sum of
@@ -74,7 +77,13 @@ layout(std430, binding = 18) buffer Frame {
 // fields) < 0.1, 0.1..0.25, 0.25..0.4, >= 0.4, 13..16 the same for the roughness field alone, 17 moving (a character), 18
 // metal > 0.5, 19 weight > 0.05 where the roughness < 0.1; refl8, the guide: 20 the game's SSR confidence > gparams.x, 21
 // our hit replaced > 5 % of the game's SSR, 22 sum of its confidence * 1000, 23 water with our mirror (weight > 0.05),
-// 24 its rgb set where its confidence is not); [CALIB_HIST + field * 16 + bin] byte histograms.
+// 24 its rgb set where its confidence is not; refl9: 25 metal > 0.5 (G-buffer surface), 26 glossy > 0.5 (not metal),
+// 27 sum of the metal / glossy paths' added weight * 1000, 28 metal with an added weight > 0.05, 29 glossy with one > 0.05);
+// [CALIB_HIST + field * 16 + bin] byte histograms;
+// [SURVEY ...] (refl9) the metal survey (mode 8, never cleared): [0] static G-buffer samples, [1] moving (characters),
+// [2 + class * 128 + layer * 32 + bit] set-bit counts, [258 + class * 256 + field * 16 + bin] byte histograms (class 0
+// static, 1 moving).
+
 // (The buffer is device-local, copied to a host buffer once a frame: atomics on host memory cross PCIe one by one, which
 // made the composite cost 3-4 ms in the 10-24 b7dd0fe6 build.)
 const int NLAYOUTS     = 13;
@@ -84,6 +93,7 @@ const int CALIB_FLOORS = CALIB_BYTES + 16 * 3;
 const int CALIB_WET    = CALIB_FLOORS + 2;
 const int CALIB_HIST   = 300;
 const int STATS        = 560;
+const int SURVEY       = 600;
 layout(std430, binding = 19) readonly buffer Exposure {
 	float exposure_values[];
 };
@@ -288,6 +298,7 @@ struct Surf {
 	float metal;
 	float water;
 	float gb; // 1: the G-buffer normal was used
+	float extra; // (refl9) the metal / glossy paths' weight (ExtraWeight)
 };
 // (refl6) Reflectivity follows the material's roughness per pixel, as light does: smooth surfaces (polished stone,
 // metal, wet floors, water) reflect, rough dry stone does not; walls and metal too, not only floors. Sources:
@@ -310,6 +321,43 @@ float GbufRough(ivec2 p, out float r0) {
 	return r;
 }
 float GbufMetal(ivec2 p) { return push.misc2.w > 0 ? clamp(Field(push.misc2.w - 1, p), 0.0, 1.0) : 0.0; }
+// (refl9) The albedo (L0 bits 0..23, sRGB-encoded rgb), linear; white without one.
+vec3 GbufAlbedo(ivec2 p) {
+	int l = int(xparams.w);
+	if (l < 0 || l >= push.dec.z) return vec3(1);
+	uint w = Packed(l, p);
+	vec3 a = vec3(Bits(w, 0, 8), Bits(w, 8, 8), Bits(w, 16, 8));
+	return a * a; // (gamma 2.0: close enough for a hue)
+}
+// (refl9) The metal's reflection tint: the albedo's hue (metals reflect in their own color: F0 = the base color), its
+// brightness normalized away (the brightness comes from what is reflected), only partly (xparams.z) so a dark or
+// strongly saturated albedo never turns the reflection into a flat color.
+vec3 MetalTint(vec3 albedo) {
+	float m = Max3(albedo);
+	vec3  h = m > 0.02 ? albedo / m : vec3(1);
+	return mix(vec3(1), h, clamp(xparams.z, 0.0, 1.0));
+}
+// (refl9) How glossy a dielectric is (the material roughness `r`, the rougher of the fields): floors (up-facing) from a
+// roughness of 0.30 down, walls and everything else facing elsewhere only when genuinely glossy (from 0.12 down, and at
+// 70 %: the game's own probes already hold most of a wall's sheen).
+float Glossy(float r, float upf) {
+	float up   = 1.0 - smoothstep(0.08, 0.30, r);
+	float wall = 0.7 * (1.0 - smoothstep(0.03, 0.12, r));
+	return mix(wall, up, clamp(upf, 0.0, 1.0));
+}
+// (refl9) The weight our hit takes beyond the game's own share on metals (armour, weapons, shields: rough-ish, any
+// orientation) and glossy dielectrics (polished stone, marble, wet stone, glass, polished wood), before our ray's
+// confidence and the composite's limits: metals at KYTY_RT_REFLECTIONS_METAL, fading out by a roughness of 0.65, a little
+// more at grazing angles; glossy surfaces at KYTY_RT_REFLECTIONS_GLOSSY x a soft Fresnel (seen from above about half,
+// grazing all). Where the game's own SSR is confident the full weight, elsewhere 65 % of it (the game decides first).
+float ExtraWeight(float metal, float r, float nv, float upf, float gmask) {
+	float g    = 1.0 - pow(1.0 - clamp(nv, 0.0, 1.0), 3.0);
+	float wmet = xparams.x * metal * (1.0 - smoothstep(0.30, 0.65, r)) * (0.85 + 0.15 * (1.0 - g));
+	float wgl  = xparams.y * (1.0 - metal) * Glossy(r, upf) * mix(1.0, 0.45, g);
+	return clamp(max(wmet, wgl) * mix(0.65, 1.0, clamp(gmask, 0.0, 1.0)), 0.0, 0.9);
+}
+// (refl9) Our lobe on those surfaces: sharper than the material (the game's own is the blurry one), still a cone.
+float ExtraLobe(float r) { return clamp(r * 0.7, 0.0, 0.42); }
 float UpFacing(vec3 Nd) {
 	if ((push.misc.w & 8) != 0) return smoothstep(0.80, 0.95, dot(Nd, up_view.xyz));
 	return smoothstep(0.80, 0.95, abs(Nd.y));
@@ -412,6 +460,7 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	if (dot(s.N, V) < 0.02) s.N = normalize(s.N + V * (0.02 - dot(s.N, V) + 0.01)); // (back-facing by a little: bent)
 	bool  have_mat = push.dec.y >= 0;
 	float mat = 0.0, mat_r = 1.0, mat_pr = 1.0, metal = 0.0;
+	s.extra    = 0.0;
 	if (GuideMode()) {
 		// (refl8) The game decides: its SSR confidence here; the roughness field (when decoded) only narrows it to the
 		// mirror-like surfaces we sharpen and sets our lobe.
@@ -419,14 +468,17 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 			float gm  = GameMask(GameSsr(ruv).a);
 			float mir = 1.0;
 			mat_pr = 0.05, mat_r = 0.0; // (no roughness field: a mirror ray, at the game's share)
-			if (match && have_mat && gm > 0.0) {
+			if (match && have_mat) {
 				float r0;
 				mat_pr = GbufRough(rp, r0);
 				mir    = RoughFade(mat_pr);
 				mat_r  = LobeRough(mat_pr);
 				metal  = GbufMetal(rp);
+				// (refl9) Metals and glossy surfaces: our own weight on any orientation, the game's mask only scales it.
+				s.extra = ExtraWeight(metal, mat_pr, clamp(dot(s.N, V), 0.0, 1.0), UpFacing(Nd), gm);
+				if (s.extra > gm * mir) mat_r = min(ExtraLobe(mat_pr), push.motion.z);
 			}
-			mat = gm * mir;
+			mat = max(gm * mir, s.extra);
 		}
 	} else if (match && have_mat) {
 		float r0;
@@ -442,7 +494,9 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	s.rough  = wat ? 0.0 : mat >= guess ? mat_r : 0.12; // (water: a mirror, no lobe)
 	s.prough = wat ? 0.0 : mat >= guess ? mat_pr : 0.12;
 	s.metal  = wat ? 0.0 : metal;
-	if (s.mask > 0.0 && Moving(ruv, P) > 0.5) s.mask = 0.0; // (characters: never)
+	// (characters: never, except (refl9) their metal: armour, swords, shields, at the metal path's weight alone)
+	if (s.mask > 0.0 && Moving(ruv, P) > 0.5) s.mask = (s.metal > 0.5 && !wat) ? s.extra : 0.0;
+	if (wat) s.extra = 0.0;
 	if (s.mask < 0.05) s.mask = 0.0;
 	return s;
 }
@@ -675,6 +729,7 @@ void Trace(ivec2 px, bool march) {
 		// (refl8, guided: the game's share, strength gparams.w; the threshold lower, the share is the game's own)
 		bool  gd   = GuideMode() && s.water <= 0.0;
 		float west = (gd ? gparams.w : push.params.x) * s.mask * Spec(s.prough, clamp(dot(s.N, V), 0.0, 1.0), s.metal, s.water);
+		if (gd) west = max(west, s.extra); // (refl9: the metal / glossy paths)
 		if (west < (gd ? 0.01 : 0.02)) {
 			s.mask = 0.0;
 			StoreMiss(px, s);
@@ -936,6 +991,10 @@ void Composite(ivec2 px) {
 		Stat(22, int(ga * 1000.0));
 		Stat(24, gsurf && gs.a <= gparams.x && Luma(gs.rgb) > 1e-4 ? 1 : 0);
 	}
+	if (st && match && have_mat && gsurf) { // (refl9: the metal / glossy shares of the G-buffer surfaces)
+		Stat(25, metal > 0.5 ? 1 : 0);
+		Stat(26, metal <= 0.5 && Glossy(rm, UpFacing(Nd)) > 0.5 ? 1 : 0);
+	}
 	vec4 rf, ax;
 	if (all(equal(ivec2(TraceSize()), ivec2(RenderSize())))) {
 		rf = texelFetch(src_a, px, 0);
@@ -954,22 +1013,33 @@ void Composite(ivec2 px) {
 	// character or a rough neighbour): water (up-facing by its own mask), else this pixel's own material roughness, else
 	// (no material field) the up-facing guess; never on moving objects.
 	float fr_rough = rm;
+	float ex       = 0.0; // (refl9) the metal / glossy paths' weight
 	if (water > 0.0) {
 		fr_rough = 0.0, metal = 0.0;
 		N        = WaterNormal(Nd); // (the G-buffer holds the bed under the water)
 	} else if (GuideMode()) {
 		// (refl8) The game's SSR confidence at this render pixel (the trace's mask is half resolution), narrowed to the
 		// mirror-like surfaces by the roughness field when there is one.
+		float tmask = mask; // (the trace's, which holds the metal / glossy paths too)
 		mask = gsurf ? min(mask, GameMask(ga) * (match && have_mat ? RoughFade(rm) : 1.0)) : 0.0;
 		if (!(match && have_mat)) fr_rough = 0.05; // (no roughness field: the game's SSR marks smooth surfaces)
+		// (refl9) Metals and glossy dielectrics, any orientation: this render pixel's own material; the trace must have
+		// marked the surface (its rays are what we mix in).
+		if (gsurf && match && have_mat && tmask > 0.01) {
+			vec3 Ve = normalize(-P);
+			ex      = ExtraWeight(metal, rm, clamp(dot(N, Ve), 0.0, 1.0), UpFacing(Nd), GameMask(ga));
+		}
 	} else if (have_mat) {
 		mask = match ? min(mask, RoughFade(rm) * mparams.z) : 0.0;
 	} else {
 		mask *= UpFacing(Nd);
 		fr_rough = 0.12;
 	}
-	if (mask > 0.0 && Moving(uv, P) > 0.5) mask = 0.0;
-	if (mask < 0.01) { imageStore(out_a, px, col); return; }
+	if ((mask > 0.0 || ex > 0.0) && Moving(uv, P) > 0.5) {
+		mask = 0.0;
+		if (metal <= 0.5) ex = 0.0; // (refl9: a character's metal keeps the metal path)
+	}
+	if (mask < 0.01 && ex < 0.01) { imageStore(out_a, px, col); return; }
 	if (st && mask > 0.5 && water > 0.5) Stat(7, 1);
 	// (refl3) Water and near-mirrors with a half-resolution trace: their own mirror ray at the render resolution, so
 	// the reflection keeps every pixel of detail (the upsampled, filtered one is the fallback where it finds nothing).
@@ -1020,11 +1090,38 @@ void Composite(ivec2 px) {
 		wm   = clamp(isnan(wm) ? 0.0 : wm, 0.0, 0.9);
 		outg = mix(outg, refl, max(wm - wg, 0.0));
 		wg   = max(wg, wm);
+		// (refl9) Metals (armour, weapons, shields) and glossy dielectrics (polished / wet stone, marble, glass, polished
+		// wood), any orientation: our hit (its lobe by the roughness, ExtraLobe; blurred by the a-trous passes by roughness
+		// and hit distance) mixed in up to ExtraWeight, a metal's tinted by its albedo's hue. A miss changed nothing above:
+		// the game's pixel (its IBL) stays. The same limits: never over the game's highlights, never darker than MaxDarken.
+		float wx = 0.0;
+		if (ex > 0.0) {
+			vec3  tgt = refl * mix(vec3(1), MetalTint(GbufAlbedo(px)), clamp(metal, 0.0, 1.0));
+			float lo2 = Luma(max(outg, vec3(0))), lt = Luma(tgt);
+			wx        = ex * sqrt(clamp(rf.a, 0.0, 1.0));
+			wx *= 1.0 - smoothstep(4.0, 12.0, lo2 / max(lt, lo2 * 1e-4 + 1e-30));
+			if (lt < lo2) wx = min(wx, MaxDarken * lo2 / max(lo2 - lt, 1e-30));
+			wx = clamp(isnan(wx) ? 0.0 : wx, 0.0, 0.9);
+			float ap = max(wx - wm, 0.0);
+			if (ap > 0.0) outg = mix(outg, tgt, ap);
+			wx = ap;
+			wg = max(wg, wm + ap);
+		}
+		// (all paths together: never darker than MaxDarken of the game's pixel)
+		{
+			float lc0 = Luma(max(col.rgb, vec3(0))), dl = Luma(outg) - lc0;
+			if (dl < -MaxDarken * lc0) outg = col.rgb + (outg - col.rgb) * (MaxDarken * lc0 / max(-dl, 1e-30));
+		}
 		if (BadV(outg)) outg = col.rgb;
 		if (st) {
 			Stat(21, ga * k > 0.05 ? 1 : 0);
 			if (wg > 0.05) Stat(1, 1);
 			Stat(2, int(wg * 1000.0));
+			Stat(27, int(wx * 1000.0));
+			if (ex > 0.0) {
+				Stat(28, metal > 0.5 && wx > 0.05 ? 1 : 0);
+				Stat(29, metal <= 0.5 && wx > 0.05 ? 1 : 0);
+			}
 		}
 		imageStore(out_a, px, vec4(clamp(outg, vec3(0), vec3(6.0e4)), col.a));
 		return;
@@ -1102,11 +1199,51 @@ void Calibrate(ivec2 gp) {
 	}
 }
 
+// (refl9) The metal survey (mode 8, a 160x90 grid jittered every run, never cleared): on G-buffer pixels (the decoded
+// normal agrees with the depth's; not water, not sky) every bit of every packed layer and every byte's histogram, apart
+// for static pixels and moving ones (characters: MovingRaw). The game's metal field shows as a near-binary value much
+// more often on characters (armour, weapons, shields) than on the static world, yet not on all of a character (skin and
+// cloth are not metal: a field set on every moving pixel is an object flag). The CPU decides (rt-reflections.cpp).
+void Survey(ivec2 gp) {
+	float f  = float(push.misc.y & 1023);
+	vec2  j  = vec2(fract(f * 0.6180340), fract(f * 0.7548777));
+	vec2  uv = (vec2(gp) + j) / vec2(160.0, 90.0);
+	float d  = DepthAt(uv);
+	if (IsSky(d)) return;
+	ivec2 p  = RenderPixel(uv);
+	vec2  ruv = (vec2(p) + 0.5) / RenderSize();
+	vec3  P  = ViewPos(ruv, d);
+	vec3  Nd = NormalAt(ruv, P);
+	vec3  Ng;
+	if (!(GbufNormal(p, Ng) && dot(Ng, Nd) > 0.8)) return;
+	if (WaterMask(p, d, ruv, Nd) > 0.0) return;
+	int cls = MovingRaw(ruv, P) > 0.5 ? 1 : 0;
+	atomicAdd(calib[SURVEY + cls], 1);
+	for (int layer = 0; layer < 4; ++layer) {
+		if (layer >= push.dec.z) break;
+		uint w = Packed(layer, p);
+		// (the bits: one atomic per subgroup and counter, the active lanes summed first)
+		for (int c = 0; c < 2; ++c)
+			for (int b = 0; b < 32; ++b) {
+				int n = subgroupAdd((cls == c && ((w >> uint(b)) & 1u) != 0u) ? 1 : 0);
+				if (subgroupElect() && n > 0) atomicAdd(calib[SURVEY + 2 + c * 128 + layer * 32 + b], n);
+			}
+		for (int b = 0; b < 4; ++b) {
+			int v = int((w >> uint(b * 8)) & 255u) >> 4;
+			atomicAdd(calib[SURVEY + 258 + cls * 256 + (layer * 4 + b) * 16 + v], 1);
+		}
+	}
+}
+
 void main() {
 	ivec2 p    = ivec2(gl_GlobalInvocationID.xy);
 	int   mode = push.misc.x;
 	if (mode == 5) {
 		if (p.x < 160 && p.y < 90) Calibrate(p);
+		return;
+	}
+	if (mode == 8) {
+		if (p.x < 160 && p.y < 90) Survey(p);
 		return;
 	}
 	if (mode == 7) {
