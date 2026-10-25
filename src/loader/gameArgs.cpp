@@ -42,6 +42,7 @@ const CamSpeed& Cam() {
 		if (is1("KYTY_KBM") || is1("KYTY_KBM_CALIBRATE")) {
 			// The game's menu speeds 1-10 (11-15 above it): at 5 a full stick turns ~90 deg/s, so a mouse flick saturates
 			// it and is clipped. 10 by default; KYTY_KBM_CAM_MIN=0 keeps the launcher's.
+			// (10-25) The free camera uses min(speed / 10, 1) (eboot+0x181b75): above 10 it turns as 10 does.
 			const char* v     = std::getenv("KYTY_KBM_CAM_MIN");
 			const int   floor = std::clamp(v != nullptr && *v != '\0' ? std::atoi(v) : 10, 0, 15);
 			if (floor > 0 && r.speed < floor) r.speed = floor, r.raised = true;

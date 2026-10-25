@@ -12,6 +12,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "libs/controller.h"
+#include "loader/demonsSoulsCamera.h"
 #include "loader/gameArgs.h"
 
 #include <algorithm>
@@ -427,6 +428,7 @@ struct KbmCurve {
 	double                tau_ms   = 0; // the game's acceleration ramp as a first-order lag
 	double                sign     = 1; // yaw direction of +X stick
 	int                   camspeed = 0; // (10-25) the game camera speed it was measured at (0: not recorded)
+	int                   noramp   = 0; // (10-25) KYTY_KBM_NO_RAMP in effect when measured (not recorded: 0, the ramp)
 	std::vector<std::pair<double, double>> pts; // (stick, rate), monotonic, dead zone included
 
 	void Build() {
@@ -497,6 +499,8 @@ bool KbmLoadCurve(KbmCurve* c) {
 			c->tau_ms = std::clamp(v, 0.0, 500.0);
 		} else if (int cs = 0; std::sscanf(line, "camspeed %d", &cs) == 1) {
 			c->camspeed = cs;
+		} else if (int nr = 0; std::sscanf(line, "noramp %d", &nr) == 1) {
+			c->noramp = nr;
 		} else if (std::sscanf(line, "sign %lf", &v) == 1) {
 			c->sign = v < 0 ? -1 : 1;
 		}
@@ -519,6 +523,8 @@ void KbmSaveCurve(const KbmCurve& c) {
 	std::fprintf(f, "onset_ms %.1f\ntau_ms %.1f\nsign %.0f\n", c.onset_ms, c.tau_ms, c.sign);
 	// (10-25) The camera speed it holds for (a curve measured at another one is not used).
 	if (c.camspeed > 0) std::fprintf(f, "camspeed %d\n", c.camspeed);
+	// (10-25) The camera's turn ramp removed or not (KYTY_KBM_NO_RAMP): a curve measured the other way is not used.
+	std::fprintf(f, "noramp %d\n", c.noramp);
 	std::fclose(f);
 	LOGF("KYTY_KBM calibrate: curve written to %s\n", path.c_str());
 }
@@ -773,6 +779,7 @@ void KbmCalibFinish(KbmState& k) {
 	curve.tau_ms   = n_ta > 0 ? ta / n_ta * 1000.0 : 0.0;
 	curve.sign     = sg < 0 ? -1.0 : 1.0;
 	curve.camspeed = Loader::GameArgs::KbmCameraSpeed(); // (10-25) the speed it holds for
+	curve.noramp   = Loader::DemonsSoulsCamera::NoRampMode();
 	curve.Build();
 	if (!curve.valid) {
 		LOGF("KYTY_KBM calibrate: failed (the camera did not turn at any stick value); kbm_curve.txt unchanged\n");
@@ -1084,10 +1091,16 @@ void KbmSetupMouse() {
 		const char* cal = std::getenv("KYTY_KBM_CALIBRATE");
 		return cal != nullptr && std::string_view(cal) == "1";
 	}();
+	const int noramp = Loader::DemonsSoulsCamera::NoRampMode();
 	if (!calibrate && KbmLoadCurve(&k.curve) && k.curve.camspeed > 0 && camspeed > 0 && k.curve.camspeed != camspeed) {
 		LOGF("KYTY_KBM: %s was measured at camera speed %d, the game runs at %d: not used (linear mapping); calibrate "
 		     "again at %d\n",
 		     KbmCurvePath().c_str(), k.curve.camspeed, camspeed, camspeed);
+		k.curve = KbmCurve {};
+	} else if (k.curve.valid && k.curve.noramp != noramp) {
+		// (10-25) Measured with the game's turn ramp and now without it (or the other way): other rates, another ramp.
+		LOGF("KYTY_KBM: %s was measured with KYTY_KBM_NO_RAMP=%d, now %d: not used (linear mapping); calibrate again\n",
+		     KbmCurvePath().c_str(), k.curve.noramp, noramp);
 		k.curve = KbmCurve {};
 	} else if (k.curve.valid) {
 		if (k.curve.camspeed == 0)
@@ -1104,6 +1117,11 @@ void KbmSetupMouse() {
 		     "measured); KYTY_KBM_CALIBRATE=1 measures the curve\n",
 		     KbmCurvePath().c_str(), k.dpc * k.sens, camspeed, k.rmax);
 	}
+	// (10-25) The game's own full-tilt turn ramp (the camera speeding up while the stick is at full, the "delay"):
+	// removed at load by Loader::DemonsSoulsCamera unless KYTY_KBM_NO_RAMP=0 (its own log line says if it was).
+	LOGF("KYTY_KBM: camera turn ramp %s (KYTY_KBM_NO_RAMP=%d)\n",
+	     noramp == 0 ? "the game's (kept)" : noramp == 1 ? "removed, yaw linear at the game's top rate" : "removed, yaw linear at the game's base rate",
+	     noramp);
 	if (const char* cal = std::getenv("KYTY_KBM_CALIBRATE"); cal != nullptr && std::string_view(cal) == "1") {
 		k.cal.phase = KbmCalib::Wait;
 		LOGF("KYTY_KBM calibrate: on: load a save, stand still in an open area and let go of the mouse and the right stick\n");
