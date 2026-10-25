@@ -4559,8 +4559,10 @@ namespace {
 // motion vectors, color, the upscaler's view_to_clip). Normals from depth; horizon search with cosine-weighted
 // slices (1: half res, 2 slices x 8 steps; 2: full res, 3 x 12; 3: full res, 4 x 16); SSGI-style temporal
 // (motion-vector reprojection, depth/normal disocclusion reset) + edge-aware a-trous (1, 2 / 1, 2, 4 / 1, 2, 4, 8);
-// composite: a soft darkening multiplied into the color, faded with distance, sky skipped. KYTY_GTAO_STRENGTH (0.6),
-// KYTY_GTAO_RADIUS (metres, 1.0), KYTY_GTAO_BENT (0: the extra multiplier on dark, ambient-dominated pixels, 0..1).
+// composite: a soft darkening multiplied into the color, faded with distance, sky skipped. KYTY_GTAO_STRENGTH (0.5),
+// KYTY_GTAO_RADIUS (metres, 0.35: the same at every distance; KYTY_GTAO_MAXSCREEN 0.1 of the height clamps it only on
+// close-ups), KYTY_GTAO_THICKNESS (metres, 0.6 x the radius), KYTY_GTAO_BENT (0: the extra multiplier on dark,
+// ambient-dominated pixels, 0..1). Samples on depth texel centres; the a-trous kernel limited to ~the radius in metres.
 // Off (the default): nothing created, nothing recorded.
 //
 // (specocc) KYTY_SPEC_OCCLUSION (strength 0..1, default 0.8 while KYTY_GTAO >= 1; 0 off): specular occlusion from the
@@ -4853,8 +4855,13 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	// (10-24 ao: subtle defaults; strength 0.6 -> 0.5, radius 1.0 -> 0.6 m, clamped to 10% of the screen height)
 	const float strength  = SsgiEnv("KYTY_GTAO_STRENGTH", 0.5f, 1.0f);
-	const float radius    = std::max(SsgiEnv("KYTY_GTAO_RADIUS", 0.6f, 8.0f), 0.05f);
-	const float thickness = std::max(SsgiEnv("KYTY_GTAO_THICKNESS", 0.35f, 4.0f), 0.02f);
+	// (gtaofar) radius 0.6 -> 0.35 m. The screen clamp below (max_r of the height) is what made the near field look
+	// right: it holds the world radius at max_r * 2 z / proj_y, i.e. ~0.3 m at 3 m from the camera with the game's
+	// projection, while everything past ~6 m got the full 0.6 m (so a staircase or a far wall darkened over whole
+	// areas and brightened as the player walked up to it). 0.35 m is that near-field radius held at every distance (the
+	// clamp now bites only nearer than ~3.5 m: close-ups). The thin-object thickness keeps its ratio to the radius.
+	const float radius    = std::max(SsgiEnv("KYTY_GTAO_RADIUS", 0.35f, 8.0f), 0.05f);
+	const float thickness = std::max(SsgiEnv("KYTY_GTAO_THICKNESS", 0.6f * radius, 4.0f), 0.02f);
 	const float max_r     = std::max(SsgiEnv("KYTY_GTAO_MAXSCREEN", 0.1f, 0.5f), 0.01f);
 	const float bent     = SsgiEnv("KYTY_GTAO_BENT", 0.0f, 1.0f);
 	const auto& m        = inputs.view_to_clip;
@@ -4909,8 +4916,14 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		static bool said = false;
 		if (!said) {
 			said = true;
-			std::printf("GTAO: on (level %d, %ux%u, strength %g, radius %g m, thickness %g m, max %g of the height, bent %g)%s\n",
-			            level, g_gtao.trace.width, g_gtao.trace.height, strength, radius, thickness, max_r, bent,
+			// (gtaofar) where the screen clamp stops shrinking the radius (w = |z C + D|, C = +-1 for the game's)
+			const float py      = std::fabs(push.proj[1]);
+			const float c_abs   = std::fabs(push.depth_map[2]);
+			const float z_clamp = c_abs > 1e-6f ? (radius * py * 0.5f / max_r - std::fabs(push.depth_map[3])) / c_abs : 0.0f;
+			std::printf("GTAO: on (level %d, %ux%u, strength %g, radius %g m (whole beyond %.1f m, vertical FOV %.1f deg), "
+			            "thickness %g m, max %g of the height, bent %g)%s\n",
+			            level, g_gtao.trace.width, g_gtao.trace.height, strength, radius, z_clamp,
+			            py > 0.0f ? 2.0f * std::atan(1.0f / py) * 57.29578f : 0.0f, thickness, max_r, bent,
 			            have_proj ? "" : " (no projection: 60 deg FOV assumed)");
 			std::fflush(stdout);
 		}

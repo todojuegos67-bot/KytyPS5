@@ -25,7 +25,7 @@
 //                at the trace resolution (half for level 1, full for 2 and 3)
 //   1 temporal:  reprojected history (motion vectors), alpha max(1/count, 0.1 or 0.05 at 3), clamped to the 3x3
 //                neighbourhood, reset on depth/normal disocclusion -> out + count in aux_out
-//   2 a-trous:   5x5 edge-aware (depth, normal) blur, steps 1, 2 (, 4 at 2, 8 at 3)
+//   2 a-trous:   5x5 edge-aware (depth, normal, world distance up to ~the radius) blur, steps 1, 2 (, 4 at 2, 8 at 3)
 //   4 composite: depth-aware upsample; soft darkening with distance fade, sky skipped -> out (render res)
 //
 // (specocc) KYTY_SPEC_OCCLUSION: specular occlusion from the same horizon search. Per slice, the reflection lobe (the
@@ -107,6 +107,8 @@ vec3 ViewPosZ(vec2 uv, float z) {
 	vec2  nd = uv * 2.0 - 1.0;
 	return vec3((nd.x * w - z * push.proj.z) / push.proj.x, (nd.y * w - z * push.proj.w) / push.proj.y, z);
 }
+// |w| at a view depth stored as |z| (the denoise's gbuf.w): exact for a perspective (D = 0) or orthographic (C = 0)
+float AbsW(float az) { return abs(az * push.depth_map.z) + abs(push.depth_map.w); }
 bool IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e3; }
 float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
@@ -239,7 +241,12 @@ vec2  EnvBrdf(float rough, float nv) {
 float Cdf(float x, float c, float a) { return smoothstep(c - a, c + a, x); }
 
 void Gtao(ivec2 pixel) {
-	vec2  uv = (vec2(pixel) + 0.5) / TraceSize();
+	// (gtaofar) Every position is rebuilt at the centre of the depth texel it reads (XeGTAO snaps its sample offsets to
+	// whole pixels for this): a point-sampled depth placed at another uv is off its surface by up to half a pixel's
+	// depth slope, which grows with distance and obliquity (z^2 per pixel on a floor) and reads as a false occluder
+	// right at the tangent plane, where the specular lobe of a far, grazing surface sits.
+	vec2  ds = vec2(textureSize(depth_tex, 0));
+	vec2  uv = (floor((vec2(pixel) + 0.5) / TraceSize() * ds) + 0.5) / ds;
 	float d  = textureLod(depth_tex, uv, 0).r;
 	if (IsSky(d)) {
 		imageStore(out_img, pixel, vec4(1));
@@ -310,7 +317,7 @@ void Gtao(ivec2 pixel) {
 			float t  = (float(k) + fract(noise_step + float(k + s * steps) * 0.618034)) / float(steps);
 			t        = t * t; // denser near the centre
 			float so = max(t * screen_r, min_s);
-			vec2  o  = dir * so;
+			vec2  o  = round(dir * so * ds) / ds; // (gtaofar) on a depth texel centre (uv is one)
 			vec2  uv0 = uv + o, uv1 = uv - o;
 			if (all(greaterThanEqual(uv0, vec2(0))) && all(lessThanEqual(uv0, vec2(1)))) {
 				float sd = textureLod(depth_tex, uv0, 0).r;
@@ -453,6 +460,12 @@ void Atrous(ivec2 pixel) {
 		return;
 	}
 	const float kern[3] = float[](0.375, 0.25, 0.0625);
+	// (gtaofar) The kernel's reach in metres: its taps are fixed in pixels (up to 2 x 8 at level 3) while the AO radius
+	// shrinks on screen with distance, so far away the blur spread each crease's occlusion over metres of open surface
+	// (a far wall or staircase washed over). A Gaussian in world distance, sigma = the AO radius: near (a pixel of a
+	// few mm) every tap keeps ~95 % of its weight; at 20 m the step 8 taps (0.2-0.6 m) fall off.
+	float wpx    = 2.0 * AbsW(g.w) / max(abs(push.proj.y) * TraceSize().y, 1e-6); // metres per trace pixel here
+	float inv_r2 = 1.0 / max(push.trace.w * push.trace.w, 1e-6);
 	float sum = 0.0, wsum = 0.0;
 	float ssum = 0.0, swsum = 0.0; // (specocc) green: the same kernel, its own value weight
 	float step = push.extra.x;
@@ -465,7 +478,9 @@ void Atrous(ivec2 pixel) {
 			float wn  = pow(max(dot(sg.xyz, g.xyz), 0.0), 32.0);
 			float wz  = exp(-abs(sg.w - g.w) / max(g.w * 0.02 * step, 1e-3));
 			float wl  = exp(-abs(sc - c.r) * 4.0);
-			float wb  = kern[abs(x)] * kern[abs(y)] * wn * wz;
+			float dm  = length(vec2(x, y)) * step * wpx;
+			float wd  = exp(-dm * dm * inv_r2);
+			float wb  = kern[abs(x)] * kern[abs(y)] * wn * wz * wd;
 			float w   = wb * wl;
 			sum += sc * w;
 			wsum += w;
