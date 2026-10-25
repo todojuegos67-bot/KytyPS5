@@ -1,3 +1,4 @@
+#include "local/astro-boost.h"
 #include "local/fg-discover.h"
 #include "local/frame-gen.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
@@ -2536,7 +2537,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 					                            gpu_count.first->Handle(), gpu_count.second,
 					                            max_count, stride);
 				}
-			} else if (m_context.GetGraphics().multi_draw_indirect_enabled && max_count > 1) {
+			} else if (m_context.GetGraphics().multi_draw_indirect_enabled && max_count > 1 &&
+			           stride % 4u == 0 && stride >= command_size) {
+				// brunoKytyPs5 (perf/astrobot-rx6600xt-boost): one multi-draw instead of one call per draw.
 				if (draw.IsIndexed()) {
 					vk_buffer.drawIndexedIndirect(buffer_handle, gpu_arguments.second, max_count, stride);
 				} else {
@@ -2581,7 +2584,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		buffer.DeferShaderWriteBarrier(shader_write_stages);
 		RecordPendingWrites(stages);
 		// Bound the per-draw overlap checks.
-		if (m_pending_writes.size() > 512) {
+		// (astro-perf-1025: 512 with KYTY_ASTRO_BOOST=writes, brunoKytyPs5's value.)
+		static const size_t pending_writes_limit = Kyty::AstroBoost::On("writes") ? 512 : 64;
+		if (m_pending_writes.size() > pending_writes_limit) {
 			m_context.GetCommandScheduler().EndRendering();
 			m_pending_writes.clear();
 		}

@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "local/astro-boost.h"
 #include "graphics/host_gpu/renderer/threadSampler.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -551,6 +552,10 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	const auto value = GuestGpuTimestamp();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	static const bool boost_clock = Kyty::AstroBoost::On("clock");
+	if (!boost_clock) {
+		m_renderer.AdvanceBdaEpochForGpuWrite(); // As WriteData.
+	}
 	DrainStats::Record(DrainStats::Kind::GpuTimestamp, 1);
 	LogTimestampWrite("clock", num_bytes, dst_address, value);
 	static std::atomic<uint32_t> clock_log_count {0};
@@ -820,6 +825,11 @@ bool GuestGpu::Process(Submission& submission) {
 	const auto FlushSubmissionIfNeeded = [&](CommandProcessor& cp_inst, bool is_complete) {
 		static const bool ab = AbSelected("batchsubmits");
 		if (ab && AbFeatureOff()) {
+			cp_inst.BufferFlush();
+			return;
+		}
+		static const bool boost_flush = Kyty::AstroBoost::On("flush");
+		if (!is_complete && !boost_flush) {
 			cp_inst.BufferFlush();
 			return;
 		}
@@ -1632,15 +1642,15 @@ bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawReg
 	const bool list      = prim_type == Prospero::PrimitiveType::kTriList ||
 	                  prim_type == Prospero::PrimitiveType::kLineList ||
 	                  prim_type == Prospero::PrimitiveType::kPointList;
-	// Modern shaders and native indirect execution pass base_vertex, first_instance, and
-	// first_index directly via VkDrawIndexedIndirectCommand on GPU, without needing per-draw
-	// CPU User SGPR patching. Bypassing CPU patching allows Vulkan vkCmdDrawIndexedIndirect
-	// to execute multi-draws directly on the GPU in a single call.
+	// A draw whose offsets go into user SGPRs needs them on the CPU: it reads its arguments.
 	const bool patches = registers.vertex_offset != Pm4::SH_NOP ||
 	                     registers.instance_offset != Pm4::SH_NOP ||
 	                     registers.index_offset != Pm4::SH_NOP;
-	static const bool strict_patches = std::getenv("KYTY_STRICT_INDIRECT_PATCHES") != nullptr;
-	const bool allow_gpu_indirect = !patches || !strict_patches;
+	// astro-perf-1025: brunoKytyPs5's bypass of that read (no wait for the GPU, but offsets in user SGPRs keep
+	// stale values) only with KYTY_ASTRO_BOOST=patches. CPU-clean arguments are still read on the CPU (no wait
+	// there; an unregistered buffer would hang the GPU, above).
+	static const bool boost_patches = Kyty::AstroBoost::On("patches");
+	const bool allow_gpu_indirect = gpu_args && (!patches || boost_patches);
 
 	if (indexed && allow_gpu_indirect && (mesh || (list && m_index_type_and_size != 2u)) &&
 	    m_index_buffer_size != 0 && Config::GpuMeshIndirectEnabled() &&
@@ -1693,8 +1703,13 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		// it to max_count on its own). Otherwise read as before; an armed page fault catches a
 		// write the tracker missed.
 		static const bool no_gpu_count = std::getenv("KYTY_DEBUG_NO_GPU_INDIRECT_COUNT") != nullptr;
+		auto&             buffers     = m_renderer.GetBufferCache();
+		static const bool boost_count = Kyty::AstroBoost::On("count");
 		if (!no_gpu_count && max_count_or_count > 1 &&
 		    (stride_in_bytes == 0 || stride_in_bytes >= args_size) &&
+		    (boost_count || buffers.IsRegionGpuModified(count_vaddr, sizeof(uint32_t)) ||
+		     buffers.HasGpuDirtyBytes(count_vaddr, sizeof(uint32_t)) ||
+		     buffers.IsPageGpuDirtyHint(count_vaddr)) &&
 		    DrawIndirectFromGpuArgs(args_addr, registers, indexed, max_count_or_count,
 		                            stride_in_bytes, count_vaddr)) {
 			return;

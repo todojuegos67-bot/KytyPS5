@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "common/emulatorConfig.h"
+#include "local/astro-boost.h"
 
 #include <array>
 
@@ -102,16 +103,23 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 
 } // namespace
 
+// astro-perf-1025: brunoKytyPs5's fast math (MAD as one FMA, FMA without NoContraction) only with
+// KYTY_ASTRO_BOOST=fastmath and --shader-optimization-type Performance.
+static bool FastMath() {
+	static const bool on = ::Kyty::AstroBoost::On("fastmath");
+	return on && ::Config::GetShaderOptimizationType() == ::Config::ShaderOptimizationType::Performance;
+}
+
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto result = EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
-	if (::Config::GetShaderOptimizationType() != ::Config::ShaderOptimizationType::Performance) {
+	if (!FastMath()) {
 		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
 	}
 	return result;
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	if (::Config::GetShaderOptimizationType() == ::Config::ShaderOptimizationType::Performance) {
+	if (FastMath()) {
 		return EmitFPFma32(state, a, b, c);
 	}
 	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24

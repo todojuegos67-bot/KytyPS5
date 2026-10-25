@@ -1280,7 +1280,10 @@ Common::UniqueFunction<vk::Pipeline> PrepareComputePipeline(GraphicContext&     
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	const auto wave_size         = input_info.stage.program->wave_size;
+	// (The device flag no longer implies the compute stage since brunoKytyPs5's vertex-stage sizes.)
 	const bool required_subgroup = graphics.compute_subgroup_size_control_enabled &&
+	                               (graphics.required_subgroup_size_stages &
+	                                vk::ShaderStageFlagBits::eCompute) &&
 	                               wave_size >= graphics.min_subgroup_size &&
 	                               wave_size <= graphics.max_subgroup_size;
 	return [&graphics, layout = pipeline.pipeline_layout, compute_module, driver_cache, wave_size,

@@ -205,13 +205,24 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
 		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		// On 8GB GPUs (e.g. RX 6600 XT), keep working sets resident (up to ~5.5-6GB) without thrashing
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(budget - GiB / 2, 3 * GiB));
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(budget - GiB - GiB / 4, 2 * GiB));
-		m_trigger_gc_memory  = static_cast<uint64_t>(
-		    std::max<int64_t>(budget - 2 * GiB, GiB));
+		if (budget < 12 * GiB) {
+			// brunoKytyPs5 (perf/astrobot-rx6600xt-boost): on GPUs under 12 GiB (an 8 GiB RX 6600 XT), keep
+			// working sets resident (up to ~5.5-6GB) without thrashing.
+			m_critical_gc_memory = static_cast<uint64_t>(
+			    std::max<int64_t>(budget - GiB / 2, 3 * GiB));
+			m_pressure_gc_memory = static_cast<uint64_t>(
+			    std::max<int64_t>(budget - GiB - GiB / 4, 2 * GiB));
+			m_trigger_gc_memory  = static_cast<uint64_t>(
+			    std::max<int64_t>(budget - 2 * GiB, GiB));
+		} else {
+			const auto threshold = std::min<int64_t>(budget, 8 * GiB);
+			m_pressure_gc_memory = static_cast<uint64_t>(std::max<int64_t>(
+			    std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+			m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(
+			    std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+			m_trigger_gc_memory =
+			    static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		}
 	}
 }
 

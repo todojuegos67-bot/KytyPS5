@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "common/emulatorConfig.h"
+#include "local/astro-boost.h"
 
 #include <algorithm>
 #include <bit>
@@ -908,9 +909,12 @@ void DefineModule(EmitterState& state) {
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
 		}
+		// astro-perf-1025: brunoKytyPs5's forced early tests only with KYTY_ASTRO_BOOST=earlyz (and Performance).
+		static const bool boost_early_z = ::Kyty::AstroBoost::On("earlyz");
 		const bool early_z =
 		    (state.input_info.pixel->ps_early_z ||
-		     ::Config::GetShaderOptimizationType() == ::Config::ShaderOptimizationType::Performance) &&
+		     (boost_early_z &&
+		      ::Config::GetShaderOptimizationType() == ::Config::ShaderOptimizationType::Performance)) &&
 		    !state.input_info.pixel->ps_pixel_kill_enable &&
 		    !state.input_info.pixel->ps_depth_export_enable &&
 		    !state.input_info.pixel->ps_sample_mask_export_enable;

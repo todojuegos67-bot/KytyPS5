@@ -318,9 +318,13 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	constexpr int64_t GiB              = 1024ll * 1024 * 1024;
 	const auto        budget =
 	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-	// On 8GB GPUs (e.g. RX 6600 XT), keep buffer allocations resident without aggressive GC thrashing
-	const auto expected  = budget - 2 * GiB;
-	const auto critical  = budget - GiB;
+	// brunoKytyPs5 (perf/astrobot-rx6600xt-boost): on GPUs under 12 GiB (an 8 GiB RX 6600 XT), keep buffer
+	// allocations resident without aggressive GC thrashing; larger GPUs keep this tree's thresholds.
+	constexpr int64_t target_threshold = 8 * GiB;
+	const auto        threshold        = std::min(budget, target_threshold);
+	const bool        small_gpu        = budget < 12 * GiB;
+	const auto expected = small_gpu ? budget - 2 * GiB : std::min(budget - 6 * threshold / 10, budget - GiB);
+	const auto critical = small_gpu ? budget - GiB : std::min(budget - 2 * threshold / 10, budget - GiB / 2);
 	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
 }
