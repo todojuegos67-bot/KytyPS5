@@ -109,6 +109,7 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	void StartPrewarm(); // pipelinePrewarm.h
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -192,6 +193,7 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
 	bool                          m_driver_cache_dirty = false;
+	bool                          m_prewarm_started    = false;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -228,6 +230,7 @@ struct ComputePipelineJob {
 	vk::ShaderModule module                 = nullptr;
 	uint32_t         required_subgroup_size = 0;
 	uint64_t         spirv_words            = 0;
+	uint64_t         prewarm_key            = 0; // pipelinePrewarm.h
 };
 void CreateComputeLayoutInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                  const ShaderComputeInputInfo& input_info,
