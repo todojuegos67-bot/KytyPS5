@@ -148,6 +148,26 @@ bool PhaseOn() {
 	return on;
 }
 
+// KYTY_PAD_LATE_MS (anti-lag.h): L ms before the frame's flip slot, 0 off.
+static double PadLateMs() {
+	static const double ms = [] {
+		const char* v = std::getenv("KYTY_PAD_LATE_MS");
+		const double r = v != nullptr ? std::atof(v) : 0.0;
+		const double c = r > 0.0 ? std::clamp(r, 10.0, 80.0) : 0.0;
+		if (c > 0.0) {
+			std::printf("Pad late: the controller read waits until %.1f ms before its frame's flip slot (KYTY_PAD_LATE_MS; "
+			            "under a 25-45 ms flip limit only)\n", c);
+			std::fflush(stdout);
+		}
+		return c;
+	}();
+	return ms;
+}
+
+bool PadLateOn() {
+	return PadLateMs() > 0.0;
+}
+
 bool PaceOn() {
 	static const bool on = [] {
 		const char* off = std::getenv("KYTY_LOWLAT_PACE_BEFORE_INPUT");
@@ -290,6 +310,8 @@ double  LatTicksPerMs();
 struct StageStamp {
 	std::atomic<uint64_t> index {0};
 	std::atomic<int64_t>  input {0}, reserve {0}, ready {0}, release {0};
+	std::atomic<int64_t>  slot {0};      // KYTY_PAD_LATE_MS: the flip slot the read was placed against (0: not paced)
+	std::atomic<double>   slept {0.0};   // KYTY_PAD_LATE_MS: ms slept before the read
 };
 constexpr uint64_t      kStageRing = 64;
 StageStamp              g_stage[kStageRing];
@@ -405,10 +427,90 @@ void PaceBeforeInput(uint64_t index) {
 	lock.unlock();
 	PaceLogOnce("drain wait", waited);
 }
+
+// KYTY_PAD_LATE_MS: per-5 s counters (under g_pace_mutex).
+struct PadLateStats {
+	int64_t  start = 0;
+	uint32_t reads = 0, slept = 0, already_late = 0, idle = 0, released = 0, misses = 0, caused = 0, stutters = 0;
+	double   slept_ms = 0.0, lead_sum = 0.0, late_sum = 0.0;
+	uint32_t lead_n = 0;
+};
+PadLateStats g_padlate;
+
+// The read of frame `index` waits until L ms before its slot: the last release + cap for each frame since. Returns the
+// slot (LatNow ticks, 0: not paced) and the ms slept.
+int64_t PadLateStep(uint64_t index, double& slept_ms) {
+	slept_ms = 0.0;
+	if (!PadLateOn()) return 0;
+	const double per_ms = LatTicksPerMs();
+	std::unique_lock lock(g_pace_mutex);
+	const double cap = g_pace.cap_ms;
+	g_padlate.reads++;
+	const int64_t now = LatNow();
+	if (cap < 25.0 || cap > 45.0 || g_rel_index == 0 || index <= g_rel_index || index - g_rel_index > 3 ||
+	    static_cast<double>(now - g_rel_ticks) / per_ms > 200.0) {
+		g_padlate.idle++;
+		return 0;
+	}
+	const double  ahead = cap * static_cast<double>(index - g_rel_index);
+	const int64_t slot  = g_rel_ticks + static_cast<int64_t>(ahead * per_ms);
+	const int64_t until = slot - static_cast<int64_t>(PadLateMs() * per_ms);
+	if (until <= now) {
+		g_padlate.already_late++;
+		return slot;
+	}
+	lock.unlock();
+	const double wait = std::min(static_cast<double>(until - now) / per_ms, cap);
+	const int64_t end = now + static_cast<int64_t>(wait * per_ms);
+	if (wait > 1.5) std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>((wait - 1.0) * 1000.0)));
+	while (LatNow() < end) std::this_thread::yield();
+	slept_ms = static_cast<double>(LatNow() - now) / per_ms;
+	lock.lock();
+	g_padlate.slept++;
+	g_padlate.slept_ms += slept_ms;
+	return slot;
+}
+
+// At a release: a paced frame later than its slot is a miss; caused by the wait when it is late by no more than it slept.
+void PadLateRelease(StageStamp& st, int64_t now, double dt_ms) {
+	if (!PadLateOn()) return;
+	const double per_ms = LatTicksPerMs();
+	auto&        p      = g_padlate;
+	if (p.start == 0) p.start = now;
+	p.released++;
+	const double vb = g_pace.vblank_ms > 0.0 ? g_pace.vblank_ms : 1.0;
+	if (g_pace.cap_ms > 0.0 && dt_ms > g_pace.cap_ms + vb * 1.5 && dt_ms < 200.0) p.stutters++;
+	const int64_t slot = st.slot.load(std::memory_order_relaxed);
+	const int64_t in   = st.input.load(std::memory_order_relaxed);
+	const int64_t rd   = st.ready.load(std::memory_order_relaxed);
+	if (in != 0 && rd > in) {
+		p.lead_sum += static_cast<double>(rd - in) / per_ms;
+		p.lead_n++;
+	}
+	if (slot != 0) {
+		const double late = static_cast<double>(now - slot) / per_ms;
+		if (late > vb * 0.5 + 0.5) {
+			p.misses++;
+			p.late_sum += late;
+			if (late <= st.slept.load(std::memory_order_relaxed) + vb) p.caused++;
+		}
+	}
+	if (static_cast<double>(now - p.start) / per_ms >= 5000.0) {
+		std::printf("[padlate] 5 s: L %.1f ms, cap %.1f: %u reads (%u slept, mean %.1f ms; %u already past L; %u not under a "
+		            "30-ish limit); %u releases, %u stutters; %u paced frames missed their slot (mean %.1f ms late), %u of "
+		            "them caused by the wait; input -> gpu done %.1f ms\n",
+		            PadLateMs(), g_pace.cap_ms, p.reads, p.slept, p.slept ? p.slept_ms / p.slept : 0.0, p.already_late, p.idle,
+		            p.released, p.stutters, p.misses, p.misses ? p.late_sum / p.misses : 0.0, p.caused,
+		            p.lead_n ? p.lead_sum / p.lead_n : 0.0);
+		std::fflush(stdout);
+		p       = PadLateStats {};
+		p.start = now;
+	}
+}
 } // namespace
 
 void SetPaceCap(double cap_ms, double vblank_ms) {
-	if (!PaceOn() && !PhaseOn()) return;
+	if (!PaceOn() && !PhaseOn() && !PadLateOn()) return;
 	std::lock_guard lock(g_pace_mutex);
 	if (cap_ms <= 0.0) { // (not a capped game-view frame: off, and start over)
 		g_pace.cap_ms = 0.0;
@@ -454,6 +556,10 @@ void OnFlipReleased(uint64_t frame_index) {
 				if (g_pace.skip > 0) g_pace.skip--;
 				g_pace.margin = std::max(g_pace.margin - 0.05, Own().margin);
 			}
+		}
+		if (PadLateOn()) {
+			const double dt = g_rel_ticks != 0 ? static_cast<double>(now - g_rel_ticks) / LatTicksPerMs() : 0.0;
+			PadLateRelease(*st, now, frame_index == g_rel_index + 1 ? dt : 0.0);
 		}
 		if (frame_index > g_rel_index) {
 			g_rel_index = frame_index;
@@ -816,7 +922,7 @@ void PhaseRelease(double queued_ms) {
 void OnInput(const char* site) {
 	if (Own().on) OwnLimit();
 	const Mode mode = g_mode.load(std::memory_order_relaxed);
-	if (mode == Mode::Off && !LatencyOn() && !PaceOn() && !PhaseOn()) return;
+	if (mode == Mode::Off && !LatencyOn() && !PaceOn() && !PhaseOn() && !PadLateOn()) return;
 	// Once per flip: the first controller read after the game flipped its last frame starts the next one.
 	const uint64_t flips = g_flips.load(std::memory_order_acquire);
 	uint64_t       seen  = g_flips_at_input.load(std::memory_order_relaxed);
@@ -864,9 +970,13 @@ void OnInput(const char* site) {
 	g_pace_site = site;
 	PaceBeforeInput(index); // KYTY_LOWLAT_PACE_BEFORE_INPUT: sleep before the sample, not after
 	PhaseStep(site);        // KYTY_PHASE_PACE: the step at its phase of the flip grid
+	double        pad_slept = 0.0;
+	const int64_t pad_slot  = PadLateStep(index, pad_slept); // KYTY_PAD_LATE_MS: the read L ms before its slot
 	{
 		auto& st = g_stage[index % kStageRing];
 		st.index.store(0, std::memory_order_release);
+		st.slot.store(pad_slot, std::memory_order_relaxed);
+		st.slept.store(pad_slept, std::memory_order_relaxed);
 		st.reserve.store(0, std::memory_order_relaxed);
 		st.ready.store(0, std::memory_order_relaxed);
 		st.release.store(0, std::memory_order_relaxed);
@@ -882,7 +992,7 @@ void OnInput(const char* site) {
 }
 
 uint64_t OnFlipReserved() {
-	if (g_mode.load(std::memory_order_relaxed) == Mode::Off && !LatencyOn() && !PaceOn() && !PhaseOn()) return 0;
+	if (g_mode.load(std::memory_order_relaxed) == Mode::Off && !LatencyOn() && !PaceOn() && !PhaseOn() && !PadLateOn()) return 0;
 	g_flips.fetch_add(1, std::memory_order_acq_rel);
 	const uint64_t index  = g_input_index.load(std::memory_order_acquire);
 	uint64_t       tagged = g_tagged_index.load(std::memory_order_relaxed);
