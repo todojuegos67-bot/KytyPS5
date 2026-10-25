@@ -202,6 +202,9 @@ bool Upscale(const UpscaleDesc& desc) {
 		init.qualitySetting   = QualityFor(ratio);
 		// The game's depth is reversed; its 3D image linear HDR (exposure computed by XeSS).
 		init.initFlags = XESS_INIT_FLAG_INVERTED_DEPTH | XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE;
+		// (rtparticles) KYTY_RT_PARTICLES=2: the responsive pixel mask input (particles) is given at execute.
+		if (const char* rtp = std::getenv("KYTY_RT_PARTICLES"); rtp != nullptr && std::atoi(rtp) >= 2)
+			init.initFlags |= XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK;
 		if (const auto result = g_api.init(g_context, &init); result != XESS_RESULT_SUCCESS) {
 			std::printf("XeSS: init failed (%d): upscaling off\n", static_cast<int>(result));
 			std::fflush(stdout);
@@ -240,6 +243,8 @@ bool Upscale(const UpscaleDesc& desc) {
 	exec.velocityTexture = ViewInfo(*desc.motion, desc.motion_view, false);
 	exec.depthTexture    = ViewInfo(*desc.depth, desc.depth_view, true);
 	exec.outputTexture   = ViewInfo(*desc.output, desc.output_view, false);
+	if (desc.mask != nullptr && desc.mask->image != nullptr && desc.mask_view != nullptr)
+		exec.responsivePixelMaskTexture = ViewInfo(*desc.mask, desc.mask_view, false); // (rtparticles)
 	// (After the game's TAA: 0, its jitter resolved. KYTY_TAA_REPLACE=upscaler: the camera's; KYTY_XESS_JITTER_SIGN=-1 the
 	// other way round.)
 	static const float jitter_sign = [] {

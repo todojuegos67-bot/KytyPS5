@@ -14,6 +14,7 @@
 //                soft AO; distance fade -> out (render res)
 //   5 gather:    (rtfire, KYTY_SSGI_EMISSIVE) one 8x8 workgroup per cell of a 32x18 grid over the render: the cell's
 //                emissive pixels (EmissiveW) reduced to one area light (position, power, mean normal, area) -> lights
+//   6 reactive:  (rtparticles, KYTY_RT_PARTICLES=2) the particle reactive mask for the upscaler -> react_out (render res)
 // Emissive light ("fire light", KYTY_SSGI_EMISSIVE > 0): a pixel is an emitter when its exposed luminance is high AND
 // far above what its G-buffer albedo (L0.b0..2) could reflect (lit colour / albedo = the irradiance it would need: a lit
 // wall needs a few x white, a flame or lava tens), softly, with less weight for unsaturated (white: glints, sky
@@ -38,6 +39,10 @@ layout(binding = 10, rgba16f) uniform writeonly image2D aux_out; // temporal: mo
                                                                  // trace (emissive on): the emissive irradiance
 layout(binding = 11) uniform sampler2D emi_tex;    // composite: the denoised emissive irradiance (trace res)
 layout(binding = 12) uniform usampler2D packed0;   // G-buffer layer 0 (albedo rgb8; flag 2), else a 1x1 stand-in
+// (rtparticles, KYTY_RT_PARTICLES) 15: the scene color copied right before the particle pass (flag 4; else the color
+// itself): color - pre_tex is the particles' own emission. 16: the reactive mask mode 6 writes (R8; level 2).
+layout(binding = 15) uniform sampler2D pre_tex;
+layout(binding = 16) uniform writeonly image2D react_out;
 const int CW = 32, CH = 18, CELLS = CW * CH;
 // hdr: [0] lights listed this frame, [1] 1.0 (the exposure without the game's), [2] gather samples, [3] emissive pixels
 // (w > 0.5), [4] composite samples (1/64 of the pixels), [5] of them lit (> 0.002 exposed), [6] sum of the added exposed
@@ -59,9 +64,9 @@ layout(push_constant) uniform Push {
 	vec4  motion;    // motion_scale.xy, render size.xy
 	vec4  trace;     // trace size.xy, intensity, ao strength
 	ivec4 misc;      // mode, frame index, quality, flags (bit0 reset, bit1 history valid)
-	vec4  extra;     // a-trous step, ray length (view units), thickness, unused
+	vec4  extra;     // a-trous step, ray length (view units), thickness, reactive mask strength (mode 6)
 	vec4  emis;      // emissive strength (x internal gain), exposed luminance threshold, lit/albedo ratio threshold, range
-	ivec4 emisc;     // flags (1 emissive on, 2 G-buffer albedo bound), exposure index, view (1 mask, 2 added light), -
+	ivec4 emisc;     // flags (1 emissive on, 2 G-buffer albedo bound, 4 pre-particle color bound), exposure index, view (1 mask, 2 added light), -
 } push;
 
 const float PI = 3.14159265;
@@ -142,8 +147,9 @@ float Hash(uvec3 v) { // pcg3d-style, one float in [0, 1)
 	v.x += v.y * v.z;
 	return float(v.x >> 8) / 16777216.0;
 }
-// 0..1: how much of this pixel is an emitter (see the header). col: its lit colour (pre-exposure), z its view depth.
-float EmissiveW(ivec2 px, vec3 col, float z, float e) {
+// 0..1: how much of this pixel is an emitter by its lit surface colour (see the header). col: its lit colour
+// (pre-exposure), z its view depth.
+float SurfaceEmissiveW(ivec2 px, vec3 col, float z, float e) {
 	if (!EmOn() || any(isnan(col)) || any(isinf(col))) return 0.0;
 	float fz = 1.0 - smoothstep(50.0, 80.0, z); // (far / fogged lights are no source: fog and distance glow stay as drawn)
 	if (fz <= 0.0) return 0.0;
@@ -164,6 +170,33 @@ float EmissiveW(ivec2 px, vec3 col, float z, float e) {
 	}
 	return wl * wr * ws * fz;
 }
+// (rtparticles) The particles' own emission at a render pixel: what the particle pass added over the pre-particle copy
+// (additive particles exactly; alpha-blended ones alpha x (particle - background), negative where smoke darkens: 0).
+bool ParticlesOn() { return (push.emisc.x & 4) != 0; }
+vec3 ParticleEmission(ivec2 px, vec3 col) {
+	vec3 pre = texelFetch(pre_tex, px, 0).rgb;
+	if (any(isnan(pre)) || any(isinf(pre))) return vec3(0);
+	return max(col - max(pre, vec3(0)), vec3(0));
+}
+// The emitter at a pixel: .rgb its radiance (pre-exposure), .a its weight 0..1. With the pre-particle copy a bright
+// particle is an emitter of its own emission (a flame over a lit wall: the flame only; lit stone: never), the surface
+// test still finds lava and emissive materials drawn before the particles; the stronger of the two.
+vec4 Emitter(ivec2 px, vec3 col, float z, float e) {
+	float ws = SurfaceEmissiveW(px, col, z, e);
+	vec4  r  = vec4(max(col, vec3(0)) * ws, ws);
+	if (!ParticlesOn() || !EmOn() || any(isnan(col)) || any(isinf(col))) return r;
+	float fz = 1.0 - smoothstep(50.0, 80.0, z);
+	if (fz <= 0.0) return r;
+	vec3  em = ParticleEmission(px, col);
+	float lx = Luma(em) * e;
+	float lt = push.emis.y;
+	float wl = smoothstep(lt, 2.0 * lt, lx);          // bright enough (embers, flames, spell glow; not fog or smoke)
+	float sh = Luma(em) / max(Luma(max(col, vec3(0))), 1e-6);
+	float wp = wl * smoothstep(0.3, 0.6, sh) * fz;    // and most of the pixel's light is the particle's
+	if (wp <= r.a) return r;
+	return vec4(em * wp, wp);
+}
+float EmissiveW(ivec2 px, vec3 col, float z, float e) { return Emitter(px, col, z, e).a; }
 
 // Mode 5: one workgroup per cell. Pass 1: the nearest emitter depth in the cell; pass 2: the emitters within 1.5x of it
 // (a flame drawn over a far background keeps its near part) reduced to one light.
@@ -208,13 +241,14 @@ void Gather() {
 				float z = abs(ViewZ(d));
 				if (z > zlim) continue;
 				vec3  col = max(texelFetch(color_tex, px, 0).rgb, vec3(0));
-				float w   = EmissiveW(px, col, z, e);
+				vec4  em  = Emitter(px, col, z, e);
+				float w   = em.a;
 				if (w <= 0.0) continue;
 				vec2  uv   = (vec2(px) + 0.5) / rs;
 				vec3  p    = ViewPos(uv, d);
 				float wv   = abs(p.z * push.depth_map.z + push.depth_map.w);
 				float area = (2.0 * wv / (abs(push.proj.x) * rs.x)) * (2.0 * wv / (abs(push.proj.y) * rs.y)); // view units^2
-				vec3  rad  = col * w;
+				vec3  rad  = em.rgb; // (the emitter's own radiance x its weight)
 				float wl   = Luma(rad) * area + 1e-12;
 				A += vec4(p * wl, wl);
 				B += vec4(rad * area, w);
@@ -641,10 +675,27 @@ void Composite(ivec2 pixel) {
 	imageStore(out_img, pixel, vec4(max(rgb, vec3(0)), col.a));
 }
 
+// (rtparticles) Mode 6: the reactive mask for the upscaler at the render size: the share of the pixel's light the
+// particle pass changed (|color - pre| against the brighter of the two), x the strength (push.extra.w); 0 on the sky
+// too when nothing was drawn there.
+void Reactive(ivec2 pixel) {
+	vec3  col = texelFetch(color_tex, pixel, 0).rgb;
+	vec3  pre = texelFetch(pre_tex, pixel, 0).rgb;
+	float m   = 0.0;
+	if (!any(isnan(col)) && !any(isinf(col)) && !any(isnan(pre)) && !any(isinf(pre))) {
+		col = max(col, vec3(0)), pre = max(pre, vec3(0));
+		float d  = Luma(abs(col - pre));
+		float b  = max(max(Luma(col), Luma(pre)), 1e-5);
+		m        = clamp(d / b, 0.0, 1.0);
+		m        = smoothstep(0.05, 0.5, m) * push.extra.w; // (a faint haze is no reactive pixel)
+	}
+	imageStore(react_out, pixel, vec4(m, 0, 0, 1));
+}
+
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	int   mode  = push.misc.x;
-	ivec2 size  = ivec2(mode == 4 ? RenderSize() : TraceSize());
+	ivec2 size  = ivec2(mode == 4 || mode == 6 ? RenderSize() : TraceSize());
 	if (mode == 5) {
 		Gather(); // (one workgroup per cell: no per-pixel bound)
 		return;
@@ -653,5 +704,6 @@ void main() {
 	if (mode == 0) Trace(pixel);
 	else if (mode == 1) Temporal(pixel);
 	else if (mode == 4) Composite(pixel);
+	else if (mode == 6) Reactive(pixel);
 	else Atrous(pixel);
 }

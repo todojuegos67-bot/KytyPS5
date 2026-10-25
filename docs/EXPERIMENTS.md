@@ -573,3 +573,33 @@ GPU 碰撞只给脚部 IK：`GpuCollisionManager::CastRay` 全镜像唯一调用
 - Not done, with the reason: shadow-atlas upscale (no render-target scaling in the emulator; the cube pool is written as
   an R32 storage image with integer coordinates; the spot pool's per-layer guest hashes assume the guest layout);
   local-light contact shadows (need the light positions: step 1's proof).
+
+## 2026-10-25 RT particles (rtparticles-1025): the particle pass's own emission for the fire light, a reactive mask
+
+- Evidence on how the game draws particles (`tools/local/static-precompile/files-PPSA01341_01.007.000.files`, the engine's
+  `coredata/enginesupport/shaders/_ps5/particle-*`): 603 cooked particle CS (one per emitter) simulate on the GPU;
+  `particle-sort-prep` + `particle-sort` (bitonic) order them; one engine pass `particle-translucent` (main_vs_79da320e + 3
+  main_ps variants, plus ultralow / underwater / displacement / distortion / motionblur / fog / ui variants) draws them
+  blended onto the HDR scene colour; `particle-lightmap-update` (4 CS) lights them from the game's lights; `particle-apply-
+  distortion` is a CS after them; `particle-clear`, `-connect-ribbons`, `-smooth-ribbons`. No half-res particle target
+  in the engine's pass list (`depthawareupsample` exists, one CS: fog). The PS5 Pro super-resolution packet has a slot 6
+  "reactive mask" the game prepares (`preparereactivemask` CS) that the emulator never used (logged by the debug switch).
+  Particles write no depth: the SSGI fire light (rtfire) placed a flame's light at the surface behind it and took the
+  whole pixel (flame + wall) as the radiance, finding flames only by lit/albedo ratio (never over the sky).
+- `KYTY_RT_PARTICLES=1`: the scene colour is copied right before the frame's first blended, depth-test-on, depth-write-off
+  draw into the upscaler's colour image (the particle pass; `KYTY_RT_PARTICLES_VS=<hex,..>` pins the shaders,
+  `KYTY_RT_PARTICLES_ANYDEPTH=1` drops the depth-test condition); ssgi.comp's emitter = the particles' own emission
+  (colour - copy) where it is bright and most of the pixel, else the old surface test. Cost: one render-size RGBA16F copy
+  (~0.05-0.1 ms at 1440p on an RTX 5090) + one render-pass break; no new SSGI dispatches.
+- `KYTY_RT_PARTICLES=2`: + an R8 reactive mask of the particle emission share (ssgi.comp mode 6, one render-size pass,
+  ~0.02 ms) for the upscaler: FSR 3.1 reactive + transparency-and-composition, XeSS responsive pixel mask (context flag),
+  DLSS bias-current-color hint. `KYTY_RT_PARTICLES_REACTIVE` (0.8). Needs KYTY_SSGI >= 1 (the mask is an SSGI mode).
+- `KYTY_RT_PARTICLES_DEBUG=1`: every 10 s the ordered passes onto the upscaler's colour images of the last flip (VS/PS,
+  blend factors, depth state, draws / instances, indirect; CS writing them; table / native-path draws), the copy's state,
+  the game's reactive-mask slot. The first run's census decides whether the heuristic picked the particle pass.
+- Not done, why: a particle depth (correct light position for braziers in open rooms) needs the pass re-drawn with depth
+  writes into our own depth image (a pipeline variant per particle pipeline, mid-pass), unproven blind; particles
+  receiving our RT/SSGI light needs the particle PS patched (particle-lightmap-update is the game's own lighting: the
+  game already lights them); frame generation (DLSS-G, FFX FI) takes no reactive/particle mask, so FG smearing of
+  particles is not addressable from here (the SR mask is). RT reflections already sample the final colour at the hit, so
+  fire over a surface reflects already; fire over the sky cannot (no depth).

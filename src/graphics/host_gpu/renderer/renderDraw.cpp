@@ -1837,6 +1837,33 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		FrameGen::BeforeFlipDraw(buffer, rendering, state.color_info[flip_slot].image_id, static_cast<uint32_t>(flip_slot),
 		                         std::span<const TextureBinding> {bindings.pixel->images}, emit_draw);
 	}
+	// (rtparticles) KYTY_RT_PARTICLES: the scene color copied before the frame's first blended draw into it (the particle
+	// pass); its census. Before the pass begins (it may end the one in progress and resume it).
+	if (FrameGen::RtParticlesWanted() && flip_slot < 0 && !record_draw && state.color_count > 0 && state.color_info[0].image_id &&
+	    rendering.num_color_attachments > 0) {
+		const auto&          hw = buffer.GetRegisters();
+		const auto&          bc = hw.GetBlendControl(state.color_info[0].target_slot);
+		const auto&          dc = hw.GetDepthControl();
+		const auto&          ci = state.color_info[0];
+		FrameGen::SceneDraw  sd;
+		sd.target      = ci.image_id;
+		sd.address     = ci.desc.info.data.address;
+		sd.width       = ci.Extent().width;
+		sd.height      = ci.Extent().height;
+		sd.format      = static_cast<int32_t>(ci.desc.view_info.format);
+		sd.vs          = state.vs_input_info.stage.program != nullptr ? state.vs_input_info.stage.program->shader_hash : 0;
+		sd.ps          = state.ps_active && state.ps_input_info.stage.program != nullptr ? state.ps_input_info.stage.program->shader_hash : 0;
+		sd.blend       = bc.enable;
+		sd.src_blend   = static_cast<uint8_t>(bc.color_srcblend);
+		sd.dst_blend   = static_cast<uint8_t>(bc.color_destblend);
+		sd.comb        = static_cast<uint8_t>(bc.color_comb_fcn);
+		sd.depth_test  = state.depth_info.image_id && dc.z_enable;
+		sd.depth_write = state.depth_info.image_id && dc.z_write_enable;
+		sd.indirect    = emit.gpu_args != 0 || !emit.direct_run.empty();
+		sd.instances   = draw.instance_count;
+		sd.index_count = draw.index_count;
+		FrameGen::BeforeSceneDraw(buffer, m_context.GetTextureCache(), rendering, rendering.color_attachments[0].image_layout, sd);
+	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	if (!record_draw) {
 		if (set_auto_debug) {
