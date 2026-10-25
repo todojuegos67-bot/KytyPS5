@@ -3963,6 +3963,12 @@ namespace {
 // SVGF-style variance-guided temporal + a-trous (3 passes, 4 at Ultra), Ultra anti-flicker, temporal (alpha 0.1, clamped),
 // 2 a-trous passes, bilateral upsample. KYTY_SSGI_INTENSITY (0.85 / 1.1 / 1.25 by quality), KYTY_SSGI_AO (0.25).
 // Normals from depth derivatives; view positions from the game's view_to_clip (handles reverse-Z).
+// (rtfire) KYTY_SSGI_EMISSIVE (strength, 0..4; default 1.0 at KYTY_SSGI >= 2, 0 at 1): "fire light": torches, bonfires,
+// lava and other emissive pixels become area lights (one per cell of a 32x18 grid, ssgi.comp mode 5) found from the
+// lit colour against the G-buffer albedo (KYTY_RT_REFLECTIONS' packed copy, layer 0 bytes 0..2), shadowed by
+// screen-space rays, denoised (temporal + 2 a-trous) and added as albedo x irradiance. KYTY_SSGI_EMISSIVE_LUM (exposed
+// luminance threshold, 1.5), KYTY_SSGI_EMISSIVE_RATIO (lit colour / albedo threshold, 12), KYTY_SSGI_EMISSIVE_RANGE
+// (m, 8), KYTY_SSGI_EMISSIVE_VIEW (1 the emitter mask, 2 the added light only). Every 10 s "SSGI emissive:" stats.
 struct SsgiImage {
 	VulkanImage   image;
 	vk::ImageView view = nullptr;
@@ -3979,6 +3985,19 @@ struct SsgiPass {
 	SsgiImage               history[2], gbuf[2];
 	SsgiImage               moments[2], var_a, var_b; // (luma m1, m2, count, variance) / filtered variance (trace res)
 	SsgiImage               gihist[2];                // the composited GI (render res), level 3's anti-flicker
+	// (rtfire) Emissive light: its trace output, temporal/a-trous ping-pong, history and moments (trace res; only
+	// when KYTY_SSGI_EMISSIVE > 0), the light list + counters, their host copies (a ring of 4), a 1x1 R32_UINT stand-in.
+	SsgiImage               emi_raw, emi_tmp, emi_hist[2], emi_mom[2];
+	VkBuffer                lights = VK_NULL_HANDLE, readback = VK_NULL_HANDLE;
+	VmaAllocation           lights_mem = VK_NULL_HANDLE, readback_mem = VK_NULL_HANDLE;
+	const uint32_t*         readback_map = nullptr;
+	VkImage                 dummy_image = VK_NULL_HANDLE;
+	VmaAllocation           dummy_mem   = VK_NULL_HANDLE;
+	vk::ImageView           dummy_view  = nullptr;
+	bool                    dummy_ready = false, emi_failed = false;
+	double                  em_acc[8] {};
+	uint32_t                em_frames = 0, em_gbuf_frames = 0;
+	std::chrono::steady_clock::time_point em_last_log = std::chrono::steady_clock::now();
 	uint32_t                frame         = 0;
 	int                     quality       = 0;
 	bool                    history_valid = false;
@@ -4000,6 +4019,21 @@ struct SsgiPush {
 	float   extra[4];
 };
 static_assert(sizeof(SsgiPush) == 96);
+// (rtfire) SSGI's own push constants: SsgiPush (shared with GTAO's, which extends it: unchanged) + the emissive terms.
+struct SsgiPushE : SsgiPush {
+	float   emis[4];  // strength x gain, exposed luminance threshold, lit/albedo ratio threshold, range (view units)
+	int32_t emisc[4]; // flags (1 on, 2 G-buffer albedo), exposure index, view mode, -
+};
+static_assert(sizeof(SsgiPushE) == 128);
+constexpr uint32_t SsgiCells       = 32 * 18;
+constexpr uint32_t SsgiLightsBytes = 64 + SsgiCells * 4 + SsgiCells * 48; // hdr[16], list, 3 vec4 a cell
+constexpr uint32_t SsgiStatWords   = 8;
+constexpr uint32_t SsgiBindings    = 15;
+vk::DescriptorType SsgiDescType(uint32_t i) {
+	if (i == 13 || i == 14) return vk::DescriptorType::eStorageBuffer;
+	if (i == 7 || i == 8 || i == 10) return vk::DescriptorType::eStorageImage;
+	return vk::DescriptorType::eCombinedImageSampler;
+}
 
 int SsgiQuality() {
 	static const int quality = [] {
@@ -4011,6 +4045,87 @@ int SsgiQuality() {
 float SsgiEnv(const char* name, float fallback, float hi) {
 	const char* value = std::getenv(name);
 	return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, hi) : fallback;
+}
+// (rtfire) The emissive light's strength: 0 off (nothing created); on by default from KYTY_SSGI=2.
+float SsgiEmissive() {
+	static const float strength = SsgiQuality() <= 0 ? 0.0f : SsgiEnv("KYTY_SSGI_EMISSIVE", SsgiQuality() >= 2 ? 1.0f : 0.0f, 4.0f);
+	return strength;
+}
+std::array<SsgiImage*, 6> SsgiEmisAll() {
+	return {&g_ssgi.emi_raw, &g_ssgi.emi_tmp, &g_ssgi.emi_hist[0], &g_ssgi.emi_hist[1], &g_ssgi.emi_mom[0], &g_ssgi.emi_mom[1]};
+}
+// The light buffer, its host ring and the stand-in image (once; on failure the emissive light stays off).
+bool SsgiEmisCreate(GraphicContext& graphics) {
+	if (g_ssgi.lights != VK_NULL_HANDLE) return true;
+	if (g_ssgi.emi_failed) return false;
+	g_ssgi.emi_failed = true;
+	VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+	buffer.size  = SsgiLightsBytes;
+	buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	VmaAllocationCreateInfo dev {};
+	dev.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+	if (vmaCreateBuffer(graphics.allocator, &buffer, &dev, &g_ssgi.lights, &g_ssgi.lights_mem, nullptr) != VK_SUCCESS) {
+		g_ssgi.lights = VK_NULL_HANDLE;
+		return false;
+	}
+	buffer.size  = 4 * SsgiStatWords * 4;
+	buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VmaAllocationCreateInfo host {};
+	host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+	host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+	VmaAllocationInfo mapped {};
+	if (vmaCreateBuffer(graphics.allocator, &buffer, &host, &g_ssgi.readback, &g_ssgi.readback_mem, &mapped) != VK_SUCCESS) {
+		g_ssgi.readback = VK_NULL_HANDLE;
+		return false;
+	}
+	g_ssgi.readback_map = static_cast<const uint32_t*>(mapped.pMappedData);
+	VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+	create.imageType   = VK_IMAGE_TYPE_2D;
+	create.format      = VK_FORMAT_R32_UINT;
+	create.extent      = {1, 1, 1};
+	create.mipLevels   = 1;
+	create.arrayLayers = 1;
+	create.samples     = VK_SAMPLE_COUNT_1_BIT;
+	create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+	create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	VmaAllocationCreateInfo allocate {};
+	allocate.usage = VMA_MEMORY_USAGE_AUTO;
+	if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_ssgi.dummy_image, &g_ssgi.dummy_mem, nullptr) != VK_SUCCESS) {
+		g_ssgi.dummy_image = VK_NULL_HANDLE;
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = vk::Image(g_ssgi.dummy_image);
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = vk::Format::eR32Uint;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (graphics.device.createImageView(&view_info, nullptr, &g_ssgi.dummy_view) != vk::Result::eSuccess) return false;
+	g_ssgi.emi_failed = false;
+	return true;
+}
+// Every frame: this frame's counters from 3 frames ago (statistics only); every 10 s the "SSGI emissive:" line.
+void SsgiEmisStats(bool have_gbuf) {
+	if (g_ssgi.readback_map == nullptr) return;
+	if (g_ssgi.frame >= 4) {
+		const uint32_t* w = g_ssgi.readback_map + ((g_ssgi.frame + 1) % 4) * SsgiStatWords; // (written 3 frames ago)
+		for (uint32_t i = 0; i < SsgiStatWords; ++i)
+			g_ssgi.em_acc[i] += static_cast<double>(w[i]);
+		++g_ssgi.em_frames;
+		if (have_gbuf) ++g_ssgi.em_gbuf_frames;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_ssgi.em_last_log < std::chrono::seconds(10) || g_ssgi.em_frames == 0) return;
+	const double* a = g_ssgi.em_acc;
+	const double  added = a[4] > 0 ? a[6] / 4096.0 / a[4] : 0.0, own = a[4] > 0 ? a[7] / 256.0 / a[4] : 0.0;
+	std::printf("SSGI emissive: %.2f %% emissive pixels, %.1f lights a frame, mean added luminance %.4f exposed (%.1f %% of the "
+	            "pixels' own %.3f), %.1f %% of the pixels lit > 0.002, G-buffer albedo %u/%u frames\n",
+	            a[2] > 0 ? 100.0 * a[3] / a[2] : 0.0, a[0] / g_ssgi.em_frames, added, own > 0 ? 100.0 * added / own : 0.0, own,
+	            a[4] > 0 ? 100.0 * a[5] / a[4] : 0.0, g_ssgi.em_gbuf_frames, g_ssgi.em_frames);
+	std::fflush(stdout);
+	for (double& v: g_ssgi.em_acc)
+		v = 0.0;
+	g_ssgi.em_frames = g_ssgi.em_gbuf_frames = 0;
+	g_ssgi.em_last_log = now;
 }
 
 bool SsgiMakeImage(GraphicContext& graphics, SsgiImage& img, vk::Extent2D extent) {
@@ -4057,10 +4172,10 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 	if (g_ssgi.pipeline == nullptr) {
 		if (g_ssgi.failed) return false;
 		g_ssgi.failed = true;
-		std::array<vk::DescriptorSetLayoutBinding, 11> bindings {};
-		for (uint32_t i = 0; i < 11; ++i) {
+		std::array<vk::DescriptorSetLayoutBinding, SsgiBindings> bindings {};
+		for (uint32_t i = 0; i < SsgiBindings; ++i) {
 			bindings[i].binding         = i;
-			bindings[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorType  = SsgiDescType(i);
 			bindings[i].descriptorCount = 1;
 			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
 		}
@@ -4069,7 +4184,7 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
 		set_info.pBindings    = bindings.data();
 		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_ssgi.set_layout) != vk::Result::eSuccess) return false;
-		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(SsgiPush)};
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(SsgiPushE)};
 		vk::PipelineLayoutCreateInfo layout_info {};
 		layout_info.setLayoutCount         = 1;
 		layout_info.pSetLayouts            = &g_ssgi.set_layout;
@@ -4112,6 +4227,8 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 	device.waitIdle();
 	for (auto* img : SsgiAll())
 		SsgiFreeImage(graphics, *img);
+	for (auto* img : SsgiEmisAll())
+		SsgiFreeImage(graphics, *img);
 	const vk::Extent2D trace = quality >= 2 ? render : vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
 	bool ok = SsgiMakeImage(graphics, g_ssgi.out, render);
 	for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.history[0], &g_ssgi.history[1], &g_ssgi.gbuf[0], &g_ssgi.gbuf[1],
@@ -4119,7 +4236,20 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		ok = ok && SsgiMakeImage(graphics, *img, trace);
 	for (auto* img : {&g_ssgi.gihist[0], &g_ssgi.gihist[1]})
 		ok = ok && SsgiMakeImage(graphics, *img, render);
+	if (ok && SsgiEmissive() > 0.0f && SsgiEmisCreate(graphics)) {
+		bool emi_ok = true;
+		for (auto* img : SsgiEmisAll())
+			emi_ok = emi_ok && SsgiMakeImage(graphics, *img, trace);
+		if (!emi_ok) {
+			for (auto* img : SsgiEmisAll())
+				SsgiFreeImage(graphics, *img);
+			std::printf("SSGI: emissive light off (could not create its images)\n");
+			std::fflush(stdout);
+		}
+	}
 	if (!ok) {
+		for (auto* img : SsgiEmisAll())
+			SsgiFreeImage(graphics, *img);
 		for (auto* img : SsgiAll())
 			SsgiFreeImage(graphics, *img);
 		g_ssgi.failed = true;
@@ -4187,7 +4317,7 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const float intensity = SsgiEnv("KYTY_SSGI_INTENSITY", quality >= 3 ? 1.25f : quality >= 2 ? 1.1f : 0.85f, 4.0f);
 	const float ao        = SsgiEnv("KYTY_SSGI_AO", 0.25f, 1.0f);
 	const auto& m         = inputs.view_to_clip;
-	SsgiPush    push {};
+	SsgiPushE   push {};
 	const bool  have_proj = m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f);
 	if (have_proj) {
 		push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
@@ -4204,6 +4334,25 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.trace[0] = static_cast<float>(g_ssgi.trace.width), push.trace[1] = static_cast<float>(g_ssgi.trace.height);
 	push.trace[2] = intensity, push.trace[3] = ao;
 	push.extra[1] = quality >= 3 ? 4.0f : 3.5f, push.extra[2] = 0.45f; // ray length / thickness at 1 m, grown with distance
+	// (rtfire) The emissive light: on when its images exist; the G-buffer albedo when this flip's (or the last's) copy
+	// matches the render; the game's exposure when the upscaler has it (else the light buffer's 1.0).
+	const bool emissive = SsgiEmissive() > 0.0f && g_ssgi.lights != VK_NULL_HANDLE && g_ssgi.emi_raw.view != nullptr &&
+	                      g_ssgi.emi_mom[1].view != nullptr;
+	RtReflGbuffer gbuf;
+	const bool    have_albedo   = emissive && RtReflGetGbuffer(gbuf) && gbuf.extent == color.extent && gbuf.views[0] != nullptr;
+	const bool    game_exposure = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
+	const float   em_lum   = SsgiEnv("KYTY_SSGI_EMISSIVE_LUM", 1.5f, 100.0f);
+	const float   em_ratio = SsgiEnv("KYTY_SSGI_EMISSIVE_RATIO", 12.0f, 1000.0f);
+	const float   em_range = std::max(SsgiEnv("KYTY_SSGI_EMISSIVE_RANGE", 8.0f, 50.0f), 0.5f);
+	static const int em_view = static_cast<int>(SsgiEnv("KYTY_SSGI_EMISSIVE_VIEW", 0.0f, 2.0f));
+	if (emissive) {
+		// (3: the internal gain over the physical L x A x cos x cos / d^2: game flames are far dimmer than real fire)
+		push.emis[0] = SsgiEmissive() * 3.0f, push.emis[1] = std::max(em_lum, 0.05f), push.emis[2] = std::max(em_ratio, 1.0f);
+		push.emis[3]  = em_range;
+		push.emisc[0] = 1 | (have_albedo ? 2 : 0);
+		push.emisc[1] = game_exposure ? static_cast<int32_t>(inputs.exposure_index) : 1;
+		push.emisc[2] = em_view;
+	}
 	{
 		static bool said = false;
 		if (!said) {
@@ -4212,10 +4361,20 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			            intensity, ao, have_proj ? "" : " (no projection: 60 deg FOV assumed)");
 			std::printf("SSGI: color format %d, depth format %d, view_to_clip z terms %g %g %g %g\n", static_cast<int>(color.format),
 			            static_cast<int>(inputs.depth.format), m[10], m[14], m[11], m[15]);
+			if (emissive)
+				std::printf("SSGI: emissive light on (strength %g, luminance > %g exposed, lit/albedo > %g, range %g m, %s, exposure %s%s)\n",
+				            SsgiEmissive(), push.emis[1], push.emis[2], em_range,
+				            have_albedo ? "G-buffer albedo" : "no G-buffer copy yet: luminance only until it comes",
+				            game_exposure ? "the game's" : "1.0", em_view == 1 ? ", view: emitter mask" : em_view == 2 ? ", view: added light" : "");
+			else if (SsgiEmissive() > 0.0f)
+				std::printf("SSGI: emissive light off (its buffer or images could not be created)\n");
+			else
+				std::printf("SSGI: emissive light off (KYTY_SSGI_EMISSIVE=0%s)\n", quality < 2 ? ", the default at quality 1" : "");
 			std::fflush(stdout);
 		}
 	}
 	SsgiReadTiming();
+	if (emissive) SsgiEmisStats(have_albedo);
 	const auto     entry = static_cast<uint32_t>(g_ssgi.written % 8);
 	const bool     timed = g_ssgi.pool != nullptr;
 	if (timed) {
@@ -4239,6 +4398,40 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		if (img->image.state.layout != vk::ImageLayout::eGeneral)
 			Transition(command, img->image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
 			           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	if (emissive) {
+		for (auto* img : SsgiEmisAll())
+			if (img->image.state.layout != vk::ImageLayout::eGeneral)
+				Transition(command, img->image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+				           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+		if (!g_ssgi.dummy_ready) {
+			g_ssgi.dummy_ready = true;
+			vk::ImageMemoryBarrier2 barrier {};
+			barrier.srcStageMask     = vk::PipelineStageFlagBits2::eNone;
+			barrier.dstStageMask     = vk::PipelineStageFlagBits2::eTransfer;
+			barrier.dstAccessMask    = vk::AccessFlagBits2::eTransferWrite;
+			barrier.oldLayout        = vk::ImageLayout::eUndefined;
+			barrier.newLayout        = vk::ImageLayout::eGeneral;
+			barrier.image            = vk::Image(g_ssgi.dummy_image);
+			barrier.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			vk::DependencyInfo dependency {};
+			dependency.imageMemoryBarrierCount = 1;
+			dependency.pImageMemoryBarriers    = &barrier;
+			command.pipelineBarrier2(dependency);
+			vk::ClearColorValue zero {};
+			zero.uint32 = std::array<uint32_t, 4> {0, 0, 0, 0};
+			const vk::ImageSubresourceRange whole {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			command.clearColorImage(vk::Image(g_ssgi.dummy_image), vk::ImageLayout::eGeneral, &zero, 1, &whole);
+		}
+		// This frame's light list and counters cleared; word 1 = 1.0 (the exposure without the game's). The previous
+		// frame's reads of the buffer (and its stats copy) before.
+		global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+		       vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+		std::array<uint32_t, 16> hdr {};
+		hdr[1] = std::bit_cast<uint32_t>(1.0f);
+		command.updateBuffer(vk::Buffer(g_ssgi.lights), 0, sizeof(hdr), hdr.data());
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+		       vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	}
 	// Earlier uses of our images (the previous frame's upscaler read of `out`) before this frame's writes.
 	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
 	       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
@@ -4253,7 +4446,7 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout, float step,
 	                     vk::Extent2D size) {
 		const vk::Sampler       lin = g_ssgi.linear, pt = g_ssgi.point;
-		vk::DescriptorImageInfo infos[11] {};
+		vk::DescriptorImageInfo infos[SsgiBindings] {};
 		infos[0]  = {lin, color.view, color.layout};
 		infos[1]  = {pt, inputs.depth.view, inputs.depth.layout};
 		infos[2]  = {pt, inputs.motion.view, inputs.motion.layout};
@@ -4265,18 +4458,34 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		infos[8]  = {nullptr, gout.view, vk::ImageLayout::eGeneral};
 		infos[9]  = {lin, aux_in->view, vk::ImageLayout::eGeneral};
 		infos[10] = {nullptr, aux_out->view, vk::ImageLayout::eGeneral};
-		vk::WriteDescriptorSet writes[11] {};
-		for (uint32_t i = 0; i < 11; ++i) {
-			writes[i].dstBinding      = i;
-			writes[i].descriptorCount = 1;
-			writes[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
-			writes[i].pImageInfo      = &infos[i];
+		// (rtfire) 11 the denoised emissive light, 12 G-buffer layer 0, 13 the light buffer, 14 the exposure (stand-ins
+		// when the emissive light is off: nothing reads them then).
+		infos[11] = {lin, emissive ? g_ssgi.emi_tmp.view : a.view, vk::ImageLayout::eGeneral};
+		infos[12] = have_albedo ? vk::DescriptorImageInfo {pt, gbuf.views[0], vk::ImageLayout::eShaderReadOnlyOptimal}
+		                        : vk::DescriptorImageInfo {pt, g_ssgi.dummy_view, vk::ImageLayout::eGeneral};
+		const vk::DescriptorBufferInfo lights_info {vk::Buffer(g_ssgi.lights), 0, VK_WHOLE_SIZE};
+		const vk::DescriptorBufferInfo exposure_info =
+		    emissive && game_exposure ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range}
+		                              : lights_info;
+		vk::WriteDescriptorSet writes[SsgiBindings] {};
+		uint32_t               bound = 0;
+		for (uint32_t i = 0; i < SsgiBindings; ++i) {
+			// (emissive off: its bindings stay unwritten; the shader reads them only when push.emisc says it is on)
+			if (i >= 12 && !emissive) continue;
+			auto& w           = writes[bound++];
+			w.dstBinding      = i;
+			w.descriptorCount = 1;
+			w.descriptorType  = SsgiDescType(i);
+			if (i == 13) w.pBufferInfo = &lights_info;
+			else if (i == 14) w.pBufferInfo = &exposure_info;
+			else w.pImageInfo = &infos[i];
 		}
 		push.misc[0] = mode;
 		push.extra[0] = step;
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_ssgi.layout, 0, 11, writes);
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_ssgi.layout, 0, bound, writes);
 		command.pushConstants(g_ssgi.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+		if (mode == 5) command.dispatch(32, 18, 1); // (one workgroup a cell)
+		else command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	};
@@ -4284,7 +4493,12 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// a-trous 2, 4 (, 8 at level 3) ping-ponging tmp_b / tmp_a with the filtered variance in var_a / var_b; composite
 	// (bilateral upsample, level 3 anti-flicker against gihist[prev]) -> out.
 	// (Bindings a mode does not write still need a valid storage image.)
+	if (emissive) {
+		run(5, g_ssgi.tmp_a, g_ssgi.tmp_b, g_ssgi.raw, g_ssgi.tmp_b, 0.0f, g_ssgi.render); // the lights (reads only the game's)
+		aux_out = &g_ssgi.emi_raw;                                                       // (the trace's emissive output)
+	}
 	run(0, g_ssgi.tmp_a, g_ssgi.tmp_b, g_ssgi.raw, g_ssgi.gbuf[cur], 0.0f, g_ssgi.trace);
+	aux_in = &g_ssgi.moments[prev], aux_out = &g_ssgi.moments[cur];
 	run(1, g_ssgi.raw, g_ssgi.history[prev], g_ssgi.tmp_a, g_ssgi.tmp_b, 0.0f, g_ssgi.trace);
 	aux_in = &g_ssgi.moments[cur], aux_out = &g_ssgi.var_a;
 	run(2, g_ssgi.tmp_a, g_ssgi.raw, g_ssgi.history[cur], g_ssgi.tmp_b, 1.0f, g_ssgi.trace);
@@ -4298,11 +4512,29 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		run(2, g_ssgi.tmp_a, g_ssgi.raw, g_ssgi.tmp_b, g_ssgi.raw, 8.0f, g_ssgi.trace);
 		final_gi = &g_ssgi.tmp_b;
 	}
+	if (emissive) {
+		// The emissive light's denoise, as the bounce's: temporal (its own count / moments) -> emi_tmp, a-trous 1 -> its
+		// history, a-trous 2 -> emi_tmp (what the composite reads). var_a / var_b are free again here; the final GI
+		// (tmp_a or tmp_b) is not written (the unused storage bindings point at emi_raw).
+		aux_in = &g_ssgi.emi_mom[prev], aux_out = &g_ssgi.emi_mom[cur];
+		run(1, g_ssgi.emi_raw, g_ssgi.emi_hist[prev], g_ssgi.emi_tmp, g_ssgi.emi_raw, 0.0f, g_ssgi.trace);
+		aux_in = &g_ssgi.emi_mom[cur], aux_out = &g_ssgi.var_a;
+		run(2, g_ssgi.emi_tmp, g_ssgi.emi_raw, g_ssgi.emi_hist[cur], g_ssgi.emi_raw, 1.0f, g_ssgi.trace);
+		aux_in = &g_ssgi.var_a, aux_out = &g_ssgi.var_b;
+		run(2, g_ssgi.emi_hist[cur], g_ssgi.emi_raw, g_ssgi.emi_tmp, g_ssgi.emi_raw, 2.0f, g_ssgi.trace);
+	}
 	aux_in = &g_ssgi.var_a, aux_out = &g_ssgi.var_b;
 	run(4, *final_gi, g_ssgi.gihist[prev], g_ssgi.out, g_ssgi.gihist[cur], 0.0f, g_ssgi.render);
 	// The composite's writes before the upscaler reads.
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
+	if (emissive && g_ssgi.readback != VK_NULL_HANDLE) {
+		// The counters (hdr[0..7]) into this frame's slot of the host ring.
+		vk::BufferCopy region {0, (g_ssgi.frame % 4) * SsgiStatWords * 4, SsgiStatWords * 4};
+		command.copyBuffer(vk::Buffer(g_ssgi.lights), vk::Buffer(g_ssgi.readback), 1, &region);
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
+		       vk::AccessFlagBits2::eHostRead);
+	}
 	if (timed) {
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_ssgi.pool, entry * 2 + 1);
 		++g_ssgi.written;
@@ -5483,7 +5715,10 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 }
 } // namespace
 
-bool SsrWanted() { return SsrLevel() > 0 || RtReflectionsWanted() || ShineWanted() || GtaoLevel() > 0 || GbufViewWanted(); }
+bool SsrWanted() {
+	return SsrLevel() > 0 || RtReflectionsWanted() || ShineWanted() || GtaoLevel() > 0 || GbufViewWanted() ||
+	       SsgiEmissive() > 0.0f; // (rtfire: the emissive light reads the G-buffer copy's albedo)
+}
 bool SsrPassWanted() { return SsrLevel() > 0; }
 
 void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
