@@ -32,6 +32,11 @@
 #include <thread>
 #include <vector>
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include "graphics/presentation/heartbeat.h"
+
 namespace Libs::Graphics {
 struct GraphicContext;
 } // namespace Libs::Graphics
@@ -1616,6 +1621,25 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 	return OK;
 }
 
+// Once every 10 s: how many guest flips completed and how many compute dispatches were
+// skipped (pipeline still compiling / unsupported resources). Black screen diagnosis.
+static void KytyFlipHeartbeat() {
+	static std::atomic<uint64_t> flips {0};
+	static std::atomic<int64_t>  last_ms {0};
+	flips.fetch_add(1, std::memory_order_relaxed);
+	const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch()).count();
+	auto last = last_ms.load(std::memory_order_relaxed);
+	if (last == 0) { last_ms.store(now); return; }
+	if (now - last < 10000 || !last_ms.compare_exchange_strong(last, now)) return;
+	const auto f = flips.exchange(0);
+	std::printf("Heartbeat: %llu flips in %.1f s (%.1f fps), compute skipped: %llu compiling, %llu unsupported\n",
+	            static_cast<unsigned long long>(f), (now - last) / 1000.0, f * 1000.0 / double(now - last),
+	            static_cast<unsigned long long>(g_kyty_skipped_dispatches.exchange(0)),
+	            static_cast<unsigned long long>(g_kyty_unsupported_dispatches.exchange(0)));
+	std::fflush(stdout);
+}
+
 void VideoOutDriver::SubmitFlipPreparation(uint64_t request_id) {
 	m_impl->Renderer().GetGpu().SubmitFlipPreparation(request_id);
 }
@@ -1626,6 +1650,7 @@ void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& b
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
 	m_impl->GetFlipQueue().Complete(request_id);
+	KytyFlipHeartbeat();
 }
 
 void VideoOutDriver::WaitForSubmitSlot(int handle) {

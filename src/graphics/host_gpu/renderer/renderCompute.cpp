@@ -37,6 +37,7 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include "graphics/presentation/heartbeat.h"
 
 namespace Libs::Graphics {
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
@@ -311,6 +312,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	if (!compute_program) {
 		ResetBindings();
+		g_kyty_unsupported_dispatches.fetch_add(1, std::memory_order_relaxed);
 		return; // A shader with unsupported resources: skip the dispatch.
 	}
 	if (use_thread_dimensions) {
@@ -355,6 +357,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
 	if (pipeline_ptr == nullptr) {
 		// Still compiling in the background (KYTY_ASYNC_COMPUTE_WORDS): skip this dispatch.
+		g_kyty_skipped_dispatches.fetch_add(1, std::memory_order_relaxed);
 		ResetBindings();
 		return;
 	}
@@ -487,12 +490,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	if (!compute_program) {
+		g_kyty_unsupported_dispatches.fetch_add(1, std::memory_order_relaxed);
 		return; // A shader with unsupported resources: skip the dispatch.
 	}
 	buffer.EndRendering();
 	auto* pipeline_ptr =
 	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
 	if (pipeline_ptr == nullptr) {
+		g_kyty_skipped_dispatches.fetch_add(1, std::memory_order_relaxed);
 		ResetBindings();
 		return;
 	}
