@@ -626,3 +626,15 @@ the take: offload of hot textures is what churned. The governor: stages soft (ta
 pipelines idle 60/30/15 s, offload only for the MiB over (soft - 256), longest-idle first, never a texture touched in
 the last 10 s (3 s in emergency), emergency scans at the next flip. Below soft: no checks, no takes, no extra passes.
 New counters: "restores blocking N (at most x ms), asynchronous N (latency ...); waits for one in flight N".
+
+## 2026-10-26 spot9-1025 — Boletaria hall lamp floor patches: shadow-layer draws skipped while compiling
+- Video 00:03 (frames 8-13 s): large sharp *lit* floor patches near the knight that change shape from one moment to
+  the next = occluders missing from a spot light's depth layer (not stale depth: that darkens).
+- Log 20261025-235744-754: no "layers refreshed" after flip 2270 (the refresh path is not involved in the hall); the
+  pool renders only 2-3 layers a flip while it samples more (static lights' layers rendered once, kept for many
+  flips); "Async draw pipelines: 512 draws skipped while their pipelines compile" (power-of-two log; < 1024 total) and
+  RAM diet / idle pipeline eviction (2778 evicted, 613 made again) re-create pipelines asynchronously.
+- Mechanism: KYTY_ASYNC_DRAW_PIPELINES dropped any geometry draw whose pipeline was compiling. For a normal pass that
+  is one frame of a missing object; for a cached spot-shadow layer the occluder stays missing until the game re-renders
+  that layer (when the light's slot is reassigned as the player moves): lit patches that pop in and out.
+- Fix: KYTY_ASYNC_SHADOW_SYNC (on unless 0): depth-only draws into a layered depth array keep the blocking compile.
