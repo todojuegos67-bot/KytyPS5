@@ -1254,13 +1254,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	} else {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
-	// (KYTY_GBUF_VIEW / KYTY_GBUF_TAP, refl7 diagnostic: a G-buffer reader's outputs logged, the tapped image copied)
-	if (FrameGen::GbufViewWanted() && !bindings.images.empty()) {
+	// (KYTY_GBUF_VIEW / KYTY_GBUF_TAP, refl7 diagnostic: a G-buffer reader's outputs logged, the tapped image copied;
+	// refl8: KYTY_RT_REFLECTIONS' guide, the game's own SSR result copied from the deferred lighting's inputs)
+	if ((FrameGen::GbufViewWanted() || FrameGen::RtReflGuideWanted()) && !bindings.images.empty()) {
 		uint64_t written = 0;
 		for (size_t i = 0; i < program.info.images.size() && i < 64; ++i)
 			if (program.info.images[i].written) written |= uint64_t {1} << i;
 		FrameGen::GbufTapAfterDispatch(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
 		                               std::span<const TextureBinding> {bindings.images}, written);
+		FrameGen::RtReflGuideAfterDispatch(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
+		                                   std::span<const TextureBinding> {bindings.images}, written);
 	}
 	ResetBindings();
 	m_context.GetCommandScheduler().CompleteDispatch();

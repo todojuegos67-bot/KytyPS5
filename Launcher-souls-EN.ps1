@@ -1743,7 +1743,7 @@ function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @(
 	return $c
 }
 $cmbRtSh = New-RtCombo 'RT Shadows' 'rtshadow' 24 'Ray-traced sun shadows on the image, with denoising. Only with DLSS, XeSS or FSR. Low ~0.3 ms, High ~1 ms, Ultra ~1.5 ms. Beta.'
-$cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl2' 56 'Ray-traced reflections on water, puddles and wet surfaces, with denoising. Only with DLSS, XeSS or FSR. Low ~0.6 ms, Medium ~1 ms, High ~2 ms, Ultra ~4.5 ms. Beta.' @('Off', 'Low', 'Medium', 'High', 'Ultra')
+$cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl2' 56 'Ray-traced reflections guided by the game''s own: only where the game reflects and at its strength, but sharper (water as a mirror). Where the ray finds nothing the game''s reflection stays. Only with DLSS, XeSS or FSR. Low ~0.6 ms, Medium ~1 ms, High ~2 ms. Beta.' @('Off', 'Low', 'Medium', 'High')
 $cmbShine = New-RtCombo 'Metal shine' 'shine' 88 'Armour, shields and metal: highlights from the sun and from torches and fires, plus a bit more sharpness. Only with DLSS, XeSS or FSR. Best with RT Shadows on. Beta.' @('Off', 'Sun', 'Sun + 2 lights', 'Sun + 4 lights')
 $cmbRays = New-RtCombo 'Light shafts' 'godrays' 120 'Crepuscular sun rays and a light halo around torches and fires. Only with DLSS, XeSS or FSR. Sun rays need RT Shadows on. Soft ~0.3 ms, Strong ~1 ms. Beta.' @('Off', 'Soft', 'Medium', 'Strong')
 

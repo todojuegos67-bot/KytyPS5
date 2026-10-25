@@ -25,6 +25,13 @@
 //                hit distance (contact reflections stay sharp, mirrors untouched)
 //   4 composite: bilateral upsample; the reflection replaces a Fresnel (Schlick with roughness) x mask x confidence share
 //                of the game's color (a convex mix, never added on top), the game's own highlights kept
+// (refl8) Guided by the game (misc.w & 512, the default): the game's own SSR result (binding 21, a half-resolution input
+// of its deferred lighting; rgb its reflected color, a its confidence) decides which surfaces reflect and how much. Our
+// sharper ray replaces only the game's SSR color, at the game's share (its confidence x a Fresnel): the color changes by
+// strength x Fresnel x a x ours' confidence x (ours - the game's). Where our ray misses or leaves the screen, or the game
+// has no confident SSR, the game's pixel stays unchanged (its IBL fallback included): no material guesses. Water (drawn
+// after the lighting, so not in the game's SSR) keeps its depth-detected mirror. The roughness field only narrows where
+// we sharpen (mirror-like), never adds a reflection.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D color_tex;
@@ -53,6 +60,8 @@ layout(std430, binding = 18) buffer Frame {
 	                   // z: the longest ray on screen (render pixels; 0 none), w: the puddle guess's scale
 	vec4 mparams;      // the material roughness: x mirror below, y nothing from (perceptual roughness), z the material's
 	                   // strength scale (refl6)
+	vec4 gparams;      // (refl8) the guide: x / y the game's SSR confidence from which / to which it counts as a reflection,
+	                   // z 1: its rgb premultiplied by a, w the guided strength (1: the game's own)
 	int  calib[];      // see CALIB_* below (calibration sums, then the cumulative stats counters)
 };
 // calib[] layout (ints): [0] samples; [CALIB_NORMAL + ((layer * NLAYOUTS + layout) * 2 + space) * 2 + convention] sum of
@@ -63,7 +72,9 @@ layout(std430, binding = 18) buffer Frame {
 // 2 sum of weight * 1000, 3 reflective mask > 0.05, 4 rays traced, 5 ray hits, 6 G-buffer normal used, 7 water,
 // 8 final depth != the G-buffer-time depth by > 2 %, 9..12 material roughness (the rougher of the roughness and 1 - gloss
 // fields) < 0.1, 0.1..0.25, 0.25..0.4, >= 0.4, 13..16 the same for the roughness field alone, 17 moving (a character), 18
-// metal > 0.5, 19 weight > 0.05 where the roughness < 0.1); [CALIB_HIST + field * 16 + bin] byte histograms.
+// metal > 0.5, 19 weight > 0.05 where the roughness < 0.1; refl8, the guide: 20 the game's SSR confidence > gparams.x, 21
+// our hit replaced > 5 % of the game's SSR, 22 sum of its confidence * 1000, 23 water with our mirror (weight > 0.05),
+// 24 its rgb set where its confidence is not); [CALIB_HIST + field * 16 + bin] byte histograms.
 // (The buffer is device-local, copied to a host buffer once a frame: atomics on host memory cross PCIe one by one, which
 // made the composite cost 3-4 ms in the 10-24 b7dd0fe6 build.)
 const int NLAYOUTS     = 13;
@@ -77,6 +88,7 @@ layout(std430, binding = 19) readonly buffer Exposure {
 	float exposure_values[];
 };
 layout(binding = 20) uniform sampler2D gdepth; // the depth when the deferred lighting ran (misc.w & 64), before water
+layout(binding = 21) uniform sampler2D game_ssr; // (refl8) the game's own SSR result (misc.w & 256), half resolution
 
 layout(push_constant) uniform Push {
 	vec4  proj;      // M[0], M[5], M[8], M[9]
@@ -86,7 +98,8 @@ layout(push_constant) uniform Push {
 	vec4  motion;    // motion scale x, y, roughness cutoff, temporal minimum alpha scale
 	ivec4 misc;      // mode, frame, level, flags (1 reset, 2 history valid, 4 camera matrices, 8 up known, 16 row 0 = NDC y +1,
 	                 // 32 checkerboard trace: half the trace pixels march each frame, the others keep their history,
-	                 // 64 the G-buffer-time depth is bound: water detection, 128 moving objects (characters) skipped)
+	                 // 64 the G-buffer-time depth is bound: water detection, 128 moving objects (characters) skipped,
+	                 // 256 the game's SSR (binding 21) bound, 512 guided by the game: no material or guess mask)
 	ivec4 dec;       // normal code (-1: depth normals), roughness field (-1: heuristic), packed layers, mode 7: the hi-z mip,
 	                 // else the gloss field (-1 none; its code inverts it: 1 - gloss)
 	ivec4 misc2;     // exposure index, hi-z levels, max iterations, metal field + 1 (0: none, f0 0.04)
@@ -241,6 +254,30 @@ vec3 NormalAt(vec2 uv, vec3 p) {
 	return n;
 }
 
+// ---- (refl8) The game's own SSR as the guide ----
+bool  GuideMode() { return (push.misc.w & 512) != 0; }
+bool  HaveGuide() { return (push.misc.w & 256) != 0; }
+vec4  GameSsr(vec2 uv) {
+	if (!HaveGuide()) return vec4(0);
+	vec4 g = textureLod(game_ssr, uv, 0);
+	if (Bad(g)) return vec4(0);
+	return vec4(max(g.rgb, vec3(0)), clamp(g.a, 0.0, 1.0));
+}
+// How much the game counts this pixel as reflecting (its SSR confidence through gparams.x..y).
+float GameMask(float a) { return smoothstep(gparams.x, max(gparams.y, gparams.x + 1e-3), a); }
+// The game's reflected color itself (not premultiplied).
+vec3  GameReflColor(vec4 g) { return gparams.z > 0.5 ? g.rgb / max(g.a, 1e-3) : g.rgb; }
+// The pixel holds the G-buffer's surface (the game's SSR belongs to it): the normals agree, or the final depth is the
+// lighting's (nothing drawn over it after).
+bool  GbufSurface(ivec2 rp, float d, bool match) {
+	if (match) return true;
+	if ((push.misc.w & 64) == 0) return false;
+	float d0 = texelFetch(gdepth, rp, 0).r;
+	if (IsSky(d0)) return false;
+	float z = abs(ViewZ(d)), z0 = abs(ViewZ(d0));
+	return abs(z0 - z) < 0.01 * z + 0.01;
+}
+
 // ---- The surface: normal, roughness, reflection mask (how much of a reflector it is) ----
 struct Surf {
 	vec3  N;  // shading normal (the G-buffer's when it matches)
@@ -375,14 +412,30 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	if (dot(s.N, V) < 0.02) s.N = normalize(s.N + V * (0.02 - dot(s.N, V) + 0.01)); // (back-facing by a little: bent)
 	bool  have_mat = push.dec.y >= 0;
 	float mat = 0.0, mat_r = 1.0, mat_pr = 1.0, metal = 0.0;
-	if (match && have_mat) {
+	if (GuideMode()) {
+		// (refl8) The game decides: its SSR confidence here; the roughness field (when decoded) only narrows it to the
+		// mirror-like surfaces we sharpen and sets our lobe.
+		if (water <= 0.0 && GbufSurface(rp, d, match)) {
+			float gm  = GameMask(GameSsr(ruv).a);
+			float mir = 1.0;
+			mat_pr = 0.05, mat_r = 0.0; // (no roughness field: a mirror ray, at the game's share)
+			if (match && have_mat && gm > 0.0) {
+				float r0;
+				mat_pr = GbufRough(rp, r0);
+				mir    = RoughFade(mat_pr);
+				mat_r  = LobeRough(mat_pr);
+				metal  = GbufMetal(rp);
+			}
+			mat = gm * mir;
+		}
+	} else if (match && have_mat) {
 		float r0;
 		mat_pr = GbufRough(rp, r0);
 		mat    = RoughFade(mat_pr) * mparams.z;
 		mat_r  = LobeRough(mat_pr);
 		metal  = GbufMetal(rp);
 	}
-	float guess = (water > 0.0 || have_mat) ? 0.0 : PuddleGuess(ruv, Nd) * fparams.w;
+	float guess = (water > 0.0 || have_mat || GuideMode()) ? 0.0 : PuddleGuess(ruv, Nd) * fparams.w;
 	s.mask   = max(water, max(mat, guess));
 	bool wat = water > 0.0 && water >= mat && water >= guess;
 	s.water  = wat ? water : 0.0;
@@ -619,8 +672,10 @@ void Trace(ivec2 px, bool march) {
 	vec3 V = normalize(-P);
 	// Early out: the composite's weight (below) would stay under 0.02: no ray, and no reflection downstream.
 	{
-		float west = push.params.x * s.mask * Spec(s.prough, clamp(dot(s.N, V), 0.0, 1.0), s.metal, s.water);
-		if (west < 0.02) {
+		// (refl8, guided: the game's share, strength gparams.w; the threshold lower, the share is the game's own)
+		bool  gd   = GuideMode() && s.water <= 0.0;
+		float west = (gd ? gparams.w : push.params.x) * s.mask * Spec(s.prough, clamp(dot(s.N, V), 0.0, 1.0), s.metal, s.water);
+		if (west < (gd ? 0.01 : 0.02)) {
 			s.mask = 0.0;
 			StoreMiss(px, s);
 			return;
@@ -872,6 +927,15 @@ void Composite(ivec2 px) {
 		}
 	}
 	if (st) Stat(17, MovingRaw(uv, P) > 0.5 ? 1 : 0);
+	// (refl8) The game's own SSR here (the guide) and whether this pixel is the G-buffer's surface it belongs to.
+	vec4  gs     = GameSsr(uv);
+	bool  gsurf  = GuideMode() && HaveGuide() && GbufSurface(px, d, match);
+	float ga     = gsurf ? gs.a : 0.0;
+	if (st && GuideMode() && HaveGuide()) {
+		Stat(20, ga > gparams.x ? 1 : 0);
+		Stat(22, int(ga * 1000.0));
+		Stat(24, gsurf && gs.a <= gparams.x && Luma(gs.rgb) > 1e-4 ? 1 : 0);
+	}
 	vec4 rf, ax;
 	if (all(equal(ivec2(TraceSize()), ivec2(RenderSize())))) {
 		rf = texelFetch(src_a, px, 0);
@@ -893,6 +957,11 @@ void Composite(ivec2 px) {
 	if (water > 0.0) {
 		fr_rough = 0.0, metal = 0.0;
 		N        = WaterNormal(Nd); // (the G-buffer holds the bed under the water)
+	} else if (GuideMode()) {
+		// (refl8) The game's SSR confidence at this render pixel (the trace's mask is half resolution), narrowed to the
+		// mirror-like surfaces by the roughness field when there is one.
+		mask = gsurf ? min(mask, GameMask(ga) * (match && have_mat ? RoughFade(rm) : 1.0)) : 0.0;
+		if (!(match && have_mat)) fr_rough = 0.05; // (no roughness field: the game's SSR marks smooth surfaces)
 	} else if (have_mat) {
 		mask = match ? min(mask, RoughFade(rm) * mparams.z) : 0.0;
 	} else {
@@ -926,6 +995,28 @@ void Composite(ivec2 px) {
 	vec3  V     = normalize(-P);
 	if (dot(N, V) < 0.02) N = normalize(N + V * (0.02 - dot(N, V) + 0.01));
 	float NoV   = clamp(dot(N, V), 0.0, 1.0);
+	if (GuideMode() && water <= 0.0) {
+		// (refl8) Only the game's SSR color is replaced, at the game's own share: its confidence a x the Fresnel x
+		// strength; ours' confidence (through a square root, as below) and the mirror-likeness (mask / the game's mask)
+		// scale how much of it is ours. A miss changed nothing above (the game's pixel, its IBL included, stays).
+		float gm  = GameMask(ga);
+		float mir = gm > 1e-3 ? clamp(mask / gm, 0.0, 1.0) : 0.0;
+		float k   = sqrt(clamp(rf.a, 0.0, 1.0)) * mir * gm;
+		float wg  = clamp(gparams.w * ga * k * Spec(fr_rough, NoV, metal, 0.0), 0.0, 1.0);
+		vec3  dlt = wg * (refl - GameReflColor(gs));
+		// (never darker than MaxDarken of the pixel's luminance, as below)
+		float lc = Luma(max(col.rgb, vec3(0))), ld = Luma(dlt);
+		if (ld < 0.0) dlt *= min(1.0, MaxDarken * lc / max(-ld, 1e-30));
+		vec3 outg = col.rgb + dlt;
+		if (BadV(outg)) outg = col.rgb;
+		if (st) {
+			Stat(21, ga * k > 0.05 ? 1 : 0);
+			if (wg > 0.05) Stat(1, 1);
+			Stat(2, int(wg * 1000.0));
+		}
+		imageStore(out_a, px, vec4(clamp(outg, vec3(0), vec3(6.0e4)), col.a));
+		return;
+	}
 	// (the confidence through a square root: a 60 % hit rate averaged in should not cut the reflection to 60 %)
 	float w     = push.params.x * mask * sqrt(clamp(rf.a, 0.0, 1.0)) * Spec(fr_rough, NoV, metal, water);
 	// The game's own highlights (lights, emissives: far brighter than what a screen-space ray can find) stay.
@@ -940,6 +1031,7 @@ void Composite(ivec2 px) {
 	if (st) {
 		if (w > 0.05) Stat(1, 1);
 		if (w > 0.05 && match && have_mat && rm < 0.1) Stat(19, 1);
+		if (w > 0.05 && water > 0.0) Stat(23, 1); // (refl8: water with our mirror)
 		Stat(2, int(w * 1000.0));
 	}
 	vec3 outc = mix(col.rgb, refl, w);

@@ -310,6 +310,12 @@ void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::Comman
 [[nodiscard]] bool GbufViewWanted();
 void GbufTapAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
                           std::span<const TextureBinding> images, uint64_t written_mask);
+// (refl8) KYTY_RT_REFLECTIONS' guide (rt-reflections.h): after a dispatch, while RtReflGuideWanted(): the deferred
+// lighting's (KYTY_RT_REFLECTIONS_GUIDE_CS, default 9fb5cc274b5e4f82) half-resolution RGBA16F input, the game's own SSR
+// result, copied for the reflections; its bindings and the dispatch that writes it logged once.
+[[nodiscard]] bool RtReflGuideWanted();
+void RtReflGuideAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                              std::span<const TextureBinding> images, uint64_t written_mask);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

@@ -6083,6 +6083,239 @@ bool GbufTapGet(GbufTapImage& out) {
 	return true;
 }
 
+// (refl8) KYTY_RT_REFLECTIONS' guide (rt-reflections.h RtReflGuide): the game's own SSR result, a half-resolution
+// RGBA16F input of the deferred lighting / specular resolve (default CS 9fb5cc274b5e4f82: reads the packed G-buffer,
+// both depths, a 256x256 RG16F BRDF LUT and this image; writes the full-resolution lit RGBA16F), copied after that
+// dispatch every frame. Its bindings are logged once, and the dispatch that writes the image (the game's SSR pass) once.
+namespace {
+struct GuideState {
+	bool                  parsed = false, failed = false, logged = false, producer_logged = false;
+	uint64_t              hash = 0x9fb5cc274b5e4f82ull;
+	int                   slot = -1, used_slot = -1;
+	uint64_t              address = 0, producer = 0;
+	VkImage               image = VK_NULL_HANDLE;
+	VmaAllocation         mem   = nullptr;
+	vk::ImageView         view  = nullptr;
+	vk::Extent2D          extent {};
+	vk::Format            format = vk::Format::eUndefined;
+	vk::ImageLayout       layout = vk::ImageLayout::eUndefined;
+	std::atomic<uint64_t> flip {~0ull};
+	uint32_t              misses = 0;
+	std::vector<SsrPass::RetiredCopy> retired;
+} g_guide;
+
+vk::Extent2D BindingExtent(TextureCache& cache, const TextureBinding& b) {
+	auto&          im    = cache.GetImage(b.image_id);
+	const uint32_t level = b.desc.view_info.base_level;
+	return {std::max(1u, im.backing.extent.width >> level), std::max(1u, im.backing.extent.height >> level)};
+}
+} // namespace
+
+void RtReflGuideAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                              std::span<const TextureBinding> images, uint64_t written_mask) {
+	if (!RtReflGuideWanted()) return;
+	if (!g_guide.parsed) {
+		g_guide.parsed = true;
+		if (const char* v = std::getenv("KYTY_RT_REFLECTIONS_GUIDE_CS"); v != nullptr && *v != '\0') {
+			unsigned long long h = 0;
+			if (std::sscanf(v, "%llx", &h) == 1 && h != 0) g_guide.hash = h;
+		}
+		if (const char* v = std::getenv("KYTY_RT_REFLECTIONS_GUIDE_SLOT"); v != nullptr && *v != '\0') g_guide.slot = std::atoi(v);
+	}
+	// (the game's SSR pass: the dispatch that writes the guide's image; once its address is known)
+	if (g_guide.address != 0 && !g_guide.producer_logged && cs_hash != g_guide.hash) {
+		for (size_t i = 0; i < images.size() && i < 64; ++i) {
+			if (((written_mask >> i) & 1u) == 0 || !images[i].image_id || images[i].desc.info.data.address != g_guide.address) continue;
+			g_guide.producer_logged = true;
+			g_guide.producer        = cs_hash;
+			std::string line;
+			char        buf[200];
+			for (size_t k = 0; k < images.size() && k < 32; ++k) {
+				const auto& b = images[k];
+				if (!b.image_id) continue;
+				auto&              im = cache.GetImage(b.image_id);
+				const vk::Extent2D e  = BindingExtent(cache, b);
+				std::snprintf(buf, sizeof(buf), " %zu%s %s %ux%u @0x%llx;", k, (written_mask >> k) & 1u ? " WRITES" : "",
+				              SsrFormatName(im.backing.format), e.width, e.height, static_cast<unsigned long long>(b.desc.info.data.address));
+				line += buf;
+			}
+			std::printf("RT reflections: guide image @0x%llx written by CS %016llx (the game's SSR pass) slot %zu; its images:%s\n",
+			            static_cast<unsigned long long>(g_guide.address), static_cast<unsigned long long>(cs_hash), i, line.c_str());
+			std::fflush(stdout);
+			break;
+		}
+	}
+	if (g_guide.failed || cs_hash != g_guide.hash) return;
+	// The slot: given, or the first RGBA16F input (not written) at half the first written image's size (+- 1).
+	vk::Extent2D out_extent {};
+	for (size_t i = 0; i < images.size() && i < 64; ++i)
+		if (((written_mask >> i) & 1u) != 0 && images[i].image_id) {
+			out_extent = BindingExtent(cache, images[i]);
+			break;
+		}
+	int slot = g_guide.slot;
+	if (slot < 0 && out_extent.width > 0) {
+		const auto near_half = [](uint32_t v, uint32_t full) { return v + 1 >= (full + 1) / 2 && v <= (full + 1) / 2 + 1; };
+		for (size_t i = 0; i < images.size() && i < 64; ++i) {
+			if (((written_mask >> i) & 1u) != 0 || !images[i].image_id) continue;
+			auto& im = cache.GetImage(images[i].image_id);
+			if (im.backing.format != vk::Format::eR16G16B16A16Sfloat) continue;
+			const vk::Extent2D e = BindingExtent(cache, images[i]);
+			if (near_half(e.width, out_extent.width) && near_half(e.height, out_extent.height)) {
+				slot = static_cast<int>(i);
+				break;
+			}
+		}
+	}
+	if (!g_guide.logged) {
+		g_guide.logged = true;
+		std::string line;
+		char        buf[200];
+		for (size_t i = 0; i < images.size() && i < 32; ++i) {
+			const auto& b = images[i];
+			if (!b.image_id) continue;
+			auto&              im = cache.GetImage(b.image_id);
+			const vk::Extent2D e  = BindingExtent(cache, b);
+			std::snprintf(buf, sizeof(buf), " %zu%s %s %ux%u @0x%llx;", i, (written_mask >> i) & 1u ? " WRITES" : "",
+			              SsrFormatName(im.backing.format), e.width, e.height, static_cast<unsigned long long>(b.desc.info.data.address));
+			line += buf;
+		}
+		std::printf("RT reflections: guide CS %016llx images:%s -> guide slot %s\n", static_cast<unsigned long long>(g_guide.hash),
+		            line.c_str(), slot >= 0 ? std::to_string(slot).c_str() : "none (no half-resolution RGBA16F input): reflections on water only");
+		std::fflush(stdout);
+	}
+	if (slot < 0 || static_cast<size_t>(slot) >= images.size() || !images[slot].image_id) {
+		if (++g_guide.misses == 600) {
+			std::printf("RT reflections: guide CS %016llx ran 600 times without a usable slot\n", static_cast<unsigned long long>(g_guide.hash));
+			std::fflush(stdout);
+		}
+		return;
+	}
+	const auto& binding = images[slot];
+	auto&       image   = cache.GetImage(binding.image_id);
+	if (image.backing.image == nullptr) return;
+	const vk::Format fmt = image.backing.format;
+	if (fmt != vk::Format::eR16G16B16A16Sfloat && fmt != vk::Format::eR32G32B32A32Sfloat) {
+		g_guide.failed = true;
+		std::printf("RT reflections: guide slot %d is %s, not RGBA float: reflections on water only\n", slot, SsrFormatName(fmt));
+		std::fflush(stdout);
+		return;
+	}
+	const uint64_t     flip  = g_flips_taken.load(std::memory_order_relaxed);
+	const uint32_t     level = binding.desc.view_info.base_level, layer = binding.desc.view_info.base_layer;
+	const vk::Extent2D extent = BindingExtent(cache, binding);
+	for (size_t i = 0; i < g_guide.retired.size();) {
+		auto& r = g_guide.retired[i];
+		if (flip < r.flip + 8) {
+			++i;
+			continue;
+		}
+		if (r.views[0] != nullptr) graphics.device.destroyImageView(r.views[0], nullptr);
+		if (r.image != VK_NULL_HANDLE) vmaDestroyImage(graphics.allocator, r.image, r.mem);
+		r = g_guide.retired.back();
+		g_guide.retired.pop_back();
+	}
+	if (g_guide.image != VK_NULL_HANDLE && (g_guide.extent != extent || g_guide.format != fmt)) {
+		SsrPass::RetiredCopy r;
+		r.image = g_guide.image, r.mem = g_guide.mem, r.flip = flip, r.views[0] = g_guide.view;
+		g_guide.retired.push_back(r);
+		g_guide.image = VK_NULL_HANDLE, g_guide.mem = nullptr, g_guide.view = nullptr, g_guide.layout = vk::ImageLayout::eUndefined;
+		g_guide.flip.store(~0ull, std::memory_order_release);
+	}
+	if (g_guide.image == VK_NULL_HANDLE) {
+		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		create.imageType   = VK_IMAGE_TYPE_2D;
+		create.format      = static_cast<VkFormat>(fmt);
+		create.extent      = {extent.width, extent.height, 1};
+		create.mipLevels   = 1;
+		create.arrayLayers = 1;
+		create.samples     = VK_SAMPLE_COUNT_1_BIT;
+		create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO;
+		if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_guide.image, &g_guide.mem, nullptr) != VK_SUCCESS) {
+			g_guide.image  = VK_NULL_HANDLE;
+			g_guide.failed = true;
+			return;
+		}
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = vk::Image(g_guide.image);
+		view_info.viewType         = vk::ImageViewType::e2D;
+		view_info.format           = fmt;
+		view_info.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		if (graphics.device.createImageView(&view_info, nullptr, &g_guide.view) != vk::Result::eSuccess) {
+			g_guide.view   = nullptr;
+			g_guide.failed = true;
+			return;
+		}
+		g_guide.extent = extent, g_guide.format = fmt, g_guide.used_slot = slot;
+		g_guide.address = binding.desc.info.data.address, g_guide.producer_logged = false;
+		std::printf("RT reflections: guide image %ux%u %s from CS %016llx slot %d (mip %u layer %u @0x%llx; the lighting writes %ux%u)\n",
+		            extent.width, extent.height, SsrFormatName(fmt), static_cast<unsigned long long>(cs_hash), slot, level, layer,
+		            static_cast<unsigned long long>(g_guide.address), out_extent.width, out_extent.height);
+		std::fflush(stdout);
+	}
+	const ImageSubresourceRange range {level, 1, layer, 1};
+	{
+		// (whatever wrote the image, and this dispatch, before the copy; also inside a compute chain)
+		vk::MemoryBarrier2 mb {};
+		mb.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		mb.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+		mb.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		mb.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &mb;
+		command.pipelineBarrier2(dependency);
+	}
+	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range, command);
+	const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+	                         vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::ImageMemoryBarrier2 b {};
+		b.srcStageMask        = src_stage;
+		b.srcAccessMask       = src_access;
+		b.dstStageMask        = dst_stage;
+		b.dstAccessMask       = dst_access;
+		b.oldLayout           = from;
+		b.newLayout           = to;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image               = vk::Image(g_guide.image);
+		b.subresourceRange    = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &b;
+		command.pipelineBarrier2(dependency);
+	};
+	barrier(g_guide.layout, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+	        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, level, layer, 1};
+	copy.dstSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = vk::Extent3D {extent.width, extent.height, 1};
+	command.copyImage(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, vk::Image(g_guide.image), vk::ImageLayout::eTransferDstOptimal,
+	                  1, &copy);
+	barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
+	        vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+	g_guide.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	const vk::ImageLayout back = binding.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding.layout;
+	image.Transit(back, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range, command);
+	g_guide.flip.store(flip, std::memory_order_release);
+}
+
+bool RtReflGetGuide(RtReflGuide& out) {
+	const uint64_t taken = g_guide.flip.load(std::memory_order_acquire);
+	const uint64_t flips = g_flips_taken.load(std::memory_order_relaxed);
+	if (taken == ~0ull || flips > taken + 1 || g_guide.view == nullptr) return false;
+	out.view     = g_guide.view;
+	out.extent   = g_guide.extent;
+	out.cs       = g_guide.hash;
+	out.producer = g_guide.producer;
+	out.slot     = g_guide.used_slot;
+	return true;
+}
+
 uint32_t SsrPackedTargets(std::array<SsrTarget, 4>& targets) {
 	std::lock_guard lock(g_ssr_gb.mutex);
 	if (!g_ssr_gb.valid || g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.flip + 4) return 0;
