@@ -1123,6 +1123,127 @@ void BufferCache::CollectReadbackHistory(const Buffer& buffer, uint64_t window_b
 	}
 }
 
+// KYTY_EAGER_WRITEBACK=<ms> (live, default 0 = off; wolverine-turbo7-1025): eager write-back of hot
+// GPU-written pages. Wolverine's guest threads read (and write) the same few hundred GPU-written pages of one
+// buffer every frame (0x12c0000000, 70 MiB, written by CS 0xeaa507075716aa3b each frame; turbo6 log: ~12K
+// async readback faults per 5 s, 650 us each on the render thread, ~10K copy-queue readbacks of 171 us on
+// Thread_Gpu). KYTY_READBACK_HISTORY batched them only at the next fault, which still costs that fault.
+// Here Thread_Gpu, between submissions and while idle, downloads every page that faulted in the last <ms>
+// milliseconds and is GPU-written again, as soon as every GPU write to its buffer has executed (the same
+// condition and the same copy as the fault path's copy-queue readback, one batched copy per buffer),
+// and lifts its GPU ownership. The guest then reads the GPU's final bytes without a fault; a later GPU
+// write marks and protects the page again (the fault path then serves it as before). Data is never
+// older than at the fault: only bytes whose writer has finished, on the thread that records GPU work.
+// Returns true when hot pages wait for a writer still in flight (the caller polls again in ~1 ms).
+bool BufferCache::EagerWriteback() {
+	static auto& eager_ms = Common::LiveSwitches::Get("KYTY_EAGER_WRITEBACK", 0);
+	const auto   age      = eager_ms.load(std::memory_order_relaxed);
+	static uint64_t s_runs = 0, s_batches = 0, s_pages = 0, s_bytes = 0, s_us = 0, s_waits = 0;
+	static auto     s_begin = std::chrono::steady_clock::now();
+	const auto      start   = std::chrono::steady_clock::now();
+	if (start - s_begin >= std::chrono::seconds(5)) {
+		if (s_runs != 0 || age > 0) {
+			::printf("Eager write-back (5 s, KYTY_EAGER_WRITEBACK=%lld): %llu batches, %llu pages, %.1f MiB, "
+			         "%.1f ms on Thread_Gpu, %llu polls waited for a writer, %zu hot pages\n",
+			         static_cast<long long>(age), static_cast<unsigned long long>(s_batches),
+			         static_cast<unsigned long long>(s_pages), static_cast<double>(s_bytes) / 1048576.0,
+			         static_cast<double>(s_us) / 1000.0, static_cast<unsigned long long>(s_waits),
+			         m_readback_history.size());
+			std::fflush(stdout);
+		}
+		s_runs = s_batches = s_pages = s_bytes = s_us = s_waits = 0;
+		s_begin = start;
+	}
+	if (age <= 0 || m_readback_history.empty() || !m_pending_write_readbacks.empty()) {
+		return false;
+	}
+	const auto now_ms = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::milliseconds>(start.time_since_epoch()).count());
+	bool                                            waiting = false;
+	std::vector<std::pair<BufferId, uint64_t>>      candidates;
+	{
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		for (const auto& [page, ms]: m_readback_history) {
+			if (now_ms - ms > static_cast<uint64_t>(age) ||
+			    !m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) ||
+			    !m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) ||
+			    m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+				continue;
+			}
+			const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+			if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(page, TRACKER_PAGE_SIZE)) {
+				continue;
+			}
+			const auto writer = m_slot_buffers[*owner].last_gpu_write_tick;
+			if (!m_scheduler.IsFree(writer)) {
+				// Only a submitted writer is worth polling for; one in the open command buffer waits
+				// for the next submission (the next loop of Thread_Gpu runs this again).
+				waiting = waiting || writer < m_scheduler.CurrentTick();
+				continue;
+			}
+			candidates.emplace_back(*owner, page);
+		}
+	}
+	if (candidates.empty()) {
+		s_waits += waiting ? 1 : 0;
+		return waiting;
+	}
+	s_runs++;
+	std::stable_sort(candidates.begin(), candidates.end(),
+	                 [](const auto& a, const auto& b) { return a.first.index < b.first.index; });
+	for (size_t i = 0; i < candidates.size();) {
+		const auto      id = candidates[i].first;
+		std::vector<uint64_t> pages;
+		for (; i < candidates.size() && candidates[i].first.index == id.index; i++) {
+			pages.push_back(candidates[i].second);
+		}
+		auto& buffer = m_slot_buffers[id];
+		// One copy per 4 MiB of staging: pages that did not fit go in the next one.
+		for (int batch = 0; batch < 16 && !pages.empty(); batch++) {
+			const auto            window = pages.front();
+			std::vector<uint64_t> rest(pages.begin() + 1, pages.end());
+			std::vector<uint64_t> copied;
+			uint64_t              bytes = 0;
+			{
+				std::shared_lock lock(m_dirty_ranges_mutex);
+				for (const auto page: pages) {
+					m_gpu_modified_ranges.ForEachInRange(page, TRACKER_PAGE_SIZE,
+					                                     [&](uint64_t b, uint64_t e) { bytes += e - b; });
+				}
+			}
+			if (!TryCopyQueueReadback(buffer, window, window + TRACKER_PAGE_SIZE, rest.empty() ? nullptr : &rest,
+			                          &copied)) {
+				break;
+			}
+			copied.push_back(window);
+			for (const auto page: copied) {
+				if (!HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE)) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+				}
+			}
+			s_batches++;
+			s_pages += copied.size();
+			std::erase_if(pages, [&](uint64_t page) {
+				return std::find(copied.begin(), copied.end(), page) != copied.end();
+			});
+			if (pages.empty()) {
+				s_bytes += bytes;
+			} else {
+				uint64_t left = 0;
+				std::shared_lock lock(m_dirty_ranges_mutex);
+				for (const auto page: pages) {
+					m_gpu_modified_ranges.ForEachInRange(page, TRACKER_PAGE_SIZE,
+					                                     [&](uint64_t b, uint64_t e) { left += e - b; });
+				}
+				s_bytes += bytes - std::min(bytes, left);
+			}
+		}
+	}
+	s_us += static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+	return waiting;
+}
+
 // GPU thread. Returns the tick the guest must wait for, or 0 when the fault is already resolved.
 uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_write,
                                          uint64_t& window_begin, uint64_t& window_end) {
@@ -1195,10 +1316,13 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 	const auto      now_ms  = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                                     std::chrono::steady_clock::now().time_since_epoch())
                                                     .count());
-	if (history > 0) {
+	// KYTY_EAGER_WRITEBACK keeps the same fault history (its own age limit): EagerWriteback() reads it.
+	static auto& eager_ms = Common::LiveSwitches::Get("KYTY_EAGER_WRITEBACK", 0);
+	const auto   keep_ms  = std::max<int64_t>(history, eager_ms.load(std::memory_order_relaxed));
+	if (keep_ms > 0) {
 		if (m_readback_history.size() >= 16384) {
 			std::erase_if(m_readback_history, [&](const auto& entry) {
-				return now_ms - entry.second > static_cast<uint64_t>(history);
+				return now_ms - entry.second > static_cast<uint64_t>(keep_ms);
 			});
 			if (m_readback_history.size() >= 16384) {
 				m_readback_history.clear();

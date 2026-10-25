@@ -110,6 +110,9 @@ public:
 	[[nodiscard]] bool              IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void                            ProcessFaultBuffer();
+	// GPU thread, between submissions: KYTY_EAGER_WRITEBACK (see bufferCache.cpp). True while hot pages
+	// wait for a writer still in flight.
+	bool                            EagerWriteback();
 	// GPU thread: writes bytes on a page protected because the GPU wrote to it, without
 	// downloading the page: the host copy through the backing store, the GPU copy in the command
 	// stream, after the GPU's earlier writes. Bytes the GPU had written are then current on both
