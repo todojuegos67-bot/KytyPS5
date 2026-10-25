@@ -14,6 +14,7 @@
 #include "sync-stats.h"
 #include "fresh-memory.h"
 #include "texture-offload.h"
+#include "ram-guard.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -61,6 +62,7 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include <tuple>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -1394,14 +1396,29 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 }
 
 static BufferCache* g_sync_cache = nullptr;
+// Uploads the ring could not take (a temporary buffer each): the cost side of KYTY_STAGING_RING_MB, in the RAM census.
+static std::atomic<uint64_t> g_ring_overflow_count {0}, g_ring_overflow_bytes {0};
 
 // The image upload ring: 1 GiB on a PC with 32 GB of RAM or more (512 MiB before). A frame where the game streams
 // in an area uploads 0.8-1.4 GB of textures; past the ring's size the render thread waited for the GPU to finish
 // the first copies before it could reuse the ring (60-80 ms of gpu_wait in those frames, Boletaria).
 static uint64_t StagingRingSize() {
 	const uint64_t     ram = LocalPlatform::PhysicalMemory();
-	if (LocalPlatform::LowMemVram()) return 256 * MiB; // KYTY_LOWMEM_VRAM=1
-	return ram >= (uint64_t {32} << 30u) ? 1024 * MiB : 512 * MiB;
+	uint64_t           size = ram >= (uint64_t {32} << 30u) ? 1024 * MiB : 512 * MiB;
+	if (LocalPlatform::LowMemVram()) size = 256 * MiB; // KYTY_LOWMEM_VRAM=1
+	// KYTY_STAGING_RING_MB=<n> (KYTY_MEMCUT): the ring's size, 64-1024. Smaller only waits for the GPU sooner in a
+	// streaming frame (or uploads through a temporary buffer past it): the bytes uploaded are the same.
+	if (const char* text = std::getenv("KYTY_STAGING_RING_MB"); text != nullptr && std::strtoull(text, nullptr, 10) > 0)
+		size = std::clamp<uint64_t>(std::strtoull(text, nullptr, 10), 64, 1024) * MiB;
+	std::printf("[memcut] image upload ring %llu MiB (host-visible)\n", static_cast<unsigned long long>(size / MiB));
+	static std::once_flag once;
+	std::call_once(once, [] {
+		RamGuard::RegisterFigure("upload ring overflows so far (the MiB figure is the number of uploads)",
+		                         [] { return g_ring_overflow_count.load(std::memory_order_relaxed) << 20u; });
+		RamGuard::RegisterFigure("upload ring overflow bytes so far",
+		                         [] { return g_ring_overflow_bytes.load(std::memory_order_relaxed); });
+	});
+	return size;
 }
 
 // KYTY_BDA_SPARSE=1 (where the device has strict sparse residency buffers; off by default while a GPU hang in 2-2's
@@ -2376,6 +2393,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return staging_ring.Handle();
 	}
 
+	g_ring_overflow_count.fetch_add(1, std::memory_order_relaxed);
+	g_ring_overflow_bytes.fetch_add(total_size, std::memory_order_relaxed);
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
