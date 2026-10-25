@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/cache/shadowPoolTrace.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -859,6 +860,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				            depth.desc.view_info.layer_count, depth.desc.info.extent.width, depth.desc.info.extent.height);
 				std::fflush(stdout);
 			}
+		}
+		if (image.info.resources.layers >= 6) {
+			ShadowPoolTrace::DepthBind(ShadowPoolTrace::Find(image.info.data.address, image.info.resources.layers,
+			                                                 image.info.extent.width, image.info.extent.height),
+			                           depth.desc.view_info.base_layer, depth.desc.view_info.layer_count,
+			                           depth.depth_clear_enable, depth_meta_clear, depth.depth_write_enable);
 		}
 		const auto pixel_writable = feedback ? writable & ~vk::ImageAspectFlagBits::eDepth : writable;
 		if (static_cast<bool>(image.binding.pixel_sampled_aspects & pixel_writable) ||
