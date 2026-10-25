@@ -1468,6 +1468,101 @@ int Make(const Options& options) {
 	}
 }
 
+// --list-programs (refl7, G-buffer reverse engineering): every program of the game's bundles and of eboot.bin with the
+// hash the emulator gives it at run time (shader.cpp ShaderCodeHash: the declared hash of the code's ShaderBinaryInfo
+// when the code starts with s_mov_b32 vcc_hi, <offset>, else XXH3-64 of the code), its stage, its bundle and the
+// materials (.cmat) that use the bundle with their pass ids. So a hash in a log ("G-buffer consumer CS ...") names its
+// shader package (iblfullscreen/csspecularibl, runtimelightingcompute/cs_run, water/..., projecteddecal/...). With
+// a dump folder: the code of every program whose bundle path contains one of the filter's comma-separated words (or
+// whose run-time hash is one of them, 16 hex digits), as
+// <STAGE>_<hash>.bin (tools/local/rdna-decode.cpp disassembles it).
+int ListPrograms(const fs::path& game, const fs::path& out, const fs::path& dump_dir, const std::string& filter) {
+	try {
+		const Inventory inventory(ExtendedLength(game));
+		if (inventory.bundles.empty()) std::fprintf(stderr, "no shader bundles (*.csdr) under %s\n", Utf8(game).c_str());
+		// The materials of each bundle (its PathKey): the .cmat path below the game folder and its techniques.
+		std::unordered_map<std::string, std::vector<std::string>> materials_of;
+		for (const auto& file: FindGameFiles(ExtendedLength(game), ".cmat")) {
+			try {
+				auto [bundle, techniques] = ParseMaterial(ReadAll(file.path));
+				std::string name;
+				for (const auto& part: file.parts) name += (name.empty() ? "" : "/") + part;
+				std::string passes;
+				for (const auto& [pass, kind]: techniques)
+					passes += (passes.empty() ? "" : ",") + std::to_string(pass) + (kind == KindCompute ? "c" : kind == KindPair ? "" : "?");
+				materials_of[PathKey(BundleParts(std::move(bundle)))].push_back(name + "[" + passes + "]");
+			} catch (const std::exception&) {
+			}
+		}
+		std::vector<std::string> words;
+		for (size_t at = 0; at < filter.size();) {
+			auto end = filter.find(',', at);
+			if (end == std::string::npos) end = filter.size();
+			if (end > at) words.push_back(Lower(std::string_view(filter).substr(at, end - at)));
+			at = end + 1;
+		}
+		std::ofstream tsv(out, std::ios::binary | std::ios::trunc);
+		if (!tsv) throw Fatal("cannot write " + Utf8(out));
+		tsv << "runtime_hash\txxh3\tstage\tcode_bytes\tbundle\tentry\tmaterials\n";
+		std::error_code error;
+		if (!dump_dir.empty()) fs::create_directories(dump_dir, error);
+		uint64_t listed = 0, dumped = 0;
+		const auto one = [&](const Shader& shader, const std::string& where, size_t entry, const std::string& mats, bool dump) {
+			const auto code  = shader.code;
+			const auto xxh3  = XXH3_64bits(code.data(), code.size());
+			uint64_t   hash  = xxh3;
+			if (code.size() >= 8 && Field<uint32_t>(code, 0) == 0xBEEB03FFu) {
+				const uint64_t at = (uint64_t {Field<uint32_t>(code, 4)} + 1) * 8 + 16; // (ShaderBinaryInfo.hash0)
+				if (at + 8 <= code.size()) {
+					const uint64_t declared = (uint64_t {Field<uint32_t>(code, at + 4)} << 32u) | Field<uint32_t>(code, at);
+					if (declared != 0) hash = declared;
+				}
+			}
+			const char* stage = shader.agc.type == TypeCs ? "CS" : shader.agc.type == TypePs ? "PS" : shader.agc.type == TypeGs ? "VS" : "XX";
+			char        head[96];
+			std::snprintf(head, sizeof(head), "%016llx\t%016llx\t%s\t%zu\t", static_cast<unsigned long long>(hash),
+			              static_cast<unsigned long long>(xxh3), stage, code.size());
+			tsv << head << where << "\t" << entry << "\t" << mats << "\n";
+			++listed;
+			char hex[20];
+			std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(hash));
+			if (!dump) dump = std::find(words.begin(), words.end(), std::string(hex)) != words.end(); // (a hash in the filter)
+			if (dump && !dump_dir.empty()) {
+				char name[64];
+				std::snprintf(name, sizeof(name), "%s_%016llx.bin", stage, static_cast<unsigned long long>(hash));
+				std::ofstream bin(dump_dir / name, std::ios::binary | std::ios::trunc);
+				bin.write(reinterpret_cast<const char*>(code.data()), static_cast<std::streamsize>(code.size()));
+				if (bin) ++dumped;
+			}
+		};
+		for (const auto& bundle: inventory.bundles) {
+			std::string where;
+			for (const auto& part: bundle.parts) where += (where.empty() ? "" : "/") + part;
+			const auto  lower = Lower(where);
+			const bool  dump  = std::any_of(words.begin(), words.end(), [&](const std::string& w) { return lower.find(w) != std::string::npos; });
+			std::string mats;
+			if (const auto found = materials_of.find(PathKey(bundle.parts)); found != materials_of.end()) {
+				const auto& list = found->second;
+				for (size_t i = 0; i < list.size() && i < 6; ++i) mats += (i ? " " : "") + list[i];
+				if (list.size() > 6) mats += " (+" + std::to_string(list.size() - 6) + " more)";
+			}
+			for (size_t e = 0; e < bundle.entries.size(); ++e) one(bundle.entries[e], where, e, mats, dump);
+		}
+		const bool dump_eboot = std::any_of(words.begin(), words.end(), [](const std::string& w) { return w == "eboot"; });
+		for (size_t e = 0; e < inventory.embedded.size(); ++e) one(inventory.embedded[e], "eboot.bin", e, "", dump_eboot);
+		tsv.close();
+		std::printf("%s: %llu programs listed%s", Utf8(out).c_str(), static_cast<unsigned long long>(listed),
+		            dump_dir.empty() ? "\n" : "");
+		if (!dump_dir.empty())
+			std::printf(", %llu dumped to %s (filter \"%s\")\n", static_cast<unsigned long long>(dumped), Utf8(dump_dir).c_str(), filter.c_str());
+		std::fflush(stdout);
+		return 0;
+	} catch (const std::exception& error) {
+		std::fprintf(stderr, "kyty_shader_precompile --list-programs: %s\n", error.what());
+		return 1;
+	}
+}
+
 uint64_t Write(const fs::path& path, std::vector<std::vector<uint32_t>> records, std::vector<std::vector<uint32_t>> pipelines) {
 	SeedFile file;
 	file.records   = std::move(records);

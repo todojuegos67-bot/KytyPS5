@@ -305,6 +305,11 @@ void OnSsrDispatch(uint64_t cs_hash, std::span<const uint64_t> addresses, std::s
 // written over it yet): the packed layers copied once a frame into SSR's own image, the source ssr.comp decodes.
 void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
                        std::span<const TextureBinding> images);
+// After a dispatch (renderCompute.cpp, while GbufViewWanted(): KYTY_GBUF_VIEW / KYTY_GBUF_TAP, gbuf-view.h): a G-buffer
+// reader's images and which it writes (written_mask: bit i = images[i]) logged once; KYTY_GBUF_TAP's image copied.
+[[nodiscard]] bool GbufViewWanted();
+void GbufTapAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                          std::span<const TextureBinding> images, uint64_t written_mask);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

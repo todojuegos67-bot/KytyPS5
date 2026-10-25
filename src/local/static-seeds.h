@@ -24,6 +24,12 @@ std::filesystem::path FindStates();
 // Writes the seed file: 0, or 1 where precompile.py stops with an error (nothing is written then).
 int Make(const Options& options);
 
+// --list-programs (refl7): every program of the game with its run-time hash, stage, bundle and materials as a TSV
+// file; with a dump folder, the code of the programs whose bundle path contains a word of the filter (comma-separated,
+// case-insensitive; "eboot" for eboot.bin's own) as <STAGE>_<hash>.bin. 0, or 1 on an error.
+int ListPrograms(const std::filesystem::path& game, const std::filesystem::path& out, const std::filesystem::path& dump_dir,
+                 const std::string& filter);
+
 // A seed file of these records and pipeline recipes, as Make writes one (the identity line, the XXH3-64 of the body,
 // the body; whole or not at all): the body's size, or 0 where it cannot be written.
 uint64_t Write(const std::filesystem::path& path, std::vector<std::vector<uint32_t>> records,
