@@ -4709,7 +4709,7 @@ bool GtaoEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
 		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
 		set_info.pBindings    = bindings.data();
 		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_gtao.set_layout) != vk::Result::eSuccess) return false;
-		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(SsgiPush)};
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(GtaoPush)};
 		vk::PipelineLayoutCreateInfo layout_info {};
 		layout_info.setLayoutCount         = 1;
 		layout_info.pSetLayouts            = &g_gtao.set_layout;
