@@ -2471,7 +2471,10 @@ void PipelineCache::EvictIdlePipelines() {
 	// (Critical only: at low pressure, 10-24, a 16 GB simulation evicted 3552 pipelines and made 1296 again for ~10-30 MB
 	// freed a pass.)
 	const int ram_pressure = RamGuard::PressureLevel() >= RamGuard::Critical ? RamGuard::Critical : 0;
-	m_evict_pressure = m_evict_pressure || RamDietEnabled() || ram_pressure != 0;
+	// The RAM governor (KYTY_RAM_TARGET_MB): above its soft threshold, pipelines idle 60 s go (30 s over the target, 15 s
+	// in its emergency), the cheapest step it has; nothing changes below it.
+	const int governor = RamGuard::GovernorStage();
+	m_evict_pressure = m_evict_pressure || RamDietEnabled() || ram_pressure != 0 || governor != 0;
 	if (RamDietEnabled()) {
 		// Replaced unoptimized pipelines past RamDietReplacedSeconds (pushed in time order).
 		const auto old = (now - std::chrono::seconds(RamDietReplacedSeconds)).time_since_epoch().count();
@@ -2495,6 +2498,9 @@ void PipelineCache::EvictIdlePipelines() {
 		auto idle = settings.idle;
 		if (ram_pressure != 0)
 			idle = std::min<std::chrono::nanoseconds>(idle, std::chrono::seconds(60));
+		if (governor != 0)
+			idle = std::min<std::chrono::nanoseconds>(
+			    idle, std::chrono::seconds(governor >= RamGuard::GovEmergency ? 15 : governor == RamGuard::GovOver ? 30 : 60));
 		const auto horizon = (now - idle).time_since_epoch().count();
 		uint32_t   first   = flip - std::min<uint32_t>(flip - 1, static_cast<uint32_t>(m_flip_times.size() - 1)), last = flip;
 		if (m_flip_times[first % m_flip_times.size()] <= horizon) {

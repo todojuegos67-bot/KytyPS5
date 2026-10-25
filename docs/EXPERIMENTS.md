@@ -614,3 +614,15 @@ GPU 碰撞只给脚部 IK：`GpuCollisionManager::CastRay` 全镜像唯一调用
   Expected: -0.25..0.5 GiB RAM+commit (ring 128-256, block slack 50-150, pipelines 50-300). A 2-4 GB cut would need
   live textures/RTs out of video memory (= the level 2 offload and its restores): not exact-safe without restore-ahead.
 - Watch: "[memcut] level", "[memcut] image upload ring", census "upload ring overflows so far" (streaming cost).
+
+## ramtarget-1025: adaptive RAM governor (KYTY_RAM_TARGET_MB)
+
+Evidence (16 GB simulated, level 2 + offload, 10-25 19:58 log): RAM in use 15.0-15.3 GiB; offload 560 MiB out; 401
+restores "at most 55.3 ms" - but 396 were "image gone" (asynchronous: download with the frame, write-back on the
+offload worker) and no "restore of ... took" line (printed for every synchronous one of 2 ms or more) appeared, so the
+55 ms is an async restore's latency, not a blocked draw; "0 buffer reads waited". 265 of the 401 came within 10 s of
+the take: offload of hot textures is what churned. The governor: stages soft (target-512) / target / emergency
+(target+512, at most total-512) from the guard's 1 s sample; above soft a flush pass every 2 s (1 s over target),
+pipelines idle 60/30/15 s, offload only for the MiB over (soft - 256), longest-idle first, never a texture touched in
+the last 10 s (3 s in emergency), emergency scans at the next flip. Below soft: no checks, no takes, no extra passes.
+New counters: "restores blocking N (at most x ms), asynchronous N (latency ...); waits for one in flight N".

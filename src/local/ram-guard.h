@@ -119,6 +119,24 @@ void RegisterBudgetFlush(const char* name, FlushClass kind, BudgetFlushFn flush)
 // flush). Default 0 at level 1, 120 at level 2.
 [[nodiscard]] uint64_t FlushImageIdleSeconds();
 
+// RAM governor (ramtarget-1025, KYTY_RAM_TARGET_MB=<n>, default off): the PC's RAM in use (total less available, as the
+// "RAM flush" line and the overlay count it, simulated with KYTY_SIMULATE_RAM_MB) held at about n MiB, adaptively. The
+// guard samples it every second; below the soft threshold nothing extra runs (no cost). Thresholds (MiB):
+//   KYTY_RAM_SOFT_MB       (default target - 512): stage 1, freeing starts ahead of streaming spikes: the flush pass
+//                          every 2 s, idle pipelines after 60 s, texture offload takes the longest-idle verified ones.
+//   target                 stage 2: the pass every second, pipelines after 30 s, offload scans every 30 flips.
+//   KYTY_RAM_EMERGENCY_MB  (default target + 512, at most total - 512): stage 3, an offload scan at the next flip with
+//                          the hot window cut to 3 s, pipelines after 15 s.
+// Texture offload under the governor takes only enough MiB to get back under the soft threshold (less 256 MiB of
+// hysteresis), longest-idle first, never a texture touched within KYTY_RAM_TARGET_HOT_SECONDS (default 10, at 60
+// flips a second); only the clean, sampled-only, download-verified ones it always took. One "RAM target:" line a pass.
+enum GovernorStageId : int { GovIdle = 0, GovSoft = 1, GovOver = 2, GovEmergency = 3 };
+[[nodiscard]] bool     GovernorOn();
+[[nodiscard]] int      GovernorStage();          // (one relaxed load; 0 when off)
+[[nodiscard]] uint64_t GovernorOffloadDemand();  // bytes texture offload should still take now (0: none)
+void                   NoteGovernorOffload(uint64_t bytes); // what a scan took for the demand
+[[nodiscard]] bool     TakeGovernorUrgent();     // stage 3 was entered or held: scan at once (cleared by the call)
+
 // A figure for the census line (bytes now; cheap and thread-safe: it runs on the guard's thread).
 void RegisterFigure(const char* name, uint64_t (*figure)());
 
