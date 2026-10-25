@@ -31,6 +31,7 @@
 #include "local/godrays.h"
 #include "local/rt-local-lights.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
+#include "gpu_tiler_shaders/rtsun_spv.h"
 #include "kernel/memory.h"
 #include <string>
 #endif
@@ -6976,8 +6977,23 @@ struct CShadowPush {
 };
 static_assert(sizeof(CShadowPush) == 176);
 
+// (rtsun) KYTY_RT_SUN=0..3: the cascades' visibility pass (frame-gen.h RtSunWanted); 0 when unset.
+int RtSunLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_RT_SUN");
+		const int   q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		if (q > 0) {
+			std::printf("RTSUN: KYTY_RT_SUN=%s read (level %d: %s)\n", value, q, q == 1 ? "low" : q == 2 ? "high" : "ultra");
+			std::fflush(stdout);
+		}
+		return q;
+	}();
+	return level;
+}
+
 int ContactQuality() {
 	static const int quality = [] {
+		if (RtSunLevel() > 0) return RtSunLevel(); // (KYTY_RT_SUN runs this plumbing with its own shader)
 		const char* name  = "KYTY_RT_SHADOWS";
 		const char* value = std::getenv(name);
 		if (value == nullptr || *value == '\0') name = "KYTY_CONTACT_SHADOWS", value = std::getenv(name);
@@ -7262,6 +7278,310 @@ void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> srt, bool shadow_t
 	}
 }
 
+// ---- KYTY_RT_SUN (frame-gen.h RtSunWanted; rt-sun.comp) ----
+// What the sun pass knows of the game's cascades (any recording thread writes, the upscaler's thread reads).
+// Evidence it builds on (logs of 10-24, KYTY_RT_SHADOWS): the sun-shadow draws (VS daa84716d49bf71d, a depth-only target
+// that is a layer of the 1024x1024 x80 array at 0x102a400000) carry an orthographic light matrix in their 32-word SRT
+// whose depth row gave the sun (0.3434 0.7004 -0.6257), 44.5 degrees; the deferred lighting dispatches (CS decd2b04b5eee050,
+// 7e676bf37482d768, 422c6f1a73af2909, a4f528961552278e, 9d79b940e729615f) sample that array.
+namespace {
+struct RtSunEntry {
+	uint32_t              layer = 0;
+	std::array<float, 16> m {}; // row-major, clip = m * (world, 1)
+	uint32_t              count = 0;
+};
+struct RtSunState {
+	std::mutex mutex;
+	// The draws' matrices: this flip's (per layer, up to 24 sampled draws) and the last complete flip's.
+	uint64_t                cur_flip = ~0ull, last_flip = ~0ull;
+	std::vector<RtSunEntry> cur, last;
+	std::array<uint8_t, 256> sampled {};
+	uint64_t                address = 0; // the cascades' array (the draws' depth target)
+	// Per vertex shader: the SRT word offset * 4 + layout (0 row-major 4x4, 1 column-major 4x4, 2 3x4 rows) of its
+	// orthographic matrix, -1 none (tries in the high bits: looked for at most 8 times).
+	std::unordered_map<uint64_t, int32_t> vs_code;
+	uint32_t                vs_logged = 0;
+	// Our copy of the cascade layers (slot k: copied[k]).
+	VkImage                 image = VK_NULL_HANDLE;
+	VmaAllocation           mem   = nullptr;
+	vk::ImageView           view  = nullptr;
+	vk::Format              format = vk::Format::eUndefined;
+	vk::Extent2D            extent {};
+	vk::ImageLayout         layout = vk::ImageLayout::eUndefined;
+	bool                    failed = false, said_copy = false;
+	uint64_t                copy_flip = ~0ull, copies = 0;
+	std::vector<RtSunEntry> copied;
+	// The shader's buffer (4 frame slots of 1 KiB).
+	VkBuffer                buf     = VK_NULL_HANDLE;
+	VmaAllocation           buf_mem = nullptr;
+	uint8_t*                buf_mapped = nullptr;
+	// Calibration: the convention (-1 undecided), its candidate, the votes last read, the bias, R (log2 (1 + R), -1 none).
+	int                     hyp = -1, cand = -1, cand_n = 0;
+	std::array<uint32_t, 8> votes {};
+	std::array<double, 32>  hist {};
+	double                  bias_m = 0.03, log_r = -1.0;
+	uint32_t                r_lit = 0, r_shadow = 0;
+	// Statistics for the 10 s line.
+	double                  st_dark = 0.0, st_lift = 0.0, st_amount = 0.0, st_pixels = 0.0;
+	uint32_t                st_frames = 0, cascades_used = 0;
+	float                   texel_min = 0.0f, texel_max = 0.0f;
+} g_rs;
+
+constexpr uint32_t kRtSunSlots = 8;      // cascades at most
+constexpr uint32_t kRtSunSlotBytes = 1024;
+
+float RtSunEnv(const char* name, float fallback, float lo, float hi) {
+	const char* value = std::getenv(name);
+	return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), lo, hi) : fallback;
+}
+
+bool RtSunHasStencil(vk::Format f) {
+	return f == vk::Format::eD32SfloatS8Uint || f == vk::Format::eD24UnormS8Uint || f == vk::Format::eD16UnormS8Uint;
+}
+
+// The first orthographic light matrix among the words (FindOrthoAxes' tests): its code (offset * 4 + layout), -1 none.
+int32_t RtSunFindMatrix(std::span<const uint32_t> srt) {
+	const size_t       n = std::min<size_t>(srt.size(), 160);
+	std::vector<float> f(n);
+	std::memcpy(f.data(), srt.data(), n * 4u);
+	const auto finite = [&](size_t o, size_t k) {
+		for (size_t i = 0; i < k; ++i)
+			if (!std::isfinite(f[o + i])) return false;
+		return true;
+	};
+	std::array<float, 3> axis {};
+	for (size_t o = 0; o + 12 <= n; ++o) {
+		if (!finite(o, 12)) continue;
+		const float* m = &f[o];
+		if (o + 16 <= n && finite(o, 16)) {
+			if (m[12] == 0.0f && m[13] == 0.0f && m[14] == 0.0f && m[15] == 1.0f && Orthonormalish(m, m + 4, m + 8, axis))
+				return static_cast<int32_t>(o * 4 + 0);
+			if (m[3] == 0.0f && m[7] == 0.0f && m[11] == 0.0f && m[15] == 1.0f) {
+				const float c0[3] {m[0], m[4], m[8]}, c1[3] {m[1], m[5], m[9]}, c2[3] {m[2], m[6], m[10]};
+				if (Orthonormalish(c0, c1, c2, axis)) return static_cast<int32_t>(o * 4 + 1);
+			}
+		}
+		const bool perspective = o + 16 <= n && finite(o, 16) &&
+		                         std::abs(m[12] * m[8] + m[13] * m[9] + m[14] * m[10]) >
+		                             0.5f * std::sqrt((m[12] * m[12] + m[13] * m[13] + m[14] * m[14]) * (m[8] * m[8] + m[9] * m[9] + m[10] * m[10])) &&
+		                         (m[12] * m[12] + m[13] * m[13] + m[14] * m[14]) > 1e-8f;
+		if ((o & 3u) == 0 && !perspective && Orthonormalish(m, m + 4, m + 8, axis)) return static_cast<int32_t>(o * 4 + 2);
+	}
+	return -1;
+}
+
+// The matrix at `code`, row-major (clip = m * p); false when it is not there (not finite, w row not (0, 0, 0, 1)).
+bool RtSunReadMatrix(std::span<const uint32_t> srt, int32_t code, std::array<float, 16>& m) {
+	const size_t o = static_cast<size_t>(code >> 2);
+	const int    kind = code & 3;
+	if (o + (kind == 2 ? 12u : 16u) > srt.size()) return false;
+	float f[16] {};
+	std::memcpy(f, srt.data() + o, (kind == 2 ? 12u : 16u) * 4u);
+	if (kind == 2) f[12] = 0.0f, f[13] = 0.0f, f[14] = 0.0f, f[15] = 1.0f;
+	if (kind == 1) {
+		for (int i = 0; i < 4; ++i)
+			for (int j = 0; j < 4; ++j) m[i * 4 + j] = f[j * 4 + i];
+	} else {
+		for (int i = 0; i < 16; ++i) m[i] = f[i];
+	}
+	for (float v: m)
+		if (!std::isfinite(v)) return false;
+	return m[12] == 0.0f && m[13] == 0.0f && m[14] == 0.0f && m[15] == 1.0f;
+}
+
+// One matrix per layer: the one most of its sampled draws used (a cascade's matrix is shared by all its draws).
+std::vector<RtSunEntry> RtSunTable(const std::vector<RtSunEntry>& entries) {
+	std::vector<RtSunEntry> out;
+	for (const auto& e: entries) {
+		auto it = std::ranges::find(out, e.layer, &RtSunEntry::layer);
+		if (it == out.end()) out.push_back(e);
+		else if (e.count > it->count) *it = e;
+	}
+	std::erase_if(out, [](const RtSunEntry& e) { return e.count < 2; });
+	std::ranges::sort(out, {}, &RtSunEntry::layer);
+	if (out.size() > kRtSunSlots) out.resize(kRtSunSlots);
+	return out;
+}
+} // namespace
+
+bool RtSunWanted() { return RtSunLevel() > 0; }
+
+void OnSunCascadeDraw(uint64_t vs_hash, std::span<const uint32_t> srt, uint32_t layer, uint64_t target_address) {
+	if (srt.empty() || layer >= 256 || !RtSunWanted()) return;
+	const uint64_t  flip = g_flips_taken.load(std::memory_order_relaxed);
+	std::lock_guard lock(g_rs.mutex);
+	if (flip != g_rs.cur_flip) {
+		if (!g_rs.cur.empty()) g_rs.last = std::move(g_rs.cur), g_rs.last_flip = g_rs.cur_flip;
+		g_rs.cur.clear();
+		g_rs.cur_flip = flip;
+		g_rs.sampled.fill(0);
+	}
+	if (g_rs.sampled[layer] >= 24) return; // (a sample of each layer's draws a flip)
+	auto it = g_rs.vs_code.find(vs_hash);
+	if (it == g_rs.vs_code.end() || (it->second < 0 && (-it->second) < 8)) {
+		const int32_t code = RtSunFindMatrix(srt);
+		const int32_t was  = it == g_rs.vs_code.end() ? 0 : -it->second;
+		g_rs.vs_code[vs_hash] = code >= 0 ? code : -(was + 1);
+		if (g_rs.vs_logged < 16 && (code >= 0 || was == 0)) {
+			++g_rs.vs_logged;
+			std::printf("RTSUN: cascade draw VS %016llx (layer %u of 0x%llx, SRT %zu words): %s at word %d\n",
+			            static_cast<unsigned long long>(vs_hash), layer, static_cast<unsigned long long>(target_address), srt.size(),
+			            code >= 0 ? (code & 3) == 0 ? "orthographic matrix (row-major 4x4)" : (code & 3) == 1 ? "orthographic matrix (column-major 4x4)"
+			                                                                             : "orthographic matrix (3x4 rows)"
+			                      : "no orthographic matrix",
+			            code >= 0 ? code >> 2 : -1);
+			std::fflush(stdout);
+		}
+		it = g_rs.vs_code.find(vs_hash);
+	}
+	if (it->second < 0) return;
+	std::array<float, 16> m {};
+	if (!RtSunReadMatrix(srt, it->second, m)) return;
+	++g_rs.sampled[layer];
+	g_rs.address = target_address;
+	for (auto& e: g_rs.cur)
+		if (e.layer == layer && e.m == m) {
+			++e.count;
+			return;
+		}
+	if (g_rs.cur.size() < 256) g_rs.cur.push_back({layer, m, 1});
+}
+
+void RtSunAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                        std::span<const TextureBinding> images) {
+	if (!RtSunWanted() || g_rs.failed) return;
+	const uint64_t          flip = g_flips_taken.load(std::memory_order_relaxed);
+	std::vector<RtSunEntry> table;
+	uint64_t                address = 0;
+	{
+		std::lock_guard lock(g_rs.mutex);
+		if (g_rs.address == 0 || g_rs.copy_flip == flip) return;
+		address = g_rs.address;
+		table   = RtSunTable(g_rs.cur_flip == flip && !g_rs.cur.empty() ? g_rs.cur : g_rs.last);
+	}
+	if (table.empty()) return;
+	const TextureBinding* binding = nullptr;
+	for (const auto& b: images)
+		if (b.image_id && b.desc.info.data.address == address && b.desc.info.resources.layers >= 4) {
+			binding = &b;
+			break;
+		}
+	if (binding == nullptr) return;
+	auto& image = cache.GetImage(binding->image_id);
+	if (image.backing.image == nullptr) return;
+	const vk::Format   fmt    = image.backing.format;
+	const vk::Extent2D extent = {image.backing.extent.width, image.backing.extent.height};
+	const bool         depth  = SsrIsDepthFormat(fmt);
+	for (const auto& e: table)
+		if (e.layer >= binding->desc.info.resources.layers) return;
+	if (g_rs.image != VK_NULL_HANDLE && (g_rs.format != fmt || g_rs.extent != extent)) {
+		// (another format or size: made again; the device idles first, as the passes' own images are remade)
+		graphics.device.waitIdle();
+		graphics.device.destroyImageView(g_rs.view, nullptr);
+		vmaDestroyImage(graphics.allocator, g_rs.image, g_rs.mem);
+		g_rs.image = VK_NULL_HANDLE, g_rs.mem = nullptr, g_rs.view = nullptr, g_rs.layout = vk::ImageLayout::eUndefined;
+	}
+	const vk::ImageAspectFlags all_aspects =
+	    depth ? (RtSunHasStencil(fmt) ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil : vk::ImageAspectFlagBits::eDepth)
+	          : vk::ImageAspectFlagBits::eColor;
+	const vk::ImageAspectFlags copy_aspect = depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
+	if (g_rs.image == VK_NULL_HANDLE) {
+		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		create.imageType   = VK_IMAGE_TYPE_2D;
+		create.format      = static_cast<VkFormat>(fmt);
+		create.extent      = {extent.width, extent.height, 1};
+		create.mipLevels   = 1;
+		create.arrayLayers = kRtSunSlots;
+		create.samples     = VK_SAMPLE_COUNT_1_BIT;
+		create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO;
+		if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_rs.image, &g_rs.mem, nullptr) != VK_SUCCESS) {
+			g_rs.image = VK_NULL_HANDLE, g_rs.failed = true;
+			std::printf("RTSUN: the cascade copy (%ux%u x%u, %s) could not be created: off\n", extent.width, extent.height, kRtSunSlots,
+			            SsrFormatName(fmt));
+			std::fflush(stdout);
+			return;
+		}
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = vk::Image(g_rs.image);
+		view_info.viewType         = vk::ImageViewType::e2DArray;
+		view_info.format           = fmt;
+		view_info.subresourceRange = vk::ImageSubresourceRange {copy_aspect, 0, 1, 0, kRtSunSlots};
+		if (graphics.device.createImageView(&view_info, nullptr, &g_rs.view) != vk::Result::eSuccess) {
+			vmaDestroyImage(graphics.allocator, g_rs.image, g_rs.mem);
+			g_rs.image = VK_NULL_HANDLE, g_rs.view = nullptr, g_rs.failed = true;
+			return;
+		}
+		g_rs.format = fmt, g_rs.extent = extent, g_rs.layout = vk::ImageLayout::eUndefined;
+	}
+	{
+		// (whatever wrote the cascades, this dispatch's reads, our pass's reads of the last copy: before the copy)
+		vk::MemoryBarrier2 mb {};
+		mb.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		mb.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+		mb.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		mb.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &mb;
+		command.pipelineBarrier2(dependency);
+	}
+	for (const auto& e: table)
+		image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, ImageSubresourceRange {0, 1, e.layer, 1},
+		              command);
+	const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+	                         vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::ImageMemoryBarrier2 b {};
+		b.srcStageMask        = src_stage;
+		b.srcAccessMask       = src_access;
+		b.dstStageMask        = dst_stage;
+		b.dstAccessMask       = dst_access;
+		b.oldLayout           = from;
+		b.newLayout           = to;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image               = vk::Image(g_rs.image);
+		b.subresourceRange    = vk::ImageSubresourceRange {all_aspects, 0, 1, 0, kRtSunSlots};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &b;
+		command.pipelineBarrier2(dependency);
+	};
+	barrier(g_rs.layout, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+	        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+	std::array<vk::ImageCopy, kRtSunSlots> copies {};
+	for (uint32_t k = 0; k < table.size(); ++k) {
+		copies[k].srcSubresource = vk::ImageSubresourceLayers {copy_aspect, 0, table[k].layer, 1};
+		copies[k].dstSubresource = vk::ImageSubresourceLayers {copy_aspect, 0, k, 1};
+		copies[k].extent         = vk::Extent3D {extent.width, extent.height, 1};
+	}
+	command.copyImage(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, vk::Image(g_rs.image), vk::ImageLayout::eTransferDstOptimal,
+	                  static_cast<uint32_t>(table.size()), copies.data());
+	barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
+	        vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
+	g_rs.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	std::lock_guard lock(g_rs.mutex);
+	g_rs.copied    = std::move(table);
+	g_rs.copy_flip = flip;
+	++g_rs.copies;
+	if (!g_rs.said_copy) {
+		g_rs.said_copy = true;
+		std::string line;
+		char        buf[160];
+		for (const auto& e: g_rs.copied) {
+			const double sx = std::sqrt(double(e.m[0]) * e.m[0] + double(e.m[1]) * e.m[1] + double(e.m[2]) * e.m[2]);
+			std::snprintf(buf, sizeof(buf), " layer %u (%.1f m wide, %u of its draws)", e.layer, sx > 0.0 ? 2.0 / sx : 0.0, e.count);
+			line += buf;
+		}
+		std::printf("RTSUN: cascades copied after CS %016llx: array 0x%llx %ux%u %s, %zu cascades:%s\n",
+		            static_cast<unsigned long long>(cs_hash), static_cast<unsigned long long>(address), extent.width, extent.height,
+		            SsrFormatName(fmt), g_rs.copied.size(), line.c_str());
+		std::fflush(stdout);
+	}
+}
+
 namespace {
 bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 	const auto device = graphics.device;
@@ -7280,18 +7600,20 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 				if (device.createSampler(&sampler, nullptr, i == 0 ? &g_ssgi.point : &g_ssgi.linear) != vk::Result::eSuccess) return false;
 			}
 		}
-		std::array<vk::DescriptorSetLayoutBinding, 12> bindings {};
-		for (uint32_t i = 0; i < 12; ++i) {
+		// (KYTY_RT_SUN: rt-sun.comp, two more: 12 the cascades' copy, 13 their matrices' buffer)
+		const uint32_t count = RtSunLevel() > 0 ? 14u : 12u;
+		std::array<vk::DescriptorSetLayoutBinding, 14> bindings {};
+		for (uint32_t i = 0; i < count; ++i) {
 			bindings[i].binding         = i;
-			bindings[i].descriptorType  = i == 11 ? vk::DescriptorType::eStorageBuffer
-			                              : i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler
-			                                                : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorType  = i == 11 || i == 13 ? vk::DescriptorType::eStorageBuffer
+			                              : i < 7 || i == 9 || i == 12 ? vk::DescriptorType::eCombinedImageSampler
+			                                                           : vk::DescriptorType::eStorageImage;
 			bindings[i].descriptorCount = 1;
 			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
 		}
 		vk::DescriptorSetLayoutCreateInfo set_info {};
 		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+		set_info.bindingCount = count;
 		set_info.pBindings    = bindings.data();
 		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_cs.set_layout) != vk::Result::eSuccess) return false;
 		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(CShadowPush)};
@@ -7302,8 +7624,8 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		layout_info.pPushConstantRanges    = &push;
 		if (device.createPipelineLayout(&layout_info, nullptr, &g_cs.layout) != vk::Result::eSuccess) return false;
 		vk::ShaderModuleCreateInfo module_info {};
-		module_info.codeSize    = sizeof(CSHADOW_SPV);
-		module_info.pCode       = CSHADOW_SPV;
+		module_info.codeSize    = RtSunLevel() > 0 ? sizeof(RTSUN_SPV) : sizeof(CSHADOW_SPV);
+		module_info.pCode       = RtSunLevel() > 0 ? RTSUN_SPV : CSHADOW_SPV;
 		vk::ShaderModule module = nullptr;
 		if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
 		vk::ComputePipelineCreateInfo pipeline_info {};
@@ -7318,7 +7640,7 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 			return false;
 		}
 		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-		create.size  = (4 * 16 + 4 * 4) * sizeof(uint32_t); // (calibration slots, then statistics)
+		create.size  = 128 * sizeof(uint32_t); // (calibration slots, then statistics; KYTY_RT_SUN's from word 80)
 		create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 		VmaAllocationCreateInfo allocate {};
 		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
@@ -7326,6 +7648,19 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		VmaAllocationInfo mapped {};
 		if (vmaCreateBuffer(graphics.allocator, &create, &allocate, &g_cs.vote, &g_cs.vote_mem, &mapped) != VK_SUCCESS) return false;
 		g_cs.vote_mapped = static_cast<const uint32_t*>(mapped.pMappedData);
+		if (RtSunLevel() > 0) {
+			// (KYTY_RT_SUN: the cascades' buffer, 4 frame slots written by the CPU)
+			VkBufferCreateInfo sun_create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+			sun_create.size  = 4 * kRtSunSlotBytes;
+			sun_create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+			VmaAllocationCreateInfo sun_allocate {};
+			sun_allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			sun_allocate.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+			VmaAllocationInfo sun_mapped {};
+			if (vmaCreateBuffer(graphics.allocator, &sun_create, &sun_allocate, &g_rs.buf, &g_rs.buf_mem, &sun_mapped) != VK_SUCCESS)
+				return false;
+			g_rs.buf_mapped = static_cast<uint8_t*>(sun_mapped.pMappedData);
+		}
 		vk::QueryPoolCreateInfo query {};
 		query.queryType  = vk::QueryType::eTimestamp;
 		query.queryCount = 16;
@@ -7356,6 +7691,192 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 	return true;
 }
 
+// (KYTY_RT_SUN) This frame's cascades into `slot` of the shader's buffer (rt-sun.comp SunBuf): each copied layer's light
+// matrix composed with the camera's view -> world (from the projection and the G-buffer draws' view-projection, as
+// CShadowView, with the translation), sorted finest first. False while there is no copy of the last 8 flips.
+bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& vp, uint32_t slot) {
+	if (g_rs.buf_mapped == nullptr || g_rs.view == nullptr) return false;
+	std::vector<RtSunEntry> table;
+	uint64_t                copy_flip = ~0ull;
+	{
+		std::lock_guard lock(g_rs.mutex);
+		table = g_rs.copied, copy_flip = g_rs.copy_flip;
+	}
+	const uint64_t flips = g_flips_taken.load(std::memory_order_relaxed);
+	if (table.empty() || copy_flip == ~0ull || flips > copy_flip + 8) return false;
+	std::array<float, 16> pc {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
+	std::array<double, 16> pinv {};
+	if (!Inverse4(pc, pinv)) return false;
+	double v[16] {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j)
+			for (int k = 0; k < 4; ++k) v[i * 4 + j] += pinv[i * 4 + k] * vp[k * 4 + j];
+	for (int i = 0; i < 3; ++i) {
+		const double n = std::sqrt(v[i * 4] * v[i * 4] + v[i * 4 + 1] * v[i * 4 + 1] + v[i * 4 + 2] * v[i * 4 + 2]);
+		if (!(n > 1e-9) || !std::isfinite(n)) return false;
+		for (int j = 0; j < 4; ++j) v[i * 4 + j] /= n;
+	}
+	// view -> world: the rotation's transpose, minus the rotated translation.
+	double vi[16] {};
+	for (int i = 0; i < 3; ++i) {
+		for (int j = 0; j < 3; ++j) vi[i * 4 + j] = v[j * 4 + i];
+		vi[i * 4 + 3] = -(v[0 * 4 + i] * v[3] + v[1 * 4 + i] * v[7] + v[2 * 4 + i] * v[11]);
+	}
+	vi[15] = 1.0;
+	struct Casc {
+		double   r[12];
+		float    texel, mz;
+		uint32_t k;
+	};
+	const float       size = static_cast<float>(std::max(g_rs.extent.width, 1u));
+	std::vector<Casc> cs;
+	for (uint32_t k = 0; k < table.size() && k < kRtSunSlots; ++k) {
+		const auto&  mm = table[k].m;
+		const double sx = std::sqrt(double(mm[0]) * mm[0] + double(mm[1]) * mm[1] + double(mm[2]) * mm[2]);
+		const double sz = std::sqrt(double(mm[8]) * mm[8] + double(mm[9]) * mm[9] + double(mm[10]) * mm[10]);
+		if (!(sx > 1e-9) || !(sz > 1e-9)) continue;
+		Casc c {};
+		for (int row = 0; row < 3; ++row)
+			for (int j = 0; j < 4; ++j) {
+				double d = 0.0;
+				for (int l = 0; l < 4; ++l) d += double(mm[row * 4 + l]) * vi[l * 4 + j];
+				c.r[row * 4 + j] = d;
+			}
+		c.texel = static_cast<float>(2.0 / (sx * size));
+		c.mz    = static_cast<float>(1.0 / sz);
+		c.k     = k;
+		cs.push_back(c);
+	}
+	if (cs.empty()) return false;
+	std::ranges::sort(cs, {}, &Casc::texel);
+	static const float angle   = RtSunEnv("KYTY_RT_SUN_ANGLE", 0.8f, 0.1f, 5.0f);     // the sun's apparent size (deg)
+	static const float reach   = RtSunEnv("KYTY_RT_SUN_REACH", 6.0f, 0.5f, 50.0f);    // occluder heights the penumbra search sees (m)
+	static const float pcf     = RtSunEnv("KYTY_RT_SUN_GAMEPCF", 1.0f, 0.0f, 3.0f);   // the game emulation's PCF radius (taps)
+	static const float band    = RtSunEnv("KYTY_RT_SUN_BAND", 0.08f, 0.0f, 0.3f);     // the cascade blend band (uv)
+	static const float lift    = RtSunEnv("KYTY_RT_SUN_LIFT", 0.75f, 0.0f, 1.0f);     // brightening allowed (share of the sun term)
+	static const float contact = RtSunEnv("KYTY_RT_SUN_CONTACT", RtSunLevel() >= 2 ? 0.75f : 0.0f, 0.0f, 1.0f);
+	static const float debug   = RtSunEnv("KYTY_RT_SUN_DEBUG", 0.0f, 0.0f, 4.0f);
+	static const float forced_hyp  = RtSunEnv("KYTY_RT_SUN_HYP", -1.0f, -1.0f, 7.0f);
+	static const float forced_bias = RtSunEnv("KYTY_RT_SUN_BIAS", -1.0f, -1.0f, 1.0f);
+	static const float forced_r    = RtSunEnv("KYTY_RT_SUN_R", -1.0f, -1.0f, 100.0f);
+	double r = 1.5; // (nothing measured yet: a moderate sun)
+	if (g_rs.log_r >= 0.0) r = std::exp2(g_rs.log_r) - 1.0;
+	else if (g_cs.log_k >= 0.0) r = std::max(std::exp2(g_cs.log_k) - 1.0, 0.0) / 0.75;
+	if (forced_r >= 0.0f) r = forced_r;
+	float* f = reinterpret_cast<float*>(g_rs.buf_mapped + slot * kRtSunSlotBytes);
+	std::memset(f, 0, kRtSunSlotBytes);
+	f[0] = static_cast<float>(cs.size());
+	f[1] = 2.0f * std::tan(0.5f * angle * 0.01745329f);
+	f[2] = static_cast<float>(r);
+	f[3] = 0.0f; // (strength x fade: RtSunSetFade)
+	f[4] = forced_hyp >= 0.0f ? std::floor(forced_hyp) : static_cast<float>(g_rs.hyp);
+	f[5] = forced_bias >= 0.0f ? forced_bias : static_cast<float>(g_rs.bias_m);
+	f[6] = std::floor(debug);
+	f[7] = size;
+	f[8] = std::floor(pcf), f[9] = contact, f[10] = band, f[11] = lift;
+	f[12] = reach;
+	for (size_t i = 0; i < cs.size(); ++i) {
+		float* c = f + 16 + i * 16;
+		for (int j = 0; j < 12; ++j) c[j] = static_cast<float>(cs[i].r[j]);
+		c[12] = static_cast<float>(cs[i].k), c[13] = cs[i].texel, c[14] = cs[i].mz, c[15] = 1.0f;
+	}
+	(void)vmaFlushAllocation(g_graphics_ctx->allocator, g_rs.buf_mem, slot * kRtSunSlotBytes, kRtSunSlotBytes);
+	g_rs.cascades_used = static_cast<uint32_t>(cs.size());
+	g_rs.texel_min = cs.front().texel, g_rs.texel_max = cs.back().texel;
+	return true;
+}
+
+void RtSunSetFade(uint32_t slot, float fade) {
+	if (g_rs.buf_mapped == nullptr) return;
+	static const float strength = RtSunEnv("KYTY_RT_SUN_STRENGTH", 1.0f, 0.0f, 1.0f);
+	float* f = reinterpret_cast<float*>(g_rs.buf_mapped + slot * kRtSunSlotBytes);
+	f[3] = strength * std::clamp(fade, 0.0f, 1.0f);
+	(void)vmaFlushAllocation(g_graphics_ctx->allocator, g_rs.buf_mem, slot * kRtSunSlotBytes, 16);
+}
+
+// (KYTY_RT_SUN) The statistics frame's words read back (v = word 64): the composite's counts, the conventions' votes, the
+// bias histogram and R's probe (rt-sun.comp mode 7).
+void RtSunTakeCalib(const uint32_t* v, double pixels) {
+	g_rs.st_dark += v[0], g_rs.st_lift += v[1], g_rs.st_amount += v[2] / 256.0, g_rs.st_pixels += pixels;
+	++g_rs.st_frames;
+	const uint32_t* w = v + 16; // (word 80)
+	for (int h = 0; h < 8; ++h) g_rs.votes[h] = w[h];
+	int      best = 0;
+	uint32_t second = 0;
+	for (int h = 1; h < 8; ++h)
+		if (w[h] > w[best]) best = h;
+	for (int h = 0; h < 8; ++h)
+		if (h != best) second = std::max(second, w[h]);
+	static uint32_t logged = 0;
+	const bool      decided_now = w[best] >= 100 && w[best] >= second * 5 / 2;
+	static const char* conv[] {"z", "z/2+1/2", "1-z", "1/2-z/2"};
+	if (decided_now && best != g_rs.hyp) {
+		if (best == g_rs.cand) ++g_rs.cand_n;
+		else g_rs.cand = best, g_rs.cand_n = 1;
+		if (g_rs.cand_n >= 2) {
+			const int was = g_rs.hyp;
+			g_rs.hyp = best, g_rs.cand = -1, g_rs.cand_n = 0;
+			g_rs.hist.fill(0.0);
+			g_cs.history_valid = false;
+			std::printf("RTSUN: cascades' convention %s: light clip y %s, stored depth = %s (lit receivers on their own depth: %u of the "
+			            "samples, next best %u)\n",
+			            was >= 0 ? "changed" : "decided", (best & 1) != 0 ? "down (row 0 = +1)" : "up", conv[best >> 1], w[best], second);
+			std::fflush(stdout);
+		}
+	} else if (decided_now) {
+		g_rs.cand = -1, g_rs.cand_n = 0;
+	}
+	if (logged < 6 || (g_rs.hyp < 0 && logged < 40)) {
+		++logged;
+		std::printf("RTSUN: calibration votes (lit receivers on their own depth, per convention):");
+		for (int h = 0; h < 8; ++h) std::printf(" %d:%u", h, w[h]);
+		std::printf("%s\n", g_rs.hyp >= 0 ? "" : decided_now ? " (candidate)" : " (undecided: look at sunlit ground and walls)");
+		std::fflush(stdout);
+	}
+	if (g_rs.hyp >= 0) {
+		// The bias: the 95th percentile of the lit cluster (stored - receiver height below +0.15 m), over the frames.
+		double total = 0.0;
+		for (int b = 0; b < 32; ++b) {
+			g_rs.hist[b] = g_rs.hist[b] * 0.8 + w[8 + b];
+			if (b < 25) total += g_rs.hist[b];
+		}
+		if (total >= 200.0) {
+			double acc = 0.0;
+			int    b   = 0;
+			for (; b < 25; ++b)
+				if ((acc += g_rs.hist[b]) >= 0.95 * total) break;
+			const double value = std::clamp((b + 1) / 64.0 - 0.25, 0.005, 0.15);
+			g_rs.bias_m        = g_rs.bias_m * 0.7 + value * 0.3;
+		}
+		const uint32_t cl = w[40], cs = w[43];
+		g_rs.r_lit = cl, g_rs.r_shadow = cs;
+		if (cl >= 60 && cs >= 60) {
+			const double k  = std::exp2((static_cast<double>(w[41]) / cl - static_cast<double>(w[44]) / cs) / 32.0);
+			const double nl = static_cast<double>(w[42]) / 256.0 / cl;
+			const double r  = std::clamp((k - 1.0) / std::max(nl, 0.3), 0.0, 40.0);
+			const double lr = std::log2(1.0 + r);
+			g_rs.log_r      = g_rs.log_r < 0.0 ? lr : g_rs.log_r + (lr - g_rs.log_r) * 0.25;
+		}
+	}
+}
+
+// (KYTY_RT_SUN) The 10 s line.
+void RtSunLog(double gpu_ms, uint32_t samples) {
+	const double px = std::max(g_rs.st_pixels, 1.0);
+	std::printf("RTSUN: stats: %.1f %% of pixels darkened, %.1f %% brightened (> 3 %%), mean change %.3f; convention %d (votes",
+	            100.0 * g_rs.st_dark / px, 100.0 * g_rs.st_lift / px, g_rs.st_amount / px, g_rs.hyp);
+	for (int h = 0; h < 8; ++h) std::printf(" %u", g_rs.votes[h]);
+	std::printf("), bias %.3f m, sun/ambient R %.2f (%u lit / %u shadowed samples), %u cascades (texel %.3f..%.3f m), %llu copies; "
+	            "GPU %.3f ms (%u samples)\n",
+	            g_rs.bias_m, g_rs.log_r >= 0.0 ? std::exp2(g_rs.log_r) - 1.0 : -1.0, g_rs.r_lit, g_rs.r_shadow, g_rs.cascades_used,
+	            g_rs.texel_min, g_rs.texel_max, static_cast<unsigned long long>(g_rs.copies), gpu_ms, samples);
+	std::fflush(stdout);
+	g_rs.st_dark = g_rs.st_lift = g_rs.st_amount = g_rs.st_pixels = 0.0;
+	g_rs.st_frames = 0;
+}
+
 void CShadowReadTiming() {
 	if (g_cs.pool == nullptr || g_graphics_ctx == nullptr) return;
 	while (g_cs.read + 4 <= g_cs.written) {
@@ -7379,6 +7900,7 @@ void CShadowTakeStats() {
 		g_cs.st_pixels += static_cast<double>(g_cs.render.width) * g_cs.render.height;
 		g_cs.st_n += v[0], g_cs.st_occ += v[1] / 256.0, g_cs.st_depth += v[2] / 2.0;
 		++g_cs.st_samples;
+		if (RtSunLevel() > 0) RtSunTakeCalib(v, static_cast<double>(g_cs.render.width) * g_cs.render.height);
 		// The light probe: geometric means of the sun-facing and facing-away luminance (log2 * 32 + 40 * 32 codes).
 		if (v[4] >= 200 && v[6] >= 200) {
 			const double lk = std::clamp((static_cast<double>(v[5]) / v[4] - static_cast<double>(v[7]) / v[6]) / 32.0, 0.0, 6.0);
@@ -7397,7 +7919,9 @@ void CShadowTakeStats() {
 	}
 	const auto now = std::chrono::steady_clock::now();
 	if (now - g_cs.last_log < std::chrono::seconds(10)) return;
-	if (g_cs.st_samples > 0 || g_cs.samples > 0) {
+	if (RtSunLevel() > 0 && (g_cs.st_samples > 0 || g_cs.samples > 0)) {
+		RtSunLog(g_cs.samples > 0 ? g_cs.sum_ms / g_cs.samples : 0.0, g_cs.samples);
+	} else if (g_cs.st_samples > 0 || g_cs.samples > 0) {
 		const double n = g_cs.st_n, px = std::max(g_cs.st_pixels, 1.0);
 		std::printf("RTSHADOW: stats: %.1f %% of pixels shadowed (occlusion > 0.1), mean occlusion %.3f (%.3f on those), their "
 		            "mean depth %.1f m; sun lit/ambient K %.2f -> overcast factor %.2f; GPU %.3f ms (%u samples, %u frames)\n",
@@ -7614,6 +8138,10 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	Rows3 view {};
 	if (!CShadowView(m, vp, view)) return said_once("the camera matrix is degenerate"), false;
 	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality)) return said_once("could not create its pipeline or images"), false;
+	// (KYTY_RT_SUN: the cascades copied lately, their matrices into this frame's slot of the buffer; else nothing yet)
+	const bool sun_mode = RtSunLevel() > 0;
+	const uint32_t sun_slot = g_cs.frame % 4;
+	if (sun_mode && !RtSunPrepare(m, vp, sun_slot)) return said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
 	CShadowCamera(view, m);
 	if (g_cs.hyp >= 0 && (CShadowLeft() & (1u << g_cs.hyp)) == 0) {
 		static const char* names[] {"+x", "-x", "+y", "-y", "+z", "-z"};
@@ -7744,13 +8272,20 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		infos[9]  = {lin, aux_in->view, vk::ImageLayout::eGeneral};
 		infos[10] = {nullptr, aux_out->view, vk::ImageLayout::eGeneral};
 		vk::DescriptorBufferInfo vote_info {vk::Buffer(g_cs.vote), 0, VK_WHOLE_SIZE};
-		vk::WriteDescriptorSet   writes[12] {};
-		for (uint32_t i = 0; i < 12; ++i) {
+		// (KYTY_RT_SUN: 12 the cascades' copy, 13 this frame's slot of their buffer)
+		const vk::DescriptorImageInfo  casc_info {pt, g_rs.view, vk::ImageLayout::eShaderReadOnlyOptimal};
+		const vk::DescriptorBufferInfo sun_info {vk::Buffer(g_rs.buf), vk::DeviceSize {sun_slot} * kRtSunSlotBytes, kRtSunSlotBytes};
+		const uint32_t                 count = sun_mode ? 14u : 12u;
+		vk::WriteDescriptorSet         writes[14] {};
+		for (uint32_t i = 0; i < count; ++i) {
 			writes[i].dstBinding      = i;
 			writes[i].descriptorCount = 1;
-			if (i == 11) {
+			if (i == 11 || i == 13) {
 				writes[i].descriptorType = vk::DescriptorType::eStorageBuffer;
-				writes[i].pBufferInfo    = &vote_info;
+				writes[i].pBufferInfo    = i == 11 ? &vote_info : &sun_info;
+			} else if (i == 12) {
+				writes[i].descriptorType = vk::DescriptorType::eCombinedImageSampler;
+				writes[i].pImageInfo     = &casc_info;
 			} else {
 				writes[i].descriptorType = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
 				writes[i].pImageInfo     = &infos[i];
@@ -7758,7 +8293,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 		push.misc[0]  = mode;
 		push.extra[0] = step;
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_cs.layout, 0, 12, writes);
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_cs.layout, 0, count, writes);
 		command.pushConstants(g_cs.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
@@ -7777,7 +8312,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// The statistics on every 16th frame (one in flight).
 	const bool stats = g_cs.stat_frame < 0 && g_cs.frame % 16 == 8;
 	if (stats) {
-		command.fillBuffer(vk::Buffer(g_cs.vote), 64 * 4, 8 * 4, 0); // (statistics 64..66, light probe 68..71)
+		command.fillBuffer(vk::Buffer(g_cs.vote), 64 * 4, (sun_mode ? 64 : 8) * 4, 0); // (statistics 64..66, light probe 68..71; KYTY_RT_SUN 80..124)
 		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
 		       vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
 	}
@@ -7840,6 +8375,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.extra[1] = static_cast<float>(l_view[0]), push.extra[2] = static_cast<float>(l_view[1]), push.extra[3] = static_cast<float>(l_view[2]);
 	push.trace[2] = strength * g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade) * static_cast<float>(g_cs.sun_factor); // (smoothstep fade; overcast)
 	push.tune[0]  = g_cs.log_k >= 0.0 ? static_cast<float>(1.0 / std::max(std::exp2(g_cs.log_k), 1.25)) : 0.0f;
+	if (sun_mode) RtSunSetFade(sun_slot, g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade));
 	if (!g_cs.said_on) {
 		g_cs.said_on = true;
 		static const char* axes[] {"+x", "-x", "+y", "-y", "+z", "-z"};
@@ -7867,16 +8403,18 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	run(2, g_cs.tmp_a, g_cs.raw, g_cs.history[cur], g_cs.tmp_b, 1.0f, g_cs.trace);
 	run(2, g_cs.history[cur], g_cs.raw, g_cs.tmp_b, g_cs.raw, 2.0f, g_cs.trace);
 	const SsgiImage* final_vis = &g_cs.tmp_b;
-	if (quality >= 2) {
+	if (quality >= 2 && !sun_mode) { // (KYTY_RT_SUN: steps 1, 2 only: wider a-trous would soften the contact-hardened edges)
 		run(2, g_cs.tmp_b, g_cs.raw, g_cs.tmp_a, g_cs.raw, 4.0f, g_cs.trace);
 		final_vis = &g_cs.tmp_a;
 	}
-	if (quality >= 3) { // (10-24: a wider pass: the penumbra soft, no hard shards)
+	if (quality >= 3 && !sun_mode) { // (10-24: a wider pass: the penumbra soft, no hard shards)
 		run(2, g_cs.tmp_a, g_cs.raw, g_cs.tmp_b, g_cs.raw, 8.0f, g_cs.trace);
 		final_vis = &g_cs.tmp_b;
 	}
 	if (stats) // (the light probe: the game's sun strength; push.extra holds this frame's light)
 		run(6, g_cs.tmp_a, g_cs.tmp_b, g_cs.raw, g_cs.gbuf[cur], 0.0f, vk::Extent2D {(color.extent.width + 3) / 4, (color.extent.height + 3) / 4});
+	if (stats && sun_mode) // (KYTY_RT_SUN: the conventions' votes, the bias histogram, R's probe)
+		run(7, g_cs.tmp_a, g_cs.tmp_b, g_cs.raw, g_cs.gbuf[cur], 0.0f, vk::Extent2D {(color.extent.width + 7) / 8, (color.extent.height + 7) / 8});
 	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_b; // (the composite's stability mask: the history count in .x)
 	if (stats) push.misc[3] |= 8;
 	run(4, *final_vis, g_cs.raw, g_cs.out, g_cs.raw, 0.0f, g_cs.render);

@@ -518,6 +518,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${cshadow_header}")
+# KYTY_RT_SUN (src/local/rt-sun.comp): the sun's visibility from the game's cascades, the CShadowApply pass's other shader.
+set(rtsun_source "${KYTY_SOURCE_DIR}/local/rt-sun.comp")
+set(rtsun_spv "${gpu_tiler_generated_dir}/rtsun.spv")
+set(rtsun_header "${gpu_tiler_generated_dir}/rtsun_spv.h")
+add_custom_command(
+	OUTPUT "${rtsun_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rtsun_spv}" "${rtsun_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rtsun_spv} -DOUTPUT=${rtsun_header}
+	        -DSYMBOL=RTSUN_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rtsun_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rtsun_header}")
 
 # FSR 3 frame generation's HUD layer (src/local/fsr3-fg.cpp).
 set(hud_split_source "${KYTY_SOURCE_DIR}/local/hud-split.comp")

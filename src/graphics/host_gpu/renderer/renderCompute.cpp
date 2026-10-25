@@ -1289,6 +1289,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		FrameGen::RtReflGuideAfterDispatch(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
 		                                   std::span<const TextureBinding> {bindings.images}, written);
 	}
+	// (KYTY_RT_SUN: the first dispatch of a flip sampling the sun cascades' array copies their layers)
+	if (FrameGen::RtSunWanted() && !bindings.images.empty())
+		FrameGen::RtSunAfterDispatch(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
+		                             std::span<const TextureBinding> {bindings.images});
 	ResetBindings();
 	m_context.GetCommandScheduler().CompleteDispatch();
 	phase.reset();
