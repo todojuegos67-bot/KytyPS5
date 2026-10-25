@@ -619,6 +619,10 @@ static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
 	}
 	auto* spec = Spec::Current();
 	if (spec == nullptr) {
+		// The buffer copies recorded before it are made first (KYTY_ASYNC_UPLOAD): the game takes a label as the GPU
+		// being done and may rewrite the buffers those copies read at once, and a copy made after that took the new
+		// bytes for the earlier draws (issue #196: lit ground and water flickered white; port of chenxiao07 f6db24b6).
+		AsyncUpload::Drain();
 		std::memcpy(dst, src, size);
 		Spec::NoteHostWrite(reinterpret_cast<uint64_t>(dst), size);
 		// (The labels a speculation's waits check: none without speculation.)

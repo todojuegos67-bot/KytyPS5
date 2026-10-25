@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "async-upload.h"
 #include "draw-state-observer.h"
 #include "local-platform.h"
 #include "vulkan-recording.h"
@@ -920,6 +921,9 @@ void Speculation::After(Result& result, size_t index) {
 	for (size_t i = from.touched_images; i < to.touched_images; ++i)
 		textures.TouchSpeculated(*state.touched_images[i].first, state.touched_images[i].second);
 	for (size_t i = from.touched_buffers; i < to.touched_buffers; ++i) buffers.TouchSpeculated(state.touched_buffers[i]);
+	// The command processor's writes (labels) wait for the upload copies recorded before them, as WriteGuestMemory's
+	// (KYTY_ASYNC_UPLOAD, issue #196).
+	if (from.writes != to.writes) AsyncUpload::Drain();
 	for (size_t i = from.writes; i < to.writes; ++i) {
 		const auto& write = state.writes[i];
 		if (write.copy) {
