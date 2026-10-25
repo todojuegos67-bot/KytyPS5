@@ -8,6 +8,8 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -766,6 +768,21 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	}
 
 	*port = next_port;
+
+	// KYTY_AUDIO_TRACE=1 (environment): the guest's own port type next to the one it maps to.
+	static const bool trace = [] {
+		const char* value = std::getenv("KYTY_AUDIO_TRACE");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (trace) {
+		::printf("Audio trace: AudioOut2 port 0x%llx raw_type=0x%04x -> type=%d object=%d format=0x%08x freq=%u "
+		         "grains=%u handle=%d\n",
+		         static_cast<unsigned long long>(next_port), static_cast<unsigned>(params->port_type), audio_type,
+		         audioout2_port_type_is_object(params->port_type) ? 1 : 0,
+		         static_cast<unsigned>(params->data_format), static_cast<unsigned>(params->sampling_freq),
+		         static_cast<unsigned>(samples_num), audio_handle);
+		std::fflush(stdout);
+	}
 
 	if (next_port <= 16 || (next_port % 600) == 0) {
 		PRINT_NAME();

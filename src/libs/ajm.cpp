@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -193,6 +194,36 @@ struct AjmInstanceState {
 	AjmGaplessState             gapless;
 	std::unique_ptr<AjmDecoder> decoder;
 };
+
+// KYTY_AUDIO_TRACE=1 (environment, diagnostic): instance creation, ATRAC9 stream formats,
+// resample requests (this HLE ignores them and always outputs at ratio 1) and decode errors.
+static bool AjmTraceEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AUDIO_TRACE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static void AjmTraceDecode(uint32_t instance, size_t input_size, size_t output_size,
+                           const AjmDecodeResult& result) {
+	if (!AjmTraceEnabled()) {
+		return;
+	}
+	const bool error = (result.result & (AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA |
+	                                     AJM_RESULT_INVALID_PARAMETER | AJM_RESULT_NOT_INITIALIZED)) != 0;
+	static std::atomic<uint32_t> errors {0};
+	static std::atomic<uint32_t> calls {0};
+	const auto                   n = calls.fetch_add(1, std::memory_order_relaxed);
+	if ((error && errors.fetch_add(1, std::memory_order_relaxed) < 64) || n < 32) {
+		std::printf("Audio trace: AJM decode instance=0x%08x in=%zu out_room=%zu -> result=0x%08x internal=%d "
+		            "consumed=%zu written=%zu frames=%u rate=%u ch=%u\n",
+		            instance, input_size, output_size, static_cast<uint32_t>(result.result),
+		            result.internal_result, result.input_consumed, result.output_written, result.frames,
+		            result.format.sampling_frequency, result.format.channel_num);
+		std::fflush(stdout);
+	}
+}
 
 static std::mutex                                     g_ajm_instances_mutex;
 static std::unordered_map<uint32_t, AjmInstanceState> g_ajm_instances;
@@ -440,8 +471,10 @@ static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, s
 		return result;
 	}
 
-	return state->decoder->Decode(input, input_size, output, output_size, multiple_frames,
-	                              &state->gapless);
+	auto result = state->decoder->Decode(input, input_size, output, output_size, multiple_frames,
+	                                     &state->gapless);
+	AjmTraceDecode(instance, input_size, output_size, result);
+	return result;
 }
 
 static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer* input_buffers,
@@ -672,6 +705,11 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 	     context, codec, flags, *instance);
 	if (!supported) {
 		LOGF("\t unsupported codec instance created without decoder\n");
+	}
+	if (AjmTraceEnabled()) {
+		std::printf("Audio trace: AJM instance 0x%08x codec=%u (%s) flags=0x%016llx\n", *instance, codec,
+		            AjmCodecName(codec), static_cast<unsigned long long>(flags));
+		std::fflush(stdout);
 	}
 
 	return OK;
@@ -939,6 +977,14 @@ int KYTY_SYSV_ABI AjmBatchJobSetResampleParameters(AjmBatchInfo* info, uint32_t 
 	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE);
 	LOGF("\t instance = 0x%08" PRIx32 ", ratio = %f, flags = 0x%08" PRIx32 "\n", instance,
 	     static_cast<double>(ratio), flags);
+	if (AjmTraceEnabled()) {
+		static std::atomic<uint32_t> traced {0};
+		if (traced.fetch_add(1, std::memory_order_relaxed) < 64) {
+			std::printf("Audio trace: AJM set-resample instance=0x%08x ratio=%f flags=0x%08x (ignored)\n",
+			            instance, static_cast<double>(ratio), flags);
+			std::fflush(stdout);
+		}
+	}
 	return AjmAppendJob(info, AJM_JOB_SET_RESAMPLE_PARAMETERS_SIZE, "set-resample");
 }
 
@@ -953,6 +999,16 @@ int KYTY_SYSV_ABI AjmBatchJobSetResampleParametersEx(AjmBatchInfo* info, uint32_
 	     "\n",
 	     instance, static_cast<double>(ratio_start), static_cast<double>(ratio_change_per_sample),
 	     flags);
+	if (AjmTraceEnabled()) {
+		static std::atomic<uint32_t> traced {0};
+		if (traced.fetch_add(1, std::memory_order_relaxed) < 64) {
+			std::printf("Audio trace: AJM set-resample-ex instance=0x%08x start=%f change=%g flags=0x%08x "
+			            "(ignored)\n",
+			            instance, static_cast<double>(ratio_start),
+			            static_cast<double>(ratio_change_per_sample), flags);
+			std::fflush(stdout);
+		}
+	}
 	return AjmAppendJob(info, AJM_JOB_SET_RESAMPLE_PARAMETERS_SIZE, "set-resample-ex");
 }
 
