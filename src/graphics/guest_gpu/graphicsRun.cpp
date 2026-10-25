@@ -27,6 +27,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
+#include "async-upload.h"
 #include "live-trace.h"
 #include "live-trace-gpu.h"
 #include "live-census.h"
@@ -1020,6 +1021,12 @@ bool GuestGpu::Process(Submission& submission) {
 	BdaDirtyRegions::Publish();
 	if (submission.type == SubmissionType::FrameBoundary) {
 		EXIT_IF(submission.started || submission.queue_id != 0);
+		// The frame's upload copies taken first (KYTY_ASYNC_UPLOAD: the upload worker reads guest memory after the
+		// render thread recorded them): past the boundary the game writes what that frame's work read (the next frame
+		// but one, double buffered), and a copy still pending took those bytes - lit ground and water flickered white
+		// for a frame on a fast PC with the game's async compute (issue #196). Without deferred submits each submission
+		// drained them; the boundary waits here only for the copies recorded since the last one.
+		AsyncUpload::Drain();
 		Common::LockGuard lock(m_queue_mutex);
 		EXIT_IF(submission.frame_epoch != m_consumed_frame);
 		++m_done_num;
