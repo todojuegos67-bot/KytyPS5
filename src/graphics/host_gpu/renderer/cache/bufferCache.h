@@ -185,8 +185,15 @@ private:
 	                                     bool is_write);
 	// GPU thread: KYTY_COPY_QUEUE_READBACK (see bufferCache.cpp). Downloads the window's
 	// GPU-written bytes on the readback queue when every GPU write to the buffer has executed.
+	// With extra_pages (KYTY_READBACK_HISTORY), GPU-written bytes of those tracker pages of the same
+	// buffer go in the same copy while they fit; the pages that went are appended to copied_pages.
 	[[nodiscard]] bool TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin,
-	                                        uint64_t window_end);
+	                                        uint64_t window_end,
+	                                        const std::vector<uint64_t>* extra_pages = nullptr,
+	                                        std::vector<uint64_t>*       copied_pages = nullptr);
+	// GPU thread: KYTY_READBACK_HISTORY. Pages of a buffer whose faults were served recently.
+	void CollectReadbackHistory(const Buffer& buffer, uint64_t window_begin, uint64_t window_end,
+	                            uint64_t page_begin, std::vector<uint64_t>& pages);
 	struct CopyQueueReadback {
 		vk::CommandPool         pool    = nullptr;
 		vk::CommandBuffer       command = nullptr;
@@ -257,6 +264,8 @@ private:
 	// IsCleanForConcurrentRead; the GPU thread reads them without it.
 	mutable std::shared_mutex                          m_dirty_ranges_mutex;
 	std::vector<PendingWriteReadback>                  m_pending_write_readbacks;
+	// KYTY_READBACK_HISTORY: tracker page -> steady-clock ms of its last async readback fault.
+	std::map<uint64_t, uint64_t>                       m_readback_history;
 	uint64_t                                           m_direct_readbacks = 0;
 	MemoryTracker                                      m_memory_tracker;
 	StreamBuffer                                       m_staging_buffer;

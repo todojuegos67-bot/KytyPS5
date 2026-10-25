@@ -725,6 +725,11 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	return true;
 }
 
+namespace {
+std::atomic<uint64_t> g_fault_us[2] {};
+std::atomic<uint64_t> g_fault_n[2] {};
+} // namespace
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	KYTY_PROFILER_FUNCTION();
 	PhaseStats::Scope phase {PhaseStats::GuestPhase(PhaseStats::RenderFault, PhaseStats::OtherFault)};
@@ -744,6 +749,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// them synchronously cost the GPU thread ~1.3 s per 5 s, mostly waiting for the GPU.
 	if (!GuestGpu::IsGpuThread() && !Libs::LibKernel::Memory::ForceSyncReadback() &&
 	    (is_write ? AsyncWriteReadbackEnabled() : AsyncReadReadbackEnabled())) {
+		// "Readback faults (5 s)": wall time guest threads spend in these faults, render thread apart.
+		struct FaultTimer {
+			std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+			~FaultTimer() {
+				const auto us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+				                                          std::chrono::steady_clock::now() - begin)
+				                                          .count());
+				const int  i  = PhaseStats::IsRenderThread() ? 0 : 1;
+				g_fault_us[i].fetch_add(us, std::memory_order_relaxed);
+				g_fault_n[i].fetch_add(1, std::memory_order_relaxed);
+			}
+		} fault_timer;
 		uint64_t tick         = 0;
 		uint64_t window_begin = 0;
 		uint64_t window_end   = 0;
@@ -910,7 +927,9 @@ static bool CopyQueueInflightEnabled() {
 	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
-bool BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin, uint64_t window_end) {
+bool BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin, uint64_t window_end,
+                                       const std::vector<uint64_t>* extra_pages,
+                                       std::vector<uint64_t>*       copied_pages) {
 	constexpr uint64_t StagingSize = 4ull * 1024 * 1024;
 	if (!CopyQueueReadbackEnabled() || m_graphics.readback_queue == nullptr ||
 	    OverlapsPendingWriteReadback(window_begin, window_end)) {
@@ -941,6 +960,35 @@ bool BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin, ui
 	}
 	if (copies.empty() || total_size > StagingSize) {
 		return false;
+	}
+	if (extra_pages != nullptr && !writer_in_flight) {
+		// Pages of the same buffer outside the window, each taken whole or not at all, while the
+		// staging buffer has room. The writer of every byte of the buffer has finished.
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		for (const auto page: *extra_pages) {
+			if (OverlapsPendingWriteReadback(page, page + TRACKER_PAGE_SIZE) ||
+			    m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+				continue;
+			}
+			const auto first      = copies.size();
+			const auto size_first = total_size;
+			m_memory_tracker.ForEachDownloadRange<false>(
+			    page, TRACKER_PAGE_SIZE, [&](uint64_t address, uint64_t bytes) noexcept {
+				    m_gpu_modified_ranges.ForEachInRange(
+				        address, bytes, [&](uint64_t start, uint64_t end) {
+					        copies.emplace_back(start - buffer_address, total_size, end - start);
+					        total_size += Common::AlignUp(end - start, 64);
+				        });
+			    });
+			if (total_size > StagingSize) {
+				copies.resize(first);
+				total_size = size_first;
+				break;
+			}
+			if (copies.size() != first && copied_pages != nullptr) {
+				copied_pages->push_back(page);
+			}
+		}
 	}
 	if (writer_in_flight) {
 		KYTY_PROFILER_BLOCK("BufferCache::CopyQueueReadbackFlush");
@@ -1049,6 +1097,32 @@ static void NoteAsyncReadback(bool copy_queue) {
 	}
 }
 
+// GPU thread (KYTY_READBACK_HISTORY): recently faulted tracker pages of this buffer, outside the window and
+// the faulting page, that are still GPU-owned with GPU-written bytes, at most 1024.
+void BufferCache::CollectReadbackHistory(const Buffer& buffer, uint64_t window_begin, uint64_t window_end,
+                                         uint64_t page_begin, std::vector<uint64_t>& pages) {
+	static auto& history_ms = Common::LiveSwitches::Get("KYTY_READBACK_HISTORY", 0);
+	const auto   history    = static_cast<uint64_t>(std::max<int64_t>(0, history_ms.load(std::memory_order_relaxed)));
+	const auto   now_ms     = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count());
+	const auto buffer_begin = buffer.CpuAddress();
+	const auto buffer_end   = buffer_begin + buffer.Size();
+	for (auto it = m_readback_history.lower_bound(buffer_begin);
+	     it != m_readback_history.end() && it->first + TRACKER_PAGE_SIZE <= buffer_end && pages.size() < 1024;
+	     ++it) {
+		const auto page = it->first;
+		if (now_ms - it->second > history || page == page_begin ||
+		    (page < window_end && window_begin < page + TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		if (m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) &&
+		    m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+			pages.push_back(page);
+		}
+	}
+}
+
 // GPU thread. Returns the tick the guest must wait for, or 0 when the fault is already resolved.
 uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_write,
                                          uint64_t& window_begin, uint64_t& window_end) {
@@ -1106,16 +1180,80 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 	// phases (old engine, 2026-10-20 log) 5-7K such flushes per 5 s split the frames and kept the guest's
 	// job threads waiting 3.6-8.7 s per 5 s; at 43 fps it was ~1.25K. 0 restores the previous path.
 	static auto& copy_queue_first = Common::LiveSwitches::Get("KYTY_ASYNC_READBACK_COPY_QUEUE", 1);
-	if (copy_queue_first.load(std::memory_order_relaxed) != 0 &&
-	    m_scheduler.IsFree(buffer.last_gpu_write_tick) &&
-	    TryCopyQueueReadback(buffer, window_begin, window_end)) {
-		stats.SetOutcome(ReadbackStats::Downloaded);
-		NoteAsyncReadback(true);
-		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
-		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	// KYTY_READBACK_HISTORY=<ms> (live, default 0 = off; wolverine-turbo5-1025): a copy-queue readback
+	// also takes the GPU-written bytes of the buffer's pages whose faults were served in the last <ms>
+	// milliseconds, in the same copy, and lifts their GPU ownership as the fault would. Wolverine reads the
+	// same few hundred scattered pages of GPU-written buffers again every frame (readback stats 10-15:
+	// 4.3-5.4K reads per 5 s on 224-290 pages of one buffer, 2-20 MB in all; 10-25 turbo4: 6.4-7.7K
+	// copy-queue readbacks per 5 s at 5-6 fps), each one a fault, a round trip to Thread_Gpu and a
+	// copy-queue submit and fence wait. Same data as the window: only bytes whose writer has finished,
+	// taken before the fault instead of at it; a later GPU write marks and protects the page again.
+	static auto& history_ms = Common::LiveSwitches::Get("KYTY_READBACK_HISTORY", 0);
+	static uint64_t s_cq = 0, s_cq_us = 0, s_prefetched = 0;
+	static auto     s_begin = std::chrono::steady_clock::now();
+	const auto      history = history_ms.load(std::memory_order_relaxed);
+	const auto      now_ms  = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count());
+	if (history > 0) {
+		if (m_readback_history.size() >= 16384) {
+			std::erase_if(m_readback_history, [&](const auto& entry) {
+				return now_ms - entry.second > static_cast<uint64_t>(history);
+			});
+			if (m_readback_history.size() >= 16384) {
+				m_readback_history.clear();
+			}
 		}
-		return 0;
+		m_readback_history[page_begin] = now_ms;
+	} else if (!m_readback_history.empty()) {
+		m_readback_history.clear();
+	}
+	if (copy_queue_first.load(std::memory_order_relaxed) != 0 &&
+	    m_scheduler.IsFree(buffer.last_gpu_write_tick)) {
+		const auto            start = std::chrono::steady_clock::now();
+		std::vector<uint64_t> extra;
+		std::vector<uint64_t> copied;
+		if (history > 0) {
+			CollectReadbackHistory(buffer, window_begin, window_end, page_begin, extra);
+		}
+		if (TryCopyQueueReadback(buffer, window_begin, window_end, extra.empty() ? nullptr : &extra,
+		                         &copied)) {
+			stats.SetOutcome(ReadbackStats::Downloaded);
+			NoteAsyncReadback(true);
+			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+			for (const auto page: copied) {
+				if (!HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE)) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+				}
+			}
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+			s_cq++;
+			s_prefetched += copied.size();
+			s_cq_us += static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start)
+			        .count());
+			const auto now = std::chrono::steady_clock::now();
+			if (now - s_begin >= std::chrono::seconds(5)) {
+				::printf("Copy-queue readbacks (5 s): %llu, %.1f ms on Thread_Gpu (%.0f us each); %llu extra pages "
+				         "taken from the fault history (KYTY_READBACK_HISTORY=%lld)\n",
+				         static_cast<unsigned long long>(s_cq), static_cast<double>(s_cq_us) / 1000.0,
+				         s_cq != 0 ? static_cast<double>(s_cq_us) / static_cast<double>(s_cq) : 0.0,
+				         static_cast<unsigned long long>(s_prefetched), static_cast<long long>(history));
+				const uint64_t rn = g_fault_n[0].exchange(0), ru = g_fault_us[0].exchange(0);
+				const uint64_t on = g_fault_n[1].exchange(0), ou = g_fault_us[1].exchange(0);
+				::printf("Readback faults (5 s): render thread %llu in %.1f ms (%.0f us each), other threads %llu in "
+				         "%.1f ms\n",
+				         static_cast<unsigned long long>(rn), static_cast<double>(ru) / 1000.0,
+				         rn != 0 ? static_cast<double>(ru) / static_cast<double>(rn) : 0.0,
+				         static_cast<unsigned long long>(on), static_cast<double>(ou) / 1000.0);
+				std::fflush(stdout);
+				s_cq = s_cq_us = s_prefetched = 0;
+				s_begin = now;
+			}
+			return 0;
+		}
 	}
 	if (!DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 		stats.SetOutcome(ReadbackStats::NothingToDownload);
