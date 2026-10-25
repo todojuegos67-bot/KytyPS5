@@ -4498,7 +4498,21 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		m_offload_unsubmitted = false;
 		m_scheduler.Flush();
 	}
-	if (tick % 120 != 0) return;
+	// The RAM governor (ram-guard.h, KYTY_RAM_TARGET_MB): below its soft threshold no check and no take (no cost but the
+	// clean walk every 120 flips); above it a scan every 120 flips (soft), 30 (over target) or at once and then every 10
+	// (emergency), taking only the demand's MiB, the longest-idle textures first, none touched within the hot window.
+	const bool governed = RamGuard::GovernorOn() && offload;
+	const int  stage    = governed ? RamGuard::GovernorStage() : RamGuard::GovEmergency;
+	const bool urgent   = governed && RamGuard::TakeGovernorUrgent();
+	const uint64_t period = !governed ? 120 : stage >= RamGuard::GovEmergency ? 10 : stage == RamGuard::GovOver ? 30 : 120;
+	if (!urgent && tick % period != 0) return;
+	static const uint64_t HotTicks = [] {
+		const char* value = std::getenv("KYTY_RAM_TARGET_HOT_SECONDS");
+		return (value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {10}) * 60;
+	}();
+	const uint64_t hot_ticks = stage >= RamGuard::GovEmergency ? std::min<uint64_t>(HotTicks, 180) : HotTicks;
+	const bool     acting    = !governed || stage >= RamGuard::GovSoft;
+	uint64_t       demand    = governed ? RamGuard::GovernorOffloadDemand() : ~uint64_t {0};
 	// (Diagnostics: where a scan's time goes, printed when it took 10 ms or more.)
 	using Clock          = std::chrono::steady_clock;
 	const auto scan_start = Clock::now();
@@ -4530,6 +4544,9 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		const auto first   = m_offload_clean.find(image.serial);
 		seen[image.serial] = first != m_offload_clean.end() ? first->second : tick;
 		if (first == m_offload_clean.end() || TextureOffload::Taken(begin, end - begin, image.serial)) return;
+		// (Governed: nothing below the soft threshold; never a hot texture - a restore follows most takes of those: of
+		// 401 in the level-2 16 GB log, 265 came within 10 s of the take.)
+		if (governed && (!acting || demand == 0 || m_lru_cache.TickOf(image.lru_id) + hot_ticks > tick)) return;
 		if (!offload) {
 			take.push_back(id);
 			return;
@@ -4541,7 +4558,7 @@ void TextureCache::OffloadScan(uint64_t tick) {
 			if (exact->second) take.push_back(id);
 			return;
 		}
-		if (m_offload_checking.contains(image.serial) || check_bytes >= CheckBudget) return;
+		if (m_offload_checking.contains(image.serial) || check_bytes >= (stage >= RamGuard::GovEmergency && governed ? 2 * CheckBudget : CheckBudget)) return;
 		// (A texture in depth tiling has no download: BuildTextureTransfer ends the emulator on one. Of a kind a check found
 		// to differ: not checked again.)
 		if (image.info.tile_mode == Prospero::TileMode::kDepth || m_offload_differ_kinds.contains(OffloadKind(image))) {
@@ -4567,6 +4584,18 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		check.emplace_back(id, std::move(plan));
 	});
 	m_offload_clean.swap(seen);
+	if (governed && !take.empty()) {
+		// Longest idle first, only as many as the demand's MiB (the pages a take drops).
+		std::stable_sort(take.begin(), take.end(), [&](ImageId a, ImageId b) {
+			return m_lru_cache.TickOf(m_slot_images[a].lru_id) < m_lru_cache.TickOf(m_slot_images[b].lru_id);
+		});
+		size_t keep = 0;
+		for (uint64_t wanted = 0; keep < take.size() && wanted < demand; keep++) {
+			const auto [begin, end] = pages_of(m_slot_images[take[keep]]);
+			wanted += end - begin;
+		}
+		take.resize(keep);
+	}
 	std::erase_if(m_offload_exact, [&](const auto& item) { return !m_offload_clean.contains(item.first); });
 	ms[0] = since(scan_start);
 	const auto report = [&] {
@@ -4606,6 +4635,7 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		ms[2] += since(mark);
 		if (offload) {
 			discards.emplace_back(begin, end - begin);
+			if (governed) RamGuard::NoteGovernorOffload(end - begin);
 			continue;
 		}
 		mark = Clock::now();
@@ -4780,7 +4810,7 @@ void TextureCache::RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch
 				for (const auto& range: raw->ranges) m_page_manager.UpdateReadWatchers<false>(range.begin, range.end - range.begin);
 				const auto us = static_cast<uint64_t>(
 				    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - raw->start).count());
-				TextureOffload::EndRestore(raw->ranges, raw->bytes, us, raw->lost);
+				TextureOffload::EndRestore(raw->ranges, raw->bytes, us, raw->lost, true);
 				raw->done.store(true, std::memory_order_release);
 			}); });
 			return;

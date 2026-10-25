@@ -35,6 +35,11 @@ constexpr uint64_t MiB = uint64_t {1} << 20u;
 constexpr uint64_t GiB = uint64_t {1} << 30u;
 
 std::atomic<int>      g_level {None};
+// The RAM governor (ram-guard.h): its stage, the offload bytes wanted, what scans took since the guard's last sample.
+std::atomic<int>      g_gov_stage {0};
+std::atomic<uint64_t> g_gov_demand {0};
+std::atomic<uint64_t> g_gov_taken {0}, g_gov_taken_total {0};
+std::atomic<bool>     g_gov_urgent {false};
 std::atomic<uint64_t> g_available {0};
 std::atomic<uint64_t> g_released_count[ReleasedKinds] {};
 std::atomic<uint64_t> g_released_bytes[ReleasedKinds] {};
@@ -173,10 +178,24 @@ void ApplyMemcutDefaults() {
 }
 } // namespace
 
+// KYTY_RAM_TARGET_MB (the governor): what it escalates to, turned on where unset - texture offload (it takes nothing
+// below the soft threshold), the RAM diet's pipeline eviction, soft release's idle scratch buffers.
+static void ApplyGovernorDefaults() {
+	if (!GovernorOn()) return;
+	std::string set;
+	SetDefault("KYTY_TEXTURE_OFFLOAD", "1", &set);
+	SetDefault("KYTY_RAM_DIET", "1", &set);
+	SetDefault("KYTY_SOFT_RELEASE", "1", &set);
+	std::printf("RAM target: on (KYTY_RAM_TARGET_MB=%s); %s\n", Env("KYTY_RAM_TARGET_MB"),
+	            set.empty() ? "every switch already set" : set.c_str());
+	std::fflush(stdout);
+}
+
 void ApplyLowRamDefaults() {
 	static std::once_flag once;
 	std::call_once(once, [] {
 		ApplyMemcutDefaults();
+		ApplyGovernorDefaults();
 		ApplyFlushDefaults();
 		const uint64_t ram    = LocalPlatform::PhysicalMemory();
 		const char*    forced = Env("KYTY_LOWRAM");
@@ -243,6 +262,30 @@ void RegisterBudgetFlush(const char* name, FlushClass kind, BudgetFlushFn flush)
 
 bool PeriodicFlush() {
 	return g_periodic.load(std::memory_order_relaxed);
+}
+
+bool GovernorOn() {
+	static const bool on = Env("KYTY_RAM_TARGET_MB") != nullptr && std::strtoull(Env("KYTY_RAM_TARGET_MB"), nullptr, 10) != 0;
+	return on;
+}
+
+int GovernorStage() {
+	return g_gov_stage.load(std::memory_order_relaxed);
+}
+
+uint64_t GovernorOffloadDemand() {
+	const uint64_t demand = g_gov_demand.load(std::memory_order_relaxed);
+	const uint64_t taken  = g_gov_taken.load(std::memory_order_relaxed);
+	return demand > taken ? demand - taken : 0;
+}
+
+void NoteGovernorOffload(uint64_t bytes) {
+	g_gov_taken.fetch_add(bytes, std::memory_order_relaxed);
+	g_gov_taken_total.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+bool TakeGovernorUrgent() {
+	return g_gov_urgent.load(std::memory_order_relaxed) && g_gov_urgent.exchange(false, std::memory_order_acq_rel);
 }
 
 #if defined(_WIN32)
@@ -555,6 +598,101 @@ void FlushPass(const Settings& s, HANDLE low_memory, uint64_t store, FlushState*
 	std::fflush(stdout);
 }
 
+// The RAM governor (ram-guard.h, KYTY_RAM_TARGET_MB): its thresholds and state, on the guard's thread.
+struct Governor {
+	bool              on = false;
+	uint64_t          target = 0, soft = 0, emergency = 0, hysteresis = 256 * MiB;
+	int               stage = GovIdle;
+	Clock::time_point next_pass {};
+	uint64_t          passes = 0, entered[4] {};
+};
+
+Governor MakeGovernor(const Settings& s, const Sample& first) {
+	Governor g;
+	g.on = GovernorOn();
+	if (!g.on) return g;
+	const uint64_t total = first.total_phys != 0 ? first.total_phys : (s.sim_ram != 0 ? s.sim_ram : 16 * GiB);
+	g.target    = EnvMiB("KYTY_RAM_TARGET_MB", 0);
+	g.target    = std::min(g.target, total > 1024 * MiB ? total - 1024 * MiB : total / 2);
+	g.soft      = std::min(g.target, EnvMiB("KYTY_RAM_SOFT_MB", g.target > 512 * MiB ? g.target - 512 * MiB : g.target));
+	g.emergency = std::max(g.target, EnvMiB("KYTY_RAM_EMERGENCY_MB", g.target + 512 * MiB));
+	g.emergency = std::min(g.emergency, total > 512 * MiB ? total - 512 * MiB : total); // (the hard ceiling below the total)
+	g.emergency = std::max(g.emergency, g.target);
+	std::printf("RAM target: soft %llu MiB, target %llu MiB, emergency %llu MiB, of %llu MiB%s; below the soft threshold "
+	            "nothing extra runs; above it: flush pass every 2 s (1 s over target), idle pipelines 60/30/15 s, texture "
+	            "offload of the longest-idle verified textures for what is over (hot window %s s)\n",
+	            static_cast<unsigned long long>(g.soft / MiB), static_cast<unsigned long long>(g.target / MiB),
+	            static_cast<unsigned long long>(g.emergency / MiB), static_cast<unsigned long long>(total / MiB),
+	            first.simulated ? " (simulated)" : "", Env("KYTY_RAM_TARGET_HOT_SECONDS") != nullptr ? Env("KYTY_RAM_TARGET_HOT_SECONDS") : "10");
+	std::fflush(stdout);
+	return g;
+}
+
+const char* GovStageName(int stage) {
+	return stage == GovEmergency ? "emergency" : stage == GovOver ? "over target" : stage == GovSoft ? "soft" : "under";
+}
+
+uint64_t InUse(const Sample& sample) {
+	return sample.total_phys - std::min(sample.total_phys, sample.available);
+}
+
+// Every second: the stage from the RAM in use (down a stage only 256 MiB below its threshold), the offload demand, and
+// above the soft threshold a flush pass (every 2 s, 1 s from the target up) with its "RAM target:" line.
+void GovernorStep(const Settings& s, HANDLE low_memory, uint64_t store, const Sample& sample, FlushState* flush_state,
+                  Governor* g, Clock::time_point now) {
+	const uint64_t in_use = InUse(sample);
+	const auto     threshold = [g](int stage) {
+        return stage >= GovEmergency ? g->emergency : stage == GovOver ? g->target : g->soft;
+	};
+	const int raw   = in_use >= g->emergency ? GovEmergency : in_use >= g->target ? GovOver : in_use >= g->soft ? GovSoft : GovIdle;
+	int       stage = g->stage;
+	if (raw > stage) stage = raw;
+	else if (raw < stage && in_use + g->hysteresis < threshold(stage)) stage = std::max(raw, stage - 1);
+	const int before_stage = g->stage;
+	if (stage != g->stage) {
+		g->entered[stage]++;
+		std::printf("RAM target: stage %s -> %s, in use %llu MiB (soft %llu, target %llu, emergency %llu)%s\n",
+		            GovStageName(g->stage), GovStageName(stage), static_cast<unsigned long long>(in_use / MiB),
+		            static_cast<unsigned long long>(g->soft / MiB), static_cast<unsigned long long>(g->target / MiB),
+		            static_cast<unsigned long long>(g->emergency / MiB), sample.simulated ? " (simulated)" : "");
+		std::fflush(stdout);
+		g->stage = stage;
+		if (stage > before_stage) g->next_pass = now; // (escalation acts at once)
+	}
+	g_gov_stage.store(stage, std::memory_order_relaxed);
+	const uint64_t goal = g->soft > g->hysteresis ? g->soft - g->hysteresis : 0;
+	g_gov_demand.store(stage >= GovSoft && in_use > goal ? in_use - goal : 0, std::memory_order_relaxed);
+	if (stage >= GovEmergency) g_gov_urgent.store(true, std::memory_order_release);
+	if (stage == GovIdle) {
+		g_gov_taken.store(0, std::memory_order_relaxed);
+		return;
+	}
+	if (now < g->next_pass) return;
+	g->next_pass = now + std::chrono::seconds(stage == GovSoft ? 2 : 1);
+	g->passes++;
+	const uint64_t taken       = g_gov_taken.exchange(0, std::memory_order_relaxed);
+	const uint64_t owners_prev = flush_state->owners_total;
+	const uint64_t caches_prev = flush_state->released_total[FlushCaches] + flush_state->released_total[FlushGuestFreed];
+	FlushPass(s, low_memory, store, flush_state);
+	const Sample   after = Take(s, low_memory, false, store);
+	const uint64_t flushed =
+	    flush_state->released_total[FlushCaches] + flush_state->released_total[FlushGuestFreed] - caches_prev;
+	std::printf("RAM target #%llu: in use %llu -> %llu MiB vs target %llu (soft %llu, emergency %llu), stage %s; actions: "
+	            "flush pass %llu MiB, pipelines idle %d s or more out (%llu MiB since the last pass), texture offload "
+	            "wanted %llu MiB, taken since the last pass %llu MiB (%llu MiB in all)%s\n",
+	            static_cast<unsigned long long>(g->passes), static_cast<unsigned long long>(in_use / MiB),
+	            static_cast<unsigned long long>(InUse(after) / MiB), static_cast<unsigned long long>(g->target / MiB),
+	            static_cast<unsigned long long>(g->soft / MiB), static_cast<unsigned long long>(g->emergency / MiB),
+	            GovStageName(stage), static_cast<unsigned long long>(flushed / MiB),
+	            stage >= GovEmergency ? 15 : stage == GovOver ? 30 : 60,
+	            static_cast<unsigned long long>((flush_state->owners_total - owners_prev) / MiB),
+	            static_cast<unsigned long long>(g_gov_demand.load(std::memory_order_relaxed) / MiB),
+	            static_cast<unsigned long long>(taken / MiB),
+	            static_cast<unsigned long long>(g_gov_taken_total.load(std::memory_order_relaxed) / MiB),
+	            after.simulated ? " (simulated)" : "");
+	std::fflush(stdout);
+}
+
 void Watch() {
 	SetThreadDescription(GetCurrentThread(), L"Kyty.RamGuard");
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -591,6 +729,7 @@ void Watch() {
 	FlushState flush_state;
 	auto       next_periodic = Clock::now() + std::chrono::seconds(std::max<int64_t>(s.flush_seconds, 1));
 	uint64_t   seconds_under_1g = 0, seconds_under_512 = 0;
+	Governor   governor = MakeGovernor(s, Take(s, low_memory, false, 0));
 	int        sim_exhausted = 0;
 	auto     next_log   = Clock::now() + std::chrono::seconds(std::max<int64_t>(log_period, 1));
 	auto     next_flush = Clock::now();
@@ -624,7 +763,10 @@ void Watch() {
 		}
 		const int level = LevelOf(s, sample);
 		g_level.store(level, std::memory_order_relaxed);
-		if (s.flush_seconds > 0 && now >= next_periodic) {
+		if (governor.on) GovernorStep(s, low_memory, store, sample, &flush_state, &governor, now);
+		if (governor.on && governor.stage != GovIdle) {
+			next_periodic = Clock::now() + std::chrono::seconds(std::max<int64_t>(s.flush_seconds, 1)); // (its passes run)
+		} else if (s.flush_seconds > 0 && now >= next_periodic) {
 			FlushPass(s, low_memory, store, &flush_state);
 			next_periodic = Clock::now() + std::chrono::seconds(s.flush_seconds);
 		}
