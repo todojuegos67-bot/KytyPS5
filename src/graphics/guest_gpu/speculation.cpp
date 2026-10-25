@@ -79,10 +79,11 @@ Speculation::Translator::Translator(RenderContext& renderer, uint32_t number)
     : index(number), draw(std::make_unique<RenderExecutor>(renderer)), compute(std::make_unique<RenderExecutor>(renderer)),
       executors {draw.get(), compute.get()}, cp(std::make_unique<CommandProcessor>(renderer, 0)),
       table_upload(std::make_unique<StreamBuffer>(renderer.GetGraphics(), renderer.GetCommandScheduler(), MemoryUsage::Upload,
-                                                  uint64_t {64} << 20u,
+                                                  (RequestRebarPlacement("speculation table upload ring"), uint64_t {64} << 20u),
                                                   AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress)),
       shader_upload(std::make_unique<StreamBuffer>(renderer.GetGraphics(), renderer.GetCommandScheduler(),
-                                                   MemoryUsage::Upload, uint64_t {16} << 20u)) {
+                                                   MemoryUsage::Upload, (RequestRebarPlacement("speculation shader upload ring"), uint64_t {16} << 20u))) {
+	RequestRebarPlacement(nullptr);
 	draw->ReadCatalogOf(renderer.DefaultRenderExecutor(), 1 + number);
 	compute->ReadCatalogOf(renderer.DefaultComputeRenderExecutor(), 1 + number);
 }
@@ -96,6 +97,11 @@ Speculation::Speculation(RenderContext& renderer)
 	                                                static_cast<uint32_t>(Spec::MaxPacketSlots))
 	                         : 1u;
 	for (uint32_t i = 0; i < threads; ++i) m_translators.push_back(std::make_unique<Translator>(renderer, i));
+	// KYTY_REBAR_STAGING=1: each translator's two upload rings (64 + 16 MiB), as the buffer cache's (bufferCache.cpp).
+	if (const auto report = TakeRebarReport(); !report.empty()) {
+		std::printf("[rebar] KYTY_REBAR_STAGING (%u speculation translators): %s\n", threads, report.c_str());
+		std::fflush(stdout);
+	}
 }
 
 Speculation::~Speculation() {

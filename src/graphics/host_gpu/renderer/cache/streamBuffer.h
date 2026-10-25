@@ -27,9 +27,17 @@ struct GraphicContext;
 // KYTY_REBAR_STAGING=1: the next MemoryUsage::Upload buffer this thread makes goes in video memory the CPU writes
 // (DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT, a heap over 256 MiB: Resizable BAR) when the video memory budget has
 // room for it plus KYTY_REBAR_MARGIN_MB (512); otherwise, or when that fails, in system memory as before. Only for rings
-// the CPU only writes (BAR reads are uncached). TakeRebarReport: what the requests got, for one start-up line.
-void        RequestRebarPlacement(const char* name);
+// the CPU only writes (BAR reads are uncached). TakeRebarReport: what the requests got, for one start-up line, with
+// the total moved. `system_ram_size` (non-zero, smaller than the size asked): the size the buffer gets instead when it
+// ends up in system memory (the image upload ring: KYTY_STAGING_RING_MB caps only a ring in system RAM).
+// RebarLargeHeadroom: KYTY_REBAR_STAGING=1, a BAR heap, and at least 4 GiB of video memory room now (a 16 GB card).
+// HostVisibleBytesInBar / InSystemRam: the host-visible buffers' bytes (mapped staging, readback, streams) now in BAR
+// and in system memory, for the RAM census.
+void        RequestRebarPlacement(const char* name, uint64_t system_ram_size = 0);
 std::string TakeRebarReport();
+[[nodiscard]] bool     RebarLargeHeadroom(GraphicContext& graphics);
+[[nodiscard]] uint64_t HostVisibleBytesInBar();
+[[nodiscard]] uint64_t HostVisibleBytesInSystemRam();
 
 enum class MemoryUsage : uint8_t {
 	DeviceLocal,
@@ -135,6 +143,7 @@ private:
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	bool                          m_in_system_memory = false;
+	uint8_t                       m_host_visible_place = 0; // 1 BAR, 2 system memory (HostVisibleBytesIn*)
 	std::span<uint8_t>            m_mapped;
 	struct Sparse;
 	std::unique_ptr<Sparse> m_sparse;

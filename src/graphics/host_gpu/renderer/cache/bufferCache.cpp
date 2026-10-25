@@ -1402,22 +1402,47 @@ static std::atomic<uint64_t> g_ring_overflow_count {0}, g_ring_overflow_bytes {0
 // The image upload ring: 1 GiB on a PC with 32 GB of RAM or more (512 MiB before). A frame where the game streams
 // in an area uploads 0.8-1.4 GB of textures; past the ring's size the render thread waited for the GPU to finish
 // the first copies before it could reuse the ring (60-80 ms of gpu_wait in those frames, Boletaria).
-static uint64_t StagingRingSize() {
+// KYTY_STAGING_RING_MB is a cap for a ring in system RAM (the launcher sets 256 to protect PCs with 8 GB cards): with
+// KYTY_REBAR_STAGING=1 and at least 4 GiB of video memory room at start (RebarLargeHeadroom: a 16 GB card) the ring
+// asks for its default size in BAR, and gets the capped size only if it ends up in system RAM after all
+// (*system_ram_size; 0: no other size).
+static uint64_t StagingRingSize(GraphicContext& graphics, uint64_t* system_ram_size) {
 	const uint64_t     ram = LocalPlatform::PhysicalMemory();
 	uint64_t           size = ram >= (uint64_t {32} << 30u) ? 1024 * MiB : 512 * MiB;
 	if (LocalPlatform::LowMemVram()) size = 256 * MiB; // KYTY_LOWMEM_VRAM=1
+	*system_ram_size = 0;
 	// KYTY_STAGING_RING_MB=<n> (KYTY_MEMCUT): the ring's size, 64-1024. Smaller only waits for the GPU sooner in a
 	// streaming frame (or uploads through a temporary buffer past it): the bytes uploaded are the same.
-	if (const char* text = std::getenv("KYTY_STAGING_RING_MB"); text != nullptr && std::strtoull(text, nullptr, 10) > 0)
-		size = std::clamp<uint64_t>(std::strtoull(text, nullptr, 10), 64, 1024) * MiB;
-	std::printf("[memcut] image upload ring %llu MiB (host-visible)\n", static_cast<unsigned long long>(size / MiB));
+	if (const char* text = std::getenv("KYTY_STAGING_RING_MB"); text != nullptr && std::strtoull(text, nullptr, 10) > 0) {
+		const uint64_t capped = std::clamp<uint64_t>(std::strtoull(text, nullptr, 10), 64, 1024) * MiB;
+		if (capped < size && RebarLargeHeadroom(graphics)) {
+			*system_ram_size = capped;
+			std::printf("[memcut] image upload ring %llu MiB in BAR (KYTY_STAGING_RING_MB=%llu lifted: >= 4 GiB of video "
+			            "memory room; %llu MiB if it ends up in system RAM)\n",
+			            static_cast<unsigned long long>(size / MiB), static_cast<unsigned long long>(capped / MiB),
+			            static_cast<unsigned long long>(capped / MiB));
+		} else {
+			size = capped;
+		}
+	}
+	if (*system_ram_size == 0)
+		std::printf("[memcut] image upload ring %llu MiB (host-visible)\n", static_cast<unsigned long long>(size / MiB));
 	static std::once_flag once;
 	std::call_once(once, [] {
 		RamGuard::RegisterFigure("upload ring overflows so far (the MiB figure is the number of uploads)",
 		                         [] { return g_ring_overflow_count.load(std::memory_order_relaxed) << 20u; });
 		RamGuard::RegisterFigure("upload ring overflow bytes so far",
 		                         [] { return g_ring_overflow_bytes.load(std::memory_order_relaxed); });
+		RamGuard::RegisterFigure("host-visible buffers in BAR (video memory)", [] { return HostVisibleBytesInBar(); });
+		RamGuard::RegisterFigure("host-visible buffers in system RAM", [] { return HostVisibleBytesInSystemRam(); });
 	});
+	return size;
+}
+
+static uint64_t ImageRingSize(GraphicContext& graphics) {
+	uint64_t   system_ram_size = 0;
+	const auto size            = StagingRingSize(graphics, &system_ram_size);
+	RequestRebarPlacement("image upload ring", system_ram_size);
 	return size;
 }
 
@@ -1504,7 +1529,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_lod_stats_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, 256 * 16),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, (RequestRebarPlacement("image upload ring"), StagingRingSize()),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, ImageRingSize(graphics),
                        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_host_shader_upload(graphics, scheduler, MemoryUsage::Upload, (RequestRebarPlacement("shader upload ring"), 64 * MiB)),

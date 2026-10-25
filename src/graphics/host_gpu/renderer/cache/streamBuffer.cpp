@@ -198,8 +198,37 @@ std::atomic<uint64_t> g_forced_spill_bytes {[] {
 }
 
 thread_local const char* g_rebar_request = nullptr;
+thread_local uint64_t    g_rebar_system_size = 0;
 std::mutex               g_rebar_mutex;
 std::string              g_rebar_report;
+uint64_t                 g_rebar_moved = 0, g_rebar_stayed = 0; // this report's bytes (under g_rebar_mutex)
+std::atomic<uint64_t>    g_host_visible_bar {0}, g_host_visible_system {0};
+
+bool RebarEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_REBAR_STAGING");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+constexpr VkMemoryPropertyFlags RebarWanted =
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+// The memory types with all of RebarWanted on a heap over 256 MiB, and the largest such heap.
+uint32_t RebarTypes(const GraphicContext& graphics, uint64_t* heap) {
+	const auto& memory = graphics.physical_device_memory_properties;
+	uint32_t    types  = 0;
+	for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+		const auto properties = static_cast<VkMemoryPropertyFlags>(memory.memoryTypes[i].propertyFlags);
+		const auto heap_size  = memory.memoryHeaps[memory.memoryTypes[i].heapIndex].size;
+		if ((properties & RebarWanted) == RebarWanted && heap_size > (uint64_t {256} << 20u)) {
+			types |= 1u << i;
+			if (heap != nullptr) *heap = std::max<uint64_t>(*heap, heap_size);
+		}
+	}
+	return types;
+}
 
 void AddRebarReport(const std::string& text) {
 	std::lock_guard lock(g_rebar_mutex);
@@ -209,18 +238,31 @@ void AddRebarReport(const std::string& text) {
 
 } // namespace
 
-void RequestRebarPlacement(const char* name) {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_REBAR_STAGING");
-		return value != nullptr && value[0] == '1';
-	}();
-	g_rebar_request = enabled ? name : nullptr;
+void RequestRebarPlacement(const char* name, uint64_t system_ram_size) {
+	g_rebar_request     = RebarEnabled() ? name : nullptr;
+	g_rebar_system_size = name != nullptr ? system_ram_size : 0;
 }
 
 std::string TakeRebarReport() {
 	std::lock_guard lock(g_rebar_mutex);
+	if (!g_rebar_report.empty()) {
+		char total[160];
+		std::snprintf(total, sizeof(total), "; total %llu MiB moved to BAR, %llu MiB left in system RAM",
+		              static_cast<unsigned long long>(g_rebar_moved >> 20u),
+		              static_cast<unsigned long long>(g_rebar_stayed >> 20u));
+		g_rebar_report += total;
+	}
+	g_rebar_moved = g_rebar_stayed = 0;
 	return std::exchange(g_rebar_report, {});
 }
+
+bool RebarLargeHeadroom(GraphicContext& graphics) {
+	return RebarEnabled() && graphics.CanReportMemoryUsage() && RebarTypes(graphics, nullptr) != 0 &&
+	       graphics.GetVideoMemoryRoom() >= (uint64_t {4} << 30u);
+}
+
+uint64_t HostVisibleBytesInBar() { return g_host_visible_bar.load(std::memory_order_relaxed); }
+uint64_t HostVisibleBytesInSystemRam() { return g_host_visible_system.load(std::memory_order_relaxed); }
 
 struct Buffer::Sparse {
 	uint64_t                    page_size   = 0;
@@ -336,20 +378,10 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	};
 	// KYTY_REBAR_STAGING (RequestRebarPlacement): the same buffer, mapped and written the same way, in BAR memory.
 	bool created = false;
+	const uint64_t system_size = usage == MemoryUsage::Upload ? std::exchange(g_rebar_system_size, 0) : 0;
 	if (const char* rebar = std::exchange(g_rebar_request, nullptr); rebar != nullptr && usage == MemoryUsage::Upload) {
-		constexpr VkMemoryPropertyFlags wanted =
-		    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		const auto& memory = graphics.physical_device_memory_properties;
-		uint32_t    types = 0;
-		uint64_t    heap  = 0;
-		for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
-			const auto properties = static_cast<VkMemoryPropertyFlags>(memory.memoryTypes[i].propertyFlags);
-			const auto heap_size  = memory.memoryHeaps[memory.memoryTypes[i].heapIndex].size;
-			if ((properties & wanted) == wanted && heap_size > (uint64_t {256} << 20u)) {
-				types |= 1u << i;
-				heap = std::max<uint64_t>(heap, heap_size);
-			}
-		}
+		uint64_t       heap  = 0;
+		const uint32_t types = RebarTypes(graphics, &heap);
 		static const uint64_t margin = [] {
 			const char* value = std::getenv("KYTY_REBAR_MARGIN_MB");
 			return (value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {512}) << 20u;
@@ -363,7 +395,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		if (why == nullptr) {
 			const auto saved              = allocation_info;
 			allocation_info.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-			allocation_info.requiredFlags  = wanted;
+			allocation_info.requiredFlags  = RebarWanted;
 			allocation_info.preferredFlags = 0;
 			allocation_info.memoryTypeBits = types;
 			allocation_info.flags |= VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
@@ -371,7 +403,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 			if (created) {
 				VkMemoryPropertyFlags got = 0;
 				vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &got);
-				if ((got & wanted) != wanted || allocation_result.pMappedData == nullptr) {
+				if ((got & RebarWanted) != RebarWanted || allocation_result.pMappedData == nullptr) {
 					vmaDestroyBuffer(graphics.allocator, native_buffer, m_allocation);
 					native_buffer = VK_NULL_HANDLE;
 					m_allocation  = nullptr;
@@ -381,12 +413,21 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 			allocation_info = saved;
 			if (!created) why = "BAR allocation failed";
 		}
-		char line[320];
+		const uint64_t placed = !created && system_size != 0 && system_size < size ? system_size : size;
+		char line[360];
 		std::snprintf(line, sizeof(line), "%s %llu MiB -> %s%s (heap %llu MiB, headroom %llu MiB, margin %llu MiB)", rebar,
-		              static_cast<unsigned long long>(size >> 20u), created ? "BAR" : "system RAM: ", created ? "" : why,
+		              static_cast<unsigned long long>(placed >> 20u), created ? "BAR" : "system RAM: ", created ? "" : why,
 		              static_cast<unsigned long long>(heap >> 20u), static_cast<unsigned long long>(room >> 20u),
 		              static_cast<unsigned long long>(margin >> 20u));
 		AddRebarReport(line);
+		std::lock_guard lock(g_rebar_mutex);
+		(created ? g_rebar_moved : g_rebar_stayed) += placed;
+	}
+	// Not in BAR: the size asked for system memory (the image upload ring's KYTY_STAGING_RING_MB cap).
+	if (!created && system_size != 0 && system_size < size) {
+		size             = system_size;
+		m_size           = size;
+		buffer_info.size = size;
 	}
 	if (!created) created = create();
 	if (!created && allocation_info.pool != nullptr) {
@@ -433,6 +474,11 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
 	}
+	if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+		const bool bar       = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+		m_host_visible_place = bar ? 1 : 2;
+		(bar ? g_host_visible_bar : g_host_visible_system).fetch_add(size, std::memory_order_relaxed);
+	}
 }
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::BufferUsageFlags flags,
@@ -468,6 +514,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t c
 
 Buffer::~Buffer() {
 	DeviceFault::NoteDestroyed(m_device_address);
+	if (m_host_visible_place != 0)
+		(m_host_visible_place == 1 ? g_host_visible_bar : g_host_visible_system).fetch_sub(m_size, std::memory_order_relaxed);
 	if (m_sparse) {
 		const auto native_device = static_cast<VkDevice>(m_graphics->device);
 		VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyBuffer(native_device, static_cast<VkBuffer>(m_buffer), nullptr);
