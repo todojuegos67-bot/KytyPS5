@@ -38,6 +38,8 @@ struct Pool {
 	std::atomic<uint32_t> switches {0};
 	std::atomic<uint32_t> refreshed_layers {0};
 	std::atomic<uint32_t> whole_uploads {0};
+	std::atomic<uint32_t> refresh_kept {0};    // KYTY_SHADOW_REFRESH_FIX: rendered layers kept (guest bytes unchanged)
+	std::atomic<uint32_t> refresh_changed {0}; // ... rendered layers uploaded (guest bytes changed)
 	std::atomic<uint64_t> rendered[8] {};  // bit per layer (first 512)
 	uint32_t              first_layer = UINT32_MAX;
 	uint32_t              last_layer  = 0;
@@ -117,28 +119,31 @@ inline void Flip(uint64_t flip) {
 		const uint32_t switches = pool.switches.exchange(0, std::memory_order_relaxed);
 		const uint32_t refresh  = pool.refreshed_layers.exchange(0, std::memory_order_relaxed);
 		const uint32_t whole    = pool.whole_uploads.exchange(0, std::memory_order_relaxed);
+		const uint32_t kept     = pool.refresh_kept.exchange(0, std::memory_order_relaxed);
+		const uint32_t changed  = pool.refresh_changed.exchange(0, std::memory_order_relaxed);
 		uint32_t       distinct = 0;
 		for (auto& bits: pool.rendered) distinct += static_cast<uint32_t>(std::popcount(bits.exchange(0, std::memory_order_relaxed)));
 		const uint32_t first = pool.first_layer;
 		const uint32_t last  = pool.last_layer;
 		pool.first_layer     = UINT32_MAX;
 		pool.last_layer      = 0;
-		const bool write_activity = binds != 0 || storage != 0 || clears != 0 || switches != 0 || refresh != 0 || whole != 0;
+		const bool write_activity = binds != 0 || storage != 0 || clears != 0 || switches != 0 || refresh != 0 || whole != 0 ||
+		                            kept != 0;
 		if (!write_activity) continue;
 		const uint64_t n  = ++pool.active_flips;
 		pool.last_active  = flip;
 		// (Anything that may lose rendered layers is always reported, at most 64 times.)
 		static std::atomic<uint32_t> risky_reports {0};
-		const bool risky = (refresh != 0 || whole != 0) && risky_reports.fetch_add(1, std::memory_order_relaxed) < 64;
+		const bool risky = (refresh != 0 || whole != 0 || kept != 0) && risky_reports.fetch_add(1, std::memory_order_relaxed) < 64;
 		if (!(level >= 2 || n <= 8 || n % 600 == 0 || risky)) continue;
 		std::printf("Shadow pool 0x%llx (%u layers %ux%u) flip %llu (active %llu): depth binds %u (load clear %u, htile "
 		            "clear %u, depth write %u, neither %u; %u layers in %u..%u), sampled %u, storage %u, clears %u, "
-		            "switches %u, layers refreshed from guest memory %u, whole uploads %u (KYTY_SHADOW_POOL_LOG=0: off, "
-		            "2: every flip)\n",
+		            "switches %u, layers refreshed from guest memory %u, whole uploads %u; rendered layers kept %u, "
+		            "uploaded as changed %u (KYTY_SHADOW_POOL_LOG=0: off, 2: every flip)\n",
 		            static_cast<unsigned long long>(address), pool.layers, pool.width, pool.height,
 		            static_cast<unsigned long long>(flip), static_cast<unsigned long long>(n), binds, clears_l, meta,
 		            writes, idle, distinct, first == UINT32_MAX ? 0 : first, last, samples, storage, clears, switches,
-		            refresh, whole);
+		            refresh, whole, kept, changed);
 		std::fflush(stdout);
 	}
 }

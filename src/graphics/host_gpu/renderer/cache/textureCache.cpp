@@ -741,6 +741,7 @@ bool TextureCache::DetachImage(ImageId id) {
 		return false;
 	}
 	m_partial_plans.erase(image->serial);
+	m_layer_owners.erase(image->serial);
 	if (!image->depth_id) {
 		std::vector<ImageId> associations;
 		for (const auto candidate: m_stencil_associations) {
@@ -2620,7 +2621,66 @@ bool TextureCache::CheckPartialHashes(const Image& image) {
 	return true;
 }
 
-// A depth array whose CPU writes cover some layers (the game's 80-layer shadow-map pool, whose free 4 MiB layers its
+// KYTY_SHADOW_REFRESH_FIX (on unless 0): a layer of a depth array the GPU rendered is refreshed from guest memory only
+// when its guest bytes changed since the GPU took it. Guest memory never holds the GPU's depth: re-uploading bytes that
+// did not change only replaces a rendered shadow with what the memory held before it. The game's 80-layer spot-shadow
+// pool (1024x1024 D32 at 0x102a400000, its shadows in layers 0-12 kept from flip to flip) had such layers refreshed a
+// few flips in ten at the Boletaria lamps (combo20 log 061301: 1-19 layers a flip, "Shadow pool" lines): the floor
+// shadows under the lamps came and went with wrong shapes. A layer whose bytes did change (a CPU write, another
+// mapping) is uploaded as before, and counts as the guest's until the GPU renders it again.
+static bool ShadowRefreshFixOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_SHADOW_REFRESH_FIX");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+enum : uint8_t { LayerRendered = 1, LayerDirtyByWrite = 2, LayerDirtyByMap = 4, LayerDirtyByUnmap = 8 };
+static bool LayerOwnerCandidate(const Image& image) {
+	const auto& info = image.info;
+	return ShadowRefreshFixOn() && info.IsDepth() && !info.IsVolume() && info.resources.levels == 1 &&
+	       info.resources.layers >= 2 && info.samples == 1 && !info.data.Empty() &&
+	       info.data.size % info.resources.layers == 0;
+}
+
+void TextureCache::NoteDepthLayersRendered(Image& image, uint32_t first, uint32_t count) {
+	if (!LayerOwnerCandidate(image)) return;
+	const uint32_t layers = image.info.resources.layers;
+	if (first >= layers || count == 0) return;
+	count       = std::min(count, layers - first);
+	auto& owner = m_layer_owners[image.serial];
+	if (owner.state.size() != layers) {
+		owner.state.assign(layers, 0);
+		owner.hash.assign(layers, 0);
+	}
+	const uint64_t slice = image.info.data.size / layers;
+	for (uint32_t layer = first; layer < first + count; ++layer) {
+		if ((owner.state[layer] & LayerRendered) != 0) continue;
+		// (Its guest bytes as the GPU takes the layer: refreshed just before, RefreshDepthLayers.)
+		owner.state[layer] = LayerRendered;
+		owner.hash[layer]  = HashGuestRange(image.info.data.address + slice * layer, slice);
+	}
+}
+
+void TextureCache::NoteDepthLayersDirtied(const Image& image, uint64_t begin, uint64_t end, uint8_t cause) {
+	if (m_layer_owners.empty()) return;
+	const auto found = m_layer_owners.find(image.serial);
+	if (found == m_layer_owners.end()) return;
+	auto&          owner  = found->second;
+	const auto&    info   = image.info;
+	const uint32_t layers = info.resources.layers;
+	if (owner.state.size() != layers || layers == 0) return;
+	const uint64_t slice = info.data.size / layers;
+	begin                = std::max(begin, info.data.address);
+	end                  = std::min(end, info.data.End());
+	if (slice == 0 || begin >= end) return;
+	const uint64_t first = (begin - info.data.address) / slice;
+	const uint64_t last  = std::min<uint64_t>(layers, (end - info.data.address + slice - 1) / slice);
+	for (uint64_t layer = first; layer < last; ++layer) {
+		if ((owner.state[layer] & LayerRendered) != 0) owner.state[layer] |= cause;
+	}
+}
+
 // texture streamer fills from the CPU): only those layers are staged, detiled and copied (of [first_layer, last_layer)
 // only, for RefreshDepthLayers). The whole-image path staged and detiled every layer (320 MiB), 20-65 ms per refresh.
 bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32_t last_layer) {
@@ -2640,6 +2700,52 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 	for (uint32_t layer = first_layer; layer < std::min(layers, last_layer); ++layer) {
 		if (IntersectsRanges(dirty, base + slice * layer, base + slice * (layer + 1))) {
 			picked.push_back(layer);
+		}
+	}
+	// (KYTY_SHADOW_REFRESH_FIX: the rendered layers whose guest bytes did not change since the GPU took them stay.)
+	if (!m_layer_owners.empty() && DepthArrayGuarded(image)) {
+		const auto found = m_layer_owners.find(image.serial);
+		if (found != m_layer_owners.end() && found->second.state.size() == layers) {
+			auto&    owner   = found->second;
+			uint32_t kept    = 0;
+			uint32_t changed = 0;
+			std::erase_if(picked, [&](uint32_t layer) {
+				auto& state = owner.state[layer];
+				if ((state & LayerRendered) == 0) return false;
+				const uint64_t begin = base + slice * layer;
+				const uint64_t end   = begin + slice;
+				m_buffer_cache.DrainGuestReadback(begin, slice);
+				const bool same  = HashGuestRange(begin, slice) == owner.hash[layer];
+				uint64_t   bytes = 0;
+				for (const auto& [from, to]: dirty) {
+					if (to > begin && from < end) bytes += std::min(to, end) - std::max(from, begin);
+				}
+				static std::atomic<uint32_t> reports {0};
+				if (reports.fetch_add(1, std::memory_order_relaxed) < 64) {
+					std::printf("Shadow refresh: depth array 0x%llx (%u layers %ux%u) layer %u, rendered by the GPU, dirty "
+					            "0x%llx of 0x%llx bytes (by%s%s%s%s): guest bytes %s (KYTY_SHADOW_REFRESH_FIX=0: "
+					            "uploaded)\n",
+					            static_cast<unsigned long long>(base), layers, info.extent.width, info.extent.height,
+					            layer, static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(slice),
+					            (state & LayerDirtyByWrite) != 0 ? " a CPU write" : "",
+					            (state & LayerDirtyByMap) != 0 ? " a map" : "",
+					            (state & LayerDirtyByUnmap) != 0 ? " an unmap" : "",
+					            (state & (LayerDirtyByWrite | LayerDirtyByMap | LayerDirtyByUnmap)) == 0 ? " nothing seen" : "",
+					            same ? "unchanged since: kept the GPU's" : "changed: uploaded");
+					std::fflush(stdout);
+				}
+				if (same) {
+					state = LayerRendered;
+					++kept;
+					return true;
+				}
+				state = 0; // (the guest's until the GPU renders it again)
+				++changed;
+				return false;
+			});
+			auto* pool = ShadowPoolTrace::Find(base, layers, info.extent.width, info.extent.height);
+			ShadowPoolTrace::Count(pool, &ShadowPoolTrace::Pool::refresh_kept, kept);
+			ShadowPoolTrace::Count(pool, &ShadowPoolTrace::Pool::refresh_changed, changed);
 		}
 	}
 	if (picked.empty()) {
@@ -3920,6 +4026,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		if (changed) m_meta_epoch.fetch_add(1, std::memory_order_release);
 	}
 	CommitGpuWrite(image, scoped);
+	NoteDepthLayersRendered(image, desc.view_info.base_layer, desc.view_info.layer_count);
 	if (desc.info.HasStencil()) {
 		AssociateStencil(id, desc.info.stencil);
 	}
@@ -4903,6 +5010,14 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			continue;
 		}
 		if (owner->Overlaps(address, size)) {
+			{
+				const auto base = owner->info.data.address;
+				const auto from = std::max(address, base) - base;
+				NoteDepthLayersDirtied(*owner, base + from / PartialDirtyGranule * PartialDirtyGranule,
+				                       base + ((std::max(address + size, base + 1) - base - 1) / PartialDirtyGranule + 1) *
+				                                  PartialDirtyGranule,
+				                       LayerDirtyByWrite);
+			}
 			if (TryInvalidatePartial(*owner, address, size, PartialDirtyGranule)) {
 				continue;
 			}
@@ -5052,6 +5167,7 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
+		NoteDepthLayersDirtied(*owner, address & ~(TRACKER_PAGE_SIZE - 1), address + size, LayerDirtyByMap);
 		if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
 			continue;
 		}
@@ -5122,6 +5238,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		// the image is next used) and stays unwatched until then; MapMemory marks it again
 		// when memory returns there.
 		if (address > owner->info.data.address || address + size < owner->info.data.End()) {
+			NoteDepthLayersDirtied(*owner, address & ~(TRACKER_PAGE_SIZE - 1), address + size, LayerDirtyByUnmap);
 			if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
 				LiveCounters::Add(LiveCounters::PartialUnmaps);
 				++slow_partial;

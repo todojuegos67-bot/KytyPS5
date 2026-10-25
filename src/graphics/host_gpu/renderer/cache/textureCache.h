@@ -267,6 +267,16 @@ private:
 		uint64_t keep = 1; // collector runs it stays parked (KYTY_CUBE_SHADOW_FIX: a shadow pool's twin, longer)
 	};
 	std::unordered_map<uint64_t, ParkedImage> m_parked;
+	// KYTY_SHADOW_REFRESH_FIX: the layers of a depth array the GPU rendered (an image's serial -> per layer: rendered,
+	// what dirtied it since, and a hash of its guest bytes when the GPU took it). A refresh keeps a rendered layer whose
+	// guest bytes are unchanged since (they never held the GPU's depth), UploadDepthPartial.
+	struct LayerOwner {
+		std::vector<uint8_t>  state; // LayerRendered | LayerDirtyBy*
+		std::vector<uint64_t> hash;
+	};
+	std::unordered_map<uint64_t, LayerOwner> m_layer_owners;
+	void NoteDepthLayersRendered(Image& image, uint32_t first, uint32_t count);
+	void NoteDepthLayersDirtied(const Image& image, uint64_t begin, uint64_t end, uint8_t cause);
 	// Views of one allocation in shapes neither holds (a texture pool sampled as 256 layers of 11 levels and as 1649
 	// layers of one: another layer pitch), both only sampled: images of their own side by side (GuestTexture), where an
 	// image for one freed the other's (a draw sampling both re-uploaded GBs per pass, 10-11). Their count: a write
