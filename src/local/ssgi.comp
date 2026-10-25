@@ -1,4 +1,6 @@
 #version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 // KYTY_SSGI (ssgi.cpp): screen-space ray-traced GI + AO on the PS5 Pro path's render-resolution color, before the
 // upscaler. One module, five modes (push.mode):
 //   0 trace:     cosine hemisphere rays marched in the depth buffer -> raw (rgb bounce, a visibility) + gbuf_out
@@ -10,6 +12,16 @@
 //                steps 1, 2, 4 (and 8 at quality 3)
 //   4 composite: joint bilateral upsample (+ anti-flicker at 3); color += clamped albedo * indirect * intensity;
 //                soft AO; distance fade -> out (render res)
+//   5 gather:    (rtfire, KYTY_SSGI_EMISSIVE) one 8x8 workgroup per cell of a 32x18 grid over the render: the cell's
+//                emissive pixels (EmissiveW) reduced to one area light (position, power, mean normal, area) -> lights
+// Emissive light ("fire light", KYTY_SSGI_EMISSIVE > 0): a pixel is an emitter when its exposed luminance is high AND
+// far above what its G-buffer albedo (L0.b0..2) could reflect (lit colour / albedo = the irradiance it would need: a lit
+// wall needs a few x white, a flame or lava tens), softly, with less weight for unsaturated (white: glints, sky
+// reflections) pixels. The trace (mode 0) adds next-event estimation of those lights at every receiver: the strongest
+// 1-3 lights and one more picked by contribution, each with a screen-space shadow ray (depth-aware occlusion), inverse
+// square falloff with the emitter's size, its facing, a range window -> aux_out; denoised like the bounce (temporal +
+// 2 a-trous) and added in the composite as albedo x irradiance, soft-capped against the pixel's own light. Rays of the
+// ordinary bounce no longer pick the emitters' colour up (no double count, no fireflies from flames).
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D color_tex;   // the game's lit HDR color (render res)
@@ -22,7 +34,22 @@ layout(binding = 6) uniform sampler2D gbuf_prev;   // last frame's normal+depth 
 layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
 layout(binding = 8, rgba16f) uniform writeonly image2D gbuf_out;
 layout(binding = 9) uniform sampler2D aux_tex;     // temporal: last moments; a-trous: this pass's variance (in .w)
-layout(binding = 10, rgba16f) uniform writeonly image2D aux_out; // temporal: moments (m1, m2, count, var); a-trous: variance
+layout(binding = 10, rgba16f) uniform writeonly image2D aux_out; // temporal: moments (m1, m2, count, var); a-trous: variance;
+                                                                 // trace (emissive on): the emissive irradiance
+layout(binding = 11) uniform sampler2D emi_tex;    // composite: the denoised emissive irradiance (trace res)
+layout(binding = 12) uniform usampler2D packed0;   // G-buffer layer 0 (albedo rgb8; flag 2), else a 1x1 stand-in
+const int CW = 32, CH = 18, CELLS = CW * CH;
+// hdr: [0] lights listed this frame, [1] 1.0 (the exposure without the game's), [2] gather samples, [3] emissive pixels
+// (w > 0.5), [4] composite samples (1/64 of the pixels), [5] of them lit (> 0.002 exposed), [6] sum of the added exposed
+// luminance x 4096, [7] sum of the pixels' own exposed luminance x 256 (all cleared every frame).
+layout(std430, binding = 13) buffer Lights {
+	uint hdr[16];
+	uint list[CELLS];
+	vec4 light[]; // per cell: (view pos, area), (power rgb, emissive pixel count), (mean normal, -)
+};
+layout(std430, binding = 14) readonly buffer ExposureBuf {
+	float exposure_values[];
+};
 
 layout(push_constant) uniform Push {
 	// Projection terms (row vectors, p' = p * M): x scale, y scale, x/y offsets from z (jitter, off-centre),
@@ -33,6 +60,8 @@ layout(push_constant) uniform Push {
 	vec4  trace;     // trace size.xy, intensity, ao strength
 	ivec4 misc;      // mode, frame index, quality, flags (bit0 reset, bit1 history valid)
 	vec4  extra;     // a-trous step, ray length (view units), thickness, unused
+	vec4  emis;      // emissive strength (x internal gain), exposed luminance threshold, lit/albedo ratio threshold, range
+	ivec4 emisc;     // flags (1 emissive on, 2 G-buffer albedo bound), exposure index, view (1 mask, 2 added light), -
 } push;
 
 const float PI = 3.14159265;
@@ -96,14 +125,226 @@ vec2 Noise2(ivec2 pixel) {
 	return vec2(n1, n2);
 }
 
+// ---- emissive light ----
+bool  EmOn() { return (push.emisc.x & 1) != 0; }
+float GameExposure() {
+	float e = exposure_values[push.emisc.y];
+	return (e > 1e-12 && e < 1e12) ? e : 1.0;
+}
+vec3 GbufAlbedo(ivec2 px) {
+	uint w = texelFetch(packed0, px, 0).r;
+	return vec3(float(w & 255u), float((w >> 8) & 255u), float((w >> 16) & 255u)) / 255.0;
+}
+float Hash(uvec3 v) { // pcg3d-style, one float in [0, 1)
+	v = v * 1664525u + 1013904223u;
+	v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+	v ^= v >> 16u;
+	v.x += v.y * v.z;
+	return float(v.x >> 8) / 16777216.0;
+}
+// 0..1: how much of this pixel is an emitter (see the header). col: its lit colour (pre-exposure), z its view depth.
+float EmissiveW(ivec2 px, vec3 col, float z, float e) {
+	if (!EmOn() || any(isnan(col)) || any(isinf(col))) return 0.0;
+	float fz = 1.0 - smoothstep(50.0, 80.0, z); // (far / fogged lights are no source: fog and distance glow stay as drawn)
+	if (fz <= 0.0) return 0.0;
+	col       = max(col, vec3(0));
+	float lx  = Luma(col) * e;
+	float lt  = push.emis.y;
+	float wl  = smoothstep(lt, 2.0 * lt, lx);
+	if (wl <= 0.0) return 0.0;
+	float mx  = max(col.r, max(col.g, col.b));
+	float sat = (mx - min(col.r, min(col.g, col.b))) / max(mx, 1e-6);
+	float ws  = mix(0.2, 1.0, smoothstep(0.15, 0.5, sat));
+	float wr;
+	if ((push.emisc.x & 2) != 0) {
+		float irr = lx / max(Luma(GbufAlbedo(px)), 0.04); // the exposed irradiance a diffuse surface would need
+		wr        = smoothstep(push.emis.z, 2.0 * push.emis.z, irr);
+	} else {
+		wr = smoothstep(4.0 * lt, 8.0 * lt, lx); // (no G-buffer: luminance alone, stricter)
+	}
+	return wl * wr * ws * fz;
+}
+
+// Mode 5: one workgroup per cell. Pass 1: the nearest emitter depth in the cell; pass 2: the emitters within 1.5x of it
+// (a flame drawn over a far background keeps its near part) reduced to one light.
+shared uint s_zmin;
+shared uint s_stat[2];
+shared vec4 s_a[64], s_b[64], s_c[64];
+void Gather() {
+	ivec2 cell = ivec2(gl_WorkGroupID.xy);
+	uint  li   = gl_LocalInvocationIndex;
+	vec2  rs   = RenderSize();
+	ivec2 lo   = ivec2(vec2(cell) * rs / vec2(CW, CH));
+	ivec2 hi   = min(ivec2(vec2(cell + 1) * rs / vec2(CW, CH)), ivec2(rs));
+	float e    = GameExposure();
+	if (li == 0) s_zmin = floatBitsToUint(1e6), s_stat[0] = 0u, s_stat[1] = 0u;
+	barrier();
+	float zmin = 1e6;
+	uint  ns = 0u, ne = 0u;
+	for (int y = lo.y + int(gl_LocalInvocationID.y); y < hi.y; y += 8)
+		for (int x = lo.x + int(gl_LocalInvocationID.x); x < hi.x; x += 8) {
+			ivec2 px = ivec2(x, y);
+			float d  = texelFetch(depth_tex, px, 0).r;
+			++ns;
+			if (IsSky(d)) continue;
+			float z = abs(ViewZ(d));
+			float w = EmissiveW(px, texelFetch(color_tex, px, 0).rgb, z, e);
+			if (w > 0.5) ++ne;
+			if (w > 0.25) zmin = min(zmin, z);
+		}
+	atomicMin(s_zmin, floatBitsToUint(zmin));
+	atomicAdd(s_stat[0], ns);
+	atomicAdd(s_stat[1], ne);
+	barrier();
+	zmin       = uintBitsToFloat(s_zmin);
+	float zlim = zmin * 1.5 + 0.75;
+	vec4  A = vec4(0), B = vec4(0), C = vec4(0);
+	if (zmin < 1e5)
+		for (int y = lo.y + int(gl_LocalInvocationID.y); y < hi.y; y += 8)
+			for (int x = lo.x + int(gl_LocalInvocationID.x); x < hi.x; x += 8) {
+				ivec2 px = ivec2(x, y);
+				float d  = texelFetch(depth_tex, px, 0).r;
+				if (IsSky(d)) continue;
+				float z = abs(ViewZ(d));
+				if (z > zlim) continue;
+				vec3  col = max(texelFetch(color_tex, px, 0).rgb, vec3(0));
+				float w   = EmissiveW(px, col, z, e);
+				if (w <= 0.0) continue;
+				vec2  uv   = (vec2(px) + 0.5) / rs;
+				vec3  p    = ViewPos(uv, d);
+				float wv   = abs(p.z * push.depth_map.z + push.depth_map.w);
+				float area = (2.0 * wv / (abs(push.proj.x) * rs.x)) * (2.0 * wv / (abs(push.proj.y) * rs.y)); // view units^2
+				vec3  rad  = col * w;
+				float wl   = Luma(rad) * area + 1e-12;
+				A += vec4(p * wl, wl);
+				B += vec4(rad * area, w);
+				C += vec4(NormalAt(uv, p) * wl, w * area);
+			}
+	s_a[li] = A, s_b[li] = B, s_c[li] = C;
+	barrier();
+	for (uint s = 32u; s > 0u; s >>= 1u) {
+		if (li < s) s_a[li] += s_a[li + s], s_b[li] += s_b[li + s], s_c[li] += s_c[li + s];
+		barrier();
+	}
+	if (li != 0u) return;
+	atomicAdd(hdr[2], s_stat[0]);
+	atomicAdd(hdr[3], s_stat[1]);
+	A = s_a[0], B = s_b[0], C = s_c[0];
+	if (A.w <= 1e-9) return;
+	vec3  pos  = A.xyz / A.w;
+	vec3  pp   = Project(pos);
+	vec2  em   = min(pp.xy, 1.0 - pp.xy);
+	// A few emissive pixels at least (no single-pixel glints flickering in and out), faded at the screen edges (a light
+	// leaving the view goes out smoothly, not at once).
+	float conf = smoothstep(1.0, 6.0, B.w) * smoothstep(0.0, 0.05, min(em.x, em.y));
+	vec3  pw   = B.rgb * conf;
+	if (Luma(pw) * e < 1e-4) return;
+	int  ci  = cell.y * CW + cell.x;
+	uint idx = atomicAdd(hdr[0], 1u);
+	list[idx]          = uint(ci);
+	light[ci * 3 + 0] = vec4(pos, C.w);
+	light[ci * 3 + 1] = vec4(pw, B.w);
+	light[ci * 3 + 2] = vec4(C.xyz / A.w, 0.0);
+}
+
+// Screen-space shadow ray from the receiver to the light, stopped short of the emitter's own surface: 0 when a
+// surface in the depth buffer is in front of the ray (by more than a small bias, less than a wall's thickness).
+float Shadow(vec3 p, vec3 n, vec3 lp, float lr, float jit, int steps) {
+	vec3  origin = p + n * (0.01 * abs(p.z) + 0.02);
+	vec3  dv     = lp - origin;
+	float dist   = length(dv);
+	float tmax   = max(0.0, 1.0 - (lr + 0.2) / max(dist, 1e-3));
+	for (int s = 0; s < steps; ++s) {
+		float t  = tmax * (float(s) + jit) / float(steps);
+		vec3  q  = origin + dv * t;
+		vec3  pr = Project(q);
+		if (any(lessThan(pr.xy, vec2(0))) || any(greaterThan(pr.xy, vec2(1)))) break;
+		float sd = textureLod(depth_tex, pr.xy, 0).r;
+		if (IsSky(sd)) continue;
+		float sz    = abs(ViewZ(sd));
+		float delta = abs(q.z) - sz; // > 0: a surface is in front of the ray there
+		if (delta > 0.02 * sz + 0.03 && delta < 1.0 + 0.05 * sz) return 0.0;
+	}
+	return 1.0;
+}
+
+// The emissive irradiance / pi at a receiver (view position p, normal n): the strongest K lights each shadowed, the
+// rest by one shadow ray to a light picked by contribution (its visibility for all of them).
+vec3 EmissiveNee(ivec2 pixel, vec3 p, vec3 n, float jit) {
+	uint count = min(hdr[0], uint(CELLS));
+	if (count == 0u) return vec3(0);
+	int   q     = push.misc.z;
+	int   K     = q >= 3 ? 3 : q >= 2 ? 2 : 1;
+	int   steps = q >= 3 ? 20 : q >= 2 ? 16 : 12;
+	float R     = push.emis.w;
+	uint  stride = (count + 95u) / 96u; // (a lava field: at most 96 lights a pixel, a rotating subset)
+	uint  start  = stride > 1u ? uint(Hash(uvec3(pixel, push.misc.y)) * float(stride)) : 0u;
+	vec3  topE[3]  = vec3[3](vec3(0), vec3(0), vec3(0));
+	float topS[3]  = float[3](0.0, 0.0, 0.0);
+	int   topC[3]  = int[3](-1, -1, -1);
+	vec3  restE = vec3(0);
+	float restS = 0.0;
+	int   restC = -1;
+	for (uint i = start; i < count; i += stride) {
+		int  c  = int(list[i]);
+		vec4 la = light[c * 3 + 0], lb = light[c * 3 + 1], lc = light[c * 3 + 2];
+		vec3 L  = la.xyz - p;
+		float d2 = dot(L, L);
+		if (d2 >= R * R) continue;
+		float d   = sqrt(d2);
+		vec3  l   = L / max(d, 1e-4);
+		float ndl = dot(n, l);
+		if (ndl <= 0.0) continue;
+		float nl  = length(lc.xyz);
+		// The emitter's facing: a flat emitter (a flame over its wall, lava) lights only its front; a mixed one more evenly.
+		float ce  = nl > 1e-3 ? mix(1.0, clamp(dot(lc.xyz / nl, -l), 0.0, 1.0), clamp(nl, 0.0, 1.0)) : 1.0;
+		float lr  = clamp(sqrt(la.w / PI), 0.15, 1.0);
+		float r4  = d2 / (R * R);
+		float win = (1.0 - r4 * r4) * (1.0 - r4 * r4);
+		vec3  E   = lb.rgb * (ndl * ce * win / (PI * (d2 + lr * lr)));
+		float s   = Luma(E);
+		if (s <= 0.0) continue;
+		// Into the top K (the weakest pushed out joins the rest), else the rest (weighted reservoir: one pick).
+		vec3  oe = E;
+		float os = s;
+		int   oc = c;
+		for (int k = 0; k < 3; ++k) {
+			if (k >= K) break;
+			if (os > topS[k]) {
+				vec3 te = topE[k]; float ts = topS[k]; int tc = topC[k];
+				topE[k] = oe, topS[k] = os, topC[k] = oc;
+				oe = te, os = ts, oc = tc;
+			}
+		}
+		if (oc >= 0 && os > 0.0) {
+			restE += oe;
+			restS += os;
+			if (Hash(uvec3(pixel, push.misc.y * 131 + int(i) * 7 + 1)) * restS < os) restC = oc;
+		}
+	}
+	vec3 total = vec3(0);
+	for (int k = 0; k < 3; ++k) {
+		if (k >= K || topC[k] < 0) continue;
+		vec4 la = light[topC[k] * 3];
+		total += topE[k] * Shadow(p, n, la.xyz, clamp(sqrt(la.w / PI), 0.15, 1.0), jit, steps);
+	}
+	if (restC >= 0) {
+		vec4 la = light[restC * 3];
+		total += restE * Shadow(p, n, la.xyz, clamp(sqrt(la.w / PI), 0.15, 1.0), fract(jit + 0.5), steps);
+	}
+	return total * float(stride);
+}
+
 void Trace(ivec2 pixel) {
 	vec2  uv = (vec2(pixel) + 0.5) / TraceSize();
 	float d  = textureLod(depth_tex, uv, 0).r;
 	if (IsSky(d)) {
 		imageStore(out_img, pixel, vec4(0, 0, 0, 1));
 		imageStore(gbuf_out, pixel, vec4(0, 0, 1, 1e6));
+		if (EmOn()) imageStore(aux_out, pixel, vec4(0, 0, 0, 1));
 		return;
 	}
+	float ex = EmOn() ? GameExposure() : 1.0;
 	vec3 p = ViewPos(uv, d);
 	vec3 n = NormalAt(uv, p);
 	imageStore(gbuf_out, pixel, vec4(n, abs(p.z)));
@@ -168,7 +409,11 @@ void Trace(ivec2 pixel) {
 				// (no halo where the hit is about to leave the view).
 				vec2  e    = min(pr.xy, 1.0 - pr.xy);
 				float edge = smoothstep(0.0, 0.06, min(e.x, e.y));
-				hit_c = textureLod(color_tex, pr.xy, 0).rgb * (1.0 - kh * kh * kh * kh) * edge;
+				hit_c = textureLod(color_tex, pr.xy, 0).rgb;
+				// (emissive on: the emitters' own light comes from EmissiveNee, not from rays that happen to hit them)
+				if (EmOn())
+					hit_c *= 1.0 - EmissiveW(min(ivec2(pr.xy * RenderSize()), ivec2(RenderSize()) - 1), hit_c, abs(hp.z), ex);
+				hit_c *= (1.0 - kh * kh * kh * kh) * edge;
 				break;
 			}
 			k_prev = k;
@@ -182,6 +427,13 @@ void Trace(ivec2 pixel) {
 	float l = Luma(bounce);
 	if (l > 3.0) bounce *= 3.0 / l;
 	imageStore(out_img, pixel, vec4(max(bounce, vec3(0)), vis));
+	if (EmOn()) {
+		vec3 em = EmissiveNee(pixel, p, n, jit) * push.emis.x;
+		// (fireflies: bounded at 8x white exposed before the temporal filter accumulates it)
+		float le = Luma(em) * ex;
+		if (le > 8.0) em *= 8.0 / le;
+		imageStore(aux_out, pixel, vec4(max(em, vec3(0)), 1.0));
+	}
 }
 
 // SVGF-style temporal integration: per-pixel accumulation count and luminance moments, alpha = max(1/count, a_min),
@@ -290,7 +542,7 @@ void Atrous(ivec2 pixel) {
 }
 
 // Joint bilateral upsample: the 4 nearest trace texels, bilinear weights times depth similarity to this pixel.
-vec4 Upsample(vec2 uv, float z) {
+vec4 Upsample(sampler2D src, vec2 uv, float z) {
 	vec2  tc = uv * TraceSize() - 0.5;
 	vec2  f  = fract(tc);
 	ivec2 b  = ivec2(floor(tc));
@@ -303,7 +555,7 @@ vec4 Upsample(vec2 uv, float z) {
 		float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
 		float tz = texelFetch(gbuf_cur, q, 0).w;
 		float w  = (bw + 1e-3) / (1e-3 + abs(tz - z) / max(z * 0.02, 1e-3));
-		sum += texelFetch(src_a, q, 0) * w;
+		sum += texelFetch(src, q, 0) * w;
 		wsum += w;
 	}
 	return sum / max(wsum, 1e-6);
@@ -326,7 +578,7 @@ void Composite(ivec2 pixel) {
 		imageStore(gbuf_out, pixel, vec4(0, 0, 0, 1));
 		return;
 	}
-	vec4 gi = Upsample(uv, z);
+	vec4 gi = Upsample(src_a, uv, z);
 	if (push.misc.z >= 3) {
 		// Anti-flicker: the reprojected last composited GI, clamped to a band around this frame's, blended in.
 		vec4 cg = gi;
@@ -358,6 +610,34 @@ void Composite(ivec2 pixel) {
 	// Never more than 15% darker (no blotches on faces or walls), and the AO applies to the base color only.
 	float aom = max(mix(1.0, ao, push.trace.w * fade), 0.85);
 	vec3  rgb = col.rgb * aom + bounce;
+	if (EmOn()) {
+		float e     = GameExposure();
+		float wself = EmissiveW(pixel, col.rgb, z, e);
+		vec3  E     = max(Upsample(emi_tex, uv, z).rgb, vec3(0));
+		// The receiver's own albedo (G-buffer), else the colour-chroma estimate above.
+		vec3  alb   = (push.emisc.x & 2) != 0 ? clamp(GbufAlbedo(pixel), vec3(0.02), vec3(0.9)) : albedo;
+		vec3  add   = alb * E * fade * (1.0 - wself); // (an emitter does not light itself: no glow around flames)
+		// Soft cap against the pixel's own exposed light: a tint that cannot blow a surface out or lift the exposure.
+		float lxo  = l * e;
+		float ax   = Luma(add) * e;
+		float capx = 0.1 + 0.6 * lxo;
+		add *= 1.0 / (1.0 + ax / capx);
+		ax = Luma(add) * e;
+		rgb += add;
+		if (push.emisc.z == 1) rgb = mix(col.rgb * 0.25, col.rgb + vec3(1, 0, 1) * (0.5 / e), wself) + add;
+		else if (push.emisc.z == 2) rgb = add * 4.0;
+		bool  sampled = (pixel.x & 7) == 0 && (pixel.y & 7) == 0;
+		uint  s0 = subgroupAdd(sampled ? 1u : 0u);
+		uint  s1 = subgroupAdd(sampled && ax > 0.002 ? 1u : 0u);
+		uint  s2 = subgroupAdd(sampled ? uint(min(ax, 8.0) * 4096.0) : 0u);
+		uint  s3 = subgroupAdd(sampled ? uint(min(lxo, 64.0) * 256.0) : 0u);
+		if (subgroupElect() && s0 > 0u) {
+			atomicAdd(hdr[4], s0);
+			atomicAdd(hdr[5], s1);
+			atomicAdd(hdr[6], s2);
+			atomicAdd(hdr[7], s3);
+		}
+	}
 	imageStore(out_img, pixel, vec4(max(rgb, vec3(0)), col.a));
 }
 
@@ -365,6 +645,10 @@ void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	int   mode  = push.misc.x;
 	ivec2 size  = ivec2(mode == 4 ? RenderSize() : TraceSize());
+	if (mode == 5) {
+		Gather(); // (one workgroup per cell: no per-pixel bound)
+		return;
+	}
 	if (pixel.x >= size.x || pixel.y >= size.y) return;
 	if (mode == 0) Trace(pixel);
 	else if (mode == 1) Temporal(pixel);
