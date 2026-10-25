@@ -71,6 +71,10 @@ void OnPresent(uint64_t frame_index);
 // 5 s, dropped after 10 s), and no step is made longer than period + 1 ms by the wait: even steps, no event wait. Off
 // with DLSS-G; Reflex's / the limiter's sleep is skipped while it is active. [phase] line once a second.
 [[nodiscard]] bool PhaseOn();
+// KYTY_PAD_LATE_MS=<L> (off by default; for KYTY_DISPLAYED_WAIT=1): under a 30-ish flip limit (cap 25-45 ms) the game's
+// controller read of frame N waits until L ms before N's flip slot (last release + cap per frame since), so the game
+// samples input late; a frame slower than L - 1 ms then misses its slot. [padlate] line every 5 s.
+[[nodiscard]] bool PadLateOn();
 void               PhaseRelease(double queued_ms); // a flip released: its gpu done -> flip, ms
 void               NoteFlipDepth(int depth);       // FlipQueue's requests after a reserve / release
 void               OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick);

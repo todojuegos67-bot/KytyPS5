@@ -1880,8 +1880,8 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	r.cfg->mutex.Unlock();
 
 	NoteFlipSubmitted(r.submit_time);
-	if (Graphics::AntiLag::PaceOn() || Graphics::AntiLag::PhaseOn()) {
-		// KYTY_LOWLAT_PACE_BEFORE_INPUT / KYTY_PHASE_PACE: the configured cap of a game-view frame (never a movie, menu, cinematic, loading
+	if (Graphics::AntiLag::PaceOn() || Graphics::AntiLag::PhaseOn() || Graphics::AntiLag::PadLateOn()) {
+		// KYTY_LOWLAT_PACE_BEFORE_INPUT / KYTY_PAD_LATE_MS / KYTY_PHASE_PACE: the configured cap of a game-view frame (never a movie, menu, cinematic, loading
 		// screen, or FG pacing's own release), else 0 (the pacing off).
 		const bool capped = r.frame != nullptr && !scene_free && !fg_off && !s_fg_paced && !MoviePlaying() && !CinematicPlaying() &&
 		                    Graphics::Presenter::IsSceneFrame(*r.frame) &&
