@@ -4205,8 +4205,10 @@ void BeforeSceneDraw(CommandBuffer& command, TextureCache& cache, const RenderSt
 		const char* v = std::getenv("KYTY_RT_PARTICLES_ANYDEPTH");
 		return v != nullptr && *v == '1';
 	}();
-	const bool particle = pinned.empty() ? (draw.blend && !draw.depth_write && (draw.depth_test || any_depth))
-	                                     : std::find(pinned.begin(), pinned.end(), draw.vs) != pinned.end();
+	// (A single quad / triangle is a full-screen pass - fog, composites - not particles: skipped by the heuristic.)
+	const bool full_screen = !draw.indirect && draw.index_count <= 6 && draw.instances <= 1;
+	const bool particle    = pinned.empty() ? (draw.blend && !draw.depth_write && (draw.depth_test || any_depth) && !full_screen)
+	                                        : std::find(pinned.begin(), pinned.end(), draw.vs) != pinned.end();
 	if (!particle) return;
 	auto& image = cache.GetImage(draw.target);
 	if (image.backing.image == nullptr || image.info.data.address != draw.address) return;
