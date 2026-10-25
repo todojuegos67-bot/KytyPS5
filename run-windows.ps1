@@ -47,6 +47,13 @@
 #   .\run-windows.ps1 -Follow                stay open showing the run log until the game exits, then its
 #                                            exit code (run.cmd)
 #   .\run-windows.ps1 -DryRun                print environment and command only
+# astro-perf-1025 (brunoKytyPs5 base; the Demon's Souls KYTY_* switches of launch.json are not read by this emulator):
+#   .\run-windows.ps1 -DrainStats 10         every 10 s, where the frame's time went: GPU busy/gap, GPU-thread idle,
+#                                            waits by cause (readbacks, faults, drains), shader/pipeline compiles
+#   .\run-windows.ps1 -AstroBoost 1          brunoKytyPs5's Astro Bot boost trade-offs (KYTY_ASTRO_BOOST; 1 = all, or
+#                                            a list: clock,flush,patches,count,writes,fastmath,earlyz; src/local/astro-boost.h)
+#   .\run-windows.ps1 -BrunoFrameGen         brunoKytyPs5's own FSR 3 interpolation (--frame-generation) instead of
+#                                            -Fsr3FrameGen (the FSR 3 frame generation swapchain) or -FrameGen (DLSS-G)
 # A release package (.github/workflows/build.yml) has its kyty_emulator.exe and launch.json next to this
 # script: those are used instead of the build tree's. A build tree takes run-windows.json (the release
 # package's switches; an older _Build\release-stage1-20260927\launch.json lacks the table modes).
@@ -100,6 +107,9 @@ param(
 	[switch]$NoAsyncShaders,
 	[switch]$FlipWhenReady,
 	[switch]$Fsr3FrameGen,
+	[switch]$BrunoFrameGen,
+	[int]$DrainStats = 0,
+	[string]$AstroBoost = '',
 	[switch]$Turbo,
 	[switch]$Turbo2,
 	[switch]$ExclusiveFullscreen,
@@ -674,6 +684,19 @@ if ("$($environment['KYTY_BRUNO_RECOMMENDED'])" -ne '0') {
 	if (-not $options.Contains('--shader-optimization-type')) { Set-Option '--shader-optimization-type' 'Performance' }
 	if (-not $options.Contains('--amd-cpu')) { $options.Add('--amd-cpu') }
 }
+# astro-perf-1025: the switches above that this emulator reads under another name.
+# Async shaders: brunoKytyPs5's --async-pipelines (a draw whose pipeline is still compiling is skipped; it appears a
+# few frames late) for KYTY_ASYNC_DRAW_PIPELINES=1, which this emulator does not read (-NoAsyncShaders: off).
+if ("$($environment['KYTY_ASYNC_DRAW_PIPELINES'])" -eq '1' -and -not $options.Contains('--async-pipelines')) { Set-Option '--async-pipelines' 'true' }
+if ($DrainStats -gt 0) { Set-Option '--drain-stats' "$DrainStats" }
+if ($AstroBoost) { $environment['KYTY_ASTRO_BOOST'] = $AstroBoost }
+if ($BrunoFrameGen) {
+	if ($environment['KYTY_FSR3_FG'] -eq '1' -or "$($environment['KYTY_FRAMEGEN'])" -match '^[1-9]') {
+		Write-Host 'framegen: -BrunoFrameGen ignored (-Fsr3FrameGen / -FrameGen asked)'
+	} else { Set-Option '--frame-generation' 'true' }
+}
+# The [fps] line every second (frame time, flip -> present) and the [traps] line every 10 s (src/local/metrics.cpp).
+if (!$environment.Contains('KYTY_FPS_LOG')) { $environment['KYTY_FPS_LOG'] = '1' }
 $quoted = @('--game', "`"$Game`"") + ($options | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } })
 $logDir = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\run-logs" } else { "$PSScriptRoot\logs" }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
