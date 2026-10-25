@@ -423,10 +423,10 @@ void GameController::LogActive(const char* why) {
 		std::printf("Pad: player 1 = %s (%s, %d connected)\n", m_active_id < 0 ? "none" : "keyboard", why,
 		            static_cast<int>(m_connected_ids.size()));
 	} else {
-		auto*       pad   = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
-		const char* name  = pad != nullptr ? SDL_GameControllerName(pad) : nullptr;
-		const int   slot  = pad != nullptr ? SDL_GameControllerGetPlayerIndex(pad) : -1;
-		const bool  ps5   = pad != nullptr && SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5;
+		auto*       pad   = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+		const char* name  = pad != nullptr ? SDL_GetGamepadName(pad) : nullptr;
+		const int   slot  = pad != nullptr ? SDL_GetGamepadPlayerIndex(pad) : -1;
+		const bool  ps5   = pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5;
 		if (slot >= 0 && !ps5) {
 			std::printf("Pad: player 1 = '%s' (id %d, XInput slot %d) (%s, %d connected)\n", name ? name : "?",
 			            m_active_id, slot + 1, why, static_cast<int>(m_connected_ids.size()));
