@@ -55,8 +55,11 @@ namespace Libs::Graphics {
 // large writable range over its descriptor tables; the stop killed the game at boot with RT saved on.
 static bool ScalarWriteOverlapAllowed() {
 	static const bool allowed = [] {
+		// Default on: an unbounded (NumRecords=UINT32_MAX) write buffer whose base sits inside a
+		// descriptor table read only means the sentinel range cannot be trimmed; the specialization
+		// snapshot is already taken. KYTY_ALLOW_SCALAR_WRITE_OVERLAP=0 restores the old stop.
 		const char* v = std::getenv("KYTY_ALLOW_SCALAR_WRITE_OVERLAP");
-		return v != nullptr && *v == '1';
+		return v == nullptr || *v != '0';
 	}();
 	if (allowed) {
 		static bool warned = false;

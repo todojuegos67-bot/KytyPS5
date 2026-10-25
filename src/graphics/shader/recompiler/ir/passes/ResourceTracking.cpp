@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <bit>
 #include <fmt/format.h>
 #include <map>
@@ -577,8 +578,15 @@ private:
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
-		EXIT("%s", message.c_str());
-		std::abort();
+		static const bool fatal = [] {
+			const char* v = std::getenv("KYTY_FATAL_UNSUPPORTED_SHADERS");
+			return v != nullptr && v[0] == '1';
+		}();
+		if (fatal) {
+			EXIT("%s", message.c_str());
+			std::abort();
+		}
+		throw UnsupportedResources(message);
 	}
 
 	Value NativeDescriptorSource(Value value, uint32_t reg, uint32_t use_pc) const {
@@ -3924,8 +3932,10 @@ private:
 				                                                        : ResourceKind::Buffer) ||
 				    !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
-					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load");
+					     fmt::format("buffer descriptor is not a valid runtime value; GPU-selected access "
+					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load "
+					     "(opcode={} kind={} formatted={})", static_cast<uint32_t>(op),
+					     static_cast<uint32_t>(memory.kind), memory.formatted ? 1 : 0));
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;

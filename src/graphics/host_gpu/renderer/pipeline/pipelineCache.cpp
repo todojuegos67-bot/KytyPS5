@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
@@ -448,6 +449,10 @@ struct PipelineCache::ProgramCache {
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
 		ShaderRecompiler::TranslateResult translated;
+		if (unsupported_keys.contains(lookup_key)) {
+			return SkipUnsupported(params.hash, input_info);
+		}
+		try {
 		if (current != nullptr) {
 			if (current->call) {
 				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
@@ -458,6 +463,11 @@ struct PipelineCache::ProgramCache {
 			}
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		}
+		} catch (const ShaderRecompiler::IR::UnsupportedResources& error) {
+			std::printf("%s\n", error.what());
+			unsupported_keys.insert(lookup_key);
+			return SkipUnsupported(params.hash, input_info);
 		}
 		if (entry == programs.end()) {
 			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
@@ -516,6 +526,7 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
+	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported_keys; // translation threw UnsupportedResources
 	GraphicContext&                                             graphics;
 	uint64_t                                                    next_shader_id = 0;
 };
