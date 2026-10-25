@@ -3822,7 +3822,7 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 	// (rtparticles) KYTY_RT_PARTICLES=2: the particle mask as DLSS's bias-current-color hint (trust the current frame
 	// where particles, drawn without motion vectors, are).
 	const bool have_reactive = inputs.reactive.view != nullptr && inputs.reactive.image != nullptr;
-	auto       reactive      = have_reactive ? resource(inputs.reactive) : sl::Resource {};
+	auto       reactive      = resource(inputs.reactive); // (null handles when there is none: the tag is not given)
 	sl::ResourceTag tags[5] {
 	    sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
 	    sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &full),
