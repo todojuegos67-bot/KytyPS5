@@ -1081,6 +1081,56 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 		window_begin = std::max(page_begin, buffer_begin);
 		window_end   = std::min(page_end, buffer_end);
 	}
+	// KYTY_ASYNC_COPY_QUEUE=1 (live, default 1): when every GPU write to the buffer has executed,
+	// serve the fault from the copy queue as the synchronous path does (TryCopyQueueReadback:
+	// only the GPU-written bytes, behind nothing but the finished writer) and resolve it here.
+	// Before, the asynchronous path always recorded the download on the main queue, broke the
+	// render pass, submitted, and the guest thread waited for everything queued before it
+	// (Wolverine 10-19: 8310 such submits per 5 s, Guest_RenderThread 1.35-1.53 s per 5 s in
+	// those waits at ~0.6 ms each; readback stats 10-15: the writer had finished for nearly
+	// every readback). 0 = the previous behaviour.
+	{
+		static auto& copy_queue = Common::LiveSwitches::Get("KYTY_ASYNC_COPY_QUEUE", 1);
+		static uint64_t stats_cq = 0, stats_main = 0, stats_in_flight = 0, stats_cq_us = 0;
+		static auto     stats_begin = std::chrono::steady_clock::now();
+		bool            served      = false;
+		if (copy_queue.load(std::memory_order_relaxed) != 0) {
+			const auto start = std::chrono::steady_clock::now();
+			if (!m_scheduler.IsFree(buffer.last_gpu_write_tick)) {
+				stats_in_flight++;
+			} else if (TryCopyQueueReadback(buffer, window_begin, window_end)) {
+				served = true;
+				stats_cq++;
+				stats_cq_us += static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::microseconds>(
+				        std::chrono::steady_clock::now() - start)
+				        .count());
+			}
+		}
+		if (!served) {
+			stats_main++;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - stats_begin >= std::chrono::seconds(5)) {
+			char line[256];
+			std::snprintf(line, sizeof(line),
+			              "Async readbacks (5 s): %" PRIu64 " copy queue (%.1f ms on Thread_Gpu), %" PRIu64
+			              " other: main queue or nothing to download (%" PRIu64 " with the writer still running)\n",
+			              stats_cq, static_cast<double>(stats_cq_us) / 1000.0, stats_main,
+			              stats_in_flight);
+			Log::WriteToConsoleAndLog(line);
+			stats_cq = stats_main = stats_in_flight = stats_cq_us = 0;
+			stats_begin = now;
+		}
+		if (served) {
+			stats.SetOutcome(ReadbackStats::Downloaded);
+			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+			return 0;
+		}
+	}
 	if (!DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 		stats.SetOutcome(ReadbackStats::NothingToDownload);
 		if (is_write) {
