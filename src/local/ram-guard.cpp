@@ -152,11 +152,31 @@ void ApplyFlushDefaults() {
 	}
 	g_flush_defaults = set;
 }
+// KYTY_MEMCUT=1|2 (memcut-1025): the emulator's own memory held all along, lowered only by switches that change where
+// or how long memory is kept, never what a draw reads: the image upload ring (KYTY_STAGING_RING_MB: a full ring waits
+// for the GPU or uploads through a temporary buffer, the same bytes), VMA's block size (KYTY_VMA_BLOCK_MB: placement
+// only, less free space held inside part-used blocks; 32 is KYTY_LOWMEM_VRAM's tested value) and idle pipelines'
+// lifetime (KYTY_PIPELINE_EVICT_SECONDS: made again from the pipeline cache on next use). Level 1: ring 384 MiB,
+// blocks 32 MiB, pipelines idle 120 s; level 2: ring 256 MiB, pipelines idle 60 s. Every switch set by hand wins.
+void ApplyMemcutDefaults() {
+	const char* value = Env("KYTY_MEMCUT");
+	const long  level = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+	if (level <= 0) return;
+	std::string set;
+	SetDefault("KYTY_STAGING_RING_MB", level >= 2 ? "256" : "384", &set);
+	SetDefault("KYTY_VMA_BLOCK_MB", "32", &set);
+	SetDefault("KYTY_RAM_DIET", "1", &set);
+	SetDefault("KYTY_PIPELINE_EVICT_SECONDS", level >= 2 ? "60" : "120", &set);
+	std::printf("[memcut] level %ld: %s (no step changes data a draw reads: verification mismatches 0 by construction)\n",
+	            level >= 2 ? 2L : 1L, set.empty() ? "every switch already set" : set.c_str());
+	std::fflush(stdout);
+}
 } // namespace
 
 void ApplyLowRamDefaults() {
 	static std::once_flag once;
 	std::call_once(once, [] {
+		ApplyMemcutDefaults();
 		ApplyFlushDefaults();
 		const uint64_t ram    = LocalPlatform::PhysicalMemory();
 		const char*    forced = Env("KYTY_LOWRAM");

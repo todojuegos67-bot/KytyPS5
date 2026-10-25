@@ -603,3 +603,14 @@ GPU 碰撞只给脚部 IK：`GpuCollisionManager::CastRay` 全镜像唯一调用
   game already lights them); frame generation (DLSS-G, FFX FI) takes no reactive/particle mask, so FG smearing of
   particles is not addressable from here (the SR mask is). RT reflections already sample the final colour at the hit, so
   fire over a surface reflects already; fire over the sky cannot (no depth).
+
+## 2026-10-25 — memcut-1025: KYTY_MEMCUT=1|2 (exact-only cuts of the emulator's own memory)
+- Census of the 16 GB-simulated runs (20261025-194716/195808): 7785 MiB of the 17.5-18.3 GiB private bytes is the
+  KYTY_SIMULATE_VRAM_MB ballast (test only); the emulator's own non-store commit is ~9.7 GiB: device-local 5.35 GiB
+  (VMA 3.4: game buffer pool 0.67-0.96, images/RTs 2.4, free inside blocks 0.17-0.33; plain type 0.9; driver 1.06),
+  host-visible 0.74 GiB (of which the image upload ring 512 MiB), pipelines ~0.6 GiB.
+- KYTY_MEMCUT sets only placement/lifetime switches: KYTY_STAGING_RING_MB (384 / 256), KYTY_VMA_BLOCK_MB=32,
+  KYTY_RAM_DIET=1 + KYTY_PIPELINE_EVICT_SECONDS (120 / 60). No data is dropped or rebuilt, so no texture can go stale.
+  Expected: -0.25..0.5 GiB RAM+commit (ring 128-256, block slack 50-150, pipelines 50-300). A 2-4 GB cut would need
+  live textures/RTs out of video memory (= the level 2 offload and its restores): not exact-safe without restore-ahead.
+- Watch: "[memcut] level", "[memcut] image upload ring", census "upload ring overflows so far" (streaming cost).
