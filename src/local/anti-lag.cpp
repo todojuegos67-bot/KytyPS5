@@ -156,7 +156,7 @@ static double PadLateMs() {
 		const double c = r > 0.0 ? std::clamp(r, 10.0, 80.0) : 0.0;
 		if (c > 0.0) {
 			std::printf("Pad late: the controller read waits until %.1f ms before its frame's flip slot (KYTY_PAD_LATE_MS; "
-			            "under a 25-45 ms flip limit only)\n", c);
+			            "under a 20-45 ms flip limit only)\n", c);
 			std::fflush(stdout);
 		}
 		return c;
@@ -447,7 +447,7 @@ int64_t PadLateStep(uint64_t index, double& slept_ms) {
 	const double cap = g_pace.cap_ms;
 	g_padlate.reads++;
 	const int64_t now = LatNow();
-	if (cap < 25.0 || cap > 45.0 || g_rel_index == 0 || index <= g_rel_index || index - g_rel_index > 3 ||
+	if (cap < 20.0 || cap > 45.0 || g_rel_index == 0 || index <= g_rel_index || index - g_rel_index > 3 ||
 	    static_cast<double>(now - g_rel_ticks) / per_ms > 200.0) {
 		g_padlate.idle++;
 		return 0;
