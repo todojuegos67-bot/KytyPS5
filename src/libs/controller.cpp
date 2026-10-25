@@ -1,5 +1,7 @@
 #include "libs/controller.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/common.h"
@@ -1080,8 +1082,35 @@ void CycleKeyboardPlayer() {
 	}
 }
 
+// Last-used pad becomes player 1 (port of the Demon's Souls fix cb428865 / Wolverine 9c0df138 to
+// this router). Windows can enumerate a virtual or idle pad first (Yotei 10-25: "Controller 8
+// assigned to player 1", the user's "Controller 7 assigned to player 2"), so the game, which reads
+// only player 1, ignored the real pad. A button press on a pad that is not player 1 swaps it into
+// player 1. KYTY_PAD_LAST_USED=0 keeps the connection order. Caller holds g_router_mutex.
+static void PromoteToPlayerOne(int id) {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_PAD_LAST_USED");
+		return v == nullptr || v[0] != '0';
+	}();
+	if (!on || id == HOST_INPUT_CONTROLLER_ID) return;
+	// With the keyboard assigned exclusively to player 1, pads cannot take that slot.
+	if (g_keyboard_player == 1) return;
+	auto self = std::find_if(g_pad_players.begin(), g_pad_players.end(),
+	                         [id](const auto& pad) { return pad.first == id; });
+	if (self == g_pad_players.end() || self->second == 0) return;
+	const int old_player = self->second;
+	for (auto& [other, player]: g_pad_players) {
+		if (player == 0) player = old_player;
+	}
+	self->second = 0;
+	std::printf("Pad: controller %d pressed a button, now player 1 (was player %d)\n", id, old_player + 1);
+	std::fflush(stdout);
+	RefreshPlayers();
+}
+
 void SetButton(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(g_router_mutex);
+	if (down) PromoteToPlayerOne(id);
 	if (auto* player = PlayerForDevice(id)) {
 		player->Button(id, button, down);
 	}
