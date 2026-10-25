@@ -268,7 +268,7 @@ void Volume(ivec2 q) {
 		float lit = wsum > 0.0 ? acc / wsum : 0.0;
 		float fall = exp(-dist * 2.2);
 		// (the sky mask is real visibility through openings: boosted at Bajo / Medio)
-		scatter += lit * fall * push.sun_uv.z * (sky ? 0.35 : 1.0) * (1.0 + 0.5 * push.extra.w);
+		scatter += lit * fall * push.sun_uv.z * (sky ? 0.35 : 1.0) * (1.0 + 0.2 * push.extra.w);
 	}
 	// (b) the raymarch along the view ray, each step shadowed toward the sun against the depth buffer.
 	int steps = int(push.motion.w);
@@ -304,87 +304,99 @@ void Volume(ivec2 q) {
 		// Boost by the shaft-ness of the ray: partly lit rays (light through gaps) gain, fully lit or fully shadowed
 		// ones (a uniform haze indoors / outdoors) do not.
 		float fr = tmax > 0.0 ? clamp(lit / tmax, 0.0, 1.0) : 0.0;
-		scatter += (lit / 60.0) * phase * 0.35 * (1.0 + push.extra.w * (0.15 + 2.4 * fr * (1.0 - fr)));
+		scatter += (lit / 60.0) * phase * 0.35 * (1.0 + push.extra.w * (0.1 + 0.8 * fr * (1.0 - fr)));
 	}
 	scatter *= push.sun.w;
-	imageStore(aux_out, q, vec4(isnan(scatter) ? 0.0 : clamp(scatter, 0.0, 4.0), min(vz, 2e3), 0, 1));
+	imageStore(aux_out, q, vec4((isnan(scatter) || isinf(scatter)) ? 0.0 : clamp(scatter, 0.0, 4.0),
+	                            (isnan(vz) || isinf(vz)) ? 2e3 : clamp(vz, 0.01, 2e3), 0, 1));
 }
 
-bool SameDepth(float a, float b, float tol) { return abs(a - b) < tol * max(b, 1.0); }
+bool  SameDepth(float a, float b, float tol) { return abs(a - b) < tol * max(b, 1.0); }
+bool  Bad(float x) { return isnan(x) || isinf(x); }
+float Fin(float x, float lo, float hi) { return Bad(x) ? lo : clamp(x, lo, hi); }
+// A volume texel, sanitized: (scatter 0..4, |view z| 0.01..2e3, history length 0..64); a bad depth is "far".
+vec4  VolTexel(sampler2D t, ivec2 q) {
+	vec4 v = texelFetch(t, q, 0);
+	return vec4(Fin(v.x, 0.0, 4.0), Bad(v.y) ? 2e3 : clamp(v.y, 0.01, 2e3), Fin(v.z, 0.0, 64.0), 1.0);
+}
 
 void Temporal(ivec2 q) {
 	vec2 qs = push.extra.xy;
 	if (q.x >= int(qs.x) || q.y >= int(qs.y)) return;
 	ivec2 qm = ivec2(qs) - 1;
-	vec2  c0 = texelFetch(aux_tex, q, 0).rg;
+	vec4  c0 = VolTexel(aux_tex, q);
 	float vz = c0.y;
-	// The raw neighbourhood (depth-aware moments).
+	bool  sky = vz >= 1999.0;
+	// The raw neighbourhood (depth-aware moments; the centre always counts).
 	float m1 = 0.0, m2 = 0.0, wn = 0.0;
 	for (int y = -1; y <= 1; ++y)
 		for (int x = -1; x <= 1; ++x) {
-			vec2 t = texelFetch(aux_tex, clamp(q + ivec2(x, y), ivec2(0), qm), 0).rg;
-			if (!SameDepth(t.y, vz, 0.15)) continue;
+			vec4 t = VolTexel(aux_tex, clamp(q + ivec2(x, y), ivec2(0), qm));
+			if (!(x == 0 && y == 0) && !SameDepth(t.y, vz, 0.2)) continue;
 			m1 += t.x, m2 += t.x * t.x, wn += 1.0;
 		}
-	m1 /= wn, m2 /= wn; // (wn >= 1: the centre)
+	m1 /= max(wn, 1.0), m2 /= max(wn, 1.0);
 	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
 	float cur = c0.x;
-	float acc = cur, n = 1.0;
+	// (no or rejected history: the neighbourhood's mean, less noisy than one sample)
+	float acc = m1, n = 1.0;
 	if (push.motion.z > 0.0) {
-		vec2  uv  = (vec2(q) + 0.5) / qs;
-		vec2  mv  = textureLod(motion_tex, uv, 0).xy * push.motion.xy; // (render pixels)
-		vec2  pq  = (uv + mv / RenderSize()) * qs - 0.5;
-		ivec2 p0  = ivec2(floor(pq));
-		vec2  f   = pq - vec2(p0);
+		vec2 uv = (vec2(q) + 0.5) / qs;
+		vec2 mv = textureLod(motion_tex, uv, 0).xy * push.motion.xy; // (render pixels)
+		// (an invalid motion vector: NaN, or more than a screen: no history)
+		bool mv_ok = !(Bad(mv.x) || Bad(mv.y)) && all(lessThan(abs(mv), RenderSize()));
+		vec2 pq = mv_ok ? (uv + mv / RenderSize()) * qs - 0.5 : vec2(-10.0);
 		float hs = 0.0, hn = 0.0, hw = 0.0;
-		for (int k = 0; k < 4; ++k) {
-			ivec2 o  = ivec2(k & 1, k >> 1);
-			ivec2 pp = p0 + o;
-			if (any(lessThan(pp, ivec2(0))) || any(greaterThan(pp, qm))) continue;
-			vec4  h  = texelFetch(vol_hist, pp, 0);
-			float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
-			if (isnan(h.x) || !SameDepth(h.y, vz, 0.1)) continue;
-			hs += h.x * bw, hn += h.z * bw, hw += bw;
+		if (mv_ok && all(greaterThan(pq, vec2(-1.0))) && all(lessThan(pq, qs))) {
+			ivec2 p0 = ivec2(floor(pq));
+			vec2  f  = clamp(pq - vec2(p0), 0.0, 1.0);
+			for (int k = 0; k < 4; ++k) {
+				ivec2 o  = ivec2(k & 1, k >> 1);
+				ivec2 pp = p0 + o;
+				if (any(lessThan(pp, ivec2(0))) || any(greaterThan(pp, qm))) continue;
+				vec4  h  = VolTexel(vol_hist, pp);
+				float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+				// (a length below 1 is a texel never written: no history)
+				if (h.z < 0.5 || !SameDepth(h.y, vz, 0.2)) continue;
+				hs += h.x * bw, hn += h.z * bw, hw += bw;
+			}
 		}
 		if (hw > 0.3) {
 			float h  = hs / hw;
-			float hl = hn / hw;
 			// Still = the camera and this pixel: the history may grow long (more in dark pixels, where the tonemap
-			// shows the noise most); moving: ~10 frames, as before.
+			// shows the noise most); moving: ~10 frames, as before. The sky (no motion of its own): short.
 			float mpix  = length(mv);
 			float still = 1.0 - smoothstep(0.1, 1.5, mpix);
 			float e     = GameExposure();
 			float dark  = 1.0 - smoothstep(0.03, 0.3, Luma(Safe(textureLod(color_tex, uv, 0).rgb)) * e);
-			float nmax  = mix(10.0, mix(20.0, 32.0, dark), still);
+			float nmax  = sky ? 6.0 : mix(10.0, mix(20.0, 32.0, dark), still);
 			float k     = mix(1.25, 3.0, still);
-			h  = clamp(h, m1 - k * sigma - 1e-3, m1 + k * sigma + 1e-3);
-			n  = min(hl * hw + 1.0, nmax); // (partly rejected history: shorter)
+			h   = clamp(h, max(m1 - k * sigma, 0.0) - 1e-3, m1 + k * sigma + 1e-3);
+			n   = clamp(hn + 1.0, 1.0, nmax); // (partly rejected history: shorter)
 			acc = mix(h, cur, 1.0 / n);
-		} else {
-			// Disocclusion: start from the neighbourhood's mean (less noisy than one sample).
-			acc = mix(cur, m1, 0.5);
 		}
-	} else {
-		acc = mix(cur, m1, 0.5);
 	}
-	imageStore(vol_out, q, vec4(isnan(acc) ? 0.0 : clamp(acc, 0.0, 4.0), vz, n, 1));
+	imageStore(vol_out, q, vec4(Fin(acc, 0.0, 4.0), vz, n, 1));
 }
 
 void Spatial(ivec2 q) {
 	vec2 qs = push.extra.xy;
 	if (q.x >= int(qs.x) || q.y >= int(qs.y)) return;
 	ivec2 qm = ivec2(qs) - 1;
-	vec4  c  = texelFetch(aux_tex, q, 0);
+	vec4  c  = VolTexel(aux_tex, q);
 	int   st = c.z < 4.0 ? 2 : 1; // (a short history: wider)
-	float s = 0.0, w = 0.0;
+	// (depth only, never the value: bright shafts are blurred like dark fog; 10 % of the depth: grazing floors keep
+	// their neighbours)
+	float s = c.x * 4.0, w = 4.0;
 	for (int y = -1; y <= 1; ++y)
 		for (int x = -1; x <= 1; ++x) {
-			vec2  t  = texelFetch(aux_tex, clamp(q + ivec2(x, y) * st, ivec2(0), qm), 0).rg;
+			if (x == 0 && y == 0) continue;
+			vec4  t  = VolTexel(aux_tex, clamp(q + ivec2(x, y) * st, ivec2(0), qm));
 			float gw = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
-			float dw = exp(-abs(t.y - c.y) / max(0.04 * c.y, 0.05));
+			float dw = exp(-abs(t.y - c.y) / max(0.1 * c.y, 0.1));
 			s += t.x * gw * dw, w += gw * dw;
 		}
-	imageStore(aux_out, q, vec4(w > 0.0 ? s / w : c.x, c.y, c.z, 1));
+	imageStore(aux_out, q, vec4(Fin(s / w, 0.0, 4.0), c.y, c.z, 1));
 }
 
 void Composite(ivec2 p) {
@@ -405,13 +417,13 @@ void Composite(ivec2 p) {
 	for (int k = 0; k < 4; ++k) {
 		ivec2 o  = ivec2(k & 1, k >> 1);
 		ivec2 qq = clamp(q0 + o, ivec2(0), ivec2(qs) - 1);
-		vec2  v  = texelFetch(vol_hist, qq, 0).rg;
+		vec2  v  = VolTexel(vol_hist, qq).xy;
 		float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
 		float dw = exp(-abs(v.y - vz) / max(0.05 * vz, 0.05));
 		float w  = bw * dw + 1e-4 * bw;
 		vs += v.x * w, ws += w;
 	}
-	float vol = ws > 0.0 ? vs / ws : 0.0;
+	float vol = ws > 0.0 ? Fin(vs / ws, 0.0, 4.0) : 0.0;
 	// (the far backdrop already carries the game's fog: half there)
 	vol *= mix(1.0, 0.5, smoothstep(80.0, 300.0, vz));
 	vec3 add = vol * sunc.rgb * push.size.z * 0.6;
@@ -451,6 +463,8 @@ void Composite(ivec2 p) {
 		float nl = cap * (1.0 - exp(-al / cap)) / (1.0 + 0.5 * bl);
 		add *= nl / al;
 	}
+	// (our light never blackens a pixel: a bad value is dropped, the game's color kept)
+	add = (any(isnan(add)) || any(isinf(add))) ? vec3(0) : max(add, vec3(0));
 	if ((push.misc.z & 2) != 0) c = vec3(0); // (KYTY_GODRAYS_DEBUG=1: our light alone, on black)
 	imageStore(out_img, p, vec4(Safe(c + add / e), 1.0));
 }

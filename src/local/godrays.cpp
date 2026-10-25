@@ -18,6 +18,8 @@
 // fades in / out over ~0.5 s as it crosses the frame edge (+-25 %); at level 1 the shafts go with it.
 // Bajo / Medio (1 / 2): the in-scattering boosted where light is actually visible (the sky mask of the radial march,
 // partly lit view rays = shafts through gaps), halos and the cap raised a little. KYTY_GODRAYS_DEBUG=1: our light only.
+// gr4: every stage sanitized (NaN / Inf -> 0, a bad depth -> far), the history restarted on a gap or never-written
+// texels, invalid motion vectors rejected, the sky's history short, our light never blackens a pixel; boosts lowered.
 // Every 10 s: "GODRAYS: stats" with the GPU ms, the sun on / off screen and the lights used.
 #include "local/godrays.h"
 
@@ -384,6 +386,9 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const float dt = g_gr.last_frame.time_since_epoch().count() == 0
 	                     ? 0.016f
 	                     : std::clamp(std::chrono::duration<float>(now - g_gr.last_frame).count(), 0.0f, 0.1f);
+	// (a gap of more than 0.25 s: menus, loading, frames without the pass: the history is stale, restart it)
+	if (g_gr.last_frame.time_since_epoch().count() != 0 && now - g_gr.last_frame > std::chrono::milliseconds(250))
+		g_gr.history_valid = false;
 	g_gr.last_frame = now;
 	float su = 0.5f, sv = 0.5f, target = 0.0f;
 	if (have_sun) {
@@ -417,7 +422,7 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// (10-25: Bajo / Medio raised a little: 0.10 / 0.18 cap, 0.5 / 0.75 halos, 0.45 / 0.7 sun before)
 	const float cap    = (level >= 3 ? 0.28f : level == 2 ? 0.22f : 0.14f) * strength;
 	const float lstr   = (level >= 3 ? 1.0f : level == 2 ? 0.95f : 0.7f) * strength;
-	const float sstr   = (level >= 3 ? 1.0f : level == 2 ? 0.85f : 0.6f) * strength;
+	const float sstr   = (level >= 3 ? 1.0f : level == 2 ? 0.8f : 0.55f) * strength; // (gr4: 0.85 / 0.6 in gr3: noisy shafts)
 	static const bool debug = [] {
 		const char* v = std::getenv("KYTY_GODRAYS_DEBUG");
 		return v != nullptr && *v == '1';
