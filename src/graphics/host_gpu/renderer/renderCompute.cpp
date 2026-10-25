@@ -1,4 +1,5 @@
 #include "local/skip-shader.h"
+#include "local/rt-local-lights.h"
 #include "local/sync-stats.h"
 #include "common/assert.h"
 #include "live-trace-gpu.h"
@@ -318,22 +319,44 @@ private:
 	static const std::string& Programs() {
 		static const std::string programs = [] {
 			const char* value = std::getenv("KYTY_PROG_TRACE");
-			return value != nullptr ? std::string(value) : std::string();
+			std::string list  = value != nullptr ? std::string(value) : std::string();
+			// (KYTY_RTLS_DEBUG / KYTY_RT_LOCAL_SHADOWS: every dispatch's bindings go to RtLocal::OnDispatch from here,
+			// out of DispatchDirect's own code and its PGO profile)
+			if (RtLocal::Wanted()) list += list.empty() ? "rtls" : ",rtls";
+			return list;
 		}();
 		return programs;
 	}
 	[[gnu::noinline]] void Begin(uint64_t shader_hash, uint64_t indirect_args, const PreparedBindings& bindings,
 	                             BufferCache& cache) {
-		m_on = Programs().find(fmt::format("{:016x}", shader_hash)) != std::string::npos ||
-		       (indirect_args != 0 && Programs().find("indirect") != std::string::npos);
+		m_traced = Programs() != "rtls" && (Programs().find(fmt::format("{:016x}", shader_hash)) != std::string::npos ||
+		                                    (indirect_args != 0 && Programs().find("indirect") != std::string::npos));
+		m_on = m_traced || RtLocal::Wanted();
 		if (!m_on) return;
 		m_shader_hash = shader_hash;
+		if (!m_traced) return;
 		for (const auto& source: bindings.buffer_sources)
 			m_dirty_before.push_back(source.size != 0 && cache.IsRegionCpuModified(source.address, source.size));
 	}
 	[[gnu::noinline]] void PrintLine(const PreparedBindings& bindings, RenderContext& context,
 	                                 const Common::SlotVector<Image>& images, uint32_t groups_x, uint32_t groups_y,
 	                                 uint32_t groups_z, uint64_t indirect_args) const {
+		if (RtLocal::Wanted() && bindings.runtime != nullptr && bindings.runtime->program != nullptr) {
+			const auto& info = bindings.runtime->program->info;
+			std::vector<RtLocal::DispatchBuffer> buffers;
+			std::vector<RtLocal::DispatchImage>  bound;
+			for (size_t i = 0; i < bindings.buffer_sources.size(); ++i)
+				buffers.push_back({bindings.buffer_sources[i].address, bindings.buffer_sources[i].size,
+				                   i < info.buffers.size() && info.buffers[i].written});
+			for (size_t i = 0; i < bindings.images.size(); ++i) {
+				const auto& d = bindings.images[i].desc.info;
+				bound.push_back({d.data.address, d.extent.width, d.extent.height, d.resources.layers,
+				                 d.IsDepth() || d.pixel_format == vk::Format::eR32Sfloat || d.pixel_format == vk::Format::eR16Unorm,
+				                 i < info.images.size() && info.images[i].written});
+			}
+			RtLocal::OnDispatch(m_shader_hash, buffers, bound, bindings.runtime->resources.flattened_srt);
+		}
+		if (!m_traced) return;
 		static std::mutex                             lines_mutex;
 		static std::unordered_map<uint64_t, uint32_t> per_program;
 		static uint32_t                               lines = 0;
@@ -364,6 +387,7 @@ private:
 	}
 
 	bool              m_on          = false;
+	bool              m_traced      = false;
 	uint64_t          m_shader_hash = 0;
 	std::vector<bool> m_dirty_before;
 };

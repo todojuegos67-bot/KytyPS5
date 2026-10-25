@@ -29,6 +29,7 @@
 #include "local/gbuf-view.h"
 #include "local/shine.h"
 #include "local/godrays.h"
+#include "local/rt-local-lights.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
 #include "kernel/memory.h"
 #include <string>
@@ -2079,7 +2080,7 @@ void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt, char path) {
 	g_camera.valid      = true;
 	// (The KYTY_KBM mouse: the camera's yaw, from the forward row.)
 	::Libs::Graphics::HostInputCameraForward(g_camera.view_proj[12], g_camera.view_proj[13], g_camera.view_proj[14]);
-	if (ContactShadowsWanted()) {
+	if (ContactShadowsWanted() || RtLocal::Wanted()) { // (rt-local-lights.cpp reads it too)
 		std::lock_guard lock(g_last_vp_mutex);
 		g_last_vp = g_camera.view_proj, g_have_last_vp = true;
 	}
