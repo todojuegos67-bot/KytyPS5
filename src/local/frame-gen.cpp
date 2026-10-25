@@ -8495,7 +8495,16 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// (KYTY_RT_SUN: the cascades copied lately, their matrices into this frame's slot of the buffer; else nothing yet)
 	const bool sun_mode = RtSunLevel() > 0;
 	const uint32_t sun_slot = g_cs.frame % 4;
-	if (sun_mode && !RtSunPrepare(m, vp, sun_slot)) return said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
+	if (sun_mode && !RtSunPrepare(m, vp, sun_slot)) {
+		// (10-25 godfix: the cascades are copied only on some frames; the latched sun still feeds the god rays and shine in
+		// the meantime, in this frame's view, else they lost the sun 250 ms later and popped off and on.)
+		if (g_cs.latched && g_cs.hyp >= 0 && g_cs.fade > 0.0f) {
+			const auto l_view = ToView(view, g_cs.latch_axis);
+			ShineSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor));
+			GodraysSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor));
+		}
+		return said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
+	}
 	CShadowCamera(view, m);
 	if (g_cs.hyp >= 0 && (CShadowLeft() & (1u << g_cs.hyp)) == 0) {
 		static const char* names[] {"+x", "-x", "+y", "-y", "+z", "-z"};

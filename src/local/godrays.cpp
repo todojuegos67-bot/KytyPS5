@@ -87,6 +87,8 @@ struct {
 	uint32_t                samples = 0;
 	std::array<uint32_t, StatsCount> stat_last {};
 	float                   on_screen = 0.0f; // the smoothed on-screen factor
+	float                   sun_held  = 0.0f; // the smoothed sun weight (10-25: fades instead of popping when the sun goes stale)
+	std::array<float, 3>    sun_dir {};       // the last sun given (view space)
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now(), last_frame {};
 } g_gr;
 
@@ -374,18 +376,22 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}();
 	const float strength = EnvFloat("KYTY_GODRAYS_STRENGTH", 1.0f, 0.0f, 3.0f);
 
-	std::array<float, 3> sun {};
-	float                sun_w = 0.0f;
+	float sun_target = 0.0f;
 	{
 		std::lock_guard lock(g_gr_sun.mutex);
-		if (std::chrono::steady_clock::now() - g_gr_sun.when < std::chrono::milliseconds(250)) sun = g_gr_sun.dir, sun_w = g_gr_sun.weight;
+		if (std::chrono::steady_clock::now() - g_gr_sun.when < std::chrono::milliseconds(250)) g_gr.sun_dir = g_gr_sun.dir, sun_target = g_gr_sun.weight;
 	}
-	const bool have_sun = sun_w > 0.0f;
 	// The sun's uv (a direction: w = z * M[11]) and how far on screen it is; smoothed over ~0.5 s.
 	const auto now = std::chrono::steady_clock::now();
 	const float dt = g_gr.last_frame.time_since_epoch().count() == 0
 	                     ? 0.016f
 	                     : std::clamp(std::chrono::duration<float>(now - g_gr.last_frame).count(), 0.0f, 0.1f);
+	// (10-25: a sun gone stale (no fresh one in 250 ms) fades out over ~0.8 s from the last one given instead of popping off,
+	// and a returning one fades back in over ~0.4 s: short gaps in the RT sun's feed no longer flicker the rays.)
+	g_gr.sun_held = std::clamp(g_gr.sun_held + std::clamp(sun_target - g_gr.sun_held, -dt / 0.8f, dt / 0.4f), 0.0f, 1.0f);
+	const std::array<float, 3> sun   = g_gr.sun_dir;
+	const float                sun_w = g_gr.sun_held;
+	const bool have_sun = sun_w > 0.0f;
 	// (a gap of more than 0.25 s: menus, loading, frames without the pass: the history is stale, restart it)
 	if (g_gr.last_frame.time_since_epoch().count() != 0 && now - g_gr.last_frame > std::chrono::milliseconds(250))
 		g_gr.history_valid = false;
