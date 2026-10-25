@@ -552,3 +552,24 @@ GPU 碰撞只给脚部 IK：`GpuCollisionManager::CastRay` 全镜像唯一调用
   up to the idle share of the 5 GiB of images), RAM -1..3 GB (offload, pipelines, freed guest pages). More than that
   is the game's live data: not returnable without paging it out. Verify with "RAM flush #N" (PC: RAM in use / commit
   before -> after) and "RAM census" lines.
+
+## 2026-10-25 shadows-1025 — local-light / shadow-map quality (non-sun)
+- Evidence (today's logs 091911 / 130923 / 134203 / 172949, build c3e58bd): the 1024x1024x80 D32 spot pool renders 5-14 layers a
+  frame (binds 300+ at the lamps), "layers refreshed from guest memory" only equal the sampled streamer layers (kept 0 /
+  changed 0: no GPU-rendered layer was dirtied, KYTY_SHADOW_REFRESH_FIX never had to act); no "RTLS:" line in any log: the
+  RT local-shadow light-list discovery (KYTY_RTLS_DEBUG, rtlocal step 1) has not been run yet, so step 2 (per-pixel rays to
+  the N nearest lights) stays blocked on that proof.
+- The game has no convar for the shadow filter, penumbra, spot resolution or distance (eboot strings + the shipped
+  coredata/enginesupport/debugmenu/debugrendermenulighting.txt): the shadow convars are the launcher's sun cascades,
+  r_enableSpotShadows, r_contactShadows{Enabled,Distance,Thickness,Softness} (0..1 each) and the ambient (capsule)
+  shadowing: r_ambientShadowMinAmbient / MinDirectional (0..1), ConeAngle (1..89), RadiusToFadeRange (5..50),
+  RadiusToFadeRangePow (0.1..4), r_enableAmbientShadowingLocalLightSource (one local light's capsule shadows). The
+  console's renderconfig_ps5_{high,perf}.txt only set r_virtualGeometryNumShadowCascades=2.
+- KYTY_SHADOW_FILTER=1|2|3 (spirvEmitterImage.cpp): every depth-compare sample / gather of a non-cube 2D-array shadow map
+  widened at translation (4-tap rotated grid / 9-tap Poisson / PCSS: 8-tap blocker search + 12 taps at the penumbra;
+  KYTY_SHADOW_FILTER_RADIUS, _SCALE (1000), _MAX (7)). Default 0: SPIR-V unchanged. A level changes the SPIR-V of the
+  shaders reading shadow maps: their pipelines compile at first use (fast build or a stall with KYTY_PIPELINE_FAST_BUILD=0).
+- KYTY_GTAO_FLOOR (0.3..0.95, 0.7): the GTAO composite's darkest multiplier ("profundidad").
+- Not done, with the reason: shadow-atlas upscale (no render-target scaling in the emulator; the cube pool is written as
+  an R32 storage image with integer coordinates; the spot pool's per-layer guest hashes assume the guest layout);
+  local-light contact shadows (need the light positions: step 1's proof).

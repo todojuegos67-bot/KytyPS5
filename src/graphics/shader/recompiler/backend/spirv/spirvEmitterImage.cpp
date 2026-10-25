@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -209,6 +212,230 @@ uint32_t CubeLayer(EmitterState& state, uint32_t value) {
 	const auto host   = Binary(state, OpISub, TypeU32(state), guest, padding);
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction({OpConvertUToF, TypeF32(state), result, host});
+	return result;
+}
+
+// KYTY_SHADOW_FILTER=0|1|2|3 (shadows-1025, "Sombras: calidad"): the game's shadow maps (Demon's Souls: the 1024x1024x80
+// spot pool, the sun cascades; D32 2D arrays) are read with hardware depth-compare samples (image_sample_c* on a linear
+// compare sampler: one bilinear 2x2 PCF tap) and depth-compare gathers. The game has no convar for the filter or the
+// penumbra (its convars: eboot strings, coredata/enginesupport/debugmenu/debugrendermenulighting.txt), so the filter is
+// widened here, at translation, for every depth-compare read of a non-cube 2D array:
+//   1: 4 taps on a rotated grid (a ~4x4 texel tent: no stair-stepping, 1 texel softer); dref gathers average 3
+//   2: 9 taps (centre + 8 Poisson, radius 2.5 texels); dref gathers average 5 (the 4 diagonal neighbours)
+//   3: PCSS (Fernando 2005): a blocker search of 8 taps at 6 texels (texel-centred compare samples + fetches of the
+//      depth: compare-op agnostic, no reverse-Z assumption), the penumbra = clamp(mean |dref - blocker| x
+//      KYTY_SHADOW_FILTER_SCALE (1000; depth-map units differ: a perspective spot's NDC depth moves ~0.002-0.01 over a
+//      0.5 m gap, a sun cascade's ~0.005), 1, KYTY_SHADOW_FILTER_MAX (7)) texels, then 12 Poisson taps at that radius:
+//      contact hardening (a hard edge at the occluder's base, softer with the distance); gathers as 2
+// The result stays a compare value in [0, 1] averaged over taps: the shader's own PCF / weights apply on top.
+// KYTY_SHADOW_FILTER_RADIUS scales every radius (1.0). Default 0: the SPIR-V is unchanged (a shader translated with
+// another level is another pipeline: its first use compiles, as any new pipeline). Cost: the extra taps run only in
+// the shaders that read shadow maps (the deferred lighting), 4x / 9x / (8 + 8 fetches + 12)x their compare samples.
+float ShadowFilterEnv(const char* name, float fallback, float low, float high) {
+	const char* value = std::getenv(name);
+	if (value == nullptr || value[0] == '\0') return fallback;
+	const float parsed = static_cast<float>(std::atof(value));
+	return std::clamp(parsed == 0.0f && value[0] != '0' ? fallback : parsed, low, high);
+}
+int ShadowFilterLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_SHADOW_FILTER");
+		if (value == nullptr || value[0] == '\0') return 0;
+		const int parsed = std::clamp(std::atoi(value), 0, 3);
+		if (parsed > 0) {
+			std::printf("Shadow filter: KYTY_SHADOW_FILTER=%d: depth-compare reads of 2D-array shadow maps widened at translation "
+			            "(%s; radius x%g, PCSS scale %g, max %g texels)\n",
+			            parsed, parsed == 1 ? "4-tap rotated grid" : parsed == 2 ? "9-tap Poisson" : "PCSS: 8-tap blocker search + 12-tap Poisson",
+			            ShadowFilterEnv("KYTY_SHADOW_FILTER_RADIUS", 1.0f, 0.25f, 4.0f),
+			            ShadowFilterEnv("KYTY_SHADOW_FILTER_SCALE", 1000.0f, 1.0f, 100000.0f),
+			            ShadowFilterEnv("KYTY_SHADOW_FILTER_MAX", 7.0f, 1.0f, 16.0f));
+			std::fflush(stdout);
+		}
+		return parsed;
+	}();
+	return level;
+}
+float ShadowFilterRadius() {
+	static const float radius = ShadowFilterEnv("KYTY_SHADOW_FILTER_RADIUS", 1.0f, 0.25f, 4.0f);
+	return radius;
+}
+float ShadowFilterScale() {
+	static const float scale = ShadowFilterEnv("KYTY_SHADOW_FILTER_SCALE", 1000.0f, 1.0f, 100000.0f);
+	return scale;
+}
+float ShadowFilterMax() {
+	static const float max_texels = ShadowFilterEnv("KYTY_SHADOW_FILTER_MAX", 7.0f, 1.0f, 16.0f);
+	return max_texels;
+}
+const uint32_t ImageOperandsConstOffsetMask = 0x00000008u;
+
+// The depth-compare sample `opcode` (dref sample, explicit or implicit LOD; `operand_mask` / `operands` its image
+// operands) of `sampled` at `coord` (vec3: x, y, layer) against `dref`, widened per ShadowFilterLevel(); `image` is the
+// descriptor (OpTypeImage) for the size query and the blocker fetches. Returns the averaged compare value (f32).
+uint32_t EmitWideDrefSample(EmitterState& state, uint32_t image, uint32_t sampled, uint32_t coord, uint32_t dref,
+                            uint32_t opcode, uint32_t operand_mask, const std::vector<uint32_t>& operands) {
+	const int level = ShadowFilterLevel();
+	auto&     b     = state.builder;
+	const auto f32  = TypeF32(state);
+	const auto vec3 = TypeF32Vector(state, 3);
+	state.builder.RequireCapability(CapabilityImageQuery);
+	// Texel size from the image.
+	const auto size_u = b.AllocateId();
+	b.AddFunction({OpImageQuerySizeLod, TypeU32Vector(state, 3), size_u, image, ConstantU32(state, 0)});
+	const auto size_f = b.AllocateId();
+	b.AddFunction({OpConvertUToF, vec3, size_f, size_u});
+	const auto size_w = b.AllocateId();
+	b.AddFunction({OpCompositeExtract, f32, size_w, size_f, 0});
+	const auto size_h = b.AllocateId();
+	b.AddFunction({OpCompositeExtract, f32, size_h, size_f, 1});
+	const auto one     = ConstantF32Value(state, 1.0f);
+	const auto texel_w = Binary(state, OpFDiv, f32, one, size_w);
+	const auto texel_h = Binary(state, OpFDiv, f32, one, size_h);
+	const auto x = b.AllocateId();
+	b.AddFunction({OpCompositeExtract, f32, x, coord, 0});
+	const auto y = b.AllocateId();
+	b.AddFunction({OpCompositeExtract, f32, y, coord, 1});
+	const auto layer = b.AllocateId();
+	b.AddFunction({OpCompositeExtract, f32, layer, coord, 2});
+
+	// One compare sample at (x + ox * radius, y + oy * radius) texels; `radius` an id (texels) or 0 for 1 texel.
+	const auto Tap = [&](float ox, float oy, uint32_t radius) {
+		auto dx = ConstantF32Value(state, ox);
+		auto dy = ConstantF32Value(state, oy);
+		if (radius != 0) {
+			dx = Binary(state, OpFMul, f32, dx, radius);
+			dy = Binary(state, OpFMul, f32, dy, radius);
+		}
+		const auto tx = Binary(state, OpFAdd, f32, x, Binary(state, OpFMul, f32, dx, texel_w));
+		const auto ty = Binary(state, OpFAdd, f32, y, Binary(state, OpFMul, f32, dy, texel_h));
+		const auto c  = b.AllocateId();
+		b.AddFunction({OpCompositeConstruct, vec3, c, tx, ty, layer});
+		const auto            sample = b.AllocateId();
+		std::vector<uint32_t> words {opcode, f32, sample, sampled, c, dref};
+		if (operand_mask != 0u) {
+			words.push_back(operand_mask);
+			words.insert(words.end(), operands.begin(), operands.end());
+		}
+		b.AddFunction(words);
+		return sample;
+	};
+	const auto Average = [&](const std::vector<uint32_t>& taps) {
+		uint32_t sum = taps[0];
+		for (size_t i = 1; i < taps.size(); ++i) sum = Binary(state, OpFAdd, f32, sum, taps[i]);
+		return Binary(state, OpFMul, f32, sum, ConstantF32Value(state, 1.0f / static_cast<float>(taps.size())));
+	};
+	const float r = ShadowFilterRadius();
+	if (level == 1) {
+		// A rotated grid: four bilinear taps covering a 4x4 texel tent.
+		return Average({Tap(-1.5f * r, 0.5f * r, 0), Tap(0.5f * r, 1.5f * r, 0), Tap(1.5f * r, -0.5f * r, 0),
+		                Tap(-0.5f * r, -1.5f * r, 0)});
+	}
+	// Poisson disc (unit radius), 8 and 12 points.
+	static const float poisson8[8][2]   = {{-0.613f, 0.617f}, {0.170f, 0.963f},  {0.955f, 0.251f},  {0.591f, -0.692f},
+	                                       {-0.137f, -0.874f}, {-0.887f, -0.246f}, {0.286f, 0.297f}, {-0.329f, -0.199f}};
+	static const float poisson12[12][2] = {{-0.326f, -0.406f}, {-0.840f, -0.074f}, {-0.696f, 0.457f}, {-0.203f, 0.621f},
+	                                       {0.962f, -0.195f},  {0.473f, -0.480f},  {0.519f, 0.767f},  {0.185f, -0.893f},
+	                                       {0.507f, 0.064f},   {0.896f, 0.412f},   {-0.322f, -0.933f}, {-0.792f, -0.598f}};
+	if (level == 2) {
+		std::vector<uint32_t> taps {Tap(0.0f, 0.0f, 0)};
+		for (const auto& p: poisson8) taps.push_back(Tap(p[0] * 2.5f * r, p[1] * 2.5f * r, 0));
+		return Average(taps);
+	}
+	// Level 3, PCSS. Blocker search: compare samples snapped to texel centres (the bilinear PCF degenerates to the
+	// texel's own compare: 0 or 1), the texel's depth fetched; a blocker is a tap failing the compare.
+	const auto half   = ConstantF32Value(state, 0.5f);
+	const auto zero   = ConstantF32Value(state, 0.0f);
+	const auto layer_i = b.AllocateId();
+	b.AddFunction({OpConvertFToS, TypeI32(state), layer_i, Binary(state, OpFAdd, f32, layer, half)});
+	const auto max_x = Binary(state, OpFSub, f32, size_w, one);
+	const auto max_y = Binary(state, OpFSub, f32, size_h, one);
+	uint32_t   dist_sum  = zero;
+	uint32_t   block_sum = zero;
+	const float search = 6.0f * r;
+	for (const auto& p: poisson8) {
+		// Texel (integer) of the tap, clamped into the image.
+		const auto fx = Binary(state, OpFAdd, f32, Binary(state, OpFMul, f32, x, size_w), ConstantF32Value(state, p[0] * search));
+		const auto fy = Binary(state, OpFAdd, f32, Binary(state, OpFMul, f32, y, size_h), ConstantF32Value(state, p[1] * search));
+		const auto floor_x = b.AllocateId();
+		b.AddFunction({OpExtInst, f32, floor_x, GlslStd450(state), GlslFloor, fx});
+		const auto floor_y = b.AllocateId();
+		b.AddFunction({OpExtInst, f32, floor_y, GlslStd450(state), GlslFloor, fy});
+		const auto cx = b.AllocateId();
+		b.AddFunction({OpExtInst, f32, cx, GlslStd450(state), GlslFClamp, floor_x, zero, max_x});
+		const auto cy = b.AllocateId();
+		b.AddFunction({OpExtInst, f32, cy, GlslStd450(state), GlslFClamp, floor_y, zero, max_y});
+		// The compare at the texel centre.
+		const auto ux = Binary(state, OpFMul, f32, Binary(state, OpFAdd, f32, cx, half), texel_w);
+		const auto uy = Binary(state, OpFMul, f32, Binary(state, OpFAdd, f32, cy, half), texel_h);
+		const auto c  = b.AllocateId();
+		b.AddFunction({OpCompositeConstruct, vec3, c, ux, uy, layer});
+		const auto            cmp = b.AllocateId();
+		std::vector<uint32_t> words {opcode, f32, cmp, sampled, c, dref};
+		if (operand_mask != 0u) {
+			words.push_back(operand_mask);
+			words.insert(words.end(), operands.begin(), operands.end());
+		}
+		b.AddFunction(words);
+		// The texel's depth.
+		const auto ix = b.AllocateId();
+		b.AddFunction({OpConvertFToS, TypeI32(state), ix, cx});
+		const auto iy = b.AllocateId();
+		b.AddFunction({OpConvertFToS, TypeI32(state), iy, cy});
+		const auto ic = b.AllocateId();
+		b.AddFunction({OpCompositeConstruct, TypeI32Vector(state, 3), ic, ix, iy, layer_i});
+		const auto fetched = b.AllocateId();
+		b.AddFunction({OpImageFetch, TypeF32Vector(state, 4), fetched, image, ic, ImageOperandsLodMask, ConstantU32(state, 0)});
+		const auto depth = b.AllocateId();
+		b.AddFunction({OpCompositeExtract, f32, depth, fetched, 0});
+		const auto diff = b.AllocateId();
+		b.AddFunction({OpExtInst, f32, diff, GlslStd450(state), GlslFAbs, Binary(state, OpFSub, f32, dref, depth)});
+		// blocker = 1 - cmp (cmp is 0 or 1 at a texel centre).
+		const auto blocker = Binary(state, OpFSub, f32, one, cmp);
+		block_sum          = Binary(state, OpFAdd, f32, block_sum, blocker);
+		dist_sum           = Binary(state, OpFAdd, f32, dist_sum, Binary(state, OpFMul, f32, blocker, diff));
+	}
+	// Penumbra in texels: mean blocker distance x scale, clamped to [1, 7] (no blockers: 1 texel: a hard, lit edge).
+	const auto mean = Binary(state, OpFDiv, f32, dist_sum,
+	                         Binary(state, OpFAdd, f32, block_sum, ConstantF32Value(state, 1e-4f)));
+	const auto scaled  = Binary(state, OpFMul, f32, mean, ConstantF32Value(state, ShadowFilterScale()));
+	const auto radius  = b.AllocateId();
+	b.AddFunction({OpExtInst, f32, radius, GlslStd450(state), GlslFClamp, scaled, ConstantF32Value(state, 1.0f * r),
+	               ConstantF32Value(state, ShadowFilterMax() * r)});
+	std::vector<uint32_t> taps;
+	for (const auto& p: poisson12) taps.push_back(Tap(p[0], p[1], radius));
+	return Average(taps);
+}
+
+// A depth-compare gather widened per ShadowFilterLevel(): the gather averaged with its copies at constant diagonal
+// offsets (each component stays a compare value). `words` is the gather instruction without image operands.
+uint32_t EmitWideDrefGather(EmitterState& state, std::vector<uint32_t> words) {
+	const int  level = ShadowFilterLevel();
+	auto&      b     = state.builder;
+	const auto vec4  = TypeF32Vector(state, 4);
+	const auto ivec2 = TypeI32Vector(state, 2);
+	std::vector<uint32_t> results;
+	auto Gather = [&](int ox, int oy) {
+		auto copy = words;
+		copy[2]   = b.AllocateId();
+		if (ox != 0 || oy != 0) {
+			copy.push_back(ImageOperandsConstOffsetMask);
+			copy.push_back(b.Constant(OpConstantComposite, ivec2, {ConstantI32(state, ox), ConstantI32(state, oy)}));
+		}
+		b.AddFunction(copy);
+		results.push_back(copy[2]);
+	};
+	Gather(0, 0);
+	Gather(1, 1);
+	Gather(-1, -1);
+	if (level >= 2) {
+		Gather(1, -1);
+		Gather(-1, 1);
+	}
+	uint32_t sum = results[0];
+	for (size_t i = 1; i < results.size(); ++i) sum = Binary(state, OpFAdd, vec4, sum, results[i]);
+	const auto scale  = ConstantF32Value(state, 1.0f / static_cast<float>(results.size()));
+	const auto result = b.AllocateId();
+	b.AddFunction({OpVectorTimesScalar, vec4, result, sum, scale});
 	return result;
 }
 
@@ -771,7 +998,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				return true;
 			}
 			const auto            sampled = MakeSampledImage(state, mem.resource, mem.sampler);
-			const auto            sample  = state.builder.AllocateId();
+			uint32_t              sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words;
 			if (dref) {
 				auto dref_value = ZeroF32(state);
@@ -789,6 +1016,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				         sample,        sampled,
 				         coord,         ConstantU32(state, component)};
 			}
+			const bool wide_gather = dref && ShadowFilterLevel() > 0 && dimension == ImageDimension::Dim2DArray &&
+			                         !image.cube && !HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal) &&
+			                         layout.offset == NoImageComponent;
 			if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
 				words.push_back(ImageOperandsConstOffsetsMask);
 				words.push_back(HorizontalOffsets(state, dimension));
@@ -796,7 +1026,12 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				words.push_back(ImageOperandsOffsetMask);
 				words.push_back(PackedOffset(ctx, mem, *address, layout, dimension));
 			}
-			state.builder.AddFunction(words);
+			if (wide_gather) {
+				// (KYTY_SHADOW_FILTER: the depth-compare gather averaged with offset copies, EmitWideDrefGather.)
+				sample = EmitWideDrefGather(state, words);
+			} else {
+				state.builder.AddFunction(words);
+			}
 			auto result_numeric_class = numeric_class;
 			if (dref) {
 				result_numeric_class = Prospero::TextureNumericClass::Float;
@@ -843,9 +1078,10 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operand_mask |= ImageOperandsBiasMask;
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
+		const bool wide_dref = dref && ShadowFilterLevel() > 0 && dimension == ImageDimension::Dim2DArray && !image.cube;
 		const auto EmitSample = [&](uint32_t resource) {
 			const auto            sampled = MakeSampledImage(state, resource, mem.sampler);
-			const auto            sample  = state.builder.AllocateId();
+			uint32_t              sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
 			if (dref) {
 				words.push_back(dref_value);
@@ -854,7 +1090,13 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				words.push_back(operand_mask);
 				words.insert(words.end(), operands.begin(), operands.end());
 			}
-			state.builder.AddFunction(words);
+			if (wide_dref) {
+				// (KYTY_SHADOW_FILTER: wider PCF / PCSS over the shadow map, EmitWideDrefSample.)
+				sample = EmitWideDrefSample(state, LoadSampledImageDescriptor(state, resource), sampled, coord,
+				                            dref_value, opcode, operand_mask, operands);
+			} else {
+				state.builder.AddFunction(words);
+			}
 			if (!explicit_lod && (dimension == ImageDimension::Dim2D || dimension == ImageDimension::Dim2DArray)) {
 				const auto stats_coord = CoordF32(ctx, mem, *address, layout.coord, 2);
 				const auto bias = layout.bias != NoImageComponent ? AddressF32(ctx, mem, *address, layout.bias) : 0u;

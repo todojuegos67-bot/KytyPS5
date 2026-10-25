@@ -80,7 +80,7 @@ layout(push_constant) uniform Push {
 	vec4  motion;    // motion_scale.xy, render size.xy
 	vec4  trace;     // trace size.xy, strength, radius (view units, metres)
 	ivec4 misc;      // mode, frame index, level, flags (bit0 reset, bit1 history valid)
-	vec4  extra;     // a-trous step, bent strength, thickness (m), max screen radius (fraction of the height)
+	vec4  extra;     // a-trous step (composite: the floor, KYTY_GTAO_FLOOR), bent strength, thickness (m), max screen radius (fraction of the height)
 	vec4  rot[2];    // world -> view rotation rows 0 and 1 packed (r00 r01 r02 r10, r11 r12 r20 r21) and r22 in misc.w
                      // via the flags: misc.w bit 2 G-buffer normal, bit 3 y flip; row 2 = cross(row 0, row 1) * (bit 4 ? -1 : 1)
                      // (128 bytes: the guaranteed push constant size)
@@ -613,7 +613,9 @@ void Composite(ivec2 pixel) {
 	// emissive, so it gets a third of the effect; dark (ambient-dominated) ones the full amount. Floored at 0.7.
 	float l   = Luma(col.rgb);
 	float amb = 1.0 - smoothstep(0.05, 0.6, l);
-	float k   = max(mix(1.0, ao, push.trace.z * fade * mix(0.35, 1.0, amb)), 0.7);
+	// (shadows-1025) The floor: KYTY_GTAO_FLOOR in extra.x for this mode (0.7 when unset).
+	float floor_k = push.extra.x > 0.0 ? push.extra.x : 0.7;
+	float k   = max(mix(1.0, ao, push.trace.z * fade * mix(0.35, 1.0, amb)), floor_k);
 	// Optional bent multiplier: the remaining occlusion only where the pixel is dark (ambient-dominated).
 	k *= mix(1.0, ao, push.extra.y * amb * fade * 0.5);
 	// Multiply only, in the input's own space: k in [0, 1], the result never above the input (no lift, no max(0)
