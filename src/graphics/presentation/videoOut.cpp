@@ -28,8 +28,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <list>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -217,11 +219,15 @@ public:
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip(uint32_t micros);
+	// astro-perf-1025 (KYTY_FLIP_WHEN_READY): whether the next flip group is ready to present, waiting up to
+	// `micros` for one to become ready.
+	bool WaitForReadyFlip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
+	bool ReadyLocked() const;
 
 	struct Request {
 		uint64_t                    id;
@@ -859,10 +865,47 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 
+	// astro-perf-1025 (ported to wolverine-turbo2-1025): KYTY_FLIP_WHEN_READY=1 ("Play Wolverine TURBO.bat" vrr; for a VRR display): a flip that
+	// becomes ready between two vblanks is presented then, instead of at the next vblank, when the last present
+	// was at least a vblank period ago (so never more than the vblank rate). Under 60 fps the frames then reach
+	// the screen at the game's own cadence (e.g. every 21 ms) instead of a mix of 16.7 and 33.3 ms. The vblank
+	// events keep their own 60 Hz ticks; a flip rate above 0 (30 fps games) keeps flipping at vblanks.
+	static const bool flip_when_ready = [] {
+		const char* value = std::getenv("KYTY_FLIP_WHEN_READY");
+		const bool  on    = value != nullptr && *value != '\0' && std::string_view(value) != "0";
+		if (on) {
+			Log::WriteToConsoleAndLog("Flip when ready: on (KYTY_FLIP_WHEN_READY; presents between vblanks)\n");
+		}
+		return on;
+	}();
+	uint64_t last_present = 0;
+
 	int64_t total_wait = 0;
 	while (!token.stop_requested()) {
+		const auto refresh     = std::max(Config::GetVblankFrequency(), 1u);
+		const auto period      = std::max(frequency / refresh, uint64_t {1});
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
-		if (total_wait > 0) {
+		bool       early       = false;
+		if (total_wait > 0 && flip_when_ready && !m_presenter.IsGuestPaused()) {
+			// Wait for the vblank in steps of at most 1 ms, presenting a ready flip early.
+			for (;;) {
+				const auto now     = Common::Timer::QueryPerformanceCounter();
+				const auto elapsed = static_cast<int64_t>(now - sleep_begin);
+				if (elapsed >= total_wait || token.stop_requested()) {
+					break;
+				}
+				const auto remaining_us = static_cast<uint64_t>(total_wait - elapsed) * 1000000u / frequency;
+				const auto step_us      = static_cast<uint32_t>(std::clamp<uint64_t>(remaining_us, 1, 1000));
+				if (last_present != 0 && now - last_present >= period) {
+					if (m_flip_queue.WaitForReadyFlip(step_us)) {
+						early = true;
+						break;
+					}
+				} else {
+					Common::Thread::SleepMicro(step_us);
+				}
+			}
+		} else if (total_wait > 0) {
 			const auto remaining_us =
 			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
 			Common::Thread::SleepMicro(static_cast<uint32_t>(
@@ -874,8 +917,17 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
 		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
 
-		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
-		const auto period  = std::max(frequency / refresh, uint64_t {1});
+		if (early) {
+			// Between vblanks: only the flip (no vblank events). A flip refused there (a flip rate) waits for the
+			// next vblank: last_present is pushed so the loop does not retry it every millisecond.
+			if (m_flip_queue.Flip(0)) {
+				last_present = Common::Timer::QueryPerformanceCounter();
+			} else {
+				last_present = frame_begin;
+			}
+			total_wait -= static_cast<int64_t>(Common::Timer::QueryPerformanceCounter() - frame_begin);
+			continue;
+		}
 
 		if (m_presenter.IsGuestPaused()) {
 			(void)m_presenter.PresentLastFrame();
@@ -887,6 +939,9 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
+		if (presented) {
+			last_present = Common::Timer::QueryPerformanceCounter();
+		}
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (m_presenter.PresentLastFrame()) {
 				presented = true;
@@ -1231,6 +1286,34 @@ static void NoteFrameStats() {
 	std::fflush(stdout);
 	intervals.clear();
 	window = now;
+}
+
+bool FlipQueue::ReadyLocked() const {
+	if (m_processing) {
+		return false;
+	}
+	const auto owner = std::find_if(m_requests.begin(), m_requests.end(),
+	                               [](const auto& r) { return r.group == r.id; });
+	if (owner == m_requests.end()) {
+		return false;
+	}
+	const uint64_t group = owner->id;
+	return std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(),
+	                    [group](const auto& r) { return r.group == group; }) &&
+	       std::none_of(m_requests.begin(), m_requests.end(), [group](const auto& r) {
+		       return r.group == group && r.state != RequestState::Ready;
+	       });
+}
+
+bool FlipQueue::WaitForReadyFlip(uint32_t micros) {
+	m_mutex.Lock();
+	bool ready = ReadyLocked();
+	if (!ready && micros != 0) {
+		m_submit_cond_var.WaitFor(&m_mutex, micros);
+		ready = ReadyLocked();
+	}
+	m_mutex.Unlock();
+	return ready;
 }
 
 bool FlipQueue::Flip(uint32_t micros) {
