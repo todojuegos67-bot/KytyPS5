@@ -76,6 +76,9 @@ struct FrameInputs {
 	vk::ImageView hudless_display_view = nullptr;
 	bool          has_hudless_display  = false;
 	bool          valid       = false;
+	// The game started its upscaler's history again in this frame (a camera cut: NoteCut): no frame is generated across
+	// it, which would blend the two views (chenxiao07 3e1e3250, issue #174).
+	bool          cut         = false;
 	uint32_t      reflex_index = 0; // 10-23: DLSS-G's Reflex frame index, begun at the guest frame's start (0: none)
 };
 
@@ -139,6 +142,9 @@ void SetStaticRect(float x0, float y0, float x1, float y1);
 // loading screen; with or without frame generation, by the normal or the table way. The guest flip takes it
 // (Presenter::PrepareFrame): above 60 Hz the other frames keep 60 (videoOut.cpp).
 void NoteScene();
+// The guest frame's upscale (PS5 Pro path) starts a new history (the game's reset flag: a camera cut). DLSS-G resets
+// its history at the next present; FSR 3 generates no frame for it (FrameInputs::cut).
+void NoteCut();
 [[nodiscard]] bool TakeScene();
 // 10-23: the guest flip on the render thread (Presenter::PrepareFrame): DLSS-G's Reflex markers for the frame that ends
 // (render submit end; its index into `fg`) and the next (Reflex sleep, simulation, render submit start).

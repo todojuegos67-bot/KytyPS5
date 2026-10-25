@@ -410,6 +410,7 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 	inputs.motion_scale_x = Word(packet, MotionScaleWord);
 	inputs.motion_scale_y = Word(packet, MotionScaleWord + 1);
 	inputs.reset          = reinterpret_cast<const uint8_t*>(packet.parameters)[ResetByte] != 0;
+	if (inputs.reset) FrameGen::NoteCut(); // (frame generation does not blend across a camera cut; chenxiao07 3e1e3250)
 	for (uint32_t i = 0; i < 16; i++) inputs.view_to_clip[i] = Word(packet, ViewToClipWord + i);
 	inputs.near_plane = Word(packet, NearWord);
 	inputs.far_plane  = Word(packet, FarWord);

@@ -1175,7 +1175,8 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 		return;
 	}
 
-	const bool generate = usable && g_fg_context != nullptr;
+	// (A camera cut in this frame: no frame generated between the two shots; chenxiao07 3e1e3250.)
+	const bool generate = usable && g_fg_context != nullptr && !inputs->cut;
 	++g_frame_id;
 	ffxConfigureDescFrameGeneration config {};
 	config.header.type             = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;

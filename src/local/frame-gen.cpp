@@ -2029,6 +2029,18 @@ void SwapchainChanging() {
 #endif
 }
 
+static bool g_cut = false; // GPU thread: the current guest frame's upscale started a new history (NoteCut)
+
+void NoteCut() {
+	g_cut = true;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	g_discontinuity.store(true, std::memory_order_relaxed); // (DLSS-G: constants.reset at the next present)
+#endif
+	static std::atomic<uint32_t> cuts {0};
+	if (const auto count = cuts.fetch_add(1, std::memory_order_relaxed) + 1; count <= 4 || count % 200 == 0)
+		LOGF("frame generation: camera cut %u (the game reset its upscaler): no frame generated across it\n", count);
+}
+
 void NoteDroppedFrame() {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	g_discontinuity.store(true, std::memory_order_relaxed);
@@ -3464,6 +3476,7 @@ void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std:
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs, ImageId flip_id, Image& flip) {
 	inputs.valid       = false;
+	inputs.cut         = std::exchange(g_cut, false);
 	inputs.has_hudless = false;
 	inputs.hudless_composite = false;
 	g_cache            = &cache;
