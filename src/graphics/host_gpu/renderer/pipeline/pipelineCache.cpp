@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelinePrewarm.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -364,6 +365,7 @@ struct PipelineCache::ProgramCache {
 		}
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
+		Prewarm::NoteSpirv(module, result.spirv);
 		const ShaderProgram handle {.id = ++next_shader_id, .module = module,
 		                            .spirv_words = static_cast<uint64_t>(result.spirv.size())};
 		spirv_modules.emplace(spirv_key, handle);
@@ -442,6 +444,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		const auto translate_start = std::chrono::steady_clock::now();
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage_input.vertex = &input_info;
@@ -533,6 +536,8 @@ struct PipelineCache::ProgramCache {
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
 		const auto& permutation = entry->second.permutations.back();
+		Prewarm::NoteTranslation(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		    std::chrono::steady_clock::now() - translate_start).count()));
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
@@ -581,7 +586,12 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	Prewarm::Shutdown();
 	StopAsyncCompute();
+	if (m_save_thread.joinable()) {
+		m_save_thread.join();
+	}
+	m_driver_cache_dirty = true;
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -678,8 +688,19 @@ void PipelineCache::CheckpointDriverCache() {
 		return;
 	}
 	m_driver_cache_dirty = true;
-	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
-		Save();
+	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save && !m_saving.load()) {
+		// The cache is ~700 MB for Ghost of Yotei: reading and writing it took the render thread
+		// for a second every 5 minutes. Save on a background thread (VkPipelineCache is internally
+		// synchronized; compiles go on meanwhile).
+		m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
+		if (m_save_thread.joinable()) {
+			m_save_thread.join();
+		}
+		m_saving = true;
+		m_save_thread = std::thread([this] {
+			Save();
+			m_saving = false;
+		});
 	}
 }
 
@@ -687,7 +708,6 @@ void PipelineCache::Save() {
 	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
 		return;
 	}
-	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -931,7 +951,9 @@ struct PipelineCache::AsyncCompute {
 static uint64_t AsyncComputeWords() {
 	static const uint64_t words = [] {
 		const char* v = std::getenv("KYTY_ASYNC_COMPUTE_WORDS");
-		return v != nullptr ? std::strtoull(v, nullptr, 10) : 0ull;
+		// default 1: every pipeline is compiled by the background threads (the draw/dispatch that
+		// needs a pipeline not ready yet is skipped until it is, instead of freezing the frame)
+		return v != nullptr ? std::strtoull(v, nullptr, 10) : 1ull;
 	}();
 	return words;
 }
@@ -959,6 +981,7 @@ PipelineCache::Pipeline* PipelineCache::GraphicsPipelineImpl(
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs, bool allow_async) {
+	StartPrewarm();
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -1236,9 +1259,24 @@ PipelineCache::Pipeline* PipelineCache::GraphicsPipelineImpl(
 	return iter->second.get();
 }
 
+void PipelineCache::StartPrewarm() {
+	if (!m_prewarm_started) {
+		m_prewarm_started = true;
+		if (Prewarm::EnsureStarted(m_graphics, PipelineCacheTitleId(), m_driver_cache)) {
+			m_driver_cache_dirty = true;
+			Save();
+			Prewarm::Shutdown();
+			std::printf("Prewarm: KYTY_PREWARM_ONLY=1: precompile finished, driver cache saved, exiting\n");
+			std::fflush(stdout);
+			std::_Exit(0);
+		}
+	}
+}
+
 PipelineCache::Pipeline&
 PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
                                   const ShaderProgram&          compute_program) {
+	StartPrewarm();
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(!compute_program);
@@ -1299,13 +1337,15 @@ void PipelineCache::StopAsyncCompute() {
 void PipelineCache::EnqueueAsync(std::function<void()> work, const std::function<void()>& mark_pending) {
 	if (m_async_compute == nullptr) {
 		m_async_compute = std::make_unique<AsyncCompute>();
-		uint32_t count  = 6;
+		const uint32_t hw = std::thread::hardware_concurrency();
+		uint32_t count  = std::clamp<uint32_t>(hw > 8 ? hw / 2u : 4u, 4u, 16u);
 		if (const char* v = std::getenv("KYTY_ASYNC_COMPUTE_THREADS"); v != nullptr) {
-			count = std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(v, nullptr, 10)), 1u, 32u);
+			count = std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(v, nullptr, 10)), 1u, 64u);
 		}
 		auto* async = m_async_compute.get();
 		for (uint32_t i = 0; i < count; i++) {
 			async->threads.emplace_back([async] {
+				Prewarm::MarkAsyncThread();
 				for (;;) {
 					std::function<void()> task;
 					{
@@ -1335,6 +1375,7 @@ void PipelineCache::EnqueueAsync(std::function<void()> work, const std::function
 PipelineCache::Pipeline*
 PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
                                      const ShaderProgram&          compute_program) {
+	StartPrewarm();
 	EXIT_IF(!compute_program);
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
