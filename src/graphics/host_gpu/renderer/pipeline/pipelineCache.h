@@ -145,6 +145,7 @@ struct GraphicsPipelineBuild {
 // A graphics pipeline a worker thread compiles (see PipelineCache::TryGetGraphicsPipeline).
 struct PendingGraphicsPipeline;
 class PipelineCompiler;
+struct DriverCacheAutosave;
 
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
@@ -238,8 +239,13 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	uint64_t                                                m_deferred_draws = 0;
+	// KYTY_PIPELINE_CACHE_AUTOSAVE_S (wolverine-turbo3-1025): a background thread writes the driver cache while
+	// the game runs, so a run that is killed (closing the console) keeps what it compiled.
+	std::unique_ptr<DriverCacheAutosave> m_autosave;
 
 	void InitializeDriverCache();
+	// Writes the driver cache to m_driver_cache_path; skipped (true) when it grew less than min_growth bytes.
+	bool WriteDriverCache(uint64_t min_growth);
 	// Takes a finished background compile into the pipeline; false while it still runs.
 	bool FinishPending(Pipeline& pipeline);
 };

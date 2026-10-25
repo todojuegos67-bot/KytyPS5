@@ -1031,6 +1031,24 @@ bool BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin, ui
 	return true;
 }
 
+// GPU thread. "Async readbacks (5 s)": faults of guest threads resolved on the copy queue
+// (KYTY_ASYNC_READBACK_COPY_QUEUE) and those that still flushed the main queue and made the guest wait for
+// its tick. Printed only when there were any.
+static void NoteAsyncReadback(bool copy_queue) {
+	static uint64_t copy_count = 0;
+	static uint64_t main_count = 0;
+	static auto     begin      = std::chrono::steady_clock::now();
+	(copy_queue ? copy_count : main_count)++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - begin >= std::chrono::seconds(5)) {
+		::printf("Async readbacks (5 s): %llu on the copy queue, %llu flushed the main queue\n",
+		         static_cast<unsigned long long>(copy_count), static_cast<unsigned long long>(main_count));
+		copy_count = 0;
+		main_count = 0;
+		begin      = now;
+	}
+}
+
 // GPU thread. Returns the tick the guest must wait for, or 0 when the fault is already resolved.
 uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_write,
                                          uint64_t& window_begin, uint64_t& window_end) {
@@ -1081,6 +1099,24 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 		window_begin = std::max(page_begin, buffer_begin);
 		window_end   = std::min(page_end, buffer_end);
 	}
+	// KYTY_ASYNC_READBACK_COPY_QUEUE=1 (live, default 1; wolverine-turbo3-1025): when every GPU write to
+	// the buffer has executed, copy the window's GPU-written bytes on the second queue (behind nothing, as
+	// the synchronous path already does) and resolve the fault here. The main-queue download below is
+	// flushed and the guest waits for its tick, i.e. for everything queued before it: in Wolverine's slow
+	// phases (old engine, 2026-10-20 log) 5-7K such flushes per 5 s split the frames and kept the guest's
+	// job threads waiting 3.6-8.7 s per 5 s; at 43 fps it was ~1.25K. 0 restores the previous path.
+	static auto& copy_queue_first = Common::LiveSwitches::Get("KYTY_ASYNC_READBACK_COPY_QUEUE", 1);
+	if (copy_queue_first.load(std::memory_order_relaxed) != 0 &&
+	    m_scheduler.IsFree(buffer.last_gpu_write_tick) &&
+	    TryCopyQueueReadback(buffer, window_begin, window_end)) {
+		stats.SetOutcome(ReadbackStats::Downloaded);
+		NoteAsyncReadback(true);
+		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+		if (is_write) {
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		}
+		return 0;
+	}
 	if (!DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 		stats.SetOutcome(ReadbackStats::NothingToDownload);
 		if (is_write) {
@@ -1089,6 +1125,7 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 		return 0;
 	}
 	stats.SetOutcome(ReadbackStats::Downloaded);
+	NoteAsyncReadback(false);
 	const auto tick = m_scheduler.CurrentTick();
 	m_scheduler.Flush();
 	m_pending_write_readbacks.push_back({window_begin, window_end, tick});
@@ -1831,6 +1868,32 @@ void BufferCache::RunGarbageCollector() {
 	    (combined.load(std::memory_order_relaxed) != 0 ? m_texture_cache.UsedMemory() : 0) +
 	    (static_cast<uint64_t>(std::max<int64_t>(0, headroom.load(std::memory_order_relaxed)))
 	     << 20u);
+	// "VRAM (5 s)" (wolverine-turbo3-1025, always on, one budget query per 5 s): the driver's device-local usage
+	// and budget (VK_EXT_memory_budget), so a log shows when the process is over budget (Windows then pages video
+	// memory to system RAM and every frame waits on PCIe), next to what the caches hold and the GC marks.
+	{
+		static auto vram_report = std::chrono::steady_clock::now();
+		const auto  now         = std::chrono::steady_clock::now();
+		if (now - vram_report >= std::chrono::seconds(5)) {
+			vram_report        = now;
+			constexpr double g = 1024.0 * 1024.0 * 1024.0;
+			if (m_graphics.CanReportMemoryUsage()) {
+				const auto usage  = m_graphics.GetDeviceMemoryUsage();
+				const auto budget = m_graphics.GetDriverMemoryBudget();
+				::printf("VRAM (5 s): device %.2f of %.2f GiB budget%s; caches: buffers %.2f, images %.2f GiB "
+				         "(GC from %.2f, aggressive from %.2f)\n",
+				         static_cast<double>(usage) / g, static_cast<double>(budget) / g,
+				         usage > budget ? " (OVER BUDGET: the driver pages to system RAM)" : "",
+				         static_cast<double>(m_total_used_memory) / g,
+				         static_cast<double>(m_texture_cache.UsedMemory()) / g,
+				         static_cast<double>(m_trigger_gc_memory) / g, static_cast<double>(m_critical_gc_memory) / g);
+			} else {
+				::printf("VRAM (5 s): no VK_EXT_memory_budget; caches: buffers %.2f, images %.2f GiB\n",
+				         static_cast<double>(m_total_used_memory) / g,
+				         static_cast<double>(m_texture_cache.UsedMemory()) / g);
+			}
+		}
+	}
 	if (used < m_trigger_gc_memory) {
 		return;
 	}

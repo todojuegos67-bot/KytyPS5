@@ -10,6 +10,13 @@ Que es
 - No es el motor de Demon's Souls: con Wolverine ese motor se cuelga al arrancar
   (logs del 15 y el 20 de octubre).
 
+Novedades turbo3 (rama wolverine-turbo3-1025)
+- Las zonas lentas (1-8 fps) tambien pasaban con el motor anterior: en ellas los hilos del juego
+  esperaban a la GPU 3.6-8.7 s cada 5 s por lecturas de memoria escrita por la GPU. Ahora esas
+  copias van por la segunda cola de la GPU (KYTY_ASYNC_READBACK_COPY_QUEUE=1; 0 = como antes).
+- La cache de pipelines se guarda cada 2 minutos: cerrar la consola ya no la pierde.
+- El log tiene lineas nuevas cada 5 s: VRAM (5 s), Async readbacks (5 s), CPU load (5 s).
+
 Instalacion
 1. Descomprime el zip en una carpeta NUEVA, por ejemplo E:\Wolverine-KytyPS5-v1\TURBO
    (dentro debe quedar "Play Wolverine TURBO.bat" y la carpeta emulator).

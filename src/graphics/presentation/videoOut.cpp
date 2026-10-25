@@ -1277,9 +1277,14 @@ static void NoteFrameStats() {
 	const auto wait_us = FrameCosts::g_pipeline_wait_us.exchange(0), waits = FrameCosts::g_pipeline_waits.exchange(0);
 	const auto gpu_wait_us = FrameCosts::g_gpu_wait_us.exchange(0); FrameCosts::g_gpu_waits.exchange(0);
 	const auto idle_us = FrameCosts::g_idle_us.exchange(0); FrameCosts::g_idles.exchange(0);
-	::printf("Render thread (5 s): busy %.0f%%, waiting for the GPU %.0f%%, idle (no guest work) %.0f%%\n",
+	const auto other_wait_us = FrameCosts::g_other_gpu_wait_us.exchange(0);
+	const auto other_waits   = FrameCosts::g_other_gpu_waits.exchange(0);
+	// Thread_Gpu only (wolverine-turbo3-1025): other threads' waits are reported apart, summed over threads.
+	::printf("Render thread (5 s): busy %.0f%%, waiting for the GPU %.0f%%, idle (no guest work) %.0f%%; "
+	         "other threads waited for the GPU %.0f ms (%llu waits)\n",
 	         100.0 - (static_cast<double>(gpu_wait_us + idle_us) / 10000.0 / seconds), static_cast<double>(gpu_wait_us) / 10000.0 / seconds,
-	         static_cast<double>(idle_us) / 10000.0 / seconds);
+	         static_cast<double>(idle_us) / 10000.0 / seconds, static_cast<double>(other_wait_us) / 1000.0,
+	         static_cast<unsigned long long>(other_waits));
 	::printf("Frames (5 s): %.1f fps, frame %.2f ms avg, %.2f ms p99, %.2f ms max; shaders %llu in %.0f ms, pipeline waits %llu in %.0f ms\n",
 	         static_cast<double>(intervals.size()) / seconds, sum / static_cast<double>(intervals.size()),
 	         static_cast<double>(p99), static_cast<double>(intervals.back()), static_cast<unsigned long long>(shaders),

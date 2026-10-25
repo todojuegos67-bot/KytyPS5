@@ -1,5 +1,5 @@
 @echo off
-rem Marvel's Wolverine en KytyPS5 - build TURBO (rama wolverine-turbo2-1025, PRUEBA).
+rem Marvel's Wolverine en KytyPS5 - build TURBO (rama wolverine-turbo3-1025, PRUEBA).
 rem Motor del fork de Wolverine (wolverine-perf) + generacion de fotogramas FSR 3 (AMD).
 rem
 rem Uso: doble clic. Opcional desde una consola:
@@ -92,6 +92,13 @@ set KYTY_BINDLESS_SKIP=0
 rem Medidos en Wolverine con A/B en el mismo proceso (docs/EXPERIMENTS.md): -1.5 ms y -1.7 ms por frame.
 set KYTY_ASYNC_WRITE_READBACK=1
 set KYTY_WRITE_WINDOW_KB=16
+rem turbo3: los fallos de los hilos del juego sobre memoria escrita por la GPU se copian en la segunda cola
+rem (no esperan a todo el trabajo de la GPU). En las zonas lentas del 20-10 eran 5-7K esperas por 5 s. 0 = como antes.
+set KYTY_ASYNC_READBACK_COPY_QUEUE=1
+rem turbo3: guarda la cache de pipelines cada 2 minutos (si crecio), asi no se pierde si cierras la consola.
+set KYTY_PIPELINE_CACHE_AUTOSAVE_S=120
+rem turbo3: en el log, cada 5 s, el uso de CPU de los hilos mas ocupados (para encontrar la causa de las zonas lentas).
+set KYTY_CPU_LOAD=1
 rem Ordenes en vivo: escribe lineas NOMBRE=valor en este archivo mientras juegas.
 set "KYTY_LIVE_FILE=%USERDATA%\kyty_live.txt"
 if not exist "%KYTY_LIVE_FILE%" type nul > "%KYTY_LIVE_FILE%"

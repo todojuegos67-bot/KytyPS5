@@ -173,7 +173,10 @@ void MasterSemaphore::Wait(uint64_t tick, std::source_location where) {
 
 	vk::Result result;
 	{
-		FrameCosts::Timer cost_timer {FrameCosts::g_gpu_wait_us, FrameCosts::g_gpu_waits};
+		// Only Thread_Gpu's waits count for the "Render thread (5 s)" line (it is Thread_Gpu's busy/wait/idle).
+		const bool        gpu_thread = PhaseStats::IsGpuThread();
+		FrameCosts::Timer cost_timer {gpu_thread ? FrameCosts::g_gpu_wait_us : FrameCosts::g_other_gpu_wait_us,
+		                              gpu_thread ? FrameCosts::g_gpu_waits : FrameCosts::g_other_gpu_waits};
 		PhaseStats::Scope phase {PhaseStats::IsGpuThread() ? PhaseStats::GpuWait
 		                                                      : PhaseStats::GuestPhase(PhaseStats::RenderGpuWait, PhaseStats::OtherGpuWait)};
 		const auto        begin = NowUs();

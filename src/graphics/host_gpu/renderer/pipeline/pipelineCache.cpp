@@ -1169,6 +1169,14 @@ PipelineCache::~PipelineCache() {
 	}
 }
 
+struct DriverCacheAutosave {
+	std::mutex              mutex;
+	std::condition_variable wake;
+	bool                    stop       = false;
+	uint64_t                saved_size = 0;
+	std::thread             thread;
+};
+
 void PipelineCache::InitializeDriverCache() {
 	const auto title_id = PipelineCacheTitleId();
 	if (title_id.empty()) {
@@ -1220,10 +1228,23 @@ void PipelineCache::InitializeDriverCache() {
 			    payload_read != initial_data.size() ||
 			    !DriverCacheSignatureMatches(cached_signature, signature) ||
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
+				const bool short_read = signature_read != cached_signature.size() ||
+				                        hash_read != sizeof(payload_hash) || payload_read != initial_data.size();
 				initial_data.clear();
+				// Which part differed (wolverine-turbo3-1025): "KytyPC1:<revision>:<vendor>:<device>:<driver>:<uuid>".
+				std::string reason;
+				if (short_read) {
+					reason = "short read";
+				} else if (!DriverCacheSignatureMatches(cached_signature, signature)) {
+					reason = "signature differs: cached '" +
+					         std::string(cached_signature.substr(0, cached_signature.find('\n'))) +
+					         "', this build and driver '" + signature.substr(0, signature.find('\n')) + "'";
+				} else {
+					reason = "payload hash mismatch (file damaged or written by an interrupted save)";
+				}
 				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
-				    path);
+				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch: {})",
+				    path, reason);
 			} else if (cached_signature != signature) {
 				PipelineCacheLog("Vulkan pipeline cache: keeping {} from another emulator revision",
 				                 path);
@@ -1257,9 +1278,40 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+	// KYTY_PIPELINE_CACHE_AUTOSAVE_S=N (default 120, 0 = off; wolverine-turbo3-1025): every N s, the driver cache
+	// is written in the background when it grew by 16 MiB or more since the last save. Before, it was written only
+	// at a clean exit: the 2026-10-25 TURBO run started cold ("invalidating"), was closed from the console and
+	// saved nothing, so its slow phase compiled pipelines on the fly (pipeline waits up to 2.8 s per 5 s, against
+	// 0.1-0.6 s in the user's warm 10-20 run) and the next run would start cold again.
+	const char* autosave_env = std::getenv("KYTY_PIPELINE_CACHE_AUTOSAVE_S");
+	const long  autosave_s   = autosave_env != nullptr ? std::strtol(autosave_env, nullptr, 10) : 120;
+	if (autosave_s > 0) {
+		m_autosave             = std::make_unique<DriverCacheAutosave>();
+		m_autosave->saved_size = initial_data.size();
+		m_autosave->thread     = std::thread([this, autosave_s] {
+            std::unique_lock lock(m_autosave->mutex);
+            while (!m_autosave->wake.wait_for(lock, std::chrono::seconds(autosave_s),
+                                              [this] { return m_autosave->stop; })) {
+                lock.unlock();
+                (void)WriteDriverCache(16ull << 20u);
+                lock.lock();
+            }
+		});
+	}
 }
 
 void PipelineCache::Save() {
+	// The autosave thread stops first: it must not read the driver cache once it is destroyed below.
+	if (m_autosave != nullptr) {
+		{
+			std::lock_guard lock(m_autosave->mutex);
+			m_autosave->stop = true;
+		}
+		m_autosave->wake.notify_all();
+		if (m_autosave->thread.joinable()) {
+			m_autosave->thread.join();
+		}
+	}
 	// No worker may use the driver cache once it is destroyed below; later pipelines are
 	// compiled on the GPU thread (FinishPending).
 	if (m_compiler != nullptr) {
@@ -1268,7 +1320,15 @@ void PipelineCache::Save() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	if (WriteDriverCache(0)) {
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
+	}
+}
 
+// vkGetPipelineCacheData does not need the cache externally synchronized, so this also runs on the autosave
+// thread while workers compile into the cache.
+bool PipelineCache::WriteDriverCache(uint64_t min_growth) {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -1278,6 +1338,9 @@ void PipelineCache::Save() {
 		if (result != vk::Result::eSuccess || size == 0 ||
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
+		}
+		if (min_growth != 0 && m_autosave != nullptr && size < m_autosave->saved_size + min_growth) {
+			return true;
 		}
 		payload.resize(size);
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
@@ -1289,7 +1352,7 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -1297,7 +1360,7 @@ void PipelineCache::Save() {
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -1314,12 +1377,14 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
-	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	if (m_autosave != nullptr) {
+		m_autosave->saved_size = payload.size();
+	}
+	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}{}", payload.size(),
+	                 Common::PathToString(m_driver_cache_path), min_growth != 0 ? " (autosave)" : "");
+	return true;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
