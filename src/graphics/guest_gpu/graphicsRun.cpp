@@ -23,6 +23,7 @@
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#include "kernel/stallWatch.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
 
@@ -1174,6 +1175,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			GuestCopies::Finish();
 		}
 		const bool     draw     = IsDrawOpcode(opcode) || IsDispatchOpcode(opcode);
+		if (draw) {
+			LibKernel::StallWatchNoteGpuWork();
+		}
 		const auto&    pipelines = m_renderer.GetPipelineCache();
 		const uint64_t pipelines_before =
 		    draw ? pipelines.GraphicsPipelinesCreated() + pipelines.ComputePipelinesCreated() : 0;

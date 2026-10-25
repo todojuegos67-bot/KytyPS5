@@ -11,6 +11,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "kernel/memory.h"
+#include "kernel/stallWatch.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/runtimeLinker.h"
@@ -27,6 +28,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1025,6 +1027,8 @@ void PthreadInitSelfForMainThread() {
 #endif
 	g_pthread_self->host_thread_id = os_thread_id;
 	g_pthread_main                 = g_pthread_self;
+	StallWatchRegisterThread(g_pthread_self, os_thread_id, 0, 0);
+	StallWatchStart();
 
 	LOGF("\tPthread main self: id = %d, os_thread_id = %" PRIu64 ", stack_addr = 0x%016" PRIx64
 	     ", stack_size = %" PRIu64 "\n",
@@ -1269,6 +1273,8 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 	}
 
 	if (timeout_us == nullptr) {
+		const GuestWaitScope wait_scope(mutex->owner != nullptr ? "mutex lock" : nullptr, mutex,
+		                                mutex->name.c_str());
 		while (mutex->owner != nullptr) {
 			mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
 			if (mutex->owner != nullptr) {
@@ -1284,6 +1290,8 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 	} else {
 		const auto deadline =
 		    std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us);
+		const GuestWaitScope wait_scope(mutex->owner != nullptr ? "mutex timed lock" : nullptr,
+		                                mutex, mutex->name.c_str());
 		while (mutex->owner != nullptr) {
 			const auto now = std::chrono::steady_clock::now();
 			if (now >= deadline) {
@@ -2347,6 +2355,7 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 	    (has_timeout ? std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us)
 	                 : std::chrono::steady_clock::time_point {});
 	bool writer_wait_registered = false;
+	std::optional<GuestWaitScope> wait_scope; // (stall watch) from the first wait on
 
 	for (;;) {
 		{
@@ -2384,6 +2393,10 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 				}
 			}
 
+			if (!wait_scope) {
+				wait_scope.emplace(write ? "rwlock write lock" : "rwlock read lock", rwlock,
+				                   rwlock->name.c_str());
+			}
 			if (has_timeout) {
 				const auto now = std::chrono::steady_clock::now();
 				if (*timeout_us == 0 || now >= deadline) {
@@ -2872,6 +2885,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(usec);
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	const GuestWaitScope wait_scope("cond timed wait", cond_value, cond_value->name.c_str());
 
 	if (usec == 0) {
 		result = ETIMEDOUT;
@@ -2960,6 +2974,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	}
 
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	const GuestWaitScope wait_scope("cond timed wait (absolute)", cond_value, cond_value->name.c_str());
 
 	while (!ready()) {
 		const auto now = std::chrono::steady_clock::now();
@@ -3036,6 +3051,7 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	}
 
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	const GuestWaitScope wait_scope("cond wait", cond_value, cond_value->name.c_str());
 
 	while (!ready()) {
 		thread->cond_cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
@@ -3176,6 +3192,7 @@ static void CleanupThread(void* arg) {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	rt->DeleteTlss(thread->unique_id);
 
+	StallWatchUnregisterThread();
 	thread->almost_done = true;
 }
 
@@ -3201,6 +3218,7 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+	StallWatchRegisterThread(thread, os_thread_id, 0, 0);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!thread->name.empty()) {
 #if defined(__APPLE__)
@@ -3335,7 +3353,11 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int result = pthread_join(thread->p, value);
+	int result = 0;
+	{
+		const GuestWaitScope wait_scope("thread join", thread, thread->name.c_str());
+		result = pthread_join(thread->p, value);
+	}
 
 	if (PRINT_NAME_ENABLED) {
 		LOGF("\tthread join: %s, %d\n", thread->name.c_str(), result);
@@ -3850,11 +3872,13 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
 	COUNT_CALL();
+	const GuestWaitScope wait_scope(microseconds >= 1000 ? "usleep" : nullptr, nullptr, nullptr);
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }
 
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
+	const GuestWaitScope wait_scope("sleep", nullptr, nullptr);
 	SleepMicroWithSignalPoll(static_cast<uint64_t>(seconds) * 1000000ull);
 	return OK;
 }
@@ -3878,7 +3902,10 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 	uint64_t nanos =
 	    static_cast<uint64_t>(rqtp->tv_sec) * 1000000000ull + static_cast<uint64_t>(rqtp->tv_nsec);
 
-	SleepNanoWithSignalPoll(nanos);
+	{
+		const GuestWaitScope wait_scope(nanos >= 1000000 ? "nanosleep" : nullptr, nullptr, nullptr);
+		SleepNanoWithSignalPoll(nanos);
+	}
 
 	if (rmtp != nullptr) {
 		rmtp->tv_sec  = 0;

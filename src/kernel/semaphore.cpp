@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/stallWatch.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -291,6 +292,7 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	const GuestWaitScope wait_scope("sema wait", sem, sem->GetName().c_str());
 	auto result = sem->Wait(need, time);
 
 	int ret = OK;
@@ -578,6 +580,7 @@ static int SemTimedwaitImpl(void* sem, uint32_t* micros) {
 		return POSIX_EINVAL;
 	}
 
+	const LibKernel::GuestWaitScope wait_scope("posix sem wait", obj, nullptr);
 	return obj->Wait(micros);
 }
 

@@ -8,6 +8,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
+#include "kernel/stallWatch.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -362,6 +364,8 @@ static void SetSubmissionComplete(uint32_t submission_id) {
 }
 
 static bool CompleteSubmission(uint32_t submission_id) {
+	const LibKernel::GuestWaitScope wait_scope(
+	    "APR/AMM submission wait", reinterpret_cast<const void*>(uintptr_t {submission_id}), nullptr);
 	std::unique_lock lock(g_mutex);
 	if (!g_submissions.contains(submission_id)) {
 		return false;
@@ -848,6 +852,17 @@ static bool EnsureCommandBufferRecordSpace(uint64_t command_buffer, CommandBuffe
 	if (state == nullptr || record_size == 0 ||
 	    !ValidateCommandBufferHeader(command_buffer, state) || state->buffer == 0 ||
 	    record_size > state->size || state->write_offset > state->size - record_size) {
+		// A command the buffer has no room for is rejected (EBUSY). A game that sized the buffer
+		// with the console's record sizes does not check: a lost completion write or event is a
+		// loader waiting forever (astro-load-1025: logged, and counted for the stall watch).
+		const auto rejected = LibKernel::StallWatchNoteAmprRejected();
+		if (rejected <= 8 && state != nullptr) {
+			std::printf("AMPR: command rejected, buffer full: buffer=0x%" PRIx64 " size=0x%" PRIx64
+			            " offset=0x%" PRIx64 " record=0x%" PRIx64 " (rejection %" PRIu64 ")\n",
+			            command_buffer, static_cast<uint64_t>(state->size),
+			            static_cast<uint64_t>(state->write_offset), record_size, rejected);
+			std::fflush(stdout);
+		}
 		return false;
 	}
 
@@ -883,6 +898,10 @@ static void UpdateCommandBufferTypeFlagsUnchecked(uint64_t command_buffer, uint3
 
 static uint64_t AprReadFileRecordSize(uint64_t file_offset) {
 	return (file_offset >> 32u) != 0 ? READ_FILE_RECORD_SIZE_EXT : READ_FILE_RECORD_SIZE;
+}
+
+static uint64_t WriteAddressRecordSize(uint64_t value) {
+	return value <= 3 ? 8 : value < (uint64_t {1} << 34) ? 12 : 16;
 }
 
 static uint64_t AprReadGatherRecordSize(uint64_t file_offset) {
@@ -1369,6 +1388,65 @@ public:
 		m_cv.notify_one();
 	}
 
+	// For the stall watch (kernel/stallWatch.h): the queued submissions, what the head of each
+	// priority waits on, and the command the worker runs now. Never blocks (try_lock).
+	void Describe(const char* engine, std::string* out) {
+		const int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+		const int64_t busy_since = m_executing_since.load(std::memory_order_relaxed);
+		char line[256];
+		std::snprintf(line, sizeof(line), "STALLWATCH ampr %s: worker %s", engine,
+		              busy_since != 0 ? "running a command" : "idle or waiting");
+		*out += line;
+		if (busy_since != 0) {
+			std::snprintf(line, sizeof(line), " (%s for %.1f s)",
+			              m_executing_kind.load(std::memory_order_relaxed),
+			              static_cast<double>(now - busy_since) / 1e9);
+			*out += line;
+		}
+		std::unique_lock lock(m_mutex, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			*out += "; queues locked\n";
+			return;
+		}
+		*out += "\n";
+		for (size_t priority = 0; priority < m_queues.size(); priority++) {
+			const auto& queue = m_queues[priority];
+			if (queue.empty()) {
+				continue;
+			}
+			const auto& head = queue.front();
+			std::snprintf(line, sizeof(line),
+			              "STALLWATCH   priority %zu: %zu submissions; head id %u at command %zu of %zu",
+			              priority, queue.size(), head.id, head.cursor, head.commands.size());
+			*out += line;
+			if (head.cursor < head.commands.size()) {
+				const auto& data = head.commands[head.cursor].data;
+				if (const auto* wait = std::get_if<CommandBufferState::WaitCommand>(&data)) {
+					uint64_t value = 0;
+					if (wait->is_counter) {
+						value = wait->source < g_counters.size()
+						            ? g_counters[wait->source].load(std::memory_order_acquire)
+						            : 0;
+					} else {
+						value = std::atomic_ref(*reinterpret_cast<uint64_t*>(wait->source))
+						            .load(std::memory_order_acquire);
+					}
+					std::snprintf(line, sizeof(line),
+					              ", waits on %s 0x%" PRIx64 " (now 0x%" PRIx64 ") compare %u 0x%" PRIx64
+					              ", %s",
+					              wait->is_counter ? "counter" : "address", wait->source, value,
+					              static_cast<unsigned>(wait->compare), wait->value,
+					              IsWaitSatisfied(*wait) ? "satisfied" : "NOT satisfied");
+					*out += line;
+				} else {
+					std::snprintf(line, sizeof(line), ", next command kind %zu", data.index());
+					*out += line;
+				}
+			}
+			*out += "\n";
+		}
+	}
+
 private:
 	void Run(std::stop_token stop) {
 		std::unique_lock lock(m_mutex);
@@ -1407,7 +1485,14 @@ private:
 			uint32_t error_offset = 0;
 			if (submission.cursor < submission.commands.size()) {
 				const auto& command = submission.commands[submission.cursor++];
+				static constexpr const char* Kinds[] = {"read file", "kernel event", "write address",
+				                                        "amm map", "wait", "write counter"};
+				m_executing_kind.store(command.data.index() < std::size(Kinds) ? Kinds[command.data.index()] : "?",
+				                       std::memory_order_relaxed);
+				m_executing_since.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+				                        std::memory_order_relaxed);
 				result              = ExecuteCommand(command);
+				m_executing_since.store(0, std::memory_order_relaxed);
 				if (result != OK) {
 					error_offset = static_cast<uint32_t>(command.record_offset);
 				}
@@ -1427,8 +1512,13 @@ private:
 	std::mutex                          m_mutex;
 	std::condition_variable             m_cv;
 	std::vector<std::deque<Submission>> m_queues;
+	std::atomic<int64_t>                m_executing_since {0};
+	std::atomic<const char*>            m_executing_kind {""};
 	std::jthread                        m_worker;
 };
+
+static std::atomic<CommandEngine*> g_apr_engine {nullptr};
+static std::atomic<CommandEngine*> g_amm_engine {nullptr};
 
 static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t bytes,
                               uint32_t priority, void* result, uint32_t* out_submission_id) {
@@ -1463,6 +1553,8 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 	}
 	static CommandEngine apr_engine(7);
 	static CommandEngine amm_engine(3);
+	g_apr_engine.store(&apr_engine, std::memory_order_release);
+	g_amm_engine.store(&amm_engine, std::memory_order_release);
 	(amm ? amm_engine : apr_engine)
 	    .Submit(priority, {std::move(state.commands), 0, result, id});
 	return OK;
@@ -1492,6 +1584,7 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	}
 
 	*bytes_read = 0;
+	LibKernel::StallWatchNoteIo();
 	if (size == 0) {
 		return OK;
 	}
@@ -1502,6 +1595,12 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	Common::File file;
 	if (!file.Open(host_path, Common::File::Mode::Read)) {
 		LOGF("\tAPR read missing host file: %s\n", Common::PathToString(host_path).c_str());
+		// (astro-load-1025) In the console log too, the first 16: a loader may wait on it forever.
+		static std::atomic<int> missing_logged {0};
+		if (missing_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("APR: read of a missing host file: %s\n", Common::PathToString(host_path).c_str());
+			std::fflush(stdout);
+		}
 		return LibKernel::KERNEL_ERROR_ENOENT;
 	}
 	const auto file_size = file.Size();
@@ -1721,11 +1820,10 @@ static uint64_t KYTY_SYSV_ABI MeasureCommandSizeFixed32(uint64_t, uint64_t, uint
 	return 0x20;
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteAddressOnCompletion(volatile uint64_t*,
-                                                                         uint64_t) {
+static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteAddress(volatile uint64_t*, uint64_t value) {
 	PRINT_NAME();
 
-	return 0x20;
+	return WriteAddressRecordSize(value);
 }
 
 static uint64_t KYTY_SYSV_ABI
@@ -2054,7 +2152,7 @@ static int KYTY_SYSV_ABI CommandBufferWaitOnCounter(void* command_buffer, uint8_
 }
 
 static int AppendWriteAddressCommand(void* command_buffer, volatile uint64_t* address,
-                                     uint64_t value) {
+                                     uint64_t value, uint64_t record_size) {
 	if (command_buffer == nullptr || address == nullptr ||
 	    (reinterpret_cast<uint64_t>(address) & 7) != 0) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -2062,7 +2160,7 @@ static int AppendWriteAddressCommand(void* command_buffer, volatile uint64_t* ad
 	return AppendCommandRecord(
 	           reinterpret_cast<uint64_t>(command_buffer),
 	           CommandBufferState::WriteAddressCommand {reinterpret_cast<uint64_t>(address), value},
-	           0x20)
+	           record_size)
 	           ? OK
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
@@ -2071,7 +2169,7 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddress(void* command_buffer, volatil
                                                    uint64_t value, uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, value);
+	return AppendWriteAddressCommand(command_buffer, address, value, WriteAddressRecordSize(value));
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressOnCompletion(void*              command_buffer,
@@ -2079,7 +2177,7 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressOnCompletion(void*            
                                                                uint64_t           value) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, value);
+	return AppendWriteAddressCommand(command_buffer, address, value, WriteAddressRecordSize(value));
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t index,
@@ -2111,14 +2209,14 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounter(void*         
                                                                   uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounterOnCompletion(
     void* command_buffer, volatile uint64_t* address) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounter(void*              command_buffer,
@@ -2126,14 +2224,14 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounter(void*             
                                                               uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterOnCompletion(
     void* command_buffer, volatile uint64_t* address, uint8_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPair(void*              command_buffer,
@@ -2141,14 +2239,14 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPair(void*         
                                                                   uint8_t, uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPairOnCompletion(
     void* command_buffer, volatile uint64_t* address, uint8_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
 static int KYTY_SYSV_ABI AprCommandBufferReadFileGather(void*    command_buffer, uint64_t, uint64_t,
@@ -2520,6 +2618,29 @@ static int KYTY_SYSV_ABI AmmWaitCommandBufferCompletion(uint32_t submission_id) 
 
 } // namespace Ampr
 
+void DescribeStateForStallWatch(std::string* out) {
+	if (auto* engine = Ampr::g_apr_engine.load(std::memory_order_acquire)) {
+		engine->Describe("APR", out);
+	} else {
+		*out += "STALLWATCH ampr APR: never used\n";
+	}
+	if (auto* engine = Ampr::g_amm_engine.load(std::memory_order_acquire)) {
+		engine->Describe("AMM", out);
+	}
+	std::unique_lock lock(AprShared::g_mutex, std::try_to_lock);
+	if (lock.owns_lock()) {
+		size_t pending = 0;
+		for (const auto& [id, done]: AprShared::g_submissions) {
+			pending += done ? 0 : 1;
+		}
+		char line[160];
+		std::snprintf(line, sizeof(line),
+		              "STALLWATCH ampr submissions with an id: %zu not complete, %zu complete and not waited for\n",
+		              pending, AprShared::g_submissions.size() - pending);
+		*out += line;
+	}
+}
+
 LIB_DEFINE(InitAmpr_1) {
 	LIB_FUNC("8aI7R7WaOlc", Ampr::CommandBufferConstructor);
 	LIB_FUNC("a8uLzYY--tM", Ampr::AprCommandBufferConstructor);
@@ -2556,14 +2677,14 @@ LIB_DEFINE(InitAmpr_1) {
 	LIB_FUNC("vWU-odnS+fU", Ampr::MeasureCommandSizeReadFile);
 	LIB_FUNC("sSAUCCU1dv4", Ampr::MeasureCommandSizeWriteKernelEventQueue);
 	LIB_FUNC("Zi3dBUjgyXI", Ampr::MeasureCommandSizeWriteKernelEventQueue);
-	LIB_FUNC("C+IEj+BsAFM", Ampr::MeasureCommandSizeWriteAddressOnCompletion);
+	LIB_FUNC("C+IEj+BsAFM", Ampr::MeasureCommandSizeWriteAddress);
 	LIB_FUNC("x7SQEXfeovg", Ampr::MeasureCommandSizeWriteAddressFromTimeCounterOnCompletion);
 	LIB_FUNC("32AcaTaBPSY", Ampr::MeasureCommandSizeWriteAddressFromCounterOnCompletion);
 	LIB_FUNC("vxC58+DRk-U", Ampr::MeasureCommandSizeWriteAddressFromCounterPairOnCompletion);
 	LIB_FUNC("4muPEJ-x5N8", Ampr::MeasureCommandSizeWriteCounterOnCompletion);
 	LIB_FUNC("0BMj1hgG+kE", Ampr::MeasureCommandSizeFixed32);
 	LIB_FUNC("ClnsFLLLcss", Ampr::MeasureCommandSizeFixed32);
-	LIB_FUNC("4fgtGfXDrFc", Ampr::MeasureCommandSizeFixed32);
+	LIB_FUNC("4fgtGfXDrFc", Ampr::MeasureCommandSizeWriteAddress);
 	LIB_FUNC("gAtc79UTt5E", Ampr::MeasureCommandSizeFixed32);
 	LIB_FUNC("JYd9g9L+TmE", Ampr::MeasureCommandSizeFixed32);
 	LIB_FUNC("2Hw8gjMdwSY", Ampr::MeasureCommandSizeFixed32);

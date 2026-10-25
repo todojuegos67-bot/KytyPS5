@@ -688,6 +688,9 @@ if ("$($environment['KYTY_BRUNO_RECOMMENDED'])" -ne '0') {
 # Async shaders: brunoKytyPs5's --async-pipelines (a draw whose pipeline is still compiling is skipped; it appears a
 # few frames late) for KYTY_ASYNC_DRAW_PIPELINES=1, which this emulator does not read (-NoAsyncShaders: off).
 if ("$($environment['KYTY_ASYNC_DRAW_PIPELINES'])" -eq '1' -and -not $options.Contains('--async-pipelines')) { Set-Option '--async-pipelines' 'true' }
+# (astro-load-1025) -NoAsyncShaders says false on the command line: an "async-pipelines = true" left in
+# kyty_settings.ini by the F2 panel would otherwise keep it on (the command line overrides the file).
+if ($NoAsyncShaders -and -not $options.Contains('--async-pipelines')) { Set-Option '--async-pipelines' 'false' }
 if ($DrainStats -gt 0) { Set-Option '--drain-stats' "$DrainStats" }
 if ($AstroBoost) { $environment['KYTY_ASTRO_BOOST'] = $AstroBoost }
 if ($BrunoFrameGen) {

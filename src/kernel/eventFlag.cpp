@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/stallWatch.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -23,6 +24,8 @@ public:
 
 	KernelEventFlagPrivate(const std::string& name, bool single, bool /*fifo*/, uint64_t bits)
 	    : m_name(name), m_single_thread(single), m_bits(bits) {}
+
+	[[nodiscard]] const std::string& GetName() const { return m_name; }
 	virtual ~KernelEventFlagPrivate();
 
 	KYTY_CLASS_NO_COPY(KernelEventFlagPrivate);
@@ -297,6 +300,7 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 	}
 
 	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
+	const GuestWaitScope wait_scope("event flag wait", ef, ef->GetName().c_str());
 	auto       result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
 
 	int ret = OK;

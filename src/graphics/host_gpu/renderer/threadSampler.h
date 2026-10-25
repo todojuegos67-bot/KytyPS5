@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_THREADSAMPLER_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_THREADSAMPLER_H_
 
+#include <cstdio>
+
 namespace Libs::Graphics {
 
 // Debugging aid (Windows): with KYTY_DEBUG_SAMPLE_GPU=<period in microseconds> (values below 100
@@ -14,6 +16,10 @@ void StartThreadSampler(const char* name);
 // stacks of all the process's threads to thread-dump-<n>.txt every <seconds>, one "# tid=... name=..."
 // line and one sampler-format stack per thread, to see what a stalled game waits on.
 void StartThreadDumper();
+
+// Windows: the call stack of every other thread of the process, in the dumper's format, each line
+// starting with `prefix` (the stall watch, kernel/stallWatch.h). Elsewhere nothing.
+void DumpAllThreadStacks(FILE* file, const char* prefix);
 
 } // namespace Libs::Graphics
 

@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/stallWatch.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -421,6 +422,7 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     Common::Thread::GetThreadIdUnique());
 
 	if (timo == nullptr) {
+		const LibKernel::GuestWaitScope wait_scope("equeue wait", reinterpret_cast<const void*>(eq), owner->GetName().c_str());
 		*out = owner->WaitForEvents(ev, num, 0);
 	}
 
@@ -428,6 +430,7 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		if (*timo == 0) {
 			*out = owner->GetTriggeredEvents(ev, num);
 		} else {
+			const LibKernel::GuestWaitScope wait_scope("equeue timed wait", reinterpret_cast<const void*>(eq), owner->GetName().c_str());
 			*out = owner->WaitForEvents(ev, num, *timo);
 		}
 	}

@@ -251,7 +251,22 @@ private:
 // Writes the call stack of every other thread of the process to thread-dump-<index>.txt: a
 // "# tid=<id> name=<description>" line, then "1 <frames>" in the sampler's format. Guest code has
 // no unwind data, so a stack usually ends at the first guest frame after the emulator's own.
+void DumpThreadsTo(FILE* file, const char* prefix);
+
 void DumpThreads(uint32_t index) {
+	char path[MAX_PATH];
+	std::snprintf(path, sizeof(path), "thread-dump-%03u.txt", index);
+	FILE* file = std::fopen(path, "w");
+	if (file == nullptr) {
+		return;
+	}
+	std::fprintf(file, "# window=%u seconds=0 samples=0 lost=0 period_us=0\n", index);
+	DumpThreadsTo(file, "");
+	std::fclose(file);
+}
+
+// Each line starts with `prefix` (the stall watch prints into the log).
+void DumpThreadsTo(FILE* file, const char* prefix) {
 	const auto process = GetCurrentProcessId();
 	const auto self    = GetCurrentThreadId();
 	std::vector<DWORD> ids;
@@ -267,13 +282,6 @@ void DumpThreads(uint32_t index) {
 		}
 		CloseHandle(snapshot);
 	}
-	char path[MAX_PATH];
-	std::snprintf(path, sizeof(path), "thread-dump-%03u.txt", index);
-	FILE* file = std::fopen(path, "w");
-	if (file == nullptr) {
-		return;
-	}
-	std::fprintf(file, "# window=%u seconds=0 samples=%zu lost=0 period_us=0\n", index, ids.size());
 	auto       copy    = std::make_unique<uint8_t[]>(StackCopyBytes);
 	const auto modules = ThreadSampler::Modules();
 	for (const auto id: ids) {
@@ -310,7 +318,7 @@ void DumpThreads(uint32_t index) {
 			ResumeThread(thread);
 		}
 		CloseHandle(thread);
-		std::fprintf(file, "# tid=%lu name=%s\n", id, name.empty() ? "-" : name.c_str());
+		std::fprintf(file, "%s# tid=%lu name=%s\n", prefix, id, name.empty() ? "-" : name.c_str());
 		if (size == 0) {
 			continue;
 		}
@@ -318,7 +326,7 @@ void DumpThreads(uint32_t index) {
 		const auto base = reinterpret_cast<uint64_t>(copy.get());
 		RebaseRegisters(context, live, base, size);
 		stack.count = UnwindCopy(&context, live, base, size, stack.frames.data());
-		std::fprintf(file, "1");
+		std::fprintf(file, "%s1", prefix);
 		for (uint32_t i = 0; i < stack.count; i++) {
 			const auto address = stack.frames[i];
 			const ThreadSampler::Module* owner = nullptr;
@@ -338,10 +346,13 @@ void DumpThreads(uint32_t index) {
 		}
 		std::fputc('\n', file);
 	}
-	std::fclose(file);
 }
 
 } // namespace
+
+void DumpAllThreadStacks(FILE* file, const char* prefix) {
+	DumpThreadsTo(file, prefix);
+}
 
 void StartThreadSampler(const char* name) {
 	const char* value = std::getenv("KYTY_DEBUG_SAMPLE_GPU");
@@ -391,6 +402,7 @@ namespace Libs::Graphics {
 
 void StartThreadSampler(const char* /*name*/) {}
 void StartThreadDumper() {}
+void DumpAllThreadStacks(FILE* /*file*/, const char* /*prefix*/) {}
 
 } // namespace Libs::Graphics
 

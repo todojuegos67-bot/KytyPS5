@@ -21,6 +21,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "kernel/stallWatch.h"
 #include "local/frame-gen.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
@@ -941,6 +942,9 @@ void WindowContext::UpdateIcon() {
 
 void WindowContext::UpdateTitle(bool new_frame) {
 	DrainStats::CountFrame(new_frame);
+	if (new_frame) {
+		LibKernel::StallWatchNoteFlip();
+	}
 	if (!frame_statistics.Record(Common::Timer::QueryPerformanceCounter(),
 	                             Common::Timer::QueryPerformanceFrequency(), new_frame)) {
 		return;
