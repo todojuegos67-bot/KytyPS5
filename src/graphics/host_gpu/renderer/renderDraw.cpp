@@ -1350,11 +1350,18 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	const bool shader_time = CommandRecorder::ShaderTimeEnabled();
 	if (shader_time) {
 		uint64_t time_hash = ps_hash;
+		bool     pops      = false;
 		for (const auto* stage: stages) {
 			if (time_hash == 0 && stage->runtime != nullptr && *stage->runtime) {
 				time_hash = stage->runtime->program->shader_hash;
 			}
+			if (stage->runtime != nullptr && *stage->runtime &&
+			    stage->runtime->program->stage == ShaderType::Pixel) {
+				pops = stage->runtime->program->info.uses_pops;
+			}
 		}
+		CommandScheduler::NoteShape(time_hash, rendering.width, rendering.height,
+		                            draw.index_count, draw.instance_count, pops);
 		vk_buffer.shaderTimeBegin(time_hash, false);
 	}
 	if (DrawDiff::Enabled()) {

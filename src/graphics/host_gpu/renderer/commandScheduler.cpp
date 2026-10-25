@@ -160,6 +160,7 @@ struct CommandScheduler::GpuTimer {
 
 	// GPU thread, before the command buffer ends.
 	void End(vk::CommandBuffer command) {
+		ShaderEnd(command);
 		if (open_slot != UINT32_MAX) {
 			command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, pool,
 			                        open_slot * 2 + 1);
@@ -168,7 +169,7 @@ struct CommandScheduler::GpuTimer {
 
 	void Submitted(uint64_t tick) {
 		if (shader_block != UINT32_MAX) {
-			shader_pending.push_back({tick, shader_block, std::move(shader_tags)});
+			shader_pending.push_back({tick, shader_block, shader_used, std::move(shader_tags)});
 			shader_tags.clear();
 			shader_block = UINT32_MAX;
 		}
@@ -181,12 +182,24 @@ struct CommandScheduler::GpuTimer {
 	// KYTY_SHADER_GPU_TIME: each command buffer takes a block of ShaderBlockSize query pairs,
 	// reset at its start (outside any render pass); draws and dispatches past the block, or
 	// while every block is in flight, are not timed.
+	// KYTY_OP_GPU_TIME (live, default 0) also times the copies, fills, clears, resolves,
+	// barriers and dispatches recorded through CommandRecorder outside a shader tag (detiling,
+	// uploads, readbacks...), by call site. Pair 0 of a block spans the whole command buffer,
+	// so every 5 s the GPU time is split exclusively: each tag gets only the time past the end
+	// of the tags recorded before it, and what no tag covers is reported as untagged (binds,
+	// render pass loads/stores, raw command-buffer work, gaps).
+	static bool OpTimeEnabled() {
+		static auto& enabled = Common::LiveSwitches::Get("KYTY_OP_GPU_TIME", 0);
+		return enabled.load(std::memory_order_relaxed) != 0;
+	}
+
 	void ShaderBegin(vk::CommandBuffer command) {
 		shader_block = UINT32_MAX;
 		shader_used  = 0;
 		shader_open  = UINT32_MAX;
+		op_open      = UINT32_MAX;
 		shader_tags.clear();
-		if (!shader_pool || !CommandRecorder::ShaderTimeEnabled()) {
+		if (!shader_pool || (!CommandRecorder::ShaderTimeEnabled() && !OpTimeEnabled())) {
 			return;
 		}
 		for (uint32_t block = 0; block < ShaderBlocks; block++) {
@@ -195,12 +208,27 @@ struct CommandScheduler::GpuTimer {
 				shader_block             = block;
 				command.resetQueryPool(shader_pool, block * ShaderBlockSize * 2,
 				                       ShaderBlockSize * 2);
+				command.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, shader_pool,
+				                        block * ShaderBlockSize * 2);
+				shader_used = 1;
 				return;
 			}
+		}
+		blockless_buffers++;
+	}
+
+	// Before the command buffer ends: the end of pair 0.
+	void ShaderEnd(vk::CommandBuffer command) {
+		ShaderTimeEnd(command);
+		OpTimeEnd(command);
+		if (shader_block != UINT32_MAX) {
+			command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, shader_pool,
+			                        shader_block * ShaderBlockSize * 2 + 1);
 		}
 	}
 
 	void ShaderTimeBegin(vk::CommandBuffer command, uint64_t hash, bool compute) {
+		OpTimeEnd(command);
 		shader_open = UINT32_MAX;
 		if (shader_block == UINT32_MAX || shader_used >= ShaderBlockSize) {
 			return;
@@ -208,7 +236,7 @@ struct CommandScheduler::GpuTimer {
 		shader_open = shader_block * ShaderBlockSize + shader_used++;
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, shader_pool,
 		                        shader_open * 2);
-		shader_tags.push_back({hash, shader_open, compute});
+		shader_tags.push_back({hash, shader_open, static_cast<uint8_t>(compute ? 1 : 0), 0});
 	}
 
 	void ShaderTimeEnd(vk::CommandBuffer command) {
@@ -219,21 +247,80 @@ struct CommandScheduler::GpuTimer {
 		}
 	}
 
+	// KYTY_OP_GPU_TIME: inside a shader tag (a dispatch's own barriers) the op is part of it.
+	void OpTimeBegin(vk::CommandBuffer command, uint32_t site, uint64_t bytes) {
+		if (shader_block == UINT32_MAX || shader_open != UINT32_MAX) {
+			return;
+		}
+		OpTimeEnd(command);
+		if (shader_used >= ShaderBlockSize) {
+			untimed_ops++;
+			return;
+		}
+		op_open = shader_block * ShaderBlockSize + shader_used++;
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, shader_pool, op_open * 2);
+		shader_tags.push_back({site, op_open, 2, bytes});
+	}
+
+	void OpTimeEnd(vk::CommandBuffer command) {
+		if (op_open != UINT32_MAX) {
+			command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, shader_pool,
+			                        op_open * 2 + 1);
+			op_open = UINT32_MAX;
+		}
+	}
+
 	template <typename IsFree>
 	void CollectShaders(IsFree&& is_free) {
 		while (!shader_pending.empty() && is_free(shader_pending.front().tick)) {
 			auto& done = shader_pending.front();
+			// One read for the block: per query its timestamp and its availability.
+			const uint32_t base  = done.block * ShaderBlockSize;
+			const uint32_t pairs = std::max<uint32_t>(done.used, 1);
+			stamp_scratch.assign(static_cast<size_t>(pairs) * 4, 0);
+			const auto result = graphics.device.getQueryPoolResults(
+			    shader_pool, base * 2, pairs * 2, stamp_scratch.size() * sizeof(uint64_t),
+			    stamp_scratch.data(), 2 * sizeof(uint64_t),
+			    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+			const bool read_ok = result == vk::Result::eSuccess || result == vk::Result::eNotReady;
+			auto read_pair = [&](uint32_t slot, std::array<uint64_t, 2>& stamps) {
+				const size_t i = static_cast<size_t>(slot - base) * 4;
+				if (!read_ok || slot < base || slot - base >= pairs || stamp_scratch[i + 1] == 0 ||
+				    stamp_scratch[i + 3] == 0) {
+					return false;
+				}
+				stamps = {stamp_scratch[i], stamp_scratch[i + 2]};
+				return stamps[1] >= stamps[0];
+			};
+			std::array<uint64_t, 2> span {};
+			const bool has_span = read_pair(base, span);
+			uint64_t   last     = has_span ? span[0] : 0;
+			double     tagged   = 0;
 			for (const auto& tag: done.tags) {
 				std::array<uint64_t, 2> stamps {};
-				if (graphics.device.getQueryPoolResults(
-				        shader_pool, tag.slot * 2, 2, sizeof(stamps), stamps.data(),
-				        sizeof(uint64_t), vk::QueryResultFlagBits::e64) == vk::Result::eSuccess &&
-				    stamps[1] >= stamps[0]) {
-					auto& total = shader_totals[tag.hash];
-					total.ns += static_cast<double>(stamps[1] - stamps[0]) * period_ns;
-					total.calls++;
-					total.compute = tag.compute;
+				if (!read_pair(tag.slot, stamps)) {
+					lost_tags++;
+					continue;
 				}
+				const double inclusive = static_cast<double>(stamps[1] - stamps[0]) * period_ns;
+				const auto   from      = std::max(stamps[0], last);
+				const double exclusive =
+				    stamps[1] > from ? static_cast<double>(stamps[1] - from) * period_ns : 0.0;
+				last = std::max(last, stamps[1]);
+				tagged += exclusive;
+				kind_ns[tag.kind] += exclusive;
+				auto& total = tag.kind == 2 ? op_totals[tag.key] : shader_totals[tag.key];
+				total.ns += inclusive;
+				total.exclusive_ns += exclusive;
+				total.calls++;
+				total.bytes += tag.bytes;
+				total.kind = tag.kind;
+			}
+			if (has_span) {
+				const double whole = static_cast<double>(span[1] - span[0]) * period_ns;
+				span_ns += whole;
+				untagged_ns += std::max(0.0, whole - tagged);
+				spanned_buffers++;
 			}
 			shader_block_busy[done.block] = false;
 			shader_pending.pop_front();
@@ -252,13 +339,61 @@ struct CommandScheduler::GpuTimer {
 				::printf("Shader GPU time (5 s): top 20\n");
 				for (size_t i = 0; i < top; i++) {
 					::printf("  %016" PRIx64 " %s %.3f ms in %" PRIu64 " calls\n", sorted[i].first,
-					         sorted[i].second.compute ? "CS" : "PS", sorted[i].second.ns / 1e6,
+					         sorted[i].second.kind == 1 ? "CS" : "PS", sorted[i].second.ns / 1e6,
 					         sorted[i].second.calls);
 				}
-				std::fflush(stdout);
 			}
+			if (spanned_buffers != 0) {
+				// One list, shaders and ops together, by exclusive time.
+				struct Row {
+					uint64_t    key;
+					ShaderTotal total;
+				};
+				std::vector<Row> rows;
+				rows.reserve(shader_totals.size() + op_totals.size());
+				for (const auto& [key, total]: shader_totals) rows.push_back({key, total});
+				for (const auto& [key, total]: op_totals) rows.push_back({key, total});
+				const size_t top = std::min<size_t>(rows.size(), 40);
+				std::partial_sort(rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(top),
+				                  rows.end(), [](const Row& a, const Row& b) {
+					                  return a.total.exclusive_ns > b.total.exclusive_ns;
+				                  });
+				::printf("GPU work (%.1f s): %" PRIu64 " command buffers timed (%" PRIu64
+				         " without a block), span %.1f ms; exclusive: draws %.1f ms, dispatches "
+				         "%.1f ms, ops %.1f ms, untagged %.1f ms; %" PRIu64 " ops untimed (block "
+				         "full), %" PRIu64 " tags lost\n",
+				         elapsed, spanned_buffers, blockless_buffers, span_ns / 1e6,
+				         kind_ns[0] / 1e6, kind_ns[1] / 1e6, kind_ns[2] / 1e6, untagged_ns / 1e6,
+				         untimed_ops, lost_tags);
+				::printf("GPU work (5 s): top %zu by exclusive time (exclusive ms, inclusive ms, "
+				         "calls, MiB)\n",
+				         top);
+				for (size_t i = 0; i < top; i++) {
+					const auto& row = rows[i];
+					if (row.total.kind == 2) {
+						::printf("  OP %-48s %8.3f %8.3f %7" PRIu64 " %8.1f\n",
+						         CommandScheduler::OpSiteName(static_cast<uint32_t>(row.key)).c_str(),
+						         row.total.exclusive_ns / 1e6, row.total.ns / 1e6, row.total.calls,
+						         static_cast<double>(row.total.bytes) / 1048576.0);
+					} else {
+						::printf("  %s %016" PRIx64 "%33s %8.3f %8.3f %7" PRIu64 "          %s\n",
+						         row.total.kind == 1 ? "CS" : "PS", row.key, "",
+						         row.total.exclusive_ns / 1e6, row.total.ns / 1e6, row.total.calls,
+						         CommandScheduler::ShapeText(row.key).c_str());
+					}
+				}
+			}
+			std::fflush(stdout);
 			shader_totals.clear();
-			shader_report = now;
+			op_totals.clear();
+			kind_ns           = {};
+			span_ns           = 0;
+			untagged_ns       = 0;
+			spanned_buffers   = 0;
+			blockless_buffers = 0;
+			untimed_ops       = 0;
+			lost_tags         = 0;
+			shader_report     = now;
 		}
 	}
 
@@ -316,21 +451,25 @@ struct CommandScheduler::GpuTimer {
 	uint64_t                              buffers  = 0;
 	std::chrono::steady_clock::time_point report   = std::chrono::steady_clock::now();
 	static constexpr uint32_t ShaderBlockSize = 1024;
-	static constexpr uint32_t ShaderBlocks    = 32;
+	static constexpr uint32_t ShaderBlocks    = 96;
 	struct ShaderTag {
-		uint64_t hash    = 0;
-		uint32_t slot    = 0;
-		bool     compute = false;
+		uint64_t key   = 0; // shader hash, or the op site (kind 2)
+		uint32_t slot  = 0;
+		uint8_t  kind  = 0; // 0 PS, 1 CS, 2 op
+		uint64_t bytes = 0;
 	};
 	struct ShaderPending {
 		uint64_t               tick  = 0;
 		uint32_t               block = 0;
+		uint32_t               used  = 0;
 		std::vector<ShaderTag> tags;
 	};
 	struct ShaderTotal {
-		double   ns      = 0;
-		uint64_t calls   = 0;
-		bool     compute = false;
+		double   ns           = 0;
+		double   exclusive_ns = 0;
+		uint64_t calls        = 0;
+		uint64_t bytes        = 0;
+		uint8_t  kind         = 0;
 	};
 	vk::QueryPool                             shader_pool  = nullptr;
 	std::array<bool, ShaderBlocks>            shader_block_busy {};
@@ -340,6 +479,16 @@ struct CommandScheduler::GpuTimer {
 	std::vector<ShaderTag>                    shader_tags;
 	std::deque<ShaderPending>                 shader_pending;
 	std::unordered_map<uint64_t, ShaderTotal> shader_totals;
+	std::unordered_map<uint64_t, ShaderTotal> op_totals;
+	std::array<double, 3>                     kind_ns {};
+	double                                    span_ns           = 0;
+	double                                    untagged_ns       = 0;
+	uint64_t                                  spanned_buffers   = 0;
+	uint64_t                                  blockless_buffers = 0;
+	uint64_t                                  untimed_ops       = 0;
+	uint64_t                                  lost_tags         = 0;
+	uint32_t                                  op_open           = UINT32_MAX;
+	std::vector<uint64_t>                     stamp_scratch;
 	std::chrono::steady_clock::time_point     shader_report = std::chrono::steady_clock::now();
 };
 
@@ -349,6 +498,93 @@ void CommandScheduler::ShaderTimeBegin(vk::CommandBuffer command, uint64_t hash,
 
 void CommandScheduler::ShaderTimeEnd(vk::CommandBuffer command) {
 	m_gpu_timer->ShaderTimeEnd(command);
+}
+
+void CommandScheduler::OpTimeBegin(vk::CommandBuffer command, uint32_t site, uint64_t bytes) {
+	m_gpu_timer->OpTimeBegin(command, site, bytes);
+}
+
+void CommandScheduler::OpTimeEnd(vk::CommandBuffer command) {
+	m_gpu_timer->OpTimeEnd(command);
+}
+
+bool CommandScheduler::OpTimeEnabled() {
+	return GpuTimer::OpTimeEnabled();
+}
+
+namespace {
+struct OpSites {
+	std::mutex                             mutex;
+	std::unordered_map<std::string, uint32_t> ids;
+	std::vector<std::string>               names;
+};
+OpSites& Sites() {
+	static OpSites sites;
+	return sites;
+}
+} // namespace
+
+uint32_t CommandScheduler::OpSite(const char* label, const std::source_location& where) {
+	const char* file = where.file_name();
+	for (const char* c = file; *c != '\0'; c++) {
+		if (*c == '/' || *c == '\\') {
+			file = c + 1;
+		}
+	}
+	std::string name = std::string(label) + " " + file + ":" + std::to_string(where.line());
+	auto&       sites = Sites();
+	std::lock_guard lock(sites.mutex);
+	const auto [it, inserted] = sites.ids.try_emplace(name, static_cast<uint32_t>(sites.names.size()));
+	if (inserted) {
+		sites.names.push_back(name);
+	}
+	return it->second;
+}
+
+namespace {
+struct Shape {
+	uint32_t width = 0, height = 0, count = 0, instances = 0;
+	bool     pops  = false;
+};
+struct Shapes {
+	std::mutex                             mutex;
+	std::unordered_map<uint64_t, Shape>    shapes;
+};
+Shapes& AllShapes() {
+	static Shapes shapes;
+	return shapes;
+}
+} // namespace
+
+void CommandScheduler::NoteShape(uint64_t hash, uint32_t width, uint32_t height, uint32_t count,
+                                 uint32_t instances, bool pops) {
+	auto&           shapes = AllShapes();
+	std::lock_guard lock(shapes.mutex);
+	shapes.shapes[hash] = {width, height, count, instances, pops};
+}
+
+std::string CommandScheduler::ShapeText(uint64_t hash) {
+	auto&           shapes = AllShapes();
+	std::lock_guard lock(shapes.mutex);
+	const auto      it = shapes.shapes.find(hash);
+	if (it == shapes.shapes.end()) {
+		return {};
+	}
+	const auto& s = it->second;
+	char        text[96];
+	if (s.width == 0 && s.height == 0) {
+		std::snprintf(text, sizeof(text), "groups %u", s.count);
+	} else {
+		std::snprintf(text, sizeof(text), "%ux%u, %u verts x %u%s", s.width, s.height, s.count,
+		              s.instances, s.pops ? ", POPS" : "");
+	}
+	return text;
+}
+
+std::string CommandScheduler::OpSiteName(uint32_t site) {
+	auto&           sites = Sites();
+	std::lock_guard lock(sites.mutex);
+	return site < sites.names.size() ? sites.names[site] : std::string("?");
 }
 
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
