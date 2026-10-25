@@ -23,6 +23,19 @@
 // Read watchers go at once after a touch by game code (a guest thread holds no lock of the emulator's) or a host write or
 // unmap (normal context); after one by the emulator's own code the fault handler only gives the pages a protection that
 // lets the access through, and the render thread removes them (Drain).
+//
+// KYTY_TEXTURE_SPILL=1 (default in the low-RAM profile, with the offload): the levels KYTY_TEXTURE_REDUCE leaves out of a
+// large 2D texture (descriptors.cpp HoldFromBaseLevel: the image holds only the first bytes of the texture's memory, its
+// smaller levels) are bytes the emulator never reads again: no image holds them, nothing uploads them, and the offload
+// cannot drop them (no image to download them from). With one level left out they are 3/4 of each such texture (at 1-1
+// its BC textures took 3.7 GiB whole, 0.9 GiB reduced). Their whole pages (a "tail" range: no image over them, nothing
+// the GPU wrote) are taken as the offload takes a texture (read watchers on the guest view), written to a scratch file
+// by the offload worker (the store alias read-only meanwhile: a write there is a touch), dropped from RAM
+// (DiscardVirtualMemory) and the alias made inaccessible. A touch reads them back from the file on the thread that
+// touched (any thread: no GPU work, so no misses), under the offload's lock, then goes on as the offload's touch; an
+// upload of an image over them, a host write over part of them likewise; an unmap or a host write over all of them only
+// drops them. Never the page file and no working set trim of pages that hold data (the 0x1A bug checks), and no
+// guess: the bytes come back as they were. KYTY_TEXTURE_SPILL_MB (default 64): the tails taken a scan (every 2 s).
 
 #include "guest-lazy-commit.h"
 
@@ -86,6 +99,7 @@ enum class Touch : uint8_t {
 	Unmap,
 	Upload,
 	ImageGone,
+	SpillFailed,
 	Count
 };
 
@@ -100,7 +114,8 @@ inline const char* TouchName(Touch touch) {
 	                              "host write over all",
 	                              "unmap",
 	                              "image upload over it",
-	                              "image gone"};
+	                              "image gone",
+	                              "spill file write failed"};
 	return names[static_cast<int>(touch)];
 }
 
@@ -118,6 +133,9 @@ struct Range {
 	bool                                  missed    = false; // (discarded and touched by a thread that could not wait)
 	bool                                  restoring = false; // (its restore runs: other touches wait for its end)
 	std::thread::id                       restorer {};       // (the thread restoring it; none: the offload worker)
+	uint64_t                              spill   = ~uint64_t {0}; // (KYTY_TEXTURE_SPILL: a tail range's file offset)
+	bool                                  spilled = false;         // (its bytes in the file and dropped from RAM)
+	[[nodiscard]] bool                    IsTail() const { return spill != ~uint64_t {0}; }
 };
 
 // Set by the texture cache: the page manager's read watchers of a guest range removed; a restore of the discarded ranges
@@ -147,11 +165,54 @@ struct State {
 	std::atomic<uint64_t> restoring_ranges {0}, read_waits {0}, read_wait_bytes {0};
 	std::unordered_map<uint64_t, uint64_t> rips;    // the emulator's instructions -> touches
 	std::unordered_map<uint64_t, uint64_t> callers; // their callers (one frame unwound) -> touches
+	// KYTY_TEXTURE_SPILL: the scratch file, its next free offset and freed blocks (offset, size), and statistics.
+	uint64_t                                   spill_file = 0, spill_end = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> spill_free;
+	uint64_t tails_now = 0, tails_peak = 0, tails_taken = 0, tails_taken_bytes = 0, tails_written = 0, tails_written_bytes = 0;
+	uint64_t tails_write_us = 0, tails_restores = 0, tails_restore_bytes = 0, tails_restore_us = 0, tails_restore_us_max = 0;
+	uint64_t tails_lost = 0, tails_dropped = 0, tails_open_failed = 0;
 };
 
 inline State& Get() {
 	static State state;
 	return state;
+}
+
+// KYTY_TEXTURE_SPILL=1 (see above; with the offload only).
+inline bool SpillEnabled() {
+#if defined(_WIN32)
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_SPILL");
+		return value != nullptr && value[0] == '1' && GetMode() == Mode::Offload;
+	}();
+	return on;
+#else
+	return false;
+#endif
+}
+// A tail range's serial: its image's with this bit (never an image's own).
+constexpr uint64_t TailSerialBit = uint64_t {1} << 63u;
+constexpr uint64_t SpillBlock    = uint64_t {64} << 10u;
+
+// (state.mutex held) A file block for `size` bytes: a freed one that fits (first fit), else the file's end.
+inline uint64_t AllocateSpillLocked(State& state, uint64_t size) {
+	size = (size + SpillBlock - 1) & ~(SpillBlock - 1);
+	for (auto it = state.spill_free.begin(); it != state.spill_free.end(); ++it) {
+		if (it->second < size) continue;
+		const uint64_t offset = it->first;
+		if (it->second == size) state.spill_free.erase(it);
+		else *it = {it->first + size, it->second - size};
+		return offset;
+	}
+	const uint64_t offset = state.spill_end;
+	state.spill_end += size;
+	return offset;
+}
+
+// (state.mutex held) A tail range leaving the maps: its file block free again.
+inline void ReleaseSpillLocked(State& state, const Range& range, uint64_t size) {
+	if (!range.IsTail()) return;
+	state.spill_free.emplace_back(range.spill, (size + SpillBlock - 1) & ~(SpillBlock - 1));
 }
 
 #if defined(_WIN32)
@@ -181,10 +242,16 @@ inline uint64_t CallerOf(const void* native_context) {
 
 // A guest range [vaddr, vaddr + size) taken, with its backing pieces and image (texture cache, render thread; the
 // caller protects, and discards, after).
-inline void Add(uint64_t vaddr, uint64_t size, std::vector<Piece> pieces, uint64_t serial, uint64_t image, bool discarded) {
+inline void Add(uint64_t vaddr, uint64_t size, std::vector<Piece> pieces, uint64_t serial, uint64_t image, bool discarded,
+                bool tail = false) {
 	auto&           state = Get();
 	std::lock_guard lock(state.mutex);
 	Range           range;
+	if (tail) {
+		range.spill = AllocateSpillLocked(state, size);
+		state.tails_taken++;
+		state.tails_taken_bytes += size;
+	}
 	range.guest_end = vaddr + size;
 	range.pieces    = std::move(pieces);
 	range.serial    = serial;
@@ -199,7 +266,9 @@ inline void Add(uint64_t vaddr, uint64_t size, std::vector<Piece> pieces, uint64
 	}
 	if (vaddr < state.guest_lo.load(std::memory_order_relaxed)) state.guest_lo.store(vaddr, std::memory_order_relaxed);
 	if (vaddr + size > state.guest_hi.load(std::memory_order_relaxed)) state.guest_hi.store(vaddr + size, std::memory_order_relaxed);
+	const bool is_tail = range.IsTail();
 	state.guest.emplace(vaddr, std::move(range));
+	if (is_tail) return; // (counted when written: SpillRange)
 	state.now += size;
 	state.peak = std::max(state.peak, state.now);
 	state.total += size;
@@ -227,6 +296,7 @@ inline bool DiscardRange(uint64_t begin) {
 	}
 	return true;
 }
+
 #endif
 
 // Not to be taken: a range of it is taken, or the image was touched once.
@@ -304,6 +374,12 @@ inline void CountLocked(State& state, std::map<uint64_t, Range>::iterator it, To
 	if (rip != 0) state.rips[rip]++;
 	if (caller != 0) state.callers[caller]++;
 	state.touched_serials.insert(range.serial);
+	if (range.IsTail()) {
+		// (A tail touched while dropped: its restore came first, or an unmap or a whole overwrite drops it.)
+		if (range.spilled) state.tails_now -= std::min(state.tails_now, size);
+		range.spilled = false;
+		return;
+	}
 	state.now -= std::min(state.now, size);
 }
 
@@ -321,6 +397,111 @@ inline void TouchLocked(State& state, std::map<uint64_t, Range>::iterator it, To
 	state.pending.push_back(it->first);
 }
 
+#if defined(_WIN32)
+// (state.mutex held) A tail range's bytes back in RAM (KYTY_TEXTURE_SPILL): the alias writable, the file's bytes read
+// into it when they were dropped. After it the range is an untouched offload range that holds its bytes: the caller
+// touches it (TouchLocked) as any other.
+inline void RestoreSpillLocked(State& state, Range& range, uint64_t size) {
+	if (!range.IsTail() || !range.discarded) return;
+	for (const auto& piece: range.pieces) (void)Protect(piece.backing, piece.size, PAGE_READWRITE);
+	if (range.spilled) {
+		const auto start  = std::chrono::steady_clock::now();
+		uint64_t   offset = range.spill;
+		bool       ok     = true;
+		for (const auto& piece: range.pieces) {
+			ok = LocalPlatform::ReadScratchFile(state.spill_file, offset, reinterpret_cast<void*>(piece.backing), piece.size) && ok;
+			offset += piece.size;
+		}
+		const auto us = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+		state.tails_restores++;
+		state.tails_restore_bytes += size;
+		state.tails_restore_us += us;
+		state.tails_restore_us_max = std::max(state.tails_restore_us_max, us);
+		state.tails_now -= std::min(state.tails_now, size);
+		if (!ok) {
+			state.tails_lost++;
+			std::printf("Texture tails: LOST 0x%llx+0x%llx (the spill file could not be read back: zeros)\n",
+			            static_cast<unsigned long long>(range.pieces.empty() ? 0 : range.pieces.front().backing),
+			            static_cast<unsigned long long>(size));
+		}
+		range.spilled = false;
+	}
+	range.discarded = false;
+}
+
+// The offload worker's spill of tail range `begin` (KYTY_TEXTURE_SPILL): its bytes written to the scratch file with the
+// alias read-only (a write through it faults: a touch, and the range is left alone), then, unless it was touched
+// meanwhile, dropped (DiscardVirtualMemory a MiB at a time) and the alias made inaccessible. True when dropped (the
+// caller trims the guest view's pages, as after DiscardRange).
+inline bool SpillRange(uint64_t begin) {
+	auto&              state = Get();
+	std::vector<Piece> pieces;
+	uint64_t           offset = 0, size = 0;
+	{
+		std::lock_guard lock(state.mutex);
+		const auto      it = state.guest.find(begin);
+		if (it == state.guest.end() || !it->second.IsTail() || it->second.touched || !it->second.discarded || it->second.spilled)
+			return false;
+		if (state.spill_file == 0) {
+			state.spill_file = LocalPlatform::OpenScratchFile();
+			if (state.spill_file == 0) {
+				if (state.tails_open_failed++ == 0) std::printf("Texture tails: no scratch file could be made: KYTY_TEXTURE_SPILL does nothing\n");
+				return false;
+			}
+		}
+		pieces = it->second.pieces;
+		offset = it->second.spill;
+		size   = it->second.guest_end - begin;
+		for (const auto& piece: pieces) (void)Protect(piece.backing, piece.size, PAGE_READONLY);
+	}
+	const auto start = std::chrono::steady_clock::now();
+	bool       ok    = true;
+	uint64_t   at    = offset;
+	for (const auto& piece: pieces) {
+		ok = ok && LocalPlatform::WriteScratchFile(state.spill_file, at, reinterpret_cast<const void*>(piece.backing), piece.size);
+		at += piece.size;
+	}
+	const auto us = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+	std::lock_guard lock(state.mutex);
+	const auto      it = state.guest.find(begin);
+	// (Touched meanwhile: the touch gave its protections back and the range goes with its watchers: Drain.)
+	if (it == state.guest.end() || it->second.touched) {
+		state.tails_dropped++;
+		return false;
+	}
+	auto& range = it->second;
+	if (!ok) {
+		// (Nothing dropped: its bytes are all there. Its watchers go as a touch's.)
+		range.discarded = false;
+		TouchLocked(state, it, Touch::SpillFailed);
+		return false;
+	}
+	constexpr uint64_t Chunk = uint64_t {1} << 20u;
+	for (const auto& piece: pieces) {
+		for (uint64_t done = 0; done < piece.size; done += Chunk) {
+			const auto bytes = std::min(Chunk, piece.size - done);
+			auto*      where = reinterpret_cast<void*>(piece.backing + done);
+			if (DiscardVirtualMemory(where, bytes) != ERROR_SUCCESS) {
+				// (Refused on read-only pages: writable for the call, under the lock: a write meanwhile is the emulator's
+				// own through the alias, which the read-only pages made fault until now.)
+				(void)Protect(piece.backing + done, bytes, PAGE_READWRITE);
+				(void)DiscardVirtualMemory(where, bytes);
+			}
+		}
+		(void)Protect(piece.backing, piece.size, PAGE_NOACCESS);
+	}
+	range.spilled = true;
+	state.tails_now += size;
+	state.tails_peak = std::max(state.tails_peak, state.tails_now);
+	state.tails_written++;
+	state.tails_written_bytes += size;
+	state.tails_write_us += us;
+	return true;
+}
+#endif
+
 // (state.mutex held) The queued ranges out of the maps (missed discarded ones stay for their restore: Drain): their guest
 // ranges, for the caller to remove the watchers of.
 inline std::vector<std::pair<uint64_t, uint64_t>> TakePendingLocked(State& state) {
@@ -335,6 +516,7 @@ inline std::vector<std::pair<uint64_t, uint64_t>> TakePendingLocked(State& state
 		}
 		ranges.emplace_back(begin, range->second.guest_end - begin);
 		for (const auto& piece: range->second.pieces) state.backing.erase(piece.backing);
+		ReleaseSpillLocked(state, range->second, range->second.guest_end - begin);
 		state.guest.erase(range);
 	}
 	state.pending.swap(kept);
@@ -360,7 +542,8 @@ inline std::vector<Restoring> BeginRestore(uint64_t vaddr, uint64_t size, Touch 
 	std::lock_guard        lock(state.mutex);
 	for (auto it = FirstOver(state, vaddr); it != state.guest.end() && it->first < vaddr + size; ++it) {
 		auto& range = it->second;
-		if (!range.discarded || range.restoring || (range.touched && !(late && range.missed))) continue;
+		// (Tails come back from their file first: RestoreSpilled.)
+		if (range.IsTail() || !range.discarded || range.restoring || (range.touched && !(late && range.missed))) continue;
 		if (!range.touched && touch != Touch::Count) CountLocked(state, it, touch);
 		range.touched   = true;
 		range.restoring = true;
@@ -380,6 +563,7 @@ inline void EndRestore(const std::vector<Restoring>& ranges, uint64_t bytes, uin
 		if (range == state.guest.end()) continue;
 		if (range->second.restoring) state.restoring_ranges.fetch_sub(1, std::memory_order_acq_rel);
 		for (const auto& piece: range->second.pieces) state.backing.erase(piece.backing);
+		ReleaseSpillLocked(state, range->second, range->second.guest_end - restored.begin);
 		state.guest.erase(range);
 	}
 	std::erase_if(state.pending, [&](uint64_t begin) { return state.guest.find(begin) == state.guest.end(); });
@@ -389,6 +573,30 @@ inline void EndRestore(const std::vector<Restoring>& ranges, uint64_t bytes, uin
 	state.restore_us_max = std::max(state.restore_us_max, us);
 	state.lost += lost;
 }
+
+#if defined(_WIN32)
+// The tails over [vaddr, vaddr + size) back from their file and touched (TextureCache::RestoreOffloaded, first: an image
+// upload over them, a restore's caller); their read watchers go at once (the render thread).
+inline void RestoreSpilled(uint64_t vaddr, uint64_t size, Touch touch) {
+	auto& state = Get();
+	if (size == 0 || vaddr + size <= state.guest_lo.load(std::memory_order_relaxed) || vaddr >= state.guest_hi.load(std::memory_order_relaxed))
+		return;
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	{
+		std::lock_guard lock(state.mutex);
+		bool            any = false;
+		for (auto it = FirstOver(state, vaddr); it != state.guest.end() && it->first < vaddr + size; ++it) {
+			if (!it->second.IsTail() || it->second.touched) continue;
+			RestoreSpillLocked(state, it->second, it->second.guest_end - it->first);
+			TouchLocked(state, it, touch == Touch::Count ? Touch::Upload : touch);
+			any = true;
+		}
+		if (!any) return;
+		ranges = TakePendingLocked(state);
+	}
+	RemoveAll(state, ranges);
+}
+#endif
 
 inline void NoteCheck(uint64_t images, uint64_t bytes, uint64_t failed) {
 	auto&           state = Get();
@@ -462,6 +670,8 @@ inline bool OnFault(uint64_t address, uint64_t rip, const void* native_context, 
 				now = TakePendingLocked(state);
 			}
 		} else {
+			// A tail's bytes back from its file on this thread (no GPU work: any thread may), then a touch as any other's.
+			if (range.IsTail()) RestoreSpillLocked(state, range, range.guest_end - it->first);
 			const Touch touch = backing_hit ? (write ? Touch::BackingWrite : Touch::BackingRead)
 			                    : host      ? (write ? Touch::EmulatorGuestWrite : Touch::EmulatorGuestRead)
 			                                : (write ? Touch::GameWrite : Touch::GameRead);
@@ -521,6 +731,13 @@ inline void OnHostAccess(uint64_t vaddr, uint64_t size, bool unmap, bool over_al
 				continue;
 			}
 			if (!unmap && !covered && it->second.discarded) {
+#if defined(_WIN32)
+				if (it->second.IsTail()) {
+					RestoreSpillLocked(state, it->second, it->second.guest_end - it->first);
+					TouchLocked(state, it, Touch::HostWrite);
+					continue;
+				}
+#endif
 				restore.emplace_back(it->first, it->second.guest_end - it->first);
 				continue;
 			}
@@ -600,6 +817,17 @@ inline void Report(bool force) {
 		            state.restore_bytes / MiB, state.restore_us / 1000.0, state.restore_us_max / 1000.0,
 		            static_cast<unsigned long long>(state.lost), static_cast<unsigned long long>(state.missed), state.missed_bytes / MiB,
 		            static_cast<unsigned long long>(state.read_waits.load()), state.read_wait_bytes.load() / MiB);
+	}
+	if (SpillEnabled()) {
+		std::printf("Texture tails (KYTY_TEXTURE_SPILL): %.0f MiB out of RAM now in the spill file (peak %.0f); taken %llu (%.0f MiB), "
+		            "written %llu (%.0f MiB, %.0f ms), dropped before written %llu; read back %llu (%.0f MiB, %.1f ms, at most %.1f ms), "
+		            "lost %llu; file %.0f MiB (%zu free blocks)\n",
+		            state.tails_now / MiB, state.tails_peak / MiB, static_cast<unsigned long long>(state.tails_taken),
+		            state.tails_taken_bytes / MiB, static_cast<unsigned long long>(state.tails_written), state.tails_written_bytes / MiB,
+		            state.tails_write_us / 1000.0, static_cast<unsigned long long>(state.tails_dropped),
+		            static_cast<unsigned long long>(state.tails_restores), state.tails_restore_bytes / MiB, state.tails_restore_us / 1000.0,
+		            state.tails_restore_us_max / 1000.0, static_cast<unsigned long long>(state.tails_lost), state.spill_end / MiB,
+		            state.spill_free.size());
 	}
 #if defined(_WIN32)
 	const auto exe  = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));

@@ -417,6 +417,10 @@ public:
 	mutable uint32_t level_view         = UINT32_MAX;
 	mutable uint64_t level_begin        = 0;
 	mutable uint64_t level_end          = 0;
+	// KYTY_TEXTURE_REDUCE: the end of the whole texture's memory when this image holds only its first bytes (its levels
+	// past the left-out ones, one layer); 0 otherwise. Past the image's end up to it: the left-out levels' bytes, which
+	// KYTY_TEXTURE_SPILL takes out of RAM (texture-offload.h).
+	uint64_t         reduced_end        = 0;
 
 private:
 	friend struct ImageTestAccess;

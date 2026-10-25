@@ -4347,6 +4347,12 @@ void TextureCache::OffloadScan(uint64_t tick) {
 	};
 	std::unordered_map<uint64_t, uint64_t>        seen;
 	std::vector<ImageId>                          take;
+	// KYTY_TEXTURE_SPILL (texture-offload.h): tails of reduced textures clean at two scans: [begin, end), serial.
+	const bool spill = offload && TextureOffload::SpillEnabled();
+	struct TailCandidate {
+		uint64_t begin = 0, end = 0, serial = 0;
+	};
+	std::vector<TailCandidate> tails;
 	std::vector<std::pair<ImageId, DownloadPlan>> check;
 	uint64_t                                      check_bytes = 0;
 	m_slot_images.ForEach([&](ImageId id, Image& image) {
@@ -4355,9 +4361,18 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		    image.usage.video_out || !image.IsTracked() || !image.untracked_holes.empty())
 			return;
 		const auto [begin, end] = pages_of(image);
-		if (end <= begin || end - begin < MinSize) return;
+		const bool small = end <= begin || end - begin < MinSize;
+		if (small && (!spill || image.reduced_end == 0)) return;
 		const auto first   = m_offload_clean.find(image.serial);
 		seen[image.serial] = first != m_offload_clean.end() ? first->second : tick;
+		// (Its tail: whole pages past the image's last byte up to the texture's end.)
+		if (spill && first != m_offload_clean.end() && image.reduced_end > image.info.data.End() && image.backing.image != nullptr) {
+			const uint64_t tail_begin = (image.info.data.End() + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+			const uint64_t tail_end   = image.reduced_end & ~(TRACKER_PAGE_SIZE - 1);
+			if (tail_end > tail_begin && tail_end - tail_begin >= MinSize)
+				tails.push_back({tail_begin, tail_end, image.serial | TextureOffload::TailSerialBit});
+		}
+		if (small) return;
 		if (first == m_offload_clean.end() || TextureOffload::Taken(begin, end - begin, image.serial)) return;
 		if (!offload) {
 			take.push_back(id);
@@ -4440,6 +4455,57 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		mark = Clock::now();
 		for (const auto& piece: pieces) (void)TextureOffload::Protect(piece.backing, piece.size, PAGE_NOACCESS);
 		ms[4] += since(mark);
+	}
+	// The tails (KYTY_TEXTURE_SPILL): no image over their pages, nothing the GPU wrote there, written bytes in them, all
+	// in the backing store; KYTY_TEXTURE_SPILL_MB of them a scan. Taken as a texture is (read watchers), written to the
+	// file and dropped by the worker.
+	std::vector<std::pair<uint64_t, uint64_t>> spills;
+	if (spill && !tails.empty()) {
+		static const uint64_t SpillBudget = [] {
+			const char* value = std::getenv("KYTY_TEXTURE_SPILL_MB");
+			return (value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {64}) << 20u;
+		}();
+		uint64_t taken = 0;
+		for (const auto& tail: tails) {
+			if (taken >= SpillBudget) break;
+			const uint64_t size = tail.end - tail.begin;
+			if (TextureOffload::Taken(tail.begin, size, tail.serial) || HasPendingDownload(tail.begin, size) ||
+			    m_buffer_cache.HasGpuDirtyBytes(tail.begin, size) || !FindImagesInRegion(tail.begin, size, true).empty())
+				continue;
+			std::vector<TextureOffload::Piece> pieces;
+			uint64_t                           covered = 0;
+			for (uint64_t at = tail.begin; at < tail.end;) {
+				const auto  mapping_end = Libs::LibKernel::Memory::BackingMappingEnd(at);
+				const auto  piece       = mapping_end > at ? std::min(mapping_end, tail.end) - at : 0;
+				const auto* backing     = piece != 0 ? Libs::LibKernel::Memory::TryGetBackingPointer(at, piece) : nullptr;
+				if (backing == nullptr) break;
+				pieces.push_back({reinterpret_cast<uint64_t>(backing), piece});
+				covered += piece;
+				at += piece;
+			}
+			if (covered != size) continue;
+			// (Never written: zero pages nobody holds in RAM, nothing to gain.)
+			uint64_t written = 0;
+			(void)FreshMemory::ForEachRun(tail.begin, size, [&](uint64_t, uint64_t bytes, bool is_fresh) {
+				if (!is_fresh) written += bytes;
+			});
+			if (FreshMemory::Get() != nullptr && written == 0) continue;
+			auto mark = Clock::now();
+			AsyncUpload::DrainRange(tail.begin, size);
+			ms[1] += since(mark);
+			TextureOffload::Add(tail.begin, size, std::move(pieces), tail.serial, 0, true, true);
+			mark = Clock::now();
+			m_page_manager.UpdateReadWatchers<true>(tail.begin, size);
+			ms[2] += since(mark);
+			spills.emplace_back(tail.begin, size);
+			taken += size;
+		}
+	}
+	if (!spills.empty()) {
+		OffloadWorker::Post([spills = std::move(spills)] {
+			for (const auto& [begin, size]: spills)
+				if (TextureOffload::SpillRange(begin)) Libs::LibKernel::Memory::TrimGuestRange(begin, size);
+		});
 	}
 	// The pages dropped by the worker thread (DiscardVirtualMemory took 10-90 ms of the render thread a scan): until then
 	// they hold their bytes, and a restore meanwhile has nothing to wait for.
@@ -4539,6 +4605,8 @@ void TextureCache::RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch
 #if defined(_WIN32)
 	if (CommandScheduler::ThreadRecorder() != nullptr) throw CommandScheduler::RecorderRefusal {"texture offload restore"};
 	const auto touch  = static_cast<TextureOffload::Touch>(touch_value);
+	// (Tails, KYTY_TEXTURE_SPILL: read back from their file now, on this thread.)
+	if (TextureOffload::SpillEnabled()) TextureOffload::RestoreSpilled(vaddr, size, touch);
 	auto       ranges = TextureOffload::BeginRestore(vaddr, size, touch, touch == TextureOffload::Touch::Count, async);
 	if (ranges.empty()) return;
 	const auto                         start = std::chrono::steady_clock::now();

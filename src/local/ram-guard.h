@@ -8,6 +8,9 @@
 //   KYTY_SOFT_RELEASE=1          heaps compacted and idle scratch buffers freed on quiet frames (no working set trim)
 //   KYTY_RAM_DIET=1              driver pipelines idle 180 s released, replaced unoptimized ones after 60 s
 //   KYTY_PREFETCH_MIN_AVAIL_MB=3072  the shader prefetch waits while less RAM than that is left
+//   KYTY_TEXTURE_OFFLOAD=1       clean sampled textures' guest bytes dropped from RAM (texture-offload.h)
+//   KYTY_TEXTURE_SPILL=1         the levels KYTY_TEXTURE_REDUCE leaves out of large textures, which nothing reads, moved
+//                                to a scratch file and dropped from RAM; read back on a touch (texture-offload.h)
 //   KYTY_BACKING_ON_DEMAND=1     the guest store's page-file section committed as the game maps it, not 13.5 GiB at
 //                                launch (KYTY_LOWRAM_ON_DEMAND=0 keeps it all committed; never with KYTY_BACKING_FILE or
 //                                KYTY_GUEST_LAZY_COMMIT)
@@ -27,6 +30,12 @@
 // does), the shader prefetch held. Never the working set (no EmptyWorkingSet / SetProcessWorkingSetSize), never the
 // page file, never guest memory.
 // A line every KYTY_RAM_LOG_SECONDS (default 30, 0 none): private commit, working set, available RAM, commit headroom.
+// With it, "RAM breakdown" (KYTY_WS_BREAKDOWN=1|0; default on in the low-RAM profile or a simulation): the working set
+// by kind, sampled (QueryWorkingSetEx on one page in every KYTY_WS_BREAKDOWN_STRIDE_KB, default 64 KiB, in batches
+// with the thread yielding between them): guest memory at the game's views and at the emulator's store alias (and
+// pages resident at both, which the working set counts twice and RAM once; "never written": zero pages someone read),
+// the emulator's private memory by allocation size (and the most resident allocations), other mapped views, code; the
+// guest store's commit and how much of it was never written (commit only, no RAM unless read).
 //
 // Simulation (to test the flush on a big PC): KYTY_SIMULATE_RAM_MB=<n> (as on a PC with n MiB) makes the watcher
 // count n MiB of RAM less KYTY_SIMULATE_OS_MB (default 3072, Windows and other programs) less the emulator's working

@@ -48,6 +48,9 @@ public:
 		ImageInfo     info;
 		ImageViewInfo view_info;
 		BindingType   type = BindingType::Texture;
+		// (descriptors.cpp HoldFromBaseLevel: the whole texture's end when `info` is its levels past the ones
+		// KYTY_TEXTURE_REDUCE left out, a 2D texture's first bytes; 0 otherwise. Image::reduced_end.)
+		uint64_t      reduced_end = 0;
 	};
 
 	// A depth-compare sample may read an R32 float image as it is (ResolveDepthOverlap: the spot-shadow pool).

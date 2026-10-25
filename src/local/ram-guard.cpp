@@ -1,5 +1,6 @@
 #include "ram-guard.h"
 
+#include "fresh-memory.h"
 #include "guest-lazy-commit.h"
 #include "local-platform.h"
 #include "mem-guard.h"
@@ -25,6 +26,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>
 #endif
 
 namespace RamGuard {
@@ -110,6 +112,10 @@ void ApplyLowRamDefaults() {
 		SetDefault("KYTY_SOFT_RELEASE", "1", &set);
 		SetDefault("KYTY_RAM_DIET", "1", &set);
 		SetDefault("KYTY_PREFETCH_MIN_AVAIL_MB", "3072", &set);
+		// Clean sampled textures' guest bytes out of RAM (their images give them back), and the levels KYTY_TEXTURE_REDUCE
+		// leaves out of large textures (no image holds them) into a scratch file: texture-offload.h.
+		SetDefault("KYTY_TEXTURE_OFFLOAD", "1", &set);
+		SetDefault("KYTY_TEXTURE_SPILL", "1", &set);
 		// (No video memory budget of its own: 5120 MiB, 10-24, left the video memory in use at 9.1-9.4 GB anyway - what
 		// holds it is not the collector's images - and only made the collector and pipeline eviction churn.)
 		// The guest store committed as it is mapped (the game maps ~11.3 of its 13.5 GiB): only for the page-file
@@ -443,6 +449,220 @@ void FlushPass(const Settings& s, HANDLE low_memory, uint64_t store, FlushState*
 	std::fflush(stdout);
 }
 
+// KYTY_WS_BREAKDOWN (ram-guard.h): the working set by kind, from QueryWorkingSetEx on one page in every `stride`
+// bytes of the committed address space (an estimate: each sampled page stands for `stride` bytes), in batches of
+// 2048 pages with the thread yielding between them (each call holds the working set lock over its pages only).
+// Guest memory is counted at both of its addresses: the game's views (a sampled page there is also looked up at its
+// store alias address, so pages resident at both - counted twice in the working set, once in RAM - are known) and the
+// emulator's alias; "never written" is the fresh-memory granules' (zero pages someone read).
+struct WsCategory {
+	uint64_t committed = 0, resident = 0, fresh = 0, both = 0;
+};
+enum WsKind : int {
+	WsGuestView = 0,
+	WsAlias,
+	WsOtherMapped,
+	WsHeap,
+	WsExec,
+	WsRwLarge,
+	WsRwMid,
+	WsRwSmall,
+	WsPrivateOther,
+	WsImage,
+	WsKinds
+};
+
+bool WsBreakdownWanted(const Settings& s) {
+	if (const char* value = Env("KYTY_WS_BREAKDOWN"); value != nullptr) return value[0] == '1';
+	return LowRam() || s.sim_ram != 0 || s.sim_commit_limit != 0;
+}
+
+void WsBreakdown() {
+	static const uint64_t stride = [] {
+		const char*    text = Env("KYTY_WS_BREAKDOWN_STRIDE_KB");
+		const uint64_t kb   = text != nullptr ? std::strtoull(text, nullptr, 10) : 64;
+		return (std::clamp<uint64_t>(kb, 4, 1024) * 1024u) & ~uint64_t {4095};
+	}();
+	const auto start = Clock::now();
+	struct Region {
+		uint64_t base, size, alloc;
+		DWORD    type, protect;
+	};
+	std::vector<Region> regions;
+	regions.reserve(65536);
+	std::vector<std::pair<uint64_t, uint64_t>> heaps; // (allocation bases of the process heaps)
+	{
+		HANDLE      handles[256];
+		const DWORD n = GetProcessHeaps(256, handles);
+		for (DWORD i = 0; i < n && i < 256; i++) {
+			MEMORY_BASIC_INFORMATION h {};
+			if (VirtualQuery(handles[i], &h, sizeof(h)) == sizeof(h)) heaps.emplace_back(reinterpret_cast<uint64_t>(h.AllocationBase), 0);
+		}
+	}
+	MEMORY_BASIC_INFORMATION info {};
+	for (uint64_t at = 0x10000; VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) == sizeof(info);) {
+		const uint64_t base = reinterpret_cast<uint64_t>(info.BaseAddress);
+		// (No-access pages too: the trackers' watched pages stay resident.)
+		if (info.State == MEM_COMMIT)
+			regions.push_back({base, info.RegionSize, reinterpret_cast<uint64_t>(info.AllocationBase), info.Type, info.Protect});
+		const uint64_t next = base + info.RegionSize;
+		if (next <= at) break;
+		at = next;
+	}
+	// Committed private bytes per allocation (its size class) and the store alias's range.
+	std::vector<std::pair<uint64_t, uint64_t>> alloc_committed; // base, committed
+	for (const auto& r: regions) {
+		if (r.type != MEM_PRIVATE) continue;
+		if (alloc_committed.empty() || alloc_committed.back().first != r.alloc) alloc_committed.emplace_back(r.alloc, 0);
+		alloc_committed.back().second += r.size;
+	}
+	const auto committed_of = [&](uint64_t alloc) {
+		auto it = std::lower_bound(alloc_committed.begin(), alloc_committed.end(), std::pair<uint64_t, uint64_t> {alloc, 0});
+		return it != alloc_committed.end() && it->first == alloc ? it->second : 0;
+	};
+	std::sort(alloc_committed.begin(), alloc_committed.end());
+	const auto alias      = reinterpret_cast<uint64_t>(g_store_alias.load(std::memory_order_relaxed));
+	const auto alias_size = g_store_size.load(std::memory_order_relaxed);
+	auto*      fresh      = FreshMemory::Get();
+	const auto is_fresh   = [&](uint64_t backing) {
+        if (fresh == nullptr) return false;
+        const auto granule = FreshMemory::GranuleOf(*fresh, backing);
+        return granule != UINT64_MAX && !FreshMemory::IsWritten(*fresh, granule);
+	};
+	WsCategory                       cat[WsKinds] {};
+	std::vector<std::pair<uint64_t, uint64_t>> private_resident; // allocation base, resident (sampled)
+	// One batch: entries and what each is (kind; for a guest-view page, the index of its alias twin, or -1).
+	constexpr size_t                          Batch = 2048;
+	std::vector<PSAPI_WORKING_SET_EX_INFORMATION> entries;
+	struct Tag {
+		int      kind;
+		int32_t  twin;   // (guest view: the alias entry's index; -1 none)
+		bool     fresh;
+		uint64_t alloc;  // (private: its allocation base)
+	};
+	std::vector<Tag> tags;
+	entries.reserve(Batch + 2);
+	tags.reserve(Batch + 2);
+	uint64_t calls = 0;
+	const auto flush = [&] {
+		if (entries.empty()) return;
+		if (QueryWorkingSetEx(GetCurrentProcess(), entries.data(), static_cast<DWORD>(entries.size() * sizeof(entries[0]))) != 0) {
+			for (size_t i = 0; i < entries.size(); i++) {
+				const auto& tag = tags[i];
+				if (tag.kind < 0) continue; // (an alias twin: counted through its guest page)
+				const bool valid = entries[i].VirtualAttributes.Valid != 0;
+				if (!valid) continue;
+				auto& c = cat[tag.kind];
+				c.resident += stride;
+				if (tag.fresh) c.fresh += stride;
+				if (tag.twin >= 0 && entries[static_cast<size_t>(tag.twin)].VirtualAttributes.Valid != 0) c.both += stride;
+				if (tag.kind >= WsHeap && tag.kind <= WsPrivateOther) {
+					if (private_resident.empty() || private_resident.back().first != tag.alloc) private_resident.emplace_back(tag.alloc, 0);
+					private_resident.back().second += stride;
+				}
+			}
+		}
+		calls++;
+		entries.clear();
+		tags.clear();
+		SwitchToThread();
+	};
+	const auto add = [&](uint64_t address, Tag tag) {
+		PSAPI_WORKING_SET_EX_INFORMATION e {};
+		e.VirtualAddress = reinterpret_cast<void*>(address);
+		entries.push_back(e);
+		tags.push_back(tag);
+	};
+	for (const auto& r: regions) {
+		int kind = WsImage;
+		if (r.type == MEM_IMAGE) kind = WsImage;
+		else if (r.type == MEM_MAPPED) kind = (alias != 0 && r.base >= alias && r.base < alias + alias_size) ? WsAlias : WsOtherMapped;
+		else {
+			const bool heap = std::any_of(heaps.begin(), heaps.end(), [&](const auto& h) { return h.first == r.alloc; });
+			const auto all  = committed_of(r.alloc);
+			kind = heap                                                                             ? WsHeap
+			       : (r.protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0 ? WsExec
+			       : (r.protect & PAGE_READWRITE) != 0 ? (all >= 64 * MiB ? WsRwLarge : all >= MiB ? WsRwMid : WsRwSmall)
+			                                           : WsPrivateOther;
+		}
+		// A view the guest maps (its bytes the store's): looked up at both addresses.
+		const uint8_t* backing     = nullptr;
+		uint64_t       backing_end = 0; // (guest address where that backing run ends)
+		if (kind == WsOtherMapped) {
+			const auto end = Libs::LibKernel::Memory::BackingMappingEnd(r.base);
+			if (end > r.base) {
+				const auto piece = std::min(end, r.base + r.size) - r.base;
+				backing          = Libs::LibKernel::Memory::TryGetBackingPointer(r.base, piece);
+				if (backing != nullptr) {
+					kind        = WsGuestView;
+					backing_end = r.base + piece;
+				}
+			}
+		}
+		cat[kind].committed += r.size;
+		// (The first sampled page of a region: its base rounded up to the stride, so every region's pages are sampled alike.)
+		for (uint64_t page = (r.base + stride - 1) & ~(stride - 1); page < r.base + r.size; page += stride) {
+			if (kind == WsGuestView && page < backing_end) {
+				const uint64_t twin = reinterpret_cast<uint64_t>(backing) + (page - r.base);
+				add(twin, {-1, -1, false, 0});
+				add(page, {WsGuestView, static_cast<int32_t>(entries.size() - 1), is_fresh(twin), 0});
+			} else if (kind == WsGuestView) {
+				add(page, {WsOtherMapped, -1, false, 0});
+			} else {
+				add(page, {kind, -1, kind == WsAlias && is_fresh(page), r.alloc});
+			}
+			if (entries.size() >= Batch) flush();
+		}
+	}
+	flush();
+	// The guest store: committed, and never written (fresh granules), over the alias's committed runs.
+	uint64_t store_committed = 0, store_fresh = 0;
+	if (alias != 0) {
+		for (const auto& r: regions) {
+			if (r.type != MEM_MAPPED || r.base < alias || r.base >= alias + alias_size) continue;
+			store_committed += r.size;
+			if (fresh == nullptr) continue;
+			for (uint64_t at = r.base; at < r.base + r.size; at += FreshMemory::Granule)
+				if (is_fresh(at)) store_fresh += std::min<uint64_t>(FreshMemory::Granule, r.base + r.size - at);
+		}
+	}
+	std::sort(private_resident.begin(), private_resident.end());
+	std::vector<std::pair<uint64_t, uint64_t>> merged; // resident, base
+	for (const auto& [base, bytes]: private_resident) {
+		if (!merged.empty() && merged.back().second == base) merged.back().first += bytes;
+		else merged.emplace_back(bytes, base);
+	}
+	std::sort(merged.begin(), merged.end(), std::greater<>());
+	const auto mi  = [](uint64_t b) { return static_cast<unsigned long long>(b / MiB); };
+	uint64_t   all = 0;
+	for (const auto& c: cat) all += c.resident;
+	const auto& g = cat[WsGuestView];
+	const auto& a = cat[WsAlias];
+	uint64_t    priv = 0;
+	for (int k = WsHeap; k <= WsPrivateOther; k++) priv += cat[k].resident;
+	const auto  use = LocalPlatform::ProcessMemory();
+	std::string largest;
+	for (size_t i = 0; i < merged.size() && i < 6; i++) {
+		char piece[96];
+		std::snprintf(piece, sizeof(piece), "%s0x%llx=%llu/%llu", i == 0 ? "" : " ", static_cast<unsigned long long>(merged[i].second),
+		              mi(merged[i].first), mi(committed_of(merged[i].second)));
+		largest += piece;
+	}
+	std::printf("RAM breakdown (working set by kind, 1 page in %llu sampled, %.0f ms, %llu calls): %llu MiB resident (working set "
+	            "%llu MiB), about %llu MiB of RAM (pages at both guest addresses counted once); guest memory: game's views %llu "
+	            "MiB (never written %llu), emulator's alias %llu MiB (never written %llu), resident at both %llu; emulator "
+	            "private %llu MiB [heaps %llu, read-write allocations >=64 MiB %llu, 1-64 MiB %llu, <1 MiB %llu, executable "
+	            "%llu, other %llu; most resident (MiB resident/committed): %s]; other mapped views %llu MiB, code (exe and "
+	            "DLLs) %llu MiB; guest store committed %llu MiB, of it never written %llu MiB (not in RAM unless read)\n",
+	            static_cast<unsigned long long>(stride / 4096u), MsSince(start), static_cast<unsigned long long>(calls), mi(all),
+	            mi(use.working_set), mi(all - std::min(all, g.both)), mi(g.resident), mi(g.fresh), mi(a.resident), mi(a.fresh),
+	            mi(g.both), mi(priv), mi(cat[WsHeap].resident), mi(cat[WsRwLarge].resident), mi(cat[WsRwMid].resident),
+	            mi(cat[WsRwSmall].resident), mi(cat[WsExec].resident), mi(cat[WsPrivateOther].resident),
+	            largest.empty() ? "none" : largest.c_str(), mi(cat[WsOtherMapped].resident), mi(cat[WsImage].resident),
+	            mi(store_committed), mi(store_fresh));
+	std::fflush(stdout);
+}
+
 void Watch() {
 	SetThreadDescription(GetCurrentThread(), L"Kyty.RamGuard");
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -472,6 +692,10 @@ void Watch() {
 		            s.flush_trim ? ", then the working set trim of cold guest pages" : "; no working set trim");
 	std::fflush(stdout);
 	g_periodic.store(s.flush_seconds > 0, std::memory_order_relaxed);
+	const bool ws_breakdown = log_period > 0 && WsBreakdownWanted(s);
+	if (ws_breakdown)
+		std::printf("RAM breakdown: on (KYTY_WS_BREAKDOWN=0 turns it off): the working set by kind with the RAM line, from one "
+		            "page in every KYTY_WS_BREAKDOWN_STRIDE_KB (default 64) KiB\n");
 	FlushState flush_state;
 	auto       next_periodic = Clock::now() + std::chrono::seconds(std::max<int64_t>(s.flush_seconds, 1));
 	uint64_t   seconds_under_1g = 0, seconds_under_512 = 0;
@@ -584,6 +808,7 @@ void Watch() {
 				            static_cast<unsigned long long>(seconds_under_512));
 			}
 			std::fflush(stdout);
+			if (ws_breakdown) WsBreakdown();
 		}
 	}
 }

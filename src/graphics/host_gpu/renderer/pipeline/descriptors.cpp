@@ -642,9 +642,15 @@ static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc
 		}
 	}
 	if (!TextureFromLevel(full, first_held, from)) return;
+	// (The left-out levels' bytes, past the held ones: a 2D texture whose T# reads from level 0, so they were streamed in.)
+	const uint64_t reduced_end = drop != 0 && base == 0 && full.resources.layers == 1 && from.data.address == full.data.address &&
+	                                     from.data.size < full.data.size
+	                                 ? full.data.End()
+	                                 : 0;
 	desc.info                  = from;
 	desc.view_info.base_level  = 0;
 	desc.view_info.level_count = last - first_held + 1u;
+	desc.reduced_end           = reduced_end;
 }
 
 // KYTY_TEXTURE_LAYER_RANGE=1|0 (default: on): a sampled array texture of one
@@ -1125,6 +1131,10 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		                             static_cast<uint32_t>(format), desc.info.data.address, desc.info.data.size));
 	}
 	auto*      image               = &texture_cache.GetImage(id);
+	// (KYTY_TEXTURE_SPILL: where the levels left out of it end; an image of exactly these bytes only.)
+	if (desc.reduced_end != 0 && image->reduced_end != desc.reduced_end && image->info.data.address == desc.info.data.address &&
+	    image->info.data.size == desc.info.data.size)
+		image->reduced_end = desc.reduced_end;
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
 		id    = image->depth_id;
