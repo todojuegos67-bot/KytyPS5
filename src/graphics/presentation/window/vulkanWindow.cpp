@@ -44,6 +44,7 @@
 #include "local/xess-sr.h"
 #include "local/fsr3-fg.h"
 #include "local/anti-lag.h"
+#include "local/hwrt-scene.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -1077,6 +1078,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	create_info.pNext = Libs::Graphics::AntiLag::ChainDeviceFeatures(anti_lag_extension, const_cast<void*>(create_info.pNext));
 	// XeSS (KYTY_UPSCALE=xess): its mutableDescriptorType feature, with its extension.
 	create_info.pNext = Libs::Graphics::Xess::ChainDeviceFeatures(device_extensions, const_cast<void*>(create_info.pNext));
+	// KYTY_HWRT=1: the acceleration structure and ray query features, when the device has them (local/hwrt-scene.h).
+	create_info.pNext = Libs::Graphics::HwScene::ChainDeviceFeatures(physical_device, device_extensions, const_cast<void*>(create_info.pNext));
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -1609,6 +1612,8 @@ void WindowContext::CreateVulkan() {
 			                                          device_extensions);
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
+		// KYTY_HWRT=1: acceleration structures and ray queries (local/hwrt-scene.h; nothing asked for without it).
+		Libs::Graphics::HwScene::AddDeviceExtensions(available_extensions, device_extensions);
 		// KYTY_ANTILAG=1: AMD Anti-Lag 2 where the device has it (local/anti-lag.h).
 		if (Libs::Graphics::AntiLag::Requested() && HasExtension(available_extensions, Libs::Graphics::AntiLag::ExtensionName()))
 			device_extensions.push_back(Libs::Graphics::AntiLag::ExtensionName());
@@ -1803,6 +1808,8 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 		}
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
+		// KYTY_HWRT=1: acceleration structures and ray queries (local/hwrt-scene.h; nothing asked for without it).
+		Libs::Graphics::HwScene::AddDeviceExtensions(available_extensions, device_extensions);
 		// KYTY_ANTILAG=1: AMD Anti-Lag 2 where the device has it (local/anti-lag.h).
 		if (Libs::Graphics::AntiLag::Requested() && HasExtension(available_extensions, Libs::Graphics::AntiLag::ExtensionName()))
 			device_extensions.push_back(Libs::Graphics::AntiLag::ExtensionName());
