@@ -1066,6 +1066,14 @@ double RealFrameInterval() {
 	return Active() ? CapInterval() : 0.0;
 }
 
+// astro-perf-1025: the render size FSR 3 is told, at most the backbuffer's. The generic inputs (zero motion vectors,
+// far depth) are at the flip image's size, which can be larger than the window (a 3840x2160 flip shown at 2560x1440);
+// a render size above the display size is outside what the frame generation context is documented for. A smaller
+// render size reads the top-left of the depth and motion images, the same zeros there.
+static vk::Extent2D RenderSize(const FrameGen::FrameInputs& inputs, vk::Extent2D backbuffer) {
+	return {std::min(inputs.render_extent.width, backbuffer.width), std::min(inputs.render_extent.height, backbuffer.height)};
+}
+
 void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs, vk::SwapchainKHR swapchain,
                    vk::Extent2D backbuffer, vk::Format format) {
 	if (!Active()) return;
@@ -1121,7 +1129,7 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	g_last_real = now;
 
 	if (usable && !g_fg_failed) {
-		const vk::Extent2D render = inputs->render_extent;
+		const vk::Extent2D render = RenderSize(*inputs, backbuffer);
 		if (g_fg_context == nullptr || g_fg_display != backbuffer || g_fg_format != format ||
 		    render.width > g_fg_max_render.width || render.height > g_fg_max_render.height) {
 			CreateFrameGeneration(graphics, backbuffer,
@@ -1232,11 +1240,12 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	prepare.frameID        = g_frame_id;
 	prepare.flags          = config.flags;
 	prepare.commandList    = slot.command;
-	prepare.renderSize     = {inputs->render_extent.width, inputs->render_extent.height};
+	const vk::Extent2D render_size = RenderSize(*inputs, backbuffer);
+	prepare.renderSize     = {render_size.width, render_size.height};
 	prepare.jitterOffset   = {0.0f, 0.0f};
 	// The game's vectors are in UV units along the motion; FSR wants pixels towards the previous position.
-	prepare.motionVectorScale = {mv_sign * static_cast<float>(inputs->render_extent.width),
-	                             mv_sign * static_cast<float>(inputs->render_extent.height)};
+	prepare.motionVectorScale = {mv_sign * static_cast<float>(render_size.width),
+	                             mv_sign * static_cast<float>(render_size.height)};
 	prepare.frameTimeDelta = static_cast<float>(std::clamp(delta_ms, 1.0, 100.0));
 	prepare.unused_reset   = false;
 	// Reversed infinite depth: far is the near plane, near is infinite (the SDK's convention).
