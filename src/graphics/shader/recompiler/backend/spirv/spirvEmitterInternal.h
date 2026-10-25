@@ -210,6 +210,7 @@ enum : uint32_t {
 	OpUDiv                         = 134,
 	OpUMod                         = 137,
 	OpFDiv                         = 136,
+	OpVectorTimesScalar            = 142,
 	OpIAddCarry                    = 149,
 	OpUMulExtended                 = 151,
 	OpSMulExtended                 = 152,
