@@ -4361,8 +4361,8 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		    image.usage.video_out || !image.IsTracked() || !image.untracked_holes.empty())
 			return;
 		const auto [begin, end] = pages_of(image);
-		const bool small = end <= begin || end - begin < MinSize;
-		if (small && (!spill || image.reduced_end == 0)) return;
+		const bool too_small = end <= begin || end - begin < MinSize;
+		if (too_small && (!spill || image.reduced_end == 0)) return;
 		const auto first   = m_offload_clean.find(image.serial);
 		seen[image.serial] = first != m_offload_clean.end() ? first->second : tick;
 		// (Its tail: whole pages past the image's last byte up to the texture's end.)
@@ -4372,7 +4372,7 @@ void TextureCache::OffloadScan(uint64_t tick) {
 			if (tail_end > tail_begin && tail_end - tail_begin >= MinSize)
 				tails.push_back({tail_begin, tail_end, image.serial | TextureOffload::TailSerialBit});
 		}
-		if (small) return;
+		if (too_small) return;
 		if (first == m_offload_clean.end() || TextureOffload::Taken(begin, end - begin, image.serial)) return;
 		if (!offload) {
 			take.push_back(id);
