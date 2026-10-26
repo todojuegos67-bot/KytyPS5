@@ -381,7 +381,7 @@ void HwSun(vec3 p, vec3 n, vec3 l, ivec2 pixel, out float occ_c, out float occ_f
 		float ang = 6.2831853 * u2, rad = 0.5 * sun.hdr.y * sqrt(u1);
 		vec3  d   = normalize(lw + (b1 * cos(ang) + b2 * sin(ang)) * rad);
 		rayQueryEXT rq;
-		rayQueryInitializeEXT(rq, tlas, flags, 0xff, o, t_min, d, sun.hw.z);
+		rayQueryInitializeEXT(rq, tlas, flags, 0x03, o, t_min, d, sun.hw.z); // (static + this frame's dynamic meshes: no stale ghosts, no tiny cards)
 		while (rayQueryProceedEXT(rq)) {}
 		if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
 			float t = rayQueryGetIntersectionTEXT(rq, true);
@@ -446,6 +446,7 @@ void Trace(ivec2 pixel) {
 			oc = clamp(oc * ew, 0.0, 1.0), of = clamp(of * ew, 0.0, 1.0);
 			v = min(v, 1.0 - oc);
 			v = min(v, max(1.0 - of, v0 - sun.hw.y));
+			v = mix(v0, v, clamp(sun.sunw.w, 0.0, 1.0)); // (KYTY_HWRT_SHADOW_STRENGTH: the rays' share at most)
 			// The self-test (the centre pixel, every frame; words 131..135): the two reconstructions' distance (m), the
 			// depth, the world facing against the view one, the world light against the latched world sun (cos).
 			ivec2 c = ivec2(TraceSize()) / 2;
@@ -538,6 +539,10 @@ void Temporal(ivec2 pixel) {
 			float k     = mix(1.0, 2.0, clamp(count / 16.0, 0.0, 1.0));
 			float hist  = clamp(textureLod(src_b, puv, 0).r, m1 - k * sigma - 0.03, m1 + k * sigma + 0.03);
 			res         = mix(hist, cur, alpha);
+#ifdef KYTY_HWRT_SHADOW
+			// (one frame cannot drop the visibility by more than 0.15: a single frame's stray hits never show as specks)
+			res = max(res, hist - 0.15);
+#endif
 		}
 	}
 	res = clamp(isnan(res) ? 1.0 : res, 0.0, 1.0);

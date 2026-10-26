@@ -1312,7 +1312,9 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 				VkAccelerationStructureInstanceKHR instance {};
 				instance.transform.matrix[0][0] = instance.transform.matrix[1][1] = instance.transform.matrix[2][2] = 1.0f;
 				instance.instanceCustomIndex                    = e.id;
-				instance.mask                                   = 0xff;
+				// (KYTY_HWRT_SHADOW's cull mask 0x03; others trace 0xff) 0x01 static, 0x02 dynamic captured this frame, 0x04
+				// dynamic with an older frame's positions, 0x08 tiny meshes (<= 24 triangles: ash, leaf and debris cards).
+				instance.mask = e.tris <= 24 ? 0x08 : !e.dynamic ? 0x01 : e.capture_frame == g.frame ? 0x02 : 0x04;
 				instance.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 				instance.accelerationStructureReference         = e.blas_address;
 				instances[instance_count]                       = instance;
