@@ -133,7 +133,7 @@ constexpr uint32_t CalibFloors   = CalibBytes + 16 * 3;
 constexpr uint32_t CalibWet      = CalibFloors + 2; // puddle guess: count + 16 byte sums; water: the same
 constexpr uint32_t CalibHist     = 300;             // 16 byte fields x 16 bins
 constexpr uint32_t StatsIndex    = 560;
-constexpr uint32_t StatsCount    = 34; // (refl10: 30..32 why rays miss, 33 the composite's mirror rays)
+constexpr uint32_t StatsCount    = 40; // (refl10: 30..32 why rays miss, 33 the composite's mirror rays; hwrt4: 34..39 the metal pass)
 // (refl9) The metal survey (the shader's SURVEY, mode 8; never cleared): static / moving sample counts, set-bit counts
 // per class x layer x bit, byte histograms per class x field x 16 bins.
 constexpr uint32_t SurveyIndex   = 600;
@@ -251,8 +251,14 @@ struct RtPass {
 	uint32_t                samples = 0;
 	std::array<std::array<uint8_t, 16>, 8> stage_of {}; // the pass each interval timed (Stage), per ring entry
 	std::array<uint32_t, 8>               stamps_in {};  // timestamps written per ring entry
-	std::array<double, 10>                stage_ms {};   // sums since the last line
-	std::array<uint32_t, 10>              stage_frames {};
+	std::array<double, 11>                stage_ms {};   // sums since the last line
+	std::array<uint32_t, 11>              stage_frames {};
+	// (hwrt4, KYTY_HWRT_METAL) the metal reflections' images (trace size: level 1 half the render, 2 full; mout: render) and state
+	RtImage                 mrad, maux, mout, mgb[2], mhist[2], mmeta[2], mtmp[2];
+	vk::Extent2D            mtrace {};
+	int                     mlevel = 0;
+	bool                    mhist_valid = false;
+	uint64_t                m_frames = 0, m_tlas_frames = 0;
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 } g_rt;
 
@@ -371,9 +377,88 @@ void Barrier(vk::CommandBuffer command, vk::PipelineStageFlags2 src_stage, vk::A
 	command.pipelineBarrier2(dependency);
 }
 
-std::array<RtImage*, 13> Sized() {
+bool HwReflWanted();
+
+// (hwrt4) KYTY_HWRT_METAL=1|2 (default 0, off: nothing created, nothing recorded): ray-traced reflections on metal
+// (armour, weapons, shields, metal fittings) through the scene TLAS, independent of the game's SSR guide. Level 1: one
+// GGX-sampled ray per pixel at half the render resolution; 2: at full. Needs KYTY_HWRT=1 and KYTY_HWRT_REFL=1 (the TLAS
+// bound to this pass) and runs inside the RT reflections (KYTY_HWRT_REFL turns them on). Settings:
+//   KYTY_HWRT_METAL_FIELD  the metal field, <layer>:<shift>:<bits>[g] (2:0:8, L2 bits 0..7: the refl9 metal survey's
+//                          pick, near-binary, set on 62 % of the characters' pixels and 8 % of the static world's)
+//   KYTY_HWRT_METAL_ROUGH  the roughness field (1:24:8, L1 bits 24..31: the byte the oct 12:12 normal leaves free in its
+//                          word; "g" suffix: it is gloss)
+//   KYTY_HWRT_METAL_ROUGH_MAX  no ray from this roughness (0.6; fades from 70 % of it)
+//   KYTY_HWRT_METAL_STRENGTH   the composite's weight scale (1.0, 0..2)
+//   KYTY_HWRT_METAL_TINT       how much of the base colour's hue the F0 keeps (1.0 physical; 0 grey F0 of its luminance)
+//   KYTY_HWRT_METAL_DIST       the reflection ray's length (world units, 200)
+//   KYTY_HWRT_METAL_SELF=0     do not skip the pixel's own TLAS instance near the surface
+//   KYTY_HWRT_METAL_VIEW=1|2|3|4  debug views: 1 metal field as grey, 2 roughness field as grey, 3 F0 (the albedo) on
+//                          metal, 4 our reflection alone (envBRDF x hit) on metal, black elsewhere
+struct MetalCfg {
+	int     level = 0, view = 0;
+	int32_t metal = -1, rough = -1;
+	float   rough_max = 0.6f, strength = 1.0f, tint = 1.0f, dist = 200.0f;
+	bool    self_skip = true;
+};
+const MetalCfg& Metal() {
+	static const MetalCfg c = [] {
+		MetalCfg m;
+		const char* v = std::getenv("KYTY_HWRT_METAL");
+		m.level       = v != nullptr ? std::clamp(std::atoi(v), 0, 2) : 0;
+		if (m.level == 0) return m;
+		const char* vw = std::getenv("KYTY_HWRT_METAL_VIEW");
+		m.view         = vw != nullptr ? std::clamp(std::atoi(vw), 0, 4) : 0;
+		m.metal        = std::getenv("KYTY_HWRT_METAL_FIELD") != nullptr ? FieldEnv("KYTY_HWRT_METAL_FIELD") : (2 | (0 << 2) | (8 << 7));
+		m.rough        = std::getenv("KYTY_HWRT_METAL_ROUGH") != nullptr ? FieldEnv("KYTY_HWRT_METAL_ROUGH") : (1 | (24 << 2) | (8 << 7));
+		m.rough_max    = EnvFloat("KYTY_HWRT_METAL_ROUGH_MAX", 0.6f, 0.05f, 1.0f);
+		m.strength     = EnvFloat("KYTY_HWRT_METAL_STRENGTH", 1.0f, 0.0f, 2.0f);
+		m.tint         = EnvFloat("KYTY_HWRT_METAL_TINT", 1.0f, 0.0f, 1.0f);
+		m.dist         = EnvFloat("KYTY_HWRT_METAL_DIST", 200.0f, 1.0f, 5000.0f);
+		const char* sf = std::getenv("KYTY_HWRT_METAL_SELF");
+		m.self_skip    = !(sf != nullptr && sf[0] == '0');
+		const auto fs  = [](int32_t f, char* buf, size_t n) {
+			if (f < 0) std::snprintf(buf, n, "none");
+			else std::snprintf(buf, n, "L%d bits %d..%d%s", f & 3, (f >> 2) & 31, ((f >> 2) & 31) + ((f >> 7) & 31) - 1, (f & 4096) ? " inverted" : "");
+		};
+		char mf[48], rf[48];
+		fs(m.metal, mf, sizeof(mf)), fs(m.rough, rf, sizeof(rf));
+		std::printf("RT metal: KYTY_HWRT_METAL=%d (%s resolution, 1 GGX ray per pixel into the scene TLAS), metal field %s, roughness "
+		            "field %s, rays below roughness %.2f, strength %g, F0 tint %g, ray length %g, self-instance skip %s, view %d%s\n",
+		            m.level, m.level >= 2 ? "full" : "half", mf, rf, static_cast<double>(m.rough_max), static_cast<double>(m.strength),
+		            static_cast<double>(m.tint), static_cast<double>(m.dist), m.self_skip ? "on" : "off", m.view,
+		            HwReflWanted() ? "" : " (KYTY_HWRT_REFL is not 1: no TLAS bound, nothing is traced)");
+		std::fflush(stdout);
+		return m;
+	}();
+	return c;
+}
+bool EnsureMetalImages(GraphicContext& graphics) {
+	const vk::Extent2D render = g_rt.render;
+	const vk::Extent2D trace  = Metal().level >= 2 ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
+	if (g_rt.mout.image != VK_NULL_HANDLE && g_rt.mtrace == trace && g_rt.mout.extent == render) return true;
+	for (auto* img: {&g_rt.mrad, &g_rt.maux, &g_rt.mout, &g_rt.mgb[0], &g_rt.mgb[1], &g_rt.mhist[0], &g_rt.mhist[1], &g_rt.mmeta[0],
+	                 &g_rt.mmeta[1], &g_rt.mtmp[0], &g_rt.mtmp[1]})
+		Retire(*img);
+	const auto f16 = vk::Format::eR16G16B16A16Sfloat;
+	bool       ok  = MakeImage(graphics, g_rt.mout, f16, render, 1, true);
+	for (auto* img: {&g_rt.mrad, &g_rt.maux, &g_rt.mgb[0], &g_rt.mgb[1], &g_rt.mhist[0], &g_rt.mhist[1], &g_rt.mmeta[0], &g_rt.mmeta[1],
+	                 &g_rt.mtmp[0], &g_rt.mtmp[1]})
+		ok = ok && MakeImage(graphics, *img, f16, trace, 1, true);
+	if (!ok) {
+		for (auto* img: {&g_rt.mrad, &g_rt.maux, &g_rt.mout, &g_rt.mgb[0], &g_rt.mgb[1], &g_rt.mhist[0], &g_rt.mhist[1], &g_rt.mmeta[0],
+		                 &g_rt.mmeta[1], &g_rt.mtmp[0], &g_rt.mtmp[1]})
+			Retire(*img);
+		return false;
+	}
+	g_rt.mtrace      = trace;
+	g_rt.mhist_valid = false;
+	return true;
+}
+
+std::array<RtImage*, 24> Sized() {
 	return {&g_rt.hiz, &g_rt.rad, &g_rt.aux, &g_rt.tmp_a, &g_rt.tmp_b, &g_rt.out, &g_rt.gb[0], &g_rt.gb[1], &g_rt.hist[0],
-	        &g_rt.hist[1], &g_rt.meta[0], &g_rt.meta[1], &g_rt.dummy};
+	        &g_rt.hist[1], &g_rt.meta[0], &g_rt.meta[1], &g_rt.dummy, &g_rt.mrad, &g_rt.maux, &g_rt.mout, &g_rt.mgb[0],
+	        &g_rt.mgb[1], &g_rt.mhist[0], &g_rt.mhist[1], &g_rt.mmeta[0], &g_rt.mmeta[1], &g_rt.mtmp[0], &g_rt.mtmp[1]};
 }
 
 bool EnsurePipeline(GraphicContext& graphics) {
@@ -662,10 +747,10 @@ void PrepareImages(vk::CommandBuffer command) {
 	}
 }
 
-enum Stage : uint8_t { StHiz, StCalib, StTrace, StTemporal, StAtrous0, StAtrous1, StAtrous2, StAtrous3, StComposite, StSurvey };
-constexpr uint32_t NStages = 10;
+enum Stage : uint8_t { StHiz, StCalib, StTrace, StTemporal, StAtrous0, StAtrous1, StAtrous2, StAtrous3, StComposite, StSurvey, StMetal };
+constexpr uint32_t NStages = 11;
 const char* const StageNames[NStages] = {"hi-z", "calib", "trace", "temporal", "a-trous 1", "a-trous 2", "a-trous 3", "a-trous 4",
-                                         "composite", "metal survey"};
+                                         "composite", "metal survey", "metal (KYTY_HWRT_METAL)"};
 
 void ReadTiming(GraphicContext& graphics) {
 	if (g_rt.pool == nullptr) return;
@@ -776,6 +861,19 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		            "refused by the hit test %.1f%%; the composite's own mirror rays on %.2f%% of the pixels\n",
 		            std::chrono::duration<double>(now - g_rt.stat_time).count(), 100.0 * sm[5] / rays, 100.0 * sm[30] / rays,
 		            100.0 * sm[31] / rays, 100.0 * sm[32] / rays, 100.0 * sm[33] / px);
+	}
+	if (Metal().level > 0) {
+		// (hwrt4) The metal reflections: the share of G-buffer pixels whose metal field is set, of them the ones traced
+		// (roughness below the cut-off), the TLAS hit rate, the pixels whose own instance was found (self-skip), the share
+		// of all pixels the composite changed by > 5 %.
+		const double gp = static_cast<double>(std::max<uint64_t>(sm[34], 1));
+		std::printf("RT metal: last %.0f s: metal field set on %.1f%% of the G-buffer pixels, rays on %.1f%% (roughness < %.2f), TLAS "
+		            "hit %.0f%%, own instance found %.0f%%; changed > 5%% on %.1f%% of the screen; TLAS bound %llu of %llu frames\n",
+		            std::chrono::duration<double>(now - g_rt.stat_time).count(), 100.0 * sm[35] / gp, 100.0 * sm[36] / gp,
+		            static_cast<double>(Metal().rough_max), sm[36] > 0 ? 100.0 * sm[37] / static_cast<double>(sm[36]) : 0.0,
+		            sm[36] > 0 ? 100.0 * sm[38] / static_cast<double>(sm[36]) : 0.0, 100.0 * sm[39] / px,
+		            static_cast<unsigned long long>(g_rt.m_tlas_frames), static_cast<unsigned long long>(g_rt.m_frames));
+		g_rt.m_tlas_frames = 0, g_rt.m_frames = 0;
 	}
 	std::string passes;
 	for (uint32_t st = 0; st < NStages; ++st) {
@@ -1118,6 +1216,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	if (graphics == nullptr || command == nullptr) return false;
 	if (VideoOut::MoviePlaying()) {
 		g_rt.history_valid = false;
+		g_rt.mhist_valid   = false;
 		return false;
 	}
 	const auto& color = inputs.color;
@@ -1559,6 +1658,54 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		run(4, s, g.render);
 		stamp(StComposite);
 	}
+	// (hwrt4, KYTY_HWRT_METAL) Metal reflections over the composite: trace (TLAS), temporal, 2 a-trous passes, composite.
+	const RtImage* final_out = &g.out;
+	if (Metal().level > 0 && EnsureMetalImages(*graphics)) {
+		PrepareImages(command);
+		const MetalCfg& mc     = Metal();
+		const RtPush    saved  = push;
+		const bool      reset  = inputs.reset || !g.mhist_valid;
+		++g.m_frames;
+		if (hw) ++g.m_tlas_frames;
+		push.size[2] = static_cast<float>(g.mtrace.width), push.size[3] = static_cast<float>(g.mtrace.height);
+		push.params[0] = mc.strength, push.params[1] = mc.rough_max, push.params[2] = mc.dist, push.params[3] = 1.0f;
+		push.motion[2] = mc.tint, push.motion[3] = static_cast<float>(mc.view);
+		push.misc[2]   = mc.level;
+		push.dec[1]    = have_gbuf ? mc.rough : -1;
+		push.dec[3]    = (reset ? 0 : 1) | (mc.self_skip ? 2 : 0) | (hw ? 4 : 0);
+		push.misc2[3]  = have_gbuf && mc.metal >= 0 ? mc.metal + 1 : 0;
+		{
+			Set s = base;
+			s.oa = &g.mrad, s.ob = &g.mgb[cur], s.oc = &g.maux;
+			run(9, s, g.mtrace);
+		}
+		{
+			Set s = base;
+			s.a = &g.mrad, s.b = &g.mhist[prev], s.gcur = &g.mgb[cur], s.gprev = &g.mgb[prev], s.aux = &g.maux, s.meta = &g.mmeta[prev];
+			s.oa = &g.mhist[cur], s.ob = &g.mmeta[cur], s.oc = &g.mtmp[1];
+			run(10, s, g.mtrace);
+		}
+		const RtImage* msrc = &g.mhist[cur];
+		for (int i = 0; i < 2; ++i) {
+			const RtImage* dst = &g.mtmp[i];
+			Set            s   = base;
+			s.a = msrc, s.b = msrc, s.gcur = &g.mgb[cur], s.gprev = &g.mgb[cur], s.aux = &g.maux, s.meta = &g.mmeta[cur];
+			s.oa = dst, s.ob = &g.mrad, s.oc = &g.mrad;
+			push.params[3] = static_cast<float>(1 << i);
+			run(11, s, g.mtrace);
+			msrc = dst;
+		}
+		{
+			Set s = base;
+			s.a = &g.out, s.b = msrc, s.gcur = &g.mgb[cur], s.gprev = &g.mgb[cur], s.aux = &g.maux, s.meta = &g.mmeta[cur];
+			s.oa = &g.mout, s.ob = &g.mrad, s.oc = &g.mrad;
+			run(12, s, g.render);
+		}
+		stamp(StMetal);
+		push           = saved;
+		g.mhist_valid  = true;
+		final_out      = &g.mout;
+	}
 	Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 	        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
 	{
@@ -1574,11 +1721,11 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	++g.frame;
 	g.history_valid     = true;
-	inputs.color.image  = vk::Image(g.out.image);
-	inputs.color.view   = g.out.view;
+	inputs.color.image  = vk::Image(final_out->image);
+	inputs.color.view   = final_out->view;
 	inputs.color.layout = vk::ImageLayout::eGeneral;
 	inputs.color.format = vk::Format::eR16G16B16A16Sfloat;
-	inputs.color.usage  = g.out.usage;
+	inputs.color.usage  = final_out->usage;
 	inputs.color.level  = 0;
 	inputs.color.layer  = 0;
 	return true;

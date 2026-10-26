@@ -960,6 +960,79 @@ bool HwMarch(vec3 P, vec3 N, vec3 R, vec3 V, out vec4 res, out float hdist) {
 	res        = vec4(c * conf, conf);
 	return !Bad(res) && conf > 1e-3;
 }
+// (hwrt4, KYTY_HWRT_METAL) A reflection ray's committed TLAS hit shaded as HwMarch shades its hits: the frame's colour
+// where the hit is on the screen and visible there, else the captured albedo (KYTY_HWRT_REFL_MATERIAL) lit by the frame's
+// mean and overhead light, else that light on the triangle's normal. Out: premultiplied (tonemapped colour, confidence).
+bool MtShadeHit(vec3 o, vec3 Rw, float t, int inst, int prim, vec2 bc, float tmax, out vec4 res) {
+	res            = vec4(0);
+	vec3  Hw       = o + Rw * t;
+	float far_fade = 1.0 - smoothstep(0.7, 1.0, t / tmax);
+	vec4  sc       = HwToScreen(Hw);
+	if (sc.w > 0.5 && InScreen(sc.xy)) {
+		float sd = DepthAt(sc.xy);
+		float zs = abs(ViewZ(sd)), zh = abs(ViewZ(sc.z));
+		if (!IsSky(sd) && abs(zs - zh) < 0.03 * zh + 0.1) {
+			vec2  edge = min(sc.xy, 1.0 - sc.xy);
+			float conf = far_fade * (0.6 + 0.4 * smoothstep(0.0, 0.05, min(edge.x, edge.y)));
+			vec3  c    = Tonemap(SafeColor(textureLod(color_tex, sc.xy, 0).rgb * GameExposure()));
+			res        = vec4(c * conf, conf);
+			return !Bad(res) && conf > 1e-3;
+		}
+	}
+	vec3     Hn  = -Rw;
+	vec3     albedo = vec3(-1.0);
+	uint64_t mat = uint64_t(hw.materials.x) | (uint64_t(hw.materials.y) << 32);
+	if (mat != 0ul && inst >= 0 && prim >= 0) {
+		HwWords  m  = HwWords(mat);
+		uint64_t vb = uint64_t(m.w[inst * 8 + 4]) | (uint64_t(m.w[inst * 8 + 5]) << 32);
+		uint64_t ib = uint64_t(m.w[inst * 8 + 6]) | (uint64_t(m.w[inst * 8 + 7]) << 32);
+		if (vb != 0ul && ib != 0ul) {
+			HwWords idx = HwWords(ib);
+			HwVerts ver = HwVerts(vb);
+			vec4    a4  = ver.v[idx.w[prim * 3 + 0]];
+			vec4    b4  = ver.v[idx.w[prim * 3 + 1]];
+			vec4    d4  = ver.v[idx.w[prim * 3 + 2]];
+			vec3    n   = cross(b4.xyz - a4.xyz, d4.xyz - a4.xyz);
+			if (length(n) > 1e-12) Hn = normalize(n);
+			if (dot(Hn, Rw) > 0.0) Hn = -Hn;
+#ifdef KYTY_HWRT_MATERIAL
+			uint64_t aw     = uint64_t(hw.materials.z) | (uint64_t(hw.materials.w) << 32);
+			uint     layer1 = aw != 0ul ? HwWords(aw).w[inst] : 0u;
+			if (layer1 != 0u && layer1 <= uint(textureSize(hw_albedo, 0).z)) {
+				vec2 t0 = unpackHalf2x16(floatBitsToUint(a4.w));
+				vec2 t1 = unpackHalf2x16(floatBitsToUint(b4.w));
+				vec2 t2 = unpackHalf2x16(floatBitsToUint(d4.w));
+				vec2 uv = t0 * (1.0 - bc.x - bc.y) + t1 * bc.x + t2 * bc.y;
+				if (!any(isnan(uv)) && all(lessThan(abs(uv), vec2(30000.0)))) {
+					vec4 sa = textureLod(hw_albedo, vec3(uv, float(layer1 - 1u)), 0.0);
+					albedo  = sa.rgb * sa.rgb;
+				}
+			}
+#endif
+		}
+	}
+	float up = clamp(Hn.y * 0.5 + 0.5, 0.0, 1.0);
+	vec3  c;
+	float conf;
+	if (albedo.x >= 0.0) {
+		vec3 sky   = vec3(0), amb = vec3(0);
+		for (int y = 0; y < 4; ++y)
+			for (int x = 0; x < 4; ++x) {
+				vec3 cc = SafeColor(textureLod(color_tex, (vec2(x, y) + 0.5) / 4.0, 0).rgb * GameExposure());
+				amb += cc;
+				if (y == 0) sky += cc;
+			}
+		amb /= 16.0, sky *= 0.25;
+		vec3 light = amb * (1.0 / 0.35) * (0.3 + 0.5 * up) + sky * (0.6 * up * up);
+		c    = Tonemap(SafeColor(albedo * light));
+		conf = 0.8 * far_fade;
+	} else {
+		c    = Tonemap(HwAmbient() * (0.35 + 0.65 * up));
+		conf = 0.6 * far_fade;
+	}
+	res = vec4(c * conf, conf);
+	return !Bad(res) && conf > 1e-3;
+}
 #endif
 
 // `march`: false on the checkerboard's other half this frame: the surface is written, the reflection marked absent
@@ -1632,6 +1705,339 @@ void Survey(ivec2 gp) {
 	}
 }
 
+// ---- (hwrt4, KYTY_HWRT_METAL=1|2) Ray-traced reflections on metal: armour, weapons, shields, fittings ----
+// Not guided by the game's SSR (which barely reflects on characters' metal): every G-buffer pixel whose metal field is
+// set and whose roughness is below the cut-off traces its own GGX-sampled ray into the scene TLAS (level 1: half the
+// render resolution, level 2: full), shaded as the TLAS misses of the reflections are (the frame's colour where the hit
+// is on the screen and visible, else the captured albedo lit by the frame's light), then a temporal accumulation along the
+// game's motion vectors, a roughness-aware a-trous filter, and a composite that replaces the metal's environment term
+// (environment BRDF x F0 = the base colour) instead of adding to it. Push in these modes (rt-reflections.cpp
+// RunMetal): size.zw the metal trace size, params x strength / y roughness cut-off / z ray length / w the a-trous step,
+// motion.z the F0 tint, motion.w the debug view (KYTY_HWRT_METAL_VIEW), dec.y the roughness field, misc2.w the metal
+// field + 1, dec.w flags (1 history valid, 2 skip the pixel's own instance, 4 a TLAS this frame).
+// Modes: 9 trace, 10 temporal, 11 a-trous, 12 composite.
+float step_(float m) { return m > 0.02 ? 1.0 : 0.0; }
+bool  MtHist() { return (push.dec.w & 1) != 0; }
+bool  MtSelfSkip() { return (push.dec.w & 2) != 0; }
+bool  MtTlas() { return (push.dec.w & 4) != 0; }
+float MtRough(ivec2 rp) { return push.dec.y >= 0 ? clamp(Field(push.dec.y, rp), 0.0, 1.0) : 0.5; }
+float MtMetal(ivec2 rp) { return push.misc2.w > 0 ? clamp(Field(push.misc2.w - 1, rp), 0.0, 1.0) : 0.0; }
+float MtMetalW(float m) { return smoothstep(0.3, 0.7, m); }
+float MtRoughFade(float r) { return 1.0 - smoothstep(push.params.y * 0.7, push.params.y, r); }
+// The pixel's surface: the G-buffer's normal when it belongs to the visible surface (else the depth's), metal, roughness.
+// false: sky, or the G-buffer is not this pixel's surface (water, particles drawn after it).
+bool MtSurface(ivec2 rp, out vec3 P, out vec3 N, out vec3 Nd, out float metal, out float rough) {
+	vec2  ruv = (vec2(rp) + 0.5) / RenderSize();
+	float d   = texelFetch(depth_tex, rp, 0).r;
+	P = vec3(0), N = vec3(0, 0, 1), Nd = N, metal = 0.0, rough = 1.0;
+	if (IsSky(d)) return false;
+	P  = ViewPos(ruv, d);
+	Nd = NormalAt(ruv, P);
+	vec3 Ng;
+	bool have = GbufNormal(rp, Ng);
+	if (have && dot(Ng, Nd) < 0.3) return false; // (something drawn over the G-buffer's surface)
+	if (!have && !GbufSurface(rp, d, false)) return false;
+	N     = have ? Ng : Nd;
+	vec3 V = normalize(-P);
+	if (dot(N, V) < 0.02) N = normalize(N + V * (0.03 - dot(N, V)));
+	metal = MtMetal(rp);
+	rough = MtRough(rp);
+	return true;
+}
+// Lazarov / Karis analytic environment BRDF: the split-sum's scale and bias for F0.
+vec2 MtEnvBrdf(float rough, float nv) {
+	const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+	const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+	vec4  r    = rough * c0 + c1;
+	float a004 = min(r.x * r.x, exp2(-9.28 * nv)) * r.x + r.y;
+	return vec2(-1.04, 1.04) * a004 + r.zw;
+}
+
+void MtTrace(ivec2 px) {
+	vec2  uv = (vec2(px) + 0.5) / TraceSize();
+	ivec2 rp = RenderPixel(uv);
+	vec3  P, N, Nd;
+	float metal, rough;
+	bool  surf = MtSurface(rp, P, N, Nd, metal, rough);
+	float dist = abs(P.z);
+	imageStore(out_b, px, vec4(N, surf ? dist : 6.0e4));
+	float mw = surf ? MtMetalW(metal) * MtRoughFade(rough) : 0.0;
+	bool  st = Sampled(px);
+	if (st && surf) Stat(34, 1), Stat(35, metal > 0.5 ? 1 : 0);
+	if (mw < 0.02) {
+		imageStore(out_a, px, vec4(0));
+		imageStore(out_c, px, vec4(rough, 0, 0, 0));
+		return;
+	}
+	if (!MtTlas()) { // (no scene TLAS this frame: not traced, the temporal pass keeps the history)
+		imageStore(out_a, px, vec4(0, 0, 0, -1));
+		imageStore(out_c, px, vec4(rough, mw, 0, 0));
+		return;
+	}
+	if (st) Stat(36, 1);
+	vec4  res   = vec4(0);
+	float hdist = 0.0;
+	bool  hit   = false;
+#ifdef KYTY_HWRT
+	if (hw.info.x > 0.5) {
+		vec3  V  = normalize(-P);
+		float fk = float(push.misc.y & 1023);
+		vec2  xi = vec2(fract(Ign(vec2(px)) + fk * 0.6180340), fract(Ign(vec2(px) + vec2(47.0, 17.0)) + fk * 0.7548777));
+		vec3  R;
+		if (rough < 0.03) R = reflect(-V, N);
+		else {
+			vec3 H = SampleGgxVndf(N, V, max(rough * rough, 1e-3), xi);
+			R      = reflect(-V, H);
+			if (dot(R, N) <= 0.02) R = reflect(-V, N);
+		}
+		float rg = dot(R, Nd);
+		if (rg < 0.01) R = normalize(R + Nd * (0.01 - rg));
+		float step = 0.01 * max(dist, 1.0);
+		vec3  Pw   = HwToWorld(P);
+		vec3  Rw   = HwToWorld(P + R * step) - Pw;
+		vec3  Nw   = HwToWorld(P + Nd * step) - Pw;
+		if (!BadV(Pw) && !BadV(Rw) && length(Rw) > 1e-9) {
+			Rw = normalize(Rw);
+			Nw = length(Nw) > 1e-9 ? normalize(Nw) : -Rw;
+			// Self-reflection: the instance the pixel belongs to (a camera ray to the pixel's point, the TLAS's hit there);
+			// its own triangles are skipped for the first stretch of the reflection ray (the acne of a curved, skinned,
+			// refitted mesh against its own G-buffer surface), anything else is a hit from the start.
+			int   self_ = -1;
+			float wd    = length(Pw - hw.cam.xyz);
+			if (MtSelfSkip() && wd > 0.1) {
+				rayQueryEXT pq;
+				rayQueryInitializeEXT(pq, hw_tlas, gl_RayFlagsOpaqueEXT, 0xff, hw.cam.xyz, 0.05, (Pw - hw.cam.xyz) / wd, wd * 1.1 + 0.5);
+				while (rayQueryProceedEXT(pq)) {}
+				if (rayQueryGetIntersectionTypeEXT(pq, true) == gl_RayQueryCommittedIntersectionTriangleEXT &&
+				    abs(rayQueryGetIntersectionTEXT(pq, true) - wd) < 0.03 * wd + 0.15)
+					self_ = rayQueryGetIntersectionInstanceIdEXT(pq, true);
+			}
+			if (st) Stat(38, self_ >= 0 ? 1 : 0);
+			float self_range = 0.25 + 0.02 * dist;
+			vec3  o    = Pw + Nw * (0.003 * dist + 0.01);
+			float tmax = max(push.params.z, 1.0);
+			rayQueryEXT rq;
+			rayQueryInitializeEXT(rq, hw_tlas, self_ >= 0 ? gl_RayFlagsNoOpaqueEXT : gl_RayFlagsOpaqueEXT, 0xff, o, 0.02, Rw, tmax);
+			while (rayQueryProceedEXT(rq)) {
+				if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+					bool own = rayQueryGetIntersectionInstanceIdEXT(rq, false) == self_ && rayQueryGetIntersectionTEXT(rq, false) < self_range;
+					if (!own) rayQueryConfirmIntersectionEXT(rq);
+				}
+			}
+			if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+				float t    = rayQueryGetIntersectionTEXT(rq, true);
+				int   inst = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+				int   prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+				vec2  bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+				hit        = MtShadeHit(o, Rw, t, inst, prim, bc, tmax, res);
+				hdist      = t;
+			}
+		}
+	}
+#endif
+	if (st) Stat(37, hit ? 1 : 0);
+	if (!hit) {
+		// (a miss: the sky or past the ray's length; the game's own environment term stays, at a low confidence the
+		// composite reads as "keep the game")
+		imageStore(out_a, px, vec4(0));
+		imageStore(out_c, px, vec4(rough, mw, 0, 1));
+		return;
+	}
+	imageStore(out_a, px, res);
+	imageStore(out_c, px, vec4(rough, mw, hdist, 1));
+}
+
+// Temporal: the history along the game's motion vector (characters' armour moves with them), disocclusion by distance
+// and normal, a YCoCg neighbourhood clamp (wider on rough metal), history up to 32 frames on rough metal, 6 on mirrors.
+void MtTemporal(ivec2 px) {
+	vec2  ts  = TraceSize();
+	vec2  uv  = (vec2(px) + 0.5) / ts;
+	vec4  g   = texelFetch(gb_cur, px, 0);
+	vec4  ax  = texelFetch(aux_tex, px, 0);
+	vec4  cur = texelFetch(src_a, px, 0);
+	if (g.w > 5e4 || ax.y < 0.02) {
+		imageStore(out_a, px, vec4(0));
+		imageStore(out_b, px, vec4(0));
+		return;
+	}
+	bool  fresh = cur.a >= 0.0;
+	float rough = ax.x;
+	vec3  m1 = vec3(0), m2 = vec3(0);
+	float a1 = 0.0, a2 = 0.0, wn = 0.0;
+	vec4  mean = vec4(0);
+	ivec2 hi   = ivec2(ts) - 1;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			ivec2 q  = clamp(px + ivec2(x, y), ivec2(0), hi);
+			vec4  sg = texelFetch(gb_cur, q, 0);
+			vec4  sv = texelFetch(src_a, q, 0);
+			vec4  sx = texelFetch(aux_tex, q, 0);
+			float w  = (abs(sg.w - g.w) < 0.05 * g.w + 0.02 && dot(sg.xyz, g.xyz) > 0.7 && sv.a >= 0.0 && sx.y > 0.02) ? 1.0 : 0.0;
+			vec3  yc = YCoCg(sv.rgb);
+			m1 += yc * w, m2 += yc * yc * w;
+			a1 += sv.a * w, a2 += sv.a * sv.a * w;
+			mean += sv * w;
+			wn += w;
+		}
+	float wraw = wn;
+	wn = max(wn, 1.0);
+	m1 /= wn, m2 /= wn, a1 /= wn, a2 /= wn, mean /= wn;
+	if (!fresh) cur = mean;
+	vec3  sig  = sqrt(max(m2 - m1 * m1, vec3(0)));
+	float asig = sqrt(max(a2 - a1 * a1, 0.0));
+	if (fresh && wraw > 2.0) { // (a lone bright hit: at most the neighbourhood's mean + 2.5 sigma)
+		float lim = Luma(Rgb(m1)) + 2.5 * Luma(sig) + 0.02, lc = Luma(cur.rgb);
+		if (lc > lim) cur.rgb *= lim / max(lc, 1e-6);
+	}
+	vec2  mv    = texelFetch(motion_tex, RenderPixel(uv), 0).xy * push.motion.xy / RenderSize();
+	vec2  puv   = uv + mv;
+	bool  valid = MtHist() && (push.misc.w & 1) == 0 && InScreen(puv);
+	vec4  meta  = vec4(0);
+	if (valid) {
+		ivec2 pp = clamp(ivec2(puv * ts), ivec2(0), hi);
+		vec4  pg = texelFetch(gb_prev, pp, 0);
+		valid    = abs(pg.w - g.w) < 0.08 * g.w + 0.03 && dot(pg.xyz, g.xyz) > 0.6;
+		meta     = texelFetch(meta_tex, pp, 0);
+		if (Bad(meta)) valid = false;
+	}
+	vec4  res;
+	float len;
+	if (valid) {
+		vec4 hist = textureLod(src_b, puv, 0);
+		if (Bad(hist)) hist = cur;
+		float k  = mix(1.0, 2.5, smoothstep(0.05, 0.45, rough));
+		vec3  hy = clamp(YCoCg(hist.rgb), m1 - k * sig - 1e-4, m1 + k * sig + 1e-4);
+		hist.rgb = max(Rgb(hy), vec3(0));
+		hist.a   = clamp(hist.a, a1 - k * asig - 0.02, a1 + k * asig + 0.02);
+		float cap = mix(6.0, 32.0, smoothstep(0.05, 0.45, rough));
+		len       = min(meta.x + 1.0, cap);
+		float alpha = 1.0 / len;
+		if (!fresh) len = max(meta.x, 1.0), alpha = wraw > 0.0 ? alpha * 0.5 : 0.0;
+		res = mix(hist, cur, alpha);
+	} else {
+		res = rough > 0.1 ? mix(cur, mean, 0.5) : cur;
+		len = 1.0;
+	}
+	if (Bad(res)) res = vec4(0), len = 0.0;
+	res.rgb = clamp(res.rgb, vec3(0), vec3(1));
+	res.a   = clamp(res.a, 0.0, 1.0);
+	imageStore(out_a, px, res);
+	imageStore(out_b, px, vec4(len, 0, 0, 0));
+}
+
+// The roughness-aware a-trous pass (step params.w): a 5x5 B3 kernel scaled by roughness (mirror-like metal untouched,
+// rough metal blurred over its lobe), short hits sharper (contact reflections), edge stops on distance, normal and the
+// metal mask.
+void MtAtrous(ivec2 px) {
+	vec4 g  = texelFetch(gb_cur, px, 0);
+	vec4 ax = texelFetch(aux_tex, px, 0);
+	vec4 c0 = texelFetch(src_a, px, 0);
+	if (g.w > 5e4 || ax.y < 0.02) {
+		imageStore(out_a, px, c0);
+		return;
+	}
+	float rough = ax.x;
+	float spread = smoothstep(0.04, 0.4, rough) * clamp(ax.z / (0.05 * g.w + 0.3), 0.35, 1.0);
+	if (spread < 0.05) {
+		imageStore(out_a, px, c0);
+		return;
+	}
+	int   step = int(push.params.w);
+	const float kw[3] = float[3](0.375, 0.25, 0.0625);
+	vec4  acc = vec4(0);
+	float ws  = 0.0;
+	ivec2 hi  = ivec2(TraceSize()) - 1;
+	for (int y = -2; y <= 2; ++y)
+		for (int x = -2; x <= 2; ++x) {
+			ivec2 q  = px + ivec2(x, y) * step;
+			if (any(lessThan(q, ivec2(0))) || any(greaterThan(q, hi))) continue;
+			vec4  sg = texelFetch(gb_cur, q, 0);
+			vec4  sx = texelFetch(aux_tex, q, 0);
+			vec4  sv = texelFetch(src_a, q, 0);
+			float k  = kw[abs(x)] * kw[abs(y)];
+			if (x != 0 || y != 0) k *= spread;
+			float w  = k * exp(-abs(sg.w - g.w) / (0.02 * g.w + 0.02)) * pow(max(dot(sg.xyz, g.xyz), 0.0), 16.0) *
+			          step_(sx.y) * exp(-abs(sx.x - rough) * 8.0);
+			acc += sv * w;
+			ws  += w;
+		}
+	imageStore(out_a, px, ws > 1e-6 ? acc / ws : c0);
+}
+
+// The composite (render resolution, over the reflections' own composite): on metal, the game's environment term is
+// replaced by ours: out = mix(game, envBRDF(F0, roughness) x our reflection, weight), weight = metal x roughness fade x
+// our confidence x strength x the history's warm-up; the game's own highlights (much brighter than the reflection: sun,
+// torches) kept; the result never above 2.5x nor below 40 % of the game's luminance (no glowing armour, no black holes).
+vec4 MtUpsample(vec2 uv, float z, vec3 N, out float len) {
+	vec2  ts = TraceSize();
+	vec2  sp = uv * ts - 0.5;
+	ivec2 b  = ivec2(floor(sp));
+	vec2  f  = sp - vec2(b);
+	vec4  acc = vec4(0);
+	float ws = 0.0, la = 0.0;
+	ivec2 hi = ivec2(ts) - 1;
+	for (int y = 0; y <= 1; ++y)
+		for (int x = 0; x <= 1; ++x) {
+			ivec2 q  = clamp(b + ivec2(x, y), ivec2(0), hi);
+			vec4  sg = texelFetch(gb_cur, q, 0);
+			float w  = (x == 0 ? 1.0 - f.x : f.x) * (y == 0 ? 1.0 - f.y : f.y) + 1e-4;
+			w *= exp(-abs(sg.w - z) / (0.02 * z + 0.02)) * max(dot(sg.xyz, N), 0.0);
+			acc += texelFetch(src_b, q, 0) * w;
+			la  += texelFetch(meta_tex, q, 0).x * w;
+			ws  += w;
+		}
+	len = ws > 1e-6 ? la / ws : 0.0;
+	return ws > 1e-6 ? acc / ws : vec4(0);
+}
+void MtComposite(ivec2 px) {
+	vec2  ruv  = (vec2(px) + 0.5) / RenderSize();
+	vec4  base = texelFetch(src_a, px, 0); // (the reflections' composite: the game's colour where they changed nothing)
+	int   view = int(push.motion.w + 0.5);
+	vec3  P, N, Nd;
+	float metal, rough;
+	bool  surf = MtSurface(px, P, N, Nd, metal, rough);
+	vec3  albedo = GbufAlbedo(px);
+	if (view == 1) { imageStore(out_a, px, vec4(vec3(surf ? metal : 0.0) / max(GameExposure(), 1e-6), base.a)); return; }
+	if (view == 2) { imageStore(out_a, px, vec4(vec3(surf ? rough : 0.0) / max(GameExposure(), 1e-6), base.a)); return; }
+	if (view == 3) { imageStore(out_a, px, vec4((surf && metal > 0.5 ? albedo : vec3(0)) / max(GameExposure(), 1e-6), base.a)); return; }
+	float mw = surf ? MtMetalW(metal) * MtRoughFade(rough) : 0.0;
+	if (mw < 0.02 || Bad(base)) {
+		if (view == 4) base.rgb = vec3(0);
+		imageStore(out_a, px, base);
+		return;
+	}
+	float len;
+	vec4  r   = MtUpsample(ruv, abs(P.z), N, len);
+	float conf = clamp(r.a, 0.0, 1.0);
+	vec3  V   = normalize(-P);
+	float nv  = clamp(dot(N, V), 1e-3, 1.0);
+	// F0: the metal's base colour (the albedo of a metalness G-buffer), its hue partly (motion.z) so an odd albedo never
+	// floods the reflection with one colour; dielectric 0.04 where the metal field fades.
+	float am  = Max3(albedo);
+	vec3  hue = am > 0.02 ? albedo / am : vec3(1);
+	vec3  f0m = mix(vec3(max(Luma(albedo), 0.04)), max(albedo, vec3(0.02)), clamp(push.motion.z, 0.0, 1.0));
+	if (am <= 0.02) f0m = vec3(0.04);
+	vec3  F0  = mix(vec3(0.04), f0m, metal);
+	vec2  ab  = MtEnvBrdf(rough, nv);
+	vec3  spec = F0 * ab.x + ab.y;
+	float e    = max(GameExposure(), 1e-6);
+	vec3  refl = conf > 1e-3 ? InvTonemap(r.rgb / conf) / e : vec3(0);
+	vec3  ours = spec * refl;
+	float lb   = Luma(base.rgb), lo = Luma(ours);
+	// (the game's highlights: far brighter than our reflection there; kept)
+	float keep = smoothstep(2.0, 4.0, lb / max(lo, 1e-6)) * smoothstep(0.5, 1.5, lb * e);
+	float warm = smoothstep(0.0, 3.0, len); // (a fresh disocclusion: the game's pixel first)
+	float w    = clamp(0.85 * mw * conf * push.params.x * warm * (1.0 - 0.85 * keep), 0.0, 0.95);
+	vec3  outc = mix(base.rgb, ours, w);
+	float lout = Luma(outc);
+	if (lout > 2.5 * lb + 1e-5) outc *= (2.5 * lb + 1e-5) / lout;
+	else if (lout < 0.4 * lb) outc *= 0.4 * lb / max(lout, 1e-6);
+	if (BadV(outc)) outc = base.rgb;
+	if (Sampled(px)) Stat(39, w > 0.05 ? 1 : 0);
+	if (view == 4) outc = ours * conf;
+	imageStore(out_a, px, vec4(outc, base.a));
+}
+
 void main() {
 	ivec2 p    = ivec2(gl_GlobalInvocationID.xy);
 	int   mode = push.misc.x;
@@ -1663,11 +2069,15 @@ void main() {
 		if (b.x < ts.x) Trace(b, false);
 		return;
 	}
-	ivec2 size = ivec2(mode == 4 || mode == 6 ? RenderSize() : TraceSize());
+	ivec2 size = ivec2(mode == 4 || mode == 6 || mode == 12 ? RenderSize() : TraceSize());
 	if (p.x >= size.x || p.y >= size.y) return;
 	if (mode == 6) HizBase(p);
 	else if (mode == 0) Trace(p, true);
 	else if (mode == 1) Temporal(p);
 	else if (mode == 2) Atrous(p);
 	else if (mode == 4) Composite(p);
+	else if (mode == 9) MtTrace(p);
+	else if (mode == 10) MtTemporal(p);
+	else if (mode == 11) MtAtrous(p);
+	else if (mode == 12) MtComposite(p);
 }
