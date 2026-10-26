@@ -520,7 +520,9 @@ void Volume(ivec2 q) {
 			float s   = 0.6;
 #ifdef KYTY_HWRT_VOLUMETRIC
 			if (hw_on) {
-				lit += HwVis(x, lw) * dt;
+				// (vol3: far samples (Ultra marches 120 m) leave the TLAS's coverage: missing occluders read as lit; they
+				// count less with distance: 1 up to 50 m, 0.35 at 120 m and beyond)
+				lit += HwVis(x, lw) * dt * mix(1.0, 0.35, smoothstep(50.0, 120.0, t));
 				continue;
 			}
 #endif
