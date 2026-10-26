@@ -1735,6 +1735,24 @@ float MtMetalW(float m) { return smoothstep(0.3, 0.7, m); }
 // (plausibility) A metal's base colour is its F0, bright (iron ~0.55, steel ~0.6, gold / brass ~0.9 in one channel,
 // linear): a pixel flagged metal whose albedo is dark is not a bare metal (stone, dirt, soot-covered fittings) and fades
 // out (KYTY_HWRT_METAL_MIN_F0, linear max channel, default 0.12, the fade from 60 % of it; no albedo layer: kept).
+// (refl2) Distance and silhouettes. The 23:44 log / screenshot: white streaks along distant ledges, walkway edges and roofs
+// in the fog. Far away the game's pixel is mostly fog (its colour is the fog's, not the surface's) while our reflection
+// is unfogged, and a ledge's silhouette pixel has a normal / depth that belongs to neither side. Metal fades out from
+// 25 m to 50 m (the fog's distance; KYTY_HWRT_FOG_DIST is the AO's, 35 m) and nothing is done on a depth edge (the
+// second difference of 1 / distance across the pixel, as the reflection march's silhouette test).
+float MtNearEdge(ivec2 rp, vec3 P) {
+	float dist = abs(P.z);
+	float near_ = 1.0 - smoothstep(25.0, 50.0, dist);
+	if (near_ <= 0.0) return 0.0;
+	ivec2 hi  = ivec2(RenderSize()) - 1;
+	float iz  = 1.0 / max(dist, 1e-3);
+	float ixp = 1.0 / max(abs(ViewZ(texelFetch(depth_tex, min(rp + ivec2(1, 0), hi), 0).r)), 1e-3);
+	float ixm = 1.0 / max(abs(ViewZ(texelFetch(depth_tex, max(rp - ivec2(1, 0), ivec2(0)), 0).r)), 1e-3);
+	float iyp = 1.0 / max(abs(ViewZ(texelFetch(depth_tex, min(rp + ivec2(0, 1), hi), 0).r)), 1e-3);
+	float iym = 1.0 / max(abs(ViewZ(texelFetch(depth_tex, max(rp - ivec2(0, 1), ivec2(0)), 0).r)), 1e-3);
+	float j   = max(abs(ixp + ixm - 2.0 * iz), abs(iyp + iym - 2.0 * iz)) / iz;
+	return near_ * (1.0 - smoothstep(0.03, 0.10, j));
+}
 float MtPlausible(ivec2 rp) {
 	float lim = float((push.dec.w >> 8) & 1023) / 1000.0; // (dec.w bits 8..17: the minimum F0 x 1000; 0 off)
 	if (lim <= 0.0 || int(xparams.w) < 0 || int(xparams.w) >= push.dec.z) return 1.0;
@@ -1778,7 +1796,7 @@ void MtTrace(ivec2 px) {
 	bool  surf = MtSurface(rp, P, N, Nd, metal, rough);
 	float dist = abs(P.z);
 	imageStore(out_b, px, vec4(N, surf ? dist : 6.0e4));
-	float mw = surf ? MtMetalW(metal) * MtRoughFade(rough) * MtPlausible(rp) : 0.0;
+	float mw = surf ? MtMetalW(metal) * MtRoughFade(rough) * MtPlausible(rp) * MtNearEdge(rp, P) : 0.0;
 	bool  st = Sampled(px);
 	if (st && surf) Stat(34, 1), Stat(35, metal > 0.5 ? 1 : 0);
 	// (the roughness of the metal pixels: 10 bins, cumulative, logged every 10 s as "RT metal: roughness on metal")
@@ -2054,7 +2072,7 @@ void MtComposite(ivec2 px) {
 	if (view == 1) { imageStore(out_a, px, vec4(vec3(surf ? metal : 0.0) * 0.25 / max(GameExposure(), 1e-6), base.a)); return; }
 	if (view == 2) { imageStore(out_a, px, vec4(vec3(surf ? rough : 0.0) * 0.25 / max(GameExposure(), 1e-6), base.a)); return; }
 	if (view == 3) { imageStore(out_a, px, vec4((surf && metal > 0.5 ? albedo : vec3(0)) * 0.25 / max(GameExposure(), 1e-6), base.a)); return; }
-	float mw = surf ? MtMetalW(metal) * MtRoughFade(rough) * MtPlausible(px) : 0.0;
+	float mw = surf ? MtMetalW(metal) * MtRoughFade(rough) * MtPlausible(px) * MtNearEdge(px, P) : 0.0;
 	if (mw < 0.02 || Bad(base)) {
 		if (view == 4) base.rgb = vec3(0);
 		imageStore(out_a, px, base);
@@ -2097,11 +2115,11 @@ void MtComposite(ivec2 px) {
 	}
 	vec3  delta = spec * (refl - amb);
 	float lb    = Luma(base.rgb);
-	float warm  = smoothstep(0.0, 3.0, len); // (a fresh disocclusion: the game's pixel first)
+	float warm  = smoothstep(1.0, 8.0, len); // (refl2: a fresh history (reset, disocclusion) fades in over ~8 frames: no one-frame flash)
 	float w     = clamp(mw * conf * push.params.x * warm, 0.0, 1.0);
 	vec3  outc  = max(base.rgb + w * delta, vec3(0));
 	float lout = Luma(outc);
-	if (lout > 1.3 * lb + 1e-5) outc *= (1.3 * lb + 1e-5) / lout; // (no glowing armour: at most 1.3x the game's pixel)
+	if (lout > 1.15 * lb + 1e-5) outc *= (1.15 * lb + 1e-5) / lout; // (refl2: at most 1.15x the game's pixel: no streaks, no icy glow)
 	bool dark = lout < 0.7 * lb; // (the stats: this pixel would have darkened by > 30 %)
 	if (lout < 0.85 * lb) outc *= 0.85 * lb / max(lout, 1e-6); // (never more than 15 % darker than the game's shading)
 	if (BadV(outc)) outc = base.rgb;
