@@ -156,6 +156,10 @@ void                    Destroy(Instance* instance);
 void                 Reset(Instance* instance);
 [[nodiscard]] bool   GetPictureInfo(void* frame_buffer, PictureInfo* picture_info);
 
+// Movie path diagnostics printed to stdout even with --printf-direction Silent (the launcher
+// log): the first 24 calls per site, then every 512th, and the first 64 failures per site.
+void Trace(const char* site, int32_t result, const Output* output, const char* extra = nullptr);
+
 } // namespace Libs::VideoDec2::Decoder
 
 #endif // EMULATOR_INCLUDE_EMULATOR_LIBS_VIDEODEC2DECODER_H_
