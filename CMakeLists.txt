@@ -454,6 +454,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${rt_reflections_header}")
+# KYTY_HWRT_REFL (hwrt2): the same pass with hardware ray queries into the scene TLAS (src/local/hwrt-scene.cpp) where
+# the screen-space march misses.
+set(rt_reflections_hw_spv "${gpu_tiler_generated_dir}/rt_reflections_hw.spv")
+set(rt_reflections_hw_header "${gpu_tiler_generated_dir}/rt_reflections_hw_spv.h")
+add_custom_command(
+	OUTPUT "${rt_reflections_hw_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_HWRT
+	        -o "${rt_reflections_hw_spv}" "${rt_reflections_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_reflections_hw_spv} -DOUTPUT=${rt_reflections_hw_header}
+	        -DSYMBOL=RT_REFLECTIONS_HW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rt_reflections_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rt_reflections_hw_header}")
 
 # KYTY_GBUF_VIEW / KYTY_GBUF_TAP: the G-buffer diagnostic view and statistics before the upscaler (src/local/gbuf-view.cpp).
 set(gbuf_view_source "${KYTY_SOURCE_DIR}/local/gbuf-view.comp")

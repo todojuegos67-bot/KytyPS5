@@ -137,6 +137,15 @@ struct Job {
 	bool     build = false, refit = false;
 };
 
+// (hwrt2) What the ray-traced effects read of the frame's scene (std430, hwrt2 shaders' binding).
+struct RayInfo {
+	float    inv[16];       // clip -> world rows
+	float    vp[16];        // world -> clip rows (clip = M * world)
+	float    cam[4];        // the camera's position
+	float    info[4];       // 1 valid, TLAS instances
+	uint32_t materials[4];  // the materials' address (8 words per TLAS instance: PS, VS, id, vertices, indices)
+};
+
 struct Pending {
 	vk::AccelerationStructureKHR as = nullptr;
 	Buffer                       a, b, c;
@@ -147,6 +156,8 @@ struct State {
 	std::mutex mutex;
 	bool       init_tried = false, ready = false, disabled = false;
 	Buffer     capture, records, instances[Slots], materials[Slots], results[Slots], scratch, tlas_buf;
+	Buffer     rayinfo[Slots]; // (hwrt2: the frame's scene for the ray-traced effects, RayInfo)
+	int        ray_slot = -1;  // the last slot whose TLAS and RayInfo are complete
 	vk::AccelerationStructureKHR tlas = nullptr;
 	vk::DeviceAddress            tlas_address = 0;
 	bool                         tlas_built = false;
@@ -219,7 +230,8 @@ bool Init(GraphicContext& graphics) {
 	ok = ok && MakeBuffer(graphics, g.records, vk::DeviceSize {MaxRecords} * Slots * sizeof(Record), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
 	for (uint32_t s = 0; s < Slots && ok; ++s) {
 		ok = ok && MakeBuffer(graphics, g.instances[s], vk::DeviceSize {MaxInstances} * sizeof(VkAccelerationStructureInstanceKHR), as_input, true);
-		ok = ok && MakeBuffer(graphics, g.materials[s], vk::DeviceSize {MaxInstances} * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+		ok = ok && MakeBuffer(graphics, g.materials[s], vk::DeviceSize {MaxInstances} * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+		ok = ok && MakeBuffer(graphics, g.rayinfo[s], sizeof(RayInfo), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
 		g_host_readback = true;
 		ok = ok && MakeBuffer(graphics, g.results[s], vk::DeviceSize {MaxChecks} * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
 		g_host_readback = false;
@@ -1317,10 +1329,15 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 				instance.accelerationStructureReference         = e.blas_address;
 				instances[instance_count]                       = instance;
 				// (Phase 2's material hook: the draw's pixel and vertex shader, by TLAS instance index.)
-				materials[instance_count * 4 + 0] = static_cast<uint32_t>(e.ps);
-				materials[instance_count * 4 + 1] = static_cast<uint32_t>(e.ps >> 32u);
-				materials[instance_count * 4 + 2] = static_cast<uint32_t>(e.vs);
-				materials[instance_count * 4 + 3] = e.id;
+				// (hwrt2: + its world-space vertices and indices, for a hit's geometric normal)
+				materials[instance_count * 8 + 0] = static_cast<uint32_t>(e.ps);
+				materials[instance_count * 8 + 1] = static_cast<uint32_t>(e.ps >> 32u);
+				materials[instance_count * 8 + 2] = static_cast<uint32_t>(e.vs);
+				materials[instance_count * 8 + 3] = e.id;
+				materials[instance_count * 8 + 4] = static_cast<uint32_t>(e.vb.address);
+				materials[instance_count * 8 + 5] = static_cast<uint32_t>(e.vb.address >> 32u);
+				materials[instance_count * 8 + 6] = static_cast<uint32_t>(e.ib.address);
+				materials[instance_count * 8 + 7] = static_cast<uint32_t>(e.ib.address >> 32u);
 				++instance_count;
 			}
 			++it;
@@ -1356,6 +1373,21 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 		}
 	}
 	g.tlas_built = payload->tlas;
+	// (hwrt2) The frame's scene for the ray-traced effects: clip <-> world, the camera, the materials.
+	g.ray_slot = -1;
+	if (g.tlas_built && camera) {
+		auto& ri = *static_cast<RayInfo*>(g.rayinfo[slot].mapped);
+		std::memcpy(ri.inv, g_inv.data(), sizeof(ri.inv));
+		for (int i = 0; i < 16; ++i) ri.vp[i] = g.view_proj[i];
+		std::memcpy(ri.cam, g_cam.data(), sizeof(ri.cam));
+		ri.info[0] = 1.0f;
+		ri.info[1] = static_cast<float>(instance_count);
+		ri.info[2] = ri.info[3] = 0.0f;
+		ri.materials[0] = static_cast<uint32_t>(g.materials[slot].address);
+		ri.materials[1] = static_cast<uint32_t>(g.materials[slot].address >> 32u);
+		ri.materials[2] = ri.materials[3] = 0;
+		g.ray_slot = static_cast<int>(slot);
+	}
 	// The GPU side, in order with the frame's commands.
 	const bool       timed  = g.pool != nullptr;
 	const auto       pool   = g.pool;
@@ -1472,6 +1504,17 @@ vk::AccelerationStructureKHR SceneTlas(bool* built_now) {
 	if (!g.ready || g.tlas == nullptr) return nullptr;
 	if (built_now != nullptr) *built_now = g.tlas_built;
 	return g.tlas;
+}
+
+bool CurrentRayScene(RayScene& out) {
+	out = {};
+	if (!Active()) return false;
+	std::lock_guard lock(g.mutex);
+	if (!g.ready || g.ray_slot < 0 || g.tlas == nullptr) return false;
+	out.tlas   = reinterpret_cast<uint64_t>(static_cast<VkAccelerationStructureKHR>(g.tlas));
+	out.info   = vk::Buffer(g.rayinfo[g.ray_slot].buffer);
+	out.size   = sizeof(RayInfo);
+	return true;
 }
 
 void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, std::span<const TextureBinding> images) {
