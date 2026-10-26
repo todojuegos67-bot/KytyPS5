@@ -8,6 +8,9 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelinePrewarm.h"
+
+#include <chrono>
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -260,12 +263,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		const auto shaders =
 		    BuildRectListShaders(vs_input_info, ps_active ? ps_input_info : nullptr);
 		tess_control_shader_module = CompileSPV(shaders.control, graphics.device);
+		Prewarm::NoteSpirv(tess_control_shader_module, shaders.control);
 		if (graphics_debug_dump_enabled()) {
 			LOGF("PipelineTrace: vkCreateShaderModule RectList TCS done module=%p\n",
 			     static_cast<void*>(tess_control_shader_module));
 		}
 
 		tess_eval_shader_module = CompileSPV(shaders.evaluation, graphics.device);
+		Prewarm::NoteSpirv(tess_eval_shader_module, shaders.evaluation);
 		if (graphics_debug_dump_enabled()) {
 			LOGF("PipelineTrace: vkCreateShaderModule RectList TES done module=%p\n",
 			     static_cast<void*>(tess_eval_shader_module));
@@ -563,8 +568,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
-	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-	                                                 &pipeline.pipeline);
+	const uint64_t prewarm_key = Prewarm::RegisterGraphics(
+	    pipeline_info, descriptor_bindings, static_cast<uint32_t>(graphics_stages),
+	    static_cast<uint32_t>(pipeline.uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+	                                                         : vk::DescriptorSetLayoutCreateFlags {}));
+	if (auto prewarmed = Prewarm::Take(prewarm_key, true); prewarmed != nullptr) {
+		pipeline.pipeline = prewarmed;
+		result            = vk::Result::eSuccess;
+	} else {
+		const auto compile_start = std::chrono::steady_clock::now();
+		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
+		                                                 &pipeline.pipeline);
+		Prewarm::NoteRuntimeCompile(true, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                      std::chrono::steady_clock::now() - compile_start).count()));
+	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -600,6 +617,8 @@ void CreateComputeLayoutInternal(GraphicContext& graphics, PipelineCache::Pipeli
 	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
 	                  vk::ShaderStageFlagBits::eCompute);
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	job.prewarm_key = Prewarm::Register(compute_module, descriptor_bindings, job.required_subgroup_size,
+	                                    static_cast<uint32_t>(pipeline.uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR : vk::DescriptorSetLayoutCreateFlags {}));
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
@@ -625,6 +644,13 @@ void CreateComputeLayoutInternal(GraphicContext& graphics, PipelineCache::Pipeli
 // Thread-safe: touches only the device, the (internally synchronized) driver cache and `pipeline`.
 void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                  const ComputePipelineJob& job, vk::PipelineCache driver_cache) {
+	if (job.prewarm_key != 0) {
+		if (auto prewarmed = Prewarm::Take(job.prewarm_key, false); prewarmed != nullptr) {
+			EXIT_IF(pipeline.pipeline != nullptr);
+			pipeline.pipeline = prewarmed;
+			return;
+		}
+	}
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
@@ -656,8 +682,11 @@ void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeli
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	const auto compile_start = std::chrono::steady_clock::now();
 	const auto result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                           &pipeline.pipeline);
+	Prewarm::NoteRuntimeCompile(false, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                       std::chrono::steady_clock::now() - compile_start).count()));
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
@@ -675,3 +704,4 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 }
 
 } // namespace Libs::Graphics
+
