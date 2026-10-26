@@ -18,6 +18,7 @@
 #include <span>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #define XXH_INLINE_ALL
 #include <xxhash.h>
@@ -626,11 +627,12 @@ private:
 			return value;
 		std::vector<const Inst*> candidates;
 		std::vector<const Inst*> visited;
+		std::unordered_set<const Inst*> visited_set;
 		std::vector<const Inst*> pending {phi};
 		while (!pending.empty()) {
 			const auto* inst = pending.back();
 			pending.pop_back();
-			if (std::ranges::find(visited, inst) != visited.end()) continue;
+			if (!visited_set.insert(inst).second) continue;
 			visited.push_back(inst);
 			if (inst->GetOpcode() == ValueOpcode::Phi) {
 				for (size_t i = 0; i < inst->NumArgs(); ++i) {
@@ -1295,14 +1297,15 @@ private:
 	}
 
 	bool GuardedOnEntry(const Block* block, const auto& stops, const auto& accepts) const {
-		std::vector<const Block*> pending {block};
+		std::vector<const Block*>        pending {block};
+		std::unordered_set<const Block*> seen {block};
 		for (size_t i = 0; i < pending.size(); ++i) {
 			const auto* current = pending[i];
 			if (stops(current) || current->ImmPredecessors().empty()) return false;
 			for (const auto* previous: current->ImmPredecessors()) {
 				const auto edge = ConditionalEdge(previous, current);
 				if (edge && accepts(*edge)) continue;
-				if (std::ranges::find(pending, previous) == pending.end())
+				if (seen.insert(previous).second)
 					pending.push_back(previous);
 			}
 		}
@@ -1817,15 +1820,40 @@ private:
 		return value;
 	}
 
+	// The CFG is fixed while resources are tracked, so block walks are memoized. They used a
+	// linear search of the work list per edge (quadratic per query) and were repeated per use.
+	struct BlockQueryKey {
+		const Block* a;
+		const Block* b;
+		const Block* c;
+		bool operator==(const BlockQueryKey&) const = default;
+	};
+	struct BlockQueryKeyHash {
+		size_t operator()(const BlockQueryKey& k) const noexcept {
+			auto h = std::hash<const void*> {};
+			return h(k.a) ^ (h(k.b) * 0x9e3779b97f4a7c15ull) ^ (h(k.c) * 0xff51afd7ed558ccdull);
+		}
+	};
+	mutable std::unordered_map<BlockQueryKey, bool, BlockQueryKeyHash> m_reaches_memo;
+	mutable std::unordered_map<BlockQueryKey, bool, BlockQueryKeyHash> m_dominates_memo;
+
 	bool Reaches(const Block* from, const Block* to, const Block* stop = nullptr) const {
-		std::vector<const Block*> pending {to};
+		const BlockQueryKey key {from, to, stop};
+		if (const auto found = m_reaches_memo.find(key); found != m_reaches_memo.end()) return found->second;
+		std::vector<const Block*>             pending {to};
+		std::unordered_set<const Block*>      seen {to};
+		bool                                  result = false;
 		for (size_t index = 0; index < pending.size(); ++index) {
 			if (pending[index] == stop) continue;
-			if (pending[index] == from) return true;
+			if (pending[index] == from) {
+				result = true;
+				break;
+			}
 			for (const auto* previous: pending[index]->ImmPredecessors())
-				if (std::ranges::find(pending, previous) == pending.end()) pending.push_back(previous);
+				if (seen.insert(previous).second) pending.push_back(previous);
 		}
-		return false;
+		m_reaches_memo.emplace(key, result);
+		return result;
 	}
 
 	bool InCycle(const Block* block) const {
@@ -1843,7 +1871,20 @@ private:
 	}
 
 	bool Dominates(const Block* initial, const Block* use, Value witness = {}) const {
-		std::vector<const Block*> pending {use};
+		if (witness.IsEmpty()) {
+			const BlockQueryKey key {initial, use, nullptr};
+			if (const auto found = m_dominates_memo.find(key); found != m_dominates_memo.end())
+				return found->second;
+			const bool result = DominatesWalk(initial, use, witness);
+			m_dominates_memo.emplace(key, result);
+			return result;
+		}
+		return DominatesWalk(initial, use, witness);
+	}
+
+	bool DominatesWalk(const Block* initial, const Block* use, Value witness) const {
+		std::vector<const Block*>        pending {use};
+		std::unordered_set<const Block*> seen {use};
 		for (size_t index = 0; index < pending.size(); ++index) {
 			const auto* current = pending[index];
 			if (current == initial) continue;
@@ -1855,7 +1896,7 @@ private:
 					if (edge && edge->lanes == LaneQuantifier::All && !edge->positive &&
 					    Implies(witness, edge->condition)) continue;
 				}
-				if (std::ranges::find(pending, previous) == pending.end()) pending.push_back(previous);
+				if (seen.insert(previous).second) pending.push_back(previous);
 			}
 		}
 		return true;
