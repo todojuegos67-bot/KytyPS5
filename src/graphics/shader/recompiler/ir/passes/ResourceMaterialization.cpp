@@ -1010,15 +1010,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    base.dimension == Decoder::ImageDimension::Dim2D &&
 			    !image.cube && !image_class.cube && is_1d_or_2d(image.dimension) &&
 			    is_1d_or_2d(image_class.dimension);
-			if ((!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension)) &&
-			     !unfiltered_coordinates) ||
-			    image.mip_count != image_class.mip_count ||
-			    image.conversion_format != image_class.conversion_format ||
-			    (!storage_swizzle && image.shader_swizzle != image_class.shader_swizzle)) {
-				// Ghost of Yotei CS 8968b4b53e5a246a: a runtime-selected texture table whose entries
-				// differ in mips/format/swizzle from the exemplar. Failing skipped the whole shader;
-				// now only the odd entries are bound as null images (reads return 0) and the shader
-				// runs. KYTY_STRICT_INDIRECT_IMAGES=1 restores the failure.
+			// Mips, conversion format and swizzle are emitted per candidate (the SPIR-V emitter
+			// switches on the selected entry and converts each one with its own class), so entries
+			// that differ only there keep their own typing. Ghost of Yotei CS 8968b4b53e5a246a
+			// (movie/plane table at pc 0xf08) selects planes with different formats: nulling them
+			// made the video black. Only entries whose coordinates cannot be formed from the
+			// instruction's address are still bound as null.
+			(void)storage_swizzle;
+			if (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension)) &&
+			    !unfiltered_coordinates) {
+				// KYTY_STRICT_INDIRECT_IMAGES=1 restores the failure.
 				static const bool strict = [] {
 					const char* v = std::getenv("KYTY_STRICT_INDIRECT_IMAGES");
 					return v != nullptr && v[0] == '1';

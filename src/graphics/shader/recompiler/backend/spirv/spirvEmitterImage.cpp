@@ -706,8 +706,9 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 			const auto next_slot = run.slot_bias + ordinal;
 			if (candidate.dimension == first.dimension && candidate.cube == first.cube &&
 			    IR::DescriptorBindingForImage(first) == kind &&
-			    (inst.GetOpcode() != IR::ValueOpcode::ImageWrite ||
-			     candidate.shader_swizzle == first.shader_swizzle) &&
+			    candidate.shader_swizzle == first.shader_swizzle &&
+			    candidate.conversion_format == first.conversion_format &&
+			    candidate.numeric_class == first.numeric_class &&
 			    candidate.mip_count == 1u && first.mip_count == 1u &&
 			    (ordinal == 1u || candidate.descriptor_index == next_slot)) {
 				// Native roots precede appended children; only the root may have a slot gap.
@@ -762,7 +763,10 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 	const bool dref = HasFlag(mem, Decoder::ImageSampleFlagCompare);
 	const bool scalar = dref && !gather;
 	const bool mixed = std::ranges::any_of(image.indirect_resources, [&](uint32_t resource) {
-		return state.program.info.images[resource].numeric_class != image.numeric_class;
+		const auto& candidate = state.program.info.images[resource];
+		return candidate.numeric_class != image.numeric_class ||
+		       candidate.conversion_format != image.conversion_format ||
+		       candidate.shader_swizzle != image.shader_swizzle;
 	});
 	const auto native_type = [&](uint32_t resource) {
 		return scalar ? TypeF32(state) : ImageVectorType(
