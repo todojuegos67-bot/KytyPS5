@@ -32,6 +32,18 @@ namespace RtLocal {
 
 // Any of the options above (read once).
 [[nodiscard]] bool Wanted();
+// (KYTY_HWRT_LIGHTS, hw-lights.cpp) The shadowed local lights seen lately: each a shadow projection's apex (its position),
+// forward, half-angle tangents, far plane (its reach) and faces (>= 4: a cube, a point light). Exact facts of the game's
+// own shadow matrices, no light-list layout needed; in the world space of the G-buffer view-projection's inverse.
+struct LiveLight {
+	float    pos[3] {}, fwd[3] {};
+	float    tan_half = 0, far_d = 0;
+	bool     point = false;
+	uint32_t seen = 0;             // scans that saw it
+	uint64_t age = 0, since = 0;   // flips since last / first seen
+};
+// Lights seen within max_age flips and >= min_seen scans (render thread; a copy under the lock).
+void LiveLights(std::vector<LiveLight>& out, uint64_t max_age, uint32_t min_seen);
 // KYTY_RTLS_DEBUG > 0: the overlay's markers (DebugMarkers).
 [[nodiscard]] bool OverlayWanted();
 

@@ -1,0 +1,258 @@
+#version 460
+#extension GL_EXT_ray_query : require
+// KYTY_HWRT_LIGHTS=1|2|3 (hw-lights.cpp): ray-traced shadows of the game's local lights (torches, braziers, hanging lamps)
+// through the scene TLAS (hwrt-scene.cpp), on the PS5 Pro path's HDR color before the upscaler. Modes (push.misc.x):
+//   0 trace     (half resolution at 1, full at 2 / 3): the pixel's world position from the depth and the inverse G-buffer
+//               view-projection, its normal from the depth; each light's unshadowed weight w_i (windowed inverse square,
+//               N.L, the spot's cone); 1 (2 at level 3) lights picked with probability w_i / W (a stochastic pick by
+//               importance), a ray toward a point jittered on the light's sphere (soft penumbra from its radius), ending
+//               short of the light (its own lamp / brazier mesh), through the TLAS. Out: occlusion estimate of the
+//               lights' share, sum(w_i (1 - V_i)) / W (unbiased for that pick), and W; gbuf_out: world normal, view depth.
+//   1 temporal  reprojection by the game's motion vectors, depth / normal rejection, 3x3 clamp, alpha max(1/n, 0.1); n in .g
+//   2 a-trous   5x5 B3, depth / normal stops (steps 1, 2, 4)
+//   3 composite full resolution: color *= 1 - min(strength * share * stable * occ, max_dark), share = W / (W + ambient)
+//               (the local lights' assumed part of the pixel's light); stable ramps with the history count (no darkening on
+//               a reset frame); misc.w bit 0: no lights this frame (the history fades out, nothing traced).
+// Statistics (composite): pixels, darkened pixels (> 2 %), the sum of their darkening * 1024 into stats[0..2].
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2) uniform sampler2D motion_tex;
+layout(binding = 3) uniform sampler2D src_tex;   // the mode's input (raw / temporal / a-trous)
+layout(binding = 4) uniform sampler2D gbuf_cur;
+layout(binding = 5) uniform sampler2D gbuf_prev;
+layout(binding = 6) uniform sampler2D hist_prev;
+layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
+layout(binding = 8, rgba16f) uniform writeonly image2D gbuf_out;
+
+struct Light {
+	vec4 pos_r;   // world position, reach (the shadow's far plane)
+	vec4 dir_cos; // forward, cos of the cone's half angle (-2: a point light)
+	vec4 misc;    // x: source radius (m), y: fade, z: cos where the cone's edge falloff starts, w: ray end short of it (m)
+};
+layout(binding = 9, std430) readonly buffer LightBuf {
+	vec4  ivp[4];  // clip -> world (rows)
+	vec4  cam;     // world camera position
+	vec4  p0;      // x: lights, y: strength, z: ambient, w: max darkening
+	vec4  p1;      // x: y sign of row 0 (-1: NDC y +1), y: ray normal bias, z: max distance (m), w: unused
+	vec4  pad;
+	Light l[32];
+} lb;
+layout(binding = 10) uniform accelerationStructureEXT tlas;
+layout(binding = 11, std430) buffer Stats { uint s[]; } stats;
+
+layout(push_constant) uniform Push {
+	vec4  size;   // render size xy, trace size zw
+	vec4  motion; // motion scale xy; z: history valid; w: a-trous step
+	ivec4 misc;   // mode, frame, level, flags
+} push;
+
+vec2 RenderSize() { return push.size.xy; }
+vec2 TraceSize() { return push.size.zw; }
+float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+bool IsSky(float d) { return d <= 1e-7 || d >= 0.9999999; }
+
+vec3 WorldPos(vec2 uv, float d) {
+	vec4 c = vec4(uv.x * 2.0 - 1.0, lb.p1.x * (uv.y * 2.0 - 1.0), d, 1.0);
+	vec4 w = vec4(dot(lb.ivp[0], c), dot(lb.ivp[1], c), dot(lb.ivp[2], c), dot(lb.ivp[3], c));
+	return w.xyz / (abs(w.w) > 1e-20 ? w.w : 1e-20);
+}
+vec3 WorldNormal(vec2 uv, vec3 p) {
+	vec2 t  = 1.0 / RenderSize();
+	vec3 px = WorldPos(uv + vec2(t.x, 0), textureLod(depth_tex, uv + vec2(t.x, 0), 0).r);
+	vec3 nx = WorldPos(uv - vec2(t.x, 0), textureLod(depth_tex, uv - vec2(t.x, 0), 0).r);
+	vec3 py = WorldPos(uv + vec2(0, t.y), textureLod(depth_tex, uv + vec2(0, t.y), 0).r);
+	vec3 ny = WorldPos(uv - vec2(0, t.y), textureLod(depth_tex, uv - vec2(0, t.y), 0).r);
+	vec3 e  = lb.cam.xyz;
+	vec3 dx = abs(distance(px, e) - distance(p, e)) < abs(distance(p, e) - distance(nx, e)) ? px - p : p - nx;
+	vec3 dy = abs(distance(py, e) - distance(p, e)) < abs(distance(p, e) - distance(ny, e)) ? py - p : p - ny;
+	vec3 n  = cross(dx, dy);
+	float l = length(n);
+	n = l > 1e-20 ? n / l : normalize(e - p);
+	if (dot(n, e - p) < 0.0) n = -n;
+	return n;
+}
+
+float LightW(int i, vec3 p, vec3 n) {
+	Light L  = lb.l[i];
+	vec3  v  = L.pos_r.xyz - p;
+	float d2 = dot(v, v);
+	float r  = L.pos_r.w;
+	if (d2 >= r * r || d2 < 1e-6) return 0.0;
+	vec3  ld  = v * inversesqrt(d2);
+	float ndl = dot(n, ld);
+	if (ndl <= 0.0) return 0.0;
+	float win = 1.0 - d2 / (r * r);
+	float w   = win * win / (d2 + 0.25) * ndl * L.misc.y;
+	if (L.dir_cos.w > -1.5) w *= smoothstep(L.dir_cos.w, L.misc.z, dot(-ld, L.dir_cos.xyz));
+	return w;
+}
+
+// 1 occluded / 0 lit, toward light i from p.
+float Shadow(int i, vec3 p, vec3 n, float z, vec2 rnd) {
+	Light L   = lb.l[i];
+	// a point on the light's sphere (uniform in the disc facing the receiver): the penumbra
+	vec3  c   = L.pos_r.xyz;
+	vec3  ax  = normalize(c - p);
+	vec3  b1  = normalize(cross(ax, abs(ax.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+	vec3  b2  = cross(ax, b1);
+	float ang = 6.2831853 * rnd.y, rad = L.misc.x * sqrt(rnd.x);
+	vec3  tgt = c + (b1 * cos(ang) + b2 * sin(ang)) * rad;
+	vec3  o   = p + n * (lb.p1.y + 0.0015 * z);
+	vec3  dv  = tgt - o;
+	float len = length(dv);
+	float tmax = len - L.misc.w;
+	float tmin = 0.01 + 0.001 * z;
+	if (tmax <= tmin) return 0.0;
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xff, o, tmin, dv / len, tmax);
+	while (rayQueryProceedEXT(rq)) {}
+	return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT ? 1.0 : 0.0;
+}
+
+void Trace(ivec2 pixel) {
+	vec2  uv = (vec2(pixel) + 0.5) / TraceSize();
+	float d  = textureLod(depth_tex, uv, 0).r;
+	if (IsSky(d) || (push.misc.w & 1) != 0) {
+		imageStore(out_img, pixel, vec4(0.0, 0.0, 0.0, 0.0));
+		imageStore(gbuf_out, pixel, vec4(0, 0, 0, 1e6));
+		return;
+	}
+	vec3  p = WorldPos(uv, d);
+	float z = distance(p, lb.cam.xyz);
+	vec3  n = WorldNormal(uv, p);
+	imageStore(gbuf_out, pixel, vec4(n, z));
+	int   count = clamp(int(lb.p0.x + 0.5), 0, 32);
+	float W     = 0.0;
+	float ws[32];
+	for (int i = 0; i < 32; ++i) {
+		ws[i] = i < count && z < lb.p1.z ? LightW(i, p, n) : 0.0;
+		W += ws[i];
+	}
+	if (!(W > 1e-6)) {
+		imageStore(out_img, pixel, vec4(0.0, 0.0, 0.0, 0.0));
+		return;
+	}
+	int   picks = push.misc.z >= 3 ? 2 : 1;
+	float f     = float(push.misc.y % 64);
+	float occ   = 0.0;
+	for (int k = 0; k < picks; ++k) {
+		// stratified: pick k from [(k + u) / picks] of the CDF
+		float u   = (float(k) + Ign(vec2(pixel) + f * 5.588238 + float(k) * 13.0)) / float(picks);
+		float acc = 0.0;
+		int   sel = 0;
+		for (int i = 0; i < count; ++i) {
+			acc += ws[i] / W;
+			sel = i;
+			if (u < acc) break;
+		}
+		vec2 rnd = vec2(Ign(vec2(pixel.y, pixel.x) + f * 2.93 + float(k) * 37.0 + 3.0), Ign(vec2(pixel) + f * 7.13 + float(k) * 19.0 + 57.0));
+		occ += Shadow(sel, p, n, z, rnd);
+	}
+	imageStore(out_img, pixel, vec4(occ / float(picks), W, 0.0, 1.0));
+}
+
+void Temporal(ivec2 pixel) {
+	vec2 ts  = 1.0 / TraceSize();
+	vec2 uv  = (vec2(pixel) + 0.5) * ts;
+	vec4 cur = textureLod(src_tex, uv, 0);
+	vec4 g   = textureLod(gbuf_cur, uv, 0);
+	if (g.w > 1e5) {
+		imageStore(out_img, pixel, vec4(0.0, 0.0, 0.0, 0.0));
+		return;
+	}
+	float m1 = 0.0, m2 = 0.0, wn = 0.0;
+	float ntol = 0.03 * g.w + 0.05;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			vec2  suv = uv + vec2(x, y) * ts;
+			vec4  sg  = textureLod(gbuf_cur, suv, 0);
+			float w   = (abs(sg.w - g.w) < ntol && dot(sg.xyz, g.xyz) > 0.7) ? 1.0 : 0.0;
+			float sv  = textureLod(src_tex, suv, 0).r;
+			m1 += sv * w, m2 += sv * sv * w, wn += w;
+		}
+	wn = max(wn, 1.0);
+	m1 /= wn, m2 /= wn;
+	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
+	float n_hist = 0.0, h = cur.r;
+	if (push.motion.z > 0.5) {
+		vec2 puv = uv + textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();
+		if (all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
+			vec4 pg = textureLod(gbuf_prev, puv, 0);
+			if (abs(pg.w - g.w) < 0.05 * g.w + 0.1 && dot(pg.xyz, g.xyz) > 0.8) {
+				vec4 ph = textureLod(hist_prev, puv, 0);
+				n_hist  = ph.g;
+				h       = clamp(ph.r, m1 - 1.5 * sigma - 0.05, m1 + 1.5 * sigma + 0.05);
+			}
+		}
+	}
+	float n_new = min(n_hist + 1.0, 32.0);
+	float a     = max(1.0 / n_new, 0.1);
+	imageStore(out_img, pixel, vec4(mix(h, cur.r, a), n_new, cur.g, 1.0));
+}
+
+void Atrous(ivec2 pixel) {
+	vec2  ts   = 1.0 / TraceSize();
+	vec2  uv   = (vec2(pixel) + 0.5) * ts;
+	vec4  c    = textureLod(src_tex, uv, 0);
+	vec4  g    = textureLod(gbuf_cur, uv, 0);
+	if (g.w > 1e5) {
+		imageStore(out_img, pixel, c);
+		return;
+	}
+	float step = push.motion.w;
+	const float k[3] = float[3](0.375, 0.25, 0.0625);
+	float sum = 0.0, wsum = 0.0;
+	for (int y = -2; y <= 2; ++y)
+		for (int x = -2; x <= 2; ++x) {
+			vec2  suv = uv + vec2(x, y) * step * ts;
+			vec4  sg  = textureLod(gbuf_cur, suv, 0);
+			float w   = k[abs(x)] * k[abs(y)];
+			w *= exp(-abs(sg.w - g.w) / (0.02 * g.w + 0.03)) * pow(max(dot(sg.xyz, g.xyz), 0.0), 16.0);
+			sum += textureLod(src_tex, suv, 0).r * w;
+			wsum += w;
+		}
+	imageStore(out_img, pixel, vec4(wsum > 1e-6 ? sum / wsum : c.r, c.g, c.b, c.a));
+}
+
+void Composite(ivec2 pixel) {
+	vec2 uv  = (vec2(pixel) + 0.5) / RenderSize();
+	vec4 col = textureLod(color_tex, uv, 0);
+	float d  = textureLod(depth_tex, uv, 0).r;
+	float dark = 0.0;
+	if (!IsSky(d)) {
+		// joint bilateral: the trace pixel of the 2x2 nearest in depth
+		vec3  p  = WorldPos(uv, d);
+		float z  = distance(p, lb.cam.xyz);
+		vec2  ts = 1.0 / TraceSize();
+		vec2  base = (floor(uv * TraceSize() - 0.5) + 0.5) * ts;
+		float best = 1e30;
+		vec4  v    = vec4(0);
+		for (int j = 0; j < 4; ++j) {
+			vec2  suv = base + vec2(j & 1, j >> 1) * ts;
+			float dz  = abs(textureLod(gbuf_cur, suv, 0).w - z);
+			if (dz < best) best = dz, v = textureLod(src_tex, suv, 0);
+		}
+		float stable = smoothstep(1.5, 6.0, v.g); // (the history count: a reset frame darkens nothing)
+		float share  = v.b / (v.b + lb.p0.z);
+		if (best < 0.05 * z + 0.1) dark = min(lb.p0.y * share * stable * clamp(v.r, 0.0, 1.0), lb.p0.w);
+		if (isnan(dark)) dark = 0.0;
+	}
+	imageStore(out_img, pixel, vec4(col.rgb * (1.0 - dark), col.a));
+	if ((pixel.x & 3) == 0 && (pixel.y & 3) == 0) { // (1 in 16 pixels)
+		atomicAdd(stats.s[0], 1u);
+		if (dark > 0.02) atomicAdd(stats.s[1], 1u), atomicAdd(stats.s[2], uint(dark * 1024.0));
+	}
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	int   mode  = push.misc.x;
+	vec2  sz    = mode == 3 ? RenderSize() : TraceSize();
+	if (pixel.x >= int(sz.x) || pixel.y >= int(sz.y)) return;
+	if (mode == 0) Trace(pixel);
+	else if (mode == 1) Temporal(pixel);
+	else if (mode == 2) Atrous(pixel);
+	else Composite(pixel);
+}

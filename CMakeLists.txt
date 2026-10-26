@@ -486,6 +486,21 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${gbuf_view_header}")
 
+# KYTY_HWRT_LIGHTS: ray-traced local-light shadows through the scene TLAS (src/local/hw-lights.cpp).
+set(hwlights_source "${KYTY_SOURCE_DIR}/local/hw-lights.comp")
+set(hwlights_spv "${gpu_tiler_generated_dir}/hwlights.spv")
+set(hwlights_header "${gpu_tiler_generated_dir}/hwlights_spv.h")
+add_custom_command(
+	OUTPUT "${hwlights_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${hwlights_spv}" "${hwlights_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${hwlights_spv} -DOUTPUT=${hwlights_header}
+	        -DSYMBOL=HWLIGHTS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${hwlights_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${hwlights_header}")
 # KYTY_SHINE: specular highlights + material-aware sharpening before the upscaler (src/local/shine.cpp).
 set(shine_source "${KYTY_SOURCE_DIR}/local/shine.comp")
 set(shine_spv "${gpu_tiler_generated_dir}/shine.spv")
@@ -690,6 +705,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/hwrt-scene.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.h"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.cpp"
+	"${KYTY_SOURCE_DIR}/local/hw-lights.h"
+	"${KYTY_SOURCE_DIR}/local/hw-lights.cpp"
 	"${KYTY_SOURCE_DIR}/local/shine.h"
 	"${KYTY_SOURCE_DIR}/local/shine.cpp"
 	"${KYTY_SOURCE_DIR}/local/godrays.h"
