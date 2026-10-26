@@ -675,6 +675,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 PipelineCache::~PipelineCache() {
 	Prewarm::Shutdown();
 	StopAsyncCompute();
+	StopOptimizedComputeBuilds();
 	if (m_save_thread.joinable()) {
 		m_save_thread.join();
 	}
@@ -684,6 +685,10 @@ PipelineCache::~PipelineCache() {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
 			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
+			if (pipeline->optimized != nullptr) {
+				if (const VkPipeline ready = pipeline->optimized->load(); ready != VK_NULL_HANDLE)
+					m_graphics.device.destroyPipeline(vk::Pipeline(ready), nullptr);
+			}
 			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
 		}

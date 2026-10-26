@@ -22,6 +22,13 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <array>
 #include <bit>
 #include <limits>
@@ -641,6 +648,117 @@ void CreateComputeLayoutInternal(GraphicContext& graphics, PipelineCache::Pipeli
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 }
 
+namespace {
+// Background optimized rebuilds of compute pipelines that were created with
+// DISABLE_OPTIMIZATION (Yotei: 400-485K-word shaders; unoptimized they ran ~0.8 s per dispatch).
+// One low-priority worker; KYTY_OPTIMIZE_BIG_COMPUTE=0 turns it off.
+struct OptimizedBuilds {
+	struct Job {
+		GraphicContext*                           graphics = nullptr;
+		vk::ComputePipelineCreateInfo             info {};
+		vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup {};
+		bool                                      has_subgroup = false;
+		vk::PipelineCache                         cache = nullptr;
+		std::shared_ptr<std::atomic<VkPipeline>>  target;
+		uint64_t                                  words = 0;
+	};
+	std::mutex              mutex;
+	std::condition_variable cv;
+	std::deque<Job>         jobs;
+	std::thread             worker;
+	bool                    stop = false;
+
+	void Run() {
+		for (;;) {
+			Job job;
+			{
+				std::unique_lock lock(mutex);
+				cv.wait(lock, [&] { return stop || !jobs.empty(); });
+				if (stop) return;
+				job = std::move(jobs.front());
+				jobs.pop_front();
+			}
+			if (job.has_subgroup) job.info.stage.pNext = &job.subgroup;
+			const auto begin = std::chrono::steady_clock::now();
+			vk::Pipeline result = nullptr;
+			const auto r = job.graphics->device.createComputePipelines(job.cache, 1, &job.info, nullptr, &result);
+			const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+			if (r == vk::Result::eSuccess && result != nullptr) {
+				job.target->store(static_cast<VkPipeline>(result), std::memory_order_release);
+				std::printf("Pipeline: optimized compute (%llu words) ready after %.0f ms, swapped in\n",
+				            static_cast<unsigned long long>(job.words), ms);
+			} else {
+				std::printf("Pipeline: optimized compute (%llu words) failed (%s); keeping the unoptimized one\n",
+				            static_cast<unsigned long long>(job.words), vk::to_string(r).c_str());
+			}
+			std::fflush(stdout);
+		}
+	}
+	void Add(Job job) {
+		std::lock_guard lock(mutex);
+		if (stop) return;
+		if (!worker.joinable()) worker = std::thread([this] { Run(); });
+		jobs.push_back(std::move(job));
+		cv.notify_one();
+	}
+	void Stop() {
+		{
+			std::lock_guard lock(mutex);
+			stop = true;
+			jobs.clear();
+		}
+		cv.notify_all();
+		if (worker.joinable()) worker.join();
+	}
+};
+
+OptimizedBuilds& Builds() {
+	static OptimizedBuilds builds;
+	return builds;
+}
+
+bool OptimizeBigCompute() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_OPTIMIZE_BIG_COMPUTE");
+		return v == nullptr || std::strcmp(v, "0") != 0;
+	}();
+	return enabled;
+}
+
+uint64_t FastCompileWords() {
+	static const uint64_t words = [] {
+		const char* v = std::getenv("KYTY_FAST_COMPILE_WORDS");
+		return v != nullptr ? std::strtoull(v, nullptr, 10) : 100000ull;
+	}();
+	return words;
+}
+
+void QueueOptimizedBuild(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                         const vk::ComputePipelineCreateInfo& unoptimized,
+                         const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo* subgroup,
+                         vk::PipelineCache driver_cache, uint64_t words) {
+	if (!OptimizeBigCompute() || pipeline.optimized != nullptr) return;
+	pipeline.optimized = std::make_shared<std::atomic<VkPipeline>>(VK_NULL_HANDLE);
+	OptimizedBuilds::Job job;
+	job.graphics = &graphics;
+	job.info     = unoptimized;
+	job.info.flags &= ~vk::PipelineCreateFlagBits::eDisableOptimization;
+	job.info.stage.pNext = nullptr;
+	if (subgroup != nullptr) {
+		job.subgroup     = *subgroup;
+		job.has_subgroup = true;
+	}
+	job.cache  = driver_cache;
+	job.target = pipeline.optimized;
+	job.words  = words;
+	Builds().Add(std::move(job));
+}
+} // namespace
+
+void StopOptimizedComputeBuilds() {
+	Builds().Stop();
+}
+
 // Thread-safe: touches only the device, the (internally synchronized) driver cache and `pipeline`.
 void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                  const ComputePipelineJob& job, vk::PipelineCache driver_cache) {
@@ -648,6 +766,21 @@ void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeli
 		if (auto prewarmed = Prewarm::Take(job.prewarm_key, false); prewarmed != nullptr) {
 			EXIT_IF(pipeline.pipeline != nullptr);
 			pipeline.pipeline = prewarmed;
+			if (FastCompileWords() != 0 && job.spirv_words > FastCompileWords()) {
+				// The replay built it without driver optimization (same size rule).
+				vk::PipelineShaderStageCreateInfo                     stage {};
+				vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo sg {};
+				stage.stage  = vk::ShaderStageFlagBits::eCompute;
+				stage.module = job.module;
+				stage.pName  = "main";
+				sg.requiredSubgroupSize = job.required_subgroup_size;
+				vk::ComputePipelineCreateInfo info {};
+				info.stage             = stage;
+				info.layout            = pipeline.pipeline_layout;
+				info.basePipelineIndex = -1;
+				QueueOptimizedBuild(graphics, pipeline, info, job.required_subgroup_size != 0 ? &sg : nullptr,
+				                    driver_cache, job.spirv_words);
+			}
 			return;
 		}
 	}
@@ -692,6 +825,10 @@ void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeli
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	if (info.flags & vk::PipelineCreateFlagBits::eDisableOptimization) {
+		QueueOptimizedBuild(graphics, pipeline, info, job.required_subgroup_size != 0 ? &comp_subgroup_size : nullptr,
+		                    driver_cache, job.spirv_words);
+	}
 }
 
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,

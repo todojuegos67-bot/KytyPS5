@@ -121,6 +121,17 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// Compute only: a pipeline first created without driver optimization (huge SPIR-V) gets
+		// an optimized build on a background thread; dispatches use it once it is ready.
+		std::shared_ptr<std::atomic<VkPipeline>> optimized;
+
+		[[nodiscard]] vk::Pipeline ComputeHandle() const {
+			if (optimized != nullptr) {
+				if (const VkPipeline ready = optimized->load(std::memory_order_acquire); ready != VK_NULL_HANDLE)
+					return ready;
+			}
+			return pipeline;
+		}
 	};
 
 	struct GraphicsPrograms {
@@ -250,6 +261,8 @@ void CreateComputeLayoutInternal(GraphicContext& graphics, PipelineCache::Pipeli
                                  ComputePipelineJob& job);
 void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                  const ComputePipelineJob& job, vk::PipelineCache driver_cache);
+// Waits for the background optimized compute builds (before the device or caches are destroyed).
+void StopOptimizedComputeBuilds();
 
 } // namespace Libs::Graphics
 
