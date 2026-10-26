@@ -43,7 +43,7 @@ struct Config {
 	std::string           dump_dir = "_TempData/rtls";
 	uint64_t              max_bytes = 256u << 10;
 	uint32_t              min_match = 3;
-	bool                  on = false;
+	bool                  on = false, hw_lights = false;
 };
 
 const Config& Cfg() {
@@ -73,7 +73,13 @@ const Config& Cfg() {
 				at = end + 1;
 			}
 		}
-		c.on = c.debug > 0 || c.shadows > 0 || c.dumps > 0 || c.scan_all;
+		// (KYTY_HWRT_LIGHTS=1..3 with KYTY_HWRT=1, hw-lights.cpp: the apexes feed the ray-traced shadow pass; scans every 4
+		// flips unless KYTY_RTLS_PERIOD says otherwise)
+		if (const char* v = env("KYTY_HWRT_LIGHTS"); v != nullptr && std::atoi(v) > 0 && env("KYTY_HWRT") != nullptr && *env("KYTY_HWRT") != '0') {
+			c.hw_lights = true;
+			if (env("KYTY_RTLS_PERIOD") == nullptr) c.period = 4;
+		}
+		c.on = c.debug > 0 || c.shadows > 0 || c.dumps > 0 || c.scan_all || c.hw_lights;
 		if (c.on) {
 			std::printf("RTLS: local light discovery on (KYTY_RTLS_DEBUG=%d, KYTY_RT_LOCAL_SHADOWS=%d, scan %s, every %u flips, "
 			            "tolerance %.3f m, %d dumps)\n",
@@ -548,6 +554,25 @@ void LogFlip(uint64_t flip) {
 } // namespace
 
 bool Wanted() { return Cfg().on; }
+
+void LiveLights(std::vector<LiveLight>& out, uint64_t max_age, uint32_t min_seen) {
+	out.clear();
+	if (!Cfg().on) return;
+	const uint64_t flip = Libs::Graphics::FrameGen::GuestFlips();
+	std::lock_guard lock(g.mutex);
+	for (const auto& a: g.apexes) {
+		if (a.seen < min_seen || a.last_flip + max_age < flip) continue;
+		LiveLight l;
+		for (int i = 0; i < 3; ++i) l.pos[i] = static_cast<float>(a.pos[i]), l.fwd[i] = static_cast<float>(a.fwd[i]);
+		l.tan_half = static_cast<float>(std::max(a.tan_x, a.tan_y));
+		l.far_d    = static_cast<float>(a.far_d);
+		l.point    = a.faces >= 4;
+		l.seen     = a.seen;
+		l.age      = flip > a.last_flip ? flip - a.last_flip : 0;
+		l.since    = flip > a.first_flip ? flip - a.first_flip : 0;
+		out.push_back(l);
+	}
+}
 bool OverlayWanted() { return Cfg().debug > 0; }
 
 void OnDispatch(uint64_t cs_hash, std::span<const DispatchBuffer> buffers, std::span<const DispatchImage> images,
