@@ -34,13 +34,25 @@ enum Phase : int {
 	OtherSync,
 	OtherFault,
 	OtherGpuWait,
+	DrawTotal,
+	DrawLock,
+	DrawState,
+	DrawBindings,
+	DrawVertex,
+	DrawPipeline,
+	DrawTargets,
+	DrawCommit,
+	DispatchTotal,
+	DispatchBindings,
 	Count
 };
 
 inline const char* const kNames[Count] = {"gpu.idle",       "gpu.cmd",       "gpu.gfx",        "gpu.compute",
                                           "gpu.flush_slices", "gpu.wait",    "submit",         "render.sync",
                                           "render.fault",   "render.gpuwait", "other.sync",    "other.fault",
-                                          "other.gpuwait"};
+                                          "other.gpuwait",
+                                          "draw.total", "draw.lock", "draw.state", "draw.bindings", "draw.vertex",
+                                          "draw.pipeline", "draw.targets", "draw.commit", "dispatch.total", "dispatch.bindings"};
 
 inline std::atomic<uint64_t> g_us[Count] {};
 inline std::atomic<uint64_t> g_calls[Count] {};

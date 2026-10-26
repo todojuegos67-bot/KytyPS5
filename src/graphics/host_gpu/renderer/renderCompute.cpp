@@ -1,3 +1,4 @@
+#include "graphics/phaseStats.h"
 #include "graphics/drawDiff.h"
 #include "common/liveSwitches.h"
 #include "common/assert.h"
@@ -481,6 +482,7 @@ void RenderExecutor::DumpBuffers(const ShaderRecompiler::IR::CompiledShaderInfo&
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
+	PhaseStats::Scope total_phase {PhaseStats::DispatchTotal};
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -664,7 +666,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
-	PrepareBindings(input_info.stage, bindings);
+	{
+		PhaseStats::Scope bind_phase {PhaseStats::DispatchBindings};
+		PrepareBindings(input_info.stage, bindings);
+	}
 	for (uint32_t axis = 0; axis < 3u; axis++) {
 		bindings.dispatch_dimensions[axis] = input_info.dispatch_threads_num[axis];
 	}
@@ -729,6 +734,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
                                       uint32_t mode) {
+	PhaseStats::Scope total_phase {PhaseStats::DispatchTotal};
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
 	// The arguments are thread counts: IndirectDispatchGroups converts them on the GPU, and the
 	// shader bounds its threads by the counts it reads from the same memory.
@@ -760,7 +766,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
-	PrepareBindings(input_info.stage, bindings);
+	{
+		PhaseStats::Scope bind_phase {PhaseStats::DispatchBindings};
+		PrepareBindings(input_info.stage, bindings);
+	}
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
