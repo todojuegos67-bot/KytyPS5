@@ -417,10 +417,11 @@ public:
 		LinkImageAliases();
 		mark("alias");
 		if (std::chrono::duration<double, std::milli>(t_last - t_begin).count() >= 200.0) {
-			std::printf("ShaderSlow: resources %s hash=0x%016" PRIx64 " indirect_plans=%zu:%s (indirect: try=%.1f check=%.1f; nested=%.1f finite=%.1f table=%.1f buffer=%.1f; memo max=%zu false=%zu)\n",
+			std::printf("ShaderSlow: resources %s hash=0x%016" PRIx64 " indirect_plans=%zu:%s (indirect: try=%.1f check=%.1f; nested=%.1f finite=%.1f table=%.1f buffer=%.1f [reads=%.1f anchor=%.1f loop=%.1f material=%.1f bound=%.1f rest=%.1f]; memo max=%zu false=%zu implies=%zu/%zu hits)\n",
 			            StageName(m_program.stage), m_program.shader_hash, m_indirect_descriptors.size(), phases,
 			            m_indirect_try_ms, m_indirect_check_ms, m_try_ms[0], m_try_ms[1], m_try_ms[2], m_try_ms[3],
-			            m_selector_maximum_memo.size(), m_selector_false_memo.size());
+			            m_buffer_ms[0], m_buffer_ms[1], m_buffer_ms[2], m_buffer_ms[3], m_buffer_ms[4], m_buffer_ms[5],
+			            m_selector_maximum_memo.size(), m_selector_false_memo.size(), m_implies_memo.size(), m_implies_hits);
 			std::fflush(stdout);
 		}
 		for (const auto& patch: m_handle_patches) {
@@ -1348,9 +1349,42 @@ private:
 		return (invariant.IsEmpty() ? guard : invariant).Resolve();
 	}
 
+	// Implies recursed over shared AND/OR guard DAGs (EXEC masks of a 128-way bindless buffer
+	// selection) without memoization and was re-asked per handle, use and CFG edge (Yotei:
+	// TryMakeIndirectBuffer 6-8 s). The IR it reads does not change while it is asked, so results
+	// are memoized per (guard, required, allow_phi).
+	struct ImpliesKey {
+		const Inst* guard;
+		const Inst* required;
+		bool        allow_phi;
+		bool operator==(const ImpliesKey&) const = default;
+	};
+	struct ImpliesKeyHash {
+		size_t operator()(const ImpliesKey& k) const noexcept {
+			auto h = std::hash<const void*> {};
+			return h(k.guard) ^ (h(k.required) * 0x9e3779b97f4a7c15ull) ^ (k.allow_phi ? 0x51ed27u : 0u);
+		}
+	};
+	mutable std::unordered_map<ImpliesKey, bool, ImpliesKeyHash> m_implies_memo;
+	mutable size_t m_implies_hits = 0;
+
 	bool Implies(Value guard, Value required, bool allow_phi = true) const {
 		guard = SimplifyGuard(guard);
 		required = SimplifyGuard(required);
+		const auto* guard_inst    = guard.TryInstruction();
+		const auto* required_inst = required.TryInstruction();
+		if (guard_inst == nullptr || required_inst == nullptr) return ImpliesImpl(guard, required, allow_phi);
+		const ImpliesKey key {guard_inst, required_inst, allow_phi};
+		if (const auto found = m_implies_memo.find(key); found != m_implies_memo.end()) {
+			++m_implies_hits;
+			return found->second;
+		}
+		const bool result = ImpliesImpl(guard, required, allow_phi);
+		m_implies_memo.emplace(key, result);
+		return result;
+	}
+
+	bool ImpliesImpl(Value guard, Value required, bool allow_phi) const {
 		if (required == Value(true) || EquivalentValue(m_program, guard, required)) return true;
 		const auto* test = required.TryInstruction();
 		if (test != nullptr && test->GetOpcode() == ValueOpcode::INotEqual32) {
@@ -1840,6 +1874,7 @@ private:
 	std::unordered_map<const Inst*, size_t> m_first_plan_for_read;
 	double m_indirect_try_ms   = 0.0;
 	double m_try_ms[4]         = {}; // nested, finite, table, buffer
+	mutable double m_buffer_ms[6] = {}; // reads, anchor, loop, exact+material, bound, rest
 	double m_indirect_check_ms = 0.0;
 	mutable std::unordered_map<BlockQueryKey, bool, BlockQueryKeyHash> m_dominates_memo;
 
@@ -3281,8 +3316,20 @@ private:
 		uint32_t table_offset = 0;
 		uint32_t table_stride = 0;
 		uint32_t table_immediate = 0;
-		if (!MatchDescriptorReads(handle, descriptor, plan, key, table_offset,
-		                          table_stride, table_immediate) ||
+		auto sub_clock = std::chrono::steady_clock::now();
+		const auto sub_mark = [&](uint32_t slot) {
+			const auto now = std::chrono::steady_clock::now();
+			m_buffer_ms[slot] += std::chrono::duration<double, std::milli>(now - sub_clock).count();
+			sub_clock = now;
+		};
+		struct SubMarkGuard {
+			decltype(sub_mark)& mark;
+			~SubMarkGuard() { mark(5); }
+		} sub_rest {sub_mark};
+		const bool reads_ok = MatchDescriptorReads(handle, descriptor, plan, key, table_offset,
+		                          table_stride, table_immediate);
+		sub_mark(0);
+		if (!reads_ok ||
 		    !MakeRuntimeTableSource(*plan.reads[0], table_source) ||
 		    table_stride < 16u || (table_stride & 3u) != 0u) return false;
 		DescriptorSource::IndirectDescriptor indirect;
@@ -3313,9 +3360,12 @@ private:
 			plan.key = key;
 			return true;
 		};
-		if (const auto* bound = BoundedLoop(key, handle.Parent()); bound != nullptr) {
-			indirect.key_count = bound->Arg(1);
-			indirect.signed_count = bound->GetOpcode() == ValueOpcode::SLessThan32;
+		sub_mark(1);
+		const auto* bounded_loop = BoundedLoop(key, handle.Parent());
+		sub_mark(2);
+		if (bounded_loop != nullptr) {
+			indirect.key_count = bounded_loop->Arg(1);
+			indirect.signed_count = bounded_loop->GetOpcode() == ValueOpcode::SLessThan32;
 			return finish();
 		}
 		if (table_source.dword_count == 4u && !plan.split_offsets &&
@@ -3324,13 +3374,16 @@ private:
 			return finish();
 		}
 		DescriptorSource material_source;
-		if (!plan.split_offsets && MatchScalarMaterialKey(key, indirect, material_source, true)) {
+		const bool material = !plan.split_offsets && MatchScalarMaterialKey(key, indirect, material_source, true);
+		sub_mark(3);
+		if (material) {
 			plan.retain_reads = true;
 			return finish();
 		}
 		if (!legacy_store) {
 			if (!plan.split_offsets) {
 				const auto count = UnsignedResourceBound(key, handle);
+				sub_mark(4);
 				if (!count.IsEmpty()) {
 					indirect.key_count = count;
 					return finish();
