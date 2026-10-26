@@ -1,6 +1,7 @@
 #include "libs/videoDec2Decoder.h"
 
 #include "common/logging/log.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -316,6 +317,9 @@ private:
 		}
 
 		auto* dst = static_cast<uint8_t*>(frame_buffer.data);
+		// One explicit invalidation of the GPU caches for the whole frame, as file reads do,
+		// instead of a write fault per 4 KiB page (~760 per 1080p NV12 frame).
+		LibKernel::Memory::InvalidateMemory(reinterpret_cast<uint64_t>(dst), required);
 		std::memset(dst, 0, static_cast<size_t>(required));
 		if (frame->format == AV_PIX_FMT_NV12) {
 			for (uint32_t y = 0; y < height; y++) {
