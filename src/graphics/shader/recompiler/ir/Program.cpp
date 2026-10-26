@@ -56,8 +56,18 @@ bool IsRuntimeRead(ValueOpcode opcode) {
 	       AddressOpcodeInfoOf(opcode).access == AddressAccess::Read;
 }
 
-bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
-                     std::vector<std::pair<const Inst*, const Inst*>>& visited) {
+struct InstPairHash {
+	size_t operator()(const std::pair<const Inst*, const Inst*>& p) const noexcept {
+		const auto a = reinterpret_cast<uintptr_t>(p.first);
+		const auto b = reinterpret_cast<uintptr_t>(p.second);
+		return static_cast<size_t>(a * 0x9e3779b97f4a7c15ull ^ (b + 0x7f4a7c15ull + (a << 6u) + (a >> 2u)));
+	}
+};
+// Pairs already being compared are assumed equal (any mismatch fails the whole comparison).
+// A hash set instead of a linearly searched vector: the walk was quadratic in DAG size.
+using EquivalentVisited = std::unordered_set<std::pair<const Inst*, const Inst*>, InstPairHash>;
+
+bool EquivalentValue(const ResourcePlan& program, Value left, Value right, EquivalentVisited& visited) {
 	left  = left.Resolve();
 	right = right.Resolve();
 	if (left == right) {
@@ -72,10 +82,9 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 	    lhs->NumArgs() != rhs->NumArgs()) {
 		return false;
 	}
-	if (std::ranges::find(visited, std::pair {lhs, rhs}) != visited.end()) {
+	if (!visited.emplace(lhs, rhs).second) {
 		return true;
 	}
-	visited.emplace_back(lhs, rhs);
 	if (IsRuntimeRead(lhs->GetOpcode())) {
 		const auto li = lhs->Flags<MemoryFlags>().index;
 		const auto ri = rhs->Flags<MemoryFlags>().index;
@@ -160,7 +169,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 }
 
 bool EquivalentValue(const ResourcePlan& program, Value left, Value right) {
-	std::vector<std::pair<const Inst*, const Inst*>> visited;
+	EquivalentVisited visited;
 	return EquivalentValue(program, left, right, visited);
 }
 

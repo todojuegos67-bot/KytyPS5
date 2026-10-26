@@ -417,8 +417,9 @@ public:
 		LinkImageAliases();
 		mark("alias");
 		if (std::chrono::duration<double, std::milli>(t_last - t_begin).count() >= 200.0) {
-			std::printf("ShaderSlow: resources %s hash=0x%016" PRIx64 " indirect_plans=%zu:%s\n",
-			            StageName(m_program.stage), m_program.shader_hash, m_indirect_descriptors.size(), phases);
+			std::printf("ShaderSlow: resources %s hash=0x%016" PRIx64 " indirect_plans=%zu:%s (indirect: try=%.1f check=%.1f)\n",
+			            StageName(m_program.stage), m_program.shader_hash, m_indirect_descriptors.size(), phases,
+			            m_indirect_try_ms, m_indirect_check_ms);
 			std::fflush(stdout);
 		}
 		for (const auto& patch: m_handle_patches) {
@@ -1835,6 +1836,9 @@ private:
 		}
 	};
 	mutable std::unordered_map<BlockQueryKey, bool, BlockQueryKeyHash> m_reaches_memo;
+	std::unordered_map<const Inst*, size_t> m_first_plan_for_read;
+	double m_indirect_try_ms   = 0.0;
+	double m_indirect_check_ms = 0.0;
 	mutable std::unordered_map<BlockQueryKey, bool, BlockQueryKeyHash> m_dominates_memo;
 
 	bool Reaches(const Block* from, const Block* to, const Block* stop = nullptr) const {
@@ -3758,17 +3762,29 @@ private:
 						    })) return;
 						plan.read_dwords = 4u;
 					}
-					if (TryMakeNestedDescriptor(*handle, descriptor, plan) ||
+					const auto try_begin = std::chrono::steady_clock::now();
+					const bool made = TryMakeNestedDescriptor(*handle, descriptor, plan) ||
 					    (sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
 					    TryMakeTableDescriptor(*handle, descriptor, plan) ||
 					    (!sampler && (TryMakeFiniteDescriptor(*handle, plan) ||
-					                  TryMakeIndirectBuffer(*handle, descriptor, plan)))) {
-						for (const auto& previous: m_indirect_descriptors) {
-							if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
-							    !EquivalentValue(m_program, previous.key, plan.key))
+					                  TryMakeIndirectBuffer(*handle, descriptor, plan)));
+					const auto try_end = std::chrono::steady_clock::now();
+					m_indirect_try_ms += std::chrono::duration<double, std::milli>(try_end - try_begin).count();
+					if (made) {
+						// Every plan kept for a shared read already proved equivalent to the first
+						// plan of that read (a mismatch fails), so one comparison per read is enough.
+						// Comparing against every earlier plan was quadratic: 128 plans sharing one
+						// bindless table read cost 6-8 s per Yotei CS translation.
+						if (plan.reads[0] != nullptr) {
+							const auto [first, inserted] =
+							    m_first_plan_for_read.try_emplace(plan.reads[0], m_indirect_descriptors.size());
+							if (!inserted &&
+							    !EquivalentValue(m_program, m_indirect_descriptors[first->second].key, plan.key))
 								Fail(flags.pc, "shared descriptor read has incompatible keys");
 						}
 						m_indirect_descriptors.push_back(std::move(plan));
+						m_indirect_check_ms += std::chrono::duration<double, std::milli>(
+						    std::chrono::steady_clock::now() - try_end).count();
 					}
 				};
 				if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw &&
