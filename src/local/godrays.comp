@@ -152,6 +152,17 @@ vec3 Hue(vec3 c) {
 	return mix(vec3(1), h, 0.6) / max(Luma(mix(vec3(1), h, 0.6)), 1e-4);
 }
 
+#ifdef KYTY_HWRT_VOLUMETRIC
+// (hwrt5v-2: lamps live in world space: a = (world xyz, weight), b = (exposed rgb, frames unseen). The screen only finds
+// and refines them; off screen / behind the character they are held (~30 s), so turning the camera never cuts a halo.)
+vec3 ToWorld(vec3 v) {
+	vec4 p = vec4(v, 1.0);
+	return vec3(dot(push.w0, p), dot(push.w1, p), dot(push.w2, p));
+}
+mat3 ViewFromWorld() { return inverse(transpose(mat3(push.w0.xyz, push.w1.xyz, push.w2.xyz))); }
+vec3 WorldT() { return vec3(push.w0.w, push.w1.w, push.w2.w); }
+#endif
+
 shared uint s_best[64];
 
 void Lights(uvec3 wg, uint li) {
@@ -186,6 +197,9 @@ void Lights(uvec3 wg, uint li) {
 	}
 }
 
+#ifdef KYTY_HWRT_VOLUMETRIC
+void TrackWorld(int slots, float keep_t, float new_t);
+#endif
 void Track() {
 	int slots = int(hdr.z);
 	// The sun's hue from the sky: around the sun when it is on screen, else the upper screen.
@@ -228,10 +242,12 @@ void Track() {
 		for (int i = 0; i < CW * CH; ++i) sum += min(cand[i * 2].x, 1.0); // (clamped: sun patches through windows or a few lamps barely move it)
 		float tt = clamp(2.5 * sum / float(CW * CH), L_FLOOR + 0.25, hdr.y);
 		float t  = L_ADAPT;
-		t        = (isnan(t) || t <= 0.0) ? tt : mix(t, tt, 0.02);
+		t        = (isnan(t) || t <= 0.0) ? tt : mix(t, tt, 0.005); // (~3 s)
 		stats[13] = floatBitsToUint(t);
 		new_t = t, keep_t = max(0.6 * t, L_FLOOR);
 	}
+	TrackWorld(slots, keep_t, new_t);
+	return;
 #endif
 	for (int k = 0; k < slots; ++k) {
 		vec4 a = lights[k * 2];
@@ -303,6 +319,92 @@ void Track() {
 		if (lights[k * 2].w > 0.5) ++used;
 	atomicAdd(stats[1], uint(used));
 }
+
+#ifdef KYTY_HWRT_VOLUMETRIC
+void TrackWorld(int slots, float keep_t, float new_t) {
+	int used = 0;
+	if (push.hw.x > 0.5) {
+		mat3 Mi = ViewFromWorld();
+		vec3 T  = WorldT();
+		bool claimed[CW * CH];
+		for (int i = 0; i < CW * CH; ++i) claimed[i] = false;
+		for (int k = 0; k < slots; ++k) {
+			vec4 a = lights[k * 2];
+			vec4 b = lights[k * 2 + 1];
+			if (a.w <= 0.0) continue;
+			if (any(isnan(a)) || any(isnan(b))) { lights[k * 2] = vec4(0), lights[k * 2 + 1] = vec4(0); continue; }
+			float w_before = a.w;
+			vec3  v  = Mi * (a.xyz - T);
+			float ld = length(v);
+			vec2  uv;
+			bool  on     = Project(v, uv) && all(greaterThan(uv, vec2(0.03))) && all(lessThan(uv, vec2(0.97)));
+			bool  seen   = false;
+			bool  hidden = !on || ld < L_NEAR + 1.0 || ld > L_FAR;
+			if (on) {
+				int   best = -1;
+				float bd   = L_MATCH;
+				for (int i = 0; i < CW * CH; ++i) {
+					vec4 c = cand[i * 2];
+					if (claimed[i] || c.x <= keep_t) continue;
+					if (abs(abs(ViewZ(c.w)) - abs(v.z)) > 0.35 * abs(v.z) + 0.5) continue;
+					float dist = length((c.yz - uv) * vec2(CW, CH));
+					if (dist < bd) bd = dist, best = i;
+				}
+				if (best >= 0) {
+					claimed[best] = true;
+					seen          = true;
+					vec4 c        = cand[best * 2];
+					a.xyz         = mix(a.xyz, ToWorld(ViewPos(c.yz, c.w)), 0.05);
+					b.rgb         = mix(b.rgb, cand[best * 2 + 1].rgb, 0.05);
+				} else {
+					// (something nearer than the light at its pixel: the character, a pillar: occluded, not gone)
+					float dz = DepthAt(uv);
+					if (!IsSky(dz) && abs(ViewZ(dz)) < 0.9 * abs(v.z) - 0.3) hidden = true;
+				}
+			}
+			if (seen) {
+				a.w = min(a.w + L_IN, 1.0), b.w = 0.0;
+			} else {
+				b.w += 1.0;
+				// (visible but no candidate for ~0.4 s: really gone, a ~2.8 s fade; held off screen / occluded ~30 s)
+				if (b.w > (hidden ? 1800.0 : 25.0)) a.w -= L_OUT;
+			}
+			if (ld > 1.4 * L_FAR) a.w -= L_OUT;
+			if (a.w <= 0.0) a = vec4(0), b = vec4(0);
+			if (w_before < 0.5 && a.w >= 0.5) atomicAdd(stats[3], 1u);
+			if (w_before >= 0.5 && a.w < 0.5) atomicAdd(stats[4], 1u);
+			lights[k * 2] = a, lights[k * 2 + 1] = b;
+		}
+		for (int k = 0; k < slots; ++k) {
+			if (lights[k * 2].w > 0.0) continue;
+			int   best = -1;
+			float bl   = 0.0;
+			vec3  bw   = vec3(0);
+			for (int i = 0; i < CW * CH; ++i) {
+				vec4 c = cand[i * 2];
+				if (claimed[i] || c.x <= bl || c.x <= new_t) continue;
+				vec3 cw   = ToWorld(ViewPos(c.yz, c.w));
+				bool near = false;
+				for (int j = 0; j < slots; ++j) {
+					if (lights[j * 2].w <= 0.0) continue;
+					vec2 juv;
+					if (distance(lights[j * 2].xyz, cw) < 1.5 ||
+					    (Project(Mi * (lights[j * 2].xyz - T), juv) && length((juv - c.yz) * vec2(CW, CH)) < 3.0))
+						near = true;
+				}
+				if (!near) bl = c.x, best = i, bw = cw;
+			}
+			if (best < 0) break;
+			claimed[best]     = true;
+			lights[k * 2]     = vec4(bw, 0.02);
+			lights[k * 2 + 1] = vec4(cand[best * 2 + 1].rgb, 0);
+		}
+	}
+	for (int k = 0; k < slots; ++k)
+		if (lights[k * 2].w > 0.5) ++used;
+	atomicAdd(stats[1], uint(used));
+}
+#endif
 
 float Hg(float c, float g) {
 	float g2 = g * g;
@@ -391,6 +493,10 @@ void Volume(ivec2 q) {
 			lit += vis * dt;
 		}
 		float phase = clamp(Hg(dot(dir, L), 0.55) / 1.0, 0.0, 6.0) / 6.0; // (1 toward the sun, ~0.03 away)
+#ifdef KYTY_HWRT_VOLUMETRIC
+		// (hwrt5v-2: a 30x drop as the camera turns from the sun made lit shafts vanish: an isotropic floor keeps them)
+		phase = 0.3 + 0.7 * phase;
+#endif
 		// The shafts' contrast, not a uniform haze: lit length / 60 m, weighted by the phase.
 		// Boost by the shaft-ness of the ray: partly lit rays (light through gaps) gain, fully lit or fully shadowed
 		// ones (a uniform haze indoors / outdoors) do not.
@@ -528,10 +634,19 @@ void Composite(ivec2 p) {
 		vec3  dir  = RayDir(uv);
 		float tmax = sky ? 200.0 : length(ViewPos(uv, d));
 		float R    = hdr.w;
+#ifdef KYTY_HWRT_VOLUMETRIC
+		mat3 Mi = ViewFromWorld();
+		vec3 T  = WorldT();
+		if (push.hw.x < 0.5) slots = 0;
+#endif
 		for (int k = 0; k < slots; ++k) {
 			vec4 a = lights[k * 2];
 			if (a.w <= 0.0) continue;
+#ifdef KYTY_HWRT_VOLUMETRIC
+			vec3  lp = Mi * (a.xyz - T);
+#else
 			vec3  lp = ViewPos(a.xy, a.z);
+#endif
 			float ld = length(lp);
 			float fade = smoothstep(45.0, 12.0, ld) * smoothstep(6.0, 14.0, ld) * smoothstep(0.0, 1.0, a.w);
 			// Fade by the halo's size on screen (its 4 R cut as a fraction of the screen height): a near, small light
