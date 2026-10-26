@@ -1,5 +1,10 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include <cstdint>
+#include <cstdio>
+#include <mutex>
+#include <unordered_set>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index) {
@@ -119,15 +124,40 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 	const auto first = root.packed_stride == 0u ? 1u : 0u;
 	const auto representative = root.indirect_resources[first];
 	const auto& shared = buffers[representative];
-	if (shared.packed_stride == 0u) return UINT32_MAX;
+	// SpirvBloat: a bindless buffer table that cannot use one descriptor-indexed access is
+	// emitted as a switch over every candidate at every access (Yotei: 400-485K-word CS).
+	const auto report = [&](const char* why, uint32_t ordinal) {
+		static std::mutex                                       mutex;
+		static std::unordered_set<uint64_t>                     seen;
+		const uint64_t id = state.program.shader_hash ^ (uint64_t {resource} * 0x9e3779b97f4a7c15ull);
+		std::lock_guard lock(mutex);
+		if (root.indirect_resources.size() < 8u || seen.size() > 256u || !seen.insert(id).second) return;
+		const auto& c = buffers[root.indirect_resources[ordinal]];
+		std::printf("SpirvBloat: hash=0x%016llx buffer %u: %zu candidates emitted as a switch per access "
+		            "(%s at #%u: stride %x/%x fmt %u/%u slot %u)\n",
+		            static_cast<unsigned long long>(state.program.shader_hash), resource,
+		            root.indirect_resources.size(), why, ordinal, shared.packed_stride, c.packed_stride,
+		            static_cast<unsigned>(shared.descriptor_format), static_cast<unsigned>(c.descriptor_format),
+		            c.descriptor_index);
+		std::fflush(stdout);
+	};
+	if (shared.packed_stride == 0u) {
+		report("first candidate empty", first);
+		return UINT32_MAX;
+	}
 	uint32_t next_child_slot = UINT32_MAX;
 	for (uint32_t ordinal = first; ordinal < root.indirect_resources.size(); ++ordinal) {
 		const auto& candidate = buffers[root.indirect_resources[ordinal]];
-		if (candidate.packed_stride != shared.packed_stride ||
-		    candidate.descriptor_format != shared.descriptor_format ||
-		    candidate.descriptor_swizzle != shared.descriptor_swizzle ||
-		    candidate.descriptor_index == UINT32_MAX ||
-		    (ordinal > 1u && candidate.descriptor_index != next_child_slot)) return UINT32_MAX;
+		const char* why = candidate.packed_stride != shared.packed_stride ? "stride differs"
+		    : candidate.descriptor_format != shared.descriptor_format    ? "format differs"
+		    : candidate.descriptor_swizzle != shared.descriptor_swizzle  ? "swizzle differs"
+		    : candidate.descriptor_index == UINT32_MAX                   ? "no slot"
+		    : (ordinal > 1u && candidate.descriptor_index != next_child_slot) ? "slots not contiguous"
+		                                                                       : nullptr;
+		if (why != nullptr) {
+			report(why, ordinal);
+			return UINT32_MAX;
+		}
 		if (ordinal != 0u) next_child_slot = candidate.descriptor_index + 1u;
 	}
 	return representative;
