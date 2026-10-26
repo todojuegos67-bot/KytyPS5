@@ -86,8 +86,10 @@ struct FrameUbo {
 	float   par[4];
 	int32_t cfg[4];
 	int32_t cfg2[4];
+	float   proj[4];
+	float   depth_map[4];
 };
-static_assert(sizeof(FrameUbo) == 224);
+static_assert(sizeof(FrameUbo) == 256);
 struct Push {
 	int32_t mode = 0;
 	float   step = 0.0f;
@@ -334,6 +336,11 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	if (color.view == nullptr || inputs.depth.view == nullptr || inputs.motion.view == nullptr || color.extent.width < 16 ||
 	    color.extent.height < 16 || inputs.depth.extent != color.extent)
 		return false;
+	// (fix 2) the view distance from the depth goes through the upscaler's projection (GTAO's): none, nothing done
+	const auto& m = inputs.view_to_clip;
+	if (!(m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f)) ||
+	    !std::all_of(m.begin(), m.end(), [](float v) { return std::isfinite(v); }))
+		return false;
 	HwScene::GiSceneInfo scene;
 	if (!HwScene::GiScene(scene)) {
 		++g_gi.frames_no_scene;
@@ -354,9 +361,9 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	++g_gi.frames_on;
 
 	static const float ao_radius   = EnvFloat("KYTY_HWRT_AO_RADIUS", 0.8f, 0.05f, 8.0f);
-	static const float ao_strength = EnvFloat("KYTY_HWRT_AO_STRENGTH", 0.6f, 0.0f, 1.0f);
-	static const float ao_floor    = EnvFloat("KYTY_HWRT_AO_FLOOR", 0.6f, 0.2f, 1.0f);
-	static const float gi_int      = EnvFloat("KYTY_HWRT_GI_INTENSITY", 0.7f, 0.0f, 4.0f);
+	static const float ao_strength = EnvFloat("KYTY_HWRT_AO_STRENGTH", 0.75f, 0.0f, 1.0f);
+	static const float ao_floor    = EnvFloat("KYTY_HWRT_AO_FLOOR", 0.55f, 0.2f, 1.0f);
+	static const float gi_int      = EnvFloat("KYTY_HWRT_GI_INTENSITY", 0.5f, 0.0f, 4.0f);
 	static const float gi_range    = EnvFloat("KYTY_HWRT_GI_RANGE", 8.0f, 0.5f, 100.0f);
 	static const float fade_start  = EnvFloat("KYTY_HWRT_GI_FADE", 120.0f, 5.0f, 5000.0f);
 	static const int   view        = std::clamp(static_cast<int>(EnvFloat("KYTY_HWRT_GI_VIEW", 0.0f, 0.0f, 2.0f)), 0, 2);
@@ -401,6 +408,8 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	ubo.cfg[3] = (inputs.reset ? 1 : 0) | (g_gi.history_valid ? 2 : 0) | (normals ? 4 : 0) | (albedo ? 8 : 0) | (half ? 16 : 0) |
 	             (cfg.ao > 0 ? 32 : 0) | (cfg.gi > 0 ? 64 : 0) | (flip_y ? 128 : 0);
 	ubo.cfg2[0] = static_cast<int32_t>(g_gi.frame), ubo.cfg2[1] = view;
+	ubo.proj[0] = m[0], ubo.proj[1] = m[5], ubo.proj[2] = m[8], ubo.proj[3] = m[9];
+	ubo.depth_map[0] = m[10], ubo.depth_map[1] = m[14], ubo.depth_map[2] = m[11], ubo.depth_map[3] = m[15];
 
 	const auto entry = static_cast<uint32_t>(g_gi.written % 8);
 	const bool timed = g_gi.pool != nullptr;

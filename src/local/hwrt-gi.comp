@@ -42,6 +42,8 @@ layout(std140, binding = 14) uniform Frame {
 	vec4  par;      // GI range (m), AO floor, fade start (m), fade end (m)
 	ivec4 cfg;      // AO rays, GI rays, level, flags (1 reset, 2 history valid, 4 G-buffer normal, 8 G-buffer albedo, 16 half res, 32 AO on, 64 GI on, 128 y flip)
 	ivec4 cfg2;     // frame, view mode, -, -
+	vec4  proj;      // the upscaler's view_to_clip: M[0], M[5], M[8], M[9]
+	vec4  depth_map; // A = M[10], B = M[14], C = M[11], D = M[15]
 } u;
 layout(push_constant) uniform Push {
 	int   mode;
@@ -54,18 +56,42 @@ const float PI = 3.14159265;
 vec2  RenderSize() { return u.motion.zw; }
 vec2  TraceSize() { return u.trace.xy; }
 float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
-bool  IsSky(float d) { return d <= 1e-7 || d >= 0.9999999; }
+bool  IsSky(float d);
 
 vec2 Ndc(vec2 uv) {
 	vec2 n = uv * 2.0 - 1.0;
 	if ((u.cfg.w & 128) != 0) n.y = -n.y;
 	return n;
 }
-vec3 World(vec2 uv, float d) {
-	vec4 c = vec4(Ndc(uv), d, 1.0);
+// (fix 2) The depth buffer's value is not the scene camera's clip z / w (its depth convention differs: points slid along
+// their view rays, wrong by an amount that changed with the camera's pitch). Only x / y go through the scene camera:
+// the pixel's world-space view ray (two points of it, any z convention); the distance along it comes from the depth
+// through the upscaler's view_to_clip (GTAO's ViewPos: view space, exact length).
+vec3 ClipToWorld(vec4 c) {
 	vec4 h = vec4(dot(u.inv[0], c), dot(u.inv[1], c), dot(u.inv[2], c), dot(u.inv[3], c));
 	return h.xyz / (abs(h.w) > 1e-20 ? h.w : 1e-20);
 }
+vec3 RayDir(vec2 uv) {
+	vec2 n = Ndc(uv);
+	vec3 a = ClipToWorld(vec4(n, 0.25, 1.0)), b = ClipToWorld(vec4(n, 0.75, 1.0));
+	vec3 d = normalize(b - a);
+	// toward the scene, away from the camera
+	if (dot(d, a - u.cam.xyz) < 0.0 && dot(d, b - u.cam.xyz) < 0.0) d = -d;
+	return d;
+}
+float ViewZ(float d) {
+	float den = d * u.depth_map.z - u.depth_map.x;
+	return abs(den) > 1e-12 ? (u.depth_map.y - d * u.depth_map.w) / den : 1e6;
+}
+float ViewDist(vec2 uv, float d) {
+	float z  = ViewZ(d);
+	float w  = z * u.depth_map.z + u.depth_map.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	vec3  v  = vec3((nd.x * w - z * u.proj.z) / u.proj.x, (nd.y * w - z * u.proj.w) / u.proj.y, z);
+	return length(v);
+}
+bool IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e3; }
+vec3 World(vec2 uv, float d) { return u.cam.xyz + RayDir(uv) * ViewDist(uv, d); }
 // world -> uv (w > 0: in front)
 vec3 Project(vec3 p) {
 	vec4 c = vec4(p, 1.0);
@@ -193,7 +219,7 @@ void Trace(ivec2 pixel) {
 				}
 			}
 			// hidden / off screen: a dim estimate from the receiver's own light (the surroundings lit alike)
-			if (!seen) L = own * 0.35;
+			if (!seen) L = own * 0.1;
 			// near hits are mostly the receiver's own crease: keep their bounce, but no light from inside a millimetre
 			gi += min(L, vec3(64.0)) * smoothstep(0.0, 0.05, t);
 		}
