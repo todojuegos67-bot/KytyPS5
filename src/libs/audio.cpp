@@ -16,6 +16,8 @@
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <string_view>
+#include <utility>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -123,6 +125,13 @@ private:
 		// KYTY_AUDIO_STATS: the blocks output in the period and each channel's peak.
 		uint32_t stat_blocks = 0;
 		float    stat_peak[12] {};
+		// (Always: the device's queue found empty at an output after the first, i.e. it played silence: a crackle.
+		// The lowest queue seen before an output, in grains.)
+		uint32_t stat_underruns  = 0; // (the outputting thread's, as stat_blocks)
+		uint32_t stat_low_grains = UINT32_MAX;
+		// (KYTY_AUDIO_ADAPT, default on: each 4 underruns of the port raise its blocking reserve by 20 ms, up to 100 ms.)
+		uint32_t underruns_total = 0;
+		uint32_t reserve_us      = 0;
 	};
 
 	struct PortIn {
@@ -614,8 +623,26 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 	}();
 	static const bool            log_queue = std::getenv("KYTY_AUDIO_LOG") != nullptr;
 	static std::atomic<uint32_t> empties {0}, clears {0}, trims {0};
-	const uint32_t               queued_bytes =
-	    log_queue || cushion_us != 0 ? SDL_GetQueuedAudioSize(port->audio_device) : 1u;
+	// (Read always: one lock of SDL's queue a grain. The [audioout] line's underrun count, 10-27: crackles reported.)
+	const uint32_t queued_bytes = SDL_GetQueuedAudioSize(port->audio_device);
+	// (A stream that went on: a port the game left quiet for 200 ms and more is starting again, not underrunning.)
+	if (port->last_output_time != 0 && queue_size != 0 && now - port->last_output_time < 200000) {
+		if (queued_bytes == 0) {
+			++port->stat_underruns;
+			static const bool adapt = [] {
+				const char* value = std::getenv("KYTY_AUDIO_ADAPT");
+				return value == nullptr || std::string_view(value) != "0";
+			}();
+			if (adapt && ++port->underruns_total % 4 == 0 && port->reserve_us < 60000) {
+				port->reserve_us += 20000;
+				std::printf("AudioOut: type %d port: %u underruns, its reserve now %u ms (KYTY_AUDIO_ADAPT=0: fixed 40 ms)\n",
+				            port->type, port->underruns_total, static_cast<unsigned>((40000 + port->reserve_us) / 1000));
+				std::fflush(stdout);
+			}
+		}
+		const uint32_t grains = queued_bytes / queue_size;
+		port->stat_low_grains = std::min(port->stat_low_grains, grains);
+	}
 	// (KYTY_AUDIO_LOG.) A main port's queue level before each output (ms), its lowest and highest every 2 s.
 	if (log_queue && port->type == 0 && queue_size != 0 && buffer_us != 0 && port->audio_device < 64) {
 		struct Level {
@@ -658,11 +685,11 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 	}
 
 	if (blocking) {
-		constexpr uint64_t target_latency_us = 40000;
+		const uint64_t target_latency_us = 40000 + port->reserve_us;
 		const auto buffers =
 		    buffer_us != 0 ? static_cast<uint32_t>((target_latency_us + buffer_us - 1) / buffer_us)
 		                   : 2u;
-		const auto min_queued_size = queue_size * std::clamp(buffers, 2u, 16u);
+		const auto min_queued_size = queue_size * std::clamp(buffers, 2u, 32u);
 		const auto wait_start      = now;
 		while (SDL_GetQueuedAudioSize(port->audio_device) > min_queued_size) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
@@ -860,8 +887,11 @@ void Audio::NoteOutputs(const OutputParam* params, uint32_t num) {
 		size_t at = 0;
 		for (int ch = 0; ch < port.channels_num && ch < 12; ch++)
 			at += static_cast<size_t>(std::snprintf(peaks + at, sizeof(peaks) - at, " %.3f", static_cast<double>(port.stat_peak[ch])));
-		std::printf("[audioout] port %d type %d %s, device %u ch: %u blocks, peak per channel%s\n", id, port.type,
-		            Common::EnumName(port.format).c_str(), static_cast<unsigned>(port.audio_spec.channels), port.stat_blocks, peaks);
+		const uint32_t underruns = std::exchange(port.stat_underruns, 0u);
+		const uint32_t low       = std::exchange(port.stat_low_grains, UINT32_MAX);
+		std::printf("[audioout] port %d type %d %s, device %u ch: %u blocks, underruns %u, lowest queue %d grains, peak per channel%s\n",
+		            id, port.type, Common::EnumName(port.format).c_str(), static_cast<unsigned>(port.audio_spec.channels),
+		            port.stat_blocks, underruns, low == UINT32_MAX ? -1 : static_cast<int>(low), peaks);
 		port.stat_blocks = 0;
 		std::fill(std::begin(port.stat_peak), std::end(port.stat_peak), 0.0f);
 	}

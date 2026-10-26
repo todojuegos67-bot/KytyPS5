@@ -10,6 +10,7 @@
 
 #include "common/logging/log.h"
 #include "local-platform.h"
+#include "slow-log.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -8941,17 +8942,23 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	// (The DLSS-G hudless path sets the context in PrepareInputs; the PS5 Pro path alone needs the renderer's.)
 	if (g_graphics_ctx == nullptr && inputs.graphics != nullptr) g_graphics_ctx = inputs.graphics;
 	RtPartNoteColor(inputs.color_address, inputs.color.extent); // (rtparticles: the scene color the draws are matched to)
-	HwParticlesApply(command, inputs); // (KYTY_HWRT_PARTICLES: first, on the game's own color; nothing when off)
-	CShadowApply(command, inputs); // (KYTY_RT_SHADOWS: direct-sun shadows first; inputs.color becomes the composited copy)
-	HwLightsApply(command, inputs); // (KYTY_HWRT_LIGHTS: ray-traced local-light shadows, hw-lights.cpp; nothing when off)
-	SsgiApply(command, inputs); // (KYTY_SSGI: likewise; nothing when off)
-	GtaoApply(command, inputs); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
-	HwGiApply(command, inputs); // (KYTY_HWRT_AO / KYTY_HWRT_GI: likewise, hwrt-gi.cpp, in GTAO's place; nothing when off)
-	SsrApply(command, inputs); // (KYTY_SSR: likewise, after GTAO; nothing when off)
-	RtReflectionsApply(command, inputs); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
-	ShineApply(command, inputs); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
-	GodraysApply(command, inputs); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off)
-	GbufViewApply(command, inputs); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
+	// (A pass's first use makes its pipelines and images here, before the flip: a slow one names itself. 10-27: the
+	// first world frame with KYTY_HWRT_REFL waited 4.7-5.4 s on the flip, the render thread idle.)
+	const auto TimedPass = [](const char* name, const auto& run) {
+		SlowLog::Scope pass_slow([name](double ms) { std::printf("SLOW UpscalePass %s %.1f ms\n", name, ms); }, SlowLog::HitchThreshold());
+		run();
+	};
+	TimedPass("HwParticlesApply", [&] { HwParticlesApply(command, inputs); }); // (KYTY_HWRT_PARTICLES: first, on the game's own color; nothing when off)
+	TimedPass("CShadowApply", [&] { CShadowApply(command, inputs); }); // (KYTY_RT_SHADOWS: direct-sun shadows first; inputs.color becomes the composited copy)
+	TimedPass("HwLightsApply", [&] { HwLightsApply(command, inputs); }); // (KYTY_HWRT_LIGHTS: ray-traced local-light shadows, hw-lights.cpp; nothing when off)
+	TimedPass("SsgiApply", [&] { SsgiApply(command, inputs); }); // (KYTY_SSGI: likewise; nothing when off)
+	TimedPass("GtaoApply", [&] { GtaoApply(command, inputs); }); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
+	TimedPass("HwGiApply", [&] { HwGiApply(command, inputs); }); // (KYTY_HWRT_AO / KYTY_HWRT_GI: likewise, hwrt-gi.cpp, in GTAO's place; nothing when off)
+	TimedPass("SsrApply", [&] { SsrApply(command, inputs); }); // (KYTY_SSR: likewise, after GTAO; nothing when off)
+	TimedPass("RtReflectionsApply", [&] { RtReflectionsApply(command, inputs); }); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
+	TimedPass("ShineApply", [&] { ShineApply(command, inputs); }); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
+	TimedPass("GodraysApply", [&] { GodraysApply(command, inputs); }); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off)
+	TimedPass("GbufViewApply", [&] { GbufViewApply(command, inputs); }); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
 	const bool  fsr  = g_sr_kind == 3;
