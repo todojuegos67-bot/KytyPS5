@@ -1012,9 +1012,10 @@ void PipelineCache::MergeAsyncJobCaches() {
 static uint64_t AsyncComputeWords() {
 	static const uint64_t words = [] {
 		const char* v = std::getenv("KYTY_ASYNC_COMPUTE_WORDS");
-		// default 1: every pipeline is compiled by the background threads (the draw/dispatch that
+		// default 50000: bigger pipelines are compiled by the background threads; small ones (a few ms)
+		// are compiled inline so the image is not black while big ones build. Before: every pipeline (the draw/dispatch that
 		// needs a pipeline not ready yet is skipped until it is, instead of freezing the frame)
-		return v != nullptr ? std::strtoull(v, nullptr, 10) : 1ull;
+		return v != nullptr ? std::strtoull(v, nullptr, 10) : 50000ull;
 	}();
 	return words;
 }
@@ -1402,7 +1403,8 @@ void PipelineCache::EnqueueAsync(std::function<void()> work, const std::function
 	if (m_async_compute == nullptr) {
 		m_async_compute = std::make_unique<AsyncCompute>();
 		const uint32_t hw = std::thread::hardware_concurrency();
-		uint32_t count  = std::clamp<uint32_t>(hw > 8 ? hw / 2u : 4u, 4u, 16u);
+		// 16 concurrent driver compiles of 700K-word shaders made each one 5-10x slower (memory bound)
+		uint32_t count  = std::clamp<uint32_t>(hw / 4u, 2u, 8u);
 		if (const char* v = std::getenv("KYTY_ASYNC_COMPUTE_THREADS"); v != nullptr) {
 			count = std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(v, nullptr, 10)), 1u, 64u);
 		}

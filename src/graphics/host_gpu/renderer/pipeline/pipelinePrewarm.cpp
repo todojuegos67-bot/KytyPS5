@@ -129,6 +129,7 @@ struct Context {
 	uint64_t                                     missed[2] = {};
 	Clock::time_point                            start_time;
 	Clock::time_point                            next_report;
+	std::vector<std::pair<uint64_t, std::vector<uint32_t>>> early_spirv;
 	GraphicContext*                              graphics     = nullptr;
 	vk::PipelineCache                            driver_cache = nullptr;
 };
@@ -577,7 +578,7 @@ void Worker() {
 uint32_t FastCompileFlags(uint64_t words) {
 	static const uint64_t fast_compile_words = [] {
 		const char* v = std::getenv("KYTY_FAST_COMPILE_WORDS");
-		return v != nullptr ? std::strtoull(v, nullptr, 10) : 300000ull;
+		return v != nullptr ? std::strtoull(v, nullptr, 10) : 100000ull;
 	}();
 	return fast_compile_words != 0 && words > fast_compile_words
 	           ? static_cast<uint32_t>(VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)
@@ -612,6 +613,12 @@ void NoteSpirv(vk::ShaderModule module, std::span<const uint32_t> spirv) {
 	auto&           ctx = Ctx();
 	std::lock_guard lock(ctx.mutex);
 	ctx.hash_of_module[ModuleId(module)] = h;
+	if (!ctx.started) {
+		// before the seed is open (shaders translate before the first pipeline): kept and written
+		// at EnsureStarted, else these pipelines would never be recorded
+		ctx.early_spirv.emplace_back(h, std::vector<uint32_t>(spirv.begin(), spirv.end()));
+		return;
+	}
 	if (!ctx.spirv_offset.contains(h)) {
 		WriteRecordLocked(ctx, KindSpirv, h, spirv);
 	}
@@ -905,8 +912,15 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 		if (ctx.out == nullptr) {
 			std::printf("Prewarm: cannot write %s; recording off\n", ctx.path.string().c_str());
 		}
+		for (const auto& [h, code]: ctx.early_spirv) {
+			if (!ctx.spirv_offset.contains(h)) {
+				WriteRecordLocked(ctx, KindSpirv, h, code);
+			}
+		}
+		ctx.early_spirv.clear();
+		ctx.early_spirv.shrink_to_fit();
 		const unsigned hw      = std::thread::hardware_concurrency();
-		unsigned       threads = std::max(1u, hw / 2u);
+		unsigned       threads = std::clamp(hw / 3u, 1u, 12u);
 		if (const char* v = std::getenv("KYTY_PREWARM_THREADS"); v != nullptr && *v != '\0') {
 			threads = std::clamp(static_cast<unsigned>(std::strtoul(v, nullptr, 10)), 1u, 64u);
 		}
@@ -922,12 +936,16 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 			}
 		}
 	}
-	static const bool wait = [] {
+	// KYTY_PREWARM_WAIT: default on when the seed has pipelines (a compile pause at the first
+	// pipeline with progress in the log, instead of minutes of skipped dispatches); 0 = off.
+	const bool wait = [&] {
 		const char* v = std::getenv("KYTY_PREWARM_WAIT");
-		return v != nullptr && std::strcmp(v, "1") == 0;
+		if (v != nullptr && *v != '\0') return std::strcmp(v, "0") != 0;
+		std::lock_guard lock(ctx.mutex);
+		return !ctx.queue.empty();
 	}();
 	if (wait || only) {
-		std::printf("Prewarm: waiting for the replay (%s)\n", only ? "KYTY_PREWARM_ONLY=1" : "KYTY_PREWARM_WAIT=1");
+		std::printf("Prewarm: waiting for the replay (%s)\n", only ? "KYTY_PREWARM_ONLY=1" : "KYTY_PREWARM_WAIT, default with a seed; 0 = play while it builds");
 		std::fflush(stdout);
 		std::unique_lock lock(ctx.mutex);
 		ctx.cv.wait(lock, [&] { return ctx.built + ctx.failed >= ctx.queue.size(); });

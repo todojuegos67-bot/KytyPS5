@@ -667,7 +667,7 @@ void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeli
 	// 1-2 MB of SPIR-V and the NVIDIA driver spent minutes optimizing each, freezing the game.
 	static const uint64_t fast_compile_words = [] {
 		const char* v = std::getenv("KYTY_FAST_COMPILE_WORDS");
-		return v != nullptr ? std::strtoull(v, nullptr, 10) : 300000ull;
+		return v != nullptr ? std::strtoull(v, nullptr, 10) : 100000ull;
 	}();
 	if (fast_compile_words != 0 && job.spirv_words > fast_compile_words) {
 		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
