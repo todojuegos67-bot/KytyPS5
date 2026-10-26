@@ -37,6 +37,7 @@
 #include <condition_variable>
 #include <shared_mutex>
 #include <string>
+#include <random>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -49,6 +50,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h> // IWYU pragma: keep
+#include <zstd.h>
 #include <winioctl.h> // FSCTL_SET_SPARSE (KYTY_BACKING_FILE)
 #ifndef MEM_RESERVE_PLACEHOLDER
 #define MEM_RESERVE_PLACEHOLDER 0x00040000
@@ -1904,6 +1906,211 @@ uint64_t FlushTrim(uint64_t budget, uint64_t* held_us) {
 } // namespace RamFlushGuest
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Guest memory compression census (KYTY_MEM_COMPRESS=1, default off; memcomp-1025). Measurement only: whether keeping
+// cold guest pages compressed in the emulator would save RAM beyond what Windows' own memory compression store does
+// with them. Every round (30 s) a guard-style thread samples KYTY_MEM_COMPRESS_SAMPLES (default 4096) random 4 KiB pages
+// of what the game allocated (direct + flexible), and per page:
+//   residency now (QueryWorkingSetEx on the guest view and the backing alias): a page in neither is already Windows'
+//   (standby / compressed store / page file) - a compressor of ours would gain nothing on it;
+//   its bytes read from the backing alias (ReadProcessMemory: a no-access page, e.g. an offloaded texture, is skipped
+//   rather than faulted) and compressed with zstd -1 (an LZ4-class speed/ratio proxy: LZ4 is not vendored) and zstd 1;
+//   then trimmed from the working set of both views (VirtualUnlock, inside RunQuiet: no map runs meanwhile), and asked
+//   again 10 s and 30 s later: still out = no CPU access of either view (game code or the emulator's host reads,
+//   uploads included: the GPU never reads guest memory directly in this build) for that long.
+// The census line extrapolates to the allocated total: cold-resident bytes x (1 - ratio) is the most an in-emulator
+// compressor could take from RAM before Windows itself would trim and compress those pages under pressure.
+// Cost: ~16 MiB read and trimmed per round, ~4K soft faults spread over 30 s for the pages that are hot.
+namespace MemCompressCensus {
+
+struct Sample {
+	uint64_t backing_offset = 0;
+	uint64_t guest_va       = 0; // 0: not mapped in the guest
+	bool     gpu            = false;
+	bool     resident       = false;
+	bool     read           = false;
+	bool     zero           = false;
+	uint32_t fast_bytes     = 0;
+	uint32_t z1_bytes       = 0;
+	bool     cold10         = false;
+};
+
+using QueryWsFn = BOOL(WINAPI*)(HANDLE, PVOID, DWORD);
+
+struct WsInfo {
+	ULONG_PTR va;
+	ULONG_PTR flags;
+};
+
+static bool QueryValid(QueryWsFn fn, std::vector<WsInfo>* infos) {
+	if (infos->empty()) return true;
+	return fn(GetCurrentProcess(), infos->data(), static_cast<DWORD>(infos->size() * sizeof(WsInfo))) != FALSE;
+}
+
+static void Run() {
+	auto* fn = reinterpret_cast<QueryWsFn>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32QueryWorkingSetEx"));
+	if (fn == nullptr) {
+		std::printf("[memcomp] census off: K32QueryWorkingSetEx not found\n");
+		return;
+	}
+	uint64_t samples_wanted = 4096;
+	if (const char* s = std::getenv("KYTY_MEM_COMPRESS_SAMPLES"); s != nullptr && std::atoll(s) > 0)
+		samples_wanted = std::min<uint64_t>(static_cast<uint64_t>(std::atoll(s)), 65536);
+	std::printf("[memcomp] census on: %llu pages a round, rounds of 30 s (cold = no CPU touch of either view for 10 / 30 s); "
+	            "the compressor pipeline itself is not built (see memcomp-1025 notes)\n",
+	            static_cast<unsigned long long>(samples_wanted));
+	std::mt19937_64       rng(0x6d656d636f6d70ull ^ static_cast<uint64_t>(GetTickCount64()));
+	std::vector<uint8_t>  page(4096), out(ZSTD_compressBound(4096));
+	ZSTD_CCtx*            cctx  = ZSTD_createCCtx();
+	uint64_t              round = 0;
+	std::this_thread::sleep_for(std::chrono::seconds(30));
+	for (;;) {
+		auto* base = reinterpret_cast<uint8_t*>(g_guest_address_space != nullptr ? g_guest_address_space->GetBackingBase() : 0);
+		if (base == nullptr || g_physical_memory == nullptr || g_flexible_memory == nullptr) {
+			std::this_thread::sleep_for(std::chrono::seconds(30));
+			continue;
+		}
+		// What the game holds now: [backing offset, size, guest va, gpu].
+		struct Range {
+			uint64_t off, size, va;
+			bool     gpu;
+		};
+		std::vector<Range> ranges;
+		uint64_t           total = 0;
+		g_physical_memory->GetMutex().Lock();
+		for (const auto& [key, b]: g_physical_memory->GetMappings()) {
+			const uint64_t va = (b.map_vaddr != 0 && b.map_size >= b.size) ? b.map_vaddr : 0;
+			ranges.push_back({b.start_addr, b.size, va, b.gpu_mode != GpuAccessMode::NoAccess});
+			total += b.size;
+		}
+		g_physical_memory->GetMutex().Unlock();
+		g_flexible_memory->GetMutex().Lock();
+		for (const auto& b: g_flexible_memory->GetBlocks()) {
+			ranges.push_back({b.backing_offset, b.map_size, b.map_vaddr, b.gpu_mode != GpuAccessMode::NoAccess});
+			total += b.map_size;
+		}
+		g_flexible_memory->GetMutex().Unlock();
+		if (total < 4096) {
+			std::this_thread::sleep_for(std::chrono::seconds(30));
+			continue;
+		}
+		std::vector<uint64_t> prefix;
+		prefix.reserve(ranges.size());
+		uint64_t acc = 0;
+		for (const auto& r: ranges) prefix.push_back(acc += r.size);
+		std::vector<Sample> s(samples_wanted);
+		for (auto& x: s) {
+			const uint64_t pick = rng() % total;
+			const size_t   i    = std::upper_bound(prefix.begin(), prefix.end(), pick) - prefix.begin();
+			const uint64_t in   = (pick - (prefix[i] - ranges[i].size)) & ~uint64_t {4095};
+			x.backing_offset    = ranges[i].off + in;
+			x.guest_va          = ranges[i].va != 0 ? ranges[i].va + in : 0;
+			x.gpu               = ranges[i].gpu;
+		}
+		const auto query = [&](std::vector<bool>* valid) {
+			std::vector<WsInfo> q;
+			q.reserve(s.size() * 2);
+			for (const auto& x: s) {
+				q.push_back({reinterpret_cast<ULONG_PTR>(base + x.backing_offset), 0});
+				q.push_back({x.guest_va != 0 ? static_cast<ULONG_PTR>(x.guest_va) : reinterpret_cast<ULONG_PTR>(base + x.backing_offset), 0});
+			}
+			if (!QueryValid(fn, &q)) return false;
+			valid->assign(s.size(), false);
+			for (size_t i = 0; i < s.size(); i++) (*valid)[i] = ((q[2 * i].flags | q[2 * i + 1].flags) & 1u) != 0;
+			return true;
+		};
+		std::vector<bool> valid;
+		if (!query(&valid)) {
+			std::printf("[memcomp] census: QueryWorkingSetEx failed (%lu)\n", GetLastError());
+			return;
+		}
+		const auto t_c0 = std::chrono::steady_clock::now();
+		for (size_t i = 0; i < s.size(); i++) {
+			auto& x    = s[i];
+			x.resident = valid[i];
+			if (!x.resident) continue; // (Reading it would bring it back from Windows' store: not ours to gain.)
+			SIZE_T got = 0;
+			if (ReadProcessMemory(GetCurrentProcess(), base + x.backing_offset, page.data(), 4096, &got) == FALSE || got != 4096)
+				continue;
+			x.read = true;
+			x.zero = std::all_of(page.begin(), page.end(), [](uint8_t b) { return b == 0; });
+			size_t r   = ZSTD_compressCCtx(cctx, out.data(), out.size(), page.data(), 4096, -1);
+			x.fast_bytes = ZSTD_isError(r) ? 4096 : static_cast<uint32_t>(std::min<size_t>(r, 4096));
+			r          = ZSTD_compressCCtx(cctx, out.data(), out.size(), page.data(), 4096, 1);
+			x.z1_bytes = ZSTD_isError(r) ? 4096 : static_cast<uint32_t>(std::min<size_t>(r, 4096));
+		}
+		const double compress_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_c0).count();
+		// Trim the sample out of both views' working sets (the page stays committed and intact).
+		const bool trimmed = g_guest_address_space->RunQuietWith([&] {
+			for (const auto& x: s) {
+				(void)VirtualUnlock(base + x.backing_offset, 4096);
+				if (x.guest_va != 0) (void)VirtualUnlock(reinterpret_cast<void*>(x.guest_va), 4096);
+			}
+		});
+		std::this_thread::sleep_for(std::chrono::seconds(10));
+		std::vector<bool> v10, v30;
+		const bool        ok10 = trimmed && query(&v10);
+		std::this_thread::sleep_for(std::chrono::seconds(20));
+		const bool ok30 = ok10 && query(&v30);
+		// Tally.
+		uint64_t n = s.size(), resident = 0, read = 0, unreadable = 0, gpu = 0, zero = 0, cold10 = 0, cold30 = 0;
+		uint64_t cold30_read = 0, cold30_gpu = 0, cold30_fast = 0, cold30_z1 = 0, all_fast = 0, all_z1 = 0, unmapped = 0;
+		for (size_t i = 0; i < s.size(); i++) {
+			const auto& x = s[i];
+			if (x.gpu) gpu++;
+			if (x.guest_va == 0) unmapped++;
+			if (!x.resident) continue;
+			resident++;
+			if (!x.read) {
+				unreadable++;
+				continue;
+			}
+			read++;
+			if (x.zero) zero++;
+			all_fast += x.fast_bytes;
+			all_z1 += x.z1_bytes;
+			const bool c10 = ok10 && !v10[i];
+			const bool c30 = ok30 && c10 && !v30[i];
+			if (c10) cold10++;
+			if (c30) {
+				cold30++;
+				cold30_read++;
+				if (x.gpu) cold30_gpu++;
+				cold30_fast += x.fast_bytes;
+				cold30_z1 += x.z1_bytes;
+			}
+		}
+		const auto mib   = [&](uint64_t count) { return static_cast<double>(total) * static_cast<double>(count) / static_cast<double>(n) / 1048576.0; };
+		const auto ratio = [](uint64_t bytes, uint64_t pages) { return pages == 0 ? 0.0 : static_cast<double>(bytes) / (4096.0 * static_cast<double>(pages)); };
+		const double cold_mib  = mib(cold30);
+		const double save_fast = cold_mib * (1.0 - ratio(cold30_fast, cold30_read));
+		const double save_z1   = cold_mib * (1.0 - ratio(cold30_z1, cold30_read));
+		std::printf("[memcomp] census #%llu: allocated %.0f MiB; sample %llu pages: resident %.1f%% (%.0f MiB; the rest is already "
+		            "Windows' standby/compressed/page file), unmapped-in-guest %.1f%%, gpu-mapped %.1f%%, unreadable(no-access) %llu; "
+		            "cold>=10s %.0f MiB, cold>=30s %.0f MiB (gpu-mapped %.1f%% of it); zero pages %.1f%% of read; ratio all: "
+		            "fast %.3f z1 %.3f, cold: fast %.3f z1 %.3f -> RAM an in-emulator compressor could save ~%.0f MiB (fast) / "
+		            "~%.0f MiB (z1) before Windows trims them itself; compress %.1f ms/%llu pages%s\n",
+		            static_cast<unsigned long long>(++round), static_cast<double>(total) / 1048576.0,
+		            static_cast<unsigned long long>(n), 100.0 * resident / n, mib(resident), 100.0 * unmapped / n,
+		            100.0 * gpu / n, static_cast<unsigned long long>(unreadable), mib(cold10), cold_mib,
+		            cold30 == 0 ? 0.0 : 100.0 * cold30_gpu / cold30, read == 0 ? 0.0 : 100.0 * zero / read,
+		            ratio(all_fast, read), ratio(all_z1, read), ratio(cold30_fast, cold30_read), ratio(cold30_z1, cold30_read),
+		            save_fast, save_z1, compress_ms, static_cast<unsigned long long>(read),
+		            !trimmed ? " (trim skipped: maps busy)" : (!ok30 ? " (working-set query failed)" : ""));
+		std::fflush(stdout);
+	}
+}
+
+static void StartIfEnabled() {
+	const char* e = std::getenv("KYTY_MEM_COMPRESS");
+	if (e == nullptr || e[0] != '1') return;
+	std::thread([] { Run(); }).detach();
+}
+
+} // namespace MemCompressCensus
+#endif
+
+
 void Initialize() {
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
@@ -1919,6 +2126,7 @@ void Initialize() {
 	EXIT_IF(!g_guest_address_space->SelfTest());
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MemCompressCensus::StartIfEnabled();
 	RamGuard::RegisterBudgetFlush("released guest memory", RamGuard::FlushGuestFreed, RamFlushGuest::FlushFreed);
 	RamGuard::RegisterBudgetFlush("guest store alias", RamGuard::FlushTrim, RamFlushGuest::FlushTrim);
 	// The census (ram-guard.h): what the game holds of the store, and what is free of it (the direct ranges never
