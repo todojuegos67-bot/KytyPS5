@@ -236,7 +236,26 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
+		bool                                         owns_module = true;
 	};
+
+	struct SpirvKey {
+		uint64_t a = 0, b = 0, size = 0;
+		bool operator==(const SpirvKey&) const = default;
+	};
+	struct SpirvKeyHash {
+		size_t operator()(const SpirvKey& k) const noexcept { return static_cast<size_t>(k.a ^ (k.b * 0x9e3779b97f4a7c15ull)); }
+	};
+	static SpirvKey HashSpirv(std::span<const uint32_t> words) {
+		uint64_t a = 0xcbf29ce484222325ull;
+		uint64_t b = 0x84222325cbf29ce4ull;
+		for (const uint32_t w: words) {
+			a = (a ^ w) * 0x100000001b3ull;
+			b = (b + w) * 0xff51afd7ed558ccdull;
+			b ^= b >> 29;
+		}
+		return {a, b, words.size()};
+	}
 
 	struct SourceEntry {
 		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
@@ -325,8 +344,29 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
+		// Permutations that differ only in specialization data often emit identical SPIR-V
+		// (Ghost of Yotei: one CS translated 84 times, 400K+ word shaders 4-6 times, ~30 s of
+		// driver compile each). Identical SPIR-V reuses the module and shader id, so the
+		// already-created (or queued) pipeline is reused instead of compiled again.
+		const SpirvKey spirv_key = HashSpirv(result.spirv);
+		if (const auto found = spirv_modules.find(spirv_key); found != spirv_modules.end()) {
+			if (options.dump_ir) {
+				LOGF("%s SPIR-V identical to shader id %" PRIu64 ", reused\n", options.dump_label,
+				     found->second.id);
+			}
+			return {
+			    .function_code  = {function_code.begin(), function_code.end()},
+			    .specialization = std::move(specialization),
+			    .program        = std::move(result.program).TakeCompiledInfo(),
+			    .handle         = found->second,
+			    .owns_module    = false,
+			};
+		}
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
+		const ShaderProgram handle {.id = ++next_shader_id, .module = module,
+		                            .spirv_words = static_cast<uint64_t>(result.spirv.size())};
+		spirv_modules.emplace(spirv_key, handle);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -335,8 +375,7 @@ struct PipelineCache::ProgramCache {
 		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module,
-		                       .spirv_words = static_cast<uint64_t>(result.spirv.size())},
+		    .handle         = handle,
 		};
 	}
 
@@ -520,7 +559,8 @@ struct PipelineCache::ProgramCache {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
-				graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
+				if (permutation.owns_module)
+					graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
 			}
 		}
 	}
@@ -530,6 +570,7 @@ struct PipelineCache::ProgramCache {
 	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported_keys; // translation threw UnsupportedResources
 	GraphicContext&                                             graphics;
 	uint64_t                                                    next_shader_id = 0;
+	std::unordered_map<SpirvKey, ShaderProgram, SpirvKeyHash>   spirv_modules;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
