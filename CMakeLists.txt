@@ -469,6 +469,20 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${rt_reflections_hw_header}")
+# KYTY_HWRT_REFL_MATERIAL (hwrt3): + the off-screen hits' albedo (binding 24, the albedo array of src/local/hwrt-scene.cpp).
+set(rt_reflections_hwm_spv "${gpu_tiler_generated_dir}/rt_reflections_hwm.spv")
+set(rt_reflections_hwm_header "${gpu_tiler_generated_dir}/rt_reflections_hwm_spv.h")
+add_custom_command(
+	OUTPUT "${rt_reflections_hwm_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_HWRT -DKYTY_HWRT_MATERIAL
+	        -o "${rt_reflections_hwm_spv}" "${rt_reflections_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_reflections_hwm_spv} -DOUTPUT=${rt_reflections_hwm_header}
+	        -DSYMBOL=RT_REFLECTIONS_HWM_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rt_reflections_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rt_reflections_hwm_header}")
 
 # KYTY_GBUF_VIEW / KYTY_GBUF_TAP: the G-buffer diagnostic view and statistics before the upscaler (src/local/gbuf-view.cpp).
 set(gbuf_view_source "${KYTY_SOURCE_DIR}/local/gbuf-view.comp")
@@ -594,7 +608,8 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${rtsun_hw_header}")
 # KYTY_HWRT (src/local/hwrt-scene.cpp): the scene capture's world-space gather and the ray query debug view.
-foreach(hwrt_shader gather debug debug11)
+# (hwrt3, KYTY_HWRT_REFL_MATERIAL: albedo, albedo_array: a base-colour texture downsampled into the albedo array)
+foreach(hwrt_shader gather debug debug11 albedo albedo_array)
 	string(TOUPPER "${hwrt_shader}" hwrt_upper)
 	set(hwrt_source "${KYTY_SOURCE_DIR}/local/hwrt-${hwrt_shader}.comp")
 	set(hwrt_defines "")
@@ -602,6 +617,10 @@ foreach(hwrt_shader gather debug debug11)
 		# (the same view into a B10G11R11 target: the PS5 Pro path's FSR output)
 		set(hwrt_source "${KYTY_SOURCE_DIR}/local/hwrt-debug.comp")
 		set(hwrt_defines "-DKYTY_FMT_R11")
+	endif()
+	if(hwrt_shader STREQUAL "albedo_array")
+		set(hwrt_source "${KYTY_SOURCE_DIR}/local/hwrt-albedo.comp")
+		set(hwrt_defines "-DKYTY_ARRAY")
 	endif()
 	set(hwrt_spv "${gpu_tiler_generated_dir}/hwrt_${hwrt_shader}.spv")
 	set(hwrt_header "${gpu_tiler_generated_dir}/hwrt_${hwrt_shader}_spv.h")

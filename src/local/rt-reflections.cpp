@@ -106,6 +106,8 @@
 #include "graphics/presentation/videoOut.h"
 #include "gpu_tiler_shaders/rt_reflections_spv.h"
 #include "gpu_tiler_shaders/rt_reflections_hw_spv.h"
+#include "gpu_tiler_shaders/rt_reflections_hwm_spv.h"
+#include "local/hwrt-scene.h"
 
 #include <algorithm>
 #include <array>
@@ -185,6 +187,12 @@ struct RtPass {
 	vk::PipelineLayout      hw_layout     = nullptr;
 	vk::Pipeline            hw_pipeline   = nullptr;
 	bool                    hw_failed     = false;
+	// (hwrt3, KYTY_HWRT_REFL_MATERIAL) the same with binding 24, the albedo array of the off-screen hits
+	vk::DescriptorSetLayout hwm_set_layout = nullptr;
+	vk::PipelineLayout      hwm_layout     = nullptr;
+	vk::Pipeline            hwm_pipeline   = nullptr;
+	bool                    hwm_failed     = false;
+	uint64_t                hwm_frames     = 0;
 	uint64_t                hw_frames = 0, sw_frames = 0;
 	vk::Sampler             point = nullptr, linear = nullptr;
 	bool                    failed = false; // (the pipeline could not be made: off for the session)
@@ -510,6 +518,59 @@ bool EnsureHwPipeline(GraphicContext& graphics) {
 	}
 	g_rt.hw_failed = false;
 	std::printf("RT reflections: hardware ray queries into the scene TLAS for the screen-space misses (KYTY_HWRT_REFL=1)\n");
+	std::fflush(stdout);
+	return true;
+}
+
+// (hwrt3) KYTY_HWRT_REFL_MATERIAL=1 (with KYTY_HWRT_REFL=1): the ray query pass whose off-screen hits take the captured
+// meshes' base colour (binding 24: the albedo array of local/hwrt-scene.cpp). Off: this pipeline is never made.
+bool EnsureHwMaterialPipeline(GraphicContext& graphics) {
+	if (g_rt.hwm_pipeline != nullptr) return true;
+	if (g_rt.hwm_failed) return false;
+	g_rt.hwm_failed   = true;
+	const auto device = graphics.device;
+	std::array<vk::DescriptorSetLayoutBinding, Bindings + 3> bindings {};
+	for (uint32_t i = 0; i < Bindings + 3; ++i) {
+		bindings[i].binding         = i;
+		bindings[i].descriptorType  = i == Bindings + 1                                       ? vk::DescriptorType::eAccelerationStructureKHR
+		                              : (i == 18 || i == 19 || i == Bindings)                 ? vk::DescriptorType::eStorageBuffer
+		                              : (i == 4 || i == 11 || i == 12 || i == 13)             ? vk::DescriptorType::eStorageImage
+		                                                                                      : vk::DescriptorType::eCombinedImageSampler;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+	}
+	vk::DescriptorSetLayoutCreateInfo set_info {};
+	set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	set_info.bindingCount = Bindings + 3;
+	set_info.pBindings    = bindings.data();
+	if (device.createDescriptorSetLayout(&set_info, nullptr, &g_rt.hwm_set_layout) != vk::Result::eSuccess) return false;
+	vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(RtPush)};
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount         = 1;
+	layout_info.pSetLayouts            = &g_rt.hwm_set_layout;
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges    = &push;
+	if (device.createPipelineLayout(&layout_info, nullptr, &g_rt.hwm_layout) != vk::Result::eSuccess) return false;
+	vk::ShaderModuleCreateInfo module_info {};
+	module_info.codeSize    = sizeof(RT_REFLECTIONS_HWM_SPV);
+	module_info.pCode       = RT_REFLECTIONS_HWM_SPV;
+	vk::ShaderModule module = nullptr;
+	if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+	vk::ComputePipelineCreateInfo pipeline_info {};
+	pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	pipeline_info.stage.module = module;
+	pipeline_info.stage.pName  = "main";
+	pipeline_info.layout       = g_rt.hwm_layout;
+	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_rt.hwm_pipeline);
+	device.destroyShaderModule(module, nullptr);
+	if (created != vk::Result::eSuccess) {
+		g_rt.hwm_pipeline = nullptr;
+		std::printf("RT reflections: the material ray query pipeline could not be made (KYTY_HWRT_REFL_MATERIAL): flat off-screen hits\n");
+		std::fflush(stdout);
+		return false;
+	}
+	g_rt.hwm_failed = false;
+	std::printf("RT reflections: off-screen hits take the captured meshes' base colour (KYTY_HWRT_REFL_MATERIAL=1)\n");
 	std::fflush(stdout);
 	return true;
 }
@@ -1346,8 +1407,18 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		            static_cast<unsigned long long>(g_rt.hw_frames), static_cast<unsigned long long>(g_rt.hw_frames + g_rt.sw_frames));
 		std::fflush(stdout);
 	}
-	const vk::PipelineLayout pass_layout = hw ? g_rt.hw_layout : g_rt.layout;
-	command.bindPipeline(vk::PipelineBindPoint::eCompute, hw ? g_rt.hw_pipeline : g_rt.pipeline);
+	// (hwrt3) the material variant while the albedo array exists (KYTY_HWRT_REFL_MATERIAL)
+	vk::ImageView albedo_view    = nullptr;
+	vk::Sampler   albedo_sampler = nullptr;
+	const bool    hwm = hw && HwScene::MaterialActive() && HwScene::MaterialAtlas(albedo_view, albedo_sampler) &&
+	                 EnsureHwMaterialPipeline(*graphics);
+	if (hwm && (++g_rt.hwm_frames % 600) == 1) {
+		std::printf("RT reflections: material off-screen hits in %llu of %llu frames (KYTY_HWRT_REFL_MATERIAL)\n",
+		            static_cast<unsigned long long>(g_rt.hwm_frames), static_cast<unsigned long long>(g_rt.hw_frames + g_rt.sw_frames));
+		std::fflush(stdout);
+	}
+	const vk::PipelineLayout pass_layout = hwm ? g_rt.hwm_layout : hw ? g_rt.hw_layout : g_rt.layout;
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, hwm ? g_rt.hwm_pipeline : hw ? g_rt.hw_pipeline : g_rt.pipeline);
 
 	auto&          g    = g_rt;
 	const uint32_t cur  = static_cast<uint32_t>(g.frame & 1u);
@@ -1387,7 +1458,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		const vk::DescriptorBufferInfo exposure_info = game_exposure
 		                                                   ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range}
 		                                                   : frame_info;
-		vk::WriteDescriptorSet writes[Bindings + 2] {};
+		vk::WriteDescriptorSet writes[Bindings + 3] {};
 		for (uint32_t i = 0; i < Bindings; ++i) {
 			writes[i].dstBinding      = i;
 			writes[i].descriptorCount = 1;
@@ -1415,7 +1486,15 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			writes[Bindings + 1].descriptorCount = 1;
 			writes[Bindings + 1].descriptorType  = vk::DescriptorType::eAccelerationStructureKHR;
 		}
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pass_layout, 0, hw ? Bindings + 2 : Bindings, writes);
+		// (hwrt3: binding 24, the albedo array)
+		const vk::DescriptorImageInfo albedo_info {albedo_sampler, albedo_view, vk::ImageLayout::eGeneral};
+		if (hwm) {
+			writes[Bindings + 2].dstBinding      = Bindings + 2;
+			writes[Bindings + 2].descriptorCount = 1;
+			writes[Bindings + 2].descriptorType  = vk::DescriptorType::eCombinedImageSampler;
+			writes[Bindings + 2].pImageInfo      = &albedo_info;
+		}
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pass_layout, 0, hwm ? Bindings + 3 : hw ? Bindings + 2 : Bindings, writes);
 		command.pushConstants(pass_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 		Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
