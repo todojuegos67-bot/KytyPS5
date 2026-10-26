@@ -439,14 +439,14 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	ReadTiming(*graphics);
 	++g_gi.frames_on;
 
-	static const float ao_radius   = EnvFloat("KYTY_HWRT_AO_RADIUS", 0.8f, 0.05f, 8.0f);
-	static const float ao_strength = EnvFloat("KYTY_HWRT_AO_STRENGTH", 0.75f, 0.0f, 1.0f);
-	static const float ao_floor    = EnvFloat("KYTY_HWRT_AO_FLOOR", 0.55f, 0.2f, 1.0f);
+	static const float ao_radius   = EnvFloat("KYTY_HWRT_AO_RADIUS", 1.5f, 0.05f, 8.0f);
+	static const float ao_strength = EnvFloat("KYTY_HWRT_AO_STRENGTH", 1.0f, 0.0f, 1.0f);
+	static const float ao_floor    = EnvFloat("KYTY_HWRT_AO_FLOOR", 0.35f, 0.2f, 1.0f);
 	static const float gi_int      = EnvFloat("KYTY_HWRT_GI_INTENSITY", 0.5f, 0.0f, 4.0f);
 	static const float gi_range    = EnvFloat("KYTY_HWRT_GI_RANGE", 8.0f, 0.5f, 100.0f);
 	static const float fade_start  = EnvFloat("KYTY_HWRT_GI_FADE", 120.0f, 5.0f, 5000.0f);
 	static const int   view        = std::clamp(static_cast<int>(EnvFloat("KYTY_HWRT_GI_VIEW", 0.0f, 0.0f, 2.0f)), 0, 2);
-	static const bool  flip_y      = EnvBool("KYTY_HWRT_GI_FLIPY", false);
+	static const bool  flip_y      = EnvBool("KYTY_HWRT_GI_FLIPY", true); // (hwrt5a) measured in DS: mirrored (92 % vs 51 %)
 	static const bool  use_normal  = EnvBool("KYTY_HWRT_GI_GBUF_NORMAL", true);
 	static const bool  use_albedo  = EnvBool("KYTY_HWRT_GI_GBUF_ALBEDO", true);
 	const int          level       = cfg.level;
@@ -490,7 +490,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	ubo.cfg2[0] = static_cast<int32_t>(g_gi.frame), ubo.cfg2[1] = view;
 	ubo.cfg2[2] = static_cast<int32_t>(g_gi.frame % StatSlots);
 	ReadStats(*graphics);
-	static const float fog_dist = EnvFloat("KYTY_HWRT_FOG_DIST", 35.0f, 0.0f, 10000.0f);
+	static const float fog_dist = EnvFloat("KYTY_HWRT_FOG_DIST", 60.0f, 0.0f, 10000.0f);
 	ubo.fog[0] = fog_dist;
 	static const bool raw = EnvBool("KYTY_HWRT_AO_RAW", false);
 	ubo.fog[1] = raw ? 1.0f : 0.0f;
