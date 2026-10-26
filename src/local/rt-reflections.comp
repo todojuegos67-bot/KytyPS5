@@ -868,8 +868,11 @@ bool HwMarch(vec3 P, vec3 N, vec3 R, vec3 V, out vec4 res, out float hdist) {
 	Rw = normalize(Rw);
 	Nw = length(Nw) > 1e-9 ? normalize(Nw) : -Rw;
 	vec3 o = Pw + Nw * (0.002 * dist + 0.01);
+	// (flick) cull mask 0x03: static + dynamic captured THIS frame. 0x04 (a dynamic mesh at an older frame's positions)
+	// toggles with 0x02 as captures come and go (~5 % of draws captured a frame), so a reflected character / door / debris
+	// card showed at a stale spot one frame and vanished the next: the reflections-only flicker. 0x08: ash / leaf cards.
 	rayQueryEXT rq;
-	rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT, 0xff, o, 0.01, Rw, max(push.params.z, 1.0));
+	rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT, 0x03, o, 0.01, Rw, max(push.params.z, 1.0));
 	while (rayQueryProceedEXT(rq)) {}
 	if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) return false;
 	float t  = rayQueryGetIntersectionTEXT(rq, true);
@@ -1040,7 +1043,9 @@ void Trace(ivec2 px, bool march) {
 		}
 		if (st) Stat(5, 1);
 		acc += hc;
-		hd_sum += hdist * hc.a, hd_w += hc.a;
+		// (flick) the virtual image follows the most confident ray, not an average of two hits at different depths
+		// (2 rays at Ultra: the averaged distance matched neither, the reprojected history failed the clamp: shimmer)
+		if (hc.a > hd_w) hd_sum = hdist * hc.a, hd_w = hc.a;
 		++hits;
 	}
 	if (hits == 0) { StoreMiss(px, s); return; }
@@ -1189,6 +1194,9 @@ void Temporal(ivec2 px) {
 	} else {
 		// (no history: rough surfaces start from the neighbourhood's mean, less noisy)
 		res = rough > 0.1 ? mix(cur, mean, 0.5) : cur;
+		// (flick) no one-frame full-strength sample after a reset / disocclusion: 40 % confidence, the history
+		// (alpha 1 / len) ramps it in over the next frames (premultiplied: colour and confidence scaled together)
+		res *= 0.4;
 		len = 1.0;
 		mo1 = lc, mo2 = lc * lc;
 	}
