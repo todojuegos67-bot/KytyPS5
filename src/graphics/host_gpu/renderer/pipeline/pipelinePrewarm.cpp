@@ -322,6 +322,8 @@ vk::ShaderModule LoadModule(Context& ctx, std::FILE* f, uint64_t hash, vk::Devic
 
 constexpr uint32_t PushSize = 128; // ShaderRecompiler::IR::NativePushConstantSize, carried in the record
 
+uint32_t FastCompileFlags(uint64_t words);
+
 vk::Pipeline BuildCompute(Context& ctx, std::FILE* f, const Pending& p) {
 	Reader         rd {p.desc};
 	const uint64_t spirv          = rd.U64();
@@ -346,7 +348,14 @@ vk::Pipeline BuildCompute(Context& ctx, std::FILE* f, const Pending& p) {
 		stage.pNext             = &sg;
 	}
 	vk::ComputePipelineCreateInfo info {};
-	info.flags             = static_cast<vk::PipelineCreateFlags>(create_flags);
+	// A record made before its SPIR-V size was known has no DISABLE_OPTIMIZATION; apply the same
+	// size rule here so a huge shader (Yotei: 448K words) is not optimized for minutes in the warm-up.
+	uint32_t module_words = 0;
+	{
+		std::lock_guard lock(ctx.mutex);
+		if (const auto it = ctx.spirv_words.find(spirv); it != ctx.spirv_words.end()) module_words = it->second;
+	}
+	info.flags             = static_cast<vk::PipelineCreateFlags>(create_flags | FastCompileFlags(module_words));
 	info.stage             = stage;
 	info.layout            = layout.layout;
 	info.basePipelineIndex = -1;
@@ -564,8 +573,16 @@ void Worker() {
 			}
 		}
 		vk::Pipeline pipeline = nullptr;
+		const auto   build_start = Clock::now();
+		const size_t desc_words  = rec->desc.size();
 		if (f != nullptr) {
 			pipeline = rec->kind == KindCompute ? BuildCompute(ctx, f, *rec) : BuildGraphics(ctx, f, *rec);
+		}
+		if (const auto ms = std::chrono::duration<double, std::milli>(Clock::now() - build_start).count(); ms >= 2000.0) {
+			std::printf("Prewarm: slow %s pipeline key=%016llx desc_words=%zu built in %.0f ms\n",
+			            rec->kind == KindCompute ? "compute" : "graphics", static_cast<unsigned long long>(rec->key),
+			            desc_words, ms);
+			std::fflush(stdout);
 		}
 		rec->desc.clear();
 		rec->desc.shrink_to_fit();
@@ -1109,9 +1126,31 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 		std::unique_lock lock(ctx.mutex);
 		const auto total      = ctx.queue.size();
 		const auto wait_start = Clock::now();
-		while (!ctx.cv.wait_for(lock, std::chrono::seconds(2),
+		// The warm-up never waits on a few stragglers: once at most 1% (min 8) of the pipelines are
+		// left and nothing finished for 3 s, the game starts and they finish in the background
+		// (Take() waits only if gameplay needs one of them before it is done).
+		// Yotei: one 448K-word compute pipeline kept the warm-up at 2344/2345 for minutes.
+		size_t last_done     = 0;
+		auto   last_progress = Clock::now();
+		const size_t straggler_limit = std::max<size_t>(8, total / 100);
+		while (!ctx.cv.wait_for(lock, std::chrono::seconds(1),
 		                        [&] { return ctx.built + ctx.failed >= ctx.queue.size(); })) {
 			const auto done = ctx.built + ctx.failed;
+			if (done != last_done) {
+				last_done     = done;
+				last_progress = Clock::now();
+			} else if (!only && total - done <= straggler_limit &&
+			           Clock::now() - last_progress >= std::chrono::seconds(3)) {
+				std::printf("Prewarm: warm-up leaves %zu slow pipelines to the background and starts the game\n",
+				            total - done);
+				for (const auto& [key, entry]: ctx.entries) {
+					if (entry.state == State::Building) {
+						std::printf("Prewarm:   still building key=%016llx\n", static_cast<unsigned long long>(key));
+					}
+				}
+				std::fflush(stdout);
+				break;
+			}
 			std::printf("Prewarm: warm-up %zu/%zu (%.0f%%), %.0f s\n", static_cast<size_t>(done), total,
 			            total != 0 ? 100.0 * static_cast<double>(done) / static_cast<double>(total) : 100.0,
 			            std::chrono::duration<double>(Clock::now() - wait_start).count());
