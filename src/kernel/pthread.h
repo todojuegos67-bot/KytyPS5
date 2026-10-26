@@ -91,6 +91,21 @@ int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex);
 
 Pthread KYTY_SYSV_ABI PthreadSelf();
 Pthread               PthreadSelfOrNull();
+
+// Diagnostics: a guest wait (cond/sema/event flag/equeue) by a traced thread (MovieDecoder, or
+// KYTY_TRACE_WAIT_THREAD=<name>) is recorded; a watchdog prints "Movie: wait ..." to stdout when
+// that thread stays blocked on the same object for more than 2 s, and each long wait on return.
+class GuestWaitTrace {
+public:
+	GuestWaitTrace(const char* kind, const void* object, const char* object_name = nullptr);
+	~GuestWaitTrace();
+	GuestWaitTrace(const GuestWaitTrace&)            = delete;
+	GuestWaitTrace& operator=(const GuestWaitTrace&) = delete;
+
+private:
+	bool     m_active = false;
+	uint64_t m_start  = 0;
+};
 Pthread               PthreadSwapSelfForSignal(Pthread thread);
 int KYTY_SYSV_ABI     PthreadCreate(Pthread* thread, const PthreadAttr* attr,
                                     pthread_entry_func_t entry, void* arg, const char* name);

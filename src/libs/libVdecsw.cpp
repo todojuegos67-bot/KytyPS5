@@ -227,7 +227,7 @@ static size_t FrameSize(const ConfigInfo& config) {
 	return pitch * height * 3 / 2 + 4096;
 }
 
-static int32_t KYTY_SYSV_ABI QueryComputeMemoryInfo(ComputeMemoryInfo* memory) {
+static int32_t KYTY_SYSV_ABI QueryComputeMemoryInfo_Impl(ComputeMemoryInfo* memory) {
 	PRINT_NAME();
 	if (memory == nullptr) return Fail(Error::ArgumentPointer);
 	if (memory->this_size != sizeof(ComputeMemoryInfo)) return Fail(Error::StructSize);
@@ -235,7 +235,13 @@ static int32_t KYTY_SYSV_ABI QueryComputeMemoryInfo(ComputeMemoryInfo* memory) {
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI AllocateComputeQueue(const ComputeConfigInfo* config,
+static int32_t KYTY_SYSV_ABI QueryComputeMemoryInfo(ComputeMemoryInfo* memory) {
+	const int32_t result = QueryComputeMemoryInfo_Impl(memory);
+	Decoder::Trace("Vdecsw.QueryComputeMemoryInfo", result, nullptr);
+	return result;
+}
+
+static int32_t KYTY_SYSV_ABI AllocateComputeQueue_Impl(const ComputeConfigInfo* config,
                                                   const ComputeMemoryInfo* memory,
                                                   ComputeQueue**           output) {
 	PRINT_NAME();
@@ -262,7 +268,15 @@ static int32_t KYTY_SYSV_ABI AllocateComputeQueue(const ComputeConfigInfo* confi
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(ComputeQueue* queue) {
+static int32_t KYTY_SYSV_ABI AllocateComputeQueue(const ComputeConfigInfo* config,
+                                                  const ComputeMemoryInfo* memory,
+                                                  ComputeQueue**           output) {
+	const int32_t result = AllocateComputeQueue_Impl(config, memory, output);
+	Decoder::Trace("Vdecsw.AllocateComputeQueue", result, nullptr);
+	return result;
+}
+
+static int32_t KYTY_SYSV_ABI ReleaseComputeQueue_Impl(ComputeQueue* queue) {
 	PRINT_NAME();
 	std::scoped_lock lock(g_registry_mutex);
 	if (!g_queues.contains(queue) || queue->decoders != 0) return Fail(Error::ComputeQueue);
@@ -271,7 +285,13 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(ComputeQueue* queue) {
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const ConfigInfo* config, MemoryInfo* memory) {
+static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(ComputeQueue* queue) {
+	const int32_t result = ReleaseComputeQueue_Impl(queue);
+	Decoder::Trace("Vdecsw.ReleaseComputeQueue", result, nullptr);
+	return result;
+}
+
+static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo_Impl(const ConfigInfo* config, MemoryInfo* memory) {
 	PRINT_NAME();
 	if (const auto error = ValidateConfig(config); error != 0) return error;
 	if (memory == nullptr) return Fail(Error::ArgumentPointer);
@@ -286,7 +306,13 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const ConfigInfo* config, Me
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI CreateDecoder(const ConfigInfo* config, const MemoryInfo* memory,
+static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const ConfigInfo* config, MemoryInfo* memory) {
+	const int32_t result = QueryDecoderMemoryInfo_Impl(config, memory);
+	Decoder::Trace("Vdecsw.QueryDecoderMemoryInfo", result, nullptr);
+	return result;
+}
+
+static int32_t KYTY_SYSV_ABI CreateDecoder_Impl(const ConfigInfo* config, const MemoryInfo* memory,
                                            State** output) {
 	PRINT_NAME();
 	if (const auto error = ValidateConfig(config); error != 0) {
@@ -320,7 +346,14 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const ConfigInfo* config, const Memor
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI DeleteDecoder(State* handle) {
+static int32_t KYTY_SYSV_ABI CreateDecoder(const ConfigInfo* config, const MemoryInfo* memory,
+                                           State** output) {
+	const int32_t result = CreateDecoder_Impl(config, memory, output);
+	Decoder::Trace("Vdecsw.CreateDecoder", result, nullptr);
+	return result;
+}
+
+static int32_t KYTY_SYSV_ABI DeleteDecoder_Impl(State* handle) {
 	PRINT_NAME();
 	std::scoped_lock lock(g_registry_mutex);
 	if (g_decoders.erase(handle) == 0) return Fail(Error::DecoderInstance);
@@ -328,7 +361,13 @@ static int32_t KYTY_SYSV_ABI DeleteDecoder(State* handle) {
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI SetDecodeInput(State* handle, const InputData* input) {
+static int32_t KYTY_SYSV_ABI DeleteDecoder(State* handle) {
+	const int32_t result = DeleteDecoder_Impl(handle);
+	Decoder::Trace("Vdecsw.DeleteDecoder", result, nullptr);
+	return result;
+}
+
+static int32_t KYTY_SYSV_ABI SetDecodeInput_Impl(State* handle, const InputData* input) {
 	PRINT_NAME();
 	const StateAccess state(handle);
 	if (!state) return Fail(Error::DecoderInstance);
@@ -353,7 +392,13 @@ static int32_t KYTY_SYSV_ABI SetDecodeInput(State* handle, const InputData* inpu
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI TrySyncDecodeInput(State* handle, InputResult* output) {
+static int32_t KYTY_SYSV_ABI SetDecodeInput(State* handle, const InputData* input) {
+	const int32_t result = SetDecodeInput_Impl(handle, input);
+	Decoder::Trace("Vdecsw.SetDecodeInput", result, nullptr);
+	return result;
+}
+
+static int32_t KYTY_SYSV_ABI TrySyncDecodeInput_Impl(State* handle, InputResult* output) {
 	PRINT_NAME();
 	const StateAccess state(handle);
 	if (!state) return Fail(Error::DecoderInstance);
@@ -367,7 +412,13 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeInput(State* handle, InputResult* outp
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI SetDecodeOutput(State* handle, FrameBuffer* buffer) {
+static int32_t KYTY_SYSV_ABI TrySyncDecodeInput(State* handle, InputResult* output) {
+	const int32_t result = TrySyncDecodeInput_Impl(handle, output);
+	Decoder::Trace("Vdecsw.TrySyncDecodeInput", result, nullptr);
+	return result;
+}
+
+static int32_t KYTY_SYSV_ABI SetDecodeOutput_Impl(State* handle, FrameBuffer* buffer) {
 	PRINT_NAME();
 	const StateAccess state(handle);
 	if (!state) return Fail(Error::DecoderInstance);
@@ -383,7 +434,13 @@ static int32_t KYTY_SYSV_ABI SetDecodeOutput(State* handle, FrameBuffer* buffer)
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(State* handle, OutputInfo* output) {
+static int32_t KYTY_SYSV_ABI SetDecodeOutput(State* handle, FrameBuffer* buffer) {
+	const int32_t result = SetDecodeOutput_Impl(handle, buffer);
+	Decoder::Trace("Vdecsw.SetDecodeOutput", result, nullptr);
+	return result;
+}
+
+static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput_Impl(State* handle, OutputInfo* output) {
 	PRINT_NAME();
 	const StateAccess state(handle);
 	if (!state) return Fail(Error::DecoderInstance);
@@ -416,7 +473,13 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(State* handle, OutputInfo* outp
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI FinalizeDecodeSequence(State* handle) {
+static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(State* handle, OutputInfo* output) {
+	const int32_t result = TrySyncDecodeOutput_Impl(handle, output);
+	Decoder::Trace("Vdecsw.TrySyncDecodeOutput", result, nullptr);
+	return result;
+}
+
+static int32_t KYTY_SYSV_ABI FinalizeDecodeSequence_Impl(State* handle) {
 	PRINT_NAME();
 	const StateAccess state(handle);
 	if (!state) return Fail(Error::DecoderInstance);
@@ -424,7 +487,13 @@ static int32_t KYTY_SYSV_ABI FinalizeDecodeSequence(State* handle) {
 	return Result(Decoder::Finalize(state->decoder));
 }
 
-static int32_t KYTY_SYSV_ABI ResetDecoder(State* handle) {
+static int32_t KYTY_SYSV_ABI FinalizeDecodeSequence(State* handle) {
+	const int32_t result = FinalizeDecodeSequence_Impl(handle);
+	Decoder::Trace("Vdecsw.FinalizeDecodeSequence", result, nullptr);
+	return result;
+}
+
+static int32_t KYTY_SYSV_ABI ResetDecoder_Impl(State* handle) {
 	PRINT_NAME();
 	const StateAccess state(handle);
 	if (!state) return Fail(Error::DecoderInstance);
@@ -435,7 +504,13 @@ static int32_t KYTY_SYSV_ABI ResetDecoder(State* handle) {
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI GetAvcPictureInfo(const OutputInfo*        output,
+static int32_t KYTY_SYSV_ABI ResetDecoder(State* handle) {
+	const int32_t result = ResetDecoder_Impl(handle);
+	Decoder::Trace("Vdecsw.ResetDecoder", result, nullptr);
+	return result;
+}
+
+static int32_t KYTY_SYSV_ABI GetAvcPictureInfo_Impl(const OutputInfo*        output,
                                                Decoder::AvcPictureInfo* first,
                                                Decoder::AvcPictureInfo* second) {
 	PRINT_NAME();
@@ -451,6 +526,14 @@ static int32_t KYTY_SYSV_ABI GetAvcPictureInfo(const OutputInfo*        output,
 	*first = Decoder::MakeAvcPictureInfo(decoded, sizeof(*first));
 	if (second != nullptr) *second = {.this_size = sizeof(*second)};
 	return 0;
+}
+
+static int32_t KYTY_SYSV_ABI GetAvcPictureInfo(const OutputInfo*        output,
+                                               Decoder::AvcPictureInfo* first,
+                                               Decoder::AvcPictureInfo* second) {
+	const int32_t result = GetAvcPictureInfo_Impl(output, first, second);
+	Decoder::Trace("Vdecsw.GetAvcPictureInfo", result, nullptr);
+	return result;
 }
 
 LIB_DEFINE(InitVdecsw_1) {

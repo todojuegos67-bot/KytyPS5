@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <cstdio>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -242,6 +243,13 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		}
 		if (log_missing) {
 			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, Common::PathToString(info.host_path).c_str());
+		}
+		// Movie diagnostics (stdout, visible with --printf-direction Silent).
+		if (path.find("movies") != std::string_view::npos || path.ends_with(".bsf")) {
+			std::printf("Movie: APR resolve %s -> result=0x%08x id=0x%08x size=%llu\n", guest_path,
+			            static_cast<uint32_t>(info.result), info.file_id,
+			            static_cast<unsigned long long>(info.file_size));
+			std::fflush(stdout);
 		}
 	}
 

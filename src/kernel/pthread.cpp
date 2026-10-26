@@ -24,6 +24,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <ctime>
 #include <memory>
 #include <mutex>
@@ -2858,6 +2861,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 		return KERNEL_ERROR_EPERM;
 	}
 
+	GuestWaitTrace   wait_trace("cond", cond_value, cond_value->name.c_str());
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -2947,6 +2951,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		return KERNEL_ERROR_EPERM;
 	}
 
+	GuestWaitTrace   wait_trace("cond", cond_value, cond_value->name.c_str());
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -3023,6 +3028,7 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return KERNEL_ERROR_EPERM;
 	}
 
+	GuestWaitTrace   wait_trace("cond", cond_value, cond_value->name.c_str());
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -3064,6 +3070,82 @@ Pthread KYTY_SYSV_ABI PthreadSelf() {
 	EXIT_NOT_IMPLEMENTED(g_pthread_self == nullptr);
 
 	return g_pthread_self;
+}
+
+namespace {
+struct TracedWait {
+	std::atomic<const char*> kind {nullptr};
+	std::atomic<const void*> object {nullptr};
+	std::atomic<uint64_t>    start {0};
+	char                     object_name[64] {};
+};
+TracedWait g_traced_wait;
+
+uint64_t TraceNowMs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+bool IsTracedThread() {
+	static const std::string target = [] {
+		const char* v = std::getenv("KYTY_TRACE_WAIT_THREAD");
+		return std::string(v != nullptr && v[0] != '\0' ? v : "MovieDecoder");
+	}();
+	const auto* self = PthreadSelfOrNull();
+	return self != nullptr && self->name == target;
+}
+
+void StartWaitWatchdog() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		std::thread([] {
+			const void* reported = nullptr;
+			uint64_t    reported_start = 0;
+			for (;;) {
+				std::this_thread::sleep_for(std::chrono::seconds(2));
+				const auto* kind   = g_traced_wait.kind.load();
+				const auto* object = g_traced_wait.object.load();
+				const auto  start  = g_traced_wait.start.load();
+				if (kind == nullptr || start == 0) continue;
+				const auto waited = TraceNowMs() - start;
+				if (waited < 2000 || (object == reported && start == reported_start && waited % 30000 > 2000))
+					continue;
+				reported       = object;
+				reported_start = start;
+				std::printf("Movie: wait %s obj=%p name=%s blocked for %llu ms\n", kind, object,
+				            g_traced_wait.object_name, static_cast<unsigned long long>(waited));
+				std::fflush(stdout);
+			}
+		}).detach();
+	});
+}
+} // namespace
+
+GuestWaitTrace::GuestWaitTrace(const char* kind, const void* object, const char* object_name) {
+	if (!IsTracedThread()) return;
+	StartWaitWatchdog();
+	m_active = true;
+	m_start  = TraceNowMs();
+	std::snprintf(g_traced_wait.object_name, sizeof(g_traced_wait.object_name), "%s",
+	              object_name != nullptr ? object_name : "");
+	g_traced_wait.object.store(object);
+	g_traced_wait.kind.store(kind);
+	g_traced_wait.start.store(m_start);
+}
+
+GuestWaitTrace::~GuestWaitTrace() {
+	if (!m_active) return;
+	const auto waited = TraceNowMs() - m_start;
+	const auto* kind  = g_traced_wait.kind.load();
+	const auto* obj   = g_traced_wait.object.load();
+	g_traced_wait.start.store(0);
+	static std::atomic<uint32_t> printed {0};
+	if (waited >= 100 && printed.fetch_add(1) < 400) {
+		std::printf("Movie: wait %s obj=%p name=%s returned after %llu ms\n", kind, obj,
+		            g_traced_wait.object_name, static_cast<unsigned long long>(waited));
+		std::fflush(stdout);
+	}
 }
 
 Pthread PthreadSelfOrNull() {

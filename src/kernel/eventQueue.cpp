@@ -1,3 +1,4 @@
+#include "kernel/pthread.h"
 #include "kernel/eventQueue.h"
 
 #include "common/assert.h"
@@ -397,6 +398,7 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
 	PRINT_NAME();
+	GuestWaitTrace wait_trace("equeue", reinterpret_cast<const void*>(static_cast<uintptr_t>(eq)));
 
 	auto owner = KernelPinEqueue(eq);
 	if (!owner) {
