@@ -472,11 +472,20 @@ double PadLateCurLocked() {
 	if (!PadLateAuto() || g_pl_cur <= 0.0) return PadLateMs();
 	return g_pl_cur;
 }
-void PadLateAdaptLocked(double lead, bool caused_miss) {
+uint32_t g_pl_skip     = 0; // reads left without the wait after a miss it caused (instant back-off)
+// `lead` < 0: no sample (a frame late for another reason: the guest's own hitch, which no L could have saved).
+void PadLateAdaptLocked(double lead, bool caused_miss, double cap) {
 	if (!PadLateAuto()) return;
-	if (lead > 0.0 && lead < 100.0) g_pl_lead[g_pl_lead_n++ % 64] = lead;
-	if (caused_miss) g_pl_margin = std::min(g_pl_margin + 2.0, 12.0);
-	else g_pl_margin = std::max(g_pl_margin - 0.02, 4.0);
+	// Only leads an L under the cap could cover (a guest hitch longer than the cap missed its slot whatever L was:
+	// counting it kept the p95 and L ~25 ms too high, and the frame's queue wait with them).
+	const bool sample = lead > 0.0 && lead < 100.0 && (cap <= 0.0 || lead < cap - 2.0);
+	if (sample) g_pl_lead[g_pl_lead_n++ % 64] = lead;
+	if (caused_miss) {
+		g_pl_margin = std::min(g_pl_margin + 2.0, 8.0);
+		g_pl_skip   = 8; // the next 8 reads at once (as the pacer's own miss rule)
+	} else {
+		g_pl_margin = std::max(g_pl_margin - 0.05, 4.0);
+	}
 	const uint32_t n = std::min<uint32_t>(g_pl_lead_n, 64);
 	if (n < 16) return; // (the ceiling until 16 frames were seen)
 	double v[64];
@@ -484,10 +493,10 @@ void PadLateAdaptLocked(double lead, bool caused_miss) {
 	const uint32_t k = std::min<uint32_t>(n - 1, static_cast<uint32_t>(n * 0.95));
 	std::nth_element(v, v + k, v + n);
 	double target = std::clamp(v[k] + g_pl_margin, PadLateMinMs(), PadLateMs());
-	if (lead + g_pl_margin > target) target = std::min(lead + g_pl_margin, PadLateMs()); // up at once
+	if (caused_miss && sample && lead + g_pl_margin > target) target = std::min(lead + g_pl_margin, PadLateMs()); // up at once
 	if (g_pl_cur <= 0.0) g_pl_cur = PadLateMs();
-	// Up at once, down 0.25 ms a frame (no sudden phase jump of the game's step).
-	g_pl_cur = target >= g_pl_cur ? target : std::max(target, g_pl_cur - 0.25);
+	// Up at once (a miss the wait caused), down 0.5 ms a frame (no sudden phase jump of the game's step).
+	g_pl_cur = target >= g_pl_cur ? target : std::max(target, g_pl_cur - 0.5);
 }
 
 // The read of frame `index` waits until L ms before its slot: the last release + cap for each frame since. Returns the
@@ -511,6 +520,11 @@ int64_t PadLateStep(uint64_t index, double& slept_ms) {
 	g_pl_cur_sum += lead_ms;
 	g_pl_cur_n++;
 	const int64_t until = slot - static_cast<int64_t>(lead_ms * per_ms);
+	if (g_pl_skip > 0) { // (back-off after a miss the wait caused: read at once)
+		g_pl_skip--;
+		g_padlate.already_late++;
+		return slot;
+	}
 	if (until <= now) {
 		g_padlate.already_late++;
 		return slot;
@@ -551,13 +565,19 @@ void PadLateRelease(StageStamp& st, int64_t now, double dt_ms) {
 		if (late > vb * 0.5 + 0.5) {
 			p.misses++;
 			p.late_sum += late;
-			if (late <= st.slept.load(std::memory_order_relaxed) + vb) {
+			// Caused by the wait only when the frame would have made its slot without it (late by no more than it slept,
+			// within half a vblank). (late <= slept + vb counted most guest hitches a whole cap late as the wait's: the
+			// margin climbed to its max and L to ~38 ms, a 32 ms queue wait at 30x2.)
+			if (late - st.slept.load(std::memory_order_relaxed) <= vb * 0.5) {
 				p.caused++;
 				caused = true;
 			}
 		}
 	}
-	if (slot != 0) PadLateAdaptLocked(lead, caused);
+	if (slot != 0) {
+		const bool late_other = !caused && static_cast<double>(now - slot) / per_ms > vb * 0.5 + 0.5;
+		PadLateAdaptLocked(late_other ? -1.0 : lead, caused, g_pace.cap_ms);
+	}
 	if (static_cast<double>(now - p.start) / per_ms >= 5000.0) {
 		std::printf("[padlate] 5 s: L %.1f ms (auto %.1f, margin %.1f), cap %.1f: %u reads (%u slept, mean %.1f ms; %u already past L; %u not under a "
 		            "30-ish limit); %u releases, %u stutters; %u paced frames missed their slot (mean %.1f ms late), %u of "
