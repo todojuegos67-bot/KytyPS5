@@ -1023,8 +1023,13 @@ bool MtShadeHit(vec3 o, vec3 Rw, float t, int inst, int prim, vec2 bc, float tma
 				if (y == 0) sky += cc;
 			}
 		amb /= 16.0, sky *= 0.25;
-		vec3 light = amb * (1.0 / 0.35) * (0.3 + 0.5 * up) + sky * (0.6 * up * up);
-		c    = Tonemap(SafeColor(albedo * light));
+		// (hwrtm2: no overhead "sky" term: the frame's top row is the bright door / fog / sky even indoors, and gave the
+		// armour an icy white glow in dark halls; the frame's mean light only, a hit never brighter than twice it)
+		vec3 light = amb * (1.0 / 0.35) * (0.4 + 0.4 * up);
+		vec3 lit   = SafeColor(albedo * light);
+		float lm   = Luma(lit), lc = 2.0 * Luma(amb) + 1e-4;
+		if (lm > lc) lit *= lc / lm;
+		c    = Tonemap(lit);
 		conf = 0.8 * far_fade;
 	} else {
 		c    = Tonemap(HwAmbient() * (0.35 + 0.65 * up));
@@ -2084,13 +2089,19 @@ void MtComposite(ivec2 px) {
 	for (int y = 0; y < 4; ++y)
 		for (int x = 0; x < 4; ++x) amb += SafeColor(textureLod(color_tex, (vec2(x, y) + 0.5) / 4.0, 0).rgb);
 	amb /= 16.0;
+	// (hwrtm2, the icy armour in the 19:56 video: the bright door / fog opening reflected at full strength in dark halls)
+	// what is reflected counts up to 3x the frame's mean luminance (rough metal averages its lobe anyway)
+	{
+		float lr = Luma(refl), la = 3.0 * Luma(amb) + 1e-4;
+		if (lr > la) refl *= la / lr;
+	}
 	vec3  delta = spec * (refl - amb);
 	float lb    = Luma(base.rgb);
 	float warm  = smoothstep(0.0, 3.0, len); // (a fresh disocclusion: the game's pixel first)
 	float w     = clamp(mw * conf * push.params.x * warm, 0.0, 1.0);
 	vec3  outc  = max(base.rgb + w * delta, vec3(0));
 	float lout = Luma(outc);
-	if (lout > 1.75 * lb + 1e-5) outc *= (1.75 * lb + 1e-5) / lout; // (no glowing armour: at most 1.75x the game's pixel)
+	if (lout > 1.3 * lb + 1e-5) outc *= (1.3 * lb + 1e-5) / lout; // (no glowing armour: at most 1.3x the game's pixel)
 	bool dark = lout < 0.7 * lb; // (the stats: this pixel would have darkened by > 30 %)
 	if (lout < 0.85 * lb) outc *= 0.85 * lb / max(lout, 1e-6); // (never more than 15 % darker than the game's shading)
 	if (BadV(outc)) outc = base.rgb;
