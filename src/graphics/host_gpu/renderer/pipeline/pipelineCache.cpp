@@ -1009,6 +1009,17 @@ void PipelineCache::MergeAsyncJobCaches() {
 }
 
 
+// KYTY_ASYNC_COMPUTE_SKIP=1 skips a dispatch whose pipeline is still compiling (the old
+// behavior). Default 0: compute is never skipped. Ghost of Yotei's compute passes produce vertex,
+// index and matrix data; skipping them left garbage buffers and exploded geometry (spikes).
+static bool ComputeSkipAllowed() {
+	static const bool allowed = [] {
+		const char* v = std::getenv("KYTY_ASYNC_COMPUTE_SKIP");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	return allowed;
+}
+
 static uint64_t AsyncComputeWords() {
 	static const uint64_t words = [] {
 		const char* v = std::getenv("KYTY_ASYNC_COMPUTE_WORDS");
@@ -1468,10 +1479,26 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 			return iter->second.get();
 		}
 		if (is_pending) {
-			return nullptr;
+			if (ComputeSkipAllowed()) {
+				return nullptr;
+			}
+			// Never skip: wait for the background compile (see ComputeSkipAllowed).
+			for (;;) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				std::lock_guard lock(async.mutex);
+				if (auto it = async.done.find(compute_program.id); it != async.done.end()) {
+					ready = std::move(it->second);
+					async.done.erase(it);
+					break;
+				}
+			}
+			auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(ready));
+			EXIT_IF(!inserted);
+			CheckpointDriverCache();
+			return iter->second.get();
 		}
 	}
-	if (threshold == 0 || compute_program.spirv_words <= threshold) {
+	if (threshold == 0 || compute_program.spirv_words <= threshold || !ComputeSkipAllowed()) {
 		return &GetComputePipeline(input_info, compute_program);
 	}
 
