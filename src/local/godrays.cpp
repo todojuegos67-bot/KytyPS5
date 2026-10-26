@@ -151,6 +151,11 @@ struct {
 	bool                    failed = false;
 	bool                    hw = false; // (KYTY_HWRT_VOLUMETRIC: the ray query pipeline, binding 10 the TLAS, 192-byte push)
 	uint32_t                hw_traced = 0, hw_stale = 0, hw_none = 0;
+	// (hwrt3v-2) the last good view -> world rows (held over frames without a camera: never the depth march once traced),
+	// the 10 s transition counts: path switches, held frames, sun on / off (hysteresis 0.35 / 0.65), history resets.
+	std::array<float, 12>   hw_w {};
+	bool                    hw_have_w = false, hw_last_path = false, sun_on = false;
+	uint32_t                hw_held = 0, path_switches = 0, sun_ons = 0, sun_offs = 0, resets = 0;
 	Img                     out;
 	std::array<Img, 2>      vol;
 	Img                     raw, filt; // (quarter: this frame's raw volume, the filtered one)
@@ -417,8 +422,13 @@ void Log(int level, bool have_sun) {
 		std::printf("HWRTVOL: 10 s: %u frames traced with this frame's TLAS, %u with an older one, %u without (depth march; level %d, "
 		            "volume %ux%u; the GPU above is the whole god-ray pass)\n",
 		            g_gr.hw_traced, g_gr.hw_stale, g_gr.hw_none, HwVolLevel(), g_gr.qextent.width, g_gr.qextent.height);
+		std::printf("HWRTVOL: 10 s transitions: path %s, %u switches TLAS<->depth, %u frames on held camera rows; sun %u on / %u off "
+		            "(weight %.2f); halos %u on / %u off; history resets %u\n",
+		            g_gr.hw_last_path ? "TLAS" : "depth", g_gr.path_switches, g_gr.hw_held, g_gr.sun_ons, g_gr.sun_offs,
+		            static_cast<double>(g_gr.sun_held), d[3], d[4], g_gr.resets);
 		std::fflush(stdout);
 		g_gr.hw_traced = g_gr.hw_stale = g_gr.hw_none = 0;
+		g_gr.path_switches = g_gr.hw_held = g_gr.sun_ons = g_gr.sun_offs = g_gr.resets = 0;
 	}
 }
 
@@ -489,7 +499,13 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	                     : std::clamp(std::chrono::duration<float>(now - g_gr.last_frame).count(), 0.0f, 0.1f);
 	// (10-25: a sun gone stale (no fresh one in 250 ms) fades out over ~0.8 s from the last one given instead of popping off,
 	// and a returning one fades back in over ~0.4 s: short gaps in the RT sun's feed no longer flicker the rays.)
-	g_gr.sun_held = std::clamp(g_gr.sun_held + std::clamp(sun_target - g_gr.sun_held, -dt / 0.8f, dt / 0.4f), 0.0f, 1.0f);
+	// (hwrt3v-2, KYTY_HWRT_VOLUMETRIC: 2.5 s out, 1.2 s in: an indoor sun feed that comes and goes no longer pulses the haze)
+	const float sun_out = g_gr.hw ? 2.5f : 0.8f, sun_in = g_gr.hw ? 1.2f : 0.4f;
+	g_gr.sun_held = std::clamp(g_gr.sun_held + std::clamp(sun_target - g_gr.sun_held, -dt / sun_out, dt / sun_in), 0.0f, 1.0f);
+	if (g_gr.hw) {
+		if (!g_gr.sun_on && g_gr.sun_held > 0.65f) g_gr.sun_on = true, ++g_gr.sun_ons;
+		if (g_gr.sun_on && g_gr.sun_held < 0.35f) g_gr.sun_on = false, ++g_gr.sun_offs;
+	}
 	const std::array<float, 3> sun   = g_gr.sun_dir;
 	const float                sun_w = g_gr.sun_held;
 	const bool have_sun = sun_w > 0.0f;
@@ -546,6 +562,7 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.sun_uv[0] = su, push.sun_uv[1] = sv, push.sun_uv[2] = have_sun ? g_gr.on_screen : 0.0f, push.sun_uv[3] = static_cast<float>(taps);
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
 	push.motion[2] = (g_gr.history_valid && !inputs.reset && inputs.motion.view != nullptr) ? 1.0f : 0.0f;
+	if (g_gr.hw && push.motion[2] == 0.0f) ++g_gr.resets;
 	push.motion[3] = static_cast<float>(steps);
 	const bool game_exposure = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
 	push.misc[1] = static_cast<int32_t>(g_gr.frame & 0x7fffffff);
@@ -569,12 +586,20 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			g_gr.history_valid = false;
 			return false;
 		}
-		if (ViewToWorld(m, vp, hpush.w)) {
-			hpush.hw[0] = 1.0f;
+		// (hwrt3v-2: a frame without the camera keeps the last good rows instead of falling back to the depth march: the
+		// two methods never alternate frame to frame once traced)
+		std::array<float, 12> rows {};
+		if (ViewToWorld(m, vp, rows.data())) {
+			g_gr.hw_w = rows, g_gr.hw_have_w = true;
 			++(built ? g_gr.hw_traced : g_gr.hw_stale);
+		} else if (g_gr.hw_have_w) {
+			++g_gr.hw_held;
 		} else {
 			++g_gr.hw_none;
 		}
+		const bool traced = g_gr.hw_have_w;
+		if (traced) std::memcpy(hpush.w, g_gr.hw_w.data(), sizeof(hpush.w)), hpush.hw[0] = 1.0f;
+		if (traced != g_gr.hw_last_path) ++g_gr.path_switches, g_gr.hw_last_path = traced;
 		hpush.hw[1] = EnvFloat("KYTY_HWRT_VOLUMETRIC_RANGE", 250.0f, 10.0f, 2000.0f);
 		hpush.hw[2] = EnvFloat("KYTY_HWRT_VOLUMETRIC_DIST", hwl >= 3 ? 80.0f : 60.0f, 10.0f, 300.0f);
 		hpush.hw[3] = static_cast<float>(hwl);
