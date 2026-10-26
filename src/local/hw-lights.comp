@@ -188,7 +188,7 @@ void Temporal(ivec2 pixel) {
 		}
 	}
 	float n_new = min(n_hist + 1.0, 32.0);
-	float a     = max(1.0 / n_new, 0.1);
+	float a     = max(1.0 / n_new, 0.06); // (hwrt3l 10-26: a longer history, the 1-ray pick's noise steadier)
 	imageStore(out_img, pixel, vec4(mix(h, cur.r, a), n_new, cur.g, 1.0));
 }
 
@@ -234,7 +234,7 @@ void Composite(ivec2 pixel) {
 			float dz  = abs(textureLod(gbuf_cur, suv, 0).w - z);
 			if (dz < best) best = dz, v = textureLod(src_tex, suv, 0);
 		}
-		float stable = smoothstep(1.5, 6.0, v.g); // (the history count: a reset frame darkens nothing)
+		float stable = smoothstep(1.5, 8.0, v.g); // (the history count: a reset frame darkens nothing)
 		float share  = v.b / (v.b + lb.p0.z);
 		if (best < 0.05 * z + 0.1) dark = min(lb.p0.y * share * stable * clamp(v.r, 0.0, 1.0), lb.p0.w);
 		if (isnan(dark)) dark = 0.0;

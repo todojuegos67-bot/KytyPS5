@@ -19,6 +19,7 @@
 //  All the GPU work is recorded right after the game's TAA dispatch (graphics queue).
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <span>
@@ -97,6 +98,9 @@ void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageVie
 // (KYTY_HWRT_SHADOW, frame-gen.cpp) The scene TLAS for a ray query pass recorded after this frame's build, in order with it
 // (null until one exists); built_now: it was built this frame (else it holds an older frame's scene).
 [[nodiscard]] vk::AccelerationStructureKHR SceneTlas(bool* built_now);
+// (KYTY_HWRT_LIGHTS, hw-lights.cpp) The G-buffer camera's view-projection of the last captured frame (the TLAS's world;
+// row-major, clip = M * world); false until one was seen.
+bool SceneCamera(std::array<float, 16>& vp);
 
 } // namespace HwScene
 } // namespace Libs::Graphics
