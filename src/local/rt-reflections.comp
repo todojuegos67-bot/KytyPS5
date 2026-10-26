@@ -1717,6 +1717,9 @@ void Survey(ivec2 gp) {
 // field + 1, dec.w flags (1 history valid, 2 skip the pixel's own instance, 4 a TLAS this frame).
 // Modes: 9 trace, 10 temporal, 11 a-trous, 12 composite.
 float step_(float m) { return m > 0.02 ? 1.0 : 0.0; }
+// (hwrt2s 16e19ef1 instance masks: 0x01 static, 0x02 dynamic captured this frame, 0x04 dynamic stale (old positions:
+// ghost hits), 0x08 tiny cards (ash, leaves, debris); the metal rays see only the first two)
+const uint MT_MASK = 0x03u;
 const int MT_HIST = 1400; // (hwrt4: past the survey; rt-reflections.cpp MetalHist)
 bool  MtHist() { return (push.dec.w & 1) != 0; }
 bool  MtSelfSkip() { return (push.dec.w & 2) != 0; }
@@ -1817,7 +1820,7 @@ void MtTrace(ivec2 px) {
 			float wd    = length(Pw - hw.cam.xyz);
 			if (MtSelfSkip() && wd > 0.1) {
 				rayQueryEXT pq;
-				rayQueryInitializeEXT(pq, hw_tlas, gl_RayFlagsOpaqueEXT, 0xff, hw.cam.xyz, 0.05, (Pw - hw.cam.xyz) / wd, wd * 1.1 + 0.5);
+				rayQueryInitializeEXT(pq, hw_tlas, gl_RayFlagsOpaqueEXT, MT_MASK, hw.cam.xyz, 0.05, (Pw - hw.cam.xyz) / wd, wd * 1.1 + 0.5);
 				while (rayQueryProceedEXT(pq)) {}
 				if (rayQueryGetIntersectionTypeEXT(pq, true) == gl_RayQueryCommittedIntersectionTriangleEXT &&
 				    abs(rayQueryGetIntersectionTEXT(pq, true) - wd) < 0.03 * wd + 0.15)
@@ -1840,7 +1843,7 @@ void MtTrace(ivec2 px) {
 			vec2  bc    = vec2(0);
 			if (self_ >= 0) {
 				rayQueryEXT sq;
-				rayQueryInitializeEXT(sq, hw_tlas, gl_RayFlagsNoOpaqueEXT, 0xff, o, t_self, Rw, max(min(self_range, tmax), t_self + 1e-3));
+				rayQueryInitializeEXT(sq, hw_tlas, gl_RayFlagsNoOpaqueEXT, MT_MASK, o, t_self, Rw, max(min(self_range, tmax), t_self + 1e-3));
 				while (rayQueryProceedEXT(sq)) {
 					if (rayQueryGetIntersectionTypeEXT(sq, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
 					    rayQueryGetIntersectionInstanceIdEXT(sq, false) != self_)
@@ -1855,7 +1858,7 @@ void MtTrace(ivec2 px) {
 			}
 			if (t_hit < 0.0 && (self_ < 0 || self_range < tmax)) {
 				rayQueryEXT rq;
-				rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT, 0xff, o, self_ >= 0 ? max(self_range, t_self) : t_self, Rw, tmax);
+				rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT, MT_MASK, o, self_ >= 0 ? max(self_range, t_self) : t_self, Rw, tmax);
 				while (rayQueryProceedEXT(rq)) {}
 				if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
 					t_hit = rayQueryGetIntersectionTEXT(rq, true);
