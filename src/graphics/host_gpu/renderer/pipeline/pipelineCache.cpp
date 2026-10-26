@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -363,8 +364,14 @@ struct PipelineCache::ProgramCache {
 			    .owns_module    = false,
 			};
 		}
+		const auto module_begin = std::chrono::steady_clock::now();
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
+		if (const auto module_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - module_begin).count();
+		    module_ms >= 50.0) {
+			std::printf("ShaderSlow: module %s hash=0x%016" PRIx64 " words=%zu vkCreateShaderModule=%.1f ms\n",
+			            stage_name, options.shader_hash, result.spirv.size(), module_ms);
+		}
 		Prewarm::NoteSpirv(module, result.spirv);
 		const ShaderProgram handle {.id = ++next_shader_id, .module = module,
 		                            .spirv_words = static_cast<uint64_t>(result.spirv.size())};
@@ -490,6 +497,7 @@ struct PipelineCache::ProgramCache {
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		ShaderRecompiler::ShaderSource source;
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		const auto prepared_at = std::chrono::steady_clock::now();
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
 		ShaderRecompiler::TranslateResult translated;
 		if (unsupported_keys.contains(lookup_key)) {
@@ -532,12 +540,24 @@ struct PipelineCache::ProgramCache {
 				return SkipUnsupported(params.hash, input_info);
 			}
 		}
+		const auto translated_at = std::chrono::steady_clock::now();
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
 		const auto& permutation = entry->second.permutations.back();
 		Prewarm::NoteTranslation(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 		    std::chrono::steady_clock::now() - translate_start).count()));
+		{
+			const auto done_at = std::chrono::steady_clock::now();
+			const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+			if (ms(translate_start, done_at) >= 50.0) {
+				std::printf("ShaderSlow: shader %s hash=0x%016" PRIx64 " total=%.1f ms: prepare=%.1f translate=%.1f "
+				            "compile=%.1f (Thread_Gpu=%d)\n",
+				            stage_name, params.hash, ms(translate_start, done_at), ms(translate_start, prepared_at),
+				            ms(prepared_at, translated_at), ms(translated_at, done_at), GuestGpu::IsGpuThread() ? 1 : 0);
+				std::fflush(stdout);
+			}
+		}
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 

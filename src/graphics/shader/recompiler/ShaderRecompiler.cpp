@@ -20,6 +20,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <string>
 #include <fmt/format.h>
 #include <functional>
 #include <map>
@@ -695,7 +698,34 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	return TranslateProgram(source.decoded, options);
 }
 
+namespace {
+// Slow-translation report: every translation or SPIR-V emit over 50 ms prints its phase split to
+// stdout (also with printf Silent), so a log shows which pass makes Thread_Gpu stall on a shader.
+struct PhaseClock {
+	std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+	std::chrono::steady_clock::time_point last  = begin;
+	std::string                           text;
+	void Mark(const char* name) {
+		const auto now = std::chrono::steady_clock::now();
+		char       buf[64];
+		std::snprintf(buf, sizeof(buf), " %s=%.1f", name,
+		              std::chrono::duration<double, std::milli>(now - last).count());
+		text += buf;
+		last = now;
+	}
+	void Report(const char* what, ShaderType stage, uint64_t hash, size_t size) const {
+		const double total = std::chrono::duration<double, std::milli>(last - begin).count();
+		if (total >= 50.0) {
+			std::printf("ShaderSlow: %s %s hash=0x%016" PRIx64 " size=%zu total=%.1f ms:%s\n", what,
+			            StageName(stage), hash, size, total, text.c_str());
+			std::fflush(stdout);
+		}
+	}
+};
+} // namespace
+
 TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options) {
+	PhaseClock clock;
 	EXIT_IF(decoded.instructions.empty());
 	if (decoded.has_swap_pc) {
 		for (const auto& inst: decoded.instructions) {
@@ -728,6 +758,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
 	     StageName(options.stage), options.shader_hash);
 	auto native_cfg = CFG::BuildGraph(decoded);
+	clock.Mark("cfg");
 	CFG::Graph structured_cfg;
 	auto* selected_cfg = &native_cfg;
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
@@ -742,6 +773,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 		structured_cfg = CFG::Structurize(native_cfg);
+		clock.Mark("structurize");
 		if (structured_cfg.unsupported) {
 			native_cfg.unsupported = true;
 			native_cfg.failure_kind = structured_cfg.failure_kind;
@@ -783,25 +815,31 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+	clock.Mark("fetch");
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	clock.Mark("frontend");
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	IR::RewriteToSsa(ir.blocks);
+	clock.Mark("ssa");
 	const auto simplify = [&ir] {
 		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 		IR::RemoveIdentities(ir);
 		IR::EliminateDeadCode(ir.blocks);
 	};
 	simplify();
+	clock.Mark("simplify1");
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
+	clock.Mark("readlane");
 	if (read_lane_stats.rewritten_reads != 0 || read_lane_stats.rewritten_reductions != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 " reductions=%" PRIu32 "\n",
 		     GetDumpLabel(options), read_lane_stats.rewritten_reads, read_lane_stats.rewritten_reductions);
 	}
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
 	simplify();
+	clock.Mark("simplify2");
 	if (decoded.has_swap_pc) {
 		// Leaf returns are resolved CFG edges; native PC values must not escape into GPU data.
 		for (const auto* block: ir.blocks)
@@ -809,6 +847,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase);
 	}
 	LowerTessellationMemory(ir, options);
+	clock.Mark("tess");
 	std::string cfg_dump;
 	if (options.dump_ir) {
 		cfg_dump = CFG::GraphToString(cfg);
@@ -818,6 +857,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		}
 	}
 	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
+	clock.Mark("resources");
+	clock.Report("translate", options.stage, options.shader_hash, decoded.instructions.size());
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {
@@ -831,8 +872,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
 	const auto emit_begin = std::chrono::steady_clock::now();
+	PhaseClock clock;
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
+	clock.Mark("specialize");
 	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
 	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
 	for (auto& inst: ir.value_storage) {
@@ -874,7 +917,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
 
+	clock.Mark("dce");
 	IR::CollectShaderInfo(ir, options.input_info);
+	clock.Mark("info");
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);
@@ -887,6 +932,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword,
 	                                options.maintenance8_enabled, options.emit_debug_info);
+	clock.Mark("spirv");
+	clock.Report("emit", ir.stage, ir.shader_hash, spirv.size());
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,
