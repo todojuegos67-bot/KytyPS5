@@ -1,3 +1,4 @@
+#include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 
 #include "common/assert.h"
@@ -290,6 +291,7 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
+	GuestWaitTrace wait_trace("sema", sem);
 
 	auto result = sem->Wait(need, time);
 

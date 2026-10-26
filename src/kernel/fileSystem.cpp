@@ -543,6 +543,11 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tOpen: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
 		}
+		if (const auto name = Common::PathToString(file->real_name);
+		    name.find("movies") != std::string::npos || name.ends_with(".bsf")) {
+			std::printf("Movie: open %s %s\n", name.c_str(), result ? "ok" : "FAILED");
+			std::fflush(stdout);
+		}
 
 		if (result && trunc) {
 			result = file->f.Truncate(0);

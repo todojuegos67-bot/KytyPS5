@@ -1,3 +1,4 @@
+#include "kernel/pthread.h"
 #include "kernel/eventFlag.h"
 
 #include "common/assert.h"
@@ -297,6 +298,7 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 	}
 
 	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
+	GuestWaitTrace wait_trace("event_flag", ef);
 	auto       result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
 
 	int ret = OK;
