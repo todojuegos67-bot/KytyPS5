@@ -55,7 +55,8 @@ public:
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
-	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
+	// Returns a per-thread vector, valid until this thread's next GetBarriers call.
+	[[nodiscard]] const Barriers& GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
 	                                   std::optional<ImageSubresourceRange> range);

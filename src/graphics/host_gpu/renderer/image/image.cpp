@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/addressBindingReport.h"
@@ -119,7 +120,7 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
-Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
+const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
@@ -135,7 +136,40 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
 	const bool has_subresource_states = !subresource_states.empty();
 
-	Barriers barriers;
+	// Reused per thread (each caller records the barriers before its next transition): a vector
+	// per transition was one of the translating thread's most frequent allocations (ported from
+	// the Demon's Souls fork, image.cpp).
+	thread_local Barriers barriers;
+	barriers.clear();
+	constexpr auto any_write = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
+	                           vk::AccessFlagBits2::eMemoryWrite;
+	// A read-only transition of part of an image (a sampled view's levels or layers: streamed
+	// textures sampled from a base level above 0) whose whole-image state, and every subresource
+	// of the part, is already in that layout and access changes nothing. Before, it split a
+	// uniform image into per-subresource states for good, which every later transition of the
+	// image walked level by level and layer by layer (Demon's Souls fork, KYTY_IMAGE_BARRIER_DEDUPE
+	// family). KYTY_IMAGE_PARTIAL_FAST (live, default 1; 0 for an A/B).
+	static auto& partial_fast = Common::LiveSwitches::Get("KYTY_IMAGE_PARTIAL_FAST", 1);
+	if (partial && !static_cast<bool>(destination_access & any_write) &&
+	    state.layout == destination_layout && state.access_mask == destination_access &&
+	    partial_fast.load(std::memory_order_relaxed) != 0) {
+		bool all = true;
+		for (uint32_t level = range->base_level;
+		     all && has_subresource_states && level < range->base_level + range->level_count; ++level) {
+			for (uint32_t layer = range->base_layer; layer < range->base_layer + range->layer_count; ++layer) {
+				const auto index = level * info.resources.layers + layer;
+				if (index >= subresource_states.size() ||
+				    subresource_states[index].layout != destination_layout ||
+				    subresource_states[index].access_mask != destination_access) {
+					all = false;
+					break;
+				}
+			}
+		}
+		if (all) {
+			return barriers;
+		}
+	}
 	if (partial || has_subresource_states) {
 		if (!has_subresource_states) {
 			subresource_states.resize(info.resources.levels * info.resources.layers, state);
@@ -189,7 +223,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
 		    !repeated_write) {
-			return {};
+			return barriers;
 		}
 
 		vk::ImageMemoryBarrier2 barrier {};
@@ -236,7 +270,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		destination_stage |=
 		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 	}
-	const auto barriers =
+	const auto& barriers =
 	    GetBarriers(destination_layout, destination_access, destination_stage, range);
 	if (barriers.empty()) {
 		return;
@@ -262,7 +296,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	buffer_barrier.buffer              = buffer;
 	buffer_barrier.offset              = offset;
 	buffer_barrier.size                = size;
-	const auto image_barriers =
+	const auto& image_barriers =
 	    GetBarriers(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
 	                vk::PipelineStageFlagBits2::eCopy, {});
 	vk::DependencyInfo dependency {};
@@ -302,7 +336,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	buffer_barrier.buffer              = buffer;
 	buffer_barrier.offset              = offset;
 	buffer_barrier.size                = size;
-	const auto image_barriers =
+	const auto& image_barriers =
 	    GetBarriers(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	                vk::PipelineStageFlagBits2::eCopy, {});
 	vk::DependencyInfo dependency {};
