@@ -168,6 +168,31 @@ bool PadLateOn() {
 	return PadLateMs() > 0.0;
 }
 
+// (10-26 latq) KYTY_PAD_LATE_AUTO (default on with KYTY_PAD_LATE_MS; =0 off): the read's lead L follows the frame's
+// own input -> gpu done (p95 of the last 64 paced frames + a margin that grows 2 ms on each miss the wait caused and
+// decays back), KYTY_PAD_LATE_MS the ceiling, KYTY_PAD_LATE_MIN_MS (default 14) the floor. The fixed 43 / 29 ms of the
+// launcher sat ~20 ms above what a 5080 frame needs: that idle time was pure latency.
+static bool PadLateAuto() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_PAD_LATE_AUTO");
+		const bool  r = PadLateMs() > 0.0 && (v == nullptr || v[0] != '0');
+		if (PadLateMs() > 0.0) {
+			std::printf("Pad late auto: %s (KYTY_PAD_LATE_AUTO; L = p95 input->gpu done + margin, at most %.1f ms)\n",
+			            r ? "on" : "off", PadLateMs());
+			std::fflush(stdout);
+		}
+		return r;
+	}();
+	return on;
+}
+static double PadLateMinMs() {
+	static const double ms = [] {
+		const char* v = std::getenv("KYTY_PAD_LATE_MIN_MS");
+		return std::clamp(v != nullptr ? std::atof(v) : 14.0, 6.0, 80.0);
+	}();
+	return ms;
+}
+
 bool PaceOn() {
 	static const bool on = [] {
 		const char* off = std::getenv("KYTY_LOWLAT_PACE_BEFORE_INPUT");
@@ -436,6 +461,34 @@ struct PadLateStats {
 	uint32_t lead_n = 0;
 };
 PadLateStats g_padlate;
+// KYTY_PAD_LATE_AUTO state (under g_pace_mutex).
+double   g_pl_lead[64] {};
+uint32_t g_pl_lead_n   = 0;
+double   g_pl_margin   = 4.0;
+double   g_pl_cur      = 0.0; // the L in use (0: not yet: the ceiling)
+double   g_pl_cur_sum  = 0.0; // [latbd] mean L
+uint32_t g_pl_cur_n    = 0;
+double PadLateCurLocked() {
+	if (!PadLateAuto() || g_pl_cur <= 0.0) return PadLateMs();
+	return g_pl_cur;
+}
+void PadLateAdaptLocked(double lead, bool caused_miss) {
+	if (!PadLateAuto()) return;
+	if (lead > 0.0 && lead < 100.0) g_pl_lead[g_pl_lead_n++ % 64] = lead;
+	if (caused_miss) g_pl_margin = std::min(g_pl_margin + 2.0, 12.0);
+	else g_pl_margin = std::max(g_pl_margin - 0.02, 4.0);
+	const uint32_t n = std::min<uint32_t>(g_pl_lead_n, 64);
+	if (n < 16) return; // (the ceiling until 16 frames were seen)
+	double v[64];
+	std::copy(g_pl_lead, g_pl_lead + n, v);
+	const uint32_t k = std::min<uint32_t>(n - 1, static_cast<uint32_t>(n * 0.95));
+	std::nth_element(v, v + k, v + n);
+	double target = std::clamp(v[k] + g_pl_margin, PadLateMinMs(), PadLateMs());
+	if (lead + g_pl_margin > target) target = std::min(lead + g_pl_margin, PadLateMs()); // up at once
+	if (g_pl_cur <= 0.0) g_pl_cur = PadLateMs();
+	// Up at once, down 0.25 ms a frame (no sudden phase jump of the game's step).
+	g_pl_cur = target >= g_pl_cur ? target : std::max(target, g_pl_cur - 0.25);
+}
 
 // The read of frame `index` waits until L ms before its slot: the last release + cap for each frame since. Returns the
 // slot (LatNow ticks, 0: not paced) and the ms slept.
@@ -454,7 +507,10 @@ int64_t PadLateStep(uint64_t index, double& slept_ms) {
 	}
 	const double  ahead = cap * static_cast<double>(index - g_rel_index);
 	const int64_t slot  = g_rel_ticks + static_cast<int64_t>(ahead * per_ms);
-	const int64_t until = slot - static_cast<int64_t>(PadLateMs() * per_ms);
+	const double  lead_ms = PadLateCurLocked();
+	g_pl_cur_sum += lead_ms;
+	g_pl_cur_n++;
+	const int64_t until = slot - static_cast<int64_t>(lead_ms * per_ms);
 	if (until <= now) {
 		g_padlate.already_late++;
 		return slot;
@@ -483,23 +539,30 @@ void PadLateRelease(StageStamp& st, int64_t now, double dt_ms) {
 	const int64_t slot = st.slot.load(std::memory_order_relaxed);
 	const int64_t in   = st.input.load(std::memory_order_relaxed);
 	const int64_t rd   = st.ready.load(std::memory_order_relaxed);
+	double lead = 0.0;
 	if (in != 0 && rd > in) {
-		p.lead_sum += static_cast<double>(rd - in) / per_ms;
+		lead = static_cast<double>(rd - in) / per_ms;
+		p.lead_sum += lead;
 		p.lead_n++;
 	}
+	bool caused = false;
 	if (slot != 0) {
 		const double late = static_cast<double>(now - slot) / per_ms;
 		if (late > vb * 0.5 + 0.5) {
 			p.misses++;
 			p.late_sum += late;
-			if (late <= st.slept.load(std::memory_order_relaxed) + vb) p.caused++;
+			if (late <= st.slept.load(std::memory_order_relaxed) + vb) {
+				p.caused++;
+				caused = true;
+			}
 		}
 	}
+	if (slot != 0) PadLateAdaptLocked(lead, caused);
 	if (static_cast<double>(now - p.start) / per_ms >= 5000.0) {
-		std::printf("[padlate] 5 s: L %.1f ms, cap %.1f: %u reads (%u slept, mean %.1f ms; %u already past L; %u not under a "
+		std::printf("[padlate] 5 s: L %.1f ms (auto %.1f, margin %.1f), cap %.1f: %u reads (%u slept, mean %.1f ms; %u already past L; %u not under a "
 		            "30-ish limit); %u releases, %u stutters; %u paced frames missed their slot (mean %.1f ms late), %u of "
 		            "them caused by the wait; input -> gpu done %.1f ms\n",
-		            PadLateMs(), g_pace.cap_ms, p.reads, p.slept, p.slept ? p.slept_ms / p.slept : 0.0, p.already_late, p.idle,
+		            PadLateMs(), PadLateCurLocked(), g_pl_margin, g_pace.cap_ms, p.reads, p.slept, p.slept ? p.slept_ms / p.slept : 0.0, p.already_late, p.idle,
 		            p.released, p.stutters, p.misses, p.misses ? p.late_sum / p.misses : 0.0, p.caused,
 		            p.lead_n ? p.lead_sum / p.lead_n : 0.0);
 		std::fflush(stdout);
@@ -730,6 +793,49 @@ void OnPresented(uint64_t frame_index) {
 			            !PaceOn() ? "off" : (PaceAllowed() && iv > 0.0 ? "on" : "idle"), dn > 0 ? ds / dn : 0.0, dn,
 			            sn > 0 ? ss / sn : 0.0, sn, lead, margin, iv, g_pace_k.load(std::memory_order_relaxed), misses);
 			std::fflush(stdout);
+		}
+	}
+	// (10-26 latq) Every 10 s: where the overlay's latency goes, one line.
+	{
+		static double   bd_sum[6] {};
+		static uint32_t bd_n = 0, bd_w = 0;
+		static int64_t  bd_start = 0;
+		if (bd_start == 0) bd_start = now;
+		if (n > 0 && g_lat.st_n > 0) {
+			const double d     = static_cast<double>(g_lat.st_n);
+			const int    g     = LatGenerated();
+			const double ivl   = g_lat.presents > 1 ? static_cast<double>(g_lat.last_present - g_lat.first_present) / per_ms /
+			                                            static_cast<double>(g_lat.presents - 1)
+			                                      : 0.0;
+			bd_sum[0] += g_lat.st_sum[0] / d;
+			bd_sum[1] += g_lat.st_sum[1] / d;
+			bd_sum[2] += g_lat.st_sum[2] / d;
+			bd_sum[3] += g_lat.st_sum[3] / d;
+			bd_sum[4] += g > 0 ? ivl * g / (g + 1.0) : 0.0;
+			bd_sum[5] += LatRefreshMs() * 0.5;
+			bd_n++;
+		}
+		if (static_cast<double>(now - bd_start) / per_ms >= 10000.0) {
+			if (bd_n > 0) {
+				const double k = static_cast<double>(bd_n);
+				double       l = 0.0;
+				{
+					std::lock_guard pl(g_pace_mutex);
+					l           = g_pl_cur_n ? g_pl_cur_sum / g_pl_cur_n : 0.0;
+					g_pl_cur_sum = 0.0;
+					g_pl_cur_n   = 0;
+				}
+				double tot = 0.0;
+				for (double x : bd_sum) tot += x / k;
+				std::printf("[latbd] 10 s: input->frame submit %.1f ms + frame gpu %.1f + queue/pace wait (gpu done->flip) %.1f + "
+				            "flip->present %.1f + fg hold %.1f + scanout %.1f = %.1f ms; pad late L %.1f ms\n",
+				            bd_sum[0] / k, bd_sum[1] / k, bd_sum[2] / k, bd_sum[3] / k, bd_sum[4] / k, bd_sum[5] / k, tot, l);
+				std::fflush(stdout);
+			}
+			for (double& x : bd_sum) x = 0.0;
+			bd_n     = 0;
+			bd_start = now;
+			(void)bd_w;
 		}
 	}
 	for (double& x : g_lat.st_sum) x = 0.0;
