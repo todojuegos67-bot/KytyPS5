@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelinePrewarm.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -550,7 +551,7 @@ class PipelineCompiler {
 public:
 	explicit PipelineCompiler(uint32_t threads) {
 		for (uint32_t i = 0; i < threads; i++) {
-			m_threads.emplace_back([this] { Run(); });
+			m_threads.emplace_back([this] { Prewarm::MarkAsyncThread(); Run(); });
 		}
 	}
 	~PipelineCompiler() { Stop(); }
@@ -859,6 +860,7 @@ struct PipelineCache::ProgramCache {
 
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
+		Prewarm::NoteSpirv(module, result.spirv);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -1171,7 +1173,21 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	}
 }
 
+void PipelineCache::StartPrewarm() {
+	if (!m_prewarm_started) {
+		m_prewarm_started = true;
+		if (Prewarm::EnsureStarted(m_graphics, PipelineCacheTitleId(), m_driver_cache)) {
+			Save();
+			Prewarm::Shutdown();
+			std::printf("Prewarm: KYTY_PREWARM_ONLY=1: precompile finished, driver cache saved, exiting\n");
+			std::fflush(stdout);
+			std::_Exit(0);
+		}
+	}
+}
+
 PipelineCache::~PipelineCache() {
+	Prewarm::Shutdown();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -1592,6 +1608,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs, bool may_defer) {
+	StartPrewarm();
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -1810,6 +1827,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 PipelineCache::Pipeline&
 PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
                                   const ShaderProgram&          compute_program) {
+	StartPrewarm();
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(!compute_program);

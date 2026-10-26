@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelinePrewarm.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -274,12 +275,14 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		const auto shaders =
 		    BuildRectListShaders(vs_input_info, ps_active ? ps_input_info : nullptr);
 		build.tess_control = CompileSPV(shaders.control, graphics.device);
+		Prewarm::NoteSpirv(build.tess_control, shaders.control);
 		if (graphics_debug_dump_enabled()) {
 			LOGF("PipelineTrace: vkCreateShaderModule RectList TCS done module=%p\n",
 			     static_cast<void*>(build.tess_control));
 		}
 
 		build.tess_eval = CompileSPV(shaders.evaluation, graphics.device);
+		Prewarm::NoteSpirv(build.tess_eval, shaders.evaluation);
 		if (graphics_debug_dump_enabled()) {
 			LOGF("PipelineTrace: vkCreateShaderModule RectList TES done module=%p\n",
 			     static_cast<void*>(build.tess_eval));
@@ -567,6 +570,12 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	                             : 0;
 	build.vs_hash = vs_input_info.stage.program->shader_hash;
 	build.ps_hash = ps_hash;
+	if (!pipeline.uses_bindless) {
+		build.prewarm_key = Prewarm::RegisterGraphics(
+		    pipeline_info, descriptor_bindings, static_cast<uint32_t>(graphics_stages),
+		    static_cast<uint32_t>(pipeline.uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+		                                                         : vk::DescriptorSetLayoutCreateFlags {}));
+	}
 
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
@@ -582,9 +591,15 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 
 vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build, vk::PipelineCache driver_cache,
                                   vk::Pipeline* pipeline) {
+	if (auto prewarmed = Prewarm::Take(build.prewarm_key, true); prewarmed != nullptr) {
+		*pipeline = prewarmed;
+		return vk::Result::eSuccess;
+	}
 	const auto create_begin = std::chrono::steady_clock::now();
 	const auto result =
 	    build.device.createGraphicsPipelines(driver_cache, 1, &build.pipeline_info, nullptr, pipeline);
+	Prewarm::NoteRuntimeCompile(true, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                      std::chrono::steady_clock::now() - create_begin).count()));
 	// On the GPU thread, a slow pipeline stops every queue.
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - create_begin)
@@ -672,10 +687,22 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
+	const uint64_t prewarm_key = pipeline.uses_bindless ? 0 : Prewarm::Register(
+	    compute_module, descriptor_bindings, comp_subgroup_size.requiredSubgroupSize,
+	    static_cast<uint32_t>(pipeline.uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+	                                                         : vk::DescriptorSetLayoutCreateFlags {}));
+	if (auto prewarmed = Prewarm::Take(prewarm_key, false); prewarmed != nullptr) {
+		pipeline.pipeline = prewarmed;
+		return;
+	}
+	const auto compile_start = std::chrono::steady_clock::now();
+
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
+	Prewarm::NoteRuntimeCompile(false, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                       std::chrono::steady_clock::now() - compile_start).count()));
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

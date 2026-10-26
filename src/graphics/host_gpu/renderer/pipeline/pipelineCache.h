@@ -138,6 +138,7 @@ struct GraphicsPipelineBuild {
 	PipelineRenderingState                                                rendering;
 	vk::PipelineRenderingCreateInfo                                       rendering_info {};
 	vk::GraphicsPipelineCreateInfo                                        pipeline_info {};
+	uint64_t                                                              prewarm_key = 0; // pipelinePrewarm.h
 	uint64_t                                                              vs_hash = 0;
 	uint64_t                                                              ps_hash = 0;
 };
@@ -154,6 +155,7 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	void StartPrewarm(); // pipelinePrewarm.h
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -234,6 +236,7 @@ private:
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	bool                          m_prewarm_started = false;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
