@@ -237,8 +237,14 @@ void WriteLayout(Writer& wr, std::span<const vk::DescriptorSetLayoutBinding> bin
 	}
 }
 
-bool BuildLayout(Reader& rd, vk::Device device, uint32_t push_size, Layout& out) {
-	const uint32_t layout_flags = rd.U();
+bool BuildLayout(Reader& rd, vk::Device device, vk::DescriptorSetLayout bindless_layout, uint32_t push_size,
+                 Layout& out) {
+	const uint32_t raw_flags    = rd.U();
+	const bool     bindless     = (raw_flags & LayoutBindlessBit) != 0;
+	const uint32_t layout_flags = raw_flags & ~LayoutBindlessBit;
+	if (bindless && bindless_layout == nullptr) {
+		return false;
+	}
 	const uint32_t push_stages  = rd.U();
 	const uint32_t nb           = rd.U();
 	if (!rd.ok || nb > 4096) {
@@ -262,9 +268,11 @@ bool BuildLayout(Reader& rd, vk::Device device, uint32_t push_size, Layout& out)
 		return false;
 	}
 	const vk::PushConstantRange push {static_cast<vk::ShaderStageFlags>(push_stages), 0, push_size};
-	vk::PipelineLayoutCreateInfo info {};
-	info.setLayoutCount         = 1;
-	info.pSetLayouts            = &out.set;
+	// Set 1 of a bindless pipeline is the shared bindless table (FillSetLayouts in shaders.cpp).
+	const vk::DescriptorSetLayout sets[2] = {out.set, bindless_layout};
+	vk::PipelineLayoutCreateInfo  info {};
+	info.setLayoutCount         = bindless ? 2u : 1u;
+	info.pSetLayouts            = sets;
 	info.pushConstantRangeCount = push_stages != 0 ? 1 : 0;
 	info.pPushConstantRanges    = &push;
 	return device.createPipelineLayout(&info, nullptr, &out.layout) == vk::Result::eSuccess;
@@ -303,7 +311,7 @@ vk::Pipeline BuildCompute(Context& ctx, std::FILE* f, const Pending& p) {
 	const uint32_t create_flags   = rd.U();
 	const uint32_t push_size      = rd.U();
 	Layout         layout;
-	if (!rd.ok || !BuildLayout(rd, ctx.graphics->device, push_size, layout)) {
+	if (!rd.ok || !BuildLayout(rd, ctx.graphics->device, ctx.graphics->bindless_layout, push_size, layout)) {
 		return nullptr;
 	}
 	auto module = LoadModule(ctx, f, spirv, ctx.graphics->device);
@@ -495,7 +503,7 @@ vk::Pipeline BuildGraphics(Context& ctx, std::FILE* f, const Pending& p) {
 		info.pNext                  = &ren;
 	}
 	Layout layout;
-	ok = ok && rd.ok && BuildLayout(rd, device, push_size, layout) && rd.ok;
+	ok = ok && rd.ok && BuildLayout(rd, device, ctx.graphics->bindless_layout, push_size, layout) && rd.ok;
 	vk::Pipeline pipeline = nullptr;
 	if (ok) {
 		info.layout             = layout.layout;
