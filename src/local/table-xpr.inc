@@ -39,6 +39,7 @@ struct RenderExecutor::TableVariant {
 	std::shared_ptr<std::function<const PipelineCache::Pipeline*(CommandBuffer&)>> hwrt_make;
 	uint64_t                                                                       hwrt_ps    = 0;
 	bool                                                                           hwrt_scene = false;
+	vk::ShaderModule                                                               hwrt_ps_module = nullptr; // (hwrt3: material)
 };
 
 // Words a draw writes whole after resizing (TableEvaluate's T#/S# words): resize leaves the new ones uninitialized. (With
@@ -82,6 +83,9 @@ struct RenderExecutor::TableImageSet {
 	vk::DescriptorSet     set  = nullptr;
 	vk::DescriptorPool    pool = nullptr;
 	std::vector<Image>    images;
+	// (hwrt3, KYTY_HWRT_REFL_MATERIAL: HwScene::MaterialActive only) the pixel stage's sampled images, by SPIR-V binding and
+	// element (the base-colour texture of a captured mesh is chosen among them)
+	std::vector<HwScene::PsImage> hwrt_ps_images;
 	// BufferCache::BdaTableGeneration when the set got the BDA page table: made again once the table grew.
 	uint64_t              bda_generation = 0;
 	// Proven current in that frame under those registrations, by role (RenderExecutor::Role: [0] also the frame it was
@@ -839,6 +843,27 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				return refuse("a binding table mode does not have");
 			}
 			pending.push_back(item);
+		}
+		if (program.stage == ShaderType::Pixel && HwScene::MaterialActive()) {
+			set->hwrt_ps_images.clear();
+			for (const auto& binding: program.bindings.descriptors) {
+				if (ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) != ShaderRecompiler::IR::ImageResourceClass::Sampled) continue;
+				for (uint32_t j = 0; j < binding.resources.size(); ++j) {
+					const auto& texture = prepared[st].images.at(binding.resources[j]);
+					auto*       image   = textures.TryGetImage(texture.image_id);
+					if (image == nullptr || texture.image_view == nullptr) continue;
+					HwScene::PsImage ps;
+					ps.binding          = ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind);
+					ps.element          = j;
+					ps.image_index      = texture.image_id.index;
+					ps.image_generation = texture.image_id.generation;
+					ps.serial           = image->serial;
+					ps.view             = texture.image_view;
+					ps.format           = texture.desc.view_info.format;
+					ps.type             = texture.desc.view_info.type;
+					set->hwrt_ps_images.push_back(ps);
+				}
+			}
 		}
 		if (st == 0) set->images.reserve(deps[0].size() + deps[1].size());
 		for (const auto& dep: deps[st])
@@ -2307,6 +2332,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			HwScene::Draw d;
 			d.vs             = pair.programs[0]->shader_hash;
 			d.ps             = variant.hwrt_ps;
+			if (HwScene::MaterialActive()) {
+				d.ps_module = variant.hwrt_ps_module;
+				d.ps_images = &set->hwrt_ps_images;
+				d.cache     = &texture_cache;
+			}
 			d.index_size     = static_cast<uint32_t>(hwrt_index_size);
 			d.index_count    = index_count;
 			d.instance_count = instance_count;
@@ -2720,6 +2750,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 			if (variant != pair->variants.end()) {
 				variant->hwrt_scene    = true;
 				variant->hwrt_ps       = pixel != nullptr ? pixel->shader_hash : 0;
+				variant->hwrt_ps_module = table_state.programs.pixel.module;
 				variant->hwrt_make     = std::move(make);
 				variant->hwrt_pipeline = made;
 			}

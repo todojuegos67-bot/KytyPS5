@@ -1,0 +1,31 @@
+#version 460
+// KYTY_HWRT_REFL_MATERIAL (hwrt-scene.cpp, hwrt3): a captured mesh's base-colour texture (the game's own view, sampled
+// once while its draw's image is current) downsampled into one layer of the albedo array the reflections' off-screen
+// hits read. Stored sqrt-encoded (RGBA8: the darks keep their precision); the reader squares it back.
+layout(local_size_x = 8, local_size_y = 8) in;
+#ifdef KYTY_ARRAY
+layout(binding = 0) uniform sampler2DArray src;
+#else
+layout(binding = 0) uniform sampler2D src;
+#endif
+layout(binding = 1, rgba8) uniform writeonly image2DArray dst;
+layout(push_constant) uniform Push {
+	uint layer, size, pad0, pad1;
+} p;
+
+void main() {
+	const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+	if (px.x >= int(p.size) || px.y >= int(p.size)) return;
+	const vec2  uv = (vec2(px) + 0.5) / float(p.size);
+	const ivec2 ts = textureSize(src, 0).xy;
+	float       lod = max(0.0, log2(float(max(max(ts.x, ts.y), 1)) / float(p.size)));
+	lod             = min(lod, float(max(textureQueryLevels(src) - 1, 0)));
+#ifdef KYTY_ARRAY
+	vec4 c = textureLod(src, vec3(uv, 0.0), lod);
+#else
+	vec4 c = textureLod(src, uv, lod);
+#endif
+	if (any(isnan(c)) || any(isinf(c))) c = vec4(0.5, 0.5, 0.5, 1.0);
+	c = clamp(c, vec4(0.0), vec4(1.0));
+	imageStore(dst, ivec3(px, int(p.layer)), vec4(sqrt(c.rgb), c.a));
+}
