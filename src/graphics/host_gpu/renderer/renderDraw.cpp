@@ -1219,7 +1219,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	std::optional<PhaseStats::Scope> sub_phase;
-	sub_phase.emplace(PhaseStats::DrawBindings);
+	sub_phase.emplace(PhaseStats::PhDrawBindings);
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1237,7 +1237,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	sub_phase.reset();
-	sub_phase.emplace(PhaseStats::DrawVertex);
+	sub_phase.emplace(PhaseStats::PhDrawVertex);
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
@@ -1269,7 +1269,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 		       });
 	};
 	sub_phase.reset();
-	sub_phase.emplace(PhaseStats::DrawPipeline);
+	sub_phase.emplace(PhaseStats::PhDrawPipeline);
 	bool may_defer = !(state.ps_active && writes_memory(state.ps_input_info.stage));
 	for (const auto& stage: vertex_stages) {
 		may_defer = may_defer && !writes_memory(stage.stage);
@@ -1283,7 +1283,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	}
 	auto& pipeline = *deferred_pipeline;
 	sub_phase.reset();
-	sub_phase.emplace(PhaseStats::DrawTargets);
+	sub_phase.emplace(PhaseStats::PhDrawTargets);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1293,7 +1293,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
 	sub_phase.reset();
-	sub_phase.emplace(PhaseStats::DrawCommit);
+	sub_phase.emplace(PhaseStats::PhDrawCommit);
 	const auto vk_buffer = buffer.Recorder();
 	if (indirect_buffer != nullptr) {
 		// Earlier passes wrote the arguments; indirect reads happen outside the render pass.
@@ -1440,7 +1440,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
-	PhaseStats::Scope total_phase {PhaseStats::DrawTotal};
+	PhaseStats::Scope total_phase {PhaseStats::PhDrawTotal};
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1452,7 +1452,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
-	std::optional<PhaseStats::Scope> lock_phase {std::in_place, PhaseStats::DrawLock};
+	std::optional<PhaseStats::Scope> lock_phase {std::in_place, PhaseStats::PhDrawLock};
 	Common::LockGuard lock = m_context.LockMutexProfiled();
 	lock_phase.reset();
 	if (args.gpu_args == 0 && (args.index_count == 0 || args.instance_count == 0)) {
@@ -1531,7 +1531,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawRenderState state {};
 	bool state_ok;
 	{
-		PhaseStats::Scope state_phase {PhaseStats::DrawState};
+		PhaseStats::Scope state_phase {PhaseStats::PhDrawState};
 		state_ok = PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state);
 	}
 	if (!state_ok) {
@@ -1559,7 +1559,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
-	PhaseStats::Scope total_phase {PhaseStats::DrawTotal};
+	PhaseStats::Scope total_phase {PhaseStats::PhDrawTotal};
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1572,7 +1572,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
 	                    args.first_instance);
 
-	std::optional<PhaseStats::Scope> lock_phase {std::in_place, PhaseStats::DrawLock};
+	std::optional<PhaseStats::Scope> lock_phase {std::in_place, PhaseStats::PhDrawLock};
 	Common::LockGuard lock = m_context.LockMutexProfiled();
 	lock_phase.reset();
 	if (args.vertex_count == 0 || args.instance_count == 0) {
@@ -1617,7 +1617,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawRenderState state {};
 	bool state_ok;
 	{
-		PhaseStats::Scope state_phase {PhaseStats::DrawState};
+		PhaseStats::Scope state_phase {PhaseStats::PhDrawState};
 		state_ok = PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state);
 	}
 	if (!state_ok) {
