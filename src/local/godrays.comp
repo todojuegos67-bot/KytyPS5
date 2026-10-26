@@ -362,13 +362,32 @@ void TrackWorld(int slots, float keep_t, float new_t) {
 					if (!IsSky(dz) && abs(ViewZ(dz)) < 0.9 * abs(v.z) - 0.3) hidden = true;
 				}
 			}
-			if (seen) {
-				a.w = min(a.w + L_IN, 1.0), b.w = 0.0;
-			} else {
-				b.w += 1.0;
-				// (visible but no candidate for ~0.4 s: really gone, a ~2.8 s fade; held off screen / occluded ~30 s)
-				if (b.w > (hidden ? 1800.0 : 25.0)) a.w -= L_OUT;
+			// (hwrt5v-3: a held lamp behind a wall / pillar glowed through it: one TLAS ray camera -> lamp a frame, smoothed
+			// ~0.25 s into the fraction of b.w (the integer part counts the frames unseen); the halo is scaled by it.)
+			float vis = fract(b.w) / 0.99;
+			{
+				rayQueryEXT rq;
+				float       len = max(ld - 0.6, 0.0);
+				vec3        dw  = a.xyz - T;
+				float       vt  = 1.0;
+				if (len > 0.1 && ld > 1e-3) {
+					rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xff, T, 0.1, dw / ld, len);
+					while (rayQueryProceedEXT(rq)) {}
+					vt = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT ? 0.0 : 1.0;
+				}
+				if (seen) vt = 1.0; // (found on screen this frame: visible whatever the capture says)
+				vis = clamp(mix(vis, vt, 0.07), 0.0, 1.0);
 			}
+			float unseen = floor(b.w);
+			if (seen) {
+				a.w = min(a.w + L_IN, 1.0), unseen = 0.0;
+			} else {
+				unseen += 1.0;
+				b.w = unseen;
+				// (visible but no candidate for ~0.4 s: really gone, a ~2.8 s fade; held off screen / occluded ~30 s)
+				if (unseen > (hidden ? 1800.0 : 25.0)) a.w -= L_OUT;
+			}
+			b.w = min(unseen, 4000.0) + vis * 0.99;
 			if (ld > 1.4 * L_FAR) a.w -= L_OUT;
 			if (a.w <= 0.0) a = vec4(0), b = vec4(0);
 			if (w_before < 0.5 && a.w >= 0.5) atomicAdd(stats[3], 1u);
@@ -397,7 +416,7 @@ void TrackWorld(int slots, float keep_t, float new_t) {
 			if (best < 0) break;
 			claimed[best]     = true;
 			lights[k * 2]     = vec4(bw, 0.02);
-			lights[k * 2 + 1] = vec4(cand[best * 2 + 1].rgb, 0);
+			lights[k * 2 + 1] = vec4(cand[best * 2 + 1].rgb, 0.99); // (visible: just found on screen)
 		}
 	}
 	for (int k = 0; k < slots; ++k)
@@ -644,6 +663,8 @@ void Composite(ivec2 p) {
 			if (a.w <= 0.0) continue;
 #ifdef KYTY_HWRT_VOLUMETRIC
 			vec3  lp = Mi * (a.xyz - T);
+			float lvis = fract(lights[k * 2 + 1].w) / 0.99;
+			if (lvis <= 0.01) continue;
 #else
 			vec3  lp = ViewPos(a.xy, a.z);
 #endif
@@ -665,6 +686,9 @@ void Composite(ivec2 p) {
 #ifdef KYTY_HWRT_VOLUMETRIC
 			// (a dark scene's lamps, tracked under the lowered threshold: the halo scaled as if at hdr.y, <= 4x)
 			ll *= clamp(hdr.y / max(L_ADAPT, 1e-3), 1.0, 4.0);
+#endif
+#ifdef KYTY_HWRT_VOLUMETRIC
+			ll *= lvis;
 #endif
 			add += Hue(lc) * (ll * 0.01 * I * fade * push.extra.z);
 		}
