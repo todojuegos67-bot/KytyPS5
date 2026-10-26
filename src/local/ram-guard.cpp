@@ -736,6 +736,10 @@ void Watch() {
 	auto     next_walk  = Clock::now();
 	int      backoff    = 0;
 	int      logged     = None;
+	int      commit_logged = None;
+	const char*   commit_line_text    = Env("KYTY_COMMIT_LINE_SECONDS");
+	const int64_t commit_line_seconds = commit_line_text != nullptr ? std::strtoll(commit_line_text, nullptr, 10) : 5;
+	auto          next_commit_line    = Clock::now();
 	uint64_t store      = 0, flushes = 0, freed_total = 0;
 	for (;;) {
 		std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -763,6 +767,47 @@ void Watch() {
 		}
 		const int level = LevelOf(s, sample);
 		g_level.store(level, std::memory_order_relaxed);
+		// (commitcut-1025) The commit as Windows' limit sees it, for the overlay (metricas.ps1 reads the last line) and
+		// the warning: the process's own = private bytes (NVIDIA's device-local charge included) + the page-file store
+		// committed, less the KYTY_SIMULATE_VRAM_MB ballast (a test's, not a real card's). KYTY_COMMIT_LINE_SECONDS (5;
+		// 0 off).
+		{
+			const uint64_t ballast = LocalPlatform::SimulationBallast();
+			const uint64_t own     = sample.private_bytes - std::min(sample.private_bytes, ballast) + sample.store_committed;
+			if (commit_line_seconds > 0 && now >= next_commit_line) {
+				next_commit_line = now + std::chrono::seconds(commit_line_seconds);
+				std::printf("[commit] %llu of %llu MiB%s, headroom %llu MiB; emulator %llu MiB (private %llu less ballast %llu, "
+				            "guest store %llu)\n",
+				            static_cast<unsigned long long>(sample.commit_total / MiB),
+				            static_cast<unsigned long long>(sample.commit_limit / MiB), sample.simulated ? " simulated" : "",
+				            static_cast<unsigned long long>(sample.Headroom() / MiB), static_cast<unsigned long long>(own / MiB),
+				            static_cast<unsigned long long>(sample.private_bytes / MiB),
+				            static_cast<unsigned long long>(ballast / MiB),
+				            static_cast<unsigned long long>(sample.store_committed / MiB));
+				std::fflush(stdout);
+			}
+			// A clear line when the commit headroom goes under the guard's mark (KYTY_RAM_LOW_COMMIT_MB, 2048; critical at
+			// half), and when it is back: the passes below run while it lasts (caches, idle pipelines; critical: images
+			// no draw used for 10 s leave video memory, which on NVIDIA lowers the commit too). Never an end of the run
+			// outside the simulation: Windows refusing memory is MemGuard's (a release pass and a retry).
+			const int commit_level = sample.commit_limit == 0 ? None
+			                         : sample.Headroom() < s.low_commit / 2 ? Critical
+			                         : sample.Headroom() < s.low_commit     ? Low
+			                                                                : None;
+			if (commit_level != commit_logged) {
+				if (commit_level != None)
+					std::printf("RAM guard: WARNING commit headroom %llu MiB (under %llu MiB: %s): releasing caches and idle "
+					            "pipelines%s; emulator commit %llu MiB; %s\n",
+					            static_cast<unsigned long long>(sample.Headroom() / MiB),
+					            static_cast<unsigned long long>((commit_level == Critical ? s.low_commit / 2 : s.low_commit) / MiB),
+					            LevelName(commit_level), commit_level == Critical ? ", idle images out of video memory" : "",
+					            static_cast<unsigned long long>(own / MiB), Figures(sample).c_str());
+				else
+					std::printf("RAM guard: commit headroom back to %llu MiB\n", static_cast<unsigned long long>(sample.Headroom() / MiB));
+				std::fflush(stdout);
+				commit_logged = commit_level;
+			}
+		}
 		if (governor.on) GovernorStep(s, low_memory, store, sample, &flush_state, &governor, now);
 		if (governor.on && governor.stage != GovIdle) {
 			next_periodic = Clock::now() + std::chrono::seconds(std::max<int64_t>(s.flush_seconds, 1)); // (its passes run)

@@ -638,3 +638,17 @@ New counters: "restores blocking N (at most x ms), asynchronous N (latency ...);
   is one frame of a missing object; for a cached spot-shadow layer the occluder stays missing until the game re-renders
   that layer (when the light's slot is reassigned as the player moves): lit patches that pop in and out.
 - Fix: KYTY_ASYNC_SHADOW_SYNC (on unless 0): depth-only draws into a layered depth array keep the blocking compile.
+
+## 2026-10-26 commitcut-1025 — what the commit is made of on a 16 GB-simulated run, a [commit] line, a commit warning
+- Log 20261025-235744-754 (16 GB + 8 GB-card simulation, flush level 1): the overlay's red "Commit 21,3 / 21 GB
+  (simulado)" was private bytes + 4: 17.3 GiB private of which 7785 MiB is the KYTY_SIMULATE_VRAM_MB ballast (a real
+  8 GB card has none), and it left out the page-file store (section commit, not private bytes). The guard's own count
+  (OS 4 + private - ballast + store) was 26963 of 32768 MiB: store 12.9 GiB (the game allocated 13.3: its live data),
+  emulator non-store 9.95 GiB = device-local 6.1 (VMA 4.4: buffer pool 0.88 in 1.11 of blocks, images 3.1, free in
+  blocks 0.36; plain type 0.73; driver 0.99), host 0.22, pipelines 0.3, the rest heaps/driver/executable.
+- No Vulkan flag lowers the WDDM charge of a device-local allocation (VK_EXT_pageable_device_local_memory / priority
+  change residency, not backing; measured 10-24: +7.8 GB ballast = +8.2 GB private). Only holding less video memory
+  lowers it: the guard's critical level already collects images idle 10 s (textureCache), level 2 the idle ones.
+- New: "[commit] U of L MiB [simulated], headroom H; emulator E (private P less ballast B, guest store S)" every 5 s
+  (KYTY_COMMIT_LINE_SECONDS, 0 off); metricas.ps1's simulated "Commit" row uses it. "RAM guard: WARNING commit headroom"
+  when under KYTY_RAM_LOW_COMMIT_MB (2048; critical at half) and "commit headroom back to" after.

@@ -267,6 +267,13 @@ function Get-Fps {
 			$r.latMean = if ($q[7].Success) { [double]::Parse($q[7].Value, $inv) } else { $lm + $add }
 			$r.latP95 = if ($q[8].Success) { [double]::Parse($q[8].Value, $inv) } else { $lp + $add }
 		}
+		# (commitcut-1025) La linea [commit] del emulador (cada 5 s): su commit contado como el limite de Windows lo ve
+		# (privado sin el lastre de KYTY_SIMULATE_VRAM_MB + el almacen de la memoria del juego) y el limite (simulado si lo es).
+		$m = [regex]::Matches($text, '\[commit\] (\d+) of (\d+) MiB')
+		if ($m.Count -gt 0) {
+			$q = $m[$m.Count - 1].Groups
+			$r.commitUsed = [double]$q[1].Value / 1024.0; $r.commitLimit = [double]$q[2].Value / 1024.0
+		}
 		return $r
 	} catch { }
 	return $null
@@ -445,6 +452,10 @@ $timer.Add_Tick({
 			if ($e3) { $priv = $e3.PrivateMemorySize64 / 1GB }
 			$commitUsed = $priv + 4
 			$commitSim = ' (simulado)'
+			# (commitcut-1025) Mejor la cifra del emulador: sin el lastre de 'Simular 8 GB VRAM' (7.8 GB del privado que una
+			# tarjeta real no tiene) y con el almacen de la memoria del juego (commit de seccion, fuera del privado).
+			$fc = Get-Fps
+			if ($fc -and $fc.commitUsed) { $commitUsed = $fc.commitUsed; $commitLimit = $fc.commitLimit; $commitSim = ' (simulado, emulador)' }
 		}
 		if ($commitLimit -gt 0) {
 			$cc = if ($commitUsed / $commitLimit -gt 0.90) { $cRed } else { Get-UseColor $commitUsed $commitLimit }
