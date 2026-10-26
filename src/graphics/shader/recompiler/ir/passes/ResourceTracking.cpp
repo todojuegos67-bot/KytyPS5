@@ -417,9 +417,10 @@ public:
 		LinkImageAliases();
 		mark("alias");
 		if (std::chrono::duration<double, std::milli>(t_last - t_begin).count() >= 200.0) {
-			std::printf("ShaderSlow: resources %s hash=0x%016" PRIx64 " indirect_plans=%zu:%s (indirect: try=%.1f check=%.1f)\n",
+			std::printf("ShaderSlow: resources %s hash=0x%016" PRIx64 " indirect_plans=%zu:%s (indirect: try=%.1f check=%.1f; nested=%.1f finite=%.1f table=%.1f buffer=%.1f; memo max=%zu false=%zu)\n",
 			            StageName(m_program.stage), m_program.shader_hash, m_indirect_descriptors.size(), phases,
-			            m_indirect_try_ms, m_indirect_check_ms);
+			            m_indirect_try_ms, m_indirect_check_ms, m_try_ms[0], m_try_ms[1], m_try_ms[2], m_try_ms[3],
+			            m_selector_maximum_memo.size(), m_selector_false_memo.size());
 			std::fflush(stdout);
 		}
 		for (const auto& patch: m_handle_patches) {
@@ -1838,6 +1839,7 @@ private:
 	mutable std::unordered_map<BlockQueryKey, bool, BlockQueryKeyHash> m_reaches_memo;
 	std::unordered_map<const Inst*, size_t> m_first_plan_for_read;
 	double m_indirect_try_ms   = 0.0;
+	double m_try_ms[4]         = {}; // nested, finite, table, buffer
 	double m_indirect_check_ms = 0.0;
 	mutable std::unordered_map<BlockQueryKey, bool, BlockQueryKeyHash> m_dominates_memo;
 
@@ -3401,6 +3403,18 @@ private:
 	bool SelectorPredicateFalse(Value value, SelectorBounds bounds, uint32_t depth = 0,
 	                            Value guard = {}) const {
 		if (depth > 32u) return false;
+		SelectorMemoKey key;
+		if (!SelectorMemoKeyOf(value, guard, bounds, key)) return SelectorPredicateFalseImpl(value, bounds, depth, guard);
+		if (const auto found = m_selector_false_memo.find(key); found != m_selector_false_memo.end() && found->second.second <= depth)
+			return found->second.first;
+		const bool result = SelectorPredicateFalseImpl(value, bounds, depth, guard);
+		const auto [slot, inserted] = m_selector_false_memo.try_emplace(key, result, depth);
+		if (!inserted && depth < slot->second.second) slot->second = {result, depth};
+		return result;
+	}
+
+	bool SelectorPredicateFalseImpl(Value value, SelectorBounds bounds, uint32_t depth, Value guard) const {
+		if (depth > 32u) return false;
 		value = value.Resolve();
 		if (value.IsImmediate()) return value.GetType() == Type::U1 && !value.U1();
 		const auto* inst = value.TryInstruction();
@@ -3488,8 +3502,53 @@ private:
 		return FiniteSelectorDomain(lane.Arg(0), lane.Arg(1));
 	}
 
+	// Selector bounds recurse over the selection DAG; a 128-way SelectU32/Phi chain (Yotei bindless
+	// image selection) re-evaluated shared sub-chains exponentially (6-8 s per translation). Any
+	// computed maximum is a sound upper bound and a proven-false predicate stays proven, whatever the
+	// remaining depth, so results without extra bounds are memoized per (value, guard).
+	struct SelectorMemoKey {
+		const Inst* value;
+		const Inst* guard;
+		bool operator==(const SelectorMemoKey&) const = default;
+	};
+	struct SelectorMemoKeyHash {
+		size_t operator()(const SelectorMemoKey& k) const noexcept {
+			return std::hash<const void*> {}(k.value) ^ (std::hash<const void*> {}(k.guard) * 0x9e3779b97f4a7c15ull);
+		}
+	};
+	// Each result keeps the depth it was computed at: it is reused only at that depth or deeper
+	// (where it had at least as much recursion budget), so memoized answers are never less precise.
+	mutable std::unordered_map<SelectorMemoKey, std::pair<uint32_t, uint32_t>, SelectorMemoKeyHash> m_selector_maximum_memo;
+	mutable std::unordered_map<SelectorMemoKey, std::pair<bool, uint32_t>, SelectorMemoKeyHash>     m_selector_false_memo;
+
+	static bool SelectorMemoKeyOf(Value value, Value guard, SelectorBounds bounds, SelectorMemoKey& key) {
+		if (!bounds.empty()) return false;
+		value = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return false;
+		const Inst* guard_inst = nullptr;
+		if (!guard.IsEmpty()) {
+			guard_inst = guard.Resolve().TryInstruction();
+			if (guard_inst == nullptr) return false;
+		}
+		key = {inst, guard_inst};
+		return true;
+	}
+
 	uint32_t SelectorMaximum(Value value, SelectorBounds bounds = {}, uint32_t depth = 0,
 	                         Value guard = {}) const {
+		if (depth > 32u) return UINT32_MAX;
+		SelectorMemoKey key;
+		if (!SelectorMemoKeyOf(value, guard, bounds, key)) return SelectorMaximumImpl(value, bounds, depth, guard);
+		if (const auto found = m_selector_maximum_memo.find(key); found != m_selector_maximum_memo.end() && found->second.second <= depth)
+			return found->second.first;
+		const auto result = SelectorMaximumImpl(value, bounds, depth, guard);
+		const auto [slot, inserted] = m_selector_maximum_memo.try_emplace(key, result, depth);
+		if (!inserted && depth < slot->second.second) slot->second = {result, depth};
+		return result;
+	}
+
+	uint32_t SelectorMaximumImpl(Value value, SelectorBounds bounds, uint32_t depth, Value guard) const {
 		if (depth > 32u) return UINT32_MAX;
 		value = value.Resolve();
 		if (value.IsImmediate() && value.GetType() == Type::U32) return value.U32();
@@ -3763,11 +3822,18 @@ private:
 						plan.read_dwords = 4u;
 					}
 					const auto try_begin = std::chrono::steady_clock::now();
-					const bool made = TryMakeNestedDescriptor(*handle, descriptor, plan) ||
-					    (sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
-					    TryMakeTableDescriptor(*handle, descriptor, plan) ||
-					    (!sampler && (TryMakeFiniteDescriptor(*handle, plan) ||
-					                  TryMakeIndirectBuffer(*handle, descriptor, plan)));
+					const auto timed = [&](double& total, auto&& fn) {
+						const auto begin = std::chrono::steady_clock::now();
+						const bool ok = fn();
+						total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+						return ok;
+					};
+					const bool made =
+					    timed(m_try_ms[0], [&] { return TryMakeNestedDescriptor(*handle, descriptor, plan); }) ||
+					    (sampler && timed(m_try_ms[1], [&] { return TryMakeFiniteDescriptor(*handle, plan); })) ||
+					    timed(m_try_ms[2], [&] { return TryMakeTableDescriptor(*handle, descriptor, plan); }) ||
+					    (!sampler && (timed(m_try_ms[1], [&] { return TryMakeFiniteDescriptor(*handle, plan); }) ||
+					                  timed(m_try_ms[3], [&] { return TryMakeIndirectBuffer(*handle, descriptor, plan); })));
 					const auto try_end = std::chrono::steady_clock::now();
 					m_indirect_try_ms += std::chrono::duration<double, std::milli>(try_end - try_begin).count();
 					if (made) {
