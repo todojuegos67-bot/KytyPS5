@@ -1816,21 +1816,41 @@ void MtTrace(ivec2 px) {
 			float self_range = 0.25 + 0.02 * dist;
 			vec3  o    = Pw + Nw * (0.003 * dist + 0.01);
 			float tmax = max(push.params.z, 1.0);
-			rayQueryEXT rq;
-			rayQueryInitializeEXT(rq, hw_tlas, self_ >= 0 ? gl_RayFlagsNoOpaqueEXT : gl_RayFlagsOpaqueEXT, 0xff, o, 0.02, Rw, tmax);
-			while (rayQueryProceedEXT(rq)) {
-				if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-					bool own = rayQueryGetIntersectionInstanceIdEXT(rq, false) == self_ && rayQueryGetIntersectionTEXT(rq, false) < self_range;
-					if (!own) rayQueryConfirmIntersectionEXT(rq);
+			// (fb6cfd8b traced the whole ray with NoOpaque: every candidate triangle of the scene came back to the shader,
+			// the cost of the user's 26 ms frames. Now only the short self stretch is non-opaque; the rest is one opaque
+			// query that the hardware resolves alone.)
+			float t_hit = -1.0;
+			int   inst  = -1, prim = -1;
+			vec2  bc    = vec2(0);
+			if (self_ >= 0) {
+				rayQueryEXT sq;
+				rayQueryInitializeEXT(sq, hw_tlas, gl_RayFlagsNoOpaqueEXT, 0xff, o, 0.02, Rw, min(self_range, tmax));
+				while (rayQueryProceedEXT(sq)) {
+					if (rayQueryGetIntersectionTypeEXT(sq, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
+					    rayQueryGetIntersectionInstanceIdEXT(sq, false) != self_)
+						rayQueryConfirmIntersectionEXT(sq);
+				}
+				if (rayQueryGetIntersectionTypeEXT(sq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+					t_hit = rayQueryGetIntersectionTEXT(sq, true);
+					inst  = rayQueryGetIntersectionInstanceIdEXT(sq, true);
+					prim  = rayQueryGetIntersectionPrimitiveIndexEXT(sq, true);
+					bc    = rayQueryGetIntersectionBarycentricsEXT(sq, true);
 				}
 			}
-			if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-				float t    = rayQueryGetIntersectionTEXT(rq, true);
-				int   inst = rayQueryGetIntersectionInstanceIdEXT(rq, true);
-				int   prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-				vec2  bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-				hit        = MtShadeHit(o, Rw, t, inst, prim, bc, tmax, res);
-				hdist      = t;
+			if (t_hit < 0.0 && (self_ < 0 || self_range < tmax)) {
+				rayQueryEXT rq;
+				rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT, 0xff, o, self_ >= 0 ? self_range : 0.02, Rw, tmax);
+				while (rayQueryProceedEXT(rq)) {}
+				if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+					t_hit = rayQueryGetIntersectionTEXT(rq, true);
+					inst  = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+					prim  = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+					bc    = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+				}
+			}
+			if (t_hit >= 0.0) {
+				hit   = MtShadeHit(o, Rw, t_hit, inst, prim, bc, tmax, res);
+				hdist = t_hit;
 			}
 		}
 	}
@@ -1997,9 +2017,9 @@ void MtComposite(ivec2 px) {
 	float metal, rough;
 	bool  surf = MtSurface(px, P, N, Nd, metal, rough);
 	vec3  albedo = GbufAlbedo(px);
-	if (view == 1) { imageStore(out_a, px, vec4(vec3(surf ? metal : 0.0) / max(GameExposure(), 1e-6), base.a)); return; }
-	if (view == 2) { imageStore(out_a, px, vec4(vec3(surf ? rough : 0.0) / max(GameExposure(), 1e-6), base.a)); return; }
-	if (view == 3) { imageStore(out_a, px, vec4((surf && metal > 0.5 ? albedo : vec3(0)) / max(GameExposure(), 1e-6), base.a)); return; }
+	if (view == 1) { imageStore(out_a, px, vec4(vec3(surf ? metal : 0.0) * 0.25 / max(GameExposure(), 1e-6), base.a)); return; }
+	if (view == 2) { imageStore(out_a, px, vec4(vec3(surf ? rough : 0.0) * 0.25 / max(GameExposure(), 1e-6), base.a)); return; }
+	if (view == 3) { imageStore(out_a, px, vec4((surf && metal > 0.5 ? albedo : vec3(0)) * 0.25 / max(GameExposure(), 1e-6), base.a)); return; }
 	float mw = surf ? MtMetalW(metal) * MtRoughFade(rough) : 0.0;
 	if (mw < 0.02 || Bad(base)) {
 		if (view == 4) base.rgb = vec3(0);
@@ -2030,7 +2050,7 @@ void MtComposite(ivec2 px) {
 	float w    = clamp(0.85 * mw * conf * push.params.x * warm * (1.0 - 0.85 * keep), 0.0, 0.95);
 	vec3  outc = mix(base.rgb, ours, w);
 	float lout = Luma(outc);
-	if (lout > 2.5 * lb + 1e-5) outc *= (2.5 * lb + 1e-5) / lout;
+	if (lout > 1.75 * lb + 1e-5) outc *= (1.75 * lb + 1e-5) / lout; // (no glowing armour: at most 1.75x the game's pixel)
 	else if (lout < 0.4 * lb) outc *= 0.4 * lb / max(lout, 1e-6);
 	if (BadV(outc)) outc = base.rgb;
 	if (Sampled(px)) Stat(39, w > 0.05 ? 1 : 0);

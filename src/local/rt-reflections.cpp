@@ -1672,7 +1672,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		push.motion[2] = mc.tint, push.motion[3] = static_cast<float>(mc.view);
 		push.misc[2]   = mc.level;
 		push.dec[1]    = have_gbuf ? mc.rough : -1;
-		push.dec[3]    = (reset ? 0 : 1) | (mc.self_skip ? 2 : 0) | (hw ? 4 : 0);
+		// (views 1..3 show G-buffer fields only: no rays traced, so a view costs nothing beyond its passes)
+		const bool rays = hw && (mc.view == 0 || mc.view == 4);
+		push.dec[3]    = (reset ? 0 : 1) | (mc.self_skip ? 2 : 0) | (rays ? 4 : 0);
 		push.misc2[3]  = have_gbuf && mc.metal >= 0 ? mc.metal + 1 : 0;
 		{
 			Set s = base;
