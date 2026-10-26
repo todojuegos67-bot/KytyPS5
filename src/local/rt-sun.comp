@@ -334,7 +334,7 @@ float SunVis(vec3 p, vec3 n, float ndl, vec3 l, ivec2 pixel, out int ci) {
 // maps' bias and texels lose those; a farther one weighs hw.y (the captured geometry is opaque: alpha-tested leaves would
 // be solid cards). Beyond the cascades (no shadow map at all) every hit counts: the far-distance shadows.
 float HwSun(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel, bool in_casc) {
-	int lvl = int(sun.hw.x + 0.5);
+	int lvl = int(sun.hw.x + 0.5) & 7;
 	if (lvl <= 0) return 0.0;
 	float z  = abs(p.z);
 	vec4  p4 = vec4(p, 1.0);
@@ -392,8 +392,13 @@ void Trace(ivec2 pixel) {
 	float v = SunVis(p, n, ndl, l, pixel, ci);
 #ifdef KYTY_HWRT_SHADOW
 	// (KYTY_HWRT_SHADOW: the scene's rays instead of the screen-space contact march, which they cover and outdo)
+	// (hwrt2s fix 10-26: outside every cascade the composite has no V_game of the game's own (GameVis says lit), so a
+	// ray hit there took the whole assumed sun term out of pixels the game lit by ambient only: indoors, on frames whose
+	// one copied cascade did not hold the view, the screen went ~8 % bright (1 / (1 + R)). Rays only where a cascade holds
+	// the pixel, unless KYTY_HWRT_SHADOW_FAR=1 (hw.x + 8).)
 	if (sun.hw.x > 0.5) {
-		v = min(v, 1.0 - clamp(HwSun(p, n, l, ndl, pixel, ci >= 0), 0.0, 1.0));
+		bool far_ok = sun.hw.x > 7.5;
+		if (ci >= 0 || far_ok) v = min(v, 1.0 - clamp(HwSun(p, n, l, ndl, pixel, ci >= 0), 0.0, 1.0));
 		imageStore(out_img, pixel, vec4(isnan(v) ? 1.0 : clamp(v, 0.0, 1.0)));
 		return;
 	}
