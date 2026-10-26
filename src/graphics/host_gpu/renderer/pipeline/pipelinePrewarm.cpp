@@ -969,6 +969,19 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 		std::error_code ec;
 		std::filesystem::create_directories("_PipelineCache", ec);
 		ctx.path = std::filesystem::path("_PipelineCache") / (title_id + ".prewarm2");
+		// First-ever run: start from a shipped seed (PrewarmSeeds/<title>.prewarm2 or <title>.prewarm2
+		// beside the emulator) so the start-up warm-up builds the pipelines before gameplay.
+		if (!std::filesystem::exists(ctx.path, ec) || std::filesystem::file_size(ctx.path, ec) <= 8u) {
+			for (const auto& shipped: {std::filesystem::path("PrewarmSeeds") / (title_id + ".prewarm2"),
+			                           std::filesystem::path(title_id + ".prewarm2")}) {
+				if (std::filesystem::exists(shipped, ec) &&
+				    std::filesystem::copy_file(shipped, ctx.path,
+				                               std::filesystem::copy_options::overwrite_existing, ec)) {
+					std::printf("Prewarm: first run, using the shipped seed %s\n", shipped.string().c_str());
+					break;
+				}
+			}
+		}
 
 		uint64_t valid_end = 0;
 		if (std::FILE* f = std::fopen(ctx.path.string().c_str(), "rb"); f != nullptr) {
@@ -1094,7 +1107,19 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 		std::printf("Prewarm: waiting for the replay (%s)\n", only ? "KYTY_PREWARM_ONLY=1" : "KYTY_PREWARM_WAIT, default with a seed; 0 = play while it builds");
 		std::fflush(stdout);
 		std::unique_lock lock(ctx.mutex);
-		ctx.cv.wait(lock, [&] { return ctx.built + ctx.failed >= ctx.queue.size(); });
+		const auto total      = ctx.queue.size();
+		const auto wait_start = Clock::now();
+		while (!ctx.cv.wait_for(lock, std::chrono::seconds(2),
+		                        [&] { return ctx.built + ctx.failed >= ctx.queue.size(); })) {
+			const auto done = ctx.built + ctx.failed;
+			std::printf("Prewarm: warm-up %zu/%zu (%.0f%%), %.0f s\n", static_cast<size_t>(done), total,
+			            total != 0 ? 100.0 * static_cast<double>(done) / static_cast<double>(total) : 100.0,
+			            std::chrono::duration<double>(Clock::now() - wait_start).count());
+			std::fflush(stdout);
+		}
+		std::printf("Prewarm: warm-up done, %zu pipelines in %.1f s\n", total,
+		            std::chrono::duration<double>(Clock::now() - wait_start).count());
+		std::fflush(stdout);
 	}
 	return only;
 }
