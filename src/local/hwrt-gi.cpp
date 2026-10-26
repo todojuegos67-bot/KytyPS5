@@ -116,6 +116,9 @@ struct State {
 	VmaAllocation           stats_mem = VK_NULL_HANDLE;
 	uint32_t*               stats_map = nullptr;
 	uint64_t                st_sum[14] {};
+	uint64_t                y_votes[4] {};     // (hwrt5a) probes, as-is agree, mirrored agree, off-horizon probes
+	bool                    y_flip = false;    // (hwrt5a) the y convention in use (KYTY_HWRT_GI_FLIPY, else measured)
+	bool                    y_init = false;
 	uint32_t                st_frames = 0;
 	std::chrono::steady_clock::time_point st_last = std::chrono::steady_clock::now();
 	vk::Extent2D            render {}, trace {};
@@ -349,6 +352,8 @@ void ReadStats(GraphicContext& graphics) {
 	const uint32_t* w = g_gi.stats_map + ((g_gi.frame + 1) % StatSlots) * StatWords;
 	for (int i = 0; i < 14; ++i)
 		g_gi.st_sum[i] += w[i];
+	for (int i = 0; i < 4; ++i)
+		g_gi.y_votes[i] += w[40 + i];
 	++g_gi.st_frames;
 	const auto now = std::chrono::steady_clock::now();
 	if (now - g_gi.st_last < std::chrono::seconds(2)) return;
@@ -368,6 +373,19 @@ void ReadStats(GraphicContext& graphics) {
 		            "ray dirs dot %.5f; depth normal (%.2f %.2f %.2f), G-buffer normal (%.2f %.2f %.2f)\n",
 		            f[0], f[1], f[2], f[3], f[8], f[9], f[10], f[7], f[7] >= 0.0f ? std::sqrt(dx * dx + dy * dy + dz * dz) : -1.0f,
 		            f[12], f[13], f[14], f[4], f[5], f[6], f[11], f[23], f[15], f[16], f[17], f[18], f[20], f[21], f[22]);
+	}
+	{ // (hwrt5a) the y convention vote
+		const auto& y = g_gi.y_votes;
+		static const bool forced = std::getenv("KYTY_HWRT_GI_FLIPY") != nullptr;
+		const bool        flip   = !forced && y[0] >= 64 && y[2] > y[1] + y[0] / 5 && y[2] * 2 > y[0];
+		std::printf("HWRTGI: self-test y convention: %llu probes (%llu off the horizon): primary rays at the depth's distance %.1f%% as used "
+		            "(y %s), %.1f%% mirrored%s\n",
+		            static_cast<unsigned long long>(y[0]), static_cast<unsigned long long>(y[3]), pct(y[1], y[0]),
+		            g_gi.y_flip ? "flipped" : "as is", pct(y[2], y[0]),
+		            flip ? " -> switching to the mirrored convention" : forced ? " (KYTY_HWRT_GI_FLIPY set: kept)" : "");
+		if (flip) g_gi.y_flip = !g_gi.y_flip, g_gi.history_valid = false;
+		for (auto& v: g_gi.y_votes)
+			v = 0;
 	}
 	std::fflush(stdout);
 	for (auto& v: g_gi.st_sum)
@@ -436,6 +454,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const int          gi_rays     = cfg.gi == 0 ? 0 : level == 1 ? 1 : 2;
 	const int          passes      = level == 1 ? 2 : 3;
 	const bool         half        = g_gi.trace != g_gi.render;
+	if (!g_gi.y_init) g_gi.y_init = true, g_gi.y_flip = flip_y;
 
 	RtReflGbuffer gbuf;
 	const bool    have_gbuf = RtReflGetGbuffer(gbuf) && gbuf.extent == color.extent;
@@ -467,7 +486,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	ubo.par[0] = gi_range, ubo.par[1] = ao_floor, ubo.par[2] = fade_start, ubo.par[3] = fade_start * 2.0f;
 	ubo.cfg[0] = ao_rays, ubo.cfg[1] = gi_rays, ubo.cfg[2] = level;
 	ubo.cfg[3] = (inputs.reset ? 1 : 0) | (g_gi.history_valid ? 2 : 0) | (normals ? 4 : 0) | (albedo ? 8 : 0) | (half ? 16 : 0) |
-	             (cfg.ao > 0 ? 32 : 0) | (cfg.gi > 0 ? 64 : 0) | (flip_y ? 128 : 0);
+	             (cfg.ao > 0 ? 32 : 0) | (cfg.gi > 0 ? 64 : 0) | (g_gi.y_flip ? 128 : 0);
 	ubo.cfg2[0] = static_cast<int32_t>(g_gi.frame), ubo.cfg2[1] = view;
 	ubo.cfg2[2] = static_cast<int32_t>(g_gi.frame % StatSlots);
 	ReadStats(*graphics);
