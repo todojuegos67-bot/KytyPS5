@@ -7313,6 +7313,10 @@ struct CShadowPass {
 	// (KYTY_HWRT_SHADOW) The pipeline traces the scene TLAS; one was built at least once; the 10 s line's counts.
 	bool                    hw = false, hw_seen = false, hw_now = false;
 	uint32_t                hw_traced = 0, hw_stale = 0, hw_none = 0;
+	// (the darkening outliers and the self-test, from the statistics frames)
+	double                  hw_px = 0.0, hw_out = 0.0, hw_big = 0.0, hw_amount = 0.0, hw_sun_cos = -1.0;
+	float                   hw_test[5] {};
+	float                   hw_test_max = 0.0f;
 	std::array<double, 3>   latch_axis {}, switch_axis {};
 	float                   fade = 0.0f;
 	std::chrono::steady_clock::time_point latch_time {}, last_fresh {};
@@ -8033,7 +8037,7 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 			return false;
 		}
 		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-		create.size  = 128 * sizeof(uint32_t); // (calibration slots, then statistics; KYTY_RT_SUN's from word 80)
+		create.size  = (g_cs.hw ? 192 : 128) * sizeof(uint32_t); // (calibration slots, then statistics; KYTY_RT_SUN's from word 80; KYTY_HWRT_SHADOW's 128..135)
 		create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 		VmaAllocationCreateInfo allocate {};
 		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
@@ -8178,18 +8182,29 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 		c[12] = static_cast<float>(cs[i].k), c[13] = cs[i].texel, c[14] = cs[i].mz, c[15] = 1.0f;
 	}
 	if (g_cs.hw) {
-		// (KYTY_HWRT_SHADOW: rt-sun.comp SunBuf w0..w2, hw: after the 8 cascades, float 144) view -> the TLAS's world (the
-		// same G-buffer view-projection the scene capture inverts), the level (0: no TLAS this frame), the far-hit weight
-		// inside the cascades, the ray length, the contact range.
-		static const float miss    = RtSunEnv("KYTY_HWRT_SHADOW_MISS", 0.5f, 0.0f, 1.0f);
-		static const float range   = RtSunEnv("KYTY_HWRT_SHADOW_RANGE", HwShadowLevel() >= 3 ? 500.0f : HwShadowLevel() >= 2 ? 300.0f : 150.0f, 5.0f, 2000.0f);
+		// (KYTY_HWRT_SHADOW: rt-sun.comp SunBuf after the 8 cascades, float 144) inv: clip -> the TLAS's world (the inverse of
+		// the same G-buffer view-projection the scene capture inverts); hw: the level (+8 far; 0: no TLAS), the far-hit
+		// margin below the cascades' visibility, the ray length, the contact range; cam; sunw; w0..w2 the cascades' view ->
+		// world (the self-test's other reconstruction).
+		static const float miss      = RtSunEnv("KYTY_HWRT_SHADOW_MISS", 0.25f, 0.0f, 1.0f);
+		static const float range     = RtSunEnv("KYTY_HWRT_SHADOW_RANGE", HwShadowLevel() >= 3 ? 500.0f : HwShadowLevel() >= 2 ? 300.0f : 150.0f, 5.0f, 2000.0f);
 		static const float contact_m = RtSunEnv("KYTY_HWRT_SHADOW_CONTACT", 1.0f, 0.05f, 20.0f);
-		float* w = f + 144;
-		for (int i = 0; i < 3; ++i)
-			for (int j = 0; j < 4; ++j) w[i * 4 + j] = static_cast<float>(vi[i * 4 + j]);
-		static const bool hw_far = RtSunEnv("KYTY_HWRT_SHADOW_FAR", 0.0f, 0.0f, 1.0f) > 0.5f; // (rays beyond the cascades too)
-		w[12] = g_cs.hw_now ? static_cast<float>(HwShadowLevel() + (hw_far ? 8 : 0)) : 0.0f;
-		w[13] = miss, w[14] = range, w[15] = contact_m;
+		static const bool  hw_far    = RtSunEnv("KYTY_HWRT_SHADOW_FAR", 0.0f, 0.0f, 1.0f) > 0.5f; // (rays beyond the cascades too)
+		std::array<double, 16> inv_vp {};
+		const bool             inv_ok = Inverse4(vp, inv_vp);
+		float*                 w      = f + 144;
+		for (int i = 0; i < 16; ++i) w[i] = static_cast<float>(inv_vp[i]);
+		w[16] = g_cs.hw_now && inv_ok ? static_cast<float>(HwShadowLevel() + (hw_far ? 8 : 0)) : 0.0f;
+		w[17] = miss, w[18] = range, w[19] = contact_m;
+		w[20] = static_cast<float>(vi[3]), w[21] = static_cast<float>(vi[7]), w[22] = static_cast<float>(vi[11]), w[23] = 1.0f;
+		w[24] = static_cast<float>(g_cs.latch_axis[0]), w[25] = static_cast<float>(g_cs.latch_axis[1]);
+		w[26] = static_cast<float>(g_cs.latch_axis[2]), w[27] = 0.0f;
+		for (int i = 0; i < 12; ++i) w[28 + i] = static_cast<float>(vi[i]);
+		// The sun-direction check: the finest cascade's light depth axis (world) against the latched sun.
+		const auto& mm = table[cs.front().k].m;
+		const double nz = std::sqrt(double(mm[8]) * mm[8] + double(mm[9]) * mm[9] + double(mm[10]) * mm[10]);
+		if (nz > 1e-9)
+			g_cs.hw_sun_cos = std::abs((mm[8] * g_cs.latch_axis[0] + mm[9] * g_cs.latch_axis[1] + mm[10] * g_cs.latch_axis[2]) / nz);
 	}
 	(void)vmaFlushAllocation(g_graphics_ctx->allocator, g_rs.buf_mem, slot * kRtSunSlotBytes, kRtSunSlotBytes);
 	g_rs.cascades_used = static_cast<uint32_t>(cs.size());
@@ -8288,8 +8303,16 @@ void RtSunLog(double gpu_ms, uint32_t samples) {
 		std::printf("HWRTSHADOW: 10 s: %u frames traced with this frame's TLAS, %u with an older one, %u without (level %d, trace %ux%u; "
 		            "the GPU above is the whole sun pass)\n",
 		            g_cs.hw_traced, g_cs.hw_stale, g_cs.hw_none, HwShadowLevel(), g_cs.trace.width, g_cs.trace.height);
+		const double px = std::max(g_cs.hw_px, 1.0);
+		std::printf("HWRTSHADOW: outliers: %.3f %% of traced pixels darkened by the rays > 0.25, %.3f %% > 0.6, mean of those %.2f; "
+		            "self-test (centre pixel): reconstructions %.3f m apart (max %.3f) at %.1f m, world-view N.L %+.3f, world light . "
+		            "sun %.4f, camera distance error %+.3f m; sun . finest cascade's depth axis %.4f\n",
+		            100.0 * g_cs.hw_out / px, 100.0 * g_cs.hw_big / px, g_cs.hw_out > 0.0 ? g_cs.hw_amount / g_cs.hw_out : 0.0,
+		            g_cs.hw_test[0], g_cs.hw_test_max, g_cs.hw_test[1], g_cs.hw_test[2], g_cs.hw_test[3], g_cs.hw_test[4], g_cs.hw_sun_cos);
 		std::fflush(stdout);
 		g_cs.hw_traced = g_cs.hw_stale = g_cs.hw_none = 0;
+		g_cs.hw_px = g_cs.hw_out = g_cs.hw_big = g_cs.hw_amount = 0.0;
+		g_cs.hw_test_max = 0.0f;
 	}
 }
 
@@ -8317,6 +8340,12 @@ void CShadowTakeStats() {
 		g_cs.st_n += v[0], g_cs.st_occ += v[1] / 256.0, g_cs.st_depth += v[2] / 2.0;
 		++g_cs.st_samples;
 		if (RtSunLevel() > 0) RtSunTakeCalib(v, static_cast<double>(g_cs.render.width) * g_cs.render.height);
+		if (g_cs.hw) {
+			g_cs.hw_px += static_cast<double>(g_cs.trace.width) * g_cs.trace.height;
+			g_cs.hw_out += v[64], g_cs.hw_big += v[65], g_cs.hw_amount += v[66] / 256.0;
+			for (int i = 0; i < 5; ++i) std::memcpy(&g_cs.hw_test[i], &v[67 + i], 4);
+			if (std::isfinite(g_cs.hw_test[0])) g_cs.hw_test_max = std::max(g_cs.hw_test_max, g_cs.hw_test[0]);
+		}
 		// The light probe: geometric means of the sun-facing and facing-away luminance (log2 * 32 + 40 * 32 codes).
 		if (v[4] >= 200 && v[6] >= 200) {
 			const double lk = std::clamp((static_cast<double>(v[5]) / v[4] - static_cast<double>(v[7]) / v[6]) / 32.0, 0.0, 6.0);
@@ -8758,7 +8787,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// The statistics on every 16th frame (one in flight).
 	const bool stats = g_cs.stat_frame < 0 && g_cs.frame % 16 == 8;
 	if (stats) {
-		command.fillBuffer(vk::Buffer(g_cs.vote), 64 * 4, (sun_mode ? 64 : 8) * 4, 0); // (statistics 64..66, light probe 68..71; KYTY_RT_SUN 80..124)
+		command.fillBuffer(vk::Buffer(g_cs.vote), 64 * 4, (g_cs.hw ? 128 : sun_mode ? 64 : 8) * 4, 0); // (statistics 64..66, light probe 68..71; KYTY_RT_SUN 80..124)
 		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
 		       vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
 	}
@@ -8843,7 +8872,9 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_cs.history_valid ? 2 : 0) | (hyp < 6 ? 4 : 0); // (slot 0: statistics at word 64)
 	// trace -> raw (+ gbuf[cur]); temporal (raw, history[prev]) -> tmp_a, count -> moments[cur]; a-trous 1 -> history[cur]
 	// (next frame's history); a-trous 2 -> tmp_b; (a-trous 4 -> tmp_a); composite -> out.
+	if (stats && g_cs.hw) push.misc[3] |= 16; // (KYTY_HWRT_SHADOW: the trace counts its darkening outliers)
 	run(0, g_cs.tmp_a, g_cs.tmp_b, g_cs.raw, g_cs.gbuf[cur], 0.0f, g_cs.trace);
+	push.misc[3] &= ~16;
 	run(1, g_cs.raw, g_cs.history[prev], g_cs.tmp_a, g_cs.tmp_b, 0.0f, g_cs.trace);
 	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_a;
 	run(2, g_cs.tmp_a, g_cs.raw, g_cs.history[cur], g_cs.tmp_b, 1.0f, g_cs.trace);
