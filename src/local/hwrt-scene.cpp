@@ -1465,6 +1465,15 @@ void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageVie
 	});
 }
 
+vk::AccelerationStructureKHR SceneTlas(bool* built_now) {
+	if (built_now != nullptr) *built_now = false;
+	if (!Active()) return nullptr;
+	std::lock_guard lock(g.mutex);
+	if (!g.ready || g.tlas == nullptr) return nullptr;
+	if (built_now != nullptr) *built_now = g.tlas_built;
+	return g.tlas;
+}
+
 void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, std::span<const TextureBinding> images) {
 	if (!Active()) return;
 	EndFrame(graphics, command, "the TAA dispatch");

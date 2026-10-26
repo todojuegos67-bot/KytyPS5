@@ -32,6 +32,8 @@
 #include "local/rt-local-lights.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
 #include "gpu_tiler_shaders/rtsun_spv.h"
+#include "gpu_tiler_shaders/rtsun_hw_spv.h"
+#include "local/hwrt-scene.h"
 #include "kernel/memory.h"
 #include <string>
 #endif
@@ -7308,6 +7310,9 @@ struct CShadowPass {
 	uint64_t                space_flip = ~0ull;
 	// The latched world-space sun (toward the light).
 	bool                    latched = false, switching = false, said_on = false;
+	// (KYTY_HWRT_SHADOW) The pipeline traces the scene TLAS; one was built at least once; the 10 s line's counts.
+	bool                    hw = false, hw_seen = false, hw_now = false;
+	uint32_t                hw_traced = 0, hw_stale = 0, hw_none = 0;
 	std::array<double, 3>   latch_axis {}, switch_axis {};
 	float                   fade = 0.0f;
 	std::chrono::steady_clock::time_point latch_time {}, last_fresh {};
@@ -7331,11 +7336,37 @@ struct CShadowPush {
 };
 static_assert(sizeof(CShadowPush) == 176);
 
-// (rtsun) KYTY_RT_SUN=0..3: the cascades' visibility pass (frame-gen.h RtSunWanted); 0 when unset.
+// (hwrt2s) KYTY_HWRT_SHADOW=0..3: the sun's rays through the scene TLAS (KYTY_HWRT=1, hwrt-scene.h) joined to KYTY_RT_SUN's
+// cascades in its trace pass (rt-sun.comp HwSun, the RTSUN_HW_SPV build): contact shadows the maps' bias loses, small
+// casters their texels miss, and every caster beyond the last cascade. 1: half-resolution trace, a ray a pixel (first
+// hit), 150 m; 2: the same, 300 m; 3: full resolution, two rays (closest hit), 500 m. It runs KYTY_RT_SUN's plumbing at
+// its own level when KYTY_RT_SUN is unset. 0 / unset: nothing (KYTY_RT_SUN and everything else exactly as before).
+int HwShadowLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_HWRT_SHADOW");
+		const int   q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		if (q > 0) {
+			std::printf("HWRTSHADOW: KYTY_HWRT_SHADOW=%s read (level %d)%s\n", value, q,
+			            HwScene::Requested() ? "" : ": needs KYTY_HWRT=1 too: off");
+			std::fflush(stdout);
+		}
+		return HwScene::Requested() ? q : 0;
+	}();
+	return level;
+}
+
+// (rtsun) KYTY_RT_SUN=0..3: the cascades' visibility pass (frame-gen.h RtSunWanted); 0 when unset (KYTY_HWRT_SHADOW's
+// level then, when that is set).
 int RtSunLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_RT_SUN");
-		const int   q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		int         q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		if ((value == nullptr || *value == '\0') && HwShadowLevel() > 0) {
+			q = HwShadowLevel();
+			std::printf("RTSUN: KYTY_RT_SUN unset: level %d for KYTY_HWRT_SHADOW\n", q);
+			std::fflush(stdout);
+			return q;
+		}
 		if (q > 0) {
 			std::printf("RTSUN: KYTY_RT_SUN=%s read (level %d: %s)\n", value, q, q == 1 ? "low" : q == 2 ? "high" : "ultra");
 			std::fflush(stdout);
@@ -7955,11 +7986,14 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 			}
 		}
 		// (KYTY_RT_SUN: rt-sun.comp, two more: 12 the cascades' copy, 13 their matrices' buffer)
-		const uint32_t count = RtSunLevel() > 0 ? 14u : 12u;
-		std::array<vk::DescriptorSetLayoutBinding, 14> bindings {};
+		// (KYTY_HWRT_SHADOW, while the device has ray queries: 14 the scene TLAS)
+		g_cs.hw = RtSunLevel() > 0 && HwShadowLevel() > 0 && HwScene::Active();
+		const uint32_t count = g_cs.hw ? 15u : RtSunLevel() > 0 ? 14u : 12u;
+		std::array<vk::DescriptorSetLayoutBinding, 15> bindings {};
 		for (uint32_t i = 0; i < count; ++i) {
 			bindings[i].binding         = i;
-			bindings[i].descriptorType  = i == 11 || i == 13 ? vk::DescriptorType::eStorageBuffer
+			bindings[i].descriptorType  = i == 14 ? vk::DescriptorType::eAccelerationStructureKHR
+			                              : i == 11 || i == 13 ? vk::DescriptorType::eStorageBuffer
 			                              : i < 7 || i == 9 || i == 12 ? vk::DescriptorType::eCombinedImageSampler
 			                                                           : vk::DescriptorType::eStorageImage;
 			bindings[i].descriptorCount = 1;
@@ -7978,8 +8012,13 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		layout_info.pPushConstantRanges    = &push;
 		if (device.createPipelineLayout(&layout_info, nullptr, &g_cs.layout) != vk::Result::eSuccess) return false;
 		vk::ShaderModuleCreateInfo module_info {};
-		module_info.codeSize    = RtSunLevel() > 0 ? sizeof(RTSUN_SPV) : sizeof(CSHADOW_SPV);
-		module_info.pCode       = RtSunLevel() > 0 ? RTSUN_SPV : CSHADOW_SPV;
+		module_info.codeSize    = g_cs.hw ? sizeof(RTSUN_HW_SPV) : RtSunLevel() > 0 ? sizeof(RTSUN_SPV) : sizeof(CSHADOW_SPV);
+		module_info.pCode       = g_cs.hw ? RTSUN_HW_SPV : RtSunLevel() > 0 ? RTSUN_SPV : CSHADOW_SPV;
+		if (HwShadowLevel() > 0) {
+			std::printf("HWRTSHADOW: %s\n", g_cs.hw ? "the sun pass traces the scene TLAS (rt-sun.comp with HwSun)"
+			                                          : "the device has no ray queries (KYTY_HWRT inactive): KYTY_RT_SUN alone");
+			std::fflush(stdout);
+		}
 		vk::ShaderModule module = nullptr;
 		if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
 		vk::ComputePipelineCreateInfo pipeline_info {};
@@ -8028,7 +8067,9 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 	                  &g_cs.gbuf[1], &g_cs.moments[0], &g_cs.moments[1], &g_cs.var_a, &g_cs.var_b};
 	for (auto* img : all)
 		SsgiFreeImage(graphics, *img);
-	const vk::Extent2D trace = quality >= 2 ? render : vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
+	// (KYTY_HWRT_SHADOW 1, 2: a half-resolution trace whatever KYTY_RT_SUN's level; 3: full)
+	const bool         half  = quality < 2 || (g_cs.hw && HwShadowLevel() < 3);
+	const vk::Extent2D trace = !half ? render : vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
 	bool ok = SsgiMakeImage(graphics, g_cs.out, render);
 	for (auto* img : all)
 		if (img != &g_cs.out) ok = ok && SsgiMakeImage(graphics, *img, trace);
@@ -8136,6 +8177,19 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 		for (int j = 0; j < 12; ++j) c[j] = static_cast<float>(cs[i].r[j]);
 		c[12] = static_cast<float>(cs[i].k), c[13] = cs[i].texel, c[14] = cs[i].mz, c[15] = 1.0f;
 	}
+	if (g_cs.hw) {
+		// (KYTY_HWRT_SHADOW: rt-sun.comp SunBuf w0..w2, hw: after the 8 cascades, float 144) view -> the TLAS's world (the
+		// same G-buffer view-projection the scene capture inverts), the level (0: no TLAS this frame), the far-hit weight
+		// inside the cascades, the ray length, the contact range.
+		static const float miss    = RtSunEnv("KYTY_HWRT_SHADOW_MISS", 0.5f, 0.0f, 1.0f);
+		static const float range   = RtSunEnv("KYTY_HWRT_SHADOW_RANGE", HwShadowLevel() >= 3 ? 500.0f : HwShadowLevel() >= 2 ? 300.0f : 150.0f, 5.0f, 2000.0f);
+		static const float contact_m = RtSunEnv("KYTY_HWRT_SHADOW_CONTACT", 1.0f, 0.05f, 20.0f);
+		float* w = f + 144;
+		for (int i = 0; i < 3; ++i)
+			for (int j = 0; j < 4; ++j) w[i * 4 + j] = static_cast<float>(vi[i * 4 + j]);
+		w[12] = g_cs.hw_now ? static_cast<float>(HwShadowLevel()) : 0.0f;
+		w[13] = miss, w[14] = range, w[15] = contact_m;
+	}
 	(void)vmaFlushAllocation(g_graphics_ctx->allocator, g_rs.buf_mem, slot * kRtSunSlotBytes, kRtSunSlotBytes);
 	g_rs.cascades_used = static_cast<uint32_t>(cs.size());
 	g_rs.texel_min = cs.front().texel, g_rs.texel_max = cs.back().texel;
@@ -8229,6 +8283,13 @@ void RtSunLog(double gpu_ms, uint32_t samples) {
 	std::fflush(stdout);
 	g_rs.st_dark = g_rs.st_lift = g_rs.st_amount = g_rs.st_pixels = 0.0;
 	g_rs.st_frames = 0;
+	if (g_cs.hw) {
+		std::printf("HWRTSHADOW: 10 s: %u frames traced with this frame's TLAS, %u with an older one, %u without (level %d, trace %ux%u; "
+		            "the GPU above is the whole sun pass)\n",
+		            g_cs.hw_traced, g_cs.hw_stale, g_cs.hw_none, HwShadowLevel(), g_cs.trace.width, g_cs.trace.height);
+		std::fflush(stdout);
+		g_cs.hw_traced = g_cs.hw_stale = g_cs.hw_none = 0;
+	}
 }
 
 void CShadowReadTiming() {
@@ -8495,6 +8556,21 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// (KYTY_RT_SUN: the cascades copied lately, their matrices into this frame's slot of the buffer; else nothing yet)
 	const bool sun_mode = RtSunLevel() > 0;
 	const uint32_t sun_slot = g_cs.frame % 4;
+	// (KYTY_HWRT_SHADOW: the TLAS built this frame, before this pass on the same command stream; an older frame's while
+	// this one built none; no rays until one was ever built)
+	vk::AccelerationStructureKHR hw_tlas = nullptr;
+	if (g_cs.hw) {
+		bool built = false;
+		hw_tlas    = HwScene::SceneTlas(&built);
+		g_cs.hw_seen = g_cs.hw_seen || (hw_tlas != nullptr && built);
+		if (hw_tlas == nullptr || !g_cs.hw_seen) {
+			// (the pipeline's layout has the binding: no TLAS yet, no pass)
+			++g_cs.hw_none;
+			return said_once("KYTY_HWRT_SHADOW: no scene TLAS built yet"), false;
+		}
+		g_cs.hw_now = true;
+		++(built ? g_cs.hw_traced : g_cs.hw_stale);
+	}
 	if (sun_mode && !RtSunPrepare(m, vp, sun_slot)) {
 		// (10-25 godfix: the cascades are copied only on some frames; the latched sun still feeds the god rays and shine in
 		// the meantime, in this frame's view, else they lost the sun 250 ms later and popped off and on.)
@@ -8638,12 +8714,18 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		// (KYTY_RT_SUN: 12 the cascades' copy, 13 this frame's slot of their buffer)
 		const vk::DescriptorImageInfo  casc_info {pt, g_rs.view, vk::ImageLayout::eShaderReadOnlyOptimal};
 		const vk::DescriptorBufferInfo sun_info {vk::Buffer(g_rs.buf), vk::DeviceSize {sun_slot} * kRtSunSlotBytes, kRtSunSlotBytes};
-		const uint32_t                 count = sun_mode ? 14u : 12u;
-		vk::WriteDescriptorSet         writes[14] {};
+		const uint32_t                 count = g_cs.hw ? 15u : sun_mode ? 14u : 12u;
+		vk::WriteDescriptorSet         writes[15] {};
+		vk::WriteDescriptorSetAccelerationStructureKHR as_write {};
+		as_write.accelerationStructureCount = 1;
+		as_write.pAccelerationStructures    = &hw_tlas;
 		for (uint32_t i = 0; i < count; ++i) {
 			writes[i].dstBinding      = i;
 			writes[i].descriptorCount = 1;
-			if (i == 11 || i == 13) {
+			if (i == 14) {
+				writes[i].descriptorType = vk::DescriptorType::eAccelerationStructureKHR;
+				writes[i].pNext          = &as_write;
+			} else if (i == 11 || i == 13) {
 				writes[i].descriptorType = vk::DescriptorType::eStorageBuffer;
 				writes[i].pBufferInfo    = i == 11 ? &vote_info : &sun_info;
 			} else if (i == 12) {

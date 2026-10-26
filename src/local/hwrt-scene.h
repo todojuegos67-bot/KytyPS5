@@ -94,6 +94,9 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* where);
 // KYTY_HWRT_DEBUG's view into an RGBA16F storage image in the GENERAL layout (the PS5 Pro path: the upscaled output).
 void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageView view, vk::Format format, vk::Extent2D extent);
+// (KYTY_HWRT_SHADOW, frame-gen.cpp) The scene TLAS for a ray query pass recorded after this frame's build, in order with it
+// (null until one exists); built_now: it was built this frame (else it holds an older frame's scene).
+[[nodiscard]] vk::AccelerationStructureKHR SceneTlas(bool* built_now);
 
 } // namespace HwScene
 } // namespace Libs::Graphics
