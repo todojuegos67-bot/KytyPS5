@@ -765,15 +765,15 @@ void PipelineCache::SaveInternal(bool background) {
 	}
 }
 
-void PipelineCache::WriteDriverCacheFile(const std::filesystem::path& m_driver_cache_path,
+void PipelineCache::WriteDriverCacheFile(const std::filesystem::path& cache_path,
                                          std::string prefix, const std::vector<uint8_t>& payload) {
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
-	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
+	if (!Common::File::CreateDirectories(cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
 		return;
 	}
-	auto temp_path = m_driver_cache_path;
+	auto temp_path = cache_path;
 	temp_path += ".tmp";
 	Common::File file;
 	uint32_t     prefix_written  = 0;
@@ -787,16 +787,16 @@ void PipelineCache::WriteDriverCacheFile(const std::filesystem::path& m_driver_c
 	const bool written = prefix_written == prefix.size() && payload_written == payload.size() && flushed;
 	std::error_code error;
 	if (written) {
-		std::filesystem::rename(temp_path, m_driver_cache_path, error);
+		std::filesystem::rename(temp_path, cache_path, error);
 	}
 	if (!written || error) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
-		                 Common::PathToString(m_driver_cache_path));
+		                 Common::PathToString(cache_path));
 		return;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
-	                 Common::PathToString(m_driver_cache_path));
+	                 Common::PathToString(cache_path));
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(

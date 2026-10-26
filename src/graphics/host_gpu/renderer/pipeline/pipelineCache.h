@@ -212,7 +212,7 @@ private:
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
 	void SaveInternal(bool background);
-	static void WriteDriverCacheFile(const std::filesystem::path& m_driver_cache_path, std::string prefix,
+	static void WriteDriverCacheFile(const std::filesystem::path& cache_path, std::string prefix,
 	                                 const std::vector<uint8_t>& payload);
 	std::thread m_save_thread;
 	vk::PipelineCache AsyncJobCache();
