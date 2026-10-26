@@ -662,7 +662,7 @@ void Composite(ivec2 p) {
 	vec2  qp = uv * qs - 0.5;
 	ivec2 q0 = ivec2(floor(qp));
 	vec2  f  = qp - vec2(q0);
-	float vs = 0.0, ws = 0.0;
+	float vs = 0.0, ws = 0.0, wm = 0.0, vmin = 4.0;
 	for (int k = 0; k < 4; ++k) {
 		ivec2 o  = ivec2(k & 1, k >> 1);
 		ivec2 qq = clamp(q0 + o, ivec2(0), ivec2(qs) - 1);
@@ -670,9 +670,14 @@ void Composite(ivec2 p) {
 		float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
 		float dw = exp(-abs(v.y - vz) / max(0.05 * vz, 0.05));
 		float w  = bw * dw + 1e-4 * bw;
-		vs += v.x * w, ws += w;
+		vs += v.x * w, ws += w, wm += bw * dw;
+		vmin = min(vmin, Fin(v.x, 0.0, 4.0));
 	}
 	float vol = ws > 0.0 ? Fin(vs / ws, 0.0, 4.0) : 0.0;
+	// (vol3: a thin full-res edge (a far ledge, a rooftop, a walkway rail) whose depth matches none of its 4 quarter texels
+	// took their plain bilinear mix: the long, lit march of the fog / sky behind it, drawn as white lines along every
+	// silhouette. Without a depth match: the darkest of the 4, never more.)
+	vol = mix(vmin, vol, smoothstep(0.02, 0.25, wm));
 	// (the far backdrop already carries the game's fog: half there)
 	vol *= mix(1.0, 0.5, smoothstep(80.0, 300.0, vz));
 	vec3 add = vol * sunc.rgb * push.size.z * 0.6;
