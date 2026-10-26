@@ -225,7 +225,7 @@ void Track() {
 		// The cells' mean brightest-tap luminance (cells without a valid tap count as 0): a lamp must stand 2.5x above it,
 		// at least L_FLOOR + 0.25, at most hdr.y. Smoothed (~1 s) so it never toggles the lights.
 		float sum = 0.0;
-		for (int i = 0; i < CW * CH; ++i) sum += min(cand[i * 2].x, 8.0);
+		for (int i = 0; i < CW * CH; ++i) sum += min(cand[i * 2].x, 1.0); // (clamped: sun patches through windows or a few lamps barely move it)
 		float tt = clamp(2.5 * sum / float(CW * CH), L_FLOOR + 0.25, hdr.y);
 		float t  = L_ADAPT;
 		t        = (isnan(t) || t <= 0.0) ? tt : mix(t, tt, 0.02);
