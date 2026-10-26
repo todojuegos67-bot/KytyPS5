@@ -272,7 +272,8 @@ bool EnsurePipeline(GraphicContext& graphics) {
 
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level) {
 	if (g_gi.out.image != VK_NULL_HANDLE && g_gi.render == render) return true;
-	const vk::Extent2D trace = level >= 3 ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
+	// (ao2) every level half res: level 3 at full res traced 1920x1080 x 3 rays (8 ms on a 5080); it gets more rays instead
+	const vk::Extent2D trace = false ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
 	for (auto* img : TraceImages())
 		FreeImage(graphics, *img);
 	bool ok = MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, render, true, g_gi.out);
@@ -439,7 +440,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	ReadTiming(*graphics);
 	++g_gi.frames_on;
 
-	static const float ao_radius   = EnvFloat("KYTY_HWRT_AO_RADIUS", 1.0f, 0.05f, 8.0f);
+	static const float ao_radius   = EnvFloat("KYTY_HWRT_AO_RADIUS", 2.0f, 0.05f, 8.0f);
 	static const float ao_strength = EnvFloat("KYTY_HWRT_AO_STRENGTH", 1.0f, 0.0f, 1.0f);
 	static const float ao_floor    = EnvFloat("KYTY_HWRT_AO_FLOOR", 0.35f, 0.2f, 1.0f);
 	static const float gi_int      = EnvFloat("KYTY_HWRT_GI_INTENSITY", 0.5f, 0.0f, 4.0f);
