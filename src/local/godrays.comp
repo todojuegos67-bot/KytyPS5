@@ -77,6 +77,24 @@ float HwVis(vec3 x, vec3 lw) {
 
 const int CW = 16;
 const int CH = 9;
+#ifdef KYTY_HWRT_VOLUMETRIC
+// (hwrt3v-2: the lamp halos popped in and out in the Boletaria hall: lights crossing the threshold / the 6 m and 45 m
+// gates / losing their match for a few frames. Here: candidates kept down to 60 % of the threshold and 4..55 m (new
+// lights still need the full threshold), a wider match, ~1.4 s fade in, ~2.8 s fade out.)
+#define L_NEAR 4.0
+#define L_FAR 55.0
+#define L_MATCH 3.5
+#define L_IN 0.012
+#define L_OUT 0.006
+#define L_THRESH (hdr.y * 0.6)
+#else
+#define L_NEAR 6.0
+#define L_FAR 45.0
+#define L_MATCH 2.5
+#define L_IN 0.06
+#define L_OUT 0.03
+#define L_THRESH hdr.y
+#endif
 
 vec2  RenderSize() { return push.size.xy; }
 float YS() { return (push.misc.z & 1) != 0 ? -1.0 : 1.0; }
@@ -140,7 +158,7 @@ void Lights(uvec3 wg, uint li) {
 	float l    = Luma(c);
 	// (nearer than 6 m: the player's own lantern, a torch held in front of the camera: a halo there is a haze over
 	// the whole character, not a shaft; rejected here so it never takes a slot)
-	bool  ok   = !IsSky(d) && abs(ViewZ(d)) < 45.0 && abs(ViewZ(d)) > 6.0 && l > hdr.y;
+	bool  ok   = !IsSky(d) && abs(ViewZ(d)) < L_FAR && abs(ViewZ(d)) > L_NEAR && l > L_THRESH;
 	// (luminance in the high 26 bits, the tap in the low 6: the max picks the brightest)
 	s_best[li] = ok ? ((min(uint(l * 1024.0), 0x3ffffffu) << 6) | li) : 0u;
 	barrier();
@@ -200,10 +218,13 @@ void Track() {
 		vec4 a = lights[k * 2];
 		vec4 b = lights[k * 2 + 1];
 		if (a.w <= 0.0) continue;
+#ifdef KYTY_HWRT_VOLUMETRIC
+		float w_before = a.w;
+#endif
 		// Reproject: the motion at the old place points to the previous frame; step the other way.
 		if (push.motion.z > 0.0) a.xy -= textureLod(motion_tex, a.xy, 0).xy * push.motion.xy / rs;
 		int   best = -1;
-		float bd   = 2.5;
+		float bd   = L_MATCH;
 		for (int i = 0; i < CW * CH; ++i) {
 			vec4 c = cand[i * 2];
 			if (claimed[i] || c.x <= 0.0) continue;
@@ -219,12 +240,17 @@ void Track() {
 			// (a depth jump of > 30 %: another surface took the tap, keep the old depth)
 			if (abs(zc - za) < 0.3 * abs(za)) a.z = mix(a.z, c.w, 0.2);
 			b.rgb = mix(b.rgb, col, 0.08);
-			a.w   = min(a.w + 0.06, 1.0);
+			a.w   = min(a.w + L_IN, 1.0);
 		} else {
-			a.w -= 0.03;
+			a.w -= L_OUT;
 		}
 		if (any(lessThan(a.xy, vec2(-0.05))) || any(greaterThan(a.xy, vec2(1.05)))) a.w -= 0.1;
 		if (a.w <= 0.0) a = vec4(0), b = vec4(0);
+#ifdef KYTY_HWRT_VOLUMETRIC
+		// (the 10 s log: halos crossing half weight, on / off)
+		if (w_before < 0.5 && a.w >= 0.5) atomicAdd(stats[3], 1u);
+		if (w_before >= 0.5 && a.w < 0.5) atomicAdd(stats[4], 1u);
+#endif
 		lights[k * 2] = a, lights[k * 2 + 1] = b;
 	}
 	// New lights: the strongest unclaimed candidates, >= 3 cells from every tracked one.
@@ -235,6 +261,9 @@ void Track() {
 		for (int i = 0; i < CW * CH; ++i) {
 			vec4 c = cand[i * 2];
 			if (claimed[i] || c.x <= bl) continue;
+#ifdef KYTY_HWRT_VOLUMETRIC
+			if (c.x <= hdr.y) continue; // (a new light needs the full threshold: hysteresis)
+#endif
 			bool near = false;
 			for (int j = 0; j < slots; ++j)
 				if (lights[j * 2].w > 0.0 && length((lights[j * 2].xy - c.yz) * vec2(CW, CH)) < 3.0) near = true;
