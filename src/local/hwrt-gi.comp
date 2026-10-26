@@ -60,6 +60,10 @@ layout(push_constant) uniform Push {
 } push;
 
 const float PI = 3.14159265;
+// (hwrt5a perf) the self-test counters on 1 trace pixel of 4x4 only: every pixel's atomics on the same few words were
+// serialised (most of the pass's 3-4 ms); percentages are unchanged
+bool g_stat = false;
+#define STAT(a, b) if (g_stat) atomicAdd(a, b)
 
 vec2  RenderSize() { return u.motion.zw; }
 vec2  TraceSize() { return u.trace.xy; }
@@ -184,19 +188,26 @@ void Trace(ivec2 pixel) {
 		imageStore(gbuf_out, pixel, vec4(0, 0, 0, 1e6));
 		return;
 	}
+	g_stat     = ((pixel.x | pixel.y) & 3) == 0;
 	vec3  P    = World(uv, d);
 	float dist = distance(P, u.cam.xyz);
+	// (hwrt5a perf) beyond what the fog fade leaves (exp(-4) < 2 %) or the distance fade's end: no rays
+	if ((u.fog.x > 0.0 && dist > 4.0 * u.fog.x) || dist > u.par.w) {
+		imageStore(out_img, pixel, vec4(0, 0, 0, 1));
+		imageStore(gbuf_out, pixel, vec4(normalize(u.cam.xyz - P), dist));
+		return;
+	}
 	vec3  N    = NormalAt(uv, P);
-	vec3  O    = P + N * (0.02 + 0.002 * dist);
+	vec3  O    = P + N * (0.015 + 0.0015 * dist);
 	float ao   = 1.0;
 	const uint sb = uint(u.cfg2.z) * 64u;
-	atomicAdd(st[sb + 0u], 1u);
-	if (N.y > 0.7) atomicAdd(st[sb + 6u], 1u);
-	if (N.y < -0.7) atomicAdd(st[sb + 7u], 1u);
+	STAT(st[sb + 0u], 1u);
+	if (N.y > 0.7) STAT(st[sb + 6u], 1u);
+	if (N.y < -0.7) STAT(st[sb + 7u], 1u);
 	if (g_gbn != vec3(0)) {
-		atomicAdd(st[sb + (dot(normalize(g_gbn * sign(dot(g_gbn, u.cam.xyz - P))), g_ng) > 0.6 ? 8u : 9u)], 1u);
-		if (g_gbn.y > 0.7) atomicAdd(st[sb + 10u], 1u);
-		if (g_gbn.y < -0.7) atomicAdd(st[sb + 11u], 1u);
+		STAT(st[sb + (dot(normalize(g_gbn * sign(dot(g_gbn, u.cam.xyz - P))), g_ng) > 0.6 ? 8u : 9u)], 1u);
+		if (g_gbn.y > 0.7) STAT(st[sb + 10u], 1u);
+		if (g_gbn.y < -0.7) STAT(st[sb + 11u], 1u);
 	}
 	// the centre pixel: this path's point against a primary ray from the camera through the TLAS (the hwrt2 / debug
 	// view convention: inverse view-projection at NDC (x, y), y = uv.y * 2 - 1), the legacy inv(VP) * (ndc, depth)
@@ -223,6 +234,7 @@ void Trace(ivec2 pixel) {
 	// there lands on geometry (the rest floats in the air: no occlusion anywhere, the grey view flat white). The CPU reads
 	// the votes (words 40.. of the slot) and turns the flag over when B wins (hwrt-gi.cpp).
 	if ((pixel.x & 15) == 8 && (pixel.y & 15) == 8) {
+		g_stat = true;
 		vec2 n  = Ndc(uv);
 		vec3 da = normalize(ClipToWorld(vec4(n, 0.5, 1.0)) - u.cam.xyz);
 		vec3 db = normalize(ClipToWorld(vec4(n.x, -n.y, 0.5, 1.0)) - u.cam.xyz);
@@ -236,11 +248,12 @@ void Trace(ivec2 pixel) {
 		while (rayQueryProceedEXT(pb)) {}
 		if (rayQueryGetIntersectionTypeEXT(pb, true) == gl_RayQueryCommittedIntersectionTriangleEXT) tb = rayQueryGetIntersectionTEXT(pb, true);
 		float tol = 0.03 * dist + 0.05;
-		atomicAdd(st[sb + 40u], 1u);
-		if (ta >= 0.0 && abs(ta - dist) < tol) atomicAdd(st[sb + 41u], 1u);
-		if (tb >= 0.0 && abs(tb - dist) < tol) atomicAdd(st[sb + 42u], 1u);
-		if (abs(n.y) > 0.3) atomicAdd(st[sb + 43u], 1u); // (off the horizon: where the two conventions differ)
+		STAT(st[sb + 40u], 1u);
+		if (ta >= 0.0 && abs(ta - dist) < tol) STAT(st[sb + 41u], 1u);
+		if (tb >= 0.0 && abs(tb - dist) < tol) STAT(st[sb + 42u], 1u);
+		if (abs(n.y) > 0.3) STAT(st[sb + 43u], 1u); // (off the horizon: where the two conventions differ)
 	}
+	g_stat = ((pixel.x | pixel.y) & 3) == 0;
 	if ((u.cfg.w & 32) != 0) {
 		float occ = 0.0;
 		float R   = u.cam.w;
@@ -249,17 +262,23 @@ void Trace(ivec2 pixel) {
 			rayQueryEXT rq;
 			// (fix 3) t_min: a receiver a hair behind its own triangle (depth precision, jitter) hits that triangle's
 			// back at once and read as fully occluded: whole surfaces went dark
-			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xff, O, 0.02 + 0.001 * dist, dir, R);
+			// (hwrt5a) cull mask 0x03: static + dynamic captured this frame; not 0x04 (dynamic with an older frame's positions:
+			// stale cloth / creatures) nor 0x08 (tiny cards: leaves, ash), which as opaque quads gave black speckle clouds
+			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0x03, O, 0.01 + 0.0005 * dist, dir, R);
 			while (rayQueryProceedEXT(rq)) {}
 			if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-				if (rayQueryGetIntersectionFrontFaceEXT(rq, true)) atomicAdd(st[sb + 13u], 1u);
+				if (rayQueryGetIntersectionFrontFaceEXT(rq, true)) STAT(st[sb + 13u], 1u);
+				// (hwrt5a) linear falloff (contact-AO look: near hits count fully, the radius' end fades to 0)
 				float t = rayQueryGetIntersectionTEXT(rq, true) / R;
-				occ += 1.0 - t * t;
-				atomicAdd(st[sb + 2u], 1u);
+				occ += clamp(1.0 - t, 0.0, 1.0);
+				STAT(st[sb + 2u], 1u);
 			}
 		}
 		ao = 1.0 - occ / float(max(u.cfg.x, 1));
-		atomicAdd(st[sb + 1u], uint(u.cfg.x));
+		// (hwrt5a) alpha-tested foliage (opaque cards in the TLAS): where the G-buffer normal and the depth's disagree
+		// the receiver is a leaf / thin edge with noisy depth; half weight there (no black speckle clouds in trees)
+		if (g_gbn != vec3(0) && dot(normalize(g_gbn * sign(dot(g_gbn, u.cam.xyz - P))), g_ng) < 0.6) ao = mix(ao, 1.0, 0.5);
+		STAT(st[sb + 1u], uint(u.cfg.x));
 	}
 	vec3 gi = vec3(0);
 	if ((u.cfg.w & 64) != 0) {
@@ -269,9 +288,9 @@ void Trace(ivec2 pixel) {
 			rayQueryEXT rq;
 			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xff, O, 0.0, dir, u.par.x);
 			while (rayQueryProceedEXT(rq)) {}
-			atomicAdd(st[sb + 3u], 1u);
+			STAT(st[sb + 3u], 1u);
 			if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) continue;
-			atomicAdd(st[sb + 4u], 1u);
+			STAT(st[sb + 4u], 1u);
 			float t    = rayQueryGetIntersectionTEXT(rq, true);
 			vec3  H    = O + dir * t;
 			vec3  huv  = Project(H);
@@ -286,7 +305,7 @@ void Trace(ivec2 pixel) {
 					if (abs(ds - dh) < 0.05 * dh + 0.1) {
 						L    = textureLod(color_tex, huv.xy, 0).rgb;
 						seen = true;
-						atomicAdd(st[sb + 5u], 1u);
+						STAT(st[sb + 5u], 1u);
 					}
 				}
 			}
@@ -421,6 +440,7 @@ void Composite(ivec2 pixel) {
 	}
 	float fade = 1.0 - smoothstep(u.par.z, u.par.w, dist);
 	float ao   = (u.cfg.w & 32) != 0 ? clamp(r.a, 0.0, 1.0) : 1.0;
+	ao         = ao * ao; // (hwrt5a) contrast: few rays and the temporal mean make creases read too light
 	// (fog) the colour here is after the game's height / volumetric fog: the fog in front of the surface must not be
 	// darkened or lit, so both terms scale with an estimate of its transmittance, exp(-distance / fog distance)
 	if (u.fog.x > 0.0) fade *= exp(-dist / u.fog.x);
