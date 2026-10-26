@@ -19,6 +19,7 @@
 //  All the GPU work is recorded right after the game's TAA dispatch (graphics queue).
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <span>
@@ -94,6 +95,10 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* where);
 // KYTY_HWRT_DEBUG's view into an RGBA16F storage image in the GENERAL layout (the PS5 Pro path: the upscaled output).
 void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageView view, vk::Format format, vk::Extent2D extent);
+// (KYTY_HWRT_VOLUMETRIC, godrays.cpp) The scene TLAS for a ray query pass recorded after this frame's build (null until
+// one exists); built_now: built this frame; view_proj: the G-buffer camera's view-projection (flattened SRT words, as
+// NoteCamera got them) the TLAS's world goes with, all zero when the frame had no camera.
+[[nodiscard]] vk::AccelerationStructureKHR VolumetricTlas(bool* built_now, std::array<float, 16>* view_proj);
 
 } // namespace HwScene
 } // namespace Libs::Graphics
