@@ -570,12 +570,13 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	                             : 0;
 	build.vs_hash = vs_input_info.stage.program->shader_hash;
 	build.ps_hash = ps_hash;
-	if (!pipeline.uses_bindless) {
-		build.prewarm_key = Prewarm::RegisterGraphics(
-		    pipeline_info, descriptor_bindings, static_cast<uint32_t>(graphics_stages),
-		    static_cast<uint32_t>(pipeline.uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
-		                                                         : vk::DescriptorSetLayoutCreateFlags {}));
-	}
+	// Bindless pipelines too (--bindless: most of Wolverine's menu and gameplay pipelines); their
+	// layout's set 1 is the shared bindless table, rebuilt the same way at replay.
+	build.prewarm_key = Prewarm::RegisterGraphics(
+	    pipeline_info, descriptor_bindings, static_cast<uint32_t>(graphics_stages),
+	    static_cast<uint32_t>(pipeline.uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+	                                                         : vk::DescriptorSetLayoutCreateFlags {}) |
+	        (pipeline.uses_bindless ? Prewarm::LayoutBindlessBit : 0u));
 
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
@@ -687,10 +688,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
-	const uint64_t prewarm_key = pipeline.uses_bindless ? 0 : Prewarm::Register(
+	const uint64_t prewarm_key = Prewarm::Register(
 	    compute_module, descriptor_bindings, comp_subgroup_size.requiredSubgroupSize,
 	    static_cast<uint32_t>(pipeline.uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
-	                                                         : vk::DescriptorSetLayoutCreateFlags {}));
+	                                                         : vk::DescriptorSetLayoutCreateFlags {}) |
+	        (pipeline.uses_bindless ? Prewarm::LayoutBindlessBit : 0u));
 	if (auto prewarmed = Prewarm::Take(prewarm_key, false); prewarmed != nullptr) {
 		pipeline.pipeline = prewarmed;
 		return;

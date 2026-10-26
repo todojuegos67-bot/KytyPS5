@@ -38,6 +38,10 @@ struct Binding {
 
 bool Enabled();
 
+// Or-ed into `layout_flags` of Register/RegisterGraphics: the pipeline layout has the shared bindless
+// table as set 1 (GraphicContext::bindless_layout). Not a Vulkan descriptor-set-layout flag.
+constexpr uint32_t LayoutBindlessBit = 0x80000000u;
+
 // Every shader module that may end in a pipeline (stores its SPIR-V once in the seed).
 void NoteSpirv(vk::ShaderModule module, std::span<const uint32_t> spirv);
 
