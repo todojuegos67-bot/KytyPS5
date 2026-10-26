@@ -762,7 +762,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		auto& root                      = specializations[resource_index];
 		root.indirect_root              = resource_index;
 		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
-		root.indirect_search_iterations = std::bit_width(key_count);
+		// Rounded up to a multiple of 4 (min 4): extra binary-search steps are no-ops once
+		// low == high, and a table growing from 3 to 9 keys no longer changes the SPIR-V
+		// (Yotei: "it 2/3/4" were most of the permutation misses of 0x4039/0x1740/0x6cc6).
+		root.indirect_search_iterations = std::max<uint32_t>(4u, (static_cast<uint32_t>(std::bit_width(key_count)) + 3u) & ~3u);
 	}
 	return true;
 }
