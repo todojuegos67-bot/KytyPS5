@@ -148,7 +148,7 @@ constexpr uint32_t MaxMips       = 12;
 static_assert(CalibWet + 34 <= CalibHist && CalibHist + 256 <= StatsIndex);
 static_assert(HeaderBytes + (StatsIndex + StatsCount) * 4 <= FrameBytes);
 static_assert(StatsIndex + StatsCount <= SurveyIndex && HeaderBytes + (SurveyIndex + SurveyCount) * 4 <= FrameBytes);
-static_assert(SurveyIndex + SurveyCount <= MetalHist && HeaderBytes + (MetalHist + 10) * 4 <= FrameBytes);
+static_assert(SurveyIndex + SurveyCount <= MetalHist && HeaderBytes + (MetalHist + 12) * 4 <= FrameBytes);
 static_assert(SurveyHist == SurveyBits + 2 * 128 && SurveyHist + 2 * 256 == SurveyCount);
 
 struct RtPush {
@@ -262,6 +262,8 @@ struct RtPass {
 	bool                    mhist_valid = false;
 	uint64_t                m_frames = 0, m_tlas_frames = 0;
 	std::array<uint32_t, 10> m_hist_last {};
+	uint32_t                m_px_last = 0, m_dark_last = 0;
+	uint64_t                m_dark_frames = 0, m_dark_px = 0, m_all_px = 0;
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 } g_rt;
 
@@ -395,6 +397,9 @@ bool HwReflWanted();
 //   KYTY_HWRT_METAL_STRENGTH   the composite's weight scale (1.0, 0..2)
 //   KYTY_HWRT_METAL_TINT       how much of the base colour's hue the F0 keeps (1.0 physical; 0 grey F0 of its luminance)
 //   KYTY_HWRT_METAL_DIST       the reflection ray's length (world units, 200)
+//   KYTY_HWRT_METAL_MIN_F0     plausibility: a metal pixel's base colour (linear, brightest channel) must reach this to
+//                          count fully (0.12; fades from 60 % of it; 0 off): dark stone or dirt with the metal bit set
+//                          is not bare metal
 //   KYTY_HWRT_METAL_SELF=0     do not skip the pixel's own TLAS instance near the surface
 //   KYTY_HWRT_METAL_VIEW=1|2|3|4  debug views: 1 metal field as grey, 2 roughness field as grey, 3 F0 (the albedo) on
 //                          metal, 4 our reflection alone (envBRDF x hit) on metal, black elsewhere
@@ -403,6 +408,7 @@ struct MetalCfg {
 	int32_t metal = -1, rough = -1;
 	float   rough_max = 0.6f, strength = 1.0f, tint = 1.0f, dist = 200.0f;
 	bool    self_skip = true;
+	float   min_f0 = 0.12f;
 };
 const MetalCfg& Metal() {
 	static const MetalCfg c = [] {
@@ -418,6 +424,7 @@ const MetalCfg& Metal() {
 		m.strength     = EnvFloat("KYTY_HWRT_METAL_STRENGTH", 1.0f, 0.0f, 2.0f);
 		m.tint         = EnvFloat("KYTY_HWRT_METAL_TINT", 1.0f, 0.0f, 1.0f);
 		m.dist         = EnvFloat("KYTY_HWRT_METAL_DIST", 200.0f, 1.0f, 5000.0f);
+		m.min_f0       = EnvFloat("KYTY_HWRT_METAL_MIN_F0", 0.12f, 0.0f, 1.0f);
 		const char* sf = std::getenv("KYTY_HWRT_METAL_SELF");
 		m.self_skip    = !(sf != nullptr && sf[0] == '0');
 		const auto fs  = [](int32_t f, char* buf, size_t n) {
@@ -795,6 +802,15 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		if (g_rt.frame > 8) g_rt.stat_sum[k] += static_cast<uint32_t>(v - g_rt.stat_last[k]);
 		g_rt.stat_last[k] = v;
 	}
+	if (Metal().level > 0 && g_rt.frame > 8) {
+		// (hwrt4) per frame: the share of the metal pixels the composite changed whose result would have been > 30 %
+		// darker than the game's (before the 0.85 floor); a frame over 5 % counts as a dark burst
+		const auto*    mh = reinterpret_cast<const uint32_t*>(g_rt.mapped + HeaderBytes / 4 + MetalHist);
+		const uint32_t np = mh[10] - g_rt.m_px_last, nd = mh[11] - g_rt.m_dark_last;
+		g_rt.m_px_last = mh[10], g_rt.m_dark_last = mh[11];
+		g_rt.m_all_px += np, g_rt.m_dark_px += nd;
+		if (np >= 50 && nd * 20u > np) ++g_rt.m_dark_frames;
+	}
 	++g_rt.stat_frames;
 	if (have_gbuf) ++g_rt.stat_gbuf_frames;
 	if (g_rt.have_guide) ++g_rt.stat_guide_frames;
@@ -877,6 +893,11 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		            static_cast<double>(Metal().rough_max), sm[36] > 0 ? 100.0 * sm[37] / static_cast<double>(sm[36]) : 0.0,
 		            sm[36] > 0 ? 100.0 * sm[38] / static_cast<double>(sm[36]) : 0.0, 100.0 * sm[39] / px,
 		            static_cast<unsigned long long>(g_rt.m_tlas_frames), static_cast<unsigned long long>(g_rt.m_frames));
+		std::printf("RT metal: darkening: %.1f%% of the changed metal pixels would have been > 30%% darker than the game's (floored "
+		            "at 85%%); frames with a burst (> 5%% of them) %llu of %llu\n",
+		            g_rt.m_all_px ? 100.0 * g_rt.m_dark_px / static_cast<double>(g_rt.m_all_px) : 0.0,
+		            static_cast<unsigned long long>(g_rt.m_dark_frames), static_cast<unsigned long long>(g_rt.m_frames));
+		g_rt.m_dark_frames = 0, g_rt.m_dark_px = 0, g_rt.m_all_px = 0;
 		g_rt.m_tlas_frames = 0, g_rt.m_frames = 0;
 		const auto* mh = reinterpret_cast<const uint32_t*>(g_rt.mapped + HeaderBytes / 4 + MetalHist);
 		std::array<uint32_t, 10> d {};
@@ -1690,7 +1711,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		push.dec[1]    = have_gbuf ? mc.rough : -1;
 		// (views 1..3 show G-buffer fields only: no rays traced, so a view costs nothing beyond its passes)
 		const bool rays = hw && (mc.view == 0 || mc.view == 4);
-		push.dec[3]    = (reset ? 0 : 1) | (mc.self_skip ? 2 : 0) | (rays ? 4 : 0);
+		push.dec[3]    = (reset ? 0 : 1) | (mc.self_skip ? 2 : 0) | (rays ? 4 : 0) | (std::clamp(static_cast<int32_t>(mc.min_f0 * 1000.0f + 0.5f), 0, 1023) << 8);
 		push.misc2[3]  = have_gbuf && mc.metal >= 0 ? mc.metal + 1 : 0;
 		{
 			Set s = base;
@@ -1728,7 +1749,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
 	{
 		// The sums, counters and the metal survey to the host (the CPU reads them a few frames late; the copy is 5.5 KB).
-		vk::BufferCopy region {HeaderBytes, HeaderBytes, (Metal().level > 0 ? MetalHist + 10 : SurveyIndex + SurveyCount) * 4};
+		vk::BufferCopy region {HeaderBytes, HeaderBytes, (Metal().level > 0 ? MetalHist + 12 : SurveyIndex + SurveyCount) * 4};
 		command.copyBuffer(vk::Buffer(g.frame_buf), vk::Buffer(g.read_buf), 1, &region);
 		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
 		        vk::AccessFlagBits2::eHostRead);
