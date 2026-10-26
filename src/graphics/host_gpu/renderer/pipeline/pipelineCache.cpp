@@ -25,6 +25,9 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <string>
+#include <unordered_map>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -402,6 +405,69 @@ struct PipelineCache::ProgramCache {
 		return {};
 	}
 
+	// ShaderMiss: why an existing shader entry needed another (slow) translation.
+	static void LogPermutationMiss(uint64_t hash, const SourceEntry& entry, bool source_changed,
+	                               uint32_t push_data_cursor) {
+		static std::unordered_map<uint64_t, uint32_t> logged;
+		static std::mutex                             logged_mutex;
+		{
+			std::lock_guard lock(logged_mutex);
+			if (logged[hash]++ >= 6) return;
+		}
+		const auto& now = entry.specialization;
+		std::string why = source_changed ? "source_changed" : "";
+		for (const auto& candidate: entry.permutations) {
+			const auto& was = candidate.specialization;
+			const auto& layout = candidate.program.bindings;
+			if (layout.push_data_start_dword !=
+			    ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords())) {
+				why += " push_data";
+			}
+			char buf[160];
+			std::snprintf(buf, sizeof(buf), " counts b%zu/%zu i%zu/%zu s%zu/%zu", was.buffers.size(),
+			              now.buffers.size(), was.images.size(), now.images.size(), was.samplers.size(),
+			              now.samplers.size());
+			why += buf;
+			for (size_t i = 0; i < std::min(was.buffers.size(), now.buffers.size()); ++i) {
+				const auto& a = was.buffers[i];
+				const auto& b = now.buffers[i];
+				if (a == b) continue;
+				std::snprintf(buf, sizeof(buf), " buf%zu(stride %x/%x fmt %u/%u map %u/%u it %u/%u)", i,
+				              a.packed_stride, b.packed_stride, static_cast<unsigned>(a.descriptor_format),
+				              static_cast<unsigned>(b.descriptor_format), a.indirect_mapping_offset,
+				              b.indirect_mapping_offset, a.indirect_search_iterations, b.indirect_search_iterations);
+				why += buf;
+				break;
+			}
+			for (size_t i = 0; i < std::min(was.images.size(), now.images.size()); ++i) {
+				const auto& a = was.images[i];
+				const auto& b = now.images[i];
+				if (a == b) continue;
+				std::snprintf(buf, sizeof(buf), " img%zu(class %u/%u dim %u/%u mips %u/%u map %u/%u it %u/%u)", i,
+				              static_cast<unsigned>(a.numeric_class), static_cast<unsigned>(b.numeric_class),
+				              static_cast<unsigned>(a.dimension), static_cast<unsigned>(b.dimension), a.mip_count,
+				              b.mip_count, a.indirect_mapping_offset, b.indirect_mapping_offset,
+				              a.indirect_search_iterations, b.indirect_search_iterations);
+				why += buf;
+				break;
+			}
+			for (size_t i = 0; i < std::min(was.samplers.size(), now.samplers.size()); ++i) {
+				const auto& a = was.samplers[i];
+				const auto& b = now.samplers[i];
+				if (a == b) continue;
+				std::snprintf(buf, sizeof(buf), " smp%zu(map %u/%u it %u/%u)", i, a.indirect_mapping_offset,
+				              b.indirect_mapping_offset, a.indirect_search_iterations, b.indirect_search_iterations);
+				why += buf;
+				break;
+			}
+			why += " |";
+			if (why.size() > 900) break;
+		}
+		std::printf("ShaderMiss: hash=0x%016" PRIx64 " permutations=%zu:%s\n", hash, entry.permutations.size(),
+		            why.c_str());
+		std::fflush(stdout);
+	}
+
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
@@ -449,6 +515,7 @@ struct PipelineCache::ProgramCache {
 			if (cached.materialize_failed) {
 				return SkipUnsupported(params.hash, input_info);
 			}
+			LogPermutationMiss(params.hash, cached, source_changed, push_data_cursor);
 		}
 
 		const auto translate_start = std::chrono::steady_clock::now();

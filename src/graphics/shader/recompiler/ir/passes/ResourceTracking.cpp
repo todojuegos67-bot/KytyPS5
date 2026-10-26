@@ -6,6 +6,9 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <bit>
 #include <fmt/format.h>
@@ -379,17 +382,44 @@ public:
 		if (m_program.resource_tracking_complete) {
 			Fail(0, "resources already tracked");
 		}
+		// ShaderSlow: split of the resources phase (Yotei: some CS spend 8 s here, on Thread_Gpu).
+		using Clock = std::chrono::steady_clock;
+		auto t_last = Clock::now();
+		const auto t_begin = t_last;
+		char phases[256] = {};
+		size_t phases_len = 0;
+		const auto mark = [&](const char* name) {
+			const auto now = Clock::now();
+			if (phases_len < sizeof(phases)) {
+				const int n = std::snprintf(phases + phases_len, sizeof(phases) - phases_len, " %s=%.1f", name,
+				                            std::chrono::duration<double, std::milli>(now - t_last).count());
+				if (n > 0) phases_len += static_cast<size_t>(n);
+			}
+			t_last = now;
+		};
 		ForwardPrivateLds();
+		mark("lds");
 		FoldBoundedLoopSelectors();
+		mark("loopsel");
 		PlanScalarReads();
+		mark("scalar");
 		EliminateDeadCode(m_program.blocks);
+		mark("dce");
 		PlanIndirectDescriptors();
+		mark("indirect");
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
 			}
 		}
+		mark("collect");
 		LinkImageAliases();
+		mark("alias");
+		if (std::chrono::duration<double, std::milli>(t_last - t_begin).count() >= 200.0) {
+			std::printf("ShaderSlow: resources %s hash=0x%016" PRIx64 " indirect_plans=%zu:%s\n",
+			            StageName(m_program.stage), m_program.shader_hash, m_indirect_descriptors.size(), phases);
+			std::fflush(stdout);
+		}
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
 		}
