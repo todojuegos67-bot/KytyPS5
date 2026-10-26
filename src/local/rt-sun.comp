@@ -65,8 +65,11 @@ layout(binding = 13, std430) readonly buffer SunBuf {
 	vec4    opt2; // x: max occluder distance for the penumbra search (m)
 	Cascade c[8];
 #ifdef KYTY_HWRT_SHADOW
-	vec4    w0, w1, w2; // our view space -> the TLAS's world (rows)
-	vec4    hw;   // x: level (0: no TLAS this frame), y: weight of far hits inside the cascades, z: ray length (m), w: contact range (m)
+	vec4    inv[4]; // clip -> the TLAS's world (rows: the inverse of the G-buffer view-projection the capture inverts)
+	vec4    hw;     // x: level (+8: rays beyond the cascades; 0: no TLAS), y: far-hit margin below the cascades' V, z: ray length (m), w: contact range (m)
+	vec4    cam;    // xyz: the camera in world space
+	vec4    sunw;   // xyz: world direction toward the sun (the latched one the light's view direction comes from)
+	vec4    w0, w1, w2; // the cascades' view -> world (the self-test's other reconstruction)
 #endif
 } sun;
 #ifdef KYTY_HWRT_SHADOW
@@ -333,25 +336,45 @@ float SunVis(vec3 p, vec3 n, float ndl, vec3 l, ivec2 pixel, out int ci) {
 // maps keep the say on what is far: a hit within the contact range (scaled with the distance) is full shadow, the shadow
 // maps' bias and texels lose those; a farther one weighs hw.y (the captured geometry is opaque: alpha-tested leaves would
 // be solid cards). Beyond the cascades (no shadow map at all) every hit counts: the far-distance shadows.
-float HwSun(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel, bool in_casc) {
+// (hwrt2s 10-26 accuracy) Positions as the reflections' HwToWorld (rt-reflections.comp, checked in game): a view-space
+// point -> its uv and depth through this pass's own projection -> the game's inverse view-projection (NDC y = uv.y * 2 - 1,
+// the HWRT debug view's convention). The first version mapped view space with the cascades' rotation (view -> world from
+// P^-1 VP), which nothing tied to the TLAS's screen convention (the GNM viewport: row 0 = NDC y +1); the self-test logs
+// how far apart the two are.
+vec3 HwToWorld(vec3 p) {
+	vec3 pr = Project(p);
+	vec4 q  = vec4(pr.xy * 2.0 - 1.0, pr.z, 1.0);
+	vec4 h  = vec4(dot(sun.inv[0], q), dot(sun.inv[1], q), dot(sun.inv[2], q), dot(sun.inv[3], q));
+	return h.xyz / h.w;
+}
+vec3 HwToWorldOld(vec3 p) {
+	vec4 p4 = vec4(p, 1.0);
+	return vec3(dot(sun.w0, p4), dot(sun.w1, p4), dot(sun.w2, p4));
+}
+// occ_c: hits within the contact range (scaled with the distance); occ_f: farther ones. ndl_w: the facing in world space.
+void HwSun(vec3 p, vec3 n, vec3 l, ivec2 pixel, out float occ_c, out float occ_f, out float ndl_w) {
+	occ_c = 0.0, occ_f = 0.0, ndl_w = 0.0;
 	int lvl = int(sun.hw.x + 0.5) & 7;
-	if (lvl <= 0) return 0.0;
+	if (lvl <= 0) return;
 	float z  = abs(p.z);
-	vec4  p4 = vec4(p, 1.0);
-	vec3  pw = vec3(dot(sun.w0, p4), dot(sun.w1, p4), dot(sun.w2, p4));
-	vec3  nw = normalize(vec3(dot(sun.w0.xyz, n), dot(sun.w1.xyz, n), dot(sun.w2.xyz, n)));
-	vec3  lw = normalize(vec3(dot(sun.w0.xyz, l), dot(sun.w1.xyz, l), dot(sun.w2.xyz, l)));
-	// The receiver comes from the depth buffer (sub-pixel jitter, 24-bit precision): off its own triangle along the normal
-	// by a few mm near to decimetres far, and the rays start a little further.
-	vec3  o     = pw + nw * (0.01 + 0.0015 * z) + lw * (0.005 + 0.0005 * z);
-	float t_min = 0.01 + 0.001 * z;
+	float s  = 0.05 + 0.01 * z;
+	vec3  pw = HwToWorld(p);
+	vec3  nw = HwToWorld(p + n * s) - pw;
+	vec3  lw = HwToWorld(p + l * s) - pw;
+	if (dot(nw, nw) < 1e-12 || dot(lw, lw) < 1e-12) return;
+	nw = normalize(nw), lw = normalize(lw);
+	ndl_w = dot(nw, lw);
+	if (ndl_w <= 0.03) return;
+	// Off the receiver's triangle (depth-buffer jitter and precision grow with the distance) along the normal and a
+	// little toward the sun; the least hit distance grows likewise (no acne far away).
+	vec3  o     = pw + nw * (0.02 + 0.003 * z) + lw * (0.01 + 0.001 * z);
+	float t_min = 0.02 + 0.004 * z;
 	float cr    = sun.hw.w * (1.0 + z / 25.0);
 	vec3  b1    = normalize(cross(lw, abs(lw.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
 	vec3  b2    = cross(lw, b1);
 	int   rays  = lvl >= 3 ? 2 : 1;
 	uint  flags = gl_RayFlagsOpaqueEXT | (lvl >= 3 ? 0u : gl_RayFlagsTerminateOnFirstHitEXT);
 	float f     = float(push.misc.y % 64);
-	float occ   = 0.0;
 	for (int r = 0; r < rays; ++r) {
 		float u1  = Ign(vec2(pixel) + f * 5.17 + float(r) * 19.0 + 3.0);
 		float u2  = Ign(vec2(pixel.y, pixel.x) + f * 2.93 + float(r) * 37.0 + 57.0);
@@ -362,11 +385,17 @@ float HwSun(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel, bool in_casc) {
 		while (rayQueryProceedEXT(rq)) {}
 		if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
 			float t = rayQueryGetIntersectionTEXT(rq, true);
-			occ += in_casc ? mix(1.0, sun.hw.y, smoothstep(cr, 3.0 * cr, t)) : 1.0;
+			float c = 1.0 - smoothstep(cr, 2.0 * cr, t);
+			occ_c += c, occ_f += 1.0 - c;
 		}
 	}
-	// (grazing receivers: their reconstructed position is the least reliable, and their sun term is small anyway)
-	return occ / float(rays) * smoothstep(0.03, 0.2, ndl);
+	// (grazing receivers: their reconstruction is the least reliable, and their sun term is small anyway)
+	float g = smoothstep(0.05, 0.25, ndl_w) / float(rays);
+	occ_c *= g, occ_f *= g;
+	// Far away the depth buffer's steps are decimetres and the captured meshes the game's far LODs: far hits fade out
+	// over 60..150 m, contact ones over 120..250 m.
+	occ_f *= 1.0 - smoothstep(60.0, 150.0, z);
+	occ_c *= 1.0 - smoothstep(120.0, 250.0, z);
 }
 #endif
 
@@ -396,9 +425,46 @@ void Trace(ivec2 pixel) {
 	// ray hit there took the whole assumed sun term out of pixels the game lit by ambient only: indoors, on frames whose
 	// one copied cascade did not hold the view, the screen went ~8 % bright (1 / (1 + R)). Rays only where a cascade holds
 	// the pixel, unless KYTY_HWRT_SHADOW_FAR=1 (hw.x + 8).)
+	// (10-26 accuracy) The scene's rays darken freely only in contact (what the maps' bias and 1.5 m texels lose); a
+	// farther hit may take the visibility at most hw.y below the cascades' own, and fades out over the last cascade's
+	// border band (no rays switching on and off at its edge). Darkening outliers counted on statistics frames.
 	if (sun.hw.x > 0.5) {
-		bool far_ok = sun.hw.x > 7.5;
-		if (ci >= 0 || far_ok) v = min(v, 1.0 - clamp(HwSun(p, n, l, ndl, pixel, ci >= 0), 0.0, 1.0));
+		bool  far_ok = sun.hw.x > 7.5;
+		float v0     = v;
+		if (ci >= 0 || far_ok) {
+			float oc, of, ndl_w;
+			HwSun(p, n, l, pixel, oc, of, ndl_w);
+			float ew = 1.0;
+			int   nc = int(sun.hdr.x + 0.5);
+			if (ci >= 0 && ci == nc - 1) {
+				vec2  u    = CascUv(LightClip(ci, p), Hyp());
+				float edge = min(min(u.x, 1.0 - u.x), min(u.y, 1.0 - u.y));
+				ew         = smoothstep(4.0 / MapSize(), 4.0 / MapSize() + max(sun.opt.z, 0.02), edge);
+			} else if (ci < 0) {
+				ew = 0.5;
+			}
+			oc = clamp(oc * ew, 0.0, 1.0), of = clamp(of * ew, 0.0, 1.0);
+			v = min(v, 1.0 - oc);
+			v = min(v, max(1.0 - of, v0 - sun.hw.y));
+			// The self-test (the centre pixel, every frame; words 131..135): the two reconstructions' distance (m), the
+			// depth, the world facing against the view one, the world light against the latched world sun (cos).
+			ivec2 c = ivec2(TraceSize()) / 2;
+			if (pixel == c) {
+				vec3 pw = HwToWorld(p);
+				vec3 lw = normalize(HwToWorld(p + l * (0.05 + 0.01 * abs(p.z))) - pw);
+				vote_buf.v[131] = floatBitsToUint(length(pw - HwToWorldOld(p)));
+				vote_buf.v[132] = floatBitsToUint(abs(p.z));
+				vote_buf.v[133] = floatBitsToUint(ndl_w - ndl);
+				vote_buf.v[134] = floatBitsToUint(dot(lw, normalize(sun.sunw.xyz)));
+				vote_buf.v[135] = floatBitsToUint(length(pw - sun.cam.xyz) - length(p));
+			}
+		}
+		if ((push.misc.w & 16) != 0) {
+			float dk = v0 - v;
+			if (dk > 0.25) atomicAdd(vote_buf.v[128], 1u);
+			if (dk > 0.6) atomicAdd(vote_buf.v[129], 1u);
+			if (dk > 0.25) atomicAdd(vote_buf.v[130], uint(dk * 256.0 + 0.5));
+		}
 		imageStore(out_img, pixel, vec4(isnan(v) ? 1.0 : clamp(v, 0.0, 1.0)));
 		return;
 	}
