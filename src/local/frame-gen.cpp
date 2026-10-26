@@ -3,6 +3,7 @@
 #include "graphics/presentation/window/hostInput.h"
 #include "fsr3-fg.h"
 #include "xess-sr.h"
+#include "hwrt-particles.h"
 #include "graphics/presentation/videoOut.h"
 #include <chrono>
 #include "live-census.h"
@@ -4135,6 +4136,7 @@ void RtPartNoteColor(uint64_t address, vk::Extent2D extent) {
 // Level >= 1 and the copy of this flip's scene color exists and is the upscaler's color: its view (else null).
 vk::ImageView RtPartPreView(uint64_t color_address, vk::Extent2D extent) {
 	if (RtParticlesLevel() == 0) return nullptr;
+	if (HwParticlesActive()) return nullptr; // (hwrt3p: the ray-traced particle light has them this flip: no double light)
 	const bool ok = g_rtpart.taken && g_rtpart.pre_view != nullptr && g_rtpart.pre_address == color_address &&
 	                g_rtpart.pre_flip == GuestFlips() && g_rtpart.pre.extent.width == extent.width &&
 	                g_rtpart.pre.extent.height == extent.height;
@@ -4151,7 +4153,15 @@ bool RtParticlesDebug() {
 	}();
 	return debug;
 }
-bool RtParticlesWanted() { return RtParticlesLevel() > 0 || RtParticlesDebug(); }
+bool RtParticlesWanted() { return RtParticlesLevel() > 0 || RtParticlesDebug() || HwParticlesWanted(); }
+// (hwrt3p) KYTY_HWRT_PARTICLES' read of the pre-particle copy (no SSGI counters; the copy is taken for it too).
+vk::ImageView RtParticlesPreCopy(uint64_t color_address, vk::Extent2D extent) {
+	if (!HwParticlesWanted()) return nullptr;
+	const bool ok = g_rtpart.taken && g_rtpart.pre_view != nullptr && g_rtpart.pre_address == color_address &&
+	                g_rtpart.pre_flip == GuestFlips() && g_rtpart.pre.extent.width == extent.width &&
+	                g_rtpart.pre.extent.height == extent.height;
+	return ok ? g_rtpart.pre_view : nullptr;
+}
 
 void NoteSceneDispatch(uint64_t cs_hash, uint64_t address, uint32_t width, uint32_t height) {
 	if (!RtParticlesDebug() || !RtPartColorKnown(address, width, height, false)) return;
@@ -4186,7 +4196,7 @@ void BeforeSceneDraw(CommandBuffer& command, TextureCache& cache, const RenderSt
 		e.instances += draw.instances;
 		e.indices += draw.index_count;
 	}
-	if (RtParticlesLevel() == 0 || g_rtpart.taken) return;
+	if ((RtParticlesLevel() == 0 && !HwParticlesWanted()) || g_rtpart.taken) return; // (hwrt3p: also for KYTY_HWRT_PARTICLES)
 	// The particle pass's first draw: blended, depth test on, depth writes off (KYTY_RT_PARTICLES_VS pins the shaders).
 	static const std::vector<uint64_t> pinned = [] {
 		std::vector<uint64_t> out;
@@ -6246,7 +6256,7 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 } // namespace
 
 bool SsrWanted() {
-	return SsrLevel() > 0 || RtReflectionsWanted() || ShineWanted() || GtaoLevel() > 0 || GbufViewWanted() ||
+	return SsrLevel() > 0 || RtReflectionsWanted() || HwParticlesWanted() || ShineWanted() || GtaoLevel() > 0 || GbufViewWanted() ||
 	       SsgiEmissive() > 0.0f; // (rtfire: the emissive light reads the G-buffer copy's albedo)
 }
 bool SsrPassWanted() { return SsrLevel() > 0; }
@@ -8873,6 +8883,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	// (The DLSS-G hudless path sets the context in PrepareInputs; the PS5 Pro path alone needs the renderer's.)
 	if (g_graphics_ctx == nullptr && inputs.graphics != nullptr) g_graphics_ctx = inputs.graphics;
 	RtPartNoteColor(inputs.color_address, inputs.color.extent); // (rtparticles: the scene color the draws are matched to)
+	HwParticlesApply(command, inputs); // (KYTY_HWRT_PARTICLES: first, on the game's own color; nothing when off)
 	CShadowApply(command, inputs); // (KYTY_RT_SHADOWS: direct-sun shadows first; inputs.color becomes the composited copy)
 	SsgiApply(command, inputs); // (KYTY_SSGI: likewise; nothing when off)
 	GtaoApply(command, inputs); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
