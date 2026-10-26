@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -565,6 +566,31 @@ void LogFlip(uint64_t flip) {
 
 bool Wanted() { return Cfg().on; }
 
+namespace {
+// (KYTY_HWRT_LIGHTS alone: the render thread's per-program filter, before any binding list is built) A program found
+// uninteresting (not the lighting, its culling or a shadow-pool consumer) stays so until the lighting's tile images or
+// the culling programs change (g_gen); an interesting one is let through once every period flips.
+struct Filter {
+	uint8_t  cls = 0; // 0 unknown, 1 interesting, 2 not
+	uint32_t gen = 0;
+	uint64_t next_flip = 0;
+};
+thread_local std::unordered_map<uint64_t, Filter> t_filter;
+std::atomic<uint32_t>                              g_gen {1};
+} // namespace
+
+bool WantsDispatch(uint64_t cs_hash) {
+	const auto& c = Cfg();
+	if (!c.on) return false;
+	if (c.layout_search) return true;
+	auto& f = t_filter[cs_hash];
+	if (f.cls == 2 && f.gen == g_gen.load(std::memory_order_relaxed)) return false;
+	const uint64_t flip = Libs::Graphics::FrameGen::GuestFlips();
+	if (f.cls == 1 && flip < f.next_flip) return false;
+	f.next_flip = flip + c.period;
+	return true;
+}
+
 void LiveLights(std::vector<LiveLight>& out, uint64_t max_age, uint32_t min_seen) {
 	out.clear();
 	if (!Cfg().on) return;
@@ -600,6 +626,7 @@ void OnDispatch(uint64_t cs_hash, std::span<const DispatchBuffer> buffers, std::
 			if (!im.written && im.address != 0 && im.width >= 16 && im.height >= 8 && im.width * 8 <= big_w && im.height * 8 <= big_h &&
 			    std::find(g.tile_images.begin(), g.tile_images.end(), im.address) == g.tile_images.end() && g.tile_images.size() < 16) {
 				g.tile_images.push_back(im.address);
+				g_gen.fetch_add(1, std::memory_order_relaxed);
 				std::printf("RTLS: lighting CS %016llx reads a %ux%u image @0x%llx (tile data: its writer is the light culling)\n",
 				            static_cast<unsigned long long>(cs_hash), im.width, im.height, static_cast<unsigned long long>(im.address));
 			}
@@ -609,7 +636,7 @@ void OnDispatch(uint64_t cs_hash, std::span<const DispatchBuffer> buffers, std::
 		for (const auto& im: images)
 			if (im.written && std::find(g.tile_images.begin(), g.tile_images.end(), im.address) != g.tile_images.end()) {
 				culling = true;
-				if (g.culling.size() < 16) g.culling.push_back(cs_hash);
+				if (g.culling.size() < 16) g.culling.push_back(cs_hash), g_gen.fetch_add(1, std::memory_order_relaxed);
 				std::printf("RTLS: CS %016llx writes the lighting's tile image @0x%llx (the light culling): scanned too\n",
 				            static_cast<unsigned long long>(cs_hash), static_cast<unsigned long long>(im.address));
 				break;
@@ -617,6 +644,11 @@ void OnDispatch(uint64_t cs_hash, std::span<const DispatchBuffer> buffers, std::
 	bool pool = false;
 	for (const auto& im: images)
 		pool = pool || (!im.written && im.depth_like && im.layers >= 6 && im.width == im.height && im.width >= 256);
+	if (!c.layout_search) {
+		auto& f = t_filter[cs_hash];
+		f.cls   = lighting || culling || pool ? 1 : 2;
+		f.gen   = g_gen.load(std::memory_order_relaxed);
+	}
 	if (!lighting && !culling && !pool && !c.scan_all) return;
 	auto& prog = g.programs[cs_hash];
 	if (prog.last_scan != ~0ull && flip < prog.last_scan + c.period) return;

@@ -44,6 +44,8 @@ struct LiveLight {
 };
 // Lights seen within max_age flips and >= min_seen scans (render thread; a copy under the lock).
 void LiveLights(std::vector<LiveLight>& out, uint64_t max_age, uint32_t min_seen);
+// Cheap per-dispatch check before the bindings are gathered for OnDispatch (render thread): false = skip it.
+[[nodiscard]] bool WantsDispatch(uint64_t cs_hash);
 // KYTY_RTLS_DEBUG > 0: the overlay's markers (DebugMarkers).
 [[nodiscard]] bool OverlayWanted();
 

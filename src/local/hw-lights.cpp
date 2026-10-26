@@ -9,7 +9,7 @@
 // lights' weighted occlusion by the TLAS (rays), share = W / (W + ambient) the analytic estimate of the local lights' part of
 // the pixel's light. Darken only; a reset / cut / first frame darkens nothing (the history count ramps it in over ~6 frames).
 //
-// Options: KYTY_HWRT_LIGHTS_STRENGTH (0.8), _MAX (max darkening, 0.6), _AMBIENT (0.08: the share's knee), _SOFT (light
+// Options: KYTY_HWRT_LIGHTS_STRENGTH (1.0), _MAX (max darkening, 0.85), _AMBIENT (0.03: the share's knee), _SOFT (light
 // source radius, 0.08 m), _SKIP (rays end this short of the light: its lamp / brazier mesh, 0.3 m), _DIST (lights and
 // pixels within this of the camera, 60 m), _FLIPY (1: row 0 = NDC y +1, default), _GUARD (a 1 s window whose mean
 // darkening over the screen exceeds it turns the pass off for 5 s, logged; 0.25).
@@ -76,7 +76,7 @@ struct {
 	uint64_t                written = 0, read = 0;
 	double                  sum_ms = 0.0, max_ms = 0.0;
 	uint32_t                samples = 0;
-	std::array<uint32_t, 3> stat_last {}, guard_last {};
+	std::array<uint32_t, 12> stat_last {}, guard_last {};
 	uint64_t                frames = 0, frames_lit = 0, lights_sum = 0, no_tlas = 0, stale_tlas = 0;
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now(), last_guard = last_log, guard_until {};
 	bool                    said_on = false;
@@ -392,9 +392,9 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	FreeRetired(*graphics);
 	ReadTiming(*graphics);
 
-	static const float strength = EnvFloat("KYTY_HWRT_LIGHTS_STRENGTH", 0.8f, 0.0f, 2.0f);
-	static const float max_dark = EnvFloat("KYTY_HWRT_LIGHTS_MAX", 0.6f, 0.0f, 0.95f);
-	static const float ambient  = EnvFloat("KYTY_HWRT_LIGHTS_AMBIENT", 0.08f, 0.001f, 100.0f);
+	static const float strength = EnvFloat("KYTY_HWRT_LIGHTS_STRENGTH", 1.0f, 0.0f, 2.0f);
+	static const float max_dark = EnvFloat("KYTY_HWRT_LIGHTS_MAX", 0.85f, 0.0f, 0.95f);
+	static const float ambient  = EnvFloat("KYTY_HWRT_LIGHTS_AMBIENT", 0.03f, 0.001f, 100.0f);
 	static const float soft     = EnvFloat("KYTY_HWRT_LIGHTS_SOFT", 0.08f, 0.0f, 2.0f);
 	static const float skip     = EnvFloat("KYTY_HWRT_LIGHTS_SKIP", 0.3f, 0.0f, 5.0f);
 	static const float max_dist = EnvFloat("KYTY_HWRT_LIGHTS_DIST", 60.0f, 5.0f, 500.0f);
@@ -424,8 +424,8 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	if (now - g_hl.last_guard >= std::chrono::seconds(1)) {
 		g_hl.last_guard = now;
 		(void)vmaInvalidateAllocation(graphics->allocator, g_hl.stat_mem, 0, VK_WHOLE_SIZE);
-		std::array<uint32_t, 3> cur {};
-		for (int i = 0; i < 3; ++i) cur[i] = g_hl.stat_mapped[i];
+		std::array<uint32_t, 12> cur {};
+		for (int i = 0; i < 12; ++i) cur[i] = g_hl.stat_mapped[i];
 		const double px = cur[0] - g_hl.guard_last[0], dk = cur[2] - g_hl.guard_last[2];
 		g_hl.guard_last = cur;
 		const double mean = px > 0 ? dk / 1024.0 / px : 0.0;
@@ -445,10 +445,10 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	if (now - g_hl.last_log >= std::chrono::seconds(10)) {
 		g_hl.last_log = now;
 		(void)vmaInvalidateAllocation(graphics->allocator, g_hl.stat_mem, 0, VK_WHOLE_SIZE);
-		std::array<uint32_t, 3> cur {};
-		for (int i = 0; i < 3; ++i) cur[i] = g_hl.stat_mapped[i];
-		const double px = std::max<double>(cur[0] - g_hl.stat_last[0], 1.0), dp = cur[1] - g_hl.stat_last[1], dk = cur[2] - g_hl.stat_last[2];
+		std::array<uint32_t, 12> cur {}, d {};
+		for (int i = 0; i < 12; ++i) cur[i] = g_hl.stat_mapped[i], d[i] = cur[i] - g_hl.stat_last[i];
 		g_hl.stat_last = cur;
+		const double px = std::max<double>(d[0], 1.0), dp = d[1], dk = d[2];
 		std::printf("HWRTLIGHTS: stats (level %d, trace %ux%u) lights %.2f a frame (%llu/%llu frames with any; %zu known now), darkened "
 		            "%.1f %% of pixels by %.1f %% on average (%.2f %% of the screen's light), TLAS stale %llu / none %llu frames, GPU %.3f ms (max %.3f)\n",
 		            level, g_hl.trace.width, g_hl.trace.height, static_cast<double>(g_hl.lights_sum) / std::max<double>(g_hl.frames, 1.0),
@@ -456,6 +456,13 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		            100.0 * dp / px, dp > 0 ? 100.0 * dk / 1024.0 / dp : 0.0, 100.0 * dk / 1024.0 / px,
 		            static_cast<unsigned long long>(g_hl.stale_tlas), static_cast<unsigned long long>(g_hl.no_tlas),
 		            g_hl.samples > 0 ? g_hl.sum_ms / g_hl.samples : 0.0, g_hl.max_ms);
+		// (rays: hit rate, hits at the light's own end; the camera -> pixel probe's agreement with the TLAS; lit pixels'
+		// mean history count and filtered occlusion)
+		std::printf("HWRTLIGHTS: rays: %.1f %% of traced shadow rays hit (%u sampled; %.1f %% of hits within 0.5 m of the light), "
+		            "TLAS alignment %.1f %% (%u camera->pixel probes hit at the pixel's depth; >~85 %%: the depth's world is the TLAS's), "
+		            "lit pixels %.1f %% (W > 0), their history %.1f frames, occlusion %.1f %%\n",
+		            d[3] > 0 ? 100.0 * d[4] / d[3] : 0.0, d[3], d[4] > 0 ? 100.0 * d[5] / d[4] : 0.0, d[7] > 0 ? 100.0 * d[6] / d[7] : 0.0, d[7],
+		            100.0 * d[9] / px, d[9] > 0 ? static_cast<double>(d[10]) / d[9] : 0.0, d[9] > 0 ? 100.0 * d[11] / 1024.0 / d[9] : 0.0);
 		std::fflush(stdout);
 		g_hl.frames = g_hl.frames_lit = g_hl.lights_sum = g_hl.stale_tlas = g_hl.no_tlas = 0;
 		g_hl.sum_ms = g_hl.max_ms = 0.0, g_hl.samples = 0;
