@@ -8196,7 +8196,8 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 		w[17] = miss, w[18] = range, w[19] = contact_m;
 		w[20] = static_cast<float>(vi[3]), w[21] = static_cast<float>(vi[7]), w[22] = static_cast<float>(vi[11]), w[23] = 1.0f;
 		w[24] = static_cast<float>(g_cs.latch_axis[0]), w[25] = static_cast<float>(g_cs.latch_axis[1]);
-		w[26] = static_cast<float>(g_cs.latch_axis[2]), w[27] = 0.0f;
+		static const float strength_hw = RtSunEnv("KYTY_HWRT_SHADOW_STRENGTH", 0.6f, 0.0f, 1.0f);
+		w[26] = static_cast<float>(g_cs.latch_axis[2]), w[27] = strength_hw;
 		for (int i = 0; i < 12; ++i) w[28 + i] = static_cast<float>(vi[i]);
 		// The sun-direction check: the finest cascade's light depth axis (world) against the latched sun.
 		const auto& mm = table[cs.front().k].m;
