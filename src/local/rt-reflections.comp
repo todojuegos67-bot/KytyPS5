@@ -1724,6 +1724,14 @@ bool  MtTlas() { return (push.dec.w & 4) != 0; }
 float MtRough(ivec2 rp) { return push.dec.y >= 0 ? clamp(Field(push.dec.y, rp), 0.0, 1.0) : 0.5; }
 float MtMetal(ivec2 rp) { return push.misc2.w > 0 ? clamp(Field(push.misc2.w - 1, rp), 0.0, 1.0) : 0.0; }
 float MtMetalW(float m) { return smoothstep(0.3, 0.7, m); }
+// (plausibility) A metal's base colour is its F0, bright (iron ~0.55, steel ~0.6, gold / brass ~0.9 in one channel,
+// linear): a pixel flagged metal whose albedo is dark is not a bare metal (stone, dirt, soot-covered fittings) and fades
+// out (KYTY_HWRT_METAL_MIN_F0, linear max channel, default 0.12, the fade from 60 % of it; no albedo layer: kept).
+float MtPlausible(ivec2 rp) {
+	float lim = float((push.dec.w >> 8) & 1023) / 1000.0; // (dec.w bits 8..17: the minimum F0 x 1000; 0 off)
+	if (lim <= 0.0 || int(xparams.w) < 0 || int(xparams.w) >= push.dec.z) return 1.0;
+	return smoothstep(0.6 * lim, lim, Max3(GbufAlbedo(rp)));
+}
 float MtRoughFade(float r) { return 1.0 - smoothstep(push.params.y * 0.7, push.params.y, r); }
 // The pixel's surface: the G-buffer's normal when it belongs to the visible surface (else the depth's), metal, roughness.
 // false: sky, or the G-buffer is not this pixel's surface (water, particles drawn after it).
@@ -1762,7 +1770,7 @@ void MtTrace(ivec2 px) {
 	bool  surf = MtSurface(rp, P, N, Nd, metal, rough);
 	float dist = abs(P.z);
 	imageStore(out_b, px, vec4(N, surf ? dist : 6.0e4));
-	float mw = surf ? MtMetalW(metal) * MtRoughFade(rough) : 0.0;
+	float mw = surf ? MtMetalW(metal) * MtRoughFade(rough) * MtPlausible(rp) : 0.0;
 	bool  st = Sampled(px);
 	if (st && surf) Stat(34, 1), Stat(35, metal > 0.5 ? 1 : 0);
 	// (the roughness of the metal pixels: 10 bins, cumulative, logged every 10 s as "RT metal: roughness on metal")
@@ -1817,6 +1825,11 @@ void MtTrace(ivec2 px) {
 			}
 			if (st) Stat(38, self_ >= 0 ? 1 : 0);
 			float self_range = 0.25 + 0.02 * dist;
+			// (d21c4a2b+: own instance found on only 3-4 % of the pixels in the log of 10-26 07:25, so the instance skip
+			// alone did not stop self-hits) Every hit nearer than t_self is ignored: 8 pixel footprints (the mesh in the TLAS
+			// and the depth / G-buffer surface differ by LOD, refit and normal-map offsets) plus 3 % of the distance.
+			float foot   = dist * 2.0 / max(abs(push.proj.y) * RenderSize().y, 1e-3);
+			float t_self = max(0.06, 8.0 * foot + 0.03 * dist);
 			vec3  o    = Pw + Nw * (0.003 * dist + 0.01);
 			float tmax = max(push.params.z, 1.0);
 			// (fb6cfd8b traced the whole ray with NoOpaque: every candidate triangle of the scene came back to the shader,
@@ -1827,7 +1840,7 @@ void MtTrace(ivec2 px) {
 			vec2  bc    = vec2(0);
 			if (self_ >= 0) {
 				rayQueryEXT sq;
-				rayQueryInitializeEXT(sq, hw_tlas, gl_RayFlagsNoOpaqueEXT, 0xff, o, 0.02, Rw, min(self_range, tmax));
+				rayQueryInitializeEXT(sq, hw_tlas, gl_RayFlagsNoOpaqueEXT, 0xff, o, t_self, Rw, max(min(self_range, tmax), t_self + 1e-3));
 				while (rayQueryProceedEXT(sq)) {
 					if (rayQueryGetIntersectionTypeEXT(sq, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
 					    rayQueryGetIntersectionInstanceIdEXT(sq, false) != self_)
@@ -1842,7 +1855,7 @@ void MtTrace(ivec2 px) {
 			}
 			if (t_hit < 0.0 && (self_ < 0 || self_range < tmax)) {
 				rayQueryEXT rq;
-				rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT, 0xff, o, self_ >= 0 ? self_range : 0.02, Rw, tmax);
+				rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT, 0xff, o, self_ >= 0 ? max(self_range, t_self) : t_self, Rw, tmax);
 				while (rayQueryProceedEXT(rq)) {}
 				if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
 					t_hit = rayQueryGetIntersectionTEXT(rq, true);
@@ -1850,6 +1863,11 @@ void MtTrace(ivec2 px) {
 					prim  = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
 					bc    = rayQueryGetIntersectionBarycentricsEXT(rq, true);
 				}
+			}
+			// (a hit that lands back on the pixel's own spot on the screen is the surface itself: a miss)
+			if (t_hit >= 0.0) {
+				vec4 hs = HwToScreen(o + Rw * t_hit);
+				if (hs.w > 0.5 && length((hs.xy - uv) * RenderSize()) < 3.0) t_hit = -1.0;
 			}
 			if (t_hit >= 0.0) {
 				hit   = MtShadeHit(o, Rw, t_hit, inst, prim, bc, tmax, res);
@@ -1936,6 +1954,11 @@ void MtTemporal(ivec2 px) {
 		len       = min(meta.x + 1.0, cap);
 		float alpha = 1.0 / len;
 		if (!fresh) len = max(meta.x, 1.0), alpha = wraw > 0.0 ? alpha * 0.5 : 0.0;
+		// (one bad frame must not show: a fresh sample much darker or brighter than the history moves it a quarter as fast)
+		{
+			float lh = Luma(hist.rgb), lf = Luma(cur.rgb);
+			if (fresh && (lf < 0.6 * lh - 0.01 || lf > 1.8 * lh + 0.02)) alpha *= 0.25;
+		}
 		res = mix(hist, cur, alpha);
 	} else {
 		res = rough > 0.1 ? mix(cur, mean, 0.5) : cur;
@@ -2023,7 +2046,7 @@ void MtComposite(ivec2 px) {
 	if (view == 1) { imageStore(out_a, px, vec4(vec3(surf ? metal : 0.0) * 0.25 / max(GameExposure(), 1e-6), base.a)); return; }
 	if (view == 2) { imageStore(out_a, px, vec4(vec3(surf ? rough : 0.0) * 0.25 / max(GameExposure(), 1e-6), base.a)); return; }
 	if (view == 3) { imageStore(out_a, px, vec4((surf && metal > 0.5 ? albedo : vec3(0)) * 0.25 / max(GameExposure(), 1e-6), base.a)); return; }
-	float mw = surf ? MtMetalW(metal) * MtRoughFade(rough) : 0.0;
+	float mw = surf ? MtMetalW(metal) * MtRoughFade(rough) * MtPlausible(px) : 0.0;
 	if (mw < 0.02 || Bad(base)) {
 		if (view == 4) base.rgb = vec3(0);
 		imageStore(out_a, px, base);
@@ -2054,9 +2077,11 @@ void MtComposite(ivec2 px) {
 	vec3  outc = mix(base.rgb, ours, w);
 	float lout = Luma(outc);
 	if (lout > 1.75 * lb + 1e-5) outc *= (1.75 * lb + 1e-5) / lout; // (no glowing armour: at most 1.75x the game's pixel)
-	else if (lout < 0.4 * lb) outc *= 0.4 * lb / max(lout, 1e-6);
+	bool dark = lout < 0.7 * lb; // (the stats: this pixel would have darkened by > 30 %)
+	if (lout < 0.85 * lb) outc *= 0.85 * lb / max(lout, 1e-6); // (never more than 15 % darker than the game's shading)
 	if (BadV(outc)) outc = base.rgb;
 	if (Sampled(px)) Stat(39, w > 0.05 ? 1 : 0);
+	if (Sampled(px) && w > 0.05) atomicAdd(calib[MT_HIST + 10], 1), atomicAdd(calib[MT_HIST + 11], dark ? 1 : 0);
 	if (view == 4) outc = ours * conf;
 	imageStore(out_a, px, vec4(outc, base.a));
 }
