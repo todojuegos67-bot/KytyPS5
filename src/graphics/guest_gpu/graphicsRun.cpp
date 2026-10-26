@@ -425,6 +425,19 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	                        dst_gds, src_gds);
 }
 
+static std::atomic<GuestGpu*> g_notify_gpu {nullptr};
+
+void GuestGpu::NotifyWorkAvailable() {
+	auto* gpu = g_notify_gpu.load(std::memory_order_acquire);
+	if (gpu == nullptr) {
+		return;
+	}
+	Common::LockGuard lock(gpu->m_queue_mutex);
+	if (gpu->m_submission_count != 0) {
+		gpu->m_work_available.Signal();
+	}
+}
+
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
@@ -450,6 +463,7 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 	PhaseStats::MarkGpuThread();
+	g_notify_gpu.store(gpu, std::memory_order_release);
 
 	for (;;) {
 		PhaseStats::MaybeReport();
@@ -507,6 +521,7 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();
+			g_notify_gpu.store(nullptr, std::memory_order_release);
 			g_gpu_state  = nullptr;
 			g_gpu_thread = false;
 			return;

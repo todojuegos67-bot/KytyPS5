@@ -23,6 +23,9 @@ class RenderContext;
 
 class GuestGpu final {
 public:
+	// Wakes Thread_Gpu so a queue suspended on WAIT_REG_MEM re-tests its label at once (called after
+	// a deferred GPU-completion operation wrote guest memory).
+	static void NotifyWorkAvailable();
 	explicit GuestGpu(RenderContext& renderer);
 	~GuestGpu();
 	KYTY_CLASS_NO_COPY(GuestGpu);

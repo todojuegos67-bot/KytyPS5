@@ -101,6 +101,28 @@ struct CpuLoadStarter {
 };
 const CpuLoadStarter g_cpu_load_starter;
 
+// Windows rounds every timed wait (SleepConditionVariable*, WaitForSingleObject, std::condition_variable
+// wait_for, Sleep) up to the system timer period, 15.6 ms by default, unless the process asks for a
+// finer one. Guest timed waits and Thread_Gpu's poll of a suspended WAIT_REG_MEM ask for 1 ms or less,
+// so each one cost ~15.6 ms and the frame serialized on them at a few % CPU. KYTY_TIMER_RES_MS
+// (default 1, 0 = leave the system default) sets the period for the life of the process.
+struct TimerResolution {
+	TimerResolution() {
+		const char* v  = std::getenv("KYTY_TIMER_RES_MS");
+		const int   ms = v != nullptr ? std::atoi(v) : 1;
+		if (ms <= 0) {
+			return;
+		}
+		using func_t = unsigned(WINAPI*)(unsigned);
+		HMODULE winmm = LoadLibraryA("winmm.dll");
+		auto*   begin = winmm != nullptr ? reinterpret_cast<func_t>(GetProcAddress(winmm, "timeBeginPeriod")) : nullptr;
+		const unsigned result = begin != nullptr ? begin(static_cast<unsigned>(ms)) : 1u;
+		std::printf("Timer: system timer period %d ms requested (%s)\n", ms, result == 0 ? "ok" : "failed");
+		std::fflush(stdout);
+	}
+};
+const TimerResolution g_timer_resolution;
+
 } // namespace
 
 void KytyNameHostThread(const char* name) {

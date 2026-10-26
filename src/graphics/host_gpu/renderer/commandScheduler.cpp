@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -287,6 +288,9 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active_tick = 0;
 		}
 		m_operation_available.notify_all();
+		// A completion (EOP label, readback) may release a queue suspended on WAIT_REG_MEM; wake
+		// Thread_Gpu instead of letting it find out on its next timed poll.
+		GuestGpu::NotifyWorkAvailable();
 	}
 }
 
