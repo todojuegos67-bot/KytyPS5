@@ -418,6 +418,15 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 	inputs.near_plane = Word(packet, NearWord);
 	inputs.far_plane  = Word(packet, FarWord);
 	inputs.graphics   = &m_context.GetGraphics();
+	// (hwrt2, KYTY_HWRT_REFL: the scene EndFrame built just above, for the reflections' ray queries)
+	if (HwScene::Active()) {
+		HwScene::RayScene scene;
+		if (HwScene::CurrentRayScene(scene)) {
+			inputs.hwrt_tlas      = scene.tlas;
+			inputs.hwrt_info      = scene.info;
+			inputs.hwrt_info_size = scene.size;
+		}
+	}
 	// (rtparticles) The color's guest address (the pre-particle copy is matched to it); with KYTY_RT_PARTICLES_DEBUG the
 	// game's own reactive mask slot (6), as it describes it, once.
 	inputs.color_address = bindings[0].desc.info.data.address;

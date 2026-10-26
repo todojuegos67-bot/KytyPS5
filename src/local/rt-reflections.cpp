@@ -105,6 +105,7 @@
 
 #include "graphics/presentation/videoOut.h"
 #include "gpu_tiler_shaders/rt_reflections_spv.h"
+#include "gpu_tiler_shaders/rt_reflections_hw_spv.h"
 
 #include <algorithm>
 #include <array>
@@ -179,6 +180,12 @@ struct RtPass {
 	vk::DescriptorSetLayout set_layout = nullptr;
 	vk::PipelineLayout      layout     = nullptr;
 	vk::Pipeline            pipeline   = nullptr;
+	// (hwrt2, KYTY_HWRT_REFL) the pass with ray queries into the scene TLAS: + binding 22 (RayInfo), 23 (the TLAS)
+	vk::DescriptorSetLayout hw_set_layout = nullptr;
+	vk::PipelineLayout      hw_layout     = nullptr;
+	vk::Pipeline            hw_pipeline   = nullptr;
+	bool                    hw_failed     = false;
+	uint64_t                hw_frames = 0, sw_frames = 0;
 	vk::Sampler             point = nullptr, linear = nullptr;
 	bool                    failed = false; // (the pipeline could not be made: off for the session)
 	bool                    images_failed = false;
@@ -442,6 +449,68 @@ bool EnsurePipeline(GraphicContext& graphics) {
 		g_rt.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
 	}
 	g_rt.failed = false;
+	return true;
+}
+
+// (hwrt2) KYTY_HWRT_REFL=1: the trace's misses (off the screen, behind something, toward the camera) take a hardware
+// ray query into the scene captured by KYTY_HWRT (local/hwrt-scene.h). Needs KYTY_HWRT=1; turns the reflections on
+// (high) when KYTY_RT_REFLECTIONS is not set.
+bool HwReflWanted() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_HWRT_REFL");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+bool EnsureHwPipeline(GraphicContext& graphics) {
+	if (g_rt.hw_pipeline != nullptr) return true;
+	if (g_rt.hw_failed) return false;
+	g_rt.hw_failed    = true;
+	const auto device = graphics.device;
+	std::array<vk::DescriptorSetLayoutBinding, Bindings + 2> bindings {};
+	for (uint32_t i = 0; i < Bindings + 2; ++i) {
+		bindings[i].binding         = i;
+		bindings[i].descriptorType  = i == Bindings + 1                                       ? vk::DescriptorType::eAccelerationStructureKHR
+		                              : (i == 18 || i == 19 || i == Bindings)                 ? vk::DescriptorType::eStorageBuffer
+		                              : (i == 4 || i == 11 || i == 12 || i == 13)             ? vk::DescriptorType::eStorageImage
+		                                                                                      : vk::DescriptorType::eCombinedImageSampler;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+	}
+	vk::DescriptorSetLayoutCreateInfo set_info {};
+	set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	set_info.bindingCount = Bindings + 2;
+	set_info.pBindings    = bindings.data();
+	if (device.createDescriptorSetLayout(&set_info, nullptr, &g_rt.hw_set_layout) != vk::Result::eSuccess) return false;
+	vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(RtPush)};
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount         = 1;
+	layout_info.pSetLayouts            = &g_rt.hw_set_layout;
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges    = &push;
+	if (device.createPipelineLayout(&layout_info, nullptr, &g_rt.hw_layout) != vk::Result::eSuccess) return false;
+	vk::ShaderModuleCreateInfo module_info {};
+	module_info.codeSize    = sizeof(RT_REFLECTIONS_HW_SPV);
+	module_info.pCode       = RT_REFLECTIONS_HW_SPV;
+	vk::ShaderModule module = nullptr;
+	if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+	vk::ComputePipelineCreateInfo pipeline_info {};
+	pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	pipeline_info.stage.module = module;
+	pipeline_info.stage.pName  = "main";
+	pipeline_info.layout       = g_rt.hw_layout;
+	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_rt.hw_pipeline);
+	device.destroyShaderModule(module, nullptr);
+	if (created != vk::Result::eSuccess) {
+		g_rt.hw_pipeline = nullptr;
+		std::printf("RT reflections: the hardware ray query pipeline could not be made (KYTY_HWRT_REFL): screen-space only\n");
+		std::fflush(stdout);
+		return false;
+	}
+	g_rt.hw_failed = false;
+	std::printf("RT reflections: hardware ray queries into the scene TLAS for the screen-space misses (KYTY_HWRT_REFL=1)\n");
+	std::fflush(stdout);
 	return true;
 }
 
@@ -966,6 +1035,7 @@ void SurveyDecide(bool force) {
 int RtReflectionsLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_RT_REFLECTIONS");
+		if (value == nullptr && HwReflWanted()) return 3; // (KYTY_HWRT_REFL alone: high)
 		return value != nullptr ? std::clamp(std::atoi(value), 0, MaxLevel) : 0; // 0 off, 1 low, 2 medium, 3 high, 4 ultra, 5 extreme
 	}();
 	return level;
@@ -1267,7 +1337,17 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
-	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_rt.pipeline);
+	// (hwrt2) the ray query pipeline when the frame has a scene TLAS (KYTY_HWRT_REFL)
+	const bool hw = HwReflWanted() && inputs.hwrt_tlas != 0 && inputs.hwrt_info && EnsureHwPipeline(*graphics);
+	if (hw) ++g_rt.hw_frames;
+	else ++g_rt.sw_frames;
+	if (HwReflWanted() && ((g_rt.hw_frames + g_rt.sw_frames) % 600) == 1) {
+		std::printf("RT reflections: hardware ray queries in %llu of %llu frames (KYTY_HWRT_REFL; none: no scene TLAS that frame)\n",
+		            static_cast<unsigned long long>(g_rt.hw_frames), static_cast<unsigned long long>(g_rt.hw_frames + g_rt.sw_frames));
+		std::fflush(stdout);
+	}
+	const vk::PipelineLayout pass_layout = hw ? g_rt.hw_layout : g_rt.layout;
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, hw ? g_rt.hw_pipeline : g_rt.pipeline);
 
 	auto&          g    = g_rt;
 	const uint32_t cur  = static_cast<uint32_t>(g.frame & 1u);
@@ -1307,7 +1387,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		const vk::DescriptorBufferInfo exposure_info = game_exposure
 		                                                   ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range}
 		                                                   : frame_info;
-		vk::WriteDescriptorSet writes[Bindings] {};
+		vk::WriteDescriptorSet writes[Bindings + 2] {};
 		for (uint32_t i = 0; i < Bindings; ++i) {
 			writes[i].dstBinding      = i;
 			writes[i].descriptorCount = 1;
@@ -1319,8 +1399,24 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			else writes[i].pImageInfo = &infos[i];
 		}
 		push.misc[0] = mode;
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, Bindings, writes);
-		command.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		// (hwrt2: the scene's RayInfo and TLAS)
+		const vk::DescriptorBufferInfo ray_info {inputs.hwrt_info, 0, inputs.hwrt_info_size};
+		const auto tlas = vk::AccelerationStructureKHR(reinterpret_cast<VkAccelerationStructureKHR>(inputs.hwrt_tlas));
+		vk::WriteDescriptorSetAccelerationStructureKHR as_write {};
+		as_write.accelerationStructureCount = 1;
+		as_write.pAccelerationStructures    = &tlas;
+		if (hw) {
+			writes[Bindings].dstBinding          = Bindings;
+			writes[Bindings].descriptorCount     = 1;
+			writes[Bindings].descriptorType      = vk::DescriptorType::eStorageBuffer;
+			writes[Bindings].pBufferInfo         = &ray_info;
+			writes[Bindings + 1].pNext           = &as_write;
+			writes[Bindings + 1].dstBinding      = Bindings + 1;
+			writes[Bindings + 1].descriptorCount = 1;
+			writes[Bindings + 1].descriptorType  = vk::DescriptorType::eAccelerationStructureKHR;
+		}
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pass_layout, 0, hw ? Bindings + 2 : Bindings, writes);
+		command.pushConstants(pass_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 		Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 		        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);

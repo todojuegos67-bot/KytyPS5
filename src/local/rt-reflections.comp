@@ -1,4 +1,10 @@
-#version 450
+#version 460
+#ifdef KYTY_HWRT
+// (hwrt2, KYTY_HWRT_REFL: rt-reflections.cpp builds this file a second time with KYTY_HWRT)
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#endif
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 // KYTY_RT_REFLECTIONS (rt-reflections.cpp): screen-space ray-traced reflections with denoising on the PS5 Pro path's
@@ -789,6 +795,108 @@ bool March(vec3 P, vec3 N, vec3 R, vec3 V, int iters, out vec4 res, out float hd
 	return true;
 }
 
+#ifdef KYTY_HWRT
+// (hwrt2, KYTY_HWRT_REFL) The scene captured by KYTY_HWRT (local/hwrt-scene.cpp): its TLAS in world space and RayInfo.
+layout(std430, binding = 22) readonly buffer HwRayInfo {
+	vec4  inv[4]; // clip -> world rows
+	vec4  vp[4];  // world -> clip rows
+	vec4  cam;
+	vec4  info;   // x 1: valid
+	uvec4 materials;
+} hw;
+layout(binding = 23) uniform accelerationStructureEXT hw_tlas;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer HwWords { uint w[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer HwVerts { vec4 v[]; };
+
+// A view-space point to world space, through the screen as the game's camera sees it: the uv and depth this pass's
+// projection gives it, then the game's own inverse view-projection (the debug view's convention: NDC y = uv.y * 2 - 1).
+vec3 HwToWorld(vec3 p) {
+	vec4  c  = Clip(p);
+	vec2  uv = Project(p);
+	vec4  q  = vec4(uv * 2.0 - 1.0, c.z / c.w, 1.0);
+	vec4  h  = vec4(dot(hw.inv[0], q), dot(hw.inv[1], q), dot(hw.inv[2], q), dot(hw.inv[3], q));
+	return h.xyz / h.w;
+}
+// A world-space point to (uv, depth) on the screen; w <= 0: behind the camera.
+vec4 HwToScreen(vec3 w) {
+	vec4 q = vec4(w, 1.0);
+	vec4 c = vec4(dot(hw.vp[0], q), dot(hw.vp[1], q), dot(hw.vp[2], q), dot(hw.vp[3], q));
+	if (c.w <= 1e-6) return vec4(-1.0, -1.0, 0.0, 0.0);
+	return vec4(c.xy / c.w * 0.5 + 0.5, c.z / c.w, 1.0);
+}
+// The scene's mean colour (a coarse 4x4 grid of the frame): the light an off-screen hit is shaded with.
+vec3 HwAmbient() {
+	vec3 sum = vec3(0);
+	for (int y = 0; y < 4; ++y)
+		for (int x = 0; x < 4; ++x) sum += SafeColor(textureLod(color_tex, (vec2(x, y) + 0.5) / 4.0, 0).rgb * GameExposure());
+	return sum / 16.0;
+}
+
+// A reflection ray the screen-space march missed, traced in the scene's TLAS. A hit on the screen and visible there takes
+// the frame's colour (as the march's hits); one off the screen or hidden is shaded by the scene's mean light and its
+// geometric normal (lit from above), at a lower confidence (the game's own reflection keeps a share).
+bool HwMarch(vec3 P, vec3 N, vec3 R, vec3 V, out vec4 res, out float hdist) {
+	res   = vec4(0);
+	hdist = 0.0;
+	if (hw.info.x < 0.5) return false;
+	float dist = abs(P.z);
+	float step = 0.01 * max(dist, 1.0);
+	vec3  Pw   = HwToWorld(P);
+	vec3  Rw   = HwToWorld(P + R * step) - Pw;
+	vec3  Nw   = HwToWorld(P + N * step) - Pw;
+	if (BadV(Pw) || BadV(Rw) || length(Rw) < 1e-9) return false;
+	Rw = normalize(Rw);
+	Nw = length(Nw) > 1e-9 ? normalize(Nw) : -Rw;
+	vec3 o = Pw + Nw * (0.002 * dist + 0.01);
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT, 0xff, o, 0.01, Rw, max(push.params.z, 1.0));
+	while (rayQueryProceedEXT(rq)) {}
+	if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) return false;
+	float t  = rayQueryGetIntersectionTEXT(rq, true);
+	vec3  Hw = o + Rw * t;
+	hdist    = t;
+	float far_fade = 1.0 - smoothstep(0.7, 1.0, t / max(push.params.z, 1.0));
+	// On the screen and visible there: the frame's own colour at the hit.
+	vec4 sc = HwToScreen(Hw);
+	if (sc.w > 0.5 && InScreen(sc.xy)) {
+		float sd = DepthAt(sc.xy);
+		float zs = abs(ViewZ(sd)), zh = abs(ViewZ(sc.z));
+		if (!IsSky(sd) && abs(zs - zh) < 0.03 * zh + 0.1) {
+			vec2  edge = min(sc.xy, 1.0 - sc.xy);
+			float conf = far_fade * (0.5 + 0.5 * smoothstep(0.0, 0.05, min(edge.x, edge.y)));
+			vec3  c    = Tonemap(SafeColor(textureLod(color_tex, sc.xy, 0).rgb * GameExposure()));
+			res        = vec4(c * conf, conf);
+			return !Bad(res) && conf > 1e-3;
+		}
+	}
+	// Off the screen or hidden: the scene's mean light on the hit triangle's normal.
+	int  inst = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+	int  prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+	vec3 Hn   = -Rw;
+	uint64_t mat = uint64_t(hw.materials.x) | (uint64_t(hw.materials.y) << 32);
+	if (mat != 0ul && inst >= 0 && prim >= 0) {
+		HwWords  m   = HwWords(mat);
+		uint64_t vb  = uint64_t(m.w[inst * 8 + 4]) | (uint64_t(m.w[inst * 8 + 5]) << 32);
+		uint64_t ib  = uint64_t(m.w[inst * 8 + 6]) | (uint64_t(m.w[inst * 8 + 7]) << 32);
+		if (vb != 0ul && ib != 0ul) {
+			HwWords idx = HwWords(ib);
+			HwVerts ver = HwVerts(vb);
+			vec3    a   = ver.v[idx.w[prim * 3 + 0]].xyz;
+			vec3    b   = ver.v[idx.w[prim * 3 + 1]].xyz;
+			vec3    d   = ver.v[idx.w[prim * 3 + 2]].xyz;
+			vec3    n   = cross(b - a, d - a);
+			if (length(n) > 1e-12) Hn = normalize(n);
+			if (dot(Hn, Rw) > 0.0) Hn = -Hn;
+		}
+	}
+	float up   = clamp(Hn.y * 0.5 + 0.5, 0.0, 1.0); // (world y up)
+	vec3  c    = Tonemap(HwAmbient() * (0.35 + 0.65 * up));
+	float conf = 0.5 * far_fade;
+	res        = vec4(c * conf, conf);
+	return !Bad(res) && conf > 1e-3;
+}
+#endif
+
 // `march`: false on the checkerboard's other half this frame: the surface is written, the reflection marked absent
 // (alpha -1: the temporal pass keeps the history there).
 void Trace(ivec2 px, bool march) {
@@ -855,7 +963,11 @@ void Trace(ivec2 px, bool march) {
 		vec4  hc;
 		float hdist;
 		g_why = 4;
-		if (!March(P, s.N, R, V, iters, hc, hdist)) {
+		bool marched = March(P, s.N, R, V, iters, hc, hdist);
+#ifdef KYTY_HWRT
+		if (!marched) marched = HwMarch(P, s.N, R, V, hc, hdist); // (hwrt2: the march's miss, in the scene's TLAS)
+#endif
+		if (!marched) {
 			// (refl10) why the rays miss (1 in 16 pixels): out of iterations / off the screen or the ray's end /
 			// refused by the validation (or faded to nothing); the rest (toward the camera, degenerate) uncounted
 			if (st) Stat(30, g_why == 1 ? 1 : 0), Stat(31, g_why == 2 ? 1 : 0), Stat(StatsRefused, g_why == 3 ? 1 : 0);
