@@ -359,7 +359,7 @@ void ReadStats(GraphicContext& graphics) {
 	if (now - g_gi.st_last < std::chrono::seconds(2)) return;
 	const auto& s   = g_gi.st_sum;
 	const auto  pct = [](uint64_t a, uint64_t b) { return b > 0 ? 100.0 * static_cast<double>(a) / static_cast<double>(b) : 0.0; };
-	std::printf("HWRTGI: self-test %u frames: %.0f px/frame; AO rays hit %.1f%% (%llu rays, front faces %.1f%% of the hits); GI rays hit %.1f%%, of those on "
+	std::printf("HWRTGI: self-test %u frames: %.0f px/frame sampled (1 of 16); AO rays hit %.1f%% (%llu rays, front faces %.1f%% of the hits); GI rays hit %.1f%%, of those on "
 	            "screen %.1f%%; normals up %.1f%% down %.1f%%; G-buffer normal agrees %.1f%% / disagrees %.1f%% (up %.1f%%, down %.1f%%)\n",
 	            g_gi.st_frames, static_cast<double>(s[0]) / g_gi.st_frames, pct(s[2], s[1]), static_cast<unsigned long long>(s[1]), pct(s[13], s[2]),
 	            pct(s[4], s[3]), pct(s[5], s[4]), pct(s[6], s[0]), pct(s[7], s[0]), pct(s[8], s[0]), pct(s[9], s[0]),
@@ -439,7 +439,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	ReadTiming(*graphics);
 	++g_gi.frames_on;
 
-	static const float ao_radius   = EnvFloat("KYTY_HWRT_AO_RADIUS", 1.5f, 0.05f, 8.0f);
+	static const float ao_radius   = EnvFloat("KYTY_HWRT_AO_RADIUS", 1.0f, 0.05f, 8.0f);
 	static const float ao_strength = EnvFloat("KYTY_HWRT_AO_STRENGTH", 1.0f, 0.0f, 1.0f);
 	static const float ao_floor    = EnvFloat("KYTY_HWRT_AO_FLOOR", 0.35f, 0.2f, 1.0f);
 	static const float gi_int      = EnvFloat("KYTY_HWRT_GI_INTENSITY", 0.5f, 0.0f, 4.0f);
@@ -450,7 +450,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	static const bool  use_normal  = EnvBool("KYTY_HWRT_GI_GBUF_NORMAL", true);
 	static const bool  use_albedo  = EnvBool("KYTY_HWRT_GI_GBUF_ALBEDO", true);
 	const int          level       = cfg.level;
-	const int          ao_rays     = cfg.ao == 0 ? 0 : level == 1 ? 2 : level == 2 ? 3 : 2;
+	const int          ao_rays     = cfg.ao == 0 ? 0 : level == 3 ? 3 : 2; // (hwrt5a perf) 2 rays at levels 1-2 (temporal accumulation does the rest)
 	const int          gi_rays     = cfg.gi == 0 ? 0 : level == 1 ? 1 : 2;
 	const int          passes      = level == 1 ? 2 : 3;
 	const bool         half        = g_gi.trace != g_gi.render;
