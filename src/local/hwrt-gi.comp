@@ -264,7 +264,16 @@ void Trace(ivec2 pixel) {
 			// back at once and read as fully occluded: whole surfaces went dark
 			// (hwrt5a) cull mask 0x03: static + dynamic captured this frame; not 0x04 (dynamic with an older frame's positions:
 			// stale cloth / creatures) nor 0x08 (tiny cards: leaves, ash), which as opaque quads gave black speckle clouds
-			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0x03, O, 0.01 + 0.0005 * dist, dir, R);
+			// (ao2) 0x07: static + all dynamic (level meshes may be classed dynamic / older-frame, 0x04); only tiny cards out
+			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0x07, O, 0.01 + 0.0005 * dist, dir, R);
+			if (g_stat) { // (ao2 diag) the same ray per mask class: words 44 static 0x01, 45 dynamic 0x02, 46 stale 0x04, 47 tiny 0x08
+				for (uint k = 0u; k < 4u; ++k) {
+					rayQueryEXT dq;
+					rayQueryInitializeEXT(dq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 1u << k, O, 0.01 + 0.0005 * dist, dir, R);
+					while (rayQueryProceedEXT(dq)) {}
+					if (rayQueryGetIntersectionTypeEXT(dq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) atomicAdd(st[sb + 44u + k], 1u);
+				}
+			}
 			while (rayQueryProceedEXT(rq)) {}
 			if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
 				if (rayQueryGetIntersectionFrontFaceEXT(rq, true)) STAT(st[sb + 13u], 1u);

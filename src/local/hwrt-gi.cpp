@@ -116,7 +116,8 @@ struct State {
 	VmaAllocation           stats_mem = VK_NULL_HANDLE;
 	uint32_t*               stats_map = nullptr;
 	uint64_t                st_sum[14] {};
-	uint64_t                y_votes[4] {};     // (hwrt5a) probes, as-is agree, mirrored agree, off-horizon probes
+	uint64_t                y_votes[4] {};
+	uint64_t                mask_hits[4] {}; // (ao2) sampled AO rays hitting each instance mask class     // (hwrt5a) probes, as-is agree, mirrored agree, off-horizon probes
 	bool                    y_flip = false;    // (hwrt5a) the y convention in use (KYTY_HWRT_GI_FLIPY, else measured)
 	bool                    y_init = false;
 	uint32_t                st_frames = 0;
@@ -272,7 +273,8 @@ bool EnsurePipeline(GraphicContext& graphics) {
 
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level) {
 	if (g_gi.out.image != VK_NULL_HANDLE && g_gi.render == render) return true;
-	const vk::Extent2D trace = level >= 3 ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
+	// (ao2) every level half res: level 3 at full res traced 1920x1080 x 3 rays (8 ms on a 5080); it gets more rays instead
+	const vk::Extent2D trace = false ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
 	for (auto* img : TraceImages())
 		FreeImage(graphics, *img);
 	bool ok = MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, render, true, g_gi.out);
@@ -353,7 +355,7 @@ void ReadStats(GraphicContext& graphics) {
 	for (int i = 0; i < 14; ++i)
 		g_gi.st_sum[i] += w[i];
 	for (int i = 0; i < 4; ++i)
-		g_gi.y_votes[i] += w[40 + i];
+		g_gi.y_votes[i] += w[40 + i], g_gi.mask_hits[i] += w[44 + i];
 	++g_gi.st_frames;
 	const auto now = std::chrono::steady_clock::now();
 	if (now - g_gi.st_last < std::chrono::seconds(2)) return;
@@ -373,6 +375,13 @@ void ReadStats(GraphicContext& graphics) {
 		            "ray dirs dot %.5f; depth normal (%.2f %.2f %.2f), G-buffer normal (%.2f %.2f %.2f)\n",
 		            f[0], f[1], f[2], f[3], f[8], f[9], f[10], f[7], f[7] >= 0.0f ? std::sqrt(dx * dx + dy * dy + dz * dz) : -1.0f,
 		            f[12], f[13], f[14], f[4], f[5], f[6], f[11], f[23], f[15], f[16], f[17], f[18], f[20], f[21], f[22]);
+	}
+	{ // (ao2) which instance classes the AO rays meet (of the sampled rays, s[1]): the AO traces 0x07
+		const auto& m = g_gi.mask_hits;
+		std::printf("HWRTGI: self-test AO hits by mask (of sampled rays): static 0x01 %.1f%%, dynamic 0x02 %.1f%%, stale dynamic 0x04 %.1f%%, tiny 0x08 %.1f%%\n",
+		            pct(m[0], s[1]), pct(m[1], s[1]), pct(m[2], s[1]), pct(m[3], s[1]));
+		for (auto& v: g_gi.mask_hits)
+			v = 0;
 	}
 	{ // (hwrt5a) the y convention vote
 		const auto& y = g_gi.y_votes;
@@ -439,7 +448,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	ReadTiming(*graphics);
 	++g_gi.frames_on;
 
-	static const float ao_radius   = EnvFloat("KYTY_HWRT_AO_RADIUS", 1.0f, 0.05f, 8.0f);
+	static const float ao_radius   = EnvFloat("KYTY_HWRT_AO_RADIUS", 2.0f, 0.05f, 8.0f);
 	static const float ao_strength = EnvFloat("KYTY_HWRT_AO_STRENGTH", 1.0f, 0.0f, 1.0f);
 	static const float ao_floor    = EnvFloat("KYTY_HWRT_AO_FLOOR", 0.35f, 0.2f, 1.0f);
 	static const float gi_int      = EnvFloat("KYTY_HWRT_GI_INTENSITY", 0.5f, 0.0f, 4.0f);
@@ -450,7 +459,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	static const bool  use_normal  = EnvBool("KYTY_HWRT_GI_GBUF_NORMAL", true);
 	static const bool  use_albedo  = EnvBool("KYTY_HWRT_GI_GBUF_ALBEDO", true);
 	const int          level       = cfg.level;
-	const int          ao_rays     = cfg.ao == 0 ? 0 : level == 3 ? 3 : 2; // (hwrt5a perf) 2 rays at levels 1-2 (temporal accumulation does the rest)
+	const int          ao_rays     = cfg.ao == 0 ? 0 : level == 3 ? 2 : 2; // (ao2: 2 at level 3 too, half res) (hwrt5a perf) 2 rays at levels 1-2 (temporal accumulation does the rest)
 	const int          gi_rays     = cfg.gi == 0 ? 0 : level == 1 ? 1 : 2;
 	const int          passes      = level == 1 ? 2 : 3;
 	const bool         half        = g_gi.trace != g_gi.render;
