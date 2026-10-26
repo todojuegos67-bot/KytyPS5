@@ -10,6 +10,8 @@
 #include "gpu_tiler_shaders/hwrt_gather_spv.h"
 #include "gpu_tiler_shaders/hwrt_debug_spv.h"
 #include "gpu_tiler_shaders/hwrt_debug11_spv.h"
+#include "gpu_tiler_shaders/hwrt_albedo_spv.h"
+#include "gpu_tiler_shaders/hwrt_albedo_array_spv.h"
 
 #include <algorithm>
 #include <array>
@@ -43,6 +45,9 @@ constexpr uint32_t MaxMeshIndices   = 3u << 20u;   // index count * instances of
 constexpr uint32_t MaxEntries       = 24576;
 constexpr uint32_t MaxInstances     = 32768;       // TLAS
 constexpr uint32_t MaxChecks        = 256;         // compare results per slot
+// (hwrt3, KYTY_HWRT_REFL_MATERIAL) the albedo array: AtlasLayers layers of AtlasSize^2 RGBA8 (sqrt-encoded colour)
+constexpr uint32_t AtlasSize        = 128;
+constexpr uint32_t AtlasLayers      = 1024;        // 64 MiB
 
 bool g_supported = false;
 
@@ -60,6 +65,8 @@ uint32_t KeepFrames() { static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT
 uint32_t RefitInterval() { static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT_REFIT_EVERY", 4)); return v; }
 uint32_t RefitsPerFrame() { static const uint32_t v = EnvU32("KYTY_HWRT_REFITS", 64); return v; }
 uint32_t DebugMode() { static const uint32_t v = EnvU32("KYTY_HWRT_DEBUG", 0); return v; }
+// (hwrt3) KYTY_HWRT_MATERIAL_COPIES (16): base-colour textures copied into the albedo array per frame at most.
+uint32_t CopiesPerFrame() { static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT_MATERIAL_COPIES", 16)); return v; }
 
 struct Buffer {
 	VkBuffer          buffer  = VK_NULL_HANDLE;
@@ -127,6 +134,13 @@ struct Entry {
 	bool     built = false, dynamic = false, updatable = false;
 	uint64_t last_seen = 0, next_check = 0, capture_frame = UINT64_MAX;
 	uint32_t built_count = 0;
+	// (hwrt3, material) the texcoord's selection in the record (0: none; else location + 1 | c0 << 8 | c1 << 10), whether
+	// the BLAS vertices carry it (written by a gather with it), the albedo array layer and the texture it holds
+	uint32_t uv_sel = 0;
+	bool     uv_written = false, material_tried = false;
+	int32_t  layer = -1;
+	uint64_t albedo_key = 0;
+	uint32_t albedo_binding = 0, albedo_element = 0;
 };
 
 struct Job {
@@ -135,6 +149,7 @@ struct Job {
 	Mode     mode  = Mode::Write;
 	uint32_t result = 0;
 	bool     build = false, refit = false;
+	bool     uv = false; // (hwrt3) its record captures the texcoord too
 };
 
 // (hwrt2) What the ray-traced effects read of the frame's scene (std430, hwrt2 shaders' binding).
@@ -143,7 +158,8 @@ struct RayInfo {
 	float    vp[16];        // world -> clip rows (clip = M * world)
 	float    cam[4];        // the camera's position
 	float    info[4];       // 1 valid, TLAS instances
-	uint32_t materials[4];  // the materials' address (8 words per TLAS instance: PS, VS, id, vertices, indices)
+	uint32_t materials[4];  // the materials' address (8 words per TLAS instance: PS, VS, id, vertices, indices); (hwrt3) zw:
+	                        // the albedo words' address (1 per TLAS instance: albedo array layer + 1, 0 none; 0: no material)
 };
 
 struct Pending {
@@ -152,11 +168,44 @@ struct Pending {
 	uint64_t                     frame = 0;
 };
 
+// (hwrt3) A sample of a pixel shader's (an OpImageSample* of a float 2D image): its image's SPIR-V binding and array
+// element, the input location its first two coordinates come from and their components.
+struct PsSample {
+	uint32_t binding = 0, element = 0, location = 0, c0 = 0, c1 = 1;
+};
+
 struct State {
 	std::mutex mutex;
 	bool       init_tried = false, ready = false, disabled = false;
 	Buffer     capture, records, instances[Slots], materials[Slots], results[Slots], scratch, tlas_buf;
 	Buffer     rayinfo[Slots]; // (hwrt2: the frame's scene for the ray-traced effects, RayInfo)
+	// (hwrt3, KYTY_HWRT_REFL_MATERIAL) captured texcoords (vec2 per captured vertex), the albedo words per slot, the array
+	Buffer     uvcap, albedo_words[Slots];
+	bool       material = false;   // the material buffers and pipelines exist
+	bool       atlas_ready = false; // its layout transition is recorded
+	VkImage            atlas_image = VK_NULL_HANDLE;
+	VmaAllocation      atlas_memory = nullptr;
+	vk::ImageView      atlas_view = nullptr;
+	vk::Sampler        atlas_sampler = nullptr, copy_sampler = nullptr;
+	vk::Pipeline       copy2d = nullptr, copy_array = nullptr;
+	vk::PipelineLayout copy_layout = nullptr;
+	vk::DescriptorSetLayout copy_set_layout = nullptr;
+	struct AtlasSlot {
+		uint64_t key = 0, last_used = 0;
+		bool     ready = false;
+	};
+	std::vector<AtlasSlot>                 atlas;
+	std::unordered_map<uint64_t, uint32_t> atlas_map; // texture key -> layer
+	std::vector<uint32_t>                  atlas_free;
+	uint64_t                               atlas_full_frame = 0;
+	struct Copy {
+		PsImage  image;
+		uint64_t key = 0, address = 0;
+		uint32_t layer = 0;
+	};
+	std::deque<Copy> copies;
+	std::unordered_map<VkShaderModule, std::shared_ptr<const std::vector<PsSample>>> ps_analysis;
+	uint64_t mat_meshes = 0, mat_none = 0, mat_copies = 0, mat_copy_dropped = 0, mat_instances = 0, mat_srgb = 0;
 	int        ray_slot = -1;  // the last slot whose TLAS and RayInfo are complete
 	vk::AccelerationStructureKHR tlas = nullptr;
 	vk::DeviceAddress            tlas_address = 0;
@@ -219,6 +268,98 @@ bool MakeCompute(GraphicContext& graphics, const uint32_t* code, size_t bytes, v
 	graphics.device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) out = nullptr;
 	return out != nullptr;
+}
+
+bool MaterialEnv() {
+	static const bool on = [] {
+		const char* m = std::getenv("KYTY_HWRT_REFL_MATERIAL");
+		const char* r = std::getenv("KYTY_HWRT_REFL");
+		return m != nullptr && m[0] == '1' && r != nullptr && r[0] == '1';
+	}();
+	return on;
+}
+
+// (hwrt3) The texcoord capture, the albedo words, the albedo array and its copy pipelines. False: no material (logged);
+// the reflections keep their flat shading.
+bool InitMaterial(GraphicContext& graphics) {
+	bool ok = MakeBuffer(graphics, g.uvcap, vk::DeviceSize {MaxCapture} * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+	for (uint32_t s = 0; s < Slots && ok; ++s)
+		ok = MakeBuffer(graphics, g.albedo_words[s], vk::DeviceSize {MaxInstances} * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+	if (ok) {
+		VkImageCreateInfo image {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		image.imageType     = VK_IMAGE_TYPE_2D;
+		image.format        = VK_FORMAT_R8G8B8A8_UNORM;
+		image.extent        = {AtlasSize, AtlasSize, 1};
+		image.mipLevels     = 1;
+		image.arrayLayers   = AtlasLayers;
+		image.samples       = VK_SAMPLE_COUNT_1_BIT;
+		image.tiling        = VK_IMAGE_TILING_OPTIMAL;
+		image.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+		ok = vmaCreateImage(graphics.allocator, &image, &allocate, &g.atlas_image, &g.atlas_memory, nullptr) == VK_SUCCESS;
+		if (!ok) g.atlas_image = VK_NULL_HANDLE;
+	}
+	if (ok) {
+		vk::ImageViewCreateInfo view {};
+		view.image            = vk::Image(g.atlas_image);
+		view.viewType         = vk::ImageViewType::e2DArray;
+		view.format           = vk::Format::eR8G8B8A8Unorm;
+		view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, AtlasLayers};
+		ok = graphics.device.createImageView(&view, nullptr, &g.atlas_view) == vk::Result::eSuccess;
+	}
+	if (ok) {
+		vk::SamplerCreateInfo sampler {};
+		sampler.magFilter    = vk::Filter::eLinear;
+		sampler.minFilter    = vk::Filter::eLinear;
+		sampler.mipmapMode   = vk::SamplerMipmapMode::eNearest;
+		sampler.addressModeU = sampler.addressModeV = vk::SamplerAddressMode::eRepeat; // (the game's texcoords tile)
+		sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+		sampler.maxLod       = 0.0f;
+		ok = graphics.device.createSampler(&sampler, nullptr, &g.atlas_sampler) == vk::Result::eSuccess;
+		sampler.addressModeU = sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+		sampler.mipmapMode   = vk::SamplerMipmapMode::eLinear;
+		sampler.maxLod       = VK_LOD_CLAMP_NONE;
+		ok = ok && graphics.device.createSampler(&sampler, nullptr, &g.copy_sampler) == vk::Result::eSuccess;
+	}
+	if (ok) {
+		std::array<vk::DescriptorSetLayoutBinding, 2> bindings {};
+		bindings[0].binding         = 0;
+		bindings[0].descriptorType  = vk::DescriptorType::eCombinedImageSampler;
+		bindings[0].descriptorCount = 1;
+		bindings[0].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+		bindings[1].binding         = 1;
+		bindings[1].descriptorType  = vk::DescriptorType::eStorageImage;
+		bindings[1].descriptorCount = 1;
+		bindings[1].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+		vk::DescriptorSetLayoutCreateInfo set_info {};
+		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+		set_info.pBindings    = bindings.data();
+		const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, 16};
+		vk::PipelineLayoutCreateInfo layout {};
+		layout.setLayoutCount         = 1;
+		layout.pSetLayouts            = &g.copy_set_layout;
+		layout.pushConstantRangeCount = 1;
+		layout.pPushConstantRanges    = &push;
+		ok = graphics.device.createDescriptorSetLayout(&set_info, nullptr, &g.copy_set_layout) == vk::Result::eSuccess &&
+		     graphics.device.createPipelineLayout(&layout, nullptr, &g.copy_layout) == vk::Result::eSuccess &&
+		     MakeCompute(graphics, HWRT_ALBEDO_SPV, sizeof(HWRT_ALBEDO_SPV), g.copy_layout, g.copy2d) &&
+		     MakeCompute(graphics, HWRT_ALBEDO_ARRAY_SPV, sizeof(HWRT_ALBEDO_ARRAY_SPV), g.copy_layout, g.copy_array);
+	}
+	if (!ok) {
+		Say("material (KYTY_HWRT_REFL_MATERIAL): could not make the texcoord buffer, albedo array or copy pipelines: off");
+		return false;
+	}
+	g.atlas.assign(AtlasLayers, {});
+	for (uint32_t i = AtlasLayers; i-- > 0;) g.atlas_free.push_back(i);
+	g.material = true;
+	std::printf("HWRT: material capture on (KYTY_HWRT_REFL_MATERIAL=1): texcoords at 0x%llx, albedo array %u x %ux%u RGBA8, "
+	            "copies/frame %u\n",
+	            static_cast<unsigned long long>(g.uvcap.address), AtlasLayers, AtlasSize, AtlasSize, CopiesPerFrame());
+	std::fflush(stdout);
+	return true;
 }
 
 bool Init(GraphicContext& graphics) {
@@ -290,6 +431,7 @@ bool Init(GraphicContext& graphics) {
 		Say("could not allocate the capture buffers or make the gather pipeline: off");
 		return false;
 	}
+	if (MaterialEnv()) InitMaterial(graphics);
 	g.ready = true;
 	std::printf("HWRT: ready (capture %u vertices at 0x%llx, records at 0x%llx; builds/frame %u, build tris/frame %u, keep %u "
 	            "frames, debug %u)\n",
@@ -353,7 +495,10 @@ struct SpirvPatcher {
 		return id;
 	}
 
-	bool Run(std::vector<uint32_t>& out, uint64_t capture_address, uint64_t records_address, uint32_t record_cap, uint32_t capture_cap) {
+	// (hwrt3) uv_address != 0: also store a vertex output's two components (the record's pad selects: location + 1 | c0 << 8
+	// | c1 << 10; 0 none) as a vec2 at uv_address[the same element].
+	bool Run(std::vector<uint32_t>& out, uint64_t capture_address, uint64_t records_address, uint32_t record_cap, uint32_t capture_cap,
+	         uint64_t uv_address = 0) {
 		if (in.size() < 5 || in[0] != 0x07230203u) return error = "not SPIR-V", false;
 		const uint32_t version = in[1];
 		bound                  = in[3];
@@ -503,6 +648,36 @@ struct SpirvPatcher {
 		const uint32_t c_8    = Const64(t_u64, 8);
 		const uint32_t c_rcap = Const32(t_u32, record_cap);
 		const uint32_t c_ccap = Const32(t_u32, capture_cap);
+		// (hwrt3) The vertex outputs a texcoord may be (vec4 Output variables with a Location), and the constants.
+		std::vector<std::pair<uint32_t, uint32_t>> uv_outs; // (location, variable)
+		uint32_t t_f32 = 0, t_v2 = 0, t_pv2 = 0, c_uv = 0, c_12 = 0, c_ff = 0, c_s8 = 0, c_s10 = 0, c_3 = 0;
+		std::vector<uint32_t> c_locs;
+		if (uv_address != 0) {
+			std::unordered_map<uint32_t, uint32_t> locations;
+			for (const auto& i: insts)
+				if (i.op == 71 && i.count >= 4 && W(i)[2] == 30) locations[W(i)[1]] = W(i)[3];
+			for (const auto& [var, storage]: var_storage) {
+				if (storage != 3) continue;
+				const auto l = locations.find(var);
+				const auto p = pointers.find(var_type[var]);
+				if (l == locations.end() || p == pointers.end() || p->second.second != vec4 || l->second >= 32) continue;
+				uv_outs.emplace_back(l->second, var);
+			}
+			std::sort(uv_outs.begin(), uv_outs.end());
+			if (uv_outs.size() > 16) uv_outs.resize(16);
+			if (!uv_outs.empty()) {
+				t_f32 = v4->second[2];
+				t_v2  = FindType(23, {t_f32, 2});
+				t_pv2 = FindType(32, {5349, t_v2});
+				c_uv  = Const64(t_u64, uv_address);
+				c_12  = Const64(t_u64, 12);
+				c_ff  = Const32(t_u32, 0xff);
+				c_s8  = Const32(t_u32, 8);
+				c_s10 = Const32(t_u32, 10);
+				c_3   = Const32(t_u32, 3);
+				for (const auto& o: uv_outs) c_locs.push_back(Const32(t_u32, o.first + 1));
+			}
+		}
 
 		size_t first_function = SIZE_MAX;
 		for (size_t k = 0; k < insts.size(); ++k)
@@ -632,6 +807,47 @@ struct SpirvPatcher {
 				Emit(out, 128, {t_u64, addr, c_cap, off});
 				Emit(out, 120, {t_pv4, dst, addr});
 				Emit(out, 62, {dst, pos, 2, 16});
+				if (!uv_outs.empty()) {
+					// (hwrt3) The record's texcoord selection; the selected output's two components to uv[e].
+					const uint32_t a3 = Id();
+					Emit(out, 128, {t_u64, a3, raddr, c_12});
+					const uint32_t pad = load_u32(a3);
+					const uint32_t sel = Id(), s0 = Id(), k0 = Id(), s1 = Id(), k1 = Id(), has = Id();
+					Emit(out, 199, {t_u32, sel, pad, c_ff});
+					Emit(out, 194, {t_u32, s0, pad, c_s8});
+					Emit(out, 199, {t_u32, k0, s0, c_3});
+					Emit(out, 194, {t_u32, s1, pad, c_s10});
+					Emit(out, 199, {t_u32, k1, s1, c_3});
+					Emit(out, 171, {t_bool, has, sel, c_0});
+					const uint32_t then4 = Id(), merge4 = Id();
+					Emit(out, 247, {merge4, 0});
+					Emit(out, 250, {has, then4, merge4});
+					Emit(out, 248, {then4});
+					uint32_t x = 0, y = 0;
+					for (size_t o = 0; o < uv_outs.size(); ++o) {
+						const uint32_t l = Id(), xo = Id(), yo = Id();
+						Emit(out, 61, {vec4, l, uv_outs[o].second});
+						Emit(out, 77, {t_f32, xo, l, k0}); // OpVectorExtractDynamic
+						Emit(out, 77, {t_f32, yo, l, k1});
+						if (o == 0) {
+							x = xo, y = yo;
+							continue;
+						}
+						const uint32_t eq = Id(), nx = Id(), ny = Id();
+						Emit(out, 170, {t_bool, eq, sel, c_locs[o]});
+						Emit(out, 169, {t_f32, nx, eq, xo, x}); // OpSelect
+						Emit(out, 169, {t_f32, ny, eq, yo, y});
+						x = nx, y = ny;
+					}
+					const uint32_t uv = Id(), uoff = Id(), uaddr = Id(), udst = Id();
+					Emit(out, 80, {t_v2, uv, x, y});
+					Emit(out, 132, {t_u64, uoff, e64, c_8});
+					Emit(out, 128, {t_u64, uaddr, c_uv, uoff});
+					Emit(out, 120, {t_pv2, udst, uaddr});
+					Emit(out, 62, {udst, uv, 2, 8});
+					Emit(out, 249, {merge4});
+					Emit(out, 248, {merge4});
+				}
 				Emit(out, 249, {merge3});
 				Emit(out, 248, {merge3});
 				Emit(out, 249, {merge2});
@@ -793,6 +1009,17 @@ void MaybeLog() {
 	std::printf("HWRT: 10 s: scene builds %llu (one a frame: at the TAA dispatch or the PS5 Pro upscale packet), debug views %llu%s\n",
 	            static_cast<unsigned long long>(g.build_calls), static_cast<unsigned long long>(g.debug_calls),
 	            g.build_calls == 0 ? " - NO BUILD HOOK RAN: no TAA dispatch / super-resolution packet reached the hook" : "");
+	if (g.material) {
+		uint32_t layers = 0;
+		for (const auto& a: g.atlas) layers += a.key != 0 && a.ready ? 1 : 0;
+		std::printf("HWRT: 10 s: material: new meshes %llu (no base colour %llu, sRGB %llu), albedo copies %llu (dropped: image gone or "
+		            "not readable %llu, queued %zu), layers filled %u of %u, TLAS instances with a material %.0f/frame\n",
+		            static_cast<unsigned long long>(g.mat_meshes), static_cast<unsigned long long>(g.mat_none),
+		            static_cast<unsigned long long>(g.mat_srgb), static_cast<unsigned long long>(g.mat_copies),
+		            static_cast<unsigned long long>(g.mat_copy_dropped), g.copies.size(), layers, AtlasLayers,
+		            static_cast<double>(g.mat_instances) / frames);
+		g.mat_meshes = g.mat_none = g.mat_srgb = g.mat_copies = g.mat_copy_dropped = g.mat_instances = 0;
+	}
 	std::fflush(stdout);
 	g.draws_seen = g.draws_captured = g.draws_reused = g.frames = g.frames_no_camera = 0;
 	std::fill(std::begin(g.skips), std::end(g.skips), 0);
@@ -844,7 +1071,341 @@ bool CreateEntry(GraphicContext& graphics, Entry& e, const Draw& d) {
 	return true;
 }
 
+// ---- (hwrt3) Material: the pixel shader's base-colour samples, the albedo array ---------------------------------------
+// Every OpImageSample{Implicit,Explicit}Lod of a float 2D image in a pixel module: its image's binding and constant array
+// element (through OpSampledImage, OpLoad, OpAccessChain), and the input location and components its coordinate's first
+// two components come from (through extracts, shuffles, constructs, loads of function variables and any arithmetic
+// whose operand leads there: the nearest input wins). Samples whose image or coordinate cannot be traced are left out.
+struct PsAnalyzer {
+	const std::vector<uint32_t>&                   in;
+	std::unordered_map<uint32_t, size_t>           def;      // result id -> word offset of its instruction
+	std::unordered_map<uint32_t, uint32_t>         binding, location, storage;
+	std::unordered_map<uint32_t, std::vector<uint32_t>> stores; // pointer -> stored values
+	std::unordered_map<uint32_t, uint32_t>         constant;
+	int                                            budget = 0;
+
+	explicit PsAnalyzer(const std::vector<uint32_t>& spirv): in(spirv) {}
+	[[nodiscard]] uint32_t Op(size_t at) const { return in[at] & 0xffffu; }
+	[[nodiscard]] uint32_t Count(size_t at) const { return in[at] >> 16u; }
+	// Where an instruction's result id is (false: it has none).
+	static bool HasResult(uint32_t op, uint32_t& type_word, uint32_t& id_word) {
+		if ((op >= 19 && op <= 39) || op == 7 || op == 11 || op == 73 || op == 248 || op == 322) return type_word = 0, id_word = 1, true;
+		switch (op) {
+			case 0: case 2: case 3: case 4: case 5: case 6: case 8: case 10: case 14: case 15: case 16: case 17: case 56: case 62:
+			case 63: case 64: case 71: case 72: case 74: case 75: case 99: case 218: case 219: case 220: case 221: case 224:
+			case 225: case 228: case 246: case 247: case 249: case 250: case 251: case 252: case 253: case 254: case 255:
+			case 256: case 257: case 317: case 330: case 331: case 332: case 4416: case 5380: case 5294: case 5295: case 5632:
+			case 5633:
+				return false;
+			default: return type_word = 1, id_word = 2, true;
+		}
+	}
+	bool Parse() {
+		if (in.size() < 5 || in[0] != 0x07230203u) return false;
+		for (size_t at = 5; at < in.size();) {
+			const uint32_t n = Count(at), op = Op(at);
+			if (n == 0 || at + n > in.size()) return false;
+			uint32_t tw = 0, iw = 0;
+			if (op == 71 && n >= 4) {
+				if (in[at + 2] == 33) binding[in[at + 1]] = in[at + 3];
+				if (in[at + 2] == 30) location[in[at + 1]] = in[at + 3];
+			} else if (op == 59 && n >= 4) {
+				storage[in[at + 2]] = in[at + 3];
+				def[in[at + 2]]     = at;
+			} else if (op == 62 && n >= 3) {
+				stores[in[at + 1]].push_back(in[at + 2]);
+			} else if (op == 43 && n >= 4) {
+				constant[in[at + 2]] = in[at + 3];
+				def[in[at + 2]]      = at;
+			} else if (op != 248 && HasResult(op, tw, iw) && n > iw) {
+				def[in[at + iw]] = at;
+			}
+			at += n;
+		}
+		return true;
+	}
+	// The component count of a value's type (1 for a scalar).
+	uint32_t Width(uint32_t id) const {
+		const auto d = def.find(id);
+		if (d == def.end()) return 1;
+		const auto t = def.find(in[d->second + 1]);
+		if (t == def.end() || Op(t->second) != 23) return 1;
+		return in[t->second + 3];
+	}
+	// (location, component) of `id`'s component `comp`.
+	bool Trace(uint32_t id, uint32_t comp, int depth, uint32_t& loc, uint32_t& c) {
+		if (depth > 32 || --budget < 0) return false;
+		const auto d = def.find(id);
+		if (d == def.end()) return false;
+		const size_t   at = d->second;
+		const uint32_t op = Op(at), n = Count(at);
+		switch (op) {
+			case 59: { // a variable reached directly (a load's pointer)
+				const auto st = storage.find(id);
+				const auto l  = location.find(id);
+				if (st != storage.end() && st->second == 1 && l != location.end()) return loc = l->second, c = comp, true;
+				return false;
+			}
+			case 61: { // OpLoad
+				const uint32_t ptr = in[at + 3];
+				const auto     pd  = def.find(ptr);
+				if (pd == def.end()) return false;
+				if (Op(pd->second) == 59) {
+					const auto st = storage.find(ptr);
+					if (st != storage.end() && st->second == 1) return Trace(ptr, comp, depth + 1, loc, c);
+					if (st != storage.end() && st->second == 7) { // a function variable: what was stored to it
+						const auto s = stores.find(ptr);
+						if (s == stores.end()) return false;
+						for (const auto v: s->second)
+							if (Trace(v, comp, depth + 1, loc, c)) return true;
+					}
+					return false;
+				}
+				if ((Op(pd->second) == 65 || Op(pd->second) == 66) && Count(pd->second) == 5) { // var[k]
+					const uint32_t base = in[pd->second + 3];
+					const auto     k    = constant.find(in[pd->second + 4]);
+					const auto     st   = storage.find(base);
+					const auto     l    = location.find(base);
+					if (k != constant.end() && st != storage.end() && st->second == 1 && l != location.end() && k->second < 4)
+						return loc = l->second, c = k->second, true;
+				}
+				const auto s = stores.find(ptr);
+				if (s != stores.end())
+					for (const auto v: s->second)
+						if (Trace(v, comp, depth + 1, loc, c)) return true;
+				return false;
+			}
+			case 81: // OpCompositeExtract
+				if (n < 5) return false;
+				return Trace(in[at + 3], in[at + 4], depth + 1, loc, c);
+			case 80: { // OpCompositeConstruct
+				uint32_t first = 0;
+				for (uint32_t k = 3; k < n; ++k) {
+					const uint32_t w = Width(in[at + k]);
+					if (comp < first + w) return Trace(in[at + k], comp - first, depth + 1, loc, c);
+					first += w;
+				}
+				return false;
+			}
+			case 79: { // OpVectorShuffle
+				if (n < 5 + comp + 1) return false;
+				const uint32_t sel = in[at + 5 + comp], w1 = Width(in[at + 3]);
+				if (sel == 0xffffffffu) return false;
+				return sel < w1 ? Trace(in[at + 3], sel, depth + 1, loc, c) : Trace(in[at + 4], sel - w1, depth + 1, loc, c);
+			}
+			case 245: // OpPhi
+				for (uint32_t k = 3; k + 1 < n; k += 2)
+					if (Trace(in[at + k], comp, depth + 1, loc, c)) return true;
+				return false;
+			case 43: case 44: case 46: case 50: case 51: case 52: case 87: case 88: case 95: case 96: case 57: case 54:
+				return false; // (constants, other samples, calls: not an input)
+			default: break;
+		}
+		// Arithmetic and conversions: an operand that leads to an input (the same component of a vector operand).
+		const uint32_t first = op == 12 ? 5 : 3; // (OpExtInst: set, instruction)
+		for (uint32_t k = first; k < n; ++k) {
+			const uint32_t v = in[at + k];
+			if (def.find(v) == def.end()) continue;
+			if (Trace(v, Width(v) > 1 ? comp : 0, depth + 1, loc, c)) return true;
+		}
+		return false;
+	}
+	// The binding and element of a sampled image operand.
+	bool Image(uint32_t id, uint32_t& b, uint32_t& e, int depth = 0) {
+		if (depth > 8) return false;
+		const auto d = def.find(id);
+		if (d == def.end()) return false;
+		const size_t at = d->second;
+		switch (Op(at)) {
+			case 86: return Image(in[at + 3], b, e, depth + 1); // OpSampledImage: its image
+			case 83: case 124: return Image(in[at + 3], b, e, depth + 1); // copy, bitcast
+			case 61: { // OpLoad
+				const uint32_t ptr = in[at + 3];
+				const auto     pd  = def.find(ptr);
+				if (pd == def.end()) return false;
+				if (Op(pd->second) == 59) {
+					const auto bb = binding.find(ptr);
+					if (bb == binding.end()) return false;
+					return b = bb->second, e = 0, true;
+				}
+				if ((Op(pd->second) == 65 || Op(pd->second) == 66) && Count(pd->second) == 5) {
+					const auto bb = binding.find(in[pd->second + 3]);
+					const auto k  = constant.find(in[pd->second + 4]);
+					if (bb == binding.end() || k == constant.end()) return false;
+					return b = bb->second, e = k->second, true;
+				}
+				return false;
+			}
+			default: return false;
+		}
+	}
+	// Whether a sampled image operand's image type is a float 2D one (arrayed or not).
+	bool Float2D(uint32_t sampled) const {
+		const auto d = def.find(sampled);
+		if (d == def.end()) return false;
+		auto t = def.find(in[d->second + 1]); // its type: OpTypeSampledImage
+		if (t == def.end() || Op(t->second) != 27) return false;
+		t = def.find(in[t->second + 2]); // OpTypeImage
+		if (t == def.end() || Op(t->second) != 25) return false;
+		const auto f = def.find(in[t->second + 2]);
+		return in[t->second + 3] == 1 && in[t->second + 4] != 1 && in[t->second + 6] == 0 && f != def.end() && Op(f->second) == 22;
+	}
+	std::vector<PsSample> Run() {
+		std::vector<PsSample> out;
+		if (!Parse()) return out;
+		for (size_t at = 5; at < in.size(); at += Count(at)) {
+			const uint32_t op = Op(at);
+			if ((op != 87 && op != 88) || Count(at) < 5) continue;
+			const uint32_t sampled = in[at + 3], coord = in[at + 4];
+			PsSample       s;
+			if (!Float2D(sampled) || !Image(sampled, s.binding, s.element)) continue;
+			uint32_t l0 = 0, l1 = 0;
+			budget = 4096;
+			if (!Trace(coord, 0, 0, l0, s.c0)) continue;
+			budget = 4096;
+			if (!Trace(coord, 1, 0, l1, s.c1) || l1 != l0 || s.c0 > 3 || s.c1 > 3) continue;
+			s.location = l0;
+			const bool dup = std::any_of(out.begin(), out.end(), [&](const PsSample& o) {
+				return o.binding == s.binding && o.element == s.element;
+			});
+			if (!dup) out.push_back(s);
+		}
+		return out;
+	}
+};
+
+std::shared_ptr<const std::vector<PsSample>> AnalyzePs(vk::ShaderModule module) {
+	const auto key = static_cast<VkShaderModule>(module);
+	if (auto found = g.ps_analysis.find(key); found != g.ps_analysis.end()) return found->second;
+	auto       result = std::make_shared<std::vector<PsSample>>();
+	const auto spirv  = module != nullptr && ModuleStore::Holds(module) ? ModuleStore::Load(module) : nullptr;
+	if (spirv != nullptr) *result = PsAnalyzer(*spirv).Run();
+	static int said = 0;
+	if (said < 12) {
+		++said;
+		std::printf("HWRT: material: pixel module %p: %zu traceable 2D samples%s", static_cast<void*>(key), result->size(),
+		            spirv == nullptr ? " (SPIR-V not readable)" : "");
+		for (const auto& s: *result) std::printf(" [b%u e%u <- loc %u .%c%c]", s.binding, s.element, s.location, "xyzw"[s.c0], "xyzw"[s.c1]);
+		std::printf("\n");
+		std::fflush(stdout);
+	}
+	g.ps_analysis[key] = result;
+	return result;
+}
+
+// A view format's rank as a base colour: 2 sRGB colour, 1 a 3-4 channel unorm colour, 0 not one (normal / mask maps,
+// integers, depth).
+int AlbedoRank(vk::Format f) {
+	switch (f) {
+		case vk::Format::eR8G8B8A8Srgb: case vk::Format::eB8G8R8A8Srgb: case vk::Format::eA8B8G8R8SrgbPack32:
+		case vk::Format::eBc1RgbSrgbBlock: case vk::Format::eBc1RgbaSrgbBlock: case vk::Format::eBc2SrgbBlock:
+		case vk::Format::eBc3SrgbBlock: case vk::Format::eBc7SrgbBlock:
+			return 2;
+		case vk::Format::eR8G8B8A8Unorm: case vk::Format::eB8G8R8A8Unorm: case vk::Format::eA8B8G8R8UnormPack32:
+		case vk::Format::eA2B10G10R10UnormPack32: case vk::Format::eBc1RgbUnormBlock: case vk::Format::eBc1RgbaUnormBlock:
+		case vk::Format::eBc2UnormBlock: case vk::Format::eBc3UnormBlock: case vk::Format::eBc7UnormBlock:
+			return 1;
+		default: return 0;
+	}
+}
+
+uint64_t TextureKey(const PsImage& p, uint64_t address) {
+	return Mix(Mix(Mix(uint64_t {p.image_index} | uint64_t {p.image_generation} << 32u, p.serial), address), static_cast<uint64_t>(p.format)) | 1u;
+}
+
+// The layer holding this texture (made: its copy queued), -1 when the array has no layer to give.
+int32_t AtlasRequest(const PsImage& p, uint64_t address, uint64_t& key) {
+	key = TextureKey(p, address);
+	if (const auto found = g.atlas_map.find(key); found != g.atlas_map.end()) return static_cast<int32_t>(found->second);
+	// A free layer, else the least recently used one no frame in flight reads (one scan a frame at most when none is).
+	if (g.copies.size() >= 4096 || g.atlas_full_frame == g.frame) return -1;
+	int32_t best = -1;
+	while (!g.atlas_free.empty() && best < 0) {
+		const uint32_t i = g.atlas_free.back();
+		g.atlas_free.pop_back();
+		if (g.atlas[i].key == 0) best = static_cast<int32_t>(i);
+	}
+	if (best < 0) {
+		uint64_t oldest = UINT64_MAX;
+		for (uint32_t i = 0; i < g.atlas.size(); ++i) {
+			const auto& a = g.atlas[i];
+			if (a.key == 0) {
+				best = static_cast<int32_t>(i);
+				break;
+			}
+			if (a.last_used + Slots + 2 < g.frame && a.last_used < oldest) oldest = a.last_used, best = static_cast<int32_t>(i);
+		}
+	}
+	if (best < 0) {
+		g.atlas_full_frame = g.frame;
+		return -1;
+	}
+	auto& slot = g.atlas[best];
+	if (slot.key != 0) g.atlas_map.erase(slot.key);
+	slot        = {key, g.frame, false};
+	g.atlas_map[key] = static_cast<uint32_t>(best);
+	g.copies.push_back({p, key, address, static_cast<uint32_t>(best)});
+	return best;
+}
+
+// A new mesh's material from its draw: the pixel shader's sample whose image is bound with the best base-colour format
+// (sRGB first; the shader's first such sample among equals), its texcoord's vertex output, its albedo layer.
+void ChooseMaterial(Entry& e, const Draw& d) {
+	e.material_tried = true;
+	if (d.ps_module == nullptr || d.ps_images == nullptr || d.cache == nullptr) return;
+	const auto samples = AnalyzePs(d.ps_module);
+	const PsSample* best = nullptr;
+	const PsImage*  best_image = nullptr;
+	int             best_rank = 0;
+	for (const auto& s: *samples) {
+		for (const auto& p: *d.ps_images) {
+			if (p.binding != s.binding || p.element != s.element) continue;
+			if (p.type != vk::ImageViewType::e2D && p.type != vk::ImageViewType::e2DArray) continue;
+			const int rank = AlbedoRank(p.format);
+			if (rank > best_rank) best_rank = rank, best = &s, best_image = &p;
+		}
+	}
+	++g.mat_meshes;
+	if (best == nullptr) {
+		++g.mat_none;
+		return;
+	}
+	if (best_rank == 2) ++g.mat_srgb;
+	auto* image = d.cache->TryGetImage(ImageId(best_image->image_index, best_image->image_generation));
+	if (image == nullptr || image->serial != best_image->serial) {
+		++g.mat_none;
+		return;
+	}
+	e.uv_sel         = (best->location + 1) | best->c0 << 8u | best->c1 << 10u;
+	e.albedo_binding = best->binding;
+	e.albedo_element = best->element;
+	e.layer          = AtlasRequest(*best_image, image->info.data.address, e.albedo_key);
+	static int said = 0;
+	if (said < 24) {
+		++said;
+		std::printf("HWRT: material: mesh %u PS %016llx: base colour b%u e%u format %d %ux%u, texcoord loc %u .%c%c, layer %d\n", e.id,
+		            static_cast<unsigned long long>(e.ps), best->binding, best->element, static_cast<int>(best_image->format),
+		            image->info.extent.width, image->info.extent.height, best->location, "xyzw"[best->c0], "xyzw"[best->c1], e.layer);
+		std::fflush(stdout);
+	}
+}
+
+// A mesh whose layer went to another texture (or never got one): its draw's own image again.
+void RefreshAlbedo(Entry& e, const Draw& d) {
+	if (e.layer >= 0 && g.atlas[e.layer].key == e.albedo_key) return;
+	e.layer = -1;
+	if (d.ps_images == nullptr || d.cache == nullptr) return;
+	for (const auto& p: *d.ps_images) {
+		if (p.binding != e.albedo_binding || p.element != e.albedo_element || AlbedoRank(p.format) == 0) continue;
+		auto* image = d.cache->TryGetImage(ImageId(p.image_index, p.image_generation));
+		if (image == nullptr || image->serial != p.serial) return;
+		e.layer = AtlasRequest(p, image->info.data.address, e.albedo_key);
+		return;
+	}
+}
+
 GraphicContext* g_graphics = nullptr;
+TextureCache*   g_cache    = nullptr; // (hwrt3: the draws' texture cache, render thread)
 
 } // namespace
 
@@ -901,6 +1462,20 @@ void* ChainDeviceFeatures(vk::PhysicalDevice physical, const std::vector<const c
 
 bool Active() { return g_supported && Requested() && !g.disabled; }
 
+bool MaterialRequested() { return Requested() && MaterialEnv(); }
+bool MaterialActive() { return MaterialRequested() && Active(); }
+
+bool MaterialAtlas(vk::ImageView& view, vk::Sampler& sampler) {
+	view    = nullptr;
+	sampler = nullptr;
+	if (!MaterialActive()) return false;
+	std::lock_guard lock(g.mutex);
+	if (!g.material || !g.atlas_ready) return false;
+	view    = g.atlas_view;
+	sampler = g.atlas_sampler;
+	return true;
+}
+
 vk::ShaderModule CaptureModule(GraphicContext& graphics, vk::ShaderModule original) {
 	if (!Active() || original == nullptr) return nullptr;
 	std::lock_guard lock(g.mutex);
@@ -917,7 +1492,7 @@ vk::ShaderModule CaptureModule(GraphicContext& graphics, vk::ShaderModule origin
 	} else {
 		std::vector<uint32_t> patched;
 		SpirvPatcher          patcher(*spirv);
-		if (!patcher.Run(patched, g.capture.address, g.records.address, MaxRecords * Slots, MaxCapture)) {
+		if (!patcher.Run(patched, g.capture.address, g.records.address, MaxRecords * Slots, MaxCapture, g.material ? g.uvcap.address : 0)) {
 			++g.patch_failed;
 			static int said = 0;
 			if (said++ < 8) {
@@ -946,6 +1521,7 @@ uint64_t VariantId(uint64_t program_id) {
 	uint64_t h = Mix(program_id ^ 0x48575254ULL, g.capture.address);
 	h          = Mix(h, g.records.address);
 	h          = Mix(h, uint64_t {MaxRecords * Slots} << 32u | MaxCapture);
+	if (g.material) h = Mix(h, g.uvcap.address ^ 0x4d41544cULL); // (hwrt3: the texcoord store; nothing mixed without it)
 	return h | (uint64_t {1} << 63u);
 }
 
@@ -977,6 +1553,7 @@ uint32_t Reserve(uint32_t count) {
 bool Note(uint32_t record, const Draw& d) {
 	if (!g.ready || g_graphics == nullptr) return false;
 	const auto start = std::chrono::steady_clock::now();
+	if (d.cache != nullptr) g_cache = d.cache;
 	if ((++g.notes & 255u) == 0) MaybeLog();
 	++g.draws_seen;
 	const uint32_t slot_base = g.slot * MaxRecords;
@@ -1009,6 +1586,7 @@ bool Note(uint32_t record, const Draw& d) {
 	}
 	auto& e     = found->second;
 	e.last_seen = g.frame;
+	if (g.material && e.uv_written) RefreshAlbedo(e, d); // (hwrt3: its layer, while the draw's images are current)
 	if (e.capture_frame == g.frame) { // (drawn twice this frame: the first draw's capture serves)
 		++g.draws_reused;
 		g.cpu_note_ms += Ms(start);
@@ -1030,6 +1608,7 @@ bool Note(uint32_t record, const Draw& d) {
 			g.cpu_note_ms += Ms(start);
 			return false;
 		}
+		if (g.material && !e.material_tried) ChooseMaterial(e, d); // (hwrt3)
 		++g.builds;
 		g.build_tris += e.tris;
 		job.build = true;
@@ -1057,6 +1636,8 @@ bool Note(uint32_t record, const Draw& d) {
 	rec.base      = g.captured;
 	rec.window    = e.window;
 	rec.instances = e.instances;
+	job.uv        = g.material && e.uv_sel != 0 && job.mode == Mode::Write && (job.build || job.refit);
+	rec.pad       = job.uv ? e.uv_sel : 0;
 	job.src       = g.captured;
 	g.captured += need;
 	e.capture_frame = g.frame;
@@ -1121,6 +1702,7 @@ struct GatherPush {
 	float    cam[4];
 	uint32_t src_base, count, mode, result;
 	uint64_t src, dst, results;
+	uint64_t uv; // (hwrt3) the captured texcoords (0: none: w = 1)
 };
 static_assert(sizeof(GatherPush) <= 128);
 struct DebugPush {
@@ -1141,6 +1723,15 @@ struct FramePayload {
 	vk::AccelerationStructureBuildRangeInfoKHR                     tlas_range {};
 	bool                                                           tlas = false;
 	uint32_t                                                       slot = 0;
+	// (hwrt3) the albedo array's first transition, and the base-colour copies into it
+	struct CopyCmd {
+		vk::ImageView   view;
+		vk::ImageLayout layout;
+		bool            array;
+		uint32_t        layer;
+	};
+	bool                 atlas_init = false;
+	std::vector<CopyCmd> copies;
 };
 
 std::array<float, 16> g_inv {};
@@ -1209,6 +1800,8 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 			push.mode     = static_cast<uint32_t>(job.mode);
 			push.result   = job.result;
 			push.dst      = e.vb.address;
+			push.uv       = job.uv ? g.uvcap.address : 0;
+			if (job.uv) e.uv_written = true;
 			if (job.mode == Mode::Compare) {
 				results[job.result] = 0;
 				g.check_keys[slot].emplace_back(e.key, job.result);
@@ -1309,11 +1902,41 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 			for (size_t i = 0; i < payload->ranges.size(); ++i) payload->range_ptrs.push_back(&payload->ranges[i]);
 		}
 	}
+	// (hwrt3) The albedo array: its first transition; this frame's base-colour copies, each of an image still the one its
+	// draw bound (the slot, its serial, its memory, registered) in a layout a shader reads, recorded in order with the
+	// frame's commands (its deferred deletion waits for them). A copy whose image went is dropped and its layer freed.
+	if (g.material) {
+		if (!g.atlas_ready) payload->atlas_init = g.atlas_ready = true;
+		uint32_t budget = CopiesPerFrame();
+		while (!g.copies.empty() && budget > 0) {
+			const auto c = g.copies.front();
+			g.copies.pop_front();
+			auto& slot_a = g.atlas[c.layer];
+			if (slot_a.key != c.key) continue; // (its layer was given to another texture meanwhile)
+			Image* image = g_cache != nullptr ? g_cache->TryGetImage(ImageId(c.image.image_index, c.image.image_generation)) : nullptr;
+			const auto layout = image != nullptr ? image->backing.state.layout : vk::ImageLayout::eUndefined;
+			const bool valid  = image != nullptr && image->serial == c.image.serial && image->registered &&
+			                   image->info.data.address == c.address && image->backing.image && image->backing.subresource_states.empty() &&
+			                   !image->info.IsDepth() && (layout == vk::ImageLayout::eShaderReadOnlyOptimal || layout == vk::ImageLayout::eGeneral);
+			if (!valid) {
+				g.atlas_map.erase(slot_a.key);
+				slot_a = {};
+				g.atlas_free.push_back(c.layer);
+				++g.mat_copy_dropped;
+				continue;
+			}
+			payload->copies.push_back({c.image.view, layout, c.image.type == vk::ImageViewType::e2DArray, c.layer});
+			slot_a.ready = true; // (the copy is recorded before any reader of this frame)
+			++g.mat_copies;
+			--budget;
+		}
+	}
 	// The TLAS: every built mesh seen in the last KeepFrames() frames; meshes unseen for 4x that are freed.
 	uint32_t instance_count = 0;
 	{
 		auto* instances = static_cast<VkAccelerationStructureInstanceKHR*>(g.instances[slot].mapped);
 		auto* materials = static_cast<uint32_t*>(g.materials[slot].mapped);
+		auto* albedo    = g.material ? static_cast<uint32_t*>(g.albedo_words[slot].mapped) : nullptr; // (hwrt3)
 		for (auto it = g.entries.begin(); it != g.entries.end();) {
 			auto& e = it->second;
 			if (e.last_seen + uint64_t {KeepFrames()} * 4 < g.frame) {
@@ -1340,6 +1963,19 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 				materials[instance_count * 8 + 5] = static_cast<uint32_t>(e.vb.address >> 32u);
 				materials[instance_count * 8 + 6] = static_cast<uint32_t>(e.ib.address);
 				materials[instance_count * 8 + 7] = static_cast<uint32_t>(e.ib.address >> 32u);
+				if (albedo != nullptr) {
+					// (hwrt3: the layer + 1 while it holds this mesh's texture and is filled, its texcoords in the vertices)
+					uint32_t word = 0;
+					if (e.uv_written && e.layer >= 0 && e.layer < static_cast<int32_t>(g.atlas.size())) {
+						auto& a = g.atlas[e.layer];
+						if (a.key == e.albedo_key && a.ready) {
+							word        = static_cast<uint32_t>(e.layer) + 1;
+							a.last_used = g.frame;
+							++g.mat_instances;
+						}
+					}
+					albedo[instance_count] = word;
+				}
 				++instance_count;
 			}
 			++it;
@@ -1388,6 +2024,10 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 		ri.materials[0] = static_cast<uint32_t>(g.materials[slot].address);
 		ri.materials[1] = static_cast<uint32_t>(g.materials[slot].address >> 32u);
 		ri.materials[2] = ri.materials[3] = 0;
+		if (g.material && g.atlas_ready) { // (hwrt3)
+			ri.materials[2] = static_cast<uint32_t>(g.albedo_words[slot].address);
+			ri.materials[3] = static_cast<uint32_t>(g.albedo_words[slot].address >> 32u);
+		}
 		g.ray_slot = static_cast<int>(slot);
 	}
 	// The GPU side, in order with the frame's commands.
@@ -1396,11 +2036,60 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 	const auto       gather = g.gather;
 	const auto       layout = g.gather_layout;
 	if (timed) g.pending_query[slot] = true;
-	Submit(command, [payload, timed, pool, gather, layout](vk::CommandBuffer cmd, const Dispatch& d) {
+	struct CopyState {
+		vk::Pipeline       p2d, parray;
+		vk::PipelineLayout layout;
+		vk::Image          atlas;
+		vk::ImageView      atlas_view;
+		vk::Sampler        sampler;
+	};
+	const CopyState cs {g.copy2d, g.copy_array, g.copy_layout, vk::Image(g.atlas_image), g.atlas_view, g.copy_sampler};
+	Submit(command, [payload, timed, pool, gather, layout, cs](vk::CommandBuffer cmd, const Dispatch& d) {
 		const uint32_t s = payload->slot;
 		if (timed) {
 			cmd.resetQueryPool(pool, s * 2, 2, d);
 			cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, s * 2, d);
+		}
+		if (payload->atlas_init) {
+			vk::ImageMemoryBarrier2 barrier {};
+			barrier.srcStageMask     = vk::PipelineStageFlagBits2::eNone;
+			barrier.dstStageMask     = vk::PipelineStageFlagBits2::eComputeShader;
+			barrier.dstAccessMask    = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+			barrier.oldLayout        = vk::ImageLayout::eUndefined;
+			barrier.newLayout        = vk::ImageLayout::eGeneral;
+			barrier.image            = cs.atlas;
+			barrier.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, AtlasLayers};
+			vk::DependencyInfo dependency {};
+			dependency.imageMemoryBarrierCount = 1;
+			dependency.pImageMemoryBarriers    = &barrier;
+			cmd.pipelineBarrier2(&dependency, d);
+		}
+		if (!payload->copies.empty()) {
+			// (hwrt3) The game's uploads and draws -> the copies' reads; each texture downsampled into its layer.
+			BarrierD(cmd, d, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite,
+			         vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+			vk::Pipeline bound = nullptr;
+			for (const auto& c: payload->copies) {
+				const vk::Pipeline p = c.array ? cs.parray : cs.p2d;
+				if (p != bound) cmd.bindPipeline(vk::PipelineBindPoint::eCompute, p, d), bound = p;
+				vk::DescriptorImageInfo src {cs.sampler, c.view, c.layout};
+				vk::DescriptorImageInfo dst {nullptr, cs.atlas_view, vk::ImageLayout::eGeneral};
+				std::array<vk::WriteDescriptorSet, 2> writes {};
+				writes[0].dstBinding      = 0;
+				writes[0].descriptorCount = 1;
+				writes[0].descriptorType  = vk::DescriptorType::eCombinedImageSampler;
+				writes[0].pImageInfo      = &src;
+				writes[1].dstBinding      = 1;
+				writes[1].descriptorCount = 1;
+				writes[1].descriptorType  = vk::DescriptorType::eStorageImage;
+				writes[1].pImageInfo      = &dst;
+				cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, cs.layout, 0, static_cast<uint32_t>(writes.size()), writes.data(), d);
+				const std::array<uint32_t, 4> push {c.layer, AtlasSize, 0, 0};
+				cmd.pushConstants(cs.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data(), d);
+				cmd.dispatch(AtlasSize / 8, AtlasSize / 8, 1, d);
+			}
+			BarrierD(cmd, d, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+			         vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
 		}
 		if (!payload->gathers.empty()) {
 			// The draws' vertex-shader stores -> the gather's reads.

@@ -69,8 +69,31 @@ void NoteSkip(Skip why, uint32_t draws = 1);
 // A G-buffer draw state seen at the table store (counted once per state, for the log).
 void NoteSceneState(bool capturable);
 
+// (hwrt3, KYTY_HWRT_REFL_MATERIAL=1, only with KYTY_HWRT=1 and KYTY_HWRT_REFL=1) Real materials for the reflections'
+// off-screen hits: a captured mesh also stores its pixel shader's base-colour texcoord (a vertex output, packed as half2
+// into its world vertices' w) and that shader's base-colour texture, copied once (downsampled, 128x128) into a layer of
+// an albedo array this module owns - the hit shader never reads a game image, so no game view can be stale for it.
+[[nodiscard]] bool MaterialRequested();
+[[nodiscard]] bool MaterialActive();
+// One sampled image of a G-buffer draw's pixel stage, as its descriptor set binds it (the table set, made once): the
+// SPIR-V binding and array element, the cache's image and its serial then, the view.
+struct PsImage {
+	uint32_t          binding = 0, element = 0;
+	uint32_t          image_index = UINT32_MAX, image_generation = 0;
+	uint64_t          serial = 0;
+	vk::ImageView     view   = nullptr;
+	vk::Format        format = vk::Format::eUndefined;
+	vk::ImageViewType type   = vk::ImageViewType::e2D;
+};
+// The albedo array for the reflections (binding 24 of their material pipeline): false while it does not exist.
+[[nodiscard]] bool MaterialAtlas(vk::ImageView& view, vk::Sampler& sampler);
+
 // One G-buffer draw (one gl_DrawID of a vk draw call).
 struct Draw {
+	// (hwrt3, MaterialActive only) the draw's pixel module and its sampled images, and the texture cache
+	vk::ShaderModule             ps_module = nullptr;
+	const std::vector<PsImage>*  ps_images = nullptr;
+	TextureCache*                cache     = nullptr;
 	uint64_t vs = 0, ps = 0;
 	uint64_t index_address  = 0; // guest address of the draw's first index (index base + first index * size)
 	uint32_t index_size     = 2; // 2 or 4

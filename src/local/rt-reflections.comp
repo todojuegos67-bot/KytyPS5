@@ -807,6 +807,11 @@ layout(std430, binding = 22) readonly buffer HwRayInfo {
 layout(binding = 23) uniform accelerationStructureEXT hw_tlas;
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer HwWords { uint w[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer HwVerts { vec4 v[]; };
+#ifdef KYTY_HWRT_MATERIAL
+// (hwrt3, KYTY_HWRT_REFL_MATERIAL) the captured meshes' base colours (hwrt-scene.cpp: one layer per texture, sqrt-encoded);
+// a TLAS instance's layer + 1 in the albedo words (hw.materials.zw), its texcoords as half2 in its world vertices' w.
+layout(binding = 24) uniform sampler2DArray hw_albedo;
+#endif
 
 // A view-space point to world space, through the screen as the game's camera sees it: the uv and depth this pass's
 // projection gives it, then the game's own inverse view-projection (the debug view's convention: NDC y = uv.y * 2 - 1).
@@ -831,6 +836,21 @@ vec3 HwAmbient() {
 		for (int x = 0; x < 4; ++x) sum += SafeColor(textureLod(color_tex, (vec2(x, y) + 0.5) / 4.0, 0).rgb * GameExposure());
 	return sum / 16.0;
 }
+#ifdef KYTY_HWRT_MATERIAL
+// (hwrt3) The same grid's mean, and its top row's (the sky or what is overhead: the light from above).
+vec3 HwAmbientSky(out vec3 sky) {
+	vec3 sum = vec3(0);
+	sky      = vec3(0);
+	for (int y = 0; y < 4; ++y)
+		for (int x = 0; x < 4; ++x) {
+			vec3 c = SafeColor(textureLod(color_tex, (vec2(x, y) + 0.5) / 4.0, 0).rgb * GameExposure());
+			sum += c;
+			if (y == 0) sky += c;
+		}
+	sky *= 0.25;
+	return sum / 16.0;
+}
+#endif
 
 // A reflection ray the screen-space march missed, traced in the scene's TLAS. A hit on the screen and visible there takes
 // the frame's colour (as the march's hits); one off the screen or hidden is shaded by the scene's mean light and its
@@ -874,6 +894,9 @@ bool HwMarch(vec3 P, vec3 N, vec3 R, vec3 V, out vec4 res, out float hdist) {
 	int  prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
 	vec3 Hn   = -Rw;
 	uint64_t mat = uint64_t(hw.materials.x) | (uint64_t(hw.materials.y) << 32);
+#ifdef KYTY_HWRT_MATERIAL
+	vec3 albedo = vec3(-1.0); // (hwrt3: the hit's base colour; < 0: none)
+#endif
 	if (mat != 0ul && inst >= 0 && prim >= 0) {
 		HwWords  m   = HwWords(mat);
 		uint64_t vb  = uint64_t(m.w[inst * 8 + 4]) | (uint64_t(m.w[inst * 8 + 5]) << 32);
@@ -881,17 +904,59 @@ bool HwMarch(vec3 P, vec3 N, vec3 R, vec3 V, out vec4 res, out float hdist) {
 		if (vb != 0ul && ib != 0ul) {
 			HwWords idx = HwWords(ib);
 			HwVerts ver = HwVerts(vb);
+#ifdef KYTY_HWRT_MATERIAL
+			vec4    a4  = ver.v[idx.w[prim * 3 + 0]];
+			vec4    b4  = ver.v[idx.w[prim * 3 + 1]];
+			vec4    d4  = ver.v[idx.w[prim * 3 + 2]];
+			vec3    a   = a4.xyz;
+			vec3    b   = b4.xyz;
+			vec3    d   = d4.xyz;
+#else
 			vec3    a   = ver.v[idx.w[prim * 3 + 0]].xyz;
 			vec3    b   = ver.v[idx.w[prim * 3 + 1]].xyz;
 			vec3    d   = ver.v[idx.w[prim * 3 + 2]].xyz;
+#endif
 			vec3    n   = cross(b - a, d - a);
 			if (length(n) > 1e-12) Hn = normalize(n);
 			if (dot(Hn, Rw) > 0.0) Hn = -Hn;
+#ifdef KYTY_HWRT_MATERIAL
+			// The mesh's albedo layer, its texcoords at the hit (the ray query's barycentrics), the base colour there.
+			uint64_t aw = uint64_t(hw.materials.z) | (uint64_t(hw.materials.w) << 32);
+			uint     layer1 = aw != 0ul ? HwWords(aw).w[inst] : 0u;
+			if (layer1 != 0u && layer1 <= uint(textureSize(hw_albedo, 0).z)) {
+				vec2 bc = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+				vec2 t0 = unpackHalf2x16(floatBitsToUint(a4.w));
+				vec2 t1 = unpackHalf2x16(floatBitsToUint(b4.w));
+				vec2 t2 = unpackHalf2x16(floatBitsToUint(d4.w));
+				vec2 uv = t0 * (1.0 - bc.x - bc.y) + t1 * bc.x + t2 * bc.y;
+				if (!any(isnan(uv)) && all(lessThan(abs(uv), vec2(30000.0)))) {
+					vec4 sa = textureLod(hw_albedo, vec3(uv, float(layer1 - 1u)), 0.0);
+					albedo  = sa.rgb * sa.rgb;
+				}
+			}
+#endif
 		}
 	}
 	float up   = clamp(Hn.y * 0.5 + 0.5, 0.0, 1.0); // (world y up)
+#ifdef KYTY_HWRT_MATERIAL
+	vec3  c;
+	float conf;
+	if (albedo.x >= 0.0) {
+		// (hwrt3) Lit as the frame is: its mean light with the mean albedo (~0.35) divided out, ambient from all around,
+		// the overhead light (the frame's top row: sky / sun-lit) on what faces up.
+		vec3 sky;
+		vec3 amb   = HwAmbientSky(sky);
+		vec3 light = amb * (1.0 / 0.35) * (0.3 + 0.5 * up) + sky * (0.6 * up * up);
+		c          = Tonemap(SafeColor(albedo * light));
+		conf       = 0.65 * far_fade;
+	} else {
+		c    = Tonemap(HwAmbient() * (0.35 + 0.65 * up));
+		conf = 0.5 * far_fade;
+	}
+#else
 	vec3  c    = Tonemap(HwAmbient() * (0.35 + 0.65 * up));
 	float conf = 0.5 * far_fade;
+#endif
 	res        = vec4(c * conf, conf);
 	return !Bad(res) && conf > 1e-3;
 }
