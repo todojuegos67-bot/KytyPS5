@@ -719,8 +719,10 @@ OptimizedBuilds& Builds() {
 
 bool OptimizeBigCompute() {
 	static const bool enabled = [] {
+		// Default off: with it on (6e66250) the user saw no video at all. Suspect: the prewarm path
+		// rebuilds without the recorded create flags. KYTY_OPTIMIZE_BIG_COMPUTE=1 turns it on.
 		const char* v = std::getenv("KYTY_OPTIMIZE_BIG_COMPUTE");
-		return v == nullptr || std::strcmp(v, "0") != 0;
+		return v != nullptr && std::strcmp(v, "1") == 0;
 	}();
 	return enabled;
 }
