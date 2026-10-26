@@ -174,6 +174,7 @@ struct {
 	uint32_t                samples = 0;
 	std::array<uint32_t, StatsCount> stat_last {};
 	float                   on_screen = 0.0f; // the smoothed on-screen factor
+	float                   sun_scale = -1.0f, sun_feed_min = 1.0f, sun_feed_max = 0.0f; // (hwrt5v-2)
 	float                   sun_held  = 0.0f; // the smoothed sun weight (10-25: fades instead of popping when the sun goes stale)
 	std::array<float, 3>    sun_dir {};       // the last sun given (view space)
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now(), last_frame {};
@@ -436,9 +437,12 @@ void Log(int level, bool have_sun) {
 			                      : g_gr.sun_held > 0.05f           ? "on: sun haze only (no lamp above the threshold)"
 			                                                        : "off: no lamp above the threshold and no sun";
 			std::printf("HWRTVOL: state: %s; lamps %.2f a frame (%u slots), light threshold %.2f (exposed, adaptive; %.2f lit), "
-			            "sun weight %.2f\n",
-			            why, lights, level >= 3 ? 8u : level == 2 ? 4u : 2u, static_cast<double>(thr),
-			            static_cast<double>(EnvFloat("KYTY_GODRAYS_LIGHT", 3.0f, 0.5f, 100.0f)), static_cast<double>(g_gr.sun_held));
+			            "sun weight %.2f (presence; slow scale %.2f, feed %.2f..%.2f in 10 s: RT shadows' fade x overcast)\n",
+			            why, lights, g_gr.hw || level >= 3 ? 8u : level == 2 ? 4u : 2u, static_cast<double>(thr),
+			            static_cast<double>(EnvFloat("KYTY_GODRAYS_LIGHT", 3.0f, 0.5f, 100.0f)), static_cast<double>(g_gr.sun_held),
+			            static_cast<double>(g_gr.sun_scale), static_cast<double>(g_gr.sun_feed_max > 0.0f ? g_gr.sun_feed_min : 0.0f),
+			            static_cast<double>(g_gr.sun_feed_max));
+			g_gr.sun_feed_min = 1.0f, g_gr.sun_feed_max = 0.0f;
 		}
 		std::fflush(stdout);
 		g_gr.hw_traced = g_gr.hw_stale = g_gr.hw_none = 0;
@@ -515,13 +519,23 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// and a returning one fades back in over ~0.4 s: short gaps in the RT sun's feed no longer flicker the rays.)
 	// (hwrt3v-2, KYTY_HWRT_VOLUMETRIC: 2.5 s out, 1.2 s in: an indoor sun feed that comes and goes no longer pulses the haze)
 	const float sun_out = g_gr.hw ? 2.5f : 0.8f, sun_in = g_gr.hw ? 1.2f : 0.4f;
+	if (g_gr.hw) {
+		// (hwrt5v-2: the feed's weight is RT shadows' fade x its overcast factor, and that factor (0.5..1) is measured from
+		// the pixels on screen: it moved with every camera turn and the sun haze with it. Here the presence (any weight)
+		// drives the fade and the factor only a slow (~8 s) scale, so turning the camera no longer dims the shafts.)
+		if (sun_target > 0.0f) {
+			g_gr.sun_feed_min = std::min(g_gr.sun_feed_min, sun_target), g_gr.sun_feed_max = std::max(g_gr.sun_feed_max, sun_target);
+			g_gr.sun_scale = g_gr.sun_scale < 0.0f ? sun_target : g_gr.sun_scale + (sun_target - g_gr.sun_scale) * std::min(dt / 8.0f, 1.0f);
+			sun_target = 1.0f;
+		}
+	}
 	g_gr.sun_held = std::clamp(g_gr.sun_held + std::clamp(sun_target - g_gr.sun_held, -dt / sun_out, dt / sun_in), 0.0f, 1.0f);
 	if (g_gr.hw) {
 		if (!g_gr.sun_on && g_gr.sun_held > 0.65f) g_gr.sun_on = true, ++g_gr.sun_ons;
 		if (g_gr.sun_on && g_gr.sun_held < 0.35f) g_gr.sun_on = false, ++g_gr.sun_offs;
 	}
 	const std::array<float, 3> sun   = g_gr.sun_dir;
-	const float                sun_w = g_gr.sun_held;
+	const float                sun_w = g_gr.sun_held * (g_gr.hw ? std::clamp(g_gr.sun_scale < 0.0f ? 1.0f : g_gr.sun_scale, 0.5f, 1.0f) : 1.0f);
 	const bool have_sun = sun_w > 0.0f;
 	// (a gap of more than 0.25 s: menus, loading, frames without the pass: the history is stale, restart it)
 	if (g_gr.last_frame.time_since_epoch().count() != 0 && now - g_gr.last_frame > std::chrono::milliseconds(250))
@@ -553,7 +567,7 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 	}
 
-	const int   slots  = level >= 3 ? 8 : level == 2 ? 4 : 2;
+	const int   slots  = g_gr.hw ? 8 : level >= 3 ? 8 : level == 2 ? 4 : 2; // (hwrt5v-2: world-space lamps: 8 slots)
 	const int   taps   = level >= 3 ? 64 : level == 2 ? 48 : 32;
 	const int   hwl    = g_gr.hw ? HwVolLevel() : 0;
 	const int   steps  = hwl >= 3 ? 24 : hwl == 2 ? 16 : hwl == 1 ? 12 : level >= 3 ? 16 : level == 2 ? 12 : 0;
