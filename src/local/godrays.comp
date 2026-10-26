@@ -86,7 +86,12 @@ const int CH = 9;
 #define L_MATCH 3.5
 #define L_IN 0.012
 #define L_OUT 0.006
-#define L_THRESH (hdr.y * 0.6)
+// (hwrt5v: the threshold adapts to the scene: hdr.y in a lit scene, down to L_FLOOR in a dark one (the lamp hall: exposed
+// lamps ~1, never 3, so no light was ever tracked and the only haze was the sun's, gone indoors). Lights() keeps every
+// cell's brightest tap above L_FLOOR; Track() sets stats[13] (float bits, smoothed) from the cells' mean luminance.)
+#define L_FLOOR 0.35
+#define L_ADAPT (stats[13] > 0u ? uintBitsToFloat(stats[13]) : hdr.y)
+#define L_THRESH L_FLOOR
 #else
 #define L_NEAR 6.0
 #define L_FAR 45.0
@@ -214,11 +219,27 @@ void Track() {
 	bool claimed[CW * CH];
 	for (int i = 0; i < CW * CH; ++i) claimed[i] = false;
 	int used = 0;
+#ifdef KYTY_HWRT_VOLUMETRIC
+	float keep_t = 0.0, new_t = 0.0;
+	{
+		// The cells' mean brightest-tap luminance (cells without a valid tap count as 0): a lamp must stand 2.5x above it,
+		// at least L_FLOOR + 0.25, at most hdr.y. Smoothed (~1 s) so it never toggles the lights.
+		float sum = 0.0;
+		for (int i = 0; i < CW * CH; ++i) sum += min(cand[i * 2].x, 8.0);
+		float tt = clamp(2.5 * sum / float(CW * CH), L_FLOOR + 0.25, hdr.y);
+		float t  = L_ADAPT;
+		t        = (isnan(t) || t <= 0.0) ? tt : mix(t, tt, 0.02);
+		stats[13] = floatBitsToUint(t);
+		new_t = t, keep_t = max(0.6 * t, L_FLOOR);
+	}
+#endif
 	for (int k = 0; k < slots; ++k) {
 		vec4 a = lights[k * 2];
 		vec4 b = lights[k * 2 + 1];
 		if (a.w <= 0.0) continue;
 #ifdef KYTY_HWRT_VOLUMETRIC
+		// (a NaN slot would hold forever: free it)
+		if (any(isnan(a)) || any(isnan(b))) { lights[k * 2] = vec4(0), lights[k * 2 + 1] = vec4(0); continue; }
 		float w_before = a.w;
 #endif
 		// Reproject: the motion at the old place points to the previous frame; step the other way.
@@ -228,6 +249,9 @@ void Track() {
 		for (int i = 0; i < CW * CH; ++i) {
 			vec4 c = cand[i * 2];
 			if (claimed[i] || c.x <= 0.0) continue;
+#ifdef KYTY_HWRT_VOLUMETRIC
+			if (c.x <= keep_t) continue;
+#endif
 			float dist = length((c.yz - a.xy) * vec2(CW, CH));
 			if (dist < bd) bd = dist, best = i;
 		}
@@ -262,7 +286,7 @@ void Track() {
 			vec4 c = cand[i * 2];
 			if (claimed[i] || c.x <= bl) continue;
 #ifdef KYTY_HWRT_VOLUMETRIC
-			if (c.x <= hdr.y) continue; // (a new light needs the full threshold: hysteresis)
+			if (c.x <= new_t) continue; // (a new light needs the full (adaptive) threshold: hysteresis)
 #endif
 			bool near = false;
 			for (int j = 0; j < slots; ++j)
@@ -523,6 +547,10 @@ void Composite(ivec2 p) {
 			I = min(I, 2.0); // (clamp: the core of a light the ray grazes stays a glow, not a flare)
 			vec3  lc = lights[k * 2 + 1].rgb;
 			float ll = min(Luma(lc), 12.0);
+#ifdef KYTY_HWRT_VOLUMETRIC
+			// (a dark scene's lamps, tracked under the lowered threshold: the halo scaled as if at hdr.y, <= 4x)
+			ll *= clamp(hdr.y / max(L_ADAPT, 1e-3), 1.0, 4.0);
+#endif
 			add += Hue(lc) * (ll * 0.01 * I * fade * push.extra.z);
 		}
 	}

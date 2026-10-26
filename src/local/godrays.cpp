@@ -426,6 +426,20 @@ void Log(int level, bool have_sun) {
 		            "(weight %.2f); halos %u on / %u off; history resets %u\n",
 		            g_gr.hw_last_path ? "TLAS" : "depth", g_gr.path_switches, g_gr.hw_held, g_gr.sun_ons, g_gr.sun_offs,
 		            static_cast<double>(g_gr.sun_held), d[3], d[4], g_gr.resets);
+		{
+			// (hwrt5v: why the haze is what it is: the lamps tracked, the adaptive threshold, the sun's share)
+			float thr = 0.0f;
+			std::memcpy(&thr, &cur[13], sizeof(thr));
+			const double lights = static_cast<double>(d[1]) / fr;
+			const char*  why    = d[0] == 0                         ? "pass not run (no frames: menu / movie / no TLAS yet)"
+			                      : lights >= 0.5                   ? "on: lamp halos"
+			                      : g_gr.sun_held > 0.05f           ? "on: sun haze only (no lamp above the threshold)"
+			                                                        : "off: no lamp above the threshold and no sun";
+			std::printf("HWRTVOL: state: %s; lamps %.2f a frame (%u slots), light threshold %.2f (exposed, adaptive; %.2f lit), "
+			            "sun weight %.2f\n",
+			            why, lights, level >= 3 ? 8u : level == 2 ? 4u : 2u, static_cast<double>(thr),
+			            static_cast<double>(EnvFloat("KYTY_GODRAYS_LIGHT", 3.0f, 0.5f, 100.0f)), static_cast<double>(g_gr.sun_held));
+		}
 		std::fflush(stdout);
 		g_gr.hw_traced = g_gr.hw_stale = g_gr.hw_none = 0;
 		g_gr.path_switches = g_gr.hw_held = g_gr.sun_ons = g_gr.sun_offs = g_gr.resets = 0;
