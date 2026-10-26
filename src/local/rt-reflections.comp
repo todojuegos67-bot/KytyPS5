@@ -1931,6 +1931,7 @@ void MtTemporal(ivec2 px) {
 	float rough = ax.x;
 	vec3  m1 = vec3(0), m2 = vec3(0);
 	float a1 = 0.0, a2 = 0.0, wn = 0.0;
+	float lnb = 0.0, wnb = 0.0, lmax = 0.0; // (fireflies: the neighbours without the centre)
 	vec4  mean = vec4(0);
 	ivec2 hi   = ivec2(ts) - 1;
 	for (int y = -1; y <= 1; ++y)
@@ -1945,6 +1946,7 @@ void MtTemporal(ivec2 px) {
 			a1 += sv.a * w, a2 += sv.a * sv.a * w;
 			mean += sv * w;
 			wn += w;
+			if ((x != 0 || y != 0) && w > 0.0) lnb += Luma(sv.rgb), wnb += 1.0, lmax = max(lmax, Luma(sv.rgb));
 		}
 	float wraw = wn;
 	wn = max(wn, 1.0);
@@ -1952,6 +1954,13 @@ void MtTemporal(ivec2 px) {
 	if (!fresh) cur = mean;
 	vec3  sig  = sqrt(max(m2 - m1 * m1, vec3(0)));
 	float asig = sqrt(max(a2 - a1 * a1, 0.0));
+	// (refl2, the bluish sparkles on the armour at Ultra: lone samples hitting a bright opening, fog, an ember or the
+	// soul form's own glow) A fresh sample is at most 2x its neighbours' mean (the centre excluded, so the outlier does
+	// not raise its own limit) and never above their brightest; with fewer than 3 neighbours, at most 2x the history.
+	if (fresh && wnb >= 3.0) {
+		float lim = min(2.0 * lnb / wnb + 0.01, lmax + 0.01), lc = Luma(cur.rgb);
+		if (lc > lim) cur.rgb *= lim / max(lc, 1e-6);
+	}
 	if (fresh && wraw > 2.0) { // (a lone bright hit: at most the neighbourhood's mean + 2.5 sigma)
 		float lim = Luma(Rgb(m1)) + 2.5 * Luma(sig) + 0.02, lc = Luma(cur.rgb);
 		if (lc > lim) cur.rgb *= lim / max(lc, 1e-6);
@@ -1984,6 +1993,8 @@ void MtTemporal(ivec2 px) {
 		{
 			float lh = Luma(hist.rgb), lf = Luma(cur.rgb);
 			if (fresh && (lf < 0.6 * lh - 0.01 || lf > 1.8 * lh + 0.02)) alpha *= 0.25;
+			// (refl2: and never more than 2.5x the history's brightness in one step)
+			if (fresh && lf > 2.5 * lh + 0.02) cur.rgb *= (2.5 * lh + 0.02) / max(lf, 1e-6);
 		}
 		res = mix(hist, cur, alpha);
 	} else {
