@@ -235,6 +235,11 @@ struct UpscaleInputs {
 	bool         reset = false;                           // no history (a cut, a level load)
 	std::array<float, 16> view_to_clip {};                // row vectors (p' = p * M)
 	float        near_plane = 0.1f, far_plane = 3000.0f;
+	// (hwrt2, KYTY_HWRT_REFL) The frame's scene acceleration structure (a VkAccelerationStructureKHR; 0: none) and its
+	// RayInfo buffer (local/hwrt-scene.h CurrentRayScene).
+	uint64_t       hwrt_tlas = 0;
+	vk::Buffer     hwrt_info = nullptr;
+	vk::DeviceSize hwrt_info_size = 0;
 	GraphicContext* graphics = nullptr;                    // the renderer's (SSGI, FSR, sharpening when nothing else set it)
 	// KYTY_SSR with KYTY_SSR_GBUF: the game's G-buffer target holding roughness / gloss (read only; no view: none),
 	// the channel (0..3) and whether it is gloss (1 - roughness).

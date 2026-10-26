@@ -92,6 +92,15 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 // before the upscale; `where` names the hook in the log once). Commands go in order with the renderer's (a recording
 // packet with KYTY_VULKAN_RECORDING).
 void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* where);
+// (hwrt2) The scene just built, for the ray-traced effects recorded after it in the same frame (KYTY_HWRT_REFL): the
+// TLAS (a VkAccelerationStructureKHR as an integer) and a storage buffer holding RayInfo (hwrt-scene.cpp: clip <-> world
+// rows, the camera, the materials' address). False: no scene this frame.
+struct RayScene {
+	uint64_t       tlas = 0;
+	vk::Buffer     info = nullptr;
+	vk::DeviceSize size = 0;
+};
+[[nodiscard]] bool CurrentRayScene(RayScene& out);
 // KYTY_HWRT_DEBUG's view into an RGBA16F storage image in the GENERAL layout (the PS5 Pro path: the upscaled output).
 void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageView view, vk::Format format, vk::Extent2D extent);
 
