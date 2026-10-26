@@ -55,7 +55,25 @@ layout(push_constant) uniform Push {
 	vec4  motion;    // motion scale x, y, history valid (1), view-ray steps (0: off)
 	ivec4 misc;      // mode, frame, flags (1 row 0 = NDC y +1, 2 debug: our light only), exposure index
 	vec4  extra;     // quarter w, h, light strength, visibility boost (0..1: Bajo / Medio)
+#ifdef KYTY_HWRT_VOLUMETRIC
+	vec4  w0, w1, w2; // view space -> the TLAS's world (rows)
+	vec4  hw;         // x: 1 = TLAS rays this frame (0: the depth-buffer march), y: ray length (m), z: march length (m), w: level
+#endif
 } push;
+#ifdef KYTY_HWRT_VOLUMETRIC
+// (KYTY_HWRT_VOLUMETRIC, godrays.cpp: this file built a second time as #version 460 with this defined, godrays_hw_spv.h)
+layout(binding = 10) uniform accelerationStructureEXT tlas;
+// The sun's visibility from a view-space point on the view ray: one first-hit ray query toward the sun through the
+// captured scene (opaque; off-screen occluders included). 1 lit, 0 occluded.
+float HwVis(vec3 x, vec3 lw) {
+	vec4 p4 = vec4(x, 1.0);
+	vec3 o  = vec3(dot(push.w0, p4), dot(push.w1, p4), dot(push.w2, p4));
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xff, o, 0.05, lw, push.hw.y);
+	while (rayQueryProceedEXT(rq)) {}
+	return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT ? 0.0 : 1.0;
+}
+#endif
 
 const int CW = 16;
 const int CH = 9;
@@ -249,7 +267,13 @@ void Volume(ivec2 q) {
 	float vz  = sky ? 2e3 : abs(ViewZ(d));
 	float scatter = 0.0;
 	// (a) the radial march toward the sun on screen.
+#ifdef KYTY_HWRT_VOLUMETRIC
+	// (KYTY_HWRT_VOLUMETRIC with a TLAS: no screen-space mask; the traced view-ray march below makes the shafts alone)
+	bool hw_on = push.hw.x > 0.5;
+	if (!hw_on && push.sun_uv.z > 0.0 && push.sun.w > 0.0) {
+#else
 	if (push.sun_uv.z > 0.0 && push.sun.w > 0.0) {
+#endif
 		vec2  aspect = vec2(RenderSize().x / RenderSize().y, 1.0);
 		vec2  to     = push.sun_uv.xy - uv;
 		float dist   = length(to * aspect);
@@ -274,8 +298,16 @@ void Volume(ivec2 q) {
 	int steps = int(push.motion.w);
 	if (steps > 0 && push.sun.w > 0.0) {
 		vec3  dir  = RayDir(uv);
+#ifdef KYTY_HWRT_VOLUMETRIC
+		float mlen = hw_on ? push.hw.z : 60.0;
+		float tmax = sky ? mlen : min(length(ViewPos(uv, d)), mlen);
+#else
 		float tmax = sky ? 60.0 : min(length(ViewPos(uv, d)), 60.0);
+#endif
 		vec3  L    = normalize(push.sun.xyz);
+#ifdef KYTY_HWRT_VOLUMETRIC
+		vec3  lw   = normalize(vec3(dot(push.w0.xyz, L), dot(push.w1.xyz, L), dot(push.w2.xyz, L)));
+#endif
 		float lit  = 0.0;
 		float dt   = tmax / float(steps);
 		for (int i = 0; i < steps; ++i) {
@@ -283,6 +315,12 @@ void Volume(ivec2 q) {
 			vec3  x = dir * t;
 			float vis = 1.0;
 			float s   = 0.6;
+#ifdef KYTY_HWRT_VOLUMETRIC
+			if (hw_on) {
+				lit += HwVis(x, lw) * dt;
+				continue;
+			}
+#endif
 			for (int k = 0; k < 5; ++k) {
 				vec3 y = x + L * s;
 				s *= 2.2;
@@ -304,7 +342,11 @@ void Volume(ivec2 q) {
 		// Boost by the shaft-ness of the ray: partly lit rays (light through gaps) gain, fully lit or fully shadowed
 		// ones (a uniform haze indoors / outdoors) do not.
 		float fr = tmax > 0.0 ? clamp(lit / tmax, 0.0, 1.0) : 0.0;
+#ifdef KYTY_HWRT_VOLUMETRIC
+		scatter += (lit / mlen) * phase * 0.35 * (1.0 + push.extra.w * (0.1 + 0.8 * fr * (1.0 - fr)));
+#else
 		scatter += (lit / 60.0) * phase * 0.35 * (1.0 + push.extra.w * (0.1 + 0.8 * fr * (1.0 - fr)));
+#endif
 	}
 	scatter *= push.sun.w;
 	imageStore(aux_out, q, vec4((isnan(scatter) || isinf(scatter)) ? 0.0 : clamp(scatter, 0.0, 4.0),

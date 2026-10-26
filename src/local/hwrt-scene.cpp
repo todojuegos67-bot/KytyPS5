@@ -1146,6 +1146,7 @@ struct FramePayload {
 std::array<float, 16> g_inv {};
 std::array<float, 4>  g_cam {};
 bool                  g_frame_camera = false;
+std::array<float, 16> g_frame_vp {}; // (hwrt3v: the view-projection the frame's TLAS was built with)
 
 } // namespace
 
@@ -1186,6 +1187,7 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 	if (camera && std::abs(inv[14]) > 1e-20)
 		for (int i = 0; i < 3; ++i) g_cam[i] = static_cast<float>(inv[i * 4 + 2] / inv[14]);
 	g_frame_camera = camera;
+	if (camera) g_frame_vp = g.view_proj;
 	if (!camera) ++g.frames_no_camera;
 
 	auto             payload = std::make_shared<FramePayload>();
@@ -1515,6 +1517,16 @@ bool CurrentRayScene(RayScene& out) {
 	out.info   = vk::Buffer(g.rayinfo[g.ray_slot].buffer);
 	out.size   = sizeof(RayInfo);
 	return true;
+}
+
+vk::AccelerationStructureKHR VolumetricTlas(bool* built_now, std::array<float, 16>* view_proj) {
+	if (built_now != nullptr) *built_now = false;
+	if (!Active()) return nullptr;
+	std::lock_guard lock(g.mutex);
+	if (!g.ready || g.tlas == nullptr) return nullptr;
+	if (built_now != nullptr) *built_now = g.tlas_built;
+	if (view_proj != nullptr) *view_proj = g_frame_camera ? g_frame_vp : std::array<float, 16> {};
+	return g.tlas;
 }
 
 void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, std::span<const TextureBinding> images) {

@@ -532,6 +532,27 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${godrays_header}")
+# KYTY_HWRT_VOLUMETRIC: the same shader as #version 460 with ray queries into the scene TLAS (-DKYTY_HWRT_VOLUMETRIC).
+file(READ "${godrays_source}" godrays_text)
+string(REPLACE "#version 450\n" "#version 460\n#extension GL_EXT_ray_query : require\n" godrays_hw_text "${godrays_text}")
+set(godrays_hw_source "${gpu_tiler_generated_dir}/godrays_hw.comp")
+file(MAKE_DIRECTORY "${gpu_tiler_generated_dir}")
+file(WRITE "${godrays_hw_source}.tmp" "${godrays_hw_text}")
+configure_file("${godrays_hw_source}.tmp" "${godrays_hw_source}" COPYONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${godrays_source}")
+set(godrays_hw_spv "${gpu_tiler_generated_dir}/godrays_hw.spv")
+set(godrays_hw_header "${gpu_tiler_generated_dir}/godrays_hw_spv.h")
+add_custom_command(
+	OUTPUT "${godrays_hw_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_HWRT_VOLUMETRIC
+	        -o "${godrays_hw_spv}" "${godrays_hw_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${godrays_hw_spv} -DOUTPUT=${godrays_hw_header}
+	        -DSYMBOL=GODRAYS_HW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${godrays_hw_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${godrays_hw_header}")
 
 # KYTY_RT_SHADOWS: screen-space ray-traced sun shadows before the upscaler (src/local/frame-gen.cpp).
 set(cshadow_source "${KYTY_SOURCE_DIR}/local/cshadow.comp")
