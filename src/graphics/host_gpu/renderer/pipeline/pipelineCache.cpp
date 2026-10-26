@@ -673,36 +673,6 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
-vk::PipelineCache PipelineCache::AsyncJobCache() {
-	if (m_driver_cache == nullptr || !AsyncOwnCache()) return m_driver_cache;
-	vk::PipelineCacheCreateInfo info {};
-	vk::PipelineCache cache = nullptr;
-	if (m_graphics.device.createPipelineCache(&info, nullptr, &cache) != vk::Result::eSuccess) {
-		return m_driver_cache;
-	}
-	return cache;
-}
-
-void PipelineCache::FinishAsyncJobCache(vk::PipelineCache cache) {
-	if (cache == nullptr || cache == m_driver_cache) return;
-	std::lock_guard lock(m_async_compute->mutex);
-	m_async_compute->merge.push_back(cache);
-}
-
-void PipelineCache::MergeAsyncJobCaches() {
-	if (m_async_compute == nullptr || m_driver_cache == nullptr) return;
-	std::vector<vk::PipelineCache> caches;
-	{
-		std::lock_guard lock(m_async_compute->mutex);
-		caches.swap(m_async_compute->merge);
-	}
-	if (caches.empty()) return;
-	(void)m_graphics.device.mergePipelineCaches(m_driver_cache, static_cast<uint32_t>(caches.size()),
-	                                            caches.data());
-	for (auto cache: caches) m_graphics.device.destroyPipelineCache(cache, nullptr);
-	m_driver_cache_dirty = true;
-}
-
 void PipelineCache::CheckpointDriverCache() {
 	if (m_driver_cache == nullptr) {
 		return;
@@ -997,6 +967,37 @@ static bool AsyncOwnCache() {
 	}();
 	return on;
 }
+
+vk::PipelineCache PipelineCache::AsyncJobCache() {
+	if (m_driver_cache == nullptr || !AsyncOwnCache()) return m_driver_cache;
+	vk::PipelineCacheCreateInfo info {};
+	vk::PipelineCache cache = nullptr;
+	if (m_graphics.device.createPipelineCache(&info, nullptr, &cache) != vk::Result::eSuccess) {
+		return m_driver_cache;
+	}
+	return cache;
+}
+
+void PipelineCache::FinishAsyncJobCache(vk::PipelineCache cache) {
+	if (cache == nullptr || cache == m_driver_cache) return;
+	std::lock_guard lock(m_async_compute->mutex);
+	m_async_compute->merge.push_back(cache);
+}
+
+void PipelineCache::MergeAsyncJobCaches() {
+	if (m_async_compute == nullptr || m_driver_cache == nullptr) return;
+	std::vector<vk::PipelineCache> caches;
+	{
+		std::lock_guard lock(m_async_compute->mutex);
+		caches.swap(m_async_compute->merge);
+	}
+	if (caches.empty()) return;
+	(void)m_graphics.device.mergePipelineCaches(m_driver_cache, static_cast<uint32_t>(caches.size()),
+	                                            caches.data());
+	for (auto cache: caches) m_graphics.device.destroyPipelineCache(cache, nullptr);
+	m_driver_cache_dirty = true;
+}
+
 
 static uint64_t AsyncComputeWords() {
 	static const uint64_t words = [] {
