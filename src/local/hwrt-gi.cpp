@@ -88,8 +88,9 @@ struct FrameUbo {
 	int32_t cfg2[4];
 	float   proj[4];
 	float   depth_map[4];
+	float   fog[4];
 };
-static_assert(sizeof(FrameUbo) == 256);
+static_assert(sizeof(FrameUbo) == 272);
 struct Push {
 	int32_t mode = 0;
 	float   step = 0.0f;
@@ -468,6 +469,16 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	ubo.cfg2[0] = static_cast<int32_t>(g_gi.frame), ubo.cfg2[1] = view;
 	ubo.cfg2[2] = static_cast<int32_t>(g_gi.frame % StatSlots);
 	ReadStats(*graphics);
+	static const float fog_dist = EnvFloat("KYTY_HWRT_FOG_DIST", 35.0f, 0.0f, 10000.0f);
+	ubo.fog[0] = fog_dist;
+	{
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("HWRTGI: fog: AO / GI weight exp(-distance / %g m) (KYTY_HWRT_FOG_DIST; 0 off): the colour here is after the game's fog\n", fog_dist);
+			std::fflush(stdout);
+		}
+	}
 	ubo.proj[0] = m[0], ubo.proj[1] = m[5], ubo.proj[2] = m[8], ubo.proj[3] = m[9];
 	ubo.depth_map[0] = m[10], ubo.depth_map[1] = m[14], ubo.depth_map[2] = m[11], ubo.depth_map[3] = m[15];
 

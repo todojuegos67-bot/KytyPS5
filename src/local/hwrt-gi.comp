@@ -41,9 +41,10 @@ layout(std140, binding = 14) uniform Frame {
 	vec4  trace;    // trace size xy, AO strength, GI intensity
 	vec4  par;      // GI range (m), AO floor, fade start (m), fade end (m)
 	ivec4 cfg;      // AO rays, GI rays, level, flags (1 reset, 2 history valid, 4 G-buffer normal, 8 G-buffer albedo, 16 half res, 32 AO on, 64 GI on, 128 y flip)
-	ivec4 cfg2;     // frame, view mode, -, -
+	ivec4 cfg2;     // frame, view mode, stats slot, -
 	vec4  proj;      // the upscaler's view_to_clip: M[0], M[5], M[8], M[9]
 	vec4  depth_map; // A = M[10], B = M[14], C = M[11], D = M[15]
+	vec4  fog;       // x the fog distance (m: AO and GI weight exp(-dist / x); 0 off)
 } u;
 // (diag) self-test counters, one 64-word slot a frame (cfg2.z), read on the CPU 4 frames later (hwrt-gi.cpp, the
 // "HWRTGI: self-test" line): 0 traced pixels, 1 AO rays, 2 AO hits, 3 GI rays, 4 GI hits, 5 GI hits seen on screen,
@@ -377,7 +378,10 @@ void Composite(ivec2 pixel) {
 	}
 	float fade = 1.0 - smoothstep(u.par.z, u.par.w, dist);
 	float ao   = (u.cfg.w & 32) != 0 ? clamp(r.a, 0.0, 1.0) : 1.0;
-	float k_ao = max(mix(1.0, ao, u.trace.z * fade), u.par.y);
+	// (fog) the colour here is after the game's height / volumetric fog: the fog in front of the surface must not be
+	// darkened or lit, so both terms scale with an estimate of its transmittance, exp(-distance / fog distance)
+	if (u.fog.x > 0.0) fade *= exp(-dist / u.fog.x);
+	float k_ao = max(mix(1.0, ao, u.trace.z * fade), mix(1.0, u.par.y, fade));
 	vec3  add  = vec3(0);
 	if ((u.cfg.w & 64) != 0) {
 		float l      = Luma(col.rgb);
