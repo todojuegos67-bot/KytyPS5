@@ -217,6 +217,30 @@ void Trace(ivec2 pixel) {
 		for (int i = 0; i < 24; ++i) st[sb + 16u + uint(i)] = floatBitsToUint(f[i]);
 		st[sb + 12u] = 1u;
 	}
+	// (hwrt5a) The screen's y convention against the TLAS, measured: on a sparse grid (1 trace pixel of 16x16), a primary
+	// ray from the camera through this pixel as the flag has it (A) and with NDC y mirrored (B); each agrees when its hit
+	// lies at this pixel's view distance (3 % + 5 cm). A wrong convention mirrors every ray about the horizon: only a band
+	// there lands on geometry (the rest floats in the air: no occlusion anywhere, the grey view flat white). The CPU reads
+	// the votes (words 40.. of the slot) and turns the flag over when B wins (hwrt-gi.cpp).
+	if ((pixel.x & 15) == 8 && (pixel.y & 15) == 8) {
+		vec2 n  = Ndc(uv);
+		vec3 da = normalize(ClipToWorld(vec4(n, 0.5, 1.0)) - u.cam.xyz);
+		vec3 db = normalize(ClipToWorld(vec4(n.x, -n.y, 0.5, 1.0)) - u.cam.xyz);
+		float ta = -1.0, tb = -1.0;
+		rayQueryEXT pa;
+		rayQueryInitializeEXT(pa, tlas, gl_RayFlagsOpaqueEXT, 0xff, u.cam.xyz, 0.05, da, 5000.0);
+		while (rayQueryProceedEXT(pa)) {}
+		if (rayQueryGetIntersectionTypeEXT(pa, true) == gl_RayQueryCommittedIntersectionTriangleEXT) ta = rayQueryGetIntersectionTEXT(pa, true);
+		rayQueryEXT pb;
+		rayQueryInitializeEXT(pb, tlas, gl_RayFlagsOpaqueEXT, 0xff, u.cam.xyz, 0.05, db, 5000.0);
+		while (rayQueryProceedEXT(pb)) {}
+		if (rayQueryGetIntersectionTypeEXT(pb, true) == gl_RayQueryCommittedIntersectionTriangleEXT) tb = rayQueryGetIntersectionTEXT(pb, true);
+		float tol = 0.03 * dist + 0.05;
+		atomicAdd(st[sb + 40u], 1u);
+		if (ta >= 0.0 && abs(ta - dist) < tol) atomicAdd(st[sb + 41u], 1u);
+		if (tb >= 0.0 && abs(tb - dist) < tol) atomicAdd(st[sb + 42u], 1u);
+		if (abs(n.y) > 0.3) atomicAdd(st[sb + 43u], 1u); // (off the horizon: where the two conventions differ)
+	}
 	if ((u.cfg.w & 32) != 0) {
 		float occ = 0.0;
 		float R   = u.cam.w;
@@ -418,7 +442,9 @@ void Composite(ivec2 pixel) {
 		if (la > cap) add *= cap / max(la, 1e-6);
 	}
 	if (u.cfg2.y == 1) {
-		imageStore(out_img, pixel, vec4(vec3(k_ao), col.a));
+		// (hwrt5a) the debug view shows what the rays saw: no strength, floor, distance or fog fade (those turned it into
+		// a flat light grey beyond a few metres and hid whether the AO worked at all)
+		imageStore(out_img, pixel, vec4(vec3(ao), col.a));
 		return;
 	}
 	if (u.cfg2.y == 2) {
