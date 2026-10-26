@@ -1211,6 +1211,25 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 			     command.file_id, command.file_offset, command.size, bytes_read,
 			     static_cast<uint32_t>(result));
 		}
+		if (const auto name = Common::PathToString(host_path);
+		    name.find("movies") != std::string::npos || name.ends_with(".bsf")) {
+			static std::atomic<uint32_t> s_movie_reads {0};
+			const auto n = s_movie_reads.fetch_add(1);
+			if (n < 64 || n % 256 == 0 || result != OK) {
+				const auto* bytes = reinterpret_cast<const uint8_t*>(command.destination);
+				std::printf("Movie: APR read #%u id=0x%08x off=0x%llx size=0x%llx read=0x%llx "
+				            "result=0x%08x dst=0x%llx head=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+				            n, command.file_id, static_cast<unsigned long long>(command.file_offset),
+				            static_cast<unsigned long long>(command.size),
+				            static_cast<unsigned long long>(bytes_read), static_cast<uint32_t>(result),
+				            static_cast<unsigned long long>(command.destination),
+				            bytes_read >= 8 ? bytes[0] : 0, bytes_read >= 8 ? bytes[1] : 0,
+				            bytes_read >= 8 ? bytes[2] : 0, bytes_read >= 8 ? bytes[3] : 0,
+				            bytes_read >= 8 ? bytes[4] : 0, bytes_read >= 8 ? bytes[5] : 0,
+				            bytes_read >= 8 ? bytes[6] : 0, bytes_read >= 8 ? bytes[7] : 0);
+				std::fflush(stdout);
+			}
+		}
 		if (result != OK) {
 			LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32 ", path=%s\n",
 			     command.file_id, static_cast<uint32_t>(result), Common::PathToString(host_path).c_str());

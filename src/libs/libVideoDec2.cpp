@@ -205,6 +205,17 @@ static void ApplyDecodedOutput(const Decoder::Output& decoded, Videodec2FrameBuf
 	}
 }
 
+// One NV12 output picture: 256-byte pitch and 16-line aligned height, as the decoder writes it
+// (videoDec2Decoder CopyFrame), plus a page for metadata. This used to report 16 MiB per frame
+// (5x a 1080p NV12 picture), so a title sizing its output pool from it gets far too few buffers.
+static size_t MaxFrameBufferSize(const Videodec2DecoderConfigInfo& config) {
+	const size_t width  = config.max_frame_width > 0 ? static_cast<size_t>(config.max_frame_width) : 4096u;
+	const size_t height = config.max_frame_height > 0 ? static_cast<size_t>(config.max_frame_height) : 2304u;
+	const size_t pitch  = (width + 255u) & ~size_t {255};
+	const size_t lines  = (height + 15u) & ~size_t {15};
+	return ((pitch * lines * 3u / 2u) + 4096u + 0xffffu) & ~size_t {0xffff};
+}
+
 static int32_t ValidateDecoderConfig(const Videodec2DecoderConfigInfo* config,
                                      bool                              require_compute_queue) {
 	if (config->resource_type != VIDEODEC2_RESOURCE_TYPE_COMPUTE) {
@@ -346,9 +357,19 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo_Impl(const Videodec2DecoderC
 	memory_info->gpu_memory             = nullptr;
 	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MIN_MEMORY_SIZE;
 	memory_info->cpu_gpu_memory         = nullptr;
-	memory_info->max_frame_buffer_size  = VIDEODEC2_MIN_MEMORY_SIZE;
+	memory_info->max_frame_buffer_size  = MaxFrameBufferSize(*config);
 	memory_info->frame_buffer_alignment = 0x100;
 	memory_info->reserved0              = 0;
+	{
+		char extra[200];
+		std::snprintf(extra, sizeof(extra),
+		              "out: cpu=0x%zx gpu=0x%zx cpu_gpu=0x%zx max_frame=0x%zx align=0x%x (in %dx%d dpb=%d)",
+		              memory_info->cpu_memory_size, memory_info->gpu_memory_size,
+		              memory_info->cpu_gpu_memory_size, memory_info->max_frame_buffer_size,
+		              memory_info->frame_buffer_alignment, config->max_frame_width,
+		              config->max_frame_height, config->max_dpb_frame_count);
+		Decoder::Trace("Videodec2.QueryDecoderMemoryInfo.out", 0, nullptr, extra);
+	}
 
 	return OK;
 }
@@ -381,7 +402,7 @@ static int32_t KYTY_SYSV_ABI CreateDecoder_Impl(const Videodec2DecoderConfigInfo
 		              config->codec_type, config->resource_type, config->profile,
 		              config->max_frame_width, config->max_frame_height, config->max_dpb_frame_count,
 		              config->decode_input_queue_depth);
-		Decoder::Trace("Videodec2.CreateDecoder", validation_result, nullptr, extra);
+		Decoder::Trace("Videodec2.CreateDecoder.in", validation_result, nullptr, extra);
 	}
 	if (validation_result != OK) {
 		return validation_result;
@@ -390,7 +411,7 @@ static int32_t KYTY_SYSV_ABI CreateDecoder_Impl(const Videodec2DecoderConfigInfo
 	if (memory_info->cpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
-	    memory_info->max_frame_buffer_size < VIDEODEC2_MIN_MEMORY_SIZE) {
+	    memory_info->max_frame_buffer_size < MaxFrameBufferSize(*config)) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
 
@@ -411,6 +432,16 @@ static int32_t KYTY_SYSV_ABI CreateDecoder_Impl(const Videodec2DecoderConfigInfo
 	}
 
 	*decoder = state;
+	{
+		char extra[220];
+		std::snprintf(extra, sizeof(extra),
+		              "handle=%p cpu=%p/0x%zx gpu=%p/0x%zx cpu_gpu=%p/0x%zx max_frame=0x%zx",
+		              static_cast<void*>(state), memory_info->cpu_memory, memory_info->cpu_memory_size,
+		              memory_info->gpu_memory, memory_info->gpu_memory_size,
+		              memory_info->cpu_gpu_memory, memory_info->cpu_gpu_memory_size,
+		              memory_info->max_frame_buffer_size);
+		Decoder::Trace("Videodec2.CreateDecoder.out", 0, nullptr, extra);
+	}
 	return OK;
 }
 
