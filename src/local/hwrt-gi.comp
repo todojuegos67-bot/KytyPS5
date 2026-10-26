@@ -44,7 +44,9 @@ layout(std140, binding = 14) uniform Frame {
 	ivec4 cfg2;     // frame, view mode, stats slot, -
 	vec4  proj;      // the upscaler's view_to_clip: M[0], M[5], M[8], M[9]
 	vec4  depth_map; // A = M[10], B = M[14], C = M[11], D = M[15]
-	vec4  fog;       // x the fog distance (m: AO and GI weight exp(-dist / x); 0 off)
+	vec4  fog;       // x the fog distance (m: AO and GI weight exp(-dist / x); 0 off), y 1: raw (no temporal / a-trous)
+	vec4  pvp[4];    // the previous frame's world -> clip rows (the scene camera's)
+	vec4  pcam;      // the previous frame's camera, w 1 valid
 } u;
 // (diag) self-test counters, one 64-word slot a frame (cfg2.z), read on the CPU 4 frames later (hwrt-gi.cpp, the
 // "HWRTGI: self-test" line): 0 traced pixels, 1 AO rays, 2 AO hits, 3 GI rays, 4 GI hits, 5 GI hits seen on screen,
@@ -221,9 +223,12 @@ void Trace(ivec2 pixel) {
 		for (int i = 0; i < u.cfg.x; ++i) {
 			vec3        dir = Cosine(N, Rand2(pixel, i));
 			rayQueryEXT rq;
-			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xff, O, 0.0, dir, R);
+			// (fix 3) t_min: a receiver a hair behind its own triangle (depth precision, jitter) hits that triangle's
+			// back at once and read as fully occluded: whole surfaces went dark
+			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xff, O, 0.02 + 0.001 * dist, dir, R);
 			while (rayQueryProceedEXT(rq)) {}
 			if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+				if (rayQueryGetIntersectionFrontFaceEXT(rq, true)) atomicAdd(st[sb + 13u], 1u);
 				float t = rayQueryGetIntersectionTEXT(rq, true) / R;
 				occ += 1.0 - t * t;
 				atomicAdd(st[sb + 2u], 1u);
@@ -301,12 +306,26 @@ void Temporal(ivec2 pixel) {
 	float count = 1.0;
 	vec4  res   = cur;
 	// the motion vectors are at render res: the render pixel under this trace pixel's centre
-	vec2 puv = uv + textureLod(motion_tex, uv, 0).xy * u.motion.xy / RenderSize();
+	// (fix 3) the point's own reprojection through the scene camera's previous view-projection (world space: no motion
+	// vector sign / scale convention to get wrong; the vertical trails were history pulled from the wrong rows)
+	vec2 puv = vec2(-1.0);
+	float pdist = g.w;
+	if (u.pcam.w > 0.5) {
+		vec3 Pw = u.cam.xyz + RayDir(uv) * g.w;
+		vec4 c  = vec4(Pw, 1.0);
+		vec4 h  = vec4(dot(u.pvp[0], c), dot(u.pvp[1], c), dot(u.pvp[2], c), dot(u.pvp[3], c));
+		if (h.w > 1e-6) {
+			vec2 n = h.xy / h.w;
+			if ((u.cfg.w & 128) != 0) n.y = -n.y;
+			puv = n * 0.5 + 0.5;
+		}
+		pdist = distance(Pw, u.pcam.xyz);
+	}
 	if ((u.cfg.w & 1) == 0 && (u.cfg.w & 2) != 0 && all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
 		vec4  pg = textureLod(gbuf_prev, puv, 0);
-		float dz = abs(pg.w - g.w) / max(g.w, 1e-3);
+		float dz = abs(pg.w - pdist) / max(pdist, 1e-3);
 		if (dz < 0.05 && dot(pg.xyz, g.xyz) > 0.9) {
-			count       = min(max(textureLod(aux_tex, puv, 0).z, 1.0) + 1.0, 48.0);
+			count       = min(max(textureLod(aux_tex, puv, 0).z, 1.0) + 1.0, 24.0);
 			float alpha = max(1.0 / count, a_min);
 			float k     = mix(1.25, 3.0, clamp(count / 24.0, 0.0, 1.0));
 			vec4  hist  = clamp(textureLod(src_b, puv, 0), m1 - k * sigma - vec4(vec3(0.002), 0.02), m1 + k * sigma + vec4(vec3(0.002), 0.02));

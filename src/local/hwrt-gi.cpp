@@ -89,8 +89,10 @@ struct FrameUbo {
 	float   proj[4];
 	float   depth_map[4];
 	float   fog[4];
+	float   pvp[16];
+	float   pcam[4];
 };
-static_assert(sizeof(FrameUbo) == 272);
+static_assert(sizeof(FrameUbo) == 352);
 struct Push {
 	int32_t mode = 0;
 	float   step = 0.0f;
@@ -113,7 +115,7 @@ struct State {
 	VkBuffer                stats = VK_NULL_HANDLE; // (diag) the self-test counters, host visible, StatSlots x StatWords
 	VmaAllocation           stats_mem = VK_NULL_HANDLE;
 	uint32_t*               stats_map = nullptr;
-	uint64_t                st_sum[12] {};
+	uint64_t                st_sum[14] {};
 	uint32_t                st_frames = 0;
 	std::chrono::steady_clock::time_point st_last = std::chrono::steady_clock::now();
 	vk::Extent2D            render {}, trace {};
@@ -345,16 +347,16 @@ void ReadStats(GraphicContext& graphics) {
 	if (g_gi.stats_map == nullptr || g_gi.frame < StatSlots) return;
 	(void)vmaInvalidateAllocation(graphics.allocator, g_gi.stats_mem, 0, VK_WHOLE_SIZE);
 	const uint32_t* w = g_gi.stats_map + ((g_gi.frame + 1) % StatSlots) * StatWords;
-	for (int i = 0; i < 12; ++i)
+	for (int i = 0; i < 14; ++i)
 		g_gi.st_sum[i] += w[i];
 	++g_gi.st_frames;
 	const auto now = std::chrono::steady_clock::now();
 	if (now - g_gi.st_last < std::chrono::seconds(2)) return;
 	const auto& s   = g_gi.st_sum;
 	const auto  pct = [](uint64_t a, uint64_t b) { return b > 0 ? 100.0 * static_cast<double>(a) / static_cast<double>(b) : 0.0; };
-	std::printf("HWRTGI: self-test %u frames: %.0f px/frame; AO rays hit %.1f%% (%llu rays); GI rays hit %.1f%%, of those on "
+	std::printf("HWRTGI: self-test %u frames: %.0f px/frame; AO rays hit %.1f%% (%llu rays, front faces %.1f%% of the hits); GI rays hit %.1f%%, of those on "
 	            "screen %.1f%%; normals up %.1f%% down %.1f%%; G-buffer normal agrees %.1f%% / disagrees %.1f%% (up %.1f%%, down %.1f%%)\n",
-	            g_gi.st_frames, static_cast<double>(s[0]) / g_gi.st_frames, pct(s[2], s[1]), static_cast<unsigned long long>(s[1]),
+	            g_gi.st_frames, static_cast<double>(s[0]) / g_gi.st_frames, pct(s[2], s[1]), static_cast<unsigned long long>(s[1]), pct(s[13], s[2]),
 	            pct(s[4], s[3]), pct(s[5], s[4]), pct(s[6], s[0]), pct(s[7], s[0]), pct(s[8], s[0]), pct(s[9], s[0]),
 	            pct(s[10], s[8] + s[9]), pct(s[11], s[8] + s[9]));
 	if (w[12] != 0) {
@@ -471,6 +473,17 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	ReadStats(*graphics);
 	static const float fog_dist = EnvFloat("KYTY_HWRT_FOG_DIST", 35.0f, 0.0f, 10000.0f);
 	ubo.fog[0] = fog_dist;
+	static const bool raw = EnvBool("KYTY_HWRT_AO_RAW", false);
+	ubo.fog[1] = raw ? 1.0f : 0.0f;
+	{ // (fix 3) the previous frame's scene camera, for the temporal pass's own reprojection
+		static std::array<float, 16> prev_vp {};
+		static std::array<float, 4>  prev_cam {};
+		static bool                  have_prev = false;
+		std::memcpy(ubo.pvp, prev_vp.data(), sizeof(ubo.pvp));
+		std::memcpy(ubo.pcam, prev_cam.data(), sizeof(ubo.pcam));
+		ubo.pcam[3] = have_prev ? 1.0f : 0.0f;
+		prev_vp = scene.vp, prev_cam = scene.cam, have_prev = true;
+	}
 	{
 		static bool said = false;
 		if (!said) {
@@ -562,10 +575,11 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	};
 	// (bindings a mode does not write still need a valid storage image: tmp_b is the scratch target)
 	run(0, g.tmp_a, g.tmp_b, g.raw, g.gbuf[cur], g.count[prev], g.tmp_b, 0.0f, g.trace);                // trace
+	static const bool raw_view = EnvBool("KYTY_HWRT_AO_RAW", false);
 	run(1, g.raw, g.history[prev], g.history[cur], g.tmp_b, g.count[prev], g.count[cur], 0.0f, g.trace); // temporal
-	const Image* src     = &g.history[cur];
+	const Image* src     = raw_view ? &g.raw : &g.history[cur]; // (KYTY_HWRT_AO_RAW=1: the rays alone, no temporal / a-trous)
 	const Image* ping[2] = {&g.tmp_a, &g.raw};
-	for (int i = 0; i < passes; ++i) {
+	for (int i = 0; i < (raw_view ? 0 : passes); ++i) {
 		const Image* dst = ping[i & 1];
 		run(2, *src, g.tmp_b, *dst, g.tmp_b, g.count[cur], g.tmp_b, static_cast<float>(1 << i), g.trace);
 		src = dst;
