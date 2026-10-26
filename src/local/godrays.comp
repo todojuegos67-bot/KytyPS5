@@ -164,6 +164,7 @@ vec3 WorldT() { return vec3(push.w0.w, push.w1.w, push.w2.w); }
 #endif
 
 shared uint s_best[64];
+shared uint s_sum;
 
 void Lights(uvec3 wg, uint li) {
 	uvec2 cell = wg.xy;
@@ -175,6 +176,14 @@ void Lights(uvec3 wg, uint li) {
 	// (nearer than 6 m: the player's own lantern, a torch held in front of the camera: a halo there is a haze over
 	// the whole character, not a shaft; rejected here so it never takes a slot)
 	bool  ok   = !IsSky(d) && abs(ViewZ(d)) < L_FAR && abs(ViewZ(d)) > L_NEAR && l > L_THRESH;
+#ifdef KYTY_HWRT_VOLUMETRIC
+	// (hwrt5v-4: only flame-like emitters: warm (red over blue) - the white door, sky light and its wet-floor reflections
+	// made lamps in mid-air; and a small hot spot: >= 3x its cell's mean (below))
+	ok = ok && c.r > 1.25 * c.b && c.r >= c.g * 0.9;
+	if (li == 0u) s_sum = 0u;
+	barrier();
+	atomicAdd(s_sum, min(uint(l * 256.0), 0xffffu));
+#endif
 	// (luminance in the high 26 bits, the tap in the low 6: the max picks the brightest)
 	s_best[li] = ok ? ((min(uint(l * 1024.0), 0x3ffffffu) << 6) | li) : 0u;
 	barrier();
@@ -185,6 +194,9 @@ void Lights(uvec3 wg, uint li) {
 	if (li == 0u) {
 		uint  b    = s_best[0];
 		uint  idx  = (cell.y * uint(CW) + cell.x) * 2u;
+#ifdef KYTY_HWRT_VOLUMETRIC
+		if (b != 0u && float(b >> 6) / 1024.0 < 3.0 * (float(s_sum) / 256.0 / 64.0)) b = 0u;
+#endif
 		if (b == 0u) {
 			cand[idx] = vec4(0), cand[idx + 1u] = vec4(0);
 		} else {
@@ -394,6 +406,7 @@ void TrackWorld(int slots, float keep_t, float new_t) {
 			if (w_before >= 0.5 && a.w < 0.5) atomicAdd(stats[4], 1u);
 			lights[k * 2] = a, lights[k * 2 + 1] = b;
 		}
+		int tries = 0;
 		for (int k = 0; k < slots; ++k) {
 			if (lights[k * 2].w > 0.0) continue;
 			int   best = -1;
@@ -415,6 +428,22 @@ void TrackWorld(int slots, float keep_t, float new_t) {
 			}
 			if (best < 0) break;
 			claimed[best]     = true;
+			{
+				// (hwrt5v-4: the candidate's surface must be in the capture: a TLAS ray from the camera reaches within 1 m of
+				// it. Smoke / particles (no geometry) or a depth from another surface fail: try the next candidate.)
+				vec3  dw = bw - T;
+				float dl = length(dw);
+				rayQueryEXT rq;
+				rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xff, T, 0.1, dw / max(dl, 1e-3), dl + 1.0);
+				while (rayQueryProceedEXT(rq)) {}
+				bool  hit = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+				float ht  = hit ? rayQueryGetIntersectionTEXT(rq, true) : 1e9;
+				if (!hit || abs(ht - dl) > 1.0 + 0.03 * dl) {
+					--k;
+					if (++tries > 6) break;
+					continue;
+				}
+			}
 			lights[k * 2]     = vec4(bw, 0.02);
 			lights[k * 2 + 1] = vec4(cand[best * 2 + 1].rgb, 0.99); // (visible: just found on screen)
 		}
@@ -685,7 +714,7 @@ void Composite(ivec2 p) {
 			float ll = min(Luma(lc), 12.0);
 #ifdef KYTY_HWRT_VOLUMETRIC
 			// (a dark scene's lamps, tracked under the lowered threshold: the halo scaled as if at hdr.y, <= 4x)
-			ll *= clamp(hdr.y / max(L_ADAPT, 1e-3), 1.0, 4.0);
+			ll *= clamp(hdr.y / max(L_ADAPT, 1e-3), 1.0, 1.5); // (hwrt5v-4: was <= 4x: the halos read as glowing disks)
 #endif
 #ifdef KYTY_HWRT_VOLUMETRIC
 			ll *= lvis;
