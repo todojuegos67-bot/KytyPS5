@@ -8174,7 +8174,8 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 		float* w = f + 144;
 		for (int i = 0; i < 3; ++i)
 			for (int j = 0; j < 4; ++j) w[i * 4 + j] = static_cast<float>(vi[i * 4 + j]);
-		w[12] = g_cs.hw_now ? static_cast<float>(HwShadowLevel()) : 0.0f;
+		static const bool far = RtSunEnv("KYTY_HWRT_SHADOW_FAR", 0.0f, 0.0f, 1.0f) > 0.5f; // (rays beyond the cascades too)
+		w[12] = g_cs.hw_now ? static_cast<float>(HwShadowLevel() + (far ? 8 : 0)) : 0.0f;
 		w[13] = miss, w[14] = range, w[15] = contact_m;
 	}
 	(void)vmaFlushAllocation(g_graphics_ctx->allocator, g_rs.buf_mem, slot * kRtSunSlotBytes, kRtSunSlotBytes);
