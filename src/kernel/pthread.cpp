@@ -1,3 +1,4 @@
+#include "graphics/phaseStats.h"
 #include "kernel/pthread.h"
 
 #include "common/assert.h"
@@ -3200,6 +3201,20 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	{
+		// Named host threads let KYTY_CPU_LOAD (and debuggers) show which guest thread is busy.
+		wchar_t wide[64] {};
+		MultiByteToWideChar(CP_UTF8, 0, thread->name.c_str(), -1, wide, 63);
+		SetThreadDescription(GetCurrentThread(), wide);
+	}
+#endif
+	{
+		const char* render_name = std::getenv("KYTY_PROF_GUEST");
+		if (thread->name == (render_name != nullptr ? render_name : "Render Thread")) {
+			PhaseStats::MarkGuestRenderThread();
+		}
+	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!thread->name.empty()) {
 #if defined(__APPLE__)

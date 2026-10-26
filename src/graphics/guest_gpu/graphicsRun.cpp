@@ -1,4 +1,6 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/phaseStats.h"
+void KytyNameHostThread(const char* name);
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -123,6 +125,7 @@ void GuestGpu::ProcessCommands() {
 
 void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
+	PhaseStats::Scope phase {PhaseStats::GuestPhase(PhaseStats::RenderSync, PhaseStats::OtherSync)};
 	if (IsGpuThread()) {
 		command();
 		return;
@@ -443,10 +446,13 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	KytyNameHostThread("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	PhaseStats::MarkGpuThread();
 
 	for (;;) {
+		PhaseStats::MaybeReport();
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
@@ -456,6 +462,7 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				PhaseStats::Scope phase {PhaseStats::GpuIdle};
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -478,7 +485,10 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					{
+						PhaseStats::Scope phase {PhaseStats::GpuBlocked};
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -504,7 +514,10 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
-			command();
+			{
+				PhaseStats::Scope phase {PhaseStats::GpuCommand};
+				command();
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -515,7 +528,14 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		bool complete = false;
+		{
+			PhaseStats::Scope phase {submission.type == SubmissionType::Graphics ? PhaseStats::GpuGraphics : PhaseStats::GpuCompute};
+			complete = gpu->Process(submission);
+		}
+		if (!complete) {
+			PhaseStats::Count1(PhaseStats::GpuIncomplete);
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {

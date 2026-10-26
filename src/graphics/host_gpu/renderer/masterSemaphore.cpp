@@ -1,3 +1,4 @@
+#include "graphics/phaseStats.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
@@ -52,6 +53,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
+	PhaseStats::Scope phase {PhaseStats::IsGpuThread() ? PhaseStats::GpuWait
+	                                                      : PhaseStats::GuestPhase(PhaseStats::RenderGpuWait, PhaseStats::OtherGpuWait)};
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
