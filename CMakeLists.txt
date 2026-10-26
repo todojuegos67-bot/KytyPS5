@@ -503,6 +503,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${godrays_header}")
 
+# KYTY_HWRT_PARTICLES (hwrt3p): emissive particle light with ray-query shadows into the KYTY_HWRT TLAS (src/local/hwrt-particles.cpp).
+set(hwrt_particles_source "${KYTY_SOURCE_DIR}/local/hwrt-particles.comp")
+set(hwrt_particles_spv "${gpu_tiler_generated_dir}/hwrt_particles.spv")
+set(hwrt_particles_header "${gpu_tiler_generated_dir}/hwrt_particles_spv.h")
+add_custom_command(
+	OUTPUT "${hwrt_particles_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${hwrt_particles_spv}" "${hwrt_particles_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${hwrt_particles_spv} -DOUTPUT=${hwrt_particles_header}
+	        -DSYMBOL=HWRT_PARTICLES_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${hwrt_particles_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${hwrt_particles_header}")
+
 # KYTY_RT_SHADOWS: screen-space ray-traced sun shadows before the upscaler (src/local/frame-gen.cpp).
 set(cshadow_source "${KYTY_SOURCE_DIR}/local/cshadow.comp")
 set(cshadow_spv "${gpu_tiler_generated_dir}/cshadow.spv")
@@ -649,6 +665,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/shine.cpp"
 	"${KYTY_SOURCE_DIR}/local/godrays.h"
 	"${KYTY_SOURCE_DIR}/local/godrays.cpp"
+	"${KYTY_SOURCE_DIR}/local/hwrt-particles.h"
+	"${KYTY_SOURCE_DIR}/local/hwrt-particles.cpp"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.cpp"
 	"${KYTY_SOURCE_DIR}/local/kbm-warp.h"
