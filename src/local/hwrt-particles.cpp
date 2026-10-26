@@ -19,6 +19,7 @@
 // KYTY_HWRT_PARTICLES_STRENGTH (1.0, 0..4), KYTY_HWRT_PARTICLES_RANGE (m, 8), KYTY_HWRT_PARTICLES_VIEW=1 (the added
 // light only, x4). Every 10 s "HWRT particles: stats" (GPU ms, emitters a frame, frames with emitters). The SSGI
 // emissive light leaves the particles to this pass while it runs (no double light).
+#include "local/local-pass-cache.h"
 #include "local/hwrt-particles.h"
 
 #include "local/rt-reflections.h"
@@ -178,6 +179,7 @@ vk::DescriptorType DescType(uint32_t i) {
 }
 
 bool EnsurePipeline(GraphicContext& graphics) {
+	std::lock_guard ensure_lock(LocalPassCache::EnsureMutex()); // (the prewarm thread's, local-pass-cache.h)
 	if (g_hp.pipeline != nullptr) return true;
 	if (g_hp.failed) return false;
 	g_hp.failed       = true;
@@ -211,7 +213,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_hp.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_hp.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_hp.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_hp.pipeline = nullptr;
@@ -329,6 +331,9 @@ int HwParticlesLevel() {
 	return level;
 }
 bool HwParticlesWanted() { return HwParticlesLevel() > 0; }
+void HwParticlesPrewarm(GraphicContext& graphics) { // (local-pass-cache.h)
+	if (HwParticlesLevel() > 0) (void)EnsurePipeline(graphics);
+}
 bool HwParticlesActive() { return HwParticlesWanted() && g_hp.flip_ran == g_hp.frame; }
 
 bool HwParticlesApply(vk::CommandBuffer command, UpscaleInputs& inputs) {

@@ -101,6 +101,7 @@
 // KYTY_RT_REFLECTIONS_RPP (rays per glossy pixel, 1..4), KYTY_RT_REFLECTIONS_ITERS (8..256) / _CAP (x the render
 // height, 0.1..4) override a level's march; level 5 "extreme": every pixel every frame, 128 iterations, rays up to 2.5x
 // the render height, 2 rays per glossy pixel. A 10 s line "RT reflections: rays:" says why rays miss.
+#include "local/local-pass-cache.h"
 #include "local/rt-reflections.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -377,6 +378,7 @@ std::array<RtImage*, 13> Sized() {
 }
 
 bool EnsurePipeline(GraphicContext& graphics) {
+	std::lock_guard ensure_lock(LocalPassCache::EnsureMutex()); // (the prewarm thread's, local-pass-cache.h)
 	if (g_rt.pipeline != nullptr) return true;
 	if (g_rt.failed) return false;
 	g_rt.failed       = true;
@@ -412,7 +414,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_rt.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_rt.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_rt.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_rt.pipeline = nullptr;
@@ -472,6 +474,7 @@ bool HwReflWanted() {
 }
 
 bool EnsureHwPipeline(GraphicContext& graphics) {
+	std::lock_guard ensure_lock(LocalPassCache::EnsureMutex()); // (the prewarm thread's, local-pass-cache.h)
 	if (g_rt.hw_pipeline != nullptr) return true;
 	if (g_rt.hw_failed) return false;
 	g_rt.hw_failed    = true;
@@ -508,7 +511,7 @@ bool EnsureHwPipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_rt.hw_layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_rt.hw_pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_rt.hw_pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_rt.hw_pipeline = nullptr;
@@ -525,6 +528,7 @@ bool EnsureHwPipeline(GraphicContext& graphics) {
 // (hwrt3) KYTY_HWRT_REFL_MATERIAL=1 (with KYTY_HWRT_REFL=1): the ray query pass whose off-screen hits take the captured
 // meshes' base colour (binding 24: the albedo array of local/hwrt-scene.cpp). Off: this pipeline is never made.
 bool EnsureHwMaterialPipeline(GraphicContext& graphics) {
+	std::lock_guard ensure_lock(LocalPassCache::EnsureMutex()); // (the prewarm thread's, local-pass-cache.h)
 	if (g_rt.hwm_pipeline != nullptr) return true;
 	if (g_rt.hwm_failed) return false;
 	g_rt.hwm_failed   = true;
@@ -561,7 +565,7 @@ bool EnsureHwMaterialPipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_rt.hwm_layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_rt.hwm_pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_rt.hwm_pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_rt.hwm_pipeline = nullptr;
@@ -1102,6 +1106,14 @@ int RtReflectionsLevel() {
 	return level;
 }
 bool RtReflectionsWanted() { return RtReflectionsLevel() > 0; }
+// (local-pass-cache.h) The pipelines a world's first frame would make on the flip path, made beside the title screen
+// with the same guards as RtReflectionsApply's: the base pass when on, the ray query pass with KYTY_HWRT_REFL and a
+// scene, its material variant with KYTY_HWRT_REFL_MATERIAL (KYTY_HWRT_METAL reuses these).
+void RtReflectionsPrewarm(GraphicContext& graphics) {
+	if (RtReflectionsLevel() == 0) return;
+	if (!EnsurePipeline(graphics)) return;
+	if (HwReflWanted() && HwScene::Active() && EnsureHwPipeline(graphics) && HwScene::MaterialActive()) (void)EnsureHwMaterialPipeline(graphics);
+}
 // (refl8) The game's SSR as the guide: on with the reflections unless KYTY_RT_REFLECTIONS_GUIDE=0.
 bool RtReflGuideWanted() {
 	static const bool wanted = [] {
