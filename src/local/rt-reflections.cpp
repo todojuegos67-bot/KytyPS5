@@ -383,6 +383,18 @@ void Barrier(vk::CommandBuffer command, vk::PipelineStageFlags2 src_stage, vk::A
 }
 
 bool HwReflWanted();
+int  HwReflQuality() {
+	static const int q = [] {
+		if (!HwReflWanted()) return 3;
+		const char* v = std::getenv("KYTY_HWRT_REFL_QUALITY");
+		const int   r = v != nullptr && *v != '\0' ? std::clamp(std::atoi(v), 1, 4) : 3;
+		std::printf("HWRTQ: reflections quality %d (%s)%s\n", r, r == 1 ? "Bajo" : r == 2 ? "Medio" : r == 3 ? "Alto" : "Ultra",
+		            v != nullptr && *v != '\0' ? "" : " (KYTY_HWRT_REFL_QUALITY unset: default)");
+		std::fflush(stdout);
+		return r;
+	}();
+	return q;
+}
 
 // (hwrt4) KYTY_HWRT_METAL=1|2 (default 0, off: nothing created, nothing recorded): ray-traced reflections on metal
 // (armour, weapons, shields, metal fittings) through the scene TLAS, independent of the game's SSR guide. Level 1: one
@@ -409,6 +421,7 @@ struct MetalCfg {
 	float   rough_max = 0.6f, strength = 1.0f, tint = 1.0f, dist = 200.0f;
 	bool    self_skip = true;
 	float   min_f0 = 0.12f;
+	int     quality = 2, passes = 2; // (hwrtq) KYTY_HWRT_METAL_QUALITY
 };
 const MetalCfg& Metal() {
 	static const MetalCfg c = [] {
@@ -416,14 +429,24 @@ const MetalCfg& Metal() {
 		const char* v = std::getenv("KYTY_HWRT_METAL");
 		m.level       = v != nullptr ? std::clamp(std::atoi(v), 0, 2) : 0;
 		if (m.level == 0) return m;
+		// (hwrtq) KYTY_HWRT_METAL_QUALITY=1..4 (Bajo / Medio / Alto / Ultra; unset: 2 at KYTY_HWRT_METAL=1, 3 at 2, today's):
+		// 1 half res, 100 m rays, no ray above roughness 0.6, 1 a-trous pass; 2 half res, 200 m, 0.85, 2 passes; 3 full res,
+		// 200 m, 0.85, 2 passes; 4 full res, 400 m, 0.9, 3 passes. The _DIST / _ROUGH_MAX knobs still override.
+		const char* qv = std::getenv("KYTY_HWRT_METAL_QUALITY");
+		m.quality      = qv != nullptr && *qv != '\0' ? std::clamp(std::atoi(qv), 1, 4) : (m.level >= 2 ? 3 : 2);
+		m.level        = m.quality >= 3 ? 2 : 1;
+		m.passes       = m.quality == 1 ? 1 : m.quality == 4 ? 3 : 2;
+		std::printf("HWRTQ: metal quality %d (%s)%s\n", m.quality,
+		            m.quality == 1 ? "Bajo" : m.quality == 2 ? "Medio" : m.quality == 3 ? "Alto" : "Ultra",
+		            qv != nullptr && *qv != '\0' ? "" : " (KYTY_HWRT_METAL_QUALITY unset: from KYTY_HWRT_METAL)");
 		const char* vw = std::getenv("KYTY_HWRT_METAL_VIEW");
 		m.view         = vw != nullptr ? std::clamp(std::atoi(vw), 0, 4) : 0;
 		m.metal        = std::getenv("KYTY_HWRT_METAL_FIELD") != nullptr ? FieldEnv("KYTY_HWRT_METAL_FIELD") : (2 | (0 << 2) | (8 << 7));
 		m.rough        = std::getenv("KYTY_HWRT_METAL_ROUGH") != nullptr ? FieldEnv("KYTY_HWRT_METAL_ROUGH") : (1 | (24 << 2) | (8 << 7));
-		m.rough_max    = EnvFloat("KYTY_HWRT_METAL_ROUGH_MAX", 0.85f, 0.05f, 1.0f);
+		m.rough_max    = EnvFloat("KYTY_HWRT_METAL_ROUGH_MAX", m.quality == 1 ? 0.6f : m.quality == 4 ? 0.9f : 0.85f, 0.05f, 1.0f);
 		m.strength     = EnvFloat("KYTY_HWRT_METAL_STRENGTH", 1.0f, 0.0f, 2.0f);
 		m.tint         = EnvFloat("KYTY_HWRT_METAL_TINT", 1.0f, 0.0f, 1.0f);
-		m.dist         = EnvFloat("KYTY_HWRT_METAL_DIST", 200.0f, 1.0f, 5000.0f);
+		m.dist         = EnvFloat("KYTY_HWRT_METAL_DIST", m.quality == 1 ? 100.0f : m.quality == 4 ? 400.0f : 200.0f, 1.0f, 5000.0f);
 		m.min_f0       = EnvFloat("KYTY_HWRT_METAL_MIN_F0", 0.12f, 0.0f, 1.0f);
 		const char* sf = std::getenv("KYTY_HWRT_METAL_SELF");
 		m.self_skip    = !(sf != nullptr && sf[0] == '0');
@@ -1423,7 +1446,12 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// longest ray on screen x the render height, 0.1..4) override the level's.
 	const int   iters    = static_cast<int>(EnvFloat("KYTY_RT_REFLECTIONS_ITERS", static_cast<float>(cfg.iters), 8.0f, 256.0f));
 	const float cutoff   = cfg.cutoff;
-	const int   passes   = cfg.passes;
+	// (hwrtq) KYTY_HWRT_REFL_QUALITY=1..4 (Bajo / Medio / Alto / Ultra; only with KYTY_HWRT_REFL=1; unset: 3, today's):
+	// the ray length (screen march + the TLAS miss ray) x 0.5 / 0.75 / 1 / 1.5, a-trous passes -1 / 0 / 0 / 0, rays per
+	// glossy pixel 1 / 1 / 1 / 2 (unless KYTY_RT_REFLECTIONS_RPP is set).
+	const int   hwq      = HwReflQuality();
+	const float len_q    = hwq == 1 ? 0.5f : hwq == 2 ? 0.75f : hwq == 4 ? 1.5f : 1.0f;
+	const int   passes   = hwq == 1 ? std::max(1, cfg.passes - 1) : cfg.passes;
 	const float cap_px   = EnvFloat("KYTY_RT_REFLECTIONS_CAP", cfg.cap, 0.1f, 4.0f) * static_cast<float>(color.extent.height);
 	// (refl10) Precision switches (1 on, 0 off; defaults per level): sub-pixel hit refinement, bicubic history and a fresh
 	// mirror every frame at the full-resolution trace (ultra and extreme), the virtual-image reprojection for pixels
@@ -1438,7 +1466,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const bool  fresh    = env_on("KYTY_RT_REFLECTIONS_FRESH_MIRROR", level >= 4);
 	const bool  vfill    = env_on("KYTY_RT_REFLECTIONS_VIRTUAL", true);
 	const float snap_deg = EnvFloat("KYTY_RT_REFLECTIONS_NORMAL_SNAP", 2.0f, 0.0f, 10.0f);
-	const int   rpp      = static_cast<int>(EnvFloat("KYTY_RT_REFLECTIONS_RPP", level >= 5 ? 2.0f : 1.0f, 1.0f, 4.0f));
+	const int   rpp      = static_cast<int>(EnvFloat("KYTY_RT_REFLECTIONS_RPP", level >= 5 || hwq >= 4 ? 2.0f : 1.0f, 1.0f, 4.0f));
 	{
 		static bool said = false;
 		if (!said) {
@@ -1464,7 +1492,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.size[0] = static_cast<float>(color.extent.width), push.size[1] = static_cast<float>(color.extent.height);
 	push.size[2] = static_cast<float>(g_rt.trace.width), push.size[3] = static_cast<float>(g_rt.trace.height);
 	push.params[0] = strength, push.params[1] = EnvFloat("KYTY_RT_REFLECTIONS_THICKNESS", 0.3f, 0.01f, 4.0f);
-	push.params[2] = cfg.max_len;
+	push.params[2] = cfg.max_len * len_q;
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
 	push.motion[2] = cutoff, push.motion[3] = cfg.alpha;
 	push.misc[1] = static_cast<int32_t>(g_rt.frame & 0x7fffffff);
@@ -1725,8 +1753,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			run(10, s, g.mtrace);
 		}
 		const RtImage* msrc = &g.mhist[cur];
-		for (int i = 0; i < 2; ++i) {
-			const RtImage* dst = &g.mtmp[i];
+		for (int i = 0; i < mc.passes; ++i) {
+			const RtImage* dst = &g.mtmp[i & 1];
 			Set            s   = base;
 			s.a = msrc, s.b = msrc, s.gcur = &g.mgb[cur], s.gprev = &g.mgb[cur], s.aux = &g.maux, s.meta = &g.mmeta[cur];
 			s.oa = dst, s.ob = &g.mrad, s.oc = &g.mrad;

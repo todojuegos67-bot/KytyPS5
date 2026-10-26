@@ -324,7 +324,13 @@ void SayOnce(const char* text) {
 int HwParticlesLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_HWRT_PARTICLES");
-		return value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		const int   q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		if (q > 0) {
+			std::printf("HWRTQ: particles level %d (%s res, %d candidates, %d shadow ray(s))\n", q, q >= 3 ? "full" : "half",
+			            q == 1 ? 4 : q == 2 ? 6 : 8, q >= 3 ? 2 : 1);
+			std::fflush(stdout);
+		}
+		return q;
 	}();
 	return level;
 }
