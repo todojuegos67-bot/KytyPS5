@@ -96,7 +96,8 @@ struct Push {
 	int32_t pad[2] {};
 };
 
-constexpr uint32_t Bindings = 15;
+constexpr uint32_t Bindings = 16;
+constexpr uint32_t StatWords = 64, StatSlots = 4;
 
 struct State {
 	vk::DescriptorSetLayout set_layout = nullptr;
@@ -108,6 +109,12 @@ struct State {
 	bool                    dummy_ready = false;
 	VkBuffer                ubo = VK_NULL_HANDLE;
 	VmaAllocation           ubo_mem = VK_NULL_HANDLE;
+	VkBuffer                stats = VK_NULL_HANDLE; // (diag) the self-test counters, host visible, StatSlots x StatWords
+	VmaAllocation           stats_mem = VK_NULL_HANDLE;
+	uint32_t*               stats_map = nullptr;
+	uint64_t                st_sum[12] {};
+	uint32_t                st_frames = 0;
+	std::chrono::steady_clock::time_point st_last = std::chrono::steady_clock::now();
 	vk::Extent2D            render {}, trace {};
 	Image                   raw, tmp_a, tmp_b, out, history[2], gbuf[2], count[2];
 	uint32_t                frame = 0;
@@ -165,6 +172,7 @@ void FreeImage(GraphicContext& graphics, Image& img) {
 vk::DescriptorType DescType(uint32_t i) {
 	if (i == 13) return vk::DescriptorType::eAccelerationStructureKHR;
 	if (i == 14) return vk::DescriptorType::eUniformBuffer;
+	if (i == 15) return vk::DescriptorType::eStorageBuffer;
 	if (i == 7 || i == 8 || i == 10) return vk::DescriptorType::eStorageImage;
 	return vk::DescriptorType::eCombinedImageSampler;
 }
@@ -231,6 +239,21 @@ bool EnsurePipeline(GraphicContext& graphics) {
 			g_gi.ubo = VK_NULL_HANDLE;
 			return false;
 		}
+	}
+	{
+		VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		buffer.size  = StatWords * StatSlots * 4;
+		buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo host {};
+		host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VmaAllocationInfo mapped {};
+		if (vmaCreateBuffer(graphics.allocator, &buffer, &host, &g_gi.stats, &g_gi.stats_mem, &mapped) != VK_SUCCESS) {
+			g_gi.stats = VK_NULL_HANDLE;
+			return false;
+		}
+		g_gi.stats_map = static_cast<uint32_t*>(mapped.pMappedData);
+		std::memset(g_gi.stats_map, 0, StatWords * StatSlots * 4);
 	}
 	vk::QueryPoolCreateInfo query {};
 	query.queryType  = vk::QueryType::eTimestamp;
@@ -313,6 +336,41 @@ void ToGeneral(vk::CommandBuffer command, Image& img) {
 	dependency.pImageMemoryBarriers    = &b;
 	command.pipelineBarrier2(dependency);
 	img.general = true;
+}
+
+// (diag) The slot written StatSlots - 1 frames ago, summed; every 2 s the "HWRTGI: self-test" line: hit rates, normal
+// orientation, and the screen centre's point by this pass against a primary ray through the TLAS (hwrt2's convention).
+void ReadStats(GraphicContext& graphics) {
+	if (g_gi.stats_map == nullptr || g_gi.frame < StatSlots) return;
+	(void)vmaInvalidateAllocation(graphics.allocator, g_gi.stats_mem, 0, VK_WHOLE_SIZE);
+	const uint32_t* w = g_gi.stats_map + ((g_gi.frame + 1) % StatSlots) * StatWords;
+	for (int i = 0; i < 12; ++i)
+		g_gi.st_sum[i] += w[i];
+	++g_gi.st_frames;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_gi.st_last < std::chrono::seconds(2)) return;
+	const auto& s   = g_gi.st_sum;
+	const auto  pct = [](uint64_t a, uint64_t b) { return b > 0 ? 100.0 * static_cast<double>(a) / static_cast<double>(b) : 0.0; };
+	std::printf("HWRTGI: self-test %u frames: %.0f px/frame; AO rays hit %.1f%% (%llu rays); GI rays hit %.1f%%, of those on "
+	            "screen %.1f%%; normals up %.1f%% down %.1f%%; G-buffer normal agrees %.1f%% / disagrees %.1f%% (up %.1f%%, down %.1f%%)\n",
+	            g_gi.st_frames, static_cast<double>(s[0]) / g_gi.st_frames, pct(s[2], s[1]), static_cast<unsigned long long>(s[1]),
+	            pct(s[4], s[3]), pct(s[5], s[4]), pct(s[6], s[0]), pct(s[7], s[0]), pct(s[8], s[0]), pct(s[9], s[0]),
+	            pct(s[10], s[8] + s[9]), pct(s[11], s[8] + s[9]));
+	if (w[12] != 0) {
+		float f[24];
+		std::memcpy(f, w + 16, sizeof(f));
+		const float dx = f[0] - f[8], dy = f[1] - f[9], dz = f[2] - f[10];
+		std::printf("HWRTGI: self-test centre: ours (%.3f %.3f %.3f) dist %.3f; TLAS primary ray (%.3f %.3f %.3f) t %.3f -> "
+		            "apart %.3f m; legacy inv(VP)*(ndc,depth) (%.3f %.3f %.3f); camera (%.3f %.3f %.3f); depth %.7f viewZ %.3f; "
+		            "ray dirs dot %.5f; depth normal (%.2f %.2f %.2f), G-buffer normal (%.2f %.2f %.2f)\n",
+		            f[0], f[1], f[2], f[3], f[8], f[9], f[10], f[7], f[7] >= 0.0f ? std::sqrt(dx * dx + dy * dy + dz * dz) : -1.0f,
+		            f[12], f[13], f[14], f[4], f[5], f[6], f[11], f[23], f[15], f[16], f[17], f[18], f[20], f[21], f[22]);
+	}
+	std::fflush(stdout);
+	for (auto& v: g_gi.st_sum)
+		v = 0;
+	g_gi.st_frames = 0;
+	g_gi.st_last   = now;
 }
 
 } // namespace
@@ -408,6 +466,8 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	ubo.cfg[3] = (inputs.reset ? 1 : 0) | (g_gi.history_valid ? 2 : 0) | (normals ? 4 : 0) | (albedo ? 8 : 0) | (half ? 16 : 0) |
 	             (cfg.ao > 0 ? 32 : 0) | (cfg.gi > 0 ? 64 : 0) | (flip_y ? 128 : 0);
 	ubo.cfg2[0] = static_cast<int32_t>(g_gi.frame), ubo.cfg2[1] = view;
+	ubo.cfg2[2] = static_cast<int32_t>(g_gi.frame % StatSlots);
+	ReadStats(*graphics);
 	ubo.proj[0] = m[0], ubo.proj[1] = m[5], ubo.proj[2] = m[8], ubo.proj[3] = m[9];
 	ubo.depth_map[0] = m[10], ubo.depth_map[1] = m[14], ubo.depth_map[2] = m[11], ubo.depth_map[3] = m[15];
 
@@ -420,6 +480,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	Barrier(command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
 	        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
 	command.updateBuffer(vk::Buffer(g_gi.ubo), 0, sizeof(ubo), &ubo);
+	command.fillBuffer(vk::Buffer(g_gi.stats), (g_gi.frame % StatSlots) * StatWords * 4, StatWords * 4, 0);
 	for (auto* img : TraceImages())
 		ToGeneral(command, *img);
 	if (!g_gi.dummy_ready) {
@@ -468,6 +529,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		as_write.accelerationStructureCount = 1;
 		as_write.pAccelerationStructures    = &scene.tlas;
 		const vk::DescriptorBufferInfo ubo_info {vk::Buffer(g.ubo), 0, sizeof(FrameUbo)};
+		const vk::DescriptorBufferInfo st_info {vk::Buffer(g.stats), 0, StatWords * StatSlots * 4};
 		vk::WriteDescriptorSet         writes[Bindings] {};
 		for (uint32_t i = 0; i < Bindings; ++i) {
 			writes[i].dstBinding      = i;
@@ -475,6 +537,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			writes[i].descriptorType  = DescType(i);
 			if (i == 13) writes[i].pNext = &as_write;
 			else if (i == 14) writes[i].pBufferInfo = &ubo_info;
+			else if (i == 15) writes[i].pBufferInfo = &st_info;
 			else writes[i].pImageInfo = &infos[i];
 		}
 		Push push {};
