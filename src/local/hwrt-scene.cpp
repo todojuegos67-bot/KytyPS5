@@ -1527,4 +1527,17 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 	}
 }
 
+// (hwrt2g, KYTY_HWRT_AO / KYTY_HWRT_GI: hwrt-gi.cpp) The scene just built, for a pass recorded after it in this frame.
+bool GiScene(GiSceneInfo& out) {
+	out = {};
+	if (!Active()) return false;
+	std::lock_guard lock(g.mutex);
+	if (!g.ready || g.tlas == nullptr || !g.tlas_built || !g_frame_camera) return false;
+	out.tlas = g.tlas;
+	out.inv  = g_inv;
+	out.vp   = g.view_proj;
+	out.cam  = g_cam;
+	return true;
+}
+
 } // namespace Libs::Graphics::HwScene
