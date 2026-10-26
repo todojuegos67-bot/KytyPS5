@@ -29,6 +29,7 @@
 // first hit, 250 m). Quarter resolution with the pass's own temporal + spatial filter and capped additive composite
 // (never darkens). KYTY_GODRAYS unset: it runs at the KYTY_HWRT_VOLUMETRIC level. No TLAS (yet) or no frame camera: the
 // depth-buffer march as before. Unset / 0: nothing changes (the same pipeline, push size and SPIR-V as before).
+#include "local/local-pass-cache.h"
 #include "local/godrays.h"
 #include "local/hwrt-scene.h"
 
@@ -281,6 +282,7 @@ vk::DescriptorType DescType(uint32_t i) {
 }
 
 bool EnsurePipeline(GraphicContext& graphics) {
+	std::lock_guard ensure_lock(LocalPassCache::EnsureMutex()); // (the prewarm thread's, local-pass-cache.h)
 	if (g_gr.pipeline != nullptr) return true;
 	if (g_gr.failed) return false;
 	g_gr.failed       = true;
@@ -323,7 +325,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_gr.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_gr.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_gr.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_gr.pipeline = nullptr;
@@ -462,6 +464,9 @@ int GodraysLevel() {
 	return level;
 }
 bool GodraysWanted() { return GodraysLevel() > 0; }
+void GodraysPrewarm(GraphicContext& graphics) { // (local-pass-cache.h; KYTY_HWRT_VOLUMETRIC's pipeline when on)
+	if (GodraysLevel() > 0) (void)EnsurePipeline(graphics);
+}
 
 void GodraysSetSun(const std::array<double, 3>& view_dir, float weight) {
 	if (!GodraysWanted()) return;

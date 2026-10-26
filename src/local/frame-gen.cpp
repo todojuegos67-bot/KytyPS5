@@ -10,6 +10,8 @@
 
 #include "common/logging/log.h"
 #include "local-platform.h"
+#include "slow-log.h"
+#include "local/local-pass-cache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -8936,22 +8938,57 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 
 bool SsgiWanted() { return SsgiQuality() > 0; }
 
+// (local-pass-cache.h) rt-reflections.cpp, hwrt-gi.cpp, godrays.cpp, hwrt-particles.cpp.
+void RtReflectionsPrewarm(GraphicContext& graphics);
+void HwGiPrewarm(GraphicContext& graphics);
+void GodraysPrewarm(GraphicContext& graphics);
+void HwParticlesPrewarm(GraphicContext& graphics);
+
 bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
+	// (The RT passes' pipelines made beside the title screen, into a cache on disk, not on the world's first flip.
+	// KYTY_RT_PREWARM=0: made where first needed, as before.)
+	if (inputs_in.graphics != nullptr) {
+		static std::once_flag prewarm;
+		std::call_once(prewarm, [graphics = inputs_in.graphics] {
+			const char* value = std::getenv("KYTY_RT_PREWARM");
+			if (value != nullptr && value[0] == '0') return;
+			std::thread([graphics] {
+				LocalPlatform::SetThreadName("Kyty.RtPrewarm");
+				const auto begin = std::chrono::steady_clock::now();
+				RtReflectionsPrewarm(*graphics);
+				HwGiPrewarm(*graphics);
+				GodraysPrewarm(*graphics);
+				HwParticlesPrewarm(*graphics);
+				LocalPassCache::Save();
+				std::printf("RT passes: pipelines made beside the game in %.0f ms (KYTY_RT_PREWARM=0: on first use)\n",
+				            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+				std::fflush(stdout);
+			}).detach();
+		});
+		static uint32_t upscales = 0;
+		if (++upscales == 3600) std::thread([] { LocalPassCache::Save(); }).detach(); // (what the flip path made later)
+	}
 	UpscaleInputs inputs = inputs_in;
 	// (The DLSS-G hudless path sets the context in PrepareInputs; the PS5 Pro path alone needs the renderer's.)
 	if (g_graphics_ctx == nullptr && inputs.graphics != nullptr) g_graphics_ctx = inputs.graphics;
 	RtPartNoteColor(inputs.color_address, inputs.color.extent); // (rtparticles: the scene color the draws are matched to)
-	HwParticlesApply(command, inputs); // (KYTY_HWRT_PARTICLES: first, on the game's own color; nothing when off)
-	CShadowApply(command, inputs); // (KYTY_RT_SHADOWS: direct-sun shadows first; inputs.color becomes the composited copy)
-	HwLightsApply(command, inputs); // (KYTY_HWRT_LIGHTS: ray-traced local-light shadows, hw-lights.cpp; nothing when off)
-	SsgiApply(command, inputs); // (KYTY_SSGI: likewise; nothing when off)
-	GtaoApply(command, inputs); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
-	HwGiApply(command, inputs); // (KYTY_HWRT_AO / KYTY_HWRT_GI: likewise, hwrt-gi.cpp, in GTAO's place; nothing when off)
-	SsrApply(command, inputs); // (KYTY_SSR: likewise, after GTAO; nothing when off)
-	RtReflectionsApply(command, inputs); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
-	ShineApply(command, inputs); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
-	GodraysApply(command, inputs); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off)
-	GbufViewApply(command, inputs); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
+	// (A pass's first use makes its pipelines and images here, before the flip: a slow one names itself. 10-27: the
+	// first world frame with KYTY_HWRT_REFL waited 4.7-5.4 s on the flip, the render thread idle.)
+	const auto TimedPass = [](const char* name, const auto& run) {
+		SlowLog::Scope pass_slow([name](double ms) { std::printf("SLOW UpscalePass %s %.1f ms\n", name, ms); }, SlowLog::HitchThreshold());
+		run();
+	};
+	TimedPass("HwParticlesApply", [&] { HwParticlesApply(command, inputs); }); // (KYTY_HWRT_PARTICLES: first, on the game's own color; nothing when off)
+	TimedPass("CShadowApply", [&] { CShadowApply(command, inputs); }); // (KYTY_RT_SHADOWS: direct-sun shadows first; inputs.color becomes the composited copy)
+	TimedPass("HwLightsApply", [&] { HwLightsApply(command, inputs); }); // (KYTY_HWRT_LIGHTS: ray-traced local-light shadows, hw-lights.cpp; nothing when off)
+	TimedPass("SsgiApply", [&] { SsgiApply(command, inputs); }); // (KYTY_SSGI: likewise; nothing when off)
+	TimedPass("GtaoApply", [&] { GtaoApply(command, inputs); }); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
+	TimedPass("HwGiApply", [&] { HwGiApply(command, inputs); }); // (KYTY_HWRT_AO / KYTY_HWRT_GI: likewise, hwrt-gi.cpp, in GTAO's place; nothing when off)
+	TimedPass("SsrApply", [&] { SsrApply(command, inputs); }); // (KYTY_SSR: likewise, after GTAO; nothing when off)
+	TimedPass("RtReflectionsApply", [&] { RtReflectionsApply(command, inputs); }); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
+	TimedPass("ShineApply", [&] { ShineApply(command, inputs); }); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
+	TimedPass("GodraysApply", [&] { GodraysApply(command, inputs); }); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off)
+	TimedPass("GbufViewApply", [&] { GbufViewApply(command, inputs); }); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
 	const bool  fsr  = g_sr_kind == 3;

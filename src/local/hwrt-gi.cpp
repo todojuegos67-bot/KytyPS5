@@ -15,6 +15,7 @@
 //  3 passes; 3 full res, AO 2 + GI 2, 3 passes. Temporal accumulation (motion vectors, disocclusion, clamped) + a-trous +
 //  a depth-aware upsample. KYTY_HWRT_GI_VIEW=1 the AO alone, 2 the added bounce x 4. Every 5 s "HWRTGI: GPU" timing.
 //  Off (both 0 / unset): nothing here runs (HwGiWanted false; GTAO, SSGI and the G-buffer copy exactly as before).
+#include "local/local-pass-cache.h"
 #include "local/hwrt-gi.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -184,6 +185,7 @@ vk::DescriptorType DescType(uint32_t i) {
 }
 
 bool EnsurePipeline(GraphicContext& graphics) {
+	std::lock_guard ensure_lock(LocalPassCache::EnsureMutex()); // (the prewarm thread's, local-pass-cache.h)
 	if (g_gi.pipeline != nullptr) return true;
 	if (g_gi.failed) return false;
 	g_gi.failed       = true;
@@ -217,7 +219,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_gi.layout;
-	const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_gi.pipeline);
+	const auto created = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_gi.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_gi.pipeline = nullptr;
@@ -397,6 +399,9 @@ void ReadStats(GraphicContext& graphics) {
 } // namespace
 
 bool HwGiWanted() { return Cfg().level > 0; }
+void HwGiPrewarm(GraphicContext& graphics) { // (local-pass-cache.h; HwGiApply's guards)
+	if (Cfg().level > 0 && HwScene::Active()) (void)EnsurePipeline(graphics);
+}
 bool HwAoReplacesGtao() {
 	static const bool keep = EnvBool("KYTY_HWRT_AO_GTAO", false);
 	return Cfg().ao > 0 && !keep && HwScene::Active();
