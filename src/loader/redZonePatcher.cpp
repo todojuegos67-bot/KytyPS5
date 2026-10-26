@@ -13,6 +13,7 @@
 #include <array>
 #include <bitset>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -139,7 +140,46 @@ struct DecodedFunction {
 struct InstructionRewrite {
 	bool protect_red_zone {};
 	bool protected_indirect_call {};
+	bool native_rsqrt {};
 };
+
+// wolverine-turbo8-1025: KYTY_NATIVE_RSQRT=1 (startup, default off). Each guest VRSQRTPS xmm, xmm otherwise
+// becomes an illegal instruction trapped and emulated (--amd-cpu): a host exception of microseconds, and the
+// slow area runs 1-2.4 million of them per 5 s on guest threads ([traps] line). With the switch, the relocated
+// copy computes the same accurate estimate inline (sqrt, then 1/x; specials match: +-0 -> +-inf, inf -> 0,
+// negative -> default NaN, NaN quieted), saving a scratch YMM below the red zone. Only difference: a
+// denormal input with MXCSR.DAZ clear gives a finite result instead of inf.
+static bool NativeRsqrtEnabled() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_RSQRT");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+
+bool GenerateNativeRsqrt(const DecodedCodeInstruction& decoded, Xbyak::CodeGenerator& g) {
+	const auto& ops = decoded.operands;
+	const int   d   = static_cast<int>(ops[0].reg.value) - static_cast<int>(ZYDIS_REGISTER_XMM0);
+	const int   s   = static_cast<int>(ops[1].reg.value) - static_cast<int>(ZYDIS_REGISTER_XMM0);
+	if (d < 0 || d > 15 || s < 0 || s > 15) {
+		return false;
+	}
+	int t = 0;
+	while (t == d || t == s) {
+		++t;
+	}
+	constexpr int Frame = 128 + 32;
+	g.lea(rsp, ptr[rsp - Frame]);
+	g.vmovdqu(ptr[rsp], Xbyak::Ymm(t));
+	g.vsqrtps(Xbyak::Xmm(t), Xbyak::Xmm(s));
+	g.vpcmpeqd(Xbyak::Xmm(d), Xbyak::Xmm(d), Xbyak::Xmm(d));
+	g.vpsrld(Xbyak::Xmm(d), Xbyak::Xmm(d), 25);
+	g.vpslld(Xbyak::Xmm(d), Xbyak::Xmm(d), 23); // 1.0f
+	g.vdivps(Xbyak::Xmm(d), Xbyak::Xmm(d), Xbyak::Xmm(t));
+	g.vmovdqu(Xbyak::Ymm(t), ptr[rsp]);
+	g.lea(rsp, ptr[rsp + Frame]);
+	return true;
+}
 
 bool IsStackPointerRegister(ZydisRegister reg) {
 	return reg != ZYDIS_REGISTER_NONE &&
@@ -796,6 +836,9 @@ void CollectReciprocalSquareRoots(const DecodedFunction& function,
 		if (protect_red_zone) {
 			rewrite_sites[address].protect_red_zone = true;
 		}
+		if (NativeRsqrtEnabled()) {
+			rewrite_sites[address].native_rsqrt = true;
+		}
 	}
 }
 
@@ -841,13 +884,19 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 				const auto rewrite = rewrite_sites.find(decoded->address);
 				const bool protected_indirect_call =
 				    rewrite != rewrite_sites.end() && rewrite->second.protected_indirect_call;
+				const bool native_rsqrt = rewrite != rewrite_sites.end() && rewrite->second.native_rsqrt;
 				const bool protect_red_zone = rewrite != rewrite_sites.end() &&
 				                              rewrite->second.protect_red_zone &&
-				                              !protected_indirect_call;
+				                              !protected_indirect_call && !native_rsqrt;
 				if (protect_red_zone) {
 					module->trampoline_gen.lea(rsp, ptr[rsp - GuestRedZoneSize]);
 				}
-				if (protected_indirect_call) {
+				if (native_rsqrt) {
+					if (!GenerateNativeRsqrt(*decoded, module->trampoline_gen)) {
+						module->trampoline_gen.setSize(trampoline_offset);
+						return std::nullopt;
+					}
+				} else if (protected_indirect_call) {
 					if (!GenerateProtectedIndirectCall(*decoded, module->trampoline_gen)) {
 						module->trampoline_gen.setSize(trampoline_offset);
 						return std::nullopt;
@@ -880,6 +929,9 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 			}
 			if (rewrite->second.protect_red_zone && decoded->accesses_memory) {
 				++result.patched_memory_instruction_count;
+			}
+			if (rewrite->second.native_rsqrt) {
+				++result.native_rsqrt_count;
 			}
 		}
 	};

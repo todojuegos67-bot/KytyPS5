@@ -2105,6 +2105,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     result.control_flow_memory_instruction_count,
 			     result.unrelocatable_memory_instruction_count);
 			reciprocal_sqrt_count = result.reciprocal_sqrt_instruction_count;
+			if (result.native_rsqrt_count != 0 || std::getenv("KYTY_NATIVE_RSQRT") != nullptr) {
+				::printf("Native VRSQRTPS (KYTY_NATIVE_RSQRT): %s, %llu inline, %llu still trapped\n",
+				         Common::PathToString(program->file_name.filename()).c_str(),
+				         static_cast<unsigned long long>(result.native_rsqrt_count),
+				         static_cast<unsigned long long>(result.reciprocal_sqrt_instruction_count));
+			}
 		}
 #else
 		if (emulate_rsqrt) {

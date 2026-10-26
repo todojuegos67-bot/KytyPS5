@@ -23,6 +23,7 @@ struct RedZonePatchResult {
 	uint64_t unrelocatable_memory_instruction_count   = 0;
 	uint64_t indirect_red_zone_function_count         = 0;
 	uint64_t reciprocal_sqrt_instruction_count        = 0;
+	uint64_t native_rsqrt_count                       = 0;
 };
 
 void RegisterRedZonePatchModule(void* module_ptr, uint64_t module_size, void* trampoline_area_ptr,
