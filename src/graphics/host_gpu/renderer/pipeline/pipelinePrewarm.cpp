@@ -13,6 +13,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <tuple>
 #include <unordered_set>
 #include <xxhash.h>
 
@@ -25,7 +26,11 @@ namespace {
 constexpr char     Magic[8] = {'K', 'P', 'R', 'E', 'W', 'R', 'M', '2'};
 constexpr uint32_t KindSpirv    = 'S';
 constexpr uint32_t KindCompute  = 'C';
-constexpr uint32_t KindGraphics = 'G';
+// 'G' (first version) copied the trailing padding of three structs: stack garbage, so the key of
+// the same pipeline differed on every creation (graphics: 11 served / 713 missed). Ignored now.
+constexpr uint32_t KindGraphicsV1 = 'G';
+constexpr uint32_t KindGraphics   = 'g';
+constexpr uint32_t KindMeta       = 'M'; // key: SPIR-V hash, payload: guest shader hash (2 words)
 constexpr uint32_t MaxWords     = 64u * 1024u * 1024u;
 
 using Clock = std::chrono::steady_clock;
@@ -50,7 +55,12 @@ struct Writer {
 		w.resize(o + n, 0);
 		std::memcpy(w.data() + o, p, bytes);
 	}
-	// the POD tail of a Vulkan struct after its sType/pNext header
+	// the POD fields of a Vulkan struct after its sType/pNext header, without trailing padding
+	template <typename T>
+	void Used(const T& s, size_t end) {
+		constexpr size_t off = offsetof(VkBaseInStructure, pNext) + sizeof(void*);
+		Raw(reinterpret_cast<const uint8_t*>(&s) + off, end - off);
+	}
 	template <typename T>
 	void Tail(const T& s) {
 		constexpr size_t off = offsetof(VkBaseInStructure, pNext) + sizeof(void*);
@@ -82,6 +92,11 @@ struct Reader {
 		}
 		std::memcpy(p, w.data() + pos, bytes);
 		pos += n;
+	}
+	template <typename T>
+	void Used(T& s, size_t end) {
+		constexpr size_t off = offsetof(VkBaseInStructure, pNext) + sizeof(void*);
+		Raw(reinterpret_cast<uint8_t*>(&s) + off, end - off);
 	}
 	template <typename T>
 	void Tail(T& s) {
@@ -129,7 +144,15 @@ struct Context {
 	uint64_t                                     missed[2] = {};
 	Clock::time_point                            start_time;
 	Clock::time_point                            next_report;
-	std::vector<std::pair<uint64_t, std::vector<uint32_t>>> early_spirv;
+	std::vector<std::tuple<uint64_t, uint64_t, std::vector<uint32_t>>> early_spirv; // hash, guest, code
+	std::unordered_map<uint64_t, uint64_t>       guest_of_spirv;
+	std::unordered_map<uint64_t, std::vector<uint64_t>> spirv_of_guest; // in the seed at boot
+	std::unordered_set<uint64_t>                 seed_spirv;          // SPIR-V in the seed at boot
+	std::vector<std::shared_ptr<Pending>>        seed_descs;          // pipeline records at boot
+	bool                                         seed_loaded = false;
+	int                                          diag_left   = 40;
+	uint64_t                                     taken_twice[2] = {};
+	uint64_t                                     not_in_seed[2] = {};
 	GraphicContext*                              graphics     = nullptr;
 	vk::PipelineCache                            driver_cache = nullptr;
 };
@@ -184,12 +207,14 @@ void ReportLocked(Context& ctx, const char* when) {
 	const auto ms = [](uint64_t ns) { return static_cast<unsigned long long>(ns / 1'000'000u); };
 	std::printf(
 	    "PipelineStats (%s): prewarm %zu/%zu built (%zu compute + %zu graphics recorded, %zu failed) | "
-	    "gameplay compute %llu served / %llu missed, graphics %llu served / %llu missed | "
+	    "gameplay compute %llu served / %llu missed (%llu new, %llu again), graphics %llu served / %llu missed (%llu new, %llu again) | "
 	    "runtime compiles: compute %llu (%llu ms, %llu sync, %llu >50ms), graphics %llu (%llu ms, %llu sync, "
 	    "%llu >50ms), worst %llu ms | translations %llu (%llu ms, worst %llu ms)\n",
 	    when, ctx.built, ctx.queue.size(), ctx.queued_c, ctx.queued_g, ctx.failed,
 	    static_cast<unsigned long long>(ctx.served[0]), static_cast<unsigned long long>(ctx.missed[0]),
+	    static_cast<unsigned long long>(ctx.not_in_seed[0]), static_cast<unsigned long long>(ctx.taken_twice[0]),
 	    static_cast<unsigned long long>(ctx.served[1]), static_cast<unsigned long long>(ctx.missed[1]),
+	    static_cast<unsigned long long>(ctx.not_in_seed[1]), static_cast<unsigned long long>(ctx.taken_twice[1]),
 	    static_cast<unsigned long long>(g_runtime_compiles[0].load()), ms(g_runtime_ns[0].load()),
 	    static_cast<unsigned long long>(g_runtime_sync[0].load()),
 	    static_cast<unsigned long long>(g_runtime_slow[0].load()),
@@ -394,12 +419,12 @@ vk::Pipeline BuildGraphics(Context& ctx, std::FILE* f, const Pending& p) {
 	}
 	VkPipelineInputAssemblyStateCreateInfo ia {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
 	if (rd.U() != 0) {
-		rd.Tail(ia);
+		rd.Used(ia, offsetof(VkPipelineInputAssemblyStateCreateInfo, primitiveRestartEnable) + 4);
 		info.pInputAssemblyState = &ia;
 	}
 	VkPipelineTessellationStateCreateInfo ts {VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
 	if (rd.U() != 0) {
-		rd.Tail(ts);
+		rd.Used(ts, offsetof(VkPipelineTessellationStateCreateInfo, patchControlPoints) + 4);
 		info.pTessellationState = &ts;
 	}
 	VkPipelineViewportStateCreateInfo vp {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -410,7 +435,7 @@ vk::Pipeline BuildGraphics(Context& ctx, std::FILE* f, const Pending& p) {
 		vp.viewportCount = rd.U();
 		vp.scissorCount  = rd.U();
 		if (rd.U() != 0) {
-			rd.Tail(dcc);
+			rd.Used(dcc, offsetof(VkPipelineViewportDepthClipControlCreateInfoEXT, negativeOneToOne) + 4);
 			vp.pNext = &dcc;
 		}
 		info.pViewportState = &vp;
@@ -421,15 +446,15 @@ vk::Pipeline BuildGraphics(Context& ctx, std::FILE* f, const Pending& p) {
 	VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pv {
 	    VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT};
 	if (rd.U() != 0) {
-		rd.Tail(rs);
+		rd.Used(rs, offsetof(VkPipelineRasterizationStateCreateInfo, lineWidth) + 4);
 		const void* chain = nullptr;
 		if (rd.U() != 0) {
-			rd.Tail(clip);
+			rd.Used(clip, offsetof(VkPipelineRasterizationDepthClipStateCreateInfoEXT, depthClipEnable) + 4);
 			clip.pNext = chain;
 			chain      = &clip;
 		}
 		if (rd.U() != 0) {
-			rd.Tail(pv);
+			rd.Used(pv, offsetof(VkPipelineRasterizationProvokingVertexStateCreateInfoEXT, provokingVertexMode) + 4);
 			pv.pNext = chain;
 			chain    = &pv;
 		}
@@ -449,7 +474,7 @@ vk::Pipeline BuildGraphics(Context& ctx, std::FILE* f, const Pending& p) {
 	}
 	VkPipelineDepthStencilStateCreateInfo ds {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
 	if (rd.U() != 0) {
-		rd.Tail(ds);
+		rd.Used(ds, offsetof(VkPipelineDepthStencilStateCreateInfo, maxDepthBounds) + 4);
 		info.pDepthStencilState = &ds;
 	}
 	VkPipelineColorBlendStateCreateInfo cb {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
@@ -585,11 +610,108 @@ uint32_t FastCompileFlags(uint64_t words) {
 	           : 0u;
 }
 
+// ---- miss diagnostics (KYTY_PREWARM_DIAG=<n> first misses, default 40; 0 = off) ---------------
+
+bool ReadSpirv(Context& ctx, std::FILE* f, uint64_t h, std::vector<uint32_t>& out) {
+	auto it = ctx.spirv_offset.find(h);
+	if (it == ctx.spirv_offset.end() || f == nullptr) return false;
+	out.resize(ctx.spirv_words[h]);
+	return Seek(f, it->second) && std::fread(out.data(), 4, out.size(), f) == out.size();
+}
+
+void DiffWords(const char* what, std::span<const uint32_t> a, std::span<const uint32_t> b) {
+	size_t diff = 0;
+	char   buf[512];
+	int    len = 0;
+	const size_t n = std::min(a.size(), b.size());
+	for (size_t i = 0; i < n; i++) {
+		if (a[i] != b[i]) {
+			if (diff < 10 && len < 440) {
+				len += std::snprintf(buf + len, sizeof(buf) - len, " [%zu] %08x->%08x", i, a[i], b[i]);
+			}
+			diff++;
+		}
+	}
+	buf[len] = '\0';
+	std::printf("PrewarmMiss:   %s: seed %zu words, now %zu words, %zu of %zu differ:%s\n", what, a.size(),
+	            b.size(), diff, n, buf);
+}
+
+void DiffSpirvVsSeed(Context& ctx, std::FILE* f, const char* what, uint64_t now_hash) {
+	const auto gi    = ctx.guest_of_spirv.find(now_hash);
+	const uint64_t g = gi != ctx.guest_of_spirv.end() ? gi->second : 0;
+	if (ctx.seed_spirv.contains(now_hash)) {
+		std::printf("PrewarmMiss:   %s SPIR-V %016llx (guest %016llx) is in the seed: same code\n", what,
+		            static_cast<unsigned long long>(now_hash), static_cast<unsigned long long>(g));
+		return;
+	}
+	const auto cands = ctx.spirv_of_guest.find(g);
+	std::printf("PrewarmMiss:   %s SPIR-V %016llx (guest %016llx, %u words) NOT in the seed; seed has %zu SPIR-V of this guest shader\n",
+	            what, static_cast<unsigned long long>(now_hash), static_cast<unsigned long long>(g),
+	            ctx.spirv_words[now_hash], g != 0 && cands != ctx.spirv_of_guest.end() ? cands->second.size() : 0);
+	if (g == 0 || cands == ctx.spirv_of_guest.end() || cands->second.empty()) return;
+	uint64_t best = cands->second.front();
+	for (const auto c: cands->second) {
+		if (ctx.spirv_words[c] == ctx.spirv_words[now_hash]) { best = c; break; }
+	}
+	std::vector<uint32_t> a, b;
+	if (ReadSpirv(ctx, f, best, a) && ReadSpirv(ctx, f, now_hash, b)) DiffWords("SPIR-V words", a, b);
+}
+
+void DiagMissLocked(Context& ctx, uint32_t kind, uint64_t key, std::span<const uint32_t> desc) {
+	static const int limit = [] {
+		const char* v = std::getenv("KYTY_PREWARM_DIAG");
+		return v != nullptr ? std::atoi(v) : 40;
+	}();
+	if (!ctx.seed_loaded || ctx.diag_left <= 0 || limit <= 0) return;
+	if (40 - ctx.diag_left >= limit) return;
+	ctx.diag_left--;
+	std::FILE* f = std::fopen(ctx.path.string().c_str(), "rb");
+	std::printf("PrewarmMiss: %s pipeline %016llx not in the seed (%zu desc words)\n",
+	            kind == KindCompute ? "compute" : "graphics", static_cast<unsigned long long>(key), desc.size());
+	// stage SPIR-V hashes
+	std::vector<uint64_t> stages;
+	if (kind == KindCompute && desc.size() >= 2) {
+		stages.push_back(desc[0] | (uint64_t {desc[1]} << 32u));
+	} else if (kind == KindGraphics && desc.size() >= 3) {
+		for (uint32_t i = 0; i < desc[2] && 3 + i * 3 + 2 < desc.size(); i++) {
+			stages.push_back(desc[3 + i * 3 + 1] | (uint64_t {desc[3 + i * 3 + 2]} << 32u));
+		}
+	}
+	bool all_in_seed = true;
+	for (size_t i = 0; i < stages.size(); i++) {
+		char what[32];
+		std::snprintf(what, sizeof(what), "stage %zu", i);
+		DiffSpirvVsSeed(ctx, f, what, stages[i]);
+		all_in_seed = all_in_seed && ctx.seed_spirv.contains(stages[i]);
+	}
+	if (all_in_seed) {
+		// same shaders: find the seed record of the same kind with the most equal words
+		const Pending* best = nullptr;
+		size_t         best_eq = 0;
+		for (const auto& r: ctx.seed_descs) {
+			if (r->kind != kind || r->desc.size() != desc.size()) continue;
+			size_t eq = 0;
+			for (size_t i = 0; i < desc.size(); i++) eq += r->desc[i] == desc[i] ? 1 : 0;
+			if (best == nullptr || eq > best_eq) { best = r.get(); best_eq = eq; }
+		}
+		if (best != nullptr) {
+			DiffWords("state words (nearest seed record)", best->desc, desc);
+		} else {
+			std::printf("PrewarmMiss:   no seed record of the same size (state differs in shape)\n");
+		}
+	}
+	if (f != nullptr) std::fclose(f);
+	std::fflush(stdout);
+}
+
 uint64_t RecordPipeline(uint32_t kind, Writer& wr) {
 	auto&          ctx = Ctx();
 	const uint64_t key = Hash(wr.w.data(), wr.w.size() * 4u, kind);
 	std::lock_guard lock(ctx.mutex);
 	if (ctx.known.insert(key).second) {
+		ctx.not_in_seed[kind == KindGraphics ? 1 : 0]++;
+		DiagMissLocked(ctx, kind, key, wr.w);
 		WriteRecordLocked(ctx, kind, key, wr.w);
 	}
 	return key;
@@ -605,7 +727,7 @@ bool Enabled() {
 	return enabled;
 }
 
-void NoteSpirv(vk::ShaderModule module, std::span<const uint32_t> spirv) {
+void NoteSpirv(vk::ShaderModule module, std::span<const uint32_t> spirv, uint64_t guest_hash) {
 	if (!Enabled() || module == nullptr || spirv.empty()) {
 		return;
 	}
@@ -616,11 +738,15 @@ void NoteSpirv(vk::ShaderModule module, std::span<const uint32_t> spirv) {
 	if (!ctx.started) {
 		// before the seed is open (shaders translate before the first pipeline): kept and written
 		// at EnsureStarted, else these pipelines would never be recorded
-		ctx.early_spirv.emplace_back(h, std::vector<uint32_t>(spirv.begin(), spirv.end()));
+		ctx.early_spirv.emplace_back(h, guest_hash, std::vector<uint32_t>(spirv.begin(), spirv.end()));
 		return;
 	}
 	if (!ctx.spirv_offset.contains(h)) {
 		WriteRecordLocked(ctx, KindSpirv, h, spirv);
+	}
+	if (guest_hash != 0 && ctx.guest_of_spirv.emplace(h, guest_hash).second) {
+		const uint32_t g[2] = {static_cast<uint32_t>(guest_hash), static_cast<uint32_t>(guest_hash >> 32u)};
+		WriteRecordLocked(ctx, KindMeta, h, g);
 	}
 }
 
@@ -707,14 +833,14 @@ uint64_t RegisterGraphics(const vk::GraphicsPipelineCreateInfo&            cinfo
 	if (const auto* ia = info.pInputAssemblyState; ia != nullptr) {
 		if (ia->pNext != nullptr) return 0;
 		wr.U(1);
-		wr.Tail(*ia);
+		wr.Used(*ia, offsetof(VkPipelineInputAssemblyStateCreateInfo, primitiveRestartEnable) + 4);
 	} else {
 		wr.U(0);
 	}
 	if (const auto* ts = info.pTessellationState; ts != nullptr) {
 		if (ts->pNext != nullptr) return 0;
 		wr.U(1);
-		wr.Tail(*ts);
+		wr.Used(*ts, offsetof(VkPipelineTessellationStateCreateInfo, patchControlPoints) + 4);
 	} else {
 		wr.U(0);
 	}
@@ -730,7 +856,7 @@ uint64_t RegisterGraphics(const vk::GraphicsPipelineCreateInfo&            cinfo
 		const auto* dcc = FindChain<VkPipelineViewportDepthClipControlCreateInfoEXT>(
 		    vp->pNext, VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT);
 		wr.U(dcc != nullptr ? 1 : 0);
-		if (dcc != nullptr) wr.Tail(*dcc);
+		if (dcc != nullptr) wr.Used(*dcc, offsetof(VkPipelineViewportDepthClipControlCreateInfoEXT, negativeOneToOne) + 4);
 	} else {
 		wr.U(0);
 	}
@@ -740,15 +866,15 @@ uint64_t RegisterGraphics(const vk::GraphicsPipelineCreateInfo&            cinfo
 			return 0;
 		}
 		wr.U(1);
-		wr.Tail(*rs);
+		wr.Used(*rs, offsetof(VkPipelineRasterizationStateCreateInfo, lineWidth) + 4);
 		const auto* clip = FindChain<VkPipelineRasterizationDepthClipStateCreateInfoEXT>(
 		    rs->pNext, VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT);
 		wr.U(clip != nullptr ? 1 : 0);
-		if (clip != nullptr) wr.Tail(*clip);
+		if (clip != nullptr) wr.Used(*clip, offsetof(VkPipelineRasterizationDepthClipStateCreateInfoEXT, depthClipEnable) + 4);
 		const auto* pv = FindChain<VkPipelineRasterizationProvokingVertexStateCreateInfoEXT>(
 		    rs->pNext, VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT);
 		wr.U(pv != nullptr ? 1 : 0);
-		if (pv != nullptr) wr.Tail(*pv);
+		if (pv != nullptr) wr.Used(*pv, offsetof(VkPipelineRasterizationProvokingVertexStateCreateInfoEXT, provokingVertexMode) + 4);
 	} else {
 		wr.U(0);
 	}
@@ -769,7 +895,7 @@ uint64_t RegisterGraphics(const vk::GraphicsPipelineCreateInfo&            cinfo
 	if (const auto* ds = info.pDepthStencilState; ds != nullptr) {
 		if (ds->pNext != nullptr) return 0;
 		wr.U(1);
-		wr.Tail(*ds);
+		wr.Used(*ds, offsetof(VkPipelineDepthStencilStateCreateInfo, maxDepthBounds) + 4);
 	} else {
 		wr.U(0);
 	}
@@ -866,6 +992,15 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 						// a torn tail is detected by the next header read failing / a short file
 						ctx.spirv_offset[key] = payload_pos;
 						ctx.spirv_words[key]  = n;
+					} else if (kind == KindMeta || kind == KindGraphicsV1) {
+						std::vector<uint32_t> payload(n);
+						if (n != 0 && std::fread(payload.data(), 4, n, f) != n) {
+							break;
+						}
+						if (kind == KindMeta && n == 2) {
+							const uint64_t g = payload[0] | (uint64_t {payload[1]} << 32u);
+							if (ctx.guest_of_spirv.emplace(key, g).second) ctx.spirv_of_guest[g].push_back(key);
+						}
 					} else if (kind == KindCompute || kind == KindGraphics) {
 						auto rec  = std::make_shared<Pending>();
 						rec->kind = kind;
@@ -877,6 +1012,7 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 						if (Hash(rec->desc.data(), n * 4u, kind) == key && ctx.known.insert(key).second) {
 							ctx.entries[key] = {};
 							(kind == KindCompute ? ctx.queued_c : ctx.queued_g)++;
+							ctx.seed_descs.push_back(std::make_shared<Pending>(*rec));
 							ctx.queue.push_back(std::move(rec));
 						}
 					} else {
@@ -887,11 +1023,17 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 			}
 			std::fclose(f);
 		}
+		for (const auto& [h, off]: ctx.spirv_offset) ctx.seed_spirv.insert(h);
+		ctx.seed_loaded = valid_end != 0;
 		const uint64_t file_size = std::filesystem::exists(ctx.path, ec) ? std::filesystem::file_size(ctx.path, ec) : 0;
 		if (valid_end > file_size) {
 			valid_end = 0; // torn SPIR-V blob at the end: start over is safest
 		}
 		if (valid_end == 0) {
+			ctx.seed_spirv.clear();
+			ctx.seed_descs.clear();
+			ctx.guest_of_spirv.clear();
+			ctx.spirv_of_guest.clear();
 			ctx.spirv_offset.clear();
 			ctx.spirv_words.clear();
 			ctx.known.clear();
@@ -912,9 +1054,13 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 		if (ctx.out == nullptr) {
 			std::printf("Prewarm: cannot write %s; recording off\n", ctx.path.string().c_str());
 		}
-		for (const auto& [h, code]: ctx.early_spirv) {
+		for (const auto& [h, guest, code]: ctx.early_spirv) {
 			if (!ctx.spirv_offset.contains(h)) {
 				WriteRecordLocked(ctx, KindSpirv, h, code);
+			}
+			if (guest != 0 && ctx.guest_of_spirv.emplace(h, guest).second) {
+				const uint32_t g[2] = {static_cast<uint32_t>(guest), static_cast<uint32_t>(guest >> 32u)};
+				WriteRecordLocked(ctx, KindMeta, h, g);
 			}
 		}
 		ctx.early_spirv.clear();
@@ -968,6 +1114,8 @@ vk::Pipeline Take(uint64_t key, bool graphics) {
 			}
 			if (it->second.state == State::Ready) {
 				result = it->second.pipeline;
+			} else if (it->second.state == State::Done) {
+				ctx.taken_twice[graphics ? 1 : 0]++;
 			}
 			it->second.state    = State::Done;
 			it->second.pipeline = nullptr;

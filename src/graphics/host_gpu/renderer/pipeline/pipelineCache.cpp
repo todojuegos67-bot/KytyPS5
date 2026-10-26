@@ -365,7 +365,7 @@ struct PipelineCache::ProgramCache {
 		}
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
-		Prewarm::NoteSpirv(module, result.spirv);
+		Prewarm::NoteSpirv(module, result.spirv, options.shader_hash);
 		const ShaderProgram handle {.id = ++next_shader_id, .module = module,
 		                            .spirv_words = static_cast<uint64_t>(result.spirv.size())};
 		spirv_modules.emplace(spirv_key, handle);

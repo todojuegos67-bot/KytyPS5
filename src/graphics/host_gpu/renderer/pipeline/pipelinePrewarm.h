@@ -39,7 +39,7 @@ struct Binding {
 bool Enabled();
 
 // Every shader module that may end in a pipeline (stores its SPIR-V once in the seed).
-void NoteSpirv(vk::ShaderModule module, std::span<const uint32_t> spirv);
+void NoteSpirv(vk::ShaderModule module, std::span<const uint32_t> spirv, uint64_t guest_hash = 0);
 
 // Compute: the pipeline's key (0: not recordable); records it when the seed lacks it.
 uint64_t Register(vk::ShaderModule module, std::span<const vk::DescriptorSetLayoutBinding> bindings,
