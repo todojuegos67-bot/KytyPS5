@@ -11,6 +11,7 @@
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <tuple>
 #include <unordered_map>
 
@@ -43,7 +44,7 @@ struct Config {
 	std::string           dump_dir = "_TempData/rtls";
 	uint64_t              max_bytes = 256u << 10;
 	uint32_t              min_match = 3;
-	bool                  on = false, hw_lights = false;
+	bool                  on = false, hw_lights = false, layout_search = false;
 };
 
 const Config& Cfg() {
@@ -79,7 +80,8 @@ const Config& Cfg() {
 			c.hw_lights = true;
 			if (env("KYTY_RTLS_PERIOD") == nullptr) c.period = 4;
 		}
-		c.on = c.debug > 0 || c.shadows > 0 || c.dumps > 0 || c.scan_all || c.hw_lights;
+		c.layout_search = c.debug > 0 || c.shadows > 0 || c.dumps > 0 || c.scan_all;
+		c.on = c.layout_search || c.hw_lights;
 		if (c.on) {
 			std::printf("RTLS: local light discovery on (KYTY_RTLS_DEBUG=%d, KYTY_RT_LOCAL_SHADOWS=%d, scan %s, every %u flips, "
 			            "tolerance %.3f m, %d dumps)\n",
@@ -185,14 +187,18 @@ bool PerspectiveApex(const float* m, bool col, Apex& out, bool light = true) {
 	return true;
 }
 
-void FindApexes(const float* f, size_t n, std::vector<Apex>& out) {
+// Returns the end (in words) of the last projection found, 0: none.
+size_t FindApexes(const float* f, size_t n, std::vector<Apex>& out) {
+	size_t end = 0;
 	for (size_t o = 0; o + 16 <= n && out.size() < 512; o += 4) {
 		Apex a;
 		if (PerspectiveApex(f + o, false, a) || PerspectiveApex(f + o, true, a)) {
 			out.push_back(a);
+			end = o + 16;
 			o += 12;
 		}
 	}
+	return end;
 }
 
 bool CameraApex(Apex& cam) {
@@ -241,6 +247,10 @@ struct Program {
 	uint64_t last_scan = ~0ull;
 	uint32_t scans = 0;
 	bool     logged = false;
+	// (KYTY_HWRT_LIGHTS alone: the buffer slots that held projections and how far into them (words, 0: none yet), and the
+	// round-robin slot probed in full this scan: every scan reads the known extents plus one other slot, bounded)
+	std::array<uint32_t, 32> extent {};
+	uint32_t                 probe = 0;
 };
 
 struct State {
@@ -629,13 +639,25 @@ void OnDispatch(uint64_t cs_hash, std::span<const DispatchBuffer> buffers, std::
 		if (!srt.empty()) std::memcpy(f.data(), srt.data(), srt.size() * 4);
 		FindApexes(f.data(), f.size(), found);
 	}
+	// (KYTY_HWRT_LIGHTS alone needs the projections only: no light-list search, and bounded reads (the known extents plus
+	// one other slot a scan, <= 64 KiB), so a scan's cost stays flat on the render thread)
+	const bool lights_only = !c.layout_search;
+	if (lights_only && buffers.size() > 0) prog.probe = (prog.probe + 1) % static_cast<uint32_t>(std::min<size_t>(buffers.size(), 32));
 	std::vector<std::vector<float>> data(buffers.size());
 	for (size_t i = 0; i < buffers.size(); ++i) {
 		if (buffers[i].written) continue;
-		if (ReadGuest(buffers[i].address, buffers[i].size, data[i])) {
+		uint64_t size = buffers[i].size;
+		if (lights_only) {
+			const uint32_t known = i < 32 ? prog.extent[i] : 0;
+			if (known > 0 && i != prog.probe) size = std::min<uint64_t>(size, (uint64_t {known} + 64) * 4);
+			else if (i == prog.probe) size = std::min<uint64_t>(size, 64u << 10);
+			else continue;
+		}
+		if (ReadGuest(buffers[i].address, size, data[i])) {
 			++g.buffers_scanned;
 			// (projections: in the first 256 KiB; a light list is searched in all that was read)
-			FindApexes(data[i].data(), std::min<size_t>(data[i].size(), 65536), found);
+			const size_t end = FindApexes(data[i].data(), std::min<size_t>(data[i].size(), 65536), found);
+			if (lights_only && i < 32 && end > prog.extent[i]) prog.extent[i] = static_cast<uint32_t>(end);
 		}
 	}
 	for (const auto& a: found) AddApex(a, flip, cs_hash, have_cam ? &cam : nullptr);
@@ -648,6 +670,7 @@ void OnDispatch(uint64_t cs_hash, std::span<const DispatchBuffer> buffers, std::
 		            static_cast<unsigned long long>(cs_hash), static_cast<unsigned long long>(flip), found.size(), found[0].pos[0],
 		            found[0].pos[1], found[0].pos[2], found[0].far_d, found[0].tan_x);
 	}
+	if (lights_only) return; // (KYTY_HWRT_LIGHTS: the apexes are all it reads)
 	// 2. The light list: float3s at the apexes, one stride.
 	std::vector<const Apex*> live;
 	for (const auto& a: g.apexes)
@@ -707,7 +730,8 @@ void OnDispatch(uint64_t cs_hash, std::span<const DispatchBuffer> buffers, std::
 			g.lights.push_back(o);
 		}
 		g.lights_flip = flip;
-		if (l.proven && !was_proven) {
+		static std::set<std::tuple<uint64_t, int, uint32_t, uint32_t>> said_proven; // (each layout logged once)
+		if (l.proven && !was_proven && said_proven.insert({cs_hash, l.slot, l.stride, l.residue % l.stride}).second) {
 			std::printf("RTLS: proven: the local light list is CS %016llx's buffer %d @0x%llx (0x%llx bytes): %u entries of %u bytes from "
 			            "entry %u, the position (float3, world space) at +%u B of each (if the array starts at the buffer's start); %u "
 			            "distinct shadow apexes (spot / cube projections the game reads) found at that stride, %u scans agree. Fields, "

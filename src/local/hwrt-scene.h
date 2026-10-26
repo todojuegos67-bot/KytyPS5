@@ -130,6 +130,9 @@ void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageVie
 // (KYTY_HWRT_SHADOW, frame-gen.cpp) The scene TLAS for a ray query pass recorded after this frame's build, in order with it
 // (null until one exists); built_now: it was built this frame (else it holds an older frame's scene).
 [[nodiscard]] vk::AccelerationStructureKHR SceneTlas(bool* built_now);
+// (KYTY_HWRT_LIGHTS, hw-lights.cpp) The G-buffer camera's view-projection of the last captured frame (the TLAS's world;
+// row-major, clip = M * world); false until one was seen.
+bool SceneCamera(std::array<float, 16>& vp);
 
 // (hwrt2g, KYTY_HWRT_AO / KYTY_HWRT_GI: hwrt-gi.cpp) The TLAS built this frame and its camera (clip -> world rows, world ->
 // clip rows, the position), for a ray query pass recorded after the build in the same frame. False: no scene this frame.

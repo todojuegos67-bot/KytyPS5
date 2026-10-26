@@ -240,6 +240,9 @@ struct State {
 	uint32_t timed = 0;
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 } g;
+// (KYTY_HWRT_LIGHTS) the G-buffer camera of the last frame that had one (row-major, clip = M * world).
+std::array<float, 16> g_scene_vp {};
+bool                  g_scene_vp_valid = false;
 
 void Say(const char* text) {
 	std::printf("HWRT: %s\n", text);
@@ -2131,6 +2134,7 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 	g.slot        = (g.slot + 1) % Slots;
 	g.next_record = NullRecords;
 	g.captured = g.builds = g.build_tris = g.checks = g.refits_frame = 0;
+	if (g.have_camera) g_scene_vp = g.view_proj, g_scene_vp_valid = true; // (KYTY_HWRT_LIGHTS: SceneCamera)
 	g.have_camera = false;
 	g.cpu_after_ms += Ms(start);
 	MaybeLog();
@@ -2186,6 +2190,14 @@ void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageVie
 		BarrierD(cmd, d, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
 		         vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
 	});
+}
+
+bool SceneCamera(std::array<float, 16>& vp) {
+	if (!Active()) return false;
+	std::lock_guard lock(g.mutex);
+	if (!g_scene_vp_valid) return false;
+	vp = g_scene_vp;
+	return true;
 }
 
 vk::AccelerationStructureKHR SceneTlas(bool* built_now) {

@@ -80,6 +80,9 @@ struct {
 	uint64_t                frames = 0, frames_lit = 0, lights_sum = 0, no_tlas = 0, stale_tlas = 0;
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now(), last_guard = last_log, guard_until {};
 	bool                    said_on = false;
+	uint64_t                skipped = 0;
+	const char*             skip_why = nullptr;
+	std::chrono::steady_clock::time_point last_skip_log = std::chrono::steady_clock::now();
 } g_hl;
 
 float EnvFloat(const char* name, float fallback, float lo, float hi) {
@@ -334,8 +337,21 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	if (level == 0) return false;
 	GraphicContext* graphics = inputs.graphics;
 	if (graphics == nullptr || command == nullptr) return false;
+	{
+		// (every 10 s, while frames are skipped before the pass runs: how many and why; the stats line below covers the rest)
+		const auto t = std::chrono::steady_clock::now();
+		if (t - g_hl.last_skip_log >= std::chrono::seconds(10)) {
+			if (g_hl.skipped > 0) {
+				std::printf("HWRTLIGHTS: 10 s: %llu frames without the pass (last: %s)\n", static_cast<unsigned long long>(g_hl.skipped),
+				            g_hl.skip_why != nullptr ? g_hl.skip_why : "?");
+				std::fflush(stdout);
+			}
+			g_hl.skipped = 0, g_hl.last_skip_log = t;
+		}
+	}
 	const auto said_once = [](const char* why) {
 		static const char* said = nullptr;
+		++g_hl.skipped, g_hl.skip_why = why;
 		if (said != why) {
 			said = why;
 			std::printf("HWRTLIGHTS: nothing this frame (%s)\n", why);
@@ -356,8 +372,9 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		return said_once("no scene TLAS built yet");
 	}
 	if (!built) ++g_hl.stale_tlas;
+	// The camera: the scene capture's own (the TLAS's world), else FrameGen's G-buffer one.
 	std::array<float, 16> vp {};
-	{
+	if (!HwScene::SceneCamera(vp)) {
 		std::lock_guard lock(g_last_vp_mutex);
 		if (!g_have_last_vp) return said_once("no camera matrix captured yet");
 		vp = g_last_vp;
