@@ -80,7 +80,8 @@ struct Draw {
 // Render thread, before a capture-pipeline draw call of `count` draws: the cursor to push (always valid: a record
 // that captures nothing when the ring is full), then Note for each draw (record = cursor + i).
 [[nodiscard]] uint32_t Reserve(uint32_t count);
-void                   Note(uint32_t record, const Draw& draw);
+// True: this draw is captured this frame (else its record captures nothing).
+bool                   Note(uint32_t record, const Draw& draw);
 // A known G-buffer vertex shader's flattened SRT (words 29..44: the camera's view-projection, clip = M * world).
 void NoteCamera(uint64_t vs_hash, std::span<const uint32_t> flattened_srt);
 

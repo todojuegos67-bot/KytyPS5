@@ -9,6 +9,7 @@
 #endif
 #include "gpu_tiler_shaders/hwrt_gather_spv.h"
 #include "gpu_tiler_shaders/hwrt_debug_spv.h"
+#include "gpu_tiler_shaders/hwrt_debug11_spv.h"
 
 #include <algorithm>
 #include <array>
@@ -56,6 +57,8 @@ uint32_t BuildTrisPerFrame() { static const uint32_t v = std::max(1000u, EnvU32(
 // KYTY_HWRT_KEEP (600): frames a mesh not drawn stays in the TLAS (out of view); 4x that: its BLAS is freed.
 uint32_t KeepFrames() { static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT_KEEP", 600)); return v; }
 // KYTY_HWRT_DEBUG=1: instance colours shaded by distance in place of the TAA's output; 2: blended 50 %. Add 4: y flipped.
+uint32_t RefitInterval() { static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT_REFIT_EVERY", 4)); return v; }
+uint32_t RefitsPerFrame() { static const uint32_t v = EnvU32("KYTY_HWRT_REFITS", 64); return v; }
 uint32_t DebugMode() { static const uint32_t v = EnvU32("KYTY_HWRT_DEBUG", 0); return v; }
 
 struct Buffer {
@@ -66,6 +69,8 @@ struct Buffer {
 	vk::DeviceSize    size    = 0;
 };
 
+bool g_host_readback = false; // (MakeBuffer: the next host buffer is read back by the CPU)
+
 bool MakeBuffer(GraphicContext& graphics, Buffer& out, vk::DeviceSize size, VkBufferUsageFlags usage, bool host) {
 	VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
 	create.size  = std::max<vk::DeviceSize>(size, 16);
@@ -73,7 +78,12 @@ bool MakeBuffer(GraphicContext& graphics, Buffer& out, vk::DeviceSize size, VkBu
 	VmaAllocationCreateInfo allocate {};
 	allocate.usage = host ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 	if (host) {
-		allocate.flags         = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		// (10-26: the records were in system memory and every G-buffer vertex read them over PCIe - 6 fps. Written by the
+		// CPU, read by the GPU: device-local host-visible memory (ReBAR) first, system memory only without it.)
+		allocate.usage         = g_host_readback ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+		allocate.flags         = (g_host_readback ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+		                                          : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT) |
+		                         VMA_ALLOCATION_CREATE_MAPPED_BIT;
 		allocate.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 	}
 	VmaAllocationInfo info {};
@@ -141,7 +151,7 @@ struct State {
 	vk::DeviceAddress            tlas_address = 0;
 	bool                         tlas_built = false;
 	vk::DeviceSize scratch_align = 256;
-	vk::Pipeline       gather = nullptr, debug = nullptr;
+	vk::Pipeline       gather = nullptr, debug = nullptr, debug11 = nullptr;
 	vk::PipelineLayout gather_layout = nullptr, debug_layout = nullptr;
 	vk::DescriptorSetLayout debug_set_layout = nullptr;
 	vk::QueryPool pool = nullptr;
@@ -150,6 +160,7 @@ struct State {
 	std::unordered_map<VkShaderModule, VkShaderModule> modules;
 	// The frame being recorded.
 	uint64_t frame = 1;
+	uint32_t refits_frame = 0;
 	uint32_t slot = 0, next_record = NullRecords, captured = 0, builds = 0, build_tris = 0, checks = 0;
 	std::vector<Job> jobs;
 	std::vector<std::pair<uint64_t, uint32_t>> check_keys[Slots]; // (key, result index) per slot
@@ -209,7 +220,9 @@ bool Init(GraphicContext& graphics) {
 	for (uint32_t s = 0; s < Slots && ok; ++s) {
 		ok = ok && MakeBuffer(graphics, g.instances[s], vk::DeviceSize {MaxInstances} * sizeof(VkAccelerationStructureInstanceKHR), as_input, true);
 		ok = ok && MakeBuffer(graphics, g.materials[s], vk::DeviceSize {MaxInstances} * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+		g_host_readback = true;
 		ok = ok && MakeBuffer(graphics, g.results[s], vk::DeviceSize {MaxChecks} * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+		g_host_readback = false;
 	}
 	if (ok) {
 		std::memset(g.records.mapped, 0, static_cast<size_t>(g.records.size));
@@ -257,6 +270,8 @@ bool Init(GraphicContext& graphics) {
 				Say("the debug view's pipeline could not be made: no debug view");
 				g.debug = nullptr;
 			}
+			if (g.debug != nullptr && !MakeCompute(graphics, HWRT_DEBUG11_SPV, sizeof(HWRT_DEBUG11_SPV), g.debug_layout, g.debug11))
+				g.debug11 = nullptr;
 		}
 	}
 	if (!ok) {
@@ -947,8 +962,8 @@ uint32_t Reserve(uint32_t count) {
 	return slot_base + first;
 }
 
-void Note(uint32_t record, const Draw& d) {
-	if (!g.ready || g_graphics == nullptr) return;
+bool Note(uint32_t record, const Draw& d) {
+	if (!g.ready || g_graphics == nullptr) return false;
 	const auto start = std::chrono::steady_clock::now();
 	if ((++g.notes & 255u) == 0) MaybeLog();
 	++g.draws_seen;
@@ -956,7 +971,7 @@ void Note(uint32_t record, const Draw& d) {
 	if (record >= MaxRecords * Slots || record < slot_base + NullRecords) {
 		++g.skips[static_cast<uint32_t>(Skip::Records)];
 		g.cpu_note_ms += Ms(start);
-		return;
+		return false;
 	}
 	auto&          rec = static_cast<Record*>(g.records.mapped)[record];
 	const uint64_t key = Mix(Mix(Mix(Mix(Mix(d.vs, d.index_address), uint64_t {d.index_count} << 32u | d.instance_count),
@@ -966,14 +981,14 @@ void Note(uint32_t record, const Draw& d) {
 	if (d.index_count < 3 || d.instance_count == 0 || d.index_address == 0) {
 		++g.skips[static_cast<uint32_t>(Skip::Topology)];
 		g.cpu_note_ms += Ms(start);
-		return;
+		return false;
 	}
 	auto found = g.entries.find(key);
 	if (found == g.entries.end()) {
 		if (g.entries.size() >= MaxEntries) {
 			++g.skips[static_cast<uint32_t>(Skip::Entries)];
 			g.cpu_note_ms += Ms(start);
-			return;
+			return false;
 		}
 		found = g.entries.emplace(key, Entry {}).first;
 		auto& e = found->second;
@@ -985,7 +1000,7 @@ void Note(uint32_t record, const Draw& d) {
 	if (e.capture_frame == g.frame) { // (drawn twice this frame: the first draw's capture serves)
 		++g.draws_reused;
 		g.cpu_note_ms += Ms(start);
-		return;
+		return false;
 	}
 	Job job;
 	job.entry = &e;
@@ -995,19 +1010,21 @@ void Note(uint32_t record, const Draw& d) {
 		if (g.builds >= BuildsPerFrame() || g.build_tris + tris > BuildTrisPerFrame()) {
 			++g.skips[static_cast<uint32_t>(Skip::Budget)];
 			g.cpu_note_ms += Ms(start);
-			return;
+			return false;
 		}
 		if (!e.created && !CreateEntry(*g_graphics, e, d)) {
 			++g.skips[static_cast<uint32_t>(Skip::Topology)];
 			g.entries.erase(found);
 			g.cpu_note_ms += Ms(start);
-			return;
+			return false;
 		}
 		++g.builds;
 		g.build_tris += e.tris;
 		job.build = true;
-	} else if (e.dynamic) {
+	} else if (e.dynamic && ((g.frame + e.id) % RefitInterval()) == 0 && g.refits_frame < RefitsPerFrame()) {
+		// (A moving mesh: refit every KYTY_HWRT_REFIT_EVERY frames (4), at most KYTY_HWRT_REFITS (64) a frame.)
 		job.refit = true;
+		++g.refits_frame;
 	} else if (g.frame >= e.next_check && g.checks < MaxChecks) {
 		job.mode   = Mode::Compare;
 		job.result = g.checks++;
@@ -1015,7 +1032,7 @@ void Note(uint32_t record, const Draw& d) {
 	} else {
 		++g.draws_reused;
 		g.cpu_note_ms += Ms(start);
-		return;
+		return false;
 	}
 	const uint32_t need = e.window * e.instances;
 	if (g.captured + need > MaxCapture) {
@@ -1023,7 +1040,7 @@ void Note(uint32_t record, const Draw& d) {
 		if (job.mode == Mode::Compare) --g.checks;
 		++g.skips[static_cast<uint32_t>(Skip::Records)];
 		g.cpu_note_ms += Ms(start);
-		return;
+		return false;
 	}
 	rec.base      = g.captured;
 	rec.window    = e.window;
@@ -1034,6 +1051,7 @@ void Note(uint32_t record, const Draw& d) {
 	g.jobs.push_back(job);
 	++g.draws_captured;
 	g.cpu_note_ms += Ms(start);
+	return true;
 }
 
 void NoteCamera(uint64_t vs_hash, std::span<const uint32_t> srt) {
@@ -1389,7 +1407,7 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 	++g.frame;
 	g.slot        = (g.slot + 1) % Slots;
 	g.next_record = NullRecords;
-	g.captured = g.builds = g.build_tris = g.checks = 0;
+	g.captured = g.builds = g.build_tris = g.checks = g.refits_frame = 0;
 	g.have_camera = false;
 	g.cpu_after_ms += Ms(start);
 	MaybeLog();
@@ -1399,11 +1417,12 @@ void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageVie
 	if (!Active() || DebugMode() == 0) return;
 	std::lock_guard lock(g.mutex);
 	if (!g.ready || g.debug == nullptr || !g.tlas_built || !g_frame_camera || view == nullptr) return;
-	if (format != vk::Format::eR16G16B16A16Sfloat) {
+	const bool r11 = format == vk::Format::eB10G11R11UfloatPack32;
+	if (format != vk::Format::eR16G16B16A16Sfloat && !(r11 && g.debug11 != nullptr)) {
 		static bool said = false;
 		if (!said) {
 			said = true;
-			std::printf("HWRT: debug view target format %d is not RGBA16F: no debug view\n", static_cast<int>(format));
+			std::printf("HWRT: debug view target format %d is neither RGBA16F nor B10G11R11: no debug view\n", static_cast<int>(format));
 			std::fflush(stdout);
 		}
 		return;
@@ -1415,7 +1434,7 @@ void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageVie
 	push.width  = extent.width;
 	push.height = extent.height;
 	push.mode   = DebugMode();
-	const vk::Pipeline       pipeline = g.debug;
+	const vk::Pipeline       pipeline = r11 ? g.debug11 : g.debug;
 	const vk::PipelineLayout layout   = g.debug_layout;
 	const auto tlas     = std::make_shared<vk::AccelerationStructureKHR>(g.tlas);
 	(void)graphics;

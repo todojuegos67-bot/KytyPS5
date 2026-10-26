@@ -2283,8 +2283,73 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	}
 	if (hwrt_capture) HwScene::NoteCamera(pair.programs[0]->shader_hash,
 	                                      std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
+	if (hwrt_capture) {
+		// (A program's push data reaching the cursor's dword: drawn uncaptured.)
+		uint32_t reach = 0;
+		for (uint32_t st = 0; st < stages; ++st) {
+			const auto& bindings = pair.programs[st]->bindings;
+			if (bindings.UsesPushData()) reach = std::max(reach, bindings.push_data_start_dword + bindings.ShaderDataDwords());
+		}
+		if (reach > HwScene::CursorDword) {
+			HwScene::NoteSkip(HwScene::Skip::PushData, direct != nullptr ? 1u : static_cast<uint32_t>(commands.size()));
+			hwrt_capture = false;
+		}
+	}
+	// The call's meshes noted before the pipeline is chosen: a call none of whose draws is captured this frame (a cached
+	// mesh: most of them) takes the game's own pipeline (10-26: the capture variant on every G-buffer draw, reading its
+	// record per vertex, was most of a 6 fps frame).
+	uint32_t                 hwrt_direct_cursor = 0;
+	std::array<uint32_t, 64> hwrt_cursors {};
+	if (hwrt_capture) {
+		const uint64_t hwrt_index_size = index_type == vk::IndexType::eUint32 ? 4u : 2u;
+		const auto     hwrt_note       = [&](uint32_t record, uint32_t index_count, uint32_t instance_count, uint32_t first_index,
+                                    int32_t vertex_offset) -> bool {
+			HwScene::Draw d;
+			d.vs             = pair.programs[0]->shader_hash;
+			d.ps             = variant.hwrt_ps;
+			d.index_size     = static_cast<uint32_t>(hwrt_index_size);
+			d.index_count    = index_count;
+			d.instance_count = instance_count;
+			d.vertex_offset  = vertex_offset;
+			const uint64_t begin = index_base + uint64_t {first_index} * hwrt_index_size;
+			if (indexed && buffer_cache.IsRegionGpuModified(begin, uint64_t {index_count} * hwrt_index_size)) {
+				HwScene::NoteSkip(HwScene::Skip::GpuWritten);
+				return false;
+			}
+			d.index_address = indexed && index_base != 0 && begin + uint64_t {index_count} * hwrt_index_size <= index_base + index_bytes
+			                      ? begin
+			                      : 0;
+			return HwScene::Note(record, d);
+		};
+		bool any = false;
+		if (direct != nullptr) {
+			hwrt_direct_cursor = HwScene::Reserve(1);
+			const auto& vertex = *pair.programs[0];
+			const auto  word   = [&](int32_t sgpr) {
+                const auto index = int64_t {sgpr} - vertex.user_data_base;
+                return index >= 0 && index < static_cast<int64_t>(user_data[0].size()) ? user_data[0][index] : 0u;
+			};
+			const uint32_t index_offset  = buffer.GetUserConfig().GetIndexOffset();
+			const uint32_t vertex_offset = variant.fetch_embedded && index_offset == 0 ? word(vertex.info.vertex_offset_sgpr) : index_offset;
+			if (indexed) any |= hwrt_note(hwrt_direct_cursor, direct->index_count, direct->instance_count, 0, static_cast<int32_t>(vertex_offset));
+			else HwScene::NoteSkip(HwScene::Skip::Topology);
+		}
+		for (uint32_t group = 0, first_command = 0; group < groups; first_command += group_sizes[group], ++group) {
+			// Each indirect draw's arguments as the game's CPU wrote them (guest memory): the mesh's counts and offsets.
+			hwrt_cursors[group] = HwScene::Reserve(group_sizes[group]);
+			for (uint32_t i = 0; i < group_sizes[group]; ++i) {
+				if (buffer_cache.IsRegionGpuModified(commands[first_command + i], stride)) {
+					HwScene::NoteSkip(HwScene::Skip::GpuWritten);
+					continue;
+				}
+				const auto* args = reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(commands[first_command + i]);
+				any |= hwrt_note(hwrt_cursors[group] + i, args->indexCount, args->instanceCount, args->firstIndex, args->vertexOffset);
+			}
+		}
+		hwrt_capture = any;
+	}
 	const auto& pipeline = hwrt_capture ? *variant.hwrt_pipeline : *variant.pipeline;
-	const PipelineCache::Pipeline* bound_pipeline = &pipeline; // (the game's own after a capture's fallback below)
+	const PipelineCache::Pipeline* bound_pipeline = &pipeline;
 	if (!same_command || emit.pipeline != &pipeline)
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, BindPipelineHandle(pipeline));
 	if (!same_command || emit.pipeline != &pipeline || table.last_set != set)
@@ -2313,54 +2378,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		                        vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 		                        push_dwords * sizeof(uint32_t), push_data.dwords.data());
 	if (!same_index) vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
-	if (hwrt_capture && push_dwords > HwScene::CursorDword) {
-		// (A program's push data reaches the cursor's dword: drawn uncaptured, with the game's pipeline.)
-		HwScene::NoteSkip(HwScene::Skip::PushData, direct != nullptr ? 1u : static_cast<uint32_t>(commands.size()));
-		hwrt_capture = false;
-		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, BindPipelineHandle(*variant.pipeline));
-		bound_pipeline = variant.pipeline;
-	}
-	// The draw's mesh for the capture: its first index in guest memory (within the bound index range), counts, offset.
-	const uint64_t hwrt_index_size = index_type == vk::IndexType::eUint32 ? 4u : 2u;
-	const auto     hwrt_note       = [&](uint32_t record, uint32_t index_count, uint32_t instance_count, uint32_t first_index,
-                                int32_t vertex_offset) {
-		HwScene::Draw d;
-		d.vs             = pair.programs[0]->shader_hash;
-		d.ps             = variant.hwrt_ps;
-		d.index_size     = static_cast<uint32_t>(hwrt_index_size);
-		d.index_count    = index_count;
-		d.instance_count = instance_count;
-		d.vertex_offset  = vertex_offset;
-		const uint64_t begin = index_base + uint64_t {first_index} * hwrt_index_size;
-		if (indexed && buffer_cache.IsRegionGpuModified(begin, uint64_t {index_count} * hwrt_index_size)) {
-			HwScene::NoteSkip(HwScene::Skip::GpuWritten);
-			return;
-		}
-		d.index_address      = indexed && index_base != 0 && begin + uint64_t {index_count} * hwrt_index_size <= index_base + index_bytes
-		                           ? begin
-		                           : 0;
-		HwScene::Note(record, d);
+	const auto push_cursor = [&](uint32_t cursor) {
+		vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+		                        HwScene::CursorDword * sizeof(uint32_t), sizeof(uint32_t), &cursor);
 	};
-	if (hwrt_capture) {
-		// The cursor of the draw call that follows (gl_DrawID counts from 0 in each call).
-		const auto push_cursor = [&](uint32_t cursor) {
-			vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
-			                        HwScene::CursorDword * sizeof(uint32_t), sizeof(uint32_t), &cursor);
-		};
-		if (direct != nullptr) {
-			const uint32_t cursor = HwScene::Reserve(1);
-			push_cursor(cursor);
-			const auto& vertex = *pair.programs[0];
-			const auto  word   = [&](int32_t sgpr) {
-                const auto index = int64_t {sgpr} - vertex.user_data_base;
-                return index >= 0 && index < static_cast<int64_t>(user_data[0].size()) ? user_data[0][index] : 0u;
-			};
-			const uint32_t index_offset  = buffer.GetUserConfig().GetIndexOffset();
-			const uint32_t vertex_offset = variant.fetch_embedded && index_offset == 0 ? word(vertex.info.vertex_offset_sgpr) : index_offset;
-			if (indexed) hwrt_note(cursor, direct->index_count, direct->instance_count, 0, static_cast<int32_t>(vertex_offset));
-			else HwScene::NoteSkip(HwScene::Skip::Topology);
-		}
-	}
+	if (hwrt_capture && direct != nullptr) push_cursor(hwrt_direct_cursor);
 	if (direct != nullptr) {
 		// This draw's offsets, as the normal path's ResolveVertexOffset/ResolveInstanceOffset give them: the index
 		// offset register, else (a vertex program that fetches) the user data its fetch adds.
@@ -2380,20 +2402,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			vk_buffer.draw(direct->index_count, direct->instance_count, vertex_offset, first_instance);
 	}
 	for (uint32_t group = 0, first_command = 0; group < groups; first_command += group_sizes[group], ++group) {
-		if (hwrt_capture) {
-			// Each indirect draw's arguments as the game's CPU wrote them (guest memory): the mesh's counts and offsets.
-			const uint32_t cursor = HwScene::Reserve(group_sizes[group]);
-			vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
-			                        HwScene::CursorDword * sizeof(uint32_t), sizeof(uint32_t), &cursor);
-			for (uint32_t i = 0; i < group_sizes[group]; ++i) {
-				if (buffer_cache.IsRegionGpuModified(commands[first_command + i], stride)) {
-					HwScene::NoteSkip(HwScene::Skip::GpuWritten);
-					continue;
-				}
-				const auto* args = reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(commands[first_command + i]);
-				hwrt_note(cursor + i, args->indexCount, args->instanceCount, args->firstIndex, args->vertexOffset);
-			}
-		}
+		if (hwrt_capture) push_cursor(hwrt_cursors[group]);
 		vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second, group_sizes[group],
 		                              static_cast<uint32_t>(stride));
 	}

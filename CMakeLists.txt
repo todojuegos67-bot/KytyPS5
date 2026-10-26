@@ -534,15 +534,21 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${rtsun_header}")
 # KYTY_HWRT (src/local/hwrt-scene.cpp): the scene capture's world-space gather and the ray query debug view.
-foreach(hwrt_shader gather debug)
+foreach(hwrt_shader gather debug debug11)
 	string(TOUPPER "${hwrt_shader}" hwrt_upper)
 	set(hwrt_source "${KYTY_SOURCE_DIR}/local/hwrt-${hwrt_shader}.comp")
+	set(hwrt_defines "")
+	if(hwrt_shader STREQUAL "debug11")
+		# (the same view into a B10G11R11 target: the PS5 Pro path's FSR output)
+		set(hwrt_source "${KYTY_SOURCE_DIR}/local/hwrt-debug.comp")
+		set(hwrt_defines "-DKYTY_FMT_R11")
+	endif()
 	set(hwrt_spv "${gpu_tiler_generated_dir}/hwrt_${hwrt_shader}.spv")
 	set(hwrt_header "${gpu_tiler_generated_dir}/hwrt_${hwrt_shader}_spv.h")
 	add_custom_command(
 		OUTPUT "${hwrt_header}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
-		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os ${hwrt_defines}
 		        -o "${hwrt_spv}" "${hwrt_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${hwrt_spv} -DOUTPUT=${hwrt_header}
 		        -DSYMBOL=HWRT_${hwrt_upper}_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
