@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <mutex>
 #include <unordered_set>
 
@@ -347,6 +348,14 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 	}
 
 	const auto validation_result = ValidateDecoderConfig(config, true);
+	{
+		char extra[160];
+		std::snprintf(extra, sizeof(extra), "codec=%u resource=%u profile=%u %dx%d dpb=%d depth=%u",
+		              config->codec_type, config->resource_type, config->profile,
+		              config->max_frame_width, config->max_frame_height, config->max_dpb_frame_count,
+		              config->decode_input_queue_depth);
+		Decoder::Trace("Videodec2.CreateDecoder", validation_result, nullptr, extra);
+	}
 	if (validation_result != OK) {
 		return validation_result;
 	}
@@ -443,7 +452,12 @@ static int32_t KYTY_SYSV_ABI Decode(Videodec2Decoder decoder, const Videodec2Inp
 	                     input_data->dts_data, input_data->attached_data},
 	                    {frame_buffer->frame_buffer, frame_buffer->frame_buffer_size}, &decoded);
 	ApplyDecodedOutput(decoded, frame_buffer, output_info);
-	return MapDecoderResult(result);
+	const int32_t mapped = MapDecoderResult(result);
+	char extra[96];
+	std::snprintf(extra, sizeof(extra), "au=%zu fb=%p fb_size=%zu", input_data->au_size,
+	              frame_buffer->frame_buffer, frame_buffer->frame_buffer_size);
+	Decoder::Trace("Videodec2.Decode", mapped, &decoded, extra);
+	return mapped;
 }
 
 static int32_t KYTY_SYSV_ABI Flush(Videodec2Decoder decoder, Videodec2FrameBuffer* frame_buffer,
@@ -479,7 +493,9 @@ static int32_t KYTY_SYSV_ABI Flush(Videodec2Decoder decoder, Videodec2FrameBuffe
 	const auto      result = Decoder::Flush(
 	    state, {frame_buffer->frame_buffer, frame_buffer->frame_buffer_size}, &decoded);
 	ApplyDecodedOutput(decoded, frame_buffer, output_info);
-	return MapDecoderResult(result);
+	const int32_t mapped = MapDecoderResult(result);
+	Decoder::Trace("Videodec2.Flush", mapped, &decoded);
+	return mapped;
 }
 
 static int32_t KYTY_SYSV_ABI Reset(Videodec2Decoder decoder) {

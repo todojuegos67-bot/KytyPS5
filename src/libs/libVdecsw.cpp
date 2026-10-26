@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <mutex>
 #include <new>
@@ -288,7 +289,16 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const ConfigInfo* config, Me
 static int32_t KYTY_SYSV_ABI CreateDecoder(const ConfigInfo* config, const MemoryInfo* memory,
                                            State** output) {
 	PRINT_NAME();
-	if (const auto error = ValidateConfig(config); error != 0) return error;
+	if (const auto error = ValidateConfig(config); error != 0) {
+		Decoder::Trace("Vdecsw.CreateDecoder", error, nullptr, "invalid config");
+		return error;
+	}
+	{
+		char extra[96];
+		std::snprintf(extra, sizeof(extra), "codec=%u %dx%d", config->codec_type, config->max_width,
+		              config->max_height);
+		Decoder::Trace("Vdecsw.CreateDecoder", 0, nullptr, extra);
+	}
 	if (memory == nullptr || output == nullptr) return Fail(Error::ArgumentPointer);
 	if (memory->this_size != sizeof(MemoryInfo)) return Fail(Error::StructSize);
 	if (memory->cpu_memory_size < sizeof(State)) return Fail(Error::MemorySize);
@@ -336,6 +346,7 @@ static int32_t KYTY_SYSV_ABI SetDecodeInput(State* handle, const InputData* inpu
 	const auto result   = Decoder::Submit(
 	    state->decoder,
 	    {input->au_data, input->au_size, input->pts, input->dts, input->attached_data}, &produced);
+	Decoder::Trace("Vdecsw.SetDecodeInput", result == Decoder::Result::Ok ? 0 : Result(result), nullptr);
 	if (result != Decoder::Result::Ok) return Result(result);
 	if (!config.disable_sync_input)
 		state->completed_inputs.push_back({sizeof(InputResult), input->au_data, produced, 0});
@@ -383,6 +394,9 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(State* handle, OutputInfo* outp
 	const auto&     buffer = *state->output_buffer;
 	Decoder::Output decoded {};
 	const auto      result = Decoder::Receive(state->decoder, {buffer.data, buffer.size}, &decoded);
+	if (result != Decoder::Result::NoFrame)
+		Decoder::Trace("Vdecsw.TrySyncDecodeOutput", result == Decoder::Result::Ok ? 0 : Result(result),
+		               &decoded);
 	if (result != Decoder::Result::Ok) return Result(result);
 	*output = {sizeof(OutputInfo),
 	           true,

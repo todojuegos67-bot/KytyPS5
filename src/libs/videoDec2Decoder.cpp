@@ -11,6 +11,9 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <atomic>
+#include <cstdio>
+#include <string>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -475,6 +478,43 @@ bool GetPictureInfo(void* frame_buffer, PictureInfo* picture_info) {
 	}
 	*picture_info = it->second.info;
 	return true;
+}
+
+void Trace(const char* site, int32_t result, const Output* output, const char* extra) {
+	struct Counter {
+		std::atomic<uint32_t> calls {0};
+		std::atomic<uint32_t> fails {0};
+		std::atomic<uint32_t> frames {0};
+	};
+	static std::mutex                                 mutex;
+	static std::unordered_map<std::string, Counter*> counters;
+	Counter*                                          counter = nullptr;
+	{
+		std::scoped_lock lock(mutex);
+		auto&            slot = counters[site];
+		if (slot == nullptr) slot = new Counter;
+		counter = slot;
+	}
+	const auto call   = counter->calls.fetch_add(1, std::memory_order_relaxed);
+	const bool frame  = output != nullptr && output->valid;
+	const auto frames = frame ? counter->frames.fetch_add(1, std::memory_order_relaxed) + 1
+	                          : counter->frames.load(std::memory_order_relaxed);
+	bool print = call < 24u || (call % 512u) == 0u;
+	if (result != 0 && counter->fails.fetch_add(1, std::memory_order_relaxed) < 64u) print = true;
+	if (!print) return;
+	if (output != nullptr) {
+		std::printf("Movie: %s #%u result=0x%08x frames=%u valid=%d err=%d last=%d accepted=%d "
+		            "codec=%u %ux%u pitch=%u buffer=%p size=%zu%s%s\n",
+		            site, call, static_cast<uint32_t>(result), frames, output->valid ? 1 : 0,
+		            output->error_frame ? 1 : 0, output->last_frame ? 1 : 0,
+		            output->buffer_accepted ? 1 : 0, output->codec_type, output->width,
+		            output->height, output->pitch, output->buffer, output->buffer_size,
+		            extra != nullptr ? " " : "", extra != nullptr ? extra : "");
+	} else {
+		std::printf("Movie: %s #%u result=0x%08x%s%s\n", site, call, static_cast<uint32_t>(result),
+		            extra != nullptr ? " " : "", extra != nullptr ? extra : "");
+	}
+	std::fflush(stdout);
 }
 
 } // namespace Libs::VideoDec2::Decoder
