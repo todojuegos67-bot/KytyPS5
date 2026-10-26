@@ -167,7 +167,11 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
                          const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
-	if (!Config::ShaderValidationEnabled()) {
+	static const bool runtime_stride = [] {
+		const char* v = std::getenv("KYTY_RUNTIME_STRIDE");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	if (!Config::ShaderValidationEnabled() && !runtime_stride) {
 		return true;
 	}
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);

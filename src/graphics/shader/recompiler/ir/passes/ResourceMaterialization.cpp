@@ -7,6 +7,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <bit>
 #include <cstdio>
@@ -765,7 +766,14 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		// Rounded up to a multiple of 4 (min 4): extra binary-search steps are no-ops once
 		// low == high, and a table growing from 3 to 9 keys no longer changes the SPIR-V
 		// (Yotei: "it 2/3/4" were most of the permutation misses of 0x4039/0x1740/0x6cc6).
-		root.indirect_search_iterations = std::max<uint32_t>(4u, (static_cast<uint32_t>(std::bit_width(key_count)) + 3u) & ~3u);
+		// KYTY_ROUND_SEARCH=1 (default off until a test run shows it is safe on the driver).
+		static const bool round_search = [] {
+			const char* v = std::getenv("KYTY_ROUND_SEARCH");
+			return v != nullptr && std::strcmp(v, "1") == 0;
+		}();
+		root.indirect_search_iterations = round_search
+		    ? std::max<uint32_t>(4u, (static_cast<uint32_t>(std::bit_width(key_count)) + 3u) & ~3u)
+		    : static_cast<uint32_t>(std::bit_width(key_count));
 	}
 	return true;
 }
@@ -1650,9 +1658,17 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	// Raw bindless buffer tables: the per-ordinal packed strides are also published in the
 	// flattened SRT, so the emitter can index one descriptor array with a runtime stride instead
 	// of a switch over every candidate at every access (Yotei: 200-485K-word compute shaders).
+	// KYTY_RUNTIME_STRIDE=1 (default off): b0a4787 enabled it unconditionally and a Yotei compute
+	// pipeline then crashed the driver (null read in vkCreateComputePipelines); with it on, every
+	// shader is run through the SPIR-V validator first.
+	static const bool runtime_stride_enabled = [] {
+		const char* v = std::getenv("KYTY_RUNTIME_STRIDE");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
 	for (uint32_t root = 0; root < program.info.buffers.size() && root < specialization.buffers.size(); ++root) {
 		auto& root_spec = specialization.buffers[root];
 		root_spec.runtime_stride_offset = UINT32_MAX;
+		if (!runtime_stride_enabled) continue;
 		if (root_spec.indirect_root != root || program.info.buffers[root].formatted) continue;
 		// Only tables whose candidates differ in nothing but a nonzero stride (an empty root,
 		// ordinal 0 with stride 0, is kept apart as the emitter does). Their strides are then
