@@ -673,17 +673,57 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
+vk::PipelineCache PipelineCache::AsyncJobCache() {
+	if (m_driver_cache == nullptr || !AsyncOwnCache()) return m_driver_cache;
+	vk::PipelineCacheCreateInfo info {};
+	vk::PipelineCache cache = nullptr;
+	if (m_graphics.device.createPipelineCache(&info, nullptr, &cache) != vk::Result::eSuccess) {
+		return m_driver_cache;
+	}
+	return cache;
+}
+
+void PipelineCache::FinishAsyncJobCache(vk::PipelineCache cache) {
+	if (cache == nullptr || cache == m_driver_cache) return;
+	std::lock_guard lock(m_async_compute->mutex);
+	m_async_compute->merge.push_back(cache);
+}
+
+void PipelineCache::MergeAsyncJobCaches() {
+	if (m_async_compute == nullptr || m_driver_cache == nullptr) return;
+	std::vector<vk::PipelineCache> caches;
+	{
+		std::lock_guard lock(m_async_compute->mutex);
+		caches.swap(m_async_compute->merge);
+	}
+	if (caches.empty()) return;
+	(void)m_graphics.device.mergePipelineCaches(m_driver_cache, static_cast<uint32_t>(caches.size()),
+	                                            caches.data());
+	for (auto cache: caches) m_graphics.device.destroyPipelineCache(cache, nullptr);
+	m_driver_cache_dirty = true;
+}
+
 void PipelineCache::CheckpointDriverCache() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	MergeAsyncJobCaches();
 	m_driver_cache_dirty = true;
 	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
-		Save();
+		SaveInternal(true);
 	}
 }
 
 void PipelineCache::Save() {
+	SaveInternal(false);
+}
+
+// The periodic save hashed and wrote ~700 MB on the render thread every 5 minutes (a multi-second
+// hitch in Yotei). Only vkGetPipelineCacheData stays on the render thread; hashing and the file
+// write run on a background thread. Exit/explicit saves still finish before returning.
+void PipelineCache::SaveInternal(bool background) {
+	if (m_save_thread.joinable()) m_save_thread.join();
+	MergeAsyncJobCaches();
 	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
 		return;
 	}
@@ -712,7 +752,21 @@ void PipelineCache::Save() {
 		return;
 	}
 	payload.resize(size);
-	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	m_driver_cache_dirty = false;
+	auto prefix = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	auto write  = [path = m_driver_cache_path, prefix = std::move(prefix),
+	               payload = std::move(payload)]() mutable {
+		WriteDriverCacheFile(path, prefix, payload);
+	};
+	if (background) {
+		m_save_thread = std::thread(std::move(write));
+	} else {
+		write();
+	}
+}
+
+void PipelineCache::WriteDriverCacheFile(const std::filesystem::path& m_driver_cache_path,
+                                         std::string prefix, const std::vector<uint8_t>& payload) {
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
@@ -743,7 +797,6 @@ void PipelineCache::Save() {
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
-	m_driver_cache_dirty = false;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -926,7 +979,24 @@ struct PipelineCache::AsyncCompute {
 	                                                         graphics_done;
 	std::vector<std::thread>                                 threads;
 	bool                                                     stop = false;
+	// Per-job driver caches waiting to be merged into the shared one (render thread only).
+	std::vector<vk::PipelineCache>                           merge;
 };
+
+// Background compiles used to pass the shared VkPipelineCache. A 20-40 s compile of a 400K-700K
+// word Yotei compute shader then shared the cache with the render thread's synchronous compiles,
+// and the game ran at 0.1-0.8 fps while those jobs were in flight (heartbeat 10-26 02:29) with the
+// CPU ~7% busy, i.e. waiting rather than working. Each job now compiles into its own empty cache,
+// merged into the shared one when the result is picked up. These shaders took 15-30 s every run
+// despite a 700 MB cache, so lookups for them gain nothing from the shared cache.
+// KYTY_ASYNC_SHARED_CACHE=1 restores the shared cache.
+static bool AsyncOwnCache() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_ASYNC_SHARED_CACHE");
+		return v == nullptr || v[0] != '1';
+	}();
+	return on;
+}
 
 static uint64_t AsyncComputeWords() {
 	static const uint64_t words = [] {
@@ -1189,10 +1259,12 @@ PipelineCache::Pipeline* PipelineCache::GraphicsPipelineImpl(
 		            static_cast<unsigned long long>(total_words));
 		EnqueueAsync([this, job] {
 			auto       pipeline = std::make_unique<Pipeline>();
+			const auto job_cache = AsyncJobCache();
 			const auto start    = std::chrono::steady_clock::now();
 			CreatePipelineInternal(m_graphics, *pipeline, job->key.rendering, job->key.vertex_input,
 			                       job->vertex_info, job->ps_active ? &job->ps_input_info : nullptr,
-			                       job->programs, job->key.static_params, m_driver_cache);
+			                       job->programs, job->key.static_params, job_cache);
+			FinishAsyncJobCache(job_cache);
 			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 			                    std::chrono::steady_clock::now() - start)
 			                    .count();
@@ -1293,6 +1365,7 @@ void PipelineCache::StopAsyncCompute() {
 	}
 	async.done.clear();
 	async.graphics_done.clear();
+	MergeAsyncJobCaches();
 	m_async_compute.reset();
 }
 
@@ -1382,7 +1455,9 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	            static_cast<unsigned long long>(compute_program.spirv_words));
 	EnqueueAsync([this, pipeline, job, id] {
 		const auto start = std::chrono::steady_clock::now();
-		CreateComputePipelineObject(m_graphics, **pipeline, *job, m_driver_cache);
+		const auto job_cache = AsyncJobCache();
+		CreateComputePipelineObject(m_graphics, **pipeline, *job, job_cache);
+		FinishAsyncJobCache(job_cache);
 		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		                    std::chrono::steady_clock::now() - start)
 		                    .count();
