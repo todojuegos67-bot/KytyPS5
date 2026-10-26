@@ -360,9 +360,25 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 				state.runtime_packed_stride = saved;
 			}
 		}
+		// A runtime-stride table whose slots are not one array still needs the real stride per
+		// candidate (the specialization holds a normalized one).
+		const bool table_strides = buffer.runtime_stride_offset != UINT32_MAX && state.flattened_srt_variable != 0;
 		return EmitIndexSwitch(state, selected, buffer.indirect_resources.size(),
 		                       has_result ? TypeU32Composite(state, components) : 0u,
-		                       [&](uint32_t item) { return access(buffer.indirect_resources[item]); });
+		                       [&](uint32_t item) {
+			                       const auto saved = state.runtime_packed_stride;
+			                       if (table_strides && !(item == 0u && buffer.packed_stride == 0u))
+				                       state.runtime_packed_stride = EmitFlattenedSrtLoad(state,
+				                           ConstantU32(state, buffer.runtime_stride_offset + item));
+			                       if constexpr (has_result) {
+				                       const auto result = access(buffer.indirect_resources[item]);
+				                       state.runtime_packed_stride = saved;
+				                       return result;
+			                       } else {
+				                       access(buffer.indirect_resources[item]);
+				                       state.runtime_packed_stride = saved;
+			                       }
+		                       });
 	};
 	if constexpr (!has_result) {
 		if (!shared) return selected_access();

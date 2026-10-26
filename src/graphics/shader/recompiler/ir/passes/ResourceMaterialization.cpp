@@ -1654,13 +1654,33 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		auto& root_spec = specialization.buffers[root];
 		root_spec.runtime_stride_offset = UINT32_MAX;
 		if (root_spec.indirect_root != root || program.info.buffers[root].formatted) continue;
+		// Only tables whose candidates differ in nothing but a nonzero stride (an empty root,
+		// ordinal 0 with stride 0, is kept apart as the emitter does). Their strides are then
+		// normalized in the specialization, so a stride change no longer makes a new permutation.
 		uint32_t candidates = 0;
-		for (const auto& candidate: specialization.buffers)
-			if (candidate.indirect_root == root) ++candidates;
-		if (candidates < 2u) continue;
+		const ResourceSpecialization::Buffer* reference = nullptr;
+		bool uniform = true;
+		for (uint32_t index = 0; index < specialization.buffers.size(); ++index) {
+			const auto& candidate = specialization.buffers[index];
+			if (candidate.indirect_root != root) continue;
+			const bool empty_root = index == root && candidate.packed_stride == 0u;
+			++candidates;
+			if (empty_root) continue;
+			if ((candidate.packed_stride & 0x3fffu) == 0u) uniform = false;
+			if (reference == nullptr) reference = &candidate;
+			else if ((candidate.packed_stride & ~0x3fffu) != (reference->packed_stride & ~0x3fffu) ||
+			         candidate.descriptor_format != reference->descriptor_format ||
+			         candidate.descriptor_swizzle != reference->descriptor_swizzle) uniform = false;
+		}
+		if (candidates < 2u || reference == nullptr || !uniform) continue;
+		const auto canonical = reference->packed_stride;
 		root_spec.runtime_stride_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
-		for (const auto& candidate: specialization.buffers)
-			if (candidate.indirect_root == root) snapshot.flattened_srt.push_back(candidate.packed_stride);
+		for (uint32_t index = 0; index < specialization.buffers.size(); ++index) {
+			auto& candidate = specialization.buffers[index];
+			if (candidate.indirect_root != root) continue;
+			snapshot.flattened_srt.push_back(candidate.packed_stride);
+			if (!(index == root && candidate.packed_stride == 0u)) candidate.packed_stride = canonical;
+		}
 	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());

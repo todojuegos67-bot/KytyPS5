@@ -353,6 +353,10 @@ struct PipelineCache::ProgramCache {
 		// (Ghost of Yotei: one CS translated 84 times, 400K+ word shaders 4-6 times, ~30 s of
 		// driver compile each). Identical SPIR-V reuses the module and shader id, so the
 		// already-created (or queued) pipeline is reused instead of compiled again.
+		if (options.stage == ShaderType::Compute && result.spirv.size() >= 20000u) {
+			std::printf("SpirvSize: cs hash=0x%016" PRIx64 " words=%zu\n", options.shader_hash, result.spirv.size());
+			std::fflush(stdout);
+		}
 		const SpirvKey spirv_key = HashSpirv(result.spirv);
 		if (const auto found = spirv_modules.find(spirv_key); found != spirv_modules.end()) {
 			if (options.dump_ir) {

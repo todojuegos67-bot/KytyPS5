@@ -172,12 +172,8 @@ bool SharedIndirectBufferRuntimeStride(const EmitterState& state, uint32_t resou
 	if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) return false;
 	const auto& buffers = state.program.info.buffers;
 	const auto& root    = buffers[resource];
-	if (root.runtime_stride_offset == UINT32_MAX) return false;
-	const auto first = root.packed_stride == 0u ? 1u : 0u;
-	const auto stride = buffers[root.indirect_resources[first]].packed_stride;
-	for (uint32_t ordinal = first; ordinal < root.indirect_resources.size(); ++ordinal)
-		if (buffers[root.indirect_resources[ordinal]].packed_stride != stride) return true;
-	return false;
+	// Materialization normalized the candidates' strides; the real ones are in the table.
+	return root.runtime_stride_offset != UINT32_MAX && state.flattened_srt_variable != 0;
 }
 
 uint32_t EmitFlattenedSrtLoad(EmitterState& state, uint32_t index) {
