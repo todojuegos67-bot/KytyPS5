@@ -90,7 +90,7 @@ float LightW(int i, vec3 p, vec3 n) {
 }
 
 // 1 occluded / 0 lit, toward light i from p.
-float Shadow(int i, vec3 p, vec3 n, float z, vec2 rnd) {
+float Shadow(int i, vec3 p, vec3 n, float z, vec2 rnd, bool smp) {
 	Light L   = lb.l[i];
 	// a point on the light's sphere (uniform in the disc facing the receiver): the penumbra
 	vec3  c   = L.pos_r.xyz;
@@ -105,10 +105,18 @@ float Shadow(int i, vec3 p, vec3 n, float z, vec2 rnd) {
 	float tmax = len - L.misc.w;
 	float tmin = 0.01 + 0.001 * z;
 	if (tmax <= tmin) return 0.0;
+	if (smp) atomicAdd(stats.s[3], 1u);
 	rayQueryEXT rq;
 	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xff, o, tmin, dv / len, tmax);
 	while (rayQueryProceedEXT(rq)) {}
-	return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT ? 1.0 : 0.0;
+	bool hit = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+	if (smp && hit) {
+		// (statistics: hits, and those within 0.5 m of the ray's end: the lamp's own mesh, a sign the skip is short)
+		float t = rayQueryGetIntersectionTEXT(rq, true);
+		atomicAdd(stats.s[4], 1u);
+		if (tmax - t < 0.5) atomicAdd(stats.s[5], 1u);
+	}
+	return hit ? 1.0 : 0.0;
 }
 
 void Trace(ivec2 pixel) {
@@ -134,6 +142,23 @@ void Trace(ivec2 pixel) {
 		imageStore(out_img, pixel, vec4(0.0, 0.0, 0.0, 0.0));
 		return;
 	}
+	bool smp = (pixel.x & 3) == 0 && (pixel.y & 3) == 0; // (statistics: 1 pixel in 16)
+	if (smp) {
+		atomicAdd(stats.s[8], 1u);
+		// The TLAS / camera alignment probe: a ray from the camera to this pixel's reconstructed position hits within
+		// 2 % (+ 0.1 m) of it when the depth's world and the TLAS's agree (the reflections' proof).
+		if ((pixel.x & 15) == 0 && (pixel.y & 15) == 0) {
+			vec3  e = lb.cam.xyz, dv = p - e;
+			float L = length(dv);
+			rayQueryEXT pq;
+			rayQueryInitializeEXT(pq, tlas, gl_RayFlagsOpaqueEXT, 0xff, e, 0.05, dv / max(L, 1e-4), L * 1.5 + 1.0);
+			while (rayQueryProceedEXT(pq)) {}
+			atomicAdd(stats.s[7], 1u);
+			if (rayQueryGetIntersectionTypeEXT(pq, true) == gl_RayQueryCommittedIntersectionTriangleEXT &&
+			    abs(rayQueryGetIntersectionTEXT(pq, true) - L) < 0.02 * L + 0.1)
+				atomicAdd(stats.s[6], 1u);
+		}
+	}
 	int   picks = push.misc.z >= 3 ? 2 : 1;
 	float f     = float(push.misc.y % 64);
 	float occ   = 0.0;
@@ -148,7 +173,7 @@ void Trace(ivec2 pixel) {
 			if (u < acc) break;
 		}
 		vec2 rnd = vec2(Ign(vec2(pixel.y, pixel.x) + f * 2.93 + float(k) * 37.0 + 3.0), Ign(vec2(pixel) + f * 7.13 + float(k) * 19.0 + 57.0));
-		occ += Shadow(sel, p, n, z, rnd);
+		occ += Shadow(sel, p, n, z, rnd, smp);
 	}
 	imageStore(out_img, pixel, vec4(occ / float(picks), W, 0.0, 1.0));
 }
@@ -220,7 +245,7 @@ void Composite(ivec2 pixel) {
 	vec2 uv  = (vec2(pixel) + 0.5) / RenderSize();
 	vec4 col = textureLod(color_tex, uv, 0);
 	float d  = textureLod(depth_tex, uv, 0).r;
-	float dark = 0.0;
+	float dark = 0.0, hcount = 0.0, raw_occ = 0.0, wsum = 0.0;
 	if (!IsSky(d)) {
 		// joint bilateral: the trace pixel of the 2x2 nearest in depth
 		vec3  p  = WorldPos(uv, d);
@@ -234,6 +259,7 @@ void Composite(ivec2 pixel) {
 			float dz  = abs(textureLod(gbuf_cur, suv, 0).w - z);
 			if (dz < best) best = dz, v = textureLod(src_tex, suv, 0);
 		}
+		hcount = v.g, raw_occ = v.r, wsum = v.b;
 		float stable = smoothstep(1.5, 8.0, v.g); // (the history count: a reset frame darkens nothing)
 		float share  = v.b / (v.b + lb.p0.z);
 		if (best < 0.05 * z + 0.1) dark = min(lb.p0.y * share * stable * clamp(v.r, 0.0, 1.0), lb.p0.w);
@@ -243,6 +269,8 @@ void Composite(ivec2 pixel) {
 	if ((pixel.x & 3) == 0 && (pixel.y & 3) == 0) { // (1 in 16 pixels)
 		atomicAdd(stats.s[0], 1u);
 		if (dark > 0.02) atomicAdd(stats.s[1], 1u), atomicAdd(stats.s[2], uint(dark * 1024.0));
+		// (the history count, lit pixels (W > 0), their filtered occlusion: where the darkening is lost)
+		if (wsum > 0.0) atomicAdd(stats.s[9], 1u), atomicAdd(stats.s[10], uint(min(hcount, 32.0))), atomicAdd(stats.s[11], uint(clamp(raw_occ, 0.0, 1.0) * 1024.0));
 	}
 }
 

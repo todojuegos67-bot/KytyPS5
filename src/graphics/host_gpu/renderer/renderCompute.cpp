@@ -342,7 +342,7 @@ private:
 	[[gnu::noinline]] void PrintLine(const PreparedBindings& bindings, RenderContext& context,
 	                                 const Common::SlotVector<Image>& images, uint32_t groups_x, uint32_t groups_y,
 	                                 uint32_t groups_z, uint64_t indirect_args) const {
-		if (RtLocal::Wanted() && bindings.runtime != nullptr && bindings.runtime->program != nullptr) {
+		if (RtLocal::Wanted() && bindings.runtime != nullptr && bindings.runtime->program != nullptr && RtLocal::WantsDispatch(m_shader_hash)) {
 			const auto& info = bindings.runtime->program->info;
 			std::vector<RtLocal::DispatchBuffer> buffers;
 			std::vector<RtLocal::DispatchImage>  bound;
