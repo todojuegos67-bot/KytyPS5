@@ -2440,7 +2440,11 @@ void PipelineCache::EvictIdlePipelines() {
 		m_scene_swept      = false;
 	}
 	if (!settings.on || flip % CheckFlips != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) return;
-	const bool scene_left = SweepsWorldsLeft() && !m_scene_swept && now - m_scene_since >= SceneSettle;
+	// (ram16-1026) The 16 GB profile's sweeps run only under RAM pressure (the guard's low level or worse): with RAM to
+	// spare they freed ~220 KB a pipeline and cost a remake at its next binding on the render thread (22:07 log: 335
+	// evicted, then xpr/remake spikes of 36-80 ms). KYTY_PIPELINE_EVICT=2 (a test) still sweeps whatever the pressure.
+	const bool ram_low    = settings.always || RamGuard::PressureLevel() >= RamGuard::Low || RamGuard::GovernorStage() != 0;
+	const bool scene_left = SweepsWorldsLeft() && ram_low && !m_scene_swept && now - m_scene_since >= SceneSettle;
 	uint64_t video = 0, budget = 0;
 	const bool known = m_graphics.QueryLocalVideoMemory(&video, &budget);
 	m_evict_pressure = known && (settings.always || video + EvictMargin >= budget);
@@ -2474,7 +2478,7 @@ void PipelineCache::EvictIdlePipelines() {
 	// The RAM governor (KYTY_RAM_TARGET_MB): above its soft threshold, pipelines idle 60 s go (30 s over the target, 15 s
 	// in its emergency), the cheapest step it has; nothing changes below it.
 	const int governor = RamGuard::GovernorStage();
-	m_evict_pressure = m_evict_pressure || RamDietEnabled() || ram_pressure != 0 || governor != 0;
+	m_evict_pressure = m_evict_pressure || (RamDietEnabled() && ram_low) || ram_pressure != 0 || governor != 0;
 	if (RamDietEnabled()) {
 		// Replaced unoptimized pipelines past RamDietReplacedSeconds (pushed in time order).
 		const auto old = (now - std::chrono::seconds(RamDietReplacedSeconds)).time_since_epoch().count();

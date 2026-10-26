@@ -208,7 +208,9 @@ void ApplyLowRamDefaults() {
 		std::string set;
 		SetDefault("KYTY_SOFT_RELEASE", "1", &set);
 		SetDefault("KYTY_RAM_DIET", "1", &set);
-		SetDefault("KYTY_PREFETCH_MIN_AVAIL_MB", "3072", &set);
+		// (ram16-1026) 1536, not 3072: a 16 GB PC sits near 3 GB free in play, and a held prefetch left shaders to
+		// translate at first use on the render thread (xpr spikes); the guard's own low level is ~1 GB.
+		SetDefault("KYTY_PREFETCH_MIN_AVAIL_MB", "1536", &set);
 		// (No video memory budget of its own: 5120 MiB, 10-24, left the video memory in use at 9.1-9.4 GB anyway - what
 		// holds it is not the collector's images - and only made the collector and pipeline eviction churn.)
 		// The guest store committed as it is mapped (the game maps ~11.3 of its 13.5 GiB): only for the page-file

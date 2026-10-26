@@ -6,8 +6,8 @@
 // counted): before anything reads them, the switches below are given low-RAM defaults where the environment does not
 // set them (ApplyLowRamDefaults, the first thing main does):
 //   KYTY_SOFT_RELEASE=1          heaps compacted and idle scratch buffers freed on quiet frames (no working set trim)
-//   KYTY_RAM_DIET=1              driver pipelines idle 180 s released, replaced unoptimized ones after 60 s
-//   KYTY_PREFETCH_MIN_AVAIL_MB=3072  the shader prefetch waits while less RAM than that is left
+//   KYTY_RAM_DIET=1              driver pipelines idle 180 s released (only under RAM pressure), replaced unoptimized after 60 s
+//   KYTY_PREFETCH_MIN_AVAIL_MB=1536  the shader prefetch waits while less RAM than that is left
 //   KYTY_BACKING_ON_DEMAND=1     the guest store's page-file section committed as the game maps it, not 13.5 GiB at
 //                                launch (KYTY_LOWRAM_ON_DEMAND=0 keeps it all committed; never with KYTY_BACKING_FILE or
 //                                KYTY_GUEST_LAZY_COMMIT)
