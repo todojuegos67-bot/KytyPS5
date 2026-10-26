@@ -31,6 +31,8 @@
 #include <filesystem>
 #include <thread>
 
+void KytyNameHostThread(const char* name);
+
 namespace Emulator {
 
 static void PrintSystemInfo() {
@@ -137,10 +139,12 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 	}
 }
 
+
 static void Execute(const std::filesystem::path& game_patch) {
 	auto           patch_path = game_patch;
 	Common::Thread guest_thread(
 	    [](void* param) {
+		    ::KytyNameHostThread("GuestMain");
 		    auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 		    rt->Execute(*static_cast<const std::filesystem::path*>(param));
 	    },
