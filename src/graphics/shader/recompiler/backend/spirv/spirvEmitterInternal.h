@@ -124,6 +124,9 @@ struct EmitterState {
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
+	// Set while one runtime-strided bindless buffer access is emitted: the SPIR-V id of the
+	// selected candidate's packed stride (0: use the specialized constant).
+	uint32_t                                         runtime_packed_stride   = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	uint32_t                                         lds_base_dwords         = 0;
 	uint32_t                                         lds_variable            = 0;
@@ -430,6 +433,9 @@ struct MemoryResourceAccess {
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
+// True when the shared bindless table of `resource` needs the runtime stride (candidates differ in stride).
+bool SharedIndirectBufferRuntimeStride(const EmitterState& state, uint32_t resource);
+uint32_t EmitFlattenedSrtLoad(EmitterState& state, uint32_t index);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
                                                  uint32_t array_index = 0u);
 

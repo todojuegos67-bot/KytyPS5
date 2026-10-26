@@ -146,9 +146,14 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 		return UINT32_MAX;
 	}
 	uint32_t next_child_slot = UINT32_MAX;
+	const bool runtime_stride = root.runtime_stride_offset != UINT32_MAX && state.flattened_srt_variable != 0;
 	for (uint32_t ordinal = first; ordinal < root.indirect_resources.size(); ++ordinal) {
 		const auto& candidate = buffers[root.indirect_resources[ordinal]];
-		const char* why = candidate.packed_stride != shared.packed_stride ? "stride differs"
+		// Strides alone may differ when the table publishes them at runtime (same flags, nonzero).
+		const bool stride_ok = candidate.packed_stride == shared.packed_stride ||
+		    (runtime_stride && (candidate.packed_stride & 0x3fffu) != 0u &&
+		     (candidate.packed_stride & ~0x3fffu) == (shared.packed_stride & ~0x3fffu));
+		const char* why = !stride_ok ? "stride differs"
 		    : candidate.descriptor_format != shared.descriptor_format    ? "format differs"
 		    : candidate.descriptor_swizzle != shared.descriptor_swizzle  ? "swizzle differs"
 		    : candidate.descriptor_index == UINT32_MAX                   ? "no slot"
@@ -161,6 +166,27 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 		if (ordinal != 0u) next_child_slot = candidate.descriptor_index + 1u;
 	}
 	return representative;
+}
+
+bool SharedIndirectBufferRuntimeStride(const EmitterState& state, uint32_t resource) {
+	if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) return false;
+	const auto& buffers = state.program.info.buffers;
+	const auto& root    = buffers[resource];
+	if (root.runtime_stride_offset == UINT32_MAX) return false;
+	const auto first = root.packed_stride == 0u ? 1u : 0u;
+	const auto stride = buffers[root.indirect_resources[first]].packed_stride;
+	for (uint32_t ordinal = first; ordinal < root.indirect_resources.size(); ++ordinal)
+		if (buffers[root.indirect_resources[ordinal]].packed_stride != stride) return true;
+	return false;
+}
+
+uint32_t EmitFlattenedSrtLoad(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.flattened_srt_variable, ConstantU32(state, 0), index);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
 }
 
 void EmitMemoryOffsets(EmitterState& state) {

@@ -138,6 +138,9 @@ struct BufferResource {
 	uint32_t               indirect_root              = NoIndirectBuffer;
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
+	// Root of a raw bindless table whose candidates differ only in stride: flattened SRT
+	// word offset of the per-ordinal packed strides (UINT32_MAX: none).
+	uint32_t               runtime_stride_offset      = UINT32_MAX;
 	std::vector<uint32_t>  indirect_resources;
 
 	bool operator==(const BufferResource& other) const = default;

@@ -3,6 +3,8 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
+#include <atomic>
+#include <cstdio>
 #include <algorithm>
 #include <bit>
 #include <utility>
@@ -90,8 +92,12 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	}
 	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
+	// A runtime-strided bindless candidate shares every packed flag with the representative.
+	const auto stride_id = state.runtime_packed_stride != 0u
+	    ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), state.runtime_packed_stride, ConstantU32(state, 0x3fffu))
+	    : ConstantU32(state, stride);
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
-	                              ConstantU32(state, stride),
+	                              stride_id,
 	                              swizzle ? ConstantBool(state, true) : 0u,
 	                              ConstantU32(state, (packed >> 16u) & 3u))
 	    .byte;
@@ -315,6 +321,15 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 	const auto selected = ctx.Arg(handle, 0);
 	const auto representative = SharedIndirectBufferResource(state, root_resource);
 	const auto shared = representative != UINT32_MAX;
+	const auto runtime_stride = shared && SharedIndirectBufferRuntimeStride(state, root_resource);
+	if (shared && buffer.indirect_resources.size() >= 8u) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 32u) {
+			std::printf("SpirvBloat: hash=0x%016llx buffer %u: %zu candidates as one indexed access%s\n",
+			            static_cast<unsigned long long>(state.program.shader_hash), root_resource,
+			            buffer.indirect_resources.size(), runtime_stride ? " (runtime stride)" : "");
+		}
+	}
 	const auto empty_root = shared && buffer.packed_stride == 0u;
 	const auto selected_access = [&]() {
 		if (shared) {
@@ -327,7 +342,23 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 				    ConstantU32(state, root_slot), slot);
 			}
 			mem.resource = representative;
-			return emit(mem, PrepareMemoryResourceAccess(state, mem, slot));
+			if (!runtime_stride) return emit(mem, PrepareMemoryResourceAccess(state, mem, slot));
+			// One descriptor-indexed access; the candidate's stride comes from the flattened SRT.
+			const auto last = ConstantU32(state, static_cast<uint32_t>(buffer.indirect_resources.size() - 1u));
+			const auto ordinal = Select(state, TypeU32(state),
+			    Binary(state, spv::OpULessThan, TypeBool(state), selected, last), selected, last);
+			const auto saved = state.runtime_packed_stride;
+			state.runtime_packed_stride = EmitFlattenedSrtLoad(state,
+			    EmitAddU32(state, ordinal, ConstantU32(state, buffer.runtime_stride_offset)));
+			const auto prepared = PrepareMemoryResourceAccess(state, mem, slot);
+			if constexpr (has_result) {
+				const auto result = emit(mem, prepared);
+				state.runtime_packed_stride = saved;
+				return result;
+			} else {
+				emit(mem, prepared);
+				state.runtime_packed_stride = saved;
+			}
 		}
 		return EmitIndexSwitch(state, selected, buffer.indirect_resources.size(),
 		                       has_result ? TypeU32Composite(state, components) : 0u,
@@ -369,7 +400,9 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	// may omit final-record padding; the payload check below still checks every byte.
 	const auto last_record = Binary(state, spv::OpUDiv, TypeU32(state),
 	    Binary(state, spv::OpISub, TypeU32(state), available, ConstantU32(state, 1u)),
-	    ConstantU32(state, buffer.packed_stride & 0x3fffu));
+	    state.runtime_packed_stride != 0u
+	        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), state.runtime_packed_stride, ConstantU32(state, 0x3fffu))
+	        : ConstantU32(state, buffer.packed_stride & 0x3fffu));
 	return AndCondition(state, payload_in_bounds,
 	    AndCondition(state,
 	        Binary(state, spv::OpUGreaterThan, TypeBool(state), bytes, resource.byte_offset),

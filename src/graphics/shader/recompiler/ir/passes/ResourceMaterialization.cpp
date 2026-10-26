@@ -1647,6 +1647,21 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
+	// Raw bindless buffer tables: the per-ordinal packed strides are also published in the
+	// flattened SRT, so the emitter can index one descriptor array with a runtime stride instead
+	// of a switch over every candidate at every access (Yotei: 200-485K-word compute shaders).
+	for (uint32_t root = 0; root < program.info.buffers.size() && root < specialization.buffers.size(); ++root) {
+		auto& root_spec = specialization.buffers[root];
+		root_spec.runtime_stride_offset = UINT32_MAX;
+		if (root_spec.indirect_root != root || program.info.buffers[root].formatted) continue;
+		uint32_t candidates = 0;
+		for (const auto& candidate: specialization.buffers)
+			if (candidate.indirect_root == root) ++candidates;
+		if (candidates < 2u) continue;
+		root_spec.runtime_stride_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+		for (const auto& candidate: specialization.buffers)
+			if (candidate.indirect_root == root) snapshot.flattened_srt.push_back(candidate.packed_stride);
+	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -1753,6 +1768,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		buffer.indirect_root              = source.indirect_root;
 		buffer.indirect_mapping_offset    = source.indirect_mapping_offset;
 		buffer.indirect_search_iterations = source.indirect_search_iterations;
+		buffer.runtime_stride_offset      = source.runtime_stride_offset;
 		buffer.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < buffers.size(); ++index) {
