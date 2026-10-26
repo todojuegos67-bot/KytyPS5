@@ -1366,6 +1366,12 @@ private:
 		}
 	};
 	mutable std::unordered_map<ImpliesKey, bool, ImpliesKeyHash> m_implies_memo;
+	struct InstPairHash {
+		size_t operator()(const std::pair<const Inst*, const Inst*>& k) const noexcept {
+			return std::hash<const void*> {}(k.first) ^ (std::hash<const void*> {}(k.second) * 0x9e3779b97f4a7c15ull);
+		}
+	};
+	mutable std::unordered_map<std::pair<const Inst*, const Inst*>, bool, InstPairHash> m_increment_proof_memo;
 	mutable size_t m_implies_hits = 0;
 
 	bool Implies(Value guard, Value required, bool allow_phi = true) const {
@@ -1775,12 +1781,20 @@ private:
 				return edge.positive && (lanes == LaneQuantifier::Any || edge.lanes == lanes) &&
 				       Implies(edge.condition, Value(use_of_key.user));
 			})) continue;
-			LoopBoundProof proof(m_program, *phi, *compare);
 			// The image bound and the increment guard are separate obligations: a
 			// skipped image alone does not prevent signed induction wraparound.
-			if (GuardedOnEntry(increment_block, stops, [&](const EdgePredicate& edge) {
-				return proof.Excludes(edge.condition, edge.positive);
-			})) return compare;
+			// The increment proof depends only on (induction, compare): the 128 handles of one
+			// bindless loop shared it, but each rebuilt it (Yotei: loop=8439 ms per translation).
+			const auto proof_key = std::pair<const Inst*, const Inst*> {phi, compare};
+			auto proven = m_increment_proof_memo.find(proof_key);
+			if (proven == m_increment_proof_memo.end()) {
+				LoopBoundProof proof(m_program, *phi, *compare);
+				const bool ok = GuardedOnEntry(increment_block, stops, [&](const EdgePredicate& edge) {
+					return proof.Excludes(edge.condition, edge.positive);
+				});
+				proven = m_increment_proof_memo.emplace(proof_key, ok).first;
+			}
+			if (proven->second) return compare;
 		}
 		return {};
 	}
