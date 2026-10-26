@@ -548,6 +548,20 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${rtsun_header}")
+# KYTY_HWRT_SHADOW: the same shader with the scene TLAS's sun rays (-DKYTY_HWRT_SHADOW).
+set(rtsun_hw_spv "${gpu_tiler_generated_dir}/rtsun_hw.spv")
+set(rtsun_hw_header "${gpu_tiler_generated_dir}/rtsun_hw_spv.h")
+add_custom_command(
+	OUTPUT "${rtsun_hw_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_HWRT_SHADOW
+	        -o "${rtsun_hw_spv}" "${rtsun_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rtsun_hw_spv} -DOUTPUT=${rtsun_hw_header}
+	        -DSYMBOL=RTSUN_HW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rtsun_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rtsun_hw_header}")
 # KYTY_HWRT (src/local/hwrt-scene.cpp): the scene capture's world-space gather and the ray query debug view.
 foreach(hwrt_shader gather debug debug11)
 	string(TOUPPER "${hwrt_shader}" hwrt_upper)
