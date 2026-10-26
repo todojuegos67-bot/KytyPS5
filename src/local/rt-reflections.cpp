@@ -140,6 +140,7 @@ constexpr uint32_t SurveyIndex   = 600;
 constexpr uint32_t SurveyBits    = 2;
 constexpr uint32_t SurveyHist    = 258;
 constexpr uint32_t SurveyCount   = 770;
+constexpr uint32_t MetalHist     = 1400;          // (hwrt4) the metal pixels' roughness, 10 bins (cumulative)
 constexpr uint32_t FrameBytes    = 8192;          // header + calibration + stats + survey
 constexpr uint32_t ExposureIndex = 128 / 4;       // fparams.x (1.0) when the game gives no exposure
 constexpr uint32_t CalibRuns     = 24;
@@ -147,6 +148,7 @@ constexpr uint32_t MaxMips       = 12;
 static_assert(CalibWet + 34 <= CalibHist && CalibHist + 256 <= StatsIndex);
 static_assert(HeaderBytes + (StatsIndex + StatsCount) * 4 <= FrameBytes);
 static_assert(StatsIndex + StatsCount <= SurveyIndex && HeaderBytes + (SurveyIndex + SurveyCount) * 4 <= FrameBytes);
+static_assert(SurveyIndex + SurveyCount <= MetalHist && HeaderBytes + (MetalHist + 10) * 4 <= FrameBytes);
 static_assert(SurveyHist == SurveyBits + 2 * 128 && SurveyHist + 2 * 256 == SurveyCount);
 
 struct RtPush {
@@ -259,6 +261,7 @@ struct RtPass {
 	int                     mlevel = 0;
 	bool                    mhist_valid = false;
 	uint64_t                m_frames = 0, m_tlas_frames = 0;
+	std::array<uint32_t, 10> m_hist_last {};
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 } g_rt;
 
@@ -387,7 +390,8 @@ bool HwReflWanted();
 //                          pick, near-binary, set on 62 % of the characters' pixels and 8 % of the static world's)
 //   KYTY_HWRT_METAL_ROUGH  the roughness field (1:24:8, L1 bits 24..31: the byte the oct 12:12 normal leaves free in its
 //                          word; "g" suffix: it is gloss)
-//   KYTY_HWRT_METAL_ROUGH_MAX  no ray from this roughness (0.6; fades from 70 % of it)
+//   KYTY_HWRT_METAL_ROUGH_MAX  no ray from this roughness (0.85: worn plate reads 0.5-0.8 and keeps a soft, blurred
+//                          reflection; fades from 70 % of it)
 //   KYTY_HWRT_METAL_STRENGTH   the composite's weight scale (1.0, 0..2)
 //   KYTY_HWRT_METAL_TINT       how much of the base colour's hue the F0 keeps (1.0 physical; 0 grey F0 of its luminance)
 //   KYTY_HWRT_METAL_DIST       the reflection ray's length (world units, 200)
@@ -410,7 +414,7 @@ const MetalCfg& Metal() {
 		m.view         = vw != nullptr ? std::clamp(std::atoi(vw), 0, 4) : 0;
 		m.metal        = std::getenv("KYTY_HWRT_METAL_FIELD") != nullptr ? FieldEnv("KYTY_HWRT_METAL_FIELD") : (2 | (0 << 2) | (8 << 7));
 		m.rough        = std::getenv("KYTY_HWRT_METAL_ROUGH") != nullptr ? FieldEnv("KYTY_HWRT_METAL_ROUGH") : (1 | (24 << 2) | (8 << 7));
-		m.rough_max    = EnvFloat("KYTY_HWRT_METAL_ROUGH_MAX", 0.6f, 0.05f, 1.0f);
+		m.rough_max    = EnvFloat("KYTY_HWRT_METAL_ROUGH_MAX", 0.85f, 0.05f, 1.0f);
 		m.strength     = EnvFloat("KYTY_HWRT_METAL_STRENGTH", 1.0f, 0.0f, 2.0f);
 		m.tint         = EnvFloat("KYTY_HWRT_METAL_TINT", 1.0f, 0.0f, 1.0f);
 		m.dist         = EnvFloat("KYTY_HWRT_METAL_DIST", 200.0f, 1.0f, 5000.0f);
@@ -874,6 +878,18 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		            sm[36] > 0 ? 100.0 * sm[38] / static_cast<double>(sm[36]) : 0.0, 100.0 * sm[39] / px,
 		            static_cast<unsigned long long>(g_rt.m_tlas_frames), static_cast<unsigned long long>(g_rt.m_frames));
 		g_rt.m_tlas_frames = 0, g_rt.m_frames = 0;
+		const auto* mh = reinterpret_cast<const uint32_t*>(g_rt.mapped + HeaderBytes / 4 + MetalHist);
+		std::array<uint32_t, 10> d {};
+		uint64_t                 total = 0;
+		for (int k = 0; k < 10; ++k) d[k] = mh[k] - g_rt.m_hist_last[k], g_rt.m_hist_last[k] = mh[k], total += d[k];
+		std::string h;
+		for (int k = 0; k < 10; ++k) {
+			char b[32];
+			std::snprintf(b, sizeof(b), "%s%.1f", k ? " / " : "", total ? 100.0 * d[k] / static_cast<double>(total) : 0.0);
+			h += b;
+		}
+		std::printf("RT metal: roughness on metal pixels (%% per 0.1 bin, 0-0.1 ... 0.9-1): %s (rays below %.2f, fading from %.2f)\n",
+		            h.c_str(), static_cast<double>(Metal().rough_max), static_cast<double>(Metal().rough_max * 0.7f));
 	}
 	std::string passes;
 	for (uint32_t st = 0; st < NStages; ++st) {
@@ -1712,7 +1728,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
 	{
 		// The sums, counters and the metal survey to the host (the CPU reads them a few frames late; the copy is 5.5 KB).
-		vk::BufferCopy region {HeaderBytes, HeaderBytes, (SurveyIndex + SurveyCount) * 4};
+		vk::BufferCopy region {HeaderBytes, HeaderBytes, (Metal().level > 0 ? MetalHist + 10 : SurveyIndex + SurveyCount) * 4};
 		command.copyBuffer(vk::Buffer(g.frame_buf), vk::Buffer(g.read_buf), 1, &region);
 		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
 		        vk::AccessFlagBits2::eHostRead);

@@ -1717,6 +1717,7 @@ void Survey(ivec2 gp) {
 // field + 1, dec.w flags (1 history valid, 2 skip the pixel's own instance, 4 a TLAS this frame).
 // Modes: 9 trace, 10 temporal, 11 a-trous, 12 composite.
 float step_(float m) { return m > 0.02 ? 1.0 : 0.0; }
+const int MT_HIST = 1400; // (hwrt4: past the survey; rt-reflections.cpp MetalHist)
 bool  MtHist() { return (push.dec.w & 1) != 0; }
 bool  MtSelfSkip() { return (push.dec.w & 2) != 0; }
 bool  MtTlas() { return (push.dec.w & 4) != 0; }
@@ -1764,6 +1765,8 @@ void MtTrace(ivec2 px) {
 	float mw = surf ? MtMetalW(metal) * MtRoughFade(rough) : 0.0;
 	bool  st = Sampled(px);
 	if (st && surf) Stat(34, 1), Stat(35, metal > 0.5 ? 1 : 0);
+	// (the roughness of the metal pixels: 10 bins, cumulative, logged every 10 s as "RT metal: roughness on metal")
+	if (st && surf && metal > 0.5) atomicAdd(calib[MT_HIST + clamp(int(rough * 10.0), 0, 9)], 1);
 	if (mw < 0.02) {
 		imageStore(out_a, px, vec4(0));
 		imageStore(out_c, px, vec4(rough, 0, 0, 0));
