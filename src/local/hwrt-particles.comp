@@ -37,6 +37,7 @@ layout(std430, binding = 9) buffer Lights {
 	Light lights[MaxLights];
 	float cdf[MaxLights];
 	uint  idx[MaxLights];
+	Light trk[MaxLights]; // the tracked emitters (per tile, faded in / out, position and intensity smoothed over time)
 } lb;
 
 layout(std430, binding = 10) readonly buffer HwRayInfo {
@@ -53,7 +54,7 @@ layout(push_constant) uniform Push {
 	vec4  params; // strength x gain, range (m), minimum distance (m), temporal alpha
 	ivec4 misc;   // mode, frame, candidates, rays
 	ivec4 misc2;  // tiles x, tiles y, sample stride, flags (1 albedo, 2 history valid, 4 view, 8 motion)
-	vec4  extra;  // motion scale x, y, a-trous step, emission threshold
+	vec4  extra;  // motion scale x, y, a-trous step (collect: the frame's seconds), emission threshold
 } push;
 
 bool Bad(float v) { return isnan(v) || isinf(v); }
@@ -156,7 +157,26 @@ void Collect() {
 			L.col = vec4(s_col[0], s_peak[0]);
 			if (BadV(p) || BadV(s_col[0])) L.pos = vec4(0), L.col = vec4(0);
 		}
-		if (i < MaxLights) lb.lights[i] = L;
+		if (i < MaxLights) {
+			// Tracking with hysteresis: a tile's emitter fades in and out over ~0.35 s and its position, colour and peak
+			// follow the raw ones smoothly (flames flicker and cross tile edges every frame: raw, they pop).
+			Light T  = lb.trk[i];
+			bool  hv = (push.misc2.w & 2) != 0 && !BadV(T.pos.xyz) && !Bad(T.pos.w) && !BadV(T.col.rgb) && !Bad(T.col.a);
+			float dt = clamp(push.extra.z, 0.0, 0.1);
+			float a  = 1.0 - exp(-dt / 0.35);
+			if (!hv) T = L;
+			else {
+				if (L.pos.w > 0.0) {
+					if (T.pos.w <= 1e-8 || distance(T.pos.xyz, L.pos.xyz) > 1.5) T.pos.xyz = L.pos.xyz;
+					else T.pos.xyz = mix(T.pos.xyz, L.pos.xyz, clamp(2.0 * a * L.pos.w / (L.pos.w + T.pos.w), 0.0, 1.0));
+				}
+				T.pos.w = mix(T.pos.w, L.pos.w, a);
+				T.col   = mix(T.col, L.col, a);
+				if (T.pos.w < 1e-7) T.pos = vec4(0), T.col = vec4(0);
+			}
+			lb.trk[i]    = T;
+			lb.lights[i] = T;
+		}
 	}
 }
 
@@ -227,7 +247,7 @@ void Trace() {
 	N         = length(N) > 1e-12 ? normalize(N) : normalize(V);
 	if (dot(N, V) < 0.0) N = -N;
 	float range = push.params.y, dmin = push.params.z;
-	uint  seed  = Pcg(uint(q.x) * 1973u + uint(q.y) * 9277u + uint(push.misc.y) * 26699u) | 1u;
+	uint  seed  = Pcg(uint(q.x) * 1973u + uint(q.y) * 9277u) | 1u; // (fixed per pixel: stable sampling)
 	int   M     = clamp(push.misc.z, 1, 16);
 	int   rays  = clamp(push.misc.w, 1, 4);
 	float total = lb.cdf[count - 1u];
@@ -308,6 +328,12 @@ void Temporal() {
 				// (loose: 1 sample per pixel is noisy; a tight box would flicker)
 				vec3 hc = clamp(h.rgb, max(m1 - 2.5 * sd, vec3(0)), m1 + 2.5 * sd + 0.02 * m1);
 				res     = mix(hc, c0.rgb, push.params.w);
+				// Variance-consistent history: the per-frame change is bounded (the emitters move slowly now; what is
+				// left is sampling noise) unless the history sits outside the box (a real change: follow it fast).
+				if (all(lessThanEqual(abs(h.rgb - m1), 2.5 * sd + 0.02 * m1 + 1e-4))) {
+					vec3 lim = 0.04 * hc + 1e-4;
+					res      = clamp(res, hc - lim, hc + lim);
+				}
 			}
 		}
 	}
