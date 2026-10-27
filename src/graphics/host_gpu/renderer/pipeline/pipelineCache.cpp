@@ -684,6 +684,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		uint64_t                                     last_use = 0;
+		uint64_t                                     input_hash = 0;
 	};
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
@@ -699,7 +700,21 @@ struct PipelineCache::ProgramCache {
 		std::vector<MemoSlot>                        memo;
 	};
 
-	static constexpr size_t MemoSlots = 8;
+	// KYTY_RESOURCE_MEMO_SLOTS (live, default 32; was a fixed 8): input sets kept per program.
+	// Owner log 20261027-172055: 21-25% hits with 8; one program drawn for many objects a frame
+	// cycles through more input sets than that, evicting each before its next frame.
+	static size_t MemoSlots() {
+		static auto& slots = Common::LiveSwitches::Get("KYTY_RESOURCE_MEMO_SLOTS", 32);
+		return static_cast<size_t>(std::clamp<int64_t>(slots.load(std::memory_order_relaxed), 1, 256));
+	}
+	static uint64_t MemoInputHash(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+		uint64_t h = XXH3_64bits(runtime.user_data.data(), runtime.user_data.size_bytes());
+		h ^= runtime.shader_base * 0x9e3779b97f4a7c15ull;
+		h ^= XXH3_64bits(runtime.workgroup_count.data(), sizeof(runtime.workgroup_count)) * 31u;
+		h ^= XXH3_64bits(runtime.workgroup_size.data(), sizeof(runtime.workgroup_size)) * 131u;
+		return h;
+	}
+	uint64_t memo_miss_inputs = 0, memo_miss_reads = 0;
 
 	// Materialization reads guest memory only through the runtime's two readers, so the same
 	// user data and shader base, with every logged read returning the same result and words,
@@ -712,12 +727,20 @@ struct PipelineCache::ProgramCache {
 			    entry.resource_plan, runtime, entry.resources, entry.specialization);
 		}
 		memo_clock++;
+		const uint64_t input_hash = MemoInputHash(runtime);
+		bool           inputs_seen = false;
 		for (auto& slot: entry.memo) {
+			if (slot.input_hash != input_hash) {
+				continue;
+			}
 			if (slot.shader_base == runtime.shader_base &&
 			    slot.workgroup_count == runtime.workgroup_count &&
 			    slot.workgroup_size == runtime.workgroup_size &&
-			    std::ranges::equal(slot.user_data, runtime.user_data) &&
-			    ReadsUnchanged(slot.log, reads)) {
+			    std::ranges::equal(slot.user_data, runtime.user_data)) {
+				inputs_seen = true;
+				if (!ReadsUnchanged(slot.log, reads)) {
+					continue;
+				}
 				entry.resources      = slot.resources;
 				entry.specialization = slot.specialization;
 				slot.last_use = memo_clock;
@@ -727,6 +750,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		memo_misses++;
+		(inputs_seen ? memo_miss_reads : memo_miss_inputs)++;
 		ShaderReadChunks::ReadLog log;
 		reads.SetLog(&log);
 		const bool ok = ShaderRecompiler::IR::MaterializeResources(
@@ -734,11 +758,22 @@ struct PipelineCache::ProgramCache {
 		reads.SetLog(nullptr);
 		if (ok) {
 			MemoSlot* slot = nullptr;
-			if (entry.memo.size() < MemoSlots) {
-				slot = &entry.memo.emplace_back();
-			} else {
-				slot = &*std::ranges::min_element(entry.memo, {}, &MemoSlot::last_use);
+			// Same inputs whose reads changed: refresh that slot instead of taking another.
+			for (auto& candidate: entry.memo) {
+				if (candidate.input_hash == input_hash && candidate.shader_base == runtime.shader_base &&
+				    std::ranges::equal(candidate.user_data, runtime.user_data)) {
+					slot = &candidate;
+					break;
+				}
 			}
+			if (slot == nullptr) {
+				if (entry.memo.size() < MemoSlots()) {
+					slot = &entry.memo.emplace_back();
+				} else {
+					slot = &*std::ranges::min_element(entry.memo, {}, &MemoSlot::last_use);
+				}
+			}
+			slot->input_hash = input_hash;
 			slot->user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 			slot->shader_base    = runtime.shader_base;
 			slot->workgroup_count = runtime.workgroup_count;
@@ -770,10 +805,12 @@ struct PipelineCache::ProgramCache {
 			return;
 		}
 		const auto total = memo_hits + memo_misses;
-		::printf("Resource memo (5 s): %" PRIu64 " hits, %" PRIu64 " misses (%.1f%% hits); lookup cache %" PRIu64
+		::printf("Resource memo (5 s): %" PRIu64 " hits, %" PRIu64 " misses (%.1f%% hits; misses: %" PRIu64
+		         " new inputs, %" PRIu64 " same inputs but guest words changed; %zu slots); lookup cache %" PRIu64
 		         " hits, %" PRIu64 " misses\n",
-		         memo_hits, memo_misses, total != 0 ? 100.0 * memo_hits / total : 0.0, lookup_hits,
-		         lookup_misses);
+		         memo_hits, memo_misses, total != 0 ? 100.0 * memo_hits / total : 0.0, memo_miss_inputs,
+		         memo_miss_reads, MemoSlots(), lookup_hits, lookup_misses);
+		memo_miss_inputs = memo_miss_reads = 0;
 		lookup_hits = lookup_misses = 0;
 		std::fflush(stdout);
 		memo_hits   = 0;
