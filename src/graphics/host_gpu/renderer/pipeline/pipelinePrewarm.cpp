@@ -16,6 +16,9 @@
 #include <tuple>
 #include <unordered_set>
 #include <xxhash.h>
+#include <set>
+#include <string>
+#include <spirv-tools/libspirv.hpp>
 
 namespace Libs::Graphics::Prewarm {
 
@@ -313,6 +316,28 @@ vk::ShaderModule LoadModule(Context& ctx, std::FILE* f, uint64_t hash, vk::Devic
 	if (!Seek(f, offset) || std::fread(code.data(), 4, words, f) != words || Hash(code.data(), words * 4u, 0) != hash) {
 		return nullptr;
 	}
+	// Seed SPIR-V is validated before it reaches the driver: a module recorded by a build that
+	// emitted invalid code (b0a4787) crashed the driver in every later replay.
+	// KYTY_PREWARM_VALIDATE=0 skips it.
+	static const bool validate = [] {
+		const char* v = std::getenv("KYTY_PREWARM_VALIDATE");
+		return v == nullptr || std::strcmp(v, "0") != 0;
+	}();
+	if (validate) {
+		spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+		std::string          first;
+		tools.SetMessageConsumer([&first](spv_message_level_t, const char*, const spv_position_t&, const char* m) {
+			if (first.empty() && m != nullptr) first = m;
+		});
+		spvtools::ValidatorOptions options;
+		options.SetAllowOffsetTextureOperand(true);
+		if (!tools.Validate(code.data(), code.size(), options)) {
+			std::printf("Prewarm: seed SPIR-V %016llx (%u words) is invalid, skipped: %s\n",
+			            static_cast<unsigned long long>(hash), words, first.c_str());
+			std::fflush(stdout);
+			return nullptr;
+		}
+	}
 	vk::ShaderModuleCreateInfo info {};
 	info.codeSize           = code.size() * 4u;
 	info.pCode              = code.data();
@@ -549,6 +574,50 @@ vk::Pipeline BuildGraphics(Context& ctx, std::FILE* f, const Pending& p) {
 	return pipeline;
 }
 
+// Crash guard: every replay build is logged as begun/ended in <seed>.inflight. A build begun but
+// never ended (the driver crashed the process inside it) is skipped by the next replay.
+std::mutex                  g_inflight_mutex;
+std::FILE*                  g_inflight = nullptr;
+std::set<uint64_t>          g_crashed;
+
+void InflightMark(char what, uint64_t key) {
+	std::lock_guard lock(g_inflight_mutex);
+	if (g_inflight == nullptr) return;
+	std::fprintf(g_inflight, "%c %016llx\n", what, static_cast<unsigned long long>(key));
+	std::fflush(g_inflight);
+}
+
+void OpenInflight(const std::filesystem::path& seed) {
+	const auto path = std::filesystem::path(seed.string() + ".inflight");
+	std::set<uint64_t> begun;
+	if (std::FILE* in = std::fopen(path.string().c_str(), "r"); in != nullptr) {
+		char               what = 0;
+		unsigned long long key  = 0;
+		while (std::fscanf(in, " %c %llx", &what, &key) == 2) {
+			if (what == 'B') begun.insert(key);
+			else if (what == 'E') begun.erase(key);
+			else if (what == 'X') g_crashed.insert(key);
+		}
+		std::fclose(in);
+	}
+	for (const auto key: begun) g_crashed.insert(key);
+	g_inflight = std::fopen(path.string().c_str(), "w");
+	if (g_inflight != nullptr) {
+		for (const auto key: g_crashed) {
+			std::fprintf(g_inflight, "X %016llx\n", static_cast<unsigned long long>(key));
+			std::printf("Prewarm: pipeline %016llx crashed a previous replay; skipped\n",
+			            static_cast<unsigned long long>(key));
+		}
+		std::fflush(g_inflight);
+		std::fflush(stdout);
+	}
+}
+
+bool CrashedBefore(uint64_t key) {
+	std::lock_guard lock(g_inflight_mutex);
+	return g_crashed.contains(key);
+}
+
 void Worker() {
 	auto&      ctx = Ctx();
 	std::FILE* f   = std::fopen(ctx.path.string().c_str(), "rb");
@@ -573,9 +642,11 @@ void Worker() {
 			}
 		}
 		vk::Pipeline pipeline = nullptr;
+		const bool   crashed_before = CrashedBefore(rec->key);
+		InflightMark('B', rec->key);
 		const auto   build_start = Clock::now();
 		const size_t desc_words  = rec->desc.size();
-		if (f != nullptr) {
+		if (f != nullptr && !crashed_before) {
 			pipeline = rec->kind == KindCompute ? BuildCompute(ctx, f, *rec) : BuildGraphics(ctx, f, *rec);
 		}
 		if (const auto ms = std::chrono::duration<double, std::milli>(Clock::now() - build_start).count(); ms >= 2000.0) {
@@ -584,6 +655,7 @@ void Worker() {
 			            desc_words, ms);
 			std::fflush(stdout);
 		}
+		InflightMark('E', rec->key);
 		rec->desc.clear();
 		rec->desc.shrink_to_fit();
 		{
@@ -1107,6 +1179,7 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 		            ctx.spirv_offset.size(), ctx.queue.empty() ? 0u : threads);
 		std::fflush(stdout);
 		if (!ctx.queue.empty()) {
+			OpenInflight(ctx.path);
 			for (unsigned i = 0; i < threads; i++) {
 				ctx.threads.emplace_back(Worker);
 			}
