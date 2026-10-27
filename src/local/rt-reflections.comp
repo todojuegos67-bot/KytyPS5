@@ -868,11 +868,12 @@ bool HwMarch(vec3 P, vec3 N, vec3 R, vec3 V, out vec4 res, out float hdist) {
 	Rw = normalize(Rw);
 	Nw = length(Nw) > 1e-9 ? normalize(Nw) : -Rw;
 	vec3 o = Pw + Nw * (0.002 * dist + 0.01);
-	// (flick) cull mask 0x03: static + dynamic captured THIS frame. 0x04 (a dynamic mesh at an older frame's positions)
+	// (flick2) static meshes only (0x01): a still character still flips between 0x02 / 0x04 / not captured frame to frame.
+	// (flick) earlier cull mask 0x03: static + dynamic captured THIS frame. 0x04 (a dynamic mesh at an older frame's positions)
 	// toggles with 0x02 as captures come and go (~5 % of draws captured a frame), so a reflected character / door / debris
 	// card showed at a stale spot one frame and vanished the next: the reflections-only flicker. 0x08: ash / leaf cards.
 	rayQueryEXT rq;
-	rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT, 0x03, o, 0.01, Rw, max(push.params.z, 1.0));
+	rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT, 0x01, o, 0.01, Rw, max(push.params.z, 1.0)); // (flick2: 0x01, static only)
 	while (rayQueryProceedEXT(rq)) {}
 	if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) return false;
 	float t  = rayQueryGetIntersectionTEXT(rq, true);
@@ -880,10 +881,12 @@ bool HwMarch(vec3 P, vec3 N, vec3 R, vec3 V, out vec4 res, out float hdist) {
 	hdist    = t;
 	float far_fade = 1.0 - smoothstep(0.7, 1.0, t / max(push.params.z, 1.0));
 	// On the screen and visible there: the frame's own colour at the hit.
+	bool hidden = false;
 	vec4 sc = HwToScreen(Hw);
 	if (sc.w > 0.5 && InScreen(sc.xy)) {
 		float sd = DepthAt(sc.xy);
 		float zs = abs(ViewZ(sd)), zh = abs(ViewZ(sc.z));
+		hidden = !IsSky(sd) && zs < zh - (0.03 * zh + 0.1); // (flick2: on the screen, behind something nearer)
 		if (!IsSky(sd) && abs(zs - zh) < 0.03 * zh + 0.1) {
 			vec2  edge = min(sc.xy, 1.0 - sc.xy);
 			float conf = far_fade * (0.5 + 0.5 * smoothstep(0.0, 0.05, min(edge.x, edge.y)));
@@ -947,10 +950,16 @@ bool HwMarch(vec3 P, vec3 N, vec3 R, vec3 V, out vec4 res, out float hdist) {
 	if (albedo.x >= 0.0) {
 		// (hwrt3) Lit as the frame is: its mean light with the mean albedo (~0.35) divided out, ambient from all around,
 		// the overhead light (the frame's top row: sky / sun-lit) on what faces up.
+		// (flick2) no overhead "sky" term (the frame's top row: a bright door / fog / candles even indoors), the hit
+		// never brighter than twice the frame's mean light and half desaturated: the blocky orange patches (candle /
+		// forge albedo at full strength) that popped on the Nexus floor around the character
 		vec3 sky;
 		vec3 amb   = HwAmbientSky(sky);
-		vec3 light = amb * (1.0 / 0.35) * (0.3 + 0.5 * up) + sky * (0.6 * up * up);
-		c          = Tonemap(SafeColor(albedo * light));
+		vec3 lit   = SafeColor(albedo * amb * (1.0 / 0.35) * (0.4 + 0.4 * up));
+		float lm   = Luma(lit), lc = 2.0 * Luma(amb) + 1e-4;
+		if (lm > lc) lit *= lc / lm;
+		lit        = mix(vec3(Luma(lit)), lit, 0.5);
+		c          = Tonemap(lit);
 		conf       = 0.65 * far_fade;
 	} else {
 		c    = Tonemap(HwAmbient() * (0.35 + 0.65 * up));
@@ -960,6 +969,13 @@ bool HwMarch(vec3 P, vec3 N, vec3 R, vec3 V, out vec4 res, out float hdist) {
 	vec3  c    = Tonemap(HwAmbient() * (0.35 + 0.65 * up));
 	float conf = 0.5 * far_fade;
 #endif
+	// (flick2) a hit that is on the screen but hidden behind something nearer (the character standing over the floor's
+	// reflection, a pillar): we cannot see it, so a dim grey guess at a third of the confidence - not a coloured one that
+	// toggles with the occluder's silhouette (the white halo / orange blocks around the boots and the shield)
+	if (hidden) {
+		c    = vec3(Luma(c)) * 0.8;
+		conf *= 0.35;
+	}
 	res        = vec4(c * conf, conf);
 	return !Bad(res) && conf > 1e-3;
 }
