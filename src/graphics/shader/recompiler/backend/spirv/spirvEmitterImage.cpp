@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
+#include <cstdlib>
 #include <cstdio>
 #include <atomic>
 #include <algorithm>
@@ -691,90 +692,95 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	}
 	const auto selected = EmitIndirectResourceIndex(
 	    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
-	struct ImageRun {
-		uint32_t first;
-		uint32_t count;
-		uint32_t resource;
-		uint32_t slot_bias;
+	// One case per distinct candidate SHAPE, not per adjacent run. Before, any candidate whose
+	// shape or descriptor slot broke adjacency opened a new run and every run became a switch
+	// case holding a full copy of the access, so a bindless table with interleaved
+	// swizzles/formats (Ghost of Yotei: 30-45 candidates) copied each access dozens of times
+	// (200K-490K-word compute shaders, 15-24 s vkCreateComputePipelines per permutation, the
+	// second movie frozen on Thread_Gpu). The access only needs the shape (type, conversion) from
+	// the candidate; the slot is an absolute index into the kind's descriptor array, so it is
+	// selected per ordinal (cheap OpSelects) and every same-shape candidate shares one case.
+	// KYTY_IMAGE_RUNS=1 restores the old per-run emission.
+	static const bool legacy_runs = [] {
+		const char* v = std::getenv("KYTY_IMAGE_RUNS");
+		return v != nullptr && v[0] == '1';
+	}();
+	const uint32_t count = static_cast<uint32_t>(image.indirect_resources.size());
+	const auto same_shape = [&](const IR::ImageResource& a, const IR::ImageResource& b) {
+		return a.dimension == b.dimension && a.cube == b.cube &&
+		       IR::DescriptorBindingForImage(a) == IR::DescriptorBindingForImage(b) &&
+		       a.shader_swizzle == b.shader_swizzle && a.conversion_format == b.conversion_format &&
+		       a.numeric_class == b.numeric_class && a.mip_count == 1u && b.mip_count == 1u;
 	};
-	std::vector<ImageRun> runs;
-	for (uint32_t ordinal = 0; ordinal < image.indirect_resources.size(); ++ordinal) {
+	struct ImageGroup {
+		uint32_t resource;
+		uint32_t members;
+	};
+	std::vector<ImageGroup> groups;
+	std::vector<uint32_t>   group_of(count);
+	uint32_t                adjacent_runs = 0;
+	for (uint32_t ordinal = 0; ordinal < count; ++ordinal) {
 		const auto resource = image.indirect_resources[ordinal];
 		const auto& candidate = state.program.info.images[resource];
-		const auto kind = *IR::DescriptorBindingForImage(candidate);
-		if (!runs.empty()) {
-			auto& run = runs.back();
-			const auto& first = state.program.info.images[run.resource];
-			const auto next_slot = run.slot_bias + ordinal;
-			if (candidate.dimension == first.dimension && candidate.cube == first.cube &&
-			    IR::DescriptorBindingForImage(first) == kind &&
-			    candidate.shader_swizzle == first.shader_swizzle &&
-			    candidate.conversion_format == first.conversion_format &&
-			    candidate.numeric_class == first.numeric_class &&
-			    candidate.mip_count == 1u && first.mip_count == 1u &&
-			    (ordinal == 1u || candidate.descriptor_index == next_slot)) {
-				// Native roots precede appended children; only the root may have a slot gap.
-				if (ordinal == 1u)
-					run.slot_bias = candidate.descriptor_index - ordinal;
-				++run.count;
-				continue;
+		(void)*IR::DescriptorBindingForImage(candidate);
+		uint32_t found = UINT32_MAX;
+		const size_t first_search = legacy_runs ? (groups.empty() ? 0 : groups.size() - 1) : 0;
+		for (size_t g = first_search; g < groups.size(); ++g) {
+			if (legacy_runs && group_of[ordinal - 1] != g) continue;
+			if (same_shape(state.program.info.images[groups[g].resource], candidate)) {
+				found = static_cast<uint32_t>(g);
+				break;
 			}
 		}
-		runs.push_back({ordinal, 1u, resource,
-		                candidate.descriptor_index - ordinal});
+		if (found == UINT32_MAX) {
+			found = static_cast<uint32_t>(groups.size());
+			groups.push_back({resource, 0u});
+		}
+		++groups[found].members;
+		group_of[ordinal] = found;
+		if (ordinal == 0u || group_of[ordinal - 1] != found) ++adjacent_runs;
 	}
-	if (runs.size() >= 4u) {
-		// SpirvBloat (images): every run is a separate case of a switch at every access.
+	if (adjacent_runs >= 4u) {
 		static std::atomic<uint32_t> logged {0};
 		if (logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
-			uint32_t mipped = 0, dims = 0, formats = 0, slots = 0;
-			for (size_t i = 1; i < runs.size(); ++i) {
-				const auto& a = state.program.info.images[runs[i - 1].resource];
-				const auto& b = state.program.info.images[runs[i].resource];
-				if (a.mip_count != 1u || b.mip_count != 1u) ++mipped;
-				else if (a.dimension != b.dimension || a.cube != b.cube) ++dims;
-				else if (a.shader_swizzle != b.shader_swizzle || a.conversion_format != b.conversion_format ||
-				         a.numeric_class != b.numeric_class) ++formats;
-				else ++slots;
-			}
-			std::printf("SpirvBloat: hash=0x%016llx image %u: %zu candidates in %zu runs (breaks: mips %u, dim %u, "
-			            "format/swizzle/class %u, slot/kind %u)\n",
-			            static_cast<unsigned long long>(state.program.shader_hash), mem.resource,
-			            image.indirect_resources.size(), runs.size(), mipped, dims, formats, slots);
+			std::printf("SpirvBloat: hash=0x%016llx image %u: %u candidates, %u runs -> %zu shape cases%s\n",
+			            static_cast<unsigned long long>(state.program.shader_hash), mem.resource, count,
+			            adjacent_runs, groups.size(), legacy_runs ? " (KYTY_IMAGE_RUNS legacy)" : "");
 			std::fflush(stdout);
 		}
 	}
-	const auto EmitRun = [&](uint32_t index) {
-		const auto& run = runs[index];
-		if (run.count == 1u) return emit(run.resource, 0u);
-		auto slot = Binary(state, spv::OpIAdd, TypeU32(state), selected,
-		                   ConstantU32(state, run.slot_bias));
-		if (run.first == 0u) {
-			const auto root_slot = image.descriptor_index;
-			if (root_slot != run.slot_bias) {
-				const auto is_root = Binary(state, spv::OpIEqual, TypeBool(state), selected,
-				                            ConstantU32(state, 0u));
-				const auto root_or_child = state.builder.AllocateId();
-				state.builder.AddFunction(spv::OpSelect, TypeU32(state), root_or_child,
-				                          is_root, ConstantU32(state, root_slot), slot);
-				slot = root_or_child;
-			}
+	// Ordinal -> value, as a chain of selects on the (ordered) ordinals where the value changes.
+	const auto select_chain = [&](auto&& value_of) {
+		auto result = ConstantU32(state, value_of(0u));
+		for (uint32_t ordinal = 1; ordinal < count; ++ordinal) {
+			if (value_of(ordinal) == value_of(ordinal - 1u)) continue;
+			const auto at_or_after = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state),
+			                                selected, ConstantU32(state, ordinal));
+			const auto next = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), next, at_or_after,
+			                          ConstantU32(state, value_of(ordinal)), result);
+			result = next;
 		}
-		return emit(run.resource, slot);
+		return result;
 	};
-	auto run_index = ConstantU32(state, 0u);
-	for (uint32_t index = 1; index < runs.size(); ++index) {
-		const auto at_or_after = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state),
-		                               selected, ConstantU32(state, runs[index].first));
-		const auto next = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpSelect, TypeU32(state), next, at_or_after,
-		                          ConstantU32(state, index), run_index);
-		run_index = next;
+	const bool any_shared = std::ranges::any_of(groups, [](const auto& g) { return g.members > 1u; });
+	uint32_t slot = 0;
+	if (any_shared) {
+		// slot = selected + (descriptor_index - ordinal), the delta changes only at slot breaks.
+		const auto delta = select_chain([&](uint32_t ordinal) {
+			return state.program.info.images[image.indirect_resources[ordinal]].descriptor_index - ordinal;
+		});
+		slot = Binary(state, spv::OpIAdd, TypeU32(state), selected, delta);
 	}
-	return runs.size() == 1u
-	           ? EmitRun(0u)
-	           : EmitIndexSwitch(state, run_index, static_cast<uint32_t>(runs.size()),
-	                             result_type, EmitRun);
+	const auto EmitGroup = [&](uint32_t index) {
+		const auto& group = groups[index];
+		if (group.members == 1u) return emit(group.resource, 0u);
+		return emit(group.resource, slot);
+	};
+	if (groups.size() == 1u) return EmitGroup(0u);
+	const auto group_index = select_chain([&](uint32_t ordinal) { return group_of[ordinal]; });
+	return EmitIndexSwitch(state, group_index, static_cast<uint32_t>(groups.size()), result_type,
+	                       EmitGroup);
 }
 
 template <typename Emit>
