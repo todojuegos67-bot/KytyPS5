@@ -524,7 +524,13 @@ void Temporal(ivec2 pixel) {
 	wn = max(wn, 1.0);
 	m1 /= wn, m2 /= wn;
 	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
+#ifdef KYTY_HWRT_SHADOW
+	// (sun stability: the rays' one-sample disc jitter averaged over ~25 frames once the history holds; the clamp box
+	// still lets a moved occluder's shadow go)
+	float a_min = 0.04;
+#else
 	float a_min = push.misc.z >= 3 ? 0.08 : 0.1;
+#endif
 	float count = 1.0;
 	float res   = mix(m1, cur, 0.5);
 	vec2  puv   = uv + textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();

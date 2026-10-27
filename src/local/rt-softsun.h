@@ -23,6 +23,9 @@ float AngleDeg();       // the sun's apparent diameter used (deg)
 void NoteUse(uint64_t flip);
 // A copy was taken from `source`; `others` the other layered arrays the same dispatch bound (the game's cache of it).
 void NoteCopy(uint64_t flip, uint64_t source, std::span<const uint64_t> others);
+// The held copy (and its use tracking and 10 s line): on with KYTY_HWRT_SOFTSUN, KYTY_HWRT_SHADOW or KYTY_RT_SUN > 0
+// (KYTY_HWRT_SOFTSUN_HOLD=0: off, the 8-flip rule as before).
+bool HoldOn();
 bool IsCompanion(uint64_t address);
 // RtSunPrepare: whether a copy taken at copy_flip may still be used now (held: older than 8 flips).
 bool CopyUsable(uint64_t now, uint64_t copy_flip, bool& held);

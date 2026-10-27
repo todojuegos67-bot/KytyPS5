@@ -8011,7 +8011,7 @@ void RtSunAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::Comma
 	std::vector<RtSunEntry> table;
 	uint64_t                address = 0;
 	// (KYTY_HWRT_SOFTSUN: the game still samples the cascades' array or its cache this flip: the held copy stays usable)
-	if (SoftSun::Level() > 0)
+	if (SoftSun::HoldOn())
 		for (const auto& b: images)
 			if (b.image_id && b.desc.info.resources.layers >= 4 && SoftSun::IsCompanion(b.desc.info.data.address)) {
 				SoftSun::NoteUse(flip);
@@ -8126,7 +8126,7 @@ void RtSunAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::Comma
 	barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
 	        vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
 	g_rs.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
-	if (SoftSun::Level() > 0) {
+	if (SoftSun::HoldOn()) {
 		std::array<uint64_t, 8> others {};
 		size_t                  n = 0;
 		for (const auto& b: images)

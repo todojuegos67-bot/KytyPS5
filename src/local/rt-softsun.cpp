@@ -80,11 +80,24 @@ bool IsCompanion(uint64_t address) {
 	return false;
 }
 
+bool HoldOn() {
+	static const bool on = [] {
+		const auto lvl = [](const char* n) {
+			const char* v = std::getenv(n);
+			return v != nullptr && *v != '\0' ? std::atoi(v) : 0;
+		};
+		const char* h = std::getenv("KYTY_HWRT_SOFTSUN_HOLD");
+		if (h != nullptr && *h == '0' && h[1] == '\0') return false;
+		return Level() > 0 || lvl("KYTY_HWRT_SHADOW") > 0 || lvl("KYTY_RT_SUN") > 0;
+	}();
+	return on;
+}
+
 bool CopyUsable(uint64_t now, uint64_t copy_flip, bool& held) {
 	held = false;
 	if (copy_flip == ~0ull) return false;
 	if (now <= copy_flip + 8) return true;
-	if (Level() <= 0) return false;
+	if (!HoldOn()) return false;
 	static const uint64_t hold = [] {
 		const char* h = std::getenv("KYTY_HWRT_SOFTSUN_HOLD");
 		return static_cast<uint64_t>(h != nullptr && *h != '\0' ? std::clamp(std::atoi(h), 8, 1000000) : 3600);
@@ -100,7 +113,7 @@ bool CopyUsable(uint64_t now, uint64_t copy_flip, bool& held) {
 }
 
 void NoteFrame(bool ran, bool held) {
-	if (Level() <= 0) return;
+	if (!HoldOn()) return;
 	std::lock_guard lock(g.mutex);
 	const auto now = std::chrono::steady_clock::now();
 	if (g.t0.time_since_epoch().count() == 0) g.t0 = now;
