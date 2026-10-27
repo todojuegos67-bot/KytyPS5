@@ -9,7 +9,7 @@
 //    and keeps it cached in between, so the copy the pass needs was taken a few times a minute and the pass ran only the
 //    8 flips after each (9..40 frames in 10 s in the 10-27 logs). With this on, the last copy stays in use while the
 //    game keeps binding that shadow array (or the arrays bound with it at the copy: its cache) in any dispatch of the
-//    last 8 flips, up to KYTY_HWRT_SOFTSUN_HOLD flips (default 3600). Gated indoors by that use: a flip with no such
+//    last 8 flips (ds-rt-shadow: or any sun-shadow consumer dispatch), up to KYTY_HWRT_SOFTSUN_HOLD flips (default: no cap). Gated indoors by that use: a flip with no such
 //    binding ends it. While the copy is held, the composite may only darken (no brightening from a stale match).
 //  - Turns KYTY_HWRT_SHADOW on at its own level when that is unset.
 #include <cstdint>
@@ -28,7 +28,9 @@ void NoteCopy(uint64_t flip, uint64_t source, std::span<const uint64_t> others);
 bool HoldOn();
 bool IsCompanion(uint64_t address);
 // RtSunPrepare: whether a copy taken at copy_flip may still be used now (held: older than 8 flips).
-bool CopyUsable(uint64_t now, uint64_t copy_flip, bool& held);
+// (ds-rt-shadow) `why`: the refusal's cause (a string literal) when false. The held copy lasts while the game uses it
+// (its array, a companion, or any sun-shadow consumer dispatch: NoteUse), with no age cap unless KYTY_HWRT_SOFTSUN_HOLD is set.
+bool CopyUsable(uint64_t now, uint64_t copy_flip, bool& held, const char** why = nullptr);
 // Once a frame the pass ran (held or fresh) / was refused for want of a copy; logs a line every 10 s.
 void NoteFrame(bool ran, bool held);
 

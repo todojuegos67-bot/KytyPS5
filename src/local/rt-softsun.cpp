@@ -31,11 +31,11 @@ int Level() {
 		const int   q     = ::Libs::Graphics::FrameGen::ParseEnvLevel(value);
 		if (q > 0) {
 			static const char* names[] {"No", "Bajo", "Medio", "Alto"};
-			std::printf("SOFTSUN: KYTY_HWRT_SOFTSUN=%d (%s): sun %.2f deg, cascade copy held while in use (up to %d flips)\n", q,
+			std::printf("SOFTSUN: KYTY_HWRT_SOFTSUN=%d (%s): sun %.2f deg, cascade copy held while in use (up to %d flips; -1: no cap)\n", q,
 			            names[q], 0.53 * (q == 1 ? 1.0 : q == 2 ? 1.5 : 2.0),
 			            [] {
 				            const char* h = std::getenv("KYTY_HWRT_SOFTSUN_HOLD");
-				            return h != nullptr && *h != '\0' ? std::clamp(std::atoi(h), 8, 1000000) : 3600;
+				            return h != nullptr && *h != '\0' ? std::clamp(std::atoi(h), 8, 1000000) : -1;
 			            }());
 			std::fflush(stdout);
 		}
@@ -94,21 +94,28 @@ bool HoldOn() {
 	return on;
 }
 
-bool CopyUsable(uint64_t now, uint64_t copy_flip, bool& held) {
+bool CopyUsable(uint64_t now, uint64_t copy_flip, bool& held, const char** why) {
 	held = false;
-	if (copy_flip == ~0ull) return false;
+	const auto refuse = [&](const char* w) {
+		if (why != nullptr) *why = w;
+		return false;
+	};
+	if (copy_flip == ~0ull) return refuse("no cascade copy yet");
 	if (now <= copy_flip + 8) return true;
-	if (!HoldOn()) return false;
+	if (!HoldOn()) return refuse("copy older than 8 flips (hold off)");
+	// (ds-rt-shadow) no age cap by default: the game re-renders (and binds, so we copy) the far cascade only when it moves;
+	// a still camera kept it for minutes and the old 3600-flip cap turned the RT sun off -> the game's shadow popped back.
 	static const uint64_t hold = [] {
 		const char* h = std::getenv("KYTY_HWRT_SOFTSUN_HOLD");
-		return static_cast<uint64_t>(h != nullptr && *h != '\0' ? std::clamp(std::atoi(h), 8, 1000000) : 3600);
+		return h != nullptr && *h != '\0' ? static_cast<uint64_t>(std::clamp(std::atoi(h), 8, 1000000)) : ~0ull / 2;
 	}();
 	uint64_t use = ~0ull;
 	{
 		std::lock_guard lock(g.mutex);
 		use = g.use_flip;
 	}
-	if (use == ~0ull || now > use + 8 || now > copy_flip + hold) return false;
+	if (use == ~0ull || now > use + 8) return refuse("game not using the sun shadows (indoors?)");
+	if (now > copy_flip + hold) return refuse("copy older than KYTY_HWRT_SOFTSUN_HOLD");
 	held = true;
 	return true;
 }

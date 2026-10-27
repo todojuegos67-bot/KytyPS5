@@ -18,6 +18,9 @@ bool     CameraStill();
 uint32_t StillFrames();
 // After a pass that replaced inputs.color (before: the color it read).
 void Probe(vk::CommandBuffer command, GraphicContext* graphics, Pass pass, const UpscaleImage& before, const UpscaleImage& after);
+// (ds-rt-shadow) A pass's own events in this 10 s window, named by a string literal (up to 8 a pass): printed after its
+// numbers as "causes: <name> <count>, ..." so a flicker figure comes with what changed (render thread only).
+void Cause(Pass pass, const char* name, uint64_t count = 1);
 
 } // namespace Libs::Graphics::FrameGen::RtFlicker
 

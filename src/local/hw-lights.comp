@@ -145,11 +145,31 @@ void Trace(ivec2 pixel) {
 		ws[i] = i < count && z < lb.p1.z ? LightW(i, p, n) : 0.0;
 		W += ws[i];
 	}
+	bool smp = (pixel.x & 3) == 0 && (pixel.y & 3) == 0; // (statistics: 1 pixel in 16)
+	if (smp && (pixel.x & 15) == 0 && (pixel.y & 15) == 0 && z < lb.p1.z) {
+		// (ds-rt-shadow) why a pixel gets no light weight: in no light's reach / in reach but facing away / facing but outside
+		// the cone (1 pixel in 256; "lit pixels 0.0 %" with 16 lights in the 10-27 logs)
+		bool reach = false, facing = false, cone = false;
+		for (int i = 0; i < count; ++i) {
+			Light L  = lb.l[i];
+			vec3  v  = L.pos_r.xyz - p;
+			float d2 = dot(v, v);
+			if (d2 >= L.pos_r.w * L.pos_r.w || d2 < 1e-6) continue;
+			reach = true;
+			vec3 ld = v * inversesqrt(d2);
+			if (dot(n, ld) <= 0.0) continue;
+			facing = true;
+			if (L.dir_cos.w <= -1.5 || dot(-ld, L.dir_cos.xyz) > L.dir_cos.w) cone = true;
+		}
+		atomicAdd(stats.s[13], 1u);
+		if (reach) atomicAdd(stats.s[14], 1u);
+		if (facing) atomicAdd(stats.s[15], 1u);
+		if (cone) atomicAdd(stats.s[16], 1u);
+	}
 	if (!(W > 1e-6)) {
 		imageStore(out_img, pixel, vec4(0.0, 0.0, 0.0, 0.0));
 		return;
 	}
-	bool smp = (pixel.x & 3) == 0 && (pixel.y & 3) == 0; // (statistics: 1 pixel in 16)
 	if (smp) {
 		atomicAdd(stats.s[8], 1u);
 		// The TLAS / camera alignment probe: a ray from the camera to this pixel's reconstructed position hits within

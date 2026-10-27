@@ -8012,7 +8012,11 @@ void RtSunAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::Comma
 	std::vector<RtSunEntry> table;
 	uint64_t                address = 0;
 	// (KYTY_HWRT_SOFTSUN: the game still samples the cascades' array or its cache this flip: the held copy stays usable)
-	if (SoftSun::HoldOn())
+	// (ds-rt-shadow: or any sun-shadow consumer dispatch, the game's own shadow apply: 10-27 logs, the cascades' array was
+	// bound only 2-18 flips in 10 s and its companions none, so the held copy was refused 270-480 frames of ~490 and the
+	// RT sun switched on and off against the game's shadow: the sun RTFLICKER 1.5-8 %)
+	if (SoftSun::HoldOn() && IsShadowConsumer(cs_hash)) SoftSun::NoteUse(flip);
+	else if (SoftSun::HoldOn())
 		for (const auto& b: images)
 			if (b.image_id && b.desc.info.resources.layers >= 4 && SoftSun::IsCompanion(b.desc.info.data.address)) {
 				SoftSun::NoteUse(flip);
@@ -8287,7 +8291,9 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 	}
 	const uint64_t flips = g_flips_taken.load(std::memory_order_relaxed);
 	bool held = false; // (KYTY_HWRT_SOFTSUN: a copy older than 8 flips the game still uses)
-	if (table.empty() || !SoftSun::CopyUsable(flips, copy_flip, held)) return false;
+	const char* why = "no cascade copy yet";
+	if (table.empty() || !SoftSun::CopyUsable(flips, copy_flip, held, &why)) return RtFlicker::Cause(RtFlicker::Sun, why), false;
+	RtFlicker::Cause(RtFlicker::Sun, held ? "frames on a held cascade copy" : "frames on a fresh cascade copy");
 	std::array<float, 16> pc {};
 	for (int i = 0; i < 4; ++i)
 		for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
@@ -8361,7 +8367,10 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 	f[5] = forced_bias >= 0.0f ? forced_bias : static_cast<float>(g_rs.bias_m);
 	f[6] = std::floor(debug);
 	f[7] = size;
-	f[8] = std::floor(pcf), f[9] = contact, f[10] = band, f[11] = held ? 0.0f : lift; // (held copy: darkening only)
+	// (ds-rt-shadow) the same brightening on a held copy as on a fresh one: the copy is the game's current cascade (it
+	// re-renders and binds it, so we copy, when it moves); darkening-only while held switched the lift off 8 flips after
+	// each copy and on again at the next: a still-camera pop at every copy.
+	f[8] = std::floor(pcf), f[9] = contact, f[10] = band, f[11] = lift;
 	f[12] = reach;
 	for (size_t i = 0; i < cs.size(); ++i) {
 		float* c = f + 16 + i * 16;
@@ -8797,7 +8806,11 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			held = g_flips_taken.load(std::memory_order_relaxed) > g_rs.copy_flip + 8;
 		}
 		SoftSun::NoteFrame(ok, held);
-		if (!ok) return said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
+		// (ds-rt-shadow) a refused frame ends the history: the next run must not blend a visibility many frames old
+		if (!ok) return g_cs.history_valid = false, said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
+		// (ds-rt-shadow) a usable copy is the game's sun still there: the latch does not age out (20 s) on a still camera that
+		// gives no new cascade draws, which faded the RT sun out and the game's shadow back in
+		if (g_cs.latched && !g_cs.switching) g_cs.last_fresh = std::chrono::steady_clock::now();
 	}
 	CShadowCamera(view, m);
 	if (g_cs.hyp >= 0 && (CShadowLeft() & (1u << g_cs.hyp)) == 0) {
@@ -8806,6 +8819,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		            names[g_cs.hyp % 6], g_cs.hyp < 6 ? "+1" : "-1");
 		std::fflush(stdout);
 		g_cs.hyp = -1, g_cs.history_valid = false;
+		if (sun_mode) RtFlicker::Cause(RtFlicker::Sun, "calibration redone");
 	}
 
 	const auto now = std::chrono::steady_clock::now();
@@ -9024,6 +9038,8 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// The fade: in over 1 s once everything is known, out over 0.3 s on a change or an absence.
 	const bool target = g_cs.latched && !g_cs.switching && !absent && hyp >= 0 && space != 0;
 	g_cs.fade         = std::clamp(g_cs.fade + (target ? dt / 1.0f : -dt / 0.3f), 0.0f, 1.0f);
+	if (g_cs.fade > 0.0f && g_cs.fade < 1.0f) RtFlicker::Cause(RtFlicker::Sun, target ? "fading in" : "fading out (sun changed / unseen)");
+	if (!g_cs.history_valid) RtFlicker::Cause(RtFlicker::Sun, "history reset");
 	if (!g_cs.latched || g_cs.fade <= 0.0f) {
 		g_cs.history_valid = false;
 		return said_once(hyp < 0 ? "calibrating world up (turn the camera; look at some floor)"

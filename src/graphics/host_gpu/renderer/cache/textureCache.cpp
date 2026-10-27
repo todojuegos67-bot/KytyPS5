@@ -2720,6 +2720,7 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 			auto&    owner   = found->second;
 			uint32_t kept    = 0;
 			uint32_t changed = 0;
+			uint32_t first_up = 0, reup = 0;
 			std::erase_if(picked, [&](uint32_t layer) {
 				auto& state = owner.state[layer];
 				if ((state & LayerRendered) == 0) {
@@ -2730,6 +2731,7 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 						++kept;
 						return true;
 					}
+					++((state & LayerUploaded) != 0 ? reup : first_up);
 					state             = LayerUploaded;
 					owner.hash[layer] = now;
 					return false;
@@ -2769,6 +2771,8 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 			auto* pool = ShadowPoolTrace::Find(base, layers, info.extent.width, info.extent.height);
 			ShadowPoolTrace::Count(pool, &ShadowPoolTrace::Pool::refresh_kept, kept);
 			ShadowPoolTrace::Count(pool, &ShadowPoolTrace::Pool::refresh_changed, changed);
+			ShadowPoolTrace::Count(pool, &ShadowPoolTrace::Pool::refresh_first, first_up);
+			ShadowPoolTrace::Count(pool, &ShadowPoolTrace::Pool::refresh_reup, reup);
 		}
 	}
 	if (picked.empty()) {
