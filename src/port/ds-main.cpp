@@ -248,14 +248,14 @@ LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 				hint     = g_splash.hint;
 			}
 			if (!hint.empty()) {
-				HFONT small = CreateFontW(height * 3 / 4, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+				HFONT hint_font = CreateFontW(height * 3 / 4, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
 				                          CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-				HGDIOBJ prev = SelectObject(dc, small);
+				HGDIOBJ prev = SelectObject(dc, hint_font);
 				RECT    line = {rc.left + height, rc.bottom - height, rc.right - height, rc.bottom - height / 6};
 				SetTextColor(dc, RGB(200, 190, 170));
 				DrawTextW(dc, hint.c_str(), -1, &line, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 				SelectObject(dc, prev);
-				DeleteObject(small);
+				DeleteObject(hint_font);
 			}
 			if (progress >= 0.0f) {
 				// (10-27c) The precompile's progress bar above the status line.
