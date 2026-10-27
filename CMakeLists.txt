@@ -763,6 +763,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/rt-contact.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-flicker.h"
 	"${KYTY_SOURCE_DIR}/local/rt-flicker.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-softsun.h"
+	"${KYTY_SOURCE_DIR}/local/rt-softsun.cpp"
 	"${KYTY_SOURCE_DIR}/local/shine.h"
 	"${KYTY_SOURCE_DIR}/local/shine.cpp"
 	"${KYTY_SOURCE_DIR}/local/godrays.h"
