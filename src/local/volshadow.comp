@@ -1,0 +1,182 @@
+#version 460
+#extension GL_EXT_ray_query : require
+// KYTY_HWRT_VOLSHADOW=1|2|3 (volshadow.cpp): the sun's visibility along each view ray through the KYTY_HWRT scene TLAS,
+// for KYTY_GODRAYS' view-ray march (godrays.comp mode 2 b). Quarter resolution, on godrays' own quarter grid (one texel
+// = one godrays volume texel: no upsample there; godrays' composite does the depth-aware upsample to full resolution).
+// Modes (push.misc.x):
+//   0 trace     per quarter texel: the camera ray to the texel's surface (sky: 60 m), 6 / 10 / 16 points (jittered: IGN
+//               + a golden-ratio rotation per frame, decorrelated from godrays' own sequence); from each point one ray
+//               query toward the sun (world direction), first hit ends it. Out: the lit fraction of the ray (0..1), the
+//               texel's |view z|, 1. Statistics: rays, occluded rays; the camera -> texel alignment probe.
+//   1 temporal  the reprojected history (motion vectors, bilinear, each tap depth-tested), length up to 24 (still) /
+//               8 (moving), 1 on disocclusion; clamped to the raw 3x3 neighbourhood's mean +- k sigma (depth-aware).
+//   2 spatial   a depth-aware 3x3 bilateral blur (x2 dilated while the history is short) -> the output; the value written
+//               is mix(1, fraction, fade): 1 = "no cut" (godrays then gives exactly its own value: min(lit, 1 * tmax)).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D depth_tex;
+layout(binding = 1) uniform sampler2D motion_tex;
+layout(binding = 2) uniform sampler2D src_tex;   // temporal: raw; spatial: this frame's history
+layout(binding = 3) uniform sampler2D hist_prev; // temporal: last frame's history
+layout(binding = 4, rgba16f) uniform writeonly image2D out_img;
+layout(binding = 5, std430) readonly buffer Scene {
+	vec4 ivp[4]; // clip -> world (rows)
+	vec4 cam;    // world camera position
+	vec4 sun;    // world direction to the sun (unit), w: ray length (m)
+	vec4 p0;     // x: y sign of row 0 (-1: NDC y +1), y: max march (m), z: fade (0..1), w: unused
+} sc;
+layout(binding = 6) uniform accelerationStructureEXT tlas;
+layout(binding = 7, std430) buffer Stats { uint s[]; } stats;
+
+layout(push_constant) uniform Push {
+	vec4  depth_map; // M[10], M[14], M[11], M[15]
+	vec4  size;      // render w, h, quarter w, h
+	vec4  motion;    // motion scale x, y, history valid, steps
+	ivec4 misc;      // mode, frame, -, -
+} push;
+
+bool  Bad(float x) { return isnan(x) || isinf(x); }
+float Fin(float x, float lo, float hi) { return Bad(x) ? lo : clamp(x, lo, hi); }
+float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+float ViewZ(float d) {
+	float den = d * push.depth_map.z - push.depth_map.x;
+	return abs(den) > 1e-12 ? (push.depth_map.y - d * push.depth_map.w) / den : 1e6;
+}
+bool IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e3; }
+vec3 WorldPos(vec2 uv, float d) {
+	vec4 c = vec4(uv.x * 2.0 - 1.0, sc.p0.x * (uv.y * 2.0 - 1.0), d, 1.0);
+	vec4 w = vec4(dot(sc.ivp[0], c), dot(sc.ivp[1], c), dot(sc.ivp[2], c), dot(sc.ivp[3], c));
+	return w.xyz / (abs(w.w) > 1e-20 ? w.w : 1e-20);
+}
+bool SameDepth(float a, float b, float tol) { return abs(a - b) < tol * max(b, 1.0); }
+vec4 Tex(sampler2D t, ivec2 q) {
+	vec4 v = texelFetch(t, q, 0);
+	return vec4(Fin(v.x, 0.0, 1.0), Bad(v.y) ? 2e3 : clamp(v.y, 0.01, 2e3), Fin(v.z, 0.0, 64.0), 1.0);
+}
+
+void Trace(ivec2 q) {
+	vec2 qs = push.size.zw;
+	if (q.x >= int(qs.x) || q.y >= int(qs.y)) return;
+	vec2  uv  = (vec2(q) + 0.5) / qs; // (godrays' quarter texel centre: the same depth it reads)
+	float d   = textureLod(depth_tex, uv, 0).r;
+	bool  sky = IsSky(d);
+	float vz  = sky ? 2e3 : abs(ViewZ(d));
+	vec3  o   = sc.cam.xyz;
+	// (the sky: a far point on the same ray; the clip depth of a mid point is enough for a direction)
+	vec3  P   = WorldPos(uv, sky ? 0.5 : d);
+	vec3  dv  = P - o;
+	float len = length(dv);
+	if (!(len > 1e-4) || Bad(len)) {
+		imageStore(out_img, q, vec4(1.0, vz, 1.0, 1.0));
+		return;
+	}
+	vec3  dir  = dv / len;
+	float tmax = sky ? sc.p0.y : min(len, sc.p0.y);
+	int   n    = int(push.motion.w);
+	float j    = fract(Ign(vec2(q) + vec2(17.0, 59.0)) + float(push.misc.y & 1023) * 0.61803399 + 0.5);
+	float dt   = tmax / float(n);
+	vec3  L    = sc.sun.xyz;
+	float lit  = 0.0;
+	uint  occ  = 0u;
+	for (int i = 0; i < n; ++i) {
+		vec3 x = o + dir * ((float(i) + j) * dt);
+		rayQueryEXT rq;
+		rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xff, x, 0.05, L, sc.sun.w);
+		while (rayQueryProceedEXT(rq)) {}
+		bool hit = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+		lit += hit ? 0.0 : 1.0;
+		occ += hit ? 1u : 0u;
+	}
+	float fr = lit / float(n);
+	// Statistics, one texel in 16: rays, occluded; the alignment probe (camera -> texel: a hit within 5 % of its distance).
+	if (((q.x | q.y) & 3) == 0) {
+		atomicAdd(stats.s[0], uint(n));
+		atomicAdd(stats.s[1], occ);
+		if (!sky && len < 200.0) {
+			rayQueryEXT rq;
+			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xff, o, 0.05, dir, len * 1.1 + 0.5);
+			while (rayQueryProceedEXT(rq)) {}
+			atomicAdd(stats.s[2], 1u);
+			if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT &&
+			    abs(rayQueryGetIntersectionTEXT(rq, true) - len) < 0.05 * len + 0.1)
+				atomicAdd(stats.s[3], 1u);
+		}
+	}
+	imageStore(out_img, q, vec4(Fin(fr, 0.0, 1.0), vz, 1.0, 1.0));
+}
+
+void Temporal(ivec2 q) {
+	vec2 qs = push.size.zw;
+	if (q.x >= int(qs.x) || q.y >= int(qs.y)) return;
+	ivec2 qm = ivec2(qs) - 1;
+	vec4  c0 = Tex(src_tex, q);
+	float vz = c0.y;
+	float m1 = 0.0, m2 = 0.0, wn = 0.0;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			vec4 t = Tex(src_tex, clamp(q + ivec2(x, y), ivec2(0), qm));
+			if (!(x == 0 && y == 0) && !SameDepth(t.y, vz, 0.2)) continue;
+			m1 += t.x, m2 += t.x * t.x, wn += 1.0;
+		}
+	m1 /= max(wn, 1.0), m2 /= max(wn, 1.0);
+	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
+	float acc = m1, n = 1.0;
+	if (push.motion.z > 0.0) {
+		vec2 rs = push.size.xy;
+		vec2 uv = (vec2(q) + 0.5) / qs;
+		vec2 mv = textureLod(motion_tex, uv, 0).xy * push.motion.xy;
+		bool mv_ok = !(Bad(mv.x) || Bad(mv.y)) && all(lessThan(abs(mv), rs));
+		vec2 pq = mv_ok ? (uv + mv / rs) * qs - 0.5 : vec2(-10.0);
+		float hs = 0.0, hn = 0.0, hw = 0.0;
+		if (mv_ok && all(greaterThan(pq, vec2(-1.0))) && all(lessThan(pq, qs))) {
+			ivec2 p0 = ivec2(floor(pq));
+			vec2  f  = clamp(pq - vec2(p0), 0.0, 1.0);
+			for (int k = 0; k < 4; ++k) {
+				ivec2 o  = ivec2(k & 1, k >> 1);
+				ivec2 pp = p0 + o;
+				if (any(lessThan(pp, ivec2(0))) || any(greaterThan(pp, qm))) continue;
+				vec4  h  = Tex(hist_prev, pp);
+				float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+				if (h.z < 0.5 || !SameDepth(h.y, vz, 0.2)) continue;
+				hs += h.x * bw, hn += h.z * bw, hw += bw;
+			}
+		}
+		if (hw > 0.3) {
+			float h     = hs / hw;
+			float still = 1.0 - smoothstep(0.1, 1.5, length(mv));
+			float nmax  = mix(8.0, 24.0, still);
+			float k     = mix(1.25, 3.0, still);
+			h   = clamp(h, max(m1 - k * sigma, 0.0) - 1e-3, min(m1 + k * sigma, 1.0) + 1e-3);
+			n   = clamp(hn + 1.0, 1.0, nmax);
+			acc = mix(h, c0.x, 1.0 / n);
+		}
+	}
+	imageStore(out_img, q, vec4(Fin(acc, 0.0, 1.0), vz, n, 1.0));
+}
+
+void Spatial(ivec2 q) {
+	vec2 qs = push.size.zw;
+	if (q.x >= int(qs.x) || q.y >= int(qs.y)) return;
+	ivec2 qm = ivec2(qs) - 1;
+	vec4  c  = Tex(src_tex, q);
+	int   st = c.z < 4.0 ? 2 : 1;
+	float s = c.x * 4.0, w = 4.0;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			if (x == 0 && y == 0) continue;
+			vec4  t  = Tex(src_tex, clamp(q + ivec2(x, y) * st, ivec2(0), qm));
+			float gw = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
+			float dw = exp(-abs(t.y - c.y) / max(0.1 * c.y, 0.1));
+			s += t.x * gw * dw, w += gw * dw;
+		}
+	float fr = Fin(s / w, 0.0, 1.0);
+	float fade = clamp(sc.p0.z, 0.0, 1.0);
+	imageStore(out_img, q, vec4(mix(1.0, fr, fade), c.y, c.z, 1.0));
+}
+
+void main() {
+	ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+	if (push.misc.x == 0) Trace(q);
+	else if (push.misc.x == 1) Temporal(q);
+	else Spatial(q);
+}

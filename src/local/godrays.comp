@@ -35,6 +35,7 @@ layout(binding = 4, rgba16f) uniform writeonly image2D vol_out;    // this frame
 layout(binding = 5, rgba16f) uniform writeonly image2D out_img;    // the composited color (render size)
 layout(binding = 8) uniform sampler2D aux_tex;                     // temporal: raw; spatial: accumulated
 layout(binding = 9, rgba16f) uniform writeonly image2D aux_out;    // volume: raw; spatial: filtered
+layout(binding = 10) uniform sampler2D rt_vis;                     // KYTY_HWRT_VOLSHADOW: the TLAS-lit fraction (misc.z & 4)
 layout(std430, binding = 6) buffer Frame {
 	vec4 hdr;        // x: 1.0 (exposure fallback), y: light threshold (exposed luminance), z: light slots, w: light radius (m)
 	uint stats[16];  // 0 frames, 1 lights in use summed, 2 sun on screen frames
@@ -314,6 +315,12 @@ void Volume(ivec2 q) {
 				}
 			}
 			lit += vis * dt;
+		}
+		// (KYTY_HWRT_VOLSHADOW: the TLAS's visibility along the same ray, quarter grid, filtered; only removes light)
+		if ((push.misc.z & 4) != 0) {
+			float rv = texelFetch(rt_vis, q, 0).x;
+			rv  = (isnan(rv) || isinf(rv)) ? 1.0 : clamp(rv, 0.0, 1.0);
+			lit = min(lit, rv * tmax);
 		}
 		float phase = clamp(Hg(dot(dir, L), 0.55) / 1.0, 0.0, 6.0) / 6.0; // (1 toward the sun, ~0.03 away)
 		// The shafts' contrast, not a uniform haze: lit length / 60 m, weighted by the phase.
