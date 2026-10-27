@@ -668,6 +668,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (graphics.device_fault_enabled) {
+		device_fault.deviceFault             = VK_TRUE;
+		device_fault.deviceFaultVendorBinary = VK_FALSE;
+		device_fault.pNext                   = const_cast<void*>(create_info.pNext);
+		create_info.pNext                    = &device_fault;
+	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -1044,6 +1051,17 @@ void WindowContext::CreateVulkan() {
 		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
+			}
+		}
+		// VK_EXT_device_fault: on a device lost, report what the GPU faulted on (address, type).
+		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
+			vk::PhysicalDeviceFeatures2        features2 {};
+			features2.pNext = &fault_features;
+			graphic_ctx.physical_device.getFeatures2(&features2);
+			if (fault_features.deviceFault) {
+				device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+				graphic_ctx.device_fault_enabled = true;
 			}
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&

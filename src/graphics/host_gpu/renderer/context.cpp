@@ -12,6 +12,10 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include <vector>
 #include <bit>
 #include <cstring>
 namespace Libs::Graphics {
@@ -49,8 +53,65 @@ void CommandBuffer::End() const {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
+namespace {
+struct RecentCommand {
+	uint32_t op, arg0, arg1, arg2, arg3;
+	uint64_t submit_id, arg4;
+};
+constexpr uint32_t                       RecentCommandCount = 48;
+std::array<RecentCommand, RecentCommandCount> g_recent_commands {};
+std::atomic<uint32_t>                    g_recent_command_next {0};
+} // namespace
+
+void ReportGpuDeviceLost(GraphicContext& graphics, const char* where) {
+	static std::atomic<bool> reported {false};
+	if (reported.exchange(true)) return;
+	std::printf("DeviceLost: detected in %s\n", where);
+	if (graphics.device_fault_enabled && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT != nullptr) {
+		VkDeviceFaultCountsEXT counts {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+		const VkDevice device = static_cast<VkDevice>(graphics.device);
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT(device, &counts, nullptr) == VK_SUCCESS) {
+			std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+			std::vector<VkDeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
+			VkDeviceFaultInfoEXT info {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+			info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+			info.pVendorInfos  = vendors.empty() ? nullptr : vendors.data();
+			counts.vendorBinarySize = 0;
+			const auto r = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT(device, &counts, &info);
+			std::printf("DeviceFault: result=%d description=\"%s\" addresses=%u vendor=%u\n", static_cast<int>(r),
+			            info.description, counts.addressInfoCount, counts.vendorInfoCount);
+			for (const auto& a: addresses) {
+				std::printf("DeviceFault:   address type=%d addr=0x%016llx precision=0x%llx\n",
+				            static_cast<int>(a.addressType), static_cast<unsigned long long>(a.reportedAddress),
+				            static_cast<unsigned long long>(a.addressPrecision));
+			}
+			for (const auto& v: vendors) {
+				std::printf("DeviceFault:   vendor \"%s\" code=0x%llx data=0x%llx\n", v.description,
+				            static_cast<unsigned long long>(v.vendorFaultCode),
+				            static_cast<unsigned long long>(v.vendorFaultData));
+			}
+		} else {
+			std::printf("DeviceFault: vkGetDeviceFaultInfoEXT failed\n");
+		}
+	} else {
+		std::printf("DeviceFault: VK_EXT_device_fault not available\n");
+	}
+	const auto next = g_recent_command_next.load(std::memory_order_relaxed);
+	const auto count = std::min(next, RecentCommandCount);
+	std::printf("DeviceLost: last %u recorded commands (op 0=dispatch 1=draw 2=draw-auto 9=dispatch-indirect), oldest first:\n", count);
+	for (uint32_t i = next - count; i != next; ++i) {
+		const auto& e = g_recent_commands[i % RecentCommandCount];
+		std::printf("DeviceLost:   submit=%llu op=%u args=%u,%u,%u,%u addr=0x%016llx\n",
+		            static_cast<unsigned long long>(e.submit_id), e.op, e.arg0, e.arg1, e.arg2, e.arg3,
+		            static_cast<unsigned long long>(e.arg4));
+	}
+	std::fflush(stdout);
+}
+
 void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
                                  uint32_t arg2, uint32_t arg3, uint64_t arg4) {
+	g_recent_commands[g_recent_command_next.fetch_add(1, std::memory_order_relaxed) % RecentCommandCount] = {
+	    op, arg0, arg1, arg2, arg3, submit_id, arg4};
 	m_debug_op        = op;
 	m_debug_submit_id = submit_id;
 	m_debug_arg0      = arg0;

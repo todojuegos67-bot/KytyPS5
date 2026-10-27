@@ -43,6 +43,9 @@ enum class CommandBufferDebugOp : uint32_t {
 	Unknown,
 };
 
+// Device-lost report: VK_EXT_device_fault info (when enabled) and the last recorded commands.
+void ReportGpuDeviceLost(GraphicContext& graphics, const char* where);
+
 enum class DrawOffsetSource : uint8_t {
 	DrawState,
 	IndirectArgs,
