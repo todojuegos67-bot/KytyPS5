@@ -974,7 +974,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
+	{
+		PhaseStats::Scope phase {PhaseStats::PhStateShaders};
+		RefreshShaders(buffer, draw, color_output_mask, state);
+	}
+	PhaseStats::Scope targets_phase {PhaseStats::PhStateTargets};
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
 		return false;
 	}

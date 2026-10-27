@@ -1,3 +1,5 @@
+#include "graphics/phaseStats.h"
+#include <optional>
 #include "graphics/drawDiff.h"
 #include "graphics/frameCosts.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -893,6 +895,7 @@ struct PipelineCache::ProgramCache {
 		BufferCache::SetReadbackStatsShader(params.hash);
 		DrawDiff::t_shader = params.hash;
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		std::optional<PhaseStats::Scope> prog_phase {std::in_place, PhaseStats::PhProgKey};
 		{
 			KYTY_PROFILER_BLOCK("ProgramCache::BuildKey");
 			lookup_key.stage           = stage;
@@ -916,6 +919,8 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		auto entry = programs.end();
+		prog_phase.reset();
+		prog_phase.emplace(PhaseStats::PhProgLookup);
 		{
 			KYTY_PROFILER_BLOCK("ProgramCache::Lookup");
 			if (unsupported.contains(lookup_key)) {
@@ -941,6 +946,8 @@ struct PipelineCache::ProgramCache {
 		}
 		if (entry != programs.end()) {
 			bool materialized = false;
+			prog_phase.reset();
+			prog_phase.emplace(PhaseStats::PhProgMaterialize);
 			{
 				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
 				materialized = Materialize(entry->second, runtime, read_chunks);
@@ -970,6 +977,8 @@ struct PipelineCache::ProgramCache {
 				return ShaderProgram {};
 			}
 			auto permutation = entry->second.permutations.end();
+			prog_phase.reset();
+			prog_phase.emplace(PhaseStats::PhProgFind);
 			{
 				KYTY_PROFILER_BLOCK("ProgramCache::FindPermutation");
 				permutation = std::ranges::find_if(
@@ -991,6 +1000,8 @@ struct PipelineCache::ProgramCache {
 
 		// A program (or permutation) this session has not built yet: recompiled on the GPU
 		// thread. Wolverine run 54: the 0.3-0.7 s frames while turning were spent here.
+		prog_phase.reset();
+		prog_phase.emplace(PhaseStats::PhProgRecompile);
 		KYTY_PROFILER_BLOCK("ProgramCache::Recompile", profiler::colors::RedA100);
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {

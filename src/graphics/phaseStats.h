@@ -44,6 +44,13 @@ enum Phase : int {
 	PhDrawCommit,
 	PhDispatchTotal,
 	PhDispatchBindings,
+	PhStateShaders,
+	PhStateTargets,
+	PhProgKey,
+	PhProgLookup,
+	PhProgMaterialize,
+	PhProgFind,
+	PhProgRecompile,
 	Count
 };
 
@@ -52,7 +59,9 @@ inline const char* const kNames[Count] = {"gpu.idle",       "gpu.cmd",       "gp
                                           "render.fault",   "render.gpuwait", "other.sync",    "other.fault",
                                           "other.gpuwait",
                                           "draw.total", "draw.lock", "draw.state", "draw.bindings", "draw.vertex",
-                                          "draw.pipeline", "draw.targets", "draw.commit", "dispatch.total", "dispatch.bindings"};
+                                          "draw.pipeline", "draw.targets", "draw.commit", "dispatch.total", "dispatch.bindings",
+                                          "state.shaders", "state.targets", "prog.key", "prog.lookup",
+                                          "prog.materialize", "prog.find", "prog.recompile"};
 
 inline std::atomic<uint64_t> g_us[Count] {};
 inline std::atomic<uint64_t> g_calls[Count] {};
