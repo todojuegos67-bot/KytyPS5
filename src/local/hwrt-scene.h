@@ -133,6 +133,17 @@ void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageVie
 // (KYTY_HWRT_LIGHTS, hw-lights.cpp) The G-buffer camera's view-projection of the last captured frame (the TLAS's world;
 // row-major, clip = M * world); false until one was seen.
 bool SceneCamera(std::array<float, 16>& vp);
+// (KYTY_HWRT_WATER, rt-water.cpp) The water surfaces' own TLAS, built this frame next to the scene's from the draws of
+// the water pixel shaders (FrameGen::RtWaterIsWaterPs; never in the scene TLAS, so no other pass sees them), and its
+// materials words (8 per instance, as RayInfo's: PS, VS, id, world vertices, indices). False: none this frame.
+struct WaterScene {
+	vk::AccelerationStructureKHR tlas = nullptr;
+	vk::DeviceAddress            materials = 0;
+	uint32_t                     instances = 0;
+};
+[[nodiscard]] bool CurrentWaterScene(WaterScene& out);
+// (the 10 s log) water draws noted, water meshes known / built, frames with a water TLAS (counters since the start)
+void WaterCounters(uint64_t& draws, uint32_t& known, uint32_t& built, uint64_t& frames);
 
 // (hwrt2g, KYTY_HWRT_AO / KYTY_HWRT_GI: hwrt-gi.cpp) The TLAS built this frame and its camera (clip -> world rows, world ->
 // clip rows, the position), for a ray query pass recorded after the build in the same frame. False: no scene this frame.

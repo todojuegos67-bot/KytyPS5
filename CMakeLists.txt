@@ -515,6 +515,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${hwlights_header}")
+# KYTY_HWRT_WATER: ray-traced mirror reflections on water / puddles through the scene TLAS (src/local/rt-water.cpp).
+set(rtwater_source "${KYTY_SOURCE_DIR}/local/rt-water.comp")
+set(rtwater_spv "${gpu_tiler_generated_dir}/rtwater.spv")
+set(rtwater_header "${gpu_tiler_generated_dir}/rtwater_spv.h")
+add_custom_command(
+	OUTPUT "${rtwater_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rtwater_spv}" "${rtwater_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rtwater_spv} -DOUTPUT=${rtwater_header}
+	        -DSYMBOL=RTWATER_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rtwater_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rtwater_header}")
 # KYTY_RT_FLICKER: the RT passes' flicker self-check (src/local/rt-flicker.cpp).
 set(rtflicker_source "${KYTY_SOURCE_DIR}/local/rt-flicker.comp")
 set(rtflicker_spv "${gpu_tiler_generated_dir}/rtflicker.spv")
@@ -761,6 +776,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/hw-lights.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-contact.h"
 	"${KYTY_SOURCE_DIR}/local/rt-contact.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-water.h"
+	"${KYTY_SOURCE_DIR}/local/rt-water.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-flicker.h"
 	"${KYTY_SOURCE_DIR}/local/rt-flicker.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-softsun.h"
