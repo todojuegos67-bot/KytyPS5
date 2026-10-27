@@ -30,6 +30,8 @@
 
 #include <intrin.h>
 
+#include "mem-guard.h"
+
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -49,6 +51,7 @@ struct State {
 	std::atomic<uint64_t> ticks {0};         // time in the commits (QueryPerformanceCounter ticks)
 	std::atomic<uint64_t> max_ticks {0};     // the longest single commit
 	std::atomic<uint64_t> failures {0};
+	std::atomic<uint32_t> last_error {0};   // the last failed commit's GetLastError
 };
 
 inline State& Get() {
@@ -127,6 +130,7 @@ inline bool CommitReservedLocked(State& state, uint64_t begin, uint64_t end, boo
 			if (done) state.committed.fetch_add(piece_end - at, std::memory_order_relaxed);
 			else {
 				state.failures.fetch_add(1, std::memory_order_relaxed);
+				state.last_error.store(static_cast<uint32_t>(GetLastError()), std::memory_order_relaxed);
 				ok = false;
 			}
 		}
@@ -149,8 +153,15 @@ inline bool Prefault(const void* address, uint64_t size) {
 			return true;
 	}
 	AcquireSRWLockExclusive(&state.lock);
-	const bool ok = CommitReservedLocked(state, begin, end, false);
+	bool ok = CommitReservedLocked(state, begin, end, false);
 	ReleaseSRWLockExclusive(&state.lock);
+	for (int attempt = 0; !ok && MemGuard::IsOutOfMemoryError(state.last_error.load(std::memory_order_relaxed)) &&
+	                      MemGuard::ShouldRetry("guest memory commit (prefault)", end - begin, attempt);
+	     ++attempt) {
+		AcquireSRWLockExclusive(&state.lock);
+		ok = CommitReservedLocked(state, begin, end, false);
+		ReleaseSRWLockExclusive(&state.lock);
+	}
 	return ok;
 }
 
@@ -180,8 +191,18 @@ inline LONG CALLBACK Handler(EXCEPTION_POINTERS* pointers) {
 	if (begin < run_begin) begin = run_begin;
 	if (end > run_end) end = run_end;
 	AcquireSRWLockExclusive(&state.lock);
-	CommitReservedLocked(state, begin, end, true);
+	bool committed = CommitReservedLocked(state, begin, end, true);
 	ReleaseSRWLockExclusive(&state.lock);
+	// Refused for lack of commit: a release pass (MemGuard, outside the lock) and another try; still refused, the clear
+	// out-of-memory message instead of an access violation in guest code.
+	for (int attempt = 0; !committed && MemGuard::IsOutOfMemoryError(state.last_error.load(std::memory_order_relaxed));
+	     ++attempt) {
+		if (!MemGuard::ShouldRetry("guest memory commit (lazy)", end - begin, attempt))
+			MemGuard::FatalOutOfMemory("guest memory commit (lazy)", end - begin);
+		AcquireSRWLockExclusive(&state.lock);
+		committed = CommitReservedLocked(state, begin, end, true);
+		ReleaseSRWLockExclusive(&state.lock);
+	}
 	// Retried: committed now (a protection fault next goes to the emulator's handler), or, when the commit failed
 	// (commit limit), the same fault is not ours the next time round only if the page changed; leave it to the others.
 	MEMORY_BASIC_INFORMATION after {};

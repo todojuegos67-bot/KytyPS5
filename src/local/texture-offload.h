@@ -143,6 +143,11 @@ struct State {
 	uint64_t ages[4] {}; // <1 s, <10 s, <60 s, later
 	uint64_t restores = 0, restore_bytes = 0, restore_us = 0, restore_us_max = 0, lost = 0, missed = 0, missed_bytes = 0;
 	uint64_t checked = 0, checked_bytes = 0, check_failed = 0;
+	// (ramtarget-1025) The restores split: those a thread waited for while they ran (render thread or a game thread
+	// through it: a hitch is one of these) and the asynchronous ones (an image gone: a download recorded with the frame's
+	// work, written back by the offload worker; nobody waits unless it touches the range meanwhile, counted in waits).
+	uint64_t blocking = 0, blocking_us_max = 0, async = 0, async_us_max = 0;
+	std::atomic<uint64_t> waits {0}, wait_us {0}, wait_us_max {0};
 	// Ranges being restored (any thread), and buffer uploads that waited for an asynchronous restore (WaitBeforeRead).
 	std::atomic<uint64_t> restoring_ranges {0}, read_waits {0}, read_wait_bytes {0};
 	std::unordered_map<uint64_t, uint64_t> rips;    // the emulator's instructions -> touches
@@ -275,7 +280,16 @@ inline bool RestoringLocked(State& state, uint64_t vaddr, uint64_t size) {
 
 // Until no other thread (nor the offload worker) restores a range over [vaddr, vaddr + size).
 inline void WaitRestores(uint64_t vaddr, uint64_t size) {
+	if (!IsRestoring(vaddr, size)) return;
+	const auto start = std::chrono::steady_clock::now();
 	while (IsRestoring(vaddr, size)) std::this_thread::yield();
+	auto&      state = Get();
+	const auto us    = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+	state.waits.fetch_add(1, std::memory_order_relaxed);
+	state.wait_us.fetch_add(us, std::memory_order_relaxed);
+	for (uint64_t max = state.wait_us_max.load(std::memory_order_relaxed);
+	     us > max && !state.wait_us_max.compare_exchange_weak(max, us, std::memory_order_relaxed);) {}
 }
 
 // Whether a read of [vaddr, vaddr + size) through the backing view must wait for a restore first (cheap when none
@@ -372,7 +386,7 @@ inline std::vector<Restoring> BeginRestore(uint64_t vaddr, uint64_t size, Touch 
 }
 
 // The restored ranges out of the maps (their bytes back and read watchers removed: other touches go on).
-inline void EndRestore(const std::vector<Restoring>& ranges, uint64_t bytes, uint64_t us, uint64_t lost) {
+inline void EndRestore(const std::vector<Restoring>& ranges, uint64_t bytes, uint64_t us, uint64_t lost, bool async = false) {
 	auto&           state = Get();
 	std::lock_guard lock(state.mutex);
 	for (const auto& restored: ranges) {
@@ -388,6 +402,13 @@ inline void EndRestore(const std::vector<Restoring>& ranges, uint64_t bytes, uin
 	state.restore_us += us;
 	state.restore_us_max = std::max(state.restore_us_max, us);
 	state.lost += lost;
+	if (async) {
+		state.async++;
+		state.async_us_max = std::max(state.async_us_max, us);
+	} else {
+		state.blocking++;
+		state.blocking_us_max = std::max(state.blocking_us_max, us);
+	}
 }
 
 inline void NoteCheck(uint64_t images, uint64_t bytes, uint64_t failed) {
@@ -600,6 +621,13 @@ inline void Report(bool force) {
 		            state.restore_bytes / MiB, state.restore_us / 1000.0, state.restore_us_max / 1000.0,
 		            static_cast<unsigned long long>(state.lost), static_cast<unsigned long long>(state.missed), state.missed_bytes / MiB,
 		            static_cast<unsigned long long>(state.read_waits.load()), state.read_wait_bytes.load() / MiB);
+		// (A hitch is a blocking restore or a wait; an asynchronous one's time is its latency, GPU download included.)
+		std::printf("Texture offload: restores blocking %llu (at most %.1f ms), asynchronous %llu (latency at most %.1f ms, "
+		            "nobody waiting); waits for one in flight %llu (%.1f ms, at most %.1f ms)\n",
+		            static_cast<unsigned long long>(state.blocking), state.blocking_us_max / 1000.0,
+		            static_cast<unsigned long long>(state.async), state.async_us_max / 1000.0,
+		            static_cast<unsigned long long>(state.waits.load()), state.wait_us.load() / 1000.0,
+		            state.wait_us_max.load() / 1000.0);
 	}
 #if defined(_WIN32)
 	const auto exe  = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));

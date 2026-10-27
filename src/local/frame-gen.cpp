@@ -1,8 +1,10 @@
 #include "local/port-live.h"
 #include "frame-gen.h"
+#include "kbm-warp.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "fsr3-fg.h"
 #include "xess-sr.h"
+#include "hwrt-particles.h"
 #include "graphics/presentation/videoOut.h"
 #include <chrono>
 #include "live-census.h"
@@ -20,18 +22,29 @@
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 #include "local/vulkan-recording.h"
 #include "local/dyn-multiplier.h"
+#include "local/hwrt-gi.h"
 #include "gpu_tiler_shaders/taa_bypass_spv.h"
 #include "gpu_tiler_shaders/sharpen_spv.h"
 #include "gpu_tiler_shaders/ssgi_spv.h"
 #include "gpu_tiler_shaders/gtao_spv.h"
 #include "gpu_tiler_shaders/ssr_spv.h"
+#include "local/rt-reflections.h"
+#include "local/gbuf-view.h"
+#include "local/shine.h"
+#include "local/godrays.h"
+#include "local/rt-local-lights.h"
+#include "local/hw-lights.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
+#include "gpu_tiler_shaders/rtsun_spv.h"
+#include "gpu_tiler_shaders/rtsun_hw_spv.h"
+#include "local/hwrt-scene.h"
 #include "kernel/memory.h"
 #include <string>
 #endif
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -460,8 +473,15 @@ CameraFrame Decompose(const std::array<float, 16>& m) {
 	return c;
 }
 
+// DLSS evaluations NGX refused (Streamline's slEvaluateFeature says eOk all the same; its log has them): its output
+// image is then never written, the game black (issue #87).
+std::atomic<uint32_t> g_dlss_refusals {0};
+
 void LogMessage(sl::LogType type, const char* message) {
 	LOGF("Streamline[%d]: %s", static_cast<int>(type), message);
+	if (type == sl::LogType::eError && message != nullptr && std::strstr(message, "[sl.dlss]") != nullptr &&
+	    std::strstr(message, "evaluate feature failed") != nullptr)
+		g_dlss_refusals.fetch_add(1, std::memory_order_relaxed);
 	// KYTY_FRAMEGEN_VERBOSE: every message on stdout (the run log), not only errors.
 	static const bool verbose = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr;
 	if (type == sl::LogType::eError || verbose) {
@@ -744,8 +764,9 @@ bool Enabled() {
 bool DlssUpscaleWanted();
 bool TaaReplaceWanted();
 bool Capturing() {
+	// (KYTY_KBM_WARP: the frame's HUD-less composite, so that only the 3D is reprojected; kbm-warp.h.)
 	return Enabled() || Fsr3::Active() || Fsr3::UpscaleWanted() || DlssUpscaleWanted() || Xess::Wanted() ||
-	       TaaReplaceWanted();
+	       TaaReplaceWanted() || KbmWarp::HudlessWanted();
 }
 
 bool Requested() {
@@ -2019,6 +2040,18 @@ void SwapchainChanging() {
 #endif
 }
 
+static bool g_cut = false; // GPU thread: the current guest frame's upscale started a new history (NoteCut)
+
+void NoteCut() {
+	g_cut = true;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	g_discontinuity.store(true, std::memory_order_relaxed); // (DLSS-G: constants.reset at the next present)
+#endif
+	static std::atomic<uint32_t> cuts {0};
+	if (const auto count = cuts.fetch_add(1, std::memory_order_relaxed) + 1; count <= 4 || count % 200 == 0)
+		LOGF("frame generation: camera cut %u (the game reset its upscaler): no frame generated across it\n", count);
+}
+
 void NoteDroppedFrame() {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	g_discontinuity.store(true, std::memory_order_relaxed);
@@ -2071,7 +2104,7 @@ void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt, char path) {
 	g_camera.valid      = true;
 	// (The KYTY_KBM mouse: the camera's yaw, from the forward row.)
 	::Libs::Graphics::HostInputCameraForward(g_camera.view_proj[12], g_camera.view_proj[13], g_camera.view_proj[14]);
-	if (ContactShadowsWanted()) {
+	if (ContactShadowsWanted() || RtLocal::Wanted()) { // (rt-local-lights.cpp reads it too)
 		std::lock_guard lock(g_last_vp_mutex);
 		g_last_vp = g_camera.view_proj, g_have_last_vp = true;
 	}
@@ -2404,7 +2437,7 @@ int FlipSlot(std::span<const ImageId> targets) {
 
 void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageId target, uint32_t slot,
                     std::span<const TextureBinding> images, const std::function<void()>& redraw) {
-	if (!Enabled() && !Fsr3::Active()) return; // (capturing for upscaling only: no HUD-less image wanted)
+	if (!Enabled() && !Fsr3::Active() && !KbmWarp::HudlessWanted()) return; // (capturing for upscaling only: no HUD-less image wanted)
 	if (g_hudless_taken || slot >= rendering.num_color_attachments || FlipOf(target) == nullptr) return;
 	auto& flip = g_cache->GetImage(target);
 	// The HUD texture: of the full-screen-ish color images the composite samples, an 8-bit (or 10-bit) one with alpha
@@ -3455,6 +3488,7 @@ void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std:
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs, ImageId flip_id, Image& flip) {
 	inputs.valid       = false;
+	inputs.cut         = std::exchange(g_cut, false);
 	inputs.has_hudless = false;
 	inputs.hudless_composite = false;
 	g_cache            = &cache;
@@ -3597,11 +3631,13 @@ void AsVulkanImage(const UpscaleImage& in, VulkanImage& out) {
 	out.image  = in.image;
 }
 bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
-	VulkanImage color, depth, motion, output;
+	VulkanImage color, depth, motion, output, reactive;
 	AsVulkanImage(inputs.color, color);
 	AsVulkanImage(inputs.depth, depth);
 	AsVulkanImage(inputs.motion, motion);
 	AsVulkanImage(inputs.output, output);
+	const bool have_reactive = inputs.reactive.view != nullptr && inputs.reactive.image != nullptr; // (rtparticles)
+	if (have_reactive) AsVulkanImage(inputs.reactive, reactive);
 	const float fov = inputs.view_to_clip[5] != 0.0f ? 2.0f * std::atan(1.0f / std::fabs(inputs.view_to_clip[5])) : 1.0f;
 	bool done = false;
 	if (g_sr_kind == 2) {
@@ -3622,6 +3658,7 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		x.jitter[1]   = inputs.jitter_y;
 		x.mv_scale[0] = inputs.motion_scale_x;
 		x.mv_scale[1] = inputs.motion_scale_y;
+		if (have_reactive) x.mask = &reactive, x.mask_view = inputs.reactive.view;
 		done          = Xess::Upscale(x);
 	} else if (g_graphics_ctx != nullptr) {
 		static auto last = std::chrono::steady_clock::now();
@@ -3644,6 +3681,7 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		desc.mv_scale[1] = inputs.motion_scale_y;
 		desc.fov         = fov;
 		desc.z_near      = inputs.near_plane;
+		if (have_reactive) desc.reactive = &reactive;
 		done             = Fsr3::Upscale(*g_graphics_ctx, desc);
 	}
 	static bool said = false;
@@ -3663,6 +3701,19 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 	if (!g_upscale_ready) return false;
 	// Its own viewport: DLSS-G's (0) takes its constants and tags at the present.
 	const sl::ViewportHandle viewport {1};
+	// DLSS given up (the game's image stretched instead, renderSuperResolution.cpp): an input outside the sizes the
+	// mode takes (the NVIDIA app's DLSS override of the program can ask for another scale: 3802x2138-3840x2160 for a
+	// 1920x1080 input, issue #87), or NGX refusing its evaluations.
+	static bool given_up = false;
+	if (given_up) return false;
+	if (g_dlss_refusals.load(std::memory_order_relaxed) >= 3) {
+		given_up = true;
+		std::printf("DLSS super resolution: NGX refused it %u times (Streamline errors above): the game's image is "
+		            "upscaled without it from here on\n",
+		            g_dlss_refusals.load(std::memory_order_relaxed));
+		std::fflush(stdout);
+		return false;
+	}
 	static vk::Extent2D options_render {}, options_output {};
 	if (options_render != inputs.color.extent || options_output != inputs.output.extent) {
 		// The mode by the input's share of the output's height (DLSS takes any input size; the mode picks its model and
@@ -3698,6 +3749,17 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 		            static_cast<uint32_t>(options.mode), settings.renderWidthMin, settings.renderHeightMin,
 		            settings.renderWidthMax, settings.renderHeightMax);
 		std::fflush(stdout);
+		if (settings.renderWidthMax != 0 && settings.renderHeightMax != 0 &&
+		    (inputs.color.extent.width < settings.renderWidthMin || inputs.color.extent.width > settings.renderWidthMax ||
+		     inputs.color.extent.height < settings.renderHeightMin || inputs.color.extent.height > settings.renderHeightMax)) {
+			given_up = true;
+			std::printf("DLSS super resolution: the game renders %ux%u, outside what DLSS takes in this mode: the game's "
+			            "image is upscaled without it. A DLSS override for this program in the NVIDIA app (Super Resolution "
+			            "mode or scaling ratio) does this; set it back to the default for kyty_emulator.exe\n",
+			            inputs.color.extent.width, inputs.color.extent.height);
+			std::fflush(stdout);
+			return false;
+		}
 		options_render = inputs.color.extent;
 		options_output = inputs.output.extent;
 	}
@@ -3783,14 +3845,20 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 	}
 	const sl::Extent render {0, 0, inputs.color.extent.width, inputs.color.extent.height};
 	const sl::Extent full {0, 0, inputs.output.extent.width, inputs.output.extent.height};
-	const sl::ResourceTag tags[] {
+	// (rtparticles) KYTY_RT_PARTICLES=2: the particle mask as DLSS's bias-current-color hint (trust the current frame
+	// where particles, drawn without motion vectors, are).
+	const bool have_reactive = inputs.reactive.view != nullptr && inputs.reactive.image != nullptr;
+	auto       reactive      = resource(inputs.reactive); // (null handles when there is none: the tag is not given)
+	sl::ResourceTag tags[5] {
 	    sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
 	    sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &full),
 	    sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
 	    sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
+	    sl::ResourceTag(&reactive, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
 	};
+	const uint32_t tag_count = have_reactive ? 5u : 4u;
 	auto* command_buffer = reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(command));
-	if (const auto result = g_api.set_tag_for_frame(*token, viewport, tags, static_cast<uint32_t>(std::size(tags)), command_buffer);
+	if (const auto result = g_api.set_tag_for_frame(*token, viewport, tags, tag_count, command_buffer);
 	    result != sl::Result::eOk) {
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
@@ -3798,8 +3866,15 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 		return false;
 	}
 	const sl::BaseStructure* evaluate_inputs[] {&viewport};
+	// (Result::eWarnOutOfVRAM is not a failure: Streamline returns it in place of eOk, DLSS recorded, while the process
+	// uses all the video memory Windows budgets it - issue #85: an RTX 2060 at 5030 of 5187 MiB had DLSS's image
+	// stretched over from then on.)
 	if (const auto result = g_api.evaluate(sl::kFeatureDLSS, *token, evaluate_inputs, 1, command_buffer);
-	    result != sl::Result::eOk) {
+	    result == sl::Result::eWarnOutOfVRAM) {
+		static std::atomic<bool> reported {false};
+		if (!reported.exchange(true, std::memory_order_relaxed))
+			std::printf("DLSS super resolution: the video memory budget is used up (Streamline's warning); DLSS still runs\n");
+	} else if (result != sl::Result::eOk) {
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
 			std::printf("DLSS super resolution: slEvaluateFeature failed (%s)\n", sl::getResultAsStr(result));
@@ -3918,13 +3993,311 @@ void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float
 }
 } // namespace
 
+// ---- (rtparticles) KYTY_RT_PARTICLES: the particle pass's own emission for the RT "fire light", a reactive mask ----
+// How Demon's Souls draws particles (tools/local/static-precompile/files-PPSA01341_01.007.000.files, the engine's
+// coredata/enginesupport/shaders/_ps5/particle-*): 603 cooked particle compute shaders (one per emitter) simulate on
+// the GPU; particle-sort-prep / particle-sort (bitonic) order them; one engine pass, particle-translucent (main_vs +
+// 3 main_ps variants; ultralow / underwater / displacement / distortion / motionblur / fog / ui variants), draws them
+// blended onto the HDR scene color with the depth test on and depth writes off (they leave no depth, so the depth
+// buffer at a flame is the wall behind it); particle-lightmap-update lights them from the game's own lights;
+// particle-apply-distortion is a compute pass after them. The TAA / PS5 Pro super-resolution input (slot 1) is that
+// color after the pass: the SSGI emissive light already sees flames as bright pixels, but tells them from lit
+// surfaces only by lit-colour / G-buffer-albedo ratio and takes the whole pixel (flame + wall) as the radiance.
+//
+// Level 1 (KYTY_RT_PARTICLES=1): right before the frame's first blended, depth-write-off draw into the scene color
+// (the particle pass's first draw; KYTY_RT_PARTICLES_VS=<hex,...> pins the vertex shaders instead), the color is
+// copied (one render-size RGBA16F copy, ~0.05-0.1 ms on an RTX 5090 at 1440p, and a render-pass break). The SSGI
+// emissive light (ssgi.comp, binding 15) then takes color - copy, the particles' own emission, as the emitter
+// radiance: exact for additive particles (embers, sparks, flames, spell glow), alpha x (particle - background) for
+// alpha-blended ones; flames over bright lit surfaces are found too, lit stone is never a particle. Positions still
+// come from the depth buffer (the surface behind the flame): a particle depth would need the pass re-drawn with
+// depth writes, not done here.
+// Level 2 (KYTY_RT_PARTICLES=2): also an R8 reactive mask of that emission share (ssgi.comp mode 6, needs KYTY_SSGI
+// >= 1) for the upscaler: FSR 3.1's reactive + transparency-and-composition, XeSS's responsive pixels, DLSS's
+// bias-current-color hint - less ghosting / smearing of particles in the upscaler (frame generation takes no mask).
+// KYTY_RT_PARTICLES_REACTIVE (0..1, 0.8): the mask's strength.
+// KYTY_RT_PARTICLES_DEBUG=1: every 10 s the ordered passes of the last flip onto the scene color (draws by vertex /
+// pixel shader, blend, depth state, count; dispatches writing it; table / native-path draws), the copy's state, the
+// game's own reactive-mask slot (renderSuperResolution.cpp).
+namespace {
+struct RtPartCensusKey {
+	uint64_t vs = 0, ps = 0, address = 0;
+	uint32_t width = 0, height = 0;
+	int32_t  format = 0;
+	uint8_t  blend = 0, src = 0, dst = 0, comb = 0, zt = 0, zw = 0, indirect = 0, path = 0;
+	bool operator==(const RtPartCensusKey&) const = default;
+};
+uint64_t RtPartMix(uint64_t h, uint64_t v) {
+	h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+	return h * 0xff51afd7ed558ccdull;
+}
+struct RtPartCensusKeyHash {
+	size_t operator()(const RtPartCensusKey& k) const {
+		uint64_t h = RtPartMix(RtPartMix(RtPartMix(k.vs, k.ps), k.address), (uint64_t {k.width} << 32) | k.height);
+		h          = RtPartMix(h, static_cast<uint64_t>(static_cast<uint32_t>(k.format)));
+		h          = RtPartMix(h, uint64_t {k.blend} | (uint64_t {k.src} << 8) | (uint64_t {k.dst} << 16) | (uint64_t {k.comb} << 24) |
+		                              (uint64_t {k.zt} << 32) | (uint64_t {k.zw} << 40) | (uint64_t {k.indirect} << 48) | (uint64_t {k.path} << 56));
+		return static_cast<size_t>(h);
+	}
+};
+struct RtPartCensusEntry {
+	uint32_t order = 0, draws = 0, instances = 0, indices = 0;
+};
+struct RtPartDispatchKey {
+	uint64_t cs = 0, address = 0;
+	uint32_t width = 0, height = 0;
+	bool     operator==(const RtPartDispatchKey&) const = default;
+};
+struct RtPartDispatchKeyHash {
+	size_t operator()(const RtPartDispatchKey& k) const {
+		return static_cast<size_t>(RtPartMix(RtPartMix(k.cs, k.address), (uint64_t {k.width} << 32) | k.height));
+	}
+};
+struct RtPartState {
+	// The scene color images the upscaler read in the last flips (guest addresses; the game rotates them).
+	std::array<uint64_t, 4> colors {};
+	std::array<uint32_t, 4> color_w {}, color_h {};
+	uint32_t                color_next = 0;
+	// The pre-particle copy.
+	VulkanImage   pre;
+	vk::ImageView pre_view = nullptr;
+	uint64_t      pre_flip = UINT64_MAX, pre_address = 0;
+	bool          taken = false; // this flip
+	uint64_t      flip  = UINT64_MAX;
+	bool          resuming = false;
+	// Statistics: copies taken, flips with none, the copy's draw's shaders.
+	uint64_t copies = 0, flips_without = 0, uses = 0, misses = 0;
+	uint64_t copy_vs = 0, copy_ps = 0;
+	uint32_t copy_order = 0;
+	// Census (debug): the last flip's passes onto the scene color (and, in order, the first draw of each key).
+	std::unordered_map<RtPartCensusKey, RtPartCensusEntry, RtPartCensusKeyHash>       draws;
+	std::unordered_map<RtPartDispatchKey, RtPartCensusEntry, RtPartDispatchKeyHash>   dispatches;
+	uint32_t                                                                           order = 0;
+	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+};
+RtPartState g_rtpart;
+
+int RtParticlesLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_RT_PARTICLES");
+		return value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 2) : 0;
+	}();
+	return level;
+}
+bool RtPartColorKnown(uint64_t address, uint32_t width, uint32_t height, bool strict_size) {
+	for (uint32_t i = 0; i < g_rtpart.colors.size(); ++i)
+		if (g_rtpart.colors[i] != 0 && g_rtpart.colors[i] == address &&
+		    (!strict_size || (g_rtpart.color_w[i] == width && g_rtpart.color_h[i] == height)))
+			return true;
+	return false;
+}
+// A new flip: the census of the last one logged (every 10 s), everything reset.
+void RtPartNewFlip(uint64_t flip) {
+	if (g_rtpart.flip == flip) return;
+	if (g_rtpart.flip != UINT64_MAX && RtParticlesLevel() > 0 && !g_rtpart.taken) ++g_rtpart.flips_without;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_rtpart.last_log >= std::chrono::seconds(10) && g_rtpart.flip != UINT64_MAX) {
+		g_rtpart.last_log = now;
+		if (RtParticlesDebug()) {
+			std::vector<std::pair<RtPartCensusKey, RtPartCensusEntry>> list(g_rtpart.draws.begin(), g_rtpart.draws.end());
+			std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a.second.order < b.second.order; });
+			std::printf("RT particles census (flip %llu): %zu draw groups onto the upscaler's color images, %zu storage dispatches; "
+			            "copy taken %s (VS %016llx PS %016llx, pass #%u); %llu copies, %llu flips without, SSGI used %llu / missed %llu\n",
+			            static_cast<unsigned long long>(g_rtpart.flip), list.size(), g_rtpart.dispatches.size(),
+			            g_rtpart.taken ? "yes" : "no", static_cast<unsigned long long>(g_rtpart.copy_vs),
+			            static_cast<unsigned long long>(g_rtpart.copy_ps), g_rtpart.copy_order, static_cast<unsigned long long>(g_rtpart.copies),
+			            static_cast<unsigned long long>(g_rtpart.flips_without), static_cast<unsigned long long>(g_rtpart.uses),
+			            static_cast<unsigned long long>(g_rtpart.misses));
+			uint32_t shown = 0;
+			for (const auto& [k, e]: list) {
+				if (shown++ >= 48) break;
+				const char* path = k.path == 1 ? "table" : k.path == 2 ? "native" : "normal";
+				std::printf("  #%-3u %-6s VS %016llx PS %016llx -> 0x%llx %ux%u fmt %d %s%s%s: %u draws, %u inst, %u idx\n", e.order, path,
+				            static_cast<unsigned long long>(k.vs), static_cast<unsigned long long>(k.ps), static_cast<unsigned long long>(k.address),
+				            k.width, k.height, k.format, k.blend ? "blend" : "opaque", k.zw ? " zwrite" : (k.zt ? " ztest" : " nodepth"),
+				            k.indirect ? " indirect" : "", e.draws, e.instances, e.indices);
+				if (k.blend)
+					std::printf("        blend src %u dst %u fn %u\n", k.src, k.dst, k.comb);
+			}
+			std::vector<std::pair<RtPartDispatchKey, RtPartCensusEntry>> ds(g_rtpart.dispatches.begin(), g_rtpart.dispatches.end());
+			std::sort(ds.begin(), ds.end(), [](const auto& a, const auto& b) { return a.second.order < b.second.order; });
+			shown = 0;
+			for (const auto& [k, e]: ds) {
+				if (shown++ >= 24) break;
+				std::printf("  #%-3u CS %016llx writes 0x%llx %ux%u: %u dispatches\n", e.order, static_cast<unsigned long long>(k.cs),
+				            static_cast<unsigned long long>(k.address), k.width, k.height, e.draws);
+			}
+			std::fflush(stdout);
+		} else if (RtParticlesLevel() > 0) {
+			std::printf("RT particles: %llu pre-particle copies, %llu flips without one, SSGI used %llu / missed %llu (copy at VS %016llx PS %016llx)\n",
+			            static_cast<unsigned long long>(g_rtpart.copies), static_cast<unsigned long long>(g_rtpart.flips_without),
+			            static_cast<unsigned long long>(g_rtpart.uses), static_cast<unsigned long long>(g_rtpart.misses),
+			            static_cast<unsigned long long>(g_rtpart.copy_vs), static_cast<unsigned long long>(g_rtpart.copy_ps));
+			std::fflush(stdout);
+		}
+	}
+	g_rtpart.flip  = flip;
+	g_rtpart.taken = false;
+	g_rtpart.order = 0;
+	g_rtpart.draws.clear();
+	g_rtpart.dispatches.clear();
+}
+// The upscaler's color this frame (Upscale): remembered so the next frames' draws into it are known.
+void RtPartNoteColor(uint64_t address, vk::Extent2D extent) {
+	if (address == 0) return;
+	for (uint32_t i = 0; i < g_rtpart.colors.size(); ++i)
+		if (g_rtpart.colors[i] == address) {
+			g_rtpart.color_w[i] = extent.width, g_rtpart.color_h[i] = extent.height;
+			return;
+		}
+	const uint32_t at    = g_rtpart.color_next++ % g_rtpart.colors.size();
+	g_rtpart.colors[at]  = address;
+	g_rtpart.color_w[at] = extent.width;
+	g_rtpart.color_h[at] = extent.height;
+}
+// Level >= 1 and the copy of this flip's scene color exists and is the upscaler's color: its view (else null).
+vk::ImageView RtPartPreView(uint64_t color_address, vk::Extent2D extent) {
+	if (RtParticlesLevel() == 0) return nullptr;
+	if (HwParticlesActive()) return nullptr; // (hwrt3p: the ray-traced particle light has them this flip: no double light)
+	const bool ok = g_rtpart.taken && g_rtpart.pre_view != nullptr && g_rtpart.pre_address == color_address &&
+	                g_rtpart.pre_flip == GuestFlips() && g_rtpart.pre.extent.width == extent.width &&
+	                g_rtpart.pre.extent.height == extent.height;
+	if (ok) ++g_rtpart.uses;
+	else ++g_rtpart.misses;
+	return ok ? g_rtpart.pre_view : nullptr;
+}
+} // namespace
+
+bool RtParticlesDebug() {
+	static const bool debug = [] {
+		const char* value = std::getenv("KYTY_RT_PARTICLES_DEBUG");
+		return value != nullptr && *value == '1';
+	}();
+	return debug;
+}
+bool RtParticlesWanted() { return RtParticlesLevel() > 0 || RtParticlesDebug() || HwParticlesWanted(); }
+// (hwrt3p) KYTY_HWRT_PARTICLES' read of the pre-particle copy (no SSGI counters; the copy is taken for it too).
+vk::ImageView RtParticlesPreCopy(uint64_t color_address, vk::Extent2D extent) {
+	if (!HwParticlesWanted()) return nullptr;
+	const bool ok = g_rtpart.taken && g_rtpart.pre_view != nullptr && g_rtpart.pre_address == color_address &&
+	                g_rtpart.pre_flip == GuestFlips() && g_rtpart.pre.extent.width == extent.width &&
+	                g_rtpart.pre.extent.height == extent.height;
+	return ok ? g_rtpart.pre_view : nullptr;
+}
+
+void NoteSceneDispatch(uint64_t cs_hash, uint64_t address, uint32_t width, uint32_t height) {
+	if (!RtParticlesDebug() || !RtPartColorKnown(address, width, height, false)) return;
+	RtPartNewFlip(GuestFlips());
+	auto& e = g_rtpart.dispatches[RtPartDispatchKey {cs_hash, address, width, height}];
+	if (e.draws == 0) e.order = ++g_rtpart.order;
+	++e.draws;
+}
+void NoteOtherPathDraw(uint64_t address, uint64_t vs, bool blend, int path) {
+	if (!RtParticlesDebug() || !RtPartColorKnown(address, 0, 0, false)) return;
+	RtPartNewFlip(GuestFlips());
+	RtPartCensusKey key;
+	key.vs = vs, key.address = address, key.blend = blend ? 1 : 0, key.path = static_cast<uint8_t>(path);
+	auto& e = g_rtpart.draws[key];
+	if (e.draws == 0) e.order = ++g_rtpart.order;
+	++e.draws;
+}
+void BeforeSceneDraw(CommandBuffer& command, TextureCache& cache, const RenderState& rendering, vk::ImageLayout layout,
+                     const SceneDraw& draw) {
+	if (g_rtpart.resuming || !RtParticlesWanted()) return;
+	// Only the images the upscaler reads (the scene color, one of a few the game rotates), at their size.
+	if (!RtPartColorKnown(draw.address, draw.width, draw.height, true)) return;
+	RtPartNewFlip(GuestFlips());
+	if (RtParticlesDebug()) {
+		RtPartCensusKey key;
+		key.vs = draw.vs, key.ps = draw.ps, key.address = draw.address, key.width = draw.width, key.height = draw.height;
+		key.format = draw.format, key.blend = draw.blend ? 1 : 0, key.src = draw.src_blend, key.dst = draw.dst_blend;
+		key.comb = draw.comb, key.zt = draw.depth_test ? 1 : 0, key.zw = draw.depth_write ? 1 : 0, key.indirect = draw.indirect ? 1 : 0;
+		auto& e = g_rtpart.draws[key];
+		if (e.draws == 0) e.order = ++g_rtpart.order;
+		++e.draws;
+		e.instances += draw.instances;
+		e.indices += draw.index_count;
+	}
+	if ((RtParticlesLevel() == 0 && !HwParticlesWanted()) || g_rtpart.taken) return; // (hwrt3p: also for KYTY_HWRT_PARTICLES)
+	// The particle pass's first draw: blended, depth test on, depth writes off (KYTY_RT_PARTICLES_VS pins the shaders).
+	static const std::vector<uint64_t> pinned = [] {
+		std::vector<uint64_t> out;
+		if (const char* v = std::getenv("KYTY_RT_PARTICLES_VS"); v != nullptr)
+			for (const char* at = v; *at != '\0';) {
+				char*                    end = nullptr;
+				const unsigned long long h   = std::strtoull(at, &end, 16);
+				if (end == at) break;
+				if (h != 0) out.push_back(h);
+				if (*end != ',' && *end != ';') break;
+				at = end + 1;
+			}
+		return out;
+	}();
+	// (KYTY_RT_PARTICLES_ANYDEPTH=1: a blended draw without the depth test counts too - a pass that fades its particles
+	// against a sampled depth instead of testing it.)
+	static const bool any_depth = [] {
+		const char* v = std::getenv("KYTY_RT_PARTICLES_ANYDEPTH");
+		return v != nullptr && *v == '1';
+	}();
+	// (A single quad / triangle is a full-screen pass - fog, composites - not particles: skipped by the heuristic.)
+	const bool full_screen = !draw.indirect && draw.index_count <= 6 && draw.instances <= 1;
+	const bool particle    = pinned.empty() ? (draw.blend && !draw.depth_write && (draw.depth_test || any_depth) && !full_screen)
+	                                        : std::find(pinned.begin(), pinned.end(), draw.vs) != pinned.end();
+	if (!particle) return;
+	auto& image = cache.GetImage(draw.target);
+	if (image.backing.image == nullptr || image.info.data.address != draw.address) return;
+	if (image.backing.extent.width != draw.width || image.backing.extent.height != draw.height) return;
+	if (image.backing.format != vk::Format::eR16G16B16A16Sfloat) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("RT particles: the scene color is not RGBA16F (format %d): no pre-particle copy\n",
+			            static_cast<int>(image.backing.format));
+			std::fflush(stdout);
+		}
+		return;
+	}
+	auto& graphics = command.GetGraphics();
+	ConfigureAs(graphics, g_rtpart.pre, g_rtpart.pre_view, image.backing.format, image.backing.extent);
+	command.EndRendering();
+	const auto vk_command = command.Handle();
+	CopyInto(vk_command, image, g_rtpart.pre); // (leaves the copy in SHADER_READ_ONLY_OPTIMAL)
+	image.Transit(layout, vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite, {}, vk_command);
+	g_rtpart.resuming = true;
+	command.ResumeRendering(rendering);
+	g_rtpart.resuming    = false;
+	g_rtpart.taken       = true;
+	g_rtpart.pre_flip    = g_rtpart.flip;
+	g_rtpart.pre_address = draw.address;
+	g_rtpart.copy_vs     = draw.vs;
+	g_rtpart.copy_ps     = draw.ps;
+	g_rtpart.copy_order  = g_rtpart.order;
+	++g_rtpart.copies;
+	static bool said = false;
+	if (!said) {
+		said = true;
+		std::printf("RT particles: level %d: the scene color (0x%llx, %ux%u) copied before its first blended depth-write-off draw "
+		            "(VS %016llx PS %016llx, blend src %u dst %u fn %u)%s\n",
+		            RtParticlesLevel(), static_cast<unsigned long long>(draw.address), draw.width, draw.height,
+		            static_cast<unsigned long long>(draw.vs), static_cast<unsigned long long>(draw.ps), draw.src_blend, draw.dst_blend,
+		            draw.comb, pinned.empty() ? "" : " (KYTY_RT_PARTICLES_VS)");
+		std::fflush(stdout);
+	}
+}
+
 namespace {
 // KYTY_SSGI=0|1|2 (ssgi.comp): screen-space ray-traced GI + AO on the PS5 Pro path's render-resolution color, recorded
 // right before the upscaler (DLSS / XeSS / FSR), which then reads our composited copy in place of the game's color, so
 // the upscaler and frame generation see it. Trace (1: half res, 1 ray/px; 2 "Alto": full res, 3 rays/px; 3 "Ultra": full res, 5 rays/px, 28 steps + refine),
 // SVGF-style variance-guided temporal + a-trous (3 passes, 4 at Ultra), Ultra anti-flicker, temporal (alpha 0.1, clamped),
-// 2 a-trous passes, bilateral upsample. KYTY_SSGI_INTENSITY (0.6), KYTY_SSGI_AO (0.25).
+// 2 a-trous passes, bilateral upsample. KYTY_SSGI_INTENSITY (0.85 / 1.1 / 1.25 by quality), KYTY_SSGI_AO (0.25).
 // Normals from depth derivatives; view positions from the game's view_to_clip (handles reverse-Z).
+// (rtfire) KYTY_SSGI_EMISSIVE (strength, 0..4; default 1.0 at KYTY_SSGI >= 2, 0 at 1): "fire light": torches, bonfires,
+// lava and other emissive pixels become area lights (one per cell of a 32x18 grid, ssgi.comp mode 5) found from the
+// lit colour against the G-buffer albedo (KYTY_RT_REFLECTIONS' packed copy, layer 0 bytes 0..2), shadowed by
+// screen-space rays, denoised (temporal + 2 a-trous) and added as albedo x irradiance. KYTY_SSGI_EMISSIVE_LUM (exposed
+// luminance threshold, 1.5), KYTY_SSGI_EMISSIVE_RATIO (lit colour / albedo threshold, 12), KYTY_SSGI_EMISSIVE_RANGE
+// (m, 8), KYTY_SSGI_EMISSIVE_VIEW (1 the emitter mask, 2 the added light only). Every 10 s "SSGI emissive:" stats.
 struct SsgiImage {
 	VulkanImage   image;
 	vk::ImageView view = nullptr;
@@ -3941,6 +4314,21 @@ struct SsgiPass {
 	SsgiImage               history[2], gbuf[2];
 	SsgiImage               moments[2], var_a, var_b; // (luma m1, m2, count, variance) / filtered variance (trace res)
 	SsgiImage               gihist[2];                // the composited GI (render res), level 3's anti-flicker
+	// (rtfire) Emissive light: its trace output, temporal/a-trous ping-pong, history and moments (trace res; only
+	// when KYTY_SSGI_EMISSIVE > 0), the light list + counters, their host copies (a ring of 4), a 1x1 R32_UINT stand-in.
+	SsgiImage               emi_raw, emi_tmp, emi_hist[2], emi_mom[2];
+	SsgiImage               reactive; // (rtparticles) KYTY_RT_PARTICLES=2: the particle reactive mask (R8_UNORM, render size)
+	bool                    reactive_failed = false;
+	VkBuffer                lights = VK_NULL_HANDLE, readback = VK_NULL_HANDLE;
+	VmaAllocation           lights_mem = VK_NULL_HANDLE, readback_mem = VK_NULL_HANDLE;
+	const uint32_t*         readback_map = nullptr;
+	VkImage                 dummy_image = VK_NULL_HANDLE;
+	VmaAllocation           dummy_mem   = VK_NULL_HANDLE;
+	vk::ImageView           dummy_view  = nullptr;
+	bool                    dummy_ready = false, emi_failed = false;
+	double                  em_acc[8] {};
+	uint32_t                em_frames = 0, em_gbuf_frames = 0;
+	std::chrono::steady_clock::time_point em_last_log = std::chrono::steady_clock::now();
 	uint32_t                frame         = 0;
 	int                     quality       = 0;
 	bool                    history_valid = false;
@@ -3962,6 +4350,22 @@ struct SsgiPush {
 	float   extra[4];
 };
 static_assert(sizeof(SsgiPush) == 96);
+// (rtfire) SSGI's own push constants: SsgiPush (shared with GTAO's, which extends it: unchanged) + the emissive terms.
+struct SsgiPushE : SsgiPush {
+	float   emis[4];  // strength x gain, exposed luminance threshold, lit/albedo ratio threshold, range (view units)
+	int32_t emisc[4]; // flags (1 on, 2 G-buffer albedo), exposure index, view mode, -
+};
+static_assert(sizeof(SsgiPushE) == 128);
+constexpr uint32_t SsgiCells       = 32 * 18;
+constexpr uint32_t SsgiLightsBytes = 64 + SsgiCells * 4 + SsgiCells * 48; // hdr[16], list, 3 vec4 a cell
+constexpr uint32_t SsgiStatWords   = 8;
+// (rtparticles) 15 the pre-particle scene color (sampled), 16 the reactive mask (R8 storage).
+constexpr uint32_t SsgiBindings    = 17;
+vk::DescriptorType SsgiDescType(uint32_t i) {
+	if (i == 13 || i == 14) return vk::DescriptorType::eStorageBuffer;
+	if (i == 7 || i == 8 || i == 10 || i == 16) return vk::DescriptorType::eStorageImage;
+	return vk::DescriptorType::eCombinedImageSampler;
+}
 
 int SsgiQuality() {
 	static const int quality = [] {
@@ -3974,14 +4378,96 @@ float SsgiEnv(const char* name, float fallback, float hi) {
 	const char* value = std::getenv(name);
 	return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, hi) : fallback;
 }
+// (rtfire) The emissive light's strength: 0 off (nothing created); on by default from KYTY_SSGI=2.
+float SsgiEmissive() {
+	static const float strength = SsgiQuality() <= 0 ? 0.0f : SsgiEnv("KYTY_SSGI_EMISSIVE", SsgiQuality() >= 2 ? 1.0f : 0.0f, 4.0f);
+	return strength;
+}
+std::array<SsgiImage*, 6> SsgiEmisAll() {
+	return {&g_ssgi.emi_raw, &g_ssgi.emi_tmp, &g_ssgi.emi_hist[0], &g_ssgi.emi_hist[1], &g_ssgi.emi_mom[0], &g_ssgi.emi_mom[1]};
+}
+// The light buffer, its host ring and the stand-in image (once; on failure the emissive light stays off).
+bool SsgiEmisCreate(GraphicContext& graphics) {
+	if (g_ssgi.lights != VK_NULL_HANDLE) return true;
+	if (g_ssgi.emi_failed) return false;
+	g_ssgi.emi_failed = true;
+	VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+	buffer.size  = SsgiLightsBytes;
+	buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	VmaAllocationCreateInfo dev {};
+	dev.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+	if (vmaCreateBuffer(graphics.allocator, &buffer, &dev, &g_ssgi.lights, &g_ssgi.lights_mem, nullptr) != VK_SUCCESS) {
+		g_ssgi.lights = VK_NULL_HANDLE;
+		return false;
+	}
+	buffer.size  = 4 * SsgiStatWords * 4;
+	buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VmaAllocationCreateInfo host {};
+	host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+	host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+	VmaAllocationInfo mapped {};
+	if (vmaCreateBuffer(graphics.allocator, &buffer, &host, &g_ssgi.readback, &g_ssgi.readback_mem, &mapped) != VK_SUCCESS) {
+		g_ssgi.readback = VK_NULL_HANDLE;
+		return false;
+	}
+	g_ssgi.readback_map = static_cast<const uint32_t*>(mapped.pMappedData);
+	VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+	create.imageType   = VK_IMAGE_TYPE_2D;
+	create.format      = VK_FORMAT_R32_UINT;
+	create.extent      = {1, 1, 1};
+	create.mipLevels   = 1;
+	create.arrayLayers = 1;
+	create.samples     = VK_SAMPLE_COUNT_1_BIT;
+	create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+	create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	VmaAllocationCreateInfo allocate {};
+	allocate.usage = VMA_MEMORY_USAGE_AUTO;
+	if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_ssgi.dummy_image, &g_ssgi.dummy_mem, nullptr) != VK_SUCCESS) {
+		g_ssgi.dummy_image = VK_NULL_HANDLE;
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = vk::Image(g_ssgi.dummy_image);
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = vk::Format::eR32Uint;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (graphics.device.createImageView(&view_info, nullptr, &g_ssgi.dummy_view) != vk::Result::eSuccess) return false;
+	g_ssgi.emi_failed = false;
+	return true;
+}
+// Every frame: this frame's counters from 3 frames ago (statistics only); every 10 s the "SSGI emissive:" line.
+void SsgiEmisStats(bool have_gbuf) {
+	if (g_ssgi.readback_map == nullptr) return;
+	if (g_ssgi.frame >= 4) {
+		const uint32_t* w = g_ssgi.readback_map + ((g_ssgi.frame + 1) % 4) * SsgiStatWords; // (written 3 frames ago)
+		for (uint32_t i = 0; i < SsgiStatWords; ++i)
+			g_ssgi.em_acc[i] += static_cast<double>(w[i]);
+		++g_ssgi.em_frames;
+		if (have_gbuf) ++g_ssgi.em_gbuf_frames;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_ssgi.em_last_log < std::chrono::seconds(10) || g_ssgi.em_frames == 0) return;
+	const double* a = g_ssgi.em_acc;
+	const double  added = a[4] > 0 ? a[6] / 4096.0 / a[4] : 0.0, own = a[4] > 0 ? a[7] / 256.0 / a[4] : 0.0;
+	std::printf("SSGI emissive: %.2f %% emissive pixels, %.1f lights a frame, mean added luminance %.4f exposed (%.1f %% of the "
+	            "pixels' own %.3f), %.1f %% of the pixels lit > 0.002, G-buffer albedo %u/%u frames\n",
+	            a[2] > 0 ? 100.0 * a[3] / a[2] : 0.0, a[0] / g_ssgi.em_frames, added, own > 0 ? 100.0 * added / own : 0.0, own,
+	            a[4] > 0 ? 100.0 * a[5] / a[4] : 0.0, g_ssgi.em_gbuf_frames, g_ssgi.em_frames);
+	std::fflush(stdout);
+	for (double& v: g_ssgi.em_acc)
+		v = 0.0;
+	g_ssgi.em_frames = g_ssgi.em_gbuf_frames = 0;
+	g_ssgi.em_last_log = now;
+}
 
-bool SsgiMakeImage(GraphicContext& graphics, SsgiImage& img, vk::Extent2D extent) {
+bool SsgiMakeImage(GraphicContext& graphics, SsgiImage& img, vk::Extent2D extent,
+                   vk::Format format = vk::Format::eR16G16B16A16Sfloat) {
 	vk::ImageCreateInfo create {};
 	create.imageType     = vk::ImageType::e2D;
 	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
 	create.mipLevels     = 1;
 	create.arrayLayers   = 1;
-	create.format        = vk::Format::eR16G16B16A16Sfloat;
+	create.format        = format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
 	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
@@ -3995,7 +4481,7 @@ bool SsgiMakeImage(GraphicContext& graphics, SsgiImage& img, vk::Extent2D extent
 	vk::ImageViewCreateInfo view_info {};
 	view_info.image            = img.image.image;
 	view_info.viewType         = vk::ImageViewType::e2D;
-	view_info.format           = vk::Format::eR16G16B16A16Sfloat;
+	view_info.format           = format;
 	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
 	if (graphics.device.createImageView(&view_info, nullptr, &img.view) != vk::Result::eSuccess) return false;
 	img.image.state = {};
@@ -4019,10 +4505,10 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 	if (g_ssgi.pipeline == nullptr) {
 		if (g_ssgi.failed) return false;
 		g_ssgi.failed = true;
-		std::array<vk::DescriptorSetLayoutBinding, 11> bindings {};
-		for (uint32_t i = 0; i < 11; ++i) {
+		std::array<vk::DescriptorSetLayoutBinding, SsgiBindings> bindings {};
+		for (uint32_t i = 0; i < SsgiBindings; ++i) {
 			bindings[i].binding         = i;
-			bindings[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorType  = SsgiDescType(i);
 			bindings[i].descriptorCount = 1;
 			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
 		}
@@ -4031,7 +4517,7 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
 		set_info.pBindings    = bindings.data();
 		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_ssgi.set_layout) != vk::Result::eSuccess) return false;
-		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(SsgiPush)};
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(SsgiPushE)};
 		vk::PipelineLayoutCreateInfo layout_info {};
 		layout_info.setLayoutCount         = 1;
 		layout_info.pSetLayouts            = &g_ssgi.set_layout;
@@ -4074,6 +4560,9 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 	device.waitIdle();
 	for (auto* img : SsgiAll())
 		SsgiFreeImage(graphics, *img);
+	for (auto* img : SsgiEmisAll())
+		SsgiFreeImage(graphics, *img);
+	SsgiFreeImage(graphics, g_ssgi.reactive);
 	const vk::Extent2D trace = quality >= 2 ? render : vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
 	bool ok = SsgiMakeImage(graphics, g_ssgi.out, render);
 	for (auto* img : {&g_ssgi.raw, &g_ssgi.tmp_a, &g_ssgi.tmp_b, &g_ssgi.history[0], &g_ssgi.history[1], &g_ssgi.gbuf[0], &g_ssgi.gbuf[1],
@@ -4081,7 +4570,28 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		ok = ok && SsgiMakeImage(graphics, *img, trace);
 	for (auto* img : {&g_ssgi.gihist[0], &g_ssgi.gihist[1]})
 		ok = ok && SsgiMakeImage(graphics, *img, render);
+	if (ok && SsgiEmissive() > 0.0f && SsgiEmisCreate(graphics)) {
+		bool emi_ok = true;
+		for (auto* img : SsgiEmisAll())
+			emi_ok = emi_ok && SsgiMakeImage(graphics, *img, trace);
+		if (!emi_ok) {
+			for (auto* img : SsgiEmisAll())
+				SsgiFreeImage(graphics, *img);
+			std::printf("SSGI: emissive light off (could not create its images)\n");
+			std::fflush(stdout);
+		}
+	}
+	// (rtparticles) The reactive mask (level 2); without it the level stays 1.
+	if (ok && RtParticlesLevel() >= 2 && !g_ssgi.reactive_failed && !SsgiMakeImage(graphics, g_ssgi.reactive, render, vk::Format::eR8Unorm)) {
+		SsgiFreeImage(graphics, g_ssgi.reactive);
+		g_ssgi.reactive_failed = true;
+		std::printf("RT particles: no reactive mask (its image could not be created): level 1\n");
+		std::fflush(stdout);
+	}
 	if (!ok) {
+		SsgiFreeImage(graphics, g_ssgi.reactive);
+		for (auto* img : SsgiEmisAll())
+			SsgiFreeImage(graphics, *img);
 		for (auto* img : SsgiAll())
 			SsgiFreeImage(graphics, *img);
 		g_ssgi.failed = true;
@@ -4146,10 +4656,10 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 		return false;
 	}
-	const float intensity = SsgiEnv("KYTY_SSGI_INTENSITY", 0.6f, 4.0f);
+	const float intensity = SsgiEnv("KYTY_SSGI_INTENSITY", quality >= 3 ? 1.25f : quality >= 2 ? 1.1f : 0.85f, 4.0f);
 	const float ao        = SsgiEnv("KYTY_SSGI_AO", 0.25f, 1.0f);
 	const auto& m         = inputs.view_to_clip;
-	SsgiPush    push {};
+	SsgiPushE   push {};
 	const bool  have_proj = m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f);
 	if (have_proj) {
 		push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
@@ -4165,7 +4675,42 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
 	push.trace[0] = static_cast<float>(g_ssgi.trace.width), push.trace[1] = static_cast<float>(g_ssgi.trace.height);
 	push.trace[2] = intensity, push.trace[3] = ao;
-	push.extra[1] = 2.0f, push.extra[2] = 0.5f; // ray length / thickness at 1 m, grown with distance
+	push.extra[1] = quality >= 3 ? 4.0f : 3.5f, push.extra[2] = 0.45f; // ray length / thickness at 1 m, grown with distance
+	// (rtfire) The emissive light: on when its images exist; the G-buffer albedo when this flip's (or the last's) copy
+	// matches the render; the game's exposure when the upscaler has it (else the light buffer's 1.0).
+	const bool emissive = SsgiEmissive() > 0.0f && g_ssgi.lights != VK_NULL_HANDLE && g_ssgi.emi_raw.view != nullptr &&
+	                      g_ssgi.emi_mom[1].view != nullptr;
+	RtReflGbuffer gbuf;
+	const bool    have_albedo   = emissive && RtReflGetGbuffer(gbuf) && gbuf.extent == color.extent && gbuf.views[0] != nullptr;
+	const bool    game_exposure = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
+	const float   em_lum   = SsgiEnv("KYTY_SSGI_EMISSIVE_LUM", 1.5f, 100.0f);
+	const float   em_ratio = SsgiEnv("KYTY_SSGI_EMISSIVE_RATIO", 12.0f, 1000.0f);
+	const float   em_range = std::max(SsgiEnv("KYTY_SSGI_EMISSIVE_RANGE", 8.0f, 50.0f), 0.5f);
+	static const int em_view = static_cast<int>(SsgiEnv("KYTY_SSGI_EMISSIVE_VIEW", 0.0f, 2.0f));
+	// (rtparticles) The pre-particle copy of this flip's scene color: the emitters' radiance is color - copy (flag 4);
+	// level 2 also writes the reactive mask (mode 6) the upscaler takes.
+	const vk::ImageView pre      = RtPartPreView(inputs.color_address, color.extent);
+	const bool          reactive = pre != nullptr && RtParticlesLevel() >= 2 && g_ssgi.reactive.view != nullptr;
+	static const float  reactive_strength = SsgiEnv("KYTY_RT_PARTICLES_REACTIVE", 0.8f, 1.0f);
+	push.extra[3]                         = reactive_strength;
+	if (emissive) {
+		// (3: the internal gain over the physical L x A x cos x cos / d^2: game flames are far dimmer than real fire)
+		push.emis[0] = SsgiEmissive() * 3.0f, push.emis[1] = std::max(em_lum, 0.05f), push.emis[2] = std::max(em_ratio, 1.0f);
+		push.emis[3]  = em_range;
+		push.emisc[0] = 1 | (have_albedo ? 2 : 0) | (pre != nullptr ? 4 : 0);
+		push.emisc[1] = game_exposure ? static_cast<int32_t>(inputs.exposure_index) : 1;
+		push.emisc[2] = em_view;
+	}
+	if (pre != nullptr) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("RT particles: the SSGI %s takes the particles' own emission (level %d%s)\n",
+			            emissive ? "emissive light" : "pass (emissive light off: KYTY_SSGI_EMISSIVE=0 or quality 1)", RtParticlesLevel(),
+			            reactive ? ", reactive mask on" : RtParticlesLevel() >= 2 ? ", reactive mask off: no image" : "");
+			std::fflush(stdout);
+		}
+	}
 	{
 		static bool said = false;
 		if (!said) {
@@ -4174,10 +4719,20 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			            intensity, ao, have_proj ? "" : " (no projection: 60 deg FOV assumed)");
 			std::printf("SSGI: color format %d, depth format %d, view_to_clip z terms %g %g %g %g\n", static_cast<int>(color.format),
 			            static_cast<int>(inputs.depth.format), m[10], m[14], m[11], m[15]);
+			if (emissive)
+				std::printf("SSGI: emissive light on (strength %g, luminance > %g exposed, lit/albedo > %g, range %g m, %s, exposure %s%s)\n",
+				            SsgiEmissive(), push.emis[1], push.emis[2], em_range,
+				            have_albedo ? "G-buffer albedo" : "no G-buffer copy yet: luminance only until it comes",
+				            game_exposure ? "the game's" : "1.0", em_view == 1 ? ", view: emitter mask" : em_view == 2 ? ", view: added light" : "");
+			else if (SsgiEmissive() > 0.0f)
+				std::printf("SSGI: emissive light off (its buffer or images could not be created)\n");
+			else
+				std::printf("SSGI: emissive light off (KYTY_SSGI_EMISSIVE=0%s)\n", quality < 2 ? ", the default at quality 1" : "");
 			std::fflush(stdout);
 		}
 	}
 	SsgiReadTiming();
+	if (emissive) SsgiEmisStats(have_albedo);
 	const auto     entry = static_cast<uint32_t>(g_ssgi.written % 8);
 	const bool     timed = g_ssgi.pool != nullptr;
 	if (timed) {
@@ -4201,6 +4756,40 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		if (img->image.state.layout != vk::ImageLayout::eGeneral)
 			Transition(command, img->image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
 			           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+	if (emissive) {
+		for (auto* img : SsgiEmisAll())
+			if (img->image.state.layout != vk::ImageLayout::eGeneral)
+				Transition(command, img->image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+				           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+		if (!g_ssgi.dummy_ready) {
+			g_ssgi.dummy_ready = true;
+			vk::ImageMemoryBarrier2 barrier {};
+			barrier.srcStageMask     = vk::PipelineStageFlagBits2::eNone;
+			barrier.dstStageMask     = vk::PipelineStageFlagBits2::eTransfer;
+			barrier.dstAccessMask    = vk::AccessFlagBits2::eTransferWrite;
+			barrier.oldLayout        = vk::ImageLayout::eUndefined;
+			barrier.newLayout        = vk::ImageLayout::eGeneral;
+			barrier.image            = vk::Image(g_ssgi.dummy_image);
+			barrier.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			vk::DependencyInfo dependency {};
+			dependency.imageMemoryBarrierCount = 1;
+			dependency.pImageMemoryBarriers    = &barrier;
+			command.pipelineBarrier2(dependency);
+			vk::ClearColorValue zero {};
+			zero.uint32 = std::array<uint32_t, 4> {0, 0, 0, 0};
+			const vk::ImageSubresourceRange whole {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			command.clearColorImage(vk::Image(g_ssgi.dummy_image), vk::ImageLayout::eGeneral, &zero, 1, &whole);
+		}
+		// This frame's light list and counters cleared; word 1 = 1.0 (the exposure without the game's). The previous
+		// frame's reads of the buffer (and its stats copy) before.
+		global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+		       vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+		std::array<uint32_t, 16> hdr {};
+		hdr[1] = std::bit_cast<uint32_t>(1.0f);
+		command.updateBuffer(vk::Buffer(g_ssgi.lights), 0, sizeof(hdr), hdr.data());
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+		       vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	}
 	// Earlier uses of our images (the previous frame's upscaler read of `out`) before this frame's writes.
 	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
 	       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
@@ -4215,7 +4804,7 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout, float step,
 	                     vk::Extent2D size) {
 		const vk::Sampler       lin = g_ssgi.linear, pt = g_ssgi.point;
-		vk::DescriptorImageInfo infos[11] {};
+		vk::DescriptorImageInfo infos[SsgiBindings] {};
 		infos[0]  = {lin, color.view, color.layout};
 		infos[1]  = {pt, inputs.depth.view, inputs.depth.layout};
 		infos[2]  = {pt, inputs.motion.view, inputs.motion.layout};
@@ -4227,18 +4816,39 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		infos[8]  = {nullptr, gout.view, vk::ImageLayout::eGeneral};
 		infos[9]  = {lin, aux_in->view, vk::ImageLayout::eGeneral};
 		infos[10] = {nullptr, aux_out->view, vk::ImageLayout::eGeneral};
-		vk::WriteDescriptorSet writes[11] {};
-		for (uint32_t i = 0; i < 11; ++i) {
-			writes[i].dstBinding      = i;
-			writes[i].descriptorCount = 1;
-			writes[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
-			writes[i].pImageInfo      = &infos[i];
+		// (rtfire) 11 the denoised emissive light, 12 G-buffer layer 0, 13 the light buffer, 14 the exposure (stand-ins
+		// when the emissive light is off: nothing reads them then).
+		infos[11] = {lin, emissive ? g_ssgi.emi_tmp.view : a.view, vk::ImageLayout::eGeneral};
+		infos[12] = have_albedo ? vk::DescriptorImageInfo {pt, gbuf.views[0], vk::ImageLayout::eShaderReadOnlyOptimal}
+		                        : vk::DescriptorImageInfo {pt, g_ssgi.dummy_view, vk::ImageLayout::eGeneral};
+		// (rtparticles) 15 the pre-particle color (the color itself when there is none: read only with flag 4 / mode 6),
+		// 16 the reactive mask (a storage stand-in otherwise; written only by mode 6).
+		infos[15] = pre != nullptr ? vk::DescriptorImageInfo {pt, pre, vk::ImageLayout::eShaderReadOnlyOptimal}
+		                           : vk::DescriptorImageInfo {pt, color.view, color.layout};
+		infos[16] = {nullptr, reactive ? g_ssgi.reactive.view : out.view, vk::ImageLayout::eGeneral};
+		const vk::DescriptorBufferInfo lights_info {vk::Buffer(g_ssgi.lights), 0, VK_WHOLE_SIZE};
+		const vk::DescriptorBufferInfo exposure_info =
+		    emissive && game_exposure ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range}
+		                              : lights_info;
+		vk::WriteDescriptorSet writes[SsgiBindings] {};
+		uint32_t               bound = 0;
+		for (uint32_t i = 0; i < SsgiBindings; ++i) {
+			// (emissive off: its bindings stay unwritten; the shader reads them only when push.emisc says it is on)
+			if (i >= 12 && i <= 14 && !emissive) continue;
+			auto& w           = writes[bound++];
+			w.dstBinding      = i;
+			w.descriptorCount = 1;
+			w.descriptorType  = SsgiDescType(i);
+			if (i == 13) w.pBufferInfo = &lights_info;
+			else if (i == 14) w.pBufferInfo = &exposure_info;
+			else w.pImageInfo = &infos[i];
 		}
 		push.misc[0] = mode;
 		push.extra[0] = step;
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_ssgi.layout, 0, 11, writes);
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_ssgi.layout, 0, bound, writes);
 		command.pushConstants(g_ssgi.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+		if (mode == 5) command.dispatch(32, 18, 1); // (one workgroup a cell)
+		else command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	};
@@ -4246,7 +4856,12 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// a-trous 2, 4 (, 8 at level 3) ping-ponging tmp_b / tmp_a with the filtered variance in var_a / var_b; composite
 	// (bilateral upsample, level 3 anti-flicker against gihist[prev]) -> out.
 	// (Bindings a mode does not write still need a valid storage image.)
+	if (emissive) {
+		run(5, g_ssgi.tmp_a, g_ssgi.tmp_b, g_ssgi.raw, g_ssgi.tmp_b, 0.0f, g_ssgi.render); // the lights (reads only the game's)
+		aux_out = &g_ssgi.emi_raw;                                                       // (the trace's emissive output)
+	}
 	run(0, g_ssgi.tmp_a, g_ssgi.tmp_b, g_ssgi.raw, g_ssgi.gbuf[cur], 0.0f, g_ssgi.trace);
+	aux_in = &g_ssgi.moments[prev], aux_out = &g_ssgi.moments[cur];
 	run(1, g_ssgi.raw, g_ssgi.history[prev], g_ssgi.tmp_a, g_ssgi.tmp_b, 0.0f, g_ssgi.trace);
 	aux_in = &g_ssgi.moments[cur], aux_out = &g_ssgi.var_a;
 	run(2, g_ssgi.tmp_a, g_ssgi.raw, g_ssgi.history[cur], g_ssgi.tmp_b, 1.0f, g_ssgi.trace);
@@ -4260,11 +4875,43 @@ bool SsgiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		run(2, g_ssgi.tmp_a, g_ssgi.raw, g_ssgi.tmp_b, g_ssgi.raw, 8.0f, g_ssgi.trace);
 		final_gi = &g_ssgi.tmp_b;
 	}
+	if (emissive) {
+		// The emissive light's denoise, as the bounce's: temporal (its own count / moments) -> emi_tmp, a-trous 1 -> its
+		// history, a-trous 2 -> emi_tmp (what the composite reads). var_a / var_b are free again here; the final GI
+		// (tmp_a or tmp_b) is not written (the unused storage bindings point at emi_raw).
+		aux_in = &g_ssgi.emi_mom[prev], aux_out = &g_ssgi.emi_mom[cur];
+		run(1, g_ssgi.emi_raw, g_ssgi.emi_hist[prev], g_ssgi.emi_tmp, g_ssgi.emi_raw, 0.0f, g_ssgi.trace);
+		aux_in = &g_ssgi.emi_mom[cur], aux_out = &g_ssgi.var_a;
+		run(2, g_ssgi.emi_tmp, g_ssgi.emi_raw, g_ssgi.emi_hist[cur], g_ssgi.emi_raw, 1.0f, g_ssgi.trace);
+		aux_in = &g_ssgi.var_a, aux_out = &g_ssgi.var_b;
+		run(2, g_ssgi.emi_hist[cur], g_ssgi.emi_raw, g_ssgi.emi_tmp, g_ssgi.emi_raw, 2.0f, g_ssgi.trace);
+	}
 	aux_in = &g_ssgi.var_a, aux_out = &g_ssgi.var_b;
 	run(4, *final_gi, g_ssgi.gihist[prev], g_ssgi.out, g_ssgi.gihist[cur], 0.0f, g_ssgi.render);
+	if (reactive) {
+		// (rtparticles) The reactive mask from the particle emission share -> g_ssgi.reactive, left for the upscaler.
+		Transition(command, g_ssgi.reactive.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+		run(6, *final_gi, g_ssgi.gihist[prev], g_ssgi.raw, g_ssgi.raw, 0.0f, g_ssgi.render);
+		Transition(command, g_ssgi.reactive.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+		inputs.reactive.image  = g_ssgi.reactive.image.image;
+		inputs.reactive.view   = g_ssgi.reactive.view;
+		inputs.reactive.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+		inputs.reactive.format = vk::Format::eR8Unorm;
+		inputs.reactive.extent = g_ssgi.render;
+		inputs.reactive.usage  = g_ssgi.reactive.image.usage;
+	}
 	// The composite's writes before the upscaler reads.
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
+	if (emissive && g_ssgi.readback != VK_NULL_HANDLE) {
+		// The counters (hdr[0..7]) into this frame's slot of the host ring.
+		vk::BufferCopy region {0, (g_ssgi.frame % 4) * SsgiStatWords * 4, SsgiStatWords * 4};
+		command.copyBuffer(vk::Buffer(g_ssgi.lights), vk::Buffer(g_ssgi.readback), 1, &region);
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
+		       vk::AccessFlagBits2::eHostRead);
+	}
 	if (timed) {
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_ssgi.pool, entry * 2 + 1);
 		++g_ssgi.written;
@@ -4288,9 +4935,20 @@ namespace {
 // motion vectors, color, the upscaler's view_to_clip). Normals from depth; horizon search with cosine-weighted
 // slices (1: half res, 2 slices x 8 steps; 2: full res, 3 x 12; 3: full res, 4 x 16); SSGI-style temporal
 // (motion-vector reprojection, depth/normal disocclusion reset) + edge-aware a-trous (1, 2 / 1, 2, 4 / 1, 2, 4, 8);
-// composite: a soft darkening multiplied into the color, faded with distance, sky skipped. KYTY_GTAO_STRENGTH (0.6),
-// KYTY_GTAO_RADIUS (metres, 1.0), KYTY_GTAO_BENT (0: the extra multiplier on dark, ambient-dominated pixels, 0..1).
+// composite: a soft darkening multiplied into the color, faded with distance, sky skipped. KYTY_GTAO_STRENGTH (0.5),
+// KYTY_GTAO_RADIUS (metres, 0.35: the same at every distance; KYTY_GTAO_MAXSCREEN 0.1 of the height clamps it only on
+// close-ups), KYTY_GTAO_THICKNESS (metres, 0.6 x the radius), KYTY_GTAO_BENT (0: the extra multiplier on dark,
+// ambient-dominated pixels, 0..1). Samples on depth texel centres; the a-trous kernel limited to ~the radius in metres.
 // Off (the default): nothing created, nothing recorded.
+//
+// (specocc) KYTY_SPEC_OCCLUSION (strength 0..1, default 0.8 while KYTY_GTAO >= 1; 0 off): specular occlusion from the
+// same horizon search (gtao.comp: the reflection lobe against the slices' visible arcs), taking off only the estimated
+// environment-specular (IBL) share of the lit color, from the G-buffer material (KYTY_RT_REFLECTIONS' packed copy):
+// KYTY_SPEC_OCCLUSION_ROUGH (default 2:0:8, L2.b0), _GLOSS (default 1:16:8g, L1.b2 inverted; 0 none; the rougher wins),
+// _METAL (default none; e.g. the field refl9's survey logs), all "<layer>:<shift>:<bits>[g]". Not where the game's SSR
+// hit (its captured guide, while KYTY_RT_REFLECTIONS runs), not on bright pixels / local peaks (KYTY_SPEC_OCCLUSION_
+// HIGHLIGHT, display-referred, 0.8; _PEAK, ratio to the neighbourhood, 1.6), not on rough materials (_ROUGH_END, 0.7).
+// Every 10 s a "GTAO: specular occlusion:" line (a 1/16 pixel sample).
 struct GtaoPass {
 	vk::DescriptorSetLayout set_layout = nullptr;
 	vk::PipelineLayout      layout     = nullptr;
@@ -4310,7 +4968,82 @@ struct GtaoPass {
 	double                  sum_ms  = 0.0;
 	uint32_t                samples = 0;
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+	VkImage       dummy_image    = VK_NULL_HANDLE;
+	VmaAllocation dummy_mem      = nullptr;
+	vk::ImageView dummy_view     = nullptr;
+	bool          dummy_ready    = false;
+	bool          normals_logged = false;
+	// (specocc) parameters + stats (device local, 128 bytes), its stats copied to a 4-slot host ring each frame
+	VkBuffer        so_dev = VK_NULL_HANDLE, so_host = VK_NULL_HANDLE;
+	VmaAllocation   so_dev_mem = nullptr, so_host_mem = nullptr;
+	const uint32_t* so_mapped  = nullptr;
+	uint64_t        so_written = 0;
+	std::array<double, 16> so_sum {};
+	uint32_t        so_frames = 0;
+	std::chrono::steady_clock::time_point so_last_log = std::chrono::steady_clock::now();
 } g_gtao;
+
+constexpr uint32_t GtaoBindings = 19;
+constexpr uint32_t GtaoSoHeader = 64, GtaoSoStats = 64;
+
+// "<layer>:<shift>:<bits>[g]" -> the shader's field code (layer | shift << 2 | bits << 7 | 4096 inverted); -1 none.
+int32_t GtaoFieldEnv(const char* name, int32_t fallback) {
+	const char* v = std::getenv(name);
+	if (v == nullptr || *v == '\0') return fallback;
+	int layer = 0, shift = 0, bits = 0;
+	if (std::sscanf(v, "%d:%d:%d", &layer, &shift, &bits) != 3 || layer < 0 || layer > 3 || shift < 0 || bits < 1 || shift + bits > 32 ||
+	    bits > 31)
+		return -1;
+	return layer | (shift << 2) | (bits << 7) | (std::strchr(v, 'g') != nullptr ? 4096 : 0);
+}
+struct GtaoSoConfig {
+	float   strength = 0.8f, highlight = 0.8f, peak = 1.6f, rough_end = 0.7f;
+	int32_t rough = 2 | (0 << 2) | (8 << 7), gloss = 1 | (16 << 2) | (8 << 7) | 4096, metal = -1;
+};
+const GtaoSoConfig& GtaoSo() {
+	static const GtaoSoConfig cfg = [] {
+		GtaoSoConfig c;
+		c.strength  = SsgiEnv("KYTY_SPEC_OCCLUSION", 0.8f, 1.0f);
+		c.highlight = std::max(SsgiEnv("KYTY_SPEC_OCCLUSION_HIGHLIGHT", 0.8f, 64.0f), 0.01f);
+		c.peak      = std::max(SsgiEnv("KYTY_SPEC_OCCLUSION_PEAK", 1.6f, 16.0f), 1.05f);
+		c.rough_end = std::clamp(SsgiEnv("KYTY_SPEC_OCCLUSION_ROUGH_END", 0.7f, 1.0f), 0.4f, 1.0f);
+		c.rough     = GtaoFieldEnv("KYTY_SPEC_OCCLUSION_ROUGH", c.rough);
+		c.gloss     = GtaoFieldEnv("KYTY_SPEC_OCCLUSION_GLOSS", c.gloss);
+		c.metal     = GtaoFieldEnv("KYTY_SPEC_OCCLUSION_METAL", -1);
+		if (c.rough < 0 && c.gloss >= 0) c.rough = c.gloss, c.gloss = -1;
+		if (c.rough < 0) c.strength = 0.0f; // (no roughness field: no material, nothing to do)
+		return c;
+	}();
+	return cfg;
+}
+
+// (specocc) The stats slot written 4 frames ago, summed; every 10 s one line.
+void GtaoSoReadStats() {
+	if (g_gtao.so_mapped == nullptr || g_graphics_ctx == nullptr) return;
+	if (g_gtao.so_written >= 4) {
+		const uint32_t slot = static_cast<uint32_t>(g_gtao.so_written % 4);
+		(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_gtao.so_host_mem, 0, VK_WHOLE_SIZE);
+		const uint32_t* c = g_gtao.so_mapped + slot * (GtaoSoStats / 4);
+		for (uint32_t i = 0; i < 16; ++i)
+			g_gtao.so_sum[i] += c[i];
+		++g_gtao.so_frames;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_gtao.so_last_log < std::chrono::seconds(10) || g_gtao.so_frames == 0) return;
+	const auto&  t   = g_gtao.so_sum;
+	const double n   = std::max(t[0], 1.0), mat = std::max(t[1], 1.0);
+	const auto   pct = [&](double v, double of) { return 100.0 * v / std::max(of, 1.0); };
+	std::printf("GTAO: specular occlusion: last %.0f s, %u frames: material %.1f%% of the pixels (water %.2f%%), occluded "
+	            "(spec visibility < 0.8) %.1f%% of those, reduced (> 5%%) %.2f%% of the pixels, mean reduction there %.1f%%; "
+	            "skipped: the game's SSR hit %.1f%%, highlights %.2f%%, not the G-buffer's surface %.1f%% (strength %g)\n",
+	            std::chrono::duration<double>(now - g_gtao.so_last_log).count(), g_gtao.so_frames, pct(t[1], n), pct(t[7], n),
+	            pct(t[6], mat), pct(t[2], n), t[2] > 0 ? t[3] / 10.0 / t[2] : 0.0, pct(t[4], mat), pct(t[5], mat), pct(t[8], n),
+	            GtaoSo().strength);
+	std::fflush(stdout);
+	g_gtao.so_sum.fill(0.0);
+	g_gtao.so_frames   = 0;
+	g_gtao.so_last_log = now;
+}
 
 int GtaoLevel() {
 	static const int level = [] {
@@ -4325,6 +5058,11 @@ int GtaoLevel() {
 	return level;
 }
 
+struct GtaoPush : SsgiPush {
+	float rot[8]; // gtao.comp's rot[2]
+};
+static_assert(sizeof(GtaoPush) == 128);
+
 std::array<SsgiImage*, 10> GtaoAll() {
 	return {&g_gtao.raw,     &g_gtao.tmp_a,   &g_gtao.tmp_b,    &g_gtao.out,      &g_gtao.history[0],
 	        &g_gtao.history[1], &g_gtao.gbuf[0], &g_gtao.gbuf[1], &g_gtao.count[0], &g_gtao.count[1]};
@@ -4335,10 +5073,12 @@ bool GtaoEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
 	if (g_gtao.pipeline == nullptr) {
 		if (g_gtao.failed) return false;
 		g_gtao.failed = true;
-		std::array<vk::DescriptorSetLayoutBinding, 11> bindings {};
-		for (uint32_t i = 0; i < 11; ++i) {
+		std::array<vk::DescriptorSetLayoutBinding, GtaoBindings> bindings {};
+		for (uint32_t i = 0; i < GtaoBindings; ++i) {
 			bindings[i].binding         = i;
-			bindings[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorType  = i >= 17 ? vk::DescriptorType::eStorageBuffer
+			                              : i < 7 || (i >= 9 && i != 10) ? vk::DescriptorType::eCombinedImageSampler
+			                                                             : vk::DescriptorType::eStorageImage;
 			bindings[i].descriptorCount = 1;
 			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
 		}
@@ -4347,7 +5087,7 @@ bool GtaoEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
 		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
 		set_info.pBindings    = bindings.data();
 		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_gtao.set_layout) != vk::Result::eSuccess) return false;
-		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(SsgiPush)};
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(GtaoPush)};
 		vk::PipelineLayoutCreateInfo layout_info {};
 		layout_info.setLayoutCount         = 1;
 		layout_info.pSetLayouts            = &g_gtao.set_layout;
@@ -4384,6 +5124,45 @@ bool GtaoEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
 		query.queryCount = 16;
 		if (device.createQueryPool(&query, nullptr, &g_gtao.pool) != vk::Result::eSuccess) g_gtao.pool = nullptr;
 		g_gtao.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		{ // a 1x1 R32_UINT stand-in for the G-buffer normal layer when there is no copy (binding 11)
+			VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+			create.imageType   = VK_IMAGE_TYPE_2D;
+			create.format      = VK_FORMAT_R32_UINT;
+			create.extent      = {1, 1, 1};
+			create.mipLevels   = 1;
+			create.arrayLayers = 1;
+			create.samples     = VK_SAMPLE_COUNT_1_BIT;
+			create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+			create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+			VmaAllocationCreateInfo allocate {};
+			allocate.usage = VMA_MEMORY_USAGE_AUTO;
+			if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_gtao.dummy_image, &g_gtao.dummy_mem, nullptr) != VK_SUCCESS)
+				return false;
+			vk::ImageViewCreateInfo view_info {};
+			view_info.image            = vk::Image(g_gtao.dummy_image);
+			view_info.viewType         = vk::ImageViewType::e2D;
+			view_info.format           = vk::Format::eR32Uint;
+			view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			if (device.createImageView(&view_info, nullptr, &g_gtao.dummy_view) != vk::Result::eSuccess) return false;
+		}
+		{ // (specocc) the parameters + stats buffer and its host ring
+			VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+			buffer.size  = GtaoSoHeader + GtaoSoStats;
+			buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+			VmaAllocationCreateInfo dev {};
+			dev.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+			if (vmaCreateBuffer(graphics.allocator, &buffer, &dev, &g_gtao.so_dev, &g_gtao.so_dev_mem, nullptr) != VK_SUCCESS) return false;
+			buffer.size  = GtaoSoStats * 4;
+			buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+			VmaAllocationCreateInfo host {};
+			host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+			VmaAllocationInfo mapped {};
+			if (vmaCreateBuffer(graphics.allocator, &buffer, &host, &g_gtao.so_host, &g_gtao.so_host_mem, &mapped) == VK_SUCCESS)
+				g_gtao.so_mapped = static_cast<const uint32_t*>(mapped.pMappedData);
+			else
+				g_gtao.so_host = VK_NULL_HANDLE; // (no stats line; the effect still runs)
+		}
 		g_gtao.failed    = false;
 	}
 	if (g_gtao.out.image.image != nullptr && g_gtao.render == render && g_gtao.level == level) return true;
@@ -4432,6 +5211,7 @@ void GtaoReadTiming() {
 bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const int level = GtaoLevel();
 	if (level == 0) return false; // off: nothing created or recorded
+	if (HwAoReplacesGtao()) return false; // (KYTY_HWRT_AO: the ray-traced AO in its place, hwrt-gi.cpp)
 	if (g_graphics_ctx == nullptr) return false;
 	if (VideoOut::MoviePlaying()) {
 		g_gtao.history_valid = false;
@@ -4450,11 +5230,19 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 		return false;
 	}
-	const float strength = SsgiEnv("KYTY_GTAO_STRENGTH", 0.6f, 1.0f);
-	const float radius   = std::max(SsgiEnv("KYTY_GTAO_RADIUS", 1.0f, 8.0f), 0.05f);
+	// (10-24 ao: subtle defaults; strength 0.6 -> 0.5, radius 1.0 -> 0.6 m, clamped to 10% of the screen height)
+	const float strength  = SsgiEnv("KYTY_GTAO_STRENGTH", 0.5f, 1.0f);
+	// (gtaofar) radius 0.6 -> 0.35 m. The screen clamp below (max_r of the height) is what made the near field look
+	// right: it holds the world radius at max_r * 2 z / proj_y, i.e. ~0.3 m at 3 m from the camera with the game's
+	// projection, while everything past ~6 m got the full 0.6 m (so a staircase or a far wall darkened over whole
+	// areas and brightened as the player walked up to it). 0.35 m is that near-field radius held at every distance (the
+	// clamp now bites only nearer than ~3.5 m: close-ups). The thin-object thickness keeps its ratio to the radius.
+	const float radius    = std::max(SsgiEnv("KYTY_GTAO_RADIUS", 0.35f, 8.0f), 0.05f);
+	const float thickness = std::max(SsgiEnv("KYTY_GTAO_THICKNESS", 0.6f * radius, 4.0f), 0.02f);
+	const float max_r     = std::max(SsgiEnv("KYTY_GTAO_MAXSCREEN", 0.1f, 0.5f), 0.01f);
 	const float bent     = SsgiEnv("KYTY_GTAO_BENT", 0.0f, 1.0f);
 	const auto& m        = inputs.view_to_clip;
-	SsgiPush    push {};
+	GtaoPush    push {};
 	const bool  have_proj = m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f);
 	if (have_proj) {
 		push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
@@ -4470,14 +5258,99 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.trace[0] = static_cast<float>(g_gtao.trace.width), push.trace[1] = static_cast<float>(g_gtao.trace.height);
 	push.trace[2] = strength, push.trace[3] = radius;
 	push.extra[1] = bent;
+	push.extra[2] = thickness;
+	push.extra[3] = max_r;
+	// The G-buffer normal (as SHINE reads it: layer 3, oct 8:8, world space, the G-buffer camera's rotation).
+	RtReflGbuffer gbuf;
+	const bool    have_gbuf = have_proj && RtReflGetGbuffer(gbuf) && gbuf.extent == color.extent && gbuf.views[3] != nullptr;
+	RtReflCamera  camera;
+	if (have_gbuf) RtReflGetCamera(m, camera);
+	static const bool use_gbuf = [] {
+		const char* v = std::getenv("KYTY_GTAO_GBUFFER");
+		return v == nullptr || *v != '0';
+	}();
+	static const bool flip_y = [] {
+		const char* v = std::getenv("KYTY_GTAO_FLIPY");
+		return v == nullptr || *v == '\0' || *v != '0';
+	}();
+	const bool normals = use_gbuf && have_gbuf && camera.rows;
+	int32_t    nflags  = 0;
+	if (normals) {
+		const auto& r = camera.view_rows; // 3 rows x 4
+		push.rot[0] = r[0], push.rot[1] = r[1], push.rot[2] = r[2], push.rot[3] = r[4];
+		push.rot[4] = r[5], push.rot[5] = r[6], push.rot[6] = r[8], push.rot[7] = r[9];
+		// row 2 = cross(row 0, row 1) * sign: the sign from the real row 2
+		const float cx = r[1] * r[6] - r[2] * r[5], cy = r[2] * r[4] - r[0] * r[6], cz = r[0] * r[5] - r[1] * r[4];
+		const bool  neg = cx * r[8] + cy * r[9] + cz * r[10] < 0.0f;
+		nflags = 1 | (flip_y ? 2 : 0) | (neg ? 4 : 0);
+	}
+	if (normals != g_gtao.normals_logged) {
+		g_gtao.normals_logged = normals;
+		std::printf("GTAO: normals from %s\n", normals ? "the G-buffer (layer 3, oct 8:8, world)" : "depth");
+		std::fflush(stdout);
+	}
 	{
 		static bool said = false;
 		if (!said) {
 			said = true;
-			std::printf("GTAO: on (level %d, %ux%u, strength %g, radius %g m, bent %g)%s\n", level, g_gtao.trace.width,
-			            g_gtao.trace.height, strength, radius, bent, have_proj ? "" : " (no projection: 60 deg FOV assumed)");
+			// (gtaofar) where the screen clamp stops shrinking the radius (w = |z C + D|, C = +-1 for the game's)
+			const float py      = std::fabs(push.proj[1]);
+			const float c_abs   = std::fabs(push.depth_map[2]);
+			const float z_clamp = c_abs > 1e-6f ? (radius * py * 0.5f / max_r - std::fabs(push.depth_map[3])) / c_abs : 0.0f;
+			std::printf("GTAO: on (level %d, %ux%u, strength %g, radius %g m (whole beyond %.1f m, vertical FOV %.1f deg), "
+			            "thickness %g m, max %g of the height, bent %g)%s\n",
+			            level, g_gtao.trace.width, g_gtao.trace.height, strength, radius, z_clamp,
+			            py > 0.0f ? 2.0f * std::atan(1.0f / py) * 57.29578f : 0.0f, thickness, max_r, bent,
+			            have_proj ? "" : " (no projection: 60 deg FOV assumed)");
 			std::fflush(stdout);
 		}
+	}
+	// (specocc) What the specular occlusion reads: the material layers (with the G-buffer normal: the same copy), the
+	// lighting's depth, the game's SSR guide, the exposure.
+	const auto& so_cfg  = GtaoSo();
+	const bool  so_mat  = normals && so_cfg.strength > 0.0f && gbuf.views[0] != nullptr && gbuf.views[1] != nullptr && gbuf.views[2] != nullptr;
+	const bool  so_dep  = so_mat && gbuf.depth != nullptr;
+	RtReflGuide guide;
+	const bool  so_gd   = so_mat && RtReflGetGuide(guide) && guide.view != nullptr;
+	const bool  so_exp  = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
+	const bool  so_stat = g_gtao.so_host != VK_NULL_HANDLE;
+	{
+		static int said = -1;
+		const int  now  = so_cfg.strength <= 0.0f ? 0 : !so_mat ? 1 : 2 + (so_gd ? 1 : 0) + (so_dep ? 2 : 0);
+		if (now != said) {
+			said = now;
+			if (now == 0) std::printf("GTAO: specular occlusion off (KYTY_SPEC_OCCLUSION=0 or no roughness field)\n");
+			else if (now == 1) std::printf("GTAO: specular occlusion waiting (no G-buffer material copy this frame)\n");
+			else
+				std::printf("GTAO: specular occlusion on (strength %g; roughness %d, gloss %d, metal %d; the game's SSR guide %s, the "
+				            "lighting's depth %s, exposure %s)\n",
+				            so_cfg.strength, so_cfg.rough, so_cfg.gloss, so_cfg.metal, so_gd ? "yes" : "no (KYTY_RT_REFLECTIONS off)",
+				            so_dep ? "yes" : "no", so_exp ? "the game's" : "1.0");
+			std::fflush(stdout);
+		}
+	}
+	GtaoSoReadStats();
+	{
+		std::array<uint32_t, GtaoSoHeader / 4> h {};
+		const auto fl = [&](uint32_t i, float v) { std::memcpy(&h[i], &v, sizeof(float)); };
+		h[0] = static_cast<uint32_t>(so_cfg.rough), h[1] = static_cast<uint32_t>(so_cfg.gloss), h[2] = static_cast<uint32_t>(so_cfg.metal);
+		h[3] = (so_mat ? 1u | 8u : 0u) | (so_gd ? 2u : 0u) | (so_dep ? 4u : 0u) | (so_mat && so_stat ? 16u : 0u);
+		h[4] = so_exp ? inputs.exposure_index : 12u;
+		fl(8, so_cfg.strength), fl(9, 0.1f), fl(10, 0.6f), fl(11, so_cfg.rough_end); // (guide range: RT reflections' defaults)
+		fl(12, 1.0f), fl(13, so_cfg.highlight), fl(14, so_cfg.peak);
+		{ // (the last frame's shader atomics and copy before these writes)
+			vk::MemoryBarrier2 mb {};
+			mb.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+			mb.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+			mb.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+			mb.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			vk::DependencyInfo dependency {};
+			dependency.memoryBarrierCount = 1;
+			dependency.pMemoryBarriers    = &mb;
+			command.pipelineBarrier2(dependency);
+		}
+		command.updateBuffer(vk::Buffer(g_gtao.so_dev), 0, sizeof(h), h.data());
+		command.fillBuffer(vk::Buffer(g_gtao.so_dev), GtaoSoHeader, GtaoSoStats, 0);
 	}
 	GtaoReadTiming();
 	const auto entry = static_cast<uint32_t>(g_gtao.written % 8);
@@ -4508,12 +5381,33 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const uint32_t prev = cur ^ 1u;
 	push.misc[1] = static_cast<int32_t>(g_gtao.frame);
 	push.misc[2] = level;
-	push.misc[3] = (inputs.reset ? 1 : 0) | (g_gtao.history_valid ? 2 : 0);
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g_gtao.history_valid ? 2 : 0) | (nflags << 2);
+	if (!g_gtao.dummy_ready) {
+		g_gtao.dummy_ready = true;
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask     = vk::PipelineStageFlagBits2::eNone;
+		barrier.dstStageMask     = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.dstAccessMask    = vk::AccessFlagBits2::eTransferWrite;
+		barrier.oldLayout        = vk::ImageLayout::eUndefined;
+		barrier.newLayout        = vk::ImageLayout::eGeneral;
+		barrier.image            = vk::Image(g_gtao.dummy_image);
+		barrier.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+		vk::ClearColorValue             zero {};
+		zero.uint32 = std::array<uint32_t, 4> {0, 0, 0, 0};
+		const vk::ImageSubresourceRange whole {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.clearColorImage(vk::Image(g_gtao.dummy_image), vk::ImageLayout::eGeneral, &zero, 1, &whole);
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+		       vk::AccessFlagBits2::eShaderRead);
+	}
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_gtao.pipeline);
 	const auto run = [&](int mode, const SsgiImage& a, const SsgiImage& b, const SsgiImage& out, const SsgiImage& gout,
 	                     const SsgiImage& aux_in, const SsgiImage& aux_out, float step, vk::Extent2D size) {
 		const vk::Sampler       lin = g_gtao.linear, pt = g_gtao.point;
-		vk::DescriptorImageInfo infos[11] {};
+		vk::DescriptorImageInfo infos[GtaoBindings] {};
 		infos[0]  = {lin, color.view, color.layout};
 		infos[1]  = {pt, inputs.depth.view, inputs.depth.layout};
 		infos[2]  = {pt, inputs.motion.view, inputs.motion.layout};
@@ -4525,16 +5419,33 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		infos[8]  = {nullptr, gout.view, vk::ImageLayout::eGeneral};
 		infos[9]  = {pt, aux_in.view, vk::ImageLayout::eGeneral};
 		infos[10] = {nullptr, aux_out.view, vk::ImageLayout::eGeneral};
-		vk::WriteDescriptorSet writes[11] {};
-		for (uint32_t i = 0; i < 11; ++i) {
+		infos[11] = normals ? vk::DescriptorImageInfo {pt, gbuf.views[3], vk::ImageLayout::eShaderReadOnlyOptimal}
+		                    : vk::DescriptorImageInfo {pt, g_gtao.dummy_view, vk::ImageLayout::eGeneral};
+		// (specocc) the material layers / lighting depth / guide, or stand-ins the flags tell the shader not to read
+		for (uint32_t l = 0; l < 3; ++l)
+			infos[12 + l] = so_mat ? vk::DescriptorImageInfo {pt, gbuf.views[l], vk::ImageLayout::eShaderReadOnlyOptimal}
+			                       : vk::DescriptorImageInfo {pt, g_gtao.dummy_view, vk::ImageLayout::eGeneral};
+		infos[15] = so_dep ? vk::DescriptorImageInfo {pt, gbuf.depth, gbuf.depth_layout} : infos[1];
+		infos[16] = so_gd ? vk::DescriptorImageInfo {lin, guide.view, vk::ImageLayout::eShaderReadOnlyOptimal}
+		                  : vk::DescriptorImageInfo {pt, g_gtao.history[prev].view, vk::ImageLayout::eGeneral};
+		const vk::DescriptorBufferInfo so_buf {vk::Buffer(g_gtao.so_dev), 0, GtaoSoHeader + GtaoSoStats};
+		const vk::DescriptorBufferInfo so_ex  = so_exp ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range}
+		                                               : so_buf;
+		vk::WriteDescriptorSet writes[GtaoBindings] {};
+		for (uint32_t i = 0; i < GtaoBindings; ++i) {
 			writes[i].dstBinding      = i;
 			writes[i].descriptorCount = 1;
-			writes[i].descriptorType  = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+			if (i >= 17) {
+				writes[i].descriptorType = vk::DescriptorType::eStorageBuffer;
+				writes[i].pBufferInfo    = i == 17 ? &so_buf : &so_ex;
+				continue;
+			}
+			writes[i].descriptorType  = i < 7 || (i >= 9 && i != 10) ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
 			writes[i].pImageInfo      = &infos[i];
 		}
 		push.misc[0]  = mode;
 		push.extra[0] = step;
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_gtao.layout, 0, 11, writes);
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_gtao.layout, 0, GtaoBindings, writes);
 		command.pushConstants(g_gtao.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
@@ -4552,9 +5463,20 @@ bool GtaoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		run(2, *src, g.tmp_b, *dst, g.tmp_b, g.count[cur], g.tmp_b, static_cast<float>(1 << i), g.trace);
 		src = dst;
 	}
-	run(4, *src, g.tmp_b, g.out, g.tmp_b, g.count[cur], g.tmp_b, 0.0f, g.render);                            // composite
+	// (shadows-1025) KYTY_GTAO_FLOOR: the composite's darkest multiplier (gtao.comp Composite: 0.7 = at most 30 % off;
+	// "Sombras: profundidad" lowers it to 0.55 / 0.45 for deeper creases under tables, carts and feet). Rides in the
+	// composite's unused a-trous step slot.
+	static const float gtao_floor = std::clamp(SsgiEnv("KYTY_GTAO_FLOOR", 0.7f, 1.0f), 0.3f, 0.95f);
+	run(4, *src, g.tmp_b, g.out, g.tmp_b, g.count[cur], g.tmp_b, gtao_floor, g.render);                      // composite
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
+	if (so_stat) { // (specocc) this frame's stats into the host ring (read 4 frames later)
+		const vk::BufferCopy copy {GtaoSoHeader, (g_gtao.so_written % 4) * GtaoSoStats, GtaoSoStats};
+		command.copyBuffer(vk::Buffer(g_gtao.so_dev), vk::Buffer(g_gtao.so_host), 1, &copy);
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
+		       vk::AccessFlagBits2::eHostRead);
+		++g_gtao.so_written;
+	}
 	if (timed) {
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_gtao.pool, entry * 2 + 1);
 		++g_gtao.written;
@@ -4638,6 +5560,26 @@ struct SsrPass {
 	std::atomic<uint64_t>   copy_flip {~0ull};
 	bool                    copy_failed = false;
 	uint32_t                packed_logged = ~0u;
+	std::atomic<uint64_t>   copies {0};       // copies taken (KYTY_RT_REFLECTIONS' periodic line)
+	vk::Extent2D            resize_to {};     // a new G-buffer size seen on consecutive attempts (resize after 30)
+	uint32_t                resize_seen = 0;
+	struct RetiredCopy {
+		VkImage       image = VK_NULL_HANDLE;
+		VmaAllocation mem   = nullptr;
+		vk::ImageView views[4] {};
+		uint64_t      flip  = 0;
+	};
+	std::vector<RetiredCopy> retired_copies; // (frames in flight may still read them: destroyed 8 flips later)
+	// KYTY_RT_REFLECTIONS: the depth as the deferred lighting reads it (before water and other forward passes draw):
+	// where the final depth is nearer, something was drawn after the G-buffer (water). Taken with the G-buffer copy.
+	VkImage                 depth_image = VK_NULL_HANDLE;
+	VmaAllocation           depth_mem   = nullptr;
+	vk::ImageView           depth_view  = nullptr;
+	vk::Extent2D            depth_extent {};
+	vk::Format              depth_format = vk::Format::eUndefined;
+	vk::ImageLayout         depth_layout = vk::ImageLayout::eUndefined;
+	uint64_t                depth_flip   = ~0ull;
+	bool                    depth_failed = false;
 } g_ssr;
 constexpr uint32_t SsrCalibRuns  = 24;  // calibration frames (one every 4th)
 constexpr uint32_t SsrCalibInts  = 41 + 16 * 3;
@@ -4730,6 +5672,10 @@ const char* SsrFormatName(vk::Format f) {
 		case vk::Format::eR32G32Uint: return "RG32_UINT";
 		case vk::Format::eR16G16B16A16Uint: return "RGBA16_UINT";
 		case vk::Format::eR8G8B8A8Uint: return "RGBA8_UINT";
+		case vk::Format::eD32Sfloat: return "D32F";
+		case vk::Format::eD32SfloatS8Uint: return "D32F_S8";
+		case vk::Format::eD24UnormS8Uint: return "D24_S8";
+		case vk::Format::eD16Unorm: return "D16";
 		default: return "other";
 	}
 }
@@ -4766,6 +5712,8 @@ struct SsrGbuffer {
 	bool                        have_vp = false;
 	uint64_t                    vp_flip = ~0ull;
 	std::array<uint64_t, 2>     packed_addresses {};   // the packed layers' last two addresses (double-buffered)
+	std::array<float, 16>       prev_view_proj {};     // the previous frame's (rows x, y, w; z from the current)
+	bool                        have_prev = false;
 } g_ssr_gb;
 
 bool SsrEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
@@ -5330,12 +6278,23 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 }
 } // namespace
 
-bool SsrWanted() { return SsrLevel() > 0; }
+bool SsrWanted() {
+	return SsrLevel() > 0 || RtReflectionsWanted() || HwParticlesWanted() || ShineWanted() || GtaoLevel() > 0 || GbufViewWanted() ||
+	       SsgiEmissive() > 0.0f || // (rtfire: the emissive light reads the G-buffer copy's albedo)
+	       HwGiWanted();             // (KYTY_HWRT_AO / KYTY_HWRT_GI: its normal and albedo)
+}
+bool SsrPassWanted() { return SsrLevel() > 0; }
 
 void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 	if (!IsGbufferVertexShader(vs_hash) || srt.size() < SrtViewProj + 16) return;
 	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
 	std::lock_guard lock(g_ssr_gb.mutex);
+	// The G-buffer pass is drawn this frame. Its targets are known from a normal-path draw (OnSsrGbuffer), but the
+	// G-buffer draws almost all take the table path (table-xpr.inc) or records (native-xpr.inc), which call only this
+	// hook: without this the targets' flip went stale after the first frames and SsrCaptureGbuffer refused the copy
+	// ("no G-buffer pass this frame or the last") nearly every frame. (The copy still proves the consumer binds the same
+	// address with a 4-layer R32_UINT backing large enough.)
+	if (g_ssr_gb.valid && g_ssr_gb.count > 0 && g_ssr_gb.flip != flip) g_ssr_gb.flip = flip;
 	if (g_ssr_gb.vp_flip == flip) return; // (the frame's first G-buffer draw)
 	std::array<float, 16> vp {};
 	for (uint32_t i = 0; i < 16; ++i) {
@@ -5345,6 +6304,21 @@ void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 	g_ssr_gb.view_proj = vp;
 	g_ssr_gb.have_vp   = true;
 	g_ssr_gb.vp_flip   = flip;
+	// (KYTY_RT_REFLECTIONS: the previous frame's rows x, y and w for the reflections' reprojection)
+	g_ssr_gb.have_prev = false;
+	if (srt.size() >= SrtPrevViewProj + 12) {
+		std::array<float, 16> pv {};
+		for (uint32_t i = 0; i < 4; ++i) {
+			pv[i]      = AsFloat(srt[SrtPrevViewProj + i]);
+			pv[4 + i]  = AsFloat(srt[SrtPrevViewProj + 4 + i]);
+			pv[8 + i]  = vp[8 + i];
+			pv[12 + i] = AsFloat(srt[SrtPrevViewProj + 8 + i]);
+		}
+		if (std::all_of(pv.begin(), pv.end(), [](float v) { return std::isfinite(v); })) {
+			g_ssr_gb.prev_view_proj = pv;
+			g_ssr_gb.have_prev      = true;
+		}
+	}
 }
 
 void OnSsrGbuffer(uint64_t vs_hash, uint64_t ps_hash, std::span<const SsrTarget> targets) {
@@ -5417,9 +6391,146 @@ void SsrCaptureSkip(const char* reason, uint64_t cs_hash) {
 	std::fflush(stdout);
 }
 
+bool SsrIsDepthFormat(vk::Format f) {
+	return f == vk::Format::eD32Sfloat || f == vk::Format::eD32SfloatS8Uint || f == vk::Format::eD24UnormS8Uint ||
+	       f == vk::Format::eX8D24UnormPack32 || f == vk::Format::eD16Unorm || f == vk::Format::eD16UnormS8Uint;
+}
+
+// KYTY_RT_REFLECTIONS' water detection: the consumer's depth binding (a depth-format backing at least the G-buffer's
+// size) copied right after the G-buffer layers, in the same command buffer.
+void SsrCaptureDepth(TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash, std::span<const TextureBinding> images,
+                     uint32_t width, uint32_t height, uint64_t flip) {
+	if (!RtReflectionsWanted() || g_ssr.depth_failed || g_graphics_ctx == nullptr) return;
+	static bool listed = false;
+	if (!listed) {
+		// (once: what the consumer binds, for the next look at its inputs)
+		listed = true;
+		std::string line;
+		char        buf[160];
+		for (size_t i = 0; i < images.size() && i < 24; ++i) {
+			const auto& b = images[i];
+			if (!b.image_id) continue;
+			auto& im = cache.GetImage(b.image_id);
+			std::snprintf(buf, sizeof(buf), " %zu: %s %ux%ux%u @0x%llx;", i, SsrFormatName(im.backing.format), im.backing.extent.width,
+			              im.backing.extent.height, im.backing.layers, static_cast<unsigned long long>(b.desc.info.data.address));
+			line += buf;
+		}
+		std::printf("SSR: G-buffer consumer CS %016llx binds:%s\n", static_cast<unsigned long long>(cs_hash), line.c_str());
+		std::fflush(stdout);
+	}
+	// (KYTY_RT_REFLECTIONS_DEPTH=<n>: the n-th depth binding of the consumer; Demon's Souls' lighting binds two
+	// D32F_S8 images of the render size, the first is the default)
+	static const int which = [] {
+		const char* v = std::getenv("KYTY_RT_REFLECTIONS_DEPTH");
+		return v != nullptr ? std::clamp(std::atoi(v), 0, 7) : 0;
+	}();
+	const TextureBinding* binding = nullptr;
+	int                   seen    = 0;
+	for (const auto& b: images) {
+		if (!b.image_id) continue;
+		auto& im = cache.GetImage(b.image_id);
+		if (im.backing.image == nullptr || !SsrIsDepthFormat(im.backing.format)) continue;
+		if (im.backing.extent.width < width || im.backing.extent.height < height) continue;
+		if (seen++ < which) continue;
+		binding = &b;
+		break;
+	}
+	if (binding == nullptr) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("SSR: the G-buffer consumer binds no depth image: no water detection\n");
+			std::fflush(stdout);
+		}
+		return;
+	}
+	auto&              image = cache.GetImage(binding->image_id);
+	const vk::Format   fmt   = image.backing.format;
+	const vk::Extent2D extent {width, height};
+	if (g_ssr.depth_image != VK_NULL_HANDLE && (g_ssr.depth_extent != extent || g_ssr.depth_format != fmt)) {
+		SsrPass::RetiredCopy r;
+		r.image = g_ssr.depth_image, r.mem = g_ssr.depth_mem, r.flip = flip, r.views[0] = g_ssr.depth_view;
+		g_ssr.retired_copies.push_back(r);
+		g_ssr.depth_image = VK_NULL_HANDLE, g_ssr.depth_mem = nullptr, g_ssr.depth_view = nullptr;
+		g_ssr.depth_layout = vk::ImageLayout::eUndefined;
+	}
+	if (g_ssr.depth_image == VK_NULL_HANDLE) {
+		g_ssr.depth_failed = true;
+		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		create.imageType   = VK_IMAGE_TYPE_2D;
+		create.format      = static_cast<VkFormat>(fmt);
+		create.extent      = {width, height, 1};
+		create.mipLevels   = 1;
+		create.arrayLayers = 1;
+		create.samples     = VK_SAMPLE_COUNT_1_BIT;
+		create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO;
+		if (vmaCreateImage(g_graphics_ctx->allocator, &create, &allocate, &g_ssr.depth_image, &g_ssr.depth_mem, nullptr) != VK_SUCCESS) {
+			g_ssr.depth_image = VK_NULL_HANDLE;
+			std::printf("SSR: depth copy image could not be created (%s)\n", SsrFormatName(fmt));
+			return;
+		}
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = vk::Image(g_ssr.depth_image);
+		view_info.viewType         = vk::ImageViewType::e2D;
+		view_info.format           = fmt;
+		view_info.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+		if (g_graphics_ctx->device.createImageView(&view_info, nullptr, &g_ssr.depth_view) != vk::Result::eSuccess) {
+			g_ssr.depth_view = nullptr;
+			return;
+		}
+		g_ssr.depth_extent = extent, g_ssr.depth_format = fmt;
+		g_ssr.depth_failed = false;
+		std::printf("SSR: depth copied with the G-buffer (%ux%u %s @0x%llx): water detection\n", width, height, SsrFormatName(fmt),
+		            static_cast<unsigned long long>(binding->desc.info.data.address));
+		std::fflush(stdout);
+	}
+	const ImageSubresourceRange range {0, 1, 0, 1};
+	// (layout transitions name every aspect of a depth / stencil image; the copy and the view only the depth)
+	const vk::ImageAspectFlags full_aspect =
+	    (fmt == vk::Format::eD32Sfloat || fmt == vk::Format::eD16Unorm || fmt == vk::Format::eX8D24UnormPack32)
+	        ? vk::ImageAspectFlags(vk::ImageAspectFlagBits::eDepth)
+	        : (vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil);
+	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range, command);
+	const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+	                         vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::ImageMemoryBarrier2 b {};
+		b.srcStageMask        = src_stage;
+		b.srcAccessMask       = src_access;
+		b.dstStageMask        = dst_stage;
+		b.dstAccessMask       = dst_access;
+		b.oldLayout           = from;
+		b.newLayout           = to;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image               = vk::Image(g_ssr.depth_image);
+		b.subresourceRange    = vk::ImageSubresourceRange {full_aspect, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &b;
+		command.pipelineBarrier2(dependency);
+	};
+	barrier(g_ssr.depth_layout, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllCommands,
+	        vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eDepth, 0, 0, 1};
+	copy.dstSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eDepth, 0, 0, 1};
+	copy.extent         = vk::Extent3D {width, height, 1};
+	command.copyImage(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, vk::Image(g_ssr.depth_image),
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+	barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
+	        vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+	g_ssr.depth_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	const vk::ImageLayout back = binding->layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding->layout;
+	image.Transit(back, vk::AccessFlagBits2::eShaderRead, range, command);
+	g_ssr.depth_flip = flip;
+}
+
 void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
                        std::span<const TextureBinding> images) {
-	if (SsrLevel() == 0 || g_ssr.copy_failed) return;
+	if (!SsrWanted() || g_ssr.copy_failed) return;
 	if (g_graphics_ctx == nullptr) g_graphics_ctx = &graphics;
 	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
 	if (g_ssr.copy_flip.load(std::memory_order_relaxed) == flip) return; // (once a frame: the first consumer)
@@ -5451,7 +6562,35 @@ void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::Comman
 	if (image.backing.extent.width < width || image.backing.extent.height < height)
 		return SsrCaptureSkip("backing smaller than the G-buffer", cs_hash);
 	const vk::Extent2D extent {width, height};
-	if (g_ssr.copy_image != VK_NULL_HANDLE && g_ssr.copy_extent != extent) return SsrCaptureSkip("size changed", cs_hash);
+	// (copies replaced at a size change: destroyed once no frame in flight can read them)
+	for (size_t i = 0; i < g_ssr.retired_copies.size();) {
+		auto& r = g_ssr.retired_copies[i];
+		if (flip < r.flip + 8) {
+			++i;
+			continue;
+		}
+		for (auto& v: r.views)
+			if (v != nullptr) g_graphics_ctx->device.destroyImageView(v, nullptr);
+		if (r.image != VK_NULL_HANDLE) vmaDestroyImage(g_graphics_ctx->allocator, r.image, r.mem);
+		r = g_ssr.retired_copies.back();
+		g_ssr.retired_copies.pop_back();
+	}
+	if (g_ssr.copy_image != VK_NULL_HANDLE && g_ssr.copy_extent != extent) {
+		// A new size on 30 consecutive attempts (a resolution change, not a second view in the frame): a new copy.
+		if (g_ssr.resize_to != extent) g_ssr.resize_to = extent, g_ssr.resize_seen = 0;
+		if (++g_ssr.resize_seen < 30) return SsrCaptureSkip("size changed", cs_hash);
+		std::printf("SSR: G-buffer copy resized %ux%u -> %ux%u\n", g_ssr.copy_extent.width, g_ssr.copy_extent.height, width, height);
+		std::fflush(stdout);
+		SsrPass::RetiredCopy r;
+		r.image = g_ssr.copy_image, r.mem = g_ssr.copy_mem, r.flip = flip;
+		for (uint32_t i = 0; i < 4; ++i) r.views[i] = g_ssr.copy_views[i], g_ssr.copy_views[i] = nullptr;
+		g_ssr.retired_copies.push_back(r);
+		g_ssr.copy_image  = VK_NULL_HANDLE;
+		g_ssr.copy_mem    = nullptr;
+		g_ssr.copy_layout = vk::ImageLayout::eUndefined;
+		g_ssr.copy_extent = {};
+	}
+	g_ssr.resize_seen = 0;
 	if (g_ssr.copy_image == VK_NULL_HANDLE) {
 		g_ssr.copy_failed = true;
 		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -5517,7 +6656,9 @@ void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::Comman
 	g_ssr.copy_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
 	const vk::ImageLayout back = binding->layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding->layout;
 	image.Transit(back, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range, command);
+	SsrCaptureDepth(cache, command, cs_hash, images, width, height, flip);
 	g_ssr.copy_flip.store(flip, std::memory_order_release);
+	g_ssr.copies.fetch_add(1, std::memory_order_relaxed);
 	static bool said = false;
 	if (!said) {
 		said = true;
@@ -5525,6 +6666,515 @@ void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::Comman
 		            static_cast<unsigned long long>(address));
 		std::fflush(stdout);
 	}
+}
+
+// KYTY_GBUF_VIEW / KYTY_GBUF_TAP (gbuf-view.h, refl7): after a dispatch (renderCompute.cpp, outside a compute chain's
+// middle): a dispatch reading the G-buffer logs once what it writes (its outputs: which image holds the game's SSR or
+// specular IBL); the KYTY_GBUF_TAP dispatch's written image is copied for the tap view (every time it runs: the last
+// one in the frame stays).
+namespace {
+struct GbufTapState {
+	bool                  parsed = false, failed = false;
+	uint64_t              hash = 0;
+	int                   slot = -1;
+	VkImage               image = VK_NULL_HANDLE;
+	VmaAllocation         mem   = nullptr;
+	vk::ImageView         view  = nullptr;
+	vk::Extent2D          extent {};
+	vk::Format            format = vk::Format::eUndefined;
+	vk::ImageLayout       layout = vk::ImageLayout::eUndefined;
+	std::atomic<uint64_t> flip {~0ull};
+	std::vector<std::pair<uint64_t, uint64_t>> logged; // (hash, written mask) logged already
+	std::vector<SsrPass::RetiredCopy>          retired;
+} g_tap;
+
+bool GbufTapFormat(vk::Format f) {
+	switch (f) {
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat:
+		case vk::Format::eR16G16Sfloat:
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR16Sfloat:
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eR8Unorm:
+		case vk::Format::eR8G8Unorm:
+		case vk::Format::eR16Unorm:
+		case vk::Format::eR16G16B16A16Unorm: return true;
+		default: return false;
+	}
+}
+} // namespace
+
+void GbufTapAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                          std::span<const TextureBinding> images, uint64_t written_mask) {
+	if (!GbufViewWanted()) return;
+	if (g_graphics_ctx == nullptr) g_graphics_ctx = &graphics;
+	if (!g_tap.parsed) {
+		g_tap.parsed = true;
+		if (const char* v = std::getenv("KYTY_GBUF_TAP"); v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0) {
+			unsigned long long h    = 0;
+			int                slot = -1;
+			if (std::sscanf(v, "%llx:%d", &h, &slot) >= 1) g_tap.hash = h, g_tap.slot = slot;
+			std::printf("GBUF: tap CS %016llx slot %s\n", h, slot >= 0 ? std::to_string(slot).c_str() : "(first written)");
+			std::fflush(stdout);
+		}
+	}
+	// (what a G-buffer reader writes: logged once per shader and written set)
+	{
+		std::array<uint64_t, 2> packed {};
+		{
+			std::lock_guard lock(g_ssr_gb.mutex);
+			packed = g_ssr_gb.packed_addresses;
+		}
+		bool reads = false;
+		for (const auto& b: images)
+			if (b.desc.info.data.address != 0 && (b.desc.info.data.address == packed[0] || b.desc.info.data.address == packed[1])) reads = true;
+		const auto key = std::make_pair(cs_hash, written_mask);
+		if ((reads || cs_hash == g_tap.hash) && g_tap.logged.size() < 128 &&
+		    std::find(g_tap.logged.begin(), g_tap.logged.end(), key) == g_tap.logged.end()) {
+			g_tap.logged.push_back(key);
+			std::string line;
+			char        buf[200];
+			for (size_t i = 0; i < images.size() && i < 32; ++i) {
+				const auto& b = images[i];
+				if (!b.image_id) continue;
+				auto& im = cache.GetImage(b.image_id);
+				std::snprintf(buf, sizeof(buf), " %zu%s %s %ux%ux%u mip %u layer %u @0x%llx;", i, (written_mask >> i) & 1u ? " WRITES" : "",
+				              SsrFormatName(im.backing.format), im.backing.extent.width, im.backing.extent.height, im.backing.layers,
+				              b.desc.view_info.base_level, b.desc.view_info.base_layer, static_cast<unsigned long long>(b.desc.info.data.address));
+				line += buf;
+			}
+			std::printf("GBUF: %s CS %016llx images:%s\n", reads ? "G-buffer reader" : "tap", static_cast<unsigned long long>(cs_hash), line.c_str());
+			std::fflush(stdout);
+		}
+	}
+	if (g_tap.failed || g_tap.hash == 0 || cs_hash != g_tap.hash) return;
+	const uint64_t flip = g_flips_taken.load(std::memory_order_relaxed);
+	int slot = g_tap.slot;
+	if (slot < 0)
+		for (size_t i = 0; i < images.size() && i < 64; ++i)
+			if ((written_mask >> i) & 1u) {
+				slot = static_cast<int>(i);
+				break;
+			}
+	if (slot < 0 || static_cast<size_t>(slot) >= images.size() || !images[slot].image_id) return;
+	const auto& binding = images[slot];
+	auto&       image   = cache.GetImage(binding.image_id);
+	if (image.backing.image == nullptr) return;
+	const vk::Format fmt = image.backing.format;
+	if (!GbufTapFormat(fmt)) {
+		g_tap.failed = true;
+		std::printf("GBUF: tap slot %d is %s: not a color format the view can show\n", slot, SsrFormatName(fmt));
+		std::fflush(stdout);
+		return;
+	}
+	const uint32_t   level = binding.desc.view_info.base_level, layer = binding.desc.view_info.base_layer;
+	const vk::Extent2D extent {std::max(1u, image.backing.extent.width >> level), std::max(1u, image.backing.extent.height >> level)};
+	for (size_t i = 0; i < g_tap.retired.size();) {
+		auto& r = g_tap.retired[i];
+		if (flip < r.flip + 8) {
+			++i;
+			continue;
+		}
+		if (r.views[0] != nullptr) graphics.device.destroyImageView(r.views[0], nullptr);
+		if (r.image != VK_NULL_HANDLE) vmaDestroyImage(graphics.allocator, r.image, r.mem);
+		r = g_tap.retired.back();
+		g_tap.retired.pop_back();
+	}
+	if (g_tap.image != VK_NULL_HANDLE && (g_tap.extent != extent || g_tap.format != fmt)) {
+		SsrPass::RetiredCopy r;
+		r.image = g_tap.image, r.mem = g_tap.mem, r.flip = flip, r.views[0] = g_tap.view;
+		g_tap.retired.push_back(r);
+		g_tap.image = VK_NULL_HANDLE, g_tap.mem = nullptr, g_tap.view = nullptr, g_tap.layout = vk::ImageLayout::eUndefined;
+	}
+	if (g_tap.image == VK_NULL_HANDLE) {
+		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		create.imageType   = VK_IMAGE_TYPE_2D;
+		create.format      = static_cast<VkFormat>(fmt);
+		create.extent      = {extent.width, extent.height, 1};
+		create.mipLevels   = 1;
+		create.arrayLayers = 1;
+		create.samples     = VK_SAMPLE_COUNT_1_BIT;
+		create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO;
+		if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_tap.image, &g_tap.mem, nullptr) != VK_SUCCESS) {
+			g_tap.image  = VK_NULL_HANDLE;
+			g_tap.failed = true;
+			return;
+		}
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = vk::Image(g_tap.image);
+		view_info.viewType         = vk::ImageViewType::e2D;
+		view_info.format           = fmt;
+		view_info.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		if (graphics.device.createImageView(&view_info, nullptr, &g_tap.view) != vk::Result::eSuccess) {
+			g_tap.view   = nullptr;
+			g_tap.failed = true;
+			return;
+		}
+		g_tap.extent = extent, g_tap.format = fmt;
+		std::printf("GBUF: tap image %ux%u %s from CS %016llx slot %d (mip %u layer %u @0x%llx)\n", extent.width, extent.height,
+		            SsrFormatName(fmt), static_cast<unsigned long long>(cs_hash), slot, level, layer,
+		            static_cast<unsigned long long>(binding.desc.info.data.address));
+		std::fflush(stdout);
+	}
+	const ImageSubresourceRange range {level, 1, layer, 1};
+	{
+		// (the dispatch's storage writes before the copy, also inside a compute chain, whose dispatches have no barriers)
+		vk::MemoryBarrier2 mb {};
+		mb.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+		mb.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite;
+		mb.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		mb.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &mb;
+		command.pipelineBarrier2(dependency);
+	}
+	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range, command);
+	const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+	                         vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::ImageMemoryBarrier2 b {};
+		b.srcStageMask        = src_stage;
+		b.srcAccessMask       = src_access;
+		b.dstStageMask        = dst_stage;
+		b.dstAccessMask       = dst_access;
+		b.oldLayout           = from;
+		b.newLayout           = to;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image               = vk::Image(g_tap.image);
+		b.subresourceRange    = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &b;
+		command.pipelineBarrier2(dependency);
+	};
+	barrier(g_tap.layout, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+	        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, level, layer, 1};
+	copy.dstSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = vk::Extent3D {extent.width, extent.height, 1};
+	command.copyImage(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, vk::Image(g_tap.image), vk::ImageLayout::eTransferDstOptimal, 1,
+	                  &copy);
+	barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
+	        vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+	g_tap.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	const vk::ImageLayout back = binding.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding.layout;
+	image.Transit(back, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range, command);
+	g_tap.flip.store(flip, std::memory_order_release);
+}
+
+bool GbufTapGet(GbufTapImage& out) {
+	const uint64_t taken = g_tap.flip.load(std::memory_order_acquire);
+	const uint64_t flips = g_flips_taken.load(std::memory_order_relaxed);
+	if (taken == ~0ull || flips > taken + 1 || g_tap.view == nullptr) return false;
+	out.view    = g_tap.view;
+	out.extent  = g_tap.extent;
+	out.integer = false;
+	return true;
+}
+
+// (refl8) KYTY_RT_REFLECTIONS' guide (rt-reflections.h RtReflGuide): the game's own SSR result, a half-resolution
+// RGBA16F input of the deferred lighting / specular resolve (default CS 9fb5cc274b5e4f82: reads the packed G-buffer,
+// both depths, a 256x256 RG16F BRDF LUT and this image; writes the full-resolution lit RGBA16F), copied after that
+// dispatch every frame. Its bindings are logged once, and the dispatch that writes the image (the game's SSR pass) once.
+namespace {
+struct GuideState {
+	bool                  parsed = false, failed = false, logged = false, producer_logged = false;
+	uint64_t              hash = 0x9fb5cc274b5e4f82ull;
+	int                   slot = -1, used_slot = -1;
+	uint64_t              address = 0, producer = 0;
+	VkImage               image = VK_NULL_HANDLE;
+	VmaAllocation         mem   = nullptr;
+	vk::ImageView         view  = nullptr;
+	vk::Extent2D          extent {};
+	vk::Format            format = vk::Format::eUndefined;
+	vk::ImageLayout       layout = vk::ImageLayout::eUndefined;
+	std::atomic<uint64_t> flip {~0ull};
+	uint32_t              misses = 0;
+	bool                  miss_logged = false, first_copy_logged = false;
+	std::atomic<const char*> status {"the lighting (guide CS) not seen yet"};
+	std::vector<SsrPass::RetiredCopy> retired;
+} g_guide;
+
+vk::Extent2D BindingExtent(TextureCache& cache, const TextureBinding& b) {
+	auto&          im    = cache.GetImage(b.image_id);
+	const uint32_t level = b.desc.view_info.base_level;
+	return {std::max(1u, im.backing.extent.width >> level), std::max(1u, im.backing.extent.height >> level)};
+}
+} // namespace
+
+void RtReflGuideAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                              std::span<const TextureBinding> images, uint64_t written_mask) {
+	if (!RtReflGuideWanted()) return;
+	if (!g_guide.parsed) {
+		g_guide.parsed = true;
+		if (const char* v = std::getenv("KYTY_RT_REFLECTIONS_GUIDE_CS"); v != nullptr && *v != '\0') {
+			unsigned long long h = 0;
+			if (std::sscanf(v, "%llx", &h) == 1 && h != 0) g_guide.hash = h;
+		}
+		if (const char* v = std::getenv("KYTY_RT_REFLECTIONS_GUIDE_SLOT"); v != nullptr && *v != '\0') g_guide.slot = std::atoi(v);
+	}
+	// (the game's SSR pass: the dispatch that writes the guide's image; once its address is known)
+	if (g_guide.address != 0 && !g_guide.producer_logged && cs_hash != g_guide.hash) {
+		for (size_t i = 0; i < images.size() && i < 64; ++i) {
+			if (((written_mask >> i) & 1u) == 0 || !images[i].image_id || images[i].desc.info.data.address != g_guide.address) continue;
+			g_guide.producer_logged = true;
+			g_guide.producer        = cs_hash;
+			std::string line;
+			char        buf[200];
+			for (size_t k = 0; k < images.size() && k < 32; ++k) {
+				const auto& b = images[k];
+				if (!b.image_id) continue;
+				auto&              im = cache.GetImage(b.image_id);
+				const vk::Extent2D e  = BindingExtent(cache, b);
+				std::snprintf(buf, sizeof(buf), " %zu%s %s %ux%u @0x%llx;", k, (written_mask >> k) & 1u ? " WRITES" : "",
+				              SsrFormatName(im.backing.format), e.width, e.height, static_cast<unsigned long long>(b.desc.info.data.address));
+				line += buf;
+			}
+			std::printf("RT reflections: guide image @0x%llx written by CS %016llx (the game's SSR pass) slot %zu; its images:%s\n",
+			            static_cast<unsigned long long>(g_guide.address), static_cast<unsigned long long>(cs_hash), i, line.c_str());
+			std::fflush(stdout);
+			break;
+		}
+	}
+	if (g_guide.failed || cs_hash != g_guide.hash) return;
+	// The slot. (refl8 fix, combo19) The first version took the first RGBA16F input at half the size of the first
+	// image the lighting WRITES; that held only on the very first run (a 2560x1440 lighting writing 2560x1440, guide
+	// 1280x720). In play the PS5 Pro path renders 1280x720 and the lighting writes a 640x720 RGBA16F (half width), its
+	// guide input is 640x360: 640 is not half of 640, no slot ever again ("ran 600 times without a usable slot", the
+	// guide copied in 0 frames). Now, in order: KYTY_RT_REFLECTIONS_GUIDE_SLOT; the slot found before when it is still
+	// an RGBA float input no larger than the render size; the first RGBA16F input at half the render size (the largest
+	// depth binding: the G-buffer's size); the old rule (half the written image).
+	vk::Extent2D out_extent {}, ref_extent {};
+	for (size_t i = 0; i < images.size() && i < 64; ++i) {
+		if (!images[i].image_id) continue;
+		const vk::Extent2D e = BindingExtent(cache, images[i]);
+		if (((written_mask >> i) & 1u) != 0 && out_extent.width == 0) out_extent = e;
+		if (SsrIsDepthFormat(cache.GetImage(images[i].image_id).backing.format) &&
+		    uint64_t {e.width} * e.height > uint64_t {ref_extent.width} * ref_extent.height)
+			ref_extent = e;
+	}
+	if (ref_extent.width == 0) ref_extent = out_extent;
+	const auto is_rgba_float = [&](size_t i) {
+		if (i >= images.size() || !images[i].image_id || ((written_mask >> i) & 1u) != 0) return false;
+		const vk::Format f = cache.GetImage(images[i].image_id).backing.format;
+		return f == vk::Format::eR16G16B16A16Sfloat || f == vk::Format::eR32G32B32A32Sfloat;
+	};
+	const auto near_half = [](uint32_t v, uint32_t full) { return v + 1 >= (full + 1) / 2 && v <= (full + 1) / 2 + 1; };
+	const auto half_of   = [&](size_t i, vk::Extent2D full) {
+		if (full.width == 0 || !is_rgba_float(i)) return false;
+		const vk::Extent2D e = BindingExtent(cache, images[i]);
+		return near_half(e.width, full.width) && near_half(e.height, full.height);
+	};
+	int         slot = g_guide.slot;
+	const char* rule = "KYTY_RT_REFLECTIONS_GUIDE_SLOT";
+	if (slot < 0 && g_guide.used_slot >= 0 && is_rgba_float(static_cast<size_t>(g_guide.used_slot))) {
+		const vk::Extent2D e = BindingExtent(cache, images[g_guide.used_slot]);
+		// (no larger than the render size, no smaller than a quarter of it: not some other small RGBA float input)
+		if (ref_extent.width == 0 || (e.width <= ref_extent.width && e.height <= ref_extent.height && e.width * 4 >= ref_extent.width &&
+		                              e.height * 4 >= ref_extent.height))
+			slot = g_guide.used_slot, rule = "the slot found before";
+	}
+	for (size_t i = 0; slot < 0 && i < images.size() && i < 64; ++i)
+		if (half_of(i, ref_extent)) slot = static_cast<int>(i), rule = "half the render (depth) size";
+	for (size_t i = 0; slot < 0 && i < images.size() && i < 64; ++i)
+		if (half_of(i, out_extent)) slot = static_cast<int>(i), rule = "half the written image's size";
+	const auto bindings_line = [&] {
+		std::string line;
+		char        buf[200];
+		for (size_t i = 0; i < images.size() && i < 32; ++i) {
+			const auto& b = images[i];
+			if (!b.image_id) continue;
+			auto&              im = cache.GetImage(b.image_id);
+			const vk::Extent2D e  = BindingExtent(cache, b);
+			std::snprintf(buf, sizeof(buf), " %zu%s %s %ux%u @0x%llx;", i, (written_mask >> i) & 1u ? " WRITES" : "",
+			              SsrFormatName(im.backing.format), e.width, e.height, static_cast<unsigned long long>(b.desc.info.data.address));
+			line += buf;
+		}
+		return line;
+	};
+	if (!g_guide.logged) {
+		g_guide.logged = true;
+		std::printf("RT reflections: guide CS %016llx images:%s (render size %ux%u, writes %ux%u) -> guide slot %s (%s)\n",
+		            static_cast<unsigned long long>(g_guide.hash), bindings_line().c_str(), ref_extent.width, ref_extent.height,
+		            out_extent.width, out_extent.height, slot >= 0 ? std::to_string(slot).c_str() : "none",
+		            slot >= 0 ? rule : "no RGBA float input at half the render size: the material mask until one is found");
+		std::fflush(stdout);
+	}
+	if (slot < 0 || static_cast<size_t>(slot) >= images.size() || !images[slot].image_id) {
+		++g_guide.misses;
+		if (!g_guide.miss_logged) {
+			// (one-shot: why this run found no guide, with what it bound)
+			g_guide.miss_logged = true;
+			std::printf("RT reflections: guide CS %016llx run without a usable slot (first time; %s): render size %ux%u, writes %ux%u, "
+			            "slot found before %d; images:%s\n",
+			            static_cast<unsigned long long>(g_guide.hash),
+			            slot >= 0 ? "the given slot is not bound" : "no RGBA float input at half the render or written size",
+			            ref_extent.width, ref_extent.height, out_extent.width, out_extent.height, g_guide.used_slot, bindings_line().c_str());
+			std::fflush(stdout);
+		}
+		g_guide.status.store("the lighting ran without a usable slot", std::memory_order_relaxed);
+		return;
+	}
+	if (slot != g_guide.used_slot && g_guide.used_slot >= 0) {
+		std::printf("RT reflections: guide slot %d -> %d (%s)\n", g_guide.used_slot, slot, rule);
+		std::fflush(stdout);
+	}
+	const auto& binding = images[slot];
+	auto&       image   = cache.GetImage(binding.image_id);
+	if (image.backing.image == nullptr) {
+		g_guide.status.store("the guide slot's image has no backing", std::memory_order_relaxed);
+		return;
+	}
+	const vk::Format fmt = image.backing.format;
+	if (fmt != vk::Format::eR16G16B16A16Sfloat && fmt != vk::Format::eR32G32B32A32Sfloat) {
+		g_guide.failed = true;
+		g_guide.status.store("the given guide slot is not RGBA float", std::memory_order_relaxed);
+		std::printf("RT reflections: guide slot %d is %s, not RGBA float: the material mask instead\n", slot, SsrFormatName(fmt));
+		std::fflush(stdout);
+		return;
+	}
+	const uint64_t     flip  = g_flips_taken.load(std::memory_order_relaxed);
+	const uint32_t     level = binding.desc.view_info.base_level, layer = binding.desc.view_info.base_layer;
+	const vk::Extent2D extent = BindingExtent(cache, binding);
+	for (size_t i = 0; i < g_guide.retired.size();) {
+		auto& r = g_guide.retired[i];
+		if (flip < r.flip + 8) {
+			++i;
+			continue;
+		}
+		if (r.views[0] != nullptr) graphics.device.destroyImageView(r.views[0], nullptr);
+		if (r.image != VK_NULL_HANDLE) vmaDestroyImage(graphics.allocator, r.image, r.mem);
+		r = g_guide.retired.back();
+		g_guide.retired.pop_back();
+	}
+	if (g_guide.image != VK_NULL_HANDLE && (g_guide.extent != extent || g_guide.format != fmt)) {
+		SsrPass::RetiredCopy r;
+		r.image = g_guide.image, r.mem = g_guide.mem, r.flip = flip, r.views[0] = g_guide.view;
+		g_guide.retired.push_back(r);
+		g_guide.image = VK_NULL_HANDLE, g_guide.mem = nullptr, g_guide.view = nullptr, g_guide.layout = vk::ImageLayout::eUndefined;
+		g_guide.flip.store(~0ull, std::memory_order_release);
+	}
+	if (g_guide.image == VK_NULL_HANDLE) {
+		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		create.imageType   = VK_IMAGE_TYPE_2D;
+		create.format      = static_cast<VkFormat>(fmt);
+		create.extent      = {extent.width, extent.height, 1};
+		create.mipLevels   = 1;
+		create.arrayLayers = 1;
+		create.samples     = VK_SAMPLE_COUNT_1_BIT;
+		create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO;
+		if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_guide.image, &g_guide.mem, nullptr) != VK_SUCCESS) {
+			g_guide.image  = VK_NULL_HANDLE;
+			g_guide.failed = true;
+			g_guide.status.store("the guide copy image could not be created", std::memory_order_relaxed);
+			return;
+		}
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = vk::Image(g_guide.image);
+		view_info.viewType         = vk::ImageViewType::e2D;
+		view_info.format           = fmt;
+		view_info.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		if (graphics.device.createImageView(&view_info, nullptr, &g_guide.view) != vk::Result::eSuccess) {
+			g_guide.view   = nullptr;
+			g_guide.failed = true;
+			g_guide.status.store("the guide copy view could not be created", std::memory_order_relaxed);
+			return;
+		}
+		g_guide.extent = extent, g_guide.format = fmt, g_guide.used_slot = slot;
+		g_guide.address = binding.desc.info.data.address, g_guide.producer_logged = false;
+		static uint32_t created = 0;
+		if (++created <= 8) std::printf("RT reflections: guide image %ux%u %s from CS %016llx slot %d (mip %u layer %u @0x%llx; the lighting writes %ux%u)\n",
+		            extent.width, extent.height, SsrFormatName(fmt), static_cast<unsigned long long>(cs_hash), slot, level, layer,
+		            static_cast<unsigned long long>(g_guide.address), out_extent.width, out_extent.height);
+		std::fflush(stdout);
+	}
+	const ImageSubresourceRange range {level, 1, layer, 1};
+	{
+		// (whatever wrote the image, and this dispatch, before the copy; also inside a compute chain)
+		vk::MemoryBarrier2 mb {};
+		mb.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		mb.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+		mb.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		mb.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &mb;
+		command.pipelineBarrier2(dependency);
+	}
+	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range, command);
+	const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+	                         vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::ImageMemoryBarrier2 b {};
+		b.srcStageMask        = src_stage;
+		b.srcAccessMask       = src_access;
+		b.dstStageMask        = dst_stage;
+		b.dstAccessMask       = dst_access;
+		b.oldLayout           = from;
+		b.newLayout           = to;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image               = vk::Image(g_guide.image);
+		b.subresourceRange    = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &b;
+		command.pipelineBarrier2(dependency);
+	};
+	barrier(g_guide.layout, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+	        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, level, layer, 1};
+	copy.dstSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = vk::Extent3D {extent.width, extent.height, 1};
+	command.copyImage(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, vk::Image(g_guide.image), vk::ImageLayout::eTransferDstOptimal,
+	                  1, &copy);
+	barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
+	        vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+	g_guide.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	const vk::ImageLayout back = binding.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding.layout;
+	image.Transit(back, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range, command);
+	g_guide.used_slot = slot;
+	g_guide.status.store("copied", std::memory_order_relaxed);
+	g_guide.flip.store(flip, std::memory_order_release);
+	if (!g_guide.first_copy_logged) {
+		g_guide.first_copy_logged = true;
+		std::printf("RT reflections: guide copied (first time, flip %llu): %ux%u from CS %016llx slot %d @0x%llx, after %u runs without a slot\n",
+		            static_cast<unsigned long long>(flip), extent.width, extent.height, static_cast<unsigned long long>(cs_hash), slot,
+		            static_cast<unsigned long long>(binding.desc.info.data.address), g_guide.misses);
+		std::fflush(stdout);
+	}
+}
+
+const char* RtReflGuideStatus() { return g_guide.status.load(std::memory_order_relaxed); }
+
+bool RtReflGetGuide(RtReflGuide& out) {
+	const uint64_t taken = g_guide.flip.load(std::memory_order_acquire);
+	const uint64_t flips = g_flips_taken.load(std::memory_order_relaxed);
+	if (taken == ~0ull || flips > taken + 1 || g_guide.view == nullptr) {
+		const char* st = g_guide.status.load(std::memory_order_relaxed);
+		if (taken != ~0ull && flips > taken + 1 && st != nullptr && std::strcmp(st, "copied") == 0)
+			g_guide.status.store("the last copy is older than one flip (the lighting did not run)", std::memory_order_relaxed);
+		return false;
+	}
+	out.view     = g_guide.view;
+	out.extent   = g_guide.extent;
+	out.cs       = g_guide.hash;
+	out.producer = g_guide.producer;
+	out.slot     = g_guide.used_slot;
+	return true;
 }
 
 uint32_t SsrPackedTargets(std::array<SsrTarget, 4>& targets) {
@@ -5553,27 +7203,96 @@ bool SsrMaterial(SsrTarget& target, int& channel, bool& gloss) {
 	return true;
 }
 
+// KYTY_RT_REFLECTIONS (rt-reflections.cpp): the G-buffer copy and the camera.
+bool RtReflGetGbuffer(RtReflGbuffer& out) {
+	const uint64_t copied = g_ssr.copy_flip.load(std::memory_order_acquire);
+	const uint64_t flips  = g_flips_taken.load(std::memory_order_relaxed);
+	if (copied == ~0ull || flips > copied + 1 || g_ssr.copy_image == VK_NULL_HANDLE) return false;
+	for (uint32_t i = 0; i < 4; ++i) {
+		if (g_ssr.copy_views[i] == nullptr) return false;
+		out.views[i] = g_ssr.copy_views[i];
+	}
+	out.extent = g_ssr.copy_extent;
+	if (g_ssr.depth_view != nullptr && g_ssr.depth_flip == copied && g_ssr.depth_extent == g_ssr.copy_extent) {
+		out.depth        = g_ssr.depth_view;
+		out.depth_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	}
+	return true;
+}
+
+uint64_t RtReflCopies() { return g_ssr.copies.load(std::memory_order_relaxed); }
+
+void RtReflGetCamera(const std::array<float, 16>& view_to_clip, RtReflCamera& out) {
+	out.rows     = SsrViewRotation(view_to_clip, out.view_rows);
+	out.up_valid = SsrUpInView(view_to_clip, out.up);
+	out.prev     = false;
+	std::array<float, 16> vp {}, pv {};
+	{
+		std::lock_guard lock(g_ssr_gb.mutex);
+		if (!g_ssr_gb.have_vp || !g_ssr_gb.have_prev || g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.vp_flip + 2) return;
+		vp = g_ssr_gb.view_proj, pv = g_ssr_gb.prev_view_proj;
+	}
+	// Current clip -> previous clip = VP_prev * VP^-1 (row-major, column vectors: clip = M * world).
+	std::array<double, 16> inv {};
+	if (!Inverse4(vp, inv)) return;
+	std::array<float, 16> c {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j) {
+			double d = 0.0;
+			for (int k = 0; k < 4; ++k) d += static_cast<double>(pv[i * 4 + k]) * inv[k * 4 + j];
+			if (!std::isfinite(d)) return;
+			c[i * 4 + j] = static_cast<float>(d);
+		}
+	out.clip_to_prev = c;
+	out.prev         = true;
+}
+
 namespace {
-// KYTY_CONTACT_SHADOWS=0|1|2|3 ("Sombras RT": No / Normal / Alta / Ultra; cshadow.comp): screen-space contact shadows
-// toward the sun, recorded after SSGI and before the upscaler. 1: half-res trace, 16 steps, temporal + a-trous 1, 2;
-// 2: full res, 24 steps, a-trous 1, 2, 4; 3: full res, 56 steps, a little longer ray (x1.15), binary-search hit refine,
-// temporal alpha 0.05, a-trous 1, 2, 4 (as 2: no wider blur), strength x0.9. The composite only darkens (color *
-// factor, factor in [1 - strength, 1], min'd with the input), skips sky and > 80 m, and is masked by the history count. KYTY_CONTACT_SHADOWS_STRENGTH (0.7: how dark a contact shadow
-// gets, 0..1), KYTY_CONTACT_SHADOWS_LENGTH (1.0: ray length scale, 0.25..4).
+// KYTY_RT_SHADOWS=0|1|2|3 ("Sombras RT": off / Low / High / Ultra; cshadow.comp; KYTY_CONTACT_SHADOWS, the old name,
+// is read when it is unset): screen-space ray-traced sun shadows on the PS5 Pro path's linear HDR color (before the
+// game's exposure, the upscaler and its TAA), recorded first in Upscale (before SSGI / GTAO / SSR). 1: half-res trace,
+// 12 steps, temporal + a-trous 1, 2; 2: full res, 20 steps, a-trous 1, 2, 4; 3: full res, 32 steps, rays x1.25,
+// slower temporal alpha. The composite only darkens: color * (1 - strength * fade * (1 - visibility)), nothing on the
+// sky, faded out between KYTY_RT_SHADOWS_FADE (100 m) and twice that. KYTY_RT_SHADOWS_STRENGTH (0.75, 0..1),
+// KYTY_RT_SHADOWS_LENGTH (3.0: world ray length in m, 0.25..10), KYTY_RT_SHADOWS_HOLD (20 s: a sun unseen is kept).
+// Every 10 s a "RTSHADOW: stats" line: the share of pixels shadowed, mean occlusion, their depth, the sun's K and the
+// overcast factor, the GPU time.
+// (10-24, second round) Hard near-black shards on far cliffs (Boletaria, overcast): rays 3.75 m long at 50 m with a
+// 1 m thickness hit the next flat facet of the cliff's mesh. Now: rays, strength and thickness scale with distance
+// (generous within 6 m, conservative beyond 40 m), a least occluder distance over the receiver's plane, a ~3 degree
+// penumbra cone jittered per frame and a wider, softer a-trous (no binary edges), a cap of 75 % darkening; pixels the
+// game already shadows (dark against the same surface around them, on the scale its sun gives) get no second shadow;
+// and an overcast factor (KYTY_RT_SHADOWS_OVERCAST=0 turns it off): the light probe compares the luminance of what
+// faces the sun with what faces away (K, the sun-lit to ambient ratio): K <= 1.3 scales the strength to 0.15, full from 2.4.
 //
-// The sun's direction (no fixed guess; off while unknown):
+// Why the first version looked wrong: its depth reconstruction took the render's row 0 as NDC y -1, while the game's
+// viewport (GNM, yscale < 0) puts NDC y +1 there: the scene it marched was mirrored vertically against the light it
+// was given (shadows cast "upward", lit floors left alone, a lighting vote picking a flipped or view-space axis to
+// compensate); its lit mask and light vote used luma thresholds that mean nothing in the pre-exposure HDR range; its
+// rays reached 2 m (doubling the game's own shadow-map shadows, grey far away) and its fade followed vote locks
+// (popping).
+//
+// The sun's direction:
 //  1. OnShadowConsumer (renderCompute.cpp): a dispatch that samples a square, layered (>= 4), depth-like image of
 //     >= 512 px (the sun cascades' shadow-map array; Demon's Souls: 1024x1024x80 at 0x102a400000) is a shadow
 //     consumer (the deferred sun lighting / shadow resolve). Its flattened SRT and its constant buffers (<= 64 KiB, the
 //     first 4 KiB) are searched for orthographic matrices: 4x4 (either major) with a (0, 0, 0, 1) projective row, or
 //     3x4 rows, whose 3x3 rows are mutually orthogonal (|cos| < 0.01), x and y scales equal (a square map) and the
 //     depth scale different (so no rigid view / object matrix passes); the camera's own forward is refused. The depth
-//     row is the light axis; the cascades must agree (2 degrees), else the axis seen in 3 frames running.
-//  2. The axis is in the matrix's input space (world, or view) with an unknown sign: four view-space candidates
-//     (world through the camera's view = P^-1 * view_proj (g_camera, P the upscaler's view_to_clip), and as-is; each
-//     sign). A vote pass (mode 5, every frame until settled, then every 16th) compares the game's own lit luma of
-//     pixels facing each candidate (n.l > 0.5) with that of pixels facing away (< -0.2); the candidate whose ratio
-//     (EMA of the log) is >= 1.2 and beats the others' axis wins. None (an interior, no sun) -> no contact shadows.
+//     row is the light axis; the cascades must agree (2 degrees), else the axis seen in 3 frames running. The draws
+//     into that array (OnShadowDraw) are the fallback source while no consumer is seen.
+//  2. The axis is in the matrices' input space (world, or the camera's view) with an unknown sign. Space: the reading
+//     that stays put while the camera turns (> 15 degrees) is the right one (2 agreeing turns decide; the draws'
+//     matrices are world; KYTY_RT_SHADOWS_SPACE=world|view forces it). Sign: the sun is above the horizon.
+//  3. World up and the screen's y convention: a calibration pass (mode 5) counts the depth buffer's floors (normals
+//     within 14 degrees of an axis) along each world axis, both signs, in both conventions; the winner (2x the next)
+//     decides; priors +y up, row 0 = NDC y +1 (KYTY_RT_SHADOWS_UP=y|-y|z|..., KYTY_RT_SHADOWS_FLIPY=1|0 force them).
+//     (10-24) The camera narrows it first: a game camera does not roll, so world up is the axis its right vector stays
+//     perpendicular to while it turns (and its screen-up row stays within 70 degrees of), with the sign that puts up at
+//     the top of the screen (row 0) in each convention: the floors only choose between the two mirror twins left. The
+//     floors alone picked -z in Boletaria (walls facing a camera that looked along +z outnumbered the grazing ground;
+//     the game is +y up, as the KBM camera's yaw from x / z assumes), which flips any sun with z > 0 below the horizon.
+// The view-space light is the world sun through the current camera every frame; the pass is off while any is unknown.
 struct CShadowPass {
 	vk::DescriptorSetLayout set_layout = nullptr;
 	vk::PipelineLayout      layout     = nullptr;
@@ -5590,13 +7309,36 @@ struct CShadowPass {
 	VmaAllocation           vote_mem      = nullptr;
 	const uint32_t*         vote_mapped   = nullptr;
 	bool                    slot_voted[4] {};
-	float                   ema[4] {};
-	uint32_t                votes = 0;
-	int                     chosen = -1, last_chosen = -1, lead = -1;
-	uint32_t                lead_n = 0;
-	bool                    locked = false; // (the vote agreed once for this latched sun: space and sign fixed)
-	bool                    latched = false, switching = false, have_dir = false;
-	std::array<float, 3>    latch_axis {}, switch_axis {}, last_dir {};
+	// Calibration: floors per hypothesis (convention c (0 row 0 = NDC +1, 1 mirrored) * 6 + axis * 2 + negative).
+	double                  calib[12] {};
+	int                     hyp = -1; // the decided hypothesis (-1: none yet)
+	// The camera's evidence on world up (frames; per axis: frames its right row is perpendicular to it and its up row
+	// leans toward it, the signed lean summed); the axis it decided (-1: none yet); the hypotheses it leaves.
+	double                  cam_frames = 0.0, cam_ok[3] {}, cam_lean[3] {};
+	int                     cam_axis = -1;
+	uint32_t                cam_mask = 0xfffu;
+	// Statistics (every 16th frame, read back 4 frames late; logged every 10 s with the GPU time).
+	int64_t                 stat_frame = -1;
+	double                  st_pixels = 0.0, st_n = 0.0, st_occ = 0.0, st_depth = 0.0;
+	uint32_t                st_samples = 0;
+	// The light probe: log2 K smoothed (K the game's sun-lit to facing-away luminance ratio; -1 none yet) and the
+	// overcast factor it gives the strength (1 full sun .. 0.15 overcast).
+	double                  log_k = -1.0, sun_factor = 1.0;
+	// The sun's space: 0 unknown, 1 world, 2 view; turns that voted for each.
+	int                     space = 0, world_votes = 0, view_votes = 0;
+	bool                    space_ref = false;
+	std::array<double, 3>   ref_axis {}, ref_vw {}, ref_fwd {};
+	uint64_t                space_flip = ~0ull;
+	// The latched world-space sun (toward the light).
+	bool                    latched = false, switching = false, said_on = false;
+	// (KYTY_HWRT_SHADOW) The pipeline traces the scene TLAS; one was built at least once; the 10 s line's counts.
+	bool                    hw = false, hw_seen = false, hw_now = false;
+	uint32_t                hw_traced = 0, hw_stale = 0, hw_none = 0;
+	// (the darkening outliers and the self-test, from the statistics frames)
+	double                  hw_px = 0.0, hw_out = 0.0, hw_big = 0.0, hw_amount = 0.0, hw_sun_cos = -1.0;
+	float                   hw_test[5] {};
+	float                   hw_test_max = 0.0f;
+	std::array<double, 3>   latch_axis {}, switch_axis {};
 	float                   fade = 0.0f;
 	std::chrono::steady_clock::time_point latch_time {}, last_fresh {};
 	vk::QueryPool           pool      = nullptr;
@@ -5615,18 +7357,70 @@ struct CShadowPush {
 	int32_t misc[4];
 	float   extra[4];
 	float   cand[4][4];
+	float   tune[4]; // x: 1 / K (the light probe's sun-lit to ambient ratio)
 };
-static_assert(sizeof(CShadowPush) == 160);
+static_assert(sizeof(CShadowPush) == 176);
+
+// (hwrt2s) KYTY_HWRT_SHADOW=0..3: the sun's rays through the scene TLAS (KYTY_HWRT=1, hwrt-scene.h) joined to KYTY_RT_SUN's
+// cascades in its trace pass (rt-sun.comp HwSun, the RTSUN_HW_SPV build): contact shadows the maps' bias loses, small
+// casters their texels miss, and every caster beyond the last cascade. 1: half-resolution trace, a ray a pixel (first
+// hit), 150 m; 2: the same, 300 m; 3: full resolution, two rays (closest hit), 500 m. It runs KYTY_RT_SUN's plumbing at
+// its own level when KYTY_RT_SUN is unset. 0 / unset: nothing (KYTY_RT_SUN and everything else exactly as before).
+int HwShadowLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_HWRT_SHADOW");
+		const int   q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		if (q > 0) {
+			std::printf("HWRTSHADOW: KYTY_HWRT_SHADOW=%s read (level %d)%s\n", value, q,
+			            HwScene::Requested() ? "" : ": needs KYTY_HWRT=1 too: off");
+			std::fflush(stdout);
+		}
+		return HwScene::Requested() ? q : 0;
+	}();
+	return level;
+}
+
+// (rtsun) KYTY_RT_SUN=0..3: the cascades' visibility pass (frame-gen.h RtSunWanted); 0 when unset (KYTY_HWRT_SHADOW's
+// level then, when that is set).
+int RtSunLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_RT_SUN");
+		int         q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		if ((value == nullptr || *value == '\0') && HwShadowLevel() > 0) {
+			q = HwShadowLevel();
+			std::printf("RTSUN: KYTY_RT_SUN unset: level %d for KYTY_HWRT_SHADOW\n", q);
+			std::fflush(stdout);
+			return q;
+		}
+		if (q > 0) {
+			std::printf("RTSUN: KYTY_RT_SUN=%s read (level %d: %s)\n", value, q, q == 1 ? "low" : q == 2 ? "high" : "ultra");
+			std::fflush(stdout);
+		}
+		return q;
+	}();
+	return level;
+}
 
 int ContactQuality() {
 	static const int quality = [] {
-		const char* value = std::getenv("KYTY_CONTACT_SHADOWS");
-		const int   q     = value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
-		std::printf("CSHADOW: KYTY_CONTACT_SHADOWS=%s read (level %d)\n", value != nullptr ? value : "(unset)", q);
-		std::fflush(stdout);
+		if (RtSunLevel() > 0) return RtSunLevel(); // (KYTY_RT_SUN runs this plumbing with its own shader)
+		const char* name  = "KYTY_RT_SHADOWS";
+		const char* value = std::getenv(name);
+		if (value == nullptr || *value == '\0') name = "KYTY_CONTACT_SHADOWS", value = std::getenv(name);
+		const int q = value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
+		if (q > 0) {
+			std::printf("RTSHADOW: %s=%s read (level %d)\n", name, value, q);
+			std::fflush(stdout);
+		}
 		return q;
 	}();
 	return quality;
+}
+
+float RtShadowEnv(const char* name, const char* old_name, float fallback, float hi) {
+	const char* value = std::getenv(name);
+	if ((value == nullptr || *value == '\0') && old_name != nullptr) value = std::getenv(old_name);
+	return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, hi) : fallback;
 }
 
 // The probe's findings (any recording thread writes, the upscaler's reads).
@@ -5637,6 +7431,8 @@ struct SunProbe {
 	uint32_t                agree = 0;  // matrices agreeing in that dispatch
 	uint32_t                stable = 0; // flips in a row with the same axis
 	bool                    valid = false;
+	int                     source = 0; // 1 a shadow consumer dispatch, 2 shadow-map draws
+	uint64_t                consumer_flip = 0;
 	std::array<float, 16>   view_proj {}; // the camera's (g_camera) when it was seen
 	bool                    have_camera = false;
 	std::array<std::atomic<uint64_t>, 8> consumers {};
@@ -5791,7 +7587,7 @@ void OnShadowConsumer(uint64_t cs_hash, const ShadowConsumer& consumer, std::spa
 	static uint32_t reports = 0;
 	if (first || (reports < 64 && flip % 600 == 0)) {
 		++reports;
-		std::printf("CSHADOW: sun-shadow consumer CS %016llx (shadow array 0x%llx %ux%u x%u layers, SRT %zu words, %u constant "
+		std::printf("RTSHADOW: sun-shadow consumer CS %016llx (shadow array 0x%llx %ux%u x%u layers, SRT %zu words, %u constant "
 		            "buffers): %zu orthographic matrices, axis (%.4f %.4f %.4f) agreed by %u%s\n",
 		            static_cast<unsigned long long>(cs_hash), static_cast<unsigned long long>(consumer.shadow_address),
 		            consumer.shadow_size, consumer.shadow_size, consumer.shadow_layers, srt.size(), consumer.buffers, axes.size(),
@@ -5807,10 +7603,23 @@ void OnShadowConsumer(uint64_t cs_hash, const ShadowConsumer& consumer, std::spa
 	g_sun.axis   = a;
 	g_sun.flip   = flip;
 	g_sun.valid  = true;
+	g_sun.source = 1;
+	g_sun.consumer_flip = flip;
 }
 
 void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> srt, bool shadow_target) {
 	if (srt.empty()) return;
+	// The RT shadows' camera on every draw path, whatever the upscaler or frame generation gate OnDraw on: a G-buffer
+	// draw's view-projection, only when finite and perspective (a w row with a spatial part); else it stays unknown.
+	if (IsGbufferVertexShader(vs_hash) && srt.size() >= SrtViewProj + 16) {
+		std::array<float, 16> vp {};
+		bool                  ok = true;
+		for (uint32_t i = 0; i < 16 && ok; ++i) ok = std::isfinite(vp[i] = AsFloat(srt[SrtViewProj + i]));
+		if (ok && std::abs(vp[12]) + std::abs(vp[13]) + std::abs(vp[14]) > 1e-6f) {
+			std::lock_guard vp_lock(g_last_vp_mutex);
+			g_last_vp = vp, g_have_last_vp = true;
+		}
+	}
 	static std::mutex                             mutex;
 	static std::unordered_map<uint64_t, uint64_t> learned;  // shadow-pass vertex shaders -> the flip last learned
 	static std::unordered_map<uint64_t, uint64_t> probed;   // others: the flip last scanned (every 300 flips at most)
@@ -5831,14 +7640,18 @@ void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> srt, bool shadow_t
 		if (best_n >= 2 || (best_n == 1 && axes.size() == 1)) {
 			const auto a = axes[best];
 			std::lock_guard sun(g_sun.mutex);
-			const bool same = g_sun.valid && std::abs(a[0] * g_sun.axis[0] + a[1] * g_sun.axis[1] + a[2] * g_sun.axis[2]) > 0.9994f;
-			g_sun.stable = same ? g_sun.stable + 1 : 1;
-			g_sun.agree  = best_n;
-			g_sun.axis   = a;
-			g_sun.flip   = flip_of;
-			g_sun.valid  = true;
-			std::lock_guard vp_lock(g_last_vp_mutex);
-			if (g_have_last_vp) g_sun.view_proj = g_last_vp, g_sun.have_camera = true;
+			// (A shadow consumer seen lately is the better source: its matrices are the cascades' own, no object's.)
+			if (!(g_sun.source == 1 && flip_of <= g_sun.consumer_flip + 120)) {
+				const bool same = g_sun.valid && std::abs(a[0] * g_sun.axis[0] + a[1] * g_sun.axis[1] + a[2] * g_sun.axis[2]) > 0.9994f;
+				g_sun.stable = same ? g_sun.stable + 1 : 1;
+				g_sun.agree  = best_n;
+				g_sun.axis   = a;
+				g_sun.flip   = flip_of;
+				g_sun.valid  = true;
+				g_sun.source = 2;
+				std::lock_guard vp_lock(g_last_vp_mutex);
+				if (g_have_last_vp) g_sun.view_proj = g_last_vp, g_sun.have_camera = true;
+			}
 		}
 		axes.clear();
 		flip_of = flip;
@@ -5868,9 +7681,313 @@ void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> srt, bool shadow_t
 	axes.push_back(found[0]);
 	if (!said) {
 		said = true;
-		std::printf("CSHADOW: sun matrix from a shadow draw (VS %016llx, %s, SRT %zu words): light axis (%.4f %.4f %.4f)\n",
+		std::printf("RTSHADOW: sun matrix from a shadow draw (VS %016llx, %s, SRT %zu words): light axis (%.4f %.4f %.4f)\n",
 		            static_cast<unsigned long long>(vs_hash), shadow_target ? "depth target a shadow-map layer" : "table/record path",
 		            srt.size(), found[0][0], found[0][1], found[0][2]);
+		std::fflush(stdout);
+	}
+}
+
+// ---- KYTY_RT_SUN (frame-gen.h RtSunWanted; rt-sun.comp) ----
+// What the sun pass knows of the game's cascades (any recording thread writes, the upscaler's thread reads).
+// Evidence it builds on (logs of 10-24, KYTY_RT_SHADOWS): the sun-shadow draws (VS daa84716d49bf71d, a depth-only target
+// that is a layer of the 1024x1024 x80 array at 0x102a400000) carry an orthographic light matrix in their 32-word SRT
+// whose depth row gave the sun (0.3434 0.7004 -0.6257), 44.5 degrees; the deferred lighting dispatches (CS decd2b04b5eee050,
+// 7e676bf37482d768, 422c6f1a73af2909, a4f528961552278e, 9d79b940e729615f) sample that array.
+namespace {
+struct RtSunEntry {
+	uint32_t              layer = 0;
+	std::array<float, 16> m {}; // row-major, clip = m * (world, 1)
+	uint32_t              count = 0;
+};
+struct RtSunState {
+	std::mutex mutex;
+	// The draws' matrices: this flip's (per layer, up to 24 sampled draws) and the last complete flip's.
+	uint64_t                cur_flip = ~0ull, last_flip = ~0ull;
+	std::vector<RtSunEntry> cur, last;
+	std::array<uint8_t, 256> sampled {};
+	uint64_t                address = 0; // the cascades' array (the draws' depth target)
+	// Per vertex shader: the SRT word offset * 4 + layout (0 row-major 4x4, 1 column-major 4x4, 2 3x4 rows) of its
+	// orthographic matrix, -1 none (tries in the high bits: looked for at most 8 times).
+	std::unordered_map<uint64_t, int32_t> vs_code;
+	uint32_t                vs_logged = 0;
+	// Our copy of the cascade layers (slot k: copied[k]).
+	VkImage                 image = VK_NULL_HANDLE;
+	VmaAllocation           mem   = nullptr;
+	vk::ImageView           view  = nullptr;
+	vk::Format              format = vk::Format::eUndefined;
+	vk::Extent2D            extent {};
+	vk::ImageLayout         layout = vk::ImageLayout::eUndefined;
+	bool                    failed = false, said_copy = false;
+	uint64_t                copy_flip = ~0ull, copies = 0;
+	std::vector<RtSunEntry> copied;
+	// The shader's buffer (4 frame slots of 1 KiB).
+	VkBuffer                buf     = VK_NULL_HANDLE;
+	VmaAllocation           buf_mem = nullptr;
+	uint8_t*                buf_mapped = nullptr;
+	// Calibration: the convention (-1 undecided), its candidate, the votes last read, the bias, R (log2 (1 + R), -1 none).
+	int                     hyp = -1, cand = -1, cand_n = 0;
+	std::array<uint32_t, 8> votes {};
+	std::array<double, 32>  hist {};
+	double                  bias_m = 0.03, log_r = -1.0;
+	uint32_t                r_lit = 0, r_shadow = 0;
+	// Statistics for the 10 s line.
+	double                  st_dark = 0.0, st_lift = 0.0, st_amount = 0.0, st_pixels = 0.0;
+	uint32_t                st_frames = 0, cascades_used = 0;
+	float                   texel_min = 0.0f, texel_max = 0.0f;
+} g_rs;
+
+constexpr uint32_t kRtSunSlots = 8;      // cascades at most
+constexpr uint32_t kRtSunSlotBytes = 1024;
+
+float RtSunEnv(const char* name, float fallback, float lo, float hi) {
+	const char* value = std::getenv(name);
+	return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), lo, hi) : fallback;
+}
+
+bool RtSunHasStencil(vk::Format f) {
+	return f == vk::Format::eD32SfloatS8Uint || f == vk::Format::eD24UnormS8Uint || f == vk::Format::eD16UnormS8Uint;
+}
+
+// The first orthographic light matrix among the words (FindOrthoAxes' tests): its code (offset * 4 + layout), -1 none.
+int32_t RtSunFindMatrix(std::span<const uint32_t> srt) {
+	const size_t       n = std::min<size_t>(srt.size(), 160);
+	std::vector<float> f(n);
+	std::memcpy(f.data(), srt.data(), n * 4u);
+	const auto finite = [&](size_t o, size_t k) {
+		for (size_t i = 0; i < k; ++i)
+			if (!std::isfinite(f[o + i])) return false;
+		return true;
+	};
+	std::array<float, 3> axis {};
+	for (size_t o = 0; o + 12 <= n; ++o) {
+		if (!finite(o, 12)) continue;
+		const float* m = &f[o];
+		if (o + 16 <= n && finite(o, 16)) {
+			if (m[12] == 0.0f && m[13] == 0.0f && m[14] == 0.0f && m[15] == 1.0f && Orthonormalish(m, m + 4, m + 8, axis))
+				return static_cast<int32_t>(o * 4 + 0);
+			if (m[3] == 0.0f && m[7] == 0.0f && m[11] == 0.0f && m[15] == 1.0f) {
+				const float c0[3] {m[0], m[4], m[8]}, c1[3] {m[1], m[5], m[9]}, c2[3] {m[2], m[6], m[10]};
+				if (Orthonormalish(c0, c1, c2, axis)) return static_cast<int32_t>(o * 4 + 1);
+			}
+		}
+		const bool perspective = o + 16 <= n && finite(o, 16) &&
+		                         std::abs(m[12] * m[8] + m[13] * m[9] + m[14] * m[10]) >
+		                             0.5f * std::sqrt((m[12] * m[12] + m[13] * m[13] + m[14] * m[14]) * (m[8] * m[8] + m[9] * m[9] + m[10] * m[10])) &&
+		                         (m[12] * m[12] + m[13] * m[13] + m[14] * m[14]) > 1e-8f;
+		if ((o & 3u) == 0 && !perspective && Orthonormalish(m, m + 4, m + 8, axis)) return static_cast<int32_t>(o * 4 + 2);
+	}
+	return -1;
+}
+
+// The matrix at `code`, row-major (clip = m * p); false when it is not there (not finite, w row not (0, 0, 0, 1)).
+bool RtSunReadMatrix(std::span<const uint32_t> srt, int32_t code, std::array<float, 16>& m) {
+	const size_t o = static_cast<size_t>(code >> 2);
+	const int    kind = code & 3;
+	if (o + (kind == 2 ? 12u : 16u) > srt.size()) return false;
+	float f[16] {};
+	std::memcpy(f, srt.data() + o, (kind == 2 ? 12u : 16u) * 4u);
+	if (kind == 2) f[12] = 0.0f, f[13] = 0.0f, f[14] = 0.0f, f[15] = 1.0f;
+	if (kind == 1) {
+		for (int i = 0; i < 4; ++i)
+			for (int j = 0; j < 4; ++j) m[i * 4 + j] = f[j * 4 + i];
+	} else {
+		for (int i = 0; i < 16; ++i) m[i] = f[i];
+	}
+	for (float v: m)
+		if (!std::isfinite(v)) return false;
+	return m[12] == 0.0f && m[13] == 0.0f && m[14] == 0.0f && m[15] == 1.0f;
+}
+
+// One matrix per layer: the one most of its sampled draws used (a cascade's matrix is shared by all its draws).
+std::vector<RtSunEntry> RtSunTable(const std::vector<RtSunEntry>& entries) {
+	std::vector<RtSunEntry> out;
+	for (const auto& e: entries) {
+		auto it = std::ranges::find(out, e.layer, &RtSunEntry::layer);
+		if (it == out.end()) out.push_back(e);
+		else if (e.count > it->count) *it = e;
+	}
+	std::erase_if(out, [](const RtSunEntry& e) { return e.count < 2; });
+	std::ranges::sort(out, {}, &RtSunEntry::layer);
+	if (out.size() > kRtSunSlots) out.resize(kRtSunSlots);
+	return out;
+}
+} // namespace
+
+bool RtSunWanted() { return RtSunLevel() > 0; }
+
+void OnSunCascadeDraw(uint64_t vs_hash, std::span<const uint32_t> srt, uint32_t layer, uint64_t target_address) {
+	if (srt.empty() || layer >= 256 || !RtSunWanted()) return;
+	const uint64_t  flip = g_flips_taken.load(std::memory_order_relaxed);
+	std::lock_guard lock(g_rs.mutex);
+	if (flip != g_rs.cur_flip) {
+		if (!g_rs.cur.empty()) g_rs.last = std::move(g_rs.cur), g_rs.last_flip = g_rs.cur_flip;
+		g_rs.cur.clear();
+		g_rs.cur_flip = flip;
+		g_rs.sampled.fill(0);
+	}
+	if (g_rs.sampled[layer] >= 24) return; // (a sample of each layer's draws a flip)
+	auto it = g_rs.vs_code.find(vs_hash);
+	if (it == g_rs.vs_code.end() || (it->second < 0 && (-it->second) < 8)) {
+		const int32_t code = RtSunFindMatrix(srt);
+		const int32_t was  = it == g_rs.vs_code.end() ? 0 : -it->second;
+		g_rs.vs_code[vs_hash] = code >= 0 ? code : -(was + 1);
+		if (g_rs.vs_logged < 16 && (code >= 0 || was == 0)) {
+			++g_rs.vs_logged;
+			std::printf("RTSUN: cascade draw VS %016llx (layer %u of 0x%llx, SRT %zu words): %s at word %d\n",
+			            static_cast<unsigned long long>(vs_hash), layer, static_cast<unsigned long long>(target_address), srt.size(),
+			            code >= 0 ? (code & 3) == 0 ? "orthographic matrix (row-major 4x4)" : (code & 3) == 1 ? "orthographic matrix (column-major 4x4)"
+			                                                                             : "orthographic matrix (3x4 rows)"
+			                      : "no orthographic matrix",
+			            code >= 0 ? code >> 2 : -1);
+			std::fflush(stdout);
+		}
+		it = g_rs.vs_code.find(vs_hash);
+	}
+	if (it->second < 0) return;
+	std::array<float, 16> m {};
+	if (!RtSunReadMatrix(srt, it->second, m)) return;
+	++g_rs.sampled[layer];
+	g_rs.address = target_address;
+	for (auto& e: g_rs.cur)
+		if (e.layer == layer && e.m == m) {
+			++e.count;
+			return;
+		}
+	if (g_rs.cur.size() < 256) g_rs.cur.push_back({layer, m, 1});
+}
+
+void RtSunAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                        std::span<const TextureBinding> images) {
+	if (!RtSunWanted() || g_rs.failed) return;
+	const uint64_t          flip = g_flips_taken.load(std::memory_order_relaxed);
+	std::vector<RtSunEntry> table;
+	uint64_t                address = 0;
+	{
+		std::lock_guard lock(g_rs.mutex);
+		if (g_rs.address == 0 || g_rs.copy_flip == flip) return;
+		address = g_rs.address;
+		table   = RtSunTable(g_rs.cur_flip == flip && !g_rs.cur.empty() ? g_rs.cur : g_rs.last);
+	}
+	if (table.empty()) return;
+	const TextureBinding* binding = nullptr;
+	for (const auto& b: images)
+		if (b.image_id && b.desc.info.data.address == address && b.desc.info.resources.layers >= 4) {
+			binding = &b;
+			break;
+		}
+	if (binding == nullptr) return;
+	auto& image = cache.GetImage(binding->image_id);
+	if (image.backing.image == nullptr) return;
+	const vk::Format   fmt    = image.backing.format;
+	const vk::Extent2D extent = {image.backing.extent.width, image.backing.extent.height};
+	const bool         depth  = SsrIsDepthFormat(fmt);
+	for (const auto& e: table)
+		if (e.layer >= binding->desc.info.resources.layers) return;
+	if (g_rs.image != VK_NULL_HANDLE && (g_rs.format != fmt || g_rs.extent != extent)) {
+		// (another format or size: made again; the device idles first, as the passes' own images are remade)
+		graphics.device.waitIdle();
+		graphics.device.destroyImageView(g_rs.view, nullptr);
+		vmaDestroyImage(graphics.allocator, g_rs.image, g_rs.mem);
+		g_rs.image = VK_NULL_HANDLE, g_rs.mem = nullptr, g_rs.view = nullptr, g_rs.layout = vk::ImageLayout::eUndefined;
+	}
+	const vk::ImageAspectFlags all_aspects =
+	    depth ? (RtSunHasStencil(fmt) ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil : vk::ImageAspectFlagBits::eDepth)
+	          : vk::ImageAspectFlagBits::eColor;
+	const vk::ImageAspectFlags copy_aspect = depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
+	if (g_rs.image == VK_NULL_HANDLE) {
+		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		create.imageType   = VK_IMAGE_TYPE_2D;
+		create.format      = static_cast<VkFormat>(fmt);
+		create.extent      = {extent.width, extent.height, 1};
+		create.mipLevels   = 1;
+		create.arrayLayers = kRtSunSlots;
+		create.samples     = VK_SAMPLE_COUNT_1_BIT;
+		create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO;
+		if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_rs.image, &g_rs.mem, nullptr) != VK_SUCCESS) {
+			g_rs.image = VK_NULL_HANDLE, g_rs.failed = true;
+			std::printf("RTSUN: the cascade copy (%ux%u x%u, %s) could not be created: off\n", extent.width, extent.height, kRtSunSlots,
+			            SsrFormatName(fmt));
+			std::fflush(stdout);
+			return;
+		}
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = vk::Image(g_rs.image);
+		view_info.viewType         = vk::ImageViewType::e2DArray;
+		view_info.format           = fmt;
+		view_info.subresourceRange = vk::ImageSubresourceRange {copy_aspect, 0, 1, 0, kRtSunSlots};
+		if (graphics.device.createImageView(&view_info, nullptr, &g_rs.view) != vk::Result::eSuccess) {
+			vmaDestroyImage(graphics.allocator, g_rs.image, g_rs.mem);
+			g_rs.image = VK_NULL_HANDLE, g_rs.view = nullptr, g_rs.failed = true;
+			return;
+		}
+		g_rs.format = fmt, g_rs.extent = extent, g_rs.layout = vk::ImageLayout::eUndefined;
+	}
+	{
+		// (whatever wrote the cascades, this dispatch's reads, our pass's reads of the last copy: before the copy)
+		vk::MemoryBarrier2 mb {};
+		mb.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		mb.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+		mb.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		mb.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &mb;
+		command.pipelineBarrier2(dependency);
+	}
+	for (const auto& e: table)
+		image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, ImageSubresourceRange {0, 1, e.layer, 1},
+		              command);
+	const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+	                         vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::ImageMemoryBarrier2 b {};
+		b.srcStageMask        = src_stage;
+		b.srcAccessMask       = src_access;
+		b.dstStageMask        = dst_stage;
+		b.dstAccessMask       = dst_access;
+		b.oldLayout           = from;
+		b.newLayout           = to;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image               = vk::Image(g_rs.image);
+		b.subresourceRange    = vk::ImageSubresourceRange {all_aspects, 0, 1, 0, kRtSunSlots};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &b;
+		command.pipelineBarrier2(dependency);
+	};
+	barrier(g_rs.layout, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+	        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+	std::array<vk::ImageCopy, kRtSunSlots> copies {};
+	for (uint32_t k = 0; k < table.size(); ++k) {
+		copies[k].srcSubresource = vk::ImageSubresourceLayers {copy_aspect, 0, table[k].layer, 1};
+		copies[k].dstSubresource = vk::ImageSubresourceLayers {copy_aspect, 0, k, 1};
+		copies[k].extent         = vk::Extent3D {extent.width, extent.height, 1};
+	}
+	command.copyImage(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, vk::Image(g_rs.image), vk::ImageLayout::eTransferDstOptimal,
+	                  static_cast<uint32_t>(table.size()), copies.data());
+	barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
+	        vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
+	g_rs.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	std::lock_guard lock(g_rs.mutex);
+	g_rs.copied    = std::move(table);
+	g_rs.copy_flip = flip;
+	++g_rs.copies;
+	if (!g_rs.said_copy) {
+		g_rs.said_copy = true;
+		std::string line;
+		char        buf[160];
+		for (const auto& e: g_rs.copied) {
+			const double sx = std::sqrt(double(e.m[0]) * e.m[0] + double(e.m[1]) * e.m[1] + double(e.m[2]) * e.m[2]);
+			std::snprintf(buf, sizeof(buf), " layer %u (%.1f m wide, %u of its draws)", e.layer, sx > 0.0 ? 2.0 / sx : 0.0, e.count);
+			line += buf;
+		}
+		std::printf("RTSUN: cascades copied after CS %016llx: array 0x%llx %ux%u %s, %zu cascades:%s\n",
+		            static_cast<unsigned long long>(cs_hash), static_cast<unsigned long long>(address), extent.width, extent.height,
+		            SsrFormatName(fmt), g_rs.copied.size(), line.c_str());
 		std::fflush(stdout);
 	}
 }
@@ -5893,18 +8010,23 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 				if (device.createSampler(&sampler, nullptr, i == 0 ? &g_ssgi.point : &g_ssgi.linear) != vk::Result::eSuccess) return false;
 			}
 		}
-		std::array<vk::DescriptorSetLayoutBinding, 12> bindings {};
-		for (uint32_t i = 0; i < 12; ++i) {
+		// (KYTY_RT_SUN: rt-sun.comp, two more: 12 the cascades' copy, 13 their matrices' buffer)
+		// (KYTY_HWRT_SHADOW, while the device has ray queries: 14 the scene TLAS)
+		g_cs.hw = RtSunLevel() > 0 && HwShadowLevel() > 0 && HwScene::Active();
+		const uint32_t count = g_cs.hw ? 15u : RtSunLevel() > 0 ? 14u : 12u;
+		std::array<vk::DescriptorSetLayoutBinding, 15> bindings {};
+		for (uint32_t i = 0; i < count; ++i) {
 			bindings[i].binding         = i;
-			bindings[i].descriptorType  = i == 11 ? vk::DescriptorType::eStorageBuffer
-			                              : i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler
-			                                                : vk::DescriptorType::eStorageImage;
+			bindings[i].descriptorType  = i == 14 ? vk::DescriptorType::eAccelerationStructureKHR
+			                              : i == 11 || i == 13 ? vk::DescriptorType::eStorageBuffer
+			                              : i < 7 || i == 9 || i == 12 ? vk::DescriptorType::eCombinedImageSampler
+			                                                           : vk::DescriptorType::eStorageImage;
 			bindings[i].descriptorCount = 1;
 			bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
 		}
 		vk::DescriptorSetLayoutCreateInfo set_info {};
 		set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-		set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+		set_info.bindingCount = count;
 		set_info.pBindings    = bindings.data();
 		if (device.createDescriptorSetLayout(&set_info, nullptr, &g_cs.set_layout) != vk::Result::eSuccess) return false;
 		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(CShadowPush)};
@@ -5915,8 +8037,13 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		layout_info.pPushConstantRanges    = &push;
 		if (device.createPipelineLayout(&layout_info, nullptr, &g_cs.layout) != vk::Result::eSuccess) return false;
 		vk::ShaderModuleCreateInfo module_info {};
-		module_info.codeSize    = sizeof(CSHADOW_SPV);
-		module_info.pCode       = CSHADOW_SPV;
+		module_info.codeSize    = g_cs.hw ? sizeof(RTSUN_HW_SPV) : RtSunLevel() > 0 ? sizeof(RTSUN_SPV) : sizeof(CSHADOW_SPV);
+		module_info.pCode       = g_cs.hw ? RTSUN_HW_SPV : RtSunLevel() > 0 ? RTSUN_SPV : CSHADOW_SPV;
+		if (HwShadowLevel() > 0) {
+			std::printf("HWRTSHADOW: %s\n", g_cs.hw ? "the sun pass traces the scene TLAS (rt-sun.comp with HwSun)"
+			                                          : "the device has no ray queries (KYTY_HWRT inactive): KYTY_RT_SUN alone");
+			std::fflush(stdout);
+		}
 		vk::ShaderModule module = nullptr;
 		if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
 		vk::ComputePipelineCreateInfo pipeline_info {};
@@ -5931,7 +8058,7 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 			return false;
 		}
 		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-		create.size  = 4 * 16 * sizeof(uint32_t);
+		create.size  = (g_cs.hw ? 192 : 128) * sizeof(uint32_t); // (calibration slots, then statistics; KYTY_RT_SUN's from word 80; KYTY_HWRT_SHADOW's 128..135)
 		create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 		VmaAllocationCreateInfo allocate {};
 		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
@@ -5939,6 +8066,19 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		VmaAllocationInfo mapped {};
 		if (vmaCreateBuffer(graphics.allocator, &create, &allocate, &g_cs.vote, &g_cs.vote_mem, &mapped) != VK_SUCCESS) return false;
 		g_cs.vote_mapped = static_cast<const uint32_t*>(mapped.pMappedData);
+		if (RtSunLevel() > 0) {
+			// (KYTY_RT_SUN: the cascades' buffer, 4 frame slots written by the CPU)
+			VkBufferCreateInfo sun_create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+			sun_create.size  = 4 * kRtSunSlotBytes;
+			sun_create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+			VmaAllocationCreateInfo sun_allocate {};
+			sun_allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			sun_allocate.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+			VmaAllocationInfo sun_mapped {};
+			if (vmaCreateBuffer(graphics.allocator, &sun_create, &sun_allocate, &g_rs.buf, &g_rs.buf_mem, &sun_mapped) != VK_SUCCESS)
+				return false;
+			g_rs.buf_mapped = static_cast<uint8_t*>(sun_mapped.pMappedData);
+		}
 		vk::QueryPoolCreateInfo query {};
 		query.queryType  = vk::QueryType::eTimestamp;
 		query.queryCount = 16;
@@ -5952,7 +8092,9 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 	                  &g_cs.gbuf[1], &g_cs.moments[0], &g_cs.moments[1], &g_cs.var_a, &g_cs.var_b};
 	for (auto* img : all)
 		SsgiFreeImage(graphics, *img);
-	const vk::Extent2D trace = quality >= 2 ? render : vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
+	// (KYTY_HWRT_SHADOW 1, 2: a half-resolution trace whatever KYTY_RT_SUN's level; 3: full)
+	const bool         half  = quality < 2 || (g_cs.hw && HwShadowLevel() < 3);
+	const vk::Extent2D trace = !half ? render : vk::Extent2D {std::max(render.width / 2, 1u), std::max(render.height / 2, 1u)};
 	bool ok = SsgiMakeImage(graphics, g_cs.out, render);
 	for (auto* img : all)
 		if (img != &g_cs.out) ok = ok && SsgiMakeImage(graphics, *img, trace);
@@ -5969,6 +8111,233 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 	return true;
 }
 
+// (KYTY_RT_SUN) This frame's cascades into `slot` of the shader's buffer (rt-sun.comp SunBuf): each copied layer's light
+// matrix composed with the camera's view -> world (from the projection and the G-buffer draws' view-projection, as
+// CShadowView, with the translation), sorted finest first. False while there is no copy of the last 8 flips.
+bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& vp, uint32_t slot) {
+	if (g_rs.buf_mapped == nullptr || g_rs.view == nullptr) return false;
+	std::vector<RtSunEntry> table;
+	uint64_t                copy_flip = ~0ull;
+	{
+		std::lock_guard lock(g_rs.mutex);
+		table = g_rs.copied, copy_flip = g_rs.copy_flip;
+	}
+	const uint64_t flips = g_flips_taken.load(std::memory_order_relaxed);
+	if (table.empty() || copy_flip == ~0ull || flips > copy_flip + 8) return false;
+	std::array<float, 16> pc {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
+	std::array<double, 16> pinv {};
+	if (!Inverse4(pc, pinv)) return false;
+	double v[16] {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j)
+			for (int k = 0; k < 4; ++k) v[i * 4 + j] += pinv[i * 4 + k] * vp[k * 4 + j];
+	for (int i = 0; i < 3; ++i) {
+		const double n = std::sqrt(v[i * 4] * v[i * 4] + v[i * 4 + 1] * v[i * 4 + 1] + v[i * 4 + 2] * v[i * 4 + 2]);
+		if (!(n > 1e-9) || !std::isfinite(n)) return false;
+		for (int j = 0; j < 4; ++j) v[i * 4 + j] /= n;
+	}
+	// view -> world: the rotation's transpose, minus the rotated translation.
+	double vi[16] {};
+	for (int i = 0; i < 3; ++i) {
+		for (int j = 0; j < 3; ++j) vi[i * 4 + j] = v[j * 4 + i];
+		vi[i * 4 + 3] = -(v[0 * 4 + i] * v[3] + v[1 * 4 + i] * v[7] + v[2 * 4 + i] * v[11]);
+	}
+	vi[15] = 1.0;
+	struct Casc {
+		double   r[12];
+		float    texel, mz;
+		uint32_t k;
+	};
+	const float       size = static_cast<float>(std::max(g_rs.extent.width, 1u));
+	std::vector<Casc> cs;
+	for (uint32_t k = 0; k < table.size() && k < kRtSunSlots; ++k) {
+		const auto&  mm = table[k].m;
+		const double sx = std::sqrt(double(mm[0]) * mm[0] + double(mm[1]) * mm[1] + double(mm[2]) * mm[2]);
+		const double sz = std::sqrt(double(mm[8]) * mm[8] + double(mm[9]) * mm[9] + double(mm[10]) * mm[10]);
+		if (!(sx > 1e-9) || !(sz > 1e-9)) continue;
+		Casc c {};
+		for (int row = 0; row < 3; ++row)
+			for (int j = 0; j < 4; ++j) {
+				double d = 0.0;
+				for (int l = 0; l < 4; ++l) d += double(mm[row * 4 + l]) * vi[l * 4 + j];
+				c.r[row * 4 + j] = d;
+			}
+		c.texel = static_cast<float>(2.0 / (sx * size));
+		c.mz    = static_cast<float>(1.0 / sz);
+		c.k     = k;
+		cs.push_back(c);
+	}
+	if (cs.empty()) return false;
+	std::ranges::sort(cs, {}, &Casc::texel);
+	static const float angle   = RtSunEnv("KYTY_RT_SUN_ANGLE", 0.8f, 0.1f, 5.0f);     // the sun's apparent size (deg)
+	static const float reach   = RtSunEnv("KYTY_RT_SUN_REACH", 6.0f, 0.5f, 50.0f);    // occluder heights the penumbra search sees (m)
+	static const float pcf     = RtSunEnv("KYTY_RT_SUN_GAMEPCF", 1.0f, 0.0f, 3.0f);   // the game emulation's PCF radius (taps)
+	static const float band    = RtSunEnv("KYTY_RT_SUN_BAND", 0.08f, 0.0f, 0.3f);     // the cascade blend band (uv)
+	static const float lift    = RtSunEnv("KYTY_RT_SUN_LIFT", 0.75f, 0.0f, 1.0f);     // brightening allowed (share of the sun term)
+	static const float contact = RtSunEnv("KYTY_RT_SUN_CONTACT", RtSunLevel() >= 2 ? 0.75f : 0.0f, 0.0f, 1.0f);
+	static const float debug   = RtSunEnv("KYTY_RT_SUN_DEBUG", 0.0f, 0.0f, 4.0f);
+	static const float forced_hyp  = RtSunEnv("KYTY_RT_SUN_HYP", -1.0f, -1.0f, 7.0f);
+	static const float forced_bias = RtSunEnv("KYTY_RT_SUN_BIAS", -1.0f, -1.0f, 1.0f);
+	static const float forced_r    = RtSunEnv("KYTY_RT_SUN_R", -1.0f, -1.0f, 100.0f);
+	double r = 1.5; // (nothing measured yet: a moderate sun)
+	if (g_rs.log_r >= 0.0) r = std::exp2(g_rs.log_r) - 1.0;
+	else if (g_cs.log_k >= 0.0) r = std::max(std::exp2(g_cs.log_k) - 1.0, 0.0) / 0.75;
+	if (forced_r >= 0.0f) r = forced_r;
+	float* f = reinterpret_cast<float*>(g_rs.buf_mapped + slot * kRtSunSlotBytes);
+	std::memset(f, 0, kRtSunSlotBytes);
+	f[0] = static_cast<float>(cs.size());
+	f[1] = 2.0f * std::tan(0.5f * angle * 0.01745329f);
+	f[2] = static_cast<float>(r);
+	f[3] = 0.0f; // (strength x fade: RtSunSetFade)
+	f[4] = forced_hyp >= 0.0f ? std::floor(forced_hyp) : static_cast<float>(g_rs.hyp);
+	f[5] = forced_bias >= 0.0f ? forced_bias : static_cast<float>(g_rs.bias_m);
+	f[6] = std::floor(debug);
+	f[7] = size;
+	f[8] = std::floor(pcf), f[9] = contact, f[10] = band, f[11] = lift;
+	f[12] = reach;
+	for (size_t i = 0; i < cs.size(); ++i) {
+		float* c = f + 16 + i * 16;
+		for (int j = 0; j < 12; ++j) c[j] = static_cast<float>(cs[i].r[j]);
+		c[12] = static_cast<float>(cs[i].k), c[13] = cs[i].texel, c[14] = cs[i].mz, c[15] = 1.0f;
+	}
+	if (g_cs.hw) {
+		// (KYTY_HWRT_SHADOW: rt-sun.comp SunBuf after the 8 cascades, float 144) inv: clip -> the TLAS's world (the inverse of
+		// the same G-buffer view-projection the scene capture inverts); hw: the level (+8 far; 0: no TLAS), the far-hit
+		// margin below the cascades' visibility, the ray length, the contact range; cam; sunw; w0..w2 the cascades' view ->
+		// world (the self-test's other reconstruction).
+		static const float miss      = RtSunEnv("KYTY_HWRT_SHADOW_MISS", 0.25f, 0.0f, 1.0f);
+		static const float range     = RtSunEnv("KYTY_HWRT_SHADOW_RANGE", HwShadowLevel() >= 3 ? 500.0f : HwShadowLevel() >= 2 ? 300.0f : 150.0f, 5.0f, 2000.0f);
+		static const float contact_m = RtSunEnv("KYTY_HWRT_SHADOW_CONTACT", 1.0f, 0.05f, 20.0f);
+		static const bool  hw_far    = RtSunEnv("KYTY_HWRT_SHADOW_FAR", 0.0f, 0.0f, 1.0f) > 0.5f; // (rays beyond the cascades too)
+		std::array<double, 16> inv_vp {};
+		const bool             inv_ok = Inverse4(vp, inv_vp);
+		float*                 w      = f + 144;
+		for (int i = 0; i < 16; ++i) w[i] = static_cast<float>(inv_vp[i]);
+		w[16] = g_cs.hw_now && inv_ok ? static_cast<float>(HwShadowLevel() + (hw_far ? 8 : 0)) : 0.0f;
+		w[17] = miss, w[18] = range, w[19] = contact_m;
+		w[20] = static_cast<float>(vi[3]), w[21] = static_cast<float>(vi[7]), w[22] = static_cast<float>(vi[11]), w[23] = 1.0f;
+		w[24] = static_cast<float>(g_cs.latch_axis[0]), w[25] = static_cast<float>(g_cs.latch_axis[1]);
+		static const float strength_hw = RtSunEnv("KYTY_HWRT_SHADOW_STRENGTH", 0.6f, 0.0f, 1.0f);
+		w[26] = static_cast<float>(g_cs.latch_axis[2]), w[27] = strength_hw;
+		for (int i = 0; i < 12; ++i) w[28 + i] = static_cast<float>(vi[i]);
+		// The sun-direction check: the finest cascade's light depth axis (world) against the latched sun.
+		const auto& mm = table[cs.front().k].m;
+		const double nz = std::sqrt(double(mm[8]) * mm[8] + double(mm[9]) * mm[9] + double(mm[10]) * mm[10]);
+		if (nz > 1e-9)
+			g_cs.hw_sun_cos = std::abs((mm[8] * g_cs.latch_axis[0] + mm[9] * g_cs.latch_axis[1] + mm[10] * g_cs.latch_axis[2]) / nz);
+	}
+	(void)vmaFlushAllocation(g_graphics_ctx->allocator, g_rs.buf_mem, slot * kRtSunSlotBytes, kRtSunSlotBytes);
+	g_rs.cascades_used = static_cast<uint32_t>(cs.size());
+	g_rs.texel_min = cs.front().texel, g_rs.texel_max = cs.back().texel;
+	return true;
+}
+
+void RtSunSetFade(uint32_t slot, float fade) {
+	if (g_rs.buf_mapped == nullptr) return;
+	static const float strength = RtSunEnv("KYTY_RT_SUN_STRENGTH", 1.0f, 0.0f, 1.0f);
+	float* f = reinterpret_cast<float*>(g_rs.buf_mapped + slot * kRtSunSlotBytes);
+	f[3] = strength * std::clamp(fade, 0.0f, 1.0f);
+	(void)vmaFlushAllocation(g_graphics_ctx->allocator, g_rs.buf_mem, slot * kRtSunSlotBytes, 16);
+}
+
+// (KYTY_RT_SUN) The statistics frame's words read back (v = word 64): the composite's counts, the conventions' votes, the
+// bias histogram and R's probe (rt-sun.comp mode 7).
+void RtSunTakeCalib(const uint32_t* v, double pixels) {
+	g_rs.st_dark += v[0], g_rs.st_lift += v[1], g_rs.st_amount += v[2] / 256.0, g_rs.st_pixels += pixels;
+	++g_rs.st_frames;
+	const uint32_t* w = v + 16; // (word 80)
+	for (int h = 0; h < 8; ++h) g_rs.votes[h] = w[h];
+	int      best = 0;
+	uint32_t second = 0;
+	for (int h = 1; h < 8; ++h)
+		if (w[h] > w[best]) best = h;
+	for (int h = 0; h < 8; ++h)
+		if (h != best) second = std::max(second, w[h]);
+	static uint32_t logged = 0;
+	const bool      decided_now = w[best] >= 100 && w[best] >= second * 5 / 2;
+	static const char* conv[] {"z", "z/2+1/2", "1-z", "1/2-z/2"};
+	if (decided_now && best != g_rs.hyp) {
+		if (best == g_rs.cand) ++g_rs.cand_n;
+		else g_rs.cand = best, g_rs.cand_n = 1;
+		if (g_rs.cand_n >= 2) {
+			const int was = g_rs.hyp;
+			g_rs.hyp = best, g_rs.cand = -1, g_rs.cand_n = 0;
+			g_rs.hist.fill(0.0);
+			g_cs.history_valid = false;
+			std::printf("RTSUN: cascades' convention %s: light clip y %s, stored depth = %s (lit receivers on their own depth: %u of the "
+			            "samples, next best %u)\n",
+			            was >= 0 ? "changed" : "decided", (best & 1) != 0 ? "down (row 0 = +1)" : "up", conv[best >> 1], w[best], second);
+			std::fflush(stdout);
+		}
+	} else if (decided_now) {
+		g_rs.cand = -1, g_rs.cand_n = 0;
+	}
+	if (logged < 6 || (g_rs.hyp < 0 && logged < 40)) {
+		++logged;
+		std::printf("RTSUN: calibration votes (lit receivers on their own depth, per convention):");
+		for (int h = 0; h < 8; ++h) std::printf(" %d:%u", h, w[h]);
+		std::printf("%s\n", g_rs.hyp >= 0 ? "" : decided_now ? " (candidate)" : " (undecided: look at sunlit ground and walls)");
+		std::fflush(stdout);
+	}
+	if (g_rs.hyp >= 0) {
+		// The bias: the 95th percentile of the lit cluster (stored - receiver height below +0.15 m), over the frames.
+		double total = 0.0;
+		for (int b = 0; b < 32; ++b) {
+			g_rs.hist[b] = g_rs.hist[b] * 0.8 + w[8 + b];
+			if (b < 25) total += g_rs.hist[b];
+		}
+		if (total >= 200.0) {
+			double acc = 0.0;
+			int    b   = 0;
+			for (; b < 25; ++b)
+				if ((acc += g_rs.hist[b]) >= 0.95 * total) break;
+			const double value = std::clamp((b + 1) / 64.0 - 0.25, 0.005, 0.15);
+			g_rs.bias_m        = g_rs.bias_m * 0.7 + value * 0.3;
+		}
+		const uint32_t cl = w[40], cs = w[43];
+		g_rs.r_lit = cl, g_rs.r_shadow = cs;
+		if (cl >= 60 && cs >= 60) {
+			const double k  = std::exp2((static_cast<double>(w[41]) / cl - static_cast<double>(w[44]) / cs) / 32.0);
+			const double nl = static_cast<double>(w[42]) / 256.0 / cl;
+			const double r  = std::clamp((k - 1.0) / std::max(nl, 0.3), 0.0, 40.0);
+			const double lr = std::log2(1.0 + r);
+			g_rs.log_r      = g_rs.log_r < 0.0 ? lr : g_rs.log_r + (lr - g_rs.log_r) * 0.25;
+		}
+	}
+}
+
+// (KYTY_RT_SUN) The 10 s line.
+void RtSunLog(double gpu_ms, uint32_t samples) {
+	const double px = std::max(g_rs.st_pixels, 1.0);
+	std::printf("RTSUN: stats: %.1f %% of pixels darkened, %.1f %% brightened (> 3 %%), mean change %.3f; convention %d (votes",
+	            100.0 * g_rs.st_dark / px, 100.0 * g_rs.st_lift / px, g_rs.st_amount / px, g_rs.hyp);
+	for (int h = 0; h < 8; ++h) std::printf(" %u", g_rs.votes[h]);
+	std::printf("), bias %.3f m, sun/ambient R %.2f (%u lit / %u shadowed samples), %u cascades (texel %.3f..%.3f m), %llu copies; "
+	            "GPU %.3f ms (%u samples)\n",
+	            g_rs.bias_m, g_rs.log_r >= 0.0 ? std::exp2(g_rs.log_r) - 1.0 : -1.0, g_rs.r_lit, g_rs.r_shadow, g_rs.cascades_used,
+	            g_rs.texel_min, g_rs.texel_max, static_cast<unsigned long long>(g_rs.copies), gpu_ms, samples);
+	std::fflush(stdout);
+	g_rs.st_dark = g_rs.st_lift = g_rs.st_amount = g_rs.st_pixels = 0.0;
+	g_rs.st_frames = 0;
+	if (g_cs.hw) {
+		std::printf("HWRTSHADOW: 10 s: %u frames traced with this frame's TLAS, %u with an older one, %u without (level %d, trace %ux%u; "
+		            "the GPU above is the whole sun pass)\n",
+		            g_cs.hw_traced, g_cs.hw_stale, g_cs.hw_none, HwShadowLevel(), g_cs.trace.width, g_cs.trace.height);
+		const double px = std::max(g_cs.hw_px, 1.0);
+		std::printf("HWRTSHADOW: outliers: %.3f %% of traced pixels darkened by the rays > 0.25, %.3f %% > 0.6, mean of those %.2f; "
+		            "self-test (centre pixel): reconstructions %.3f m apart (max %.3f) at %.1f m, world-view N.L %+.3f, world light . "
+		            "sun %.4f, camera distance error %+.3f m; sun . finest cascade's depth axis %.4f\n",
+		            100.0 * g_cs.hw_out / px, 100.0 * g_cs.hw_big / px, g_cs.hw_out > 0.0 ? g_cs.hw_amount / g_cs.hw_out : 0.0,
+		            g_cs.hw_test[0], g_cs.hw_test_max, g_cs.hw_test[1], g_cs.hw_test[2], g_cs.hw_test[3], g_cs.hw_test[4], g_cs.hw_sun_cos);
+		std::fflush(stdout);
+		g_cs.hw_traced = g_cs.hw_stale = g_cs.hw_none = 0;
+		g_cs.hw_px = g_cs.hw_out = g_cs.hw_big = g_cs.hw_amount = 0.0;
+		g_cs.hw_test_max = 0.0f;
+	}
+}
+
 void CShadowReadTiming() {
 	if (g_cs.pool == nullptr || g_graphics_ctx == nullptr) return;
 	while (g_cs.read + 4 <= g_cs.written) {
@@ -5981,64 +8350,231 @@ void CShadowReadTiming() {
 		++g_cs.samples;
 		++g_cs.read;
 	}
-	const auto now = std::chrono::steady_clock::now();
-	if (now - g_cs.last_log >= std::chrono::seconds(5) && g_cs.samples > 0) {
-		std::printf("CSHADOW: GPU %.3f ms (mean of %u frames; light candidate %d, vote log-ratios %.2f %.2f %.2f %.2f)\n",
-		            g_cs.sum_ms / g_cs.samples, g_cs.samples, g_cs.chosen, g_cs.ema[0], g_cs.ema[1], g_cs.ema[2], g_cs.ema[3]);
-		std::fflush(stdout);
-		g_cs.sum_ms   = 0.0;
-		g_cs.samples  = 0;
-		g_cs.last_log = now;
-	}
 }
 
-// The vote read back (4 frames late) into the per-candidate EMAs; the choice made again with hysteresis.
-void CShadowTakeVote(uint32_t slot) {
+// The statistics read back (4 frames after the composite wrote them) and, every 10 s, the log line.
+void CShadowTakeStats() {
+	if (g_cs.stat_frame >= 0 && static_cast<int64_t>(g_cs.frame) >= g_cs.stat_frame + 4 && g_cs.vote_mapped != nullptr) {
+		g_cs.stat_frame = -1;
+		(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_cs.vote_mem, 0, VK_WHOLE_SIZE);
+		const uint32_t* v = g_cs.vote_mapped + 64;
+		g_cs.st_pixels += static_cast<double>(g_cs.render.width) * g_cs.render.height;
+		g_cs.st_n += v[0], g_cs.st_occ += v[1] / 256.0, g_cs.st_depth += v[2] / 2.0;
+		++g_cs.st_samples;
+		if (RtSunLevel() > 0) RtSunTakeCalib(v, static_cast<double>(g_cs.render.width) * g_cs.render.height);
+		if (g_cs.hw) {
+			g_cs.hw_px += static_cast<double>(g_cs.trace.width) * g_cs.trace.height;
+			g_cs.hw_out += v[64], g_cs.hw_big += v[65], g_cs.hw_amount += v[66] / 256.0;
+			for (int i = 0; i < 5; ++i) std::memcpy(&g_cs.hw_test[i], &v[67 + i], 4);
+			if (std::isfinite(g_cs.hw_test[0])) g_cs.hw_test_max = std::max(g_cs.hw_test_max, g_cs.hw_test[0]);
+		}
+		// The light probe: geometric means of the sun-facing and facing-away luminance (log2 * 32 + 40 * 32 codes).
+		if (v[4] >= 200 && v[6] >= 200) {
+			const double lk = std::clamp((static_cast<double>(v[5]) / v[4] - static_cast<double>(v[7]) / v[6]) / 32.0, 0.0, 6.0);
+			g_cs.log_k      = g_cs.log_k < 0.0 ? lk : g_cs.log_k + (lk - g_cs.log_k) * 0.2; // (~1.3 s at 60 fps)
+		}
+		// K 1.3 or less: overcast (the sun barely lights what faces it): 0.15; K 2.4 or more: full (sun-facing pixels in
+		// the game's own shadows pull K down in full sun too).
+		static const bool auto_sun = [] {
+			const char* value = std::getenv("KYTY_RT_SHADOWS_OVERCAST");
+			return !(value != nullptr && *value == '0');
+		}();
+		if (auto_sun && g_cs.log_k >= 0.0) {
+			const double k = std::exp2(g_cs.log_k), x = std::clamp((k - 1.15) / (2.0 - 1.15), 0.0, 1.0); // (10-24 r3: gentler)
+			g_cs.sun_factor = 0.5 + 0.5 * x * x * (3.0 - 2.0 * x);
+		}
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_cs.last_log < std::chrono::seconds(10)) return;
+	if (RtSunLevel() > 0 && (g_cs.st_samples > 0 || g_cs.samples > 0)) {
+		RtSunLog(g_cs.samples > 0 ? g_cs.sum_ms / g_cs.samples : 0.0, g_cs.samples);
+	} else if (g_cs.st_samples > 0 || g_cs.samples > 0) {
+		const double n = g_cs.st_n, px = std::max(g_cs.st_pixels, 1.0);
+		std::printf("RTSHADOW: stats: %.1f %% of pixels shadowed (occlusion > 0.1), mean occlusion %.3f (%.3f on those), their "
+		            "mean depth %.1f m; sun lit/ambient K %.2f -> overcast factor %.2f; GPU %.3f ms (%u samples, %u frames)\n",
+		            100.0 * n / px, g_cs.st_occ / px, n > 0.0 ? g_cs.st_occ / n : 0.0, n > 0.0 ? g_cs.st_depth / n : 0.0,
+		            g_cs.log_k >= 0.0 ? std::exp2(g_cs.log_k) : 0.0, g_cs.sun_factor,
+		            g_cs.samples > 0 ? g_cs.sum_ms / g_cs.samples : 0.0, g_cs.st_samples, g_cs.samples);
+		std::fflush(stdout);
+	}
+	g_cs.st_pixels = g_cs.st_n = g_cs.st_occ = g_cs.st_depth = 0.0;
+	g_cs.st_samples = 0;
+	g_cs.sum_ms     = 0.0;
+	g_cs.samples    = 0;
+	g_cs.last_log   = now;
+}
+
+using Rows3 = std::array<std::array<double, 3>, 3>;
+
+// The camera's world -> view rotation (rows: the view axes in world): View = P^-1 * view_proj (column vectors; P's
+// column form is the transpose of the row-vector view_to_clip). Rows normalized; false when degenerate.
+bool CShadowView(const std::array<float, 16>& m, const std::array<float, 16>& vp, Rows3& v) {
+	std::array<float, 16> pc {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
+	std::array<double, 16> pinv {};
+	if (!Inverse4(pc, pinv)) return false;
+	for (int i = 0; i < 3; ++i) {
+		double n = 0.0;
+		for (int j = 0; j < 3; ++j) {
+			double d = 0.0;
+			for (int k = 0; k < 4; ++k) d += pinv[i * 4 + k] * vp[k * 4 + j];
+			v[i][j] = d;
+			n += d * d;
+		}
+		n = std::sqrt(n);
+		if (!(n > 1e-9) || !std::isfinite(n)) return false;
+		for (int j = 0; j < 3; ++j) v[i][j] /= n;
+	}
+	// (A view-projection of another camera than the projection's (a shadow cascade, a reflection) leaves no rotation.)
+	for (int i = 0; i < 3; ++i) {
+		const auto& a = v[i];
+		const auto& b = v[(i + 1) % 3];
+		if (std::abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) > 0.05) return false;
+	}
+	return true;
+}
+
+std::array<double, 3> Norm3(const std::array<double, 3>& a) {
+	const double n = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+	return n > 1e-12 ? std::array<double, 3> {a[0] / n, a[1] / n, a[2] / n} : std::array<double, 3> {0.0, 0.0, 0.0};
+}
+double Dot3(const std::array<double, 3>& a, const std::array<double, 3>& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+std::array<double, 3> ToView(const Rows3& v, const std::array<double, 3>& w) {
+	return Norm3({Dot3(v[0], w), Dot3(v[1], w), Dot3(v[2], w)});
+}
+std::array<double, 3> ToWorld(const Rows3& v, const std::array<double, 3>& d) {
+	std::array<double, 3> w {};
+	for (int j = 0; j < 3; ++j) w[j] = v[0][j] * d[0] + v[1][j] * d[1] + v[2][j] * d[2];
+	return Norm3(w);
+}
+
+// The hypotheses the switches leave (KYTY_RT_SHADOWS_UP, KYTY_RT_SHADOWS_FLIPY) as a 12-bit mask.
+uint32_t CShadowAllowed() {
+	static const uint32_t mask = [] {
+		uint32_t    m  = 0xfffu;
+		const char* up = std::getenv("KYTY_RT_SHADOWS_UP");
+		if (up != nullptr && *up != '\0') {
+			std::string v   = up;
+			int         neg = 0;
+			if (v[0] == '-') neg = 1, v.erase(0, 1);
+			else if (v[0] == '+') v.erase(0, 1);
+			const int axis = v == "x" ? 0 : v == "z" ? 2 : 1;
+			m &= (1u << (axis * 2 + neg)) | (1u << (6 + axis * 2 + neg));
+		}
+		const char* flip = std::getenv("KYTY_RT_SHADOWS_FLIPY");
+		if (flip != nullptr && *flip == '1') m &= 0x03fu;
+		if (flip != nullptr && *flip == '0') m &= 0xfc0u;
+		return m;
+	}();
+	return mask;
+}
+
+bool CShadowUpForced() {
+	static const bool forced = [] {
+		const char* up = std::getenv("KYTY_RT_SHADOWS_UP");
+		return up != nullptr && *up != '\0';
+	}();
+	return forced;
+}
+
+// The camera's evidence on world up, every frame (view: the world -> view rows; m: view_to_clip, row vectors): a game
+// camera does not roll, so its right row stays perpendicular to world up while it turns; its screen-up row (view y
+// times the sign of m[5], which maps it to NDC y) leans toward up unless it looks > 70 degrees up or down.
+void CShadowCamera(const Rows3& view, const std::array<float, 16>& m) {
+	const double ys = m[5] < 0.0f ? -1.0 : 1.0;
+	g_cs.cam_frames += 1.0;
+	for (int k = 0; k < 3; ++k) {
+		const double r = std::abs(view[0][k]), u = view[1][k] * ys;
+		if (r < 0.1 && std::abs(u) > 0.35) g_cs.cam_ok[k] += 1.0, g_cs.cam_lean[k] += u;
+	}
+	if (g_cs.cam_frames > 4000.0) { // (a window: old views fade)
+		g_cs.cam_frames *= 0.5;
+		for (int k = 0; k < 3; ++k) g_cs.cam_ok[k] *= 0.5, g_cs.cam_lean[k] *= 0.5;
+	}
+	const double f = g_cs.cam_frames;
+	// The axis: plausible in >= 90 % of >= 120 frames, every other in <= 75 % (the camera turned enough to tell).
+	int axis = -1;
+	for (int k = 0; k < 3 && f >= 120.0; ++k) {
+		bool others = true;
+		for (int j = 0; j < 3; ++j)
+			if (j != k && g_cs.cam_ok[j] > 0.75 * f) others = false;
+		if (g_cs.cam_ok[k] >= 0.9 * f && others) axis = k;
+	}
+	if (axis >= 0 && axis != g_cs.cam_axis) {
+		static const char* names[] {"x", "y", "z"};
+		std::printf("RTSHADOW: camera: world up is the %s axis (its right row perpendicular to it in %.0f %% of %.0f frames; "
+		            "x %.0f %%, y %.0f %%, z %.0f %%)%s\n",
+		            names[axis], 100.0 * g_cs.cam_ok[axis] / f, f, 100.0 * g_cs.cam_ok[0] / f, 100.0 * g_cs.cam_ok[1] / f,
+		            100.0 * g_cs.cam_ok[2] / f, g_cs.cam_axis >= 0 ? " (changed)" : "");
+		std::fflush(stdout);
+		g_cs.cam_axis = axis;
+	}
+	// The hypotheses left: the decided axis (else every axis still plausible in >= 85 % of the frames), and for an
+	// axis whose lean is clear the sign that puts up at the top of the screen (row 0) in each convention.
+	uint32_t mask = 0;
+	for (int k = 0; k < 3; ++k) {
+		if (g_cs.cam_axis >= 0 ? k != g_cs.cam_axis : f >= 30.0 && g_cs.cam_ok[k] < 0.85 * f) continue;
+		uint32_t bits = (3u << (k * 2)) | (3u << (6 + k * 2));
+		const double lean = g_cs.cam_ok[k] > 0.0 ? g_cs.cam_lean[k] / g_cs.cam_ok[k] : 0.0;
+		if (g_cs.cam_ok[k] >= 30.0 && std::abs(lean) > 0.3) {
+			// Row 0 = NDC y +1 (hypotheses 0..5): up leans to NDC +y; mirrored (6..11): to NDC -y.
+			bits = lean > 0.0 ? (1u << (k * 2)) | (1u << (6 + k * 2 + 1)) : (1u << (k * 2 + 1)) | (1u << (6 + k * 2));
+		}
+		mask |= bits;
+	}
+	g_cs.cam_mask = mask != 0 ? mask : 0xfffu;
+}
+
+// The hypotheses left by the switches and the camera (the switch alone when KYTY_RT_SHADOWS_UP is set or they disagree).
+uint32_t CShadowLeft() {
+	const uint32_t env = CShadowAllowed();
+	if (CShadowUpForced()) return env;
+	const uint32_t both = env & g_cs.cam_mask;
+	return both != 0 ? both : env;
+}
+
+// The calibration read back (4 frames late) and the decision made (again).
+void CShadowTakeCalib(uint32_t slot) {
 	if (!g_cs.slot_voted[slot] || g_cs.vote_mapped == nullptr) return;
 	g_cs.slot_voted[slot] = false;
 	(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_cs.vote_mem, 0, VK_WHOLE_SIZE);
-	const uint32_t* v = g_cs.vote_mapped + slot * 16;
-	float score[4];
-	bool  any = false;
-	for (int k = 0; k < 4; ++k) {
-		const uint32_t lit_n = v[k * 4 + 1], away_n = v[k * 4 + 3];
-		if (lit_n < 200 || away_n < 200) {
-			score[k] = -1e9f;
-			continue;
-		}
-		const double lit = (static_cast<double>(v[k * 4]) + 1.0) / lit_n, away = (static_cast<double>(v[k * 4 + 2]) + 1.0) / away_n;
-		score[k] = static_cast<float>(std::log(lit / away));
-		any      = true;
+	const uint32_t* v   = g_cs.vote_mapped + slot * 16;
+	double          sum = 0.0;
+	for (int i = 0; i < 12; ++i) g_cs.calib[i] += v[i], sum += g_cs.calib[i];
+	if (sum > 4e6)
+		for (auto& c: g_cs.calib) c *= 0.5; // (a window: old views fade)
+	const uint32_t allowed = CShadowLeft();
+	int            best = -1, second = -1;
+	for (int i = 0; i < 12; ++i) {
+		if ((allowed & (1u << i)) == 0) continue;
+		if (best < 0 || g_cs.calib[i] > g_cs.calib[best]) second = best, best = i;
+		else if (second < 0 || g_cs.calib[i] > g_cs.calib[second]) second = i;
 	}
-	if (!any) return;
-	++g_cs.votes;
-	const float a = g_cs.votes == 1 ? 1.0f : 0.25f;
-	for (int k = 0; k < 4; ++k)
-		g_cs.ema[k] = score[k] < -1e8f ? g_cs.ema[k] * (1.0f - a) : g_cs.ema[k] + (score[k] - g_cs.ema[k]) * a;
-	int best = 0;
-	for (int k = 1; k < 4; ++k)
-		if (g_cs.ema[k] > g_cs.ema[best]) best = k;
-	const float other = std::max(g_cs.ema[best < 2 ? 2 : 0], g_cs.ema[best < 2 ? 3 : 1]); // the other interpretation's axis
-	const float keep  = std::log(1.12f), take = std::log(1.2f);
-	const int   was   = g_cs.chosen;
-	(void)keep;
-	// Hysteresis: the same leader, clear of the rest, for 6 votes running; then locked (no pause, no flip) until the
-	// latched sun changes by > 10 degrees.
-	const bool clear = g_cs.ema[best] >= take && g_cs.ema[best] - other > 0.15f;
-	if (clear && best == g_cs.lead) ++g_cs.lead_n;
-	else g_cs.lead = clear ? best : -1, g_cs.lead_n = clear ? 1u : 0u;
-	if (!g_cs.locked && g_cs.votes >= 4 && g_cs.lead >= 0 && g_cs.lead_n >= 6) {
-		g_cs.chosen = g_cs.lead;
-		g_cs.locked = true;
-		std::printf("CSHADOW: light locked (candidate %d) for this sun: no re-vote until it changes\n", g_cs.chosen);
-	}
-	if (was != g_cs.chosen) {
-		static const char* names[] {"world axis +", "world axis -", "view axis +", "view axis -"};
-		std::printf("CSHADOW: light %s (vote log-ratios %.3f %.3f %.3f %.3f after %u votes)\n",
-		            g_cs.chosen >= 0 ? names[g_cs.chosen] : "none: contact shadows paused (no sunlit agreement)", g_cs.ema[0],
-		            g_cs.ema[1], g_cs.ema[2], g_cs.ema[3], g_cs.votes);
-		std::fflush(stdout);
-	}
+	if (best < 0) return;
+	const double b = g_cs.calib[best], s = second >= 0 ? g_cs.calib[second] : 0.0;
+	int          pick = -1;
+	// A level camera cannot tell (up, row 0 = NDC +1) from its mirror twin (-up, mirrored): the GNM viewport's prior.
+	const auto twin = [](int i) { return (i < 6 ? 6 : 0) + ((i % 6) / 2) * 2 + (1 - (i & 1)); };
+	const int  gnm  = best < 6 ? best : twin(best);
+	if (std::popcount(allowed) == 1) pick = best;
+	else if (b >= 2000.0 && b >= 2.0 * s) pick = best;
+	else if (b >= 2000.0 && second == twin(best) && (allowed & (1u << gnm)) != 0) pick = gnm;
+	// The camera left only a twin pair: the prior unless the mirrored one has twice the floors.
+	else if (g_cs.cam_axis >= 0 && std::popcount(allowed) == 2 && (allowed & (1u << twin(best))) != 0 && (allowed & (1u << gnm)) != 0)
+		pick = gnm;
+	if (pick < 0 || pick == g_cs.hyp) return;
+	// A decided hypothesis changes only on clear evidence (3x).
+	if (g_cs.hyp >= 0 && g_cs.calib[pick] < 3.0 * g_cs.calib[g_cs.hyp]) return;
+	const int was = g_cs.hyp;
+	g_cs.hyp      = pick;
+	static const char* axes[] {"+x", "-x", "+y", "-y", "+z", "-z"};
+	std::printf("RTSHADOW: calibration: world up %s, render row 0 = NDC y %s (floors %.0f vs next %.0f; camera %s)%s\n", axes[pick % 6],
+	            pick < 6 ? "+1 (GNM viewport)" : "-1 (mirrored)", g_cs.calib[pick], s,
+	            CShadowUpForced() ? "not asked (KYTY_RT_SHADOWS_UP)" : g_cs.cam_axis >= 0 ? "agrees" : "undecided, axis among those left",
+	            was >= 0 ? " (changed)" : "");
+	std::fflush(stdout);
+	g_cs.history_valid = false;
 }
 
 bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
@@ -6047,7 +8583,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		static std::string said;
 		if (said != why) {
 			said = why;
-			std::printf("CSHADOW: off for now (%s)\n", why);
+			std::printf("RTSHADOW: off for now (%s)\n", why);
 			std::fflush(stdout);
 		}
 	};
@@ -6060,109 +8596,129 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const auto& m = inputs.view_to_clip;
 	if (!(m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f)))
 		return said_once("no camera projection (view_to_clip)"), false;
-	// The sun latch: the last good axis is kept (slowly smoothed) across frames that lack it; dropped only after a long
-	// absence (KYTY_CONTACT_SHADOWS_HOLD seconds, default 20) or a scene change (a jump > 10 degrees), and then faded
-	// out / in over 0.5 s instead of popping.
+	std::array<float, 16> vp {};
+	{
+		std::lock_guard vp_lock(g_last_vp_mutex);
+		if (!g_have_last_vp) return said_once("no camera matrix captured yet"), false;
+		vp = g_last_vp;
+	}
+	Rows3 view {};
+	if (!CShadowView(m, vp, view)) return said_once("the camera matrix is degenerate"), false;
+	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality)) return said_once("could not create its pipeline or images"), false;
+	// (KYTY_RT_SUN: the cascades copied lately, their matrices into this frame's slot of the buffer; else nothing yet)
+	const bool sun_mode = RtSunLevel() > 0;
+	const uint32_t sun_slot = g_cs.frame % 4;
+	// (KYTY_HWRT_SHADOW: the TLAS built this frame, before this pass on the same command stream; an older frame's while
+	// this one built none; no rays until one was ever built)
+	vk::AccelerationStructureKHR hw_tlas = nullptr;
+	if (g_cs.hw) {
+		bool built = false;
+		hw_tlas    = HwScene::SceneTlas(&built);
+		g_cs.hw_seen = g_cs.hw_seen || (hw_tlas != nullptr && built);
+		if (hw_tlas == nullptr || !g_cs.hw_seen) {
+			// (the pipeline's layout has the binding: no TLAS yet, no pass)
+			++g_cs.hw_none;
+			return said_once("KYTY_HWRT_SHADOW: no scene TLAS built yet"), false;
+		}
+		g_cs.hw_now = true;
+		++(built ? g_cs.hw_traced : g_cs.hw_stale);
+	}
+	if (sun_mode && !RtSunPrepare(m, vp, sun_slot)) {
+		// (10-25 godfix: the cascades are copied only on some frames; the latched sun still feeds the god rays and shine in
+		// the meantime, in this frame's view, else they lost the sun 250 ms later and popped off and on.)
+		if (g_cs.latched && g_cs.hyp >= 0 && g_cs.fade > 0.0f) {
+			const auto l_view = ToView(view, g_cs.latch_axis);
+			ShineSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor));
+			GodraysSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor));
+		}
+		return said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
+	}
+	CShadowCamera(view, m);
+	if (g_cs.hyp >= 0 && (CShadowLeft() & (1u << g_cs.hyp)) == 0) {
+		static const char* names[] {"+x", "-x", "+y", "-y", "+z", "-z"};
+		std::printf("RTSHADOW: calibration: world up %s (row 0 = NDC y %s) does not fit the camera: calibrating again\n",
+		            names[g_cs.hyp % 6], g_cs.hyp < 6 ? "+1" : "-1");
+		std::fflush(stdout);
+		g_cs.hyp = -1, g_cs.history_valid = false;
+	}
+
 	const auto now = std::chrono::steady_clock::now();
 	const float dt = g_cs.latch_time.time_since_epoch().count() == 0
 	                     ? 0.0f
 	                     : std::clamp(std::chrono::duration<float>(now - g_cs.latch_time).count(), 0.0f, 0.25f);
-	g_cs.latch_time = now;
-	const float hold = std::max(SsgiEnv("KYTY_CONTACT_SHADOWS_HOLD", 20.0f, 600.0f), 1.0f);
-	std::array<float, 3>  axis {};
-	std::array<float, 16> vp {};
-	bool                  fresh = false, have_camera = false;
+	g_cs.latch_time  = now;
+	const float hold = std::max(RtShadowEnv("KYTY_RT_SHADOWS_HOLD", "KYTY_CONTACT_SHADOWS_HOLD", 20.0f, 600.0f), 1.0f);
+
+	// The sun probe's axis (fresh: seen in the last 2 s of flips, by agreeing cascades or 3 flips running).
+	std::array<double, 3> raw {};
+	bool                  fresh = false, recent = false;
+	int                   source = 0;
+	const uint64_t        flips  = g_flips_taken.load(std::memory_order_relaxed);
 	{
 		std::lock_guard lock(g_sun.mutex);
-		fresh       = g_sun.valid && (g_sun.agree >= 2 || g_sun.stable >= 3) &&
-		              g_flips_taken.load(std::memory_order_relaxed) <= g_sun.flip + 120;
-		axis        = g_sun.axis;
-		vp          = g_sun.view_proj;
-		have_camera = g_sun.have_camera;
+		fresh  = g_sun.valid && (g_sun.agree >= 2 || g_sun.stable >= 3) && flips <= g_sun.flip + 120;
+		recent = fresh && flips <= g_sun.flip + 2;
+		raw    = {g_sun.axis[0], g_sun.axis[1], g_sun.axis[2]};
+		source = g_sun.source;
 	}
-	{
-		// The camera now (the axis's camera is stale once latched).
-		std::lock_guard vp_lock(g_last_vp_mutex);
-		if (g_have_last_vp) vp = g_last_vp, have_camera = true;
-	}
-	if (fresh) {
-		if (!g_cs.latched) {
-			g_cs.latched = true, g_cs.latch_axis = axis, g_cs.switching = false;
-			std::printf("CSHADOW: sun latched, axis (%.4f %.4f %.4f)\n", axis[0], axis[1], axis[2]);
-			std::fflush(stdout);
-		} else {
-			const auto& l = g_cs.latch_axis;
-			const float c = axis[0] * l[0] + axis[1] * l[1] + axis[2] * l[2];
-			const float s = c < 0.0f ? -1.0f : 1.0f;
-			if (std::abs(c) >= 0.9848f) { // (within 10 degrees: the same sun, smoothed over ~1 s)
-				const float a = 1.0f - std::exp(-dt / 1.0f);
-				std::array<float, 3> n {l[0] + (s * axis[0] - l[0]) * a, l[1] + (s * axis[1] - l[1]) * a, l[2] + (s * axis[2] - l[2]) * a};
-				const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-				if (len > 1e-6f) g_cs.latch_axis = {n[0] / len, n[1] / len, n[2] / len};
-				g_cs.switching = false;
-			} else if (!g_cs.switching) {
-				g_cs.switching = true; // (a scene change: fade out, then take the new axis)
-				std::printf("CSHADOW: sun changed (axis (%.4f %.4f %.4f), was (%.4f %.4f %.4f)): fading out, then re-latching\n", axis[0],
-				            axis[1], axis[2], l[0], l[1], l[2]);
+	raw = Norm3(raw);
+
+	// The space: which reading of the axis stays put while the camera turns.
+	static const int forced_space = [] {
+		const char* value = std::getenv("KYTY_RT_SHADOWS_SPACE");
+		const std::string v = value != nullptr ? value : "";
+		return v == "world" ? 1 : v == "view" ? 2 : 0;
+	}();
+	if (recent && forced_space == 0 && g_cs.space_flip != flips) {
+		g_cs.space_flip = flips;
+		const std::array<double, 3> fwd = view[2];
+		const std::array<double, 3> vw  = ToWorld(view, raw);
+		if (!g_cs.space_ref) {
+			g_cs.space_ref = true, g_cs.ref_axis = raw, g_cs.ref_vw = vw, g_cs.ref_fwd = fwd;
+		} else if (Dot3(fwd, g_cs.ref_fwd) < 0.9659) { // (15 degrees)
+			const double dr = std::abs(Dot3(raw, g_cs.ref_axis)), dv = std::abs(Dot3(vw, g_cs.ref_vw));
+			if (dr > 0.9986 && dv < 0.9903) ++g_cs.world_votes; // (3 / 8 degrees)
+			else if (dv > 0.9986 && dr < 0.9903) ++g_cs.view_votes;
+			g_cs.ref_axis = raw, g_cs.ref_vw = vw, g_cs.ref_fwd = fwd;
+			const int was = g_cs.space, was_used = was != 0 ? was : source == 2 ? 1 : 0;
+			if (g_cs.world_votes >= g_cs.view_votes + 2) g_cs.space = 1;
+			else if (g_cs.view_votes >= g_cs.world_votes + 2) g_cs.space = 2;
+			if (was != g_cs.space) {
+				std::printf("RTSHADOW: the sun axis is in %s space (camera turns: %d world, %d view)\n", g_cs.space == 1 ? "world" : "view",
+				            g_cs.world_votes, g_cs.view_votes);
 				std::fflush(stdout);
+				if (was_used != 0 && was_used != g_cs.space) g_cs.latched = false, g_cs.fade = 0.0f; // (the other reading was in use)
 			}
-			g_cs.switch_axis = axis;
-		}
-		g_cs.last_fresh = now;
-	}
-	if (g_cs.latched && g_cs.switching && g_cs.fade <= 0.0f) {
-		g_cs.latch_axis = g_cs.switch_axis, g_cs.switching = false;
-		g_cs.votes = 0, g_cs.chosen = -1, g_cs.last_chosen = -1, g_cs.lead = -1, g_cs.lead_n = 0, g_cs.locked = false;
-		for (auto& e: g_cs.ema) e = 0.0f;
-		g_cs.history_valid = false;
-	}
-	const bool absent = g_cs.latched && now - g_cs.last_fresh > std::chrono::duration<float>(hold);
-	if (absent && g_cs.fade <= 0.0f) {
-		g_cs.latched = false;
-		std::printf("CSHADOW: sun unseen for %g s: dropped (faded out)\n", hold);
-		std::fflush(stdout);
-	}
-	if (!g_cs.latched) return g_cs.history_valid = false, g_cs.fade = 0.0f, said_once("no sun direction yet: the pass is skipped"), false;
-	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality)) return said_once("could not create its pipeline or images"), false;
-	axis = g_cs.latch_axis;
-
-	// The light candidates in view space.
-	float cand[4][4] {};
-	cand[2][0] = axis[0], cand[2][1] = axis[1], cand[2][2] = axis[2], cand[2][3] = 1.0f;
-	cand[3][0] = -axis[0], cand[3][1] = -axis[1], cand[3][2] = -axis[2], cand[3][3] = 1.0f;
-	if (have_camera) {
-		// View = P^-1 * view_proj (column vectors): P's column form is the transpose of the row-vector view_to_clip.
-		std::array<float, 16> pc {};
-		for (int i = 0; i < 4; ++i)
-			for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
-		std::array<double, 16> pinv {};
-		if (Inverse4(pc, pinv)) {
-			double d[3] {};
-			for (int i = 0; i < 3; ++i)
-				for (int j = 0; j < 3; ++j) {
-					double vij = 0.0;
-					for (int k = 0; k < 4; ++k) vij += pinv[i * 4 + k] * vp[k * 4 + j];
-					d[i] += vij * axis[j];
-				}
-			const double n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-			if (n > 1e-9 && std::isfinite(n))
-				for (int i = 0; i < 3; ++i) cand[0][i] = static_cast<float>(d[i] / n), cand[1][i] = -cand[0][i];
-			cand[0][3] = cand[1][3] = n > 1e-9 && std::isfinite(n) ? 1.0f : 0.0f;
 		}
 	}
+	const int space = forced_space != 0 ? forced_space : g_cs.space != 0 ? g_cs.space : source == 2 ? 1 : 0;
 
-	const float strength = SsgiEnv("KYTY_CONTACT_SHADOWS_STRENGTH", 0.7f, 1.0f) * (quality >= 3 ? 0.9f : 1.0f);
-	const float length   = std::max(SsgiEnv("KYTY_CONTACT_SHADOWS_LENGTH", 1.0f, 4.0f), 0.25f);
+	// The calibration (world up, the screen's y convention): every frame until decided, then every 16th.
+	const uint32_t slot = g_cs.frame % 4;
+	CShadowTakeCalib(slot);
+	const bool calibrate = g_cs.hyp < 0 || g_cs.frame % 16 == 0;
+
 	CShadowPush push {};
 	push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
 	push.depth_map[0] = m[10], push.depth_map[1] = m[14], push.depth_map[2] = m[11], push.depth_map[3] = m[15];
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
 	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
 	push.trace[0] = static_cast<float>(g_cs.trace.width), push.trace[1] = static_cast<float>(g_cs.trace.height);
+	const float strength = RtShadowEnv("KYTY_RT_SHADOWS_STRENGTH", "KYTY_CONTACT_SHADOWS_STRENGTH", 0.5f, 1.0f) /* (10-24 r3: 0.6 looked thin) */;
+	const float length   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_LENGTH", "KYTY_CONTACT_SHADOWS_LENGTH", 1.5f, 10.0f), 0.25f); // (rtsart: 1.5 m: contact shadows; long rays only doubled the game's) // (10-24) 3 m (1 m was too short)
+	const float fade_m   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_FADE", nullptr, 100.0f, 600.0f), 2.0f); // (10-24) 100-200 m by default; far (dist-1023): up to 600
 	push.trace[2] = strength, push.trace[3] = length;
-	std::memcpy(push.cand, cand, sizeof(cand));
+	for (int k = 0; k < 3; ++k) {
+		const auto c = ToView(view, {k == 0 ? 1.0 : 0.0, k == 1 ? 1.0 : 0.0, k == 2 ? 1.0 : 0.0});
+		push.cand[k][0] = static_cast<float>(c[0]), push.cand[k][1] = static_cast<float>(c[1]), push.cand[k][2] = static_cast<float>(c[2]);
+		push.cand[k][3] = 1.0f;
+	}
+	push.cand[3][0] = quality >= 3 ? 400.0f : quality >= 2 ? 280.0f : 160.0f; // (screen cap, px at 1440p; 10-24: longer)
+	push.cand[3][1] = 1.0f;
+	push.cand[3][2] = fade_m, push.cand[3][3] = fade_m * 2.0f;
 
 	CShadowReadTiming();
+	CShadowTakeStats();
 	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
 	                        vk::AccessFlags2 dst) {
 		vk::MemoryBarrier2 barrier {};
@@ -6207,13 +8763,26 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		infos[9]  = {lin, aux_in->view, vk::ImageLayout::eGeneral};
 		infos[10] = {nullptr, aux_out->view, vk::ImageLayout::eGeneral};
 		vk::DescriptorBufferInfo vote_info {vk::Buffer(g_cs.vote), 0, VK_WHOLE_SIZE};
-		vk::WriteDescriptorSet   writes[12] {};
-		for (uint32_t i = 0; i < 12; ++i) {
+		// (KYTY_RT_SUN: 12 the cascades' copy, 13 this frame's slot of their buffer)
+		const vk::DescriptorImageInfo  casc_info {pt, g_rs.view, vk::ImageLayout::eShaderReadOnlyOptimal};
+		const vk::DescriptorBufferInfo sun_info {vk::Buffer(g_rs.buf), vk::DeviceSize {sun_slot} * kRtSunSlotBytes, kRtSunSlotBytes};
+		const uint32_t                 count = g_cs.hw ? 15u : sun_mode ? 14u : 12u;
+		vk::WriteDescriptorSet         writes[15] {};
+		vk::WriteDescriptorSetAccelerationStructureKHR as_write {};
+		as_write.accelerationStructureCount = 1;
+		as_write.pAccelerationStructures    = &hw_tlas;
+		for (uint32_t i = 0; i < count; ++i) {
 			writes[i].dstBinding      = i;
 			writes[i].descriptorCount = 1;
-			if (i == 11) {
+			if (i == 14) {
+				writes[i].descriptorType = vk::DescriptorType::eAccelerationStructureKHR;
+				writes[i].pNext          = &as_write;
+			} else if (i == 11 || i == 13) {
 				writes[i].descriptorType = vk::DescriptorType::eStorageBuffer;
-				writes[i].pBufferInfo    = &vote_info;
+				writes[i].pBufferInfo    = i == 11 ? &vote_info : &sun_info;
+			} else if (i == 12) {
+				writes[i].descriptorType = vk::DescriptorType::eCombinedImageSampler;
+				writes[i].pImageInfo     = &casc_info;
 			} else {
 				writes[i].descriptorType = i < 7 || i == 9 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
 				writes[i].pImageInfo     = &infos[i];
@@ -6221,17 +8790,13 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 		push.misc[0]  = mode;
 		push.extra[0] = step;
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_cs.layout, 0, 12, writes);
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_cs.layout, 0, count, writes);
 		command.pushConstants(g_cs.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 		       vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	};
-
-	// The vote: every frame until a light is chosen, then every 16th (the scene, an interior, may change).
-	const uint32_t slot = g_cs.frame % 4;
-	CShadowTakeVote(slot);
-	if (!g_cs.locked) {
+	if (calibrate) {
 		command.fillBuffer(vk::Buffer(g_cs.vote), slot * 64, 64, 0);
 		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
 		       vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
@@ -6241,43 +8806,84 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		       vk::AccessFlagBits2::eHostRead);
 		g_cs.slot_voted[slot] = true;
 	}
-	// The fade: toward 1 while a sun is latched, agreed by the vote and not switching / absent; 0.5 s each way.
-	if (g_cs.chosen >= 0) g_cs.last_chosen = g_cs.chosen;
-	const int  use    = g_cs.chosen >= 0 ? g_cs.chosen : g_cs.last_chosen;
-	const bool target = g_cs.chosen >= 0 && !g_cs.switching && !absent;
-	g_cs.fade         = std::clamp(g_cs.fade + (target ? dt : -dt) / 0.5f, 0.0f, 1.0f);
-	if (use < 0 || g_cs.fade <= 0.0f) {
-		++g_cs.frame;
+	// The statistics on every 16th frame (one in flight).
+	const bool stats = g_cs.stat_frame < 0 && g_cs.frame % 16 == 8;
+	if (stats) {
+		command.fillBuffer(vk::Buffer(g_cs.vote), 64 * 4, (g_cs.hw ? 128 : sun_mode ? 64 : 8) * 4, 0); // (statistics 64..66, light probe 68..71; KYTY_RT_SUN 80..124)
+		global(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+		       vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
+	}
+	const int64_t this_frame = g_cs.frame;
+	++g_cs.frame;
+
+	// World up (the calibration's, +y until then) and the world-space sun toward the light, latched.
+	const int hyp = g_cs.hyp;
+	std::array<double, 3> up {};
+	up[hyp >= 0 ? (hyp % 6) / 2 : 1] = hyp >= 0 && (hyp & 1) != 0 ? -1.0 : 1.0;
+	if (fresh && space != 0 && hyp >= 0) { // (10-24: once up is known: its sign and the logged elevation are up's)
+		std::array<double, 3> sun = space == 1 ? raw : ToWorld(view, raw);
+		const double          h   = Dot3(sun, up);
+		if (h < 0.0) sun = {-sun[0], -sun[1], -sun[2]};
+		// (A sun on the horizon has no reliable sign: kept from the latch when there is one.)
+		if (std::abs(h) < 0.03 && g_cs.latched && Dot3(sun, g_cs.latch_axis) < 0.0) sun = {-sun[0], -sun[1], -sun[2]};
+		if (!g_cs.latched) {
+			g_cs.latched = true, g_cs.latch_axis = sun, g_cs.switching = false;
+			std::printf("RTSHADOW: sun latched, world direction to the light (%.4f %.4f %.4f), elevation %.1f deg\n", sun[0], sun[1],
+			            sun[2], std::asin(std::clamp(std::abs(h), 0.0, 1.0)) * 57.29578);
+			std::fflush(stdout);
+		} else {
+			const double c = Dot3(sun, g_cs.latch_axis);
+			if (c >= 0.9848) { // (within 10 degrees: the same sun, smoothed over ~1 s)
+				const double a = 1.0 - std::exp(-dt / 1.0);
+				const auto&  l = g_cs.latch_axis;
+				g_cs.latch_axis = Norm3({l[0] + (sun[0] - l[0]) * a, l[1] + (sun[1] - l[1]) * a, l[2] + (sun[2] - l[2]) * a});
+				g_cs.switching  = false;
+			} else if (!g_cs.switching) {
+				g_cs.switching = true; // (a scene change: fade out, then take the new sun)
+				std::printf("RTSHADOW: sun changed to (%.4f %.4f %.4f) from (%.4f %.4f %.4f): fading over\n", sun[0], sun[1], sun[2],
+				            g_cs.latch_axis[0], g_cs.latch_axis[1], g_cs.latch_axis[2]);
+				std::fflush(stdout);
+			}
+			g_cs.switch_axis = sun;
+		}
+		g_cs.last_fresh = now;
+	}
+	if (g_cs.latched && g_cs.switching && g_cs.fade <= 0.0f) g_cs.latch_axis = g_cs.switch_axis, g_cs.switching = false;
+	const bool absent = g_cs.latched && now - g_cs.last_fresh > std::chrono::duration<float>(hold);
+	if (absent && g_cs.fade <= 0.0f) {
+		g_cs.latched = false;
+		std::printf("RTSHADOW: sun unseen for %g s: dropped\n", hold);
+		std::fflush(stdout);
+	}
+	// The fade: in over 1 s once everything is known, out over 0.3 s on a change or an absence.
+	const bool target = g_cs.latched && !g_cs.switching && !absent && hyp >= 0 && space != 0;
+	g_cs.fade         = std::clamp(g_cs.fade + (target ? dt / 1.0f : -dt / 0.3f), 0.0f, 1.0f);
+	if (!g_cs.latched || g_cs.fade <= 0.0f) {
 		g_cs.history_valid = false;
-		return said_once(use < 0 ? "sun axis found, waiting for the lighting vote to agree on its space and sign"
-		                         : "faded out (sun absent, changed or not agreed by the vote)"),
+		return said_once(hyp < 0 ? "calibrating world up (turn the camera; look at some floor)"
+		                 : !g_cs.latched ? (space == 0 && fresh ? "sun axis found; turn the camera to tell its space (world / view)"
+		                                                        : "no sun direction yet")
+		                                 : "faded out (sun changed or absent)"),
 		       false;
 	}
-	if (cand[use][3] >= 0.5f) g_cs.last_dir = {cand[use][0], cand[use][1], cand[use][2]}, g_cs.have_dir = true;
-	if (!g_cs.have_dir) {
-		++g_cs.frame;
-		return said_once("the chosen world-space light has no camera yet"), false;
-	}
-	push.extra[1] = g_cs.last_dir[0], push.extra[2] = g_cs.last_dir[1], push.extra[3] = g_cs.last_dir[2];
-	push.trace[2] = strength * g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade); // (smoothstep fade)
-	{
-		static float said_fade = -1.0f;
-		const float  f         = g_cs.fade >= 1.0f ? 1.0f : g_cs.fade <= 0.0f ? 0.0f : 0.5f;
-		if (f != said_fade && f != 0.5f) {
-			said_fade = f;
-			std::printf("CSHADOW: fade %s (light %d, sun %s)\n", f >= 1.0f ? "in complete" : "out complete", use,
-			            fresh ? "seen this frame" : "latched");
-			std::fflush(stdout);
-		}
-	}
-	{
-		static bool said = false;
-		if (!said) {
-			said = true;
-			std::printf("CSHADOW: on (level %d, trace %ux%u, strength %g, length %g, light view dir %.3f %.3f %.3f)\n", quality,
-			            g_cs.trace.width, g_cs.trace.height, strength, length, push.extra[1], push.extra[2], push.extra[3]);
-			std::fflush(stdout);
-		}
+	const auto l_view = ToView(view, g_cs.latch_axis);
+	ShineSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor)); // (KYTY_SHINE: shine.cpp)
+	GodraysSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor)); // (KYTY_GODRAYS: godrays.cpp)
+	push.extra[1] = static_cast<float>(l_view[0]), push.extra[2] = static_cast<float>(l_view[1]), push.extra[3] = static_cast<float>(l_view[2]);
+	push.trace[2] = strength * g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade) * static_cast<float>(g_cs.sun_factor); // (smoothstep fade; overcast)
+	push.tune[0]  = g_cs.log_k >= 0.0 ? static_cast<float>(1.0 / std::max(std::exp2(g_cs.log_k), 1.25)) : 0.0f;
+	if (sun_mode) RtSunSetFade(sun_slot, g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade));
+	if (!g_cs.said_on) {
+		g_cs.said_on = true;
+		static const char* axes[] {"+x", "-x", "+y", "-y", "+z", "-z"};
+		std::printf("RTSHADOW: on (level %d, trace %ux%u of %ux%u, strength %g, length %g m, fade %g-%g m; light from %s, %s space; "
+		            "world dir to the sun (%.4f %.4f %.4f), up %s, row 0 = NDC y %s; the light in view space now (%.3f %.3f %.3f), elevation %.1f deg)\n",
+		            quality, g_cs.trace.width, g_cs.trace.height, color.extent.width, color.extent.height, strength, length, fade_m,
+		            fade_m * 2.0f, source == 1 ? "the sun-shadow consumer's cascades" : "the shadow-map draws",
+		            space == 1 ? "world" : "view", g_cs.latch_axis[0], g_cs.latch_axis[1], g_cs.latch_axis[2], axes[hyp % 6],
+		            hyp < 6 ? "+1" : "-1", l_view[0], l_view[1], l_view[2],
+		            std::asin(std::clamp(std::abs(Dot3(g_cs.latch_axis, up)), 0.0, 1.0)) * 57.29578);
+		std::fflush(stdout);
 	}
 	const auto entry = static_cast<uint32_t>(g_cs.written % 8);
 	const bool timed = g_cs.pool != nullptr;
@@ -6285,29 +8891,44 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		command.resetQueryPool(g_cs.pool, entry * 2, 2);
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_cs.pool, entry * 2);
 	}
-	push.misc[3] = (inputs.reset ? 1 : 0) | (g_cs.history_valid ? 2 : 0);
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g_cs.history_valid ? 2 : 0) | (hyp < 6 ? 4 : 0); // (slot 0: statistics at word 64)
+	// trace -> raw (+ gbuf[cur]); temporal (raw, history[prev]) -> tmp_a, count -> moments[cur]; a-trous 1 -> history[cur]
+	// (next frame's history); a-trous 2 -> tmp_b; (a-trous 4 -> tmp_a); composite -> out.
+	if (stats && g_cs.hw) push.misc[3] |= 16; // (KYTY_HWRT_SHADOW: the trace counts its darkening outliers)
 	run(0, g_cs.tmp_a, g_cs.tmp_b, g_cs.raw, g_cs.gbuf[cur], 0.0f, g_cs.trace);
+	push.misc[3] &= ~16;
 	run(1, g_cs.raw, g_cs.history[prev], g_cs.tmp_a, g_cs.tmp_b, 0.0f, g_cs.trace);
 	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_a;
 	run(2, g_cs.tmp_a, g_cs.raw, g_cs.history[cur], g_cs.tmp_b, 1.0f, g_cs.trace);
-	aux_in = &g_cs.var_a, aux_out = &g_cs.var_b;
 	run(2, g_cs.history[cur], g_cs.raw, g_cs.tmp_b, g_cs.raw, 2.0f, g_cs.trace);
 	const SsgiImage* final_vis = &g_cs.tmp_b;
-	if (quality >= 2) {
-		aux_in = &g_cs.var_b, aux_out = &g_cs.var_a;
+	if (quality >= 2 && !sun_mode) { // (KYTY_RT_SUN: steps 1, 2 only: wider a-trous would soften the contact-hardened edges)
 		run(2, g_cs.tmp_b, g_cs.raw, g_cs.tmp_a, g_cs.raw, 4.0f, g_cs.trace);
 		final_vis = &g_cs.tmp_a;
 	}
-	// (Level 3: no a-trous 8 any more: its wide grey halos read as haze; Ultra's extra is the longer, refined trace.)
-	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_b; // (the composite's stability mask: the history count in .z)
+	if (quality >= 3 && !sun_mode) { // (10-24: a wider pass: the penumbra soft, no hard shards)
+		run(2, g_cs.tmp_a, g_cs.raw, g_cs.tmp_b, g_cs.raw, 8.0f, g_cs.trace);
+		final_vis = &g_cs.tmp_b;
+	}
+	if (stats) // (the light probe: the game's sun strength; push.extra holds this frame's light)
+		run(6, g_cs.tmp_a, g_cs.tmp_b, g_cs.raw, g_cs.gbuf[cur], 0.0f, vk::Extent2D {(color.extent.width + 3) / 4, (color.extent.height + 3) / 4});
+	if (stats && sun_mode) // (KYTY_RT_SUN: the conventions' votes, the bias histogram, R's probe)
+		run(7, g_cs.tmp_a, g_cs.tmp_b, g_cs.raw, g_cs.gbuf[cur], 0.0f, vk::Extent2D {(color.extent.width + 7) / 8, (color.extent.height + 7) / 8});
+	aux_in = &g_cs.moments[cur], aux_out = &g_cs.var_b; // (the composite's stability mask: the history count in .x)
+	if (stats) push.misc[3] |= 8;
 	run(4, *final_vis, g_cs.raw, g_cs.out, g_cs.raw, 0.0f, g_cs.render);
+	if (stats) {
+		push.misc[3] &= ~8;
+		global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eHost,
+		       vk::AccessFlagBits2::eHostRead);
+		g_cs.stat_frame = this_frame;
+	}
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
 	if (timed) {
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_cs.pool, entry * 2 + 1);
 		++g_cs.written;
 	}
-	++g_cs.frame;
 	g_cs.history_valid = true;
 	inputs.color.image  = g_cs.out.image.image;
 	inputs.color.view   = g_cs.out.view;
@@ -6326,10 +8947,18 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	UpscaleInputs inputs = inputs_in;
 	// (The DLSS-G hudless path sets the context in PrepareInputs; the PS5 Pro path alone needs the renderer's.)
 	if (g_graphics_ctx == nullptr && inputs.graphics != nullptr) g_graphics_ctx = inputs.graphics;
-	SsgiApply(command, inputs); // (KYTY_SSGI: inputs.color becomes the composited copy)
+	RtPartNoteColor(inputs.color_address, inputs.color.extent); // (rtparticles: the scene color the draws are matched to)
+	HwParticlesApply(command, inputs); // (KYTY_HWRT_PARTICLES: first, on the game's own color; nothing when off)
+	CShadowApply(command, inputs); // (KYTY_RT_SHADOWS: direct-sun shadows first; inputs.color becomes the composited copy)
+	HwLightsApply(command, inputs); // (KYTY_HWRT_LIGHTS: ray-traced local-light shadows, hw-lights.cpp; nothing when off)
+	SsgiApply(command, inputs); // (KYTY_SSGI: likewise; nothing when off)
 	GtaoApply(command, inputs); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
+	HwGiApply(command, inputs); // (KYTY_HWRT_AO / KYTY_HWRT_GI: likewise, hwrt-gi.cpp, in GTAO's place; nothing when off)
 	SsrApply(command, inputs); // (KYTY_SSR: likewise, after GTAO; nothing when off)
-	CShadowApply(command, inputs); // (KYTY_CONTACT_SHADOWS: likewise, after SSGI)
+	RtReflectionsApply(command, inputs); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
+	ShineApply(command, inputs); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
+	GodraysApply(command, inputs); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off)
+	GbufViewApply(command, inputs); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
 	const bool  fsr  = g_sr_kind == 3;
@@ -6367,7 +8996,7 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 }
 
 void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,
-                  vk::Format format) {
+                  vk::Rect2D region, vk::Format format) {
 	inputs.has_hudless_display = false;
 	if (!inputs.valid || !inputs.has_hudless || inputs.hudless.image == nullptr) return;
 	ConfigureAs(graphics, inputs.hudless_display, inputs.hudless_display_view, format,
@@ -6376,14 +9005,30 @@ void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInpu
 	           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
 	Transition(command, inputs.hudless_display, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
 	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
-	vk::ImageBlit region {};
-	region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-	region.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-	region.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(inputs.hudless.extent.width),
-                                         static_cast<int32_t>(inputs.hudless.extent.height), 1};
-	region.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(backbuffer.width), static_cast<int32_t>(backbuffer.height), 1};
+	// Where RecordPresentCommands put the frame image (its present region: black bars at another aspect or with
+	// KYTY_PRESENT_ASPECT=fit), black around it as there; the whole backbuffer otherwise, as before.
+	const bool partial = region.extent.width != 0 && region.extent.height != 0 &&
+	                     (region.offset.x != 0 || region.offset.y != 0 || region.extent != backbuffer);
+	if (partial) {
+		const vk::ClearColorValue       black {std::array<float, 4> {0.0f, 0.0f, 0.0f, 1.0f}};
+		const vk::ImageSubresourceRange whole {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.clearColorImage(inputs.hudless_display.image, vk::ImageLayout::eTransferDstOptimal, &black, 1, &whole);
+		Transition(command, inputs.hudless_display, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+		           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	}
+	vk::ImageBlit blit {};
+	blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(inputs.hudless.extent.width),
+                                       static_cast<int32_t>(inputs.hudless.extent.height), 1};
+	blit.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(backbuffer.width), static_cast<int32_t>(backbuffer.height), 1};
+	if (partial) {
+		blit.dstOffsets[0] = vk::Offset3D {region.offset.x, region.offset.y, 0};
+		blit.dstOffsets[1] = vk::Offset3D {region.offset.x + static_cast<int32_t>(region.extent.width),
+		                                   region.offset.y + static_cast<int32_t>(region.extent.height), 1};
+	}
 	command.blitImage(inputs.hudless.image, vk::ImageLayout::eTransferSrcOptimal, inputs.hudless_display.image,
-	                  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eLinear);
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &blit, vk::Filter::eLinear);
 	for (auto* image: {&inputs.hudless, &inputs.hudless_display})
 		Transition(command, *image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
 		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);

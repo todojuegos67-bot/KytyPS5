@@ -76,6 +76,8 @@ void* MonitorHandle(void* window);
 // The height in pixels of the current mode of the display a window is on (nullptr: the primary display; its HWND on
 // Windows; 0 when unknown or elsewhere): the monitor's native resolution as set, independent of DPI scaling.
 uint32_t DisplayHeight(void* window);
+// Its width, as DisplayHeight (the current mode's dmPelsWidth on Windows; 0 when unknown or elsewhere).
+uint32_t DisplayWidth(void* window);
 // Sleeps until the steady_clock time `deadline_ns` (its time_since_epoch in ns): a high-resolution waitable timer on
 // Windows (sleep_until elsewhere) to about 0.5 ms before it, then a spin.
 void SleepUntilPrecise(int64_t deadline_ns);
@@ -130,6 +132,8 @@ bool MemoryTagsEnabled();
 bool LowMemVram();
 // KYTY_SIMULATE_VRAM_MB's ballast (bytes): the breakdown line says that much of its commit is the test's.
 void SetSimulationBallast(uint64_t bytes);
+// The KYTY_SIMULATE_VRAM_MB ballast held (its driver commit shows in the private bytes: the test's, not the game's).
+uint64_t SimulationBallast();
 void MemoryTagAdd(int tag, int64_t requested, int64_t committed);
 uint64_t  PhysicalMemory();
 // KYTY_TRIM_RAM_SECONDS=<n>: every n seconds the process's working set is emptied (Windows: the pages go to the

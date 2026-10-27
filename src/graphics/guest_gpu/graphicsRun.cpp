@@ -1,6 +1,7 @@
 #include "local/skip-shader.h"
 #include "local/sync-stats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "local/anti-lag.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -26,6 +27,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
+#include "async-upload.h"
 #include "live-trace.h"
 #include "live-trace-gpu.h"
 #include "live-census.h"
@@ -617,6 +619,10 @@ static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
 	}
 	auto* spec = Spec::Current();
 	if (spec == nullptr) {
+		// The buffer copies recorded before it are made first (KYTY_ASYNC_UPLOAD): the game takes a label as the GPU
+		// being done and may rewrite the buffers those copies read at once, and a copy made after that took the new
+		// bytes for the earlier draws (issue #196: lit ground and water flickered white; port of chenxiao07 f6db24b6).
+		AsyncUpload::Drain();
 		std::memcpy(dst, src, size);
 		Spec::NoteHostWrite(reinterpret_cast<uint64_t>(dst), size);
 		// (The labels a speculation's waits check: none without speculation.)
@@ -1019,6 +1025,12 @@ bool GuestGpu::Process(Submission& submission) {
 	BdaDirtyRegions::Publish();
 	if (submission.type == SubmissionType::FrameBoundary) {
 		EXIT_IF(submission.started || submission.queue_id != 0);
+		// The frame's upload copies taken first (KYTY_ASYNC_UPLOAD: the upload worker reads guest memory after the
+		// render thread recorded them): past the boundary the game writes what that frame's work read (the next frame
+		// but one, double buffered), and a copy still pending took those bytes - lit ground and water flickered white
+		// for a frame on a fast PC with the game's async compute (issue #196). Without deferred submits each submission
+		// drained them; the boundary waits here only for the copies recorded since the last one.
+		AsyncUpload::Drain();
 		Common::LockGuard lock(m_queue_mutex);
 		EXIT_IF(submission.frame_epoch != m_consumed_frame);
 		++m_done_num;
@@ -1229,6 +1241,12 @@ bool GuestGpu::Process(Submission& submission) {
 		}
 		case SubmissionType::FlipPreparation:
 			m_renderer.GetGpuResources().EndSubmission();
+			if (AntiLag::OwnLowLatencyOn()) { // KYTY_LOWLAT: this frame's last host GPU tick (local/anti-lag.h)
+				auto& master = m_renderer.GetCommandScheduler().GetMasterSemaphore();
+				AntiLag::OnFrameSubmitted(static_cast<VkDevice>(m_renderer.GetGraphics().device),
+				                          static_cast<VkSemaphore>(master.Handle(0)),
+				                          master.LanesOn() ? master.LastTick(0) : master.CurrentTick() - 1);
+			}
 			m_renderer.GetGpuResources().AdvanceFrame();
 			m_renderer.GetPipelineCache().PromoteFinished();
 			cp.PrepareCpuFlip(submission.flip_request_id);

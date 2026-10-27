@@ -63,6 +63,9 @@ struct UpscaleDesc {
 	float jitter[2] {0.0f, 0.0f}; // (pixels, as DLSS takes it: the raw jittered frame of KYTY_TAA_REPLACE=upscaler)
 	float mv_scale[2] {0.0f, 0.0f}; // vectors * scale = pixels to the previous frame (0: the TAA's UV vectors)
 	float fov = 0.0f, z_near = 0.0f; // the camera's (0: from `camera`)
+	// (rtparticles) KYTY_RT_PARTICLES=2: the particle reactive mask (R8, render size; null: none), given as FSR's
+	// reactive and transparency-and-composition masks.
+	const VulkanImage* reactive = nullptr;
 };
 bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc);
 bool               CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR& info, vk::SwapchainKHR* out);

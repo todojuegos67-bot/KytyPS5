@@ -5,6 +5,7 @@
 
 #include "port/ds-settings.h"
 
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -17,6 +18,9 @@ struct Runtime {
 	std::string              game_info;  // "Demon's Souls, PPSA01341 01.007.000"
 	Settings                 launched;   // what this run started with
 	std::vector<std::string> notes;      // what BuildLaunch adjusted
+	PcInfo                   pc;         // TU EQUIPO
+	std::filesystem::path    exe_path;   // "Demon's Souls.exe" (the update's elevated helper)
+	std::filesystem::path    game_rel;   // the game's folder relative to the port's, when inside it (else empty)
 };
 
 // Installs the port's hooks (PortLive::g_hooks): the menu (F1, or OPTIONS held + R3), the window icon and title, the

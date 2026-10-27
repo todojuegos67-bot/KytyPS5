@@ -665,7 +665,7 @@ index 5c47b25..85a5762 100644
      // update active backbuffer and block when no buffer is available
      replacementSwapBufferIndex = presentCount % gameBufferCount;
 diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
-index 0218ade..249085b 100644
+index 0218ade..f488532 100644
 --- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
 +++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
 @@ -113,10 +113,13 @@ typedef struct PacingData
@@ -682,6 +682,15 @@ index 0218ade..249085b 100644
          Real,
          Count
      } FrameType;
+@@ -157,7 +160,7 @@ enum class FGSwapchainCompositionMode
+ 
+ struct FrameinterpolationPresentInfo
+ {
+-    VulkanCommandPool<3, 8> commandPool; // at most 3 families: game, asyncCompute, present
++    VulkanCommandPool<3, 32> commandPool; // at most 3 families: game, asyncCompute, present (Kyty: 8 -> 32, MFG and a shared family)
+ 
+     PacingData scheduledInterpolations;
+     PacingData scheduledPresents;
 @@ -244,6 +247,9 @@ public:  // vulkan functions reimplementation
  
      uint64_t getLastPresentCount();
@@ -719,6 +728,108 @@ index 0218ade..249085b 100644
  
      LARGE_INTEGER lastTimestamp = {};
      LARGE_INTEGER currTimestamp = {};
+diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_Helpers.h b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_Helpers.h
+index 25f2c1e..bd8f182 100644
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_Helpers.h
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_Helpers.h
+@@ -29,6 +29,7 @@
+ 
+ #include <Windows.h>
+ #include <synchapi.h>
++#include <cstdio>
+ 
+ 
+ void waitForPerformanceCount(const int64_t targetCount);
+@@ -251,6 +252,13 @@ public:
+         return queue.submit(VK_NULL_HANDLE, semaphore, availableSemaphoreValue);
+     }
+ 
++    // Kyty: the timeline value this list's last submission signals (to wait for it with the pool unlocked).
++    void waitTarget(VkSemaphore& outSemaphore, uint64_t& outValue)
++    {
++        outSemaphore = semaphore;
++        outValue     = availableSemaphoreValue;
++    }
++
+     bool available()
+     {
+         uint64_t value = 0;
+@@ -323,17 +331,69 @@ public:
+         FFX_ASSERT(familyIndex < NumFamilies);
+ 
+         VkCommands* pCommands = nullptr;
+-        
+-        for (size_t idx = 0; idx < Capacity && (pCommands == nullptr); idx++)
++
++        // Kyty: never hand out a null list. The stock pool returned nullptr when all of a family's lists were still in
++        // flight (FFX_ASSERT is compiled out in release) and occupy() then wrote to address 0x38: the crash in
++        // vkQueuePresentFFX minutes into play with frame generation x2..x4 (the game, interpolation, composition and
++        // present queues share one queue family, so one ring of lists, and multi frame generation records 2-3x as many
++        // per real frame). Capacity is larger now; when even that is exhausted the caller waits, without holding the
++        // pool's lock (the list waited for may depend on a submission of another thread that also takes a list).
++        for (uint32_t attempt = 0; pCommands == nullptr; attempt++)
+         {
+-            auto& cmds = buffer[familyIndex][idx];
+-            if (cmds.verify(device, queue.familyIndex) && cmds.available())
++            VkCommands* pBusy     = nullptr;
++            uint64_t    busyValue = 0;
++            VkSemaphore busySem   = VK_NULL_HANDLE;
++            for (size_t idx = 0; idx < Capacity && (pCommands == nullptr); idx++)
++            {
++                auto& cmds = buffer[familyIndex][idx];
++                if (!cmds.verify(device, queue.familyIndex))
++                    continue;
++                if (cmds.available())
++                    pCommands = &cmds;
++                else if (pBusy == nullptr)
++                {
++                    pBusy = &cmds;
++                    cmds.waitTarget(busySem, busyValue);
++                }
++            }
++            if (pCommands != nullptr || pBusy == nullptr)
++                break;
++
++            LeaveCriticalSection(&criticalSection);
++            if (attempt == 0 || (attempt % 1000) == 0)
++            {
++                static volatile LONG logged = 0;
++                if (InterlockedIncrement(&logged) <= 8)
++                {
++                    char text[192];
++                    snprintf(text, sizeof(text), "FFX FI swapchain: all %u command lists of queue family %u in flight (%s): waiting (attempt %u)\n",
++                             uint32_t(Capacity), queue.familyIndex, name != nullptr ? name : "?", attempt);
++                    OutputDebugStringA(text);
++                    fputs(text, stdout);
++                    fflush(stdout);
++                }
++            }
++            if (busySem != VK_NULL_HANDLE)
++            {
++                VkSemaphoreWaitInfo waitInfo = {};
++                waitInfo.sType               = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
++                waitInfo.semaphoreCount      = 1;
++                waitInfo.pSemaphores         = &busySem;
++                waitInfo.pValues             = &busyValue;
++                vkWaitSemaphores(device, &waitInfo, 1000000ull);  // 1 ms, then scan again
++            }
++            else
+             {
+-                pCommands = &cmds;
++                Sleep(1);
+             }
++            EnterCriticalSection(&criticalSection);
+         }
+ 
+-        FFX_ASSERT(pCommands);
++        if (pCommands == nullptr)
++        {
++            // no list could be created at all (out of memory): the first one, whatever its state (better than null)
++            pCommands = &buffer[familyIndex][0];
++        }
+ 
+         pCommands->occupy(queue, name);
+ 
 diff --git a/sdk/src/components/frameinterpolation/ffx_frameinterpolation.cpp b/sdk/src/components/frameinterpolation/ffx_frameinterpolation.cpp
 index a60ff6a..ceedf7f 100644
 --- a/sdk/src/components/frameinterpolation/ffx_frameinterpolation.cpp

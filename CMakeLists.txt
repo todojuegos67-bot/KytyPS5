@@ -439,7 +439,152 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${ssr_header}")
 
-# KYTY_CONTACT_SHADOWS: screen-space contact shadows before the upscaler (src/local/frame-gen.cpp).
+# KYTY_RT_REFLECTIONS: screen-space ray-traced reflections with denoising before the upscaler (src/local/rt-reflections.cpp).
+set(rt_reflections_source "${KYTY_SOURCE_DIR}/local/rt-reflections.comp")
+set(rt_reflections_spv "${gpu_tiler_generated_dir}/rt_reflections.spv")
+set(rt_reflections_header "${gpu_tiler_generated_dir}/rt_reflections_spv.h")
+add_custom_command(
+	OUTPUT "${rt_reflections_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rt_reflections_spv}" "${rt_reflections_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_reflections_spv} -DOUTPUT=${rt_reflections_header}
+	        -DSYMBOL=RT_REFLECTIONS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rt_reflections_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rt_reflections_header}")
+# KYTY_HWRT_REFL (hwrt2): the same pass with hardware ray queries into the scene TLAS (src/local/hwrt-scene.cpp) where
+# the screen-space march misses.
+set(rt_reflections_hw_spv "${gpu_tiler_generated_dir}/rt_reflections_hw.spv")
+set(rt_reflections_hw_header "${gpu_tiler_generated_dir}/rt_reflections_hw_spv.h")
+add_custom_command(
+	OUTPUT "${rt_reflections_hw_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_HWRT
+	        -o "${rt_reflections_hw_spv}" "${rt_reflections_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_reflections_hw_spv} -DOUTPUT=${rt_reflections_hw_header}
+	        -DSYMBOL=RT_REFLECTIONS_HW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rt_reflections_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rt_reflections_hw_header}")
+# KYTY_HWRT_REFL_MATERIAL (hwrt3): + the off-screen hits' albedo (binding 24, the albedo array of src/local/hwrt-scene.cpp).
+set(rt_reflections_hwm_spv "${gpu_tiler_generated_dir}/rt_reflections_hwm.spv")
+set(rt_reflections_hwm_header "${gpu_tiler_generated_dir}/rt_reflections_hwm_spv.h")
+add_custom_command(
+	OUTPUT "${rt_reflections_hwm_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_HWRT -DKYTY_HWRT_MATERIAL
+	        -o "${rt_reflections_hwm_spv}" "${rt_reflections_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_reflections_hwm_spv} -DOUTPUT=${rt_reflections_hwm_header}
+	        -DSYMBOL=RT_REFLECTIONS_HWM_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rt_reflections_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rt_reflections_hwm_header}")
+
+# KYTY_GBUF_VIEW / KYTY_GBUF_TAP: the G-buffer diagnostic view and statistics before the upscaler (src/local/gbuf-view.cpp).
+set(gbuf_view_source "${KYTY_SOURCE_DIR}/local/gbuf-view.comp")
+set(gbuf_view_spv "${gpu_tiler_generated_dir}/gbuf_view.spv")
+set(gbuf_view_header "${gpu_tiler_generated_dir}/gbuf_view_spv.h")
+add_custom_command(
+	OUTPUT "${gbuf_view_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gbuf_view_spv}" "${gbuf_view_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gbuf_view_spv} -DOUTPUT=${gbuf_view_header}
+	        -DSYMBOL=GBUF_VIEW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gbuf_view_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gbuf_view_header}")
+
+# KYTY_HWRT_LIGHTS: ray-traced local-light shadows through the scene TLAS (src/local/hw-lights.cpp).
+set(hwlights_source "${KYTY_SOURCE_DIR}/local/hw-lights.comp")
+set(hwlights_spv "${gpu_tiler_generated_dir}/hwlights.spv")
+set(hwlights_header "${gpu_tiler_generated_dir}/hwlights_spv.h")
+add_custom_command(
+	OUTPUT "${hwlights_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${hwlights_spv}" "${hwlights_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${hwlights_spv} -DOUTPUT=${hwlights_header}
+	        -DSYMBOL=HWLIGHTS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${hwlights_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${hwlights_header}")
+# KYTY_SHINE: specular highlights + material-aware sharpening before the upscaler (src/local/shine.cpp).
+set(shine_source "${KYTY_SOURCE_DIR}/local/shine.comp")
+set(shine_spv "${gpu_tiler_generated_dir}/shine.spv")
+set(shine_header "${gpu_tiler_generated_dir}/shine_spv.h")
+add_custom_command(
+	OUTPUT "${shine_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${shine_spv}" "${shine_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${shine_spv} -DOUTPUT=${shine_header}
+	        -DSYMBOL=SHINE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${shine_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${shine_header}")
+
+# KYTY_GODRAYS: sun shafts + light halos before the upscaler (src/local/godrays.cpp).
+set(godrays_source "${KYTY_SOURCE_DIR}/local/godrays.comp")
+set(godrays_spv "${gpu_tiler_generated_dir}/godrays.spv")
+set(godrays_header "${gpu_tiler_generated_dir}/godrays_spv.h")
+add_custom_command(
+	OUTPUT "${godrays_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${godrays_spv}" "${godrays_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${godrays_spv} -DOUTPUT=${godrays_header}
+	        -DSYMBOL=GODRAYS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${godrays_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${godrays_header}")
+# KYTY_HWRT_VOLUMETRIC: the same shader as #version 460 with ray queries into the scene TLAS (-DKYTY_HWRT_VOLUMETRIC).
+file(READ "${godrays_source}" godrays_text)
+string(REPLACE "#version 450\n" "#version 460\n#extension GL_EXT_ray_query : require\n" godrays_hw_text "${godrays_text}")
+set(godrays_hw_source "${gpu_tiler_generated_dir}/godrays_hw.comp")
+file(MAKE_DIRECTORY "${gpu_tiler_generated_dir}")
+file(WRITE "${godrays_hw_source}.tmp" "${godrays_hw_text}")
+configure_file("${godrays_hw_source}.tmp" "${godrays_hw_source}" COPYONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${godrays_source}")
+set(godrays_hw_spv "${gpu_tiler_generated_dir}/godrays_hw.spv")
+set(godrays_hw_header "${gpu_tiler_generated_dir}/godrays_hw_spv.h")
+add_custom_command(
+	OUTPUT "${godrays_hw_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_HWRT_VOLUMETRIC
+	        -o "${godrays_hw_spv}" "${godrays_hw_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${godrays_hw_spv} -DOUTPUT=${godrays_hw_header}
+	        -DSYMBOL=GODRAYS_HW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${godrays_hw_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${godrays_hw_header}")
+
+# KYTY_HWRT_PARTICLES (hwrt3p): emissive particle light with ray-query shadows into the KYTY_HWRT TLAS (src/local/hwrt-particles.cpp).
+set(hwrt_particles_source "${KYTY_SOURCE_DIR}/local/hwrt-particles.comp")
+set(hwrt_particles_spv "${gpu_tiler_generated_dir}/hwrt_particles.spv")
+set(hwrt_particles_header "${gpu_tiler_generated_dir}/hwrt_particles_spv.h")
+add_custom_command(
+	OUTPUT "${hwrt_particles_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${hwrt_particles_spv}" "${hwrt_particles_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${hwrt_particles_spv} -DOUTPUT=${hwrt_particles_header}
+	        -DSYMBOL=HWRT_PARTICLES_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${hwrt_particles_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${hwrt_particles_header}")
+
+# KYTY_RT_SHADOWS: screen-space ray-traced sun shadows before the upscaler (src/local/frame-gen.cpp).
 set(cshadow_source "${KYTY_SOURCE_DIR}/local/cshadow.comp")
 set(cshadow_spv "${gpu_tiler_generated_dir}/cshadow.spv")
 set(cshadow_header "${gpu_tiler_generated_dir}/cshadow_spv.h")
@@ -454,6 +599,64 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${cshadow_header}")
+# KYTY_RT_SUN (src/local/rt-sun.comp): the sun's visibility from the game's cascades, the CShadowApply pass's other shader.
+set(rtsun_source "${KYTY_SOURCE_DIR}/local/rt-sun.comp")
+set(rtsun_spv "${gpu_tiler_generated_dir}/rtsun.spv")
+set(rtsun_header "${gpu_tiler_generated_dir}/rtsun_spv.h")
+add_custom_command(
+	OUTPUT "${rtsun_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rtsun_spv}" "${rtsun_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rtsun_spv} -DOUTPUT=${rtsun_header}
+	        -DSYMBOL=RTSUN_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rtsun_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rtsun_header}")
+# KYTY_HWRT_SHADOW: the same shader with the scene TLAS's sun rays (-DKYTY_HWRT_SHADOW).
+set(rtsun_hw_spv "${gpu_tiler_generated_dir}/rtsun_hw.spv")
+set(rtsun_hw_header "${gpu_tiler_generated_dir}/rtsun_hw_spv.h")
+add_custom_command(
+	OUTPUT "${rtsun_hw_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_HWRT_SHADOW
+	        -o "${rtsun_hw_spv}" "${rtsun_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rtsun_hw_spv} -DOUTPUT=${rtsun_hw_header}
+	        -DSYMBOL=RTSUN_HW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rtsun_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rtsun_hw_header}")
+# KYTY_HWRT (src/local/hwrt-scene.cpp): the scene capture's world-space gather and the ray query debug view.
+# (hwrt3, KYTY_HWRT_REFL_MATERIAL: albedo, albedo_array: a base-colour texture downsampled into the albedo array)
+foreach(hwrt_shader gather debug debug11 gi albedo albedo_array)
+	string(TOUPPER "${hwrt_shader}" hwrt_upper)
+	set(hwrt_source "${KYTY_SOURCE_DIR}/local/hwrt-${hwrt_shader}.comp")
+	set(hwrt_defines "")
+	if(hwrt_shader STREQUAL "debug11")
+		# (the same view into a B10G11R11 target: the PS5 Pro path's FSR output)
+		set(hwrt_source "${KYTY_SOURCE_DIR}/local/hwrt-debug.comp")
+		set(hwrt_defines "-DKYTY_FMT_R11")
+	endif()
+	if(hwrt_shader STREQUAL "albedo_array")
+		set(hwrt_source "${KYTY_SOURCE_DIR}/local/hwrt-albedo.comp")
+		set(hwrt_defines "-DKYTY_ARRAY")
+	endif()
+	set(hwrt_spv "${gpu_tiler_generated_dir}/hwrt_${hwrt_shader}.spv")
+	set(hwrt_header "${gpu_tiler_generated_dir}/hwrt_${hwrt_shader}_spv.h")
+	add_custom_command(
+		OUTPUT "${hwrt_header}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os ${hwrt_defines}
+		        -o "${hwrt_spv}" "${hwrt_source}"
+		COMMAND ${CMAKE_COMMAND} -DINPUT=${hwrt_spv} -DOUTPUT=${hwrt_header}
+		        -DSYMBOL=HWRT_${hwrt_upper}_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		DEPENDS "${hwrt_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		VERBATIM
+	)
+	list(APPEND kyty_emulator_src "${hwrt_header}")
+endforeach()
 
 # FSR 3 frame generation's HUD layer (src/local/fsr3-fg.cpp).
 set(hud_split_source "${KYTY_SOURCE_DIR}/local/hud-split.comp")
@@ -470,6 +673,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${hud_split_header}")
+# KYTY_KBM_WARP's late reprojection under a still HUD (src/local/kbm-warp.cpp).
+set(kbm_warp_source "${KYTY_SOURCE_DIR}/local/kbm-warp.comp")
+set(kbm_warp_spv "${gpu_tiler_generated_dir}/kbm_warp.spv")
+set(kbm_warp_header "${gpu_tiler_generated_dir}/kbm_warp_spv.h")
+add_custom_command(
+	OUTPUT "${kbm_warp_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${kbm_warp_spv}" "${kbm_warp_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${kbm_warp_spv} -DOUTPUT=${kbm_warp_header}
+	        -DSYMBOL=KBM_WARP_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${kbm_warp_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${kbm_warp_header}")
 # The game's exposure on the upscaled image of its super resolution path (renderSuperResolution.cpp).
 set(sr_exposure_source "${KYTY_SOURCE_DIR}/local/sr-exposure.comp")
 set(sr_exposure_spv "${gpu_tiler_generated_dir}/sr_exposure.spv")
@@ -519,8 +737,28 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/dyn-multiplier.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-reflections.h"
+	"${KYTY_SOURCE_DIR}/local/gbuf-view.h"
+	"${KYTY_SOURCE_DIR}/local/gbuf-view.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-reflections.cpp"
+	"${KYTY_SOURCE_DIR}/local/hwrt-scene.h"
+	"${KYTY_SOURCE_DIR}/local/hwrt-scene.cpp"
+	"${KYTY_SOURCE_DIR}/local/hwrt-gi.h"
+	"${KYTY_SOURCE_DIR}/local/hwrt-gi.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-local-lights.h"
+	"${KYTY_SOURCE_DIR}/local/rt-local-lights.cpp"
+	"${KYTY_SOURCE_DIR}/local/hw-lights.h"
+	"${KYTY_SOURCE_DIR}/local/hw-lights.cpp"
+	"${KYTY_SOURCE_DIR}/local/shine.h"
+	"${KYTY_SOURCE_DIR}/local/shine.cpp"
+	"${KYTY_SOURCE_DIR}/local/godrays.h"
+	"${KYTY_SOURCE_DIR}/local/godrays.cpp"
+	"${KYTY_SOURCE_DIR}/local/hwrt-particles.h"
+	"${KYTY_SOURCE_DIR}/local/hwrt-particles.cpp"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.cpp"
+	"${KYTY_SOURCE_DIR}/local/kbm-warp.h"
+	"${KYTY_SOURCE_DIR}/local/kbm-warp.cpp"
 	"${KYTY_SOURCE_DIR}/local/anti-lag.h"
 	"${KYTY_SOURCE_DIR}/local/anti-lag.cpp"
 	"${KYTY_SOURCE_DIR}/local/xess-sr.cpp"
@@ -532,6 +770,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.cpp"
 	"${KYTY_SOURCE_DIR}/local/soft-release.h"
 	"${KYTY_SOURCE_DIR}/local/soft-release.cpp"
+	"${KYTY_SOURCE_DIR}/local/ram-guard.h"
+	"${KYTY_SOURCE_DIR}/local/ram-guard.cpp"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.h"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.cpp"
 	"${KYTY_SOURCE_DIR}/local/jit-arena.h"
@@ -683,6 +923,13 @@ add_executable(demons_souls_copy_tests EXCLUDE_FROM_ALL
 target_link_libraries(demons_souls_copy_tests xbyak::xbyak)
 target_include_directories(demons_souls_copy_tests PRIVATE ${inc_headers})
 
+# (10-27) The port's in-place update and its launch settings (plain C++: also on Linux).
+add_executable(port_update_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PortUpdateTests.cpp"
+	"${KYTY_SOURCE_DIR}/port/ds-update.cpp"
+	"${KYTY_SOURCE_DIR}/port/ds-settings.cpp")
+target_include_directories(port_update_tests PRIVATE ${inc_headers})
+
 add_executable(demons_souls_idle_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DemonsSoulsIdleTests.cpp")
 target_link_libraries(demons_souls_idle_tests xbyak::xbyak)
@@ -767,6 +1014,7 @@ target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(kernel_file_system_tests
 	"${KYTY_TESTS_DIR}/KernelFileSystemTests.cpp")
+add_kyty_full_emulator_test(pad_input_tests "${KYTY_TESTS_DIR}/PadInputTests.cpp")
 add_executable(save_data_capacity_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataCapacityTests.cpp")
 target_include_directories(save_data_capacity_tests PRIVATE ${inc_headers})
@@ -856,6 +1104,7 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	add_test(NAME pad_input COMMAND $<TARGET_FILE:pad_input_tests>)
 	add_test(NAME save_data_capacity COMMAND $<TARGET_FILE:save_data_capacity_tests>)
 	add_test(NAME save_data_backup COMMAND $<TARGET_FILE:save_data_backup_tests>)
 	add_test(NAME fiber_migration COMMAND $<TARGET_FILE:fiber_migration_tests>)
@@ -935,6 +1184,7 @@ if(BUILD_TESTING)
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
+		pad_input_tests
 		fiber_migration_tests
 		save_data_capacity_tests
 		save_data_backup_tests
@@ -957,13 +1207,15 @@ if (KYTY_DS_PORT AND WIN32)
 		"${KYTY_SOURCE_DIR}/port/ds-main.cpp"
 		"${KYTY_SOURCE_DIR}/port/ds-menu.cpp"
 		"${KYTY_SOURCE_DIR}/port/ds-settings.cpp"
+		"${KYTY_SOURCE_DIR}/port/ds-update.cpp"
+		"${KYTY_SOURCE_DIR}/port/ds-update.h"
 		"${KYTY_SOURCE_DIR}/port/ds-port.h"
 		"${KYTY_SOURCE_DIR}/port/ds-settings.h"
 		"${KYTY_SOURCE_DIR}/port/ds-tables.h"
 		"${KYTY_SOURCE_DIR}/port/ds-port.rc")
 	if (KYTY_CLANG_CL)
 		set_source_files_properties("${KYTY_SOURCE_DIR}/port/ds-main.cpp" "${KYTY_SOURCE_DIR}/port/ds-menu.cpp"
-			"${KYTY_SOURCE_DIR}/port/ds-settings.cpp" PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
+			"${KYTY_SOURCE_DIR}/port/ds-settings.cpp" "${KYTY_SOURCE_DIR}/port/ds-update.cpp" PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 	endif()
 	# (The icon by name from resources/.)
 	set_property(SOURCE "${KYTY_SOURCE_DIR}/port/ds-port.rc" APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/resources")
@@ -978,7 +1230,12 @@ if (KYTY_DS_PORT AND WIN32)
 		# A Windows program with the usual main(): no console window.
 		target_link_options(kyty_emulator PRIVATE "/ENTRY:mainCRTStartup")
 	endif()
-	target_link_libraries(kyty_emulator ole32 shell32 uuid gdi32)
+	target_link_libraries(kyty_emulator ole32 shell32 uuid gdi32 winhttp dxgi advapi32)
+	# (10-27) The version stamp the in-game update compares with releases/latest (the CI passes its package name, the tag).
+	set(KYTY_DS_PORT_VERSION "" CACHE STRING "Demon's Souls PC port version (its release tag)")
+	if (KYTY_DS_PORT_VERSION)
+		target_compile_definitions(kyty_emulator PRIVATE "KYTY_DS_PORT_VERSION=\"${KYTY_DS_PORT_VERSION}\"")
+	endif()
 endif()
 configure_macos_guest_address_space(kyty_emulator)
 
@@ -1097,7 +1354,7 @@ if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 		DEPENDS "${recording_generator}" "${vulkan_registry}" "${vulkan_hpp}"
 		VERBATIM)
 	foreach(recording_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests xpr_replay_tests
-			virtual_memory_allocation_tests)
+			virtual_memory_allocation_tests pad_input_tests)
 		target_sources(${recording_target} PRIVATE
 			"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}")
 		target_include_directories(${recording_target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -1110,7 +1367,7 @@ if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 	target_link_libraries(vulkan_recording_tests PRIVATE Threads::Threads Vulkan::Headers)
 
 	foreach(native_resource_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests shader_cfg_tests
-			resource_tracking_tests resource_materialization_tests virtual_memory_allocation_tests)
+			resource_tracking_tests resource_materialization_tests virtual_memory_allocation_tests pad_input_tests)
 		target_sources(${native_resource_target} PRIVATE "${lod_stats_pack_header}")
 		target_compile_definitions(${native_resource_target} PRIVATE KYTY_LOCAL_NATIVE_RESOURCES=1)
 		target_link_libraries(${native_resource_target} ${CMAKE_DL_LIBS})

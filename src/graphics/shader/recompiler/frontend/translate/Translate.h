@@ -65,15 +65,20 @@ bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneL
 // player compile pipelines again (the static precompile stamps its store with them: PipelineCache).
 constexpr uint32_t TranslatorFeatureCooperativeHalves = 1u; // LaneLocal.cpp's cooperative halves (9935d547)
 constexpr uint32_t TranslatorFeatureTableSlotsAtUse   = 2u; // a table mode slot loaded where the shader reads it
-constexpr uint32_t TranslatorFeatures = TranslatorFeatureCooperativeHalves | TranslatorFeatureTableSlotsAtUse;
+// V_MIN/MAX/MIN3/MAX3_F32 as GLSL NMin/NMax, which AMD GPUs execute with the guest GPU's own NaN and signed-zero rules
+// (v_min_f32/v_max_f32), in place of an exact emulation (about a dozen instructions each; upstream PR #1761).
+constexpr uint32_t TranslatorFeatureNativeFloatMinMax = 4u;
+constexpr uint32_t TranslatorFeatures =
+    TranslatorFeatureCooperativeHalves | TranslatorFeatureTableSlotsAtUse | TranslatorFeatureNativeFloatMinMax;
 // Those the translation uses (default: all; the emulator sets those its static store was made with before it translates
 // anything). KYTY_LANE_LOCAL_COOP=0/1 overrides the cooperative halves either way, KYTY_TABLE_SLOTS_AT_USE=0/1 the
-// table slots' loads.
+// table slots' loads, KYTY_NATIVE_FLOAT_MIN_MAX=0/1 the float min/max.
 void                   SetTranslatorFeatures(uint32_t features);
 [[nodiscard]] uint32_t TranslatorFeatureSet();
 // Those this GPU's translation may use (default: all) and those it uses whatever the store was made with (`required`,
 // default: none), set with the device before anything is translated: TranslatorFeatureSet() holds no others (but those
-// KYTY_LANE_LOCAL_COOP=1 / KYTY_TABLE_SLOTS_AT_USE=1 force), and a static store made without the others is up to date.
+// KYTY_LANE_LOCAL_COOP=1 / KYTY_TABLE_SLOTS_AT_USE=1 / KYTY_NATIVE_FLOAT_MIN_MAX=1 force), and a static store made
+// without the others is up to date.
 void                   SetTranslatorDeviceFeatures(uint32_t features, uint32_t required = 0);
 [[nodiscard]] uint32_t TranslatorDeviceFeatures();
 

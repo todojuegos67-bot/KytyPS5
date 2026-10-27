@@ -33,6 +33,35 @@ $fgModes = @(
 	@('   Frame generation DLSS x4',                    'dlss-x4.json'),
 	@('   DLSS MFG dynamic (x2-x4 automatic)',         'dlss-dynamic.json')
 )
+# (10-23) Grafica y equipo: con una grafica que no es NVIDIA no se ofrece nada de DLSS (ni reescalado ni frame generation).
+$script:gpuName = ''; $script:pcInfo = ''; $script:ramGB = 0
+try {
+	$vcs = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object { $_.Name })
+	$pick = $vcs | Where-Object { $_.Name -match 'NVIDIA|GeForce|Radeon|AMD|Arc' } | Select-Object -First 1
+	if (-not $pick) { $pick = $vcs | Select-Object -First 1 }
+	if ($pick) { $script:gpuName = "$($pick.Name)".Trim() }
+	$cpu = (Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1).Name
+	$ram = [math]::Round((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1GB)
+	$script:pcInfo = "$($cpu -replace '\s+', ' ')".Trim() + "  |  $ram GB RAM"
+	$script:ramGB = [int]$ram
+} catch { }
+$script:isNvidia = (-not $script:gpuName) -or ($script:gpuName -match 'NVIDIA|GeForce|RTX|GTX|Quadro')
+$script:isAmd = [bool]($script:gpuName -match 'AMD|Radeon')  # (10-24) AMD: su Anti-Lag 2 de serie
+# (10-23) Base de datos de graficas: el modo recomendado y lo que se puede esperar. Medido en una RTX 5080 (1440p:
+# ~75 reales, 224 en pantalla con frame generation dinamico; 4K cine ~40-48 reales) y en una de 8 GB simulada; el
+# resto es una ESTIMACION por potencia relativa (el emulador tambien depende mucho de la CPU).
+$script:gpuDb = @(
+	# (10-23) Sin VK_KHR_fragment_shader_barycentric (lo exige el emulador para los shaders del juego): no arrancan.
+	@('GTX (9|10)[0-9]{2}|GTX TITAN|RX (4|5)[0-9]{2}\b|RX 5[0-9]{3}|Vega|Radeon VII', 'NOT COMPATIBLE', 'your GPU lacks fragmentShaderBarycentric (needs NVIDIA RTX 20 / GTX 16 or AMD RX 6000 or newer)'),
+	@('RTX 509|RTX 508|RTX 409|RTX 408|RX 7900 XTX', 'Souls extreme mode', '4K cinematic: ~40-50 real FPS (150-224 on screen with FG). 1440p: 60-75 real'),
+	@('RTX 507|RTX 4070 Ti|RTX 4070 SUPER|RTX 309|RTX 3080 Ti|RX 907|RX 7900 XT|RX 7900 GRE|RX 6950', 'Souls ultra mode', '1440p: ~50-65 real FPS (150-224 on screen with FG)'),
+	@('RTX 4070|RTX 4060 Ti 16|RTX 3080|RTX 506|RX 6800|RX 6900|RX 7800|RX 7700|Arc.*B5[78]0', 'Souls balanced mode', '1440p: fixed 45 real FPS (90 on screen with AMD x2)'),
+	@('RTX 4060|RTX 3070|RTX 3060|RTX 207|RTX 208|RTX 2060|RX 66|RX 7600|RX 6700|Arc.*A7', 'Souls light mode', '1080p: fixed 30 real FPS (60 on screen with AMD x2); 8 GB of VRAM is tight'),
+	@('GTX|RX 5[0-9]|RX 6500|RX 6400|Arc.*A[35]|Radeon\(TM\) Graphics|Iris|UHD', 'Souls PC low profile mode', '900p: fixed 30 real FPS (60 with AMD x2); may not be smooth')
+)
+$script:gpuRec = $null
+foreach ($row in $script:gpuDb) { if ($script:gpuName -match $row[0]) { $script:gpuRec = $row; break } }
+if (-not $script:isNvidia) { $fgModes = @($fgModes | Where-Object { $_[1] -notlike 'dlss*' -and $_[0] -notmatch 'NVIDIA' }) }
 # Reescalado: texto -> altura del 3D (run-windows.ps1 -RenderHeight), reescalador (-Upscale) y altura de salida
 # (-UpscaleHeight; 0 = 1440). DLSS (NVIDIA RTX): DLAA 1x, Ultra calidad 1.3x, Calidad 1.5x, Equilibrado 1.72x,
 # Rendimiento 2x, Ultra rendimiento 3x (720 -> 2160). XeSS 3 (todas las graficas): AA 1x, Ultra calidad plus 1.3x,
@@ -61,6 +90,7 @@ $resModes = @(
 	@('FSR Quality',    1.5,  'fsr',  0),
 	@('FSR Balanced',   1.72, 'fsr',  0),
 	@('FSR Perf.',      2.0,  'fsr',  0),
+	@('FSR 900p (AA)',  1.6,  'fsr',  0),  # (10-23) PC low profile: el 3D a 900 (1440 / 1.6) con FSR y nitidez
 	@('1080p game',    1080, '',     0),
 	@('900p game',     900,  '',     0),
 	@('720p game',     720,  '',     0)
@@ -113,7 +143,7 @@ function Set-IniValue([string]$key, [string]$value) {
 function Set-FgIndex([int]$i) { Set-IniValue 'fgmode' "$i"; if ($i -ge 0 -and $i -lt $fgModes.Count -and $fgModes[$i][1]) { Set-IniValue 'fgcfg' $fgModes[$i][1] } }
 # (10-22) Frame generation fijo (AMD x2): Modo graficas de 8 GB (30 FPS, 1080p, solo AA) o Modo 45 FPS (1440p, reescalado
 # normal). Lo de 1080p y el filtro de AA siguen mirando solo chkLowEnd.
-function Is-FixedFg { return ($chkLowEnd -and $chkLowEnd.Checked) -or ($chkLowEnd45 -and $chkLowEnd45.Checked) }
+function Is-FixedFg { return ($chkLowEnd -and $chkLowEnd.Checked) -or ($chkLowEnd45 -and $chkLowEnd45.Checked) -or ($chkSoulsLow -and $chkSoulsLow.Checked) }  # (10-23) low profile: 30 reales con AMD x2
 # (10-22) FPS desbloqueados siempre, salvo DLSS frame generation (Reflex) y los modos Souls ligero / equilibrado.
 function Is-Unlocked { if (Is-FixedFg) { return $false }; $c = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]; return $true }  # (10-22 d) DLSS tambien desbloqueado: reflexfree (Reflex como unico limite)
 
@@ -168,6 +198,11 @@ function Start-Game {
 	$psargs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $root 'run-windows.ps1')`"",
 	          '-Exe', "`"$(Join-Path $root $exeName)`"", '-Config', "`"$(Join-Path $root "config\$config")`"", '-Fullscreen')
 	if ($ram16 -or $chkPc16.Checked) { $psargs += '-Ram16' }
+	# (10-24) Perfil seguro de 16 GB (Update-LowRam: 20 GB de RAM o menos, o "Simular 16 GB RAM"): -Ram16 de siempre y
+	# KYTY_LOWRAM=1 (los limites de memoria del emulador para 16 GB). Con la simulacion, el emulador cree tener 16 GB.
+	$lowRamSets = @()
+	if ($ram16 -or $chkPc16.Checked -or (Test-LowRam)) { $lowRamSets += 'KYTY_LOWRAM=1' }
+	if ($chkRam16.Checked) { $lowRamSets += 'KYTY_SIMULATE_RAM_MB=16384' }
 	# HDR10 (solo si "Usar HDR" esta activado en la pantalla de Windows) y VSync (modo FIFO: sin tearing).
 	if ($chkHdr.Checked)   { $psargs += '-Hdr' }
 	if ($chkVsync.Checked) { $psargs += @('-PresentMode', 'Fifo') }
@@ -179,26 +214,62 @@ function Start-Game {
 	# juego y Windows usan aparte, por debajo de 8 GB) y texturas a la mitad y sombras mas cortas (-Quality low).
 	# Modo GPU seguro: el trabajo de compute del juego sin solaparse (KYTY_COMPUTE_CHAIN=0), para graficas que se
 	# cuelgan o dan pantallazo azul (~37% menos FPS).
-	$sets = @()
+	$sets = @() + $lowRamSets
 	# (10-23) Reserva PS5 reducida retirada: el juego pide unos 11,8 GB fijos y con 12 GB fallaban asignaciones  # (10-23) reserva de memoria PS5 reducida
 	# Modo TURBO (run-windows -Turbo): caches de video a 4.5 GB (unos 6 GB en total), texturas a un cuarto, detalle bajo
 	# del juego y la RAM vaciada cada 15 s por encima de 5 GB: para PCs de 16 GB que se cerraban en zonas pesadas.
 	if ($chkTurbo2.Checked) { $psargs += @('-Turbo2', '-Quality', 'low', '-TextureReduce', '2') }
-	elseif ($chkLowPc.Checked) { $sets += 'KYTY_SIMULATE_RAM_MB=16384'; $psargs += @('-Turbo', '-Quality', 'low', '-TextureReduce', '2') }
+	elseif ($chkLowPc.Checked) { if ($sets -notcontains 'KYTY_SIMULATE_RAM_MB=16384') { $sets += 'KYTY_SIMULATE_RAM_MB=16384' }; $psargs += @('-Turbo', '-Quality', 'low', '-TextureReduce', '2') }
 	# (10-23) Modo GPU seguro retirado del launcher
 	# Graficos: texturas (0 entera, 1 mitad, 2 cuarto) y distancia de dibujado (-Quality low/lowest: solo el LOD).
 	$psargs += @('-TextureReduce', @('0', 'h', '1', '2')[$cmbTex.SelectedIndex])  # (10-23) Alto = h
-	if ($chkAntiLag.Checked) { $psargs += '-AntiLag' }
+	# (10-23) Anti-Lag solo en los modos Souls ligero y PC low profile (frame generation de AMD + Reflex); en los demas
+	# no mejoraba y quitaba FPS.
+	# (10-23 noche) Anti-Lag solo con graficas AMD (AMD Anti-Lag 2) en Souls ligero y PC low profile. En NVIDIA no: Reflex
+	# sobre la frame generation de AMD cerro el juego (20261023-205956, en Fsr3::QueuePresent).
+	# NVIDIA + frame generation de AMD: casilla "Anti-Lag (experimental)", solo sin reescalado DLSS (con DLSS cargado fue
+	# el crash); usa Reflex por Vulkan, el camino anterior a hoy.
+	$resNow = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
+	# (10-23 21:30) NVIDIA Reflex sobre la frame generation de AMD crashea tambien sin DLSS (20261023-213004, Fsr3::QueuePresent): nunca.
+	$nvAmd  = $false
+	# Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag automatico en AMD, y en NVIDIA solo con XeSS o FSR.
+	# (10-24) Graficas AMD: su Anti-Lag 2 de serie con la frame generation de AMD (y nada mas); NVIDIA / Intel: el propio.
+	# (10-24) Se elige en el desplegable: en AMD, Anti-Lag 2 de serie (por defecto) o el nuestro; en NVIDIA el nuestro
+	# (Reflex sobre la frame generation de AMD se cerraba). Modos Souls fijos: el nuestro en Ultra.
+	$fixedAl = $script:isAmd -and ($config -like 'fsr3*') -and $cmbAl.SelectedIndex -eq 0 -and -not (Is-FixedFg)
+	# (10-23 noche) Anti-Lag propio del emulador (KYTY_LOWLAT): sin Reflex ni FSR3 tocado; con la frame generation de AMD.
+	if (Is-FixedFg) { $cmbAl.SelectedIndex = 2 }  # (10-24) siempre Ultra en los modos fijos
+	$ownLat = ($cmbAl.SelectedIndex -eq 1 -or $cmbAl.SelectedIndex -eq 2) -and $config -like 'fsr3*'
+	# (10-24) Frame generation de NVIDIA (DLSS-G): Reflex (por defecto) o el nuestro; con el nuestro Reflex se apaga.
+	$dgOwn = $config -like 'dlss*' -and $cmbAlNv.SelectedIndex -gt 0
+	if ($dgOwn) {
+		$sets += 'KYTY_DLSSG_REFLEX=off'; $sets += 'KYTY_LOWLAT=1'
+		$sets += $(if ($cmbAlNv.SelectedIndex -eq 2) { 'KYTY_LOWLAT_QUEUE=1' } else { 'KYTY_LOWLAT_QUEUE=2' })
+	}
+	if ($ownLat) { $sets += 'KYTY_LOWLAT=1'; $sets += $(if ($cmbAl.SelectedIndex -eq 2) { 'KYTY_LOWLAT_QUEUE=1' } else { 'KYTY_LOWLAT_QUEUE=2' }) }  # (10-23) Anti-Lag: 2 frames en cola; Ultra: 1
+	# (10-23) Para las metricas: si va Anti-Lag y cual.
+	Set-IniValue 'antilagon' $(if ($dgOwn) { $(if ($cmbAlNv.SelectedIndex -eq 2) { 'Ultra (Reflex off)' } else { 'Normal (Reflex off)' }) } elseif ($ownLat) { $(if ($cmbAl.SelectedIndex -eq 2) { 'Ultra' } else { 'Normal' }) } elseif ($nvAmd -or $fixedAl) { if ($script:isNvidia) { 'Reflex (NVIDIA)' } else { 'Anti-Lag 2 (AMD)' } } elseif ($config -like 'dlss*') { 'Reflex (DLSS-G)' } else { 'No' })
+	if ($nvAmd -or $fixedAl) {
+		$psargs += '-AntiLag'
+		# (10-23) Baja latencia: la CPU no prepara un frame por adelantado (~ -18 ms de retraso, algo menos de FPS) y
+		# con DLSS Frame Generation, Reflex en modo Boost.
+		# (10-23 tarde) KYTY_FRAME_PIPELINE=0 quitado: a 4K bajaba de ~45 a 35 reales (y x3 a 20): limitaba los FPS.
+		if ($config -like 'dlss*') { $sets += 'KYTY_DLSSG_REFLEX=boost' }
+	}
 	if ($cmbRt.SelectedIndex -gt 0) { $psargs += @('-Ssgi', "$($cmbRt.SelectedIndex)") }
+	foreach ($n in 'KYTY_RT_SHADOWS', 'KYTY_RT_REFLECTIONS') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }  # (10-24) RT beta
+	if ($cmbRtSh -and $cmbRtSh.SelectedIndex -gt 0) { $env:KYTY_RT_SHADOWS = "$($cmbRtSh.SelectedIndex)" }
+	if ($cmbRtRf -and $cmbRtRf.SelectedIndex -gt 0) { $env:KYTY_RT_REFLECTIONS = "$($cmbRtRf.SelectedIndex)" }
 	# (10-23) Sombras RT retiradas: el juego tiene las suyas (Sombras Ultra)
 	if ($cmbShadow.SelectedIndex -gt 0) { $psargs += @('-Shadows', @('0', '3', '1', '2')[$cmbShadow.SelectedIndex]) }  # (10-23) Alto = 3
 	$rN = @('Ultra', '', 'Normal', 'Low'); if ($rN[$cmbRefl.SelectedIndex]) { $psargs += @('-Reflections', $rN[$cmbRefl.SelectedIndex]) }
 	if ($rN[$cmbFade.SelectedIndex]) { $psargs += @('-ObjectFade', $rN[$cmbFade.SelectedIndex]) }
 	$aN = @('Ultra', 'High', '', 'Low', 'Off'); if ($aN[$cmbAaS.SelectedIndex]) { $psargs += @('-AaSharp', $aN[$cmbAaS.SelectedIndex]) }
 	$postOff = @($script:postChecks | Where-Object { -not $_[0].Checked } | ForEach-Object { $_[1] }) -join ','; if ($postOff) { $psargs += @('-PostOff', $postOff) }  # (10-23)
-	$detNames = @('Ultra', 'VeryHigh', 'High', 'Normal', 'Low'); if ($cmbDet.SelectedIndex -ne 2) { $psargs += @('-Detail', $detNames[$cmbDet.SelectedIndex]) }  # (10-23) preset de detalle
+	$detNames = @('Lejana', 'VeryHigh', 'High', 'Normal', 'Low')  # (10-24) Ultra = Lejana: sombras del juego a 1000 m, 4 cascadas, objetos lejanos, SSR largo; if ($cmbDet.SelectedIndex -ne 2) { $psargs += @('-Detail', $detNames[$cmbDet.SelectedIndex]) }  # (10-23) preset de detalle
 	if ($cmbDist.SelectedIndex -ge 1) { $psargs += @('-Quality', @('', 'high', 'low', 'lowest')[$cmbDist.SelectedIndex]) }  # (10-23) Alto = high
 	if ($chkExcl.Checked) { $psargs += '-ExclusiveFullscreen' }
+	if ($cmbAspect.SelectedIndex -gt 0) { $psargs += @('-Aspect', @('16:9', '21:9', '32:9')[$cmbAspect.SelectedIndex]) }  # (10-23) ultrawide
 	# Preset C con la imagen sin HUD (hudless) daba pantalla negra con solo el HUD (10-21): sin ese buffer.
 	# (10-21) Preset C del frame generation de NVIDIA siempre (mas rapido; el emulador solo lo aplica a DLSS-G).
 	$sets += 'KYTY_DLSSG_PRESET=C'
@@ -216,7 +287,9 @@ function Start-Game {
 	$fgConfig = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	if (Is-FixedFg) { $fgConfig = 'fsr3.json'; $sets += $(if ($chkLowEnd45.Checked) { 'KYTY_FLIP_FPS=45' } else { 'KYTY_FLIP_FPS=30' }) }
 	# Nombre del modo de frame generation para las metricas.
-	if ($chkLowEnd45.Checked) { Set-IniValue 'fglabel' 'MODE SOULS BALANCED' } elseif ($chkLowEnd.Checked) { Set-IniValue 'fglabel' 'MODE SOULS LIGHT' } else { Set-IniValue 'fglabel' ($fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][0].Trim()) }
+	# (10-23) El modo grafico para las metricas.
+	Set-IniValue 'soulsmodo' $(if ($chkLowEnd.Checked) { 'Souls light mode' } elseif ($chkLowEnd45.Checked) { 'Souls balanced mode' } elseif ($chkSoulsUltra.Checked) { 'Souls ultra mode' } elseif ($chkSoulsExt.Checked) { 'Souls extreme mode' } elseif ($chkSoulsLow.Checked) { 'Souls PC low profile mode' } else { 'Custom' })
+	if ($chkLowEnd45.Checked) { Set-IniValue 'fglabel' 'MODE SOULS BALANCED' } elseif ($chkLowEnd.Checked) { Set-IniValue 'fglabel' 'MODE SOULS LIGHT' } elseif ($chkSoulsLow.Checked) { Set-IniValue 'fglabel' 'Souls PC low profile mode' } else { Set-IniValue 'fglabel' ($fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][0].Trim()) }
 	# (10-22) FPS desbloqueados solo sin frame generation: con frame generation el juego se queda en su base (60) y el
 	# multiplicador llega al monitor; desbloqueado (110 reales x3 = 330) se pasaba de los 240 Hz y salia de G-Sync.
 	# AMD x4: 56 FPS reales (224 mostrados), por debajo de 240 Hz para que G-SYNC vaya suave.
@@ -231,8 +304,20 @@ function Start-Game {
 	# (10-23) KYTY_GUEST_LAZY_COMMIT retirado: bloqueaba el arranque y solo ahorraba ~0,5 GB
 	# (10-23) KYTY_LOWMEM_VRAM retirado: con graficas de 8 GB bajaba el presupuesto a 4 GB y daba tirones (13-47% de tramos frente a 2-7%)
 	$sets += 'KYTY_FAULT_STATS=1'
+	$sets += 'KYTY_ALIAS_STATS=0'  # (10-23) el diagnostico de alias recorria todos los mapeos en cada map: tirones al cambiar de zona que empeoraban con la sesion
 	if ($fgConfig -eq 'fsr3-x4.json') { $sets += 'KYTY_VRR_CAP_FPS=224' }  # (10-22 d) en DLSS el tope se aplicaba dos veces: 14 reales x4 = 56
 	if ($fgConfig -like '*dyn*') { $sets += 'KYTY_DYN_QUALITY=0.95' }  # (10-22 g) llenar el monitor: el menor multiplicador que llega a ~224 (80 reales = x3, 120 = x2)
+	# (10-23) Teclado y raton: velocidad de camara del juego (sin teclado y raton no se toca: la del menu del juego).
+	# (10-24) Convars extra: velocidad de camara (raton) y la prueba elegida en Ajustes (manchas negras).
+	$extraCv = @()
+	if ($chkKbm.Checked) { $extraCv += "cp11_Setting_CameraSpeed=$($trkCam.Value)" }
+	$tsel = if ($cmbTest) { $script:testModes[[math]::Max(0, $cmbTest.SelectedIndex)][1] } else { '' }
+	if ($tsel -like 'KYTY_*') { $sets += $tsel } elseif ($tsel) { $extraCv += $tsel }  # (KYTY_*: por -Set, que manda sobre la config)
+	if ($extraCv.Count) { $psargs += @('-ExtraConvars', ($extraCv -join ';')) }
+	if ($chkMetricas.Checked) { $sets += 'KYTY_LATENCY=1' }
+	$sets += 'KYTY_LOWLAT_PACE_BEFORE_INPUT=0'  # (10-24) ritmo antes del mando: bajaba los FPS en videos y menus; apagado hasta arreglarlo
+	if ($cmbRays -and $cmbRays.SelectedIndex -gt 0) { $sets += "KYTY_GODRAYS=$($cmbRays.SelectedIndex)" }  # (10-24) rayos de luz
+	if ($cmbShine -and $cmbShine.SelectedIndex -gt 0) { $sets += "KYTY_SHINE=$($cmbShine.SelectedIndex)" }  # (10-24) brillo de metales
 	if ($sets.Count -gt 0) { $psargs += @('-Set', ($sets -join ',')) }
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
@@ -250,6 +335,11 @@ function Start-Game {
 	# (Desbloqueado sin frame generation: vblank virtual de 360 Hz y cada frame se muestra en cuanto esta listo
 	# (-FlipWhenReady), no al siguiente tick de 120 Hz: a ~80 FPS los frames alternaban 8 y 17 ms (tirones).)
 	elseif ((Is-Unlocked)) { $psargs += @('-Vblank', '960') }
+	# (10-23) 900 en cualquier monitor: la altura REAL del monitor (con el escalado de Windows al 150 % la de la ventana
+	# sale 960 y daba 1350 lineas).
+	$realH = 0; try { $realH = [int](@(Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object { $_.CurrentVerticalResolution } | Sort-Object CurrentVerticalResolution -Descending)[0].CurrentVerticalResolution) } catch { }
+	if ($realH -le 0) { $realH = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height }
+	foreach ($rm in $resModes) { if ($rm[0] -eq 'FSR 900p (AA)') { $rm[1] = [math]::Max(1.0, [math]::Round($realH / 900.0, 4)) } }
 	$res    = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
 	if ($res[1] -eq 0) { $res = $resModes[0] }
 	# (10-22) Modo 4K: el modo cinematico del juego a 4K nativo (sin reescalado).
@@ -280,7 +370,7 @@ function Start-Game {
 	# Cinematico a 60 quitado (no funcionaba): el modo cinematico queda como en PS5.
 	$env:KYTY_UNLOCK_30 = '0'
 	# (10-23) Mando remapeado (KYTY_PAD_MAP) y teclado y raton (KYTY_KBM): ver "Mapear mando". Sin nada, como siempre.
-	foreach ($n in 'KYTY_PAD_MAP', 'KYTY_KBM', 'KYTY_KBM_MAP', 'KYTY_KBM_SENS', 'KYTY_KBM_ANTIDZ', 'KYTY_KBM_CALIBRATE') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
+	foreach ($n in 'KYTY_PAD_MAP', 'KYTY_KBM', 'KYTY_KBM_MAP', 'KYTY_KBM_SENS', 'KYTY_KBM_ANTIDZ', 'KYTY_KBM_CALIBRATE', 'KYTY_KBM_WARP') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 	$padMap = Get-IniValue 'padmap' ''; if ($padMap) { $env:KYTY_PAD_MAP = $padMap }
 	# (10-23) "Calibrar camara": el emulador mide cuanto gira la camara del juego con cada posicion del stick y lo guarda
 	# en kbm_curve.txt junto al exe; desde entonces el raton gira la camara exactamente lo que se mueve.
@@ -290,6 +380,7 @@ function Start-Game {
 		$kbmMap = Get-IniValue 'kbmmap' ''; if ($kbmMap) { $env:KYTY_KBM_MAP = $kbmMap }
 		$env:KYTY_KBM_SENS   = ($trkSens.Value / 100).ToString([System.Globalization.CultureInfo]::InvariantCulture)
 		$env:KYTY_KBM_ANTIDZ = ($trkAdz.Value / 100).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+		if ($chkWarp.Checked) { $env:KYTY_KBM_WARP = '1' } else { Remove-Item Env:KYTY_KBM_WARP -ErrorAction SilentlyContinue }
 	}
 	foreach ($n in 'KYTY_VSYNC_LOCK', 'KYTY_FPS_CAP', 'KYTY_FLIP_WHEN_READY') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 	# G-Sync: reloj del emulador suelto del monitor. Mostrar cada frame al momento solo con FPS desbloqueados y sin
@@ -424,7 +515,7 @@ $cmbFg.Add_SelectedIndexChanged({
 		$cmbFg.SelectedIndex = [math]::Min($cmbFg.SelectedIndex + 1, $fgModes.Count - 1)
 		return
 	}
-	Set-FgIndex $cmbFg.SelectedIndex
+	if (-not $script:fgNoSave) { Set-FgIndex $cmbFg.SelectedIndex }
 })
 $panel.Controls.Add($cmbFg)
 
@@ -501,7 +592,7 @@ $tips.SetToolTip($chkLowEnd45, 'For GPUs around RTX 3080 level: RTX 2080 Ti, RTX
 $panel.Controls.Add($chkLowEnd45)
 # (10-22) Solo uno de los dos modos a la vez (si ya estaban los dos en el ini, gana el de 30).
 if ($chkLowEnd.Checked -and $chkLowEnd45.Checked) { $chkLowEnd45.Checked = $false }
-$tips.SetToolTip($chkAntiLag, 'Lower input lag: AMD Anti-Lag 2 on AMD GPUs, the emulator limiter on others. Does nothing with DLSS (it already uses Reflex).')
+$tips.SetToolTip($chkAntiLag, 'Less input and mouse lag: AMD Anti-Lag 2 on AMD GPUs and Reflex Boost with DLSS Frame Generation.')
 $panel.Controls.Add($chkAntiLag)
 $chk4K = New-Check '4K mode' 0 0 120 'modo4k'
 $tips.SetToolTip($chk4K, 'The game starts in its 4K cinematic mode (as on PS5). With an upscaler, its resolution is calculated for 4K.')
@@ -558,6 +649,7 @@ function Get-ResFamilies {
 }
 function Get-OutHeight {
 	# (10-22) Modo graficas de 8 GB: siempre 1080p.
+	if ($chkSoulsLow -and $chkSoulsLow.Checked) { return 900 }  # (10-23) PC low profile: salida de 900, FSR 3.1 AA nativo a 900
 	if ($chkLowEnd -and $chkLowEnd.Checked) { return 1080 }
 	# (10-22) Modo 45 FPS: siempre 1440p.
 	if ($chkLowEnd45 -and $chkLowEnd45.Checked) { return 1440 }
@@ -578,7 +670,10 @@ function Fill-Res {
 		# PC bajos requisitos: sin DLSS (usa el frame generation de AMD x2; solo XeSS, FSR o nativo).
 		# (10-22) DLSS Equilibrado y Ultra rendimiento solo a 4K: sobre 1440 caen por debajo de lo que acepta DLSS.
 		# Modo graficas de 8 GB: frame generation de AMD, asi que sin DLSS (todos los de XeSS y FSR).
-		if ($chkLowEnd -and $chkLowEnd.Checked -and $family -ne 'dlss') { $modes = @($modes | Where-Object { $_[0] -in 'XeSS AA', 'FSR AA native' }) }
+		if ($family -eq 'dlss' -and -not $script:isNvidia) { continue }  # (10-23) sin NVIDIA no hay DLSS
+		$modes = @($modes | Where-Object { $_[0] -ne 'FSR 900p (AA)' })  # (10-23) ya no se usa: low profile = FSR AA nativo con salida de 900
+		# (10-23) Modo Souls ligero: solo el antialiasing de cada uno (DLSS DLAA, XeSS AA, FSR AA) o nativo.
+		if (($chkLowEnd -and $chkLowEnd.Checked) -or ($chkSoulsLow -and $chkSoulsLow.Checked)) { $modes = @($modes | Where-Object { $_[0] -in 'DLSS DLAA', 'XeSS AA', 'FSR AA native' }) }
 		# (10-22) Modo graficas de 8 GB: tambien sin reescalado (1080p nativo, sin XeSS ni FSR), lo primero de la lista.
 		if ($chkLowEnd -and $chkLowEnd.Checked -and $family -eq 'xess') { $shown += , @('No upscaling (1080p native)', 1080, '', 0) }
 		$outH = Get-OutHeight
@@ -632,9 +727,17 @@ $cmbFg.Add_SelectedIndexChanged({ Update-UnlockForFg })
 Update-UnlockForFg
 $chkTurbo2.Add_CheckedChanged({ Fill-Res })
 # PC bajos requisitos: la lista de frame generation bloqueada (va con AMD x2) y sin modos DLSS.
-function Update-LowEnd { $low = Is-FixedFg; $cmbFg.Enabled = -not $low; if ($cmbOut) { if ($chkLowEnd45.Checked) { $cmbOut.SelectedIndex = 0 }; $cmbOut.Enabled = -not $low; $chk4K.Checked = (-not $low) -and $cmbOut.SelectedIndex -eq 1 }; if ($cmbPreset) { $cmbPreset.Enabled = $true }; Fill-Res }
-$chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { $chkLowEnd45.Checked = $false }; Update-LowEnd })
-$chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { $chkLowEnd.Checked = $false }; Update-LowEnd })
+function Update-LowEnd { $low = Is-FixedFg; $cmbFg.Enabled = -not $low
+	# (10-23) Con un modo de FG fija (Souls ligero, equilibrado, low profile) el desplegable muestra AMD x2; al quitarlo vuelve
+	# el que habia (sin guardarlo en launcher.ini).
+	$fixIdx = -1; for ($q = 0; $q -lt $fgModes.Count; $q++) { if ($fgModes[$q][1] -eq 'fsr3.json') { $fixIdx = $q } }
+	$script:fgNoSave = $true
+	if ($low -and $fixIdx -ge 0) { if ($null -eq $script:fgBefore) { $script:fgBefore = $cmbFg.SelectedIndex }; $cmbFg.SelectedIndex = $fixIdx }
+	elseif (-not $low -and $null -ne $script:fgBefore) { $cmbFg.SelectedIndex = $script:fgBefore; $script:fgBefore = $null }
+	$script:fgNoSave = $false
+	; if ($cmbOut) { if ($chkLowEnd45.Checked) { $cmbOut.SelectedIndex = 0 }; $cmbOut.Enabled = -not $low; $chk4K.Checked = (-not $low) -and $cmbOut.SelectedIndex -eq 1 }; if ($cmbPreset) { $cmbPreset.Enabled = $script:isNvidia }; Fill-Res }
+$chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { $chkLowEnd45.Checked = $false }; Update-LowEnd; if (Get-Command Update-AntiLagBox -ErrorAction SilentlyContinue) { Update-AntiLagBox } })
+$chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { $chkLowEnd.Checked = $false }; Update-LowEnd; if (Get-Command Update-AntiLagBox -ErrorAction SilentlyContinue) { Update-AntiLagBox } })
 $cmbFg.Enabled = -not (Is-FixedFg)
 $cmbFg.Add_DrawItem({ param($sender, $e) Draw-ColoredItem $sender $e })
 
@@ -650,7 +753,7 @@ $cmbPreset.SelectedIndex = [math]::Min([math]::Max(0, $presetIndex), $dlssPreset
 $cmbPreset.Add_SelectedIndexChanged({ Set-IniValue 'dlsspreset' "$($cmbPreset.SelectedIndex)" })
 $tips.SetToolTip($cmbPreset, 'DLSS model: auto (NVIDIA default), K = DLSS 4, L and M = DLSS 4.5 (sharper, a bit slower)')
 $panel.Controls.Add($cmbPreset)
-$cmbPreset.Enabled = $true  # (10-23) modos Souls: tambien con DLSS
+$cmbPreset.Enabled = $script:isNvidia  # (10-23) modos Souls: tambien con DLSS (solo NVIDIA)
 
 # Nitidez del reescalado: Auto (FSR 0.3, DLSS y XeSS sin nada) o un nivel fijo para todos.
 $sharpLevels = @(@('Sharpness: auto', ''), @('Sharpness: 0', '0'), @('Sharpness: 25%', '0.25'), @('Sharpness: 50%', '0.5'),
@@ -716,6 +819,25 @@ $panel.Controls.Add($btnSettings)
 
 $btnExit = New-Button 'Exit' ($W - 190) 46 140 58 $false
 $btnExit.Add_Click({ $form.Close() })
+# (10-23) Cruz arriba a la derecha para cerrar el launcher.
+$btnX = New-Object System.Windows.Forms.Button
+$btnX.Text = [string][char]0x2715; $btnX.Font = New-Object System.Drawing.Font('Segoe UI Symbol', 14, [System.Drawing.FontStyle]::Bold)
+$btnX.FlatStyle = 'Flat'; $btnX.FlatAppearance.BorderSize = 0
+$btnX.BackColor = [System.Drawing.Color]::FromArgb(14, 16, 22); $btnX.ForeColor = [System.Drawing.Color]::FromArgb(222, 196, 140)
+$btnX.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(180, 40, 40)
+$btnX.Size = New-Object System.Drawing.Size(48, 40); $btnX.Location = New-Object System.Drawing.Point(($W - $panelW - 56), 8)  # a la izquierda del panel: no tapa nada
+$btnX.Add_Click({ $form.Close() })
+$form.Controls.Add($btnX); $btnX.BringToFront()
+# (10-23) Abajo: la grafica y el equipo detectados.
+$lbPc = New-Object System.Windows.Forms.Label
+$lbPc.AutoSize = $false; $lbPc.TextAlign = 'MiddleLeft'
+$lbPc.Font = $smallFont; $lbPc.ForeColor = [System.Drawing.Color]::FromArgb(222, 196, 140)
+$lbPc.BackColor = [System.Drawing.Color]::FromArgb(170, 14, 16, 22)
+$lbPc.Text = "  GPU: $(if ($script:gpuName) { $script:gpuName } else { 'not detected' })$(if (-not $script:isNvidia) { '  (no DLSS: NVIDIA only)' })     PC: $($script:pcInfo)" +
+	$(if ($script:gpuRec) { "`n  Recommended: $($script:gpuRec[1]).  Expected (estimate): $($script:gpuRec[2])" } else { "`n  GPU not in the list: start with the Souls balanced mode and watch the metrics." })
+$lbPc.Location = New-Object System.Drawing.Point(16, ($H - 60)); $lbPc.Size = New-Object System.Drawing.Size(($W - $panelW - 32), 48)
+$form.Controls.Add($lbPc); $lbPc.BringToFront(); $lbPc.Visible = $false  # (10-24) ahora en la tarjeta 'Tu equipo'
+if ($cmbPreset -and -not $script:isNvidia) { $cmbPreset.Enabled = $false }
 $panel.Controls.Add($btnExit)
 $chk4K.Visible = $false
 # (10-22) Salida: 1440p (el monitor), 4K (modo cinematico del juego), 1080p y 720p (graficas mas modestas). Los
@@ -767,8 +889,8 @@ $gImg = New-Group 'Image' 10 8 420 152
 $gFg  = New-Group 'Frame generation' 450 8 420 94
 $gGfx = New-Group 'Graphics quality' 10 168 420 410
 $gScr = New-Group 'Display and other' 450 110 420 56
-$gModes = New-Group 'Souls Modes' 450 174 420 86
-$gPc  = New-Group 'Performance / PC' 450 268 420 116
+$gModes = New-Group 'Souls Modes' 450 174 420 114
+$gPc  = New-Group 'Performance / PC' 450 294 420 90
 # Imagen: salida, reescalado, preset y nitidez.
 Move-To $lbOut $gImg 10 26 98
 Move-To $cmbOut $gImg 110 24 296
@@ -783,6 +905,57 @@ Move-To $cmbFg $gFg 12 24 396
 Move-To $chkUnlock $gFg 12 60 200
 $chkUnlock.Visible = $false  # (10-22) sin casilla: siempre desbloqueados salvo DLSS y modos Souls
 Move-To $chkAntiLag $gFg 222 60 186
+# (10-23 noche) Visible solo con NVIDIA: "Anti-Lag (experimental)" para la frame generation de AMD sin DLSS.
+$chkAntiLag.Text = 'Anti-Lag'
+# (10-23) Desplegable Anti-Lag: No / Anti-Lag (2 frames en cola) / Anti-Lag Ultra (1), en el sitio de la casilla.
+$cmbAl = New-Object System.Windows.Forms.ComboBox
+$cmbAl.DropDownStyle = 'DropDownList'; $cmbAl.Font = $smallFont
+# (10-24) AMD: Anti-Lag 2 de serie (por defecto), el nuestro, el nuestro Ultra o ninguno. NVIDIA: ninguno / el nuestro / Ultra.
+$script:alKey = if ($script:isAmd) { 'antilagamd' } else { 'antilagmode2' }
+$alItems = if ($script:isAmd) { @('Anti-Lag 2 (AMD)', 'Anti-Lag', 'Anti-Lag Ultra', 'Anti-Lag: off') } else { @('Anti-Lag: off', 'Anti-Lag', 'Anti-Lag Ultra') }
+foreach ($l in $alItems) { [void]$cmbAl.Items.Add($l) }
+$ai2 = if ($script:isAmd) { 0 } else { 1 }; [void][int]::TryParse((Get-IniValue $script:alKey "$ai2"), [ref]$ai2); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $ai2), $cmbAl.Items.Count - 1)
+$cmbAl.Add_SelectedIndexChanged({ if (-not $script:alLocked) { Set-IniValue $script:alKey "$($cmbAl.SelectedIndex)" } })
+$gFg.Controls.Add($cmbAl); $cmbAl.Location = $chkAntiLag.Location; $cmbAl.Size = New-Object System.Drawing.Size(186, 26)
+# (10-24) Con la frame generation de NVIDIA (DLSS-G) va siempre NVIDIA Reflex: se muestra para que se sepa.
+$lbReflex = New-Label 'Reflex: on (DLSS-G)' $smallFont ([System.Drawing.Color]::FromArgb(120, 210, 120)) 0 0 186 24
+$lbReflex.TextAlign = 'MiddleLeft'; $gFg.Controls.Add($lbReflex); $lbReflex.Location = $chkAntiLag.Location; $lbReflex.Visible = $false
+$tips.SetToolTip($lbReflex, 'NVIDIA frame generation (DLSS-G) always runs with NVIDIA Reflex on: lower latency automatically.')
+# (10-24) Con DLSS-G: elegir Reflex (por defecto) o nuestro Anti-Lag (Reflex apagado), para comparar.
+$cmbAlNv = New-Object System.Windows.Forms.ComboBox
+$cmbAlNv.DropDownStyle = 'DropDownList'; $cmbAlNv.Font = $smallFont
+foreach ($l in 'Reflex (NVIDIA)', 'Anti-Lag', 'Anti-Lag Ultra') { [void]$cmbAlNv.Items.Add($l) }
+$an = 0; [void][int]::TryParse((Get-IniValue 'antilagdlssg' '0'), [ref]$an); $cmbAlNv.SelectedIndex = [math]::Min([math]::Max(0, $an), 2)
+$cmbAlNv.Add_SelectedIndexChanged({ Set-IniValue 'antilagdlssg' "$($cmbAlNv.SelectedIndex)" })
+$gFg.Controls.Add($cmbAlNv); $cmbAlNv.Location = $chkAntiLag.Location; $cmbAlNv.Size = New-Object System.Drawing.Size(186, 26); $cmbAlNv.Visible = $false
+$tips.SetToolTip($cmbAlNv, 'With NVIDIA frame generation (DLSS-G). Reflex: NVIDIA''s (recommended). Anti-Lag / Ultra: ours with Reflex off, to compare which feels better. Without Reflex, DLSS-G may pace differently or warn that Reflex is missing.')
+# Solo se puede marcar con la frame generation de AMD (con la de NVIDIA ya va Reflex); fuera de ella se desmarca.
+function Update-AntiLagBox {
+	$cfgNow = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
+	$resSel = if ($script:resShown.Count) { $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)] } else { $null }
+	$ok = $cfgNow -like 'fsr3*' -or (Is-FixedFg)  # (10-23 noche) anti-lag propio: con la frame generation de AMD, cualquier reescalado
+	# (10-23) Modos Souls con FG fija: se ve marcada y gris cuando se activa sola (AMD siempre; NVIDIA con XeSS o FSR).
+	$autoAl = $false
+	if ($autoAl) { $chkAntiLag.Checked = $true; $chkAntiLag.Enabled = $false; $chkAntiLag.Visible = $true; $script:alAuto = $true; return }
+	if ($script:alAuto) { $chkAntiLag.Checked = $false; $script:alAuto = $false }
+	$chkAntiLag.Enabled = $true
+	if (-not $ok) { $chkAntiLag.Checked = $false }
+	$chkAntiLag.Visible = $false; $cmbAl.Visible = $ok
+	# (10-24) Modos Souls con FG fija (ligero, equilibrado, low profile): Anti-Lag Ultra siempre, sin poder cambiarlo.
+	if (Is-FixedFg) {
+		if (-not $script:alLocked) { $script:alLocked = $true; $cmbAl.SelectedIndex = 2 }
+		$cmbAl.Enabled = $false
+	} elseif ($script:alLocked) {
+		$script:alLocked = $false; $cmbAl.Enabled = $true
+		$v = if ($script:isAmd) { 0 } else { 1 }; [void][int]::TryParse((Get-IniValue $script:alKey "$v"), [ref]$v); $cmbAl.SelectedIndex = [math]::Min([math]::Max(0, $v), $cmbAl.Items.Count - 1)
+	}
+	$lbReflex.Visible = $false
+	$cmbAlNv.Visible = (-not $ok) -and $cfgNow -like 'dlss*'
+}
+$cmbFg.Add_SelectedIndexChanged({ Update-AntiLagBox })
+$cmbRes.Add_SelectedIndexChanged({ Update-AntiLagBox })
+$form.Add_Shown({ Update-AntiLagBox })
+$tips.SetToolTip($cmbAl, 'With AMD frame generation. Anti-Lag 2 (AMD): AMD GPUs'' built-in one. Anti-Lag: ours, at most 2 frames queued before reading the controller. Ultra: 1 (even less lag). The Souls light, balanced and low profile modes always use ours on Ultra.')
 # Calidad grafica: texturas, distancia, sombras, Luz RT y filtrado x16 ($script:gfxTop: etiqueta y desplegable de Texturas, Sombras, Distancia).
 Move-To $script:gfxTop[0] $gGfx 10 26 98; Move-To $cmbTex $gGfx 110 24 296
 Move-To $script:gfxTop[4] $gGfx 10 58 98; Move-To $cmbDist $gGfx 110 56 296
@@ -847,11 +1020,35 @@ Move-To $chkPc16 $gPc 12 24 190
 $chkSafeGpu.Visible = $false; $chkSafeGpu.Checked = $false
 Move-To $chkRam16 $gPc 12 54 190
 Move-To $chkVram8 $gPc 202 54 206
+# (10-24) PCs de 20 GB de RAM o menos (o con "Simular 16 GB RAM"): el perfil seguro de 16 GB solo (la casilla del equipo
+# de 16 GB marcada y fija, KYTY_LOWRAM=1) y un aviso de una linea. Lo que el usuario tenia marcado se guarda aparte: al
+# quitar la simulacion vuelve tal cual (mientras esta forzada la casilla escribe en otra clave del ini).
+function Test-LowRam { return ($chkRam16.Checked -or ($script:ramGB -gt 0 -and $script:ramGB -le 20)) }
+$script:pc16User = $chkPc16.Checked
+$lbRamNote = New-Label '' (New-Object System.Drawing.Font('Segoe UI', 8.25)) $gold 0 0 212 34
+$panel.Controls.Add($lbRamNote)
+Move-To $lbRamNote $gPc 202 19 212  # (hasta dos lineas cortas, sin tapar la fila de abajo)
+$tips.SetToolTip($lbRamNote, 'With 16 GB of RAM the game is tight on memory: the launcher uses the safe 16 GB profile (less kept in RAM, resolution unchanged). Close your browser (Chrome, Edge, Firefox), Discord and other launchers before playing.')
+function Update-LowRam {
+	if (Test-LowRam) {
+		if ($chkPc16.Enabled) { $script:pc16User = $chkPc16.Checked }
+		$chkPc16.Tag = 'pc16forced'; $chkPc16.Checked = $true; $chkPc16.Enabled = $false
+		$ramTxt = if ($chkRam16.Checked) { '16 GB (simulated)' } else { "$($script:ramGB) GB" }
+		$lbRamNote.Text = "RAM $($ramTxt): safe profile. Close browsers"
+		$lbRamNote.Visible = $true
+	} else {
+		if (-not $chkPc16.Enabled) { $chkPc16.Enabled = $true; $chkPc16.Checked = [bool]$script:pc16User; $chkPc16.Tag = 'pc16' }
+		$lbRamNote.Visible = $false
+	}
+}
+Update-LowRam
+$chkRam16.Add_CheckedChanged({ Update-LowRam })
 # (10-23) Optimizacion tarjetas de 8 GB: texturas bajo, distancia y sombras medio (7,4 -> 6,3 GB de VRAM, tirones 26% -> 4%).
 $chkGpu8 = New-Check '8 GB GPU optimization' 0 0 206 'gpu8opt'
 $tips.SetToolTip($chkGpu8, '8 GB GPUs: sets textures to Low and distance and shadows to Medium so the game fits in the GPU memory.')
 $panel.Controls.Add($chkGpu8)
 Move-To $chkGpu8 $gPc 202 24 206
+$chkGpu8.Visible = $false; $chkGpu8.Checked = $false  # (10-23) retirada: hacia lo mismo que los graficos del Modo Souls ligero
 # (10-23) Presets: Souls ligero = Optimizacion 8 GB (texturas bajo, distancia y sombras medio, Luz RT no, Detail Normal,
 # Oclusion Normal); Souls equilibrado (todo Maximo, Luz RT no, Detail High, Oclusion Alta). Al quitarlos: todo Maximo.
 function Set-PresetLight { $cmbTex.SelectedIndex = 3; $cmbDist.SelectedIndex = 2; $cmbShadow.SelectedIndex = 2; $cmbRt.SelectedIndex = 0; $cmbDet.SelectedIndex = 3; $cmbAo.SelectedIndex = 1; $cmbAaS.SelectedIndex = 1; $cmbFade.SelectedIndex = 2; $cmbRefl.SelectedIndex = 2 }
@@ -861,23 +1058,58 @@ $chkSoulsUltra = New-Check 'Souls Ultra mode' 0 0 186 'soulsultra'
 $tips.SetToolTip($chkSoulsUltra, 'For RTX 5060 / 5060 Ti / 5070 / 5070 Ti and RX 9070 / 9070 XT: everything maxed, Detail Very High, RT Light and Occlusion on High. FPS depends on how powerful your GPU and CPU are.')
 $panel.Controls.Add($chkSoulsUltra); Move-To $chkSoulsUltra $gModes 12 54 186
 $chkSoulsExt = New-Check 'Souls Extreme mode' 0 0 206 'soulsext'
-$tips.SetToolTip($chkSoulsExt, 'For Souls addicts. RTX 5080, RTX 5090 or better: absolutely everything maxed (Ultra on everything, x16 filtering and sharp textures). FPS depends on how powerful your GPU and CPU are.')
+$tips.SetToolTip($chkSoulsExt, 'For Souls addicts. RTX 5080, RTX 5090 or better: the game''s 4K cinematic mode and absolutely everything maxed (Ultra on everything, x16 filtering and sharp textures). FPS depends on how powerful your GPU and CPU are.')
 $panel.Controls.Add($chkSoulsExt); Move-To $chkSoulsExt $gModes 202 54 206
-function Set-PresetUltra { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex = 0; $cmbShadow.SelectedIndex = 0; $cmbDet.SelectedIndex = 1; $cmbRt.SelectedIndex = 2; $cmbAo.SelectedIndex = 2; $cmbRefl.SelectedIndex = 1; $cmbFade.SelectedIndex = 1; $cmbAaS.SelectedIndex = 2 }
-function Set-PresetExtreme { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex = 0; $cmbShadow.SelectedIndex = 0; $cmbDet.SelectedIndex = 0; $cmbRt.SelectedIndex = 3; $cmbAo.SelectedIndex = 3; $cmbRefl.SelectedIndex = 0; $cmbFade.SelectedIndex = 0; $cmbAaS.SelectedIndex = 0; $chkAf16.Checked = $true }
-$script:soulsModes = @($chkLowEnd, $chkLowEnd45, $chkSoulsUltra, $chkSoulsExt)
+function Set-PresetUltra { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex = 0; $cmbShadow.SelectedIndex = 0; $cmbDet.SelectedIndex = 1; $cmbRt.SelectedIndex = 2; $cmbAo.SelectedIndex = 2; $cmbRefl.SelectedIndex = 1; $cmbFade.SelectedIndex = 1; $cmbAaS.SelectedIndex = 0 }  # (10-23) nitidez del AA al maximo (no cuesta)
+function Set-PresetExtreme { $cmbTex.SelectedIndex = 0; $cmbDist.SelectedIndex = 0; $cmbShadow.SelectedIndex = 0; $cmbDet.SelectedIndex = 0; $cmbRt.SelectedIndex = 3; $cmbAo.SelectedIndex = 3; $cmbRefl.SelectedIndex = 0; $cmbFade.SelectedIndex = 0; $cmbAaS.SelectedIndex = 0; $chkAf16.Checked = $true; $chkLod.Checked = $true
+	if ($cmbOut) { $cmbOut.SelectedIndex = 1 }; $chk4K.Checked = $true }  # (10-23) extremo: modo cinematico del juego a 4K
+# (10-23) Modo Souls PC low profile: 900p y todo en bajo, para PCs modestos.
+$chkSoulsLow = New-Check 'Souls PC low profile (900p, all low)' 0 0 396 'soulslow'
+$tips.SetToolTip($chkSoulsLow, 'For modest PCs: 30 real FPS with AMD frame generation x2 (60 on screen), the game at 900p upscaled with FSR (50 % sharpness) with every graphics option on low (textures, distance, shadows, detail, reflections, objects and sharpness). Unticking it puts everything back to Max and 1440p.')
+$panel.Controls.Add($chkSoulsLow); Move-To $chkSoulsLow $gModes 12 84 396
+function Set-ResByName([string]$name) {
+	for ($i = 0; $i -lt $script:resShown.Count; $i++) { if ($script:resShown[$i][0] -eq $name) { $cmbRes.SelectedIndex = $i; Set-IniValue 'scalelabel' $name; return } }
+}
+function Set-PresetLowProfile {
+	$cmbTex.SelectedIndex = 3; $cmbDist.SelectedIndex = 3; $cmbShadow.SelectedIndex = 3; $cmbDet.SelectedIndex = 4
+	$cmbRefl.SelectedIndex = 3; $cmbFade.SelectedIndex = 3; $cmbAaS.SelectedIndex = 3; $cmbRt.SelectedIndex = 0; $cmbAo.SelectedIndex = 0
+	# (10-23) Lo que casi no cuesta, al maximo: filtrado x16, texturas nitidas y el postprocesado del juego.
+	$chkAf16.Checked = $true; $chkLod.Checked = $true
+	foreach ($pc in @($script:postChecks)) { if ($pc -and $pc[0]) { $pc[0].Checked = $true } }
+	if ($cmbOut) { $cmbOut.SelectedIndex = 0 }; $chk4K.Checked = $false
+	Fill-Res; Set-ResByName 'FSR AA native'
+	$cmbSharp.SelectedIndex = 3  # (10-23) FSR con nitidez al 50 %, fija
+}
+$script:soulsModes = @($chkLowEnd, $chkLowEnd45, $chkSoulsUltra, $chkSoulsExt, $chkSoulsLow)
+$chkSoulsLow.Add_CheckedChanged({
+	if ($chkSoulsLow.Checked) { foreach ($o in $script:soulsModes) { if ($o -ne $chkSoulsLow -and $o.Checked) { $o.Checked = $false } }; Set-PresetLowProfile }
+	else { if (-not (@($script:soulsModes | Where-Object { $_.Checked }).Count)) { Set-PresetMax }; Fill-Res; Set-ResByName '1440p native' }
+})
 foreach ($m in @($chkSoulsUltra, $chkSoulsExt)) {
 	$m.Add_CheckedChanged({ param($sender, $e)
 		if ($sender.Checked) {
 			foreach ($o in $script:soulsModes) { if ($o -ne $sender -and $o.Checked) { $o.Checked = $false } }
 			if ($sender -eq $chkSoulsExt) { Set-PresetExtreme } else { Set-PresetUltra }
-		} elseif (-not (@($script:soulsModes | Where-Object { $_.Checked }).Count)) { Set-PresetMax }
+		} elseif (-not (@($script:soulsModes | Where-Object { $_.Checked }).Count)) { Set-PresetMax; if ($sender -eq $chkSoulsExt -and $cmbOut -and $cmbOut.SelectedIndex -eq 1) { $cmbOut.SelectedIndex = 0; $chk4K.Checked = $false } }
 	})
 }
-foreach ($m in @($chkLowEnd, $chkLowEnd45)) { $m.Add_CheckedChanged({ param($sender, $e) if ($sender.Checked) { $chkSoulsUltra.Checked = $false; $chkSoulsExt.Checked = $false } }) }
+foreach ($m in @($chkLowEnd, $chkLowEnd45)) { $m.Add_CheckedChanged({ param($sender, $e) if ($sender.Checked) { $chkSoulsUltra.Checked = $false; $chkSoulsExt.Checked = $false; $chkSoulsLow.Checked = $false } }) }
 $chkGpu8.Add_CheckedChanged({ if ($chkGpu8.Checked) { Set-PresetLight } else { Set-PresetMax } })
+# (10-23) Modo Souls ligero y PC low profile: resolucion fija (no se puede cambiar el reescalado).
+function Update-ResLock { $lock = $false;  # (10-23) low profile: el AA se elige (solo modos AA a 900)
+ if ($lock -and $chkLowEnd.Checked) { Set-ResByName 'No upscaling (1080p native)' }; $cmbRes.Enabled = -not $lock 
+	# (10-23) PC low profile: todo fijo (salida, graficos y casillas), nada se puede cambiar.
+	$low = $chkSoulsLow.Checked
+	$cmbFg.Enabled = -not (Is-FixedFg)  # (10-23) ligero / equilibrado / low profile: FG fija (antes esta funcion la volvia a activar)
+	if ($cmbOut) { $cmbOut.Enabled = -not (Is-FixedFg) }
+	foreach ($c in @($cmbSharp, $cmbTex, $cmbDist, $cmbShadow, $cmbDet, $cmbRefl, $cmbFade, $cmbAaS, $cmbRt, $cmbAo, $chkAf16, $chkLod)) { if ($c) { $c.Enabled = -not $low } }
+	foreach ($p in @($script:postChecks)) { if ($p -and $p[0]) { $p[0].Enabled = -not $low } }
+}
+$chkLowEnd.Add_CheckedChanged({ Update-ResLock })
+$chkSoulsLow.Add_CheckedChanged({ Update-ResLock; Update-LowEnd; Update-AntiLagBox })
+$form.Add_Shown({ Update-ResLock; Update-LowEnd })
 $chkLowEnd.Add_CheckedChanged({ if ($chkLowEnd.Checked) { Set-PresetLight } elseif (-not $chkLowEnd45.Checked) { Set-PresetMax } })
-$chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { Set-PresetMax; $cmbTex.SelectedIndex = 1; $cmbDist.SelectedIndex = 1; $cmbShadow.SelectedIndex = 1; $cmbRt.SelectedIndex = 0; $cmbAo.SelectedIndex = 2 } elseif (-not $chkLowEnd.Checked) { Set-PresetMax } })
+$chkLowEnd45.Add_CheckedChanged({ if ($chkLowEnd45.Checked) { Set-PresetMax; $cmbTex.SelectedIndex = 1; $cmbDist.SelectedIndex = 1; $cmbShadow.SelectedIndex = 1; $cmbRt.SelectedIndex = 0; $cmbAo.SelectedIndex = 2; $cmbAaS.SelectedIndex = 1 } elseif (-not $chkLowEnd.Checked) { Set-PresetMax } })
 Move-To $chkTurbo2 $gPc 202 54 206
 $chkStore = New-Check 'Smaller PS5 memory reserve (12 GB)' 0 0 396 'guest12'
 $tips.SetToolTip($chkStore, 'Reserves 12 GB for the PS5 memory instead of 13.8 GB (the game uses about 10.7 at most). Helps on 16 GB PCs. If the game closes with a memory warning, untick it.')
@@ -885,9 +1117,17 @@ $chkStore.Visible = $false; $chkStore.Checked = $false
 $chkRamOpt.Visible = $false
 # Pantalla y otros: HDR, VSync, Metricas en una fila (pantalla exclusiva, Modo 4K, Preset C y G-Sync siguen ocultas,
 # en el mismo sitio: no se ven).
-Move-To $chkHdr $gScr 12 24 120
-Move-To $chkVsync $gScr 142 24 120
-Move-To $chkMetricas $gScr 272 24 136
+Move-To $chkHdr $gScr 12 24 72
+Move-To $chkVsync $gScr 88 24 84
+Move-To $chkMetricas $gScr 176 24 100
+# (10-23) Monitores panoramicos: el 3D a 21:9 o 32:9 (run-windows -Aspect; con DLSS / XeSS / FSR la salida es ancha).
+$cmbAspect = New-Object System.Windows.Forms.ComboBox
+$cmbAspect.DropDownStyle = 'DropDownList'; $cmbAspect.Font = $smallFont
+foreach ($l in 'Monitor 16:9', 'Monitor 21:9', 'Monitor 32:9') { [void]$cmbAspect.Items.Add($l) }
+$ai = 0; [void][int]::TryParse((Get-IniValue 'aspect' '0'), [ref]$ai); $cmbAspect.SelectedIndex = [math]::Min([math]::Max(0, $ai), 2)
+$cmbAspect.Add_SelectedIndexChanged({ Set-IniValue 'aspect' "$($cmbAspect.SelectedIndex)" })
+$tips.SetToolTip($cmbAspect, 'Ultrawide monitors: the game is rendered at 21:9 or 32:9 instead of stretched. Works with DLSS, XeSS and FSR. Movies and some menus look stretched.')
+$gScr.Controls.Add($cmbAspect); $cmbAspect.Location = New-Object System.Drawing.Point(280, 21); $cmbAspect.Size = New-Object System.Drawing.Size(130, 26)
 Move-To $chkExcl $gScr 12 24 120
 Move-To $chk4K $gScr 142 24 120
 Move-To $chkPresetC $gScr 272 24 136
@@ -942,14 +1182,21 @@ public static class PadSdl {
 }
 "@
 }
+# (10-23) Lo que hace cada control en Demon's Souls (para el mapeo).
+$script:padAction = @{
+	'R1' = 'Attack'; 'R2' = 'Strong attack'; 'L1' = 'Block'; 'L2' = 'Parry'; 'L3' = 'Left stick click'; 'R3' = 'Lock on'
+	'Cross' = 'Interact'; 'Circle' = 'Roll / run'; 'Square' = 'Use item'; 'Triangle' = 'Two-hand weapon'
+	'Up' = 'Switch spell'; 'Down' = 'Switch item'; 'Left' = 'Left-hand weapon'; 'Right' = 'Right-hand weapon'
+	'Options' = 'Menu'; 'TouchPad' = 'Gestures'
+}
 $script:padGlyph = @{
 	'Cross' = [string][char]0x2715; 'Circle' = [string][char]0x25CB; 'Triangle' = [string][char]0x25B3; 'Square' = [string][char]0x25A1
 	'L1' = 'L1'; 'R1' = 'R1'; 'L2' = 'L2'; 'R2' = 'R2'; 'L3' = 'L3'; 'R3' = 'R3'; 'Options' = 'Options'; 'TouchPad' = 'Touchpad'
 	'Up' = [string][char]0x25B2; 'Down' = [string][char]0x25BC; 'Left' = [string][char]0x25C0; 'Right' = [string][char]0x25B6; 'None' = '-'
 }
 $script:xbLabel = @{
-	'a' = 'A'; 'b' = 'B'; 'x' = 'X'; 'y' = 'Y'; 'leftshoulder' = 'LB'; 'rightshoulder' = 'RB'; 'lefttrigger' = 'LT'; 'righttrigger' = 'RT'
-	'leftstick' = 'LS'; 'rightstick' = 'RS'; 'start' = 'Start'; 'back' = 'Select'
+	'a' = "A $([char]0x2715)"; 'b' = "B $([char]0x25CB)"; 'x' = "X $([char]0x25A1)"; 'y' = "Y $([char]0x25B3)"; 'leftshoulder' = 'LB / L1'; 'rightshoulder' = 'RB / R1'; 'lefttrigger' = 'LT / L2'; 'righttrigger' = 'RT / R2'
+	'leftstick' = 'LS L3'; 'rightstick' = 'RS R3'; 'start' = 'Start'; 'back' = 'Select'
 	'dpup' = [string][char]0x25B2; 'dpdown' = [string][char]0x25BC; 'dpleft' = [string][char]0x25C0; 'dpright' = [string][char]0x25B6
 }
 $script:xbSources = @('a', 'b', 'x', 'y', 'leftshoulder', 'rightshoulder', 'lefttrigger', 'righttrigger', 'leftstick', 'rightstick', 'start', 'back', 'dpup', 'dpdown', 'dpleft', 'dpright')
@@ -1029,7 +1276,7 @@ function Show-PadMapper {
 	$script:pmRectPs = @{}; $script:pmRectXb = @{}
 	$script:pmAll = (Get-IniValue 'padlines' '0') -eq '1'
 
-	$info = New-Label '1. Click a button on the PlayStation controller (left).   2. Press the button on your controller or click the one on the right.' $smallFont $gold 12 8 1220 24
+	$info = New-Label 'Step 1: click the game button you want to move (left).   Step 2: press that button on your controller, or click it on the right.   Gold arrows are your changes.' $smallFont $gold 12 8 1220 24
 	$tPad.Controls.Add($info)
 	$canvas = New-Object System.Windows.Forms.PictureBox
 	$canvas.Location = New-Object System.Drawing.Point(8, 36); $canvas.Size = New-Object System.Drawing.Size(1236, 500); $canvas.BackColor = $back
@@ -1054,6 +1301,32 @@ function Show-PadMapper {
 		'dpup' = @(190, 198, 30, 30, 'r'); 'dpdown' = @(190, 258, 30, 30, 'r'); 'dpleft' = @(160, 228, 30, 30, 'r'); 'dpright' = @(220, 228, 30, 30, 'r')
 		'y' = @(384, 112, 34, 34, 'c'); 'a' = @(384, 182, 34, 34, 'c'); 'x' = @(349, 147, 34, 34, 'c'); 'b' = @(419, 147, 34, 34, 'c')
 		'back' = @(206, 138, 52, 18, 'r'); 'start' = @(282, 138, 52, 18, 'r') }
+	# (10-23) Fotos propias de los mandos (mando-ps5.png / mando-8bitdo.png junto al launcher; no van en la release):
+	# los botones se colocan sobre la foto (centros medidos en la foto a 350 de alto).
+	$script:pmPhotoPs = $null; $script:pmPhotoXb = $null
+	try {
+		$fp = Join-Path $root 'mando-ps5.png'; if (Test-Path -LiteralPath $fp) { $script:pmPhotoPs = [System.Drawing.Image]::FromFile($fp) }
+		$fx = Join-Path $root 'mando-8bitdo.png'; if (Test-Path -LiteralPath $fx) { $script:pmPhotoXb = [System.Drawing.Image]::FromFile($fx) }
+	} catch { $script:pmPhotoPs = $null; $script:pmPhotoXb = $null }
+	$photoTop = 84
+	if ($script:pmPhotoPs) {
+		# (10-24) Dibujo del mando (sin logos, va en la release), 350 de alto: centros medidos en el.
+		$k = 1.0; $offX = (540 - $script:pmPhotoPs.Width) / 2
+		$c = @{ 'Up' = @(96, 62, 29); 'Down' = @(96, 126, 29); 'Left' = @(65, 93, 29); 'Right' = @(128, 93, 29)
+			'Triangle' = @(435, 60, 38); 'Circle' = @(472, 94, 38); 'Cross' = @(435, 131, 38); 'Square' = @(398, 94, 38)
+			'L3' = @(178, 160, 67); 'R3' = @(346, 160, 67); 'Options' = @(389, 32, 20); 'TouchPad' = @(265, 52, 150) }
+		foreach ($n in $c.Keys) { $v = $c[$n]; $d = $v[2] * $k; $h = if ($n -eq 'TouchPad') { 80 * $k } else { $d }
+			$ps[$n] = @(($offX + $v[0] * $k - $d / 2), ($photoTop + $v[1] * $k - $h / 2), $d, $h, $(if ($n -eq 'TouchPad') { 'r' } else { 'c' })) }
+	}
+	if ($script:pmPhotoXb) {
+		$k = 1.0; $offX = (540 - $script:pmPhotoXb.Width) / 2
+		$c = @{ 'y' = @(416, 58, 38); 'x' = @(377, 95, 38); 'b' = @(456, 95, 38); 'a' = @(416, 132, 38)
+			'leftstick' = @(125, 86, 72); 'rightstick' = @(339, 156, 72)
+			'dpup' = @(193, 140, 25); 'dpdown' = @(193, 192, 25); 'dpleft' = @(167, 166, 25); 'dpright' = @(219, 166, 25)
+			'back' = @(226, 89, 22); 'start' = @(312, 89, 22) }
+		foreach ($n in $c.Keys) { $v = $c[$n]; $d = $v[2] * $k
+			$xb[$n] = @(($offX + $v[0] * $k - $d / 2), ($photoTop + $v[1] * $k - $d / 2), $d, $d, 'c') }
+	}
 	$script:pmPsDef = $ps; $script:pmXbDef = $xb
 	$psX = 30; $xbX = 690; $padY = 60
 	foreach ($k in $ps.Keys) { $v = $ps[$k]; $script:pmRectPs[$k] = New-Object System.Drawing.RectangleF(($psX + $v[0]), ($padY + $v[1]), $v[2], $v[3]) }
@@ -1079,16 +1352,32 @@ function Show-PadMapper {
 		}
 		$bodyFill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(34, 38, 50))
 		$bodyPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, 222, 196, 140), 2)
-		# Cuerpos genericos: un rectangulo redondeado con dos empunaduras.
+		# (10-23) Silueta de mando con empunaduras (dibujada; un contorno continuo) y gatillos detras.
+		$trigFill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(26, 29, 38))
 		foreach ($ox in $psX, $xbX) {
-			$body = & $rr ($ox + 40) ($padY + 84) 460 200 70
-			$g.FillEllipse($bodyFill, ($ox + 44), ($padY + 200), 150, 190); $g.DrawEllipse($bodyPen, ($ox + 44), ($padY + 200), 150, 190)
-			$g.FillEllipse($bodyFill, ($ox + 346), ($padY + 200), 150, 190); $g.DrawEllipse($bodyPen, ($ox + 346), ($padY + 200), 150, 190)
-			$g.FillPath($bodyFill, $body); $g.DrawPath($bodyPen, $body)
+			$oy = $padY
+			$photo = if ($ox -eq $psX) { $script:pmPhotoPs } else { $script:pmPhotoXb }
+			if ($photo) {
+				foreach ($tx in ($ox + 70), ($ox + 340)) { $tp = & $rr $tx ($oy + 10) 130 74 26; $g.FillPath($trigFill, $tp); $g.DrawPath($bodyPen, $tp); $tp.Dispose() }
+				$g.DrawImage($photo, [float]($ox + (540 - $photo.Width) / 2), [float]($oy + 84), [float]$photo.Width, [float]$photo.Height)
+				continue
+			}
+			foreach ($tx in ($ox + 70), ($ox + 340)) { $tp = & $rr $tx ($oy + 10) 130 90 26; $g.FillPath($trigFill, $tp); $g.DrawPath($bodyPen, $tp); $tp.Dispose() }
+			$body = New-Object System.Drawing.Drawing2D.GraphicsPath
+			$pts = @(@(110, 84), @(160, 76), @(380, 76), @(430, 84), @(480, 92), @(505, 120), @(512, 170), @(525, 250), @(540, 330), @(520, 375),
+				@(505, 405), @(460, 410), @(440, 385), @(420, 360), @(400, 310), @(370, 295), @(330, 285), @(210, 285), @(170, 295),
+				@(140, 310), @(120, 360), @(100, 385), @(80, 410), @(35, 405), @(20, 375), @(0, 330), @(15, 250), @(28, 170),
+				@(35, 120), @(60, 92), @(110, 84))
+			$pf = New-Object 'System.Drawing.PointF[]' $pts.Count
+			for ($q = 0; $q -lt $pts.Count; $q++) { $pf[$q] = New-Object System.Drawing.PointF(($ox + $pts[$q][0]), ($oy + $pts[$q][1])) }
+			$body.AddBeziers($pf); $body.CloseFigure()
+			$g.FillPath($bodyFill, $body); $g.DrawPath($bodyPen, $body); $body.Dispose()
 		}
+		$trigFill.Dispose()
 		$tb = New-Object System.Drawing.SolidBrush($gold)
-		$g.DrawString('Game controller (PS5)', $script:pmFontTitle, $tb, ($psX + 270), 22, $center)
-		$g.DrawString('Your controller (8BitDo / Xbox)', $script:pmFontTitle, $tb, ($xbX + 270), 22, $center)
+		$g.DrawString('1. Game button (PS5 controller)', $script:pmFontTitle, $tb, ($psX + 270), 22, $center)
+		$g.DrawString('2. Your controller (Xbox, 8BitDo or DualSense)', $script:pmFontTitle, $tb, ($xbX + 270), 22, $center)
+		$g.DrawString([string][char]0x2192, $script:pmFontTitle, $tb, 630, 22, $center)
 		$g.FillEllipse($bodyFill, ($xbX + 250), ($padY + 96), 40, 40)
 		$g.DrawEllipse($bodyPen, ($xbX + 250), ($padY + 96), 40, 40)
 		$dim = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(120, 120, 120))
@@ -1099,7 +1388,13 @@ function Show-PadMapper {
 			'Triangle' = [System.Drawing.Color]::FromArgb(80, 220, 170); 'Square' = [System.Drawing.Color]::FromArgb(240, 130, 210)
 			'y' = [System.Drawing.Color]::FromArgb(240, 210, 80); 'a' = [System.Drawing.Color]::FromArgb(110, 210, 110); 'x' = [System.Drawing.Color]::FromArgb(100, 160, 255); 'b' = [System.Drawing.Color]::FromArgb(255, 100, 100) }
 		$drawBtn = {
-			param($name, $rect, $shape, $text, $hot, $faded)
+			param($name, $rect, $shape, $text, $hot, $faded, $onPhoto)
+			if ($onPhoto) {
+				$ring = New-Object System.Drawing.Pen($(if ($hot) { [System.Drawing.Color]::FromArgb(255, 236, 200, 120) } else { [System.Drawing.Color]::FromArgb(110, 236, 200, 120) }), $(if ($hot) { 4 } else { 2 }))
+				if ($hot) { $hb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(110, 236, 200, 120)); if ($shape -eq 'c') { $g.FillEllipse($hb, $rect) } else { $g.FillRectangle($hb, $rect) }; $hb.Dispose() }
+				if ($shape -eq 'c') { $g.DrawEllipse($ring, $rect) } else { $g.DrawRectangle($ring, $rect.X, $rect.Y, $rect.Width, $rect.Height) }
+				$ring.Dispose(); return
+			}
 			$fill = if ($hot) { [System.Drawing.Color]::FromArgb(222, 196, 140) } elseif ($faded) { [System.Drawing.Color]::FromArgb(40, 44, 54) } else { [System.Drawing.Color]::FromArgb(58, 64, 80) }
 			$br = New-Object System.Drawing.SolidBrush($fill)
 			$pen = New-Object System.Drawing.Pen($(if ($hot) { [System.Drawing.Color]::White } else { [System.Drawing.Color]::FromArgb(110, 110, 100) }), $(if ($hot) { 2 } else { 1 }))
@@ -1127,13 +1422,29 @@ function Show-PadMapper {
 			$g.DrawBezier($pen, $x1, $y1, ($x1 - 160), ($y1 - 60), ($x2 + 160), ($y2 - 60), $x2, $y2)
 			$pen.Dispose()
 		}
+		# (10-23) Que hace cada control en Demon's Souls: los gatillos al lado, el resto al pasar el raton (abajo).
+		$capBr = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(190, 190, 180))
+		$capL = New-Object System.Drawing.StringFormat; $capL.Alignment = 'Far'; $capL.LineAlignment = 'Center'
+		$capR = New-Object System.Drawing.StringFormat; $capR.Alignment = 'Near'; $capR.LineAlignment = 'Center'
+		foreach ($k in 'L1', 'L2') { $r = $script:pmRectPs[$k]; $g.DrawString($script:padAction[$k], $script:pmFontTiny, $capBr, (New-Object System.Drawing.RectangleF(($r.X - 82), $r.Y, 78, $r.Height)), $capL) }
+		foreach ($k in 'R1', 'R2') { $r = $script:pmRectPs[$k]; $g.DrawString($script:padAction[$k], $script:pmFontTiny, $capBr, (New-Object System.Drawing.RectangleF(($r.Right + 4), $r.Y, 90, $r.Height)), $capR) }
+		$focus = if ($script:pmSel) { $script:pmSel } elseif ($script:pmHover -and $script:pmRectPs.ContainsKey($script:pmHover)) { $script:pmHover } elseif ($script:pmHover) { $script:pmMap[$script:pmHover] } else { $null }
+		if ($focus -and $script:padAction.ContainsKey($focus)) {
+			$cap = "$($script:padGlyph[$focus])  =  $($script:padAction[$focus])"
+			$cb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(230, 40, 34, 22))
+			$cr = if ($script:pmPhotoPs) { New-Object System.Drawing.RectangleF(($psX + 110), ($padY + 84 + 290), 320, 30) } else { New-Object System.Drawing.RectangleF(($psX + 110), ($padY + 410), 320, 30) }
+			$g.FillRectangle($cb, $cr); $g.DrawString($cap, $script:pmFontTitle, $tb, $cr, $center); $cb.Dispose()
+		}
+		$capBr.Dispose()
 		foreach ($k in $script:pmRectPs.Keys) {
 			$hot = ($script:pmSel -eq $k) -or ($script:pmHover -eq $k)
-			& $drawBtn $k $script:pmRectPs[$k] $script:pmPsDef[$k][4] $script:padGlyph[$k] $hot (-not $used.ContainsKey($k))
+			$onP = $script:pmPhotoPs -and $k -notin 'L1', 'L2', 'R1', 'R2'
+			& $drawBtn $k $script:pmRectPs[$k] $script:pmPsDef[$k][4] $script:padGlyph[$k] $hot (-not $used.ContainsKey($k)) $onP
 		}
 		foreach ($k in $script:pmRectXb.Keys) {
 			$hot = ($script:pmHover -eq $k) -or ($script:pmFlash -eq $k) -or ($script:pmSel -and $script:pmMap[$k] -eq $script:pmSel)
-			& $drawBtn $k $script:pmRectXb[$k] $script:pmXbDef[$k][4] $script:xbLabel[$k] $hot $false
+			$onP = $script:pmPhotoXb -and $k -notin 'leftshoulder', 'rightshoulder', 'lefttrigger', 'righttrigger'
+			& $drawBtn $k $script:pmRectXb[$k] $script:pmXbDef[$k][4] $script:xbLabel[$k] $hot $false $onP
 			# Insignia con el control de PS5 que hace este boton.
 			$r = $script:pmRectXb[$k]; $t = $script:pmMap[$k]
 			$bb = New-Object System.Drawing.RectangleF(($r.Right - 6), ($r.Y - 12), 40, 18)
@@ -1161,7 +1472,7 @@ function Show-PadMapper {
 		# Intercambio: el boton que tenia este control se queda con el que tenia el nuevo (nada se queda sin hacer).
 		foreach ($k in @($script:pmMap.Keys)) { if ($k -ne $src -and $script:pmMap[$k] -eq $script:pmSel) { $script:pmMap[$k] = $old } }
 		$script:pmMap[$src] = $script:pmSel
-		$status.Text = "Done: game $($script:padGlyph[$script:pmSel]) = $($script:xbLabel[$src]) button on your controller."
+		$status.Text = "Done: game $($script:padGlyph[$script:pmSel]) ($($script:padAction[$script:pmSel])) = $($script:xbLabel[$src]) button on your controller."
 		$script:pmFlash = $src; $script:pmSel = $null
 		$canvas.Invalidate()
 	}
@@ -1177,7 +1488,7 @@ function Show-PadMapper {
 		if (-not $h) { $script:pmSel = $null; $status.Text = ''; $canvas.Invalidate(); return }
 		if ($h[0] -eq 'ps') {
 			$script:pmSel = $h[1]; $script:pmFlash = $null
-			$status.Text = "Selected $($script:padGlyph[$h[1]]). Now press the button on your controller (or click the one on the right)."
+			$status.Text = "Selected $($script:padGlyph[$h[1]]) ($($script:padAction[$h[1]])). Now press the button on your controller (or click the one on the right)."
 			$canvas.Invalidate()
 		} else { & $script:pmAssign $h[1] }
 	})
@@ -1202,7 +1513,9 @@ function Show-PadMapper {
 			if ($v -lt 0) { continue }
 			$names += "XInput $($i + 1)"
 			$prev = if ($script:pmXiPrev.ContainsKey($i)) { $script:pmXiPrev[$i] } else { $v }
-			foreach ($bit in $script:xiBits.Keys) { if ((($v -band $bit) -ne 0) -and (($prev -band $bit) -eq 0)) { $pressed = $script:xiBits[$bit] } }
+			# (10-23) Por pares clave/valor: un diccionario [ordered] indexado con un numero devuelve por POSICION (0x1000 = A
+			# daba nada y la cruceta daba botones cambiados): solo funcionaba la cruceta.
+			foreach ($kv in $script:xiBits.GetEnumerator()) { $bit = [int]$kv.Key; if ((($v -band $bit) -ne 0) -and (($prev -band $bit) -eq 0)) { $pressed = $kv.Value } }
 			$script:pmXiPrev[$i] = $v
 		}
 		if ($script:pmSdlOk) {
@@ -1260,6 +1573,7 @@ function Show-PadMapper {
 		}
 		if ($sel -ge 0 -and $sel -lt $lv.Items.Count) { $lv.Items[$sel].Selected = $true }
 		$lv.EndUpdate()
+		if ($mouseBox) { $mouseBox.Invalidate() }
 	}
 	& $script:pmFillLv
 	$cap = New-Object System.Windows.Forms.Button
@@ -1273,6 +1587,61 @@ function Show-PadMapper {
 	$btnClear = New-Button 'Clear key' 960 250 270 44 $false; $btnClear.Font = $boldSmall
 	$tKbm.Controls.Add($btnChange); $tKbm.Controls.Add($btnClear)
 	$tKbm.Controls.Add((New-Label ("Mouse: moves the camera (right stick). Shift + click: strong attacks (R2 / L2).`nIn game: Esc releases the mouse and a click captures it again. F7 also releases or captures it.`nSensitivity and anti-deadzone are in the launcher (Controls section).") $smallFont ([System.Drawing.Color]::FromArgb(190, 190, 190)) 670 310 560 90 'TopLeft'))
+	# (10-23) Dibujo del raton con lo que hace cada boton (se actualiza al cambiar la lista).
+	$mouseBox = New-Object System.Windows.Forms.PictureBox
+	$mouseBox.Location = New-Object System.Drawing.Point(670, 404); $mouseBox.Size = New-Object System.Drawing.Size(560, 236); $mouseBox.BackColor = $back
+	$tKbm.Controls.Add($mouseBox)
+	$mouseBox.Add_Paint({
+		param($s, $e)
+		$g = $e.Graphics; $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+		$g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+		$fill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(34, 38, 50))
+		$btnFill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(58, 64, 80))
+		$pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, 222, 196, 140), 2)
+		$thin = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(120, 222, 196, 140), 1)
+		$gold2 = New-Object System.Drawing.SolidBrush($gold); $txt = New-Object System.Drawing.SolidBrush($ink)
+		$f1 = New-Object System.Drawing.Font('Segoe UI Semibold', 9, [System.Drawing.FontStyle]::Bold); $f2 = New-Object System.Drawing.Font('Segoe UI Symbol', 9)
+		# Cuerpo: dos arcos y la base redondeada; botones izquierdo y derecho, rueda y dos laterales.
+		$mphoto = $null; $mp = Join-Path $root 'raton.png'
+		if (Test-Path -LiteralPath $mp) { try { $mphoto = [System.Drawing.Image]::FromFile($mp) } catch { $mphoto = $null } }
+		$cx = 90; $top = 10; $w = 130; $h = 214
+		$body = New-Object System.Drawing.Drawing2D.GraphicsPath
+		$body.AddArc(($cx - $w / 2), $top, $w, 120, 180, 180); $body.AddArc(($cx - $w / 2), ($top + $h - 140), $w, 140, 0, 180); $body.CloseFigure()
+		if ($mphoto) { $g.DrawImage($mphoto, 10, 8, $mphoto.Width, $mphoto.Height) } else { $g.FillPath($fill, $body); $g.DrawPath($pen, $body) }
+		$lb = New-Object System.Drawing.Drawing2D.GraphicsPath; $lb.AddArc(($cx - $w / 2 + 4), ($top + 4), ($w - 8), 112, 180, 90); $lb.AddLine(($cx - 2), ($top + 4), ($cx - 2), ($top + 80)); $lb.AddLine(($cx - 2), ($top + 80), ($cx - $w / 2 + 4), ($top + 80)); $lb.CloseFigure()
+		$rb = New-Object System.Drawing.Drawing2D.GraphicsPath; $rb.AddArc(($cx - $w / 2 + 4), ($top + 4), ($w - 8), 112, 270, 90); $rb.AddLine(($cx + $w / 2 - 4), ($top + 80), ($cx + 2), ($top + 80)); $rb.AddLine(($cx + 2), ($top + 80), ($cx + 2), ($top + 4)); $rb.CloseFigure()
+		if (-not $mphoto) {
+			$g.FillPath($btnFill, $lb); $g.DrawPath($thin, $lb); $g.FillPath($btnFill, $rb); $g.DrawPath($thin, $rb)
+			$wheel = New-Object System.Drawing.RectangleF(($cx - 9), ($top + 22), 18, 40); $g.FillRectangle($fill, $wheel); $g.DrawRectangle($thin, $wheel.X, $wheel.Y, $wheel.Width, $wheel.Height)
+			$x1r = New-Object System.Drawing.RectangleF(($cx - $w / 2 - 6), ($top + 104), 10, 26); $x2r = New-Object System.Drawing.RectangleF(($cx - $w / 2 - 6), ($top + 136), 10, 26)
+			foreach ($r in $x1r, $x2r) { $g.FillRectangle($btnFill, $r); $g.DrawRectangle($thin, $r.X, $r.Y, $r.Width, $r.Height) }
+		}
+		# Que hace cada entrada del raton (de la lista).
+		$what = { param($inp)
+			$acts = @(); foreach ($r in $script:pmKbm) { if ($r.k -eq $inp -or $r.k -eq "Shift+$inp") { $n = if ($script:kbmNames.ContainsKey($r.c)) { $script:kbmNames[$r.c] } else { $r.c }; $acts += $(if ($r.k -like 'Shift+*') { "Shift+: $n" } else { $n }) } }
+			if ($acts.Count) { return ($acts -join '   ') } else { return '(unassigned)' } }
+		$rows = @(@('Left click', 'Mouse:Left', ($cx - 34), ($top + 40)), @('Right click', 'Mouse:Right', ($cx + 34), ($top + 40)),
+			@('Wheel click', 'Mouse:Middle', $cx, ($top + 42)), @('Wheel up', 'Mouse:WheelUp', $cx, ($top + 26)), @('Wheel down', 'Mouse:WheelDown', $cx, ($top + 58)),
+			@('Side 1', 'Mouse:X1', ($cx - $w / 2 - 1), ($top + 117)), @('Side 2', 'Mouse:X2', ($cx - $w / 2 - 1), ($top + 149)))
+		$lx = 200
+		if ($mphoto) {
+			# Puntos medidos en la foto (raton.png a 220 de alto, dibujada en 10,8).
+			$pt = @{ 'Mouse:Left' = @(55, 83); 'Mouse:Right' = @(125, 78); 'Mouse:Middle' = @(85, 60); 'Mouse:WheelUp' = @(80, 54); 'Mouse:WheelDown' = @(90, 66); 'Mouse:X1' = @(52, 113); 'Mouse:X2' = @(58, 136) }
+			foreach ($row in $rows) { $row[2] = $pt[$row[1]][0]; $row[3] = $pt[$row[1]][1] }
+			$lx = 236
+		}
+		$y = 6
+		foreach ($row in $rows) {
+			$ly = $y + 12
+			$g.DrawLine($thin, [float]$row[2], [float]$row[3], [float]($lx - 4), [float]$ly); $g.FillEllipse($gold2, ([float]$row[2] - 3), ([float]$row[3] - 3), 6, 6)
+			$g.DrawString($row[0], $f1, $gold2, $lx, $y + 3)
+			$g.DrawString((& $what $row[1]), $f2, $txt, (New-Object System.Drawing.RectangleF(($lx + 100), ($y + 3), (558 - $lx - 100), 30)))
+			$y += 32
+		}
+		$g.DrawString('Move the mouse = camera', $f1, $gold2, 14, 216)
+		foreach ($o in $fill, $btnFill, $pen, $thin, $gold2, $txt, $f1, $f2, $body, $lb, $rb) { $o.Dispose() }
+		if ($mphoto) { $mphoto.Dispose() }
+	})
 	$script:pmStartWait = {
 		if ($lv.SelectedIndices.Count -eq 0) { $cap.Text = 'First pick an action from the list.'; return }
 		$script:pmWait = $lv.SelectedIndices[0]
@@ -1360,7 +1729,77 @@ foreach ($pp in @(@('Motion Blur', 'motionblur'), @('Depth of Field', 'dof'), @(
 	$script:postChecks += ,@($c, $pp[1])
 	$px += 134; if ($px -gt 300) { $px = 12; $py += 30 }
 }
-$gCtl = New-Group 'Controls' 450 604 420 168
+# (10-24) Ray tracing en pantalla (beta): sombras del sol y reflejos con denoise. Solo con DLSS, XeSS o FSR.
+$gRt = New-Group 'Ray tracing (beta)' 10 586 420 156
+function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @('Off', 'Low', 'High', 'Ultra')) {
+	$lb = New-Label $label $smallFont $ink 0 0 98 22; $panel.Controls.Add($lb)
+	$c = New-Object System.Windows.Forms.ComboBox
+	$c.DropDownStyle = 'DropDownList'; $c.Font = $smallFont; $c.Tag = $key
+	foreach ($it in $items) { [void]$c.Items.Add($it) }
+	$v = 0; [void][int]::TryParse((Get-IniValue $key '0'), [ref]$v); $c.SelectedIndex = [math]::Min([math]::Max(0, $v), $items.Count - 1)
+	$c.Add_SelectedIndexChanged({ param($sender, $e) Set-IniValue $sender.Tag "$($sender.SelectedIndex)" })
+	$tips.SetToolTip($c, $tip); $panel.Controls.Add($c)
+	Move-To $lb $gRt 10 ($y + 2) 98; Move-To $c $gRt 110 $y 296
+	return $c
+}
+$cmbRtSh = New-RtCombo 'RT Shadows' 'rtshadow' 24 'Ray-traced sun shadows on the image, with denoising. Only with DLSS, XeSS or FSR. Low ~0.3 ms, High ~1 ms, Ultra ~1.5 ms. Beta.'
+$cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl2' 56 'Ray-traced reflections guided by the game''s own: only where the game reflects and at its strength, but sharper (water as a mirror). Where the ray finds nothing the game''s reflection stays. Only with DLSS, XeSS or FSR. Low ~0.6 ms, Medium ~1 ms, High ~2 ms. Beta.' @('Off', 'Low', 'Medium', 'High')
+$cmbShine = New-RtCombo 'Metal shine' 'shine' 88 'Armour, shields and metal: highlights from the sun and from torches and fires, plus a bit more sharpness. Only with DLSS, XeSS or FSR. Best with RT Shadows on. Beta.' @('Off', 'Sun', 'Sun + 2 lights', 'Sun + 4 lights')
+$cmbRays = New-RtCombo 'Light shafts' 'godrays' 120 'Crepuscular sun rays and a light halo around torches and fires. Only with DLSS, XeSS or FSR. Sun rays need RT Shadows on. Soft ~0.3 ms, Strong ~1 ms. Beta.' @('Off', 'Soft', 'Medium', 'Strong')
+
+# (10-24) Tu equipo: tarjeta con el caballero senalando la grafica y el equipo detectados (antes, una linea abajo).
+function New-PcCard {
+	$cw = 420; $ch = 262
+	$bmp = New-Object System.Drawing.Bitmap($cw, $ch, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+	$gc = [System.Drawing.Graphics]::FromImage($bmp)
+	$gc.SmoothingMode = 'AntiAlias'; $gc.TextRenderingHint = 'AntiAliasGridFit'; $gc.InterpolationMode = 'HighQualityBicubic'
+	$path = New-Object System.Drawing.Drawing2D.GraphicsPath; $r = 14
+	$path.AddArc(0, 0, $r * 2, $r * 2, 180, 90); $path.AddArc($cw - 1 - $r * 2, 0, $r * 2, $r * 2, 270, 90)
+	$path.AddArc($cw - 1 - $r * 2, $ch - 1 - $r * 2, $r * 2, $r * 2, 0, 90); $path.AddArc(0, $ch - 1 - $r * 2, $r * 2, $r * 2, 90, 90); $path.CloseFigure()
+	$fill = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-Object System.Drawing.Point(0, 0)), (New-Object System.Drawing.Point($cw, $ch)),
+		[System.Drawing.Color]::FromArgb(215, 30, 26, 20), [System.Drawing.Color]::FromArgb(215, 12, 13, 18))
+	$gc.FillPath($fill, $path)
+	$pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, 222, 196, 140), 1.5); $gc.DrawPath($pen, $path)
+	$knight = $null; $kp = Join-Path $root 'caballero.png'
+	try { if (Test-Path -LiteralPath $kp) { $knight = [System.Drawing.Image]::FromFile($kp) } } catch { $knight = $null }
+	if ($knight) { $gc.DrawImage($knight, [float]($cw - $knight.Width - 6), [float]($ch - $knight.Height - 6), [float]$knight.Width, [float]$knight.Height) }
+	$goldB = New-Object System.Drawing.SolidBrush($gold); $inkB = New-Object System.Drawing.SolidBrush($ink)
+	$dimB = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(160, 150, 140))
+	$redB = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(235, 90, 80))
+	$fHead = New-Object System.Drawing.Font('Segoe UI Black', 13, [System.Drawing.FontStyle]::Bold)
+	$fCap = New-Object System.Drawing.Font('Segoe UI', 8.5); $fVal = New-Object System.Drawing.Font('Segoe UI Semibold', 10, [System.Drawing.FontStyle]::Bold)
+	$fTxt = New-Object System.Drawing.Font('Segoe UI', 9)
+	$tw = 232; $x = 16; $y = 14
+	$gc.DrawString('YOUR PC', $fHead, $goldB, [float]$x, [float]$y); $y += 34
+	$put = {
+		param($cap, $val, $font, $brush)
+		$gc.DrawString($cap, $fCap, $dimB, [float]$x, [float]$y); $script:pcY = $y + 16
+		$sz = $gc.MeasureString($val, $font, $tw)
+		$gc.DrawString($val, $font, $brush, (New-Object System.Drawing.RectangleF($x, ($y + 16), $tw, ($sz.Height + 2))))
+		return ($y + 18 + $sz.Height + 6)
+	}
+	$gpu = if ($script:gpuName) { $script:gpuName } else { 'not detected' }
+	if (-not $script:isNvidia -and $script:gpuName) { $gpu += '  (no DLSS: NVIDIA only)' }
+	$y = & $put 'Graphics card' $gpu $fVal $inkB
+	$y = & $put 'Processor and RAM' "$($script:pcInfo)" $fTxt $inkB
+	if ($script:gpuRec) {
+		$bad = $script:gpuRec[1] -eq 'NOT COMPATIBLE'
+		$y = & $put 'Recommended mode' "$($script:gpuRec[1])" $fVal $(if ($bad) { $redB } else { $goldB })
+		[void](& $put 'Expected (estimate)' "$($script:gpuRec[2])" $fTxt $(if ($bad) { $redB } else { $inkB }))
+	} else {
+		[void](& $put 'Recommended mode' 'GPU not in the list: start with the Souls balanced mode and watch the metrics.' $fTxt $inkB)
+	}
+	foreach ($o in $fill, $pen, $goldB, $inkB, $dimB, $redB, $fHead, $fCap, $fVal, $fTxt, $path) { $o.Dispose() }
+	if ($knight) { $knight.Dispose() }
+	$gc.Dispose()
+	$pb = New-Object System.Windows.Forms.PictureBox
+	$pb.BackColor = [System.Drawing.Color]::Transparent; $pb.Image = $bmp
+	$pb.Location = New-Object System.Drawing.Point(10, 750); $pb.Size = New-Object System.Drawing.Size($cw, $ch)
+	$panel.Controls.Add($pb)
+	return $pb
+}
+$pcCard = New-PcCard
+$gCtl = New-Group 'Controls' 450 604 420 214
 # (10-23) Controles en un desplegable: el boton los muestra u oculta.
 $gCtl.Visible = $false
 $btnCtl = New-Button 'Controls  v' 450 566 420 32 $false
@@ -1372,14 +1811,14 @@ $lnkDon = New-Object System.Windows.Forms.LinkLabel
 $lnkDon.Text = ([string][char]0x2665) + '  Donate your soul  -  PayPal: todojuegos67@gmail.com'
 $lnkDon.Font = $boldSmall; $lnkDon.LinkColor = $gold; $lnkDon.ActiveLinkColor = [System.Drawing.Color]::White
 $lnkDon.BackColor = [System.Drawing.Color]::Transparent
-$lnkDon.Location = New-Object System.Drawing.Point(450, 790); $lnkDon.Size = New-Object System.Drawing.Size(420, 28)
+$lnkDon.Location = New-Object System.Drawing.Point(450, 830); $lnkDon.Size = New-Object System.Drawing.Size(420, 28)
 $lnkDon.TextAlign = 'MiddleCenter'
 $lnkDon.Add_LinkClicked({ Start-Process 'https://www.paypal.com/donate?business=todojuegos67%40gmail.com&currency_code=EUR' })
 $tips.SetToolTip($lnkDon, 'If you enjoy the project, you can donate via PayPal. Thank you, bearer of the curse.')
 $panel.Controls.Add($lnkDon)
 # (10-23) Boton oficial 'Donar' de PayPal, servido por PayPal (paypalobjects.com); si no hay internet, solo queda el texto.
 $picDon = New-Object System.Windows.Forms.PictureBox
-$picDon.Size = New-Object System.Drawing.Size(92, 26); $picDon.Location = New-Object System.Drawing.Point(614, 822)
+$picDon.Size = New-Object System.Drawing.Size(92, 26); $picDon.Location = New-Object System.Drawing.Point(614, 862)
 $picDon.BackColor = [System.Drawing.Color]::Transparent; $picDon.Cursor = [System.Windows.Forms.Cursors]::Hand
 $picDon.SizeMode = 'Zoom'; $picDon.WaitOnLoad = $false
 try { $picDon.LoadAsync('https://www.paypalobjects.com/en_US/i/btn/btn_donate_LG.gif') } catch { }
@@ -1411,8 +1850,16 @@ function New-Slider([string]$key, [int]$min, [int]$max, [int]$def, $x, $y, [scri
 $trkSens = New-Slider 'kbmsens' 5 400 100 12 62 { param($v) 'Mouse sensitivity: ' + ($v / 100).ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture) }
 $trkAdz = New-Slider 'kbmadz' 0 50 15 218 62 { param($v) "Anti-deadzone: $v%" }
 $tips.SetToolTip($trkSens, 'How much the camera turns per mouse movement (1.00 = normal).')
+# (10-23) Velocidad de camara del juego con teclado y raton (cp11_Setting_CameraSpeed): mas alta = los giros grandes del
+# raton no se quedan en el tope del stick. Sin teclado y raton, la del juego (la de su menu).
+$trkCam = New-Slider 'kbmcam2' 5 15 10 12 116 { param($v) "Camera speed (mouse): $v$(if ($v -gt 10) { ' (extra)' })" }  # (10-24) 11-15: por encima del menu del juego
+$tips.SetToolTip($trkCam, 'Keyboard and mouse only: the game camera''s maximum turn speed. 10 = the game menu''s maximum. 11-15 (extra, experimental): faster than the menu; if the camera acts strange, go back to 10. Without keyboard and mouse the game menu''s value is used.')
 $tips.SetToolTip($trkAdz, 'Skips the game''s stick deadzone: higher means a small mouse movement already turns the camera. If the camera moves by itself, lower it.')
-function Update-KbmEnabled { $trkSens.Enabled = $chkKbm.Checked; $trkAdz.Enabled = $chkKbm.Checked }
+# (10-24) Frame warp: la camara del raton desplaza el 3D al momento (HUD quieto), tambien con la frame generation de AMD.
+$chkWarp = New-Check 'Instant camera (frame warp)' 0 0 300 'kbmwarp'
+$tips.SetToolTip($chkWarp, 'Keyboard and mouse only: right before each image is shown, the 3D is shifted by your mouse movement (the HUD stays still). Works without frame generation and with AMD; does nothing with NVIDIA. Experimental.')
+$panel.Controls.Add($chkWarp); Move-To $chkWarp $gCtl 222 120 186
+function Update-KbmEnabled { $trkSens.Enabled = $chkKbm.Checked; $trkAdz.Enabled = $chkKbm.Checked; $trkCam.Enabled = $chkKbm.Checked; $chkWarp.Enabled = $chkKbm.Checked }
 $chkKbm.Add_CheckedChanged({ Update-KbmEnabled })
 Update-KbmEnabled
 # (10-23) Calibrar la camara para el raton: arranca el juego con KYTY_KBM_CALIBRATE=1 (y teclado y raton).
@@ -1426,7 +1873,7 @@ $btnCal.Add_Click({
 	$script:kbmCalibrate = $true
 	try { Start-Game } finally { $script:kbmCalibrate = $false }
 })
-Move-To $btnCal $gCtl 12 124 396
+Move-To $btnCal $gCtl 12 170 396
 
 # ---- Settings (panel desplegable) ----
 $settings = New-Object System.Windows.Forms.Panel
@@ -1451,18 +1898,76 @@ $btnBrowse.Add_Click({
 	if ($dialog.ShowDialog($form) -eq 'OK') { $pathBox.Text = $dialog.SelectedPath }
 })
 $settings.Controls.Add($btnBrowse)
+# (10-23) El juego comprimido en un solo archivo .zar (unos dos tercios del tamano): el emulador lo lee sin descomprimir.
+$btnZarPick = New-Button '.zar' 536 52 54 32 $false
+$btnZarPick.Font = $smallFont
+$tips.SetToolTip($btnZarPick, 'Choose the compressed game (.zar) instead of the folder')
+$btnZarPick.Add_Click({
+	$d = New-Object System.Windows.Forms.OpenFileDialog
+	$d.Filter = 'Compressed game (*.zar)|*.zar'; $d.Title = 'Choose the game .zar file'
+	if ($d.ShowDialog($form) -eq 'OK') { $pathBox.Text = $d.FileName }
+})
+$settings.Controls.Add($btnZarPick)
+$btnZarMake = New-Button 'Compress to .zar' 200 96 200 36 $false
+$btnZarMake.Font = $smallFont
+$tips.SetToolTip($btnZarMake, 'Creates a .zar of the game (about two thirds of the folder size). The original folder is not deleted.')
+$btnZarMake.Add_Click({
+	$src = $pathBox.Text.Trim()
+	$tool = Join-Path $root 'zarchive.exe'
+	if (-not (Test-Path -LiteralPath $tool)) { [System.Windows.Forms.MessageBox]::Show('zarchive.exe is missing next to the launcher (it comes in the release).', 'Compress', 'OK', 'Warning') | Out-Null; return }
+	if (-not $src -or -not (Test-Path -LiteralPath $src -PathType Container) -or -not (Test-Path -LiteralPath (Join-Path $src 'eboot.bin'))) {
+		[System.Windows.Forms.MessageBox]::Show('Set the game folder first (the one with eboot.bin).', 'Compress', 'OK', 'Warning') | Out-Null; return }
+	$dst = $src.TrimEnd('\') + '.zar'
+	if (Test-Path -LiteralPath $dst) { [System.Windows.Forms.MessageBox]::Show("Already exists:`n$dst", 'Compress', 'OK', 'Warning') | Out-Null; return }
+	$msg = "This will create:`n$dst`n`nIt takes about two thirds of the game folder and several minutes. You need that much free disk space.`nThe original folder is NOT deleted: once the .zar works, you can delete it yourself.`n`nWhen done, the launcher will use the .zar."
+	if ([System.Windows.Forms.MessageBox]::Show($msg, 'Compress to .zar', 'OKCancel', 'Information') -ne 'OK') { return }
+	$status.Text = 'Compressing... (separate window)'
+	$p = Start-Process -FilePath $tool -ArgumentList @("`"$src`"", "`"$dst`"") -PassThru -Wait
+	if ($p.ExitCode -eq 0 -and (Test-Path -LiteralPath $dst)) {
+		$pathBox.Text = $dst; Set-GamePath $dst
+		$gb = [math]::Round((Get-Item -LiteralPath $dst).Length / 1GB, 1)
+		$status.Text = "Done: $gb GB. The launcher now uses the .zar."
+	} else { $status.Text = "Could not compress (code $($p.ExitCode))."; Remove-Item -LiteralPath $dst -ErrorAction SilentlyContinue }
+})
+$settings.Controls.Add($btnZarMake)
 $status = New-Label '' $smallFont $ink 20 140 560 24
 $settings.Controls.Add($status)
 $btnSave = New-Button 'Save' 20 96 160 36 $true
 $btnSave.Font = $smallFont
 $btnSave.Add_Click({
 	$p = $pathBox.Text.Trim()
-	if (-not $p -or -not (Test-Path -LiteralPath $p)) { $status.Text = 'That folder does not exist.'; return }
+	if (-not $p -or -not (Test-Path -LiteralPath $p)) { $status.Text = 'That folder (or .zar) does not exist.'; return }
 	Set-GamePath $p
 	$status.Text = 'Saved to game-path.txt'
+	$settings.Visible = $false
 })
 $settings.Controls.Add($btnSave)
+# (10-24) Prueba para las manchas negras del suelo mojado: una cosa cada vez (se guarda; 'Ninguna' para volver).
+$script:testModes = @(
+	@('Test: none', ''), @('Hardware RT shadows', 'KYTY_RT_SHADOWS_HW=1'), @('No async compute', 'enableAsyncCompute=false'), @('No spot shadows', 'r_enableSpotShadows=false'),
+	@('No ambient shadowing', 'r_enableAmbientShadowing=false'), @('No game SSR', 'r_ssrCutoffDistance=0'),
+	@('Emu: fresh memory off', 'KYTY_FRESH_MEMORY=0'), @('Emu: partial dirty off', 'KYTY_PARTIAL_IMAGE_DIRTY=0'),
+	@('Emu: resolve pages off', 'KYTY_TEXTURE_RESOLVE_PAGES=0'), @('Emu: image pool off', 'KYTY_IMAGE_POOL=0'), @('Emu: texture reduce off', 'KYTY_TEXTURE_REDUCE=0'), @('Emu: sin arreglo focos', 'KYTY_DEPTH_ARRAY_GUARD=0'),
+	@('Lejos: cascadas 400 m', 'sunShadowMaxDistance=400;r_virtualGeometryNumShadowCascades=4;sunShadowCascadeDistance0=27;sunShadowCascadeDistance1=61;sunShadowCascadeDistance2=131;sunShadowCascadeDistance3=400;sunShadowLightDistance=1000'),
+	@('Lejos: sin sombras cascada', 'r_enableCascadeShadows=false'), @('Lejos: sombra con fundido', 'r_EnableShadowFadeout=true'),
+	@('Lejos: GI sin areas', 'GIEnableAreasOfInterest=false'), @('Lejos: GI areas de fondo', 'GIEnableBackgroundAOI=true;GIEnableDefaultCameraAOI=true'),
+	@('Lejos: sin oclusion IBL', 'r_enableIBLOcclusion=false'), @('Lejos: sin culling luces', 'r_enableLightOcclusionCulling=false'),
+	@('Lejos: sombreado amb. 1000', 'r_ambientShadowCutoffDistance=1000;r_ambientShadowCutoffFadeDistance=100'))
+$cmbTest = New-Object System.Windows.Forms.ComboBox
+$cmbTest.DropDownStyle = 'DropDownList'; $cmbTest.Font = $smallFont
+foreach ($t in $script:testModes) { [void]$cmbTest.Items.Add($t[0]) }
+$tv = 0; [void][int]::TryParse((Get-IniValue 'pruebamanchas' '0'), [ref]$tv); $cmbTest.SelectedIndex = [math]::Min([math]::Max(0, $tv), $script:testModes.Count - 1)
+$cmbTest.Add_SelectedIndexChanged({ Set-IniValue 'pruebamanchas' "$($cmbTest.SelectedIndex)" })
+$cmbTest.Location = New-Object System.Drawing.Point(410, 100); $cmbTest.Size = New-Object System.Drawing.Size(180, 26)
+$tips.SetToolTip($cmbTest, 'Testing only: turns off one game or emulator feature to find the black-patch bug. Leave Test: none for normal play.')
+$settings.Controls.Add($cmbTest)
 $btnSettings.Add_Click({ $settings.Visible = -not $settings.Visible })
+# (10-23) Cruz para cerrar Settings; al guardar bien tambien se cierra.
+$btnCloseSet = New-Button ([string][char]0x2715) 572 6 32 30 $false
+$btnCloseSet.Font = $smallFont
+$tips.SetToolTip($btnCloseSet, 'Close')
+$btnCloseSet.Add_Click({ $settings.Visible = $false })
+$settings.Controls.Add($btnCloseSet); $btnCloseSet.BringToFront()
 
 # (10-23) Aviso del archivo de paginacion: solo lo LEE; nunca cambia ajustes de Windows. Abre la ventana de Windows
 # para que el usuario lo cambie el mismo si quiere. No vuelve a avisar si se pulsa "No volver a avisar".

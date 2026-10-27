@@ -1,10 +1,15 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <bit>
+#include <cmath>
+#include <limits>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <fmt/format.h>
@@ -1464,7 +1469,7 @@ private:
 		                           memory.kind == ResourceKind::ScalarBuffer;
 	}
 
-	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
+	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc, uint32_t array_index_bound) {
 		const auto resource_class = ImageOpcodeInfoOf(op).resource_class;
 		const auto mip   = resource_class == ImageResourceClass::Storage && memory.image_has_mip
 		                       ? ImageMipMode::DynamicStorage
@@ -1475,7 +1480,8 @@ private:
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
 			    image.depth_compare == depth && image.r128 == memory.image_r128) {
-				image.cube = image.cube || memory.image_cube;
+				image.cube            = image.cube || memory.image_cube;
+				image.max_array_index = std::max(image.max_array_index, array_index_bound);
 				Merge(image, op, pc);
 				return i;
 			}
@@ -1493,9 +1499,374 @@ private:
 		image.mip_mode       = mip;
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
+		image.max_array_index = array_index_bound;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
+	}
+
+	// The bound of the layer coordinate of a sample or gather of a sampled array image (ImageResource::max_array_index):
+	// the layer it reads is the coordinate rounded to the nearest, clamped to the view's layers (the hardware's rule and
+	// Vulkan's), so a coordinate of a known range reaches no layer past its rounded maximum. The game's texture pools
+	// are sampled through views of a few thousand layers whose shaders take the layer from a byte: 256 of them (a
+	// 1,023-layer image of 1 GiB on an 8 GB card, issue #174). Any other operation on the image, a cube, a 16-bit
+	// coordinate or an operand of unknown range: no bound.
+	// Only the lanes whose result the shader keeps count (ResultLanes): the translator writes a register as
+	// select(exec, new, old) and the old value of a lane the exec leaves out is the register's earlier use (an
+	// interpolated value, a product). Another lane's layer is clamped to the view as well, its texel never seen.
+	uint32_t ArrayIndexBound(const Inst& inst, const MemoryInfo& memory, ValueOpcode op) {
+		const auto dimension = memory.image_dimension;
+		if ((op != ValueOpcode::ImageSampleRaw && op != ValueOpcode::ImageGatherRaw) || memory.image_cube ||
+		    (dimension != Decoder::ImageDimension::Dim1DArray && dimension != Decoder::ImageDimension::Dim2DArray) ||
+		    inst.NumArgs() < 3)
+			return ImageResource::NoArrayIndexBound;
+		const auto* address = inst.Arg(2).Resolve().TryInstruction();
+		if (address == nullptr || address->GetOpcode() != ValueOpcode::MakeImageAddress)
+			return ImageResource::NoArrayIndexBound;
+		// The address's components in SpirvEmitter's order (Layout): offset, bias, compare, derivatives, the coordinates
+		// (the layer after the spatial ones).
+		const uint32_t flags   = memory.image_sample_flags;
+		const uint32_t spatial = dimension == Decoder::ImageDimension::Dim1DArray ? 1u : 2u;
+		uint32_t       layer   = spatial;
+		if ((flags & Decoder::ImageSampleFlagOffset) != 0u) layer++;
+		if ((flags & Decoder::ImageSampleFlagBias) != 0u) layer++;
+		if ((flags & Decoder::ImageSampleFlagCompare) != 0u) layer++;
+		if ((flags & Decoder::ImageSampleFlagDerivative) != 0u) layer += 2u * spatial;
+		const auto component = Decoder::ImageAddressComponentLayout(flags, layer);
+		if (component.bit_width != 32u) return ImageResource::NoArrayIndexBound;
+		// (A component past the address's words reads 0: SpirvEmitter's AddressU32.)
+		const auto word = component.bit_offset / 32u;
+		if (word >= address->NumArgs()) return 0;
+		m_lanes          = ResultLanes(inst);
+		CollectLaneTerms();
+		const auto bound = SolveBound(address->Arg(word));
+		if (!(bound < 65536.0)) return ImageResource::NoArrayIndexBound;
+		return static_cast<uint32_t>(std::floor(bound + 0.5));
+	}
+
+	// The lanes an image operation's result is kept for: every component of it taken out and written to a register by
+	// a select on one condition (the exec mask the translator gives the operation's destination registers), that
+	// condition. None (an empty value: every lane) when a use is anything else or the conditions differ.
+	static Value ResultLanes(const Inst& image) {
+		Value lanes;
+		for (const auto& use: image.Uses()) {
+			const auto* extract = use.user;
+			if (extract == nullptr || extract->GetOpcode() != ValueOpcode::CompositeExtractU32x4) return {};
+			for (const auto& kept: extract->Uses()) {
+				const auto* select = kept.user;
+				if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32 || kept.operand != 1) return {};
+				const auto condition = select->Arg(0).Resolve();
+				if (lanes.IsEmpty()) {
+					lanes = condition;
+				} else if (!(lanes == condition)) {
+					return {};
+				}
+			}
+		}
+		return lanes;
+	}
+
+	// The terms of the result's lanes (ResultLanes), each true in all of them: the condition and the operands of its ands;
+	// and the values a term is the not of, false in all of them. Per ArrayIndexBound call, as the answers below.
+	void CollectLaneTerms() {
+		m_lane_terms.clear();
+		m_lane_negated.clear();
+		m_lanes_imply.clear();
+		m_lanes_exclude.clear();
+		if (m_lanes.IsEmpty()) return;
+		std::vector<Value> pending {m_lanes};
+		while (!pending.empty()) {
+			const auto* term = pending.back().Resolve().TryInstruction();
+			pending.pop_back();
+			if (term == nullptr || !m_lane_terms.insert(term).second) continue;
+			if (term->GetOpcode() == ValueOpcode::LogicalAnd) {
+				pending.push_back(term->Arg(0));
+				pending.push_back(term->Arg(1));
+			} else if (term->GetOpcode() == ValueOpcode::LogicalNot) {
+				if (const auto* negated = term->Arg(0).Resolve().TryInstruction(); negated != nullptr)
+					m_lane_negated.insert(negated);
+			}
+		}
+	}
+
+	// Whether `condition` holds in every lane the result is kept for: the lanes' condition, a term of it, or an and of
+	// such. (Each and answered once: the conditions share their terms, the exec masks of nested branches.)
+	bool LanesImply(Value condition, uint32_t depth) {
+		condition = condition.Resolve();
+		if (m_lanes.IsEmpty() || depth > 16) return false;
+		if (condition == m_lanes.Resolve()) return true;
+		const auto* inst = condition.TryInstruction();
+		if (inst == nullptr) return false;
+		if (m_lane_terms.contains(inst)) return true;
+		if (inst->GetOpcode() != ValueOpcode::LogicalAnd) return false;
+		if (const auto known = m_lanes_imply.find(inst); known != m_lanes_imply.end()) return known->second;
+		const bool implied   = LanesImply(inst->Arg(0), depth + 1) && LanesImply(inst->Arg(1), depth + 1);
+		m_lanes_imply[inst] = implied;
+		return implied;
+	}
+
+	// Whether `condition` fails in every lane the result is kept for: a term of the lanes is its not, it is the not of a
+	// condition they imply, or an and with such an operand.
+	bool LanesExclude(Value condition, uint32_t depth) {
+		condition = condition.Resolve();
+		if (m_lanes.IsEmpty() || depth > 16) return false;
+		const auto* inst = condition.TryInstruction();
+		if (inst == nullptr) return false;
+		if (m_lane_negated.contains(inst)) return true;
+		if (inst->GetOpcode() == ValueOpcode::LogicalNot) return LanesImply(inst->Arg(0), depth + 1);
+		if (inst->GetOpcode() != ValueOpcode::LogicalAnd) return false;
+		if (const auto known = m_lanes_exclude.find(inst); known != m_lanes_exclude.end()) return known->second;
+		const bool excluded   = LanesExclude(inst->Arg(0), depth + 1) || LanesExclude(inst->Arg(1), depth + 1);
+		m_lanes_exclude[inst] = excluded;
+		return excluded;
+	}
+
+	// The bound analysis: each value it meets, read as a float or as an unsigned integer, for the lanes the result is
+	// kept for or for any lane (past a loop's phi), is a node whose bound follows from its operands' by a rule. Every
+	// rule grows with its operands, so the bounds, all 0 at first and recomputed in rounds until none grows, are the
+	// least ones the rules allow for every value a loop's iterations give as well. (A value read as a float may also be
+	// negative: the first layer. NoBound: none.)
+	enum class BoundRule : uint8_t {
+		Constant,        // its value
+		Copy,            // its operand's
+		Max,             // its largest operand's (0 without one)
+		Min,             // its smallest operand's (an operand of no bound gives the others')
+		RoundEven,       // to the nearest integer
+		Floor,           // (a truncation too: the bounds are not negative)
+		Ceil,
+		SignedToFloat,   // an integer below the sign bit
+		BitsToFloat,     // an integer's bits: below the sign bit, a larger integer is a larger float
+		FloatToUnsigned, // a float's integer part
+		ShiftRight,      // by `shift`
+		BitField,        // `bits` bits from bit `shift` (32: all there are)
+	};
+	struct BoundNode {
+		BoundRule rule  = BoundRule::Constant;
+		uint8_t   shift = 0;
+		uint8_t   bits  = 32;
+		uint32_t  first = 0; // its operands: m_bound_operands[first, first + count), met as m_bound_specs
+		uint32_t  count = 0;
+		double    value = 0.0;
+	};
+	struct BoundOperand {
+		Value value;
+		bool  is_float = false;
+		bool  lanes    = false;
+	};
+
+	static constexpr double NoBound = std::numeric_limits<double>::infinity();
+	// (A shader of more values than that, or whose bounds still grow after that many rounds: no bound.)
+	static constexpr uint32_t MaxBoundNodes  = 4096;
+	static constexpr uint32_t MaxBoundRounds = 16;
+
+	// A 32-bit value's bits read as a float: a negative one counts as 0 (the first layer), an infinity or NaN as no bound.
+	static double FloatOfBits(uint32_t bits) {
+		if ((bits & 0x7f800000u) == 0x7f800000u) return NoBound;
+		if ((bits & 0x80000000u) != 0u) return 0.0;
+		return static_cast<double>(std::bit_cast<float>(bits));
+	}
+
+	// Whether a phi may take a value along a back edge: a predecessor that is not before its block (the blocks are in
+	// the order of their code; an unknown one counts as such). Past one the result's lanes no longer select the values:
+	// they are other iterations', whose conditions are not the ones the lanes are made of.
+	bool IsLoopPhi(const Inst& phi) {
+		if (m_block_order.empty())
+			for (size_t i = 0; i < m_program.blocks.size(); i++) m_block_order[m_program.blocks[i]] = i;
+		const auto block = m_block_order.find(phi.Parent());
+		if (block == m_block_order.end()) return true;
+		for (size_t i = 0; i < phi.NumPhiBlocks(); i++) {
+			const auto from = m_block_order.find(phi.PhiBlock(i));
+			if (from == m_block_order.end() || from->second >= block->second) return true;
+		}
+		return false;
+	}
+
+	// The bound of `root`, a 32-bit value read as a float, for the result's lanes (m_lanes): the nodes of the values it
+	// is made of, each after its operands' (but around a loop), then the rounds.
+	double SolveBound(Value root) {
+		m_bound_nodes.clear();
+		m_bound_specs.clear();
+		m_bound_operands.clear();
+		m_bound_order.clear();
+		m_bound_index.clear();
+		m_bound_stack.clear();
+		bool       fresh = false;
+		const auto top   = BoundNodeOf({root, true, true}, fresh);
+		if (!top) return NoBound;
+		if (fresh) m_bound_stack.emplace_back(*top, 0u);
+		while (!m_bound_stack.empty()) {
+			const auto [id, next] = m_bound_stack.back();
+			if (next == m_bound_nodes[id].count) {
+				m_bound_order.push_back(id);
+				m_bound_stack.pop_back();
+				continue;
+			}
+			m_bound_stack.back().second++;
+			const uint32_t     slot    = m_bound_nodes[id].first + next;
+			const BoundOperand operand = m_bound_specs[slot];
+			const auto         node    = BoundNodeOf(operand, fresh);
+			if (!node) return NoBound;
+			m_bound_operands[slot] = *node;
+			if (fresh) m_bound_stack.emplace_back(*node, 0u);
+		}
+		for (uint32_t round = 0; round < MaxBoundRounds; round++) {
+			bool grew = false;
+			for (const auto id: m_bound_order) {
+				auto& node = m_bound_nodes[id];
+				if (node.rule == BoundRule::Constant) continue;
+				if (const double bound = BoundOf(node); bound != node.value) {
+					node.value = bound;
+					grew       = true;
+				}
+			}
+			if (!grew) return m_bound_nodes[*top].value;
+		}
+		return NoBound;
+	}
+
+	// The node of a value read as a float or as an integer for the lanes or not: the one it has, or a new one (`fresh`,
+	// its operands still to meet). None past MaxBoundNodes.
+	std::optional<uint32_t> BoundNodeOf(const BoundOperand& operand, bool& fresh) {
+		fresh            = false;
+		const auto value = operand.value.Resolve();
+		if (m_bound_nodes.size() >= MaxBoundNodes) return std::nullopt;
+		const auto* inst = value.IsImmediate() ? nullptr : value.TryInstruction();
+		if (inst == nullptr) {
+			BoundNode node;
+			node.value = NoBound;
+			if (value.IsImmediate() && operand.is_float && value.GetType() == Type::F32)
+				node.value = FloatOfBits(std::bit_cast<uint32_t>(value.F32Value()));
+			else if (value.IsImmediate() && value.GetType() == Type::U32)
+				node.value = operand.is_float ? FloatOfBits(value.U32()) : static_cast<double>(value.U32());
+			m_bound_nodes.push_back(node);
+			return static_cast<uint32_t>(m_bound_nodes.size() - 1);
+		}
+		const auto key = reinterpret_cast<uintptr_t>(inst) | (operand.is_float ? 2u : 0u) | (operand.lanes ? 1u : 0u);
+		const auto id  = static_cast<uint32_t>(m_bound_nodes.size());
+		if (const auto [known, added] = m_bound_index.try_emplace(key, id); !added) return known->second;
+		BoundNode node;
+		node.first = static_cast<uint32_t>(m_bound_specs.size());
+		MakeBoundRule(node, *inst, operand.is_float, operand.lanes);
+		node.count = static_cast<uint32_t>(m_bound_specs.size()) - node.first;
+		m_bound_operands.resize(m_bound_specs.size());
+		m_bound_nodes.push_back(node);
+		fresh = true;
+		return id;
+	}
+
+	// The rule of `inst` read as a float (is_float) or as an unsigned integer for the lanes or not, its operands added
+	// to m_bound_specs. Any other operation: no bound.
+	void MakeBoundRule(BoundNode& node, const Inst& inst, bool is_float, bool lanes) {
+		const auto add = [&](Value value, bool as_float, bool for_lanes) {
+			m_bound_specs.push_back({value, as_float, for_lanes});
+		};
+		const auto args = [&](size_t count, bool as_float, BoundRule rule) {
+			for (size_t i = 0; i < count; i++) add(inst.Arg(i), as_float, lanes);
+			node.rule = rule;
+		};
+		const auto constant = [&](size_t index) -> std::optional<uint32_t> {
+			const auto value = inst.Arg(index).Resolve();
+			return value.IsImmediate() && value.GetType() == Type::U32 ? std::optional<uint32_t>(value.U32()) : std::nullopt;
+		};
+		const auto op = inst.GetOpcode();
+		// A select of a condition the lanes decide: the operand they take.
+		if (op == ValueOpcode::SelectU32 || (is_float && op == ValueOpcode::SelectF32)) {
+			node.rule = BoundRule::Copy;
+			if (lanes && LanesImply(inst.Arg(0), 0)) return add(inst.Arg(1), is_float, lanes);
+			if (lanes && LanesExclude(inst.Arg(0), 0)) return add(inst.Arg(2), is_float, lanes);
+			node.rule = BoundRule::Max;
+			add(inst.Arg(1), is_float, lanes);
+			return add(inst.Arg(2), is_float, lanes);
+		}
+		if (op == ValueOpcode::Phi) {
+			const bool through = lanes && !IsLoopPhi(inst);
+			for (size_t i = 0; i < inst.NumArgs(); i++) add(inst.Arg(i), is_float, through);
+			node.rule = BoundRule::Max;
+			return;
+		}
+		if (is_float) {
+			switch (op) {
+				case ValueOpcode::BitCastU32F32:
+				case ValueOpcode::BitCastF32U32: return args(1, true, BoundRule::Copy);
+				case ValueOpcode::FPRoundEven32: return args(1, true, BoundRule::RoundEven);
+				case ValueOpcode::FPFloor32:
+				case ValueOpcode::FPTrunc32: return args(1, true, BoundRule::Floor);
+				case ValueOpcode::FPCeil32: return args(1, true, BoundRule::Ceil);
+				case ValueOpcode::FPMax32: return args(2, true, BoundRule::Max);
+				case ValueOpcode::FPMaxTri32: return args(3, true, BoundRule::Max);
+				// (No larger than any operand of a bound: a NaN operand gives the other one, and no value of a bound
+				// here is a NaN.)
+				case ValueOpcode::FPMin32: return args(2, true, BoundRule::Min);
+				case ValueOpcode::FPMinTri32: return args(3, true, BoundRule::Min);
+				case ValueOpcode::ConvertF32U32: return args(1, false, BoundRule::Copy);
+				case ValueOpcode::ConvertF32S32: return args(1, false, BoundRule::SignedToFloat);
+				default:
+					// The instruction read as an integer.
+					node.rule = BoundRule::BitsToFloat;
+					return add(Value(const_cast<Inst*>(&inst)), false, lanes);
+			}
+		}
+		switch (op) {
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::UMin32: return args(2, false, BoundRule::Min);
+			case ValueOpcode::UMax32: return args(2, false, BoundRule::Max);
+			case ValueOpcode::ShiftRightLogical32: {
+				const auto shift = constant(1);
+				node.shift       = static_cast<uint8_t>(shift.value_or(0) & 31u);
+				return args(1, false, shift ? BoundRule::ShiftRight : BoundRule::Copy);
+			}
+			case ValueOpcode::BitFieldUExtract: {
+				const auto offset = constant(1), count = constant(2);
+				node.shift        = static_cast<uint8_t>(offset.value_or(0) & 31u);
+				node.bits         = static_cast<uint8_t>(count && *count < 32u ? *count : 32u);
+				return args(1, false, BoundRule::BitField);
+			}
+			case ValueOpcode::ConvertU32U8: node.value = 0xffu; return;
+			case ValueOpcode::ConvertU32U16: node.value = 0xffffu; return;
+			case ValueOpcode::ConvertU32F32: return args(1, true, BoundRule::FloatToUnsigned);
+			default: node.value = NoBound; return;
+		}
+	}
+
+	// A node's bound from its operands' now.
+	double BoundOf(const BoundNode& node) const {
+		const auto operand = [&](uint32_t index) { return m_bound_nodes[m_bound_operands[node.first + index]].value; };
+		switch (node.rule) {
+			case BoundRule::Constant: return node.value;
+			case BoundRule::Copy: return operand(0);
+			case BoundRule::Max: {
+				double bound = 0.0;
+				for (uint32_t i = 0; i < node.count; i++) bound = std::max(bound, operand(i));
+				return bound;
+			}
+			case BoundRule::Min: {
+				double bound = NoBound;
+				for (uint32_t i = 0; i < node.count; i++) bound = std::min(bound, operand(i));
+				return bound;
+			}
+			case BoundRule::RoundEven: return std::floor(operand(0) + 0.5);
+			case BoundRule::Floor: return std::floor(operand(0));
+			case BoundRule::Ceil: return std::ceil(operand(0));
+			case BoundRule::SignedToFloat: return operand(0) <= 2147483647.0 ? operand(0) : NoBound;
+			case BoundRule::BitsToFloat:
+				return operand(0) <= 2139095039.0 ? FloatOfBits(static_cast<uint32_t>(operand(0))) : NoBound;
+			case BoundRule::FloatToUnsigned: {
+				const double bound = operand(0);
+				if (bound == NoBound) return NoBound;
+				return bound >= 4294967295.0 ? 4294967295.0 : std::floor(bound);
+			}
+			case BoundRule::ShiftRight: {
+				const double bound = operand(0);
+				return static_cast<double>((bound == NoBound ? UINT32_MAX : static_cast<uint32_t>(bound)) >> node.shift);
+			}
+			case BoundRule::BitField: {
+				double bound = operand(0);
+				if (bound != NoBound) bound = static_cast<double>(static_cast<uint32_t>(bound) >> node.shift);
+				if (node.bits < 32u) bound = std::min(bound, static_cast<double>((1u << node.bits) - 1u));
+				return bound;
+			}
+		}
+		return NoBound;
 	}
 
 	static void Merge(ImageResource& image, ValueOpcode op, uint32_t pc) {
@@ -1632,7 +2003,7 @@ private:
 		} else {
 			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle, source);
 		}
-		resource = AddImage(source, memory, op, flags.pc);
+		resource = AddImage(source, memory, op, flags.pc, ArrayIndexBound(inst, memory, op));
 		if (resource == UINT32_MAX) {
 			Fail(flags.pc, "image resource limit exceeded");
 		}
@@ -1689,6 +2060,19 @@ private:
 
 	Program&                       m_program;
 	ShaderInfo                     m_info;
+	// (ArrayIndexBound's, per call: the nodes of the values met (SolveBound), the lanes whose result counts.)
+	std::vector<BoundNode>                     m_bound_nodes;
+	std::vector<BoundOperand>                  m_bound_specs;
+	std::vector<uint32_t>                      m_bound_operands;
+	std::vector<uint32_t>                      m_bound_order;
+	std::vector<std::pair<uint32_t, uint32_t>> m_bound_stack;
+	std::unordered_map<uintptr_t, uint32_t>    m_bound_index;
+	Value                                      m_lanes;
+	std::unordered_set<const Inst*>            m_lane_terms;
+	std::unordered_set<const Inst*>            m_lane_negated;
+	std::unordered_map<const Inst*, bool>      m_lanes_imply;
+	std::unordered_map<const Inst*, bool>      m_lanes_exclude;
+	std::unordered_map<const Block*, size_t>   m_block_order;
 	std::vector<DescriptorSource>  m_sources;
 	std::vector<HandlePatch>       m_handle_patches;
 	std::vector<MemoryPatch>       m_memory_patches;

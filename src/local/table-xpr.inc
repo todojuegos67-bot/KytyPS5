@@ -33,6 +33,13 @@ struct RenderExecutor::TableVariant {
 	bool                           refused        = false;   // another specialization than the pair's programs
 	// The pixel program's export mapping under this state (GetGraphicsPrograms).
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> mapping {};
+	// KYTY_HWRT (local/hwrt-scene.h): a G-buffer state's capturing pipeline (null: none, or a worker still compiles it:
+	// hwrt_make asks again, with the registers of a draw of this same state), and its pixel shader (the material hook).
+	const PipelineCache::Pipeline*                                                 hwrt_pipeline = nullptr;
+	std::shared_ptr<std::function<const PipelineCache::Pipeline*(CommandBuffer&)>> hwrt_make;
+	uint64_t                                                                       hwrt_ps    = 0;
+	bool                                                                           hwrt_scene = false;
+	vk::ShaderModule                                                               hwrt_ps_module = nullptr; // (hwrt3: material)
 };
 
 // Words a draw writes whole after resizing (TableEvaluate's T#/S# words): resize leaves the new ones uninitialized. (With
@@ -76,6 +83,9 @@ struct RenderExecutor::TableImageSet {
 	vk::DescriptorSet     set  = nullptr;
 	vk::DescriptorPool    pool = nullptr;
 	std::vector<Image>    images;
+	// (hwrt3, KYTY_HWRT_REFL_MATERIAL: HwScene::MaterialActive only) the pixel stage's sampled images, by SPIR-V binding and
+	// element (the base-colour texture of a captured mesh is chosen among them)
+	std::vector<HwScene::PsImage> hwrt_ps_images;
 	// BufferCache::BdaTableGeneration when the set got the BDA page table: made again once the table grew.
 	uint64_t              bda_generation = 0;
 	// Proven current in that frame under those registrations, by role (RenderExecutor::Role: [0] also the frame it was
@@ -624,7 +634,8 @@ bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64
 	auto&       variant = table.last_pair->variants[table.last_variant];
 	const auto& emit    = m_native_xpr->emit;
 	if (emit.command != buffer.Handle() || emit.generation != buffer.GraphicsGeneration() ||
-	    emit.state != table.last_state || emit.pipeline != variant.pipeline)
+	    emit.state != table.last_state ||
+	    (emit.pipeline != variant.pipeline && (variant.hwrt_pipeline == nullptr || emit.pipeline != variant.hwrt_pipeline)))
 		return false;
 	// (The GPU thread's: a speculation's thread does not take it.)
 	std::optional<RenderLockGuard> lock;
@@ -833,6 +844,27 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			}
 			pending.push_back(item);
 		}
+		if (program.stage == ShaderType::Pixel && HwScene::MaterialActive()) {
+			set->hwrt_ps_images.clear();
+			for (const auto& binding: program.bindings.descriptors) {
+				if (ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) != ShaderRecompiler::IR::ImageResourceClass::Sampled) continue;
+				for (uint32_t j = 0; j < binding.resources.size(); ++j) {
+					const auto& texture = prepared[st].images.at(binding.resources[j]);
+					auto*       image   = textures.TryGetImage(texture.image_id);
+					if (image == nullptr || texture.image_view == nullptr) continue;
+					HwScene::PsImage ps;
+					ps.binding          = ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind);
+					ps.element          = j;
+					ps.image_index      = texture.image_id.index;
+					ps.image_generation = texture.image_id.generation;
+					ps.serial           = image->serial;
+					ps.view             = texture.image_view;
+					ps.format           = texture.desc.view_info.format;
+					ps.type             = texture.desc.view_info.type;
+					set->hwrt_ps_images.push_back(ps);
+				}
+			}
+		}
 		if (st == 0) set->images.reserve(deps[0].size() + deps[1].size());
 		for (const auto& dep: deps[st])
 			if (dep.layout != vk::ImageLayout::eUndefined) set->images.push_back(dep);
@@ -959,8 +991,12 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 			// normal path's lookup takes the set's image back (TakeParkedImage: the same id and serial, its views kept, the
 			// other form's bytes copied in): the set then binds what that lookup and its acquisition bind. (The lookup is
 			// the proof for a depth-tiled view too, which IsSampledImageCurrent declines: the surface's storage use.)
+			// (A view the set's lookup moved into a larger image, its first layer in that image (on AMD GPUs a texture in the
+			// layers a texture pool's views hold), is no request of its own: looked up again it ended the emulator (issue
+			// #102, an RX 9070 XT). Its image is the one the set holds, and the checks below are its proof.)
 			auto       desc  = dep.desc;
-			const bool taken = textures.FindImage(desc) == dep.id && desc.view_info == dep.desc.view_info;
+			const bool taken = !TextureCache::ViewFitsImage(desc) ||
+			                   (textures.FindImage(desc) == dep.id && desc.view_info == dep.desc.view_info);
 			image            = textures.m_slot_images.try_get(dep.id); // (the lookup may have moved the slots)
 			if (taken && image != nullptr && image->serial == dep.serial && image->registered && !image->depth_id &&
 			    !image->binding.needs_rebind) {
@@ -2166,6 +2202,10 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// Frame generation's camera (FrameGen::OnDraw: the G-buffer vertex shaders' view-projection, previous one and
 	// jitter), from the block's slots: dword s of the vertex stage's block is flattened SRT slot s, as the normal path's
 	// flattened_srt. Without it every frame of a session reported "camera default" (the G-buffer draws take this path).
+	// (KYTY_HWRT: the camera from any G-buffer draw of the frame, captured or not)
+	if (HwScene::Active() && Spec::Current() == nullptr)
+		HwScene::NoteCamera(pair.programs[0]->shader_hash,
+		                    std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
 	if (FrameGen::Capturing() && Spec::Current() == nullptr)
 		FrameGen::OnDraw(pair.programs[0]->shader_hash,
 		                 std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()), 't');
@@ -2175,6 +2215,16 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (FrameGen::ContactShadowsWanted() && Spec::Current() == nullptr)
 		FrameGen::OnShadowDraw(pair.programs[0]->shader_hash,
 		                       std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()), false);
+	// (KYTY_RT_SUN: a sun cascade's draw, a depth-only draw into a layer of a square layered depth image: its layer and
+	// light matrix)
+	if (FrameGen::RtSunWanted() && Spec::Current() == nullptr && draw_state.targets.size() == 1) {
+		const auto& t = draw_state.targets[0];
+		const auto& r = t.requested;
+		if (r.IsDepth() && r.resources.layers >= 4 && r.extent.width == r.extent.height && r.extent.width >= 512)
+			FrameGen::OnSunCascadeDraw(pair.programs[0]->shader_hash,
+			                           std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()),
+			                           t.range.base_layer, r.data.address);
+	}
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
 	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;
@@ -2241,7 +2291,95 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	    std::memcmp(&emit.state->dynamic, &draw_state.dynamic, sizeof(draw_state.dynamic)) == 0)
 		emit.state = &draw_state;
 	if (!same_command || emit.state != &draw_state) NativeXprEmitDynamic(cache, vk_buffer, draw_state, same_command);
-	const auto& pipeline = *variant.pipeline;
+	// KYTY_HWRT (local/hwrt-scene.h): a G-buffer state's draws take its capturing pipeline (same layout), on this
+	// render thread only; the first record of each draw call goes in push constant dword HwScene::CursorDword.
+	bool hwrt_capture = false;
+	if (variant.hwrt_scene && HwScene::Active()) {
+		const uint32_t draws = direct != nullptr ? 1u : static_cast<uint32_t>(commands.size());
+		if (Role() != 0 || Spec::Current() != nullptr) {
+			HwScene::NoteSkip(HwScene::Skip::Speculation, draws);
+		} else {
+			if (variant.hwrt_pipeline == nullptr && variant.hwrt_make) variant.hwrt_pipeline = (*variant.hwrt_make)(buffer);
+			if (variant.hwrt_pipeline == nullptr || variant.hwrt_pipeline->pipeline_layout != variant.pipeline->pipeline_layout)
+				HwScene::NoteSkip(HwScene::Skip::NoVariant, draws);
+			else
+				hwrt_capture = true;
+		}
+	}
+	if (hwrt_capture) HwScene::NoteCamera(pair.programs[0]->shader_hash,
+	                                      std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
+	if (hwrt_capture) {
+		// (A program's push data reaching the cursor's dword: drawn uncaptured.)
+		uint32_t reach = 0;
+		for (uint32_t st = 0; st < stages; ++st) {
+			const auto& bindings = pair.programs[st]->bindings;
+			if (bindings.UsesPushData()) reach = std::max(reach, bindings.push_data_start_dword + bindings.ShaderDataDwords());
+		}
+		if (reach > HwScene::CursorDword) {
+			HwScene::NoteSkip(HwScene::Skip::PushData, direct != nullptr ? 1u : static_cast<uint32_t>(commands.size()));
+			hwrt_capture = false;
+		}
+	}
+	// The call's meshes noted before the pipeline is chosen: a call none of whose draws is captured this frame (a cached
+	// mesh: most of them) takes the game's own pipeline (10-26: the capture variant on every G-buffer draw, reading its
+	// record per vertex, was most of a 6 fps frame).
+	uint32_t                 hwrt_direct_cursor = 0;
+	std::array<uint32_t, 64> hwrt_cursors {};
+	if (hwrt_capture) {
+		const uint64_t hwrt_index_size = index_type == vk::IndexType::eUint32 ? 4u : 2u;
+		const auto     hwrt_note       = [&](uint32_t record, uint32_t index_count, uint32_t instance_count, uint32_t first_index,
+                                    int32_t vertex_offset) -> bool {
+			HwScene::Draw d;
+			d.vs             = pair.programs[0]->shader_hash;
+			d.ps             = variant.hwrt_ps;
+			if (HwScene::MaterialActive()) {
+				d.ps_module = variant.hwrt_ps_module;
+				d.ps_images = &set->hwrt_ps_images;
+				d.cache     = &texture_cache;
+			}
+			d.index_size     = static_cast<uint32_t>(hwrt_index_size);
+			d.index_count    = index_count;
+			d.instance_count = instance_count;
+			d.vertex_offset  = vertex_offset;
+			const uint64_t begin = index_base + uint64_t {first_index} * hwrt_index_size;
+			if (indexed && buffer_cache.IsRegionGpuModified(begin, uint64_t {index_count} * hwrt_index_size)) {
+				HwScene::NoteSkip(HwScene::Skip::GpuWritten);
+				return false;
+			}
+			d.index_address = indexed && index_base != 0 && begin + uint64_t {index_count} * hwrt_index_size <= index_base + index_bytes
+			                      ? begin
+			                      : 0;
+			return HwScene::Note(record, d);
+		};
+		bool any = false;
+		if (direct != nullptr) {
+			hwrt_direct_cursor = HwScene::Reserve(1);
+			const auto& vertex = *pair.programs[0];
+			const auto  word   = [&](int32_t sgpr) {
+                const auto index = int64_t {sgpr} - vertex.user_data_base;
+                return index >= 0 && index < static_cast<int64_t>(user_data[0].size()) ? user_data[0][index] : 0u;
+			};
+			const uint32_t index_offset  = buffer.GetUserConfig().GetIndexOffset();
+			const uint32_t vertex_offset = variant.fetch_embedded && index_offset == 0 ? word(vertex.info.vertex_offset_sgpr) : index_offset;
+			if (indexed) any |= hwrt_note(hwrt_direct_cursor, direct->index_count, direct->instance_count, 0, static_cast<int32_t>(vertex_offset));
+			else HwScene::NoteSkip(HwScene::Skip::Topology);
+		}
+		for (uint32_t group = 0, first_command = 0; group < groups; first_command += group_sizes[group], ++group) {
+			// Each indirect draw's arguments as the game's CPU wrote them (guest memory): the mesh's counts and offsets.
+			hwrt_cursors[group] = HwScene::Reserve(group_sizes[group]);
+			for (uint32_t i = 0; i < group_sizes[group]; ++i) {
+				if (buffer_cache.IsRegionGpuModified(commands[first_command + i], stride)) {
+					HwScene::NoteSkip(HwScene::Skip::GpuWritten);
+					continue;
+				}
+				const auto* args = reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(commands[first_command + i]);
+				any |= hwrt_note(hwrt_cursors[group] + i, args->indexCount, args->instanceCount, args->firstIndex, args->vertexOffset);
+			}
+		}
+		hwrt_capture = any;
+	}
+	const auto& pipeline = hwrt_capture ? *variant.hwrt_pipeline : *variant.pipeline;
+	const PipelineCache::Pipeline* bound_pipeline = &pipeline;
 	if (!same_command || emit.pipeline != &pipeline)
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, BindPipelineHandle(pipeline));
 	if (!same_command || emit.pipeline != &pipeline || table.last_set != set)
@@ -2270,6 +2408,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		                        vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 		                        push_dwords * sizeof(uint32_t), push_data.dwords.data());
 	if (!same_index) vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
+	const auto push_cursor = [&](uint32_t cursor) {
+		vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+		                        HwScene::CursorDword * sizeof(uint32_t), sizeof(uint32_t), &cursor);
+	};
+	if (hwrt_capture && direct != nullptr) push_cursor(hwrt_direct_cursor);
 	if (direct != nullptr) {
 		// This draw's offsets, as the normal path's ResolveVertexOffset/ResolveInstanceOffset give them: the index
 		// offset register, else (a vertex program that fetches) the user data its fetch adds.
@@ -2288,9 +2431,13 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		else
 			vk_buffer.draw(direct->index_count, direct->instance_count, vertex_offset, first_instance);
 	}
-	for (uint32_t group = 0; group < groups; ++group)
+	for (uint32_t group = 0, first_command = 0; group < groups; first_command += group_sizes[group], ++group) {
+		if (hwrt_capture) push_cursor(hwrt_cursors[group]);
 		vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second, group_sizes[group],
 		                              static_cast<uint32_t>(stride));
+	}
+	if (FrameGen::RtParticlesDebug() && !draw_state.targets.empty()) // (rtparticles census: this path's draws by target)
+		FrameGen::NoteOtherPathDraw(draw_state.targets[0].requested.data.address, 0, false, 1);
 	if (FrameGen::Capturing()) FrameGen::AfterDraw(buffer); // (frame generation's HUD-less image)
 	// As the normal path's: shaders that write buffers end the rendering, and a barrier orders their writes.
 	if (writes) {
@@ -2300,7 +2447,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	emit.command     = vk_buffer;
 	emit.generation  = buffer.GraphicsGeneration();
 	emit.state       = &draw_state;
-	emit.pipeline    = &pipeline;
+	emit.pipeline    = bound_pipeline;
 	draw_state.Use(m_context.FrameNumber());
 	if (indexed) {
 		emit.index_base  = index_base;
@@ -2557,6 +2704,58 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		variant->mapping        = mapping;
 		variant->fetch_embedded = table_state.vs_input_info.fetch_embedded;
 	}
+	// KYTY_HWRT (local/hwrt-scene.h): a G-buffer draw state (>= 3 colour targets, a single-layer depth target >= 1280 px
+	// wide it writes, a triangle list) gets the capturing variant of its pipeline too, compiled by a worker.
+	// (10-25 combo25: the G-buffer pass draws after the depth prepass with depth writes off - a depth-equal test - so
+	// depth writes alone found 5 states: a state that writes depth, tests it for equality, or is a known G-buffer
+	// vertex shader's qualifies; decals test without writing and are not equal tests.)
+	const bool hwrt_gbuffer_vs = vertex != nullptr && FrameGen::IsGbufferVertexShader(vertex->shader_hash);
+	const bool hwrt_depth      = state.depth_info.depth_write_enable ||
+	                        (state.depth_info.depth_test_enable && state.depth_info.depth_compare_op == vk::CompareOp::eEqual) ||
+	                        hwrt_gbuffer_vs;
+	if (HwScene::Active() && Role() == 0 && state.color_count >= 3 && state.depth_info.image_id &&
+	    state.depth_info.desc.info.resources.layers == 1 && state.depth_info.desc.info.extent.width >= 1280) {
+		static std::atomic<uint32_t> hwrt_reports {0};
+		if (hwrt_reports.fetch_add(1, std::memory_order_relaxed) < 48) {
+			std::printf("HWRT: G-buffer-like state VS %016llx PS %016llx: %u colours, depth %ux%u test %d write %d op %d, topology %d "
+			            "restart %d, known G-buffer VS %d -> %s\n",
+			            static_cast<unsigned long long>(vertex != nullptr ? vertex->shader_hash : 0),
+			            static_cast<unsigned long long>(pixel != nullptr ? pixel->shader_hash : 0), state.color_count,
+			            state.depth_info.desc.info.extent.width, state.depth_info.desc.info.extent.height,
+			            state.depth_info.depth_test_enable ? 1 : 0, state.depth_info.depth_write_enable ? 1 : 0,
+			            static_cast<int>(state.depth_info.depth_compare_op), static_cast<int>(topology), primitive_restart_enable ? 1 : 0,
+			            hwrt_gbuffer_vs ? 1 : 0,
+			            hwrt_depth && topology == vk::PrimitiveTopology::eTriangleList && !primitive_restart_enable ? "captured" : "not");
+			std::fflush(stdout);
+		}
+	}
+	if (HwScene::Active() && Role() == 0 && state.color_count >= 3 && state.depth_info.image_id && hwrt_depth &&
+	    state.depth_info.desc.info.resources.layers == 1 &&
+	    state.depth_info.desc.info.extent.width >= 1280 && topology == vk::PrimitiveTopology::eTriangleList &&
+	    !primitive_restart_enable) {
+		const auto module = HwScene::CaptureModule(m_context.GetGraphics(), table_state.programs.vertex.module);
+		HwScene::NoteSceneState(module != nullptr);
+		if (module) {
+			const ShaderProgram capture_program {HwScene::VariantId(table_state.programs.vertex.id), module};
+			auto make = std::make_shared<std::function<const PipelineCache::Pipeline*(CommandBuffer&)>>(
+			    [this, s = table_state, topology, primitive_restart_enable, capture_program](CommandBuffer& command) {
+				    return static_cast<const PipelineCache::Pipeline*>(m_context.GetPipelineCache().TryCreateGraphicsPipeline(
+				        std::span<const RenderColorInfo> {s.color_info, s.color_count}, s.depth_info, s.vs_input_info, command,
+				        s.ps_active ? &s.ps_input_info : nullptr, topology, primitive_restart_enable, capture_program,
+				        s.programs.pixel, true));
+			    });
+			const auto* made  = (*make)(buffer);
+			const auto  write = CatalogWrite();
+			auto variant = std::ranges::find(pair->variants, table.store_state, &TableXpr::Variant::state);
+			if (variant != pair->variants.end()) {
+				variant->hwrt_scene    = true;
+				variant->hwrt_ps       = pixel != nullptr ? pixel->shader_hash : 0;
+				variant->hwrt_ps_module = table_state.programs.pixel.module;
+				variant->hwrt_make     = std::move(make);
+				variant->hwrt_pipeline = made;
+			}
+		}
+	}
 	NativeXprCaptureState(buffer, state, rendering, table.store_state);
 }
 
@@ -2644,6 +2843,9 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	// (RenderExecutor::DispatchDirect, FrameGen::OnDispatch): one dispatch a frame.
 	if (FrameGen::Capturing() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
 		return m_dispatch_declined = "table: frame generation (TAA)", false;
+	// (KYTY_HWRT: the TAA's dispatch is where the scene's acceleration structures are built, on the normal path.)
+	if (HwScene::Active() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
+		return m_dispatch_declined = "table: hardware ray tracing (TAA)", false;
 	TablePrefetchPair(pair);
 	if (Role() == 0) pair.used_frame = m_context.FrameNumber();
 	if (Role() == 0) TablePrefetchNext(OwnTable().previous_dispatch, pair);

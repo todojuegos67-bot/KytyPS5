@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/presentation/window/hostInput.h"
 #include "kernel/pthread.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "libs/errno.h"
@@ -197,6 +198,7 @@ struct VideoOutConfig {
 	bool                                closing     = false;
 	int                                 flip_rate   = 0;
 	uint64_t                            last_flip_vblank = 0; // vblank_status.count at the last flip
+	int                                 displayed_index  = -1; // the last flipped buffer (on screen), under FlipQueue's mutex
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -240,6 +242,7 @@ private:
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
 		uint64_t                    latency_index; // KYTY_ANTILAG: the frame's index (local/anti-lag.h), 0 none
+		uint64_t                    kbm_seq;       // KYTY_KBM: the game-frame pad reads this frame shows (HostInputKbmOnFlip)
 	};
 
 	Graphics::Presenter& m_presenter;
@@ -252,6 +255,7 @@ private:
 	std::list<Request>   m_cancelled_requests;
 	bool                 m_processing      = false;
 	uint64_t             m_next_request_id = 1;
+	double               m_min_flip_ms     = 0.0; // the last release's minimum interval (its floor), under m_mutex
 };
 
 struct VideoOutDriver::Impl {
@@ -1298,9 +1302,11 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	r.source     = source;
 	r.state      = RequestState::Reserved;
 	r.latency_index = Graphics::AntiLag::OnFlipReserved(); // KYTY_ANTILAG (local/anti-lag.h)
+	r.kbm_seq       = Graphics::HostInputKbmOnFlip();     // KYTY_KBM: one stick per game frame; the warp's shown reads
 
 	pending.push_back(r);
 	request_id = r.id;
+	Graphics::AntiLag::NoteFlipDepth(static_cast<int>(m_requests.size() + m_cpu_requests.size()));
 
 	cfg.flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
@@ -1347,6 +1353,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 			it = queue->erase(it);
 		}
 	}
+	cfg.displayed_index = -1; // (KYTY_DISPLAYED_WAIT)
 	m_done_cond_var.SignalAll();
 	m_submit_slot_cond_var.SignalAll();
 	m_submit_cond_var.SignalAll();
@@ -1505,6 +1512,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 		}
 		request->state      = RequestState::Ready;
 		request->ready_time = std::chrono::steady_clock::now();
+		Graphics::AntiLag::OnFlipReady(request->latency_index); // KYTY_LOWLAT pacing / [lat] stages
 		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
 		return;
@@ -1534,6 +1542,39 @@ void FlipQueue::WaitForSubmitSlot() {
 	}
 }
 
+// KYTY_DISPLAYED_WAIT (off by default; 1: under a flip floor of 10 ms or more, 2: always): the game's
+// WaitUntilSafeForRendering (PM4 WAIT_FLIP_DONE) also waits while the buffer is on screen, until a later flip queued
+// for the port replaced it: the console's "safe for rendering". Without it a buffer was free once its own flip was
+// released (our presenter shows a copy), one flip earlier than on the console. Demon's Souls registers 2 display
+// buffers (CRenderDisplay::RegisterFlip, sceVideoOutRegisterBuffers2 count 2) and waits for its back buffer before its
+// last pass: under a 30 fps floor it rendered into the buffer just put on screen and kept 2 flips queued (gpu done ->
+// flip 66 ms, logs 202407 / 213420 / 215007); with the console's rule 1 (~33 ms). Never waits for a flip that is not
+// queued (no deadlock), at most 200 ms (a paused presenter).
+static int DisplayedWaitMode() {
+	static const int mode = [] {
+		const char* v = std::getenv("KYTY_DISPLAYED_WAIT");
+		const int   m = v != nullptr ? std::clamp(std::atoi(v), 0, 2) : 0;
+		if (m != 0) {
+			std::printf("Flips: a display buffer is safe for rendering once a later flip replaced it on screen, as on the "
+			            "console (KYTY_DISPLAYED_WAIT=%d%s)\n",
+			            m, m == 1 ? ": under a flip floor of 10 ms or more" : ": always");
+			std::fflush(stdout);
+		}
+		return m;
+	}();
+	return mode;
+}
+
+namespace {
+struct DisplayedWaitStats {
+	std::chrono::steady_clock::time_point start {};
+	uint32_t                              waits = 0, timeouts = 0, free = 0, unreplaced = 0;
+	double                                sum_ms = 0.0, max_ms = 0.0;
+	bool                                  first_logged = false;
+};
+DisplayedWaitStats g_displayed_wait; // under FlipQueue's m_mutex
+} // namespace
+
 void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	Common::LockGuard lock(m_mutex);
 
@@ -1544,6 +1585,59 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	};
 	while (has_request()) {
 		m_done_cond_var.Wait(&m_mutex);
+	}
+
+	const int mode = DisplayedWaitMode();
+	if (mode == 0 || (mode == 1 && m_min_flip_ms < 10.0)) return;
+	// On screen, and a later flip of this port queued that will replace it (else nothing would: no wait).
+	auto replacing = [this, &cfg, index] {
+		auto other = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index != index; };
+		return std::any_of(m_requests.begin(), m_requests.end(), other) ||
+		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), other);
+	};
+	auto& s   = g_displayed_wait;
+	auto  now = std::chrono::steady_clock::now();
+	if (s.start == std::chrono::steady_clock::time_point {}) s.start = now;
+	if (cfg.displayed_index != index) {
+		s.free++;
+	} else if (!replacing()) {
+		s.unreplaced++;
+	} else {
+		if (!s.first_logged) {
+			s.first_logged = true;
+			size_t pending = 0;
+			for (const auto& r: m_requests) pending += r.cfg == &cfg ? 1 : 0;
+			for (const auto& r: m_cpu_requests) pending += r.cfg == &cfg ? 1 : 0;
+			std::printf("[displayed-wait] first: buffer %d on screen, %zu flip(s) queued; waiting for the next flip (floor %.1f ms)\n",
+			            index, pending, m_min_flip_ms);
+			std::fflush(stdout);
+		}
+		const auto begin = now;
+		const auto until = begin + std::chrono::milliseconds(200);
+		bool       timed_out = false;
+		while (cfg.displayed_index == index && replacing()) {
+			now = std::chrono::steady_clock::now();
+			if (now >= until) {
+				timed_out = true;
+				break;
+			}
+			m_done_cond_var.WaitFor(&m_mutex, static_cast<uint32_t>(
+			                                      std::chrono::duration_cast<std::chrono::microseconds>(until - now).count()));
+		}
+		now             = std::chrono::steady_clock::now();
+		const double ms = std::chrono::duration<double, std::milli>(now - begin).count();
+		s.waits++;
+		s.sum_ms += ms;
+		s.max_ms = std::max(s.max_ms, ms);
+		if (timed_out) s.timeouts++;
+	}
+	if (now - s.start >= std::chrono::seconds(5)) {
+		std::printf("[displayed-wait] 5 s: %u waits (mean %.1f ms, max %.1f), %u timeouts; %u buffers already off screen, %u on "
+		            "screen with no later flip queued; floor %.1f ms\n",
+		            s.waits, s.waits ? s.sum_ms / s.waits : 0.0, s.max_ms, s.timeouts, s.free, s.unreplaced, m_min_flip_ms);
+		std::fflush(stdout);
+		s       = DisplayedWaitStats {.first_logged = s.first_logged};
+		s.start = now;
 	}
 }
 
@@ -1786,7 +1880,24 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	r.cfg->mutex.Unlock();
 
 	NoteFlipSubmitted(r.submit_time);
+	if (Graphics::AntiLag::PaceOn() || Graphics::AntiLag::PhaseOn() || Graphics::AntiLag::PadLateOn()) {
+		// KYTY_LOWLAT_PACE_BEFORE_INPUT / KYTY_PAD_LATE_MS / KYTY_PHASE_PACE: the configured cap of a game-view frame (never a movie, menu, cinematic, loading
+		// screen, or FG pacing's own release), else 0 (the pacing off).
+		const bool capped = r.frame != nullptr && !scene_free && !fg_off && !s_fg_paced && !MoviePlaying() && !CinematicPlaying() &&
+		                    Graphics::Presenter::IsSceneFrame(*r.frame) &&
+		                    (!Graphics::Presenter::GeneratesFrames() || Graphics::Presenter::IsGameView(*r.frame)) &&
+		                    (FlipFpsFloor() > 0 || g_dyn_flip_floor.load(std::memory_order_relaxed) > 0 || r.cfg->flip_rate > 0);
+		const int  vblanks = std::max(floor, r.cfg->flip_rate) + 1; // (the game's own rate: 202407, 30 fps on flip rate 1)
+		Graphics::AntiLag::SetPaceCap(capped && vblanks > 1 ? 1000.0 * static_cast<double>(vblanks) / vblank_hz : 0.0,
+		                              1000.0 / vblank_hz);
+	}
+	Graphics::AntiLag::OnFlipReleased(r.latency_index); // KYTY_LOWLAT pacing / [lat] stages
+	if (Graphics::AntiLag::PhaseOn())
+		Graphics::AntiLag::PhaseRelease(r.ready_time != std::chrono::steady_clock::time_point {}
+		                                    ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r.ready_time).count()
+		                                    : -1.0);
 	Graphics::Presenter::SetLatencyIndex(*r.frame, r.latency_index);
+	Graphics::Presenter::SetKbmSeq(*r.frame, r.kbm_seq);
 	m_presenter.Submit(*r.frame);
 
 	r.cfg->mutex.Lock();
@@ -1796,6 +1907,11 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 		EXIT("video-out flip queue changed while processing its front request\n");
 	}
 	m_requests.pop_front();
+	Graphics::AntiLag::NoteFlipDepth(static_cast<int>(m_requests.size() + m_cpu_requests.size()));
+	// KYTY_DISPLAYED_WAIT: the buffer now on screen, and this release's floor (Wait).
+	r.cfg->displayed_index = r.index;
+	m_min_flip_ms          = std::max(1000.0 * static_cast<double>(std::max(floor, r.cfg->flip_rate) + 1) / vblank_hz,
+	                                  s_fg_paced ? g_fg_pacing.target * 1000.0 : 0.0);
 
 	if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
 		r.cfg->flip_status.count++;

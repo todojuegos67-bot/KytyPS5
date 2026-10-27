@@ -210,6 +210,7 @@ enum : uint32_t {
 	OpUDiv                         = 134,
 	OpUMod                         = 137,
 	OpFDiv                         = 136,
+	OpVectorTimesScalar            = 142,
 	OpIAddCarry                    = 149,
 	OpUMulExtended                 = 151,
 	OpSMulExtended                 = 152,
@@ -320,6 +321,8 @@ enum : uint32_t {
 	GlslUnpackHalf2x16  = 62,
 	GlslFindILsb        = 73,
 	GlslFindUMsb        = 75,
+	GlslNMin            = 79,
+	GlslNMax            = 80,
 };
 
 struct InputBinding {

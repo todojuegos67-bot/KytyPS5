@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include "common/assert.h"
+#include "local/mem-guard.h"
+#include "ram-guard.h"
 #include "gpu_tiler_shaders/gpu_tiler_demote_d24_to_d16_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_demote_d32_to_d16_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_promote_d16_to_d24_spv.h"
@@ -23,6 +25,38 @@
 
 namespace Libs::Graphics {
 
+// The tile manager whose pool the periodic RAM flush releases (ram-guard.h), and the lock the flush holds meanwhile.
+static std::atomic<TileManager*> g_flush_tile_manager {nullptr};
+static std::mutex                g_flush_tile_mutex;
+
+uint64_t TileManager::FlushScratchPool(uint64_t budget, uint64_t* held_us) {
+	std::scoped_lock flush_lock(g_flush_tile_mutex);
+	auto*            self = g_flush_tile_manager.load(std::memory_order_acquire);
+	if (self == nullptr) return 0;
+	std::vector<PooledScratch> taken;
+	uint64_t                   bytes = 0;
+	{
+		const auto       start = std::chrono::steady_clock::now();
+		const auto       old   = start - std::chrono::seconds(30);
+		std::scoped_lock lock(self->m_scratch_mutex);
+		for (auto it = self->m_scratch_pool.begin(); it != self->m_scratch_pool.end() && bytes < budget;) {
+			if (it->pooled_at > old) {
+				++it;
+				continue;
+			}
+			bytes += it->capacity;
+			taken.push_back(*it);
+			it = self->m_scratch_pool.erase(it);
+		}
+		self->m_scratch_pool_bytes -= std::min(self->m_scratch_pool_bytes, bytes);
+		if (held_us != nullptr)
+			*held_us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+	}
+	for (const auto& item: taken) vmaDestroyBuffer(self->m_graphics.allocator, item.buffer, item.allocation);
+	return bytes;
+}
+
 // Freed scratch buffers kept for reuse: at most this much.
 static constexpr uint64_t ScratchPoolBudget = 512ull << 20u;
 
@@ -30,6 +64,27 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_graphics(graphics), m_scheduler(scheduler) {
 	// Kept scratch is video memory too: a smaller GPU keeps less (8 GB: ~200 MiB).
 	m_scratch_pool_budget = std::min(ScratchPoolBudget, m_graphics.GetTotalMemoryBudget() / 32);
+	// The periodic RAM flush (ram-guard.h): the buffers pooled 30 s and not reused.
+	g_flush_tile_manager.store(this, std::memory_order_release);
+	{
+		static std::once_flag once;
+		std::call_once(once, [] {
+			RamGuard::RegisterBudgetFlush("tiling scratch pool", RamGuard::FlushCaches, &TileManager::FlushScratchPool);
+		});
+	}
+	// Out of memory (MemGuard): the pooled scratch buffers (the GPU is done with them) go; made again when needed.
+	m_mem_guard_id = MemGuard::RegisterReleaser("tiling scratch pool", [this] {
+		std::vector<PooledScratch> pooled;
+		uint64_t                   bytes = 0;
+		{
+			std::scoped_lock lock(m_scratch_mutex);
+			pooled.swap(m_scratch_pool);
+			bytes                = m_scratch_pool_bytes;
+			m_scratch_pool_bytes = 0;
+		}
+		for (const auto& item: pooled) vmaDestroyBuffer(m_graphics.allocator, item.buffer, item.allocation);
+		return bytes;
+	});
 	static_assert(FamilyCount == 9);
 	static_assert(sizeof(Push) == 52);
 	static_assert(std::size(GPU_TILER_VARIANTS) == PipelineCount);
@@ -60,6 +115,13 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler)
 }
 
 TileManager::~TileManager() {
+	{
+		// (The flush takes the pool's lock while it uses this: it is done with it once the lock is ours.)
+		TileManager* self = this;
+		g_flush_tile_manager.compare_exchange_strong(self, nullptr, std::memory_order_acq_rel);
+		std::scoped_lock lock(g_flush_tile_mutex);
+	}
+	if (m_mem_guard_id != 0) MemGuard::UnregisterReleaser(m_mem_guard_id);
 	if (m_timing_pool != nullptr) m_graphics.device.destroyQueryPool(m_timing_pool, nullptr);
 	for (const auto& pooled: m_scratch_pool) {
 		vmaDestroyBuffer(m_graphics.allocator, pooled.buffer, pooled.allocation);
@@ -143,6 +205,10 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 		result         = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
 		if (result == VK_SUCCESS) m_graphics.ReportMemoryFallback("a tiling scratch buffer is in system memory", capacity);
 	}
+	// Still refused: release passes and more tries (MemGuard); then RequireVulkanSuccess's out-of-memory message.
+	for (int attempt = 0; result != VK_SUCCESS && MemGuard::ShouldRetry("a tiling scratch buffer", capacity, attempt);
+	     ++attempt)
+		result = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
 	RequireVulkanSuccess(static_cast<vk::Result>(result), "allocate TileManager scratch buffer");
 	return {buffer, memory, size};
 }

@@ -965,6 +965,18 @@ uint32_t DisplayHeight(void* window) {
 	return static_cast<uint32_t>(mode.dmPelsHeight);
 }
 
+uint32_t DisplayWidth(void* window) {
+	HMONITOR monitor = window != nullptr ? MonitorFromWindow(static_cast<HWND>(window), MONITOR_DEFAULTTONEAREST)
+	                                     : MonitorFromPoint(POINT {0, 0}, MONITOR_DEFAULTTOPRIMARY);
+	MONITORINFOEXW info {};
+	info.cbSize = sizeof(info);
+	if (monitor == nullptr || GetMonitorInfoW(monitor, &info) == FALSE) return 0;
+	DEVMODEW mode {};
+	mode.dmSize = sizeof(mode);
+	if (EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) == FALSE) return 0;
+	return static_cast<uint32_t>(mode.dmPelsWidth);
+}
+
 bool StartDisplayVblanks(void* window) {
 	g_display_vblanks.window.store(static_cast<HWND>(window));
 	if (g_display_vblanks.started.load()) return true;
@@ -1595,6 +1607,7 @@ inline size_t Hash(uint64_t address) {
 
 static std::atomic<uint64_t> g_simulation_ballast {0};
 void SetSimulationBallast(uint64_t bytes) { g_simulation_ballast = bytes; }
+uint64_t SimulationBallast() { return g_simulation_ballast.load(); }
 
 bool MemoryTagsEnabled() {
 	// KYTY_MEMORY_TAGS=1 (default off): a regression (black screen after the intro video on an RTX) followed the
@@ -2288,6 +2301,10 @@ uint32_t DisplayHeight(void* /*window*/) {
 	return 0;
 }
 
+uint32_t DisplayWidth(void* /*window*/) {
+	return 0;
+}
+
 bool StartDisplayVblanks(void* /*window*/) {
 	return false;
 }
@@ -2372,6 +2389,7 @@ void StartWorkingSetTrim() {}
 void KeepResident() {}
 void StartMemoryBreakdown() {}
 void SetSimulationBallast(uint64_t) {}
+uint64_t SimulationBallast() { return 0; }
 bool MemoryTagsEnabled() { return false; }
 void MemoryTagAdd(int, int64_t, int64_t) {}
 void SetTrimRunner(void (*)(void (*)())) {}

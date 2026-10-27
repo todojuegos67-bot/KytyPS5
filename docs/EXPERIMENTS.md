@@ -527,3 +527,114 @@ GPU 碰撞只给脚部 IK：`GpuCollisionManager::CastRay` 全镜像唯一调用
 - User: with the game's TAA the image is fine; without it (sin TAA) whole scenes are darker in some zones.
 - TAA shader a44e580f4f0cfb2b (dumped with KYTY_SHADER_DUMP): works in tonemapped space (c/(1+luma 0.3/0.59/0.11), inverse at the end); multiplies the history (5-tap bicubic of the previous output) by a constant (S_BUFFER_LOAD offset 24 of the buffer at s30+240), likely an exposure ratio. Steady state out = w*cur/(1-(1-w)K): brighter than the raw frame when K > 1. Skipping the TAA loses it.
 - Next: log that constant per frame in those zones; then apply the same factor before the upscaler. Also a bug found: DlssUpscale passes jitter 0 (meant for the TAA's resolved output), but with KYTY_TAA_REPLACE=upscaler the input is the raw jittered frame: it needs the camera jitter like the TAA path.
+
+## 2026-10-25 — RAM flush ("Vaciado RAM"): where the memory goes, what a flush can return (ramflush-1025)
+- Figures from the user's 64 GB / RTX 5090 log of 10-24 21:23 (c646a54, no flush): process private 12.2 GiB, working set
+  15.6 GiB, guest store 13824 MiB all committed (SEC_COMMIT; the game maps ~11.3 GiB), video memory in use 6.1 GiB (VMA
+  device-local 5.2, driver 0.9), Vulkan host memory 1.3 GiB, buffer cache 1.4-1.5 GiB registered, ~5.9K pipelines alive
+  (~220 KB of driver RAM each: ~1.3 GB). System: 29-35 GiB in use, commit 43-53 of 68 GiB; the emulator's own share is
+  ~15.6 GiB of RAM and ~26 GiB of commit (12.2 private + 13.8 store). The overlay's "RAM x / 64, Commit y / 68" are the
+  PC's figures, not the process's: the flush line now prints both.
+- Private bytes are mostly not RAM: NVIDIA's driver charges every device-local allocation to the process's commit (a 7.8 GB
+  video-memory ballast grew the private bytes 8.2 GB, 10-24): ~5-6 GiB of the 12.2 are the video memory in use. The
+  "Private breakdown" line showed 8.2 GiB in ~1600 allocations of 1-64 MiB (the driver's) and 3 GiB in >= 64 MiB blocks.
+- What a pass can decommit for real is small while the game plays: freed images kept for reuse (0.2-0.3 GiB), VMA free
+  blocks (0.2), idle scratch, heap free blocks; guest memory the game released is dropped (DiscardVirtualMemory: RAM, not
+  commit - a page-file section's pages cannot be decommitted; only a store of many sections, each closed and made again
+  when wholly free, could return that commit: not done, the "guest store free" census figure says what it would be worth).
+- So the flush option now turns on what lowers the held memory all along (ApplyFlushDefaults, ram-guard.h):
+  KYTY_BACKING_ON_DEMAND=1 (-2.2..2.5 GiB of commit: the 16 GB default since 10-23), KYTY_RAM_DIET=1 (pipelines idle
+  180 s: ~0.5-1.3 GB of RAM+commit after a world change), KYTY_SOFT_RELEASE=1; level 2 (KYTY_RAM_FLUSH_LEVEL=2) adds
+  KYTY_TEXTURE_OFFLOAD=1 (0.8-2 GB of RAM measured on a 5090, 10-20) and images idle 120 s out of video memory
+  (KYTY_RAM_FLUSH_IMAGE_IDLE_SECONDS: commit on NVIDIA, re-uploads on return). Rejected again: any working-set trim
+  (EmptyWorkingSet / SetProcessWorkingSetSize / VirtualUnlock: paging, 0x1A bug checks); KYTY_RAM_FLUSH_TRIM stays opt-in.
+- Expected on the user's PC: commit -3..4.5 GiB (store 2.5, pipelines 0.5-1.3, pools 0.3-0.5, idle images at level 2
+  up to the idle share of the 5 GiB of images), RAM -1..3 GB (offload, pipelines, freed guest pages). More than that
+  is the game's live data: not returnable without paging it out. Verify with "RAM flush #N" (PC: RAM in use / commit
+  before -> after) and "RAM census" lines.
+
+## 2026-10-25 shadows-1025 — local-light / shadow-map quality (non-sun)
+- Evidence (today's logs 091911 / 130923 / 134203 / 172949, build c3e58bd): the 1024x1024x80 D32 spot pool renders 5-14 layers a
+  frame (binds 300+ at the lamps), "layers refreshed from guest memory" only equal the sampled streamer layers (kept 0 /
+  changed 0: no GPU-rendered layer was dirtied, KYTY_SHADOW_REFRESH_FIX never had to act); no "RTLS:" line in any log: the
+  RT local-shadow light-list discovery (KYTY_RTLS_DEBUG, rtlocal step 1) has not been run yet, so step 2 (per-pixel rays to
+  the N nearest lights) stays blocked on that proof.
+- The game has no convar for the shadow filter, penumbra, spot resolution or distance (eboot strings + the shipped
+  coredata/enginesupport/debugmenu/debugrendermenulighting.txt): the shadow convars are the launcher's sun cascades,
+  r_enableSpotShadows, r_contactShadows{Enabled,Distance,Thickness,Softness} (0..1 each) and the ambient (capsule)
+  shadowing: r_ambientShadowMinAmbient / MinDirectional (0..1), ConeAngle (1..89), RadiusToFadeRange (5..50),
+  RadiusToFadeRangePow (0.1..4), r_enableAmbientShadowingLocalLightSource (one local light's capsule shadows). The
+  console's renderconfig_ps5_{high,perf}.txt only set r_virtualGeometryNumShadowCascades=2.
+- KYTY_SHADOW_FILTER=1|2|3 (spirvEmitterImage.cpp): every depth-compare sample / gather of a non-cube 2D-array shadow map
+  widened at translation (4-tap rotated grid / 9-tap Poisson / PCSS: 8-tap blocker search + 12 taps at the penumbra;
+  KYTY_SHADOW_FILTER_RADIUS, _SCALE (1000), _MAX (7)). Default 0: SPIR-V unchanged. A level changes the SPIR-V of the
+  shaders reading shadow maps: their pipelines compile at first use (fast build or a stall with KYTY_PIPELINE_FAST_BUILD=0).
+- KYTY_GTAO_FLOOR (0.3..0.95, 0.7): the GTAO composite's darkest multiplier ("profundidad").
+- Not done, with the reason: shadow-atlas upscale (no render-target scaling in the emulator; the cube pool is written as
+  an R32 storage image with integer coordinates; the spot pool's per-layer guest hashes assume the guest layout);
+  local-light contact shadows (need the light positions: step 1's proof).
+
+## 2026-10-25 RT particles (rtparticles-1025): the particle pass's own emission for the fire light, a reactive mask
+
+- Evidence on how the game draws particles (`tools/local/static-precompile/files-PPSA01341_01.007.000.files`, the engine's
+  `coredata/enginesupport/shaders/_ps5/particle-*`): 603 cooked particle CS (one per emitter) simulate on the GPU;
+  `particle-sort-prep` + `particle-sort` (bitonic) order them; one engine pass `particle-translucent` (main_vs_79da320e + 3
+  main_ps variants, plus ultralow / underwater / displacement / distortion / motionblur / fog / ui variants) draws them
+  blended onto the HDR scene colour; `particle-lightmap-update` (4 CS) lights them from the game's lights; `particle-apply-
+  distortion` is a CS after them; `particle-clear`, `-connect-ribbons`, `-smooth-ribbons`. No half-res particle target
+  in the engine's pass list (`depthawareupsample` exists, one CS: fog). The PS5 Pro super-resolution packet has a slot 6
+  "reactive mask" the game prepares (`preparereactivemask` CS) that the emulator never used (logged by the debug switch).
+  Particles write no depth: the SSGI fire light (rtfire) placed a flame's light at the surface behind it and took the
+  whole pixel (flame + wall) as the radiance, finding flames only by lit/albedo ratio (never over the sky).
+- `KYTY_RT_PARTICLES=1`: the scene colour is copied right before the frame's first blended, depth-test-on, depth-write-off
+  draw into the upscaler's colour image (the particle pass; `KYTY_RT_PARTICLES_VS=<hex,..>` pins the shaders,
+  `KYTY_RT_PARTICLES_ANYDEPTH=1` drops the depth-test condition); ssgi.comp's emitter = the particles' own emission
+  (colour - copy) where it is bright and most of the pixel, else the old surface test. Cost: one render-size RGBA16F copy
+  (~0.05-0.1 ms at 1440p on an RTX 5090) + one render-pass break; no new SSGI dispatches.
+- `KYTY_RT_PARTICLES=2`: + an R8 reactive mask of the particle emission share (ssgi.comp mode 6, one render-size pass,
+  ~0.02 ms) for the upscaler: FSR 3.1 reactive + transparency-and-composition, XeSS responsive pixel mask (context flag),
+  DLSS bias-current-color hint. `KYTY_RT_PARTICLES_REACTIVE` (0.8). Needs KYTY_SSGI >= 1 (the mask is an SSGI mode).
+- `KYTY_RT_PARTICLES_DEBUG=1`: every 10 s the ordered passes onto the upscaler's colour images of the last flip (VS/PS,
+  blend factors, depth state, draws / instances, indirect; CS writing them; table / native-path draws), the copy's state,
+  the game's reactive-mask slot. The first run's census decides whether the heuristic picked the particle pass.
+- Not done, why: a particle depth (correct light position for braziers in open rooms) needs the pass re-drawn with depth
+  writes into our own depth image (a pipeline variant per particle pipeline, mid-pass), unproven blind; particles
+  receiving our RT/SSGI light needs the particle PS patched (particle-lightmap-update is the game's own lighting: the
+  game already lights them); frame generation (DLSS-G, FFX FI) takes no reactive/particle mask, so FG smearing of
+  particles is not addressable from here (the SR mask is). RT reflections already sample the final colour at the hit, so
+  fire over a surface reflects already; fire over the sky cannot (no depth).
+
+## 2026-10-25 — memcut-1025: KYTY_MEMCUT=1|2 (exact-only cuts of the emulator's own memory)
+- Census of the 16 GB-simulated runs (20261025-194716/195808): 7785 MiB of the 17.5-18.3 GiB private bytes is the
+  KYTY_SIMULATE_VRAM_MB ballast (test only); the emulator's own non-store commit is ~9.7 GiB: device-local 5.35 GiB
+  (VMA 3.4: game buffer pool 0.67-0.96, images/RTs 2.4, free inside blocks 0.17-0.33; plain type 0.9; driver 1.06),
+  host-visible 0.74 GiB (of which the image upload ring 512 MiB), pipelines ~0.6 GiB.
+- KYTY_MEMCUT sets only placement/lifetime switches: KYTY_STAGING_RING_MB (384 / 256), KYTY_VMA_BLOCK_MB=32,
+  KYTY_RAM_DIET=1 + KYTY_PIPELINE_EVICT_SECONDS (120 / 60). No data is dropped or rebuilt, so no texture can go stale.
+  Expected: -0.25..0.5 GiB RAM+commit (ring 128-256, block slack 50-150, pipelines 50-300). A 2-4 GB cut would need
+  live textures/RTs out of video memory (= the level 2 offload and its restores): not exact-safe without restore-ahead.
+- Watch: "[memcut] level", "[memcut] image upload ring", census "upload ring overflows so far" (streaming cost).
+
+## ramtarget-1025: adaptive RAM governor (KYTY_RAM_TARGET_MB)
+
+Evidence (16 GB simulated, level 2 + offload, 10-25 19:58 log): RAM in use 15.0-15.3 GiB; offload 560 MiB out; 401
+restores "at most 55.3 ms" - but 396 were "image gone" (asynchronous: download with the frame, write-back on the
+offload worker) and no "restore of ... took" line (printed for every synchronous one of 2 ms or more) appeared, so the
+55 ms is an async restore's latency, not a blocked draw; "0 buffer reads waited". 265 of the 401 came within 10 s of
+the take: offload of hot textures is what churned. The governor: stages soft (target-512) / target / emergency
+(target+512, at most total-512) from the guard's 1 s sample; above soft a flush pass every 2 s (1 s over target),
+pipelines idle 60/30/15 s, offload only for the MiB over (soft - 256), longest-idle first, never a texture touched in
+the last 10 s (3 s in emergency), emergency scans at the next flip. Below soft: no checks, no takes, no extra passes.
+New counters: "restores blocking N (at most x ms), asynchronous N (latency ...); waits for one in flight N".
+
+## 2026-10-26 spot9-1025 — Boletaria hall lamp floor patches: shadow-layer draws skipped while compiling
+- Video 00:03 (frames 8-13 s): large sharp *lit* floor patches near the knight that change shape from one moment to
+  the next = occluders missing from a spot light's depth layer (not stale depth: that darkens).
+- Log 20261025-235744-754: no "layers refreshed" after flip 2270 (the refresh path is not involved in the hall); the
+  pool renders only 2-3 layers a flip while it samples more (static lights' layers rendered once, kept for many
+  flips); "Async draw pipelines: 512 draws skipped while their pipelines compile" (power-of-two log; < 1024 total) and
+  RAM diet / idle pipeline eviction (2778 evicted, 613 made again) re-create pipelines asynchronously.
+- Mechanism: KYTY_ASYNC_DRAW_PIPELINES dropped any geometry draw whose pipeline was compiling. For a normal pass that
+  is one frame of a missing object; for a cached spot-shadow layer the occluder stays missing until the game re-renders
+  that layer (when the light's slot is reassigned as the player moves): lit patches that pop in and out.
+- Fix: KYTY_ASYNC_SHADOW_SYNC (on unless 0): depth-only draws into a layered depth array keep the blocking compile.

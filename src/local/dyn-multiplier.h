@@ -7,7 +7,7 @@
 // - free[m]: the real rate last measured at multiplier m (EMA, not sitting on the target / m cap); the rate at m + 1
 //   is estimated as 1 / (1 / free[m] + cost), cost = measured seconds per extra generated frame (from switches),
 //   8% of the frame until one was measured.
-// - Minimum real fps per multiplier: x2 30, x3 40, x4 45, x5/x6 50; never up when real (or the estimate) is below the
+// - Minimum real fps per multiplier (10-23): x2 20, x3 26, x4 30, x5/x6 36; never up when real (or the estimate) is below the
 //   next one's, down after 2 windows in a row below the current one's; m only where target / m >= its minimum. A
 //   window under 60% of the one before (hitch, loading) is ignored.
 // - Up at once when real * (m + 1) <= 1.03 target (the game's own 56-60 cap keeps real), or after 5 s under 90% of
@@ -40,6 +40,7 @@ struct DynMultiplier {
 	std::array<double, kMax + 1> free {};  // real fps measured at m (0 = unknown)
 	std::array<int, kMax + 1>    age {};   // windows since free[m] was measured
 	std::array<int, kMax + 1>    block {}; // windows left with level m blocked
+	std::array<int, kMax + 1>    reverts {}; // step-up reverts of level m (each doubles its block)
 	double cost       = 0.0;               // seconds per extra generated frame (0 = unknown)
 	int    settle     = 0;                 // windows left before measuring after a switch
 	int    check_from = 0;                 // after a step up: the level we came from (0 = none)
@@ -61,7 +62,17 @@ struct DynMultiplier {
 		return q;
 	}
 
-	static double MinReal(int m) { return m <= 2 ? 30.0 : m == 3 ? 40.0 : m == 4 ? 45.0 : 50.0; }
+	// 10-23: lower minimums (x2 20, x3 26, x4 30, x5+ 36): with a heavy load (4K cinematic, ~37-48 real) x3 fell
+	// to x2 under the old 40 and the screen showed 80-90 of 224, flipping x2/x3 every few seconds. The aim is the
+	// monitor's rate; fewer generated frames only when the GPU has headroom (the quality rule).
+	// KYTY_DYN_MIN_SCALE scales them (1 = these; 1.5 = the old ones).
+	static double MinReal(int m) {
+		static const double k = [] {
+			const char* v = std::getenv("KYTY_DYN_MIN_SCALE");
+			return v != nullptr && *v != '\0' ? std::clamp(std::atof(v), 0.25, 3.0) : 1.0;
+		}();
+		return k * (m <= 2 ? 20.0 : m == 3 ? 26.0 : m == 4 ? 30.0 : 36.0);
+	}
 
 	double Estimate(int m, double base_real, int base_m) const {
 		if (free[m] > 0.0 && age[m] < 10) return free[m]; // (recent only: the scene moves on)
@@ -130,10 +141,14 @@ struct DynMultiplier {
 				if (c > 0.0) cost = cost > 0.0 ? 0.5 * cost + 0.5 * c : c;
 			}
 			if ((shown < 1.05 * check_shown && shown < 0.97 * T) || real < MinReal(m)) {
-				block[m] = 10;
+				// 10-23: each revert of the same level blocks it twice as long (30 s, 60, 120, up to 4 min): x4/x5 every
+				// ~5 s changed the pacing each time (a hitch per switch, 20261023-205449).
+				reverts[m] = std::min(reverts[m] + 1, 4);
+				block[m]   = 30 << (reverts[m] - 1);
 				free[m]  = 0.0;
 				return go(from);
 			}
+			reverts[m] = 0; // kept
 		}
 		// Down after 2 windows in a row below the level's minimum (to the largest lower level whose known rate meets its own).
 		if (m > 2 && (low_n >= 2 || m > maxm)) {

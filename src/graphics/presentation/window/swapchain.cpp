@@ -13,6 +13,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/presentation/window/hostInput.h"
 #include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsWarp.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -20,7 +21,9 @@
 #endif
 #include "frame-gen.h"
 #include "local/fsr3-fg.h"
+#include "local/kbm-warp.h"
 #include "local/anti-lag.h"
+#include "local/rt-local-lights.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
 #if defined(_WIN32)
@@ -64,6 +67,7 @@ struct Presenter::Frame {
 	bool                   blank        = false; // a cleared frame (no guest picture)
 	bool                   scene        = false; // the game's 3D view (FrameGen::TakeScene)
 	uint64_t               latency_index = 0;    // KYTY_ANTILAG (local/anti-lag.h)
+	uint64_t               kbm_seq       = 0;    // KYTY_KBM_WARP: the pad reads it shows (HostInputKbmOnFlip)
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -240,7 +244,8 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	create.format        = format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
-	create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+	// (Sampled: KYTY_KBM_WARP's and FSR 3's HUD layer passes read it; the format's features hold it, checked above.)
+	create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
 	create.sharingMode = vk::SharingMode::eExclusive;
 	create.samples     = vk::SampleCountFlagBits::e1;
 	if (!graphics.CreateImage(create, dst)) {
@@ -323,11 +328,13 @@ public:
 	[[nodiscard]] Status AcquireNextImage();
 	[[nodiscard]] bool   PrepareSystemOverlay(SystemOverlayHud* hud = nullptr);
 	// `scene`: the frame shows the game's 3D view (Presenter::IsSceneFrame).
-	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
+	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source, FrameGen::FrameInputs* fg,
 	                                           bool draw_system_overlay, bool scene);
 	uint64_t             Submit(CommandScheduler& scheduler);
 	[[nodiscard]] Status Present();
 	void                 SetPresentId(uint64_t id) noexcept { m_present_id = id; }
+	// KYTY_KBM_WARP: the pad reads the next recorded frame shows (Presenter::Frame::kbm_seq).
+	void                 SetKbmSeq(uint64_t seq) noexcept { m_kbm_seq = seq; }
 
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
 		return static_cast<uint32_t>(m_images.size());
@@ -385,6 +392,7 @@ private:
 	vk::Rect2D                  m_present_region {};
 	bool                        m_fsr3 = false;
 	uint64_t                    m_present_id = 0; // KYTY_ANTILAG: VkPresentIdKHR (0 none)
+	uint64_t                    m_kbm_seq    = 0; // KYTY_KBM_WARP (SetKbmSeq)
 	bool                        m_exclusive_app      = false; // application controlled exclusive full screen
 	bool                        m_exclusive_acquired = false;
 	std::chrono::steady_clock::time_point m_exclusive_retry {};
@@ -545,6 +553,8 @@ struct Presenter::Impl {
 		const auto now   = std::chrono::steady_clock::now();
 		UpdateStatus(now);
 		hud.notice = Loader::DemonsSoulsWarp::HudText();
+		const bool markers = RtLocal::OverlayWanted(); // (KYTY_RTLS_DEBUG: drawn by PlaceHud)
+		if (!markers) hud.markers.clear();
 		if (level < 2) {
 			// (Switched down from detailed with F8: its rows go.)
 			hud.perf.rows.clear();
@@ -559,7 +569,7 @@ struct Presenter::Impl {
 			hud.perf.busy_ms.clear();
 			hud_window = {}; // (the count starts again when it is switched on)
 			hud_frames = 0;
-			return hud.status.empty() && hud.notice.empty() ? nullptr : PlaceHud();
+			return hud.status.empty() && hud.notice.empty() && !markers ? nullptr : PlaceHud();
 		}
 		if (level >= 2 && !machine_started) {
 			// The GPU NVML reports on: the Vulkan device's.
@@ -618,7 +628,7 @@ struct Presenter::Impl {
 			hud_window = now;
 			hud_frames = 0;
 		}
-		if (hud.title.empty() && hud.status.empty() && hud.notice.empty()) {
+		if (hud.title.empty() && hud.status.empty() && hud.notice.empty() && !markers) {
 			return nullptr;
 		}
 		return PlaceHud();
@@ -627,6 +637,13 @@ struct Presenter::Impl {
 		hud.region = swapchain.PresentRegion();
 		if (hud.region.extent.width == 0 || hud.region.extent.height == 0) {
 			hud.region = vk::Rect2D {{0, 0}, swapchain.Extent()};
+		}
+		if (RtLocal::OverlayWanted()) {
+			std::vector<RtLocal::Marker> found;
+			RtLocal::DebugMarkers(static_cast<float>(hud.region.offset.x), static_cast<float>(hud.region.offset.y),
+			                      static_cast<float>(hud.region.extent.width), static_cast<float>(hud.region.extent.height), found);
+			hud.markers.clear();
+			for (auto& m: found) hud.markers.push_back({m.x, m.y, m.radius, m.rgba, m.shape, std::move(m.label)});
 		}
 		return &hud;
 	}
@@ -1197,7 +1214,7 @@ bool Swapchain::PrepareSystemOverlay(SystemOverlayHud* hud) {
 	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount(), hud);
 }
 
-void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
+void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& source, FrameGen::FrameInputs* fg,
                                       bool draw_system_overlay, bool scene) {
 	if (source.state.layout != vk::ImageLayout::eTransferSrcOptimal) {
 		EXIT("invalid prepared presentation image, vk_image=%p layout=%d\n",
@@ -1268,25 +1285,142 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	}
 
 	m_present_region = vk::Rect2D {{dst_x, dst_y}, {static_cast<uint32_t>(dst_w), static_cast<uint32_t>(dst_h)}};
-	vk::ImageBlit region {};
-	region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
-	region.srcSubresource.mipLevel       = 0;
-	region.srcSubresource.baseArrayLayer = 0;
-	region.srcSubresource.layerCount     = 1;
-	region.srcOffsets[1].x               = static_cast<int>(src_w);
-	region.srcOffsets[1].y               = static_cast<int>(source.extent.height);
-	region.srcOffsets[1].z               = 1;
-	region.dstSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
-	region.dstSubresource.mipLevel       = 0;
-	region.dstSubresource.baseArrayLayer = 0;
-	region.dstSubresource.layerCount     = 1;
-	region.dstOffsets[0].x               = dst_x;
-	region.dstOffsets[0].y               = dst_y;
-	region.dstOffsets[1].x               = dst_x + dst_w;
-	region.dstOffsets[1].y               = dst_y + dst_h;
-	region.dstOffsets[1].z               = 1;
-	vk_command.blitImage(source.image, vk::ImageLayout::eTransferSrcOptimal,
-	                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1, &region,
+	// KYTY_KBM_WARP=1 (with KYTY_KBM=1): late reprojection of the mouse turn the game has not shown yet. The source rect
+	// moves by the pending yaw/pitch in pixels (pinhole: f = (w/2)/tan(hfov/2)); the uncovered strip repeats the edge
+	// pixels. The whole final image moves (the HUD too), so the shift is capped (KYTY_KBM_WARP_MAX, of the width).
+	// With the frame's HUD-less composite (KbmWarp::Record, kbm-warp.h) only the 3D moves, the HUD stays; with FSR 3
+	// frame generation the frame's inputs (HUD-less image, depth, motion vectors) are shifted alike before FSR 3 takes
+	// them. DLSS-G: not warped.
+	int          shift_x = 0, shift_y = 0;
+	VulkanImage* blit_source = &source;
+	{
+		struct WarpCfg {
+			bool   on = false;
+			double fov = 70.0, max = 0.06, invy = 1.0;
+		};
+		static const WarpCfg cfg = [] {
+			WarpCfg     c;
+			const char* on  = std::getenv("KYTY_KBM_WARP");
+			const char* kbm = std::getenv("KYTY_KBM");
+			c.on = on != nullptr && std::string_view(on) == "1" && kbm != nullptr && std::string_view(kbm) == "1";
+			auto num = [](const char* name, double def, double lo, double hi) {
+				const char* v = std::getenv(name);
+				if (v == nullptr || *v == '\0') return def;
+				const double d = std::strtod(v, nullptr);
+				return std::isfinite(d) ? std::clamp(d, lo, hi) : def;
+			};
+			c.fov  = num("KYTY_KBM_WARP_FOV", 70.0, 20.0, 150.0);
+			c.max  = num("KYTY_KBM_WARP_MAX", 0.06, 0.0, 0.25);
+			c.invy = num("KYTY_KBM_WARP_INVY", 0.0, 0.0, 1.0) >= 0.5 ? -1.0 : 1.0;
+			if (c.on) {
+				LOGF("KBM warp: on (hfov %.0f deg, max shift %.1f%% of width, pitch %s; HUD-less composite %s: %s; FSR 3 frame "
+				     "generation %s; DLSS-G: not warped)\n",
+				     c.fov, c.max * 100.0, c.invy < 0.0 ? "inverted" : "normal",
+				     KbmWarp::HudlessWanted() ? "on" : "off (KYTY_KBM_WARP_HUDLESS=0)",
+				     KbmWarp::HudlessWanted() ? "the 3D moves under a still HUD (the whole image when a frame has none)"
+				                              : "the whole image moves, the HUD too",
+				     KbmWarp::Fsr3Wanted() ? "warped (its inputs shifted alike; KYTY_KBM_WARP_FSR3=1)"
+				                           : "not warped (KYTY_KBM_WARP_FSR3=1 warps it)");
+			}
+			return c;
+		}();
+		static bool fg_logged = false;
+		static const bool hud_layer = [] {
+			const char* v = std::getenv("KYTY_FSR3_HUD_LAYER");
+			return v != nullptr && *v == '1';
+		}();
+		// FSR 3: warped only with the frame's inputs shifted alike (its HUD layer mode compares F with H: not then).
+		const bool fsr3    = IsFsr3();
+		const bool fsr3_ok = fsr3 && !FrameGen::Enabled() && KbmWarp::Fsr3Wanted() && !hud_layer;
+		const bool usable  = fg != nullptr && fg->valid;
+		double     yaw = 0.0, pitch = 0.0;
+		const bool pending =
+		    cfg.on && scene && !Libs::VideoOut::MoviePlaying() && HostInputKbmWarpDegrees(m_kbm_seq, &yaw, &pitch);
+		float      fx = 0.0f, fy = 0.0f;
+		if (pending && src_w > 0 && source.extent.height > 0) {
+			const double kPi = 3.14159265358979323846;
+			const double f   = 0.5 * src_w / std::tan(cfg.fov * 0.5 * kPi / 180.0);
+			const double cap = cfg.max * src_w;
+			auto         px  = [&](double deg) {
+                const double a = std::clamp(deg, -60.0, 60.0) * kPi / 180.0;
+                return static_cast<float>(std::clamp(f * std::tan(a), -cap, cap));
+			};
+			fx = px(yaw);
+			fy = px(pitch * cfg.invy);
+		}
+		const bool moving = std::fabs(fx) >= 0.5f || std::fabs(fy) >= 0.5f;
+		if (cfg.on && (FrameGen::Enabled() || (fsr3 && !fsr3_ok))) {
+			if (moving && !fg_logged) {
+				fg_logged = true;
+				LOGF("KBM warp: %s: frames are not warped\n", FrameGen::Enabled() ? "DLSS-G frame generation is on"
+				                                                                   : "FSR 3 frame generation (KYTY_KBM_WARP_FSR3=1 "
+				                                                                     "warps it, without KYTY_FSR3_HUD_LAYER=1)");
+			}
+			if (fsr3) KbmWarp::NoteUnshifted();
+		} else if (fsr3) {
+			// (A frame without inputs: FSR 3 generates nothing for it; the next starts from no shift.)
+			VulkanImage* warped = nullptr;
+			if (cfg.on && usable && (moving || KbmWarp::InputsShifted()))
+				warped = KbmWarp::Record(m_window.graphic_ctx, command.Handle(), source, fg, moving ? fx : 0.0f,
+				                         moving ? fy : 0.0f, true);
+			if (warped != nullptr) blit_source = warped;
+			else KbmWarp::NoteUnshifted();
+		} else if (moving || (cfg.on && usable && KbmWarp::InputsShifted())) {
+			// (10-24) Also while the edge zoom eases back after a turn (else it would snap off).
+			VulkanImage* warped =
+			    usable ? KbmWarp::Record(m_window.graphic_ctx, command.Handle(), source, fg, moving ? fx : 0.0f,
+			                             moving ? fy : 0.0f, false)
+			           : nullptr;
+			if (warped != nullptr) {
+				blit_source = warped;
+			} else if (moving) {
+				shift_x = static_cast<int>(std::lround(fx)); // (no HUD-less image: the whole image, as before)
+				shift_y = static_cast<int>(std::lround(fy));
+			}
+		}
+	}
+
+	m_present_region = vk::Rect2D {{dst_x, dst_y}, {static_cast<uint32_t>(dst_w), static_cast<uint32_t>(dst_h)}};
+	// Per axis up to two pieces: the shifted image and the edge strip (one source pixel stretched) it uncovers.
+	struct Piece {
+		int s0, s1; // source range
+		int d0, d1; // destination range
+	};
+	auto pieces = [](int size, int shift, int d_origin, int d_size, Piece* out) {
+		if (shift == 0 || std::abs(shift) >= size) {
+			out[0] = {0, size, d_origin, d_origin + d_size};
+			return 1;
+		}
+		const double scale = static_cast<double>(d_size) / size;
+		const int    a0 = std::max(0, shift), a1 = std::min(size, size + shift);
+		const int    d0 = d_origin + static_cast<int>(std::lround((a0 - shift) * scale));
+		const int    d1 = d_origin + static_cast<int>(std::lround((a1 - shift) * scale));
+		out[0]          = {a0, a1, d0, d1};
+		if (shift > 0) out[1] = {size - 1, size, d1, d_origin + d_size};
+		else out[1] = {0, 1, d_origin, d0};
+		return out[1].d1 > out[1].d0 ? 2 : 1;
+	};
+	Piece      px[2], py[2];
+	const int  nx = pieces(static_cast<int>(src_w), shift_x, dst_x, dst_w, px);
+	const int  ny = pieces(static_cast<int>(source.extent.height), shift_y, dst_y, dst_h, py);
+	vk::ImageBlit regions[4] {};
+	uint32_t      count = 0;
+	for (int ix = 0; ix < nx; ++ix) {
+		for (int iy = 0; iy < ny; ++iy) {
+			vk::ImageBlit& region                = regions[count++];
+			region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
+			region.srcSubresource.mipLevel       = 0;
+			region.srcSubresource.baseArrayLayer = 0;
+			region.srcSubresource.layerCount     = 1;
+			region.srcOffsets[0]                 = vk::Offset3D {px[ix].s0, py[iy].s0, 0};
+			region.srcOffsets[1]                 = vk::Offset3D {px[ix].s1, py[iy].s1, 1};
+			region.dstSubresource                = region.srcSubresource;
+			region.dstOffsets[0]                 = vk::Offset3D {px[ix].d0, py[iy].d0, 0};
+			region.dstOffsets[1]                 = vk::Offset3D {px[ix].d1, py[iy].d1, 1};
+		}
+	}
+	vk_command.blitImage(blit_source->image, vk::ImageLayout::eTransferSrcOptimal,
+	                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, count, regions,
 	                     vk::Filter::eLinear);
 
 	vk::ImageMemoryBarrier to_present {};
@@ -1627,6 +1761,10 @@ void Presenter::SetLatencyIndex(Frame& frame, uint64_t index) noexcept {
 	frame.latency_index = index;
 }
 
+void Presenter::SetKbmSeq(Frame& frame, uint64_t seq) noexcept {
+	frame.kbm_seq = seq;
+}
+
 bool Presenter::GeneratesFrames() noexcept {
 	return FrameGen::Enabled() || Fsr3::Active();
 }
@@ -1702,7 +1840,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				    (static_cast<float>(hud->drawn.offset.x - region.offset.x) + static_cast<float>(hud->drawn.extent.width) + margin) / w,
 				    (static_cast<float>(hud->drawn.offset.y - region.offset.y) + static_cast<float>(hud->drawn.extent.height) + margin) / h);
 			}
-			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay, frame.scene);
+			swapchain.SetKbmSeq(frame.kbm_seq);
+			swapchain.RecordPresentCommands(command, frame.image, frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
+			                                draw_system_overlay, frame.scene);
 			// KYTY_FSR3_FG: the HUD as a layer FSR 3 composites over every frame shown, and the frame without it in the
 			// backbuffer (generated frames then have no HUD to drag).
 			if (swapchain.IsFsr3() && !draw_system_overlay)
@@ -1710,7 +1850,8 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				                     swapchain.PresentRegion(), frame.image,
 				                     frame.fg.valid && !frame.reusing_last && !port_menu ? &frame.fg : nullptr);
 			if (FrameGen::Enabled() && frame.fg.valid && !frame.reusing_last && !port_menu)
-				FrameGen::ScaleHudless(m_impl->window.graphic_ctx, command.Handle(), frame.fg, swapchain.Extent(), swapchain.Format());
+				FrameGen::ScaleHudless(m_impl->window.graphic_ctx, command.Handle(), frame.fg, swapchain.Extent(),
+				                       swapchain.PresentRegion(), swapchain.Format());
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 			if (timed) FrameGen::NoteSubmitMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_begin).count());
 		}
@@ -1753,6 +1894,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		status = swapchain.Present();
 		swapchain.SetPresentId(0);
 		AntiLag::AfterPresent(latency_index);
+		if (status == Swapchain::Status::Success) AntiLag::OnPresented(latency_index); // KYTY_LATENCY: input -> present
 		if (generate) {
 			FrameGen::AfterPresent();
 			FrameGen::NoteFlipPresentMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - flip_begin).count());

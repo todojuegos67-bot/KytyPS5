@@ -341,6 +341,32 @@ static int KYTY_SYSV_ABI PsmlDispatch(uint64_t handle, const CommandSpan* span, 
 	return OK;
 }
 
+// 01.005.000's dispatch (RUNLFro+qok) takes an older parameter block (by @Al3cko, issue #87; the native wrapper at
+// libScePsml+0x2c240): the descriptors and the projection where 1.07 has them, the jitter, motion scale and reset
+// eight bytes earlier, and the block ends at 0x148. Copied into 1.07's layout, the packet is the same.
+static int KYTY_SYSV_ABI PsmlDispatchLegacy(uint64_t handle, const CommandSpan* span, const uint8_t* params) {
+	if (params == nullptr) return PSML_ERROR_INVALID_POINTER;
+	uint8_t normalized[Graphics::SuperResolution::ParameterBytes] {};
+	const auto copy = [&](size_t to, size_t from, size_t bytes) { std::memcpy(normalized + to, params + from, bytes); };
+	copy(0x000, 0x000, 0x40);
+	copy(0x048, 0x040, 0x10);
+	copy(0x058, 0x058, 0xa0);
+	copy(0x100, 0x0f8, 0x1d);
+	uint32_t flags = 0;
+	std::memcpy(&flags, params + 0x118, sizeof(flags));
+	flags &= 0x80008000u;
+	std::memcpy(normalized + 0x120, &flags, sizeof(flags));
+	copy(0x124, 0x11c, 4);
+	copy(0x130, 0x128, 4);
+	const float one = 1.0f;
+	std::memcpy(normalized + 0x134, &one, sizeof(one));
+	copy(0x138, 0x12c, 8);
+	copy(0x140, 0x134, 4);
+	copy(0x144, 0x13c, 4);
+	copy(0x14c, 0x13c, 12);
+	return PsmlDispatch(handle, span, normalized);
+}
+
 // The game's texture LOD bias for the input size `width` x `height`: it adds 0.5 and keeps it at most 0, so this
 // gives it the size's ratio to the output in powers of two (DLSS' advice: -0.49 at 1440 for 2160).
 static int KYTY_SYSV_ABI PsmlGetMipBias(uint64_t handle, float* out_bias, uint32_t width, uint32_t height) {
@@ -405,9 +431,12 @@ LIB_DEFINE(InitPsml_1) {
 	LIB_FUNC("sjTyYheKTrU", Psml::PsmlGetContextMemoryRequirements);
 	LIB_FUNC("ArakEpzsZo0", Psml::PsmlGetContextMemoryRequirements);
 	LIB_FUNC("fccGInHrj8A", Psml::PsmlCreateContext);
+	// 01.005.000's context creation: the same blocks, sizes and shared-resource offsets (its native wrapper at 0x2b770).
+	LIB_FUNC("gxv3i+MTEzU", Psml::PsmlCreateContext);
 	LIB_FUNC("JaLBe0P3jSU", Psml::PsmlDestroyContext);
 	LIB_FUNC("AHalTX9wFZY", Psml::PsmlGetDispatchSize);
 	LIB_FUNC("94iBp3KvIuI", Psml::PsmlDispatch);
+	LIB_FUNC("RUNLFro+qok", Psml::PsmlDispatchLegacy);
 	LIB_FUNC("GHna9-DvnUk", Psml::PsmlGetMipBias);
 	LIB_FUNC("GJY0MvuTcs8", Psml::PsmlRequestCapture);
 	LIB_FUNC("LXq+6mIxpCw", Psml::PsmlValidateObject);

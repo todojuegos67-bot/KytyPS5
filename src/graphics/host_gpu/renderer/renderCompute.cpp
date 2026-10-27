@@ -1,4 +1,6 @@
 #include "local/skip-shader.h"
+#include "local/rt-local-lights.h"
+#include "local/hwrt-scene.h"
 #include "local/sync-stats.h"
 #include "common/assert.h"
 #include "live-trace-gpu.h"
@@ -318,22 +320,44 @@ private:
 	static const std::string& Programs() {
 		static const std::string programs = [] {
 			const char* value = std::getenv("KYTY_PROG_TRACE");
-			return value != nullptr ? std::string(value) : std::string();
+			std::string list  = value != nullptr ? std::string(value) : std::string();
+			// (KYTY_RTLS_DEBUG / KYTY_RT_LOCAL_SHADOWS: every dispatch's bindings go to RtLocal::OnDispatch from here,
+			// out of DispatchDirect's own code and its PGO profile)
+			if (RtLocal::Wanted()) list += list.empty() ? "rtls" : ",rtls";
+			return list;
 		}();
 		return programs;
 	}
 	[[gnu::noinline]] void Begin(uint64_t shader_hash, uint64_t indirect_args, const PreparedBindings& bindings,
 	                             BufferCache& cache) {
-		m_on = Programs().find(fmt::format("{:016x}", shader_hash)) != std::string::npos ||
-		       (indirect_args != 0 && Programs().find("indirect") != std::string::npos);
+		m_traced = Programs() != "rtls" && (Programs().find(fmt::format("{:016x}", shader_hash)) != std::string::npos ||
+		                                    (indirect_args != 0 && Programs().find("indirect") != std::string::npos));
+		m_on = m_traced || RtLocal::Wanted();
 		if (!m_on) return;
 		m_shader_hash = shader_hash;
+		if (!m_traced) return;
 		for (const auto& source: bindings.buffer_sources)
 			m_dirty_before.push_back(source.size != 0 && cache.IsRegionCpuModified(source.address, source.size));
 	}
 	[[gnu::noinline]] void PrintLine(const PreparedBindings& bindings, RenderContext& context,
 	                                 const Common::SlotVector<Image>& images, uint32_t groups_x, uint32_t groups_y,
 	                                 uint32_t groups_z, uint64_t indirect_args) const {
+		if (RtLocal::Wanted() && bindings.runtime != nullptr && bindings.runtime->program != nullptr && RtLocal::WantsDispatch(m_shader_hash)) {
+			const auto& info = bindings.runtime->program->info;
+			std::vector<RtLocal::DispatchBuffer> buffers;
+			std::vector<RtLocal::DispatchImage>  bound;
+			for (size_t i = 0; i < bindings.buffer_sources.size(); ++i)
+				buffers.push_back({bindings.buffer_sources[i].address, bindings.buffer_sources[i].size,
+				                   i < info.buffers.size() && info.buffers[i].written});
+			for (size_t i = 0; i < bindings.images.size(); ++i) {
+				const auto& d = bindings.images[i].desc.info;
+				bound.push_back({d.data.address, d.extent.width, d.extent.height, d.resources.layers,
+				                 d.IsDepth() || d.pixel_format == vk::Format::eR32Sfloat || d.pixel_format == vk::Format::eR16Unorm,
+				                 i < info.images.size() && info.images[i].written});
+			}
+			RtLocal::OnDispatch(m_shader_hash, buffers, bound, bindings.runtime->resources.flattened_srt);
+		}
+		if (!m_traced) return;
 		static std::mutex                             lines_mutex;
 		static std::unordered_map<uint64_t, uint32_t> per_program;
 		static uint32_t                               lines = 0;
@@ -364,6 +388,7 @@ private:
 	}
 
 	bool              m_on          = false;
+	bool              m_traced      = false;
 	uint64_t          m_shader_hash = 0;
 	std::vector<bool> m_dirty_before;
 };
@@ -1064,6 +1089,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	if (FrameGen::IsTaaShader(program.shader_hash)) FrameGen::NoteScene(); // (the game's 3D view)
 	FrameGen::NoteShader(program.shader_hash, 'c');
+	if (FrameGen::RtParticlesDebug()) {
+		// (rtparticles census: the dispatches writing a storage image, matched to the scene color there.)
+		for (size_t i = 0; i < bindings.images.size() && i < program.info.images.size(); ++i) {
+			const auto& info = bindings.images[i].desc.info;
+			if (program.info.images[i].written && !info.data.Empty())
+				FrameGen::NoteSceneDispatch(program.shader_hash, info.data.address, info.extent.width, info.extent.height);
+		}
+	}
 	if (FrameGen::SsrWanted() && !bindings.images.empty()) {
 		// (KYTY_SSR, logging only: a dispatch reading the G-buffer targets, the deferred lighting.)
 		std::array<uint64_t, 32>   addresses {};
@@ -1254,6 +1287,25 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	} else {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	// (KYTY_GBUF_VIEW / KYTY_GBUF_TAP, refl7 diagnostic: a G-buffer reader's outputs logged, the tapped image copied;
+	// refl8: KYTY_RT_REFLECTIONS' guide, the game's own SSR result copied from the deferred lighting's inputs)
+	if ((FrameGen::GbufViewWanted() || FrameGen::RtReflGuideWanted()) && !bindings.images.empty()) {
+		uint64_t written = 0;
+		for (size_t i = 0; i < program.info.images.size() && i < 64; ++i)
+			if (program.info.images[i].written) written |= uint64_t {1} << i;
+		FrameGen::GbufTapAfterDispatch(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
+		                               std::span<const TextureBinding> {bindings.images}, written);
+		FrameGen::RtReflGuideAfterDispatch(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
+		                                   std::span<const TextureBinding> {bindings.images}, written);
+	}
+	// (KYTY_RT_SUN: the first dispatch of a flip sampling the sun cascades' array copies their layers)
+	if (FrameGen::RtSunWanted() && !bindings.images.empty())
+		FrameGen::RtSunAfterDispatch(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
+		                             std::span<const TextureBinding> {bindings.images});
+	// (KYTY_HWRT: after the game's TAA, the frame's scene acceleration structures; its debug view over the TAA's output)
+	if (HwScene::Active() && !chain && FrameGen::IsTaaShader(program.shader_hash))
+		HwScene::AfterTaa(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer,
+		                  std::span<const TextureBinding> {bindings.images});
 	ResetBindings();
 	m_context.GetCommandScheduler().CompleteDispatch();
 	phase.reset();

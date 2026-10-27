@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "device-fault.h"
+#include "local/mem-guard.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -16,6 +17,7 @@
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <string>
 #include <thread>
 #include <vector>
 #include <vk_mem_alloc.h>
@@ -52,8 +54,39 @@ public:
 	}
 	// Returns once every pushed buffer is destroyed (before the allocator goes away).
 	void Flush() {
+		Release();
 		std::unique_lock lock(m_mutex);
 		m_idle.wait(lock, [this] { return m_pending.empty() && !m_busy; });
+	}
+	// BufferCache::Defragment: no memory is freed here while a pass over the game buffers' pool is open; what is pushed
+	// meanwhile waits for its end. A pass names allocations of erased buffers waiting here, and VMA reads its moves till
+	// the pass ends: freed meanwhile, they were read freed (8 GB GPUs: access violations in vmaGetAllocationInfo from
+	// Defragment, its block gone, 10-23). False while frees are queued or run: the pass waits for a later flip. (Begun
+	// over them, a pass lists allocations of erased buffers, which Defragment can only ignore: each takes a move of the
+	// pass's 64, and VMA counts its block as one it cannot empty.)
+	bool TryHold() {
+		const std::unique_lock freeing(m_free_mutex, std::try_to_lock);
+		if (!freeing.owns_lock()) return false;
+		{
+			const std::lock_guard lock(m_mutex);
+			if (!m_pending.empty() || m_busy) return false;
+		}
+		m_hold = true;
+		return true;
+	}
+	void Release() {
+		std::vector<Item> held;
+		{
+			const std::lock_guard freeing(m_free_mutex);
+			m_hold = false;
+			held.swap(m_held);
+		}
+		if (held.empty()) return;
+		{
+			const std::lock_guard lock(m_mutex);
+			m_pending.insert(m_pending.end(), held.begin(), held.end());
+		}
+		m_wake.notify_one();
 	}
 
 private:
@@ -71,7 +104,14 @@ private:
 			batch.swap(m_pending);
 			m_busy = true;
 			lock.unlock();
-			for (const auto& item: batch) vmaDestroyBuffer(item.allocator, item.buffer, item.allocation);
+			for (const auto& item: batch) {
+				const std::lock_guard freeing(m_free_mutex);
+				if (m_hold && item.allocation != nullptr) {
+					m_held.push_back(item);
+					continue;
+				}
+				vmaDestroyBuffer(item.allocator, item.buffer, item.allocation);
+			}
 			batch.clear();
 			lock.lock();
 			m_busy = false;
@@ -83,6 +123,9 @@ private:
 	std::vector<Item>       m_pending;
 	bool                    m_busy = false, m_stop = false;
 	std::thread             m_thread;
+	std::mutex              m_free_mutex; // (held over each free: TryHold)
+	std::vector<Item>       m_held;
+	bool                    m_hold = false;
 };
 
 BufferReclaimer& Reclaimer() {
@@ -154,7 +197,30 @@ std::atomic<uint64_t> g_forced_spill_bytes {[] {
 	return false;
 }
 
+thread_local const char* g_rebar_request = nullptr;
+std::mutex               g_rebar_mutex;
+std::string              g_rebar_report;
+
+void AddRebarReport(const std::string& text) {
+	std::lock_guard lock(g_rebar_mutex);
+	if (!g_rebar_report.empty()) g_rebar_report += "; ";
+	g_rebar_report += text;
+}
+
 } // namespace
+
+void RequestRebarPlacement(const char* name) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_REBAR_STAGING");
+		return value != nullptr && value[0] == '1';
+	}();
+	g_rebar_request = enabled ? name : nullptr;
+}
+
+std::string TakeRebarReport() {
+	std::lock_guard lock(g_rebar_mutex);
+	return std::exchange(g_rebar_report, {});
+}
 
 struct Buffer::Sparse {
 	uint64_t                    page_size   = 0;
@@ -268,7 +334,61 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		return vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
 		                       &allocation_info, &native_buffer, &m_allocation, &allocation_result) == VK_SUCCESS;
 	};
-	bool created = create();
+	// KYTY_REBAR_STAGING (RequestRebarPlacement): the same buffer, mapped and written the same way, in BAR memory.
+	bool created = false;
+	if (const char* rebar = std::exchange(g_rebar_request, nullptr); rebar != nullptr && usage == MemoryUsage::Upload) {
+		constexpr VkMemoryPropertyFlags wanted =
+		    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		const auto& memory = graphics.physical_device_memory_properties;
+		uint32_t    types = 0;
+		uint64_t    heap  = 0;
+		for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+			const auto properties = static_cast<VkMemoryPropertyFlags>(memory.memoryTypes[i].propertyFlags);
+			const auto heap_size  = memory.memoryHeaps[memory.memoryTypes[i].heapIndex].size;
+			if ((properties & wanted) == wanted && heap_size > (uint64_t {256} << 20u)) {
+				types |= 1u << i;
+				heap = std::max<uint64_t>(heap, heap_size);
+			}
+		}
+		static const uint64_t margin = [] {
+			const char* value = std::getenv("KYTY_REBAR_MARGIN_MB");
+			return (value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {512}) << 20u;
+		}();
+		// (The room in the largest video memory heap; KYTY_SIMULATE_VRAM_MB's ballast is in its usage.)
+		const uint64_t room = graphics.CanReportMemoryUsage() ? graphics.GetVideoMemoryRoom() : 0;
+		const char*    why  = nullptr;
+		if (!graphics.CanReportMemoryUsage()) why = "no VK_EXT_memory_budget";
+		else if (types == 0) why = "no DEVICE_LOCAL|HOST_VISIBLE heap over 256 MiB (no Resizable BAR)";
+		else if (room < size + margin) why = "video memory headroom below ring + margin";
+		if (why == nullptr) {
+			const auto saved              = allocation_info;
+			allocation_info.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+			allocation_info.requiredFlags  = wanted;
+			allocation_info.preferredFlags = 0;
+			allocation_info.memoryTypeBits = types;
+			allocation_info.flags |= VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+			created = create();
+			if (created) {
+				VkMemoryPropertyFlags got = 0;
+				vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &got);
+				if ((got & wanted) != wanted || allocation_result.pMappedData == nullptr) {
+					vmaDestroyBuffer(graphics.allocator, native_buffer, m_allocation);
+					native_buffer = VK_NULL_HANDLE;
+					m_allocation  = nullptr;
+					created       = false;
+				}
+			}
+			allocation_info = saved;
+			if (!created) why = "BAR allocation failed";
+		}
+		char line[320];
+		std::snprintf(line, sizeof(line), "%s %llu MiB -> %s%s (heap %llu MiB, headroom %llu MiB, margin %llu MiB)", rebar,
+		              static_cast<unsigned long long>(size >> 20u), created ? "BAR" : "system RAM: ", created ? "" : why,
+		              static_cast<unsigned long long>(heap >> 20u), static_cast<unsigned long long>(room >> 20u),
+		              static_cast<unsigned long long>(margin >> 20u));
+		AddRebarReport(line);
+	}
+	if (!created) created = create();
 	if (!created && allocation_info.pool != nullptr) {
 		allocation_info.pool = nullptr;
 		created              = create();
@@ -278,7 +398,16 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	if (!created) {
 		graphics.TrimImagePool();
 		allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-		if (!create()) graphics.ReportMemoryFallback("a buffer could not be created", size);
+		created = create();
+		if (!created) graphics.ReportMemoryFallback("a buffer could not be created", size);
+	}
+	// Still refused: release passes (MemGuard: caches, pools, the heaps) and more tries; then the clear out-of-memory
+	// message instead of an exit with no word on the cause.
+	for (int attempt = 0; !created; ++attempt) {
+		if (!MemGuard::ShouldRetry("a GPU buffer (vmaCreateBuffer)", size, attempt))
+			MemGuard::FatalOutOfMemory("a GPU buffer (vmaCreateBuffer)", size);
+		graphics.TrimImagePool();
+		created = create();
 	}
 	EXIT_NOT_IMPLEMENTED(native_buffer == VK_NULL_HANDLE);
 
@@ -357,6 +486,14 @@ Buffer::~Buffer() {
 
 void FlushBufferReclaimer() {
 	Reclaimer().Flush();
+}
+
+bool HoldBufferFrees() {
+	return Reclaimer().TryHold();
+}
+
+void ReleaseBufferFrees() {
+	Reclaimer().Release();
 }
 
 vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {
@@ -502,8 +639,13 @@ void Buffer::MakeResident(uint64_t offset, uint64_t size) {
 			allocate.allocationSize  = sparse.page_size * SparseChunkPages;
 			allocate.memoryTypeIndex = sparse.memory_type;
 			VkDeviceMemory chunk     = VK_NULL_HANDLE;
-			EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(static_cast<VkDevice>(m_graphics->device), &allocate, nullptr, &chunk) !=
-			                     VK_SUCCESS);
+			// (Refused: release passes and more tries, then the clear out-of-memory message, MemGuard.)
+			for (int attempt = 0; VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(static_cast<VkDevice>(m_graphics->device),
+			                                                                     &allocate, nullptr, &chunk) != VK_SUCCESS;
+			     ++attempt) {
+				if (!MemGuard::ShouldRetry("sparse buffer memory (vkAllocateMemory)", allocate.allocationSize, attempt))
+					MemGuard::FatalOutOfMemory("sparse buffer memory (vkAllocateMemory)", allocate.allocationSize);
+			}
 			sparse.chunks.push_back(chunk);
 			sparse.free_in_chunk = SparseChunkPages;
 		}

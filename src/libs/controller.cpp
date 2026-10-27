@@ -34,6 +34,17 @@ constexpr int PAD_ERROR_INVALID_HANDLE = -2137915389; /* 0x80920003 */
 
 constexpr uint32_t RUMBLE_DURATION_MS = 0xffff;
 constexpr uint32_t RELEASE_FLUSH_MS   = 50;
+constexpr uint64_t DROP_REPORT_MS     = 5000;
+
+// The newest unread input state takes an event that changes no button and no touch (GameController::AddState).
+// KYTY_PAD_STATE_COALESCE=0: every input event a state of its own, as before.
+static bool StateCoalescing() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PAD_STATE_COALESCE");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	return on;
+}
 
 struct PadControllerInformation {
 	float    touch_pixel_density;
@@ -124,7 +135,11 @@ private:
 	static constexpr uint32_t STATES_MAX = 64;
 
 	void CheckActive();
+	bool Claim(int id, bool significant);
+	void LogActive(const char* why);
 	void AddState();
+	void CountDroppedState();
+	void ReportDroppedStates();
 
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
@@ -140,6 +155,12 @@ private:
 	// Every effect the game set, whether or not the host pad could reproduce it:
 	// scePadGetTriggerEffectState answers from it (m_trigger_sent keeps the sent one only).
 	PadTriggerEffectParam m_state_effect {};
+	// Input states dropped from the history before a read took them (AddState): in all, since the last report, and when
+	// that was (SDL ticks; none yet: m_dropped_reported).
+	uint64_t         m_dropped_states     = 0;
+	uint64_t         m_dropped_unreported = 0;
+	uint64_t         m_dropped_report_ms  = 0;
+	bool             m_dropped_reported   = false;
 };
 
 static GameController* g_controller = nullptr;
@@ -376,10 +397,73 @@ void GameController::CheckActive() {
 	m_states_num    = 0;
 	m_first_state   = 0;
 	m_next_touch_id = 1;
+	LogActive("connected pads changed");
 }
 
+// pad-1024: the player-1 pad, its name and its XInput slot (SDL player index: 0-3 for an XInput pad, whatever slot
+// Windows gave it; -1 for a HIDAPI pad such as a DualSense).
+void GameController::LogActive(const char* why) {
+	if (m_active_id < 0 || m_active_id == HOST_INPUT_CONTROLLER_ID) {
+		std::printf("Pad: player 1 = %s (%s, %d connected)\n", m_active_id < 0 ? "none" : "keyboard", why,
+		            static_cast<int>(m_connected_ids.size()));
+	} else {
+		auto*       pad   = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
+		const char* name  = pad != nullptr ? SDL_GameControllerName(pad) : nullptr;
+		const int   slot  = pad != nullptr ? SDL_GameControllerGetPlayerIndex(pad) : -1;
+		const bool  ps5   = pad != nullptr && SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5;
+		if (slot >= 0 && !ps5) {
+			std::printf("Pad: player 1 = '%s' (id %d, XInput slot %d) (%s, %d connected)\n", name ? name : "?",
+			            m_active_id, slot + 1, why, static_cast<int>(m_connected_ids.size()));
+		} else {
+			std::printf("Pad: player 1 = '%s' (id %d%s) (%s, %d connected)\n", name ? name : "?", m_active_id,
+			            ps5 ? ", DualSense" : "", why, static_cast<int>(m_connected_ids.size()));
+		}
+	}
+	std::fflush(stdout);
+}
+
+// pad-1024: last-used pad wins. Windows can put the user's pad in any XInput slot (2-4 while another device, a
+// virtual or idle pad, holds slot 1), and a DualSense and an XInput pad can both be connected: the first connected one
+// was player 1 for good and the other's input was dropped. Now a press (or a stick/trigger past half) on another
+// connected pad makes it player 1; input from the others is ignored, so two pads never mix in one state.
+bool GameController::Claim(int id, bool significant) {
+	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+		return true;
+	}
+	if (!significant || std::find(m_connected_ids.begin(), m_connected_ids.end(), id) == m_connected_ids.end()) {
+		return false;
+	}
+	m_active_id     = id;
+	m_state         = {};
+	m_next_touch_id = 1;
+	LogActive("input on it");
+	return true;
+}
+
+// The history scePadRead returns, oldest unread first: a state per input event. Demon's Souls reads 64 each tick and
+// takes the presses and releases of every one, the last as the pad's state (its pad update, eboot 0xb933a0), so a press
+// is lost only when it leaves the STATES_MAX states unread. An event that changes no button and no touch (a stick or
+// trigger step, a finger moving) updates the newest state instead while no read has taken it (StateCoalescing): every
+// press and release keeps a state of its own, and a burst of axis events between two reads (a frame hitch: 5-43 of
+// 100 ms or more a session in the logs, one of 18.5 s) no longer pushes an unread press out.
 void GameController::AddState() {
+	if (m_states_num != 0 && StateCoalescing()) {
+		const auto  newest = (m_first_state + m_states_num - 1) % STATES_MAX;
+		const auto& last   = m_states[newest];
+		if (!m_obtained[newest] && last.buttons == m_state.buttons &&
+		    std::equal(std::begin(last.touch), std::end(last.touch), std::begin(m_state.touch),
+		               [](const ControllerState::Touch& a, const ControllerState::Touch& b) {
+			               return a.down == b.down && a.id == b.id;
+		               })) {
+			m_states[newest] = m_state;
+			return;
+		}
+	}
+
 	if (m_states_num >= STATES_MAX) {
+		if (!m_obtained[m_first_state]) {
+			CountDroppedState();
+		}
 		m_states_num  = STATES_MAX - 1;
 		m_first_state = (m_first_state + 1) % STATES_MAX;
 	}
@@ -390,11 +474,33 @@ void GameController::AddState() {
 	m_states_num++;
 }
 
+// A state dropped before a read took it: in the log (stdout) at most every DROP_REPORT_MS, the count since the last line.
+void GameController::CountDroppedState() {
+	m_dropped_states++;
+	m_dropped_unreported++;
+	if (const auto now = SDL_GetTicks64(); !m_dropped_reported || now - m_dropped_report_ms >= DROP_REPORT_MS) {
+		m_dropped_reported  = true;
+		m_dropped_report_ms = now;
+		ReportDroppedStates();
+	}
+}
+
+void GameController::ReportDroppedStates() {
+	if (m_dropped_unreported == 0) {
+		return;
+	}
+	std::printf("Pad: %llu input states dropped unread (the %u-state history was full; %llu in all)\n",
+	            static_cast<unsigned long long>(m_dropped_unreported), STATES_MAX,
+	            static_cast<unsigned long long>(m_dropped_states));
+	std::fflush(stdout);
+	m_dropped_unreported = 0;
+}
+
 void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
 
 	// The keyboard shares the player-1 pad with the active gamepad.
-	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+	if (Claim(id, down)) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
 		m_state.buttons = down ? m_state.buttons | button : m_state.buttons & ~button;
@@ -406,7 +512,8 @@ void GameController::Button(int id, uint32_t button, bool down) {
 void GameController::Axis(int id, Controller::Axis axis, int value) {
 	Common::LockGuard lock(m_mutex);
 
-	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+	const bool trigger_axis = axis == Controller::Axis::TriggerLeft || axis == Controller::Axis::TriggerRight;
+	if (Claim(id, trigger_axis ? value > 128 : (value < 64 || value > 192))) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
 		int axis_id = static_cast<int>(axis);
@@ -505,6 +612,7 @@ void GameController::ReleaseHostPads() {
 	}
 
 	m_connected_ids.clear();
+	ReportDroppedStates();
 }
 
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
@@ -841,7 +949,7 @@ int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformati
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PRINT_NAME();
 	Loader::DemonsSoulsWarp::RunQueuedCommand(); // (live `gamecmd`: on the game's own thread)
-	Libs::Graphics::AntiLag::OnInput();          // KYTY_ANTILAG: the frame's INPUT mark
+	Libs::Graphics::AntiLag::OnInput("scePadReadState"); // KYTY_ANTILAG: the frame's INPUT mark
 
 	if (handle != 1) {
 		return PAD_ERROR_INVALID_HANDLE;
@@ -866,7 +974,7 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(num < 1 || num > 64);
-	Libs::Graphics::AntiLag::OnInput(); // KYTY_ANTILAG: the frame's INPUT mark
+	Libs::Graphics::AntiLag::OnInput("scePadRead"); // KYTY_ANTILAG: the frame's INPUT mark
 	if (handle != 1) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}

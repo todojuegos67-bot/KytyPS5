@@ -5,6 +5,7 @@
 // emulator starts: the environment switches and command-line options that Launcher-souls.ps1 and run-windows.ps1
 // passed (the same rules, in the same order; resources/LEEME-PC.txt lists each option).
 
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -47,10 +48,20 @@ extern const Choice  kReflections[];  // also the object fade's levels
 extern const int     kReflectionCount;
 extern const Choice  kAaSharp[];
 extern const int     kAaSharpCount;
-extern const Choice  kRtLight[];      // KYTY_SSGI 0-3
-extern const int     kRtLightCount;
-extern const Choice  kAmbientOcclusion[]; // KYTY_GTAO 0-3
-extern const int     kAmbientOcclusionCount;
+// (10-27) Launcher-souls.ps1: Bordes sombras (KYTY_SHADOW_FILTER 0-3), Sombra rincones (the hardware RT AO's floor and
+// strength), Texturas (normales / nitidas / extra nitidas), Anti-Lag.
+extern const Choice  kShadowEdges[];
+extern const int     kShadowEdgeCount;
+extern const Choice  kCornerShadows[];
+extern const int     kCornerShadowCount;
+extern const Choice  kTextureSharpness[];
+extern const int     kTextureSharpnessCount;
+extern const Choice  kAntiLagAmd[];   // the AMD frame generation's, on an AMD graphics card
+extern const int     kAntiLagAmdCount;
+extern const Choice  kAntiLagOther[]; // the AMD frame generation's, on NVIDIA / Intel
+extern const int     kAntiLagOtherCount;
+extern const Choice  kAntiLagDlssg[]; // NVIDIA frame generation's
+extern const int     kAntiLagDlssgCount;
 extern const Choice  kSoulsModes[];
 extern const int     kSoulsModeCount;
 
@@ -76,26 +87,35 @@ struct Settings {
 	// [FrameGeneration]
 	std::string framegen = "sin-fg";
 	// [Rendimiento]
-	bool        profile16 = false;  // run-windows -Ram16 (ram16.txt): memory only
+	bool        profile16 = false;  // run-windows -Ram16 (ram16.txt): memory only, and only on a PC of 20 GB of RAM or less
+	bool        simulate_ram16 = false; // (10-24) "Simular 16 GB RAM": KYTY_SIMULATE_RAM_MB=16384 (and the 16 GB profile)
 	bool        safe_gpu = false;   // KYTY_COMPUTE_CHAIN=0
 	std::string quality = "standard";
 	std::string texture_reduce = "0";
 	bool        simulate_vram8 = false;
 	bool        all_ccds = false;
-	bool        antilag = false;     // KYTY_ANTILAG
+	bool        antilag = false;     // (before 10-27) KYTY_ANTILAG: now antilag_mode
+	std::string antilag_mode = "auto"; // AMD frame generation: auto (amd2 on AMD, normal else), amd2, normal, ultra, no
+	std::string antilag_dlssg = "reflex"; // NVIDIA frame generation: reflex, normal, ultra (ours, Reflex off)
 	// [Graficos] (10-23, the launcher's "Calidad grafica" and "Modos Souls")
-	std::string souls_mode = "ninguno"; // ninguno, ligero (30 x2 AMD), equilibrado (45 x2 AMD), ultra, extremo
+	std::string souls_mode = "ninguno"; // ninguno, ligero (30 x2 AMD), equilibrado (45 x2 AMD), ultra, extremo, low (PC low profile)
 	bool        gpu8 = false;        // Optimizacion tarjetas 8 GB (the menu sets the light preset)
 	std::string shadows = "maximo";  // maximo, alto (190 m), medio (125 m), bajo (60 m)
 	std::string detail = "alto";     // ultra, muy-alto, alto (the game's), normal, bajo
 	std::string reflections = "alto"; // ultra, alto (the game's), normal, bajo
 	std::string object_fade = "alto";
 	std::string aa_sharp = "normal"; // ultra, alto, normal (the game's), bajo, no
-	std::string rt_light = "0";      // KYTY_SSGI
-	std::string ambient_occlusion = "0"; // KYTY_GTAO
+	std::string rt_light = "0";      // (10-26: removed from the launcher) KYTY_SSGI, never passed now
+	std::string ambient_occlusion = "0"; // (10-26: GTAO removed) never passed now
+	// (10-27) Ray tracing (hardware): the launcher's six No / Si rows ($hwTbl). Every Souls mode turns them off.
+	bool        rt_reflections = false, rt_sun = false, rt_fog = false, rt_particles = false, rt_metal = false, rt_ao = false;
+	std::string shadow_edges = "0";  // Bordes sombras: 0 Normal, 1 Alta, 2 Muy alta, 3 Ultra (KYTY_SHADOW_FILTER)
+	std::string corner_shadow = "0"; // Sombra rincones: 0 Normal, 1 Alta, 2 Maxima (with Oclusion RT only)
 	bool        motion_blur = true, dof = true, vignette = true, bloom = true, eye_adapt = true;
 	bool        af16 = false;        // KYTY_FORCE_AF=16
-	bool        sharp_textures = false; // KYTY_TEXTURE_LOD_BIAS=auto
+	// Texturas (10-25, the launcher's lodbias, default "nitidas"): 0 normales, 1 nitidas (KYTY_TEXTURE_LOD_BIAS=auto),
+	// 2 extra nitidas (log2(ratio) - 1 with an upscaler, -0.5 without; at least -2)
+	std::string texture_sharpness = "1";
 	// [Mandos] (10-23: Launcher-souls.ps1 "Controles")
 	bool        kbm = false;         // KYTY_KBM: keyboard and mouse
 	float       kbm_sens = 1.0f;     // KYTY_KBM_SENS
@@ -124,15 +144,32 @@ struct LaunchPlan {
 	int                      vblank = 60;
 };
 
+// The PC (ds-main.cpp: the dedicated graphics card first, as Launcher-souls.ps1's Select-BestGpu).
+struct PcInfo {
+	std::string gpu;        // the graphics card's name
+	uint64_t    vram = 0;   // its dedicated memory (bytes)
+	std::string cpu;
+	int         ram_gb = 0;
+	int         screen_h = 0; // the monitor's real height (FSR 900p)
+	bool        nvidia = true, amd = false;
+	std::string recommended, expected; // the launcher's graphics card table ($gpuDb)
+	bool        unsupported = false;
+};
+void RecommendFor(PcInfo* pc); // fills recommended / expected / unsupported from `gpu`
+// (10-24) Launcher-souls.ps1 Test-LowRam: a PC of 20 GB of RAM or less, or "Simular 16 GB RAM".
+bool LowRam(const Settings& settings, const PcInfo& pc);
+
 // `title_id` from sce_sys/param.json (empty: unknown, the Demon's Souls engine settings still apply: this is its port).
-LaunchPlan BuildLaunch(const Settings& settings, const std::string& title_id);
+LaunchPlan BuildLaunch(const Settings& settings, const std::string& title_id, const PcInfo& pc = {});
 
 // Settings whose change needs a restart (everything the menu does not apply live).
 bool NeedsRestart(const Settings& launched, const Settings& now);
 
 // The launcher's presets (Set-PresetLight / Max / Ultra / Extreme and Souls equilibrado) on the graphics settings.
-void ApplyPreset(Settings* settings, const std::string& preset); // ligero, maximo, equilibrado, ultra, extremo
-// Souls ligero / equilibrado: frame generation fixed at AMD x2, the game at 30 / 45.
+void ApplyPreset(Settings* settings, const std::string& preset); // ligero, maximo, equilibrado, ultra, extremo, low
+// (10-26) Choosing any Souls mode: every ray tracing row to No.
+void RtAllOff(Settings* settings);
+// Souls ligero / equilibrado / PC low profile: frame generation fixed at AMD x2, the game at 30 / 45 / 30.
 bool FixedFg(const Settings& settings);
 
 } // namespace Port

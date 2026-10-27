@@ -29,6 +29,11 @@ void LowerThreadMemoryPriority();
 // Helpers for sources: drop the pages of [address, address + size) whose contents are no longer needed (they stay
 // committed; the next write gets zero or old bytes). Page-aligned inside; returns the bytes covered.
 uint64_t DiscardPages(void* address, uint64_t size);
+// One pass now, whatever the frames (ram-guard.h's pressure response, on its thread): the registered sources, scratch
+// buffers idle for scratch_idle_ms or more (one in use is never touched), the heaps compacted. Works with
+// KYTY_SOFT_RELEASE off too (then no scratch buffer is registered). Returns the bytes released (the private bytes' or
+// the working set's drop, whichever is more); detail: the parts, for the log line.
+uint64_t FlushNow(int64_t scratch_idle_ms, char* detail, size_t detail_size);
 
 // A thread's reusable byte buffer (one per thread: `thread_local SoftRelease::Scratch s("name")`), which otherwise keeps
 // its largest size for good. With KYTY_SOFT_RELEASE=1 the release thread frees one idle for 10 s or more, under its own
@@ -45,7 +50,7 @@ public:
 	std::vector<uint8_t> bytes;
 
 	// (The release thread's.)
-	uint64_t ReleaseIfIdle(int64_t now_ns);
+	uint64_t ReleaseIfIdle(int64_t now_ns, int64_t idle_ns = 10'000'000'000ll);
 	const char* const     source;
 	std::mutex            mutex;
 	std::atomic<int64_t>  last_use_ns {0};

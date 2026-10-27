@@ -1,5 +1,6 @@
 // Sony's PS5 Pro super resolution as Demon's Souls dispatches it (graphics/guest_gpu/superResolution.h), done here:
 // DLSS (KYTY_UPSCALER=dlss, frame-gen.h) where Streamline offers it, else a linear stretch of the input.
+#include "local/hwrt-scene.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/superResolution.h"
@@ -357,6 +358,8 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		                    bindings[1].desc.info.data.address);
 	buffer.EndRendering();
 	const auto vk_buffer = buffer.Handle();
+	// (KYTY_HWRT: the frame's scene acceleration structures - the PS5 Pro path has no TAA dispatch)
+	if (HwScene::Active()) HwScene::EndFrame(m_context.GetGraphics(), vk_buffer, "the PS5 Pro super-resolution packet");
 	auto&      color     = cache.GetImage(bindings[0].image_id);
 	auto&      motion    = cache.GetImage(bindings[1].image_id);
 	auto&      depth     = cache.GetImage(bindings[2].image_id);
@@ -410,10 +413,40 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 	inputs.motion_scale_x = Word(packet, MotionScaleWord);
 	inputs.motion_scale_y = Word(packet, MotionScaleWord + 1);
 	inputs.reset          = reinterpret_cast<const uint8_t*>(packet.parameters)[ResetByte] != 0;
+	if (inputs.reset) FrameGen::NoteCut(); // (frame generation does not blend across a camera cut; chenxiao07 3e1e3250)
 	for (uint32_t i = 0; i < 16; i++) inputs.view_to_clip[i] = Word(packet, ViewToClipWord + i);
 	inputs.near_plane = Word(packet, NearWord);
 	inputs.far_plane  = Word(packet, FarWord);
 	inputs.graphics   = &m_context.GetGraphics();
+	// (hwrt2, KYTY_HWRT_REFL: the scene EndFrame built just above, for the reflections' ray queries)
+	if (HwScene::Active()) {
+		HwScene::RayScene scene;
+		if (HwScene::CurrentRayScene(scene)) {
+			inputs.hwrt_tlas      = scene.tlas;
+			inputs.hwrt_info      = scene.info;
+			inputs.hwrt_info_size = scene.size;
+		}
+	}
+	// (rtparticles) The color's guest address (the pre-particle copy is matched to it); with KYTY_RT_PARTICLES_DEBUG the
+	// game's own reactive mask slot (6), as it describes it, once.
+	inputs.color_address = bindings[0].desc.info.data.address;
+	if (FrameGen::RtParticlesDebug()) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			constexpr uint32_t    slot_reactive = 6;
+			ShaderTextureResource reactive {};
+			std::memcpy(reactive.fields, packet.textures[slot_reactive], sizeof(reactive.fields));
+			if ((packet.textures_given & (1u << slot_reactive)) != 0 && !reactive.IsNull())
+				std::printf("RT particles: the game's super-resolution reactive mask: slot 6 at 0x%" PRIx64 ", %ux%u, format %u, type %u\n",
+				            reactive.Base40(), static_cast<uint32_t>(reactive.Width5()) + 1u, static_cast<uint32_t>(reactive.Height5()) + 1u,
+				            static_cast<uint32_t>(reactive.Format()), static_cast<uint32_t>(reactive.Type()));
+			else
+				std::printf("RT particles: the game's super-resolution packet gives no reactive mask (slot 6: given 0x%x)\n",
+				            packet.textures_given);
+			std::fflush(stdout);
+		}
+	}
 	// The exposure: the float the 1x1 32-bit float texture of slot 5 holds (the game's constants), read as a buffer.
 	ShaderTextureResource exposure_texture {};
 	std::memcpy(exposure_texture.fields, packet.textures[SlotExposure], sizeof(exposure_texture.fields));
@@ -428,6 +461,10 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 			record.exposure_range  = offset - base + sizeof(float);
 			record.exposure_index  = static_cast<uint32_t>((offset - base) / sizeof(float));
 			record.exposure_pass   = Exposure(m_context.GetGraphics());
+			inputs.exposure_buffer = record.exposure_buffer;
+			inputs.exposure_base   = record.exposure_base;
+			inputs.exposure_range  = record.exposure_range;
+			inputs.exposure_index  = record.exposure_index;
 			// (A view the pass samples: the output's own, the image's to keep and destroy.)
 			auto view_info    = bindings[3].desc.view_info;
 			view_info.usage   = vk::ImageUsageFlagBits::eSampled;
@@ -454,7 +491,7 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 	// KYTY_SSR with KYTY_SSR_GBUF: the G-buffer target holding roughness, sampled read only (its contents untouched).
 	Image*                 ssr_material = nullptr;
 	ImageSubresourceRange  ssr_range {};
-	if (dlss && FrameGen::SsrWanted()) {
+	if (dlss && FrameGen::SsrPassWanted()) {
 		FrameGen::SsrTarget target;
 		int                 channel = -1;
 		bool                gloss   = false;
@@ -494,7 +531,7 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 	// KYTY_SSR: the packed (R32_UINT) G-buffer layers, sampled read only (normals / roughness decoded in ssr.comp).
 	std::array<Image*, 4>                packed_images {};
 	std::array<ImageSubresourceRange, 4> packed_ranges {};
-	if (dlss && FrameGen::SsrWanted()) {
+	if (dlss && FrameGen::SsrPassWanted()) {
 		std::array<FrameGen::SsrTarget, 4> targets {};
 		const uint32_t                     n = FrameGen::SsrPackedTargets(targets);
 		for (uint32_t i = 0; i < n; ++i) {
@@ -572,6 +609,9 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		               range(bindings[3]), vk_buffer);
 		ApplyExposure(record, VULKAN_HPP_DEFAULT_DISPATCHER);
 	}
+	// (KYTY_HWRT_DEBUG: the ray query view over the upscaled output)
+	if (HwScene::Active())
+		HwScene::DebugView(m_context.GetGraphics(), vk_buffer, bindings[3].image_view, output.backing.format, extent(bindings[3], output));
 	ResetBindings();
 }
 

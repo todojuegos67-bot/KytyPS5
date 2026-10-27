@@ -14,6 +14,7 @@
 #include "sync-stats.h"
 #include "fresh-memory.h"
 #include "texture-offload.h"
+#include "ram-guard.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -61,6 +62,7 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include <tuple>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -1394,14 +1396,29 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 }
 
 static BufferCache* g_sync_cache = nullptr;
+// Uploads the ring could not take (a temporary buffer each): the cost side of KYTY_STAGING_RING_MB, in the RAM census.
+static std::atomic<uint64_t> g_ring_overflow_count {0}, g_ring_overflow_bytes {0};
 
 // The image upload ring: 1 GiB on a PC with 32 GB of RAM or more (512 MiB before). A frame where the game streams
 // in an area uploads 0.8-1.4 GB of textures; past the ring's size the render thread waited for the GPU to finish
 // the first copies before it could reuse the ring (60-80 ms of gpu_wait in those frames, Boletaria).
 static uint64_t StagingRingSize() {
 	const uint64_t     ram = LocalPlatform::PhysicalMemory();
-	if (LocalPlatform::LowMemVram()) return 256 * MiB; // KYTY_LOWMEM_VRAM=1
-	return ram >= (uint64_t {32} << 30u) ? 1024 * MiB : 512 * MiB;
+	uint64_t           size = ram >= (uint64_t {32} << 30u) ? 1024 * MiB : 512 * MiB;
+	if (LocalPlatform::LowMemVram()) size = 256 * MiB; // KYTY_LOWMEM_VRAM=1
+	// KYTY_STAGING_RING_MB=<n> (KYTY_MEMCUT): the ring's size, 64-1024. Smaller only waits for the GPU sooner in a
+	// streaming frame (or uploads through a temporary buffer past it): the bytes uploaded are the same.
+	if (const char* text = std::getenv("KYTY_STAGING_RING_MB"); text != nullptr && std::strtoull(text, nullptr, 10) > 0)
+		size = std::clamp<uint64_t>(std::strtoull(text, nullptr, 10), 64, 1024) * MiB;
+	std::printf("[memcut] image upload ring %llu MiB (host-visible)\n", static_cast<unsigned long long>(size / MiB));
+	static std::once_flag once;
+	std::call_once(once, [] {
+		RamGuard::RegisterFigure("upload ring overflows so far (the MiB figure is the number of uploads)",
+		                         [] { return g_ring_overflow_count.load(std::memory_order_relaxed) << 20u; });
+		RamGuard::RegisterFigure("upload ring overflow bytes so far",
+		                         [] { return g_ring_overflow_bytes.load(std::memory_order_relaxed); });
+	});
+	return size;
 }
 
 // KYTY_BDA_SPARSE=1 (where the device has strict sparse residency buffers; off by default while a GPU hang in 2-2's
@@ -1487,17 +1504,24 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_lod_stats_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, 256 * 16),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, StagingRingSize(),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, (RequestRebarPlacement("image upload ring"), StagingRingSize()),
                        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-      m_host_shader_upload(graphics, scheduler, MemoryUsage::Upload, 64 * MiB),
-      m_table_upload(graphics, scheduler, MemoryUsage::Upload, 32 * MiB,
+      m_host_shader_upload(graphics, scheduler, MemoryUsage::Upload, (RequestRebarPlacement("shader upload ring"), 64 * MiB)),
+      m_table_upload(graphics, scheduler, MemoryUsage::Upload, (RequestRebarPlacement("table upload ring"), 32 * MiB),
                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_staging_device(graphics, scheduler, MemoryUsage::Stream, 64 * MiB,
                        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache), m_resources(resources) {
+	RequestRebarPlacement(nullptr);
+	if (const auto report = TakeRebarReport(); !report.empty()) {
+		std::printf("[rebar] KYTY_REBAR_STAGING: %s\n", report.c_str());
+		std::fflush(stdout);
+	} else if (const char* value = std::getenv("KYTY_REBAR_STAGING"); value != nullptr && value[0] == '1') {
+		std::printf("[rebar] KYTY_REBAR_STAGING: no ring requested\n");
+	}
 	{
 		const auto usage = PageTableUsage(graphics);
 		m_bda_tables.push_back(
@@ -2376,6 +2400,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return staging_ring.Handle();
 	}
 
+	g_ring_overflow_count.fetch_add(1, std::memory_order_relaxed);
+	g_ring_overflow_bytes.fetch_add(total_size, std::memory_order_relaxed);
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
@@ -2914,7 +2940,13 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 	// chain makes every frame, on the frame's critical path: 0.39 ms on this thread alone, 0.24 ms shared at Latria).
 	const auto page_of = [&](uint64_t at) { return (dst_vaddr + at) / TRACKER_PAGE_SIZE - dst_vaddr / TRACKER_PAGE_SIZE; };
 	thread_local std::vector<uint8_t> differs;
-	const bool parallel = size >= ParallelCompareBytes;
+	// (Helpers only over pages no read faults on: a helper's fault waits for this thread's
+	// readback, which waits for the helpers. CopyBuffer left out GPU-modified memory, so these are
+	// the pages the texture and file offloads hold; this thread compares such a copy alone, its own
+	// faults are served here. Only this thread adds holds.)
+	const bool parallel = size >= ParallelCompareBytes &&
+	                      !Libs::LibKernel::Memory::ReadFaults(dst_vaddr, size) &&
+	                      !Libs::LibKernel::Memory::ReadFaults(src_vaddr, size);
 	if (parallel) {
 		struct Compare {
 			uint64_t dst, src, size;
@@ -3154,6 +3186,7 @@ void BufferCache::Defragment(uint64_t tick) {
 		for (auto* allocation: m_defrag_free_later) vmaFreeMemory(allocator, allocation);
 		m_defrag_free_later.clear();
 		m_defrag_moves.clear();
+		ReleaseBufferFrees();
 		if (result != VK_INCOMPLETE) EndDefragmentation();
 		return;
 	}
@@ -3162,13 +3195,17 @@ void BufferCache::Defragment(uint64_t tick) {
 		BufferCache*                          cache;
 		std::chrono::steady_clock::time_point start;
 		bool                                  on    = false;
-		uint32_t                              moves = 0;
+		uint32_t                              moves = 0, ignored = 0;
+		double                                begin_ms = 0;
 		~Timed() {
 			if (!on) return;
 			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 			cache->m_defrag_ms += ms;
 			cache->m_defrag_max_ms = std::max(cache->m_defrag_max_ms, ms);
-			if (ms >= 4.0) std::printf("Game buffers compacting: a flip's pass took %.2f ms (%u moves)\n", ms, moves);
+			if (ms >= 4.0)
+				std::printf("Game buffers compacting: a flip's pass took %.2f ms (%u moves, %u ignored; VMA's pass begin %.2f "
+				            "ms)\n",
+				            ms, moves, ignored, begin_ms);
 		}
 	} timed {this, start};
 	if (m_defrag_pass_open) {
@@ -3203,8 +3240,13 @@ void BufferCache::Defragment(uint64_t tick) {
 	}
 	// (On the command buffer being recorded, outside a speculation: MoveSpilledBufferBack.)
 	if (!m_scheduler.Active() || m_scheduler.Current().IsInvalid() || Spec::Current() != nullptr) return;
-	timed.on = true;
-	if (vmaBeginDefragmentationPass(allocator, m_defrag, &m_defrag_pass) != VK_INCOMPLETE) {
+	// (The allocations of buffers erased before it stay till its end: their free on the reclaimer's thread waits.)
+	if (!HoldBufferFrees()) return;
+	timed.on         = true;
+	const auto begun = vmaBeginDefragmentationPass(allocator, m_defrag, &m_defrag_pass);
+	timed.begin_ms   = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+	if (begun != VK_INCOMPLETE) {
+		ReleaseBufferFrees();
 		EndDefragmentation();
 		return;
 	}
@@ -3219,6 +3261,8 @@ void BufferCache::Defragment(uint64_t tick) {
 		auto*      old = key != 0 ? m_slot_buffers.try_get(id) : nullptr;
 		if (old == nullptr || old->Allocation() != move.srcAllocation) {
 			move.operation = VMA_DEFRAGMENTATION_MOVE_OPERATION_IGNORE;
+			timed.ignored++;
+			m_defrag_ignored++;
 			continue;
 		}
 		if (old->is_deleted) {
@@ -3261,13 +3305,13 @@ void BufferCache::EndDefragmentation() {
 	VmaStatistics statistics {};
 	vmaGetPoolStatistics(m_graphics.allocator, m_graphics.game_buffer_pool, &statistics);
 	m_defrag_free_after = statistics.blockBytes - statistics.allocationBytes;
-	std::printf("Game buffers compacted: %u moved (%llu MiB), %u blocks freed (%llu MiB); %llu MiB of %llu MiB free; %u "
-	            "passes, %.1f ms (at most %.2f in a flip)\n",
-	            stats.allocationsMoved, static_cast<unsigned long long>(stats.bytesMoved >> 20u),
+	std::printf("Game buffers compacted: %u moved (%llu MiB, %u ignored), %u blocks freed (%llu MiB); %llu MiB of %llu MiB "
+	            "free; %u passes, %.1f ms (at most %.2f in a flip)\n",
+	            stats.allocationsMoved, static_cast<unsigned long long>(stats.bytesMoved >> 20u), m_defrag_ignored,
 	            stats.deviceMemoryBlocksFreed, static_cast<unsigned long long>(stats.bytesFreed >> 20u),
 	            static_cast<unsigned long long>(m_defrag_free_after >> 20u),
 	            static_cast<unsigned long long>(statistics.blockBytes >> 20u), m_defrag_passes, m_defrag_ms, m_defrag_max_ms);
-	m_defrag_passes = 0;
+	m_defrag_passes = m_defrag_ignored = 0;
 	m_defrag_ms = m_defrag_max_ms = 0;
 }
 
