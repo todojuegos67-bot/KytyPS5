@@ -43,7 +43,7 @@ extern std::array<float, 16> g_last_vp;
 extern bool                  g_have_last_vp;
 namespace {
 
-constexpr uint32_t Bindings  = 13;
+constexpr uint32_t Bindings  = 14;
 constexpr uint32_t MaxLights = 8;
 constexpr uint32_t SlotBytes = 1024;
 constexpr uint32_t Slots     = 4;
@@ -68,7 +68,9 @@ struct {
 	vk::Sampler             point = nullptr, linear = nullptr;
 	bool                    failed = false;
 	vk::Extent2D            extent {}, trace {};
-	Img                     out, raw, tmp_a, tmp_b;
+	Img                     out, raw, tmp_a, tmp_b, held; // held: the last exact sun visibility (full res)
+	bool                    held_valid = false;
+	float                   held_w     = 0.0f;
 	std::array<Img, 2>      gbuf, hist;
 	bool                    layouts_ready = false, history_valid = false;
 	std::array<std::pair<Img, uint64_t>, 16> retired {};
@@ -193,7 +195,7 @@ void FreeRetired(GraphicContext& graphics) {
 vk::DescriptorType DescType(uint32_t i) {
 	return i == 9 || i == 11 ? vk::DescriptorType::eStorageBuffer
 	       : i == 10         ? vk::DescriptorType::eAccelerationStructureKHR
-	       : i == 7 || i == 8 ? vk::DescriptorType::eStorageImage
+	       : i == 7 || i == 8 || i == 13 ? vk::DescriptorType::eStorageImage
 	                          : vk::DescriptorType::eCombinedImageSampler;
 }
 
@@ -280,13 +282,13 @@ bool EnsurePipeline(GraphicContext& graphics) {
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D extent, int level) {
 	const vk::Extent2D trace = level >= 3 ? extent : vk::Extent2D {std::max(extent.width / 2, 1u), std::max(extent.height / 2, 1u)};
 	if (g_ct.out.image != VK_NULL_HANDLE && g_ct.extent == extent && g_ct.trace == trace) return true;
-	Img* all[] {&g_ct.out, &g_ct.raw, &g_ct.tmp_a, &g_ct.tmp_b, &g_ct.gbuf[0], &g_ct.gbuf[1], &g_ct.hist[0], &g_ct.hist[1]};
+	Img* all[] {&g_ct.out, &g_ct.held, &g_ct.raw, &g_ct.tmp_a, &g_ct.tmp_b, &g_ct.gbuf[0], &g_ct.gbuf[1], &g_ct.hist[0], &g_ct.hist[1]};
 	for (Img* img: all) Retire(graphics, *img);
 	g_ct.extent = extent, g_ct.trace = trace;
-	g_ct.layouts_ready = false, g_ct.history_valid = false;
-	bool ok = MakeImage(graphics, extent, g_ct.out);
+	g_ct.layouts_ready = false, g_ct.history_valid = false, g_ct.held_valid = false, g_ct.held_w = 0.0f;
+	bool ok = MakeImage(graphics, extent, g_ct.out) && MakeImage(graphics, extent, g_ct.held);
 	for (Img* img: all)
-		if (img != &g_ct.out) ok = ok && MakeImage(graphics, trace, *img);
+		if (img != &g_ct.out && img != &g_ct.held) ok = ok && MakeImage(graphics, trace, *img);
 	if (!ok)
 		for (Img* img: all) Retire(graphics, *img);
 	return ok;
@@ -439,6 +441,13 @@ bool RtContactApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const float  target = g_ct_sun.weight;
 	sun_w = std::clamp(sun_w + std::clamp(target - sun_w, -dt / 0.5f, dt / 0.5f), 0.0f, 1.0f);
 	const bool exact = sun_fresh && g_ct_sun.exact;
+	// (ds-rt-stable-1027) RTFLICKER contact 10-28 %, max jump 140 %: the RT sun pass ran on only 18-74 of ~490 frames
+	// (HWRTCONTACT 'sun in N frames (M with exact visibility)'), and the composite switched V between that visibility
+	// and 1 on every such frame - a sun-shadowed pixel was left alone one frame and darkened by up to K/(1+K) the next.
+	// Now the composite stores V on an exact frame and reuses the held copy on every other one (one V every frame);
+	// its weight eases in / out over 1 s, so the model never switches in one frame.
+	if (exact) g_ct.held_valid = true;
+	g_ct.held_w = std::clamp(g_ct.held_w + (g_ct.held_valid ? dt : -dt), 0.0f, 1.0f);
 
 	// The local lights: seen within 120 flips by >= 2 scans, nearest first, up to 8 (the pixel picks the strongest).
 	std::vector<RtLocal::LiveLight> live;
@@ -522,9 +531,10 @@ bool RtContactApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		for (int i = 0; i < 16; ++i) f[i] = static_cast<float>(ivp[i]);
 		f[16] = static_cast<float>(cam[0]), f[17] = static_cast<float>(cam[1]), f[18] = static_cast<float>(cam[2]), f[19] = 1.0f;
 		f[20] = g_ct_sun.dir[0], f[21] = g_ct_sun.dir[1], f[22] = g_ct_sun.dir[2], f[23] = sun_w;
-		f[24] = g_ct_sun.r, f[25] = exact ? 2.0f : 0.0f, f[26] = length, f[27] = strength;
+		f[24] = g_ct_sun.r, f[25] = exact ? 2.0f : g_ct.held_valid ? 1.0f : 0.0f, f[26] = length, f[27] = strength;
 		f[28] = static_cast<float>(picks.size()), f[29] = -1.0f, f[30] = max_dark, f[31] = fade_m;
 		f[32] = fade_m * 1.6f, f[33] = std::tan(soft * 0.01745329f), f[34] = ambient, f[35] = knee;
+		f[36] = g_ct.held_w;
 		for (size_t i = 0; i < picks.size(); ++i) {
 			const auto& l = *picks[i].l;
 			float*      e = &f[40 + i * 12];
@@ -560,7 +570,7 @@ bool RtContactApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	Barrier(command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
 	        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	if (!g_ct.layouts_ready) {
-		Img* all[] {&g_ct.out, &g_ct.raw, &g_ct.tmp_a, &g_ct.tmp_b, &g_ct.gbuf[0], &g_ct.gbuf[1], &g_ct.hist[0], &g_ct.hist[1]};
+		Img* all[] {&g_ct.out, &g_ct.held, &g_ct.raw, &g_ct.tmp_a, &g_ct.tmp_b, &g_ct.gbuf[0], &g_ct.gbuf[1], &g_ct.hist[0], &g_ct.hist[1]};
 		for (Img* img: all) ToGeneral(command, img->image);
 		g_ct.layouts_ready = true, g_ct.history_valid = false, push.motion[2] = 0.0f;
 	}
@@ -593,6 +603,7 @@ bool RtContactApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		infos[7]  = {nullptr, out.view, gen};
 		infos[8]  = {nullptr, g_ct.gbuf[cur].view, gen};
 		infos[12] = vis_info;
+		infos[13] = {nullptr, g_ct.held.view, gen};
 		vk::WriteDescriptorSet writes[Bindings] {};
 		for (uint32_t i = 0; i < Bindings; ++i) {
 			writes[i].dstBinding      = i;
