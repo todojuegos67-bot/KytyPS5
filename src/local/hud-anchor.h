@@ -438,6 +438,12 @@ public:
 		float scale = 1.0f, shift = 0.0f;
 		if (width != CanvasWidth) {
 			shift = static_cast<float>(width - CanvasWidth) * (a.side + 1.0f) / 2.0f;
+			// A wide output narrower than the aspect (held at DemonsSoulsRenderSize::MaxWideOutputWidth, 32:9): the
+			// presenter widens the canvas after, so the area is narrowed as much around its side (none otherwise).
+			if (const double widened = wide * CanvasHeight / width; widened > 1.01) {
+				scale = static_cast<float>(1.0 / widened);
+				shift += (a.side + 1.0f) * (CanvasWidth / 2.0f) * (1.0f - scale);
+			}
 		} else {
 			scale = static_cast<float>((16.0 / 9.0) / wide);
 			shift = (m_xoffset + a.side * m_xscale) * (1.0f - scale);

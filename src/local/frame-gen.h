@@ -204,9 +204,10 @@ bool ReplaceTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<
 // by the raw jittered frame's, its alpha (flags later passes read) kept. False: nothing done.
 bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
-// Present thread, in the present's command buffer: the HUD-less image scaled to the backbuffer (DLSS-G).
+// Present thread, in the present's command buffer: the HUD-less image scaled to the backbuffer (DLSS-G), into `region`
+// (the presenter's present region) with black around it when that is not the whole backbuffer.
 void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,
-                  vk::Format format);
+                  vk::Rect2D region, vk::Format format);
 
 // Frame generation's own images (not the texture cache's; frame-gen-hudless.cpp's too), on the thread that records
 // them: `image` (re)made as a sampled copy target like `source`, with its view (with `attachment`, a color attachment
@@ -234,6 +235,11 @@ struct UpscaleInputs {
 	bool         reset = false;                           // no history (a cut, a level load)
 	std::array<float, 16> view_to_clip {};                // row vectors (p' = p * M)
 	float        near_plane = 0.1f, far_plane = 3000.0f;
+	// (hwrt2, KYTY_HWRT_REFL) The frame's scene acceleration structure (a VkAccelerationStructureKHR; 0: none) and its
+	// RayInfo buffer (local/hwrt-scene.h CurrentRayScene).
+	uint64_t       hwrt_tlas = 0;
+	vk::Buffer     hwrt_info = nullptr;
+	vk::DeviceSize hwrt_info_size = 0;
 	GraphicContext* graphics = nullptr;                    // the renderer's (SSGI, FSR, sharpening when nothing else set it)
 	// KYTY_SSR with KYTY_SSR_GBUF: the game's G-buffer target holding roughness / gloss (read only; no view: none),
 	// the channel (0..3) and whether it is gloss (1 - roughness).
@@ -244,6 +250,16 @@ struct UpscaleInputs {
 	// RT0..RT3, one 4-layer image), decoded by ssr.comp after its calibration.
 	std::array<UpscaleImage, 4> packed {};
 	uint32_t                    packed_count = 0;
+	// The game's exposure (applied after the upscale; KYTY_RT_REFLECTIONS reads it): its float at exposure_index of the
+	// buffer range (none: no buffer).
+	vk::Buffer                  exposure_buffer = nullptr;
+	vk::DeviceSize              exposure_base = 0, exposure_range = 0;
+	uint32_t                    exposure_index = 0;
+	// (rtparticles) The color image's guest address (the PS5 Pro path's slot 1: RtParticles matches the pre-particle copy
+	// to it), and the particle reactive mask KYTY_RT_PARTICLES=2 builds (R8_UNORM, render size; no view: none) for the
+	// upscaler (FSR 3.1 reactive, XeSS responsive pixels, DLSS bias-current-color hint).
+	uint64_t                    color_address = 0;
+	UpscaleImage                reactive;
 };
 // Streamline offers DLSS super resolution on this device.
 [[nodiscard]] bool UpscalerReady();
@@ -251,7 +267,8 @@ struct UpscaleInputs {
 [[nodiscard]] bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs);
 // KYTY_SSGI=1|2: screen-space GI on the color before the upscaler (in Upscale).
 [[nodiscard]] bool SsgiWanted();
-// KYTY_CONTACT_SHADOWS=1|2|3 ("Sombras RT"): screen-space contact shadows toward the sun before the upscaler (in Upscale).
+// KYTY_RT_SHADOWS=1|2|3 ("Sombras RT"; KYTY_CONTACT_SHADOWS the old name): screen-space ray-traced sun shadows with a
+// temporal + a-trous denoise on the PS5 Pro path's HDR color before the upscaler (in Upscale).
 [[nodiscard]] bool ContactShadowsWanted();
 // The sun's direction for it: a dispatch that samples a shadow-map array (a square, layered, depth-like image) is a
 // sun-shadow consumer; its flattened SRT and small constant buffers are searched for the cascades' orthographic
@@ -272,7 +289,10 @@ void OnShadowDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt, boo
 
 // KYTY_SSR=1|2|3 ("Reflejos RT": Normal / Alta / Ultra): screen-space reflections before the upscaler (in Upscale).
 // Everything below runs only while SsrWanted() (KYTY_SSR > 0), and only reads.
+// (also while KYTY_RT_REFLECTIONS > 0: rt-reflections.cpp reads the G-buffer copy and the camera these hooks take)
 [[nodiscard]] bool SsrWanted();
+// KYTY_SSR's own pass (its roughness target and live packed layers at the upscaler): KYTY_SSR > 0 only.
+[[nodiscard]] bool SsrPassWanted();
 // A G-buffer draw's vertex SRT (any path): the camera's view-projection for the up direction of the heuristic mask.
 void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt);
 // A G-buffer vertex shader's draw on the normal path: its color targets (the G-buffer layout, logged; the one
@@ -293,8 +313,59 @@ void OnSsrDispatch(uint64_t cs_hash, std::span<const uint64_t> addresses, std::s
 [[nodiscard]] uint32_t SsrPackedTargets(std::array<SsrTarget, 4>& targets);
 // Before a G-buffer consumer dispatch (renderCompute.cpp; the deferred lighting: the G-buffer complete, nothing else
 // written over it yet): the packed layers copied once a frame into SSR's own image, the source ssr.comp decodes.
+// (rtparticles) KYTY_RT_PARTICLES=0|1|2 ("Particulas RT", default 0) and KYTY_RT_PARTICLES_DEBUG=1 (census): see the
+// RtParticles section of frame-gen.cpp. Level 1: the scene color is copied right before the frame's first blended,
+// depth-write-off draw into it (the particle / transparent pass), and the SSGI emissive light takes the particles'
+// own emission (color - copy) as the emitters' radiance. Level 2: also a reactive mask of that emission for the
+// upscaler. The debug census logs, every 10 s, the ordered passes drawing into / dispatching onto the scene color.
+[[nodiscard]] bool RtParticlesWanted();
+[[nodiscard]] bool RtParticlesDebug();
+struct SceneDraw {
+	ImageId  target;
+	uint64_t address = 0;
+	uint32_t width = 0, height = 0;
+	int32_t  format = 0;
+	uint64_t vs = 0, ps = 0;
+	bool     blend = false, depth_test = false, depth_write = false, indirect = false;
+	uint8_t  src_blend = 0, dst_blend = 0, comb = 0;
+	uint32_t instances = 0, index_count = 0;
+};
+// Normal-path draw, right before its render pass begins (ExecutePreparedDraw): color target 0's draw state. May end the
+// pass in progress, copy the target and resume it (`layout`: the target's attachment layout).
+void BeforeSceneDraw(CommandBuffer& command, TextureCache& cache, const RenderState& rendering, vk::ImageLayout layout,
+                     const SceneDraw& draw);
+// Table / native-path draws (counted only: the copy is taken on the normal path).
+void NoteOtherPathDraw(uint64_t address, uint64_t vs, bool blend, int path);
+// A dispatch binding a storage image it writes (census only).
+void NoteSceneDispatch(uint64_t cs_hash, uint64_t address, uint32_t width, uint32_t height);
 void SsrCaptureGbuffer(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
                        std::span<const TextureBinding> images);
+// After a dispatch (renderCompute.cpp, while GbufViewWanted(): KYTY_GBUF_VIEW / KYTY_GBUF_TAP, gbuf-view.h): a G-buffer
+// reader's images and which it writes (written_mask: bit i = images[i]) logged once; KYTY_GBUF_TAP's image copied.
+[[nodiscard]] bool GbufViewWanted();
+void GbufTapAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                          std::span<const TextureBinding> images, uint64_t written_mask);
+// (refl8) KYTY_RT_REFLECTIONS' guide (rt-reflections.h): after a dispatch, while RtReflGuideWanted(): the deferred
+// lighting's (KYTY_RT_REFLECTIONS_GUIDE_CS, default 9fb5cc274b5e4f82) half-resolution RGBA16F input, the game's own SSR
+// result, copied for the reflections; its bindings and the dispatch that writes it logged once.
+[[nodiscard]] bool RtReflGuideWanted();
+void RtReflGuideAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                              std::span<const TextureBinding> images, uint64_t written_mask);
+
+// (rtsun) KYTY_RT_SUN=0|1|2|3 ("Sombras RT del sol": off / low / high / ultra; rt-sun.comp, frame-gen.cpp RtSun*): the
+// sun's visibility recomputed from the game's own cascaded shadow maps (contact-hardening PCSS, cascades blended, normal
+// offset) plus screen-space contact rays, and put in place of the game's own shadow-map lookup in its sun term: the
+// lit color is relit by (1 + R N.L V_new) / (1 + R N.L V_game) (R the sun / ambient ratio measured on the screen, V_game
+// the game's own lookup emulated on the same maps). Runs the KYTY_RT_SHADOWS plumbing (its hooks and the CShadowApply
+// pass, in Upscale) with another shader; KYTY_RT_SUN wins over KYTY_RT_SHADOWS when both are set. Off: nothing.
+[[nodiscard]] bool RtSunWanted();
+// A depth-only draw into a layer of a square layered depth image (>= 512 px, >= 4 layers): a sun cascade's draw (any
+// path). Its orthographic light matrix (found once per vertex shader in its flattened SRT) is noted for that layer.
+void OnSunCascadeDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt, uint32_t layer, uint64_t target_address);
+// After a dispatch (renderCompute.cpp): the first one of a flip that samples the cascades' array (the sun lighting)
+// copies the cascade layers into our own array, with the matrices that drew them.
+void RtSunAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                        std::span<const TextureBinding> images);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

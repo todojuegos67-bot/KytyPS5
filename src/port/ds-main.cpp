@@ -10,6 +10,7 @@
 #undef main
 
 #include "port/ds-port.h"
+#include "port/ds-update.h"
 
 #include <nlohmann/json.hpp>
 
@@ -18,6 +19,7 @@
 #include <shlobj.h>
 #include <psapi.h>
 #include <tlhelp32.h>
+#include <dxgi.h>
 
 #include <atomic>
 #include <cctype>
@@ -118,6 +120,70 @@ bool RamWarning() {
 	text += "\nCierralos si puedes (navegador, Discord, etc.).\n\nAceptar: jugar igualmente    Cancelar: salir";
 	std::printf("[port] RAM: %.1f GB free of %.0f GB (warned)\n", free_gb, total);
 	return MessageBoxW(nullptr, Wide(text).c_str(), L"Memoria RAM", MB_OKCANCEL | MB_ICONWARNING | MB_TOPMOST) == IDOK;
+}
+
+// ---- (10-27) The PC: Launcher-souls.ps1's Select-BestGpu (the dedicated graphics card before the integrated one: NVIDIA,
+// AMD Radeon RX / Pro or Intel Arc before Intel UHD / Iris or AMD "Radeon(TM) Graphics"; else the one with the most
+// VRAM), the CPU's name and the RAM, for the menu's TU EQUIPO and BuildLaunch. ----
+
+Port::PcInfo DetectPc() {
+	Port::PcInfo pc;
+	IDXGIFactory1* factory = nullptr;
+	if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory != nullptr) {
+		int      best_tier = -1;
+		uint64_t best_vram = 0;
+		IDXGIAdapter1* adapter = nullptr;
+		for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+			DXGI_ADAPTER_DESC1 d {};
+			if (SUCCEEDED(adapter->GetDesc1(&d)) && (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
+				std::string name = Utf8(d.Description);
+				while (!name.empty() && name.back() == ' ') name.pop_back();
+				std::string up = name;
+				std::transform(up.begin(), up.end(), up.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+				const auto has  = [&](const char* k) { return up.find(k) != std::string::npos; };
+				int        tier = 1;
+				if (d.VendorId == 0x1414 || has("BASIC") || has("REMOTE DISPLAY") || has("VIRTUAL") || has("PARSEC") || has("DISPLAYLINK")) tier = 0;
+				else if (has("RADEON(TM)") && has("GRAPHICS") && !has(" RX")) tier = 1;
+				else if (has("UHD") || has("IRIS") || has("HD GRAPHICS") || has("VEGA")) tier = 1;
+				else if (d.VendorId == 0x10DE || has("RADEON RX") || has("RADEON PRO") || has("RX ") || has(" ARC")) tier = 2;
+				const uint64_t vram = d.DedicatedVideoMemory;
+				if (tier > best_tier || (tier == best_tier && vram > best_vram)) {
+					best_tier = tier;
+					best_vram = vram;
+					pc.gpu    = name;
+					pc.vram   = vram;
+				}
+			}
+			adapter->Release();
+		}
+		factory->Release();
+	}
+	std::string up = pc.gpu;
+	std::transform(up.begin(), up.end(), up.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+	pc.nvidia = pc.gpu.empty() || up.find("NVIDIA") != std::string::npos || up.find("GEFORCE") != std::string::npos ||
+	            up.find("RTX") != std::string::npos || up.find("GTX") != std::string::npos || up.find("QUADRO") != std::string::npos;
+	pc.amd = up.find("AMD") != std::string::npos || up.find("RADEON") != std::string::npos;
+	HKEY key = nullptr;
+	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_READ, &key) == ERROR_SUCCESS) {
+		wchar_t name[256] = {};
+		DWORD   size      = sizeof(name) - sizeof(wchar_t);
+		if (RegQueryValueExW(key, L"ProcessorNameString", nullptr, nullptr, reinterpret_cast<LPBYTE>(name), &size) == ERROR_SUCCESS) {
+			std::string cpu = Utf8(name), out;
+			for (char c: cpu)
+				if (!(c == ' ' && (out.empty() || out.back() == ' '))) out += c;
+			while (!out.empty() && out.back() == ' ') out.pop_back();
+			pc.cpu = out;
+		}
+		RegCloseKey(key);
+	}
+	MEMORYSTATUSEX m {};
+	m.dwLength = sizeof(m);
+	if (GlobalMemoryStatusEx(&m)) pc.ram_gb = static_cast<int>(std::llround(static_cast<double>(m.ullTotalPhys) / (1024.0 * 1024.0 * 1024.0)));
+	DEVMODEW mode {};
+	mode.dmSize = sizeof(mode);
+	if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode)) pc.screen_h = static_cast<int>(mode.dmPelsHeight);
+	Port::RecommendFor(&pc);
+	return pc;
 }
 
 // ---- The splash screen: fondo-souls.jpg, a status line under it, until the game's first frame. ----
@@ -458,10 +524,14 @@ void RequestRestart() {
 } // namespace Port
 
 int main(int argc, char* argv[]) {
+	// (10-27) The update's helper mode (run elevated when the folder cannot be written): only that, then out.
+	if (const int helper = Port::Update::HelperMain(0, nullptr); helper >= 0) return helper;
 	g_exe               = ExePath();
 	const fs::path root = g_exe.parent_path();
 	SetCurrentDirectoryW(root.c_str());
 	std::error_code ec;
+	// (10-27) What an update left: the exe and the DLLs that were running then, renamed to .old.
+	const int olds = Port::Update::RemoveOldFiles(root);
 	fs::create_directories(root / L"logs", ec);
 	const bool restarted = argc > 1 && std::string(argv[1]) == "--restarted";
 
@@ -517,13 +587,17 @@ int main(int argc, char* argv[]) {
 	Port::SaveSettings(ini, settings);
 
 	const GameParam param = ReadParam(settings.game);
-	std::printf("[port] Demon's Souls PC: %s %s %s; settings %s\n", param.name.c_str(), param.title_id.c_str(), param.version.c_str(),
-	            ini.c_str());
+	std::printf("[port] Demon's Souls PC %s: %s %s %s; settings %s\n", Port::Update::CurrentVersion(), param.name.c_str(),
+	            param.title_id.c_str(), param.version.c_str(), ini.c_str());
+	if (olds > 0) std::printf("[port] update: %d .old file(s) of the previous version deleted\n", olds);
+	const Port::PcInfo pc = DetectPc();
+	std::printf("[port] PC: %s (%llu MB), %s, %d GB RAM%s\n", pc.gpu.c_str(), static_cast<unsigned long long>(pc.vram >> 20), pc.cpu.c_str(),
+	            pc.ram_gb, Port::LowRam(settings, pc) ? " (16 GB profile)" : "");
 	const std::string version = param.title_id + " " + param.version;
 	if (!param.title_id.empty() && version != "PPSA01341 01.007.000" && version != "PPSA01341 01.005.000")
 		std::printf("[port] untested game version %s (tested: PPSA01341 01.007.000 and 01.005.000)\n", version.c_str());
 
-	Port::LaunchPlan plan = Port::BuildLaunch(settings, param.title_id);
+	Port::LaunchPlan plan = Port::BuildLaunch(settings, param.title_id, pc);
 	for (const auto& note: plan.notes) std::printf("[port] %s\n", note.c_str());
 
 	// CPU affinity (run-windows.ps1): every CPU, or the one L3 cache's of a CPU with several (the 3D V-Cache CCD).
@@ -558,6 +632,14 @@ int main(int argc, char* argv[]) {
 	                    (param.title_id.empty() ? std::string() : "  " + version);
 	runtime.launched   = settings;
 	runtime.notes      = plan.notes;
+	runtime.pc         = pc;
+	runtime.exe_path   = g_exe;
+	{
+		// The game's folder, when it is inside the port's (the update never touches it).
+		const fs::path game = fs::path(Wide(settings.game));
+		const fs::path rel  = game.lexically_relative(root);
+		if (!rel.empty() && rel.native()[0] != L'.') runtime.game_rel = rel;
+	}
 	Port::InstallMenu(runtime);
 	std::atexit(RestartIfAsked);
 	std::at_quick_exit(RestartIfAsked);

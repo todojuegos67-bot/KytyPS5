@@ -83,6 +83,8 @@ inline constexpr int      PerformanceMode = 2, TrinityMode = 4; // (indexes in t
 inline constexpr std::string_view AspectStore = "c7 43 04 39 8e e3 3f";
 inline constexpr double           GameAspect  = 16.0 / 9.0;
 inline constexpr double           WidestAspect = 32.0 / 9.0;
+// The widest wide output (InstallWideOutput): 21:9's 5120x2160; a wider aspect's output is held at it.
+inline constexpr uint32_t         MaxWideOutputWidth = 5120;
 
 // The render size for a height and an aspect, its width a multiple of 8; {0, 0} for a height out of range.
 struct Size {

@@ -37,11 +37,62 @@ void               OnSwapchain(VkSwapchainKHR swapchain, bool fsr3);
 void                   AfterPresent(uint64_t frame_index);
 
 // The game reads its controller (scePadRead / scePadReadState): once per flip, the frame's INPUT mark (or the limiter).
-void OnInput();
+void OnInput(const char* site = "scePadRead");
 // A guest flip reserved: the frame's index (0: none).
 [[nodiscard]] uint64_t OnFlipReserved();
+// The flip's GPU work done (FlipQueue::Complete) / the flip released to the presenter (FlipQueue::Flip): stage stamps
+// for KYTY_LOWLAT_PACE_BEFORE_INPUT (default on with KYTY_LOWLAT=1: the game's thread sleeps at its controller read
+// until the latest moment its frame is still ready for its release slot, so frames no longer queue behind the cap)
+// and the [lat] stages line.
+void OnFlipReady(uint64_t frame_index);
+void OnFlipReleased(uint64_t frame_index);
+// Before OnFlipReleased: the configured release interval of that frame (the cap: KYTY_FLIP_FPS / the vblank floor, ms)
+// when it is a game-view frame under a cap, else 0 (movie, menu, cinematic, loading, no cap: the pacing is off).
+void SetPaceCap(double cap_ms, double vblank_ms);
 // Right before the frame's present (a new frame, not a repeat): its PRESENT mark.
 void OnPresent(uint64_t frame_index);
+
+// KYTY_LOWLAT=1: the emulator's own latency limiter (no Reflex / Anti-Lag / Streamline, nothing on any swapchain or
+// present). Each guest flip records the host GPU timeline tick (MasterSemaphore, lane 0) of its frame's last submission;
+// at the controller read of the next frame the game's thread waits (vkWaitSemaphores, at most 50 ms, no lock held)
+// until no more than KYTY_LOWLAT_QUEUE (1|2, default 2) real frames are still on the GPU.
+[[nodiscard]] bool OwnLowLatencyOn();
+// KYTY_LOWLAT=1 with FSR 3 frame generation on NVIDIA (VK_NV_low_latency2, no Streamline): NVIDIA Reflex on FSR 3's
+// real swapchain as with KYTY_ANTILAG=1 (the same sleep and markers Streamline's Reflex gives the plain 30 fps path),
+// our own pacer off while that swapchain has it. KYTY_LOWLAT_REFLEX=0 off.
+[[nodiscard]] bool AutoReflex();
+// The flip queue limit (KYTY_FLIP_QUEUE_LIMIT, default on; KYTY_LOWLAT_PACE_BEFORE_INPUT=0 also turns it off): under a
+// flip rate (the game's own, KYTY_FLIP_FPS) the controller read of frame N waits for frame N - k's release (k 1 or 2).
+[[nodiscard]] bool PaceOn();
+// KYTY_PHASE_PACE (default on with KYTY_LOWLAT=1; =0 off, =1 on): under a flip rate or cap (SetPaceCap), each game step
+// (the first controller read after a flip) waits until a fixed phase of the smoothed flip grid (period = cap x the
+// game's cadence, releases per step over 2 s); the phase moves at most 0.5 ms a step toward a queue target (gpu done ->
+// flip of the released frames, FlipQueue's stamps: a margin, + one cap of cushion while a frame was late in the last
+// 5 s, dropped after 10 s), and no step is made longer than period + 1 ms by the wait: even steps, no event wait. Off
+// with DLSS-G; Reflex's / the limiter's sleep is skipped while it is active. [phase] line once a second.
+[[nodiscard]] bool PhaseOn();
+// KYTY_PAD_LATE_MS=<L> (off by default; for KYTY_DISPLAYED_WAIT=1): under a 30-ish flip limit (cap 25-45 ms) the game's
+// controller read of frame N waits until L ms before N's flip slot (last release + cap per frame since), so the game
+// samples input late; a frame slower than L - 1 ms then misses its slot. [padlate] line every 5 s.
+[[nodiscard]] bool PadLateOn();
+void               PhaseRelease(double queued_ms); // a flip released: its gpu done -> flip, ms
+void               NoteFlipDepth(int depth);       // FlipQueue's requests after a reserve / release
+void               OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick);
+
+// KYTY_LATENCY=1 (the launcher sets it with the metrics overlay): input -> present latency, any Anti-Lag mode or none.
+// The game's controller read that starts frame N (the first scePadRead / scePadReadState after its last flip, after any
+// Reflex / Anti-Lag 2 / KYTY_LOWLAT wait: the same point as Reflex's INPUT_SAMPLE) is stamped with
+// QueryPerformanceCounter; the frame id goes with the guest flip (OnFlipReserved) to the present thread, and
+// OnPresented(id) right after vkQueuePresentKHR of that real frame returned (the GPU work done: the present thread
+// waited for it; with DLSS-G / FSR 3 frame generation this is the real frame handed to the generating swapchain, never a
+// generated one) takes the difference. Once a second, on stdout (parsed by the metrics overlay, metricas.ps1):
+//   [lat] input->present mean 38.2 ms, p95 45.1, max 52.0; +scanout 2.1; fg +16.7 (n 60); total 57.0, p95 63.9; mode reflex
+// +scanout: an estimate, half the display's refresh interval (present -> the middle of the screen scanned out), not
+// measured; fg: the frame generation hold of the real frame, estimated as real interval x g / (g + 1) for g generated
+// frames per real one (x2: half a real frame), 0 without frame generation; total = input->present + scanout + fg.
+// Off: one cached flag test per controller read / flip / present.
+[[nodiscard]] bool LatencyOn();
+void               OnPresented(uint64_t frame_index);
 
 } // namespace Libs::Graphics::AntiLag
 

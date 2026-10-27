@@ -1151,6 +1151,26 @@ struct SystemOverlay::Impl {
 	void DrawHud(SystemOverlayHud& hud) {
 		const auto  region = hud.region;
 		const float unit   = std::max(static_cast<float>(region.extent.height) / 1080.0f, 0.5f);
+		if (!hud.markers.empty()) {
+			// (KYTY_RTLS_DEBUG: the local lights found and the shadow projections' apexes)
+			auto* draw = ImGui::GetForegroundDrawList();
+			for (const auto& m: hud.markers) {
+				const ImU32 color = static_cast<ImU32>(m.rgba);
+				if (m.shape == 0) {
+					draw->AddCircle({m.x, m.y}, m.radius, color, 0, 2.0f * unit);
+					draw->AddCircleFilled({m.x, m.y}, 2.5f * unit, color);
+				} else if (m.shape == 1) {
+					draw->AddLine({m.x - m.radius, m.y - m.radius}, {m.x + m.radius, m.y + m.radius}, color, 2.0f * unit);
+					draw->AddLine({m.x - m.radius, m.y + m.radius}, {m.x + m.radius, m.y - m.radius}, color, 2.0f * unit);
+				}
+				if (!m.label.empty()) {
+					const ImVec2 at = m.shape == 2 ? ImVec2 {m.x, m.y} : ImVec2 {m.x + std::min(m.radius, 12.0f * unit) + 3.0f * unit, m.y - 7.0f * unit};
+					const ImVec2 size = ImGui::CalcTextSize(m.label.c_str());
+					draw->AddRectFilled({at.x - 2.0f, at.y - 1.0f}, {at.x + size.x + 2.0f, at.y + size.y + 1.0f}, IM_COL32(0, 0, 0, 140));
+					draw->AddText(at, color, m.label.c_str());
+				}
+			}
+		}
 		const float right  = static_cast<float>(region.offset.x) + static_cast<float>(region.extent.width) - 28.0f * unit;
 		float       top    = static_cast<float>(region.offset.y) + static_cast<float>(region.extent.height) * 0.10f;
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {16.0f * unit, 8.0f * unit});

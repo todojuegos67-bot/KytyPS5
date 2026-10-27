@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "device-fault.h"
+#include "local/mem-guard.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -52,8 +53,39 @@ public:
 	}
 	// Returns once every pushed buffer is destroyed (before the allocator goes away).
 	void Flush() {
+		Release();
 		std::unique_lock lock(m_mutex);
 		m_idle.wait(lock, [this] { return m_pending.empty() && !m_busy; });
+	}
+	// BufferCache::Defragment: no memory is freed here while a pass over the game buffers' pool is open; what is pushed
+	// meanwhile waits for its end. A pass names allocations of erased buffers waiting here, and VMA reads its moves till
+	// the pass ends: freed meanwhile, they were read freed (8 GB GPUs: access violations in vmaGetAllocationInfo from
+	// Defragment, its block gone, 10-23). False while frees are queued or run: the pass waits for a later flip. (Begun
+	// over them, a pass lists allocations of erased buffers, which Defragment can only ignore: each takes a move of the
+	// pass's 64, and VMA counts its block as one it cannot empty.)
+	bool TryHold() {
+		const std::unique_lock freeing(m_free_mutex, std::try_to_lock);
+		if (!freeing.owns_lock()) return false;
+		{
+			const std::lock_guard lock(m_mutex);
+			if (!m_pending.empty() || m_busy) return false;
+		}
+		m_hold = true;
+		return true;
+	}
+	void Release() {
+		std::vector<Item> held;
+		{
+			const std::lock_guard freeing(m_free_mutex);
+			m_hold = false;
+			held.swap(m_held);
+		}
+		if (held.empty()) return;
+		{
+			const std::lock_guard lock(m_mutex);
+			m_pending.insert(m_pending.end(), held.begin(), held.end());
+		}
+		m_wake.notify_one();
 	}
 
 private:
@@ -71,7 +103,14 @@ private:
 			batch.swap(m_pending);
 			m_busy = true;
 			lock.unlock();
-			for (const auto& item: batch) vmaDestroyBuffer(item.allocator, item.buffer, item.allocation);
+			for (const auto& item: batch) {
+				const std::lock_guard freeing(m_free_mutex);
+				if (m_hold && item.allocation != nullptr) {
+					m_held.push_back(item);
+					continue;
+				}
+				vmaDestroyBuffer(item.allocator, item.buffer, item.allocation);
+			}
 			batch.clear();
 			lock.lock();
 			m_busy = false;
@@ -83,6 +122,9 @@ private:
 	std::vector<Item>       m_pending;
 	bool                    m_busy = false, m_stop = false;
 	std::thread             m_thread;
+	std::mutex              m_free_mutex; // (held over each free: TryHold)
+	std::vector<Item>       m_held;
+	bool                    m_hold = false;
 };
 
 BufferReclaimer& Reclaimer() {
@@ -278,7 +320,16 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	if (!created) {
 		graphics.TrimImagePool();
 		allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-		if (!create()) graphics.ReportMemoryFallback("a buffer could not be created", size);
+		created = create();
+		if (!created) graphics.ReportMemoryFallback("a buffer could not be created", size);
+	}
+	// Still refused: release passes (MemGuard: caches, pools, the heaps) and more tries; then the clear out-of-memory
+	// message instead of an exit with no word on the cause.
+	for (int attempt = 0; !created; ++attempt) {
+		if (!MemGuard::ShouldRetry("a GPU buffer (vmaCreateBuffer)", size, attempt))
+			MemGuard::FatalOutOfMemory("a GPU buffer (vmaCreateBuffer)", size);
+		graphics.TrimImagePool();
+		created = create();
 	}
 	EXIT_NOT_IMPLEMENTED(native_buffer == VK_NULL_HANDLE);
 
@@ -357,6 +408,14 @@ Buffer::~Buffer() {
 
 void FlushBufferReclaimer() {
 	Reclaimer().Flush();
+}
+
+bool HoldBufferFrees() {
+	return Reclaimer().TryHold();
+}
+
+void ReleaseBufferFrees() {
+	Reclaimer().Release();
 }
 
 vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {
@@ -502,8 +561,13 @@ void Buffer::MakeResident(uint64_t offset, uint64_t size) {
 			allocate.allocationSize  = sparse.page_size * SparseChunkPages;
 			allocate.memoryTypeIndex = sparse.memory_type;
 			VkDeviceMemory chunk     = VK_NULL_HANDLE;
-			EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(static_cast<VkDevice>(m_graphics->device), &allocate, nullptr, &chunk) !=
-			                     VK_SUCCESS);
+			// (Refused: release passes and more tries, then the clear out-of-memory message, MemGuard.)
+			for (int attempt = 0; VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(static_cast<VkDevice>(m_graphics->device),
+			                                                                     &allocate, nullptr, &chunk) != VK_SUCCESS;
+			     ++attempt) {
+				if (!MemGuard::ShouldRetry("sparse buffer memory (vkAllocateMemory)", allocate.allocationSize, attempt))
+					MemGuard::FatalOutOfMemory("sparse buffer memory (vkAllocateMemory)", allocate.allocationSize);
+			}
 			sparse.chunks.push_back(chunk);
 			sparse.free_in_chunk = SparseChunkPages;
 		}

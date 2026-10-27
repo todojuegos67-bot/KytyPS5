@@ -26,6 +26,26 @@ modos DLSS fijos (x2-x6, hasta el elegido al arrancar).
 Mientras el menu esta abierto no se generan frames (no se "arrastra" con la imagen) y el
 juego no recibe los botones.
 
+Pestanas del menu (como el lanzador anterior): Imagen, Frame generation, Calidad grafica, Ray tracing,
+Modos Souls, Pantalla y otros, Rendimiento / PC, Controles y Tu equipo (grafica, procesador, RAM y el modo
+recomendado para tu grafica).
+
+Buscar actualizacion (pestana "Tu equipo")
+------------------------------------------
+  "Actualizar version": busca la ultima version publicada en GitHub (todojuegos67-bot/KytyPS5) y la compara con
+  la tuya (se ve debajo de TU EQUIPO). Sale "Ya tienes la ultima version" o "Nueva version X - Cruz para
+  actualizar". Al confirmar, descarga el zip, comprueba que trae "Demon's Souls.exe", guarda el exe y las DLL
+  actuales en _backup_update\<version vieja>\ (se guardan las 2 ultimas) y copia la version nueva en esta
+  misma carpeta. Si algo falla lo deja todo como estaba.
+  NUNCA toca: _PipelineCache (tus shaders compilados), las partidas (_SaveData), los seeds, la carpeta del
+  juego ni tus valores de settings.ini (solo se anaden las opciones nuevas).
+  Al terminar: "Actualizacion completada a la version X. Cierra el juego y vuelve a abrirlo para usar la nueva
+  version. Tus shaders compilados y partidas guardadas se mantienen."
+  "Volver a la version anterior": lista las versiones de _backup_update, pide confirmacion, guarda antes la
+  actual (se puede deshacer) y restaura la elegida. Sin copias: "No hay versiones anteriores guardadas".
+  Solo pide permiso de administrador si la carpeta no se puede escribir (p. ej. dentro de Archivos de programa).
+  El exe en uso se renombra a .old y se borra solo al abrir el juego la siguiente vez.
+
 Otras teclas: F8 metricas, F11 / Alt+Enter pantalla completa, F7 raton como mando.
 
 settings.ini
@@ -41,14 +61,15 @@ Esta junto al exe y tiene comentarios en cada opcion. Equivalencias con el lanza
   hdr, vsync, gsync = las casillas HDR, VSync y G-Sync.
   (La FG DLSS usa siempre el preset C.)
   fps_desbloqueados = FPS desbloqueados (experimental; sin FG: reloj a 960 Hz).
-  perfil_16gb       = Equipo de 16 GB RAM: 6 GB fijos en RAM, la precarga de shaders espera con poca RAM
-                      libre (no cambia los graficos).
+  perfil_16gb       = Optimizacion equipos 16 GB RAM: 6 GB fijos en RAM, la precarga de shaders espera con menos
+                      de 1,5 GB libres. Solo en PCs de 20 GB de RAM o menos (o con simular_ram_16gb); no cambia los graficos.
+  simular_ram_16gb  = Simular 16 GB RAM (pruebas).
   gpu_seguro        = Modo GPU seguro.     simular_vram_8gb = Simular grafica 8 GB.
   metricas          = panel de FPS dentro del juego (0 / 1 / 2), con el modo de frame generation y su
                       multiplicador actual (verde NVIDIA, rojo AMD; los FPS en blanco sin frame generation) y
                       el nivel de Texturas y Distancia de dibujado (antes: Metricas abria metricas.ps1).
   vibracion, vibracion_fuerza = vibracion del mando desde el audio haptico (KYTY_HAPTIC_RUMBLE / _GAIN).
-  antilag           = Anti-Lag (AMD Anti-Lag 2; con DLSS, NVIDIA Reflex).
+  antilag_modo      = Anti-Lag con la FG de AMD: auto, amd2, normal, ultra, no.  antilag_dlssg = reflex, normal, ultra.
 
   [Graficos] (pestana "Calidad grafica" del menu, como en el lanzador)
   modo_souls        = ninguno / ligero / equilibrado / ultra / extremo:
@@ -66,7 +87,10 @@ Esta junto al exe y tiene comentarios en cada opcion. Equivalencias con el lanza
   detalle           = ultra, muy-alto (cine), alto (rendimiento de PS5), normal, bajo: teselado, cascadas, iluminacion.
   reflejos, distancia_objetos = ultra, alto (PS5), normal, bajo (los reflejos y el fundido de objetos del juego).
   nitidez_aa        = nitidez del antialiasing del juego: ultra, alto, normal (PS5), bajo, no.
-  luz_rt, oclusion_ambiental = 0-3 (solo con DLSS, XeSS o FSR; cuestan FPS).
+  bordes_sombras    = Bordes sombras: 0 normal, 1 alta, 2 muy alta, 3 ultra.
+  sombra_rincones   = Sombra rincones: 0 normal, 1 alta, 2 maxima (solo con rt_oclusion=1).
+  [RayTracing] rt_reflejos, rt_sombras_sol, rt_niebla, rt_particulas, rt_metal, rt_oclusion = 1 si / 0 no
+                      (trazado de rayos por hardware; cualquier modo Souls los pone en 0). Luz RT y GTAO ya no existen.
   desenfoque_movimiento, profundidad_campo, vineteado, resplandor, adaptacion_ojo = postprocesado (1 como en PS5).
   filtrado_x16      = filtrado anisotropico x16.   texturas_nitidas = el detalle de la resolucion final (no toca la niebla).
 

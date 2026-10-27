@@ -50,6 +50,9 @@ public:
 		BindingType   type = BindingType::Texture;
 	};
 
+	// A depth-compare sample may read an R32 float image as it is (ResolveDepthOverlap: the spot-shadow pool).
+	[[nodiscard]] bool R32DepthCompareSupported() const;
+
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	             BufferCache& buffer_cache);
 	~TextureCache();
@@ -90,6 +93,9 @@ public:
 	// DCC metadata (whose pending fast clears FindTexture applies: the caller checks IsMetaCleared), and with
 	// `storage_dcc` one written as storage too.
 	[[nodiscard]] bool IsSampledImageCurrent(ImageId id, const ImageDesc& desc, bool storage_dcc = false);
+	// The view's levels and layers lie in the image `desc` describes. FindImage moves a view into a larger image it found
+	// (its first level and layer in that image), so a description it was given is not a request of its own any more.
+	[[nodiscard]] static bool ViewFitsImage(const ImageDesc& desc);
 	// A depth image sampled through a view of its memory (FindImage takes it through ResolveDepthOverlap, a 32-bit
 	// float view of a D32S8 image having no format of the same class, or through its stencil plane's association): the
 	// lookup finds it again while no image was registered or unregistered over the view's pages since `epoch` (the same
@@ -258,8 +264,19 @@ private:
 	struct ParkedImage {
 		ImageId  id;
 		uint64_t tick = 0;
+		uint64_t keep = 1; // collector runs it stays parked (KYTY_CUBE_SHADOW_FIX: a shadow pool's twin, longer)
 	};
 	std::unordered_map<uint64_t, ParkedImage> m_parked;
+	// KYTY_SHADOW_REFRESH_FIX: the layers of a depth array the GPU rendered (an image's serial -> per layer: rendered,
+	// what dirtied it since, and a hash of its guest bytes when the GPU took it). A refresh keeps a rendered layer whose
+	// guest bytes are unchanged since (they never held the GPU's depth), UploadDepthPartial.
+	struct LayerOwner {
+		std::vector<uint8_t>  state; // LayerRendered | LayerDirtyBy*
+		std::vector<uint64_t> hash;
+	};
+	std::unordered_map<uint64_t, LayerOwner> m_layer_owners;
+	void NoteDepthLayersRendered(Image& image, uint32_t first, uint32_t count);
+	void NoteDepthLayersDirtied(const Image& image, uint64_t begin, uint64_t end, uint8_t cause);
 	// Views of one allocation in shapes neither holds (a texture pool sampled as 256 layers of 11 levels and as 1649
 	// layers of one: another layer pitch), both only sampled: images of their own side by side (GuestTexture), where an
 	// image for one freed the other's (a draw sampling both re-uploaded GBs per pass, 10-11). Their count: a write
@@ -270,7 +287,7 @@ private:
 	[[nodiscard]] static bool GuestTextureRequest(BindingType type, const ImageInfo& info);
 	void                      NoteGuestAlias(const ImageInfo& requested, Image& kept);
 	void                      FreeGuestAliases(ImageId written);
-	void                      ParkImage(ImageId id);
+	void                      ParkImage(ImageId id, uint64_t keep = 1);
 	[[nodiscard]] ImageId     TakeParkedImage(const ImageInfo& info);
 	void                      FreeImage(ImageId id, const char* site = "");
 	void                      TouchImage(Image& image);
@@ -427,6 +444,8 @@ private:
 	uint64_t                                          m_logged_private       = 0;
 	bool                                              m_logged_short_of_ram  = false;
 	uint64_t         m_gc_tick                = 0;
+	uint64_t         m_scene_generation       = 0; // RetireStaleImages: the world the game is in (SceneTags), entered
+	uint64_t         m_scene_tick             = 0; // at this tick
 	std::atomic<uint64_t> m_frame {0};
 	struct PendingDownload {
 		uint64_t address = 0, size = 0, tick = 0;

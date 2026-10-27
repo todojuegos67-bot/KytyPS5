@@ -1,4 +1,5 @@
 #include "loader/runtimeLinker.h"
+#include "local/mem-guard.h"
 #include "loader/gameArgs.h"
 
 #include "common/assert.h"
@@ -23,6 +24,7 @@
 #include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsSceneGuard.h"
 #include "loader/demonsSoulsSuperResolution.h"
+#include "loader/demonsSoulsCamera.h"
 #include "loader/demonsSoulsTouchGuard.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
@@ -993,6 +995,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			            page.Protect, page.Type, page.BaseAddress, page.RegionSize);
 		}
 #endif
+		MemGuard::LogState("at the fault");
+		if (MemGuard::SystemNearlyOut())
+			std::printf("The system is nearly out of memory (RAM or commit): the likely cause of this fault.\n");
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64 " (%s)"
@@ -1627,6 +1632,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsRenderSize::InstallSixtyStep(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsSceneGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsTouchGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsCamera::InstallNoRamp(m_programs.empty() ? nullptr : m_programs.front());
 	StartAllModules();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");

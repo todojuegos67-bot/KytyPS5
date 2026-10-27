@@ -3,6 +3,7 @@
 #include "port/ds-tables.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,29 +15,32 @@ namespace Port {
 
 // Launcher-souls.ps1 $resModes (the deployed launcher's list, labels as there).
 const ResMode kResModes[] = {
+    // (10-27) Launcher-souls.ps1 $resModes: its labels; DLSS Calidad 1.333 (10-21: DLSS goes out at 4K inside, the game's
+    // PS5 Pro path: it takes 1080 lines or more; 1440 / 1.5 = 960 left the picture black).
     {"nativo", "1440p nativo", 1440, ""},
     {"dlss-dlaa", "DLSS DLAA", 1.0, "dlss"},
-    {"dlss-ucalidad", "DLSS Ultra calidad", 1.3, "dlss"},
-    {"dlss-calidad", "DLSS Calidad", 1.5, "dlss"},
-    {"dlss-equilibrado", "DLSS Equilibrado", 1.72, "dlss"},
-    {"dlss-rendimiento", "DLSS Rendimiento", 2.0, "dlss"},
+    {"dlss-ucalidad", "DLSS U.calidad", 1.3, "dlss"},
+    {"dlss-calidad", "DLSS Calidad", 1.333, "dlss"},
+    {"dlss-equilibrado", "DLSS Equilib.", 1.72, "dlss"},
+    {"dlss-rendimiento", "DLSS Rendim.", 2.0, "dlss"},
     {"xess-aa", "XeSS AA", 1.0, "xess"},
-    {"xess-ucalidad-plus", "XeSS Ultra calidad +", 1.3, "xess"},
-    {"xess-ucalidad", "XeSS Ultra calidad", 1.5, "xess"},
+    {"xess-ucalidad-plus", "XeSS U.cal.+", 1.3, "xess"},
+    {"xess-ucalidad", "XeSS U.calidad", 1.5, "xess"},
     {"xess-calidad", "XeSS Calidad", 1.7, "xess"},
-    {"xess-equilibrado", "XeSS Equilibrado", 2.0, "xess"},
-    {"xess-rendimiento", "XeSS Rendimiento", 2.3, "xess"},
-    {"fsr-aa", "FSR AA (FSR 3.1 nativo)", 1.0, "fsr"},
-    {"fsr-ucalidad", "FSR Ultra calidad", 1.3, "fsr"},
+    {"xess-equilibrado", "XeSS Equilib.", 2.0, "xess"},
+    {"xess-rendimiento", "XeSS Rendim.", 2.3, "xess"},
+    {"fsr-aa", "FSR AA nativo", 1.0, "fsr"},
+    {"fsr-ucalidad", "FSR U.calidad", 1.3, "fsr"},
     {"fsr-calidad", "FSR Calidad", 1.5, "fsr"},
-    {"fsr-equilibrado", "FSR Equilibrado", 1.72, "fsr"},
-    {"fsr-rendimiento", "FSR Rendimiento", 2.0, "fsr"},
+    {"fsr-equilibrado", "FSR Equilib.", 1.72, "fsr"},
+    {"fsr-rendimiento", "FSR Rendim.", 2.0, "fsr"},
+    {"fsr-900", "FSR 900p (AA)", 1.6, "fsr"},
 };
 const int kResModeCount = static_cast<int>(sizeof(kResModes) / sizeof(kResModes[0]));
 
-const Choice kSharpness[] = {{"auto", "Auto"}, {"0", "0"}, {"0.25", "25%"}, {"0.5", "50%"}, {"0.75", "75%"}, {"1", "100%"}};
+const Choice kSharpness[] = {{"auto", "Nitidez: auto"}, {"0", "Nitidez: 0"}, {"0.25", "Nitidez: 25%"}, {"0.5", "Nitidez: 50%"}, {"0.75", "Nitidez: 75%"}, {"1", "Nitidez: 100%"}};
 const int    kSharpnessCount = 6;
-const Choice kDlssPresets[] = {{"auto", "Auto (NVIDIA)"}, {"K", "DLSS 4 (K)"}, {"L", "DLSS 4.5 (L)"}, {"M", "DLSS 4.5 (M)"}};
+const Choice kDlssPresets[] = {{"auto", "DLSS auto"}, {"K", "DLSS 4 (K)"}, {"L", "DLSS 4.5 (L)"}, {"M", "DLSS 4.5 (M)"}};
 const int    kDlssPresetCount = 4;
 const Choice kQualities[] = {{"standard", "Maximo"}, {"high", "Alto"}, {"low", "Medio"}, {"lowest", "Bajo"}}; // draw distance (LOD)
 const int    kQualityCount = 4;
@@ -44,22 +48,31 @@ const Choice kTextureReduce[] = {{"0", "Maximo"}, {"h", "Alto"}, {"1", "Medio"},
 const int    kTextureReduceCount = 4;
 const Choice kShadows[] = {{"maximo", "Maximo"}, {"alto", "Alto"}, {"medio", "Medio"}, {"bajo", "Bajo"}};
 const int    kShadowCount = 4;
-const Choice kDetails[] = {{"ultra", "Ultra"}, {"muy-alto", "Muy alto (cine)"}, {"alto", "Alto (rendimiento PS5)"}, {"normal", "Normal"}, {"bajo", "Bajo"}};
+const Choice kDetails[] = {{"ultra", "Ultra"}, {"muy-alto", "Muy alto (cine)"}, {"alto", "Alto (rendimiento de PS5)"}, {"normal", "Normal"}, {"bajo", "Bajo"}};
 const int    kDetailCount = 5;
-const Choice kReflections[] = {{"ultra", "Ultra"}, {"alto", "Alto (PS5)"}, {"normal", "Normal"}, {"bajo", "Bajo"}};
+const Choice kReflections[] = {{"ultra", "Ultra"}, {"alto", "Alto (de serie)"}, {"normal", "Normal"}, {"bajo", "Bajo"}};
 const int    kReflectionCount = 4;
-const Choice kAaSharp[] = {{"ultra", "Ultra"}, {"alto", "Alto"}, {"normal", "Normal (PS5)"}, {"bajo", "Bajo"}, {"no", "No"}};
+const Choice kAaSharp[] = {{"ultra", "Ultra"}, {"alto", "Alto"}, {"normal", "Normal (de serie)"}, {"bajo", "Bajo"}, {"no", "No"}};
 const int    kAaSharpCount = 5;
-const Choice kRtLight[] = {{"0", "No"}, {"1", "Media"}, {"2", "Alta"}, {"3", "Ultra"}};
-const int    kRtLightCount = 4;
-const Choice kAmbientOcclusion[] = {{"0", "No"}, {"1", "Normal"}, {"2", "Alta"}, {"3", "Ultra"}};
-const int    kAmbientOcclusionCount = 4;
-const Choice kSoulsModes[] = {{"ninguno", "Ninguno"},
-                              {"ligero", "Souls ligero (graficas de 8 GB, 30 x2 AMD)"},
-                              {"equilibrado", "Souls equilibrado (45 x2 AMD)"},
-                              {"ultra", "Souls ultra (RTX 5060-5070 Ti, RX 9070)"},
-                              {"extremo", "Souls extremo (RTX 5080 / 5090)"}};
-const int    kSoulsModeCount = 5;
+const Choice kShadowEdges[] = {{"0", "Normal"}, {"1", "Alta"}, {"2", "Muy alta"}, {"3", "Ultra"}};
+const int    kShadowEdgeCount = 4;
+const Choice kCornerShadows[] = {{"0", "Normal"}, {"1", "Alta"}, {"2", "Maxima"}};
+const int    kCornerShadowCount = 3;
+const Choice kTextureSharpness[] = {{"0", "Texturas: normales"}, {"1", "Texturas: nitidas"}, {"2", "Texturas: extra nitidas"}};
+const int    kTextureSharpnessCount = 3;
+const Choice kAntiLagAmd[] = {{"amd2", "Anti-Lag 2 (AMD)"}, {"normal", "Anti-Lag"}, {"ultra", "Anti-Lag Ultra"}, {"no", "Anti-Lag: no"}};
+const int    kAntiLagAmdCount = 4;
+const Choice kAntiLagOther[] = {{"no", "Anti-Lag: no"}, {"normal", "Anti-Lag"}, {"ultra", "Anti-Lag Ultra"}};
+const int    kAntiLagOtherCount = 3;
+const Choice kAntiLagDlssg[] = {{"reflex", "Reflex (NVIDIA)"}, {"normal", "Anti-Lag"}, {"ultra", "Anti-Lag Ultra"}};
+const int    kAntiLagDlssgCount = 3;
+const Choice kSoulsModes[] = {{"ninguno", "Personalizado (ningun modo)"},
+                              {"ligero", "Modo Souls ligero"},
+                              {"equilibrado", "Modo Souls equilibrado"},
+                              {"ultra", "Modo Souls ultra"},
+                              {"extremo", "Modo Souls extremo"},
+                              {"low", "Modo Souls PC low profile (900p, todo en bajo)"}};
+const int    kSoulsModeCount = 6;
 const Choice kMetrics[] = {{"0", "No"}, {"1", "FPS"}, {"2", "FPS + detalle"}};
 const int    kMetricsCount = 3;
 const Choice kLanguages[] = {{"3", "Espanol (Espana)"}, {"20", "Espanol (Latinoamerica)"}, {"1", "English (US)"},
@@ -185,6 +198,18 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	num("vibracion_fuerza", s->rumble_gain);
 	str("extra", s->extra);
 	boo("antilag", s->antilag);
+	// (before 10-27 "antilag" was a box, written 0 by default: the launcher's default, auto, either way)
+	str("antilag_modo", s->antilag_mode);
+	str("antilag_dlssg", s->antilag_dlssg);
+	boo("simular_ram_16gb", s->simulate_ram16);
+	boo("rt_reflejos", s->rt_reflections);
+	boo("rt_sombras_sol", s->rt_sun);
+	boo("rt_niebla", s->rt_fog);
+	boo("rt_particulas", s->rt_particles);
+	boo("rt_metal", s->rt_metal);
+	boo("rt_oclusion", s->rt_ao);
+	str("bordes_sombras", s->shadow_edges);
+	str("sombra_rincones", s->corner_shadow);
 	str("modo_souls", s->souls_mode);
 	boo("optimizacion_8gb", s->gpu8);
 	str("sombras", s->shadows);
@@ -200,7 +225,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("resplandor", s->bloom);
 	boo("adaptacion_ojo", s->eye_adapt);
 	boo("filtrado_x16", s->af16);
-	boo("texturas_nitidas", s->sharp_textures);
+	str("texturas_nitidas", s->texture_sharpness); // (0 / 1 before 10-27: the same values)
 	boo("teclado_raton", s->kbm);
 	num("raton_sensibilidad", s->kbm_sens);
 	num("raton_antizona", s->kbm_antidz);
@@ -253,20 +278,26 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "frame_generation=" << s.framegen << "\n"
 	  << "\n"
 	  << "[Rendimiento]\n"
-	  << "; PCs de 16 GB de RAM: 6 GB del juego fijos en RAM y la precarga de shaders espera con poca RAM libre\n"
+	  << "; Optimizacion equipos 16 GB RAM: el perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera con\n"
+	  << "; menos de 1,5 GB libres). Solo se aplica en PCs de 20 GB de RAM o menos, o con simular_ram_16gb. No cambia los graficos.\n"
 	  << "perfil_16gb=" << b(s.profile16) << "\n"
 	  << "; Para graficas que se cuelgan o dan pantallazo azul (~37% menos FPS)\n"
 	  << "gpu_seguro=" << b(s.safe_gpu) << "\n"
+	  << "; Pruebas: el juego como en un PC de 16 GB de RAM / con una grafica de 8 GB\n"
+	  << "simular_ram_16gb=" << b(s.simulate_ram16) << "\n"
 	  << "simular_vram_8gb=" << b(s.simulate_vram8) << "\n"
 	  << "; Ryzen con dos CCD: 0 = el juego en el CCD con mas cache L3 (mas rapido); 1 = todos los nucleos\n"
 	  << "todos_los_ccd=" << b(s.all_ccds) << "\n"
-	  << "; Anti-Lag: AMD Anti-Lag 2 si el driver lo tiene; con DLSS, NVIDIA Reflex\n"
-	  << "antilag=" << b(s.antilag) << "\n\n"
+	  << "; Anti-Lag con la frame generation de AMD: auto (Anti-Lag 2 en graficas AMD, el nuestro en las demas), amd2, normal,\n"
+	  << "; ultra, no. En los modos Souls ligero, equilibrado y low profile va siempre el nuestro en Ultra.\n"
+	  << "antilag_modo=" << s.antilag_mode << "\n"
+	  << "; Con la frame generation de NVIDIA: reflex (recomendado), normal o ultra (el nuestro, con Reflex apagado)\n"
+	  << "antilag_dlssg=" << s.antilag_dlssg << "\n\n"
 	  << "[Graficos]\n"
-	  << "; Modos Souls: ninguno; ligero (graficas de 8 GB: 30 reales x2 AMD, texturas bajo, distancia y sombras medio);\n"
+	  << "; Modos Souls: ninguno; low (PC low profile: 900p con FSR, todo en bajo, 30 reales x2 AMD); ligero (graficas de 8 GB: 30 reales x2 AMD, FSR Calidad, texturas y sombras medio);\n"
 	  << "; equilibrado (45 reales x2 AMD, texturas, distancia y sombras alto); ultra (RTX 5060-5070 Ti, RX 9070);\n"
 	  << "; extremo (RTX 5080 / 5090: todo al maximo). Los FPS dependen de tu GPU y tu CPU.\n"
-	  << "; Ligero y equilibrado mandan sobre frame_generation (AMD x2 fija; el reescalado DLSS si se puede usar).\n"
+	  << "; Ligero, equilibrado y low mandan sobre frame_generation (AMD x2 fija; el reescalado DLSS si se puede usar).\n"
 	  << "modo_souls=" << s.souls_mode << "\n"
 	  << "; Optimizacion tarjetas 8 GB: en el menu pone texturas en bajo y distancia y sombras en medio\n"
 	  << "optimizacion_8gb=" << b(s.gpu8) << "\n"
@@ -284,10 +315,10 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "distancia_objetos=" << s.object_fade << "\n"
 	  << "; Nitidez del antialiasing del juego: ultra, alto, normal (PS5), bajo, no\n"
 	  << "nitidez_aa=" << s.aa_sharp << "\n"
-	  << "; Luz RT (iluminacion por rayos en pantalla, solo con DLSS / XeSS / FSR; experimental): 0 no, 1 media, 2 alta, 3 ultra\n"
-	  << "luz_rt=" << s.rt_light << "\n"
-	  << "; Oclusion ambiental avanzada (GTAO, solo con DLSS / XeSS / FSR): 0 no, 1 normal, 2 alta, 3 ultra\n"
-	  << "oclusion_ambiental=" << s.ambient_occlusion << "\n"
+	  << "; Bordes sombras (filtrado de las sombras del juego): 0 normal, 1 alta, 2 muy alta, 3 ultra\n"
+	  << "bordes_sombras=" << s.shadow_edges << "\n"
+	  << "; Sombra rincones (fuerza de la oclusion de ray tracing; necesita rt_oclusion=1): 0 normal, 1 alta, 2 maxima\n"
+	  << "sombra_rincones=" << s.corner_shadow << "\n"
 	  << "; Postprocesado del juego (1 = como en PS5, 0 = quitado)\n"
 	  << "desenfoque_movimiento=" << b(s.motion_blur) << "\n"
 	  << "profundidad_campo=" << b(s.dof) << "\n"
@@ -296,8 +327,16 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "adaptacion_ojo=" << b(s.eye_adapt) << "\n"
 	  << "; Filtrado anisotropico x16 (solo superficies de la escena)\n"
 	  << "filtrado_x16=" << b(s.af16) << "\n"
-	  << "; Texturas nitidas con reescalado: el detalle de la resolucion final (solo texturas de superficie, no la niebla)\n"
-	  << "texturas_nitidas=" << b(s.sharp_textures) << "\n\n"
+	  << "; Texturas: 0 normales, 1 nitidas (con reescalado, el detalle de la resolucion final), 2 extra nitidas\n"
+	  << "texturas_nitidas=" << s.texture_sharpness << "\n\n"
+	  << "[RayTracing]\n"
+	  << "; Trazado de rayos por hardware (1 si, 0 no). Elegir un modo Souls los pone todos en 0.\n"
+	  << "rt_reflejos=" << b(s.rt_reflections) << "\n"
+	  << "rt_sombras_sol=" << b(s.rt_sun) << "\n"
+	  << "rt_niebla=" << b(s.rt_fog) << "\n"
+	  << "rt_particulas=" << b(s.rt_particles) << "\n"
+	  << "rt_metal=" << b(s.rt_metal) << "\n"
+	  << "rt_oclusion=" << b(s.rt_ao) << "\n\n"
 	  << "[Mandos]\n"
 	  << "; Teclado y raton (F7 tambien cambia el raton a mando en vivo)\n"
 	  << "teclado_raton=" << b(s.kbm) << "\n"
@@ -327,50 +366,206 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	return std::rename(tmp.c_str(), path.c_str()) == 0;
 }
 
-LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
+
+bool LowRam(const Settings& s, const PcInfo& pc) {
+	return s.simulate_ram16 || (pc.ram_gb > 0 && pc.ram_gb <= 20);
+}
+
+void RecommendFor(PcInfo* pc) {
+	// Launcher-souls.ps1 $gpuDb (10-23): the recommended mode and what to expect (measured on an RTX 5080 and a simulated
+	// 8 GB card; the rest an ESTIMATE by relative power: the emulator depends a lot on the CPU too).
+	struct Row {
+		std::vector<const char*> any;
+		const char*              mode;
+		const char*              expected;
+	};
+	static const Row rows[] = {
+	    {{"GTX 9", "GTX 10", "GTX TITAN", "RX 4", "RX 5", "VEGA", "RADEON VII"}, "NO COMPATIBLE",
+	     "tu grafica no tiene fragmentShaderBarycentric (hace falta NVIDIA RTX 20 / GTX 16 o AMD RX 6000 o mas nuevas)"},
+	    {{"RTX 509", "RTX 508", "RTX 409", "RTX 408", "RX 7900 XTX"}, "Modo Souls extremo",
+	     "4K cine: ~40-50 FPS reales (150-224 en pantalla con FG). 1440p: 60-75 reales"},
+	    {{"RTX 507", "RTX 4070 TI", "RTX 4070 SUPER", "RTX 309", "RTX 3080 TI", "RX 907", "RX 7900 XT", "RX 7900 GRE", "RX 6950"},
+	     "Modo Souls ultra", "1440p: ~50-65 FPS reales (150-224 en pantalla con FG)"},
+	    {{"RTX 4070", "RTX 4060 TI 16", "RTX 3080", "RTX 506", "RX 6800", "RX 6900", "RX 7800", "RX 7700", "B580", "B570"},
+	     "Modo Souls equilibrado", "1440p: 45 FPS reales fijos (90 en pantalla con AMD x2)"},
+	    {{"RTX 4060", "RTX 3070", "RTX 3060", "RTX 207", "RTX 208", "RTX 2060", "RX 66", "RX 7600", "RX 6700", "ARC A7"},
+	     "Modo Souls ligero", "1080p: 30 FPS reales fijos (60 en pantalla con AMD x2); 8 GB de VRAM justos"},
+	    {{"GTX", "RX 6500", "RX 6400", "ARC A3", "ARC A5", "RADEON(TM) GRAPHICS", "IRIS", "UHD"}, "Modo Souls PC low profile",
+	     "900p: 30 FPS reales fijos (60 con AMD x2); puede no ir fluido"},
+	};
+	std::string up = pc->gpu;
+	std::transform(up.begin(), up.end(), up.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+	pc->recommended.clear();
+	pc->expected.clear();
+	pc->unsupported = false;
+	for (const auto& row: rows) {
+		bool hit = false;
+		for (const char* k: row.any) {
+			const auto at = up.find(k);
+			if (at == std::string::npos) continue;
+			// "RX 4" / "RX 5" / "GTX 9": the old generations only (RX 4xx / 5xx, RX 5x00), not RX 6000+ that also start so.
+			const std::string key = k;
+			if ((key == "RX 4" || key == "RX 5") && at + key.size() < up.size()) {
+				size_t digits = 0;
+				for (size_t i = at + key.size() - 1; i < up.size() && std::isdigit(static_cast<unsigned char>(up[i])) != 0; i++) digits++;
+				if (digits != 3 && digits != 4) continue;
+				if (digits == 4 && key == "RX 4") continue;
+			}
+			hit = true;
+			break;
+		}
+		if (!hit) continue;
+		pc->recommended = row.mode;
+		pc->expected    = row.expected;
+		pc->unsupported = std::strcmp(row.mode, "NO COMPATIBLE") == 0;
+		return;
+	}
+}
+
+LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcInfo& pc) {
 	LaunchPlan plan;
 	Env        env;
 	const bool demons = title_id.empty() || title_id.rfind("PPSA0134", 0) == 0;
 	// The frame generation config (config/<mode>.json): the common switches, then the mode's.
-	// Souls ligero / equilibrado: AMD x2 whatever frame_generation says, the game flipped at 30 / 45.
+	// Souls ligero / equilibrado / PC low profile: AMD x2 whatever frame_generation says, the game flipped at 30 / 45 / 30.
+	// (10-23) No DLSS on a graphics card that is not NVIDIA (the launcher does not offer it).
 	const bool  fixed_fg = FixedFg(s);
-	const auto* fg       = FindFg(fixed_fg ? "amd-x2" : s.framegen);
+	std::string fg_id    = fixed_fg ? "amd-x2" : s.framegen;
+	if (!pc.nvidia && fg_id.rfind("dlss", 0) == 0) {
+		fg_id = "sin-fg";
+		plan.notes.emplace_back("DLSS frame generation needs NVIDIA: without frame generation");
+	}
+	const auto* fg = FindFg(fg_id);
 	for (const auto& p: Tables::kBaseEnv) env.Set(p.key, p.value);
 	for (int i = 0; i < fg->env_count; i++) env.Set(fg->env[i].key, fg->env[i].value);
-	const bool with_fg = std::strcmp(fg->id, "sin-fg") != 0;
-	const bool amd_fg  = std::strncmp(fg->id, "amd", 3) == 0;
+	const bool with_fg  = std::strcmp(fg->id, "sin-fg") != 0;
+	const bool amd_fg   = std::strncmp(fg->id, "amd", 3) == 0;
+	const bool dlss_fg  = std::strncmp(fg->id, "dlss", 4) == 0;
+	// (10-22) Unlocked always (the launcher has no box any more), but in the fixed Souls modes.
+	const bool unlocked = !fixed_fg;
+	const bool low_ram  = LowRam(s, pc);
 
-	// Launcher-souls.ps1: super resolution. (10-23) DLSS upscaling with AMD frame generation works (the user's
-	// 10-23 07:37 log, Souls ligero): allowed, in the Souls modes too.
-	(void)amd_fg;
+	// Super resolution. (10-23) DLSS upscaling with AMD frame generation works: allowed, in the Souls modes too.
 	const ResMode* res      = FindRes(s.res);
-	std::string    upscaler = res->upscaler;
-	double         ratio    = upscaler.empty() ? 0.0 : res->value;
+	if (!pc.nvidia && std::strcmp(res->upscaler, "dlss") == 0) {
+		// (DLSS needs NVIDIA: FSR at the same quality.)
+		std::string other = std::string("fsr-") + (std::strcmp(res->id, "dlss-dlaa") == 0 ? "aa" : res->id + 5);
+		res = FindRes(other);
+		if (std::strcmp(res->id, other.c_str()) != 0) res = FindRes("fsr-calidad");
+		plan.notes.emplace_back(std::string("DLSS needs NVIDIA: ") + res->label);
+	}
+	std::string upscaler = res->upscaler;
+	double      ratio    = upscaler.empty() ? 0.0 : res->value;
+	if (std::strcmp(res->id, "fsr-900") == 0 && pc.screen_h > 0) ratio = std::max(1.0, std::round(pc.screen_h / 900.0 * 10000.0) / 10000.0);
 
-	// Launcher-souls.ps1's -Set switches.
+	// Launcher-souls.ps1 Start-Game's -Set switches, in its order.
 	EnvList sets;
+	if (low_ram) sets.emplace_back("KYTY_LOWRAM", "1"); // (10-24) the emulator's 16 GB limits
+	if (s.simulate_ram16) sets.emplace_back("KYTY_SIMULATE_RAM_MB", "16384");
+	if (fixed_fg) sets.emplace_back("KYTY_PAD_LATE_MS", s.souls_mode == "equilibrado" ? "29" : "43"); // (10-25) Anti-Lag+
+	// (10-26) The RAM flush is gone (hitches): none of it, and out of the config too.
+	for (const char* k: {"KYTY_MEMCUT", "KYTY_REBAR_STAGING", "KYTY_STAGING_RING_MB", "KYTY_RAM_TARGET_MB", "KYTY_RAM_FLUSH_SECONDS",
+	                     "KYTY_RAM_FLUSH_MB", "KYTY_RAM_FLUSH_LEVEL"})
+		sets.emplace_back(k, "");
 	if (s.safe_gpu) sets.emplace_back("KYTY_COMPUTE_CHAIN", "0");
-	if (s.sharpness != "auto" && !s.sharpness.empty()) sets.emplace_back("KYTY_UPSCALE_SHARPNESS", s.sharpness);
-	if (s.unlock_fps && with_fg && !fixed_fg) sets.emplace_back("KYTY_FRAMEGEN_BASE", "0");
-	// (10-23) Launcher-souls.ps1 Start-Game's other -Set switches.
+	// Anti-Lag (10-24): with the AMD frame generation, AMD's Anti-Lag 2 on an AMD card (default) or ours (2 frames queued, Ultra 1);
+	// the fixed Souls modes always ours in Ultra. With NVIDIA's frame generation, Reflex (default) or ours with Reflex off.
+	std::string al = s.antilag_mode.empty() || s.antilag_mode == "auto" ? (pc.amd ? "amd2" : "normal") : s.antilag_mode;
+	if (fixed_fg) al = "ultra";
+	const bool amd_al = pc.amd && amd_fg && al == "amd2" && !fixed_fg;
+	const bool own_al = (al == "normal" || al == "ultra") && amd_fg;
+	const bool dg_own = dlss_fg && (s.antilag_dlssg == "normal" || s.antilag_dlssg == "ultra");
+	if (dg_own) {
+		sets.emplace_back("KYTY_DLSSG_REFLEX", "off");
+		sets.emplace_back("KYTY_LOWLAT", "1");
+		sets.emplace_back("KYTY_LOWLAT_QUEUE", s.antilag_dlssg == "ultra" ? "1" : "2");
+	}
+	if (own_al) {
+		sets.emplace_back("KYTY_LOWLAT", "1");
+		sets.emplace_back("KYTY_LOWLAT_QUEUE", al == "ultra" ? "1" : "2");
+	}
+	// (10-26) GTAO and the screen-space RT (Luz RT, volumetric, RT reflections, RT sun, RT particles) are gone: never passed.
+	// Bordes sombras: the game's shadow maps filtered (KYTY_SHADOW_FILTER).
+	if (s.shadow_edges == "1" || s.shadow_edges == "2" || s.shadow_edges == "3") sets.emplace_back("KYTY_SHADOW_FILTER", s.shadow_edges);
+	// (10-27) Ray tracing (hardware), No / Si: Launcher-souls.ps1 $hwTbl.
+	{
+		struct Row {
+			bool                     on;
+			const char*              key;
+			std::vector<const char*> env;
+		};
+		const Row rows[] = {
+		    {s.rt_reflections, "refl", {"KYTY_HWRT_REFL=1", "KYTY_HWRT_REFL_MATERIAL=1"}},
+		    {s.rt_sun, "sol", {"KYTY_HWRT_SHADOW=2"}},
+		    {s.rt_fog, "volum", {"KYTY_HWRT_VOLUMETRIC=2"}},
+		    {s.rt_particles, "partic", {"KYTY_HWRT_PARTICLES=2"}},
+		    {s.rt_metal, "metal", {"KYTY_HWRT_REFL=1", "KYTY_HWRT_REFL_MATERIAL=1", "KYTY_HWRT_METAL=1"}},
+		    {s.rt_ao, "ao", {"KYTY_HWRT_AO=2"}},
+		};
+		Env hw;
+		for (const auto& row: rows) {
+			if (!row.on) continue;
+			for (const char* e: row.env) {
+				const std::string pair = e;
+				const auto        eq   = pair.find('=');
+				const std::string n = pair.substr(0, eq), v = pair.substr(eq + 1);
+				if (hw.Has(n) && n.rfind("KYTY_HWRT_SHADOW", 0) == 0 && std::strcmp(row.key, "sol") != 0) continue;
+				hw.Set(n, v);
+			}
+		}
+		if (s.rt_fog && !s.rt_sun && !hw.Has("KYTY_HWRT_SHADOW")) hw.Set("KYTY_HWRT_SHADOW", "1");
+		if (s.rt_metal) {
+			hw.Set("KYTY_HWRT_REFL", "1");
+			hw.Set("KYTY_HWRT_REFL_MATERIAL", "1");
+		}
+		// Sombra rincones: the hardware AO's floor and strength (Normal = the emulator's own), with Oclusion only.
+		if ((s.corner_shadow == "1" || s.corner_shadow == "2") && s.rt_ao) {
+			const int i = s.corner_shadow == "1" ? 1 : 2;
+			hw.Set("KYTY_HWRT_AO_FLOOR", std::string(i == 1 ? "0.45" : "0.35"));
+			hw.Set("KYTY_HWRT_AO_STRENGTH", std::string(i == 1 ? "0.85" : "0.95"));
+		}
+		if (!hw.list.empty()) {
+			sets.emplace_back("KYTY_HWRT", "1");
+			sets.insert(sets.end(), hw.list.begin(), hw.list.end());
+		}
+	}
+	sets.emplace_back("KYTY_DLSSG_PRESET", "C");
 	sets.emplace_back("KYTY_FG_PACING", "0");        // (10-21) the emulator's frame pacing (stuck at 20 FPS) off
 	sets.emplace_back("KYTY_DS_SIXTY_STEP", "0");    // (10-22) cinematic as on PS5
 	sets.emplace_back("KYTY_DS_VARIABLE_STEP", "1"); // (10-21) physics at each frame's real time
+	// Upscaler sharpness: (10-24) ligero 75 %, (10-24) PC low profile 100 %.
+	std::string sharp = s.sharpness == "auto" ? std::string() : s.sharpness;
+	if (s.souls_mode == "low") sharp = "1";
+	else if (s.souls_mode == "ligero") sharp = "0.75";
+	if (!sharp.empty()) sets.emplace_back("KYTY_UPSCALE_SHARPNESS", sharp);
+	if (fixed_fg) sets.emplace_back("KYTY_FLIP_FPS", s.souls_mode == "equilibrado" ? "45" : "30");
+	if (unlocked && with_fg) sets.emplace_back("KYTY_FRAMEGEN_BASE", "0");
 	if (s.af16) sets.emplace_back("KYTY_FORCE_AF", "16");
-	if (s.sharp_textures) sets.emplace_back("KYTY_TEXTURE_LOD_BIAS", "auto"); // (10-23) per texture: not the fog
-	sets.emplace_back("KYTY_DLSSG_PACE", "grid");    // (10-22 e) reflexfree waited once per shown frame: 14 real
-	if (s.ambient_occlusion != "0" && !s.ambient_occlusion.empty()) {
-		sets.emplace_back("KYTY_GTAO", s.ambient_occlusion);
-		sets.emplace_back("KYTY_GTAO_STRENGTH", "0.35");
+	if (s.texture_sharpness == "2") {
+		// (10-25) Extra nitidas: log2(render / output) - 1 with an upscaler (NVIDIA's DLSS guide), -0.5 without; at least -2.
+		const double lb = std::max(-2.0, ratio > 1.0 ? -std::log2(ratio) - 1.0 : -0.5);
+		char         text[32];
+		std::snprintf(text, sizeof(text), "%.3f", lb);
+		sets.emplace_back("KYTY_TEXTURE_LOD_BIAS", text);
+	} else if (s.texture_sharpness == "1") {
+		sets.emplace_back("KYTY_TEXTURE_LOD_BIAS", "auto"); // (10-23) per texture: not the fog
 	}
+	sets.emplace_back("KYTY_DLSSG_PACE", "grid"); // (10-22 e) reflexfree waited once per shown frame: 14 real
 	sets.emplace_back("KYTY_FAULT_STATS", "1");
+	sets.emplace_back("KYTY_ALIAS_STATS", "0"); // (10-23) the alias walk of every mapping: hitches on area changes
 	if (std::strcmp(fg->id, "amd-x4") == 0) sets.emplace_back("KYTY_VRR_CAP_FPS", "224");
 	if (std::strstr(fg->config, "dyn") != nullptr) sets.emplace_back("KYTY_DYN_QUALITY", "0.95"); // (10-22 g) fill the monitor
-	// Its vblank: 360 / 840 Hz with frame generation (the game's speed corrected), 960 unlocked without, else 60.
-	// (10-21 b, Launcher-souls.ps1) DLSS and AMD dynamic: 840 Hz (60 = 14 pulses, 56 = 15).
-	const bool vb840  = std::strncmp(fg->id, "dlss", 4) == 0 || std::strcmp(fg->id, "amd-dinamico") == 0;
-	const int  vblank = with_fg ? (vb840 ? 840 : 360) : (s.unlock_fps ? 960 : 60);
-	plan.vblank      = vblank;
+	if (s.metrics == "1" || s.metrics == "2") sets.emplace_back("KYTY_LATENCY", "1");
+	sets.emplace_back("KYTY_DEPTH_ARRAY_LOG", "1");
+	sets.emplace_back("KYTY_LOWLAT_PACE_BEFORE_INPUT", "0");
+	sets.emplace_back("KYTY_FLIP_QUEUE_LIMIT", "0");
+	sets.emplace_back("KYTY_PHASE_PACE", "0");
+	if (fixed_fg) sets.emplace_back("KYTY_DISPLAYED_WAIT", "1"); // (10-25) one frame queued as on the console: 30 / 45 only
+	// Its vblank: 840 Hz with DLSS and AMD dynamic frame generation, 360 with the other frame generation, 960 unlocked
+	// without, else 60.
+	const bool vb840  = dlss_fg || std::strcmp(fg->id, "amd-dinamico") == 0;
+	const int  vblank = with_fg ? (vb840 ? 840 : 360) : (unlocked ? 960 : 60);
+	plan.vblank       = vblank;
 	const std::string& quality = s.quality;
 	const std::string& texture = s.texture_reduce;
 
@@ -391,20 +586,18 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 	env.Remove("KYTY_UPSCALE");
 	if (upscaler == "dlss" && s.dlss_preset != "auto" && !s.dlss_preset.empty()) env.Set("KYTY_DLSS_PRESET", s.dlss_preset);
 	if (!s.aspect.empty() && s.aspect != "16:9") env.Set("KYTY_RENDER_ASPECT", s.aspect);
-	// -ForceMode: the game's mode by the output (4K = cinematic, else performance; the Souls modes performance).
-	if (demons) env.Set("KYTY_DS_FORCE_MODE", s.height >= 2160 && !fixed_fg ? "cinematic" : "performance");
+	// -ForceMode performance (10-25: 4K no longer forces the cinematic mode: it held the game at 30 real).
+	if (demons) env.Set("KYTY_DS_FORCE_MODE", "performance");
 	static const std::map<std::string, std::string> convars = {
-	    // (Shadows untouched: their distance and kinds popped in visibly.)
 	    {"high", "r_forceViewportHeightForPixelSizeCalc=1080"},
 	    {"low", "r_forceViewportHeightForPixelSizeCalc=720"},
 	    {"lowest", "r_forceViewportHeightForPixelSizeCalc=480"}};
 	if (auto it = convars.find(quality); it != convars.end() && demons) env.AppendConvars(it->second);
-	if (s.antilag) env.Set("KYTY_ANTILAG", "1");
-	if (s.rt_light != "0" && !s.rt_light.empty()) env.Set("KYTY_SSGI", s.rt_light);
+	if (amd_al) env.Set("KYTY_ANTILAG", "1"); // (run-windows -AntiLag)
 	if (demons) {
-		// (10-23) run-windows.ps1 $gfxExtra / -PostOff / $detailConvars / -Shadows: the game's own settings (defaults
-		// from the eboot: r_ssrMaxIterations 128, r_ssrMaxRayLength 1000, r_ssrCutoffDistance 1000,
-		// r_fadeOutInstanceOverDistance 15, r_aaSharpenStrength* 2.5, r_aaHistorySharpeningStrength 0.8).
+		// run-windows.ps1 $gfxExtra / -PostOff / $detailConvars / -Shadows (10-24: the cascade cuts spread, 75 % log +
+		// 25 % linear from 0.5 m, the last one the maximum: else the far away was drawn black).
+		const bool far = s.detail == "ultra"; // (10-24) the launcher's Ultra = run-windows' "Lejana"
 		static const std::map<std::string, std::string> extra = {
 		    {"refl_ultra", "r_ssrEnableOverrides=true;r_ssrMaxIterations=192;r_ssrMaxRayLength=1400;r_ssrCutoffDistance=1500"},
 		    {"refl_normal", "r_ssrEnableOverrides=true;r_ssrMaxIterations=64;r_ssrMaxRayLength=600;r_ssrCutoffDistance=500"},
@@ -428,15 +621,21 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 		off(s.bloom, "r_bloomEnable=false");
 		off(s.eye_adapt, "r_exposureEyeAdaptEnable=false");
 		if (!post.empty()) env.AppendConvars(post);
+		if (far) env.Default("KYTY_RT_SHADOWS_FADE", "250");
 		static const std::map<std::string, std::string> details = {
-		    {"ultra", "r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=400;r_contactShadowsEnabled=true;r_iblResolution=Full;"
-		              "r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.015;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0"},
-		    {"muy-alto", "r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=250;r_iblResolution=Full;r_tessellationDensity=18.0;"
-		                 "r_tessellationSmallestEdgeLength=0.02;r_tessellationFadeOutStart=15.0;r_tessellationFadeOutRange=3.0"},
-		    {"normal", "r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=180;r_iblResolution=HalfResX;r_tessellationDensity=6.0;"
-		               "r_tessellationSmallestEdgeLength=0.06;r_tessellationFadeOutStart=9.0;r_tessellationFadeOutRange=3.0"},
-		    {"bajo", "r_virtualGeometryNumShadowCascades=1;sunShadowMaxDistance=125;r_iblResolution=HalfResX;r_tessellationDensity=4.0;"
-		             "r_tessellationSmallestEdgeLength=0.08;r_tessellationFadeOutStart=6.0;r_tessellationFadeOutRange=2.0"}};
+		    {"ultra", "r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=1000;sunShadowCascadeDistance0=65;sunShadowCascadeDistance1=142;"
+		              "sunShadowCascadeDistance2=300;sunShadowCascadeDistance3=1000;sunShadowLightDistance=1000;r_contactShadowsEnabled=true;"
+		              "r_fadeOutInstanceOverDistance=60;r_ssrEnableOverrides=true;r_ssrMaxIterations=256;r_ssrMaxRayLength=1600;"
+		              "r_ssrCutoffDistance=5000;r_iblResolution=Full;r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.015;"
+		              "r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0"},
+		    {"muy-alto", "r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=250;sunShadowCascadeDistance0=40;sunShadowCascadeDistance1=250;"
+		                 "r_iblResolution=Full;r_tessellationDensity=18.0;r_tessellationSmallestEdgeLength=0.02;r_tessellationFadeOutStart=15.0;"
+		                 "r_tessellationFadeOutRange=3.0"},
+		    {"normal", "r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=180;sunShadowCascadeDistance0=30;sunShadowCascadeDistance1=180;"
+		               "r_iblResolution=HalfResX;r_tessellationDensity=6.0;r_tessellationSmallestEdgeLength=0.06;r_tessellationFadeOutStart=9.0;"
+		               "r_tessellationFadeOutRange=3.0"},
+		    {"bajo", "r_virtualGeometryNumShadowCascades=1;sunShadowMaxDistance=125;sunShadowCascadeDistance0=125;r_iblResolution=HalfResX;"
+		             "r_tessellationDensity=4.0;r_tessellationSmallestEdgeLength=0.08;r_tessellationFadeOutStart=6.0;r_tessellationFadeOutRange=2.0"}};
 		if (auto it = details.find(s.detail); it != details.end()) env.AppendConvars(it->second);
 		static const std::map<std::string, std::string> shadows = {
 		    {"alto", "sunShadowMaxDistance=190"},
@@ -453,9 +652,10 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 	env.Default("KYTY_HITCH_LOG_MS", "40");
 	if (s.aspect_fit) env.Set("KYTY_PRESENT_ASPECT", "fit");
 	env.Default("KYTY_ASYNC_DRAW_PIPELINES", "1");
-	if (s.profile16) {
+	// -Ram16 (10-24): "Optimizacion equipos 16 GB RAM" on a PC of 20 GB of RAM or less (or simulated) only.
+	if (s.profile16 && low_ram) {
 		env.Default("KYTY_RESIDENT_MB", "6144");
-		env.Default("KYTY_PREFETCH_MIN_AVAIL_MB", "3072");
+		env.Default("KYTY_PREFETCH_MIN_AVAIL_MB", "1536");
 		env.Default("KYTY_BACKING_FILE", "0");
 	}
 	if (!upscaler.empty()) env.Set("KYTY_UPSCALER", upscaler);
@@ -468,9 +668,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 			pair          = Trim(pair);
 			const auto eq = pair.find('=');
 			if (eq == std::string::npos || eq == 0) continue;
-			const auto key = Trim(pair.substr(0, eq)), value = Trim(pair.substr(eq + 1));
-			if (value.empty()) env.Set(key, "");
-			else env.Set(key, value);
+			env.Set(Trim(pair.substr(0, eq)), Trim(pair.substr(eq + 1)));
 		}
 	}
 	// (10-21) KYTY_DS_VARIABLE_STEP=1: the game's physics at each frame's real time (run-windows.ps1).
@@ -487,18 +685,17 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id) {
 	env.Set("KYTY_FLIP_WHEN_READY", "");
 	if (s.gsync) {
 		env.Set("KYTY_VSYNC_LOCK", "0");
-		if (s.unlock_fps && !with_fg) {
+		if (unlocked && !with_fg) {
 			env.Set("KYTY_FPS_CAP", s.fps_cap > 0 ? Num(s.fps_cap) : "auto");
 			env.Set("KYTY_FLIP_WHEN_READY", "1");
 		}
 	}
-	env.Set("KYTY_DLSSG_PRESET", "C"); // (always: the emulator applies it to nvngx_dlssg only)
-	if (fixed_fg) env.Set("KYTY_FLIP_FPS", s.souls_mode == "equilibrado" ? "45" : "30");
-	// (10-23) Controls (Launcher-souls.ps1 "Controles"): keyboard and mouse, the pad's remap.
+	// (10-23) Controls: keyboard and mouse, the pad's remap. (10-25) A little less sensitivity in 30x2 / 45x2.
 	env.Set("KYTY_PAD_MAP", s.pad_map);
 	env.Set("KYTY_KBM", s.kbm ? "1" : "");
 	env.Set("KYTY_KBM_MAP", s.kbm ? s.kbm_map : "");
-	env.Set("KYTY_KBM_SENS", s.kbm ? Num(s.kbm_sens > 0 ? s.kbm_sens : 1.0f) : "");
+	const float sens = (s.kbm_sens > 0 ? s.kbm_sens : 1.0f) * (fixed_fg ? 0.92f : 1.0f);
+	env.Set("KYTY_KBM_SENS", s.kbm ? Num(sens) : "");
 	env.Set("KYTY_KBM_ANTIDZ", s.kbm ? Num(s.kbm_antidz >= 0 ? s.kbm_antidz : 0.15f) : "");
 	// The port's own: metrics (the launcher started metricas.ps1; here the in-game panel) and rumble.
 	env.Set("KYTY_FPS_HUD", s.metrics == "1" || s.metrics == "2" ? s.metrics : "");
@@ -527,23 +724,29 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.height != n.height || l.hdr != n.hdr || l.vsync != n.vsync || l.gsync != n.gsync ||
 	       l.unlock_fps != n.unlock_fps || l.aspect_fit != n.aspect_fit || l.aspect != n.aspect || l.res != n.res ||
 	       l.dlss_preset != n.dlss_preset || l.framegen != n.framegen || l.souls_mode != n.souls_mode ||
-	       l.antilag != n.antilag || l.shadows != n.shadows || l.detail != n.detail || l.reflections != n.reflections ||
-	       l.object_fade != n.object_fade || l.aa_sharp != n.aa_sharp || l.rt_light != n.rt_light ||
-	       l.ambient_occlusion != n.ambient_occlusion || l.motion_blur != n.motion_blur || l.dof != n.dof ||
-	       l.vignette != n.vignette || l.bloom != n.bloom || l.eye_adapt != n.eye_adapt || l.af16 != n.af16 ||
-	       l.sharp_textures != n.sharp_textures || l.kbm != n.kbm || l.kbm_sens != n.kbm_sens ||
-	       l.kbm_antidz != n.kbm_antidz || l.kbm_map != n.kbm_map || l.pad_map != n.pad_map ||
-	       l.profile16 != n.profile16 || l.safe_gpu != n.safe_gpu || l.quality != n.quality ||
-	       l.texture_reduce != n.texture_reduce || l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds ||
-	       l.extra != n.extra || (l.sharpness == "auto") != (n.sharpness == "auto");
+	       l.antilag_mode != n.antilag_mode || l.antilag_dlssg != n.antilag_dlssg || l.shadows != n.shadows ||
+	       l.detail != n.detail || l.reflections != n.reflections || l.object_fade != n.object_fade || l.aa_sharp != n.aa_sharp ||
+	       l.shadow_edges != n.shadow_edges || l.corner_shadow != n.corner_shadow || l.rt_reflections != n.rt_reflections ||
+	       l.rt_sun != n.rt_sun || l.rt_fog != n.rt_fog || l.rt_particles != n.rt_particles || l.rt_metal != n.rt_metal ||
+	       l.rt_ao != n.rt_ao || l.motion_blur != n.motion_blur || l.dof != n.dof || l.vignette != n.vignette ||
+	       l.bloom != n.bloom || l.eye_adapt != n.eye_adapt || l.af16 != n.af16 || l.texture_sharpness != n.texture_sharpness ||
+	       l.kbm != n.kbm || l.kbm_sens != n.kbm_sens || l.kbm_antidz != n.kbm_antidz || l.kbm_map != n.kbm_map ||
+	       l.pad_map != n.pad_map || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
+	       l.safe_gpu != n.safe_gpu || l.quality != n.quality || l.texture_reduce != n.texture_reduce ||
+	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.extra != n.extra ||
+	       (l.sharpness == "auto") != (n.sharpness == "auto");
 }
 
 bool FixedFg(const Settings& s) {
-	return s.souls_mode == "ligero" || s.souls_mode == "equilibrado";
+	return s.souls_mode == "ligero" || s.souls_mode == "equilibrado" || s.souls_mode == "low";
+}
+
+void RtAllOff(Settings* s) {
+	s->rt_reflections = s->rt_sun = s->rt_fog = s->rt_particles = s->rt_metal = s->rt_ao = false;
 }
 
 void ApplyPreset(Settings* s, const std::string& preset) {
-	// Launcher-souls.ps1 (10-23): Set-PresetMax, Set-PresetLight, Souls equilibrado, Set-PresetUltra, Set-PresetExtreme.
+	// Launcher-souls.ps1 (10-27): Set-PresetMax / Light / Ultra / Extreme / LowProfile and Souls equilibrado's handler.
 	const auto max = [&]() {
 		s->texture_reduce = "0";
 		s->quality        = "standard";
@@ -553,43 +756,63 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->object_fade    = "alto";
 		s->reflections    = "alto";
 	};
+	const auto post_on = [&]() { s->motion_blur = s->dof = s->vignette = s->bloom = s->eye_adapt = true; };
+	s->rt_light          = "0"; // (10-26) gone
+	s->ambient_occlusion = "0";
 	if (preset == "ligero") {
-		s->texture_reduce    = "2";
-		s->quality           = "low";
-		s->shadows           = "medio";
-		s->rt_light          = "0";
-		s->detail            = "normal";
-		s->ambient_occlusion = "1";
-		s->aa_sharp          = "alto";
-		s->object_fade       = "normal";
-		s->reflections       = "normal";
+		// Set-PresetLight; FSR Calidad recommended (10-25); sharpness 75 %.
+		s->texture_reduce = "1";
+		s->quality        = "high";
+		s->shadows        = "medio";
+		s->detail         = "normal";
+		s->aa_sharp       = "alto";
+		s->object_fade    = "normal";
+		s->reflections    = "normal";
+		s->res            = "fsr-calidad";
+		s->sharpness      = "0.75";
 	} else if (preset == "equilibrado") {
+		// (10-25) The user's capture: DLSS Calidad (K), sharpness 100 %, textures Maximo, distance and shadows Alto, Detail
+		// High, Reflections / Object Fade High, AA Sharpness High, x16, extra sharp textures, all the post-processing.
 		max();
-		s->texture_reduce    = "h";
 		s->quality           = "high";
 		s->shadows           = "alto";
-		s->rt_light          = "0";
-		s->ambient_occlusion = "2";
 		s->aa_sharp          = "alto";
+		s->af16              = true;
+		s->texture_sharpness = "2";
+		post_on();
+		s->sharpness = "1";
+		s->res       = "dlss-calidad";
+		s->dlss_preset = "K";
 	} else if (preset == "ultra") {
 		max();
-		s->detail            = "muy-alto";
-		s->rt_light          = "2";
-		s->ambient_occlusion = "2";
-		s->aa_sharp          = "ultra"; // (10-23) costs nothing
+		s->detail   = "muy-alto";
+		s->aa_sharp = "ultra"; // (10-23) costs nothing
 	} else if (preset == "extremo") {
 		max();
-		s->detail            = "ultra";
-		s->rt_light          = "3";
-		s->ambient_occlusion = "3";
-		s->reflections       = "ultra";
-		s->object_fade       = "ultra";
-		s->aa_sharp          = "ultra";
+		s->detail      = "ultra";
+		s->reflections = "ultra";
+		s->object_fade = "ultra";
+		s->aa_sharp    = "ultra";
+		s->af16        = true;
+		if (s->texture_sharpness == "0") s->texture_sharpness = "1";
+	} else if (preset == "low") {
+		// Set-PresetLowProfile: 900p-ish with FSR Calidad, everything low; what costs nearly nothing at its best.
+		s->texture_reduce    = "2";
+		s->quality           = "high";
+		s->shadows           = "medio";
+		s->detail            = "bajo";
+		s->reflections       = "bajo";
+		s->object_fade       = "bajo";
+		s->aa_sharp          = "bajo";
 		s->af16              = true;
-		s->sharp_textures    = true;
+		if (s->texture_sharpness == "0") s->texture_sharpness = "1";
+		post_on();
+		s->res       = "fsr-calidad";
+		s->sharpness = "1";
 	} else {
 		max();
 	}
+	if (preset != "maximo") RtAllOff(s); // (10-26) every Souls mode: ray tracing No
 }
 
 } // namespace Port

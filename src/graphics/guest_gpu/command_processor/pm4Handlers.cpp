@@ -1356,7 +1356,17 @@ KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_DISPATCH_DIRECT);
-	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
+	// (10-24) A longer DISPATCH_DIRECT (extra trailing dwords, seen once with DLSS + FSR 3 FG in Boletaria) closed the
+	// emulator: the first four dwords are the same; the rest is skipped. Shorter ones are still unsupported.
+	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) < 5u);
+	if (KYTY_PM4_LEN(cmd_id) != 5u) {
+		static int logged = 0;
+		if (logged < 4) {
+			++logged;
+			std::printf("PM4: DISPATCH_DIRECT with %u dwords (expected 5): the extra ones skipped\n", static_cast<unsigned>(KYTY_PM4_LEN(cmd_id)));
+			std::fflush(stdout);
+		}
+	}
 
 	uint32_t thread_group_x = buffer[0];
 	uint32_t thread_group_y = buffer[1];

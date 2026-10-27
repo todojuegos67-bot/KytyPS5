@@ -603,7 +603,19 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		blob_writer                     = std::make_unique<PipelineCacheBlobWriter>();
 		m_graphics.pipeline_blob_writer = blob_writer.get();
 	}
-	vk::PipelineCache target = binaries || blobs ? nullptr : m_static_cache;
+	// NVIDIA trains its compression dictionary once a process has made a few hundred pipelines (230 to 319 here), and
+	// the captures after it are left out (PipelineBinaryWriter). A shard stops well before, after capture_cap captures
+	// (KYTY_PRECOMPILE_SHARD_CAP, default 160 on NVIDIA; 0: none), its other work items left to its halves (exit 3): on
+	// some PCs the shards share the driver's cache, and one shard's dictionary reached every later shard from its
+	// first pipeline on, splitting them without end (issue #107).
+	const size_t capture_cap = [&]() -> size_t {
+		if (const char* value = std::getenv("KYTY_PRECOMPILE_SHARD_CAP"); value != nullptr && *value != 0)
+			return std::strtoull(value, nullptr, 10);
+		constexpr uint32_t NvidiaVendor = 0x10DE;
+		return m_graphics.GetPhysicalDeviceProperties().vendorID == NvidiaVendor ? 160 : 0;
+	}();
+	std::atomic<size_t> capped {0};
+	vk::PipelineCache   target = binaries || blobs ? nullptr : m_static_cache;
 	if (create_pipelines && !blobs && (shards > 1 || binaries)) {
 		vk::PipelineCacheCreateInfo info {};
 		if (m_graphics.device.createPipelineCache(&info, nullptr, &target) != vk::Result::eSuccess) target = nullptr;
@@ -730,8 +742,12 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 			if (!mine(n) || (writer != nullptr && writer->LeftOut() != 0) ||
 			    (blob_writer != nullptr && blob_writer->LeftOut() != 0))
 				return;
+			if (n < seed_words.size() && stage_of(n) != ShaderType::Compute) return;
+			if (writer != nullptr && capture_cap != 0 && writer->Captured() >= capture_cap) {
+				capped.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
 			if (n < seed_words.size()) {
-				if (stage_of(n) != ShaderType::Compute) return;
 				LocalShaderWarmup::Record input;
 				if (!decode(static_cast<uint32_t>(n), input)) return;
 				const bool covered = covers(ShaderType::Compute, input.hash);
@@ -877,7 +893,12 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		                 plan.owners.size() - planned_keys);
 		if (!written) return false;
 	}
-	left_out = (writer != nullptr ? writer->LeftOut() : 0) + (blob_writer != nullptr ? blob_writer->LeftOut() : 0);
+	if (const auto stopped = capped.load(); stopped != 0)
+		PipelineCacheLog("Shader seeds: stopped after {} captured pipelines (KYTY_PRECOMPILE_SHARD_CAP), {} work items left "
+		                 "to a smaller shard",
+		                 writer->Captured(), stopped);
+	left_out = (writer != nullptr ? writer->LeftOut() : 0) + (blob_writer != nullptr ? blob_writer->LeftOut() : 0) +
+	           capped.load();
 	m_graphics.pipeline_binary_writer = nullptr;
 	m_graphics.pipeline_blob_writer   = nullptr;
 	if (!args.timings.empty()) {

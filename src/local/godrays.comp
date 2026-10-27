@@ -1,0 +1,503 @@
+#version 450
+// KYTY_GODRAYS (godrays.cpp): crepuscular rays (sun shafts) and volumetric halos around local lights (torches, fires)
+// on the PS5 Pro path's pre-exposure HDR color, after the RT shadows / SSGI / GTAO / SSR / RT reflections / shine
+// passes, before the upscaler. All light is added display-referred (x the game's exposure), hue-preserving and
+// soft-capped, then divided by the exposure again: the image is never washed out.
+// Modes (push.misc.x):
+//   0 lights:    a 16x9 grid of cells, 8x8 fixed taps a cell: the brightest emissive tap (exposed luminance above the
+//                threshold, not sky, nearer than 45 m) -> cand[cell]
+//   1 track:     one thread: the tracked lights (<= 8 slots) are reprojected with the motion vectors, matched to the
+//                candidates (nearest, <= 2.5 cells), smoothed, faded in (~16 frames) / out (~32 frames); unmatched strong
+//                candidates take free slots. The sun's colour (hue) from the sky around it, smoothed over ~1 s.
+//   2 volume:    quarter resolution: (a) the sun on screen: an occlusion-aware radial march toward it over the depth
+//                (sky / very far = light, the rest occludes), 32..64 jittered taps; (b) level >= 2: a raymarch along
+//                the view ray (12 / 16 steps up to 60 m), every step tested toward the sun against the depth buffer
+//                (5 taps, a thickness test), Henyey-Greenstein phase: shafts even when the sun is off screen. At the
+//                quarter texel's centre (a stable depth); the jitter (the march's start) is interleaved-gradient noise
+//                in space rotated by the golden ratio each frame, so every texel walks a low-discrepancy sequence and
+//                the accumulation converges instead of leaving a fixed pattern. -> raw (aux_out)
+//   4 temporal:  quarter resolution: the raw value accumulated with the reprojected history (bilinear, each tap
+//                depth-tested); the history length rises to 20 (32 in dark pixels: weight ~0.95-0.97) where the camera
+//                and the pixel are still, to ~10 (as before) on motion, to 1 on disocclusion; the history clamped to the
+//                raw 3x3 neighbourhood's mean +- k sigma (depth-aware; k wider when still) against ghosting.
+//                -> vol_out (scatter, |view z|, history length)
+//   5 spatial:   quarter resolution: a depth-aware 3x3 bilateral blur of the accumulated volume (dilated x2 while the
+//                history is short) -> aux_out; the history itself stays unblurred.
+//   3 composite: full resolution: the volume upsampled depth-aware, x the sun's colour; the lights' analytic in-scatter
+//                along the view ray (closed-form 1/r^2 integral, cut at the surface: walls in front occlude); capped.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2) uniform sampler2D motion_tex;
+layout(binding = 3) uniform sampler2D vol_hist;                    // last frame's volume (quarter res): (scatter, |view z|)
+layout(binding = 4, rgba16f) uniform writeonly image2D vol_out;    // this frame's
+layout(binding = 5, rgba16f) uniform writeonly image2D out_img;    // the composited color (render size)
+layout(binding = 8) uniform sampler2D aux_tex;                     // temporal: raw; spatial: accumulated
+layout(binding = 9, rgba16f) uniform writeonly image2D aux_out;    // volume: raw; spatial: filtered
+layout(std430, binding = 6) buffer Frame {
+	vec4 hdr;        // x: 1.0 (exposure fallback), y: light threshold (exposed luminance), z: light slots, w: light radius (m)
+	uint stats[16];  // 0 frames, 1 lights in use summed, 2 sun on screen frames
+	vec4 sunc;       // the sun's hue (rgb, luminance 1), w: valid
+	vec4 lights[16]; // 8 slots x (uv x, uv y, depth, weight), (exposed rgb, age)
+	vec4 cand[];     // 16x9 cells x (exposed luminance, uv x, uv y, depth), (exposed rgb, -)
+};
+layout(std430, binding = 7) readonly buffer Exposure {
+	float exposure_values[];
+};
+
+layout(push_constant) uniform Push {
+	vec4  proj;      // M[0], M[5], M[8], M[9]
+	vec4  depth_map; // M[10], M[14], M[11], M[15]
+	vec4  size;      // render w, h, strength, added-luminance cap (exposed)
+	vec4  sun;       // view-space direction to the sun, weight (0: no sun)
+	vec4  sun_uv;    // the sun's uv (x, y), on-screen factor (0..1), radial taps
+	vec4  motion;    // motion scale x, y, history valid (1), view-ray steps (0: off)
+	ivec4 misc;      // mode, frame, flags (1 row 0 = NDC y +1, 2 debug: our light only), exposure index
+	vec4  extra;     // quarter w, h, light strength, visibility boost (0..1: Bajo / Medio)
+} push;
+
+const int CW = 16;
+const int CH = 9;
+
+vec2  RenderSize() { return push.size.xy; }
+float YS() { return (push.misc.z & 1) != 0 ? -1.0 : 1.0; }
+float ViewZ(float d) {
+	float den = d * push.depth_map.z - push.depth_map.x;
+	return abs(den) > 1e-12 ? (push.depth_map.y - d * push.depth_map.w) / den : 1e6;
+}
+vec3 ViewPosZ(vec2 uv, float z) {
+	float w  = z * push.depth_map.z + push.depth_map.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	nd.y *= YS();
+	return vec3((nd.x * w - z * push.proj.z) / push.proj.x, (nd.y * w - z * push.proj.w) / push.proj.y, z);
+}
+vec3 ViewPos(vec2 uv, float d) { return ViewPosZ(uv, ViewZ(d)); }
+// A view direction through uv (unit length, toward the scene).
+vec3 RayDir(vec2 uv) {
+	float z0 = abs(push.depth_map.z) > 1e-12 ? 1.0 / push.depth_map.z : -1.0;
+	return normalize(ViewPosZ(uv, z0));
+}
+// View position -> uv (false behind the camera).
+bool Project(vec3 v, out vec2 uv) {
+	float w = v.z * push.depth_map.z + push.depth_map.w;
+	if (w <= 1e-5) return false;
+	vec2 nd = vec2((v.x * push.proj.x + v.z * push.proj.z) / w, (v.y * push.proj.y + v.z * push.proj.w) / w);
+	nd.y *= YS();
+	uv = nd * 0.5 + 0.5;
+	return true;
+}
+bool  IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e3; }
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+float Max3(vec3 c) { return max(c.r, max(c.g, c.b)); }
+vec3  Safe(vec3 c) { return (any(isnan(c)) || any(isinf(c))) ? vec3(0) : clamp(c, vec3(0), vec3(6.0e4)); }
+float GameExposure() {
+	float e = exposure_values[push.misc.w];
+	return (e > 1e-12 && e < 1e12) ? e : 1.0;
+}
+float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+float DepthAt(vec2 uv) { return textureLod(depth_tex, uv, 0).r; }
+// The light mask of the radial march: sky or very far (fog, distant backdrop) = 1, the rest occludes.
+float LightMask(vec2 uv) {
+	float d = DepthAt(uv);
+	if (IsSky(d)) return 1.0;
+	return smoothstep(180.0, 450.0, abs(ViewZ(d)));
+}
+// A hue of luminance 1, saturation limited (a light, not a pure colour).
+vec3 Hue(vec3 c) {
+	float l = Luma(c);
+	if (l < 1e-5) return vec3(1);
+	vec3 h = c / l;
+	return mix(vec3(1), h, 0.6) / max(Luma(mix(vec3(1), h, 0.6)), 1e-4);
+}
+
+shared uint s_best[64];
+
+void Lights(uvec3 wg, uint li) {
+	uvec2 cell = wg.xy;
+	vec2  uv   = (vec2(cell) + (vec2(li % 8u, li / 8u) + 0.5) / 8.0) / vec2(CW, CH);
+	float e    = GameExposure();
+	vec3  c    = Safe(textureLod(color_tex, uv, 0).rgb) * e;
+	float d    = DepthAt(uv);
+	float l    = Luma(c);
+	// (nearer than 6 m: the player's own lantern, a torch held in front of the camera: a halo there is a haze over
+	// the whole character, not a shaft; rejected here so it never takes a slot)
+	bool  ok   = !IsSky(d) && abs(ViewZ(d)) < 45.0 && abs(ViewZ(d)) > 6.0 && l > hdr.y;
+	// (luminance in the high 26 bits, the tap in the low 6: the max picks the brightest)
+	s_best[li] = ok ? ((min(uint(l * 1024.0), 0x3ffffffu) << 6) | li) : 0u;
+	barrier();
+	for (uint s = 32u; s > 0u; s >>= 1) {
+		if (li < s) s_best[li] = max(s_best[li], s_best[li + s]);
+		barrier();
+	}
+	if (li == 0u) {
+		uint  b    = s_best[0];
+		uint  idx  = (cell.y * uint(CW) + cell.x) * 2u;
+		if (b == 0u) {
+			cand[idx] = vec4(0), cand[idx + 1u] = vec4(0);
+		} else {
+			uint t   = b & 63u;
+			vec2 tuv = (vec2(cell) + (vec2(t % 8u, t / 8u) + 0.5) / 8.0) / vec2(CW, CH);
+			vec3 tc  = Safe(textureLod(color_tex, tuv, 0).rgb) * e;
+			cand[idx]      = vec4(Luma(tc), tuv, DepthAt(tuv));
+			cand[idx + 1u] = vec4(tc, 0);
+		}
+	}
+}
+
+void Track() {
+	int slots = int(hdr.z);
+	// The sun's hue from the sky: around the sun when it is on screen, else the upper screen.
+	{
+		float e   = GameExposure();
+		vec3  acc = vec3(0);
+		float n   = 0.0;
+		for (int i = 0; i < 24; ++i) {
+			float a  = float(i) * 2.39996;
+			float r  = 0.04 + 0.12 * fract(float(i) * 0.618);
+			vec2  uv = push.sun_uv.z > 0.1 ? push.sun_uv.xy + r * vec2(cos(a), sin(a) * 1.7)
+			                               : vec2(fract(float(i) * 0.618 + 0.05), (YS() < 0.0 ? 0.05 : 0.95) + (YS() < 0.0 ? 1.0 : -1.0) * 0.3 * fract(float(i) * 0.37));
+			if (any(lessThan(uv, vec2(0.01))) || any(greaterThan(uv, vec2(0.99)))) continue;
+			if (!IsSky(DepthAt(uv))) continue;
+			acc += Safe(textureLod(color_tex, uv, 0).rgb) * e;
+			n += 1.0;
+		}
+		vec3 warm = vec3(1.0, 0.9, 0.74) / Luma(vec3(1.0, 0.9, 0.74));
+		if (n >= 3.0) {
+			vec3 h = mix(warm, Hue(acc / n), 0.5);
+			h /= max(Luma(h), 1e-4);
+			sunc = sunc.w > 0.5 ? vec4(mix(sunc.rgb, h, 0.02), 1.0) : vec4(h, 1.0);
+		} else if (sunc.w < 0.5) {
+			sunc = vec4(warm, 1.0);
+		}
+	}
+	// (vol-fix) Openness: the share of the screen that is sky, smoothed (~1 s). The view-ray march tests the sun against
+	// the depth buffer only, so a roof / ceiling off screen does not occlude: indoors every ray read as lit and the pass
+	// laid a uniform veil over dark interiors. The march is scaled by this factor: no sky in view -> no haze; the
+	// radial march (gated by real sky pixels) is unaffected. stats[14] holds it (float bits; read back for the log).
+	{
+		float sky = 0.0;
+		for (int i = 0; i < 96; ++i) {
+			vec2 uv = vec2((float(i % 12) + 0.5) / 12.0, (float(i / 12) + 0.5) / 8.0);
+			if (IsSky(DepthAt(uv))) sky += 1.0;
+		}
+		float o_t  = smoothstep(0.03, 0.18, sky / 96.0);
+		float o    = uintBitsToFloat(stats[14]);
+		o          = (isnan(o) || isinf(o) || o < 0.0 || o > 1.0) ? o_t : o;
+		o         += clamp(o_t - o, -0.02, 0.02); // (<= 2 % a frame: >= 0.8 s for a full change, no pop)
+		stats[14]  = floatBitsToUint(o);
+	}
+	atomicAdd(stats[0], 1u);
+	if (push.sun_uv.z > 0.5) atomicAdd(stats[2], 1u);
+	if (slots <= 0) return;
+	vec2 rs = RenderSize();
+	bool claimed[CW * CH];
+	for (int i = 0; i < CW * CH; ++i) claimed[i] = false;
+	int used = 0;
+	for (int k = 0; k < slots; ++k) {
+		vec4 a = lights[k * 2];
+		vec4 b = lights[k * 2 + 1];
+		if (a.w <= 0.0) continue;
+		// Reproject: the motion at the old place points to the previous frame; step the other way.
+		if (push.motion.z > 0.0) a.xy -= textureLod(motion_tex, a.xy, 0).xy * push.motion.xy / rs;
+		int   best = -1;
+		float bd   = 2.5;
+		for (int i = 0; i < CW * CH; ++i) {
+			vec4 c = cand[i * 2];
+			if (claimed[i] || c.x <= 0.0) continue;
+			float dist = length((c.yz - a.xy) * vec2(CW, CH));
+			if (dist < bd) bd = dist, best = i;
+		}
+		if (best >= 0) {
+			claimed[best] = true;
+			vec4 c = cand[best * 2];
+			vec3 col = cand[best * 2 + 1].rgb;
+			a.xy  = mix(a.xy, c.yz, 0.3);
+			float za = ViewZ(a.z), zc = ViewZ(c.w);
+			// (a depth jump of > 30 %: another surface took the tap, keep the old depth)
+			if (abs(zc - za) < 0.3 * abs(za)) a.z = mix(a.z, c.w, 0.2);
+			b.rgb = mix(b.rgb, col, 0.08);
+			a.w   = min(a.w + 0.06, 1.0);
+		} else {
+			a.w -= 0.03;
+		}
+		if (any(lessThan(a.xy, vec2(-0.05))) || any(greaterThan(a.xy, vec2(1.05)))) a.w -= 0.1;
+		if (a.w <= 0.0) a = vec4(0), b = vec4(0);
+		lights[k * 2] = a, lights[k * 2 + 1] = b;
+	}
+	// New lights: the strongest unclaimed candidates, >= 3 cells from every tracked one.
+	for (int k = 0; k < slots; ++k) {
+		if (lights[k * 2].w > 0.0) continue;
+		int   best = -1;
+		float bl   = 0.0;
+		for (int i = 0; i < CW * CH; ++i) {
+			vec4 c = cand[i * 2];
+			if (claimed[i] || c.x <= bl) continue;
+			bool near = false;
+			for (int j = 0; j < slots; ++j)
+				if (lights[j * 2].w > 0.0 && length((lights[j * 2].xy - c.yz) * vec2(CW, CH)) < 3.0) near = true;
+			if (!near) bl = c.x, best = i;
+		}
+		if (best < 0) break;
+		claimed[best] = true;
+		vec4 c = cand[best * 2];
+		lights[k * 2]     = vec4(c.yz, c.w, 0.02);
+		lights[k * 2 + 1] = vec4(cand[best * 2 + 1].rgb, 0);
+	}
+	for (int k = 0; k < slots; ++k)
+		if (lights[k * 2].w > 0.5) ++used;
+	atomicAdd(stats[1], uint(used));
+}
+
+float Hg(float c, float g) {
+	float g2 = g * g;
+	return (1.0 - g2) / pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5);
+}
+
+void Volume(ivec2 q) {
+	vec2 qs = push.extra.xy;
+	if (q.x >= int(qs.x) || q.y >= int(qs.y)) return;
+	// (spatial IGN + a golden-ratio rotation per frame: an R1 sequence per texel, decorrelated between neighbours)
+	float j  = fract(Ign(vec2(q) + 0.5) + float(push.misc.y & 1023) * 0.61803399);
+	vec2  uv = (vec2(q) + 0.5) / qs;
+	float d  = DepthAt(uv);
+	bool  sky = IsSky(d);
+	float vz  = sky ? 2e3 : abs(ViewZ(d));
+	float scatter = 0.0;
+	// (a) the radial march toward the sun on screen.
+	if (push.sun_uv.z > 0.0 && push.sun.w > 0.0) {
+		vec2  aspect = vec2(RenderSize().x / RenderSize().y, 1.0);
+		vec2  to     = push.sun_uv.xy - uv;
+		float dist   = length(to * aspect);
+		float reach  = min(dist, 0.75);
+		int   n      = int(push.sun_uv.w);
+		vec2  stepv  = normalize(to * aspect) / aspect * (reach / float(n));
+		float acc = 0.0, wsum = 0.0, wgt = 1.0;
+		vec2  p = uv + stepv * j;
+		for (int i = 0; i < n; ++i) {
+			if (any(lessThan(p, vec2(0.0))) || any(greaterThan(p, vec2(1.0)))) break;
+			acc += LightMask(p) * wgt;
+			wsum += wgt;
+			wgt *= 0.97;
+			p += stepv;
+		}
+		float lit = wsum > 0.0 ? acc / wsum : 0.0;
+		float fall = exp(-dist * 2.2);
+		// (the sky mask is real visibility through openings: boosted at Bajo / Medio)
+		scatter += lit * fall * push.sun_uv.z * (sky ? 0.35 : 1.0) * (1.0 + 0.2 * push.extra.w);
+	}
+	// (b) the raymarch along the view ray, each step shadowed toward the sun against the depth buffer.
+	int steps = int(push.motion.w);
+	if (steps > 0 && push.sun.w > 0.0) {
+		vec3  dir  = RayDir(uv);
+		float tmax = sky ? 60.0 : min(length(ViewPos(uv, d)), 60.0);
+		vec3  L    = normalize(push.sun.xyz);
+		float lit  = 0.0;
+		float dt   = tmax / float(steps);
+		for (int i = 0; i < steps; ++i) {
+			float t = (float(i) + j) * dt;
+			vec3  x = dir * t;
+			float vis = 1.0;
+			float s   = 0.6;
+			for (int k = 0; k < 5; ++k) {
+				vec3 y = x + L * s;
+				s *= 2.2;
+				vec2 yuv;
+				if (!Project(y, yuv)) break;
+				if (any(lessThan(yuv, vec2(0.0))) || any(greaterThan(yuv, vec2(1.0)))) break;
+				float sd = DepthAt(yuv);
+				if (IsSky(sd)) continue;
+				float sz = abs(ViewZ(sd)), yz = abs(y.z);
+				if (sz < yz - 0.25 && yz - sz < 4.0 + 0.1 * yz) {
+					vis = 0.0;
+					break;
+				}
+			}
+			lit += vis * dt;
+		}
+		float phase = clamp(Hg(dot(dir, L), 0.55) / 1.0, 0.0, 6.0) / 6.0; // (1 toward the sun, ~0.03 away)
+		// The shafts' contrast, not a uniform haze: lit length / 60 m, weighted by the phase.
+		// Boost by the shaft-ness of the ray: partly lit rays (light through gaps) gain, fully lit or fully shadowed
+		// ones (a uniform haze indoors / outdoors) do not.
+		float fr = tmax > 0.0 ? clamp(lit / tmax, 0.0, 1.0) : 0.0;
+		float open = clamp(uintBitsToFloat(stats[14]), 0.0, 1.0);
+		open = isnan(open) ? 0.0 : open;
+		scatter += (lit / 60.0) * phase * 0.35 * open * (1.0 + push.extra.w * (0.1 + 0.8 * fr * (1.0 - fr)));
+	}
+	scatter *= push.sun.w;
+	imageStore(aux_out, q, vec4((isnan(scatter) || isinf(scatter)) ? 0.0 : clamp(scatter, 0.0, 4.0),
+	                            (isnan(vz) || isinf(vz)) ? 2e3 : clamp(vz, 0.01, 2e3), 0, 1));
+}
+
+bool  SameDepth(float a, float b, float tol) { return abs(a - b) < tol * max(b, 1.0); }
+bool  Bad(float x) { return isnan(x) || isinf(x); }
+float Fin(float x, float lo, float hi) { return Bad(x) ? lo : clamp(x, lo, hi); }
+// A volume texel, sanitized: (scatter 0..4, |view z| 0.01..2e3, history length 0..64); a bad depth is "far".
+vec4  VolTexel(sampler2D t, ivec2 q) {
+	vec4 v = texelFetch(t, q, 0);
+	return vec4(Fin(v.x, 0.0, 4.0), Bad(v.y) ? 2e3 : clamp(v.y, 0.01, 2e3), Fin(v.z, 0.0, 64.0), 1.0);
+}
+
+void Temporal(ivec2 q) {
+	vec2 qs = push.extra.xy;
+	if (q.x >= int(qs.x) || q.y >= int(qs.y)) return;
+	ivec2 qm = ivec2(qs) - 1;
+	vec4  c0 = VolTexel(aux_tex, q);
+	float vz = c0.y;
+	bool  sky = vz >= 1999.0;
+	// The raw neighbourhood (depth-aware moments; the centre always counts).
+	float m1 = 0.0, m2 = 0.0, wn = 0.0;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			vec4 t = VolTexel(aux_tex, clamp(q + ivec2(x, y), ivec2(0), qm));
+			if (!(x == 0 && y == 0) && !SameDepth(t.y, vz, 0.2)) continue;
+			m1 += t.x, m2 += t.x * t.x, wn += 1.0;
+		}
+	m1 /= max(wn, 1.0), m2 /= max(wn, 1.0);
+	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
+	float cur = c0.x;
+	// (no or rejected history: the neighbourhood's mean, less noisy than one sample)
+	float acc = m1, n = 1.0;
+	if (push.motion.z > 0.0) {
+		vec2 uv = (vec2(q) + 0.5) / qs;
+		vec2 mv = textureLod(motion_tex, uv, 0).xy * push.motion.xy; // (render pixels)
+		// (an invalid motion vector: NaN, or more than a screen: no history)
+		bool mv_ok = !(Bad(mv.x) || Bad(mv.y)) && all(lessThan(abs(mv), RenderSize()));
+		vec2 pq = mv_ok ? (uv + mv / RenderSize()) * qs - 0.5 : vec2(-10.0);
+		float hs = 0.0, hn = 0.0, hw = 0.0;
+		if (mv_ok && all(greaterThan(pq, vec2(-1.0))) && all(lessThan(pq, qs))) {
+			ivec2 p0 = ivec2(floor(pq));
+			vec2  f  = clamp(pq - vec2(p0), 0.0, 1.0);
+			for (int k = 0; k < 4; ++k) {
+				ivec2 o  = ivec2(k & 1, k >> 1);
+				ivec2 pp = p0 + o;
+				if (any(lessThan(pp, ivec2(0))) || any(greaterThan(pp, qm))) continue;
+				vec4  h  = VolTexel(vol_hist, pp);
+				float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+				// (a length below 1 is a texel never written: no history)
+				if (h.z < 0.5 || !SameDepth(h.y, vz, 0.2)) continue;
+				hs += h.x * bw, hn += h.z * bw, hw += bw;
+			}
+		}
+		if (hw > 0.3) {
+			float h  = hs / hw;
+			// Still = the camera and this pixel: the history may grow long (more in dark pixels, where the tonemap
+			// shows the noise most); moving: ~10 frames, as before. The sky (no motion of its own): short.
+			float mpix  = length(mv);
+			float still = 1.0 - smoothstep(0.1, 1.5, mpix);
+			float e     = GameExposure();
+			float dark  = 1.0 - smoothstep(0.03, 0.3, Luma(Safe(textureLod(color_tex, uv, 0).rgb)) * e);
+			float nmax  = sky ? 6.0 : mix(10.0, mix(20.0, 32.0, dark), still);
+			float k     = mix(1.25, 3.0, still);
+			h   = clamp(h, max(m1 - k * sigma, 0.0) - 1e-3, m1 + k * sigma + 1e-3);
+			n   = clamp(hn + 1.0, 1.0, nmax); // (partly rejected history: shorter)
+			acc = mix(h, cur, 1.0 / n);
+		}
+	}
+	imageStore(vol_out, q, vec4(Fin(acc, 0.0, 4.0), vz, n, 1));
+}
+
+void Spatial(ivec2 q) {
+	vec2 qs = push.extra.xy;
+	if (q.x >= int(qs.x) || q.y >= int(qs.y)) return;
+	ivec2 qm = ivec2(qs) - 1;
+	vec4  c  = VolTexel(aux_tex, q);
+	int   st = c.z < 4.0 ? 2 : 1; // (a short history: wider)
+	// (depth only, never the value: bright shafts are blurred like dark fog; 10 % of the depth: grazing floors keep
+	// their neighbours)
+	float s = c.x * 4.0, w = 4.0;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			if (x == 0 && y == 0) continue;
+			vec4  t  = VolTexel(aux_tex, clamp(q + ivec2(x, y) * st, ivec2(0), qm));
+			float gw = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
+			float dw = exp(-abs(t.y - c.y) / max(0.1 * c.y, 0.1));
+			s += t.x * gw * dw, w += gw * dw;
+		}
+	imageStore(aux_out, q, vec4(Fin(s / w, 0.0, 4.0), c.y, c.z, 1));
+}
+
+void Composite(ivec2 p) {
+	vec2 rs = RenderSize();
+	if (p.x >= int(rs.x) || p.y >= int(rs.y)) return;
+	vec2  uv  = (vec2(p) + 0.5) / rs;
+	vec3  c   = Safe(texelFetch(color_tex, p, 0).rgb);
+	float e   = GameExposure();
+	float d   = texelFetch(depth_tex, p, 0).r;
+	bool  sky = IsSky(d);
+	float vz  = sky ? 2e3 : abs(ViewZ(d));
+	// The volume, upsampled depth-aware (4 quarter texels).
+	vec2  qs = push.extra.xy;
+	vec2  qp = uv * qs - 0.5;
+	ivec2 q0 = ivec2(floor(qp));
+	vec2  f  = qp - vec2(q0);
+	// (vol-fix) No depth-blind fallback: where none of the 4 texels shares this pixel's depth (a thin far silhouette
+	// against the sky) the old +1e-4 bilinear term blended the sky's bright scatter onto it: the white streaks. Now the
+	// texel nearest in depth is taken alone, and a sky texel never lends to geometry (or geometry to sky).
+	float vs = 0.0, ws = 0.0, best = 1e30, bv = 0.0;
+	for (int k = 0; k < 4; ++k) {
+		ivec2 o  = ivec2(k & 1, k >> 1);
+		ivec2 qq = clamp(q0 + o, ivec2(0), ivec2(qs) - 1);
+		vec2  v  = VolTexel(vol_hist, qq).xy;
+		float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+		float rd = abs(v.y - vz) / max(0.05 * vz, 0.05);
+		if ((v.y >= 1999.0) != sky) rd = 1e6;
+		if (rd < best) best = rd, bv = v.x;
+		float w  = bw * exp(-rd);
+		vs += v.x * w, ws += w;
+	}
+	float vol = ws > 1e-3 ? Fin(vs / ws, 0.0, 4.0) : (best < 1e5 ? Fin(bv, 0.0, 4.0) : 0.0);
+	// (the far backdrop already carries the game's fog: half there)
+	vol *= mix(1.0, 0.5, smoothstep(80.0, 300.0, vz));
+	vec3 add = vol * sunc.rgb * push.size.z * 0.6;
+	// The lights' halos: in-scatter of a point light along the view ray up to the surface.
+	int slots = int(hdr.z);
+	if (slots > 0) {
+		vec3  dir  = RayDir(uv);
+		float tmax = sky ? 200.0 : length(ViewPos(uv, d));
+		float R    = hdr.w;
+		for (int k = 0; k < slots; ++k) {
+			vec4 a = lights[k * 2];
+			if (a.w <= 0.0) continue;
+			vec3  lp = ViewPos(a.xy, a.z);
+			float ld = length(lp);
+			float fade = smoothstep(45.0, 12.0, ld) * smoothstep(6.0, 14.0, ld) * smoothstep(0.0, 1.0, a.w);
+			// Fade by the halo's size on screen (its 4 R cut as a fraction of the screen height): a near, small light
+			// would cover a large part of the image with a milky haze.
+			float scr = 2.0 * R * abs(push.proj.y) / max(ld, 1e-3);
+			fade *= smoothstep(0.45, 0.2, scr);
+			if (fade <= 0.0) continue;
+			float t0 = dot(lp, dir);
+			float h  = max(length(lp - dir * t0), 0.3 * R);
+			// The closed-form integral of R / (h^2 + (t - t0)^2) over t in [0, tmax] (dimensionless), x a soft radius cut.
+			float I  = (atan((tmax - t0) / h) - atan(-t0 / h)) * (R / h);
+			I *= smoothstep(4.0 * R, 0.5 * R, h);
+			I = min(I, 2.0); // (clamp: the core of a light the ray grazes stays a glow, not a flare)
+			vec3  lc = lights[k * 2 + 1].rgb;
+			float ll = min(Luma(lc), 12.0);
+			add += Hue(lc) * (ll * 0.01 * I * fade * push.extra.z);
+		}
+	}
+	// Hue-preserving soft cap on the added (exposed) luminance, less over already bright pixels.
+	float al  = Luma(add);
+	float cap = push.size.w;
+	if (al > 1e-6) {
+		float bl = Luma(c) * e;
+		float nl = cap * (1.0 - exp(-al / cap)) / (1.0 + 0.5 * bl);
+		add *= nl / al;
+	}
+	// (our light never blackens a pixel: a bad value is dropped, the game's color kept)
+	add = (any(isnan(add)) || any(isinf(add))) ? vec3(0) : max(add, vec3(0));
+	if ((push.misc.z & 2) != 0) c = vec3(0); // (KYTY_GODRAYS_DEBUG=1: our light alone, on black)
+	imageStore(out_img, p, vec4(Safe(c + add / e), 1.0));
+}
+
+void main() {
+	if (push.misc.x == 0) Lights(gl_WorkGroupID, gl_LocalInvocationIndex);
+	else if (push.misc.x == 1) {
+		if (gl_GlobalInvocationID.xy == uvec2(0)) Track();
+	} else if (push.misc.x == 2) Volume(ivec2(gl_GlobalInvocationID.xy));
+	else if (push.misc.x == 4) Temporal(ivec2(gl_GlobalInvocationID.xy));
+	else if (push.misc.x == 5) Spatial(ivec2(gl_GlobalInvocationID.xy));
+	else Composite(ivec2(gl_GlobalInvocationID.xy));
+}

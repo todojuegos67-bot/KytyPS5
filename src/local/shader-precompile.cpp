@@ -8,6 +8,7 @@
 //   kyty_shader_precompile --game <dir> --make-seeds <file> [--states <pass-states.json>]
 //                          [--stages cs,gfx] [--limit <n>]
 //   kyty_shader_precompile --game <dir> --param <file>
+//   kyty_shader_precompile --game <dir> --list-programs <file.tsv> [--dump-dir <dir> --dump-filter <word,word,...>]
 //   kyty_shader_precompile --game <dir> --seeds <file> --make-hints <file> --recorded <file> [--recorded <file>...]
 //   kyty_shader_precompile --game <dir> --seeds <file> --apply-hints <file> --out <file>
 //
@@ -105,6 +106,9 @@ int main(int argc, char* argv[]) {
 	std::filesystem::path            param_copy;          // --param
 	std::filesystem::path              make_hints, apply_hints; // --make-hints, --apply-hints
 	std::vector<std::filesystem::path> recordings;              // --recorded (--make-hints)
+	std::filesystem::path              list_programs, dump_dir; // --list-programs, --dump-dir (refl7)
+	std::string                        dump_filter = "iblfullscreen,runtimelightingcompute,ssr,water,brdfmodifiers,"
+	                                                 "wetitem,displaytexture,debug,lightresolve,compositeview,projecteddecal";
 	options.threads = std::max(1u, std::thread::hardware_concurrency());
 	for (int i = 1; i < argc; i++) {
 		const std::string_view arg   = argv[i];
@@ -162,6 +166,12 @@ int main(int argc, char* argv[]) {
 			make_hints = argv[++i];
 		} else if (arg == "--apply-hints") {
 			apply_hints = argv[++i];
+		} else if (arg == "--list-programs") {
+			list_programs = argv[++i];
+		} else if (arg == "--dump-dir") {
+			dump_dir = argv[++i];
+		} else if (arg == "--dump-filter") {
+			dump_filter = argv[++i];
 		} else if (arg == "--recorded") {
 			recordings.emplace_back(argv[++i]);
 		} else if (arg == "--states") {
@@ -203,6 +213,13 @@ int main(int argc, char* argv[]) {
 		uint32_t written = 0;
 		out.Write(text, &written);
 		return written == text.Size() ? 0 : 1;
+	}
+	// The program list (static-seeds.cpp ListPrograms): no Vulkan device, none of the emulator's subsystems.
+	if (!list_programs.empty()) {
+		if (game.empty()) return Usage();
+		const int code = StaticSeeds::ListPrograms(game, list_programs, dump_dir, dump_filter);
+		std::fflush(nullptr);
+		std::_Exit(code);
 	}
 	// Specialization hints (shader-hints.h): no Vulkan device, none of the emulator's subsystems.
 	if (!make_hints.empty() || !apply_hints.empty()) {
@@ -275,6 +292,6 @@ int main(int argc, char* argv[]) {
 	                            : PipelineCache::Precompile(graphics, options, left_out);
 	std::printf("Shader precompile: %s\n", !done ? "failed" : left_out != 0 ? "partial" : "complete");
 	std::fflush(nullptr);
-	// 3: pipelines' binaries were left out (PipelineBinaryWriter): run this shard as two.
+	// 3: pipelines' binaries were left out (PipelineBinaryWriter), or the shard stopped at its capture cap: run it as two.
 	std::_Exit(!done ? 1 : left_out != 0 ? 3 : 0);
 }

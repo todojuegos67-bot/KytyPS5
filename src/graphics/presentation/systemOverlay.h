@@ -43,6 +43,15 @@ struct SystemOverlayHud {
 	std::string status; // the progress line (empty: none), over a bar
 	float       status_fraction = 0.0f;
 	std::string notice; // a text panel (empty: none)
+	// KYTY_RTLS_DEBUG (rt-local-lights.h): markers over the game image, in swapchain pixels (shape 0 circle, 1 cross,
+	// 2 text only; rgba as IM_COL32).
+	struct Marker {
+		float       x = 0, y = 0, radius = 0;
+		uint32_t    rgba  = 0xffffffffu;
+		int         shape = 0;
+		std::string label;
+	};
+	std::vector<Marker> markers;
 	vk::Rect2D  region; // the game image in the swapchain image
 	vk::Rect2D  drawn;  // out: the panels, in swapchain pixels
 };

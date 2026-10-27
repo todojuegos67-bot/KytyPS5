@@ -1,0 +1,789 @@
+#version 460
+// (KYTY_HWRT_SHADOW: built a second time with KYTY_HWRT_SHADOW defined, rtsun_hw_spv.h: ray queries into the scene TLAS
+// (hwrt-scene.cpp) toward the sun join the cascades' visibility in the trace pass; see HwSun below.)
+#ifdef KYTY_HWRT_SHADOW
+#extension GL_EXT_ray_query : require
+#endif
+// KYTY_RT_SUN=1|2|3 ("Sombras RT del sol"; frame-gen.cpp RtSun*, the CShadowApply pass with this shader): the sun's
+// visibility recomputed from the game's own cascaded shadow maps and put in place of the game's own shadow-map lookup.
+// Built from cshadow.comp (KYTY_RT_SHADOWS, which stays as it was); the helpers, the contact march, the temporal and
+// a-trous filters are its own. Modes (misc.x):
+//   0 trace:     the new visibility V_new at the trace size: the cascade holding the pixel (blended stochastically into
+//                the next one over a band at its edge: no seams once accumulated), normal offset by one texel, a
+//                contact-hardening PCSS (blocker search over the sun's penumbra cone, then a PCF disk as wide as the
+//                penumbra those blockers cast: sharp at contact, soft far from the caster; at least a texel wide: no
+//                stair steps), a receiver-plane bias; times a short screen-space contact ray (levels 2, 3) for what the
+//                shadow maps' texels and the game's bias lose (peter-panning at feet, ledges, small props)
+//   1 temporal / 2 a-trous: cshadow.comp's denoise on V_new
+//   4 composite: V_game = the game's own lookup emulated on the same maps (the same cascade choice, offset and bias, a
+//                PCF tent); the lit color relit as color * (1 + R N.L V_new) / (1 + R N.L V_game), R the sun's radiance
+//                over the ambient's (measured: mode 7): the sun term's visibility replaced, albedo and ambient kept;
+//                identical visibilities change nothing. KYTY_RT_SUN_DEBUG views: 1 V_game, 2 V_new, 3 the factor, 4 cascades.
+//   5 calibrate: world up and the screen's y convention (cshadow.comp's)
+//   6 probe:     cshadow.comp's sun-facing / facing-away luminance probe (R's fallback)
+//   7 sun calibration (render / 8): which of 8 conventions (light clip y flip x stored depth = z, z/2 + 1/2, 1 - z,
+//                1/2 - z/2) makes lit receivers land on their own depth in the map (votes, words 80..87); the signed
+//                stored - receiver height of the decided one (32 bins over -0.25..0.25 m, words 88..119: the lit
+//                cluster's spread sets the bias); R: the luminance of sun-facing pixels V_game calls lit against those
+//                it calls shadowed (words 120..124)
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2) uniform sampler2D motion_tex;
+layout(binding = 3) uniform sampler2D src_a;
+layout(binding = 4) uniform sampler2D src_b;
+layout(binding = 5) uniform sampler2D gbuf_cur;
+layout(binding = 6) uniform sampler2D gbuf_prev;
+layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
+layout(binding = 8, rgba16f) uniform writeonly image2D gbuf_out;
+layout(binding = 9) uniform sampler2D aux_tex;
+layout(binding = 10, rgba16f) uniform writeonly image2D aux_out;
+layout(binding = 11, std430) buffer VoteBuf { uint v[]; } vote_buf; // per slot 16 words; statistics from word 64
+
+layout(push_constant) uniform Push {
+	vec4  proj;      // M[0], M[5], M[8], M[9] (row vectors)
+	vec4  depth_map; // A = M[10], B = M[14], C = M[11], D = M[15]
+	vec4  motion;    // motion_scale.xy, render size.xy
+	vec4  trace;     // trace size.xy, strength, length scale
+	ivec4 misc;      // mode, frame, level, flags (bit0 reset, bit1 history valid, bit2 row 0 = NDC y +1); slot: misc.w >> 8
+	vec4  extra;     // a-trous step; light direction in view space (toward the light) in yzw
+	vec4  cand[4];   // calibrate: world X, Y, Z in view space (w 1 = in use); cand[3]: screen cap px, thickness
+	                 // scale, fade start, fade end (m)
+	vec4  tune;      // x: 1 / K, K the game's sun-lit to ambient luminance ratio (the light probe's, >= 1.25)
+} push;
+// The cascades: our copy of the game's sun shadow-map layers (frame-gen.cpp RtSunAfterDispatch), sampled raw.
+layout(binding = 12) uniform sampler2DArray casc_tex;
+struct Cascade {
+	vec4 r0, r1, r2; // our view space -> the cascade's light clip (rows; xyz . p + w)
+	vec4 info;       // x: layer in casc_tex, y: texel size (m), z: metres per light clip z unit, w: 1
+};
+layout(binding = 13, std430) readonly buffer SunBuf {
+	vec4    hdr;  // x: cascades (sorted finest first), y: penumbra per metre (2 tan(angle / 2)), z: R, w: strength
+	vec4    hyp;  // x: convention (-1: undecided), y: bias (m), z: debug view, w: shadow-map size (texels)
+	vec4    opt;  // x: game PCF radius (taps), y: contact ray strength, z: cascade blend band (uv), w: max brightening
+	vec4    opt2; // x: max occluder distance for the penumbra search (m)
+	Cascade c[8];
+#ifdef KYTY_HWRT_SHADOW
+	vec4    inv[4]; // clip -> the TLAS's world (rows: the inverse of the G-buffer view-projection the capture inverts)
+	vec4    hw;     // x: level (+8: rays beyond the cascades; 0: no TLAS), y: far-hit margin below the cascades' V, z: ray length (m), w: contact range (m)
+	vec4    cam;    // xyz: the camera in world space
+	vec4    sunw;   // xyz: world direction toward the sun (the latched one the light's view direction comes from)
+	vec4    w0, w1, w2; // the cascades' view -> world (the self-test's other reconstruction)
+#endif
+} sun;
+#ifdef KYTY_HWRT_SHADOW
+layout(binding = 14) uniform accelerationStructureEXT tlas;
+#endif
+
+vec2 RenderSize() { return push.motion.zw; }
+vec2 TraceSize() { return push.trace.xy; }
+float YSign() { return (push.misc.w & 4) != 0 ? -1.0 : 1.0; }
+
+float ViewZ(float d) {
+	float den = d * push.depth_map.z - push.depth_map.x;
+	return abs(den) > 1e-12 ? (push.depth_map.y - d * push.depth_map.w) / den : 1e6;
+}
+vec3 ViewPosY(vec2 uv, float d, float ys) {
+	float z  = ViewZ(d);
+	float w  = z * push.depth_map.z + push.depth_map.w;
+	vec2  nd = vec2(uv.x * 2.0 - 1.0, ys * (uv.y * 2.0 - 1.0));
+	return vec3((nd.x * w - z * push.proj.z) / push.proj.x, (nd.y * w - z * push.proj.w) / push.proj.y, z);
+}
+vec3 ViewPos(vec2 uv, float d) { return ViewPosY(uv, d, YSign()); }
+vec3 Project(vec3 p) {
+	float w  = p.z * push.depth_map.z + push.depth_map.w;
+	vec2  nd = vec2(p.x * push.proj.x + p.z * push.proj.z, p.y * push.proj.y + p.z * push.proj.w) / w;
+	return vec3(nd.x * 0.5 + 0.5, YSign() * nd.y * 0.5 + 0.5, (p.z * push.depth_map.x + push.depth_map.y) / w);
+}
+bool IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e3; }
+float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+// The linear depth's change per trace pixel on this surface (gbuf .w; the smaller side each way, sky excluded): a
+// ground plane seen at a grazing angle 50 m away changes ~5 % per pixel, so relative depth tests alone reject it.
+float DepthSlope(vec2 uv, float z) {
+	vec2  ts = 1.0 / TraceSize();
+	float xp = textureLod(gbuf_cur, uv + vec2(ts.x, 0), 0).w, xn = textureLod(gbuf_cur, uv - vec2(ts.x, 0), 0).w;
+	float yp = textureLod(gbuf_cur, uv + vec2(0, ts.y), 0).w, yn = textureLod(gbuf_cur, uv - vec2(0, ts.y), 0).w;
+	float gx = min(abs(xp - z), abs(xn - z)), gy = min(abs(yp - z), abs(yn - z));
+	return min(gx + gy, 0.25 * z); // (a silhouette both ways: no plane to follow)
+}
+
+vec3 NormalAtY(vec2 uv, vec3 p, float ys) {
+	vec2 t  = 1.0 / RenderSize();
+	vec3 px = ViewPosY(uv + vec2(t.x, 0), textureLod(depth_tex, uv + vec2(t.x, 0), 0).r, ys);
+	vec3 nx = ViewPosY(uv - vec2(t.x, 0), textureLod(depth_tex, uv - vec2(t.x, 0), 0).r, ys);
+	vec3 py = ViewPosY(uv + vec2(0, t.y), textureLod(depth_tex, uv + vec2(0, t.y), 0).r, ys);
+	vec3 ny = ViewPosY(uv - vec2(0, t.y), textureLod(depth_tex, uv - vec2(0, t.y), 0).r, ys);
+	// The smaller-step side each way (no normals across silhouettes).
+	vec3 dx = abs(px.z - p.z) < abs(p.z - nx.z) ? px - p : p - nx;
+	vec3 dy = abs(py.z - p.z) < abs(p.z - ny.z) ? py - p : p - ny;
+	vec3 n  = cross(dx, dy);
+	float l = length(n);
+	n = l > 1e-20 ? n / l : normalize(-p);
+	if (dot(n, -p) < 0.0) n = -n;
+	return n;
+}
+vec3 NormalAt(vec2 uv, vec3 p) { return NormalAtY(uv, p, YSign()); }
+
+// How near the pixel is (1 within 6 m, 0 beyond 40 m): rays, strength and trust are generous near the camera
+// (contact shadows under the character, barrels, battlements) and conservative far away, where a pixel spans
+// decimetres, depth normals are the mesh's flat facets, and the game's shadow maps already have the shapes.
+float NearW(float z) { return 1.0 - smoothstep(6.0, 40.0, z); }
+
+// The march: occlusion toward the light (0 lit, 1 occluded by something in the depth buffer).
+// l: the ray's direction (jittered within the sun's penumbra cone); ndl: the receiver's facing to the true sun.
+float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
+	int   q     = push.misc.z;
+	int   steps = q >= 3 ? 48 : q >= 2 ? 28 : 16; // (10-24) more: the rays are longer
+	float z     = abs(p.z);
+	float nw    = NearW(z);
+	// World length (full near, 30 % far), capped to a screen length (the detail scale Bend's shadows work at; long
+	// rays are the shadow maps' business and only double them).
+	float px_m  = abs(push.proj.y) * 0.5 * RenderSize().y / max(z, 1e-3);
+	float cap   = push.cand[3].x * RenderSize().y / 1440.0;
+	// (10-24 far) Past 60 m, with a fade beyond 120 m (KYTY_RT_SHADOWS_FADE > 60), the world length grows again with
+	// the distance (geometry there is metres across: a 0.9 m ray finds nothing), still capped to the screen length.
+	float farx  = push.cand[3].w > 121.0 ? smoothstep(60.0, max(push.cand[3].w * 0.5, 61.0), z) : 0.0;
+	float len   = min((q >= 3 ? 1.25 : 1.0) * push.trace.w * mix(0.45, 1.0, nw) + farx * 0.03 * z, cap / px_m);
+	// Thickness: an occluder is taken as this deep behind its depth-buffer surface (thin-object leak guard). (10-24:
+	// 0.2 m near to 0.45 m far; it grew to 1 m at 47 m, and rays passing up to 1 m behind a cliff's front faces
+	// made hard dark shards there.)
+	// (10-24 far) plus ~2 pixels' footprint far away (0 m at 50 m, ~0.4 m at 300 m): the depth buffer's own steps,
+	// not a fixed metre that let rays pass behind cliffs; the bias adds a slope term (half a pixel, more when grazing).
+	float foot  = 1.0 / px_m;
+	// (rtsart 10-24: a narrower band; rays that dip far behind a depth step (a pillar's edge, a foreground body)
+	// are not occluded by it, and an occluder must be confirmed by two consecutive samples.)
+	float thick = (clamp(0.12 + 0.004 * z, 0.12, 0.3) + farx * 1.0 * foot) * push.cand[3].y;
+	float bias  = 0.004 * z + 0.01 + farx * foot * mix(0.5, 1.5, 1.0 - ndl);
+	// The occluder must stand clear of the receiver's own plane: a ray over a low-poly surface (a cliff's flat facets
+	// in the depth buffer, smooth in the game's shading) hits the next facet of a crease within decimetres. The
+	// height of the ray over that plane is t * N.L: a least distance, a few cm near, ~0.25 m at 50 m.
+	float t_min = (0.04 + 0.008 * z) / max(ndl, 0.3);
+	float jit   = Ign(vec2(pixel) + float(push.misc.y % 64) * 5.588238);
+	vec3  o     = p + n * (0.006 * z + 0.02); // (normal bias: no self-hits at grazing angles)
+	// The first sample one pixel out (no self-hit on the start texel).
+	float t0    = 1.0 / px_m;
+	if (t0 >= len) return 0.0;
+	int hits = 0;
+	for (int s = 0; s < steps; ++s) {
+		float k  = (float(s) + jit) / float(steps);
+		float t  = t0 + (len - t0) * k * k; // denser near the surface: contact detail
+		vec3  qp = o + l * t;
+		vec3  pr = Project(qp);
+		// Off screen or near the edge: unknown, never an occluder (fail safe: no shadow).
+		if (any(lessThan(pr.xy, vec2(0.01))) || any(greaterThan(pr.xy, vec2(0.99)))) break;
+		float sd = textureLod(depth_tex, pr.xy, 0).r;
+		if (IsSky(sd)) { hits = 0; continue; }
+		float oz    = abs(ViewZ(sd));
+		float delta = abs(qp.z) - oz; // > 0: the ray point is behind the depth surface there
+		// A ray far behind a depth step has left the occluder's volume: stop (a foreground object, not a caster).
+		if (delta > 4.0 * thick) break;
+		bool cand = delta > bias && delta < thick && t > t_min;
+		if (cand) {
+			// The occluder must be solid: its depth-buffer neighbours agree (alpha-tested foliage, grass, ivy and
+			// silhouettes are noisy there and are no occluders).
+			vec2  rs = 1.5 / RenderSize();
+			float a0 = abs(ViewZ(textureLod(depth_tex, pr.xy + vec2(rs.x, 0), 0).r));
+			float a1 = abs(ViewZ(textureLod(depth_tex, pr.xy - vec2(rs.x, 0), 0).r));
+			float a2 = abs(ViewZ(textureLod(depth_tex, pr.xy + vec2(0, rs.y), 0).r));
+			float a3 = abs(ViewZ(textureLod(depth_tex, pr.xy - vec2(0, rs.y), 0).r));
+			float tol = 0.02 * oz + 0.05;
+			// A plane passes through: a0 - oz ~ oz - a1 (and y likewise); anything else is broken depth.
+			bool solid = abs(a0 + a1 - 2.0 * oz) < tol && abs(a2 + a3 - 2.0 * oz) < tol;
+			cand = solid;
+		}
+		hits = cand ? hits + 1 : 0;
+		if (hits >= 2) {
+			// Screen-edge and ray-end fades (no hard cut where the ray leaves what the screen knows), a softer hit
+			// near the thickness limit and near the least distance.
+			vec2  e    = min(pr.xy, 1.0 - pr.xy);
+			float edge = smoothstep(0.0, 0.04, min(e.x, e.y));
+			float end  = 1.0 - smoothstep(0.85, 1.0, k); // (10-24) only the last stretch (was 0.65: rays felt short)
+			float soft = 1.0 - smoothstep(0.5 * thick, thick, delta);
+			float near = smoothstep(t_min, 2.0 * t_min, t);
+			// Softer with the distance to the occluder: contact dark, longer ones faint.
+			float dist = mix(1.0, 0.35, clamp(t / len, 0.0, 1.0));
+			return edge * end * soft * near * dist;
+		}
+	}
+	return 0.0;
+}
+
+
+// ---- the cascades (KYTY_RT_SUN) ----
+int   Hyp() { return int(floor(sun.hyp.x + 0.5)); }
+float MapSize() { return max(sun.hyp.w, 1.0); }
+vec3 LightClip(int i, vec3 p) {
+	vec4 q = vec4(p, 1.0);
+	return vec3(dot(sun.c[i].r0, q), dot(sun.c[i].r1, q), dot(sun.c[i].r2, q));
+}
+vec2 CascUv(vec3 lc, int h) { return vec2(lc.x * 0.5 + 0.5, (h & 1) != 0 ? 0.5 - 0.5 * lc.y : 0.5 + 0.5 * lc.y); }
+// The stored value back to light clip z under convention h (>> 1: s = z, z / 2 + 1 / 2, 1 - z, 1 / 2 - z / 2).
+vec4 StoredToZ4(vec4 s, int h) {
+	int m = h >> 1;
+	return m == 0 ? s : m == 1 ? s * 2.0 - 1.0 : m == 2 ? 1.0 - s : 1.0 - 2.0 * s;
+}
+float StoredToZ(float s, int h) { return StoredToZ4(vec4(s), h).x; }
+// Metres toward the sun per light clip z unit (signed: + when z grows toward the light).
+float TowardLight(int i, vec3 l) { return (dot(sun.c[i].r2.xyz, l) >= 0.0 ? 1.0 : -1.0) * sun.c[i].info.z; }
+// The finest cascade that holds p with `margin` texels to spare (-1: none).
+int PickCascade(vec3 p, int h, float margin) {
+	int   n = int(sun.hdr.x + 0.5);
+	float m = margin / MapSize();
+	for (int i = 0; i < n && i < 8; ++i) {
+		vec2 u = CascUv(LightClip(i, p), h);
+		if (all(greaterThan(u, vec2(m))) && all(lessThan(u, vec2(1.0 - m)))) return i;
+	}
+	return -1;
+}
+// The receiver's tilt to the light (tan of the angle between its normal and the sun): the receiver-plane bias' slope.
+float TanTilt(float ndl) { return clamp(sqrt(max(1.0 - ndl * ndl, 0.0)) / max(ndl, 0.05), 0.0, 6.0); }
+// One bilinear compare tap: the lit share of the 2x2 texels around uv (dh = stored - receiver height toward the light;
+// lit when it is not above the bias).
+float PcfTap(vec2 uv, float layer, float zr, float tl, float bias, int h) {
+	vec4 dh  = (StoredToZ4(textureGather(casc_tex, vec3(uv, layer), 0), h) - zr) * tl;
+	vec4 lit = vec4(lessThanEqual(dh, vec4(bias)));
+	vec2 f   = fract(uv * MapSize() - 0.5);
+	// (gather order: x (0, 1), y (1, 1), z (1, 0), w (0, 0))
+	return mix(mix(lit.w, lit.z, f.x), mix(lit.x, lit.y, f.x), f.y);
+}
+// The cascade's normal-offset receiver: one texel along the normal (the same for the game emulation and ours).
+vec3 Offset(int i, vec3 p, vec3 n) { return p + n * sun.c[i].info.y; }
+// The game's own lookup, emulated: the finest cascade holding the pixel, a PCF tent of bilinear compare taps
+// (KYTY_RT_SUN_GAMEPCF radius), the measured bias. ci: the cascade (-1: none, lit).
+float GameVis(vec3 p, vec3 n, float ndl, vec3 l, out int ci) {
+	int h = Hyp();
+	int r = int(sun.opt.x + 0.5);
+	ci = h < 0 ? -1 : PickCascade(p, h, float(r) + 2.0);
+	if (ci < 0) return 1.0;
+	float t    = sun.c[ci].info.y;
+	vec3  lc   = LightClip(ci, Offset(ci, p, n));
+	vec2  uv   = CascUv(lc, h);
+	float tl   = TowardLight(ci, l);
+	float tilt = TanTilt(ndl);
+	float sum = 0.0, wsum = 0.0;
+	for (int y = -r; y <= r; ++y)
+		for (int x = -r; x <= r; ++x) {
+			float w    = float(r + 1 - abs(x)) * float(r + 1 - abs(y));
+			float bias = sun.hyp.y + t * (0.5 + tilt * (1.0 + length(vec2(x, y))));
+			sum += w * PcfTap(uv + vec2(x, y) / MapSize(), sun.c[ci].info.x, lc.z, tl, bias, h);
+			wsum += w;
+		}
+	return sum / max(wsum, 1e-6);
+}
+vec2 Vogel(int j, int n, float a0) {
+	float r = sqrt((float(j) + 0.5) / float(n));
+	float a = float(j) * 2.39996323 + a0;
+	return r * vec2(cos(a), sin(a));
+}
+// Our visibility: PCSS on the cascades (see the header). ci: the cascade used (-1: none).
+float SunVis(vec3 p, vec3 n, float ndl, vec3 l, ivec2 pixel, out int ci) {
+	int   h  = Hyp();
+	int   q  = push.misc.z;
+	int   nb = q >= 3 ? 16 : q >= 2 ? 12 : 8;
+	int   np = q >= 3 ? 24 : q >= 2 ? 16 : 12;
+	float fr = float(push.misc.y % 64);
+	ci = h < 0 ? -1 : PickCascade(p, h, 4.0);
+	if (ci < 0) return 1.0;
+	// The blend band: near the cascade's edge the next (coarser) one is taken instead, with a probability ramping to 1
+	// at the edge: the accumulated result fades between them (no seam).
+	int n_c = int(sun.hdr.x + 0.5);
+	if (ci + 1 < n_c && sun.opt.z > 0.0) {
+		vec2  u    = CascUv(LightClip(ci, p), h);
+		float edge = min(min(u.x, 1.0 - u.x), min(u.y, 1.0 - u.y));
+		float pr   = 1.0 - smoothstep(4.0 / MapSize(), sun.opt.z, edge);
+		if (Ign(vec2(pixel) + fr * 3.17 + 41.0) < pr) {
+			vec2 u2 = CascUv(LightClip(ci + 1, p), h);
+			if (all(greaterThan(u2, vec2(4.0 / MapSize()))) && all(lessThan(u2, vec2(1.0 - 4.0 / MapSize())))) ci = ci + 1;
+		}
+	}
+	float t     = sun.c[ci].info.y;
+	float layer = sun.c[ci].info.x;
+	vec3  lc    = LightClip(ci, Offset(ci, p, n));
+	vec2  uv    = CascUv(lc, h);
+	float tl    = TowardLight(ci, l);
+	float tilt  = TanTilt(ndl);
+	float k     = sun.hdr.y;
+	float uvm   = 1.0 / (t * MapSize()); // (uv per metre)
+	float base  = sun.hyp.y + t * 0.5;
+	float a0    = 6.2831853 * Ign(vec2(pixel) + fr * 5.588238);
+	// Blockers within the penumbra cone of the farthest occluder that matters (opt2.x metres above the receiver).
+	float rs   = clamp(k * sun.opt2.x, 1.5 * t, 24.0 * t);
+	float bsum = 0.0, bn = 0.0;
+	for (int j = 0; j < nb; ++j) {
+		vec2  o    = Vogel(j, nb, a0) * rs;
+		float bias = base + tilt * (length(o) + t);
+		vec4  dh   = (StoredToZ4(textureGather(casc_tex, vec3(uv + o * uvm, layer), 0), h) - lc.z) * tl;
+		vec4  isb  = vec4(greaterThan(dh, vec4(bias)));
+		bsum += dot(isb, dh);
+		bn += dot(isb, vec4(1.0));
+	}
+	if (bn < 0.5) return 1.0;
+	// The penumbra those blockers cast (the sun's angular size x their mean height above the receiver), at least a
+	// texel (the edge filtered, never a stair step), at most the search disk.
+	float rf  = clamp(k * (bsum / bn), 0.75 * t, rs);
+	float sum = 0.0;
+	for (int j = 0; j < np; ++j) {
+		vec2 o = Vogel(j, np, a0 + 1.7) * rf;
+		sum += PcfTap(uv + o * uvm, layer, lc.z, tl, base + tilt * (length(o) + t), h);
+	}
+	return sum / float(np);
+}
+
+#ifdef KYTY_HWRT_SHADOW
+// (KYTY_HWRT_SHADOW) The sun's occlusion by the captured scene: rays from the receiver toward the sun (jittered within its
+// disc: the temporal and a-trous passes turn them into a penumbra) through the TLAS. Inside a cascade (in_casc) the game's
+// maps keep the say on what is far: a hit within the contact range (scaled with the distance) is full shadow, the shadow
+// maps' bias and texels lose those; a farther one weighs hw.y (the captured geometry is opaque: alpha-tested leaves would
+// be solid cards). Beyond the cascades (no shadow map at all) every hit counts: the far-distance shadows.
+// (hwrt2s 10-26 accuracy) Positions as the reflections' HwToWorld (rt-reflections.comp, checked in game): a view-space
+// point -> its uv and depth through this pass's own projection -> the game's inverse view-projection (NDC y = uv.y * 2 - 1,
+// the HWRT debug view's convention). The first version mapped view space with the cascades' rotation (view -> world from
+// P^-1 VP), which nothing tied to the TLAS's screen convention (the GNM viewport: row 0 = NDC y +1); the self-test logs
+// how far apart the two are.
+vec3 HwToWorld(vec3 p) {
+	vec3 pr = Project(p);
+	vec4 q  = vec4(pr.xy * 2.0 - 1.0, pr.z, 1.0);
+	vec4 h  = vec4(dot(sun.inv[0], q), dot(sun.inv[1], q), dot(sun.inv[2], q), dot(sun.inv[3], q));
+	return h.xyz / h.w;
+}
+vec3 HwToWorldOld(vec3 p) {
+	vec4 p4 = vec4(p, 1.0);
+	return vec3(dot(sun.w0, p4), dot(sun.w1, p4), dot(sun.w2, p4));
+}
+// occ_c: hits within the contact range (scaled with the distance); occ_f: farther ones. ndl_w: the facing in world space.
+void HwSun(vec3 p, vec3 n, vec3 l, ivec2 pixel, out float occ_c, out float occ_f, out float ndl_w) {
+	occ_c = 0.0, occ_f = 0.0, ndl_w = 0.0;
+	int lvl = int(sun.hw.x + 0.5) & 7;
+	if (lvl <= 0) return;
+	float z  = abs(p.z);
+	float s  = 0.05 + 0.01 * z;
+	vec3  pw = HwToWorld(p);
+	vec3  nw = HwToWorld(p + n * s) - pw;
+	vec3  lw = HwToWorld(p + l * s) - pw;
+	if (dot(nw, nw) < 1e-12 || dot(lw, lw) < 1e-12) return;
+	nw = normalize(nw), lw = normalize(lw);
+	ndl_w = dot(nw, lw);
+	if (ndl_w <= 0.03) return;
+	// Off the receiver's triangle (depth-buffer jitter and precision grow with the distance) along the normal and a
+	// little toward the sun; the least hit distance grows likewise (no acne far away).
+	vec3  o     = pw + nw * (0.02 + 0.003 * z) + lw * (0.01 + 0.001 * z);
+	float t_min = 0.02 + 0.004 * z;
+	float cr    = sun.hw.w * (1.0 + z / 25.0);
+	vec3  b1    = normalize(cross(lw, abs(lw.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+	vec3  b2    = cross(lw, b1);
+	int   rays  = lvl >= 3 ? 2 : 1;
+	uint  flags = gl_RayFlagsOpaqueEXT | (lvl >= 3 ? 0u : gl_RayFlagsTerminateOnFirstHitEXT);
+	float f     = float(push.misc.y % 64);
+	for (int r = 0; r < rays; ++r) {
+		float u1  = Ign(vec2(pixel) + f * 5.17 + float(r) * 19.0 + 3.0);
+		float u2  = Ign(vec2(pixel.y, pixel.x) + f * 2.93 + float(r) * 37.0 + 57.0);
+		float ang = 6.2831853 * u2, rad = 0.5 * sun.hdr.y * sqrt(u1);
+		vec3  d   = normalize(lw + (b1 * cos(ang) + b2 * sin(ang)) * rad);
+		rayQueryEXT rq;
+		// (rtstab) static meshes only: a moving mesh (character, enemy, door) at positions a few frames old left a ghost shadow
+		// beside it; its shadow stays the game's own cascade term, which is current every frame.
+		rayQueryInitializeEXT(rq, tlas, flags, 0x01, o, t_min, d, sun.hw.z);
+		while (rayQueryProceedEXT(rq)) {}
+		if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+			float t = rayQueryGetIntersectionTEXT(rq, true);
+			float c = 1.0 - smoothstep(cr, 2.0 * cr, t);
+			occ_c += c, occ_f += 1.0 - c;
+		}
+	}
+	// (grazing receivers: their reconstruction is the least reliable, and their sun term is small anyway)
+	float g = smoothstep(0.05, 0.25, ndl_w) / float(rays);
+	occ_c *= g, occ_f *= g;
+	// Far away the depth buffer's steps are decimetres and the captured meshes the game's far LODs: far hits fade out
+	// over 60..150 m, contact ones over 120..250 m.
+	occ_f *= 1.0 - smoothstep(60.0, 150.0, z);
+	occ_c *= 1.0 - smoothstep(120.0, 250.0, z);
+}
+#endif
+
+void Trace(ivec2 pixel) {
+	vec2  uv = (vec2(pixel) + 0.5) / TraceSize();
+	float d  = textureLod(depth_tex, uv, 0).r;
+	if (IsSky(d)) {
+		imageStore(out_img, pixel, vec4(1));
+		imageStore(gbuf_out, pixel, vec4(0, 0, 1, 1e6));
+		return;
+	}
+	vec3 p = ViewPos(uv, d);
+	vec3 n = NormalAt(uv, p);
+	imageStore(gbuf_out, pixel, vec4(n, abs(p.z)));
+	vec3  l   = normalize(push.extra.yzw);
+	float ndl = dot(n, l);
+	// Facing away: the sun term is zero there (the composite leaves it); nothing to trace.
+	if (Hyp() < 0 || ndl <= 0.02) {
+		imageStore(out_img, pixel, vec4(1));
+		return;
+	}
+	int   ci;
+	float v = SunVis(p, n, ndl, l, pixel, ci);
+#ifdef KYTY_HWRT_SHADOW
+	// (KYTY_HWRT_SHADOW: the scene's rays instead of the screen-space contact march, which they cover and outdo)
+	// (hwrt2s fix 10-26: outside every cascade the composite has no V_game of the game's own (GameVis says lit), so a
+	// ray hit there took the whole assumed sun term out of pixels the game lit by ambient only: indoors, on frames whose
+	// one copied cascade did not hold the view, the screen went ~8 % bright (1 / (1 + R)). Rays only where a cascade holds
+	// the pixel, unless KYTY_HWRT_SHADOW_FAR=1 (hw.x + 8).)
+	// (10-26 accuracy) The scene's rays darken freely only in contact (what the maps' bias and 1.5 m texels lose); a
+	// farther hit may take the visibility at most hw.y below the cascades' own, and fades out over the last cascade's
+	// border band (no rays switching on and off at its edge). Darkening outliers counted on statistics frames.
+	if (sun.hw.x > 0.5) {
+		bool  far_ok = sun.hw.x > 7.5;
+		float v0     = v;
+		if (ci >= 0 || far_ok) {
+			float oc, of, ndl_w;
+			HwSun(p, n, l, pixel, oc, of, ndl_w);
+			float ew = 1.0;
+			int   nc = int(sun.hdr.x + 0.5);
+			if (ci >= 0 && ci == nc - 1) {
+				vec2  u    = CascUv(LightClip(ci, p), Hyp());
+				float edge = min(min(u.x, 1.0 - u.x), min(u.y, 1.0 - u.y));
+				ew         = smoothstep(4.0 / MapSize(), 4.0 / MapSize() + max(sun.opt.z, 0.02), edge);
+			} else if (ci < 0) {
+				ew = 0.5;
+			}
+			oc = clamp(oc * ew, 0.0, 1.0), of = clamp(of * ew, 0.0, 1.0);
+			v = min(v, 1.0 - oc);
+			v = min(v, max(1.0 - of, v0 - sun.hw.y));
+			v = mix(v0, v, clamp(sun.sunw.w, 0.0, 1.0)); // (KYTY_HWRT_SHADOW_STRENGTH: the rays' share at most)
+			// The self-test (the centre pixel, every frame; words 131..135): the two reconstructions' distance (m), the
+			// depth, the world facing against the view one, the world light against the latched world sun (cos).
+			ivec2 c = ivec2(TraceSize()) / 2;
+			if (pixel == c) {
+				vec3 pw = HwToWorld(p);
+				vec3 lw = normalize(HwToWorld(p + l * (0.05 + 0.01 * abs(p.z))) - pw);
+				vote_buf.v[131] = floatBitsToUint(length(pw - HwToWorldOld(p)));
+				vote_buf.v[132] = floatBitsToUint(abs(p.z));
+				vote_buf.v[133] = floatBitsToUint(ndl_w - ndl);
+				vote_buf.v[134] = floatBitsToUint(dot(lw, normalize(sun.sunw.xyz)));
+				vote_buf.v[135] = floatBitsToUint(length(pw - sun.cam.xyz) - length(p));
+			}
+		}
+		if ((push.misc.w & 16) != 0) {
+			float dk = v0 - v;
+			if (dk > 0.25) atomicAdd(vote_buf.v[128], 1u);
+			if (dk > 0.6) atomicAdd(vote_buf.v[129], 1u);
+			if (dk > 0.25) atomicAdd(vote_buf.v[130], uint(dk * 256.0 + 0.5));
+		}
+		imageStore(out_img, pixel, vec4(isnan(v) ? 1.0 : clamp(v, 0.0, 1.0)));
+		return;
+	}
+#endif
+	// The contact ray (levels 2, 3): what the maps' texels and bias lose near the receiver.
+	if (push.misc.z >= 2 && sun.opt.y > 0.0) {
+		float z  = abs(p.z);
+		vec2  rs = 1.0 / RenderSize();
+		float a0 = abs(ViewZ(textureLod(depth_tex, uv + vec2(rs.x, 0), 0).r)), a1 = abs(ViewZ(textureLod(depth_tex, uv - vec2(rs.x, 0), 0).r));
+		float a2 = abs(ViewZ(textureLod(depth_tex, uv + vec2(0, rs.y), 0).r)), a3 = abs(ViewZ(textureLod(depth_tex, uv - vec2(0, rs.y), 0).r));
+		float tol = 0.01 * z + 0.03;
+		bool  planar = abs(a0 + a1 - 2.0 * z) <= tol && abs(a2 + a3 - 2.0 * z) <= tol;
+		if (planar) {
+			float f   = float(push.misc.y % 64);
+			float u1  = Ign(vec2(pixel) + f * 7.123 + 13.0), u2 = Ign(vec2(pixel.y, pixel.x) + f * 3.731 + 71.0);
+			vec3  b1  = normalize(cross(l, abs(l.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+			vec3  b2  = cross(l, b1);
+			float ang = 6.2831853 * u2, rad = 0.5 * sun.hdr.y * sqrt(u1);
+			vec3  lj  = normalize(l + (b1 * cos(ang) + b2 * sin(ang)) * rad);
+			float occ = March(p, n, lj, ndl, pixel) * smoothstep(0.1, 0.3, ndl);
+			v *= 1.0 - clamp(sun.opt.y * occ, 0.0, 1.0);
+		}
+	}
+	imageStore(out_img, pixel, vec4(isnan(v) ? 1.0 : clamp(v, 0.0, 1.0)));
+}
+void Temporal(ivec2 pixel) {
+	vec2 ts  = 1.0 / TraceSize();
+	vec2 uv  = (vec2(pixel) + 0.5) * ts;
+	float cur = textureLod(src_a, uv, 0).r;
+	vec4 g   = textureLod(gbuf_cur, uv, 0);
+	if (g.w > 1e5) {
+		imageStore(out_img, pixel, vec4(1));
+		imageStore(aux_out, pixel, vec4(0));
+		return;
+	}
+	// Depth tolerances that follow the surface's slope (far grazing ground) and the camera's own motion between
+	// frames (the previous depth is not reprojected: walking forward changes it by ~0.1 m a frame).
+	float slope = DepthSlope(uv, g.w);
+	float far_k = smoothstep(10.0, 60.0, g.w);
+	// The 3x3 neighbourhood of the same surface: mean and deviation (the history's clamp box).
+	float m1 = 0.0, m2 = 0.0, wn = 0.0;
+	float ntol = 0.03 * g.w + 2.0 * slope;
+	float ndot = mix(0.8, 0.65, far_k);
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			vec2  suv = uv + vec2(x, y) * ts;
+			vec4  sg  = textureLod(gbuf_cur, suv, 0);
+			float w   = (abs(sg.w - g.w) < ntol && dot(sg.xyz, g.xyz) > ndot) ? 1.0 : 0.0;
+			float sv  = textureLod(src_a, suv, 0).r;
+			m1 += sv * w;
+			m2 += sv * sv * w;
+			wn += w;
+		}
+	wn = max(wn, 1.0);
+	m1 /= wn, m2 /= wn;
+	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
+	float a_min = push.misc.z >= 3 ? 0.08 : 0.1;
+	float count = 1.0;
+	float res   = mix(m1, cur, 0.5);
+	vec2  puv   = uv + textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();
+	if ((push.misc.w & 1) == 0 && (push.misc.w & 2) != 0 && all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
+		vec4 pg = textureLod(gbuf_prev, puv, 0);
+		// History rejection: another surface there last frame (depth off by more than 4 % + 1.5 pixels of its slope +
+		// 0.15 m of camera motion, or the normal turned > 25 degrees near, > 45 far where depth normals are noisy).
+		float ptol = 0.04 * g.w + 1.5 * slope + 0.15;
+		if (pg.w < 1e5 && abs(pg.w - g.w) < ptol && dot(pg.xyz, g.xyz) > mix(0.9, 0.7, far_k)) {
+			float pc    = textureLod(aux_tex, puv, 0).x;
+			count       = min(max(pc, 1.0) + 1.0, 32.0);
+			float alpha = max(1.0 / count, a_min);
+			// (A tighter box than before (2.5 sigma + 0.05): a moved occluder's old shadow does not linger.)
+			float k     = mix(1.0, 2.0, clamp(count / 16.0, 0.0, 1.0));
+			float hist  = clamp(textureLod(src_b, puv, 0).r, m1 - k * sigma - 0.03, m1 + k * sigma + 0.03);
+			res         = mix(hist, cur, alpha);
+#ifdef KYTY_HWRT_SHADOW
+			// (one frame cannot drop the visibility by more than 0.15: a single frame's stray hits never show as specks)
+			res = max(res, hist - 0.15);
+#endif
+		}
+	}
+	res = clamp(isnan(res) ? 1.0 : res, 0.0, 1.0);
+	imageStore(out_img, pixel, vec4(res));
+	imageStore(aux_out, pixel, vec4(count, 0, 0, 0));
+}
+
+void Atrous(ivec2 pixel) {
+	vec2 ts = 1.0 / TraceSize();
+	vec2 uv = (vec2(pixel) + 0.5) * ts;
+	vec4 g  = textureLod(gbuf_cur, uv, 0);
+	float c = textureLod(src_a, uv, 0).r;
+	if (g.w > 1e5) {
+		imageStore(out_img, pixel, vec4(c));
+		return;
+	}
+	const float kern[3] = float[](0.375, 0.25, 0.0625);
+	float step = push.extra.x;
+	// Depth stop: relative, plus the surface's own slope (far grazing ground is still one surface).
+	float zden = max((g.w * 0.015 + 1.5 * DepthSlope(uv, g.w)) * step, 1e-3);
+	// Visibility edge stop: loose on the first passes (noise, and the penumbra's jitter to average into a soft edge),
+	// moderate after. (10-24: was 0.6 / 0.35: it kept the binary edges of each frame's rays: hard shards.)
+	float sv_den = step <= 2.0 ? 0.9 : 0.5;
+	float sum = 0.0, wsum = 0.0;
+	for (int y = -2; y <= 2; ++y)
+		for (int x = -2; x <= 2; ++x) {
+			vec2  suv = uv + vec2(x, y) * step * ts;
+			vec4  sg  = textureLod(gbuf_cur, suv, 0);
+			float sc  = textureLod(src_a, suv, 0).r;
+			float w   = kern[abs(x)] * kern[abs(y)] * pow(max(dot(sg.xyz, g.xyz), 0.0), 16.0) *
+			          exp(-abs(sg.w - g.w) / zden) * exp(-abs(sc - c) / sv_den);
+			w = sg.w > 1e5 ? 0.0 : w;
+			sum += sc * w;
+			wsum += w;
+		}
+	float r = wsum > 1e-6 ? sum / wsum : c;
+	imageStore(out_img, pixel, vec4(clamp(isnan(r) ? c : r, 0.0, 1.0)));
+}
+
+float Upsample(vec2 uv, float z) {
+	vec2  tc = uv * TraceSize() - 0.5;
+	vec2  f  = fract(tc);
+	ivec2 b  = ivec2(floor(tc));
+	ivec2 mx = ivec2(TraceSize()) - 1;
+	float sum = 0.0, wsum = 0.0;
+	for (int i = 0; i < 4; ++i) {
+		ivec2 o  = ivec2(i & 1, i >> 1);
+		ivec2 q  = clamp(b + o, ivec2(0), mx);
+		float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+		float w  = (bw + 1e-3) / (1e-3 + abs(texelFetch(gbuf_cur, q, 0).w - z) / max(z * 0.02, 1e-3));
+		sum += texelFetch(src_a, q, 0).r * w;
+		wsum += w;
+	}
+	return sum / max(wsum, 1e-6);
+}
+
+
+// The composite: the game's sun term's visibility V_game replaced by ours (see the header). dark / lift: how much it
+// darkened / brightened (the statistics).
+void Composite(ivec2 pixel, out float dark, out float lift) {
+	dark = 0.0, lift = 0.0;
+	vec2  uv  = (vec2(pixel) + 0.5) / RenderSize();
+	vec4  col = texelFetch(color_tex, pixel, 0);
+	float d   = texelFetch(depth_tex, pixel, 0).r;
+	int   dbg = int(sun.hyp.z + 0.5);
+	if (IsSky(d) || Hyp() < 0) {
+		imageStore(out_img, pixel, dbg > 0 && dbg < 4 ? vec4(vec3(dbg == 3 ? 0.5 : 1.0), col.a) : col);
+		return;
+	}
+	vec3  p   = ViewPos(uv, d);
+	float z   = abs(p.z);
+	vec3  n   = NormalAt(uv, p);
+	vec3  l   = normalize(push.extra.yzw);
+	float ndl = dot(n, l);
+	float vis = TraceSize().x == RenderSize().x ? texelFetch(src_a, pixel, 0).r : Upsample(uv, z);
+	vis = (isnan(vis) || isinf(vis)) ? 1.0 : clamp(vis, 0.0, 1.0);
+	int   ci = -1;
+	float vg = ndl > 0.02 ? GameVis(p, n, ndl, l, ci) : 1.0;
+	// Newly disoccluded pixels (no history yet): our noisy first frames weigh less.
+	float count  = textureLod(aux_tex, uv, 0).x;
+	float stable = mix(0.5, 1.0, smoothstep(1.0, 4.0, count));
+	float fade   = 1.0 - smoothstep(push.cand[3].z, push.cand[3].w, z);
+	float rn     = sun.hdr.z * max(ndl, 0.0);
+	float f      = (1.0 + rn * vis) / (1.0 + rn * vg);
+	// (brightening capped at opt.w of the full sun term: a pixel the emulation misjudges as shadowed is lifted less)
+	f = min(f, 1.0 + sun.opt.w * (rn / (1.0 + rn * vg)));
+	f = mix(1.0, f, clamp(sun.hdr.w * fade * stable, 0.0, 1.0));
+	if (isnan(f) || isinf(f)) f = 1.0;
+	dark = clamp(1.0 - f, 0.0, 1.0), lift = clamp(f - 1.0, 0.0, 4.0);
+	vec3 rgb = col.rgb * f;
+	if (dbg == 1) rgb = vec3(vg);
+	else if (dbg == 2) rgb = vec3(vis);
+	else if (dbg == 3) rgb = vec3(0.5 * f);
+	else if (dbg == 4) {
+		const vec3 tint[5] = vec3[](vec3(1, 0.35, 0.35), vec3(0.35, 1, 0.35), vec3(0.35, 0.35, 1), vec3(1, 1, 0.35), vec3(1, 0.35, 1));
+		rgb = col.rgb * (ci < 0 ? vec3(1) : tint[min(ci, 4)]);
+	}
+	if (any(isnan(rgb)) || any(isinf(rgb))) rgb = col.rgb;
+	imageStore(out_img, pixel, vec4(rgb, col.a));
+}
+
+// The composite with its statistics (every invocation reaches the barriers: misc is uniform): words 64..66 the pixels
+// darkened by more than 3 %, those brightened by more than 3 %, the sum of |factor - 1| * 256.
+shared uint s_stat[3];
+void CompositeStats(ivec2 pixel) {
+	bool  inb  = pixel.x < int(RenderSize().x) && pixel.y < int(RenderSize().y);
+	float dark = 0.0, lift = 0.0;
+	if ((push.misc.w & 8) == 0) {
+		if (inb) Composite(pixel, dark, lift);
+		return;
+	}
+	uint li = gl_LocalInvocationIndex;
+	if (li < 3u) s_stat[li] = 0u;
+	barrier();
+	if (inb) Composite(pixel, dark, lift);
+	if (inb && dark > 0.03) atomicAdd(s_stat[0], 1u);
+	if (inb && lift > 0.03) atomicAdd(s_stat[1], 1u);
+	if (inb && dark + lift > 0.0) atomicAdd(s_stat[2], uint(clamp(dark + lift, 0.0, 4.0) * 256.0 + 0.5));
+	barrier();
+	if (li < 3u && s_stat[li] != 0u) atomicAdd(vote_buf.v[64u + li], s_stat[li]);
+}
+
+// The light probe (mode 6, at render / 4, on the statistics frames): log2 luminance of the pixels facing the sun
+// (N.L > 0.5) and of those facing away (N.L < -0.15, ambient only), within 60 m: their geometric means' ratio K is how
+// strong the sun is in the game's own lighting (overcast: ~1). Words 68..71: count lit, sum lit, count away, sum away.
+shared uint s_probe[4];
+void Probe(ivec2 pixel) {
+	uint li = gl_LocalInvocationIndex;
+	if (li < 4u) s_probe[li] = 0u;
+	barrier();
+	ivec2 rp = pixel * 4 + 2;
+	if (rp.x < int(RenderSize().x) && rp.y < int(RenderSize().y)) {
+		vec2  uv = (vec2(rp) + 0.5) / RenderSize();
+		float d  = texelFetch(depth_tex, rp, 0).r;
+		float l  = dot(texelFetch(color_tex, rp, 0).rgb, vec3(0.2126, 0.7152, 0.0722));
+		if (!IsSky(d) && abs(ViewZ(d)) < 60.0 && l > 0.0 && !isinf(l)) {
+			vec3  p    = ViewPos(uv, d);
+			float ndl  = dot(NormalAt(uv, p), normalize(push.extra.yzw));
+			uint  code = uint(clamp((log2(l) + 40.0) * 32.0, 0.0, 4095.0));
+			if (ndl > 0.5) atomicAdd(s_probe[0], 1u), atomicAdd(s_probe[1], code);
+			else if (ndl < -0.15) atomicAdd(s_probe[2], 1u), atomicAdd(s_probe[3], code);
+		}
+	}
+	barrier();
+	if (li < 4u && s_probe[li] != 0u) atomicAdd(vote_buf.v[68u + li], s_probe[li]);
+}
+
+shared uint s_vote[12];
+void Calibrate(ivec2 pixel) {
+	uint li = gl_LocalInvocationIndex;
+	if (li < 12u) s_vote[li] = 0u;
+	barrier();
+	// Every 4th pixel each way of the render (dispatched at render / 4).
+	ivec2 rp = pixel * 4 + 2;
+	if (rp.x < int(RenderSize().x) && rp.y < int(RenderSize().y)) {
+		vec2  uv = (vec2(rp) + 0.5) / RenderSize();
+		float d  = texelFetch(depth_tex, rp, 0).r;
+		if (!IsSky(d) && abs(ViewZ(d)) < 40.0) {
+			// The normal as reconstructed with row 0 = NDC y +1; the other convention mirrors its y.
+			vec3 p  = ViewPosY(uv, d, -1.0);
+			vec3 na = NormalAtY(uv, p, -1.0);
+			vec3 nb = vec3(na.x, -na.y, na.z);
+			for (int k = 0; k < 3; ++k) {
+				if (push.cand[k].w < 0.5) continue;
+				vec3  a  = normalize(push.cand[k].xyz);
+				float ca = dot(na, a), cb = dot(nb, a);
+				if (ca > 0.97) atomicAdd(s_vote[k * 2 + 0], 1u);
+				if (ca < -0.97) atomicAdd(s_vote[k * 2 + 1], 1u);
+				if (cb > 0.97) atomicAdd(s_vote[6 + k * 2 + 0], 1u);
+				if (cb < -0.97) atomicAdd(s_vote[6 + k * 2 + 1], 1u);
+			}
+		}
+	}
+	barrier();
+	if (li < 12u && s_vote[li] != 0u) atomicAdd(vote_buf.v[uint(push.misc.w >> 8) * 16u + li], s_vote[li]);
+}
+
+
+// Mode 7 (render / 8, on the statistics frames; see the header): words 80..87 votes, 88..119 the histogram,
+// 120..124 R's probe (count lit, sum lit codes, sum N.L * 256 of lit, count shadowed, sum shadowed codes).
+shared uint s_cal[45];
+void SunCalib(ivec2 pixel) {
+	uint li = gl_LocalInvocationIndex;
+	if (li < 45u) s_cal[li] = 0u;
+	barrier();
+	ivec2 rp = pixel * 8 + 4;
+	if (rp.x < int(RenderSize().x) && rp.y < int(RenderSize().y)) {
+		vec2  uv = (vec2(rp) + 0.5) / RenderSize();
+		float d  = texelFetch(depth_tex, rp, 0).r;
+		if (!IsSky(d) && abs(ViewZ(d)) < 60.0) {
+			vec3  p    = ViewPos(uv, d);
+			vec3  n    = NormalAt(uv, p);
+			vec3  l    = normalize(push.extra.yzw);
+			float ndl  = dot(n, l);
+			float tilt = TanTilt(max(ndl, 0.05));
+			if (ndl > 0.15) {
+				for (int h = 0; h < 8; ++h) {
+					int ci = PickCascade(p, h, 2.0);
+					if (ci < 0) continue;
+					vec3  lc = LightClip(ci, p);
+					float s  = textureLod(casc_tex, vec3(CascUv(lc, h), sun.c[ci].info.x), 0).r;
+					float dm = abs(StoredToZ(s, h) - lc.z) * sun.c[ci].info.z;
+					if (dm < 0.04 + 2.0 * sun.c[ci].info.y * (1.0 + tilt)) atomicAdd(s_cal[h], 1u);
+				}
+			}
+			int h = Hyp();
+			if (h >= 0 && ndl > 0.2) {
+				int ci = PickCascade(p, h, 2.0);
+				if (ci >= 0) {
+					vec3  lc = LightClip(ci, Offset(ci, p, n));
+					float s  = textureLod(casc_tex, vec3(CascUv(lc, h), sun.c[ci].info.x), 0).r;
+					float dh = (StoredToZ(s, h) - lc.z) * TowardLight(ci, l) - tilt * sun.c[ci].info.y;
+					atomicAdd(s_cal[8 + clamp(int(floor((dh + 0.25) * 64.0)), 0, 31)], 1u);
+				}
+			}
+			float lum = dot(texelFetch(color_tex, rp, 0).rgb, vec3(0.2126, 0.7152, 0.0722));
+			if (h >= 0 && ndl > 0.35 && abs(p.z) < 40.0 && lum > 0.0 && !isinf(lum)) {
+				int   ci;
+				float vg   = GameVis(p, n, ndl, l, ci);
+				uint  code = uint(clamp((log2(lum) + 40.0) * 32.0, 0.0, 4095.0));
+				if (ci >= 0 && vg > 0.95) atomicAdd(s_cal[40], 1u), atomicAdd(s_cal[41], code), atomicAdd(s_cal[42], uint(ndl * 256.0));
+				else if (ci >= 0 && vg < 0.05) atomicAdd(s_cal[43], 1u), atomicAdd(s_cal[44], code);
+			}
+		}
+	}
+	barrier();
+	if (li < 45u && s_cal[li] != 0u) atomicAdd(vote_buf.v[80u + li], s_cal[li]);
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	int   mode  = push.misc.x;
+	if (mode == 5) { Calibrate(pixel); return; } // (all invocations reach its barriers)
+	if (mode == 4) { CompositeStats(pixel); return; } // (likewise)
+	if (mode == 6) { Probe(pixel); return; } // (likewise)
+	if (mode == 7) { SunCalib(pixel); return; } // (likewise)
+	ivec2 size = ivec2(TraceSize());
+	if (pixel.x >= size.x || pixel.y >= size.y) return;
+	if (mode == 0) Trace(pixel);
+	else if (mode == 1) Temporal(pixel);
+	else Atrous(pixel);
+}

@@ -1,0 +1,44 @@
+#version 460
+// KYTY_RT_FLICKER (rt-flicker.cpp): the flicker self-check of one ray-traced pass. Its contribution D = luminance(after)
+// - luminance(before) on a 4x4 grid (a 2x2 mean at each grid point, against the TAA jitter), kept per grid point for the
+// next frame; while the camera holds still: the grid points the pass touches, and those whose D moved by more than X
+// (and 2X) of the pixel's light since the previous frame. A stable pass on a still camera reads ~0.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D before_tex;
+layout(binding = 1) uniform sampler2D after_tex;
+layout(binding = 2, rgba16f) uniform image2D prev_img;
+layout(binding = 3, std430) buffer Stats { uint st[]; };
+layout(push_constant) uniform Push {
+	ivec4 size; // xy the render size, zw the grid
+	vec4  par;  // x the threshold X (fraction), y camera still, z history valid, w the pass index
+} push;
+float Lum(vec3 c) { return dot(clamp(c, vec3(0.0), vec3(65000.0)), vec3(0.2126, 0.7152, 0.0722)); }
+void main() {
+	ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(q, push.size.zw))) return;
+	ivec2 hi   = push.size.xy - 1;
+	ivec2 base = q * 4 + 1;
+	float d = 0.0, a = 0.0;
+	for (int j = 0; j < 2; ++j)
+		for (int i = 0; i < 2; ++i) {
+			ivec2 p  = min(base + ivec2(i, j), hi);
+			float lb = Lum(texelFetch(before_tex, p, 0).rgb);
+			float la = Lum(texelFetch(after_tex, p, 0).rgb);
+			d += la - lb;
+			a += la;
+		}
+	d *= 0.25, a *= 0.25;
+	if (isnan(d) || isnan(a)) d = 0.0, a = 0.0;
+	vec4 pv = imageLoad(prev_img, q);
+	imageStore(prev_img, q, vec4(d, a, 0.0, 1.0));
+	if (push.par.y < 0.5 || push.par.z < 0.5 || pv.w < 0.5) return;
+	uint o = uint(push.par.w) * 4u;
+	atomicAdd(st[o], 1u);
+	float ref = max(max(a, pv.y), 0.02);
+	if (abs(d) < 0.005 * ref && abs(pv.x) < 0.005 * ref) return; // (the pass leaves this point alone)
+	atomicAdd(st[o + 1u], 1u);
+	float ch = abs(d - pv.x) / ref;
+	atomicMax(st[40u + uint(push.par.w)], uint(min(ch, 100.0) * 10000.0)); // (the largest jump, 1e-4 of the light)
+	if (ch > push.par.x) atomicAdd(st[o + 2u], 1u);
+	if (ch > 2.0 * push.par.x) atomicAdd(st[o + 3u], 1u);
+}

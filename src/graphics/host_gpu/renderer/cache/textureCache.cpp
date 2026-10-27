@@ -27,6 +27,8 @@
 #include "live-counters.h"
 #include "local-platform.h"
 #include "native-resource-state.h"
+#include "scene-tags.h"
+#include "graphics/host_gpu/renderer/cache/shadowPoolTrace.h"
 
 #include <algorithm>
 #include <array>
@@ -46,6 +48,7 @@
 #include <xxhash.h>
 #include "speculation-state.h"
 #include "soft-release.h"
+#include "ram-guard.h"
 
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_image_granules_mode {0};
@@ -577,6 +580,14 @@ size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
 	const uint64_t       goal  = all ? UINT64_MAX : std::max(bytes * 2, uint64_t {256} << 20u);
 	uint64_t             freed = 0;
 	std::vector<ImageId> victims;
+	// (KYTY_CUBE_SHADOW_FIX: a shadow pool's parked twin goes first; the next switch makes it again.)
+	std::vector<ImageId> twins;
+	std::erase_if(m_parked, [&](const auto& item) {
+		if (item.second.keep <= 1 || freed >= goal) return false;
+		if (const auto* twin = m_slot_images.try_get(item.second.id)) freed += twin->AccountedSize();
+		twins.push_back(item.second.id);
+		return true;
+	});
 	if (m_gc_tick >= UnusedTicks) {
 		m_lru_cache.ForEachItemBelow(m_gc_tick - UnusedTicks, [&](ImageId id) {
 			const auto* owner = m_slot_images.try_get(id);
@@ -587,6 +598,7 @@ size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
 		});
 	}
 	std::erase_if(victims, [&](ImageId id) { return !DetachImage(id); });
+	for (const auto id: twins) victims.push_back(id); // (parked: already out of every index)
 	if (!victims.empty()) {
 		m_scheduler.Wait(m_scheduler.CurrentTick());
 		// (Destroyed now, not after RetireImage's operation: the GPU is done with them.)
@@ -729,6 +741,7 @@ bool TextureCache::DetachImage(ImageId id) {
 		return false;
 	}
 	m_partial_plans.erase(image->serial);
+	m_layer_owners.erase(image->serial);
 	if (!image->depth_id) {
 		std::vector<ImageId> associations;
 		for (const auto candidate: m_stencil_associations) {
@@ -1090,9 +1103,12 @@ bool TextureCache::PartialDirtyCandidate(const Image& image) {
 bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
                                         uint64_t granule) {
 	const auto& info = image.info;
+	// (With GPU buffer writes over known ranges of it too: a refresh uploads those with the dirty ranges, InitializeImage.
+	// One written all over, or where not known, goes up whole anyway.)
 	if (!PartialDirtyCandidate(image) || !image.registered || !image.IsTracked() ||
 	    image.track_addr != info.data.address || image.track_addr_end != info.data.End() ||
-	    !image.CanTakePartialDirty() || image.IsBufferModified() || image.IsStencilModified()) {
+	    !image.CanTakePartialDirty() || (image.IsBufferModified() && image.BufferModifiedRanges().empty()) ||
+	    image.IsStencilModified()) {
 		return false;
 	}
 	const auto base  = info.data.address;
@@ -1261,15 +1277,18 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	return id;
 }
 
+bool TextureCache::ViewFitsImage(const ImageDesc& desc) {
+	const auto& view      = desc.view_info;
+	const auto& resources = desc.info.resources;
+	return view.level_count != 0 && view.layer_count != 0 && view.base_level < resources.levels &&
+	       view.level_count <= resources.levels - view.base_level &&
+	       (desc.info.IsVolume() ||
+	        (view.base_layer < resources.layers && view.layer_count <= resources.layers - view.base_layer));
+}
+
 void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
 	ImageOps::Validate(desc.info);
-	if (desc.view_info.format == vk::Format::eUndefined || desc.view_info.level_count == 0 ||
-	    desc.view_info.layer_count == 0 ||
-	    desc.view_info.base_level >= desc.info.resources.levels ||
-	    desc.view_info.level_count > desc.info.resources.levels - desc.view_info.base_level ||
-	    (!desc.info.IsVolume() &&
-	     (desc.view_info.base_layer >= desc.info.resources.layers ||
-	      desc.view_info.layer_count > desc.info.resources.layers - desc.view_info.base_layer))) {
+	if (desc.view_info.format == vk::Format::eUndefined || !ViewFitsImage(desc)) {
 		EXIT("TextureCache: invalid image view description\n");
 	}
 	if (desc.type == BindingType::DepthTarget && !IsSupportedDepthTargetFormat(desc.info)) {
@@ -1424,6 +1443,9 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
+// (Defined with UploadDepthPartial's helpers below.)
+static void DepthArrayEvent(const char* what, const Image& image, uint64_t address, uint64_t size, const char* detail);
+
 static bool GrowImageToLayers(ImageInfo& info, uint32_t layers) {
 	const auto current = info.resources.layers;
 	if (info.resources.levels != 1 || current == 0 || layers <= current ||
@@ -1450,12 +1472,62 @@ static bool GrowImageToLayers(ImageInfo& info, uint32_t layers) {
 	return true;
 }
 
+// KYTY_R32_SHADOW_POOL (on unless 0): the spot-shadow pool (a 360-layer 384x384 array at 0x3f...) is written by a
+// compute pass as an R32 float storage image and sampled by the lighting with a depth compare (D32). Each switch
+// recreated it (a 135 MiB copy each way, 7 pairs a session). Where the GPU compares depth on R32_SFLOAT
+// (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT, Vulkan 1.3; and linear filtering for PCF), the R32 image
+// is sampled with the compare as it is: the pool stays R32 and is never switched back to D32 for sampling.
+bool TextureCache::R32DepthCompareSupported() const {
+	static const bool supported = [this] {
+		const char* value = std::getenv("KYTY_R32_SHADOW_POOL");
+		if (value != nullptr && value[0] == '0') return false;
+		vk::FormatProperties3 properties3 {};
+		vk::FormatProperties2 properties2 {};
+		properties2.pNext = &properties3;
+		m_graphics.physical_device.getFormatProperties2(vk::Format::eR32Sfloat, &properties2);
+		const auto needed = vk::FormatFeatureFlagBits2::eSampledImageDepthComparison |
+		                    vk::FormatFeatureFlagBits2::eSampledImageFilterLinear |
+		                    vk::FormatFeatureFlagBits2::eSampledImage;
+		const bool ok = (properties3.optimalTilingFeatures & needed) == needed;
+		std::printf("Depth array: R32 float depth compare %s (KYTY_R32_SHADOW_POOL=0: off)\n",
+		            ok ? "supported: the shadow pool stays R32" : "unsupported: the shadow pool switches to D32 to be sampled");
+		std::fflush(stdout);
+		return ok;
+	}();
+	return supported;
+}
+
+// KYTY_CUBE_SHADOW_FIX (on unless 0): a layered shadow pool the GPU rendered (the 384x384x360 D16 cube pool, written as
+// R16 storage by a compute pass and then sampled with a depth compare again) switches depth <-> colour with a full copy
+// both ways (bit-exact: D16 and R16 through a buffer). The image it leaves stayed parked one flip only: the next switch,
+// seconds later in a burst of them, made a new 135 MiB image (and its views) each time. Now the one it leaves stays
+// parked as its twin for CubeTwinKeep collector runs (taken back at the next switch, copied over whole as before;
+// freed first when video memory runs short). Contents are handled as before: only the image's lifetime changes.
+static bool CubeShadowFixOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CUBE_SHADOW_FIX");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+static constexpr uint64_t CubeTwinKeep = 1800;
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
 	if (!cached.info.IsDepth() && !requested.IsDepth()) {
 		return {};
 	}
+	// (Defined here: a depth-compare texture of an R32 float array of the same layout samples it as it is.)
+	const auto R32ShadowPoolSample = [this](const ImageInfo& want, const Image& have) {
+		return want.pixel_format == vk::Format::eD32Sfloat && have.backing.format == vk::Format::eR32Sfloat &&
+		       have.info.pixel_format == vk::Format::eR32Sfloat && have.backing.samples == 1 && want.samples == 1 &&
+		       want.data == have.info.data && want.extent == have.info.extent &&
+		       want.resources == have.info.resources && want.resources.levels == 1 && want.resources.layers > 1 &&
+		       want.type == have.info.type && want.pitch == have.info.pitch && want.tile_mode == have.info.tile_mode &&
+		       !want.HasStencil() && !have.info.HasStencil() && !want.HasMetadata() && !have.info.HasMetadata() &&
+		       R32DepthCompareSupported();
+	};
 	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
 	const bool bpp_match     = requested.bytes_per_block == cached.info.bytes_per_block;
 	// PPSA04264
@@ -1492,6 +1564,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	bool recreate = !cached.info.resources.Contains(requested.resources);
 	switch (binding) {
 		case BindingType::Texture:
+			if (requested.IsDepth() && !cached.info.IsDepth() && R32ShadowPoolSample(requested, cached)) {
+				return cached_id;
+			}
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
 			recreate |= raw_d16_texture;
 			break;
@@ -1508,6 +1583,23 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	LiveCounters::Add(LiveCounters::DepthOverlaps);
 	LiveCounters::Add(LiveCounters::DepthOverlapBytes, cached.info.data.size);
+	static const char* const binding_names[] = {"texture", "storage", "render_target", "depth_target", "video_out"};
+	const auto binding_index = static_cast<uint32_t>(binding);
+	char detail[256];
+	std::snprintf(detail, sizeof(detail),
+	              "binding=%s requested: depth=%d fmt=%u guest_fmt=%u layers=%u levels=%u type=%u tile=%u cached: fmt=%u levels=%u",
+	              binding_index < 5 ? binding_names[binding_index] : "?", requested.IsDepth() ? 1 : 0,
+	              static_cast<uint32_t>(requested.pixel_format), static_cast<uint32_t>(requested.guest_format),
+	              requested.resources.layers, requested.resources.levels, static_cast<uint32_t>(requested.type),
+	              static_cast<uint32_t>(requested.tile_mode), static_cast<uint32_t>(cached.info.pixel_format),
+	              cached.info.resources.levels);
+	DepthArrayEvent(binding == BindingType::DepthTarget ? "a recreation for a depth target" : "a recreation for another use", cached,
+	                requested.data.address, requested.data.size, detail);
+	// The spot-shadow pool (a GPU-rendered layered depth image) taken over by another use keeps its guard: the texture
+	// streamer's CPU writes to its free layers then refresh only those layers, never all of it from guest memory,
+	// which never held the rendered shadows (they vanished until the lights were rendered again).
+	const bool alias_guard = (cached.info.IsDepth() || cached.depth_array_alias) && cached.IsGpuModified() &&
+	                         cached.info.resources.layers > 1;
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
@@ -1522,9 +1614,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	info.htile_clear_mask = 0;
 	auto replacement_id   = TakeParkedImage(info);
+	const bool from_parked = static_cast<bool>(replacement_id);
 	if (!replacement_id) replacement_id = InsertImage(info);
+	const auto copy_start = std::chrono::steady_clock::now();
 	auto& replacement = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
+	replacement.depth_array_alias = alias_guard && !replacement.info.IsDepth() &&
+	                                replacement.info.resources.layers == cached.info.resources.layers;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
 	}
@@ -1570,21 +1666,61 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		cached.track_addr     = 0;
 		cached.track_addr_end = 0;
 	}
-	ParkImage(cached_id);
+	if (alias_guard) {
+		// KYTY_DEPTH_ARRAY_LOG: what the switch did (the copy keeps the rendered layers; a replacement that is not
+		// GPU-modified afterwards, or a skipped copy, loses them).
+		static std::atomic<uint32_t> switch_reports {0};
+		if (switch_reports.fetch_add(1, std::memory_order_relaxed) < 64) {
+			std::printf("Depth array switch: %s -> %s replacement=%s copied_samples=%u/%u gpu_after=%d cpu_after=%d "
+			            "partial_after=%d buffer_after=%d copy_ms=%.2f frame=%llu command_serial=%llu tick=%llu speculative=%d "
+			            "packet_slot=%zu packet=%llu\n",
+			            cached.info.IsDepth() ? "depth" : "color", replacement.info.IsDepth() ? "depth" : "color",
+			            from_parked ? "parked" : "new", cached.backing.samples, replacement.backing.samples,
+			            replacement.IsGpuModified() ? 1 : 0, replacement.IsCpuDirty() ? 1 : 0,
+			            replacement.IsPartiallyCpuDirty() ? 1 : 0, replacement.IsBufferModified() ? 1 : 0,
+			            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copy_start).count(),
+			            static_cast<unsigned long long>(m_frame.load(std::memory_order_relaxed)),
+			            static_cast<unsigned long long>(m_scheduler.CommandSerial()),
+			            static_cast<unsigned long long>(m_scheduler.CurrentTick()), Spec::t_effects != nullptr ? 1 : 0,
+			            Spec::t_packet_slot, static_cast<unsigned long long>(Spec::t_packets));
+			std::fflush(stdout);
+		}
+	}
+	const bool keep_twin = alias_guard && CubeShadowFixOn() && cached.info.resources.levels == 1 &&
+	                       replacement.info.resources.layers == cached.info.resources.layers &&
+	                       replacement.info.data == cached.info.data && cached.backing.samples == 1;
+	if (alias_guard) {
+		ShadowPoolTrace::Count(ShadowPoolTrace::Find(cached.info.data.address, cached.info.resources.layers,
+		                                             cached.info.extent.width, cached.info.extent.height),
+		                       &ShadowPoolTrace::Pool::switches);
+		static std::atomic<bool> told {false};
+		if (keep_twin && !told.exchange(true)) {
+			std::printf("Cube shadow pool: 0x%llx+0x%llx (%u layers %ux%u) switches %s <-> %s; the image it leaves stays "
+			            "parked as its twin for %llu flips (KYTY_CUBE_SHADOW_FIX=0: one flip, then a new image)\n",
+			            static_cast<unsigned long long>(cached.info.data.address),
+			            static_cast<unsigned long long>(cached.info.data.size), cached.info.resources.layers,
+			            cached.info.extent.width, cached.info.extent.height,
+			            cached.info.IsDepth() ? "depth" : "color", replacement.info.IsDepth() ? "depth" : "color",
+			            static_cast<unsigned long long>(CubeTwinKeep));
+			std::fflush(stdout);
+		}
+	}
+	ParkImage(cached_id, keep_twin ? CubeTwinKeep : 1);
 	return replacement_id;
 }
 
 // (FreeImage's, but parked: TakeParkedImage takes it back for its description; the collector retires it a flip on.)
-void TextureCache::ParkImage(ImageId id) {
+void TextureCache::ParkImage(ImageId id, uint64_t keep) {
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
 	}
+	image.depth_array_alias = false;
 	const auto address = image.info.data.address;
 	if (!DetachImage(id)) return;
 	auto& parked = m_parked[address];
 	if (parked.id) RetireImage(parked.id);
-	parked = {id, m_gc_tick};
+	parked = {id, m_gc_tick, std::max<uint64_t>(keep, 1)};
 }
 
 // An image a depth overlap parked at `info`'s memory made for the same Vulkan image (all of its description but the
@@ -2109,6 +2245,47 @@ static bool PartialFail(const char* why) {
 	return false;
 }
 
+// KYTY_DEPTH_ARRAY_GUARD (on unless 0): a layered depth image the GPU rendered into (the game's 80-layer shadow-map
+// pool, 320 MiB, whose free layers its texture streamer borrows from the CPU) refreshes only its dirty layers, however
+// many, never all of it from guest memory (see UploadDepthPartial). KYTY_DEPTH_ARRAY_LOG=1: every event that still
+// drops such an image's rendered layers (a whole upload, a whole CPU-dirty state, a recreation, an unmap), not only
+// the first 16.
+static bool DepthArrayGuardOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_DEPTH_ARRAY_GUARD");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+static bool DepthArrayGuarded(const Image& image) {
+	return DepthArrayGuardOn() && image.IsGpuModified() && (image.info.IsDepth() || image.depth_array_alias) &&
+	       image.info.resources.layers > 1;
+}
+static void DepthArrayEvent(const char* what, const Image& image, uint64_t address, uint64_t size, const char* detail) {
+	if (!(image.info.IsDepth() || image.depth_array_alias) || image.info.resources.layers < 2 || !image.IsGpuModified()) return;
+	static const bool all = [] {
+		const char* value = std::getenv("KYTY_DEPTH_ARRAY_LOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	static std::atomic<uint32_t> reports {0};
+	if (std::strncmp(what, "a recreation", 12) != 0) {
+		ShadowPoolTrace::Count(ShadowPoolTrace::Find(image.info.data.address, image.info.resources.layers,
+		                                             image.info.extent.width, image.info.extent.height),
+		                       &ShadowPoolTrace::Pool::whole_uploads);
+	}
+	if (!all && reports.fetch_add(1, std::memory_order_relaxed) >= 16) return;
+	std::printf("Depth array: %s (its rendered layers at risk): image 0x%llx+0x%llx (%u layers, %ux%u) at 0x%llx+0x%llx "
+	            "cpu=%d partial=%d maybe=%d buffer=%d buffer_ranges=%zu tracked_whole=%d %s (KYTY_DEPTH_ARRAY_LOG=1: all)\n",
+	            what, static_cast<unsigned long long>(image.info.data.address),
+	            static_cast<unsigned long long>(image.info.data.size), image.info.resources.layers, image.info.extent.width,
+	            image.info.extent.height, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+	            image.IsCpuDirty() ? 1 : 0, image.IsPartiallyCpuDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
+	            image.IsBufferModified() ? 1 : 0, image.BufferModifiedRanges().size(),
+	            image.track_addr == image.info.data.address && image.track_addr_end == image.info.data.End() ? 1 : 0,
+	            detail != nullptr ? detail : "");
+	std::fflush(stdout);
+}
+
 // A texture the game writes while draws sample it (mip streaming: its threads write the levels while the frame is
 // translated) was dirty again at each draw, and each uploaded all of it: 6-14 times in a millisecond for one 2.75 MiB
 // texture, 1.5 GB of the 2.85 GB uploaded in a 10 s walk. While the command buffer that recorded its last whole upload
@@ -2143,10 +2320,13 @@ void TextureCache::InitializeImage(ImageId id) {
 	LiveCounters::ScopedUs timed(LiveCounters::ImageInitUs);
 	auto&             image = m_slot_images[id];
 	Clock::time_point marks[3] {Clock::now()};
-	const char*       kind = image.IsPartiallyCpuDirty() ? "partial"
-	                         : image.IsBufferModified()  ? "buffer"
-	                         : image.IsCpuDirty()        ? "cpu"
-	                                                     : "clean";
+	// (buffer: GPU buffer writes over known ranges; buffer-all: over all of it or where not known; +cpu: and CPU writes)
+	const bool        buffer_all = image.IsBufferModified() && image.BufferModifiedRanges().empty();
+	const bool        cpu        = image.IsCpuDirty();
+	const char*       kind = image.IsPartiallyCpuDirty() ? (image.IsBufferModified() ? "partial+buffer" : "partial")
+	                         : !image.IsBufferModified() ? (cpu ? "cpu" : "clean")
+	                         : buffer_all                ? (cpu ? "buffer-all+cpu" : "buffer-all")
+	                                                     : (cpu ? "buffer+cpu" : "buffer");
 	SlowLog::Scope    slow([&](double ms) {
         const auto at = [&](int i) {
             return marks[i] == Clock::time_point {}
@@ -2273,6 +2453,7 @@ void TextureCache::InitializeImage(ImageId id) {
 			}
 		}
 		if (!uploaded) {
+			DepthArrayEvent("whole upload", image, image.info.data.address, image.info.data.size, kind);
 			bool refillable = false;
 			const auto [source, source_offset] =
 			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size, &refillable);
@@ -2440,7 +2621,66 @@ bool TextureCache::CheckPartialHashes(const Image& image) {
 	return true;
 }
 
-// A depth array whose CPU writes cover some layers (the game's 80-layer shadow-map pool, whose free 4 MiB layers its
+// KYTY_SHADOW_REFRESH_FIX (on unless 0): a layer of a depth array the GPU rendered is refreshed from guest memory only
+// when its guest bytes changed since the GPU took it. Guest memory never holds the GPU's depth: re-uploading bytes that
+// did not change only replaces a rendered shadow with what the memory held before it. The game's 80-layer spot-shadow
+// pool (1024x1024 D32 at 0x102a400000, its shadows in layers 0-12 kept from flip to flip) had such layers refreshed a
+// few flips in ten at the Boletaria lamps (combo20 log 061301: 1-19 layers a flip, "Shadow pool" lines): the floor
+// shadows under the lamps came and went with wrong shapes. A layer whose bytes did change (a CPU write, another
+// mapping) is uploaded as before, and counts as the guest's until the GPU renders it again.
+static bool ShadowRefreshFixOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_SHADOW_REFRESH_FIX");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+enum : uint8_t { LayerRendered = 1, LayerDirtyByWrite = 2, LayerDirtyByMap = 4, LayerDirtyByUnmap = 8 };
+static bool LayerOwnerCandidate(const Image& image) {
+	const auto& info = image.info;
+	return ShadowRefreshFixOn() && info.IsDepth() && !info.IsVolume() && info.resources.levels == 1 &&
+	       info.resources.layers >= 2 && info.samples == 1 && !info.data.Empty() &&
+	       info.data.size % info.resources.layers == 0;
+}
+
+void TextureCache::NoteDepthLayersRendered(Image& image, uint32_t first, uint32_t count) {
+	if (!LayerOwnerCandidate(image)) return;
+	const uint32_t layers = image.info.resources.layers;
+	if (first >= layers || count == 0) return;
+	count       = std::min(count, layers - first);
+	auto& owner = m_layer_owners[image.serial];
+	if (owner.state.size() != layers) {
+		owner.state.assign(layers, 0);
+		owner.hash.assign(layers, 0);
+	}
+	const uint64_t slice = image.info.data.size / layers;
+	for (uint32_t layer = first; layer < first + count; ++layer) {
+		if ((owner.state[layer] & LayerRendered) != 0) continue;
+		// (Its guest bytes as the GPU takes the layer: refreshed just before, RefreshDepthLayers.)
+		owner.state[layer] = LayerRendered;
+		owner.hash[layer]  = HashGuestRange(image.info.data.address + slice * layer, slice);
+	}
+}
+
+void TextureCache::NoteDepthLayersDirtied(const Image& image, uint64_t begin, uint64_t end, uint8_t cause) {
+	if (m_layer_owners.empty()) return;
+	const auto found = m_layer_owners.find(image.serial);
+	if (found == m_layer_owners.end()) return;
+	auto&          owner  = found->second;
+	const auto&    info   = image.info;
+	const uint32_t layers = info.resources.layers;
+	if (owner.state.size() != layers || layers == 0) return;
+	const uint64_t slice = info.data.size / layers;
+	begin                = std::max(begin, info.data.address);
+	end                  = std::min(end, info.data.End());
+	if (slice == 0 || begin >= end) return;
+	const uint64_t first = (begin - info.data.address) / slice;
+	const uint64_t last  = std::min<uint64_t>(layers, (end - info.data.address + slice - 1) / slice);
+	for (uint64_t layer = first; layer < last; ++layer) {
+		if ((owner.state[layer] & LayerRendered) != 0) owner.state[layer] |= cause;
+	}
+}
+
 // texture streamer fills from the CPU): only those layers are staged, detiled and copied (of [first_layer, last_layer)
 // only, for RefreshDepthLayers). The whole-image path staged and detiled every layer (320 MiB), 20-65 ms per refresh.
 bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32_t last_layer) {
@@ -2462,11 +2702,64 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 			picked.push_back(layer);
 		}
 	}
+	// (KYTY_SHADOW_REFRESH_FIX: the rendered layers whose guest bytes did not change since the GPU took them stay.)
+	if (!m_layer_owners.empty() && DepthArrayGuarded(image)) {
+		const auto found = m_layer_owners.find(image.serial);
+		if (found != m_layer_owners.end() && found->second.state.size() == layers) {
+			auto&    owner   = found->second;
+			uint32_t kept    = 0;
+			uint32_t changed = 0;
+			std::erase_if(picked, [&](uint32_t layer) {
+				auto& state = owner.state[layer];
+				if ((state & LayerRendered) == 0) return false;
+				const uint64_t begin = base + slice * layer;
+				const uint64_t end   = begin + slice;
+				m_buffer_cache.DrainGuestReadback(begin, slice);
+				const bool same  = HashGuestRange(begin, slice) == owner.hash[layer];
+				uint64_t   bytes = 0;
+				for (const auto& [from, to]: dirty) {
+					if (to > begin && from < end) bytes += std::min(to, end) - std::max(from, begin);
+				}
+				static std::atomic<uint32_t> reports {0};
+				if (reports.fetch_add(1, std::memory_order_relaxed) < 64) {
+					std::printf("Shadow refresh: depth array 0x%llx (%u layers %ux%u) layer %u, rendered by the GPU, dirty "
+					            "0x%llx of 0x%llx bytes (by%s%s%s%s): guest bytes %s (KYTY_SHADOW_REFRESH_FIX=0: "
+					            "uploaded)\n",
+					            static_cast<unsigned long long>(base), layers, info.extent.width, info.extent.height,
+					            layer, static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(slice),
+					            (state & LayerDirtyByWrite) != 0 ? " a CPU write" : "",
+					            (state & LayerDirtyByMap) != 0 ? " a map" : "",
+					            (state & LayerDirtyByUnmap) != 0 ? " an unmap" : "",
+					            (state & (LayerDirtyByWrite | LayerDirtyByMap | LayerDirtyByUnmap)) == 0 ? " nothing seen" : "",
+					            same ? "unchanged since: kept the GPU's" : "changed: uploaded");
+					std::fflush(stdout);
+				}
+				if (same) {
+					state = LayerRendered;
+					++kept;
+					return true;
+				}
+				state = 0; // (the guest's until the GPU renders it again)
+				++changed;
+				return false;
+			});
+			auto* pool = ShadowPoolTrace::Find(base, layers, info.extent.width, info.extent.height);
+			ShadowPoolTrace::Count(pool, &ShadowPoolTrace::Pool::refresh_kept, kept);
+			ShadowPoolTrace::Count(pool, &ShadowPoolTrace::Pool::refresh_changed, changed);
+		}
+	}
 	if (picked.empty()) {
 		LiveCounters::Add(LiveCounters::PartialUploads);
 		return true;
 	}
-	if (slice * picked.size() > info.data.size / PartialUploadMaxShare) {
+	if (image.IsGpuModified()) {
+		ShadowPoolTrace::Count(ShadowPoolTrace::Find(info.data.address, layers, info.extent.width, info.extent.height),
+		                       &ShadowPoolTrace::Pool::refreshed_layers, static_cast<uint32_t>(picked.size()));
+	}
+	// (The share is a cost limit: past it a whole upload is cheaper. Not for an array the GPU rendered into: a whole
+	// upload replaces its rendered layers with guest memory, which never held them - the shadow-map pool's spot shadows,
+	// kept from frame to frame, came back as stale depth: black shapes on lit floors, DepthArrayGuard.)
+	if (slice * picked.size() > info.data.size / PartialUploadMaxShare && !DepthArrayGuarded(image)) {
 		return PartialFail("depth_share");
 	}
 	// Runs of consecutive layers stage as one piece each.
@@ -2787,7 +3080,8 @@ bool TextureCache::UploadImagePartial(Image& image, uint64_t window_begin, uint6
 		picked += tile.tiled_size;
 	}
 	// (A window's refresh leaves the rest dirty: no whole upload instead.)
-	if (window_begin == 0 && window_end == UINT64_MAX && picked > info.data.size / PartialUploadMaxShare) {
+	if (window_begin == 0 && window_end == UINT64_MAX && picked > info.data.size / PartialUploadMaxShare &&
+	    !DepthArrayGuarded(image)) {
 		return PartialFail("share");
 	}
 	if (picks.empty()) {
@@ -3113,11 +3407,19 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		EXIT("TextureCache: stencil association requires a depth/stencil image\n");
 	}
 
+	// (Not an image the GPU draws or writes to at that address: memory it shares with the stencil plane (a pool of
+	// targets reused while an area loads) made it the depth image's from then on, and the next draw to it ended the
+	// emulator, "color target requires rediscovery before final acquisition" (issue #94, fast travel to 1-1). A record of
+	// its own beside it.)
 	ImageId association {};
 	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
 		const auto owner = m_slot_images.try_get(id);
-		if (owner != nullptr && owner->info.data.address == stencil.address) {
+		if (owner == nullptr || owner->info.data.address != stencil.address) continue;
+		if (!owner->usage.render_target && !owner->usage.depth_target && !owner->usage.storage) {
 			association = id;
+		} else if (static std::atomic<uint32_t> reports {0}; reports.fetch_add(1, std::memory_order_relaxed) < 4) {
+			std::printf("TextureCache: a %s target at 0x%llx shares its memory with a depth image's stencil: kept apart\n",
+			            owner->usage.depth_target ? "depth" : "color", static_cast<unsigned long long>(stencil.address));
 		}
 	}
 	if (!association) {
@@ -3625,6 +3927,12 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	                  image.IsCpuDirty() ? 1 : 0, image.IsBufferModified() ? 1 : 0, image.views.size());
     });
 	TouchImage(image);
+	if (image.info.resources.layers >= 6 && (image.info.IsDepth() || image.depth_array_alias)) {
+		ShadowPoolTrace::Count(ShadowPoolTrace::Find(image.info.data.address, image.info.resources.layers,
+		                                             image.info.extent.width, image.info.extent.height),
+		                       desc.type == BindingType::Storage ? &ShadowPoolTrace::Pool::storage
+		                                                         : &ShadowPoolTrace::Pool::samples);
+	}
 	if (!image.info.data.Empty()) {
 		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
@@ -3718,6 +4026,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		if (changed) m_meta_epoch.fetch_add(1, std::memory_order_release);
 	}
 	CommitGpuWrite(image, scoped);
+	NoteDepthLayersRendered(image, desc.view_info.base_layer, desc.view_info.layer_count);
 	if (desc.info.HasStencil()) {
 		AssociateStencil(id, desc.info.stencil);
 	}
@@ -3812,6 +4121,11 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
 	auto& image = m_slot_images[id];
+	if (image.info.resources.layers >= 6 && (image.info.IsDepth() || image.depth_array_alias)) {
+		ShadowPoolTrace::Count(ShadowPoolTrace::Find(image.info.data.address, image.info.resources.layers,
+		                                             image.info.extent.width, image.info.extent.height),
+		                       &ShadowPoolTrace::Pool::clears);
+	}
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
 	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
@@ -4657,6 +4971,36 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	return false;
 }
 
+namespace {
+
+// KYTY_SLOW_LOG_MS: a large image a CPU write or a map made dirty whole, or a partial unmap deleted, and why it took no
+// partial dirty state (TextureCache::TryInvalidatePartial).
+void LogFullDirty(const char* why, const Image& image, uint64_t address, uint64_t size, bool candidate) {
+	if (SlowLog::Threshold() <= 0.0 || image.info.data.size < PartialDirtyMinSize || !image.IsTracked() ||
+	    kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	const auto& info = image.info;
+	std::printf("[tsc %llu] FULL-DIRTY %s addr=0x%llx size=0x%llx write=0x%llx+0x%llx candidate=%d "
+	            "(depth_id=%d backing=%d samples=%u volume=%d depth=%d stencil_plane=%d compression=%u) "
+	            "registered=%d tracked=%d whole=%d take=%d maybe=%d cpu=%d partial=%d gpu=%d buffer=%d "
+	            "buffer_ranges=%zu stencil=%d\n",
+	            static_cast<unsigned long long>(__rdtsc()), why, static_cast<unsigned long long>(info.data.address),
+	            static_cast<unsigned long long>(info.data.size), static_cast<unsigned long long>(address),
+	            static_cast<unsigned long long>(size), candidate ? 1 : 0, image.depth_id ? 1 : 0,
+	            image.backing.image != nullptr ? 1 : 0, info.samples, info.IsVolume() ? 1 : 0, info.IsDepth() ? 1 : 0,
+	            info.HasStencil() ? 1 : 0, static_cast<uint32_t>(info.metadata.compression), image.registered ? 1 : 0,
+	            image.IsTracked() ? 1 : 0,
+	            image.track_addr == info.data.address && image.track_addr_end == info.data.End() ? 1 : 0,
+	            image.CanTakePartialDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
+	            image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsPartiallyCpuDirty() ? 1 : 0,
+	            image.IsGpuModified() ? 1 : 0, image.IsBufferModified() ? 1 : 0, image.BufferModifiedRanges().size(),
+	            image.IsStencilModified() ? 1 : 0);
+	std::fflush(stdout);
+}
+
+} // namespace
+
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	const auto page_begin = address & ~(TRACKER_PAGE_SIZE - 1);
 	const auto page_end   = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
@@ -4666,36 +5010,19 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			continue;
 		}
 		if (owner->Overlaps(address, size)) {
+			{
+				const auto base = owner->info.data.address;
+				const auto from = std::max(address, base) - base;
+				NoteDepthLayersDirtied(*owner, base + from / PartialDirtyGranule * PartialDirtyGranule,
+				                       base + ((std::max(address + size, base + 1) - base - 1) / PartialDirtyGranule + 1) *
+				                                  PartialDirtyGranule,
+				                       LayerDirtyByWrite);
+			}
 			if (TryInvalidatePartial(*owner, address, size, PartialDirtyGranule)) {
 				continue;
 			}
-			if (SlowLog::Threshold() > 0.0 && owner->info.data.size >= PartialDirtyMinSize &&
-			    owner->IsTracked() &&
-			    kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) != 0) {
-				std::printf("[tsc %llu] FULL-DIRTY addr=0x%llx size=0x%llx write=0x%llx+0x%llx candidate=%d "
-				            "(depth_id=%d backing=%d samples=%u volume=%d depth=%d stencil_plane=%d compression=%u) "
-				            "registered=%d tracked=%d whole=%d take=%d maybe=%d cpu=%d partial=%d gpu=%d buffer=%d "
-				            "stencil=%d\n",
-				            static_cast<unsigned long long>(__rdtsc()),
-				            static_cast<unsigned long long>(owner->info.data.address),
-				            static_cast<unsigned long long>(owner->info.data.size),
-				            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
-				            PartialDirtyCandidate(*owner) ? 1 : 0, owner->depth_id ? 1 : 0,
-			            owner->backing.image != nullptr ? 1 : 0, owner->info.samples,
-			            owner->info.IsVolume() ? 1 : 0, owner->info.IsDepth() ? 1 : 0,
-			            owner->info.HasStencil() ? 1 : 0,
-			            static_cast<uint32_t>(owner->info.metadata.compression), owner->registered ? 1 : 0,
-				            owner->IsTracked() ? 1 : 0,
-				            owner->track_addr == owner->info.data.address &&
-				                    owner->track_addr_end == owner->info.data.End()
-				                ? 1
-				                : 0,
-				            owner->CanTakePartialDirty() ? 1 : 0, owner->IsMaybeCpuDirty() ? 1 : 0,
-				            owner->IsDefinitelyCpuDirty() ? 1 : 0, owner->IsPartiallyCpuDirty() ? 1 : 0,
-				            owner->IsGpuModified() ? 1 : 0, owner->IsBufferModified() ? 1 : 0,
-				            owner->IsStencilModified() ? 1 : 0);
-				std::fflush(stdout);
-			}
+			LogFullDirty("write", *owner, address, size, PartialDirtyCandidate(*owner));
+			DepthArrayEvent("a CPU write (whole image dirty)", *owner, address, size, nullptr);
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id, "cpu-write");
 			continue;
@@ -4840,9 +5167,12 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
+		NoteDepthLayersDirtied(*owner, address & ~(TRACKER_PAGE_SIZE - 1), address + size, LayerDirtyByMap);
 		if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
 			continue;
 		}
+		LogFullDirty("map", *owner, address, size, PartialDirtyCandidate(*owner));
+		DepthArrayEvent("a map (whole image dirty)", *owner, address, size, nullptr);
 		owner->InvalidateCpuWrite(address, size);
 		UntrackImage(id, "map");
 	}
@@ -4875,6 +5205,12 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}, SlowLog::HitchThreshold());
 	std::scoped_lock lock {m_lock};
 	const auto       end = address + size;
+	// (KYTY_CUBE_SHADOW_FIX: a shadow pool's parked twin goes with its memory, not 1800 flips later.)
+	std::erase_if(m_parked, [&](const auto& item) {
+		if (item.second.keep <= 1 || item.first < address || item.first >= end) return false;
+		RetireImage(item.second.id);
+		return true;
+	});
 	bool             erased_metadata = false;
 	for (auto metadata = m_surface_metas.lower_bound(address);
 	     metadata != m_surface_metas.end() && metadata->first < end;) {
@@ -4901,12 +5237,16 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		// layer's memory at a time. The unmapped span becomes dirty (read back as it is when
 		// the image is next used) and stays unwatched until then; MapMemory marks it again
 		// when memory returns there.
-		if ((address > owner->info.data.address || address + size < owner->info.data.End()) &&
-		    TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
-			LiveCounters::Add(LiveCounters::PartialUnmaps);
-			++slow_partial;
-			continue;
+		if (address > owner->info.data.address || address + size < owner->info.data.End()) {
+			NoteDepthLayersDirtied(*owner, address & ~(TRACKER_PAGE_SIZE - 1), address + size, LayerDirtyByUnmap);
+			if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
+				LiveCounters::Add(LiveCounters::PartialUnmaps);
+				++slow_partial;
+				continue;
+			}
+			LogFullDirty("unmap", *owner, address, size, PartialDirtyCandidate(*owner));
 		}
+		DepthArrayEvent("an unmap (image deleted)", *owner, address, size, nullptr);
 		++slow_deleted;
 		slow_bytes += owner->info.data.size;
 		if (owner->info.data.size > slow_largest) {
@@ -4936,16 +5276,33 @@ void TextureCache::EraseRetired() {
 // faults 73 -> 232), and they held their video memory for good. One the game draws again is made again from its bytes.
 // Passed over (to the back of the list): images whose bytes only the GPU has (no download here), depth images with a
 // stencil association (deleting depth deletes it too), unregistered ones.
+// Texture pools of the world the game is in stay where the budget is 12 GiB or more (the collector below takes them,
+// oldest first, when it runs): one-level arrays of ChunkedUploadMin and up that shaders only sample. The game samples a
+// pool through views from a few first layers to a last one that moves as it streams, and leaves one for minutes as the
+// camera moves on: retired, the next view made it again whole from guest memory (2-2 and 5-2 tours: 1.3-2 GB, 150-460
+// ms frames, 2-3 times a map), where the image kept serves it or gives its layers on the GPU (HoldLayers). A kept
+// pool's watchers take a fault per MiB the game writes at most (partial dirty state). One last used before the game
+// entered its world (SceneTags) goes as before: the memory of the worlds left comes back.
 void TextureCache::RetireStaleImages(uint64_t tick) {
 	constexpr uint64_t RetireTicks    = 1200;
 	constexpr size_t   MaxRetirements = 16;
+	if (const auto generation = SceneTags::Generation(); generation != m_scene_generation) {
+		m_scene_generation = generation;
+		m_scene_tick       = tick;
+	}
 	if (tick <= RetireTicks) return;
 	thread_local std::vector<ImageId> stale, kept;
 	stale.clear();
 	kept.clear();
+	const bool keep_pools = !m_graphics.small_video_memory;
 	m_lru_cache.ForEachItemBelow(tick - RetireTicks, [&](ImageId id) {
 		const auto* owner = m_slot_images.try_get(id);
 		if (owner == nullptr || !owner->registered) return false;
+		// (Left at its age: the collector's.)
+		if (keep_pools && owner->info.resources.levels == 1 && owner->info.resources.layers > 1 &&
+		    owner->info.data.size >= ChunkedUploadMin && GuestTexture(*owner) &&
+		    m_lru_cache.TickOf(owner->lru_id) >= m_scene_tick)
+			return false;
 		if (owner->depth_id || owner->IsGpuModified())
 			kept.push_back(id);
 		else
@@ -4993,11 +5350,12 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t   tick = m_gc_tick++;
 	// Parked images not taken back since the flip before: the game left that use of the memory.
 	std::erase_if(m_parked, [&](const auto& item) {
-		if (item.second.tick + 1 >= tick) return false;
+		if (item.second.tick + item.second.keep >= tick) return false;
 		RetireImage(item.second.id);
 		return true;
 	});
 	RetireStaleImages(tick);
+	ShadowPoolTrace::Flip(tick);
 	if (TextureOffload::Enabled()) OffloadScan(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
@@ -5104,10 +5462,25 @@ void TextureCache::RunGarbageCollector() {
 	// in Boletaria (10 minutes, 1-1 to the first tower), as the images unused for 600 flips came at 40 a flip.
 	// Less the room game buffers in use that got system memory need back (BufferCache::MoveSpilledBufferBack).
 	constexpr uint64_t GiB           = uint64_t {1} << 30u;
-	const uint64_t     collect_above = m_trigger_gc_memory - std::min(m_trigger_gc_memory, m_buffer_cache.SpilledRoom());
+	const uint64_t     normal_above  = m_trigger_gc_memory - std::min(m_trigger_gc_memory, m_buffer_cache.SpilledRoom());
+	uint64_t           collect_above = normal_above;
+	// Critical RAM pressure (ram-guard.h): images no draw used for 600 flips go (uploaded again from guest memory at
+	// their next use; GPU-written ones as below) down to 1 GiB under the use when it began, not under 2 GiB. The target
+	// is held while the pressure lasts: not a collection that follows the use down.
+	static uint64_t ram_target = 0;
+	bool            by_ram     = false;
+	if (RamGuard::PressureLevel() >= RamGuard::Critical && m_total_used_memory != 0) {
+		if (ram_target == 0) ram_target = std::max<uint64_t>(2 * GiB, m_total_used_memory > GiB ? m_total_used_memory - GiB : 0);
+		if (ram_target < collect_above) {
+			by_ram        = m_total_used_memory < normal_above;
+			collect_above = ram_target;
+		}
+	} else {
+		ram_target = 0;
+	}
 	const uint64_t     over          = m_total_used_memory > collect_above ? m_total_used_memory - collect_above : 0;
-	const uint64_t     StaleTicks    = over >= 2 * GiB ? 120 : over >= GiB ? 300 : 600;
-	const size_t       MaxDeletions  = over >= 2 * GiB ? 160 : over >= GiB ? 80 : 40;
+	const uint64_t     StaleTicks    = by_ram ? 600 : over >= 2 * GiB ? 120 : over >= GiB ? 300 : 600;
+	const size_t       MaxDeletions  = by_ram ? 40 : over >= 2 * GiB ? 160 : over >= GiB ? 80 : 40;
 	// For a while after the GPU could not make an image (InsertImage), images unused for FailedRetryTicks go too: the
 	// superseded ones whose memory it needs (issue #49: a 16 GB GPU full of texture-pool images).
 	const bool     failing     = m_failed_tick != 0 && tick < m_failed_tick + 600;
@@ -5144,6 +5517,10 @@ void TextureCache::RunGarbageCollector() {
 		if (owner == nullptr || !owner->registered) {
 			continue;
 		}
+		// (For the RAM pressure only images whose bytes are guest memory's: none the GPU wrote.)
+		if (by_ram && owner->IsGpuModified()) {
+			continue;
+		}
 		if (owner->IsGpuModified()) {
 			if (SafeToDownload(*owner) && !TryDownloadImage(id)) {
 				continue;
@@ -5158,6 +5535,7 @@ void TextureCache::RunGarbageCollector() {
 			            static_cast<unsigned long long>(m_total_used_memory));
 			std::fflush(stdout);
 		}
+		if (by_ram) RamGuard::NoteReleased(RamGuard::Images, 1, owner->info.data.size);
 		DeleteImage(id);
 		LiveCounters::Add(LiveCounters::GcImageDeletes);
 	}

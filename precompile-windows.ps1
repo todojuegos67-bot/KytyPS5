@@ -28,8 +28,10 @@
 # into shards, a below-normal-priority process each (kyty_shader_precompile --shard i/n), whose caches
 # are merged into the static cache at the end. The shards are small (-Shards, about 100 pipelines each):
 # after a few hundred pipelines NVIDIA compresses binaries with a dictionary of its own, which only that
-# PC reads (pipelineBinaries.h); a shard that got there anyway left the rest out (exit code 3) and runs
-# again as two. recorded-<title>_<version>.seeds next to the seed file (-Recorded) adds the specializations of
+# PC reads (pipelineBinaries.h); a shard stops at 160 (KYTY_PRECOMPILE_SHARD_CAP) or where the dictionary came
+# anyway, leaves the rest (exit code 3) and runs again as two. A dictionary from a shard's first pipeline on came
+# from the driver's own cache, which then ends the run (issue #107: it splits every shard without end).
+# recorded-<title>_<version>.seeds next to the seed file (-Recorded) adds the specializations of
 # recorded play; a PC without a recording of its own (a release) gets those of the specialization hints the release
 # ships (tools\local\static-precompile\hints-<title>_<version>.hints: recordings without the game's code), completed
 # with the code of the seed file into hinted-<title>_<version>.seeds (kyty_shader_precompile --apply-hints, a second).
@@ -218,6 +220,13 @@ if ($Recorded -eq '*') {
 		}
 	}
 }
+# The pipelines a seed file's dry run planned as its own (its plan line), 0 without one.
+function Get-PlannedPipelines([string]$name) {
+	$line = Select-String -LiteralPath "$logs\$name.out.log" -Pattern "of them this seed file's" -SimpleMatch -ErrorAction SilentlyContinue |
+		Select-Object -Last 1
+	if ($line -and $line.Line -match '\((\d+) pipelines, (\d+) of them') { return [int64]$Matches[2] }
+	return 0
+}
 # The pipeline recipes of a seed file (its body after the identity line and checksum: the records, each its word
 # count and words, then the recipes' count).
 function Get-SeedPipelines([string]$file) {
@@ -335,13 +344,17 @@ if (!$Quick) {
 }
 $first  = [System.Collections.Generic.Queue[object]]::new()
 $second = [System.Collections.Generic.Queue[object]]::new()
+# About 100 pipelines a shard, as the plan counts them. (The recorded seed file's graphics recipes alone counted half of
+# its pipelines: 1.07's hints made shards of about 240, past where NVIDIA's driver compresses with its dictionary.)
 if ($hasRecorded) {
-	# About as many pipelines a shard as the seeds' (100: a recording of every world holds about 16000).
-	$count = [math]::Max(1, [math]::Ceiling((Get-SeedPipelines $Recorded) / 100))
+	$planned = Get-PlannedPipelines 'plan-recorded'
+	if ($planned -le 0) { $planned = 2 * (Get-SeedPipelines $Recorded) }
+	$count = [math]::Max(1, [math]::Ceiling($planned / 100))
 	for ($i = 0; $i -lt $count; $i++) { $first.Enqueue(@($Recorded, "$i/$count")) }
 }
 if (!$Quick) {
-	for ($i = 0; $i -lt $Shards; $i++) { $second.Enqueue(@($Seeds, "$i/$Shards")) }
+	$count = [math]::Max($Shards, [math]::Ceiling((Get-PlannedPipelines 'plan-seeds') / 100))
+	for ($i = 0; $i -lt $count; $i++) { $second.Enqueue(@($Seeds, "$i/$count")) }
 }
 # The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that the seeds of several
 # shards make (a third of them) is compiled once.
@@ -382,6 +395,14 @@ while ($first.Count -or $second.Count -or $running.Count) {
 		$running.Remove($name)
 		Remove-NvidiaCache $process
 		if ($process.ExitCode -eq 3) {
+			# NVIDIA's dictionary from the shard's first pipeline on: the driver has it from its own cache, and every
+			# smaller shard would too (issue #107).
+			if (Select-String -LiteralPath "$logs\$name.out.log" -Pattern 'dictionary from here on (after 0 captured' -SimpleMatch -Quiet) {
+				throw ("$name : NVIDIA's driver compressed even its first pipeline with a dictionary, which comes from the " +
+					"driver's own shader cache, so the precompile cannot keep its pipelines. Close this window, delete the folders " +
+					"GLCache and DXCache in $env:LOCALAPPDATA\NVIDIA (the driver's shader caches; games make theirs again) and " +
+					"start the precompile again: what it finished is kept. Logs: $logName")
+			}
 			$i, $n = [int[]]($shard -split '/')
 			if ($n -ge 65536) { throw "$name cannot be split further; logs: $logName" }
 			$queue = $second

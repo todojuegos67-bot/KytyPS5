@@ -1,4 +1,5 @@
 #include "local/skip-shader.h"
+#include "local/hwrt-scene.h"
 #include "local/sync-stats.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "live-trace-gpu.h"
@@ -19,6 +20,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/cache/shadowPoolTrace.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -730,7 +732,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
-			target.image_id = cache.FindImage(target.desc);
+			// (Asked again as at first: the lookup moved the view into the image it found then, a larger one.)
+			target.desc.view_info.base_level = target.guest_mip_level;
+			target.desc.view_info.base_layer = target.guest_array_layer;
+			target.image_id                  = cache.FindImage(target.desc);
 			BindRenderTarget(target.image_id);
 		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
@@ -844,6 +849,24 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto writable = depth.AttachmentWriteAspects() & vk::ImageAspectFlagBits::eStencil;
 		if (depth.depth_write_enable) {
 			writable |= vk::ImageAspectFlagBits::eDepth;
+		} else if (depth.depth_load_clear_enable && DepthClearStoreFix()) {
+			// (KYTY_SPOT_FIX6: the load clear writes the depth; a read-only layout stored nothing, depthRenderTarget.h.)
+			writable |= vk::ImageAspectFlagBits::eDepth;
+			static std::atomic<uint32_t> cleared {0};
+			const uint32_t               n = cleared.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (n <= 4 || (n & (n - 1)) == 0) {
+				std::printf("Depth clears: %u cleared by a draw that writes no depth, stored (was dropped; last 0x%llx "
+				            "layer %u+%u %ux%u; KYTY_SPOT_FIX6=0: as before)\n",
+				            n, static_cast<unsigned long long>(image.info.data.address), depth.desc.view_info.base_layer,
+				            depth.desc.view_info.layer_count, depth.desc.info.extent.width, depth.desc.info.extent.height);
+				std::fflush(stdout);
+			}
+		}
+		if (image.info.resources.layers >= 6) {
+			ShadowPoolTrace::DepthBind(ShadowPoolTrace::Find(image.info.data.address, image.info.resources.layers,
+			                                                 image.info.extent.width, image.info.extent.height),
+			                           depth.desc.view_info.base_layer, depth.desc.view_info.layer_count,
+			                           depth.depth_clear_enable, depth_meta_clear, depth.depth_write_enable);
 		}
 		const auto pixel_writable = feedback ? writable & ~vk::ImageAspectFlagBits::eDepth : writable;
 		if (static_cast<bool>(image.binding.pixel_sampled_aspects & pixel_writable) ||
@@ -1520,6 +1543,10 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                    info.extent.width == info.extent.height && info.extent.width >= 512;
 		FrameGen::OnShadowDraw(state.vs_input_info.stage.program->shader_hash, state.vs_input_info.stage.resources.flattened_srt,
 		                       target);
+		// (KYTY_RT_SUN: a sun cascade's draw: its layer and light matrix)
+		if (target && FrameGen::RtSunWanted())
+			FrameGen::OnSunCascadeDraw(state.vs_input_info.stage.program->shader_hash, state.vs_input_info.stage.resources.flattened_srt,
+			                           state.depth_info.desc.view_info.base_layer, info.data.address);
 	}
 	if (FrameGen::SsrWanted() && state.vs_input_info.stage.program != nullptr) {
 		// (KYTY_SSR, read only: the camera for its up direction, and the G-buffer draws' color targets.)
@@ -1545,6 +1572,8 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			                       std::span<const FrameGen::SsrTarget>(targets.data(), n));
 		}
 	}
+	if (HwScene::Active() && state.vs_input_info.stage.program != nullptr) // (KYTY_HWRT: the camera)
+		HwScene::NoteCamera(state.vs_input_info.stage.program->shader_hash, state.vs_input_info.stage.resources.flattened_srt);
 	if (FrameGen::Capturing() && state.vs_input_info.stage.program != nullptr) {
 		FrameGen::OnDraw(state.vs_input_info.stage.program->shader_hash,
 		                 state.vs_input_info.stage.resources.flattened_srt);
@@ -1607,7 +1636,30 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		return true;
 	};
 	const bool full_screen_pass = full_screen && (AsyncDrawSyncSmall() || !targets_written());
-	if (AsyncDrawPipelines() && !full_screen_pass) {
+	// KYTY_ASYNC_SHADOW_SYNC (on unless 0): a depth-only draw into a layered depth array (the spot-shadow pool
+	// 1024x1024x80, the sun cascades) keeps the blocking compile. The game renders a static light's layer once and
+	// samples it for many frames after: an occluder dropped while its pipeline compiled (or was made again after an
+	// idle eviction, KYTY_RAM_DIET / KYTY_PIPELINE_EVICT_SECONDS) stays missing from that layer until the game
+	// re-renders it - sharp lit floor patches under the Boletaria hall lamps that come and go as the lights' layers
+	// are reassigned. Depth-only pipelines compile in a few ms.
+	const bool shadow_layer_pass = [&] {
+		static const bool on = [] {
+			const char* value = std::getenv("KYTY_ASYNC_SHADOW_SYNC");
+			return value == nullptr || value[0] != '0';
+		}();
+		return on && state.color_count == 0 && state.depth_info.image_id &&
+		       state.depth_info.desc.info.resources.layers >= 2 && state.depth_info.desc.info.IsDepth();
+	}();
+	if (shadow_layer_pass && AsyncDrawPipelines()) {
+		static std::atomic<uint64_t> shadow_sync {0};
+		const auto n = shadow_sync.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((n & (n - 1)) == 0 && n >= 1024 && n <= (uint64_t {1} << 20)) {
+			std::printf("Async draw pipelines: %llu shadow-layer draws kept the blocking compile (KYTY_ASYNC_SHADOW_SYNC=0: "
+			            "skipped while compiling)\n",
+			            static_cast<unsigned long long>(n));
+		}
+	}
+	if (AsyncDrawPipelines() && !full_screen_pass && !shadow_layer_pass) {
 		auto& cache    = m_context.GetPipelineCache();
 		const auto try_create = [&] {
 			return cache.TryCreateGraphicsPipeline(std::span {state.color_info, state.color_count}, state.depth_info,
@@ -1811,6 +1863,33 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		FrameGen::BeforeFlipDraw(buffer, rendering, state.color_info[flip_slot].image_id, static_cast<uint32_t>(flip_slot),
 		                         std::span<const TextureBinding> {bindings.pixel->images}, emit_draw);
 	}
+	// (rtparticles) KYTY_RT_PARTICLES: the scene color copied before the frame's first blended draw into it (the particle
+	// pass); its census. Before the pass begins (it may end the one in progress and resume it).
+	if (FrameGen::RtParticlesWanted() && flip_slot < 0 && !record_draw && state.color_count > 0 && state.color_info[0].image_id &&
+	    rendering.num_color_attachments > 0) {
+		const auto&          hw = buffer.GetRegisters();
+		const auto&          bc = hw.GetBlendControl(state.color_info[0].target_slot);
+		const auto&          dc = hw.GetDepthControl();
+		const auto&          ci = state.color_info[0];
+		FrameGen::SceneDraw  sd;
+		sd.target      = ci.image_id;
+		sd.address     = ci.desc.info.data.address;
+		sd.width       = ci.Extent().width;
+		sd.height      = ci.Extent().height;
+		sd.format      = static_cast<int32_t>(ci.desc.view_info.format);
+		sd.vs          = state.vs_input_info.stage.program != nullptr ? state.vs_input_info.stage.program->shader_hash : 0;
+		sd.ps          = state.ps_active && state.ps_input_info.stage.program != nullptr ? state.ps_input_info.stage.program->shader_hash : 0;
+		sd.blend       = bc.enable;
+		sd.src_blend   = static_cast<uint8_t>(bc.color_srcblend);
+		sd.dst_blend   = static_cast<uint8_t>(bc.color_destblend);
+		sd.comb        = static_cast<uint8_t>(bc.color_comb_fcn);
+		sd.depth_test  = state.depth_info.image_id && dc.z_enable;
+		sd.depth_write = state.depth_info.image_id && dc.z_write_enable;
+		sd.indirect    = emit.gpu_args != 0 || !emit.direct_run.empty();
+		sd.instances   = draw.instance_count;
+		sd.index_count = draw.index_count;
+		FrameGen::BeforeSceneDraw(buffer, m_context.GetTextureCache(), rendering, rendering.color_attachments[0].image_layout, sd);
+	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	if (!record_draw) {
 		if (set_auto_debug) {
@@ -1880,6 +1959,10 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 }
 
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
+// (<windows.h> defines MemoryBarrier; the records use vk::MemoryBarrier.)
+#ifdef MemoryBarrier
+#undef MemoryBarrier
+#endif
 #include "native-xpr.inc"
 #include "table-xpr.inc"
 #endif

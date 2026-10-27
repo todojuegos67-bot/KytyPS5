@@ -102,8 +102,8 @@ std::unique_lock<std::mutex> Scratch::Use() {
 	return std::unique_lock<std::mutex>(mutex);
 }
 
-uint64_t Scratch::ReleaseIfIdle(int64_t now_ns) {
-	if (now_ns - last_use_ns.load(std::memory_order_relaxed) < 10'000'000'000ll) return 0;
+uint64_t Scratch::ReleaseIfIdle(int64_t now_ns, int64_t idle_ns) {
+	if (now_ns - last_use_ns.load(std::memory_order_relaxed) < idle_ns) return 0;
 	std::unique_lock lock(mutex, std::try_to_lock);
 	if (!lock.owns_lock()) return 0;
 	const uint64_t capacity = bytes.capacity();
@@ -132,6 +132,41 @@ uint64_t DiscardPages(void* address, uint64_t size) {
 #else
 	(void)address;
 	(void)size;
+	return 0;
+#endif
+}
+
+uint64_t FlushNow(int64_t scratch_idle_ms, char* detail, size_t detail_size) {
+#if defined(_WIN32)
+	// (One pass at a time: the soft-release thread's own passes and the RAM guard's.)
+	static std::mutex flushing;
+	const std::lock_guard serial(flushing);
+	const auto [before, ws_before] = Usage();
+	uint64_t sources = 0;
+	{
+		std::vector<std::pair<const char*, uint64_t (*)()>> list;
+		{
+			std::lock_guard lock(g_mutex);
+			list = g_sources;
+		}
+		for (const auto& [name, release]: list) sources += release();
+	}
+	uint64_t scratch = 0;
+	{
+		const auto now = NowNs();
+		std::lock_guard lock(g_scratch_mutex);
+		for (auto* s: g_scratches) scratch += s->ReleaseIfIdle(now, std::max<int64_t>(0, scratch_idle_ms) * 1'000'000ll);
+	}
+	const size_t heaps = CompactHeaps();
+	const auto [after, ws_after] = Usage();
+	const uint64_t released = std::max<uint64_t>(before > after ? before - after : 0, ws_before > ws_after ? ws_before - ws_after : 0);
+	if (detail != nullptr && detail_size != 0)
+		std::snprintf(detail, detail_size, "heaps %zu compacted, scratch %.1f MiB, free pools %.1f MiB", heaps,
+		              static_cast<double>(scratch) / 1048576.0, static_cast<double>(sources) / 1048576.0);
+	return released;
+#else
+	(void)scratch_idle_ms;
+	if (detail != nullptr && detail_size != 0) detail[0] = '\0';
 	return 0;
 #endif
 }

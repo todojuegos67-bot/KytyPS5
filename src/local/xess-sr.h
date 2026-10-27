@@ -43,6 +43,10 @@ struct UpscaleDesc {
 	bool               reset = false;
 	float jitter[2] {0.0f, 0.0f}; // (pixels, as DLSS takes it: the raw jittered frame of KYTY_TAA_REPLACE=upscaler)
 	float mv_scale[2] {0.0f, 0.0f}; // vectors * scale = pixels to the previous frame (0: the TAA's UV vectors)
+	// (rtparticles) KYTY_RT_PARTICLES=2: the particle reactive mask (R8, render size, SHADER_READ_ONLY_OPTIMAL; null:
+	// none): XeSS's responsive pixel mask (the context is made with XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK at level 2).
+	const VulkanImage* mask      = nullptr;
+	vk::ImageView      mask_view = nullptr;
 };
 // Color, depth and motion in SHADER_READ_ONLY_OPTIMAL, the output in GENERAL.
 bool Upscale(const UpscaleDesc& desc);

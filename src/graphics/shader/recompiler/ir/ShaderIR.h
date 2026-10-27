@@ -121,6 +121,8 @@ struct ImageResource {
 	// range is empty, and indirect_mapping_offset names the flattened-SRT word that holds the
 	// offset of the key mapping.
 	static constexpr uint32_t RuntimeIndirectSearch = UINT32_MAX;
+	// max_array_index when no bound of an array image's layer coordinate was shown.
+	static constexpr uint32_t NoArrayIndexBound = UINT32_MAX;
 
 	uint32_t                      source            = 0;
 	uint32_t                      first_use_pc      = 0;
@@ -140,6 +142,10 @@ struct ImageResource {
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
+	// A sampled array image's largest layer the shader can read, counted from the view's base layer (ResourceTracking:
+	// every sample and gather of it takes its layer coordinate from values of a known range). Its view needs no layer
+	// past it (descriptors.cpp TextureViewInfo).
+	uint32_t                      max_array_index = NoArrayIndexBound;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -724,6 +730,8 @@ struct Program: ResourcePlan {
 	// Table mode: each slot loaded where the shader reads it (Frontend::TranslatorFeatureTableSlotsAtUse), not all of
 	// them at the entry.
 	bool                          table_slots_at_use = false;
+	// Float min/max as host instructions (Frontend::TranslatorFeatureNativeFloatMinMax).
+	bool                          native_float_min_max = false;
 
 	std::optional<SpirvRequirements> spirv_requirements;
 };

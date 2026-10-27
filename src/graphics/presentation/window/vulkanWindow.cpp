@@ -44,6 +44,7 @@
 #include "local/xess-sr.h"
 #include "local/fsr3-fg.h"
 #include "local/anti-lag.h"
+#include "local/hwrt-scene.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -628,13 +629,18 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	// XT (RDNA4, Linux RADV: page faults or a ring timeout) at their first dispatches; with them loaded at use, or those
 	// 4 on the normal path, the fight passed (issue #51). A store made without it is out of date there (precompile
 	// again); until then its table mode pipelines are compiled at their first use.
+	// Float min/max as host instructions only on AMD GPUs (Translate::TranslatorFeatureNativeFloatMinMax).
 	namespace Translate = ShaderRecompiler::Frontend;
+	const bool     amd      = device_properties.vendorID == 0x1002u;
+	const uint32_t features = amd ? Translate::TranslatorFeatures
+	                              : Translate::TranslatorFeatures & ~Translate::TranslatorFeatureNativeFloatMinMax;
 	if (device_properties.vendorID != 0x10deu) {
-		const bool amd = device_properties.vendorID == 0x1002u;
-		Translate::SetTranslatorDeviceFeatures(Translate::TranslatorFeatures & ~Translate::TranslatorFeatureCooperativeHalves,
+		Translate::SetTranslatorDeviceFeatures(features & ~Translate::TranslatorFeatureCooperativeHalves,
 		                                       amd ? Translate::TranslatorFeatureTableSlotsAtUse : 0u);
 		std::printf("Cooperative halves: off on this GPU (tested on NVIDIA GPUs; KYTY_LANE_LOCAL_COOP=1 forces them)%s\n",
-		            amd ? "; table mode slots loaded at use" : "");
+		            amd ? "; table mode slots loaded at use, float min/max native" : "");
+	} else {
+		Translate::SetTranslatorDeviceFeatures(features);
 	}
 	std::fflush(stdout);
 
@@ -1072,6 +1078,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	create_info.pNext = Libs::Graphics::AntiLag::ChainDeviceFeatures(anti_lag_extension, const_cast<void*>(create_info.pNext));
 	// XeSS (KYTY_UPSCALE=xess): its mutableDescriptorType feature, with its extension.
 	create_info.pNext = Libs::Graphics::Xess::ChainDeviceFeatures(device_extensions, const_cast<void*>(create_info.pNext));
+	// KYTY_HWRT=1: the acceleration structure and ray query features, when the device has them (local/hwrt-scene.h).
+	create_info.pNext = Libs::Graphics::HwScene::ChainDeviceFeatures(physical_device, device_extensions, const_cast<void*>(create_info.pNext));
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -1604,12 +1612,14 @@ void WindowContext::CreateVulkan() {
 			                                          device_extensions);
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
+		// KYTY_HWRT=1: acceleration structures and ray queries (local/hwrt-scene.h; nothing asked for without it).
+		Libs::Graphics::HwScene::AddDeviceExtensions(available_extensions, device_extensions);
 		// KYTY_ANTILAG=1: AMD Anti-Lag 2 where the device has it (local/anti-lag.h).
 		if (Libs::Graphics::AntiLag::Requested() && HasExtension(available_extensions, Libs::Graphics::AntiLag::ExtensionName()))
 			device_extensions.push_back(Libs::Graphics::AntiLag::ExtensionName());
 		// KYTY_ANTILAG=1 on NVIDIA without Streamline (whose Reflex is then active): VK_NV_low_latency2 and the
 		// present-id extension it needs.
-		if (Libs::Graphics::AntiLag::Requested() && !FrameGen::StreamlineLoaded() &&
+		if ((Libs::Graphics::AntiLag::Requested() || Libs::Graphics::AntiLag::AutoReflex()) && !FrameGen::StreamlineLoaded() &&
 		    HasExtension(available_extensions, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
@@ -1798,12 +1808,14 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 		}
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
+		// KYTY_HWRT=1: acceleration structures and ray queries (local/hwrt-scene.h; nothing asked for without it).
+		Libs::Graphics::HwScene::AddDeviceExtensions(available_extensions, device_extensions);
 		// KYTY_ANTILAG=1: AMD Anti-Lag 2 where the device has it (local/anti-lag.h).
 		if (Libs::Graphics::AntiLag::Requested() && HasExtension(available_extensions, Libs::Graphics::AntiLag::ExtensionName()))
 			device_extensions.push_back(Libs::Graphics::AntiLag::ExtensionName());
 		// KYTY_ANTILAG=1 on NVIDIA without Streamline (whose Reflex is then active): VK_NV_low_latency2 and the
 		// present-id extension it needs.
-		if (Libs::Graphics::AntiLag::Requested() && !FrameGen::StreamlineLoaded() &&
+		if ((Libs::Graphics::AntiLag::Requested() || Libs::Graphics::AntiLag::AutoReflex()) && !FrameGen::StreamlineLoaded() &&
 		    HasExtension(available_extensions, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);

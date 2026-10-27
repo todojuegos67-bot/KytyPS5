@@ -13,6 +13,9 @@
 #include "common/assert.h"
 #include "common/platform/sysVirtual.h"
 #include "common/virtualMemory.h"
+#include "local/mem-guard.h"
+
+#include <utility>
 
 // IWYU pragma: no_include <basetsd.h>
 // IWYU pragma: no_include <errhandlingapi.h>
@@ -60,12 +63,21 @@ static VirtualMemory::Mode GetProtectionFlag(DWORD mode) {
 
 void SysVirtualInit() {}
 
+// A commit refused for lack of memory (commit limit, RAM): a release pass (MemGuard) and another try, a few times;
+// then the caller's own failure path as before. Other errors fail at once. GetLastError is kept for the caller.
+template <typename F>
+static uintptr_t CommitWithRetry(const char* what, uint64_t size, F&& alloc) {
+	return MemGuard::RetryOs(what, size, std::forward<F>(alloc));
+}
+
 uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
 	auto ptr = (address == 0 ? SysVirtualAllocAligned(address, size, mode, 1)
-	                         : reinterpret_cast<uintptr_t>(VirtualAlloc(
-	                               reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
-	                               static_cast<DWORD>(MEM_COMMIT) | static_cast<DWORD>(MEM_RESERVE),
-	                               GetProtectionFlag(mode))));
+	                         : CommitWithRetry("VirtualAlloc(MEM_COMMIT)", size, [&] {
+		                           return reinterpret_cast<uintptr_t>(VirtualAlloc(
+		                               reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
+		                               static_cast<DWORD>(MEM_COMMIT) | static_cast<DWORD>(MEM_RESERVE),
+		                               GetProtectionFlag(mode)));
+	                           }));
 	if (ptr == 0) {
 		auto err = static_cast<uint32_t>(GetLastError());
 
@@ -130,17 +142,19 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 
 	EXIT_NOT_IMPLEMENTED(virtual_alloc2 == nullptr);
 
-	auto ptr = reinterpret_cast<uintptr_t>(
-	    virtual_alloc2(GetCurrentProcess(), nullptr, size,
-	                   static_cast<DWORD>(MEM_COMMIT) | static_cast<DWORD>(MEM_RESERVE),
-	                   GetProtectionFlag(mode), &param, 1));
-
-	if (ptr == 0) {
-		ptr = reinterpret_cast<uintptr_t>(
+	auto ptr = CommitWithRetry("VirtualAlloc2(MEM_COMMIT)", size, [&] {
+		auto p = reinterpret_cast<uintptr_t>(
 		    virtual_alloc2(GetCurrentProcess(), nullptr, size,
 		                   static_cast<DWORD>(MEM_COMMIT) | static_cast<DWORD>(MEM_RESERVE),
-		                   GetProtectionFlag(mode), &param2, 1));
-	}
+		                   GetProtectionFlag(mode), &param, 1));
+		if (p == 0) {
+			p = reinterpret_cast<uintptr_t>(
+			    virtual_alloc2(GetCurrentProcess(), nullptr, size,
+			                   static_cast<DWORD>(MEM_COMMIT) | static_cast<DWORD>(MEM_RESERVE),
+			                   GetProtectionFlag(mode), &param2, 1));
+		}
+		return p;
+	});
 
 	if (ptr == 0) {
 		auto err = static_cast<uint32_t>(GetLastError());
@@ -155,9 +169,11 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 }
 
 bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
-	auto ptr = reinterpret_cast<uintptr_t>(VirtualAlloc(
-	    reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
-	    static_cast<DWORD>(MEM_COMMIT) | static_cast<DWORD>(MEM_RESERVE), GetProtectionFlag(mode)));
+	auto ptr = CommitWithRetry("VirtualAlloc(MEM_COMMIT, fixed)", size, [&] {
+		return reinterpret_cast<uintptr_t>(VirtualAlloc(
+		    reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
+		    static_cast<DWORD>(MEM_COMMIT) | static_cast<DWORD>(MEM_RESERVE), GetProtectionFlag(mode)));
+	});
 	if (ptr == 0) {
 		auto err = static_cast<uint32_t>(GetLastError());
 
@@ -175,9 +191,11 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 }
 
 bool SysVirtualCommit(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
-	auto ptr = reinterpret_cast<uintptr_t>(
-	    VirtualAlloc(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
-	                 static_cast<DWORD>(MEM_COMMIT), GetProtectionFlag(mode)));
+	auto ptr = CommitWithRetry("VirtualAlloc(MEM_COMMIT)", size, [&] {
+		return reinterpret_cast<uintptr_t>(
+		    VirtualAlloc(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
+		                 static_cast<DWORD>(MEM_COMMIT), GetProtectionFlag(mode)));
+	});
 	if (ptr == 0) {
 		printf("VirtualAlloc(MEM_COMMIT) failed: 0x%08" PRIx32 "\n",
 		       static_cast<uint32_t>(GetLastError()));

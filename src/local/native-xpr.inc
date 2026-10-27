@@ -3319,6 +3319,8 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 			vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second,
 			                              group_sizes[group], static_cast<uint32_t>(stride));
 	}
+	if (FrameGen::RtParticlesDebug() && !draw_state.targets.empty()) // (rtparticles census: this path's draws by target)
+		FrameGen::NoteOtherPathDraw(draw_state.targets[0].requested.data.address, 0, false, 2);
 	if (FrameGen::Capturing()) FrameGen::AfterDraw(buffer); // (frame generation's HUD-less image)
 	emit.command     = vk_buffer;
 	emit.generation  = buffer.GraphicsGeneration();
@@ -3331,13 +3333,25 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	// KYTY_FRAMEGEN: the camera, which the normal path's draw hook reads from the G-buffer vertex
 	// shader's SRT. Without it frames drawn from records had no generated frames (and were not
 	// capped by KYTY_FLIP_RATE).
-	if (FrameGen::Enabled() && record.stage_count > 0 && record.stages[0].program != nullptr) {
+	// (Capturing, not Enabled: with DLSS/FSR/XeSS upscaling but no frame generation the G-buffer draws that come
+	// from records never gave the camera, so the RT shadows stayed off: "no camera matrix captured yet".)
+	if (FrameGen::Capturing() && record.stage_count > 0 && record.stages[0].program != nullptr) {
 		FrameGen::OnDraw(record.stages[0].program->shader_hash, record.stages[0].flattened, 'r');
 	}
+	if (HwScene::Active() && record.stage_count > 0 && record.stages[0].program != nullptr) // (KYTY_HWRT: the camera)
+		HwScene::NoteCamera(record.stages[0].program->shader_hash, record.stages[0].flattened);
 	if (FrameGen::SsrWanted() && record.stage_count > 0 && record.stages[0].program != nullptr)
 		FrameGen::OnSsrDraw(record.stages[0].program->shader_hash, record.stages[0].flattened);
 	if (FrameGen::ContactShadowsWanted() && record.stage_count > 0 && record.stages[0].program != nullptr)
 		FrameGen::OnShadowDraw(record.stages[0].program->shader_hash, record.stages[0].flattened, false);
+	// (KYTY_RT_SUN: a sun cascade's draw, a depth-only draw into a layer of a square layered depth image)
+	if (FrameGen::RtSunWanted() && record.stage_count > 0 && record.stages[0].program != nullptr && draw_state.targets.size() == 1) {
+		const auto& t = draw_state.targets[0];
+		const auto& r = t.requested;
+		if (r.IsDepth() && r.resources.layers >= 4 && r.extent.width == r.extent.height && r.extent.width >= 512)
+			FrameGen::OnSunCascadeDraw(record.stages[0].program->shader_hash, record.stages[0].flattened, t.range.base_layer,
+			                           r.data.address);
+	}
 	return true;
 }
 

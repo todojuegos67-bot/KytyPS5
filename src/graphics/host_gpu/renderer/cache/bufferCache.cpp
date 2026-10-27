@@ -2914,7 +2914,13 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 	// chain makes every frame, on the frame's critical path: 0.39 ms on this thread alone, 0.24 ms shared at Latria).
 	const auto page_of = [&](uint64_t at) { return (dst_vaddr + at) / TRACKER_PAGE_SIZE - dst_vaddr / TRACKER_PAGE_SIZE; };
 	thread_local std::vector<uint8_t> differs;
-	const bool parallel = size >= ParallelCompareBytes;
+	// (Helpers only over pages no read faults on: a helper's fault waits for this thread's
+	// readback, which waits for the helpers. CopyBuffer left out GPU-modified memory, so these are
+	// the pages the texture and file offloads hold; this thread compares such a copy alone, its own
+	// faults are served here. Only this thread adds holds.)
+	const bool parallel = size >= ParallelCompareBytes &&
+	                      !Libs::LibKernel::Memory::ReadFaults(dst_vaddr, size) &&
+	                      !Libs::LibKernel::Memory::ReadFaults(src_vaddr, size);
 	if (parallel) {
 		struct Compare {
 			uint64_t dst, src, size;
@@ -3154,6 +3160,7 @@ void BufferCache::Defragment(uint64_t tick) {
 		for (auto* allocation: m_defrag_free_later) vmaFreeMemory(allocator, allocation);
 		m_defrag_free_later.clear();
 		m_defrag_moves.clear();
+		ReleaseBufferFrees();
 		if (result != VK_INCOMPLETE) EndDefragmentation();
 		return;
 	}
@@ -3162,13 +3169,17 @@ void BufferCache::Defragment(uint64_t tick) {
 		BufferCache*                          cache;
 		std::chrono::steady_clock::time_point start;
 		bool                                  on    = false;
-		uint32_t                              moves = 0;
+		uint32_t                              moves = 0, ignored = 0;
+		double                                begin_ms = 0;
 		~Timed() {
 			if (!on) return;
 			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 			cache->m_defrag_ms += ms;
 			cache->m_defrag_max_ms = std::max(cache->m_defrag_max_ms, ms);
-			if (ms >= 4.0) std::printf("Game buffers compacting: a flip's pass took %.2f ms (%u moves)\n", ms, moves);
+			if (ms >= 4.0)
+				std::printf("Game buffers compacting: a flip's pass took %.2f ms (%u moves, %u ignored; VMA's pass begin %.2f "
+				            "ms)\n",
+				            ms, moves, ignored, begin_ms);
 		}
 	} timed {this, start};
 	if (m_defrag_pass_open) {
@@ -3203,8 +3214,13 @@ void BufferCache::Defragment(uint64_t tick) {
 	}
 	// (On the command buffer being recorded, outside a speculation: MoveSpilledBufferBack.)
 	if (!m_scheduler.Active() || m_scheduler.Current().IsInvalid() || Spec::Current() != nullptr) return;
-	timed.on = true;
-	if (vmaBeginDefragmentationPass(allocator, m_defrag, &m_defrag_pass) != VK_INCOMPLETE) {
+	// (The allocations of buffers erased before it stay till its end: their free on the reclaimer's thread waits.)
+	if (!HoldBufferFrees()) return;
+	timed.on         = true;
+	const auto begun = vmaBeginDefragmentationPass(allocator, m_defrag, &m_defrag_pass);
+	timed.begin_ms   = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+	if (begun != VK_INCOMPLETE) {
+		ReleaseBufferFrees();
 		EndDefragmentation();
 		return;
 	}
@@ -3219,6 +3235,8 @@ void BufferCache::Defragment(uint64_t tick) {
 		auto*      old = key != 0 ? m_slot_buffers.try_get(id) : nullptr;
 		if (old == nullptr || old->Allocation() != move.srcAllocation) {
 			move.operation = VMA_DEFRAGMENTATION_MOVE_OPERATION_IGNORE;
+			timed.ignored++;
+			m_defrag_ignored++;
 			continue;
 		}
 		if (old->is_deleted) {
@@ -3261,13 +3279,13 @@ void BufferCache::EndDefragmentation() {
 	VmaStatistics statistics {};
 	vmaGetPoolStatistics(m_graphics.allocator, m_graphics.game_buffer_pool, &statistics);
 	m_defrag_free_after = statistics.blockBytes - statistics.allocationBytes;
-	std::printf("Game buffers compacted: %u moved (%llu MiB), %u blocks freed (%llu MiB); %llu MiB of %llu MiB free; %u "
-	            "passes, %.1f ms (at most %.2f in a flip)\n",
-	            stats.allocationsMoved, static_cast<unsigned long long>(stats.bytesMoved >> 20u),
+	std::printf("Game buffers compacted: %u moved (%llu MiB, %u ignored), %u blocks freed (%llu MiB); %llu MiB of %llu MiB "
+	            "free; %u passes, %.1f ms (at most %.2f in a flip)\n",
+	            stats.allocationsMoved, static_cast<unsigned long long>(stats.bytesMoved >> 20u), m_defrag_ignored,
 	            stats.deviceMemoryBlocksFreed, static_cast<unsigned long long>(stats.bytesFreed >> 20u),
 	            static_cast<unsigned long long>(m_defrag_free_after >> 20u),
 	            static_cast<unsigned long long>(statistics.blockBytes >> 20u), m_defrag_passes, m_defrag_ms, m_defrag_max_ms);
-	m_defrag_passes = 0;
+	m_defrag_passes = m_defrag_ignored = 0;
 	m_defrag_ms = m_defrag_max_ms = 0;
 }
 

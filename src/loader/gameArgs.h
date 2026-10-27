@@ -16,6 +16,11 @@ struct Program;
 
 namespace Loader::GameArgs {
 
+// (10-25) The game's camera speed in effect (cp11_Setting_CameraSpeed, 0: not set): the launcher's, raised with KYTY_KBM=1
+// (or KYTY_KBM_CALIBRATE=1) to KYTY_KBM_CAM_MIN (10; 0 = keep the launcher's) so a mouse flick fits a full stick.
+int  KbmCameraSpeed();
+bool KbmCameraSpeedRaised();
+
 // The host file a read-only open of `real` should open instead (empty: `real` itself).
 std::filesystem::path RedirectRead(const std::filesystem::path& real);
 // A stat of `real`: the size of the copy a read would get (nothing: its own).

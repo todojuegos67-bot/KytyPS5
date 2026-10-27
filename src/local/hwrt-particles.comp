@@ -1,0 +1,381 @@
+#version 460
+#extension GL_EXT_ray_query : require
+// KYTY_HWRT_PARTICLES (hwrt-particles.cpp): ray-traced light from the game's emissive particles (fire, embers, sparks,
+// magic) on the PS5 Pro path's HDR scene color, before the other passes of FrameGen::Upscale.
+//   0 collect   one workgroup per screen tile: the particles' own emission (scene color - the pre-particle copy that
+//               KYTY_RT_PARTICLES' hook takes) gathered into one emitter per tile: world position (power-weighted, a
+//               little toward the camera: the depth at a flame is the wall behind it), intensity (radiance x the
+//               pixels' world area) and the tile's peak radiance
+//   1 cdf       one thread: the non-empty emitters compacted, their power CDF, the frame's total power smoothed (a
+//               burst ramps in over ~8 frames, never a flash)
+//   2 trace     trace resolution: per pixel M candidates drawn from the CDF (power), resampled by power x cos / d^2
+//               (RIS), 1-2 TLAS shadow ray queries to the chosen ones -> irradiance (rgb, a = the distance to the camera)
+//   3 temporal  motion-reprojected exponential history (distance-tested, clamped to the raw neighbourhood)
+//   4 a-trous   depth-aware 5x5 a-trous (steps 1, 2 [, 4])
+//   5 composite render size: color + albedo / pi x irradiance x strength, soft-capped by the emitters' own radiance,
+//               less on the particles themselves
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;   // the game's scene color (render size)
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2) uniform sampler2D motion_tex;
+layout(binding = 3) uniform sampler2D pre_tex;     // the scene color before the particle pass
+layout(binding = 4) uniform usampler2D packed0;    // G-buffer layer 0 (albedo rgb8; flag 1), else a 1x1 stand-in
+layout(binding = 5) uniform sampler2D hist_tex;    // last frame's accumulated irradiance (trace res)
+layout(binding = 6, rgba16f) uniform writeonly image2D aux_out; // trace: raw; temporal: history; a-trous: ping-pong
+layout(binding = 7) uniform sampler2D aux_tex;     // temporal: raw; a-trous: its input; composite: the filtered light
+layout(binding = 8, rgba16f) uniform writeonly image2D out_img; // the composited color (render size)
+
+const uint MaxLights = 576u;
+struct Light {
+	vec4 pos; // world position, w power (luminance x area)
+	vec4 col; // intensity rgb, a the tile's peak radiance (luminance)
+};
+layout(std430, binding = 9) buffer Lights {
+	vec4  head;  // x count, y total power, z smoothed total power, w the cap (peak radiance)
+	vec4  head2; // x frames with emitters, y scale applied
+	Light lights[MaxLights];
+	float cdf[MaxLights];
+	uint  idx[MaxLights];
+} lb;
+
+layout(std430, binding = 10) readonly buffer HwRayInfo {
+	vec4  inv[4]; // clip -> world rows
+	vec4  vp[4];  // world -> clip rows
+	vec4  cam;
+	vec4  info;   // x 1: valid
+	uvec4 materials;
+} hw;
+layout(binding = 11) uniform accelerationStructureEXT hw_tlas;
+
+layout(push_constant) uniform Push {
+	vec4  size;   // render w, h, trace w, h
+	vec4  params; // strength x gain, range (m), minimum distance (m), temporal alpha
+	ivec4 misc;   // mode, frame, candidates, rays
+	ivec4 misc2;  // tiles x, tiles y, sample stride, flags (1 albedo, 2 history valid, 4 view, 8 motion)
+	vec4  extra;  // motion scale x, y, a-trous step, emission threshold
+} push;
+
+bool Bad(float v) { return isnan(v) || isinf(v); }
+bool BadV(vec3 v) { return any(isnan(v)) || any(isinf(v)); }
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+vec3 Safe(vec3 c) { return BadV(c) ? vec3(0) : clamp(c, vec3(0), vec3(65000.0)); }
+
+uint Pcg(uint v) {
+	uint s = v * 747796405u + 2891336453u;
+	uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+	return (w >> 22u) ^ w;
+}
+float Rand(inout uint s) {
+	s = Pcg(s);
+	return float(s >> 8) * (1.0 / 16777216.0);
+}
+
+// A render uv and depth to world space through the game's inverse view-projection (hwrt2's convention).
+vec3 ToWorld(vec2 uv, float d) {
+	vec4 q = vec4(uv * 2.0 - 1.0, d, 1.0);
+	vec4 h = vec4(dot(hw.inv[0], q), dot(hw.inv[1], q), dot(hw.inv[2], q), dot(hw.inv[3], q));
+	return abs(h.w) > 1e-12 ? h.xyz / h.w : vec3(1e30);
+}
+// The sky / nothing drawn: a world point absurdly far.
+bool IsFar(vec3 w) { return BadV(w) || length(w - hw.cam.xyz) > 5000.0; }
+
+vec2 RenderSize() { return push.size.xy; }
+vec2 TraceSize() { return push.size.zw; }
+
+// ---------------------------------------------------------------------------------------------------------------
+// 0 collect
+shared float s_pow[64];
+shared vec3  s_col[64];
+shared vec3  s_pos[64];
+shared float s_peak[64];
+
+void Collect() {
+	uint  t     = gl_LocalInvocationIndex;
+	uvec2 tile  = gl_WorkGroupID.xy;
+	uvec2 tiles = uvec2(push.misc2.xy);
+	vec2  rs    = RenderSize();
+	vec2  t0    = floor(vec2(tile) * rs / vec2(tiles));
+	vec2  t1    = floor(vec2(tile + 1u) * rs / vec2(tiles));
+	int   st    = max(push.misc2.z, 1);
+	float pw = 0.0, peak = 0.0;
+	vec3  cs = vec3(0), ps = vec3(0);
+	float range = push.params.y;
+	for (float y = t0.y + float(gl_LocalInvocationID.y * uint(st)); y < t1.y; y += float(8 * st)) {
+		for (float x = t0.x + float(gl_LocalInvocationID.x * uint(st)); x < t1.x; x += float(8 * st)) {
+			ivec2 px  = ivec2(x, y);
+			vec3  col = texelFetch(color_tex, px, 0).rgb;
+			vec3  pre = texelFetch(pre_tex, px, 0).rgb;
+			if (BadV(col) || BadV(pre)) continue;
+			vec3  e = max(col - max(pre, vec3(0)), vec3(0));
+			float l = Luma(e);
+			if (l < push.extra.w) continue;
+			vec2  uv = (vec2(px) + 0.5) / rs;
+			float d  = texelFetch(depth_tex, px, 0).r;
+			vec3  w  = ToWorld(uv, d);
+			if (IsFar(w)) continue;
+			float dist = length(w - hw.cam.xyz);
+			// (particles far away light nothing near the camera that matters; faded over the last part of 6x the range)
+			float fz = 1.0 - smoothstep(4.0 * range, 6.0 * range, dist);
+			if (fz <= 0.0) continue;
+			// The pixel's footprint at that distance (the step of one pixel at the same depth), x the sampled block.
+			vec3  w1   = ToWorld(uv + vec2(1.0 / rs.x, 0.0), d);
+			float side = BadV(w1) ? 0.0 : min(length(w1 - w), 0.05 * dist + 0.01);
+			float area = side * side * float(st * st) * fz;
+			e          = min(e, vec3(64.0)); // (a single absurd pixel never dominates)
+			l          = Luma(e);
+			pw += l * area;
+			cs += e * area;
+			ps += w * l * area;
+			peak = max(peak, l);
+		}
+	}
+	s_pow[t] = pw, s_col[t] = cs, s_pos[t] = ps, s_peak[t] = peak;
+	barrier();
+	for (uint s = 32u; s > 0u; s >>= 1u) {
+		if (t < s) {
+			s_pow[t] += s_pow[t + s];
+			s_col[t] += s_col[t + s];
+			s_pos[t] += s_pos[t + s];
+			s_peak[t] = max(s_peak[t], s_peak[t + s]);
+		}
+		barrier();
+	}
+	if (t == 0u) {
+		uint  i = tile.y * tiles.x + tile.x;
+		Light L;
+		L.pos = vec4(0);
+		L.col = vec4(0);
+		if (i < MaxLights && s_pow[0] > 1e-8 && !Bad(s_pow[0])) {
+			vec3  p    = s_pos[0] / s_pow[0];
+			vec3  toc  = hw.cam.xyz - p;
+			float dc   = length(toc);
+			// (the depth at a flame is the surface behind it: the emitter a little in front of it)
+			if (dc > 1e-3) p += toc / dc * min(0.25, 0.08 * dc);
+			L.pos = vec4(p, s_pow[0]);
+			L.col = vec4(s_col[0], s_peak[0]);
+			if (BadV(p) || BadV(s_col[0])) L.pos = vec4(0), L.col = vec4(0);
+		}
+		if (i < MaxLights) lb.lights[i] = L;
+	}
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// 1 cdf (one thread)
+void BuildCdf() {
+	if (gl_GlobalInvocationID.x != 0u || gl_GlobalInvocationID.y != 0u) return;
+	uint  n     = min(uint(push.misc2.x * push.misc2.y), MaxLights);
+	uint  count = 0u;
+	float total = 0.0, cap = 0.0;
+	for (uint i = 0u; i < n; ++i) {
+		float w = lb.lights[i].pos.w;
+		if (w <= 1e-8 || Bad(w)) continue;
+		total += w;
+		lb.cdf[count] = total;
+		lb.idx[count] = i;
+		cap           = max(cap, lb.lights[i].col.a);
+		++count;
+	}
+	// The total power smoothed: a sudden burst (a spell, a flare) ramps in over ~8 frames; a drop is immediate (the
+	// irradiance history fades it out). (history invalid: start from the current)
+	float sm    = (push.misc2.w & 2) != 0 && !Bad(lb.head.z) ? lb.head.z : total;
+	sm          = mix(sm, total, 0.12);
+	float scale = total > 1e-8 ? clamp(sm / total, 0.0, 1.0) : 1.0;
+	float pc    = (push.misc2.w & 2) != 0 && !Bad(lb.head.w) ? lb.head.w : cap;
+	lb.head     = vec4(float(count), total, sm, mix(pc, cap, 0.1));
+	lb.head2    = vec4(lb.head2.x + (count > 0u ? 1.0 : 0.0), scale, 0.0, 0.0);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// 2 trace
+uint SampleCdf(float u, uint count) {
+	float target = u * lb.cdf[count - 1u];
+	uint  lo = 0u, hi = count - 1u;
+	while (lo < hi) {
+		uint mid = (lo + hi) >> 1u;
+		if (lb.cdf[mid] < target) lo = mid + 1u;
+		else hi = mid;
+	}
+	return lo;
+}
+
+void Trace() {
+	ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+	vec2  ts = TraceSize();
+	if (any(greaterThanEqual(q, ivec2(ts)))) return;
+	vec2  uv = (vec2(q) + 0.5) / ts;
+	vec2  rs = RenderSize();
+	ivec2 px = clamp(ivec2(uv * rs), ivec2(0), ivec2(rs) - 1);
+	float d  = texelFetch(depth_tex, px, 0).r;
+	vec3  P  = ToWorld((vec2(px) + 0.5) / rs, d);
+	uint  count = uint(lb.head.x + 0.5);
+	if (hw.info.x < 0.5 || IsFar(P) || count == 0u) {
+		imageStore(aux_out, q, vec4(0, 0, 0, IsFar(P) ? 0.0 : length(P - hw.cam.xyz)));
+		return;
+	}
+	float dist = length(P - hw.cam.xyz);
+	// The geometric normal from the depth's neighbours (the smaller step on each axis: edges do not bleed).
+	ivec2 mx = ivec2(rs) - 1;
+	vec3  Px0 = ToWorld((vec2(clamp(px + ivec2(-1, 0), ivec2(0), mx)) + 0.5) / rs, texelFetch(depth_tex, clamp(px + ivec2(-1, 0), ivec2(0), mx), 0).r);
+	vec3  Px1 = ToWorld((vec2(clamp(px + ivec2(1, 0), ivec2(0), mx)) + 0.5) / rs, texelFetch(depth_tex, clamp(px + ivec2(1, 0), ivec2(0), mx), 0).r);
+	vec3  Py0 = ToWorld((vec2(clamp(px + ivec2(0, -1), ivec2(0), mx)) + 0.5) / rs, texelFetch(depth_tex, clamp(px + ivec2(0, -1), ivec2(0), mx), 0).r);
+	vec3  Py1 = ToWorld((vec2(clamp(px + ivec2(0, 1), ivec2(0), mx)) + 0.5) / rs, texelFetch(depth_tex, clamp(px + ivec2(0, 1), ivec2(0), mx), 0).r);
+	vec3  dx  = length(Px1 - P) < length(P - Px0) ? Px1 - P : P - Px0;
+	vec3  dy  = length(Py1 - P) < length(P - Py0) ? Py1 - P : P - Py0;
+	vec3  N   = cross(dx, dy);
+	vec3  V   = hw.cam.xyz - P;
+	N         = length(N) > 1e-12 ? normalize(N) : normalize(V);
+	if (dot(N, V) < 0.0) N = -N;
+	float range = push.params.y, dmin = push.params.z;
+	uint  seed  = Pcg(uint(q.x) * 1973u + uint(q.y) * 9277u + uint(push.misc.y) * 26699u) | 1u;
+	int   M     = clamp(push.misc.z, 1, 16);
+	int   rays  = clamp(push.misc.w, 1, 4);
+	float total = lb.cdf[count - 1u];
+	vec3  sum   = vec3(0);
+	for (int r = 0; r < rays; ++r) {
+		// RIS: M candidates by power, resampled by the unshadowed contribution.
+		float wsum = 0.0, chosen_p = 0.0;
+		uint  chosen = 0xffffffffu;
+		for (int m = 0; m < M; ++m) {
+			uint  k   = SampleCdf(Rand(seed), count);
+			uint  li  = lb.idx[k];
+			Light L   = lb.lights[li];
+			vec3  Lv  = L.pos.xyz - P;
+			float d2  = dot(Lv, Lv);
+			float dl  = sqrt(d2);
+			float c   = dl > 1e-4 ? dot(N, Lv / dl) : 0.0;
+			float rf  = 1.0 - smoothstep(0.6 * range, range, dl);
+			float ph  = L.pos.w * max(c, 0.0) * rf / max(d2, dmin * dmin);
+			float pdf = L.pos.w / total;
+			float w   = pdf > 0.0 ? ph / pdf : 0.0;
+			wsum += w;
+			if (w > 0.0 && Rand(seed) * wsum <= w) chosen = li, chosen_p = ph;
+		}
+		if (chosen == 0xffffffffu || chosen_p <= 0.0) continue;
+		Light L  = lb.lights[chosen];
+		vec3  Lv = L.pos.xyz - P;
+		float dl = length(Lv);
+		vec3  Ld = Lv / dl;
+		float c  = max(dot(N, Ld), 0.0);
+		float rf = 1.0 - smoothstep(0.6 * range, range, dl);
+		vec3  contrib = L.col.rgb * c * rf / max(dl * dl, dmin * dmin);
+		// The RIS weight: contribution / p_hat x (sum of w) / M.
+		vec3 est = contrib / chosen_p * (wsum / float(M));
+		// The shadow ray: from just off the surface to just short of the emitter (its torch / brazier is not a blocker).
+		vec3  o    = P + N * (0.02 + 0.002 * dist);
+		float tmax = dl - min(0.3, 0.3 * dl);
+		if (tmax > 0.05) {
+			rayQueryEXT rq;
+			rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xff, o, 0.02, Ld, tmax);
+			while (rayQueryProceedEXT(rq)) {}
+			if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) continue;
+		}
+		sum += est;
+	}
+	vec3 E = Safe(sum / float(rays)) * lb.head2.y;
+	imageStore(aux_out, q, vec4(E, dist));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// 3 temporal
+bool SameDist(float a, float b) { return abs(a - b) < 0.06 * max(a, b) + 0.1; }
+
+void Temporal() {
+	ivec2 q  = ivec2(gl_GlobalInvocationID.xy);
+	vec2  ts = TraceSize();
+	if (any(greaterThanEqual(q, ivec2(ts)))) return;
+	vec4  c0 = texelFetch(aux_tex, q, 0);
+	// The raw neighbourhood (3x3): mean and deviation, the clamp box.
+	vec3  m1 = vec3(0), m2 = vec3(0);
+	float n  = 0.0;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			vec4 s = texelFetch(aux_tex, clamp(q + ivec2(x, y), ivec2(0), ivec2(ts) - 1), 0);
+			if (!SameDist(s.a, c0.a)) continue;
+			m1 += s.rgb, m2 += s.rgb * s.rgb, n += 1.0;
+		}
+	m1 /= max(n, 1.0), m2 /= max(n, 1.0);
+	vec3 sd  = sqrt(max(m2 - m1 * m1, vec3(0)));
+	vec3 res = m1;
+	if ((push.misc2.w & 2) != 0 && (push.misc2.w & 8) != 0) {
+		vec2 uv = (vec2(q) + 0.5) / ts;
+		vec2 mv = textureLod(motion_tex, uv, 0).xy * push.extra.xy;
+		bool ok = !(Bad(mv.x) || Bad(mv.y)) && all(lessThan(abs(mv), RenderSize()));
+		vec2 pu = uv + mv / RenderSize();
+		if (ok && all(greaterThanEqual(pu, vec2(0))) && all(lessThanEqual(pu, vec2(1)))) {
+			vec4 h = textureLod(hist_tex, pu, 0);
+			if (!BadV(h.rgb) && h.a > 0.0 && SameDist(h.a, c0.a)) {
+				// (loose: 1 sample per pixel is noisy; a tight box would flicker)
+				vec3 hc = clamp(h.rgb, max(m1 - 2.5 * sd, vec3(0)), m1 + 2.5 * sd + 0.02 * m1);
+				res     = mix(hc, c0.rgb, push.params.w);
+			}
+		}
+	}
+	imageStore(aux_out, q, vec4(Safe(res), c0.a));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// 4 a-trous
+void Atrous() {
+	ivec2 q  = ivec2(gl_GlobalInvocationID.xy);
+	vec2  ts = TraceSize();
+	if (any(greaterThanEqual(q, ivec2(ts)))) return;
+	vec4  c   = texelFetch(aux_tex, q, 0);
+	int   stp = max(int(push.extra.z), 1);
+	const float k[3] = float[3](0.375, 0.25, 0.0625);
+	vec3  sum = vec3(0);
+	float ws  = 0.0;
+	for (int y = -2; y <= 2; ++y)
+		for (int x = -2; x <= 2; ++x) {
+			vec4  s = texelFetch(aux_tex, clamp(q + ivec2(x, y) * stp, ivec2(0), ivec2(ts) - 1), 0);
+			float w = k[abs(x)] * k[abs(y)];
+			w *= exp(-abs(s.a - c.a) / (0.03 * max(c.a, 0.1) + 0.05));
+			if (s.a <= 0.0) w = 0.0;
+			sum += s.rgb * w, ws += w;
+		}
+	imageStore(aux_out, q, vec4(ws > 1e-6 ? sum / ws : c.rgb, c.a));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// 5 composite
+void Composite() {
+	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+	vec2  rs = RenderSize();
+	if (any(greaterThanEqual(px, ivec2(rs)))) return;
+	vec4 col = texelFetch(color_tex, px, 0);
+	vec2 uv  = (vec2(px) + 0.5) / rs;
+	vec4 E   = textureLod(aux_tex, uv, 0);
+	vec3 alb;
+	if ((push.misc2.w & 1) != 0) {
+		uint w = texelFetch(packed0, px, 0).r;
+		alb    = vec3(float(w & 255u), float((w >> 8) & 255u), float((w >> 16) & 255u)) / 255.0;
+		alb    = clamp(pow(alb, vec3(2.2)), vec3(0.02), vec3(0.9));
+	} else {
+		// (no G-buffer: the color's chroma at a mid reflectance)
+		vec3 pre = max(texelFetch(pre_tex, px, 0).rgb, vec3(0));
+		alb      = clamp(pre / max(Luma(pre), 1e-3), vec3(0), vec3(2)) * 0.3;
+	}
+	vec3  add = alb * (1.0 / 3.14159265) * E.rgb * push.params.x;
+	// Never brighter than the emitters themselves (a diffuse surface cannot outshine its light): a soft cap.
+	float cap = max(lb.head.w * 0.5, 1e-4);
+	float la  = Luma(add);
+	if (la > 1e-6) add *= (cap / (cap + la));
+	// Less on the particles' own pixels (their light is their own).
+	vec3  pre   = max(texelFetch(pre_tex, px, 0).rgb, vec3(0));
+	float share = clamp(Luma(max(col.rgb - pre, vec3(0))) / max(Luma(max(col.rgb, vec3(0))), 1e-4), 0.0, 1.0);
+	add *= 1.0 - share;
+	add = Safe(add);
+	if ((push.misc2.w & 4) != 0) imageStore(out_img, px, vec4(add * 4.0, col.a));
+	else imageStore(out_img, px, vec4(BadV(col.rgb) ? col.rgb : col.rgb + add, col.a));
+}
+
+void main() {
+	switch (push.misc.x) {
+		case 0: Collect(); break;
+		case 1: BuildCdf(); break;
+		case 2: Trace(); break;
+		case 3: Temporal(); break;
+		case 4: Atrous(); break;
+		default: Composite(); break;
+	}
+}
