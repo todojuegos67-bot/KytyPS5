@@ -14,8 +14,8 @@
 //   spatial   quarter resolution: a depth-aware 3x3 bilateral blur before the composite
 //   composite full resolution: the volume x the sun's hue + the lights' analytic halos; added display-referred
 //             (x the game's exposure), hue-preserving, soft-capped (0.10 / 0.18 / 0.28 x strength exposed luminance)
-// The sun direction comes from KYTY_RT_SHADOWS (CShadowApply's latched sun): without it, lights only. The sun on screen
-// fades in / out over ~0.5 s as it crosses the frame edge (+-25 %); at level 1 the shafts go with it.
+// The sun direction comes from GodraysSetSun (RT shadows / RT sun); held for good once given, faded (vol-fix), never toggled.
+// The sun on screen fades in / out over ~0.5 s as it crosses the frame edge (+-25 %); at level 1 the shafts go with it.
 // Bajo / Medio (1 / 2): the in-scattering boosted where light is actually visible (the sky mask of the radial march,
 // partly lit view rays = shafts through gaps), halos and the cap raised a little. KYTY_GODRAYS_DEBUG=1: our light only.
 // gr4: every stage sanitized (NaN / Inf -> 0, a bad depth -> far), the history restarted on a gap or never-written
@@ -87,6 +87,12 @@ struct {
 	uint32_t                samples = 0;
 	std::array<uint32_t, StatsCount> stat_last {};
 	float                   on_screen = 0.0f; // the smoothed on-screen factor
+	// (vol-fix) the sun as the pass uses it: the last direction ever given (held, smoothed), a weight faded in / out
+	// over >= 0.6 s / 1.2 s, the feed's age; counters for the 10 s log
+	std::array<float, 3>    sun_dir {};
+	bool                    sun_seen = false;
+	float                   sun_held = 0.0f;
+	uint32_t                feeds = 0, stale = 0;
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now(), last_frame {};
 } g_gr;
 
@@ -303,6 +309,16 @@ void ReadTiming(GraphicContext& graphics) {
 	}
 }
 
+bool HalosOn() {
+	// (vol-fix) lamp / fire halos off by default: they were tracked from the frame's brightest pixels (flames, whose
+	// brightness flickers), so they swelled and faded with the flame and veiled dark rooms; the game draws its own glow.
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_GODRAYS_HALOS");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+
 void Log(int level, bool have_sun) {
 	const auto now = std::chrono::steady_clock::now();
 	if (now - g_gr.last_log < std::chrono::seconds(10) || g_gr.mapped == nullptr) return;
@@ -313,6 +329,15 @@ void Log(int level, bool have_sun) {
 	for (uint32_t i = 0; i < StatsCount; ++i) d[i] = cur[i] - g_gr.stat_last[i];
 	g_gr.stat_last  = cur;
 	const double fr = std::max<double>(d[0], 1.0);
+	float open = 0.0f;
+	std::memcpy(&open, &cur[14], sizeof(open)); // (stats[14]: the openness, a float)
+	std::printf("GODRAYS: sun %s, weight %.2f (held direction %.3f %.3f %.3f), fed %u of %u frames (%u frames past 0.5 s: "
+	            "fading on the held sun), openness %.2f (sky in view; 0 = indoors: no view-ray haze), halos %s\n",
+	            !g_gr.sun_seen ? "never given yet (nothing added)" : g_gr.sun_held > 0.99f ? "steady" : "fading",
+	            static_cast<double>(g_gr.sun_held), static_cast<double>(g_gr.sun_dir[0]), static_cast<double>(g_gr.sun_dir[1]),
+	            static_cast<double>(g_gr.sun_dir[2]), g_gr.feeds, d[0], g_gr.stale, static_cast<double>(open),
+	            HalosOn() ? "on (KYTY_GODRAYS_HALOS=1)" : "off");
+	g_gr.feeds = g_gr.stale = 0;
 	std::printf("GODRAYS: stats (level %d) GPU %.3f ms (max %.3f), sun %s (on screen %.0f %% of frames), lights %.2f a frame\n", level,
 	            g_gr.samples > 0 ? g_gr.sum_ms / g_gr.samples : 0.0, g_gr.max_ms,
 	            !have_sun ? "unknown (needs KYTY_RT_SHADOWS)" : g_gr.on_screen > 0.5f ? "on screen" : "off screen", 100.0 * d[2] / fr,
@@ -374,18 +399,44 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}();
 	const float strength = EnvFloat("KYTY_GODRAYS_STRENGTH", 1.0f, 0.0f, 3.0f);
 
-	std::array<float, 3> sun {};
-	float                sun_w = 0.0f;
-	{
-		std::lock_guard lock(g_gr_sun.mutex);
-		if (std::chrono::steady_clock::now() - g_gr_sun.when < std::chrono::milliseconds(250)) sun = g_gr_sun.dir, sun_w = g_gr_sun.weight;
-	}
-	const bool have_sun = sun_w > 0.0f;
 	// The sun's uv (a direction: w = z * M[11]) and how far on screen it is; smoothed over ~0.5 s.
 	const auto now = std::chrono::steady_clock::now();
 	const float dt = g_gr.last_frame.time_since_epoch().count() == 0
 	                     ? 0.016f
 	                     : std::clamp(std::chrono::duration<float>(now - g_gr.last_frame).count(), 0.0f, 0.1f);
+	// (vol-fix) The sun never switches the pass on / off. The last direction given is held for good (smoothed, so a
+	// re-latched axis glides), the weight eases toward the feed's (fade in 0.6 s, out 1.2 s); a feed older than 0.5 s
+	// eases toward 0 the same way instead of cutting at 250 ms (the RT sun pass fed it in bursts: the fog popped).
+	{
+		float target = 0.0f;
+		{
+			std::lock_guard lock(g_gr_sun.mutex);
+			const bool fresh = g_gr_sun.when.time_since_epoch().count() != 0 && now - g_gr_sun.when < std::chrono::milliseconds(500);
+			if (g_gr_sun.when.time_since_epoch().count() != 0) {
+				const auto& nd = g_gr_sun.dir;
+				const float n  = std::sqrt(nd[0] * nd[0] + nd[1] * nd[1] + nd[2] * nd[2]);
+				if (n > 1e-6f && std::isfinite(n)) {
+					if (!g_gr.sun_seen) {
+						for (int i = 0; i < 3; ++i) g_gr.sun_dir[i] = nd[i] / n;
+						g_gr.sun_seen = true;
+					} else if (fresh) {
+						const float a = std::min(dt / 0.3f, 1.0f);
+						float       l = 0.0f;
+						for (int i = 0; i < 3; ++i) g_gr.sun_dir[i] += (nd[i] / n - g_gr.sun_dir[i]) * a, l += g_gr.sun_dir[i] * g_gr.sun_dir[i];
+						l = std::sqrt(l);
+						if (l > 1e-6f)
+							for (auto& c: g_gr.sun_dir) c /= l;
+					}
+				}
+			}
+			if (fresh) target = g_gr_sun.weight, ++g_gr.feeds;
+			else if (g_gr.sun_seen) ++g_gr.stale;
+		}
+		g_gr.sun_held = std::clamp(g_gr.sun_held + std::clamp(target - g_gr.sun_held, -dt / 1.2f, dt / 0.6f), 0.0f, 1.0f);
+	}
+	const std::array<float, 3> sun   = g_gr.sun_dir;
+	const float                sun_w = g_gr.sun_seen ? g_gr.sun_held : 0.0f;
+	const bool                 have_sun = g_gr.sun_seen;
 	// (a gap of more than 0.25 s: menus, loading, frames without the pass: the history is stale, restart it)
 	if (g_gr.last_frame.time_since_epoch().count() != 0 && now - g_gr.last_frame > std::chrono::milliseconds(250))
 		g_gr.history_valid = false;
@@ -416,12 +467,12 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 	}
 
-	const int   slots  = level >= 3 ? 8 : level == 2 ? 4 : 2;
+	const int   slots  = !HalosOn() ? 0 : level >= 3 ? 8 : level == 2 ? 4 : 2;
 	const int   taps   = level >= 3 ? 64 : level == 2 ? 48 : 32;
 	const int   steps  = level >= 3 ? 16 : level == 2 ? 12 : 0;
 	// (10-25: Bajo / Medio raised a little: 0.10 / 0.18 cap, 0.5 / 0.75 halos, 0.45 / 0.7 sun before)
 	const float cap    = (level >= 3 ? 0.28f : level == 2 ? 0.22f : 0.14f) * strength;
-	const float lstr   = (level >= 3 ? 1.0f : level == 2 ? 0.95f : 0.7f) * strength;
+	const float lstr   = (level >= 3 ? 1.0f : level == 2 ? 0.95f : 0.7f) * strength * 0.4f; // (vol-fix: opt-in, subtle)
 	const float sstr   = (level >= 3 ? 1.0f : level == 2 ? 0.8f : 0.55f) * strength; // (gr4: 0.85 / 0.6 in gr3: noisy shafts)
 	static const bool debug = [] {
 		const char* v = std::getenv("KYTY_GODRAYS_DEBUG");
@@ -434,7 +485,7 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.size[0] = static_cast<float>(color.extent.width), push.size[1] = static_cast<float>(color.extent.height);
 	push.size[2] = sstr, push.size[3] = cap;
 	const float sun_fade = sun_w * sun_w * (3.0f - 2.0f * sun_w);
-	push.sun[0] = sun[0], push.sun[1] = sun[1], push.sun[2] = sun[2], push.sun[3] = have_sun ? sun_fade : 0.0f;
+	push.sun[0] = sun[0], push.sun[1] = sun[1], push.sun[2] = sun[2], push.sun[3] = sun_fade;
 	push.sun_uv[0] = su, push.sun_uv[1] = sv, push.sun_uv[2] = have_sun ? g_gr.on_screen : 0.0f, push.sun_uv[3] = static_cast<float>(taps);
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
 	push.motion[2] = (g_gr.history_valid && !inputs.reset && inputs.motion.view != nullptr) ? 1.0f : 0.0f;
@@ -512,7 +563,7 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 		        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	};
-	run(0, 16, 9);
+	if (slots > 0) run(0, 16, 9); // (the light candidates: only with halos)
 	run(1, 1, 1);
 	run(2, (g_gr.qextent.width + 7) / 8, (g_gr.qextent.height + 7) / 8);
 	const uint32_t qx = (g_gr.qextent.width + 7) / 8, qy = (g_gr.qextent.height + 7) / 8;
