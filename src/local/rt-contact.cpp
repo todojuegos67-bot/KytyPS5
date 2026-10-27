@@ -280,7 +280,10 @@ bool EnsurePipeline(GraphicContext& graphics) {
 }
 
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D extent, int level) {
-	const vk::Extent2D trace = level >= 3 ? extent : vk::Extent2D {std::max(extent.width / 2, 1u), std::max(extent.height / 2, 1u)};
+	// (ds-rt-stable-1027) level 3 traces at half resolution too (2 rays, 64-frame still mean, 2x2 nearest-depth upsample):
+	// ~1/4 of the 3.7 ms; KYTY_HWRT_CONTACT_FULL=1 keeps the old full-res trace
+	static const bool full = [] { const char* v = std::getenv("KYTY_HWRT_CONTACT_FULL"); return v != nullptr && *v == '1'; }();
+	const vk::Extent2D trace = level >= 3 && full ? extent : vk::Extent2D {std::max(extent.width / 2, 1u), std::max(extent.height / 2, 1u)};
 	if (g_ct.out.image != VK_NULL_HANDLE && g_ct.extent == extent && g_ct.trace == trace) return true;
 	Img* all[] {&g_ct.out, &g_ct.held, &g_ct.raw, &g_ct.tmp_a, &g_ct.tmp_b, &g_ct.gbuf[0], &g_ct.gbuf[1], &g_ct.hist[0], &g_ct.hist[1]};
 	for (Img* img: all) Retire(graphics, *img);
@@ -515,7 +518,7 @@ bool RtContactApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		g_ct.said_on = true;
 		std::printf("HWRTCONTACT: on (level %d: %s, %ux%u; rays %g m toward the sun and the strongest local light, mask static + "
 		            "fresh dynamic, one blend formula, held sun; strength %g, max %g, sun cone %g deg, fade %g-%g m, texture knee %g)\n",
-		            level, level == 1 ? "half-res, 1 ray" : level == 2 ? "half-res, 1 ray" : "full-res, 2 rays", color.extent.width,
+		            level, level == 1 ? "half-res, 1 ray" : level == 2 ? "half-res, 1 ray" : (g_ct.trace == color.extent ? "full-res, 2 rays" : "half-res, 2 rays"), color.extent.width,
 		            color.extent.height, static_cast<double>(length), static_cast<double>(strength), static_cast<double>(max_dark),
 		            static_cast<double>(soft), static_cast<double>(fade_m), static_cast<double>(fade_m * 1.6f), static_cast<double>(knee));
 		std::fflush(stdout);
