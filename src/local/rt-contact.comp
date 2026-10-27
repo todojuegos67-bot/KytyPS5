@@ -10,19 +10,16 @@
 //               meshes; no stale or tiny ones), closest hit; the receiver's own mesh is skipped (entirely when it is a
 //               dynamic one: its captured positions may trail the depth, no self-shadow acne; in its first 0.15 m when
 //               static). Occlusion fades over the ray's last 35 % (no hard cut at its end).
-//               Out: (sun occlusion, light occlusion x the lights' share of the pixel's light, e (Existing), 1);
+//               Out: (sun occlusion, light occlusion x the lights' share of the pixel's light, 0, 1);
 //               gbuf_out: normal, depth.
 //   1 temporal  reprojection by the game's motion vectors, depth / normal disocclusion test, 3x3 variance clamp
 //               (1.25 sigma), alpha max(1/n, 0.08): with a still camera the inputs are identical frame to frame
 //   2 a-trous   5x5 B3 with depth / normal stops (steps 1, 2; 4 at level 3): edge-aware, no bleeding across silhouettes
 //   3 composite full resolution, the trace pixel of the 2x2 nearest in depth (none matching: nothing darkened, no halo).
-//               Direct light only, never twice:
-//                 sun, exact (KYTY_RT_SUN's visibility V known): color *= (1 + K min(V, 1 - occ)) / (1 + K V), K = R N.L w
-//                 (the RT sun pass's own relighting model: the ambient and albedo kept, an already shadowed pixel unchanged)
-//                 otherwise: the target t = (1 + K (1 - occ)) / (1 + K) x (1 - share occ_light) against the light the
-//                 pixel already lost (e: its luminance over the brightest of 8 taps on its own surface, the game's
-//                 screen-space contact shadow / cascades / RT lamp shadows): color *= min(1, t / e) - darkening that is
-//                 already there is not added again (contrast under lb.p2.w is texture, ignored)
+//               Direct light only, never twice: color *= (1 + K min(V, 1 - occ)) / (1 + K V) x (1 - share occ_light),
+//               K = R N.L w, V the RT sun pass's visibility this frame (1 without it): an already sun-shadowed pixel is
+//               unchanged, ambient and albedo kept. (ds-fx-all2: no estimate read back from the color - it changed with the
+//               other passes and the upscaler's jitter: 37 % of touched points flickered.)
 //               stable ramps with the history count; far pixels fade out (lb.p1.w .. lb.p2.x m).
 // Statistics (1 pixel in 16) into stats[]: see rt-contact.cpp.
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -104,43 +101,20 @@ float LightW(int i, vec3 p, vec3 n) {
 	return w;
 }
 
-// e: the share of its light the pixel still has against the brightest of 8 taps on its own surface (render-res color),
-// 1 when the contrast is under the texture knee lb.p2.w: the darkening already there (the game's screen-space contact
-// shadow, its cascades, the RT sun / lamp passes) - filtered over time and space with the occlusion (no jitter flicker).
-float Existing(vec2 uv, vec3 p, vec3 n, float z) {
-	float lum = Lum(textureLod(color_tex, uv, 0).rgb), ref = lum;
-	float rpx = RenderSize().y / 720.0;
-	for (int i = 0; i < 8; ++i) {
-		float a  = 0.785398 * float(i) + 0.3927;
-		vec2  o  = vec2(cos(a), sin(a)) * ((i & 1) == 0 ? 6.0 : 14.0) * rpx / RenderSize();
-		vec2  tu = uv + o;
-		float td = textureLod(depth_tex, tu, 0).r;
-		if (IsSky(td)) continue;
-		vec3 q = WorldPos(tu, td);
-		if (abs(dot(q - p, n)) > 0.02 + 0.006 * z) continue; // (another surface)
-		ref = max(ref, Lum(textureLod(color_tex, tu, 0).rgb));
-	}
-	float e    = ref > 1e-6 ? lum / ref : 1.0;
-	float knee = lb.p2.w;
-	return clamp(1.0 - max(0.0, (1.0 - e) - knee) / (1.0 - knee), 0.0, 1.0);
-}
-
-// The receiver's mesh: a ray across the pixel's surface (from 0.25 m toward the camera to just behind it). Dynamic meshes
-// (0x02 | 0x04) first. Returns the instance's custom index + 1 (0: none), dyn: a dynamic one.
+// The receiver's mesh when it is a dynamic one (0x02 | 0x04): a ray across the pixel's surface (from 0.25 m toward the
+// camera to just behind it). Returns the instance's custom index + 1 (0: a static receiver or none).
 uint Receiver(vec3 p, float z, out bool dyn) {
 	vec3  v   = normalize(lb.cam.xyz - p);
 	float tol = 0.06 + 0.01 * z;
 	vec3  o   = p + v * 0.25;
 	dyn       = false;
-	for (int pass = 0; pass < 2; ++pass) {
-		rayQueryEXT rq;
-		rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, pass == 0 ? 0x06 : 0x01, o, 0.0, -v, 0.25 + tol);
-		while (rayQueryProceedEXT(rq)) {}
-		if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT &&
-		    abs(rayQueryGetIntersectionTEXT(rq, true) - 0.25) < tol) {
-			dyn = pass == 0;
-			return uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true)) + 1u;
-		}
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0x06, o, 0.0, -v, 0.25 + tol);
+	while (rayQueryProceedEXT(rq)) {}
+	if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT &&
+	    abs(rayQueryGetIntersectionTEXT(rq, true) - 0.25) < tol) {
+		dyn = true;
+		return uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true)) + 1u;
 	}
 	return 0u;
 }
@@ -202,7 +176,7 @@ void Trace(ivec2 pixel) {
 	bool dyn = false;
 	uint rid = Receiver(p, z, dyn);
 	if (smp && dyn) atomicAdd(stats.s[8], 1u);
-	float skip_t = dyn ? 1e9 : 0.15;
+	float skip_t = 1e9; // (only a dynamic receiver is named: its own mesh skipped)
 	int   rays   = push.misc.z >= 3 ? 2 : 1;
 	float occ_s = 0.0, occ_l = 0.0;
 	for (int k = 0; k < rays; ++k) {
@@ -236,7 +210,7 @@ void Trace(ivec2 pixel) {
 		}
 	}
 	float share = want_l ? wsum / (wsum + lb.p2.z) : 0.0;
-	imageStore(out_img, pixel, vec4(occ_s / float(rays), share * occ_l / float(rays), Existing(uv, p, n, z), 1.0));
+	imageStore(out_img, pixel, vec4(occ_s / float(rays), share * occ_l / float(rays), 0.0, 1.0));
 }
 
 void Temporal(ivec2 pixel) {
@@ -265,14 +239,18 @@ void Temporal(ivec2 pixel) {
 	float n_hist = 0.0;
 	vec3  h      = cur.rgb;
 	if (push.motion.z > 0.5) {
-		vec2 puv = uv + textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();
+		vec2  mv  = textureLod(motion_tex, uv, 0).xy * push.motion.xy;
+		vec2  puv = uv + mv / RenderSize();
+		// (a still pixel - under 0.3 px of motion - keeps its history unclamped: the upscaler's sub-pixel jitter moves the
+		// 3x3 box every frame, and a clamp that follows it is a flicker; the plain average moves <= 8 % a frame)
+		float still = length(mv) < 0.3 ? 1.0 : 0.0;
 		if (all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
 			vec4 pg = textureLod(gbuf_prev, puv, 0);
 			// disocclusion: the previous surface must be this one (depth within 4 % + 8 cm, normals agree)
 			if (abs(pg.w - g.w) < 0.04 * g.w + 0.08 && dot(pg.xyz, g.xyz) > 0.8) {
 				vec4 ph = textureLod(hist_prev, puv, 0);
 				n_hist  = ph.a;
-				h       = clamp(ph.rgb, m1 - 1.25 * sigma - 0.04, m1 + 1.25 * sigma + 0.04);
+				h       = still > 0.5 ? ph.rgb : clamp(ph.rgb, m1 - 1.25 * sigma - 0.04, m1 + 1.25 * sigma + 0.04);
 			}
 		}
 	}
@@ -332,19 +310,12 @@ void Composite(ivec2 pixel) {
 			float K  = lb.p0.x * max(dot(n, lb.sun.xyz), 0.0) * lb.sun.w;
 			float os = clamp(v.r * gain, 0.0, 1.0);
 			float ol = clamp(v.g * gain, 0.0, 1.0);
-			float e  = clamp(v.b, 0.05, 1.0);
-			float exact = lb.p0.y > 1.5 ? 1.0 : 0.0;
-			if (exact > 0.5) {
-				float V  = clamp(textureLod(sun_vis, uv, 0).r, 0.0, 1.0);
-				float fs = (1.0 + K * min(V, 1.0 - os)) / (1.0 + K * V);
-				float fl = min(1.0, (1.0 - ol) / e);
-				m        = fs * fl;
-				limited  = (1.0 - fs) + 0.02 < os * K / (1.0 + K) || fl > 1.0 - ol + 0.02;
-			} else {
-				float t = (1.0 + K * (1.0 - os)) / (1.0 + K) * (1.0 - ol);
-				m       = min(1.0, t / e);
-				limited = m > t + 0.02;
-			}
+			// (one formula every frame: V the RT sun pass's visibility when it ran this frame, else 1 - the color then has
+			// no RT sun relighting either; no switch between models, nothing read back from the color)
+			float V  = lb.p0.y > 1.5 ? clamp(textureLod(sun_vis, uv, 0).r, 0.0, 1.0) : 1.0;
+			float fs = (1.0 + K * min(V, 1.0 - os)) / (1.0 + K * V);
+			m        = fs * (1.0 - ol);
+			limited  = V < 1.0 - os + 0.02 && os > 0.02;
 			m = clamp(m, 1.0 - lb.p1.z, 1.0);
 			if (isnan(m)) m = 1.0;
 		}

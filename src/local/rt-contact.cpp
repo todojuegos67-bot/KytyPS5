@@ -7,12 +7,13 @@
 // HWRT sun rays trace static meshes only (mask 0x01). These rays (mask 0x03: static + dynamic meshes captured fresh) give
 // feet, armour, props and the bases of things their grounding shadow toward the sun and the strongest local light.
 //
-// Levels (No / Bajo / Medio / Alto): 1 half-res trace, 1 ray per light, 0.25 m; 2 full res, 1 ray, 0.5 m; 3 full res,
+// Levels (No / Bajo / Medio / Alto): 1 half-res trace, 1 ray per light, 0.25 m; 2 half res, 1 ray, 0.5 m; 3 full res,
 // 2 rays, 1.0 m (x up to 2 with the distance). Seeds are fixed per pixel (no frame index): a still view traces the same
 // rays every frame; a temporal pass (reprojection, disocclusion, 1.25 sigma variance clamp, alpha >= 0.08) and an
 // edge-aware a-trous (depth / normal stops) clean the penumbra. The composite (rt-contact.comp) darkens the direct term
 // only and blends with what is already dark (no double darkening): with KYTY_RT_SUN the sun pass's own visibility V and
-// its relighting model; otherwise the pixel's luminance against its own surface's brightest taps.
+// its relighting model (V = 1 on a frame without it: the color then has no RT sun relighting either). ds-fx-all2: the
+// old luminance-against-neighbours estimate is gone (it moved with the other passes and the jitter: 37 % flicker).
 //
 // Options: KYTY_HWRT_CONTACT_STRENGTH (1.0), _MAX (max darkening, 0.6), _LEN (ray length override, m), _SOFT (sun cone
 // half-angle, deg, 1.5), _FADE (fade start, 25 m; out at 1.6x), _KNEE (contrast taken as texture, 0.15), _AMBIENT (local
@@ -277,7 +278,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 }
 
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D extent, int level) {
-	const vk::Extent2D trace = level >= 2 ? extent : vk::Extent2D {std::max(extent.width / 2, 1u), std::max(extent.height / 2, 1u)};
+	const vk::Extent2D trace = level >= 3 ? extent : vk::Extent2D {std::max(extent.width / 2, 1u), std::max(extent.height / 2, 1u)};
 	if (g_ct.out.image != VK_NULL_HANDLE && g_ct.extent == extent && g_ct.trace == trace) return true;
 	Img* all[] {&g_ct.out, &g_ct.raw, &g_ct.tmp_a, &g_ct.tmp_b, &g_ct.gbuf[0], &g_ct.gbuf[1], &g_ct.hist[0], &g_ct.hist[1]};
 	for (Img* img: all) Retire(graphics, *img);
@@ -432,8 +433,10 @@ bool RtContactApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	static auto last_t = now;
 	const float dt     = std::clamp(std::chrono::duration<float>(now - last_t).count(), 0.0f, 0.25f);
 	last_t             = now;
+	// (ds-fx-all2) held: the last weight given, never eased to 0 on a frame the sun pass skipped (sun in 257 of 343
+	// frames: the old easing pulsed the shadow); eased toward a new value over 0.5 s.
 	static float sun_w = 0.0f;
-	const float  target = sun_fresh ? g_ct_sun.weight : 0.0f;
+	const float  target = g_ct_sun.weight;
 	sun_w = std::clamp(sun_w + std::clamp(target - sun_w, -dt / 0.5f, dt / 0.5f), 0.0f, 1.0f);
 	const bool exact = sun_fresh && g_ct_sun.exact;
 
@@ -485,7 +488,7 @@ bool RtContactApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		g_ct.stat_last = cur;
 		const double px = std::max<double>(d[0], 1.0), dp = d[1], dk = d[2];
 		std::printf("HWRTCONTACT: stats (level %d, trace %ux%u, rays %.2f m) darkened %.2f %% of pixels by %.1f %% on average (%.3f %% of "
-		            "the screen's light); %.2f %% of pixels held back by darkening already there (no double shadow); sun in %llu/%llu "
+		            "the screen's light); %.2f %% of pixels already in the RT sun pass's shadow (left as they are); sun in %llu/%llu "
 		            "frames (%llu with KYTY_RT_SUN's exact visibility), lights %.2f a frame; GPU %.3f ms (max %.3f)\n",
 		            level, g_ct.trace.width, g_ct.trace.height, static_cast<double>(length), 100.0 * dp / px, dp > 0 ? 100.0 * dk / 1024.0 / dp : 0.0,
 		            100.0 * dk / 1024.0 / px, 100.0 * d[7] / px, static_cast<unsigned long long>(g_ct.frames_sun),
@@ -502,8 +505,8 @@ bool RtContactApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	if (!g_ct.said_on) {
 		g_ct.said_on = true;
 		std::printf("HWRTCONTACT: on (level %d: %s, %ux%u; rays %g m toward the sun and the strongest local light, mask static + "
-		            "fresh dynamic; strength %g, max %g, sun cone %g deg, fade %g-%g m, texture knee %g)\n",
-		            level, level == 1 ? "half-res, 1 ray" : level == 2 ? "full-res, 1 ray" : "full-res, 2 rays", color.extent.width,
+		            "fresh dynamic, one blend formula, held sun; strength %g, max %g, sun cone %g deg, fade %g-%g m, texture knee %g)\n",
+		            level, level == 1 ? "half-res, 1 ray" : level == 2 ? "half-res, 1 ray" : "full-res, 2 rays", color.extent.width,
 		            color.extent.height, static_cast<double>(length), static_cast<double>(strength), static_cast<double>(max_dark),
 		            static_cast<double>(soft), static_cast<double>(fade_m), static_cast<double>(fade_m * 1.6f), static_cast<double>(knee));
 		std::fflush(stdout);
