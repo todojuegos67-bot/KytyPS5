@@ -1,3 +1,4 @@
+#include "graphics/gpuProf.h"
 #include "graphics/presentation/videoOut.h"
 
 #include "common/abi.h"
@@ -1650,6 +1651,7 @@ void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& b
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
 	m_impl->GetFlipQueue().Complete(request_id);
+	GpuProf::NoteFlip();
 	KytyFlipHeartbeat();
 }
 

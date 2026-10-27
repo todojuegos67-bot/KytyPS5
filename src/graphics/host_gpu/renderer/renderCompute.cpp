@@ -1,3 +1,4 @@
+#include "graphics/gpuProf.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -276,6 +277,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 	const SlowDispatchTimer slow_timer {"direct", sh_ctx.GetCs().cs_regs.data_addr, thread_group_x,
 	                                    thread_group_y, thread_group_z};
+	GpuProf::Scope gpuprof {GpuProf::CsRecord};
 
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
 		static std::atomic<uint32_t> log_count {0};
@@ -333,8 +335,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
+	gpuprof.Switch(GpuProf::CsProgram);
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	gpuprof.Switch(GpuProf::CsRecord);
 	if (!compute_program) {
 		ResetBindings();
 		g_kyty_unsupported_dispatches.fetch_add(1, std::memory_order_relaxed);
@@ -378,8 +382,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
+	gpuprof.Switch(GpuProf::CsPipeline);
 	auto* pipeline_ptr =
 	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	gpuprof.Switch(GpuProf::CsRecord);
 	if (pipeline_ptr == nullptr) {
 		// Still compiling in the background (KYTY_ASYNC_COMPUTE_WORDS): skip this dispatch.
 		g_kyty_skipped_dispatches.fetch_add(1, std::memory_order_relaxed);
