@@ -134,7 +134,7 @@ constexpr uint32_t CalibFloors   = CalibBytes + 16 * 3;
 constexpr uint32_t CalibWet      = CalibFloors + 2; // puddle guess: count + 16 byte sums; water: the same
 constexpr uint32_t CalibHist     = 300;             // 16 byte fields x 16 bins
 constexpr uint32_t StatsIndex    = 560;
-constexpr uint32_t StatsCount    = 34; // (refl10: 30..32 why rays miss, 33 the composite's mirror rays)
+constexpr uint32_t StatsCount    = 40; // (refl-pro: 34..39) // (refl10: 30..32 why rays miss, 33 the composite's mirror rays)
 // (refl9) The metal survey (the shader's SURVEY, mode 8; never cleared): static / moving sample counts, set-bit counts
 // per class x layer x bit, byte histograms per class x field x 16 bins.
 constexpr uint32_t SurveyIndex   = 600;
@@ -465,6 +465,16 @@ bool EnsurePipeline(GraphicContext& graphics) {
 // (hwrt2) KYTY_HWRT_REFL=1: the trace's misses (off the screen, behind something, toward the camera) take a hardware
 // ray query into the scene captured by KYTY_HWRT (local/hwrt-scene.h). Needs KYTY_HWRT=1; turns the reflections on
 // (high) when KYTY_RT_REFLECTIONS is not set.
+bool HwReflWanted();
+// (refl-pro) Physically based reflections from the G-buffer material (no SSR-confidence gate), hybrid screen-space + TLAS
+// with an environment fallback: on with KYTY_HWRT_REFL=1 unless KYTY_RT_REFLECTIONS_PRO=0.
+bool ProWanted() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_RT_REFLECTIONS_PRO");
+		return v != nullptr && *v != '\0' ? *v != '0' : HwReflWanted();
+	}();
+	return on;
+}
 bool HwReflWanted() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_HWRT_REFL");
@@ -789,6 +799,17 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		std::snprintf(buf, sizeof(buf), "%s%s %.3f", passes.empty() ? "" : ", ", StageNames[st],
 		              g_rt.stage_ms[st] / g_rt.stage_frames[st]);
 		passes += buf;
+	}
+	if (ProWanted()) {
+		// (refl-pro) The self-check: coverage (share > 2 %), mean share on the smooth G-buffer surfaces, where the hits came
+		// from (screen space / TLAS / environment, confidence-weighted, % of the rays), the accumulated confidence, GPU.
+		const double rays = static_cast<double>(std::max<uint64_t>(sm[4], 1));
+		std::printf("RT reflections pro: last %.0f s: coverage %.1f%% of the pixels (share > 2%%), smooth surfaces %.1f%% with mean "
+		            "share %.3f, hits screen-space %.1f%% / TLAS %.1f%% / environment (miss) %.1f%% of the rays, mean confidence %.2f, "
+		            "GPU %.3f ms\n",
+		            std::chrono::duration<double>(now - g_rt.stat_time).count(), 100.0 * sm[1] / px, 100.0 * sm[37] / px,
+		            sm[37] > 0 ? sm[38] / 1000.0 / static_cast<double>(sm[37]) : 0.0, 0.1 * sm[34] / rays, 0.1 * sm[35] / rays,
+		            0.1 * sm[36] / rays, sm[3] > 0 ? sm[39] / 1000.0 / static_cast<double>(sm[3]) : 0.0, g_rt.samples > 0 ? g_rt.sum_ms / g_rt.samples : 0.0);
 	}
 	if (!passes.empty()) std::printf("RT reflections: GPU ms per pass (%s): %s\n", Cfg(level).name, passes.c_str());
 	if (RtReflGuideWanted()) {
@@ -1291,7 +1312,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 
 	// (refl6: per level by default, so the medium level shows: low 1.3, medium 1.6, high 1.8, ultra 2.0)
 	static constexpr float DefStrength[MaxLevel + 1] = {0.0f, 1.3f, 1.6f, 1.8f, 2.0f, 2.0f};
-	const float strength = EnvFloat("KYTY_RT_REFLECTIONS_STRENGTH", DefStrength[std::clamp(level, 0, MaxLevel)], 0.0f, 3.0f);
+	const bool  pro      = ProWanted();
+	const float strength = pro ? EnvFloat("KYTY_RT_REFLECTIONS_PRO_STRENGTH", 1.0f, 0.0f, 2.0f)
+	                           : EnvFloat("KYTY_RT_REFLECTIONS_STRENGTH", DefStrength[std::clamp(level, 0, MaxLevel)], 0.0f, 3.0f);
 	const float min_refl = EnvFloat("KYTY_RT_REFLECTIONS_MIN", 0.4f, 0.0f, 0.8f);
 	const float guess    = EnvFloat("KYTY_RT_REFLECTIONS_GUESS", 0.0f, 0.0f, 1.0f);
 	const auto& cfg      = Cfg(level);
@@ -1340,15 +1363,15 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.size[0] = static_cast<float>(color.extent.width), push.size[1] = static_cast<float>(color.extent.height);
 	push.size[2] = static_cast<float>(g_rt.trace.width), push.size[3] = static_cast<float>(g_rt.trace.height);
 	push.params[0] = strength, push.params[1] = EnvFloat("KYTY_RT_REFLECTIONS_THICKNESS", 0.3f, 0.01f, 4.0f);
-	push.params[2] = cfg.max_len;
+	push.params[2] = pro ? std::max(cfg.max_len, 2000.0f) : cfg.max_len; // (refl-pro: the whole scene, no far fade)
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
 	push.motion[2] = cutoff, push.motion[3] = cfg.alpha;
 	push.misc[1] = static_cast<int32_t>(g_rt.frame & 0x7fffffff);
 	push.misc[2] = level;
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0) |
 	               (g_rt.row0_up ? 16 : 0) | (cfg.checker ? 32 : 0) | (have_water ? 64 : 0) |
-	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0) | (refine ? 1024 : 0) | (bicubic ? 2048 : 0) |
-	               (fresh ? 4096 : 0) | (vfill ? 8192 : 0);
+	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide && !pro ? 512 : 0) | (refine ? 1024 : 0) | (bicubic ? 2048 : 0) |
+	               (fresh ? 4096 : 0) | (vfill ? 8192 : 0) | (pro ? 16384 : 0);
 	// (combo19: guided only while the guide is there; without it the material mask, refl6, instead of water only: the
 	// guide never found in play was the whole reason nothing changed)
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
