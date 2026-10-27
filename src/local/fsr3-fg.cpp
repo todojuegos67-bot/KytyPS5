@@ -1031,12 +1031,6 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 		static const float sr_sign = EnvFloat("KYTY_SR_MV_SIGN", 1.0f) >= 0 ? 1.0f : -1.0f;
 		up.motionVectorScale = {sr_sign * desc.mv_scale[0], sr_sign * desc.mv_scale[1]};
 	}
-	if (desc.reactive != nullptr && desc.reactive->image != nullptr) {
-		// (rtparticles) The particle mask: reactive (favour the current frame there) and transparency-and-composition
-		// (no locks / less history there), as FSR takes them for particles drawn without motion vectors.
-		up.reactive                   = ImageResource(*desc.reactive, false);
-		up.transparencyAndComposition = up.reactive;
-	}
 	up.renderSize        = {desc.render.width, desc.render.height};
 	up.upscaleSize       = {desc.upscale.width, desc.upscale.height};
 	const float sharpness = EnvFloat("KYTY_UPSCALE_SHARPNESS", 0.3f);

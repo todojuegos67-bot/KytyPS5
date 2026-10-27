@@ -3660,7 +3660,6 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		desc.mv_scale[1] = inputs.motion_scale_y;
 		desc.fov         = fov;
 		desc.z_near      = inputs.near_plane;
-		if (have_reactive) desc.reactive = &reactive;
 		done             = Fsr3::Upscale(*g_graphics_ctx, desc);
 	}
 	static bool said = false;
