@@ -276,19 +276,31 @@ void Trace(ivec2 pixel) {
 			// behind (dark ghosting behind moving characters). 0x04 (stale positions) and 0x08 (tiny cards) never.
 			float       t   = R;
 			bool        hit = false, dyn = false;
-			rayQueryEXT rs;
-			rayQueryInitializeEXT(rs, tlas, gl_RayFlagsOpaqueEXT, 0x01, O, tmin, dir, R);
-			while (rayQueryProceedEXT(rs)) {}
-			if (rayQueryGetIntersectionTypeEXT(rs, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-				t = rayQueryGetIntersectionTEXT(rs, true), hit = true;
-				if (rayQueryGetIntersectionFrontFaceEXT(rs, true)) STAT(st[sb + 13u], 1u);
-			}
-			rayQueryEXT rd;
-			rayQueryInitializeEXT(rd, tlas, gl_RayFlagsOpaqueEXT, 0x02, O, tmin, dir, t);
-			while (rayQueryProceedEXT(rd)) {}
-			if (rayQueryGetIntersectionTypeEXT(rd, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-				t = rayQueryGetIntersectionTEXT(rd, true), hit = dyn = true;
-				if (rayQueryGetIntersectionFrontFaceEXT(rd, true)) STAT(st[sb + 13u], 1u);
+			if ((u.cfg2.w & 1) == 0) {
+				// (gi2-1027 cost) one 0x03 closest-hit query: in DS every instance is 0x02 (HWRTAO: moving 100 %), the
+				// static-then-dynamic pair paid two traversals for one answer
+				rayQueryEXT ra;
+				rayQueryInitializeEXT(ra, tlas, gl_RayFlagsOpaqueEXT, 0x03, O, tmin, dir, R);
+				while (rayQueryProceedEXT(ra)) {}
+				if (rayQueryGetIntersectionTypeEXT(ra, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+					t = rayQueryGetIntersectionTEXT(ra, true), hit = true;
+					if (rayQueryGetIntersectionFrontFaceEXT(ra, true)) STAT(st[sb + 13u], 1u);
+				}
+			} else {
+				rayQueryEXT rs;
+				rayQueryInitializeEXT(rs, tlas, gl_RayFlagsOpaqueEXT, 0x01, O, tmin, dir, R);
+				while (rayQueryProceedEXT(rs)) {}
+				if (rayQueryGetIntersectionTypeEXT(rs, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+					t = rayQueryGetIntersectionTEXT(rs, true), hit = true;
+					if (rayQueryGetIntersectionFrontFaceEXT(rs, true)) STAT(st[sb + 13u], 1u);
+				}
+				rayQueryEXT rd;
+				rayQueryInitializeEXT(rd, tlas, gl_RayFlagsOpaqueEXT, 0x02, O, tmin, dir, t);
+				while (rayQueryProceedEXT(rd)) {}
+				if (rayQueryGetIntersectionTypeEXT(rd, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+					t = rayQueryGetIntersectionTEXT(rd, true), hit = dyn = true;
+					if (rayQueryGetIntersectionFrontFaceEXT(rd, true)) STAT(st[sb + 13u], 1u);
+				}
 			}
 			if (hit) {
 				// (ao-fix) contact falloff (1 - t / R)^2: near occluders count fully, the radius' far half little; the
@@ -344,7 +356,12 @@ void Trace(ivec2 pixel) {
 			// hidden / off screen: a dim estimate from the receiver's own light (the surroundings lit alike)
 			if (!seen) L = own * 0.2; // (gi-1027) 0.1 -> 0.2
 			// near hits are mostly the receiver's own crease: keep their bounce, but no light from inside a millimetre
-			gi += min(L, vec3(64.0)) * smoothstep(0.0, 0.05, t);
+			// (gi2-1027) firefly clamp: one ray onto a torch / a sunlit opening was a 100 %+ one-frame jump; at most 8x the
+			// frame's light (64 while unknown), hue kept
+			float lc = u.fog.z > 0.0 ? 8.0 * u.fog.z + 0.02 : 64.0;
+			float ll = Luma(L);
+			if (ll > lc) L *= lc / ll;
+			gi += L * smoothstep(0.0, 0.05, t);
 		}
 		gi /= float(max(u.cfg.y, 1));
 	}
@@ -385,18 +402,15 @@ void Temporal(ivec2 pixel) {
 	wn = max(wn, 1.0);
 	m1 /= wn, m2 /= wn;
 	vec4  sigma = sqrt(max(m2 - m1 * m1, vec4(0)));
-	// (ao-fix) the camera holding still: a longer mean (no reprojection error to hide), the noise about half
-	float a_min = still ? 0.02 : u.cfg.z >= 3 ? 0.05 : 0.06;
-	float n_max = still ? 64.0 : 24.0;
+	// (gi2-1027 flicker) camera still: a plain running mean (alpha 1 / count, up to 255 frames, no floor) and no variance
+	// clamp (the clamp against a 3x3 of 2-4 noisy rays moved the converged history every frame: RTFLICKER gi+ao 1-4 %);
+	// a real change (light, occluder) is caught by the release test, which shortens the mean instead of jumping
+	float a_min = still ? 0.0 : u.cfg.z >= 3 ? 0.05 : 0.06;
+	float n_max = still ? 255.0 : 24.0;
 	float count = 1.0;
 	float dyn   = dcur;
-	// (rt3fx) no history (disocclusion, reset): the 3x3 neighbourhood's mean (same surface), not this pixel's 2-3 rays
-	// alone: a lone noisy sample was a one-frame dark / light speck wherever something moved
 	vec4  res   = wn > 1.5 ? m1 : cur;
-	// the motion vectors are at render res: the render pixel under this trace pixel's centre
-	// (fix 3) the point's own reprojection through the scene camera's previous view-projection (world space: no motion
-	// vector sign / scale convention to get wrong; the vertical trails were history pulled from the wrong rows)
-	vec2 puv = vec2(-1.0);
+	vec2  puv   = vec2(-1.0);
 	float pdist = g.w;
 	if (u.pcam.w > 0.5) {
 		vec3 Pw = u.cam.xyz + RayDir(uv) * g.w;
@@ -410,27 +424,32 @@ void Temporal(ivec2 pixel) {
 		pdist = distance(Pw, u.pcam.xyz);
 	}
 	if ((u.cfg.w & 1) == 0 && (u.cfg.w & 2) != 0 && all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
-		vec4  pg = textureLod(gbuf_prev, puv, 0);
+		// (gi2-1027) still: point-sampled history (the linear sampler mixed across edges, a different mix each jittered
+		// frame) and a looser test (the TAA jitter moves an edge pixel's depth between surfaces; each failed test restarted
+		// that pixel from a noisy 3x3 mean)
+		vec2  hp = still ? (floor(puv * TraceSize()) + 0.5) * ts : puv;
+		vec4  pg = textureLod(gbuf_prev, hp, 0);
 		float dz = abs(pg.w - pdist) / max(pdist, 1e-3);
-		if (dz < 0.05 && dot(pg.xyz, g.xyz) > 0.9) {
-			vec4 pa = textureLod(aux_tex, puv, 0);
-			count   = min(max(pa.z, 1.0) + 1.0, n_max);
-			// (ao-fix) history darkened by a moving occluder (this frame's or the last frames'): the occluder may have
-			// left, so that history lets go fast, toward the neighbourhood mean (not one pixel's 2-4 rays), and the
-			// variance clamp tightens
-			dyn         = max(dcur, pa.y * 0.8);
-			float alpha = max(max(1.0 / count, a_min), 0.3 * dyn);
-			float k     = mix(1.25, 3.0, clamp(count / 24.0, 0.0, 1.0)) * mix(1.0, 0.5, dyn);
-			vec4  hraw  = textureLod(src_b, puv, 0);
-			vec4  hist  = clamp(hraw, m1 - k * sigma - vec4(vec3(0.002), 0.02), m1 + k * sigma + vec4(vec3(0.002), 0.02));
-			// (gi-1027) occluder / light really changed (in place of the mask): the 3x3 mean this frame lies far outside the
-			// history, measured in the mean's own standard error; noise alone stays near 1 (no release while still)
-			vec4  se    = sigma / sqrt(wn) + vec4(vec3(0.004), 0.015);
-			vec4  dv    = abs(m1 - hraw) / (3.0 * se);
-			float rel   = smoothstep(1.0, 2.5, max(dv.a, Luma(dv.rgb)));
-			dyn         = max(dyn, rel);
-			alpha       = max(alpha, 0.5 * rel);
-			res         = mix(hist, mix(cur, m1, dyn), alpha);
+		if (dz < (still ? 0.15 : 0.05) && dot(pg.xyz, g.xyz) > (still ? 0.7 : 0.9)) {
+			vec4 pa   = textureLod(aux_tex, hp, 0);
+			count     = min(max(pa.z, 1.0) + 1.0, n_max);
+			dyn       = max(dcur, pa.y * 0.8);
+			vec4 hraw = textureLod(src_b, hp, 0);
+			// release: this frame's 3x3 mean far outside the history in the mean's own standard error (+ floors for the
+			// heavy-tailed GI and a relative share): noise alone stays well below 4
+			vec4  se  = sigma / sqrt(wn) + vec4(vec3(0.004) + 0.15 * hraw.rgb, 0.02);
+			vec4  dv  = abs(m1 - hraw) / se;
+			float rel = smoothstep(4.0, 8.0, max(dv.a, Luma(dv.rgb)));
+			dyn       = max(dyn, rel);
+			// a release shortens the mean (the count falls) instead of snapping to this frame's samples
+			count       = max(mix(count, 4.0, max(rel, 0.5 * dyn)), 1.0);
+			float alpha = max(1.0 / count, a_min);
+			vec4  hist  = hraw;
+			if (!still) {
+				float k = mix(1.25, 3.0, clamp(count / 24.0, 0.0, 1.0)) * mix(1.0, 0.5, dyn);
+				hist    = clamp(hraw, m1 - k * sigma - vec4(vec3(0.002), 0.02), m1 + k * sigma + vec4(vec3(0.002), 0.02));
+			}
+			res = mix(hist, mix(cur, m1, 0.5 + 0.5 * dyn), alpha);
 		}
 	}
 	imageStore(out_img, pixel, max(res, vec4(0)));

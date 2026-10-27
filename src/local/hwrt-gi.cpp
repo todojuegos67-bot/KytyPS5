@@ -13,8 +13,8 @@
 //      hit is on screen and not hidden (exact for what the camera sees), a dim estimate off screen; misses add nothing
 //      (the sky's light is the game's ambient already). Added as G-buffer albedo x bounce x KYTY_HWRT_GI_INTENSITY (0.7),
 //      soft-capped against the pixel's own light: dark creases next to lit walls lift and take their colour; nothing glows.
-//  Levels (the higher of the two switches): 1 half res, AO 2 rays + GI 1 ray, 2 a-trous passes; 2 half res, AO 3 + GI 2,
-//  3 passes; 3 full res, AO 2 + GI 2, 3 passes. Temporal accumulation (motion vectors, disocclusion, clamped) + a-trous +
+//  Levels (gi2-1027; all half res, one query an AO ray): 1 AO 2 + GI 1 (4 m), 2 a-trous passes; 2 AO 2 + GI 1 (6 m),
+//  3 passes; 3 AO 3 + GI 2 (10 m), 3 passes. Temporal accumulation (motion vectors, disocclusion, clamped) + a-trous +
 //  a depth-aware upsample. KYTY_HWRT_GI_VIEW=1 the AO alone, 2 the added bounce x 4. Every 5 s "HWRTGI: GPU" timing.
 //  Off (both 0 / unset): nothing here runs (HwGiWanted false; GTAO, SSGI and the G-buffer copy exactly as before).
 #include "local/hwrt-gi.h"
@@ -297,7 +297,9 @@ bool EnsurePipeline(GraphicContext& graphics) {
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level) {
 	if (g_gi.out.image != VK_NULL_HANDLE && g_gi.render == render) return true;
 	// (ao2) every level half res: level 3 at full res traced 1920x1080 x 3 rays (8 ms on a 5080); it gets more rays instead
-	const vk::Extent2D trace = (level >= 3 && Cfg().gi >= 3) ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
+	// (gi2-1027) Alto too: its full-res trace measured 10.1 ms (owner's RTX, 1280x720); half res + more rays instead
+	(void)level;
+	const vk::Extent2D trace = vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
 	for (auto* img : TraceImages())
 		FreeImage(graphics, *img);
 	bool ok = MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, render, true, g_gi.out);
@@ -404,7 +406,7 @@ void ReadStats(GraphicContext& graphics) {
 	if (Cfg().gi > 0) { // (gi-1027) the GI's own line
 		std::printf("HWRTGI: 10 s: GI quality %s (%d): %d rays, %ux%u trace, GPU %.3f ms (AO + GI pass), GI rays hit %.1f%% (%llu sampled), "
 		            "of the hits lit on screen %.1f%%\n",
-		            QualityName(Cfg().gi), Cfg().gi, Cfg().gi, g_gi.trace.width, g_gi.trace.height,
+		            QualityName(Cfg().gi), Cfg().gi, Cfg().gi >= 3 ? 2 : 1, g_gi.trace.width, g_gi.trace.height,
 		            pass_ms, pct(s[4], s[3]), static_cast<unsigned long long>(s[3]), pct(s[5], s[4]));
 	}
 	std::printf("HWRTGI: self-test %u frames: %.0f px/frame sampled (1 of 16); AO rays hit %.1f%% (%llu rays, front faces %.1f%% of the hits); GI rays hit %.1f%%, of those on "
@@ -497,7 +499,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	static const float ao_floor    = EnvFloat("KYTY_HWRT_AO_FLOOR", 0.35f, 0.2f, 1.0f);
 	// (gi-1027) GI levels: Bajo 1 ray, 4 m, half res; Medio 2 rays, 8 m, half res; Alto 3 rays, 12 m, full res
 	static const float gi_int      = EnvFloat("KYTY_HWRT_GI_INTENSITY", cfg.gi >= 3 ? 1.2f : cfg.gi == 2 ? 1.0f : 0.8f, 0.0f, 4.0f);
-	static const float gi_range    = EnvFloat("KYTY_HWRT_GI_RANGE", cfg.gi >= 3 ? 12.0f : cfg.gi == 2 ? 8.0f : 4.0f, 0.5f, 100.0f);
+	static const float gi_range    = EnvFloat("KYTY_HWRT_GI_RANGE", cfg.gi >= 3 ? 10.0f : cfg.gi == 2 ? 6.0f : 4.0f, 0.5f, 100.0f);
 	static const float gi_ambient  = EnvFloat("KYTY_HWRT_GI_AMBIENT", 3.0f, 0.0f, 50.0f); // (AO on albedo x this x the frame's light only)
 	static const bool  dyn_mask    = EnvBool("KYTY_HWRT_AO_DYNMASK", false);
 	static const float fade_start  = EnvFloat("KYTY_HWRT_GI_FADE", 120.0f, 5.0f, 5000.0f);
@@ -508,8 +510,12 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const int          level       = cfg.level;
 	// (ao-fix) Bajo 2, Medio 3, Alto 4 rays a trace pixel, always half res (each ray: a static closest hit + a short
 	// dynamic one); temporal accumulation does the rest
-	const int          ao_rays     = cfg.ao == 0 ? 0 : 1 + cfg.ao;
-	const int          gi_rays     = cfg.gi;
+	// (gi2-1027 cost: Medio <= 1.5 ms, Alto <= 3 ms; measured before: Medio AO 3 x 2 queries + GI 2 x 8 m 2.0 ms, Alto
+	// full res 10.1 ms) AO one 0x03 query a ray: Bajo / Medio 2, Alto 3; GI Bajo / Medio 1 ray (4 / 6 m), Alto 2 (10 m),
+	// all half res; the still-camera running mean (up to 255 frames) carries the quality
+	static constexpr int ao_by_level[4] {0, 2, 2, 3}, gi_by_level[4] {0, 1, 1, 2};
+	const int          ao_rays     = ao_by_level[cfg.ao];
+	const int          gi_rays     = gi_by_level[cfg.gi];
 	const int          passes      = level == 1 ? 2 : 3;
 	// (ao-fix) the camera holding still (the scene camera's view-projection unchanged): the temporal pass averages longer
 	static std::array<float, 16> still_vp {};
@@ -518,7 +524,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		float big = 1e-12f;
 		for (float v: scene.vp) big = std::max(big, std::abs(v));
 		for (int i = 0; i < 16; ++i)
-			if (std::abs(scene.vp[i] - still_vp[i]) > 1e-5f * big) still = false;
+			if (std::abs(scene.vp[i] - still_vp[i]) > 4e-3f * big) still = false; // (gi2-1027: RTFLICKER's test; the TAA jitter ~1e-3)
 		still_vp = scene.vp;
 	}
 	if (still) ++g_gi.ao_frames_still;
