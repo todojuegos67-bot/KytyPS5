@@ -6,6 +6,7 @@
 #include "port/ds-settings.h"
 
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,9 @@ struct Runtime {
 	PcInfo                   pc;         // TU EQUIPO
 	std::filesystem::path    exe_path;   // "Demon's Souls.exe" (the update's elevated helper)
 	std::filesystem::path    game_rel;   // the game's folder relative to the port's, when inside it (else empty)
+	// (10-27b) The start menu's "Carpeta del juego": a folder with eboot.bin (or a .zar), and the Windows folder picker.
+	std::function<bool(const std::string&)> is_game;
+	std::function<std::string()>            pick_folder;
 };
 
 // Installs the port's hooks (PortLive::g_hooks): the menu (F1, or OPTIONS held + R3), the window icon and title, the

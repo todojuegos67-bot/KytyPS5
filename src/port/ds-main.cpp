@@ -12,6 +12,7 @@
 #include "port/ds-port.h"
 #include "port/ds-update.h"
 #include "port/ds-precompile.h"
+#include "port/ds-i18n.h"
 
 #include <nlohmann/json.hpp>
 
@@ -596,9 +597,16 @@ int main(int argc, char* argv[]) {
 		}
 		settings.profile16 = fs::exists(root / L"ram16.txt", ec);
 	}
+	// (10-27b) The menus' language: settings.ini's idioma_menu, else (a first start) the Windows UI language; the
+	// game's follows it until chosen.
+	if (settings.menu_language.empty()) settings.menu_language = Port::I18n::DetectWindowsLanguage();
+	if (!settings.game_language_set) settings.language = Port::I18n::GameLanguageFor(settings.menu_language);
+	Port::I18n::SetLanguage(settings.menu_language);
 	if (!restarted && !RamWarning()) return 0;
 	ShowSplash(image);
-	while (!IsGame(settings.game)) {
+	// (10-27b) With the start menu the game folder is chosen there (its "Carpeta del juego" row, or at JUGAR).
+	const bool start_menu = settings.start_menu && !restarted;
+	while (!start_menu && !IsGame(settings.game)) {
 		if (!settings.game.empty())
 			Message("No hay eboot.bin en:\n" + settings.game + "\n\nElige la carpeta del juego volcado (la que tiene eboot.bin y sce_sys).");
 		SplashStatus("Elige la carpeta del juego...");
@@ -611,14 +619,14 @@ int main(int argc, char* argv[]) {
 	}
 	Port::SaveSettings(ini, settings);
 
-	const GameParam param = ReadParam(settings.game);
+	GameParam param = ReadParam(settings.game);
 	std::printf("[port] Demon's Souls PC %s: %s %s %s; settings %s\n", Port::Update::CurrentVersion(), param.name.c_str(),
 	            param.title_id.c_str(), param.version.c_str(), ini.c_str());
 	if (olds > 0) std::printf("[port] update: %d .old file(s) of the previous version deleted\n", olds);
 	const Port::PcInfo pc = DetectPc();
 	std::printf("[port] PC: %s (%llu MB), %s, %d GB RAM%s\n", pc.gpu.c_str(), static_cast<unsigned long long>(pc.vram >> 20), pc.cpu.c_str(),
 	            pc.ram_gb, Port::LowRam(settings, pc) ? " (16 GB profile)" : "");
-	const std::string version = param.title_id + " " + param.version;
+	std::string version = param.title_id + " " + param.version;
 	if (!param.title_id.empty() && version != "PPSA01341 01.007.000" && version != "PPSA01341 01.005.000")
 		std::printf("[port] untested game version %s (tested: PPSA01341 01.007.000 and 01.005.000)\n", version.c_str());
 
@@ -659,7 +667,7 @@ int main(int argc, char* argv[]) {
 	int cpus = count_cpus(mask);
 	// (10-27b) Shaders first (the seed file, the release's hints, the prefetch inputs: splash "Preparando shaders 1/3..3/3"),
 	// then the start menu, which runs the static precompile (precompile-windows.ps1) when this GPU's cache is not current.
-	PrepareShaders(root, settings.game, param, mask != system_mask ? mask : 0, cpus);
+	if (IsGame(settings.game)) PrepareShaders(root, settings.game, param, mask != system_mask ? mask : 0, cpus);
 	{
 		Port::Precompile::Setup ps;
 		ps.root     = root;
@@ -670,22 +678,33 @@ int main(int argc, char* argv[]) {
 		ps.cpus     = cpus;
 		Port::Precompile::Configure(ps);
 		std::error_code pe;
-		if (settings.start_menu && !restarted && !ps.id.empty() && fs::exists(ps.seeds, pe)) {
+		if (start_menu && !ps.id.empty() && fs::exists(ps.seeds, pe)) {
 			SplashStatus("Comprobando la cache de shaders...");
 			const bool current = Port::Precompile::CacheCurrent();
 			std::printf("[port] static shader cache: %s\n", current ? "current" : "to be made (the start menu precompiles it)");
 			if (!current) Port::Precompile::Start();
 		}
 	}
-	if (settings.start_menu && !restarted) {
-		const bool play = Port::RunStartMenu(make_runtime(Port::BuildLaunch(settings, param.title_id, pc)), &settings);
+	if (start_menu) {
+		const std::string game_before = settings.game;
+		Port::Runtime     menu_rt     = make_runtime(Port::BuildLaunch(settings, param.title_id, pc));
+		menu_rt.is_game               = [](const std::string& p) { return IsGame(p); };
+		menu_rt.pick_folder           = [] { return PickFolder(); };
+		const bool play = Port::RunStartMenu(menu_rt, &settings);
 		Port::Precompile::Stop();
-		if (!play) return 0;
+		if (!play || !IsGame(settings.game)) return 0;
 		Port::SaveSettings(ini, settings);
 		ShowSplash(image);
 		SplashStatus("Iniciando...");
 		mask = cpu_mask();
 		cpus = count_cpus(mask);
+		if (settings.game != game_before) {
+			// (Another game folder: its version's seeds, hints and prefetch inputs.)
+			param   = ReadParam(settings.game);
+			version = param.title_id + " " + param.version;
+			std::printf("[port] game folder: %s (%s)\n", settings.game.c_str(), version.c_str());
+			PrepareShaders(root, settings.game, param, mask != system_mask ? mask : 0, cpus);
+		}
 	}
 
 	Port::LaunchPlan plan = Port::BuildLaunch(settings, param.title_id, pc);

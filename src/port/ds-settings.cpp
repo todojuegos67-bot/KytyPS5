@@ -171,6 +171,10 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	};
 	str("carpeta_juego", s->game);
 	num("idioma", s->language);
+	num("idioma_juego", s->language);
+	for (const char* k: {"idioma", "idioma_juego"})
+		if (auto it = v.find(k); it != v.end() && !it->second.empty()) s->game_language_set = true;
+	str("idioma_menu", s->menu_language);
 	boo("copia_partidas", s->backup_saves);
 	boo("pantalla_completa", s->fullscreen);
 	num("ancho", s->width);
@@ -246,7 +250,10 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Carpeta del juego volcado (la que tiene eboot.bin y sce_sys), o un .zar. Vacia: se pregunta al arrancar.\n"
 	  << "carpeta_juego=" << s.game << "\n"
 	  << "; Idioma de la consola: 3 espanol (Espana), 20 espanol (Latinoamerica), 1 ingles (EE. UU.), 18 ingles (R. U.)\n"
-	  << "idioma=" << s.language << "\n"
+	  << "; Idioma del juego (consola PS5: 3 espanol, 20 espanol latino, 1 ingles EE. UU., 18 ingles RU, 2 frances, 4 aleman, 5 italiano, 7 portugues, 17 portugues Brasil, 0 japones, 11 chino simplificado)\n"
+	  << "idioma_juego=" << s.language << "\n"
+	  << "; Idioma de los menus: es, en, pt, fr, it, de\n"
+	  << "idioma_menu=" << s.menu_language << "\n"
 	  << "; Copia de seguridad de _SaveData en _SaveData-copias antes de jugar\n"
 	  << "copia_partidas=" << b(s.backup_saves) << "\n\n"
 	  << "[Pantalla]\n"

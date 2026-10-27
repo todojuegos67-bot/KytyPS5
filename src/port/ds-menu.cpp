@@ -9,6 +9,7 @@
 #include "port/ds-port.h"
 #include "port/ds-update.h"
 #include "port/ds-precompile.h"
+#include "port/ds-i18n.h"
 
 #include "local/perf-overlay.h"
 #include "local/port-live.h"
@@ -304,7 +305,7 @@ bool ComboRow(const char* label, bool restart, int count, const Item* items, std
 	for (int i = 0; i < count; i++)
 		if (value == id(items[i])) current = i;
 	ImGui::AlignTextToFramePadding();
-	ImGui::TextUnformatted(label);
+	ImGui::TextUnformatted(I18n::T(label));
 	if (restart) {
 		ImGui::SameLine(0, 4);
 		ImGui::TextColored(kWarn, "*");
@@ -314,10 +315,10 @@ bool ComboRow(const char* label, bool restart, int count, const Item* items, std
 	ImGui::SetNextItemWidth(-1);
 	bool changed = false;
 	ImGui::PushID(label);
-	if (ImGui::BeginCombo("##c", text(items[current]))) {
+	if (ImGui::BeginCombo("##c", I18n::T(text(items[current])))) {
 		for (int i = 0; i < count; i++) {
 			const bool selected = i == current;
-			if (ImGui::Selectable(text(items[i]), selected)) {
+			if (ImGui::Selectable(I18n::T(text(items[i])), selected)) {
 				value   = id(items[i]);
 				changed = true;
 			}
@@ -338,7 +339,7 @@ bool CheckRow(const char* label, bool restart, bool& value, const char* tip = nu
 	const bool changed = ImGui::Checkbox("##k", &value);
 	ImGui::PopID();
 	ImGui::SameLine();
-	ImGui::TextUnformatted(label);
+	ImGui::TextUnformatted(I18n::T(label));
 	if (restart) {
 		ImGui::SameLine(0, 4);
 		ImGui::TextColored(kWarn, "*");
@@ -514,18 +515,18 @@ void DrawShaderBlock(float unit) {
 		ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), {-1, 30 * unit}, "Preparando...");
 	}
 	ImGui::TextColored(v.failed ? kWarn : (v.finished ? kGold : kDim), "%s",
-	                   v.text.empty() ? "Shaders: la cache de esta grafica ya esta preparada." : v.text.c_str());
+	                   v.text.empty() ? I18n::T("Shaders: la cache de esta grafica ya esta preparada.") : v.text.c_str());
 	if (v.running) {
 		ImGui::SameLine();
-		if (ImGui::SmallButton("Detener")) std::thread([] { Precompile::Stop(); }).detach();
+		if (ImGui::SmallButton(I18n::T("Detener"))) std::thread([] { Precompile::Stop(); }).detach();
 	} else if (!v.finished) {
 		ImGui::SameLine();
-		if (ImGui::SmallButton("Preparar shaders")) Precompile::Start();
+		if (ImGui::SmallButton(I18n::T("Preparar shaders"))) Precompile::Start();
 	}
 }
 
 void InfoLine(const char* caption, const std::string& value, const ImVec4& color) {
-	ImGui::TextColored(kDim, "%s", caption);
+	ImGui::TextColored(kDim, "%s", I18n::T(caption));
 	ImGui::PushStyleColor(ImGuiCol_Text, color);
 	ImGui::TextWrapped("%s", value.c_str());
 	ImGui::PopStyleColor();
@@ -539,7 +540,7 @@ void DrawPcTab(float unit) {
 	ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14 * unit);
 	ImGui::BeginChild("##card", {0, 330 * unit}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
 	ImGui::PushFont(nullptr, 30.0f * unit);
-	ImGui::TextColored(kGold, "TU EQUIPO");
+	ImGui::TextColored(kGold, "%s", I18n::T("TU EQUIPO"));
 	ImGui::PopFont();
 	const auto& pc  = g_rt.pc;
 	std::string gpu = pc.gpu.empty() ? std::string("no detectada") : pc.gpu;
@@ -571,14 +572,14 @@ void DrawPcTab(float unit) {
 	ImGui::BeginDisabled(busy);
 	if (state == UpdateUi::Available) {
 		if (ImGui::Button(("Actualizar a " + g_upd.release.tag).c_str(), {bw, bh})) StartWorker(InstallWork);
-	} else if (ImGui::Button("Actualizar version", {bw, bh})) {
+	} else if (ImGui::Button(I18n::T("Actualizar version"), {bw, bh})) {
 		SetUpd(UpdateUi::Checking, "Buscando la ultima version en GitHub...");
 		StartWorker(CheckWork);
 	}
 	if (ImGui::IsItemHovered())
 		ImGui::SetTooltip("Busca la ultima version publicada en GitHub y la instala en esta misma carpeta. Guarda los archivos del motor actuales en _backup_update (las 2 ultimas) y no toca la cache de shaders, las partidas, los seeds ni los ajustes.");
 	ImGui::SameLine();
-	if (ImGui::Button("Volver a la version anterior", {bw, bh})) {
+	if (ImGui::Button(I18n::T("Volver a la version anterior"), {bw, bh})) {
 		OpenRestore();
 		std::scoped_lock lock(g_upd.mutex);
 		state = g_upd.state;
@@ -593,7 +594,7 @@ void DrawPcTab(float unit) {
 		char        label[64];
 		std::snprintf(label, sizeof(label), "%.0f / %.0f MB", g_upd.done.load() / 1048576.0, g_upd.total.load() / 1048576.0);
 		ImGui::ProgressBar(f, {-1, 0}, label);
-		if (ImGui::Button("Cancelar")) g_upd.cancel = true;
+		if (ImGui::Button(I18n::T("Cancelar"))) g_upd.cancel = true;
 	}
 	if (state == UpdateUi::Choosing || state == UpdateUi::Confirming) {
 		std::scoped_lock lock(g_upd.mutex);
@@ -607,9 +608,9 @@ void DrawPcTab(float unit) {
 		}
 	}
 	if (state == UpdateUi::Confirming) {
-		if (ImGui::Button("Restaurar", {bw * 0.6f, bh})) StartWorker(RestoreWork);
+		if (ImGui::Button(I18n::T("Restaurar"), {bw * 0.6f, bh})) StartWorker(RestoreWork);
 		ImGui::SameLine();
-		if (ImGui::Button("Cancelar##r", {bw * 0.6f, bh})) SetUpd(UpdateUi::Idle, "");
+		if (ImGui::Button(I18n::T("Cancelar##r"), {bw * 0.6f, bh})) SetUpd(UpdateUi::Idle, "");
 	}
 }
 
@@ -672,7 +673,7 @@ void Draw(float width, float height) {
 	}
 	ImGui::Begin("##PortMenu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 	ImGui::PushFont(font, 40.0f * unit);
-	ImGui::TextColored(kGold, "%s", g_start_mode ? "DEMON'S SOULS" : "OPCIONES");
+	ImGui::TextColored(kGold, "%s", g_start_mode ? "DEMON'S SOULS" : I18n::T("OPCIONES"));
 	ImGui::PopFont();
 	ImGui::SameLine();
 	ImGui::SetCursorPosX(size.x - ImGui::CalcTextSize(g_rt.game_info.c_str()).x - 32 * unit);
@@ -689,7 +690,7 @@ void Draw(float width, float height) {
 	if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
 		for (int t = 0; t < kTabCount; t++) {
 			const ImGuiTabItemFlags flags = g_tab_request == t ? ImGuiTabItemFlags_SetSelected : 0;
-			if (!ImGui::BeginTabItem(tabs[t], nullptr, flags)) continue;
+			if (!ImGui::BeginTabItem((std::string(I18n::T(tabs[t])) + "###tab" + std::to_string(t)).c_str(), nullptr, flags)) continue;
 			g_tab = t;
 			ImGui::BeginChild("##page", {0, size.y - footer - ImGui::GetCursorPosY()}, ImGuiChildFlags_None);
 			const bool fixed = FixedFg(s);
@@ -743,7 +744,7 @@ void Draw(float width, float height) {
 					if (max_gen > 1 && s.framegen == g_rt.launched.framegen) {
 						if (g_fg_live == 0) g_fg_live = max_gen;
 						ImGui::AlignTextToFramePadding();
-						ImGui::TextUnformatted("Multiplicador (en vivo)");
+						ImGui::TextUnformatted(I18n::T("Multiplicador (en vivo)"));
 						ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.42f + ImGui::GetCursorStartPos().x);
 						ImGui::SetNextItemWidth(-1);
 						int shown = g_fg_live + 1;
@@ -840,13 +841,26 @@ void Draw(float width, float height) {
 						s.fps_cap    = static_cast<float>(std::atof(cap.c_str()));
 						live_changed = true;
 					}
+					{
+						std::vector<Choice> langs;
+						for (int i = 0; i < I18n::kMenuLanguageCount; i++) langs.push_back({I18n::kMenuLanguages[i], I18n::kMenuLanguageNames[i]});
+						if (s.menu_language.empty()) s.menu_language = "es";
+						if (ChoiceRow("Idioma del menu", false, langs.data(), static_cast<int>(langs.size()), s.menu_language)) {
+							I18n::SetLanguage(s.menu_language);
+							// (The game's language follows the menu's until it is chosen on its own.)
+							if (!s.game_language_set) s.language = I18n::GameLanguageFor(s.menu_language);
+						}
+					}
 					std::string lang = std::to_string(s.language);
-					if (ChoiceRow("Idioma", true, kLanguages, kLanguageCount, lang)) s.language = std::atoi(lang.c_str());
+					if (ChoiceRow("Idioma", true, kLanguages, kLanguageCount, lang)) {
+						s.language          = std::atoi(lang.c_str());
+						s.game_language_set = true;
+					}
 					CheckRow("Copia de las partidas al arrancar", false, s.backup_saves);
 					ImGui::Spacing();
-					ImGui::TextColored(kDim, "Carpeta del juego:");
+					ImGui::TextColored(kDim, "%s", I18n::T("Carpeta del juego:"));
 					ImGui::TextWrapped("%s", s.game.c_str());
-					ImGui::TextColored(kDim, "Para cambiarla, borra carpeta_juego en settings.ini.");
+					ImGui::TextColored(kDim, "%s", g_start_mode ? "Se cambia abajo (Cambiar...)." : "Se cambia en el menu de inicio, antes del juego.");
 					break;
 				}
 				case 6: { // Rendimiento / PC
@@ -861,8 +875,7 @@ void Draw(float width, float height) {
 					ImGui::EndDisabled();
 					if (low) ImGui::TextColored(kGold, "RAM %s: perfil seguro. Cierra navegadores", s.simulate_ram16 ? "16 GB (simulado)" : (std::to_string(g_rt.pc.ram_gb) + " GB").c_str());
 					else ImGui::TextColored(kDim, "RAM %d GB: sin perfil de 16 GB (solo en PCs de 20 GB o menos).", g_rt.pc.ram_gb);
-					CheckRow("Simular 16 GB RAM", true, s.simulate_ram16, "Solo el juego: como mucho 12 GB en RAM (4 GB para Windows), el resto a disco, como un PC de 16 GB.");
-					CheckRow("Simular grafica 8 GB", true, s.simulate_vram8, "El juego solo puede usar 8 GB de VRAM, como una grafica de 8 GB.");
+					// (10-27b) "Simular 16 GB RAM" / "Simular grafica 8 GB" (the launcher's tests) are not shown: settings.ini only.
 					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para graficas que se cuelgan o dan pantallazo azul: mas estable, ~37% menos FPS");
 					CheckRow("Usar todos los CCD (Ryzen de dos CCD)", true, s.all_ccds);
 					break;
@@ -877,7 +890,7 @@ void Draw(float width, float height) {
 					ImGui::SetNextItemWidth(-1);
 					ImGui::SliderFloat("##sens", &s.kbm_sens, 0.1f, 5.0f, "%.2f");
 					ImGui::AlignTextToFramePadding();
-					ImGui::TextUnformatted("Antizona muerta");
+					ImGui::TextUnformatted(I18n::T("Antizona muerta"));
 					if (ImGui::IsItemHovered()) ImGui::SetTooltip("Salta la zona muerta del stick del juego: con mas, un movimiento pequeno del raton ya gira la camara. Si la camara se mueve sola, bajalo.");
 					ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.42f + ImGui::GetCursorStartPos().x);
 					ImGui::SetNextItemWidth(-1);
@@ -885,7 +898,7 @@ void Draw(float width, float height) {
 					ImGui::EndDisabled();
 					if (CheckRow("Vibracion", false, s.rumble)) live_changed = true;
 					ImGui::AlignTextToFramePadding();
-					ImGui::TextUnformatted("Fuerza de la vibracion");
+					ImGui::TextUnformatted(I18n::T("Fuerza de la vibracion"));
 					ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.42f + ImGui::GetCursorStartPos().x);
 					ImGui::SetNextItemWidth(-1);
 					if (ImGui::SliderFloat("##gain", &s.rumble_gain, 1.0f, 8.0f, "%.1f")) live_changed = true;
@@ -908,55 +921,89 @@ void Draw(float width, float height) {
 	ImGui::SetCursorPosY(size.y - footer + 8 * unit);
 	ImGui::Separator();
 	if (g_start_mode) {
+		{
+			const bool valid = !g_rt.is_game || g_rt.is_game(s.game);
+			ImGui::AlignTextToFramePadding();
+			ImGui::TextColored(kDim, "%s", I18n::T("Carpeta del juego:"));
+			ImGui::SameLine();
+			ImGui::TextColored(valid ? kGold : kWarn, "%s", s.game.empty() ? I18n::T("(sin elegir)") : s.game.c_str());
+			ImGui::SameLine();
+			if (ImGui::SmallButton(I18n::T("Cambiar...")) && g_rt.pick_folder) {
+				const std::string picked = g_rt.pick_folder();
+				if (!picked.empty() && (!g_rt.is_game || g_rt.is_game(picked))) {
+					s.game = picked;
+					Save();
+				} else if (!picked.empty()) {
+					g_status = "Esa carpeta no tiene eboot.bin ni sce_sys: elige la carpeta del juego volcado.";
+				}
+			}
+			if (!valid) {
+				ImGui::SameLine();
+				ImGui::TextColored(kWarn, "%s", I18n::T("(no valida: JUGAR te la pide)"));
+			}
+		}
 		DrawShaderBlock(unit);
-		ImGui::TextColored(kDim, "%s", g_status.empty() ? "Los cambios se aplican al pulsar JUGAR (sin reiniciar). F1 dentro del juego: opciones en vivo." : g_status.c_str());
+		ImGui::TextColored(kDim, "%s", g_status.empty() ? I18n::T("Los cambios se aplican al pulsar JUGAR (sin reiniciar). F1 dentro del juego: opciones en vivo.") : g_status.c_str());
 		const float bw = 300 * unit, bh = 60 * unit;
 		const auto  v  = Precompile::State();
-		if (ImGui::Button(v.running && !v.playable ? "JUGAR (sin esperar)" : "JUGAR", {bw, bh})) {
-			Save();
-			g_start_result = 1;
+		if (ImGui::Button(I18n::T(v.running && !v.playable ? "JUGAR (sin esperar)" : "JUGAR"), {bw, bh})) {
+			// (No game folder: the picker at once; a valid one chosen, saved and played.)
+			bool ok = !g_rt.is_game || g_rt.is_game(s.game);
+			if (!ok && g_rt.pick_folder) {
+				const std::string picked = g_rt.pick_folder();
+				if (!picked.empty() && g_rt.is_game(picked)) {
+					s.game = picked;
+					ok     = true;
+				} else if (!picked.empty()) {
+					g_status = "Esa carpeta no tiene eboot.bin ni sce_sys: elige la carpeta del juego volcado.";
+				}
+			}
+			if (ok) {
+				Save();
+				g_start_result = 1;
+			}
 		}
 		if (v.running && ImGui::IsItemHovered())
 			ImGui::SetTooltip("Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez). Sin ella, el juego compila shaders al jugar (tirones).");
 		ImGui::SameLine();
 		ImGui::BeginDisabled(g_upd.busy.load());
-		if (ImGui::Button("Actualizar version", {bw, bh})) {
+		if (ImGui::Button(I18n::T("Actualizar version"), {bw, bh})) {
 			g_tab_request = 8;
 			OpenCheck();
 		}
 		ImGui::SameLine();
-		if (ImGui::Button("Volver a la version anterior", {bw, bh})) {
+		if (ImGui::Button(I18n::T("Volver a la version anterior"), {bw, bh})) {
 			g_tab_request = 8;
 			OpenRestore();
 		}
 		ImGui::EndDisabled();
 		ImGui::SameLine();
-		if (ImGui::Button("Salir", {bw * 0.6f, bh})) g_start_result = -1;
+		if (ImGui::Button(I18n::T("Salir"), {bw * 0.6f, bh})) g_start_result = -1;
 	} else {
 	const bool needs = NeedsRestart(g_rt.launched, s);
 	if (needs) ImGui::TextColored(kWarn, "* Hay cambios que necesitan reiniciar el juego (guarda antes en una hoguera / al salir).");
 	else ImGui::TextColored(kDim, "%s", g_status.empty() ? "* = necesita reiniciar.   Circulo / Esc: volver al juego." : g_status.c_str());
 	const float bw = 220 * unit, bh = 52 * unit;
-	if (ImGui::Button("Guardar y volver", {bw, bh})) {
+	if (ImGui::Button(I18n::T("Guardar y volver"), {bw, bh})) {
 		Save();
 		ApplyLive(s);
 		SetOpen(false);
 	}
 	ImGui::SameLine();
 	ImGui::BeginDisabled(!needs);
-	if (ImGui::Button("Reiniciar ahora", {bw, bh})) {
+	if (ImGui::Button(I18n::T("Reiniciar ahora"), {bw, bh})) {
 		Save();
 		RequestRestart();
 	}
 	ImGui::EndDisabled();
 	ImGui::SameLine();
-	if (ImGui::Button("Descartar", {bw, bh})) {
+	if (ImGui::Button(I18n::T("Descartar"), {bw, bh})) {
 		g_edit = g_saved;
 		ApplyLive(g_saved);
 		SetOpen(false);
 	}
 	ImGui::SameLine();
-	if (ImGui::Button("Salir del juego", {bw, bh})) RequestQuit();
+	if (ImGui::Button(I18n::T("Salir del juego"), {bw, bh})) RequestQuit();
 	}
 	ImGui::End();
 	// (11 colours and 4 variables pushed above; 13 popped before 10-27b: Dear ImGui's "PopStyleColor() too many times".)

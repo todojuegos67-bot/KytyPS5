@@ -68,7 +68,9 @@ extern const int     kSoulsModeCount;
 struct Settings {
 	// [Juego]
 	std::string game;             // the game's folder (eboot.bin) or .zar
-	int         language = 3;     // console language (PS5 numbering; 3 = espanol (Espana), 1 = English (US))
+	int         language = 3;     // idioma_juego: console language (PS5 numbering; 3 = espanol (Espana), 1 = English (US))
+	bool        game_language_set = false; // (idioma_juego / idioma in settings.ini)
+	std::string menu_language;    // (10-27b) idioma_menu: es, en, pt, fr, it, de (empty: the Windows UI language at start)
 	bool        backup_saves = true;
 	// [Pantalla]
 	bool        fullscreen = true;
