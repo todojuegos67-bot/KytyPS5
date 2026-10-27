@@ -320,7 +320,11 @@ bool EnsurePipeline(GraphicContext& graphics) {
 }
 
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D extent, int level) {
-	const vk::Extent2D trace = level >= 3 ? extent : vk::Extent2D {std::max(extent.width / 2, 1u), std::max(extent.height / 2, 1u)};
+	// (all2-1027) the trace's pixel budget, whatever the render size (a 2880x1620 render traced at full size cost 9.7 ms):
+	// Bajo / Medio ~0.23 M (640x360 at 16:9), Alto ~0.92 M (1280x720); never above the render size
+	const double budget = level >= 3 ? 921600.0 : 230400.0;
+	const double scale  = std::min(1.0, std::sqrt(budget / std::max(1.0, double(extent.width) * double(extent.height))));
+	const vk::Extent2D trace {std::max(static_cast<uint32_t>(extent.width * scale), 1u), std::max(static_cast<uint32_t>(extent.height * scale), 1u)};
 	if (g_hl.out.image != VK_NULL_HANDLE && g_hl.extent == extent && g_hl.trace == trace) return true;
 	Img* all[] {&g_hl.out, &g_hl.raw, &g_hl.tmp_a, &g_hl.tmp_b, &g_hl.gbuf[0], &g_hl.gbuf[1], &g_hl.hist[0], &g_hl.hist[1]};
 	for (Img* img: all) Retire(graphics, *img);
@@ -544,7 +548,7 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		std::printf("HWRTLIGHTS: on (level %d: %s, %ux%u; strength %g, max %g, ambient %g, source radius %g m, skip %g m, %g m; lights from "
 		            "the game's shadow projections eased per frame, weight (r/d)^2 windowed, penumbra = source size (contact-hardening), "
 		            "a ratio correction of the lit color)\n",
-		            level, level == 1 ? "half-res, 1 ray, 8 lights" : level == 2 ? "half-res, 2 rays, 12 lights" : "full-res, 1 ray, 16 lights", color.extent.width,
+		            level, level == 1 ? "~0.23 Mpx, 1 ray, 8 lights" : level == 2 ? "~0.23 Mpx, 2 rays, 12 lights" : "~0.92 Mpx, 1 ray, 16 lights", color.extent.width,
 		            color.extent.height, strength, max_dark, ambient, soft, skip, max_dist);
 		std::fflush(stdout);
 	}
