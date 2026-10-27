@@ -333,7 +333,7 @@ uint64_t ReadbackWindowSize() {
 	return bytes;
 }
 
-// KYTY_REPEAT_READ_WINDOW_KB (live, default 0 = off, wolverine-rbwin-1027): a guest read of a page
+// KYTY_REPEAT_READ_WINDOW_KB (live, default 256 since wolverine-rbfix-1027; 0 = off): a guest read of a page
 // that already faulted in the last 250 ms downloads only this window (a power of two, at least the
 // tracker page) instead of KYTY_READBACK_WINDOW_KB. Owner log 20261027-180242 (KYTY_READBACK_STATS):
 // three buffers re-read the same 2-23 pages every frame and each fault downloaded 1-2 MiB
@@ -342,7 +342,7 @@ uint64_t ReadbackWindowSize() {
 // the GPU rewrites it before the next frame. The window is only a transfer size: correctness is
 // the same at any width (pages outside it stay GPU-owned and fault on their own).
 uint64_t RepeatReadWindowSize(uint64_t page, bool is_write) {
-	static auto& kib = Common::LiveSwitches::Get("KYTY_REPEAT_READ_WINDOW_KB", 0);
+	static auto& kib = Common::LiveSwitches::Get("KYTY_REPEAT_READ_WINDOW_KB", 256);
 	static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> s_last; // GPU thread
 	const auto value = kib.load(std::memory_order_relaxed);
 	const auto bytes = static_cast<uint64_t>(value) * 1024;
@@ -921,6 +921,9 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	const auto     buffer_end   = buffer_begin + buffer.Size();
 	const auto     window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	// Whatever the width, the window must hold every faulting byte: only those are unprotected
+	// below, the rest of the buffer stays GPU-owned and faults on its own.
+	EXIT_IF(window_begin > vaddr || window_end < std::min(vaddr + size, buffer_end));
 
 	if (stats.Enabled()) {
 		stats.FindWriter([this](uint64_t tick) { return m_scheduler.IsFree(tick); });
@@ -1371,6 +1374,7 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 	const auto     buffer_end   = buffer_begin + buffer.Size();
 	window_begin                = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 	window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	EXIT_IF(window_begin > vaddr || window_end < std::min(vaddr + size, buffer_end));
 	if (OverlapsPendingWriteReadback(window_begin, window_end)) {
 		// The page itself is not pending (checked above), but the window shares bytes with a
 		// landing readback (neighbouring pages read by other guest threads): download only the

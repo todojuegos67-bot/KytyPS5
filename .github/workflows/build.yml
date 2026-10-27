@@ -45,7 +45,7 @@ jobs:
         shell: pwsh
         run: |
           $name = "KytyPS5-Wolverine-TURBO-$((Get-Date).ToUniversalTime().ToString('yyyyMMdd'))-$($env:GITHUB_SHA.Substring(0, 8))"
-          if ($env:GITHUB_REF_NAME -in @('rtall-1023','wolverine-ab-1027','wolverine-rbwin-1027','wolverine-memo-1027','wolverine-fast-1027','wolverine-state-1027','wolverine-async-1027','wolverine-turbo9-1025','wolverine-turbo8-1025','wolverine-turbo7-1025','wolverine-turbo6-1025','wolverine-turbo5-1025','wolverine-turbo4-1025','wolverine-turbo3-1025','wolverine-turbo2-1025','wolverine-turbo-1025')) { $name = "$name-fg" }
+          if ($env:GITHUB_REF_NAME -in @('rtall-1023','wolverine-rbfix-1027','wolverine-ab-1027','wolverine-rbwin-1027','wolverine-memo-1027','wolverine-fast-1027','wolverine-state-1027','wolverine-async-1027','wolverine-turbo9-1025','wolverine-turbo8-1025','wolverine-turbo7-1025','wolverine-turbo6-1025','wolverine-turbo5-1025','wolverine-turbo4-1025','wolverine-turbo3-1025','wolverine-turbo2-1025','wolverine-turbo-1025')) { $name = "$name-fg" }
           "package=$name" >> $env:GITHUB_OUTPUT
 
       - name: Setup Visual Studio environment
@@ -87,7 +87,7 @@ jobs:
       # x3/x4 (KYTY_FSR3_MFG=3|4 with KYTY_FSR3_DLL=fsr3-mfg\amd_fidelityfx_vk.dll): the same SDK tag built from
       # source with tools/local/fsr3-mfg/ffx-sdk-v1.1.4-mfg.patch. Unsigned; packaged beside AMD's, not over it.
       - name: FidelityFX DLL (patched, multi frame generation)
-        if: ${{ inputs.ffx_mfg == true || github.ref_name == 'rtall-1023' || github.ref_name == 'wolverine-ab-1027' || github.ref_name == 'wolverine-rbwin-1027' || github.ref_name == 'wolverine-memo-1027' || github.ref_name == 'wolverine-fast-1027' || github.ref_name == 'wolverine-state-1027' || github.ref_name == 'wolverine-async-1027' || github.ref_name == 'wolverine-turbo9-1025' || github.ref_name == 'wolverine-turbo8-1025' || github.ref_name == 'wolverine-turbo7-1025' || github.ref_name == 'wolverine-turbo6-1025' || github.ref_name == 'wolverine-turbo5-1025' || github.ref_name == 'wolverine-turbo4-1025' || github.ref_name == 'wolverine-turbo3-1025' || github.ref_name == 'wolverine-turbo2-1025' || github.ref_name == 'wolverine-turbo-1025' }}
+        if: ${{ inputs.ffx_mfg == true || github.ref_name == 'rtall-1023' || github.ref_name == 'wolverine-rbfix-1027' || github.ref_name == 'wolverine-ab-1027' || github.ref_name == 'wolverine-rbwin-1027' || github.ref_name == 'wolverine-memo-1027' || github.ref_name == 'wolverine-fast-1027' || github.ref_name == 'wolverine-state-1027' || github.ref_name == 'wolverine-async-1027' || github.ref_name == 'wolverine-turbo9-1025' || github.ref_name == 'wolverine-turbo8-1025' || github.ref_name == 'wolverine-turbo7-1025' || github.ref_name == 'wolverine-turbo6-1025' || github.ref_name == 'wolverine-turbo5-1025' || github.ref_name == 'wolverine-turbo4-1025' || github.ref_name == 'wolverine-turbo3-1025' || github.ref_name == 'wolverine-turbo2-1025' || github.ref_name == 'wolverine-turbo-1025' }}
         shell: pwsh
         env:
           VULKAN_VERSION: 1.3.296.0
@@ -135,7 +135,7 @@ jobs:
           type build.log
 
       - name: Unit tests
-        if: ${{ inputs.pgo_generate != true || github.ref_name == 'rtall-1023' || github.ref_name == 'wolverine-ab-1027' || github.ref_name == 'wolverine-rbwin-1027' || github.ref_name == 'wolverine-memo-1027' || github.ref_name == 'wolverine-fast-1027' || github.ref_name == 'wolverine-state-1027' || github.ref_name == 'wolverine-async-1027' || github.ref_name == 'wolverine-turbo9-1025' || github.ref_name == 'wolverine-turbo8-1025' || github.ref_name == 'wolverine-turbo7-1025' || github.ref_name == 'wolverine-turbo6-1025' || github.ref_name == 'wolverine-turbo5-1025' || github.ref_name == 'wolverine-turbo4-1025' || github.ref_name == 'wolverine-turbo3-1025' || github.ref_name == 'wolverine-turbo2-1025' || github.ref_name == 'wolverine-turbo-1025' }}
+        if: ${{ inputs.pgo_generate != true || github.ref_name == 'rtall-1023' || github.ref_name == 'wolverine-rbfix-1027' || github.ref_name == 'wolverine-ab-1027' || github.ref_name == 'wolverine-rbwin-1027' || github.ref_name == 'wolverine-memo-1027' || github.ref_name == 'wolverine-fast-1027' || github.ref_name == 'wolverine-state-1027' || github.ref_name == 'wolverine-async-1027' || github.ref_name == 'wolverine-turbo9-1025' || github.ref_name == 'wolverine-turbo8-1025' || github.ref_name == 'wolverine-turbo7-1025' || github.ref_name == 'wolverine-turbo6-1025' || github.ref_name == 'wolverine-turbo5-1025' || github.ref_name == 'wolverine-turbo4-1025' || github.ref_name == 'wolverine-turbo3-1025' || github.ref_name == 'wolverine-turbo2-1025' || github.ref_name == 'wolverine-turbo-1025' }}
         shell: cmd
         run: |
           ctest --test-dir _Build/windows --output-on-failure -R "^(lru_cache)$"

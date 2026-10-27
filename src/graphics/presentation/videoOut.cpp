@@ -1305,7 +1305,7 @@ static void NoteFrameStats() {
 		static auto& sw_defer  = Common::LiveSwitches::Get("KYTY_DEFER_DEPTH_DRAWS", 0);
 		static auto& sw_used   = Common::LiveSwitches::Get("KYTY_MEMO_USED_KEY", 1);
 		static auto& sw_slots  = Common::LiveSwitches::Get("KYTY_RESOURCE_MEMO_SLOTS", 128);
-		static auto& sw_rwin   = Common::LiveSwitches::Get("KYTY_REPEAT_READ_WINDOW_KB", 0);
+		static auto& sw_rwin   = Common::LiveSwitches::Get("KYTY_REPEAT_READ_WINDOW_KB", 256);
 		static auto& sw_win    = Common::LiveSwitches::Get("KYTY_READBACK_WINDOW_KB", 2048);
 		// KYTY_AUTO_AB="NAME=v,NAME=v,..." (wolverine-ab-1027): every KYTY_AUTO_AB_WINDOWS (default 6)
 		// windows of 5 s, the next assignment is applied, cycling, so one run A/Bs by itself.
