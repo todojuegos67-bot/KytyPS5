@@ -1249,8 +1249,14 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 					g_rt.mat_lo = lo, g_rt.mat_hi = hi, g_rt.mat_forced = true;
 			}
 			// (refl6) The material roughness by default: L2.b0 (roughness) and L1.b2 (gloss), the rougher of the two.
-			if (r < 0) g_rt.dec_rough = 2 | (0 << 2) | (8 << 7);
-			g_rt.dec_gloss = 1 | (16 << 2) | (8 << 7) | 4096;
+			// (ds-rt-refl-1027, KYTY_RT_CAPTURE 20261028-001124 'moving', the Boletarian courtyard) The roughness is L1.b3
+			// (bits 24..31, 0 = mirror): fountain water median 41/255, stone 140-200, wet ground lower, armour 95-247. The
+			// old default L2.b0 is no roughness (0 on all terrain and water, ~200 on walls / characters / trees: an object
+			// class) and L1.b2 (the "gloss") is high-frequency per pixel (normal-like): taking the rougher of the two gave
+			// every pixel a jittering roughness - glossy weight on 60 % of the screen, mirrors on 0 %, the RTFLASH "other"
+			// flicker. KYTY_RT_REFLECTIONS_ROUGH / _GLOSS still override.
+			if (r < 0) g_rt.dec_rough = 1 | (24 << 2) | (8 << 7), g_rt.rough_trusted = true;
+			g_rt.dec_gloss = -1;
 			if (const char* gl = std::getenv("KYTY_RT_REFLECTIONS_GLOSS"); gl != nullptr && *gl != '\0') {
 				const int32_t gc = FieldEnv("KYTY_RT_REFLECTIONS_GLOSS");
 				g_rt.dec_gloss   = gc >= 0 ? gc : -1; // ("0" or anything malformed: no gloss field)
