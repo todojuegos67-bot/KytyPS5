@@ -515,6 +515,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${hwlights_header}")
+# KYTY_RT_FLICKER: the RT passes' flicker self-check (src/local/rt-flicker.cpp).
+set(rtflicker_source "${KYTY_SOURCE_DIR}/local/rt-flicker.comp")
+set(rtflicker_spv "${gpu_tiler_generated_dir}/rtflicker.spv")
+set(rtflicker_header "${gpu_tiler_generated_dir}/rtflicker_spv.h")
+add_custom_command(
+	OUTPUT "${rtflicker_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rtflicker_spv}" "${rtflicker_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rtflicker_spv} -DOUTPUT=${rtflicker_header}
+	        -DSYMBOL=RTFLICKER_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rtflicker_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rtflicker_header}")
 # KYTY_SHINE: specular highlights + material-aware sharpening before the upscaler (src/local/shine.cpp).
 set(shine_source "${KYTY_SOURCE_DIR}/local/shine.comp")
 set(shine_spv "${gpu_tiler_generated_dir}/shine.spv")
@@ -726,6 +741,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.cpp"
 	"${KYTY_SOURCE_DIR}/local/hw-lights.h"
 	"${KYTY_SOURCE_DIR}/local/hw-lights.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-flicker.h"
+	"${KYTY_SOURCE_DIR}/local/rt-flicker.cpp"
 	"${KYTY_SOURCE_DIR}/local/shine.h"
 	"${KYTY_SOURCE_DIR}/local/shine.cpp"
 	"${KYTY_SOURCE_DIR}/local/godrays.h"

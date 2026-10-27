@@ -381,7 +381,9 @@ void HwSun(vec3 p, vec3 n, vec3 l, ivec2 pixel, out float occ_c, out float occ_f
 		float ang = 6.2831853 * u2, rad = 0.5 * sun.hdr.y * sqrt(u1);
 		vec3  d   = normalize(lw + (b1 * cos(ang) + b2 * sin(ang)) * rad);
 		rayQueryEXT rq;
-		rayQueryInitializeEXT(rq, tlas, flags, 0x03, o, t_min, d, sun.hw.z); // (static + this frame's dynamic meshes: no stale ghosts, no tiny cards)
+		// (rtstab) static meshes only: a moving mesh (character, enemy, door) at positions a few frames old left a ghost shadow
+		// beside it; its shadow stays the game's own cascade term, which is current every frame.
+		rayQueryInitializeEXT(rq, tlas, flags, 0x01, o, t_min, d, sun.hw.z);
 		while (rayQueryProceedEXT(rq)) {}
 		if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
 			float t = rayQueryGetIntersectionTEXT(rq, true);

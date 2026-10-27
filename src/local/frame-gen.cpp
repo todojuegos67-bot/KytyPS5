@@ -31,6 +31,7 @@
 #include "local/shine.h"
 #include "local/godrays.h"
 #include "local/rt-local-lights.h"
+#include "local/rt-flicker.h"
 #include "local/hw-lights.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
 #include "gpu_tiler_shaders/rtsun_spv.h"
@@ -8915,13 +8916,19 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	// (The DLSS-G hudless path sets the context in PrepareInputs; the PS5 Pro path alone needs the renderer's.)
 	if (g_graphics_ctx == nullptr && inputs.graphics != nullptr) g_graphics_ctx = inputs.graphics;
 	RtPartNoteColor(inputs.color_address, inputs.color.extent); // (rtparticles: the scene color the draws are matched to)
-	HwParticlesApply(command, inputs); // (KYTY_HWRT_PARTICLES: first, on the game's own color; nothing when off)
-	CShadowApply(command, inputs); // (KYTY_RT_SHADOWS: direct-sun shadows first; inputs.color becomes the composited copy)
-	HwLightsApply(command, inputs); // (KYTY_HWRT_LIGHTS: ray-traced local-light shadows, hw-lights.cpp; nothing when off)
+	// (KYTY_RT_FLICKER: each RT pass's contribution checked frame to frame with the camera still, rt-flicker.cpp)
+	RtFlicker::BeginFrame(inputs);
+	const auto probed = [&](RtFlicker::Pass pass, auto&& apply) {
+		const UpscaleImage before = inputs.color;
+		if (apply()) RtFlicker::Probe(command, inputs.graphics, pass, before, inputs.color);
+	};
+	probed(RtFlicker::Particles, [&] { return HwParticlesApply(command, inputs); }); // (KYTY_HWRT_PARTICLES: first, on the game's own color; nothing when off)
+	probed(RtFlicker::Sun, [&] { return CShadowApply(command, inputs); }); // (KYTY_RT_SHADOWS: direct-sun shadows first; inputs.color becomes the composited copy)
+	probed(RtFlicker::Lights, [&] { return HwLightsApply(command, inputs); }); // (KYTY_HWRT_LIGHTS: ray-traced local-light shadows, hw-lights.cpp; nothing when off)
 	SsgiApply(command, inputs); // (KYTY_SSGI: likewise; nothing when off)
 	GtaoApply(command, inputs); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
 	SsrApply(command, inputs); // (KYTY_SSR: likewise, after GTAO; nothing when off)
-	RtReflectionsApply(command, inputs); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
+	probed(RtFlicker::Reflections, [&] { return RtReflectionsApply(command, inputs); }); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
 	ShineApply(command, inputs); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
 	GodraysApply(command, inputs); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off)
 	GbufViewApply(command, inputs); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
