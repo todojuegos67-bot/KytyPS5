@@ -35,6 +35,7 @@
 #include "local/rt-local-lights.h"
 #include "local/rt-flicker.h"
 #include "local/hw-lights.h"
+#include "local/rt-contact.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
 #include "gpu_tiler_shaders/rtsun_spv.h"
 #include "gpu_tiler_shaders/rtsun_hw_spv.h"
@@ -9055,6 +9056,13 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
+	if (RtContactLevel() > 0) { // (KYTY_HWRT_CONTACT: rt-contact.cpp; the sun, R and this pass's final visibility)
+		double r = 1.5;
+		if (sun_mode && g_rs.buf_mapped != nullptr) r = reinterpret_cast<const float*>(g_rs.buf_mapped + sun_slot * kRtSunSlotBytes)[2];
+		else if (g_cs.log_k >= 0.0) r = std::max(std::exp2(g_cs.log_k) - 1.0, 0.0) / 0.75;
+		RtContactSetSun(g_cs.latch_axis, g_cs.fade * static_cast<float>(g_cs.sun_factor), static_cast<float>(r), final_vis->view,
+		                g_cs.trace, sun_mode);
+	}
 	if (timed) {
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_cs.pool, entry * 2 + 1);
 		++g_cs.written;
@@ -9118,6 +9126,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	probed(RtFlicker::Particles, "HwParticlesApply", [&] { return HwParticlesApply(command, inputs); }); // (KYTY_HWRT_PARTICLES: first, on the game's own color; nothing when off)
 	probed(RtFlicker::Sun, "CShadowApply", [&] { return CShadowApply(command, inputs); }); // (KYTY_RT_SHADOWS: direct-sun shadows first; inputs.color becomes the composited copy)
 	probed(RtFlicker::Lights, "HwLightsApply", [&] { return HwLightsApply(command, inputs); }); // (KYTY_HWRT_LIGHTS: ray-traced local-light shadows, hw-lights.cpp; nothing when off)
+	probed(RtFlicker::Contact, "RtContactApply", [&] { return RtContactApply(command, inputs); }); // (KYTY_HWRT_CONTACT: ray-traced contact shadows, rt-contact.cpp; nothing when off)
 	TimedPass("SsgiApply", [&] { SsgiApply(command, inputs); }); // (KYTY_SSGI: likewise; nothing when off)
 	TimedPass("GtaoApply", [&] { GtaoApply(command, inputs); }); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
 	TimedPass("SsrApply", [&] { SsrApply(command, inputs); }); // (KYTY_SSR: likewise, after GTAO; nothing when off)

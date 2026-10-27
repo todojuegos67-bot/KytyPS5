@@ -578,6 +578,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${hwrt_particles_header}")
 
+# KYTY_HWRT_CONTACT: ray-traced contact shadows with ray queries into the KYTY_HWRT TLAS (src/local/rt-contact.cpp).
+set(rt_contact_source "${KYTY_SOURCE_DIR}/local/rt-contact.comp")
+set(rt_contact_spv "${gpu_tiler_generated_dir}/rt_contact.spv")
+set(rt_contact_header "${gpu_tiler_generated_dir}/rt_contact_spv.h")
+add_custom_command(
+	OUTPUT "${rt_contact_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rt_contact_spv}" "${rt_contact_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_contact_spv} -DOUTPUT=${rt_contact_header}
+	        -DSYMBOL=RT_CONTACT_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rt_contact_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rt_contact_header}")
+
 # KYTY_RT_SHADOWS: screen-space ray-traced sun shadows before the upscaler (src/local/frame-gen.cpp).
 set(cshadow_source "${KYTY_SOURCE_DIR}/local/cshadow.comp")
 set(cshadow_spv "${gpu_tiler_generated_dir}/cshadow.spv")
@@ -741,6 +757,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.cpp"
 	"${KYTY_SOURCE_DIR}/local/hw-lights.h"
 	"${KYTY_SOURCE_DIR}/local/hw-lights.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-contact.h"
+	"${KYTY_SOURCE_DIR}/local/rt-contact.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-flicker.h"
 	"${KYTY_SOURCE_DIR}/local/rt-flicker.cpp"
 	"${KYTY_SOURCE_DIR}/local/shine.h"

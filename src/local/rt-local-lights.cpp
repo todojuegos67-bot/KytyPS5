@@ -77,7 +77,10 @@ const Config& Cfg() {
 		}
 		// (KYTY_HWRT_LIGHTS=1..3 with KYTY_HWRT=1, hw-lights.cpp: the apexes feed the ray-traced shadow pass; scans every 4
 		// flips unless KYTY_RTLS_PERIOD says otherwise)
-		if (const char* v = env("KYTY_HWRT_LIGHTS"); v != nullptr && std::atoi(v) > 0 && env("KYTY_HWRT") != nullptr && *env("KYTY_HWRT") != '0') {
+		// (KYTY_HWRT_CONTACT too, rt-contact.cpp: its rays toward the strongest local light)
+		const char* hw_contact = env("KYTY_HWRT_CONTACT");
+		if (const char* v = env("KYTY_HWRT_LIGHTS"); ((v != nullptr && std::atoi(v) > 0) || (hw_contact != nullptr && std::atoi(hw_contact) > 0)) &&
+		                                             env("KYTY_HWRT") != nullptr && *env("KYTY_HWRT") != '0') {
 			c.hw_lights = true;
 			if (env("KYTY_RTLS_PERIOD") == nullptr) c.period = 4;
 		}
