@@ -66,7 +66,7 @@ void SetAxis(int id, Axis axis, int value) {
 		guest_stick[axis == Axis::LeftY ? 1 : 0] = value;
 	}
 }
-void SetTouchPad(int id, int finger, bool down, float, float) {
+void SetTouchPad(int id, int finger, bool down, float, float, bool) {
 	if (id == 1 && finger == 1) {
 		guest_touch = down;
 	}
