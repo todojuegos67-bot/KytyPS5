@@ -8763,6 +8763,13 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 	};
 	if (quality == 0 || g_graphics_ctx == nullptr) return false;
+	// (ds-rt-shadow 10-28) KYTY_RT_CAPTURE's sun from the RT sun pass's latch every frame, the pass run or not (it was set
+	// only at the end of a run: frame.json "sun": null on the frames the pass was refused)
+	if (RtCapture::Enabled() && g_cs.latched) {
+		double r = 1.5;
+		if (g_cs.log_k >= 0.0) r = std::max(std::exp2(g_cs.log_k) - 1.0, 0.0) / 0.75;
+		RtContactSetSun(g_cs.latch_axis, g_cs.fade * static_cast<float>(g_cs.sun_factor), static_cast<float>(r), nullptr, vk::Extent2D {}, false);
+	}
 	if (VideoOut::MoviePlaying()) return g_cs.history_valid = false, false;
 	const auto& color = inputs.color;
 	if (color.view == nullptr || inputs.depth.view == nullptr || inputs.motion.view == nullptr || color.extent.width < 16 ||
