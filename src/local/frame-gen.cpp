@@ -9123,7 +9123,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	TimedPass("SsrApply", [&] { SsrApply(command, inputs); }); // (KYTY_SSR: likewise, after GTAO; nothing when off)
 	probed(RtFlicker::Reflections, "RtReflectionsApply", [&] { return RtReflectionsApply(command, inputs); }); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
 	TimedPass("ShineApply", [&] { ShineApply(command, inputs); }); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
-	TimedPass("GodraysApply", [&] { GodraysApply(command, inputs); }); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off)
+	probed(RtFlicker::Volumetric, "GodraysApply", [&] { return GodraysApply(command, inputs); }); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off; flicker self-check)
 	TimedPass("GbufViewApply", [&] { GbufViewApply(command, inputs); }); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);

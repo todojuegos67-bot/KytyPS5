@@ -19,6 +19,8 @@ struct Push {
 	float   par[4];
 };
 static_assert(sizeof(Push) == 32);
+constexpr uint32_t MaxIndex = 40; // st[40 + pass]: the largest jump in 10 s, x 1e-4 of the pixel's light
+static_assert(Count * 4 <= MaxIndex && MaxIndex + Count <= 64);
 
 struct Grid {
 	VkImage       image  = VK_NULL_HANDLE;
@@ -64,7 +66,7 @@ float Threshold() {
 	return t;
 }
 const char* Name(uint32_t p) {
-	static const char* names[] {"particles light", "sun shadows", "lamp/torch shadows", "reflections"};
+	static const char* names[] {"particles light", "sun shadows", "lamp/torch shadows", "reflections", "volumetric light"};
 	return p < Count ? names[p] : "?";
 }
 
@@ -191,7 +193,7 @@ void MaybeLog() {
 	std::array<uint32_t, Count * 4> cur {}, d {};
 	for (uint32_t i = 0; i < Count * 4; ++i) cur[i] = g_f.stat[i], d[i] = cur[i] - g_f.last[i];
 	g_f.last = cur;
-	char line[1024];
+	char line[1400];
 	int  n = std::snprintf(line, sizeof(line), "RTFLICKER: 10 s: camera still %llu of %llu frames;",
 	                       static_cast<unsigned long long>(g_f.still_frames), static_cast<unsigned long long>(g_f.frames));
 	for (uint32_t p = 0; p < Count && n > 0 && n < static_cast<int>(sizeof(line)); ++p) {
@@ -200,10 +202,13 @@ void MaybeLog() {
 			continue;
 		}
 		const double touched = static_cast<double>(std::max(d[p * 4 + 1], 1u));
-		n += std::snprintf(line + n, sizeof(line) - n, " %s: changed > %.0f %% %.3f %% (> %.0f %% %.3f %%) of %u touched points (%u probed, %llu frames);",
+		const double maxj    = static_cast<double>(g_f.stat[MaxIndex + p]) / 100.0; // (%)
+		g_f.stat[MaxIndex + p] = 0;
+		n += std::snprintf(line + n, sizeof(line) - n,
+		                   " %s: changed > %.0f %% %.3f %% (> %.0f %% %.3f %%) of %u touched points (%u probed, %llu frames), max jump %.1f %%;",
 		                   Name(p), static_cast<double>(Threshold() * 100.0f), 100.0 * d[p * 4 + 2] / touched,
 		                   static_cast<double>(Threshold() * 200.0f), 100.0 * d[p * 4 + 3] / touched, d[p * 4 + 1], d[p * 4],
-		                   static_cast<unsigned long long>(g_f.ran[p]));
+		                   static_cast<unsigned long long>(g_f.ran[p]), maxj);
 	}
 	std::printf("%s\n", line);
 	std::fflush(stdout);

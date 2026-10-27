@@ -38,6 +38,7 @@ void main() {
 	if (abs(d) < 0.005 * ref && abs(pv.x) < 0.005 * ref) return; // (the pass leaves this point alone)
 	atomicAdd(st[o + 1u], 1u);
 	float ch = abs(d - pv.x) / ref;
+	atomicMax(st[40u + uint(push.par.w)], uint(min(ch, 100.0) * 10000.0)); // (the largest jump, 1e-4 of the light)
 	if (ch > push.par.x) atomicAdd(st[o + 2u], 1u);
 	if (ch > 2.0 * push.par.x) atomicAdd(st[o + 3u], 1u);
 }

@@ -171,6 +171,22 @@ void Track() {
 			sunc = vec4(warm, 1.0);
 		}
 	}
+	// (vol-fix) Openness: the share of the screen that is sky, smoothed (~1 s). The view-ray march tests the sun against
+	// the depth buffer only, so a roof / ceiling off screen does not occlude: indoors every ray read as lit and the pass
+	// laid a uniform veil over dark interiors. The march is scaled by this factor: no sky in view -> no haze; the
+	// radial march (gated by real sky pixels) is unaffected. stats[14] holds it (float bits; read back for the log).
+	{
+		float sky = 0.0;
+		for (int i = 0; i < 96; ++i) {
+			vec2 uv = vec2((float(i % 12) + 0.5) / 12.0, (float(i / 12) + 0.5) / 8.0);
+			if (IsSky(DepthAt(uv))) sky += 1.0;
+		}
+		float o_t  = smoothstep(0.03, 0.18, sky / 96.0);
+		float o    = uintBitsToFloat(stats[14]);
+		o          = (isnan(o) || isinf(o) || o < 0.0 || o > 1.0) ? o_t : o;
+		o         += clamp(o_t - o, -0.02, 0.02); // (<= 2 % a frame: >= 0.8 s for a full change, no pop)
+		stats[14]  = floatBitsToUint(o);
+	}
 	atomicAdd(stats[0], 1u);
 	if (push.sun_uv.z > 0.5) atomicAdd(stats[2], 1u);
 	if (slots <= 0) return;
@@ -304,7 +320,9 @@ void Volume(ivec2 q) {
 		// Boost by the shaft-ness of the ray: partly lit rays (light through gaps) gain, fully lit or fully shadowed
 		// ones (a uniform haze indoors / outdoors) do not.
 		float fr = tmax > 0.0 ? clamp(lit / tmax, 0.0, 1.0) : 0.0;
-		scatter += (lit / 60.0) * phase * 0.35 * (1.0 + push.extra.w * (0.1 + 0.8 * fr * (1.0 - fr)));
+		float open = clamp(uintBitsToFloat(stats[14]), 0.0, 1.0);
+		open = isnan(open) ? 0.0 : open;
+		scatter += (lit / 60.0) * phase * 0.35 * open * (1.0 + push.extra.w * (0.1 + 0.8 * fr * (1.0 - fr)));
 	}
 	scatter *= push.sun.w;
 	imageStore(aux_out, q, vec4((isnan(scatter) || isinf(scatter)) ? 0.0 : clamp(scatter, 0.0, 4.0),
@@ -413,17 +431,22 @@ void Composite(ivec2 p) {
 	vec2  qp = uv * qs - 0.5;
 	ivec2 q0 = ivec2(floor(qp));
 	vec2  f  = qp - vec2(q0);
-	float vs = 0.0, ws = 0.0;
+	// (vol-fix) No depth-blind fallback: where none of the 4 texels shares this pixel's depth (a thin far silhouette
+	// against the sky) the old +1e-4 bilinear term blended the sky's bright scatter onto it: the white streaks. Now the
+	// texel nearest in depth is taken alone, and a sky texel never lends to geometry (or geometry to sky).
+	float vs = 0.0, ws = 0.0, best = 1e30, bv = 0.0;
 	for (int k = 0; k < 4; ++k) {
 		ivec2 o  = ivec2(k & 1, k >> 1);
 		ivec2 qq = clamp(q0 + o, ivec2(0), ivec2(qs) - 1);
 		vec2  v  = VolTexel(vol_hist, qq).xy;
 		float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
-		float dw = exp(-abs(v.y - vz) / max(0.05 * vz, 0.05));
-		float w  = bw * dw + 1e-4 * bw;
+		float rd = abs(v.y - vz) / max(0.05 * vz, 0.05);
+		if ((v.y >= 1999.0) != sky) rd = 1e6;
+		if (rd < best) best = rd, bv = v.x;
+		float w  = bw * exp(-rd);
 		vs += v.x * w, ws += w;
 	}
-	float vol = ws > 0.0 ? Fin(vs / ws, 0.0, 4.0) : 0.0;
+	float vol = ws > 1e-3 ? Fin(vs / ws, 0.0, 4.0) : (best < 1e5 ? Fin(bv, 0.0, 4.0) : 0.0);
 	// (the far backdrop already carries the game's fog: half there)
 	vol *= mix(1.0, 0.5, smoothstep(80.0, 300.0, vz));
 	vec3 add = vol * sunc.rgb * push.size.z * 0.6;
