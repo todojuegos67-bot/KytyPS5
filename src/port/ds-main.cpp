@@ -248,12 +248,26 @@ LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 				hint     = g_splash.hint;
 			}
 			if (!hint.empty()) {
-				HFONT hint_font = CreateFontW(height * 3 / 4, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+				// (10-27c) The hint at the top right: bigger, light on a dark backing, with a shadow.
+				HFONT hint_font = CreateFontW(height, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
 				                          CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
 				HGDIOBJ prev = SelectObject(dc, hint_font);
-				RECT    line = {rc.left + height, rc.bottom - height, rc.right - height, rc.bottom - height / 6};
-				SetTextColor(dc, RGB(200, 190, 170));
-				DrawTextW(dc, hint.c_str(), -1, &line, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+				const int pad   = height / 2;
+				const int max_w = std::max<int>(height * 8, (rc.right - rc.left) * 11 / 20);
+				RECT      size  = {0, 0, max_w, 0};
+				DrawTextW(dc, hint.c_str(), -1, &size, DT_RIGHT | DT_WORDBREAK | DT_CALCRECT);
+				RECT box = {rc.right - height - (size.right - size.left) - pad * 2, rc.top + height, rc.right - height,
+				            rc.top + height + (size.bottom - size.top) + pad * 2};
+				HBRUSH backing = CreateSolidBrush(RGB(12, 10, 8));
+				FillRect(dc, &box, backing);
+				DeleteObject(backing);
+				RECT line = {box.left + pad, box.top + pad, box.right - pad, box.bottom - pad};
+				RECT line_shade = line;
+				OffsetRect(&line_shade, 2, 2);
+				SetTextColor(dc, RGB(0, 0, 0));
+				DrawTextW(dc, hint.c_str(), -1, &line_shade, DT_RIGHT | DT_WORDBREAK);
+				SetTextColor(dc, RGB(245, 235, 210));
+				DrawTextW(dc, hint.c_str(), -1, &line, DT_RIGHT | DT_WORDBREAK);
 				SelectObject(dc, prev);
 				DeleteObject(hint_font);
 			}
@@ -757,7 +771,8 @@ int main(int argc, char* argv[]) {
 					}
 					if (v.total > 0) SplashProgress(static_cast<float>(v.done) / static_cast<float>(v.total));
 					SplashStatus(v.text);
-					SplashHint("Esc: jugar ya (lo hecho se guarda, pero el juego tendrá tirones hasta que termine la precompilación)");
+					SplashHint("Esc: jugar ya (lo hecho se guarda, pero el juego tendrá tirones hasta que termine la precompilación)\n"
+					           "Si cierras el juego, la precompilación seguirá donde la dejaste.");
 					if (g_splash.skip) {
 						SplashStatus("Guardando lo hecho...");
 						Port::Precompile::Stop();
