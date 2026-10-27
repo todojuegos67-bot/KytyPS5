@@ -15,6 +15,7 @@
 // rays, occluded share, the TLAS alignment probe and the GPU ms.
 // Options: KYTY_HWRT_VOLSHADOW_LEN (sun ray length, 300 m).
 #include "local/volshadow.h"
+#include "local/env-level.h"
 
 #include "gpu_tiler_shaders/volshadow_spv.h"
 #include "graphics/presentation/videoOut.h"
@@ -335,7 +336,7 @@ vk::ImageView Skip(const char* why) {
 int VolShadowLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_HWRT_VOLSHADOW");
-		const int   q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		const int   q     = ::Libs::Graphics::FrameGen::ParseEnvLevel(value);
 		if (q > 0) {
 			std::printf("VOLSHADOW: KYTY_HWRT_VOLSHADOW=%s read (level %d: %s)%s\n", value, q, q == 1 ? "Bajo" : q == 2 ? "Medio" : "Alto",
 			            HwScene::Requested() ? "" : ": needs KYTY_HWRT=1 too: off");

@@ -19,6 +19,7 @@
 // light share knee, 0.03), _GUARD (1 s mean screen darkening above it: off 5 s, 0.2).
 // Every 10 s: "HWRTCONTACT: stats" (darkened pixels, mean darkening, blended-away pixels, ray hit rates, GPU ms).
 #include "local/rt-contact.h"
+#include "local/env-level.h"
 
 #include "graphics/presentation/videoOut.h"
 #include "gpu_tiler_shaders/rt_contact_spv.h"
@@ -336,7 +337,7 @@ bool Inverse4(const double* m, double* out) {
 int RtContactLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_HWRT_CONTACT");
-		const int   q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		const int   q     = ::Libs::Graphics::FrameGen::ParseEnvLevel(value);
 		if (q > 0) {
 			std::printf("HWRTCONTACT: KYTY_HWRT_CONTACT=%s read (level %d: %s)%s\n", value, q, q == 1 ? "Bajo" : q == 2 ? "Medio" : "Alto",
 			            HwScene::Requested() ? "" : ": needs KYTY_HWRT=1 too: off");

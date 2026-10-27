@@ -1,4 +1,5 @@
 #include "local/rt-softsun.h"
+#include "local/env-level.h"
 
 #include <algorithm>
 #include <array>
@@ -26,7 +27,7 @@ struct State {
 int Level() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_HWRT_SOFTSUN");
-		const int   q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		const int   q     = ::Libs::Graphics::FrameGen::ParseEnvLevel(value);
 		if (q > 0) {
 			static const char* names[] {"No", "Bajo", "Medio", "Alto"};
 			std::printf("SOFTSUN: KYTY_HWRT_SOFTSUN=%d (%s): sun %.2f deg, cascade copy held while in use (up to %d flips)\n", q,

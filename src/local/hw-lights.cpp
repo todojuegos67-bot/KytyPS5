@@ -15,6 +15,7 @@
 // darkening over the screen exceeds it turns the pass off for 5 s, logged; 0.25).
 // Every 10 s: "HWRTLIGHTS: stats" with lights used, darkened pixels, their mean darkening and the GPU ms.
 #include "local/hw-lights.h"
+#include "local/env-level.h"
 
 #include "graphics/presentation/videoOut.h"
 #include "gpu_tiler_shaders/hwlights_spv.h"
@@ -377,7 +378,7 @@ bool Inverse4(const double* m, double* out) {
 int HwLightsLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_HWRT_LIGHTS");
-		const int   q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		const int   q     = ::Libs::Graphics::FrameGen::ParseEnvLevel(value);
 		if (q > 0) {
 			std::printf("HWRTLIGHTS: KYTY_HWRT_LIGHTS=%s read (level %d)%s\n", value, q,
 			            HwScene::Requested() ? "" : ": needs KYTY_HWRT=1 too: off");

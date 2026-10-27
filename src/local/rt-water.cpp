@@ -28,6 +28,7 @@
 // the history's validity, the composited share, the TLAS alignment self-check and the GPU time; the flicker self-check
 // has its own "water mirrors" entry in the RTFLICKER line.
 #include "local/rt-water.h"
+#include "local/env-level.h"
 
 #include "graphics/presentation/videoOut.h"
 #include "gpu_tiler_shaders/rtwater_spv.h"
@@ -431,7 +432,7 @@ void Log(GraphicContext& graphics, int level) {
 int RtWaterLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_HWRT_WATER");
-		const int   q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		const int   q     = ::Libs::Graphics::FrameGen::ParseEnvLevel(value);
 		if (q > 0) {
 			std::printf("HWRTWATER: KYTY_HWRT_WATER=%s read (level %d)%s\n", value, q,
 			            HwScene::Requested() ? "" : ": needs KYTY_HWRT=1 too: off");
