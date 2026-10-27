@@ -1199,6 +1199,7 @@ void Temporal(ivec2 px) {
 		vec4  hist = BicubicHist() && rough < 0.3 ? HistoryCR(puv) : textureLod(src_b, puv, 0);
 		if (Bad(hist)) hist = cur;
 		float k    = mix(0.75, 2.5, smoothstep(0.05, 0.4, rough)); // (refl3: mirrors clamped tighter: no ghosts)
+		if ((push.misc.w & 32768) != 0) k *= 2.0; // (rtstab2: a still camera, no parallax to ghost)
 		vec3  hy   = clamp(YCoCg(hist.rgb), m1 - k * sig - 1e-4, m1 + k * sig + 1e-4);
 		hist.rgb   = max(Rgb(hy), vec3(0));
 		hist.a     = clamp(hist.a, a1 - k * asig - 0.02, a1 + k * asig + 0.02);

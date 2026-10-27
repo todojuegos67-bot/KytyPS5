@@ -213,8 +213,12 @@ void MaybeLog() {
 
 } // namespace
 
+uint32_t g_still_run = 0;
+
+bool     CameraStill() { return g_f.still; }
+uint32_t StillFrames() { return g_still_run; }
+
 void BeginFrame(const UpscaleInputs& inputs) {
-	if (!Enabled()) return;
 	++g_f.frame;
 	++g_f.frames;
 	std::array<float, 16> vp {};
@@ -228,6 +232,8 @@ void BeginFrame(const UpscaleInputs& inputs) {
 	g_f.prev_vp   = vp;
 	g_f.have_prev = have;
 	g_f.still     = still;
+	g_still_run   = still ? g_still_run + 1 : 0;
+	if (!Enabled()) return;
 	if (still) ++g_f.still_frames;
 	MaybeLog();
 }
