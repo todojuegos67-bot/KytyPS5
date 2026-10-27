@@ -2729,8 +2729,14 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 			std::fflush(stdout);
 		}
 	}
-	if (HwScene::Active() && Role() == 0 && state.color_count >= 3 && state.depth_info.image_id && hwrt_depth &&
-	    state.depth_info.desc.info.resources.layers == 1 &&
+	// (KYTY_HWRT_WATER, rt-water.cpp: off by default) the water surface's draws (its pixel shader, drawn after the
+	// lighting, forward, maybe without depth writes) are captured too, into their own TLAS (hwrt-scene.cpp).
+	const bool hwrt_water = pixel != nullptr && FrameGen::RtWaterIsWaterPs(pixel->shader_hash) && state.color_count >= 1;
+	if (hwrt_water) FrameGen::RtWaterNoteState(vertex != nullptr ? vertex->shader_hash : 0, pixel->shader_hash, state.color_count,
+	                                           state.depth_info.image_id ? state.depth_info.desc.info.extent.width : 0,
+	                                           state.depth_info.depth_write_enable, static_cast<int>(topology));
+	if (HwScene::Active() && Role() == 0 && (state.color_count >= 3 || hwrt_water) && state.depth_info.image_id &&
+	    (hwrt_depth || hwrt_water) && state.depth_info.desc.info.resources.layers == 1 &&
 	    state.depth_info.desc.info.extent.width >= 1280 && topology == vk::PrimitiveTopology::eTriangleList &&
 	    !primitive_restart_enable) {
 		const auto module = HwScene::CaptureModule(m_context.GetGraphics(), table_state.programs.vertex.module);
