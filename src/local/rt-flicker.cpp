@@ -66,7 +66,7 @@ float Threshold() {
 	return t;
 }
 const char* Name(uint32_t p) {
-	static const char* names[] {"particles light", "sun shadows", "lamp/torch shadows", "reflections", "volumetric light", "gi+ao"};
+	static const char* names[] {"particles light", "sun shadows", "lamp/torch shadows", "reflections", "volumetric light", "gi+ao", "contact shadows", "water mirrors"};
 	return p < Count ? names[p] : "?";
 }
 
@@ -193,7 +193,7 @@ void MaybeLog() {
 	std::array<uint32_t, Count * 4> cur {}, d {};
 	for (uint32_t i = 0; i < Count * 4; ++i) cur[i] = g_f.stat[i], d[i] = cur[i] - g_f.last[i];
 	g_f.last = cur;
-	char line[2048];
+	char line[3072];
 	int  n = std::snprintf(line, sizeof(line), "RTFLICKER: 10 s: camera still %llu of %llu frames;",
 	                       static_cast<unsigned long long>(g_f.still_frames), static_cast<unsigned long long>(g_f.frames));
 	for (uint32_t p = 0; p < Count && n > 0 && n < static_cast<int>(sizeof(line)); ++p) {

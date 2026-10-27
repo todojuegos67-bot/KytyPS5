@@ -8,8 +8,9 @@
 
 namespace Libs::Graphics::FrameGen::RtFlicker {
 
+// Contact: KYTY_HWRT_CONTACT; Water: KYTY_HWRT_WATER.
 // Gi: KYTY_HWRT_GI / KYTY_HWRT_AO (hwrt-gi.cpp), the RT GI + AO on the ambient term.
-enum Pass : uint32_t { Particles = 0, Sun = 1, Lights = 2, Reflections = 3, Volumetric = 4, Gi = 5, Count = 6 };
+enum Pass : uint32_t { Particles = 0, Sun = 1, Lights = 2, Reflections = 3, Volumetric = 4, Gi = 5, Contact = 6, Water = 7, Count = 8 };
 // Once a frame, before the passes: whether the camera holds still since the last frame.
 void BeginFrame(const UpscaleInputs& inputs);
 // After a pass that replaced inputs.color (before: the color it read).
