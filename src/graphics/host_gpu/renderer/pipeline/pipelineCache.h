@@ -103,6 +103,9 @@ struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
 	uint64_t         spirv_words = 0;
+	// Another permutation of the same guest shader already existed when this one was made
+	// (permutation churn): compiled in the background when KYTY_ASYNC_COMPUTE_SKIP=1.
+	bool             repeat_permutation = false;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };

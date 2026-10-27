@@ -639,6 +639,8 @@ struct PipelineCache::ProgramCache {
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
+		if (entry->second.permutations.size() > 1u)
+			entry->second.permutations.back().handle.repeat_permutation = true;
 		const auto& permutation = entry->second.permutations.back();
 		Prewarm::NoteTranslation(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 		    std::chrono::steady_clock::now() - translate_start).count()));
@@ -1618,7 +1620,19 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 			return iter->second.get();
 		}
 	}
-	if (threshold == 0 || compute_program.spirv_words <= threshold || !ComputeSkipAllowed()) {
+	// Ghost of Yotei: one culling CS (0x8457901d80b91921, ~90-97K words) gets a new permutation
+	// almost every frame (its indirect buffer candidate count varies 5..23), each a ~1.3 s
+	// synchronous vkCreateComputePipelines on Thread_Gpu (0.6-5 fps in gameplay). A repeated
+	// permutation over KYTY_ASYNC_REPEAT_WORDS (default 20000, 0 = off) is compiled in the
+	// background like the huge ones; first-seen shaders keep the size threshold.
+	static const uint64_t repeat_words = [] {
+		const char* v = std::getenv("KYTY_ASYNC_REPEAT_WORDS");
+		return v != nullptr ? std::strtoull(v, nullptr, 10) : 20000ull;
+	}();
+	const bool background = (threshold != 0 && compute_program.spirv_words > threshold) ||
+	                        (repeat_words != 0 && compute_program.repeat_permutation &&
+	                         compute_program.spirv_words > repeat_words);
+	if (!background || !ComputeSkipAllowed()) {
 		return &GetComputePipeline(input_info, compute_program);
 	}
 
@@ -1631,9 +1645,10 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	CreateComputeLayoutInternal(m_graphics, **pipeline, input_info, compute_program.module,
 	                            compute_program.spirv_words, *job);
 	const uint64_t id = compute_program.id;
-	std::printf("Pipeline: async compute %016llx queued (%llu words)\n",
+	std::printf("Pipeline: async compute %016llx queued (%llu words%s)\n",
 	            static_cast<unsigned long long>(id),
-	            static_cast<unsigned long long>(compute_program.spirv_words));
+	            static_cast<unsigned long long>(compute_program.spirv_words),
+	            compute_program.repeat_permutation ? ", repeat permutation" : "");
 	EnqueueAsync([this, pipeline, job, id] {
 		const auto start = std::chrono::steady_clock::now();
 		const auto job_cache = AsyncJobCache();
