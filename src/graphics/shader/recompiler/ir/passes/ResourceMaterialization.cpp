@@ -1698,6 +1698,26 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (!(index == root && candidate.packed_stride == 0u)) candidate.packed_stride = canonical;
 		}
 	}
+	// Plain raw buffers: the stride is read at runtime from the flattened SRT instead of being
+	// baked into the SPIR-V. Ghost of Yotei: 6e177a8a (346K words) and f7d692b6 (352K) got a new
+	// permutation per stride (buf2 stride 8/0x144/0x118...), 158 differing words = the stride
+	// constant, each a ~20 s driver compile, so the realtime cinematic skipped every run.
+	// Zero stride stays specialized (different addressing). KYTY_RUNTIME_PLAIN_STRIDE=0: off.
+	static const bool plain_stride_enabled = [] {
+		const char* v = std::getenv("KYTY_RUNTIME_PLAIN_STRIDE");
+		return v == nullptr || v[0] != '0';
+	}();
+	if (plain_stride_enabled && program.info.uses_flattened_srt) {
+		for (uint32_t index = 0; index < program.info.buffers.size() && index < specialization.buffers.size(); ++index) {
+			auto& spec = specialization.buffers[index];
+			if (spec.indirect_root != BufferResource::NoIndirectBuffer || spec.runtime_stride_offset != UINT32_MAX ||
+			    program.info.buffers[index].formatted || (spec.packed_stride & 0x3fffu) == 0u)
+				continue;
+			spec.runtime_stride_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+			snapshot.flattened_srt.push_back(spec.packed_stride);
+			spec.packed_stride = (spec.packed_stride & ~0x3fffu) | 4u; // canonical nonzero; never emitted
+		}
+	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {

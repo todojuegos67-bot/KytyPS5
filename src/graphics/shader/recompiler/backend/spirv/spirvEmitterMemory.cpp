@@ -78,6 +78,20 @@ BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32
 	return {offset, add(address, soffset)};
 }
 
+// The packed stride as a runtime id: the indirect table's (set by EmitBufferAccess) or a plain
+// buffer's from the flattened SRT (ResourceMaterialization, KYTY_RUNTIME_PLAIN_STRIDE); 0 = baked.
+uint32_t RuntimePackedStride(EmitterState& state, const IR::MemoryInfo& mem) {
+	if (state.runtime_packed_stride != 0u) return state.runtime_packed_stride;
+	if (mem.kind != IR::ResourceKind::Buffer || mem.resource >= state.program.info.buffers.size() ||
+	    state.flattened_srt_variable == 0)
+		return 0u;
+	const auto& buffer = state.program.info.buffers[mem.resource];
+	if (buffer.indirect_root != IR::BufferResource::NoIndirectBuffer ||
+	    buffer.runtime_stride_offset == UINT32_MAX)
+		return 0u;
+	return EmitFlattenedSrtLoad(state, ConstantU32(state, buffer.runtime_stride_offset));
+}
+
 uint32_t BufferLane(EmitterState& state) {
 	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), EmitSubgroupLocalInvocationId(state),
 	              ConstantU32(state, 63));
@@ -93,8 +107,9 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	}
 	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
 	// A runtime-strided bindless candidate shares every packed flag with the representative.
-	const auto stride_id = state.runtime_packed_stride != 0u
-	    ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), state.runtime_packed_stride, ConstantU32(state, 0x3fffu))
+	const auto runtime_packed = RuntimePackedStride(state, mem);
+	const auto stride_id = runtime_packed != 0u
+	    ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), runtime_packed, ConstantU32(state, 0x3fffu))
 	    : ConstantU32(state, stride);
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
 	                              stride_id,
@@ -416,8 +431,8 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	// may omit final-record padding; the payload check below still checks every byte.
 	const auto last_record = Binary(state, spv::OpUDiv, TypeU32(state),
 	    Binary(state, spv::OpISub, TypeU32(state), available, ConstantU32(state, 1u)),
-	    state.runtime_packed_stride != 0u
-	        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), state.runtime_packed_stride, ConstantU32(state, 0x3fffu))
+	    RuntimePackedStride(state, mem) != 0u
+	        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), RuntimePackedStride(state, mem), ConstantU32(state, 0x3fffu))
 	        : ConstantU32(state, buffer.packed_stride & 0x3fffu));
 	return AndCondition(state, payload_in_bounds,
 	    AndCondition(state,
