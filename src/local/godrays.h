@@ -16,6 +16,9 @@ namespace Libs::Graphics::FrameGen {
 bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs);
 // From CShadowApply (KYTY_RT_SHADOWS) every frame it knows the sun: the view-space direction to it and its weight.
 void GodraysSetSun(const std::array<double, 3>& view_dir, float weight);
+// (vol-1027) Why CShadowApply gave no sun this frame (the flicker self-check's cause counters): 0 the sun is not latched
+// yet / dropped, 1 the RT sun cascades were not copied this frame, 2 no scene TLAS yet, 3 the pass's images / pipeline.
+void GodraysNoteSunMiss(int cause);
 
 } // namespace Libs::Graphics::FrameGen
 
