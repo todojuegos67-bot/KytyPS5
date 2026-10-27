@@ -633,23 +633,21 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 }
 
+// Layouts, prewarm lookup and the create info's inputs (Thread_Gpu: reads the program). When the
+// prewarm already has the pipeline, pipeline.pipeline is set and job.module stays null.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+void CreateComputeLayoutInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 const ShaderComputeInputInfo& input_info,
+                                 vk::ShaderModule compute_module, ComputePipelineJob& job) {
 	EXIT_IF(compute_module == nullptr);
+	job = {};
 
-	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
-	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
-	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
-	comp_shader_stage_info.module = compute_module;
-	comp_shader_stage_info.pName  = "main";
+	uint32_t required_subgroup_size = 0;
 	EXIT_IF(!input_info.stage);
 	const auto wave_size = input_info.stage.program->wave_size;
 	if (graphics.compute_subgroup_size_control_enabled &&
 	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
-		comp_subgroup_size.requiredSubgroupSize = wave_size;
-		comp_shader_stage_info.pNext            = &comp_subgroup_size;
+		required_subgroup_size = wave_size;
 	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
@@ -681,15 +679,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
-	vk::ComputePipelineCreateInfo info {};
-	info.stage             = comp_shader_stage_info;
-	info.layout            = pipeline.pipeline_layout;
-	info.basePipelineIndex = -1;
-
 	EXIT_IF(pipeline.pipeline != nullptr);
 
 	const uint64_t prewarm_key = Prewarm::Register(
-	    compute_module, descriptor_bindings, comp_subgroup_size.requiredSubgroupSize,
+	    compute_module, descriptor_bindings, required_subgroup_size,
 	    static_cast<uint32_t>(pipeline.uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
 	                                                         : vk::DescriptorSetLayoutCreateFlags {}) |
 	        (pipeline.uses_bindless ? Prewarm::LayoutBindlessBit : 0u));
@@ -697,12 +690,37 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		pipeline.pipeline = prewarmed;
 		return;
 	}
+	job.module                 = compute_module;
+	job.required_subgroup_size = required_subgroup_size;
+}
+
+// The driver compile alone. Thread-safe: touches only the device, the (internally synchronized)
+// driver cache and `pipeline`, so a background thread may run it (KYTY_ASYNC_COMPUTE_WORDS).
+void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 const ComputePipelineJob& job, vk::PipelineCache driver_cache) {
+	EXIT_IF(job.module == nullptr || pipeline.pipeline_layout == nullptr ||
+	        pipeline.pipeline != nullptr);
+	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
+	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
+	comp_shader_stage_info.module = job.module;
+	comp_shader_stage_info.pName  = "main";
+	if (job.required_subgroup_size != 0) {
+		comp_subgroup_size.requiredSubgroupSize = job.required_subgroup_size;
+		comp_shader_stage_info.pNext            = &comp_subgroup_size;
+	}
+
+	vk::ComputePipelineCreateInfo info {};
+	info.stage             = comp_shader_stage_info;
+	info.layout            = pipeline.pipeline_layout;
+	info.basePipelineIndex = -1;
+
 	const auto compile_start = std::chrono::steady_clock::now();
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
-	                                                &pipeline.pipeline);
+	const auto result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
+	                                                           &pipeline.pipeline);
 	Prewarm::NoteRuntimeCompile(false, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                       std::chrono::steady_clock::now() - compile_start).count()));
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
@@ -710,6 +728,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+}
+
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const ShaderComputeInputInfo& input_info,
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+	ComputePipelineJob job;
+	CreateComputeLayoutInternal(graphics, pipeline, input_info, compute_module, job);
+	if (job.module != nullptr) {
+		CreateComputePipelineObject(graphics, pipeline, job, driver_cache);
+	}
 }
 
 } // namespace Libs::Graphics

@@ -664,7 +664,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto* pipeline_ptr = m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pipeline_ptr == nullptr) {
+		// Compiling in the background and KYTY_ASYNC_COMPUTE_SKIP=1: this dispatch is skipped.
+		ResetBindings();
+		return;
+	}
+	auto& pipeline = *pipeline_ptr;
 	auto& bindings = m_compute_bindings;
 	{
 		PhaseStats::Scope bind_phase {PhaseStats::PhDispatchBindings};
@@ -764,7 +770,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    m_context.GetGraphics(), m_context.GetCommandScheduler());
 	}
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto* pipeline_ptr = m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pipeline_ptr == nullptr) {
+		// Compiling in the background and KYTY_ASYNC_COMPUTE_SKIP=1: this dispatch is skipped.
+		ResetBindings();
+		return;
+	}
+	auto& pipeline = *pipeline_ptr;
 	auto& bindings = m_compute_bindings;
 	{
 		PhaseStats::Scope bind_phase {PhaseStats::PhDispatchBindings};

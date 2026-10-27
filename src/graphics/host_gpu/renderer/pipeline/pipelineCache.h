@@ -101,6 +101,10 @@ struct PipelineVertexInputState {
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
+	uint64_t         spirv_words = 0;
+	// Another permutation of the same guest shader already existed when this one was made
+	// (permutation churn); see PipelineCache::TryGetComputePipeline.
+	bool             repeat_permutation = false;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
@@ -203,9 +207,16 @@ public:
 	                                 const GraphicsPrograms& programs, bool may_defer);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
+	// Like GetComputePipeline, but large (KYTY_ASYNC_COMPUTE_WORDS) or repeated large
+	// (KYTY_ASYNC_REPEAT_WORDS) permutations are compiled by background threads. By default the
+	// dispatch then waits for that compile (never skipped); nullptr (skip this dispatch) only with
+	// KYTY_ASYNC_COMPUTE_SKIP=1.
+	Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+	                                const ShaderProgram&          compute_program);
 
 private:
 	struct ProgramCache;
+	struct AsyncCompute;
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
@@ -241,6 +252,8 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
+	std::unique_ptr<AsyncCompute>                           m_async_compute;
+	void                                                    StopAsyncCompute();
 	uint64_t                                                m_deferred_draws = 0;
 	// KYTY_PIPELINE_CACHE_AUTOSAVE_S (wolverine-turbo3-1025): a background thread writes the driver cache while
 	// the game runs, so a run that is killed (closing the console) keeps what it compiled.
@@ -277,6 +290,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+
+struct ComputePipelineJob {
+	vk::ShaderModule module                 = nullptr; // null: the prewarm already had it
+	uint32_t         required_subgroup_size = 0;
+};
+void CreateComputeLayoutInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 const ShaderComputeInputInfo& input_info,
+                                 vk::ShaderModule compute_module, ComputePipelineJob& job);
+void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 const ComputePipelineJob& job, vk::PipelineCache driver_cache);
 
 } // namespace Libs::Graphics
 

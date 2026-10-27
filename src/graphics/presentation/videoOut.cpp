@@ -1285,6 +1285,22 @@ static void NoteFrameStats() {
 	         100.0 - (static_cast<double>(gpu_wait_us + idle_us) / 10000.0 / seconds), static_cast<double>(gpu_wait_us) / 10000.0 / seconds,
 	         static_cast<double>(idle_us) / 10000.0 / seconds, static_cast<double>(other_wait_us) / 1000.0,
 	         static_cast<unsigned long long>(other_waits));
+	{
+		const auto cs_us   = FrameCosts::g_compute_sync_us.exchange(0);
+		const auto cs_n    = FrameCosts::g_compute_syncs.exchange(0);
+		const auto cs_q    = FrameCosts::g_compute_async_queued.exchange(0);
+		const auto cs_skip = FrameCosts::g_compute_skipped.exchange(0);
+		const auto deferred = FrameCosts::g_draws_deferred.exchange(0);
+		const auto crit_us = FrameCosts::g_critical_wait_us.exchange(0);
+		const auto crit_n  = FrameCosts::g_critical_waits.exchange(0);
+		// wolverine-async-1027: where new pipelines cost the GPU thread time, and what was skipped.
+		::printf("Pipelines (5 s): compute inline %llu in %.0f ms, compute queued %llu, compute dispatches skipped %llu; "
+		         "graphics draws skipped while compiling %llu, must-draw inline compiles %llu in %.0f ms\n",
+		         static_cast<unsigned long long>(cs_n), static_cast<double>(cs_us) / 1000.0,
+		         static_cast<unsigned long long>(cs_q), static_cast<unsigned long long>(cs_skip),
+		         static_cast<unsigned long long>(deferred), static_cast<unsigned long long>(crit_n),
+		         static_cast<double>(crit_us) / 1000.0);
+	}
 	::printf("Frames (5 s): %.1f fps, frame %.2f ms avg, %.2f ms p99, %.2f ms max; shaders %llu in %.0f ms, pipeline waits %llu in %.0f ms\n",
 	         static_cast<double>(intervals.size()) / seconds, sum / static_cast<double>(intervals.size()),
 	         static_cast<double>(p99), static_cast<double>(intervals.back()), static_cast<unsigned long long>(shaders),

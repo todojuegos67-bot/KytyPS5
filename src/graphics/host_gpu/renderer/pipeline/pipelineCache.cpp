@@ -684,14 +684,15 @@ struct PipelineCache::ProgramCache {
 	};
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
-			permutations.reserve(8);
-		}
+		    : resource_plan(std::move(plan)) {}
 
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
+		// A deque: input_info.stage points at a permutation's program, and a new permutation of
+		// the same shader must not move the ones already handed out (a vector reallocated them
+		// past 8 permutations).
+		std::deque<Permutation>                     permutations;
 		std::vector<MemoSlot>                        memo;
 	};
 
@@ -868,7 +869,8 @@ struct PipelineCache::ProgramCache {
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = {.id = ++next_shader_id, .module = module,
+		                       .spirv_words = static_cast<uint64_t>(result.spirv.size())},
 		};
 	}
 
@@ -1085,6 +1087,9 @@ struct PipelineCache::ProgramCache {
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		if (entry->second.permutations.size() > 1u) {
+			entry->second.permutations.back().handle.repeat_permutation = true;
+		}
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -1187,6 +1192,7 @@ void PipelineCache::StartPrewarm() {
 }
 
 PipelineCache::~PipelineCache() {
+	StopAsyncCompute();
 	Prewarm::Shutdown();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
@@ -1761,6 +1767,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	}
 
 	const auto defer = [this] {
+		FrameCosts::g_draws_deferred.fetch_add(1, std::memory_order_relaxed);
 		if (++m_deferred_draws % 256 == 1) {
 			LOGF("PipelineCache: %" PRIu64 " draws skipped while their pipeline compiled in the "
 			     "background\n",
@@ -1812,7 +1819,12 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 		return &pipeline;
 	}
-	const auto result = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline);
+	vk::Result result = vk::Result::eSuccess;
+	{
+		// Draws that may not be skipped (they write memory, depth or stencil): compiled inline.
+		FrameCosts::Timer cost_timer {FrameCosts::g_critical_wait_us, FrameCosts::g_critical_waits};
+		result = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
@@ -1842,7 +1854,10 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	{
+		FrameCosts::Timer cost_timer {FrameCosts::g_compute_sync_us, FrameCosts::g_compute_syncs};
+		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
@@ -1851,5 +1866,181 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_IF(!inserted);
 
 	return *iter->second;
+}
+// Ported from yotei-movie5-1027 (e4ddbca9, bd048103, 5a917b43), Wolverine defaults:
+// KYTY_ASYNC_COMPUTE_WORDS=<n> (default 0 = off): compute pipelines whose SPIR-V has more words are
+//   created by background threads (KYTY_ASYNC_COMPUTE_THREADS, default 4).
+// KYTY_ASYNC_REPEAT_WORDS=<n> (default 20000, 0 = off): the same for a repeated permutation of a
+//   guest shader (another permutation already existed) over n words. Ghost of Yotei: one culling CS
+//   got a new ~90K-word permutation almost every frame, a ~1.3 s synchronous compile each.
+// KYTY_ASYNC_COMPUTE_SKIP=1 (default 0): a dispatch whose pipeline is still compiling is skipped.
+//   Off by default because skipped producer passes (vertex/index/matrix data, culling lists) leave
+//   garbage buffers: exploded geometry and missing objects in Yotei. With 0 the background compile
+//   is waited for, so the dispatch is never lost.
+// Background compiles happen only when they can pay off: with KYTY_ASYNC_COMPUTE_SKIP=0 a new
+// pipeline compiles inline (waiting for a worker would only add a thread hop).
+struct PipelineCache::AsyncCompute {
+	struct Job {
+		uint64_t                  id = 0;
+		std::unique_ptr<Pipeline> pipeline;
+		ComputePipelineJob        job;
+	};
+
+	std::mutex                                              mutex;
+	std::condition_variable                                 cv;
+	std::condition_variable                                 done_cv;
+	std::deque<Job>                                         queue;
+	std::unordered_set<uint64_t>                            pending;
+	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> done;
+	std::vector<std::thread>                                threads;
+	bool                                                    stop = false;
+};
+
+static uint64_t EnvU64(const char* name, uint64_t fallback) {
+	const char* v = std::getenv(name);
+	return v != nullptr && v[0] != '\0' ? std::strtoull(v, nullptr, 10) : fallback;
+}
+
+static bool ComputeSkipAllowed() {
+	static const bool allowed = EnvU64("KYTY_ASYNC_COMPUTE_SKIP", 0) == 1;
+	return allowed;
+}
+
+void PipelineCache::StopAsyncCompute() {
+	if (m_async_compute == nullptr) {
+		return;
+	}
+	auto& async = *m_async_compute;
+	{
+		std::lock_guard lock(async.mutex);
+		async.stop = true;
+		for (auto& job: async.queue) {
+			async.pending.erase(job.id);
+			m_graphics.device.destroyPipelineLayout(job.pipeline->pipeline_layout, nullptr);
+			m_graphics.device.destroyDescriptorSetLayout(job.pipeline->descriptor_set_layout, nullptr);
+		}
+		async.queue.clear();
+	}
+	async.cv.notify_all();
+	for (auto& t: async.threads) {
+		t.join();
+	}
+	for (auto& [id, pipeline]: async.done) {
+		m_compute_pipelines.emplace(id, std::move(pipeline));
+	}
+	async.done.clear();
+	m_async_compute.reset();
+}
+
+PipelineCache::Pipeline*
+PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+                                     const ShaderProgram&          compute_program) {
+	EXIT_IF(!compute_program);
+	if (auto iter = m_compute_pipelines.find(compute_program.id);
+	    iter != m_compute_pipelines.end()) {
+		return iter->second.get();
+	}
+	static const uint64_t words        = EnvU64("KYTY_ASYNC_COMPUTE_WORDS", 0);
+	static const uint64_t repeat_words = EnvU64("KYTY_ASYNC_REPEAT_WORDS", 20000);
+
+	if (m_async_compute != nullptr) {
+		auto&                     async = *m_async_compute;
+		std::unique_ptr<Pipeline> ready;
+		{
+			std::unique_lock lock(async.mutex);
+			if (async.pending.contains(compute_program.id)) {
+				if (ComputeSkipAllowed()) {
+					FrameCosts::g_compute_skipped.fetch_add(1, std::memory_order_relaxed);
+					return nullptr;
+				}
+				// Never skip (default): wait for the background compile.
+				FrameCosts::Timer cost_timer {FrameCosts::g_compute_sync_us, FrameCosts::g_compute_syncs};
+				async.done_cv.wait(lock, [&] { return !async.pending.contains(compute_program.id); });
+			}
+			if (auto it = async.done.find(compute_program.id); it != async.done.end()) {
+				ready = std::move(it->second);
+				async.done.erase(it);
+			}
+		}
+		if (ready != nullptr) {
+			auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(ready));
+			EXIT_IF(!inserted);
+			return iter->second.get();
+		}
+	}
+
+	const bool background = ComputeSkipAllowed() &&
+	                        ((words != 0 && compute_program.spirv_words > words) ||
+	                         (repeat_words != 0 && compute_program.repeat_permutation &&
+	                          compute_program.spirv_words > repeat_words));
+	if (!background) {
+		return &GetComputePipeline(input_info, compute_program);
+	}
+
+	StartPrewarm();
+	auto job      = AsyncCompute::Job {};
+	job.id        = compute_program.id;
+	job.pipeline  = std::make_unique<Pipeline>();
+	// Layouts and the prewarm lookup read the program: done here, only the driver compile moves.
+	CreateComputeLayoutInternal(m_graphics, *job.pipeline, input_info, compute_program.module, job.job);
+	if (job.job.module == nullptr) {
+		auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(job.pipeline));
+		EXIT_IF(!inserted);
+		return iter->second.get();
+	}
+
+	if (m_async_compute == nullptr) {
+		m_async_compute = std::make_unique<AsyncCompute>();
+		const auto count =
+		    static_cast<uint32_t>(std::clamp<uint64_t>(EnvU64("KYTY_ASYNC_COMPUTE_THREADS", 4), 1, 16));
+		auto* async = m_async_compute.get();
+		for (uint32_t i = 0; i < count; i++) {
+			async->threads.emplace_back([this, async] {
+				Prewarm::MarkAsyncThread();
+				for (;;) {
+					AsyncCompute::Job work;
+					{
+						std::unique_lock lock(async->mutex);
+						async->cv.wait(lock, [async] { return async->stop || !async->queue.empty(); });
+						if (async->stop) {
+							return;
+						}
+						work = std::move(async->queue.front());
+						async->queue.pop_front();
+					}
+					const auto start = std::chrono::steady_clock::now();
+					CreateComputePipelineObject(m_graphics, *work.pipeline, work.job, m_driver_cache);
+					const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					                    std::chrono::steady_clock::now() - start)
+					                    .count();
+					std::printf("Pipeline: async compute %016llx compiled in %lld ms\n",
+					            static_cast<unsigned long long>(work.id), static_cast<long long>(ms));
+					{
+						std::lock_guard lock(async->mutex);
+						async->done.emplace(work.id, std::move(work.pipeline));
+						async->pending.erase(work.id);
+					}
+					async->done_cv.notify_all();
+				}
+			});
+		}
+		std::printf("Pipeline: async compute enabled, %u threads, SPIR-V > %llu words, repeat permutations > %llu words, skip=%d\n",
+		            count, static_cast<unsigned long long>(words),
+		            static_cast<unsigned long long>(repeat_words), ComputeSkipAllowed() ? 1 : 0);
+	}
+	std::printf("Pipeline: async compute %016llx queued (%llu words%s)\n",
+	            static_cast<unsigned long long>(job.id),
+	            static_cast<unsigned long long>(compute_program.spirv_words),
+	            compute_program.repeat_permutation ? ", repeat permutation" : "");
+	std::fflush(stdout);
+	FrameCosts::g_compute_async_queued.fetch_add(1, std::memory_order_relaxed);
+	FrameCosts::g_compute_skipped.fetch_add(1, std::memory_order_relaxed);
+	{
+		std::lock_guard lock(m_async_compute->mutex);
+		m_async_compute->pending.insert(job.id);
+		m_async_compute->queue.push_back(std::move(job));
+	}
+	m_async_compute->cv.notify_one();
+	return nullptr;
 }
 } // namespace Libs::Graphics

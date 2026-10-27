@@ -19,6 +19,16 @@ inline std::atomic<uint64_t> g_other_gpu_wait_us {0};
 inline std::atomic<uint64_t> g_other_gpu_waits {0};
 inline std::atomic<uint64_t> g_idle_us {0};
 inline std::atomic<uint64_t> g_idles {0};
+// "Pipelines (5 s)" line (wolverine-async-1027): compute pipelines the GPU thread compiled (or
+// waited for) synchronously, draws skipped while their graphics pipeline compiled, and draws that
+// were not allowed to skip (they write depth or memory) and waited for their pipeline instead.
+inline std::atomic<uint64_t> g_compute_sync_us {0};
+inline std::atomic<uint64_t> g_compute_syncs {0};
+inline std::atomic<uint64_t> g_compute_async_queued {0};
+inline std::atomic<uint64_t> g_compute_skipped {0};
+inline std::atomic<uint64_t> g_draws_deferred {0};
+inline std::atomic<uint64_t> g_critical_wait_us {0};
+inline std::atomic<uint64_t> g_critical_waits {0};
 
 struct Timer {
 	std::atomic<uint64_t>&                sum;

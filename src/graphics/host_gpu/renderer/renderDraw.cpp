@@ -1274,6 +1274,18 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	for (const auto& stage: vertex_stages) {
 		may_defer = may_defer && !writes_memory(stage.stage);
 	}
+	// wolverine-async-1027: a draw that writes depth or tests stencil is visible-critical and waits
+	// for its pipeline. Skipped, it leaves holes that outlive the compile: shadow-map casters
+	// (Wolverine caches shadow maps, so a missing caster stays missing: light/shadow patches),
+	// depth prepass (later passes test against a missing occluder) and stencil masks (lighting and
+	// decals gated by them). Color-only draws (particles, UI, transparent effects) may still be
+	// skipped for the few frames their pipeline compiles. KYTY_DEFER_DEPTH_DRAWS=1 (live) restores
+	// the old rule.
+	static auto& defer_depth_draws = Common::LiveSwitches::Get("KYTY_DEFER_DEPTH_DRAWS", 0);
+	if (may_defer && defer_depth_draws.load(std::memory_order_relaxed) == 0 &&
+	    (state.depth_info.depth_write_enable || state.depth_info.stencil_test_enable)) {
+		may_defer = false;
+	}
 	auto* deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
