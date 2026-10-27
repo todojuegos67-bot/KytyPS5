@@ -986,10 +986,12 @@ bool MtShadeHit(vec3 o, vec3 Rw, float t, int inst, int prim, vec2 bc, float tma
 	res            = vec4(0);
 	vec3  Hw       = o + Rw * t;
 	float far_fade = 1.0 - smoothstep(0.7, 1.0, t / tmax);
+	bool  hidden   = false;
 	vec4  sc       = HwToScreen(Hw);
 	if (sc.w > 0.5 && InScreen(sc.xy)) {
 		float sd = DepthAt(sc.xy);
 		float zs = abs(ViewZ(sd)), zh = abs(ViewZ(sc.z));
+		hidden = !IsSky(sd) && zs < zh - (0.03 * zh + 0.1); // (flick3: on the screen, behind something nearer)
 		if (!IsSky(sd) && abs(zs - zh) < 0.03 * zh + 0.1) {
 			vec2  edge = min(sc.xy, 1.0 - sc.xy);
 			float conf = far_fade * (0.6 + 0.4 * smoothstep(0.0, 0.05, min(edge.x, edge.y)));
@@ -1048,12 +1050,15 @@ bool MtShadeHit(vec3 o, vec3 Rw, float t, int inst, int prim, vec2 bc, float tma
 		vec3 lit   = SafeColor(albedo * light);
 		float lm   = Luma(lit), lc = 2.0 * Luma(amb) + 1e-4;
 		if (lm > lc) lit *= lc / lm;
+		lit  = mix(vec3(Luma(lit)), lit, 0.5); // (flick3: half desaturated: no blue / orange albedo flashes)
 		c    = Tonemap(lit);
 		conf = 0.8 * far_fade;
 	} else {
 		c    = Tonemap(HwAmbient() * (0.35 + 0.65 * up));
 		conf = 0.6 * far_fade;
 	}
+	// (flick3) hidden on the screen (behind the character / a pillar): a dim grey guess at a third of the confidence
+	if (hidden) c = vec3(Luma(c)) * 0.8, conf *= 0.35;
 	res = vec4(c * conf, conf);
 	return !Bad(res) && conf > 1e-3;
 }
@@ -1905,7 +1910,7 @@ void MtTrace(ivec2 px) {
 			}
 			if (t_hit < 0.0 && (self_ < 0 || self_range < tmax)) {
 				rayQueryEXT rq;
-				rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT, MT_MASK, o, self_ >= 0 ? max(self_range, t_self) : t_self, Rw, tmax);
+				rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT, 0x01u /* (flick3: static only; MT_MASK kept for the self-skip queries) */, o, self_ >= 0 ? max(self_range, t_self) : t_self, Rw, tmax);
 				while (rayQueryProceedEXT(rq)) {}
 				if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
 					t_hit = rayQueryGetIntersectionTEXT(rq, true);
@@ -1983,6 +1988,13 @@ void MtTemporal(ivec2 px) {
 	// not raise its own limit) and never above their brightest; with fewer than 3 neighbours, at most 2x the history.
 	if (fresh && wnb >= 3.0) {
 		float lim = min(2.0 * lnb / wnb + 0.01, lmax + 0.01), lc = Luma(cur.rgb);
+		if (lc > lim) cur.rgb *= lim / max(lc, 1e-6);
+	}
+	// (flick3) silhouette edges (fewer than 3 neighbours on the same surface): no limit above applied, the sparkles on
+	// armour outlines; at most 1.25x the neighbours' mean (or their brightest), and with no neighbour half strength
+	if (fresh && wnb < 3.0) {
+		float lc = Luma(cur.rgb);
+		float lim = wnb > 0.5 ? min(1.25 * lnb / wnb + 0.01, lmax + 0.01) : 0.5 * lc;
 		if (lc > lim) cur.rgb *= lim / max(lc, 1e-6);
 	}
 	if (fresh && wraw > 2.0) { // (a lone bright hit: at most the neighbourhood's mean + 2.5 sigma)
