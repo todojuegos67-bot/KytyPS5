@@ -162,6 +162,7 @@ private:
 					call(job);
 					LiveCounters::Add(LiveCounters::UploadCallUs, since(called));
 					++done;
+					Publish(done);
 					continue;
 				}
 				// The jobs up to the next other call (which keeps its place): their write protections first, in their
@@ -181,11 +182,20 @@ private:
 				LiveCounters::Add(LiveCounters::UploadCallUs, since(protecting));
 				CopyRun(done, end, bytes);
 				done = end;
+				Publish(done);
 			}
 			LiveCounters::Add(LiveCounters::UploadBusyUs, since(start));
 			m_done.store(done, std::memory_order_seq_cst);
 			if (m_waiters.load(std::memory_order_seq_cst) != 0) m_done.notify_all();
 		}
+	}
+
+	// Progress published per run, not per batch: a submission (or DrainRange) waiting for an early sequence of a
+	// long batch (a streamed area's 100-200 MB of copies) is released as soon as its own copies are in staging memory,
+	// instead of after the whole batch the worker had taken (upload_wait in SLOW Frame lines).
+	void Publish(uint64_t done) {
+		m_done.store(done, std::memory_order_seq_cst);
+		if (m_waiters.load(std::memory_order_seq_cst) != 0) m_done.notify_all();
 	}
 
 	// The copies among jobs [first, last) (calls skipped), `bytes` in all. Copies of 1 MiB or more together are
