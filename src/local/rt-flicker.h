@@ -8,7 +8,10 @@
 
 namespace Libs::Graphics::FrameGen::RtFlicker {
 
-enum Pass : uint32_t { Particles = 0, Sun = 1, Lights = 2, Reflections = 3, Count = 4 };
+// (rt3fx) Ao: KYTY_HWRT_AO / _GI (hwrt-gi.cpp), Volumetric: the god rays (KYTY_GODRAYS, KYTY_HWRT_VOLUMETRIC), Metal: the
+// KYTY_HWRT_METAL composite alone (rt-reflections.cpp: its input is the reflections' composite). Each pass also logs its
+// largest single-point jump (% of the point's light) over the 10 s.
+enum Pass : uint32_t { Particles = 0, Sun = 1, Lights = 2, Reflections = 3, Ao = 4, Volumetric = 5, Metal = 6, Count = 7 };
 // Once a frame, before the passes: whether the camera holds still since the last frame.
 void BeginFrame(const UpscaleInputs& inputs);
 // After a pass that replaced inputs.color (before: the color it read).

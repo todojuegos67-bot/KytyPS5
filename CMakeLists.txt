@@ -624,7 +624,7 @@ add_custom_command(
 list(APPEND kyty_emulator_src "${rtsun_hw_header}")
 # KYTY_HWRT (src/local/hwrt-scene.cpp): the scene capture's world-space gather and the ray query debug view.
 # (hwrt3, KYTY_HWRT_REFL_MATERIAL: albedo, albedo_array: a base-colour texture downsampled into the albedo array)
-foreach(hwrt_shader gather debug debug11 albedo albedo_array)
+foreach(hwrt_shader gather debug debug11 gi albedo albedo_array)
 	string(TOUPPER "${hwrt_shader}" hwrt_upper)
 	set(hwrt_source "${KYTY_SOURCE_DIR}/local/hwrt-${hwrt_shader}.comp")
 	set(hwrt_defines "")
@@ -737,6 +737,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-scene.h"
 	"${KYTY_SOURCE_DIR}/local/hwrt-scene.cpp"
+	"${KYTY_SOURCE_DIR}/local/hwrt-gi.h"
+	"${KYTY_SOURCE_DIR}/local/hwrt-gi.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.h"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.cpp"
 	"${KYTY_SOURCE_DIR}/local/hw-lights.h"
