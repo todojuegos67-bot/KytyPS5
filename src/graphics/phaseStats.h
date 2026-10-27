@@ -51,6 +51,8 @@ enum Phase : int {
 	PhProgMaterialize,
 	PhProgFind,
 	PhProgRecompile,
+	PhMemoHit,
+	PhMemoMiss,
 	Count
 };
 
@@ -61,7 +63,8 @@ inline const char* const kNames[Count] = {"gpu.idle",       "gpu.cmd",       "gp
                                           "draw.total", "draw.lock", "draw.state", "draw.bindings", "draw.vertex",
                                           "draw.pipeline", "draw.targets", "draw.commit", "dispatch.total", "dispatch.bindings",
                                           "state.shaders", "state.targets", "prog.key", "prog.lookup",
-                                          "prog.materialize", "prog.find", "prog.recompile"};
+                                          "prog.materialize", "prog.find", "prog.recompile",
+                                          "memo.hit", "memo.miss"};
 
 inline std::atomic<uint64_t> g_us[Count] {};
 inline std::atomic<uint64_t> g_calls[Count] {};

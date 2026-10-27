@@ -702,7 +702,15 @@ struct PipelineCache::ProgramCache {
 		// a scan of the plan's own instructions; empty until computed, all-true when unsure.
 		std::vector<uint8_t>                         used_user_data;
 		bool                                         used_computed = false;
+		// Memo miss diagnostics: new-input misses this window, and the last missed key.
+		uint64_t                                     new_input_misses = 0;
+		std::vector<uint32_t>                        last_missed_key;
+		std::array<uint64_t, 64>                     varying_word_count {};
+		uint64_t                                     base_changes = 0, workgroup_changes = 0;
+		uint64_t                                     last_missed_base = 0;
+		std::array<uint32_t, 3>                      last_missed_groups {};
 	};
+	SourceEntry* memo_worst = nullptr;
 
 	// The plan owns every instruction it evaluates (value_storage), and user data reaches the
 	// walk, its native code and the clean walk only through GetUserData. Words no GetUserData
@@ -794,6 +802,7 @@ struct PipelineCache::ProgramCache {
 				if (!ReadsUnchanged(slot.log, reads)) {
 					continue;
 				}
+				PhaseStats::Scope hit_phase {PhaseStats::PhMemoHit};
 				entry.resources      = slot.resources;
 				entry.specialization = slot.specialization;
 				// The only verbatim copy of the inputs in the snapshot (shader data words).
@@ -806,6 +815,30 @@ struct PipelineCache::ProgramCache {
 		}
 		memo_misses++;
 		(inputs_seen ? memo_miss_reads : memo_miss_inputs)++;
+		PhaseStats::Scope miss_phase {PhaseStats::PhMemoMiss};
+		if (!inputs_seen) {
+			// Which key words differ from the previous new-input miss of this program.
+			entry.new_input_misses++;
+			if (entry.last_missed_key.size() == key_words.size()) {
+				for (size_t i = 0; i < key_words.size() && i < entry.varying_word_count.size(); i++) {
+					if (entry.last_missed_key[i] != key_words[i]) {
+						entry.varying_word_count[i]++;
+					}
+				}
+			}
+			if (entry.last_missed_base != runtime.shader_base) {
+				entry.base_changes++;
+			}
+			if (entry.last_missed_groups != runtime.workgroup_count) {
+				entry.workgroup_changes++;
+			}
+			entry.last_missed_key.assign(key_words.begin(), key_words.end());
+			entry.last_missed_base   = runtime.shader_base;
+			entry.last_missed_groups = runtime.workgroup_count;
+			if (memo_worst == nullptr || entry.new_input_misses > memo_worst->new_input_misses) {
+				memo_worst = &entry;
+			}
+		}
 		ShaderReadChunks::ReadLog log;
 		reads.SetLog(&log);
 		const bool ok = ShaderRecompiler::IR::MaterializeResources(
@@ -868,6 +901,31 @@ struct PipelineCache::ProgramCache {
 		::printf("Resource memo key (5 s): KYTY_MEMO_USED_KEY=%lld, %.1f%% of user-data words left out of the key\n",
 		         static_cast<long long>(Common::LiveSwitches::Get("KYTY_MEMO_USED_KEY", 1).load()),
 		         memo_total_words != 0 ? 100.0 * static_cast<double>(memo_masked_words) / memo_total_words : 0.0);
+		if (memo_worst != nullptr && memo_worst->new_input_misses != 0) {
+			// The program with most new-input misses: how often each key word changed between
+			// consecutive misses (u = the plan reads it, - = left out of the key).
+			auto& w = *memo_worst;
+			std::string words;
+			for (size_t i = 0; i < w.last_missed_key.size() && i < w.varying_word_count.size(); i++) {
+				if (w.varying_word_count[i] != 0) {
+					words += fmt::format(" [{}{}]{}", i,
+					                     i < w.used_user_data.size() && w.used_user_data[i] ? "u" : "-",
+					                     w.varying_word_count[i]);
+				}
+			}
+			::printf("Resource memo worst (5 s): shader 0x%016" PRIx64 " stage %u, %" PRIu64
+			         " new-input misses, %zu memo slots used, user data %zu words; shader base changed %" PRIu64
+			         ", workgroups changed %" PRIu64 "; changing words:%s\n",
+			         w.resource_plan.shader_hash, static_cast<uint32_t>(w.resource_plan.stage), w.new_input_misses,
+			         w.memo.size(), w.last_missed_key.size(), w.base_changes, w.workgroup_changes, words.c_str());
+		}
+		for (auto& [key, e]: programs) {
+			(void)key;
+			e.new_input_misses = 0;
+			e.varying_word_count.fill(0);
+			e.base_changes = e.workgroup_changes = 0;
+		}
+		memo_worst = nullptr;
 		memo_miss_inputs = memo_miss_reads = 0;
 		memo_masked_words = memo_total_words = 0;
 		lookup_hits = lookup_misses = 0;

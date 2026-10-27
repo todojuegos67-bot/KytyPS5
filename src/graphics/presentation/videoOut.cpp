@@ -1,3 +1,4 @@
+#include <string>
 #include "common/liveSwitches.h"
 #include "graphics/frameCosts.h"
 #include <cstdio>
@@ -1302,11 +1303,53 @@ static void NoteFrameStats() {
 		static auto& sw_state  = Common::LiveSwitches::Get("KYTY_STATE_CACHE", 0);
 		static auto& sw_eager  = Common::LiveSwitches::Get("KYTY_EAGER_WRITEBACK", 0);
 		static auto& sw_defer  = Common::LiveSwitches::Get("KYTY_DEFER_DEPTH_DRAWS", 0);
+		static auto& sw_used   = Common::LiveSwitches::Get("KYTY_MEMO_USED_KEY", 1);
+		static auto& sw_slots  = Common::LiveSwitches::Get("KYTY_RESOURCE_MEMO_SLOTS", 128);
+		static auto& sw_rwin   = Common::LiveSwitches::Get("KYTY_REPEAT_READ_WINDOW_KB", 0);
+		static auto& sw_win    = Common::LiveSwitches::Get("KYTY_READBACK_WINDOW_KB", 2048);
+		// KYTY_AUTO_AB="NAME=v,NAME=v,..." (wolverine-ab-1027): every KYTY_AUTO_AB_WINDOWS (default 6)
+		// windows of 5 s, the next assignment is applied, cycling, so one run A/Bs by itself.
+		{
+			static const std::vector<std::pair<std::string, int64_t>> steps = [] {
+				std::vector<std::pair<std::string, int64_t>> out;
+				if (const char* v = std::getenv("KYTY_AUTO_AB"); v != nullptr) {
+					std::string all = v;
+					size_t      pos = 0;
+					while (pos <= all.size()) {
+						const auto end  = std::min(all.find(',', pos), all.size());
+						const auto item = all.substr(pos, end - pos);
+						const auto eq   = item.find('=');
+						if (eq != std::string::npos && eq > 0) {
+							out.emplace_back(item.substr(0, eq), std::strtoll(item.c_str() + eq + 1, nullptr, 10));
+						}
+						pos = end + 1;
+					}
+				}
+				return out;
+			}();
+			static const int64_t every = [] {
+				const char* v = std::getenv("KYTY_AUTO_AB_WINDOWS");
+				return v != nullptr ? std::max<int64_t>(1, std::strtoll(v, nullptr, 10)) : int64_t {6};
+			}();
+			static int64_t window_n = 0;
+			static size_t  step     = 0;
+			if (!steps.empty() && window_n++ % every == 0) {
+				const auto& [name, value] = steps[step % steps.size()];
+				// Get() keeps the first default; every switch named here is registered above or
+				// at its use site before the first window.
+				Common::LiveSwitches::Get(name.c_str(), value).store(value, std::memory_order_relaxed);
+				::printf("Auto A/B: step %zu: %s=%lld\n", step, name.c_str(), static_cast<long long>(value));
+				step++;
+			}
+		}
 		::printf("Switches (5 s): KYTY_RESOURCE_MEMO=%lld KYTY_LOOKUP_CACHE=%lld KYTY_RT_CACHE=%lld "
-		         "KYTY_STATE_CACHE=%lld KYTY_EAGER_WRITEBACK=%lld KYTY_DEFER_DEPTH_DRAWS=%lld\n",
+		         "KYTY_STATE_CACHE=%lld KYTY_EAGER_WRITEBACK=%lld KYTY_DEFER_DEPTH_DRAWS=%lld KYTY_MEMO_USED_KEY=%lld "
+		         "KYTY_RESOURCE_MEMO_SLOTS=%lld KYTY_REPEAT_READ_WINDOW_KB=%lld KYTY_READBACK_WINDOW_KB=%lld\n",
 		         static_cast<long long>(sw_memo.load()), static_cast<long long>(sw_lookup.load()),
 		         static_cast<long long>(sw_rt.load()), static_cast<long long>(sw_state.load()),
-		         static_cast<long long>(sw_eager.load()), static_cast<long long>(sw_defer.load()));
+		         static_cast<long long>(sw_eager.load()), static_cast<long long>(sw_defer.load()),
+		         static_cast<long long>(sw_used.load()), static_cast<long long>(sw_slots.load()),
+		         static_cast<long long>(sw_rwin.load()), static_cast<long long>(sw_win.load()));
 		// wolverine-async-1027: where new pipelines cost the GPU thread time, and what was skipped.
 		::printf("Pipelines (5 s): compute inline %llu in %.0f ms, compute queued %llu, compute dispatches skipped %llu; "
 		         "graphics draws skipped while compiling %llu, must-draw inline compiles %llu in %.0f ms\n",
