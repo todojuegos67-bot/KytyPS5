@@ -351,10 +351,20 @@ void Temporal(ivec2 tp) {
 			valid   = KindOf(va.y) >= 1.0 && (Flag(8) || ((va.x >= FAR * 0.5) == (caux.x >= FAR * 0.5) &&
 			                                              (caux.x >= FAR * 0.5 || abs(va.x - caux.x) < 0.15 * caux.x + 0.3)));
 			if (valid) {
-				float g = Flag(8) ? 2.0 : 1.25;
-				h.rgb   = n > 0.0 ? clamp(h.rgb, mean - g * sig - 0.002, mean + g * sig + 0.002) : h.rgb;
-				float a = Flag(8) ? 0.05 : 0.2;
-				res.rgb = cur.a > 1e-4 ? mix(h.rgb, cur.rgb, a) : h.rgb;
+				// (ds-rt-stable-1027) still camera: the pixel's own history texel, no clamp against this frame's noisy 3x3,
+				// a 1/32 running mean and a fresh sample at most 1.5x the history (water mirrors' 0.3-1.4 %, max jump 91 %)
+				vec4  c2 = cur;
+				float a  = 0.2;
+				if (Flag(8)) {
+					h = texelFetch(hist_prev, tp, 0);
+					a = 1.0 / 32.0;
+					float lh = dot(h.rgb, vec3(0.2126, 0.7152, 0.0722)), lf = dot(c2.rgb, vec3(0.2126, 0.7152, 0.0722));
+					float lim = 1.5 * lh + 0.01;
+					if (h.a > 0.05 && lf > lim) c2.rgb *= lim / max(lf, 1e-6);
+				} else {
+					h.rgb = n > 0.0 ? clamp(h.rgb, mean - 1.25 * sig - 0.002, mean + 1.25 * sig + 0.002) : h.rgb;
+				}
+				res.rgb = cur.a > 1e-4 ? mix(h.rgb, c2.rgb, a) : h.rgb;
 				res.a   = mix(h.a, cur.a, a);
 			}
 		} else valid = false;

@@ -140,6 +140,7 @@ struct State {
 	bool                    y_flip = false;    // (hwrt5a) the y convention in use (KYTY_HWRT_GI_FLIPY, else measured)
 	bool                    y_init = false;
 	uint32_t                st_frames = 0;
+	bool                    still_now = false; // (ds-rt-stable-1027) the camera held still this frame: frame light frozen
 	float                   log_light = 0.0f; // (ao-fix) the frame's light, log2 of its geometric mean, smoothed
 	bool                    light_valid = false;
 	double                  ao_ms_sum = 0.0;   // (ao-fix) GPU ms over the HWRTAO line's window
@@ -385,7 +386,9 @@ void ReadStats(GraphicContext& graphics) {
 		g_gi.y_votes[i] += w[40 + i], g_gi.mask_hits[i] += w[44 + i];
 	if (w[49] > 0) { // (ao-fix) the frame's light (geometric mean of the sampled pixels), smoothed over ~20 frames
 		const float l = static_cast<float>(static_cast<double>(w[48]) / w[49] / 256.0 - 32.0);
-		g_gi.log_light   = g_gi.light_valid ? g_gi.log_light + (l - g_gi.log_light) * 0.05f : l;
+		// (ds-rt-stable-1027) frozen while the camera holds still: the estimate followed the other passes' changes in the
+		// colour and moved every pixel's AO / GI ratio with them
+		if (!(g_gi.light_valid && g_gi.still_now)) g_gi.log_light = g_gi.light_valid ? g_gi.log_light + (l - g_gi.log_light) * 0.05f : l;
 		g_gi.light_valid = true;
 	}
 	++g_gi.st_frames;
@@ -528,6 +531,7 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		still_vp = scene.vp;
 	}
 	if (still) ++g_gi.ao_frames_still;
+	g_gi.still_now = still;
 	const bool         half        = g_gi.trace != g_gi.render;
 	if (!g_gi.y_init) g_gi.y_init = true, g_gi.y_flip = flip_y;
 

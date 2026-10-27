@@ -1634,7 +1634,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
 	{
 		// The sums, counters and the metal survey to the host (the CPU reads them a few frames late; the copy is 5.5 KB).
-		vk::BufferCopy region {HeaderBytes, HeaderBytes, (SurveyIndex + SurveyCount) * 4};
+		vk::BufferCopy region {HeaderBytes, HeaderBytes, (FlashIndex + FlashCount) * 4}; // (ds-rt-stable-1027: + RTFLASH, 1440.., was cut off at the survey: 0 samples)
 		command.copyBuffer(vk::Buffer(g.frame_buf), vk::Buffer(g.read_buf), 1, &region);
 		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
 		        vk::AccessFlagBits2::eHostRead);

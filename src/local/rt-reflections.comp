@@ -1306,19 +1306,33 @@ void Temporal(ivec2 px) {
 		// (refl10, KYTY_RT_REFLECTIONS_BICUBIC) Smooth surfaces: the history through a Catmull-Rom filter instead of
 		// bilinear: a bilinear fetch every frame is a blur that compounds (the history is re-filtered each frame: sharp
 		// reflections went soft in motion); the neighbourhood clamp below catches the filter's overshoot.
-		vec4  hist = BicubicHist() && rough < 0.3 ? HistoryCR(puv) : textureLod(src_b, puv, 0);
+		// (ds-rt-stable-1027) still camera, the pixel under 0.3 px of motion: its own history texel, unfiltered (a filtered
+		// fetch every frame re-blurs the converged history and moves it with the jitter)
+		bool  hold = still_ && length((puv - uv) * ts) < 0.3;
+		vec4  hist = hold ? texelFetch(src_b, px, 0) : BicubicHist() && rough < 0.3 ? HistoryCR(puv) : textureLod(src_b, puv, 0);
 		if (Bad(hist)) hist = cur;
 		f_hraw     = hist;
 		float k    = mix(0.75, 2.5, smoothstep(0.05, 0.4, rough)); // (refl3: mirrors clamped tighter: no ghosts)
 		if (still_) k *= 2.0; // (refl-pro: a still camera has no parallax to ghost: the clamp only catches real changes)
-		vec3  hy   = clamp(YCoCg(hist.rgb), m1 - k * sig - 1e-4, m1 + k * sig + 1e-4);
-		hist.rgb   = max(Rgb(hy), vec3(0));
-		hist.a     = clamp(hist.a, a1 - k * asig - 0.02, a1 + k * asig + 0.02);
+		// (ds-rt-stable-1027) held: no clamp against this frame's noisy 3x3 (it moved the converged history every frame:
+		// RTFLICKER reflections 1-3.6 %, max jump ~100 %); a real change still comes in through the running mean
+		if (!hold) {
+			vec3 hy  = clamp(YCoCg(hist.rgb), m1 - k * sig - 1e-4, m1 + k * sig + 1e-4);
+			hist.rgb = max(Rgb(hy), vec3(0));
+			hist.a   = clamp(hist.a, a1 - k * asig - 0.02, a1 + k * asig + 0.02);
+		}
 		f_hclamp   = Luma(hist.rgb);
 		len        = min(meta.x + 1.0, still_ ? 64.0 : 32.0);
 		// Mirrors follow quickly (a parallax error would ghost); rough surfaces average longer.
 		float amin  = mix(0.25, 0.04, smoothstep(0.02, 0.3, rough)) * push.motion.w; // (refl3: mirrors 0.25, was 0.15)
-		float alpha = max(1.0 / len, amin);
+		float alpha = hold ? 1.0 / len : max(1.0 / len, amin);
+		// (held: a fresh sample at most 1.5x / 0.67x the history's luminance - one firefly or a hit <-> miss toggle moves
+		// a converged pixel by <= 1 % a frame)
+		if (hold && fresh) {
+			float lh = Luma(hist.rgb), lf = Luma(cur.rgb), hi_ = 1.5 * lh + 0.01, lo_ = 0.67 * lh;
+			if (lf > hi_) cur.rgb *= hi_ / max(lf, 1e-6);
+			cur.a = clamp(cur.a, hist.a - 0.25, hist.a + 0.25);
+		}
 		// (a miss this frame against a held reflection: the history fades slowly instead of popping)
 		if (fresh && cur.a < hist.a * 0.5) alpha *= 0.5;
 		// (refl9b) a sample far brighter or darker than the history: taken in more slowly (per-pixel flicker)

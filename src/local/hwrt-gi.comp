@@ -439,7 +439,9 @@ void Temporal(ivec2 pixel) {
 			// heavy-tailed GI and a relative share): noise alone stays well below 4
 			vec4  se  = sigma / sqrt(wn) + vec4(vec3(0.004) + 0.15 * hraw.rgb, 0.02);
 			vec4  dv  = abs(m1 - hraw) / se;
-			float rel = smoothstep(4.0, 8.0, max(dv.a, Luma(dv.rgb)));
+			// (ds-rt-stable-1027) still camera: only a large, real change releases (12-24 standard errors, was 4-8: noise
+			// and the jitter released converged pixels, RTFLICKER gi+ao ~8 %, max jump 145 %)
+			float rel = still ? smoothstep(12.0, 24.0, max(dv.a, Luma(dv.rgb))) : smoothstep(4.0, 8.0, max(dv.a, Luma(dv.rgb)));
 			dyn       = max(dyn, rel);
 			// a release shortens the mean (the count falls) instead of snapping to this frame's samples
 			count       = max(mix(count, 4.0, max(rel, 0.5 * dyn)), 1.0);
