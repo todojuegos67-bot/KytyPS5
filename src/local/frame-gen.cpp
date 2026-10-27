@@ -8812,8 +8812,10 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		g_cs.hw_now = true;
 		++(built ? g_cs.hw_traced : g_cs.hw_stale);
 	}
+	bool sun_ok = false; // (ds-rt-shadow 10-28: the cascade copy usable this frame)
 	if (sun_mode) {
 		const bool ok   = RtSunPrepare(m, vp, sun_slot);
+		sun_ok          = ok;
 		bool       held = false;
 		if (ok) {
 			std::lock_guard lock(g_rs.mutex);
@@ -8856,6 +8858,23 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		source = g_sun.source;
 	}
 	raw = Norm3(raw);
+	// (ds-rt-shadow 10-28) the copied cascade's own light axis is the sun when no fresher reading is there: the latch
+	// otherwise needed a new cascade draw within 2 s, and once "sun unseen for 20 s: dropped" (20261028-001843 log) it
+	// never came back: faded out, "history reset" on 630 of 630 frames, the pass never ran.
+	if (sun_ok && !fresh) {
+		std::array<double, 3> ax {};
+		{
+			std::lock_guard lock(g_rs.mutex);
+			if (!g_rs.copied.empty()) {
+				const auto& mm = g_rs.copied.front().m;
+				ax             = {mm[8], mm[9], mm[10]};
+			}
+		}
+		if (Dot3(ax, ax) > 1e-12) {
+			raw = Norm3(ax), fresh = true, source = 2;
+			if (!g_cs.latched) RtFlicker::Cause(RtFlicker::Sun, "sun latched from the cascade copy");
+		}
+	}
 
 	// The space: which reading of the axis stays put while the camera turns.
 	static const int forced_space = [] {
