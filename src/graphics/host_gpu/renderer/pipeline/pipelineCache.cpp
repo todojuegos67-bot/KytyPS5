@@ -1619,6 +1619,32 @@ void PipelineCache::EnqueueAsync(std::function<void()> work, const std::function
 	m_async_compute->cv.notify_one();
 }
 
+// KYTY_ASYNC_GRACE_MS (default 150): before skipping a dispatch whose pipeline is compiling in the
+// background, wait this long for it. Ghost of Yotei's second (realtime) cinematic: all 238
+// background compiles were driver-cache hits finished in <50 ms, yet each first dispatch was
+// skipped (compute skipped 95/222 per 10 s), so the cinematic never rendered.
+static uint32_t AsyncGraceMs() {
+	static const uint32_t ms = [] {
+		const char* v = std::getenv("KYTY_ASYNC_GRACE_MS");
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 150u;
+	}();
+	return ms;
+}
+
+// Serializes driver compiles of very large modules (KYTY_SERIAL_COMPILE_WORDS, default 400000,
+// 0 = off): two 700-800K-word compiles at once preceded the only device-lost seen.
+static std::mutex& HugeCompileMutex() {
+	static std::mutex m;
+	return m;
+}
+static uint64_t SerialCompileWords() {
+	static const uint64_t w = [] {
+		const char* v = std::getenv("KYTY_SERIAL_COMPILE_WORDS");
+		return v != nullptr ? std::strtoull(v, nullptr, 10) : 400000ull;
+	}();
+	return w;
+}
+
 PipelineCache::Pipeline*
 PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
                                      const ShaderProgram&          compute_program) {
@@ -1650,7 +1676,20 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 		}
 		if (is_pending) {
 			if (ComputeSkipAllowed()) {
-				return nullptr;
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(AsyncGraceMs());
+				while (ready == nullptr && std::chrono::steady_clock::now() < deadline) {
+					std::this_thread::sleep_for(std::chrono::microseconds(500));
+					std::lock_guard lock(async.mutex);
+					if (auto it = async.done.find(compute_program.id); it != async.done.end()) {
+						ready = std::move(it->second);
+						async.done.erase(it);
+					}
+				}
+				if (ready == nullptr) return nullptr;
+				auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(ready));
+				EXIT_IF(!inserted);
+				CheckpointDriverCache();
+				return iter->second.get();
 			}
 			// Never skip: wait for the background compile (see ComputeSkipAllowed).
 			for (;;) {
@@ -1697,10 +1736,15 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	            static_cast<unsigned long long>(id),
 	            static_cast<unsigned long long>(compute_program.spirv_words),
 	            compute_program.repeat_permutation ? ", repeat permutation" : "");
-	EnqueueAsync([this, pipeline, job, id] {
+	EnqueueAsync([this, pipeline, job, id, words = compute_program.spirv_words] {
 		const auto start = std::chrono::steady_clock::now();
 		const auto job_cache = AsyncJobCache();
-		CreateComputePipelineObject(m_graphics, **pipeline, *job, job_cache);
+		{
+			const bool serial = SerialCompileWords() != 0 && words > SerialCompileWords();
+			std::unique_lock<std::mutex> huge(HugeCompileMutex(), std::defer_lock);
+			if (serial) huge.lock();
+			CreateComputePipelineObject(m_graphics, **pipeline, *job, job_cache);
+		}
 		FinishAsyncJobCache(job_cache);
 		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		                    std::chrono::steady_clock::now() - start)
@@ -1712,7 +1756,8 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 		m_async_compute->pending.erase(id);
 		m_async_compute->done.emplace(id, std::move(*pipeline));
 	}, [this, id] { m_async_compute->pending.insert(id); });
-	return nullptr;
+	// Driver-cache hits finish in a few ms: give the job its grace before skipping the dispatch.
+	return TryGetComputePipeline(input_info, compute_program);
 }
 } // namespace Libs::Graphics
 

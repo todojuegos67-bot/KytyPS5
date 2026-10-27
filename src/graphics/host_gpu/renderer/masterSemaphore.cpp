@@ -1,6 +1,8 @@
 #include "graphics/phaseStats.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
+#include <cstdio>
+
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -56,6 +58,12 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	PhaseStats::Scope phase {PhaseStats::IsGpuThread() ? PhaseStats::GpuWait
 	                                                      : PhaseStats::GuestPhase(PhaseStats::RenderGpuWait, PhaseStats::OtherGpuWait)};
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	if (result != vk::Result::eSuccess) {
+		std::printf("MasterSemaphore: waitSemaphores(tick=%llu) failed: %s (%d)\n",
+		            static_cast<unsigned long long>(tick), vk::to_string(result).c_str(),
+		            static_cast<int>(result));
+		std::fflush(stdout);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }
