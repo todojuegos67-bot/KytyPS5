@@ -120,7 +120,8 @@ constexpr std::array PAD_DEFAULTS = {
     PadDefault {"R2", "RightTrigger"},     PadDefault {"Up", "DpadUp"},
     PadDefault {"Down", "DpadDown"},       PadDefault {"Left", "DpadLeft"},
     PadDefault {"Right", "DpadRight"},     PadDefault {"TouchPad", "Touchpad"},
-    PadDefault {"GyroToggle", "Back"},
+    // Xbox-style pads have no touchpad: Back/View is the touchpad (hold + right stick = swipe).
+    PadDefault {"TouchPad", "Back"},
 };
 
 constexpr std::string_view PAD_PREFIX = "Pad:";
@@ -370,13 +371,78 @@ void SetButton(uint32_t button, bool down) {
 	}
 }
 
-void SetTouchPad(float x, bool down) {
-	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 0, down, x, 0.5f);
+void SetSwipeTouchPad(bool down, float x, float y) {
+	// A DualSense swipe reports the finger without pressing the touchpad button.
+	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 1, down, x, y, false);
 }
 
-void SetSwipeTouchPad(bool down, float x, float y) {
-	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 1, down, x, y);
+// Always-on "hold to swipe": middle mouse or a held touchpad key (Backspace/Tab) puts finger 0
+// on the pad and relative mouse motion drags it. A key press starts as a click (button down);
+// the first motion turns it into a swipe (button released, finger stays down).
+struct HoldSwipeState {
+	bool  mouse  = false;
+	bool  key    = false;
+	bool  active = false;
+	bool  click  = false;
+	float x      = 0.5f;
+	float y      = 0.5f;
+};
+HoldSwipeState g_hold_swipe;
+
+// Relative pixels for a full pad traverse (pad is ~2:1).
+constexpr float HOLD_SWIPE_PIXELS_X = 700.0f;
+constexpr float HOLD_SWIPE_PIXELS_Y = 350.0f;
+
+void HoldSwipeBegin(float start_x, bool click) {
+	auto& h = g_hold_swipe;
+	if (h.active) {
+		return;
+	}
+	h.active = true;
+	h.click  = click;
+	h.x      = start_x;
+	h.y      = 0.5f;
+	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 0, true, h.x, h.y, click);
 }
+
+void HoldSwipeEndIfReleased() {
+	auto& h = g_hold_swipe;
+	if (!h.active || h.mouse || h.key) {
+		return;
+	}
+	// press_button=true also clears the button if this was still a click.
+	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 0, false, h.x, h.y, h.click);
+	h = {};
+}
+
+void HoldSwipeKey(float start_x, bool down) {
+	auto& h = g_hold_swipe;
+	if (down) {
+		if (h.key) {
+			return;
+		}
+		h.key = true;
+		HoldSwipeBegin(start_x, true);
+	} else {
+		h.key = false;
+		HoldSwipeEndIfReleased();
+	}
+}
+
+struct PadHoldSwipeState {
+	bool     active = false;
+	bool     click  = false;
+	int      id     = -1;
+	int      rx     = 128;
+	int      ry     = 128;
+	float    x      = 0.5f;
+	float    y      = 0.5f;
+	uint64_t last   = 0;
+};
+PadHoldSwipeState g_pad_hold_swipe;
+
+constexpr int   PAD_HOLD_SWIPE_DEADZONE = 20;
+constexpr float PAD_HOLD_SWIPE_SPEED    = 1.25f; // pad widths per second at full deflection
 
 void RecordMouseTouchPadPosition(float x, float y) {
 	int width  = 0;
@@ -459,7 +525,7 @@ void SetControl(std::size_t control, bool down) {
 
 	const auto& info = CONTROL_INFO[control];
 	if (info.button == Controller::PAD_BUTTON_TOUCH_PAD) {
-		SetTouchPad(info.touch_x, down);
+		HoldSwipeKey(info.touch_x != 0.0f ? info.touch_x : 0.5f, down);
 		return;
 	}
 	if (info.button != 0) {
@@ -504,13 +570,13 @@ void DefaultKeyboardInput(int key_code, bool down) {
 	static StickKeys right;
 
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
-		case SDLK_BACKSPACE: SetTouchPad(0.25f, down); return;
+		case SDLK_BACKSPACE: HoldSwipeKey(0.25f, down); return;
 		case SDLK_F6:
 			if (down) {
 				HostInputToggleTouchPadMode();
 			}
 			return;
-		case SDLK_TAB: SetTouchPad(0.75f, down); return;
+		case SDLK_TAB: HoldSwipeKey(0.75f, down); return;
 		case SDLK_1: CycleSettingOnPress(Controller::Setting::SpeakerVolume, down); return;
 		case SDLK_2: CycleSettingOnPress(Controller::Setting::VibrationIntensity, down); return;
 		case SDLK_3: CycleSettingOnPress(Controller::Setting::TriggerEffectIntensity, down); return;
@@ -586,7 +652,10 @@ int PollMouse(uint64_t now_ms) {
 	float delta_x = 0;
 	float delta_y = 0;
 	SDL_GetRelativeMouseState(&delta_x, &delta_y);
-	if (delta_x == 0 && delta_y == 0) {
+	if (g_hold_swipe.active) {
+		// Mouse motion is drawing on the touchpad; keep the camera still.
+		CenterMouseStick();
+	} else if (delta_x == 0 && delta_y == 0) {
 		CenterMouseStick();
 	} else {
 		MouseToJoystick(delta_x, delta_y);
@@ -642,7 +711,41 @@ void ApplyPadControl(int id, std::size_t control, std::size_t source, bool down)
 	} else if (info.button == Controller::PAD_BUTTON_TOUCH_PAD) {
 		// Real touchpads report their own finger position; other inputs emulate a click.
 		if (source != PAD_SOURCES.size() && PAD_SOURCES[source].button != SDL_GAMEPAD_BUTTON_TOUCHPAD) {
-			Controller::SetTouchPad(id, 0, down, info.touch_x != 0.0f ? info.touch_x : 0.5f, 0.5f);
+			// Hold + right stick = swipe; a press without stick motion stays a click.
+			auto& h = g_pad_hold_swipe;
+			if (down) {
+				if (h.active) {
+					return;
+				}
+				h        = {};
+				h.active = true;
+				h.click  = true;
+				h.id     = id;
+				h.x      = info.touch_x != 0.0f ? info.touch_x : 0.5f;
+				h.last   = SDL_GetTicks();
+				if (auto* pad = SDL_GetGamepadFromID(id); pad != nullptr) {
+					h.rx = Controller::controller_get_axis(SDL_JOYSTICK_AXIS_MIN, SDL_JOYSTICK_AXIS_MAX,
+					                                       SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX));
+					h.ry = Controller::controller_get_axis(SDL_JOYSTICK_AXIS_MIN, SDL_JOYSTICK_AXIS_MAX,
+					                                       SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY));
+				}
+				Controller::SetAxis(id, Controller::Axis::RightX, 128);
+				Controller::SetAxis(id, Controller::Axis::RightY, 128);
+				Controller::SetTouchPad(id, 0, true, h.x, h.y);
+				Controller::SetButton(id, Controller::PAD_BUTTON_TOUCH_PAD, true);
+			} else {
+				if (!h.active || h.id != id) {
+					return;
+				}
+				Controller::SetTouchPad(id, 0, false, h.x, h.y);
+				Controller::SetButton(id, Controller::PAD_BUTTON_TOUCH_PAD, false);
+				const int rx = h.rx;
+				const int ry = h.ry;
+				h            = {};
+				Controller::SetAxis(id, Controller::Axis::RightX, rx);
+				Controller::SetAxis(id, Controller::Axis::RightY, ry);
+			}
+			return;
 		}
 		Controller::SetButton(id, Controller::PAD_BUTTON_TOUCH_PAD, down);
 	} else if (info.button == Controller::PAD_BUTTON_L2) {
@@ -654,6 +757,36 @@ void ApplyPadControl(int id, std::size_t control, std::size_t source, bool down)
 	} else if (info.axis == Controller::Axis::AxisMax) {
 		CycleSettingOnPress(info.setting, down);
 	}
+}
+
+int PollPadHoldSwipe(uint64_t now_ms) {
+	auto& h = g_pad_hold_swipe;
+	if (!h.active) {
+		return -1;
+	}
+	const float dt =
+	    now_ms <= h.last ? 0.0f : std::min(static_cast<float>(now_ms - h.last) * 0.001f, 0.05f);
+	h.last              = now_ms;
+	const auto velocity = [](int axis) {
+		const int offset = axis - 128;
+		if (std::abs(offset) <= PAD_HOLD_SWIPE_DEADZONE) {
+			return 0.0f;
+		}
+		const int adj = offset > 0 ? offset - PAD_HOLD_SWIPE_DEADZONE : offset + PAD_HOLD_SWIPE_DEADZONE;
+		return static_cast<float>(adj) / static_cast<float>(127 - PAD_HOLD_SWIPE_DEADZONE);
+	};
+	const float vx = velocity(h.rx);
+	const float vy = velocity(h.ry);
+	if (vx != 0.0f || vy != 0.0f) {
+		if (h.click) {
+			h.click = false;
+			Controller::SetButton(h.id, Controller::PAD_BUTTON_TOUCH_PAD, false);
+		}
+		h.x = std::clamp(h.x + vx * PAD_HOLD_SWIPE_SPEED * dt, 0.0f, 1.0f);
+		h.y = std::clamp(h.y + vy * PAD_HOLD_SWIPE_SPEED * 2.0f * dt, 0.0f, 1.0f);
+		Controller::SetTouchPad(h.id, 0, true, h.x, h.y);
+	}
+	return GAMEPAD_TOUCHPAD_POLL_MS;
 }
 
 int PollGamepadTouchPad(uint64_t now_ms) {
@@ -737,6 +870,11 @@ void HostInputPadTrigger(int id, bool left, int value) {
 
 void HostInputDisconnectGamepad(int id) {
 	g_pad_trigger_pressed.erase(id);
+	if (g_pad_hold_swipe.active && g_pad_hold_swipe.id == id) {
+		Controller::SetTouchPad(id, 0, false, g_pad_hold_swipe.x, g_pad_hold_swipe.y);
+		Controller::SetButton(id, Controller::PAD_BUTTON_TOUCH_PAD, false);
+		g_pad_hold_swipe = {};
+	}
 	HostInputDisconnectGamepadTouchPad(id);
 }
 
@@ -785,6 +923,49 @@ void HostInputMouseButton(uint8_t mouse_button, bool down) {
 	if (map.Custom() && mouse_button != 0) {
 		SetControl(map.FindMouseButton(mouse_button), down);
 	}
+}
+
+void HostInputHoldSwipeMouse(bool down) {
+	auto& h = g_hold_swipe;
+	if (down) {
+		if (h.mouse) {
+			return;
+		}
+		h.mouse = true;
+		HoldSwipeBegin(0.5f, false);
+	} else {
+		h.mouse = false;
+		HoldSwipeEndIfReleased();
+	}
+}
+
+bool HostInputHoldSwipeMotion(float dx, float dy) {
+	auto& h = g_hold_swipe;
+	if (!h.active) {
+		return false;
+	}
+	if (dx == 0.0f && dy == 0.0f) {
+		return true;
+	}
+	if (h.click) {
+		// Motion while holding the key: it is a swipe, not a click.
+		h.click = false;
+		Controller::SetButton(Controller::HOST_INPUT_CONTROLLER_ID, Controller::PAD_BUTTON_TOUCH_PAD,
+		                      false);
+	}
+	h.x = std::clamp(h.x + dx / HOLD_SWIPE_PIXELS_X, 0.0f, 1.0f);
+	h.y = std::clamp(h.y + dy / HOLD_SWIPE_PIXELS_Y, 0.0f, 1.0f);
+	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 0, true, h.x, h.y, false);
+	return true;
+}
+
+bool HostInputHoldSwipeRightAxis(int id, bool horizontal, int value) {
+	auto& h = g_pad_hold_swipe;
+	if (!h.active || h.id != id) {
+		return false;
+	}
+	(horizontal ? h.rx : h.ry) = std::clamp(value, 0, 255);
+	return true;
 }
 
 void HostInputMouseTouchPad(bool down, float x, float y) {
@@ -1034,6 +1215,9 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 		const int  cursor_timeout =
 		    now_ms < g_cursor_hide_at ? static_cast<int>(g_cursor_hide_at - now_ms) : 0;
 		timeout = timeout < 0 ? cursor_timeout : std::min(timeout, cursor_timeout);
+	}
+	if (const int swipe_timeout = PollPadHoldSwipe(SDL_GetTicks()); swipe_timeout >= 0) {
+		timeout = timeout < 0 ? swipe_timeout : std::min(timeout, swipe_timeout);
 	}
 	if (const int touch_timeout = PollGamepadTouchPad(SDL_GetTicks()); touch_timeout >= 0) {
 		timeout = timeout < 0 ? touch_timeout : std::min(timeout, touch_timeout);
