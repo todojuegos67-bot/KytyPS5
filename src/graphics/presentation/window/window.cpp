@@ -95,8 +95,8 @@ struct EventMouse {
 	int    x;
 	int    y;
 	bool   motion;
-	int    motion_x;
-	int    motion_y;
+	float  motion_x;
+	float  motion_y;
 	double timestamp_seconds;
 };
 
@@ -220,7 +220,7 @@ static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
 		LOGF("Mouse wheel: time = %.04f, %s[%d, %d]\n", mb.timestamp_seconds,
 		     (mb.touch ? "touch, " : ""), mb.x, mb.y);
 	} else if (mb.motion) {
-		LOGF("Mouse motion: time = %.04f, %s%s%s%s%s%s, [%d, %d], (%d, %d)\n", mb.timestamp_seconds,
+		LOGF("Mouse motion: time = %.04f, %s%s%s%s%s%s, [%d, %d], (%f, %f)\n", mb.timestamp_seconds,
 		     (mb.left ? "left" : ""), (mb.middle ? "middle" : ""), (mb.right ? "right" : ""),
 		     (mb.x1 ? "x1" : ""), (mb.x2 ? "x2" : ""), (mb.touch ? "_touch" : ""), mb.x, mb.y,
 		     mb.motion_x, mb.motion_y);
@@ -248,11 +248,19 @@ static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
 			mouse_button = SDL_BUTTON_X2;
 		}
 
+		if (mb.middle && !mb.touch) {
+			// Middle mouse is always the touchpad finger (hold + move = swipe).
+			HostInputHoldSwipeMouse(mb.down);
+			return;
+		}
 		HostInputMouseButton(mouse_button, mb.down);
 		if (!mb.touch && mb.left) {
 			HostInputMouseTouchPad(mb.down, static_cast<float>(mb.x), static_cast<float>(mb.y));
 		}
 	} else if (mb.motion && !mb.touch) {
+		if (HostInputHoldSwipeMotion(mb.motion_x, mb.motion_y)) {
+			return;
+		}
 		if (mb.left) {
 			HostInputMouseTouchPad(true, static_cast<float>(mb.x), static_cast<float>(mb.y));
 		} else {
@@ -325,6 +333,10 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		} else if (const auto axis = ControllerAxisFromSdl(f.axis_id);
 		           axis != Controller::Axis::AxisMax) {
 			const int value = ControllerAxisValueFromSdl(f.axis_id, f.axis_value);
+			if ((f.axis_id == SDL_GAMEPAD_AXIS_RIGHTX || f.axis_id == SDL_GAMEPAD_AXIS_RIGHTY) &&
+			    HostInputHoldSwipeRightAxis(f.id, f.axis_id == SDL_GAMEPAD_AXIS_RIGHTX, value)) {
+				return;
+			}
 			if ((f.axis_id == SDL_GAMEPAD_AXIS_LEFTX || f.axis_id == SDL_GAMEPAD_AXIS_LEFTY) &&
 			    HostInputGamepadAxis(f.id, f.axis_id == SDL_GAMEPAD_AXIS_LEFTX, value)) {
 				return;
