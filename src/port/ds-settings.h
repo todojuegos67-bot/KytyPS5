@@ -128,6 +128,7 @@ struct Settings {
 	std::string pad_map;             // KYTY_PAD_MAP
 	// [Interfaz]
 	std::string metrics = "0"; // KYTY_FPS_HUD 0/1/2
+	bool        start_menu = true; // (10-27b) menu_inicio: the launcher-style menu before the game
 	bool        rumble = true;
 	float       rumble_gain = 4.0f;
 	// [Avanzado]

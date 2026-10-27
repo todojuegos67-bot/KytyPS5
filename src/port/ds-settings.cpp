@@ -194,6 +194,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("simular_vram_8gb", s->simulate_vram8);
 	boo("todos_los_ccd", s->all_ccds);
 	str("metricas", s->metrics);
+	boo("menu_inicio", s->start_menu);
 	boo("vibracion", s->rumble);
 	num("vibracion_fuerza", s->rumble_gain);
 	str("extra", s->extra);
@@ -355,6 +356,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "[Interfaz]\n"
 	  << "; Metricas en pantalla: 0 no, 1 FPS, 2 FPS + detalle\n"
 	  << "metricas=" << s.metrics << "\n"
+	  << "; Menu de inicio (como el launcher) antes del juego: 1 si, 0 arranca directo\n"
+	  << "menu_inicio=" << b(s.start_menu) << "\n"
 	  << "; Vibracion del mando (el audio haptico del DualSense como vibracion; mandos Xbox, DualSense por Bluetooth)\n"
 	  << "vibracion=" << b(s.rumble) << "\n"
 	  << "vibracion_fuerza=" << Num(s.rumble_gain) << "\n\n"

@@ -32,6 +32,10 @@ void CloseSplash();
 void RequestRestart();
 // Ends the game.
 void RequestQuit();
+// (10-27b) The launcher-style start menu, before the game (its own window, the F1 menu's pages full screen over
+// fondo-souls.jpg, with Jugar / Actualizar version / Volver a la version anterior / Salir; the static shader precompile
+// with its progress bar). `settings` gets what was chosen (saved to settings.ini). False: Salir.
+bool RunStartMenu(const Runtime& runtime, Settings* settings);
 
 } // namespace Port
 

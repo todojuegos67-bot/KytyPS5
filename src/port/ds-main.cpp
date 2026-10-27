@@ -11,6 +11,7 @@
 
 #include "port/ds-port.h"
 #include "port/ds-update.h"
+#include "port/ds-precompile.h"
 
 #include <nlohmann/json.hpp>
 
@@ -621,33 +622,7 @@ int main(int argc, char* argv[]) {
 	if (!param.title_id.empty() && version != "PPSA01341 01.007.000" && version != "PPSA01341 01.005.000")
 		std::printf("[port] untested game version %s (tested: PPSA01341 01.007.000 and 01.005.000)\n", version.c_str());
 
-	Port::LaunchPlan plan = Port::BuildLaunch(settings, param.title_id, pc);
-	for (const auto& note: plan.notes) std::printf("[port] %s\n", note.c_str());
-
-	// CPU affinity (run-windows.ps1): every CPU, or the one L3 cache's of a CPU with several (the 3D V-Cache CCD).
-	DWORD_PTR process_mask = 0, system_mask = 0;
-	GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
-	uint64_t mask = system_mask;
-	if (!settings.all_ccds) {
-		if (const uint64_t ccd = LargestL3Mask() & system_mask; ccd != 0) {
-			mask = ccd;
-			std::printf("[port] CPU: the emulator on the largest L3 cache's CPUs (0x%llX)\n", static_cast<unsigned long long>(ccd));
-		}
-	}
-	int cpus = 0;
-	for (int bit = 0; bit < 64; bit++) cpus += (mask >> bit) & 1;
-	for (auto& [key, value]: plan.env) {
-		if ((key == "KYTY_RECORDING_CPUS" || key == "KYTY_RENDER_CPUS") && value == "auto") value = PerformanceCpus(mask);
-	}
-	for (const auto& [key, value]: plan.env) SetEnv(key, value);
-	std::printf("[port] switches: %zu, vblank %d Hz\n", plan.env.size(), plan.vblank);
-	std::fflush(stdout);
-
-	if (settings.backup_saves) BackupSaves(root);
-	PrepareShaders(root, settings.game, param, mask != system_mask ? mask : 0, cpus);
-	if (mask != system_mask) SetProcessAffinityMask(GetCurrentProcess(), static_cast<DWORD_PTR>(mask));
-	SplashStatus("Iniciando...");
-
+	const auto make_runtime = [&](const Port::LaunchPlan& plan) {
 	Port::Runtime runtime;
 	runtime.exe_dir    = Utf8(root.wstring()) + "\\";
 	runtime.ini_path   = ini;
@@ -664,6 +639,70 @@ int main(int argc, char* argv[]) {
 		const fs::path rel  = game.lexically_relative(root);
 		if (!rel.empty() && rel.native()[0] != L'.') runtime.game_rel = rel;
 	}
+	return runtime;
+	};
+	// CPU affinity (run-windows.ps1): every CPU, or the one L3 cache's of a CPU with several (the 3D V-Cache CCD).
+	DWORD_PTR process_mask = 0, system_mask = 0;
+	GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
+	const auto cpu_mask = [&]() {
+		uint64_t m = system_mask;
+		if (!settings.all_ccds)
+			if (const uint64_t ccd = LargestL3Mask() & system_mask; ccd != 0) m = ccd;
+		return m;
+	};
+	uint64_t mask = cpu_mask();
+	const auto count_cpus = [](uint64_t m) {
+		int n = 0;
+		for (int bit = 0; bit < 64; bit++) n += (m >> bit) & 1;
+		return n;
+	};
+	int cpus = count_cpus(mask);
+	// (10-27b) Shaders first (the seed file, the release's hints, the prefetch inputs: splash "Preparando shaders 1/3..3/3"),
+	// then the start menu, which runs the static precompile (precompile-windows.ps1) when this GPU's cache is not current.
+	PrepareShaders(root, settings.game, param, mask != system_mask ? mask : 0, cpus);
+	{
+		Port::Precompile::Setup ps;
+		ps.root     = root;
+		ps.game     = settings.game;
+		ps.id       = param.title_id.empty() ? std::string() : param.title_id + "_" + param.version;
+		ps.seeds    = root / Wide(ps.id.empty() ? std::string("seeds.seeds") : "seeds-" + ps.id + ".seeds");
+		ps.affinity = mask != system_mask ? mask : 0;
+		ps.cpus     = cpus;
+		Port::Precompile::Configure(ps);
+		std::error_code pe;
+		if (settings.start_menu && !restarted && !ps.id.empty() && fs::exists(ps.seeds, pe)) {
+			SplashStatus("Comprobando la cache de shaders...");
+			const bool current = Port::Precompile::CacheCurrent();
+			std::printf("[port] static shader cache: %s\n", current ? "current" : "to be made (the start menu precompiles it)");
+			if (!current) Port::Precompile::Start();
+		}
+	}
+	if (settings.start_menu && !restarted) {
+		const bool play = Port::RunStartMenu(make_runtime(Port::BuildLaunch(settings, param.title_id, pc)), &settings);
+		Port::Precompile::Stop();
+		if (!play) return 0;
+		Port::SaveSettings(ini, settings);
+		ShowSplash(image);
+		SplashStatus("Iniciando...");
+		mask = cpu_mask();
+		cpus = count_cpus(mask);
+	}
+
+	Port::LaunchPlan plan = Port::BuildLaunch(settings, param.title_id, pc);
+	for (const auto& note: plan.notes) std::printf("[port] %s\n", note.c_str());
+
+	for (auto& [key, value]: plan.env) {
+		if ((key == "KYTY_RECORDING_CPUS" || key == "KYTY_RENDER_CPUS") && value == "auto") value = PerformanceCpus(mask);
+	}
+	for (const auto& [key, value]: plan.env) SetEnv(key, value);
+	std::printf("[port] switches: %zu, vblank %d Hz\n", plan.env.size(), plan.vblank);
+	std::fflush(stdout);
+
+	if (settings.backup_saves) BackupSaves(root);
+	if (mask != system_mask) SetProcessAffinityMask(GetCurrentProcess(), static_cast<DWORD_PTR>(mask));
+	SplashStatus("Iniciando...");
+
+	Port::Runtime runtime = make_runtime(plan);
 	Port::InstallMenu(runtime);
 	std::atexit(RestartIfAsked);
 	std::at_quick_exit(RestartIfAsked);

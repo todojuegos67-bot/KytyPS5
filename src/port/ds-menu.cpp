@@ -8,6 +8,7 @@
 
 #include "port/ds-port.h"
 #include "port/ds-update.h"
+#include "port/ds-precompile.h"
 
 #include "local/perf-overlay.h"
 #include "local/port-live.h"
@@ -16,6 +17,10 @@
 #include "SDL_syswm.h"
 #include "imgui.h"
 #include "imgui_internal.h" // ImGui::RegisterUserTexture (the background image)
+#if defined(_WIN32)
+#include "imgui_impl_sdl2.h"
+#include "imgui_impl_sdlrenderer2.h"
+#endif
 #include "stb_image.h"
 
 #include <algorithm>
@@ -68,6 +73,8 @@ bool                     g_first_present = true;
 bool                     g_focus_once = true;
 bool                     g_start_swallowed = false; // window thread: OPTIONS went to the menu's combo
 std::atomic<bool>        g_popup {false}; // a combo is open (Circle closes it, not the menu)
+bool                     g_start_mode = false; // (10-27b) the start menu (before the game), not F1
+int                      g_start_result = 0;   // 1 Jugar, -1 Salir
 
 void Bump() {
 	g_revision.fetch_add(1, std::memory_order_relaxed);
@@ -482,6 +489,41 @@ void RestoreWork() {
 #endif
 }
 
+void OpenRestore() {
+	std::scoped_lock lock(g_upd.mutex);
+	g_upd.backups = Update::ListBackups(PortRoot());
+	g_upd.chosen  = 0;
+	g_upd.state   = g_upd.backups.empty() ? UpdateUi::Failed : UpdateUi::Choosing;
+	g_upd.text    = g_upd.backups.empty() ? "No hay versiones anteriores guardadas" : "Elige la version a restaurar:";
+	Bump();
+}
+
+void OpenCheck() {
+	SetUpd(UpdateUi::Checking, "Buscando la ultima version en GitHub...");
+	StartWorker(CheckWork);
+}
+
+// (10-27b) The start menu's shader block: the static precompile's state, its progress bar and its button.
+void DrawShaderBlock(float unit) {
+	const auto v = Precompile::State();
+	if (v.running && v.total > 0) {
+		char label[64];
+		std::snprintf(label, sizeof(label), "%d / %d", v.done, v.total);
+		ImGui::ProgressBar(static_cast<float>(v.done) / static_cast<float>(v.total), {-1, 30 * unit}, label);
+	} else if (v.running) {
+		ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), {-1, 30 * unit}, "Preparando...");
+	}
+	ImGui::TextColored(v.failed ? kWarn : (v.finished ? kGold : kDim), "%s",
+	                   v.text.empty() ? "Shaders: la cache de esta grafica ya esta preparada." : v.text.c_str());
+	if (v.running) {
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Detener")) std::thread([] { Precompile::Stop(); }).detach();
+	} else if (!v.finished) {
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Preparar shaders")) Precompile::Start();
+	}
+}
+
 void InfoLine(const char* caption, const std::string& value, const ImVec4& color) {
 	ImGui::TextColored(kDim, "%s", caption);
 	ImGui::PushStyleColor(ImGuiCol_Text, color);
@@ -537,13 +579,10 @@ void DrawPcTab(float unit) {
 		ImGui::SetTooltip("Busca la ultima version publicada en GitHub y la instala en esta misma carpeta. Guarda los archivos del motor actuales en _backup_update (las 2 ultimas) y no toca la cache de shaders, las partidas, los seeds ni los ajustes.");
 	ImGui::SameLine();
 	if (ImGui::Button("Volver a la version anterior", {bw, bh})) {
+		OpenRestore();
 		std::scoped_lock lock(g_upd.mutex);
-		g_upd.backups = Update::ListBackups(PortRoot());
-		g_upd.chosen  = 0;
-		g_upd.state   = g_upd.backups.empty() ? UpdateUi::Failed : UpdateUi::Choosing;
-		g_upd.text    = g_upd.backups.empty() ? "No hay versiones anteriores guardadas" : "Elige la version a restaurar:";
-		state         = g_upd.state;
-		text          = g_upd.text;
+		state = g_upd.state;
+		text  = g_upd.text;
 	}
 	if (ImGui::IsItemHovered())
 		ImGui::SetTooltip("Vuelve a una version guardada en _backup_update. Antes guarda la actual (se puede deshacer). No toca la cache de shaders, las partidas, los seeds ni los ajustes.");
@@ -597,6 +636,15 @@ void Draw(float width, float height) {
 	bg->AddRectFilledMultiColor({0, 0}, {width, height}, IM_COL32(0, 0, 0, 90), IM_COL32(0, 0, 0, 90), IM_COL32(0, 0, 0, 200),
 	                            IM_COL32(0, 0, 0, 200));
 
+	// (10-27b) Balanced by construction: whatever this frame pushes is popped back to these sizes at its end; a
+	// release never shows Dear ImGui's error box.
+	auto&     io_errors = ImGui::GetIO();
+#if defined(NDEBUG)
+	io_errors.ConfigErrorRecoveryEnableTooltip = false;
+	io_errors.ConfigErrorRecoveryEnableAssert  = false;
+#endif
+	ImGuiContext& ctx = *ImGui::GetCurrentContext();
+	const int colors_before = ctx.ColorStack.Size, vars_before = ctx.StyleVarStack.Size;
 	ImFont* font = FindFont("segoeui");
 	ImGui::PushFont(font, 24.0f * unit);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {32 * unit, 24 * unit});
@@ -614,7 +662,8 @@ void Draw(float width, float height) {
 	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.55f, 0.43f, 0.22f, 1.0f});
 	ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4 {0.55f, 0.43f, 0.22f, 0.8f});
 	ImGui::PushStyleColor(ImGuiCol_NavCursor, kGold);
-	const ImVec2 size {std::min(1100 * unit, width - 32), std::min(820 * unit, height - 32)};
+	const ImVec2 size = g_start_mode ? ImVec2 {std::min(1500 * unit, width - 32), height - 48 * unit}
+	                                 : ImVec2 {std::min(1100 * unit, width - 32), std::min(820 * unit, height - 32)};
 	ImGui::SetNextWindowPos({width * 0.5f, height * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
 	ImGui::SetNextWindowSize(size, ImGuiCond_Always);
 	if (g_focus_once) {
@@ -623,7 +672,7 @@ void Draw(float width, float height) {
 	}
 	ImGui::Begin("##PortMenu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 	ImGui::PushFont(font, 40.0f * unit);
-	ImGui::TextColored(kGold, "OPCIONES");
+	ImGui::TextColored(kGold, "%s", g_start_mode ? "DEMON'S SOULS" : "OPCIONES");
 	ImGui::PopFont();
 	ImGui::SameLine();
 	ImGui::SetCursorPosX(size.x - ImGui::CalcTextSize(g_rt.game_info.c_str()).x - 32 * unit);
@@ -635,7 +684,7 @@ void Draw(float width, float height) {
 	// (10-27) The tabs are Launcher-souls.ps1's groups, in its order, with its labels and tooltips.
 	const char* tabs[kTabCount] = {"Imagen", "Frame generation", "Calidad grafica", "Ray tracing", "Modos Souls",
 	                               "Pantalla y otros", "Rendimiento / PC", "Controles", "Tu equipo"};
-	const float footer  = 150 * unit;
+	const float footer  = (g_start_mode ? 250 : 150) * unit;
 	const bool  nvidia  = g_rt.pc.nvidia;
 	if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
 		for (int t = 0; t < kTabCount; t++) {
@@ -858,6 +907,32 @@ void Draw(float width, float height) {
 
 	ImGui::SetCursorPosY(size.y - footer + 8 * unit);
 	ImGui::Separator();
+	if (g_start_mode) {
+		DrawShaderBlock(unit);
+		ImGui::TextColored(kDim, "%s", g_status.empty() ? "Los cambios se aplican al pulsar JUGAR (sin reiniciar). F1 dentro del juego: opciones en vivo." : g_status.c_str());
+		const float bw = 300 * unit, bh = 60 * unit;
+		const auto  v  = Precompile::State();
+		if (ImGui::Button(v.running && !v.playable ? "JUGAR (sin esperar)" : "JUGAR", {bw, bh})) {
+			Save();
+			g_start_result = 1;
+		}
+		if (v.running && ImGui::IsItemHovered())
+			ImGui::SetTooltip("Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez). Sin ella, el juego compila shaders al jugar (tirones).");
+		ImGui::SameLine();
+		ImGui::BeginDisabled(g_upd.busy.load());
+		if (ImGui::Button("Actualizar version", {bw, bh})) {
+			g_tab_request = 8;
+			OpenCheck();
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Volver a la version anterior", {bw, bh})) {
+			g_tab_request = 8;
+			OpenRestore();
+		}
+		ImGui::EndDisabled();
+		ImGui::SameLine();
+		if (ImGui::Button("Salir", {bw * 0.6f, bh})) g_start_result = -1;
+	} else {
 	const bool needs = NeedsRestart(g_rt.launched, s);
 	if (needs) ImGui::TextColored(kWarn, "* Hay cambios que necesitan reiniciar el juego (guarda antes en una hoguera / al salir).");
 	else ImGui::TextColored(kDim, "%s", g_status.empty() ? "* = necesita reiniciar.   Circulo / Esc: volver al juego." : g_status.c_str());
@@ -882,9 +957,11 @@ void Draw(float width, float height) {
 	}
 	ImGui::SameLine();
 	if (ImGui::Button("Salir del juego", {bw, bh})) RequestQuit();
+	}
 	ImGui::End();
-	ImGui::PopStyleColor(13);
-	ImGui::PopStyleVar(4);
+	// (11 colours and 4 variables pushed above; 13 popped before 10-27b: Dear ImGui's "PopStyleColor() too many times".)
+	if (ctx.ColorStack.Size > colors_before) ImGui::PopStyleColor(ctx.ColorStack.Size - colors_before);
+	if (ctx.StyleVarStack.Size > vars_before) ImGui::PopStyleVar(ctx.StyleVarStack.Size - vars_before);
 	ImGui::PopFont();
 	Bump(); // (redrawn while open: hover, the nav cursor)
 }
@@ -965,6 +1042,104 @@ void RequestQuit() {
 	SDL_Event quit {};
 	quit.type = SDL_QUIT;
 	SDL_PushEvent(&quit);
+}
+
+bool RunStartMenu(const Runtime& runtime, Settings* settings) {
+#if defined(_WIN32)
+	g_rt           = runtime;
+	g_saved        = *settings;
+	g_edit         = *settings;
+	g_start_mode   = true;
+	g_start_result = 0;
+	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
+		std::printf("[port] start menu: SDL failed (%s): straight to the game\n", SDL_GetError());
+		g_start_mode = false;
+		return true;
+	}
+	const Uint32 flags  = SDL_WINDOW_ALLOW_HIGHDPI | (settings->fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : SDL_WINDOW_RESIZABLE);
+	SDL_Window*  window = SDL_CreateWindow("Demon's Souls", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+	                                       settings->width > 0 ? settings->width : 1600, settings->height > 0 ? settings->height : 900, flags);
+	SDL_Renderer* renderer = window != nullptr ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : nullptr;
+	if (renderer == nullptr) {
+		std::printf("[port] start menu: no window (%s): straight to the game\n", SDL_GetError());
+		if (window != nullptr) SDL_DestroyWindow(window);
+		SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS);
+		g_start_mode = false;
+		return true;
+	}
+	WindowCreated(window); // (the icon)
+	ImGuiContext* previous = ImGui::GetCurrentContext();
+	ImGuiContext* context  = ImGui::CreateContext();
+	ImGui::SetCurrentContext(context);
+	auto& io = ImGui::GetIO();
+	io.IniFilename = nullptr;
+	io.LogFilename = nullptr;
+	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+	{
+		wchar_t windows[MAX_PATH + 1] = {};
+		GetWindowsDirectoryW(windows, MAX_PATH);
+		const auto ttf = std::filesystem::path(windows) / L"Fonts" / L"segoeui.ttf";
+		std::error_code ec;
+		if (std::filesystem::exists(ttf, ec)) io.Fonts->AddFontFromFileTTF(ttf.string().c_str());
+	}
+	ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
+	ImGui_ImplSDLRenderer2_Init(renderer);
+	g_background_tried = false;
+	g_background       = nullptr;
+	g_focus_once       = true;
+	SDL_ShowCursor(SDL_ENABLE);
+	CloseSplash();
+	while (g_start_result == 0) {
+		SDL_Event e;
+		while (SDL_PollEvent(&e) == 1) {
+			ImGui_ImplSDL2_ProcessEvent(&e);
+			if (e.type == SDL_QUIT) g_start_result = -1;
+			if (e.type == SDL_KEYDOWN && e.key.repeat == 0) {
+				if (e.key.keysym.sym == SDLK_q || e.key.keysym.sym == SDLK_PAGEUP) Queue({Input::Tab, -1});
+				if (e.key.keysym.sym == SDLK_e || e.key.keysym.sym == SDLK_PAGEDOWN) Queue({Input::Tab, +1});
+			}
+			if (e.type == SDL_CONTROLLERBUTTONDOWN) {
+				if (e.cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) Queue({Input::Tab, -1});
+				if (e.cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) Queue({Input::Tab, +1});
+			}
+		}
+		ImGui_ImplSDLRenderer2_NewFrame();
+		ImGui_ImplSDL2_NewFrame();
+		ImGui::NewFrame();
+		Draw(io.DisplaySize.x, io.DisplaySize.y);
+		ImGui::Render();
+		SDL_RenderSetScale(renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
+		SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+		SDL_RenderClear(renderer);
+		ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
+		SDL_RenderPresent(renderer);
+	}
+	if (g_start_result > 0) *settings = g_edit;
+	ImGui_ImplSDLRenderer2_Shutdown(); // (destroys the background's SDL texture too)
+	ImGui_ImplSDL2_Shutdown();
+	if (g_background != nullptr) {
+		ImGui::UnregisterUserTexture(g_background);
+		IM_DELETE(g_background);
+	}
+	ImGui::DestroyContext(context);
+	ImGui::SetCurrentContext(previous);
+	g_background       = nullptr;
+	g_background_tried = false;
+	g_start_mode       = false;
+	g_status.clear();
+	{
+		std::scoped_lock lock(g_mutex);
+		g_inputs.clear();
+	}
+	SDL_DestroyRenderer(renderer);
+	SDL_DestroyWindow(window);
+	SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS);
+	return g_start_result > 0;
+#else
+	(void)runtime;
+	(void)settings;
+	return true;
+#endif
 }
 
 } // namespace Port
