@@ -286,6 +286,11 @@ bool  Refine() { return (push.misc.w & 1024) != 0; }
 bool  BicubicHist() { return (push.misc.w & 2048) != 0; }
 bool  FreshMirror() { return (push.misc.w & 4096) != 0; }
 bool  VirtualFill() { return (push.misc.w & 8192) != 0; }
+// (rtstab2, KYTY_RT_REFLECTIONS_STABLE=1, the default) the glossy lobe samples are a fixed per-pixel blue-noise sequence,
+// not advanced by the frame: with the camera still every frame traces the same rays, so nothing changes frame to frame
+// (RTFLICKER 10-27 03:51: 1.9 % of the touched points changed > 10 % with the frame-indexed sequence); the a-trous filter
+// takes the spatial noise.
+bool  StableNoise() { return (push.misc.w & 16384) != 0; }
 // (refl10) Rays per trace pixel on glossy surfaces (yparams.z, KYTY_RT_REFLECTIONS_RPP; mirrors always one).
 int   RaysPerPixel() { return clamp(int(yparams.z + 0.5), 1, 4); }
 bool  HaveGuide() { return (push.misc.w & 256) != 0; }
@@ -881,18 +886,32 @@ bool HwMarch(vec3 P, vec3 N, vec3 R, vec3 V, out vec4 res, out float hdist) {
 	hdist    = t;
 	float far_fade = 1.0 - smoothstep(0.7, 1.0, t / max(push.params.z, 1.0));
 	// On the screen and visible there: the frame's own colour at the hit.
-	bool hidden = false;
+	// (rtstab2) Soft, not binary: the screen depth at the hit moves with the TAA jitter, so "visible" / "hidden" / "off"
+	// flipped frame to frame at every silhouette the reflected ray met - the frame's colour one frame, the grey guess the
+	// next. Now the on-screen colour weighs by how well the depths match (full within the old tolerance, nothing from 3x
+	// it) and the "hidden" darkening by how far in front the occluder is, over the same ramp.
+	float hidden  = 0.0;
+	float vis     = 0.0;
+	vec4  on_res  = vec4(0);
 	vec4 sc = HwToScreen(Hw);
 	if (sc.w > 0.5 && InScreen(sc.xy)) {
-		float sd = DepthAt(sc.xy);
-		float zs = abs(ViewZ(sd)), zh = abs(ViewZ(sc.z));
-		hidden = !IsSky(sd) && zs < zh - (0.03 * zh + 0.1); // (flick2: on the screen, behind something nearer)
-		if (!IsSky(sd) && abs(zs - zh) < 0.03 * zh + 0.1) {
+		float sd  = DepthAt(sc.xy);
+		float zs  = abs(ViewZ(sd)), zh = abs(ViewZ(sc.z));
+		float tol = 0.03 * zh + 0.1;
+		if (!IsSky(sd)) {
+			hidden = smoothstep(tol, 3.0 * tol, zh - zs); // (flick2: on the screen, behind something nearer)
+			vis    = 1.0 - smoothstep(tol, 3.0 * tol, abs(zs - zh));
+		}
+		if (vis > 0.0) {
 			vec2  edge = min(sc.xy, 1.0 - sc.xy);
 			float conf = far_fade * (0.5 + 0.5 * smoothstep(0.0, 0.05, min(edge.x, edge.y)));
 			vec3  c    = Tonemap(SafeColor(textureLod(color_tex, sc.xy, 0).rgb * GameExposure()));
-			res        = vec4(c * conf, conf);
-			return !Bad(res) && conf > 1e-3;
+			on_res     = vec4(c * conf, conf);
+			if (Bad(on_res)) on_res = vec4(0), vis = 0.0;
+			if (vis >= 1.0) {
+				res = on_res;
+				return conf > 1e-3;
+			}
 		}
 	}
 	// Off the screen or hidden: the scene's mean light on the hit triangle's normal.
@@ -972,12 +991,12 @@ bool HwMarch(vec3 P, vec3 N, vec3 R, vec3 V, out vec4 res, out float hdist) {
 	// (flick2) a hit that is on the screen but hidden behind something nearer (the character standing over the floor's
 	// reflection, a pillar): we cannot see it, so a dim grey guess at a third of the confidence - not a coloured one that
 	// toggles with the occluder's silhouette (the white halo / orange blocks around the boots and the shield)
-	if (hidden) {
-		c    = vec3(Luma(c)) * 0.8;
-		conf *= 0.35;
-	}
+	c    = mix(c, vec3(Luma(c)) * 0.8, hidden);
+	conf *= mix(1.0, 0.35, hidden);
 	res        = vec4(c * conf, conf);
-	return !Bad(res) && conf > 1e-3;
+	if (Bad(res)) res = vec4(0);
+	res        = mix(res, on_res, vis); // (rtstab2: the on-screen colour as far as the depths match)
+	return res.a > 1e-3;
 }
 #endif
 
@@ -1030,7 +1049,7 @@ void Trace(ivec2 px, bool march) {
 	int   hits = 0;
 	for (int k = 0; k < nr; ++k) {
 		if (st) Stat(4, 1);
-		float fk = f * float(nr) + float(k);
+		float fk = StableNoise() ? float(k) : f * float(nr) + float(k);
 		vec2  xi = vec2(fract(Ign(vec2(px)) + fk * 0.6180340), fract(Ign(vec2(px) + vec2(47.0, 17.0)) + fk * 0.7548777));
 		vec3  R;
 		if (s.rough < 0.02) R = reflect(-V, s.N);
@@ -1050,6 +1069,14 @@ void Trace(ivec2 px, bool march) {
 		bool marched = March(P, s.N, R, V, iters, hc, hdist);
 #ifdef KYTY_HWRT
 		if (!marched) marched = HwMarch(P, s.N, R, V, hc, hdist); // (hwrt2: the march's miss, in the scene's TLAS)
+		else if (hc.a < 0.95) {
+			// (rtstab2) A weak screen-space hit (near the march's validation limits, which the TAA jitter crosses
+			// frame to frame) is completed by the TLAS ray under it, so a lost march hands over continuously instead
+			// of switching the pixel between the frame's colour and the TLAS hit (premultiplied "over").
+			vec4  hh;
+			float hd2;
+			if (HwMarch(P, s.N, R, V, hh, hd2)) hc += hh * (1.0 - hc.a);
+		}
 #endif
 		if (!marched) {
 			// (refl10) why the rays miss (1 in 16 pixels): out of iterations / off the screen or the ray's end /
@@ -1172,6 +1199,15 @@ void Temporal(ivec2 px) {
 		vec4  pg = texelFetch(gb_prev, pp, 0);
 		float dz = abs(pg.w - g.w) / max(g.w, 1e-3);
 		valid    = dz < 0.06 && dot(pg.xyz, g.xyz) > 0.85;
+		// (rtstab2) An edge pixel whose depth the TAA jitter moves across the silhouette failed the test every other frame
+		// and restarted at 40 % confidence: the best match in the previous frame's 3x3 keeps its history instead.
+		if (!valid)
+			for (int y = -1; y <= 1 && !valid; ++y)
+				for (int x = -1; x <= 1 && !valid; ++x) {
+					ivec2 q  = clamp(pp + ivec2(x, y), ivec2(0), hi);
+					vec4  qg = texelFetch(gb_prev, q, 0);
+					if (abs(qg.w - g.w) / max(g.w, 1e-3) < 0.06 && dot(qg.xyz, g.xyz) > 0.85) valid = true, pp = q;
+				}
 		meta     = texelFetch(meta_tex, pp, 0);
 		if (Bad(meta)) valid = false;
 	}
@@ -1185,6 +1221,7 @@ void Temporal(ivec2 px) {
 		vec4  hist = BicubicHist() && rough < 0.3 ? HistoryCR(puv) : textureLod(src_b, puv, 0);
 		if (Bad(hist)) hist = cur;
 		float k    = mix(0.75, 2.5, smoothstep(0.05, 0.4, rough)); // (refl3: mirrors clamped tighter: no ghosts)
+		if ((push.misc.w & 32768) != 0) k *= 2.0; // (rtstab2: a still camera, no parallax to ghost)
 		vec3  hy   = clamp(YCoCg(hist.rgb), m1 - k * sig - 1e-4, m1 + k * sig + 1e-4);
 		hist.rgb   = max(Rgb(hy), vec3(0));
 		hist.a     = clamp(hist.a, a1 - k * asig - 0.02, a1 + k * asig + 0.02);

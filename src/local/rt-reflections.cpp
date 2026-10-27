@@ -103,6 +103,7 @@
 // the render height, 2 rays per glossy pixel. A 10 s line "RT reflections: rays:" says why rays miss.
 #include "local/local-pass-cache.h"
 #include "local/rt-reflections.h"
+#include "local/rt-flicker.h"
 
 #include "graphics/presentation/videoOut.h"
 #include "gpu_tiler_shaders/rt_reflections_spv.h"
@@ -125,6 +126,14 @@ namespace {
 
 constexpr uint32_t Bindings      = 22;
 constexpr uint32_t HeaderBytes   = 208;           // view_rot[3], clip_prev[4], up_view, fparams, mparams, gparams, xparams, yparams
+// (rtstab2) KYTY_RT_REFLECTIONS_STABLE (1; 0: the frame-indexed lobe sequence as before): rt-reflections.comp StableNoise.
+bool StableNoise() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_RT_REFLECTIONS_STABLE");
+		return !(v != nullptr && v[0] == '0');
+	}();
+	return on;
+}
 // calib[] (after the header; the shader's CALIB_* / STATS): samples, normal sums per layer x layout x space x screen
 // y convention, byte statistics, floor votes, then the cumulative stats counters (never cleared).
 constexpr uint32_t NLayouts      = 13;
@@ -1342,13 +1351,17 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.params[0] = strength, push.params[1] = EnvFloat("KYTY_RT_REFLECTIONS_THICKNESS", 0.3f, 0.01f, 4.0f);
 	push.params[2] = cfg.max_len;
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
-	push.motion[2] = cutoff, push.motion[3] = cfg.alpha;
+	// (rtstab2, KYTY_RT_REFLECTIONS_STABLE) camera still for 4+ frames: the history's weight floor a quarter of it and the
+	// neighbourhood clamp twice as wide (shader: misc.w & 32768), so the TAA jitter's sample-to-sample change averages
+	// out instead of passing through at 25 % a frame on mirrors; any camera motion restores the fast settings at once.
+	const bool cam_still = StableNoise() && RtFlicker::StillFrames() >= 4;
+	push.motion[2] = cutoff, push.motion[3] = cam_still ? cfg.alpha * 0.25f : cfg.alpha;
 	push.misc[1] = static_cast<int32_t>(g_rt.frame & 0x7fffffff);
 	push.misc[2] = level;
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0) |
 	               (g_rt.row0_up ? 16 : 0) | (cfg.checker ? 32 : 0) | (have_water ? 64 : 0) |
 	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0) | (refine ? 1024 : 0) | (bicubic ? 2048 : 0) |
-	               (fresh ? 4096 : 0) | (vfill ? 8192 : 0);
+	               (fresh ? 4096 : 0) | (vfill ? 8192 : 0) | (StableNoise() ? 16384 : 0) | (cam_still ? 32768 : 0);
 	// (combo19: guided only while the guide is there; without it the material mask, refl6, instead of water only: the
 	// guide never found in play was the whole reason nothing changed)
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
