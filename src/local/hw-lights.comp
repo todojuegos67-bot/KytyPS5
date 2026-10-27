@@ -165,6 +165,8 @@ void Trace(ivec2 pixel) {
 		if (reach) atomicAdd(stats.s[14], 1u);
 		if (facing) atomicAdd(stats.s[15], 1u);
 		if (cone) atomicAdd(stats.s[16], 1u);
+		if (W > 1e-6) atomicAdd(stats.s[17], 1u);
+		if (W / (W + lb.p0.z) >= 0.03) atomicAdd(stats.s[18], 1u);
 	}
 	if (!(W > 1e-6)) {
 		imageStore(out_img, pixel, vec4(0.0, 0.0, 0.0, 0.0));

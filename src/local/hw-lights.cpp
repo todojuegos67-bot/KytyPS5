@@ -82,6 +82,9 @@ struct {
 	uint64_t                frames = 0, frames_lit = 0, lights_sum = 0, no_tlas = 0, stale_tlas = 0;
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now(), last_guard = last_log, guard_until {};
 	bool                    said_on = false;
+	bool                    idle = false; // (ds-rt-shadow) no pixel traced in the last 1 s window: probe only
+	uint64_t                idle_frames = 0;
+	uint32_t                guard_last_w = 0;
 	uint64_t                skipped = 0;
 	const char*             skip_why = nullptr;
 	std::chrono::steady_clock::time_point last_skip_log = std::chrono::steady_clock::now();
@@ -127,7 +130,7 @@ void UpdateTracks(const std::vector<const RtLocal::LiveLight*>& in, const double
 	for (auto& t: g_tracks) t.hit = false;
 	for (uint32_t li = 0; li < in.size(); ++li) {
 		const auto* l        = in[li];
-		const float fade_out = 1.0f - std::clamp((static_cast<float>(l->age) - 60.0f) / 60.0f, 0.0f, 1.0f);
+		const float fade_out = 1.0f; // (ds-rt-shadow 10-28: the miss ramp (vis) fades a light that is no longer scanned)
 		const float fade_in  = std::clamp(static_cast<float>(l->since) / 30.0f, 0.0f, 1.0f);
 		const float fade     = fade_out * fade_in;
 		Track*      best     = match[li] >= 0 ? &g_tracks[match[li]] : nullptr;
@@ -556,6 +559,13 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		const double px = cur[0] - g_hl.guard_last[0], dk = cur[2] - g_hl.guard_last[2];
 		g_hl.guard_last = cur;
 		const double mean = px > 0 ? dk / 1024.0 / px : 0.0;
+		// (ds-rt-shadow 10-28) idle when no trace pixel had any light weight in the last second (s[8], the trace's W > 0
+		// samples): the lights cover nothing on screen; the pass then only traces every 15th frame, its color left as it
+		// is (invisible, ~0 cost), until a weight shows up again
+		const bool was_idle = g_hl.idle;
+		g_hl.idle           = cur[8] == g_hl.guard_last_w;
+		g_hl.guard_last_w   = cur[8];
+		if (was_idle != g_hl.idle) RtFlicker::Cause(RtFlicker::Lights, g_hl.idle ? "went idle (no light weight on screen)" : "woke up");
 		if (guard > 0.0f && mean > guard && now >= g_hl.guard_until) {
 			g_hl.guard_until = now + std::chrono::seconds(5);
 			std::printf("HWRTLIGHTS: guard: the screen darkened %.1f %% on average over 1 s (> %.0f %%): off for 5 s\n", 100.0 * mean,
@@ -594,10 +604,13 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		            d[4] > 0 ? 100.0 * d[12] / d[4] : 0.0, static_cast<unsigned long long>(g_track_jumps));
 		g_track_jumps = 0;
 		// (ds-rt-shadow) where the light weight is lost (1 pixel in 256 within the distance)
-		std::printf("HWRTLIGHTS: reach: of %u probed pixels %.1f %% within a light's reach, %.1f %% also facing it, %.1f %% also in its cone "
+		std::printf("HWRTLIGHTS: reach: of %u probed pixels %.1f %% within a light's reach, %.1f %% also facing it, %.1f %% also in its cone, "
+		            "%.1f %% with a weight W > 0, %.1f %% traced (share >= 3 %%); idle frames %llu "
 		            "(reach 0 with lights near: their positions are not in the depth's world; facing but no cone: the forward)\n",
 		            d[13], d[13] > 0 ? 100.0 * d[14] / d[13] : 0.0, d[13] > 0 ? 100.0 * d[15] / d[13] : 0.0,
-		            d[13] > 0 ? 100.0 * d[16] / d[13] : 0.0);
+		            d[13] > 0 ? 100.0 * d[16] / d[13] : 0.0, d[13] > 0 ? 100.0 * d[17] / d[13] : 0.0,
+		            d[13] > 0 ? 100.0 * d[18] / d[13] : 0.0, static_cast<unsigned long long>(g_hl.idle_frames));
+		g_hl.idle_frames = 0;
 		std::fflush(stdout);
 		g_hl.frames = g_hl.frames_lit = g_hl.lights_sum = g_hl.stale_tlas = g_hl.no_tlas = 0;
 		g_hl.sum_ms = g_hl.max_ms = 0.0, g_hl.samples = 0;
@@ -711,6 +724,19 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	};
 	const uint32_t tw = g_hl.trace.width, th = g_hl.trace.height;
+	if (g_hl.idle) {
+		++g_hl.idle_frames;
+		if (g_hl.frame % 15 == 0) run(0, g_hl.hist[prev], g_hl.raw, tw, th, 1.0f); // (the probe: its stats only)
+		Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+		        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
+		if (timed) {
+			command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_hl.pool, entry * 2 + 1);
+			++g_hl.written;
+		}
+		++g_hl.frame;
+		g_hl.history_valid = false;
+		return false;
+	}
 	run(0, g_hl.hist[prev], g_hl.raw, tw, th, 1.0f);
 	run(1, g_hl.raw, g_hl.hist[cur], tw, th, 1.0f);
 	run(2, g_hl.hist[cur], g_hl.tmp_a, tw, th, 1.0f);
