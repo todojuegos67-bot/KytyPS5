@@ -192,6 +192,10 @@ void SelectCapped(std::vector<const Track*>& sent, size_t cap, bool snap) {
 	sent.clear();
 	for (const Track* t: cand)
 		if (t->cap_w > 0.0f && sent.size() < MaxLights) sent.push_back(t);
+	// (ds-rt-shadow 10-28) sent in a fixed order (the track's slot), not by distance: the trace picks a light per pixel from
+	// the weights' running sum in list order, so a reordering (a light entering, two distances crossing) re-picked the light
+	// of every pixel at once and its 1-sample occlusion flipped (20261028-001843: max jump 552-567 % on cap swaps / entries)
+	std::sort(sent.begin(), sent.end(), [](const Track* a, const Track* b) { return a < b; });
 }
 
 float EnvFloat(const char* name, float fallback, float lo, float hi) {
