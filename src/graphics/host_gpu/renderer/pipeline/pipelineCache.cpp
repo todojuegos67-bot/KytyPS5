@@ -40,6 +40,8 @@
 #include <thread>
 #include <unordered_set>
 #include <cstdio>
+#include <filesystem>
+#include <vector>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -126,6 +128,51 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+}
+
+// SpirvHist: where a huge module's words go (opcode -> words), once per guest shader, and the
+// module itself in _shaderdump/ (first permutation only) for offline analysis.
+static void LogSpirvHistogram(const char* stage_name, uint64_t shader_hash, const std::vector<uint32_t>& spirv) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen;
+	{
+		std::lock_guard lock(mutex);
+		if (seen.size() >= 48u || !seen.insert(shader_hash).second) return;
+	}
+	std::unordered_map<uint32_t, std::pair<uint64_t, uint64_t>> by_op; // opcode -> (count, words)
+	uint64_t switch_targets = 0, functions = 0;
+	for (size_t i = 5; i < spirv.size();) {
+		const uint32_t n = spirv[i] >> 16u, op = spirv[i] & 0xffffu;
+		if (n == 0u) break;
+		auto& e = by_op[op];
+		e.first++;
+		e.second += n;
+		if (op == 251u /*OpSwitch*/ && n > 3u) switch_targets += (n - 3u) / 2u;
+		if (op == 54u /*OpFunction*/) functions++;
+		i += n;
+	}
+	std::vector<std::pair<uint32_t, std::pair<uint64_t, uint64_t>>> top(by_op.begin(), by_op.end());
+	std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+	std::string text;
+	for (size_t i = 0; i < std::min<size_t>(14, top.size()); ++i) {
+		char buf[64];
+		std::snprintf(buf, sizeof(buf), " op%u=%llu/%lluw", top[i].first,
+		              static_cast<unsigned long long>(top[i].second.first),
+		              static_cast<unsigned long long>(top[i].second.second));
+		text += buf;
+	}
+	std::printf("SpirvHist: %s hash=0x%016" PRIx64 " words=%zu functions=%llu switch_targets=%llu:%s\n", stage_name,
+	            shader_hash, spirv.size(), static_cast<unsigned long long>(functions),
+	            static_cast<unsigned long long>(switch_targets), text.c_str());
+	std::fflush(stdout);
+	std::error_code ec;
+	std::filesystem::create_directories("_shaderdump", ec);
+	char name[96];
+	std::snprintf(name, sizeof(name), "_shaderdump/%s_%016" PRIx64 "_%zu.spv", stage_name, shader_hash, spirv.size());
+	if (FILE* f = std::fopen(name, "wb")) {
+		std::fwrite(spirv.data(), 4, spirv.size(), f);
+		std::fclose(f);
+	}
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -381,6 +428,7 @@ struct PipelineCache::ProgramCache {
 			std::printf("SpirvSize: cs hash=0x%016" PRIx64 " words=%zu\n", options.shader_hash, result.spirv.size());
 			std::fflush(stdout);
 		}
+		if (result.spirv.size() >= 150000u) LogSpirvHistogram(stage_name, options.shader_hash, result.spirv);
 		const SpirvKey spirv_key = HashSpirv(result.spirv);
 		if (const auto found = spirv_modules.find(spirv_key); found != spirv_modules.end()) {
 			if (options.dump_ir) {

@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
+#include <cstdlib>
 #include <cstdio>
 #include <atomic>
 #include <algorithm>
@@ -742,6 +743,81 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 			            static_cast<unsigned long long>(state.program.shader_hash), mem.resource,
 			            image.indirect_resources.size(), runs.size(), mipped, dims, formats, slots);
 			std::fflush(stdout);
+		}
+	}
+	// Shape grouping (Ghost of Yotei: 272 candidates in 85 runs, 84 breaks by format/swizzle/
+	// class, so every access was copied 85 times). The access needs only the candidate's shape;
+	// the slot is an absolute index into the kind's descriptor array, picked per ordinal. Used
+	// ONLY when it merges cases: every other shader keeps the per-run emission byte for byte, so
+	// its SPIR-V (and the prewarm seed / driver cache entries) stay valid. KYTY_IMAGE_SHAPES=0: off.
+	static const bool shape_groups = [] {
+		const char* v = std::getenv("KYTY_IMAGE_SHAPES");
+		return v == nullptr || v[0] != '0';
+	}();
+	if (shape_groups && runs.size() >= 2u) {
+		const uint32_t count = static_cast<uint32_t>(image.indirect_resources.size());
+		const auto same_shape = [&](const IR::ImageResource& a, const IR::ImageResource& b) {
+			return a.dimension == b.dimension && a.cube == b.cube &&
+			       IR::DescriptorBindingForImage(a) == IR::DescriptorBindingForImage(b) &&
+			       a.shader_swizzle == b.shader_swizzle && a.conversion_format == b.conversion_format &&
+			       a.numeric_class == b.numeric_class && a.mip_count == 1u && b.mip_count == 1u;
+		};
+		std::vector<uint32_t> group_first; // resource of each group's first member
+		std::vector<uint32_t> group_members;
+		std::vector<uint32_t> group_of(count);
+		for (uint32_t ordinal = 0; ordinal < count; ++ordinal) {
+			const auto resource = image.indirect_resources[ordinal];
+			const auto& candidate = state.program.info.images[resource];
+			uint32_t found = UINT32_MAX;
+			for (uint32_t g = 0; g < group_first.size(); ++g) {
+				if (same_shape(state.program.info.images[group_first[g]], candidate)) {
+					found = g;
+					break;
+				}
+			}
+			if (found == UINT32_MAX) {
+				found = static_cast<uint32_t>(group_first.size());
+				group_first.push_back(resource);
+				group_members.push_back(0u);
+			}
+			++group_members[found];
+			group_of[ordinal] = found;
+		}
+		if (group_first.size() < runs.size()) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
+				std::printf("SpirvShrink: hash=0x%016llx image %u: %u candidates, %zu runs -> %zu shape cases\n",
+				            static_cast<unsigned long long>(state.program.shader_hash), mem.resource, count,
+				            runs.size(), group_first.size());
+				std::fflush(stdout);
+			}
+			const auto select_chain = [&](auto&& value_of) {
+				auto result = ConstantU32(state, value_of(0u));
+				for (uint32_t ordinal = 1; ordinal < count; ++ordinal) {
+					if (value_of(ordinal) == value_of(ordinal - 1u)) continue;
+					const auto at_or_after = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state),
+					                                selected, ConstantU32(state, ordinal));
+					const auto next = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpSelect, TypeU32(state), next, at_or_after,
+					                          ConstantU32(state, value_of(ordinal)), result);
+					result = next;
+				}
+				return result;
+			};
+			uint32_t slot = 0;
+			if (std::ranges::any_of(group_members, [](uint32_t m) { return m > 1u; })) {
+				const auto delta = select_chain([&](uint32_t ordinal) {
+					return state.program.info.images[image.indirect_resources[ordinal]].descriptor_index - ordinal;
+				});
+				slot = Binary(state, spv::OpIAdd, TypeU32(state), selected, delta);
+			}
+			const auto EmitGroup = [&](uint32_t index) {
+				return emit(group_first[index], group_members[index] == 1u ? 0u : slot);
+			};
+			if (group_first.size() == 1u) return EmitGroup(0u);
+			const auto group_index = select_chain([&](uint32_t ordinal) { return group_of[ordinal]; });
+			return EmitIndexSwitch(state, group_index, static_cast<uint32_t>(group_first.size()),
+			                       result_type, EmitGroup);
 		}
 	}
 	const auto EmitRun = [&](uint32_t index) {
