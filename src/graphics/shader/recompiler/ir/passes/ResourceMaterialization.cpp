@@ -1703,9 +1703,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	// permutation per stride (buf2 stride 8/0x144/0x118...), 158 differing words = the stride
 	// constant, each a ~20 s driver compile, so the realtime cinematic skipped every run.
 	// Zero stride stays specialized (different addressing). KYTY_RUNTIME_PLAIN_STRIDE=0: off.
+	// Default OFF since 6e6deb0: the only two device-lost crashes in all Yotei logs (170853,
+	// 180952) are both in builds with this on (0 of ~25 runs before it). KYTY_RUNTIME_PLAIN_STRIDE=1: on.
 	static const bool plain_stride_enabled = [] {
 		const char* v = std::getenv("KYTY_RUNTIME_PLAIN_STRIDE");
-		return v == nullptr || v[0] != '0';
+		return v != nullptr && v[0] == '1';
 	}();
 	if (plain_stride_enabled && program.info.uses_flattened_srt) {
 		for (uint32_t index = 0; index < program.info.buffers.size() && index < specialization.buffers.size(); ++index) {

@@ -488,7 +488,7 @@ struct PipelineCache::ProgramCache {
 		static std::mutex                             logged_mutex;
 		{
 			std::lock_guard lock(logged_mutex);
-			if (logged[hash]++ >= 6) return;
+			if (logged[hash]++ >= 24) return;
 		}
 		const auto& now = entry.specialization;
 		std::string why = source_changed ? "source_changed" : "";
@@ -1619,14 +1619,14 @@ void PipelineCache::EnqueueAsync(std::function<void()> work, const std::function
 	m_async_compute->cv.notify_one();
 }
 
-// KYTY_ASYNC_GRACE_MS (default 150): before skipping a dispatch whose pipeline is compiling in the
+// KYTY_ASYNC_GRACE_MS (default 20; cache hits finish in 0-5 ms, longer waits stall the game timeline/audio): before skipping a dispatch whose pipeline is compiling in the
 // background, wait this long for it. Ghost of Yotei's second (realtime) cinematic: all 238
 // background compiles were driver-cache hits finished in <50 ms, yet each first dispatch was
 // skipped (compute skipped 95/222 per 10 s), so the cinematic never rendered.
 static uint32_t AsyncGraceMs() {
 	static const uint32_t ms = [] {
 		const char* v = std::getenv("KYTY_ASYNC_GRACE_MS");
-		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 150u;
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 20u;
 	}();
 	return ms;
 }
