@@ -94,6 +94,16 @@ struct {
 	bool                    sun_seen = false;
 	float                   sun_held = 0.0f;
 	uint32_t                feeds = 0, stale = 0;
+	// (vol-1027 flicker self-check, 10 s: new feeds, frames between them, the weight's range and steps, the direction's
+	// largest step, switches between the TLAS-shadowed and the depth-only march, the cause counters of missed feeds)
+	uint64_t                feed_seen = 0;
+	uint32_t                w_flips = 0;
+	float                   w_dprev = 0.0f;
+	uint32_t                fresh_frames = 0, gap_frames = 0, gap_run = 0, gap_max = 0, path_switches = 0, path_rt = 0;
+	float                   w_min = 2.0f, w_max = -1.0f, w_step = 0.0f, dir_step = 0.0f, w_prev = -1.0f;
+	std::array<float, 3>    dir_prev {};
+	int                     path_prev = -1;
+	std::array<uint32_t, 4> miss {};
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now(), last_frame {};
 } g_gr;
 
@@ -102,6 +112,8 @@ struct {
 	std::array<float, 3>                  dir {};
 	float                                 weight = 0.0f;
 	std::chrono::steady_clock::time_point when {};
+	uint64_t                              seq = 0;
+	std::array<uint32_t, 4>               miss {};
 } g_gr_sun;
 
 float EnvFloat(const char* name, float fallback, float lo, float hi) {
@@ -339,6 +351,27 @@ void Log(int level, bool have_sun) {
 	            static_cast<double>(g_gr.sun_dir[2]), g_gr.feeds, d[0], g_gr.stale, static_cast<double>(open),
 	            HalosOn() ? "on (KYTY_GODRAYS_HALOS=1)" : "off");
 	g_gr.feeds = g_gr.stale = 0;
+	{
+		// (vol-1027) the flicker self-check: on a still camera every number but "new feeds" should be ~0. A gap means the
+		// RT sun-shadow pass did not give the sun on those frames (the cause counters say why); a weight that keeps turning
+		// around is the fog pumping; path switches pop between the TLAS and depth marches.
+		g_gr.gap_max = std::max(g_gr.gap_max, g_gr.gap_run);
+		const bool  jump  = g_gr.w_flips > 4 || g_gr.path_switches > 2;
+		const char* cause = !g_gr.sun_seen           ? "no sun yet (RT sun shadows off or not latched)"
+		                    : g_gr.path_switches > 2 ? "the TLAS / depth march switched"
+		                    : g_gr.w_flips > 4       ? "the sun weight pumped (the feed came in bursts)"
+		                    : g_gr.gap_max > 30      ? "feed gaps (held: no visible change)"
+		                                             : "none";
+		std::printf("GODRAYS: flicker self-check %s (cause: %s): new sun feeds %u of %u frames, gaps %u (longest %u frames; not latched %u; "
+		            "sun-shadow gates fed through: RT sun cascades %u, no TLAS %u, pass images %u), weight %.3f-%.3f max step %.4f a frame, "
+		            "turned around %u times, view direction max step %.3f deg (camera turns too), TLAS-shadowed march %u frames, path switches %u\n",
+		            jump ? "JUMP" : "ok", cause, g_gr.fresh_frames, d[0], g_gr.gap_frames, g_gr.gap_max, g_gr.miss[0], g_gr.miss[1],
+		            g_gr.miss[2], g_gr.miss[3], static_cast<double>(g_gr.w_min > 1.5f ? 0.0f : g_gr.w_min),
+		            static_cast<double>(std::max(g_gr.w_max, 0.0f)), static_cast<double>(g_gr.w_step), g_gr.w_flips, static_cast<double>(g_gr.dir_step),
+		            g_gr.path_rt, g_gr.path_switches);
+		g_gr.fresh_frames = g_gr.gap_frames = g_gr.gap_run = g_gr.gap_max = g_gr.path_switches = g_gr.path_rt = 0;
+		g_gr.w_min = 2.0f, g_gr.w_max = -1.0f, g_gr.w_step = g_gr.dir_step = 0.0f, g_gr.miss = {}, g_gr.w_flips = 0;
+	}
 	std::printf("GODRAYS: stats (level %d) GPU %.3f ms (max %.3f), sun %s (on screen %.0f %% of frames), lights %.2f a frame\n", level,
 	            g_gr.samples > 0 ? g_gr.sum_ms / g_gr.samples : 0.0, g_gr.max_ms,
 	            !have_sun ? "unknown (needs KYTY_RT_SHADOWS)" : g_gr.on_screen > 0.5f ? "on screen" : "off screen", 100.0 * d[2] / fr,
@@ -364,6 +397,25 @@ void GodraysSetSun(const std::array<double, 3>& view_dir, float weight) {
 	g_gr_sun.dir    = {static_cast<float>(view_dir[0]), static_cast<float>(view_dir[1]), static_cast<float>(view_dir[2])};
 	g_gr_sun.weight = std::isfinite(weight) ? std::clamp(weight, 0.0f, 1.0f) : 0.0f;
 	g_gr_sun.when   = std::chrono::steady_clock::now();
+	++g_gr_sun.seq;
+}
+
+void GodraysNoteSunMiss(int cause) {
+	if (!GodraysWanted() || cause < 0 || cause > 3) return;
+	std::lock_guard lock(g_gr_sun.mutex);
+	++g_gr_sun.miss[cause];
+}
+
+std::string GodraysDescribe() {
+	if (!GodraysWanted()) return "null";
+	char b[512];
+	std::snprintf(b, sizeof(b),
+	              "{\"level\": %d, \"sun_seen\": %s, \"sun_dir_view\": [%g, %g, %g], \"sun_weight_held\": %g, \"on_screen\": %g, "
+	              "\"tlas_march\": %s, \"history_valid\": %s, \"frames_since_feed\": %u}",
+	              GodraysLevel(), g_gr.sun_seen ? "true" : "false", static_cast<double>(g_gr.sun_dir[0]), static_cast<double>(g_gr.sun_dir[1]),
+	              static_cast<double>(g_gr.sun_dir[2]), static_cast<double>(g_gr.sun_held), static_cast<double>(g_gr.on_screen),
+	              g_gr.path_prev == 1 ? "true" : "false", g_gr.history_valid ? "true" : "false", g_gr.gap_run);
+	return b;
 }
 
 bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
@@ -432,11 +484,34 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			}
 			if (fresh) target = g_gr_sun.weight, ++g_gr.feeds;
 			else if (g_gr.sun_seen) ++g_gr.stale;
+			// (self-check: was there a new feed since the last frame of this pass?)
+			if (g_gr_sun.seq != g_gr.feed_seen) {
+				g_gr.feed_seen = g_gr_sun.seq, ++g_gr.fresh_frames;
+				g_gr.gap_max = std::max(g_gr.gap_max, g_gr.gap_run), g_gr.gap_run = 0;
+			} else if (g_gr.sun_seen) {
+				++g_gr.gap_frames, ++g_gr.gap_run;
+			}
+			for (int i = 0; i < 4; ++i) g_gr.miss[i] += g_gr_sun.miss[i], g_gr_sun.miss[i] = 0;
 		}
 		g_gr.sun_held = std::clamp(g_gr.sun_held + std::clamp(target - g_gr.sun_held, -dt / 1.2f, dt / 0.6f), 0.0f, 1.0f);
 	}
 	const std::array<float, 3> sun   = g_gr.sun_dir;
 	const float                sun_w = g_gr.sun_seen ? g_gr.sun_held : 0.0f;
+	if (g_gr.sun_seen) {
+		g_gr.w_min = std::min(g_gr.w_min, sun_w), g_gr.w_max = std::max(g_gr.w_max, sun_w);
+		if (g_gr.w_prev >= 0.0f) {
+			const float dw = sun_w - g_gr.w_prev;
+			g_gr.w_step    = std::max(g_gr.w_step, std::abs(dw));
+			// (a pumping weight: the change turns around; the feed in bursts did this every few frames)
+			if (std::abs(dw) > 0.002f) {
+				if (g_gr.w_dprev != 0.0f && (dw > 0.0f) != (g_gr.w_dprev > 0.0f)) ++g_gr.w_flips;
+				g_gr.w_dprev = dw;
+			}
+			const float c = std::clamp(sun[0] * g_gr.dir_prev[0] + sun[1] * g_gr.dir_prev[1] + sun[2] * g_gr.dir_prev[2], -1.0f, 1.0f);
+			g_gr.dir_step = std::max(g_gr.dir_step, std::acos(c) * 57.29578f);
+		}
+		g_gr.w_prev = sun_w, g_gr.dir_prev = sun;
+	}
 	const bool                 have_sun = g_gr.sun_seen;
 	// (a gap of more than 0.25 s: menus, loading, frames without the pass: the history is stale, restart it)
 	if (g_gr.last_frame.time_since_epoch().count() != 0 && now - g_gr.last_frame > std::chrono::milliseconds(250))
@@ -500,8 +575,13 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.extra[3] = level <= 2 ? 1.0f : 0.0f; // (the visibility boost)
 
 	// (KYTY_HWRT_VOLSHADOW, volshadow.cpp: the view-ray march's TLAS visibility on this quarter grid; null when off)
-	const vk::ImageView rt_vis = steps > 0 ? VolShadowRun(command, inputs, g_gr.qextent, sun, sun_fade, row0_up) : nullptr;
+	const vk::ImageView rt_vis = steps > 0 && have_sun ? VolShadowRun(command, inputs, g_gr.qextent, sun, sun_fade, row0_up) : nullptr;
 	if (rt_vis != nullptr) push.misc[2] |= 4;
+	{
+		const int path = rt_vis != nullptr ? 1 : 0;
+		if (g_gr.path_prev >= 0 && path != g_gr.path_prev) ++g_gr.path_switches;
+		g_gr.path_prev = path, g_gr.path_rt += static_cast<uint32_t>(path);
+	}
 
 	const auto entry = static_cast<uint32_t>(g_gr.written % 8);
 	const bool timed = g_gr.pool != nullptr && g_gr.written < g_gr.read + 8;

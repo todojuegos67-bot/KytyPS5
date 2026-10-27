@@ -8779,7 +8779,14 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	Rows3 view {};
 	if (!CShadowView(m, vp, view)) return said_once("the camera matrix is degenerate"), false;
-	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality)) return said_once("could not create its pipeline or images"), false;
+	// (vol-1027) The volumetric light's sun, every frame this pass is reached, before its per-frame gates (the RT sun's
+	// cascades not copied this frame, no TLAS yet, ...) and without this pass's own shadow fade: those gave the sun to
+	// godrays only on some frames and dipped its weight on every re-latch, so the fog jumped with both on. The latched
+	// axis (last frame's while this frame's is decided) and the overcast factor only; dropped only when the latch is.
+	if (g_cs.latched) GodraysSetSun(ToView(view, g_cs.latch_axis), static_cast<float>(g_cs.sun_factor));
+	else GodraysNoteSunMiss(0);
+	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality))
+		return GodraysNoteSunMiss(3), said_once("could not create its pipeline or images"), false;
 	// (KYTY_RT_SUN: the cascades copied lately, their matrices into this frame's slot of the buffer; else nothing yet)
 	const bool sun_mode = RtSunLevel() > 0;
 	const uint32_t sun_slot = g_cs.frame % 4;
@@ -8793,7 +8800,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		if (hw_tlas == nullptr || !g_cs.hw_seen) {
 			// (the pipeline's layout has the binding: no TLAS yet, no pass)
 			++g_cs.hw_none;
-			return said_once("KYTY_HWRT_SHADOW: no scene TLAS built yet"), false;
+			return GodraysNoteSunMiss(2), said_once("KYTY_HWRT_SHADOW: no scene TLAS built yet"), false;
 		}
 		g_cs.hw_now = true;
 		++(built ? g_cs.hw_traced : g_cs.hw_stale);
@@ -8807,7 +8814,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 		SoftSun::NoteFrame(ok, held);
 		// (ds-rt-shadow) a refused frame ends the history: the next run must not blend a visibility many frames old
-		if (!ok) return g_cs.history_valid = false, said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
+		if (!ok) return g_cs.history_valid = false, GodraysNoteSunMiss(1), said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
 		// (ds-rt-shadow) a usable copy is the game's sun still there: the latch does not age out (20 s) on a still camera that
 		// gives no new cascade draws, which faded the RT sun out and the game's shadow back in
 		if (g_cs.latched && !g_cs.switching) g_cs.last_fresh = std::chrono::steady_clock::now();
@@ -9050,7 +9057,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	const auto l_view = ToView(view, g_cs.latch_axis);
 	ShineSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor)); // (KYTY_SHINE: shine.cpp)
-	GodraysSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor)); // (KYTY_GODRAYS: godrays.cpp)
+	// (KYTY_GODRAYS: fed above, before the gates: vol-1027)
 	push.extra[1] = static_cast<float>(l_view[0]), push.extra[2] = static_cast<float>(l_view[1]), push.extra[3] = static_cast<float>(l_view[2]);
 	push.trace[2] = strength * g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade) * static_cast<float>(g_cs.sun_factor); // (smoothstep fade; overcast)
 	push.tune[0]  = g_cs.log_k >= 0.0 ? static_cast<float>(1.0 / std::max(std::exp2(g_cs.log_k), 1.25)) : 0.0f;
