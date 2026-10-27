@@ -63,7 +63,14 @@ uint32_t BuildTrisPerFrame() { static const uint32_t v = std::max(1000u, EnvU32(
 uint32_t KeepFrames() { static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT_KEEP", 600)); return v; }
 // KYTY_HWRT_DEBUG=1: instance colours shaded by distance in place of the TAA's output; 2: blended 50 %. Add 4: y flipped.
 uint32_t RefitInterval() { static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT_REFIT_EVERY", 4)); return v; }
-uint32_t RefitsPerFrame() { static const uint32_t v = EnvU32("KYTY_HWRT_REFITS", 64); return v; }
+// (rtstab) KYTY_HWRT_REFITS (192): refits a frame at most, oldest positions first (the 64 cap was hit every frame with
+// 800-1450 dynamic meshes: positions 14-23 frames old, some never refreshed).
+uint32_t RefitsPerFrame() { static const uint32_t v = EnvU32("KYTY_HWRT_REFITS", 192); return v; }
+// (rtstab) KYTY_HWRT_STALE (16): a dynamic mesh whose positions are at most this many frames old keeps mask 0x02
+// ("current"), whatever frame it was last captured; older: 0x04. KYTY_HWRT_DYN_VOTES (2): compares in a row that must see
+// it move before a static mesh becomes dynamic.
+uint32_t StaleFrames() { static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT_STALE", 16)); return v; }
+uint32_t DynVotes() { static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT_DYN_VOTES", 2)); return v; }
 uint32_t DebugMode() { static const uint32_t v = EnvU32("KYTY_HWRT_DEBUG", 0); return v; }
 // (hwrt3) KYTY_HWRT_MATERIAL_COPIES (16): base-colour textures copied into the albedo array per frame at most.
 uint32_t CopiesPerFrame() { static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT_MATERIAL_COPIES", 16)); return v; }
@@ -134,6 +141,9 @@ struct Entry {
 	bool     built = false, dynamic = false, updatable = false;
 	uint64_t last_seen = 0, next_check = 0, capture_frame = UINT64_MAX;
 	uint32_t built_count = 0;
+	uint64_t write_frame = 0; // (rtstab) the frame its vertices were last written (build or refit)
+	uint32_t dyn_votes = 0;   // (rtstab) compares in a row that saw it move
+	uint8_t  last_mask = 0;   // (rtstab) its TLAS mask last frame
 	// (hwrt3, material) the texcoord's selection in the record (0: none; else location + 1 | c0 << 8 | c1 << 10), whether
 	// the BLAS vertices carry it (written by a gather with it), the albedo array layer and the texture it holds
 	uint32_t uv_sel = 0;
@@ -238,6 +248,11 @@ struct State {
 	uint64_t evicted = 0, captured_vertices = 0, tlas_instances_sum = 0, patched = 0, patch_failed = 0;
 	double   build_ms = 0.0, cpu_note_ms = 0.0, cpu_after_ms = 0.0, gpu_ms_max = 0.0;
 	uint32_t timed = 0;
+	// (rtstab) per-frame TLAS stability: the previous frame's instances (id -> BLAS address), and the 10 s sums.
+	std::unordered_map<uint32_t, vk::DeviceAddress> prev_instances;
+	uint64_t st_frames = 0, st_added = 0, st_removed = 0, st_blas_swaps = 0, st_mask_flips = 0, st_dyn = 0, st_age_sum = 0;
+	uint64_t st_stale = 0, st_votes_rejected = 0, st_refit_starved = 0;
+	uint32_t st_add_max = 0, st_rem_max = 0, st_age_max = 0;
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 } g;
 // (KYTY_HWRT_LIGHTS) the G-buffer camera of the last frame that had one (row-major, clip = M * world).
@@ -1023,6 +1038,22 @@ void MaybeLog() {
 		            static_cast<double>(g.mat_instances) / frames);
 		g.mat_meshes = g.mat_none = g.mat_srgb = g.mat_copies = g.mat_copy_dropped = g.mat_instances = 0;
 	}
+	{
+		const double sf = static_cast<double>(std::max<uint64_t>(g.st_frames, 1));
+		std::printf("HWRTSTAB: 10 s: %llu TLAS frames, instances added %.2f/frame (max %u), removed %.2f/frame (max %u), BLAS swaps "
+		            "of kept instances %.2f/frame, mask flips %.2f/frame; dynamic %.0f/frame, position age %.1f avg %u max frames (older "
+		            "than %u: %.1f/frame); static->dynamic votes rejected %llu; refits deferred by the cap %llu; TLAS frame = shaded "
+		            "frame (built at the frame's own TAA hook)\n",
+		            static_cast<unsigned long long>(g.st_frames), static_cast<double>(g.st_added) / sf, g.st_add_max,
+		            static_cast<double>(g.st_removed) / sf, g.st_rem_max, static_cast<double>(g.st_blas_swaps) / sf,
+		            static_cast<double>(g.st_mask_flips) / sf, static_cast<double>(g.st_dyn) / sf,
+		            g.st_dyn > 0 ? static_cast<double>(g.st_age_sum) / static_cast<double>(g.st_dyn) : 0.0, g.st_age_max, StaleFrames(),
+		            static_cast<double>(g.st_stale) / sf, static_cast<unsigned long long>(g.st_votes_rejected),
+		            static_cast<unsigned long long>(g.st_refit_starved));
+		g.st_frames = g.st_added = g.st_removed = g.st_blas_swaps = g.st_mask_flips = g.st_dyn = g.st_age_sum = 0;
+		g.st_stale = g.st_votes_rejected = g.st_refit_starved = 0;
+		g.st_add_max = g.st_rem_max = g.st_age_max = 0;
+	}
 	std::fflush(stdout);
 	g.draws_seen = g.draws_captured = g.draws_reused = g.frames = g.frames_no_camera = 0;
 	std::fill(std::begin(g.skips), std::end(g.skips), 0);
@@ -1615,10 +1646,17 @@ bool Note(uint32_t record, const Draw& d) {
 		++g.builds;
 		g.build_tris += e.tris;
 		job.build = true;
-	} else if (e.dynamic && ((g.frame + e.id) % RefitInterval()) == 0 && g.refits_frame < RefitsPerFrame()) {
-		// (A moving mesh: refit every KYTY_HWRT_REFIT_EVERY frames (4), at most KYTY_HWRT_REFITS (64) a frame.)
+	} else if (e.dynamic && g.frame >= e.write_frame + RefitInterval() && g.refits_frame < RefitsPerFrame()) {
+		// (A moving mesh: refit when its positions are KYTY_HWRT_REFIT_EVERY frames (4) old, at most KYTY_HWRT_REFITS a
+		// frame. (rtstab) By age, not (frame + id) % 4: a mesh the cap skipped is refit the next frame it is drawn instead
+		// of waiting for its residue again - before, the same meshes lost every time and kept stale positions.)
 		job.refit = true;
 		++g.refits_frame;
+	} else if (e.dynamic && g.frame >= e.write_frame + RefitInterval()) {
+		++g.st_refit_starved; // (falls through: no compare for a dynamic mesh)
+		++g.draws_reused;
+		g.cpu_note_ms += Ms(start);
+		return false;
 	} else if (g.frame >= e.next_check && g.checks < MaxChecks) {
 		job.mode   = Mode::Compare;
 		job.result = g.checks++;
@@ -1644,6 +1682,7 @@ bool Note(uint32_t record, const Draw& d) {
 	job.src       = g.captured;
 	g.captured += need;
 	e.capture_frame = g.frame;
+	if (job.mode == Mode::Write && (job.build || job.refit)) e.write_frame = g.frame;
 	g.jobs.push_back(job);
 	++g.draws_captured;
 	g.cpu_note_ms += Ms(start);
@@ -1765,9 +1804,21 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 		if (found == g.entries.end()) continue;
 		float delta = 0.0f;
 		std::memcpy(&delta, static_cast<const uint32_t*>(g.results[(slot + 1) % Slots].mapped) + index, 4);
-		if (delta > 1.0f && !found->second.dynamic) {
-			found->second.dynamic = true;
-			++g.became_dynamic;
+		auto& fe = found->second;
+		if (fe.dynamic) continue;
+		// (rtstab) Hysteresis: DynVotes() compares in a row must see it move; one still compare clears the votes. A single
+		// noisy compare used to flip a static mesh to dynamic for good: out of the static-only reflection rays, rebuilt,
+		// then refit at the starved rate.
+		if (delta > 1.0f) {
+			if (++fe.dyn_votes >= DynVotes()) {
+				fe.dynamic = true;
+				++g.became_dynamic;
+			} else {
+				fe.next_check = g.frame + 8; // (confirm soon)
+			}
+		} else {
+			if (fe.dyn_votes > 0) ++g.st_votes_rejected;
+			fe.dyn_votes = 0;
 		}
 	}
 	g.check_keys[(slot + 1) % Slots].clear();
@@ -1938,21 +1989,54 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 		auto* instances = static_cast<VkAccelerationStructureInstanceKHR*>(g.instances[slot].mapped);
 		auto* materials = static_cast<uint32_t*>(g.materials[slot].mapped);
 		auto* albedo    = g.material ? static_cast<uint32_t*>(g.albedo_words[slot].mapped) : nullptr; // (hwrt3)
+		// (rtstab) Eviction first (never a mesh seen within KeepFrames(): those are in this TLAS), then the instances in id
+		// order, so an instance keeps its index (InstanceId, the materials' slot) from frame to frame while the set holds:
+		// the unordered map's order moved with every insert and rehash.
+		static std::vector<Entry*> order;
+		order.clear();
 		for (auto it = g.entries.begin(); it != g.entries.end();) {
 			auto& e = it->second;
-			if (e.last_seen + uint64_t {KeepFrames()} * 4 < g.frame) {
+			if (e.last_seen + uint64_t {KeepFrames()} * 4 < g.frame && e.last_seen + KeepFrames() < g.frame) {
 				Bury(e);
 				++g.evicted;
 				it = g.entries.erase(it);
 				continue;
 			}
-			if (e.built && e.blas_address != 0 && e.last_seen + KeepFrames() >= g.frame && instance_count < MaxInstances) {
+			if (e.built && e.blas_address != 0 && e.last_seen + KeepFrames() >= g.frame) order.push_back(&e);
+			++it;
+		}
+		std::sort(order.begin(), order.end(), [](const Entry* a, const Entry* b) { return a->id < b->id; });
+		std::unordered_map<uint32_t, vk::DeviceAddress> now_instances;
+		now_instances.reserve(order.size() * 2);
+		uint32_t added = 0;
+		for (Entry* ep: order) {
+			auto& e = *ep;
+			if (instance_count < MaxInstances) {
 				VkAccelerationStructureInstanceKHR instance {};
 				instance.transform.matrix[0][0] = instance.transform.matrix[1][1] = instance.transform.matrix[2][2] = 1.0f;
 				instance.instanceCustomIndex                    = e.id;
 				// (KYTY_HWRT_SHADOW's cull mask 0x03; others trace 0xff) 0x01 static, 0x02 dynamic captured this frame, 0x04
 				// dynamic with an older frame's positions, 0x08 tiny meshes (<= 24 triangles: ash, leaf and debris cards).
-				instance.mask = e.tris <= 24 ? 0x08 : !e.dynamic ? 0x01 : e.capture_frame == g.frame ? 0x02 : 0x04;
+				// (rtstab) 0x02/0x04 by the age of its positions, not "captured this frame": with refits every 4+ frames
+				// (and compares counting as captures) a moving mesh flipped 0x02 <-> 0x04 every few frames, so the sun
+				// (0x03) saw the character's shadow strobe and every other pass saw it pop.
+				const uint32_t age = static_cast<uint32_t>(std::min<uint64_t>(g.frame - std::min(e.write_frame, g.frame), 1u << 20u));
+				instance.mask = e.tris <= 24 ? 0x08 : !e.dynamic ? 0x01 : age <= StaleFrames() ? 0x02 : 0x04;
+				if (e.dynamic) {
+					++g.st_dyn;
+					g.st_age_sum += age;
+					g.st_age_max = std::max(g.st_age_max, age);
+					if (age > StaleFrames()) ++g.st_stale;
+				}
+				const auto prev = g.prev_instances.find(e.id);
+				if (prev == g.prev_instances.end()) {
+					++added;
+				} else {
+					if (prev->second != e.blas_address) ++g.st_blas_swaps;
+					if (e.last_mask != 0 && e.last_mask != instance.mask) ++g.st_mask_flips;
+				}
+				e.last_mask = static_cast<uint8_t>(instance.mask);
+				now_instances.emplace(e.id, e.blas_address);
 				instance.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 				instance.accelerationStructureReference         = e.blas_address;
 				instances[instance_count]                       = instance;
@@ -1981,7 +2065,17 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 				}
 				++instance_count;
 			}
-			++it;
+		}
+		uint32_t removed = 0;
+		for (const auto& [id, address]: g.prev_instances) removed += now_instances.count(id) == 0 ? 1 : 0;
+		(void)removed;
+		g.prev_instances.swap(now_instances);
+		if (camera) {
+			++g.st_frames;
+			g.st_added += added;
+			g.st_removed += removed;
+			g.st_add_max = std::max(g.st_add_max, added);
+			g.st_rem_max = std::max(g.st_rem_max, removed);
 		}
 	}
 	g.tlas_instances_sum += instance_count;
@@ -2118,9 +2212,12 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 			         vk::AccessFlagBits2::eAccelerationStructureReadKHR | vk::AccessFlagBits2::eAccelerationStructureWriteKHR);
 			const vk::AccelerationStructureBuildRangeInfoKHR* tlas_ranges = &payload->tlas_range;
 			cmd.buildAccelerationStructuresKHR(1, &payload->tlas_info, &tlas_ranges, d);
+			// (rtstab) The TLAS build -> every ray query of the frame, compute or fragment, and the BLAS/vertex reads
+			// (the hit normals read the vertex buffers the gather wrote).
 			BarrierD(cmd, d, vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR, vk::AccessFlagBits2::eAccelerationStructureWriteKHR,
-			         vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR,
-			         vk::AccessFlagBits2::eAccelerationStructureReadKHR);
+			         vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eFragmentShader |
+			             vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR,
+			         vk::AccessFlagBits2::eAccelerationStructureReadKHR | vk::AccessFlagBits2::eShaderRead);
 		}
 		if (timed) cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, s * 2 + 1, d);
 	});
