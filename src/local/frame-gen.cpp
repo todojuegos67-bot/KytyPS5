@@ -8765,7 +8765,18 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		g_cs.hw_now = true;
 		++(built ? g_cs.hw_traced : g_cs.hw_stale);
 	}
-	if (sun_mode && !RtSunPrepare(m, vp, sun_slot)) return said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
+	if (sun_mode && !RtSunPrepare(m, vp, sun_slot)) {
+		// (rt3fx, from rt-stable 10-25 godfix) The cascades are copied only on some frames: with the RT sun on, this pass
+		// then returned before GodraysSetSun / ShineSetSun, so they got the sun in bursts and dropped it after 250 ms (the
+		// fog popping in and out, and why the launcher forced KYTY_RT_SUN=0). The latched sun, in this frame's view, still
+		// feeds them every frame here.
+		if (g_cs.latched && g_cs.hyp >= 0 && g_cs.fade > 0.0f) {
+			const auto l_view = ToView(view, g_cs.latch_axis);
+			ShineSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor));
+			GodraysSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor));
+		}
+		return said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
+	}
 	CShadowCamera(view, m);
 	if (g_cs.hyp >= 0 && (CShadowLeft() & (1u << g_cs.hyp)) == 0) {
 		static const char* names[] {"+x", "-x", "+y", "-y", "+z", "-z"};
