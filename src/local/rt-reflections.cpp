@@ -130,7 +130,7 @@ constexpr uint32_t HeaderBytes   = 208;           // view_rot[3], clip_prev[4], 
 bool StableNoise() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_RT_REFLECTIONS_STABLE");
-		return !(v != nullptr && v[0] == '0');
+		return v != nullptr && v[0] == '1'; // (flash-meter: default 0 = b8ef1945's reflections, the look the owner preferred)
 	}();
 	return on;
 }
@@ -152,6 +152,7 @@ constexpr uint32_t SurveyHist    = 258;
 constexpr uint32_t SurveyCount   = 770;
 constexpr uint32_t MetalHist     = 1400;          // (hwrt4) the metal pixels' roughness, 10 bins (cumulative)
 constexpr uint32_t FrameBytes    = 8192;          // header + calibration + stats + survey
+constexpr uint32_t FlashIndex    = 1440, FlashCount = 13; // (flash-meter) the shader's FLASH counters (cumulative)
 constexpr uint32_t MetalAmb      = 1420;          // (rt3fx) the metal pass's smoothed frame light: 2 x 4 floats (the shader's MT_AMB)
 constexpr uint32_t ExposureIndex = 128 / 4;       // fparams.x (1.0) when the game gives no exposure
 constexpr uint32_t CalibRuns     = 24;
@@ -161,6 +162,7 @@ static_assert(HeaderBytes + (StatsIndex + StatsCount) * 4 <= FrameBytes);
 static_assert(StatsIndex + StatsCount <= SurveyIndex && HeaderBytes + (SurveyIndex + SurveyCount) * 4 <= FrameBytes);
 static_assert(SurveyIndex + SurveyCount <= MetalHist && HeaderBytes + (MetalHist + 12) * 4 <= FrameBytes);
 static_assert(SurveyHist == SurveyBits + 2 * 128 && SurveyHist + 2 * 256 == SurveyCount);
+static_assert(1428 <= FlashIndex && HeaderBytes + (FlashIndex + FlashCount) * 4 <= FrameBytes);
 static_assert(MetalHist + 12 <= MetalAmb && HeaderBytes + (MetalAmb + 8) * 4 <= FrameBytes);
 
 struct RtPush {
@@ -231,6 +233,8 @@ struct RtPass {
 	float                   metal_strength = 0.35f, glossy_strength = 0.25f, metal_tint = 0.7f;
 	float                   min_area = 10.0f, pool_boost = 0.6f; // (refl9b: KYTY_RT_REFLECTIONS_MIN_AREA / _POOL_BOOST)
 	bool                    survey_on = false, survey_done = false;
+	uint64_t                flash_sum[FlashCount] {};
+	uint32_t                flash_last[FlashCount] {};
 	uint64_t                survey_runs = 0, survey_next_log = 0;
 	bool                    moving_on = true, moving_auto_off = false;
 	const int32_t*          mapped    = nullptr;
@@ -855,6 +859,13 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		g_rt.m_all_px += np, g_rt.m_dark_px += nd;
 		if (np >= 50 && nd * 20u > np) ++g_rt.m_dark_frames;
 	}
+	{ // (flash-meter) the flash detector's counters, per frame deltas summed over the 10 s window
+		const auto* fc = reinterpret_cast<const uint32_t*>(g_rt.mapped + HeaderBytes / 4 + FlashIndex);
+		for (uint32_t k = 0; k < FlashCount; ++k) {
+			if (g_rt.frame > 8) g_rt.flash_sum[k] += static_cast<uint32_t>(fc[k] - g_rt.flash_last[k]);
+			g_rt.flash_last[k] = fc[k];
+		}
+	}
 	++g_rt.stat_frames;
 	if (have_gbuf) ++g_rt.stat_gbuf_frames;
 	if (g_rt.have_guide) ++g_rt.stat_guide_frames;
@@ -915,6 +926,21 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		            "metal %g, glossy %g\n",
 		            std::chrono::duration<double>(now - g_rt.stat_time).count(), pc(25), mf, pc(26), pc(28), pc(29), sm[27] / 1000.0 / px,
 		            on > 0 ? sm[27] / 1000.0 / on : 0.0, g_rt.metal_strength, g_rt.glossy_strength);
+	}
+	{
+		// (flash-meter) With the camera still (RTFLICKER's still frames), 1 trace pixel in 16 that carries a reflection:
+		// a flash = this frame's reflection > 2x (or < 1/2) of what the reprojected history showed there; its cause.
+		const auto&  f  = g_rt.flash_sum;
+		const double ev = static_cast<double>(std::max<uint64_t>(f[0], 1)), fl = static_cast<double>(std::max<uint64_t>(f[1], 1));
+		const auto   pf = [&](uint32_t k) { return 100.0 * static_cast<double>(f[k]) / fl; };
+		std::printf("RTFLASH: reflections, last %.0f s, camera still: %llu samples; flashes (> 2x vs the history) %.3f%%, jumps > 10%% "
+		            "%.3f%%; flashes by cause: no history (disocclusion / reset) %.1f%%, hit <-> miss toggle %.1f%%, firefly (> 4x the "
+		            "neighbourhood) %.1f%%, neighbourhood clamp cut %.1f%%, not traced this frame %.1f%%, other %.1f%%; mean flash jump "
+		            "%.0f%%, flashes > 50%% %.1f%% / > 80%% %.1f%% / > 95%% %.1f%%; STABLE %s\n",
+		            std::chrono::duration<double>(now - g_rt.stat_time).count(), static_cast<unsigned long long>(f[0]),
+		            100.0 * f[1] / ev, 100.0 * f[2] / ev, pf(3), pf(4), pf(5), pf(6), pf(7), pf(8),
+		            f[1] > 0 ? static_cast<double>(f[9]) / fl : 0.0, pf(10), pf(11), pf(12), StableNoise() ? "1 (rtstab2)" : "0 (b8ef1945 look)");
+		for (auto& v: g_rt.flash_sum) v = 0;
 	}
 	if (sm[4] > 0) {
 		// (refl10) Why the rays miss: the depth limit (iterations: KYTY_RT_REFLECTIONS_ITERS), the screen or the ray's
@@ -1533,7 +1559,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0) |
 	               (g_rt.row0_up ? 16 : 0) | (cfg.checker ? 32 : 0) | (have_water ? 64 : 0) |
 	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0) | (refine ? 1024 : 0) | (bicubic ? 2048 : 0) |
-	               (fresh ? 4096 : 0) | (vfill ? 8192 : 0) | (StableNoise() ? 16384 : 0) | (cam_still ? 32768 : 0);
+	               (fresh ? 4096 : 0) | (vfill ? 8192 : 0) | (StableNoise() ? 16384 : 0) | (cam_still ? 32768 : 0) |
+	               (RtFlicker::StillFrames() >= 4 ? 65536 : 0); // (flash-meter: camera still, any STABLE)
 	// (combo19: guided only while the guide is there; without it the material mask, refl6, instead of water only: the
 	// guide never found in play was the whole reason nothing changed)
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
@@ -1810,7 +1837,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
 	{
 		// The sums, counters and the metal survey to the host (the CPU reads them a few frames late; the copy is 5.5 KB).
-		vk::BufferCopy region {HeaderBytes, HeaderBytes, (Metal().level > 0 ? MetalHist + 12 : SurveyIndex + SurveyCount) * 4};
+		vk::BufferCopy region {HeaderBytes, HeaderBytes, (FlashIndex + FlashCount) * 4}; // (flash-meter: through the flash counters)
 		command.copyBuffer(vk::Buffer(g.frame_buf), vk::Buffer(g.read_buf), 1, &region);
 		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
 		        vk::AccessFlagBits2::eHostRead);
