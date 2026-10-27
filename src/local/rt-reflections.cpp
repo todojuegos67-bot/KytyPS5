@@ -136,7 +136,7 @@ constexpr uint32_t CalibWet      = CalibFloors + 2; // puddle guess: count + 16 
 constexpr uint32_t CalibHist     = 300;             // 16 byte fields x 16 bins
 constexpr uint32_t StatsIndex    = 560;
 constexpr uint32_t StatsCount    = 40; // (refl-pro: 34..39)
-constexpr uint32_t FlashIndex    = 1440, FlashCount = 23; // (refl-pro: RTFLASH + the material check, the shader's FLASH) // (refl10: 30..32 why rays miss, 33 the composite's mirror rays)
+constexpr uint32_t FlashIndex    = 1440, FlashCount = 33; // (ds-rt-refl-1027: 23..32 the "other" split, the hold's reach) // (refl-pro: RTFLASH + the material check, the shader's FLASH) // (refl10: 30..32 why rays miss, 33 the composite's mirror rays)
 // (refl9) The metal survey (the shader's SURVEY, mode 8; never cleared): static / moving sample counts, set-bit counts
 // per class x layer x bit, byte histograms per class x field x 16 bins.
 constexpr uint32_t SurveyIndex   = 600;
@@ -842,6 +842,12 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		            "<= 0.5 (%.3f); gloss > 0.7 %.1f%% (%.3f) vs < 0.3 %.1f%% (%.3f); L2.b0 mean on characters %.2f (%llu samples)\n",
 		            100.0 * f[13] / gn, mc(13, 14), mc(15, 16), 100.0 * f[17] / gn, mc(17, 18), 100.0 * f[19] / gn, mc(19, 20),
 		            mc(21, 22), static_cast<unsigned long long>(f[21]));
+		// (ds-rt-refl-1027) "other" split (% of the flashes) and how many still samples took the hold
+		const double ev2 = ev;
+		std::printf("RTFLASH: reflections other split: dark (< 0.06) %.1f%%, short history (< 4 frames) %.1f%%, not held %.1f%%, big "
+		            "blend %.1f%%, rest %.1f%%; held %.1f%% of the samples, mv >= 1 px %.1f%% (same surface %.1f%%), flashes on held "
+		            "samples %.1f%%, hit <-> miss not held %.1f%%\n",
+		            pf(23), pf(24), pf(25), pf(26), pf(27), 100.0 * f[28] / ev2, 100.0 * f[29] / ev2, 100.0 * f[30] / ev2, pf(31), pf(32));
 		for (auto& v: g_rt.flash_sum) v = 0;
 	}
 	if (!passes.empty()) std::printf("RT reflections: GPU ms per pass (%s): %s\n", Cfg(level).name, passes.c_str());

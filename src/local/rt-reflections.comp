@@ -115,6 +115,7 @@ const int StatsRefused = 32; // (refl-pro: 34 SS hit confidence x1000, 35 TLAS, 
 // of the flashes' jump x 100, 10..12 flashes > 50 / 80 / 95 %. Material check (composite, G-buffer pixels with the game's
 // SSR bound): 13 / 14 L2.b0 > 0.5 count / the game's SSR confidence there x 1000, 15 / 16 the same with L2.b0 <= 0.5, 17 / 18
 // gloss (L1.b2) > 0.7, 19 / 20 gloss < 0.3, 21 / 22 moving pixels (characters) count / their L2.b0 x 1000.
+// (ds-rt-refl-1027) 23..32: "other" split and the still-camera hold's reach (Temporal).
 const int FLASH = 1440;
 void FStat(int k, int v) {
 	int sum = subgroupAdd(v);
@@ -1296,12 +1297,28 @@ void Temporal(ivec2 px) {
 		meta     = texelFetch(meta_tex, pp, 0);
 		if (Bad(meta)) valid = false;
 	}
+	// (ds-rt-refl-1027) Still camera: the same G-buffer surface at this very pixel last frame (depth within 2 %, normal
+	// within ~14 deg). The 3d9088db hold test was the game's motion vector under 1 render pixel only - with DLSS the
+	// motion vector carries the jitter's frame-to-frame delta (up to ~1.4 px): about half the still pixels missed the
+	// hold, took the 3x3 clamp / the 0.25 blend and flashed (RTFLASH hit <-> miss 41-46 %, other 40-42 %).
+	float mvpx  = length(mv * RenderSize());
+	bool  still_ = (push.misc.w & 32768) != 0;
+	bool  same  = false;
+	if (still_) {
+		vec4 pg0 = texelFetch(gb_prev, px, 0);
+		same     = abs(pg0.w - g.w) / max(g.w, 1e-3) < 0.02 && dot(pg0.xyz, g.xyz) > 0.97;
+		vec4 m0  = texelFetch(meta_tex, px, 0);
+		// (reprojection refused - virtual image off screen, a jittered silhouette - but the surface did not move: its own
+		// history, not a 40 % restart)
+		if (!valid && same && (push.misc.w & 1) == 0 && (push.misc.w & 2) != 0 && !Bad(m0) && mvpx < 3.0) valid = true, meta = m0;
+	}
+	bool  hold  = still_ && valid && (mvpx < 1.0 || (same && mvpx < 3.0));
 	vec4  res;
 	float len, mo1, mo2;
 	float lc = Luma(cur.rgb);
 	vec4  f_hraw = vec4(-1.0);
 	float f_hclamp = -1.0;
-	bool  still_ = (push.misc.w & 32768) != 0;
+	float f_alpha = -1.0;
 	if (valid) {
 		// (refl10, KYTY_RT_REFLECTIONS_BICUBIC) Smooth surfaces: the history through a Catmull-Rom filter instead of
 		// bilinear: a bilinear fetch every frame is a blur that compounds (the history is re-filtered each frame: sharp
@@ -1311,7 +1328,6 @@ void Temporal(ivec2 px) {
 		// (865551c6 log: the clamp still cut 12-23 % of the flashes - this test used puv, the virtual-image reprojection,
 		// whose hit distance moves with the jitter, in trace pixels: never under 0.3 under DLSS. Now the surface's own
 		// motion vector, under 1 render pixel: the game's jitter is not motion)
-		bool  hold = still_ && length(mv * RenderSize()) < 1.0;
 		vec4  hist = hold ? texelFetch(src_b, px, 0) : BicubicHist() && rough < 0.3 ? HistoryCR(puv) : textureLod(src_b, puv, 0);
 		if (Bad(hist)) hist = cur;
 		f_hraw     = hist;
@@ -1339,6 +1355,14 @@ void Temporal(ivec2 px) {
 			bool miss = cur.a < hist.a - 0.1 && hist.a > 0.2;
 			cur.a = clamp(cur.a, hist.a - 0.1, hist.a + 0.1);
 			if (miss) cur.rgb = hist.rgb * (cur.a / max(hist.a, 1e-3)); // (premultiplied: the held colour at the new confidence)
+		} else if (still_ && fresh) {
+			// (ds-rt-refl-1027) still camera, not held (a moving character, a surface that changed): the same limiter, looser
+			// (1.75x / 0.57x, confidence 0.2 a frame) - a real change converges in a few frames instead of popping
+			float lh = Luma(hist.rgb), lf = Luma(cur.rgb), hi_ = 1.75 * lh + 0.01;
+			if (lf > hi_) cur.rgb *= hi_ / max(lf, 1e-6);
+			bool miss = cur.a < hist.a - 0.2 && hist.a > 0.2;
+			cur.a = clamp(cur.a, hist.a - 0.2, hist.a + 0.2);
+			if (miss) cur.rgb = mix(cur.rgb, hist.rgb * (cur.a / max(hist.a, 1e-3)), 0.75);
 		}
 		// (a miss this frame against a held reflection: the history fades slowly instead of popping)
 		if (fresh && cur.a < hist.a * 0.5) alpha *= 0.5;
@@ -1353,6 +1377,7 @@ void Temporal(ivec2 px) {
 			alpha = wraw > 0.0 ? alpha * 0.5 : 0.0;
 		}
 		res         = mix(hist, cur, alpha);
+		f_alpha     = alpha;
 		mo1         = mix(meta.y, lc, alpha);
 		mo2         = mix(meta.z, lc * lc, alpha);
 	} else {
@@ -1388,6 +1413,18 @@ void Temporal(ivec2 px) {
 		for (int c = 3; c <= 8; ++c) FStat(c, fl && cause == c ? 1 : 0);
 		FStat(9, fl ? int(jmp * 100.0) : 0);
 		FStat(10, fl && jmp > 0.5 ? 1 : 0), FStat(11, fl && jmp > 0.8 ? 1 : 0), FStat(12, fl && jmp > 0.95 ? 1 : 0);
+		// (ds-rt-refl-1027) "other" split (a partition, first match): 23 dark (both < 0.06: the 0.02 floor), 24 short history
+		// (< 4 frames since a reset), 25 not held (mv >= the hold limit / surface changed), 26 big blend (alpha >= 0.2),
+		// 27 the rest. Then the hold's reach: 28 samples held, 29 still samples with mv >= 1 px (the jitter's delta),
+		// 30 of those on the same surface, 31 flashes on held samples, 32 hit <-> miss on non-held samples.
+		int oc = 27;
+		if (max(lo, lp) < 0.06) oc = 23;
+		else if (valid && meta.x < 4.0) oc = 24;
+		else if (!hold) oc = 25;
+		else if (f_alpha >= 0.2) oc = 26;
+		for (int c = 23; c <= 27; ++c) FStat(c, fl && cause == 8 && oc == c ? 1 : 0);
+		FStat(28, hold ? 1 : 0), FStat(29, mvpx >= 1.0 ? 1 : 0), FStat(30, mvpx >= 1.0 && same ? 1 : 0);
+		FStat(31, fl && hold ? 1 : 0), FStat(32, fl && cause == 4 && !hold ? 1 : 0);
 	}
 	imageStore(out_a, px, res);
 	imageStore(out_b, px, vec4(len, mo1, mo2, var));
