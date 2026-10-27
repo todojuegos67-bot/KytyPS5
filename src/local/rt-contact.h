@@ -18,6 +18,8 @@ namespace Libs::Graphics::FrameGen {
 // visibility image (trace size, .r, GENERAL layout; null when none) with exact = true when that visibility is the whole
 // sun term's (KYTY_RT_SUN: the composite replaced the game's own visibility with it).
 void RtContactSetSun(const std::array<double, 3>& world_dir, float weight, float r, vk::ImageView vis, vk::Extent2D vis_extent, bool exact);
+// (KYTY_RT_CAPTURE) the last sun RtContactSetSun gave (false: none yet).
+bool RtContactGetSun(std::array<float, 3>& dir, float& weight, float& r, bool& exact);
 // In Upscale, after HwLightsApply: inputs.color becomes the composited copy. False: nothing done.
 bool RtContactApply(vk::CommandBuffer command, UpscaleInputs& inputs);
 

@@ -609,6 +609,31 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${hwrt_particles_header}")
 
+# KYTY_RT_CAPTURE: the RT data capture's readback shader, float and uint views (src/local/rt-capture.cpp).
+set(rt_capture_source "${KYTY_SOURCE_DIR}/local/rt-capture.comp")
+foreach(kind f u)
+	set(rt_capture_spv_${kind} "${gpu_tiler_generated_dir}/rt_capture_${kind}.spv")
+	set(rt_capture_header_${kind} "${gpu_tiler_generated_dir}/rt_capture_${kind}_spv.h")
+	if(kind STREQUAL "u")
+		set(rt_capture_def "-DKYTY_UINT")
+		set(rt_capture_sym "RT_CAPTURE_U_SPV")
+	else()
+		set(rt_capture_def "-DKYTY_FLOAT")
+		set(rt_capture_sym "RT_CAPTURE_F_SPV")
+	endif()
+	add_custom_command(
+		OUTPUT "${rt_capture_header_${kind}}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os ${rt_capture_def}
+		        -o "${rt_capture_spv_${kind}}" "${rt_capture_source}"
+		COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_capture_spv_${kind}} -DOUTPUT=${rt_capture_header_${kind}}
+		        -DSYMBOL=${rt_capture_sym} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		DEPENDS "${rt_capture_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		VERBATIM
+	)
+	list(APPEND kyty_emulator_src "${rt_capture_header_${kind}}")
+endforeach()
+
 # KYTY_HWRT_CONTACT: ray-traced contact shadows with ray queries into the KYTY_HWRT TLAS (src/local/rt-contact.cpp).
 set(rt_contact_source "${KYTY_SOURCE_DIR}/local/rt-contact.comp")
 set(rt_contact_spv "${gpu_tiler_generated_dir}/rt_contact.spv")
@@ -792,6 +817,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/hw-lights.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-contact.h"
 	"${KYTY_SOURCE_DIR}/local/rt-contact.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-capture.h"
+	"${KYTY_SOURCE_DIR}/local/rt-capture.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-water.h"
 	"${KYTY_SOURCE_DIR}/local/rt-water.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-flicker.h"

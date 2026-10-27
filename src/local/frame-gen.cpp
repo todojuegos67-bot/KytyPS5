@@ -35,6 +35,7 @@
 #include "local/godrays.h"
 #include "local/rt-local-lights.h"
 #include "local/rt-flicker.h"
+#include "local/rt-capture.h"
 #include "local/rt-softsun.h"
 #include "local/hw-lights.h"
 #include "local/rt-contact.h"
@@ -9090,7 +9091,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
-	if (RtContactLevel() > 0) { // (KYTY_HWRT_CONTACT: rt-contact.cpp; the sun, R and this pass's final visibility)
+	if (RtContactLevel() > 0 || RtCapture::Enabled()) { // (KYTY_RT_CAPTURE reads the sun from it too) (KYTY_HWRT_CONTACT: rt-contact.cpp; the sun, R and this pass's final visibility)
 		double r = 1.5;
 		if (sun_mode && g_rs.buf_mapped != nullptr) r = reinterpret_cast<const float*>(g_rs.buf_mapped + sun_slot * kRtSunSlotBytes)[2];
 		else if (g_cs.log_k >= 0.0) r = std::max(std::exp2(g_cs.log_k) - 1.0, 0.0) / 0.75;
@@ -9153,20 +9154,21 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	};
 	// (KYTY_RT_FLICKER: each RT pass's contribution checked frame to frame with the camera still, rt-flicker.cpp)
 	RtFlicker::BeginFrame(inputs);
+	RtCapture::OnFrame(command, inputs); // (KYTY_RT_CAPTURE: the RT data capture, rt-capture.cpp; nothing when off)
 	const auto probed = [&](RtFlicker::Pass pass, const char* name, auto&& apply) {
 		const UpscaleImage before = inputs.color;
 		if (TimedPass(name, apply)) RtFlicker::Probe(command, inputs.graphics, pass, before, inputs.color);
 	};
-	probed(RtFlicker::Particles, "HwParticlesApply", [&] { return HwParticlesApply(command, inputs); }); // (KYTY_HWRT_PARTICLES: first, on the game's own color; nothing when off)
+	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Particles, "HwParticlesApply")
 	probed(RtFlicker::Sun, "CShadowApply", [&] { return CShadowApply(command, inputs); }); // (KYTY_RT_SHADOWS: direct-sun shadows first; inputs.color becomes the composited copy)
 	probed(RtFlicker::Lights, "HwLightsApply", [&] { return HwLightsApply(command, inputs); }); // (KYTY_HWRT_LIGHTS: ray-traced local-light shadows, hw-lights.cpp; nothing when off)
-	probed(RtFlicker::Contact, "RtContactApply", [&] { return RtContactApply(command, inputs); }); // (KYTY_HWRT_CONTACT: ray-traced contact shadows, rt-contact.cpp; nothing when off)
+	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Contact, "RtContactApply")
 	TimedPass("SsgiApply", [&] { SsgiApply(command, inputs); }); // (KYTY_SSGI: likewise; nothing when off)
 	TimedPass("GtaoApply", [&] { GtaoApply(command, inputs); }); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
-	probed(RtFlicker::Gi, "HwGiApply", [&] { return HwGiApply(command, inputs); }); // (KYTY_HWRT_AO / KYTY_HWRT_GI: hwrt-gi.cpp, in GTAO's place; nothing when off)
+	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Gi, "HwGiApply")
 	TimedPass("SsrApply", [&] { SsrApply(command, inputs); }); // (KYTY_SSR: likewise, after GTAO; nothing when off)
 	probed(RtFlicker::Reflections, "RtReflectionsApply", [&] { return RtReflectionsApply(command, inputs); }); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
-	probed(RtFlicker::Water, "RtWaterApply", [&] { return RtWaterApply(command, inputs); }); // (KYTY_HWRT_WATER: water / puddle mirrors, rt-water.cpp; nothing when off)
+	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Water, "RtWaterApply")
 	TimedPass("ShineApply", [&] { ShineApply(command, inputs); }); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
 	probed(RtFlicker::Volumetric, "GodraysApply", [&] { return GodraysApply(command, inputs); }); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off; flicker self-check)
 	TimedPass("GbufViewApply", [&] { GbufViewApply(command, inputs); }); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)

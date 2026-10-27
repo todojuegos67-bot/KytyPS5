@@ -324,6 +324,7 @@ void SayOnce(const char* text) {
 } // namespace
 
 int HwParticlesLevel() {
+	return 0; // (ds-rt-stable-1027) removed: the owner keeps only RT reflections, RT sun / lamp shadows and volumetric shafts
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_HWRT_PARTICLES");
 		return value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;

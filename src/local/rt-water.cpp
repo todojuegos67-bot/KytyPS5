@@ -430,6 +430,7 @@ void Log(GraphicContext& graphics, int level) {
 } // namespace
 
 int RtWaterLevel() {
+	return 0; // (ds-rt-stable-1027) removed: the owner keeps only RT reflections, RT sun / lamp shadows and volumetric shafts
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_HWRT_WATER");
 		const int   q     = ::Libs::Graphics::FrameGen::ParseEnvLevel(value);

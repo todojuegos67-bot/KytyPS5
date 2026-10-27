@@ -25,6 +25,7 @@ struct State {
 } // namespace
 
 int Level() {
+	return 0; // (ds-rt-stable-1027) removed: the owner keeps only RT reflections, RT sun / lamp shadows and volumetric shafts
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_HWRT_SOFTSUN");
 		const int   q     = ::Libs::Graphics::FrameGen::ParseEnvLevel(value);

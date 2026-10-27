@@ -341,6 +341,7 @@ bool Inverse4(const double* m, double* out) {
 } // namespace
 
 int RtContactLevel() {
+	return 0; // (ds-rt-stable-1027) removed: the owner keeps only RT reflections, RT sun / lamp shadows and volumetric shafts
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_HWRT_CONTACT");
 		const int   q     = ::Libs::Graphics::FrameGen::ParseEnvLevel(value);
@@ -355,7 +356,7 @@ int RtContactLevel() {
 }
 
 void RtContactSetSun(const std::array<double, 3>& world_dir, float weight, float r, vk::ImageView vis, vk::Extent2D vis_extent, bool exact) {
-	if (RtContactLevel() == 0) return;
+	// (ds-rt-stable-1027: kept for KYTY_RT_CAPTURE with the contact shadows removed)
 	const double n = std::sqrt(world_dir[0] * world_dir[0] + world_dir[1] * world_dir[1] + world_dir[2] * world_dir[2]);
 	if (!(n > 1e-6) || !std::isfinite(n)) return;
 	for (int i = 0; i < 3; ++i) g_ct_sun.dir[i] = static_cast<float>(world_dir[i] / n);
@@ -365,6 +366,12 @@ void RtContactSetSun(const std::array<double, 3>& world_dir, float weight, float
 	g_ct_sun.vis_extent = vis_extent;
 	g_ct_sun.exact      = exact && vis != nullptr;
 	g_ct_sun.upscale    = g_ct_upscales;
+}
+
+bool RtContactGetSun(std::array<float, 3>& dir, float& weight, float& r, bool& exact) {
+	if (g_ct_sun.upscale == ~0ull) return false;
+	dir = g_ct_sun.dir, weight = g_ct_sun.weight, r = g_ct_sun.r, exact = g_ct_sun.exact;
+	return true;
 }
 
 bool RtContactApply(vk::CommandBuffer command, UpscaleInputs& inputs) {

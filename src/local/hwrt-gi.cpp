@@ -71,6 +71,7 @@ const Config& Cfg() {
 		Config r;
 		r.ao = EnvLevel("KYTY_HWRT_AO");
 		r.gi = EnvLevel("KYTY_HWRT_GI");
+		r.ao = r.gi = 0; // (ds-rt-stable-1027) removed: only RT reflections, RT sun / lamp shadows and volumetric shafts stay
 		// (gi-1027) KYTY_HWRT_GI brings its own stable AO on the ambient term at the same level unless KYTY_HWRT_AO is set
 		{
 			const char* a = std::getenv("KYTY_HWRT_AO");
