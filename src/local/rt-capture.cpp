@@ -4,6 +4,7 @@
 
 #include "gpu_tiler_shaders/rt_capture_f_spv.h"
 #include "gpu_tiler_shaders/rt_capture_u_spv.h"
+#include "local/godrays.h"
 #include "local/hwrt-scene.h"
 #include "local/rt-contact.h"
 #include "local/rt-flicker.h"
@@ -398,6 +399,7 @@ std::string Describe(const UpscaleInputs& in) {
 	} else {
 		j += "  \"sun\": null,\n";
 	}
+	j += "  \"volumetric\": " + GodraysDescribe() + ",\n"; // (vol-1027: the god rays' sun as fed, its weight, the march path)
 	std::vector<RtLocal::LiveLight> lights;
 	if (RtLocal::Wanted()) RtLocal::LiveLights(lights, 120, 1);
 	j += "  \"local_lights\": [";

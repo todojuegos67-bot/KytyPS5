@@ -406,6 +406,18 @@ void GodraysNoteSunMiss(int cause) {
 	++g_gr_sun.miss[cause];
 }
 
+std::string GodraysDescribe() {
+	if (!GodraysWanted()) return "null";
+	char b[512];
+	std::snprintf(b, sizeof(b),
+	              "{\"level\": %d, \"sun_seen\": %s, \"sun_dir_view\": [%g, %g, %g], \"sun_weight_held\": %g, \"on_screen\": %g, "
+	              "\"tlas_march\": %s, \"history_valid\": %s, \"frames_since_feed\": %u}",
+	              GodraysLevel(), g_gr.sun_seen ? "true" : "false", static_cast<double>(g_gr.sun_dir[0]), static_cast<double>(g_gr.sun_dir[1]),
+	              static_cast<double>(g_gr.sun_dir[2]), static_cast<double>(g_gr.sun_held), static_cast<double>(g_gr.on_screen),
+	              g_gr.path_prev == 1 ? "true" : "false", g_gr.history_valid ? "true" : "false", g_gr.gap_run);
+	return b;
+}
+
 bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const int level = GodraysLevel();
 	if (level == 0) return false;

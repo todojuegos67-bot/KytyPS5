@@ -7,6 +7,7 @@
 #include "local/frame-gen.h"
 
 #include <array>
+#include <string>
 
 namespace Libs::Graphics::FrameGen {
 
@@ -19,6 +20,9 @@ void GodraysSetSun(const std::array<double, 3>& view_dir, float weight);
 // (vol-1027) Why CShadowApply gave no sun this frame (the flicker self-check's cause counters): 0 the sun is not latched
 // yet / dropped, 1 the RT sun cascades were not copied this frame, 2 no scene TLAS yet, 3 the pass's images / pipeline.
 void GodraysNoteSunMiss(int cause);
+// (vol-1027, KYTY_RT_CAPTURE frame.json) the pass's state as a JSON object: level, the held view-space sun and its weight,
+// the on-screen factor, the TLAS-shadowed march in use, the last frame's feed. "null" when off.
+[[nodiscard]] std::string GodraysDescribe();
 
 } // namespace Libs::Graphics::FrameGen
 
