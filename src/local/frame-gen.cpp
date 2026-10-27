@@ -3678,6 +3678,72 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 }
 } // namespace
 
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+namespace {
+// KYTY_DLSS_OUT_DISPLAY (default on when KYTY_DISPLAY_HEIGHT is set below the output's height): DLSS super resolution
+// outputs at the display's height (the output's aspect), into g_dlss_mid, which a linear blit then scales into the
+// game's output (3840x2160) for its own later stages. DLSS's output fixed at 4K took inputs of 720, 1080, 1256 or 1440
+// only (a 3x/2x/1.72x/1.5x ratio), so 628 or 540 from a 1080 display fell outside its range (10-27).
+uint32_t DlssDisplayHeight(uint32_t output_height) {
+	static const uint32_t height = [] {
+		const char* value = std::getenv("KYTY_DISPLAY_HEIGHT");
+		return value != nullptr ? static_cast<uint32_t>(std::max(0, std::atoi(value))) : 0u;
+	}();
+	static const int forced = [] {
+		const char* value = std::getenv("KYTY_DLSS_OUT_DISPLAY");
+		return value != nullptr && *value != '\0' ? (value[0] == '0' ? 0 : 1) : -1;
+	}();
+	if (forced == 0 || height < 360 || height >= output_height) return 0;
+	if (forced == -1 && height >= 2160) return 0;
+	return height;
+}
+struct DlssMid {
+	VulkanImage   image;
+	vk::ImageView view = nullptr;
+	vk::Format    format = vk::Format::eUndefined;
+};
+DlssMid g_dlss_mid;
+bool EnsureDlssMid(GraphicContext& graphics, vk::Extent2D extent, vk::Format format) {
+	if (g_dlss_mid.image.image != nullptr && g_dlss_mid.image.extent.width == extent.width &&
+	    g_dlss_mid.image.extent.height == extent.height && g_dlss_mid.format == format)
+		return true;
+	const auto device = graphics.device;
+	if (g_dlss_mid.view != nullptr || g_dlss_mid.image.image != nullptr) device.waitIdle();
+	if (g_dlss_mid.view != nullptr) device.destroyImageView(g_dlss_mid.view, nullptr);
+	g_dlss_mid.view = nullptr;
+	if (g_dlss_mid.image.image != nullptr) graphics.DeleteImage(g_dlss_mid.image);
+	g_dlss_mid.image.image = nullptr;
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = format;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc;
+	create.sharingMode = vk::SharingMode::eExclusive;
+	create.samples     = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, g_dlss_mid.image)) {
+		g_dlss_mid.image.image = nullptr;
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = g_dlss_mid.image.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = format;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (device.createImageView(&view_info, nullptr, &g_dlss_mid.view) != vk::Result::eSuccess) {
+		g_dlss_mid.view = nullptr;
+		return false;
+	}
+	g_dlss_mid.image.state = {};
+	g_dlss_mid.format      = format;
+	return true;
+}
+} // namespace
+#endif
+
 static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	if (!g_upscale_ready) return false;
@@ -3696,21 +3762,83 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 		std::fflush(stdout);
 		return false;
 	}
-	static vk::Extent2D options_render {}, options_output {};
+	static vk::Extent2D options_render {}, options_output {}, options_target {};
+	static bool         mid_failed = false; // (no display-size image could be made: the game's output, as before)
+	static bool         to_mid = false; // DLSS writes g_dlss_mid (the display's size), blitted into the output
 	if (options_render != inputs.color.extent || options_output != inputs.output.extent) {
-		// The mode by the input's share of the output's height (DLSS takes any input size; the mode picks its model and
-		// limits): PS5 Pro's 1512 of 2160 and 1440 are quality, 1080 performance, the output's own DLAA; below half
-		// the output (performance's least, 1080 of 2160) ultra performance, down to its third (720).
-		const double share = static_cast<double>(inputs.color.extent.height) / inputs.output.extent.height;
-		sl::DLSSOptions options {};
-		options.mode = share >= 0.95   ? sl::DLSSMode::eDLAA
-		               : share >= 0.62 ? sl::DLSSMode::eMaxQuality
-		               : share >= 0.55 ? sl::DLSSMode::eBalanced
-		               : share >= 0.495 ? sl::DLSSMode::eMaxPerformance // (10-21: 1079 of 2160 from a 1.334 ratio fell
-		                                                                // to ultra performance, which takes 720 only: black)
-		                               : sl::DLSSMode::eUltraPerformance;
-		options.outputWidth     = inputs.output.extent.width;
-		options.outputHeight    = inputs.output.extent.height;
+		const vk::Extent2D render = inputs.color.extent;
+		const vk::Extent2D full   = inputs.output.extent;
+		// The DLSS output tried: the display's height (KYTY_DLSS_OUT_DISPLAY), else the game's output as before.
+		std::vector<vk::Extent2D> targets;
+		if (const uint32_t height = DlssDisplayHeight(full.height);
+		    !mid_failed && height > render.height && g_graphics_ctx != nullptr && (inputs.output.usage & vk::ImageUsageFlagBits::eTransferDst) &&
+		    (inputs.output.layout == vk::ImageLayout::eGeneral || inputs.output.layout == vk::ImageLayout::eTransferDstOptimal)) {
+			const uint32_t width = (static_cast<uint32_t>(std::lround(static_cast<double>(height) * full.width / full.height)) + 1u) & ~1u;
+			targets.push_back(vk::Extent2D {width, height});
+		}
+		targets.push_back(full);
+		const auto by_share = [](double share) {
+			// The mode by the input's share of the output's height (the mode picks DLSS's model and limits): 2/3 quality,
+			// 0.58 balanced, half performance (PS5 Pro's 1512 and 1440 of 2160 quality, 1080 performance), the output's
+			// own DLAA; below half ultra performance, down to its third.
+			return share >= 0.95    ? sl::DLSSMode::eDLAA
+			       : share >= 0.62  ? sl::DLSSMode::eMaxQuality
+			       : share >= 0.55  ? sl::DLSSMode::eBalanced
+			       : share >= 0.495 ? sl::DLSSMode::eMaxPerformance // (10-21: 1079 of 2160 from a 1.334 ratio fell
+			                                                        // to ultra performance, which takes 720 only: black)
+			                        : sl::DLSSMode::eUltraPerformance;
+		};
+		sl::DLSSOptions       options {};
+		sl::DLSSOptimalSettings settings {};
+		bool                  found = false;
+		for (size_t t = 0; t < targets.size() && !found; ++t) {
+			const vk::Extent2D target = targets[t];
+			const sl::DLSSMode first  = by_share(static_cast<double>(render.height) / target.height);
+			// The share's mode first, then the others: the first whose optimal-settings range takes the input.
+			const sl::DLSSMode modes[] {first, sl::DLSSMode::eMaxQuality, sl::DLSSMode::eBalanced, sl::DLSSMode::eMaxPerformance,
+			                            sl::DLSSMode::eUltraPerformance, sl::DLSSMode::eDLAA};
+			for (const sl::DLSSMode mode: modes) {
+				options              = {};
+				options.mode         = mode;
+				options.outputWidth  = target.width;
+				options.outputHeight = target.height;
+				settings             = {};
+				const bool queried   = g_api.dlss_get_optimal_settings(options, settings) == sl::Result::eOk;
+				const bool known     = queried && settings.renderWidthMax != 0 && settings.renderHeightMax != 0;
+				const bool inside = known && render.width >= settings.renderWidthMin && render.width <= settings.renderWidthMax &&
+				                    render.height >= settings.renderHeightMin && render.height <= settings.renderHeightMax;
+				// (No range from Streamline: the share's mode, as before - for the game's output only.)
+				if (inside || (!known && mode == first && t + 1 == targets.size())) {
+					found = true;
+					to_mid         = t + 1 < targets.size();
+					options_target = target;
+					break;
+				}
+			}
+		}
+		if (!found) {
+			given_up = true;
+			std::printf("DLSS super resolution: the game renders %ux%u, outside what DLSS takes in this mode (its range "
+			            "%ux%u-%ux%u): the game's image is upscaled without it. A DLSS override for this program in the "
+			            "NVIDIA app (Super Resolution mode or scaling ratio) does this; set it back to the default for "
+			            "kyty_emulator.exe\n",
+			            render.width, render.height, settings.renderWidthMin, settings.renderHeightMin, settings.renderWidthMax,
+			            settings.renderHeightMax);
+			std::fflush(stdout);
+			return false;
+		}
+		if (to_mid && !EnsureDlssMid(*g_graphics_ctx, options_target,
+		                             StorageFormat(*g_graphics_ctx, inputs.output.format) ? inputs.output.format
+		                                                                                 : vk::Format::eR16G16B16A16Sfloat)) {
+			std::printf("DLSS super resolution: no %ux%u image for the display-size output: DLSS outputs %ux%u\n",
+			            options_target.width, options_target.height, full.width, full.height);
+			to_mid         = false;
+			mid_failed     = true;
+			options_render = {}; // (chosen again for the game's output)
+			options_output = {};
+			std::fflush(stdout);
+			return false;
+		}
 		options.colorBuffersHDR = sl::Boolean::eTrue; // (the game's linear HDR scene, before its tone mapping)
 		options.useAutoExposure = sl::Boolean::eTrue;
 		// KYTY_DLSS_PRESET=<letter> (a test): that DLSS model for every mode instead of the mode's default.
@@ -3724,24 +3852,14 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 			std::fflush(stdout);
 			return false;
 		}
-		sl::DLSSOptimalSettings settings {};
-		(void)g_api.dlss_get_optimal_settings(options, settings);
-		std::printf("DLSS super resolution: %ux%u -> %ux%u, mode %u (its range %ux%u-%ux%u)\n", inputs.color.extent.width,
-		            inputs.color.extent.height, inputs.output.extent.width, inputs.output.extent.height,
-		            static_cast<uint32_t>(options.mode), settings.renderWidthMin, settings.renderHeightMin,
-		            settings.renderWidthMax, settings.renderHeightMax);
+		std::printf("DLSS super resolution: %ux%u -> %ux%u, mode %u (its range %ux%u-%ux%u)%s\n", render.width, render.height,
+		            options_target.width, options_target.height, static_cast<uint32_t>(options.mode), settings.renderWidthMin,
+		            settings.renderHeightMin, settings.renderWidthMax, settings.renderHeightMax,
+		            to_mid ? ", display-size output blitted to the game's output (KYTY_DLSS_OUT_DISPLAY)" : "");
+		std::printf("DLSS out display: %s, %ux%u -> %ux%u -> %ux%u, mode %u\n", to_mid ? "on" : "off", render.width,
+		            render.height, options_target.width, options_target.height, full.width, full.height,
+		            static_cast<uint32_t>(options.mode));
 		std::fflush(stdout);
-		if (settings.renderWidthMax != 0 && settings.renderHeightMax != 0 &&
-		    (inputs.color.extent.width < settings.renderWidthMin || inputs.color.extent.width > settings.renderWidthMax ||
-		     inputs.color.extent.height < settings.renderHeightMin || inputs.color.extent.height > settings.renderHeightMax)) {
-			given_up = true;
-			std::printf("DLSS super resolution: the game renders %ux%u, outside what DLSS takes in this mode: the game's "
-			            "image is upscaled without it. A DLSS override for this program in the NVIDIA app (Super Resolution "
-			            "mode or scaling ratio) does this; set it back to the default for kyty_emulator.exe\n",
-			            inputs.color.extent.width, inputs.color.extent.height);
-			std::fflush(stdout);
-			return false;
-		}
 		options_render = inputs.color.extent;
 		options_output = inputs.output.extent;
 	}
@@ -3807,7 +3925,19 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 	auto             color  = resource(inputs.color);
 	auto             depth  = resource(inputs.depth);
 	auto             motion = resource(inputs.motion);
-	auto             output = resource(inputs.output);
+	UpscaleImage     mid_image;
+	if (to_mid) {
+		mid_image.image  = g_dlss_mid.image.image;
+		mid_image.view   = g_dlss_mid.view;
+		mid_image.layout = vk::ImageLayout::eGeneral;
+		mid_image.format = g_dlss_mid.format;
+		mid_image.extent = options_target;
+		mid_image.usage  = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc;
+		Transition(command, g_dlss_mid.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eShaderStorageRead,
+		           vk::PipelineStageFlagBits2::eAllCommands);
+	}
+	auto             output = resource(to_mid ? mid_image : inputs.output);
 	// (KYTY_SR_LOG: the first two evaluations' images and constants.)
 	static const bool describe = std::getenv("KYTY_SR_LOG") != nullptr;
 	if (static std::atomic<uint32_t> described {0}; describe && described.fetch_add(1, std::memory_order_relaxed) < 2) {
@@ -3826,7 +3956,8 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 		std::fflush(stdout);
 	}
 	const sl::Extent render {0, 0, inputs.color.extent.width, inputs.color.extent.height};
-	const sl::Extent full {0, 0, inputs.output.extent.width, inputs.output.extent.height};
+	const sl::Extent full {0, 0, to_mid ? options_target.width : inputs.output.extent.width,
+	                       to_mid ? options_target.height : inputs.output.extent.height};
 	// (rtparticles) KYTY_RT_PARTICLES=2: the particle mask as DLSS's bias-current-color hint (trust the current frame
 	// where particles, drawn without motion vectors, are).
 	const bool have_reactive = inputs.reactive.view != nullptr && inputs.reactive.image != nullptr;
@@ -3861,6 +3992,35 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
 			std::printf("DLSS super resolution: slEvaluateFeature failed (%s)\n", sl::getResultAsStr(result));
 		return false;
+	}
+	if (to_mid) {
+		// DLSS's display-size image scaled (linear) into the game's output, which its later stages read as before.
+		const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
+		                        vk::AccessFlags2 dst) {
+			vk::MemoryBarrier2 barrier {};
+			barrier.srcStageMask  = src_stage;
+			barrier.srcAccessMask = src;
+			barrier.dstStageMask  = dst_stage;
+			barrier.dstAccessMask = dst;
+			vk::DependencyInfo dependency {};
+			dependency.memoryBarrierCount = 1;
+			dependency.pMemoryBarriers    = &barrier;
+			command.pipelineBarrier2(dependency);
+		};
+		global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead,
+		       vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite);
+		Transition(command, g_dlss_mid.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+		           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eBlit);
+		const auto& out = inputs.output;
+		vk::ImageBlit blit {};
+		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, out.level, out.layer, 1};
+		blit.srcOffsets[1] = vk::Offset3D {static_cast<int32_t>(options_target.width), static_cast<int32_t>(options_target.height), 1};
+		blit.dstOffsets[1] = vk::Offset3D {static_cast<int32_t>(out.extent.width), static_cast<int32_t>(out.extent.height), 1};
+		command.blitImage(g_dlss_mid.image.image, vk::ImageLayout::eTransferSrcOptimal, out.image, out.layout, 1, &blit,
+		                  vk::Filter::eLinear);
+		global(vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands,
+		       vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
 	}
 	return true;
 #else
