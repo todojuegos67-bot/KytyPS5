@@ -55,10 +55,56 @@ layout(push_constant) uniform Push {
 	vec4  motion;    // motion scale x, y, history valid (1), view-ray steps (0: off)
 	ivec4 misc;      // mode, frame, flags (1 row 0 = NDC y +1, 2 debug: our light only), exposure index
 	vec4  extra;     // quarter w, h, light strength, visibility boost (0..1: Bajo / Medio)
+#ifdef KYTY_HWRT_VOLUMETRIC
+	vec4  w0, w1, w2; // view space -> the TLAS's world (rows)
+	vec4  hw;         // x: 1 = TLAS rays this frame (0: the depth-buffer march), y: ray length (m), z: march length (m), w: level
+#endif
 } push;
+#ifdef KYTY_HWRT_VOLUMETRIC
+// (KYTY_HWRT_VOLUMETRIC, godrays.cpp: this file built a second time as #version 460 with this defined, godrays_hw_spv.h)
+layout(binding = 10) uniform accelerationStructureEXT tlas;
+// The sun's visibility from a view-space point on the view ray: one first-hit ray query toward the sun through the
+// captured scene (opaque; off-screen occluders included). 1 lit, 0 occluded.
+// (rt3fx) Static meshes only (cull mask 0x01). 0xff also traced 0x04 (dynamic meshes with an older frame's positions:
+// occluders no longer there) and 0x08 (tiny cards: ash, leaves, debris), and every dynamic mesh whose refit lags: those
+// instances come and go frame to frame (log 20261027-012803: TLAS instances 289..862 a frame between 10 s windows, up to
+// 342 evictions / 10 s), and each one flipped the sun's visibility along whole view rays - the fog appearing and
+// disappearing. The sun shafts are cut by the architecture, which is static.
+float HwVis(vec3 x, vec3 lw) {
+	vec4 p4 = vec4(x, 1.0);
+	vec3 o  = vec3(dot(push.w0, p4), dot(push.w1, p4), dot(push.w2, p4));
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0x01, o, 0.05, lw, push.hw.y);
+	while (rayQueryProceedEXT(rq)) {}
+	return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT ? 0.0 : 1.0;
+}
+#endif
 
 const int CW = 16;
 const int CH = 9;
+#ifdef KYTY_HWRT_VOLUMETRIC
+// (hwrt3v-2: the lamp halos popped in and out in the Boletaria hall: lights crossing the threshold / the 6 m and 45 m
+// gates / losing their match for a few frames. Here: candidates kept down to 60 % of the threshold and 4..55 m (new
+// lights still need the full threshold), a wider match, ~1.4 s fade in, ~2.8 s fade out.)
+#define L_NEAR 4.0
+#define L_FAR 55.0
+#define L_MATCH 3.5
+#define L_IN 0.012
+#define L_OUT 0.006
+// (hwrt5v: the threshold adapts to the scene: hdr.y in a lit scene, down to L_FLOOR in a dark one (the lamp hall: exposed
+// lamps ~1, never 3, so no light was ever tracked and the only haze was the sun's, gone indoors). Lights() keeps every
+// cell's brightest tap above L_FLOOR; Track() sets stats[13] (float bits, smoothed) from the cells' mean luminance.)
+#define L_FLOOR 0.35
+#define L_ADAPT (stats[13] > 0u ? uintBitsToFloat(stats[13]) : hdr.y)
+#define L_THRESH L_FLOOR
+#else
+#define L_NEAR 6.0
+#define L_FAR 45.0
+#define L_MATCH 2.5
+#define L_IN 0.06
+#define L_OUT 0.03
+#define L_THRESH hdr.y
+#endif
 
 vec2  RenderSize() { return push.size.xy; }
 float YS() { return (push.misc.z & 1) != 0 ? -1.0 : 1.0; }
@@ -111,7 +157,19 @@ vec3 Hue(vec3 c) {
 	return mix(vec3(1), h, 0.6) / max(Luma(mix(vec3(1), h, 0.6)), 1e-4);
 }
 
+#ifdef KYTY_HWRT_VOLUMETRIC
+// (hwrt5v-2: lamps live in world space: a = (world xyz, weight), b = (exposed rgb, frames unseen). The screen only finds
+// and refines them; off screen / behind the character they are held (~30 s), so turning the camera never cuts a halo.)
+vec3 ToWorld(vec3 v) {
+	vec4 p = vec4(v, 1.0);
+	return vec3(dot(push.w0, p), dot(push.w1, p), dot(push.w2, p));
+}
+mat3 ViewFromWorld() { return inverse(transpose(mat3(push.w0.xyz, push.w1.xyz, push.w2.xyz))); }
+vec3 WorldT() { return vec3(push.w0.w, push.w1.w, push.w2.w); }
+#endif
+
 shared uint s_best[64];
+shared uint s_sum;
 
 void Lights(uvec3 wg, uint li) {
 	uvec2 cell = wg.xy;
@@ -122,7 +180,15 @@ void Lights(uvec3 wg, uint li) {
 	float l    = Luma(c);
 	// (nearer than 6 m: the player's own lantern, a torch held in front of the camera: a halo there is a haze over
 	// the whole character, not a shaft; rejected here so it never takes a slot)
-	bool  ok   = !IsSky(d) && abs(ViewZ(d)) < 45.0 && abs(ViewZ(d)) > 6.0 && l > hdr.y;
+	bool  ok   = !IsSky(d) && abs(ViewZ(d)) < L_FAR && abs(ViewZ(d)) > L_NEAR && l > L_THRESH;
+#ifdef KYTY_HWRT_VOLUMETRIC
+	// (hwrt5v-4: only flame-like emitters: warm (red over blue) - the white door, sky light and its wet-floor reflections
+	// made lamps in mid-air; and a small hot spot: >= 3x its cell's mean (below))
+	ok = ok && c.r > 1.25 * c.b && c.r >= c.g * 0.9;
+	if (li == 0u) s_sum = 0u;
+	barrier();
+	atomicAdd(s_sum, min(uint(l * 256.0), 0xffffu));
+#endif
 	// (luminance in the high 26 bits, the tap in the low 6: the max picks the brightest)
 	s_best[li] = ok ? ((min(uint(l * 1024.0), 0x3ffffffu) << 6) | li) : 0u;
 	barrier();
@@ -133,6 +199,9 @@ void Lights(uvec3 wg, uint li) {
 	if (li == 0u) {
 		uint  b    = s_best[0];
 		uint  idx  = (cell.y * uint(CW) + cell.x) * 2u;
+#ifdef KYTY_HWRT_VOLUMETRIC
+		if (b != 0u && float(b >> 6) / 1024.0 < 3.0 * (float(s_sum) / 256.0 / 64.0)) b = 0u;
+#endif
 		if (b == 0u) {
 			cand[idx] = vec4(0), cand[idx + 1u] = vec4(0);
 		} else {
@@ -145,6 +214,9 @@ void Lights(uvec3 wg, uint li) {
 	}
 }
 
+#ifdef KYTY_HWRT_VOLUMETRIC
+void TrackWorld(int slots, float keep_t, float new_t);
+#endif
 void Track() {
 	int slots = int(hdr.z);
 	// The sun's hue from the sky: around the sun when it is on screen, else the upper screen.
@@ -178,17 +250,41 @@ void Track() {
 	bool claimed[CW * CH];
 	for (int i = 0; i < CW * CH; ++i) claimed[i] = false;
 	int used = 0;
+#ifdef KYTY_HWRT_VOLUMETRIC
+	float keep_t = 0.0, new_t = 0.0;
+	{
+		// The cells' mean brightest-tap luminance (cells without a valid tap count as 0): a lamp must stand 2.5x above it,
+		// at least L_FLOOR + 0.25, at most hdr.y. Smoothed (~1 s) so it never toggles the lights.
+		float sum = 0.0;
+		for (int i = 0; i < CW * CH; ++i) sum += min(cand[i * 2].x, 1.0); // (clamped: sun patches through windows or a few lamps barely move it)
+		float tt = clamp(2.5 * sum / float(CW * CH), L_FLOOR + 0.25, hdr.y);
+		float t  = L_ADAPT;
+		t        = (isnan(t) || t <= 0.0) ? tt : mix(t, tt, 0.005); // (~3 s)
+		stats[13] = floatBitsToUint(t);
+		new_t = t, keep_t = max(0.6 * t, L_FLOOR);
+	}
+	TrackWorld(slots, keep_t, new_t);
+	return;
+#endif
 	for (int k = 0; k < slots; ++k) {
 		vec4 a = lights[k * 2];
 		vec4 b = lights[k * 2 + 1];
 		if (a.w <= 0.0) continue;
+#ifdef KYTY_HWRT_VOLUMETRIC
+		// (a NaN slot would hold forever: free it)
+		if (any(isnan(a)) || any(isnan(b))) { lights[k * 2] = vec4(0), lights[k * 2 + 1] = vec4(0); continue; }
+		float w_before = a.w;
+#endif
 		// Reproject: the motion at the old place points to the previous frame; step the other way.
 		if (push.motion.z > 0.0) a.xy -= textureLod(motion_tex, a.xy, 0).xy * push.motion.xy / rs;
 		int   best = -1;
-		float bd   = 2.5;
+		float bd   = L_MATCH;
 		for (int i = 0; i < CW * CH; ++i) {
 			vec4 c = cand[i * 2];
 			if (claimed[i] || c.x <= 0.0) continue;
+#ifdef KYTY_HWRT_VOLUMETRIC
+			if (c.x <= keep_t) continue;
+#endif
 			float dist = length((c.yz - a.xy) * vec2(CW, CH));
 			if (dist < bd) bd = dist, best = i;
 		}
@@ -201,12 +297,17 @@ void Track() {
 			// (a depth jump of > 30 %: another surface took the tap, keep the old depth)
 			if (abs(zc - za) < 0.3 * abs(za)) a.z = mix(a.z, c.w, 0.2);
 			b.rgb = mix(b.rgb, col, 0.08);
-			a.w   = min(a.w + 0.06, 1.0);
+			a.w   = min(a.w + L_IN, 1.0);
 		} else {
-			a.w -= 0.03;
+			a.w -= L_OUT;
 		}
 		if (any(lessThan(a.xy, vec2(-0.05))) || any(greaterThan(a.xy, vec2(1.05)))) a.w -= 0.1;
 		if (a.w <= 0.0) a = vec4(0), b = vec4(0);
+#ifdef KYTY_HWRT_VOLUMETRIC
+		// (the 10 s log: halos crossing half weight, on / off)
+		if (w_before < 0.5 && a.w >= 0.5) atomicAdd(stats[3], 1u);
+		if (w_before >= 0.5 && a.w < 0.5) atomicAdd(stats[4], 1u);
+#endif
 		lights[k * 2] = a, lights[k * 2 + 1] = b;
 	}
 	// New lights: the strongest unclaimed candidates, >= 3 cells from every tracked one.
@@ -217,6 +318,9 @@ void Track() {
 		for (int i = 0; i < CW * CH; ++i) {
 			vec4 c = cand[i * 2];
 			if (claimed[i] || c.x <= bl) continue;
+#ifdef KYTY_HWRT_VOLUMETRIC
+			if (c.x <= new_t) continue; // (a new light needs the full (adaptive) threshold: hysteresis)
+#endif
 			bool near = false;
 			for (int j = 0; j < slots; ++j)
 				if (lights[j * 2].w > 0.0 && length((lights[j * 2].xy - c.yz) * vec2(CW, CH)) < 3.0) near = true;
@@ -232,6 +336,128 @@ void Track() {
 		if (lights[k * 2].w > 0.5) ++used;
 	atomicAdd(stats[1], uint(used));
 }
+
+#ifdef KYTY_HWRT_VOLUMETRIC
+void TrackWorld(int slots, float keep_t, float new_t) {
+	int used = 0;
+	if (push.hw.x > 0.5) {
+		mat3 Mi = ViewFromWorld();
+		vec3 T  = WorldT();
+		bool claimed[CW * CH];
+		for (int i = 0; i < CW * CH; ++i) claimed[i] = false;
+		for (int k = 0; k < slots; ++k) {
+			vec4 a = lights[k * 2];
+			vec4 b = lights[k * 2 + 1];
+			if (a.w <= 0.0) continue;
+			if (any(isnan(a)) || any(isnan(b))) { lights[k * 2] = vec4(0), lights[k * 2 + 1] = vec4(0); continue; }
+			float w_before = a.w;
+			vec3  v  = Mi * (a.xyz - T);
+			float ld = length(v);
+			vec2  uv;
+			bool  on     = Project(v, uv) && all(greaterThan(uv, vec2(0.03))) && all(lessThan(uv, vec2(0.97)));
+			bool  seen   = false;
+			bool  hidden = !on || ld < L_NEAR + 1.0 || ld > L_FAR;
+			if (on) {
+				int   best = -1;
+				float bd   = L_MATCH;
+				for (int i = 0; i < CW * CH; ++i) {
+					vec4 c = cand[i * 2];
+					if (claimed[i] || c.x <= keep_t) continue;
+					if (abs(abs(ViewZ(c.w)) - abs(v.z)) > 0.35 * abs(v.z) + 0.5) continue;
+					float dist = length((c.yz - uv) * vec2(CW, CH));
+					if (dist < bd) bd = dist, best = i;
+				}
+				if (best >= 0) {
+					claimed[best] = true;
+					seen          = true;
+					vec4 c        = cand[best * 2];
+					a.xyz         = mix(a.xyz, ToWorld(ViewPos(c.yz, c.w)), 0.05);
+					b.rgb         = mix(b.rgb, cand[best * 2 + 1].rgb, 0.05);
+				} else {
+					// (something nearer than the light at its pixel: the character, a pillar: occluded, not gone)
+					float dz = DepthAt(uv);
+					if (!IsSky(dz) && abs(ViewZ(dz)) < 0.9 * abs(v.z) - 0.3) hidden = true;
+				}
+			}
+			// (hwrt5v-3: a held lamp behind a wall / pillar glowed through it: one TLAS ray camera -> lamp a frame, smoothed
+			// ~0.25 s into the fraction of b.w (the integer part counts the frames unseen); the halo is scaled by it.)
+			float vis = fract(b.w) / 0.99;
+			{
+				rayQueryEXT rq;
+				float       len = max(ld - 0.6, 0.0);
+				vec3        dw  = a.xyz - T;
+				float       vt  = 1.0;
+				if (len > 0.1 && ld > 1e-3) {
+					rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xff, T, 0.1, dw / ld, len);
+					while (rayQueryProceedEXT(rq)) {}
+					vt = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT ? 0.0 : 1.0;
+				}
+				if (seen) vt = 1.0; // (found on screen this frame: visible whatever the capture says)
+				vis = clamp(mix(vis, vt, 0.07), 0.0, 1.0);
+			}
+			float unseen = floor(b.w);
+			if (seen) {
+				a.w = min(a.w + L_IN, 1.0), unseen = 0.0;
+			} else {
+				unseen += 1.0;
+				b.w = unseen;
+				// (visible but no candidate for ~0.4 s: really gone, a ~2.8 s fade; held off screen / occluded ~30 s)
+				if (unseen > (hidden ? 1800.0 : 25.0)) a.w -= L_OUT;
+			}
+			b.w = min(unseen, 4000.0) + vis * 0.99;
+			if (ld > 1.4 * L_FAR) a.w -= L_OUT;
+			if (a.w <= 0.0) a = vec4(0), b = vec4(0);
+			if (w_before < 0.5 && a.w >= 0.5) atomicAdd(stats[3], 1u);
+			if (w_before >= 0.5 && a.w < 0.5) atomicAdd(stats[4], 1u);
+			lights[k * 2] = a, lights[k * 2 + 1] = b;
+		}
+		int tries = 0;
+		for (int k = 0; k < slots; ++k) {
+			if (lights[k * 2].w > 0.0) continue;
+			int   best = -1;
+			float bl   = 0.0;
+			vec3  bw   = vec3(0);
+			for (int i = 0; i < CW * CH; ++i) {
+				vec4 c = cand[i * 2];
+				if (claimed[i] || c.x <= bl || c.x <= new_t) continue;
+				vec3 cw   = ToWorld(ViewPos(c.yz, c.w));
+				bool near = false;
+				for (int j = 0; j < slots; ++j) {
+					if (lights[j * 2].w <= 0.0) continue;
+					vec2 juv;
+					if (distance(lights[j * 2].xyz, cw) < 1.5 ||
+					    (Project(Mi * (lights[j * 2].xyz - T), juv) && length((juv - c.yz) * vec2(CW, CH)) < 3.0))
+						near = true;
+				}
+				if (!near) bl = c.x, best = i, bw = cw;
+			}
+			if (best < 0) break;
+			claimed[best]     = true;
+			{
+				// (hwrt5v-4: the candidate's surface must be in the capture: a TLAS ray from the camera reaches within 1 m of
+				// it. Smoke / particles (no geometry) or a depth from another surface fail: try the next candidate.)
+				vec3  dw = bw - T;
+				float dl = length(dw);
+				rayQueryEXT rq;
+				rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xff, T, 0.1, dw / max(dl, 1e-3), dl + 1.0);
+				while (rayQueryProceedEXT(rq)) {}
+				bool  hit = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+				float ht  = hit ? rayQueryGetIntersectionTEXT(rq, true) : 1e9;
+				if (!hit || abs(ht - dl) > 1.0 + 0.03 * dl) {
+					--k;
+					if (++tries > 6) break;
+					continue;
+				}
+			}
+			lights[k * 2]     = vec4(bw, 0.02);
+			lights[k * 2 + 1] = vec4(cand[best * 2 + 1].rgb, 0.99); // (visible: just found on screen)
+		}
+	}
+	for (int k = 0; k < slots; ++k)
+		if (lights[k * 2].w > 0.5) ++used;
+	atomicAdd(stats[1], uint(used));
+}
+#endif
 
 float Hg(float c, float g) {
 	float g2 = g * g;
@@ -249,7 +475,13 @@ void Volume(ivec2 q) {
 	float vz  = sky ? 2e3 : abs(ViewZ(d));
 	float scatter = 0.0;
 	// (a) the radial march toward the sun on screen.
+#ifdef KYTY_HWRT_VOLUMETRIC
+	// (KYTY_HWRT_VOLUMETRIC with a TLAS: no screen-space mask; the traced view-ray march below makes the shafts alone)
+	bool hw_on = push.hw.x > 0.5;
+	if (!hw_on && push.sun_uv.z > 0.0 && push.sun.w > 0.0) {
+#else
 	if (push.sun_uv.z > 0.0 && push.sun.w > 0.0) {
+#endif
 		vec2  aspect = vec2(RenderSize().x / RenderSize().y, 1.0);
 		vec2  to     = push.sun_uv.xy - uv;
 		float dist   = length(to * aspect);
@@ -274,8 +506,16 @@ void Volume(ivec2 q) {
 	int steps = int(push.motion.w);
 	if (steps > 0 && push.sun.w > 0.0) {
 		vec3  dir  = RayDir(uv);
+#ifdef KYTY_HWRT_VOLUMETRIC
+		float mlen = hw_on ? push.hw.z : 60.0;
+		float tmax = sky ? mlen : min(length(ViewPos(uv, d)), mlen);
+#else
 		float tmax = sky ? 60.0 : min(length(ViewPos(uv, d)), 60.0);
+#endif
 		vec3  L    = normalize(push.sun.xyz);
+#ifdef KYTY_HWRT_VOLUMETRIC
+		vec3  lw   = normalize(vec3(dot(push.w0.xyz, L), dot(push.w1.xyz, L), dot(push.w2.xyz, L)));
+#endif
 		float lit  = 0.0;
 		float dt   = tmax / float(steps);
 		for (int i = 0; i < steps; ++i) {
@@ -283,6 +523,14 @@ void Volume(ivec2 q) {
 			vec3  x = dir * t;
 			float vis = 1.0;
 			float s   = 0.6;
+#ifdef KYTY_HWRT_VOLUMETRIC
+			if (hw_on) {
+				// (vol3: far samples (Ultra marches 120 m) leave the TLAS's coverage: missing occluders read as lit; they
+				// count less with distance: 1 up to 50 m, 0.35 at 120 m and beyond)
+				lit += HwVis(x, lw) * dt * mix(1.0, 0.35, smoothstep(50.0, 120.0, t));
+				continue;
+			}
+#endif
 			for (int k = 0; k < 5; ++k) {
 				vec3 y = x + L * s;
 				s *= 2.2;
@@ -300,11 +548,22 @@ void Volume(ivec2 q) {
 			lit += vis * dt;
 		}
 		float phase = clamp(Hg(dot(dir, L), 0.55) / 1.0, 0.0, 6.0) / 6.0; // (1 toward the sun, ~0.03 away)
+#ifdef KYTY_HWRT_VOLUMETRIC
+		// (hwrt5v-2: a 30x drop as the camera turns from the sun made lit shafts vanish: an isotropic floor keeps them)
+		phase = 0.3 + 0.7 * phase;
+#endif
 		// The shafts' contrast, not a uniform haze: lit length / 60 m, weighted by the phase.
 		// Boost by the shaft-ness of the ray: partly lit rays (light through gaps) gain, fully lit or fully shadowed
 		// ones (a uniform haze indoors / outdoors) do not.
 		float fr = tmax > 0.0 ? clamp(lit / tmax, 0.0, 1.0) : 0.0;
+#ifdef KYTY_HWRT_VOLUMETRIC
+		// (rt3fx) the sky: no geometry along its view ray, so every step reads lit (the whole march length): a uniform
+		// bright veil over the sky and, through the upsample, white lines on the far silhouettes against it. The sky
+		// already carries the game's own fog: a third there, as the screen-space path's sky mask.
+		scatter += (lit / mlen) * phase * 0.35 * (1.0 + push.extra.w * (0.1 + 0.8 * fr * (1.0 - fr))) * (sky && hw_on ? 0.35 : 1.0);
+#else
 		scatter += (lit / 60.0) * phase * 0.35 * (1.0 + push.extra.w * (0.1 + 0.8 * fr * (1.0 - fr)));
+#endif
 	}
 	scatter *= push.sun.w;
 	imageStore(aux_out, q, vec4((isnan(scatter) || isinf(scatter)) ? 0.0 : clamp(scatter, 0.0, 4.0),
@@ -413,7 +672,7 @@ void Composite(ivec2 p) {
 	vec2  qp = uv * qs - 0.5;
 	ivec2 q0 = ivec2(floor(qp));
 	vec2  f  = qp - vec2(q0);
-	float vs = 0.0, ws = 0.0;
+	float vs = 0.0, ws = 0.0, wm = 0.0, vmin = 4.0;
 	for (int k = 0; k < 4; ++k) {
 		ivec2 o  = ivec2(k & 1, k >> 1);
 		ivec2 qq = clamp(q0 + o, ivec2(0), ivec2(qs) - 1);
@@ -421,9 +680,14 @@ void Composite(ivec2 p) {
 		float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
 		float dw = exp(-abs(v.y - vz) / max(0.05 * vz, 0.05));
 		float w  = bw * dw + 1e-4 * bw;
-		vs += v.x * w, ws += w;
+		vs += v.x * w, ws += w, wm += bw * dw;
+		vmin = min(vmin, Fin(v.x, 0.0, 4.0));
 	}
 	float vol = ws > 0.0 ? Fin(vs / ws, 0.0, 4.0) : 0.0;
+	// (vol3: a thin full-res edge (a far ledge, a rooftop, a walkway rail) whose depth matches none of its 4 quarter texels
+	// took their plain bilinear mix: the long, lit march of the fog / sky behind it, drawn as white lines along every
+	// silhouette. Without a depth match: the darkest of the 4, never more.)
+	vol = mix(vmin, vol, smoothstep(0.02, 0.25, wm));
 	// (the far backdrop already carries the game's fog: half there)
 	vol *= mix(1.0, 0.5, smoothstep(80.0, 300.0, vz));
 	vec3 add = vol * sunc.rgb * push.size.z * 0.6;
@@ -433,10 +697,21 @@ void Composite(ivec2 p) {
 		vec3  dir  = RayDir(uv);
 		float tmax = sky ? 200.0 : length(ViewPos(uv, d));
 		float R    = hdr.w;
+#ifdef KYTY_HWRT_VOLUMETRIC
+		mat3 Mi = ViewFromWorld();
+		vec3 T  = WorldT();
+		if (push.hw.x < 0.5) slots = 0;
+#endif
 		for (int k = 0; k < slots; ++k) {
 			vec4 a = lights[k * 2];
 			if (a.w <= 0.0) continue;
+#ifdef KYTY_HWRT_VOLUMETRIC
+			vec3  lp = Mi * (a.xyz - T);
+			float lvis = fract(lights[k * 2 + 1].w) / 0.99;
+			if (lvis <= 0.01) continue;
+#else
 			vec3  lp = ViewPos(a.xy, a.z);
+#endif
 			float ld = length(lp);
 			float fade = smoothstep(45.0, 12.0, ld) * smoothstep(6.0, 14.0, ld) * smoothstep(0.0, 1.0, a.w);
 			// Fade by the halo's size on screen (its 4 R cut as a fraction of the screen height): a near, small light
@@ -452,6 +727,13 @@ void Composite(ivec2 p) {
 			I = min(I, 2.0); // (clamp: the core of a light the ray grazes stays a glow, not a flare)
 			vec3  lc = lights[k * 2 + 1].rgb;
 			float ll = min(Luma(lc), 12.0);
+#ifdef KYTY_HWRT_VOLUMETRIC
+			// (a dark scene's lamps, tracked under the lowered threshold: the halo scaled as if at hdr.y, <= 4x)
+			ll *= clamp(hdr.y / max(L_ADAPT, 1e-3), 1.0, 1.5); // (hwrt5v-4: was <= 4x: the halos read as glowing disks)
+#endif
+#ifdef KYTY_HWRT_VOLUMETRIC
+			ll *= lvis;
+#endif
 			add += Hue(lc) * (ll * 0.01 * I * fade * push.extra.z);
 		}
 	}

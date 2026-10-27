@@ -1779,6 +1779,7 @@ struct FramePayload {
 std::array<float, 16> g_inv {};
 std::array<float, 4>  g_cam {};
 bool                  g_frame_camera = false;
+std::array<float, 16> g_frame_vp {}; // (hwrt3v: the view-projection the frame's TLAS was built with)
 
 } // namespace
 
@@ -1831,6 +1832,7 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 	if (camera && std::abs(inv[14]) > 1e-20)
 		for (int i = 0; i < 3; ++i) g_cam[i] = static_cast<float>(inv[i * 4 + 2] / inv[14]);
 	g_frame_camera = camera;
+	if (camera) g_frame_vp = g.view_proj;
 	if (!camera) ++g.frames_no_camera;
 
 	auto             payload = std::make_shared<FramePayload>();
@@ -2289,17 +2291,6 @@ void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageVie
 	});
 }
 
-bool CurrentRayScene(RayScene& out) {
-	out = {};
-	if (!Active()) return false;
-	std::lock_guard lock(g.mutex);
-	if (!g.ready || g.ray_slot < 0 || g.tlas == nullptr) return false;
-	out.tlas   = reinterpret_cast<uint64_t>(static_cast<VkAccelerationStructureKHR>(g.tlas));
-	out.info   = vk::Buffer(g.rayinfo[g.ray_slot].buffer);
-	out.size   = sizeof(RayInfo);
-	return true;
-}
-
 bool SceneCamera(std::array<float, 16>& vp) {
 	if (!Active()) return false;
 	std::lock_guard lock(g.mutex);
@@ -2317,6 +2308,27 @@ vk::AccelerationStructureKHR SceneTlas(bool* built_now) {
 	return g.tlas;
 }
 
+bool CurrentRayScene(RayScene& out) {
+	out = {};
+	if (!Active()) return false;
+	std::lock_guard lock(g.mutex);
+	if (!g.ready || g.ray_slot < 0 || g.tlas == nullptr) return false;
+	out.tlas   = reinterpret_cast<uint64_t>(static_cast<VkAccelerationStructureKHR>(g.tlas));
+	out.info   = vk::Buffer(g.rayinfo[g.ray_slot].buffer);
+	out.size   = sizeof(RayInfo);
+	return true;
+}
+
+vk::AccelerationStructureKHR VolumetricTlas(bool* built_now, std::array<float, 16>* view_proj) {
+	if (built_now != nullptr) *built_now = false;
+	if (!Active()) return nullptr;
+	std::lock_guard lock(g.mutex);
+	if (!g.ready || g.tlas == nullptr) return nullptr;
+	if (built_now != nullptr) *built_now = g.tlas_built;
+	if (view_proj != nullptr) *view_proj = g_frame_camera ? g_frame_vp : std::array<float, 16> {};
+	return g.tlas;
+}
+
 void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, std::span<const TextureBinding> images) {
 	if (!Active()) return;
 	EndFrame(graphics, command, "the TAA dispatch");
@@ -2325,6 +2337,19 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 		DebugView(graphics, command, images[6].image_view, output.backing.format,
 		          vk::Extent2D {output.backing.extent.width, output.backing.extent.height});
 	}
+}
+
+// (hwrt2g, KYTY_HWRT_AO / KYTY_HWRT_GI: hwrt-gi.cpp) The scene just built, for a pass recorded after it in this frame.
+bool GiScene(GiSceneInfo& out) {
+	out = {};
+	if (!Active()) return false;
+	std::lock_guard lock(g.mutex);
+	if (!g.ready || g.tlas == nullptr || !g.tlas_built || !g_frame_camera) return false;
+	out.tlas = g.tlas;
+	out.inv  = g_inv;
+	out.vp   = g.view_proj;
+	out.cam  = g_cam;
+	return true;
 }
 
 } // namespace Libs::Graphics::HwScene
