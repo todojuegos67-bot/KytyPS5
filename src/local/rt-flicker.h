@@ -8,7 +8,7 @@
 
 namespace Libs::Graphics::FrameGen::RtFlicker {
 
-enum Pass : uint32_t { Particles = 0, Sun = 1, Lights = 2, Reflections = 3, Volumetric = 4, Count = 5 };
+enum Pass : uint32_t { Particles = 0, Sun = 1, Lights = 2, Reflections = 3, Volumetric = 4, Metal = 5, Count = 6 };
 // Once a frame, before the passes: whether the camera holds still since the last frame.
 void BeginFrame(const UpscaleInputs& inputs);
 // (rtstab2) Whether the camera held still this frame, and for how many frames in a row (computed even with the
