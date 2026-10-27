@@ -195,14 +195,16 @@ void EmitMemoryOffsets(EmitterState& state) {
 			dynamic_offsets[state.program.info.buffers[candidate].descriptor_index] = true;
 		}
 	}
+	// Static offsets are emitted for every descriptor, also those of shared bindless tables:
+	// paths that bypass EmitBufferAccess (64-bit loads/atomics, ByteAddress without a prefix)
+	// read memory_byte_offsets directly, and a skipped entry was emitted as id 0 (Yotei CS
+	// d8959888aafd2552 with the runtime-stride tables: "Id is 0").
+	(void)dynamic_offsets;
 	for (uint32_t i = 0; i < count; i += 4u) {
 		const auto lanes = std::min(4u, count - i);
-		if (std::all_of(dynamic_offsets.begin() + i, dynamic_offsets.begin() + i + lanes,
-		                [](bool dynamic) { return dynamic; })) continue;
 		const auto word =
 		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
 		for (uint32_t lane = 0; lane < lanes; ++lane) {
-			if (dynamic_offsets[i + lane]) continue;
 			state.memory_byte_offsets[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
 		}

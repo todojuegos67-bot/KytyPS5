@@ -27,6 +27,8 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <cstdio>
+#include <chrono>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -240,6 +242,27 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+namespace {
+// SlowDispatch: a dispatch whose host-side recording (translation, pipeline creation, binding)
+// takes >= 200 ms. Yotei: gpu.compute 2.3 s per submission while the GPU sat at ~2%, so the time
+// is CPU work on Thread_Gpu, not shader execution. Names the guest shader and the groups.
+struct SlowDispatchTimer {
+	const char*                           kind;
+	uint64_t                              shader_addr;
+	uint32_t                              x, y, z;
+	std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+	~SlowDispatchTimer() {
+		const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+		if (ms < 200.0) return;
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) >= 200u) return;
+		std::printf("SlowDispatch: %s shader_addr=0x%016llx groups=%ux%ux%u host=%.0f ms\n", kind,
+		            static_cast<unsigned long long>(shader_addr), x, y, z, ms);
+		std::fflush(stdout);
+	}
+};
+} // namespace
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
@@ -251,6 +274,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
+	const SlowDispatchTimer slow_timer {"direct", sh_ctx.GetCs().cs_regs.data_addr, thread_group_x,
+	                                    thread_group_y, thread_group_z};
 
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
 		static std::atomic<uint32_t> log_count {0};

@@ -822,6 +822,13 @@ void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeli
 	                                                           &pipeline.pipeline);
 	Prewarm::NoteRuntimeCompile(false, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                       std::chrono::steady_clock::now() - compile_start).count()));
+	if (const auto compile_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start).count();
+	    compile_ms >= 200.0) {
+		std::printf("PipelineSlow: compute words=%llu flags=0x%x vkCreateComputePipelines=%.0f ms\n",
+		            static_cast<unsigned long long>(job.spirv_words), static_cast<unsigned>(VkPipelineCreateFlags(info.flags)),
+		            compile_ms);
+		std::fflush(stdout);
+	}
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

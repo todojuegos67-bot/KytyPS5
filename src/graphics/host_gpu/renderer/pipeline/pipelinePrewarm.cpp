@@ -300,6 +300,35 @@ bool BuildLayout(Reader& rd, vk::Device device, uint32_t push_size, Layout& out)
 	// layouts stay alive: the pipeline is used with gameplay's identically defined ones
 }
 
+// Seed modules that passed validation once are listed in <seed>.valid and not validated again
+// (validating every module made the warm-up 18-20 s instead of ~3 s).
+std::mutex                   g_valid_mutex;
+std::unordered_set<uint64_t> g_valid;
+std::FILE*                   g_valid_out = nullptr;
+
+void OpenValidated(const std::filesystem::path& seed) {
+	const auto path = seed.string() + ".valid";
+	std::lock_guard lock(g_valid_mutex);
+	if (std::FILE* in = std::fopen(path.c_str(), "r"); in != nullptr) {
+		unsigned long long h = 0;
+		while (std::fscanf(in, " %llx", &h) == 1) g_valid.insert(h);
+		std::fclose(in);
+	}
+	g_valid_out = std::fopen(path.c_str(), "a");
+}
+
+bool ValidatedBefore(uint64_t hash) {
+	std::lock_guard lock(g_valid_mutex);
+	return g_valid.contains(hash);
+}
+
+void NoteValidated(uint64_t hash) {
+	std::lock_guard lock(g_valid_mutex);
+	if (!g_valid.insert(hash).second || g_valid_out == nullptr) return;
+	std::fprintf(g_valid_out, "%016llx\n", static_cast<unsigned long long>(hash));
+	std::fflush(g_valid_out);
+}
+
 vk::ShaderModule LoadModule(Context& ctx, std::FILE* f, uint64_t hash, vk::Device device) {
 	uint64_t offset = 0;
 	uint32_t words  = 0;
@@ -323,7 +352,7 @@ vk::ShaderModule LoadModule(Context& ctx, std::FILE* f, uint64_t hash, vk::Devic
 		const char* v = std::getenv("KYTY_PREWARM_VALIDATE");
 		return v == nullptr || std::strcmp(v, "0") != 0;
 	}();
-	if (validate) {
+	if (validate && !ValidatedBefore(hash)) {
 		spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
 		std::string          first;
 		tools.SetMessageConsumer([&first](spv_message_level_t, const char*, const spv_position_t&, const char* m) {
@@ -337,6 +366,7 @@ vk::ShaderModule LoadModule(Context& ctx, std::FILE* f, uint64_t hash, vk::Devic
 			std::fflush(stdout);
 			return nullptr;
 		}
+		NoteValidated(hash);
 	}
 	vk::ShaderModuleCreateInfo info {};
 	info.codeSize           = code.size() * 4u;
@@ -1180,6 +1210,7 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 		std::fflush(stdout);
 		if (!ctx.queue.empty()) {
 			OpenInflight(ctx.path);
+			OpenValidated(ctx.path);
 			for (unsigned i = 0; i < threads; i++) {
 				ctx.threads.emplace_back(Worker);
 			}

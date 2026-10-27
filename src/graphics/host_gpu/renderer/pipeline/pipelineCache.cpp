@@ -198,6 +198,26 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	LOGF_COLOR(Log::Color::BrightRed, "%s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s",
 	           label, shader_hash, messages.c_str());
 	LOGF("%s\n", text.c_str());
+	// Always kept for diagnosis (the LOG may be silent): binary + plain disassembly + messages.
+	{
+		const auto base = fmt::format("_PipelineCache/spirv-fail-{:016x}", shader_hash);
+		if (std::FILE* f = std::fopen((base + ".spv").c_str(), "wb"); f != nullptr) {
+			std::fwrite(spirv.data(), 4, spirv.size(), f);
+			std::fclose(f);
+		}
+		std::string plain;
+		disassembler.Disassemble(spirv, &plain,
+		                         static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_NO_HEADER) |
+		                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES) |
+		                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_INDENT));
+		if (std::FILE* f = std::fopen((base + ".txt").c_str(), "w"); f != nullptr) {
+			std::fprintf(f, "%s\n%s", messages.c_str(), plain.c_str());
+			std::fclose(f);
+		}
+		std::printf("SPIR-V validation failed hash=0x%016" PRIx64 ": %s(dumped to %s.spv/.txt)\n", shader_hash,
+		            messages.c_str(), base.c_str());
+		std::fflush(stdout);
+	}
 	return false;
 }
 
