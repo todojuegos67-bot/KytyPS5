@@ -22,6 +22,7 @@
 // texels, invalid motion vectors rejected, the sky's history short, our light never blackens a pixel; boosts lowered.
 // Every 10 s: "GODRAYS: stats" with the GPU ms, the sun on / off screen and the lights used.
 #include "local/godrays.h"
+#include "local/volshadow.h"
 
 #include "graphics/presentation/videoOut.h"
 #include "gpu_tiler_shaders/godrays_spv.h"
@@ -38,7 +39,7 @@
 namespace Libs::Graphics::FrameGen {
 namespace {
 
-constexpr uint32_t Bindings    = 10;
+constexpr uint32_t Bindings    = 11; // (10: KYTY_HWRT_VOLSHADOW's TLAS visibility; a dummy when off)
 constexpr uint32_t StatsWord   = 4;
 constexpr uint32_t StatsCount  = 16;
 constexpr uint32_t Cells       = 16 * 9;
@@ -498,6 +499,10 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.extra[2] = lstr;
 	push.extra[3] = level <= 2 ? 1.0f : 0.0f; // (the visibility boost)
 
+	// (KYTY_HWRT_VOLSHADOW, volshadow.cpp: the view-ray march's TLAS visibility on this quarter grid; null when off)
+	const vk::ImageView rt_vis = steps > 0 ? VolShadowRun(command, inputs, g_gr.qextent, sun, sun_fade, row0_up) : nullptr;
+	if (rt_vis != nullptr) push.misc[2] |= 4;
+
 	const auto entry = static_cast<uint32_t>(g_gr.written % 8);
 	const bool timed = g_gr.pool != nullptr && g_gr.written < g_gr.read + 8;
 	if (timed) {
@@ -539,6 +544,7 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	infos[5] = {nullptr, g_gr.out.view, gen};
 	infos[8] = {g_gr.point, g_gr.filt.view, gen}; // (lights / track / volume: not read)
 	infos[9] = {nullptr, g_gr.raw.view, gen};     // volume: the raw scatter
+	infos[10] = {g_gr.point, rt_vis != nullptr ? rt_vis : g_gr.filt.view, gen}; // (volume, misc.z bit 2 only)
 	const vk::DescriptorBufferInfo frame_info {vk::Buffer(g_gr.frame_buf), 0, VK_WHOLE_SIZE};
 	const vk::DescriptorBufferInfo exposure_info =
 	    game_exposure ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range} : frame_info;
