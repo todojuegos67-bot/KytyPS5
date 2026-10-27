@@ -114,7 +114,16 @@ bool CopyUsable(uint64_t now, uint64_t copy_flip, bool& held, const char** why) 
 		std::lock_guard lock(g.mutex);
 		use = g.use_flip;
 	}
-	if (use == ~0ull || now > use + 8) return refuse("game not using the sun shadows (indoors?)");
+	// (ds-rt-shadow 10-28) no use gate: the consumer dispatches run on the table path, which never reaches
+	// RtSunAfterDispatch, so "in use" was seen only on copy frames (20261028-001032 log: refused 579-665 of ~700 frames,
+	// held 0) and the pass toggled. The copy is the game's current cascade until it copies again; the composite compares
+	// against the game's own lookup on the same copy, so where the game itself is shadowed (indoors) nothing changes.
+	// KYTY_HWRT_SOFTSUN_GATE=1: the old gate.
+	static const bool gate = [] {
+		const char* v = std::getenv("KYTY_HWRT_SOFTSUN_GATE");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (gate && (use == ~0ull || now > use + 8)) return refuse("game not using the sun shadows (indoors?)");
 	if (now > copy_flip + hold) return refuse("copy older than KYTY_HWRT_SOFTSUN_HOLD");
 	held = true;
 	return true;
