@@ -11,6 +11,9 @@ namespace Libs::Graphics::FrameGen::RtFlicker {
 enum Pass : uint32_t { Particles = 0, Sun = 1, Lights = 2, Reflections = 3, Volumetric = 4, Count = 5 };
 // Once a frame, before the passes: whether the camera holds still since the last frame.
 void BeginFrame(const UpscaleInputs& inputs);
+// (refl-pro) The camera held still since the last frame / for how many frames in a row.
+bool     CameraStill();
+uint32_t StillFrames();
 // After a pass that replaced inputs.color (before: the color it read).
 void Probe(vk::CommandBuffer command, GraphicContext* graphics, Pass pass, const UpscaleImage& before, const UpscaleImage& after);
 
