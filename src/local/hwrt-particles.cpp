@@ -39,7 +39,7 @@ namespace {
 
 constexpr uint32_t Bindings  = 12;
 constexpr uint32_t MaxLights = 576;
-constexpr uint32_t LightBytes = 32 + MaxLights * 32 + MaxLights * 4 + MaxLights * 4;
+constexpr uint32_t LightBytes = 32 + MaxLights * 32 + MaxLights * 4 + MaxLights * 4 + MaxLights * 32; // (+ the tracked emitters)
 
 struct HpPush {
 	float   size[4];
@@ -356,7 +356,14 @@ bool HwParticlesApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		g_hp.history_valid = false;
 		return false;
 	}
-	const vk::ImageView pre = RtParticlesPreCopy(inputs.color_address, color.extent);
+	vk::ImageView       pre        = RtParticlesPreCopy(inputs.color_address, color.extent);
+	vk::ImageLayout     pre_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	if (pre == nullptr && g_hp.history_valid) {
+		// (no particles drawn this flip: the color stands in for the copy, no emission, so the tracked emitters and the
+		// history fade out instead of a reset and a pop when they return)
+		++g_hp.no_pre;
+		pre = color.view, pre_layout = color.layout;
+	}
 	if (pre == nullptr) {
 		++g_hp.no_pre;
 		g_hp.history_valid = false; // (no particles drawn this flip: the history restarts when they return)
@@ -377,8 +384,12 @@ bool HwParticlesApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	Log(level);
 
 	const auto now = std::chrono::steady_clock::now();
-	if (g_hp.last_frame.time_since_epoch().count() != 0 && now - g_hp.last_frame > std::chrono::milliseconds(250))
-		g_hp.history_valid = false;
+	float      dt  = 1.0f / 60.0f;
+	if (g_hp.last_frame.time_since_epoch().count() != 0) {
+		dt = std::chrono::duration<float>(now - g_hp.last_frame).count();
+		if (now - g_hp.last_frame > std::chrono::milliseconds(500)) g_hp.history_valid = false;
+	}
+	dt = std::clamp(dt, 0.0f, 0.1f);
 	g_hp.last_frame = now;
 
 	const float strength = EnvFloat("KYTY_HWRT_PARTICLES_STRENGTH", 1.0f, 0.0f, 4.0f);
@@ -399,7 +410,7 @@ bool HwParticlesApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.size[2] = static_cast<float>(g_hp.textent.width), push.size[3] = static_cast<float>(g_hp.textent.height);
 	// (2: the internal gain over the physical I x cos / d^2: the game's flames are far dimmer than real fire)
 	push.params[0] = strength * 2.0f, push.params[1] = range, push.params[2] = 0.5f;
-	push.params[3] = level >= 3 ? 0.08f : level == 2 ? 0.1f : 0.12f;
+	push.params[3] = level >= 3 ? 0.05f : level == 2 ? 0.06f : 0.07f;
 	push.misc[1]  = static_cast<int32_t>(g_hp.frame & 0x7fffffff);
 	push.misc[2]  = level >= 3 ? 8 : level == 2 ? 6 : 4;
 	push.misc[3]  = level >= 3 ? 2 : 1;
@@ -457,7 +468,7 @@ bool HwParticlesApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	infos[1] = {g_hp.point, inputs.depth.view, inputs.depth.layout};
 	infos[2] = inputs.motion.view != nullptr ? vk::DescriptorImageInfo {g_hp.point, inputs.motion.view, inputs.motion.layout}
 	                                         : vk::DescriptorImageInfo {g_hp.point, g_hp.tmp.view, gen};
-	infos[3] = {g_hp.point, pre, ro};
+	infos[3] = {g_hp.point, pre, pre_layout};
 	infos[4] = have_albedo ? vk::DescriptorImageInfo {g_hp.point, gbuf.views[0], ro} : vk::DescriptorImageInfo {g_hp.point, g_hp.dummy.view, gen};
 	infos[5] = {g_hp.linear, g_hp.hist[cur ^ 1u].view, gen};
 	infos[6] = {nullptr, g_hp.raw.view, gen};
@@ -492,6 +503,7 @@ bool HwParticlesApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	};
 	const uint32_t tx = (g_hp.textent.width + 7) / 8, ty = (g_hp.textent.height + 7) / 8;
 	push_set();
+	push.extra[2] = dt; // (collect: the tracking's time step)
 	run(0, tiles_x, tiles_y); // collect
 	run(1, 1, 1);             // cdf
 	run(2, tx, ty);           // trace -> raw
