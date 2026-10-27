@@ -6,6 +6,9 @@
 // shards on a worker thread, the specializations of recorded play first (released-/hinted-<id>.seeds, from the shipped
 // hints and this PC's recordings), then every shader the game ships; the shards merged into
 // _PipelineCache/static/<title>_<version>.bin(aries). Stopped, it resumes the next time (finished shards are kept).
+// (10-27c) Instead: every pipeline recipe of the static inputs (_PipelineCache/static/<id>.shaders, the splash's step 3)
+// compiled by 256 shards into the driver cache the game loads (_PipelineCache/local/<key>/<title>.bin), merged as they
+// finish and when stopped (JUGAR); "current" once all 256 are in it for these inputs (<bin>.static-done).
 
 #include <cstdint>
 #include <filesystem>
@@ -23,7 +26,7 @@ struct Setup {
 };
 
 void Configure(const Setup& setup);
-// "--status": the static cache is this GPU's and driver's and not older than the seeds.
+// "--driver-cache-status": the game's driver cache holds every static recipe of this GPU's and driver's inputs.
 bool CacheCurrent();
 void Start();
 void Stop(); // waits for the worker (the running shards are killed; what finished is kept)

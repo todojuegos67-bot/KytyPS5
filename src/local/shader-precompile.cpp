@@ -98,6 +98,9 @@ int main(int argc, char* argv[]) {
 	bool                           keep   = false; // --keep-shards
 	bool                           stamp  = false; // --stamp: a precompile's last merge (the store's translation features)
 	bool                           status = false;
+	// (10-27c) The local driver cache warmed with the static inputs' recipes: a shard of it (--shard i/n), the merge of
+	// the shards' files into it, or whether all n are in it (KYTY_WARM_DRIVER_CACHE_KEY names the cache).
+	bool                           warm_driver = false, merge_driver = false, driver_status = false;
 	PipelineCache::PrecompileOptions options;
 	StaticSeeds::Options             make_seeds;          // --make-seeds and its options
 	bool                             seed_option = false; // --states, --stages or --limit
@@ -123,6 +126,12 @@ int main(int argc, char* argv[]) {
 			stamp = true;
 		} else if (arg == "--status") {
 			status = true;
+		} else if (arg == "--warm-driver-cache") {
+			warm_driver = true;
+		} else if (arg == "--merge-driver-cache") {
+			merge_driver = true;
+		} else if (arg == "--driver-cache-status") {
+			driver_status = true;
 		} else if (arg == "--no-pipelines") {
 			options.pipelines = false;
 		} else if (arg == "--dry-run") {
@@ -276,6 +285,22 @@ int main(int argc, char* argv[]) {
 	// Compute seeds as the game gets this GPU's programs (PipelineCache::GetComputeProgram: 64-lane host subgroups
 	// where wave64 programs run natively, else 32), whatever host subgroups they were listed or recorded with.
 	if (options.host_subgroup_size == 0) options.host_subgroup_size = graphics.SupportsComputeWave64() ? 64u : 32u;
+	if (warm_driver || merge_driver || driver_status) {
+		bool ok = false;
+		if (driver_status) {
+			uint32_t done = 0;
+			const bool warm = PipelineCache::DriverCacheWarm(graphics, options.shards, &done);
+			std::printf("driver cache %s (%u of %u shards)\n", warm ? "warm" : "cold", done, options.shards);
+			ok = true;
+		} else if (merge_driver) {
+			ok = PipelineCache::MergeDriverCacheShards(graphics, options.shards);
+		} else {
+			ok = PipelineCache::WarmDriverCacheShard(graphics, options.shard, options.shards, options.threads);
+		}
+		std::printf("Driver cache warm: %s\n", ok ? "complete" : "failed");
+		std::fflush(nullptr);
+		std::_Exit(ok ? 0 : 1);
+	}
 	if (status) {
 		// (outdated: this GPU's and driver's, older than the seeds.)
 		const bool built = PipelineCache::StaticCacheCurrent(graphics, {});

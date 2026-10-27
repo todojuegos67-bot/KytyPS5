@@ -1204,6 +1204,8 @@ if (KYTY_DS_PORT AND WIN32)
 		"${KYTY_SOURCE_DIR}/port/ds-update.cpp"
 		"${KYTY_SOURCE_DIR}/port/ds-update.h"
 		"${KYTY_SOURCE_DIR}/port/ds-precompile.cpp"
+		"${KYTY_SOURCE_DIR}/port/ds-steam.cpp"
+		"${KYTY_SOURCE_DIR}/port/ds-steam.h"
 		"${KYTY_SOURCE_DIR}/port/ds-i18n.cpp"
 		"${KYTY_SOURCE_DIR}/port/ds-i18n.h"
 		"${KYTY_SOURCE_DIR}/port/ds-precompile.h"
@@ -1215,7 +1217,7 @@ if (KYTY_DS_PORT AND WIN32)
 		"${KYTY_SOURCE_DIR}/port/ds-port.rc")
 	if (KYTY_CLANG_CL)
 		set_source_files_properties("${KYTY_SOURCE_DIR}/port/ds-main.cpp" "${KYTY_SOURCE_DIR}/port/ds-menu.cpp"
-			"${KYTY_SOURCE_DIR}/port/ds-settings.cpp" "${KYTY_SOURCE_DIR}/port/ds-update.cpp" "${KYTY_SOURCE_DIR}/port/ds-precompile.cpp" "${KYTY_SOURCE_DIR}/port/ds-i18n.cpp" PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
+			"${KYTY_SOURCE_DIR}/port/ds-settings.cpp" "${KYTY_SOURCE_DIR}/port/ds-update.cpp" "${KYTY_SOURCE_DIR}/port/ds-precompile.cpp" "${KYTY_SOURCE_DIR}/port/ds-steam.cpp" "${KYTY_SOURCE_DIR}/port/ds-i18n.cpp" PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 	endif()
 	# (The icon by name from resources/.)
 	set_property(SOURCE "${KYTY_SOURCE_DIR}/port/ds-port.rc" APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/resources")
@@ -1230,7 +1232,7 @@ if (KYTY_DS_PORT AND WIN32)
 		# A Windows program with the usual main(): no console window.
 		target_link_options(kyty_emulator PRIVATE "/ENTRY:mainCRTStartup")
 	endif()
-	target_link_libraries(kyty_emulator ole32 shell32 uuid gdi32 winhttp dxgi advapi32)
+	target_link_libraries(kyty_emulator ole32 oleaut32 shell32 uuid gdi32 winhttp dxgi advapi32 windowscodecs)
 	# (10-27) The version stamp the in-game update compares with releases/latest (the CI passes its package name, the tag).
 	set(KYTY_DS_PORT_VERSION "" CACHE STRING "Demon's Souls PC port version (its release tag)")
 	if (KYTY_DS_PORT_VERSION)

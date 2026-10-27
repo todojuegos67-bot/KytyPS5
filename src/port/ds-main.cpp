@@ -12,6 +12,7 @@
 #include "port/ds-port.h"
 #include "port/ds-update.h"
 #include "port/ds-precompile.h"
+#include "port/ds-steam.h"
 #include "port/ds-i18n.h"
 
 #include <nlohmann/json.hpp>
@@ -196,6 +197,8 @@ struct Splash {
 	std::wstring            status = L"Cargando...";
 	std::vector<uint8_t>    bgra;
 	int                     w = 0, h = 0;
+	float                   progress = -1.0f; // (10-27c) the start-up precompile's bar (0..1; <0: none)
+	std::atomic<bool>       skip {false};     // (10-27c) Esc during the precompile: play now
 } g_splash;
 
 LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -236,12 +239,31 @@ LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			DrawTextW(dc, status.c_str(), -1, &shade, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 			SetTextColor(dc, RGB(222, 196, 140));
 			DrawTextW(dc, status.c_str(), -1, &text, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+			float progress;
+			{
+				std::scoped_lock lock(g_splash.mutex);
+				progress = g_splash.progress;
+			}
+			if (progress >= 0.0f) {
+				// (10-27c) The precompile's progress bar above the status line.
+				RECT bar = {rc.left + height, rc.bottom - height * 4, rc.right - height, rc.bottom - height * 3 - height / 3};
+				HBRUSH back = CreateSolidBrush(RGB(30, 26, 20)), fill = CreateSolidBrush(RGB(222, 196, 140));
+				FillRect(dc, &bar, back);
+				RECT done = bar;
+				done.right = bar.left + static_cast<LONG>((bar.right - bar.left) * std::min(1.0f, progress));
+				FillRect(dc, &done, fill);
+				DeleteObject(back);
+				DeleteObject(fill);
+			}
 			SelectObject(dc, old);
 			DeleteObject(font);
 			EndPaint(hwnd, &ps);
 			return 0;
 		}
 		case WM_ERASEBKGND: return 1;
+		case WM_KEYDOWN:
+			if (wp == VK_ESCAPE) g_splash.skip = true;
+			return 0;
 		case WM_CLOSE: DestroyWindow(hwnd); return 0;
 		case WM_DESTROY: PostQuitMessage(0); return 0;
 		default: return DefWindowProcW(hwnd, msg, wp, lp);
@@ -281,6 +303,14 @@ void ShowSplash(const std::string& image) {
 		}
 		g_splash.window = nullptr;
 	}).detach();
+}
+
+void SplashProgress(float f) {
+	{
+		std::scoped_lock lock(g_splash.mutex);
+		g_splash.progress = f;
+	}
+	if (HWND w = g_splash.window.load(); w != nullptr) InvalidateRect(w, nullptr, FALSE);
 }
 
 void SplashStatus(const std::string& text) {
@@ -493,7 +523,7 @@ void PrepareShaders(const fs::path& root, const std::string& game, const GamePar
 	const std::string status = ReadText(status_file);
 	std::printf("[port] shaders: %s\n", status.find("inputs current") != std::string::npos ? "prefetch inputs ready" : "making the prefetch inputs");
 	if (status.find("inputs current") == std::string::npos) {
-		SplashStatus("Preparando shaders 3/3: para esta grafica (primera vez o driver nuevo: un minuto). Despues, en la pantalla de titulo, se compilan con su progreso en pantalla.");
+		SplashStatus("Preparando shaders 3/3: para esta grafica (primera vez o driver nuevo: un minuto). Despues se compilan todos los pipelines con su barra de progreso.");
 		if (RunHidden(tool, base + L"--no-pipelines --static-inputs --threads " + std::to_wstring(cpus), root, log, affinity) != 0)
 			std::printf("[port] shaders: making the prefetch inputs failed\n");
 	}
@@ -560,6 +590,14 @@ int main(int argc, char* argv[]) {
 	const int olds = Port::Update::RemoveOldFiles(root);
 	fs::create_directories(root / L"logs", ec);
 	const bool restarted = argc > 1 && std::string(argv[1]) == "--restarted";
+	// (10-27c) --add-to-steam: the Steam shortcut (ds-steam.cpp), its result in a message, then out.
+	for (int i = 1; i < argc; i++) {
+		if (std::string(argv[i]) != "--add-to-steam") continue;
+		std::string report;
+		const bool  ok = Port::Steam::AddToSteam(g_exe, &report);
+		Message(report, ok ? MB_ICONINFORMATION : MB_ICONWARNING);
+		return ok ? 0 : 1;
+	}
 
 	// One game at a time (a restart waits for the one before to end).
 	HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\DemonsSoulsPC");
@@ -605,7 +643,8 @@ int main(int argc, char* argv[]) {
 	if (!restarted && !RamWarning()) return 0;
 	ShowSplash(image);
 	// (10-27b) With the start menu the game folder is chosen there (its "Carpeta del juego" row, or at JUGAR).
-	const bool start_menu = settings.start_menu && !restarted;
+	// (10-27c) No start menu: the exe starts the game (the folder asked once, settings.ini keeps it; options in F1).
+	const bool start_menu = false;
 	while (!start_menu && !IsGame(settings.game)) {
 		if (!settings.game.empty())
 			Message("No hay eboot.bin en:\n" + settings.game + "\n\nElige la carpeta del juego volcado (la que tiene eboot.bin y sce_sys).");
@@ -678,11 +717,35 @@ int main(int argc, char* argv[]) {
 		ps.cpus     = cpus;
 		Port::Precompile::Configure(ps);
 		std::error_code pe;
-		if (start_menu && !ps.id.empty() && fs::exists(ps.seeds, pe)) {
+		if (!ps.id.empty() && fs::exists(ps.seeds, pe)) {
 			SplashStatus("Comprobando la cache de shaders...");
 			const bool current = Port::Precompile::CacheCurrent();
-			std::printf("[port] static shader cache: %s\n", current ? "current" : "to be made (the start menu precompiles it)");
-			if (!current) Port::Precompile::Start();
+			std::printf("[port] driver pipeline cache: %s\n", current ? "every static recipe in it" : "to be made (start-up precompile)");
+			std::fflush(stdout);
+			if (!current) {
+				// (10-27c) Every pipeline of the game into this GPU's driver cache, before the game, with its bar; Esc plays
+				// now (what is done is kept, the rest the next start or beside the game).
+				g_splash.skip = false;
+				if (HWND w = g_splash.window.load(); w != nullptr) SetForegroundWindow(w);
+				Port::Precompile::Start();
+				for (;;) {
+					const auto v = Port::Precompile::State();
+					if (!v.running) {
+						if (v.failed) std::printf("[port] precompile: %s\n", v.text.c_str());
+						break;
+					}
+					if (v.total > 0) SplashProgress(static_cast<float>(v.done) / static_cast<float>(v.total));
+					SplashStatus(v.text + "   (Esc: jugar ya, lo hecho se guarda)");
+					if (g_splash.skip) {
+						SplashStatus("Guardando lo hecho...");
+						Port::Precompile::Stop();
+						break;
+					}
+					Sleep(200);
+				}
+				SplashProgress(-1.0f);
+				std::printf("[port] precompile: %s\n", Port::Precompile::State().text.c_str());
+			}
 		}
 	}
 	if (start_menu) {

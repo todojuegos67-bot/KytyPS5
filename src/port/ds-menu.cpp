@@ -10,6 +10,7 @@
 #include "port/ds-update.h"
 #include "port/ds-precompile.h"
 #include "port/ds-i18n.h"
+#include "port/ds-steam.h"
 
 #include "local/perf-overlay.h"
 #include "local/port-live.h"
@@ -588,6 +589,33 @@ void DrawPcTab(float unit) {
 	if (ImGui::IsItemHovered())
 		ImGui::SetTooltip("Vuelve a una version guardada en _backup_update. Antes guarda la actual (se puede deshacer). No toca la cache de shaders, las partidas, los seeds ni los ajustes.");
 	ImGui::EndDisabled();
+	// (10-27c) "Anadir a Steam": a non-Steam shortcut with its icon and artwork (ds-steam.cpp).
+	{
+		static std::mutex  steam_mutex;
+		static std::string steam_text;
+		static std::atomic<bool> steam_busy {false};
+		ImGui::BeginDisabled(steam_busy.load());
+		if (ImGui::Button("Anadir a Steam", {bw, bh})) {
+			steam_busy = true;
+			{
+				std::scoped_lock lock(steam_mutex);
+				steam_text = "Anadiendo a Steam...";
+			}
+			std::thread([] {
+				std::string report;
+				const bool  ok = Steam::AddToSteam(g_rt.exe_path, &report);
+				std::scoped_lock lock(steam_mutex);
+				steam_text = (ok ? "OK: " : "ERROR: ") + report;
+				steam_busy = false;
+			}).detach();
+		}
+		ImGui::EndDisabled();
+		if (ImGui::IsItemHovered())
+			ImGui::SetTooltip("Anade \"Demon's Souls\" a la biblioteca de Steam como juego externo (con icono e imagenes). Mejor con Steam cerrado; si esta abierto, reinicialo para que aparezca.");
+		std::scoped_lock lock(steam_mutex);
+		if (!steam_text.empty()) ImGui::TextWrapped("%s", steam_text.c_str());
+		else ImGui::TextColored(kDim, "%s", "Steam debe cerrarse antes o reiniciarse despues para ver el acceso.");
+	}
 	if (!text.empty()) ImGui::TextWrapped("%s", text.c_str());
 	if (state == UpdateUi::Working && g_upd.total.load() > 0 && text.rfind("Descargando", 0) == 0) {
 		const float f = static_cast<float>(static_cast<double>(g_upd.done.load()) / static_cast<double>(g_upd.total.load()));

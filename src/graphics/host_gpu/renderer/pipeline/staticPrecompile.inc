@@ -1230,3 +1230,144 @@ bool PipelineCache::MergePrecompileShards(GraphicContext& graphics, bool prune, 
 	PipelineCacheLog("Static pipeline cache: merged {} shards", shards.size());
 	return stamped(merged);
 }
+
+// (10-27c) The local driver cache warmed with the static inputs' recipes (pipelineCache.h). KYTY_WARM_DRIVER_CACHE_KEY:
+// the game's KYTY_DRIVER_CACHE_KEY (what names and signs its local cache), passed apart so this process does not load
+// that cache itself (InitializeDriverCache).
+static std::filesystem::path WarmDriverCachePath(std::string& key) {
+	const char* value = std::getenv("KYTY_WARM_DRIVER_CACHE_KEY");
+	key               = value != nullptr ? value : "";
+	if (!IsBinaryDriverCacheKey(key) || PipelineCacheTitleId().empty()) return {};
+	return std::filesystem::path("_PipelineCache") / "local" / key / (PipelineCacheTitleId() + ".bin");
+}
+
+static std::filesystem::path WarmShardPath(const std::filesystem::path& bin, uint32_t shard, uint32_t shards) {
+	auto path = bin;
+	path += fmt::format(".shard{}of{}", shard, shards);
+	return path;
+}
+
+bool PipelineCache::WarmDriverCacheShard(GraphicContext& graphics, uint32_t shard, uint32_t shards, uint32_t threads) {
+	const auto begin = std::chrono::steady_clock::now();
+	std::string key;
+	const auto  bin = WarmDriverCachePath(key);
+	if (bin.empty() || shards == 0 || shard >= shards) {
+		PipelineCacheLog("Driver cache warm: no cache key (KYTY_WARM_DRIVER_CACHE_KEY) or title, or a bad shard");
+		return false;
+	}
+	PipelineCache cache(graphics);
+	cache.m_driver_cache_key = key;
+	// Every pipeline compiled through this shard's cache alone: none taken from the static store instead.
+	graphics.pipeline_blobs        = nullptr;
+	graphics.pipeline_binaries     = nullptr;
+	graphics.played_pipelines      = nullptr;
+	graphics.static_pipeline_cache = nullptr;
+	auto&      programs = *cache.m_program_cache;
+	const auto identity = PipelineCacheTitleId() + ShaderInputDeviceSignature(graphics.GetPhysicalDeviceProperties());
+	if (!programs.static_warm.Open(StaticInputsPath(), identity) || programs.static_warm.pipelines.empty()) {
+		PipelineCacheLog("Driver cache warm: no static inputs of this GPU and driver in {}", Common::PathToString(StaticInputsPath()));
+		return false;
+	}
+	const auto& records = programs.static_warm.records;
+	const auto& recipes = programs.static_warm.pipelines;
+	std::vector<uint8_t> needed(records.size(), 0);
+	programs.warm_recipes.clear();
+	for (size_t i = shard; i < recipes.size(); i += shards) {
+		LocalShaderWarmup::PipelineRecord recipe;
+		LocalShaderWarmup::Reader         reader {recipes[i]};
+		if (!LocalShaderWarmup::VisitPipeline(reader, recipe)) continue;
+		for (const auto index: {recipe.vertex, recipe.pixel, recipe.compute})
+			if (index < needed.size()) needed[index] = 1;
+		programs.warm_recipes.push_back(recipes[i]);
+	}
+	programs.warm_records.assign(records.size(), std::span<const uint32_t> {});
+	for (size_t i = 0; i < records.size(); ++i)
+		if (needed[i] != 0) programs.warm_records[i] = records[i];
+	const auto threads_text = std::to_string(std::max<uint32_t>(1, threads));
+#ifdef _WIN32
+	_putenv_s("KYTY_SHADER_WARMUP_THREADS", threads_text.c_str());
+#else
+	setenv("KYTY_SHADER_WARMUP_THREADS", threads_text.c_str(), 1);
+#endif
+	PipelineCacheLog("Driver cache warm: shard {}/{}: {} of {} recipes, {} of {} inputs", shard, shards, programs.warm_recipes.size(),
+	                 recipes.size(), std::count(needed.begin(), needed.end(), uint8_t {1}), records.size());
+	programs.TranslateWarmup(cache.m_mutex, false, cache.m_warmup_stop);
+	vk::PipelineCache           target = nullptr;
+	vk::PipelineCacheCreateInfo info {};
+	if (graphics.device.createPipelineCache(&info, nullptr, &target) != vk::Result::eSuccess) return false;
+	const auto own          = cache.m_driver_cache;
+	cache.m_driver_cache    = target;
+	cache.m_warm_cache_only = true;
+	cache.WarmPipelines(UINT64_MAX, false, nullptr);
+	size_t     saved_size = 0;
+	const bool saved      = cache.SaveDriverCache(target, WarmShardPath(bin, shard, shards), saved_size);
+	cache.m_driver_cache  = own;
+	graphics.device.destroyPipelineCache(target, nullptr);
+	programs.warm_permutations = {};
+	programs.warm_recipes      = {};
+	programs.warm_records      = {};
+	PipelineCacheLog("Driver cache warm: shard {}/{} {} in {} ms", shard, shards, saved ? "saved" : "NOT saved",
+	                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
+	return saved;
+}
+
+bool PipelineCache::MergeDriverCacheShards(GraphicContext& graphics, uint32_t shards) {
+	std::string key;
+	const auto  bin = WarmDriverCachePath(key);
+	if (bin.empty() || shards == 0) return false;
+	PipelineCache cache(graphics);
+	cache.m_driver_cache_key = key;
+	std::set<uint32_t> done;
+	uint32_t           noted = shards;
+	if (StaticShardsDone(bin, &noted, &done) == UINT32_MAX) {
+		PipelineCacheLog("Driver cache warm: every static recipe already in {}", Common::PathToString(bin));
+		return true;
+	}
+	size_t     saved_size = 0;
+	const auto main       = cache.LoadDriverCache(bin, UINT64_MAX, saved_size);
+	if (main == nullptr) return false;
+	uint32_t merged = 0;
+	std::vector<std::filesystem::path> merged_files;
+	for (uint32_t i = 0; i < shards; ++i) {
+		const auto      path = WarmShardPath(bin, i, shards);
+		std::error_code error;
+		if (!std::filesystem::exists(path, error)) continue;
+		size_t     shard_size = 0;
+		const auto part       = cache.LoadDriverCache(path, UINT64_MAX, shard_size);
+		if (part == nullptr) continue;
+		if (shard_size != 0 && graphics.device.mergePipelineCaches(main, 1, &part) == vk::Result::eSuccess) {
+			done.insert(i);
+			merged++;
+			merged_files.push_back(path);
+		}
+		graphics.device.destroyPipelineCache(part, nullptr);
+	}
+	bool ok = true;
+	if (merged != 0) ok = cache.SaveDriverCache(main, bin, saved_size);
+	graphics.device.destroyPipelineCache(main, nullptr);
+	if (!ok) return false;
+	for (const auto& path: merged_files) {
+		std::error_code error;
+		std::filesystem::remove(path, error);
+	}
+	NoteStaticShardsDone(bin, shards, done, done.size() >= shards);
+	PipelineCacheLog("Driver cache warm: merged {} shards; {} of {} done in {}", merged, done.size(), shards, Common::PathToString(bin));
+	return true;
+}
+
+bool PipelineCache::DriverCacheWarm(GraphicContext& graphics, uint32_t shards, uint32_t* done) {
+	(void)graphics;
+	std::string key;
+	const auto  bin = WarmDriverCachePath(key);
+	if (bin.empty()) return false;
+	std::set<uint32_t> which;
+	uint32_t           n     = shards;
+	const auto         count = StaticShardsDone(bin, &n, &which);
+	if (done != nullptr) *done = count == UINT32_MAX ? shards : count;
+	if (count != UINT32_MAX) {
+		std::printf("driver cache shards done:");
+		for (const auto i: which) std::printf(" %u", i);
+		std::printf("\n");
+	}
+	return count == UINT32_MAX;
+}

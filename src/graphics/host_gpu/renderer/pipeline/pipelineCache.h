@@ -179,6 +179,13 @@ public:
 	// older runs left that no seed makes any more is dropped).
 	// `keep_shards`: the shard files stay (a merge in the middle of a run, which its final pruning merge counts).
 	static bool MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards = false, bool stamp = false);
+	// (10-27c) The local driver cache (_PipelineCache/local/<KYTY_DRIVER_CACHE_KEY>/<title>.bin, what the game loads)
+	// warmed with every pipeline recipe of the static inputs (_PipelineCache/static/<id>.shaders): shard i of n
+	// compiles its share into a cache file of its own (<bin>.shard<i>of<n>), the merge folds the shards' files into
+	// the local cache and notes them done (<bin>.static-done), the status tells whether all n are.
+	static bool WarmDriverCacheShard(GraphicContext& graphics, uint32_t shard, uint32_t shards, uint32_t threads);
+	static bool MergeDriverCacheShards(GraphicContext& graphics, uint32_t shards);
+	static bool DriverCacheWarm(GraphicContext& graphics, uint32_t shards, uint32_t* done = nullptr);
 #endif
 
 	// A pipeline no cache holds, compiled without optimization so its draw or dispatch need not wait:
@@ -463,6 +470,9 @@ private:
 	// the game loads later, until m_warmup_stop.
 	std::filesystem::path        m_warmup_path;
 	bool                         m_scene_warmup     = false;
+	// (10-27c) The warmup's pipelines are only compiled into the driver cache, then destroyed (the static inputs'
+	// recipes on a PC without recorded play: tens of thousands, too many to hold).
+	bool                         m_warm_cache_only  = false;
 	bool                         m_scene_warmed_all = false;
 	std::unordered_set<uint32_t> m_scenes_warmed;
 	void                         WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory);

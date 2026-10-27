@@ -2058,6 +2058,9 @@ struct PipelineCache::ProgramCache {
 		    threads, background ? ", beside the game" : "", left);
 	}
 	LocalShaderWarmup::Cache warmup;
+	// (10-27c) The static inputs (_PipelineCache/static/<id>.shaders) as the warmup's records and recipes on a PC whose
+	// recording is empty, or in the precompile's driver cache shards: never saved as a recording.
+	LocalShaderWarmup::Cache static_warm;
 	// The warmup's view of the recording (LoadWarmup), each record's permutation (TranslateWarmup) and the keys of the
 	// programs it made (the shader prefetch leaves their static inputs out); all freed once it is done.
 	std::vector<std::span<const uint32_t>> warm_records;
@@ -2652,6 +2655,65 @@ static std::filesystem::path StaticInputsPath() {
 	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".shaders");
 }
 
+// (10-27c) The static inputs as the driver cache's warm notes them (<bin>.static-done): their size and time, so new
+// inputs (another driver, new seeds) warm it again.
+static std::string StaticInputsStamp() {
+	std::error_code error;
+	const auto      path = StaticInputsPath();
+	const auto      size = std::filesystem::file_size(path, error);
+	if (error) return {};
+	const auto time = std::filesystem::last_write_time(path, error);
+	if (error) return {};
+	return fmt::format("{} {}", size, static_cast<long long>(time.time_since_epoch().count()));
+}
+
+static std::filesystem::path StaticDonePath(const std::filesystem::path& driver_cache) {
+	auto path = driver_cache;
+	path += ".static-done";
+	return path;
+}
+
+// The shards of the static inputs' recipes the driver cache holds (all: UINT32_MAX), of `shards` (0: as noted).
+static uint32_t StaticShardsDone(const std::filesystem::path& driver_cache, uint32_t* shards, std::set<uint32_t>* which) {
+	std::ifstream file(StaticDonePath(driver_cache));
+	std::string   stamp, word;
+	if (!std::getline(file, stamp) || stamp.empty() || stamp != StaticInputsStamp()) return 0;
+	uint32_t n = 0;
+	if (!(file >> n) || n == 0) return 0;
+	if (shards != nullptr) {
+		if (*shards != 0 && *shards != n) return 0;
+		*shards = n;
+	}
+	std::set<uint32_t> done;
+	while (file >> word) {
+		if (word == "all") return UINT32_MAX;
+		uint32_t i = 0;
+		if (std::from_chars(word.data(), word.data() + word.size(), i).ec == std::errc {} && i < n) done.insert(i);
+	}
+	const auto count = static_cast<uint32_t>(done.size());
+	if (which != nullptr) *which = std::move(done);
+	return count >= n ? UINT32_MAX : count;
+}
+
+static void NoteStaticShardsDone(const std::filesystem::path& driver_cache, uint32_t shards, const std::set<uint32_t>& done,
+                                 bool all) {
+	const auto stamp = StaticInputsStamp();
+	if (stamp.empty()) return;
+	auto            path      = StaticDonePath(driver_cache);
+	auto            temporary = path;
+	std::error_code error;
+	temporary += ".tmp";
+	{
+		std::ofstream file(temporary, std::ios::trunc);
+		file << stamp << '\n' << shards << '\n';
+		if (all) file << "all\n";
+		else
+			for (const auto i: done) file << i << '\n';
+		if (!file) return;
+	}
+	std::filesystem::rename(temporary, path, error);
+}
+
 // Live "objects" (live-counters.h): container sizes read from the live thread (counts only, no iteration).
 static PipelineCache* g_live_pipeline_cache = nullptr;
 
@@ -2745,6 +2807,29 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		if (low_ram && std::string_view(warmup) == "1")
 			PipelineCacheLog("Shader warmup: recording only (RAM {} MiB)", ram >> 20u);
 		m_program_cache->LoadWarmup(path, title + device, adopt_from);
+		// (10-27c) A PC without recorded play (a fresh folder: warmup-v2 empty) whose driver cache the start menu's
+		// precompile did not warm with every static recipe: the static inputs' recipes, compiled beside the game into
+		// the driver cache only (KYTY_STATIC_WARMUP=0: not). Before, such a PC warmed 0 of 0 recipes and compiled every
+		// pipeline in play.
+		if (const char* value = std::getenv("KYTY_STATIC_WARMUP");
+		    m_program_cache->warm_records.empty() && m_program_cache->warm_recipes.empty() &&
+		    !(value != nullptr && std::string_view(value) == "0")) {
+			std::error_code exists;
+			if (StaticShardsDone(m_driver_cache_path, nullptr, nullptr) == UINT32_MAX) {
+				PipelineCacheLog("Shader warmup: no recorded play; the driver cache holds every static recipe already "
+				                 "(the start menu's precompile)");
+			} else if (std::filesystem::exists(StaticInputsPath(), exists) &&
+			           m_program_cache->static_warm.Open(StaticInputsPath(), title + device) &&
+			           !m_program_cache->static_warm.pipelines.empty()) {
+				auto& programs = *m_program_cache;
+				programs.warm_records.assign(programs.static_warm.records.begin(), programs.static_warm.records.end());
+				programs.warm_recipes = programs.static_warm.pipelines;
+				m_warm_cache_only     = true;
+				PipelineCacheLog("Shader warmup: no recorded play: the static inputs' {} shader inputs and {} pipeline "
+				                 "recipes, into the driver cache beside the game",
+				                 programs.warm_records.size(), programs.warm_recipes.size());
+			}
+		}
 		// The warmup by scene (local/scene-tags.h): Demon's Souls reports the map it loads (libAmpr); KYTY_SCENE_WARMUP=0
 		// makes every recorded pipeline at start-up, as before.
 		const char* by_scene = std::getenv("KYTY_SCENE_WARMUP");
@@ -2816,7 +2901,7 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 	const auto memory_shaders = LocalPlatform::ProcessMemory();
 	// By scene (local/scene-tags.h): the shader prefetch at once, the pipelines once the game loads its first scene (after
 	// the title and menus, whose own it makes where needed), those of later scenes as it loads them (SceneLoop).
-	const bool by_scene = settings.background && settings.warm_pipelines && m_scene_warmup;
+	const bool by_scene = settings.background && settings.warm_pipelines && m_scene_warmup && !m_warm_cache_only;
 	if (by_scene && !m_warmup_stop.load(std::memory_order_relaxed)) StartShaderPrefetch(std::move(recorded_inputs));
 	if (settings.warm_pipelines && !m_warmup_stop.load(std::memory_order_relaxed)) {
 		const auto pipelines_begin = std::chrono::steady_clock::now();
@@ -2830,7 +2915,15 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 			if (!m_warmup_stop.load(std::memory_order_relaxed))
 				WarmScene(SceneTags::Current(), settings.compute_video, true);
 		} else {
-			WarmPipelines(settings.compute_video, settings.background);
+			WarmPipelines(m_warm_cache_only ? UINT64_MAX : settings.compute_video, settings.background);
+			if (m_warm_cache_only && !m_warmup_stop.load(std::memory_order_relaxed) && m_driver_cache != nullptr) {
+				{
+					std::lock_guard save(m_main_cache_mutex);
+					(void)SaveDriverCache(m_driver_cache, m_driver_cache_path, m_driver_cache_saved_size);
+				}
+				NoteStaticShardsDone(m_driver_cache_path, 1, {}, true);
+				PipelineCacheLog("Pipeline warmup: the driver cache holds every static recipe now");
+			}
 		}
 		// What the driver had to compile is kept at once: the cache is otherwise written only
 		// at a normal exit, so after a crash the next launch compiled it all again (2+ minutes). (Beside the game: by
@@ -2840,6 +2933,11 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 	programs.warm_permutations = {};
 	programs.warm_recipes      = {};
 	programs.warm_records      = {};
+	if (m_warm_cache_only) {
+		Common::LockGuard lock(m_mutex);
+		programs.static_warm.records   = {};
+		programs.static_warm.pipelines = {};
+	}
 	if (settings.background) {
 		Common::LockGuard lock(m_mutex);
 		programs.warming = false;
@@ -3146,7 +3244,20 @@ void PipelineCache::WarmPipelines(uint64_t compute_video, bool background, const
 				finished = workers_done == threads;
 			}
 			if (batch.empty()) continue;
-			{
+			if (m_warm_cache_only) {
+				// (Into the driver cache only: destroyed at once, the game makes its own from that cache when it needs it.)
+				for (auto& [n, pipeline]: batch) {
+					m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
+					pipeline = nullptr;
+					++compiled;
+				}
+				// Saved as it goes beside the game (the cache saver waits for compiles to settle, which they do not here).
+				if (background && m_driver_cache != nullptr && !m_driver_cache_path.empty() &&
+				    compiled / 4000 != (compiled - batch.size()) / 4000) {
+					std::lock_guard save(m_main_cache_mutex);
+					(void)SaveDriverCache(m_driver_cache, m_driver_cache_path, m_driver_cache_saved_size);
+				}
+			} else {
 				Common::LockGuard lock(m_mutex);
 				for (auto& [n, pipeline]: batch) {
 					const auto& job   = jobs[n];
@@ -3484,8 +3595,12 @@ void PipelineCache::InitializeDriverCache() {
 	// SmallSaveSeconds while compiles go on: a session that never settles 20 s and does not exit cleanly kept none of them.
 	const uint64_t ram       = LocalPlatform::PhysicalMemory();
 	const bool     store     = m_static_binaries != nullptr || m_static_blobs != nullptr;
-	const auto     ram_limit = [ram, store](uint64_t limit) {
+	// (10-27c) A cache the start menu's precompile warmed with every static recipe is what this PC plays from: kept up
+	// to 1/8 of the RAM (2 GiB at most), whatever the store, instead of starting over and compiling them in play again.
+	const bool     warmed    = StaticShardsDone(m_driver_cache_path, nullptr, nullptr) == UINT32_MAX;
+	const auto     ram_limit = [ram, store, warmed](uint64_t limit) {
 		constexpr uint64_t StoreLimit = uint64_t {256} << 20u;
+		if (warmed) return ram != 0 ? std::min(limit, std::max<uint64_t>(ram / 8u, uint64_t {512} << 20u)) : limit;
 		if (ram != 0) limit = std::min(limit, ram >= (uint64_t {24} << 30u) ? ram / 16u : uint64_t {512} << 20u);
 		return store ? std::min(limit, StoreLimit) : limit;
 	};

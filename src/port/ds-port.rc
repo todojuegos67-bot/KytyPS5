@@ -2,6 +2,8 @@
 #include <winver.h>
 
 1 ICON "demons-souls.ico"
+// (10-27c) The same icon as a file's bytes: "Anadir a Steam" writes it next to the exe (ds-steam.cpp).
+2 RCDATA "demons-souls.ico"
 
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION 1,0,0,0
