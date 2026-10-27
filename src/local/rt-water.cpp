@@ -20,7 +20,7 @@
 // by the surface's kind and distance at its previous position, a 3x3 mean +- sigma clamp, a firefly clamp, alpha
 // 0.08 still / 0.2 moving; the history is dropped on a cut, a resize or a frame the pass did not run.
 //
-// Levels: 1 Bajo (trace at half resolution, rays <= 80 m, puddles from SSR confidence 0.30), 2 Medio (full resolution,
+// Levels (water2: Medio at half resolution too): 1 Bajo (trace at half resolution, rays <= 80 m, puddles from SSR confidence 0.30), 2 Medio (half resolution,
 // 150 m, 0.20), 3 Alto (full resolution, 300 m, 0.12, stronger puddles). Options: KYTY_HWRT_WATER_PS=<hex>[,<hex>..],
 // KYTY_HWRT_WATER_STRENGTH (0..2), _MIN (water's minimum reflectance, 0..0.9), _RIPPLE (normal slope amplitude, 0..0.2),
 // _PUDDLE (puddles' share, 0 off, 0..1.5), _DIST (ray length, m), _FLIPY (1: row 0 = NDC y +1, the default).
@@ -307,7 +307,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 }
 
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D extent, int level) {
-	const vk::Extent2D trace = level >= 2 ? extent : vk::Extent2D {std::max(extent.width / 2, 1u), std::max(extent.height / 2, 1u)};
+	const vk::Extent2D trace = level >= 3 ? extent : vk::Extent2D {std::max(extent.width / 2, 1u), std::max(extent.height / 2, 1u)};
 	if (g_w.out.image != VK_NULL_HANDLE && g_w.extent == extent && g_w.trace == trace) return true;
 	Img* all[] {&g_w.out, &g_w.raw, &g_w.raw_aux, &g_w.hist[0], &g_w.hist[1], &g_w.aux[0], &g_w.aux[1]};
 	for (Img* img: all) Retire(graphics, *img);
