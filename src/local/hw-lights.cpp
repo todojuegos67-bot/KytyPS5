@@ -120,17 +120,19 @@ void UpdateTracks(const std::vector<const RtLocal::LiveLight*>& in, const double
 			best->used = true, best->point = l->point;
 			for (int k = 0; k < 3; ++k) best->pos[k] = l->pos[k], best->fwd[k] = l->fwd[k];
 			best->tan_half = l->tan_half, best->far_d = l->far_d, best->fade = fade;
-		} else if (bd > 0.04f) {
+		} else if (bd > 0.09f) {
 			++g_track_jumps;
 		}
-		const float a = snap ? 1.0f : 0.15f;
+		// (all2-1027) a dead band: a rescan within 0.3 m (the apex's jitter) does not move the light at all; a real move
+		// is followed slowly (~1 s); the inputs are constant while the light holds still
+		const float a = snap ? 1.0f : bd < 0.09f ? 0.0f : 0.03f;
 		for (int k = 0; k < 3; ++k) best->pos[k] += (l->pos[k] - best->pos[k]) * a, best->fwd[k] += (l->fwd[k] - best->fwd[k]) * a;
 		const float fl = std::sqrt(best->fwd[0] * best->fwd[0] + best->fwd[1] * best->fwd[1] + best->fwd[2] * best->fwd[2]);
 		if (fl > 1e-6f)
 			for (float& v: best->fwd) v /= fl;
 		best->tan_half += (l->tan_half - best->tan_half) * a;
 		best->far_d += (l->far_d - best->far_d) * a;
-		best->fade += (fade - best->fade) * a;
+		best->fade += (fade - best->fade) * (snap ? 1.0f : 0.05f);
 		best->hit = true;
 	}
 	for (auto& t: g_tracks) {
@@ -318,7 +320,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 }
 
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D extent, int level) {
-	const vk::Extent2D trace = level >= 2 ? extent : vk::Extent2D {std::max(extent.width / 2, 1u), std::max(extent.height / 2, 1u)};
+	const vk::Extent2D trace = level >= 3 ? extent : vk::Extent2D {std::max(extent.width / 2, 1u), std::max(extent.height / 2, 1u)};
 	if (g_hl.out.image != VK_NULL_HANDLE && g_hl.extent == extent && g_hl.trace == trace) return true;
 	Img* all[] {&g_hl.out, &g_hl.raw, &g_hl.tmp_a, &g_hl.tmp_b, &g_hl.gbuf[0], &g_hl.gbuf[1], &g_hl.hist[0], &g_hl.hist[1]};
 	for (Img* img: all) Retire(graphics, *img);
@@ -482,7 +484,9 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	for (const auto& t: g_tracks)
 		if (t.used && t.vis > 0.0f && t.fade > 0.0f) sent.push_back(&t);
 	std::sort(sent.begin(), sent.end(), [](const Track* a, const Track* b) { return a->d < b->d; });
-	if (sent.size() > MaxLights) sent.resize(MaxLights);
+	// (all2-1027) per level: Bajo 8, Medio 12, Alto 16 lights (the per-pixel loop and the picks' spread)
+	const size_t cap = level == 1 ? 8 : level == 2 ? 12 : 16;
+	if (sent.size() > cap) sent.resize(cap);
 
 	// The guard: a 1 s window whose mean darkening over the screen passes KYTY_HWRT_LIGHTS_GUARD turns the pass off for 5 s.
 	const auto now = std::chrono::steady_clock::now();
@@ -540,7 +544,7 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		std::printf("HWRTLIGHTS: on (level %d: %s, %ux%u; strength %g, max %g, ambient %g, source radius %g m, skip %g m, %g m; lights from "
 		            "the game's shadow projections eased per frame, weight (r/d)^2 windowed, penumbra = source size (contact-hardening), "
 		            "a ratio correction of the lit color)\n",
-		            level, level == 1 ? "half-res, 1 ray" : level == 2 ? "full-res, 1 ray" : "full-res, 2 rays", color.extent.width,
+		            level, level == 1 ? "half-res, 1 ray, 8 lights" : level == 2 ? "half-res, 2 rays, 12 lights" : "full-res, 1 ray, 16 lights", color.extent.width,
 		            color.extent.height, strength, max_dark, ambient, soft, skip, max_dist);
 		std::fflush(stdout);
 	}

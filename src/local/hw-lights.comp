@@ -166,8 +166,16 @@ void Trace(ivec2 pixel) {
 				atomicAdd(stats.s[6], 1u);
 		}
 	}
-	int   picks = push.misc.z >= 3 ? 2 : 1;
-	float f     = float(push.misc.y % 64);
+	// (all2-1027) a negligible share cannot darken visibly: no ray (most "lit" pixels, the cost)
+	if (W / (W + lb.p0.z) < 0.03) {
+		imageStore(out_img, pixel, vec4(0.0, W, -1.0, 1.0));
+		return;
+	}
+	// Medio: 2 rays at half res; Bajo / Alto: 1 (Alto at full res)
+	int   picks = push.misc.z == 2 ? 2 : 1;
+	// (all2-1027) the sample pattern is fixed per pixel (no per-frame seed): a still camera traces the same rays every
+	// frame, so the result is bit-identical (zero flicker); the a-trous removes the fixed dither, motion decorrelates it.
+	float f     = 0.0;
 	float occ   = 0.0, pen = 1e9;
 	// one trace pixel's world size at p (penumbra in pixels: the contact-hardening filter's radius)
 	vec2  tpx   = vec2(1.0 / TraceSize().x, 0.0);
@@ -228,7 +236,7 @@ void Temporal(ivec2 pixel) {
 	}
 	float n_new = min(n_hist + 1.0, 32.0);
 	float a     = max(1.0 / n_new, 0.04); // (lampshadow-1027: ~25 frames; the variance clamp bounds the lag)
-	float pen   = cur.b >= 0.0 ? (pen_h > 0.0 ? mix(pen_h, cur.b, 0.25) : cur.b) : (pen_h > 0.0 ? min(pen_h * 1.02 + 0.05, 64.0) : 64.0);
+	float pen   = cur.b >= 0.0 ? cur.b : 64.0; // (all2-1027: this frame's, no drifting history)
 	imageStore(out_img, pixel, vec4(mix(h, cur.r, a), n_new, cur.g, pen));
 }
 
@@ -280,7 +288,7 @@ void Composite(ivec2 pixel) {
 			if (dz < best) best = dz, v = textureLod(src_tex, suv, 0);
 		}
 		hcount = v.g, raw_occ = v.r, wsum = v.b;
-		float stable = smoothstep(1.5, 8.0, v.g); // (the history count: a reset frame darkens nothing)
+		float stable = 1.0; // (all2-1027: deterministic samples: a reset frame is already the converged value; no ramp)
 		float share  = v.b / (v.b + lb.p0.z);
 		if (best < 0.05 * z + 0.1) dark = min(lb.p0.y * share * stable * clamp(v.r, 0.0, 1.0), lb.p0.w);
 		if (isnan(dark)) dark = 0.0;
