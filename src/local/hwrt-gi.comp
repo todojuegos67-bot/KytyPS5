@@ -34,6 +34,10 @@ layout(binding = 11) uniform usampler2D gb_normal; // G-buffer layer 3 (oct 8:8 
 layout(binding = 12) uniform usampler2D gb_albedo; // G-buffer layer 0 (albedo rgb8; flag 8), else a 1x1 stand-in
 layout(binding = 13) uniform accelerationStructureEXT tlas;
 layout(binding = 16) uniform sampler2D dyn_tex; // (ao-fix) temporal: the trace's share of AO weight from moving occluders (.x)
+layout(binding = 17) uniform sampler2D rh_prev;                // (ds-rt-stable-1027) composite history: r (render res)
+layout(binding = 18, rgba16f) uniform writeonly image2D rh_out;
+layout(binding = 19) uniform sampler2D rh2_prev;               // amb, contribution / light, Luma(fresh r), fresh ao
+layout(binding = 20, rgba16f) uniform writeonly image2D rh2_out;
 layout(std140, binding = 14) uniform Frame {
 	vec4  inv[4];   // clip -> world rows
 	vec4  vp[4];    // world -> clip rows
@@ -492,6 +496,7 @@ void Composite(ivec2 pixel) {
 	vec4  col = texelFetch(color_tex, pixel, 0);
 	float d   = texelFetch(depth_tex, pixel, 0).r;
 	if (IsSky(d)) {
+		imageStore(rh2_out, pixel, vec4(-1.0)); // (ds-rt-stable-1027: no history here)
 		imageStore(out_img, pixel, (u.cfg2.y == 0) ? col : vec4(u.cfg2.y == 1 ? vec3(1) : vec3(0), col.a));
 		return;
 	}
@@ -534,6 +539,17 @@ void Composite(ivec2 pixel) {
 	} else {
 		r = texelFetch(src_a, pixel, 0);
 	}
+	// (ds-rt-stable-1027) GI+AO 8-9.5 %, max jump 140-171 % on a still camera with the contact fix confirmed: the 2x2
+	// upsample's depth / normal weights and the colour-side terms take the jittered render-res depth, G-buffer and colour
+	// (DLSS Ultra Performance: a third of the output, the jitter moves edges a whole pixel), so the same converged trace
+	// gave a different pixel every frame. Still camera: a render-res running mean (1/32) of the upsampled r and of the
+	// colour-side relief; moving: as before (fresh each frame, the history kept current)
+	bool  c_still = (u.cfg.w & 256) != 0 && (u.cfg.w & 2) != 0 && (u.cfg.w & 1) == 0;
+	vec4  rf      = r;
+	vec4  ph      = texelFetch(rh_prev, pixel, 0);
+	vec4  p2      = texelFetch(rh2_prev, pixel, 0);
+	bool  h_ok    = c_still && p2.x >= 0.0 && !any(isnan(ph)) && !any(isnan(p2));
+	if (h_ok) r = mix(ph, r, 1.0 / 32.0);
 	float fade = 1.0 - smoothstep(u.par.z, u.par.w, dist);
 	float ao   = (u.cfg.w & 32) != 0 ? clamp(r.a, 0.0, 1.0) : 1.0;
 	ao         = ao * ao; // (hwrt5a) contrast: few rays and the temporal mean make creases read too light
@@ -547,6 +563,8 @@ void Composite(ivec2 pixel) {
 	float amb = 1.0;
 	bool amb_model = (u.cfg.w & 8) != 0 && u.fog.z > 0.0 && (u.cfg2.w >> 8) > 0;
 	if (u.fog.z > 0.0 && !amb_model) amb = 1.0 - u.fog.w * smoothstep(1.5, 6.0, Luma(col.rgb) / u.fog.z);
+	float amb_f = amb;
+	if (h_ok) amb = mix(p2.x, amb, 1.0 / 32.0);
 	float k_ao = max(mix(1.0, ao, u.trace.z * fade * amb), mix(1.0, u.par.y, fade));
 	// (gi-1027) AO on the ambient term only: the ambient part of this pixel is at most albedo x the frame's ambient light
 	// (the geometric-mean light x KYTY_HWRT_GI_AMBIENT); light above that is direct (sun, torches) and keeps its level
@@ -585,7 +603,25 @@ void Composite(ivec2 pixel) {
 		return;
 	}
 	// the bounce lights the ambient term too, so the same AO occludes it (its rays' misses already did most)
-	imageStore(out_img, pixel, vec4(col.rgb - amb_part * (1.0 - k_ao) + add * mix(1.0, k_ao, 0.5), col.a));
+	vec3 res = col.rgb - amb_part * (1.0 - k_ao) + add * mix(1.0, k_ao, 0.5);
+	float lc = max(Luma(col.rgb), 1e-3);
+	float cn = Luma(res - col.rgb) / lc; // this pass's contribution, a share of the pixel's light
+	imageStore(rh_out, pixel, r);
+	imageStore(rh2_out, pixel, vec4(amb, cn, Luma(rf.rgb), rf.a));
+	if (h_ok && (pixel.x & 3) == 0 && (pixel.y & 3) == 0) {
+		const uint fb = uint(u.cfg2.z) * 64u + 52u;
+		float dc = abs(cn - p2.y);
+		atomicAdd(st[fb + 0u], 1u);
+		if (dc > 0.2) atomicAdd(st[fb + 5u], 1u);
+		if (dc > 0.1) {
+			atomicAdd(st[fb + 1u], 1u);
+			float dr = abs(Luma(r.rgb) - Luma(ph.rgb)) / max(max(Luma(r.rgb), Luma(ph.rgb)), 1e-3);
+			if (dr > 0.05 || abs(r.a - ph.a) > 0.03) atomicAdd(st[fb + 2u], 1u);
+			else if (abs(amb - p2.x) > 0.02) atomicAdd(st[fb + 3u], 1u);
+			else atomicAdd(st[fb + 4u], 1u);
+		}
+	}
+	imageStore(out_img, pixel, vec4(res, col.a));
 }
 
 void main() {

@@ -118,7 +118,7 @@ struct Push {
 	int32_t pad[2] {};
 };
 
-constexpr uint32_t Bindings = 17; // (ao-fix) 16: the trace's moving-occluder share, read by the temporal pass
+constexpr uint32_t Bindings = 21; // (ds-rt-stable-1027) 17..20: the composite's render-res history (r, then amb / contribution / raw) // (ao-fix) 16: the trace's moving-occluder share, read by the temporal pass
 constexpr uint32_t StatWords = 64, StatSlots = 4;
 
 struct State {
@@ -136,6 +136,7 @@ struct State {
 	uint32_t*               stats_map = nullptr;
 	uint64_t                st_sum[14] {};
 	uint64_t                y_votes[4] {};
+	uint64_t                flash[6] {}; // (ds-rt-stable-1027) GIFLASH: words 52..57 of a slot
 	uint64_t                mask_hits[4] {}; // (ao-fix) sampled AO hits whose nearest occluder is static 0x01 / dynamic 0x02
 	bool                    y_flip = false;    // (hwrt5a) the y convention in use (KYTY_HWRT_GI_FLIPY, else measured)
 	bool                    y_init = false;
@@ -147,7 +148,7 @@ struct State {
 	uint32_t                ao_ms_n = 0, ao_frames_on = 0, ao_frames_no_scene = 0, ao_frames_still = 0;
 	std::chrono::steady_clock::time_point st_last = std::chrono::steady_clock::now();
 	vk::Extent2D            render {}, trace {};
-	Image                   raw, tmp_a, tmp_b, out, history[2], gbuf[2], count[2];
+	Image                   raw, tmp_a, tmp_b, out, history[2], gbuf[2], count[2], rhist[2], rhist2[2];
 	uint32_t                frame = 0;
 	bool                    history_valid = false;
 	vk::QueryPool           pool = nullptr;
@@ -158,9 +159,9 @@ struct State {
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 } g_gi;
 
-std::array<Image*, 10> TraceImages() {
+std::array<Image*, 14> TraceImages() {
 	return {&g_gi.raw, &g_gi.tmp_a, &g_gi.tmp_b, &g_gi.history[0], &g_gi.history[1], &g_gi.gbuf[0], &g_gi.gbuf[1], &g_gi.count[0],
-	        &g_gi.count[1], &g_gi.out};
+	        &g_gi.count[1], &g_gi.out, &g_gi.rhist[0], &g_gi.rhist[1], &g_gi.rhist2[0], &g_gi.rhist2[1]};
 }
 
 bool MakeImage(GraphicContext& graphics, vk::Format format, vk::Extent2D extent, bool storage, Image& img) {
@@ -204,7 +205,7 @@ vk::DescriptorType DescType(uint32_t i) {
 	if (i == 13) return vk::DescriptorType::eAccelerationStructureKHR;
 	if (i == 14) return vk::DescriptorType::eUniformBuffer;
 	if (i == 15) return vk::DescriptorType::eStorageBuffer;
-	if (i == 7 || i == 8 || i == 10) return vk::DescriptorType::eStorageImage;
+	if (i == 7 || i == 8 || i == 10 || i == 18 || i == 20) return vk::DescriptorType::eStorageImage;
 	return vk::DescriptorType::eCombinedImageSampler;
 }
 
@@ -303,9 +304,14 @@ bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level) {
 	const vk::Extent2D trace = vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
 	for (auto* img : TraceImages())
 		FreeImage(graphics, *img);
-	bool ok = MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, render, true, g_gi.out);
+	const auto at_render = [](const Image* img) {
+		return img == &g_gi.out || img == &g_gi.rhist[0] || img == &g_gi.rhist[1] || img == &g_gi.rhist2[0] || img == &g_gi.rhist2[1];
+	};
+	bool ok = true;
 	for (auto* img : TraceImages())
-		if (img != &g_gi.out) ok = ok && MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, trace, true, *img);
+		if (at_render(img)) ok = ok && MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, render, true, *img);
+	for (auto* img : TraceImages())
+		if (!at_render(img)) ok = ok && MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, trace, true, *img);
 	if (!ok) {
 		for (auto* img : TraceImages())
 			FreeImage(graphics, *img);
@@ -384,6 +390,7 @@ void ReadStats(GraphicContext& graphics) {
 		g_gi.st_sum[i] += w[i];
 	for (int i = 0; i < 4; ++i)
 		g_gi.y_votes[i] += w[40 + i], g_gi.mask_hits[i] += w[44 + i];
+	for (int i = 0; i < 6; ++i) g_gi.flash[i] += w[52 + i];
 	if (w[49] > 0) { // (ao-fix) the frame's light (geometric mean of the sampled pixels), smoothed over ~20 frames
 		const float l = static_cast<float>(static_cast<double>(w[48]) / w[49] / 256.0 - 32.0);
 		// (ds-rt-stable-1027) frozen while the camera holds still: the estimate followed the other passes' changes in the
@@ -397,6 +404,14 @@ void ReadStats(GraphicContext& graphics) {
 	const auto& s   = g_gi.st_sum;
 	const auto  pct = [](uint64_t a, uint64_t b) { return b > 0 ? 100.0 * static_cast<double>(a) / static_cast<double>(b) : 0.0; };
 	const double pass_ms = g_gi.ao_ms_n > 0 ? g_gi.ao_ms_sum / g_gi.ao_ms_n : 0.0;
+	{ // (ds-rt-stable-1027) the composite's own still-camera flicker check, split by cause
+		const auto& f = g_gi.flash;
+		std::printf("GIFLASH: 10 s, camera still: %llu samples; contribution changed > 10%% of the pixel's light %.3f%%; of those: the "
+		            "traced GI / AO (after the render-res history) %.1f%%, the colour-side terms (lit-pixel relief / cap from the jittered "
+		            "colour) %.1f%%, the G-buffer albedo / colour itself %.1f%%; > 20%% %.3f%%\n",
+		            static_cast<unsigned long long>(f[0]), pct(f[1], f[0]), pct(f[2], f[1]), pct(f[3], f[1]), pct(f[4], f[1]), pct(f[5], f[0]));
+		for (auto& v: g_gi.flash) v = 0;
+	}
 	if (Cfg().ao > 0) { // (ao-fix) the AO's own line: quality, GPU cost, hit rate, where the hits are
 		const auto& m = g_gi.mask_hits;
 		std::printf("HWRTAO: 10 s: quality %s (%d), GPU %.3f ms (mean of %u frames, the whole pass), AO rays hit %.1f%% (%llu sampled rays), "
@@ -652,6 +667,10 @@ bool HwGiApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		infos[12] = albedo ? vk::DescriptorImageInfo {pt, gbuf.views[0], vk::ImageLayout::eShaderReadOnlyOptimal}
 		                   : vk::DescriptorImageInfo {pt, g.dummy.view, gen};
 		infos[16] = {pt, dyn.view, gen};
+		infos[17] = {pt, g.rhist[prev].view, gen};
+		infos[18] = {nullptr, g.rhist[cur].view, gen};
+		infos[19] = {pt, g.rhist2[prev].view, gen};
+		infos[20] = {nullptr, g.rhist2[cur].view, gen};
 		vk::WriteDescriptorSetAccelerationStructureKHR as_write {};
 		as_write.accelerationStructureCount = 1;
 		as_write.pAccelerationStructures    = &scene.tlas;

@@ -1308,7 +1308,10 @@ void Temporal(ivec2 px) {
 		// reflections went soft in motion); the neighbourhood clamp below catches the filter's overshoot.
 		// (ds-rt-stable-1027) still camera, the pixel under 0.3 px of motion: its own history texel, unfiltered (a filtered
 		// fetch every frame re-blurs the converged history and moves it with the jitter)
-		bool  hold = still_ && length((puv - uv) * ts) < 0.3;
+		// (865551c6 log: the clamp still cut 12-23 % of the flashes - this test used puv, the virtual-image reprojection,
+		// whose hit distance moves with the jitter, in trace pixels: never under 0.3 under DLSS. Now the surface's own
+		// motion vector, under 1 render pixel: the game's jitter is not motion)
+		bool  hold = still_ && length(mv * RenderSize()) < 1.0;
 		vec4  hist = hold ? texelFetch(src_b, px, 0) : BicubicHist() && rough < 0.3 ? HistoryCR(puv) : textureLod(src_b, puv, 0);
 		if (Bad(hist)) hist = cur;
 		f_hraw     = hist;
@@ -1331,7 +1334,11 @@ void Temporal(ivec2 px) {
 		if (hold && fresh) {
 			float lh = Luma(hist.rgb), lf = Luma(cur.rgb), hi_ = 1.5 * lh + 0.01, lo_ = 0.67 * lh;
 			if (lf > hi_) cur.rgb *= hi_ / max(lf, 1e-6);
-			cur.a = clamp(cur.a, hist.a - 0.25, hist.a + 0.25);
+			// hit <-> miss (35-68 % of the flashes): the confidence moves at most 0.1 a sample and a miss keeps the
+			// held colour (a miss's environment colour is not mixed in at all while the history has a hit)
+			bool miss = cur.a < hist.a - 0.1 && hist.a > 0.2;
+			cur.a = clamp(cur.a, hist.a - 0.1, hist.a + 0.1);
+			if (miss) cur.rgb = hist.rgb * (cur.a / max(hist.a, 1e-3)); // (premultiplied: the held colour at the new confidence)
 		}
 		// (a miss this frame against a held reflection: the history fades slowly instead of popping)
 		if (fresh && cur.a < hist.a * 0.5) alpha *= 0.5;

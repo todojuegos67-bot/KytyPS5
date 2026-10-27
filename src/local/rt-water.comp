@@ -330,7 +330,23 @@ void Temporal(ivec2 tp) {
 	}
 	vec4 res   = cur;
 	bool valid = false;
-	if (Flag(1)) {
+	if (Flag(1) && Flag(8)) {
+		// (ds-rt-stable-1027) still camera: the pixel's own history, never rejected by a kind / distance test that the
+		// jitter toggles (a rejected pixel took this frame's sample alone: the 91 % jumps); 1/32 running mean, a fresh
+		// sample at most 1.5x the history, its confidence at most 0.1 a frame (hit <-> miss)
+		vec4 h = texelFetch(hist_prev, tp, 0);
+		if (!BadV(h.rgb) && !isnan(h.a) && h.a > 0.0) {
+			valid = true;
+			vec4  c2  = cur;
+			float lh  = Luma(h.rgb), lf = Luma(c2.rgb), lim = 1.5 * lh + 0.01;
+			if (lf > lim) c2.rgb *= lim / max(lf, 1e-6);
+			bool  miss = c2.a < h.a - 0.1;
+			c2.a = clamp(c2.a, h.a - 0.1, h.a + 0.1);
+			if (miss || cur.a <= 1e-4) c2.rgb = h.rgb;
+			res.rgb = mix(h.rgb, c2.rgb, 1.0 / 32.0);
+			res.a   = mix(h.a, c2.a, 1.0 / 32.0);
+		}
+	} else if (Flag(1)) {
 		vec2  uv   = (vec2(tp) + 0.5) / TraceSize();
 		vec2  ruv  = (vec2(RenderPixel(uv)) + 0.5) / RenderSize();
 		vec3  cam  = pb.cam.xyz;
