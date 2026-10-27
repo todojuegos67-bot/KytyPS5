@@ -1,3 +1,7 @@
+#include "common/threads.h"
+#include <string>
+#include <tuple>
+#include <map>
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/phaseStats.h"
 
@@ -727,6 +731,43 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 
 namespace {
 std::atomic<uint64_t> g_fault_us[2] {};
+// KYTY_READBACK_SITES (live, default 1, wolverine-fast-1027): the guest-thread readback stalls
+// split by thread, direction and 1 MiB guest region; the 8 costliest print every 5 s.
+struct FaultSite {
+	uint64_t n = 0, us = 0;
+};
+std::mutex                                g_site_mutex;
+std::map<std::tuple<std::string, bool, uint64_t>, FaultSite> g_sites;
+void NoteFaultSite(uint64_t vaddr, bool is_write, uint64_t us) {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_READBACK_SITES", 1);
+	if (enabled.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	thread_local const std::string tid = Common::Thread::GetThreadId();
+	std::lock_guard lock(g_site_mutex);
+	auto& site = g_sites[{tid, is_write, vaddr >> 20u}];
+	site.n++;
+	site.us += us;
+}
+void PrintFaultSites() {
+	std::vector<std::pair<std::tuple<std::string, bool, uint64_t>, FaultSite>> sites;
+	{
+		std::lock_guard lock(g_site_mutex);
+		sites.assign(g_sites.begin(), g_sites.end());
+		g_sites.clear();
+	}
+	if (sites.empty()) {
+		return;
+	}
+	std::sort(sites.begin(), sites.end(), [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
+	::printf("Readback sites (5 s), costliest first: thread, kind, guest MiB region, faults, ms\n");
+	for (size_t i = 0; i < sites.size() && i < 8; i++) {
+		const auto& [key, site] = sites[i];
+		::printf("    tid %s %s 0x%llx00000 %llu %.1f\n", std::get<0>(key).c_str(),
+		         std::get<1>(key) ? "write" : "read", static_cast<unsigned long long>(std::get<2>(key)),
+		         static_cast<unsigned long long>(site.n), static_cast<double>(site.us) / 1000.0);
+	}
+}
 std::atomic<uint64_t> g_fault_n[2] {};
 } // namespace
 
@@ -751,6 +792,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	    (is_write ? AsyncWriteReadbackEnabled() : AsyncReadReadbackEnabled())) {
 		// "Readback faults (5 s)": wall time guest threads spend in these faults, render thread apart.
 		struct FaultTimer {
+			uint64_t                              vaddr;
+			bool                                  is_write;
 			std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
 			~FaultTimer() {
 				const auto us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -758,9 +801,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				                                          .count());
 				const int  i  = PhaseStats::IsRenderThread() ? 0 : 1;
 				g_fault_us[i].fetch_add(us, std::memory_order_relaxed);
+				NoteFaultSite(vaddr, is_write, us);
 				g_fault_n[i].fetch_add(1, std::memory_order_relaxed);
 			}
-		} fault_timer;
+		} fault_timer {vaddr, is_write};
 		uint64_t tick         = 0;
 		uint64_t window_begin = 0;
 		uint64_t window_end   = 0;
@@ -1372,6 +1416,7 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 				         static_cast<unsigned long long>(rn), static_cast<double>(ru) / 1000.0,
 				         rn != 0 ? static_cast<double>(ru) / static_cast<double>(rn) : 0.0,
 				         static_cast<unsigned long long>(on), static_cast<double>(ou) / 1000.0);
+				PrintFaultSites();
 				std::fflush(stdout);
 				s_cq = s_cq_us = s_prefetched = 0;
 				s_begin = now;

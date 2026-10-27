@@ -352,9 +352,10 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 	return ok;
 }
 
-// KYTY_RESOURCE_MEMO=1 (a live switch, off by default): see ProgramCache::Materialize.
+// KYTY_RESOURCE_MEMO (live; default 1 since wolverine-fast-1027): see ProgramCache::Materialize.
+// Safe by construction: a hit re-reads every guest word the walk read and requires them equal.
 bool ResourceMemoEnabled() {
-	static auto& enabled = Common::LiveSwitches::Get("KYTY_RESOURCE_MEMO", 0);
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_RESOURCE_MEMO", 1);
 	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
@@ -769,8 +770,11 @@ struct PipelineCache::ProgramCache {
 			return;
 		}
 		const auto total = memo_hits + memo_misses;
-		::printf("Resource memo (5 s): %" PRIu64 " hits, %" PRIu64 " misses (%.1f%% hits)\n",
-		         memo_hits, memo_misses, total != 0 ? 100.0 * memo_hits / total : 0.0);
+		::printf("Resource memo (5 s): %" PRIu64 " hits, %" PRIu64 " misses (%.1f%% hits); lookup cache %" PRIu64
+		         " hits, %" PRIu64 " misses\n",
+		         memo_hits, memo_misses, total != 0 ? 100.0 * memo_hits / total : 0.0, lookup_hits,
+		         lookup_misses);
+		lookup_hits = lookup_misses = 0;
 		std::fflush(stdout);
 		memo_hits   = 0;
 		memo_misses = 0;
@@ -923,10 +927,31 @@ struct PipelineCache::ProgramCache {
 		prog_phase.emplace(PhaseStats::PhProgLookup);
 		{
 			KYTY_PROFILER_BLOCK("ProgramCache::Lookup");
-			if (unsupported.contains(lookup_key)) {
-				return ShaderProgram {};
+			// KYTY_LOOKUP_CACHE (live, default 1): the last key found per stage and its entry. A
+			// hit needs the full key equal (stage, hash, sizes, static register state, expanded
+			// code), the same bucket count (iterators survive) and no new unsupported key, so it
+			// returns exactly what find() would; it only saves hashing the key.
+			static auto& lookup_cache_switch = Common::LiveSwitches::Get("KYTY_LOOKUP_CACHE", 1);
+			auto&        last = last_lookup[static_cast<size_t>(stage) % last_lookup.size()];
+			const bool   use_cache = lookup_cache_switch.load(std::memory_order_relaxed) != 0;
+			if (use_cache && last.valid && last.buckets == programs.bucket_count() &&
+			    last.unsupported_size == unsupported.size() && last.key == lookup_key) {
+				entry = last.entry;
+				lookup_hits++;
+			} else {
+				if (unsupported.contains(lookup_key)) {
+					return ShaderProgram {};
+				}
+				entry = programs.find(lookup_key);
+				lookup_misses++;
+				last.valid = use_cache && entry != programs.end();
+				if (last.valid) {
+					last.key              = lookup_key;
+					last.entry            = entry;
+					last.buckets          = programs.bucket_count();
+					last.unsupported_size = unsupported.size();
+				}
 			}
-			entry = programs.find(lookup_key);
 		}
 		NotePredictability(stage, entry != programs.end() ? &entry->second : nullptr, user_data);
 		ShaderReadChunks                 read_chunks(ShaderReadChunks::Mode());
@@ -1155,6 +1180,16 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported;
+	struct LastLookup {
+		bool                                                              valid = false;
+		ProgramKey                                                        key;
+		std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash>::iterator entry;
+		size_t                                                            buckets          = 0;
+		size_t                                                            unsupported_size = 0;
+	};
+	std::array<LastLookup, 16> last_lookup {};
+public:
+	uint64_t lookup_hits = 0, lookup_misses = 0;
 	ShaderRecompiler::Decoder::ShaderFunctionExpander          function_expander;
 	ProgramKey                                                  lookup_key;
 	// Research: per shader hash, the user-data dwords holding its inlined call targets.

@@ -1,3 +1,5 @@
+#include "common/liveSwitches.h"
+#include <cstring>
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 
 #include "common/assert.h"
@@ -70,6 +72,33 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 
 		return;
+	}
+	// KYTY_RT_CACHE (live, default 1, wolverine-fast-1027): the descriptor computed from the
+	// render-target registers is a pure function of (registers, slot mask, slice offset, flags);
+	// consecutive draws with the same registers reuse it. The texture-cache lookup and binding
+	// (FindImage, BindRenderTarget) still run every draw, so image discovery, invalidation and
+	// usage tracking are unchanged.
+	struct CachedTarget {
+		bool            valid = false;
+		HW::RenderTarget rt {};
+		uint32_t        mask = 0, slice = 0;
+		bool            ignore_mask = false, exact = false;
+		RenderColorInfo info {};
+	};
+	static thread_local std::array<CachedTarget, RENDER_COLOR_ATTACHMENTS_MAX> s_cache {};
+	static auto& rt_cache_switch = Common::LiveSwitches::Get("KYTY_RT_CACHE", 1);
+	const bool   use_rt_cache    = rt_cache_switch.load(std::memory_order_relaxed) != 0 &&
+	                          rt_slot < s_cache.size();
+	if (use_rt_cache) {
+		auto& c = s_cache[rt_slot];
+		if (c.valid && c.mask == mask && c.slice == render_target_slice_offset &&
+		    c.ignore_mask == ignore_target_mask && c.exact == exact_format &&
+		    std::memcmp(&c.rt, &rt, sizeof(rt)) == 0) {
+			r          = c.info;
+			r.image_id = m_context.GetTextureCache().FindImage(r.desc, exact_format);
+			BindRenderTarget(r.image_id);
+			return;
+		}
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
@@ -334,8 +363,19 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
+	if (use_rt_cache) {
+		// Stored before FindImage, which may remap r.desc into a larger cache image.
+		auto& c       = s_cache[rt_slot];
+		c.valid       = true;
+		std::memcpy(&c.rt, &rt, sizeof(rt));
+		c.mask        = mask;
+		c.slice       = render_target_slice_offset;
+		c.ignore_mask = ignore_target_mask;
+		c.exact       = exact_format;
+		c.info        = r;
+	}
+	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	BindRenderTarget(r.image_id);
 }
 

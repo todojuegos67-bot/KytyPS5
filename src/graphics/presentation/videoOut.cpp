@@ -1,3 +1,4 @@
+#include "common/liveSwitches.h"
 #include "graphics/frameCosts.h"
 #include <cstdio>
 #include <chrono>
@@ -1293,6 +1294,19 @@ static void NoteFrameStats() {
 		const auto deferred = FrameCosts::g_draws_deferred.exchange(0);
 		const auto crit_us = FrameCosts::g_critical_wait_us.exchange(0);
 		const auto crit_n  = FrameCosts::g_critical_waits.exchange(0);
+		// wolverine-fast-1027: the live switches in effect this window, so an fps change can be
+		// attributed to the switch flipped in live.txt.
+		static auto& sw_memo   = Common::LiveSwitches::Get("KYTY_RESOURCE_MEMO", 1);
+		static auto& sw_lookup = Common::LiveSwitches::Get("KYTY_LOOKUP_CACHE", 1);
+		static auto& sw_rt     = Common::LiveSwitches::Get("KYTY_RT_CACHE", 1);
+		static auto& sw_state  = Common::LiveSwitches::Get("KYTY_STATE_CACHE", 0);
+		static auto& sw_eager  = Common::LiveSwitches::Get("KYTY_EAGER_WRITEBACK", 0);
+		static auto& sw_defer  = Common::LiveSwitches::Get("KYTY_DEFER_DEPTH_DRAWS", 0);
+		::printf("Switches (5 s): KYTY_RESOURCE_MEMO=%lld KYTY_LOOKUP_CACHE=%lld KYTY_RT_CACHE=%lld "
+		         "KYTY_STATE_CACHE=%lld KYTY_EAGER_WRITEBACK=%lld KYTY_DEFER_DEPTH_DRAWS=%lld\n",
+		         static_cast<long long>(sw_memo.load()), static_cast<long long>(sw_lookup.load()),
+		         static_cast<long long>(sw_rt.load()), static_cast<long long>(sw_state.load()),
+		         static_cast<long long>(sw_eager.load()), static_cast<long long>(sw_defer.load()));
 		// wolverine-async-1027: where new pipelines cost the GPU thread time, and what was skipped.
 		::printf("Pipelines (5 s): compute inline %llu in %.0f ms, compute queued %llu, compute dispatches skipped %llu; "
 		         "graphics draws skipped while compiling %llu, must-draw inline compiles %llu in %.0f ms\n",
