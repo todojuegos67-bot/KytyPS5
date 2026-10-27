@@ -134,6 +134,15 @@ void DebugView(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageVie
 // row-major, clip = M * world); false until one was seen.
 bool SceneCamera(std::array<float, 16>& vp);
 
+// (hwrt2g, KYTY_HWRT_AO / KYTY_HWRT_GI: hwrt-gi.cpp) The TLAS built this frame and its camera (clip -> world rows, world ->
+// clip rows, the position), for a ray query pass recorded after the build in the same frame. False: no scene this frame.
+struct GiSceneInfo {
+	vk::AccelerationStructureKHR tlas = nullptr;
+	std::array<float, 16>        inv {}, vp {};
+	std::array<float, 4>         cam {};
+};
+[[nodiscard]] bool GiScene(GiSceneInfo& out);
+
 } // namespace HwScene
 } // namespace Libs::Graphics
 
