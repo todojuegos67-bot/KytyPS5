@@ -513,7 +513,13 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.size[2] = static_cast<float>(g_hl.trace.width), push.size[3] = static_cast<float>(g_hl.trace.height);
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
 	push.motion[2] = g_hl.history_valid && !inputs.reset && inputs.motion.view != nullptr ? 1.0f : 0.0f;
-	push.misc[1]   = static_cast<int32_t>(g_hl.frame & 0x7fffffff);
+	// (rtstab2, KYTY_HWRT_LIGHTS_STABLE=1, the default: misc.y is the shader's noise only; the same per-pixel sequence
+	// every frame, so a still camera traces the same rays; 0: frame-indexed as before)
+	static const bool stable = [] {
+		const char* v = std::getenv("KYTY_HWRT_LIGHTS_STABLE");
+		return !(v != nullptr && v[0] == '0');
+	}();
+	push.misc[1]   = stable ? 0 : static_cast<int32_t>(g_hl.frame & 0x7fffffff);
 	push.misc[2]   = level;
 
 	const auto entry = static_cast<uint32_t>(g_hl.written % 8);

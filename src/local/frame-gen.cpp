@@ -8253,7 +8253,17 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 // (KYTY_RT_SUN) This frame's cascades into `slot` of the shader's buffer (rt-sun.comp SunBuf): each copied layer's light
 // matrix composed with the camera's view -> world (from the projection and the G-buffer draws' view-projection, as
 // CShadowView, with the translation), sorted finest first. False while there is no copy of the last 8 flips.
-bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& vp, uint32_t slot) {
+// (rtstab2) KYTY_RT_SUN_HOLD (600 flips, ~10 s): how long the last copied cascades keep serving. The game copies its far
+// cascade only every ~12 flips (47 copies in 10 s at the Boletaria gate); the old limit of 8 flips switched the pass off
+// on 3 frames of 4 (133 of 544 still frames ran): the sun term pulsed between ours and the game's. The cascades are
+// light-space (world -> light clip), so the copy stays exact for the static world while the camera moves; past the hold
+// the pass fades out over 0.5 s instead of stopping.
+uint32_t RtSunHold() {
+	static const uint32_t v = static_cast<uint32_t>(RtSunEnv("KYTY_RT_SUN_HOLD", 600.0f, 8.0f, 100000.0f));
+	return v;
+}
+bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& vp, uint32_t slot, bool* stale) {
+	if (stale != nullptr) *stale = false;
 	if (g_rs.buf_mapped == nullptr || g_rs.view == nullptr) return false;
 	std::vector<RtSunEntry> table;
 	uint64_t                copy_flip = ~0ull;
@@ -8262,7 +8272,8 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 		table = g_rs.copied, copy_flip = g_rs.copy_flip;
 	}
 	const uint64_t flips = g_flips_taken.load(std::memory_order_relaxed);
-	if (table.empty() || copy_flip == ~0ull || flips > copy_flip + 8) return false;
+	if (table.empty() || copy_flip == ~0ull) return false;
+	if (stale != nullptr) *stale = flips > copy_flip + RtSunHold();
 	std::array<float, 16> pc {};
 	for (int i = 0; i < 4; ++i)
 		for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
@@ -8762,7 +8773,16 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		g_cs.hw_now = true;
 		++(built ? g_cs.hw_traced : g_cs.hw_stale);
 	}
-	if (sun_mode && !RtSunPrepare(m, vp, sun_slot)) return said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
+	bool sun_stale = false;
+	if (sun_mode && !RtSunPrepare(m, vp, sun_slot, &sun_stale)) {
+		// (no cascade ever copied here: the latched sun still feeds the god rays and shine, in this frame's view)
+		if (g_cs.latched && g_cs.hyp >= 0 && g_cs.fade > 0.0f) {
+			const auto l_view = ToView(view, g_cs.latch_axis);
+			ShineSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor));
+			GodraysSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor));
+		}
+		return said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
+	}
 	CShadowCamera(view, m);
 	if (g_cs.hyp >= 0 && (CShadowLeft() & (1u << g_cs.hyp)) == 0) {
 		static const char* names[] {"+x", "-x", "+y", "-y", "+z", "-z"};
@@ -8872,7 +8892,13 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	       vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite);
 	const uint32_t cur  = g_cs.frame & 1u;
 	const uint32_t prev = cur ^ 1u;
-	push.misc[1] = static_cast<int32_t>(g_cs.frame);
+	// (rtstab2, KYTY_RT_SUN_STABLE=1, the default: the shaders' only use of misc.y is their noise; 0 = the same per-pixel
+	// sequence every frame, so a still camera traces the same rays and the result holds. 0: frame-indexed as before.)
+	static const bool sun_stable = [] {
+		const char* v = std::getenv("KYTY_RT_SUN_STABLE");
+		return !(v != nullptr && v[0] == '0');
+	}();
+	push.misc[1] = sun_stable ? 0 : static_cast<int32_t>(g_cs.frame);
 	push.misc[2] = quality;
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_cs.pipeline);
 	const SsgiImage* aux_in  = &g_cs.moments[prev];
@@ -8986,8 +9012,9 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		std::fflush(stdout);
 	}
 	// The fade: in over 1 s once everything is known, out over 0.3 s on a change or an absence.
-	const bool target = g_cs.latched && !g_cs.switching && !absent && hyp >= 0 && space != 0;
-	g_cs.fade         = std::clamp(g_cs.fade + (target ? dt / 1.0f : -dt / 0.3f), 0.0f, 1.0f);
+	// (rtstab2: cascades older than KYTY_RT_SUN_HOLD fade the pass out too, over 0.5 s, never a cut)
+	const bool target = g_cs.latched && !g_cs.switching && !absent && hyp >= 0 && space != 0 && !sun_stale;
+	g_cs.fade         = std::clamp(g_cs.fade + (target ? dt / 1.0f : -dt / 0.5f), 0.0f, 1.0f);
 	if (!g_cs.latched || g_cs.fade <= 0.0f) {
 		g_cs.history_valid = false;
 		return said_once(hyp < 0 ? "calibrating world up (turn the camera; look at some floor)"
