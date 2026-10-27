@@ -7,7 +7,10 @@ Como jugar
 2. La primera vez pide la carpeta del juego volcado (la que tiene eboot.bin y sce_sys).
    Se guarda en settings.ini (carpeta_juego). Versiones probadas: PPSA01341 01.007.000 y 01.005.000.
 3. La primera vez (y despues de actualizar el driver de la grafica) prepara los shaders
-   durante un minuto aprox. mientras se ve la pantalla de inicio.
+   solo, sin hacer nada: "Preparando shaders 1/3, 2/3, 3/3" (la lista de shaders del juego, las
+   especializaciones de partidas grabadas que trae el paquete y las entradas para tu grafica; un minuto
+   aprox.). Despues, durante la intro y la pantalla de titulo, se compilan con el progreso en pantalla
+   ("Preparando shaders X/Y") hasta "Shaders listos". Puedes jugar mientras tanto.
 
 No hace falta PowerShell ni ninguna consola: todo va dentro del exe.
 

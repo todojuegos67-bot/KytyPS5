@@ -738,12 +738,23 @@ void Draw(float width, float height) {
 						std::string x = v ? "1" : "0";
 						if (ChoiceRow(label, true, yes_no, 2, x, tip)) v = x == "1";
 					};
+					// (10-27b) The s25 launcher's rows: Reflejos, Sombras sol, Luces antorcha/lamparas, Luz volumetrica and
+					// "Juego original" (its rows inactive while checked, their values kept).
+					ImGui::BeginDisabled(s.pure_game);
 					row("Reflejos", s.rt_reflections, "Reflejos con trazado de rayos: refleja tambien lo que esta fuera de pantalla o tapado, con sus texturas.");
+					const bool sun_was = s.rt_sun;
 					row("Sombras sol", s.rt_sun, "Sombras del sol con trazado de rayos: sombras de contacto y las que faltaban.");
-					row("Niebla volum.", s.rt_fog, "Niebla y haces de luz por puertas y ventanas cortados por la geometria real, sin parpadeos. Solo suma luz.");
-					row("Particulas", s.rt_particles, "El fuego, las chispas y la magia iluminan lo que tienen cerca, con sombras reales. Muy barato.");
-					row("Metal/armadura", s.rt_metal, "Reflejos con trazado de rayos en armaduras, espadas, escudos y herrajes de metal.");
-					row("Oclusion", s.rt_ao, "Oclusion ambiental con trazado de rayos: rincones, contactos y objetos asentados con la geometria real.");
+					row("Luces antorcha/lamparas", s.rt_particles, "Antorchas, lamparas, fuego y magia iluminan lo que tienen cerca con trazado de rayos y sombras reales.");
+					static const Choice rays[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}};
+					const std::string rays_was = s.godrays;
+					ChoiceRow("Luz volumetrica", true, rays, 4, s.godrays,
+					          "Luz volumetrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms.");
+					// (vol25) Luz volumetrica and Sombras sol share the engine's sun pass: choosing one turns the other off.
+					if (s.rt_sun && !sun_was && s.godrays != "0") s.godrays = "0";
+					else if (s.godrays != "0" && s.godrays != rays_was && s.rt_sun) s.rt_sun = false;
+					ImGui::EndDisabled();
+					CheckRow("Juego original (sin efectos anadidos)", true, s.pure_game,
+					         "Apaga todos los efectos visuales que anade el emulador (ray tracing, luz volumetrica, sombras RT, brillo, oclusion, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, frame generation y latencia no cambian.");
 					ImGui::Spacing();
 					ImGui::TextColored(kDim, "Al elegir cualquier Modo Souls todo el ray tracing pasa a No (se enciende a mano despues).");
 					break;
@@ -770,7 +781,7 @@ void Draw(float width, float height) {
 					CheckRow("HDR", true, s.hdr, "HDR10: activa antes \"Usar HDR\" en la configuracion de pantalla de Windows");
 					CheckRow("VSync", true, s.vsync, "VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando");
 					CheckRow("G-Sync", true, s.gsync, "G-Sync / FreeSync: el emulador no ata su reloj a los Hz del monitor");
-					if (ChoiceRow("Metricas", false, kMetrics, kMetricsCount, s.metrics, "Muestra encima del juego los FPS, el modo de frame generation y el detalle")) live_changed = true;
+					if (ChoiceRow("Metricas", false, kMetrics, kMetricsCount, s.metrics, "Panel dentro del juego (F8 lo cambia en vivo): FPS, el modo de frame generation, latencia y el detalle. Ya no abre una ventana aparte.")) live_changed = true;
 					static const Choice aspects[] = {{"16:9", "Monitor 16:9"}, {"21:9", "Monitor 21:9"}, {"32:9", "Monitor 32:9"}};
 					ChoiceRow("Monitor", true, aspects, 3, s.aspect, "Monitores panoramicos (ultrawide): el juego se dibuja a 21:9 o 32:9 en vez de estirarse. Funciona con DLSS, XeSS y FSR. Los videos y algunos menus se ven estirados.");
 					CheckRow("Mantener 16:9 (bandas negras)", true, s.aspect_fit);
@@ -790,18 +801,17 @@ void Draw(float width, float height) {
 					break;
 				}
 				case 6: { // Rendimiento / PC
+					// (10-27b) The 16 GB profile only on a PC of 20 GB of RAM or less (or simulated): fixed on there, off and
+					// inactive on the others (as the launcher's Update-LowRam).
 					const bool low = LowRam(s, g_rt.pc);
-					bool       p16 = low ? true : s.profile16;
-					ImGui::BeginDisabled(low);
-					if (CheckRow("Optimizacion equipos 16 GB RAM", true, p16,
-					             "Solo aplica el perfil de memoria de 16 GB en PCs reales de 20 GB de RAM o menos, o con \"Simular 16 GB RAM\". No cambia los graficos.") &&
-					    !low)
-						s.profile16 = p16;
+					bool       p16 = low;
+					s.profile16    = low;
+					ImGui::BeginDisabled(true);
+					CheckRow("Optimizacion equipos 16 GB RAM", true, p16,
+					         "Solo aplica el perfil de memoria de 16 GB en PCs reales de 20 GB de RAM o menos, o con \"Simular 16 GB RAM\". No cambia los graficos.");
 					ImGui::EndDisabled();
-					if (low) {
-						s.profile16 = true;
-						ImGui::TextColored(kGold, "RAM %s: perfil seguro. Cierra navegadores", s.simulate_ram16 ? "16 GB (simulado)" : (std::to_string(g_rt.pc.ram_gb) + " GB").c_str());
-					}
+					if (low) ImGui::TextColored(kGold, "RAM %s: perfil seguro. Cierra navegadores", s.simulate_ram16 ? "16 GB (simulado)" : (std::to_string(g_rt.pc.ram_gb) + " GB").c_str());
+					else ImGui::TextColored(kDim, "RAM %d GB: sin perfil de 16 GB (solo en PCs de 20 GB o menos).", g_rt.pc.ram_gb);
 					CheckRow("Simular 16 GB RAM", true, s.simulate_ram16, "Solo el juego: como mucho 12 GB en RAM (4 GB para Windows), el resto a disco, como un PC de 16 GB.");
 					CheckRow("Simular grafica 8 GB", true, s.simulate_vram8, "El juego solo puede usar 8 GB de VRAM, como una grafica de 8 GB.");
 					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para graficas que se cuelgan o dan pantallazo azul: mas estable, ~37% menos FPS");
@@ -947,7 +957,8 @@ void InstallMenu(const Runtime& runtime) {
 		      level(kShadows, kShadowCount, runtime.launched.shadows) + ", Detalle " + level(kDetails, kDetailCount, runtime.launched.detail);
 		PortLive::gfx_line = gfx.c_str();
 	}
-	PortLive::g_hooks = &kHooks;
+	PortLive::g_hooks   = &kHooks;
+	PortLive::status_es = true; // (10-27b) "Preparando shaders X/Y" on screen
 }
 
 void RequestQuit() {

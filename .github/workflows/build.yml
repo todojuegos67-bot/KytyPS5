@@ -261,8 +261,10 @@ jobs:
             Copy-Item _Build\deps\ffx\amd_fidelityfx_vk.dll, _Build\deps\ffx\FidelityFX-LICENSE.txt $out
             $states = "$out\tools\local\static-precompile"
             New-Item -ItemType Directory -Force $states | Out-Null
-            Copy-Item tools\local\static-precompile\pass-states.json, tools\local\static-precompile\hints-*.hints $states
-            Copy-Item tools\local\static-precompile\files-*.files $states -ErrorAction SilentlyContinue
+            # (10-27b) The whole folder, as the launcher's: pass-states.json (the seed file's render-pass states), the
+            # specialization hints (released-*.seeds is made from them on the PC: Demon's Souls.exe, before the game) and
+            # the file recordings. seeds-*, hinted-*, released-* and recorded-play-* hold the game's shader code: made on the PC.
+            Copy-Item tools\local\static-precompile\* $states -Recurse
             $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
             $crt = Get-Item "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" | Where-Object { $_.Parent.Parent.Name -match '^\d+\.' } |
               Sort-Object { [version]$_.Parent.Parent.Name } | Select-Object -Last 1

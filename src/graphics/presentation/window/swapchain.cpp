@@ -41,6 +41,7 @@
 #include <string>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <deque>
 #include <string_view>
@@ -531,7 +532,12 @@ struct Presenter::Impl {
 		if (status_shown == std::chrono::steady_clock::time_point {}) status_shown = now;
 		if (hide_after > 0 && now - status_shown >= std::chrono::seconds(hide_after)) return;
 		std::array<char, 128> line {};
-		if (progress.done < progress.total || progress.label != nullptr) {
+		const bool es = PortLive::status_es.load(std::memory_order_relaxed); // (the PC port)
+		if (es && (progress.done < progress.total || progress.label != nullptr)) {
+			const bool pipelines = progress.label != nullptr && std::strstr(progress.label, "pipelines") != nullptr;
+			std::snprintf(line.data(), line.size(), "%s %zu/%zu  (%zu%%)", pipelines ? "Preparando pipelines" : "Preparando shaders",
+			              progress.done, progress.total, progress.done * 100 / progress.total);
+		} else if (progress.done < progress.total || progress.label != nullptr) {
 			std::snprintf(line.data(), line.size(), "%s %zu%%  (%zu / %zu)",
 			              progress.label != nullptr ? progress.label : "Preparing shaders", progress.done * 100 / progress.total,
 			              progress.done, progress.total);
@@ -542,7 +548,7 @@ struct Presenter::Impl {
 			if (now - prefetch_finished >= std::chrono::seconds(3)) {
 				return;
 			}
-			std::snprintf(line.data(), line.size(), "All shaders ready (%zu)", progress.total);
+			std::snprintf(line.data(), line.size(), es ? "Shaders listos (%zu)" : "All shaders ready (%zu)", progress.total);
 		}
 		hud.status          = line.data();
 		hud.status_fraction = static_cast<float>(progress.done) / static_cast<float>(progress.total);

@@ -449,7 +449,7 @@ void PrepareShaders(const fs::path& root, const std::string& game, const GamePar
 	const bool     have  = fs::exists(seeds, ec);
 	const bool     stale = have && ReadText(stamp_file).find(stamp) == std::string::npos;
 	if (!have || stale) {
-		SplashStatus("Preparando la lista de shaders del juego (solo la primera vez)...");
+		SplashStatus("Preparando shaders 1/3: la lista de shaders del juego (solo la primera vez)...");
 		const fs::path made = stale ? fs::path(seeds.wstring() + L".new") : seeds;
 		if (RunHidden(tool, L"--game " + wgame + L" --make-seeds \"" + made.wstring() + L"\" --states \"" + states.wstring() + L"\"",
 		              root, log, affinity) == 0 &&
@@ -461,13 +461,37 @@ void PrepareShaders(const fs::path& root, const std::string& game, const GamePar
 			return;
 		}
 	}
+	// (10-27b) The release's specialization hints (tools/local/static-precompile/hints-<title>_<version>.hints, shipped:
+	// recorded play without the game's code), completed with the seed file's code into released-<title>_<version>.seeds
+	// next to the exe: the shader prefetch starts with them (PipelineCache::StartShaderPrefetch), what a PC without a
+	// recording of its own compiled one by one in the first fights (precompile-windows.ps1 does the same).
+	if (!param.title_id.empty() && !param.version.empty()) {
+		const std::string id       = param.title_id + "_" + param.version;
+		const fs::path    hints    = root / L"tools" / L"local" / L"static-precompile" / Wide("hints-" + id + ".hints");
+		const fs::path    released = root / Wide("released-" + id + ".seeds");
+		const auto        newer    = [&](const fs::path& a, const fs::path& b) {
+            std::error_code e;
+            return fs::last_write_time(a, e) > fs::last_write_time(b, e);
+		};
+		if (fs::exists(hints, ec) && (!fs::exists(released, ec) || newer(seeds, released) || newer(hints, released))) {
+			SplashStatus("Preparando shaders 2/3: especializaciones de partidas grabadas (unos segundos)...");
+			if (RunHidden(tool, L"--game " + wgame + L" --seeds \"" + seeds.wstring() + L"\" --apply-hints \"" + hints.wstring() +
+			                        L"\" --out \"" + released.wstring() + L"\"",
+			              root, root / L"logs" / L"apply-hints.log", affinity) != 0) {
+				fs::remove(released, ec);
+				std::printf("[port] shaders: the release's hints could not be applied: the seeds alone\n");
+			} else {
+				std::printf("[port] shaders: %s made from the release's hints\n", ("released-" + id + ".seeds").c_str());
+			}
+		}
+	}
 	const fs::path status_file = root / L"logs" / L"precompile-status.txt";
 	const std::wstring base    = L"--game " + wgame + L" --seeds \"" + seeds.wstring() + L"\" ";
 	if (RunHidden(tool, base + L"--status", root, status_file, affinity) != 0) return;
 	const std::string status = ReadText(status_file);
 	std::printf("[port] shaders: %s\n", status.find("inputs current") != std::string::npos ? "prefetch inputs ready" : "making the prefetch inputs");
 	if (status.find("inputs current") == std::string::npos) {
-		SplashStatus("Preparando los shaders para esta grafica (primera vez o driver nuevo: un minuto)...");
+		SplashStatus("Preparando shaders 3/3: para esta grafica (primera vez o driver nuevo: un minuto). Despues, en la pantalla de titulo, se compilan con su progreso en pantalla.");
 		if (RunHidden(tool, base + L"--no-pipelines --static-inputs --threads " + std::to_wstring(cpus), root, log, affinity) != 0)
 			std::printf("[port] shaders: making the prefetch inputs failed\n");
 	}

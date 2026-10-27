@@ -208,6 +208,8 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("rt_particulas", s->rt_particles);
 	boo("rt_metal", s->rt_metal);
 	boo("rt_oclusion", s->rt_ao);
+	str("luz_volumetrica", s->godrays);
+	boo("juego_original", s->pure_game);
 	str("bordes_sombras", s->shadow_edges);
 	str("sombra_rincones", s->corner_shadow);
 	str("modo_souls", s->souls_mode);
@@ -336,7 +338,11 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "rt_niebla=" << b(s.rt_fog) << "\n"
 	  << "rt_particulas=" << b(s.rt_particles) << "\n"
 	  << "rt_metal=" << b(s.rt_metal) << "\n"
-	  << "rt_oclusion=" << b(s.rt_ao) << "\n\n"
+	  << "rt_oclusion=" << b(s.rt_ao) << "\n"
+	  << "; Luz volumetrica: 0 no, 1 bajo, 2 medio, 3 alto (excluye rt_sombras_sol)\n"
+	  << "luz_volumetrica=" << s.godrays << "\n"
+	  << "; Juego original: 1 apaga todos los efectos visuales que anade el emulador\n"
+	  << "juego_original=" << b(s.pure_game) << "\n\n"
 	  << "[Mandos]\n"
 	  << "; Teclado y raton (F7 tambien cambia el raton a mando en vivo)\n"
 	  << "teclado_raton=" << b(s.kbm) << "\n"
@@ -456,6 +462,12 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	}
 	std::string upscaler = res->upscaler;
 	double      ratio    = upscaler.empty() ? 0.0 : res->value;
+	// (10-27) DLSS in Souls ligero / PC low profile: DLSS outputs 4K inside and only takes 2160 / an exact ratio (1440, 1256,
+	// 1080, 720): any DLSS quality there renders at 720 (DLAA at 1080 stays).
+	if (upscaler == "dlss" && pc.nvidia && (s.souls_mode == "ligero" || s.souls_mode == "low")) {
+		const int out_h = s.fullscreen && pc.screen_h > 0 ? pc.screen_h : (s.height > 0 ? s.height : 1440);
+		if (!(out_h == 1080 && ratio == 1.0)) ratio = std::round(out_h / 720.0 * 10000.0) / 10000.0;
+	}
 	if (std::strcmp(res->id, "fsr-900") == 0 && pc.screen_h > 0) ratio = std::max(1.0, std::round(pc.screen_h / 900.0 * 10000.0) / 10000.0);
 
 	// Launcher-souls.ps1 Start-Game's -Set switches, in its order.
@@ -487,42 +499,18 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (10-26) GTAO and the screen-space RT (Luz RT, volumetric, RT reflections, RT sun, RT particles) are gone: never passed.
 	// Bordes sombras: the game's shadow maps filtered (KYTY_SHADOW_FILTER).
 	if (s.shadow_edges == "1" || s.shadow_edges == "2" || s.shadow_edges == "3") sets.emplace_back("KYTY_SHADOW_FILTER", s.shadow_edges);
-	// (10-27) Ray tracing (hardware), No / Si: Launcher-souls.ps1 $hwTbl.
+	// (10-27b) Ray tracing (hardware), the s25 launcher: only Reflejos, Sombras sol and Luces antorcha/lamparas (No / Si);
+	// no hardware volumetric, metal or AO.
 	{
-		struct Row {
-			bool                     on;
-			const char*              key;
-			std::vector<const char*> env;
-		};
-		const Row rows[] = {
-		    {s.rt_reflections, "refl", {"KYTY_HWRT_REFL=1", "KYTY_HWRT_REFL_MATERIAL=1"}},
-		    {s.rt_sun, "sol", {"KYTY_HWRT_SHADOW=2"}},
-		    {s.rt_fog, "volum", {"KYTY_HWRT_VOLUMETRIC=2"}},
-		    {s.rt_particles, "partic", {"KYTY_HWRT_PARTICLES=2"}},
-		    {s.rt_metal, "metal", {"KYTY_HWRT_REFL=1", "KYTY_HWRT_REFL_MATERIAL=1", "KYTY_HWRT_METAL=1"}},
-		    {s.rt_ao, "ao", {"KYTY_HWRT_AO=2"}},
-		};
 		Env hw;
-		for (const auto& row: rows) {
-			if (!row.on) continue;
-			for (const char* e: row.env) {
-				const std::string pair = e;
-				const auto        eq   = pair.find('=');
-				const std::string n = pair.substr(0, eq), v = pair.substr(eq + 1);
-				if (hw.Has(n) && n.rfind("KYTY_HWRT_SHADOW", 0) == 0 && std::strcmp(row.key, "sol") != 0) continue;
-				hw.Set(n, v);
-			}
-		}
-		if (s.rt_fog && !s.rt_sun && !hw.Has("KYTY_HWRT_SHADOW")) hw.Set("KYTY_HWRT_SHADOW", "1");
-		if (s.rt_metal) {
+		if (s.rt_reflections) {
 			hw.Set("KYTY_HWRT_REFL", "1");
 			hw.Set("KYTY_HWRT_REFL_MATERIAL", "1");
 		}
-		// Sombra rincones: the hardware AO's floor and strength (Normal = the emulator's own), with Oclusion only.
-		if ((s.corner_shadow == "1" || s.corner_shadow == "2") && s.rt_ao) {
-			const int i = s.corner_shadow == "1" ? 1 : 2;
-			hw.Set("KYTY_HWRT_AO_FLOOR", std::string(i == 1 ? "0.45" : "0.35"));
-			hw.Set("KYTY_HWRT_AO_STRENGTH", std::string(i == 1 ? "0.85" : "0.95"));
+		if (s.rt_sun) hw.Set("KYTY_HWRT_SHADOW", "2");
+		if (s.rt_particles) {
+			hw.Set("KYTY_HWRT_PARTICLES", "2");
+			hw.Set("KYTY_HWRT_LIGHTS", "2");
 		}
 		if (!hw.list.empty()) {
 			sets.emplace_back("KYTY_HWRT", "1");
@@ -561,6 +549,19 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	sets.emplace_back("KYTY_FLIP_QUEUE_LIMIT", "0");
 	sets.emplace_back("KYTY_PHASE_PACE", "0");
 	if (fixed_fg) sets.emplace_back("KYTY_DISPLAYED_WAIT", "1"); // (10-25) one frame queued as on the console: 30 / 45 only
+	// Luz volumetrica (Bajo / Medio / Alto): KYTY_GODRAYS, its sun from the screen-space RT shadow at strength 0 (draws no
+	// shadow). KYTY_RT_SUN=0 (vol25): without the cascade mode the volumetric gets the sun every frame (no fog popping).
+	// (The engine has no sun-fix yet: Luz volumetrica and Sombras sol stay exclusive, the menu turns the other off.)
+	const bool godrays = !s.pure_game && (s.godrays == "1" || s.godrays == "2" || s.godrays == "3");
+	if (godrays) {
+		sets.emplace_back("KYTY_GODRAYS", s.godrays);
+		sets.emplace_back("KYTY_RT_SHADOWS", "1");
+		sets.emplace_back("KYTY_RT_SHADOWS_STRENGTH", "0");
+		sets.emplace_back("KYTY_RT_SUN", "0");
+	} else {
+		sets.emplace_back("KYTY_RT_SHADOWS", "");
+		sets.emplace_back("KYTY_RT_SHADOWS_STRENGTH", "");
+	}
 	// Its vblank: 840 Hz with DLSS and AMD dynamic frame generation, 360 with the other frame generation, 960 unlocked
 	// without, else 60.
 	const bool vb840  = dlss_fg || std::strcmp(fg->id, "amd-dinamico") == 0;
@@ -638,28 +639,48 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		             "r_tessellationDensity=4.0;r_tessellationSmallestEdgeLength=0.08;r_tessellationFadeOutStart=6.0;r_tessellationFadeOutRange=2.0"}};
 		if (auto it = details.find(s.detail); it != details.end()) env.AppendConvars(it->second);
 		static const std::map<std::string, std::string> shadows = {
-		    {"alto", "sunShadowMaxDistance=190"},
-		    {"medio", "sunShadowMaxDistance=125"},
-		    {"bajo", "sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false"}};
+		    {"alto", "sunShadowMaxDistance=190;sunShadowLightDistance=1000"},
+		    {"medio", "sunShadowMaxDistance=125;sunShadowLightDistance=1000"},
+		    {"bajo", "sunShadowMaxDistance=60;sunShadowLightDistance=1000;r_enableAmbientShadowing=false;r_enableSpotShadows=false"}};
 		if (auto it = shadows.find(s.shadows); it != shadows.end()) env.AppendConvars(it->second);
 	}
 	env.Set("KYTY_TEXTURE_REDUCE", texture == "h" || texture == "1" || texture == "2" ? texture : "0"); // (an old "auto": Maximo)
 	env.Default("KYTY_UNMAP_PROTECT_SKIP", "1");
 	env.Set("KYTY_DRIVER_CACHE_KEY", "1f3c29b70e536c8f5a5e812e793b33ac2eb6858b4810ed98ca2a51b9fa5eed97");
 	env.Set("KYTY_SHADER_WARMUP_ONLY", "");
+	// (10-27b) The shader warmup and prefetch run beside the game's intro and title screen: their progress line stays on
+	// screen until they finish ("Preparando shaders X/Y"; the launcher's 6 s hid it).
+	env.Set("KYTY_SHADER_WARMUP", "1");
+	env.Set("KYTY_SHADER_WARMUP_BACKGROUND", "");
+	env.Set("KYTY_SHADER_PREFETCH", "");
+	env.Set("KYTY_PREFETCH_RELEASE", "");
+	env.Set("KYTY_STATUS_HUD_SECONDS", "0");
 	env.Default("KYTY_SHADER_WARMUP_SECONDS", "60");
 	env.Default("KYTY_TABLE_STORE_BUDGET", "8");
 	env.Default("KYTY_HITCH_LOG_MS", "40");
 	if (s.aspect_fit) env.Set("KYTY_PRESENT_ASPECT", "fit");
 	env.Default("KYTY_ASYNC_DRAW_PIPELINES", "1");
 	// -Ram16 (10-24): "Optimizacion equipos 16 GB RAM" on a PC of 20 GB of RAM or less (or simulated) only.
-	if (s.profile16 && low_ram) {
+	if (low_ram) { // (10-27b) on low-RAM PCs only, whatever the old box says
 		env.Default("KYTY_RESIDENT_MB", "6144");
 		env.Default("KYTY_PREFETCH_MIN_AVAIL_MB", "1536");
 		env.Default("KYTY_BACKING_FILE", "0");
 	}
 	if (!upscaler.empty()) env.Set("KYTY_UPSCALER", upscaler);
 	for (const auto& [k, v]: sets) env.Set(k, v);
+	// Juego original (the launcher's $pureGame): no visual pass the emulator adds; performance, upscaler, frame generation
+	// and latency the same.
+	if (s.pure_game) {
+		static const char* fx[] = {"KYTY_HWRT", "KYTY_RT_REFLECTIONS", "KYTY_RT_SHADOWS", "KYTY_RT_SUN", "KYTY_RT_PARTICLES", "KYTY_RT_LOCAL",
+		                           "KYTY_GODRAYS", "KYTY_SHINE", "KYTY_SPEC_OCCLUSION", "KYTY_GTAO", "KYTY_SSGI", "KYTY_SSR", "KYTY_CONTACT_SHADOWS"};
+		for (auto& [k, v]: env.list)
+			for (const char* p: fx)
+				if (k.rfind(p, 0) == 0) v.clear();
+		for (const char* k: {"KYTY_HWRT", "KYTY_HWRT_REFL", "KYTY_HWRT_SHADOW", "KYTY_HWRT_LIGHTS", "KYTY_HWRT_PARTICLES", "KYTY_RT_REFLECTIONS",
+		                     "KYTY_RT_SHADOWS", "KYTY_CONTACT_SHADOWS", "KYTY_RT_SUN", "KYTY_RT_PARTICLES", "KYTY_GODRAYS", "KYTY_SHINE",
+		                     "KYTY_SPEC_OCCLUSION", "KYTY_GTAO", "KYTY_SSGI", "KYTY_SSR"})
+			env.Set(k, "0");
+	}
 	// settings.ini [Avanzado] extra: as -Set (KEY= removes it).
 	{
 		std::stringstream list(s.extra);
@@ -728,7 +749,7 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.detail != n.detail || l.reflections != n.reflections || l.object_fade != n.object_fade || l.aa_sharp != n.aa_sharp ||
 	       l.shadow_edges != n.shadow_edges || l.corner_shadow != n.corner_shadow || l.rt_reflections != n.rt_reflections ||
 	       l.rt_sun != n.rt_sun || l.rt_fog != n.rt_fog || l.rt_particles != n.rt_particles || l.rt_metal != n.rt_metal ||
-	       l.rt_ao != n.rt_ao || l.motion_blur != n.motion_blur || l.dof != n.dof || l.vignette != n.vignette ||
+	       l.rt_ao != n.rt_ao || l.godrays != n.godrays || l.pure_game != n.pure_game || l.motion_blur != n.motion_blur || l.dof != n.dof || l.vignette != n.vignette ||
 	       l.bloom != n.bloom || l.eye_adapt != n.eye_adapt || l.af16 != n.af16 || l.texture_sharpness != n.texture_sharpness ||
 	       l.kbm != n.kbm || l.kbm_sens != n.kbm_sens || l.kbm_antidz != n.kbm_antidz || l.kbm_map != n.kbm_map ||
 	       l.pad_map != n.pad_map || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
@@ -770,6 +791,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->reflections    = "normal";
 		s->res            = "fsr-calidad";
 		s->sharpness      = "0.75";
+		s->godrays        = "2"; // (10-25) Luz volumetrica Medio
 	} else if (preset == "equilibrado") {
 		// (10-25) The user's capture: DLSS Calidad (K), sharpness 100 %, textures Maximo, distance and shadows Alto, Detail
 		// High, Reflections / Object Fade High, AA Sharpness High, x16, extra sharp textures, all the post-processing.
@@ -783,6 +805,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->sharpness = "1";
 		s->res       = "dlss-calidad";
 		s->dlss_preset = "K";
+		s->godrays     = "1"; // (10-25) Luz volumetrica Bajo
 	} else if (preset == "ultra") {
 		max();
 		s->detail   = "muy-alto";
@@ -809,6 +832,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		post_on();
 		s->res       = "fsr-calidad";
 		s->sharpness = "1";
+		s->godrays   = "2"; // (10-25) Luz volumetrica Medio
 	} else {
 		max();
 	}

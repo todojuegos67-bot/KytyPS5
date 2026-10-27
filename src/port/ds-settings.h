@@ -108,7 +108,11 @@ struct Settings {
 	std::string rt_light = "0";      // (10-26: removed from the launcher) KYTY_SSGI, never passed now
 	std::string ambient_occlusion = "0"; // (10-26: GTAO removed) never passed now
 	// (10-27) Ray tracing (hardware): the launcher's six No / Si rows ($hwTbl). Every Souls mode turns them off.
+	// (10-27b, the s25 launcher) Only Reflejos, Sombras sol and Luces antorcha/lamparas (rt_particles) are offered and passed;
+	// rt_fog / rt_metal / rt_ao stay in settings.ini but are never passed.
 	bool        rt_reflections = false, rt_sun = false, rt_fog = false, rt_particles = false, rt_metal = false, rt_ao = false;
+	std::string godrays = "0";       // Luz volumetrica: 0 No, 1 Bajo, 2 Medio, 3 Alto (KYTY_GODRAYS + the hidden RT sun pass)
+	bool        pure_game = false;   // Juego original: every visual pass the emulator adds off
 	std::string shadow_edges = "0";  // Bordes sombras: 0 Normal, 1 Alta, 2 Muy alta, 3 Ultra (KYTY_SHADOW_FILTER)
 	std::string corner_shadow = "0"; // Sombra rincones: 0 Normal, 1 Alta, 2 Maxima (with Oclusion RT only)
 	bool        motion_blur = true, dof = true, vignette = true, bloom = true, eye_adapt = true;

@@ -290,26 +290,37 @@ void TestLaunch() {
 	p                = Port::BuildLaunch(s, "PPSA01341", pc);
 	CHECK(EnvOf(p, "KYTY_PREFETCH_MIN_AVAIL_MB") == "1536");
 	pc.ram_gb = 32;
-	// Ray tracing rows ($hwTbl).
+	// (10-27b) Ray tracing rows of the s25 launcher: Reflejos, Sombras sol, Luces antorcha/lamparas; Luz volumetrica; Juego original.
 	Port::Settings r;
-	r.rt_fog = true;
-	p        = Port::BuildLaunch(r, "PPSA01341", pc);
-	CHECK(EnvOf(p, "KYTY_HWRT") == "1" && EnvOf(p, "KYTY_HWRT_VOLUMETRIC") == "2" && EnvOf(p, "KYTY_HWRT_SHADOW") == "1");
-	r.rt_sun = true;
-	p        = Port::BuildLaunch(r, "PPSA01341", pc);
-	CHECK(EnvOf(p, "KYTY_HWRT_SHADOW") == "2");
-	Port::Settings m;
-	m.rt_metal = true;
-	p          = Port::BuildLaunch(m, "PPSA01341", pc);
-	CHECK(EnvOf(p, "KYTY_HWRT_METAL") == "1" && EnvOf(p, "KYTY_HWRT_REFL") == "1" && EnvOf(p, "KYTY_HWRT_REFL_MATERIAL") == "1");
+	r.rt_fog = r.rt_metal = r.rt_ao = true; // (kept in settings.ini, never passed)
+	p                     = Port::BuildLaunch(r, "PPSA01341", pc);
+	EnvOf(p, "KYTY_HWRT_VOLUMETRIC", &has);
+	CHECK(!has);
+	r.rt_sun = r.rt_particles = r.rt_reflections = true;
+	p                                            = Port::BuildLaunch(r, "PPSA01341", pc);
+	CHECK(EnvOf(p, "KYTY_HWRT") == "1" && EnvOf(p, "KYTY_HWRT_SHADOW") == "2" && EnvOf(p, "KYTY_HWRT_LIGHTS") == "2" &&
+	      EnvOf(p, "KYTY_HWRT_PARTICLES") == "2" && EnvOf(p, "KYTY_HWRT_REFL_MATERIAL") == "1");
+	Port::Settings g;
+	g.godrays = "3";
+	p         = Port::BuildLaunch(g, "PPSA01341", pc);
+	CHECK(EnvOf(p, "KYTY_GODRAYS") == "3" && EnvOf(p, "KYTY_RT_SHADOWS") == "1" && EnvOf(p, "KYTY_RT_SHADOWS_STRENGTH") == "0" &&
+	      EnvOf(p, "KYTY_RT_SUN") == "0");
+	g.pure_game = g.rt_reflections = true;
+	p                              = Port::BuildLaunch(g, "PPSA01341", pc);
+	CHECK(EnvOf(p, "KYTY_GODRAYS") == "0" && EnvOf(p, "KYTY_HWRT") == "0" && EnvOf(p, "KYTY_HWRT_REFL") == "0" && EnvOf(p, "KYTY_SSGI") == "0");
+	CHECK(EnvOf(p, "KYTY_STATUS_HUD_SECONDS") == "0" && EnvOf(p, "KYTY_SHADER_WARMUP") == "1");
 	Port::Settings a;
-	a.corner_shadow = "2";
-	p               = Port::BuildLaunch(a, "PPSA01341", pc);
-	EnvOf(p, "KYTY_HWRT_AO_FLOOR", &has);
-	CHECK(!has); // (Sombra rincones needs Oclusion)
-	a.rt_ao = true;
-	p       = Port::BuildLaunch(a, "PPSA01341", pc);
-	CHECK(EnvOf(p, "KYTY_HWRT_AO") == "2" && EnvOf(p, "KYTY_HWRT_AO_FLOOR") == "0.35" && EnvOf(p, "KYTY_HWRT_AO_STRENGTH") == "0.95");
+	a.shadows = "medio";
+	p         = Port::BuildLaunch(a, "PPSA01341", pc);
+	CHECK(EnvOf(p, "KYTY_GAME_CONVARS").find("sunShadowMaxDistance=125;sunShadowLightDistance=1000") != std::string::npos);
+	{
+		Port::Settings d;
+		d.souls_mode = "ligero";
+		d.res        = "dlss-calidad";
+		d.fullscreen = false;
+		d.height     = 1440;
+		CHECK(Port::BuildLaunch(d, "PPSA01341", pc).ratio == 2.0); // (DLSS in Souls ligero: 720 input)
+	}
 	a.shadow_edges = "3";
 	p              = Port::BuildLaunch(a, "PPSA01341", pc);
 	CHECK(EnvOf(p, "KYTY_SHADOW_FILTER") == "3");

@@ -14,6 +14,7 @@ namespace PortLive {
 
 inline std::atomic<float> sharpness {-1.0f};  // KYTY_UPSCALE_SHARPNESS; < 0: the environment's
 inline std::atomic<int>   fg_generate {0};    // generated frames per real frame (fixed DLSS-G, FSR 3 MFG); 0: as launched
+inline std::atomic<bool>  status_es {false}; // (10-27b) the shader progress line in Spanish: "Preparando shaders X/Y"
 inline std::atomic<float> fps_cap {0.0f};     // KYTY_FPS_CAP (with KYTY_FLIP_WHEN_READY); 0: as launched
 inline std::atomic<int>   rumble {-1};        // KYTY_HAPTIC_RUMBLE; < 0: the environment's
 inline std::atomic<float> rumble_gain {0.0f}; // KYTY_HAPTIC_RUMBLE_GAIN; 0: the environment's
