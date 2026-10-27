@@ -34,6 +34,7 @@
 #include "local/godrays.h"
 #include "local/rt-local-lights.h"
 #include "local/rt-flicker.h"
+#include "local/rt-softsun.h"
 #include "local/hw-lights.h"
 #include "gpu_tiler_shaders/cshadow_spv.h"
 #include "gpu_tiler_shaders/rtsun_spv.h"
@@ -7508,7 +7509,9 @@ static_assert(sizeof(CShadowPush) == 176);
 int HwShadowLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_HWRT_SHADOW");
-		const int   q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		int         q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		// (KYTY_HWRT_SOFTSUN: the sun pass at its level when KYTY_HWRT_SHADOW is unset)
+		if ((value == nullptr || *value == '\0') && SoftSun::Level() > 0) value = "(KYTY_HWRT_SOFTSUN)", q = SoftSun::Level();
 		if (q > 0) {
 			std::printf("HWRTSHADOW: KYTY_HWRT_SHADOW=%s read (level %d)%s\n", value, q,
 			            HwScene::Requested() ? "" : ": needs KYTY_HWRT=1 too: off");
@@ -8002,6 +8005,13 @@ void RtSunAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::Comma
 	const uint64_t          flip = g_flips_taken.load(std::memory_order_relaxed);
 	std::vector<RtSunEntry> table;
 	uint64_t                address = 0;
+	// (KYTY_HWRT_SOFTSUN: the game still samples the cascades' array or its cache this flip: the held copy stays usable)
+	if (SoftSun::Level() > 0)
+		for (const auto& b: images)
+			if (b.image_id && b.desc.info.resources.layers >= 4 && SoftSun::IsCompanion(b.desc.info.data.address)) {
+				SoftSun::NoteUse(flip);
+				break;
+			}
 	{
 		std::lock_guard lock(g_rs.mutex);
 		if (g_rs.address == 0 || g_rs.copy_flip == flip) return;
@@ -8111,6 +8121,14 @@ void RtSunAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::Comma
 	barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
 	        vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
 	g_rs.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	if (SoftSun::Level() > 0) {
+		std::array<uint64_t, 8> others {};
+		size_t                  n = 0;
+		for (const auto& b: images)
+			if (b.image_id && b.desc.info.resources.layers >= 4 && b.desc.info.data.address != address && n < others.size())
+				others[n++] = b.desc.info.data.address;
+		SoftSun::NoteCopy(flip, address, std::span<const uint64_t>(others.data(), n));
+	}
 	std::lock_guard lock(g_rs.mutex);
 	g_rs.copied    = std::move(table);
 	g_rs.copy_flip = flip;
@@ -8262,7 +8280,8 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 		table = g_rs.copied, copy_flip = g_rs.copy_flip;
 	}
 	const uint64_t flips = g_flips_taken.load(std::memory_order_relaxed);
-	if (table.empty() || copy_flip == ~0ull || flips > copy_flip + 8) return false;
+	bool held = false; // (KYTY_HWRT_SOFTSUN: a copy older than 8 flips the game still uses)
+	if (table.empty() || !SoftSun::CopyUsable(flips, copy_flip, held)) return false;
 	std::array<float, 16> pc {};
 	for (int i = 0; i < 4; ++i)
 		for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
@@ -8327,14 +8346,16 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 	float* f = reinterpret_cast<float*>(g_rs.buf_mapped + slot * kRtSunSlotBytes);
 	std::memset(f, 0, kRtSunSlotBytes);
 	f[0] = static_cast<float>(cs.size());
-	f[1] = 2.0f * std::tan(0.5f * angle * 0.01745329f);
+	// (KYTY_HWRT_SOFTSUN: the sun's real size, x1 / x1.5 / x2 by level, for the PCSS cone and the rays' disc alike)
+	const float sun_deg = SoftSun::Level() > 0 && std::getenv("KYTY_RT_SUN_ANGLE") == nullptr ? SoftSun::AngleDeg() : angle;
+	f[1] = 2.0f * std::tan(0.5f * sun_deg * 0.01745329f);
 	f[2] = static_cast<float>(r);
 	f[3] = 0.0f; // (strength x fade: RtSunSetFade)
 	f[4] = forced_hyp >= 0.0f ? std::floor(forced_hyp) : static_cast<float>(g_rs.hyp);
 	f[5] = forced_bias >= 0.0f ? forced_bias : static_cast<float>(g_rs.bias_m);
 	f[6] = std::floor(debug);
 	f[7] = size;
-	f[8] = std::floor(pcf), f[9] = contact, f[10] = band, f[11] = lift;
+	f[8] = std::floor(pcf), f[9] = contact, f[10] = band, f[11] = held ? 0.0f : lift; // (held copy: darkening only)
 	f[12] = reach;
 	for (size_t i = 0; i < cs.size(); ++i) {
 		float* c = f + 16 + i * 16;
@@ -8762,7 +8783,16 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		g_cs.hw_now = true;
 		++(built ? g_cs.hw_traced : g_cs.hw_stale);
 	}
-	if (sun_mode && !RtSunPrepare(m, vp, sun_slot)) return said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
+	if (sun_mode) {
+		const bool ok   = RtSunPrepare(m, vp, sun_slot);
+		bool       held = false;
+		if (ok) {
+			std::lock_guard lock(g_rs.mutex);
+			held = g_flips_taken.load(std::memory_order_relaxed) > g_rs.copy_flip + 8;
+		}
+		SoftSun::NoteFrame(ok, held);
+		if (!ok) return said_once("KYTY_RT_SUN: no sun cascades copied yet (outdoors, in sunlight)"), false;
+	}
 	CShadowCamera(view, m);
 	if (g_cs.hyp >= 0 && (CShadowLeft() & (1u << g_cs.hyp)) == 0) {
 		static const char* names[] {"+x", "-x", "+y", "-y", "+z", "-z"};
