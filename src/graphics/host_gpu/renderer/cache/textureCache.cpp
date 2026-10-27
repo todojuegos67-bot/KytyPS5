@@ -2635,7 +2635,7 @@ static bool ShadowRefreshFixOn() {
 	}();
 	return on;
 }
-enum : uint8_t { LayerRendered = 1, LayerDirtyByWrite = 2, LayerDirtyByMap = 4, LayerDirtyByUnmap = 8 };
+enum : uint8_t { LayerRendered = 1, LayerDirtyByWrite = 2, LayerDirtyByMap = 4, LayerDirtyByUnmap = 8, LayerUploaded = 16 };
 static bool LayerOwnerCandidate(const Image& image) {
 	const auto& info = image.info;
 	return ShadowRefreshFixOn() && info.IsDepth() && !info.IsVolume() && info.resources.levels == 1 &&
@@ -2703,6 +2703,17 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 		}
 	}
 	// (KYTY_SHADOW_REFRESH_FIX: the rendered layers whose guest bytes did not change since the GPU took them stay.)
+	// (Also a layer the GPU did not render through a depth bind of this image - the 80-layer pool's spot shadows had
+	// 1-33 such layers re-uploaded a flip with "rendered layers kept 0", 20261027-182152 log, flickering lamp shadows:
+	// once uploaded, its guest bytes are hashed, and a later refresh of the same bytes keeps the image's layer. Bytes
+	// that did not change since the last upload can only replace the layer with what it already held or with less.)
+	if (DepthArrayGuarded(image) && LayerOwnerCandidate(image) && !picked.empty()) {
+		auto& slot = m_layer_owners[image.serial];
+		if (slot.state.size() != layers) {
+			slot.state.assign(layers, 0);
+			slot.hash.assign(layers, 0);
+		}
+	}
 	if (!m_layer_owners.empty() && DepthArrayGuarded(image)) {
 		const auto found = m_layer_owners.find(image.serial);
 		if (found != m_layer_owners.end() && found->second.state.size() == layers) {
@@ -2711,7 +2722,18 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 			uint32_t changed = 0;
 			std::erase_if(picked, [&](uint32_t layer) {
 				auto& state = owner.state[layer];
-				if ((state & LayerRendered) == 0) return false;
+				if ((state & LayerRendered) == 0) {
+					const uint64_t begin = base + slice * layer;
+					m_buffer_cache.DrainGuestReadback(begin, slice);
+					const uint64_t now = HashGuestRange(begin, slice);
+					if ((state & LayerUploaded) != 0 && owner.hash[layer] == now) {
+						++kept;
+						return true;
+					}
+					state             = LayerUploaded;
+					owner.hash[layer] = now;
+					return false;
+				}
 				const uint64_t begin = base + slice * layer;
 				const uint64_t end   = begin + slice;
 				m_buffer_cache.DrainGuestReadback(begin, slice);
@@ -2739,7 +2761,8 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 					++kept;
 					return true;
 				}
-				state = 0; // (the guest's until the GPU renders it again)
+				state             = LayerUploaded; // (the guest's until the GPU renders it again)
+				owner.hash[layer] = HashGuestRange(begin, slice);
 				++changed;
 				return false;
 			});
