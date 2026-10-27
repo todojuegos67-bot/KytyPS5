@@ -197,6 +197,7 @@ struct Splash {
 	std::wstring            status = L"Cargando...";
 	std::vector<uint8_t>    bgra;
 	int                     w = 0, h = 0;
+	std::wstring            hint;             // (10-27c) a second line under the status
 	float                   progress = -1.0f; // (10-27c) the start-up precompile's bar (0..1; <0: none)
 	std::atomic<bool>       skip {false};     // (10-27c) Esc during the precompile: play now
 } g_splash;
@@ -236,13 +237,25 @@ LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			RECT shade = text;
 			OffsetRect(&shade, 2, 2);
 			SetTextColor(dc, RGB(0, 0, 0));
-			DrawTextW(dc, status.c_str(), -1, &shade, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+			DrawTextW(dc, status.c_str(), -1, &shade, DT_RIGHT | DT_WORDBREAK);
 			SetTextColor(dc, RGB(222, 196, 140));
-			DrawTextW(dc, status.c_str(), -1, &text, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-			float progress;
+			DrawTextW(dc, status.c_str(), -1, &text, DT_RIGHT | DT_WORDBREAK);
+			float        progress;
+			std::wstring hint;
 			{
 				std::scoped_lock lock(g_splash.mutex);
 				progress = g_splash.progress;
+				hint     = g_splash.hint;
+			}
+			if (!hint.empty()) {
+				HFONT small = CreateFontW(height * 3 / 4, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+				                          CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+				HGDIOBJ prev = SelectObject(dc, small);
+				RECT    line = {rc.left + height, rc.bottom - height, rc.right - height, rc.bottom - height / 6};
+				SetTextColor(dc, RGB(200, 190, 170));
+				DrawTextW(dc, hint.c_str(), -1, &line, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+				SelectObject(dc, prev);
+				DeleteObject(small);
 			}
 			if (progress >= 0.0f) {
 				// (10-27c) The precompile's progress bar above the status line.
@@ -303,6 +316,14 @@ void ShowSplash(const std::string& image) {
 		}
 		g_splash.window = nullptr;
 	}).detach();
+}
+
+void SplashHint(const std::string& text) {
+	{
+		std::scoped_lock lock(g_splash.mutex);
+		g_splash.hint = Wide(text);
+	}
+	if (HWND w = g_splash.window.load(); w != nullptr) InvalidateRect(w, nullptr, FALSE);
 }
 
 void SplashProgress(float f) {
@@ -735,7 +756,8 @@ int main(int argc, char* argv[]) {
 						break;
 					}
 					if (v.total > 0) SplashProgress(static_cast<float>(v.done) / static_cast<float>(v.total));
-					SplashStatus(v.text + "   (Esc: jugar ya, lo hecho se guarda)");
+					SplashStatus(v.text);
+					SplashHint("Esc: jugar ya (lo hecho se guarda, pero el juego tendrá tirones hasta que termine la precompilación)");
 					if (g_splash.skip) {
 						SplashStatus("Guardando lo hecho...");
 						Port::Precompile::Stop();
@@ -744,6 +766,7 @@ int main(int argc, char* argv[]) {
 					Sleep(200);
 				}
 				SplashProgress(-1.0f);
+				SplashHint("");
 				std::printf("[port] precompile: %s\n", Port::Precompile::State().text.c_str());
 			}
 		}

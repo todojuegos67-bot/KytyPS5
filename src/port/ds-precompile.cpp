@@ -157,8 +157,21 @@ std::vector<bool> ShardsDone(const fs::path& log, bool* all) {
 void Work() {
 	const fs::path& root  = g_setup.root;
 	const fs::path& seeds = g_setup.seeds;
-	const int threads     = 3;
-	const int jobs        = std::max(1, (g_setup.cpus + threads - 1) / threads);
+	// (10-27c) Bounded: a 32-thread PC ran 11 processes of 3 threads at once and rebooted (RAM, video memory or the
+	// driver). Now at most 4 processes of 2 threads (one per 8 CPUs), a new one only with 8 GB of RAM and of commit
+	// left, and one starting at a time (each creates its Vulkan device and translates its shaders first).
+	const int threads     = 2;
+	const int jobs        = std::clamp(g_setup.cpus / 8, 1, 4);
+	const auto memory_ok  = [] {
+		MEMORYSTATUSEX m {};
+		m.dwLength = sizeof(m);
+		if (!GlobalMemoryStatusEx(&m)) return true;
+		constexpr DWORDLONG Need = DWORDLONG {8} << 30u;
+		return m.ullAvailPhys >= Need && m.ullAvailPageFile >= Need;
+	};
+	auto      last_start = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+	const auto begin     = std::chrono::steady_clock::now();
+	int        done_here = 0;
 	wchar_t   temp[MAX_PATH + 1] = {};
 	GetTempPathW(MAX_PATH, temp);
 	const auto stamp = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
@@ -215,7 +228,15 @@ void Work() {
 			(void)merge("merge-stopped");
 			return fail("");
 		}
+		bool waiting_memory = false;
 		while (!pending.empty() && static_cast<int>(running.size()) < jobs) {
+			if (!memory_ok()) {
+				waiting_memory = true;
+				break;
+			}
+			// (One starting at a time: 4 s apart.)
+			if (!running.empty() && std::chrono::steady_clock::now() - last_start < std::chrono::seconds(4)) break;
+			last_start = std::chrono::steady_clock::now();
 			const int i = pending.front();
 			pending.pop_front();
 			const std::string name = "warm" + std::to_string(i) + "of" + std::to_string(kShards);
@@ -231,8 +252,17 @@ void Work() {
 		{
 			std::scoped_lock lock(g_mutex);
 			g_view.done = done;
-			g_view.text = "Compilando todos los pipelines del juego en la cache de esta grafica " + std::to_string(done) + "/" +
-			              std::to_string(kShards);
+			const int pct = done * 100 / kShards;
+			std::string eta = "calculando el tiempo restante";
+			if (done_here > 0) {
+				const auto spent = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - begin).count();
+				const long long left = spent * (kShards - done) / done_here;
+				eta = "quedan unos " + (left >= 3600 ? std::to_string(left / 3600) + " h " + std::to_string(left % 3600 / 60) + " min"
+				                                      : std::to_string(std::max<long long>(1, left / 60)) + " min");
+			}
+			g_view.text = "Ten paciencia: se están precompilando los shaders del juego (solo la primera vez).\n" + std::to_string(pct) +
+			              " %  (" + std::to_string(done) + " / " + std::to_string(kShards) + " partes, " + eta + ")" +
+			              (waiting_memory ? "  [esperando memoria libre]" : "");
 		}
 		Sleep(250);
 		for (size_t k = 0; k < running.size();) {
@@ -248,6 +278,7 @@ void Work() {
 				return fail("Fallo un trozo de la preparacion de shaders (" + r.name + "). Mira logs\\*-precompile.");
 			}
 			done++;
+			done_here++;
 		}
 		// Merged as it goes (every 16 shards): a crash or a closed window keeps what was made.
 		if (done - merged_at >= 16) {

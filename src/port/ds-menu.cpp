@@ -64,7 +64,7 @@ std::mutex               g_mutex;
 std::deque<Input>        g_inputs;
 int                      g_passthrough = 0; // window thread: zeroed axes sent to the game as the menu opened
 int                      g_cursor_before = -1;
-constexpr int            kTabCount = 9;
+constexpr int            kTabCount = 5; // (10-27c) Gráficos, Pantalla, Sonido, Controles, Sistema
 int                      g_tab = 0, g_tab_request = -1;
 int                      g_fg_live = 0;
 std::string              g_status;
@@ -298,37 +298,80 @@ const ImVec4 kGold {0.87f, 0.77f, 0.55f, 1.0f};
 const ImVec4 kWarn {1.0f, 0.78f, 0.30f, 1.0f};
 const ImVec4 kDim {0.72f, 0.70f, 0.66f, 1.0f};
 
-// A row: its label (with "*" when a change needs a restart) and a combo of `choices`.
+// (10-27c) A video game's options row: the label on the left, "<  value  >" on the right; Left/Right (arrows, D-pad,
+// left stick) or a click change the value, A / Enter the next one. The focused (or hovered) row's text goes to the
+// description panel on the right.
+std::string g_desc_title, g_desc_text;
+float       g_unit = 1.0f;
+
+void Describe(const char* label, const char* tip) {
+	if (ImGui::IsItemFocused() || ImGui::IsItemHovered()) {
+		g_desc_title = I18n::T(label);
+		g_desc_text  = tip != nullptr ? tip : "";
+	}
+}
+
+// The row itself: `current` changed by `step` (-1 / +1) within count; true when it changed.
+bool SelectorRow(const char* label, bool restart, int count, int& current, const char* value, const char* tip) {
+	ImGui::PushID(label);
+	const bool  disabled = (ImGui::GetCurrentContext()->CurrentItemFlags & ImGuiItemFlags_Disabled) != 0;
+	const float h        = 50.0f * g_unit;
+	const ImVec2 at      = ImGui::GetCursorScreenPos();
+	const float  w       = ImGui::GetContentRegionAvail().x;
+	const bool   clicked = ImGui::Selectable("##row", false, ImGuiSelectableFlags_None, {w, h});
+	const bool   focused = !disabled && (ImGui::IsItemFocused() || ImGui::IsItemHovered());
+	Describe(label, tip);
+	int step = 0;
+	if (!disabled && ImGui::IsItemFocused()) {
+		if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft) ||
+		    ImGui::IsKeyPressed(ImGuiKey_GamepadLStickLeft))
+			step = -1;
+		if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight) ||
+		    ImGui::IsKeyPressed(ImGuiKey_GamepadLStickRight))
+			step = +1;
+	}
+	if (clicked && !disabled) {
+		// (A click on the left arrow's half goes back.)
+		const float x = ImGui::GetIO().MousePos.x;
+		step          = ImGui::IsMouseReleased(0) && x < at.x + w * 0.72f && x > at.x + w * 0.45f ? -1 : +1;
+	}
+	auto*       dl    = ImGui::GetWindowDrawList();
+	const ImU32 ink   = ImGui::GetColorU32(disabled ? ImVec4 {0.5f, 0.48f, 0.45f, 1.0f} : ImVec4 {0.93f, 0.91f, 0.88f, 1.0f});
+	const ImU32 gold  = ImGui::GetColorU32(disabled ? ImVec4 {0.5f, 0.45f, 0.35f, 1.0f} : kGold);
+	const float pad   = 16.0f * g_unit;
+	const float ty    = at.y + (h - ImGui::GetFontSize()) * 0.5f;
+	if (focused) dl->AddRectFilled({at.x, at.y + h - 3 * g_unit}, {at.x + w, at.y + h}, gold);
+	std::string text = I18n::T(label);
+	if (restart) text += " *";
+	dl->AddText({at.x + pad, ty}, ink, text.c_str());
+	const char*  shown = I18n::T(value);
+	const ImVec2 vs    = ImGui::CalcTextSize(shown);
+	const float  right = at.x + w - pad;
+	const float  mid   = right - std::max(vs.x, 220.0f * g_unit) * 0.5f - 30.0f * g_unit;
+	dl->AddText({mid - vs.x * 0.5f, ty}, gold, shown);
+	if (count > 1) {
+		const float half = std::max(vs.x, 220.0f * g_unit) * 0.5f + 18.0f * g_unit;
+		const float cy   = at.y + h * 0.5f, s2 = 7.0f * g_unit;
+		const ImU32 arrow = focused ? gold : ink;
+		dl->AddTriangleFilled({mid - half, cy}, {mid - half + s2, cy - s2}, {mid - half + s2, cy + s2}, arrow);
+		dl->AddTriangleFilled({mid + half, cy}, {mid + half - s2, cy - s2}, {mid + half - s2, cy + s2}, arrow);
+	}
+	ImGui::PopID();
+	if (step == 0 || count <= 1) return false;
+	current = (current + step + count) % count;
+	return true;
+}
+
 template <typename Item, typename Id, typename Label>
 bool ComboRow(const char* label, bool restart, int count, const Item* items, std::string& value, Id id, Label text,
               const char* tip = nullptr) {
 	int current = 0;
 	for (int i = 0; i < count; i++)
 		if (value == id(items[i])) current = i;
-	ImGui::AlignTextToFramePadding();
-	ImGui::TextUnformatted(I18n::T(label));
-	if (restart) {
-		ImGui::SameLine(0, 4);
-		ImGui::TextColored(kWarn, "*");
-	}
-	if (tip != nullptr && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
-	ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.42f + ImGui::GetCursorStartPos().x);
-	ImGui::SetNextItemWidth(-1);
-	bool changed = false;
-	ImGui::PushID(label);
-	if (ImGui::BeginCombo("##c", I18n::T(text(items[current])))) {
-		for (int i = 0; i < count; i++) {
-			const bool selected = i == current;
-			if (ImGui::Selectable(I18n::T(text(items[i])), selected)) {
-				value   = id(items[i]);
-				changed = true;
-			}
-			if (selected) ImGui::SetItemDefaultFocus();
-		}
-		ImGui::EndCombo();
-	}
-	ImGui::PopID();
-	return changed;
+	if (count == 0) return false;
+	if (!SelectorRow(label, restart, count, current, text(items[current]), tip)) return false;
+	value = id(items[current]);
+	return true;
 }
 
 bool ChoiceRow(const char* label, bool restart, const Choice* items, int count, std::string& value, const char* tip = nullptr) {
@@ -336,17 +379,35 @@ bool ChoiceRow(const char* label, bool restart, const Choice* items, int count, 
 }
 
 bool CheckRow(const char* label, bool restart, bool& value, const char* tip = nullptr) {
-	ImGui::PushID(label);
-	const bool changed = ImGui::Checkbox("##k", &value);
-	ImGui::PopID();
+	int current = value ? 1 : 0;
+	if (!SelectorRow(label, restart, 2, current, current ? "Sí" : "No", tip)) return false;
+	value = current == 1;
+	return true;
+}
+
+// A slider row in the same look (the label left, the slider right).
+bool SliderRow(const char* label, float& v, float lo, float hi, const char* format, const char* tip = nullptr) {
+	ImGui::AlignTextToFramePadding();
+	ImGui::Dummy({16.0f * g_unit, 0});
 	ImGui::SameLine();
 	ImGui::TextUnformatted(I18n::T(label));
-	if (restart) {
-		ImGui::SameLine(0, 4);
-		ImGui::TextColored(kWarn, "*");
-	}
-	if (tip != nullptr && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+	ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.45f + ImGui::GetCursorStartPos().x);
+	ImGui::SetNextItemWidth(-16.0f * g_unit);
+	ImGui::PushID(label);
+	const bool changed = ImGui::SliderFloat("##s", &v, lo, hi, format);
+	ImGui::PopID();
+	Describe(label, tip);
 	return changed;
+}
+
+void Section(const char* title) {
+	ImGui::Spacing();
+	ImGui::PushFont(nullptr, 30.0f * g_unit);
+	ImGui::TextColored(kGold, "%s", title);
+	ImGui::PopFont();
+	const ImVec2 p = ImGui::GetCursorScreenPos();
+	ImGui::GetWindowDrawList()->AddLine(p, {p.x + ImGui::GetContentRegionAvail().x, p.y}, ImGui::GetColorU32(ImVec4 {0.87f, 0.77f, 0.55f, 0.35f}));
+	ImGui::Spacing();
 }
 
 int FixedDlssGenerated(const std::string& fg) {
@@ -595,11 +656,11 @@ void DrawPcTab(float unit) {
 		static std::string steam_text;
 		static std::atomic<bool> steam_busy {false};
 		ImGui::BeginDisabled(steam_busy.load());
-		if (ImGui::Button("Anadir a Steam", {bw, bh})) {
+		if (ImGui::Button("Añadir a Steam", {bw, bh})) {
 			steam_busy = true;
 			{
 				std::scoped_lock lock(steam_mutex);
-				steam_text = "Anadiendo a Steam...";
+				steam_text = "Añadiendo a Steam...";
 			}
 			std::thread([] {
 				std::string report;
@@ -614,7 +675,7 @@ void DrawPcTab(float unit) {
 			ImGui::SetTooltip("Anade \"Demon's Souls\" a la biblioteca de Steam como juego externo (con icono e imagenes). Mejor con Steam cerrado; si esta abierto, reinicialo para que aparezca.");
 		std::scoped_lock lock(steam_mutex);
 		if (!steam_text.empty()) ImGui::TextWrapped("%s", steam_text.c_str());
-		else ImGui::TextColored(kDim, "%s", "Steam debe cerrarse antes o reiniciarse despues para ver el acceso.");
+		else ImGui::TextColored(kDim, "%s", "Steam debe cerrarse antes o reiniciarse después para que aparezca el acceso.");
 	}
 	if (!text.empty()) ImGui::TextWrapped("%s", text.c_str());
 	if (state == UpdateUi::Working && g_upd.total.load() > 0 && text.rfind("Descargando", 0) == 0) {
@@ -675,12 +736,12 @@ void Draw(float width, float height) {
 	ImGuiContext& ctx = *ImGui::GetCurrentContext();
 	const int colors_before = ctx.ColorStack.Size, vars_before = ctx.StyleVarStack.Size;
 	ImFont* font = FindFont("segoeui");
-	ImGui::PushFont(font, 24.0f * unit);
+	ImGui::PushFont(font, 28.0f * unit);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {32 * unit, 24 * unit});
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12 * unit, 12 * unit});
 	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {12 * unit, 6 * unit});
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6 * unit);
-	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.035f, 0.05f, 0.86f});
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.02f, 0.02f, 0.025f, 0.80f});
 	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.87f, 0.77f, 0.55f, 0.45f});
 	ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4 {0.12f, 0.11f, 0.10f, 1.0f});
 	ImGui::PushStyleColor(ImGuiCol_TabSelected, ImVec4 {0.55f, 0.43f, 0.22f, 1.0f});
@@ -692,7 +753,7 @@ void Draw(float width, float height) {
 	ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4 {0.55f, 0.43f, 0.22f, 0.8f});
 	ImGui::PushStyleColor(ImGuiCol_NavCursor, kGold);
 	const ImVec2 size = g_start_mode ? ImVec2 {std::min(1500 * unit, width - 32), height - 48 * unit}
-	                                 : ImVec2 {std::min(1100 * unit, width - 32), std::min(820 * unit, height - 32)};
+	                                 : ImVec2 {std::min(1500 * unit, width - 32), std::min(940 * unit, height - 32)};
 	ImGui::SetNextWindowPos({width * 0.5f, height * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
 	ImGui::SetNextWindowSize(size, ImGuiCond_Always);
 	if (g_focus_once) {
@@ -701,7 +762,7 @@ void Draw(float width, float height) {
 	}
 	ImGui::Begin("##PortMenu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 	ImGui::PushFont(font, 40.0f * unit);
-	ImGui::TextColored(kGold, "%s", g_start_mode ? "DEMON'S SOULS" : I18n::T("OPCIONES"));
+	ImGui::TextColored(kGold, "%s", g_start_mode ? "DEMON'S SOULS" : "AJUSTES");
 	ImGui::PopFont();
 	ImGui::SameLine();
 	ImGui::SetCursorPosX(size.x - ImGui::CalcTextSize(g_rt.game_info.c_str()).x - 32 * unit);
@@ -711,8 +772,13 @@ void Draw(float width, float height) {
 	Settings&  s       = g_edit;
 	bool live_changed = false;
 	// (10-27) The tabs are Launcher-souls.ps1's groups, in its order, with its labels and tooltips.
-	const char* tabs[kTabCount] = {"Imagen", "Frame generation", "Calidad grafica", "Ray tracing", "Modos Souls",
-	                               "Pantalla y otros", "Rendimiento / PC", "Controles", "Tu equipo"};
+	// (10-27c) A game's settings menu: five tabs (LB/RB or Q/E), each the launcher's groups as sections; the rows on the
+	// left, the focused row's description on the right.
+	const char* tabs[kTabCount] = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema"};
+	static const std::vector<int> groups[kTabCount] = {{4, 0, 1, 2, 3}, {5}, {}, {7}, {6, 8}};
+	static const char* section_names[9] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
+	                                       "Pantalla", "Rendimiento", "Controles", "Tu equipo"};
+	g_unit = unit;
 	const float footer  = (g_start_mode ? 250 : 150) * unit;
 	const bool  nvidia  = g_rt.pc.nvidia;
 	if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
@@ -720,9 +786,19 @@ void Draw(float width, float height) {
 			const ImGuiTabItemFlags flags = g_tab_request == t ? ImGuiTabItemFlags_SetSelected : 0;
 			if (!ImGui::BeginTabItem((std::string(I18n::T(tabs[t])) + "###tab" + std::to_string(t)).c_str(), nullptr, flags)) continue;
 			g_tab = t;
-			ImGui::BeginChild("##page", {0, size.y - footer - ImGui::GetCursorPosY()}, ImGuiChildFlags_None);
+			const float page_h = size.y - footer - ImGui::GetCursorPosY();
+			const float list_w = ImGui::GetContentRegionAvail().x * 0.62f;
+			ImGui::BeginChild("##page", {list_w, page_h}, ImGuiChildFlags_None);
 			const bool fixed = FixedFg(s);
-			switch (t) {
+			g_desc_title.clear();
+			g_desc_text.clear();
+			if (groups[t].empty()) {
+				Section("Sonido");
+				ImGui::TextWrapped("%s", "El sonido se ajusta en el menú del propio juego (Opciones > Sonido). El port no añade opciones de sonido.");
+			}
+			for (const int section: groups[t]) {
+			if (groups[t].size() > 1) Section(section_names[section]);
+			switch (section) {
 				case 0: { // Imagen
 					static std::vector<ResMode> shown;
 					shown.clear();
@@ -911,33 +987,35 @@ void Draw(float width, float height) {
 				case 7: { // Controles
 					CheckRow("Teclado y raton", true, s.kbm, "Jugar con teclado y raton: WASD para moverse, el raton mueve la camara, clic izquierdo R1, clic derecho L1, rueda o clic central fija objetivo. Las teclas: mapa_teclado en settings.ini. F7: solo el raton en vivo");
 					ImGui::BeginDisabled(!s.kbm);
-					ImGui::AlignTextToFramePadding();
-					ImGui::TextUnformatted("Sensibilidad");
-					if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cuanto gira la camara por cada movimiento del raton (1.00 = normal).");
-					ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.42f + ImGui::GetCursorStartPos().x);
-					ImGui::SetNextItemWidth(-1);
-					ImGui::SliderFloat("##sens", &s.kbm_sens, 0.1f, 5.0f, "%.2f");
-					ImGui::AlignTextToFramePadding();
-					ImGui::TextUnformatted(I18n::T("Antizona muerta"));
-					if (ImGui::IsItemHovered()) ImGui::SetTooltip("Salta la zona muerta del stick del juego: con mas, un movimiento pequeno del raton ya gira la camara. Si la camara se mueve sola, bajalo.");
-					ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.42f + ImGui::GetCursorStartPos().x);
-					ImGui::SetNextItemWidth(-1);
-					ImGui::SliderFloat("##adz", &s.kbm_antidz, 0.0f, 0.6f, "%.2f");
+					SliderRow("Sensibilidad", s.kbm_sens, 0.1f, 5.0f, "%.2f", "Cuánto gira la cámara por cada movimiento del ratón (1.00 = normal).");
+					SliderRow("Antizona muerta", s.kbm_antidz, 0.0f, 0.6f, "%.2f",
+					          "Salta la zona muerta del stick del juego: con más, un movimiento pequeño del ratón ya gira la cámara. Si la cámara se mueve sola, bájalo.");
 					ImGui::EndDisabled();
 					if (CheckRow("Vibracion", false, s.rumble)) live_changed = true;
-					ImGui::AlignTextToFramePadding();
-					ImGui::TextUnformatted(I18n::T("Fuerza de la vibracion"));
-					ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.42f + ImGui::GetCursorStartPos().x);
-					ImGui::SetNextItemWidth(-1);
-					if (ImGui::SliderFloat("##gain", &s.rumble_gain, 1.0f, 8.0f, "%.1f")) live_changed = true;
+					if (SliderRow("Fuerza de la vibracion", s.rumble_gain, 1.0f, 8.0f, "%.1f", "Fuerza de la vibración del mando (en vivo).")) live_changed = true;
 					if (!s.pad_map.empty()) ImGui::TextColored(kDim, "Mando remapeado (mapa_mando en settings.ini).");
 					ImGui::TextColored(kDim, "F8: metricas.  F11 / Alt+Enter: pantalla completa.");
 					break;
 				}
-				case 8: DrawPcTab(unit); break; // Tu equipo
+				case 8: DrawPcTab(unit); break; // Tu equipo (Añadir a Steam)
 				default: break;
 			}
+			}
 			ImGui::EndChild();
+			// The description panel.
+			ImGui::SameLine();
+			ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.06f, 0.055f, 0.05f, 0.75f});
+			ImGui::BeginChild("##desc", {0, page_h}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+			ImGui::PushFont(nullptr, 30.0f * unit);
+			ImGui::TextColored(kGold, "%s", g_desc_title.empty() ? tabs[t] : g_desc_title.c_str());
+			ImGui::PopFont();
+			ImGui::Separator();
+			ImGui::PushTextWrapPos(0.0f);
+			ImGui::TextUnformatted(g_desc_text.empty() ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: siguiente valor.\nLB / RB o Q / E: cambiar de pestaña.\nB / Esc: volver al juego.\n\n* = necesita reiniciar el juego."
+			                                           : g_desc_text.c_str());
+			ImGui::PopTextWrapPos();
+			ImGui::EndChild();
+			ImGui::PopStyleColor();
 			ImGui::EndTabItem();
 		}
 		ImGui::EndTabBar();
@@ -996,12 +1074,12 @@ void Draw(float width, float height) {
 		ImGui::SameLine();
 		ImGui::BeginDisabled(g_upd.busy.load());
 		if (ImGui::Button(I18n::T("Actualizar version"), {bw, bh})) {
-			g_tab_request = 8;
+			g_tab_request = 4;
 			OpenCheck();
 		}
 		ImGui::SameLine();
 		if (ImGui::Button(I18n::T("Volver a la version anterior"), {bw, bh})) {
-			g_tab_request = 8;
+			g_tab_request = 4;
 			OpenRestore();
 		}
 		ImGui::EndDisabled();
@@ -1010,9 +1088,25 @@ void Draw(float width, float height) {
 	} else {
 	const bool needs = NeedsRestart(g_rt.launched, s);
 	if (needs) ImGui::TextColored(kWarn, "* Hay cambios que necesitan reiniciar el juego (guarda antes en una hoguera / al salir).");
-	else ImGui::TextColored(kDim, "%s", g_status.empty() ? "* = necesita reiniciar.   Circulo / Esc: volver al juego." : g_status.c_str());
+	else ImGui::TextColored(kDim, "%s", g_status.empty() ? "* = necesita reiniciar.   B / Círculo / Esc: volver al juego (sin aplicar).   LB / RB, Q / E: pestañas." : g_status.c_str());
 	const float bw = 220 * unit, bh = 52 * unit;
-	if (ImGui::Button(I18n::T("Guardar y volver"), {bw, bh})) {
+	if (ImGui::Button("Aplicar", {bw, bh})) {
+		Save();
+		ApplyLive(s);
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Restablecer", {bw, bh})) {
+		// (The defaults, but the game folder and the languages stay.)
+		Settings d;
+		d.game              = s.game;
+		d.menu_language     = s.menu_language;
+		d.language          = s.language;
+		d.game_language_set = s.game_language_set;
+		s                   = d;
+		g_status            = "Valores por defecto (pulsa Aplicar para guardarlos).";
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Volver", {bw, bh})) {
 		Save();
 		ApplyLive(s);
 		SetOpen(false);
@@ -1024,12 +1118,6 @@ void Draw(float width, float height) {
 		RequestRestart();
 	}
 	ImGui::EndDisabled();
-	ImGui::SameLine();
-	if (ImGui::Button(I18n::T("Descartar"), {bw, bh})) {
-		g_edit = g_saved;
-		ApplyLive(g_saved);
-		SetOpen(false);
-	}
 	ImGui::SameLine();
 	if (ImGui::Button(I18n::T("Salir del juego"), {bw, bh})) RequestQuit();
 	}
