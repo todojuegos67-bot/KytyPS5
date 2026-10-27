@@ -698,17 +698,52 @@ struct PipelineCache::ProgramCache {
 		// past 8 permutations).
 		std::deque<Permutation>                     permutations;
 		std::vector<MemoSlot>                        memo;
+		// KYTY_MEMO_USED_KEY: which user-data words the resource plan reads (GetUserData), from
+		// a scan of the plan's own instructions; empty until computed, all-true when unsure.
+		std::vector<uint8_t>                         used_user_data;
+		bool                                         used_computed = false;
 	};
+
+	// The plan owns every instruction it evaluates (value_storage), and user data reaches the
+	// walk, its native code and the clean walk only through GetUserData. Words no GetUserData
+	// names cannot change the snapshot or the specialization, except snapshot.user_data (a plain
+	// copy, restored on a hit). An operand that is not a constant scalar register marks all used.
+	static void ComputeUsedUserData(SourceEntry& entry) {
+		const auto& plan = entry.resource_plan;
+		entry.used_user_data.assign(plan.user_data_count, 0);
+		bool all = false;
+		for (const auto& inst: plan.value_storage) {
+			if (inst.GetOpcode() != ShaderRecompiler::IR::ValueOpcode::GetUserData) {
+				continue;
+			}
+			if (inst.NumArgs() != 1 || inst.Arg(0).GetType() != ShaderRecompiler::IR::Type::ScalarReg) {
+				all = true;
+				break;
+			}
+			const auto reg = ShaderRecompiler::IR::RegIndex(inst.Arg(0).ScalarRegister());
+			if (reg < plan.user_data_base || reg - plan.user_data_base >= entry.used_user_data.size()) {
+				continue; // the walker fails on it whatever the data (see SrtWalker)
+			}
+			entry.used_user_data[reg - plan.user_data_base] = 1;
+		}
+		if (all) {
+			entry.used_user_data.assign(plan.user_data_count, 1);
+		}
+		entry.used_computed = true;
+	}
+	std::vector<uint32_t> memo_key_words;
+	uint64_t              memo_masked_words = 0, memo_total_words = 0;
 
 	// KYTY_RESOURCE_MEMO_SLOTS (live, default 32; was a fixed 8): input sets kept per program.
 	// Owner log 20261027-172055: 21-25% hits with 8; one program drawn for many objects a frame
 	// cycles through more input sets than that, evicting each before its next frame.
 	static size_t MemoSlots() {
-		static auto& slots = Common::LiveSwitches::Get("KYTY_RESOURCE_MEMO_SLOTS", 32);
+		static auto& slots = Common::LiveSwitches::Get("KYTY_RESOURCE_MEMO_SLOTS", 128);
 		return static_cast<size_t>(std::clamp<int64_t>(slots.load(std::memory_order_relaxed), 1, 256));
 	}
-	static uint64_t MemoInputHash(const ShaderRecompiler::IR::SrtRuntime& runtime) {
-		uint64_t h = XXH3_64bits(runtime.user_data.data(), runtime.user_data.size_bytes());
+	static uint64_t MemoInputHash(const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                              std::span<const uint32_t>               key_words) {
+		uint64_t h = XXH3_64bits(key_words.data(), key_words.size_bytes());
 		h ^= runtime.shader_base * 0x9e3779b97f4a7c15ull;
 		h ^= XXH3_64bits(runtime.workgroup_count.data(), sizeof(runtime.workgroup_count)) * 31u;
 		h ^= XXH3_64bits(runtime.workgroup_size.data(), sizeof(runtime.workgroup_size)) * 131u;
@@ -727,7 +762,25 @@ struct PipelineCache::ProgramCache {
 			    entry.resource_plan, runtime, entry.resources, entry.specialization);
 		}
 		memo_clock++;
-		const uint64_t input_hash = MemoInputHash(runtime);
+		// KYTY_MEMO_USED_KEY (live, default 1): the key holds only the user-data words the plan
+		// reads; the others (per-object constants and addresses the walk never follows) are
+		// zeroed, so objects drawn with the same descriptor tables share a slot.
+		static auto& used_key = Common::LiveSwitches::Get("KYTY_MEMO_USED_KEY", 1);
+		memo_key_words.assign(runtime.user_data.begin(), runtime.user_data.end());
+		if (used_key.load(std::memory_order_relaxed) != 0) {
+			if (!entry.used_computed) {
+				ComputeUsedUserData(entry);
+			}
+			for (size_t i = 0; i < memo_key_words.size(); i++) {
+				if (i >= entry.used_user_data.size() || entry.used_user_data[i] == 0) {
+					memo_key_words[i] = 0;
+					memo_masked_words++;
+				}
+			}
+		}
+		memo_total_words += memo_key_words.size();
+		const std::span<const uint32_t> key_words {memo_key_words};
+		const uint64_t input_hash = MemoInputHash(runtime, key_words);
 		bool           inputs_seen = false;
 		for (auto& slot: entry.memo) {
 			if (slot.input_hash != input_hash) {
@@ -736,13 +789,15 @@ struct PipelineCache::ProgramCache {
 			if (slot.shader_base == runtime.shader_base &&
 			    slot.workgroup_count == runtime.workgroup_count &&
 			    slot.workgroup_size == runtime.workgroup_size &&
-			    std::ranges::equal(slot.user_data, runtime.user_data)) {
+			    std::ranges::equal(slot.user_data, key_words)) {
 				inputs_seen = true;
 				if (!ReadsUnchanged(slot.log, reads)) {
 					continue;
 				}
 				entry.resources      = slot.resources;
 				entry.specialization = slot.specialization;
+				// The only verbatim copy of the inputs in the snapshot (shader data words).
+				entry.resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 				slot.last_use = memo_clock;
 				memo_hits++;
 				ReportMemo();
@@ -761,7 +816,7 @@ struct PipelineCache::ProgramCache {
 			// Same inputs whose reads changed: refresh that slot instead of taking another.
 			for (auto& candidate: entry.memo) {
 				if (candidate.input_hash == input_hash && candidate.shader_base == runtime.shader_base &&
-				    std::ranges::equal(candidate.user_data, runtime.user_data)) {
+				    std::ranges::equal(candidate.user_data, key_words)) {
 					slot = &candidate;
 					break;
 				}
@@ -774,7 +829,7 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 			slot->input_hash = input_hash;
-			slot->user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+			slot->user_data.assign(key_words.begin(), key_words.end());
 			slot->shader_base    = runtime.shader_base;
 			slot->workgroup_count = runtime.workgroup_count;
 			slot->workgroup_size  = runtime.workgroup_size;
@@ -810,7 +865,11 @@ struct PipelineCache::ProgramCache {
 		         " hits, %" PRIu64 " misses\n",
 		         memo_hits, memo_misses, total != 0 ? 100.0 * memo_hits / total : 0.0, memo_miss_inputs,
 		         memo_miss_reads, MemoSlots(), lookup_hits, lookup_misses);
+		::printf("Resource memo key (5 s): KYTY_MEMO_USED_KEY=%lld, %.1f%% of user-data words left out of the key\n",
+		         static_cast<long long>(Common::LiveSwitches::Get("KYTY_MEMO_USED_KEY", 1).load()),
+		         memo_total_words != 0 ? 100.0 * static_cast<double>(memo_masked_words) / memo_total_words : 0.0);
 		memo_miss_inputs = memo_miss_reads = 0;
+		memo_masked_words = memo_total_words = 0;
 		lookup_hits = lookup_misses = 0;
 		std::fflush(stdout);
 		memo_hits   = 0;

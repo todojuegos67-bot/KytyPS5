@@ -333,6 +333,45 @@ uint64_t ReadbackWindowSize() {
 	return bytes;
 }
 
+// KYTY_REPEAT_READ_WINDOW_KB (live, default 0 = off, wolverine-rbwin-1027): a guest read of a page
+// that already faulted in the last 250 ms downloads only this window (a power of two, at least the
+// tracker page) instead of KYTY_READBACK_WINDOW_KB. Owner log 20261027-180242 (KYTY_READBACK_STATS):
+// three buffers re-read the same 2-23 pages every frame and each fault downloaded 1-2 MiB
+// (0x1193020000: 267 faults, 459 MB; 0x1187184000: 90, 96 MB; 0x118c3f0000: 47, 93 MB) while
+// downloads changed ~2% of the bytes; a re-faulting page gains nothing from the wide window, since
+// the GPU rewrites it before the next frame. The window is only a transfer size: correctness is
+// the same at any width (pages outside it stay GPU-owned and fault on their own).
+uint64_t RepeatReadWindowSize(uint64_t page, bool is_write) {
+	static auto& kib = Common::LiveSwitches::Get("KYTY_REPEAT_READ_WINDOW_KB", 0);
+	static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> s_last; // GPU thread
+	const auto value = kib.load(std::memory_order_relaxed);
+	const auto bytes = static_cast<uint64_t>(value) * 1024;
+	if (is_write || value <= 0 || bytes < TRACKER_PAGE_SIZE || (bytes & (bytes - 1)) != 0) {
+		if (!s_last.empty()) {
+			s_last.clear();
+		}
+		return 0;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (s_last.size() > 65536) {
+		std::erase_if(s_last, [&](const auto& e) { return now - e.second > std::chrono::milliseconds(250); });
+	}
+	auto [it, inserted] = s_last.try_emplace(page, now);
+	const bool repeat   = !inserted && now - it->second <= std::chrono::milliseconds(250);
+	it->second          = now;
+	static uint64_t s_narrowed = 0, s_wide = 0;
+	static auto     s_report   = now;
+	(repeat ? s_narrowed : s_wide)++;
+	if (now - s_report >= std::chrono::seconds(5)) {
+		::printf("Repeat-read window (5 s): KYTY_REPEAT_READ_WINDOW_KB=%lld, %llu read faults narrowed, %llu wide\n",
+		         static_cast<long long>(value), static_cast<unsigned long long>(s_narrowed),
+		         static_cast<unsigned long long>(s_wide));
+		s_narrowed = s_wide = 0;
+		s_report = now;
+	}
+	return repeat ? bytes : 0;
+}
+
 } // namespace
 
 void BufferCache::SetReadbackStatsShader(uint64_t hash) {
@@ -876,7 +915,8 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	}
 
 	// Widen nearby CPU reads so they share one GPU drain.
-	const uint64_t WindowSize   = ReadbackWindowSize();
+	const uint64_t repeat_window = RepeatReadWindowSize(page_begin, is_write);
+	const uint64_t WindowSize    = repeat_window != 0 ? repeat_window : ReadbackWindowSize();
 	const auto     buffer_begin = buffer.CpuAddress();
 	const auto     buffer_end   = buffer_begin + buffer.Size();
 	const auto     window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
@@ -1325,7 +1365,8 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 		return 0;
 	}
 
-	const uint64_t WindowSize   = ReadbackWindowSize();
+	const uint64_t repeat_window = RepeatReadWindowSize(page_begin, is_write);
+	const uint64_t WindowSize   = repeat_window != 0 ? repeat_window : ReadbackWindowSize();
 	const auto     buffer_begin = buffer.CpuAddress();
 	const auto     buffer_end   = buffer_begin + buffer.Size();
 	window_begin                = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
