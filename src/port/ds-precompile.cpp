@@ -67,6 +67,10 @@ Child Launch(const std::string& name, const std::wstring& args, bool claims) {
 	fs::create_directories(c.nvidia_cache, ec);
 	SetEnvironmentVariableW(L"__GL_SHADER_DISK_CACHE_PATH", c.nvidia_cache.c_str());
 	SetEnvironmentVariableW(L"KYTY_PRECOMPILE_CLAIMS", claims ? (g_nvidia / L"claims").c_str() : nullptr);
+	// (10-27c) Launched from Steam: its Vulkan layers (Fossilize recording every pipeline into steamapps\shadercache,
+	// the overlay) stay out of the precompile's processes; their caches are the port's own, in _PipelineCache.
+	SetEnvironmentVariableW(L"DISABLE_VK_LAYER_VALVE_steam_fossilize_1", L"1");
+	SetEnvironmentVariableW(L"DISABLE_VK_LAYER_VALVE_steam_overlay_1", L"1");
 	std::wstring        command = Quote(g_setup.root / L"kyty_shader_precompile.exe") + L" --game \"" + Wide(g_setup.game) + L"\" " + args;
 	SECURITY_ATTRIBUTES sa {sizeof(sa), nullptr, TRUE};
 	HANDLE              out = CreateFileW(c.log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, 0, nullptr);
@@ -82,6 +86,16 @@ Child Launch(const std::string& name, const std::wstring& args, bool claims) {
 	SetEnvironmentVariableW(L"KYTY_PRECOMPILE_CLAIMS", nullptr);
 	if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
 	if (!ok) return c;
+	// (10-27c) In a job that ends with the port: a closed or killed game leaves no precompile running on (the next
+	// launch merges the shard files it finished and goes on from there).
+	static HANDLE job = [] {
+		HANDLE h = CreateJobObjectW(nullptr, nullptr);
+		JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits {};
+		limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+		if (h != nullptr) SetInformationJobObject(h, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
+		return h;
+	}();
+	if (job != nullptr) AssignProcessToJobObject(job, pi.hProcess);
 	if (g_setup.affinity != 0) SetProcessAffinityMask(pi.hProcess, static_cast<DWORD_PTR>(g_setup.affinity));
 	// (Windows 11: no power throttling for a windowless process, as precompile-windows.ps1's Qos.High.)
 	PROCESS_POWER_THROTTLING_STATE state {PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED, 0};
@@ -201,6 +215,7 @@ void Work() {
 	for (int i = 0; i < kShards; i++)
 		if (!done_shards[i]) pending.push_back(i);
 	int done = kShards - static_cast<int>(pending.size()), merged_at = done;
+	const int resumed_pct = done * 100 / kShards;
 	{
 		std::scoped_lock lock(g_mutex);
 		g_view.total = kShards;
@@ -262,6 +277,8 @@ void Work() {
 			}
 			g_view.text = "Ten paciencia: se están precompilando los shaders del juego (solo la primera vez).\n" + std::to_string(pct) +
 			              " %  (" + std::to_string(done) + " / " + std::to_string(kShards) + " partes, " + eta + ")" +
+			              (resumed_pct > 0 ? "  (retomada desde el " + std::to_string(resumed_pct) + " %)"
+			                   : std::string()) +
 			              (waiting_memory ? "  [esperando memoria libre]" : "");
 		}
 		Sleep(250);

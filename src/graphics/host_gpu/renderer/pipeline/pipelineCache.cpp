@@ -2655,9 +2655,27 @@ static std::filesystem::path StaticInputsPath() {
 	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".shaders");
 }
 
-// (10-27c) The static inputs as the driver cache's warm notes them (<bin>.static-done): their size and time, so new
-// inputs (another driver, new seeds) warm it again.
+// (10-27c) The static inputs as the driver cache's warm notes them (<bin>.static-done). Keyed on what decides which
+// recipes each shard compiles and how they translate: the inputs file's identity line (schema, title, GPU and driver), its
+// content checksum and size, and the translator's device features. Not on its time or the emulator's build: a new exe
+// that remakes the same inputs keeps the shards done (before, a rewrite of the same file threw them all away).
 static std::string StaticInputsStamp() {
+	std::error_code error;
+	const auto      path = StaticInputsPath();
+	const auto      size = std::filesystem::file_size(path, error);
+	if (error) return {};
+	std::ifstream file(path, std::ios::binary);
+	std::string   identity;
+	uint64_t      checksum = 0;
+	if (!std::getline(file, identity) || !file.read(reinterpret_cast<char*>(&checksum), sizeof(checksum))) return {};
+	for (auto& c: identity)
+		if (c == ' ' || c == '\r') c = '_';
+	return fmt::format("inputs2 {} {:016x} {} {:08x}", identity, checksum, size,
+	                   ShaderRecompiler::Frontend::TranslatorDeviceFeatures());
+}
+
+// The stamp before 10-27c's content key (size and time): still read, so a run noted with it is kept.
+static std::string StaticInputsLegacyStamp() {
 	std::error_code error;
 	const auto      path = StaticInputsPath();
 	const auto      size = std::filesystem::file_size(path, error);
@@ -2677,7 +2695,8 @@ static std::filesystem::path StaticDonePath(const std::filesystem::path& driver_
 static uint32_t StaticShardsDone(const std::filesystem::path& driver_cache, uint32_t* shards, std::set<uint32_t>* which) {
 	std::ifstream file(StaticDonePath(driver_cache));
 	std::string   stamp, word;
-	if (!std::getline(file, stamp) || stamp.empty() || stamp != StaticInputsStamp()) return 0;
+	if (!std::getline(file, stamp) || stamp.empty() || (stamp != StaticInputsStamp() && stamp != StaticInputsLegacyStamp()))
+		return 0;
 	uint32_t n = 0;
 	if (!(file >> n) || n == 0) return 0;
 	if (shards != nullptr) {

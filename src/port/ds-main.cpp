@@ -521,7 +521,14 @@ void PrepareShaders(const fs::path& root, const std::string& game, const GamePar
 		if (RunHidden(tool, L"--game " + wgame + L" --make-seeds \"" + made.wstring() + L"\" --states \"" + states.wstring() + L"\"",
 		              root, log, affinity) == 0 &&
 		    fs::exists(made, ec)) {
-			if (stale) fs::rename(made, seeds, ec);
+			// (10-27c) A new exe that lists the same shaders keeps the seed file as it was (its time too): the prefetch
+			// inputs stay current and the start-up precompile's shards done stay done.
+			if (stale && ReadText(made) == ReadText(seeds)) {
+				fs::remove(made, ec);
+				std::printf("[port] shaders: new program, same shader list: the seed file is kept\n");
+			} else if (stale) {
+				fs::rename(made, seeds, ec);
+			}
 			std::ofstream(stamp_file, std::ios::binary) << stamp;
 		} else if (!have) {
 			std::printf("[port] shaders: listing failed: the game compiles its shaders when they first appear\n");
