@@ -689,6 +689,8 @@ bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.light[0] = EnvFloat("KYTY_TORCH_RANGE", 1.0f, 0.3f, 3.0f), push.light[1] = 0.05f, push.light[2] = static_cast<float>(steps);
 	push.light[3] = 130.0f;
 	push.flare[0] = fstr, push.flare[1] = static_cast<float>(color.extent.width) / static_cast<float>(color.extent.height);
+	static const auto t0 = now;
+	push.flare[2] = static_cast<float>(std::fmod(std::chrono::duration<double>(now - t0).count(), 1000.0)); // (natural-1028: the flicker's slow sines)
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
 	push.motion[2] = (g_tc.history_valid && !inputs.reset && inputs.motion.view != nullptr) ? 1.0f : 0.0f;
 	push.motion[3] = dt;
@@ -743,7 +745,13 @@ bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		const Img* shadow_in = &g_tc.raw;
 		if (TorchHwWanted() && RecordHybrid(*graphics, command, inputs, push)) shadow_in = &g_tc.hwraw;
 		Record(command, inputs, gb, g_tc.out, sp, {5}, shadow_in, &g_tc.hist[prev], &g_tc.hist[cur]);
+		// (denoise-1028) three a-trous iterations, ping-pong filt / raw (raw is free once the temporal pass read it)
+		sp.flare[3] = 1.0f;
 		Record(command, inputs, gb, g_tc.out, sp, {7}, &g_tc.hist[cur], nullptr, &g_tc.filt);
+		sp.flare[3] = 2.0f;
+		Record(command, inputs, gb, g_tc.out, sp, {7}, &g_tc.filt, nullptr, &g_tc.raw);
+		sp.flare[3] = 4.0f;
+		Record(command, inputs, gb, g_tc.out, sp, {7}, &g_tc.raw, nullptr, &g_tc.filt);
 		Record(command, inputs, gb, g_tc.out, push, {2}, &g_tc.filt);
 		g_tc.shadow_history = true;
 	}
