@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include <tuple>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -3716,14 +3717,16 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 namespace {
-// KYTY_DLSS_OUT_DISPLAY (default on when KYTY_DISPLAY_HEIGHT is set below the output's height): DLSS super resolution
+// KYTY_DLSS_OUT_DISPLAY (default on when the display, KYTY_DISPLAY_HEIGHT else the monitor's mode, is below the output's height): DLSS super resolution
 // outputs at the display's height (the output's aspect), into g_dlss_mid, which a linear blit then scales into the
 // game's output (3840x2160) for its own later stages. DLSS's output fixed at 4K took inputs of 720, 1080, 1256 or 1440
 // only (a 3x/2x/1.72x/1.5x ratio), so 628 or 540 from a 1080 display fell outside its range (10-27).
 uint32_t DlssDisplayHeight(uint32_t output_height) {
 	static const uint32_t height = [] {
+		// (10-28: else the monitor's mode, as FSR 4, XeSS and FSR 3.1: the sharpening at the size shown)
 		const char* value = std::getenv("KYTY_DISPLAY_HEIGHT");
-		return value != nullptr ? static_cast<uint32_t>(std::max(0, std::atoi(value))) : 0u;
+		return value != nullptr && *value != '\0' ? static_cast<uint32_t>(std::max(0, std::atoi(value)))
+		                                          : LocalPlatform::DisplayHeight(nullptr);
 	}();
 	static const int forced = [] {
 		const char* value = std::getenv("KYTY_DLSS_OUT_DISPLAY");
@@ -3739,6 +3742,8 @@ struct DlssMid {
 	vk::Format    format = vk::Format::eUndefined;
 };
 DlssMid g_dlss_mid;
+bool         g_dlss_mid_pending = false; // this upscale wrote g_dlss_mid
+vk::Extent2D g_dlss_mid_extent {};
 bool EnsureDlssMid(GraphicContext& graphics, vk::Extent2D extent, vk::Format format) {
 	if (g_dlss_mid.image.image != nullptr && g_dlss_mid.image.extent.width == extent.width &&
 	    g_dlss_mid.image.extent.height == extent.height && g_dlss_mid.format == format)
@@ -4029,35 +4034,9 @@ static bool UpscaleStreamline(vk::CommandBuffer command, const UpscaleInputs& in
 			std::printf("DLSS super resolution: slEvaluateFeature failed (%s)\n", sl::getResultAsStr(result));
 		return false;
 	}
-	if (to_mid) {
-		// DLSS's display-size image scaled (linear) into the game's output, which its later stages read as before.
-		const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
-		                        vk::AccessFlags2 dst) {
-			vk::MemoryBarrier2 barrier {};
-			barrier.srcStageMask  = src_stage;
-			barrier.srcAccessMask = src;
-			barrier.dstStageMask  = dst_stage;
-			barrier.dstAccessMask = dst;
-			vk::DependencyInfo dependency {};
-			dependency.memoryBarrierCount = 1;
-			dependency.pMemoryBarriers    = &barrier;
-			command.pipelineBarrier2(dependency);
-		};
-		global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead,
-		       vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite);
-		Transition(command, g_dlss_mid.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
-		           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eBlit);
-		const auto& out = inputs.output;
-		vk::ImageBlit blit {};
-		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-		blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, out.level, out.layer, 1};
-		blit.srcOffsets[1] = vk::Offset3D {static_cast<int32_t>(options_target.width), static_cast<int32_t>(options_target.height), 1};
-		blit.dstOffsets[1] = vk::Offset3D {static_cast<int32_t>(out.extent.width), static_cast<int32_t>(out.extent.height), 1};
-		command.blitImage(g_dlss_mid.image.image, vk::ImageLayout::eTransferSrcOptimal, out.image, out.layout, 1, &blit,
-		                  vk::Filter::eLinear);
-		global(vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands,
-		       vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
-	}
+	// DLSS's display-size image: sharpened, then scaled into the game's output by Upscale (DlssMidTake).
+	g_dlss_mid_pending = to_mid;
+	if (to_mid) g_dlss_mid_extent = options_target;
 	return true;
 #else
 	(void)command;
@@ -4168,6 +4147,293 @@ void SharpenOutput(vk::CommandBuffer command, const UpscaleInputs& inputs, float
 	// The pass's writes before whatever reads or writes the output next (the exposure pass, the composite).
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 	       vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+}
+
+// ---- The sharpening's measured effect (frame-gen.h SharpenProbeDue) ----
+constexpr uint32_t ProbeSide = 128;
+struct SharpenProbeState {
+	VkBuffer       buffer = VK_NULL_HANDLE;
+	VmaAllocation  memory = VK_NULL_HANDLE;
+	const uint8_t* mapped = nullptr;
+	bool           failed = false;
+	uint64_t       frame = 0, pending = 0; // upscales seen; the one copied at (0: none)
+	vk::Format     format[2] {};
+	vk::Extent2D   size[2] {};
+	bool           copied[2] {};
+	std::string    upscaler, where;
+	float          strength = 0.0f;
+} g_sp;
+
+float HalfBits(uint16_t h) {
+	const uint32_t exp = (h >> 10) & 0x1Fu, mant = h & 0x3FFu;
+	float v = exp == 0 ? std::ldexp(static_cast<float>(mant), -24)
+	          : exp == 31 ? (mant ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity())
+	                      : std::ldexp(static_cast<float>(mant | 0x400u), static_cast<int>(exp) - 25);
+	return (h & 0x8000u) ? -v : v;
+}
+float SmallFloat(uint32_t bits, int mant_bits) { // the unsigned 11/10-bit floats of B10G11R11 (5-bit exponent)
+	const uint32_t mant = bits & ((1u << mant_bits) - 1u), exp = bits >> mant_bits;
+	if (exp == 0) return std::ldexp(static_cast<float>(mant), -14 - mant_bits);
+	if (exp == 31) return std::numeric_limits<float>::infinity();
+	return std::ldexp(static_cast<float>(mant | (1u << mant_bits)), static_cast<int>(exp) - 15 - mant_bits);
+}
+uint32_t ProbeBytes(vk::Format f) {
+	switch (f) {
+		case vk::Format::eR16G16B16A16Sfloat: return 8;
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eA2B10G10R10UnormPack32: return 4;
+		default: return 0;
+	}
+}
+// The mean |laplacian| of the tonemapped luma (x1000) of a slot; -1: unreadable.
+double ProbeDetail(int slot) {
+	const auto f = g_sp.format[slot];
+	const auto w = g_sp.size[slot].width, h = g_sp.size[slot].height, bytes = ProbeBytes(f);
+	if (!g_sp.copied[slot] || bytes == 0 || w < 3 || h < 3) return -1.0;
+	const uint8_t* base = g_sp.mapped + static_cast<size_t>(slot) * ProbeSide * ProbeSide * 8;
+	std::vector<float> y(static_cast<size_t>(w) * h);
+	for (uint32_t i = 0; i < w * h; ++i) {
+		float r = 0, g = 0, b = 0;
+		const uint8_t* p = base + static_cast<size_t>(i) * bytes;
+		if (f == vk::Format::eR16G16B16A16Sfloat) {
+			uint16_t c[3];
+			std::memcpy(c, p, 6);
+			r = HalfBits(c[0]), g = HalfBits(c[1]), b = HalfBits(c[2]);
+		} else {
+			uint32_t v = 0;
+			std::memcpy(&v, p, 4);
+			if (f == vk::Format::eB10G11R11UfloatPack32) r = SmallFloat(v & 0x7FFu, 6), g = SmallFloat((v >> 11) & 0x7FFu, 6), b = SmallFloat(v >> 22, 5);
+			else if (f == vk::Format::eA2B10G10R10UnormPack32) r = (v & 0x3FFu) / 1023.0f, g = ((v >> 10) & 0x3FFu) / 1023.0f, b = ((v >> 20) & 0x3FFu) / 1023.0f;
+			else if (f == vk::Format::eR8G8B8A8Unorm) r = (v & 0xFFu) / 255.0f, g = ((v >> 8) & 0xFFu) / 255.0f, b = ((v >> 16) & 0xFFu) / 255.0f;
+			else b = (v & 0xFFu) / 255.0f, g = ((v >> 8) & 0xFFu) / 255.0f, r = ((v >> 16) & 0xFFu) / 255.0f;
+		}
+		float l = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+		if (!std::isfinite(l)) return -1.0;
+		l   = std::max(l, 0.0f);
+		y[i] = l / (1.0f + l);
+	}
+	double sum = 0.0;
+	for (uint32_t j = 1; j + 1 < h; ++j)
+		for (uint32_t i = 1; i + 1 < w; ++i) {
+			const size_t k = static_cast<size_t>(j) * w + i;
+			sum += std::fabs(4.0 * y[k] - y[k - 1] - y[k + 1] - y[k - w] - y[k + w]);
+		}
+	return 1000.0 * sum / (static_cast<double>(w - 2) * (h - 2));
+}
+void SharpenProbeTick() {
+	++g_sp.frame;
+	if (g_sp.pending == 0 || g_sp.frame < g_sp.pending + 8) return;
+	const double before = ProbeDetail(0), after = ProbeDetail(1);
+	if (after < 0.0) {
+		std::printf("sharpening %s: strength %.3f, detail not measured (format %d)\n", g_sp.upscaler.c_str(), g_sp.strength,
+		            static_cast<int>(g_sp.format[1]));
+	} else if (before < 0.0) {
+		std::printf("sharpening %s: strength %.3f, detail after %.3f (no before: %s), %s\n", g_sp.upscaler.c_str(), g_sp.strength,
+		            after, g_sp.upscaler == "FSR 3.1" ? "its RCAS runs inside AMD's DLL" : "not copied", g_sp.where.c_str());
+	} else {
+		std::printf("sharpening %s: strength %.3f, detail before %.3f after %.3f (%+.1f%%), %s\n", g_sp.upscaler.c_str(), g_sp.strength,
+		            before, after, before > 0.0 ? 100.0 * (after - before) / before : 0.0, g_sp.where.c_str());
+	}
+	std::fflush(stdout);
+	g_sp.pending = 0;
+}
+} // namespace
+
+bool SharpenProbeDue() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_SHARPEN_PROBE");
+		return !(v != nullptr && v[0] == '0');
+	}();
+	const uint64_t frame = g_sp.frame;
+	return on && !g_sp.failed && (g_sp.pending == 0 || g_sp.pending == frame) && frame >= 1800 && frame % 1800 == 0 &&
+	       g_graphics_ctx != nullptr;
+}
+
+void SharpenProbeCopy(vk::CommandBuffer command, vk::Image image, vk::ImageLayout layout, vk::Format format, vk::Extent2D extent,
+                      uint32_t level, uint32_t layer, int slot) {
+	if (!SharpenProbeDue() || slot < 0 || slot > 1 || image == nullptr || ProbeBytes(format) == 0) return;
+	if (g_sp.buffer == VK_NULL_HANDLE) {
+		g_sp.failed = true;
+		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		create.size  = 2ull * ProbeSide * ProbeSide * 8;
+		create.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo host {};
+		host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VmaAllocationInfo info {};
+		if (vmaCreateBuffer(g_graphics_ctx->allocator, &create, &host, &g_sp.buffer, &g_sp.memory, &info) != VK_SUCCESS) {
+			g_sp.buffer = VK_NULL_HANDLE;
+			return;
+		}
+		g_sp.mapped = static_cast<const uint8_t*>(info.pMappedData);
+		g_sp.failed = false;
+	}
+	if (g_sp.pending != g_sp.frame) {
+		g_sp.pending   = g_sp.frame;
+		g_sp.copied[0] = g_sp.copied[1] = false;
+	}
+	const uint32_t w = std::min(ProbeSide, extent.width), h = std::min(ProbeSide, extent.height);
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eCopy;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency);
+	vk::BufferImageCopy copy {};
+	copy.bufferOffset     = static_cast<vk::DeviceSize>(slot) * ProbeSide * ProbeSide * 8;
+	copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, layer, 1};
+	copy.imageOffset      = vk::Offset3D {static_cast<int32_t>((extent.width - w) / 2), static_cast<int32_t>((extent.height - h) / 2), 0};
+	copy.imageExtent      = vk::Extent3D {w, h, 1};
+	command.copyImageToBuffer(image, layout, g_sp.buffer, 1, &copy);
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eHost | vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	command.pipelineBarrier2(dependency);
+	g_sp.format[slot] = format;
+	g_sp.size[slot]   = {w, h};
+	g_sp.copied[slot] = true;
+}
+
+void SharpenProbeArm(const char* upscaler, float strength, const char* where) {
+	if (g_sp.pending != g_sp.frame || g_sp.pending == 0) return;
+	g_sp.upscaler = upscaler;
+	g_sp.strength = strength;
+	g_sp.where    = where;
+}
+
+namespace {
+// ---- XeSS and FSR 3.1 at the display's size (as DLSS's KYTY_DLSS_OUT_DISPLAY and FSR 4's) ----
+// KYTY_SR_OUT_DISPLAY=0: their output the game's (3840x2160) as before. Otherwise, with a display lower than the
+// game's output (KYTY_DISPLAY_HEIGHT, else the monitor's mode) and no lower than the 3D, they write g_sr_mid (rgba16f,
+// the display's size), the sharpening runs on it, and it is blitted into the game's output (nearest at an integer
+// ratio: the presenter's 2x downscale then gives its pixels back). 10-28: sharpening at 2160 was mostly averaged away
+// by the presenter's 2160 -> 1080.
+struct SrMid {
+	VulkanImage   image;
+	vk::ImageView view = nullptr;
+	bool          failed = false;
+} g_sr_mid;
+
+uint32_t SrDisplayHeight() {
+	static const uint32_t display = [] {
+		const char* value = std::getenv("KYTY_DISPLAY_HEIGHT");
+		if (value != nullptr && *value != '\0') return static_cast<uint32_t>(std::max(0, std::atoi(value)));
+		return LocalPlatform::DisplayHeight(nullptr);
+	}();
+	return display;
+}
+
+// The display-size extent for an output (none: {0, 0}).
+vk::Extent2D SrDisplayExtent(const UpscaleInputs& inputs) {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_SR_OUT_DISPLAY");
+		return !(v != nullptr && v[0] == '0');
+	}();
+	const uint32_t display = SrDisplayHeight();
+	const auto&    out     = inputs.output;
+	if (!on || g_sr_mid.failed || display < 360 || display >= out.extent.height || display < inputs.color.extent.height ||
+	    !(out.usage & vk::ImageUsageFlagBits::eTransferDst) ||
+	    !(out.layout == vk::ImageLayout::eGeneral || out.layout == vk::ImageLayout::eTransferDstOptimal))
+		return {};
+	const auto width = (static_cast<uint32_t>(std::lround(static_cast<double>(display) * out.extent.width / out.extent.height)) + 1u) & ~1u;
+	return {width, display};
+}
+
+bool EnsureSrMid(GraphicContext& graphics, vk::Extent2D extent) {
+	if (g_sr_mid.image.image != nullptr && g_sr_mid.image.extent.width == extent.width && g_sr_mid.image.extent.height == extent.height)
+		return true;
+	const auto device = graphics.device;
+	if (g_sr_mid.view != nullptr || g_sr_mid.image.image != nullptr) device.waitIdle();
+	if (g_sr_mid.view != nullptr) device.destroyImageView(g_sr_mid.view, nullptr);
+	g_sr_mid.view = nullptr;
+	if (g_sr_mid.image.image != nullptr) graphics.DeleteImage(g_sr_mid.image);
+	g_sr_mid.image.image = nullptr;
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = vk::Format::eR16G16B16A16Sfloat;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc |
+	               vk::ImageUsageFlagBits::eTransferDst;
+	create.sharingMode = vk::SharingMode::eExclusive;
+	create.samples     = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, g_sr_mid.image)) {
+		g_sr_mid.image.image = nullptr;
+		g_sr_mid.failed      = true;
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = g_sr_mid.image.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = create.format;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (device.createImageView(&view_info, nullptr, &g_sr_mid.view) != vk::Result::eSuccess) {
+		g_sr_mid.view   = nullptr;
+		g_sr_mid.failed = true;
+		return false;
+	}
+	g_sr_mid.image.state = {};
+	return true;
+}
+
+// A display-size image (general) as the upscalers' output.
+UpscaleImage MidImage(VulkanImage& image, vk::ImageView view, vk::Format format, vk::Extent2D extent, vk::ImageUsageFlags usage) {
+	UpscaleImage m;
+	m.image  = image.image;
+	m.view   = view;
+	m.layout = vk::ImageLayout::eGeneral;
+	m.format = format;
+	m.extent = extent;
+	m.usage  = usage;
+	return m;
+}
+
+// `mid` (general) scaled into the game's output: nearest at an integer ratio, else linear.
+void BlitMid(vk::CommandBuffer command, VulkanImage& mid, vk::Extent2D extent, const UpscaleImage& out) {
+	const auto global = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = src_stage;
+		barrier.srcAccessMask = src;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	global(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead,
+	       vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite);
+	Transition(command, mid, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+	           vk::PipelineStageFlagBits2::eBlit);
+	const bool integer = out.extent.width % extent.width == 0 && out.extent.height % extent.height == 0 &&
+	                     out.extent.width / extent.width == out.extent.height / extent.height;
+	vk::ImageBlit blit {};
+	blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, out.level, out.layer, 1};
+	blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1};
+	blit.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(out.extent.width), static_cast<int32_t>(out.extent.height), 1};
+	command.blitImage(mid.image, vk::ImageLayout::eTransferSrcOptimal, out.image, out.layout, 1, &blit,
+	                  integer ? vk::Filter::eNearest : vk::Filter::eLinear);
+	global(vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eTransferRead,
+	       vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+	Transition(command, mid, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+	           vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eShaderStorageRead, vk::PipelineStageFlagBits2::eComputeShader);
+	static bool said = false;
+	if (!said) {
+		said = true;
+		std::printf("Super resolution: output at the display's %ux%u, sharpened there, blitted (%s) into the game's %ux%u\n",
+		            extent.width, extent.height, integer ? "nearest, an integer ratio" : "linear", out.extent.width, out.extent.height);
+		std::fflush(stdout);
+	}
 }
 } // namespace
 
@@ -9263,8 +9529,36 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	TimedPass("ShineApply", [&] { ShineApply(command, inputs); }); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
 	probed(RtFlicker::Volumetric, "GodraysApply", [&] { return GodraysApply(command, inputs); }); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off; flicker self-check)
 	TimedPass("GbufViewApply", [&] { GbufViewApply(command, inputs); }); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
+	SharpenProbeTick();
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3 || g_sr_kind == 4;
-	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
+	// XeSS and FSR 3.1: their output at the display's size (g_sr_mid; FSR 4 and DLSS do it themselves).
+	const vk::Extent2D mid_extent = (g_sr_kind == 2 || g_sr_kind == 3) && g_graphics_ctx != nullptr ? SrDisplayExtent(inputs) : vk::Extent2D {};
+	const bool to_mid = mid_extent.width != 0 && EnsureSrMid(*g_graphics_ctx, mid_extent);
+	UpscaleInputs up = inputs;
+	if (to_mid) {
+		Transition(command, g_sr_mid.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eShaderStorageRead, vk::PipelineStageFlagBits2::eComputeShader);
+		up.output = MidImage(g_sr_mid.image, g_sr_mid.view, vk::Format::eR16G16B16A16Sfloat, mid_extent,
+		                     vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc |
+		                         vk::ImageUsageFlagBits::eTransferDst);
+	}
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	g_dlss_mid_pending = false;
+#endif
+	const bool  done = ours ? UpscaleOurs(command, up) : UpscaleStreamline(command, inputs);
+	// DLSS's display-size image (KYTY_DLSS_OUT_DISPLAY): the sharpening's target, then blitted as XeSS's and FSR 3.1's.
+	VulkanImage* mid_image = to_mid ? &g_sr_mid.image : nullptr;
+	vk::Extent2D mid_size  = mid_extent;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (done && !ours && g_dlss_mid_pending) {
+		Transition(command, g_dlss_mid.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eShaderStorageRead, vk::PipelineStageFlagBits2::eComputeShader);
+		up.output = MidImage(g_dlss_mid.image, g_dlss_mid.view, g_dlss_mid.format, g_dlss_mid_extent,
+		                     vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc);
+		mid_image = &g_dlss_mid.image;
+		mid_size  = g_dlss_mid_extent;
+	}
+#endif
 	const bool  fsr  = g_sr_kind == 3 || g_sr_kind == 4; // (FSR 4: its own RCAS too)
 	// (FSR: its RCAS, KYTY_UPSCALE_SHARPNESS defaulting to 0.3 in Fsr3::Upscale; DLSS and XeSS: 0 unless set.)
 	const float amount = g_sr_kind == 4 ? Fsr4::Sharpness() : fsr ? [] {
@@ -9279,7 +9573,27 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 		            g_sr_kind == 4 ? "FSR 4 RCAS" : fsr ? "FSR RCAS" : g_sr_kind == 2 ? "XeSS + sharpen.comp" : "DLSS + sharpen.comp");
 		std::fflush(stdout);
 	}
-	if (done && !fsr && amount > 0.0f) SharpenOutput(command, inputs, amount);
+	// The sharpening on the display-size image where there is one (else the game's output), measured (SharpenProbeDue).
+	const auto& target = mid_image != nullptr ? up.output : inputs.output;
+	const char* name   = g_sr_kind == 1 ? "DLSS" : g_sr_kind == 2 ? "XeSS" : g_sr_kind == 3 ? "FSR 3.1" : "FSR 4";
+	char where[128];
+	std::snprintf(where, sizeof(where), "at %ux%u (%s)", target.extent.width, target.extent.height,
+	              mid_image != nullptr ? "the display's size" : "the game's output");
+	if (done && g_sr_kind != 4 && SharpenProbeDue()) {
+		if (!fsr) SharpenProbeCopy(command, target.image, vk::ImageLayout::eGeneral, target.format, target.extent, target.level, target.layer, 0);
+		if (fsr || amount <= 0.0f) {
+			SharpenProbeCopy(command, target.image, vk::ImageLayout::eGeneral, target.format, target.extent, target.level, target.layer, 1);
+			SharpenProbeArm(name, fsr ? amount : 0.0f, where);
+		}
+	}
+	if (done && !fsr && amount > 0.0f) {
+		SharpenOutput(command, mid_image != nullptr ? up : inputs, amount);
+		if (SharpenProbeDue()) {
+			SharpenProbeCopy(command, target.image, vk::ImageLayout::eGeneral, target.format, target.extent, target.level, target.layer, 1);
+			SharpenProbeArm(name, amount, where);
+		}
+	}
+	if (done && mid_image != nullptr) BlitMid(command, *mid_image, mid_size, inputs.output);
 	return done;
 }
 

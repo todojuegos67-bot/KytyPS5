@@ -1175,6 +1175,27 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 		g.failed = true;
 		return false;
 	}
+	// The sharpening's measured effect (frame-gen.h SharpenProbeDue): the model's result (rcas_temp) and RCAS's.
+	if (FrameGen::SharpenProbeDue()) {
+		if (rcas) {
+			FrameGen::Transition(command, g.rcas_temp.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+			                     vk::AccessFlagBits2::eShaderStorageRead, vk::PipelineStageFlagBits2::eComputeShader);
+			FrameGen::SharpenProbeCopy(command, g.rcas_temp.image.image, vk::ImageLayout::eGeneral, vk::Format::eR16G16B16A16Sfloat,
+			                           target, 0, 0, 0);
+		}
+		if (direct)
+			FrameGen::SharpenProbeCopy(command, desc.output, vk::ImageLayout::eGeneral, desc.output_format, target, desc.output_level,
+			                           desc.output_layer, 1);
+		else {
+			FrameGen::Transition(command, g.out16.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+			                     vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eComputeShader);
+			FrameGen::SharpenProbeCopy(command, g.out16.image.image, vk::ImageLayout::eGeneral, vk::Format::eR16G16B16A16Sfloat, target,
+			                           0, 0, 1);
+		}
+		char where[128];
+		std::snprintf(where, sizeof(where), "at %ux%u (%s)", target.width, target.height, scaled ? "the display's size" : "the game's output");
+		FrameGen::SharpenProbeArm("FSR 4", rcas ? sharpness : 0.0f, where);
+	}
 	if (!direct) {
 		FrameGen::Transition(command, g.out16.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
 		                     vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eBlit);
