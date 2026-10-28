@@ -1122,7 +1122,9 @@ void DrawMenu() {
 	if (s.up_quality != 0)
 		ImGui::TextDisabled("Pon la escala de resolucion del juego en ~%d%%", static_cast<int>(ScaleForQuality(s.up_quality) * 100 + 0.5f));
 	ImGui::SliderFloat("Nitidez (RCAS, a resolucion de pantalla)", &s.up_sharpness, 0.0f, 1.0f, "%.2f");
-	ImGui::Checkbox("A/B: ver la imagen original del juego (F3)", &s.up_original);
+	char ab[80];
+	std::snprintf(ab, sizeof ab, "A/B: ver la imagen original del juego (%s)", KeyName(s.ab_key));
+	ImGui::Checkbox(ab, &s.up_original);
 	ImGui::Checkbox("Pantalla dividida (izq. reescalado, der. original)", &s.up_split);
 	ImGui::Combo("Jitter", &s.up_jitter, "Auto (el detectado en la proyeccion)\0Ninguno\0Inyectar Halton (con el TAA del juego apagado)\0");
 	ImGui::Combo("Entrada de color", &s.up_input, "Imagen de escena (tras el TAA del juego)\0Pre-TAA (experimental)\0");

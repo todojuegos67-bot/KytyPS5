@@ -27,7 +27,7 @@ add_library(injector_vulkan SHARED
   src/camera.cpp src/upscale.cpp src/up_dlss.cpp src/up_fsr3.cpp src/up_fsr4.cpp src/up_xess.cpp
   ${IMGUI_DIR}/imgui.cpp ${IMGUI_DIR}/imgui_draw.cpp ${IMGUI_DIR}/imgui_tables.cpp ${IMGUI_DIR}/imgui_widgets.cpp
   ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp)
-set_target_properties(injector_vulkan PROPERTIES OUTPUT_NAME "vulkan-1")
+set_target_properties(injector_vulkan PROPERTIES OUTPUT_NAME "winevulkan")
 target_include_directories(injector_vulkan PRIVATE src ${VULKAN_HEADERS_DIR}/include ${IMGUI_DIR} ${IMGUI_DIR}/backends
   ${CMAKE_SOURCE_DIR}/third_party/ffx_api/include)
 target_compile_definitions(injector_vulkan PRIVATE VK_NO_PROTOTYPES IMGUI_IMPL_VULKAN_NO_PROTOTYPES VK_USE_PLATFORM_WIN32_KHR

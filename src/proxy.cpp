@@ -93,6 +93,70 @@ size_t FeatureStructSize(VkStructureType type) {
 	}
 }
 
+// ---------------------------------------------------------------- "vulkan-1.dll" -> us, in third-party modules
+namespace {
+HMODULE SelfModule() {
+	HMODULE self = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                   reinterpret_cast<LPCWSTR>(&SelfModule), &self);
+	return self;
+}
+template <class C> bool IsVulkanLoaderName(const C* name) {
+	if (name == nullptr) return false;
+	const C* base = name;
+	for (const C* p = name; *p; ++p) if (*p == '\\' || *p == '/') base = p + 1;
+	const char* want = "vulkan-1.dll";
+	size_t i = 0;
+	for (; base[i] && want[i]; ++i) {
+		C c = base[i];
+		if (c >= 'A' && c <= 'Z') c = static_cast<C>(c - 'A' + 'a');
+		if (c != static_cast<C>(want[i])) return false;
+	}
+	return base[i] == 0 && want[i] == 0;
+}
+HMODULE WINAPI Redir_LoadLibraryA(LPCSTR n) { return IsVulkanLoaderName(n) ? SelfModule() : LoadLibraryA(n); }
+HMODULE WINAPI Redir_LoadLibraryW(LPCWSTR n) { return IsVulkanLoaderName(n) ? SelfModule() : LoadLibraryW(n); }
+HMODULE WINAPI Redir_LoadLibraryExA(LPCSTR n, HANDLE f, DWORD fl) { return IsVulkanLoaderName(n) ? SelfModule() : LoadLibraryExA(n, f, fl); }
+HMODULE WINAPI Redir_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD fl) { return IsVulkanLoaderName(n) ? SelfModule() : LoadLibraryExW(n, f, fl); }
+HMODULE WINAPI Redir_GetModuleHandleA(LPCSTR n) { return IsVulkanLoaderName(n) ? SelfModule() : GetModuleHandleA(n); }
+HMODULE WINAPI Redir_GetModuleHandleW(LPCWSTR n) { return IsVulkanLoaderName(n) ? SelfModule() : GetModuleHandleW(n); }
+} // namespace
+
+int RedirectVulkanLoads(HMODULE module, const char* who) {
+	if (module == nullptr) return 0;
+	auto* base = reinterpret_cast<uint8_t*>(module);
+	auto* dos  = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+	auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+	const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	if (dir.VirtualAddress == 0) return 0;
+	struct R { const char* name; void* fn; } const table[] = {
+	    {"LoadLibraryA", reinterpret_cast<void*>(&Redir_LoadLibraryA)}, {"LoadLibraryW", reinterpret_cast<void*>(&Redir_LoadLibraryW)},
+	    {"LoadLibraryExA", reinterpret_cast<void*>(&Redir_LoadLibraryExA)}, {"LoadLibraryExW", reinterpret_cast<void*>(&Redir_LoadLibraryExW)},
+	    {"GetModuleHandleA", reinterpret_cast<void*>(&Redir_GetModuleHandleA)}, {"GetModuleHandleW", reinterpret_cast<void*>(&Redir_GetModuleHandleW)}};
+	int patched = 0;
+	for (auto* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); d->Name != 0; ++d) {
+		if (d->OriginalFirstThunk == 0) continue;  // (no name table: bound imports only)
+		auto* names = reinterpret_cast<IMAGE_THUNK_DATA*>(base + d->OriginalFirstThunk);
+		auto* slots = reinterpret_cast<IMAGE_THUNK_DATA*>(base + d->FirstThunk);
+		for (; names->u1.AddressOfData != 0; ++names, ++slots) {
+			if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+			const char* fn = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData)->Name;
+			for (const auto& r: table) {
+				if (std::strcmp(fn, r.name) != 0 || slots->u1.Function == reinterpret_cast<ULONG_PTR>(r.fn)) continue;
+				DWORD old = 0;
+				if (VirtualProtect(&slots->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) {
+					slots->u1.Function = reinterpret_cast<ULONG_PTR>(r.fn);
+					VirtualProtect(&slots->u1.Function, sizeof(void*), old, &old);
+					++patched;
+				}
+			}
+		}
+	}
+	if (patched) Log("[loader] %s: %d LoadLibrary / GetModuleHandle imports patched (\"vulkan-1.dll\" -> this winevulkan.dll)", who, patched);
+	return patched;
+}
+
 Settings& Cfg() { return g_settings; }
 Real& R() { return g_real; }
 Queues& Q() { return g_queues; }
@@ -100,6 +164,31 @@ HWND& GameWindow() { return g_hwnd; }
 std::recursive_mutex& QueueLock() { return g_queue_lock; }
 
 static std::wstring IniPath() { return ExeDir() + L"injector.ini"; }
+
+namespace {
+struct KeyEntry { const char* name; int vk; };
+const KeyEntry kKeys[] = {{"F1", VK_F1}, {"F2", VK_F2}, {"F3", VK_F3}, {"F4", VK_F4}, {"F5", VK_F5}, {"F6", VK_F6},
+    {"F7", VK_F7}, {"F8", VK_F8}, {"F9", VK_F9}, {"F10", VK_F10}, {"F11", VK_F11}, {"F12", VK_F12}, {"Insert", VK_INSERT},
+    {"Home", VK_HOME}, {"End", VK_END}, {"Delete", VK_DELETE}, {"PageUp", VK_PRIOR}, {"PageDown", VK_NEXT},
+    {"Pause", VK_PAUSE}, {"ScrollLock", VK_SCROLL}, {"NumLock", VK_NUMLOCK}};
+int ParseKey(const wchar_t* key, int def) {
+	wchar_t buf[64] {};
+	GetPrivateProfileStringW(L"injector", key, L"", buf, 64, (ExeDir() + L"injector.ini").c_str());
+	std::string text;
+	for (const wchar_t* c = buf; *c; ++c) if (*c != L' ') text.push_back(static_cast<char>(*c));
+	if (text.empty()) return def;
+	for (const auto& k: kKeys) if (_stricmp(k.name, text.c_str()) == 0) return k.vk;
+	const long v = std::strtol(text.c_str(), nullptr, 0);
+	return v > 0 && v < 256 ? static_cast<int>(v) : def;
+}
+}  // namespace
+
+const char* KeyName(int vk) {
+	for (const auto& k: kKeys) if (k.vk == vk) return k.name;
+	static char buf[16];
+	std::snprintf(buf, sizeof buf, "0x%02X", vk);
+	return buf;
+}
 
 void LoadSettings() {
 	const auto path = IniPath();
@@ -115,6 +204,8 @@ void LoadSettings() {
 	s.mv_units        = geti(L"mv_units", 0) != 0 ? 1 : 0;
 	s.depth_mode      = geti(L"depth_mode", 0);
 	s.previews        = geti(L"previews", 1) != 0;
+	s.menu_key        = ParseKey(L"menu_key", VK_F2);
+	s.fg_key          = ParseKey(L"fg_key", VK_F3);
 	s.up_backend      = std::clamp(geti(L"upscaler", 0), 0, 4);
 	s.up_quality      = std::clamp(geti(L"up_quality", 0), 0, 5);
 	s.up_sharpness    = std::clamp(geti(L"up_sharpness_pct", 30), 0, 100) / 100.0f;
@@ -124,6 +215,7 @@ void LoadSettings() {
 	s.up_input        = std::clamp(geti(L"up_input", 0), 0, 1);
 	s.up_native       = geti(L"up_native", 0) != 0;
 	s.up_streamline   = geti(L"up_streamline", 1) != 0;
+	s.ab_key          = ParseKey(L"ab_key", VK_F4);
 }
 
 void SaveSettings() {
@@ -140,6 +232,8 @@ void SaveSettings() {
 	put(L"mv_units", s.mv_units);
 	put(L"depth_mode", s.depth_mode);
 	put(L"previews", s.previews);
+	WritePrivateProfileStringW(L"injector", L"menu_key", std::wstring(KeyName(s.menu_key), KeyName(s.menu_key) + std::strlen(KeyName(s.menu_key))).c_str(), path.c_str());
+	WritePrivateProfileStringW(L"injector", L"fg_key", std::wstring(KeyName(s.fg_key), KeyName(s.fg_key) + std::strlen(KeyName(s.fg_key))).c_str(), path.c_str());
 	put(L"upscaler", s.up_backend);
 	put(L"up_quality", s.up_quality);
 	put(L"up_sharpness_pct", static_cast<int>(s.up_sharpness * 100 + 0.5f));
@@ -148,6 +242,7 @@ void SaveSettings() {
 	put(L"up_input", s.up_input);
 	put(L"up_native", s.up_native);
 	put(L"up_streamline", s.up_streamline);
+	WritePrivateProfileStringW(L"injector", L"ab_key", std::wstring(KeyName(s.ab_key), KeyName(s.ab_key) + std::strlen(KeyName(s.ab_key))).c_str(), path.c_str());
 }
 
 double DisplayRefreshHz() {
@@ -167,14 +262,59 @@ uint32_t FindMemoryType(uint32_t bits, VkMemoryPropertyFlags flags) {
 	return 0;
 }
 
+static HMODULE g_self = nullptr;
+static std::wstring SelfPath() {
+	wchar_t p[MAX_PATH] {};
+	GetModuleFileNameW(g_self, p, MAX_PATH);
+	return p;
+}
+static bool SelfIsVulkan1() {
+	std::wstring p = SelfPath();
+	p = p.substr(p.find_last_of(L"\\/") + 1);
+	return _wcsicmp(p.c_str(), L"vulkan-1.dll") == 0;
+}
+
+// The first line of every load, written with plain Win32 calls from DllMain (no CRT stream, no locks of ours): next
+// to the exe (injector.log) and in %LOCALAPPDATA%\injector\boot.log (if the game folder is not writable).
+static void BootLine(HMODULE module) {
+	wchar_t mod[MAX_PATH] {}, exe[MAX_PATH] {};
+	GetModuleFileNameW(module, mod, MAX_PATH);
+	GetModuleFileNameW(nullptr, exe, MAX_PATH);
+	SYSTEMTIME t;
+	GetLocalTime(&t);
+	char line[1600];
+	const int n = std::snprintf(line, sizeof line, "%04d-%02d-%02d %02d:%02d:%02d.%03d BOOT pid %lu, module %ls @ %p, exe %ls\r\n",
+	                            t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, GetCurrentProcessId(),
+	                            mod, static_cast<void*>(module), exe);
+	std::wstring dir(exe);
+	dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
+	std::wstring targets[2] = {dir + L"injector.log", L""};
+	wchar_t local[MAX_PATH] {};
+	if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH) > 0) {
+		CreateDirectoryW((std::wstring(local) + L"\\injector").c_str(), nullptr);
+		targets[1] = std::wstring(local) + L"\\injector\\boot.log";
+	}
+	for (const auto& path: targets) {
+		if (path.empty()) continue;
+		HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+		                       FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (h == INVALID_HANDLE_VALUE) continue;
+		DWORD written = 0;
+		WriteFile(h, line, n > 0 ? static_cast<DWORD>(n) : 0, &written, nullptr);
+		CloseHandle(h);
+	}
+}
+
 static void InitOnce() {
 	std::call_once(g_init_once, [] {
 		LoadSettings();
-		Log("injector phase 2 (generic proxy vulkan-1.dll: frame generation + upscalers) in %s.exe", ExeName().c_str());
+		Log("injector phase 2 (generic proxy winevulkan.dll: frame generation + upscalers) in %s.exe", ExeName().c_str());
 		Log("settings: fg %d, cap %d, osd %d, analyze %d, game inputs %d, min confidence %.2f; upscaler %d, quality %d, sharpness %.2f, "
 		    "jitter %d, input %d, native %d, streamline %d", g_settings.fg_enabled, g_settings.fg_cap_fps, g_settings.osd,
 		    g_settings.analyze, g_settings.use_game_inputs, g_settings.min_confidence, g_settings.up_backend, g_settings.up_quality,
 		    g_settings.up_sharpness, g_settings.up_jitter, g_settings.up_input, g_settings.up_native, g_settings.up_streamline);
+		Log("keys: menu %s, frame generation %s, upscaler A/B %s (injector.ini menu_key / fg_key / ab_key)", KeyName(g_settings.menu_key),
+		    KeyName(g_settings.fg_key), KeyName(g_settings.ab_key));
 		wchar_t sys[MAX_PATH] {};
 		GetSystemDirectoryW(sys, MAX_PATH);
 		const std::wstring system = std::wstring(sys) + L"\\vulkan-1.dll";
@@ -185,7 +325,11 @@ static void InitOnce() {
 		// vulkan-1.dll but ours is ever in the process. Falls back to System32 directly if the copy fails.
 		std::wstring path = system;
 		wchar_t local[MAX_PATH] {};
-		if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH) > 0) {
+		// As winevulkan.dll (the DX11 install: DXVK tries that name first, and no Windows module has it) there is no
+		// name clash: the system loader is loaded from System32 as it is (it may already be loaded by an overlay).
+		if (!SelfIsVulkan1()) {
+			Log("loaded as %ls", SelfPath().c_str());
+		} else if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH) > 0) {
 			const std::wstring dir = std::wstring(local) + L"\\injector";
 			CreateDirectoryW(dir.c_str(), nullptr);
 			const std::wstring copy = dir + L"\\vulkan-1-system.dll";
@@ -931,6 +1075,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL inj_vkGetDeviceProcAddr(VkDevice device
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
 	if (reason == DLL_PROCESS_ATTACH) {
+		inj::g_self = module;
+		inj::BootLine(module);
 		// Pinned: a FreeLibrary by DXVK after its probe device must not unload us (see InitOnce).
 		HMODULE self = nullptr;
 		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,

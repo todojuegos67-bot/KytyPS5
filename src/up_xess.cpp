@@ -42,6 +42,7 @@ bool Load() {
 	if (g_tried) return g_loaded;
 	g_tried = true;
 	HMODULE dll = LoadLibraryW((ExeDir() + L"libxess.dll").c_str());
+	RedirectVulkanLoads(dll, "libxess.dll");  // ("vulkan-1.dll" -> this winevulkan.dll)
 	if (dll == nullptr) {
 		g_why = "libxess.dll no esta junto al exe";
 		Log("[xess] libxess.dll not next to the exe: XeSS unavailable");

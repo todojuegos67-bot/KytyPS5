@@ -1,4 +1,3 @@
-LIBRARY vulkan-1
 EXPORTS
     vkGetInstanceProcAddr = inj_vkGetInstanceProcAddr
     vkGetDeviceProcAddr = inj_vkGetDeviceProcAddr

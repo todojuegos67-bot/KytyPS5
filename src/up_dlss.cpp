@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <type_traits>
@@ -47,6 +48,16 @@ bool        g_tried = false, g_inited = false, g_device_set = false, g_ready = f
 std::string g_why = "Streamline no cargado";
 std::vector<std::string> g_instance_ext, g_device_ext, g_features12, g_features13;
 VkDevice    g_device = VK_NULL_HANDLE;
+
+// Streamline's plugins (loaded by slInit) and NGX: their "vulkan-1.dll" loads redirected to us too.
+void PatchPlugins() {
+	for (const wchar_t* name: {L"sl.interposer.dll", L"sl.common.dll", L"sl.dlss.dll", L"nvngx_dlss.dll"})
+		if (HMODULE m = GetModuleHandleW(name)) {
+			char who[64];
+			std::snprintf(who, sizeof who, "%ls", name);
+			RedirectVulkanLoads(m, who);
+		}
+}
 
 void SlLog(sl::LogType type, const char* message) {
 	static uint32_t count = 0;
@@ -270,7 +281,9 @@ void BeforeCreateInstance() {
 	g_tried = true;
 	std::wstring dir = ExeDir() + L"streamline\\";
 	if (GetFileAttributesW((dir + L"sl.interposer.dll").c_str()) == INVALID_FILE_ATTRIBUTES) dir = ExeDir();
-	HMODULE sl = LoadLibraryW((dir + L"sl.interposer.dll").c_str());
+	// (Its own dependencies resolved against the exe's folder first; then "vulkan-1.dll" -> us in its imports.)
+	HMODULE sl = LoadLibraryExW((dir + L"sl.interposer.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+	RedirectVulkanLoads(sl, "sl.interposer.dll");
 	if (sl == nullptr) {
 		g_why = "no esta streamline\\sl.interposer.dll junto al exe";
 		Log("[dlss] no streamline\\sl.interposer.dll next to the exe: DLSS unavailable");
@@ -312,6 +325,7 @@ void BeforeCreateInstance() {
 		return;
 	}
 	g_inited = true;
+	PatchPlugins();
 	sl::FeatureRequirements req {};
 	if (g_api.get_requirements(sl::kFeatureDLSS, req) == sl::Result::eOk) {
 		for (uint32_t i = 0; i < req.vkNumInstanceExtensions; ++i) g_instance_ext.emplace_back(req.vkInstanceExtensions[i]);
@@ -357,6 +371,7 @@ void DeviceFeatures(VkPhysicalDeviceVulkan12Features& f12, VkPhysicalDeviceVulka
 
 void OnFirstPresent(VkDevice device) {
 	if (!g_inited || (g_device_set && g_device == device)) return;
+	PatchPlugins();  // (before Streamline loads the Vulkan loader for this device: ours)
 	sl::VulkanInfo info {};
 	info.device             = device;
 	info.instance           = R().instance;

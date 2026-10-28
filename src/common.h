@@ -31,7 +31,7 @@ void Log(const char* fmt, ...);
 std::wstring ExeDir();   // with a trailing backslash
 std::string  ExeName();  // "GRW.exe" -> "GRW"
 
-// ---- settings (injector.ini next to the exe), changed from the F1 menu ----
+// ---- settings (injector.ini next to the exe), changed from the menu (F2 by default) ----
 struct Settings {
 	bool  fg_enabled     = true;   // FSR 3 frame generation x2
 	int   fg_cap_fps     = -1;     // shown-frame cap for VRR: -1 auto (refresh - refresh^2/3600), 0 off, N fps
@@ -43,20 +43,24 @@ struct Settings {
 	int   mv_units       = 0;      // 0: UV (scale by render size), 1: pixels (scale 1)
 	int   depth_mode     = 0;      // 0 auto (from the depth clear value), 1 normal, 2 reversed
 	bool  previews       = true;
-	// ---- upscaling (F1 > Reescalado) ----
+	int   menu_key       = VK_F2;  // injector.ini menu_key / fg_key: a name (F1..F12, Insert, Home, End, ...) or a
+	int   fg_key         = VK_F3;  // virtual-key number (0x71 or 113)
+	// ---- upscaling (menu > Reescalado) ----
 	int   up_backend     = 0;      // 0 off, 1 DLSS (Streamline), 2 FSR 4, 3 FSR 3.1, 4 XeSS
 	int   up_quality     = 0;      // 0 auto (from the game's own scale), 1 native AA, 2 quality, 3 balanced, 4 performance, 5 ultra perf.
 	float up_sharpness   = 0.30f;  // RCAS at the display size (0 off)
-	bool  up_original    = false;  // A/B (F3): the game's own image on screen, the upscaler keeps running
+	bool  up_original    = false;  // A/B (ab_key, F4): the game's own image on screen, the upscaler keeps running
 	bool  up_split       = false;  // left half upscaled, right half the game's
 	int   up_jitter      = 0;      // 0 auto (detected in the projection), 1 none, 2 inject a Halton jitter into the projection
 	int   up_input       = 0;      // 0 the final scene image (post-TAA, before the composite), 1 pre-TAA (experimental)
 	bool  up_native      = false;  // also when the game renders at the display size (anti-aliasing only)
 	bool  up_streamline  = true;   // load NVIDIA Streamline at start (DLSS needs it before the game's Vulkan instance)
+	int   ab_key         = VK_F4;  // the upscaler's A/B toggle (injector.ini ab_key)
 };
 Settings&   Cfg();
 void        LoadSettings();
 void        SaveSettings();
+const char* KeyName(int vk);
 
 // ---- dispatch to the real loader / driver ----
 struct Real {
@@ -91,6 +95,13 @@ struct InternalScope {
 	InternalScope& operator=(const InternalScope&) = delete;
 };
 bool Internal();
+
+// Streamline (sl.interposer / its plugins) and XeSS load the Vulkan loader with LoadLibrary*("vulkan-1.dll"). Installed
+// as winevulkan.dll, ours is not that module: they would get the system loader, a second loader instance whose
+// dispatch does not know our instance / device. So their import tables' LoadLibraryA/W/ExA/ExW and GetModuleHandleA/W
+// are patched: "vulkan-1.dll" (any path) resolves to OUR module, every other name goes through unchanged. Returns the
+// number of entries patched (0: already patched, or nothing imported).
+int RedirectVulkanLoads(HMODULE module, const char* who);
 
 // The queues added at device creation for frame generation (VK_NULL_HANDLE when unavailable).
 struct Queues {

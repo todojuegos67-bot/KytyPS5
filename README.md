@@ -1,6 +1,6 @@
 # Injector (generic, phases 1 and 2)
 
-An OptiScaler-style injector that works in any game. Its files go next to the game's exe. Press **F1** in game to open the menu.
+An OptiScaler-style injector that works in any game. Its files go next to the game's exe. Press **F2** in game to open the menu and **F3** to toggle frame generation (both set in `injector.ini`: `menu_key`, `fg_key`).
 
 It covers **DX11 games through DXVK**, with these features:
 
@@ -8,7 +8,7 @@ It covers **DX11 games through DXVK**, with these features:
 - FSR 3.1 frame generation x2 with pacing;
 - a live "Analizar vectores" analyzer that finds the depth buffer, the motion vectors and the HUD point;
 - (phase 2) upscaling: **DLSS** (NVIDIA Streamline), **FSR 4**, **FSR 3.1** and **XeSS**, with quality modes, RCAS sharpening
-  at the display size and a live A/B (F3);
+  at the display size and a live A/B (F4, `ab_key`);
 - a log next to the exe.
 
 The code contains no game-specific values: no offsets, no shader hashes, no exe names. Knowledge about a particular game lives only in the profiles that the analyzer writes (`injector_profiles\<exe>.ini`). Those profiles hold image signatures (format and size), never handles or addresses.
@@ -16,11 +16,11 @@ The code contains no game-specific values: no offsets, no shader hashes, no exe 
 ## How it works
 
 ```
-game (DX11) -> d3d11.dll / dxgi.dll (DXVK 2.6.1, official) -> vulkan-1.dll (OURS, next to the exe)
+game (DX11) -> d3d11.dll / dxgi.dll (DXVK 2.6.1, official) -> winevulkan.dll (OURS, next to the exe)
                                                                -> %SystemRoot%\System32\vulkan-1.dll (system loader)
 ```
 
-DXVK loads `vulkan-1.dll` from the exe's folder first. Our proxy forwards every call to the system loader and intercepts only a few:
+DXVK tries `winevulkan.dll` before `vulkan-1.dll`. No Windows module has that name, so ours is always the one DXVK gets, even when an overlay (RTSS, Ubisoft) already loaded the system `vulkan-1.dll` (the 10-28 Wildlands failure). Native Vulkan games get the same binary as `vulkan-1.dll`. Our proxy forwards every call to the system loader and intercepts only a few:
 
 - **Device creation:** adds the three queues that FSR 3 frame generation needs (an extra graphics queue for present, plus two in a compute-only family).
 - **Swapchain:** replaced by the FidelityFX frame interpolation swapchain (the same mechanism as KytyPS5's `src/local/fsr3-fg.cpp`).
@@ -37,7 +37,7 @@ DXVK loads `vulkan-1.dll` from the exe's folder first. Our proxy forwards every 
 1. Unzip the release anywhere.
 2. Run `InjectorSetup.exe` and pick the game's exe. For Wildlands that is `GRW.exe`, in the Ubisoft Connect / Steam install folder.
 3. The setup reads the exe's import table and detects the API:
-   - **DX11:** copies `d3d11.dll`, `dxgi.dll`, `vulkan-1.dll`, `amd_fidelityfx_vk.dll`, `dxvk.conf` and `injector.ini` next to the exe, and (phase 2, when the package has them) `libxess.dll`, the `streamline\` folder (NVIDIA's `sl.interposer.dll`, `sl.common.dll`, `sl.dlss.dll`, `nvngx_dlss.dll`) and the `fsr4_shaders\` folder (AMD's FSR 4 model). Files already there are renamed to `*.injector-bak`. Everything is recorded in `injector_install.txt`.
+   - **DX11:** copies `d3d11.dll`, `dxgi.dll`, `winevulkan.dll`, `amd_fidelityfx_vk.dll`, `dxvk.conf` and `injector.ini` next to the exe. Phase 2 also copies (when the package has them) `libxess.dll`, the `streamline\\` folder and the `fsr4_shaders\\` folder. A `vulkan-1.dll` left by an older install is moved aside. Files already there are renamed to `*.injector-bak`. Everything is recorded in `injector_install.txt`.
    - **DX12:** nothing is copied. DX12 is a later phase: the same DLL behind vkd3d-proton.
    - **Vulkan:** copies only `vulkan-1.dll`, `amd_fidelityfx_vk.dll` and `injector.ini`, and only if the exe gets Vulkan functions through `vkGetInstanceProcAddr`. An exe that imports other `vk*` functions directly is refused.
    - **32-bit, DX9 or unknown:** refused.
@@ -51,9 +51,9 @@ InjectorSetup.exe detect|install|uninstall <game.exe>
 
 To install by hand for a DX11 game, copy everything in `payload\` (files and the `streamline\` and `fsr4_shaders\` folders) next to the exe.
 
-## The menu (F1)
+## The menu (F2)
 
-F2 toggles frame generation without opening the menu. Settings are saved to `injector.ini` when the menu closes.
+F3 toggles frame generation without opening the menu. Settings are saved to `injector.ini` when the menu closes.
 
 - **Frame generation:**
   - on/off;
@@ -71,16 +71,16 @@ F2 toggles frame generation without opening the menu. Settings are saved to `inj
   The profile is rewritten while you play, at most every 5 s and only when something changed. On the next start it locks on within about 10 frames.
 - **Reescalado** (phase 2): see below.
 
-## Upscaling (phase 2, F1 > Reescalado)
+## Upscaling (phase 2, menu > Reescalado)
 
 ### What to do in the game (Wildlands)
 
 1. In the game's own video options, keep its anti-aliasing / TAA on and set its **resolution scale below 100%**
    (Quality ~67%, Balanced ~58%, Performance 50%, Ultra Performance 33%). The injector does not shrink the game's render
    targets itself (see "Render size" below): the game renders smaller, the injector upscales.
-2. F1 > Reescalado: pick **DLSS**, **FSR 4**, **FSR 3.1** or **XeSS**; "Modo" Auto follows the game's scale.
+2. Menu (F2) > Reescalado: pick **DLSS**, **FSR 4**, **FSR 3.1** or **XeSS**; "Modo" Auto follows the game's scale.
 3. Watch the status lines in the menu (render size -> display size, inputs, jitter, GPU ms, sharpness metric).
-   **F3** (or the checkbox) toggles A/B: the game's own image on screen while the upscaler keeps running.
+   **F4** (`ab_key` in `injector.ini`, or the checkbox) toggles A/B: the game's own image on screen while the upscaler keeps running.
    "Pantalla dividida": left half upscaled, right half the game's.
 
 ### How it works
@@ -131,7 +131,7 @@ F2 toggles frame generation without opening the menu. Settings are saved to `inj
 ... [fg] FidelityFX API loaded (amd_fidelityfx_vk.dll)
 ... [fg] frame interpolation swapchain 1920x1080, format 44, present mode 0, 3 images
 ... swapchain 1920x1080 format 44, 3 images, FidelityFX frame interpolation swapchain
-... [overlay] ImGui ready (F1 menu, F2 frame generation on/off)
+... [overlay] ImGui ready (F2 menu, F3 frame generation on/off)
 ... [fg] generation context 1920x1080 (render up to 1920x1080, format 44, depth normal)
 ... [fg] inputs: neutral (far depth, zero motion): FSR 3 interpolates from optical flow only
 ... [fg] generation on: x2, render 1920x1080 -> display 1920x1080
@@ -156,7 +156,7 @@ Upscaling (phase 2) lines, per upscaler:
 The same with `[fsr4] first frame`, `[fsr3.1] first dispatch` or `[xess] first execute`. The proof that an upscaler
 ran and its image reached the screen is the pair `[<backend>] first ...` + `[up] <backend> frame N: ... sharpness
 metric: game X -> ours Y`: the metric is measured on the backbuffer before our blit (the game's own stretch) and after
-it (what is on screen), so a different value means our image is there. With F3 (A/B original) on, "ours" is not measured.
+it (what is on screen), so a different value means our image is there. With F4 (A/B original) on, "ours" is not measured.
 (Again, the values above only show the format: nothing has run on a real PC yet.)
 
 The `[fg] real … -> shown …` line is the proof that generated frames reach the screen:
@@ -196,7 +196,10 @@ Ghost Recon Wildlands ships **EasyAntiCheat** (Ghost War PvP, error 30005 report
   Wildlands has been seen; every log line above is the expected format, not an observed one.
 - **DLSS:** Streamline in manual-hooking mode on Vulkan without its present / swapchain hooks is not NVIDIA's usual
   integration; whether `slSetVulkanInfo` after DXVK's probe device, and NGX on a device DXVK made, work is unverified.
-  Streamline loads "vulkan-1.dll" by name and gets ours (we pass its calls straight through).
+  Streamline and XeSS load "vulkan-1.dll" by name; installed as winevulkan.dll ours is not that module, so their
+  import tables' LoadLibrary* / GetModuleHandle* are patched to hand back ours (log: `[loader] ... imports patched`),
+  and their calls then pass straight through our hooks. A load made with an API we did not patch would still reach the
+  system loader.
 - **Placement:** relies on the analyzer's backbuffer / HUD point; a game that draws its UI in the same pass as the
   composite gets its HUD covered (logged). Image layouts at that point are taken from the barriers DXVK recorded.
 - **Inputs:** the default input is the game's post-TAA scene image (so the upscaler mostly does a better stretch + its

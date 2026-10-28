@@ -84,7 +84,7 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" >nul
-          dumpbin /exports build\Release\vulkan-1.dll | findstr vk
+          dumpbin /exports build\Release\winevulkan.dll | findstr vk
 
       - name: Package
         id: pkg
@@ -94,7 +94,11 @@ jobs:
           $root = "out/$name"
           New-Item -ItemType Directory -Force "$root/payload", "$root/licenses" | Out-Null
           Copy-Item build/Release/InjectorSetup.exe $root/
-          Copy-Item build/Release/vulkan-1.dll "$root/payload/"
+          # One binary, two names: winevulkan.dll for DX11 (DXVK tries that name before vulkan-1.dll, and no Windows
+          # module has it, so an overlay that already loaded the system vulkan-1.dll can't take our place),
+          # vulkan-1.dll for native Vulkan games.
+          Copy-Item build/Release/winevulkan.dll "$root/payload/winevulkan.dll"
+          Copy-Item build/Release/winevulkan.dll "$root/payload/vulkan-1.dll"
           Copy-Item deps/dxvk-2.6.1/x64/d3d11.dll, deps/dxvk-2.6.1/x64/dxgi.dll "$root/payload/"
           Copy-Item deps/amd_fidelityfx_vk.dll "$root/payload/"
           Copy-Item payload/dxvk.conf, payload/injector.ini "$root/payload/"

@@ -148,7 +148,7 @@ Api Detect(const PeInfo& pe) {
 const std::wstring kManifest = L"injector_install.txt";
 
 std::vector<std::wstring> FilesFor(Api api) {
-	if (api == Api::DX11) return {L"d3d11.dll", L"dxgi.dll", L"vulkan-1.dll", L"amd_fidelityfx_vk.dll", L"dxvk.conf", L"injector.ini"};
+	if (api == Api::DX11) return {L"d3d11.dll", L"dxgi.dll", L"winevulkan.dll", L"amd_fidelityfx_vk.dll", L"dxvk.conf", L"injector.ini"};
 	if (api == Api::Vulkan) return {L"vulkan-1.dll", L"amd_fidelityfx_vk.dll", L"injector.ini"};
 	return {};
 }
@@ -200,6 +200,12 @@ bool Install(const std::wstring& exe) {
 	std::wofstream manifest(dir + kManifest);
 	manifest << L"api=" << (api == Api::DX11 ? L"dx11" : L"vulkan") << L"\n";
 	std::wstring done;
+	// DX11: a vulkan-1.dll left next to the exe (an older install of ours) is moved aside; DXVK must find winevulkan.dll.
+	if (api == Api::DX11 && Exists(dir + L"vulkan-1.dll")) {
+		MoveFileExW((dir + L"vulkan-1.dll").c_str(), (dir + L"vulkan-1.dll.injector-bak").c_str(), MOVEFILE_REPLACE_EXISTING);
+		manifest << L"backup=vulkan-1.dll\n";
+		done += L"  (vulkan-1.dll -> vulkan-1.dll.injector-bak)\n";
+	}
 	for (const auto& name: FilesFor(api)) {
 		const std::wstring src = payload + name, dst = dir + name;
 		if (!Exists(src)) { Say(L"Falta " + src, MB_ICONERROR); return false; }
@@ -240,7 +246,7 @@ bool Install(const std::wstring& exe) {
 		done += L"  " + std::wstring(folder) + L"\\ (" + std::to_wstring(n) + L" archivos)\n";
 	}
 	Say(std::wstring(L"Instalado para ") + std::wstring(ApiName(api), ApiName(api) + std::strlen(ApiName(api))) + L" en\n" + dir +
-	    L"\n\n" + done + L"\nInicia el juego y pulsa F1. Log: injector.log junto al exe.");
+	    L"\n\n" + done + L"\nInicia el juego y pulsa F2 (menu), F3 (frame generation). Log: injector.log junto al exe.");
 	return true;
 }
 

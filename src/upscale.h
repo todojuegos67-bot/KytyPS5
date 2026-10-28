@@ -1,4 +1,4 @@
-// Upscaling (phase 2, F1 > Reescalado): DLSS (NVIDIA Streamline, the public SDK), FSR 4 (AMD's v07 INT8 model through
+// Upscaling (phase 2, menu > Reescalado; ab_key = A/B): DLSS (NVIDIA Streamline, the public SDK), FSR 4 (AMD's v07 INT8 model through
 // KytyPS5's own runtime), FSR 3.1 (AMD FidelityFX API, amd_fidelityfx_vk.dll) and XeSS (Intel XeSS SDK, libxess.dll),
 // each on Vulkan, inside DXVK's command stream.
 //
