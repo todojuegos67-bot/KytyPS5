@@ -8,6 +8,7 @@ namespace inj::overlay {
 
 void OnSwapchain(VkSwapchainKHR swapchain, const VkImage* images, uint32_t count, VkFormat format, VkExtent2D extent);
 void OnSwapchainDestroyed(VkSwapchainKHR swapchain);
+void OnDeviceDestroyed();    // ImGui's Vulkan objects belong to that device: all made again on the next one
 void PollInput();             // once per present
 bool WantsDraw();             // menu open or the OSD on
 bool MenuVisible();

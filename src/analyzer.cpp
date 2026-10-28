@@ -569,6 +569,16 @@ void Shutdown() {
 	DestroyCopy(g_copy_depth);
 	DestroyCopy(g_copy_motion);
 	DestroyCopy(g_copy_color);
+	// Everything learned about this device's images goes with it (the profile stays).
+	g_images.clear();
+	g_views.clear();
+	g_cb.clear();
+	g_frame.clear();
+	g_swap.clear();
+	g_depth = g_motion = g_backbuffer = Pick {};
+	g_hud_after = -1;
+	g_hud_stable = 0;
+	g_hud_conf = 0;
 }
 
 } // namespace inj::analyzer

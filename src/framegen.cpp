@@ -409,6 +409,18 @@ VkResult Present(VkQueue queue, const VkPresentInfoKHR* info) {
 	return r;
 }
 
+void OnDeviceDestroyed() {
+	std::lock_guard lock(QueueLock());
+	if (g_sc_ctx != nullptr) DestroySwapchain(g_swapchain);
+	DestroyFg();
+	DestroyOwned(g_neutral_depth);
+	DestroyOwned(g_neutral_motion);
+	g_fg_failed = false;
+	g_inputs_mode_known = false;
+	g_last_real = g_window_start = g_next_real = {};
+	g_stats = {};
+}
+
 Stats LastStats() {
 	return g_stats;
 }

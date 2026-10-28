@@ -135,6 +135,10 @@ bool EnsureRenderPass(VkFormat format) {
 	return true;
 }
 
+void vkDestroySamplerReal(VkSampler sampler) {
+	if (auto f = reinterpret_cast<PFN_vkDestroySampler>(RealDeviceProc("vkDestroySampler"))) f(R().device, sampler, nullptr);
+}
+
 bool Down(int vk) {
 	return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
@@ -209,6 +213,25 @@ void OnSwapchainDestroyed(VkSwapchainKHR swapchain) {
 	if (swapchain != g_swapchain) return;
 	DestroyTargets();
 	g_swapchain = VK_NULL_HANDLE;
+}
+
+void OnDeviceDestroyed() {
+	std::lock_guard lock(QueueLock());
+	DestroyTargets();
+	if (g_init) {
+		for (auto& [view, set]: g_textures) ImGui_ImplVulkan_RemoveTexture(set);
+		ImGui_ImplVulkan_Shutdown();
+		ImGui::DestroyContext();
+	}
+	g_textures.clear();
+	if (g_render_pass) R().vkDestroyRenderPass(R().device, g_render_pass, nullptr);
+	if (g_sampler) vkDestroySamplerReal(g_sampler);
+	g_render_pass = VK_NULL_HANDLE;
+	g_pool = VK_NULL_HANDLE;  // (freed with the device)
+	g_sampler = VK_NULL_HANDLE;
+	g_init = g_init_failed = false;
+	g_swapchain = VK_NULL_HANDLE;
+	g_format = VK_FORMAT_UNDEFINED;
 }
 
 void PollInput() {

@@ -34,5 +34,6 @@ struct Stats {
 	const char* state = "off";
 };
 Stats LastStats();
+void  OnDeviceDestroyed();  // contexts and our images belong to that device
 
 } // namespace inj::framegen

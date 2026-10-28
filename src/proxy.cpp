@@ -44,8 +44,13 @@ std::string ExeName() {
 void Log(const char* fmt, ...) {
 	std::lock_guard lock(g_log_mutex);
 	if (g_log == nullptr) {
-		g_log = _wfopen((ExeDir() + L"injector.log").c_str(), L"w");
+		// Append: the module may be loaded more than once per process, and a run must not erase the last one.
+		g_log = _wfopen((ExeDir() + L"injector.log").c_str(), L"a");
 		if (g_log == nullptr) return;
+		SYSTEMTIME d;
+		GetLocalTime(&d);
+		std::fprintf(g_log, "\n==== injector log opened %04d-%02d-%02d, pid %lu, module %p ====\n", d.wYear, d.wMonth, d.wDay,
+		             GetCurrentProcessId(), static_cast<void*>(GetModuleHandleW(L"vulkan-1.dll")));
 	}
 	SYSTEMTIME t;
 	GetLocalTime(&t);
@@ -123,8 +128,27 @@ static void InitOnce() {
 		    g_settings.fg_cap_fps, g_settings.osd, g_settings.analyze, g_settings.use_game_inputs, g_settings.min_confidence);
 		wchar_t sys[MAX_PATH] {};
 		GetSystemDirectoryW(sys, MAX_PATH);
-		const std::wstring path = std::wstring(sys) + L"\\vulkan-1.dll";
+		const std::wstring system = std::wstring(sys) + L"\\vulkan-1.dll";
+		// 10-28, Wildlands: DXVK freed our vulkan-1.dll after its probe device, the system loader we had loaded stayed
+		// in the process under the same module name, and DXVK's next LoadLibraryA("vulkan-1.dll") got THAT one: the
+		// real device ran without us. So (1) our module is pinned (never unloaded), and (2) the system loader is loaded
+		// from a copy under another name (%LOCALAPPDATA%\injector\vulkan-1-system.dll), so no module named
+		// vulkan-1.dll but ours is ever in the process. Falls back to System32 directly if the copy fails.
+		std::wstring path = system;
+		wchar_t local[MAX_PATH] {};
+		if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH) > 0) {
+			const std::wstring dir = std::wstring(local) + L"\\injector";
+			CreateDirectoryW(dir.c_str(), nullptr);
+			const std::wstring copy = dir + L"\\vulkan-1-system.dll";
+			WIN32_FILE_ATTRIBUTE_DATA a {}, b {};
+			const bool have = GetFileAttributesExW(copy.c_str(), GetFileExInfoStandard, &b);
+			const bool same = have && GetFileAttributesExW(system.c_str(), GetFileExInfoStandard, &a) &&
+			                  a.nFileSizeLow == b.nFileSizeLow && CompareFileTime(&a.ftLastWriteTime, &b.ftLastWriteTime) == 0;
+			if (same || CopyFileW(system.c_str(), copy.c_str(), FALSE)) path = copy;
+			else Log("could not copy the system loader to %ls (%lu): loading it from System32", copy.c_str(), GetLastError());
+		}
 		g_real.loader = LoadLibraryW(path.c_str());
+		if (g_real.loader == nullptr && path != system) { path = system; g_real.loader = LoadLibraryW(path.c_str()); }
 		if (g_real.loader == nullptr) { Log("FATAL: the system Vulkan loader (%ls) not found", path.c_str()); return; }
 		g_real.gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(g_real.loader, "vkGetInstanceProcAddr"));
 		Log("system Vulkan loader: %ls", path.c_str());
@@ -194,6 +218,13 @@ bool EnsureSlots() {
 	return true;
 }
 
+VKAPI_ATTR void VKAPI_CALL Hook_DestroyInstance(VkInstance instance, const VkAllocationCallbacks* alloc) {
+	auto f = reinterpret_cast<PFN_vkDestroyInstance>(R().gipa(instance, "vkDestroyInstance"));
+	Log("vkDestroyInstance %p", static_cast<void*>(instance));
+	f(instance, alloc);
+	if (instance == R().instance) R().instance = VK_NULL_HANDLE;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateWin32SurfaceKHR(VkInstance instance, const VkWin32SurfaceCreateInfoKHR* info,
                                                          const VkAllocationCallbacks* alloc, VkSurfaceKHR* surface) {
 	if (info != nullptr) g_hwnd = info->hwnd;
@@ -204,6 +235,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateWin32SurfaceKHR(VkInstance instance, c
 VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
                                                  const VkAllocationCallbacks* alloc, VkDevice* device) {
 	auto& r = R();
+	Log("vkCreateDevice (instance %p)", static_cast<void*>(r.instance));
 	auto  get_families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(r.gipa(r.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
 	auto  create = reinterpret_cast<PFN_vkCreateDevice>(r.gipa(r.instance, "vkCreateDevice"));
 	uint32_t n = 0;
@@ -265,6 +297,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(VkPhysicalDevice physical, cons
 	if (result != VK_SUCCESS) return result;
 	r.physical = physical;
 	r.device = *device;
+	g_presents = 0;
 	r.gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(r.gipa(r.instance, "vkGetDeviceProcAddr"));
 	LoadDeviceFunctions(*device);
 	VkPhysicalDeviceProperties props {};
@@ -291,12 +324,18 @@ VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device, const VkAllocatio
 	if (device == R().device) {
 		R().vkDeviceWaitIdle(device);
 		analyzer::Shutdown();
+		overlay::OnDeviceDestroyed();
+		framegen::OnDeviceDestroyed();
 		Log("device destroyed after %llu presents", static_cast<unsigned long long>(g_presents));
 		g_pool = VK_NULL_HANDLE;  // (freed with the device)
 		g_slots = {};
 	}
 	R().vkDestroyDevice(device, alloc);
-	if (device == R().device) R().device = VK_NULL_HANDLE;
+	if (device == R().device) {
+		R().device = VK_NULL_HANDLE;
+		Q() = {};
+		g_swap = {};
+	}
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
@@ -400,7 +439,8 @@ VKAPI_ATTR void VKAPI_CALL Hook_SetHdrMetadataEXT(VkDevice device, uint32_t n, c
 VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info) {
 	std::lock_guard lock(QueueLock());
 	++g_presents;
-	if (g_presents == 1) Log("first present");
+	if (g_presents == 1) Log("first present on device %p, swapchain %p (%ux%u)", static_cast<void*>(R().device),
+	                         reinterpret_cast<void*>(g_swap.handle), g_swap.extent.width, g_swap.extent.height);
 	auto& q = Q();
 	if (q.game != queue) {
 		q.game = queue;
@@ -546,6 +586,7 @@ struct HookEntry { const char* name; PFN_vkVoidFunction fn; bool device; };
 const HookEntry kHooks[] = {
     HOOK("vkGetDeviceProcAddr", Hook_GetDeviceProcAddr, true),
     HOOK("vkCreateDevice", Hook_CreateDevice, false),
+    HOOK("vkDestroyInstance", Hook_DestroyInstance, false),
     HOOK("vkEnumerateDeviceExtensionProperties", Hook_EnumerateDeviceExtensionProperties, false),
     HOOK("vkCreateWin32SurfaceKHR", Hook_CreateWin32SurfaceKHR, false),
     HOOK("vkDestroyDevice", Hook_DestroyDevice, true),
@@ -603,6 +644,7 @@ VKAPI_ATTR VkResult VKAPI_CALL inj_vkCreateInstance(const VkInstanceCreateInfo* 
 	VkResult r = create(info, alloc, instance);
 	if (r == VK_SUCCESS) {
 		R().instance = *instance;
+		Log("vkCreateInstance -> %p", static_cast<void*>(*instance));
 		if (info->pApplicationInfo) R().api_version = info->pApplicationInfo->apiVersion;
 		Log("vkCreateInstance: %s / %s", info->pApplicationInfo && info->pApplicationInfo->pApplicationName ? info->pApplicationInfo->pApplicationName : "?",
 		    info->pApplicationInfo && info->pApplicationInfo->pEngineName ? info->pApplicationInfo->pEngineName : "?");
@@ -646,8 +688,12 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL inj_vkGetDeviceProcAddr(VkDevice device
 
 }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
 	if (reason == DLL_PROCESS_ATTACH) {
+		// Pinned: a FreeLibrary by DXVK after its probe device must not unload us (see InitOnce).
+		HMODULE self = nullptr;
+		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+		                   reinterpret_cast<LPCWSTR>(module), &self);
 		// Nothing heavy under the loader lock: the system loader is loaded at the first Vulkan call.
 	}
 	return TRUE;
