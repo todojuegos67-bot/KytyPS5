@@ -7534,9 +7534,12 @@ int RtSunLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_RT_SUN");
 		int         q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
-		if ((value == nullptr || *value == '\0') && HwShadowLevel() > 0) {
+		// (ds-rt-shadow 10-28) KYTY_HWRT_SHADOW > 0 runs the RT sun pass whatever KYTY_RT_SUN says: the launcher writes
+		// KYTY_RT_SUN=0 when its own sun toggle is off, which left KYTY_HWRT_SHADOW=2 on the old screen-space pass at
+		// strength 0 (20261028-013206 log: "no ray queries ... KYTY_RT_SUN alone", 0.0 % shadowed): nothing visible
+		if (HwShadowLevel() > q) {
 			q = HwShadowLevel();
-			std::printf("RTSUN: KYTY_RT_SUN unset: level %d for KYTY_HWRT_SHADOW\n", q);
+			std::printf("RTSUN: KYTY_RT_SUN=%s: level %d for KYTY_HWRT_SHADOW\n", value != nullptr ? value : "(unset)", q);
 			std::fflush(stdout);
 			return q;
 		}
