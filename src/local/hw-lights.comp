@@ -193,32 +193,31 @@ void Trace(ivec2 pixel) {
 		imageStore(out_img, pixel, vec4(0.0, W, -1.0, 1.0));
 		return;
 	}
-	// Medio: 2 rays at half res; Bajo / Alto: 1 (Alto at full res)
-	int   picks = push.misc.z == 2 ? 2 : 1;
-	// (all2-1027) the sample pattern is fixed per pixel (no per-frame seed): a still camera traces the same rays every
-	// frame, so the result is bit-identical (zero flicker); the a-trous removes the fixed dither, motion decorrelates it.
-	float f     = 0.0;
-	float occ   = 0.0, pen = 1e9;
-	// one trace pixel's world size at p (penumbra in pixels: the contact-hardening filter's radius)
-	vec2  tpx   = vec2(1.0 / TraceSize().x, 0.0);
-	float pxw   = max(distance(WorldPos(uv + tpx, d), p), 1e-5);
+	// (ds-rt-shadow 10-28) no stochastic pick: a ray to each of the pixel's strongest lights (2; 3 at Alto), the occlusion
+	// sum(w_i occ_i) / W over them (the rest counted lit). A light's weight ramps in / out, so its share of the estimate
+	// does too; the old CDF pick re-chose every pixel's light whenever the list changed (lights entered / left / cap swaps
+	// 12-24 per 10 s, 20261028-031412: max jump 168-567 %).
+	int   picks = push.misc.z >= 3 ? 3 : 2;
+	int   top[3] = int[3](-1, -1, -1);
+	for (int i = 0; i < count; ++i) {
+		if (!(ws[i] > 0.0)) continue;
+		if (top[0] < 0 || ws[i] > ws[top[0]]) { top[2] = top[1]; top[1] = top[0]; top[0] = i; }
+		else if (top[1] < 0 || ws[i] > ws[top[1]]) { top[2] = top[1]; top[1] = i; }
+		else if (top[2] < 0 || ws[i] > ws[top[2]]) top[2] = i;
+	}
+	float occ = 0.0, pen = 1e9;
+	vec2  tpx = vec2(1.0 / TraceSize().x, 0.0);
+	float pxw = max(distance(WorldPos(uv + tpx, d), p), 1e-5);
 	for (int k = 0; k < picks; ++k) {
-		// stratified: pick k from [(k + u) / picks] of the CDF
-		float u   = (float(k) + Ign(vec2(pixel) + f * 5.588238 + float(k) * 13.0)) / float(picks);
-		float acc = 0.0;
-		int   sel = 0;
-		for (int i = 0; i < count; ++i) {
-			acc += ws[i] / W;
-			sel = i;
-			if (u < acc) break;
-		}
-		vec2 rnd = vec2(Ign(vec2(pixel.y, pixel.x) + f * 2.93 + float(k) * 37.0 + 3.0), Ign(vec2(pixel) + f * 7.13 + float(k) * 19.0 + 57.0));
+		int sel = top[k];
+		if (sel < 0) break;
+		// (a fixed per-pixel point on the source: a still camera traces the same rays every frame)
+		vec2 rnd = vec2(Ign(vec2(pixel.y, pixel.x) + float(sel) * 37.0 + 3.0), Ign(vec2(pixel) + float(sel) * 19.0 + 57.0));
 		float th, tl;
-		occ += Shadow(sel, p, n, z, rnd, smp, th, tl);
-		// penumbra width at the receiver: the source's diameter * (receiver - occluder) / (occluder - light)
+		occ += ws[sel] * Shadow(sel, p, n, z, rnd, smp, th, tl);
 		if (th > 0.0) pen = min(pen, 2.0 * lb.l[sel].misc.x * th / max(tl - th, 0.05) / pxw);
 	}
-	imageStore(out_img, pixel, vec4(occ / float(picks), W, pen < 1e8 ? min(pen, 64.0) : -1.0, 1.0));
+	imageStore(out_img, pixel, vec4(occ / W, W, pen < 1e8 ? min(pen, 64.0) : -1.0, 1.0));
 }
 
 void Temporal(ivec2 pixel) {
