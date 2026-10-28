@@ -240,6 +240,15 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	num("raton_antizona", s->kbm_antidz);
 	str("mapa_teclado", s->kbm_map);
 	str("mapa_mando", s->pad_map);
+	str("rt_antorchas", s->rt_lamps);
+	num("raton_velocidad_camara", s->kbm_camera);
+	s->kbm_camera = std::clamp(s->kbm_camera, 5, 15);
+	boo("raton_camara_instantanea", s->kbm_warp);
+	boo("raton_calibrar", s->kbm_calibrate);
+	boo("configurado", s->configured);
+	boo("mejoras_16gb", s->ram16_boost);
+	// (10-28) No presets or modes any more: an old modo_souls is dropped (its graphics stay as saved).
+	s->souls_mode = "ninguno";
 	return true;
 }
 
@@ -354,6 +363,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Luz volumetrica: 0 no, 1 bajo, 2 medio, 3 alto (excluye rt_sombras_sol)\n"
 	  << "luz_volumetrica=" << s.godrays << "\n"
 	  << "; Juego original: 1 apaga todos los efectos visuales que anade el emulador\n"
+	  << "; Antorchas (luces RT de antorchas, lamparas, fuego y magia): 0 no, 1 bajo, 2 medio, 3 alto\n"
+	  << "rt_antorchas=" << LampLevel(s) << "\n"
 	  << "juego_original=" << b(s.pure_game) << "\n\n"
 	  << "[Mandos]\n"
 	  << "; Teclado y raton (F7 tambien cambia el raton a mando en vivo)\n"
@@ -363,7 +374,18 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Teclas: Cross=F;R1=Mouse:Left;... (vacio = las de serie, estilo Souls)\n"
 	  << "mapa_teclado=" << s.kbm_map << "\n"
 	  << "; Mando remapeado: a=Cross;b=Circle;... (boton fisico de SDL = control de PS5; vacio = normal)\n"
-	  << "mapa_mando=" << s.pad_map << "\n\n"
+	  << "mapa_mando=" << s.pad_map << "\n"
+	  << "; Velocidad de camara con raton (5-15; 10 = el maximo del menu del juego, 11-15 extra)\n"
+	  << "raton_velocidad_camara=" << s.kbm_camera << "\n"
+	  << "; Camara instantanea (frame warp): la imagen gira con el raton antes de que el juego dibuje\n"
+	  << "raton_camara_instantanea=" << b(s.kbm_warp) << "\n"
+	  << "; 1: el proximo arranque calibra la camara del raton (kbm_curve.txt) y vuelve a 0\n"
+	  << "raton_calibrar=" << b(s.kbm_calibrate) << "\n\n"
+	  << "[Configurador]\n"
+	  << "; 0: el configurador de hardware se muestra al arrancar\n"
+	  << "configurado=" << b(s.configured) << "\n"
+	  << "; Mejoras para equipos de 16 GB de RAM: perfil de 16 GB + vaciado RAM (solo en PCs de 20 GB de RAM o menos)\n"
+	  << "mejoras_16gb=" << b(s.ram16_boost) << "\n\n"
 	  << "[Interfaz]\n"
 	  << "; Metricas en pantalla: 0 no, 1 FPS, 2 FPS + detalle\n"
 	  << "metricas=" << s.metrics << "\n"
@@ -388,7 +410,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 
 
 bool LowRam(const Settings& s, const PcInfo& pc) {
-	return s.simulate_ram16 || (pc.ram_gb > 0 && pc.ram_gb <= 20);
+	// (10-28) "Mejoras para equipos de 16 GB de RAM" (on by default) on a PC of 20 GB or less, or simulated.
+	return s.simulate_ram16 || (s.ram16_boost && pc.ram_gb > 0 && pc.ram_gb <= 20);
 }
 
 void RecommendFor(PcInfo* pc) {
@@ -495,6 +518,12 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	for (const char* k: {"KYTY_MEMCUT", "KYTY_REBAR_STAGING", "KYTY_STAGING_RING_MB", "KYTY_RAM_TARGET_MB", "KYTY_RAM_FLUSH_SECONDS",
 	                     "KYTY_RAM_FLUSH_MB", "KYTY_RAM_FLUSH_LEVEL"})
 		sets.emplace_back(k, "");
+	// (10-28) Mejoras para equipos de 16 GB de RAM: the launcher's "perfil 16 GB + vaciado RAM": the RAM flush every 5 s
+	// (up to 2 GB of what the emulator can rebuild and what the game freed; KYTY_RAM_FLUSH_*, ram-guard.cpp).
+	if (low_ram) {
+		sets.emplace_back("KYTY_RAM_FLUSH_SECONDS", "5");
+		sets.emplace_back("KYTY_RAM_FLUSH_MB", "2048");
+	}
 	if (s.safe_gpu) sets.emplace_back("KYTY_COMPUTE_CHAIN", "0");
 	// Anti-Lag (10-24): with the AMD frame generation, AMD's Anti-Lag 2 on an AMD card (default) or ours (2 frames queued, Ultra 1);
 	// the fixed Souls modes always ours in Ultra. With NVIDIA's frame generation, Reflex (default) or ours with Reflex off.
@@ -524,9 +553,10 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			hw.Set("KYTY_HWRT_REFL_MATERIAL", "1");
 		}
 		if (s.rt_sun) hw.Set("KYTY_HWRT_SHADOW", "2");
-		if (s.rt_particles) {
+		// (10-28) Antorchas: the launcher's hwlamp4 levels (KYTY_HWRT_LIGHTS 1-3).
+		if (const std::string lamps = LampLevel(s); lamps != "0") {
 			hw.Set("KYTY_HWRT_PARTICLES", "2");
-			hw.Set("KYTY_HWRT_LIGHTS", "2");
+			hw.Set("KYTY_HWRT_LIGHTS", lamps);
 		}
 		if (!hw.list.empty()) {
 			sets.emplace_back("KYTY_HWRT", "1");
@@ -734,6 +764,11 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	const float sens = (s.kbm_sens > 0 ? s.kbm_sens : 1.0f) * (fixed_fg ? 0.92f : 1.0f);
 	env.Set("KYTY_KBM_SENS", s.kbm ? Num(sens) : "");
 	env.Set("KYTY_KBM_ANTIDZ", s.kbm ? Num(s.kbm_antidz >= 0 ? s.kbm_antidz : 0.15f) : "");
+	// (10-28) The launcher's: Camara instantanea, Calibrar camara (once) and the mouse's camera speed (a game convar).
+	env.Set("KYTY_KBM_WARP", s.kbm && s.kbm_warp ? "1" : "");
+	env.Set("KYTY_KBM_CALIBRATE", s.kbm_calibrate ? "1" : "");
+	if (s.kbm_calibrate) env.Set("KYTY_KBM", "1");
+	if ((s.kbm || s.kbm_calibrate) && demons) env.AppendConvars("cp11_Setting_CameraSpeed=" + std::to_string(std::clamp(s.kbm_camera, 5, 15)));
 	// The port's own: metrics (the launcher started metricas.ps1; here the in-game panel) and rumble.
 	env.Set("KYTY_FPS_HUD", s.metrics == "1" || s.metrics == "2" ? s.metrics : "");
 	env.Set("KYTY_HAPTIC_RUMBLE", s.rumble ? "1" : "0");
@@ -768,11 +803,11 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.antilag_mode != n.antilag_mode || l.antilag_dlssg != n.antilag_dlssg || l.shadows != n.shadows ||
 	       l.detail != n.detail || l.reflections != n.reflections || l.object_fade != n.object_fade || l.aa_sharp != n.aa_sharp ||
 	       l.shadow_edges != n.shadow_edges || l.corner_shadow != n.corner_shadow || l.rt_reflections != n.rt_reflections ||
-	       l.rt_sun != n.rt_sun || l.rt_fog != n.rt_fog || l.rt_particles != n.rt_particles || l.rt_metal != n.rt_metal ||
+	       l.rt_sun != n.rt_sun || l.rt_fog != n.rt_fog || LampLevel(l) != LampLevel(n) || l.rt_metal != n.rt_metal ||
 	       l.rt_ao != n.rt_ao || l.godrays != n.godrays || l.pure_game != n.pure_game || l.motion_blur != n.motion_blur || l.dof != n.dof || l.vignette != n.vignette ||
 	       l.bloom != n.bloom || l.eye_adapt != n.eye_adapt || l.af16 != n.af16 || l.texture_sharpness != n.texture_sharpness ||
 	       l.kbm != n.kbm || l.kbm_sens != n.kbm_sens || l.kbm_antidz != n.kbm_antidz || l.kbm_map != n.kbm_map ||
-	       l.pad_map != n.pad_map || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
+	       l.pad_map != n.pad_map || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
 	       l.safe_gpu != n.safe_gpu || l.quality != n.quality || l.texture_reduce != n.texture_reduce ||
 	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.extra != n.extra ||
 	       (l.sharpness == "auto") != (n.sharpness == "auto");
@@ -857,6 +892,229 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		max();
 	}
 	if (preset != "maximo") RtAllOff(s); // (10-26) every Souls mode: ray tracing No
+}
+
+
+std::string LampLevel(const Settings& s) {
+	if (s.rt_lamps == "0" || s.rt_lamps == "1" || s.rt_lamps == "2" || s.rt_lamps == "3") return s.rt_lamps;
+	return s.rt_particles ? "2" : "0";
+}
+
+int LiveRtOff(const Settings& l, const Settings& n) {
+	int mask = 0;
+	if (l.rt_reflections && (!n.rt_reflections || n.pure_game)) mask |= 1;
+	if (LampLevel(l) != "0" && (LampLevel(n) == "0" || n.pure_game)) mask |= 2;
+	if (l.godrays != "0" && !l.godrays.empty() && (n.godrays == "0" || n.pure_game)) mask |= 4;
+	return l.pure_game ? 0 : mask;
+}
+
+// ---- (10-28) The Configurador's hardware-tier table ----
+//
+// Calibration (the owner's logs, RTX 5080 16 GB + Ryzen 9 9950X3D + 64 GB, 4K output, everything at its maximum, Detalle
+// Ultra / Muy alto): the [fps] lines' mean frame time (median of each session):
+//   DLSS 1/3 (0.92 Mpx rendered), no RT: 13.2 ms;   DLSS 1/2 (2.07 Mpx), no RT: 10.3-13.8 ms;
+//   DLSS 1/1.333 (4.67 Mpx), no RT: 17.8 ms;          DLSS 1/3 + RT reflections: 13.5-17.2 ms;
+//   DLSS 1/1.333 + RT reflections: 17.3-26 ms;         + Antorchas: +2-3 ms GPU (HWRTLIGHTS 1.3-5.1 ms);
+//   Luz volumetrica 0.07-0.19 ms (GODRAYS), RT reflections pass 0.4 ms at 1/3 and 1.3-1.9 ms at 1/1.333 (+0.3 ms BLAS
+//   build, +~2 ms on the render thread), VRAM 6-7 GB without RT, 10-12 GB with it.
+// Fitted: frame ms = cpu_base + gpu_ms_per_mpx * Mpx (+ RT costs). For the 5080 + 9950X3D: cpu_base 9.5 ms (below ~1 Mpx
+// the game is CPU bound at 11-13 ms), 1.9 ms per rendered megapixel; RT reflections 2.5 ms + 0.3 ms/Mpx; Antorchas 2.5 ms;
+// Luz volumetrica 0.2 ms. The target is a mean of 14.5 ms or less (~69 FPS mean: 60 or more in the heavier places).
+// Other graphics cards: gpu_ms_per_mpx scaled by 100 / their raster score (the 5080 = 100), the RT costs by
+// 100 / (score * rt factor); other CPUs: cpu_base * 100 / their score.
+namespace {
+
+struct GpuTier {
+	const char* key;   // upper-case substring of the name
+	int         score; // raster vs the RTX 5080 = 100
+	double      rt;    // ray tracing factor (RTX 40/50 = 1)
+};
+
+const GpuTier kGpuTiers[] = {
+    // NVIDIA RTX 50
+    {"RTX 5090", 140, 1.0}, {"RTX 5080", 100, 1.0}, {"RTX 5070 TI", 85, 1.0}, {"RTX 5070", 68, 1.0}, {"RTX 5060 TI", 48, 1.0}, {"RTX 5060", 38, 1.0},
+    {"RTX 5050", 28, 1.0},
+    // RTX 40
+    {"RTX 4090", 125, 1.0}, {"RTX 4080 SUPER", 92, 1.0}, {"RTX 4080", 90, 1.0}, {"RTX 4070 TI SUPER", 78, 1.0}, {"RTX 4070 TI", 72, 1.0},
+    {"RTX 4070 SUPER", 65, 1.0}, {"RTX 4070", 55, 1.0}, {"RTX 4060 TI", 40, 1.0}, {"RTX 4060", 32, 1.0}, {"RTX 4050", 24, 1.0},
+    // RTX 30
+    {"RTX 3090 TI", 70, 0.8}, {"RTX 3090", 62, 0.8}, {"RTX 3080 TI", 60, 0.8}, {"RTX 3080", 55, 0.8}, {"RTX 3070 TI", 45, 0.8},
+    {"RTX 3070", 42, 0.8}, {"RTX 3060 TI", 36, 0.8}, {"RTX 3060", 28, 0.8}, {"RTX 3050", 15, 0.8},
+    // RTX 20
+    {"RTX 2080 TI", 40, 0.6}, {"RTX 2080 SUPER", 33, 0.6}, {"RTX 2080", 31, 0.6}, {"RTX 2070 SUPER", 29, 0.6}, {"RTX 2070", 26, 0.6},
+    {"RTX 2060 SUPER", 24, 0.6}, {"RTX 2060", 20, 0.6}, {"GTX 16", 14, 0.0},
+    // AMD RX 9000 / 7000 / 6000
+    {"RX 9070 XT", 85, 0.8}, {"RX 9070", 75, 0.8}, {"RX 9060 XT", 42, 0.8}, {"RX 9060", 36, 0.8},
+    {"RX 7900 XTX", 95, 0.55}, {"RX 7900 XT", 82, 0.55}, {"RX 7900 GRE", 68, 0.55}, {"RX 7800 XT", 60, 0.55}, {"RX 7700 XT", 50, 0.55},
+    {"RX 7700", 46, 0.55}, {"RX 7600 XT", 32, 0.55}, {"RX 7600", 30, 0.55},
+    {"RX 6950 XT", 62, 0.4}, {"RX 6900 XT", 58, 0.4}, {"RX 6800 XT", 55, 0.4}, {"RX 6800", 48, 0.4}, {"RX 6750 XT", 40, 0.4},
+    {"RX 6700 XT", 38, 0.4}, {"RX 6700", 35, 0.4}, {"RX 6650 XT", 30, 0.4}, {"RX 6600 XT", 29, 0.4}, {"RX 6600", 25, 0.4},
+    {"RX 6500", 12, 0.3}, {"RX 6400", 9, 0.3},
+    // Intel Arc
+    {"B580", 33, 0.6}, {"B570", 28, 0.6}, {"A770", 28, 0.6}, {"A750", 25, 0.6}, {"A580", 20, 0.6}, {"A380", 8, 0.5}, {"A310", 6, 0.5},
+};
+
+std::string Upper(std::string s) {
+	std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+	return s;
+}
+
+// Raster score (5080 = 100) and RT factor; unknown cards by their video memory.
+void GpuScore(const PcInfo& pc, int* score, double* rt, std::string* how) {
+	const std::string up = Upper(pc.gpu);
+	for (const auto& g: kGpuTiers) {
+		if (up.find(g.key) != std::string::npos) {
+			*score = g.score;
+			*rt    = g.rt;
+			*how   = g.key;
+			return;
+		}
+	}
+	const int gb = static_cast<int>((pc.vram + (512ull << 20)) >> 30);
+	*rt          = up.find("RTX") != std::string::npos ? 0.6 : 0.4;
+	*score       = gb >= 16 ? 50 : gb >= 12 ? 35 : gb >= 8 ? 22 : 10;
+	*how         = "VRAM " + std::to_string(gb) + " GB";
+}
+
+// CPU score (Ryzen 9 9950X3D = 100): the emulator's frame is mostly the CPU below ~1 Mpx.
+int CpuScore(const PcInfo& pc, std::string* cls) {
+	const std::string up = Upper(pc.cpu);
+	const auto has = [&](const char* k) { return up.find(k) != std::string::npos; };
+	int score = 0;
+	if (has("X3D") && (has(" 9") || has(" 7"))) score = 100, *cls = "Ryzen X3D (7000 / 9000)";
+	else if (has("X3D")) score = 85, *cls = "Ryzen X3D (5000)";
+	else if (has("RYZEN") && (has(" 9 9") || has(" 7 9") || has(" 5 9") || has(" 9 7") || has(" 7 7") || has(" 5 7"))) score = 88, *cls = "Ryzen 7000 / 9000";
+	else if (has("ULTRA") || has("I9-14") || has("I7-14") || has("I9-13") || has("I7-13")) score = 88, *cls = "Intel 13.a / 14.a gen. / Core Ultra";
+	else if (has("RYZEN") && (has(" 5 5") || has(" 7 5") || has(" 9 5"))) score = 75, *cls = "Ryzen 5000";
+	else if (has("I5-14") || has("I5-13") || has("-12")) score = 75, *cls = "Intel 12.a-14.a gen.";
+	else if (has("RYZEN") && (has(" 3") || has(" 5 3") || has(" 7 3") || has(" 9 3"))) score = 60, *cls = "Ryzen 3000";
+	else if (has("-11") || has("-10")) score = 60, *cls = "Intel 10.a / 11.a gen.";
+	else score = 55, *cls = "otro";
+	if (pc.cpu_cores > 0 && pc.cpu_cores < 6) score = score * 8 / 10;
+	return score;
+}
+
+char g_fmt[64];
+const char* F1(double v) {
+	std::snprintf(g_fmt, sizeof(g_fmt), "%.0f", v);
+	return g_fmt;
+}
+
+} // namespace
+
+std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
+	std::vector<std::string> why;
+	int         gpu = 0;
+	double      rtf = 0;
+	std::string gpu_how, cpu_how;
+	GpuScore(pc, &gpu, &rtf, &gpu_how);
+	const int    cpu   = CpuScore(pc, &cpu_how);
+	const int    vram  = static_cast<int>((pc.vram + (512ull << 20)) >> 30);
+	const double base  = 9.5 * 100.0 / std::max(cpu, 20);
+	const double k     = 1.9 * 100.0 / std::max(gpu, 4);
+	const double rtk   = rtf > 0 ? 100.0 / (std::max(gpu, 4) * rtf) : 1e9;
+	const double target = 14.5;
+	// The output: the chosen full-screen resolution, else the monitor's (else 1440p).
+	int out_w = pc.screen_w > 0 ? pc.screen_w : 2560, out_h = pc.screen_h > 0 ? pc.screen_h : 1440;
+	if (int w = 0, h = 0; s->fullscreen && std::sscanf(s->resolution.c_str(), "%dx%d", &w, &h) == 2 && w > 0 && h > 0) out_w = w, out_h = h;
+	const double out_mpx = out_w * static_cast<double>(out_h) / 1e6;
+	const char*  up_kind = pc.nvidia ? "dlss" : (Upper(pc.gpu).find("ARC") != std::string::npos ? "xess" : "fsr");
+
+	// The upscaler mode: the best image (lowest ratio, from native AA) whose frame fits without ray tracing.
+	std::vector<const ResMode*> modes;
+	for (int i = 0; i < kResModeCount; i++)
+		if (std::strcmp(kResModes[i].upscaler, up_kind) == 0 && std::strcmp(kResModes[i].id, "fsr-900") != 0) modes.push_back(&kResModes[i]);
+	std::sort(modes.begin(), modes.end(), [](const ResMode* a, const ResMode* b) { return a->value < b->value; });
+	const ResMode* pick = modes.empty() ? &kResModes[0] : modes.back();
+	double         ms   = 0;
+	for (const ResMode* m: modes) {
+		const double mpx = out_mpx / (m->value * m->value);
+		ms               = base + k * mpx;
+		if (ms <= target) {
+			pick = m;
+			break;
+		}
+	}
+	const double mpx = out_mpx / (pick->value * pick->value);
+	ms               = base + k * mpx;
+	// Too slow even at the lowest: the game's own detail down (~15 % of the GPU each step).
+	double detail_scale = 1.0;
+	std::string detail  = gpu >= 80 ? "ultra" : gpu >= 55 ? "muy-alto" : gpu >= 30 ? "alto" : gpu >= 18 ? "normal" : "bajo";
+	if (ms > target && detail != "bajo") {
+		detail       = gpu >= 30 ? "normal" : "bajo";
+		detail_scale = 0.75;
+		ms           = base + k * mpx * detail_scale;
+	}
+	s->souls_mode = "ninguno";
+	s->res        = pick->id;
+	s->dlss_preset = pc.nvidia ? "K" : s->dlss_preset;
+	s->sharpness   = pick->value >= 1.7 ? "0.5" : "0.25";
+	s->detail      = detail;
+	// Video memory: textures (6-7 GB used without RT at 4K on the 5080, 10-12 GB with it).
+	s->texture_reduce = vram >= 12 ? "0" : vram >= 10 ? "h" : vram >= 8 ? "1" : "2";
+	s->reflections    = gpu >= 80 ? "ultra" : gpu >= 30 ? "alto" : "normal";
+	s->object_fade    = gpu >= 80 ? "ultra" : gpu >= 30 ? "alto" : "normal";
+	s->aa_sharp       = "ultra"; // (free)
+	s->shadows        = gpu >= 40 ? "maximo" : gpu >= 25 ? "alto" : "medio";
+	s->shadow_edges   = gpu >= 30 ? "1" : "0"; // (Alta: almost free)
+	s->quality        = cpu >= 85 ? "standard" : cpu >= 70 ? "high" : "low"; // draw distance: the CPU
+	s->af16           = gpu >= 18;
+	s->texture_sharpness = "1";
+	s->motion_blur = s->dof = s->vignette = s->bloom = s->eye_adapt = true;
+	s->pure_game = false;
+	// The RAM (16 GB or less: the launcher's 16 GB profile and RAM flush; textures and distance at most Alto).
+	s->ram16_boost = pc.ram_gb > 0 && pc.ram_gb <= 20;
+	if (s->ram16_boost) {
+		if (s->texture_reduce == "0") s->texture_reduce = "h";
+		if (s->quality == "standard") s->quality = "high";
+	}
+	// Ray tracing: what still fits, in this order: reflections, Luz volumetrica, Antorchas.
+	RtAllOff(s);
+	s->rt_lamps = "0";
+	s->godrays  = "0";
+	const double refl = rtk * (2.5 + 0.3 * mpx) / 1.0;
+	if (vram >= 12 && !s->ram16_boost && ms + refl <= target) {
+		s->rt_reflections = true;
+		ms += refl;
+	}
+	if (rtf > 0 && ms + 0.2 * rtk <= target && gpu >= 25) {
+		s->godrays = gpu >= 80 ? "2" : "1";
+		ms += 0.2 * rtk;
+	}
+	if (vram >= 16 && ms + 2.5 * rtk <= target) {
+		s->rt_lamps = gpu >= 120 ? "2" : "1";
+		ms += 2.5 * rtk;
+	}
+	const auto label = [](const Choice* items, int count, const std::string& id) {
+		for (int i = 0; i < count; i++)
+			if (id == items[i].id) return items[i].label;
+		return items[0].label;
+	};
+	why.push_back(std::string("Gráfica: ") + gpu_how + " (potencia " + std::to_string(gpu) + " de 100; RTX 5080 = 100). Procesador: " + cpu_how +
+	              " (" + std::to_string(cpu) + " de 100).");
+	why.push_back(std::string("Reescalado: ") + pick->label + " a " + std::to_string(out_w) + "x" + std::to_string(out_h) +
+	              " (el 3D a " + std::to_string(static_cast<int>(out_w / pick->value)) + "x" + std::to_string(static_cast<int>(out_h / pick->value)) + ").");
+	why.push_back(std::string("Detalle ") + label(kDetails, kDetailCount, s->detail) + ", texturas " + label(kTextureReduce, kTextureReduceCount, s->texture_reduce) +
+	              " (" + std::to_string(vram) + " GB de VRAM), sombras " + label(kShadows, kShadowCount, s->shadows) + ", distancia " +
+	              label(kQualities, kQualityCount, s->quality) + " (según el procesador), filtrado x16 " + (s->af16 ? "sí" : "no") + ".");
+	std::string rt = "Ray tracing: ";
+	if (!s->rt_reflections && s->godrays == "0" && s->rt_lamps == "0") rt += "desactivado (no cabe a 60 FPS en este equipo).";
+	else {
+		if (s->rt_reflections) rt += "reflejos RT; ";
+		if (s->godrays != "0") rt += std::string("luz volumétrica ") + (s->godrays == "2" ? "media; " : "baja; ");
+		if (s->rt_lamps != "0") rt += "antorchas RT; ";
+		rt.resize(rt.size() - 2);
+		rt += ".";
+	}
+	why.push_back(rt);
+	if (s->ram16_boost) why.push_back("RAM " + std::to_string(pc.ram_gb) + " GB: activadas las mejoras para equipos de 16 GB (perfil de memoria y vaciado de RAM); texturas y distancia como mucho en Alto.");
+	else why.push_back("RAM " + std::to_string(pc.ram_gb) + " GB: no hacen falta las mejoras para equipos de 16 GB.");
+	const double fps = 1000.0 / ms;
+	std::string  exp = std::string("Esperado: unos ") + F1(fps) + " FPS de media";
+	if (pc.refresh_hz >= 100 && fps < pc.refresh_hz * 0.9) exp += std::string(" (tu monitor va a ") + std::to_string(pc.refresh_hz) + " Hz: la frame generation de Gráficos puede llenarlo)";
+	if (base > target) exp += ". Tu procesador limita: por debajo de 60 FPS en las zonas pesadas aunque bajes gráficos";
+	why.push_back(exp + ". Es una estimación: puedes cambiar cualquier opción en F1.");
+	return why;
 }
 
 } // namespace Port

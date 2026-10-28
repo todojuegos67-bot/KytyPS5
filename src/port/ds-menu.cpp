@@ -3,7 +3,7 @@
 // frames go out without generated ones (swapchain.cpp, PortLive::menu_open), and the game gets no input.
 //   F1, or R3 held + OPTIONS (OPTIONS then never reaches the game): open / close. Circle / Escape: close. L1 / R1, Q / E: the tabs.
 // What the engine applies while playing (sharpness, the fps cap, the frame generation multiplier of a fixed DLSS mode,
-// metrics, rumble) is applied at once; the rest is saved to settings.ini and marked "*": it needs a restart, which
+// metrics, rumble, ray tracing turned off) is applied at once; the rest is saved to settings.ini and marked "(requiere reinicio)": applied at the next start, which
 // the menu offers.
 
 #include "port/ds-port.h"
@@ -80,6 +80,9 @@ bool                     g_start_swallowed = false; // window thread: OPTIONS we
 std::atomic<bool>        g_popup {false}; // a combo is open (Circle closes it, not the menu)
 bool                     g_start_mode = false; // (10-27b) the start menu (before the game), not F1
 int                      g_start_result = 0;   // 1 Jugar, -1 Salir
+bool                     g_config_mode = false; // (10-28) the Configurador before the game (its own window)
+bool                     g_cfg_open = false;    // (10-28) the Configurador inside F1 (Sistema > Configurador)
+std::vector<std::string> g_cfg_why;             // its "Hemos elegido: ..." lines (empty: not optimized yet)
 
 void Bump() {
 	g_revision.fetch_add(1, std::memory_order_relaxed);
@@ -345,8 +348,14 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 	const float ty    = at.y + (h - ImGui::GetFontSize()) * 0.5f;
 	if (focused) dl->AddRectFilled({at.x, at.y + h - 3 * g_unit}, {at.x + w, at.y + h}, gold);
 	std::string text = I18n::T(label);
-	if (restart) text += " *";
 	dl->AddText({at.x + pad, ty}, ink, text.c_str());
+	if (restart) {
+		// (10-28) Only the rows that truly need a restart; saved now, applied at the next start.
+		const ImVec2 ls = ImGui::CalcTextSize(text.c_str());
+		ImGui::PushFont(nullptr, ImGui::GetFontSize() * 0.68f);
+		dl->AddText({at.x + pad + ls.x + 10 * g_unit, ty + 6 * g_unit}, ImGui::GetColorU32(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}), "(requiere reinicio)");
+		ImGui::PopFont();
+	}
 	const char*  shown = I18n::T(value);
 	const ImVec2 vs    = ImGui::CalcTextSize(shown);
 	const float  right = at.x + w - pad;
@@ -430,6 +439,17 @@ void ApplyLive(const Settings& s) {
 	PortLive::rumble_gain = s.rumble_gain > 0 ? s.rumble_gain : 4.0f;
 	const int level       = s.metrics == "2" ? 2 : (s.metrics == "1" ? 1 : 0);
 	for (int i = 0; i < 3 && PerfOverlay::Level() != level; i++) PerfOverlay::CycleLevel();
+	PortLive::rt_off = LiveRtOff(g_rt.launched, s); // (10-28) RT passes off live
+}
+
+// (10-28) What needs a restart: as NeedsRestart, but the ray tracing turned off live does not.
+bool NeedsRestartLive(const Settings& launched, const Settings& now) {
+	Settings n   = now;
+	const int off = LiveRtOff(launched, now);
+	if ((off & 1) != 0) n.rt_reflections = launched.rt_reflections;
+	if ((off & 2) != 0) n.rt_lamps = LampLevel(launched), n.rt_particles = launched.rt_particles;
+	if ((off & 4) != 0) n.godrays = launched.godrays;
+	return NeedsRestart(launched, n);
 }
 
 void Save() {
@@ -820,10 +840,104 @@ void DrawPcTab(float unit) {
 	}
 }
 
+// (10-28) Resolucion (F1 > Gráficos > Imagen): full screen, the desktop's or a monitor mode; window, its size.
+void ResolutionRow(Settings& s) {
+	static const char* sizes[] = {"1280x720", "1600x900", "1920x1080", "2560x1080", "2560x1440", "3440x1440", "3840x1600", "3840x2160"};
+	static std::vector<std::string> ids, labels;
+	ids.clear();
+	labels.clear();
+	if (s.fullscreen) {
+		ids.emplace_back("escritorio");
+		labels.emplace_back(std::string(I18n::T("Escritorio")) +
+		                    (g_rt.pc.screen_h > 0 ? " (" + std::to_string(g_rt.pc.screen_h) + "p)" : std::string()));
+	}
+	for (const char* z: sizes) {
+		ids.emplace_back(z);
+		labels.emplace_back(z);
+	}
+	std::string value = s.fullscreen ? s.resolution : std::to_string(s.width) + "x" + std::to_string(s.height);
+	if (std::find(ids.begin(), ids.end(), value) == ids.end()) {
+		ids.push_back(value);
+		labels.push_back(value);
+	}
+	std::vector<Choice> res;
+	for (size_t i = 0; i < ids.size(); i++) res.push_back({ids[i].c_str(), labels[i].c_str()});
+	if (ChoiceRow("Resolucion", true, res.data(), static_cast<int>(res.size()), value,
+	              s.fullscreen ? "Resolucion de salida en pantalla completa. Escritorio: la de Windows. Otra: el monitor cambia a ella mientras juegas."
+	                           : "Tamano de la ventana.")) {
+		if (s.fullscreen) {
+			s.resolution = value;
+		} else if (int w = 0, h = 0; std::sscanf(value.c_str(), "%dx%d", &w, &h) == 2) {
+			s.width  = w;
+			s.height = h;
+		}
+	}
+}
+
+// (10-28) The Configurador: the detected hardware, "Optimizar según tu equipo" (Optimize, ds-settings.cpp) and "Continuar".
+void DrawConfigurator(float unit) {
+	const ImVec4 ink {0.93f, 0.91f, 0.88f, 1.0f};
+	const auto&  pc = g_rt.pc;
+	ImGui::PushFont(nullptr, 34.0f * unit);
+	ImGui::TextColored(kGold, "%s", "Configurador");
+	ImGui::PopFont();
+	ImGui::TextColored(kDim, "%s", "Hemos detectado tu equipo. Puedes optimizar los gráficos para él o seguir con tus ajustes actuales.");
+	ImGui::Spacing();
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.12f, 0.10f, 0.08f, 0.85f});
+	ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14 * unit);
+	ImGui::BeginChild("##hw", {0, 330 * unit}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+	std::string gpu = pc.gpu.empty() ? std::string("no detectada") : pc.gpu;
+	if (pc.vram > 0) gpu += "  -  " + std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB de VRAM";
+	InfoLine("Tarjeta gráfica", gpu, ink);
+	std::string cpu = pc.cpu.empty() ? std::string("?") : pc.cpu;
+	if (pc.cpu_cores > 0) cpu += "  -  " + std::to_string(pc.cpu_cores) + " núcleos / " + std::to_string(pc.cpu_threads) + " hilos";
+	InfoLine("Procesador", cpu, ink);
+	const bool low = pc.ram_gb > 0 && pc.ram_gb <= 20;
+	InfoLine("Memoria RAM", std::to_string(pc.ram_gb) + " GB" + (low ? "  (se activan las mejoras para equipos de 16 GB de RAM)" : ""), low ? kWarn : ink);
+	InfoLine("Monitor", pc.screen_w > 0 ? std::to_string(pc.screen_w) + "x" + std::to_string(pc.screen_h) + " a " + std::to_string(pc.refresh_hz) + " Hz" : std::string("?"), ink);
+	ImGui::EndChild();
+	ImGui::PopStyleVar();
+	ImGui::PopStyleColor();
+	if (pc.unsupported) ImGui::TextColored(kWarn, "%s", pc.expected.c_str());
+	ImGui::Spacing();
+	const float bw = 420 * unit, bh = 60 * unit;
+	if (ImGui::Button("Optimizar según tu equipo", {bw, bh})) {
+		g_cfg_why         = Optimize(pc, &g_edit);
+		g_edit.configured = true;
+		Save();
+		if (!g_config_mode) ApplyLive(g_edit);
+	}
+	if (ImGui::IsItemHovered())
+		ImGui::SetTooltip("Elige los ajustes con mejor rendimiento para tu gráfica, procesador, RAM y monitor (objetivo: 60 FPS o más) y los guarda en settings.ini.");
+	ImGui::SameLine();
+	if (ImGui::Button("Continuar", {bw * 0.6f, bh})) {
+		if (!g_edit.configured) {
+			g_edit.configured = true;
+			Save();
+		}
+		g_cfg_open = false;
+		if (g_config_mode) g_start_result = 1;
+	}
+	if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", g_cfg_why.empty() ? "Sigue con tus ajustes actuales." : "Sigue con los ajustes elegidos.");
+	if (!g_cfg_why.empty()) {
+		ImGui::Spacing();
+		ImGui::PushFont(nullptr, 30.0f * unit);
+		ImGui::TextColored(kGold, "%s", "Hemos elegido:");
+		ImGui::PopFont();
+		ImGui::PushTextWrapPos(0.0f);
+		for (const auto& line: g_cfg_why) ImGui::BulletText("%s", line.c_str());
+		ImGui::PopTextWrapPos();
+		ImGui::TextColored(kDim, "%s", g_config_mode ? "Después puedes cambiar cualquier opción en el juego con F1."
+		                                              : "Guardado. Lo marcado \"(requiere reinicio)\" se aplica la próxima vez que inicies el juego.");
+	}
+}
+
 void Draw(float width, float height) {
 	if (g_reset_edit.exchange(false)) {
 		g_edit       = g_saved;
 		g_focus_once = true;
+		g_cfg_open   = false;
+		g_cfg_why.clear();
 		g_status.clear();
 		auto& io = ImGui::GetIO();
 		io.ClearInputKeys();
@@ -885,6 +999,9 @@ void Draw(float width, float height) {
 	ImGui::SetCursorPosX(size.x - ImGui::CalcTextSize(g_rt.game_info.c_str()).x - 32 * unit);
 	ImGui::TextColored(kDim, "%s", g_rt.game_info.c_str());
 	ImGui::Separator();
+	if (g_config_mode || g_cfg_open) {
+		DrawConfigurator(unit);
+	} else {
 
 	Settings&  s       = g_edit;
 	bool live_changed = false;
@@ -892,7 +1009,7 @@ void Draw(float width, float height) {
 	// (10-27c) A game's settings menu: five tabs (LB/RB or Q/E), each the launcher's groups as sections; the rows on the
 	// left, the focused row's description on the right.
 	const char* tabs[kTabCount] = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos"};
-	static const std::vector<int> groups[kTabCount] = {{4, 0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}};
+	static const std::vector<int> groups[kTabCount] = {{0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}}; // (10-28) no Modos Souls
 	static const char* section_names[9] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
 	                                       "Pantalla", "Rendimiento", "Controles", "Tu equipo"};
 	g_unit = unit;
@@ -918,6 +1035,7 @@ void Draw(float width, float height) {
 			if (groups[t].size() > 1) Section(section_names[section]);
 			switch (section) {
 				case 0: { // Imagen
+					ResolutionRow(s);
 					static std::vector<ResMode> shown;
 					shown.clear();
 					for (int i = 0; i < kResModeCount; i++)
@@ -979,73 +1097,71 @@ void Draw(float width, float height) {
 					ImGui::TextColored(kDim, "El menu se muestra sin frames generados (no se arrastra con la imagen).");
 					break;
 				}
-				case 2: { // Calidad grafica
-					ChoiceRow("Texturas", true, kTextureReduce, kTextureReduceCount, s.texture_reduce, "Texturas: Medio = mitad de tamano, Bajo = un cuarto. Lo que mas VRAM ahorra.");
-					ChoiceRow("Distancia", true, kQualities, kQualityCount, s.quality, "Distancia de dibujado: a menos nivel, los objetos lejanos pasan antes a modelos mas simples. Mas FPS si va justo el procesador.");
-					ChoiceRow("Sombras", true, kShadows, kShadowCount, s.shadows, "Sombras: Medio = las del sol hasta 125 m, Bajo = hasta 60 m y sin sombras de focos ni ambientales. Mas FPS, pero pueden aparecer de golpe.");
-					ChoiceRow("Detalle", true, kDetails, kDetailCount, s.detail, "Detalle del juego: sombras (cascadas y distancia), iluminacion de entorno y relieve (teselado). Ultra > Muy alto (modo cine) > Alto (modo rendimiento de PS5) > Normal > Bajo (graficas modestas).");
-					ChoiceRow("Reflejos", true, kReflections, kReflectionCount, s.reflections, "Reflejos del propio juego (agua, charcos, suelos): mas pasos y mas alcance en Ultra. Cuesta algo de GPU.");
-					ChoiceRow("Desvanecido objetos", true, kReflections, kReflectionCount, s.object_fade, "Distancia a la que los objetos lejanos se desvanecen. Ultra: aparecen de golpe mucho menos.");
-					ChoiceRow("Nitidez AA", true, kAaSharp, kAaSharpCount, s.aa_sharp, "Nitidez del antialiasing del juego. No cuesta FPS.");
-					CheckRow("Filtrado x16", true, s.af16, "Filtrado anisotropico x16 en las texturas: suelos y paredes nitidos a lo lejos y en angulo. Cuesta muy poco.");
-					ChoiceRow("Texturas (nitidez)", true, kTextureSharpness, kTextureSharpnessCount, s.texture_sharpness,
-					          "Nitidez de las texturas. Nitidas: el detalle de la resolucion final con reescalado. Extra nitidas: un escalon mas (lo que recomienda NVIDIA para DLSS); mas detalle en suelos y paredes, puede brillar algo en rejas y hierba. Cuesta pocos FPS.");
-					ImGui::Spacing();
-					ImGui::TextColored(kDim, "Postprocesado del juego (marcado = como viene):");
-					CheckRow("Desenfoque de movimiento", true, s.motion_blur);
-					CheckRow("Profundidad de campo", true, s.dof);
-					CheckRow("Vineteado", true, s.vignette);
-					CheckRow("Resplandor (bloom)", true, s.bloom);
-					CheckRow("Adaptacion del ojo", true, s.eye_adapt);
-					ImGui::Spacing();
-					ChoiceRow("Bordes sombras", true, kShadowEdges, kShadowEdgeCount, s.shadow_edges,
-					          "Filtrado de los bordes de las sombras del juego (antorchas, lamparas y sol): Alta quita los dientes de sierra (casi gratis), Muy alta bordes suaves, Ultra nitida al pie y suave al alejarse (~0,5-1,5 ms). Al cambiar de nivel hay un tiron la primera vez.");
-					ChoiceRow("Sombra rincones", true, kCornerShadows, kCornerShadowCount, s.corner_shadow,
-					          "Rincones, esquinas, debajo de mesas y carros y pies mas oscuros y asentados: mas fuerza en la oclusion de Ray tracing. Necesita 'Oclusion' (Ray tracing) encendido (si no, no hace nada). Sin coste.");
+				case 2: { // Calidad grafica (the launcher's group, in its order)
+					ChoiceRow("Texturas", true, kTextureReduce, kTextureReduceCount, s.texture_reduce, "Tamaño de las texturas: Medio = la mitad, Bajo = un cuarto. Lo que más VRAM ahorra.");
+					ChoiceRow("Distancia", true, kQualities, kQualityCount, s.quality, "Distancia de dibujado: a menos nivel, los objetos lejanos pasan antes a modelos más simples. Más FPS si va justo el procesador.");
+					ChoiceRow("Sombras", true, kShadows, kShadowCount, s.shadows, "Sombras: Medio = las del sol hasta 125 m, Bajo = hasta 60 m y sin sombras de focos ni ambientales. Más FPS, pero pueden aparecer de golpe.");
+					ChoiceRow("Detalle", true, kDetails, kDetailCount, s.detail, "Detalle del juego: sombras (cascadas y distancia), iluminación de entorno y relieve (teselado). Ultra > Muy alto (modo cine) > Alto (modo rendimiento de PS5) > Normal > Bajo.");
+					ChoiceRow("Reflejos", true, kReflections, kReflectionCount, s.reflections, "Reflejos del propio juego (agua, charcos, suelos): más pasos y más alcance en Ultra. Cuesta algo de GPU.");
+					CheckRow("Filtrado anisotrópico x16", true, s.af16, "Filtrado anisotrópico x16: suelos y paredes nítidos a lo lejos y en ángulo. Cuesta muy poco.");
+					ChoiceRow("Nitidez de texturas", true, kTextureSharpness, kTextureSharpnessCount, s.texture_sharpness,
+					          "Texturas: nítidas = el detalle de la resolución final con reescalado. Extra nítidas: un escalón más (lo que recomienda NVIDIA para DLSS); puede brillar algo en rejas y hierba. Cuesta pocos FPS.");
+					ChoiceRow("Desvanecimiento de objetos", true, kReflections, kReflectionCount, s.object_fade, "Distancia a la que los objetos lejanos se desvanecen. Ultra: aparecen de golpe mucho menos.");
+					ChoiceRow("Nitidez del AA", true, kAaSharp, kAaSharpCount, s.aa_sharp, "Nitidez del antialiasing del juego. No cuesta FPS.");
+					CheckRow("Desenfoque de movimiento", true, s.motion_blur, "Desenfoque de movimiento del juego (Sí = como en PS5).");
+					CheckRow("Profundidad de campo", true, s.dof, "Desenfoque de lo lejano y de lo cercano en escenas (Sí = como en PS5).");
+					CheckRow("Viñeta", true, s.vignette, "Oscurecimiento de los bordes de la imagen (Sí = como en PS5).");
+					CheckRow("Bloom", true, s.bloom, "Resplandor alrededor de las luces fuertes (Sí = como en PS5).");
+					CheckRow("Adaptación de la vista", true, s.eye_adapt, "La exposición se adapta al pasar de zonas oscuras a claras, como el ojo (Sí = como en PS5).");
+					ImGui::TextColored(kDim, "%s", "Son ajustes internos del juego: los lee al arrancar.");
 					break;
 				}
-				case 3: { // Ray tracing
-					static const Choice yes_no[] = {{"0", "No"}, {"1", "Si"}};
-					const auto row = [&](const char* label, bool& v, const char* tip) {
-						std::string x = v ? "1" : "0";
-						if (ChoiceRow(label, true, yes_no, 2, x, tip)) v = x == "1";
+				case 3: { // Ray tracing (the launcher's rows; "Rayos de luz RT" (hwvolsh) does not exist in this engine)
+					static const Choice yes_no[] = {{"0", "No"}, {"1", "Sí"}};
+					static const Choice levels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}};
+					const Settings& l       = g_rt.launched;
+					const bool      live_ok = !l.pure_game;
+					// (10-28) Turning a launched pass off is live (PortLive::rt_off); on, or another level, needs a restart.
+					const auto restart_lvl = [&](const std::string& was, const std::string& now) {
+						const std::string a = was.empty() ? "0" : was, b = now.empty() ? "0" : now;
+						return !(a == b || (b == "0" && live_ok));
 					};
-					// (10-27b) The s25 launcher's rows: Reflejos, Sombras sol, Luces antorcha/lamparas, Luz volumetrica and
-					// "Juego original" (its rows inactive while checked, their values kept).
 					ImGui::BeginDisabled(s.pure_game);
-					row("Reflejos", s.rt_reflections, "Reflejos con trazado de rayos: refleja tambien lo que esta fuera de pantalla o tapado, con sus texturas.");
+					{
+						std::string x = s.rt_reflections ? "1" : "0";
+						if (ChoiceRow("Reflejos", restart_lvl(l.rt_reflections ? "1" : "0", x), yes_no, 2, x,
+						              "Reflejos con trazado de rayos: refleja también lo que está fuera de pantalla o tapado, con sus texturas. Apagarlo es inmediato.")) {
+							s.rt_reflections = x == "1";
+							live_changed     = true;
+						}
+					}
 					const bool sun_was = s.rt_sun;
-					row("Sombras sol", s.rt_sun, "Sombras del sol con trazado de rayos: sombras de contacto y las que faltaban.");
-					row("Luces antorcha/lamparas", s.rt_particles, "Antorchas, lamparas, fuego y magia iluminan lo que tienen cerca con trazado de rayos y sombras reales.");
-					static const Choice rays[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}};
+					{
+						std::string x = s.rt_sun ? "1" : "0";
+						if (ChoiceRow("Sombras sol", s.rt_sun != l.rt_sun, yes_no, 2, x,
+						              "Sombras del sol con trazado de rayos: sombras de contacto y las que faltaban. No se puede usar a la vez que la Luz volumétrica."))
+							s.rt_sun = x == "1";
+					}
+					{
+						std::string lamps = LampLevel(s);
+						if (ChoiceRow("Antorchas", restart_lvl(LampLevel(l), lamps), levels, 4, lamps,
+						              "Antorchas, lámparas, fuego y magia iluminan lo que tienen cerca con trazado de rayos y sombras reales. Bajo / Medio / Alto: más luces y más rayos. Apagarlo es inmediato.")) {
+							s.rt_lamps     = lamps;
+							s.rt_particles = lamps != "0";
+							live_changed   = true;
+						}
+					}
 					const std::string rays_was = s.godrays;
-					ChoiceRow("Luz volumetrica", true, rays, 4, s.godrays,
-					          "Luz volumetrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms.");
+					if (ChoiceRow("Luz volumétrica", restart_lvl(l.godrays, s.godrays), levels, 4, s.godrays,
+					              "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms. Apagarla es inmediato."))
+						live_changed = true;
 					// (vol25) Luz volumetrica and Sombras sol share the engine's sun pass: choosing one turns the other off.
 					if (s.rt_sun && !sun_was && s.godrays != "0") s.godrays = "0";
 					else if (s.godrays != "0" && s.godrays != rays_was && s.rt_sun) s.rt_sun = false;
 					ImGui::EndDisabled();
-					CheckRow("Juego original (sin efectos anadidos)", true, s.pure_game,
-					         "Apaga todos los efectos visuales que anade el emulador (ray tracing, luz volumetrica, sombras RT, brillo, oclusion, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, frame generation y latencia no cambian.");
-					ImGui::Spacing();
-					ImGui::TextColored(kDim, "Al elegir cualquier Modo Souls todo el ray tracing pasa a No (se enciende a mano despues).");
-					break;
-				}
-				case 4: { // Modos Souls
-					std::string mode = s.souls_mode;
-					if (ChoiceRow("Modo Souls", true, kSoulsModes, kSoulsModeCount, mode,
-					              "Ligero: graficas de 8 GB (RTX 3060-3070, RX 6600): 30 FPS estables y AMD x2 (60 en pantalla). Equilibrado: potencia de una RTX 3080: 45 FPS y AMD x2 (90). "
-					              "Ultra: RTX 5060-5070 Ti, RX 9070. Extremo: para enfermos de Souls (RTX 5080 / 5090). PC low profile: PCs modestos, 900p y todo en bajo. Los FPS dependen de tu GPU y tu CPU.")) {
-						s.souls_mode = mode;
-						ApplyPreset(&s, mode == "ninguno" ? std::string("maximo") : mode);
-					}
-					ImGui::Spacing();
-					ImGui::TextWrapped("Ligero: adaptado para graficas de 8 GB como RTX 3060, RTX 3060 Ti, RTX 3070, RTX 2070/2080, RX 6600: el juego a 30 FPS estables y frame generation de AMD x2 (60 en pantalla).");
-					ImGui::TextWrapped("Equilibrado: RTX 2080 Ti, 3070 Ti, 3080, 4060 Ti, 4070, RX 6800-6950, RX 7700-7800, Arc B580: 45 FPS estables y AMD x2 (90 en pantalla).");
-					ImGui::TextWrapped("Ultra: RTX 5060 / 5060 Ti / 5070 / 5070 Ti y RX 9070 / 9070 XT: todo al maximo y Detalle Muy alto.");
-					ImGui::TextWrapped("Extremo: RTX 5080, RTX 5090 o superior: Ultra en todo, filtrado x16 y texturas nitidas.");
-					ImGui::TextWrapped("PC low profile: 30 FPS reales con AMD x2, FSR Calidad (nitidez 100 %%) y todos los graficos en bajo.");
-					if (!g_rt.pc.recommended.empty()) ImGui::TextColored(kGold, "Recomendado para tu grafica: %s", g_rt.pc.recommended.c_str());
+					if (CheckRow("Juego original (sin efectos añadidos)", s.pure_game != l.pure_game, s.pure_game,
+					             "Apaga todos los efectos visuales que añade el emulador (ray tracing, luz volumétrica, sombras RT, brillo, oclusión, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, frame generation y latencia no cambian."))
+						live_changed = true;
 					break;
 				}
 				case 5: { // Pantalla y otros
@@ -1055,36 +1171,6 @@ void Draw(float width, float height) {
 						static const Choice modes[] = {{"1", "Pantalla completa"}, {"0", "Ventana"}};
 						std::string mode = s.fullscreen ? "1" : "0";
 						if (ChoiceRow("Modo de pantalla", true, modes, 2, mode, "Pantalla completa o ventana (F11 lo cambia en vivo).")) s.fullscreen = mode == "1";
-						static const char* sizes[] = {"1280x720", "1600x900", "1920x1080", "2560x1080", "2560x1440", "3440x1440", "3840x1600", "3840x2160"};
-						static std::vector<std::string> ids, labels;
-						ids.clear();
-						labels.clear();
-						if (s.fullscreen) {
-							ids.emplace_back("escritorio");
-							labels.emplace_back(std::string(I18n::T("Escritorio")) +
-							                    (g_rt.pc.screen_h > 0 ? " (" + std::to_string(g_rt.pc.screen_h) + "p)" : std::string()));
-						}
-						for (const char* z: sizes) {
-							ids.emplace_back(z);
-							labels.emplace_back(z);
-						}
-						std::string value = s.fullscreen ? s.resolution : std::to_string(s.width) + "x" + std::to_string(s.height);
-						if (std::find(ids.begin(), ids.end(), value) == ids.end()) {
-							ids.push_back(value);
-							labels.push_back(value);
-						}
-						std::vector<Choice> res;
-						for (size_t i = 0; i < ids.size(); i++) res.push_back({ids[i].c_str(), labels[i].c_str()});
-						if (ChoiceRow("Resolucion", true, res.data(), static_cast<int>(res.size()), value,
-						              s.fullscreen ? "Resolucion de salida en pantalla completa. Escritorio: la de Windows. Otra: el monitor cambia a ella mientras juegas."
-						                           : "Tamano de la ventana.")) {
-							if (s.fullscreen) {
-								s.resolution = value;
-							} else if (int w = 0, h = 0; std::sscanf(value.c_str(), "%dx%d", &w, &h) == 2) {
-								s.width  = w;
-								s.height = h;
-							}
-						}
 					}
 					CheckRow("HDR", true, s.hdr, "HDR10: activa antes \"Usar HDR\" en la configuracion de pantalla de Windows");
 					CheckRow("VSync", true, s.vsync, "VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando");
@@ -1121,34 +1207,99 @@ void Draw(float width, float height) {
 					ImGui::TextColored(kDim, "%s", g_start_mode ? "Se cambia abajo (Cambiar...)." : "Se cambia en el menu de inicio, antes del juego.");
 					break;
 				}
-				case 6: { // Rendimiento / PC
-					// (10-27b) The 16 GB profile only on a PC of 20 GB of RAM or less (or simulated): fixed on there, off and
-					// inactive on the others (as the launcher's Update-LowRam).
-					const bool low = LowRam(s, g_rt.pc);
-					bool       p16 = low;
-					s.profile16    = low;
-					ImGui::BeginDisabled(true);
-					CheckRow("Optimizacion equipos 16 GB RAM", true, p16,
-					         "Solo aplica el perfil de memoria de 16 GB en PCs reales de 20 GB de RAM o menos, o con \"Simular 16 GB RAM\". No cambia los graficos.");
+				case 6: { // Sistema
+					// (10-28) The Configurador again: the detected hardware and "Optimizar según tu equipo".
+					if (ImGui::Button("Configurador", {420 * unit, 56 * unit})) {
+						g_cfg_open = true;
+						g_cfg_why.clear();
+					}
+					if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) {
+						g_desc_title = "Configurador";
+						g_desc_text  = "Muestra tu gráfica, procesador, RAM y monitor, y elige los ajustes con mejor rendimiento para tu equipo.";
+					}
+					ImGui::Spacing();
+					// (10-28) Mejoras para equipos de 16 GB de RAM: the launcher's 16 GB profile + RAM flush, on PCs of 20 GB or less.
+					const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
+					ImGui::BeginDisabled(!small);
+					CheckRow("Mejoras para equipos de 16 GB de RAM", s.ram16_boost != g_rt.launched.ram16_boost, s.ram16_boost,
+					         "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria) y vaciado de RAM cada 5 s (devuelve a Windows hasta 2 GB que el emulador puede rehacer y la que el juego ya soltó). Solo en PCs de 20 GB de RAM o menos. No cambia los gráficos.");
 					ImGui::EndDisabled();
-					if (low) ImGui::TextColored(kGold, "RAM %s: perfil seguro. Cierra navegadores", s.simulate_ram16 ? "16 GB (simulado)" : (std::to_string(g_rt.pc.ram_gb) + " GB").c_str());
-					else ImGui::TextColored(kDim, "RAM %d GB: sin perfil de 16 GB (solo en PCs de 20 GB o menos).", g_rt.pc.ram_gb);
-					// (10-27b) "Simular 16 GB RAM" / "Simular grafica 8 GB" (the launcher's tests) are not shown: settings.ini only.
-					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para graficas que se cuelgan o dan pantallazo azul: mas estable, ~37% menos FPS");
-					CheckRow("Usar todos los CCD (Ryzen de dos CCD)", true, s.all_ccds);
+					s.profile16 = LowRam(s, g_rt.pc);
+					if (!small) ImGui::TextColored(kDim, "RAM %d GB: no hacen falta (solo en PCs de 20 GB o menos).", g_rt.pc.ram_gb);
+					else if (s.ram16_boost) ImGui::TextColored(kGold, "RAM %s: mejoras activadas. Cierra los navegadores mientras juegas.", s.simulate_ram16 ? "16 GB (simulado)" : (std::to_string(g_rt.pc.ram_gb) + " GB").c_str());
+					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para gráficas que se cuelgan o dan pantallazo azul: más estable, ~37% menos FPS.");
+					CheckRow("Usar todos los CCD (Ryzen de dos CCD)", true, s.all_ccds, "Ryzen de dos CCD: No = el juego en el CCD con más caché L3 (más rápido); Sí = todos los núcleos.");
 					break;
 				}
-				case 7: { // Controles
-					CheckRow("Teclado y raton", true, s.kbm, "Jugar con teclado y raton: WASD para moverse, el raton mueve la camara, clic izquierdo R1, clic derecho L1, rueda o clic central fija objetivo. Las teclas: mapa_teclado en settings.ini. F7: solo el raton en vivo");
+				case 7: { // Controles (the launcher's "Controles" and "Mapear mando")
+					const Settings& l = g_rt.launched;
+					CheckRow("Teclado y ratón", s.kbm != l.kbm, s.kbm,
+					         "Jugar con teclado y ratón: WASD para moverse, el ratón mueve la cámara, clic izquierdo R1, clic derecho L1, rueda o clic central fija objetivo. F7 suelta o captura el ratón. Con él activo la cámara gira sin la aceleración del juego, también con el stick derecho del mando: si juegas con mando, déjalo desactivado.");
 					ImGui::BeginDisabled(!s.kbm);
-					SliderRow("Sensibilidad", s.kbm_sens, 0.1f, 5.0f, "%.2f", "Cuánto gira la cámara por cada movimiento del ratón (1.00 = normal).");
-					SliderRow("Antizona muerta", s.kbm_antidz, 0.0f, 0.6f, "%.2f",
+					const auto restart_note = [&](bool changed) {
+						if (changed) ImGui::TextColored(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}, "%s", "   (requiere reinicio)");
+					};
+					SliderRow("Sensibilidad del ratón", s.kbm_sens, 0.05f, 4.0f, "%.2f", "Cuánto gira la cámara por cada movimiento del ratón (1.00 = normal).");
+					restart_note(s.kbm_sens != l.kbm_sens);
+					SliderRow("Antizona muerta", s.kbm_antidz, 0.0f, 0.5f, "%.2f",
 					          "Salta la zona muerta del stick del juego: con más, un movimiento pequeño del ratón ya gira la cámara. Si la cámara se mueve sola, bájalo.");
+					restart_note(s.kbm_antidz != l.kbm_antidz);
+					{
+						float cam = static_cast<float>(s.kbm_camera);
+						if (SliderRow("Velocidad de cámara (ratón)", cam, 5.0f, 15.0f, "%.0f",
+						              "La velocidad máxima de giro de la cámara del juego con teclado y ratón. 10 = el máximo del menú del juego. 11-15 (extra, experimental): más rápido que el menú; si la cámara hace cosas raras, vuelve a 10. Sin teclado y ratón se usa la del menú del juego."))
+							s.kbm_camera = std::clamp(static_cast<int>(std::lround(cam)), 5, 15);
+						restart_note(s.kbm_camera != l.kbm_camera);
+					}
+					CheckRow("Cámara instantánea (frame warp)", s.kbm_warp != l.kbm_warp, s.kbm_warp,
+					         "La imagen gira con el ratón antes de que el juego dibuje el siguiente fotograma: la cámara responde al instante.");
+					{
+						std::string cal = s.kbm_calibrate ? "1" : "0";
+						static const Choice cal_items[] = {{"0", "No"}, {"1", "En el próximo inicio"}};
+						if (ChoiceRow("Calibrar cámara (kbm_curve)", s.kbm_calibrate, cal_items, 2, cal,
+						              "Mide cómo gira la cámara del juego para que el ratón la mueva exactamente lo que se mueve (se guarda en kbm_curve.txt; una vez basta). Al iniciar: carga tu partida, quédate quieto en un sitio abierto sin tocar el ratón ni el stick; a los 3 s la cámara gira sola unos 13 s. Necesita un reescalador o frame generation."))
+							s.kbm_calibrate = cal == "1";
+					}
 					ImGui::EndDisabled();
-					if (CheckRow("Vibracion", false, s.rumble)) live_changed = true;
-					if (SliderRow("Fuerza de la vibracion", s.rumble_gain, 1.0f, 8.0f, "%.1f", "Fuerza de la vibración del mando (en vivo).")) live_changed = true;
-					if (!s.pad_map.empty()) ImGui::TextColored(kDim, "Mando remapeado (mapa_mando en settings.ini).");
-					ImGui::TextColored(kDim, "F8: metricas.  F11 / Alt+Enter: pantalla completa.");
+					ImGui::Spacing();
+					if (CheckRow("Vibración", false, s.rumble, "Vibración del mando (en vivo).")) live_changed = true;
+					if (SliderRow("Fuerza de la vibración", s.rumble_gain, 1.0f, 8.0f, "%.1f", "Fuerza de la vibración del mando (en vivo).")) live_changed = true;
+					ImGui::Spacing();
+					ImGui::TextColored(kDim, "%s", s.pad_map.empty() ? "Mando: botones de serie (mapa_mando en settings.ini para cambiarlos)." : "Mando: remapeado (mapa_mando en settings.ini).");
+					// (10-28) The key bindings (the launcher's "Mapear mando" > Teclado y ratón), read only.
+					if (ImGui::CollapsingHeader("Teclas (teclado y ratón)")) {
+						static const char* kDefault =
+						    "LeftStickUp=W;LeftStickDown=S;LeftStickLeft=A;LeftStickRight=D;Walk=Left Ctrl;R1=Mouse:Left;L1=Mouse:Right;R2=Shift+Mouse:Left;L2=Shift+Mouse:Right;R3=Mouse:Middle;R3=Mouse:WheelUp;R3=Mouse:WheelDown;Circle=Space;Square=E;Cross=F;Triangle=G;Left=Q;Right=R;Up=1;Down=2;Left=3;Right=4;Options=Tab;TouchPad=Backspace";
+						static const std::pair<const char*, const char*> names[] = {
+						    {"LeftStickUp", "Avanzar"}, {"LeftStickDown", "Retroceder"}, {"LeftStickLeft", "Izquierda"}, {"LeftStickRight", "Derecha"},
+						    {"Walk", "Caminar"}, {"R1", "R1 (ataque)"}, {"L1", "L1 (bloquear)"}, {"R2", "R2 (ataque fuerte)"}, {"L2", "L2 (parada)"},
+						    {"R3", "R3 (fijar objetivo)"}, {"Circle", "Círculo (rodar / correr)"}, {"Square", "Cuadrado (objeto)"}, {"Cross", "Cruz (acción)"},
+						    {"Triangle", "Triángulo (cambiar agarre)"}, {"Left", "Izquierda cruceta"}, {"Right", "Derecha cruceta"}, {"Up", "Arriba cruceta"},
+						    {"Down", "Abajo cruceta"}, {"Options", "Menú"}, {"TouchPad", "Panel táctil"}};
+						const std::string map = s.kbm_map.empty() ? std::string(kDefault) : s.kbm_map;
+						if (ImGui::BeginTable("##keys", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+							size_t at = 0;
+							while (at <= map.size()) {
+								const size_t end = std::min(map.find(';', at), map.size());
+								const std::string item = map.substr(at, end - at);
+								at = end + 1;
+								const size_t eq = item.find('=');
+								if (eq == std::string::npos) continue;
+								const std::string c = item.substr(0, eq);
+								std::string        shown = c;
+								for (const auto& [k, v]: names)
+									if (c == k) shown = v;
+								ImGui::TableNextRow();
+								ImGui::TableSetColumnIndex(0);
+								ImGui::TextUnformatted(shown.c_str());
+								ImGui::TableSetColumnIndex(1);
+								ImGui::TextColored(kGold, "%s", item.substr(eq + 1).c_str());
+							}
+							ImGui::EndTable();
+						}
+						ImGui::TextColored(kDim, "%s", "Las teclas se cambian en mapa_teclado (settings.ini) o con \"Mapear mando\" del lanzador.");
+					}
+					ImGui::TextColored(kDim, "%s", "F7: soltar o capturar el ratón.  F8: métricas.  F11 / Alt+Intro: pantalla completa.");
 					break;
 				}
 				case 8: DrawPcTab(unit); break; // Tu equipo (Añadir a Steam)
@@ -1165,7 +1316,7 @@ void Draw(float width, float height) {
 			ImGui::PopFont();
 			ImGui::Separator();
 			ImGui::PushTextWrapPos(0.0f);
-			ImGui::TextUnformatted(g_desc_text.empty() ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: siguiente valor.\nLB / RB o Q / E: cambiar de pestaña.\nB / Esc: volver al juego.\n\n* = necesita reiniciar el juego."
+			ImGui::TextUnformatted(g_desc_text.empty() ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: siguiente valor.\nLB / RB o Q / E: cambiar de pestaña.\nB / Esc: volver al juego.\n\n(requiere reinicio): se guarda ya y se aplica en el próximo inicio. El resto se aplica al momento."
 			                                           : g_desc_text.c_str());
 			ImGui::PopTextWrapPos();
 			ImGui::EndChild();
@@ -1240,9 +1391,9 @@ void Draw(float width, float height) {
 		ImGui::SameLine();
 		if (ImGui::Button(I18n::T("Salir"), {bw * 0.6f, bh})) g_start_result = -1;
 	} else {
-	const bool needs = NeedsRestart(g_rt.launched, s);
-	if (needs) ImGui::TextColored(kWarn, "* Hay cambios que necesitan reiniciar el juego (guarda antes en una hoguera / al salir).");
-	else ImGui::TextColored(kDim, "%s", g_status.empty() ? "* = necesita reiniciar.   B / Círculo / Esc: volver al juego (sin aplicar).   LB / RB, Q / E: pestañas." : g_status.c_str());
+	const bool needs = NeedsRestartLive(g_rt.launched, s);
+	if (needs) ImGui::TextColored(kWarn, "Hay cambios \"(requiere reinicio)\": se aplican la próxima vez que inicies el juego (o pulsa Reiniciar ahora).");
+	else ImGui::TextColored(kDim, "%s", g_status.empty() ? "B / Círculo / Esc: volver al juego (sin aplicar).   LB / RB, Q / E: pestañas." : g_status.c_str());
 	const float bw = 220 * unit, bh = 52 * unit;
 	if (ImGui::Button("Aplicar", {bw, bh})) {
 		Save();
@@ -1256,6 +1407,7 @@ void Draw(float width, float height) {
 		d.menu_language     = s.menu_language;
 		d.language          = s.language;
 		d.game_language_set = s.game_language_set;
+		d.configured        = true;
 		s                   = d;
 		g_status            = "Valores por defecto (pulsa Aplicar para guardarlos).";
 	}
@@ -1275,6 +1427,7 @@ void Draw(float width, float height) {
 	ImGui::SameLine();
 	if (ImGui::Button(I18n::T("Salir del juego"), {bw, bh})) RequestQuit();
 	}
+	} // (10-28) not the Configurador
 	ImGui::End();
 	// (11 colours and 4 variables pushed above; 13 popped before 10-27b: Dear ImGui's "PopStyleColor() too many times".)
 	if (ctx.ColorStack.Size > colors_before) ImGui::PopStyleColor(ctx.ColorStack.Size - colors_before);
@@ -1457,6 +1610,15 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	(void)settings;
 	return true;
 #endif
+}
+
+void RunConfigurator(const Runtime& runtime, Settings* settings) {
+	// (10-28) The start menu's window and loop, showing the Configurador page only.
+	g_config_mode = true;
+	g_cfg_why.clear();
+	RunStartMenu(runtime, settings);
+	g_config_mode = false;
+	g_cfg_why.clear();
 }
 
 } // namespace Port

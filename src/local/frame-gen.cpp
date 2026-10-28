@@ -9118,7 +9118,11 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	};
 	// (KYTY_RT_FLICKER: each RT pass's contribution checked frame to frame with the camera still, rt-flicker.cpp)
 	RtFlicker::BeginFrame(inputs);
+	const int  rt_off = PortLive::rt_off.load(std::memory_order_relaxed); // (10-28) the port's menu: passes off live
 	const auto probed = [&](RtFlicker::Pass pass, const char* name, auto&& apply) {
+		if (((rt_off & 1) != 0 && pass == RtFlicker::Reflections) || ((rt_off & 2) != 0 && (pass == RtFlicker::Lights || pass == RtFlicker::Particles)) ||
+		    ((rt_off & 4) != 0 && pass == RtFlicker::Volumetric))
+			return;
 		const UpscaleImage before = inputs.color;
 		if (TimedPass(name, apply)) RtFlicker::Probe(command, inputs.graphics, pass, before, inputs.color);
 	};

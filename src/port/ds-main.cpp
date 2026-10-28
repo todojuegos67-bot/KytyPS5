@@ -184,7 +184,31 @@ Port::PcInfo DetectPc() {
 	if (GlobalMemoryStatusEx(&m)) pc.ram_gb = static_cast<int>(std::llround(static_cast<double>(m.ullTotalPhys) / (1024.0 * 1024.0 * 1024.0)));
 	DEVMODEW mode {};
 	mode.dmSize = sizeof(mode);
-	if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode)) pc.screen_h = static_cast<int>(mode.dmPelsHeight);
+	if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode)) {
+		pc.screen_h   = static_cast<int>(mode.dmPelsHeight);
+		pc.screen_w   = static_cast<int>(mode.dmPelsWidth);
+		pc.refresh_hz = static_cast<int>(mode.dmDisplayFrequency);
+	}
+	// (10-28) Cores and threads (the Configurador).
+	{
+		DWORD len = 0;
+		GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+		std::vector<char> buf(len);
+		if (len > 0 && GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) {
+			for (DWORD at = 0; at < len;) {
+				const auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + at);
+				pc.cpu_cores++;
+				for (WORD g = 0; g < info->Processor.GroupCount; g++) {
+					KAFFINITY m2 = info->Processor.GroupMask[g].Mask;
+					while (m2 != 0) {
+						pc.cpu_threads += static_cast<int>(m2 & 1);
+						m2 >>= 1;
+					}
+				}
+				at += info->Size;
+			}
+		}
+	}
 	Port::RecommendFor(&pc);
 	return pc;
 }
@@ -815,7 +839,24 @@ int main(int argc, char* argv[]) {
 		}
 	}
 
+	// (10-28) The Configurador at the first start (configurado=0 in settings.ini); later from F1 > Sistema.
+	if (!settings.configured) {
+		Port::Runtime cfg_rt = make_runtime(Port::BuildLaunch(settings, param.title_id, pc));
+		Port::CloseSplash();
+		Port::RunConfigurator(cfg_rt, &settings);
+		settings.configured = true;
+		Port::SaveSettings(ini, settings);
+		ShowSplash(image);
+		SplashStatus("Iniciando...");
+	}
+
 	Port::LaunchPlan plan = Port::BuildLaunch(settings, param.title_id, pc);
+	// (10-28) "Calibrar cámara" runs once.
+	if (settings.kbm_calibrate) {
+		Port::Settings next = settings;
+		next.kbm_calibrate  = false;
+		Port::SaveSettings(ini, next);
+	}
 	for (const auto& note: plan.notes) std::printf("[port] %s\n", note.c_str());
 
 	for (auto& [key, value]: plan.env) {

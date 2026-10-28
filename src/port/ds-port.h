@@ -40,6 +40,9 @@ void RequestQuit();
 // fondo-souls.jpg, with Jugar / Actualizar version / Volver a la version anterior / Salir; the static shader precompile
 // with its progress bar). `settings` gets what was chosen (saved to settings.ini). False: Salir.
 bool RunStartMenu(const Runtime& runtime, Settings* settings);
+// (10-28) The Configurador before the game (first start): the detected hardware, "Optimizar según tu equipo" and
+// "Continuar". `settings` gets the result (saved to settings.ini, configurado=1).
+void RunConfigurator(const Runtime& runtime, Settings* settings);
 
 } // namespace Port
 

@@ -116,6 +116,8 @@ struct Settings {
 	// (10-27b, the s25 launcher) Only Reflejos, Sombras sol and Luces antorcha/lamparas (rt_particles) are offered and passed;
 	// rt_fog / rt_metal / rt_ao stay in settings.ini but are never passed.
 	bool        rt_reflections = false, rt_sun = false, rt_fog = false, rt_particles = false, rt_metal = false, rt_ao = false;
+	// (10-28) Antorchas (the launcher's hwlamp4): 0 No, 1 Bajo, 2 Medio, 3 Alto (KYTY_HWRT_LIGHTS level, with the RT particles).
+	std::string rt_lamps = "";       // empty: from rt_particles (an older settings.ini: Si = 2)
 	std::string godrays = "0";       // Luz volumetrica: 0 No, 1 Bajo, 2 Medio, 3 Alto (KYTY_GODRAYS + the hidden RT sun pass)
 	bool        pure_game = false;   // Juego original: every visual pass the emulator adds off
 	std::string shadow_edges = "0";  // Bordes sombras: 0 Normal, 1 Alta, 2 Muy alta, 3 Ultra (KYTY_SHADOW_FILTER)
@@ -131,6 +133,12 @@ struct Settings {
 	float       kbm_antidz = 0.15f;  // KYTY_KBM_ANTIDZ
 	std::string kbm_map;             // KYTY_KBM_MAP
 	std::string pad_map;             // KYTY_PAD_MAP
+	int         kbm_camera = 10;     // (10-28) cp11_Setting_CameraSpeed with keyboard and mouse (5-15; the launcher's kbmcam2)
+	bool        kbm_warp = false;    // (10-28) Camara instantanea (frame warp): KYTY_KBM_WARP
+	bool        kbm_calibrate = false; // (10-28) the next start measures the camera into kbm_curve.txt (KYTY_KBM_CALIBRATE), once
+	// [Configurador] (10-28)
+	bool        configured = false;  // the first-start dialog has been shown
+	bool        ram16_boost = true;  // Mejoras para equipos de 16 GB de RAM: the 16 GB profile + the RAM flush (PCs of 20 GB or less)
 	// [Interfaz]
 	std::string metrics = "0"; // KYTY_FPS_HUD 0/1/2
 	bool        start_menu = true; // (10-27b) menu_inicio: the launcher-style menu before the game
@@ -161,6 +169,8 @@ struct PcInfo {
 	std::string cpu;
 	int         ram_gb = 0;
 	int         screen_h = 0; // the monitor's real height (FSR 900p)
+	int         screen_w = 0, refresh_hz = 0; // (10-28) the monitor's width and refresh rate
+	int         cpu_cores = 0, cpu_threads = 0; // (10-28)
 	bool        nvidia = true, amd = false;
 	std::string recommended, expected; // the launcher's graphics card table ($gpuDb)
 	bool        unsupported = false;
@@ -171,6 +181,16 @@ bool LowRam(const Settings& settings, const PcInfo& pc);
 
 // `title_id` from sce_sys/param.json (empty: unknown, the Demon's Souls engine settings still apply: this is its port).
 LaunchPlan BuildLaunch(const Settings& settings, const std::string& title_id, const PcInfo& pc = {});
+
+// (10-28) The Configurador: the best settings for this PC from the hardware-tier table (ds-settings.cpp, calibrated
+// on an RTX 5080 + Ryzen 9 9950X3D at 4K). Writes only graphics, ray tracing and the RAM option into `settings`;
+// returns the explanation lines ("Hemos elegido: ...").
+std::vector<std::string> Optimize(const PcInfo& pc, Settings* settings);
+// Ray tracing rows (Reflejos, Antorchas, Luz volumetrica) turned off in the menu are applied live (PortLive::rt_off);
+// turning them on, or anything else, needs a restart.
+int  LiveRtOff(const Settings& launched, const Settings& now); // the PortLive::rt_off mask
+// (The Antorchas level: rt_lamps, or rt_particles of an older settings.ini.)
+std::string LampLevel(const Settings& settings);
 
 // Settings whose change needs a restart (everything the menu does not apply live).
 bool NeedsRestart(const Settings& launched, const Settings& now);
