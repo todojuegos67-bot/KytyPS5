@@ -136,7 +136,7 @@ constexpr uint32_t CalibWet      = CalibFloors + 2; // puddle guess: count + 16 
 constexpr uint32_t CalibHist     = 300;             // 16 byte fields x 16 bins
 constexpr uint32_t StatsIndex    = 560;
 constexpr uint32_t StatsCount    = 40; // (refl-pro: 34..39)
-constexpr uint32_t FlashIndex    = 1440, FlashCount = 33; // (ds-rt-refl-1027: 23..32 the "other" split, the hold's reach) // (refl-pro: RTFLASH + the material check, the shader's FLASH) // (refl10: 30..32 why rays miss, 33 the composite's mirror rays)
+constexpr uint32_t FlashIndex    = 1440, FlashCount = 40; // (ds-rt-refl2-1027: 33..39 colour outliers by cause) // (ds-rt-refl-1027: 23..32 the "other" split, the hold's reach) // (refl-pro: RTFLASH + the material check, the shader's FLASH) // (refl10: 30..32 why rays miss, 33 the composite's mirror rays)
 // (refl9) The metal survey (the shader's SURVEY, mode 8; never cleared): static / moving sample counts, set-bit counts
 // per class x layer x bit, byte histograms per class x field x 16 bins.
 constexpr uint32_t SurveyIndex   = 600;
@@ -244,6 +244,7 @@ struct RtPass {
 	// The periodic line (every 10 s): the stats counters' last values and the sums since the last line.
 	std::array<uint32_t, StatsCount> stat_last {};
 	std::array<uint64_t, StatsCount> stat_sum {};
+	bool                             guide_rejected = false; // (ds-rt-refl2-1027)
 	uint64_t                         flash_sum[FlashCount] {};
 	uint32_t                         flash_last[FlashCount] {};
 	uint64_t                stat_frames = 0, stat_gbuf_frames = 0, stat_copies0 = 0;
@@ -848,6 +849,12 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		            "blend %.1f%%, rest %.1f%%; held %.1f%% of the samples, drifting \"still\" samples (mv >= 1 px, not in the flash counts) %llu (same surface %llu), flashes on held "
 		            "samples %.1f%%, hit <-> miss not held %.1f%%\n",
 		            pf(23), pf(24), pf(25), pf(26), pf(27), 100.0 * f[28] / ev2, static_cast<unsigned long long>(f[29]), static_cast<unsigned long long>(f[30]), pf(31), pf(32));
+		// (ds-rt-refl2-1027) colour outliers (every frame, 1 trace pixel in 16), by cause
+		const double on = static_cast<double>(std::max<uint64_t>(f[39], 1));
+		std::printf("RTFLASH: colour outliers: %llu samples; NaN/Inf sample %.3f%%, NaN history %.3f%%, luma firefly cut %.3f%%, chroma "
+		            "outlier cut (vs the 3x3) %.3f%%, saturation cap %.3f%%, disocclusion cut %.3f%%; guide %s\n",
+		            static_cast<unsigned long long>(f[39]), 100.0 * f[33] / on, 100.0 * f[34] / on, 100.0 * f[35] / on,
+		            100.0 * f[36] / on, 100.0 * f[37] / on, 100.0 * f[38] / on, g_rt.guide_rejected ? "rejected (no confidence)" : "in use");
 		for (auto& v: g_rt.flash_sum) v = 0;
 	}
 	if (!passes.empty()) std::printf("RT reflections: GPU ms per pass (%s): %s\n", Cfg(level).name, passes.c_str());
@@ -865,6 +872,16 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		            sm[22] / 1000.0 / px, pc(24), static_cast<unsigned long long>(g_rt.stat_guide_frames),
 		            static_cast<unsigned long long>(g_rt.stat_frames), gl.extent.width, gl.extent.height,
 		            static_cast<unsigned long long>(gl.cs), gl.slot, producer, RtReflGuideStatus());
+		// (ds-rt-refl2-1027) a guide whose confidence is ~0 for a whole window is not the game's SSR (the wrong slot: the
+		// 1028 logs, CS 9fb5cc274b5e4f82 slot 5, confidence 0.000 in every line) - its mask spread over half the screen:
+		// dropped for the session (KYTY_RT_REFLECTIONS_GUIDE_KEEP=1 keeps it)
+		static const bool keep = [] { const char* e = std::getenv("KYTY_RT_REFLECTIONS_GUIDE_KEEP"); return e != nullptr && *e == '1'; }();
+		if (!keep && !g_rt.guide_rejected && g_rt.stat_guide_frames >= 300 && sm[22] / 1000.0 / px < 0.002 && pc(20) < 0.05) {
+			g_rt.guide_rejected = true;
+			std::printf("RT reflections: guide rejected: CS %016llx slot %d gave confidence %.4f over %llu frames (not the game's SSR); "
+			            "the material / roughness path from now on\n",
+			            static_cast<unsigned long long>(gl.cs), gl.slot, sm[22] / 1000.0 / px, static_cast<unsigned long long>(g_rt.stat_guide_frames));
+		}
 	}
 	std::fflush(stdout);
 	g_rt.stage_ms.fill(0.0);
@@ -1226,7 +1243,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// (refl8) The game's own SSR result (the guide), taken in this flip or the last.
 	const bool  guide_mode = RtReflGuideWanted();
 	RtReflGuide guide;
-	const bool  have_guide = guide_mode && RtReflGetGuide(guide) && guide.view != nullptr;
+	const bool  have_guide = guide_mode && !g_rt.guide_rejected && RtReflGetGuide(guide) && guide.view != nullptr;
 	if (have_guide) g_rt.guide_last = guide;
 	g_rt.have_guide = have_guide;
 	ReadStats(*graphics, have_gbuf, level);
