@@ -531,6 +531,10 @@ void Temporal(ivec2 pixel) {
 #else
 	float a_min = push.misc.z >= 3 ? 0.08 : 0.1;
 #endif
+	// (ds-rt-shadow 10-28) camera still >= 4 frames (bit 32): a long average (~50 frames) and a wider box: the TAA jitter
+	// moves each pixel's reconstructed point every frame, which alone flickered the edges (RTFLICKER sun 4 %)
+	bool still = (push.misc.w & 32) != 0;
+	if (still) a_min = 0.02;
 	float count = 1.0;
 	float res   = mix(m1, cur, 0.5);
 	vec2  puv   = uv + textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();
@@ -541,10 +545,10 @@ void Temporal(ivec2 pixel) {
 		float ptol = 0.04 * g.w + 1.5 * slope + 0.15;
 		if (pg.w < 1e5 && abs(pg.w - g.w) < ptol && dot(pg.xyz, g.xyz) > mix(0.9, 0.7, far_k)) {
 			float pc    = textureLod(aux_tex, puv, 0).x;
-			count       = min(max(pc, 1.0) + 1.0, 32.0);
+			count       = min(max(pc, 1.0) + 1.0, still ? 64.0 : 32.0);
 			float alpha = max(1.0 / count, a_min);
 			// (A tighter box than before (2.5 sigma + 0.05): a moved occluder's old shadow does not linger.)
-			float k     = mix(1.0, 2.0, clamp(count / 16.0, 0.0, 1.0));
+			float k     = still ? 3.0 : mix(1.0, 2.0, clamp(count / 16.0, 0.0, 1.0));
 			float hist  = clamp(textureLod(src_b, puv, 0).r, m1 - k * sigma - 0.03, m1 + k * sigma + 0.03);
 			res         = mix(hist, cur, alpha);
 #ifdef KYTY_HWRT_SHADOW

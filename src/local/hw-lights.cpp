@@ -519,7 +519,7 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 
 	static const float strength = EnvFloat("KYTY_HWRT_LIGHTS_STRENGTH", 1.0f, 0.0f, 2.0f);
 	static const float max_dark = EnvFloat("KYTY_HWRT_LIGHTS_MAX", 0.85f, 0.0f, 0.95f);
-	static const float ambient  = EnvFloat("KYTY_HWRT_LIGHTS_AMBIENT", 0.5f, 0.001f, 100.0f);
+	static const float ambient  = EnvFloat("KYTY_HWRT_LIGHTS_AMBIENT", 0.05f, 0.001f, 100.0f) /* (ds-rt-shadow 10-28: 0.5 left W > 0 on 3.8 % of pixels but none over the 3 % share to trace: nothing darkened) */;
 	static const float soft     = EnvFloat("KYTY_HWRT_LIGHTS_SOFT", 0.12f, 0.0f, 2.0f);
 	static const float skip     = EnvFloat("KYTY_HWRT_LIGHTS_SKIP", 0.3f, 0.0f, 5.0f);
 	static const float max_dist = EnvFloat("KYTY_HWRT_LIGHTS_DIST", 60.0f, 5.0f, 500.0f);
