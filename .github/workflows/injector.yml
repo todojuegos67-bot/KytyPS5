@@ -1,0 +1,87 @@
+name: Build injector (Windows)
+
+# The generic frame injector (branches injector-*): builds vulkan-1.dll (our proxy), InjectorSetup.exe, packages them
+# with DXVK's official x64 d3d11.dll / dxgi.dll and AMD's signed amd_fidelityfx_vk.dll (FidelityFX SDK v1.1.4), and
+# makes a DRAFT release (never published by this workflow). The asset id and md5s go out as annotations.
+on:
+  push:
+    branches: [ 'injector-*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies (fixed tags, official sources only)
+        shell: pwsh
+        run: |
+          git clone -q --depth 1 -b v1.3.290 https://github.com/KhronosGroup/Vulkan-Headers third_party/Vulkan-Headers
+          git clone -q --depth 1 -b v1.91.0 https://github.com/ocornut/imgui third_party/imgui
+          New-Item -ItemType Directory -Force deps | Out-Null
+          $ffx = 'https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v1.1.4'
+          Invoke-WebRequest "$ffx/PrebuiltSignedDLL/amd_fidelityfx_vk.dll" -OutFile deps/amd_fidelityfx_vk.dll
+          Invoke-WebRequest "$ffx/LICENSE.txt" -OutFile deps/FidelityFX-LICENSE.txt
+          Invoke-WebRequest 'https://github.com/doitsujin/dxvk/releases/download/v2.6.1/dxvk-2.6.1.tar.gz' -OutFile deps/dxvk.tar.gz
+          tar -xzf deps/dxvk.tar.gz -C deps
+          Get-ChildItem deps -Recurse -File | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.FullName }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Exports check
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" >nul
+          dumpbin /exports build\Release\vulkan-1.dll | findstr vk
+
+      - name: Package
+        id: pkg
+        shell: pwsh
+        run: |
+          $name = "Injector-$((Get-Date).ToUniversalTime().ToString('yyyyMMdd'))-$($env:GITHUB_SHA.Substring(0, 8))"
+          $root = "out/$name"
+          New-Item -ItemType Directory -Force "$root/payload", "$root/licenses" | Out-Null
+          Copy-Item build/Release/InjectorSetup.exe $root/
+          Copy-Item build/Release/vulkan-1.dll "$root/payload/"
+          Copy-Item deps/dxvk-2.6.1/x64/d3d11.dll, deps/dxvk-2.6.1/x64/dxgi.dll "$root/payload/"
+          Copy-Item deps/amd_fidelityfx_vk.dll "$root/payload/"
+          Copy-Item payload/dxvk.conf, payload/injector.ini "$root/payload/"
+          Copy-Item deps/FidelityFX-LICENSE.txt "$root/licenses/"
+          Copy-Item deps/dxvk-2.6.1/LICENSE -Destination "$root/licenses/DXVK-LICENSE.txt" -ErrorAction SilentlyContinue
+          Copy-Item third_party/imgui/LICENSE.txt "$root/licenses/imgui-LICENSE.txt"
+          Copy-Item README.md "$root/README.md"
+          $lines = Get-ChildItem $root -Recurse -File | ForEach-Object {
+            $md5 = (Get-FileHash $_.FullName -Algorithm MD5).Hash.ToLowerInvariant()
+            "$md5  $($_.FullName.Substring((Resolve-Path $root).Path.Length + 1))" }
+          $lines | Set-Content "$root/MD5SUMS.txt"
+          $lines
+          Compress-Archive -Path $root -DestinationPath "out/$name.zip"
+          $zipmd5 = (Get-FileHash "out/$name.zip" -Algorithm MD5).Hash.ToLowerInvariant()
+          "zip md5 $zipmd5"
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "zipmd5=$zipmd5" >> $env:GITHUB_OUTPUT
+          foreach ($l in $lines) { "::notice title=md5::$l" }
+
+      - name: Draft release (never published)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $name = '${{ steps.pkg.outputs.name }}'
+          $tag = "injector-$($env:GITHUB_SHA.Substring(0, 8))"
+          gh release create $tag "out/$name.zip" --draft --target $env:GITHUB_SHA --title "$name (draft, untested)" `
+            --notes "Generic DX11 (DXVK) injector, phase 1. DRAFT: not published. See README.md in the zip. zip md5 ${{ steps.pkg.outputs.zipmd5 }}"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $assets = gh api "repos/$env:GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \`"$tag\`") | .assets[] | \`"\(.id) \(.name) \(.size)\`""
+          $assets
+          "::notice title=asset::$assets zip md5 ${{ steps.pkg.outputs.zipmd5 }}"

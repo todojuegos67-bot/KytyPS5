@@ -1,0 +1,8 @@
+LIBRARY vulkan-1
+EXPORTS
+    vkGetInstanceProcAddr = inj_vkGetInstanceProcAddr
+    vkGetDeviceProcAddr = inj_vkGetDeviceProcAddr
+    vkCreateInstance = inj_vkCreateInstance
+    vkEnumerateInstanceExtensionProperties = inj_vkEnumerateInstanceExtensionProperties
+    vkEnumerateInstanceLayerProperties = inj_vkEnumerateInstanceLayerProperties
+    vkEnumerateInstanceVersion = inj_vkEnumerateInstanceVersion
