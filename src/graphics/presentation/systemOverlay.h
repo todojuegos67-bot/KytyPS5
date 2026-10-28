@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "libs/trophy.h"
 
 #include <cstdint>
 #include <memory>
@@ -52,6 +53,9 @@ struct SystemOverlayHud {
 		std::string label;
 	};
 	std::vector<Marker> markers;
+	// The trophy unlock popup (libs/trophy.h; nullptr: none) and its age in seconds.
+	std::shared_ptr<const Libs::Trophy::Toast> trophy;
+	float                                      trophy_seconds = 0.0f;
 	vk::Rect2D  region; // the game image in the swapchain image
 	vk::Rect2D  drawn;  // out: the panels, in swapchain pixels
 };

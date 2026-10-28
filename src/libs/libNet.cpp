@@ -5,6 +5,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/trophy.h"
 #include "libs/addcont.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
@@ -2079,6 +2080,27 @@ static int KYTY_SYSV_ABI NpTrophy2RegisterContext(int context, int handle, uint6
 	     "\t options = 0x%016" PRIx64 "\n",
 	     context, handle, options);
 
+	// (The package read now, not at the first unlock.)
+	(void)Libs::Trophy::Count();
+
+	return 0;
+}
+
+// The unlock: recorded in _SaveData/<title>/trophies.json and shown as a popup (Libs::Trophy, SystemOverlay).
+static int KYTY_SYSV_ABI NpTrophy2UnlockTrophy(int context, int handle, int trophy_id, int* platinum_id) {
+	PRINT_NAME();
+
+	LOGF("\t context   = %d\n"
+	     "\t handle    = %d\n"
+	     "\t trophy_id = %d\n",
+	     context, handle, trophy_id);
+
+	int platinum = -1;
+	Libs::Trophy::Unlock(trophy_id, &platinum);
+	if (platinum_id != nullptr) {
+		*platinum_id = platinum;
+	}
+
 	return 0;
 }
 
@@ -2194,10 +2216,17 @@ static int KYTY_SYSV_ABI NpTrophy2GetTrophyInfo(int context, int handle, int tro
 		details->target.value = 0;
 		NpTrophy2FillTitle(details->name, sizeof(details->name), "Trophy");
 		NpTrophy2FillTitle(details->description, sizeof(details->description), "Trophy");
+		if (Libs::Trophy::Info info; Libs::Trophy::GetInfo(trophy_id, &info)) {
+			if (info.grade != 0) details->trophy_grade = info.grade;
+			details->hidden = info.hidden;
+			NpTrophy2FillTitle(details->name, sizeof(details->name), info.name.c_str());
+			NpTrophy2FillTitle(details->description, sizeof(details->description), info.detail.c_str());
+		}
 	}
 	if (data != nullptr) {
 		std::memset(data, 0, sizeof(*data));
 		data->trophy_id = trophy_id;
+		data->unlocked  = Libs::Trophy::IsUnlocked(trophy_id);
 	}
 
 	return 0;
@@ -2342,6 +2371,7 @@ LIB_DEFINE(InitNet_1_NpTrophy2) {
 	LIB_FUNC("6IjXJUy6ZnA", LibNpTrophy2::NpTrophy2GetGroupIcon);
 	LIB_FUNC("-9LLVU0uvs8", LibNpTrophy2::NpTrophy2GetTrophyIcon);
 	LIB_FUNC("sUXGfNMalIo", LibNpTrophy2::NpTrophy2RegisterUnlockCallback);
+	LIB_FUNC("887L9z0Th2E", LibNpTrophy2::NpTrophy2UnlockTrophy);
 	LIB_FUNC("fYapWA9xVmA", LibNpTrophy2::NpTrophy2AbortHandle);
 	LIB_FUNC("d8P11CI40KE", LibNpTrophy2::NpTrophy2DestroyHandle);
 	LIB_FUNC("sysY2FHYff4", LibNpTrophy2::NpTrophy2DestroyContext);
