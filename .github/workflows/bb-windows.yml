@@ -1,0 +1,34 @@
+name: bb-windows
+on:
+  workflow_dispatch:
+  push:
+    branches: [bb-port]
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-2025-vs2026
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+        fetch-depth: 1
+    - uses: egor-tensin/vs-shell@v2
+      with: { arch: x64 }
+    - name: Configure
+      run: cmake --fresh -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+    - name: Build
+      run: cmake --build build --config Release --parallel $env:NUMBER_OF_PROCESSORS
+    - name: Package
+      shell: bash
+      run: |
+        mkdir out && cp build/shadPS4.exe out/
+        cd out && 7z a ../bb-port-win64.zip shadPS4.exe >/dev/null && cd ..
+        md5sum out/shadPS4.exe bb-port-win64.zip | tee md5.txt
+    - name: Draft release
+      shell: bash
+      env: { GH_TOKEN: "${{ github.token }}" }
+      run: |
+        tag="bb-port-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+        gh release create "$tag" bb-port-win64.zip md5.txt --draft --target "$GITHUB_SHA" \
+          --title "$tag (draft, untested)" --notes "Automated draft build of branch bb-port. Not a release."
