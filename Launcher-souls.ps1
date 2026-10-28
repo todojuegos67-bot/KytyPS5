@@ -423,15 +423,17 @@ function Start-Game {
 		# (vol25) KYTY_RT_SUN=0: la sombra RT de pantalla a fuerza 0 da el sol a la volumetrica en cada frame (sin niebla que salta).
 		$sets += 'KYTY_RT_SUN=0'
 	} else { foreach ($n in 'KYTY_RT_SHADOWS', 'KYTY_RT_SHADOWS_STRENGTH') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue } }  # (audit) ni volumetrica ni Sombras RT: nada
+	if (-not $pureGame -and $cmbTorch -and $cmbTorch.SelectedIndex -gt 0) { $sets += "KYTY_TORCH=$($cmbTorch.SelectedIndex)" }  # (torch-1028) luz de antorchas RT (pantalla, sin RT por hardware)
+	if (-not $pureGame -and $cmbFlare -and $cmbFlare.SelectedIndex -gt 0) { $sets += 'KYTY_TORCH_FLARE=1' }  # (torch-1028) destellos de lente
 	if ($pureGame) {
 		# (audit) Juego original: fuera todo pase visual del emulador (RT, volumetrica, sombra RT, brillo, oclusion especular, GTAO,
 		# SSGI, reflejos RT de pantalla, contacto, particulas RT); -Set manda sobre el entorno. Rendimiento, reescalador, FG y latencia igual.
-		$fxPat = '^KYTY_(HWRT|RT_REFLECTIONS|RT_SHADOWS|RT_SUN|RT_PARTICLES|RT_LOCAL|GODRAYS|SHINE|SPEC_OCCLUSION|GTAO|SSGI|SSR|CONTACT_SHADOWS|AO)'
+		$fxPat = '^KYTY_(HWRT|RT_REFLECTIONS|RT_SHADOWS|RT_SUN|RT_PARTICLES|RT_LOCAL|GODRAYS|SHINE|SPEC_OCCLUSION|GTAO|SSGI|SSR|CONTACT_SHADOWS|AO|TORCH)'
 		$sets = @($sets | Where-Object { $_ -notmatch $fxPat })
 		foreach ($n in @(Get-ChildItem Env: | Where-Object { $_.Name -match $fxPat } | ForEach-Object { $_.Name })) { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 		$sets += @('KYTY_HWRT=0', 'KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_REFLECTIONS=0',
 			'KYTY_RT_SHADOWS=0', 'KYTY_CONTACT_SHADOWS=0', 'KYTY_RT_SUN=0', 'KYTY_RT_PARTICLES=0', 'KYTY_GODRAYS=0', 'KYTY_SHINE=0', 'KYTY_SPEC_OCCLUSION=0',
-			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0')
+			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0')
 		$pa = @(); for ($i = 0; $i -lt $psargs.Count; $i++) { if ($psargs[$i] -eq '-Ssgi') { $i++; continue }; $pa += $psargs[$i] }; $psargs = $pa
 	}
 	# (10-24) Brillo metales retirado (no aportaba)
@@ -2275,10 +2277,12 @@ function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @(
 	Move-To $lb $gRt 10 ($y + 2) 112; Move-To $c $gRt 124 $y 282
 	return $c
 }
-$cmbRtSh = New-RtCombo 'Sombras RT' 'rtshadow2' 120 'Sombras del sol por rayos sobre la imagen (de pantalla, sin RT real): sombras de contacto que las del juego pierden (bajo brazos, entre piernas, junto a muros), con borde suave y estable. Solo donde el juego ya muestra sol. Solo con DLSS, XeSS o FSR. Bajo ~0,3 ms, Medio ~0,6 ms, Alto ~1 ms.' @('No', 'Bajo', 'Medio', 'Alto')  # (ds-shadow-1028)
+$cmbRtSh = New-RtCombo 'Sombras RT' 'rtshadow2' 600 'Sombras del sol por rayos sobre la imagen (de pantalla, sin RT real): sombras de contacto que las del juego pierden (bajo brazos, entre piernas, junto a muros), con borde suave y estable. Solo donde el juego ya muestra sol. Solo con DLSS, XeSS o FSR. Bajo ~0,3 ms, Medio ~0,6 ms, Alto ~1 ms.' @('No', 'Bajo', 'Medio', 'Alto')  # (ds-shadow-1028)
 $cmbAoNew = New-RtCombo 'Oclusión ambiental' 'ao1028' 88 'Oclusion ambiental nueva (ao-1028, sin RT por hardware): oscurece solo la luz ambiental en rincones, juntas y bajo objetos, con radio en metros, sin halos ni ruido; nunca el cielo, el fuego ni lo emisivo. Sustituye a la oclusion del juego (no oscurece dos veces). Solo con DLSS, XeSS o FSR. Bajo ~0,3 ms, Medio ~0,5 ms, Alto ~1 ms (resolucion completa).' @('No', 'Bajo', 'Medio', 'Alto')  # (ao-1028) oclusion ambiental nueva (KYTY_AO), solo en Ray tracing
 $cmbRays = New-RtCombo 'Luz volumetrica' 'godrays2' 24 'Luz volumetrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms (mas rayos y mas pasos de sombra).' @('No', 'Bajo', 'Medio', 'Alto')
 $cmbRtRf = New-RtCombo 'Reflejos RT' 'rtrefl2' 56 'Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, mas nitidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolucion completa y mas fuertes). Beta.' @('No', 'Bajo', 'Medio', 'Alto', 'Ultra', 'Extremo')  # (10-25 noche) Extremo = nivel 5 (refl10)  # (10-25) refl8; Ultra vuelve: el cierre era del frame generation AMD, no de los reflejos
+$cmbTorch = New-RtCombo 'Luz de antorchas RT' 'torchrt' 536 'Luz de antorchas RT: el fuego de antorchas, braseros y hogueras ilumina paredes, suelos y estructuras cercanas con un rebote calido que parpadea, y se refleja en superficies lisas o mojadas. No atraviesa paredes ni personajes (se comprueba en la profundidad). Solo en pantalla, sin RT por hardware. Solo con DLSS, XeSS o FSR. Bajo 2 fuegos ~0,3 ms, Medio 4 ~0,5 ms, Alto 8 ~0,9 ms.' @('No', 'Bajo', 'Medio', 'Alto')  # (torch-1028)
+$cmbFlare = New-RtCombo 'Destellos de lente' 'lensflare' 568 'Destello de lente de antorchas y fuegos visibles: pequenos reflejos de la optica, una estrella y una raya suaves. Desaparece si el fuego queda tapado y cerca de los bordes. Sin halo ni velo en pantalla. Se dibuja antes del HUD. Solo con DLSS, XeSS o FSR. ~0,1 ms.' @('No', 'Sí')  # (torch-1028)
 $cmbShine = $null  # (10-24) Brillo metales retirado
 # (10-24) Ajustes del juego: convars del propio motor, cada uno en Juego (no se toca) o en un nivel. Nombres, tipos,
 # rangos y valores de fabrica sacados del registro de convars del eboot 1.07 (constructor de cada convar: min / max;
@@ -2700,7 +2704,7 @@ if ($gCtl -and $btnCtl) { $gCtl.Top = $btnCtl.Bottom + 6 }
 # (audit) Casilla Juego original: al marcarla las filas de efectos quedan inactivas (sus valores se guardan).
 $chkPure = New-Check 'Juego original (sin efectos añadidos)' 0 0 396 'puregame'
 $tips.SetToolTip($chkPure, 'Apaga todos los efectos visuales que anade el emulador (ray tracing, luz volumetrica, sombras RT, brillo, oclusion, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, frame generation y latencia no cambian.')
-function Update-PureGame { foreach ($c in @($cmbRtRf, $cmbRt, $cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRays, $cmbAoNew, $cmbRtSh)) { if ($c) { $c.Enabled = -not $chkPure.Checked } } }
+function Update-PureGame { foreach ($c in @($cmbRtRf, $cmbRt, $cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbRtSh)) { if ($c) { $c.Enabled = -not $chkPure.Checked } } }
 $chkPure.Add_CheckedChanged({ Update-PureGame })
 # (10-26) "Ray tracing" solo con RT real: fuera Luz RT (SSGI), Luz volumetrica de pantalla, Reflejos RT, Sol RT y Particulas RT de pantalla.
 # (Visible no sirve para leer antes de mostrar la ventana: se trabaja con listas.)
@@ -2709,7 +2713,7 @@ try {
 	$rtHwExp = (Get-IniValue 'rthwexp' '0') -eq '1'
 	$fake = @($cmbSun, $cmbPart, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater) | Where-Object { $_ }  # (10-27) solo reflejos, sombras RT y rayos volumetricos
 	$hideOnly = @(if (-not $rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } })  # (vol25) la Luz volumetrica ya no se oculta
-	$keep = @(@($cmbRtRf, $cmbRt, $cmbRays, $cmbAoNew, $cmbRtSh) | Where-Object { $_ }) + @(if ($rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } | Sort-Object Top })  # (vol25) Luz volumetrica del 10-25 visible otra vez, debajo
+	$keep = @(@($cmbRtRf, $cmbRt, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbRtSh) | Where-Object { $_ }) + @(if ($rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } | Sort-Object Top })  # (vol25) Luz volumetrica del 10-25 visible otra vez, debajo
 	$lblOf = @{}
 	foreach ($c in @($fake + $hideOnly + $keep + @($cmbShQ, $cmbShD, $cmbAo) | Where-Object { $_ })) {
 		$lblOf[$c.GetHashCode()] = @($gRt.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and [math]::Abs($_.Top - ($c.Top + 2)) -le 4 })
@@ -2744,7 +2748,7 @@ try {
 	if ($pcCard) { $pcCard.Top = $gRt.Top + $gRt.Height + 12 }
 } catch { }
 # (10-26) Al elegir cualquier Modo Souls: todo el ray tracing en No (el usuario lo enciende a mano despues).
-function Set-RtAllOff { foreach ($c in @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRt, $cmbRtRf, $cmbAoNew, $cmbRtSh)) { if ($c -and $c.Items.Count -gt 0) { $c.SelectedIndex = 0 } } }
+function Set-RtAllOff { foreach ($c in @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRt, $cmbRtRf, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbRtSh)) { if ($c -and $c.Items.Count -gt 0) { $c.SelectedIndex = 0 } } }
 # (vol25) Luz volumetrica y Sombras sol RT comparten el pase del sol en el motor: con las dos, el sol de la volumetrica
 # llega a ratos (niebla que salta). Se excluyen: elegir una pone la otra en No.
 if ($false -and $cmbRays -and $cmbHSun) {  # (rt-vol 1ac512fe) ya pueden ir juntas

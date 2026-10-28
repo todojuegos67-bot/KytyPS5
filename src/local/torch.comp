@@ -1,0 +1,516 @@
+#version 450
+// KYTY_TORCH / KYTY_TORCH_FLARE (torch.cpp): "Luz de antorchas RT" and "Destellos de lente" on the PS5 Pro path's
+// pre-exposure HDR color, before the upscaler. Screen-space / G-buffer only: no acceleration structure, no ray query.
+// Modes (push.misc.x):
+//   0 detect:    a 32x18 grid of cells, 8x8 fixed taps a cell: fire pixels (exposed luminance above the threshold, warm
+//                hue r/g, far above what their G-buffer albedo could reflect, 0.8..120 m) -> cand[cell]: weight, the
+//                weighted uv, the nearest depth, the mean colour, the tap count
+//   1 track:     one thread: the cells clustered into blobs (8-connected, depth-coherent), the strongest kept; the
+//                tracked lights (2 / 4 / 8 slots) reprojected with the motion vectors and matched to them; position,
+//                hue and power smoothed; a slow and a fast power -> the flicker (fast / slow, clamped 0.8..1.2, eased);
+//                fade in ~0.25 s, out ~0.5 s; the flare's visibility (depth-tested at the source, eased ~0.12 s)
+//   2 light:     full resolution: every lit G-buffer surface within a light's range gets a point light: G-buffer
+//                normal (world oct 8:8, rotated to view) and albedo, windowed inverse-square falloff, N.L, a short
+//                screen-space march toward the light in the depth buffer (occlusion: no light through walls or
+//                through characters), a GGX glint from the G-buffer roughness (the fire seen on wet / smooth
+//                surfaces); added display-referred (x the game's exposure), soft-capped, faded with distance;
+//                the sky, the far plane and the fire pixels themselves untouched. Deterministic: no noise, no history.
+//   3 flare:     full resolution, after every other pass: per visible light a tiny starburst, a short anamorphic
+//                streak, 4 ghosts and a faint ring along the axis through the screen centre; faded at the screen
+//                edges and with the light's visibility. No bloom wash: everything is small and capped.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2) uniform usampler2D packed0;
+layout(binding = 3) uniform usampler2D packed1;
+layout(binding = 4) uniform usampler2D packed2;
+layout(binding = 5) uniform usampler2D packed3;
+layout(binding = 6, rgba16f) uniform writeonly image2D out_img;
+layout(binding = 9) uniform sampler2D motion_tex;
+layout(std430, binding = 7) buffer Frame {
+	vec4 view_rot[3]; // words 0..11: world -> view rotation rows
+	vec4 hp;          // 12..15: x 1.0 (exposure when the game gives none), y fire threshold (exposed), z slots, w -
+	uint stats[16];   // 16..31: 0 frames, 1 blobs, 2 lights in use, 3 flares drawn, 4 sampled pixels, 5 lit pixels
+	vec4 lights[32];  // 32..159: 8 slots x [0] (uv, view z, fade) [1] (hue rgb, slow power) [2] (fast power, flicker,
+	                  // flare visibility, missing frames) [3] (view position xyz, power used)
+	vec4 cand[];      // 160..: 32x18 cells x (weight, uv x, uv y, nearest z), (mean exposed rgb, taps)
+};
+layout(std430, binding = 8) readonly buffer Exposure {
+	float exposure_values[];
+};
+
+layout(push_constant) uniform Push {
+	vec4  proj;      // M[0], M[5], M[8], M[9]
+	vec4  depth_map; // M[10], M[14], M[11], M[15]
+	vec4  size;      // render w, h, strength, added-luminance cap (exposed)
+	vec4  light;     // range scale, glint strength, march steps, max distance (m)
+	vec4  flare;     // strength, aspect (w / h), -, -
+	vec4  motion;    // motion scale x, y, history valid (1), frame dt (s)
+	ivec4 misc;      // mode, frame, flags (1 row 0 = NDC y +1, 2 G-buffer usable, 4 motion bound, 8 debug), exposure index
+	ivec4 dec;       // normal code, roughness field, -, -
+} push;
+
+const int   CW    = 32;
+const int   CH    = 18;
+const int   NCELL = CW * CH;
+const float PI    = 3.14159265;
+
+vec2  RenderSize() { return push.size.xy; }
+float YS() { return (push.misc.z & 1) != 0 ? -1.0 : 1.0; }
+bool  Gbuf() { return (push.misc.z & 2) != 0; }
+float ViewZ(float d) {
+	float den = d * push.depth_map.z - push.depth_map.x;
+	return abs(den) > 1e-12 ? (push.depth_map.y - d * push.depth_map.w) / den : 1e6;
+}
+vec3 ViewPosZ(vec2 uv, float z) {
+	float w  = z * push.depth_map.z + push.depth_map.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	nd.y *= YS();
+	return vec3((nd.x * w - z * push.proj.z) / push.proj.x, (nd.y * w - z * push.proj.w) / push.proj.y, z);
+}
+bool Project(vec3 v, out vec2 uv) {
+	float w = v.z * push.depth_map.z + push.depth_map.w;
+	uv      = vec2(-1.0);
+	if (w <= 1e-5) return false;
+	vec2 nd = vec2((v.x * push.proj.x + v.z * push.proj.z) / w, (v.y * push.proj.y + v.z * push.proj.w) / w);
+	nd.y *= YS();
+	uv = nd * 0.5 + 0.5;
+	return true;
+}
+bool  IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e3; }
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+vec3  Safe(vec3 c) { return (any(isnan(c)) || any(isinf(c))) ? vec3(0) : clamp(c, vec3(0), vec3(6.0e4)); }
+float Sat(float x) { return clamp(x, 0.0, 1.0); }
+float Smooth01(float x) {
+	x = Sat(x);
+	return x * x * (3.0 - 2.0 * x);
+}
+float GameExposure() {
+	float e = exposure_values[push.misc.w];
+	return (e > 1e-12 && e < 1e12) ? e : 1.0;
+}
+float DepthAt(vec2 uv) { return textureLod(depth_tex, uv, 0).r; }
+float ZAt(ivec2 p) {
+	float d = texelFetch(depth_tex, p, 0).r;
+	return IsSky(d) ? 1e6 : ViewZ(d);
+}
+
+// ---- G-buffer (Demon's Souls: L0 albedo rgb8, L3 world normal oct 8:8, L2 byte 0 roughness; codes as in shine) ----
+uint Packed(int layer, ivec2 p) {
+	if (layer == 0) return texelFetch(packed0, p, 0).r;
+	if (layer == 1) return texelFetch(packed1, p, 0).r;
+	if (layer == 2) return texelFetch(packed2, p, 0).r;
+	return texelFetch(packed3, p, 0).r;
+}
+float Bits(uint w, int shift, int bits) { return float((w >> uint(shift)) & ((1u << uint(bits)) - 1u)) / float((1u << uint(bits)) - 1u); }
+vec3  OctDecode(vec2 e) {
+	e       = e * 2.0 - 1.0;
+	vec3  n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+	float t = max(-n.z, 0.0);
+	n.x += n.x >= 0.0 ? -t : t;
+	n.y += n.y >= 0.0 ? -t : t;
+	return normalize(n);
+}
+vec3 DecodeNormal(uint w, int l) {
+	if (l == 0) return OctDecode(vec2(Bits(w, 0, 16), Bits(w, 16, 16)));
+	if (l == 5) return OctDecode(vec2(Bits(w, 16, 16), Bits(w, 0, 16)));
+	if (l == 10) return OctDecode(vec2(Bits(w, 16, 8), Bits(w, 24, 8)));
+	return OctDecode(vec2(Bits(w, 0, 8), Bits(w, 8, 8)));
+}
+vec3 ToView(vec3 n) { return vec3(dot(view_rot[0].xyz, n), dot(view_rot[1].xyz, n), dot(view_rot[2].xyz, n)); }
+// The depth-derived normal (the smaller-step side on each axis: no smearing across edges), facing the camera.
+vec3 DepthNormal(ivec2 p, vec3 pos) {
+	ivec2 sz = ivec2(RenderSize());
+	vec2  rs = RenderSize();
+	ivec2 px = clamp(p + ivec2(1, 0), ivec2(0), sz - 1), nx = clamp(p - ivec2(1, 0), ivec2(0), sz - 1);
+	ivec2 py = clamp(p + ivec2(0, 1), ivec2(0), sz - 1), ny = clamp(p - ivec2(0, 1), ivec2(0), sz - 1);
+	vec3  a  = ViewPosZ((vec2(px) + 0.5) / rs, ZAt(px)) - pos;
+	vec3  b  = pos - ViewPosZ((vec2(nx) + 0.5) / rs, ZAt(nx));
+	vec3  c  = ViewPosZ((vec2(py) + 0.5) / rs, ZAt(py)) - pos;
+	vec3  d  = pos - ViewPosZ((vec2(ny) + 0.5) / rs, ZAt(ny));
+	vec3  dx = abs(a.z) < abs(b.z) ? a : b;
+	vec3  dy = abs(c.z) < abs(d.z) ? c : d;
+	vec3  n  = cross(dx, dy);
+	float l  = length(n);
+	if (!(l > 1e-12)) return normalize(-pos);
+	n /= l;
+	return dot(n, -pos) < 0.0 ? -n : n;
+}
+vec3 NormalAt(ivec2 p, vec3 pos) {
+	if (!Gbuf()) return DepthNormal(p, pos);
+	int  c = push.dec.x;
+	vec3 n = DecodeNormal(Packed(c & 3, p), (c >> 2) & 15);
+	if ((c & 64) != 0) n = ToView(n);
+	if ((c & 128) != 0) n = -n;
+	if (dot(n, -pos) < 0.0) n = -n;
+	return normalize(n);
+}
+float Field(int f, ivec2 p) {
+	if (f < 0) return 0.5;
+	float v = Bits(Packed(f & 3, p), (f >> 2) & 31, max((f >> 7) & 31, 1));
+	return (f & 4096) != 0 ? 1.0 - v : v;
+}
+// The diffuse albedo, roughly linear (the G-buffer's 8-bit albedo is gamma-like: squared); without the G-buffer the
+// lit colour's chroma at a fixed dark-stone reflectance.
+vec3 AlbedoAt(ivec2 p, vec3 col) {
+	if (Gbuf()) {
+		uint a0 = Packed(0, p);
+		vec3 a  = vec3(Bits(a0, 0, 8), Bits(a0, 8, 8), Bits(a0, 16, 8));
+		return clamp(a * a, vec3(0.02), vec3(0.9));
+	}
+	float l = Luma(col);
+	return l > 1e-5 ? clamp(col / l, vec3(0), vec3(2)) * 0.15 : vec3(0.15);
+}
+
+// 0..1: how much of a fire this pixel is: bright (exposed), warm (r over g), far brighter than its albedo can reflect
+// (with the G-buffer), not sky, 0.8..120 m. col: exposed colour.
+float FireW(vec3 col, float z, vec3 alb) {
+	if (z < 0.8 || z > 120.0) return 0.0;
+	float l = Luma(col);
+	float t = hp.y;
+	float w = Smooth01((l - t) / t);
+	if (w <= 0.0) return 0.0;
+	float warm = Sat((col.r / max(col.g, 1e-4) - 1.35) / 0.8);
+	float gate = Gbuf() ? Sat((l / max(Luma(alb), 0.02) - 4.0) / 6.0) : 1.0;
+	return w * warm * gate;
+}
+
+// ---- 0 detect ----
+shared vec4  s_a[64]; // (w, w u, w v, -)
+shared vec4  s_b[64]; // (w r, w g, w b, taps)
+shared float s_z[64]; // nearest z of a fire tap
+
+void Detect(uvec3 wg, uint li) {
+	uvec2 cell = wg.xy;
+	vec2  rs   = RenderSize();
+	vec2  uv   = (vec2(cell) + (vec2(li % 8u, li / 8u) + 0.5) / 8.0) / vec2(CW, CH);
+	ivec2 p    = clamp(ivec2(uv * rs), ivec2(0), ivec2(rs) - 1);
+	float e    = GameExposure();
+	vec3  c    = Safe(texelFetch(color_tex, p, 0).rgb) * e;
+	float z    = ZAt(p);
+	float w    = FireW(c, z, AlbedoAt(p, c / e));
+	vec3  cc   = c * min(1.0, 64.0 / max(Luma(c), 1e-4)); // (a clipped sun of a pixel does not make a white light)
+	s_a[li]    = vec4(w, w * uv, 0.0);
+	s_b[li]    = vec4(w * cc, w > 0.0 ? 1.0 : 0.0);
+	s_z[li]    = w > 0.0 ? z : 1e6;
+	barrier();
+	for (uint s = 32u; s > 0u; s >>= 1) {
+		if (li < s) {
+			s_a[li] += s_a[li + s];
+			s_b[li] += s_b[li + s];
+			s_z[li] = min(s_z[li], s_z[li + s]);
+		}
+		barrier();
+	}
+	if (li == 0u) {
+		uint idx = (cell.y * uint(CW) + cell.x) * 2u;
+		vec4 a   = s_a[0];
+		vec4 b   = s_b[0];
+		if (a.x <= 1e-4) {
+			cand[idx] = vec4(0), cand[idx + 1u] = vec4(0);
+		} else {
+			cand[idx]      = vec4(a.x, a.yz / a.x, s_z[0]);
+			cand[idx + 1u] = vec4(b.rgb / a.x, b.w);
+		}
+	}
+}
+
+// ---- 1 track ----
+const int MAXB = 16;
+
+void Track() {
+	int   slots = int(hp.z);
+	float dt    = clamp(push.motion.w, 0.001, 0.1);
+	vec2  rs    = RenderSize();
+	atomicAdd(stats[0], 1u);
+	// Cluster: 8-connected cells of comparable depth.
+	int   lab[NCELL];
+	int   queue[NCELL];
+	for (int i = 0; i < NCELL; ++i) lab[i] = -1;
+	vec4  bw[MAXB]; // (weight, u, v, z)
+	vec4  bc[MAXB]; // (rgb, taps)
+	int   nb = 0;
+	for (int i = 0; i < NCELL; ++i) {
+		if (lab[i] >= 0 || cand[i * 2].x < 0.25) continue;
+		int  head = 0, tail = 0;
+		queue[tail++] = i;
+		lab[i]        = 1;
+		vec4 acc = vec4(0), accc = vec4(0);
+		while (head < tail) {
+			int  j  = queue[head++];
+			vec4 cj = cand[j * 2];
+			vec4 kj = cand[j * 2 + 1];
+			acc += vec4(cj.x, cj.yz * cj.x, cj.w * cj.x);
+			accc += vec4(kj.rgb * cj.x, kj.w);
+			int jx = j % CW, jy = j / CW;
+			for (int oy = -1; oy <= 1; ++oy)
+				for (int ox = -1; ox <= 1; ++ox) {
+					int nx = jx + ox, ny = jy + oy;
+					if (nx < 0 || ny < 0 || nx >= CW || ny >= CH) continue;
+					int k = ny * CW + nx;
+					if (lab[k] >= 0) continue;
+					vec4 ck = cand[k * 2];
+					if (ck.x < 0.25 || abs(ck.w - cj.w) > max(1.5, 0.25 * cj.w)) continue;
+					lab[k]          = 1;
+					queue[tail++]   = k;
+				}
+		}
+		if (acc.x < 0.5) continue;
+		vec4 blob  = vec4(acc.x, acc.yz / acc.x, acc.w / acc.x);
+		vec4 blobc = vec4(accc.rgb / acc.x, accc.w);
+		// Keep the MAXB strongest (insertion).
+		int at = nb < MAXB ? nb : -1;
+		if (at < 0) {
+			int weakest = 0;
+			for (int k = 1; k < MAXB; ++k)
+				if (bw[k].x < bw[weakest].x) weakest = k;
+			if (bw[weakest].x < blob.x) at = weakest;
+		} else {
+			++nb;
+		}
+		if (at >= 0) bw[at] = blob, bc[at] = blobc;
+	}
+	atomicAdd(stats[1], uint(nb));
+	// Power: the flame's world size (screen area x z^2 / focal^2) and brightness.
+	float cellpx = (rs.x / float(CW * 8)) * (rs.y / float(CH * 8));
+	float pw[MAXB];
+	vec3  hu[MAXB];
+	bool  claimed[MAXB];
+	for (int b = 0; b < nb; ++b) {
+		float area = bc[b].w * cellpx / (rs.x * rs.y * 0.25) * bw[b].w * bw[b].w / max(abs(push.proj.x * push.proj.y), 1e-6);
+		float bri  = min(Luma(bc[b].rgb), 40.0);
+		pw[b]      = clamp(6.0 * sqrt(area) * sqrt(bri / 4.0), 0.4, 6.0);
+		vec3 h     = bc[b].rgb / max(Luma(bc[b].rgb), 1e-4);
+		h          = 0.7 * h + 0.3;
+		hu[b]      = h / max(Luma(h), 1e-4);
+		claimed[b] = false;
+	}
+	// Match the tracked lights.
+	int used = 0, flares = 0;
+	for (int k = 0; k < 8; ++k) {
+		vec4 l0 = lights[k * 4], l1 = lights[k * 4 + 1], l2 = lights[k * 4 + 2];
+		if (k >= slots) {
+			lights[k * 4] = vec4(0), lights[k * 4 + 1] = vec4(0), lights[k * 4 + 2] = vec4(0), lights[k * 4 + 3] = vec4(0);
+			continue;
+		}
+		if (l0.w <= 0.0 && l2.w <= 0.0) continue;
+		if (push.motion.z > 0.0 && all(greaterThan(l0.xy, vec2(0))) && all(lessThan(l0.xy, vec2(1))))
+			l0.xy -= textureLod(motion_tex, l0.xy, 0).xy * push.motion.xy / rs;
+		int   best = -1;
+		float bd   = 2.5;
+		for (int b = 0; b < nb; ++b) {
+			if (claimed[b]) continue;
+			float zr = bw[b].w / max(l0.z, 1e-3);
+			if (zr < 0.7 || zr > 1.4) continue;
+			float dist = length((bw[b].yz - l0.xy) * vec2(CW, CH));
+			if (dist < bd) bd = dist, best = b;
+		}
+		float target_vis = 0.0;
+		if (best >= 0) {
+			claimed[best] = true;
+			l0.xy = mix(l0.xy, bw[best].yz, 0.5);
+			l0.z  = mix(l0.z, bw[best].w, 0.5);
+			l0.w  = min(1.0, l0.w + dt / 0.25);
+			l1.rgb = mix(l1.rgb, hu[best], 0.1);
+			l1.w   = mix(l1.w, pw[best], 0.04);
+			l2.x   = mix(l2.x, pw[best], 0.35);
+			l2.w   = 0.0;
+			target_vis = 1.0;
+		} else {
+			l0.w = max(0.0, l0.w - dt / 0.5);
+			l2.x = mix(l2.x, l1.w, 0.1);
+			l2.w += 1.0;
+		}
+		// The flicker: the fast power over the slow one, clamped and eased (no frame-to-frame noise).
+		float fl = clamp(l2.x / max(l1.w, 1e-3), 0.8, 1.2);
+		l2.y     = mix(l2.y <= 0.0 ? 1.0 : l2.y, fl, 0.3);
+		// The flare's source must be in view: the depth around it no nearer than the fire (a wall, a character in front).
+		if (target_vis > 0.0) {
+			float seen = 0.0;
+			for (int t = 0; t < 9; ++t) {
+				vec2 o = vec2(float(t % 3) - 1.0, float(t / 3) - 1.0) * 2.0 / rs;
+				float d = DepthAt(clamp(l0.xy + o, vec2(0), vec2(1)));
+				float zz = IsSky(d) ? 1e6 : ViewZ(d);
+				seen += zz >= l0.z * 0.9 - 0.5 ? 1.0 : 0.0;
+			}
+			target_vis = seen / 9.0;
+		}
+		l2.z = clamp(l2.z + clamp(target_vis - l2.z, -dt / 0.12, dt / 0.12), 0.0, 1.0);
+		if (l0.w <= 0.0 && l2.z <= 0.0) {
+			lights[k * 4] = vec4(0), lights[k * 4 + 1] = vec4(0), lights[k * 4 + 2] = vec4(0), lights[k * 4 + 3] = vec4(0);
+			continue;
+		}
+		vec3 pos = ViewPosZ(l0.xy, l0.z);
+		pos -= normalize(pos) * 0.3; // (the flame in front of what it is drawn on)
+		lights[k * 4]     = l0;
+		lights[k * 4 + 1] = l1;
+		lights[k * 4 + 2] = l2;
+		lights[k * 4 + 3] = vec4(pos, l1.w * l2.y);
+		++used;
+		if (l2.z > 0.05) ++flares;
+	}
+	// New lights: the strongest unclaimed blobs take free slots.
+	for (int k = 0; k < slots; ++k) {
+		if (lights[k * 4].w > 0.0 || lights[k * 4 + 2].z > 0.0) continue;
+		int best = -1;
+		for (int b = 0; b < nb; ++b)
+			if (!claimed[b] && (best < 0 || bw[b].x > bw[best].x)) best = b;
+		if (best < 0) break;
+		claimed[best] = true;
+		vec3 pos = ViewPosZ(bw[best].yz, bw[best].w);
+		pos -= normalize(pos) * 0.3;
+		lights[k * 4]     = vec4(bw[best].yz, bw[best].w, dt / 0.25);
+		lights[k * 4 + 1] = vec4(hu[best], pw[best]);
+		lights[k * 4 + 2] = vec4(pw[best], 1.0, 0.0, 0.0);
+		lights[k * 4 + 3] = vec4(pos, pw[best]);
+		++used;
+	}
+	atomicAdd(stats[2], uint(used));
+	atomicAdd(stats[3], uint(flares));
+}
+
+// ---- 2 light ----
+// The visibility of the light from p: a march in the depth buffer along the segment (its ends left out: the surface
+// itself and the flame's own geometry); a sample hidden behind the depth by more than the thickness (and by less
+// than 4 m, a front object far from the segment does not shadow) occludes, softly.
+float Visibility(vec3 p, vec3 lp, int steps) {
+	float vis = 1.0;
+	for (int s = 0; s < steps; ++s) {
+		float t  = 0.06 + 0.82 * (float(s) + 0.5) / float(steps);
+		vec3  pt = mix(p, lp, t);
+		vec2  uv;
+		if (!Project(pt, uv) || any(lessThan(uv, vec2(0))) || any(greaterThan(uv, vec2(1)))) continue;
+		float d  = DepthAt(uv);
+		if (IsSky(d)) continue;
+		float dd = pt.z - ViewZ(d);
+		float tk = 0.12 + 0.015 * pt.z;
+		float o  = Sat((dd - tk) / tk) * (dd < 4.0 ? 1.0 : 0.0);
+		vis *= 1.0 - 0.9 * o;
+		if (vis < 0.02) return 0.0;
+	}
+	return vis;
+}
+
+void Light(ivec2 p) {
+	vec2  rs = RenderSize();
+	ivec2 sz = ivec2(rs);
+	if (any(greaterThanEqual(p, sz))) return;
+	vec3  c  = Safe(texelFetch(color_tex, p, 0).rgb);
+	float d  = texelFetch(depth_tex, p, 0).r;
+	bool  sample_px = (p.x & 3) == 0 && (p.y & 3) == 0;
+	if (sample_px) atomicAdd(stats[4], 1u);
+	bool debug = (push.misc.z & 8) != 0;
+	float zmax = push.light.w;
+	float z    = IsSky(d) ? 1e6 : ViewZ(d);
+	if (IsSky(d) || z > zmax) {
+		imageStore(out_img, p, vec4(debug ? vec3(0) : c, 1.0));
+		return;
+	}
+	float e     = GameExposure();
+	vec2  uv    = (vec2(p) + 0.5) / rs;
+	vec3  pos   = ViewPosZ(uv, z);
+	vec3  N     = NormalAt(p, pos);
+	vec3  V     = normalize(-pos);
+	vec3  alb   = AlbedoAt(p, c);
+	float rough = Gbuf() ? clamp(Field(push.dec.y, p), 0.25, 1.0) : 0.6;
+	float selfw = FireW(c * e, z, alb);
+	int   steps = int(push.light.z);
+	vec3  diff  = vec3(0), spec = vec3(0);
+	for (int k = 0; k < 8; ++k) {
+		vec4 l0 = lights[k * 4];
+		if (l0.w <= 0.0) continue;
+		vec4  l3  = lights[k * 4 + 3];
+		float pwr = l3.w * l0.w;
+		if (pwr <= 0.0) continue;
+		vec3  L    = l3.xyz - pos;
+		float dist = length(L);
+		float R    = clamp(5.0 + 4.0 * sqrt(lights[k * 4 + 1].w), 5.0, 20.0) * push.light.x;
+		if (dist >= R || dist < 1e-3) continue;
+		vec3  l   = L / dist;
+		float ndl = dot(N, l);
+		if (ndl <= 0.0) continue;
+		float x   = dist / R;
+		float win = Sat(1.0 - x * x * x * x);
+		float att = win * win / (dist * dist + 1.0);
+		float vis = Visibility(pos + N * 0.04, l3.xyz, steps);
+		if (vis <= 0.0) continue;
+		// A flicker that also shifts the hue: brighter = a little more yellow.
+		float fl  = lights[k * 4 + 2].y;
+		vec3  hue = lights[k * 4 + 1].rgb * mix(vec3(1.0), vec3(0.94, 1.06, 1.1), Sat((fl - 1.0) * 4.0));
+		vec3  E   = hue * pwr * att * vis;
+		diff += E * ndl;
+		vec3  H   = normalize(l + V);
+		float ndh = Sat(dot(N, H));
+		float a2  = rough * rough * rough * rough;
+		float den = ndh * ndh * (a2 - 1.0) + 1.0;
+		float D   = min(a2 / (PI * den * den), 8.0);
+		spec += E * ndl * D;
+	}
+	vec3  add  = (alb * diff * 3.0 + spec * push.light.y) * push.size.z * (1.0 - selfw);
+	add *= 1.0 - smoothstep(zmax * 0.6, zmax, z); // (fog and distant walls stay as drawn)
+	float al   = Luma(add);
+	float cap  = push.size.w;
+	add /= 1.0 + al / max(cap, 1e-3); // (soft cap, hue-preserving)
+	add  = Safe(add);
+	if (sample_px && Luma(add) > 0.01) atomicAdd(stats[5], 1u);
+	imageStore(out_img, p, vec4(debug ? add / e : c + add / e, 1.0));
+}
+
+// ---- 3 flare ----
+float Ring(float r, float rad, float w) {
+	float x = (r - rad) / w;
+	return exp(-x * x);
+}
+float Disc(float r, float rad) {
+	// A soft-edged aperture ghost, a little brighter toward its rim.
+	float edge = Sat((rad - r) / (rad * 0.3));
+	return edge * (0.55 + 0.45 * Sat(r / rad) * Sat(r / rad));
+}
+
+void Flare(ivec2 p) {
+	vec2  rs = RenderSize();
+	if (any(greaterThanEqual(p, ivec2(rs)))) return;
+	vec3  c   = Safe(texelFetch(color_tex, p, 0).rgb);
+	float e   = GameExposure();
+	vec2  uv  = (vec2(p) + 0.5) / rs;
+	float asp = push.flare.y;
+	vec3  fl  = vec3(0);
+	for (int k = 0; k < 8; ++k) {
+		vec4  l2  = lights[k * 4 + 2];
+		if (l2.z <= 0.01) continue;
+		vec4  l0  = lights[k * 4];
+		vec2  s   = l0.xy;
+		float edge = Smooth01(min(min(s.x, 1.0 - s.x), min(s.y, 1.0 - s.y)) / 0.12);
+		float I    = l2.z * edge * min(lights[k * 4 + 3].w, 4.0) / 4.0 * 0.5 * push.flare.x;
+		if (I <= 0.003) continue;
+		vec3  hue  = lights[k * 4 + 1].rgb;
+		vec2  axis = vec2(0.5) - s;
+		vec2  q    = (uv - s) * vec2(asp, 1.0);
+		float r    = length(q);
+		// Starburst (6 thin spokes, tiny) and a short anamorphic streak.
+		float ang  = atan(q.y, q.x);
+		float star = pow(abs(cos(3.0 * (ang + 0.35))), 120.0) * exp(-r / 0.014) * 0.18;
+		float strk = exp(-abs(q.y) / 0.0012) * exp(-abs(q.x) / 0.06) * 0.10;
+		fl += I * (star + strk) * hue;
+		// Ghosts along the axis through the centre (aperture discs, tinted like coated glass).
+		fl += I * 0.100 * Disc(length((uv - (s + axis * 0.45)) * vec2(asp, 1.0)), 0.020) * vec3(1.0, 0.55, 0.2);
+		fl += I * 0.060 * Disc(length((uv - (s + axis * 1.25)) * vec2(asp, 1.0)), 0.034) * vec3(0.5, 0.8, 1.0);
+		fl += I * 0.120 * Disc(length((uv - (s + axis * 1.62)) * vec2(asp, 1.0)), 0.012) * vec3(1.0, 0.7, 0.3);
+		fl += I * 0.035 * Disc(length((uv - (s + axis * 2.10)) * vec2(asp, 1.0)), 0.055) * vec3(0.7, 1.0, 0.6);
+		// A faint, thin ring.
+		fl += I * 0.015 * Ring(length((uv - (s + axis * 1.45)) * vec2(asp, 1.0)), 0.11, 0.004) * hue * vec3(1.0, 0.9, 0.8);
+	}
+	fl = min(Safe(fl), vec3(0.6)); // (exposed: a flare never whites out a region)
+	bool debug = (push.misc.z & 8) != 0;
+	imageStore(out_img, p, vec4(debug ? c + fl / e : c + fl / e, 1.0));
+}
+
+void main() {
+	int mode = push.misc.x;
+	if (mode == 0) Detect(gl_WorkGroupID, gl_LocalInvocationIndex);
+	else if (mode == 1) {
+		if (gl_LocalInvocationIndex == 0u) Track();
+	} else if (mode == 2) Light(ivec2(gl_GlobalInvocationID.xy));
+	else Flare(ivec2(gl_GlobalInvocationID.xy));
+}
