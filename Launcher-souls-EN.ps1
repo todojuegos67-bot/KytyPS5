@@ -91,6 +91,14 @@ $resModes = @(
 	@('FSR Balanced',   1.72, 'fsr',  0),
 	@('FSR Perf.',      2.0,  'fsr',  0),
 	@('FSR 900p (AA)',  1.6,  'fsr',  0),  # (10-23) PC low profile: el 3D a 900 (1440 / 1.6) con FSR y nitidez
+	# AMD FSR 4 (AMD's v07 INT8 model, src/local/fsr4-sr.h): the fifth value is the model (KYTY_FSR4_PRESET), one per
+	# preset; its 1080 or 2160 variant by the output. Needs a GPU with INT8 dot product (RTX 20+, RX 6000+).
+	@('FSR 4 Native AA',         1.0, 'fsr4', 0, 'native'),
+	@('FSR 4 Quality',           1.5, 'fsr4', 0, 'quality'),
+	@('FSR 4 Balanced',          1.7, 'fsr4', 0, 'balanced'),
+	@('FSR 4 Performance',       2.0, 'fsr4', 0, 'performance'),
+	@('FSR 4 Ultra Performance', 3.0, 'fsr4', 0, 'ultraperf'),
+	@('FSR 4 Dynamic',           1.5, 'fsr4', 0, 'drs'),
 	@('1080p game',    1080, '',     0),
 	@('900p game',     900,  '',     0),
 	@('720p game',     720,  '',     0)
@@ -355,7 +363,7 @@ function Start-Game {
 	}
 	# DLSS, XeSS and FSR go through the game's PS5 Pro path (its output 4K): the ratio to the monitor's height, the
 	# emulator detecting it (KYTY_UPSCALE_RATIO); the others their render height.
-	if ($res[2] -in 'dlss', 'xess', 'fsr') {
+	if ($res[2] -in 'dlss', 'xess', 'fsr', 'fsr4') {
 		$psargs += @('-UpscaleRatio', ([double]$res[1]).ToString([System.Globalization.CultureInfo]::InvariantCulture))
 	} elseif ($res[1] -ne 1440) { $psargs += @('-RenderHeight', "$($res[1])") }
 	# "sin TAA": el TAA del juego no se ejecuta; DLSS (DLAA) en su lugar, o (taa-up-*) el reescalador elegido toma la
@@ -365,6 +373,7 @@ function Start-Game {
 	elseif ($res[2]) { $psargs += @('-Upscale', $res[2]) }
 	if ($res[3] -gt 0) { $psargs += @('-UpscaleHeight', "$($res[3])") }
 	$preset = $dlssPresets[[math]::Max(0, $cmbPreset.SelectedIndex)][1]
+	if ($res[2] -eq 'fsr4' -and $res.Count -gt 4 -and $res[4]) { $psargs += @('-Fsr4Preset', $res[4]) }  # (FSR 4: el modelo del preset)
 	if ($res[2] -like '*dlss' -and $preset) { $psargs += @('-DlssPreset', $preset) }
 	if ($chkVram8.Checked) { $env:KYTY_SIMULATE_VRAM_MB = '8192' } else { Remove-Item Env:KYTY_SIMULATE_VRAM_MB -ErrorAction SilentlyContinue }
 	# Cinematico a 60 quitado (no funcionaba): el modo cinematico queda como en PS5.
@@ -639,13 +648,13 @@ function Draw-ColoredItem($combo, $e) {
 $script:resShown = @()
 function Get-ResFamilies {
 	# (10-22) Modo graficas de 8 GB: frame generation de AMD, asi que XeSS y FSR (aunque la lista tenga uno de NVIDIA).
-	if ($chkLowEnd -and $chkLowEnd.Checked) { return @('dlss', 'xess', 'fsr') }  # (10-23) DLSS tambien (va con el FG de AMD)
+	if ($chkLowEnd -and $chkLowEnd.Checked) { return @('dlss', 'xess', 'fsr', 'fsr4') }  # (10-23) DLSS tambien (va con el FG de AMD)
 	# (10-22) Modo Souls equilibrado: frame generation de AMD, asi que sin DLSS (XeSS, FSR o el del juego).
-	if ($chkLowEnd45 -and $chkLowEnd45.Checked) { return @('', 'dlss', 'xess', 'fsr', 'juego') }  # (10-23) DLSS tambien
+	if ($chkLowEnd45 -and $chkLowEnd45.Checked) { return @('', 'dlss', 'xess', 'fsr', 'fsr4', 'juego') }  # (10-23) DLSS tambien
 	$cfg = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	if ($cfg -like 'dlss*') { return @('', 'dlss', 'juego') }
-	if ($cfg -like 'fsr3*') { return @('', 'dlss', 'xess', 'fsr', 'juego') }  # (10-23) DLSS + frame generation de AMD (prueba)
-	return @('', 'dlss', 'xess', 'fsr', 'juego')
+	if ($cfg -like 'fsr3*') { return @('', 'dlss', 'xess', 'fsr', 'fsr4', 'juego') }  # (10-23) DLSS + frame generation de AMD (prueba)
+	return @('', 'dlss', 'xess', 'fsr', 'fsr4', 'juego')
 }
 function Get-OutHeight {
 	# (10-22) Modo graficas de 8 GB: siempre 1080p.
@@ -659,7 +668,7 @@ function Get-OutHeight {
 }
 function Fill-Res {
 	$wanted = Get-IniValue 'scalelabel' '1440p native'
-	$titles = @{ 'dlss' = '--- NVIDIA DLSS ---'; 'xess' = '--- Intel XeSS ---'; 'fsr' = '--- AMD FSR 3.1 ---'; 'juego' = '--- From the game ---' }
+	$titles = @{ 'dlss' = '--- NVIDIA DLSS ---'; 'xess' = '--- Intel XeSS ---'; 'fsr' = '--- AMD FSR 3.1 ---'; 'fsr4' = '--- AMD FSR 4 ---'; 'juego' = '--- From the game ---' }
 	$shown  = @()
 	foreach ($family in (Get-ResFamilies)) {
 		$modes = @($resModes | Where-Object { $(if ($_[2] -eq '' -and $_[1] -ne 1440) { 'juego' } elseif ($_[2] -like 'taa-*') { $_[2] -replace '^taa-(up-)?', '' } else { $_[2] }) -eq $family })
@@ -679,6 +688,7 @@ function Fill-Res {
 		$outH = Get-OutHeight
 		if ($family -eq 'dlss') { $modes = @($modes | Where-Object { $h = [math]::Round($outH / $_[1]); $h -ge 1080 -or $h -eq 720 }) }
 		elseif ($family -in 'xess', 'fsr' -and $outH -lt 1440) { $modes = @($modes | Where-Object { $outH / $_[1] -ge 719 }) }
+		elseif ($family -eq 'fsr4') { $modes = @($modes | Where-Object { $outH / $_[1] -ge 719 }) }  # (FSR 4: el 3D a 720 como minimo)
 		if ($family -eq 'juego' -and $outH -lt 1440) { $modes = @() }
 		if ($modes.Count -eq 0) { continue }
 		if ($titles.ContainsKey($family)) { $shown += , @($titles[$family], 0, '', 0) }

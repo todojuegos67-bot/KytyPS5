@@ -105,7 +105,9 @@ param(
 	[switch]$ExclusiveFullscreen,
 	[switch]$Ram16,
 	[switch]$GentlePrecompile,
-	[ValidateSet('', 'dlss', 'xess', 'fsr')][string]$Upscaler = '',
+	[ValidateSet('', 'dlss', 'xess', 'fsr', 'fsr4')][string]$Upscaler = '',
+	# KYTY_FSR4_PRESET with -Upscaler fsr4 (AMD FSR 4, src/local/fsr4-sr.h): the model, one per preset.
+	[ValidateSet('', 'native', 'quality', 'balanced', 'performance', 'ultraperf', 'drs', 'auto')][string]$Fsr4Preset = '',
 	[string]$StreamlineDir = '',
 	[string]$Affinity = '',
 	[switch]$AllCcds,
@@ -409,8 +411,8 @@ elseif ($ForceMode -ne '') { Write-Warning "-ForceMode $ForceMode is not cinemat
 # -Upscale fsr: the 3D image (at -RenderHeight) upscaled to 1440 by FSR 3.1 before the game's composite (frame-gen.h
 # UpscaleComposite), instead of the game's own scaling in that composite.
 # One upscaler: -Upscale (the old path after the game's TAA) goes to the PS5 Pro path (-Upscaler) with the same upscaler.
-if ($Upscale -in 'dlss', 'xess', 'fsr' -and !$Upscaler) { $Upscaler = $Upscale }
-if ($environment['KYTY_UPSCALE'] -in 'dlss', 'xess', 'fsr' -and !$Upscaler) { $Upscaler = $environment['KYTY_UPSCALE'] }
+if ($Upscale -in 'dlss', 'xess', 'fsr', 'fsr4' -and !$Upscaler) { $Upscaler = $Upscale }
+if ($environment['KYTY_UPSCALE'] -in 'dlss', 'xess', 'fsr', 'fsr4' -and !$Upscaler) { $Upscaler = $environment['KYTY_UPSCALE'] }
 $environment.Remove('KYTY_UPSCALE')
 # -UpscaleHeight: the upscaled image's height (default 1440; 2160 for DLSS ultra performance); -DlssPreset K|L|M|J.
 if ($UpscaleHeight -gt 0) { $environment['KYTY_UPSCALE_HEIGHT'] = "$UpscaleHeight" }
@@ -589,6 +591,8 @@ elseif ($Turbo) {
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
 # -Upscaler dlss: src/loader/demonsSoulsSuperResolution.h.
 if ($Upscaler) { $environment['KYTY_UPSCALER'] = $Upscaler }
+# -Fsr4Preset: AMD FSR 4's model (native, quality, balanced, performance, ultraperf, drs; default quality).
+if ($Upscaler -eq 'fsr4' -and $Fsr4Preset) { $environment['KYTY_FSR4_PRESET'] = $Fsr4Preset }
 # Without -StreamlineDir, the Streamline folder chosen in the launcher (launcher-settings.json), as the launcher passes
 # it: run.cmd -FrameGen 1 had started with frame generation off, its runtime not found (issue #38).
 if (!$StreamlineDir -and (Test-Path "$PSScriptRoot\launcher-settings.json")) {
