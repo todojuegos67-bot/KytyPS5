@@ -8398,7 +8398,10 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 	f[2] = static_cast<float>(r);
 	f[3] = 0.0f; // (strength x fade: RtSunSetFade)
 	f[4] = forced_hyp >= 0.0f ? std::floor(forced_hyp) : static_cast<float>(g_rs.hyp);
-	f[5] = forced_bias >= 0.0f ? forced_bias : static_cast<float>(g_rs.bias_m);
+	// (ds-rt-shadow 10-28) the bias never under 0.75 of the finest cascade's texel: the auto-bias settled at its 5 mm floor
+	// against a 0.38 m texel (20261028-044645), the cascade compare self-shadowed in stripes ("rayas") that the composite
+	// then amplified
+	f[5] = forced_bias >= 0.0f ? forced_bias : std::max(static_cast<float>(g_rs.bias_m), 0.75f * cs.front().texel);
 	f[6] = std::floor(debug);
 	f[7] = size;
 	// (ds-rt-shadow) the same brightening on a held copy as on a fresh one: the copy is the game's current cascade (it
