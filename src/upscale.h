@@ -43,7 +43,8 @@ struct DevicePatch {
 	void Restore();
 };
 void PatchDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo& in, VkDeviceCreateInfo& out, DevicePatch& patch);
-void OnDeviceCreated(const VkDeviceCreateInfo& made_with);  // the create info the device was made with
+void OnDeviceCreated(VkDevice device, const VkDeviceCreateInfo& made_with);  // the create info each device was made with
+void OnActivate(VkDevice device);  // that device becomes the active one (the one with the swapchain)
 void OnFirstPresent();  // the device that presents (DXVK's real one, not its probe): Streamline is told about it here
 void OnDeviceDestroyed();
 void SetDisplay(VkExtent2D display, VkFormat format);

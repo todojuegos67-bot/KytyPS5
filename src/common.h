@@ -78,7 +78,12 @@ struct Real {
 };
 Real& R();
 void  LoadDeviceFunctions(VkDevice device);
-PFN_vkVoidFunction RealDeviceProc(const char* name);  // for FidelityFX and ImGui: never our hooks
+PFN_vkVoidFunction RealDeviceProc(const char* name);
+// Instance-level calls through the system loader's own exports (trampolines: valid for any live instance), and the live
+// instance that enumerated a physical device (null when none is alive). Never R().gipa(R().instance, ...): that instance
+// may be one DXVK already destroyed.
+PFN_vkVoidFunction LoaderProc(const char* name);
+VkInstance         InstanceOf(VkPhysicalDevice physical);  // for FidelityFX and ImGui: never our hooks
 
 // One lock for every submit / present on any queue we share with the game (vkQueue* are externally synchronized;
 // FidelityFX submits on the game queue from its own thread through our callback). Recursive: our present path

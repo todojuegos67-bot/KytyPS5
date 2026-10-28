@@ -16,7 +16,7 @@ The code contains no game-specific values: no offsets, no shader hashes, no exe 
 ## How it works
 
 ```
-game (DX11) -> d3d11.dll / dxgi.dll (DXVK 2.6.1, official) -> winevulkan.dll (OURS, next to the exe)
+game (DX11) -> d3d11.dll / dxgi.dll (DXVK 2.7.1, official) -> winevulkan.dll (OURS, next to the exe)
                                                                -> %SystemRoot%\System32\vulkan-1.dll (system loader)
 ```
 

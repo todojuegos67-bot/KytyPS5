@@ -60,8 +60,8 @@ void DeviceFeatures(VkPhysicalDevice physical, VkPhysicalDeviceFeatures& f, VkPh
                     VkPhysicalDeviceVulkan13Features& f13, bool derivatives_ext, bool& want_derivatives) {
 	g_dev = {};
 	if (!AssetsPresent()) return;
-	auto features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(R().gipa(R().instance, "vkGetPhysicalDeviceFeatures2"));
-	auto props2    = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(R().gipa(R().instance, "vkGetPhysicalDeviceProperties2"));
+	auto features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(LoaderProc("vkGetPhysicalDeviceFeatures2"));
+	auto props2    = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(LoaderProc("vkGetPhysicalDeviceProperties2"));
 	if (features2 == nullptr || props2 == nullptr) return;
 	g_dev.checked = true;
 	VkPhysicalDeviceComputeShaderDerivativesFeaturesNV derivatives {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV};

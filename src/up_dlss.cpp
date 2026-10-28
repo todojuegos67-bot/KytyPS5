@@ -371,10 +371,11 @@ void DeviceFeatures(VkPhysicalDeviceVulkan12Features& f12, VkPhysicalDeviceVulka
 
 void OnFirstPresent(VkDevice device) {
 	if (!g_inited || (g_device_set && g_device == device)) return;
+	if (InstanceOf(R().physical) == VK_NULL_HANDLE) { Log("[dlss] no live instance for the active device: Streamline not told"); return; }
 	PatchPlugins();  // (before Streamline loads the Vulkan loader for this device: ours)
 	sl::VulkanInfo info {};
 	info.device             = device;
-	info.instance           = R().instance;
+	info.instance           = InstanceOf(R().physical);  // (the live instance owning the active device's GPU)
 	info.physicalDevice     = R().physical;
 	info.graphicsQueueFamily = Q().graphics_family;
 	info.graphicsQueueIndex  = QueueCount(Q().graphics_family);  // (where queues Streamline asks for would start: none for DLSS SR)

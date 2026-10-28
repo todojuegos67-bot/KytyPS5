@@ -114,7 +114,7 @@ public:
 				old_.push_back(ctx_);
 				ctx_ = nullptr;
 			}
-			if (g_api.create_context(R().instance, R().physical, R().device, &ctx_) != XESS_RESULT_SUCCESS) {
+			if (g_api.create_context(InstanceOf(R().physical), R().physical, R().device, &ctx_) != XESS_RESULT_SUCCESS) {
 				Log("[xess] context not created");
 				ctx_ = nullptr;
 				return false;
@@ -187,11 +187,12 @@ void InstanceExtensions(std::vector<const char*>& names) {
 	for (const auto& e: g_instance_ext) names.push_back(e.c_str());
 }
 void DeviceExtensions(VkPhysicalDevice physical, std::vector<const char*>& names) {
-	if (!g_loaded || R().instance == VK_NULL_HANDLE) return;
+	const VkInstance instance = InstanceOf(physical);  // (the live instance that owns this GPU, never a destroyed one)
+	if (!g_loaded || instance == VK_NULL_HANDLE) return;
 	uint32_t count = 0;
 	const char* const* list = nullptr;
 	InternalScope scope;
-	if (g_api.get_device_extensions(R().instance, physical, &count, &list) != XESS_RESULT_SUCCESS) {
+	if (g_api.get_device_extensions(instance, physical, &count, &list) != XESS_RESULT_SUCCESS) {
 		g_why = "XeSS no soporta esta GPU / driver";
 		Log("[xess] this GPU or driver is not supported (xessVKGetRequiredDeviceExtensions failed)");
 		return;
@@ -203,10 +204,11 @@ void DeviceExtensions(VkPhysicalDevice physical, std::vector<const char*>& names
 	}
 }
 void* DeviceFeatureChain(VkPhysicalDevice physical) {
-	if (!g_loaded || R().instance == VK_NULL_HANDLE) return nullptr;
+	const VkInstance instance = InstanceOf(physical);
+	if (!g_loaded || instance == VK_NULL_HANDLE) return nullptr;
 	void* chain = nullptr;
 	InternalScope scope;
-	if (g_api.get_device_features(R().instance, physical, &chain) != XESS_RESULT_SUCCESS) return nullptr;
+	if (g_api.get_device_features(instance, physical, &chain) != XESS_RESULT_SUCCESS) return nullptr;
 	return chain;
 }
 bool Ready(std::string& why) {

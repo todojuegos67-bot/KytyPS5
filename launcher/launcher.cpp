@@ -250,30 +250,72 @@ bool Install(const std::wstring& exe) {
 	return true;
 }
 
+// Our DLL (as winevulkan.dll or vulkan-1.dll), recognized by a string only it contains: removed even when no manifest
+// lists it (10-28: an older manifest without winevulkan.dll left it behind, and the user's own DXVK then loaded it).
+bool IsOurDll(const std::wstring& path) {
+	std::ifstream f(path, std::ios::binary);
+	if (!f) return false;
+	const std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+	return data.find("injector phase 1 (generic proxy") != std::string::npos || data.find("injector phase 2 (generic proxy") != std::string::npos;
+}
+
 bool Uninstall(const std::wstring& exe) {
 	const std::wstring dir = Dir(exe);
+	std::wstring removed, restored;
+	std::set<std::wstring> backups;
+	std::vector<std::wstring> dirs;
 	std::wifstream manifest(dir + kManifest);
-	if (!manifest) { Say(L"No hay instalacion aqui (falta injector_install.txt).", MB_ICONWARNING); return false; }
-	std::wstring line, removed;
-	std::vector<std::wstring> backups, dirs;
-	while (std::getline(manifest, line)) {
-		if (line.rfind(L"file=", 0) == 0) {
-			const std::wstring name = line.substr(5);
-			if (name == L"injector.ini") continue;  // settings stay unless asked
-			DeleteFileW((dir + name).c_str());
-			removed += L"  " + name + L"\n";
-		} else if (line.rfind(L"backup=", 0) == 0) {
-			backups.push_back(line.substr(7));
-		} else if (line.rfind(L"dir=", 0) == 0) {
-			dirs.push_back(line.substr(4));
+	if (manifest) {
+		std::wstring line;
+		while (std::getline(manifest, line)) {
+			if (line.rfind(L"file=", 0) == 0) {
+				const std::wstring name = line.substr(5);
+				if (name == L"injector.ini") continue;  // settings stay
+				if (DeleteFileW((dir + name).c_str())) removed += L"  " + name + L"\n";
+			} else if (line.rfind(L"backup=", 0) == 0) {
+				backups.insert(line.substr(7));
+			} else if (line.rfind(L"dir=", 0) == 0) {
+				dirs.push_back(line.substr(4));
+			}
 		}
+		manifest.close();
 	}
-	manifest.close();
-	for (const auto& name: backups)
-		MoveFileExW((dir + name + L".injector-bak").c_str(), (dir + name).c_str(), MOVEFILE_REPLACE_EXISTING);
+	// Every file the injector ever installs, whatever the manifest says: our DLL under either name.
+	for (const wchar_t* name: {L"winevulkan.dll", L"vulkan-1.dll"})
+		if (Exists(dir + name) && IsOurDll(dir + name) && DeleteFileW((dir + name).c_str())) removed += std::wstring(L"  ") + name + L"\n";
+	// Backups: the manifest's, and any *.injector-bak left by an older setup, restored where the file is now missing.
+	WIN32_FIND_DATAW fd {};
+	HANDLE h = FindFirstFileW((dir + L"*.injector-bak").c_str(), &fd);
+	if (h != INVALID_HANDLE_VALUE) {
+		do {
+			std::wstring name(fd.cFileName);
+			backups.insert(name.substr(0, name.size() - std::wstring(L".injector-bak").size()));
+		} while (FindNextFileW(h, &fd));
+		FindClose(h);
+	}
+	for (const auto& name: backups) {
+		const std::wstring bak = dir + name + L".injector-bak";
+		if (!Exists(bak)) continue;
+		if (MoveFileExW(bak.c_str(), (dir + name).c_str(), MOVEFILE_REPLACE_EXISTING)) restored += L"  " + name + L"\n";
+	}
+	// Phase 2's folders: emptied by the manifest's file= lines; fsr4_shaders\ (a name no game uses) emptied in any case.
+	{
+		WIN32_FIND_DATAW f {};
+		HANDLE fh = FindFirstFileW((dir + L"fsr4_shaders\\fsr4_model_v07_*").c_str(), &f);
+		if (fh != INVALID_HANDLE_VALUE) {
+			int n = 0;
+			do { if (DeleteFileW((dir + L"fsr4_shaders\\" + f.cFileName).c_str())) ++n; } while (FindNextFileW(fh, &f));
+			FindClose(fh);
+			for (const wchar_t* extra: {L"LICENSE-FSR4-v07.txt", L"rcas.spv", L"spd_auto_exposure.spv"}) DeleteFileW((dir + L"fsr4_shaders\\" + extra).c_str());
+			if (n) removed += L"  fsr4_shaders\\ (" + std::to_wstring(n) + L" archivos)\n";
+		}
+		dirs.push_back(L"fsr4_shaders");
+	}
 	for (const auto& name: dirs) RemoveDirectoryW((dir + name).c_str());  // (only when empty: nothing of the game's is lost)
 	DeleteFileW((dir + kManifest).c_str());
-	Say(L"Desinstalado de " + dir + L"\n\n" + removed + L"\n(injector.ini, injector.log e injector_profiles se conservan.)");
+	if (removed.empty() && restored.empty()) { Say(L"No habia nada del injector en " + dir, MB_ICONINFORMATION); return true; }
+	Say(L"Desinstalado de " + dir + L"\n\nBorrados:\n" + removed + L"\nRestaurados:\n" + restored +
+	    L"\n(injector.ini, injector.log e injector_profiles se conservan.)");
 	return true;
 }
 
@@ -309,7 +351,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 	const std::wstring exe = PickExe();
 	if (exe.empty()) return 0;
 	const auto pe = ReadImports(exe);
-	const bool installed = Exists(Dir(exe) + kManifest);
+	const bool installed = Exists(Dir(exe) + kManifest) || (Exists(Dir(exe) + L"winevulkan.dll") && IsOurDll(Dir(exe) + L"winevulkan.dll")) ||
+	                       (Exists(Dir(exe) + L"vulkan-1.dll") && IsOurDll(Dir(exe) + L"vulkan-1.dll"));
 	std::wstring msg = L"Juego: " + exe + L"\nAPI detectada: ";
 	const char* api = ApiName(Detect(pe));
 	msg += std::wstring(api, api + std::strlen(api));

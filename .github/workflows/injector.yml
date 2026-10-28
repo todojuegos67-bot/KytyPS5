@@ -30,7 +30,7 @@ jobs:
           $ffx = 'https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v1.1.4'
           Invoke-WebRequest "$ffx/PrebuiltSignedDLL/amd_fidelityfx_vk.dll" -OutFile deps/amd_fidelityfx_vk.dll
           Invoke-WebRequest "$ffx/LICENSE.txt" -OutFile deps/FidelityFX-LICENSE.txt
-          Invoke-WebRequest 'https://github.com/doitsujin/dxvk/releases/download/v2.6.1/dxvk-2.6.1.tar.gz' -OutFile deps/dxvk.tar.gz
+          Invoke-WebRequest 'https://github.com/doitsujin/dxvk/releases/download/v2.7.1/dxvk-2.7.1.tar.gz' -OutFile deps/dxvk.tar.gz
           tar -xzf deps/dxvk.tar.gz -C deps
           # nlohmann/json (single header) for FSR 4's manifests.
           New-Item -ItemType Directory -Force third_party/json/nlohmann | Out-Null
@@ -99,7 +99,7 @@ jobs:
           # vulkan-1.dll for native Vulkan games.
           Copy-Item build/Release/winevulkan.dll "$root/payload/winevulkan.dll"
           Copy-Item build/Release/winevulkan.dll "$root/payload/vulkan-1.dll"
-          Copy-Item deps/dxvk-2.6.1/x64/d3d11.dll, deps/dxvk-2.6.1/x64/dxgi.dll "$root/payload/"
+          Copy-Item deps/dxvk-2.7.1/x64/d3d11.dll, deps/dxvk-2.7.1/x64/dxgi.dll "$root/payload/"
           Copy-Item deps/amd_fidelityfx_vk.dll "$root/payload/"
           Copy-Item payload/dxvk.conf, payload/injector.ini "$root/payload/"
           # Phase 2: XeSS, DLSS (Streamline's production DLLs only) and FSR 4's model.
@@ -116,7 +116,7 @@ jobs:
           Copy-Item fsr4_shaders/LICENSE-FSR4-v07.txt "$root/licenses/FSR4-v07-LICENSE.txt"
           Copy-Item third_party/Vulkan-Headers/LICENSE.md "$root/licenses/Vulkan-Headers-LICENSE.md" -ErrorAction SilentlyContinue
           Copy-Item deps/FidelityFX-LICENSE.txt "$root/licenses/"
-          Copy-Item deps/dxvk-2.6.1/LICENSE -Destination "$root/licenses/DXVK-LICENSE.txt" -ErrorAction SilentlyContinue
+          Copy-Item deps/dxvk-2.7.1/LICENSE -Destination "$root/licenses/DXVK-LICENSE.txt" -ErrorAction SilentlyContinue
           Copy-Item third_party/imgui/LICENSE.txt "$root/licenses/imgui-LICENSE.txt"
           Copy-Item README.md "$root/README.md"
           $lines = Get-ChildItem $root -Recurse -File | ForEach-Object {

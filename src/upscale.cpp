@@ -308,8 +308,8 @@ uint32_t g_queue_counts[16] {};  // queues the device was made with, per family 
 
 void PatchDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo& in, VkDeviceCreateInfo& out, DevicePatch& patch) {
 	auto& r = R();
-	auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(r.gipa(r.instance, "vkEnumerateDeviceExtensionProperties"));
-	auto features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(r.gipa(r.instance, "vkGetPhysicalDeviceFeatures2"));
+	auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(LoaderProc("vkEnumerateDeviceExtensionProperties"));
+	auto features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(LoaderProc("vkGetPhysicalDeviceFeatures2"));
 	std::vector<VkExtensionProperties> available;
 	if (enumerate != nullptr) {
 		uint32_t n = 0;
@@ -414,14 +414,30 @@ void PatchDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo& in, VkDevi
 	}
 }
 
-void OnDeviceCreated(const VkDeviceCreateInfo& info) {
-	g_device_extensions.clear();
-	for (uint32_t i = 0; i < info.enabledExtensionCount; ++i) g_device_extensions.insert(info.ppEnabledExtensionNames[i]);
-	g_push_descriptors = DeviceHas(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-	std::fill(std::begin(g_queue_counts), std::end(g_queue_counts), 0u);
+namespace {
+struct DeviceRecord { std::unordered_set<std::string> extensions; uint32_t queues[16] {}; };
+std::mutex g_records_mutex;
+std::unordered_map<VkDevice, DeviceRecord> g_records;
+} // namespace
+
+void OnDeviceCreated(VkDevice device, const VkDeviceCreateInfo& info) {
+	DeviceRecord rec;
+	for (uint32_t i = 0; i < info.enabledExtensionCount; ++i) rec.extensions.insert(info.ppEnabledExtensionNames[i]);
 	for (uint32_t i = 0; i < info.queueCreateInfoCount; ++i)
-		if (info.pQueueCreateInfos[i].queueFamilyIndex < 16) g_queue_counts[info.pQueueCreateInfos[i].queueFamilyIndex] += info.pQueueCreateInfos[i].queueCount;
-	Log("[up] device made with %u extensions (push descriptors %s)", info.enabledExtensionCount, g_push_descriptors ? "on" : "off");
+		if (info.pQueueCreateInfos[i].queueFamilyIndex < 16) rec.queues[info.pQueueCreateInfos[i].queueFamilyIndex] += info.pQueueCreateInfos[i].queueCount;
+	Log("[up] device %p made with %u extensions (push descriptors %s)", static_cast<void*>(device), info.enabledExtensionCount,
+	    rec.extensions.count(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) ? "on" : "off");
+	std::lock_guard lock(g_records_mutex);
+	g_records[device] = std::move(rec);
+}
+
+void OnActivate(VkDevice device) {
+	std::lock_guard lock(g_records_mutex);
+	auto it = g_records.find(device);
+	if (it == g_records.end()) return;
+	g_device_extensions = it->second.extensions;
+	g_push_descriptors  = DeviceHas(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+	std::copy(std::begin(it->second.queues), std::end(it->second.queues), std::begin(g_queue_counts));
 }
 uint32_t QueueCount(uint32_t family) {
 	return family < 16 ? g_queue_counts[family] : 0;
