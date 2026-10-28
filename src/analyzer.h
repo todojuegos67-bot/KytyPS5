@@ -25,7 +25,18 @@ void SetSwapchainImages(const VkImage* images, uint32_t count);
 
 // Command recording (record order) and submission (execution order).
 void OnBeginCommandBuffer(VkCommandBuffer cb);
-void OnBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* info);
+// What a pass draws into, for the upscaler's placement and the camera finder (record order).
+struct PassInfo {
+	VkImage       color0 = VK_NULL_HANDLE;    // its first color attachment
+	VkImageLayout color0_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+	VkImage       depth = VK_NULL_HANDLE;
+	bool          main_depth = false;         // depth is the analyzer's pick (a scene pass)
+	bool          swapchain = false;          // color0 is a swapchain image (DXVK's present blit: the frame ends)
+	bool          backbuffer = false;         // color0 is the analyzer's backbuffer pick
+};
+PassInfo OnBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* info);
+// The analyzer runs (live analysis, game inputs for FG, or an upscaler on).
+bool Active();
 void OnBarrier2(VkCommandBuffer cb, const VkDependencyInfo* info);
 void OnBarrier(VkCommandBuffer cb, uint32_t count, const VkImageMemoryBarrier* barriers);
 void OnSubmit(const VkCommandBuffer* cbs, uint32_t count);
@@ -43,6 +54,29 @@ struct Inputs {
 };
 // Records the copies of the selected images into `cb` (the game queue, right before present).
 Inputs RecordCopies(VkCommandBuffer cb);
+
+// What the upscaler needs, with each image's layout at this point of `cb`'s recording (the last barrier or attachment
+// layout recorded for it in this command buffer, else the last one submitted).
+struct Image {
+	VkImage           image = VK_NULL_HANDLE;
+	VkFormat          format = VK_FORMAT_UNDEFINED;
+	VkExtent2D        extent {};
+	VkImageUsageFlags usage = 0;
+	VkImageLayout     layout = VK_IMAGE_LAYOUT_UNDEFINED;
+	float             confidence = 0;
+};
+struct UpscaleView {
+	Image backbuffer;  // display size: the composite and UI are drawn into it
+	Image scene;       // render size: the last color image written before the composite (the game's post-TAA scene)
+	Image pretaa;      // render size: the color image the game's TAA reads (found by its history ping-pong), if any
+	Image depth, motion;
+	bool  reversed_depth = false;
+	int   hud_after = -1, ui_passes = 0;
+	float hud_confidence = 0;
+	bool  taa_found = false;
+};
+UpscaleView View(VkCommandBuffer cb);
+VkImageLayout LayoutIn(VkCommandBuffer cb, VkImage image);
 
 // The menu section (inside an ImGui window).
 void DrawMenu();

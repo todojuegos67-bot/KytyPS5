@@ -8,7 +8,12 @@
 #include "analyzer.h"
 #include "common.h"
 
+struct ffxFunctions;
+
 namespace inj::framegen {
+
+// AMD's FidelityFX API (amd_fidelityfx_vk.dll next to the exe), loaded once; null when missing. FSR 3.1 upscaling uses it too.
+const ffxFunctions* FfxApi();
 
 bool Available();  // the DLL loaded and the extra queues created
 bool Owns(VkSwapchainKHR swapchain);

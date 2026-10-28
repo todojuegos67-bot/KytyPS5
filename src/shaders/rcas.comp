@@ -1,0 +1,50 @@
+#version 450
+// RCAS (robust contrast-adaptive sharpening): the algorithm of AMD FidelityFX FSR 1 (MIT), at the display size, after
+// every upscaler (KytyPS5's convention: one sharpening pass after DLSS / XeSS / FSR, src/local/sharpen.comp). HDR input is
+// tone mapped reversibly (c / (1 + max)) around it, as RCAS expects values in [0, 1].
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(rgba16f, binding = 1) uniform writeonly image2D dst;
+layout(push_constant) uniform Push {
+	float sharpness;  // exp2(-stops): 1 the sharpest, 0.25 soft
+	uint  hdr;
+	uint  width;
+	uint  height;
+} pc;
+
+const float kLimit = 0.25 - 1.0 / 16.0;
+
+vec3 Load(ivec2 p) {
+	p = clamp(p, ivec2(0), ivec2(int(pc.width) - 1, int(pc.height) - 1));
+	vec3 c = max(texelFetch(src, p, 0).rgb, vec3(0.0));
+	if (pc.hdr != 0u) c = c / (1.0 + max(c.r, max(c.g, c.b)));
+	return c;
+}
+float Luma(vec3 c) { return c.b * 0.5 + (c.r * 0.5 + c.g); }
+
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (p.x >= int(pc.width) || p.y >= int(pc.height)) return;
+	vec3 b = Load(p + ivec2(0, -1));
+	vec3 d = Load(p + ivec2(-1, 0));
+	vec3 e = Load(p);
+	vec3 f = Load(p + ivec2(1, 0));
+	vec3 h = Load(p + ivec2(0, 1));
+	float bL = Luma(b), dL = Luma(d), eL = Luma(e), fL = Luma(f), hL = Luma(h);
+	// Noise detection (FSR 1's RCAS_DENOISE).
+	float nz = 0.25 * bL + 0.25 * dL + 0.25 * fL + 0.25 * hL - eL;
+	float range = max(max(max(bL, dL), max(eL, fL)), hL) - min(min(min(bL, dL), min(eL, fL)), hL);
+	nz = clamp(abs(nz) / max(range, 1e-5), 0.0, 1.0);
+	nz = -0.5 * nz + 1.0;
+	vec3 mn4 = min(min(b, d), min(f, h));
+	vec3 mx4 = max(max(b, d), max(f, h));
+	vec3 hitMin = min(mn4, e) / max(4.0 * mx4, vec3(1e-5));
+	vec3 hitMax = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3(-1e-5));
+	vec3 lobeRGB = max(-hitMin, hitMax);
+	float lobe = max(-kLimit, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * pc.sharpness;
+	lobe *= nz;
+	float rcpL = 1.0 / (4.0 * lobe + 1.0);
+	vec3 c = (lobe * (b + d + h + f) + e) * rcpL;
+	if (pc.hdr != 0u) c = c / max(1.0 - max(c.r, max(c.g, c.b)), 1e-4);
+	imageStore(dst, p, vec4(c, texelFetch(src, p, 0).a));
+}

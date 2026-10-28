@@ -1,8 +1,10 @@
 // The proxy vulkan-1.dll: exports, the real loader, the hooks, and the present path.
 #include "analyzer.h"
+#include "camera.h"
 #include "common.h"
 #include "framegen.h"
 #include "overlay.h"
+#include "upscale.h"
 
 #include <algorithm>
 #include <array>
@@ -63,6 +65,34 @@ void Log(const char* fmt, ...) {
 	std::fflush(g_log);
 }
 
+namespace {
+thread_local int t_internal = 0;
+}
+InternalScope::InternalScope() { ++t_internal; }
+InternalScope::~InternalScope() { --t_internal; }
+bool Internal() { return t_internal > 0; }
+
+size_t FeatureStructSize(VkStructureType type) {
+	switch (type) {
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2: return sizeof(VkPhysicalDeviceFeatures2);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES: return sizeof(VkPhysicalDeviceVulkan11Features);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: return sizeof(VkPhysicalDeviceVulkan12Features);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: return sizeof(VkPhysicalDeviceVulkan13Features);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT: return sizeof(VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV: return sizeof(VkPhysicalDeviceComputeShaderDerivativesFeaturesNV);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES: return sizeof(VkPhysicalDeviceShaderIntegerDotProductFeatures);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES: return sizeof(VkPhysicalDeviceShaderFloat16Int8Features);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: return sizeof(VkPhysicalDeviceBufferDeviceAddressFeatures);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES: return sizeof(VkPhysicalDevice16BitStorageFeatures);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES: return sizeof(VkPhysicalDevice8BitStorageFeatures);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES: return sizeof(VkPhysicalDeviceSynchronization2Features);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES: return sizeof(VkPhysicalDeviceDynamicRenderingFeatures);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES: return sizeof(VkPhysicalDeviceTimelineSemaphoreFeatures);
+	case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES: return sizeof(VkPhysicalDeviceDescriptorIndexingFeatures);
+	default: return 0;
+	}
+}
+
 Settings& Cfg() { return g_settings; }
 Real& R() { return g_real; }
 Queues& Q() { return g_queues; }
@@ -85,6 +115,15 @@ void LoadSettings() {
 	s.mv_units        = geti(L"mv_units", 0) != 0 ? 1 : 0;
 	s.depth_mode      = geti(L"depth_mode", 0);
 	s.previews        = geti(L"previews", 1) != 0;
+	s.up_backend      = std::clamp(geti(L"upscaler", 0), 0, 4);
+	s.up_quality      = std::clamp(geti(L"up_quality", 0), 0, 5);
+	s.up_sharpness    = std::clamp(geti(L"up_sharpness_pct", 30), 0, 100) / 100.0f;
+	s.up_original     = false;  // (A/B always starts on our image)
+	s.up_split        = geti(L"up_split", 0) != 0;
+	s.up_jitter       = std::clamp(geti(L"up_jitter", 0), 0, 2);
+	s.up_input        = std::clamp(geti(L"up_input", 0), 0, 1);
+	s.up_native       = geti(L"up_native", 0) != 0;
+	s.up_streamline   = geti(L"up_streamline", 1) != 0;
 }
 
 void SaveSettings() {
@@ -101,6 +140,14 @@ void SaveSettings() {
 	put(L"mv_units", s.mv_units);
 	put(L"depth_mode", s.depth_mode);
 	put(L"previews", s.previews);
+	put(L"upscaler", s.up_backend);
+	put(L"up_quality", s.up_quality);
+	put(L"up_sharpness_pct", static_cast<int>(s.up_sharpness * 100 + 0.5f));
+	put(L"up_split", s.up_split);
+	put(L"up_jitter", s.up_jitter);
+	put(L"up_input", s.up_input);
+	put(L"up_native", s.up_native);
+	put(L"up_streamline", s.up_streamline);
 }
 
 double DisplayRefreshHz() {
@@ -123,9 +170,11 @@ uint32_t FindMemoryType(uint32_t bits, VkMemoryPropertyFlags flags) {
 static void InitOnce() {
 	std::call_once(g_init_once, [] {
 		LoadSettings();
-		Log("injector phase 1 (generic proxy vulkan-1.dll) in %s.exe", ExeName().c_str());
-		Log("settings: fg %d, cap %d, osd %d, analyze %d, game inputs %d, min confidence %.2f", g_settings.fg_enabled,
-		    g_settings.fg_cap_fps, g_settings.osd, g_settings.analyze, g_settings.use_game_inputs, g_settings.min_confidence);
+		Log("injector phase 2 (generic proxy vulkan-1.dll: frame generation + upscalers) in %s.exe", ExeName().c_str());
+		Log("settings: fg %d, cap %d, osd %d, analyze %d, game inputs %d, min confidence %.2f; upscaler %d, quality %d, sharpness %.2f, "
+		    "jitter %d, input %d, native %d, streamline %d", g_settings.fg_enabled, g_settings.fg_cap_fps, g_settings.osd,
+		    g_settings.analyze, g_settings.use_game_inputs, g_settings.min_confidence, g_settings.up_backend, g_settings.up_quality,
+		    g_settings.up_sharpness, g_settings.up_jitter, g_settings.up_input, g_settings.up_native, g_settings.up_streamline);
 		wchar_t sys[MAX_PATH] {};
 		GetSystemDirectoryW(sys, MAX_PATH);
 		const std::wstring system = std::wstring(sys) + L"\\vulkan-1.dll";
@@ -288,13 +337,30 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(VkPhysicalDevice physical, cons
 		patched.queueCreateInfoCount = static_cast<uint32_t>(queues.size());
 		patched.pQueueCreateInfos = queues.data();
 	}
-	VkResult result = create(physical, ok ? &patched : info, alloc, device);
+	// The upscalers' extensions and features (DLSS, FSR 4, XeSS, our push-descriptor passes), where the device has them.
+	upscale::DevicePatch up;
+	const VkDeviceCreateInfo base = ok ? patched : *info;
+	VkDeviceCreateInfo with_up = base;
+	{
+		InternalScope scope;  // (XeSS asks the driver through "vulkan-1.dll": ours)
+		upscale::PatchDevice(physical, base, with_up, up);
+	}
+	const VkDeviceCreateInfo* made = &with_up;
+	VkResult result = create(physical, &with_up, alloc, device);
+	if (result != VK_SUCCESS) {
+		Log("vkCreateDevice with the upscalers' extensions / features failed (%d): again without them", result);
+		up.Restore();
+		made = ok ? &patched : info;
+		result = create(physical, made, alloc, device);
+	}
 	if (result != VK_SUCCESS && ok) {
 		Log("vkCreateDevice with the frame generation queues failed (%d): again without them", result);
 		ok = false;
+		made = info;
 		result = create(physical, info, alloc, device);
 	}
 	if (result != VK_SUCCESS) return result;
+	upscale::OnDeviceCreated(*made);
 	r.physical = physical;
 	r.device = *device;
 	g_presents = 0;
@@ -323,6 +389,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(VkPhysicalDevice physical, cons
 VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device, const VkAllocationCallbacks* alloc) {
 	if (device == R().device) {
 		R().vkDeviceWaitIdle(device);
+		upscale::OnDeviceDestroyed();
+		camera::Shutdown();
 		analyzer::Shutdown();
 		overlay::OnDeviceDestroyed();
 		framegen::OnDeviceDestroyed();
@@ -340,14 +408,15 @@ VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device, const VkAllocatio
 
 VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
 	std::lock_guard lock(QueueLock());
-	for (uint32_t i = 0; i < count; ++i) analyzer::OnSubmit(submits[i].pCommandBuffers, submits[i].commandBufferCount);
+	if (!Internal())
+		for (uint32_t i = 0; i < count; ++i) analyzer::OnSubmit(submits[i].pCommandBuffers, submits[i].commandBufferCount);
 	return R().vkQueueSubmit(queue, count, submits, fence);
 }
 
 static VkResult Submit2(PFN_vkQueueSubmit2 fn, VkQueue queue, uint32_t count, const VkSubmitInfo2* submits, VkFence fence) {
 	std::lock_guard lock(QueueLock());
 	std::vector<VkCommandBuffer> cbs;
-	for (uint32_t i = 0; i < count; ++i) {
+	for (uint32_t i = 0; i < count && !Internal(); ++i) {
 		cbs.clear();
 		for (uint32_t j = 0; j < submits[i].commandBufferInfoCount; ++j) cbs.push_back(submits[i].pCommandBufferInfos[j].commandBuffer);
 		analyzer::OnSubmit(cbs.data(), static_cast<uint32_t>(cbs.size()));
@@ -398,6 +467,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(VkDevice device, const Vk
 		return r;
 	}
 	g_swap = {*out, ci.imageExtent, ci.imageFormat};
+	upscale::SetDisplay(ci.imageExtent, ci.imageFormat);
 	uint32_t n = 0;
 	Hook_GetSwapchainImagesKHR(device, *out, &n, nullptr);
 	std::vector<VkImage> images(n);
@@ -439,8 +509,12 @@ VKAPI_ATTR void VKAPI_CALL Hook_SetHdrMetadataEXT(VkDevice device, uint32_t n, c
 VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info) {
 	std::lock_guard lock(QueueLock());
 	++g_presents;
-	if (g_presents == 1) Log("first present on device %p, swapchain %p (%ux%u)", static_cast<void*>(R().device),
-	                         reinterpret_cast<void*>(g_swap.handle), g_swap.extent.width, g_swap.extent.height);
+	if (g_presents == 1) {
+		Log("first present on device %p, swapchain %p (%ux%u)", static_cast<void*>(R().device),
+		    reinterpret_cast<void*>(g_swap.handle), g_swap.extent.width, g_swap.extent.height);
+		upscale::OnFirstPresent();  // (DXVK's real device: Streamline is told about it)
+	}
+	upscale::OnPresent();
 	auto& q = Q();
 	if (q.game != queue) {
 		q.game = queue;
@@ -493,6 +567,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue, const VkPrese
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* alloc, VkImage* image) {
+	if (Internal()) return R().vkCreateImage(device, info, alloc, image);
 	VkImageCreateInfo ci = *info;
 	analyzer::PatchImageCreate(ci);
 	VkResult r = R().vkCreateImage(device, &ci, alloc, image);
@@ -504,43 +579,165 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateImage(VkDevice device, const VkImageCr
 	return r;
 }
 VKAPI_ATTR void VKAPI_CALL Hook_DestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* alloc) {
-	if (image != VK_NULL_HANDLE) analyzer::OnImageDestroyed(image);
+	if (image != VK_NULL_HANDLE && !Internal()) analyzer::OnImageDestroyed(image);
 	R().vkDestroyImage(device, image, alloc);
 }
 VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateImageView(VkDevice device, const VkImageViewCreateInfo* info, const VkAllocationCallbacks* alloc, VkImageView* view) {
 	VkResult r = R().vkCreateImageView(device, info, alloc, view);
-	if (r == VK_SUCCESS) analyzer::OnViewCreated(*view, *info);
+	if (r == VK_SUCCESS && !Internal()) analyzer::OnViewCreated(*view, *info);
 	return r;
 }
 VKAPI_ATTR void VKAPI_CALL Hook_DestroyImageView(VkDevice device, VkImageView view, const VkAllocationCallbacks* alloc) {
-	if (view != VK_NULL_HANDLE) analyzer::OnViewDestroyed(view);
+	if (view != VK_NULL_HANDLE && !Internal()) analyzer::OnViewDestroyed(view);
 	R().vkDestroyImageView(device, view, alloc);
 }
 VKAPI_ATTR VkResult VKAPI_CALL Hook_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo* info) {
-	analyzer::OnBeginCommandBuffer(cb);
+	if (!Internal()) {
+		analyzer::OnBeginCommandBuffer(cb);
+		upscale::OnBeginCommandBuffer(cb);
+	}
 	return R().vkBeginCommandBuffer(cb, info);
 }
+// A pass begins: the analyzer records it, the camera finder knows whether it is a scene pass, and the upscaler may do its
+// work right before it (the HUD point) or end the frame (DXVK's present blit).
+static void BeforeBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* info) {
+	if (Internal()) return;
+	const analyzer::PassInfo pass = analyzer::OnBeginRendering(cb, info);
+	upscale::BeforeRendering(cb, info, pass);
+	camera::SetScenePass(pass.main_depth);
+}
 VKAPI_ATTR void VKAPI_CALL Hook_CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* info) {
-	analyzer::OnBeginRendering(cb, info);
+	BeforeBeginRendering(cb, info);
 	R().vkCmdBeginRendering(cb, info);
 }
 VKAPI_ATTR void VKAPI_CALL Hook_CmdBeginRenderingKHR(VkCommandBuffer cb, const VkRenderingInfo* info) {
-	analyzer::OnBeginRendering(cb, info);
+	BeforeBeginRendering(cb, info);
 	R().vkCmdBeginRenderingKHR(cb, info);
 }
+VKAPI_ATTR void VKAPI_CALL Hook_CmdEndRendering(VkCommandBuffer cb) {
+	if (!Internal()) camera::SetScenePass(false);
+	R().vkCmdEndRendering(cb);
+}
+VKAPI_ATTR void VKAPI_CALL Hook_CmdEndRenderingKHR(VkCommandBuffer cb) {
+	if (!Internal()) camera::SetScenePass(false);
+	R().vkCmdEndRenderingKHR(cb);
+}
 VKAPI_ATTR void VKAPI_CALL Hook_CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo* info) {
-	analyzer::OnBarrier2(cb, info);
+	if (!Internal()) analyzer::OnBarrier2(cb, info);
 	R().vkCmdPipelineBarrier2(cb, info);
 }
 VKAPI_ATTR void VKAPI_CALL Hook_CmdPipelineBarrier2KHR(VkCommandBuffer cb, const VkDependencyInfo* info) {
-	analyzer::OnBarrier2(cb, info);
+	if (!Internal()) analyzer::OnBarrier2(cb, info);
 	R().vkCmdPipelineBarrier2KHR(cb, info);
 }
 VKAPI_ATTR void VKAPI_CALL Hook_CmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst,
                                                    VkDependencyFlags dep, uint32_t nm, const VkMemoryBarrier* m, uint32_t nb,
                                                    const VkBufferMemoryBarrier* b, uint32_t ni, const VkImageMemoryBarrier* im) {
-	analyzer::OnBarrier(cb, ni, im);
+	if (!Internal()) analyzer::OnBarrier(cb, ni, im);
 	R().vkCmdPipelineBarrier(cb, src, dst, dep, nm, m, nb, b, ni, im);
+}
+
+// ---- the state DXVK leaves bound (re-bound after the upscaler's work in its command buffer) ----
+VKAPI_ATTR void VKAPI_CALL Hook_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint point, VkPipeline pipeline) {
+	upscale::OnBindPipeline(cb, point, pipeline);  // (inside our work too: a graphics bind there is noted, then undone)
+	R().vkCmdBindPipeline(cb, point, pipeline);
+}
+VKAPI_ATTR void VKAPI_CALL Hook_CmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint point, VkPipelineLayout layout,
+                                                      uint32_t first, uint32_t count, const VkDescriptorSet* sets,
+                                                      uint32_t dynamic_count, const uint32_t* dynamic) {
+	upscale::OnBindDescriptorSets(cb, point, layout, first, count, sets, dynamic_count, dynamic);
+	R().vkCmdBindDescriptorSets(cb, point, layout, first, count, sets, dynamic_count, dynamic);
+}
+VKAPI_ATTR void VKAPI_CALL Hook_CmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout, VkShaderStageFlags stages,
+                                                 uint32_t offset, uint32_t size, const void* data) {
+	upscale::OnPushConstants(cb, layout, stages, offset, size, data);
+	R().vkCmdPushConstants(cb, layout, stages, offset, size, data);
+}
+
+// ---- the camera finder: constant buffers (descriptor templates, buffer memory, mapped allocations) ----
+static VkResult CreateTemplate(PFN_vkCreateDescriptorUpdateTemplate fn, VkDevice device, const VkDescriptorUpdateTemplateCreateInfo* info,
+                               const VkAllocationCallbacks* alloc, VkDescriptorUpdateTemplate* out) {
+	const VkResult r = fn(device, info, alloc, out);
+	if (r == VK_SUCCESS && !Internal()) camera::OnCreateTemplate(*out, *info);
+	return r;
+}
+VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDescriptorUpdateTemplate(VkDevice d, const VkDescriptorUpdateTemplateCreateInfo* i,
+                                                                   const VkAllocationCallbacks* a, VkDescriptorUpdateTemplate* o) {
+	return CreateTemplate(R().vkCreateDescriptorUpdateTemplate, d, i, a, o);
+}
+VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDescriptorUpdateTemplateKHR(VkDevice d, const VkDescriptorUpdateTemplateCreateInfo* i,
+                                                                      const VkAllocationCallbacks* a, VkDescriptorUpdateTemplate* o) {
+	return CreateTemplate(R().vkCreateDescriptorUpdateTemplateKHR, d, i, a, o);
+}
+VKAPI_ATTR void VKAPI_CALL Hook_DestroyDescriptorUpdateTemplate(VkDevice d, VkDescriptorUpdateTemplate t, const VkAllocationCallbacks* a) {
+	if (t != VK_NULL_HANDLE) camera::OnDestroyTemplate(t);
+	R().vkDestroyDescriptorUpdateTemplate(d, t, a);
+}
+VKAPI_ATTR void VKAPI_CALL Hook_DestroyDescriptorUpdateTemplateKHR(VkDevice d, VkDescriptorUpdateTemplate t, const VkAllocationCallbacks* a) {
+	if (t != VK_NULL_HANDLE) camera::OnDestroyTemplate(t);
+	R().vkDestroyDescriptorUpdateTemplateKHR(d, t, a);
+}
+VKAPI_ATTR void VKAPI_CALL Hook_UpdateDescriptorSetWithTemplate(VkDevice d, VkDescriptorSet set, VkDescriptorUpdateTemplate t, const void* data) {
+	if (!Internal()) camera::OnUpdateWithTemplate(t, data);  // (before the call: a Halton jitter goes in before the GPU reads it)
+	R().vkUpdateDescriptorSetWithTemplate(d, set, t, data);
+}
+VKAPI_ATTR void VKAPI_CALL Hook_UpdateDescriptorSetWithTemplateKHR(VkDevice d, VkDescriptorSet set, VkDescriptorUpdateTemplate t, const void* data) {
+	if (!Internal()) camera::OnUpdateWithTemplate(t, data);
+	R().vkUpdateDescriptorSetWithTemplateKHR(d, set, t, data);
+}
+VKAPI_ATTR void VKAPI_CALL Hook_UpdateDescriptorSets(VkDevice d, uint32_t nw, const VkWriteDescriptorSet* w, uint32_t nc,
+                                                     const VkCopyDescriptorSet* c) {
+	if (!Internal()) camera::OnUpdateDescriptorSets(nw, w);
+	R().vkUpdateDescriptorSets(d, nw, w, nc, c);
+}
+VKAPI_ATTR void VKAPI_CALL Hook_CmdUpdateBuffer(VkCommandBuffer cb, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const void* data) {
+	if (!Internal()) camera::OnCmdUpdateBuffer(data, size);
+	R().vkCmdUpdateBuffer(cb, buffer, offset, size, data);
+}
+VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateBuffer(VkDevice d, const VkBufferCreateInfo* info, const VkAllocationCallbacks* a, VkBuffer* out) {
+	const VkResult r = R().vkCreateBuffer(d, info, a, out);
+	if (r == VK_SUCCESS && !Internal() && (info->usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) camera::OnCreateBuffer(*out, info->size);
+	return r;
+}
+VKAPI_ATTR void VKAPI_CALL Hook_DestroyBuffer(VkDevice d, VkBuffer buffer, const VkAllocationCallbacks* a) {
+	if (buffer != VK_NULL_HANDLE) camera::OnDestroyBuffer(buffer);
+	R().vkDestroyBuffer(d, buffer, a);
+}
+VKAPI_ATTR VkResult VKAPI_CALL Hook_BindBufferMemory(VkDevice d, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset) {
+	const VkResult r = R().vkBindBufferMemory(d, buffer, memory, offset);
+	if (r == VK_SUCCESS && !Internal()) camera::OnBindBufferMemory(buffer, memory, offset);
+	return r;
+}
+static VkResult BindBuffers2(PFN_vkBindBufferMemory2 fn, VkDevice d, uint32_t n, const VkBindBufferMemoryInfo* infos) {
+	const VkResult r = fn(d, n, infos);
+	if (r == VK_SUCCESS && !Internal())
+		for (uint32_t i = 0; i < n; ++i) camera::OnBindBufferMemory(infos[i].buffer, infos[i].memory, infos[i].memoryOffset);
+	return r;
+}
+VKAPI_ATTR VkResult VKAPI_CALL Hook_BindBufferMemory2(VkDevice d, uint32_t n, const VkBindBufferMemoryInfo* i) {
+	return BindBuffers2(R().vkBindBufferMemory2, d, n, i);
+}
+VKAPI_ATTR VkResult VKAPI_CALL Hook_BindBufferMemory2KHR(VkDevice d, uint32_t n, const VkBindBufferMemoryInfo* i) {
+	return BindBuffers2(R().vkBindBufferMemory2KHR, d, n, i);
+}
+VKAPI_ATTR VkResult VKAPI_CALL Hook_MapMemory(VkDevice d, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size,
+                                              VkMemoryMapFlags flags, void** data) {
+	const VkResult r = R().vkMapMemory(d, memory, offset, size, flags, data);
+	if (r == VK_SUCCESS && !Internal() && data != nullptr) camera::OnMapMemory(memory, offset, *data);
+	return r;
+}
+VKAPI_ATTR VkResult VKAPI_CALL Hook_MapMemory2KHR(VkDevice d, const VkMemoryMapInfoKHR* info, void** data) {
+	const VkResult r = R().vkMapMemory2KHR(d, info, data);
+	if (r == VK_SUCCESS && !Internal() && data != nullptr) camera::OnMapMemory(info->memory, info->offset, *data);
+	return r;
+}
+VKAPI_ATTR void VKAPI_CALL Hook_UnmapMemory(VkDevice d, VkDeviceMemory memory) {
+	camera::OnUnmapMemory(memory);
+	R().vkUnmapMemory(d, memory);
+}
+VKAPI_ATTR void VKAPI_CALL Hook_FreeMemory(VkDevice d, VkDeviceMemory memory, const VkAllocationCallbacks* a) {
+	if (memory != VK_NULL_HANDLE) camera::OnUnmapMemory(memory);
+	R().vkFreeMemory(d, memory, a);
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Hook_GetDeviceProcAddr(VkDevice device, const char* name);
@@ -613,6 +810,28 @@ const HookEntry kHooks[] = {
     HOOK("vkCmdPipelineBarrier", Hook_CmdPipelineBarrier, true),
     HOOK("vkCmdPipelineBarrier2", Hook_CmdPipelineBarrier2, true),
     HOOK("vkCmdPipelineBarrier2KHR", Hook_CmdPipelineBarrier2KHR, true),
+    HOOK("vkCmdEndRendering", Hook_CmdEndRendering, true),
+    HOOK("vkCmdEndRenderingKHR", Hook_CmdEndRenderingKHR, true),
+    HOOK("vkCmdBindPipeline", Hook_CmdBindPipeline, true),
+    HOOK("vkCmdBindDescriptorSets", Hook_CmdBindDescriptorSets, true),
+    HOOK("vkCmdPushConstants", Hook_CmdPushConstants, true),
+    HOOK("vkCreateDescriptorUpdateTemplate", Hook_CreateDescriptorUpdateTemplate, true),
+    HOOK("vkCreateDescriptorUpdateTemplateKHR", Hook_CreateDescriptorUpdateTemplateKHR, true),
+    HOOK("vkDestroyDescriptorUpdateTemplate", Hook_DestroyDescriptorUpdateTemplate, true),
+    HOOK("vkDestroyDescriptorUpdateTemplateKHR", Hook_DestroyDescriptorUpdateTemplateKHR, true),
+    HOOK("vkUpdateDescriptorSetWithTemplate", Hook_UpdateDescriptorSetWithTemplate, true),
+    HOOK("vkUpdateDescriptorSetWithTemplateKHR", Hook_UpdateDescriptorSetWithTemplateKHR, true),
+    HOOK("vkUpdateDescriptorSets", Hook_UpdateDescriptorSets, true),
+    HOOK("vkCmdUpdateBuffer", Hook_CmdUpdateBuffer, true),
+    HOOK("vkCreateBuffer", Hook_CreateBuffer, true),
+    HOOK("vkDestroyBuffer", Hook_DestroyBuffer, true),
+    HOOK("vkBindBufferMemory", Hook_BindBufferMemory, true),
+    HOOK("vkBindBufferMemory2", Hook_BindBufferMemory2, true),
+    HOOK("vkBindBufferMemory2KHR", Hook_BindBufferMemory2KHR, true),
+    HOOK("vkMapMemory", Hook_MapMemory, true),
+    HOOK("vkMapMemory2KHR", Hook_MapMemory2KHR, true),
+    HOOK("vkUnmapMemory", Hook_UnmapMemory, true),
+    HOOK("vkFreeMemory", Hook_FreeMemory, true),
 };
 
 const HookEntry* FindHook(const char* name) {
@@ -641,7 +860,29 @@ VKAPI_ATTR VkResult VKAPI_CALL inj_vkCreateInstance(const VkInstanceCreateInfo* 
 	InitOnce();
 	if (R().gipa == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
 	auto create = reinterpret_cast<PFN_vkCreateInstance>(R().gipa(VK_NULL_HANDLE, "vkCreateInstance"));
-	VkResult r = create(info, alloc, instance);
+	if (Internal()) return create(info, alloc, instance);  // (Streamline's / XeSS's own instances: not the game's)
+	// Streamline (slInit) and XeSS load first: DLSS / XeSS need their instance extensions on the game's instance.
+	upscale::BeforeCreateInstance();
+	std::vector<const char*> extensions(info->ppEnabledExtensionNames, info->ppEnabledExtensionNames + info->enabledExtensionCount);
+	{
+		auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(R().gipa(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties"));
+		uint32_t n = 0;
+		std::vector<VkExtensionProperties> available;
+		if (enumerate != nullptr && enumerate(nullptr, &n, nullptr) == VK_SUCCESS) {
+			available.resize(n);
+			enumerate(nullptr, &n, available.data());
+			available.resize(n);
+		}
+		upscale::InstanceExtensions(available, extensions);
+	}
+	VkInstanceCreateInfo patched = *info;
+	patched.enabledExtensionCount   = static_cast<uint32_t>(extensions.size());
+	patched.ppEnabledExtensionNames = extensions.data();
+	VkResult r = create(&patched, alloc, instance);
+	if (r != VK_SUCCESS && patched.enabledExtensionCount != info->enabledExtensionCount) {
+		Log("vkCreateInstance with the upscalers' extensions failed (%d): again without them", r);
+		r = create(info, alloc, instance);
+	}
 	if (r == VK_SUCCESS) {
 		R().instance = *instance;
 		Log("vkCreateInstance -> %p", static_cast<void*>(*instance));

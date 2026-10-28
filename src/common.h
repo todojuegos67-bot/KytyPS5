@@ -43,6 +43,16 @@ struct Settings {
 	int   mv_units       = 0;      // 0: UV (scale by render size), 1: pixels (scale 1)
 	int   depth_mode     = 0;      // 0 auto (from the depth clear value), 1 normal, 2 reversed
 	bool  previews       = true;
+	// ---- upscaling (F1 > Reescalado) ----
+	int   up_backend     = 0;      // 0 off, 1 DLSS (Streamline), 2 FSR 4, 3 FSR 3.1, 4 XeSS
+	int   up_quality     = 0;      // 0 auto (from the game's own scale), 1 native AA, 2 quality, 3 balanced, 4 performance, 5 ultra perf.
+	float up_sharpness   = 0.30f;  // RCAS at the display size (0 off)
+	bool  up_original    = false;  // A/B (F3): the game's own image on screen, the upscaler keeps running
+	bool  up_split       = false;  // left half upscaled, right half the game's
+	int   up_jitter      = 0;      // 0 auto (detected in the projection), 1 none, 2 inject a Halton jitter into the projection
+	int   up_input       = 0;      // 0 the final scene image (post-TAA, before the composite), 1 pre-TAA (experimental)
+	bool  up_native      = false;  // also when the game renders at the display size (anti-aliasing only)
+	bool  up_streamline  = true;   // load NVIDIA Streamline at start (DLSS needs it before the game's Vulkan instance)
 };
 Settings&   Cfg();
 void        LoadSettings();
@@ -71,6 +81,17 @@ PFN_vkVoidFunction RealDeviceProc(const char* name);  // for FidelityFX and ImGu
 // submits while holding it.
 std::recursive_mutex& QueueLock();
 
+// Third-party runtimes (Streamline, XeSS, FidelityFX) that load "vulkan-1.dll" by name get ours and call back into our
+// exports: while one of their calls runs on this thread (an InternalScope alive), every hook passes straight through
+// (no analyzer, no recording, no instance / device bookkeeping).
+struct InternalScope {
+	InternalScope();
+	~InternalScope();
+	InternalScope(const InternalScope&) = delete;
+	InternalScope& operator=(const InternalScope&) = delete;
+};
+bool Internal();
+
 // The queues added at device creation for frame generation (VK_NULL_HANDLE when unavailable).
 struct Queues {
 	uint32_t graphics_family = UINT32_MAX;
@@ -83,6 +104,9 @@ struct Queues {
 	bool     fg_queues_ok    = false;
 };
 Queues& Q();
+
+// Sizes of the feature structures we OR flags into at device creation (0: unknown).
+size_t FeatureStructSize(VkStructureType type);
 
 HWND& GameWindow();
 uint32_t FindMemoryType(uint32_t bits, VkMemoryPropertyFlags flags);

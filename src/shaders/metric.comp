@@ -1,0 +1,29 @@
+#version 450
+// Sharpness metric for the log: the mean absolute Laplacian of luma (tone mapped l / (1 + l)) over a 256x256 crop of the
+// display image's centre, summed into sums[slot] (fixed point, 1/1024). The same crop is taken of the game's own image
+// (before our blit) and of the image we put on screen (after it).
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform sampler2D img;
+layout(std430, binding = 1) buffer Sums { uint sums[4]; } o;
+layout(push_constant) uniform Push { uint slot; } pc;
+
+shared float part[256];
+
+float L(ivec2 p) {
+	vec3 c = max(texelFetch(img, clamp(p, ivec2(0), ivec2(255)), 0).rgb, vec3(0.0));
+	float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+	return l / (1.0 + l);
+}
+
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	uint i = gl_LocalInvocationIndex;
+	float lap = abs(4.0 * L(p) - L(p + ivec2(1, 0)) - L(p - ivec2(1, 0)) - L(p + ivec2(0, 1)) - L(p - ivec2(0, 1)));
+	part[i] = lap;
+	barrier();
+	for (uint s = 128u; s > 0u; s >>= 1u) {
+		if (i < s) part[i] += part[i + s];
+		barrier();
+	}
+	if (i == 0u) atomicAdd(o.sums[pc.slot], uint(part[0] * 1024.0 + 0.5));
+}

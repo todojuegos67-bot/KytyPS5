@@ -212,6 +212,33 @@ bool Install(const std::wstring& exe) {
 		manifest << L"file=" << name << L"\n";
 		done += L"  " + name + L"\n";
 	}
+	// Phase 2, optional (copied when the package has them): XeSS (libxess.dll), DLSS (streamline\, NVIDIA's Streamline
+	// DLLs) and FSR 4 (fsr4_shaders\, AMD's model). Files already there are backed up as the others.
+	const auto copy_one = [&](const std::wstring& name) {
+		const std::wstring src = payload + name, dst = dir + name;
+		if (Exists(dst)) {
+			MoveFileExW(dst.c_str(), (dst + L".injector-bak").c_str(), MOVEFILE_REPLACE_EXISTING);
+			manifest << L"backup=" << name << L"\n";
+		}
+		if (!CopyFileW(src.c_str(), dst.c_str(), FALSE)) return false;
+		manifest << L"file=" << name << L"\n";
+		return true;
+	};
+	if (Exists(payload + L"libxess.dll") && copy_one(L"libxess.dll")) done += L"  libxess.dll (XeSS)\n";
+	for (const wchar_t* folder: {L"streamline", L"fsr4_shaders"}) {
+		WIN32_FIND_DATAW fd {};
+		HANDLE find = FindFirstFileW((payload + folder + L"\\*").c_str(), &fd);
+		if (find == INVALID_HANDLE_VALUE) continue;
+		const bool made = CreateDirectoryW((dir + folder).c_str(), nullptr) != 0;
+		if (made) manifest << L"dir=" << folder << L"\n";
+		int n = 0;
+		do {
+			if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+			if (copy_one(std::wstring(folder) + L"\\" + fd.cFileName)) ++n;
+		} while (FindNextFileW(find, &fd));
+		FindClose(find);
+		done += L"  " + std::wstring(folder) + L"\\ (" + std::to_wstring(n) + L" archivos)\n";
+	}
 	Say(std::wstring(L"Instalado para ") + std::wstring(ApiName(api), ApiName(api) + std::strlen(ApiName(api))) + L" en\n" + dir +
 	    L"\n\n" + done + L"\nInicia el juego y pulsa F1. Log: injector.log junto al exe.");
 	return true;
@@ -222,7 +249,7 @@ bool Uninstall(const std::wstring& exe) {
 	std::wifstream manifest(dir + kManifest);
 	if (!manifest) { Say(L"No hay instalacion aqui (falta injector_install.txt).", MB_ICONWARNING); return false; }
 	std::wstring line, removed;
-	std::vector<std::wstring> backups;
+	std::vector<std::wstring> backups, dirs;
 	while (std::getline(manifest, line)) {
 		if (line.rfind(L"file=", 0) == 0) {
 			const std::wstring name = line.substr(5);
@@ -231,11 +258,14 @@ bool Uninstall(const std::wstring& exe) {
 			removed += L"  " + name + L"\n";
 		} else if (line.rfind(L"backup=", 0) == 0) {
 			backups.push_back(line.substr(7));
+		} else if (line.rfind(L"dir=", 0) == 0) {
+			dirs.push_back(line.substr(4));
 		}
 	}
 	manifest.close();
 	for (const auto& name: backups)
 		MoveFileExW((dir + name + L".injector-bak").c_str(), (dir + name).c_str(), MOVEFILE_REPLACE_EXISTING);
+	for (const auto& name: dirs) RemoveDirectoryW((dir + name).c_str());  // (only when empty: nothing of the game's is lost)
 	DeleteFileW((dir + kManifest).c_str());
 	Say(L"Desinstalado de " + dir + L"\n\n" + removed + L"\n(injector.ini, injector.log e injector_profiles se conservan.)");
 	return true;

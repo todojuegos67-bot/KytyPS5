@@ -199,6 +199,9 @@ double CapFps() {
 bool Available() {
 	return Q().fg_queues_ok && Load();
 }
+const ffxFunctions* FfxApi() {
+	return Load() ? &g_ffx : nullptr;
+}
 bool Owns(VkSwapchainKHR swapchain) {
 	return g_sc_ctx != nullptr && swapchain == g_swapchain;
 }

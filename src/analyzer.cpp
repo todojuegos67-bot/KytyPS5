@@ -48,6 +48,7 @@ struct Img {
 	VkImageLayout     layout = VK_IMAGE_LAYOUT_UNDEFINED;  // last layout seen in submitted work
 	bool              interesting = false;
 	bool              swapchain   = false;
+	uint32_t          written = 0;  // bit 0: written as a pass target this frame, bit n: n frames ago
 };
 
 enum class Kind : uint8_t { Layout, Rendering };
@@ -79,7 +80,8 @@ struct Pick {
 	float      score = 0;
 	std::string why;
 };
-Pick  g_depth, g_motion, g_backbuffer;
+Pick  g_depth, g_motion, g_backbuffer, g_scene, g_pretaa;
+bool  g_taa_found = false;
 bool  g_reversed = false, g_reversed_known = false;
 int   g_hud_after = -1, g_hud_stable = 0, g_ui_passes = 0, g_passes_last = 0;
 float g_hud_conf = 0;
@@ -191,8 +193,10 @@ void PatchImageCreate(VkImageCreateInfo& info) {
 	const bool depth  = IsDepthFormat(info.format) && (info.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
 	const bool motion = MotionFormatScore(info.format) > 0 &&
 	                    (info.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT));
-	const bool color  = (info.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && info.extent.width >= 640;
+	const bool color  = (info.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && info.extent.width >= 320;
 	if ((depth || motion || color) && info.samples == VK_SAMPLE_COUNT_1_BIT) info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+	// (Upscaling: the result is blitted into the game's backbuffer, a display-size color target.)
+	if (color && info.samples == VK_SAMPLE_COUNT_1_BIT) info.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 }
 
 void OnImageCreated(VkImage image, const VkImageCreateInfo& info) {
@@ -211,7 +215,7 @@ void OnImageCreated(VkImage image, const VkImageCreateInfo& info) {
 void OnImageDestroyed(VkImage image) {
 	std::lock_guard lock(g_mutex);
 	g_images.erase(image);
-	for (Pick* p: {&g_depth, &g_motion, &g_backbuffer})
+	for (Pick* p: {&g_depth, &g_motion, &g_backbuffer, &g_scene, &g_pretaa})
 		if (p->image == image) p->image = VK_NULL_HANDLE;
 }
 
@@ -230,15 +234,20 @@ void SetSwapchainImages(const VkImage* images, uint32_t count) {
 	for (uint32_t i = 0; i < count; ++i) g_swap.insert(images[i]);
 }
 
+bool Active() {
+	return Cfg().analyze || Cfg().use_game_inputs || Cfg().up_backend != 0;
+}
+
 void OnBeginCommandBuffer(VkCommandBuffer cb) {
-	if (!Cfg().analyze && !Cfg().use_game_inputs) return;
+	if (!Active()) return;
 	std::lock_guard lock(g_mutex);
 	auto it = g_cb.find(cb);
 	if (it != g_cb.end()) it->second.clear();
 }
 
-void OnBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* info) {
-	if (info == nullptr || (!Cfg().analyze && !Cfg().use_game_inputs)) return;
+PassInfo OnBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* info) {
+	PassInfo pass;
+	if (info == nullptr || !Active()) return pass;
 	Ev ev {Kind::Rendering};
 	std::lock_guard lock(g_mutex);
 	const auto image_of = [](VkImageView view) {
@@ -258,6 +267,15 @@ void OnBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* info) {
 			ev.depth_clear = info->pDepthAttachment->clearValue.depthStencil.depth;
 	}
 	g_cb[cb].push_back(ev);
+	pass.depth      = ev.image;
+	pass.main_depth = ev.image != VK_NULL_HANDLE && ev.image == g_depth.image;
+	if (ev.ncolors > 0) {
+		pass.color0        = ev.colors[0];
+		pass.color0_layout = ev.color_layouts[0];
+		pass.swapchain     = g_swap.count(ev.colors[0]) != 0;
+		pass.backbuffer    = ev.colors[0] != VK_NULL_HANDLE && ev.colors[0] == g_backbuffer.image;
+	}
+	return pass;
 }
 
 static void RecordLayout(VkCommandBuffer cb, VkImage image, VkImageLayout layout) {
@@ -270,20 +288,20 @@ static void RecordLayout(VkCommandBuffer cb, VkImage image, VkImageLayout layout
 }
 
 void OnBarrier2(VkCommandBuffer cb, const VkDependencyInfo* info) {
-	if (info == nullptr || (!Cfg().analyze && !Cfg().use_game_inputs)) return;
+	if (info == nullptr || !Active()) return;
 	std::lock_guard lock(g_mutex);
 	for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i)
 		RecordLayout(cb, info->pImageMemoryBarriers[i].image, info->pImageMemoryBarriers[i].newLayout);
 }
 
 void OnBarrier(VkCommandBuffer cb, uint32_t count, const VkImageMemoryBarrier* barriers) {
-	if (barriers == nullptr || (!Cfg().analyze && !Cfg().use_game_inputs)) return;
+	if (barriers == nullptr || !Active()) return;
 	std::lock_guard lock(g_mutex);
 	for (uint32_t i = 0; i < count; ++i) RecordLayout(cb, barriers[i].image, barriers[i].newLayout);
 }
 
 void OnSubmit(const VkCommandBuffer* cbs, uint32_t count) {
-	if (!Cfg().analyze && !Cfg().use_game_inputs) return;
+	if (!Active()) return;
 	std::lock_guard lock(g_mutex);
 	for (uint32_t i = 0; i < count; ++i) {
 		auto it = g_cb.find(cbs[i]);
@@ -308,7 +326,7 @@ void OnSubmit(const VkCommandBuffer* cbs, uint32_t count) {
 
 void EndFrame(VkExtent2D display) {
 	if (!g_prof_loaded) LoadProfile();
-	if (!Cfg().analyze && !Cfg().use_game_inputs) return;
+	if (!Active()) return;
 	std::lock_guard lock(g_mutex);
 	++g_frames;
 	struct Use { uint32_t depth = 0, color = 0, layout_general = 0; int first = -1, last = -1; float clear = -1; };
@@ -413,6 +431,61 @@ void EndFrame(VkExtent2D display) {
 	} else {
 		g_hud_conf *= 0.95f;
 	}
+
+	// Pass-target history (bit 0 = this frame), for the TAA's ping-pong.
+	for (auto& [image, img]: g_images) img.written <<= 1;
+	for (const auto& [image, u]: uses) {
+		if (u.color == 0) continue;
+		auto it = g_images.find(image);
+		if (it != g_images.end()) it->second.written |= 1u;
+	}
+	// The scene image (upscaler input): at the depth's size, the last color target written before the composite (the
+	// backbuffer's first pass), not the motion vectors. At the display's size too when the game renders at it.
+	const int composite = bb != VK_NULL_HANDLE ? uses[bb].first : passes;
+	const auto render_sized = [&](VkImage t) -> const Img* {
+		if (t == VK_NULL_HANDLE || t == bb || g_depth.image == VK_NULL_HANDLE) return nullptr;
+		auto it = g_images.find(t);
+		if (it == g_images.end() || !it->second.interesting || IsDepthFormat(it->second.info.format)) return nullptr;
+		const auto& e = it->second.info.extent;
+		if (e.width != g_depth.extent.width || e.height != g_depth.extent.height) return nullptr;
+		if (t == g_motion.image) return nullptr;
+		return &it->second;
+	};
+	const Img* scene = nullptr; VkImage scene_image = VK_NULL_HANDLE;
+	for (int p = std::min(composite, passes) - 1; p >= 0 && scene == nullptr; --p) {
+		if (const Img* img = render_sized(pass_target[p])) { scene = img; scene_image = pass_target[p]; }
+	}
+	Settle(g_scene, scene, scene_image, 1.0f);
+	g_scene.confidence = scene != nullptr ? std::min(1.0f, 0.4f + 0.6f * std::min(1.0f, g_scene.stable / 60.0f)) * std::min(1.0f, g_depth.confidence / 0.6f)
+	                                      : g_scene.confidence * 0.95f;
+	if (scene != nullptr) g_scene.why = "last render-size target before the composite";
+	// Pre-TAA: the game's TAA writes one of two render-size images on alternate frames (its history ping-pong); the
+	// color it resolves is the last other render-size target written before that pass.
+	const Img* pre = nullptr; VkImage pre_image = VK_NULL_HANDLE; int taa_pass = -1;
+	g_taa_found = false;
+	for (const auto& [image, u]: uses) {
+		if (u.color == 0) continue;
+		const Img* x = render_sized(image);
+		if (x == nullptr || (x->written & 0xFFu) != 0x55u) continue;  // written this frame, every other frame
+		for (const auto& [other, oi]: g_images) {
+			if (other == image || oi.info.format != x->info.format || oi.info.extent.width != x->info.extent.width ||
+			    oi.info.extent.height != x->info.extent.height || (oi.written & 0xFFu) != 0xAAu)
+				continue;
+			g_taa_found = true;
+			taa_pass = u.last;
+			for (int p = taa_pass - 1; p >= 0 && pre == nullptr; --p) {
+				const VkImage t = pass_target[p];
+				if (t == image || t == other) continue;
+				if (const Img* img = render_sized(t)) { pre = img; pre_image = t; }
+			}
+			break;
+		}
+		if (g_taa_found) break;
+	}
+	Settle(g_pretaa, pre, pre_image, 1.0f);
+	g_pretaa.confidence = pre != nullptr ? std::min(1.0f, 0.3f + 0.7f * std::min(1.0f, g_pretaa.stable / 60.0f)) : g_pretaa.confidence * 0.95f;
+	if (pre != nullptr) g_pretaa.why = "read by the TAA (history ping-pong)";
+
 	if (g_frames % 300 == 0)
 		Log("[analyze] frame %llu: %d passes; depth %s %.2f (fmt %d %ux%u, %s); motion %s %.2f (fmt %d %ux%u); hud %.2f "
 		    "(after pass %d, %d UI passes)",
@@ -420,6 +493,12 @@ void EndFrame(VkExtent2D display) {
 		    g_depth.format, g_depth.extent.width, g_depth.extent.height, g_depth.why.c_str(),
 		    g_motion.image ? "found" : "none", g_motion.confidence, g_motion.format, g_motion.extent.width,
 		    g_motion.extent.height, g_hud_conf, g_hud_after, g_ui_passes);
+	if (g_frames % 300 == 0 && Cfg().up_backend != 0)
+		Log("[analyze] frame %llu: scene %s %.2f (fmt %d %ux%u); TAA %s, pre-TAA %s %.2f (fmt %d %ux%u, TAA pass %d)",
+		    static_cast<unsigned long long>(g_frames), g_scene.image ? "found" : "none", g_scene.confidence, g_scene.format,
+		    g_scene.extent.width, g_scene.extent.height, g_taa_found ? "ping-pong found" : "not seen",
+		    g_pretaa.image ? "found" : "none", g_pretaa.confidence, g_pretaa.format, g_pretaa.extent.width,
+		    g_pretaa.extent.height, taa_pass);
 	SaveProfileIfChanged();
 }
 
@@ -533,6 +612,61 @@ Inputs RecordCopies(VkCommandBuffer cb) {
 	return in;
 }
 
+namespace {
+VkImageLayout LayoutLocked(VkCommandBuffer cb, VkImage image) {
+	auto c = g_cb.find(cb);
+	if (c != g_cb.end()) {
+		for (auto ev = c->second.rbegin(); ev != c->second.rend(); ++ev) {
+			if (ev->kind == Kind::Layout) {
+				if (ev->image == image) return ev->layout;
+				continue;
+			}
+			if (ev->image == image) return ev->depth_layout;
+			for (uint8_t i = 0; i < ev->ncolors; ++i)
+				if (ev->colors[i] == image) return ev->color_layouts[i];
+		}
+	}
+	auto it = g_images.find(image);
+	return it != g_images.end() ? it->second.layout : VK_IMAGE_LAYOUT_UNDEFINED;
+}
+Image ImageOf(VkCommandBuffer cb, const Pick& p) {
+	Image out;
+	if (p.image == VK_NULL_HANDLE) return out;
+	auto it = g_images.find(p.image);
+	if (it == g_images.end()) return out;
+	out.image  = p.image;
+	out.format = it->second.info.format;
+	out.extent = {it->second.info.extent.width, it->second.info.extent.height};
+	out.usage  = it->second.info.usage;
+	out.layout = LayoutLocked(cb, p.image);
+	out.confidence = p.confidence;
+	return out;
+}
+} // namespace
+
+VkImageLayout LayoutIn(VkCommandBuffer cb, VkImage image) {
+	std::lock_guard lock(g_mutex);
+	return LayoutLocked(cb, image);
+}
+
+UpscaleView View(VkCommandBuffer cb) {
+	std::lock_guard lock(g_mutex);
+	UpscaleView v;
+	v.backbuffer = ImageOf(cb, g_backbuffer);
+	v.backbuffer.confidence = g_hud_conf;
+	v.scene  = ImageOf(cb, g_scene);
+	v.pretaa = ImageOf(cb, g_pretaa);
+	v.depth  = ImageOf(cb, g_depth);
+	v.motion = ImageOf(cb, g_motion);
+	const int mode = Cfg().depth_mode;
+	v.reversed_depth = mode == 2 || (mode == 0 && g_reversed_known && g_reversed);
+	v.hud_after = g_hud_after;
+	v.ui_passes = g_ui_passes;
+	v.hud_confidence = g_hud_conf;
+	v.taa_found = g_taa_found;
+	return v;
+}
+
 void DrawMenu() {
 	std::lock_guard lock(g_mutex);
 	auto& s = Cfg();
@@ -554,6 +688,10 @@ void DrawMenu() {
 	Pick hp = g_backbuffer;
 	hp.confidence = g_hud_conf;
 	row("HUD", hp, g_copy_color, hud);
+	if (Cfg().up_backend != 0) {
+		row("Escena", g_scene, Copy {}, g_scene.why.c_str());
+		row("Pre-TAA", g_pretaa, Copy {}, g_taa_found ? g_pretaa.why.c_str() : "sin ping-pong de TAA");
+	}
 	ImGui::SliderFloat("Confianza minima", &s.min_confidence, 0.3f, 0.95f, "%.2f");
 	ImGui::Checkbox("Usar depth/vectores del juego en FG", &s.use_game_inputs);
 	ImGui::Checkbox("Previews", &s.previews);
@@ -575,7 +713,8 @@ void Shutdown() {
 	g_cb.clear();
 	g_frame.clear();
 	g_swap.clear();
-	g_depth = g_motion = g_backbuffer = Pick {};
+	g_depth = g_motion = g_backbuffer = g_scene = g_pretaa = Pick {};
+	g_taa_found = false;
 	g_hud_after = -1;
 	g_hud_stable = 0;
 	g_hud_conf = 0;

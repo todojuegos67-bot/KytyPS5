@@ -2,6 +2,7 @@
 
 #include "analyzer.h"
 #include "framegen.h"
+#include "upscale.h"
 
 #include <imgui.h>
 #include <imgui_impl_vulkan.h>
@@ -28,7 +29,7 @@ VkSampler        g_sampler = VK_NULL_HANDLE;
 std::vector<VkImageView>   g_views;
 std::vector<VkFramebuffer> g_framebuffers;
 std::unordered_map<VkImageView, VkDescriptorSet> g_textures;
-bool g_key_f1 = false, g_key_f2 = false;
+bool g_key_f1 = false, g_key_f2 = false, g_key_f3 = false;
 std::chrono::steady_clock::time_point g_last {};
 
 PFN_vkVoidFunction Loader(const char* name, void*) {
@@ -147,15 +148,15 @@ void DrawUi() {
 	auto& s = Cfg();
 	const auto st = framegen::LastStats();
 	if (s.osd) {
-		char line[160];
-		std::snprintf(line, sizeof line, "FG %s | real %.0f -> shown %.0f fps (x%.2f) | F1 menu", st.state, st.real_fps,
-		              st.shown_fps, st.ratio);
+		char line[320];
+		std::snprintf(line, sizeof line, "FG %s | real %.0f -> shown %.0f fps (x%.2f)%s | F1 menu", st.state, st.real_fps,
+		              st.shown_fps, st.ratio, upscale::OsdText());
 		ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(4, 4), ImVec2(12 + 7.0f * std::strlen(line), 24), IM_COL32(0, 0, 0, 150));
 		ImGui::GetForegroundDrawList()->AddText(ImVec2(8, 7), IM_COL32(255, 255, 255, 255), line);
 	}
 	if (!g_menu) return;
 	ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_FirstUseEver);
-	ImGui::SetNextWindowSize(ImVec2(520, 640), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(560, 760), ImGuiCond_FirstUseEver);
 	ImGui::Begin("Injector (F1)");
 	ImGui::Text("Juego: %s.exe", ExeName().c_str());
 	if (ImGui::CollapsingHeader("Frame generation", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -170,8 +171,8 @@ void DrawUi() {
 		ImGui::Checkbox("Analisis en vivo", &s.analyze);
 		analyzer::DrawMenu();
 	}
-	if (ImGui::CollapsingHeader("Upscaler (fase 2)")) {
-		ImGui::TextWrapped("FSR / XeSS / DLSS (Streamline) usaran los mismos datos del perfil. No implementado en fase 1.");
+	if (ImGui::CollapsingHeader("Reescalado", ImGuiTreeNodeFlags_DefaultOpen)) {
+		upscale::DrawMenu();
 	}
 	ImGui::Checkbox("OSD", &s.osd);
 	ImGui::End();
@@ -246,8 +247,14 @@ void PollInput() {
 		Log("[overlay] F2: frame generation %s", Cfg().fg_enabled ? "on" : "off");
 		SaveSettings();
 	}
+	const bool f3 = Down(VK_F3);
+	if (f3 && !g_key_f3 && Cfg().up_backend != 0) {
+		Cfg().up_original = !Cfg().up_original;
+		Log("[overlay] F3: A/B, %s on screen", Cfg().up_original ? "the game's original image" : "the upscaled image");
+	}
 	g_key_f1 = f1;
 	g_key_f2 = f2;
+	g_key_f3 = f3;
 }
 
 bool WantsDraw() {
