@@ -476,7 +476,7 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		static const char* const upscaler_name = [] {
 			const char* value = std::getenv("KYTY_UPSCALER");
 			const std::string kind = value != nullptr ? value : "";
-			return kind == "xess" ? "XeSS" : kind == "fsr" ? "FSR 3.1" : "DLSS";
+			return kind == "xess" ? "XeSS" : kind == "fsr" ? "FSR 3.1" : kind == "fsr4" ? "AMD FSR 4" : "DLSS";
 		}();
 		std::printf("Super resolution: %s, the game's exposure %s\n", dlss ? upscaler_name : "stretch",
 		            record.exposure_pass.pipeline != nullptr ? "applied" : "not applied");

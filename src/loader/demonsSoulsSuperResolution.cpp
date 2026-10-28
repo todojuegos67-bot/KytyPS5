@@ -44,7 +44,7 @@ bool AnyHeight() {
 void Install(Program* program) {
 	const char* upscaler = std::getenv("KYTY_UPSCALER");
 	const std::string_view kind = upscaler != nullptr ? std::string_view(upscaler) : std::string_view();
-	if ((kind != "dlss" && kind != "xess" && kind != "fsr") || program == nullptr ||
+	if ((kind != "dlss" && kind != "xess" && kind != "fsr" && kind != "fsr4") || program == nullptr ||
 	    !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin")
 		return;
 	// (The device exists by now: without DLSS on it, the game's own TAA rather than a stretch without anti-aliasing.)
@@ -52,6 +52,9 @@ void Install(Program* program) {
 		if (kind == "dlss")
 			std::printf("Demon's Souls super resolution: DLSS is not available here (an NVIDIA RTX GPU and NVIDIA's Streamline "
 			            "runtime); the game's own TAA kept\n");
+		else if (kind == "fsr4")
+			std::printf("Demon's Souls super resolution: AMD FSR 4 is not available here (the INT8/DOT4 GPU features or "
+			            "fsr4_shaders next to the emulator; see the FSR 4 lines above); the game's own TAA kept\n");
 		else
 			std::printf("Demon's Souls super resolution: %s is not available here (its DLL next to the emulator); the game's "
 			            "own TAA kept\n", kind == "xess" ? "XeSS" : "FSR 3.1");

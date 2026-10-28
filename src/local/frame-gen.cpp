@@ -3,6 +3,7 @@
 #include "graphics/presentation/window/hostInput.h"
 #include "fsr3-fg.h"
 #include "xess-sr.h"
+#include "fsr4-sr.h"
 #include "hwrt-particles.h"
 #include "graphics/presentation/videoOut.h"
 #include <chrono>
@@ -172,7 +173,7 @@ bool     g_ready       = false; // Streamline loaded and the feature available
 bool     g_upscale     = false; // KYTY_UPSCALER=dlss: DLSS super resolution asked for (Streamline loaded for it)
 bool     g_upscale_ready = false; // ... and available on the device
 // KYTY_UPSCALER=xess|fsr: the PS5 Pro path (renderSuperResolution.cpp) upscaled by our XeSS or FSR 3.1 instead of DLSS.
-int      g_sr_kind = 0; // 0 none, 1 DLSS, 2 XeSS, 3 FSR
+int      g_sr_kind = 0; // 0 none, 1 DLSS, 2 XeSS, 3 FSR 3.1, 4 FSR 4 (fsr4-sr.h)
 Camera   g_camera;              // Kyty.Gpu: the current guest frame
 Sources  g_sources;             // Kyty.Gpu: the current guest frame
 uint64_t g_guest_frame = 0;     // Kyty.Gpu
@@ -1048,7 +1049,7 @@ void Initialize() {
 		// KYTY_UPSCALER: the game's PS5 Pro path (its upscaler in place of the TAA) with DLSS, XeSS or FSR.
 		const char* upscaler = std::getenv("KYTY_UPSCALER");
 		const std::string kind = upscaler != nullptr ? upscaler : "";
-		g_sr_kind = kind == "dlss" ? 1 : kind == "xess" ? 2 : kind == "fsr" ? 3 : 0;
+		g_sr_kind = kind == "dlss" ? 1 : kind == "xess" ? 2 : kind == "fsr" ? 3 : kind == "fsr4" ? 4 : 0;
 		g_upscale = g_sr_kind == 1;
 	}
 	if (g_generate == 0 && !g_dlss_sr && !g_taa_dlss && !g_upscale) {
@@ -3606,6 +3607,7 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 bool UpscalerReady() {
 	if (g_sr_kind == 2) return Xess::Ready();
 	if (g_sr_kind == 3) return Fsr3::SrReady();
+	if (g_sr_kind == 4) return Fsr4::Ready();
 	return g_upscale_ready;
 }
 
@@ -3647,6 +3649,34 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		x.mv_scale[1] = inputs.motion_scale_y;
 		if (have_reactive) x.mask = &reactive, x.mask_view = inputs.reactive.view;
 		done          = Xess::Upscale(x);
+	} else if (g_sr_kind == 4 && g_graphics_ctx != nullptr) {
+		// AMD FSR 4 (fsr4-sr.cpp): our runtime of the v07 INT8 model, its RCAS included.
+		Fsr4::UpscaleDesc f;
+		f.command        = command;
+		f.color_view     = inputs.color.view;
+		f.color_layout   = inputs.color.layout;
+		f.depth_view     = inputs.depth.view;
+		f.depth_layout   = inputs.depth.layout;
+		f.motion_view    = inputs.motion.view;
+		f.motion_layout  = inputs.motion.layout;
+		f.output         = inputs.output.image;
+		f.output_view    = inputs.output.view;
+		f.output_format  = inputs.output.format;
+		f.output_usage   = inputs.output.usage;
+		f.output_level   = inputs.output.level;
+		f.output_layer   = inputs.output.layer;
+		f.render         = inputs.color.extent;
+		f.upscale        = inputs.output.extent;
+		f.reset          = inputs.reset;
+		f.jitter[0]      = inputs.jitter_x;
+		f.jitter[1]      = inputs.jitter_y;
+		f.mv_scale[0]    = inputs.motion_scale_x;
+		f.mv_scale[1]    = inputs.motion_scale_y;
+		f.exposure_buffer = inputs.exposure_buffer;
+		f.exposure_base   = inputs.exposure_base;
+		f.exposure_range  = inputs.exposure_range;
+		f.exposure_index  = inputs.exposure_index;
+		done             = Fsr4::Upscale(*g_graphics_ctx, f);
 	} else if (g_graphics_ctx != nullptr) {
 		static auto last = std::chrono::steady_clock::now();
 		const auto  now  = std::chrono::steady_clock::now();
@@ -3673,7 +3703,8 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 	static bool said = false;
 	if (!said) {
 		said = true;
-		std::printf("Super resolution (PS5 Pro path): %s %ux%u -> %ux%u%s\n", g_sr_kind == 2 ? "XeSS" : "FSR 3.1",
+		std::printf("Super resolution (PS5 Pro path): %s %ux%u -> %ux%u%s\n",
+		            g_sr_kind == 2 ? "XeSS" : g_sr_kind == 4 ? Fsr4::Name() : "FSR 3.1",
 		            inputs.color.extent.width, inputs.color.extent.height, inputs.output.extent.width,
 		            inputs.output.extent.height, done ? "" : " (failed: stretched)");
 		std::fflush(stdout);
@@ -9224,9 +9255,9 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	TimedPass("ShineApply", [&] { ShineApply(command, inputs); }); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
 	probed(RtFlicker::Volumetric, "GodraysApply", [&] { return GodraysApply(command, inputs); }); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off; flicker self-check)
 	TimedPass("GbufViewApply", [&] { GbufViewApply(command, inputs); }); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
-	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3;
+	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3 || g_sr_kind == 4;
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
-	const bool  fsr  = g_sr_kind == 3;
+	const bool  fsr  = g_sr_kind == 3 || g_sr_kind == 4; // (FSR 4: its own RCAS too)
 	// (FSR: its RCAS, KYTY_UPSCALE_SHARPNESS defaulting to 0.3 in Fsr3::Upscale; DLSS and XeSS: 0 unless set.)
 	const float amount = fsr ? [] {
 		const char* value = std::getenv("KYTY_UPSCALE_SHARPNESS");
@@ -9237,7 +9268,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	if (!said) {
 		said = true;
 		std::printf("Super resolution sharpening: %g (%s)\n", amount,
-		            fsr ? "FSR RCAS" : g_sr_kind == 2 ? "XeSS + sharpen.comp" : "DLSS + sharpen.comp");
+		            g_sr_kind == 4 ? "FSR 4 RCAS" : fsr ? "FSR RCAS" : g_sr_kind == 2 ? "XeSS + sharpen.comp" : "DLSS + sharpen.comp");
 		std::fflush(stdout);
 	}
 	if (done && !fsr && amount > 0.0f) SharpenOutput(command, inputs, amount);

@@ -375,6 +375,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${sharpen_header}")
 
+# KYTY_UPSCALER=fsr4: the depth copy and exposure texture the FSR 4 model reads (src/local/fsr4-sr.cpp).
+set(fsr4_prep_source "${KYTY_SOURCE_DIR}/local/fsr4-prep.comp")
+set(fsr4_prep_spv "${gpu_tiler_generated_dir}/fsr4_prep.spv")
+set(fsr4_prep_header "${gpu_tiler_generated_dir}/fsr4_prep_spv.h")
+add_custom_command(
+	OUTPUT "${fsr4_prep_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${fsr4_prep_spv}" "${fsr4_prep_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${fsr4_prep_spv} -DOUTPUT=${fsr4_prep_header}
+	        -DSYMBOL=FSR4_PREP_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${fsr4_prep_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${fsr4_prep_header}")
+
 # KYTY_TAA_REPLACE=upscaler: the raw frame into the TAA's output, its alpha kept (src/local/frame-gen.cpp).
 set(taa_bypass_source "${KYTY_SOURCE_DIR}/local/taa-bypass.comp")
 set(taa_bypass_spv "${gpu_tiler_generated_dir}/taa_bypass.spv")
@@ -840,6 +856,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/anti-lag.h"
 	"${KYTY_SOURCE_DIR}/local/anti-lag.cpp"
 	"${KYTY_SOURCE_DIR}/local/xess-sr.cpp"
+	"${KYTY_SOURCE_DIR}/local/fsr4-sr.h"
+	"${KYTY_SOURCE_DIR}/local/fsr4-sr.cpp"
 	"${KYTY_SOURCE_DIR}/local/sync-stats.h"
 	"${KYTY_SOURCE_DIR}/local/sync-stats.cpp"
 	"${KYTY_SOURCE_DIR}/local/debug-snapshot.h"

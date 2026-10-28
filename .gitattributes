@@ -5,3 +5,6 @@
 *.hints binary
 # FidelityFX SDK patches (tools/local/fsr3-mfg): applied with git apply, keep LF.
 *.patch text eol=lf
+# AMD FSR 4 model assets (fsr4_shaders/, src/local/fsr4-sr.h): SPIR-V and weights, never converted.
+fsr4_shaders/** binary
+fsr4_shaders/*.txt text
