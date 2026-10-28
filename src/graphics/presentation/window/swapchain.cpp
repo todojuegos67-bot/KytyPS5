@@ -552,6 +552,7 @@ struct Presenter::Impl {
 		const auto now   = std::chrono::steady_clock::now();
 		UpdateStatus(now);
 		hud.notice = Loader::DemonsSoulsWarp::HudText();
+		hud.trophy = Libs::Trophy::CurrentToast(&hud.trophy_seconds); // (the trophy popup: drawn with the panels)
 		const bool markers = RtLocal::OverlayWanted(); // (KYTY_RTLS_DEBUG: drawn by PlaceHud)
 		if (!markers) hud.markers.clear();
 		if (level < 2) {
@@ -568,7 +569,7 @@ struct Presenter::Impl {
 			hud.perf.busy_ms.clear();
 			hud_window = {}; // (the count starts again when it is switched on)
 			hud_frames = 0;
-			return hud.status.empty() && hud.notice.empty() && !markers ? nullptr : PlaceHud();
+			return hud.status.empty() && hud.notice.empty() && !markers && hud.trophy == nullptr ? nullptr : PlaceHud();
 		}
 		if (level >= 2 && !machine_started) {
 			// The GPU NVML reports on: the Vulkan device's.
@@ -627,7 +628,7 @@ struct Presenter::Impl {
 			hud_window = now;
 			hud_frames = 0;
 		}
-		if (hud.title.empty() && hud.status.empty() && hud.notice.empty() && !markers) {
+		if (hud.title.empty() && hud.status.empty() && hud.notice.empty() && !markers && hud.trophy == nullptr) {
 			return nullptr;
 		}
 		return PlaceHud();
