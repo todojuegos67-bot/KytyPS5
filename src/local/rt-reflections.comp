@@ -497,17 +497,33 @@ float PuddleGuess(vec2 uv, vec3 Nd) {
 	return upf * flat_ * plain * dark;
 }
 // Water: something nearer than the G-buffer's surface (by 2 % of the distance or more), up-facing and flat.
+// (ds-rt-refl2-1027) The game's wetness, L2.b1 (128 dry, 32..112 the fountain's water and the wet ground, lower =
+// wetter), read straight from the packed layers - before, only under the calibrated layout (CaptureLayout), and the
+// depth test below never fires in Demon's Souls (the upscaler's depth == the G-buffer-time depth: the capture 20261028-
+// 001124 has them bit-identical), so the fountain got the generic glossy path: water 0.0 % in every log.
+float WetWater(ivec2 rp, vec2 uv, vec3 Nd) {
+	if (push.dec.z < 3) return 0.0;
+	uint  w2 = Packed(2, rp);
+	if (w2 == 0u) return 0.0;
+	float b1 = float((w2 >> 8u) & 255u);
+	if (b1 < 32.0 || b1 > 120.0) return 0.0;
+	float wet = clamp((120.0 - b1) / 56.0, 0.0, 1.0); // (112 -> 0.14, 64 and below -> 1)
+	float upf = UpFacing(Nd);
+	if (upf <= 0.0) return 0.0;
+	return wet * upf * Flatness(uv, Nd, 0.9, 0.98);
+}
 float WaterMask(ivec2 rp, float d, vec2 uv, vec3 Nd) {
-	if ((push.misc.w & 64) == 0) return 0.0;
+	float ww = WetWater(rp, uv, Nd);
+	if ((push.misc.w & 64) == 0) return ww;
 	float d0 = texelFetch(gdepth, rp, 0).r;
 	float z  = abs(ViewZ(d));
 	float z0 = IsSky(d0) ? FAR : abs(ViewZ(d0));
 	// (refl3: 0.5 % of the distance and 3 cm, was 2 %: far and shallow water was lost)
 	float nearer = smoothstep(0.004, 0.015, (z0 - z) / max(z, 1e-3)) * smoothstep(0.02, 0.06, z0 - z);
-	if (nearer <= 0.0) return 0.0;
+	if (nearer <= 0.0) return ww;
 	float upf = UpFacing(Nd);
-	if (upf <= 0.0) return 0.0;
-	return nearer * upf * Flatness(uv, Nd, 0.93, 0.985); // (refl4: must be flat: never a character or a particle)
+	if (upf <= 0.0) return ww;
+	return max(ww, nearer * upf * Flatness(uv, Nd, 0.93, 0.985)); // (refl4: must be flat: never a character or a particle)
 }
 // Flat water reflects as a mirror: its depth normal (noisy from the depth's precision far away) snapped to world up
 // when it is close to it; waves (normals further off) keep their own.
