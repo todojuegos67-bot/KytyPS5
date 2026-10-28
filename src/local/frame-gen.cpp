@@ -8533,7 +8533,7 @@ void RtSunLog(double gpu_ms, uint32_t samples) {
 	for (int h = 0; h < 8; ++h) std::printf(" %u", g_rs.votes[h]);
 	std::printf("), bias %.3f m, sun/ambient R %.2f (%u lit / %u shadowed samples), %u cascades (texel %.3f..%.3f m), %llu copies; "
 	            "GPU %.3f ms (%u samples)\n",
-	            g_rs.bias_m, g_rs.log_r >= 0.0 ? std::exp2(g_rs.log_r) - 1.0 : -1.0, g_rs.r_lit, g_rs.r_shadow, g_rs.cascades_used,
+	            std::max(g_rs.bias_m, 0.75 * static_cast<double>(g_rs.texel_min)), g_rs.log_r >= 0.0 ? std::exp2(g_rs.log_r) - 1.0 : -1.0, g_rs.r_lit, g_rs.r_shadow, g_rs.cascades_used,
 	            g_rs.texel_min, g_rs.texel_max, static_cast<unsigned long long>(g_rs.copies), gpu_ms, samples);
 	std::fflush(stdout);
 	g_rs.st_dark = g_rs.st_lift = g_rs.st_amount = g_rs.st_pixels = 0.0;
@@ -9148,7 +9148,8 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		command.resetQueryPool(g_cs.pool, entry * 2, 2);
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_cs.pool, entry * 2);
 	}
-	push.misc[3] = (inputs.reset ? 1 : 0) | (g_cs.history_valid ? 2 : 0) | (hyp < 6 ? 4 : 0); // (slot 0: statistics at word 64)
+	push.misc[3] = (inputs.reset ? 1 : 0) | (g_cs.history_valid ? 2 : 0) | (hyp < 6 ? 4 : 0) |
+	               (sun_mode && RtFlicker::StillFrames() >= 4 ? 32 : 0); // (slot 0: statistics at word 64; 32: camera still)
 	// trace -> raw (+ gbuf[cur]); temporal (raw, history[prev]) -> tmp_a, count -> moments[cur]; a-trous 1 -> history[cur]
 	// (next frame's history); a-trous 2 -> tmp_b; (a-trous 4 -> tmp_a); composite -> out.
 	if (stats && g_cs.hw) push.misc[3] |= 16; // (KYTY_HWRT_SHADOW: the trace counts its darkening outliers)
