@@ -1,0 +1,402 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// KYTY_RT_REFLECTIONS_HYBRID=1 ("Reflejos RT: Hibrido", rt-reflections.cpp; needs KYTY_HWRT=1 and the scene TLAS,
+// hwrt-scene.cpp): a soft hardware fill for rt-reflections.comp's screen-space trace, recorded between its trace (mode 0)
+// and its temporal pass (mode 1). The screen-space result stays primary and is never changed where it hit.
+//
+//  - Only on reflective trace pixels whose screen-space ray MISSED (off-screen, hidden or nothing found), one ray query a
+//    pixel through the scene TLAS along the mirror direction.
+//  - The hit's colour is never a TLAS material: it is the PREVIOUS frame's composited screen at the hit's reprojected
+//    position, used only when the hit was visible there (its previous-frame distance agrees with the previous trace's
+//    surface distance); otherwise (off-screen, hidden, a miss / the sky) a conservative stand-in, the mean of the local
+//    references below.
+//  - Safe radiance: the colour is limited against the references (the screen-space hits on the same surface in a 5x5
+//    neighbourhood, or, with fewer than 3, the game's own lit colour around the reflector): a YCoCg box clamp, a
+//    saturation cap (never more saturated than the most saturated reference), a per-channel ratio cap (no channel more
+//    dominant than in any reference: no red), a luminance clamp (0.5x .. 1.5x their mean, never over their maximum),
+//    NaN / Inf guards everywhere.
+//  - Its own temporal accumulation (reprojected by the motion vector, disocclusion by distance / normal), the history
+//    variance-clamped to the references (mean +- 1.5 sigma), at most 1.5x brighter or darker than the history per frame.
+//  - Its weight is zero without history and fades in over ~12 frames (a disocclusion, a camera cut, the first frames,
+//    a frame without the TLAS); at most KYTY_RT_REFLECTIONS_HYBRID_WEIGHT (0.35) x the share the screen-space ray left
+//    (1 - its confidence), lower (40 %) while the history holds mostly stand-ins rather than real hits.
+// In: the trace's out_a (premultiplied tonemapped colour, confidence; -1: not traced this frame) and out_c (roughness,
+// mask, hit distance, hit flag). Out: the same out_a with the fill added (rad2), and the fill's history.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D rad_tex;    // the trace's out_a
+layout(binding = 1) uniform sampler2D aux_tex;    // the trace's out_c
+layout(binding = 2) uniform sampler2D gb_cur;     // (view normal, view distance) this frame
+layout(binding = 3) uniform sampler2D gb_prev;    // the same, last frame
+layout(binding = 4) uniform sampler2D depth_tex;  // render depth
+layout(binding = 5) uniform sampler2D prev_scr;   // last frame's composited colour (pre-exposure HDR, render size)
+layout(binding = 6) uniform sampler2D color_tex;  // this frame's game colour (pre-exposure HDR)
+layout(binding = 7) uniform sampler2D motion_tex;
+layout(binding = 8) uniform sampler2D fhist_prev; // the fill's history: tonemapped rgb, a = length + real-hit share
+layout(binding = 9, rgba16f) uniform writeonly image2D rad_out;
+layout(binding = 10, rgba16f) uniform writeonly image2D fhist_out;
+layout(std430, binding = 11) buffer Frame {
+	vec4  ivp[4];       // scene clip -> world (rows)
+	vec4  vp[4];        // world -> scene clip (rows)
+	vec4  clip_prev[4]; // the reflections' current clip -> previous clip (rows)
+	vec4  proj;         // M[0], M[5], M[8], M[9]
+	vec4  depth_map;    // M[10], M[14], M[11], M[15]
+	vec4  size;         // render w, h, trace w, h
+	vec4  params;       // x max weight, y the scene clip's y sign, z max ray length, w 1.0 (exposure stand-in)
+	vec4  mparams;      // x, y the motion vectors' scale (render pixels to the previous frame), z, w -
+	ivec4 misc;         // x frame, y flags (1 history valid, 2 reset, 4 camera matrices, 16 row 0 = NDC y +1), z exposure index
+	uint  stats[32];
+};
+layout(std430, binding = 12) readonly buffer Exposure {
+	float exposure_values[];
+};
+layout(binding = 13) uniform accelerationStructureEXT tlas;
+
+// stats[] (every pixel, cumulative, never cleared): 0 reflective trace pixels (traced this frame), 1 screen-space misses
+// (HW rays), 2 TLAS hits, 3 hits taken from the previous screen, 4 stand-ins (no visible hit), 5 sum of the fill weight
+// x 1000, 6 fill weight > 0.02, 7 RTFLASH raw: a source > 2x the references' mean luminance (what the clamps stopped), 8
+// RTFLASH raw red: a source redder / more saturated than every reference, 9 RTFLASH out: the accumulated fill > 2x or
+// < 0.5x its history (must stay 0), 10 RTFLASH out red: the fill more saturated than its references (must stay 0), 11
+// NaN / Inf caught, 12 disocclusions (no history), 13 the 1.5x history limiter engaged, 14 references from the game's
+// colour (fewer than 3 screen-space hits around).
+
+const float FAR = 1.0e5;
+
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+float Max3(vec3 c) { return max(c.r, max(c.g, c.b)); }
+float Min3(vec3 c) { return min(c.r, min(c.g, c.b)); }
+bool  BadV(vec3 v) { return any(isnan(v)) || any(isinf(v)); }
+bool  Bad(vec4 v) { return any(isnan(v)) || any(isinf(v)); }
+vec3  SafeColor(vec3 c) { return BadV(c) ? vec3(0) : clamp(c, vec3(0), vec3(6.0e4)); }
+vec3  Tonemap(vec3 c) { return c / (1.0 + Max3(c)); }
+vec3  InvTonemap(vec3 t) { return t / max(1.0 - min(Max3(t), 0.999), 1e-3); }
+vec3  YCoCg(vec3 c) { return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b); }
+vec3  Rgb(vec3 y) { return vec3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z); }
+float Sat(vec3 c) { float m = Max3(c); return m > 1e-6 ? (m - Min3(c)) / m : 0.0; }
+bool  InScreen(vec2 uv) { return all(greaterThanEqual(uv, vec2(0))) && all(lessThanEqual(uv, vec2(1))); }
+
+vec2  RenderSize() { return size.xy; }
+vec2  TraceSize() { return size.zw; }
+float YS() { return (misc.y & 16) != 0 ? -1.0 : 1.0; }
+float ViewZ(float d) {
+	float den = d * depth_map.z - depth_map.x;
+	return abs(den) > 1e-12 ? (depth_map.y - d * depth_map.w) / den : 1e6;
+}
+vec3 ViewPos(vec2 uv, float d) {
+	float z  = ViewZ(d);
+	float w  = z * depth_map.z + depth_map.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	nd.y *= YS();
+	return vec3((nd.x * w - z * proj.z) / proj.x, (nd.y * w - z * proj.w) / proj.y, z);
+}
+vec4 Clip(vec3 p) {
+	return vec4(p.x * proj.x + p.z * proj.z, p.y * proj.y + p.z * proj.w, p.z * depth_map.x + depth_map.y, p.z * depth_map.z + depth_map.w);
+}
+bool IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e3; }
+ivec2 RenderPixel(vec2 uv) { return clamp(ivec2(uv * RenderSize()), ivec2(0), ivec2(RenderSize()) - 1); }
+float GameExposure() {
+	float e = exposure_values[misc.z];
+	return (e > 1e-12 && e < 1e12) ? e : 1.0;
+}
+// The previous frame's uv of a view-space point (`flip`: the clip's y the other way) and its view distance then.
+vec2 PrevUv(vec3 X, bool flip, out float pdist) {
+	vec4 c = Clip(X);
+	if (flip) c.y = -c.y;
+	vec4 p = vec4(dot(clip_prev[0], c), dot(clip_prev[1], c), 0.0, dot(clip_prev[3], c));
+	pdist  = abs(p.w);
+	if (!(abs(p.w) > 1e-8)) return vec2(-10.0);
+	vec2 nd = p.xy / p.w;
+	if (flip) nd.y = -nd.y;
+	nd.y *= YS();
+	return nd * 0.5 + 0.5;
+}
+// Scene (TLAS) world <-> the render's uv and device depth (hwrt-scene.cpp's camera; the clip's y sign params.y).
+vec3 WorldPos(vec2 uv, float d) {
+	vec4 c = vec4(uv.x * 2.0 - 1.0, params.y * (uv.y * 2.0 - 1.0), d, 1.0);
+	vec4 w = vec4(dot(ivp[0], c), dot(ivp[1], c), dot(ivp[2], c), dot(ivp[3], c));
+	return w.xyz / (abs(w.w) > 1e-20 ? w.w : 1e-20);
+}
+bool WorldToUvD(vec3 X, out vec2 uv, out float d) {
+	vec4 c = vec4(dot(vp[0], vec4(X, 1)), dot(vp[1], vec4(X, 1)), dot(vp[2], vec4(X, 1)), dot(vp[3], vec4(X, 1)));
+	uv = vec2(-10.0), d = 0.0;
+	if (!(c.w > 1e-5)) return false;
+	vec3 n = c.xyz / c.w;
+	uv     = vec2(n.x, params.y * n.y) * 0.5 + 0.5;
+	d      = n.z;
+	return !BadV(vec3(uv, d));
+}
+
+// The references: what a fill may look like here (linear exposed HDR).
+struct Refs {
+	vec3  mn, mx;      // YCoCg box
+	vec3  m1, m2;      // YCoCg moments
+	vec3  mean;        // linear mean
+	float lmean, lmax; // luminance
+	float smax;        // saturation
+	vec3  ratio;       // the largest channel / luminance ratio
+	float n;
+	float lpix;        // the reflector's own luminance (the darkest of its 3x3 render pixels, the game's colour)
+};
+void AddRef(inout Refs r, vec3 c) {
+	vec3  y = YCoCg(c);
+	float l = Luma(c);
+	r.mn = min(r.mn, y), r.mx = max(r.mx, y);
+	r.m1 += y, r.m2 += y * y;
+	r.mean += c;
+	r.lmean += l, r.lmax = max(r.lmax, l);
+	r.smax = max(r.smax, Sat(c));
+	if (l > 1e-6) r.ratio = max(r.ratio, c / l);
+	r.n += 1.0;
+}
+Refs NewRefs() {
+	Refs r;
+	r.mn = vec3(1e30), r.mx = vec3(-1e30), r.m1 = vec3(0), r.m2 = vec3(0), r.mean = vec3(0);
+	r.lmean = 0.0, r.lmax = 0.0, r.smax = 0.0, r.ratio = vec3(0), r.n = 0.0, r.lpix = 0.0;
+	return r;
+}
+void EndRefs(inout Refs r) {
+	float k = 1.0 / max(r.n, 1.0);
+	r.m1 *= k, r.m2 *= k, r.mean *= k, r.lmean *= k;
+}
+
+// The safe radiance: `c` limited to the references (box, saturation, channel ratios, luminance).
+vec3 Limit(vec3 c, Refs r) {
+	if (BadV(c)) c = r.mean;
+	c = max(c, vec3(0));
+	// YCoCg box of the references (a little slack)
+	vec3 e = (r.mx - r.mn) * 0.05 + 1e-5;
+	c      = max(Rgb(clamp(YCoCg(c), r.mn - e, r.mx + e)), vec3(0));
+	// channel ratios: no channel more dominant than in any reference (only lowers that channel)
+	{
+		float l = Luma(c);
+		if (l > 1e-6) c = min(c, l * (r.ratio + 0.02));
+	}
+	// saturation: toward its own grey (luminance kept) until no more saturated than the most saturated reference
+	{
+		float l = Luma(c), mx = Max3(c), mn = Min3(c), s = r.smax;
+		float den = (mx - mn) - s * (mx - l);
+		if (Sat(c) > s && den > 1e-9) {
+			float k = clamp(s * l / den, 0.0, 1.0);
+			c       = vec3(l) + (c - vec3(l)) * k;
+		}
+		c = max(c, vec3(0));
+	}
+	// luminance: 0.5x .. 1.5x the references' mean, never over their brightest nor over 2x the reflector's own colour
+	// (what the composite mixes it into: a dark pixel next to bright references never jumps), scaling keeps the hue
+	{
+		float hi = min(min(1.5 * r.lmean, max(r.lmax, r.lmean)), 2.0 * r.lpix);
+		float l = Luma(c), lo = min(0.5 * r.lmean, hi);
+		if (l > hi) c *= hi / max(l, 1e-12);
+		else if (l < lo) c = l > 1e-9 ? c * (lo / l) : r.mean;
+	}
+	return BadV(c) ? r.mean : c;
+}
+// The history's variance clamp (mean +- 1.5 sigma of the references, YCoCg), then the same limits.
+vec3 ClampHistory(vec3 h, Refs r) {
+	vec3 sig = sqrt(max(r.m2 - r.m1 * r.m1, vec3(0)));
+	vec3 y   = clamp(YCoCg(max(h, vec3(0))), r.m1 - 1.5 * sig - 1e-5, r.m1 + 1.5 * sig + 1e-5);
+	return Limit(max(Rgb(y), vec3(0)), r);
+}
+
+void Stat(int k, uint v) {
+	uint s = subgroupAdd(v);
+	if (subgroupElect() && s > 0u) atomicAdd(stats[k], s);
+}
+
+// The previous clip's y convention that maps this pixel onto its motion-vector position (rt-reflections.comp's MovingRaw).
+bool PickFlip(vec3 P, vec2 ruv, vec2 mv_px) {
+	float a, b;
+	vec2  rs = RenderSize();
+	vec2  e0 = (PrevUv(P, false, a) - ruv) * rs - mv_px, e1 = (PrevUv(P, true, b) - ruv) * rs - mv_px;
+	return dot(e1, e1) < dot(e0, e0);
+}
+
+void main() {
+	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+	vec2  ts = TraceSize();
+	if (any(greaterThanEqual(px, ivec2(ts)))) return;
+	vec4 rad = texelFetch(rad_tex, px, 0);
+	vec4 ax  = texelFetch(aux_tex, px, 0);
+	vec4 g   = texelFetch(gb_cur, px, 0);
+	// Not reflective, the sky, or not traced this frame (the checkerboard's -1, kept for the temporal pass): unchanged,
+	// and no fill history (a later fill there starts from zero weight).
+	if (g.w > 5e4 || ax.y < 0.01 || rad.a < 0.0 || Bad(rad) || Bad(g) || Bad(ax)) {
+		imageStore(rad_out, px, rad);
+		imageStore(fhist_out, px, vec4(0));
+		return;
+	}
+	vec2  uv  = (vec2(px) + 0.5) / ts;
+	ivec2 rp  = RenderPixel(uv);
+	vec2  ruv = (vec2(rp) + 0.5) / RenderSize();
+	float d   = texelFetch(depth_tex, rp, 0).r;
+	if (IsSky(d)) {
+		imageStore(rad_out, px, rad);
+		imageStore(fhist_out, px, vec4(0));
+		return;
+	}
+	float e     = GameExposure();
+	vec3  P     = ViewPos(ruv, d);
+	float dist  = abs(P.z);
+	float conf  = clamp(rad.a, 0.0, 1.0);
+	bool  miss  = ax.w < 0.5 || conf < 1e-3; // (the screen-space ray found nothing it could keep)
+	ivec2 hi    = ivec2(ts) - 1;
+	vec2  mv_px = texelFetch(motion_tex, rp, 0).xy * mparams.xy;
+	if (BadV(vec3(mv_px, 0))) mv_px = vec2(0);
+	bool  cam   = (misc.y & 4) != 0;
+	bool  flip  = cam && PickFlip(P, ruv, mv_px);
+	uint  nan_n = 0u;
+
+	// ---- The references (linear, exposed) ----
+	Refs r = NewRefs();
+	for (int y = -2; y <= 2; ++y)
+		for (int x = -2; x <= 2; ++x) {
+			ivec2 q  = clamp(px + ivec2(x, y), ivec2(0), hi);
+			vec4  sv = texelFetch(rad_tex, q, 0);
+			vec4  sg = texelFetch(gb_cur, q, 0);
+			if (Bad(sv) || Bad(sg) || sv.a < 0.05 || sg.w > 5e4) continue;
+			if (abs(sg.w - g.w) > 0.1 * g.w + 0.05 || dot(sg.xyz, g.xyz) < 0.8) continue;
+			AddRef(r, InvTonemap(clamp(sv.rgb / sv.a, vec3(0), vec3(1))));
+		}
+	bool game_refs = r.n < 3.0;
+	if (game_refs) {
+		// (too few screen-space hits around: the game's own lit colour around the reflector, 3x3 taps 2 px apart)
+		r      = NewRefs();
+		vec2 t = 2.0 / RenderSize();
+		for (int y = -1; y <= 1; ++y)
+			for (int x = -1; x <= 1; ++x) {
+				vec3 c = textureLod(color_tex, ruv + vec2(x, y) * t, 0).rgb;
+				if (BadV(c)) nan_n = 1u;
+				AddRef(r, SafeColor(c) * e);
+			}
+	}
+	EndRefs(r);
+	{
+		float lp = 1e30;
+		for (int y = -1; y <= 1; ++y)
+			for (int x = -1; x <= 1; ++x) {
+				ivec2 q = clamp(rp + ivec2(x, y), ivec2(0), ivec2(RenderSize()) - 1);
+				lp      = min(lp, Luma(SafeColor(texelFetch(color_tex, q, 0).rgb) * e));
+			}
+		r.lpix = lp;
+	}
+
+	// ---- One ray where the screen-space ray missed; the hit's colour from the previous screen, else the stand-in ----
+	vec3 src    = r.mean;
+	bool real   = false, traced = false, hit = false;
+	if (miss && cam && length(g.xyz) > 0.5) {
+		vec3 V = normalize(-P);
+		vec3 R = reflect(-V, normalize(g.xyz));
+		// (a second point along the ray, in front of the camera: the world-space direction through the scene camera)
+		float sgn = P.z >= 0.0 ? 1.0 : -1.0;
+		float fwd = R.z * sgn;
+		float s   = 0.25 * dist + 0.1;
+		if (fwd < 0.0) s = min(s, 0.5 * max(dist - 0.2, 0.0) / -fwd);
+		vec3 P2 = P + R * s;
+		vec4 c1 = Clip(P), c2 = Clip(P2);
+		if (!BadV(R) && s > 1e-3 && c1.w * c2.w > 0.0 && abs(c2.w) > 1e-6) {
+			vec2  uv2 = vec2(c2.x / c2.w, YS() * c2.y / c2.w) * 0.5 + 0.5;
+			float d2  = c2.z / c2.w;
+			vec3  O   = WorldPos(ruv, d);
+			vec3  D   = WorldPos(uv2, d2) - O;
+			float dl  = length(D);
+			if (dl > 1e-6 && !BadV(O) && !BadV(D)) {
+				D            = D / dl;
+				traced       = true;
+				float ws     = dl / s; // (world units per view unit)
+				float tmin   = (0.03 + 0.004 * dist) * ws;
+				float tmax   = max(params.z * ws, tmin * 2.0);
+				rayQueryEXT rq;
+				rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xff, O, tmin, D, tmax);
+				while (rayQueryProceedEXT(rq)) {}
+				hit = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+				vec2  huv;
+				float hd;
+				if (hit && WorldToUvD(O + D * rayQueryGetIntersectionTEXT(rq, true), huv, hd)) {
+					float pdis;
+					vec2  puv = PrevUv(ViewPos(huv, hd), flip, pdis);
+					// visible last frame: inside the screen (a margin) and its distance then = the previous trace's surface
+					if (all(greaterThan(puv, vec2(0.01))) && all(lessThan(puv, vec2(0.99))) && (misc.y & 1) != 0 && (misc.y & 2) == 0) {
+						vec4 pg = texelFetch(gb_prev, clamp(ivec2(puv * ts), ivec2(0), hi), 0);
+						if (!Bad(pg) && pg.w < 5e4 && abs(pg.w - pdis) < 0.04 * pdis + 0.05) {
+							vec3 pc = textureLod(prev_scr, puv, 0).rgb;
+							if (BadV(pc)) nan_n = 1u;
+							else src = SafeColor(pc) * e, real = true;
+						}
+					}
+				}
+			}
+		}
+	}
+	// (RTFLASH raw: the source before the limits; counted, then limited)
+	bool f_raw = real && Luma(src) > 2.0 * r.lmean + 1e-4;
+	bool r_raw = real && Sat(src) > r.smax + 0.1 && src.r > 1.5 * max(src.g, src.b);
+	vec3 cand  = miss ? Limit(src, r) : r.mean; // (a hit: no ray; the history only holds)
+
+	// ---- The fill's temporal accumulation (no history: zero weight) ----
+	vec2  puv_s = uv + mv_px / RenderSize();
+	bool  valid = (misc.y & 1) != 0 && (misc.y & 2) == 0 && InScreen(puv_s);
+	vec4  fh    = vec4(0);
+	if (valid) {
+		ivec2 pp = clamp(ivec2(puv_s * ts), ivec2(0), hi);
+		vec4  pg = texelFetch(gb_prev, pp, 0);
+		valid    = !Bad(pg) && abs(pg.w - g.w) / max(g.w, 1e-3) < 0.06 && dot(pg.xyz, g.xyz) > 0.85;
+		fh       = texelFetch(fhist_prev, pp, 0); // (nearest: the length and the hit share are not filtered)
+		if (Bad(fh) || fh.a < 1.0) valid = false; // (a length of at least 1: an accumulated fill)
+	}
+	float len = 0.0, q = 0.0;
+	vec3  acc = cand;
+	bool  lim = false, f_out = false;
+	if (valid) {
+		len    = floor(fh.a);
+		q      = fract(fh.a);
+		vec3 h = ClampHistory(InvTonemap(clamp(fh.rgb, vec3(0), vec3(1))), r);
+		if (miss) {
+			float alpha = max(1.0 / (len + 1.0), 0.125);
+			acc         = mix(h, cand, alpha);
+			q           = mix(q, real ? 0.999 : 0.0, alpha);
+		} else {
+			acc = h; // (the screen-space ray hit: the fill holds, unused at that weight)
+		}
+		// at most 1.5x brighter or darker than its history per frame
+		float lh = Luma(h), la = Luma(acc);
+		if (la > 1.5 * lh + 1e-6) acc *= (1.5 * lh) / max(la, 1e-12), lim = true;
+		else if (la < lh / 1.5 - 1e-6) acc = la > 1e-9 ? acc * ((lh / 1.5) / la) : h, lim = true;
+		acc = Limit(acc, r); // (the limits again: the history may have come from other references)
+		float la2 = Luma(acc);
+		f_out = la2 > 2.0 * lh + 1e-4 || la2 < 0.5 * lh - 1e-4;
+		len   = min(len + 1.0, 32.0);
+	} else {
+		len = miss ? 1.0 : 0.0; // (this frame's sample starts the history: its own weight is zero, below)
+		q   = real ? 0.999 : 0.0;
+	}
+	if (BadV(acc)) acc = r.mean, nan_n = 1u;
+	bool r_out = Sat(acc) > r.smax + 0.02;
+	// The share: zero without history, a slow fade in over ~12 frames, the part the screen-space ray left, lower while
+	// the history is mostly stand-ins. Passed as share^2 in the confidence: the composite takes sqrt(confidence).
+	float ramp = valid ? smoothstep(1.0, 13.0, len) : 0.0;
+	float wf   = params.x * ramp * (1.0 - conf) * mix(0.4, 1.0, q);
+	wf         = clamp(isnan(wf) ? 0.0 : wf, 0.0, 0.8);
+	float a2   = wf * wf;
+	vec4 outv  = vec4(rad.rgb + Tonemap(acc) * a2, rad.a + a2);
+	if (Bad(outv)) outv = rad, nan_n = 1u;
+	imageStore(rad_out, px, outv);
+	imageStore(fhist_out, px, vec4(Tonemap(acc), len + clamp(q, 0.0, 0.999)));
+
+	Stat(0, 1u);
+	Stat(1, traced ? 1u : 0u);
+	Stat(2, hit ? 1u : 0u);
+	Stat(3, real ? 1u : 0u);
+	Stat(4, traced && !real ? 1u : 0u);
+	Stat(5, uint(wf * 1000.0 + 0.5));
+	Stat(6, wf > 0.02 ? 1u : 0u);
+	Stat(7, f_raw ? 1u : 0u);
+	Stat(8, r_raw ? 1u : 0u);
+	Stat(9, f_out ? 1u : 0u);
+	Stat(10, r_out && wf > 0.0 ? 1u : 0u);
+	Stat(11, nan_n);
+	Stat(12, miss && !valid ? 1u : 0u);
+	Stat(13, lim ? 1u : 0u);
+	Stat(14, game_refs ? 1u : 0u);
+}
