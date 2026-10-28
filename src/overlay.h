@@ -1,5 +1,5 @@
-// The F1 overlay (Dear ImGui, Vulkan backend): drawn into the swapchain image right before present, on the game
-// queue. F1 opens / closes the menu, F2 toggles frame generation without the menu. Input is polled (no window
+// The overlay (Dear ImGui, Vulkan backend): drawn into the swapchain image right before present, on the game
+// queue. menu_key (default F2) opens / closes the menu, fg_key (default F3) toggles frame generation (injector.ini). Input is polled (no window
 // procedure hook): cursor position and mouse buttons through GetCursorPos / GetAsyncKeyState.
 #pragma once
 #include "common.h"

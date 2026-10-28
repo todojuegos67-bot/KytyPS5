@@ -31,7 +31,7 @@ void Log(const char* fmt, ...);
 std::wstring ExeDir();   // with a trailing backslash
 std::string  ExeName();  // "GRW.exe" -> "GRW"
 
-// ---- settings (injector.ini next to the exe), changed from the F1 menu ----
+// ---- settings (injector.ini next to the exe), changed from the menu (F2 by default) ----
 struct Settings {
 	bool  fg_enabled     = true;   // FSR 3 frame generation x2
 	int   fg_cap_fps     = -1;     // shown-frame cap for VRR: -1 auto (refresh - refresh^2/3600), 0 off, N fps
@@ -43,10 +43,13 @@ struct Settings {
 	int   mv_units       = 0;      // 0: UV (scale by render size), 1: pixels (scale 1)
 	int   depth_mode     = 0;      // 0 auto (from the depth clear value), 1 normal, 2 reversed
 	bool  previews       = true;
+	int   menu_key       = VK_F2;  // injector.ini menu_key / fg_key: a name (F1..F12, Insert, Home, End, ...) or a
+	int   fg_key         = VK_F3;  // virtual-key number (0x71 or 113)
 };
 Settings&   Cfg();
 void        LoadSettings();
 void        SaveSettings();
+const char* KeyName(int vk);
 
 // ---- dispatch to the real loader / driver ----
 struct Real {

@@ -322,7 +322,7 @@ void Record(VkCommandBuffer cb, VkSwapchainKHR swapchain, VkExtent2D display, Vk
 	}
 	g_stats.generating = want;
 	g_stats.state = want ? (game ? "on (game depth + MV)" : "on (optical flow only)") : "off (menu)";
-	if (!want) { if (g_logged_on) Log("[fg] generation off (menu / F2)"); g_logged_on = false; return; }
+	if (!want) { if (g_logged_on) Log("[fg] generation off (menu / key)"); g_logged_on = false; return; }
 
 	VkImage depth = in.depth, motion = in.motion;
 	VkFormat depth_format = in.depth_format, motion_format = in.motion_format;

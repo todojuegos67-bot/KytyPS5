@@ -1,6 +1,6 @@
 # Injector (generic, phase 1)
 
-An OptiScaler-style injector that works in any game. Its files go next to the game's exe. Press **F1** in game to open the menu.
+An OptiScaler-style injector that works in any game. Its files go next to the game's exe. Press **F2** in game to open the menu and **F3** to toggle frame generation (both set in `injector.ini`: `menu_key`, `fg_key`).
 
 Phase 1 covers **DX11 games through DXVK**, with these features:
 
@@ -14,11 +14,11 @@ The code contains no game-specific values: no offsets, no shader hashes, no exe 
 ## How it works
 
 ```
-game (DX11) -> d3d11.dll / dxgi.dll (DXVK 2.6.1, official) -> vulkan-1.dll (OURS, next to the exe)
+game (DX11) -> d3d11.dll / dxgi.dll (DXVK 2.6.1, official) -> winevulkan.dll (OURS, next to the exe)
                                                                -> %SystemRoot%\System32\vulkan-1.dll (system loader)
 ```
 
-DXVK loads `vulkan-1.dll` from the exe's folder first. Our proxy forwards every call to the system loader and intercepts only a few:
+DXVK tries `winevulkan.dll` before `vulkan-1.dll`. No Windows module has that name, so ours is always the one DXVK gets, even when an overlay (RTSS, Ubisoft) already loaded the system `vulkan-1.dll` (the 10-28 Wildlands failure). Native Vulkan games get the same binary as `vulkan-1.dll`. Our proxy forwards every call to the system loader and intercepts only a few:
 
 - **Device creation:** adds the three queues that FSR 3 frame generation needs (an extra graphics queue for present, plus two in a compute-only family).
 - **Swapchain:** replaced by the FidelityFX frame interpolation swapchain (the same mechanism as KytyPS5's `src/local/fsr3-fg.cpp`).
@@ -35,7 +35,7 @@ DXVK loads `vulkan-1.dll` from the exe's folder first. Our proxy forwards every 
 1. Unzip the release anywhere.
 2. Run `InjectorSetup.exe` and pick the game's exe. For Wildlands that is `GRW.exe`, in the Ubisoft Connect / Steam install folder.
 3. The setup reads the exe's import table and detects the API:
-   - **DX11:** copies `d3d11.dll`, `dxgi.dll`, `vulkan-1.dll`, `amd_fidelityfx_vk.dll`, `dxvk.conf` and `injector.ini` next to the exe. Files already there are renamed to `*.injector-bak`. Everything is recorded in `injector_install.txt`.
+   - **DX11:** copies `d3d11.dll`, `dxgi.dll`, `winevulkan.dll`, `amd_fidelityfx_vk.dll`, `dxvk.conf` and `injector.ini` next to the exe. A `vulkan-1.dll` left by an older install is moved aside. Files already there are renamed to `*.injector-bak`. Everything is recorded in `injector_install.txt`.
    - **DX12:** nothing is copied. DX12 is phase 2: the same DLL behind vkd3d-proton.
    - **Vulkan:** copies only `vulkan-1.dll`, `amd_fidelityfx_vk.dll` and `injector.ini`, and only if the exe gets Vulkan functions through `vkGetInstanceProcAddr`. An exe that imports other `vk*` functions directly is refused.
    - **32-bit, DX9 or unknown:** refused.
@@ -49,9 +49,9 @@ InjectorSetup.exe detect|install|uninstall <game.exe>
 
 To install by hand for a DX11 game, copy the six files from `payload\` next to the exe.
 
-## The menu (F1)
+## The menu (F2)
 
-F2 toggles frame generation without opening the menu. Settings are saved to `injector.ini` when the menu closes.
+F3 toggles frame generation without opening the menu. Settings are saved to `injector.ini` when the menu closes.
 
 - **Frame generation:**
   - on/off;
@@ -77,7 +77,7 @@ F2 toggles frame generation without opening the menu. Settings are saved to `inj
 ... [fg] FidelityFX API loaded (amd_fidelityfx_vk.dll)
 ... [fg] frame interpolation swapchain 1920x1080, format 44, present mode 0, 3 images
 ... swapchain 1920x1080 format 44, 3 images, FidelityFX frame interpolation swapchain
-... [overlay] ImGui ready (F1 menu, F2 frame generation on/off)
+... [overlay] ImGui ready (F2 menu, F3 frame generation on/off)
 ... [fg] generation context 1920x1080 (render up to 1920x1080, format 44, depth normal)
 ... [fg] inputs: neutral (far depth, zero motion): FSR 3 interpolates from optical flow only
 ... [fg] generation on: x2, render 1920x1080 -> display 1920x1080

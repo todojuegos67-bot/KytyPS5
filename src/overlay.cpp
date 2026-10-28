@@ -82,7 +82,7 @@ bool InitImGui() {
 	if (!ImGui_ImplVulkan_Init(&init)) { g_init_failed = true; Log("[overlay] ImGui_ImplVulkan_Init failed"); return false; }
 	ImGui_ImplVulkan_CreateFontsTexture();
 	g_init = true;
-	Log("[overlay] ImGui ready (F1 menu, F2 frame generation on/off)");
+	Log("[overlay] ImGui ready (%s menu, %s frame generation on/off)", KeyName(Cfg().menu_key), KeyName(Cfg().fg_key));
 	return true;
 }
 
@@ -148,19 +148,23 @@ void DrawUi() {
 	const auto st = framegen::LastStats();
 	if (s.osd) {
 		char line[160];
-		std::snprintf(line, sizeof line, "FG %s | real %.0f -> shown %.0f fps (x%.2f) | F1 menu", st.state, st.real_fps,
-		              st.shown_fps, st.ratio);
+		std::snprintf(line, sizeof line, "FG %s | real %.0f -> shown %.0f fps (x%.2f) | %s menu", st.state, st.real_fps,
+		              st.shown_fps, st.ratio, KeyName(Cfg().menu_key));
 		ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(4, 4), ImVec2(12 + 7.0f * std::strlen(line), 24), IM_COL32(0, 0, 0, 150));
 		ImGui::GetForegroundDrawList()->AddText(ImVec2(8, 7), IM_COL32(255, 255, 255, 255), line);
 	}
 	if (!g_menu) return;
 	ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_FirstUseEver);
 	ImGui::SetNextWindowSize(ImVec2(520, 640), ImGuiCond_FirstUseEver);
-	ImGui::Begin("Injector (F1)");
+	char title[64];
+	std::snprintf(title, sizeof title, "Injector (%s)###injector", KeyName(Cfg().menu_key));
+	ImGui::Begin(title);
 	ImGui::Text("Juego: %s.exe", ExeName().c_str());
 	if (ImGui::CollapsingHeader("Frame generation", ImGuiTreeNodeFlags_DefaultOpen)) {
 		if (!framegen::Available()) ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "No disponible (ver injector.log)");
-		ImGui::Checkbox("FSR 3 frame generation x2 (F2)", &s.fg_enabled);
+		char label[64];
+		std::snprintf(label, sizeof label, "FSR 3 frame generation x2 (%s)", KeyName(Cfg().fg_key));
+		ImGui::Checkbox(label, &s.fg_enabled);
 		ImGui::SliderInt("Tope VRR (fps, -1 auto, 0 off)", &s.fg_cap_fps, -1, 360);
 		ImGui::Text("Estado: %s", st.state);
 		ImGui::Text("Real %.1f fps -> mostrados %.1f fps (x%.2f), generados %u/s", st.real_fps, st.shown_fps, st.ratio, st.generated);
@@ -235,7 +239,7 @@ void OnDeviceDestroyed() {
 }
 
 void PollInput() {
-	const bool f1 = Down(VK_F1), f2 = Down(VK_F2);
+	const bool f1 = Down(Cfg().menu_key), f2 = Down(Cfg().fg_key);
 	if (f1 && !g_key_f1) {
 		g_menu = !g_menu;
 		Log("[overlay] menu %s", g_menu ? "open" : "closed");
@@ -243,7 +247,7 @@ void PollInput() {
 	}
 	if (f2 && !g_key_f2) {
 		Cfg().fg_enabled = !Cfg().fg_enabled;
-		Log("[overlay] F2: frame generation %s", Cfg().fg_enabled ? "on" : "off");
+		Log("[overlay] %s: frame generation %s", KeyName(Cfg().fg_key), Cfg().fg_enabled ? "on" : "off");
 		SaveSettings();
 	}
 	g_key_f1 = f1;
