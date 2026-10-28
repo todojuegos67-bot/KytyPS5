@@ -8380,7 +8380,9 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 	static const float reach   = RtSunEnv("KYTY_RT_SUN_REACH", 6.0f, 0.5f, 50.0f);    // occluder heights the penumbra search sees (m)
 	static const float pcf     = RtSunEnv("KYTY_RT_SUN_GAMEPCF", 1.0f, 0.0f, 3.0f);   // the game emulation's PCF radius (taps)
 	static const float band    = RtSunEnv("KYTY_RT_SUN_BAND", 0.08f, 0.0f, 0.3f);     // the cascade blend band (uv)
-	static const float lift    = RtSunEnv("KYTY_RT_SUN_LIFT", 0.75f, 0.0f, 1.0f);     // brightening allowed (share of the sun term)
+	// (ds-rt-shadow 10-28) default 0: darken only. The lift brightened wherever the emulated game lookup self-shadowed (acne
+	// stripes, "rayas") and RT said lit; brightening on every frame since 466c992c made them show (35-41 % brightened).
+	static const float lift    = RtSunEnv("KYTY_RT_SUN_LIFT", 0.0f, 0.0f, 1.0f);
 	static const float contact = RtSunEnv("KYTY_RT_SUN_CONTACT", RtSunLevel() >= 2 ? 0.75f : 0.0f, 0.0f, 1.0f);
 	static const float debug   = RtSunEnv("KYTY_RT_SUN_DEBUG", 0.0f, 0.0f, 4.0f);
 	static const float forced_hyp  = RtSunEnv("KYTY_RT_SUN_HYP", -1.0f, -1.0f, 7.0f);
