@@ -367,7 +367,7 @@ void HwSun(vec3 p, vec3 n, vec3 l, ivec2 pixel, out float occ_c, out float occ_f
 	if (ndl_w <= 0.03) return;
 	// Off the receiver's triangle (depth-buffer jitter and precision grow with the distance) along the normal and a
 	// little toward the sun; the least hit distance grows likewise (no acne far away).
-	vec3  o     = pw + nw * (0.02 + 0.003 * z) + lw * (0.01 + 0.001 * z);
+	vec3  o     = pw + nw * (0.05 + 0.004 * z) + lw * (0.02 + 0.002 * z); // (ds-rt-shadow 10-28: larger: TLAS self-hits)
 	float t_min = 0.02 + 0.004 * z;
 	float cr    = sun.hw.w * (1.0 + z / 25.0);
 	vec3  b1    = normalize(cross(lw, abs(lw.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
