@@ -1,10 +1,4 @@
-#version 460
-#ifdef KYTY_HWRT
-// (hwrt2, KYTY_HWRT_REFL: rt-reflections.cpp builds this file a second time with KYTY_HWRT)
-#extension GL_EXT_ray_query : require
-#extension GL_EXT_buffer_reference : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-#endif
+#version 450
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 // KYTY_RT_REFLECTIONS (rt-reflections.cpp): screen-space ray-traced reflections with denoising on the PS5 Pro path's
@@ -38,9 +32,6 @@
 // has no confident SSR, the game's pixel stays unchanged (its IBL fallback included): no material guesses. Water (drawn
 // after the lighting, so not in the game's SSR) keeps its depth-detected mirror. The roughness field only narrows where
 // we sharpen (mirror-like), never adds a reflection.
-// (refl10) Precision: a fresh mirror every frame at the full-resolution trace (misc.w 4096), the virtual-image
-// reprojection from the neighbours' hit distance (8192), Catmull-Rom history on smooth surfaces (2048), sub-pixel hit
-// refinement (1024), floors' normal from the depth plane where the 8-bit G-buffer one agrees (yparams.w degrees), rays per glossy pixel (yparams.z).
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D color_tex;
@@ -75,8 +66,7 @@ layout(std430, binding = 18) buffer Frame {
 	                   // (KYTY_RT_REFLECTIONS_GLOSSY), z how much of the albedo's hue tints a metal's reflection, w the albedo
 	                   // layer (L0 bits 0..23 as sRGB rgb; < 0 none)
 	vec4 yparams;      // (refl9b) x the minimum reflective area's radius (render pixels; 0 off: KYTY_RT_REFLECTIONS_MIN_AREA),
-	                   // y the large pools' boost (KYTY_RT_REFLECTIONS_POOL_BOOST); (refl10) z rays per glossy pixel
-	                   // (KYTY_RT_REFLECTIONS_RPP), w the floor normal snap in degrees (KYTY_RT_REFLECTIONS_NORMAL_SNAP)
+	                   // y the large pools' boost (KYTY_RT_REFLECTIONS_POOL_BOOST)
 	int  calib[];      // see CALIB_* below (calibration sums, then the cumulative stats counters)
 };
 // calib[] layout (ints): [0] samples; [CALIB_NORMAL + ((layer * NLAYOUTS + layout) * 2 + space) * 2 + convention] sum of
@@ -106,21 +96,6 @@ const int CALIB_WET    = CALIB_FLOORS + 2;
 const int CALIB_HIST   = 300;
 const int STATS        = 560;
 const int SURVEY       = 600;
-const int StatsRefused = 32; // (refl-pro: 34 SS hit confidence x1000, 35 TLAS, 36 environment, 37 rough<ramp px, 38 their weight, 39 conf)
-// // (refl10: stats 30 / 31 / 32 why rays miss, 33 the composite's fresh mirror rays)
-// (refl-pro, RTFLASH, from ds-reflmeter-1027) per-frame flash detector, cumulative counters (rt-reflections.cpp FlashIndex),
-// 1 trace pixel in 16, camera still (misc.w 65536) only: 0 evaluated, 1 flashes (output luminance vs the reprojected
-// history's > 2x, floor 0.02), 2 > 10 % jumps, causes: 3 no history, 4 hit <-> miss toggle (confidence change > 0.5), 5
-// firefly (> 4x the neighbourhood), 6 the neighbourhood clamp cut the history > 2x, 7 not traced this frame, 8 other; 9 sum
-// of the flashes' jump x 100, 10..12 flashes > 50 / 80 / 95 %. Material check (composite, G-buffer pixels with the game's
-// SSR bound): 13 / 14 L2.b0 > 0.5 count / the game's SSR confidence there x 1000, 15 / 16 the same with L2.b0 <= 0.5, 17 / 18
-// gloss (L1.b2) > 0.7, 19 / 20 gloss < 0.3, 21 / 22 moving pixels (characters) count / their L2.b0 x 1000.
-// (ds-rt-refl-1027) 23..32: "other" split and the still-camera hold's reach (Temporal).
-const int FLASH = 1440;
-void FStat(int k, int v) {
-	int sum = subgroupAdd(v);
-	if (subgroupElect() && sum != 0) atomicAdd(calib[FLASH + k], sum);
-}
 layout(std430, binding = 19) readonly buffer Exposure {
 	float exposure_values[];
 };
@@ -293,82 +268,7 @@ vec3 NormalAt(vec2 uv, vec3 p) {
 
 // ---- (refl8) The game's own SSR as the guide ----
 bool  GuideMode() { return (push.misc.w & 512) != 0; }
-// (refl10) misc.w 1024: sub-pixel hit refinement, 2048: bicubic (Catmull-Rom) history on smooth surfaces, 4096: a fresh
-// mirror every frame at the full-resolution trace (the composite's own ray where the checkerboard skipped the pixel),
-// 8192: the virtual-image reprojection also where the pixel has no hit of its own this frame (its neighbours' distance).
-bool  Refine() { return (push.misc.w & 1024) != 0; }
-bool  BicubicHist() { return (push.misc.w & 2048) != 0; }
-bool  FreshMirror() { return (push.misc.w & 4096) != 0; }
-bool  VirtualFill() { return (push.misc.w & 8192) != 0; }
-// (refl10) Rays per trace pixel on glossy surfaces (yparams.z, KYTY_RT_REFLECTIONS_RPP; mirrors always one).
-int   RaysPerPixel() { return clamp(int(yparams.z + 0.5), 1, 4); }
 bool  HaveGuide() { return (push.misc.w & 256) != 0; }
-// (refl-pro) Physically based weights from the G-buffer material alone (KYTY_HWRT_REFL=1 default; KYTY_RT_REFLECTIONS_PRO=0
-// off). Demon's Souls G-buffer, from the calibration logs (10-27): L3 bits 0..15 the oct normal (world space, cos 0.984);
-// L1.b2 the gloss (continuous; 0.68 mean, 0.96 on puddles): roughness = 1 - gloss; L2.b0 a near-binary field (histogram 37 %
-// at 0, 39 % at 1, higher on puddles 0.69 vs 0.50) - not a roughness (it marked 93 % of a scene "mirror"): read as the
-// specular level, F0 = 0.02 .. 0.08 (0.04 at one half, as a UE-style specular); metal none (the survey found no field).
-// The game's SSR confidence never decides whether a reflection exists (that gate - 0.3-0.4 % of the pixels confident in the
-// 10-27 logs - made the reflections pop in and out).
-bool  Pro() { return (push.misc.w & 16384) != 0; }
-// (ds-rt-refl-1027) The capture's layout (roughness L1.b3, code 1121): L2.b1 is the game's wetness - 128 dry (94 % of
-// the courtyard), 32..112 on the fountain's water and the wet ground around it (lower = wetter). (L2.b2's low nibble,
-// first taken for it, is also set on grass, leaves and banners: a foliage / two-sided flag, not water.)
-bool  CaptureLayout() { return push.dec.y == (1 | (24 << 2) | (8 << 7)) && push.dec.w < 0; }
-// the wetness 0..1: L2.b1 128 -> 0, 48 -> 1
-float CaptureWet(ivec2 p) { return CaptureLayout() ? clamp((128.0 - float((Packed(2, p) >> 8u) & 255u)) / 80.0, 0.0, 1.0) : 0.0; }
-float ProRough(ivec2 p) {
-	float r = push.dec.w >= 0 ? Field(push.dec.w, p) : (push.dec.y >= 0 ? Field(push.dec.y, p) : 1.0);
-	float wt = CaptureWet(p);
-	if (wt > 0.1) r = min(r, mix(0.2, 0.02, wt)); // (wet: glossy, standing water a mirror)
-	return clamp(r, 0.0, 1.0);
-}
-float ProF0(ivec2 p) { return (push.dec.w >= 0 && push.dec.y >= 0) ? mix(0.02, 0.08, clamp(Field(push.dec.y, p), 0.0, 1.0)) : 0.04; }
-// The reflectivity ramp by roughness: full to 0.25, smoothly nothing at the level's cut-off (no hard threshold).
-float ProRamp(float r) {
-	float hi = max(push.motion.z, 0.3);
-	// (ds-rt-refl-1027) the real roughness: genuinely glossy only (full to 0.12, nothing from 0.35): the courtyard capture
-	// 13.5 % of the pixels instead of 32 % (stone walls at 0.55 took a faint, noisy glossy reflection)
-	// (glossy tier, the owner: armour / polished stone at 0.35..0.6 reflect too: a blurred, lower reflection - mask 0.6,
-	// fading out to the level's cut-off; the lobe is the roughness's (the a-trous / temporal take the noise))
-	if (CaptureLayout()) return max(1.0 - smoothstep(0.12, min(hi, 0.35), r), 0.6 * (1.0 - smoothstep(0.45, hi, r)));
-	return 1.0 - smoothstep(0.25 * hi / 0.6, hi, r);
-}
-// (refl-pro) Specular occlusion: a screen-space ambient occlusion estimate (8 depth taps, two rings: the share of the
-// hemisphere above the surface that nearby geometry covers) through Lagarde's specular-occlusion fit, x the horizon fade
-// of the mirror direction against the geometric normal (a normal map bending the lobe under the surface). Crevices and
-// contact corners no longer show a full-strength reflection; open floors keep 1.
-float ProSpecOcc(vec2 uv, vec3 P, vec3 N, vec3 Ng, vec3 V, float rough, float nv) {
-	float z  = abs(P.z);
-	float rw = clamp(0.5 * z, 0.3, 4.0);                         // (world radius: 0.5 m near, wider far)
-	float rp = clamp(rw * push.proj.x / max(z, 1e-3) * 0.5 * RenderSize().x, 3.0, 48.0); // (pixels)
-	float occ = 0.0;
-	for (int i = 0; i < 8; ++i) {
-		float ang = (float(i) + 0.5) * 0.785398;
-		vec2  o   = vec2(cos(ang), sin(ang)) * rp * ((i & 1) != 0 ? 1.0 : 0.5) / RenderSize();
-		vec2  su  = uv + o;
-		if (!InScreen(su)) continue;
-		float sd = DepthAt(su);
-		if (IsSky(sd)) continue;
-		vec3  S  = ViewPos(su, sd) - P;
-		float l  = length(S);
-		if (l < 1e-4) continue;
-		float h  = max(dot(Ng, S / l) - 0.1, 0.0);
-		occ += h * (1.0 - smoothstep(0.5 * rw, rw, l));
-	}
-	float ao  = clamp(1.0 - occ / 8.0 * 1.6, 0.0, 1.0);
-	float so  = clamp(pow(nv + ao, exp2(-16.0 * rough - 1.0)) - 1.0 + ao, 0.0, 1.0);
-	float hz  = clamp(1.0 + 1.3 * dot(reflect(-V, N), Ng), 0.0, 1.0);
-	return so * hz * hz;
-}
-// Split-sum environment BRDF (Karis' analytic fit): F0 x A + B with roughness and N.V.
-vec2  EnvDfg(float rough, float nv) {
-	const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022), c1 = vec4(1.0, 0.0425, 1.04, -0.04);
-	vec4  r    = rough * c0 + c1;
-	float a004 = min(r.x * r.x, exp2(-9.28 * clamp(nv, 0.0, 1.0))) * r.x + r.y;
-	return vec2(-1.04, 1.04) * a004 + r.zw;
-}
-vec3  EnvSpec(vec3 f0, float rough, float nv) { vec2 ab = EnvDfg(rough, nv); return clamp(f0 * ab.x + ab.y, 0.0, 1.0); }
 vec4  GameSsr(vec2 uv) {
 	if (!HaveGuide()) return vec4(0);
 	vec4 g = textureLod(game_ssr, uv, 0);
@@ -517,36 +417,6 @@ vec3 WaterNormal(vec3 Nd) {
 	float c  = dot(Nd, up);
 	return c > 0.97 ? up : normalize(mix(Nd, up, smoothstep(0.85, 0.97, c)));
 }
-// (refl10) The plane's normal over +-2 render pixels (less depth noise than NormalAt's one-pixel steps); false off a
-// plane (1 / distance is linear across a plane on screen: its second difference over the span > 1 % of it).
-bool WideNormal(vec2 uv, vec3 P, out vec3 n) {
-	vec2 t  = 2.0 / RenderSize();
-	vec3 px = ViewPos(uv + vec2(t.x, 0), DepthAt(uv + vec2(t.x, 0))), nx = ViewPos(uv - vec2(t.x, 0), DepthAt(uv - vec2(t.x, 0)));
-	vec3 py = ViewPos(uv + vec2(0, t.y), DepthAt(uv + vec2(0, t.y))), ny = ViewPos(uv - vec2(0, t.y), DepthAt(uv - vec2(0, t.y)));
-	float iz = 1.0 / max(abs(P.z), 1e-3);
-	float jx = abs(1.0 / max(abs(px.z), 1e-3) + 1.0 / max(abs(nx.z), 1e-3) - 2.0 * iz) / iz;
-	float jy = abs(1.0 / max(abs(py.z), 1e-3) + 1.0 / max(abs(ny.z), 1e-3) - 2.0 * iz) / iz;
-	n = cross(px - nx, py - ny);
-	float l = length(n);
-	if (!(l > 1e-12) || max(jx, jy) > 0.01) return false;
-	n /= l;
-	if (dot(n, -P) < 0.0) n = -n;
-	return true;
-}
-// (refl10, KYTY_RT_REFLECTIONS_NORMAL_SNAP, degrees in yparams.w; 0 off) The G-buffer's normal is octahedral 8:8 (the
-// calibration's pick in every log: layer 3 bits 0..15): steps of ~0.45 degrees, so a mirror's reflection direction moves
-// in ~0.9 degree steps: banding across flat puddles and polished floors (about 0.4 m at 25 m) that crawled as the camera
-// moved. On floors and ramps (within ~25 degrees of world up) where the G-buffer's normal and the geometry's plane (the
-// depth over +-2 pixels, exact on a flat mesh) agree within the snap angle (the normal map adds nothing there but the
-// quantization), the plane's normal is used: continuous, and its true slope (not forced to world up). Elsewhere (normal
-// maps, curved or broken surfaces, edges) the G-buffer's.
-vec3 SnapFloor(vec2 uv, vec3 P, vec3 N) {
-	if (!(yparams.w > 0.0) || (push.misc.w & 8) == 0) return N;
-	if (dot(N, normalize(up_view.xyz)) < 0.9) return N;
-	vec3 Nw;
-	if (!WideNormal(uv, P, Nw) || dot(Nw, N) < cos(radians(yparams.w))) return N;
-	return Nw;
-}
 // The previous frame's uv of a view-space point through clip -> previous clip (`flip`: the clip's y the other way).
 vec2 PrevUv(vec3 X, bool flip) {
 	vec4 c = Clip(X);
@@ -586,21 +456,14 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	vec3 V     = normalize(-P);
 	float water = WaterMask(rp, d, ruv, Nd);
 	if (water > 0.0) match = false; // (the G-buffer holds the bed under the water)
-	s.N  = match ? SnapFloor(ruv, P, Ng) : (water > 0.0 ? WaterNormal(Nd) : Nd); // (refl10: floors' exact plane normal)
+	s.N  = match ? Ng : (water > 0.0 ? WaterNormal(Nd) : Nd);
 	s.Ng = Nd;
 	s.gb = match ? 1.0 : 0.0;
 	if (dot(s.N, V) < 0.02) s.N = normalize(s.N + V * (0.02 - dot(s.N, V) + 0.01)); // (back-facing by a little: bent)
 	bool  have_mat = push.dec.y >= 0;
 	float mat = 0.0, mat_r = 1.0, mat_pr = 1.0, metal = 0.0;
 	s.extra    = 0.0;
-	if (Pro()) {
-		if (water <= 0.0 && match && have_mat) {
-			mat_pr = ProRough(rp);
-			mat    = ProRamp(mat_pr);
-			mat_r  = min(mat_pr, push.motion.z);
-			metal  = GbufMetal(rp);
-		}
-	} else if (GuideMode()) {
+	if (GuideMode()) {
 		// (refl8) The game decides: its SSR confidence here; the roughness field (when decoded) only narrows it to the
 		// mirror-like surfaces we sharpen and sets our lobe.
 		if (water <= 0.0 && GbufSurface(rp, d, match)) {
@@ -634,11 +497,6 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	s.prough = wat ? 0.0 : mat >= guess ? mat_pr : 0.12;
 	s.metal  = wat ? 0.0 : metal;
 	// (characters: never, except (refl9) their metal: armour, swords, shields, at the metal path's weight alone)
-	if (Pro()) {
-		s.mask *= 1.0 - Moving(ruv, P); // (characters: no reflection on them; their own probes stay)
-		s.extra = 0.0;
-		return s;
-	}
 	if (s.mask > 0.0 && Moving(ruv, P) > 0.5) s.mask = (s.metal > 0.5 && !wat) ? s.extra : 0.0;
 	if (wat) s.extra = 0.0;
 	if (s.mask < 0.05) s.mask = 0.0;
@@ -687,43 +545,9 @@ float RayTAt(Ray r, float dist) {
 	float den = (r.b.z - r.a.z) - zt * (r.h1 - r.h0);
 	return abs(den) > 1e-20 ? num / den : -1.0;
 }
-// (refl10) Why the last HizTrace ended without a hit: 1 out of iterations, 2 left the screen / reached the ray's end.
-int g_why = 0;
-// (refl10) The linear view distance at a continuous render-pixel position, bilinear over the hi-z's mip 0 (the exact
-// per-pixel distances); false across a depth edge (the four differ by > 4 %: no surface to interpolate).
-bool SmoothDist(vec2 p, out float z) {
-	vec2  q  = p - 0.5;
-	ivec2 b  = ivec2(floor(q));
-	vec2  f  = q - vec2(b);
-	ivec2 hi = ivec2(RenderSize()) - 1;
-	float z00 = texelFetch(hiz_tex, clamp(b, ivec2(0), hi), 0).r, z10 = texelFetch(hiz_tex, clamp(b + ivec2(1, 0), ivec2(0), hi), 0).r;
-	float z01 = texelFetch(hiz_tex, clamp(b + ivec2(0, 1), ivec2(0), hi), 0).r, z11 = texelFetch(hiz_tex, clamp(b + ivec2(1, 1), ivec2(0), hi), 0).r;
-	float lo = min(min(z00, z10), min(z01, z11)), hz = max(max(z00, z10), max(z01, z11));
-	z        = mix(mix(z00, z10, f.x), mix(z01, z11, f.x), f.y);
-	return hz < FAR * 0.5 && hz - lo <= 0.04 * lo + 0.02;
-}
-// (refl10, KYTY_RT_REFLECTIONS_REFINE) The hit's position within its pixel: the march treats every pixel as a flat
-// screen-facing box (a staircase on slanted surfaces: the reflected edges stepped, by up to a pixel, and swam as the
-// camera moved); bisection of ray distance - surface distance on the bilinear surface, between a point a pixel and a half
-// before the hit (in front) and half a pixel after it. Unchanged where the surface is an edge or the bracket does not hold.
-float RefineHit(Ray r, float th, float t_min, float t_end) {
-	float dt = 1.0 / max(max(abs(r.dp.x), abs(r.dp.y)), 1.0);
-	float a  = max(th - 1.5 * dt, t_min), b = min(th + 0.5 * dt, t_end);
-	float za, zb;
-	if (!(b > a) || !SmoothDist(r.p0 + r.dp * a, za) || !SmoothDist(r.p0 + r.dp * b, zb)) return th;
-	if (!(RayDist(r, a) < za && RayDist(r, b) >= zb)) return th;
-	for (int k = 0; k < 6; ++k) {
-		float m = 0.5 * (a + b), zm;
-		if (!SmoothDist(r.p0 + r.dp * m, zm)) return th;
-		if (RayDist(r, m) < zm) a = m;
-		else b = m;
-	}
-	return b;
-}
 // Hierarchical-Z march over the closest-distance pyramid, t in [t, t_end] along the segment: the hit's t (-1: none).
 float HizTrace(Ray r, float t, float t_end, int max_iter, out float hit_z) {
 	hit_z           = 0.0;
-	g_why           = 2;
 	int   max_level = clamp(push.misc2.y - 1, 0, 9);
 	int   level     = 0;
 	bool  mx        = abs(r.dp.x) > 1e-5, my = abs(r.dp.y) > 1e-5;
@@ -768,12 +592,10 @@ float HizTrace(Ray r, float t, float t_end, int max_iter, out float hit_z) {
 				if (tz >= t && tz <= te) th = tz;
 			}
 			hit_z = zmin;
-			g_why = 0;
 			return th;
 		}
 		t = t_ex; // (behind the slab: the ray passes behind this pixel's surface)
 	}
-	g_why = t >= t_end ? 2 : 1;
 	return -1.0;
 }
 
@@ -851,8 +673,6 @@ bool March(vec3 P, vec3 N, vec3 R, vec3 V, int iters, out vec4 res, out float hd
 	float hit_z = 0.0;
 	float th    = HizTrace(r, t0, tmax, iters, hit_z);
 	if (th < 0.0) return false;
-	g_why = 3; // (from here: found, then refused by the validation)
-	if (Refine()) th = RefineHit(r, th, t0, tmax);
 	vec2  hp  = r.p0 + r.dp * th;
 	vec2  huv = hp / rs;
 	if (!InScreen(huv)) return false;
@@ -887,209 +707,6 @@ bool March(vec3 P, vec3 N, vec3 R, vec3 V, int iters, out vec4 res, out float hd
 	return true;
 }
 
-#ifdef KYTY_HWRT
-// (hwrt2, KYTY_HWRT_REFL) The scene captured by KYTY_HWRT (local/hwrt-scene.cpp): its TLAS in world space and RayInfo.
-layout(std430, binding = 22) readonly buffer HwRayInfo {
-	vec4  inv[4]; // clip -> world rows
-	vec4  vp[4];  // world -> clip rows
-	vec4  cam;
-	vec4  info;   // x 1: valid
-	uvec4 materials;
-} hw;
-layout(binding = 23) uniform accelerationStructureEXT hw_tlas;
-layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer HwWords { uint w[]; };
-layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer HwVerts { vec4 v[]; };
-#ifdef KYTY_HWRT_MATERIAL
-// (hwrt3, KYTY_HWRT_REFL_MATERIAL) the captured meshes' base colours (hwrt-scene.cpp: one layer per texture, sqrt-encoded);
-// a TLAS instance's layer + 1 in the albedo words (hw.materials.zw), its texcoords as half2 in its world vertices' w.
-layout(binding = 24) uniform sampler2DArray hw_albedo;
-#endif
-
-// A view-space point to world space, through the screen as the game's camera sees it: the uv and depth this pass's
-// projection gives it, then the game's own inverse view-projection (the debug view's convention: NDC y = uv.y * 2 - 1).
-vec3 HwToWorld(vec3 p) {
-	vec4  c  = Clip(p);
-	vec2  uv = Project(p);
-	vec4  q  = vec4(uv * 2.0 - 1.0, c.z / c.w, 1.0);
-	vec4  h  = vec4(dot(hw.inv[0], q), dot(hw.inv[1], q), dot(hw.inv[2], q), dot(hw.inv[3], q));
-	return h.xyz / h.w;
-}
-// A world-space point to (uv, depth) on the screen; w <= 0: behind the camera.
-vec4 HwToScreen(vec3 w) {
-	vec4 q = vec4(w, 1.0);
-	vec4 c = vec4(dot(hw.vp[0], q), dot(hw.vp[1], q), dot(hw.vp[2], q), dot(hw.vp[3], q));
-	if (c.w <= 1e-6) return vec4(-1.0, -1.0, 0.0, 0.0);
-	return vec4(c.xy / c.w * 0.5 + 0.5, c.z / c.w, 1.0);
-}
-// The scene's mean colour (a coarse 4x4 grid of the frame): the light an off-screen hit is shaded with.
-vec3 HwAmbient() {
-	vec3 sum = vec3(0);
-	for (int y = 0; y < 4; ++y)
-		for (int x = 0; x < 4; ++x) sum += SafeColor(textureLod(color_tex, (vec2(x, y) + 0.5) / 4.0, 0).rgb * GameExposure());
-	return sum / 16.0;
-}
-#ifdef KYTY_HWRT_MATERIAL
-// (hwrt3) The same grid's mean, and its top row's (the sky or what is overhead: the light from above).
-vec3 HwAmbientSky(out vec3 sky) {
-	vec3 sum = vec3(0);
-	sky      = vec3(0);
-	for (int y = 0; y < 4; ++y)
-		for (int x = 0; x < 4; ++x) {
-			vec3 c = SafeColor(textureLod(color_tex, (vec2(x, y) + 0.5) / 4.0, 0).rgb * GameExposure());
-			sum += c;
-			if (y == 0) sky += c;
-		}
-	sky *= 0.25;
-	return sum / 16.0;
-}
-#endif
-
-// A reflection ray the screen-space march missed, traced in the scene's TLAS. A hit on the screen and visible there takes
-// the frame's colour (as the march's hits); one off the screen or hidden is shaded by the scene's mean light and its
-// geometric normal (lit from above), at a lower confidence (the game's own reflection keeps a share).
-bool g_sky = false; // (refl-pro: the last HwMarch result was the environment fallback)
-bool HwMarch(vec3 P, vec3 N, vec3 R, vec3 V, out vec4 res, out float hdist) {
-	g_sky = false;
-	res   = vec4(0);
-	hdist = 0.0;
-	if (hw.info.x < 0.5) return false;
-	float dist = abs(P.z);
-	float step = 0.01 * max(dist, 1.0);
-	vec3  Pw   = HwToWorld(P);
-	vec3  Rw   = HwToWorld(P + R * step) - Pw;
-	vec3  Nw   = HwToWorld(P + N * step) - Pw;
-	if (BadV(Pw) || BadV(Rw) || length(Rw) < 1e-9) return false;
-	Rw = normalize(Rw);
-	Nw = length(Nw) > 1e-9 ? normalize(Nw) : -Rw;
-	vec3 o = Pw + Nw * (0.002 * dist + 0.01);
-	// (flick2) static meshes only (0x01): a still character still flips between 0x02 / 0x04 / not captured frame to frame.
-	// (flick) earlier cull mask 0x03: static + dynamic captured THIS frame. 0x04 (a dynamic mesh at an older frame's positions)
-	// toggles with 0x02 as captures come and go (~5 % of draws captured a frame), so a reflected character / door / debris
-	// card showed at a stale spot one frame and vanished the next: the reflections-only flicker. 0x08: ash / leaf cards.
-	rayQueryEXT rq;
-	rayQueryInitializeEXT(rq, hw_tlas, gl_RayFlagsOpaqueEXT, 0x01, o, 0.01, Rw, max(push.params.z, 1.0)); // (flick2: 0x01, static only)
-	while (rayQueryProceedEXT(rq)) {}
-	if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
-		if (!Pro()) return false;
-		// (refl-pro) Nothing in the scene along the ray: the environment - the frame's overhead light (sky / what is above)
-		// for rays going up, its mean light for the rest, smoothly by the ray's elevation, at a moderate confidence (the
-		// game's own probe in the pixel keeps the rest): a miss never turns a reflection off.
-		vec3 env = HwAmbient();
-#ifdef KYTY_HWRT_MATERIAL
-		vec3 skyc;
-		env = HwAmbientSky(skyc);
-		env = mix(env, skyc, smoothstep(0.0, 0.6, Rw.y));
-#endif
-		res   = vec4(Tonemap(SafeColor(env)) * 0.45, 0.45);
-		hdist = max(push.params.z, 1.0);
-		g_sky = true;
-		return !Bad(res);
-	}
-	float t  = rayQueryGetIntersectionTEXT(rq, true);
-	vec3  Hw = o + Rw * t;
-	hdist    = t;
-	float far_fade = Pro() ? 1.0 : 1.0 - smoothstep(0.7, 1.0, t / max(push.params.z, 1.0)); // (refl-pro: no fade with distance)
-	// On the screen and visible there: the frame's own colour at the hit.
-	bool hidden = false;
-	vec4 sc = HwToScreen(Hw);
-	if (sc.w > 0.5 && InScreen(sc.xy)) {
-		float sd = DepthAt(sc.xy);
-		float zs = abs(ViewZ(sd)), zh = abs(ViewZ(sc.z));
-		hidden = !IsSky(sd) && zs < zh - (0.03 * zh + 0.1); // (flick2: on the screen, behind something nearer)
-		if (!IsSky(sd) && abs(zs - zh) < 0.03 * zh + 0.1) {
-			vec2  edge = min(sc.xy, 1.0 - sc.xy);
-			float conf = far_fade * (0.5 + 0.5 * smoothstep(0.0, 0.05, min(edge.x, edge.y)));
-			vec3  c    = Tonemap(SafeColor(textureLod(color_tex, sc.xy, 0).rgb * GameExposure()));
-			res        = vec4(c * conf, conf);
-			return !Bad(res) && conf > 1e-3;
-		}
-	}
-	// Off the screen or hidden: the scene's mean light on the hit triangle's normal.
-	int  inst = rayQueryGetIntersectionInstanceIdEXT(rq, true);
-	int  prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-	vec3 Hn   = -Rw;
-	uint64_t mat = uint64_t(hw.materials.x) | (uint64_t(hw.materials.y) << 32);
-#ifdef KYTY_HWRT_MATERIAL
-	vec3 albedo = vec3(-1.0); // (hwrt3: the hit's base colour; < 0: none)
-#endif
-	if (mat != 0ul && inst >= 0 && prim >= 0) {
-		HwWords  m   = HwWords(mat);
-		uint64_t vb  = uint64_t(m.w[inst * 8 + 4]) | (uint64_t(m.w[inst * 8 + 5]) << 32);
-		uint64_t ib  = uint64_t(m.w[inst * 8 + 6]) | (uint64_t(m.w[inst * 8 + 7]) << 32);
-		if (vb != 0ul && ib != 0ul) {
-			HwWords idx = HwWords(ib);
-			HwVerts ver = HwVerts(vb);
-#ifdef KYTY_HWRT_MATERIAL
-			vec4    a4  = ver.v[idx.w[prim * 3 + 0]];
-			vec4    b4  = ver.v[idx.w[prim * 3 + 1]];
-			vec4    d4  = ver.v[idx.w[prim * 3 + 2]];
-			vec3    a   = a4.xyz;
-			vec3    b   = b4.xyz;
-			vec3    d   = d4.xyz;
-#else
-			vec3    a   = ver.v[idx.w[prim * 3 + 0]].xyz;
-			vec3    b   = ver.v[idx.w[prim * 3 + 1]].xyz;
-			vec3    d   = ver.v[idx.w[prim * 3 + 2]].xyz;
-#endif
-			vec3    n   = cross(b - a, d - a);
-			if (length(n) > 1e-12) Hn = normalize(n);
-			if (dot(Hn, Rw) > 0.0) Hn = -Hn;
-#ifdef KYTY_HWRT_MATERIAL
-			// The mesh's albedo layer, its texcoords at the hit (the ray query's barycentrics), the base colour there.
-			uint64_t aw = uint64_t(hw.materials.z) | (uint64_t(hw.materials.w) << 32);
-			uint     layer1 = aw != 0ul ? HwWords(aw).w[inst] : 0u;
-			if (layer1 != 0u && layer1 <= uint(textureSize(hw_albedo, 0).z)) {
-				vec2 bc = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-				vec2 t0 = unpackHalf2x16(floatBitsToUint(a4.w));
-				vec2 t1 = unpackHalf2x16(floatBitsToUint(b4.w));
-				vec2 t2 = unpackHalf2x16(floatBitsToUint(d4.w));
-				vec2 uv = t0 * (1.0 - bc.x - bc.y) + t1 * bc.x + t2 * bc.y;
-				if (!any(isnan(uv)) && all(lessThan(abs(uv), vec2(30000.0)))) {
-					vec4 sa = textureLod(hw_albedo, vec3(uv, float(layer1 - 1u)), 0.0);
-					albedo  = sa.rgb * sa.rgb;
-				}
-			}
-#endif
-		}
-	}
-	float up   = clamp(Hn.y * 0.5 + 0.5, 0.0, 1.0); // (world y up)
-#ifdef KYTY_HWRT_MATERIAL
-	vec3  c;
-	float conf;
-	if (albedo.x >= 0.0) {
-		// (hwrt3) Lit as the frame is: its mean light with the mean albedo (~0.35) divided out, ambient from all around,
-		// the overhead light (the frame's top row: sky / sun-lit) on what faces up.
-		// (flick2) no overhead "sky" term (the frame's top row: a bright door / fog / candles even indoors), the hit
-		// never brighter than twice the frame's mean light and half desaturated: the blocky orange patches (candle /
-		// forge albedo at full strength) that popped on the Nexus floor around the character
-		vec3 sky;
-		vec3 amb   = HwAmbientSky(sky);
-		vec3 lit   = SafeColor(albedo * amb * (1.0 / 0.35) * (0.4 + 0.4 * up));
-		float lm   = Luma(lit), lc = 2.0 * Luma(amb) + 1e-4;
-		if (lm > lc) lit *= lc / lm;
-		lit        = mix(vec3(Luma(lit)), lit, 0.5);
-		c          = Tonemap(lit);
-		conf       = 0.65 * far_fade;
-	} else {
-		c    = Tonemap(HwAmbient() * (0.35 + 0.65 * up));
-		conf = 0.5 * far_fade;
-	}
-#else
-	vec3  c    = Tonemap(HwAmbient() * (0.35 + 0.65 * up));
-	float conf = 0.5 * far_fade;
-#endif
-	// (flick2) a hit that is on the screen but hidden behind something nearer (the character standing over the floor's
-	// reflection, a pillar): we cannot see it, so a dim grey guess at a third of the confidence - not a coloured one that
-	// toggles with the occluder's silhouette (the white halo / orange blocks around the boots and the shield)
-	if (hidden) {
-		c    = vec3(Luma(c)) * 0.8;
-		conf *= 0.35;
-	}
-	res        = vec4(c * conf, conf);
-	return !Bad(res) && conf > 1e-3;
-}
-#endif
-
 // `march`: false on the checkerboard's other half this frame: the surface is written, the reflection marked absent
 // (alpha -1: the temporal pass keeps the history there).
 void Trace(ivec2 px, bool march) {
@@ -1115,8 +732,7 @@ void Trace(ivec2 px, bool march) {
 		bool  gd   = GuideMode() && s.water <= 0.0;
 		float west = (gd ? gparams.w : push.params.x) * s.mask * Spec(s.prough, clamp(dot(s.N, V), 0.0, 1.0), s.metal, s.water);
 		if (gd) west = max(west, s.extra); // (refl9: the metal / glossy paths)
-		if (Pro()) gd = true, west = push.params.x * s.mask * Luma(EnvSpec(vec3(ProF0(rp)), s.prough, clamp(dot(s.N, V), 0.0, 1.0)));
-		if (west < (gd ? (Pro() ? 0.004 : 0.01) : 0.02)) {
+		if (west < (gd ? 0.01 : 0.02)) {
 			s.mask = 0.0;
 			StoreMiss(px, s);
 			return;
@@ -1128,105 +744,29 @@ void Trace(ivec2 px, bool march) {
 		return;
 	}
 	bool st = Sampled(px);
+	if (st) Stat(4, 1);
 	float f  = float(push.misc.y & 1023);
-	int   iters = max(int(float(push.misc2.z) * mix(1.0, 0.5, smoothstep(0.15, 0.45, s.rough))), 8);
-	// (refl10) Glossy surfaces: up to RaysPerPixel() rays (KYTY_RT_REFLECTIONS_RPP; the extreme level 2), each its own
-	// lobe sample (the next points of the same per-pixel sequence), averaged: the premultiplied colors and confidences
-	// over all rays (a miss counts as nothing, as one ray's miss did), the hit distance confidence-weighted (the
-	// temporal pass's virtual image). Mirrors (one direction) one ray.
-	int   nr  = s.rough < 0.02 ? 1 : RaysPerPixel();
-	vec4  acc = vec4(0);
-	float hd_sum = 0.0, hd_w = 0.0;
-	int   hits = 0;
-	for (int k = 0; k < nr; ++k) {
-		if (st) Stat(4, 1);
-		// (refl-pro) a fixed per-pixel sequence (interleaved gradient noise: blue-noise-like spatially), not advanced by the
-		// frame: with a still camera every frame traces the same rays - nothing to flicker; the a-trous pass and the
-		// split-sum ratio (radiance averaged here, the BRDF analytic in the composite) take the spatial noise.
-		float fk = Pro() ? float(k) : f * float(nr) + float(k);
-		vec2  xi = vec2(fract(Ign(vec2(px)) + fk * 0.6180340), fract(Ign(vec2(px) + vec2(47.0, 17.0)) + fk * 0.7548777));
-		vec3  R;
-		if (s.rough < 0.02) R = reflect(-V, s.N);
-		else {
-			vec3 H = SampleGgxVndf(s.N, V, max(s.rough * s.rough, 1e-3), xi);
-			R      = reflect(-V, H);
-			if (dot(R, s.N) <= 0.02) R = reflect(-V, s.N);
-		}
-		// (a normal-mapped normal can send the ray into the surface itself: kept just above its geometric plane)
-		float rg = dot(R, s.Ng);
-		if (rg < 0.01) R += s.Ng * (0.01 - rg);
-		R = normalize(R);
-		if (BadV(R)) continue;
-		vec4  hc;
-		float hdist;
-		g_why = 4;
-#ifdef KYTY_HWRT
-		g_sky = false;
-#endif
-		bool marched = March(P, s.N, R, V, iters, hc, hdist);
-		bool ss_hit  = marched && hc.a >= 0.5;
-		if (st && Pro()) Stat(34, marched ? int(hc.a * 1000.0) : 0);
-#ifdef KYTY_HWRT
-		if (Pro() && marched && hc.a < 0.98) {
-			// (refl-pro) The screen-space hit fades out (screen edges, silhouettes, rays toward the camera): the TLAS ray
-			// fills the rest by that confidence - no switch between the two sources.
-			vec4  hw4;
-			float hwd;
-			if (HwMarch(P, s.N, R, V, hw4, hwd)) {
-				float k = 1.0 - hc.a;
-				if (st) Stat(g_sky ? 36 : 35, int(k * hw4.a * 1000.0));
-				hdist = hc.a >= k * hw4.a ? hdist : hwd;
-				hc += k * hw4;
-			}
-		}
-		if (!marched) {
-			marched = HwMarch(P, s.N, R, V, hc, hdist); // (hwrt2: the march's miss, in the scene's TLAS)
-			if (st && Pro() && marched) Stat(g_sky ? 36 : 35, int(hc.a * 1000.0));
-		}
-#endif
-		if (!marched) {
-			// (refl10) why the rays miss (1 in 16 pixels): out of iterations / off the screen or the ray's end /
-			// refused by the validation (or faded to nothing); the rest (toward the camera, degenerate) uncounted
-			if (st) Stat(30, g_why == 1 ? 1 : 0), Stat(31, g_why == 2 ? 1 : 0), Stat(StatsRefused, g_why == 3 ? 1 : 0);
-			continue;
-		}
-		// (ds-rt-refl-1027) a hit: the screen-space march or a TLAS triangle; the environment fallback of a TLAS miss
-		// (g_sky, conf 0.45) is a miss (it made the "hit rate 100 %")
-#ifdef KYTY_HWRT
-		if (st && (ss_hit || !g_sky)) Stat(5, 1);
-#else
-		if (st) Stat(5, 1);
-#endif
-		acc += hc;
-		// (flick) the virtual image follows the most confident ray, not an average of two hits at different depths
-		// (2 rays at Ultra: the averaged distance matched neither, the reprojected history failed the clamp: shimmer)
-		if (hc.a > hd_w) hd_sum = hdist * hc.a, hd_w = hc.a;
-		++hits;
+	vec2  xi = vec2(fract(Ign(vec2(px)) + f * 0.6180340), fract(Ign(vec2(px) + vec2(47.0, 17.0)) + f * 0.7548777));
+	vec3  R;
+	if (s.rough < 0.02) R = reflect(-V, s.N);
+	else {
+		vec3 H = SampleGgxVndf(s.N, V, max(s.rough * s.rough, 1e-3), xi);
+		R      = reflect(-V, H);
+		if (dot(R, s.N) <= 0.02) R = reflect(-V, s.N);
 	}
-	if (hits == 0) { StoreMiss(px, s); return; }
-	acc /= float(nr);
-	imageStore(out_a, px, acc);
-	imageStore(out_c, px, vec4(s.rough, s.mask, hd_w > 1e-6 ? hd_sum / hd_w : 0.0, 1));
-}
+	// (a normal-mapped normal can send the ray into the surface itself: kept just above its geometric plane)
+	float rg = dot(R, s.Ng);
+	if (rg < 0.01) R += s.Ng * (0.01 - rg);
+	R = normalize(R);
+	if (BadV(R)) { StoreMiss(px, s); return; }
 
-// (refl10) The history (src_b, linear sampler) at `uv` through a 5-tap Catmull-Rom (the corner taps dropped,
-// renormalised), never negative.
-vec4 HistoryCR(vec2 uv) {
-	vec2 ts = TraceSize();
-	vec2 sp = uv * ts;
-	vec2 tp = floor(sp - 0.5) + 0.5;
-	vec2 f  = sp - tp;
-	vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
-	vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
-	vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
-	vec2 w3 = f * f * (-0.5 + 0.5 * f);
-	vec2 w12 = w1 + w2;
-	vec2 t0 = (tp - 1.0) / ts, t3 = (tp + 2.0) / ts, t12 = (tp + w2 / max(w12, vec2(1e-6))) / ts;
-	vec4 c = textureLod(src_b, vec2(t12.x, t0.y), 0) * (w12.x * w0.y) + textureLod(src_b, vec2(t0.x, t12.y), 0) * (w0.x * w12.y) +
-	         textureLod(src_b, t12, 0) * (w12.x * w12.y) + textureLod(src_b, vec2(t3.x, t12.y), 0) * (w3.x * w12.y) +
-	         textureLod(src_b, vec2(t12.x, t3.y), 0) * (w12.x * w3.y);
-	float w = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
-	return max(c / max(w, 1e-4), vec4(0));
+	vec4 hc;
+	float hdist;
+	int   iters = max(int(float(push.misc2.z) * mix(1.0, 0.5, smoothstep(0.15, 0.45, s.rough))), 8);
+	if (!March(P, s.N, R, V, iters, hc, hdist)) { StoreMiss(px, s); return; }
+	if (st) Stat(5, 1);
+	imageStore(out_a, px, hc);
+	imageStore(out_c, px, vec4(s.rough, s.mask, hdist, 1));
 }
 
 void Temporal(ivec2 px) {
@@ -1245,7 +785,6 @@ void Temporal(ivec2 px) {
 	// The 3x3 neighbourhood on the same surface (YCoCg of the premultiplied color, confidence).
 	vec3  m1 = vec3(0), m2 = vec3(0);
 	float a1 = 0.0, a2 = 0.0, l1 = 0.0, l2 = 0.0, wn = 0.0, wraw = 0.0;
-	float nhd = 0.0, nhw = 0.0; // (refl10: the neighbours' hit distances, confidence-weighted)
 	vec4  mean = vec4(0);
 	ivec2 hi   = ivec2(ts) - 1;
 	for (int y = -1; y <= 1; ++y)
@@ -1261,10 +800,6 @@ void Temporal(ivec2 px) {
 			l1 += l * w, l2 += l * l * w;
 			mean += sv * w;
 			wn += w;
-			if (w > 0.0 && sv.a > 1e-3) {
-				vec4 sx = texelFetch(aux_tex, q, 0);
-				if (sx.w > 0.5 && sx.z > 0.0) nhd += sx.z * sv.a, nhw += sv.a;
-			}
 		}
 	wraw = wn;
 	wn   = max(wn, 1.0);
@@ -1284,15 +819,10 @@ void Temporal(ivec2 px) {
 	vec2 mv    = texelFetch(motion_tex, RenderPixel(uv), 0).xy * push.motion.xy / RenderSize();
 	vec2 puv_s = uv + mv;
 	vec2 puv   = puv_s;
-	// (refl10) The virtual image needs the reflected hit's distance: the pixel's own hit this frame, else (KYTY_RT_
-	// REFLECTIONS_VIRTUAL: the checkerboard's untraced half, a miss) its neighbours' on the same surface. Before, those
-	// pixels took the history by the surface's motion: a reflection that moves with the floor instead of with the
-	// mirrored world, the smear / ghost trail behind reflected objects at every camera move (half the pixels at ultra).
-	float vdist = ax.w > 0.5 && ax.z > 0.0 ? ax.z : (VirtualFill() && nhw > 1e-3 ? nhd / nhw : 0.0);
-	if ((push.misc.w & 4) != 0 && vdist > 0.0) {
+	if ((push.misc.w & 4) != 0 && ax.w > 0.5 && ax.z > 0.0) {
 		float d  = DepthAt(uv);
 		vec3  P  = ViewPos((vec2(RenderPixel(uv)) + 0.5) / RenderSize(), d);
-		vec3  Xv = P + normalize(P) * vdist;
+		vec3  Xv = P + normalize(P) * ax.z;
 		vec2  s0 = PrevUv(P, false), s1 = PrevUv(P, true);
 		float e0 = length((s0 - puv_s) * RenderSize()), e1 = length((s1 - puv_s) * RenderSize());
 		bool  fl = e1 < e0;
@@ -1311,88 +841,23 @@ void Temporal(ivec2 px) {
 		vec4  pg = texelFetch(gb_prev, pp, 0);
 		float dz = abs(pg.w - g.w) / max(g.w, 1e-3);
 		valid    = dz < 0.06 && dot(pg.xyz, g.xyz) > 0.85;
-		// (refl-pro) an edge pixel the TAA jitter moves across a silhouette: the best match in the previous 3x3 keeps its
-		// history instead of restarting at 40 % (a flash every other frame)
-		if (!valid && Pro())
-			for (int y = -1; y <= 1 && !valid; ++y)
-				for (int x = -1; x <= 1 && !valid; ++x) {
-					ivec2 q  = clamp(pp + ivec2(x, y), ivec2(0), hi);
-					vec4  qg = texelFetch(gb_prev, q, 0);
-					if (abs(qg.w - g.w) / max(g.w, 1e-3) < 0.06 && dot(qg.xyz, g.xyz) > 0.85) valid = true, pp = q;
-				}
 		meta     = texelFetch(meta_tex, pp, 0);
 		if (Bad(meta)) valid = false;
 	}
-	// (ds-rt-refl-1027) Still camera: the same G-buffer surface at this very pixel last frame (depth within 2 %, normal
-	// within ~14 deg). The 3d9088db hold test was the game's motion vector under 1 render pixel only - with DLSS the
-	// motion vector carries the jitter's frame-to-frame delta (up to ~1.4 px): about half the still pixels missed the
-	// hold, took the 3x3 clamp / the 0.25 blend and flashed (RTFLASH hit <-> miss 41-46 %, other 40-42 %).
-	float mvpx  = length(mv * RenderSize());
-	bool  still_ = (push.misc.w & 32768) != 0;
-	bool  same  = false;
-	if (still_) {
-		vec4 pg0 = texelFetch(gb_prev, px, 0);
-		same     = abs(pg0.w - g.w) / max(g.w, 1e-3) < 0.02 && dot(pg0.xyz, g.xyz) > 0.97;
-		vec4 m0  = texelFetch(meta_tex, px, 0);
-		// (reprojection refused - virtual image off screen, a jittered silhouette - but the surface did not move: its own
-		// history, not a 40 % restart)
-		if (!valid && same && (push.misc.w & 1) == 0 && (push.misc.w & 2) != 0 && !Bad(m0) && mvpx < 3.0) valid = true, meta = m0;
-	}
-	// (a3d1eac9 log: "mv >= 1 px" on 70-84 % of the "still" samples - the capture shows no jitter in the motion vectors
-	// (still set p99 0.7 px): rt-flicker's still test (any vp element within 4e-3 x the largest, the translation ~160)
-	// passes a slowly turning / drifting camera. Held only where the pixel really did not move.)
-	bool  hold  = still_ && valid && mvpx < 1.0;
 	vec4  res;
 	float len, mo1, mo2;
 	float lc = Luma(cur.rgb);
-	vec4  f_hraw = vec4(-1.0);
-	float f_hclamp = -1.0;
-	float f_alpha = -1.0;
 	if (valid) {
-		// (refl10, KYTY_RT_REFLECTIONS_BICUBIC) Smooth surfaces: the history through a Catmull-Rom filter instead of
-		// bilinear: a bilinear fetch every frame is a blur that compounds (the history is re-filtered each frame: sharp
-		// reflections went soft in motion); the neighbourhood clamp below catches the filter's overshoot.
-		// (ds-rt-stable-1027) still camera, the pixel under 0.3 px of motion: its own history texel, unfiltered (a filtered
-		// fetch every frame re-blurs the converged history and moves it with the jitter)
-		// (865551c6 log: the clamp still cut 12-23 % of the flashes - this test used puv, the virtual-image reprojection,
-		// whose hit distance moves with the jitter, in trace pixels: never under 0.3 under DLSS. Now the surface's own
-		// motion vector, under 1 render pixel: the game's jitter is not motion)
-		vec4  hist = hold ? texelFetch(src_b, px, 0) : BicubicHist() && rough < 0.3 ? HistoryCR(puv) : textureLod(src_b, puv, 0);
+		vec4  hist = textureLod(src_b, puv, 0);
 		if (Bad(hist)) hist = cur;
-		f_hraw     = hist;
 		float k    = mix(0.75, 2.5, smoothstep(0.05, 0.4, rough)); // (refl3: mirrors clamped tighter: no ghosts)
-		if (still_) k *= 2.0; // (refl-pro: a still camera has no parallax to ghost: the clamp only catches real changes)
-		// (ds-rt-stable-1027) held: no clamp against this frame's noisy 3x3 (it moved the converged history every frame:
-		// RTFLICKER reflections 1-3.6 %, max jump ~100 %); a real change still comes in through the running mean
-		if (!hold) {
-			vec3 hy  = clamp(YCoCg(hist.rgb), m1 - k * sig - 1e-4, m1 + k * sig + 1e-4);
-			hist.rgb = max(Rgb(hy), vec3(0));
-			hist.a   = clamp(hist.a, a1 - k * asig - 0.02, a1 + k * asig + 0.02);
-		}
-		f_hclamp   = Luma(hist.rgb);
-		len        = min(meta.x + 1.0, still_ ? 64.0 : 32.0);
+		vec3  hy   = clamp(YCoCg(hist.rgb), m1 - k * sig - 1e-4, m1 + k * sig + 1e-4);
+		hist.rgb   = max(Rgb(hy), vec3(0));
+		hist.a     = clamp(hist.a, a1 - k * asig - 0.02, a1 + k * asig + 0.02);
+		len        = min(meta.x + 1.0, 32.0);
 		// Mirrors follow quickly (a parallax error would ghost); rough surfaces average longer.
 		float amin  = mix(0.25, 0.04, smoothstep(0.02, 0.3, rough)) * push.motion.w; // (refl3: mirrors 0.25, was 0.15)
-		float alpha = hold ? 1.0 / len : max(1.0 / len, amin);
-		// (held: a fresh sample at most 1.5x / 0.67x the history's luminance - one firefly or a hit <-> miss toggle moves
-		// a converged pixel by <= 1 % a frame)
-		if (hold && fresh) {
-			float lh = Luma(hist.rgb), lf = Luma(cur.rgb), hi_ = 1.5 * lh + 0.01, lo_ = 0.67 * lh;
-			if (lf > hi_) cur.rgb *= hi_ / max(lf, 1e-6);
-			// hit <-> miss (35-68 % of the flashes): the confidence moves at most 0.1 a sample and a miss keeps the
-			// held colour (a miss's environment colour is not mixed in at all while the history has a hit)
-			bool miss = cur.a < hist.a - 0.1 && hist.a > 0.2;
-			cur.a = clamp(cur.a, hist.a - 0.1, hist.a + 0.1);
-			if (miss) cur.rgb = hist.rgb * (cur.a / max(hist.a, 1e-3)); // (premultiplied: the held colour at the new confidence)
-		} else if (still_ && fresh) {
-			// (ds-rt-refl-1027) still camera, not held (a moving character, a surface that changed): the same limiter, looser
-			// (1.75x / 0.57x, confidence 0.2 a frame) - a real change converges in a few frames instead of popping
-			float lh = Luma(hist.rgb), lf = Luma(cur.rgb), hi_ = 1.75 * lh + 0.01;
-			if (lf > hi_) cur.rgb *= hi_ / max(lf, 1e-6);
-			bool miss = cur.a < hist.a - 0.2 && hist.a > 0.2;
-			cur.a = clamp(cur.a, hist.a - 0.2, hist.a + 0.2);
-			if (miss) cur.rgb = mix(cur.rgb, hist.rgb * (cur.a / max(hist.a, 1e-3)), 0.75);
-		}
+		float alpha = max(1.0 / len, amin);
 		// (a miss this frame against a held reflection: the history fades slowly instead of popping)
 		if (fresh && cur.a < hist.a * 0.5) alpha *= 0.5;
 		// (refl9b) a sample far brighter or darker than the history: taken in more slowly (per-pixel flicker)
@@ -1406,15 +871,11 @@ void Temporal(ivec2 px) {
 			alpha = wraw > 0.0 ? alpha * 0.5 : 0.0;
 		}
 		res         = mix(hist, cur, alpha);
-		f_alpha     = alpha;
 		mo1         = mix(meta.y, lc, alpha);
 		mo2         = mix(meta.z, lc * lc, alpha);
 	} else {
 		// (no history: rough surfaces start from the neighbourhood's mean, less noisy)
 		res = rough > 0.1 ? mix(cur, mean, 0.5) : cur;
-		// (flick) no one-frame full-strength sample after a reset / disocclusion: 40 % confidence, the history
-		// (alpha 1 / len) ramps it in over the next frames (premultiplied: colour and confidence scaled together)
-		res *= 0.4;
 		len = 1.0;
 		mo1 = lc, mo2 = lc * lc;
 	}
@@ -1423,40 +884,6 @@ void Temporal(ivec2 px) {
 	if (Bad(res)) res = vec4(0);
 	res.rgb = clamp(res.rgb, vec3(0), vec3(1));
 	res.a   = clamp(res.a, 0.0, 1.0);
-	if ((push.misc.w & 65536) != 0 && Sampled(px)) FStat(29, mvpx >= 1.0 ? 1 : 0), FStat(30, mvpx >= 1.0 && same ? 1 : 0);
-	// (RTFLASH: the pixels that really are still, under 1 render pixel of motion; the drifting rest is camera motion)
-	if ((push.misc.w & 65536) != 0 && Sampled(px) && mvpx < 1.0) {
-		float lo = Luma(res.rgb);
-		float lp = f_hraw.a >= 0.0 ? Luma(max(f_hraw.rgb, vec3(0))) : 0.0;
-		float jmp = abs(lo - lp) / max(max(lo, lp), 0.02);
-		bool  fl  = max(lo, lp) > 0.02 && max(lo, lp) > 2.0 * min(lo, lp);
-		int   cause = 8;
-		if (fl) {
-			if (!valid) cause = 3;
-			else if (!fresh) cause = 7;
-			else if (Luma(cur.rgb) > 4.0 * l1 + 0.02) cause = 5;
-			else if (abs(cur.a - f_hraw.a) > 0.5) cause = 4;
-			else if (f_hclamp >= 0.0 && max(f_hclamp, lp) > 2.0 * min(f_hclamp, lp) + 0.01) cause = 6;
-		}
-		FStat(0, 1);
-		FStat(1, fl ? 1 : 0);
-		FStat(2, jmp > 0.1 && max(lo, lp) > 0.02 ? 1 : 0);
-		for (int c = 3; c <= 8; ++c) FStat(c, fl && cause == c ? 1 : 0);
-		FStat(9, fl ? int(jmp * 100.0) : 0);
-		FStat(10, fl && jmp > 0.5 ? 1 : 0), FStat(11, fl && jmp > 0.8 ? 1 : 0), FStat(12, fl && jmp > 0.95 ? 1 : 0);
-		// (ds-rt-refl-1027) "other" split (a partition, first match): 23 dark (both < 0.06: the 0.02 floor), 24 short history
-		// (< 4 frames since a reset), 25 not held (mv >= the hold limit / surface changed), 26 big blend (alpha >= 0.2),
-		// 27 the rest. Then the hold's reach: 28 samples held, 29 still samples with mv >= 1 px (the jitter's delta),
-		// 30 of those on the same surface, 31 flashes on held samples, 32 hit <-> miss on non-held samples.
-		int oc = 27;
-		if (max(lo, lp) < 0.06) oc = 23;
-		else if (valid && meta.x < 4.0) oc = 24;
-		else if (!hold) oc = 25;
-		else if (f_alpha >= 0.2) oc = 26;
-		for (int c = 23; c <= 27; ++c) FStat(c, fl && cause == 8 && oc == c ? 1 : 0);
-		FStat(28, hold ? 1 : 0);
-		FStat(31, fl && hold ? 1 : 0), FStat(32, fl && cause == 4 && !hold ? 1 : 0);
-	}
 	imageStore(out_a, px, res);
 	imageStore(out_b, px, vec4(len, mo1, mo2, var));
 }
@@ -1599,17 +1026,6 @@ void Composite(ivec2 px) {
 		}
 	}
 	if (st) Stat(17, MovingRaw(uv, P) > 0.5 ? 1 : 0);
-	if (st && Pro() && match && push.dec.y >= 0) {
-		// (refl-pro) the L2.b0 check: where the game's own SSR is confident against L2.b0 and the gloss
-		float b0 = Field(push.dec.y, px), gl = push.dec.w >= 0 ? 1.0 - Field(push.dec.w, px) : -1.0;
-		float ga0 = HaveGuide() && GbufSurface(px, d, match) ? GameSsr(uv).a : 0.0;
-		FStat(13, b0 > 0.5 ? 1 : 0), FStat(14, b0 > 0.5 ? int(ga0 * 1000.0) : 0);
-		FStat(15, b0 <= 0.5 ? 1 : 0), FStat(16, b0 <= 0.5 ? int(ga0 * 1000.0) : 0);
-		FStat(17, gl > 0.7 ? 1 : 0), FStat(18, gl > 0.7 ? int(ga0 * 1000.0) : 0);
-		FStat(19, gl >= 0.0 && gl < 0.3 ? 1 : 0), FStat(20, gl >= 0.0 && gl < 0.3 ? int(ga0 * 1000.0) : 0);
-		bool mv = MovingRaw(uv, P) > 0.5;
-		FStat(21, mv ? 1 : 0), FStat(22, mv ? int(b0 * 1000.0) : 0);
-	}
 	// (refl8) The game's own SSR here (the guide) and whether this pixel is the G-buffer's surface it belongs to.
 	vec4  gs     = GameSsr(uv);
 	bool  gsurf  = GuideMode() && HaveGuide() && GbufSurface(px, d, match);
@@ -1645,9 +1061,6 @@ void Composite(ivec2 px) {
 	if (water > 0.0) {
 		fr_rough = 0.0, metal = 0.0;
 		N        = WaterNormal(Nd); // (the G-buffer holds the bed under the water)
-	} else if (Pro()) {
-		mask = match && have_mat ? min(mask, ProRamp(ProRough(px))) : 0.0;
-		fr_rough = match && have_mat ? ProRough(px) : 1.0;
 	} else if (GuideMode()) {
 		// (refl8) The game's SSR confidence at this render pixel (the trace's mask is half resolution), narrowed to the
 		// mirror-like surfaces by the roughness field when there is one.
@@ -1666,20 +1079,18 @@ void Composite(ivec2 px) {
 		mask *= UpFacing(Nd);
 		fr_rough = 0.12;
 	}
-	if (Pro()) mask *= 1.0 - Moving(uv, P);
-	else if ((mask > 0.0 || ex > 0.0) && Moving(uv, P) > 0.5) {
+	if ((mask > 0.0 || ex > 0.0) && Moving(uv, P) > 0.5) {
 		mask = 0.0;
 		if (metal <= 0.5) ex = 0.0; // (refl9: a character's metal keeps the metal path)
 	}
 	if (mask < 0.01 && ex < 0.01) { imageStore(out_a, px, col); return; }
-	if (water <= 0.0 && match) N = SnapFloor(uv, P, N); // (refl10: floors' exact plane normal, as the trace's)
 	// (refl9b) Floors (up-facing, not metal) and water: the area test (tiny / speckled wet patches out, large pools up).
 	float upf_c = UpFacing(Nd);
 	bool  floor_ = (upf_c > 0.0 && metal <= 0.5) || water > 0.0;
 	float cov   = floor_ ? Coverage(uv, z, N) : 1.0;
 	float areaf = floor_ ? AreaFade(cov) : 1.0;
 	float pool  = floor_ ? Pool(cov) : 0.0;
-	if (floor_ && metal <= 0.5 && !Pro()) { // (refl-pro: the real roughness decides, not the puddle area test)
+	if (floor_ && metal <= 0.5) {
 		float fl = water > 0.0 ? 1.0 : upf_c;
 		mask *= mix(1.0, areaf, fl);
 		ex *= mix(1.0, areaf, fl);
@@ -1691,33 +1102,14 @@ void Composite(ivec2 px) {
 	// (refl9b) Large pools too (up to a roughness of 0.25: wet stone under a puddle reads rougher than its water): their
 	// own sharp mirror ray, the filtered result mixed in less.
 	bool pool_ray = pool > 0.5 && rough < 0.25 && (water > 0.0 || upf_c > 0.5) && mask > 0.1;
-	// (refl10, KYTY_RT_REFLECTIONS_FRESH_MIRROR) At the full-resolution trace too (ultra, extreme): a mirror's reflection
-	// is one direction, noise-free, so nothing needs averaging over frames; the temporal result (a fifth of a fresh sample
-	// a frame, bilinear history, half the pixels traced per frame at ultra) only made it lag and smear. This frame's
-	// mirror ray where the trace marched one (binding 6: the trace's raw output), else (the checkerboard's other half,
-	// pools' rougher lobe) the composite's own; the large pools' own mirror ray (refl9b) only ran at half resolution.
-	bool full = all(equal(ivec2(TraceSize()), ivec2(RenderSize())));
-	if (((rough < 0.04 && mask > 0.3) || pool_ray) && (!full || FreshMirror())) {
+	if (((rough < 0.04 && mask > 0.3) || pool_ray) && !all(equal(ivec2(TraceSize()), ivec2(RenderSize())))) {
 		vec3 Vf = normalize(-P);
 		vec3 Rf = reflect(-Vf, N);
 		float rg = dot(Rf, Nd);
 		if (rg < 0.01) Rf = normalize(Rf + Nd * (0.01 - rg));
-		vec4  hc  = vec4(0);
-		float hd  = 0.0;
-		bool  got = false, run_ray = true;
-		if (full) {
-			vec4 raw = texelFetch(src_b, px, 0);
-			if (rough < 0.02 && raw.a >= 0.0) {
-				// (marched this frame with this pixel's mirror direction: its hit, or its miss, as is)
-				run_ray = false;
-				if (raw.a > 1e-3 && !Bad(raw)) hc = raw, got = true;
-			}
-		}
-		if (run_ray && !BadV(Rf)) {
-			if (st) Stat(33, 1);
-			got = March(P, N, Rf, Vf, push.misc2.z, hc, hd);
-		}
-		if (got) {
+		vec4  hc;
+		float hd;
+		if (!BadV(Rf) && March(P, N, Rf, Vf, push.misc2.z, hc, hd)) {
 			// (a little of the temporal result where it agrees: steadier under sub-pixel camera motion)
 			bool agree = rf.a > 1e-3 && !Bad(rf) && distance(rf.rgb / rf.a, hc.rgb / hc.a) < 0.1;
 			rf = agree ? mix(hc, rf, 0.25 * (1.0 - pool)) : hc;
@@ -1734,37 +1126,6 @@ void Composite(ivec2 px) {
 	float NoV   = clamp(dot(N, V), 0.0, 1.0);
 	// (refl9b) Floors and water: the reflection's energy clamped (no fireflies)
 	vec3  reflf = floor_ && metal <= 0.5 ? ClampEnergy(refl, Luma(max(col.rgb, vec3(0))), pool) : refl;
-	if (Pro()) {
-		// (refl-pro) The split-sum share: F0 (the specular level; a metal's albedo) x A + B by roughness and N.V, x the
-		// roughness ramp, x the hit's accumulated confidence (through a square root: a partial hit rate never halves it).
-		// The pixel is mixed toward the reflection by that share (the game's lit color stands for diffuse + its probe).
-		vec3  f0  = mix(vec3(water > 0.0 ? 0.02 : ProF0(px)), GbufAlbedo(px), clamp(metal, 0.0, 1.0));
-		vec3  spc = EnvSpec(f0, water > 0.0 ? 0.0 : fr_rough, NoV);
-		if (water > 0.0) spc = max(spc, vec3(fparams.y * smoothstep(0.3, 0.8, water)));
-		// (ds-rt-refl-1027) the game's own wetness (L2.b2 nibble): water / puddles at the water minimum reflectance (0.4 x
-		// wetness). A dielectric's 0.04 Fresnel alone replaced ~4 % of the pixel (log 013206: mean share 0.04, "nothing
-		// visible"); the depth-based water detector finds 0 % in fbe13e4e (the water pass is gone)
-		else if (match) spc = max(spc, vec3(0.6 * CaptureWet(px))); // (standing water 0.6, damp ground less)
-		if (water <= 0.0 && match && CaptureLayout() && fr_rough > 0.3) spc = max(spc, vec3(0.15)); // (glossy tier: visible sheen)
-		float a   = sqrt(clamp(rf.a, 0.0, 1.0)) * mask * push.params.x * ProSpecOcc(uv, P, N, Nd, V, water > 0.0 ? 0.0 : fr_rough, NoV);
-		vec3  wv  = clamp(spc * a, 0.0, 0.95);
-		float lc  = Luma(max(col.rgb, vec3(0))), lr = Luma(reflf);
-		float keep = 1.0 - smoothstep(4.0, 12.0, lc / max(lr, lc * 1e-4 + 1e-30)); // (the game's highlights stay)
-		wv *= keep;
-		float wl = Luma(wv);
-		if (lr < lc && wl > 0.0) wv *= min(1.0, MaxDarken * lc / max((lc - lr) * wl, 1e-30));
-		vec3 outp = mix(col.rgb, reflf, wv);
-		if (BadV(outp)) outp = col.rgb;
-		if (st) {
-			float wf = Luma(wv);
-			if (wf > 0.02) Stat(1, 1);
-			Stat(2, int(wf * 1000.0));
-			if (match && have_mat && ProRamp(fr_rough) > 0.5) Stat(37, 1), Stat(38, int(wf * 1000.0));
-			Stat(39, int(clamp(rf.a, 0.0, 1.0) * 1000.0));
-		}
-		imageStore(out_a, px, vec4(clamp(outp, vec3(0), vec3(6.0e4)), col.a));
-		return;
-	}
 	if (GuideMode() && water <= 0.0) {
 		// (refl8) Only the game's SSR color is replaced, at the game's own share: its confidence a x the Fresnel x
 		// strength; ours' confidence (through a square root, as below) and the mirror-likeness (mask / the game's mask)

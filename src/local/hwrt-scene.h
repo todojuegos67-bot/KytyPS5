@@ -39,6 +39,8 @@ namespace HwScene {
 constexpr uint32_t CursorDword = 31;
 
 // KYTY_HWRT=1 (read once).
+// (ds-rt1026-restore) KYTY_RT_HW_EXPERIMENTAL=1: the hardware-RT passes may be asked for (KYTY_HWRT=1); default off.
+[[nodiscard]] bool RtHwExperimental();
 [[nodiscard]] bool Requested();
 // At device creation (only when Requested): the extensions, and the features chained in front of `next` when the
 // device has them all (Active() false otherwise, logged).

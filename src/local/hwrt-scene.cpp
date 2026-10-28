@@ -1452,10 +1452,26 @@ TextureCache*   g_cache    = nullptr; // (hwrt3: the draws' texture cache, rende
 
 } // namespace
 
+bool RtHwExperimental() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_RT_HW_EXPERIMENTAL");
+		return value != nullptr && *value == '1';
+	}();
+	return on;
+}
+
 bool Requested() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_HWRT");
-		return value != nullptr && *value == '1';
+		// (ds-rt1026-restore) The hardware-RT effects (TLAS: reflections, sun, lamps, GI, water, volumetric) are out of the
+		// default build again: KYTY_HWRT=1 is honoured only with KYTY_RT_HW_EXPERIMENTAL=1 ("RT real (experimental)").
+		const bool  asked = value != nullptr && *value == '1';
+		if (asked && !RtHwExperimental()) {
+			std::printf("HWRT: KYTY_HWRT=1 ignored: the 10-26 screen-space RT set is in use (KYTY_RT_HW_EXPERIMENTAL=1: the hardware RT, experimental)\n");
+			std::fflush(stdout);
+			return false;
+		}
+		return asked;
 	}();
 	return on;
 }
