@@ -828,7 +828,7 @@ function Fill-Res {
 		$lowAll = ($chkLowEnd -and $chkLowEnd.Checked) -or ($chkSoulsLow -and $chkSoulsLow.Checked)  # (10-25) ligero y low profile: todas las calidades de DLSS (Ultra rendimiento incluido)
 		if ($family -eq 'dlss' -and -not $lowAll) { $modes = @($modes | Where-Object { $h = [math]::Round($outH / $_[1]); $h -ge 1080 -or $h -eq 720 }) }
 		elseif ($family -in 'xess', 'fsr' -and $outH -lt 1440 -and -not $lowAll) { $modes = @($modes | Where-Object { $outH / $_[1] -ge 719 }) }
-		elseif ($family -eq 'fsr4') { $modes = @($modes | Where-Object { $outH / $_[1] -ge 719 }) }  # (FSR 4: el 3D a 720 como minimo)
+		elseif ($family -eq 'fsr4') { $modes = @($modes | Where-Object { $outH / $_[1] -ge 359 }) }  # (10-28) FSR 4: el 3D a 360 como minimo (su modelo sale al tamano de la pantalla: en 1080p Equilibrado 635, Rendimiento 540, Ultra rendimiento 360)
 		if ($family -eq 'juego' -and $outH -lt 1440) { $modes = @() }
 		if ($modes.Count -eq 0) { continue }
 		if ($titles.ContainsKey($family)) { $shown += , @($titles[$family], 0, '', 0) }
