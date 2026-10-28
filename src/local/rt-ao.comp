@@ -248,7 +248,11 @@ void Trace(ivec2 tp) {
 		vsum += lp * a;
 		wsum += lp;
 	}
-	float vis = wsum > 1e-6 ? clamp(vsum / wsum, 0.0, 1.0) : 1.0;
+	// the paper's unbiased estimator (sum |n_p| a / slices), NOT clamped to 1 here: an open surface seen at a grazing
+	// angle scatters around 1 per pixel (a 60-degree floor: per-slice values up to ~1.3); clamping each pixel before the
+	// temporal and spatial means biases every oblique open surface dark (0.86 at 60 degrees, 0.80 at 80: gtao.comp's
+	// grey floors and its 12 % dead-zone patch). The composite clamps the denoised mean.
+	float vis = wsum > 1e-6 ? clamp(vsum / float(slices), 0.0, 2.0) : 1.0;
 	imageStore(out_img, tp, vec4(vis, 0, 0, 1));
 }
 
@@ -292,7 +296,7 @@ void Temporal(ivec2 tp) {
 	}
 	float c   = ok ? min(n + 1.0, float(u.cfg2.z)) : 1.0;
 	float res = ok ? hist + (raw - hist) / c : raw;
-	imageStore(out_img, tp, vec4(clamp(res, 0.0, 1.0), 0, 0, 1));
+	imageStore(out_img, tp, vec4(clamp(res, 0.0, 2.0), 0, 0, 1));
 	imageStore(cnt_out, tp, vec4(c, 0, 0, 1));
 }
 
