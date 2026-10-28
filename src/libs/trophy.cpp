@@ -293,14 +293,25 @@ void Load(State& s) {
 		if (Lower(Common::PathToString(f.path().extension())) == ".ucp" && (ucp.empty() || f.path() < ucp)) ucp = f.path();
 	}
 	std::map<std::string, Bytes> files;
+	// (10-27c) Every trophy line on the port's console too (its log is silent): the package found or why not.
 	if (ucp.empty() || !ReadUcp(ucp, files)) {
-		LOGF("Trophy: no trophy package in %s\n", Common::PathToString(dir).c_str());
+		std::printf("Trophy: no trophy package in %s (%s)\n", Common::PathToString(dir).c_str(),
+		            ucp.empty() ? "no .ucp file" : ("unreadable: " + Common::PathToString(ucp)).c_str());
+		std::fflush(stdout);
 		return;
 	}
 	const auto conf_it = files.find("tropconf.json");
-	if (conf_it == files.end()) return;
+	if (conf_it == files.end()) {
+		std::printf("Trophy: %s has no tropconf.json (%zu files)\n", Common::PathToString(ucp).c_str(), files.size());
+		std::fflush(stdout);
+		return;
+	}
 	const auto conf = nlohmann::json::parse(conf_it->second.begin(), conf_it->second.end(), nullptr, false);
-	if (!conf.is_object()) return;
+	if (!conf.is_object()) {
+		std::printf("Trophy: %s: tropconf.json unreadable\n", Common::PathToString(ucp).c_str());
+		std::fflush(stdout);
+		return;
+	}
 
 	// The metadata in the game's language, else English, else the package's default, else any.
 	std::vector<std::string> tags = LanguageTags(lang);
@@ -360,7 +371,8 @@ void Load(State& s) {
 			s.trophies[e.info.id] = std::move(e);
 		}
 	}
-	LOGF("Trophy: %zu trophies (%s), %zu unlocked\n", s.trophies.size(), s.language.c_str(), s.unlocked.size());
+	std::printf("Trophy: %zu trophies (%s), %zu unlocked\n", s.trophies.size(), s.language.c_str(), s.unlocked.size());
+	std::fflush(stdout);
 	SaveList(s);
 }
 
@@ -433,8 +445,8 @@ void Record(State& s, int id) {
 	}
 	t->label      = s.words.earned;
 	t->grade_text = t->grade >= 1 && t->grade <= 4 ? s.words.grades[t->grade - 1] : "";
-	LOGF("Trophy: unlocked id %d %s (%s)\n", id, t->name.c_str(), GradeName(t->grade));
 	std::printf("Trophy: unlocked id %d %s (%s)\n", id, t->name.c_str(), GradeName(t->grade));
+	std::fflush(stdout);
 	if (PopupWanted()) s.queue.push_back(std::move(t));
 }
 

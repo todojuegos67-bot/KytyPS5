@@ -931,7 +931,43 @@ void Draw(float width, float height) {
 					break;
 				}
 				case 5: { // Pantalla y otros
-					CheckRow("Pantalla completa", true, s.fullscreen);
+					{
+						// (10-27c) As a game's options: the display mode, then the output resolution (full screen: the
+						// desktop's or a mode of the monitor's; window: its size). Saved to settings.ini ([Pantalla]).
+						static const Choice modes[] = {{"1", "Pantalla completa"}, {"0", "Ventana"}};
+						std::string mode = s.fullscreen ? "1" : "0";
+						if (ChoiceRow("Modo de pantalla", true, modes, 2, mode, "Pantalla completa o ventana (F11 lo cambia en vivo).")) s.fullscreen = mode == "1";
+						static const char* sizes[] = {"1280x720", "1600x900", "1920x1080", "2560x1080", "2560x1440", "3440x1440", "3840x1600", "3840x2160"};
+						static std::vector<std::string> ids, labels;
+						ids.clear();
+						labels.clear();
+						if (s.fullscreen) {
+							ids.emplace_back("escritorio");
+							labels.emplace_back(std::string(I18n::T("Escritorio")) +
+							                    (g_rt.pc.screen_h > 0 ? " (" + std::to_string(g_rt.pc.screen_h) + "p)" : std::string()));
+						}
+						for (const char* z: sizes) {
+							ids.emplace_back(z);
+							labels.emplace_back(z);
+						}
+						std::string value = s.fullscreen ? s.resolution : std::to_string(s.width) + "x" + std::to_string(s.height);
+						if (std::find(ids.begin(), ids.end(), value) == ids.end()) {
+							ids.push_back(value);
+							labels.push_back(value);
+						}
+						std::vector<Choice> res;
+						for (size_t i = 0; i < ids.size(); i++) res.push_back({ids[i].c_str(), labels[i].c_str()});
+						if (ChoiceRow("Resolucion", true, res.data(), static_cast<int>(res.size()), value,
+						              s.fullscreen ? "Resolucion de salida en pantalla completa. Escritorio: la de Windows. Otra: el monitor cambia a ella mientras juegas."
+						                           : "Tamano de la ventana.")) {
+							if (s.fullscreen) {
+								s.resolution = value;
+							} else if (int w = 0, h = 0; std::sscanf(value.c_str(), "%dx%d", &w, &h) == 2) {
+								s.width  = w;
+								s.height = h;
+							}
+						}
+					}
 					CheckRow("HDR", true, s.hdr, "HDR10: activa antes \"Usar HDR\" en la configuracion de pantalla de Windows");
 					CheckRow("VSync", true, s.vsync, "VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando");
 					CheckRow("G-Sync", true, s.gsync, "G-Sync / FreeSync: el emulador no ata su reloj a los Hz del monitor");

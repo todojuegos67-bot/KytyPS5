@@ -75,6 +75,9 @@ struct Settings {
 	// [Pantalla]
 	bool        fullscreen = true;
 	int         width = 2560, height = 1440; // the window's (fullscreen: the desktop's size is used)
+	// (10-27c) resolucion: the full screen's output resolution, "escritorio" (the desktop's) or WxH (the monitor switched
+	// to that mode while the game runs: KYTY_DISPLAY_MODE).
+	std::string resolution = "escritorio";
 	bool        hdr = false;
 	bool        vsync = false;
 	bool        gsync = false;

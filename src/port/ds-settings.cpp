@@ -179,6 +179,8 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("pantalla_completa", s->fullscreen);
 	num("ancho", s->width);
 	num("alto", s->height);
+	str("resolucion", s->resolution);
+	if (s->resolution.empty()) s->resolution = "escritorio";
 	boo("hdr", s->hdr);
 	boo("vsync", s->vsync);
 	boo("gsync", s->gsync);
@@ -260,6 +262,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "pantalla_completa=" << b(s.fullscreen) << "\n"
 	  << "; Tamano de la ventana (sin pantalla completa)\n"
 	  << "ancho=" << s.width << "\nalto=" << s.height << "\n"
+	  << "; Resolucion en pantalla completa: escritorio (la de Windows) o AnchoxAlto, p. ej. 1920x1080 (el monitor cambia a ella)\n"
+	  << "resolucion=" << s.resolution << "\n"
 	  << "; HDR10: solo si \"Usar HDR\" esta activado en la configuracion de pantalla de Windows\n"
 	  << "hdr=" << b(s.hdr) << "\n"
 	  << "vsync=" << b(s.vsync) << "\n"
@@ -475,7 +479,9 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (10-27) DLSS in Souls ligero / PC low profile: DLSS outputs 4K inside and only takes 2160 / an exact ratio (1440, 1256,
 	// 1080, 720): any DLSS quality there renders at 720 (DLAA at 1080 stays).
 	if (upscaler == "dlss" && pc.nvidia && (s.souls_mode == "ligero" || s.souls_mode == "low")) {
-		const int out_h = s.fullscreen && pc.screen_h > 0 ? pc.screen_h : (s.height > 0 ? s.height : 1440);
+		int mode_w = 0, mode_h = 0;
+		const bool mode = s.fullscreen && std::sscanf(s.resolution.c_str(), "%dx%d", &mode_w, &mode_h) == 2 && mode_h > 0;
+		const int out_h = mode ? mode_h : s.fullscreen && pc.screen_h > 0 ? pc.screen_h : (s.height > 0 ? s.height : 1440);
 		if (!(out_h == 1080 && ratio == 1.0)) ratio = std::round(out_h / 720.0 * 10000.0) / 10000.0;
 	}
 	if (std::strcmp(res->id, "fsr-900") == 0 && pc.screen_h > 0) ratio = std::max(1.0, std::round(pc.screen_h / 900.0 * 10000.0) / 10000.0);
@@ -742,6 +748,9 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	           "--shader-validation", "false", "--shader-log-direction", "Silent", "--printf-direction", "Silent",
 	           "--vblank-frequency", std::to_string(vblank), "--present-mode", s.vsync ? "Fifo" : "Immediate"};
 	if (s.fullscreen) a.emplace_back("--fullscreen");
+	// (10-27c) The full screen's output resolution (F1 > Pantalla > Resolucion): the monitor in that mode.
+	if (int w = 0, h = 0; s.fullscreen && std::sscanf(s.resolution.c_str(), "%dx%d", &w, &h) == 2 && w > 0 && h > 0)
+		plan.env.emplace_back("KYTY_DISPLAY_MODE", std::to_string(w) + "x" + std::to_string(h));
 	if (s.hdr) a.emplace_back("--hdr");
 	a.emplace_back("--redzone");
 	a.emplace_back("--game");
@@ -751,7 +760,8 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 
 bool NeedsRestart(const Settings& l, const Settings& n) {
 	// Live: sharpness, the fps cap, metrics and rumble.
-	return l.game != n.game || l.language != n.language || l.fullscreen != n.fullscreen || l.width != n.width ||
+	return l.game != n.game || l.language != n.language || l.fullscreen != n.fullscreen || l.resolution != n.resolution ||
+	       l.width != n.width ||
 	       l.height != n.height || l.hdr != n.hdr || l.vsync != n.vsync || l.gsync != n.gsync ||
 	       l.unlock_fps != n.unlock_fps || l.aspect_fit != n.aspect_fit || l.aspect != n.aspect || l.res != n.res ||
 	       l.dlss_preset != n.dlss_preset || l.framegen != n.framegen || l.souls_mode != n.souls_mode ||

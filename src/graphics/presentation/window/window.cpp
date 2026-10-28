@@ -50,6 +50,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -1043,6 +1044,27 @@ static void WindowCreate(WindowContext& context) {
 
 	if (context.window == nullptr) {
 		EXIT("%s\n", SDL_GetError());
+	}
+
+	// (10-27c) KYTY_DISPLAY_MODE=WxH (the PC port's F1 > Pantalla > Resolucion): full screen in the monitor's closest mode
+	// of that size instead of the desktop's; the swapchain follows the window, the present scales into it.
+	if (const char* mode = std::getenv("KYTY_DISPLAY_MODE"); mode != nullptr && fullscreen) {
+		int w = 0, h = 0;
+		if (std::sscanf(mode, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+			SDL_DisplayMode want {}, got {};
+			want.w = w;
+			want.h = h;
+			const int display = std::max(0, SDL_GetWindowDisplayIndex(context.window));
+			if (SDL_GetClosestDisplayMode(display, &want, &got) != nullptr && SDL_SetWindowDisplayMode(context.window, &got) == 0 &&
+			    SDL_SetWindowFullscreen(context.window, SDL_WINDOW_FULLSCREEN) == 0) {
+				context.graphic_ctx.screen_width  = static_cast<uint32_t>(got.w);
+				context.graphic_ctx.screen_height = static_cast<uint32_t>(got.h);
+				std::printf("Display: full screen at %dx%d %d Hz (asked %dx%d)\n", got.w, got.h, got.refresh_rate, w, h);
+			} else {
+				std::printf("Display: no %dx%d mode (%s): the desktop's\n", w, h, SDL_GetError());
+			}
+			std::fflush(stdout);
+		}
 	}
 
 	// Resizable, so the title bar's maximize button is enabled: Windows greys it out for a

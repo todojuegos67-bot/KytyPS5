@@ -2704,8 +2704,24 @@ static uint32_t StaticShardsDone(const std::filesystem::path& driver_cache, uint
 		*shards = n;
 	}
 	std::set<uint32_t> done;
+	bool               sized = false;
 	while (file >> word) {
-		if (word == "all") return UINT32_MAX;
+		// (10-27c) The cache's size when noted: one started over or invalidated since (a smaller file) is warm no more.
+		if (word.starts_with("bytes=")) {
+			uint64_t        noted = 0;
+			std::error_code size_error;
+			const auto      size = std::filesystem::file_size(driver_cache, size_error);
+			std::from_chars(word.data() + 6, word.data() + word.size(), noted);
+			if (size_error || size < noted / 10u * 9u) return 0;
+			sized = true;
+			continue;
+		}
+		if (word == "all") {
+			// (A note without its size, 16bb7dc5 and before: a full cache of every recipe is GBs; a small one was started over.)
+			std::error_code size_error;
+			if (!sized && std::filesystem::file_size(driver_cache, size_error) < (uint64_t {512} << 20u)) return 0;
+			return UINT32_MAX;
+		}
 		uint32_t i = 0;
 		if (std::from_chars(word.data(), word.data() + word.size(), i).ec == std::errc {} && i < n) done.insert(i);
 	}
@@ -2725,6 +2741,8 @@ static void NoteStaticShardsDone(const std::filesystem::path& driver_cache, uint
 	{
 		std::ofstream file(temporary, std::ios::trunc);
 		file << stamp << '\n' << shards << '\n';
+		std::error_code size_error;
+		if (const auto size = std::filesystem::file_size(driver_cache, size_error); !size_error) file << "bytes=" << size << '\n';
 		if (all) file << "all\n";
 		else
 			for (const auto i: done) file << i << '\n';
@@ -3616,10 +3634,16 @@ void PipelineCache::InitializeDriverCache() {
 	const bool     store     = m_static_binaries != nullptr || m_static_blobs != nullptr;
 	// (10-27c) A cache the start menu's precompile warmed with every static recipe is what this PC plays from: kept up
 	// to 1/8 of the RAM (2 GiB at most), whatever the store, instead of starting over and compiling them in play again.
-	const bool     warmed    = StaticShardsDone(m_driver_cache_path, nullptr, nullptr) == UINT32_MAX;
+	// (Any precompile note, of every recipe or some: a cache the start-up precompile made, never started over.)
+	std::error_code noted_error;
+	const bool     warmed    = StaticShardsDone(m_driver_cache_path, nullptr, nullptr) == UINT32_MAX ||
+	                    std::filesystem::exists(StaticDonePath(m_driver_cache_path), noted_error);
 	const auto     ram_limit = [ram, store, warmed](uint64_t limit) {
 		constexpr uint64_t StoreLimit = uint64_t {256} << 20u;
-		if (warmed) return ram != 0 ? std::min(limit, std::max<uint64_t>(ram / 8u, uint64_t {512} << 20u)) : limit;
+		// (10-27c) Never started over: a full precompile of 1.07 is ~2.5 GB on NVIDIA, past the 2 GiB below, and was
+		// dropped at the game's start (every pipeline compiled in play again, 7.6 s compute stalls). Up to the file
+		// format's 4 GiB.
+		if (warmed) return uint64_t {std::numeric_limits<uint32_t>::max()};
 		if (ram != 0) limit = std::min(limit, ram >= (uint64_t {24} << 30u) ? ram / 16u : uint64_t {512} << 20u);
 		return store ? std::min(limit, StoreLimit) : limit;
 	};
@@ -3712,6 +3736,8 @@ vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& fi
 		if (file_size > limit) {
 			file.Close();
 			PipelineCacheLog("Vulkan pipeline cache: starting {} over ({} bytes, limit {})", path, file_size, limit);
+			std::error_code done_error;
+			std::filesystem::remove(StaticDonePath(file_path), done_error);
 		} else if (file_size >= signature.size() + sizeof(uint64_t) &&
 		           file_size <= std::numeric_limits<uint32_t>::max()) {
 			std::string cached_signature(signature.size(), '\0');
@@ -3733,6 +3759,8 @@ vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& fi
 				PipelineCacheLog(
 				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
 				    path);
+				std::error_code done_error;
+				std::filesystem::remove(StaticDonePath(file_path), done_error);
 			}
 		} else {
 			file.Close();

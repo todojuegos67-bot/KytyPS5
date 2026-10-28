@@ -2069,6 +2069,11 @@ static int KYTY_SYSV_ABI NpTrophy2CreateContext(int* context, int user_id, uint3
 	     "\t options       = 0x%016" PRIx64 "\n",
 	     user_id, service_label, options);
 
+	// (10-27c) The trophy package read at the game's first trophy call (its init line on the console).
+	std::printf("Trophy: the game opened its trophies (sceNpTrophy2CreateContext, user %d)\n", user_id);
+	std::fflush(stdout);
+	(void)Libs::Trophy::Count();
+
 	return 0;
 }
 
@@ -2095,6 +2100,8 @@ static int KYTY_SYSV_ABI NpTrophy2UnlockTrophy(int context, int handle, int trop
 	     "\t trophy_id = %d\n",
 	     context, handle, trophy_id);
 
+	std::printf("Trophy: the game unlocks id %d\n", trophy_id);
+	std::fflush(stdout);
 	int platinum = -1;
 	Libs::Trophy::Unlock(trophy_id, &platinum);
 	if (platinum_id != nullptr) {
