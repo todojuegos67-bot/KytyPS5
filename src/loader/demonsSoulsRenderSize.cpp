@@ -249,11 +249,11 @@ void Install(Program* program) {
 		if (display == 0) display = OutputHeight;
 		if (ratio >= 1.0 && ratio <= 4.0) {
 			const auto height = static_cast<uint32_t>(std::lround(display / ratio));
-			requested         = std::clamp<uint32_t>(height, 720, OutputHeight);
+			requested         = std::clamp<uint32_t>(height, LeastRenderHeight(), OutputHeight);
 			g_lod_render_height  = requested;
 			g_lod_display_height = display;
 			std::printf("Demon's Souls render size: KYTY_UPSCALE_RATIO=%s on a %u high display: %u%s\n", ratio_s, display,
-			            requested, requested != height ? " (720-2160)" : "");
+			            requested, requested != height ? (LeastRenderHeight() == 360 ? " (360-2160)" : " (720-2160)") : "");
 		} else {
 			std::printf("Demon's Souls render size: KYTY_UPSCALE_RATIO=%s is not 1-4; ignored\n", ratio_s);
 		}
@@ -321,7 +321,7 @@ void Install(Program* program) {
 		            natural_width, OutputHeight, MaxWideOutputWidth, output_width, OutputHeight);
 		if (size.width > output_width) {
 			auto narrower = size;
-			while (narrower.height > 720 && narrower.width > output_width)
+			while (narrower.height > LeastRenderHeight() && narrower.width > output_width)
 				narrower = RenderSizeFor(narrower.height - 8, aspect);
 			std::printf("Demon's Souls render size: %ux%u is wider than the %u wide output; %ux%u instead\n", size.width,
 			            size.height, output_width, narrower.width, narrower.height);
