@@ -21,6 +21,9 @@ ap.add_argument("--warmup", type=int, default=16)
 ap.add_argument("--light", type=float, nargs=3, default=[-0.397, 0.701, -0.593])
 ap.add_argument("--strength", type=float, default=0.5)
 ap.add_argument("--png", default="")
+# --lit1: the composite's "lit" gate (the game's own sunlight in the image) forced to 1: the shadow signal alone, for
+# judging its shape (stripes, haloes, flicker) on a capture without direct sun (the 20261028-001124 one is overcast fog).
+ap.add_argument("--lit1", action="store_true")
 a = ap.parse_args()
 
 fj = json.load(open(os.path.join(a.set_dir, "frame.json")))
@@ -119,7 +122,7 @@ def trace(frame):
     thick = (np.clip(0.12 + 0.004 * z, 0.12, 0.3) + farx * foot) * cand3[1]
     bias = 0.004 * z + 0.01 + farx * foot * (0.5 + (1.0 - ndl))
     ndl_c = np.clip(ndl, -1, 1)
-    t_min = (0.04 + 0.008 * z) / np.maximum(ndl_c, 0.3)
+    t_min = (0.015 + 0.003 * z) / np.maximum(ndl_c, 0.3) + 2.0 / px_m
     jit = ign(gx + f * 5.588238, gy + f * 5.588238)
     o = p + n * (0.006 * z + 0.02)[..., None]
     t0 = 1.0 / px_m
@@ -130,7 +133,7 @@ def trace(frame):
         t = t0 + (ln_ - t0) * k * k
         qp = o + lj * t[..., None]
         u, v = project(qp)
-        off = (u < 0.01) | (v < 0.01) | (u > 0.99) | (v > 0.99)
+        off = (u < 0.005) | (v < 0.005) | (u > 0.995) | (v > 0.995)
         done |= off
         sd = dpt(u, v); sky = is_sky(sd)
         oz = np.abs(view_z(sd)); delta = np.abs(qp[..., 2]) - oz
@@ -145,7 +148,7 @@ def trace(frame):
         hits = np.where(live, np.where(c, hits + 1, 0), hits)
         got = live & (hits >= 2)
         e = np.minimum(np.minimum(u, 1 - u), np.minimum(v, 1 - v))
-        val = smoothstep(0, 0.04, e) * (1 - smoothstep(0.85, 1.0, k)) * (1 - smoothstep(0.5 * thick, thick, delta)) * \
+        val = smoothstep(0.005, 0.08, e) * (1 - smoothstep(0.85, 1.0, k)) * (1 - smoothstep(0.5 * thick, thick, delta)) * \
               smoothstep(t_min, 2 * t_min, t) * (1.0 + (0.35 - 1.0) * np.clip(t / ln_, 0, 1))
         res = np.where(got, val, res)
         done |= got | (live & brk)
@@ -176,7 +179,7 @@ def temporal(cur, hist, count_prev, valid):
             sg = shift(gbuf, xx, yy); sv = shift(cur, xx, yy)
             w_ = ((np.abs(sg[..., 3] - gw) < ntol) & (np.sum(sg[..., :3] * gbuf[..., :3], -1) > ndot)).astype(float)
             m1 += sv * w_; m2 += sv * sv * w_; wn += w_
-    wn = np.maximum(wn, 1); m1 /= wn; m2 /= wn
+    wn_raw = wn.copy(); wn = np.maximum(wn, 1); m1 /= wn; m2 /= wn
     sigma = np.sqrt(np.maximum(m2 - m1 * m1, 0))
     a_min = 0.08 if q >= 3 else 0.1
     count = np.ones_like(cur); res = 0.5 * (m1 + cur)
@@ -187,7 +190,8 @@ def temporal(cur, hist, count_prev, valid):
         cnt = np.minimum(np.maximum(pc, 1) + 1, 32.0)
         alpha = np.maximum(1 / cnt, a_min)
         kk = 1.0 + np.clip(cnt / 16.0, 0, 1)
-        h = np.clip(fetch_lin(hist, puv_u, puv_v), m1 - kk * sigma - 0.03, m1 + kk * sigma + 0.03)
+        h0 = fetch_lin(hist, puv_u, puv_v)
+        h = np.where(wn_raw >= 3, np.clip(h0, m1 - kk * sigma - 0.03, m1 + kk * sigma + 0.03), h0)
         res = np.where(ok, h + (cur - h) * alpha, res); count = np.where(ok, cnt, count)
     res = np.clip(res, 0, 1)
     sk = gw > 1e5
@@ -222,6 +226,7 @@ for (ox, oy) in ((6, 0), (-6, 0), (0, 6), (0, -6), (10, 10), (-10, 10), (10, -10
 inv_k = 0.5
 rel = lum / np.maximum(0.85 * lref, 1e-8)
 lit = smoothstep(0.55, 0.9, (rel - inv_k) / (1 - inv_k))
+if a.lit1: lit = np.ones_like(lit)
 nearr = 0.6 + 0.4 * (1 - smoothstep(6.0, 60.0, rz))
 def composite(vis, count):
     if half:
@@ -273,6 +278,13 @@ dd = dk
 sec_y = np.abs(dd[2:, :] - 2 * dd[1:-1, :] + dd[:-2, :])[:, 1:-1]; sec_x = np.abs(dd[:, 2:] - 2 * dd[:, 1:-1] + dd[:, :-2])[1:-1, :]
 m_ = (dd[1:-1, 1:-1] > 0.02)
 alt = float(max(sec_y[m_].mean(), sec_x[m_].mean()) / max(dd[1:-1, 1:-1][m_].mean(), 1e-9)) if m_.any() else 0.0
+# Haloes: darkening on the far side of a depth edge (a pixel within 2 px of a nearer surface: the background around a
+# character), as a share of all the darkening; ~0 for no haloes.
+nearer = np.zeros(rz.shape, bool)
+for oy in range(-2, 3):
+    for ox in range(-2, 3):
+        nearer |= shift(np.where(rsky, 1e6, rz), ox, oy) < np.where(rsky, 1e6, rz) * 0.85
+halo = float(dk[nearer].sum() / max(dk.sum(), 1e-12))
 pct = 100.0 * changed / max(touched, 1); pct20 = 100.0 * changed20 / max(touched, 1)
 print(f"RTSHADOW replay (screen-space, KYTY_RT_SHADOWS level {q}, trace {TW}x{TH} of {W}x{H}, strength {a.strength}, "
       f"{a.frames} frames, still camera): {shadowed:.2f} % of pixels shadowed (occlusion > 0.1), mean darkening on geometry "
@@ -280,6 +292,7 @@ print(f"RTSHADOW replay (screen-space, KYTY_RT_SHADOWS level {q}, trace {TW}x{TH
 print(f"RTFLICKER replay sun shadows (screen-space): changed > 10 % {pct:.3f} % (> 20 % {pct20:.3f} %) of {touched} touched "
       f"points ({a.frames - a.warmup - 1} frames), max jump {100 * maxj:.1f} %")
 print(f"STRIPES replay: profile index rows {r_idx:.4f} cols {c_idx:.4f}; local alternation {alt:.3f} (|2nd diff| / darkening)")
+print(f"HALO replay: {100 * halo:.2f} % of the darkening on the far side of a depth edge (background next to a nearer surface)")
 if a.png:
     from PIL import Image
     v = np.clip(dk / max(float(dk.max()), 1e-6), 0, 1)

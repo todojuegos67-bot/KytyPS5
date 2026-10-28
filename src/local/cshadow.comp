@@ -130,7 +130,10 @@ float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 	// The occluder must stand clear of the receiver's own plane: a ray over a low-poly surface (a cliff's flat facets
 	// in the depth buffer, smooth in the game's shading) hits the next facet of a crease within decimetres. The
 	// height of the ray over that plane is t * N.L: a least distance, a few cm near, ~0.25 m at 50 m.
-	float t_min = (0.04 + 0.008 * z) / max(ndl, 0.3);
+	// (10-28 Sombras RT) A least distance relative to the depth and to the pixel's own footprint (2 texels: the
+	// receiver's depth-buffer texel never shadows itself, whatever the distance) instead of 4-24 cm near, which left
+	// no contact shadows on a body at 4 m (0.03 % of the capture's pixels). Grazing receivers still get more.
+	float t_min = (0.015 + 0.003 * z) / max(ndl, 0.3) + 2.0 / px_m;
 	float jit   = Ign(vec2(pixel) + float(push.misc.y % 64) * 5.588238);
 	vec3  o     = p + n * (0.006 * z + 0.02); // (normal bias: no self-hits at grazing angles)
 	// The first sample one pixel out (no self-hit on the start texel).
@@ -143,7 +146,7 @@ float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 		vec3  qp = o + l * t;
 		vec3  pr = Project(qp);
 		// Off screen or near the edge: unknown, never an occluder (fail safe: no shadow).
-		if (any(lessThan(pr.xy, vec2(0.01))) || any(greaterThan(pr.xy, vec2(0.99)))) break;
+		if (any(lessThan(pr.xy, vec2(0.005))) || any(greaterThan(pr.xy, vec2(0.995)))) break;
 		float sd = textureLod(depth_tex, pr.xy, 0).r;
 		if (IsSky(sd)) { hits = 0; continue; }
 		float oz    = abs(ViewZ(sd));
@@ -169,7 +172,7 @@ float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 			// Screen-edge and ray-end fades (no hard cut where the ray leaves what the screen knows), a softer hit
 			// near the thickness limit and near the least distance.
 			vec2  e    = min(pr.xy, 1.0 - pr.xy);
-			float edge = smoothstep(0.0, 0.04, min(e.x, e.y));
+			float edge = smoothstep(0.005, 0.08, min(e.x, e.y)); // (10-28: wider: occluders leaving the screen fade, no pop)
 			float end  = 1.0 - smoothstep(0.85, 1.0, k); // (10-24) only the last stretch (was 0.65: rays felt short)
 			float soft = 1.0 - smoothstep(0.5 * thick, thick, delta);
 			float near = smoothstep(t_min, 2.0 * t_min, t);
@@ -250,6 +253,10 @@ void Temporal(ivec2 pixel) {
 			m2 += sv * sv * w;
 			wn += w;
 		}
+	// (10-28) A pixel with fewer than 3 neighbours of its own surface (a sword's edge, a strap) has no clamp box worth
+	// the name (sigma 0 on itself alone): the history is taken unclamped there, else such pixels followed each frame's
+	// jittered ray (RTFLICKER replay: 0.13 % of touched points jumping > 20 % at level 2).
+	float wn_raw = wn;
 	wn = max(wn, 1.0);
 	m1 /= wn, m2 /= wn;
 	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
@@ -268,7 +275,8 @@ void Temporal(ivec2 pixel) {
 			float alpha = max(1.0 / count, a_min);
 			// (A tighter box than before (2.5 sigma + 0.05): a moved occluder's old shadow does not linger.)
 			float k     = mix(1.0, 2.0, clamp(count / 16.0, 0.0, 1.0));
-			float hist  = clamp(textureLod(src_b, puv, 0).r, m1 - k * sigma - 0.03, m1 + k * sigma + 0.03);
+			float hist  = textureLod(src_b, puv, 0).r;
+			if (wn_raw >= 3.0) hist = clamp(hist, m1 - k * sigma - 0.03, m1 + k * sigma + 0.03);
 			res         = mix(hist, cur, alpha);
 		}
 	}
