@@ -27,6 +27,8 @@ constexpr uint8_t Taken[5] {0xb0, 0x01, 0x0f, 0x1f, 0x00};
 constexpr std::string_view EnabledCheck =
     "83 78 3c 05 75 15 48 8b 46 50 c5 fa 10 40 04 c5 f8 2e 05 ?? ?? ?? ?? 0f 93 c0 c3";
 constexpr uint8_t AnyHeightBytes[11] {0x81, 0x78, 0x04, 0x00, 0x00, 0x34, 0x44, 0x0f, 0x93, 0xc0, 0x90};
+// FSR 4 (its output the display's size): cmp dword [rax+4], 360.0f (0x43b40000), still above the menus' 270.
+constexpr uint8_t AnyHeight360Bytes[11] {0x81, 0x78, 0x04, 0x00, 0x00, 0xb4, 0x43, 0x0f, 0x93, 0xc0, 0x90};
 
 bool g_active     = false;
 bool g_any_height = false;
@@ -69,7 +71,8 @@ void Install(Program* program) {
 	std::memcpy(reinterpret_cast<void*>(*site), Taken, sizeof(Taken));
 	g_active = true;
 	if (const auto enabled = GuestCode::FindUnique(*program, GuestCode::Pattern(EnabledCheck)); enabled) {
-		std::memcpy(reinterpret_cast<void*>(*enabled + 15), AnyHeightBytes, sizeof(AnyHeightBytes));
+		std::memcpy(reinterpret_cast<void*>(*enabled + 15), kind == "fsr4" ? AnyHeight360Bytes : AnyHeightBytes, sizeof(AnyHeightBytes));
+		if (kind == "fsr4") std::printf("Demon's Souls super resolution: FSR 4 takes a 3D of 360 lines and more (720 for the others)\n");
 		g_any_height = true;
 	} else {
 		std::printf("Demon's Souls super resolution: its 1080 least render height check not found; 1080 at least\n");

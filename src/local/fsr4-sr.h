@@ -42,7 +42,7 @@ void* ChainDeviceFeatures(vk::PhysicalDevice physical_device, const std::vector<
 // The device has what the model needs and the preset's assets are there and match their manifest (after the device
 // exists; checked once, logged).
 [[nodiscard]] bool Ready();
-// RCAS's amount (0..1; 0 off): KYTY_FSR4_SHARPNESS, else half KYTY_UPSCALE_SHARPNESS, else 0.15.
+// RCAS's amount (0..1; 0 off): KYTY_FSR4_SHARPNESS, else KYTY_UPSCALE_SHARPNESS, else 0.3.
 [[nodiscard]] float Sharpness();
 // The preset's display name ("FSR 4 Quality", ...).
 [[nodiscard]] const char* Name();

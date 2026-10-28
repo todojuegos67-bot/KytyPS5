@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <string_view>
 
 namespace Loader {
@@ -91,8 +92,18 @@ struct Size {
 	uint32_t width  = 0;
 	uint32_t height = 0;
 };
+// The least render height: 720 (the PS5 Pro path's upscalers on a 4K output), 360 with KYTY_UPSCALER=fsr4 (its model
+// outputs the display's size, so a 1080 display's Balanced 635, Performance 540 and Ultra Performance 360 are in its
+// trained ratios). The menus' 480x270 background stays below either.
+inline uint32_t LeastRenderHeight() {
+	static const uint32_t least = [] {
+		const char* v = std::getenv("KYTY_UPSCALER");
+		return v != nullptr && std::string_view(v) == "fsr4" ? 360u : 720u;
+	}();
+	return least;
+}
 inline Size RenderSizeFor(uint32_t height, double aspect = GameAspect) {
-	if (height < 720 || height > OutputHeight) return {};
+	if (height < LeastRenderHeight() || height > OutputHeight) return {};
 	const auto width = static_cast<uint32_t>(std::lround(height * aspect / 8.0)) * 8u;
 	return {width, height};
 }
