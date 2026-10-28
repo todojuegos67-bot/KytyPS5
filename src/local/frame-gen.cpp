@@ -30,6 +30,7 @@
 #include "gpu_tiler_shaders/sharpen_spv.h"
 #include "gpu_tiler_shaders/ssgi_spv.h"
 #include "gpu_tiler_shaders/gtao_spv.h"
+#include "local/rt-ao.h"
 #include "gpu_tiler_shaders/ssr_spv.h"
 #include "local/rt-reflections.h"
 #include "local/gbuf-view.h"
@@ -6725,7 +6726,8 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 bool SsrWanted() {
 	return SsrLevel() > 0 || RtReflectionsWanted() || HwParticlesWanted() || ShineWanted() || GtaoLevel() > 0 || GbufViewWanted() ||
 	       SsgiEmissive() > 0.0f || // (rtfire: the emissive light reads the G-buffer copy's albedo)
-	       HwGiWanted();             // (KYTY_HWRT_AO / KYTY_HWRT_GI: its normal and albedo)
+	       HwGiWanted() ||           // (KYTY_HWRT_AO / KYTY_HWRT_GI: its normal and albedo)
+	       RtAoLevel() > 0;          // (ao-1028: KYTY_AO: its normal, albedo and the lighting's depth)
 }
 bool SsrPassWanted() { return SsrLevel() > 0; }
 
@@ -9528,6 +9530,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Contact, "RtContactApply")
 	TimedPass("SsgiApply", [&] { SsgiApply(command, inputs); }); // (KYTY_SSGI: likewise; nothing when off)
 	TimedPass("GtaoApply", [&] { GtaoApply(command, inputs); }); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
+	probed(RtFlicker::Ao, "RtAoApply", [&] { return RtAoApply(command, inputs); }); // (ao-1028: KYTY_AO, rt-ao.cpp: the new ambient occlusion on the ambient term; nothing when off)
 	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Gi, "HwGiApply")
 	TimedPass("SsrApply", [&] { SsrApply(command, inputs); }); // (KYTY_SSR: likewise, after GTAO; nothing when off)
 	probed(RtFlicker::Reflections, "RtReflectionsApply", [&] { return RtReflectionsApply(command, inputs); }); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)

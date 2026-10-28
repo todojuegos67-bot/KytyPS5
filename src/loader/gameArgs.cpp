@@ -87,6 +87,19 @@ const std::string& ExtraLines() {
 			at = end + 1;
 		}
 		if (cam_mine) out += "+cp11_Setting_CameraSpeed=" + std::to_string(cam) + "\n";
+		// (ao-1028) KYTY_AO (rt-ao.cpp) replaces the game's own ambient occlusion: r_enableAmbientShadowing off, so the
+		// occlusion is never applied twice (KYTY_AO_GAME=keep leaves the game's on; a list naming the convar wins)
+		{
+			const char* ao   = std::getenv("KYTY_AO");
+			const char* game = std::getenv("KYTY_AO_GAME");
+			const bool  on   = ao != nullptr && *ao != '\0' && *ao != '0' && (*ao | 0x20) != 'n' && (*ao | 0x20) != 'o';
+			const bool  keep = game != nullptr && (game[0] | 0x20) == 'k';
+			if (on && !keep && list.find("r_enableAmbientShadowing") == std::string::npos) {
+				out += "+r_enableAmbientShadowing=false\n";
+				std::printf("Game convars: r_enableAmbientShadowing=false (KYTY_AO replaces the game's ambient occlusion)\n");
+				std::fflush(stdout);
+			}
+		}
 		return out;
 	}();
 	return lines;
