@@ -25,6 +25,7 @@ const ResMode kResModes[] = {
     {"dlss-calidad", "DLSS Calidad", 1.333, "dlss"},
     {"dlss-equilibrado", "DLSS Equilib.", 1.72, "dlss"},
     {"dlss-rendimiento", "DLSS Rendim.", 2.0, "dlss"},
+    {"dlss-urendimiento", "DLSS U.rendim.", 3.0, "dlss"}, // (10-28) 2160 / 3 = 720; below 4K BuildLaunch snaps it to 720
     {"xess-aa", "XeSS AA", 1.0, "xess"},
     {"xess-ucalidad-plus", "XeSS U.cal.+", 1.3, "xess"},
     {"xess-ucalidad", "XeSS U.calidad", 1.5, "xess"},
@@ -45,6 +46,10 @@ const ResMode kResModes[] = {
     {"fsr4-rendimiento", "FSR 4 Rendimiento", 2.0, "fsr4", "performance"},
     {"fsr4-urendimiento", "FSR 4 Ultra rendimiento", 3.0, "fsr4", "ultraperf"},
     {"fsr4-dinamico", "FSR 4 Dinámico", 1.5, "fsr4", "drs"},
+    // (10-28) Launcher-souls.ps1's "juego" modes: no upscaler, the game's own upscale from this 3D height (KYTY_RENDER_HEIGHT).
+    {"juego-1080", "1080p juego", 1080, ""},
+    {"juego-900", "900p juego", 900, ""},
+    {"juego-720", "720p juego", 720, ""},
 };
 const int kResModeCount = static_cast<int>(sizeof(kResModes) / sizeof(kResModes[0]));
 
@@ -326,6 +331,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "aspecto=" << s.aspect << "\n\n"
 	  << "[Reescalado]\n"
 	  << "; nativo, dlss-dlaa, dlss-ucalidad, dlss-calidad, dlss-equilibrado, dlss-rendimiento,\n"
+	  << "; dlss-urendimiento, juego-1080, juego-900, juego-720,\n"
 	  << "; xess-aa, xess-ucalidad-plus, xess-ucalidad, xess-calidad, xess-equilibrado, xess-rendimiento,\n"
 	  << "; fsr-aa, fsr-ucalidad, fsr-calidad, fsr-equilibrado, fsr-rendimiento (FSR 3.1),\n"
 	  << "; fsr4-aa, fsr4-calidad, fsr4-equilibrado, fsr4-rendimiento, fsr4-urendimiento, fsr4-dinamico (AMD FSR 4)\n"
@@ -547,6 +553,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (!pc.nvidia && std::strcmp(res->upscaler, "dlss") == 0) {
 		// (DLSS needs NVIDIA: FSR at the same quality.)
 		std::string other = std::string("fsr-") + (std::strcmp(res->id, "dlss-dlaa") == 0 ? "aa" : res->id + 5);
+		if (other == "fsr-urendimiento") other = "fsr-rendimiento"; // (FSR 3.1 has no Ultra rendimiento)
 		res = FindRes(other);
 		if (std::strcmp(res->id, other.c_str()) != 0) res = FindRes("fsr-calidad");
 		plan.notes.emplace_back(std::string("DLSS needs NVIDIA: ") + res->label);
@@ -755,6 +762,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	env.Default("KYTY_NATIVE_XPR_INSTANCES", "1");
 	if (demons) env.Default("KYTY_GAME_CONVARS", "doIndexBufferCulling=false");
 	if (ratio > 0) env.Set("KYTY_UPSCALE_RATIO", Num(ratio));
+	if (upscaler.empty() && std::strncmp(res->id, "juego-", 6) == 0) env.Set("KYTY_RENDER_HEIGHT", Num(res->value)); // (-RenderHeight)
 	env.Remove("KYTY_UPSCALE");
 	if (upscaler == "dlss" && s.dlss_preset != "auto" && !s.dlss_preset.empty()) env.Set("KYTY_DLSS_PRESET", s.dlss_preset);
 	if (upscaler == "fsr4" && res->fsr4_preset != nullptr) env.Set("KYTY_FSR4_PRESET", res->fsr4_preset); // (run-windows -Fsr4Preset)

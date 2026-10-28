@@ -1051,21 +1051,23 @@ void Draw(float width, float height) {
 	if (g_tab_request >= 0 && g_tab_request < kTabCount) g_tab = g_tab_request;
 	if (g_tab < 0 || g_tab >= kTabCount) g_tab = 0;
 	{
-		const float side_w = 210.0f * unit;
-		ImGui::BeginChild("##sections", {side_w, size.y - footer - ImGui::GetCursorPosY()}, ImGuiChildFlags_Borders);
+		// (10-28c) The sections as one "Sección" dropdown (no tabs or side list): mouse, D-pad + A / Intro opens it,
+		// B / Circle closes it (g_popup), LB / RB, Q / E and RePág / AvPág as before.
 		ImGui::PushFont(nullptr, 22.0f * unit);
-		for (int t = 0; t < kTabCount; t++) {
-			const bool on = g_tab == t;
-			if (on) ImGui::PushStyleColor(ImGuiCol_Text, kGold);
-			if (ImGui::Selectable((std::string(I18n::T(tabs[t])) + "###sec" + std::to_string(t)).c_str(), on, ImGuiSelectableFlags_None,
-			                      {0, 40.0f * unit}))
-				g_tab = t;
-			if (on) ImGui::PopStyleColor();
-			if (on && g_tab_request == t) ImGui::SetScrollHereY();
+		ImGui::AlignTextToFramePadding();
+		ImGui::TextColored(kGold, "%s", I18n::T("Sección"));
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(360.0f * unit);
+		if (ImGui::BeginCombo("##section", I18n::T(tabs[g_tab]), ImGuiComboFlags_HeightLarge)) {
+			for (int t = 0; t < kTabCount; t++) {
+				const bool on = g_tab == t;
+				if (ImGui::Selectable((std::string(I18n::T(tabs[t])) + "###sec" + std::to_string(t)).c_str(), on)) g_tab = t;
+				if (on) ImGui::SetItemDefaultFocus();
+			}
+			ImGui::EndCombo();
 		}
 		ImGui::PopFont();
-		ImGui::EndChild();
-		ImGui::SameLine();
+		ImGui::Separator();
 	}
 	ImGui::BeginGroup();
 	{
