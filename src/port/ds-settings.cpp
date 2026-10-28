@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <sstream>
 
@@ -75,8 +76,9 @@ const Choice kAntiLagOther[] = {{"no", "Anti-Lag: no"}, {"normal", "Anti-Lag"}, 
 const int    kAntiLagOtherCount = 3;
 const Choice kAntiLagDlssg[] = {{"reflex", "Reflex (NVIDIA)"}, {"normal", "Anti-Lag"}, {"ultra", "Anti-Lag Ultra"}};
 const int    kAntiLagDlssgCount = 3;
-const Choice kRtReflLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}, {"5", "Extremo"}};
-const int    kRtReflLevelCount = 6;
+const Choice kRtReflLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}, {"5", "Extremo"},
+                              {"6", "H\xC3\xAD" "brido"}}; // (refl-hybrid-1028) Hibrido = Alto + the hardware fill
+const int    kRtReflLevelCount = 7;
 const Choice kRtLightLevels[] = {{"0", "No"}, {"1", "Media"}, {"2", "Alta"}, {"3", "Ultra"}, {"4", "Extremo"}};
 const int    kRtLightLevelCount = 5;
 const Choice kRtLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}};
@@ -278,7 +280,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 		const int n = std::atoi(v.c_str());
 		v           = n >= 0 && n <= max && !v.empty() && std::isdigit(static_cast<unsigned char>(v[0])) != 0 ? std::to_string(n) : "0";
 	};
-	clamp_level(s->rt_ss_refl, 5);
+	clamp_level(s->rt_ss_refl, 6);
 	clamp_level(s->rt_ssgi, 4);
 	clamp_level(s->rt_shadows, 3);
 	clamp_level(s->ao, 3);
@@ -391,7 +393,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "texturas_nitidas=" << s.texture_sharpness << "\n\n"
 	  << "[RayTracing]\n"
 	  << "; Efectos de pantalla (sin RT por hardware; solo con DLSS, XeSS o FSR):\n"
-	  << "; Reflejos RT: 0 no, 1 bajo, 2 medio, 3 alto, 4 ultra, 5 extremo\n"
+	  << "; Reflejos RT: 0 no, 1 bajo, 2 medio, 3 alto, 4 ultra, 5 extremo, 6 hibrido (alto + relleno por hardware; GPU con RT)\n"
 	  << "reflejos_rt=" << s.rt_ss_refl << "\n"
 	  << "; Luz RT (luz rebotada en pantalla): 0 no, 1 media, 2 alta, 3 ultra, 4 extremo\n"
 	  << "luz_rt_pantalla=" << s.rt_ssgi << "\n"
@@ -559,6 +561,26 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		const int out_h = mode ? mode_h : s.fullscreen && pc.screen_h > 0 ? pc.screen_h : (s.height > 0 ? s.height : 1440);
 		if (!(out_h == 1080 && ratio == 1.0)) ratio = std::round(out_h / 720.0 * 10000.0) / 10000.0;
 	}
+	// (10-28, the launcher's "DLSS en cualquier resolucion") DLSS only takes the 3D at 2160 / 1440 / 1256 / 1080 / 720: when
+	// the chosen quality does not land on one, the nearest valid height at or below it (at least 720) instead of the game
+	// starting without DLSS.
+	if (upscaler == "dlss" && pc.nvidia && ratio > 0) {
+		int mode_w = 0, mode_h = 0;
+		const bool mode = s.fullscreen && std::sscanf(s.resolution.c_str(), "%dx%d", &mode_w, &mode_h) == 2 && mode_h > 0;
+		const int  out_h = mode ? mode_h : s.fullscreen && pc.screen_h > 0 ? pc.screen_h : (s.height > 0 ? s.height : 1440);
+		const int  in_h  = static_cast<int>(std::lround(out_h / ratio));
+		static const int ok[] = {2160, 1440, 1256, 1080, 720};
+		if (std::find(std::begin(ok), std::end(ok), in_h) == std::end(ok)) {
+			int pick = 720;
+			for (int v: ok)
+				if (v <= in_h && v <= out_h) {
+					pick = v;
+					break;
+				}
+			ratio = std::round(out_h / static_cast<double>(pick) * 10000.0) / 10000.0;
+			plan.notes.emplace_back("DLSS: the 3D at " + std::to_string(pick) + " lines (" + std::to_string(in_h) + " is not a DLSS height)");
+		}
+	}
 	if (std::strcmp(res->id, "fsr-900") == 0 && pc.screen_h > 0) ratio = std::max(1.0, std::round(pc.screen_h / 900.0 * 10000.0) / 10000.0);
 
 	// Launcher-souls.ps1 Start-Game's -Set switches, in its order.
@@ -621,8 +643,9 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		}
 	}
 	if (!s.pure_game && s.rt_ss_refl != "0" && !s.rt_ss_refl.empty()) {
-		sets.emplace_back("KYTY_RT_REFLECTIONS", s.rt_ss_refl);
-		if (std::atoi(s.rt_ss_refl.c_str()) >= 4) {
+		// (refl-hybrid-1028, Launcher-souls.ps1) Hibrido (6) = Alto (level 3) + the hardware fill (set after the torch below).
+		sets.emplace_back("KYTY_RT_REFLECTIONS", s.rt_ss_refl == "6" ? "3" : s.rt_ss_refl);
+		if (const int lv = std::atoi(s.rt_ss_refl.c_str()); lv >= 4 && lv <= 5) {
 			sets.emplace_back("KYTY_RT_REFLECTIONS_MIN", "0.55");
 			sets.emplace_back("KYTY_RT_REFLECTIONS_GUIDE_STRENGTH", "1.3");
 		}
@@ -697,6 +720,17 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 				                     "KYTY_HWRT_CONTACT", "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_RT_SUN"})
 					sets.emplace_back(k, "0");
 		}
+	}
+	// (refl-hybrid-1028) Reflejos RT Hibrido: the hardware scene (TLAS) only to fill where the screen-space ray misses (the
+	// other hardware passes off without rt_experimental), as the launcher.
+	if (!s.pure_game && s.rt_ss_refl == "6") {
+		sets.emplace_back("KYTY_RT_REFLECTIONS_HYBRID", "1");
+		sets.emplace_back("KYTY_RT_HW_EXPERIMENTAL", "1");
+		sets.emplace_back("KYTY_HWRT", "1");
+		if (!s.rt_hw_exp)
+			for (const char* k: {"KYTY_HWRT_REFL", "KYTY_HWRT_SHADOW", "KYTY_HWRT_LIGHTS", "KYTY_HWRT_PARTICLES", "KYTY_HWRT_GI", "KYTY_HWRT_AO",
+			                     "KYTY_HWRT_CONTACT", "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_RT_SUN"})
+				sets.emplace_back(k, "0");
 	}
 	if (!s.pure_game && s.lens_flare) sets.emplace_back("KYTY_TORCH_FLARE", "1");
 	// Its vblank: 840 Hz with DLSS and AMD dynamic frame generation, 360 with the other frame generation, 960 unlocked

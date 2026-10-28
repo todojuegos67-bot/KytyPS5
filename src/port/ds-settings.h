@@ -64,7 +64,7 @@ extern const int     kAntiLagOtherCount;
 extern const Choice  kAntiLagDlssg[]; // NVIDIA frame generation's
 extern const int     kAntiLagDlssgCount;
 // (10-28, ds-torch-1028's launcher) The screen-space RT set (c3e58bd5) and the new passes: their rows' levels.
-extern const Choice  kRtReflLevels[];  // Reflejos RT: No, Bajo, Medio, Alto, Ultra, Extremo (KYTY_RT_REFLECTIONS 0-5)
+extern const Choice  kRtReflLevels[];  // Reflejos RT: No, Bajo, Medio, Alto, Ultra, Extremo (KYTY_RT_REFLECTIONS 0-5), Hibrido (6: Alto + KYTY_RT_REFLECTIONS_HYBRID)
 extern const int     kRtReflLevelCount;
 extern const Choice  kRtLightLevels[]; // Luz RT (SSGI): No, Media, Alta, Ultra, Extremo
 extern const int     kRtLightLevelCount;
@@ -133,7 +133,7 @@ struct Settings {
 	std::string godrays = "0";       // Luz volumetrica: 0 No, 1 Bajo, 2 Medio, 3 Alto (KYTY_GODRAYS + the hidden RT sun pass)
 	bool        pure_game = false;   // Juego original: every visual pass the emulator adds off
 	// (10-28, ds-torch-1028) The screen-space RT set and the new passes (none needs hardware RT but Hibrido):
-	std::string rt_ss_refl = "0";    // reflejos_rt: Reflejos RT 0-5 (KYTY_RT_REFLECTIONS; 4+: more presence)
+	std::string rt_ss_refl = "0";    // reflejos_rt: Reflejos RT 0-6 (KYTY_RT_REFLECTIONS; 4-5: more presence; 6 Hibrido)
 	std::string rt_ssgi = "0";       // luz_rt_pantalla: Luz RT (SSGI) 0 No, 1 Media, 2 Alta, 3 Ultra, 4 Extremo (KYTY_SSGI)
 	std::string rt_shadows = "0";    // sombras_rt: Sombras RT de pantalla 0-3 (KYTY_RT_SHADOWS, strength 0.35 / 0.5 / 0.7)
 	std::string ao = "0";            // oclusion_ao: Oclusion ambiental 0-3 (KYTY_AO); default No (its composite costs ~7 ms now)

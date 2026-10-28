@@ -514,8 +514,14 @@ void CheckWork() {
 		std::scoped_lock lock(g_upd.mutex);
 		g_upd.release = r;
 	}
-	if (r.tag == Update::CurrentVersion()) SetUpd(UpdateUi::UpToDate, "Ya tienes la ultima version (" + r.tag + ").");
-	else SetUpd(UpdateUi::Available, "Nueva version " + r.tag + " \xE2\x80\x94 Cruz para actualizar");
+	// (10-28, the emulator launcher) Both versions shown; an installed version with the same or a newer date (the 8-digit
+	// YYYYMMDD in the tag) is never offered the published one (no downgrade).
+	const std::string cur  = Update::CurrentVersion();
+	const std::string both = "Version instalada: " + cur + "\nUltima release en GitHub: " + r.tag;
+	const std::string dc = Update::TagDate(cur), dr = Update::TagDate(r.tag);
+	if (r.tag == cur) SetUpd(UpdateUi::UpToDate, both + "\nYa tienes la ultima version.");
+	else if (!dc.empty() && !dr.empty() && dc >= dr) SetUpd(UpdateUi::UpToDate, both + "\nTu version es igual o mas nueva. No hace falta actualizar.");
+	else SetUpd(UpdateUi::Available, both + "\nNueva version " + r.tag + " \xE2\x80\x94 Cruz para actualizar");
 #else
 	SetUpd(UpdateUi::Failed, "Solo en Windows.");
 #endif
@@ -1175,7 +1181,7 @@ void Draw(float width, float height) {
 					ImGui::BeginDisabled(s.pure_game);
 					if (ChoiceRow("Reflejos RT", changed_not_live(l.rt_ss_refl != s.rt_ss_refl, 1),
 					              kRtReflLevels, kRtReflLevelCount, s.rt_ss_refl,
-					              "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Beta. Apagarlo es inmediato."))
+					              "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Híbrido: Alto + rayos por hardware (RT real) solo donde el rayo de pantalla no encuentra nada. Necesita GPU con RT. Beta. Apagarlo es inmediato."))
 						live_changed = true;
 					ChoiceRow("Luz RT", s.rt_ssgi != l.rt_ssgi, kRtLightLevels, kRtLightLevelCount, s.rt_ssgi,
 					          "Iluminación por rayos sobre la imagen (luz rebotada y sombreado de contacto). Solo funciona con DLSS, XeSS o FSR. Cuesta FPS. Experimental.");

@@ -89,12 +89,24 @@ int64_t Stamp(const fs::path& p) {
 
 // The user's folders and files (the launcher's $ExcludeDirs / $ExcludeFiles, for the port).
 const char* const kUserDirs[]  = {"_PipelineCache", "_SaveData", "_SaveData-copias", "_backup_update", "logs", "config", "profiles"};
-const char* const kUserFiles[] = {"game-path.txt", "ram16.txt", "kbm_curve.txt", "version.txt"};
+// (10-28) amd_fidelityfx_vk.dll: the patched AMD DLL (FSR 3 frame generation x3 / x4) is never replaced on update or restore.
+const char* const kUserFiles[] = {"game-path.txt", "ram16.txt", "kbm_curve.txt", "version.txt", "amd_fidelityfx_vk.dll"};
 
 } // namespace
 
 const char* CurrentVersion() {
 	return KYTY_DS_PORT_VERSION;
+}
+
+std::string TagDate(const std::string& tag) {
+	// The first 8 digits in a row that start with 20 (YYYYMMDD), as the launcher's '(20\d{6})'.
+	for (size_t i = 0; i + 8 <= tag.size(); i++) {
+		if (tag[i] != '2' || tag[i + 1] != '0') continue;
+		bool ok = true;
+		for (size_t k = 0; k < 8 && ok; k++) ok = std::isdigit(static_cast<unsigned char>(tag[i + k])) != 0;
+		if (ok) return tag.substr(i, 8);
+	}
+	return {};
 }
 
 bool IsExcluded(const fs::path& rel, const fs::path& game_rel) {
@@ -584,6 +596,10 @@ bool CheckLatest(Release* release, std::string* error) {
 	}
 	try {
 		const auto json = nlohmann::json::parse(body);
+		if (json.value("draft", false) || json.value("prerelease", false)) {
+			*error = "GitHub no devolvio ninguna version publicada.";
+			return false;
+		}
 		release->tag    = json.value("tag_name", "");
 		release->name   = json.value("name", "");
 		int64_t best    = -1;

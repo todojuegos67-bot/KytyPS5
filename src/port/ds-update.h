@@ -84,6 +84,8 @@ struct Release {
 	int64_t     size = 0;
 };
 // releases/latest of todojuegos67-bot/KytyPS5 and its port zip (DemonsSoulsPC-*.zip). false: `error` says why.
+// (10-28) The 8-digit YYYYMMDD date in a tag (the first "20" + 6 digits), or "" without one.
+std::string TagDate(const std::string& tag);
 bool CheckLatest(Release* release, std::string* error);
 // Downloads to `file`; `progress(done, total)`; `cancel` is polled.
 bool Download(const Release& release, const fs::path& file, const std::function<void(int64_t, int64_t)>& progress,
