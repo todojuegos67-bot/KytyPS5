@@ -1,4 +1,9 @@
 #version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// (ao2-1028) cost: one prep pass writes a trace-res linear view z (R32F) + the normal; the trace reads only that
+// (half res for every level: 4x fewer, cache-friendly taps than the game's full-res depth), the composite no longer
+// rebuilds depth normals, the stats reduce per subgroup before one atomic (no serialized atomics on 1/16 pixels).
 // KYTY_AO=0..3 (rt-ao.cpp): "Oclusion ambiental", screen-space ambient occlusion written from scratch (ao-1028). It
 // does not reuse gtao.comp. One shader, four modes (push.mode):
 //
@@ -58,6 +63,14 @@ layout(std140, binding = 14) uniform Frame {
 	vec4  rot2;
 } u;
 layout(std430, binding = 15) buffer Stats { uint st[]; };
+layout(binding = 16) uniform sampler2D lz_tex;              // trace-res view z (1e6: sky), written by the prep
+layout(binding = 17, r32f) uniform writeonly image2D lz_out;
+
+// one atomic per subgroup (active lanes only)
+void StatAdd(uint idx, uint v) {
+	uint t = subgroupAdd(v);
+	if (subgroupElect() && t != 0u) atomicAdd(st[idx], t);
+}
 
 layout(push_constant) uniform Push {
 	int   mode;
@@ -144,7 +157,7 @@ vec3 SurfaceNormal(ivec2 p, vec3 P, bool vote) {
 			float a = dot(t, nd);
 			if (a > best) best = a, bi = uint(c);
 		}
-		if (best > 0.9) atomicAdd(st[uint(u.cfg.w) * SLOT_WORDS + 8u + bi], 1u);
+		for (uint c = 0u; c < 4u; ++c) StatAdd(uint(u.cfg.w) * SLOT_WORDS + 8u + c, (best > 0.9 && bi == c) ? 1u : 0u);
 	}
 	if (!ok) return nd;
 	if (dot(ng, P) > 0.0) ng = -ng;
@@ -159,13 +172,12 @@ float Bayer4(ivec2 p) {
 }
 float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 
-// ---- mode 0: the horizon trace ----
-void Trace(ivec2 tp) {
+// ---- mode 0: prep (trace res): the closest depth of the 2x2, its normal (G-buffer + depth) and linear view z ----
+void Prep(ivec2 tp) {
 	ivec2 rs = ivec2(RenderSize());
 	ivec2 p  = tp;
 	float d  = 0.0;
 	if (Flag(F_HALF)) {
-		// the closest of the 2x2 (reverse Z: the largest depth); the upsample rejects it for background pixels
 		ivec2 base = tp * 2;
 		d          = -1.0;
 		for (int i = 0; i < 4; ++i) {
@@ -178,34 +190,47 @@ void Trace(ivec2 tp) {
 		d = texelFetch(depth_tex, p, 0).r;
 	}
 	if (Sky(d)) {
-		imageStore(out_img, tp, vec4(1.0));
 		imageStore(gz_out, tp, vec4(0, 0, -1, 1e6));
+		imageStore(lz_out, tp, vec4(1e6));
 		return;
 	}
-	vec2 inv = 1.0 / RenderSize();
-	vec3 P   = PosZ((vec2(p) + 0.5) * inv, ViewZ(d));
-	bool vote = (tp.x & 3) == 0 && (tp.y & 3) == 0;
-	vec3 N   = SurfaceNormal(p, P, vote);
-	imageStore(gz_out, tp, vec4(N, P.z));
+	float z = ViewZ(d);
+	vec3  P = PosZ((vec2(p) + 0.5) / RenderSize(), z);
+	vec3  N = SurfaceNormal(p, P, (tp.x & 3) == 0 && (tp.y & 3) == 0);
+	imageStore(gz_out, tp, vec4(N, z));
+	imageStore(lz_out, tp, vec4(z));
+}
+
+// ---- mode 1: the horizon trace (trace res, on the prep's linear z: positions at texel centres, the centre's too) ----
+void Trace(ivec2 tp) {
+	ivec2 ts = ivec2(TraceSize());
+	float z  = texelFetch(lz_tex, tp, 0).r;
+	if (z >= 1e5) {
+		imageStore(out_img, tp, vec4(1.0));
+		return;
+	}
+	vec2  inv    = 1.0 / TraceSize();
+	vec3  P      = PosZ((vec2(tp) + 0.5) * inv, z);
+	vec3  N      = texelFetch(gz_cur, tp, 0).xyz;
 	vec3  V      = normalize(-P);
 	float R      = u.trace.w;
-	float H      = RenderSize().y;
+	float H      = TraceSize().y;
 	float wclip  = abs(P.z * u.depth_map.z + u.depth_map.w);
-	float rpx    = min(R * abs(u.proj.y) * 0.5 * H / max(wclip, 1e-4), u.par.w * H);
+	float rpx    = min(R * abs(u.proj.y) * 0.5 * H / max(wclip, 1e-4), u.par.w * H); // trace pixels
 	if (rpx < 1.0) {
 		imageStore(out_img, tp, vec4(1.0));
 		return;
 	}
 	int   slices = u.cfg2.x, steps = u.cfg2.y;
 	float frame  = float(u.cfg.y & 1023);
-	float rot    = fract(Bayer4(p) + frame * 0.6180339887);
-	float jit    = Ign(vec2(p) + 5.588238 * float(u.cfg.y & 63));
+	float rot    = fract(Bayer4(tp) + frame * 0.6180339887);
+	float jit    = Ign(vec2(tp) + 5.588238 * float(u.cfg.y & 63));
 	float vsum = 0.0, wsum = 0.0;
+	float inv_r = 1.0 / R;
 	for (int s = 0; s < slices; ++s) {
 		float phi = (float(s) + rot) / float(slices) * PI;
-		vec2  o   = vec2(cos(phi), sin(phi)); // pixels
-		// the slice plane: V and this screen direction lifted to view space at the pixel's depth
-		vec3 d3 = PosZ((vec2(p) + 0.5 + o) * inv, P.z) - P;
+		vec2  o   = vec2(cos(phi), sin(phi));
+		vec3 d3 = PosZ((vec2(tp) + 0.5 + o) * inv, P.z) - P;
 		d3 -= dot(d3, V) * V;
 		float dl = length(d3);
 		if (dl < 1e-9) continue;
@@ -223,19 +248,19 @@ void Trace(ivec2 tp) {
 			for (int k = 0; k < steps; ++k) {
 				float t   = (float(k) + fract(jit + 0.37 * float(k))) / float(steps);
 				t         = t * t;
-				float off = max(t * rpx, 1.5 + float(k));
-				ivec2 q   = ivec2(round(vec2(p) + sg * o * off));
-				if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, rs))) break;
-				float dq = texelFetch(depth_tex, q, 0).r;
-				if (Sky(dq)) continue;
-				vec3  S    = PosZ((vec2(q) + 0.5) * inv, ViewZ(dq));
-				vec3  D    = S - P;
-				float dist = length(D);
-				if (dist < 1e-6) continue;
-				float c    = dot(D, V) / dist;
-				float wgt  = clamp((R - dist) / (0.5 * R), 0.0, 1.0);          // world-space falloff (no halos)
-				wgt       *= clamp((dot(D, N) / dist - 0.06) / 0.12, 0.0, 1.0); // above the tangent plane only
-				hc         = max(hc, mix(low, c, wgt));
+				float off = max(t * rpx, 1.0 + 0.75 * float(k));
+				ivec2 q   = ivec2(round(vec2(tp) + sg * o * off));
+				if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ts))) break;
+				float zq = texelFetch(lz_tex, q, 0).r;
+				if (zq >= 1e5) continue;
+				vec3  D    = PosZ((vec2(q) + 0.5) * inv, zq) - P;
+				float dl2  = dot(D, D);
+				if (dl2 < 1e-12) continue;
+				float idist = inversesqrt(dl2);
+				float c     = dot(D, V) * idist;
+				float wgt   = clamp(2.0 - 2.0 * dl2 * idist * inv_r, 0.0, 1.0);    // world-space falloff (no halos)
+				wgt        *= clamp((dot(D, N) * idist - 0.06) * 8.333, 0.0, 1.0); // above the tangent plane only
+				hc          = max(hc, mix(low, c, wgt));
 			}
 			hcos[side] = hc;
 		}
@@ -248,15 +273,12 @@ void Trace(ivec2 tp) {
 		vsum += lp * a;
 		wsum += lp;
 	}
-	// the paper's unbiased estimator (sum |n_p| a / slices), NOT clamped to 1 here: an open surface seen at a grazing
-	// angle scatters around 1 per pixel (a 60-degree floor: per-slice values up to ~1.3); clamping each pixel before the
-	// temporal and spatial means biases every oblique open surface dark (0.86 at 60 degrees, 0.80 at 80: gtao.comp's
-	// grey floors and its 12 % dead-zone patch). The composite clamps the denoised mean.
+	// the paper's unbiased estimator (sum |n_p| a / slices), not clamped to 1 before the temporal / spatial means
 	float vis = wsum > 1e-6 ? clamp(vsum / float(slices), 0.0, 2.0) : 1.0;
 	imageStore(out_img, tp, vec4(vis, 0, 0, 1));
 }
 
-// ---- mode 1: temporal ----
+// ---- mode 2: temporal ----
 void Temporal(ivec2 tp) {
 	vec4  g   = texelFetch(gz_cur, tp, 0);
 	float raw = texelFetch(src_a, tp, 0).r;
@@ -300,7 +322,7 @@ void Temporal(ivec2 tp) {
 	imageStore(cnt_out, tp, vec4(c, 0, 0, 1));
 }
 
-// ---- mode 2: edge-aware a-trous ----
+// ---- mode 3: edge-aware a-trous ----
 void Denoise(ivec2 tp) {
 	vec4 g = texelFetch(gz_cur, tp, 0);
 	if (g.w >= 1e5) {
@@ -316,15 +338,17 @@ void Denoise(ivec2 tp) {
 			ivec2 q  = clamp(tp + ivec2(x, y) * stp, ivec2(0), ts - 1);
 			vec4  gq = texelFetch(gz_cur, q, 0);
 			if (gq.w >= 1e5) continue;
-			float w = k[x + 2] * k[y + 2] * exp(-abs(gq.w - g.w) / (0.02 * g.w + 0.01)) * pow(clamp(dot(gq.xyz, g.xyz), 0.0, 1.0), 8.0);
+			float cn = clamp(dot(gq.xyz, g.xyz), 0.0, 1.0);
+			cn *= cn, cn *= cn, cn *= cn;
+			float w = k[x + 2] * k[y + 2] * exp(-abs(gq.w - g.w) / (0.02 * g.w + 0.01)) * cn;
 			acc += w * texelFetch(src_a, q, 0).r;
 			ws += w;
 		}
 	imageStore(out_img, tp, vec4(ws > 1e-6 ? acc / ws : texelFetch(src_a, tp, 0).r, 0, 0, 1));
 }
 
-// ---- mode 3: upsample + application ----
-float Upsample(ivec2 p, float z, vec3 N) {
+// ---- mode 4: upsample + application ----
+float Upsample(ivec2 p, float z) {
 	if (!Flag(F_HALF)) return texelFetch(src_a, p, 0).r;
 	ivec2 ts   = ivec2(TraceSize());
 	vec2  f    = (vec2(p) + 0.5) * (TraceSize() / RenderSize()) - 0.5;
@@ -338,7 +362,7 @@ float Upsample(ivec2 p, float z, vec3 N) {
 		float v  = texelFetch(src_a, q, 0).r;
 		float bw = (o.x == 1 ? fr.x : 1.0 - fr.x) * (o.y == 1 ? fr.y : 1.0 - fr.y);
 		float dz = abs(g.w - z);
-		float w  = max(bw, 1e-3) * exp(-dz / (0.01 * z + 0.005)) * pow(clamp(dot(g.xyz, N), 0.0, 1.0), 4.0);
+		float w  = max(bw, 1e-3) * exp(-dz / (0.01 * z + 0.005)); // (ao2) depth only: the trace texel's normal came from the same 2x2
 		acc += w * v;
 		ws += w;
 		if (dz < best) best = dz, bestv = v;
@@ -356,7 +380,7 @@ void Composite(ivec2 p) {
 	float d     = texelFetch(depth_tex, p, 0).r;
 	bool  smp   = (p.x & 3) == 0 && (p.y & 3) == 0;
 	uint  base  = uint(u.cfg.w) * SLOT_WORDS;
-	if (smp) atomicAdd(st[base + 0u], 1u);
+	if (smp) StatAdd(base + 0u, 1u);
 	if (Sky(d) || any(isnan(col.rgb)) || any(isinf(col.rgb))) {
 		imageStore(out_img, p, col);
 		return;
@@ -382,20 +406,10 @@ void Composite(ivec2 p) {
 	}
 	float l = Luma(col.rgb);
 	if (smp && l > 1e-4) {
-		atomicAdd(st[base + 4u], uint(clamp(log2(l) + 32.0, 0.0, 64.0) * 256.0));
-		atomicAdd(st[base + 5u], 1u);
+		StatAdd(base + 4u, uint(clamp(log2(l) + 32.0, 0.0, 64.0) * 256.0));
+		StatAdd(base + 5u, 1u);
 	}
-	vec3  P  = PosZ((vec2(p) + 0.5) / RenderSize(), z);
-	vec3  N  = DepthNormal(p, P);
-	{
-		bool ok;
-		vec3 ng = GbufNormal(p, u.cfg2.w, ok);
-		if (ok) {
-			if (dot(ng, P) > 0.0) ng = -ng;
-			N = normalize(mix(N, ng, clamp((dot(ng, N) - 0.3) / 0.4, 0.0, 1.0)));
-		}
-	}
-	float ao = Upsample(p, z, N);
+	float ao = Upsample(p, z);
 	ao       = (isnan(ao) || isinf(ao)) ? 1.0 : clamp(ao, 0.0, 1.0);
 	float v  = 1.0 - u.trace.z * (1.0 - ao);
 	vec3  vm = max(MultiBounce(v, albedo), vec3(u.par.x));
@@ -412,11 +426,11 @@ void Composite(ivec2 p) {
 	}
 	if (any(isnan(res)) || any(isinf(res))) res = col.rgb;
 	if (smp) {
-		atomicAdd(st[base + 1u], 1u);
-		atomicAdd(st[base + 2u], uint(ao * 1000.0 + 0.5));
+		StatAdd(base + 1u, 1u);
+		StatAdd(base + 2u, uint(ao * 1000.0 + 0.5));
 		float drop = l > 1e-5 ? 1.0 - Luma(res) / l : 0.0;
-		if (drop > 0.02) atomicAdd(st[base + 3u], 1u);
-		atomicAdd(st[base + 6u], uint(clamp(drop, 0.0, 1.0) * 1000.0 + 0.5));
+		StatAdd(base + 3u, drop > 0.02 ? 1u : 0u);
+		StatAdd(base + 6u, uint(clamp(drop, 0.0, 1.0) * 1000.0 + 0.5));
 	}
 	imageStore(out_img, p, vec4(res, col.a));
 }
@@ -424,10 +438,11 @@ void Composite(ivec2 p) {
 void main() {
 	ivec2 p    = ivec2(gl_GlobalInvocationID.xy);
 	int   mode = push.mode;
-	ivec2 size = ivec2(mode == 3 ? RenderSize() : TraceSize());
+	ivec2 size = ivec2(mode == 4 ? RenderSize() : TraceSize());
 	if (p.x >= size.x || p.y >= size.y) return;
-	if (mode == 0) Trace(p);
-	else if (mode == 1) Temporal(p);
-	else if (mode == 2) Denoise(p);
+	if (mode == 0) Prep(p);
+	else if (mode == 1) Trace(p);
+	else if (mode == 2) Temporal(p);
+	else if (mode == 3) Denoise(p);
 	else Composite(p);
 }

@@ -4,8 +4,10 @@
 //
 //   Bajo  (1): half-res trace, 2 slices x 4 steps a side, 0.6 m, history 16 frames
 //   Medio (2): half-res trace, 3 slices x 6 steps a side, 0.8 m, history 24 frames
-//   Alto  (3): full-res trace, 4 slices x 8 steps a side, 1.0 m, history 32 frames
-//   Passes: trace -> temporal -> a-trous (steps 1, 2) -> composite (joint-bilateral upsample + ambient-only apply).
+//   Alto  (3): half-res trace, 4 slices x 8 steps a side, 1.0 m, history 32 frames
+//   Passes: prep (trace-res linear z + normal) -> trace -> temporal -> a-trous (steps 1, 2) -> composite (joint-bilateral
+//   upsample + ambient-only apply). (ao2-1028) Alto at full res traced on the game's full-res depth cost 8.4 ms in game
+//   (RTX 5080, 720p); every level now traces at half res on its own R32F linear z, and the RTAO line times each pass.
 //
 // Knobs: KYTY_AO_STRENGTH (1), KYTY_AO_FLOOR (0.4: the ambient term keeps at least this), KYTY_AO_RADIUS (metres, the
 // level's), KYTY_AO_AMBIENT (6: the ambient light = this x the frame's geometric-mean light x albedo), KYTY_AO_FOG
@@ -80,7 +82,8 @@ struct Push {
 	int32_t pad[2] {};
 };
 
-constexpr uint32_t Bindings = 16;
+constexpr uint32_t Bindings = 18;
+constexpr uint32_t Stamps = 7; // (ao2) start, after prep, trace, temporal, a-trous 1, a-trous 2, composite
 constexpr uint32_t SlotWords = 32, Slots = 4;
 
 struct State {
@@ -97,7 +100,7 @@ struct State {
 	VmaAllocation           stats_mem = VK_NULL_HANDLE;
 	uint32_t*               stats_map = nullptr;
 	vk::Extent2D            render {}, trace {};
-	Image                   raw, tmp_a, tmp_b, out, history[2], gz[2], count[2];
+	Image                   raw, tmp_a, tmp_b, out, history[2], gz[2], count[2], lz;
 	uint32_t                frame = 0;
 	bool                    history_valid = false;
 	// timing
@@ -105,6 +108,7 @@ struct State {
 	double        period_ns = 1.0;
 	uint64_t      written = 0, read = 0;
 	double        ms_sum = 0.0;
+	std::array<double, Stamps - 1> pass_ms {};
 	uint32_t      ms_n = 0;
 	// stats
 	uint64_t sum[16] {};
@@ -116,9 +120,9 @@ struct State {
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 } g_ao;
 
-std::array<Image*, 11> Images() {
+std::array<Image*, 12> Images() {
 	return {&g_ao.raw, &g_ao.tmp_a, &g_ao.tmp_b, &g_ao.out, &g_ao.history[0], &g_ao.history[1], &g_ao.gz[0], &g_ao.gz[1],
-	        &g_ao.count[0], &g_ao.count[1], &g_ao.dummy_u};
+	        &g_ao.count[0], &g_ao.count[1], &g_ao.lz, &g_ao.dummy_u};
 }
 
 bool MakeImage(GraphicContext& graphics, vk::Format format, vk::Extent2D extent, bool storage, Image& img) {
@@ -161,7 +165,7 @@ void FreeImage(GraphicContext& graphics, Image& img) {
 vk::DescriptorType DescType(uint32_t i) {
 	if (i == 14) return vk::DescriptorType::eUniformBuffer;
 	if (i == 15) return vk::DescriptorType::eStorageBuffer;
-	if (i == 7 || i == 8 || i == 10) return vk::DescriptorType::eStorageImage;
+	if (i == 7 || i == 8 || i == 10 || i == 17) return vk::DescriptorType::eStorageImage;
 	return vk::DescriptorType::eCombinedImageSampler;
 }
 
@@ -243,7 +247,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	}
 	vk::QueryPoolCreateInfo query {};
 	query.queryType  = vk::QueryType::eTimestamp;
-	query.queryCount = 16;
+	query.queryCount = Stamps * 8;
 	if (device.createQueryPool(&query, nullptr, &g_ao.pool) != vk::Result::eSuccess) g_ao.pool = nullptr;
 	g_ao.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
 	g_ao.failed    = false;
@@ -256,8 +260,9 @@ bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, bool half) {
 	for (auto* img : Images())
 		if (img != &g_ao.dummy_u) FreeImage(graphics, *img);
 	bool ok = MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, render, true, g_ao.out);
+	ok = ok && MakeImage(graphics, vk::Format::eR32Sfloat, trace, true, g_ao.lz);
 	for (auto* img : Images())
-		if (img != &g_ao.dummy_u && img != &g_ao.out) ok = ok && MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, trace, true, *img);
+		if (img != &g_ao.dummy_u && img != &g_ao.out && img != &g_ao.lz) ok = ok && MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, trace, true, *img);
 	if (!ok) {
 		for (auto* img : Images())
 			if (img != &g_ao.dummy_u) FreeImage(graphics, *img);
@@ -303,12 +308,14 @@ void ToGeneral(vk::CommandBuffer command, Image& img) {
 
 void ReadTiming(GraphicContext& graphics) {
 	while (g_ao.pool != nullptr && g_ao.read + 4 <= g_ao.written) {
-		const auto              entry = static_cast<uint32_t>(g_ao.read % 8);
-		std::array<uint64_t, 2> stamps {};
-		if (graphics.device.getQueryPoolResults(g_ao.pool, entry * 2, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		const auto                   entry = static_cast<uint32_t>(g_ao.read % 8);
+		std::array<uint64_t, Stamps> stamps {};
+		if (graphics.device.getQueryPoolResults(g_ao.pool, entry * Stamps, Stamps, sizeof(stamps), stamps.data(), sizeof(uint64_t),
 		                                        vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
 			break;
-		g_ao.ms_sum += static_cast<double>(stamps[1] - stamps[0]) * g_ao.period_ns / 1e6;
+		g_ao.ms_sum += static_cast<double>(stamps[Stamps - 1] - stamps[0]) * g_ao.period_ns / 1e6;
+		for (uint32_t i = 0; i + 1 < Stamps; ++i)
+			g_ao.pass_ms[i] += static_cast<double>(stamps[i + 1] - stamps[i]) * g_ao.period_ns / 1e6;
 		++g_ao.ms_n;
 		++g_ao.read;
 	}
@@ -354,17 +361,21 @@ void ReadStats(GraphicContext& graphics, int level, bool still) {
 	if (now - g_ao.last_log < std::chrono::seconds(10)) return;
 	const auto& s   = g_ao.sum;
 	const auto  pct = [](uint64_t a, uint64_t b) { return b > 0 ? 100.0 * static_cast<double>(a) / static_cast<double>(b) : 0.0; };
+	const auto  pm  = [](int i) { return g_ao.ms_n > 0 ? g_ao.pass_ms[i] / g_ao.ms_n : 0.0; };
 	std::printf("RTAO: 10 s: quality %s (%d), %ux%u trace for %ux%u, GPU %.3f ms (mean of %u frames, all passes), mean AO %.3f, "
 	            "darkened (> 2 %%) %.1f%% of the pixels (%.1f%% of the shaded surfaces), mean drop on those surfaces %.2f%%, "
-	            "surfaces %.1f%% of the pixels; frame light %.4f; normal convention %d; %u frames on (%u camera still)\n",
+	            "surfaces %.1f%% of the pixels; frame light %.4f; normal convention %d; %u frames on (%u camera still); GPU ms per pass: "
+	            "prep %.3f, trace %.3f, temporal %.3f, a-trous 1 %.3f, a-trous 2 %.3f, upsample + composite %.3f\n",
 	            LevelName(level), level, g_ao.trace.width, g_ao.trace.height, g_ao.render.width, g_ao.render.height,
 	            g_ao.ms_n > 0 ? g_ao.ms_sum / g_ao.ms_n : 0.0, g_ao.ms_n, s[1] > 0 ? static_cast<double>(s[2]) / 1000.0 / s[1] : 1.0,
 	            pct(s[3], s[0]), pct(s[3], s[1]), s[1] > 0 ? static_cast<double>(s[6]) / 10.0 / s[1] : 0.0, pct(s[1], s[0]),
-	            g_ao.light_valid ? std::exp2(g_ao.log_light) : 0.0f, g_ao.conv, g_ao.frames_on, g_ao.frames_still);
+	            g_ao.light_valid ? std::exp2(g_ao.log_light) : 0.0f, g_ao.conv, g_ao.frames_on, g_ao.frames_still,
+	            pm(0), pm(1), pm(2), pm(3), pm(4), pm(5));
 	std::fflush(stdout);
 	for (auto& v: g_ao.sum) v = 0;
 	g_ao.st_frames = g_ao.frames_on = g_ao.frames_still = 0;
 	g_ao.ms_sum = 0.0, g_ao.ms_n = 0;
+	g_ao.pass_ms.fill(0.0);
 	g_ao.last_log = now;
 }
 
@@ -401,7 +412,7 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		return false;
 	static constexpr int   slices_by[4] {0, 2, 3, 4}, steps_by[4] {0, 4, 6, 8}, hist_by[4] {0, 16, 24, 32};
 	static constexpr float radius_by[4] {0.0f, 0.6f, 0.8f, 1.0f};
-	const bool             half = level < 3;
+	const bool             half = true; // (ao2-1028) every level: Alto full res cost 8.4 ms
 	if (!EnsurePipeline(*graphics) || !EnsureImages(*graphics, color.extent, half)) {
 		static bool said = false;
 		if (!said) {
@@ -475,8 +486,8 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const auto entry = static_cast<uint32_t>(g_ao.written % 8);
 	const bool timed = g_ao.pool != nullptr;
 	if (timed) {
-		command.resetQueryPool(g_ao.pool, entry * 2, 2);
-		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_ao.pool, entry * 2);
+		command.resetQueryPool(g_ao.pool, entry * Stamps, Stamps);
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_ao.pool, entry * Stamps);
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
 	        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
@@ -499,6 +510,7 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const uint32_t cur  = g.frame & 1u;
 	const uint32_t prev = cur ^ 1u;
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
+	uint32_t stamp = 0;
 	const auto run = [&](int mode, const Image& a, const Image& out, const Image& gz_out, const Image& cnt_out, float step, vk::Extent2D size) {
 		const vk::Sampler       pt  = g.point;
 		const auto              gen = vk::ImageLayout::eGeneral;
@@ -517,6 +529,8 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		infos[10] = {nullptr, cnt_out.view, gen};
 		infos[11] = normals ? vk::DescriptorImageInfo {pt, gbuf.views[3], ro} : vk::DescriptorImageInfo {pt, g.dummy_u.view, gen};
 		infos[12] = albedo ? vk::DescriptorImageInfo {pt, gbuf.views[0], ro} : vk::DescriptorImageInfo {pt, g.dummy_u.view, gen};
+		infos[16] = {pt, g.lz.view, gen};
+		infos[17] = {nullptr, g.lz.view, gen};
 		infos[13] = gdepth ? vk::DescriptorImageInfo {pt, gbuf.depth, gbuf.depth_layout}
 		                   : vk::DescriptorImageInfo {pt, inputs.depth.view, inputs.depth.layout};
 		const vk::DescriptorBufferInfo ubo_info {vk::Buffer(g.ubo), 0, sizeof(FrameUbo)};
@@ -538,18 +552,19 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 		Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 		        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+		if (timed) command.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, g.pool, entry * Stamps + (++stamp));
 	};
 	// (storage bindings a mode does not write still need a valid image: tmp_b is the scratch target)
-	run(0, g.tmp_a, g.raw, g.gz[cur], g.tmp_b, 0.0f, g.trace);                    // trace -> raw, gz[cur]
-	run(1, g.raw, g.history[cur], g.tmp_b, g.count[cur], 0.0f, g.trace);         // temporal -> history[cur], count[cur]
-	run(2, g.history[cur], g.tmp_a, g.tmp_b, g.tmp_b, 1.0f, g.trace);            // a-trous 1 -> tmp_a
-	run(2, g.tmp_a, g.raw, g.tmp_b, g.tmp_b, 2.0f, g.trace);                     // a-trous 2 -> raw
-	run(3, g.raw, g.out, g.tmp_b, g.tmp_b, 0.0f, g.render);                      // composite -> out
+	run(0, g.tmp_a, g.tmp_b, g.gz[cur], g.tmp_b, 0.0f, g.trace);                  // prep -> gz[cur], lz
+	run(1, g.tmp_a, g.raw, g.tmp_b, g.tmp_b, 0.0f, g.trace);                      // trace -> raw
+	run(2, g.raw, g.history[cur], g.tmp_b, g.count[cur], 0.0f, g.trace);         // temporal -> history[cur], count[cur]
+	run(3, g.history[cur], g.tmp_a, g.tmp_b, g.tmp_b, 1.0f, g.trace);            // a-trous 1 -> tmp_a
+	run(3, g.tmp_a, g.raw, g.tmp_b, g.tmp_b, 2.0f, g.trace);                     // a-trous 2 -> raw
+	run(4, g.raw, g.out, g.tmp_b, g.tmp_b, 0.0f, g.render);                      // composite -> out
 	Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 	        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
 	if (timed) {
-		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g.pool, entry * 2 + 1);
-		++g.written;
+		++g.written; // (the last stamp: written after the composite by run())
 	}
 	++g.frame;
 	g.history_valid     = true;
