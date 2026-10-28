@@ -439,6 +439,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${gtao_header}")
 
+# KYTY_AO (ao-1028): the screen-space ambient occlusion written from scratch (src/local/rt-ao.cpp).
+set(rt_ao_source "${KYTY_SOURCE_DIR}/local/rt-ao.comp")
+set(rt_ao_spv "${gpu_tiler_generated_dir}/rt_ao.spv")
+set(rt_ao_header "${gpu_tiler_generated_dir}/rt_ao_spv.h")
+add_custom_command(
+	OUTPUT "${rt_ao_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rt_ao_spv}" "${rt_ao_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_ao_spv} -DOUTPUT=${rt_ao_header}
+	        -DSYMBOL=RT_AO_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rt_ao_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rt_ao_header}")
+
 # KYTY_SSR: screen-space reflections before the PS5 Pro path's upscaler (src/local/frame-gen.cpp).
 set(ssr_source "${KYTY_SOURCE_DIR}/local/ssr.comp")
 set(ssr_spv "${gpu_tiler_generated_dir}/ssr.spv")
@@ -842,6 +858,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/hwrt-scene.h"
 	"${KYTY_SOURCE_DIR}/local/hwrt-scene.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-gi.h"
+	"${KYTY_SOURCE_DIR}/local/rt-ao.h"
+	"${KYTY_SOURCE_DIR}/local/rt-ao.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-gi.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.h"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.cpp"

@@ -20,7 +20,7 @@ struct Push {
 	float   par[4];
 };
 static_assert(sizeof(Push) == 32);
-constexpr uint32_t MaxIndex = 40; // st[40 + pass]: the largest jump in 10 s, x 1e-4 of the pixel's light
+constexpr uint32_t MaxIndex = 44; // st[44 + pass]: the largest jump in 10 s, x 1e-4 of the pixel's light
 static_assert(Count * 4 <= MaxIndex && MaxIndex + Count <= 64);
 
 struct Grid {
@@ -69,7 +69,7 @@ float Threshold() {
 	return t;
 }
 const char* Name(uint32_t p) {
-	static const char* names[] {"particles light", "sun shadows", "lamp/torch shadows", "reflections", "volumetric light", "gi+ao", "contact shadows", "water mirrors", "torch light", "lens flare"};
+	static const char* names[] {"particles light", "sun shadows", "lamp/torch shadows", "reflections", "volumetric light", "gi+ao", "contact shadows", "water mirrors", "ambient occlusion", "torch light", "lens flare"};
 	return p < Count ? names[p] : "?";
 }
 
