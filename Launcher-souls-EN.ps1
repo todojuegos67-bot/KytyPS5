@@ -1379,7 +1379,7 @@ $title = T 'Actualizar version' 'Update version'
 $BackupDirName = '_backup_update'
 # Datos del usuario: NUNCA se copian encima ni se mueven (carpetas raiz y patrones de archivo).
 $ExcludeDirs = @('_PipelineCache', '_SaveData', '_SaveData-copias', 'config', 'logs', 'profiles', $BackupDirName)
-$ExcludeFiles = @('*.ini', '*.seeds', '*.seeds.program', '*.prewarm2', 'game-path.txt', 'ram16.txt', 'version.txt')
+$ExcludeFiles = @('*.ini', '*.seeds', '*.seeds.program', '*.prewarm2', 'game-path.txt', 'ram16.txt', 'version.txt', 'amd_fidelityfx_vk.dll')  # (10-28) la DLL de AMD modificada (x3/x4) nunca se cambia al actualizar ni restaurar
 # Archivos del motor (solo raiz) que se mueven a la copia de seguridad.
 $EnginePatterns = @('*.exe', '*.dll', '*.ps1')
 
