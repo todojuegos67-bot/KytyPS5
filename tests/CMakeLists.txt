@@ -1,0 +1,557 @@
+# SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# Find or download Google Test
+include(FetchContent)
+    FetchContent_Declare(
+    googletest
+    URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.zip
+)
+FetchContent_MakeAvailable(googletest)
+
+foreach(gtest_target gtest gtest_main gmock gmock_main)
+    if (TARGET ${gtest_target})
+        target_compile_options(${gtest_target} PRIVATE $<IF:$<BOOL:${MSVC}>,/WX-,-Wno-error>)
+    endif()
+endforeach()
+
+set(TEST_TARGETS
+    shadps4_settings_test
+    shadps4_ngs2_test
+    shadps4_gcn_test
+)
+
+set(SETTINGS_TEST_SOURCES
+    # Under test
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_state.cpp
+
+    # Minimal common support
+    ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/classes.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
+
+    # Stubs that replace dependencies
+    stubs/common_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
+    stubs/scm_rev_stub.cpp
+    stubs/sdl_stub.cpp
+
+    # Tests
+    test_emulator_settings.cpp
+)
+
+set(NGS2_TEST_SOURCES
+    # Under test
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/ngs2/ngs2_impl.cpp
+
+    # Minimal common and kernel support
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_state.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/kernel/sync/mutex.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/classes.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
+
+    # Stubs that replace dependencies
+    stubs/common_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
+    stubs/scm_rev_stub.cpp
+    stubs/sdl_stub.cpp
+
+    # Tests
+    test_ngs2.cpp
+)
+set(GCN_TEST_SOURCES
+    # Under test
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_state.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_barriers.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_bitwise_conversion.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_composite.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_convert.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_integer.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_logical.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_select.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_shared_memory.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_undefined.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/format.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/decode.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/decode.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/fetch_shader.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/fetch_shader.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/translate/data_share.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/translate/export.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/translate/translate.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/translate/translate.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/translate/scalar_alu.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/translate/scalar_flow.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/translate/scalar_memory.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/translate/vector_alu.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/translate/vector_interpolation.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/translate/vector_memory.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/abstract_syntax_list.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/abstract_syntax_list.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/basic_block.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/basic_block.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/microinstruction.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/attribute.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/attribute.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/ir_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/ir_emitter.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/opcodes.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/opcodes.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/patch.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/patch.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/program.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/program.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/ir_passes.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/constant_propagation_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/dead_code_elimination_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/shader_info_collection_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/ssa_rewrite_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/post_order.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/post_order.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/type.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/type.h
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/value.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/value.h
+    ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.h
+    ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/resource.h
+
+    # Minimal common support
+    ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/io_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/classes.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/ntapi.cpp
+
+    # Stubs that replace dependencies
+    stubs/common_stub.cpp
+    stubs/resource_tracking_pass_stub.cpp
+    stubs/scm_rev_stub.cpp
+    stubs/sdl_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
+
+    gcn/gcn_test_runner.hpp
+    gcn/gcn_test_runner.cpp
+    gcn/translator.hpp
+    gcn/translator.cpp
+
+    # Tests
+    gcn/test_gcn_instructions.cpp
+)
+
+add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})
+add_executable(shadps4_ngs2_test ${NGS2_TEST_SOURCES})
+add_executable(shadps4_gcn_test ${GCN_TEST_SOURCES})
+
+foreach(t ${TEST_TARGETS})
+    target_include_directories(${t} PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}
+    )
+    target_compile_features(${t} PRIVATE cxx_std_23)
+    target_compile_definitions(${t} PRIVATE BOOST_ASIO_STANDALONE)
+endforeach()
+
+target_link_libraries(shadps4_settings_test PRIVATE
+    GTest::gtest_main
+    fmt::fmt
+    nlohmann_json::nlohmann_json
+    toml11::toml11
+    SDL3::SDL3
+    spdlog::spdlog
+)
+target_link_libraries(shadps4_ngs2_test PRIVATE
+    GTest::gtest_main
+    fmt::fmt
+    nlohmann_json::nlohmann_json
+    toml11::toml11
+    SDL3::SDL3
+    spdlog::spdlog
+)
+target_link_libraries(shadps4_gcn_test PRIVATE
+    GTest::gtest_main
+    fmt::fmt
+    nlohmann_json::nlohmann_json
+    magic_enum::magic_enum
+    toml11::toml11
+    Boost::headers
+    Vulkan::Headers
+    sirit
+    SDL3::SDL3
+    spdlog::spdlog
+    half::half
+)
+
+if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+    CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    include(CheckCXXSymbolExists)
+    check_cxx_symbol_exists(_LIBCPP_VERSION version LIBCPP)
+    if (LIBCPP)
+        foreach(t ${TEST_TARGETS})
+            target_compile_options(${t} PRIVATE -fexperimental-library)
+        endforeach()
+    endif()
+endif()
+
+foreach(t ${TEST_TARGETS})
+    if (WIN32)
+        target_link_libraries(${t} PRIVATE onecore)
+        target_compile_definitions(${t} PRIVATE
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            NTDDI_VERSION=0x0A000006
+            _WIN32_WINNT=0x0A00
+            WINVER=0x0A00
+        )
+        if (MSVC)
+            target_compile_definitions(${t} PRIVATE
+                _CRT_SECURE_NO_WARNINGS
+                _CRT_NONSTDC_NO_DEPRECATE
+                _SCL_SECURE_NO_WARNINGS
+                _TIMESPEC_DEFINED
+            )
+        endif()
+    endif()
+endforeach()
+
+include(GoogleTest)
+
+foreach(t ${TEST_TARGETS})
+    gtest_discover_tests(${t}
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        DISCOVERY_TIMEOUT 60
+    )
+endforeach()
+
+# ===========================================================================
+# HTTP tests (libSceHttp - URI helpers and status-line parsing)
+# ===========================================================================
+# Self-contained block - mirrors the structure of the targets above so the
+# new test does not depend on any earlier foreach iterations.
+
+set(HTTP_TEST_SOURCES
+    # Under test
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/network/http.cpp
+    # Required to link RegisterLib's LIB_FUNCTION calls and the logger's
+    # access to EmulatorSettings.
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_state.cpp
+
+    # Minimal common support
+    ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/classes.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
+
+    # Stubs that replace dependencies
+    stubs/common_stub.cpp
+    stubs/scm_rev_stub.cpp
+    stubs/sdl_stub.cpp
+    stubs/loader_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
+    stubs/kernel_stub.cpp
+
+    # Tests
+    network/test_http_uri.cpp
+    network/test_http_status_line.cpp
+    network/test_http_parse_response_header.cpp
+    network/test_http_lifecycle.cpp
+)
+
+add_executable(shadps4_http_test ${HTTP_TEST_SOURCES})
+
+list(APPEND TEST_TARGETS shadps4_http_test)
+
+target_include_directories(shadps4_http_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}
+)
+target_compile_features(shadps4_http_test PRIVATE cxx_std_23)
+target_compile_definitions(shadps4_http_test PRIVATE BOOST_ASIO_STANDALONE)
+
+target_link_libraries(shadps4_http_test PRIVATE
+    GTest::gtest_main
+    fmt::fmt
+    magic_enum::magic_enum
+    nlohmann_json::nlohmann_json
+    toml11::toml11
+    SDL3::SDL3
+    spdlog::spdlog
+    ZLIB::ZLIB
+)
+
+if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+    CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    include(CheckCXXSymbolExists)
+    check_cxx_symbol_exists(_LIBCPP_VERSION version LIBCPP)
+    if (LIBCPP)
+        target_compile_options(shadps4_http_test PRIVATE -fexperimental-library)
+    endif()
+endif()
+
+if (WIN32)
+    target_link_libraries(shadps4_http_test PRIVATE onecore)
+    target_compile_definitions(shadps4_http_test PRIVATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        NTDDI_VERSION=0x0A000006
+        _WIN32_WINNT=0x0A00
+        WINVER=0x0A00
+    )
+    if (MSVC)
+        target_compile_definitions(shadps4_http_test PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            _CRT_NONSTDC_NO_DEPRECATE
+            _SCL_SECURE_NO_WARNINGS
+            _TIMESPEC_DEFINED
+        )
+    endif()
+endif()
+
+gtest_discover_tests(shadps4_http_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    DISCOVERY_TIMEOUT 60
+)
+
+# ===========================================================================
+# Core::Net tests (host sockets, guest layer, P2P transport, TCP, wire codec)
+# ===========================================================================
+
+set(NET_CORE_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/core/net/guest_net.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/net/host_net.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/net/p2p_codec.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/net/p2p_crypto.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/net/p2p_transport.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/net/p2p_tcp.cpp
+)
+
+# libcrypto for p2p_crypto.cpp:
+get_directory_property(NET_TEST_SSL_LIBS DIRECTORY ${CMAKE_SOURCE_DIR}/externals
+                       DEFINITION SSL_DEPENDENCIES)
+if (NOT NET_TEST_SSL_LIBS)
+    find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+    set(NET_TEST_SSL_LIBS OpenSSL::Crypto)
+endif()
+
+add_executable(shadps4_net_test
+    ${NET_CORE_SOURCES}
+    network/test_net_host.cpp
+    network/test_net_p2p_codec.cpp
+    network/test_net_p2p_guest.cpp
+    network/test_net_p2p_tcp.cpp
+)
+
+# Our TCP against the Linux kernel's TCP through a TUN device. Needs root or CAP_NET_ADMIN
+# and skips itself otherwise (and on other platforms). Separate target so it can run serially:
+# every test creates the same TUN interface.
+add_executable(shadps4_net_interop_test
+    ${CMAKE_SOURCE_DIR}/src/core/net/p2p_tcp.cpp
+    network/test_net_p2p_tcp_interop.cpp
+)
+
+foreach(t shadps4_net_test shadps4_net_interop_test)
+    list(APPEND TEST_TARGETS ${t})
+    target_include_directories(${t} PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}
+    )
+    target_compile_features(${t} PRIVATE cxx_std_23)
+    target_link_libraries(${t} PRIVATE GTest::gtest_main)
+
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+        CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+        include(CheckCXXSymbolExists)
+        check_cxx_symbol_exists(_LIBCPP_VERSION version LIBCPP)
+        if (LIBCPP)
+            target_compile_options(${t} PRIVATE -fexperimental-library)
+        endif()
+    endif()
+
+    if (WIN32)
+        target_link_libraries(${t} PRIVATE onecore ws2_32)
+        target_compile_definitions(${t} PRIVATE
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            NTDDI_VERSION=0x0A000006
+            _WIN32_WINNT=0x0A00
+            WINVER=0x0A00
+        )
+        if (MSVC)
+            target_compile_definitions(${t} PRIVATE
+                _CRT_SECURE_NO_WARNINGS
+                _CRT_NONSTDC_NO_DEPRECATE
+                _SCL_SECURE_NO_WARNINGS
+                _TIMESPEC_DEFINED
+            )
+        endif()
+    endif()
+endforeach()
+
+target_link_libraries(shadps4_net_test PRIVATE ${NET_TEST_SSL_LIBS})
+if (WIN32)
+    target_link_libraries(shadps4_net_test PRIVATE wepoll)
+endif()
+
+gtest_discover_tests(shadps4_net_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    DISCOVERY_TIMEOUT 60
+    PROPERTIES TIMEOUT 300
+)
+gtest_discover_tests(shadps4_net_interop_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    DISCOVERY_TIMEOUT 60
+    PROPERTIES RUN_SERIAL TRUE TIMEOUT 600
+)
+
+# ===========================================================================
+# New libSceNet (src/core/libraries/net) on top of Core::Net
+# ===========================================================================
+# The library with the same logging/HLE support as the HTTP test; its kernel glue
+# (net_kernel.cpp) is tested separately against a stub of the kernel.
+
+set(NET_LIB_TEST_SOURCES
+    # Under test
+    ${NET_CORE_SOURCES}
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/net/net.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/net/net_log.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/net/net_p2p.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/net/net_p2p_ioctl.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/net/net_resolver.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/net/net_translate.cpp
+
+    # Logging and RegisterLib support
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_state.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/classes.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
+
+    # Stubs that replace dependencies
+    stubs/common_stub.cpp
+    stubs/scm_rev_stub.cpp
+    stubs/sdl_stub.cpp
+    stubs/loader_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
+    stubs/net_lib_kernel_stub.cpp
+)
+
+# Both targets below share this setup.
+function(add_net_lib_test target)
+    add_executable(${target} ${ARGN})
+    list(APPEND TEST_TARGETS ${target})
+
+    target_include_directories(${target} PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}
+    )
+    target_compile_features(${target} PRIVATE cxx_std_23)
+    target_compile_definitions(${target} PRIVATE BOOST_ASIO_STANDALONE)
+    target_link_libraries(${target} PRIVATE
+        GTest::gtest_main
+        fmt::fmt
+        magic_enum::magic_enum
+        nlohmann_json::nlohmann_json
+        toml11::toml11
+        SDL3::SDL3
+        spdlog::spdlog
+        ${NET_TEST_SSL_LIBS}
+    )
+
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+        CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+        include(CheckCXXSymbolExists)
+        check_cxx_symbol_exists(_LIBCPP_VERSION version LIBCPP)
+        if (LIBCPP)
+            target_compile_options(${target} PRIVATE -fexperimental-library)
+        endif()
+    endif()
+
+    if (WIN32)
+        target_link_libraries(${target} PRIVATE onecore ws2_32 wepoll)
+        target_compile_definitions(${target} PRIVATE
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            NTDDI_VERSION=0x0A000006
+            _WIN32_WINNT=0x0A00
+            WINVER=0x0A00
+        )
+        if (MSVC)
+            target_compile_definitions(${target} PRIVATE
+                _CRT_SECURE_NO_WARNINGS
+                _CRT_NONSTDC_NO_DEPRECATE
+                _SCL_SECURE_NO_WARNINGS
+                _TIMESPEC_DEFINED
+            )
+        endif()
+    endif()
+
+    gtest_discover_tests(${target}
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        DISCOVERY_TIMEOUT 60
+        PROPERTIES TIMEOUT 300
+    )
+    set(TEST_TARGETS ${TEST_TARGETS} PARENT_SCOPE)
+endfunction()
+
+add_net_lib_test(shadps4_net_lib_test
+    ${NET_LIB_TEST_SOURCES}
+    network/test_net_lib.cpp
+    network/test_net_lib_p2p_ioctl.cpp
+    network/test_net_lib_translate.cpp
+    network/test_net_sample_sockets.cpp
+)
+
+# The kernel glue: net ids as kernel file descriptors, the BSD socket calls. The kernel's
+# errno and file table come from a stub; everything else is the real code.
+add_net_lib_test(shadps4_net_kernel_test
+    ${NET_LIB_TEST_SOURCES}
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/net/net_kernel.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/net/net_upnp.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/net/net_util.cpp
+    stubs/net_kernel_stub.cpp
+    network/test_net_kernel.cpp
+)
+target_link_libraries(shadps4_net_kernel_test PRIVATE
+    tsl::robin_map         # fs.h
+    miniupnpc::miniupnpc   # UPnP forwarding of the P2P port
+)
