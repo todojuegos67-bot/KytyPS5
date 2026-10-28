@@ -329,7 +329,9 @@ float ProRamp(float r) {
 	float hi = max(push.motion.z, 0.3);
 	// (ds-rt-refl-1027) the real roughness: genuinely glossy only (full to 0.12, nothing from 0.35): the courtyard capture
 	// 13.5 % of the pixels instead of 32 % (stone walls at 0.55 took a faint, noisy glossy reflection)
-	if (CaptureLayout()) return 1.0 - smoothstep(0.12, min(hi, 0.35), r);
+	// (glossy tier, the owner: armour / polished stone at 0.35..0.6 reflect too: a blurred, lower reflection - mask 0.6,
+	// fading out to the level's cut-off; the lobe is the roughness's (the a-trous / temporal take the noise))
+	if (CaptureLayout()) return max(1.0 - smoothstep(0.12, min(hi, 0.35), r), 0.6 * (1.0 - smoothstep(0.45, hi, r)));
 	return 1.0 - smoothstep(0.25 * hi / 0.6, hi, r);
 }
 // (refl-pro) Specular occlusion: a screen-space ambient occlusion estimate (8 depth taps, two rings: the share of the
@@ -1738,6 +1740,7 @@ void Composite(ivec2 px) {
 		// wetness). A dielectric's 0.04 Fresnel alone replaced ~4 % of the pixel (log 013206: mean share 0.04, "nothing
 		// visible"); the depth-based water detector finds 0 % in fbe13e4e (the water pass is gone)
 		else if (match) spc = max(spc, vec3(0.6 * CaptureWet(px))); // (standing water 0.6, damp ground less)
+		if (water <= 0.0 && match && CaptureLayout() && fr_rough > 0.3) spc = max(spc, vec3(0.15)); // (glossy tier: visible sheen)
 		float a   = sqrt(clamp(rf.a, 0.0, 1.0)) * mask * push.params.x * ProSpecOcc(uv, P, N, Nd, V, water > 0.0 ? 0.0 : fr_rough, NoV);
 		vec3  wv  = clamp(spc * a, 0.0, 0.95);
 		float lc  = Luma(max(col.rgb, vec3(0))), lr = Luma(reflf);
