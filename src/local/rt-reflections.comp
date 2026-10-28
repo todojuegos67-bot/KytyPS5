@@ -311,14 +311,16 @@ bool  HaveGuide() { return (push.misc.w & 256) != 0; }
 // The game's SSR confidence never decides whether a reflection exists (that gate - 0.3-0.4 % of the pixels confident in the
 // 10-27 logs - made the reflections pop in and out).
 bool  Pro() { return (push.misc.w & 16384) != 0; }
-// (ds-rt-refl-1027) The capture's layout (roughness L1.b3, code 1121): L2.b2's low nibble is the game's wetness (5..8 on
-// water and wet ground, 0 dry): wet pixels at most 0.1 rough.
+// (ds-rt-refl-1027) The capture's layout (roughness L1.b3, code 1121): L2.b1 is the game's wetness - 128 dry (94 % of
+// the courtyard), 32..112 on the fountain's water and the wet ground around it (lower = wetter). (L2.b2's low nibble,
+// first taken for it, is also set on grass, leaves and banners: a foliage / two-sided flag, not water.)
 bool  CaptureLayout() { return push.dec.y == (1 | (24 << 2) | (8 << 7)) && push.dec.w < 0; }
-// the wetness 0..1 (nibble / 8: water and puddles 5..8)
-float CaptureWet(ivec2 p) { return CaptureLayout() ? clamp(float((Packed(2, p) >> 16u) & 15u) / 8.0, 0.0, 1.0) : 0.0; }
+// the wetness 0..1: L2.b1 128 -> 0, 48 -> 1
+float CaptureWet(ivec2 p) { return CaptureLayout() ? clamp((128.0 - float((Packed(2, p) >> 8u) & 255u)) / 80.0, 0.0, 1.0) : 0.0; }
 float ProRough(ivec2 p) {
 	float r = push.dec.w >= 0 ? Field(push.dec.w, p) : (push.dec.y >= 0 ? Field(push.dec.y, p) : 1.0);
-	if (CaptureLayout() && Bits(Packed(2, p), 16, 4) > 0.0) r = min(r, 0.1);
+	float wt = CaptureWet(p);
+	if (wt > 0.1) r = min(r, mix(0.2, 0.02, wt)); // (wet: glossy, standing water a mirror)
 	return clamp(r, 0.0, 1.0);
 }
 float ProF0(ivec2 p) { return (push.dec.w >= 0 && push.dec.y >= 0) ? mix(0.02, 0.08, clamp(Field(push.dec.y, p), 0.0, 1.0)) : 0.04; }
@@ -1735,7 +1737,7 @@ void Composite(ivec2 px) {
 		// (ds-rt-refl-1027) the game's own wetness (L2.b2 nibble): water / puddles at the water minimum reflectance (0.4 x
 		// wetness). A dielectric's 0.04 Fresnel alone replaced ~4 % of the pixel (log 013206: mean share 0.04, "nothing
 		// visible"); the depth-based water detector finds 0 % in fbe13e4e (the water pass is gone)
-		else if (match) spc = max(spc, vec3(fparams.y * CaptureWet(px)));
+		else if (match) spc = max(spc, vec3(0.6 * CaptureWet(px))); // (standing water 0.6, damp ground less)
 		float a   = sqrt(clamp(rf.a, 0.0, 1.0)) * mask * push.params.x * ProSpecOcc(uv, P, N, Nd, V, water > 0.0 ? 0.0 : fr_rough, NoV);
 		vec3  wv  = clamp(spc * a, 0.0, 0.95);
 		float lc  = Luma(max(col.rgb, vec3(0))), lr = Luma(reflf);
