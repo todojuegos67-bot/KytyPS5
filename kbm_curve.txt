@@ -1,0 +1,10 @@
+# Kyty KBM: Demon's Souls stick -> camera yaw (KYTY_KBM_CALIBRATE=1 rewrites it; delete to go back to the linear mapping)
+stick 0.20 rate 1.41
+stick 0.40 rate 5.27
+stick 0.60 rate 32.02
+stick 0.80 rate 59.91
+stick 1.00 rate 169.95
+onset_ms 43.3
+tau_ms 26.8
+sign -1
+camspeed 15

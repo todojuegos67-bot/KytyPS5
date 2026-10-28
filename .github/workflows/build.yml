@@ -235,7 +235,7 @@ jobs:
           Copy-Item LICENSES $out -Recurse
           if (Test-Path "$build\3rdparty\zarchive.exe") { Copy-Item "$build\3rdparty\zarchive.exe" $out }
           # Demon's Souls launcher (window with frame generation choice) and its two configs.
-          Copy-Item Launcher-souls.ps1, Launcher-souls-EN.ps1, Launcher-souls.cmd, 'Jugar (Espanol).cmd', 'Play (English).cmd', fondo-souls.jpg, LEEME-souls.txt, metricas.ps1, NOVEDADES.txt, mando-ps5.png, mando-8bitdo.png, caballero.png $out
+          Copy-Item Launcher-souls.ps1, Launcher-souls-EN.ps1, Launcher-souls.cmd, 'Jugar (Espanol).cmd', 'Play (English).cmd', fondo-souls.jpg, LEEME-souls.txt, metricas.ps1, NOVEDADES.txt, mando-ps5.png, mando-8bitdo.png, caballero.png, caballero-espada.png, raton.png, kbm_curve.txt, mando-8bitdo-foto.png, mando-ps5-foto.png, Medir-rendimiento.cmd, Medir-rendimiento.ps1, Capturar-RT.cmd, Capturar-RT.ps1 $out
           Copy-Item config "$out\config" -Recurse
           Copy-Item run-windows.json "$out\launch.json"
           Copy-Item docs\PORTABLE-README.md "$out\README.md"

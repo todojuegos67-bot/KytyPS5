@@ -8,3 +8,12 @@
 # AMD FSR 4 model assets (fsr4_shaders/, src/local/fsr4-sr.h): SPIR-V and weights, never converted.
 fsr4_shaders/** binary
 fsr4_shaders/*.txt text
+# Packaged root files (Demon's Souls launcher and tools): shipped byte-identical to the installed folder, never converted.
+/Launcher-souls.ps1 -text
+/Launcher-souls-EN.ps1 -text
+/metricas.ps1 -text
+/kbm_curve.txt -text
+/Medir-rendimiento.cmd -text
+/Medir-rendimiento.ps1 -text
+/Capturar-RT.cmd -text
+/Capturar-RT.ps1 -text

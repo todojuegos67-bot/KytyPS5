@@ -1,5 +1,5 @@
 ﻿# Metricas: ventana pequena siempre encima con GPU, VRAM, CPU, RAM y FPS del emulador.
-# Uso: powershell -ExecutionPolicy Bypass -File metricas.ps1 [-VramMB 8192] [-LogDir "C:\DEMON SOULS TURBO\logs"]
+# Uso: powershell -ExecutionPolicy Bypass -File metricas.ps1 [-VramMB 8192] [-RamGB 16] [-NoOverlay] [-LogDir "C:\DEMON SOULS TURBO\logs"]
 # -VramMB: si el emulador simula una grafica mas pequena (KYTY_SIMULATE_VRAM_MB), la VRAM se muestra
 #          sobre ese maximo, restando lo que el emulador reserva para la simulacion.
 param(
@@ -7,6 +7,7 @@ param(
 	[int]$MaxMB = 0,
 	[int]$RamGB = 0,
 	[switch]$LossLess,
+	[switch]$NoOverlay,
 	[string]$LogDir = "",
 	[string]$Titulo = "DEMON'S SOULS REMAKE"
 )
@@ -22,6 +23,27 @@ public static class RamLimit {
 }
 "@
 $script:limitedPid = 0
+
+# (10-27) -NoOverlay: solo la simulacion (limite de RAM del juego), sin ventana ni formulario. La VRAM de 8 GB la
+# simula el emulador (KYTY_SIMULATE_VRAM_MB); aqui solo se usaba para mostrarla, asi que no hace falta nada mas.
+# Termina cuando se cierra el juego, igual que el overlay.
+if ($NoOverlay) {
+	if ($RamGB -le 0) { exit 0 }
+	$emuSeen = $false; $emuGone = 0
+	while ($true) {
+		$emuWin = Get-Process -Name 'kyty_emulator*' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }
+		if ($emuWin) {
+			$emuSeen = $true; $emuGone = 0
+			$p = $emuWin | Select-Object -First 1
+			if ($p.Id -ne $script:limitedPid) {
+				$max = [uint64](($RamGB - 4) * 1GB)
+				try { [void][RamLimit]::SetProcessWorkingSetSizeEx($p.Handle, [UIntPtr][uint64]200MB, [UIntPtr]$max, 6) } catch { }
+				$script:limitedPid = $p.Id
+			}
+		} elseif ($emuSeen) { $emuGone++; if ($emuGone -ge 2) { exit 0 } }
+		Start-Sleep -Seconds 1
+	}
+}
 
 $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 if (-not $smi) {
@@ -49,13 +71,47 @@ $fontSmall = New-Object System.Drawing.Font("Consolas", [single](10 * $S), [Syst
 $DOT = ' ' + [char]0x00B7 + ' '   # separador (punto medio)
 $ARROW = [string][char]0x2192     # flecha "->"
 
-$form = New-Object System.Windows.Forms.Form
+# (10-27) Grabacion de NVIDIA (ShadowPlay / NVIDIA App, Alt+F9): la ventana de metricas nunca toma el foco.
+# Antes Application.Run la activaba (el juego perdia el primer plano) y NVIDIA cortaba la grabacion al empezar.
+# Ahora: se muestra sin activarse (ShowWithoutActivation + WS_EX_NOACTIVATE), es de herramienta (fuera de la barra
+# de tareas y de Alt-Tab), transparente al raton, topmost una sola vez con SWP_NOACTIVATE, y excluida de la captura
+# (WDA_EXCLUDEFROMCAPTURE): no sale en el video y no molesta a la captura del juego.
+Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing @"
+using System; using System.Runtime.InteropServices; using System.Windows.Forms;
+public class NoActForm : Form {
+  public const int WS_EX_TOPMOST = 0x8, WS_EX_TRANSPARENT = 0x20, WS_EX_TOOLWINDOW = 0x80, WS_EX_LAYERED = 0x80000, WS_EX_NOACTIVATE = 0x8000000;
+  const int WM_MOUSEACTIVATE = 0x21, MA_NOACTIVATE = 3;
+  protected override bool ShowWithoutActivation { get { return true; } }
+  protected override CreateParams CreateParams { get {
+    CreateParams cp = base.CreateParams;
+    cp.ExStyle |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOPMOST;
+    return cp; } }
+  protected override void WndProc(ref Message m) {
+    if (m.Msg == WM_MOUSEACTIVATE) { m.Result = (IntPtr)MA_NOACTIVATE; return; }
+    base.WndProc(ref m);
+  }
+}
+public static class OvWin {
+  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i);
+  [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint f);
+  [DllImport("user32.dll")] public static extern bool SetWindowDisplayAffinity(IntPtr h, uint a);
+  public static void Apply(IntPtr h) {
+    int ex = GetWindowLong(h, -20);
+    SetWindowLong(h, -20, ex | NoActForm.WS_EX_TOOLWINDOW | NoActForm.WS_EX_LAYERED | NoActForm.WS_EX_TRANSPARENT | NoActForm.WS_EX_NOACTIVATE);
+    // HWND_TOPMOST, SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOOWNERZORDER|SWP_FRAMECHANGED
+    SetWindowPos(h, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0200 | 0x0020);
+    // WDA_EXCLUDEFROMCAPTURE (Windows 10 2004+); si falla, WDA_MONITOR no: se deja como esta.
+  }
+}
+"@
+$form = New-Object NoActForm
 $form.Text = "Metricas"
 $form.FormBorderStyle = 'None'
-$form.TopMost = $true
 $form.ShowInTaskbar = $false
-$form.BackColor = [System.Drawing.Color]::Black
-$form.Opacity = 0.8
+$keyCol = [System.Drawing.Color]::FromArgb(255, 1, 0, 1)
+$form.BackColor = $keyCol; $form.TransparencyKey = $keyCol
+$form.Opacity = 1.0
 $form.StartPosition = 'Manual'
 $form.AutoScaleMode = 'None'
 $form.Location = New-Object System.Drawing.Point((Px 10), (Px 10))
@@ -67,7 +123,7 @@ $form.Size = New-Object System.Drawing.Size((Px 420), (Px 400))
 $script:rows = @(,@('', 'Cargando...', [System.Drawing.Color]::Orange))
 $script:fpsText = ''; $script:fpsColor = [System.Drawing.Color]::White
 $label = New-Object System.Windows.Forms.PictureBox
-$label.Dock = 'Fill'; $label.BackColor = [System.Drawing.Color]::Black
+$label.Dock = 'Fill'; $label.BackColor = $keyCol
 $colName = [System.Drawing.Color]::FromArgb(150, 150, 150)
 $fmtEll = New-Object System.Drawing.StringFormat
 $fmtEll.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
@@ -99,7 +155,7 @@ function Measure-Layout {
 }
 $label.Add_Paint({ param($s, $e)
 	$g = $e.Graphics; $L = $script:layout; if (-not $L.rowH) { return }
-	$g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+	$g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::SingleBitPerPixelGridFit
 	$pad = $L.pad; $w = $label.Width - 2 * $pad
 	$b = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
 	$g.DrawString($Titulo, $fontTitle, $b, (New-Object System.Drawing.RectangleF([single]$pad, [single]$pad, [single]$w, [single]$L.titleH)), $fmtCenter)
@@ -126,7 +182,7 @@ $label.Add_Paint({ param($s, $e)
 $script:ft = New-Object System.Collections.Generic.List[double]
 $script:ftMax = New-Object System.Collections.Generic.List[double]
 $graph = New-Object System.Windows.Forms.PictureBox
-$graph.Dock = 'Bottom'; $graph.Height = (Px 90); $graph.BackColor = [System.Drawing.Color]::Black
+$graph.Dock = 'Bottom'; $graph.Height = (Px 90); $graph.BackColor = $keyCol
 $graph.Add_Paint({ param($s, $e)
 	$g = $e.Graphics; $w = $graph.Width; $h = $graph.Height
 	$top = 40.0
@@ -229,10 +285,11 @@ $label.Add_MouseMove({
 })
 $label.Add_DoubleClick({ $form.Close() })
 
+# (10-25) Horas en UTC: con el cambio de hora (3:00 -> 2:00) el log viejo de las 2:55 parecia el mas nuevo y se leia ese.
 function Get-Fps {
 	if (-not $LogDir -or -not (Test-Path $LogDir)) { return $null }
-	$log = Get-ChildItem -Path $LogDir -Filter "*.out.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-	if (-not $log -or ((Get-Date) - $log.LastWriteTime).TotalSeconds -gt 10) { return $null }
+	$log = Get-ChildItem -Path $LogDir -Filter "*.out.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+	if (-not $log -or [Math]::Abs(([DateTime]::UtcNow - $log.LastWriteTimeUtc).TotalSeconds) -gt 10) { return $null }
 	$inv = [System.Globalization.CultureInfo]::InvariantCulture
 	try {
 		$fs = [System.IO.File]::Open($log.FullName, 'Open', 'Read', 'ReadWrite')
@@ -242,9 +299,10 @@ function Get-Fps {
 		$fs.Read($buf, 0, $take) | Out-Null
 		$fs.Close()
 		$text = [System.Text.Encoding]::UTF8.GetString($buf)
-		$r = @{}
+		$r = @{}; $prevFpsIdx = $null
 		$m = [regex]::Matches($text, '\[fps\] \d+ frames: mean ([0-9.]+) ms, max ([0-9.]+)')
 		if ($m.Count -gt 0) {
+			$prevFpsIdx = if ($m.Count -gt 1) { $m[$m.Count - 2].Index } else { -1 }  # (10-25) FG solo si su linea es de este segundo
 			$last = $m[$m.Count - 1]
 			$r.mean = [double]::Parse($last.Groups[1].Value, $inv); $r.max = [double]::Parse($last.Groups[2].Value, $inv)
 			if ($r.mean -gt 0) { $r.fps = [Math]::Round(1000.0 / $r.mean) }
@@ -256,7 +314,8 @@ function Get-Fps {
 		$m = [regex]::Matches($text, '\[[a-z0-9]+\][^\r\n]*?real ([0-9.]+) fps, shown ([0-9.]+) fps')
 		$x = [regex]::Matches($text, '\[(dlssg|fsr3-mfg)\][^\r\n]*?x(\d)')
 		if ($x.Count -gt 0) { $r.fgMult = [int]$x[$x.Count - 1].Groups[2].Value }
-		if ($m.Count -gt 0) { $r.fgShown = [Math]::Round([double]::Parse($m[$m.Count - 1].Groups[2].Value, $inv)); $r.fgReal = [Math]::Round([double]::Parse($m[$m.Count - 1].Groups[1].Value, $inv)) }
+		if ($null -eq $prevFpsIdx) { $prevFpsIdx = -1 }
+		if ($m.Count -gt 0 -and $m[$m.Count - 1].Index -gt $prevFpsIdx -and $m[$m.Count - 1].Groups[2].Value -ne $m[$m.Count - 1].Groups[1].Value) { $r.fgShown = [Math]::Round([double]::Parse($m[$m.Count - 1].Groups[2].Value, $inv)); $r.fgReal = [Math]::Round([double]::Parse($m[$m.Count - 1].Groups[1].Value, $inv)) }
 		# (lat-1023) Latencia (KYTY_LATENCY=1): la ultima linea [lat]. total = mando leido -> present + scanout (estimado)
 		# + retencion del frame generation (estimada); sin 'total' (version vieja): media + scanout + fg.
 		$m = [regex]::Matches($text, '\[lat\] input->present mean ([0-9.]+) ms, p95 ([0-9.]+), max ([0-9.]+); \+scanout ([0-9.]+); fg \+([0-9.]+) \(n (\d+)\)(?:; total ([0-9.]+), p95 ([0-9.]+))?')
@@ -271,7 +330,7 @@ function Get-Fps {
 	} catch { }
 	return $null
 }
-$script:lastKey = -1; $script:lastLog = ''
+$script:lastKey = -1; $script:lastLog = ''; $script:lastKeyAt = $null
 
 # launcher.ini una vez por segundo, como tabla (antes se leia cuatro veces por tick).
 function Read-Ini {
@@ -300,7 +359,7 @@ function Get-ScaleModeName([string]$label) {
 }
 function Update-ScaleLog {
 	if (-not $LogDir -or -not (Test-Path $LogDir)) { return }
-	$log = Get-ChildItem -Path $LogDir -Filter "*.out.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+	$log = Get-ChildItem -Path $LogDir -Filter "*.out.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
 	if (-not $log) { return }
 	if ($log.FullName -ne $script:sc.log) { Reset-Scale; $script:sc.log = $log.FullName }
 	try {
@@ -368,6 +427,7 @@ function Get-Scale($ini) {
 	elseif ($lbl -like '*juego*') { $h = ($lbl -split 'p', 2)[0]; $r.kind = 'Juego'; $r.res = "{0}p $ARROW {1}p" -f $h, $outH; $r.model = 'reescalado del juego' }
 	elseif ($s.native) { $r.kind = 'Nativo'; $r.res = "{0}p $ARROW {1}p" -f $s.native, $outH }
 	elseif ($lbl) { $r.kind = $lbl }
+	if ($lbl -like 'FSR 4*' -and $r.kind -eq 'FSR') { $r.kind = 'FSR 4'; $r.mode = ($lbl -replace '^FSR 4 ', ''); $r.model = 'FSR 4 (IA, modelo v07)' }  # (fsr4)
 	return $r
 }
 
@@ -454,10 +514,12 @@ $timer.Add_Tick({
 	$shownFps = $null
 	$fps = Get-Fps
 	if ($fps) {
-		$shownFps = if ($fps.fgShown) { $fps.fgShown } elseif ($fps.fps) { $fps.fps } else { $null }
+		$fgOn = "$($ini['fglabel'])" -and "$($ini['fglabel'])" -notmatch '^(Sin|No) frame generation$'
+		$shownFps = if ($fps.fgShown -and $fgOn) { $fps.fgShown } elseif ($fps.fps) { $fps.fps } else { $null }
 		if ($fps.mean) {
 			$rows.Add(@('Frame', ("{0:N1} ms" -f $fps.mean), $cOrange))
 			if ($fps.key -ne $script:lastKey) {
+				$script:lastKeyAt = Get-Date
 				$script:lastKey = $fps.key
 				$script:ft.Add($fps.mean); $script:ftMax.Add($fps.max)
 				while ($script:ft.Count -gt 60) { $script:ft.RemoveAt(0); $script:ftMax.RemoveAt(0) }
@@ -474,7 +536,7 @@ $timer.Add_Tick({
 	# Reescalador en su color: DLSS (NVIDIA) verde, FSR (AMD) rojo, XeSS (Intel) azul.
 	$sc = Get-Scale $ini
 	if ($sc.kind) {
-		$col = switch ($sc.kind) { 'DLSS' { $cGreen } 'FSR' { $cRed } 'XeSS' { $cBlue } default { $cOrange } }
+		$col = switch ($sc.kind) { 'DLSS' { $cGreen } 'FSR' { $cRed } 'FSR 4' { $cRed } 'XeSS' { $cBlue } default { $cOrange } }
 		$rows.Add(@('Escala', ($(if ($sc.mode) { $sc.kind + $DOT + $sc.mode } else { $sc.kind })), $col))
 		if ($sc.res) { $rows.Add(@('Resol.', $sc.res, $col)) }
 		if ($sc.model) { $rows.Add(@('Modelo', $sc.model, $col)) }
@@ -497,12 +559,14 @@ $timer.Add_Tick({
 	$modo = "$($ini['soulsmodo'])"
 	if ($modo) { $rows.Add(@('', $modo, $cKhaki)) }
 	$script:rows = $rows.ToArray()
+	# (10-25) Si el log no trae una medida nueva en 3 s, no se deja el numero viejo quieto en pantalla.
+	if ($fps -and $fps.key -and $script:lastKeyAt -and ((Get-Date) - $script:lastKeyAt).TotalSeconds -gt 3) { $shownFps = $null }
 	$script:fpsText = $(if ($fps -and $shownFps) { "FPS $shownFps" } else { '' })
 	# FPS en el color del frame generation: verde NVIDIA, rojo AMD, blanco sin frame generation.
 	$script:fpsColor = if ($fgName -and $fgName -ne 'Sin frame generation' -and $fgName -ne 'No frame generation') { if ($fgNv) { $cGreen } else { $cRed } } else { $cWhite }
 	Measure-Layout
 	$label.Invalidate(); $graph.Invalidate()
 })
-$form.Add_Shown({ Measure-Layout; $label.Invalidate() })
+$form.Add_Shown({ try { [OvWin]::Apply($form.Handle) } catch { }; Measure-Layout; $label.Invalidate() })
 $timer.Start()
 [System.Windows.Forms.Application]::Run($form)
