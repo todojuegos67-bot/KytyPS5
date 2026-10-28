@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/bb/bb_analyze.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -668,6 +669,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
+    if (BB::Analyze::Enabled()) {
+        const auto& bb_img = texture_cache.GetImage(image_id);
+        BB::Analyze::OnPresent(bb_img.info.size.width, bb_img.info.size.height,
+                               bb_img.info.pixel_format, cpu_address);
+    }
 
     Frame* frame = GetRenderFrame();
 
