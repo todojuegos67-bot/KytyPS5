@@ -8,3 +8,6 @@
 # AMD FSR 4 model assets (fsr4_shaders/, src/local/fsr4-sr.h): SPIR-V and weights, never converted.
 fsr4_shaders/** binary
 fsr4_shaders/*.txt text
+# Add-to-Steam files and the owner's tested FidelityFX DLL: committed byte-identical, never converted.
+tools/local/steam/** -text
+tools/local/fsr3-mfg/prebuilt/** -text
