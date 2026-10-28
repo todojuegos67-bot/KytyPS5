@@ -477,6 +477,12 @@ function Start-Game {
 	if ($script:isNvidia -and $res[2] -eq 'dlss' -and (($chkLowEnd -and $chkLowEnd.Checked) -or ($chkSoulsLow -and $chkSoulsLow.Checked))) {
 		if (-not ($outH -eq 1080 -and [double]$res[1] -eq 1.0)) { $res = @($res[0], [math]::Round($outH / 720.0, 4), 'dlss', 0) }  # DLAA a 1080 (valido) se queda
 	}
+	# (10-28) DLSS en cualquier resolucion: solo acepta el 3D a 2160/1440/1256/1080/720; si la calidad elegida no cae en una,
+	# se usa la valida mas cercana por debajo (minimo 720) en vez de que el juego arranque sin DLSS.
+	if ($script:isNvidia -and $res[2] -eq 'dlss' -and [double]$res[1] -gt 0) {
+		$inH = [math]::Round($outH / [double]$res[1]); $ok = @(2160, 1440, 1256, 1080, 720)
+		if ($ok -notcontains $inH) { $pick = @($ok | Where-Object { $_ -le $inH -and $_ -le $outH } | Select-Object -First 1); if (-not $pick) { $pick = 720 }; $res = @($res[0], [math]::Round($outH / [double]$pick, 4), 'dlss', $res[3]) }
+	}
 	# (10-22) Modo 4K: el modo cinematico del juego a 4K nativo (sin reescalado).
 	# (10-22) El modo del juego siempre segun la salida: 4K = cinematico, lo demas = rendimiento (el juego guarda el
 	# ultimo en la partida y sin esto se quedaba en cinematico).
@@ -844,10 +850,8 @@ function Fill-Res {
 		# (10-22) Modo graficas de 8 GB: tambien sin reescalado (1080p nativo, sin XeSS ni FSR), lo primero de la lista.
 		$outH = Get-OutHeight
 		$lowAll = ($chkLowEnd -and $chkLowEnd.Checked) -or ($chkSoulsLow -and $chkSoulsLow.Checked)  # (10-25) ligero y low profile: todas las calidades de DLSS (Ultra rendimiento incluido)
-		if ($family -eq 'dlss' -and -not $lowAll) { $modes = @($modes | Where-Object { $h = [math]::Round($outH / $_[1]); $h -ge 1080 -or $h -eq 720 }) }
-		elseif ($family -in 'xess', 'fsr' -and $outH -lt 1440 -and -not $lowAll) { $modes = @($modes | Where-Object { $outH / $_[1] -ge 719 }) }
-		elseif ($family -eq 'fsr4') { $modes = @($modes | Where-Object { $outH / $_[1] -ge 359 }) }  # (10-28) FSR 4: el 3D a 360 como minimo (su modelo sale al tamano de la pantalla: en 1080p Equilibrado 635, Rendimiento 540, Ultra rendimiento 360)
-		if ($family -eq 'juego' -and $outH -lt 1440) { $modes = @() }
+		if ($family -eq 'fsr4') { $modes = @($modes | Where-Object { $outH / $_[1] -ge 359 }) }  # FSR 4: el 3D a 360 como minimo (limite del modelo)
+		# (10-28) todas las calidades de reescalado en cualquier resolucion (720p, 1080p, 1440p, 4K)
 		if ($modes.Count -eq 0) { continue }
 		if ($titles.ContainsKey($family)) { $shown += , @($titles[$family], 0, '', 0) }
 		foreach ($m in $modes) { $shown += , $m }
