@@ -95,6 +95,7 @@ struct {
 // ramped in / out (vis) when one enters or leaves the nearest 32: the visibility itself is never smoothed here.
 struct Track {
 	float    pos[3] {}, fwd[3] {}, tan_half = 0, far_d = 0, fade = 0, vis = 0, d = 0;
+	uint32_t miss = 0;             // (ds-rt-shadow) frames since a scan last had it
 	float    cap_w = 0;            // (ds-rt-shadow) its weight in the per-level light cap, ramped (no pop at the cap's edge)
 	bool     point = false, used = false, hit = false, in_cap = false;
 };
@@ -163,10 +164,14 @@ void UpdateTracks(const std::vector<const RtLocal::LiveLight*>& in, const double
 	}
 	for (auto& t: g_tracks) {
 		if (!t.used) continue;
-		t.vis = snap ? (t.hit ? 1.0f : 0.0f) : std::clamp(t.vis + (t.hit ? 0.05f : -0.05f), 0.0f, 1.0f);
+		// (ds-rt-shadow 10-28) a light missing from a scan keeps its shadow for 90 frames (the scans drop and re-find the
+		// same lamps: entered / left 12-24 per 10 s), then fades over ~0.5 s; a new one fades in over ~0.5 s
+		t.miss = t.hit ? 0u : t.miss + 1u;
+		const bool present = t.hit || t.miss < 90u;
+		t.vis = snap ? (present ? 1.0f : 0.0f) : std::clamp(t.vis + (present ? 1.0f / 30.0f : -1.0f / 30.0f), 0.0f, 1.0f);
 		const double dx = t.pos[0] - cam[0], dy = t.pos[1] - cam[1], dz = t.pos[2] - cam[2];
 		t.d = static_cast<float>(std::sqrt(dx * dx + dy * dy + dz * dz));
-		if (!t.hit && t.vis <= 0.0f) {
+		if (!present && t.vis <= 0.0f) {
 			RtFlicker::Cause(RtFlicker::Lights, "lights left");
 			t = {};
 		}
@@ -181,14 +186,14 @@ void SelectCapped(std::vector<const Track*>& sent, size_t cap, bool snap) {
 	for (auto& t: g_tracks)
 		if (t.used && t.vis > 0.0f && t.fade > 0.0f) cand.push_back(&t);
 	std::sort(cand.begin(), cand.end(), [](const Track* a, const Track* b) {
-		return (a->in_cap ? a->d * 0.8f : a->d) < (b->in_cap ? b->d * 0.8f : b->d);
+		return (a->in_cap ? a->d * 0.5f : a->d) < (b->in_cap ? b->d * 0.5f : b->d); // (10-28: twice as near to take a place)
 	});
 	for (size_t i = 0; i < cand.size(); ++i) {
 		Track* t        = cand[i];
 		const bool was  = t->in_cap;
 		t->in_cap       = i < cap;
 		if (was != t->in_cap && !snap) RtFlicker::Cause(RtFlicker::Lights, "cap swaps");
-		t->cap_w = snap ? (t->in_cap ? 1.0f : 0.0f) : std::clamp(t->cap_w + (t->in_cap ? 0.05f : -0.05f), 0.0f, 1.0f);
+		t->cap_w = snap ? (t->in_cap ? 1.0f : 0.0f) : std::clamp(t->cap_w + (t->in_cap ? 1.0f / 30.0f : -1.0f / 30.0f), 0.0f, 1.0f);
 	}
 	for (auto& t: g_tracks)
 		if (!t.used || t.vis <= 0.0f || t.fade <= 0.0f) t.in_cap = false;
