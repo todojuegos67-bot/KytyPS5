@@ -384,7 +384,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "[Configurador]\n"
 	  << "; 0: el configurador de hardware se muestra al arrancar\n"
 	  << "configurado=" << b(s.configured) << "\n"
-	  << "; Mejoras para equipos de 16 GB de RAM: perfil de 16 GB + vaciado RAM (solo en PCs de 20 GB de RAM o menos)\n"
+	  << "; Mejoras para equipos de 16 GB de RAM: perfil de 16 GB (solo en PCs de 20 GB de RAM o menos)\n"
 	  << "mejoras_16gb=" << b(s.ram16_boost) << "\n\n"
 	  << "[Interfaz]\n"
 	  << "; Metricas en pantalla: 0 no, 1 FPS, 2 FPS + detalle\n"
@@ -518,12 +518,6 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	for (const char* k: {"KYTY_MEMCUT", "KYTY_REBAR_STAGING", "KYTY_STAGING_RING_MB", "KYTY_RAM_TARGET_MB", "KYTY_RAM_FLUSH_SECONDS",
 	                     "KYTY_RAM_FLUSH_MB", "KYTY_RAM_FLUSH_LEVEL"})
 		sets.emplace_back(k, "");
-	// (10-28) Mejoras para equipos de 16 GB de RAM: the launcher's "perfil 16 GB + vaciado RAM": the RAM flush every 5 s
-	// (up to 2 GB of what the emulator can rebuild and what the game freed; KYTY_RAM_FLUSH_*, ram-guard.cpp).
-	if (low_ram) {
-		sets.emplace_back("KYTY_RAM_FLUSH_SECONDS", "5");
-		sets.emplace_back("KYTY_RAM_FLUSH_MB", "2048");
-	}
 	if (s.safe_gpu) sets.emplace_back("KYTY_COMPUTE_CHAIN", "0");
 	// Anti-Lag (10-24): with the AMD frame generation, AMD's Anti-Lag 2 on an AMD card (default) or ours (2 frames queued, Ultra 1);
 	// the fixed Souls modes always ours in Ultra. With NVIDIA's frame generation, Reflex (default) or ours with Reflex off.
@@ -1062,7 +1056,7 @@ std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
 	s->texture_sharpness = "1";
 	s->motion_blur = s->dof = s->vignette = s->bloom = s->eye_adapt = true;
 	s->pure_game = false;
-	// The RAM (16 GB or less: the launcher's 16 GB profile and RAM flush; textures and distance at most Alto).
+	// The RAM (16 GB or less: the launcher's 16 GB profile; textures and distance at most Alto).
 	s->ram16_boost = pc.ram_gb > 0 && pc.ram_gb <= 20;
 	if (s->ram16_boost) {
 		if (s->texture_reduce == "0") s->texture_reduce = "h";
@@ -1107,7 +1101,7 @@ std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
 		rt += ".";
 	}
 	why.push_back(rt);
-	if (s->ram16_boost) why.push_back("RAM " + std::to_string(pc.ram_gb) + " GB: activadas las mejoras para equipos de 16 GB (perfil de memoria y vaciado de RAM); texturas y distancia como mucho en Alto.");
+	if (s->ram16_boost) why.push_back("RAM " + std::to_string(pc.ram_gb) + " GB: activadas las mejoras para equipos de 16 GB (perfil de memoria); texturas y distancia como mucho en Alto.");
 	else why.push_back("RAM " + std::to_string(pc.ram_gb) + " GB: no hacen falta las mejoras para equipos de 16 GB.");
 	const double fps = 1000.0 / ms;
 	std::string  exp = std::string("Esperado: unos ") + F1(fps) + " FPS de media";

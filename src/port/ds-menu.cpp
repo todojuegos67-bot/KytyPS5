@@ -1218,11 +1218,11 @@ void Draw(float width, float height) {
 						g_desc_text  = "Muestra tu gráfica, procesador, RAM y monitor, y elige los ajustes con mejor rendimiento para tu equipo.";
 					}
 					ImGui::Spacing();
-					// (10-28) Mejoras para equipos de 16 GB de RAM: the launcher's 16 GB profile + RAM flush, on PCs of 20 GB or less.
+					// (10-28) Mejoras para equipos de 16 GB de RAM: the launcher's 16 GB profile, on PCs of 20 GB or less.
 					const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
 					ImGui::BeginDisabled(!small);
 					CheckRow("Mejoras para equipos de 16 GB de RAM", s.ram16_boost != g_rt.launched.ram16_boost, s.ram16_boost,
-					         "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria) y vaciado de RAM cada 5 s (devuelve a Windows hasta 2 GB que el emulador puede rehacer y la que el juego ya soltó). Solo en PCs de 20 GB de RAM o menos. No cambia los gráficos.");
+					         "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria). Solo en PCs de 20 GB de RAM o menos. No cambia los gráficos.");
 					ImGui::EndDisabled();
 					s.profile16 = LowRam(s, g_rt.pc);
 					if (!small) ImGui::TextColored(kDim, "RAM %d GB: no hacen falta (solo en PCs de 20 GB o menos).", g_rt.pc.ram_gb);
