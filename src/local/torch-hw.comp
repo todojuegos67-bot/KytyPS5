@@ -1,0 +1,103 @@
+#version 460
+#extension GL_EXT_ray_query : require
+// KYTY_TORCH_HW=1 ("Luz de antorchas RT: Hibrido", torch.cpp; needs KYTY_HWRT=1 and the scene TLAS, hwrt-scene.cpp):
+// the hardware fallback of torch.comp's screen-space shadow (mode 4). Only where that march could not tell (a sample
+// off-screen, or behind a surface much nearer than the ray: the occluder is not in the depth buffer), one ray a pixel
+// through the scene TLAS toward the light picked there (by its inconclusive weight), jittered on the flame's disc.
+// The result may only DARKEN, and only the inconclusive share: ratio' = max(ratio - share * hit, ratio * 0.15), so a
+// wrong or missing TLAS triangle can never add light (no flashes); the temporal pass then filters it like the rest.
+// In: src_tex = mode 4's (ratio, W, pick + share, view z). Out: the same with the ratio corrected.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D src_tex;
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2, rgba16f) uniform writeonly image2D out_img;
+layout(std430, binding = 3) buffer Frame {
+	vec4 view_rot[3];
+	vec4 hp;
+	uint stats[16];
+	vec4 lights[32];
+};
+layout(binding = 4) uniform accelerationStructureEXT tlas;
+
+layout(push_constant) uniform Push {
+	vec4  ivp[4];    // clip -> world (rows), the TLAS camera
+	vec4  proj;      // M[0], M[5], M[8], M[9] (torch.comp's view space)
+	vec4  depth_map; // M[10], M[14], M[11], M[15]
+	vec4  size;      // render w, h, y sign of the clip (hw-lights' convention: -1), -
+	ivec4 misc;      // frame, flags (1: torch.comp's row 0 = NDC y +1), -, -
+} push;
+
+float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+bool  IsSky(float d) { return d <= 1e-7 || d >= 0.9999999; }
+
+vec3 WorldPos(vec2 uv, float d) {
+	vec4 c = vec4(uv.x * 2.0 - 1.0, push.size.z * (uv.y * 2.0 - 1.0), d, 1.0);
+	vec4 w = vec4(dot(push.ivp[0], c), dot(push.ivp[1], c), dot(push.ivp[2], c), dot(push.ivp[3], c));
+	return w.xyz / (abs(w.w) > 1e-20 ? w.w : 1e-20);
+}
+// torch.comp's view position -> its texture uv and device depth (false: behind the camera)
+bool ViewToUvD(vec3 v, out vec2 uv, out float d) {
+	float w = v.z * push.depth_map.z + push.depth_map.w;
+	uv = vec2(0), d = 0.0;
+	if (w <= 1e-5) return false;
+	vec2 nd = vec2((v.x * push.proj.x + v.z * push.proj.z) / w, (v.y * push.proj.y + v.z * push.proj.w) / w);
+	if ((push.misc.y & 1) != 0) nd.y = -nd.y;
+	uv = nd * 0.5 + 0.5;
+	float den = v.z * push.depth_map.z + push.depth_map.w;
+	d = (push.depth_map.y + v.z * push.depth_map.x) / den;
+	return true;
+}
+
+void main() {
+	ivec2 p  = ivec2(gl_GlobalInvocationID.xy);
+	vec2  rs = push.size.xy;
+	if (any(greaterThanEqual(p, ivec2(rs)))) return;
+	vec4  s     = texelFetch(src_tex, p, 0);
+	float share = fract(s.z);
+	int   k     = int(floor(s.z + 1e-3));
+	bool  smp   = (p.x & 3) == 0 && (p.y & 3) == 0;
+	if (s.y <= 0.0 || share <= 0.02 || k < 0 || k > 7) {
+		imageStore(out_img, p, s);
+		return;
+	}
+	vec2  uv = (vec2(p) + 0.5) / rs;
+	float d  = textureLod(depth_tex, uv, 0).r;
+	vec4  l3 = lights[k * 4 + 3];
+	vec2  luv;
+	float ld;
+	if (IsSky(d) || lights[k * 4].w <= 0.0 || !ViewToUvD(l3.xyz, luv, ld)) {
+		imageStore(out_img, p, s);
+		return;
+	}
+	vec3  P   = WorldPos(uv, d);
+	vec3  Lc  = WorldPos(luv, ld);
+	int   fr  = push.misc.x;
+	// a point on the flame's disc
+	vec3  ax  = normalize(Lc - P);
+	vec3  b1  = normalize(cross(ax, abs(ax.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+	vec3  b2  = cross(ax, b1);
+	float a   = 6.2831853 * fract(Ign(vec2(p) + 7.31 * float(fr & 63)));
+	float r   = 0.1 * sqrt(fract(Ign(vec2(p.y, p.x) + 3.7 * float(fr & 63)) + 0.25));
+	vec3  tgt = Lc + (b1 * cos(a) + b2 * sin(a)) * r;
+	float z   = s.w;
+	// the origin lifted off the surface toward the light (no world normal here) by ~2 % of the depth's agreement
+	vec3  dv   = tgt - P;
+	float len  = length(dv);
+	vec3  dir  = dv / max(len, 1e-4);
+	float tmin = 0.05 + 0.004 * z;
+	float tmax = len - 0.35; // (the torch's own bracket / brazier mesh)
+	if (tmax <= tmin) {
+		imageStore(out_img, p, s);
+		return;
+	}
+	if (smp) atomicAdd(stats[8], 1u);
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xff, P, tmin, dir, tmax);
+	while (rayQueryProceedEXT(rq)) {}
+	bool hit = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+	if (hit && smp) atomicAdd(stats[9], 1u);
+	float ratio = s.x;
+	if (hit) ratio = max(ratio - share, ratio * 0.15);
+	imageStore(out_img, p, vec4(ratio, s.y, s.z, s.w));
+}

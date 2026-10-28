@@ -375,6 +375,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${sharpen_header}")
 
+# KYTY_UPSCALER=fsr4: the depth copy and exposure texture the FSR 4 model reads (src/local/fsr4-sr.cpp).
+set(fsr4_prep_source "${KYTY_SOURCE_DIR}/local/fsr4-prep.comp")
+set(fsr4_prep_spv "${gpu_tiler_generated_dir}/fsr4_prep.spv")
+set(fsr4_prep_header "${gpu_tiler_generated_dir}/fsr4_prep_spv.h")
+add_custom_command(
+	OUTPUT "${fsr4_prep_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${fsr4_prep_spv}" "${fsr4_prep_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${fsr4_prep_spv} -DOUTPUT=${fsr4_prep_header}
+	        -DSYMBOL=FSR4_PREP_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${fsr4_prep_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${fsr4_prep_header}")
+
 # KYTY_TAA_REPLACE=upscaler: the raw frame into the TAA's output, its alpha kept (src/local/frame-gen.cpp).
 set(taa_bypass_source "${KYTY_SOURCE_DIR}/local/taa-bypass.comp")
 set(taa_bypass_spv "${gpu_tiler_generated_dir}/taa_bypass.spv")
@@ -422,6 +438,22 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${gtao_header}")
+
+# KYTY_AO (ao-1028): the screen-space ambient occlusion written from scratch (src/local/rt-ao.cpp).
+set(rt_ao_source "${KYTY_SOURCE_DIR}/local/rt-ao.comp")
+set(rt_ao_spv "${gpu_tiler_generated_dir}/rt_ao.spv")
+set(rt_ao_header "${gpu_tiler_generated_dir}/rt_ao_spv.h")
+add_custom_command(
+	OUTPUT "${rt_ao_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rt_ao_spv}" "${rt_ao_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_ao_spv} -DOUTPUT=${rt_ao_header}
+	        -DSYMBOL=RT_AO_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rt_ao_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rt_ao_header}")
 
 # KYTY_SSR: screen-space reflections before the PS5 Pro path's upscaler (src/local/frame-gen.cpp).
 set(ssr_source "${KYTY_SOURCE_DIR}/local/ssr.comp")
@@ -515,6 +547,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${hwlights_header}")
+# KYTY_HWRT_WATER: ray-traced mirror reflections on water / puddles through the scene TLAS (src/local/rt-water.cpp).
+set(rtwater_source "${KYTY_SOURCE_DIR}/local/rt-water.comp")
+set(rtwater_spv "${gpu_tiler_generated_dir}/rtwater.spv")
+set(rtwater_header "${gpu_tiler_generated_dir}/rtwater_spv.h")
+add_custom_command(
+	OUTPUT "${rtwater_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rtwater_spv}" "${rtwater_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rtwater_spv} -DOUTPUT=${rtwater_header}
+	        -DSYMBOL=RTWATER_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rtwater_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rtwater_header}")
 # KYTY_RT_FLICKER: the RT passes' flicker self-check (src/local/rt-flicker.cpp).
 set(rtflicker_source "${KYTY_SOURCE_DIR}/local/rt-flicker.comp")
 set(rtflicker_spv "${gpu_tiler_generated_dir}/rtflicker.spv")
@@ -562,6 +609,53 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${godrays_header}")
 
+# KYTY_TORCH / KYTY_TORCH_FLARE: firelight + lens flare from torches, screen-space (src/local/torch.cpp).
+set(torch_source "${KYTY_SOURCE_DIR}/local/torch.comp")
+set(torch_spv "${gpu_tiler_generated_dir}/torch.spv")
+set(torch_header "${gpu_tiler_generated_dir}/torch_spv.h")
+add_custom_command(
+	OUTPUT "${torch_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${torch_spv}" "${torch_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${torch_spv} -DOUTPUT=${torch_header}
+	        -DSYMBOL=TORCH_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${torch_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${torch_header}")
+# KYTY_TORCH_HW: the torch light's hardware-RT occlusion fallback through the scene TLAS (src/local/torch.cpp).
+set(torchhw_source "${KYTY_SOURCE_DIR}/local/torch-hw.comp")
+set(torchhw_spv "${gpu_tiler_generated_dir}/torchhw.spv")
+set(torchhw_header "${gpu_tiler_generated_dir}/torchhw_spv.h")
+add_custom_command(
+	OUTPUT "${torchhw_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${torchhw_spv}" "${torchhw_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${torchhw_spv} -DOUTPUT=${torchhw_header}
+	        -DSYMBOL=TORCHHW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${torchhw_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${torchhw_header}")
+
+# KYTY_HWRT_VOLSHADOW: TLAS-shadowed god-ray march (src/local/volshadow.cpp).
+set(volshadow_source "${KYTY_SOURCE_DIR}/local/volshadow.comp")
+set(volshadow_spv "${gpu_tiler_generated_dir}/volshadow.spv")
+set(volshadow_header "${gpu_tiler_generated_dir}/volshadow_spv.h")
+add_custom_command(
+	OUTPUT "${volshadow_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${volshadow_spv}" "${volshadow_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${volshadow_spv} -DOUTPUT=${volshadow_header}
+	        -DSYMBOL=VOLSHADOW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${volshadow_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${volshadow_header}")
+
 # KYTY_HWRT_PARTICLES (hwrt3p): emissive particle light with ray-query shadows into the KYTY_HWRT TLAS (src/local/hwrt-particles.cpp).
 set(hwrt_particles_source "${KYTY_SOURCE_DIR}/local/hwrt-particles.comp")
 set(hwrt_particles_spv "${gpu_tiler_generated_dir}/hwrt_particles.spv")
@@ -577,6 +671,47 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${hwrt_particles_header}")
+
+# KYTY_RT_CAPTURE: the RT data capture's readback shader, float and uint views (src/local/rt-capture.cpp).
+set(rt_capture_source "${KYTY_SOURCE_DIR}/local/rt-capture.comp")
+foreach(kind f u)
+	set(rt_capture_spv_${kind} "${gpu_tiler_generated_dir}/rt_capture_${kind}.spv")
+	set(rt_capture_header_${kind} "${gpu_tiler_generated_dir}/rt_capture_${kind}_spv.h")
+	if(kind STREQUAL "u")
+		set(rt_capture_def "-DKYTY_UINT")
+		set(rt_capture_sym "RT_CAPTURE_U_SPV")
+	else()
+		set(rt_capture_def "-DKYTY_FLOAT")
+		set(rt_capture_sym "RT_CAPTURE_F_SPV")
+	endif()
+	add_custom_command(
+		OUTPUT "${rt_capture_header_${kind}}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os ${rt_capture_def}
+		        -o "${rt_capture_spv_${kind}}" "${rt_capture_source}"
+		COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_capture_spv_${kind}} -DOUTPUT=${rt_capture_header_${kind}}
+		        -DSYMBOL=${rt_capture_sym} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		DEPENDS "${rt_capture_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		VERBATIM
+	)
+	list(APPEND kyty_emulator_src "${rt_capture_header_${kind}}")
+endforeach()
+
+# KYTY_HWRT_CONTACT: ray-traced contact shadows with ray queries into the KYTY_HWRT TLAS (src/local/rt-contact.cpp).
+set(rt_contact_source "${KYTY_SOURCE_DIR}/local/rt-contact.comp")
+set(rt_contact_spv "${gpu_tiler_generated_dir}/rt_contact.spv")
+set(rt_contact_header "${gpu_tiler_generated_dir}/rt_contact_spv.h")
+add_custom_command(
+	OUTPUT "${rt_contact_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rt_contact_spv}" "${rt_contact_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_contact_spv} -DOUTPUT=${rt_contact_header}
+	        -DSYMBOL=RT_CONTACT_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rt_contact_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rt_contact_header}")
 
 # KYTY_RT_SHADOWS: screen-space ray-traced sun shadows before the upscaler (src/local/frame-gen.cpp).
 set(cshadow_source "${KYTY_SOURCE_DIR}/local/cshadow.comp")
@@ -624,7 +759,7 @@ add_custom_command(
 list(APPEND kyty_emulator_src "${rtsun_hw_header}")
 # KYTY_HWRT (src/local/hwrt-scene.cpp): the scene capture's world-space gather and the ray query debug view.
 # (hwrt3, KYTY_HWRT_REFL_MATERIAL: albedo, albedo_array: a base-colour texture downsampled into the albedo array)
-foreach(hwrt_shader gather debug debug11 albedo albedo_array)
+foreach(hwrt_shader gather debug debug11 gi albedo albedo_array)
 	string(TOUPPER "${hwrt_shader}" hwrt_upper)
 	set(hwrt_source "${KYTY_SOURCE_DIR}/local/hwrt-${hwrt_shader}.comp")
 	set(hwrt_defines "")
@@ -737,16 +872,32 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-scene.h"
 	"${KYTY_SOURCE_DIR}/local/hwrt-scene.cpp"
+	"${KYTY_SOURCE_DIR}/local/hwrt-gi.h"
+	"${KYTY_SOURCE_DIR}/local/rt-ao.h"
+	"${KYTY_SOURCE_DIR}/local/rt-ao.cpp"
+	"${KYTY_SOURCE_DIR}/local/hwrt-gi.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.h"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.cpp"
 	"${KYTY_SOURCE_DIR}/local/hw-lights.h"
 	"${KYTY_SOURCE_DIR}/local/hw-lights.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-contact.h"
+	"${KYTY_SOURCE_DIR}/local/rt-contact.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-capture.h"
+	"${KYTY_SOURCE_DIR}/local/rt-capture.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-water.h"
+	"${KYTY_SOURCE_DIR}/local/rt-water.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-flicker.h"
 	"${KYTY_SOURCE_DIR}/local/rt-flicker.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-softsun.h"
+	"${KYTY_SOURCE_DIR}/local/rt-softsun.cpp"
 	"${KYTY_SOURCE_DIR}/local/shine.h"
 	"${KYTY_SOURCE_DIR}/local/shine.cpp"
 	"${KYTY_SOURCE_DIR}/local/godrays.h"
 	"${KYTY_SOURCE_DIR}/local/godrays.cpp"
+	"${KYTY_SOURCE_DIR}/local/torch.h"
+	"${KYTY_SOURCE_DIR}/local/torch.cpp"
+	"${KYTY_SOURCE_DIR}/local/volshadow.h"
+	"${KYTY_SOURCE_DIR}/local/volshadow.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-particles.h"
 	"${KYTY_SOURCE_DIR}/local/hwrt-particles.cpp"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"
@@ -756,6 +907,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/anti-lag.h"
 	"${KYTY_SOURCE_DIR}/local/anti-lag.cpp"
 	"${KYTY_SOURCE_DIR}/local/xess-sr.cpp"
+	"${KYTY_SOURCE_DIR}/local/fsr4-sr.h"
+	"${KYTY_SOURCE_DIR}/local/fsr4-sr.cpp"
 	"${KYTY_SOURCE_DIR}/local/sync-stats.h"
 	"${KYTY_SOURCE_DIR}/local/sync-stats.cpp"
 	"${KYTY_SOURCE_DIR}/local/debug-snapshot.h"

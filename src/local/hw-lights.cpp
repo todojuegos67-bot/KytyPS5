@@ -15,11 +15,13 @@
 // darkening over the screen exceeds it turns the pass off for 5 s, logged; 0.25).
 // Every 10 s: "HWRTLIGHTS: stats" with lights used, darkened pixels, their mean darkening and the GPU ms.
 #include "local/hw-lights.h"
+#include "local/env-level.h"
 
 #include "graphics/presentation/videoOut.h"
 #include "gpu_tiler_shaders/hwlights_spv.h"
 #include "local/hwrt-scene.h"
 #include "local/rt-local-lights.h"
+#include "local/rt-flicker.h"
 
 #include <algorithm>
 #include <array>
@@ -76,14 +78,133 @@ struct {
 	uint64_t                written = 0, read = 0;
 	double                  sum_ms = 0.0, max_ms = 0.0;
 	uint32_t                samples = 0;
-	std::array<uint32_t, 12> stat_last {}, guard_last {};
+	std::array<uint32_t, 32> stat_last {}, guard_last {};
 	uint64_t                frames = 0, frames_lit = 0, lights_sum = 0, no_tlas = 0, stale_tlas = 0;
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now(), last_guard = last_log, guard_until {};
 	bool                    said_on = false;
+	bool                    idle = false; // (ds-rt-shadow) no pixel traced in the last 1 s window: probe only
+	uint64_t                idle_frames = 0;
+	uint32_t                guard_last_w = 0;
 	uint64_t                skipped = 0;
 	const char*             skip_why = nullptr;
 	std::chrono::steady_clock::time_point last_skip_log = std::chrono::steady_clock::now();
 } g_hl;
+
+// (lampshadow-1027) The lights as sent: tracked across frames, their position / forward / reach eased toward each new
+// scan (a flame-carried light or a rescan's jitter moves the shadow smoothly, not in 30-flip steps) and their weight
+// ramped in / out (vis) when one enters or leaves the nearest 32: the visibility itself is never smoothed here.
+struct Track {
+	float    pos[3] {}, fwd[3] {}, tan_half = 0, far_d = 0, fade = 0, vis = 0, d = 0;
+	uint32_t miss = 0;             // (ds-rt-shadow) frames since a scan last had it
+	float    cap_w = 0;            // (ds-rt-shadow) its weight in the per-level light cap, ramped (no pop at the cap's edge)
+	bool     point = false, used = false, hit = false, in_cap = false;
+};
+std::array<Track, 64> g_tracks {};
+uint64_t              g_track_jumps = 0;
+
+// (ds-rt-shadow) The scan's lights matched to the tracks one to one, nearest pairs first (a global greedy match). The
+// per-light greedy in scan order let a light take its neighbour's track when the scan listed it first (two lamps within
+// 0.75 m, a torch and its brazier): both tracks jumped, "light rescans moved 176" in 10 s at the 10-27 lamps, the one
+// window with lit pixels, its RTFLICKER 18 % of the touched points, max jump 143 %.
+void UpdateTracks(const std::vector<const RtLocal::LiveLight*>& in, const double* cam, bool snap) {
+	for (auto& t: g_tracks) t.hit = false;
+	struct Pair {
+		float    d2;
+		uint32_t li, ti;
+	};
+	std::vector<Pair> pairs;
+	for (uint32_t li = 0; li < in.size(); ++li) {
+		const auto* l   = in[li];
+		const float tol = std::max(0.75f, 0.1f * l->far_d);
+		for (uint32_t ti = 0; ti < g_tracks.size(); ++ti) {
+			const auto& t = g_tracks[ti];
+			if (!t.used || t.point != l->point) continue;
+			const float dx = t.pos[0] - l->pos[0], dy = t.pos[1] - l->pos[1], dz = t.pos[2] - l->pos[2];
+			const float d2 = dx * dx + dy * dy + dz * dz;
+			if (d2 <= tol * tol) pairs.push_back({d2, li, ti});
+		}
+	}
+	std::sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) { return a.d2 < b.d2; });
+	std::vector<int32_t> match(in.size(), -1);
+	for (const auto& p: pairs)
+		if (match[p.li] < 0 && !g_tracks[p.ti].hit) match[p.li] = static_cast<int32_t>(p.ti), g_tracks[p.ti].hit = true;
+	for (auto& t: g_tracks) t.hit = false;
+	for (uint32_t li = 0; li < in.size(); ++li) {
+		const auto* l        = in[li];
+		const float fade_out = 1.0f; // (ds-rt-shadow 10-28: the miss ramp (vis) fades a light that is no longer scanned)
+		const float fade_in  = std::clamp(static_cast<float>(l->since) / 30.0f, 0.0f, 1.0f);
+		const float fade     = fade_out * fade_in;
+		Track*      best     = match[li] >= 0 ? &g_tracks[match[li]] : nullptr;
+		float       bd       = 0.0f;
+		if (best != nullptr) {
+			const float dx = best->pos[0] - l->pos[0], dy = best->pos[1] - l->pos[1], dz = best->pos[2] - l->pos[2];
+			bd             = dx * dx + dy * dy + dz * dz;
+			if (bd > 0.09f) ++g_track_jumps, RtFlicker::Cause(RtFlicker::Lights, "light rescans moved > 0.3 m");
+		} else {
+			for (auto& t: g_tracks)
+				if (!t.used) { best = &t; break; }
+			if (best == nullptr) continue;
+			*best = {};
+			best->used = true, best->point = l->point;
+			for (int k = 0; k < 3; ++k) best->pos[k] = l->pos[k], best->fwd[k] = l->fwd[k];
+			best->tan_half = l->tan_half, best->far_d = l->far_d, best->fade = fade;
+			RtFlicker::Cause(RtFlicker::Lights, "lights entered");
+		}
+		// (all2-1027) a dead band: a rescan within 0.3 m (the apex's jitter) does not move the light at all; a real move
+		// is followed slowly (~1 s); the inputs are constant while the light holds still
+		const float a = snap ? 1.0f : bd < 0.09f ? 0.0f : 0.03f;
+		for (int k = 0; k < 3; ++k) best->pos[k] += (l->pos[k] - best->pos[k]) * a, best->fwd[k] += (l->fwd[k] - best->fwd[k]) * a;
+		const float fl = std::sqrt(best->fwd[0] * best->fwd[0] + best->fwd[1] * best->fwd[1] + best->fwd[2] * best->fwd[2]);
+		if (fl > 1e-6f)
+			for (float& v: best->fwd) v /= fl;
+		best->tan_half += (l->tan_half - best->tan_half) * a;
+		best->far_d += (l->far_d - best->far_d) * a;
+		best->fade += (fade - best->fade) * (snap ? 1.0f : 0.05f);
+		best->hit = true;
+	}
+	for (auto& t: g_tracks) {
+		if (!t.used) continue;
+		// (ds-rt-shadow 10-28) a light missing from a scan keeps its shadow for 90 frames (the scans drop and re-find the
+		// same lamps: entered / left 12-24 per 10 s), then fades over ~0.5 s; a new one fades in over ~0.5 s
+		t.miss = t.hit ? 0u : t.miss + 1u;
+		const bool present = t.hit || t.miss < 90u;
+		t.vis = snap ? (present ? 1.0f : 0.0f) : std::clamp(t.vis + (present ? 1.0f / 30.0f : -1.0f / 30.0f), 0.0f, 1.0f);
+		const double dx = t.pos[0] - cam[0], dy = t.pos[1] - cam[1], dz = t.pos[2] - cam[2];
+		t.d = static_cast<float>(std::sqrt(dx * dx + dy * dy + dz * dz));
+		if (!present && t.vis <= 0.0f) {
+			RtFlicker::Cause(RtFlicker::Lights, "lights left");
+			t = {};
+		}
+	}
+}
+
+// (ds-rt-shadow) The per-level cap with hysteresis: the lights in it last frame keep their place unless another is 25 %
+// nearer, and a light entering / leaving it ramps its weight over 20 frames. A hard nearest-N cut ("lights 16.00 a frame"
+// at the 10-27 lamps: the cap full) dropped and added whole shadows as the eased distances crossed.
+void SelectCapped(std::vector<const Track*>& sent, size_t cap, bool snap) {
+	std::vector<Track*> cand;
+	for (auto& t: g_tracks)
+		if (t.used && t.vis > 0.0f && t.fade > 0.0f) cand.push_back(&t);
+	std::sort(cand.begin(), cand.end(), [](const Track* a, const Track* b) {
+		return (a->in_cap ? a->d * 0.5f : a->d) < (b->in_cap ? b->d * 0.5f : b->d); // (10-28: twice as near to take a place)
+	});
+	for (size_t i = 0; i < cand.size(); ++i) {
+		Track* t        = cand[i];
+		const bool was  = t->in_cap;
+		t->in_cap       = i < cap;
+		if (was != t->in_cap && !snap) RtFlicker::Cause(RtFlicker::Lights, "cap swaps");
+		t->cap_w = snap ? (t->in_cap ? 1.0f : 0.0f) : std::clamp(t->cap_w + (t->in_cap ? 1.0f / 30.0f : -1.0f / 30.0f), 0.0f, 1.0f);
+	}
+	for (auto& t: g_tracks)
+		if (!t.used || t.vis <= 0.0f || t.fade <= 0.0f) t.in_cap = false;
+	sent.clear();
+	for (const Track* t: cand)
+		if (t->cap_w > 0.0f && sent.size() < MaxLights) sent.push_back(t);
+	// (ds-rt-shadow 10-28) sent in a fixed order (the track's slot), not by distance: the trace picks a light per pixel from
+	// the weights' running sum in list order, so a reordering (a light entering, two distances crossing) re-picked the light
+	// of every pixel at once and its 1-sample occlusion flipped (20261028-001843: max jump 552-567 % on cap swaps / entries)
+	std::sort(sent.begin(), sent.end(), [](const Track* a, const Track* b) { return a < b; });
+}
 
 float EnvFloat(const char* name, float fallback, float lo, float hi) {
 	const char* value = std::getenv(name);
@@ -243,13 +364,13 @@ bool EnsurePipeline(GraphicContext& graphics) {
 		return false;
 	}
 	g_hl.light_mapped = static_cast<uint8_t*>(mapped.pMappedData);
-	buffer.size       = 64;
+	buffer.size       = 128;
 	if (vmaCreateBuffer(graphics.allocator, &buffer, &host, &g_hl.stat_buf, &g_hl.stat_mem, &mapped) != VK_SUCCESS) {
 		g_hl.stat_buf = VK_NULL_HANDLE;
 		return false;
 	}
 	g_hl.stat_mapped = static_cast<volatile uint32_t*>(mapped.pMappedData);
-	for (int i = 0; i < 16; ++i) g_hl.stat_mapped[i] = 0;
+	for (int i = 0; i < 32; ++i) g_hl.stat_mapped[i] = 0;
 	(void)vmaFlushAllocation(graphics.allocator, g_hl.stat_mem, 0, VK_WHOLE_SIZE);
 	vk::QueryPoolCreateInfo query {};
 	query.queryType  = vk::QueryType::eTimestamp;
@@ -261,7 +382,11 @@ bool EnsurePipeline(GraphicContext& graphics) {
 }
 
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D extent, int level) {
-	const vk::Extent2D trace = level >= 2 ? extent : vk::Extent2D {std::max(extent.width / 2, 1u), std::max(extent.height / 2, 1u)};
+	// (all2-1027) the trace's pixel budget, whatever the render size (a 2880x1620 render traced at full size cost 9.7 ms):
+	// Bajo / Medio ~0.23 M (640x360 at 16:9), Alto ~0.92 M (1280x720); never above the render size
+	const double budget = level >= 3 ? 921600.0 : 230400.0;
+	const double scale  = std::min(1.0, std::sqrt(budget / std::max(1.0, double(extent.width) * double(extent.height))));
+	const vk::Extent2D trace {std::max(static_cast<uint32_t>(extent.width * scale), 1u), std::max(static_cast<uint32_t>(extent.height * scale), 1u)};
 	if (g_hl.out.image != VK_NULL_HANDLE && g_hl.extent == extent && g_hl.trace == trace) return true;
 	Img* all[] {&g_hl.out, &g_hl.raw, &g_hl.tmp_a, &g_hl.tmp_b, &g_hl.gbuf[0], &g_hl.gbuf[1], &g_hl.hist[0], &g_hl.hist[1]};
 	for (Img* img: all) Retire(graphics, *img);
@@ -321,7 +446,7 @@ bool Inverse4(const double* m, double* out) {
 int HwLightsLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_HWRT_LIGHTS");
-		const int   q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		const int   q     = ::Libs::Graphics::FrameGen::ParseEnvLevel(value);
 		if (q > 0) {
 			std::printf("HWRTLIGHTS: KYTY_HWRT_LIGHTS=%s read (level %d)%s\n", value, q,
 			            HwScene::Requested() ? "" : ": needs KYTY_HWRT=1 too: off");
@@ -394,8 +519,8 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 
 	static const float strength = EnvFloat("KYTY_HWRT_LIGHTS_STRENGTH", 1.0f, 0.0f, 2.0f);
 	static const float max_dark = EnvFloat("KYTY_HWRT_LIGHTS_MAX", 0.85f, 0.0f, 0.95f);
-	static const float ambient  = EnvFloat("KYTY_HWRT_LIGHTS_AMBIENT", 0.03f, 0.001f, 100.0f);
-	static const float soft     = EnvFloat("KYTY_HWRT_LIGHTS_SOFT", 0.08f, 0.0f, 2.0f);
+	static const float ambient  = EnvFloat("KYTY_HWRT_LIGHTS_AMBIENT", 0.5f, 0.001f, 100.0f);
+	static const float soft     = EnvFloat("KYTY_HWRT_LIGHTS_SOFT", 0.12f, 0.0f, 2.0f);
 	static const float skip     = EnvFloat("KYTY_HWRT_LIGHTS_SKIP", 0.3f, 0.0f, 5.0f);
 	static const float max_dist = EnvFloat("KYTY_HWRT_LIGHTS_DIST", 60.0f, 5.0f, 500.0f);
 	static const float flipy    = EnvFloat("KYTY_HWRT_LIGHTS_FLIPY", 1.0f, 0.0f, 1.0f);
@@ -418,17 +543,34 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	std::sort(picks.begin(), picks.end(), [](const Pick& a, const Pick& b) { return a.d < b.d; });
 	if (picks.size() > MaxLights) picks.resize(MaxLights);
+	std::vector<const RtLocal::LiveLight*> in;
+	for (const auto& p: picks) in.push_back(p.l);
+	// (ds-rt-shadow) snapped only on a camera cut: a frame with no light (the history dropped) no longer snaps the next
+	// one's weights to full at once (a lamp's shadow popped in when it was the only light and came back into the scan)
+	const bool snap = inputs.reset;
+	UpdateTracks(in, cam, snap);
+	std::vector<const Track*> sent;
+	// (all2-1027) per level: Bajo 8, Medio 12, Alto 16 lights (the per-pixel loop and the picks' spread)
+	const size_t cap = level == 1 ? 8 : level == 2 ? 12 : 16;
+	SelectCapped(sent, cap, snap);
 
 	// The guard: a 1 s window whose mean darkening over the screen passes KYTY_HWRT_LIGHTS_GUARD turns the pass off for 5 s.
 	const auto now = std::chrono::steady_clock::now();
 	if (now - g_hl.last_guard >= std::chrono::seconds(1)) {
 		g_hl.last_guard = now;
 		(void)vmaInvalidateAllocation(graphics->allocator, g_hl.stat_mem, 0, VK_WHOLE_SIZE);
-		std::array<uint32_t, 12> cur {};
-		for (int i = 0; i < 12; ++i) cur[i] = g_hl.stat_mapped[i];
+		std::array<uint32_t, 32> cur {};
+		for (int i = 0; i < 32; ++i) cur[i] = g_hl.stat_mapped[i];
 		const double px = cur[0] - g_hl.guard_last[0], dk = cur[2] - g_hl.guard_last[2];
 		g_hl.guard_last = cur;
 		const double mean = px > 0 ? dk / 1024.0 / px : 0.0;
+		// (ds-rt-shadow 10-28) idle when no trace pixel had any light weight in the last second (s[8], the trace's W > 0
+		// samples): the lights cover nothing on screen; the pass then only traces every 15th frame, its color left as it
+		// is (invisible, ~0 cost), until a weight shows up again
+		const bool was_idle = g_hl.idle;
+		g_hl.idle           = cur[8] == g_hl.guard_last_w;
+		g_hl.guard_last_w   = cur[8];
+		if (was_idle != g_hl.idle) RtFlicker::Cause(RtFlicker::Lights, g_hl.idle ? "went idle (no light weight on screen)" : "woke up");
 		if (guard > 0.0f && mean > guard && now >= g_hl.guard_until) {
 			g_hl.guard_until = now + std::chrono::seconds(5);
 			std::printf("HWRTLIGHTS: guard: the screen darkened %.1f %% on average over 1 s (> %.0f %%): off for 5 s\n", 100.0 * mean,
@@ -440,13 +582,13 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 
 	// The log, every 10 s.
 	++g_hl.frames;
-	g_hl.lights_sum += picks.size();
-	if (!picks.empty()) ++g_hl.frames_lit;
+	g_hl.lights_sum += sent.size();
+	if (!sent.empty()) ++g_hl.frames_lit;
 	if (now - g_hl.last_log >= std::chrono::seconds(10)) {
 		g_hl.last_log = now;
 		(void)vmaInvalidateAllocation(graphics->allocator, g_hl.stat_mem, 0, VK_WHOLE_SIZE);
-		std::array<uint32_t, 12> cur {}, d {};
-		for (int i = 0; i < 12; ++i) cur[i] = g_hl.stat_mapped[i], d[i] = cur[i] - g_hl.stat_last[i];
+		std::array<uint32_t, 32> cur {}, d {};
+		for (int i = 0; i < 32; ++i) cur[i] = g_hl.stat_mapped[i], d[i] = cur[i] - g_hl.stat_last[i];
 		g_hl.stat_last = cur;
 		const double px = std::max<double>(d[0], 1.0), dp = d[1], dk = d[2];
 		std::printf("HWRTLIGHTS: stats (level %d, trace %ux%u) lights %.2f a frame (%llu/%llu frames with any; %zu known now), darkened "
@@ -460,9 +602,20 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		// mean history count and filtered occlusion)
 		std::printf("HWRTLIGHTS: rays: %.1f %% of traced shadow rays hit (%u sampled; %.1f %% of hits within 0.5 m of the light), "
 		            "TLAS alignment %.1f %% (%u camera->pixel probes hit at the pixel's depth; >~85 %%: the depth's world is the TLAS's), "
-		            "lit pixels %.1f %% (W > 0), their history %.1f frames, occlusion %.1f %%\n",
+		            "lit pixels %.1f %% (W > 0), their history %.1f frames, occlusion %.1f %%; hits at the receiver (< 0.15 m) %.1f %%; "
+		            "light rescans moved %llu\n",
 		            d[3] > 0 ? 100.0 * d[4] / d[3] : 0.0, d[3], d[4] > 0 ? 100.0 * d[5] / d[4] : 0.0, d[7] > 0 ? 100.0 * d[6] / d[7] : 0.0, d[7],
-		            100.0 * d[9] / px, d[9] > 0 ? static_cast<double>(d[10]) / d[9] : 0.0, d[9] > 0 ? 100.0 * d[11] / 1024.0 / d[9] : 0.0);
+		            100.0 * d[9] / px, d[9] > 0 ? static_cast<double>(d[10]) / d[9] : 0.0, d[9] > 0 ? 100.0 * d[11] / 1024.0 / d[9] : 0.0,
+		            d[4] > 0 ? 100.0 * d[12] / d[4] : 0.0, static_cast<unsigned long long>(g_track_jumps));
+		g_track_jumps = 0;
+		// (ds-rt-shadow) where the light weight is lost (1 pixel in 256 within the distance)
+		std::printf("HWRTLIGHTS: reach: of %u probed pixels %.1f %% within a light's reach, %.1f %% also facing it, %.1f %% also in its cone, "
+		            "%.1f %% with a weight W > 0, %.1f %% traced (share >= 3 %%); idle frames %llu "
+		            "(reach 0 with lights near: their positions are not in the depth's world; facing but no cone: the forward)\n",
+		            d[13], d[13] > 0 ? 100.0 * d[14] / d[13] : 0.0, d[13] > 0 ? 100.0 * d[15] / d[13] : 0.0,
+		            d[13] > 0 ? 100.0 * d[16] / d[13] : 0.0, d[13] > 0 ? 100.0 * d[17] / d[13] : 0.0,
+		            d[13] > 0 ? 100.0 * d[18] / d[13] : 0.0, static_cast<unsigned long long>(g_hl.idle_frames));
+		g_hl.idle_frames = 0;
 		std::fflush(stdout);
 		g_hl.frames = g_hl.frames_lit = g_hl.lights_sum = g_hl.stale_tlas = g_hl.no_tlas = 0;
 		g_hl.sum_ms = g_hl.max_ms = 0.0, g_hl.samples = 0;
@@ -470,13 +623,15 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	if (!g_hl.said_on) {
 		g_hl.said_on = true;
 		std::printf("HWRTLIGHTS: on (level %d: %s, %ux%u; strength %g, max %g, ambient %g, source radius %g m, skip %g m, %g m; lights from "
-		            "the game's shadow projections, a ratio correction of the lit color)\n",
-		            level, level == 1 ? "half-res, 1 ray" : level == 2 ? "full-res, 1 ray" : "full-res, 2 rays", color.extent.width,
+		            "the game's shadow projections eased per frame, weight (r/d)^2 windowed, penumbra = source size (contact-hardening), "
+		            "a ratio correction of the lit color)\n",
+		            level, level == 1 ? "~0.23 Mpx, 1 ray, 8 lights" : level == 2 ? "~0.23 Mpx, 2 rays, 12 lights" : "~0.92 Mpx, 1 ray, 16 lights", color.extent.width,
 		            color.extent.height, strength, max_dark, ambient, soft, skip, max_dist);
 		std::fflush(stdout);
 	}
 	// Nothing to shadow (no light near, or the guard): the color as it is (no pass at all), the history dropped.
-	if (picks.empty() || guarded) {
+	if (sent.empty() || guarded) {
+		RtFlicker::Cause(RtFlicker::Lights, guarded ? "guard (pass off)" : "no light near (pass off)");
 		g_hl.history_valid = false;
 		return false;
 	}
@@ -487,20 +642,23 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		std::array<float, SlotBytes / 4> f {};
 		for (int i = 0; i < 16; ++i) f[i] = static_cast<float>(ivp[i]);
 		f[16] = static_cast<float>(cam[0]), f[17] = static_cast<float>(cam[1]), f[18] = static_cast<float>(cam[2]), f[19] = 1.0f;
-		f[20] = static_cast<float>(picks.size()), f[21] = strength, f[22] = ambient, f[23] = max_dark;
+		f[20] = static_cast<float>(sent.size()), f[21] = strength, f[22] = ambient, f[23] = max_dark;
 		f[24] = flipy > 0.5f ? -1.0f : 1.0f, f[25] = 0.01f, f[26] = max_dist, f[27] = 0.0f;
-		for (size_t i = 0; i < picks.size(); ++i) {
-			const auto& l = *picks[i].l;
+		for (size_t i = 0; i < sent.size(); ++i) {
+			const auto& l = *sent[i];
 			float*      e = &f[32 + i * 12];
 			e[0] = l.pos[0], e[1] = l.pos[1], e[2] = l.pos[2], e[3] = l.far_d;
 			e[4] = l.fwd[0], e[5] = l.fwd[1], e[6] = l.fwd[2];
 			// (the cone: the shadow frustum's half angle; its outer 15 % fades)
-			const float half = std::atan(std::max(l.tan_half, 0.01f));
+			// (ds-rt-shadow 10-28) never narrower than KYTY_HWRT_LIGHTS_MINCONE (45 deg half angle): the projection's x / y
+			// scale carries the spot pool's atlas scale too, so 1 / scale gave cones a fraction of the light's
+			// (20261028-044645: 81.6 % of probed pixels in a light's reach, 19.7 % facing it, 0.0 % in its cone: no shadow)
+			static const float min_half = EnvFloat("KYTY_HWRT_LIGHTS_MINCONE", 45.0f, 1.0f, 89.0f) * 0.01745329f;
+			const float half = std::max(std::atan(std::max(l.tan_half, 0.01f)), min_half);
 			e[7]  = l.point || half > 1.5f ? -2.0f : std::cos(half);
 			e[8]  = soft;
-			const float fade_out = 1.0f - std::clamp((static_cast<float>(l.age) - 60.0f) / 60.0f, 0.0f, 1.0f);
-			const float fade_in  = std::clamp(static_cast<float>(l.since) / 30.0f, 0.0f, 1.0f);
-			e[9]  = fade_out * fade_in;
+			const float v = l.vis * l.cap_w;
+			e[9]  = l.fade * v * v * (3.0f - 2.0f * v);
 			e[10] = l.point || half > 1.5f ? 0.0f : std::cos(half * 0.85f);
 			e[11] = std::max(skip, 1.5f * soft);
 		}
@@ -534,7 +692,7 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const auto     gen = vk::ImageLayout::eGeneral;
 	const uint32_t cur = static_cast<uint32_t>(g_hl.frame & 1u), prev = cur ^ 1u;
 	const vk::DescriptorBufferInfo light_info {vk::Buffer(g_hl.light_buf), vk::DeviceSize {slot} * SlotBytes, SlotBytes};
-	const vk::DescriptorBufferInfo stat_info {vk::Buffer(g_hl.stat_buf), 0, 64};
+	const vk::DescriptorBufferInfo stat_info {vk::Buffer(g_hl.stat_buf), 0, 128};
 	vk::WriteDescriptorSetAccelerationStructureKHR as_write {};
 	as_write.accelerationStructureCount = 1;
 	as_write.pAccelerationStructures    = &tlas;
@@ -575,6 +733,19 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	};
 	const uint32_t tw = g_hl.trace.width, th = g_hl.trace.height;
+	if (g_hl.idle) {
+		++g_hl.idle_frames;
+		if (g_hl.frame % 15 == 0) run(0, g_hl.hist[prev], g_hl.raw, tw, th, 1.0f); // (the probe: its stats only)
+		Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+		        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
+		if (timed) {
+			command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_hl.pool, entry * 2 + 1);
+			++g_hl.written;
+		}
+		++g_hl.frame;
+		g_hl.history_valid = false;
+		return false;
+	}
 	run(0, g_hl.hist[prev], g_hl.raw, tw, th, 1.0f);
 	run(1, g_hl.raw, g_hl.hist[cur], tw, th, 1.0f);
 	run(2, g_hl.hist[cur], g_hl.tmp_a, tw, th, 1.0f);

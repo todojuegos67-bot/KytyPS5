@@ -3,6 +3,7 @@
 #include "port/ds-tables.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -35,6 +36,14 @@ const ResMode kResModes[] = {
     {"fsr-equilibrado", "FSR Equilib.", 1.72, "fsr"},
     {"fsr-rendimiento", "FSR Rendim.", 2.0, "fsr"},
     {"fsr-900", "FSR 900p (AA)", 1.6, "fsr"},
+    // (10-28) AMD FSR 4 (the v07 INT8 model, src/local/fsr4-sr.h; fsr4_shaders next to the exe): its own upscaler, one model
+    // per preset (Launcher-souls.ps1 ds-torch-1028). Output at the display's size; the 3D down to 360 lines.
+    {"fsr4-aa", "FSR 4 Nativo (AA)", 1.0, "fsr4", "native"},
+    {"fsr4-calidad", "FSR 4 Calidad", 1.5, "fsr4", "quality"},
+    {"fsr4-equilibrado", "FSR 4 Equilibrado", 1.7, "fsr4", "balanced"},
+    {"fsr4-rendimiento", "FSR 4 Rendimiento", 2.0, "fsr4", "performance"},
+    {"fsr4-urendimiento", "FSR 4 Ultra rendimiento", 3.0, "fsr4", "ultraperf"},
+    {"fsr4-dinamico", "FSR 4 Dinámico", 1.5, "fsr4", "drs"},
 };
 const int kResModeCount = static_cast<int>(sizeof(kResModes) / sizeof(kResModes[0]));
 
@@ -66,6 +75,16 @@ const Choice kAntiLagOther[] = {{"no", "Anti-Lag: no"}, {"normal", "Anti-Lag"}, 
 const int    kAntiLagOtherCount = 3;
 const Choice kAntiLagDlssg[] = {{"reflex", "Reflex (NVIDIA)"}, {"normal", "Anti-Lag"}, {"ultra", "Anti-Lag Ultra"}};
 const int    kAntiLagDlssgCount = 3;
+const Choice kRtReflLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}, {"5", "Extremo"}};
+const int    kRtReflLevelCount = 6;
+const Choice kRtLightLevels[] = {{"0", "No"}, {"1", "Media"}, {"2", "Alta"}, {"3", "Ultra"}, {"4", "Extremo"}};
+const int    kRtLightLevelCount = 5;
+const Choice kRtLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}};
+const int    kRtLevelCount = 4;
+const Choice kTorchLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Híbrido"}};
+const int    kTorchLevelCount = 5;
+const Choice kYesNo[] = {{"0", "No"}, {"1", "Sí"}};
+const int    kYesNoCount = 2;
 const Choice kSoulsModes[] = {{"ninguno", "Personalizado (ningun modo)"},
                               {"ligero", "Modo Souls ligero"},
                               {"equilibrado", "Modo Souls equilibrado"},
@@ -247,6 +266,23 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("raton_calibrar", s->kbm_calibrate);
 	boo("configurado", s->configured);
 	boo("mejoras_16gb", s->ram16_boost);
+	str("reflejos_rt", s->rt_ss_refl);
+	str("luz_rt_pantalla", s->rt_ssgi);
+	str("sombras_rt", s->rt_shadows);
+	str("oclusion_ao", s->ao);
+	str("luz_antorchas", s->torch);
+	boo("destellos_lente", s->lens_flare);
+	boo("rt_experimental", s->rt_hw_exp);
+	// (Out of range: No.)
+	const auto clamp_level = [](std::string& v, int max) {
+		const int n = std::atoi(v.c_str());
+		v           = n >= 0 && n <= max && !v.empty() && std::isdigit(static_cast<unsigned char>(v[0])) != 0 ? std::to_string(n) : "0";
+	};
+	clamp_level(s->rt_ss_refl, 5);
+	clamp_level(s->rt_ssgi, 4);
+	clamp_level(s->rt_shadows, 3);
+	clamp_level(s->ao, 3);
+	clamp_level(s->torch, 4);
 	// (10-28) No presets or modes any more: an old modo_souls is dropped (its graphics stay as saved).
 	s->souls_mode = "ninguno";
 	return true;
@@ -289,7 +325,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "[Reescalado]\n"
 	  << "; nativo, dlss-dlaa, dlss-ucalidad, dlss-calidad, dlss-equilibrado, dlss-rendimiento,\n"
 	  << "; xess-aa, xess-ucalidad-plus, xess-ucalidad, xess-calidad, xess-equilibrado, xess-rendimiento,\n"
-	  << "; fsr-aa, fsr-ucalidad, fsr-calidad, fsr-equilibrado, fsr-rendimiento\n"
+	  << "; fsr-aa, fsr-ucalidad, fsr-calidad, fsr-equilibrado, fsr-rendimiento (FSR 3.1),\n"
+	  << "; fsr4-aa, fsr4-calidad, fsr4-equilibrado, fsr4-rendimiento, fsr4-urendimiento, fsr4-dinamico (AMD FSR 4)\n"
 	  << "reescalado=" << s.res << "\n"
 	  << "; auto, 0, 0.25, 0.5, 0.75, 1\n"
 	  << "nitidez=" << s.sharpness << "\n"
@@ -353,7 +390,22 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Texturas: 0 normales, 1 nitidas (con reescalado, el detalle de la resolucion final), 2 extra nitidas\n"
 	  << "texturas_nitidas=" << s.texture_sharpness << "\n\n"
 	  << "[RayTracing]\n"
-	  << "; Trazado de rayos por hardware (1 si, 0 no). Elegir un modo Souls los pone todos en 0.\n"
+	  << "; Efectos de pantalla (sin RT por hardware; solo con DLSS, XeSS o FSR):\n"
+	  << "; Reflejos RT: 0 no, 1 bajo, 2 medio, 3 alto, 4 ultra, 5 extremo\n"
+	  << "reflejos_rt=" << s.rt_ss_refl << "\n"
+	  << "; Luz RT (luz rebotada en pantalla): 0 no, 1 media, 2 alta, 3 ultra, 4 extremo\n"
+	  << "luz_rt_pantalla=" << s.rt_ssgi << "\n"
+	  << "; Sombras RT (sombras del sol de pantalla): 0 no, 1 bajo, 2 medio, 3 alto\n"
+	  << "sombras_rt=" << s.rt_shadows << "\n"
+	  << "; Oclusion ambiental: 0 no, 1 bajo, 2 medio, 3 alto (por ahora cuesta varios ms: mejor en 0)\n"
+	  << "oclusion_ao=" << s.ao << "\n"
+	  << "; Luz de antorchas RT: 0 no, 1 bajo, 2 medio, 3 alto, 4 hibrido (alto + rayos por hardware; GPU con RT)\n"
+	  << "luz_antorchas=" << s.torch << "\n"
+	  << "; Destellos de lente de antorchas y fuegos: 1 si, 0 no\n"
+	  << "destellos_lente=" << b(s.lens_flare) << "\n"
+	  << "; RT por hardware (experimental): 1 activa las filas de trazado de rayos por hardware de abajo\n"
+	  << "rt_experimental=" << b(s.rt_hw_exp) << "\n"
+	  << "; Trazado de rayos por hardware (1 si, 0 no; solo con rt_experimental=1). Elegir un modo Souls los pone todos en 0.\n"
 	  << "rt_reflejos=" << b(s.rt_reflections) << "\n"
 	  << "rt_sombras_sol=" << b(s.rt_sun) << "\n"
 	  << "rt_niebla=" << b(s.rt_fog) << "\n"
@@ -552,10 +604,30 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			hw.Set("KYTY_HWRT_PARTICLES", "2");
 			hw.Set("KYTY_HWRT_LIGHTS", lamps);
 		}
-		if (!hw.list.empty()) {
+		// (10-28, ds-rt1026-restore) Hardware RT only as experimental (rt_experimental): the engine needs KYTY_RT_HW_EXPERIMENTAL=1.
+		if (!hw.list.empty() && s.rt_hw_exp) {
+			sets.emplace_back("KYTY_RT_HW_EXPERIMENTAL", "1");
 			sets.emplace_back("KYTY_HWRT", "1");
 			sets.insert(sets.end(), hw.list.begin(), hw.list.end());
 		}
+	}
+	// (10-28, the c3e58bd5 screen-space RT set) Luz RT (SSGI: run-windows -Ssgi 1-3; Extremo = Ultra with more bounce and
+	// contact shading) and Reflejos RT (KYTY_RT_REFLECTIONS 1-5; Ultra and up with more presence).
+	if (!s.pure_game && s.rt_ssgi != "0" && !s.rt_ssgi.empty()) {
+		sets.emplace_back("KYTY_SSGI", std::to_string(std::min(std::atoi(s.rt_ssgi.c_str()), 3)));
+		if (s.rt_ssgi == "4") {
+			sets.emplace_back("KYTY_SSGI_INTENSITY", "1.6");
+			sets.emplace_back("KYTY_SSGI_AO", "0.4");
+		}
+	}
+	if (!s.pure_game && s.rt_ss_refl != "0" && !s.rt_ss_refl.empty()) {
+		sets.emplace_back("KYTY_RT_REFLECTIONS", s.rt_ss_refl);
+		if (std::atoi(s.rt_ss_refl.c_str()) >= 4) {
+			sets.emplace_back("KYTY_RT_REFLECTIONS_MIN", "0.55");
+			sets.emplace_back("KYTY_RT_REFLECTIONS_GUIDE_STRENGTH", "1.3");
+		}
+	} else {
+		sets.emplace_back("KYTY_RT_REFLECTIONS", "");
 	}
 	sets.emplace_back("KYTY_DLSSG_PRESET", "C");
 	sets.emplace_back("KYTY_FG_PACING", "0");        // (10-21) the emulator's frame pacing (stuck at 20 FPS) off
@@ -592,9 +664,19 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// Luz volumetrica (Bajo / Medio / Alto): KYTY_GODRAYS, its sun from the screen-space RT shadow at strength 0 (draws no
 	// shadow). KYTY_RT_SUN=0 (vol25): without the cascade mode the volumetric gets the sun every frame (no fog popping).
 	// (The engine has no sun-fix yet: Luz volumetrica and Sombras sol stay exclusive, the menu turns the other off.)
+	// (10-28, ds-shadow-1028) Sombras RT (screen-space, cshadow.comp; never hardware RT): level 1 / 2 / 3 at strength 0.35 /
+	// 0.5 / 0.7, without the cascade mode or the TLAS. With Luz volumetrica and no Sombras RT the pass runs at strength 0.
+	sets.emplace_back("KYTY_AO", !s.pure_game && (s.ao == "1" || s.ao == "2" || s.ao == "3") ? s.ao : "0"); // (ao-1028)
 	const bool godrays = !s.pure_game && (s.godrays == "1" || s.godrays == "2" || s.godrays == "3");
-	if (godrays) {
-		sets.emplace_back("KYTY_GODRAYS", s.godrays);
+	const bool shadows = !s.pure_game && (s.rt_shadows == "1" || s.rt_shadows == "2" || s.rt_shadows == "3");
+	if (godrays) sets.emplace_back("KYTY_GODRAYS", s.godrays);
+	if (shadows) {
+		static const char* strength[] = {"0", "0.35", "0.5", "0.7"};
+		sets.emplace_back("KYTY_RT_SHADOWS", s.rt_shadows);
+		sets.emplace_back("KYTY_RT_SHADOWS_STRENGTH", strength[std::atoi(s.rt_shadows.c_str())]);
+		sets.emplace_back("KYTY_RT_SUN", "0");
+		sets.emplace_back("KYTY_HWRT_SHADOW", "0");
+	} else if (godrays) {
 		sets.emplace_back("KYTY_RT_SHADOWS", "1");
 		sets.emplace_back("KYTY_RT_SHADOWS_STRENGTH", "0");
 		sets.emplace_back("KYTY_RT_SUN", "0");
@@ -602,6 +684,21 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		sets.emplace_back("KYTY_RT_SHADOWS", "");
 		sets.emplace_back("KYTY_RT_SHADOWS_STRENGTH", "");
 	}
+	// (torch-1028) Luz de antorchas RT (screen-space) Bajo / Medio / Alto; Hibrido (torch-shadow-1028): Alto + the hardware
+	// scene (TLAS) for the torch light only (the other hardware passes off without rt_experimental). Destellos de lente.
+	if (!s.pure_game && s.torch != "0" && !s.torch.empty()) {
+		sets.emplace_back("KYTY_TORCH", std::to_string(std::min(std::atoi(s.torch.c_str()), 3)));
+		if (s.torch == "4") {
+			sets.emplace_back("KYTY_TORCH_HW", "1");
+			sets.emplace_back("KYTY_RT_HW_EXPERIMENTAL", "1");
+			sets.emplace_back("KYTY_HWRT", "1");
+			if (!s.rt_hw_exp)
+				for (const char* k: {"KYTY_HWRT_REFL", "KYTY_HWRT_SHADOW", "KYTY_HWRT_LIGHTS", "KYTY_HWRT_PARTICLES", "KYTY_HWRT_GI", "KYTY_HWRT_AO",
+				                     "KYTY_HWRT_CONTACT", "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_RT_SUN"})
+					sets.emplace_back(k, "0");
+		}
+	}
+	if (!s.pure_game && s.lens_flare) sets.emplace_back("KYTY_TORCH_FLARE", "1");
 	// Its vblank: 840 Hz with DLSS and AMD dynamic frame generation, 360 with the other frame generation, 960 unlocked
 	// without, else 60.
 	const bool vb840  = dlss_fg || std::strcmp(fg->id, "amd-dinamico") == 0;
@@ -626,6 +723,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (ratio > 0) env.Set("KYTY_UPSCALE_RATIO", Num(ratio));
 	env.Remove("KYTY_UPSCALE");
 	if (upscaler == "dlss" && s.dlss_preset != "auto" && !s.dlss_preset.empty()) env.Set("KYTY_DLSS_PRESET", s.dlss_preset);
+	if (upscaler == "fsr4" && res->fsr4_preset != nullptr) env.Set("KYTY_FSR4_PRESET", res->fsr4_preset); // (run-windows -Fsr4Preset)
 	if (!s.aspect.empty() && s.aspect != "16:9") env.Set("KYTY_RENDER_ASPECT", s.aspect);
 	// -ForceMode performance (10-25: 4K no longer forces the cinematic mode: it held the game at 30 real).
 	if (demons) env.Set("KYTY_DS_FORCE_MODE", "performance");
@@ -712,13 +810,16 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// and latency the same.
 	if (s.pure_game) {
 		static const char* fx[] = {"KYTY_HWRT", "KYTY_RT_REFLECTIONS", "KYTY_RT_SHADOWS", "KYTY_RT_SUN", "KYTY_RT_PARTICLES", "KYTY_RT_LOCAL",
-		                           "KYTY_GODRAYS", "KYTY_SHINE", "KYTY_SPEC_OCCLUSION", "KYTY_GTAO", "KYTY_SSGI", "KYTY_SSR", "KYTY_CONTACT_SHADOWS"};
+		                           "KYTY_GODRAYS", "KYTY_SHINE", "KYTY_SPEC_OCCLUSION", "KYTY_GTAO", "KYTY_SSGI", "KYTY_SSR", "KYTY_CONTACT_SHADOWS",
+		                           "KYTY_AO", "KYTY_TORCH"};
 		for (auto& [k, v]: env.list)
 			for (const char* p: fx)
 				if (k.rfind(p, 0) == 0) v.clear();
 		for (const char* k: {"KYTY_HWRT", "KYTY_HWRT_REFL", "KYTY_HWRT_SHADOW", "KYTY_HWRT_LIGHTS", "KYTY_HWRT_PARTICLES", "KYTY_RT_REFLECTIONS",
 		                     "KYTY_RT_SHADOWS", "KYTY_CONTACT_SHADOWS", "KYTY_RT_SUN", "KYTY_RT_PARTICLES", "KYTY_GODRAYS", "KYTY_SHINE",
-		                     "KYTY_SPEC_OCCLUSION", "KYTY_GTAO", "KYTY_SSGI", "KYTY_SSR"})
+		                     "KYTY_SPEC_OCCLUSION", "KYTY_GTAO", "KYTY_SSGI", "KYTY_SSR", "KYTY_HWRT_GI", "KYTY_HWRT_AO", "KYTY_HWRT_CONTACT",
+		                     "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_AO", "KYTY_TORCH", "KYTY_TORCH_FLARE",
+		                     "KYTY_TORCH_HW", "KYTY_RT_HW_EXPERIMENTAL"})
 			env.Set(k, "0");
 	}
 	// settings.ini [Avanzado] extra: as -Set (KEY= removes it).
@@ -804,6 +905,8 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.pad_map != n.pad_map || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
 	       l.safe_gpu != n.safe_gpu || l.quality != n.quality || l.texture_reduce != n.texture_reduce ||
 	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.extra != n.extra ||
+	       l.rt_ss_refl != n.rt_ss_refl || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao ||
+	       l.torch != n.torch || l.lens_flare != n.lens_flare || l.rt_hw_exp != n.rt_hw_exp ||
 	       (l.sharpness == "auto") != (n.sharpness == "auto");
 }
 
@@ -813,6 +916,9 @@ bool FixedFg(const Settings& s) {
 
 void RtAllOff(Settings* s) {
 	s->rt_reflections = s->rt_sun = s->rt_fog = s->rt_particles = s->rt_metal = s->rt_ao = false;
+	// (10-28) and the screen-space set / new passes (rt_experimental itself stays as chosen)
+	s->rt_ss_refl = s->rt_ssgi = s->rt_shadows = s->ao = s->torch = "0";
+	s->lens_flare = false;
 }
 
 void ApplyPreset(Settings* s, const std::string& preset) {
@@ -895,10 +1001,20 @@ std::string LampLevel(const Settings& s) {
 }
 
 int LiveRtOff(const Settings& l, const Settings& n) {
-	int mask = 0;
-	if (l.rt_reflections && (!n.rt_reflections || n.pure_game)) mask |= 1;
-	if (LampLevel(l) != "0" && (LampLevel(n) == "0" || n.pure_game)) mask |= 2;
-	if (l.godrays != "0" && !l.godrays.empty() && (n.godrays == "0" || n.pure_game)) mask |= 4;
+	int        mask = 0;
+	const auto on   = [](const std::string& v) { return !v.empty() && v != "0"; };
+	// (10-28) The RT reflections pass is the screen-space Reflejos RT and the hardware one (rt_experimental) together.
+	const auto refl = [&](const Settings& x) { return !x.pure_game && (on(x.rt_ss_refl) || (x.rt_reflections && x.rt_hw_exp)); };
+	const auto lamp = [&](const Settings& x) { return !x.pure_game && x.rt_hw_exp && LampLevel(x) != "0"; };
+	if (refl(l) && !refl(n)) mask |= 1;
+	if (lamp(l) && !lamp(n)) mask |= 2;
+	if (on(l.godrays) && (!on(n.godrays) || n.pure_game)) mask |= 4;
+	if (on(l.ao) && (!on(n.ao) || n.pure_game)) mask |= 8;
+	if (on(l.torch) && (!on(n.torch) || n.pure_game)) mask |= 16;
+	if (l.lens_flare && (!n.lens_flare || n.pure_game)) mask |= 32;
+	// Sombras RT: the sun pass also gives Luz volumetrica its sun, and holds the hardware sun: off live only when neither stays.
+	const bool sun_hw = l.rt_sun && l.rt_hw_exp;
+	if (on(l.rt_shadows) && (!on(n.rt_shadows) || n.pure_game) && !sun_hw && (!on(l.godrays) || (mask & 4) != 0)) mask |= 64;
 	return l.pure_game ? 0 : mask;
 }
 
@@ -1067,7 +1183,8 @@ std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
 	s->rt_lamps = "0";
 	s->godrays  = "0";
 	const double refl = rtk * (2.5 + 0.3 * mpx) / 1.0;
-	if (vram >= 12 && !s->ram16_boost && ms + refl <= target) {
+	// (10-28) Hardware RT is experimental now (rt_experimental): the Configurador only picks it when that switch is on.
+	if (s->rt_hw_exp && vram >= 12 && !s->ram16_boost && ms + refl <= target) {
 		s->rt_reflections = true;
 		ms += refl;
 	}
@@ -1075,9 +1192,29 @@ std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
 		s->godrays = gpu >= 80 ? "2" : "1";
 		ms += 0.2 * rtk;
 	}
-	if (vram >= 16 && ms + 2.5 * rtk <= target) {
+	if (s->rt_hw_exp && vram >= 16 && ms + 2.5 * rtk <= target) {
 		s->rt_lamps = gpu >= 120 ? "2" : "1";
 		ms += 2.5 * rtk;
+	}
+	// (10-28) The screen-space set, conservatively (its launcher costs on the 5080, scaled by the GPU score): only Bajo, only
+	// what still fits, and only on the stronger cards. Never Oclusion ambiental (its composite costs ~7 ms in game now),
+	// Luz RT (SSGI) or Hibrido.
+	const double g = 100.0 / std::max(gpu, 4);
+	if (gpu >= 55 && ms + 0.4 * g <= target) { // Sombras RT Bajo ~0,3 ms
+		s->rt_shadows = "1";
+		ms += 0.4 * g;
+	}
+	if (gpu >= 55 && ms + 0.4 * g <= target) { // Luz de antorchas RT Bajo ~0,3 ms
+		s->torch = "1";
+		ms += 0.4 * g;
+	}
+	if (gpu >= 55 && ms + 0.15 * g <= target) { // Destellos de lente ~0,1 ms
+		s->lens_flare = true;
+		ms += 0.15 * g;
+	}
+	if (gpu >= 80 && vram >= 12 && ms + 0.8 * g <= target) { // Reflejos RT Bajo ~0,6 ms
+		s->rt_ss_refl = "1";
+		ms += 0.8 * g;
 	}
 	const auto label = [](const Choice* items, int count, const std::string& id) {
 		for (int i = 0; i < count; i++)
@@ -1092,11 +1229,17 @@ std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
 	              " (" + std::to_string(vram) + " GB de VRAM), sombras " + label(kShadows, kShadowCount, s->shadows) + ", distancia " +
 	              label(kQualities, kQualityCount, s->quality) + " (según el procesador), filtrado x16 " + (s->af16 ? "sí" : "no") + ".");
 	std::string rt = "Ray tracing: ";
-	if (!s->rt_reflections && s->godrays == "0" && s->rt_lamps == "0") rt += "desactivado (no cabe a 60 FPS en este equipo).";
+	if (!s->rt_reflections && s->godrays == "0" && s->rt_lamps == "0" && s->rt_shadows == "0" && s->torch == "0" && !s->lens_flare &&
+	    s->rt_ss_refl == "0")
+		rt += "desactivado (no cabe a 60 FPS en este equipo).";
 	else {
-		if (s->rt_reflections) rt += "reflejos RT; ";
+		if (s->rt_ss_refl != "0") rt += "reflejos RT bajos; ";
+		if (s->rt_shadows != "0") rt += "sombras RT bajas; ";
+		if (s->torch != "0") rt += "luz de antorchas RT baja; ";
+		if (s->lens_flare) rt += "destellos de lente; ";
+		if (s->rt_reflections) rt += "reflejos RT por hardware; ";
 		if (s->godrays != "0") rt += std::string("luz volumétrica ") + (s->godrays == "2" ? "media; " : "baja; ");
-		if (s->rt_lamps != "0") rt += "antorchas RT; ";
+		if (s->rt_lamps != "0") rt += "antorchas RT por hardware; ";
 		rt.resize(rt.size() - 2);
 		rt += ".";
 	}

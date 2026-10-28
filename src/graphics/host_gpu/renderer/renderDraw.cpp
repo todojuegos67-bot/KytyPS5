@@ -1,5 +1,6 @@
 #include "local/skip-shader.h"
 #include "local/hwrt-scene.h"
+#include "local/rt-water.h"
 #include "local/sync-stats.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "live-trace-gpu.h"
@@ -1537,6 +1538,8 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.vs_input_info.stage.program != nullptr) FrameGen::NoteShader(state.vs_input_info.stage.program->shader_hash, 'v');
 	if (state.ps_active && state.ps_input_info.stage.program != nullptr)
 		FrameGen::NoteShader(state.ps_input_info.stage.program->shader_hash, 'p');
+	if (state.ps_active && state.ps_input_info.stage.program != nullptr && FrameGen::RtWaterIsWaterPs(state.ps_input_info.stage.program->shader_hash))
+		FrameGen::RtWaterNoteNormalDraw(); // (KYTY_HWRT_WATER: a water draw the table path did not take: not captured)
 	if (FrameGen::ContactShadowsWanted() && state.vs_input_info.stage.program != nullptr) {
 		const auto& info   = state.depth_info.desc.info;
 		const bool  target = state.depth_info.image_id && state.color_count == 0 && info.resources.layers >= 4 &&

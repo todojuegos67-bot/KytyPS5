@@ -8,15 +8,21 @@
 
 namespace Libs::Graphics::FrameGen::RtFlicker {
 
-enum Pass : uint32_t { Particles = 0, Sun = 1, Lights = 2, Reflections = 3, Volumetric = 4, Count = 5 };
+// Contact: KYTY_HWRT_CONTACT; Water: KYTY_HWRT_WATER.
+// Gi: KYTY_HWRT_GI / KYTY_HWRT_AO (hwrt-gi.cpp), the RT GI + AO on the ambient term.
+// Ao: KYTY_AO (rt-ao.cpp), the screen-space ambient occlusion (ao-1028).
+// Torch: KYTY_TORCH (torch.cpp, the firelight); Flare: KYTY_TORCH_FLARE (its lens flare).
+enum Pass : uint32_t { Particles = 0, Sun = 1, Lights = 2, Reflections = 3, Volumetric = 4, Gi = 5, Contact = 6, Water = 7, Ao = 8, Torch = 9, Flare = 10, Count = 11 };
 // Once a frame, before the passes: whether the camera holds still since the last frame.
 void BeginFrame(const UpscaleInputs& inputs);
-// (rtstab2) Whether the camera held still this frame, and for how many frames in a row (computed even with the
-// self-check off): the RT passes' temporal filters average longer then.
-[[nodiscard]] bool     CameraStill();
-[[nodiscard]] uint32_t StillFrames();
+// (refl-pro) The camera held still since the last frame / for how many frames in a row.
+bool     CameraStill();
+uint32_t StillFrames();
 // After a pass that replaced inputs.color (before: the color it read).
 void Probe(vk::CommandBuffer command, GraphicContext* graphics, Pass pass, const UpscaleImage& before, const UpscaleImage& after);
+// (ds-rt-shadow) A pass's own events in this 10 s window, named by a string literal (up to 8 a pass): printed after its
+// numbers as "causes: <name> <count>, ..." so a flicker figure comes with what changed (render thread only).
+void Cause(Pass pass, const char* name, uint64_t count = 1);
 
 } // namespace Libs::Graphics::FrameGen::RtFlicker
 

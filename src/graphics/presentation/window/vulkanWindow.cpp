@@ -42,6 +42,7 @@
 #include "local-platform.h"
 #include "frame-gen.h"
 #include "local/xess-sr.h"
+#include "local/fsr4-sr.h"
 #include "local/fsr3-fg.h"
 #include "local/anti-lag.h"
 #include "local/hwrt-scene.h"
@@ -1080,6 +1081,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	create_info.pNext = Libs::Graphics::Xess::ChainDeviceFeatures(device_extensions, const_cast<void*>(create_info.pNext));
 	// KYTY_HWRT=1: the acceleration structure and ray query features, when the device has them (local/hwrt-scene.h).
 	create_info.pNext = Libs::Graphics::HwScene::ChainDeviceFeatures(physical_device, device_extensions, const_cast<void*>(create_info.pNext));
+	// KYTY_UPSCALER=fsr4: the INT8/DOT4 model's features (integer dot product, int8/int16/float16, compute derivatives),
+	// where the device has them (local/fsr4-sr.h; nothing changed without it).
+	create_info.pNext = Libs::Graphics::Fsr4::ChainDeviceFeatures(physical_device, device_extensions, features12, features13,
+	                                                              device_features, const_cast<void*>(create_info.pNext));
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -1610,6 +1615,8 @@ void WindowContext::CreateVulkan() {
 		if (Libs::Graphics::Xess::Wanted() || Libs::Graphics::Xess::SrPathWanted())
 			Libs::Graphics::Xess::AddDeviceExtensions(graphic_ctx.instance, graphic_ctx.physical_device, available_extensions,
 			                                          device_extensions);
+		// KYTY_UPSCALER=fsr4: VK_KHR_compute_shader_derivatives (or the NV one) for the FSR 4 model (local/fsr4-sr.h).
+		Libs::Graphics::Fsr4::AddDeviceExtensions(available_extensions, device_extensions);
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
 		// KYTY_HWRT=1: acceleration structures and ray queries (local/hwrt-scene.h; nothing asked for without it).

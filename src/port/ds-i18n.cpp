@@ -130,6 +130,21 @@ const Row kRows[] = {
 	{{"Procesador y RAM", "CPU and RAM", "Processador e RAM", "Processeur et RAM", "Processore e RAM", "Prozessor und RAM"}},
 	{{"Modo recomendado", "Recommended mode", "Modo recomendado", "Mode recommand\xC3\xA9", "Modalit\xC3\xA0 consigliata", "Empfohlener Modus"}},
 	{{"Esperado (estimacion)", "Expected (estimate)", "Esperado (estimativa)", "Attendu (estimation)", "Previsto (stima)", "Erwartet (Sch\xC3\xA4tzung)"}},
+	// (10-28) ds-torch-1028's Ray tracing rows
+	{{"Reflejos RT", "RT reflections", "Reflexos RT", "R\xC3\xA9" "flexions RT", "Riflessi RT", "RT-Reflexionen"}},
+	{{"Luz RT", "RT lighting", "Luz RT", "\xC3\x89" "clairage RT", "Luce RT", "RT-Beleuchtung"}},
+	{{"Luz volum\xC3\xA9trica", "Volumetric light", "Luz volum\xC3\xA9trica", "Lumi\xC3\xA8re volum\xC3\xA9trique", "Luce volumetrica", "Volumetrisches Licht"}},
+	{{"Oclusi\xC3\xB3n ambiental", "Ambient occlusion", "Oclus\xC3\xA3o de ambiente", "Occlusion ambiante", "Occlusione ambientale", "Umgebungsverdeckung"}},
+	{{"Luz de antorchas RT", "RT torch light", "Luz de tochas RT", "Lumi\xC3\xA8re des torches RT", "Luce delle torce RT", "RT-Fackellicht"}},
+	{{"Destellos de lente", "Lens flare", "Reflexo de lente", "Reflet d'objectif", "Riflesso dell'obiettivo", "Linsenreflexe"}},
+	{{"Sombras RT", "RT shadows", "Sombras RT", "Ombres RT", "Ombre RT", "RT-Schatten"}},
+	{{"RT por hardware (experimental)", "Hardware RT (experimental)", "RT por hardware (experimental)", "RT mat\xC3\xA9riel (exp\xC3\xA9rimental)", "RT hardware (sperimentale)", "Hardware-RT (experimentell)"}},
+	{{"Reflejos (RT real)", "Reflections (hardware RT)", "Reflexos (RT real)", "R\xC3\xA9" "flexions (RT mat\xC3\xA9riel)", "Riflessi (RT hardware)", "Reflexionen (Hardware-RT)"}},
+	{{"Sombras sol (RT real)", "Sun shadows (hardware RT)", "Sombras do sol (RT real)", "Ombres du soleil (RT mat\xC3\xA9riel)", "Ombre del sole (RT hardware)", "Sonnenschatten (Hardware-RT)"}},
+	{{"Antorchas (RT real)", "Torches (hardware RT)", "Tochas (RT real)", "Torches (RT mat\xC3\xA9riel)", "Torce (RT hardware)", "Fackeln (Hardware-RT)"}},
+	{{"H\xC3\xAD" "brido", "Hybrid", "H\xC3\xAD" "brido", "Hybride", "Ibrido", "Hybrid"}},
+	{{"Media", "Medium", "M\xC3\xA9" "dia", "Moyenne", "Media", "Mittel"}},
+	{{"Extremo", "Extreme", "Extremo", "Extr\xC3\xAAme", "Estremo", "Extrem"}},
 };
 // clang-format on
 

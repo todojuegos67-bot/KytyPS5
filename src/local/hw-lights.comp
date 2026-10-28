@@ -83,14 +83,17 @@ float LightW(int i, vec3 p, vec3 n) {
 	vec3  ld  = v * inversesqrt(d2);
 	float ndl = dot(n, ld);
 	if (ndl <= 0.0) return 0.0;
+	// (lampshadow-1027) a light's intensity scales with its reach (the game ends a light where I / d^2 falls under a
+	// threshold, so I ~ r^2): the weight is relative to the reach, (r / d)^2 windowed, not absolute 1/m^2 (that made a
+	// pixel 5 m from a 15 m torch weigh 0.006 against ambient 0.03: occluded 99 %, darkened 0.0 %).
 	float win = 1.0 - d2 / (r * r);
-	float w   = win * win / (d2 + 0.25) * ndl * L.misc.y;
+	float w   = win * win * (r * r) / (d2 + 0.25) * ndl * L.misc.y;
 	if (L.dir_cos.w > -1.5) w *= smoothstep(L.dir_cos.w, L.misc.z, dot(-ld, L.dir_cos.xyz));
 	return w;
 }
 
 // 1 occluded / 0 lit, toward light i from p.
-float Shadow(int i, vec3 p, vec3 n, float z, vec2 rnd, bool smp) {
+float Shadow(int i, vec3 p, vec3 n, float z, vec2 rnd, bool smp, out float thit, out float tlen) {
 	Light L   = lb.l[i];
 	// a point on the light's sphere (uniform in the disc facing the receiver): the penumbra
 	vec3  c   = L.pos_r.xyz;
@@ -99,11 +102,13 @@ float Shadow(int i, vec3 p, vec3 n, float z, vec2 rnd, bool smp) {
 	vec3  b2  = cross(ax, b1);
 	float ang = 6.2831853 * rnd.y, rad = L.misc.x * sqrt(rnd.x);
 	vec3  tgt = c + (b1 * cos(ang) + b2 * sin(ang)) * rad;
-	vec3  o   = p + n * (lb.p1.y + 0.0015 * z);
+	// (lampshadow-1027: a larger origin offset, toward the camera too: the depth's world and the TLAS's agree to ~2 %)
+	vec3  o   = p + n * (lb.p1.y + 0.003 * z) + normalize(lb.cam.xyz - p) * (0.002 * z);
 	vec3  dv  = tgt - o;
 	float len = length(dv);
 	float tmax = len - L.misc.w;
-	float tmin = 0.01 + 0.001 * z;
+	float tmin = 0.02 + 0.002 * z;
+	thit = -1.0, tlen = len;
 	if (tmax <= tmin) return 0.0;
 	if (smp) atomicAdd(stats.s[3], 1u);
 	rayQueryEXT rq;
@@ -115,7 +120,9 @@ float Shadow(int i, vec3 p, vec3 n, float z, vec2 rnd, bool smp) {
 		float t = rayQueryGetIntersectionTEXT(rq, true);
 		atomicAdd(stats.s[4], 1u);
 		if (tmax - t < 0.5) atomicAdd(stats.s[5], 1u);
+		if (t < 0.15) atomicAdd(stats.s[12], 1u); // (at the receiver: self-hits if large)
 	}
+	if (hit) thit = rayQueryGetIntersectionTEXT(rq, true);
 	return hit ? 1.0 : 0.0;
 }
 
@@ -138,11 +145,33 @@ void Trace(ivec2 pixel) {
 		ws[i] = i < count && z < lb.p1.z ? LightW(i, p, n) : 0.0;
 		W += ws[i];
 	}
+	bool smp = (pixel.x & 3) == 0 && (pixel.y & 3) == 0; // (statistics: 1 pixel in 16)
+	if (smp && (pixel.x & 15) == 0 && (pixel.y & 15) == 0 && z < lb.p1.z) {
+		// (ds-rt-shadow) why a pixel gets no light weight: in no light's reach / in reach but facing away / facing but outside
+		// the cone (1 pixel in 256; "lit pixels 0.0 %" with 16 lights in the 10-27 logs)
+		bool reach = false, facing = false, cone = false;
+		for (int i = 0; i < count; ++i) {
+			Light L  = lb.l[i];
+			vec3  v  = L.pos_r.xyz - p;
+			float d2 = dot(v, v);
+			if (d2 >= L.pos_r.w * L.pos_r.w || d2 < 1e-6) continue;
+			reach = true;
+			vec3 ld = v * inversesqrt(d2);
+			if (dot(n, ld) <= 0.0) continue;
+			facing = true;
+			if (L.dir_cos.w <= -1.5 || dot(-ld, L.dir_cos.xyz) > L.dir_cos.w) cone = true;
+		}
+		atomicAdd(stats.s[13], 1u);
+		if (reach) atomicAdd(stats.s[14], 1u);
+		if (facing) atomicAdd(stats.s[15], 1u);
+		if (cone) atomicAdd(stats.s[16], 1u);
+		if (W > 1e-6) atomicAdd(stats.s[17], 1u);
+		if (W / (W + lb.p0.z) >= 0.03) atomicAdd(stats.s[18], 1u);
+	}
 	if (!(W > 1e-6)) {
 		imageStore(out_img, pixel, vec4(0.0, 0.0, 0.0, 0.0));
 		return;
 	}
-	bool smp = (pixel.x & 3) == 0 && (pixel.y & 3) == 0; // (statistics: 1 pixel in 16)
 	if (smp) {
 		atomicAdd(stats.s[8], 1u);
 		// The TLAS / camera alignment probe: a ray from the camera to this pixel's reconstructed position hits within
@@ -159,23 +188,36 @@ void Trace(ivec2 pixel) {
 				atomicAdd(stats.s[6], 1u);
 		}
 	}
-	int   picks = push.misc.z >= 3 ? 2 : 1;
-	float f     = float(push.misc.y % 64);
-	float occ   = 0.0;
-	for (int k = 0; k < picks; ++k) {
-		// stratified: pick k from [(k + u) / picks] of the CDF
-		float u   = (float(k) + Ign(vec2(pixel) + f * 5.588238 + float(k) * 13.0)) / float(picks);
-		float acc = 0.0;
-		int   sel = 0;
-		for (int i = 0; i < count; ++i) {
-			acc += ws[i] / W;
-			sel = i;
-			if (u < acc) break;
-		}
-		vec2 rnd = vec2(Ign(vec2(pixel.y, pixel.x) + f * 2.93 + float(k) * 37.0 + 3.0), Ign(vec2(pixel) + f * 7.13 + float(k) * 19.0 + 57.0));
-		occ += Shadow(sel, p, n, z, rnd, smp);
+	// (all2-1027) a negligible share cannot darken visibly: no ray (most "lit" pixels, the cost)
+	if (W / (W + lb.p0.z) < 0.03) {
+		imageStore(out_img, pixel, vec4(0.0, W, -1.0, 1.0));
+		return;
 	}
-	imageStore(out_img, pixel, vec4(occ / float(picks), W, 0.0, 1.0));
+	// (ds-rt-shadow 10-28) no stochastic pick: a ray to each of the pixel's strongest lights (2; 3 at Alto), the occlusion
+	// sum(w_i occ_i) / W over them (the rest counted lit). A light's weight ramps in / out, so its share of the estimate
+	// does too; the old CDF pick re-chose every pixel's light whenever the list changed (lights entered / left / cap swaps
+	// 12-24 per 10 s, 20261028-031412: max jump 168-567 %).
+	int   picks = push.misc.z >= 3 ? 3 : 2;
+	int   top[3] = int[3](-1, -1, -1);
+	for (int i = 0; i < count; ++i) {
+		if (!(ws[i] > 0.0)) continue;
+		if (top[0] < 0 || ws[i] > ws[top[0]]) { top[2] = top[1]; top[1] = top[0]; top[0] = i; }
+		else if (top[1] < 0 || ws[i] > ws[top[1]]) { top[2] = top[1]; top[1] = i; }
+		else if (top[2] < 0 || ws[i] > ws[top[2]]) top[2] = i;
+	}
+	float occ = 0.0, pen = 1e9;
+	vec2  tpx = vec2(1.0 / TraceSize().x, 0.0);
+	float pxw = max(distance(WorldPos(uv + tpx, d), p), 1e-5);
+	for (int k = 0; k < picks; ++k) {
+		int sel = top[k];
+		if (sel < 0) break;
+		// (a fixed per-pixel point on the source: a still camera traces the same rays every frame)
+		vec2 rnd = vec2(Ign(vec2(pixel.y, pixel.x) + float(sel) * 37.0 + 3.0), Ign(vec2(pixel) + float(sel) * 19.0 + 57.0));
+		float th, tl;
+		occ += ws[sel] * Shadow(sel, p, n, z, rnd, smp, th, tl);
+		if (th > 0.0) pen = min(pen, 2.0 * lb.l[sel].misc.x * th / max(tl - th, 0.05) / pxw);
+	}
+	imageStore(out_img, pixel, vec4(occ / W, W, pen < 1e8 ? min(pen, 64.0) : -1.0, 1.0));
 }
 
 void Temporal(ivec2 pixel) {
@@ -200,7 +242,7 @@ void Temporal(ivec2 pixel) {
 	wn = max(wn, 1.0);
 	m1 /= wn, m2 /= wn;
 	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
-	float n_hist = 0.0, h = cur.r;
+	float n_hist = 0.0, h = cur.r, pen_h = -1.0;
 	if (push.motion.z > 0.5) {
 		vec2 puv = uv + textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();
 		if (all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
@@ -208,13 +250,15 @@ void Temporal(ivec2 pixel) {
 			if (abs(pg.w - g.w) < 0.05 * g.w + 0.1 && dot(pg.xyz, g.xyz) > 0.8) {
 				vec4 ph = textureLod(hist_prev, puv, 0);
 				n_hist  = ph.g;
+				pen_h   = ph.a;
 				h       = clamp(ph.r, m1 - 1.5 * sigma - 0.05, m1 + 1.5 * sigma + 0.05);
 			}
 		}
 	}
 	float n_new = min(n_hist + 1.0, 32.0);
-	float a     = max(1.0 / n_new, 0.06); // (hwrt3l 10-26: a longer history, the 1-ray pick's noise steadier)
-	imageStore(out_img, pixel, vec4(mix(h, cur.r, a), n_new, cur.g, 1.0));
+	float a     = max(1.0 / n_new, 0.04); // (lampshadow-1027: ~25 frames; the variance clamp bounds the lag)
+	float pen   = cur.b >= 0.0 ? cur.b : 64.0; // (all2-1027: this frame's, no drifting history)
+	imageStore(out_img, pixel, vec4(mix(h, cur.r, a), n_new, cur.g, pen));
 }
 
 void Atrous(ivec2 pixel) {
@@ -235,7 +279,12 @@ void Atrous(ivec2 pixel) {
 			vec4  sg  = textureLod(gbuf_cur, suv, 0);
 			float w   = k[abs(x)] * k[abs(y)];
 			w *= exp(-abs(sg.w - g.w) / (0.02 * g.w + 0.03)) * pow(max(dot(sg.xyz, g.xyz), 0.0), 16.0);
-			sum += textureLod(src_tex, suv, 0).r * w;
+			vec4  sv  = textureLod(src_tex, suv, 0);
+			// contact hardening: no blur wider than the narrower penumbra of the two (sharp at contact, soft far off)
+			float reach = step * float(max(abs(x), abs(y)));
+			float pl    = 1.0 + min(max(c.a, 0.0), max(sv.a, 0.0));
+			if (reach > pl) w *= exp(-(reach - pl) / max(0.5 * pl, 0.5));
+			sum += sv.r * w;
 			wsum += w;
 		}
 	imageStore(out_img, pixel, vec4(wsum > 1e-6 ? sum / wsum : c.r, c.g, c.b, c.a));
@@ -260,7 +309,7 @@ void Composite(ivec2 pixel) {
 			if (dz < best) best = dz, v = textureLod(src_tex, suv, 0);
 		}
 		hcount = v.g, raw_occ = v.r, wsum = v.b;
-		float stable = smoothstep(1.5, 8.0, v.g); // (the history count: a reset frame darkens nothing)
+		float stable = 1.0; // (all2-1027: deterministic samples: a reset frame is already the converged value; no ramp)
 		float share  = v.b / (v.b + lb.p0.z);
 		if (best < 0.05 * z + 0.1) dark = min(lb.p0.y * share * stable * clamp(v.r, 0.0, 1.0), lb.p0.w);
 		if (isnan(dark)) dark = 0.0;

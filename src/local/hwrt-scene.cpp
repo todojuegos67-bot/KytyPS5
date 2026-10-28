@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
 #include "local/frame-gen.h"
+#include "local/rt-water.h"
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 #include "local/vulkan-recording.h"
 #endif
@@ -151,6 +152,7 @@ struct Entry {
 	int32_t  layer = -1;
 	uint64_t albedo_key = 0;
 	uint32_t albedo_binding = 0, albedo_element = 0;
+	bool     water = false; // (KYTY_HWRT_WATER) drawn by a water pixel shader: the water TLAS only
 };
 
 struct Job {
@@ -220,6 +222,13 @@ struct State {
 	vk::AccelerationStructureKHR tlas = nullptr;
 	vk::DeviceAddress            tlas_address = 0;
 	bool                         tlas_built = false;
+	// (KYTY_HWRT_WATER) the water surfaces' TLAS (made on the first frame with a water mesh)
+	Buffer                       winstances[Slots], wmaterials[Slots], wtlas_buf, wscratch;
+	vk::AccelerationStructureKHR wtlas = nullptr;
+	bool                         wtlas_built = false;
+	int                          w_slot = -1;
+	uint32_t                     w_instances = 0;
+	uint64_t                     w_draws = 0, w_frames = 0;
 	vk::DeviceSize scratch_align = 256;
 	vk::Pipeline       gather = nullptr, debug = nullptr, debug11 = nullptr;
 	vk::PipelineLayout gather_layout = nullptr, debug_layout = nullptr;
@@ -1443,10 +1452,26 @@ TextureCache*   g_cache    = nullptr; // (hwrt3: the draws' texture cache, rende
 
 } // namespace
 
+bool RtHwExperimental() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_RT_HW_EXPERIMENTAL");
+		return value != nullptr && *value == '1';
+	}();
+	return on;
+}
+
 bool Requested() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_HWRT");
-		return value != nullptr && *value == '1';
+		// (ds-rt1026-restore) The hardware-RT effects (TLAS: reflections, sun, lamps, GI, water, volumetric) are out of the
+		// default build again: KYTY_HWRT=1 is honoured only with KYTY_RT_HW_EXPERIMENTAL=1 ("RT real (experimental)").
+		const bool  asked = value != nullptr && *value == '1';
+		if (asked && !RtHwExperimental()) {
+			std::printf("HWRT: KYTY_HWRT=1 ignored: the 10-26 screen-space RT set is in use (KYTY_RT_HW_EXPERIMENTAL=1: the hardware RT, experimental)\n");
+			std::fflush(stdout);
+			return false;
+		}
+		return asked;
 	}();
 	return on;
 }
@@ -1597,10 +1622,12 @@ bool Note(uint32_t record, const Draw& d) {
 		return false;
 	}
 	auto&          rec = static_cast<Record*>(g.records.mapped)[record];
+	const bool     water = FrameGen::RtWaterIsWaterPs(d.ps); // (KYTY_HWRT_WATER: false when off)
 	const uint64_t key = Mix(Mix(Mix(Mix(Mix(d.vs, d.index_address), uint64_t {d.index_count} << 32u | d.instance_count),
 	                                 static_cast<uint32_t>(d.vertex_offset)),
 	                             d.index_size),
-	                         0x5eedULL);
+	                         water ? 0x3a7e5eedULL : 0x5eedULL);
+	if (water) ++g.w_draws;
 	if (d.index_count < 3 || d.instance_count == 0 || d.index_address == 0) {
 		++g.skips[static_cast<uint32_t>(Skip::Topology)];
 		g.cpu_note_ms += Ms(start);
@@ -1616,6 +1643,7 @@ bool Note(uint32_t record, const Draw& d) {
 		found = g.entries.emplace(key, Entry {}).first;
 		auto& e = found->second;
 		e.key = key, e.id = g.next_id++ & 0xffffffu, e.vs = d.vs, e.ps = d.ps;
+		e.water = water;
 		e.next_check = g.frame + 32 + (e.id & 31u);
 	}
 	auto& e     = found->second;
@@ -1642,7 +1670,7 @@ bool Note(uint32_t record, const Draw& d) {
 			g.cpu_note_ms += Ms(start);
 			return false;
 		}
-		if (g.material && !e.material_tried) ChooseMaterial(e, d); // (hwrt3)
+		if (g.material && !e.material_tried && !e.water) ChooseMaterial(e, d); // (hwrt3)
 		++g.builds;
 		g.build_tris += e.tris;
 		job.build = true;
@@ -1764,6 +1792,11 @@ struct FramePayload {
 	vk::AccelerationStructureBuildGeometryInfoKHR                  tlas_info {};
 	vk::AccelerationStructureBuildRangeInfoKHR                     tlas_range {};
 	bool                                                           tlas = false;
+	// (KYTY_HWRT_WATER) the water TLAS's build
+	vk::AccelerationStructureGeometryKHR                           wtlas_geometry {};
+	vk::AccelerationStructureBuildGeometryInfoKHR                  wtlas_info {};
+	vk::AccelerationStructureBuildRangeInfoKHR                     wtlas_range {};
+	bool                                                           wtlas = false;
 	uint32_t                                                       slot = 0;
 	// (hwrt3) the albedo array's first transition, and the base-colour copies into it
 	struct CopyCmd {
@@ -1779,6 +1812,71 @@ struct FramePayload {
 std::array<float, 16> g_inv {};
 std::array<float, 4>  g_cam {};
 bool                  g_frame_camera = false;
+std::vector<Entry*>   water_order; // (KYTY_HWRT_WATER) the frame's water meshes, in id order
+
+// (KYTY_HWRT_WATER) The water meshes' TLAS: instances as the scene's (identity transform, both faces), cull mask 0xff.
+constexpr uint32_t MaxWaterInstances = 1024;
+void BuildWaterTlas(GraphicContext& graphics, FramePayload& p, uint32_t slot, const std::vector<Entry*>& water) {
+	const VkBufferUsageFlags as_input = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+	if (g.winstances[slot].buffer == VK_NULL_HANDLE &&
+	    !MakeBuffer(graphics, g.winstances[slot], vk::DeviceSize {MaxWaterInstances} * sizeof(VkAccelerationStructureInstanceKHR), as_input, true))
+		return;
+	if (g.wmaterials[slot].buffer == VK_NULL_HANDLE &&
+	    !MakeBuffer(graphics, g.wmaterials[slot], vk::DeviceSize {MaxWaterInstances} * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true))
+		return;
+	auto*    instances = static_cast<VkAccelerationStructureInstanceKHR*>(g.winstances[slot].mapped);
+	auto*    materials = static_cast<uint32_t*>(g.wmaterials[slot].mapped);
+	uint32_t n         = 0;
+	for (const Entry* ep: water) {
+		if (n >= MaxWaterInstances) break;
+		const Entry&                       e = *ep;
+		VkAccelerationStructureInstanceKHR instance {};
+		instance.transform.matrix[0][0] = instance.transform.matrix[1][1] = instance.transform.matrix[2][2] = 1.0f;
+		instance.instanceCustomIndex            = e.id;
+		instance.mask                           = 0xff;
+		instance.flags                          = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+		instance.accelerationStructureReference = e.blas_address;
+		instances[n]                            = instance;
+		materials[n * 8 + 0] = static_cast<uint32_t>(e.ps);
+		materials[n * 8 + 1] = static_cast<uint32_t>(e.ps >> 32u);
+		materials[n * 8 + 2] = static_cast<uint32_t>(e.vs);
+		materials[n * 8 + 3] = e.id;
+		materials[n * 8 + 4] = static_cast<uint32_t>(e.vb.address);
+		materials[n * 8 + 5] = static_cast<uint32_t>(e.vb.address >> 32u);
+		materials[n * 8 + 6] = static_cast<uint32_t>(e.ib.address);
+		materials[n * 8 + 7] = static_cast<uint32_t>(e.ib.address >> 32u);
+		++n;
+	}
+	if (n == 0) return;
+	vk::AccelerationStructureGeometryInstancesDataKHR instances_data {};
+	instances_data.arrayOfPointers       = VK_FALSE;
+	instances_data.data.deviceAddress    = g.winstances[slot].address;
+	p.wtlas_geometry.geometryType       = vk::GeometryTypeKHR::eInstances;
+	p.wtlas_geometry.geometry.instances = instances_data;
+	auto& info         = p.wtlas_info;
+	info.type          = vk::AccelerationStructureTypeKHR::eTopLevel;
+	info.flags         = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
+	info.mode          = vk::BuildAccelerationStructureModeKHR::eBuild;
+	info.geometryCount = 1;
+	info.pGeometries   = &p.wtlas_geometry;
+	const uint32_t max_instances = MaxWaterInstances;
+	vk::AccelerationStructureBuildSizesInfoKHR sizes {};
+	graphics.device.getAccelerationStructureBuildSizesKHR(vk::AccelerationStructureBuildTypeKHR::eDevice, &info, &max_instances, &sizes);
+	if (g.wtlas == nullptr &&
+	    !MakeAs(graphics, g.wtlas_buf, g.wtlas, sizes.accelerationStructureSize, vk::AccelerationStructureTypeKHR::eTopLevel))
+		return;
+	if (g.wscratch.buffer == VK_NULL_HANDLE &&
+	    !MakeBuffer(graphics, g.wscratch, sizes.buildScratchSize + g.scratch_align, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false))
+		return;
+	info.dstAccelerationStructure  = g.wtlas;
+	info.scratchData.deviceAddress = (g.wscratch.address + g.scratch_align - 1) / g.scratch_align * g.scratch_align;
+	p.wtlas_range.primitiveCount   = n;
+	p.wtlas                        = true;
+	g.wtlas_built                  = true;
+	g.w_slot                       = static_cast<int>(slot);
+	g.w_instances                  = n;
+	++g.w_frames;
+}
 
 } // namespace
 
@@ -1994,6 +2092,7 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 		// the unordered map's order moved with every insert and rehash.
 		static std::vector<Entry*> order;
 		order.clear();
+		water_order.clear();
 		for (auto it = g.entries.begin(); it != g.entries.end();) {
 			auto& e = it->second;
 			if (e.last_seen + uint64_t {KeepFrames()} * 4 < g.frame && e.last_seen + KeepFrames() < g.frame) {
@@ -2011,6 +2110,10 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 		uint32_t added = 0;
 		for (Entry* ep: order) {
 			auto& e = *ep;
+			if (e.water) { // (KYTY_HWRT_WATER: its own TLAS, below; never the scene's)
+				water_order.push_back(ep);
+				continue;
+			}
 			if (instance_count < MaxInstances) {
 				VkAccelerationStructureInstanceKHR instance {};
 				instance.transform.matrix[0][0] = instance.transform.matrix[1][1] = instance.transform.matrix[2][2] = 1.0f;
@@ -2108,6 +2211,8 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 		}
 	}
 	g.tlas_built = payload->tlas;
+	g.wtlas_built = false;
+	if (payload->tlas && !water_order.empty()) BuildWaterTlas(graphics, *payload, slot, water_order);
 	// (hwrt2) The frame's scene for the ray-traced effects: clip <-> world, the camera, the materials.
 	g.ray_slot = -1;
 	if (g.tlas_built && camera) {
@@ -2212,6 +2317,10 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 			         vk::AccessFlagBits2::eAccelerationStructureReadKHR | vk::AccessFlagBits2::eAccelerationStructureWriteKHR);
 			const vk::AccelerationStructureBuildRangeInfoKHR* tlas_ranges = &payload->tlas_range;
 			cmd.buildAccelerationStructuresKHR(1, &payload->tlas_info, &tlas_ranges, d);
+			if (payload->wtlas) { // (KYTY_HWRT_WATER: its own scratch and destination; the same barriers cover it)
+				const vk::AccelerationStructureBuildRangeInfoKHR* water_ranges = &payload->wtlas_range;
+				cmd.buildAccelerationStructuresKHR(1, &payload->wtlas_info, &water_ranges, d);
+			}
 			// (rtstab) The TLAS build -> every ray query of the frame, compute or fragment, and the BLAS/vertex reads
 			// (the hit normals read the vertex buffers the gather wrote).
 			BarrierD(cmd, d, vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR, vk::AccessFlagBits2::eAccelerationStructureWriteKHR,
@@ -2300,6 +2409,27 @@ bool CurrentRayScene(RayScene& out) {
 	return true;
 }
 
+bool CurrentWaterScene(WaterScene& out) {
+	out = {};
+	if (!Active()) return false;
+	std::lock_guard lock(g.mutex);
+	if (!g.ready || !g.wtlas_built || g.wtlas == nullptr || g.w_slot < 0) return false;
+	out.tlas      = g.wtlas;
+	out.materials = g.wmaterials[g.w_slot].address;
+	out.instances = g.w_instances;
+	return true;
+}
+
+void WaterCounters(uint64_t& draws, uint32_t& known, uint32_t& built, uint64_t& frames) {
+	draws = frames = 0, known = built = 0;
+	if (!Active()) return;
+	std::lock_guard lock(g.mutex);
+	draws  = g.w_draws;
+	frames = g.w_frames;
+	for (const auto& [key, e]: g.entries)
+		if (e.water) ++known, built += e.built ? 1u : 0u;
+}
+
 bool SceneCamera(std::array<float, 16>& vp) {
 	if (!Active()) return false;
 	std::lock_guard lock(g.mutex);
@@ -2325,6 +2455,19 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 		DebugView(graphics, command, images[6].image_view, output.backing.format,
 		          vk::Extent2D {output.backing.extent.width, output.backing.extent.height});
 	}
+}
+
+// (hwrt2g, KYTY_HWRT_AO / KYTY_HWRT_GI: hwrt-gi.cpp) The scene just built, for a pass recorded after it in this frame.
+bool GiScene(GiSceneInfo& out) {
+	out = {};
+	if (!Active()) return false;
+	std::lock_guard lock(g.mutex);
+	if (!g.ready || g.tlas == nullptr || !g.tlas_built || !g_frame_camera) return false;
+	out.tlas = g.tlas;
+	out.inv  = g_inv;
+	out.vp   = g.view_proj;
+	out.cam  = g_cam;
+	return true;
 }
 
 } // namespace Libs::Graphics::HwScene

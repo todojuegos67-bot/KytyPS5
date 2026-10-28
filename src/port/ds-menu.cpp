@@ -449,6 +449,11 @@ bool NeedsRestartLive(const Settings& launched, const Settings& now) {
 	if ((off & 1) != 0) n.rt_reflections = launched.rt_reflections;
 	if ((off & 2) != 0) n.rt_lamps = LampLevel(launched), n.rt_particles = launched.rt_particles;
 	if ((off & 4) != 0) n.godrays = launched.godrays;
+	if ((off & 8) != 0) n.ao = launched.ao;
+	if ((off & 16) != 0) n.torch = launched.torch;
+	if ((off & 32) != 0) n.lens_flare = launched.lens_flare;
+	if ((off & 64) != 0) n.rt_shadows = launched.rt_shadows;
+	if ((off & 1) != 0) n.rt_ss_refl = launched.rt_ss_refl;
 	return NeedsRestart(launched, n);
 }
 
@@ -1055,17 +1060,24 @@ void Draw(float width, float height) {
 					ResolutionRow(s);
 					static std::vector<ResMode> shown;
 					shown.clear();
-					for (int i = 0; i < kResModeCount; i++)
-						if (nvidia || std::strcmp(kResModes[i].upscaler, "dlss") != 0) shown.push_back(kResModes[i]);
+					// (10-28) FSR 4: the 3D at 360 lines at least (its model outputs at the display's size).
+					int out_h = g_rt.pc.screen_h > 0 ? g_rt.pc.screen_h : 1440;
+					if (int w = 0, h = 0; s.fullscreen && std::sscanf(s.resolution.c_str(), "%dx%d", &w, &h) == 2 && h > 0) out_h = h;
+					else if (!s.fullscreen && s.height > 0) out_h = s.height;
+					for (int i = 0; i < kResModeCount; i++) {
+						if (!nvidia && std::strcmp(kResModes[i].upscaler, "dlss") == 0) continue;
+						if (std::strcmp(kResModes[i].upscaler, "fsr4") == 0 && out_h / kResModes[i].value < 359 && s.res != kResModes[i].id) continue;
+						shown.push_back(kResModes[i]);
+					}
 					ComboRow("Reescalado", true, static_cast<int>(shown.size()), shown.data(), s.res, [](const ResMode& m) { return m.id; },
 					         [](const ResMode& m) { return m.label; },
-					         "Reescalado: dibuja el 3D a menos resolucion y lo sube a 1440 (mas fps). DLSS: NVIDIA RTX. XeSS y FSR: todas las graficas.");
+					         "Reescalado: dibuja el 3D a menos resolucion y lo sube a la de la pantalla (mas fps). DLSS: NVIDIA RTX. XeSS, FSR 3.1 y FSR 4: todas las graficas (FSR 4: modelo de AMD con INT8, RTX 20 / RX 6000 o mas nuevas; el 3D a 360 lineas como minimo).");
 					ImGui::BeginDisabled(!nvidia);
 					ChoiceRow("Preset DLSS", true, kDlssPresets, kDlssPresetCount, s.dlss_preset,
 					          "Modelo de DLSS: auto (el de NVIDIA), K = DLSS 4, L y M = DLSS 4.5 (mas nitidos, algo mas lentos)");
 					ImGui::EndDisabled();
 					if (ChoiceRow("Nitidez", (s.sharpness == "auto") != (g_rt.launched.sharpness == "auto"), kSharpness, kSharpnessCount, s.sharpness,
-					              "Nitidez del reescalado (DLSS, XeSS y FSR). Mas alto: mas nitido, pero puede marcar bordes y ruido."))
+					              "Nitidez del reescalado (DLSS, XeSS, FSR 3.1 y FSR 4), aplicada a la resolucion de la pantalla. Mas alto: mas nitido, pero puede marcar bordes y ruido."))
 						live_changed = true;
 					if (!nvidia) ImGui::TextColored(kDim, "Sin DLSS: tu grafica no es NVIDIA.");
 					break;
@@ -1133,51 +1145,74 @@ void Draw(float width, float height) {
 					ImGui::TextColored(kDim, "%s", "Son ajustes internos del juego: los lee al arrancar.");
 					break;
 				}
-				case 3: { // Ray tracing (the launcher's rows; "Rayos de luz RT" (hwvolsh) does not exist in this engine)
-					static const Choice yes_no[] = {{"0", "No"}, {"1", "Sí"}};
-					static const Choice levels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}};
+				case 3: { // Ray tracing (ds-torch-1028's launcher rows, in its order; hardware RT only with the experimental switch)
 					const Settings& l       = g_rt.launched;
 					const bool      live_ok = !l.pure_game;
 					// (10-28) Turning a launched pass off is live (PortLive::rt_off); on, or another level, needs a restart.
-					const auto restart_lvl = [&](const std::string& was, const std::string& now) {
-						const std::string a = was.empty() ? "0" : was, b = now.empty() ? "0" : now;
-						return !(a == b || (b == "0" && live_ok));
-					};
+					const auto changed_not_live = [&](bool changed, int bit) { return changed && !(live_ok && (LiveRtOff(l, s) & bit) != 0); };
 					ImGui::BeginDisabled(s.pure_game);
-					{
-						std::string x = s.rt_reflections ? "1" : "0";
-						if (ChoiceRow("Reflejos", restart_lvl(l.rt_reflections ? "1" : "0", x), yes_no, 2, x,
-						              "Reflejos con trazado de rayos: refleja también lo que está fuera de pantalla o tapado, con sus texturas. Apagarlo es inmediato.")) {
-							s.rt_reflections = x == "1";
-							live_changed     = true;
-						}
-					}
-					const bool sun_was = s.rt_sun;
-					{
-						std::string x = s.rt_sun ? "1" : "0";
-						if (ChoiceRow("Sombras sol", s.rt_sun != l.rt_sun, yes_no, 2, x,
-						              "Sombras del sol con trazado de rayos: sombras de contacto y las que faltaban. No se puede usar a la vez que la Luz volumétrica."))
-							s.rt_sun = x == "1";
-					}
-					{
-						std::string lamps = LampLevel(s);
-						if (ChoiceRow("Antorchas", restart_lvl(LampLevel(l), lamps), levels, 4, lamps,
-						              "Antorchas, lámparas, fuego y magia iluminan lo que tienen cerca con trazado de rayos y sombras reales. Bajo / Medio / Alto: más luces y más rayos. Apagarlo es inmediato.")) {
-							s.rt_lamps     = lamps;
-							s.rt_particles = lamps != "0";
-							live_changed   = true;
-						}
-					}
-					const std::string rays_was = s.godrays;
-					if (ChoiceRow("Luz volumétrica", restart_lvl(l.godrays, s.godrays), levels, 4, s.godrays,
+					if (ChoiceRow("Reflejos RT", changed_not_live(l.rt_ss_refl != s.rt_ss_refl, 1),
+					              kRtReflLevels, kRtReflLevelCount, s.rt_ss_refl,
+					              "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Beta. Apagarlo es inmediato."))
+						live_changed = true;
+					ChoiceRow("Luz RT", s.rt_ssgi != l.rt_ssgi, kRtLightLevels, kRtLightLevelCount, s.rt_ssgi,
+					          "Iluminación por rayos sobre la imagen (luz rebotada y sombreado de contacto). Solo funciona con DLSS, XeSS o FSR. Cuesta FPS. Experimental.");
+					if (ChoiceRow("Luz volumétrica", changed_not_live(l.godrays != s.godrays, 4), kRtLevels, kRtLevelCount, s.godrays,
 					              "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms. Apagarla es inmediato."))
 						live_changed = true;
-					// (vol25) Luz volumetrica and Sombras sol share the engine's sun pass: choosing one turns the other off.
-					if (s.rt_sun && !sun_was && s.godrays != "0") s.godrays = "0";
-					else if (s.godrays != "0" && s.godrays != rays_was && s.rt_sun) s.rt_sun = false;
+					if (ChoiceRow("Oclusión ambiental", changed_not_live(l.ao != s.ao, 8), kRtLevels, kRtLevelCount, s.ao,
+					              "Oclusión ambiental nueva (sin RT por hardware): oscurece solo la luz ambiental en rincones, juntas y bajo objetos, con radio en metros, sin halos ni ruido; nunca el cielo, el fuego ni lo emisivo. Sustituye a la oclusión del juego. Solo con DLSS, XeSS o FSR. Ahora mismo cuesta unos 7 ms en el juego (se está arreglando): mejor en No. Apagarla es inmediato."))
+						live_changed = true;
+					if (ChoiceRow("Luz de antorchas RT", changed_not_live(l.torch != s.torch, 16), kTorchLevels, kTorchLevelCount, s.torch,
+					              "Luz de antorchas RT: el fuego de antorchas, braseros y hogueras ilumina paredes, suelos y estructuras cercanas con un rebote cálido que parpadea, y se refleja en superficies lisas o mojadas. No atraviesa paredes ni personajes. Solo en pantalla, sin RT por hardware. Solo con DLSS, XeSS o FSR. Bajo 2 fuegos ~0,3 ms, Medio 4 ~0,5 ms, Alto 8 ~0,9 ms. Híbrido: Alto + rayos por hardware (RT real) donde la pantalla no ve al que tapa la luz; solo oscurece, nunca añade luz. Necesita GPU con RT. ~+0,5 ms. Apagarla es inmediato."))
+						live_changed = true;
+					{
+						std::string x = s.lens_flare ? "1" : "0";
+						if (ChoiceRow("Destellos de lente", changed_not_live(l.lens_flare != s.lens_flare, 32), kYesNo, kYesNoCount, x,
+						              "Destello de lente de antorchas y fuegos visibles: pequeños reflejos de la óptica, una estrella y una raya suaves. Desaparece si el fuego queda tapado y cerca de los bordes. Se dibuja antes del HUD. Solo con DLSS, XeSS o FSR. ~0,1 ms. Apagarlo es inmediato.")) {
+							s.lens_flare = x == "1";
+							live_changed = true;
+						}
+					}
+					if (ChoiceRow("Sombras RT", changed_not_live(s.rt_shadows != l.rt_shadows, 64), kRtLevels, kRtLevelCount, s.rt_shadows,
+					              "Sombras del sol por rayos sobre la imagen (de pantalla, sin RT real): sombras de contacto que las del juego pierden (bajo brazos, entre piernas, junto a muros), con borde suave y estable. Solo donde el juego ya muestra sol. Solo con DLSS, XeSS o FSR. Bajo ~0,3 ms, Medio ~0,6 ms, Alto ~1 ms."))
+						live_changed = true;
 					ImGui::EndDisabled();
+					CheckRow("RT por hardware (experimental)", s.rt_hw_exp != l.rt_hw_exp, s.rt_hw_exp,
+					         "Activa las opciones de trazado de rayos por hardware (Reflejos, Sombras sol y Antorchas por RT real). Experimental: puede tener fallos y cuesta mucha GPU y VRAM. Necesita GPU con RT.");
+					if (s.rt_hw_exp) {
+						ImGui::BeginDisabled(s.pure_game);
+						{
+							std::string x = s.rt_reflections ? "1" : "0";
+							if (ChoiceRow("Reflejos (RT real)", changed_not_live(s.rt_reflections != l.rt_reflections || (s.rt_reflections && !l.rt_hw_exp), 1), kYesNo, kYesNoCount, x,
+							              "Reflejos con trazado de rayos: refleja también lo que está fuera de pantalla o tapado, con sus texturas. Apagarlo es inmediato.")) {
+								s.rt_reflections = x == "1";
+								live_changed     = true;
+							}
+						}
+						const bool sun_was = s.rt_sun;
+						{
+							std::string x = s.rt_sun ? "1" : "0";
+							if (ChoiceRow("Sombras sol (RT real)", s.rt_sun != l.rt_sun || (s.rt_sun && !l.rt_hw_exp), kYesNo, kYesNoCount, x,
+							              "Sombras del sol con trazado de rayos: sombras de contacto y las que faltaban. No se puede usar a la vez que la Luz volumétrica ni las Sombras RT."))
+								s.rt_sun = x == "1";
+						}
+						{
+							std::string lamps = LampLevel(s);
+							if (ChoiceRow("Antorchas (RT real)", changed_not_live(LampLevel(l) != lamps || (lamps != "0" && !l.rt_hw_exp), 2), kRtLevels, kRtLevelCount, lamps,
+							              "Antorchas, lámparas, fuego y magia iluminan lo que tienen cerca con trazado de rayos y sombras reales. Bajo / Medio / Alto: más luces y más rayos. Apagarlo es inmediato.")) {
+								s.rt_lamps     = lamps;
+								s.rt_particles = lamps != "0";
+								live_changed   = true;
+							}
+						}
+						// (vol25) Luz volumetrica / Sombras RT and Sombras sol share the engine's sun pass: choosing one turns the other off.
+						if (s.rt_sun && !sun_was) s.godrays = "0", s.rt_shadows = "0";
+						ImGui::EndDisabled();
+					}
+					if (s.rt_sun && s.rt_hw_exp && (s.godrays != "0" || s.rt_shadows != "0")) s.rt_sun = false;
 					if (CheckRow("Juego original (sin efectos añadidos)", s.pure_game != l.pure_game, s.pure_game,
-					             "Apaga todos los efectos visuales que añade el emulador (ray tracing, luz volumétrica, sombras RT, brillo, oclusión, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, frame generation y latencia no cambian."))
+					             "Apaga todos los efectos visuales que añade el emulador (ray tracing, luz volumétrica, sombras RT, oclusión, luz de antorchas, destellos, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, frame generation y latencia no cambian."))
 						live_changed = true;
 					break;
 				}

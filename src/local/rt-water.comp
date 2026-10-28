@@ -1,0 +1,441 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// (water2, 10-27 owner logs: RTFLICKER water 5-28 %, 3.6-4.4 ms, no water draw seen - puddles only) Fixes: the puddle
+// mask came straight from the game's SSR confidence of this frame (it flickers with its own jitter) and the depth
+// normal's level test, so kind / weight toggled and 45-70 % of the history was rejected as disoccluded every frame;
+// now a per-pixel wetness (aux.y's fraction) is reprojected and filtered (6 % a frame) with hysteresis, and a still
+// camera never rejects history by the virtual image's distance. Cost: the statistics were ~60k same-address atomics a
+// frame; now one per subgroup; Medio traces at half resolution.
+// KYTY_HWRT_WATER=1|2|3 (rt-water.cpp): ray-traced mirror reflections on water and puddles, on the PS5 Pro path's
+// render-resolution HDR color before the upscaler, after KYTY_RT_REFLECTIONS (whose output it reads as is).
+//
+// Water is found by geometry, not guessed: the draws of the game's water-surface pixel shader (7a59c1a20cbe5d4a, drawn
+// forward after the deferred lighting, so it is in neither the G-buffer nor the game's SSR, and the depth it leaves may
+// be the bed's) are captured by KYTY_HWRT into a TLAS of their own (hwrt-scene.cpp BuildWaterTlas). A pixel is water when
+// the camera ray through it meets that TLAS before the depth buffer's surface; the hit gives the exact surface point and
+// the triangle's normal. Puddles / wet stone: up-facing flat pixels where the game's own SSR (its confidence, the guide
+// KYTY_RT_REFLECTIONS copies) says the surface reflects.
+//
+// Modes (push.misc.x):
+//   0 trace     (half resolution at 1, full at 2 / 3): the surface point and normal (water TLAS / depth), a static
+//               world-space ripple (no time term: a still camera sees a still image), one mirror ray into the scene TLAS
+//               (static meshes, mask 0x01: what the other passes found stable). A hit visible on the screen, or the sky
+//               on the screen, gives the frame's colour there; anything else no sample (the game's own reflection stays).
+//               Out: rgb tonemapped colour, a its weight (Schlick Fresnel, f0 0.02, raised to the minimum reflectance, x
+//               confidence); aux: hit distance, kind (1 water, 2 puddle), target weight, surface distance.
+//   1 temporal  history of the virtual image (the hit reprojected along the mirrored ray: the reflection does not slide
+//               with the surface), disocclusion (the surface's kind and distance at its own previous position), the
+//               3x3 neighbourhood's mean +- gamma sigma clamp, the firefly clamp (3x the neighbourhood's mean luma),
+//               alpha 0.08 still / 0.2 moving, 1 without history.
+//   2 composite (render resolution): weighted bilinear of the history, color = mix(color, reflection, weight).
+// Statistics into stats[] (sampled pixels only: 1 in 16 / 64): see rt-water.cpp.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;  // linear
+layout(binding = 1) uniform sampler2D depth_tex;  // point
+layout(binding = 2) uniform sampler2D hist_prev;  // linear
+layout(binding = 3) uniform sampler2D aux_prev;   // point
+layout(binding = 4) uniform sampler2D src_tex;    // point: the mode's input
+layout(binding = 5) uniform sampler2D src_aux;    // point
+layout(binding = 6, rgba16f) uniform writeonly image2D out_img;
+layout(binding = 7, rgba16f) uniform writeonly image2D out_aux;
+layout(binding = 8, std430) readonly buffer Params {
+	vec4  ivp[4];  // clip -> world rows (this frame)
+	vec4  vp[4];   // world -> clip rows (this frame)
+	vec4  pvp[4];  // world -> clip rows (the previous frame)
+	vec4  cam;     // xyz camera
+	vec4  p0;      // x y sign of row 0 (-1: NDC y +1), y max ray distance (m), z puddle guide threshold, w ripple amplitude
+	vec4  p1;      // x strength, y minimum reflectance (water), z puddle share, w exposure fallback (1.0)
+	uvec4 wmat;    // xy the water materials' address, z water instances
+} pb;
+layout(binding = 9) uniform accelerationStructureEXT scene_tlas;
+layout(binding = 10) uniform accelerationStructureEXT water_tlas;
+layout(binding = 11, std430) buffer Stats { uint s[]; } stats;
+layout(binding = 12) uniform sampler2D guide_tex; // the game's SSR (rgb, a confidence), half resolution; linear
+layout(binding = 13, std430) readonly buffer Exposure { float e[]; } exposure;
+
+layout(push_constant) uniform Push {
+	vec4  size;  // render size xy, trace size zw
+	ivec4 misc;  // mode, frame, level, flags (1 history, 2 water TLAS, 4 guide, 8 camera still)
+	ivec4 misc2; // x exposure index
+	vec4  pad;
+} push;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint w[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Verts { vec4 v[]; };
+
+const float FAR = 1.0e4;
+
+vec2  RenderSize() { return push.size.xy; }
+vec2  TraceSize() { return push.size.zw; }
+bool  Flag(int f) { return (push.misc.w & f) != 0; }
+bool  IsSky(float d) { return d <= 1e-7 || d >= 0.9999999; }
+float Max3(vec3 c) { return max(c.r, max(c.g, c.b)); }
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+bool  BadV(vec3 v) { return any(isnan(v)) || any(isinf(v)); }
+vec3  SafeColor(vec3 c) { return BadV(c) ? vec3(0) : clamp(c, vec3(0), vec3(6.0e4)); }
+float GameExposure() {
+	float x = exposure.e[push.misc2.x];
+	return (x > 1e-12 && x < 1e12) ? x : 1.0;
+}
+vec3 Tonemap(vec3 c) { return c / (1.0 + Max3(c)); }
+vec3 InvTonemap(vec3 t) { return t / max(1.0 - min(Max3(t), 0.999), 1e-3); }
+bool InScreen(vec2 uv) { return all(greaterThanEqual(uv, vec2(0))) && all(lessThanEqual(uv, vec2(1))); }
+const int NStat = 18;
+uint g_st[NStat];
+void Stat(uint i, uint v) { g_st[i] += v; }
+void FlushStats() {
+	for (int i = 0; i < NStat; ++i) {
+		uint s = subgroupAdd(g_st[i]);
+		if (subgroupElect() && s > 0u) atomicAdd(stats.s[i], s);
+	}
+}
+float KindOf(float y) { return floor(y + 0.001); }
+float WetOf(float y) { return y - KindOf(y); }
+
+vec3 WorldPos(vec2 uv, float d) {
+	vec4 c = vec4(uv.x * 2.0 - 1.0, pb.p0.x * (uv.y * 2.0 - 1.0), d, 1.0);
+	vec4 w = vec4(dot(pb.ivp[0], c), dot(pb.ivp[1], c), dot(pb.ivp[2], c), dot(pb.ivp[3], c));
+	return w.xyz / (abs(w.w) > 1e-20 ? w.w : 1e-20);
+}
+// world -> (uv, depth, valid) through the rows m
+vec4 ToScreen(vec4 m0, vec4 m1, vec4 m2, vec4 m3, vec3 p) {
+	vec4 q = vec4(p, 1.0);
+	vec4 c = vec4(dot(m0, q), dot(m1, q), dot(m2, q), dot(m3, q));
+	if (c.w <= 1e-6) return vec4(-1.0, -1.0, 0.0, 0.0);
+	return vec4(c.x / c.w * 0.5 + 0.5, pb.p0.x * (c.y / c.w) * 0.5 + 0.5, c.z / c.w, 1.0);
+}
+vec4 Project(vec3 p) { return ToScreen(pb.vp[0], pb.vp[1], pb.vp[2], pb.vp[3], p); }
+vec4 ProjectPrev(vec3 p) { return ToScreen(pb.pvp[0], pb.pvp[1], pb.pvp[2], pb.pvp[3], p); }
+
+ivec2 RenderPixel(vec2 uv) { return clamp(ivec2(uv * RenderSize()), ivec2(0), ivec2(RenderSize()) - 1); }
+float DepthAtPixel(ivec2 p) { return texelFetch(depth_tex, clamp(p, ivec2(0), ivec2(RenderSize()) - 1), 0).r; }
+
+// The depth's normal at a render pixel (the smaller of the two one-sided differences per axis: no bleeding over edges).
+vec3 DepthNormal(ivec2 p, vec3 P) {
+	vec2 inv = 1.0 / RenderSize();
+	vec3 px = WorldPos((vec2(p + ivec2(1, 0)) + 0.5) * inv, DepthAtPixel(p + ivec2(1, 0)));
+	vec3 nx = WorldPos((vec2(p - ivec2(1, 0)) + 0.5) * inv, DepthAtPixel(p - ivec2(1, 0)));
+	vec3 py = WorldPos((vec2(p + ivec2(0, 1)) + 0.5) * inv, DepthAtPixel(p + ivec2(0, 1)));
+	vec3 ny = WorldPos((vec2(p - ivec2(0, 1)) + 0.5) * inv, DepthAtPixel(p - ivec2(0, 1)));
+	vec3 dx = length(px - P) < length(P - nx) ? px - P : P - nx;
+	vec3 dy = length(py - P) < length(P - ny) ? py - P : P - ny;
+	vec3 n  = cross(dx, dy);
+	return length(n) > 1e-12 ? normalize(n) : vec3(0, 1, 0);
+}
+
+// A static value noise (world xz, metres): the ripple's slopes. No time term (a still camera keeps a still image).
+float Hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float Noise(vec2 p) {
+	vec2 i = floor(p), f = fract(p);
+	vec2 u = f * f * (3.0 - 2.0 * f);
+	return mix(mix(Hash(i), Hash(i + vec2(1, 0)), u.x), mix(Hash(i + vec2(0, 1)), Hash(i + vec2(1, 1)), u.x), u.y);
+}
+vec2 Slope(vec2 p) {
+	const float e = 0.05;
+	return vec2(Noise(p + vec2(e, 0)) - Noise(p - vec2(e, 0)), Noise(p + vec2(0, e)) - Noise(p - vec2(0, e))) / (2.0 * e);
+}
+vec3 Ripple(vec3 N, vec3 P, float amp, float dist) {
+	if (amp <= 0.0 || N.y < 0.9) return N;
+	// (two scales; faded with distance so far water stays a clean mirror instead of aliasing)
+	vec2 s = Slope(P.xz * 1.6) * 0.6 + Slope(P.xz * 5.3 + 17.0) * 0.4;
+	s *= amp * (1.0 - smoothstep(15.0, 60.0, dist));
+	return normalize(N + vec3(s.x, 0.0, s.y));
+}
+
+// The water TLAS along the camera ray: the surface point, its triangle's normal (facing the camera).
+bool WaterHit(vec3 o, vec3 dir, float tmax, out float t, out vec3 N) {
+	t = 0.0;
+	N = vec3(0, 1, 0);
+	if (!Flag(2)) return false;
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, water_tlas, gl_RayFlagsOpaqueEXT, 0xff, o, 0.05, dir, tmax);
+	while (rayQueryProceedEXT(rq)) {}
+	if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) return false;
+	t        = rayQueryGetIntersectionTEXT(rq, true);
+	int inst = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+	int prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+	uint64_t mat = uint64_t(pb.wmat.x) | (uint64_t(pb.wmat.y) << 32);
+	if (mat != 0ul && inst >= 0 && uint(inst) < pb.wmat.z && prim >= 0) {
+		Words    m  = Words(mat);
+		uint64_t vb = uint64_t(m.w[inst * 8 + 4]) | (uint64_t(m.w[inst * 8 + 5]) << 32);
+		uint64_t ib = uint64_t(m.w[inst * 8 + 6]) | (uint64_t(m.w[inst * 8 + 7]) << 32);
+		if (vb != 0ul && ib != 0ul) {
+			Words idx = Words(ib);
+			Verts ver = Verts(vb);
+			vec3  a   = ver.v[idx.w[prim * 3 + 0]].xyz;
+			vec3  b   = ver.v[idx.w[prim * 3 + 1]].xyz;
+			vec3  c   = ver.v[idx.w[prim * 3 + 2]].xyz;
+			vec3  n   = cross(b - a, c - a);
+			if (length(n) > 1e-12 && !BadV(n)) N = normalize(n);
+		}
+	}
+	if (dot(N, dir) > 0.0) N = -N;
+	// (a near-level water plane is a level mirror: the captured triangles' precision and the waves of its vertex shader
+	// would otherwise tilt the mirror a little differently every frame)
+	if (N.y > 0.985) N = vec3(0, 1, 0);
+	return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+void Trace(ivec2 tp) {
+	vec2  uv  = (vec2(tp) + 0.5) / TraceSize();
+	ivec2 rp  = RenderPixel(uv);
+	vec2  ruv = (vec2(rp) + 0.5) / RenderSize();
+	float d   = DepthAtPixel(rp);
+	bool  sky = IsSky(d);
+	vec3  cam = pb.cam.xyz;
+	vec3  far_p = WorldPos(ruv, sky ? 0.5 : d);
+	vec3  dir   = normalize(far_p - cam);
+	float dist  = sky ? FAR : length(far_p - cam);
+	bool  st    = (tp.x & 3) == 0 && (tp.y & 3) == 0;
+	if (st) Stat(0, 1);
+	if (BadV(dir)) {
+		imageStore(out_img, tp, vec4(0));
+		imageStore(out_aux, tp, vec4(0));
+		return;
+	}
+	// (the self-check: the depth's world is the TLAS's - a camera ray meets the scene at the pixel's distance)
+	if (!sky && (tp.x & 15) == 0 && (tp.y & 15) == 0 && dist < 200.0) {
+		rayQueryEXT pq;
+		rayQueryInitializeEXT(pq, scene_tlas, gl_RayFlagsOpaqueEXT, 0x01, cam, 0.05, dir, dist * 1.5 + 1.0);
+		while (rayQueryProceedEXT(pq)) {}
+		if (rayQueryGetIntersectionTypeEXT(pq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+			Stat(16, 1);
+			if (abs(rayQueryGetIntersectionTEXT(pq, true) - dist) < 0.03 * dist + 0.1) Stat(17, 1);
+		}
+	}
+	float kind = 0.0, share = 0.0, sdist = dist, wet = 0.0;
+	vec3  P = far_p, N = vec3(0, 1, 0);
+	float tw;
+	vec3  Nw;
+	if (WaterHit(cam, dir, sky ? FAR : dist * 1.01 + 0.1, tw, Nw)) {
+		kind = 1.0, share = 1.0, sdist = tw;
+		P = cam + dir * tw, N = Nw;
+	} else if (!sky && Flag(4) && pb.p1.z > 0.0) {
+		// Puddles / wet stone: the game's SSR confidence on a level floor, as a filtered per-pixel wetness (the game's own
+		// confidence and the depth normal change from frame to frame; the wetness is reprojected with the surface).
+		vec3 Nd = DepthNormal(rp, P);
+		if (dot(Nd, dir) > 0.0) Nd = -Nd;
+		float lvl  = smoothstep(0.94, 0.985, Nd.y);
+		float now  = lvl > 0.0 ? textureLod(guide_tex, ruv, 0).a * lvl : 0.0;
+		bool  was  = false;
+		wet        = now;
+		if (Flag(1)) {
+			vec4 ps = ProjectPrev(P);
+			if (ps.w > 0.5 && InScreen(ps.xy)) {
+				vec4 pa = texelFetch(aux_prev, clamp(ivec2(ps.xy * TraceSize()), ivec2(0), ivec2(TraceSize()) - 1), 0);
+				if (KindOf(pa.y) != 1.0 && abs(pa.w - dist) < 0.02 * dist + 0.05) {
+					was = KindOf(pa.y) == 2.0;
+					wet = mix(WetOf(pa.y), now, 0.06);
+				}
+			}
+		}
+		wet = clamp(wet, 0.0, 0.98);
+		float thr = was ? pb.p0.z * 0.6 : pb.p0.z;
+		if (wet > thr) {
+			kind  = 2.0;
+			share = pb.p1.z * smoothstep(pb.p0.z * 0.6, min(pb.p0.z + 0.35, 1.0), wet);
+			N     = Nd.y > 0.985 ? vec3(0, 1, 0) : Nd;
+		}
+	}
+	if (kind == 0.0) {
+		imageStore(out_img, tp, vec4(0));
+		imageStore(out_aux, tp, vec4(0.0, wet, 0.0, sdist));
+		return;
+	}
+	if (st) Stat(kind == 1.0 ? 1u : 2u, 1);
+	N = Ripple(N, P, pb.p0.w * (kind == 1.0 ? 1.0 : 0.5), sdist);
+	vec3  V   = -dir;
+	float NoV = clamp(dot(N, V), 0.0, 1.0);
+	float F   = 0.02 + 0.98 * pow(1.0 - NoV, 5.0);
+	float tgt = clamp(max(F, pb.p1.y) * pb.p1.x * share, 0.0, 0.95);
+	vec3  R   = reflect(dir, N);
+	if (dot(R, N) < 0.01) R = normalize(R + N * (0.01 - dot(R, N)));
+	vec3 o = P + N * (0.01 + 0.0005 * sdist);
+	if (st) Stat(3, 1);
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, scene_tlas, gl_RayFlagsOpaqueEXT, 0x01, o, 0.02, R, pb.p0.y);
+	while (rayQueryProceedEXT(rq)) {}
+	vec3  c    = vec3(0);
+	float conf = 0.0;
+	float t    = FAR;
+	if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+		t       = rayQueryGetIntersectionTEXT(rq, true);
+		vec3 H  = o + R * t;
+		vec4 sc = Project(H);
+		if (sc.w > 0.5 && InScreen(sc.xy)) {
+			ivec2 hp = RenderPixel(sc.xy);
+			float sd = DepthAtPixel(hp);
+			float zs = IsSky(sd) ? FAR : length(WorldPos((vec2(hp) + 0.5) / RenderSize(), sd) - cam);
+			float zh = length(H - cam);
+			if (abs(zs - zh) < 0.03 * zh + 0.15) {
+				vec2 edge = min(sc.xy, 1.0 - sc.xy);
+				conf = smoothstep(0.0, 0.04, min(edge.x, edge.y)) * (1.0 - smoothstep(0.7, 1.0, t / max(pb.p0.y, 1.0)));
+				c    = textureLod(color_tex, sc.xy, 0).rgb;
+				if (st) Stat(4, 1);
+			} else if (st) Stat(6, 1);
+		} else if (st) Stat(6, 1);
+	} else {
+		// Nothing in the scene: the sky, when the mirrored direction lands on the screen's sky.
+		vec4 sc = Project(o + R * FAR);
+		if (sc.w > 0.5 && InScreen(sc.xy) && IsSky(DepthAtPixel(RenderPixel(sc.xy)))) {
+			vec2 edge = min(sc.xy, 1.0 - sc.xy);
+			conf = smoothstep(0.0, 0.04, min(edge.x, edge.y));
+			c    = textureLod(color_tex, sc.xy, 0).rgb;
+			if (st) Stat(5, 1);
+		} else if (st) Stat(7, 1);
+	}
+	c = Tonemap(SafeColor(c * GameExposure()));
+	if (BadV(c)) c = vec3(0), conf = 0.0;
+	imageStore(out_img, tp, vec4(c, tgt * conf));
+	imageStore(out_aux, tp, vec4(t, kind + wet, tgt, sdist));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+void Temporal(ivec2 tp) {
+	vec4 cur  = texelFetch(src_tex, tp, 0);
+	vec4 caux = texelFetch(src_aux, tp, 0);
+	if (KindOf(caux.y) == 0.0) { // (not reflective now: no history kept, no ghost)
+		imageStore(out_img, tp, vec4(0));
+		imageStore(out_aux, tp, caux);
+		return;
+	}
+	bool st = (tp.x & 3) == 0 && (tp.y & 3) == 0;
+	if (st) Stat(8, 1);
+	// The neighbourhood's moments (its sampled pixels only).
+	vec3  m1 = vec3(0), m2 = vec3(0);
+	float n  = 0.0;
+	ivec2 hi = ivec2(TraceSize()) - 1;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			ivec2 q = clamp(tp + ivec2(x, y), ivec2(0), hi);
+			vec4  s = texelFetch(src_tex, q, 0);
+			if (s.a <= 1e-4) continue;
+			m1 += s.rgb, m2 += s.rgb * s.rgb, n += 1.0;
+		}
+	vec3 mean = n > 0.0 ? m1 / n : cur.rgb;
+	vec3 sig  = n > 0.0 ? sqrt(max(m2 / n - mean * mean, vec3(0))) : vec3(0);
+	// Fireflies: a sample far brighter than its neighbourhood is brought down to it.
+	if (cur.a > 1e-4 && n >= 3.0) {
+		float lm = Luma(mean), lc = Luma(cur.rgb);
+		if (lc > 3.0 * lm + 0.02) {
+			cur.rgb *= (3.0 * lm + 0.02) / max(lc, 1e-6);
+			if (st) Stat(11, 1);
+		}
+	}
+	vec4 res   = cur;
+	bool valid = false;
+	if (Flag(1) && Flag(8)) {
+		// (ds-rt-stable-1027) still camera: the pixel's own history, never rejected by a kind / distance test that the
+		// jitter toggles (a rejected pixel took this frame's sample alone: the 91 % jumps); 1/32 running mean, a fresh
+		// sample at most 1.5x the history, its confidence at most 0.1 a frame (hit <-> miss)
+		vec4 h = texelFetch(hist_prev, tp, 0);
+		if (!BadV(h.rgb) && !isnan(h.a) && h.a > 0.0) {
+			valid = true;
+			vec4  c2  = cur;
+			float lh  = Luma(h.rgb), lf = Luma(c2.rgb), lim = 1.5 * lh + 0.01;
+			if (lf > lim) c2.rgb *= lim / max(lf, 1e-6);
+			bool  miss = c2.a < h.a - 0.1;
+			c2.a = clamp(c2.a, h.a - 0.1, h.a + 0.1);
+			if (miss || cur.a <= 1e-4) c2.rgb = h.rgb;
+			res.rgb = mix(h.rgb, c2.rgb, 1.0 / 32.0);
+			res.a   = mix(h.a, c2.a, 1.0 / 32.0);
+		}
+	} else if (Flag(1)) {
+		vec2  uv   = (vec2(tp) + 0.5) / TraceSize();
+		vec2  ruv  = (vec2(RenderPixel(uv)) + 0.5) / RenderSize();
+		vec3  cam  = pb.cam.xyz;
+		vec3  dir  = normalize(WorldPos(ruv, 0.5) - cam);
+		vec3  Ps   = cam + dir * caux.w;
+		// (the surface at its own previous position: the same kind at the same distance, else disoccluded)
+		vec4 ps = ProjectPrev(Ps);
+		if (ps.w > 0.5 && InScreen(ps.xy)) {
+			vec4 pa = texelFetch(aux_prev, clamp(ivec2(ps.xy * TraceSize()), ivec2(0), hi), 0);
+			valid   = KindOf(pa.y) == KindOf(caux.y) && abs(pa.w - caux.w) < 0.02 * caux.w + 0.05;
+		}
+		// (the reflection's own previous position: the virtual image, the hit seen through the mirror)
+		vec4 vs = ProjectPrev(cam + dir * (caux.w + min(caux.x, FAR)));
+		if (valid && vs.w > 0.5 && InScreen(vs.xy)) {
+			vec4 h = textureLod(hist_prev, vs.xy, 0);
+			vec4 va = texelFetch(aux_prev, clamp(ivec2(vs.xy * TraceSize()), ivec2(0), hi), 0);
+			// (a still camera: the same pixel, never rejected by the hit distance - its jitter moved hits across edges)
+			valid   = KindOf(va.y) >= 1.0 && (Flag(8) || ((va.x >= FAR * 0.5) == (caux.x >= FAR * 0.5) &&
+			                                              (caux.x >= FAR * 0.5 || abs(va.x - caux.x) < 0.15 * caux.x + 0.3)));
+			if (valid) {
+				// (ds-rt-stable-1027) still camera: the pixel's own history texel, no clamp against this frame's noisy 3x3,
+				// a 1/32 running mean and a fresh sample at most 1.5x the history (water mirrors' 0.3-1.4 %, max jump 91 %)
+				vec4  c2 = cur;
+				float a  = 0.2;
+				if (Flag(8)) {
+					h = texelFetch(hist_prev, tp, 0);
+					a = 1.0 / 32.0;
+					float lh = dot(h.rgb, vec3(0.2126, 0.7152, 0.0722)), lf = dot(c2.rgb, vec3(0.2126, 0.7152, 0.0722));
+					float lim = 1.5 * lh + 0.01;
+					if (h.a > 0.05 && lf > lim) c2.rgb *= lim / max(lf, 1e-6);
+				} else {
+					h.rgb = n > 0.0 ? clamp(h.rgb, mean - 1.25 * sig - 0.002, mean + 1.25 * sig + 0.002) : h.rgb;
+				}
+				res.rgb = cur.a > 1e-4 ? mix(h.rgb, c2.rgb, a) : h.rgb;
+				res.a   = mix(h.a, cur.a, a);
+			}
+		} else valid = false;
+	}
+	if (st) Stat(valid ? 9u : 10u, 1);
+	if (BadV(res.rgb) || isnan(res.a)) res = vec4(0);
+	imageStore(out_img, tp, res);
+	imageStore(out_aux, tp, caux);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+void Composite(ivec2 p) {
+	vec2 uv = (vec2(p) + 0.5) / RenderSize();
+	vec4 c  = texelFetch(color_tex, p, 0);
+	// weighted bilinear of the history (only its reflective texels: no darkening at the edges)
+	vec2  t  = uv * TraceSize() - 0.5;
+	ivec2 b  = ivec2(floor(t));
+	vec2  f  = t - vec2(b);
+	ivec2 hi = ivec2(TraceSize()) - 1;
+	vec3  sum = vec3(0);
+	float wsum = 0.0, wbil = 0.0;
+	for (int i = 0; i < 4; ++i) {
+		ivec2 o  = ivec2(i & 1, i >> 1);
+		float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+		vec4  h  = texelFetch(src_tex, clamp(b + o, ivec2(0), hi), 0);
+		sum += h.rgb * h.a * bw;
+		wsum += h.a * bw;
+		wbil += bw;
+	}
+	float w  = wbil > 0.0 ? wsum / wbil : 0.0;
+	bool  st = (p.x & 7) == 0 && (p.y & 7) == 0;
+	if (st) Stat(12, 1);
+	if (w <= 1e-3) {
+		imageStore(out_img, p, c);
+		return;
+	}
+	vec3 refl = InvTonemap(sum / max(wsum, 1e-6)) / GameExposure();
+	vec3 o    = mix(c.rgb, SafeColor(refl), clamp(w, 0.0, 0.95));
+	if (BadV(o)) o = c.rgb;
+	if (st && w > 0.05) {
+		Stat(13, 1);
+		Stat(14, uint(w * 1000.0));
+	}
+	imageStore(out_img, p, vec4(o, c.a));
+}
+
+void main() {
+	ivec2 p    = ivec2(gl_GlobalInvocationID.xy);
+	int   mode = push.misc.x;
+	vec2  ext  = mode == 2 ? RenderSize() : TraceSize();
+	for (int i = 0; i < NStat; ++i) g_st[i] = 0u;
+	if (p.x < int(ext.x) && p.y < int(ext.y)) {
+		if (mode == 0) Trace(p);
+		else if (mode == 1) Temporal(p);
+		else Composite(p);
+	}
+	FlushStats();
+}

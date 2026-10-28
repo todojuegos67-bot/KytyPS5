@@ -1,0 +1,448 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// (ao2-1028) cost: one prep pass writes a trace-res linear view z (R32F) + the normal; the trace reads only that
+// (half res for every level: 4x fewer, cache-friendly taps than the game's full-res depth), the composite no longer
+// rebuilds depth normals, the stats reduce per subgroup before one atomic (no serialized atomics on 1/16 pixels).
+// KYTY_AO=0..3 (rt-ao.cpp): "Oclusion ambiental", screen-space ambient occlusion written from scratch (ao-1028). It
+// does not reuse gtao.comp. One shader, four modes (push.mode):
+//
+//   0 trace     (trace res: half for Bajo / Medio, full for Alto) horizon-based visibility (GTAO's cosine-weighted
+//               slice integral, Jimenez et al. 2016, re-derived here): per pixel S slices (2 / 3 / 4) x 2 sides x K steps
+//               (4 / 6 / 8), the radius in METRES (0.6 / 0.8 / 1.0) projected through the game's own projection, clamped to
+//               1/8 of the screen height on close-ups; the slice rotation from an interleaved 4x4 Bayer pattern + an R1
+//               golden-ratio step per frame, the step jitter from interleaved gradient noise (decorrelated), so 16 frames
+//               cover every rotation of every 4x4 tile. An occluder counts by its 3D distance (falloff over the last half
+//               of the radius: a character 2 m in front of a wall never darkens the wall: no halo) and only when it rises
+//               above the surface's own tangent plane by > ~4 degrees (8-bit G-buffer normals: no self-occlusion bands).
+//               Normals: the G-buffer's (layer 3, oct 8:8, world) rotated into view space, the sign convention voted on
+//               the GPU against depth normals; the depth normal where they disagree (forward-drawn surfaces).
+//               -> out .r visibility; gz_out (view normal, view z)
+//   1 temporal  motion-vector reprojection of the history; rejected on depth (> 3 % + 2 cm) or normal (cos < 0.9)
+//               disagreement (no ghosting: a fresh sample there); running mean up to 16 / 24 / 32 frames; while the
+//               camera moves the history is clipped to the raw 3x3 mean +- 1.5 sigma; held still, it converges.
+//   2 denoise   5x5 a-trous, edge-aware: depth (2 % of z) and normal (cos^8) weights, steps 1 and 2.
+//   3 composite (render res) joint-bilateral upsample (the 4 nearest trace texels: bilinear x depth x normal; the
+//               closest-depth texel when none matches: no bleeding across silhouettes, no dark outlines), then the
+//               physical application:
+//                 - the AMBIENT term only: ambient = min(colour, albedo x the frame's ambient light), the frame's light
+//                   being the geometric mean of the lit pixels (exposure-free); direct sun / torches / spells above it
+//                   keep their level;
+//                 - Jimenez' multi-bounce fit with the G-buffer albedo (bright materials lose less), floored (KYTY_AO_FLOOR);
+//                 - never the sky (depth 0), never surfaces drawn after the G-buffer (fire, particles, water, emissive
+//                   effects: the final depth nearer than the lighting's), faded by the fog in front, exp(-z / fog);
+//                 - the game's own AO: r_enableAmbientShadowing is switched off while this runs (gameArgs.cpp), so the
+//                   occlusion is replaced, never applied twice (KYTY_AO_GAME=keep: the game's kept, ours at half).
+//               Stats on 1 pixel in 16: mean AO, darkened share, the frame light, the normal-convention votes.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2) uniform sampler2D motion_tex;
+layout(binding = 3) uniform sampler2D src_a;     // trace / temporal / denoise input
+layout(binding = 4) uniform sampler2D hist_prev; // temporal: the previous history
+layout(binding = 5) uniform sampler2D gz_cur;    // (view normal, view z) at the trace res, this frame
+layout(binding = 6) uniform sampler2D gz_prev;   // the same, last frame
+layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
+layout(binding = 8, rgba16f) uniform writeonly image2D gz_out;
+layout(binding = 9) uniform sampler2D cnt_prev;
+layout(binding = 10, rgba16f) uniform writeonly image2D cnt_out;
+layout(binding = 11) uniform usampler2D gb_normal; // G-buffer layer 3 (or a 1x1 zero)
+layout(binding = 12) uniform usampler2D gb_albedo; // G-buffer layer 0 (or a 1x1 zero)
+layout(binding = 13) uniform sampler2D gdepth_tex; // the depth the deferred lighting read (or the final depth)
+layout(std140, binding = 14) uniform Frame {
+	vec4  proj;      // M[0], M[5], M[8], M[9] (view_to_clip, column-major)
+	vec4  depth_map; // M[10], M[14], M[11], M[15]
+	vec4  motion;    // motion_scale.xy, render size.xy
+	vec4  trace;     // trace size.xy, strength, radius (m)
+	vec4  par;       // floor, fog distance (m, 0 off), ambient light (frame light x KYTY_AO_AMBIENT; 0: unknown yet), max radius (fraction of the height)
+	ivec4 cfg;       // level, frame, flags, stats slot
+	ivec4 cfg2;      // slices, steps, history max, normal convention (bit 0 negate y, bit 1 negate z)
+	vec4  rot0;      // world -> view rows (the G-buffer camera's)
+	vec4  rot1;
+	vec4  rot2;
+} u;
+layout(std430, binding = 15) buffer Stats { uint st[]; };
+layout(binding = 16) uniform sampler2D lz_tex;              // trace-res view z (1e6: sky), written by the prep
+layout(binding = 17, r32f) uniform writeonly image2D lz_out;
+
+// one atomic per subgroup (active lanes only)
+void StatAdd(uint idx, uint v) {
+	uint t = subgroupAdd(v);
+	if (subgroupElect() && t != 0u) atomicAdd(st[idx], t);
+}
+
+layout(push_constant) uniform Push {
+	int   mode;
+	float step;
+	int   pad0, pad1;
+} push;
+
+// cfg.z flags
+const int F_RESET = 1, F_HIST = 2, F_NORMALS = 4, F_ALBEDO = 8, F_HALF = 16, F_GDEPTH = 32, F_STILL = 64, F_VIEW = 128;
+const uint SLOT_WORDS = 32u;
+const float PI = 3.14159265, HALF_PI = 1.57079633;
+
+bool  Flag(int f) { return (u.cfg.z & f) != 0; }
+vec2  RenderSize() { return u.motion.zw; }
+vec2  TraceSize() { return u.trace.xy; }
+
+// ---- the game's projection (reverse Z: the far plane at depth 0) ----
+float ViewZ(float d) {
+	float den = d * u.depth_map.z - u.depth_map.x;
+	return abs(den) > 1e-12 ? (u.depth_map.y - d * u.depth_map.w) / den : 1e6;
+}
+vec3 PosZ(vec2 uv, float z) {
+	float w  = z * u.depth_map.z + u.depth_map.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	return vec3((nd.x * w - z * u.proj.z) / u.proj.x, (nd.y * w - z * u.proj.w) / u.proj.y, z);
+}
+bool Sky(float d) { return !(d > 1e-7) || d >= 0.9999999; }
+
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// ---- normals ----
+vec3 OctDecode(uint w) {
+	vec2 e = vec2(float(w & 255u), float((w >> 8) & 255u)) / 255.0 * 2.0 - 1.0;
+	vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+	float t = max(-n.z, 0.0);
+	n.x -= n.x >= 0.0 ? t : -t;
+	n.y -= n.y >= 0.0 ? t : -t;
+	return normalize(n);
+}
+vec3 GbufNormal(ivec2 full_px, int conv, out bool ok) {
+	ok = false;
+	if (!Flag(F_NORMALS)) return vec3(0, 0, -1);
+	ivec2 gs = textureSize(gb_normal, 0);
+	uint  w  = texelFetch(gb_normal, clamp(full_px, ivec2(0), gs - 1), 0).r;
+	if (w == 0u) return vec3(0, 0, -1);
+	vec3 nw = OctDecode(w);
+	vec3 n  = vec3(dot(u.rot0.xyz, nw), dot(u.rot1.xyz, nw), dot(u.rot2.xyz, nw));
+	if ((conv & 1) != 0) n.y = -n.y;
+	if ((conv & 2) != 0) n.z = -n.z;
+	float l = length(n);
+	if (!(l > 0.5)) return vec3(0, 0, -1);
+	ok = true;
+	return n / l;
+}
+// The depth normal: the smaller of the one-sided differences on each axis (no smearing across silhouettes).
+vec3 DepthNormal(ivec2 p, vec3 P) {
+	ivec2 rs = ivec2(RenderSize());
+	vec2  inv = 1.0 / RenderSize();
+	ivec2 pr = min(p + ivec2(1, 0), rs - 1), pl = max(p - ivec2(1, 0), ivec2(0));
+	ivec2 pd = min(p + ivec2(0, 1), rs - 1), pu = max(p - ivec2(0, 1), ivec2(0));
+	vec3  R = PosZ((vec2(pr) + 0.5) * inv, ViewZ(texelFetch(depth_tex, pr, 0).r));
+	vec3  L = PosZ((vec2(pl) + 0.5) * inv, ViewZ(texelFetch(depth_tex, pl, 0).r));
+	vec3  D = PosZ((vec2(pd) + 0.5) * inv, ViewZ(texelFetch(depth_tex, pd, 0).r));
+	vec3  U = PosZ((vec2(pu) + 0.5) * inv, ViewZ(texelFetch(depth_tex, pu, 0).r));
+	vec3  dx = abs(R.z - P.z) < abs(P.z - L.z) ? R - P : P - L;
+	vec3  dy = abs(D.z - P.z) < abs(P.z - U.z) ? D - P : P - U;
+	vec3  n  = cross(dx, dy);
+	float l  = length(n);
+	n        = l > 1e-12 ? n / l : vec3(0, 0, -1);
+	return dot(n, P) > 0.0 ? -n : n;
+}
+vec3 SurfaceNormal(ivec2 p, vec3 P, bool vote) {
+	vec3 nd = DepthNormal(p, P);
+	bool ok;
+	vec3 ng = GbufNormal(p, u.cfg2.w, ok);
+	if (vote && Flag(F_NORMALS) && ok) {
+		// the convention vote: which of the four sign combinations agrees with the depth normal (sampled pixels)
+		float best = -2.0;
+		uint  bi   = 0u;
+		for (int c = 0; c < 4; ++c) {
+			bool o2;
+			vec3 t = GbufNormal(p, c, o2);
+			if (dot(t, P) > 0.0) t = -t;
+			float a = dot(t, nd);
+			if (a > best) best = a, bi = uint(c);
+		}
+		for (uint c = 0u; c < 4u; ++c) StatAdd(uint(u.cfg.w) * SLOT_WORDS + 8u + c, (best > 0.9 && bi == c) ? 1u : 0u);
+	}
+	if (!ok) return nd;
+	if (dot(ng, P) > 0.0) ng = -ng;
+	float agree = clamp((dot(ng, nd) - 0.3) / 0.4, 0.0, 1.0);
+	return normalize(mix(nd, ng, agree));
+}
+
+// ---- noise: 4x4 interleaved Bayer for the slice rotation (+ R1 per frame), IGN for the steps ----
+float Bayer4(ivec2 p) {
+	const float b[16] = float[16](0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
+	return b[(p.y & 3) * 4 + (p.x & 3)] / 16.0;
+}
+float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+
+// ---- mode 0: prep (trace res): the closest depth of the 2x2, its normal (G-buffer + depth) and linear view z ----
+void Prep(ivec2 tp) {
+	ivec2 rs = ivec2(RenderSize());
+	ivec2 p  = tp;
+	float d  = 0.0;
+	if (Flag(F_HALF)) {
+		ivec2 base = tp * 2;
+		d          = -1.0;
+		for (int i = 0; i < 4; ++i) {
+			ivec2 q  = min(base + ivec2(i & 1, i >> 1), rs - 1);
+			float dq = texelFetch(depth_tex, q, 0).r;
+			if (dq > d) d = dq, p = q;
+		}
+	} else {
+		p = min(tp, rs - 1);
+		d = texelFetch(depth_tex, p, 0).r;
+	}
+	if (Sky(d)) {
+		imageStore(gz_out, tp, vec4(0, 0, -1, 1e6));
+		imageStore(lz_out, tp, vec4(1e6));
+		return;
+	}
+	float z = ViewZ(d);
+	vec3  P = PosZ((vec2(p) + 0.5) / RenderSize(), z);
+	vec3  N = SurfaceNormal(p, P, (tp.x & 3) == 0 && (tp.y & 3) == 0);
+	imageStore(gz_out, tp, vec4(N, z));
+	imageStore(lz_out, tp, vec4(z));
+}
+
+// ---- mode 1: the horizon trace (trace res, on the prep's linear z: positions at texel centres, the centre's too) ----
+void Trace(ivec2 tp) {
+	ivec2 ts = ivec2(TraceSize());
+	float z  = texelFetch(lz_tex, tp, 0).r;
+	if (z >= 1e5) {
+		imageStore(out_img, tp, vec4(1.0));
+		return;
+	}
+	vec2  inv    = 1.0 / TraceSize();
+	vec3  P      = PosZ((vec2(tp) + 0.5) * inv, z);
+	vec3  N      = texelFetch(gz_cur, tp, 0).xyz;
+	vec3  V      = normalize(-P);
+	float R      = u.trace.w;
+	float H      = TraceSize().y;
+	float wclip  = abs(P.z * u.depth_map.z + u.depth_map.w);
+	float rpx    = min(R * abs(u.proj.y) * 0.5 * H / max(wclip, 1e-4), u.par.w * H); // trace pixels
+	if (rpx < 1.0) {
+		imageStore(out_img, tp, vec4(1.0));
+		return;
+	}
+	int   slices = u.cfg2.x, steps = u.cfg2.y;
+	float frame  = float(u.cfg.y & 1023);
+	float rot    = fract(Bayer4(tp) + frame * 0.6180339887);
+	float jit    = Ign(vec2(tp) + 5.588238 * float(u.cfg.y & 63));
+	float vsum = 0.0, wsum = 0.0;
+	float inv_r = 1.0 / R;
+	for (int s = 0; s < slices; ++s) {
+		float phi = (float(s) + rot) / float(slices) * PI;
+		vec2  o   = vec2(cos(phi), sin(phi));
+		vec3 d3 = PosZ((vec2(tp) + 0.5 + o) * inv, P.z) - P;
+		d3 -= dot(d3, V) * V;
+		float dl = length(d3);
+		if (dl < 1e-9) continue;
+		d3 /= dl;
+		vec3  axis = cross(d3, V);
+		vec3  Np   = N - axis * dot(N, axis);
+		float lp   = length(Np);
+		if (lp < 1e-4) continue;
+		float nang = sign(dot(Np, d3)) * acos(clamp(dot(Np, V) / lp, -1.0, 1.0));
+		float hcos[2];
+		for (int side = 0; side < 2; ++side) {
+			float sg  = side == 0 ? 1.0 : -1.0;
+			float low = cos(nang + sg * HALF_PI);
+			float hc  = low;
+			for (int k = 0; k < steps; ++k) {
+				float t   = (float(k) + fract(jit + 0.37 * float(k))) / float(steps);
+				t         = t * t;
+				float off = max(t * rpx, 1.0 + 0.75 * float(k));
+				ivec2 q   = ivec2(round(vec2(tp) + sg * o * off));
+				if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ts))) break;
+				float zq = texelFetch(lz_tex, q, 0).r;
+				if (zq >= 1e5) continue;
+				vec3  D    = PosZ((vec2(q) + 0.5) * inv, zq) - P;
+				float dl2  = dot(D, D);
+				if (dl2 < 1e-12) continue;
+				float idist = inversesqrt(dl2);
+				float c     = dot(D, V) * idist;
+				float wgt   = clamp(2.0 - 2.0 * dl2 * idist * inv_r, 0.0, 1.0);    // world-space falloff (no halos)
+				wgt        *= clamp((dot(D, N) * idist - 0.06) * 8.333, 0.0, 1.0); // above the tangent plane only
+				hc          = max(hc, mix(low, c, wgt));
+			}
+			hcos[side] = hc;
+		}
+		float h1 = acos(clamp(hcos[0], -1.0, 1.0));
+		float h0 = -acos(clamp(hcos[1], -1.0, 1.0));
+		h0 = nang + max(h0 - nang, -HALF_PI);
+		h1 = nang + min(h1 - nang, HALF_PI);
+		float sn = sin(nang), cs = cos(nang);
+		float a  = 0.25 * (-cos(2.0 * h0 - nang) + cs + 2.0 * h0 * sn) + 0.25 * (-cos(2.0 * h1 - nang) + cs + 2.0 * h1 * sn);
+		vsum += lp * a;
+		wsum += lp;
+	}
+	// the paper's unbiased estimator (sum |n_p| a / slices), not clamped to 1 before the temporal / spatial means
+	float vis = wsum > 1e-6 ? clamp(vsum / float(slices), 0.0, 2.0) : 1.0;
+	imageStore(out_img, tp, vec4(vis, 0, 0, 1));
+}
+
+// ---- mode 2: temporal ----
+void Temporal(ivec2 tp) {
+	vec4  g   = texelFetch(gz_cur, tp, 0);
+	float raw = texelFetch(src_a, tp, 0).r;
+	if (g.w >= 1e5) {
+		imageStore(out_img, tp, vec4(1.0));
+		imageStore(cnt_out, tp, vec4(0.0));
+		return;
+	}
+	ivec2 ts    = ivec2(TraceSize());
+	float scale = RenderSize().x / TraceSize().x;
+	// the full-res pixel this trace texel stands for (its centre is close enough for the motion lookup)
+	ivec2 fp    = min(ivec2((vec2(tp) + 0.5) * scale), ivec2(RenderSize()) - 1);
+	vec2  mv    = texelFetch(motion_tex, fp, 0).rg * u.motion.xy; // render pixels to the previous frame
+	vec2  prev  = (vec2(tp) + 0.5) + mv / scale;
+	ivec2 pp    = ivec2(floor(prev));
+	float n     = 0.0;
+	float hist  = raw;
+	bool  ok    = Flag(F_HIST) && !Flag(F_RESET) && all(greaterThanEqual(pp, ivec2(0))) && all(lessThan(pp, ts));
+	if (ok) {
+		vec4 gp = texelFetch(gz_prev, pp, 0);
+		ok      = abs(gp.w - g.w) <= 0.03 * g.w + 0.02 && dot(gp.xyz, g.xyz) > 0.9;
+		if (ok) {
+			hist = texelFetch(hist_prev, pp, 0).r;
+			n    = texelFetch(cnt_prev, pp, 0).r;
+		}
+	}
+	if (ok && !Flag(F_STILL)) {
+		float m1 = 0.0, m2 = 0.0;
+		for (int y = -1; y <= 1; ++y)
+			for (int x = -1; x <= 1; ++x) {
+				float v = texelFetch(src_a, clamp(tp + ivec2(x, y), ivec2(0), ts - 1), 0).r;
+				m1 += v, m2 += v * v;
+			}
+		m1 /= 9.0;
+		float sd = sqrt(max(m2 / 9.0 - m1 * m1, 0.0));
+		hist     = clamp(hist, m1 - 1.5 * sd - 0.02, m1 + 1.5 * sd + 0.02);
+	}
+	float c   = ok ? min(n + 1.0, float(u.cfg2.z)) : 1.0;
+	float res = ok ? hist + (raw - hist) / c : raw;
+	imageStore(out_img, tp, vec4(clamp(res, 0.0, 2.0), 0, 0, 1));
+	imageStore(cnt_out, tp, vec4(c, 0, 0, 1));
+}
+
+// ---- mode 3: edge-aware a-trous ----
+void Denoise(ivec2 tp) {
+	vec4 g = texelFetch(gz_cur, tp, 0);
+	if (g.w >= 1e5) {
+		imageStore(out_img, tp, vec4(1.0));
+		return;
+	}
+	ivec2       ts = ivec2(TraceSize());
+	int         stp = int(push.step);
+	const float k[5] = float[5](1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0);
+	float acc = 0.0, ws = 0.0;
+	for (int y = -2; y <= 2; ++y)
+		for (int x = -2; x <= 2; ++x) {
+			ivec2 q  = clamp(tp + ivec2(x, y) * stp, ivec2(0), ts - 1);
+			vec4  gq = texelFetch(gz_cur, q, 0);
+			if (gq.w >= 1e5) continue;
+			float cn = clamp(dot(gq.xyz, g.xyz), 0.0, 1.0);
+			cn *= cn, cn *= cn, cn *= cn;
+			float w = k[x + 2] * k[y + 2] * exp(-abs(gq.w - g.w) / (0.02 * g.w + 0.01)) * cn;
+			acc += w * texelFetch(src_a, q, 0).r;
+			ws += w;
+		}
+	imageStore(out_img, tp, vec4(ws > 1e-6 ? acc / ws : texelFetch(src_a, tp, 0).r, 0, 0, 1));
+}
+
+// ---- mode 4: upsample + application ----
+float Upsample(ivec2 p, float z) {
+	if (!Flag(F_HALF)) return texelFetch(src_a, p, 0).r;
+	ivec2 ts   = ivec2(TraceSize());
+	vec2  f    = (vec2(p) + 0.5) * (TraceSize() / RenderSize()) - 0.5;
+	ivec2 b    = ivec2(floor(f));
+	vec2  fr   = f - vec2(b);
+	float acc = 0.0, ws = 0.0, best = 1e9, bestv = 1.0;
+	for (int i = 0; i < 4; ++i) {
+		ivec2 o  = ivec2(i & 1, i >> 1);
+		ivec2 q  = clamp(b + o, ivec2(0), ts - 1);
+		vec4  g  = texelFetch(gz_cur, q, 0);
+		float v  = texelFetch(src_a, q, 0).r;
+		float bw = (o.x == 1 ? fr.x : 1.0 - fr.x) * (o.y == 1 ? fr.y : 1.0 - fr.y);
+		float dz = abs(g.w - z);
+		float w  = max(bw, 1e-3) * exp(-dz / (0.01 * z + 0.005)); // (ao2) depth only: the trace texel's normal came from the same 2x2
+		acc += w * v;
+		ws += w;
+		if (dz < best) best = dz, bestv = v;
+	}
+	return ws > 1e-4 ? acc / ws : bestv;
+}
+vec3 MultiBounce(float v, vec3 albedo) {
+	vec3 a = 2.0404 * albedo - 0.3324;
+	vec3 b = -4.7951 * albedo + 0.6417;
+	vec3 c = 2.7552 * albedo + 0.6903;
+	return max(vec3(v), ((v * a + b) * v + c) * v);
+}
+void Composite(ivec2 p) {
+	vec4  col   = texelFetch(color_tex, p, 0);
+	float d     = texelFetch(depth_tex, p, 0).r;
+	bool  smp   = (p.x & 3) == 0 && (p.y & 3) == 0;
+	uint  base  = uint(u.cfg.w) * SLOT_WORDS;
+	if (smp) StatAdd(base + 0u, 1u);
+	if (Sky(d) || any(isnan(col.rgb)) || any(isinf(col.rgb))) {
+		imageStore(out_img, p, col);
+		return;
+	}
+	float z = ViewZ(d);
+	// surfaces drawn after the G-buffer (fire, particles, water, glass, spell effects): not this pass's
+	if (Flag(F_GDEPTH)) {
+		float dg = texelFetch(gdepth_tex, p, 0).r;
+		if (Sky(dg) || ViewZ(dg) - z > 0.01 * z + 0.02) {
+			imageStore(out_img, p, col);
+			return;
+		}
+	}
+	vec3 albedo = vec3(0.35);
+	if (Flag(F_ALBEDO)) {
+		ivec2 gs = textureSize(gb_albedo, 0);
+		uint  w  = texelFetch(gb_albedo, clamp(p, ivec2(0), gs - 1), 0).r;
+		if (w == 0u) { // no G-buffer surface here
+			imageStore(out_img, p, col);
+			return;
+		}
+		albedo = clamp(pow(vec3(float(w & 255u), float((w >> 8) & 255u), float((w >> 16) & 255u)) / 255.0, vec3(2.2)), vec3(0.02), vec3(0.9));
+	}
+	float l = Luma(col.rgb);
+	if (smp && l > 1e-4) {
+		StatAdd(base + 4u, uint(clamp(log2(l) + 32.0, 0.0, 64.0) * 256.0));
+		StatAdd(base + 5u, 1u);
+	}
+	float ao = Upsample(p, z);
+	ao       = (isnan(ao) || isinf(ao)) ? 1.0 : clamp(ao, 0.0, 1.0);
+	float v  = 1.0 - u.trace.z * (1.0 - ao);
+	vec3  vm = max(MultiBounce(v, albedo), vec3(u.par.x));
+	float fade = u.par.y > 0.0 ? exp(-z / u.par.y) : 1.0;
+	vec3  k    = 1.0 - (1.0 - vm) * fade;
+	if (Flag(F_VIEW)) {
+		imageStore(out_img, p, vec4(vec3(ao), col.a));
+		return;
+	}
+	vec3 res = col.rgb;
+	if (u.par.z > 0.0) {
+		vec3 amb = min(max(col.rgb, vec3(0.0)), albedo * u.par.z);
+		res      = col.rgb - amb * (1.0 - k);
+	}
+	if (any(isnan(res)) || any(isinf(res))) res = col.rgb;
+	if (smp) {
+		StatAdd(base + 1u, 1u);
+		StatAdd(base + 2u, uint(ao * 1000.0 + 0.5));
+		float drop = l > 1e-5 ? 1.0 - Luma(res) / l : 0.0;
+		StatAdd(base + 3u, drop > 0.02 ? 1u : 0u);
+		StatAdd(base + 6u, uint(clamp(drop, 0.0, 1.0) * 1000.0 + 0.5));
+	}
+	imageStore(out_img, p, vec4(res, col.a));
+}
+
+void main() {
+	ivec2 p    = ivec2(gl_GlobalInvocationID.xy);
+	int   mode = push.mode;
+	ivec2 size = ivec2(mode == 4 ? RenderSize() : TraceSize());
+	if (p.x >= size.x || p.y >= size.y) return;
+	if (mode == 0) Prep(p);
+	else if (mode == 1) Trace(p);
+	else if (mode == 2) Temporal(p);
+	else if (mode == 3) Denoise(p);
+	else Composite(p);
+}

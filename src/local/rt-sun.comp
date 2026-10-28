@@ -159,7 +159,7 @@ float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 	// in the depth buffer, smooth in the game's shading) hits the next facet of a crease within decimetres. The
 	// height of the ray over that plane is t * N.L: a least distance, a few cm near, ~0.25 m at 50 m.
 	float t_min = (0.04 + 0.008 * z) / max(ndl, 0.3);
-	float jit   = Ign(vec2(pixel) + float(push.misc.y % 64) * 5.588238);
+	float jit   = Ign(vec2(pixel) + 0.0 /* (ds-rt-shadow 10-28: fixed per-pixel samples, no per-frame seed: the still-camera flicker) */ * 5.588238);
 	vec3  o     = p + n * (0.006 * z + 0.02); // (normal bias: no self-hits at grazing angles)
 	// The first sample one pixel out (no self-hit on the start texel).
 	float t0    = 1.0 / px_m;
@@ -282,7 +282,7 @@ float SunVis(vec3 p, vec3 n, float ndl, vec3 l, ivec2 pixel, out int ci) {
 	int   q  = push.misc.z;
 	int   nb = q >= 3 ? 16 : q >= 2 ? 12 : 8;
 	int   np = q >= 3 ? 24 : q >= 2 ? 16 : 12;
-	float fr = float(push.misc.y % 64);
+	float fr = 0.0 /* (ds-rt-shadow 10-28: fixed per-pixel samples, no per-frame seed: the still-camera flicker) */;
 	ci = h < 0 ? -1 : PickCascade(p, h, 4.0);
 	if (ci < 0) return 1.0;
 	// The blend band: near the cascade's edge the next (coarser) one is taken instead, with a probability ramping to 1
@@ -367,14 +367,14 @@ void HwSun(vec3 p, vec3 n, vec3 l, ivec2 pixel, out float occ_c, out float occ_f
 	if (ndl_w <= 0.03) return;
 	// Off the receiver's triangle (depth-buffer jitter and precision grow with the distance) along the normal and a
 	// little toward the sun; the least hit distance grows likewise (no acne far away).
-	vec3  o     = pw + nw * (0.02 + 0.003 * z) + lw * (0.01 + 0.001 * z);
+	vec3  o     = pw + nw * (0.05 + 0.004 * z) + lw * (0.02 + 0.002 * z); // (ds-rt-shadow 10-28: larger: TLAS self-hits)
 	float t_min = 0.02 + 0.004 * z;
 	float cr    = sun.hw.w * (1.0 + z / 25.0);
 	vec3  b1    = normalize(cross(lw, abs(lw.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
 	vec3  b2    = cross(lw, b1);
 	int   rays  = lvl >= 3 ? 2 : 1;
 	uint  flags = gl_RayFlagsOpaqueEXT | (lvl >= 3 ? 0u : gl_RayFlagsTerminateOnFirstHitEXT);
-	float f     = float(push.misc.y % 64);
+	float f     = 0.0 /* (ds-rt-shadow 10-28: fixed per-pixel samples, no per-frame seed: the still-camera flicker) */;
 	for (int r = 0; r < rays; ++r) {
 		float u1  = Ign(vec2(pixel) + f * 5.17 + float(r) * 19.0 + 3.0);
 		float u2  = Ign(vec2(pixel.y, pixel.x) + f * 2.93 + float(r) * 37.0 + 57.0);
@@ -481,7 +481,7 @@ void Trace(ivec2 pixel) {
 		float tol = 0.01 * z + 0.03;
 		bool  planar = abs(a0 + a1 - 2.0 * z) <= tol && abs(a2 + a3 - 2.0 * z) <= tol;
 		if (planar) {
-			float f   = float(push.misc.y % 64);
+			float f   = 0.0 /* (ds-rt-shadow 10-28: fixed per-pixel samples, no per-frame seed: the still-camera flicker) */;
 			float u1  = Ign(vec2(pixel) + f * 7.123 + 13.0), u2 = Ign(vec2(pixel.y, pixel.x) + f * 3.731 + 71.0);
 			vec3  b1  = normalize(cross(l, abs(l.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
 			vec3  b2  = cross(l, b1);
@@ -524,7 +524,13 @@ void Temporal(ivec2 pixel) {
 	wn = max(wn, 1.0);
 	m1 /= wn, m2 /= wn;
 	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
+#ifdef KYTY_HWRT_SHADOW
+	// (sun stability: the rays' one-sample disc jitter averaged over ~25 frames once the history holds; the clamp box
+	// still lets a moved occluder's shadow go)
+	float a_min = 0.04;
+#else
 	float a_min = push.misc.z >= 3 ? 0.08 : 0.1;
+#endif
 	float count = 1.0;
 	float res   = mix(m1, cur, 0.5);
 	vec2  puv   = uv + textureLod(motion_tex, uv, 0).xy * push.motion.xy / RenderSize();
@@ -633,6 +639,7 @@ void Composite(ivec2 pixel, out float dark, out float lift) {
 	f = min(f, 1.0 + sun.opt.w * (rn / (1.0 + rn * vg)));
 	f = mix(1.0, f, clamp(sun.hdr.w * fade * stable, 0.0, 1.0));
 	if (isnan(f) || isinf(f)) f = 1.0;
+	f = clamp(f, 0.3, 1.5); // (ds-rt-shadow 10-28: a bounded correction, never a 3-4x swing from a small visibility difference)
 	dark = clamp(1.0 - f, 0.0, 1.0), lift = clamp(f - 1.0, 0.0, 4.0);
 	vec3 rgb = col.rgb * f;
 	if (dbg == 1) rgb = vec3(vg);

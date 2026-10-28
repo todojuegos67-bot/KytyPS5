@@ -1961,6 +1961,15 @@ namespace LibNpTrophy2 {
 
 LIB_VERSION("NpTrophy2", 1, "NpTrophy2", 1, 1);
 
+// (10-28) The emulator's own log is silenced in the packages: each NpTrophy2 call's first time goes to stdout (the
+// out.log), so a log shows whether the game reaches the trophy API at all.
+#define TROPHY2_TRACE()                                                                                                \
+	do {                                                                                                               \
+		static std::once_flag trace_once;                                                                              \
+		const char* trace_name = __func__;                                                             \
+		std::call_once(trace_once, [&] { std::printf("Trophy: the game called sceNp%s\n", trace_name); });      \
+	} while (false)
+
 constexpr int NP_TROPHY2_ERROR_ICON_FILE_NOT_FOUND = -2141898479; /* 0x80553911 */
 
 struct NpTrophy2Progress {
@@ -2048,10 +2057,13 @@ static void NpTrophy2FillTitle(char* dst, size_t dst_size, const char* src) {
 
 static int KYTY_SYSV_ABI NpTrophy2CreateHandle(int* handle) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	if (handle != nullptr) {
 		*handle = 1;
 	}
+
+	(void)Libs::Trophy::Count();
 
 	return 0;
 }
@@ -2059,10 +2071,13 @@ static int KYTY_SYSV_ABI NpTrophy2CreateHandle(int* handle) {
 static int KYTY_SYSV_ABI NpTrophy2CreateContext(int* context, int user_id, uint32_t service_label,
                                                 uint64_t options) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	if (context != nullptr) {
 		*context = 1;
 	}
+
+	(void)Libs::Trophy::Count(); // (the package read at the first trophy call)
 
 	LOGF("\t user_id       = %d\n"
 	     "\t service_label = %u\n"
@@ -2079,6 +2094,7 @@ static int KYTY_SYSV_ABI NpTrophy2CreateContext(int* context, int user_id, uint3
 
 static int KYTY_SYSV_ABI NpTrophy2RegisterContext(int context, int handle, uint64_t options) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t context = %d\n"
 	     "\t handle  = %d\n"
@@ -2094,14 +2110,13 @@ static int KYTY_SYSV_ABI NpTrophy2RegisterContext(int context, int handle, uint6
 // The unlock: recorded in _SaveData/<title>/trophies.json and shown as a popup (Libs::Trophy, SystemOverlay).
 static int KYTY_SYSV_ABI NpTrophy2UnlockTrophy(int context, int handle, int trophy_id, int* platinum_id) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t context   = %d\n"
 	     "\t handle    = %d\n"
 	     "\t trophy_id = %d\n",
 	     context, handle, trophy_id);
 
-	std::printf("Trophy: the game unlocks id %d\n", trophy_id);
-	std::fflush(stdout);
 	int platinum = -1;
 	Libs::Trophy::Unlock(trophy_id, &platinum);
 	if (platinum_id != nullptr) {
@@ -2115,6 +2130,7 @@ static int KYTY_SYSV_ABI NpTrophy2GetGameInfo(int context, int handle,
                                               NpTrophy2GameDetails* details,
                                               NpTrophy2GameData*    data) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t context = %d\n"
 	     "\t handle  = %d\n"
@@ -2139,6 +2155,7 @@ static int KYTY_SYSV_ABI NpTrophy2GetGroupInfo(int context, int handle, int grou
                                                NpTrophy2GroupDetails* details,
                                                NpTrophy2GroupData*    data) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t context  = %d\n"
 	     "\t handle   = %d\n"
@@ -2171,6 +2188,7 @@ static int KYTY_SYSV_ABI NpTrophy2GetGroupInfoArray(int context, int handle, uin
                                                     NpTrophy2GroupData*    data_array,
                                                     uint32_t*              count) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t context       = %d\n"
 	     "\t handle        = %d\n"
@@ -2205,6 +2223,7 @@ static int KYTY_SYSV_ABI NpTrophy2GetGroupInfoArray(int context, int handle, uin
 static int KYTY_SYSV_ABI NpTrophy2GetTrophyInfo(int context, int handle, int trophy_id,
                                                 NpTrophy2Details* details, NpTrophy2Data* data) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t context   = %d\n"
 	     "\t handle    = %d\n"
@@ -2244,6 +2263,7 @@ static int KYTY_SYSV_ABI NpTrophy2GetTrophyInfoArray(int context, int handle, ui
                                                      NpTrophy2Details* details_array,
                                                      NpTrophy2Data* data_array, uint32_t* count) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t context       = %d\n"
 	     "\t handle        = %d\n"
@@ -2279,6 +2299,7 @@ static int KYTY_SYSV_ABI NpTrophy2GetTrophyInfoArray(int context, int handle, ui
 
 static int KYTY_SYSV_ABI NpTrophy2GetGameIcon(int context, int handle, void* buffer, size_t* size) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t context = %d\n"
 	     "\t handle  = %d\n"
@@ -2296,6 +2317,7 @@ static int KYTY_SYSV_ABI NpTrophy2GetGameIcon(int context, int handle, void* buf
 static int KYTY_SYSV_ABI NpTrophy2GetGroupIcon(int context, int handle, int group_id, void* buffer,
                                                size_t* size) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t context  = %d\n"
 	     "\t handle   = %d\n"
@@ -2315,6 +2337,7 @@ static int KYTY_SYSV_ABI NpTrophy2GetGroupIcon(int context, int handle, int grou
 static int KYTY_SYSV_ABI NpTrophy2GetTrophyIcon(int context, int handle, int trophy_id,
                                                 void* buffer, size_t* size) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t context   = %d\n"
 	     "\t handle    = %d\n"
@@ -2333,6 +2356,7 @@ static int KYTY_SYSV_ABI NpTrophy2GetTrophyIcon(int context, int handle, int tro
 
 static int KYTY_SYSV_ABI NpTrophy2RegisterUnlockCallback(void* callback, void* userdata) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t callback = 0x%016" PRIx64 "\n"
 	     "\t userdata = 0x%016" PRIx64 "\n",
@@ -2343,6 +2367,7 @@ static int KYTY_SYSV_ABI NpTrophy2RegisterUnlockCallback(void* callback, void* u
 
 static int KYTY_SYSV_ABI NpTrophy2AbortHandle(int handle) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t handle = %d\n", handle);
 
@@ -2351,6 +2376,7 @@ static int KYTY_SYSV_ABI NpTrophy2AbortHandle(int handle) {
 
 static int KYTY_SYSV_ABI NpTrophy2DestroyHandle(int handle) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t handle = %d\n", handle);
 
@@ -2359,6 +2385,7 @@ static int KYTY_SYSV_ABI NpTrophy2DestroyHandle(int handle) {
 
 static int KYTY_SYSV_ABI NpTrophy2DestroyContext(int context) {
 	PRINT_NAME();
+	TROPHY2_TRACE();
 
 	LOGF("\t context = %d\n", context);
 

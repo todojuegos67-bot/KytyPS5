@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics::FrameGen::RtFlicker {
 namespace {
@@ -19,7 +20,7 @@ struct Push {
 	float   par[4];
 };
 static_assert(sizeof(Push) == 32);
-constexpr uint32_t MaxIndex = 40; // st[40 + pass]: the largest jump in 10 s, x 1e-4 of the pixel's light
+constexpr uint32_t MaxIndex = 44; // st[44 + pass]: the largest jump in 10 s, x 1e-4 of the pixel's light
 static_assert(Count * 4 <= MaxIndex && MaxIndex + Count <= 64);
 
 struct Grid {
@@ -47,6 +48,8 @@ struct {
 	bool                  have_prev = false, still = false;
 	uint64_t              frame = 0, frames = 0, still_frames = 0;
 	std::array<uint64_t, Count> ran {};
+	std::array<uint64_t, Count> resumed {}; // (the pass ran this frame after not running the one before: an on/off pop)
+	std::array<std::array<std::pair<const char*, uint64_t>, 8>, Count> causes {};
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 } g_f;
 
@@ -66,7 +69,7 @@ float Threshold() {
 	return t;
 }
 const char* Name(uint32_t p) {
-	static const char* names[] {"particles light", "sun shadows", "lamp/torch shadows", "reflections", "volumetric light"};
+	static const char* names[] {"particles light", "sun shadows", "lamp/torch shadows", "reflections", "volumetric light", "gi+ao", "contact shadows", "water mirrors", "ambient occlusion", "torch light", "lens flare"};
 	return p < Count ? names[p] : "?";
 }
 
@@ -193,12 +196,18 @@ void MaybeLog() {
 	std::array<uint32_t, Count * 4> cur {}, d {};
 	for (uint32_t i = 0; i < Count * 4; ++i) cur[i] = g_f.stat[i], d[i] = cur[i] - g_f.last[i];
 	g_f.last = cur;
-	char line[1400];
+	char line[3072];
 	int  n = std::snprintf(line, sizeof(line), "RTFLICKER: 10 s: camera still %llu of %llu frames;",
 	                       static_cast<unsigned long long>(g_f.still_frames), static_cast<unsigned long long>(g_f.frames));
 	for (uint32_t p = 0; p < Count && n > 0 && n < static_cast<int>(sizeof(line)); ++p) {
 		if (g_f.ran[p] == 0) {
-			n += std::snprintf(line + n, sizeof(line) - n, " %s off;", Name(p));
+			n += std::snprintf(line + n, sizeof(line) - n, " %s off", Name(p));
+			for (uint32_t i = 0; i < g_f.causes[p].size() && n > 0 && n < static_cast<int>(sizeof(line)); ++i)
+				if (g_f.causes[p][i].first != nullptr)
+					n += std::snprintf(line + n, sizeof(line) - n, "%s%s %llu", i == 0 ? " (causes: " : ", ", g_f.causes[p][i].first,
+					                   static_cast<unsigned long long>(g_f.causes[p][i].second));
+			if (n > 0 && n < static_cast<int>(sizeof(line)))
+				n += std::snprintf(line + n, sizeof(line) - n, "%s;", g_f.causes[p][0].first != nullptr ? ")" : "");
 			continue;
 		}
 		const double touched = static_cast<double>(std::max(d[p * 4 + 1], 1u));
@@ -209,7 +218,18 @@ void MaybeLog() {
 		                   Name(p), static_cast<double>(Threshold() * 100.0f), 100.0 * d[p * 4 + 2] / touched,
 		                   static_cast<double>(Threshold() * 200.0f), 100.0 * d[p * 4 + 3] / touched, d[p * 4 + 1], d[p * 4],
 		                   static_cast<unsigned long long>(g_f.ran[p]), maxj);
+		// (ds-rt-shadow) the causes: on/off switches the probe sees, then the pass's own events
+		if (n > 0 && n < static_cast<int>(sizeof(line)) && (g_f.resumed[p] > 0 || g_f.causes[p][0].first != nullptr)) {
+			n -= 1; // (the ';' goes after the causes)
+			n += std::snprintf(line + n, sizeof(line) - n, " causes: resumed after a gap %llu", static_cast<unsigned long long>(g_f.resumed[p]));
+			for (const auto& [name, count]: g_f.causes[p])
+				if (name != nullptr && n > 0 && n < static_cast<int>(sizeof(line)))
+					n += std::snprintf(line + n, sizeof(line) - n, ", %s %llu", name, static_cast<unsigned long long>(count));
+			if (n > 0 && n < static_cast<int>(sizeof(line))) n += std::snprintf(line + n, sizeof(line) - n, ";");
+		}
 	}
+	for (auto& c: g_f.causes) c = {};
+	g_f.resumed = {};
 	std::printf("%s\n", line);
 	std::fflush(stdout);
 	g_f.frames = g_f.still_frames = 0;
@@ -219,7 +239,6 @@ void MaybeLog() {
 } // namespace
 
 uint32_t g_still_run = 0;
-
 bool     CameraStill() { return g_f.still; }
 uint32_t StillFrames() { return g_still_run; }
 
@@ -238,7 +257,7 @@ void BeginFrame(const UpscaleInputs& inputs) {
 	g_f.have_prev = have;
 	g_f.still     = still;
 	g_still_run   = still ? g_still_run + 1 : 0;
-	if (!Enabled()) return;
+	if (!Enabled()) return; // (refl-pro: the still-camera state is kept for the reflections even with the check off)
 	if (still) ++g_f.still_frames;
 	MaybeLog();
 }
@@ -254,6 +273,7 @@ void Probe(vk::CommandBuffer command, GraphicContext* graphics, Pass pass, const
 	const vk::Extent2D ge {(after.extent.width + 3) / 4, (after.extent.height + 3) / 4};
 	if (!EnsureGrid(*graphics, grid, ge)) return;
 	const bool history = !grid.fresh && grid.last_frame + 1 == g_f.frame; // (the pass ran last frame too)
+	if (!grid.fresh && !history && grid.last_frame != 0) ++g_f.resumed[pass];
 	if (grid.fresh) {
 		vk::ImageMemoryBarrier2 b {};
 		b.srcStageMask     = vk::PipelineStageFlagBits2::eNone;
@@ -319,6 +339,17 @@ void Probe(vk::CommandBuffer command, GraphicContext* graphics, Pass pass, const
 	mb.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	mb.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 	command.pipelineBarrier2(dep);
+}
+
+void Cause(Pass pass, const char* name, uint64_t count) {
+	if (!Enabled() || pass >= Count || name == nullptr || count == 0) return;
+	for (auto& c: g_f.causes[pass]) {
+		if (c.first == nullptr) c.first = name;
+		if (c.first == name || std::strcmp(c.first, name) == 0) {
+			c.second += count;
+			return;
+		}
+	}
 }
 
 } // namespace Libs::Graphics::FrameGen::RtFlicker

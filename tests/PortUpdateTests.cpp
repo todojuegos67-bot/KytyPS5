@@ -298,6 +298,11 @@ void TestLaunch() {
 	CHECK(!has);
 	r.rt_sun = r.rt_particles = r.rt_reflections = true;
 	p                                            = Port::BuildLaunch(r, "PPSA01341", pc);
+	EnvOf(p, "KYTY_HWRT", &has);
+	CHECK(!has); // (10-28: hardware RT only with rt_experimental)
+	r.rt_hw_exp = true;
+	p           = Port::BuildLaunch(r, "PPSA01341", pc);
+	CHECK(EnvOf(p, "KYTY_RT_HW_EXPERIMENTAL") == "1");
 	CHECK(EnvOf(p, "KYTY_HWRT") == "1" && EnvOf(p, "KYTY_HWRT_SHADOW") == "2" && EnvOf(p, "KYTY_HWRT_LIGHTS") == "2" &&
 	      EnvOf(p, "KYTY_HWRT_PARTICLES") == "2" && EnvOf(p, "KYTY_HWRT_REFL_MATERIAL") == "1");
 	Port::Settings g;
@@ -309,6 +314,49 @@ void TestLaunch() {
 	p                              = Port::BuildLaunch(g, "PPSA01341", pc);
 	CHECK(EnvOf(p, "KYTY_GODRAYS") == "0" && EnvOf(p, "KYTY_HWRT") == "0" && EnvOf(p, "KYTY_HWRT_REFL") == "0" && EnvOf(p, "KYTY_SSGI") == "0");
 	CHECK(EnvOf(p, "KYTY_STATUS_HUD_SECONDS") == "0" && EnvOf(p, "KYTY_SHADER_WARMUP") == "1");
+	{
+		// (10-28) ds-torch-1028: the screen-space set, AO, torch light / flare / Hibrido, Sombras RT, FSR 4.
+		Port::Settings n;
+		p = Port::BuildLaunch(n, "PPSA01341", pc);
+		CHECK(EnvOf(p, "KYTY_AO") == "0");
+		EnvOf(p, "KYTY_TORCH", &has);
+		CHECK(!has);
+		n.rt_ss_refl = "4";
+		n.rt_ssgi    = "4";
+		n.rt_shadows = "2";
+		n.ao         = "1";
+		n.torch      = "4";
+		n.lens_flare = true;
+		n.godrays    = "2";
+		p            = Port::BuildLaunch(n, "PPSA01341", pc);
+		CHECK(EnvOf(p, "KYTY_RT_REFLECTIONS") == "4" && EnvOf(p, "KYTY_RT_REFLECTIONS_MIN") == "0.55");
+		CHECK(EnvOf(p, "KYTY_SSGI") == "3" && EnvOf(p, "KYTY_SSGI_INTENSITY") == "1.6");
+		CHECK(EnvOf(p, "KYTY_RT_SHADOWS") == "2" && EnvOf(p, "KYTY_RT_SHADOWS_STRENGTH") == "0.5" && EnvOf(p, "KYTY_HWRT_SHADOW") == "0");
+		CHECK(EnvOf(p, "KYTY_GODRAYS") == "2" && EnvOf(p, "KYTY_AO") == "1");
+		CHECK(EnvOf(p, "KYTY_TORCH") == "3" && EnvOf(p, "KYTY_TORCH_HW") == "1" && EnvOf(p, "KYTY_RT_HW_EXPERIMENTAL") == "1" &&
+		      EnvOf(p, "KYTY_HWRT_REFL") == "0" && EnvOf(p, "KYTY_TORCH_FLARE") == "1");
+		Port::Settings live = n;
+		live.ao = "0", live.torch = "0", live.lens_flare = false, live.rt_shadows = "0";
+		CHECK(Port::LiveRtOff(n, live) == (8 | 16 | 32)); // (Sombras RT stays: Luz volumetrica needs the sun pass)
+		live.godrays = "0";
+		CHECK(Port::LiveRtOff(n, live) == (4 | 8 | 16 | 32 | 64));
+		n.pure_game = true;
+		p           = Port::BuildLaunch(n, "PPSA01341", pc);
+		CHECK(EnvOf(p, "KYTY_AO") == "0" && EnvOf(p, "KYTY_TORCH") == "0" && EnvOf(p, "KYTY_TORCH_FLARE") == "0" &&
+		      EnvOf(p, "KYTY_RT_REFLECTIONS") == "0" && EnvOf(p, "KYTY_TORCH_HW") == "0");
+		Port::Settings f;
+		f.res = "fsr4-rendimiento";
+		p     = Port::BuildLaunch(f, "PPSA01341", pc);
+		CHECK(EnvOf(p, "KYTY_UPSCALER") == "fsr4" && EnvOf(p, "KYTY_FSR4_PRESET") == "performance" && p.ratio == 2.0);
+		// The Configurador: never AO, Luz RT or Hibrido; no hardware RT without rt_experimental.
+		Port::PcInfo big = pc;
+		big.cpu          = "AMD Ryzen 9 9950X3D";
+		big.vram         = 16ull << 30;
+		big.screen_w = 1920, big.screen_h = 1080;
+		Port::Settings o;
+		Port::Optimize(big, &o);
+		CHECK(o.ao == "0" && o.rt_ssgi == "0" && o.torch != "4" && !o.rt_reflections && o.rt_lamps == "0");
+	}
 	Port::Settings a;
 	a.shadows = "medio";
 	p         = Port::BuildLaunch(a, "PPSA01341", pc);

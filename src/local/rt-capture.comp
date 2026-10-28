@@ -1,0 +1,26 @@
+#version 460
+// KYTY_RT_CAPTURE (rt-capture.cpp): one image's texels into a host-visible buffer, bit-exact. Built twice: float views
+// (colour, depth, motion: 4 floats a texel, raw bits) and, with -DKYTY_UINT, R32_UINT views (the packed G-buffer layers:
+// 1 word a texel).
+layout(local_size_x = 8, local_size_y = 8) in;
+#ifdef KYTY_UINT
+layout(binding = 0) uniform usampler2D src;
+#else
+layout(binding = 0) uniform sampler2D src;
+#endif
+layout(binding = 1, std430) writeonly buffer Out { uint w[]; } o;
+layout(push_constant) uniform Push { ivec4 size; } push; // xy the extent
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, push.size.xy))) return;
+	uint i = uint(p.y * push.size.x + p.x);
+#ifdef KYTY_UINT
+	o.w[i] = texelFetch(src, p, 0).r;
+#else
+	vec4 v = texelFetch(src, p, 0);
+	o.w[i * 4u + 0u] = floatBitsToUint(v.r);
+	o.w[i * 4u + 1u] = floatBitsToUint(v.g);
+	o.w[i * 4u + 2u] = floatBitsToUint(v.b);
+	o.w[i * 4u + 3u] = floatBitsToUint(v.a);
+#endif
+}

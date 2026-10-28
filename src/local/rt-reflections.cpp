@@ -1,4 +1,4 @@
-// KYTY_RT_REFLECTIONS=0|1|2|3|4|5 ("RT reflections": off / low / medium / high / ultra / extreme; rt-reflections.comp): screen-space ray-traced
+// KYTY_RT_REFLECTIONS=0|1|2|3|4 ("RT reflections": off / low / medium / high / ultra; rt-reflections.comp): screen-space ray-traced
 // reflections with denoising for Demon's Souls' PS5 Pro path, recorded in FrameGen::Upscale right before the upscaler
 // (DLSS / XeSS / FSR), which then reads our composited copy of the game's color. Only there: it is the one point where
 // the game hands over its lit HDR color before anti-aliasing together with depth, motion vectors and the projection
@@ -85,31 +85,10 @@
 // roughness of 0.25 (no filtered blur mixed in). Fireflies: the floor's reflection at most 3x (pools 6x) the pixel's
 // luminance, the temporal pass clamps a sample to its neighbourhood (mean + 2.5 sigma) and takes in a sample that differs
 // 2x from its history at half the rate.
-// (refl10, precision and depth; the user's Ultra: KYTY_RT_REFLECTIONS=4) What limited it, from the code and the logs:
-// mirrors at ultra came from the temporal history (a fifth of a fresh sample a frame through a bilinear fetch, half the
-// pixels traced per frame), and the composite's own sharp mirror ray (half-resolution levels only) never ran there,
-// pools' included: soft, lagging mirrors; the history of untraced (checkerboard) and missed pixels was reprojected by the
-// surface's motion, not the reflected hit's (virtual image), so the reflection slid with the floor (smear / ghost
-// trails); every pixel's hit was the entry of a flat screen-facing box (stepped edges); the G-buffer normal is
-// octahedral 8:8 (~0.45 degree steps: banding across flat puddles, ~0.4 m at 25 m); rays hit 36-58 % of the time.
-// Changes: KYTY_RT_REFLECTIONS_FRESH_MIRROR (ultra / extreme: this frame's mirror ray, the trace's or the composite's
-// own), KYTY_RT_REFLECTIONS_VIRTUAL (every level: the neighbours' hit distance for the virtual image),
-// KYTY_RT_REFLECTIONS_BICUBIC (ultra / extreme: Catmull-Rom history below a roughness of 0.3),
-// KYTY_RT_REFLECTIONS_REFINE (ultra / extreme: bisection on the bilinear surface), KYTY_RT_REFLECTIONS_NORMAL_SNAP
-// (degrees, 2; 0 off: on floors / ramps where the 8-bit G-buffer normal agrees with the depth's plane that closely, the
-// plane's exact normal),
-// KYTY_RT_REFLECTIONS_RPP (rays per glossy pixel, 1..4), KYTY_RT_REFLECTIONS_ITERS (8..256) / _CAP (x the render
-// height, 0.1..4) override a level's march; level 5 "extreme": every pixel every frame, 128 iterations, rays up to 2.5x
-// the render height, 2 rays per glossy pixel. A 10 s line "RT reflections: rays:" says why rays miss.
-#include "local/local-pass-cache.h"
 #include "local/rt-reflections.h"
-#include "local/rt-flicker.h"
 
 #include "graphics/presentation/videoOut.h"
 #include "gpu_tiler_shaders/rt_reflections_spv.h"
-#include "gpu_tiler_shaders/rt_reflections_hw_spv.h"
-#include "gpu_tiler_shaders/rt_reflections_hwm_spv.h"
-#include "local/hwrt-scene.h"
 
 #include <algorithm>
 #include <array>
@@ -126,14 +105,6 @@ namespace {
 
 constexpr uint32_t Bindings      = 22;
 constexpr uint32_t HeaderBytes   = 208;           // view_rot[3], clip_prev[4], up_view, fparams, mparams, gparams, xparams, yparams
-// (rtstab2) KYTY_RT_REFLECTIONS_STABLE (1; 0: the frame-indexed lobe sequence as before): rt-reflections.comp StableNoise.
-bool StableNoise() {
-	static const bool on = [] {
-		const char* v = std::getenv("KYTY_RT_REFLECTIONS_STABLE");
-		return !(v != nullptr && v[0] == '0');
-	}();
-	return on;
-}
 // calib[] (after the header; the shader's CALIB_* / STATS): samples, normal sums per layer x layout x space x screen
 // y convention, byte statistics, floor votes, then the cumulative stats counters (never cleared).
 constexpr uint32_t NLayouts      = 13;
@@ -143,7 +114,7 @@ constexpr uint32_t CalibFloors   = CalibBytes + 16 * 3;
 constexpr uint32_t CalibWet      = CalibFloors + 2; // puddle guess: count + 16 byte sums; water: the same
 constexpr uint32_t CalibHist     = 300;             // 16 byte fields x 16 bins
 constexpr uint32_t StatsIndex    = 560;
-constexpr uint32_t StatsCount    = 34; // (refl10: 30..32 why rays miss, 33 the composite's mirror rays)
+constexpr uint32_t StatsCount    = 32;
 // (refl9) The metal survey (the shader's SURVEY, mode 8; never cleared): static / moving sample counts, set-bit counts
 // per class x layer x bit, byte histograms per class x field x 16 bins.
 constexpr uint32_t SurveyIndex   = 600;
@@ -192,18 +163,6 @@ struct RtPass {
 	vk::DescriptorSetLayout set_layout = nullptr;
 	vk::PipelineLayout      layout     = nullptr;
 	vk::Pipeline            pipeline   = nullptr;
-	// (hwrt2, KYTY_HWRT_REFL) the pass with ray queries into the scene TLAS: + binding 22 (RayInfo), 23 (the TLAS)
-	vk::DescriptorSetLayout hw_set_layout = nullptr;
-	vk::PipelineLayout      hw_layout     = nullptr;
-	vk::Pipeline            hw_pipeline   = nullptr;
-	bool                    hw_failed     = false;
-	// (hwrt3, KYTY_HWRT_REFL_MATERIAL) the same with binding 24, the albedo array of the off-screen hits
-	vk::DescriptorSetLayout hwm_set_layout = nullptr;
-	vk::PipelineLayout      hwm_layout     = nullptr;
-	vk::Pipeline            hwm_pipeline   = nullptr;
-	bool                    hwm_failed     = false;
-	uint64_t                hwm_frames     = 0;
-	uint64_t                hw_frames = 0, sw_frames = 0;
 	vk::Sampler             point = nullptr, linear = nullptr;
 	bool                    failed = false; // (the pipeline could not be made: off for the session)
 	bool                    images_failed = false;
@@ -387,7 +346,6 @@ std::array<RtImage*, 13> Sized() {
 }
 
 bool EnsurePipeline(GraphicContext& graphics) {
-	std::lock_guard ensure_lock(LocalPassCache::EnsureMutex()); // (the prewarm thread's, local-pass-cache.h)
 	if (g_rt.pipeline != nullptr) return true;
 	if (g_rt.failed) return false;
 	g_rt.failed       = true;
@@ -423,7 +381,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_rt.layout;
-	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_rt.pipeline);
+	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_rt.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_rt.pipeline = nullptr;
@@ -471,123 +429,6 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	return true;
 }
 
-// (hwrt2) KYTY_HWRT_REFL=1: the trace's misses (off the screen, behind something, toward the camera) take a hardware
-// ray query into the scene captured by KYTY_HWRT (local/hwrt-scene.h). Needs KYTY_HWRT=1; turns the reflections on
-// (high) when KYTY_RT_REFLECTIONS is not set.
-bool HwReflWanted() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_HWRT_REFL");
-		return value != nullptr && value[0] == '1';
-	}();
-	return on;
-}
-
-bool EnsureHwPipeline(GraphicContext& graphics) {
-	std::lock_guard ensure_lock(LocalPassCache::EnsureMutex()); // (the prewarm thread's, local-pass-cache.h)
-	if (g_rt.hw_pipeline != nullptr) return true;
-	if (g_rt.hw_failed) return false;
-	g_rt.hw_failed    = true;
-	const auto device = graphics.device;
-	std::array<vk::DescriptorSetLayoutBinding, Bindings + 2> bindings {};
-	for (uint32_t i = 0; i < Bindings + 2; ++i) {
-		bindings[i].binding         = i;
-		bindings[i].descriptorType  = i == Bindings + 1                                       ? vk::DescriptorType::eAccelerationStructureKHR
-		                              : (i == 18 || i == 19 || i == Bindings)                 ? vk::DescriptorType::eStorageBuffer
-		                              : (i == 4 || i == 11 || i == 12 || i == 13)             ? vk::DescriptorType::eStorageImage
-		                                                                                      : vk::DescriptorType::eCombinedImageSampler;
-		bindings[i].descriptorCount = 1;
-		bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
-	}
-	vk::DescriptorSetLayoutCreateInfo set_info {};
-	set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-	set_info.bindingCount = Bindings + 2;
-	set_info.pBindings    = bindings.data();
-	if (device.createDescriptorSetLayout(&set_info, nullptr, &g_rt.hw_set_layout) != vk::Result::eSuccess) return false;
-	vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(RtPush)};
-	vk::PipelineLayoutCreateInfo layout_info {};
-	layout_info.setLayoutCount         = 1;
-	layout_info.pSetLayouts            = &g_rt.hw_set_layout;
-	layout_info.pushConstantRangeCount = 1;
-	layout_info.pPushConstantRanges    = &push;
-	if (device.createPipelineLayout(&layout_info, nullptr, &g_rt.hw_layout) != vk::Result::eSuccess) return false;
-	vk::ShaderModuleCreateInfo module_info {};
-	module_info.codeSize    = sizeof(RT_REFLECTIONS_HW_SPV);
-	module_info.pCode       = RT_REFLECTIONS_HW_SPV;
-	vk::ShaderModule module = nullptr;
-	if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
-	vk::ComputePipelineCreateInfo pipeline_info {};
-	pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
-	pipeline_info.stage.module = module;
-	pipeline_info.stage.pName  = "main";
-	pipeline_info.layout       = g_rt.hw_layout;
-	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_rt.hw_pipeline);
-	device.destroyShaderModule(module, nullptr);
-	if (created != vk::Result::eSuccess) {
-		g_rt.hw_pipeline = nullptr;
-		std::printf("RT reflections: the hardware ray query pipeline could not be made (KYTY_HWRT_REFL): screen-space only\n");
-		std::fflush(stdout);
-		return false;
-	}
-	g_rt.hw_failed = false;
-	std::printf("RT reflections: hardware ray queries into the scene TLAS for the screen-space misses (KYTY_HWRT_REFL=1)\n");
-	std::fflush(stdout);
-	return true;
-}
-
-// (hwrt3) KYTY_HWRT_REFL_MATERIAL=1 (with KYTY_HWRT_REFL=1): the ray query pass whose off-screen hits take the captured
-// meshes' base colour (binding 24: the albedo array of local/hwrt-scene.cpp). Off: this pipeline is never made.
-bool EnsureHwMaterialPipeline(GraphicContext& graphics) {
-	std::lock_guard ensure_lock(LocalPassCache::EnsureMutex()); // (the prewarm thread's, local-pass-cache.h)
-	if (g_rt.hwm_pipeline != nullptr) return true;
-	if (g_rt.hwm_failed) return false;
-	g_rt.hwm_failed   = true;
-	const auto device = graphics.device;
-	std::array<vk::DescriptorSetLayoutBinding, Bindings + 3> bindings {};
-	for (uint32_t i = 0; i < Bindings + 3; ++i) {
-		bindings[i].binding         = i;
-		bindings[i].descriptorType  = i == Bindings + 1                                       ? vk::DescriptorType::eAccelerationStructureKHR
-		                              : (i == 18 || i == 19 || i == Bindings)                 ? vk::DescriptorType::eStorageBuffer
-		                              : (i == 4 || i == 11 || i == 12 || i == 13)             ? vk::DescriptorType::eStorageImage
-		                                                                                      : vk::DescriptorType::eCombinedImageSampler;
-		bindings[i].descriptorCount = 1;
-		bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
-	}
-	vk::DescriptorSetLayoutCreateInfo set_info {};
-	set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-	set_info.bindingCount = Bindings + 3;
-	set_info.pBindings    = bindings.data();
-	if (device.createDescriptorSetLayout(&set_info, nullptr, &g_rt.hwm_set_layout) != vk::Result::eSuccess) return false;
-	vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(RtPush)};
-	vk::PipelineLayoutCreateInfo layout_info {};
-	layout_info.setLayoutCount         = 1;
-	layout_info.pSetLayouts            = &g_rt.hwm_set_layout;
-	layout_info.pushConstantRangeCount = 1;
-	layout_info.pPushConstantRanges    = &push;
-	if (device.createPipelineLayout(&layout_info, nullptr, &g_rt.hwm_layout) != vk::Result::eSuccess) return false;
-	vk::ShaderModuleCreateInfo module_info {};
-	module_info.codeSize    = sizeof(RT_REFLECTIONS_HWM_SPV);
-	module_info.pCode       = RT_REFLECTIONS_HWM_SPV;
-	vk::ShaderModule module = nullptr;
-	if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
-	vk::ComputePipelineCreateInfo pipeline_info {};
-	pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
-	pipeline_info.stage.module = module;
-	pipeline_info.stage.pName  = "main";
-	pipeline_info.layout       = g_rt.hwm_layout;
-	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_rt.hwm_pipeline);
-	device.destroyShaderModule(module, nullptr);
-	if (created != vk::Result::eSuccess) {
-		g_rt.hwm_pipeline = nullptr;
-		std::printf("RT reflections: the material ray query pipeline could not be made (KYTY_HWRT_REFL_MATERIAL): flat off-screen hits\n");
-		std::fflush(stdout);
-		return false;
-	}
-	g_rt.hwm_failed = false;
-	std::printf("RT reflections: off-screen hits take the captured meshes' base colour (KYTY_HWRT_REFL_MATERIAL=1)\n");
-	std::fflush(stdout);
-	return true;
-}
-
 // The quality levels (KYTY_RT_REFLECTIONS 1..4). Costs measured with the first version on an RTX 5080 at a 1080p render:
 // full-resolution trace, 72 iterations, 3 a-trous passes, every pixel = 8.5-10 ms; most of it the march, then the wet-
 // surface mask evaluated twice per pixel (trace and composite) and the full-resolution filters.
@@ -602,18 +443,14 @@ struct LevelCfg {
 	float       cap;      // the longest ray on screen, x the render height
 	float       alpha;    // temporal minimum alpha scale
 };
-constexpr LevelCfg Levels[6] = {
+constexpr LevelCfg Levels[5] = {
     {"off", false, false, 0, 0.0f, 0, 0.0f, 0.0f, 1.0f},
     {"low", false, true, 24, 0.45f, 1, 200.0f, 0.30f, 1.0f},
     {"medium", false, false, 32, 0.55f, 2, 300.0f, 0.45f, 1.0f},
     {"high", false, false, 48, 0.60f, 3, 800.0f, 0.75f, 0.9f}, // (10-24 far: 400 m / 0.65)
     {"ultra", true, true, 72, 0.65f, 3, 1600.0f, 1.00f, 0.8f}, // (10-24 far: 64 / 600 m / 0.90)
-    // (refl10) every pixel every frame (no checkerboard), longer rays (2.5 x the render height on screen: the whole
-    // screen; 128 iterations), 2 rays on glossy surfaces (KYTY_RT_REFLECTIONS_RPP). About 2-2.5x ultra's GPU time.
-    {"extreme", true, false, 128, 0.65f, 3, 3000.0f, 2.50f, 0.8f},
 };
-constexpr int MaxLevel = 5;
-const LevelCfg& Cfg(int level) { return Levels[std::clamp(level, 0, MaxLevel)]; }
+const LevelCfg& Cfg(int level) { return Levels[std::clamp(level, 0, 4)]; }
 
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level) {
 	if (g_rt.out.image != VK_NULL_HANDLE && g_rt.render == render && g_rt.level == level) return true;
@@ -779,16 +616,6 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		            "metal %g, glossy %g\n",
 		            std::chrono::duration<double>(now - g_rt.stat_time).count(), pc(25), mf, pc(26), pc(28), pc(29), sm[27] / 1000.0 / px,
 		            on > 0 ? sm[27] / 1000.0 / on : 0.0, g_rt.metal_strength, g_rt.glossy_strength);
-	}
-	if (sm[4] > 0) {
-		// (refl10) Why the rays miss: the depth limit (iterations: KYTY_RT_REFLECTIONS_ITERS), the screen or the ray's
-		// length (KYTY_RT_REFLECTIONS_CAP; off screen is what a screen-space ray cannot see), the hit's validation
-		// (silhouettes, back faces, the reflector's own plane, the screen-edge fade); the rest: rays toward the camera.
-		const double rays = static_cast<double>(sm[4]);
-		std::printf("RT reflections: rays: last %.0f s: hit %.1f%%, missed: out of iterations %.1f%%, off the screen / ray end %.1f%%, "
-		            "refused by the hit test %.1f%%; the composite's own mirror rays on %.2f%% of the pixels\n",
-		            std::chrono::duration<double>(now - g_rt.stat_time).count(), 100.0 * sm[5] / rays, 100.0 * sm[30] / rays,
-		            100.0 * sm[31] / rays, 100.0 * sm[32] / rays, 100.0 * sm[33] / px);
 	}
 	std::string passes;
 	for (uint32_t st = 0; st < NStages; ++st) {
@@ -1109,20 +936,11 @@ void SurveyDecide(bool force) {
 int RtReflectionsLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_RT_REFLECTIONS");
-		if (value == nullptr && HwReflWanted()) return 3; // (KYTY_HWRT_REFL alone: high)
-		return value != nullptr ? std::clamp(std::atoi(value), 0, MaxLevel) : 0; // 0 off, 1 low, 2 medium, 3 high, 4 ultra, 5 extreme
+		return value != nullptr ? std::clamp(std::atoi(value), 0, 4) : 0; // 0 off, 1 low, 2 medium, 3 high, 4 ultra
 	}();
 	return level;
 }
 bool RtReflectionsWanted() { return RtReflectionsLevel() > 0; }
-// (local-pass-cache.h) The pipelines a world's first frame would make on the flip path, made beside the title screen
-// with the same guards as RtReflectionsApply's: the base pass when on, the ray query pass with KYTY_HWRT_REFL and a
-// scene, its material variant with KYTY_HWRT_REFL_MATERIAL (KYTY_HWRT_METAL reuses these).
-void RtReflectionsPrewarm(GraphicContext& graphics) {
-	if (RtReflectionsLevel() == 0) return;
-	if (!EnsurePipeline(graphics)) return;
-	if (HwReflWanted() && HwScene::Active() && EnsureHwPipeline(graphics) && HwScene::MaterialActive()) (void)EnsureHwMaterialPipeline(graphics);
-}
 // (refl8) The game's SSR as the guide: on with the reflections unless KYTY_RT_REFLECTIONS_GUIDE=0.
 bool RtReflGuideWanted() {
 	static const bool wanted = [] {
@@ -1299,46 +1117,27 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	if (g_rt.survey_on && !g_rt.survey_done) SurveyDecide(g_rt.survey_runs > 1100); // (~5 min of surveyed frames: the minimum)
 
 	// (refl6: per level by default, so the medium level shows: low 1.3, medium 1.6, high 1.8, ultra 2.0)
-	static constexpr float DefStrength[MaxLevel + 1] = {0.0f, 1.3f, 1.6f, 1.8f, 2.0f, 2.0f};
-	const float strength = EnvFloat("KYTY_RT_REFLECTIONS_STRENGTH", DefStrength[std::clamp(level, 0, MaxLevel)], 0.0f, 3.0f);
+	static constexpr float DefStrength[5] = {0.0f, 1.3f, 1.6f, 1.8f, 2.0f};
+	const float strength = EnvFloat("KYTY_RT_REFLECTIONS_STRENGTH", DefStrength[std::clamp(level, 0, 4)], 0.0f, 3.0f);
 	const float min_refl = EnvFloat("KYTY_RT_REFLECTIONS_MIN", 0.4f, 0.0f, 0.8f);
 	const float guess    = EnvFloat("KYTY_RT_REFLECTIONS_GUESS", 0.0f, 0.0f, 1.0f);
 	const auto& cfg      = Cfg(level);
-	// (refl10) The march's depth: KYTY_RT_REFLECTIONS_ITERS (hi-z iterations, 8..256) and KYTY_RT_REFLECTIONS_CAP (the
-	// longest ray on screen x the render height, 0.1..4) override the level's.
-	const int   iters    = static_cast<int>(EnvFloat("KYTY_RT_REFLECTIONS_ITERS", static_cast<float>(cfg.iters), 8.0f, 256.0f));
+	const int   iters    = cfg.iters;
 	const float cutoff   = cfg.cutoff;
 	const int   passes   = cfg.passes;
-	const float cap_px   = EnvFloat("KYTY_RT_REFLECTIONS_CAP", cfg.cap, 0.1f, 4.0f) * static_cast<float>(color.extent.height);
-	// (refl10) Precision switches (1 on, 0 off; defaults per level): sub-pixel hit refinement, bicubic history and a fresh
-	// mirror every frame at the full-resolution trace (ultra and extreme), the virtual-image reprojection for pixels
-	// without their own hit (every level), floors' plane normal for the 8-bit G-buffer one (degrees, 2; 0 off), rays per pixel
-	// on glossy surfaces (extreme 2, else 1).
-	const auto  env_on   = [](const char* name, bool fallback) {
-		const char* v = std::getenv(name);
-		return v == nullptr || *v == '\0' ? fallback : *v != '0';
-	};
-	const bool  refine   = env_on("KYTY_RT_REFLECTIONS_REFINE", level >= 4);
-	const bool  bicubic  = env_on("KYTY_RT_REFLECTIONS_BICUBIC", level >= 4);
-	const bool  fresh    = env_on("KYTY_RT_REFLECTIONS_FRESH_MIRROR", level >= 4);
-	const bool  vfill    = env_on("KYTY_RT_REFLECTIONS_VIRTUAL", true);
-	const float snap_deg = EnvFloat("KYTY_RT_REFLECTIONS_NORMAL_SNAP", 2.0f, 0.0f, 10.0f);
-	const int   rpp      = static_cast<int>(EnvFloat("KYTY_RT_REFLECTIONS_RPP", level >= 5 ? 2.0f : 1.0f, 1.0f, 4.0f));
+	const float cap_px   = cfg.cap * static_cast<float>(color.extent.height);
 	{
 		static bool said = false;
 		if (!said) {
 			said = true;
 			std::printf("RT reflections: on (level %d %s: trace %ux%u of %ux%u%s, hi-z %u mips, %d iterations, rays <= %.0f px, %d "
 			            "a-trous passes, strength %g, water minimum reflectance %g, roughness: a mirror below %.2f, nothing from %.2f, G-buffer %s, "
-			            "exposure %s, camera %s, %s; refl10: %d ray(s) per glossy pixel, hit refinement %s, bicubic history %s, "
-			            "fresh mirrors %s, virtual-image fill %s, floor normal snap %g deg)\n",
+			            "exposure %s, camera %s, %s)\n",
 			            level, cfg.name, g_rt.trace.width, g_rt.trace.height, color.extent.width, color.extent.height,
 			            cfg.checker ? " checkerboard" : "", g_rt.hiz.levels, iters, cap_px, passes, strength, min_refl, g_rt.mat_lo, g_rt.mat_hi, have_gbuf ? "copy found (calibrating)" : "not found yet (depth normals, heuristic)",
 			            inputs.exposure_buffer != nullptr ? "the game's" : "1.0", camera.prev ? "matrices" : "motion vectors only",
 			            guide_mode ? (have_guide ? "guided by the game's SSR (found)" : "guided by the game's SSR (not found yet: the material mask until it is)")
-			                       : "material mask (KYTY_RT_REFLECTIONS_GUIDE=0)",
-			            rpp, refine ? "on" : "off", bicubic ? "on" : "off", fresh ? "on" : "off", vfill ? "on" : "off",
-			            static_cast<double>(snap_deg));
+			                       : "material mask (KYTY_RT_REFLECTIONS_GUIDE=0)");
 			std::fflush(stdout);
 		}
 	}
@@ -1351,17 +1150,12 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.params[0] = strength, push.params[1] = EnvFloat("KYTY_RT_REFLECTIONS_THICKNESS", 0.3f, 0.01f, 4.0f);
 	push.params[2] = cfg.max_len;
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
-	// (rtstab2, KYTY_RT_REFLECTIONS_STABLE) camera still for 4+ frames: the history's weight floor a quarter of it and the
-	// neighbourhood clamp twice as wide (shader: misc.w & 32768), so the TAA jitter's sample-to-sample change averages
-	// out instead of passing through at 25 % a frame on mirrors; any camera motion restores the fast settings at once.
-	const bool cam_still = StableNoise() && RtFlicker::StillFrames() >= 4;
-	push.motion[2] = cutoff, push.motion[3] = cam_still ? cfg.alpha * 0.25f : cfg.alpha;
+	push.motion[2] = cutoff, push.motion[3] = cfg.alpha;
 	push.misc[1] = static_cast<int32_t>(g_rt.frame & 0x7fffffff);
 	push.misc[2] = level;
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0) |
 	               (g_rt.row0_up ? 16 : 0) | (cfg.checker ? 32 : 0) | (have_water ? 64 : 0) |
-	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0) | (refine ? 1024 : 0) | (bicubic ? 2048 : 0) |
-	               (fresh ? 4096 : 0) | (vfill ? 8192 : 0) | (StableNoise() ? 16384 : 0) | (cam_still ? 32768 : 0);
+	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0);
 	// (combo19: guided only while the guide is there; without it the material mask, refl6, instead of water only: the
 	// guide never found in play was the whole reason nothing changed)
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
@@ -1418,32 +1212,11 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		// (refl9b, yparams) the minimum reflective area's radius in render pixels (KYTY_RT_REFLECTIONS_MIN_AREA, given at a
 		// 720-line render, scaled to this one) and the large pools' boost
 		header[48] = g_rt.min_area * static_cast<float>(color.extent.height) / 720.0f, header[49] = g_rt.pool_boost;
-		header[50] = static_cast<float>(rpp), header[51] = snap_deg; // (refl10, yparams.z / w)
 		command.updateBuffer(vk::Buffer(g_rt.frame_buf), 0, HeaderBytes, header.data());
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
-	// (hwrt2) the ray query pipeline when the frame has a scene TLAS (KYTY_HWRT_REFL)
-	const bool hw = HwReflWanted() && inputs.hwrt_tlas != 0 && inputs.hwrt_info && EnsureHwPipeline(*graphics);
-	if (hw) ++g_rt.hw_frames;
-	else ++g_rt.sw_frames;
-	if (HwReflWanted() && ((g_rt.hw_frames + g_rt.sw_frames) % 600) == 1) {
-		std::printf("RT reflections: hardware ray queries in %llu of %llu frames (KYTY_HWRT_REFL; none: no scene TLAS that frame)\n",
-		            static_cast<unsigned long long>(g_rt.hw_frames), static_cast<unsigned long long>(g_rt.hw_frames + g_rt.sw_frames));
-		std::fflush(stdout);
-	}
-	// (hwrt3) the material variant while the albedo array exists (KYTY_HWRT_REFL_MATERIAL)
-	vk::ImageView albedo_view    = nullptr;
-	vk::Sampler   albedo_sampler = nullptr;
-	const bool    hwm = hw && HwScene::MaterialActive() && HwScene::MaterialAtlas(albedo_view, albedo_sampler) &&
-	                 EnsureHwMaterialPipeline(*graphics);
-	if (hwm && (++g_rt.hwm_frames % 600) == 1) {
-		std::printf("RT reflections: material off-screen hits in %llu of %llu frames (KYTY_HWRT_REFL_MATERIAL)\n",
-		            static_cast<unsigned long long>(g_rt.hwm_frames), static_cast<unsigned long long>(g_rt.hw_frames + g_rt.sw_frames));
-		std::fflush(stdout);
-	}
-	const vk::PipelineLayout pass_layout = hwm ? g_rt.hwm_layout : hw ? g_rt.hw_layout : g_rt.layout;
-	command.bindPipeline(vk::PipelineBindPoint::eCompute, hwm ? g_rt.hwm_pipeline : hw ? g_rt.hw_pipeline : g_rt.pipeline);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_rt.pipeline);
 
 	auto&          g    = g_rt;
 	const uint32_t cur  = static_cast<uint32_t>(g.frame & 1u);
@@ -1483,7 +1256,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		const vk::DescriptorBufferInfo exposure_info = game_exposure
 		                                                   ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range}
 		                                                   : frame_info;
-		vk::WriteDescriptorSet writes[Bindings + 3] {};
+		vk::WriteDescriptorSet writes[Bindings] {};
 		for (uint32_t i = 0; i < Bindings; ++i) {
 			writes[i].dstBinding      = i;
 			writes[i].descriptorCount = 1;
@@ -1495,32 +1268,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			else writes[i].pImageInfo = &infos[i];
 		}
 		push.misc[0] = mode;
-		// (hwrt2: the scene's RayInfo and TLAS)
-		const vk::DescriptorBufferInfo ray_info {inputs.hwrt_info, 0, inputs.hwrt_info_size};
-		const auto tlas = vk::AccelerationStructureKHR(reinterpret_cast<VkAccelerationStructureKHR>(inputs.hwrt_tlas));
-		vk::WriteDescriptorSetAccelerationStructureKHR as_write {};
-		as_write.accelerationStructureCount = 1;
-		as_write.pAccelerationStructures    = &tlas;
-		if (hw) {
-			writes[Bindings].dstBinding          = Bindings;
-			writes[Bindings].descriptorCount     = 1;
-			writes[Bindings].descriptorType      = vk::DescriptorType::eStorageBuffer;
-			writes[Bindings].pBufferInfo         = &ray_info;
-			writes[Bindings + 1].pNext           = &as_write;
-			writes[Bindings + 1].dstBinding      = Bindings + 1;
-			writes[Bindings + 1].descriptorCount = 1;
-			writes[Bindings + 1].descriptorType  = vk::DescriptorType::eAccelerationStructureKHR;
-		}
-		// (hwrt3: binding 24, the albedo array)
-		const vk::DescriptorImageInfo albedo_info {albedo_sampler, albedo_view, vk::ImageLayout::eGeneral};
-		if (hwm) {
-			writes[Bindings + 2].dstBinding      = Bindings + 2;
-			writes[Bindings + 2].descriptorCount = 1;
-			writes[Bindings + 2].descriptorType  = vk::DescriptorType::eCombinedImageSampler;
-			writes[Bindings + 2].pImageInfo      = &albedo_info;
-		}
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pass_layout, 0, hwm ? Bindings + 3 : hw ? Bindings + 2 : Bindings, writes);
-		command.pushConstants(pass_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, Bindings, writes);
+		command.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 		command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
 		Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 		        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
@@ -1579,7 +1328,6 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	{
 		Set s = base;
 		s.a = src, s.b = src, s.gcur = &g.gb[cur], s.gprev = &g.gb[cur], s.aux = &g.aux, s.meta = &g.meta[cur];
-		s.b  = &g.rad; // (refl10: the trace's raw output: this frame's mirror hits at the full-resolution trace)
 		s.oa = &g.out, s.ob = &g.rad, s.oc = &g.rad;
 		run(4, s, g.render);
 		stamp(StComposite);
@@ -1608,5 +1356,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	inputs.color.layer  = 0;
 	return true;
 }
+
+// (ds-rt1026-restore) The 10-25/26 RT reflections (c3e58bd5) restored; frame-gen.cpp's prewarm hook (09e52edf) kept as a
+// no-op: the pipeline is made on first use, as it was then.
+void RtReflectionsPrewarm(GraphicContext& /*graphics*/) {}
 
 } // namespace Libs::Graphics::FrameGen

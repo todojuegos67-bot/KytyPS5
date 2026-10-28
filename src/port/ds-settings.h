@@ -23,7 +23,8 @@ struct ResMode {
 	const char* id;
 	const char* label;
 	double      value;    // ratio (upscalers) or render height (others)
-	const char* upscaler; // "dlss", "xess", "fsr" or "" (the game's)
+	const char* upscaler; // "dlss", "xess", "fsr" (FSR 3.1), "fsr4" (AMD FSR 4) or "" (the game's)
+	const char* fsr4_preset = nullptr; // (10-28) FSR 4's model (KYTY_FSR4_PRESET): native, quality, balanced, performance, ultraperf, drs
 };
 extern const ResMode kResModes[];
 extern const int     kResModeCount;
@@ -62,6 +63,17 @@ extern const Choice  kAntiLagOther[]; // the AMD frame generation's, on NVIDIA /
 extern const int     kAntiLagOtherCount;
 extern const Choice  kAntiLagDlssg[]; // NVIDIA frame generation's
 extern const int     kAntiLagDlssgCount;
+// (10-28, ds-torch-1028's launcher) The screen-space RT set (c3e58bd5) and the new passes: their rows' levels.
+extern const Choice  kRtReflLevels[];  // Reflejos RT: No, Bajo, Medio, Alto, Ultra, Extremo (KYTY_RT_REFLECTIONS 0-5)
+extern const int     kRtReflLevelCount;
+extern const Choice  kRtLightLevels[]; // Luz RT (SSGI): No, Media, Alta, Ultra, Extremo
+extern const int     kRtLightLevelCount;
+extern const Choice  kRtLevels[];      // No, Bajo, Medio, Alto (Luz volumetrica, Oclusion ambiental, Sombras RT)
+extern const int     kRtLevelCount;
+extern const Choice  kTorchLevels[];   // Luz de antorchas RT: No, Bajo, Medio, Alto, Hibrido
+extern const int     kTorchLevelCount;
+extern const Choice  kYesNo[];
+extern const int     kYesNoCount;
 extern const Choice  kSoulsModes[];
 extern const int     kSoulsModeCount;
 
@@ -120,6 +132,14 @@ struct Settings {
 	std::string rt_lamps = "";       // empty: from rt_particles (an older settings.ini: Si = 2)
 	std::string godrays = "0";       // Luz volumetrica: 0 No, 1 Bajo, 2 Medio, 3 Alto (KYTY_GODRAYS + the hidden RT sun pass)
 	bool        pure_game = false;   // Juego original: every visual pass the emulator adds off
+	// (10-28, ds-torch-1028) The screen-space RT set and the new passes (none needs hardware RT but Hibrido):
+	std::string rt_ss_refl = "0";    // reflejos_rt: Reflejos RT 0-5 (KYTY_RT_REFLECTIONS; 4+: more presence)
+	std::string rt_ssgi = "0";       // luz_rt_pantalla: Luz RT (SSGI) 0 No, 1 Media, 2 Alta, 3 Ultra, 4 Extremo (KYTY_SSGI)
+	std::string rt_shadows = "0";    // sombras_rt: Sombras RT de pantalla 0-3 (KYTY_RT_SHADOWS, strength 0.35 / 0.5 / 0.7)
+	std::string ao = "0";            // oclusion_ao: Oclusion ambiental 0-3 (KYTY_AO); default No (its composite costs ~7 ms now)
+	std::string torch = "0";         // luz_antorchas: Luz de antorchas RT 0-3, 4 Hibrido (KYTY_TORCH, KYTY_TORCH_HW)
+	bool        lens_flare = false;  // destellos_lente: KYTY_TORCH_FLARE
+	bool        rt_hw_exp = false;   // rt_experimental: hardware RT (the launcher's rthwexp; KYTY_RT_HW_EXPERIMENTAL=1)
 	std::string shadow_edges = "0";  // Bordes sombras: 0 Normal, 1 Alta, 2 Muy alta, 3 Ultra (KYTY_SHADOW_FILTER)
 	std::string corner_shadow = "0"; // Sombra rincones: 0 Normal, 1 Alta, 2 Maxima (with Oclusion RT only)
 	bool        motion_blur = true, dof = true, vignette = true, bloom = true, eye_adapt = true;
@@ -186,7 +206,8 @@ LaunchPlan BuildLaunch(const Settings& settings, const std::string& title_id, co
 // on an RTX 5080 + Ryzen 9 9950X3D at 4K). Writes only graphics, ray tracing and the RAM option into `settings`;
 // returns the explanation lines ("Hemos elegido: ...").
 std::vector<std::string> Optimize(const PcInfo& pc, Settings* settings);
-// Ray tracing rows (Reflejos, Antorchas, Luz volumetrica) turned off in the menu are applied live (PortLive::rt_off);
+// Ray tracing rows (Reflejos, Antorchas, Luz volumetrica, and since 10-28 Oclusion ambiental (8), Luz de antorchas RT (16),
+// Destellos de lente (32), Sombras RT (64)) turned off in the menu are applied live (PortLive::rt_off);
 // turning them on, or anything else, needs a restart.
 int  LiveRtOff(const Settings& launched, const Settings& now); // the PortLive::rt_off mask
 // (The Antorchas level: rt_lamps, or rt_particles of an older settings.ini.)

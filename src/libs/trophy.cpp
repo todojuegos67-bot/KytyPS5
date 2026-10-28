@@ -265,12 +265,17 @@ void SaveList(State& s) {
 	if (f) f << j.dump(1, '\t');
 }
 
+bool SoundWanted();
+bool PopupWanted();
+
 void Load(State& s) {
 	if (s.loaded) return;
 	s.loaded = true;
 	if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &s.title_id) || s.title_id.empty()) s.title_id = "UNKNOWN";
 	s.store = std::filesystem::path("_SaveData") / s.title_id / "trophies.json";
 	const uint32_t lang = Config::GetConsoleLanguage();
+	std::printf("Trophy: init (title %s, sound %s, popups %s)\n", s.title_id.c_str(), SoundWanted() ? "on" : "off",
+	            PopupWanted() ? "on" : "off");
 	s.words             = LabelFor(Primary(lang));
 
 	// The unlocks so far.
@@ -293,25 +298,19 @@ void Load(State& s) {
 		if (Lower(Common::PathToString(f.path().extension())) == ".ucp" && (ucp.empty() || f.path() < ucp)) ucp = f.path();
 	}
 	std::map<std::string, Bytes> files;
-	// (10-27c) Every trophy line on the port's console too (its log is silent): the package found or why not.
 	if (ucp.empty() || !ReadUcp(ucp, files)) {
+		LOGF("Trophy: no trophy package in %s\n", Common::PathToString(dir).c_str());
 		std::printf("Trophy: no trophy package in %s (%s)\n", Common::PathToString(dir).c_str(),
-		            ucp.empty() ? "no .ucp file" : ("unreadable: " + Common::PathToString(ucp)).c_str());
-		std::fflush(stdout);
+		            ucp.empty() ? "no .ucp" : "unreadable .ucp");
 		return;
 	}
 	const auto conf_it = files.find("tropconf.json");
 	if (conf_it == files.end()) {
-		std::printf("Trophy: %s has no tropconf.json (%zu files)\n", Common::PathToString(ucp).c_str(), files.size());
-		std::fflush(stdout);
+		std::printf("Trophy: %s has no tropconf.json\n", Common::PathToString(ucp).c_str());
 		return;
 	}
 	const auto conf = nlohmann::json::parse(conf_it->second.begin(), conf_it->second.end(), nullptr, false);
-	if (!conf.is_object()) {
-		std::printf("Trophy: %s: tropconf.json unreadable\n", Common::PathToString(ucp).c_str());
-		std::fflush(stdout);
-		return;
-	}
+	if (!conf.is_object()) return;
 
 	// The metadata in the game's language, else English, else the package's default, else any.
 	std::vector<std::string> tags = LanguageTags(lang);
@@ -371,8 +370,10 @@ void Load(State& s) {
 			s.trophies[e.info.id] = std::move(e);
 		}
 	}
-	std::printf("Trophy: %zu trophies (%s), %zu unlocked\n", s.trophies.size(), s.language.c_str(), s.unlocked.size());
-	std::fflush(stdout);
+	LOGF("Trophy: %zu trophies (%s), %zu unlocked\n", s.trophies.size(), s.language.c_str(), s.unlocked.size());
+	std::printf("Trophy: opened %s: %zu trophies, language %s (console language %u), %zu unlocked (%s)\n",
+	            Common::PathToString(ucp.filename()).c_str(), s.trophies.size(), s.language.c_str(), lang,
+	            s.unlocked.size(), Common::PathToString(s.store).c_str());
 	SaveList(s);
 }
 
@@ -445,8 +446,8 @@ void Record(State& s, int id) {
 	}
 	t->label      = s.words.earned;
 	t->grade_text = t->grade >= 1 && t->grade <= 4 ? s.words.grades[t->grade - 1] : "";
+	LOGF("Trophy: unlocked id %d %s (%s)\n", id, t->name.c_str(), GradeName(t->grade));
 	std::printf("Trophy: unlocked id %d %s (%s)\n", id, t->name.c_str(), GradeName(t->grade));
-	std::fflush(stdout);
 	if (PopupWanted()) s.queue.push_back(std::move(t));
 }
 
@@ -511,6 +512,15 @@ bool Snapshot(std::vector<Info>* all, std::vector<int>* unlocked) {
 		for (const auto& [id, t]: s.unlocked) unlocked->push_back(id);
 	}
 	return true;
+}
+
+void Preload() {
+	// (At the start, on its own thread: the init and package lines in every log, and no reading at the first unlock.)
+	std::thread([] {
+		auto&           s = S();
+		std::lock_guard lock(s.mutex);
+		Load(s);
+	}).detach();
 }
 
 std::shared_ptr<const Toast> CurrentToast(float* seconds) {

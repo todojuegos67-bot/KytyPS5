@@ -1,0 +1,354 @@
+#version 460
+#extension GL_EXT_ray_query : require
+// KYTY_HWRT_CONTACT=1|2|3 (rt-contact.cpp): ray-traced contact shadows through the scene TLAS (hwrt-scene.cpp), on the
+// PS5 Pro path's HDR color before the upscaler. Modes (push.misc.x):
+//   0 trace     (half resolution at 1, full at 2 / 3): the pixel's world position (depth + the inverse view-projection),
+//               its normal from the depth. The receiver: a short probe ray across the pixel's own surface names the
+//               mesh it lies on (dynamic meshes first). Short rays (lb.p0.z metres, x2 far away) toward the sun (inside
+//               its cone, a fixed per-pixel seed: the same rays every frame) and toward the pixel's strongest local light
+//               (jittered on its source radius, ending short of its lamp), cull mask 0x03 (static + this frame's dynamic
+//               meshes; no stale or tiny ones), closest hit; the receiver's own mesh is skipped (entirely when it is a
+//               dynamic one: its captured positions may trail the depth, no self-shadow acne; in its first 0.15 m when
+//               static). Occlusion fades over the ray's last 35 % (no hard cut at its end).
+//               Out: (sun occlusion, light occlusion x the lights' share of the pixel's light, 0, 1);
+//               gbuf_out: normal, depth.
+//   1 temporal  reprojection by the game's motion vectors, depth / normal disocclusion test, 3x3 variance clamp
+//               (1.25 sigma), alpha max(1/n, 0.08): with a still camera the inputs are identical frame to frame
+//   2 a-trous   5x5 B3 with depth / normal stops (steps 1, 2; 4 at level 3): edge-aware, no bleeding across silhouettes
+//   3 composite full resolution, the trace pixel of the 2x2 nearest in depth (none matching: nothing darkened, no halo).
+//               Direct light only, never twice: color *= (1 + K min(V, 1 - occ)) / (1 + K V) x (1 - share occ_light),
+//               K = R N.L w, V the RT sun pass's visibility this frame (1 without it): an already sun-shadowed pixel is
+//               unchanged, ambient and albedo kept. (ds-fx-all2: no estimate read back from the color - it changed with the
+//               other passes and the upscaler's jitter: 37 % of touched points flickered.)
+//               stable ramps with the history count; far pixels fade out (lb.p1.w .. lb.p2.x m).
+// Statistics (1 pixel in 16) into stats[]: see rt-contact.cpp.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2) uniform sampler2D motion_tex;
+layout(binding = 3) uniform sampler2D src_tex;
+layout(binding = 4) uniform sampler2D gbuf_cur;
+layout(binding = 5) uniform sampler2D gbuf_prev;
+layout(binding = 6) uniform sampler2D hist_prev;
+layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
+layout(binding = 8, rgba16f) uniform writeonly image2D gbuf_out;
+
+struct Light {
+	vec4 pos_r;   // world position, reach
+	vec4 dir_cos; // forward, cos of the cone's half angle (-2: point light)
+	vec4 misc;    // x fade, y cos where the cone's edge falloff starts, z ray end short of the light (m), w source radius
+};
+layout(binding = 9, std430) readonly buffer ParamBuf {
+	vec4  ivp[4]; // clip -> world (rows)
+	vec4  cam;    // world camera position
+	vec4  sun;    // xyz world direction toward the sun, w weight (0: no sun)
+	vec4  p0;     // x R, y sun visibility image (0 none, 1 partial, 2 exact), z ray length (m), w strength
+	vec4  p1;     // x lights, y y sign of row 0, z max darkening, w fade start (m)
+	vec4  p2;     // x fade end (m), y sun cone tan, z light share knee, w texture-contrast knee
+	vec4  p3;     // x weight of the sun visibility (held copy included), eased 0..1 over 1 s
+	Light l[8];
+} lb;
+layout(binding = 10) uniform accelerationStructureEXT tlas;
+layout(binding = 11, std430) buffer Stats { uint s[]; } stats;
+layout(binding = 12) uniform sampler2D sun_vis;
+layout(binding = 13, rgba16f) uniform image2D held_vis; // the last exact sun visibility (ds-rt-stable-1027)
+
+layout(push_constant) uniform Push {
+	vec4  size;   // render size xy, trace size zw
+	vec4  motion; // motion scale xy; z history valid; w a-trous step
+	ivec4 misc;   // mode, frame, level, flags
+} push;
+
+vec2  RenderSize() { return push.size.xy; }
+vec2  TraceSize() { return push.size.zw; }
+float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+bool  IsSky(float d) { return d <= 1e-7 || d >= 0.9999999; }
+float Lum(vec3 c) { return dot(clamp(c, vec3(0.0), vec3(65000.0)), vec3(0.2126, 0.7152, 0.0722)); }
+
+vec3 WorldPos(vec2 uv, float d) {
+	vec4 c = vec4(uv.x * 2.0 - 1.0, lb.p1.y * (uv.y * 2.0 - 1.0), d, 1.0);
+	vec4 w = vec4(dot(lb.ivp[0], c), dot(lb.ivp[1], c), dot(lb.ivp[2], c), dot(lb.ivp[3], c));
+	return w.xyz / (abs(w.w) > 1e-20 ? w.w : 1e-20);
+}
+vec3 WorldNormal(vec2 uv, vec3 p) {
+	vec2 t  = 1.0 / RenderSize();
+	vec3 px = WorldPos(uv + vec2(t.x, 0), textureLod(depth_tex, uv + vec2(t.x, 0), 0).r);
+	vec3 nx = WorldPos(uv - vec2(t.x, 0), textureLod(depth_tex, uv - vec2(t.x, 0), 0).r);
+	vec3 py = WorldPos(uv + vec2(0, t.y), textureLod(depth_tex, uv + vec2(0, t.y), 0).r);
+	vec3 ny = WorldPos(uv - vec2(0, t.y), textureLod(depth_tex, uv - vec2(0, t.y), 0).r);
+	vec3 e  = lb.cam.xyz;
+	vec3 dx = abs(distance(px, e) - distance(p, e)) < abs(distance(p, e) - distance(nx, e)) ? px - p : p - nx;
+	vec3 dy = abs(distance(py, e) - distance(p, e)) < abs(distance(p, e) - distance(ny, e)) ? py - p : p - ny;
+	vec3 n  = cross(dx, dy);
+	float l = length(n);
+	n = l > 1e-20 ? n / l : normalize(e - p);
+	if (dot(n, e - p) < 0.0) n = -n;
+	return n;
+}
+
+float LightW(int i, vec3 p, vec3 n) {
+	Light L  = lb.l[i];
+	vec3  v  = L.pos_r.xyz - p;
+	float d2 = dot(v, v);
+	float r  = L.pos_r.w;
+	if (d2 >= r * r || d2 < 1e-6) return 0.0;
+	vec3  ld  = v * inversesqrt(d2);
+	float ndl = dot(n, ld);
+	if (ndl <= 0.0) return 0.0;
+	float win = 1.0 - d2 / (r * r);
+	float w   = win * win / (d2 + 0.25) * ndl * L.misc.x;
+	if (L.dir_cos.w > -1.5) w *= smoothstep(L.dir_cos.w, L.misc.y, dot(-ld, L.dir_cos.xyz));
+	return w;
+}
+
+// The receiver's mesh when it is a dynamic one (0x02 | 0x04): a ray across the pixel's surface (from 0.25 m toward the
+// camera to just behind it). Returns the instance's custom index + 1 (0: a static receiver or none).
+uint Receiver(vec3 p, float z, out bool dyn) {
+	vec3  v   = normalize(lb.cam.xyz - p);
+	float tol = 0.06 + 0.01 * z;
+	vec3  o   = p + v * 0.25;
+	dyn       = false;
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0x06, o, 0.0, -v, 0.25 + tol);
+	while (rayQueryProceedEXT(rq)) {}
+	if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT &&
+	    abs(rayQueryGetIntersectionTEXT(rq, true) - 0.25) < tol) {
+		dyn = true;
+		return uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true)) + 1u;
+	}
+	return 0u;
+}
+
+// Occlusion (0..1) of a ray from o along dir up to tmax; the receiver (rid - 1) skipped within skip_t (all when dynamic).
+float Occlusion(vec3 o, vec3 dir, float tmin, float tmax, uint rid, float skip_t, bool smp) {
+	if (tmax <= tmin) return 0.0;
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, rid != 0u ? gl_RayFlagsNoOpaqueEXT : gl_RayFlagsOpaqueEXT, 0x03, o, tmin, dir, tmax);
+	while (rayQueryProceedEXT(rq)) {
+		if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+			bool self = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false)) + 1u == rid &&
+			            rayQueryGetIntersectionTEXT(rq, false) < skip_t;
+			if (!self) rayQueryConfirmIntersectionEXT(rq);
+			else if (smp) atomicAdd(stats.s[9], 1u);
+		}
+	}
+	if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) return 0.0;
+	float t = rayQueryGetIntersectionTEXT(rq, true);
+	return 1.0 - smoothstep(0.65 * tmax, tmax, t);
+}
+
+void Trace(ivec2 pixel) {
+	vec2  uv = (vec2(pixel) + 0.5) / TraceSize();
+	float d  = textureLod(depth_tex, uv, 0).r;
+	if (IsSky(d)) {
+		imageStore(out_img, pixel, vec4(0.0));
+		imageStore(gbuf_out, pixel, vec4(0, 0, 0, 1e6));
+		return;
+	}
+	vec3  p = WorldPos(uv, d);
+	float z = distance(p, lb.cam.xyz);
+	vec3  n = WorldNormal(uv, p);
+	imageStore(gbuf_out, pixel, vec4(n, z));
+	if (z > lb.p2.x) {
+		imageStore(out_img, pixel, vec4(0.0, 0.0, 1.0, 1.0));
+		return;
+	}
+	bool  smp  = (pixel.x & 3) == 0 && (pixel.y & 3) == 0;
+	float len  = lb.p0.z * clamp(1.0 + z / 40.0, 1.0, 2.0);
+	vec3  o    = p + n * (0.012 + 0.0015 * z);
+	float tmin = 0.01 + 0.001 * z;
+	// The strongest local light here.
+	int   count = clamp(int(lb.p1.x + 0.5), 0, 8);
+	float wbest = 0.0, wsum = 0.0;
+	int   best  = -1;
+	for (int i = 0; i < count; ++i) {
+		float w = LightW(i, p, n);
+		wsum += w;
+		if (w > wbest) wbest = w, best = i;
+	}
+	float ndl_sun = dot(n, lb.sun.xyz);
+	bool  want_sun = lb.sun.w > 0.0 && ndl_sun > 0.02;
+	bool  want_l   = best >= 0;
+	if (!want_sun && !want_l) {
+		imageStore(out_img, pixel, vec4(0.0, 0.0, 1.0, 1.0));
+		return;
+	}
+	bool dyn = false;
+	uint rid = Receiver(p, z, dyn);
+	if (smp && dyn) atomicAdd(stats.s[8], 1u);
+	float skip_t = 1e9; // (only a dynamic receiver is named: its own mesh skipped)
+	int   rays   = push.misc.z >= 3 ? 2 : 1;
+	float occ_s = 0.0, occ_l = 0.0;
+	for (int k = 0; k < rays; ++k) {
+		// fixed per-pixel seeds (no frame index): the same rays every frame on a still view
+		float u1 = (float(k) + Ign(vec2(pixel) + float(k) * 13.0)) / float(rays);
+		float u2 = Ign(vec2(pixel.y, pixel.x) + 3.0 + float(k) * 37.0);
+		float ang = 6.2831853 * u2, rad = sqrt(u1);
+		if (want_sun) {
+			vec3 ax = lb.sun.xyz;
+			vec3 b1 = normalize(cross(ax, abs(ax.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+			vec3 b2 = cross(ax, b1);
+			vec3 dir = normalize(ax + (b1 * cos(ang) + b2 * sin(ang)) * (lb.p2.y * rad));
+			if (smp) atomicAdd(stats.s[3], 1u);
+			float oc = Occlusion(o, dir, tmin, len, rid, skip_t, smp);
+			if (smp && oc > 0.0) atomicAdd(stats.s[4], 1u);
+			occ_s += oc;
+		}
+		if (want_l) {
+			Light L  = lb.l[best];
+			vec3  c  = L.pos_r.xyz;
+			vec3  ax = normalize(c - p);
+			vec3  b1 = normalize(cross(ax, abs(ax.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+			vec3  b2 = cross(ax, b1);
+			vec3  tg = c + (b1 * cos(ang) + b2 * sin(ang)) * (L.misc.w * rad);
+			vec3  dv = tg - o;
+			float dl = length(dv);
+			if (smp) atomicAdd(stats.s[5], 1u);
+			float oc = Occlusion(o, dv / max(dl, 1e-4), tmin, min(len, dl - L.misc.z), rid, skip_t, smp);
+			if (smp && oc > 0.0) atomicAdd(stats.s[6], 1u);
+			occ_l += oc * (wbest / max(wsum, 1e-6)); // (the other lights still reach the pixel)
+		}
+	}
+	float share = want_l ? wsum / (wsum + lb.p2.z) : 0.0;
+	imageStore(out_img, pixel, vec4(occ_s / float(rays), share * occ_l / float(rays), 0.0, 1.0));
+}
+
+void Temporal(ivec2 pixel) {
+	vec2 ts  = 1.0 / TraceSize();
+	vec2 uv  = (vec2(pixel) + 0.5) * ts;
+	vec4 cur = textureLod(src_tex, uv, 0);
+	vec4 g   = textureLod(gbuf_cur, uv, 0);
+	if (g.w > 1e5) {
+		imageStore(out_img, pixel, vec4(0.0));
+		return;
+	}
+	vec3  m1 = vec3(0.0), m2 = vec3(0.0);
+	float wn = 0.0;
+	float ntol = 0.03 * g.w + 0.05;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			vec2  suv = uv + vec2(x, y) * ts;
+			vec4  sg  = textureLod(gbuf_cur, suv, 0);
+			float w   = (abs(sg.w - g.w) < ntol && dot(sg.xyz, g.xyz) > 0.7) ? 1.0 : 0.0;
+			vec3  sv  = textureLod(src_tex, suv, 0).rgb;
+			m1 += sv * w, m2 += sv * sv * w, wn += w;
+		}
+	wn = max(wn, 1.0);
+	m1 /= wn, m2 /= wn;
+	vec3  sigma = sqrt(max(m2 - m1 * m1, vec3(0.0)));
+	float n_hist = 0.0;
+	vec3  h      = cur.rgb;
+	float still  = 0.0;
+	if (push.motion.z > 0.5) {
+		vec2  mv  = textureLod(motion_tex, uv, 0).xy * push.motion.xy;
+		vec2  puv = uv + mv / RenderSize();
+		// (a still pixel - under 0.3 px of motion - keeps its history unclamped: the upscaler's sub-pixel jitter moves the
+		// 3x3 box every frame, and a clamp that follows it is a flicker; the plain average moves <= 8 % a frame)
+		still = length(mv) < 0.3 ? 1.0 : 0.0;
+		if (all(greaterThanEqual(puv, vec2(0))) && all(lessThanEqual(puv, vec2(1)))) {
+			vec4 pg = textureLod(gbuf_prev, puv, 0);
+			// disocclusion: the previous surface must be this one (depth within 4 % + 8 cm, normals agree)
+			if (abs(pg.w - g.w) < 0.04 * g.w + 0.08 && dot(pg.xyz, g.xyz) > 0.8) {
+				vec4 ph = textureLod(hist_prev, puv, 0);
+				n_hist  = ph.a;
+				h       = still > 0.5 ? ph.rgb : clamp(ph.rgb, m1 - 1.25 * sigma - 0.04, m1 + 1.25 * sigma + 0.04);
+			}
+		}
+	}
+	// (ds-rt-stable-1027) still pixel: a 64-frame running mean (a binary hit flipping with the upscaler's depth jitter
+	// moved the old 0.08 floor's output 8 % a frame); moving: as before
+	float n_new = min(n_hist + 1.0, still > 0.5 ? 64.0 : 24.0);
+	float a     = max(1.0 / n_new, still > 0.5 ? 1.0 / 64.0 : 0.08);
+	imageStore(out_img, pixel, vec4(mix(h, cur.rgb, a), n_new));
+}
+
+void Atrous(ivec2 pixel) {
+	vec2 ts = 1.0 / TraceSize();
+	vec2 uv = (vec2(pixel) + 0.5) * ts;
+	vec4 c  = textureLod(src_tex, uv, 0);
+	vec4 g  = textureLod(gbuf_cur, uv, 0);
+	if (g.w > 1e5) {
+		imageStore(out_img, pixel, c);
+		return;
+	}
+	float step = push.motion.w;
+	const float k[3] = float[3](0.375, 0.25, 0.0625);
+	vec3  sum  = vec3(0.0);
+	float wsum = 0.0;
+	for (int y = -2; y <= 2; ++y)
+		for (int x = -2; x <= 2; ++x) {
+			vec2  suv = uv + vec2(x, y) * step * ts;
+			vec4  sg  = textureLod(gbuf_cur, suv, 0);
+			float w   = k[abs(x)] * k[abs(y)];
+			w *= exp(-abs(sg.w - g.w) / (0.015 * g.w + 0.02)) * pow(max(dot(sg.xyz, g.xyz), 0.0), 32.0);
+			sum += textureLod(src_tex, suv, 0).rgb * w;
+			wsum += w;
+		}
+	imageStore(out_img, pixel, vec4(wsum > 1e-6 ? sum / wsum : c.rgb, c.a));
+}
+
+void Composite(ivec2 pixel) {
+	vec2  uv  = (vec2(pixel) + 0.5) / RenderSize();
+	vec4  col = textureLod(color_tex, uv, 0);
+	float d   = textureLod(depth_tex, uv, 0).r;
+	float m   = 1.0;
+	bool  limited = false;
+	if (!IsSky(d)) {
+		vec3  p  = WorldPos(uv, d);
+		float z  = distance(p, lb.cam.xyz);
+		vec2  ts = 1.0 / TraceSize();
+		vec2  base = (floor(uv * TraceSize() - 0.5) + 0.5) * ts;
+		float best = 1e30;
+		vec4  v    = vec4(0);
+		for (int j = 0; j < 4; ++j) {
+			vec2  suv = base + vec2(j & 1, j >> 1) * ts;
+			float dz  = abs(textureLod(gbuf_cur, suv, 0).w - z);
+			if (dz < best) best = dz, v = textureLod(src_tex, suv, 0);
+		}
+		float stable = smoothstep(1.5, 6.0, v.a);
+		float fade   = 1.0 - smoothstep(lb.p1.w, lb.p2.x, z);
+		float gain   = lb.p0.w * stable * fade;
+		if (best < 0.04 * z + 0.08 && gain > 0.0 && (v.r > 0.002 || v.g > 0.002)) {
+			vec3  n  = WorldNormal(uv, p);
+			float K  = lb.p0.x * max(dot(n, lb.sun.xyz), 0.0) * lb.sun.w;
+			float os = clamp(v.r * gain, 0.0, 1.0);
+			float ol = clamp(v.g * gain, 0.0, 1.0);
+			// (one formula every frame: V the RT sun pass's visibility when it ran this frame, else 1 - the color then has
+			// no RT sun relighting either; no switch between models, nothing read back from the color)
+			// (ds-rt-stable-1027) the sun pass's visibility on its frames, stored; the held copy on every other frame
+			// (it ran on 18-74 of ~490 frames: switching V <-> 1 per frame was the 10-28 % contact flicker)
+			float V  = 1.0;
+			if (lb.p0.y > 1.5) {
+				V = clamp(textureLod(sun_vis, uv, 0).r, 0.0, 1.0);
+				imageStore(held_vis, pixel, vec4(V, 0.0, 0.0, 1.0));
+			} else if (lb.p0.y > 0.5) {
+				V = clamp(imageLoad(held_vis, pixel).r, 0.0, 1.0);
+			}
+			V        = mix(1.0, V, clamp(lb.p3.x, 0.0, 1.0));
+			float fs = (1.0 + K * min(V, 1.0 - os)) / (1.0 + K * V);
+			m        = fs * (1.0 - ol);
+			limited  = V < 1.0 - os + 0.02 && os > 0.02;
+			m = clamp(m, 1.0 - lb.p1.z, 1.0);
+			if (isnan(m)) m = 1.0;
+		}
+	}
+	imageStore(out_img, pixel, vec4(col.rgb * m, col.a));
+	if ((pixel.x & 3) == 0 && (pixel.y & 3) == 0) {
+		atomicAdd(stats.s[0], 1u);
+		float dark = 1.0 - m;
+		if (dark > 0.02) atomicAdd(stats.s[1], 1u), atomicAdd(stats.s[2], uint(dark * 1024.0));
+		if (limited) atomicAdd(stats.s[7], 1u);
+	}
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	int   mode  = push.misc.x;
+	vec2  sz    = mode == 3 ? RenderSize() : TraceSize();
+	if (pixel.x >= int(sz.x) || pixel.y >= int(sz.y)) return;
+	if (mode == 0) Trace(pixel);
+	else if (mode == 1) Temporal(pixel);
+	else if (mode == 2) Atrous(pixel);
+	else Composite(pixel);
+}

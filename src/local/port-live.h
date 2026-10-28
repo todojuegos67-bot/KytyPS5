@@ -14,7 +14,7 @@ namespace PortLive {
 
 inline std::atomic<float> sharpness {-1.0f};  // KYTY_UPSCALE_SHARPNESS; < 0: the environment's
 // (10-28) Ray-traced passes the menu turned off live (bits: 1 RT reflections, 2 Antorchas (RT lights + particles),
-// 4 Luz volumetrica); 0: as launched. Only an "off": a pass not launched cannot be turned on without a restart.
+// 4 Luz volumetrica, 8 Oclusion ambiental, 16 Luz de antorchas RT, 32 Destellos de lente, 64 Sombras RT); 0: as launched. Only an "off": a pass not launched cannot be turned on without a restart.
 inline std::atomic<int>   rt_off {0};
 inline std::atomic<int>   fg_generate {0};    // generated frames per real frame (fixed DLSS-G, FSR 3 MFG); 0: as launched
 inline std::atomic<bool>  status_es {false}; // (10-27b) the shader progress line in Spanish: "Preparando shaders X/Y"

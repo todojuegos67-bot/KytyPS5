@@ -1,3 +1,4 @@
+#include "libs/trophy.h"
 #include "emulator.h"
 
 #include "common/abi.h"
@@ -212,6 +213,8 @@ void Run(const RunOptions& options) {
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
+
+	Libs::Trophy::Preload();
 
 	LoadElf(options.elf);
 

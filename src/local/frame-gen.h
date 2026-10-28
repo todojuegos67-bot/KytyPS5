@@ -217,6 +217,16 @@ void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view
 void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFlags aspect, vk::ImageLayout layout,
                 vk::AccessFlags2 access, vk::PipelineStageFlags2 stage);
 
+// The sharpening's measured effect (KYTY_SHARPEN_PROBE=0: none): on the PS5 Pro path, at frame 1800 and every 1800
+// after, the central 128x128 of the image the sharpening reads (slot 0) and writes (slot 1) copied to the host and
+// logged some frames later as "sharpening <upscaler>: strength X, detail before A after B (+P%)", the detail the mean
+// |laplacian| of the tonemapped luma (x1000). SharpenProbeDue: this upscale's frame is one; SharpenProbeCopy: `image`
+// (in `layout`: general or transfer source) into a slot; SharpenProbeArm: what the log line names.
+[[nodiscard]] bool SharpenProbeDue();
+void SharpenProbeCopy(vk::CommandBuffer command, vk::Image image, vk::ImageLayout layout, vk::Format format, vk::Extent2D extent,
+                      uint32_t level, uint32_t layer, int slot);
+void SharpenProbeArm(const char* upscaler, float strength, const char* where);
+
 // DLSS super resolution (KYTY_UPSCALER=dlss) in place of Sony's PS5 Pro upscaler the game dispatches
 // (graphics/guest_gpu/superResolution.h, renderer/renderSuperResolution.cpp).
 struct UpscaleImage {
