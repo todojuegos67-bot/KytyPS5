@@ -571,7 +571,7 @@ bool Build(GraphicContext& graphics, int preset, bool res2160) {
 	if (!CreateBuffer(graphics, g.scratch, res2160 ? Scratch2160 : Scratch1080, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
 	    !CreateBuffer(graphics, g.init, std::max<vk::DeviceSize>(g.initializers.size(), 256), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
 	    !CreateBuffer(graphics, g.weights, 1024, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
-	    !CreateBuffer(graphics, g.constants, 256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
+	    !CreateBuffer(graphics, g.constants, 256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) || // (also fsr4-prep's stand-in exposure buffer)
 	    !CreateBuffer(graphics, g.rcas_constants, 256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
 		std::printf("FSR 4: its buffers were not created (%.1f MB scratch): off (stretched)\n",
 		            static_cast<double>(res2160 ? Scratch2160 : Scratch1080) / 1e6);
