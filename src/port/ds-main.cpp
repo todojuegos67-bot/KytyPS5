@@ -656,6 +656,13 @@ int main(int argc, char* argv[]) {
 	const int olds = Port::Update::RemoveOldFiles(root);
 	fs::create_directories(root / L"logs", ec);
 	const bool restarted = argc > 1 && std::string(argv[1]) == "--restarted";
+	// (10-28b) The launcher: --sin-lanzador (or --no-launcher) skips it this time, --lanzador shows it this time.
+	bool skip_launcher = false, force_launcher = false;
+	for (int i = 1; i < argc; i++) {
+		const std::string a = argv[i];
+		if (a == "--sin-lanzador" || a == "--no-launcher") skip_launcher = true;
+		if (a == "--lanzador" || a == "--launcher") force_launcher = true;
+	}
 	// (10-27c) --add-to-steam: the Steam shortcut (ds-steam.cpp), its result in a message, then out.
 	for (int i = 1; i < argc; i++) {
 		if (std::string(argv[i]) != "--add-to-steam") continue;
@@ -710,7 +717,9 @@ int main(int argc, char* argv[]) {
 	ShowSplash(image);
 	// (10-27b) With the start menu the game folder is chosen there (its "Carpeta del juego" row, or at JUGAR).
 	// (10-27c) No start menu: the exe starts the game (the folder asked once, settings.ini keeps it; options in F1).
-	const bool start_menu = false;
+	// (10-28b) The launcher comes first (settings.ini menu_inicio=1, the default), and always at a first start (it holds
+	// the Configurador, configurado=0); not after F1's "Reiniciar ahora", nor with --sin-lanzador.
+	const bool start_menu = force_launcher || (!skip_launcher && !restarted && (settings.start_menu || !settings.configured));
 	while (!start_menu && !IsGame(settings.game)) {
 		if (!settings.game.empty())
 			Message("No hay eboot.bin en:\n" + settings.game + "\n\nElige la carpeta del juego volcado (la que tiene eboot.bin y sce_sys).");
@@ -788,7 +797,11 @@ int main(int argc, char* argv[]) {
 			const bool current = Port::Precompile::CacheCurrent();
 			std::printf("[port] driver pipeline cache: %s\n", current ? "every static recipe in it" : "to be made (start-up precompile)");
 			std::fflush(stdout);
-			if (!current) {
+			if (!current && start_menu) {
+				// (10-28b) The launcher shows first: the precompile runs beside it, with its bar (JUGAR stops it, what
+				// is done is kept).
+				Port::Precompile::Start();
+			} else if (!current) {
 				// (10-27c) Every pipeline of the game into this GPU's driver cache, before the game, with its bar; Esc plays
 				// now (what is done is kept, the rest the next start or beside the game).
 				g_splash.skip = false;
@@ -825,6 +838,7 @@ int main(int argc, char* argv[]) {
 		const bool play = Port::RunStartMenu(menu_rt, &settings);
 		Port::Precompile::Stop();
 		if (!play || !IsGame(settings.game)) return 0;
+		settings.configured = true; // (10-28b) the Configurador is the launcher's Sistema tab
 		Port::SaveSettings(ini, settings);
 		ShowSplash(image);
 		SplashStatus("Iniciando...");
@@ -840,7 +854,8 @@ int main(int argc, char* argv[]) {
 	}
 
 	// (10-28) The Configurador at the first start (configurado=0 in settings.ini); later from F1 > Sistema.
-	if (!settings.configured) {
+	// (10-28b) Folded into the launcher's Sistema tab: shown only if the launcher could not be (no window).
+	if (!settings.configured && !start_menu && !skip_launcher) {
 		Port::Runtime cfg_rt = make_runtime(Port::BuildLaunch(settings, param.title_id, pc));
 		Port::CloseSplash();
 		Port::RunConfigurator(cfg_rt, &settings);

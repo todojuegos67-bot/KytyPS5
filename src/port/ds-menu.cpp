@@ -349,7 +349,7 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 	if (focused) dl->AddRectFilled({at.x, at.y + h - 3 * g_unit}, {at.x + w, at.y + h}, gold);
 	std::string text = I18n::T(label);
 	dl->AddText({at.x + pad, ty}, ink, text.c_str());
-	if (restart) {
+	if (restart && !g_start_mode) { // (10-28b) the launcher applies everything at start: no "(requiere reinicio)" there
 		// (10-28) Only the rows that truly need a restart; saved now, applied at the next start.
 		const ImVec2 ls = ImGui::CalcTextSize(text.c_str());
 		ImGui::PushFont(nullptr, ImGui::GetFontSize() * 0.68f);
@@ -875,13 +875,18 @@ void ResolutionRow(Settings& s) {
 }
 
 // (10-28) The Configurador: the detected hardware, "Optimizar según tu equipo" (Optimize, ds-settings.cpp) and "Continuar".
-void DrawConfigurator(float unit) {
+// (10-28b) `in_tab`: inside the launcher's Sistema tab (no title, no "Continuar").
+void DrawConfigurator(float unit, bool in_tab = false) {
 	const ImVec4 ink {0.93f, 0.91f, 0.88f, 1.0f};
 	const auto&  pc = g_rt.pc;
-	ImGui::PushFont(nullptr, 34.0f * unit);
-	ImGui::TextColored(kGold, "%s", "Configurador");
-	ImGui::PopFont();
+	if (!in_tab) {
+		ImGui::PushFont(nullptr, 34.0f * unit);
+		ImGui::TextColored(kGold, "%s", "Configurador");
+		ImGui::PopFont();
+	}
+	ImGui::PushTextWrapPos(0.0f);
 	ImGui::TextColored(kDim, "%s", "Hemos detectado tu equipo. Puedes optimizar los gráficos para él o seguir con tus ajustes actuales.");
+	ImGui::PopTextWrapPos();
 	ImGui::Spacing();
 	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.12f, 0.10f, 0.08f, 0.85f});
 	ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14 * unit);
@@ -905,10 +910,14 @@ void DrawConfigurator(float unit) {
 		g_cfg_why         = Optimize(pc, &g_edit);
 		g_edit.configured = true;
 		Save();
-		if (!g_config_mode) ApplyLive(g_edit);
+		if (!g_config_mode && !g_start_mode) ApplyLive(g_edit);
 	}
-	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip("Elige los ajustes con mejor rendimiento para tu gráfica, procesador, RAM y monitor (objetivo: 60 FPS o más) y los guarda en settings.ini.");
+	if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) {
+		g_desc_title = "Optimizar según tu equipo";
+		g_desc_text  = "Elige los ajustes con mejor rendimiento para tu gráfica, procesador, RAM y monitor (objetivo: 60 FPS o más) y los guarda en settings.ini. Cambia gráficos, ray tracing y la opción de 16 GB de RAM; revisa las otras pestañas para ver el resultado.";
+		if (!in_tab) ImGui::SetTooltip("%s", g_desc_text.c_str());
+	}
+	if (!in_tab) {
 	ImGui::SameLine();
 	if (ImGui::Button("Continuar", {bw * 0.6f, bh})) {
 		if (!g_edit.configured) {
@@ -919,6 +928,7 @@ void DrawConfigurator(float unit) {
 		if (g_config_mode) g_start_result = 1;
 	}
 	if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", g_cfg_why.empty() ? "Sigue con tus ajustes actuales." : "Sigue con los ajustes elegidos.");
+	}
 	if (!g_cfg_why.empty()) {
 		ImGui::Spacing();
 		ImGui::PushFont(nullptr, 30.0f * unit);
@@ -927,7 +937,8 @@ void DrawConfigurator(float unit) {
 		ImGui::PushTextWrapPos(0.0f);
 		for (const auto& line: g_cfg_why) ImGui::BulletText("%s", line.c_str());
 		ImGui::PopTextWrapPos();
-		ImGui::TextColored(kDim, "%s", g_config_mode ? "Después puedes cambiar cualquier opción en el juego con F1."
+		ImGui::TextColored(kDim, "%s", g_start_mode ? "Guardado. Se aplica al pulsar JUGAR; en el juego puedes cambiarlo con F1."
+		                               : g_config_mode ? "Después puedes cambiar cualquier opción en el juego con F1."
 		                                              : "Guardado. Lo marcado \"(requiere reinicio)\" se aplica la próxima vez que inicies el juego.");
 	}
 }
@@ -1008,10 +1019,16 @@ void Draw(float width, float height) {
 	// (10-27) The tabs are Launcher-souls.ps1's groups, in its order, with its labels and tooltips.
 	// (10-27c) A game's settings menu: five tabs (LB/RB or Q/E), each the launcher's groups as sections; the rows on the
 	// left, the focused row's description on the right.
-	const char* tabs[kTabCount] = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos"};
-	static const std::vector<int> groups[kTabCount] = {{0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}}; // (10-28) no Modos Souls
-	static const char* section_names[9] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
-	                                       "Pantalla", "Rendimiento", "Controles", "Tu equipo"};
+	// (10-28b) The launcher (before the game): Imagen, Calidad gráfica, Ray tracing, Controles, Sistema (the Configurador
+	// folded in) and Trofeos; the same sections and rows as F1, so both write the same settings.ini the same way.
+	const char* game_tabs[kTabCount]     = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos"};
+	const char* launcher_tabs[kTabCount] = {"Imagen", "Calidad gráfica", "Ray tracing", "Controles", "Sistema", "Trofeos"};
+	const char* const* tabs = g_start_mode ? launcher_tabs : game_tabs;
+	static const std::vector<int> game_groups[kTabCount] = {{0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}}; // (10-28) no Modos Souls
+	static const std::vector<int> launcher_groups[kTabCount] = {{5, 0, 1}, {2}, {3}, {7}, {9, 6, 8}, {}};
+	const std::vector<int>* groups = g_start_mode ? launcher_groups : game_groups;
+	static const char* section_names[10] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
+	                                        "Pantalla", "Rendimiento", "Controles", "Tu equipo", "Configurador"};
 	g_unit = unit;
 	const float footer  = (g_start_mode ? 250 : 150) * unit;
 	const bool  nvidia  = g_rt.pc.nvidia;
@@ -1207,7 +1224,9 @@ void Draw(float width, float height) {
 					ImGui::TextColored(kDim, "%s", g_start_mode ? "Se cambia abajo (Cambiar...)." : "Se cambia en el menu de inicio, antes del juego.");
 					break;
 				}
+				case 9: DrawConfigurator(unit, true); break; // (10-28b) the launcher's Sistema: hardware and Optimizar
 				case 6: { // Sistema
+					if (!g_start_mode) {
 					// (10-28) The Configurador again: the detected hardware and "Optimizar según tu equipo".
 					if (ImGui::Button("Configurador", {420 * unit, 56 * unit})) {
 						g_cfg_open = true;
@@ -1218,6 +1237,14 @@ void Draw(float width, float height) {
 						g_desc_text  = "Muestra tu gráfica, procesador, RAM y monitor, y elige los ajustes con mejor rendimiento para tu equipo.";
 					}
 					ImGui::Spacing();
+					}
+					{
+						// (10-28b) The launcher before the game (settings.ini menu_inicio; --sin-lanzador skips it once).
+						bool show = s.start_menu;
+						if (CheckRow("Mostrar el lanzador al iniciar", false, show,
+						             "Muestra el lanzador (estas opciones, Optimizar según tu equipo y JUGAR) antes del juego. No: el juego arranca directo; las opciones siguen en F1. \"Demon's Souls.exe\" --lanzador lo muestra una vez."))
+							s.start_menu = show;
+					}
 					// (10-28) Mejoras para equipos de 16 GB de RAM: the launcher's 16 GB profile, on PCs of 20 GB or less.
 					const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
 					ImGui::BeginDisabled(!small);
@@ -1237,7 +1264,7 @@ void Draw(float width, float height) {
 					         "Jugar con teclado y ratón: WASD para moverse, el ratón mueve la cámara, clic izquierdo R1, clic derecho L1, rueda o clic central fija objetivo. F7 suelta o captura el ratón. Con él activo la cámara gira sin la aceleración del juego, también con el stick derecho del mando: si juegas con mando, déjalo desactivado.");
 					ImGui::BeginDisabled(!s.kbm);
 					const auto restart_note = [&](bool changed) {
-						if (changed) ImGui::TextColored(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}, "%s", "   (requiere reinicio)");
+						if (changed && !g_start_mode) ImGui::TextColored(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}, "%s", "   (requiere reinicio)");
 					};
 					SliderRow("Sensibilidad del ratón", s.kbm_sens, 0.05f, 4.0f, "%.2f", "Cuánto gira la cámara por cada movimiento del ratón (1.00 = normal).");
 					restart_note(s.kbm_sens != l.kbm_sens);
@@ -1316,7 +1343,8 @@ void Draw(float width, float height) {
 			ImGui::PopFont();
 			ImGui::Separator();
 			ImGui::PushTextWrapPos(0.0f);
-			ImGui::TextUnformatted(g_desc_text.empty() ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: siguiente valor.\nLB / RB o Q / E: cambiar de pestaña.\nB / Esc: volver al juego.\n\n(requiere reinicio): se guarda ya y se aplica en el próximo inicio. El resto se aplica al momento."
+			ImGui::TextUnformatted(g_desc_text.empty() && g_start_mode ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: siguiente valor.\nLB / RB o Q / E: cambiar de pestaña.\n\nTodo se guarda en settings.ini y se aplica al pulsar JUGAR. Dentro del juego, F1 abre estas mismas opciones."
+			                       : g_desc_text.empty() ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: siguiente valor.\nLB / RB o Q / E: cambiar de pestaña.\nB / Esc: volver al juego.\n\n(requiere reinicio): se guarda ya y se aplica en el próximo inicio. El resto se aplica al momento."
 			                                           : g_desc_text.c_str());
 			ImGui::PopTextWrapPos();
 			ImGui::EndChild();
@@ -1390,6 +1418,18 @@ void Draw(float width, float height) {
 		ImGui::EndDisabled();
 		ImGui::SameLine();
 		if (ImGui::Button(I18n::T("Salir"), {bw * 0.6f, bh})) g_start_result = -1;
+		ImGui::SameLine();
+		{
+			// (10-28b) "No mostrar al iniciar": settings.ini menu_inicio=0 (F1 > Sistema or --lanzador bring it back).
+			bool hide = !s.start_menu;
+			ImGui::AlignTextToFramePadding();
+			if (ImGui::Checkbox(I18n::T("No mostrar al iniciar"), &hide)) {
+				s.start_menu = !hide;
+				Save();
+			}
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("%s", "El juego arrancará directo. Para volver a verlo: F1 > Sistema > Mostrar el lanzador al iniciar, o \"Demon's Souls.exe\" --lanzador.");
+		}
 	} else {
 	const bool needs = NeedsRestartLive(g_rt.launched, s);
 	if (needs) ImGui::TextColored(kWarn, "Hay cambios \"(requiere reinicio)\": se aplican la próxima vez que inicies el juego (o pulsa Reiniciar ahora).");
@@ -1526,9 +1566,15 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 		g_start_mode = false;
 		return true;
 	}
-	const Uint32 flags  = SDL_WINDOW_ALLOW_HIGHDPI | (settings->fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : SDL_WINDOW_RESIZABLE);
-	SDL_Window*  window = SDL_CreateWindow("Demon's Souls", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-	                                       settings->width > 0 ? settings->width : 1600, settings->height > 0 ? settings->height : 900, flags);
+	// (10-28b) The launcher: its own window (1600x900, at most 90% of the desktop), whatever the game's display mode.
+	int win_w = 1600, win_h = 900;
+	if (SDL_Rect desk {}; SDL_GetDisplayUsableBounds(0, &desk) == 0 && desk.w > 0 && desk.h > 0) {
+		const float k = std::min({1.0f, desk.w * 0.9f / win_w, desk.h * 0.9f / win_h});
+		win_w = static_cast<int>(win_w * k);
+		win_h = static_cast<int>(win_h * k);
+	}
+	const Uint32 flags  = SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE;
+	SDL_Window*  window = SDL_CreateWindow("Demon's Souls", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, flags);
 	SDL_Renderer* renderer = window != nullptr ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : nullptr;
 	if (renderer == nullptr) {
 		std::printf("[port] start menu: no window (%s): straight to the game\n", SDL_GetError());
