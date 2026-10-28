@@ -38,6 +38,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <cstdlib>
+#include <string>
 #include <string>
 #include <cmath>
 #include <cstdio>
@@ -459,6 +463,57 @@ struct Presenter::Impl {
 	uint32_t                              hud_frames      = 0;
 	bool                                  machine_started = false;
 
+	// (10-28) Frame generation's own per-second measurement, the "[fsr3] real X fps, shown Y fps" / "[dlssg] ... real X fps,
+	// shown Y fps" lines in the run's log (KYTY_RUN_LOG; fsr3-fg.cpp's shown = the presents the FidelityFX DLL counted),
+	// as metricas.ps1 reads them: the panel's numbers with FSR 3 / MFG and DLSS-G (the game's flips were the real frames
+	// only, times the requested multiplier). Only a line written since the last read counts (a second with shown == real
+	// is shown as measured, x1).
+	struct FgMeasure {
+		double                                real  = 0.0;
+		double                                shown = 0.0;
+		std::chrono::steady_clock::time_point at {};
+		long long                             seen  = -1;
+	} fg_measure;
+	bool ReadFgMeasure(std::chrono::steady_clock::time_point now) {
+		static const char* log = std::getenv("KYTY_RUN_LOG");
+		if (log == nullptr || *log == '\0') return false;
+		std::fflush(stdout);
+#ifdef _WIN32
+		static const std::wstring wlog = std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(log))).wstring();
+		FILE* f = _wfopen(wlog.c_str(), L"rb");
+#else
+		FILE* f = std::fopen(log, "rb");
+#endif
+		if (f != nullptr) {
+			std::fseek(f, 0, SEEK_END);
+			const long long size = std::ftell(f);
+			const long long from = size > 16384 ? size - 16384 : 0;
+			std::string     text(static_cast<size_t>(size - from), '\0');
+			std::fseek(f, static_cast<long>(from), SEEK_SET);
+			text.resize(std::fread(text.data(), 1, text.size(), f));
+			std::fclose(f);
+			for (size_t at = text.rfind("\n["); at != std::string::npos; at = at == 0 ? std::string::npos : text.rfind("\n[", at - 1)) {
+				const size_t end  = text.find('\n', at + 1);
+				const std::string line = text.substr(at + 1, end == std::string::npos ? std::string::npos : end - at - 1);
+				if (line.rfind("[fsr3] ", 0) != 0 && line.rfind("[dlssg] ", 0) != 0) continue;
+				const size_t r = line.find("real ");
+				double real = 0, shown = 0;
+				if (r == std::string::npos || std::sscanf(line.c_str() + r, "real %lf fps, shown %lf fps", &real, &shown) != 2) continue;
+				if (end == std::string::npos) continue; // (not finished yet)
+				const long long pos = from + static_cast<long long>(at);
+				if (pos > fg_measure.seen) {
+					fg_measure.seen  = pos;
+					fg_measure.real  = real;
+					fg_measure.shown = shown;
+					fg_measure.at    = now;
+				}
+				break;
+			}
+		}
+		return fg_measure.at != std::chrono::steady_clock::time_point {} && now - fg_measure.at < std::chrono::seconds(3) &&
+		       fg_measure.real > 0.0;
+	}
+
 	// The detailed panel's rows from the machine's last sample.
 	void UpdateMachineRows() {
 		const auto machine = PerfOverlay::LatestMachine();
@@ -606,11 +661,20 @@ struct Presenter::Impl {
 			const uint32_t presents = FrameGen::Enabled() ? FrameGen::PresentedFrames() : 1u;
 			std::array<char, 32>  title {};
 			std::array<char, 128> detail {};
-			if (presents > 1) {
+			const bool fg_on = FrameGen::Enabled() || Fsr3::Active();
+			if (fg_on && ReadFgMeasure(now)) {
+				// (10-28) Measured: the frames shown on screen, the game's real ones and their ratio (not the requested one).
+				const int mult = std::max(1, static_cast<int>(std::lround(fg_measure.shown / fg_measure.real)));
+				PortLive::fg_measured.store(mult, std::memory_order_relaxed);
+				std::snprintf(title.data(), title.size(), "%.0f FPS", fg_measure.shown);
+				std::snprintf(detail.data(), detail.size(), "Reales %.0f FPS  |  FG x%d", fg_measure.real, mult);
+			} else if (presents > 1) {
+				PortLive::fg_measured.store(0, std::memory_order_relaxed);
 				std::snprintf(title.data(), title.size(), "%.0f FPS",
 				              (seconds >= 1.0 ? hud_frames / seconds : game) * presents);
 				std::snprintf(detail.data(), detail.size(), "DLSS Frame Generation %ux  |  game %.0f fps", presents, game);
 			} else {
+				PortLive::fg_measured.store(0, std::memory_order_relaxed);
 				std::snprintf(title.data(), title.size(), "%.0f FPS", game);
 			}
 			hud.title  = title.data();
