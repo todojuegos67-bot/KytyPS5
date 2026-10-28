@@ -845,9 +845,9 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		// (ds-rt-refl-1027) "other" split (% of the flashes) and how many still samples took the hold
 		const double ev2 = ev;
 		std::printf("RTFLASH: reflections other split: dark (< 0.06) %.1f%%, short history (< 4 frames) %.1f%%, not held %.1f%%, big "
-		            "blend %.1f%%, rest %.1f%%; held %.1f%% of the samples, mv >= 1 px %.1f%% (same surface %.1f%%), flashes on held "
+		            "blend %.1f%%, rest %.1f%%; held %.1f%% of the samples, drifting \"still\" samples (mv >= 1 px, not in the flash counts) %llu (same surface %llu), flashes on held "
 		            "samples %.1f%%, hit <-> miss not held %.1f%%\n",
-		            pf(23), pf(24), pf(25), pf(26), pf(27), 100.0 * f[28] / ev2, 100.0 * f[29] / ev2, 100.0 * f[30] / ev2, pf(31), pf(32));
+		            pf(23), pf(24), pf(25), pf(26), pf(27), 100.0 * f[28] / ev2, static_cast<unsigned long long>(f[29]), static_cast<unsigned long long>(f[30]), pf(31), pf(32));
 		for (auto& v: g_rt.flash_sum) v = 0;
 	}
 	if (!passes.empty()) std::printf("RT reflections: GPU ms per pass (%s): %s\n", Cfg(level).name, passes.c_str());
