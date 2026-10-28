@@ -7566,6 +7566,12 @@ int RtSunLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_RT_SUN");
 		int         q     = value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 3) : 0;
+		// (ds-rt1026-restore) the cascade RT sun came after the 10-26 set: only with KYTY_RT_HW_EXPERIMENTAL=1
+		if (q > 0 && !HwScene::RtHwExperimental()) {
+			std::printf("RTSUN: KYTY_RT_SUN=%s ignored (10-26 RT set; KYTY_RT_HW_EXPERIMENTAL=1 for it)\n", value);
+			std::fflush(stdout);
+			q = 0;
+		}
 		// (ds-rt-shadow 10-28) KYTY_HWRT_SHADOW > 0 runs the RT sun pass whatever KYTY_RT_SUN says: the launcher writes
 		// KYTY_RT_SUN=0 when its own sun toggle is off, which left KYTY_HWRT_SHADOW=2 on the old screen-space pass at
 		// strength 0 (20261028-013206 log: "no ray queries ... KYTY_RT_SUN alone", 0.0 % shadowed): nothing visible
@@ -8832,8 +8838,8 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	// cascades not copied this frame, no TLAS yet, ...) and without this pass's own shadow fade: those gave the sun to
 	// godrays only on some frames and dipped its weight on every re-latch, so the fog jumped with both on. The latched
 	// axis (last frame's while this frame's is decided) and the overcast factor only; dropped only when the latch is.
-	if (g_cs.latched) GodraysSetSun(ToView(view, g_cs.latch_axis), static_cast<float>(g_cs.sun_factor));
-	else GodraysNoteSunMiss(0);
+	// (ds-rt1026-restore) the 10-26 god rays are fed below, after the gates, with the pass's fade, as they were then
+	if (!g_cs.latched) GodraysNoteSunMiss(0);
 	if (!CShadowEnsure(*g_graphics_ctx, color.extent, quality))
 		return GodraysNoteSunMiss(3), said_once("could not create its pipeline or images"), false;
 	// (KYTY_RT_SUN: the cascades copied lately, their matrices into this frame's slot of the buffer; else nothing yet)
@@ -9125,7 +9131,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	const auto l_view = ToView(view, g_cs.latch_axis);
 	ShineSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor)); // (KYTY_SHINE: shine.cpp)
-	// (KYTY_GODRAYS: fed above, before the gates: vol-1027)
+	GodraysSetSun(l_view, g_cs.fade * static_cast<float>(g_cs.sun_factor)); // (KYTY_GODRAYS: godrays.cpp; ds-rt1026-restore: the 10-26 feed)
 	push.extra[1] = static_cast<float>(l_view[0]), push.extra[2] = static_cast<float>(l_view[1]), push.extra[3] = static_cast<float>(l_view[2]);
 	push.trace[2] = strength * g_cs.fade * g_cs.fade * (3.0f - 2.0f * g_cs.fade) * static_cast<float>(g_cs.sun_factor); // (smoothstep fade; overcast)
 	push.tune[0]  = g_cs.log_k >= 0.0 ? static_cast<float>(1.0 / std::max(std::exp2(g_cs.log_k), 1.25)) : 0.0f;
