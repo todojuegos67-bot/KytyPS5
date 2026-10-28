@@ -96,7 +96,11 @@ struct State {
 	bool                    dummy_ready = false;
 	VkBuffer                ubo = VK_NULL_HANDLE;
 	VmaAllocation           ubo_mem = VK_NULL_HANDLE;
-	VkBuffer                stats = VK_NULL_HANDLE;
+	VkBuffer                stats = VK_NULL_HANDLE; // host-visible readback copy (never touched by shaders)
+	// (ao3-1028) the counters the shaders add to: device local. They were host-visible memory: every atomic crossed PCIe,
+	// serialized (composite 1.1 ms with no geometry, 7.3 ms on a full screen; prep 0.29 ms from the normal vote alone)
+	VkBuffer                stats_dev = VK_NULL_HANDLE;
+	VmaAllocation           stats_dev_mem = VK_NULL_HANDLE;
 	VmaAllocation           stats_mem = VK_NULL_HANDLE;
 	uint32_t*               stats_map = nullptr;
 	vk::Extent2D            render {}, trace {};
@@ -244,6 +248,17 @@ bool EnsurePipeline(GraphicContext& graphics) {
 		}
 		g_ao.stats_map = static_cast<uint32_t*>(mapped.pMappedData);
 		std::memset(g_ao.stats_map, 0, SlotWords * Slots * 4);
+	}
+	{
+		VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		buffer.size  = SlotWords * Slots * 4;
+		buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+		VmaAllocationCreateInfo dev {};
+		dev.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+		if (vmaCreateBuffer(graphics.allocator, &buffer, &dev, &g_ao.stats_dev, &g_ao.stats_dev_mem, nullptr) != VK_SUCCESS) {
+			g_ao.stats_dev = VK_NULL_HANDLE;
+			return false;
+		}
 	}
 	vk::QueryPoolCreateInfo query {};
 	query.queryType  = vk::QueryType::eTimestamp;
@@ -492,7 +507,7 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	Barrier(command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
 	        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
 	command.updateBuffer(vk::Buffer(g_ao.ubo), 0, sizeof(ubo), &ubo);
-	command.fillBuffer(vk::Buffer(g_ao.stats), (g_ao.frame % Slots) * SlotWords * 4, SlotWords * 4, 0);
+	command.fillBuffer(vk::Buffer(g_ao.stats_dev), (g_ao.frame % Slots) * SlotWords * 4, SlotWords * 4, 0);
 	for (auto* img : Images())
 		ToGeneral(command, *img);
 	if (!g_ao.dummy_ready) {
@@ -534,7 +549,7 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		infos[13] = gdepth ? vk::DescriptorImageInfo {pt, gbuf.depth, gbuf.depth_layout}
 		                   : vk::DescriptorImageInfo {pt, inputs.depth.view, inputs.depth.layout};
 		const vk::DescriptorBufferInfo ubo_info {vk::Buffer(g.ubo), 0, sizeof(FrameUbo)};
-		const vk::DescriptorBufferInfo st_info {vk::Buffer(g.stats), 0, SlotWords * Slots * 4};
+		const vk::DescriptorBufferInfo st_info {vk::Buffer(g.stats_dev), 0, SlotWords * Slots * 4};
 		vk::WriteDescriptorSet         writes[Bindings] {};
 		for (uint32_t i = 0; i < Bindings; ++i) {
 			writes[i].dstBinding      = i;
@@ -563,6 +578,13 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	run(4, g.raw, g.out, g.tmp_b, g.tmp_b, 0.0f, g.render);                      // composite -> out
 	Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 	        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
+	{ // (ao3-1028) this frame's counters, 128 bytes, to the host-visible readback slot
+		const vk::DeviceSize off = (g.frame % Slots) * SlotWords * 4;
+		const vk::BufferCopy region {off, off, SlotWords * 4};
+		command.copyBuffer(vk::Buffer(g.stats_dev), vk::Buffer(g.stats), 1, &region);
+		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
+		        vk::AccessFlagBits2::eHostRead);
+	}
 	if (timed) {
 		++g.written; // (the last stamp: written after the composite by run())
 	}

@@ -7,8 +7,9 @@
 //                weighted uv, the nearest depth, the mean colour, the tap count
 //   1 track:     one thread: the cells clustered into blobs (8-connected, depth-coherent), the strongest kept; the
 //                tracked lights (2 / 4 / 8 slots) reprojected with the motion vectors and matched to them; position,
-//                hue and power smoothed; a slow and a fast power -> the flicker (fast / slow, clamped 0.8..1.2, eased);
-//                fade in ~0.25 s, out ~0.5 s; the flare's visibility (depth-tested at the source, eased ~0.12 s)
+//                hue and power smoothed; a slow and a fast power -> the flicker (fast 0.3 s / slow 2 s, +-6 %, plus two slow
+//                sines, clamped 0.9..1.1, low-passed 0.25 s); fade in ~0.35 s, a 0.15 s hold, out ~0.5 s; the flare's
+//                visibility (depth-tested at the source, eased ~0.35 s)
 //   2 light:     full resolution: every lit G-buffer surface within a light's range gets a point light: G-buffer
 //                normal (world oct 8:8, rotated to view) and albedo, windowed inverse-square falloff, N.L, a short
 //                screen-space march toward the light in the depth buffer (occlusion: no light through walls or
@@ -28,9 +29,9 @@
 //                aux_img: (sum w_k v_k / W, W, k + share of W whose march was inconclusive (off-screen / behind a
 //                much nearer surface: the hybrid's ray), view z); W the lights' unshadowed luminance weight.
 //   5 temporal:  aux_img = the ratio reprojected with the motion vectors (src_tex this frame's, hist_tex last frame's),
-//                rejected on a depth mismatch, clamped to this frame's 3x3 range (+-0.15), alpha max(1 / n, 0.1):
-//                (ratio, n, W, z).
-//   7 spatial:   aux_img = a 5x5 joint bilateral (depth, lit neighbours only) of mode 5's ratio.
+//                rejected on a depth mismatch, variance-clamped to this frame's 3x3 neighbourhood, up to 24 frames:
+//                (ratio, n, variance, z). The hybrid's rays come in already folded into src_tex: same history.
+//   7 spatial:   aux_img = one a-trous iteration (steps 1, 2, 4: three passes) with depth, normal and variance stops.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D color_tex;
@@ -63,7 +64,7 @@ layout(push_constant) uniform Push {
 	vec4  depth_map; // M[10], M[14], M[11], M[15]
 	vec4  size;      // render w, h, strength, added-luminance cap (exposed)
 	vec4  light;     // range scale, glint strength, march steps, max distance (m)
-	vec4  flare;     // strength, aspect (w / h), -, -
+	vec4  flare;     // strength, aspect (w / h), time (s, wrapped), -
 	vec4  motion;    // motion scale x, y, history valid (1), frame dt (s)
 	ivec4 misc;      // mode, frame, flags (1 row 0 = NDC y +1, 2 G-buffer usable, 4 motion bound, 8 debug), exposure index
 	ivec4 dec;       // normal code, roughness field, -, -
@@ -329,20 +330,26 @@ void Track() {
 			claimed[best] = true;
 			l0.xy = mix(l0.xy, bw[best].yz, 0.5);
 			l0.z  = mix(l0.z, bw[best].w, 0.5);
-			l0.w  = min(1.0, l0.w + dt / 0.25);
-			l1.rgb = mix(l1.rgb, hu[best], 0.1);
-			l1.w   = mix(l1.w, pw[best], 0.04);
-			l2.x   = mix(l2.x, pw[best], 0.35);
+			// (natural-1028) time constants, not per-frame fractions: fade in 0.35 s, hue 0.4 s, slow power 2 s, fast 0.3 s
+			l0.w  = min(1.0, l0.w + dt / 0.35);
+			l1.rgb = mix(l1.rgb, hu[best], 1.0 - exp(-dt / 0.4));
+			l1.w   = mix(l1.w, pw[best], 1.0 - exp(-dt / 2.0));
+			l2.x   = mix(l2.x, pw[best], 1.0 - exp(-dt / 0.3));
 			l2.w   = 0.0;
 			target_vis = 1.0;
 		} else {
-			l0.w = max(0.0, l0.w - dt / 0.5);
-			l2.x = mix(l2.x, l1.w, 0.1);
-			l2.w += 1.0;
+			// (a fire missed for a moment holds ~0.15 s before fading over 0.5 s: no pops from an intermittent detection)
+			l2.w += dt;
+			if (l2.w > 0.15) l0.w = max(0.0, l0.w - dt / 0.5);
+			l2.x = mix(l2.x, l1.w, 1.0 - exp(-dt / 0.5));
 		}
 		// The flicker: the fast power over the slow one, clamped and eased (no frame-to-frame noise).
-		float fl = clamp(l2.x / max(l1.w, 1e-3), 0.8, 1.2);
-		l2.y     = mix(l2.y <= 0.0 ? 1.0 : l2.y, fl, 0.3);
+		// (natural-1028) the blob's own brightness (fast / slow, +-6 %) and two slow incommensurate sines per slot
+		// (0.31 / 0.83 Hz, +-3 % / +-2 %), clamped 0.9..1.1, then low-passed (0.25 s): no frame-to-frame jumps.
+		float tt = push.flare.z + float(k) * 1.7;
+		float org = 0.03 * sin(6.2831853 * 0.31 * tt) + 0.02 * sin(6.2831853 * 0.83 * tt + 1.3);
+		float fl  = clamp(1.0 + clamp(l2.x / max(l1.w, 1e-3) - 1.0, -0.06, 0.06) + org, 0.9, 1.1);
+		l2.y      = mix(l2.y <= 0.0 ? 1.0 : l2.y, fl, 1.0 - exp(-dt / 0.25));
 		// The flare's source must be in view: the depth around it no nearer than the fire (a wall, a character in front).
 		if (target_vis > 0.0) {
 			float seen = 0.0;
@@ -354,7 +361,7 @@ void Track() {
 			}
 			target_vis = seen / 9.0;
 		}
-		l2.z = clamp(l2.z + clamp(target_vis - l2.z, -dt / 0.12, dt / 0.12), 0.0, 1.0);
+		l2.z = clamp(l2.z + clamp(target_vis - l2.z, -dt / 0.35, dt / 0.35), 0.0, 1.0); // (the flare fades over 0.35 s)
 		if (l0.w <= 0.0 && l2.z <= 0.0) {
 			lights[k * 4] = vec4(0), lights[k * 4 + 1] = vec4(0), lights[k * 4 + 2] = vec4(0), lights[k * 4 + 3] = vec4(0);
 			continue;
@@ -378,7 +385,7 @@ void Track() {
 		claimed[best] = true;
 		vec3 pos = ViewPosZ(bw[best].yz, bw[best].w);
 		pos -= normalize(pos) * 0.3;
-		lights[k * 4]     = vec4(bw[best].yz, bw[best].w, dt / 0.25);
+		lights[k * 4]     = vec4(bw[best].yz, bw[best].w, dt / 0.35);
 		lights[k * 4 + 1] = vec4(hu[best], pw[best]);
 		lights[k * 4 + 2] = vec4(pw[best], 1.0, 0.0, 0.0);
 		lights[k * 4 + 3] = vec4(pos, pw[best]);
@@ -492,6 +499,9 @@ void Shadow(ivec2 p) {
 	imageStore(aux_img, p, vec4(ratio, W, float(pick) + share, z));
 }
 
+// (denoise-1028) Temporal: the history reprojected with the motion vectors, rejected on a depth mismatch, clamped to
+// this frame's 3x3 mean +- (1.25 sigma + 0.03) (variance-guided: a moving shadow is followed, a still one converges),
+// alpha max(1 / n, 1 / 24). Out: (ratio, n (0: no torch light here), variance estimate, z).
 void Temporal(ivec2 p) {
 	vec2  rs = RenderSize();
 	ivec2 sz = ivec2(rs);
@@ -501,24 +511,28 @@ void Temporal(ivec2 p) {
 		imageStore(aux_img, p, vec4(1.0, 0.0, 0.0, cur.w));
 		return;
 	}
-	float mn = cur.x, mx = cur.x;
+	float m1 = 0.0, m2 = 0.0, cnt = 0.0;
 	for (int y = -1; y <= 1; ++y)
 		for (int x = -1; x <= 1; ++x) {
 			vec4 q = texelFetch(src_tex, clamp(p + ivec2(x, y), ivec2(0), sz - 1), 0);
-			if (q.y <= 0.0) continue;
-			mn = min(mn, q.x), mx = max(mx, q.x);
+			if (q.y <= 0.0 || abs(q.w - cur.w) > 0.05 * cur.w + 0.05) continue;
+			m1 += q.x, m2 += q.x * q.x, cnt += 1.0;
 		}
-	float r = cur.x, n = 1.0;
+	m1 /= max(cnt, 1.0), m2 /= max(cnt, 1.0);
+	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
+	float r = cur.x, n = 1.0, var = sigma * sigma;
 	if (push.motion.z > 0.0) {
 		vec2 uv  = (vec2(p) + 0.5) / rs;
 		vec2 puv = uv - textureLod(motion_tex, uv, 0).xy * push.motion.xy / rs;
 		if (all(greaterThan(puv, vec2(0))) && all(lessThan(puv, vec2(1)))) {
 			vec4 h = texelFetch(hist_tex, clamp(ivec2(puv * rs), ivec2(0), sz - 1), 0);
-			if (h.z > 0.0 && abs(h.w - cur.w) < 0.1 * cur.w + 0.05) {
-				float hr = clamp(h.x, mn - 0.15, mx + 0.15);
-				n        = min(h.y + 1.0, 12.0);
-				float al = max(1.0 / n, 0.1);
+			if (h.y > 0.0 && abs(h.w - cur.w) < 0.1 * cur.w + 0.05) {
+				float g  = 1.25 * sigma + 0.03;
+				float hr = clamp(h.x, m1 - g, m1 + g);
+				n        = min(h.y + 1.0, 24.0);
+				float al = max(1.0 / n, 1.0 / 24.0);
 				r        = mix(hr, cur.x, al);
+				var      = mix(h.z, sigma * sigma, al) ; // (the variance follows the same average: the a-trous' stop)
 			}
 		}
 	}
@@ -526,29 +540,46 @@ void Temporal(ivec2 p) {
 		atomicAdd(stats[10], uint(n));
 		if (r < 0.5) atomicAdd(stats[11], 1u);
 	}
-	imageStore(aux_img, p, vec4(Sat(r), n, cur.y, cur.w));
+	imageStore(aux_img, p, vec4(Sat(r), n, var, cur.w));
 }
 
+// (denoise-1028) Spatial: one a-trous iteration (push.flare.w: the step, 1 / 2 / 4), 5x5 B3 kernel, edge-stopping on
+// depth (relative), normal (G-buffer / depth normals, cos^32) and the ratio itself against the variance (the luminance
+// stop of SVGF: a contact shadow's edge stays sharp where the history agrees). Pixels without torch light (n = 0) and
+// other surfaces (characters in front) never mix in. Keeps (ratio, n, variance / 2 per pass, z).
 void Spatial(ivec2 p) {
 	vec2  rs = RenderSize();
 	ivec2 sz = ivec2(rs);
 	if (any(greaterThanEqual(p, sz))) return;
 	vec4 c = texelFetch(src_tex, p, 0);
-	if (c.z <= 0.0) {
-		imageStore(aux_img, p, vec4(1.0, 0.0, 0.0, 0.0));
+	if (c.y <= 0.0) {
+		imageStore(aux_img, p, c);
 		return;
 	}
-	// (fewer accumulated frames: a wider weight; a converged pixel keeps its own value more)
-	float sig = mix(2.0, 0.9, Sat((c.y - 1.0) / 8.0));
-	float sum = 0.0, ws = 0.0;
+	int   step = max(int(push.flare.w), 1);
+	vec3  np   = NormalAt(p, ViewPosZ((vec2(p) + 0.5) / rs, c.w));
+	float sd   = sqrt(max(c.z, 0.0)) * 4.0 + 0.02;
+	// (fewer accumulated frames: the luminance stop is looser)
+	sd *= mix(3.0, 1.0, Sat((c.y - 1.0) / 8.0));
+	const float kw[3] = float[3](0.375, 0.25, 0.0625);
+	float sum = 0.0, ws = 0.0, vs = 0.0;
 	for (int y = -2; y <= 2; ++y)
 		for (int x = -2; x <= 2; ++x) {
-			vec4  q = texelFetch(src_tex, clamp(p + ivec2(x, y), ivec2(0), sz - 1), 0);
-			if (q.z <= 0.0) continue;
-			float w = exp(-float(x * x + y * y) / (2.0 * sig * sig)) * exp(-abs(q.w - c.w) / (0.02 * c.w + 0.02));
-			sum += q.x * w, ws += w;
+			ivec2 q = p + ivec2(x, y) * step;
+			if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, sz))) continue;
+			vec4 v = texelFetch(src_tex, q, 0);
+			if (v.y <= 0.0) continue;
+			float w = kw[abs(x)] * kw[abs(y)];
+			w *= exp(-abs(v.w - c.w) / (0.01 * c.w * float(step) + 0.01));
+			if (x != 0 || y != 0) {
+				vec3 nq = NormalAt(q, ViewPosZ((vec2(q) + 0.5) / rs, v.w));
+				w *= pow(max(dot(np, nq), 0.0), 32.0);
+				w *= exp(-abs(v.x - c.x) / sd);
+			}
+			sum += v.x * w, vs += v.z * w * w, ws += w;
 		}
-	imageStore(aux_img, p, vec4(ws > 0.0 ? sum / ws : c.x, 0.0, 0.0, 0.0));
+	float r = ws > 0.0 ? sum / ws : c.x;
+	imageStore(aux_img, p, vec4(r, c.y, ws > 0.0 ? vs / (ws * ws) : c.z, c.w));
 }
 
 void Light(ivec2 p) {

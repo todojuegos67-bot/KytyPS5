@@ -726,7 +726,12 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (upscaler == "fsr4" && res->fsr4_preset != nullptr) env.Set("KYTY_FSR4_PRESET", res->fsr4_preset); // (run-windows -Fsr4Preset)
 	if (!s.aspect.empty() && s.aspect != "16:9") env.Set("KYTY_RENDER_ASPECT", s.aspect);
 	// -ForceMode performance (10-25: 4K no longer forces the cinematic mode: it held the game at 30 real).
-	if (demons) env.Set("KYTY_DS_FORCE_MODE", "performance");
+	// (10-28, the emulator launcher) A 4K output starts the game in Cinematico, the other outputs in Rendimiento.
+	if (demons) {
+		int out_h = s.fullscreen && pc.screen_h > 0 ? pc.screen_h : (s.height > 0 ? s.height : 1440);
+		if (int w = 0, h = 0; s.fullscreen && std::sscanf(s.resolution.c_str(), "%dx%d", &w, &h) == 2 && h > 0) out_h = h;
+		env.Set("KYTY_DS_FORCE_MODE", out_h >= 2160 ? "cinematic" : "performance");
+	}
 	static const std::map<std::string, std::string> convars = {
 	    {"high", "r_forceViewportHeightForPixelSizeCalc=1080"},
 	    {"low", "r_forceViewportHeightForPixelSizeCalc=720"},
