@@ -34,6 +34,7 @@ bool Unlock(int trophy_id, int* platinum_id);
 bool IsUnlocked(int trophy_id);
 bool GetInfo(int trophy_id, Info* info);
 int  Count();
+void Preload(); // the package read in the background (the emulator, once /app0 is mounted)
 
 // The popup to draw now (nullptr: none) and its age in seconds; the presenter thread calls it each frame.
 std::shared_ptr<const Toast> CurrentToast(float* seconds);

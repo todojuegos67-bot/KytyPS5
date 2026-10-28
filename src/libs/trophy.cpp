@@ -265,12 +265,17 @@ void SaveList(State& s) {
 	if (f) f << j.dump(1, '\t');
 }
 
+bool SoundWanted();
+bool PopupWanted();
+
 void Load(State& s) {
 	if (s.loaded) return;
 	s.loaded = true;
 	if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &s.title_id) || s.title_id.empty()) s.title_id = "UNKNOWN";
 	s.store = std::filesystem::path("_SaveData") / s.title_id / "trophies.json";
 	const uint32_t lang = Config::GetConsoleLanguage();
+	std::printf("Trophy: init (title %s, sound %s, popups %s)\n", s.title_id.c_str(), SoundWanted() ? "on" : "off",
+	            PopupWanted() ? "on" : "off");
 	s.words             = LabelFor(Primary(lang));
 
 	// The unlocks so far.
@@ -295,10 +300,15 @@ void Load(State& s) {
 	std::map<std::string, Bytes> files;
 	if (ucp.empty() || !ReadUcp(ucp, files)) {
 		LOGF("Trophy: no trophy package in %s\n", Common::PathToString(dir).c_str());
+		std::printf("Trophy: no trophy package in %s (%s)\n", Common::PathToString(dir).c_str(),
+		            ucp.empty() ? "no .ucp" : "unreadable .ucp");
 		return;
 	}
 	const auto conf_it = files.find("tropconf.json");
-	if (conf_it == files.end()) return;
+	if (conf_it == files.end()) {
+		std::printf("Trophy: %s has no tropconf.json\n", Common::PathToString(ucp).c_str());
+		return;
+	}
 	const auto conf = nlohmann::json::parse(conf_it->second.begin(), conf_it->second.end(), nullptr, false);
 	if (!conf.is_object()) return;
 
@@ -361,6 +371,9 @@ void Load(State& s) {
 		}
 	}
 	LOGF("Trophy: %zu trophies (%s), %zu unlocked\n", s.trophies.size(), s.language.c_str(), s.unlocked.size());
+	std::printf("Trophy: opened %s: %zu trophies, language %s (console language %u), %zu unlocked (%s)\n",
+	            Common::PathToString(ucp.filename()).c_str(), s.trophies.size(), s.language.c_str(), lang,
+	            s.unlocked.size(), Common::PathToString(s.store).c_str());
 	SaveList(s);
 }
 
@@ -484,6 +497,15 @@ int Count() {
 	std::lock_guard lock(s.mutex);
 	Load(s);
 	return static_cast<int>(s.trophies.size());
+}
+
+void Preload() {
+	// (At the start, on its own thread: the init and package lines in every log, and no reading at the first unlock.)
+	std::thread([] {
+		auto&           s = S();
+		std::lock_guard lock(s.mutex);
+		Load(s);
+	}).detach();
 }
 
 std::shared_ptr<const Toast> CurrentToast(float* seconds) {
