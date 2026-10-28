@@ -498,6 +498,21 @@ int Count() {
 	return static_cast<int>(s.trophies.size());
 }
 
+bool Snapshot(std::vector<Info>* all, std::vector<int>* unlocked) {
+	auto&           s = S();
+	std::lock_guard lock(s.mutex);
+	if (!s.loaded || s.trophies.empty()) return false;
+	if (all != nullptr) {
+		all->clear();
+		for (const auto& [id, e]: s.trophies) all->push_back(e.info);
+	}
+	if (unlocked != nullptr) {
+		unlocked->clear();
+		for (const auto& [id, t]: s.unlocked) unlocked->push_back(id);
+	}
+	return true;
+}
+
 std::shared_ptr<const Toast> CurrentToast(float* seconds) {
 	auto& s = S();
 	// (Nearly every frame: nothing queued. Read without waiting on an unlock in progress.)

@@ -14,6 +14,7 @@
 
 #include "local/perf-overlay.h"
 #include "local/port-live.h"
+#include "libs/trophy.h"
 
 #include "SDL.h"
 #include "SDL_syswm.h"
@@ -34,6 +35,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <nlohmann/json.hpp>
+#include <set>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -64,7 +67,7 @@ std::mutex               g_mutex;
 std::deque<Input>        g_inputs;
 int                      g_passthrough = 0; // window thread: zeroed axes sent to the game as the menu opened
 int                      g_cursor_before = -1;
-constexpr int            kTabCount = 5; // (10-27c) Gráficos, Pantalla, Sonido, Controles, Sistema
+constexpr int            kTabCount = 6; // (10-27c) Gráficos, Pantalla, Sonido, Controles, Sistema, Trofeos
 int                      g_tab = 0, g_tab_request = -1;
 int                      g_fg_live = 0;
 std::string              g_status;
@@ -595,6 +598,120 @@ void InfoLine(const char* caption, const std::string& value, const ImVec4& color
 	ImGui::Spacing();
 }
 
+// (F1 Trofeos) The trophies: from the trophy module when it has loaded them, else _SaveData/<title>/trophies-list.json
+// and trophies.json. Earned first (grade colour), then the rest greyed; hidden unearned ones as "Trofeo oculto".
+struct TrophyRow {
+	int         id = -1, grade = 0;
+	bool        hidden = false, earned = false;
+	std::string name, detail;
+};
+
+std::vector<TrophyRow> LoadTrophyRows() {
+	std::vector<TrophyRow> rows;
+	std::vector<Libs::Trophy::Info> all;
+	std::vector<int>                unlocked;
+	if (Libs::Trophy::Snapshot(&all, &unlocked)) {
+		const std::set<int> got(unlocked.begin(), unlocked.end());
+		for (const auto& i: all) rows.push_back({i.id, i.grade, i.hidden, got.count(i.id) != 0, i.name, i.detail});
+		return rows;
+	}
+	std::error_code       ec;
+	std::filesystem::path list;
+	for (const auto& d: std::filesystem::directory_iterator("_SaveData", ec)) {
+		const auto f = d.path() / "trophies-list.json";
+		if (std::filesystem::exists(f, ec) && (list.empty() || f < list)) list = f;
+	}
+	if (list.empty()) return rows;
+	std::set<int> got;
+	if (std::ifstream f(list.parent_path() / "trophies.json", std::ios::binary); f) {
+		const auto j = nlohmann::json::parse(f, nullptr, false);
+		if (j.is_object() && j.contains("unlocked") && j["unlocked"].is_object())
+			for (const auto& [k, v]: j["unlocked"].items()) got.insert(std::atoi(k.c_str()));
+	}
+	if (std::ifstream f(list, std::ios::binary); f) {
+		const auto j = nlohmann::json::parse(f, nullptr, false);
+		if (j.is_object() && j.contains("trophies") && j["trophies"].is_array()) {
+			for (const auto& t: j["trophies"]) {
+				if (!t.is_object()) continue;
+				TrophyRow r;
+				r.id = t.value("id", -1);
+				const std::string g = t.contains("grade") && t["grade"].is_string() ? t["grade"].get<std::string>() : "";
+				r.grade  = g == "P" ? 1 : g == "G" ? 2 : g == "S" ? 3 : g == "B" ? 4 : 0;
+				r.hidden = t.contains("hidden") && t["hidden"].is_boolean() && t["hidden"].get<bool>();
+				r.name   = t.contains("name") && t["name"].is_string() ? t["name"].get<std::string>() : "";
+				r.detail = t.contains("detail") && t["detail"].is_string() ? t["detail"].get<std::string>() : "";
+				r.earned = got.count(r.id) != 0;
+				rows.push_back(std::move(r));
+			}
+		}
+	}
+	return rows;
+}
+
+void DrawTrophyTab(float unit) {
+	static std::vector<TrophyRow> rows;
+	static double                 loaded_at = -100.0;
+	if (ImGui::GetTime() - loaded_at > 2.0) {
+		rows      = LoadTrophyRows();
+		loaded_at = ImGui::GetTime();
+		std::stable_sort(rows.begin(), rows.end(), [](const TrophyRow& a, const TrophyRow& b) { return a.earned && !b.earned; });
+	}
+	Section("Trofeos");
+	if (rows.empty()) {
+		ImGui::TextWrapped("%s", "Aún no hay datos de trofeos: se cargan al iniciar el juego.");
+		return;
+	}
+	auto points = [](int g) { return g == 1 ? 300 : g == 2 ? 90 : g == 3 ? 30 : g == 4 ? 15 : 0; };
+	int  total = 0, have = 0, earned = 0;
+	for (const auto& r: rows) {
+		total += points(r.grade);
+		if (r.earned) {
+			have += points(r.grade);
+			earned++;
+		}
+	}
+	const float frac = total > 0 ? static_cast<float>(have) / static_cast<float>(total) : 0.0f;
+	ImGui::PushFont(nullptr, 30.0f * unit);
+	ImGui::TextColored(kGold, "%d%% completado", static_cast<int>(frac * 100.0f));
+	ImGui::PopFont();
+	ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4 {0.80f, 0.63f, 0.30f, 1.0f});
+	ImGui::ProgressBar(frac, {-1.0f, 22.0f * unit}, "");
+	ImGui::PopStyleColor();
+	ImGui::Text("%d / %d trofeos", earned, static_cast<int>(rows.size()));
+	ImGui::Separator();
+	static const ImVec4 grade_col[5] = {{0.6f, 0.6f, 0.6f, 1.0f}, {0.70f, 0.85f, 1.00f, 1.0f}, {1.00f, 0.82f, 0.30f, 1.0f},
+	                                    {0.78f, 0.80f, 0.84f, 1.0f}, {0.80f, 0.52f, 0.30f, 1.0f}};
+	static const char*  grade_txt[5] = {"", "Platino", "Oro", "Plata", "Bronce"};
+	const ImVec4        grey {0.45f, 0.45f, 0.45f, 1.0f};
+	ImGui::BeginChild("##trophies", {0, 0}, ImGuiChildFlags_None);
+	for (const auto& r: rows) {
+		ImGui::PushID(r.id);
+		const int    g      = r.grade >= 1 && r.grade <= 4 ? r.grade : 0;
+		const bool   secret = r.hidden && !r.earned;
+		const ImVec2 at     = ImGui::GetCursorScreenPos();
+		const float  w      = ImGui::GetContentRegionAvail().x;
+		const float  h      = 64.0f * unit;
+		ImGui::Selectable("##t", false, ImGuiSelectableFlags_None, {w, h}); // focusable: D-pad / arrows scroll the list
+		if (ImGui::IsItemFocused() || ImGui::IsItemHovered()) {
+			g_desc_title = secret ? "Trofeo oculto" : r.name;
+			g_desc_text  = std::string(grade_txt[g]) + (r.earned ? " - obtenido" : " - sin obtener") + "\n\n" +
+			              (secret ? "Se revelará al obtenerlo." : r.detail);
+		}
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		const float r0 = 12.0f * unit;
+		dl->AddCircleFilled({at.x + 8 * unit + r0, at.y + h * 0.5f}, r0, ImGui::GetColorU32(r.earned ? grade_col[g] : grey));
+		const float tx = at.x + 16 * unit + 2 * r0;
+		dl->AddText({tx, at.y + 4 * unit}, ImGui::GetColorU32(r.earned ? ImVec4 {1, 1, 1, 1} : grey),
+		            secret ? "Trofeo oculto" : r.name.c_str());
+		const std::string sub = secret ? std::string(grade_txt[g]) : std::string(grade_txt[g]) + " - " + r.detail;
+		dl->PushClipRect(at, {at.x + w, at.y + h}, true);
+		dl->AddText({tx, at.y + h * 0.5f + 2 * unit}, ImGui::GetColorU32(r.earned ? grade_col[g] : ImVec4 {0.35f, 0.35f, 0.35f, 1.0f}), sub.c_str());
+		dl->PopClipRect();
+		ImGui::PopID();
+	}
+	ImGui::EndChild();
+}
+
 void DrawPcTab(float unit) {
 	const ImVec4 ink {0.93f, 0.91f, 0.88f, 1.0f};
 	const ImVec4 red {0.92f, 0.35f, 0.31f, 1.0f};
@@ -774,8 +891,8 @@ void Draw(float width, float height) {
 	// (10-27) The tabs are Launcher-souls.ps1's groups, in its order, with its labels and tooltips.
 	// (10-27c) A game's settings menu: five tabs (LB/RB or Q/E), each the launcher's groups as sections; the rows on the
 	// left, the focused row's description on the right.
-	const char* tabs[kTabCount] = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema"};
-	static const std::vector<int> groups[kTabCount] = {{4, 0, 1, 2, 3}, {5}, {}, {7}, {6, 8}};
+	const char* tabs[kTabCount] = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos"};
+	static const std::vector<int> groups[kTabCount] = {{4, 0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}};
 	static const char* section_names[9] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
 	                                       "Pantalla", "Rendimiento", "Controles", "Tu equipo"};
 	g_unit = unit;
@@ -792,7 +909,8 @@ void Draw(float width, float height) {
 			const bool fixed = FixedFg(s);
 			g_desc_title.clear();
 			g_desc_text.clear();
-			if (groups[t].empty()) {
+			if (t == 5) DrawTrophyTab(unit);
+			else if (groups[t].empty()) {
 				Section("Sonido");
 				ImGui::TextWrapped("%s", "El sonido se ajusta en el menú del propio juego (Opciones > Sonido). El port no añade opciones de sonido.");
 			}

@@ -34,6 +34,8 @@ bool Unlock(int trophy_id, int* platinum_id);
 bool IsUnlocked(int trophy_id);
 bool GetInfo(int trophy_id, Info* info);
 int  Count();
+// (F1 Trofeos) Every trophy and the unlocked ids, only when the module already loaded them (never loads): false if not.
+bool Snapshot(std::vector<Info>* all, std::vector<int>* unlocked);
 
 // The popup to draw now (nullptr: none) and its age in seconds; the presenter thread calls it each frame.
 std::shared_ptr<const Toast> CurrentToast(float* seconds);
