@@ -3652,6 +3652,7 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 	} else if (g_sr_kind == 4 && g_graphics_ctx != nullptr) {
 		// AMD FSR 4 (fsr4-sr.cpp): our runtime of the v07 INT8 model, its RCAS included.
 		Fsr4::UpscaleDesc f;
+		f.graphics       = g_graphics_ctx;
 		f.command        = command;
 		f.color_view     = inputs.color.view;
 		f.color_layout   = inputs.color.layout;
@@ -9259,7 +9260,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	const bool  done = ours ? UpscaleOurs(command, inputs) : UpscaleStreamline(command, inputs);
 	const bool  fsr  = g_sr_kind == 3 || g_sr_kind == 4; // (FSR 4: its own RCAS too)
 	// (FSR: its RCAS, KYTY_UPSCALE_SHARPNESS defaulting to 0.3 in Fsr3::Upscale; DLSS and XeSS: 0 unless set.)
-	const float amount = fsr ? [] {
+	const float amount = g_sr_kind == 4 ? Fsr4::Sharpness() : fsr ? [] {
 		const char* value = std::getenv("KYTY_UPSCALE_SHARPNESS");
 		return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f) : 0.3f;
 	}()

@@ -4,6 +4,7 @@
 // buffer and RCAS's constants follow AMD's FidelityFX SDK FSR 4 provider (MIT) for its non-WMMA (DOT4) path.
 
 #include "frame-gen.h"
+#include "local-platform.h"
 #include "gpu_tiler_shaders/fsr4_prep_spv.h"
 
 #include <nlohmann/json.hpp>
@@ -643,7 +644,139 @@ uint32_t Div(uint32_t a, uint32_t b) {
 	return (a + b - 1) / b;
 }
 
+float HalfToFloat(uint16_t h) {
+	const uint32_t sign = (h & 0x8000u) << 16, exp = (h >> 10) & 0x1Fu, mant = h & 0x3FFu;
+	uint32_t f = 0;
+	if (exp == 0) {
+		if (mant == 0) f = sign;
+		else {
+			float v = std::ldexp(static_cast<float>(mant), -24);
+			return (h & 0x8000u) ? -v : v;
+		}
+	} else if (exp == 31) f = sign | 0x7F800000u | (mant << 13);
+	else f = sign | ((exp + 112u) << 23) | (mant << 13);
+	float v = 0.0f;
+	std::memcpy(&v, &f, 4);
+	return v;
+}
+
+// The check that FSR 4's result reached the game's image (KYTY_FSR4_PROBE=0: none): at a few frames, the centre texel
+// of our result and of the game's output after our blit, and the exposure the model read, copied to a host buffer and
+// logged some frames later.
+struct ProbeState {
+	VkBuffer      buffer = VK_NULL_HANDLE;
+	VmaAllocation memory = VK_NULL_HANDLE;
+	const uint8_t* mapped = nullptr;
+	Target        game; // 1x1 rgba16f: the output's centre texel blitted here
+	uint64_t      pending = 0; // the frame the copies were recorded at (0: none)
+	bool          failed = false;
+} g_probe;
+
+void ProbeRead() {
+	if (g_probe.pending == 0 || g.frames < g_probe.pending + 8) return;
+	const auto* h = reinterpret_cast<const uint16_t*>(g_probe.mapped);
+	float ours[3], game[3], exposure = 0.0f;
+	for (int i = 0; i < 3; ++i) {
+		ours[i] = HalfToFloat(h[i]);
+		game[i] = HalfToFloat(h[4 + i]);
+	}
+	std::memcpy(&exposure, g_probe.mapped + 16, 4);
+	const auto finite = [](const float* c) { return std::isfinite(c[0]) && std::isfinite(c[1]) && std::isfinite(c[2]); };
+	float diff = 0.0f, mag = 0.0f;
+	for (int i = 0; i < 3; ++i) {
+		diff = std::max(diff, std::fabs(ours[i] - game[i]));
+		mag  = std::max(mag, std::fabs(ours[i]));
+	}
+	const bool reached = finite(ours) && finite(game) && diff <= 0.05f * std::max(mag, 0.05f);
+	std::printf("FSR 4 check (frame %llu): its result at the centre %.4f %.4f %.4f, the game's output there %.4f %.4f %.4f, "
+	            "exposure read %.4f: %s\n",
+	            static_cast<unsigned long long>(g_probe.pending), ours[0], ours[1], ours[2], game[0], game[1], game[2], exposure,
+	            !finite(ours) ? "NaN/Inf in FSR 4's result" : reached ? "FSR 4's output reached the game's image"
+	                                                                  : "the game's image differs from FSR 4's result");
+	std::fflush(stdout);
+	g_probe.pending = 0;
+}
+
+void Probe(vk::CommandBuffer command, const UpscaleDesc& desc, vk::Extent2D target) {
+	static const bool on = EnvOn("KYTY_FSR4_PROBE", true);
+	const uint64_t frame = g.frames + 1;
+	if (!on || g_probe.failed || g_probe.pending != 0 || !(frame == 120 || frame % 3600 == 0)) return;
+	if (!(desc.output_usage & vk::ImageUsageFlagBits::eTransferSrc)) return;
+	if (g_probe.buffer == VK_NULL_HANDLE) {
+		g_probe.failed = true;
+		auto* graphics = desc.graphics;
+		if (graphics == nullptr) return;
+		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		create.size  = 64;
+		create.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo host {};
+		host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VmaAllocationInfo info {};
+		if (vmaCreateBuffer(graphics->allocator, &create, &host, &g_probe.buffer, &g_probe.memory, &info) != VK_SUCCESS) {
+			g_probe.buffer = VK_NULL_HANDLE;
+			return;
+		}
+		g_probe.mapped = static_cast<const uint8_t*>(info.pMappedData);
+		if (!CreateTarget(*graphics, g_probe.game, {1, 1}, vk::Format::eR16G16B16A16Sfloat,
+		                  vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc))
+			return;
+		g_probe.failed = false;
+	}
+	Barrier(command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite, vk::PipelineStageFlagBits2::eAllTransfer,
+	        vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite);
+	const int32_t tx = static_cast<int32_t>(target.width / 2), ty = static_cast<int32_t>(target.height / 2);
+	const int32_t ox = static_cast<int32_t>(desc.upscale.width / 2), oy = static_cast<int32_t>(desc.upscale.height / 2);
+	// Ours (out16, transfer source now).
+	vk::BufferImageCopy copy {};
+	copy.bufferOffset     = 0;
+	copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.imageOffset      = vk::Offset3D {tx, ty, 0};
+	copy.imageExtent      = vk::Extent3D {1, 1, 1};
+	command.copyImageToBuffer(g.out16.image.image, vk::ImageLayout::eTransferSrcOptimal, g_probe.buffer, 1, &copy);
+	// The game's output at the same place, as rgba16f.
+	FrameGen::Transition(command, g_probe.game.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	                     vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eBlit);
+	vk::ImageBlit blit {};
+	blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, desc.output_level, desc.output_layer, 1};
+	blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.srcOffsets[0]  = vk::Offset3D {ox, oy, 0};
+	blit.srcOffsets[1]  = vk::Offset3D {ox + 1, oy + 1, 1};
+	blit.dstOffsets[1]  = vk::Offset3D {1, 1, 1};
+	command.blitImage(desc.output, vk::ImageLayout::eGeneral, g_probe.game.image.image, vk::ImageLayout::eTransferDstOptimal, 1, &blit,
+	                  vk::Filter::eNearest);
+	FrameGen::Transition(command, g_probe.game.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+	                     vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eCopy);
+	copy.bufferOffset = 8;
+	copy.imageOffset  = vk::Offset3D {0, 0, 0};
+	command.copyImageToBuffer(g_probe.game.image.image, vk::ImageLayout::eTransferSrcOptimal, g_probe.buffer, 1, &copy);
+	// The exposure texel (general).
+	copy.bufferOffset = 16;
+	command.copyImageToBuffer(g.exposure.image.image, vk::ImageLayout::eGeneral, g_probe.buffer, 1, &copy);
+	Barrier(command, vk::PipelineStageFlagBits2::eAllTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
+	        vk::AccessFlagBits2::eHostRead);
+	g_probe.pending = frame;
+}
+
 } // namespace
+
+float Sharpness() {
+	// KYTY_FSR4_SHARPNESS=<0..1>, else half the launcher's KYTY_UPSCALE_SHARPNESS (the model's output is already
+	// sharp: the shared 0.75 made it brittle, 10-28), else 0.15.
+	static const float amount = [] {
+		const auto read = [](const char* name, float& out) {
+			const char* value = std::getenv(name);
+			if (value == nullptr || *value == '\0') return false;
+			out = std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f);
+			return true;
+		};
+		float v = 0.0f;
+		if (read("KYTY_FSR4_SHARPNESS", v)) return v;
+		if (read("KYTY_UPSCALE_SHARPNESS", v)) return 0.5f * v;
+		return 0.15f;
+	}();
+	return amount;
+}
 
 bool SrPathWanted() {
 	static const bool wanted = [] {
@@ -764,8 +897,26 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 	    desc.motion_view == nullptr || desc.output_view == nullptr || desc.render.width == 0 || desc.upscale.width == 0)
 		return false;
 	const auto command = desc.command;
-	const uint32_t W = (desc.upscale.width + 7u) & ~7u;
-	const uint32_t H = (desc.upscale.height + 7u) & ~7u;
+	ProbeRead();
+	// The model's output: the display's size (as DLSS's KYTY_DLSS_OUT_DISPLAY), linearly blitted up into the game's
+	// 3840x2160 output for its later stages, which the presenter then scales to the display. 10-28: on a 1080 monitor
+	// the model made 3840x2160 from 720 (a 3x ratio, the 2160 variant) only for the presenter to shrink it back to
+	// 1080: wasteful and soft. KYTY_FSR4_OUT_DISPLAY=0: the game's output size as before.
+	const vk::Extent2D target = [&] {
+		static const uint32_t display = [] {
+			const char* value = std::getenv("KYTY_DISPLAY_HEIGHT");
+			if (value != nullptr && *value != '\0') return static_cast<uint32_t>(std::max(0, std::atoi(value)));
+			return LocalPlatform::DisplayHeight(nullptr);
+		}();
+		static const bool on = EnvOn("KYTY_FSR4_OUT_DISPLAY", true);
+		if (!on || display < 360 || display >= desc.upscale.height || display < desc.render.height) return desc.upscale;
+		const auto width = (static_cast<uint32_t>(std::lround(static_cast<double>(display) * desc.upscale.width / desc.upscale.height)) + 1u) & ~1u;
+		return vk::Extent2D {width, display};
+	}();
+	const bool scaled = target != desc.upscale;
+	if (scaled && !(desc.output_usage & vk::ImageUsageFlagBits::eTransferDst)) return false;
+	const uint32_t W = (target.width + 7u) & ~7u;
+	const uint32_t H = (target.height + 7u) & ~7u;
 	if (W > 3840 || H > 2160) {
 		static bool said = false;
 		if (!said) {
@@ -776,7 +927,7 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 		return false;
 	}
 	const bool res2160 = W > 1920 || H > 1080;
-	const float ratio  = static_cast<float>(desc.upscale.height) / static_cast<float>(desc.render.height);
+	const float ratio  = static_cast<float>(target.height) / static_cast<float>(desc.render.height);
 	const int   preset = RequestedPreset() == PresetAuto ? (g.built ? g.preset : PresetForRatio(ratio)) : RequestedPreset();
 	if (!g.built || g.res2160 != res2160 || g.preset != preset) {
 		if (!Build(graphics, preset, res2160)) {
@@ -794,7 +945,8 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 		    !CreateTarget(graphics, g.recurrent, size, vk::Format::eR8G8B8A8Unorm, sampled_storage) ||
 		    !CreateTarget(graphics, g.rcas_temp, size, vk::Format::eR16G16B16A16Sfloat, sampled_storage) ||
 		    !CreateTarget(graphics, g.out16, size, vk::Format::eR16G16B16A16Sfloat, sampled_storage | vk::ImageUsageFlagBits::eTransferSrc) ||
-		    (g.exposure.image.image == nullptr && !CreateTarget(graphics, g.exposure, {1, 1}, vk::Format::eR32Sfloat, sampled_storage))) {
+		    (g.exposure.image.image == nullptr &&
+		     !CreateTarget(graphics, g.exposure, {1, 1}, vk::Format::eR32Sfloat, sampled_storage | vk::ImageUsageFlagBits::eTransferSrc))) {
 			std::printf("FSR 4: its %ux%u images were not created: off (stretched)\n", W, H);
 			std::fflush(stdout);
 			g.failed = true;
@@ -813,7 +965,7 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 		g.first  = true;
 	}
 	// Where the result goes: the output itself (rgba16f with storage), else our rgba16f blitted into it.
-	const bool direct = desc.output_format == vk::Format::eR16G16B16A16Sfloat && (desc.output_usage & vk::ImageUsageFlagBits::eStorage);
+	const bool direct = !scaled && desc.output_format == vk::Format::eR16G16B16A16Sfloat && (desc.output_usage & vk::ImageUsageFlagBits::eStorage);
 	if (!direct && !(desc.output_usage & vk::ImageUsageFlagBits::eTransferDst)) {
 		static bool said = false;
 		if (!said) {
@@ -824,10 +976,7 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 		}
 		return false;
 	}
-	const float sharpness = [] {
-		const char* value = std::getenv("KYTY_UPSCALE_SHARPNESS");
-		return value != nullptr && *value != '\0' ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f) : 0.3f;
-	}();
+	const float sharpness = Sharpness();
 	const bool rcas = sharpness > 0.0f;
 
 	// Previous work on our images and the inputs before anything here.
@@ -895,7 +1044,11 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 
 	// The depth copy and the exposure (fsr4-prep.comp).
 	{
-		const bool has_exposure = desc.exposure_buffer != nullptr && desc.exposure_range >= sizeof(float);
+		static const bool game_exposure = [] { // KYTY_FSR4_EXPOSURE=1: the model sees exposure 1 (A/B)
+			const char* value = std::getenv("KYTY_FSR4_EXPOSURE");
+			return !(value != nullptr && std::string(value) == "1");
+		}();
+		const bool has_exposure = game_exposure && desc.exposure_buffer != nullptr && desc.exposure_range >= sizeof(float);
 		const vk::DescriptorImageInfo  depth_in {g.nearest, desc.depth_view, desc.depth_layout};
 		const vk::DescriptorBufferInfo values = has_exposure ? vk::DescriptorBufferInfo {desc.exposure_buffer, desc.exposure_base, desc.exposure_range}
 		                                                     : vk::DescriptorBufferInfo {g.constants.buffer, 0, 256};
@@ -1006,10 +1159,11 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 		vk::ImageBlit blit {};
 		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
 		blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, desc.output_level, desc.output_layer, 1};
-		blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(desc.upscale.width), static_cast<int32_t>(desc.upscale.height), 1};
-		blit.dstOffsets[1]  = blit.srcOffsets[1];
+		blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(target.width), static_cast<int32_t>(target.height), 1};
+		blit.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(desc.upscale.width), static_cast<int32_t>(desc.upscale.height), 1};
 		command.blitImage(g.out16.image.image, vk::ImageLayout::eTransferSrcOptimal, desc.output, vk::ImageLayout::eGeneral, 1, &blit,
-		                  vk::Filter::eNearest);
+		                  scaled ? vk::Filter::eLinear : vk::Filter::eNearest);
+		Probe(command, desc, target);
 		FrameGen::Transition(command, g.out16.image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
 		                     vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
 	}
@@ -1019,9 +1173,13 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 	        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
 	if (g.frames++ == 0) {
 		std::printf("FSR 4: first frame %ux%u -> %ux%u (%s, %s variant), RCAS %s, depth %s, exposure %s, output %s\n", desc.render.width,
-		            desc.render.height, desc.upscale.width, desc.upscale.height, PresetTitles[g.preset], g.res2160 ? "2160" : "1080",
+		            desc.render.height, target.width, target.height, PresetTitles[g.preset], g.res2160 ? "2160" : "1080",
 		            rcas ? "on" : "off", EnvOn("KYTY_FSR4_DEPTH_INVERT", true) ? "flipped" : "as is",
-		            desc.exposure_buffer != nullptr ? "the game's" : "1.0", direct ? "written in place" : "via rgba16f + blit");
+		            desc.exposure_buffer != nullptr ? "the game's" : "1.0", direct ? "written in place" : scaled ? "at the display's size, blitted (linear) into the game's output" : "via rgba16f + blit");
+		if (scaled)
+			std::printf("FSR 4: the game's output stays %ux%u (its HUD and composite); the model makes the display's %ux%u from %ux%u (%.2fx)\n",
+			            desc.upscale.width, desc.upscale.height, target.width, target.height, desc.render.width, desc.render.height, ratio);
+		std::fflush(stdout);
 		std::fflush(stdout);
 	}
 	g.first = false;

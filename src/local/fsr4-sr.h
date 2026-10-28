@@ -19,6 +19,10 @@
 // KYTY_FSR4_DEPTH_INVERT = 0 : the depth as it is (default 1: the game's reversed depth flipped for the model's
 //   closest-depth motion vector dilation, which the shipped modules compile for a forward depth).
 // KYTY_UPSCALE_SHARPNESS = <0..1> : RCAS (default 0.3; 0 off), as for FSR 3.1.
+// KYTY_FSR4_OUT_DISPLAY = 0 : the model's output at the game's 3840x2160 (default: the display's size, as DLSS's
+//   KYTY_DLSS_OUT_DISPLAY, linearly blitted up into the game's output; the 1080 variant on a 1080 display).
+// KYTY_FSR4_EXPOSURE = 1 : the model sees exposure 1 instead of the game's (A/B).
+// KYTY_FSR4_PROBE = 0 : no check that the result reached the game's image (default: logged at frame 120, every 3600).
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <cstdint>
@@ -38,10 +42,13 @@ void* ChainDeviceFeatures(vk::PhysicalDevice physical_device, const std::vector<
 // The device has what the model needs and the preset's assets are there and match their manifest (after the device
 // exists; checked once, logged).
 [[nodiscard]] bool Ready();
+// RCAS's amount (0..1; 0 off): KYTY_FSR4_SHARPNESS, else half KYTY_UPSCALE_SHARPNESS, else 0.15.
+[[nodiscard]] float Sharpness();
 // The preset's display name ("FSR 4 Quality", ...).
 [[nodiscard]] const char* Name();
 
 struct UpscaleDesc {
+	GraphicContext*   graphics = nullptr;
 	vk::CommandBuffer command = nullptr;
 	vk::ImageView     color_view = nullptr; // render size, color_layout
 	vk::ImageLayout   color_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
