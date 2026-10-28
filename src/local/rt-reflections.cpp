@@ -85,10 +85,25 @@
 // roughness of 0.25 (no filtered blur mixed in). Fireflies: the floor's reflection at most 3x (pools 6x) the pixel's
 // luminance, the temporal pass clamps a sample to its neighbourhood (mean + 2.5 sigma) and takes in a sample that differs
 // 2x from its history at half the rate.
+//
+// (refl-hybrid-1028) KYTY_RT_REFLECTIONS_HYBRID=1 ("Reflejos RT: Hibrido"; needs KYTY_HWRT=1, and so
+// KYTY_RT_HW_EXPERIMENTAL=1, and the scene TLAS of hwrt-scene.cpp): a soft hardware fill between the trace and the
+// temporal pass (rt-refl-hw.comp). The screen-space trace stays primary and unchanged where it hit; where it missed, one
+// ray query a pixel through the TLAS, its colour the PREVIOUS frame's composited screen at the hit's reprojected position
+// when the hit was visible there, else the mean of the local references, never a TLAS material. That colour is limited
+// to the references (the screen-space hits around, or the game's colour around the reflector): YCoCg box, saturation
+// cap, channel-ratio cap, luminance 0.5x .. 1.5x their mean and <= 2x the reflector's own colour, NaN guards; accumulated
+// over time (variance-clamped history, <= 1.5x change a frame); zero weight without history, a ~12-frame fade in, at
+// most KYTY_RT_REFLECTIONS_HYBRID_WEIGHT (0.35) of the part the screen-space ray left (passed squared as confidence:
+// the composite takes its square root). Every 10 s "RT reflections: hybrid:" with the traced / hit / previous-screen
+// shares, the fill share and the RTFLASH counters (raw: what the limits stopped; out: must stay 0). Not available this
+// frame (no TLAS built, no ray queries): the screen-space path alone, and the fill restarts from zero weight.
 #include "local/rt-reflections.h"
 
 #include "graphics/presentation/videoOut.h"
 #include "gpu_tiler_shaders/rt_reflections_spv.h"
+#include "gpu_tiler_shaders/rt_refl_hw_spv.h"
+#include "local/hwrt-scene.h"
 
 #include <algorithm>
 #include <array>
@@ -123,6 +138,14 @@ constexpr uint32_t SurveyHist    = 258;
 constexpr uint32_t SurveyCount   = 770;
 constexpr uint32_t FrameBytes    = 8192;          // header + calibration + stats + survey
 constexpr uint32_t ExposureIndex = 128 / 4;       // fparams.x (1.0) when the game gives no exposure
+// (refl-hybrid-1028) rt-refl-hw.comp's buffer: its header (ivp, vp, clip_prev, proj, depth_map, size, params, mparams,
+// misc: 18 x 16 bytes) and its 32 counters (cumulative, never cleared).
+constexpr uint32_t HwBindings      = 14;
+constexpr uint32_t HwHeaderBytes   = 288;
+constexpr uint32_t HwStatsCount    = 32;
+constexpr uint32_t HwBufferBytes   = 512;
+constexpr uint32_t HwExposureIndex = 63; // (params.w = 1.0: the exposure when the game gives none)
+static_assert(HwHeaderBytes + HwStatsCount * 4 <= HwBufferBytes);
 constexpr uint32_t CalibRuns     = 24;
 constexpr uint32_t MaxMips       = 12;
 static_assert(CalibWet + 34 <= CalibHist && CalibHist + 256 <= StatsIndex);
@@ -170,6 +193,7 @@ struct RtPass {
 	int                     level = 0;
 	RtImage                 hiz, rad, aux, tmp_a, tmp_b, out;
 	RtImage                 gb[2], hist[2], meta[2];
+	RtImage                 rad2, fhist[2]; // (refl-hybrid-1028) the trace's result with the fill, the fill's history
 	RtImage                 dummy; // 1x1 R32_UINT stand-in for absent G-buffer layers
 	std::vector<Retired>    retired;
 	VkBuffer                frame_buf = VK_NULL_HANDLE; // device-local: the shader's header, sums and counters
@@ -220,9 +244,22 @@ struct RtPass {
 	uint32_t                samples = 0;
 	std::array<std::array<uint8_t, 16>, 8> stage_of {}; // the pass each interval timed (Stage), per ring entry
 	std::array<uint32_t, 8>               stamps_in {};  // timestamps written per ring entry
-	std::array<double, 10>                stage_ms {};   // sums since the last line
-	std::array<uint32_t, 10>              stage_frames {};
+	std::array<double, 11>                stage_ms {};   // sums since the last line
+	std::array<uint32_t, 11>              stage_frames {};
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+	// (refl-hybrid-1028) The hybrid's ray query pipeline, buffer and counters.
+	vk::DescriptorSetLayout hw_set_layout = nullptr;
+	vk::PipelineLayout      hw_layout     = nullptr;
+	vk::Pipeline            hw_pipeline   = nullptr;
+	bool                    hw_failed     = false;
+	VkBuffer                hw_buf = VK_NULL_HANDLE, hw_read = VK_NULL_HANDLE;
+	VmaAllocation           hw_dev_mem = nullptr, hw_read_mem = nullptr;
+	const uint32_t*         hw_mapped = nullptr;
+	bool                    hw_cleared = false, hw_ran_last = false;
+	const char*             hw_why = "";
+	uint64_t                hw_frames = 0, hw_skipped = 0, hw_read_frames = 0;
+	std::array<uint32_t, HwStatsCount> hw_last {};
+	std::array<uint64_t, HwStatsCount> hw_sum {};
 } g_rt;
 
 float EnvFloat(const char* name, float fallback, float lo, float hi) {
@@ -340,9 +377,9 @@ void Barrier(vk::CommandBuffer command, vk::PipelineStageFlags2 src_stage, vk::A
 	command.pipelineBarrier2(dependency);
 }
 
-std::array<RtImage*, 13> Sized() {
+std::array<RtImage*, 16> Sized() {
 	return {&g_rt.hiz, &g_rt.rad, &g_rt.aux, &g_rt.tmp_a, &g_rt.tmp_b, &g_rt.out, &g_rt.gb[0], &g_rt.gb[1], &g_rt.hist[0],
-	        &g_rt.hist[1], &g_rt.meta[0], &g_rt.meta[1], &g_rt.dummy};
+	        &g_rt.hist[1], &g_rt.meta[0], &g_rt.meta[1], &g_rt.rad2, &g_rt.fhist[0], &g_rt.fhist[1], &g_rt.dummy};
 }
 
 bool EnsurePipeline(GraphicContext& graphics) {
@@ -463,7 +500,7 @@ bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level) {
 	bool ok = MakeImage(graphics, g_rt.hiz, vk::Format::eR32Sfloat, render, levels, true) &&
 	          MakeImage(graphics, g_rt.out, f16, render, 1, true);
 	for (auto* img: {&g_rt.rad, &g_rt.aux, &g_rt.tmp_a, &g_rt.tmp_b, &g_rt.gb[0], &g_rt.gb[1], &g_rt.hist[0], &g_rt.hist[1],
-	                 &g_rt.meta[0], &g_rt.meta[1]})
+	                 &g_rt.meta[0], &g_rt.meta[1], &g_rt.rad2, &g_rt.fhist[0], &g_rt.fhist[1]})
 		ok = ok && MakeImage(graphics, *img, f16, trace, 1, true);
 	if (!ok) {
 		for (auto* img: Sized())
@@ -475,6 +512,7 @@ bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level) {
 	g_rt.trace         = trace;
 	g_rt.level         = level;
 	g_rt.history_valid = false;
+	g_rt.hw_ran_last   = false;
 	return true;
 }
 
@@ -512,10 +550,10 @@ void PrepareImages(vk::CommandBuffer command) {
 	}
 }
 
-enum Stage : uint8_t { StHiz, StCalib, StTrace, StTemporal, StAtrous0, StAtrous1, StAtrous2, StAtrous3, StComposite, StSurvey };
-constexpr uint32_t NStages = 10;
+enum Stage : uint8_t { StHiz, StCalib, StTrace, StTemporal, StAtrous0, StAtrous1, StAtrous2, StAtrous3, StComposite, StSurvey, StHybrid };
+constexpr uint32_t NStages = 11;
 const char* const StageNames[NStages] = {"hi-z", "calib", "trace", "temporal", "a-trous 1", "a-trous 2", "a-trous 3", "a-trous 4",
-                                         "composite", "metal survey"};
+                                         "composite", "metal survey", "hybrid (TLAS fill)"};
 
 void ReadTiming(GraphicContext& graphics) {
 	if (g_rt.pool == nullptr) return;
@@ -541,6 +579,153 @@ void ReadTiming(GraphicContext& graphics) {
 		}
 		++g_rt.read;
 	}
+}
+
+// ---- (refl-hybrid-1028) The hybrid: rt-refl-hw.comp, a TLAS fill where the screen-space trace missed ----
+
+// KYTY_RT_REFLECTIONS_HYBRID=1 with the reflections on (read once). The hardware scene itself needs KYTY_HWRT=1 (and so
+// KYTY_RT_HW_EXPERIMENTAL=1): without it the screen-space path alone (said once).
+bool HybridWanted() {
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_RT_REFLECTIONS_HYBRID");
+		const bool  asked = value != nullptr && *value == '1' && RtReflectionsLevel() > 0;
+		if (asked) {
+			std::printf("RT reflections: KYTY_RT_REFLECTIONS_HYBRID=1 read (hybrid: screen-space first, scene TLAS rays only where it "
+			            "misses, colour from the previous screen, limited to the screen's own)%s\n",
+			            HwScene::Requested() ? "" : ": needs KYTY_HWRT=1 (and KYTY_RT_HW_EXPERIMENTAL=1) too: screen-space only");
+			std::fflush(stdout);
+		}
+		return asked;
+	}();
+	return wanted;
+}
+
+// A 4x4 inverse (row-major, Gauss-Jordan with partial pivoting). False: singular or not finite.
+bool InvertRows(const std::array<float, 16>& m, std::array<double, 16>& out) {
+	double a[4][8];
+	for (int r = 0; r < 4; ++r)
+		for (int c = 0; c < 8; ++c) a[r][c] = c < 4 ? static_cast<double>(m[r * 4 + c]) : (c - 4 == r ? 1.0 : 0.0);
+	for (int c = 0; c < 4; ++c) {
+		int piv = c;
+		for (int r = c + 1; r < 4; ++r)
+			if (std::abs(a[r][c]) > std::abs(a[piv][c])) piv = r;
+		if (!(std::abs(a[piv][c]) > 1e-30)) return false;
+		if (piv != c)
+			for (int k = 0; k < 8; ++k) std::swap(a[c][k], a[piv][k]);
+		const double inv = 1.0 / a[c][c];
+		for (int k = 0; k < 8; ++k) a[c][k] *= inv;
+		for (int r = 0; r < 4; ++r) {
+			if (r == c) continue;
+			const double f = a[r][c];
+			if (f == 0.0) continue;
+			for (int k = 0; k < 8; ++k) a[r][k] -= f * a[c][k];
+		}
+	}
+	for (int r = 0; r < 4; ++r)
+		for (int c = 0; c < 4; ++c) {
+			out[r * 4 + c] = a[r][c + 4];
+			if (!std::isfinite(out[r * 4 + c])) return false;
+		}
+	return true;
+}
+
+bool EnsureHwPipeline(GraphicContext& graphics) {
+	if (g_rt.hw_pipeline != nullptr) return true;
+	if (g_rt.hw_failed) return false;
+	g_rt.hw_failed    = true;
+	const auto device = graphics.device;
+	std::array<vk::DescriptorSetLayoutBinding, HwBindings> bindings {};
+	for (uint32_t i = 0; i < HwBindings; ++i) {
+		bindings[i].binding         = i;
+		bindings[i].descriptorType  = i == 13 ? vk::DescriptorType::eAccelerationStructureKHR
+		                              : (i == 11 || i == 12) ? vk::DescriptorType::eStorageBuffer
+		                              : (i == 9 || i == 10)  ? vk::DescriptorType::eStorageImage
+		                                                     : vk::DescriptorType::eCombinedImageSampler;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+	}
+	vk::DescriptorSetLayoutCreateInfo set_info {};
+	set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	set_info.bindingCount = HwBindings;
+	set_info.pBindings    = bindings.data();
+	if (device.createDescriptorSetLayout(&set_info, nullptr, &g_rt.hw_set_layout) != vk::Result::eSuccess) return false;
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount = 1;
+	layout_info.pSetLayouts    = &g_rt.hw_set_layout;
+	if (device.createPipelineLayout(&layout_info, nullptr, &g_rt.hw_layout) != vk::Result::eSuccess) return false;
+	vk::ShaderModuleCreateInfo module_info {};
+	module_info.codeSize    = sizeof(RT_REFL_HW_SPV);
+	module_info.pCode       = RT_REFL_HW_SPV;
+	vk::ShaderModule module = nullptr;
+	if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+	vk::ComputePipelineCreateInfo pipeline_info {};
+	pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	pipeline_info.stage.module = module;
+	pipeline_info.stage.pName  = "main";
+	pipeline_info.layout       = g_rt.hw_layout;
+	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_rt.hw_pipeline);
+	device.destroyShaderModule(module, nullptr);
+	if (created != vk::Result::eSuccess) {
+		g_rt.hw_pipeline = nullptr;
+		return false;
+	}
+	VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+	buffer.size  = HwBufferBytes;
+	buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	VmaAllocationCreateInfo dev {};
+	dev.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+	if (vmaCreateBuffer(graphics.allocator, &buffer, &dev, &g_rt.hw_buf, &g_rt.hw_dev_mem, nullptr) != VK_SUCCESS) {
+		g_rt.hw_buf = VK_NULL_HANDLE;
+		return false;
+	}
+	buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VmaAllocationCreateInfo host {};
+	host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+	host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+	VmaAllocationInfo mapped {};
+	if (vmaCreateBuffer(graphics.allocator, &buffer, &host, &g_rt.hw_read, &g_rt.hw_read_mem, &mapped) != VK_SUCCESS) {
+		g_rt.hw_read = VK_NULL_HANDLE;
+		return false;
+	}
+	g_rt.hw_mapped = static_cast<const uint32_t*>(mapped.pMappedData);
+	g_rt.hw_failed = false;
+	return true;
+}
+
+// The hybrid's counters (cumulative, modulo 2^32: the difference since the last frame) and, with the periodic lines,
+// its own: the share of the reflective pixels the screen-space ray missed (traced), the TLAS hit rate, how many hits took
+// their colour from the previous screen (the rest: the stand-in), the fill share, and the RTFLASH counters.
+void ReadHwStats(GraphicContext& graphics) {
+	if (g_rt.hw_mapped == nullptr || g_rt.hw_frames == 0) return;
+	(void)vmaInvalidateAllocation(graphics.allocator, g_rt.hw_read_mem, 0, VK_WHOLE_SIZE);
+	const uint32_t* c = g_rt.hw_mapped + HwHeaderBytes / 4;
+	for (uint32_t k = 0; k < HwStatsCount; ++k) {
+		const uint32_t v = c[k];
+		if (g_rt.hw_read_frames > 8) g_rt.hw_sum[k] += static_cast<uint32_t>(v - g_rt.hw_last[k]);
+		g_rt.hw_last[k] = v;
+	}
+	++g_rt.hw_read_frames;
+}
+void LogHwStats(double seconds) {
+	if (!HybridWanted()) return;
+	const auto&  sm   = g_rt.hw_sum;
+	const double refl = static_cast<double>(std::max<uint64_t>(sm[0], 1));
+	const double tr   = static_cast<double>(std::max<uint64_t>(sm[1], 1));
+	const double hits = static_cast<double>(std::max<uint64_t>(sm[2], 1));
+	std::printf("RT reflections: hybrid: last %.0f s: %llu frames traced (%llu without: %s); traced (the screen-space ray "
+	            "missed) %.1f%% of the reflective pixels (%.0f a frame), TLAS hit %.1f%% of those rays, colour from the previous screen "
+	            "%.1f%% of the hits (stand-in %.1f%% of the rays), references from the game's colour %.1f%%; fill share %.4f "
+	            "(weight > 0.02 on %.1f%%), no history %.1f%%, limiter %.2f%%; RTFLASH raw (stopped by the limits): > 2x %llu, "
+	            "red %llu; RTFLASH out: > 2x %llu, red %llu, NaN caught %llu\n",
+	            seconds, static_cast<unsigned long long>(g_rt.hw_frames), static_cast<unsigned long long>(g_rt.hw_skipped),
+	            g_rt.hw_why != nullptr && *g_rt.hw_why ? g_rt.hw_why : "-", 100.0 * sm[1] / refl,
+	            g_rt.hw_frames > 0 ? static_cast<double>(sm[1]) / static_cast<double>(g_rt.hw_frames) : 0.0,
+	            100.0 * sm[2] / tr, 100.0 * sm[3] / hits, 100.0 * sm[4] / tr, 100.0 * sm[14] / refl, sm[5] / 1000.0 / refl,
+	            100.0 * sm[6] / refl, 100.0 * sm[12] / refl, 100.0 * sm[13] / refl, static_cast<unsigned long long>(sm[7]),
+	            static_cast<unsigned long long>(sm[8]), static_cast<unsigned long long>(sm[9]),
+	            static_cast<unsigned long long>(sm[10]), static_cast<unsigned long long>(sm[11]));
+	g_rt.hw_sum.fill(0);
+	g_rt.hw_frames = 0, g_rt.hw_skipped = 0;
 }
 
 // The stats counters (the shader's atomics on 1 pixel in 16, cumulative: the difference since the last frame, modulo
@@ -642,6 +827,7 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		            static_cast<unsigned long long>(g_rt.stat_frames), gl.extent.width, gl.extent.height,
 		            static_cast<unsigned long long>(gl.cs), gl.slot, producer, RtReflGuideStatus());
 	}
+	LogHwStats(std::chrono::duration<double>(now - g_rt.stat_time).count()); // (refl-hybrid-1028)
 	std::fflush(stdout);
 	g_rt.stage_ms.fill(0.0);
 	g_rt.stage_frames.fill(0);
@@ -996,6 +1182,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const bool  have_guide = guide_mode && RtReflGetGuide(guide) && guide.view != nullptr;
 	if (have_guide) g_rt.guide_last = guide;
 	g_rt.have_guide = have_guide;
+	ReadHwStats(*graphics); // (refl-hybrid-1028; before ReadStats: its periodic line logs the hybrid's too)
 	ReadStats(*graphics, have_gbuf, level);
 	{
 		static bool said = false;
@@ -1165,6 +1352,57 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.misc2[1] = static_cast<int32_t>(g_rt.hiz.levels), push.misc2[2] = iters;
 	push.misc2[3] = use_normal && dec_metal >= 0 ? dec_metal + 1 : 0; // (the metal field + 1; 0: none)
 
+	// (refl-hybrid-1028) The hybrid this frame: the scene TLAS built this frame, its camera, the pipeline; else the
+	// screen-space path alone (the reason logged when it changes) and the fill's history restarts.
+	vk::AccelerationStructureKHR hw_tlas = nullptr;
+	std::array<float, HwHeaderBytes / 4> hw_header {};
+	bool hw_on = false;
+	if (HybridWanted()) {
+		const char* why = nullptr;
+		bool        built = false;
+		std::array<float, 16> vp {};
+		std::array<double, 16> ivp {};
+		if (!HwScene::Active()) why = "KYTY_HWRT inactive (needs KYTY_HWRT=1 and KYTY_RT_HW_EXPERIMENTAL=1, and a GPU with ray queries)";
+		else if ((hw_tlas = HwScene::SceneTlas(&built)) == nullptr) why = "no scene TLAS built yet";
+		else if (!built) why = "the TLAS is an older frame's";
+		else if (!HwScene::SceneCamera(vp)) why = "no scene camera yet";
+		else if (!InvertRows(vp, ivp)) why = "the scene camera is degenerate";
+		else if (!camera.prev) why = "no camera matrices (motion vectors only)";
+		else if (!EnsureHwPipeline(*graphics)) why = "could not create its ray query pipeline";
+		if (why != nullptr) {
+			++g_rt.hw_skipped;
+			if (g_rt.hw_why != why) {
+				g_rt.hw_why = why;
+				std::printf("RT reflections: hybrid: not this frame (%s): screen-space only\n", why);
+				std::fflush(stdout);
+			}
+		} else {
+			hw_on = true;
+			if (g_rt.hw_why != nullptr) {
+				g_rt.hw_why = nullptr;
+				std::printf("RT reflections: hybrid: tracing (scene TLAS, one ray a pixel where the screen-space ray missed)\n");
+				std::fflush(stdout);
+			}
+			static const float hw_weight = EnvFloat("KYTY_RT_REFLECTIONS_HYBRID_WEIGHT", 0.35f, 0.0f, 0.8f);
+			static const float hw_flipy  = EnvFloat("KYTY_RT_REFLECTIONS_HYBRID_FLIPY", 1.0f, 0.0f, 1.0f);
+			auto& h = hw_header;
+			for (int i = 0; i < 16; ++i) h[i] = static_cast<float>(ivp[i]);
+			for (int i = 0; i < 16; ++i) h[16 + i] = vp[i];
+			std::copy(camera.clip_to_prev.begin(), camera.clip_to_prev.end(), h.begin() + 32);
+			h[48] = m[0], h[49] = m[5], h[50] = m[8], h[51] = m[9];
+			h[52] = m[10], h[53] = m[14], h[54] = m[11], h[55] = m[15];
+			h[56] = static_cast<float>(color.extent.width), h[57] = static_cast<float>(color.extent.height);
+			h[58] = static_cast<float>(g_rt.trace.width), h[59] = static_cast<float>(g_rt.trace.height);
+			h[60] = hw_weight, h[61] = hw_flipy > 0.5f ? -1.0f : 1.0f, h[62] = cfg.max_len, h[63] = 1.0f;
+			h[64] = inputs.motion_scale_x, h[65] = inputs.motion_scale_y;
+			const int32_t misc[4] = {static_cast<int32_t>(g_rt.frame & 0x7fffffff),
+			                         (g_rt.history_valid && g_rt.hw_ran_last ? 1 : 0) | (inputs.reset ? 2 : 0) | (camera.prev ? 4 : 0) |
+			                             (g_rt.row0_up ? 16 : 0),
+			                         0, 0};
+			std::memcpy(&h[68], misc, sizeof(misc));
+		}
+	}
+
 	const bool timed = g_rt.pool != nullptr && g_rt.written < g_rt.read + 8; // (a ring of 8 frames)
 	const auto entry = static_cast<uint32_t>(g_rt.written % 8);
 	uint32_t   stamp_n = 0;
@@ -1213,6 +1451,18 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		// 720-line render, scaled to this one) and the large pools' boost
 		header[48] = g_rt.min_area * static_cast<float>(color.extent.height) / 720.0f, header[49] = g_rt.pool_boost;
 		command.updateBuffer(vk::Buffer(g_rt.frame_buf), 0, HeaderBytes, header.data());
+	}
+	if (hw_on) {
+		if (!g_rt.hw_cleared) {
+			g_rt.hw_cleared = true;
+			command.fillBuffer(vk::Buffer(g_rt.hw_buf), 0, VK_WHOLE_SIZE, 0);
+			Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer,
+			        vk::AccessFlagBits2::eTransferWrite);
+		}
+		// (the exposure's index: the game's, else params.w = 1.0 in this buffer)
+		const int32_t ei = game_exposure ? static_cast<int32_t>(inputs.exposure_index) : static_cast<int32_t>(HwExposureIndex);
+		std::memcpy(&hw_header[70], &ei, sizeof(ei));
+		command.updateBuffer(vk::Buffer(g_rt.hw_buf), 0, HwHeaderBytes, hw_header.data());
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
@@ -1306,9 +1556,55 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		run(0, s, cfg.checker ? vk::Extent2D {(g.trace.width + 1) / 2, g.trace.height} : g.trace);
 		stamp(StTrace);
 	}
+	if (hw_on) {
+		// (refl-hybrid-1028) rad -> rad2: the TLAS fill where the trace missed (rt-refl-hw.comp); g.out still holds the
+		// previous frame's composite here (the composite below rewrites it).
+		const vk::Sampler lin = g.linear, pt = g.point;
+		const auto        gen = vk::ImageLayout::eGeneral;
+		vk::DescriptorImageInfo infos[HwBindings] {};
+		infos[0]  = {pt, g.rad.view, gen};
+		infos[1]  = {pt, g.aux.view, gen};
+		infos[2]  = {pt, g.gb[cur].view, gen};
+		infos[3]  = {pt, g.gb[prev].view, gen};
+		infos[4]  = {pt, inputs.depth.view, inputs.depth.layout};
+		infos[5]  = {lin, g.out.view, gen};
+		infos[6]  = {lin, color.view, color.layout};
+		infos[7]  = {pt, inputs.motion.view, inputs.motion.layout};
+		infos[8]  = {pt, g.fhist[prev].view, gen};
+		infos[9]  = {nullptr, g.rad2.view, gen};
+		infos[10] = {nullptr, g.fhist[cur].view, gen};
+		const vk::DescriptorBufferInfo hw_info {vk::Buffer(g.hw_buf), 0, VK_WHOLE_SIZE};
+		const vk::DescriptorBufferInfo exposure_info = game_exposure
+		                                                   ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range}
+		                                                   : hw_info;
+		vk::WriteDescriptorSetAccelerationStructureKHR as_write {};
+		as_write.accelerationStructureCount = 1;
+		as_write.pAccelerationStructures    = &hw_tlas;
+		vk::WriteDescriptorSet writes[HwBindings] {};
+		for (uint32_t i = 0; i < HwBindings; ++i) {
+			writes[i].dstBinding      = i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType  = i == 13 ? vk::DescriptorType::eAccelerationStructureKHR
+			                            : (i == 11 || i == 12) ? vk::DescriptorType::eStorageBuffer
+			                            : (i == 9 || i == 10)  ? vk::DescriptorType::eStorageImage
+			                                                   : vk::DescriptorType::eCombinedImageSampler;
+			if (i == 11) writes[i].pBufferInfo = &hw_info;
+			else if (i == 12) writes[i].pBufferInfo = &exposure_info;
+			else if (i == 13) writes[i].pNext = &as_write;
+			else writes[i].pImageInfo = &infos[i];
+		}
+		command.bindPipeline(vk::PipelineBindPoint::eCompute, g.hw_pipeline);
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.hw_layout, 0, HwBindings, writes);
+		command.dispatch((g.trace.width + 7) / 8, (g.trace.height + 7) / 8, 1);
+		Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+		        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+		command.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
+		++g.hw_frames;
+		stamp(StHybrid);
+	}
 	{
 		Set s = base;
-		s.a = &g.rad, s.b = &g.hist[prev], s.gcur = &g.gb[cur], s.gprev = &g.gb[prev], s.aux = &g.aux, s.meta = &g.meta[prev];
+		s.a = hw_on ? &g.rad2 : &g.rad, s.b = &g.hist[prev], s.gcur = &g.gb[cur], s.gprev = &g.gb[prev], s.aux = &g.aux, s.meta = &g.meta[prev];
 		s.oa = &g.hist[cur], s.ob = &g.meta[cur], s.oc = &g.tmp_b;
 		run(1, s, g.trace);
 		stamp(StTemporal);
@@ -1338,6 +1634,10 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		// The sums, counters and the metal survey to the host (the CPU reads them a few frames late; the copy is 5.5 KB).
 		vk::BufferCopy region {HeaderBytes, HeaderBytes, (SurveyIndex + SurveyCount) * 4};
 		command.copyBuffer(vk::Buffer(g.frame_buf), vk::Buffer(g.read_buf), 1, &region);
+		if (hw_on) {
+			const vk::BufferCopy hw_region {HwHeaderBytes, HwHeaderBytes, HwStatsCount * 4};
+			command.copyBuffer(vk::Buffer(g.hw_buf), vk::Buffer(g.hw_read), 1, &hw_region);
+		}
 		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
 		        vk::AccessFlagBits2::eHostRead);
 	}
@@ -1347,6 +1647,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	++g.frame;
 	g.history_valid     = true;
+	g.hw_ran_last       = hw_on;
 	inputs.color.image  = vk::Image(g.out.image);
 	inputs.color.view   = g.out.view;
 	inputs.color.layout = vk::ImageLayout::eGeneral;

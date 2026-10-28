@@ -313,9 +313,9 @@ function Start-Game {
 	if ($cmbRt.SelectedIndex -gt 0) { $psargs += @('-Ssgi', "$([math]::Min($cmbRt.SelectedIndex, 3))") }
 	if ($cmbRt.SelectedIndex -eq 4) { $sets += 'KYTY_SSGI_INTENSITY=1.6'; $sets += 'KYTY_SSGI_AO=0.4' }  # (10-25) Extremo: Ultra con mas luz rebotada y mas sombreado de contacto  # (10-24) iluminacion RT (vuelve)
 	foreach ($n in 'KYTY_RT_SHADOWS', 'KYTY_RT_REFLECTIONS') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }  # (10-24) RT beta
-	if ($cmbRtRf -and $cmbRtRf.SelectedIndex -gt 0) { $env:KYTY_RT_REFLECTIONS = "$($cmbRtRf.SelectedIndex)" }
+	if ($cmbRtRf -and $cmbRtRf.SelectedIndex -gt 0) { $env:KYTY_RT_REFLECTIONS = $(if ($cmbRtRf.SelectedIndex -eq 6) { '3' } else { "$($cmbRtRf.SelectedIndex)" }) }  # (refl-hybrid-1028) Hibrido = Alto (nivel 3) + el relleno por hardware
 	foreach ($n in 'KYTY_RT_REFLECTIONS_MIN', 'KYTY_RT_REFLECTIONS_GUIDE_STRENGTH') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
-	if ($cmbRtRf -and $cmbRtRf.SelectedIndex -ge 4) { $env:KYTY_RT_REFLECTIONS_MIN = '0.55'; $env:KYTY_RT_REFLECTIONS_GUIDE_STRENGTH = '1.3' }  # (10-25) Ultra: nivel 4 del emulador, mas presencia
+	if ($cmbRtRf -and $cmbRtRf.SelectedIndex -ge 4 -and $cmbRtRf.SelectedIndex -le 5) { $env:KYTY_RT_REFLECTIONS_MIN = '0.55'; $env:KYTY_RT_REFLECTIONS_GUIDE_STRENGTH = '1.3' }  # (10-25) Ultra: nivel 4 del emulador, mas presencia
 	# (10-25 noche) combo22: sol RT, calidad de sombra, profundidad, particulas RT
 	foreach ($n in 'KYTY_GTAO', 'KYTY_GTAO_STRENGTH', 'KYTY_GTAO_BENT') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 	# (10-26) Oclusion (GTAO) retirada: nunca se pasa KYTY_GTAO*. Profundidad va al AO de RT real (ver hwMap).
@@ -428,6 +428,10 @@ function Start-Game {
 		$sets += @('KYTY_TORCH_HW=1', 'KYTY_RT_HW_EXPERIMENTAL=1', 'KYTY_HWRT=1')
 		if ((Get-IniValue 'rthwexp' '0') -ne '1') { $sets += @('KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_SUN=0') }
 	}  # (torch-1028) luz de antorchas RT (pantalla, sin RT por hardware)
+	if (-not $pureGame -and $cmbRtRf -and $cmbRtRf.SelectedIndex -eq 6) {  # (refl-hybrid-1028) Reflejos RT Hibrido: la escena por hardware (TLAS) solo para rellenar donde el rayo de pantalla falla
+		$sets += @('KYTY_RT_REFLECTIONS_HYBRID=1', 'KYTY_RT_HW_EXPERIMENTAL=1', 'KYTY_HWRT=1')
+		if ((Get-IniValue 'rthwexp' '0') -ne '1') { $sets += @('KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_SUN=0') }
+	}
 	if (-not $pureGame -and $cmbFlare -and $cmbFlare.SelectedIndex -gt 0) { $sets += 'KYTY_TORCH_FLARE=1' }  # (torch-1028) destellos de lente
 	if ($pureGame) {
 		# (audit) Juego original: fuera todo pase visual del emulador (RT, volumetrica, sombra RT, brillo, oclusion especular, GTAO,
@@ -473,10 +477,16 @@ function Start-Game {
 	if ($script:isNvidia -and $res[2] -eq 'dlss' -and (($chkLowEnd -and $chkLowEnd.Checked) -or ($chkSoulsLow -and $chkSoulsLow.Checked))) {
 		if (-not ($outH -eq 1080 -and [double]$res[1] -eq 1.0)) { $res = @($res[0], [math]::Round($outH / 720.0, 4), 'dlss', 0) }  # DLAA a 1080 (valido) se queda
 	}
+	# (10-28) DLSS en cualquier resolucion: solo acepta el 3D a 2160/1440/1256/1080/720; si la calidad elegida no cae en una,
+	# se usa la valida mas cercana por debajo (minimo 720) en vez de que el juego arranque sin DLSS.
+	if ($script:isNvidia -and $res[2] -eq 'dlss' -and [double]$res[1] -gt 0) {
+		$inH = [math]::Round($outH / [double]$res[1]); $ok = @(2160, 1440, 1256, 1080, 720)
+		if ($ok -notcontains $inH) { $pick = @($ok | Where-Object { $_ -le $inH -and $_ -le $outH } | Select-Object -First 1); if (-not $pick) { $pick = 720 }; $res = @($res[0], [math]::Round($outH / [double]$pick, 4), 'dlss', $res[3]) }
+	}
 	# (10-22) Modo 4K: el modo cinematico del juego a 4K nativo (sin reescalado).
 	# (10-22) El modo del juego siempre segun la salida: 4K = cinematico, lo demas = rendimiento (el juego guarda el
 	# ultimo en la partida y sin esto se quedaba en cinematico).
-	$psargs += @('-ForceMode', $(if (($cmbTest -and $script:testModes[[math]::Max(0, $cmbTest.SelectedIndex)][1] -eq 'TESTCINE') -or $false) { 'cinematic' } else { 'performance' }))  # (10-25) 4K ya no fuerza el cinematico (bloqueaba el juego a 30 reales)
+	$psargs += @('-ForceMode', $(if (($cmbTest -and $script:testModes[[math]::Max(0, $cmbTest.SelectedIndex)][1] -eq 'TESTCINE') -or ($cmbOut -and $cmbOut.SelectedIndex -eq 1)) { 'cinematic' } else { 'performance' }))  # (10-25) 4K ya no fuerza el cinematico (bloqueaba el juego a 30 reales)
 	#  # (10-22) modos Souls: siempre rendimiento
 	# 1080p / 720p sin reescalador: el juego dibuja a esa altura.
 	if ($outH -lt 1440 -and -not $res[2]) { $res = @("${outH}p", $outH, '', 0) }
@@ -840,10 +850,8 @@ function Fill-Res {
 		# (10-22) Modo graficas de 8 GB: tambien sin reescalado (1080p nativo, sin XeSS ni FSR), lo primero de la lista.
 		$outH = Get-OutHeight
 		$lowAll = ($chkLowEnd -and $chkLowEnd.Checked) -or ($chkSoulsLow -and $chkSoulsLow.Checked)  # (10-25) ligero y low profile: todas las calidades de DLSS (Ultra rendimiento incluido)
-		if ($family -eq 'dlss' -and -not $lowAll) { $modes = @($modes | Where-Object { $h = [math]::Round($outH / $_[1]); $h -ge 1080 -or $h -eq 720 }) }
-		elseif ($family -in 'xess', 'fsr' -and $outH -lt 1440 -and -not $lowAll) { $modes = @($modes | Where-Object { $outH / $_[1] -ge 719 }) }
-		elseif ($family -eq 'fsr4') { $modes = @($modes | Where-Object { $outH / $_[1] -ge 359 }) }  # (10-28) FSR 4: el 3D a 360 como minimo (su modelo sale al tamano de la pantalla: en 1080p Equilibrado 635, Rendimiento 540, Ultra rendimiento 360)
-		if ($family -eq 'juego' -and $outH -lt 1440) { $modes = @() }
+		if ($family -eq 'fsr4') { $modes = @($modes | Where-Object { $outH / $_[1] -ge 359 }) }  # FSR 4: el 3D a 360 como minimo (limite del modelo)
+		# (10-28) todas las calidades de reescalado en cualquier resolucion (720p, 1080p, 1440p, 4K)
 		if ($modes.Count -eq 0) { continue }
 		if ($titles.ContainsKey($family)) { $shown += , @($titles[$family], 0, '', 0) }
 		foreach ($m in $modes) { $shown += , $m }
@@ -1584,6 +1592,11 @@ function Start-UpdateVersion {
 	try { $form.Cursor = 'WaitCursor'; $rel = Get-LatestRelease }
 	catch { [System.Windows.Forms.MessageBox]::Show((UT 'No se pudo consultar GitHub: ' 'Could not check GitHub: ') + $_.Exception.Message, $t, 'OK', 'Error') | Out-Null; return }
 	finally { $form.Cursor = 'Default' }
+	$dCur = if ($cur -match '(20\d{6})') { $Matches[1] } else { '' }
+	$dRel = if ($rel.Tag -match '(20\d{6})') { $Matches[1] } else { '' }
+	if ($cur -and $cur -ne $rel.Tag -and $dCur -and $dRel -and $dCur -ge $dRel) {
+		[System.Windows.Forms.MessageBox]::Show((UT 'Version instalada: ' 'Installed version: ') + $cur + "`n" + (UT 'Ultima release en GitHub: ' 'Latest GitHub release: ') + $rel.Tag + "`n`n" + (UT 'Tu version es igual o mas nueva. No hace falta actualizar.' 'Your version is the same or newer. No update needed.'), $t, 'OK', 'Information') | Out-Null; return
+	}
 	if ($cur -and $cur -eq $rel.Tag) {
 		[System.Windows.Forms.MessageBox]::Show((UT 'Ya tienes la última versión: ' 'You already have the latest version: ') + $rel.Tag, $t, 'OK', 'Information') | Out-Null; return
 	}
@@ -2284,7 +2297,7 @@ function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @(
 $cmbRtSh = New-RtCombo 'RT shadows' 'rtshadow2' 600 'Screen-space ray-traced sun shadows (no hardware RT): the contact shadows the game misses (under arms, between legs, by walls), soft and stable. Only where the game already shows sunlight. DLSS, XeSS or FSR only. Low ~0.3 ms, Medium ~0.6 ms, High ~1 ms.' @('No', 'Low', 'Medium', 'High')  # (ds-shadow-1028)
 $cmbAoNew = New-RtCombo 'Ambient occlusion' 'ao1028' 88 'New ambient occlusion (ao-1028, no hardware RT): darkens only the ambient light in corners, joints and under objects, metre-based radius, no halos or noise; never the sky, fire or emissives. Replaces the game's own occlusion (no double darkening). Only with DLSS, XeSS or FSR. Low ~0.3 ms, Medium ~0.5 ms, High ~1 ms (full resolution).' @('No', 'Low', 'Medium', 'High')  # (ao-1028) oclusion ambiental nueva (KYTY_AO), solo en Ray tracing
 $cmbRays = New-RtCombo 'Luz volumetrica' 'godrays2' 24 'Luz volumetrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms (mas rayos y mas pasos de sombra).' @('No', 'Bajo', 'Medio', 'Alto')
-$cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl2' 56 'Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, mas nitidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolucion completa y mas fuertes). Beta.' @('No', 'Bajo', 'Medio', 'Alto', 'Ultra', 'Extreme')  # (10-25 noche) Extremo = nivel 5 (refl10)  # (10-25) refl8; Ultra vuelve: el cierre era del frame generation AMD, no de los reflejos
+$cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl2' 56 'Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, mas nitidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolucion completa y mas fuertes). Hybrid: High + hardware rays (real RT) only where the screen-space ray finds nothing (off-screen or hidden); the colour comes from the previous screen, limited to its surroundings and faded in slowly: no flashes. Needs an RT-capable GPU. ~+0.5 ms. Beta.' @('No', 'Bajo', 'Medio', 'Alto', 'Ultra', 'Extreme', 'Hybrid')  # (10-25 noche) Extremo = nivel 5 (refl10)  # (10-25) refl8; Ultra vuelve: el cierre era del frame generation AMD, no de los reflejos  # (refl-hybrid-1028) Hibrido = 6
 $cmbTorch = New-RtCombo 'RT torch light' 'torchrt' 536 'RT torch light: fire from torches, braziers and bonfires lights nearby walls, floors and structures with a warm flickering bounce, and is reflected on smooth or wet surfaces. It does not leak through walls or characters (checked against the depth). Screen-space only, no hardware RT. Only with DLSS, XeSS or FSR. Low 2 fires ~0.3 ms, Medium 4 ~0.5 ms, High 8 ~0.9 ms. Hybrid: High + hardware rays (real RT) where the screen cannot see what blocks the light (off-screen or behind something else); it only darkens, never adds light. Needs an RT-capable GPU. ~+0.5 ms.' @('No', 'Low', 'Medium', 'High', 'Hybrid')  # (torch-1028) (torch-shadow-1028) Hybrid
 $cmbFlare = New-RtCombo 'Lens flare' 'lensflare' 568 'Lens flare from visible torches and fires: small lens ghosts, a soft star and streak. It fades out when the fire is hidden and near the screen edges. No halo, no screen-wide glow. Drawn before the HUD. Only with DLSS, XeSS or FSR. ~0.1 ms.' @('No', 'Yes')  # (torch-1028)
 $cmbShine = $null  # (10-24) Brillo metales retirado
@@ -2752,7 +2765,7 @@ try {
 	if ($pcCard) { $pcCard.Top = $gRt.Top + $gRt.Height + 12 }
 } catch { }
 # (10-26) Al elegir cualquier Modo Souls: todo el ray tracing en No (el usuario lo enciende a mano despues).
-function Set-RtAllOff { foreach ($c in @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRt, $cmbRtRf, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbRtSh)) { if ($c -and $c.Items.Count -gt 0) { $c.SelectedIndex = 0 } } }
+function Set-RtAllOff { foreach ($c in @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRt, $cmbRtRf, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbRtSh, $cmbRays)) { if ($c -and $c.Items.Count -gt 0) { $c.SelectedIndex = 0 } } }
 # (vol25) Luz volumetrica y Sombras sol RT comparten el pase del sol en el motor: con las dos, el sol de la volumetrica
 # llega a ratos (niebla que salta). Se excluyen: elegir una pone la otra en No.
 if ($false -and $cmbRays -and $cmbHSun) {  # (rt-vol 1ac512fe) ya pueden ir juntas

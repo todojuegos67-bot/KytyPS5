@@ -639,6 +639,22 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${torchhw_header}")
+# KYTY_RT_REFLECTIONS_HYBRID (refl-hybrid-1028): the reflections' soft TLAS fill where the screen-space trace misses
+# (src/local/rt-reflections.cpp).
+set(rtreflhw_source "${KYTY_SOURCE_DIR}/local/rt-refl-hw.comp")
+set(rtreflhw_spv "${gpu_tiler_generated_dir}/rt_refl_hw.spv")
+set(rtreflhw_header "${gpu_tiler_generated_dir}/rt_refl_hw_spv.h")
+add_custom_command(
+	OUTPUT "${rtreflhw_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rtreflhw_spv}" "${rtreflhw_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rtreflhw_spv} -DOUTPUT=${rtreflhw_header}
+	        -DSYMBOL=RT_REFL_HW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rtreflhw_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rtreflhw_header}")
 
 # KYTY_HWRT_VOLSHADOW: TLAS-shadowed god-ray march (src/local/volshadow.cpp).
 set(volshadow_source "${KYTY_SOURCE_DIR}/local/volshadow.comp")
