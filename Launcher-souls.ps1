@@ -416,7 +416,11 @@ function Start-Game {
 		# pantalla a fuerza 0 vuelve a dar el sol a la volumetrica en cada frame, como en 10-25 (sin niebla que aparece y desaparece).
 		$sets += 'KYTY_RT_SUN=0'
 	} else { foreach ($n in 'KYTY_RT_SHADOWS', 'KYTY_RT_SHADOWS_STRENGTH') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue } }  # (audit) Luz volumetrica = No: tampoco sombra RT oculta
-	if (-not $pureGame -and $cmbTorch -and $cmbTorch.SelectedIndex -gt 0) { $sets += "KYTY_TORCH=$($cmbTorch.SelectedIndex)" }  # (torch-1028) luz de antorchas RT (pantalla, sin RT por hardware)
+	if (-not $pureGame -and $cmbTorch -and $cmbTorch.SelectedIndex -gt 0) { $sets += "KYTY_TORCH=$([math]::Min(3, $cmbTorch.SelectedIndex))" }
+	if (-not $pureGame -and $cmbTorch -and $cmbTorch.SelectedIndex -ge 4) {  # (torch-shadow-1028) Hibrido: la escena por hardware (TLAS) solo para la luz de antorchas
+		$sets += @('KYTY_TORCH_HW=1', 'KYTY_RT_HW_EXPERIMENTAL=1', 'KYTY_HWRT=1')
+		if ((Get-IniValue 'rthwexp' '0') -ne '1') { $sets += @('KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_SUN=0') }
+	}  # (torch-1028) luz de antorchas RT (pantalla, sin RT por hardware)
 	if (-not $pureGame -and $cmbFlare -and $cmbFlare.SelectedIndex -gt 0) { $sets += 'KYTY_TORCH_FLARE=1' }  # (torch-1028) destellos de lente
 	if ($pureGame) {
 		# (audit) Juego original: fuera todo pase visual del emulador (RT, volumetrica, sombra RT, brillo, oclusion especular, GTAO,
@@ -426,7 +430,7 @@ function Start-Game {
 		foreach ($n in @(Get-ChildItem Env: | Where-Object { $_.Name -match $fxPat } | ForEach-Object { $_.Name })) { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 		$sets += @('KYTY_HWRT=0', 'KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_REFLECTIONS=0',
 			'KYTY_RT_SHADOWS=0', 'KYTY_CONTACT_SHADOWS=0', 'KYTY_RT_SUN=0', 'KYTY_RT_PARTICLES=0', 'KYTY_GODRAYS=0', 'KYTY_SHINE=0', 'KYTY_SPEC_OCCLUSION=0',
-			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0')
+			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0', 'KYTY_TORCH_HW=0', 'KYTY_RT_HW_EXPERIMENTAL=0')
 		$pa = @(); for ($i = 0; $i -lt $psargs.Count; $i++) { if ($psargs[$i] -eq '-Ssgi') { $i++; continue }; $pa += $psargs[$i] }; $psargs = $pa
 	}
 	# (10-24) Brillo metales retirado (no aportaba)
@@ -2274,7 +2278,7 @@ $cmbRtSh = $null  # (10-24) RT retirado del launcher
 $cmbAoNew = New-RtCombo 'Oclusión ambiental' 'ao1028' 88 'Oclusion ambiental nueva (ao-1028, sin RT por hardware): oscurece solo la luz ambiental en rincones, juntas y bajo objetos, con radio en metros, sin halos ni ruido; nunca el cielo, el fuego ni lo emisivo. Sustituye a la oclusion del juego (no oscurece dos veces). Solo con DLSS, XeSS o FSR. Bajo ~0,3 ms, Medio ~0,5 ms, Alto ~1 ms (resolucion completa).' @('No', 'Bajo', 'Medio', 'Alto')  # (ao-1028) oclusion ambiental nueva (KYTY_AO), solo en Ray tracing
 $cmbRays = New-RtCombo 'Luz volumetrica' 'godrays2' 24 'Luz volumetrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms (mas rayos y mas pasos de sombra).' @('No', 'Bajo', 'Medio', 'Alto')
 $cmbRtRf = New-RtCombo 'Reflejos RT' 'rtrefl2' 56 'Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, mas nitidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolucion completa y mas fuertes). Beta.' @('No', 'Bajo', 'Medio', 'Alto', 'Ultra', 'Extremo')  # (10-25 noche) Extremo = nivel 5 (refl10)  # (10-25) refl8; Ultra vuelve: el cierre era del frame generation AMD, no de los reflejos
-$cmbTorch = New-RtCombo 'Luz de antorchas RT' 'torchrt' 536 'Luz de antorchas RT: el fuego de antorchas, braseros y hogueras ilumina paredes, suelos y estructuras cercanas con un rebote calido que parpadea, y se refleja en superficies lisas o mojadas. No atraviesa paredes ni personajes (se comprueba en la profundidad). Solo en pantalla, sin RT por hardware. Solo con DLSS, XeSS o FSR. Bajo 2 fuegos ~0,3 ms, Medio 4 ~0,5 ms, Alto 8 ~0,9 ms.' @('No', 'Bajo', 'Medio', 'Alto')  # (torch-1028)
+$cmbTorch = New-RtCombo 'Luz de antorchas RT' 'torchrt' 536 'Luz de antorchas RT: el fuego de antorchas, braseros y hogueras ilumina paredes, suelos y estructuras cercanas con un rebote calido que parpadea, y se refleja en superficies lisas o mojadas. No atraviesa paredes ni personajes (se comprueba en la profundidad). Solo en pantalla, sin RT por hardware. Solo con DLSS, XeSS o FSR. Bajo 2 fuegos ~0,3 ms, Medio 4 ~0,5 ms, Alto 8 ~0,9 ms. Hibrido: Alto + rayos por hardware (RT real) donde la pantalla no ve al que tapa la luz (fuera de pantalla o detras de otra cosa); solo oscurece, nunca anade luz. Necesita GPU con RT. ~+0,5 ms.' @('No', 'Bajo', 'Medio', 'Alto', 'Híbrido')  # (torch-1028) (torch-shadow-1028) Hibrido
 $cmbFlare = New-RtCombo 'Destellos de lente' 'lensflare' 568 'Destello de lente de antorchas y fuegos visibles: pequenos reflejos de la optica, una estrella y una raya suaves. Desaparece si el fuego queda tapado y cerca de los bordes. Sin halo ni velo en pantalla. Se dibuja antes del HUD. Solo con DLSS, XeSS o FSR. ~0,1 ms.' @('No', 'Sí')  # (torch-1028)
 $cmbShine = $null  # (10-24) Brillo metales retirado
 # (10-24) Ajustes del juego: convars del propio motor, cada uno en Juego (no se toca) o en un nivel. Nombres, tipos,

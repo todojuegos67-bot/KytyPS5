@@ -8,10 +8,15 @@
 //   track   one thread: cells clustered into blobs (8-connected, depth-coherent); 2 / 4 / 8 tracked lights (Bajo / Medio
 //           / Alto) reprojected with the motion vectors, matched, smoothed; the flicker from each blob's own luminance
 //           (fast / slow power, 0.8..1.2, eased); the flare's visibility depth-tested at the source
-//   light   full resolution: G-buffer normal + albedo + roughness, windowed 1/r^2, N.L, a 8 / 12 / 16-step march in the
-//           depth buffer toward the light (no light through walls / characters), a GGX glint; display-referred,
-//           soft-capped, faded with distance; sky, far plane and the fires themselves untouched. No blur, no
-//           history: nothing to smear into a halo, nothing to boil.
+//   shadow  (torch-shadow-1028) full resolution: a march in the depth buffer toward a point jittered on the flame's disc,
+//           screen-uniform steps (~1 per 5 px, up to 8 / 12 / 16), jittered start per pixel and frame, an object-thickness
+//           window (a character a metre in front of the ray does not shadow it: 90fae059's stacked shadow copies), then
+//           a temporal accumulation (motion-reprojected, depth-rejected, 3x3-clamped) and a 5x5 bilateral of the
+//           visibility ratio only (the light itself has no history: no halo can smear).
+//   hybrid  KYTY_TORCH_HW=1 (with KYTY_HWRT=1, "Hibrido"): where the march could not tell (off-screen / hidden), one ray
+//           query a pixel through the scene TLAS (torch-hw.comp); it can only darken that share, never add light.
+//   light   full resolution: G-buffer normal + albedo + roughness, windowed 1/r^2, N.L, x the filtered visibility, a GGX
+//           glint; display-referred, soft-capped, faded with distance; sky, far plane and the fires themselves untouched.
 // TorchFlareApply (last, after the god rays; the HUD is drawn after the upscaler): starburst, streak, 4 ghosts, a faint
 //   ring, per visible tracked light, faded at the screen edges and with its visibility.
 // Without the G-buffer copy (it comes with KYTY_RT_REFLECTIONS / Reflejos RT) the depth's normals and the colour's chroma
@@ -21,6 +26,8 @@
 
 #include "graphics/presentation/videoOut.h"
 #include "gpu_tiler_shaders/torch_spv.h"
+#include "gpu_tiler_shaders/torchhw_spv.h"
+#include "local/hwrt-scene.h"
 #include "local/rt-flicker.h"
 #include "local/rt-reflections.h"
 
@@ -36,7 +43,8 @@
 namespace Libs::Graphics::FrameGen {
 namespace {
 
-constexpr uint32_t Bindings    = 10;
+constexpr uint32_t Bindings    = 13;
+constexpr uint32_t HwBindings  = 5;
 constexpr uint32_t HeaderWords = 16;
 constexpr uint32_t StatsWord   = 16;
 constexpr uint32_t StatsCount  = 16;
@@ -68,7 +76,15 @@ struct {
 	vk::Pipeline            pipeline   = nullptr;
 	vk::Sampler             point = nullptr, linear = nullptr;
 	bool                    failed = false;
-	Img                     out, flare, dummy;
+	Img                     out, flare, dummy, raw, hwraw, filt, hist[2];
+	// (the hybrid's ray query pipeline: made only with KYTY_TORCH_HW=1 and an active scene)
+	vk::DescriptorSetLayout hw_set_layout = nullptr;
+	vk::PipelineLayout      hw_layout     = nullptr;
+	vk::Pipeline            hw_pipeline   = nullptr;
+	bool                    hw_failed     = false;
+	uint64_t                hw_frames = 0, hw_skipped = 0;
+	const char*             hw_why    = nullptr;
+	bool                    shadow_history = false;
 	vk::Extent2D            extent {};
 	bool                    ready = false, dummy_ready = false, history_valid = false;
 	VkBuffer                frame_buf = VK_NULL_HANDLE, read_buf = VK_NULL_HANDLE;
@@ -200,7 +216,7 @@ int32_t NormalEnv(const char* name, int32_t fallback) {
 
 vk::DescriptorType DescType(uint32_t i) {
 	return (i == 7 || i == 8) ? vk::DescriptorType::eStorageBuffer
-	       : i == 6           ? vk::DescriptorType::eStorageImage
+	       : (i == 6 || i == 12) ? vk::DescriptorType::eStorageImage
 	                          : vk::DescriptorType::eCombinedImageSampler;
 }
 
@@ -287,12 +303,85 @@ bool EnsurePipeline(GraphicContext& graphics) {
 
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D extent) {
 	if (g_tc.out.image != VK_NULL_HANDLE && g_tc.extent == extent) return true;
-	Retire(graphics, g_tc.out);
-	Retire(graphics, g_tc.flare);
-	g_tc.ready = false, g_tc.history_valid = false;
+	Img* all[] {&g_tc.out, &g_tc.flare, &g_tc.raw, &g_tc.hwraw, &g_tc.filt, &g_tc.hist[0], &g_tc.hist[1]};
+	for (Img* img: all) Retire(graphics, *img);
+	g_tc.ready = false, g_tc.history_valid = false, g_tc.shadow_history = false;
 	g_tc.extent = extent;
-	return MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, extent, g_tc.out) &&
-	       MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, extent, g_tc.flare);
+	for (Img* img: all)
+		if (!MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, extent, *img)) return false;
+	return true;
+}
+
+bool Inverse4(const double* m, double* out) {
+	double inv[16];
+	inv[0]  = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+	inv[4]  = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+	inv[8]  = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+	inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+	inv[1]  = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+	inv[5]  = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+	inv[9]  = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+	inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+	inv[2]  = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+	inv[6]  = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+	inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+	inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+	inv[3]  = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+	inv[7]  = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+	inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+	inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+	const double det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+	if (!(std::abs(det) > 1e-30) || !std::isfinite(det)) return false;
+	for (int i = 0; i < 16; ++i) out[i] = inv[i] / det;
+	return true;
+}
+
+// The hybrid's pipeline (torch-hw.comp): false when it cannot be made (logged by the caller).
+bool EnsureHwPipeline(GraphicContext& graphics) {
+	if (g_tc.hw_pipeline != nullptr) return true;
+	if (g_tc.hw_failed) return false;
+	g_tc.hw_failed    = true;
+	const auto device = graphics.device;
+	std::array<vk::DescriptorSetLayoutBinding, HwBindings> bindings {};
+	const vk::DescriptorType types[HwBindings] {vk::DescriptorType::eCombinedImageSampler, vk::DescriptorType::eCombinedImageSampler,
+	                                            vk::DescriptorType::eStorageImage, vk::DescriptorType::eStorageBuffer,
+	                                            vk::DescriptorType::eAccelerationStructureKHR};
+	for (uint32_t i = 0; i < HwBindings; ++i) {
+		bindings[i].binding         = i;
+		bindings[i].descriptorType  = types[i];
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+	}
+	vk::DescriptorSetLayoutCreateInfo set_info {};
+	set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	set_info.bindingCount = HwBindings;
+	set_info.pBindings    = bindings.data();
+	if (device.createDescriptorSetLayout(&set_info, nullptr, &g_tc.hw_set_layout) != vk::Result::eSuccess) return false;
+	vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, 128};
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount         = 1;
+	layout_info.pSetLayouts            = &g_tc.hw_set_layout;
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges    = &push;
+	if (device.createPipelineLayout(&layout_info, nullptr, &g_tc.hw_layout) != vk::Result::eSuccess) return false;
+	vk::ShaderModuleCreateInfo module_info {};
+	module_info.codeSize    = sizeof(TORCHHW_SPV);
+	module_info.pCode       = TORCHHW_SPV;
+	vk::ShaderModule module = nullptr;
+	if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+	vk::ComputePipelineCreateInfo pipeline_info {};
+	pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	pipeline_info.stage.module = module;
+	pipeline_info.stage.pName  = "main";
+	pipeline_info.layout       = g_tc.hw_layout;
+	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_tc.hw_pipeline);
+	device.destroyShaderModule(module, nullptr);
+	if (created != vk::Result::eSuccess) {
+		g_tc.hw_pipeline = nullptr;
+		return false;
+	}
+	g_tc.hw_failed = false;
+	return true;
 }
 
 // (both passes' GPU time together: TorchApply opens the timestamp pair, the last pass of the frame closes it)
@@ -313,6 +402,9 @@ void ReadTiming(GraphicContext& graphics) {
 	}
 }
 
+} // namespace
+bool TorchHwWanted();
+namespace {
 void Log(int level, bool flare, bool have_gbuf) {
 	const auto now = std::chrono::steady_clock::now();
 	if (now - g_tc.last_log < std::chrono::seconds(10) || g_tc.mapped == nullptr) return;
@@ -329,6 +421,16 @@ void Log(int level, bool flare, bool have_gbuf) {
 	            d[4] > 0 ? 100.0 * d[5] / d[4] : 0.0, d[3] / fr, g_tc.samples > 0 ? g_tc.sum_ms / g_tc.samples : 0.0, g_tc.max_ms);
 	std::fflush(stdout);
 	g_tc.sum_ms = 0.0, g_tc.max_ms = 0.0, g_tc.samples = 0;
+	// (torch-shadow-1028) the shadow: lit pixels' share the march could not tell, the hybrid's rays on them, hits
+	std::printf("TORCH: shadow: of the lit pixels %.1f %% inconclusive on screen (off-screen / hidden), %.1f %% shadowed (< 0.5), "
+	            "history %.1f frames; hybrid %s: %.1f %% of the lit pixels traced (%.1f %% of the inconclusive), %.1f %% of the rays hit, "
+	            "%llu frames traced, %llu skipped (%s)\n",
+	            d[6] > 0 ? 100.0 * d[7] / d[6] : 0.0, d[6] > 0 ? 100.0 * d[11] / d[6] : 0.0, d[6] > 0 ? static_cast<double>(d[10]) / d[6] : 0.0,
+	            TorchHwWanted() ? "on" : "off", d[6] > 0 ? 100.0 * d[8] / d[6] : 0.0, d[7] > 0 ? 100.0 * d[8] / d[7] : 0.0,
+	            d[8] > 0 ? 100.0 * d[9] / d[8] : 0.0, static_cast<unsigned long long>(g_tc.hw_frames),
+	            static_cast<unsigned long long>(g_tc.hw_skipped), g_tc.hw_why != nullptr ? g_tc.hw_why : "-");
+	std::fflush(stdout);
+	g_tc.hw_frames = g_tc.hw_skipped = 0;
 }
 
 void ReplaceColor(UpscaleInputs& inputs, const Img& img) {
@@ -344,7 +446,7 @@ void ReplaceColor(UpscaleInputs& inputs, const Img& img) {
 
 // One push-descriptor set + dispatches of the given modes; out: the storage image written.
 void Record(vk::CommandBuffer command, const UpscaleInputs& inputs, const RtReflGbuffer* gbuf, const Img& out, TorchPush push,
-            std::initializer_list<int> modes) {
+            std::initializer_list<int> modes, const Img* src = nullptr, const Img* hist = nullptr, const Img* aux = nullptr) {
 	const auto gen = vk::ImageLayout::eGeneral;
 	vk::DescriptorImageInfo infos[Bindings] {};
 	infos[0] = {g_tc.linear, inputs.color.view, inputs.color.layout};
@@ -355,7 +457,10 @@ void Record(vk::CommandBuffer command, const UpscaleInputs& inputs, const RtRefl
 		                   : vk::DescriptorImageInfo {g_tc.point, g_tc.dummy.view, gen};
 	infos[6] = {nullptr, out.view, gen};
 	infos[9] = inputs.motion.view != nullptr ? vk::DescriptorImageInfo {g_tc.point, inputs.motion.view, inputs.motion.layout}
-	                                         : vk::DescriptorImageInfo {g_tc.point, g_tc.out.view, gen};
+	                                         : vk::DescriptorImageInfo {g_tc.point, g_tc.filt.view, gen};
+	infos[10] = {g_tc.point, (src != nullptr ? *src : g_tc.filt).view, gen};
+	infos[11] = {g_tc.point, (hist != nullptr ? *hist : g_tc.hist[0]).view, gen};
+	infos[12] = {nullptr, (aux != nullptr ? *aux : g_tc.raw).view, gen};
 	const vk::DescriptorBufferInfo frame_info {vk::Buffer(g_tc.frame_buf), 0, VK_WHOLE_SIZE};
 	const vk::DescriptorBufferInfo exposure_info =
 	    g_tc.game_exposure ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range} : frame_info;
@@ -391,6 +496,78 @@ void FinishFrame(vk::CommandBuffer command) {
 	        vk::AccessFlagBits2::eHostRead);
 }
 
+
+// (torch-shadow-1028) The hybrid: raw -> hwraw through the scene TLAS. False: not this frame (hwraw not written; why logged).
+bool RecordHybrid(GraphicContext& graphics, vk::CommandBuffer command, const UpscaleInputs& inputs, const TorchPush& tp) {
+	const auto skip = [](const char* why) {
+		++g_tc.hw_skipped;
+		if (g_tc.hw_why != why) {
+			g_tc.hw_why = why;
+			std::printf("TORCH: hybrid: not this frame (%s)\n", why);
+			std::fflush(stdout);
+		}
+		return false;
+	};
+	if (!HwScene::Active()) return skip("KYTY_HWRT inactive: the device has no ray queries");
+	bool built = false;
+	vk::AccelerationStructureKHR tlas = HwScene::SceneTlas(&built);
+	if (tlas == nullptr) return skip("no scene TLAS built yet");
+	if (!built) return skip("the TLAS is an older frame's");
+	std::array<float, 16> vp {};
+	if (!HwScene::SceneCamera(vp)) return skip("no scene camera yet");
+	double vpd[16], ivp[16];
+	for (int i = 0; i < 16; ++i) vpd[i] = vp[i];
+	if (!Inverse4(vpd, ivp)) return skip("the scene camera is degenerate");
+	if (!EnsureHwPipeline(graphics)) return skip("could not create its ray query pipeline");
+	static const float flipy = EnvFloat("KYTY_TORCH_HW_FLIPY", 1.0f, 0.0f, 1.0f);
+	struct {
+		float   ivp[16];
+		float   proj[4], depth_map[4], size[4];
+		int32_t misc[4];
+	} push {};
+	static_assert(sizeof(push) == 128);
+	for (int i = 0; i < 16; ++i) push.ivp[i] = static_cast<float>(ivp[i]);
+	std::memcpy(push.proj, tp.proj, sizeof(push.proj));
+	std::memcpy(push.depth_map, tp.depth_map, sizeof(push.depth_map));
+	push.size[0] = tp.size[0], push.size[1] = tp.size[1], push.size[2] = flipy > 0.5f ? -1.0f : 1.0f;
+	push.misc[0] = tp.misc[1], push.misc[1] = tp.misc[2] & 1;
+	const auto gen = vk::ImageLayout::eGeneral;
+	const vk::DescriptorImageInfo  src_info {g_tc.point, g_tc.raw.view, gen};
+	const vk::DescriptorImageInfo  depth_info {g_tc.point, inputs.depth.view, inputs.depth.layout};
+	const vk::DescriptorImageInfo  out_info {nullptr, g_tc.hwraw.view, gen};
+	const vk::DescriptorBufferInfo frame_info {vk::Buffer(g_tc.frame_buf), 0, VK_WHOLE_SIZE};
+	vk::WriteDescriptorSetAccelerationStructureKHR as_write {};
+	as_write.accelerationStructureCount = 1;
+	as_write.pAccelerationStructures    = &tlas;
+	const vk::DescriptorType types[HwBindings] {vk::DescriptorType::eCombinedImageSampler, vk::DescriptorType::eCombinedImageSampler,
+	                                            vk::DescriptorType::eStorageImage, vk::DescriptorType::eStorageBuffer,
+	                                            vk::DescriptorType::eAccelerationStructureKHR};
+	vk::WriteDescriptorSet writes[HwBindings] {};
+	for (uint32_t i = 0; i < HwBindings; ++i) {
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = types[i];
+	}
+	writes[0].pImageInfo  = &src_info;
+	writes[1].pImageInfo  = &depth_info;
+	writes[2].pImageInfo  = &out_info;
+	writes[3].pBufferInfo = &frame_info;
+	writes[4].pNext       = &as_write;
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_tc.hw_pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_tc.hw_layout, 0, HwBindings, writes);
+	command.pushConstants(g_tc.hw_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	command.dispatch((inputs.color.extent.width + 7) / 8, (inputs.color.extent.height + 7) / 8, 1);
+	Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+	        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	++g_tc.hw_frames;
+	if (g_tc.hw_why != nullptr) {
+		g_tc.hw_why = nullptr;
+		std::printf("TORCH: hybrid: tracing (scene TLAS, one ray a pixel where the screen cannot tell)\n");
+		std::fflush(stdout);
+	}
+	return true;
+}
+
 bool g_timing_open = false;
 uint32_t g_timing_entry = 0;
 
@@ -402,6 +579,20 @@ void CloseTiming(vk::CommandBuffer command) {
 }
 
 } // namespace
+
+bool TorchHwWanted() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TORCH_HW");
+		const bool  asked = value != nullptr && std::atoi(value) > 0;
+		if (asked) {
+			std::printf("TORCH: KYTY_TORCH_HW=%s read (hybrid: the TLAS for what the screen cannot see)%s\n", value,
+			            HwScene::Requested() ? "" : ": needs KYTY_HWRT=1 (and KYTY_RT_HW_EXPERIMENTAL=1) too: screen-space only");
+			std::fflush(stdout);
+		}
+		return asked && HwScene::Requested();
+	}();
+	return on;
+}
 
 int TorchLevel() {
 	static const int level = [] {
@@ -425,7 +616,7 @@ bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	GraphicContext* graphics = inputs.graphics;
 	if (graphics == nullptr || command == nullptr) return false;
 	if (VideoOut::MoviePlaying()) {
-		g_tc.history_valid = false;
+		g_tc.history_valid = false, g_tc.shadow_history = false;
 		return false;
 	}
 	const auto& color = inputs.color;
@@ -471,10 +662,11 @@ bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		if (!said) {
 			said = true;
 			std::printf("TORCH: on (light level %d, flare %s, %ux%u, strength %g, flare strength %g, G-buffer %s, exposure %s; "
-			            "screen-space only, no hardware RT)\n",
+			            "%s)\n",
 			            level, flare ? "on" : "off", color.extent.width, color.extent.height, strength, fstr,
 			            gbuf_ok ? "found" : "not yet (depth normals until Reflejos RT copies it)",
-			            inputs.exposure_buffer != nullptr ? "the game's" : "1.0");
+			            inputs.exposure_buffer != nullptr ? "the game's" : "1.0",
+			            TorchHwWanted() ? "hybrid: screen-space + scene TLAS rays where the screen cannot tell" : "screen-space only, no hardware RT");
 			std::fflush(stdout);
 		}
 	}
@@ -515,7 +707,11 @@ bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	Barrier(command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
 	        vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite);
-	if (!g_tc.ready) ToGeneral(command, g_tc.out.image), ToGeneral(command, g_tc.flare.image), g_tc.ready = true;
+	if (!g_tc.ready) {
+		Img* all[] {&g_tc.out, &g_tc.flare, &g_tc.raw, &g_tc.hwraw, &g_tc.filt, &g_tc.hist[0], &g_tc.hist[1]};
+		for (Img* img: all) ToGeneral(command, img->image);
+		g_tc.ready = true, g_tc.shadow_history = false;
+	}
 	if (!g_tc.dummy_ready) ToGeneral(command, g_tc.dummy.image), g_tc.dummy_ready = true;
 	if (!g_tc.cleared || !g_tc.history_valid) {
 		// (first use, or after a gap / a resize: the tracked lights start over)
@@ -537,8 +733,20 @@ bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	g_tc.push = push;
 	const RtReflGbuffer* gb = gbuf_ok ? &gbuf : nullptr;
-	if (level > 0) Record(command, inputs, gb, g_tc.out, push, {0, 1, 2});
-	else Record(command, inputs, gb, g_tc.out, push, {0, 1});
+	Record(command, inputs, gb, g_tc.out, push, {0, 1});
+	if (level > 0) {
+		// The shadow: raw march (4), the hybrid's rays (torch-hw.comp), temporal (5), spatial (7), then the light (2).
+		const uint32_t cur = static_cast<uint32_t>(g_tc.frame & 1u), prev = cur ^ 1u;
+		TorchPush      sp  = push;
+		if (!g_tc.shadow_history) sp.motion[2] = 0.0f;
+		Record(command, inputs, gb, g_tc.out, sp, {4}, nullptr, nullptr, &g_tc.raw);
+		const Img* shadow_in = &g_tc.raw;
+		if (TorchHwWanted() && RecordHybrid(*graphics, command, inputs, push)) shadow_in = &g_tc.hwraw;
+		Record(command, inputs, gb, g_tc.out, sp, {5}, shadow_in, &g_tc.hist[prev], &g_tc.hist[cur]);
+		Record(command, inputs, gb, g_tc.out, sp, {7}, &g_tc.hist[cur], nullptr, &g_tc.filt);
+		Record(command, inputs, gb, g_tc.out, push, {2}, &g_tc.filt);
+		g_tc.shadow_history = true;
+	}
 	g_tc.tracked_frame = g_tc.frame;
 	g_tc.history_valid = true;
 	if (!flare) {

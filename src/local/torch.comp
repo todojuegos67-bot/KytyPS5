@@ -14,10 +14,23 @@
 //                screen-space march toward the light in the depth buffer (occlusion: no light through walls or
 //                through characters), a GGX glint from the G-buffer roughness (the fire seen on wet / smooth
 //                surfaces); added display-referred (x the game's exposure), soft-capped, faded with distance;
-//                the sky, the far plane and the fire pixels themselves untouched. Deterministic: no noise, no history.
+//                the sky, the far plane and the fire pixels themselves untouched. The occlusion is not marched here:
+//                the light is multiplied by the filtered visibility ratio of modes 4 / 5 / 7 (src_tex .r).
 //   3 flare:     full resolution, after every other pass: per visible light a tiny starburst, a short anamorphic
 //                streak, 4 ghosts and a faint ring along the axis through the screen centre; faded at the screen
 //                edges and with the light's visibility. No bloom wash: everything is small and capped.
+//   4 shadow:    (torch-shadow-1028) full resolution: per light, a march in the depth buffer from the surface toward a
+//                point jittered on the flame's disc (0.1 m), its samples uniform in SCREEN space (perspective-correct t),
+//                ~1 per 5 px, 4..push.light.z, the start jittered per pixel and per frame (interleaved gradient noise +
+//                the golden ratio); a sample occludes only when it lies behind the depth by more than a bias and LESS
+//                than an object thickness (0.4 m + 8 % of z, <= 3 m): a character a metre in front of the ray no longer
+//                shadows it (90fae059's 4 m window: the knight's stacked shadow copies, one per fixed step). Out
+//                aux_img: (sum w_k v_k / W, W, k + share of W whose march was inconclusive (off-screen / behind a
+//                much nearer surface: the hybrid's ray), view z); W the lights' unshadowed luminance weight.
+//   5 temporal:  aux_img = the ratio reprojected with the motion vectors (src_tex this frame's, hist_tex last frame's),
+//                rejected on a depth mismatch, clamped to this frame's 3x3 range (+-0.15), alpha max(1 / n, 0.1):
+//                (ratio, n, W, z).
+//   7 spatial:   aux_img = a 5x5 joint bilateral (depth, lit neighbours only) of mode 5's ratio.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D color_tex;
@@ -28,10 +41,15 @@ layout(binding = 4) uniform usampler2D packed2;
 layout(binding = 5) uniform usampler2D packed3;
 layout(binding = 6, rgba16f) uniform writeonly image2D out_img;
 layout(binding = 9) uniform sampler2D motion_tex;
+layout(binding = 10) uniform sampler2D src_tex;  // (modes 2 / 5 / 7: their input)
+layout(binding = 11) uniform sampler2D hist_tex; // (mode 5: last frame's history)
+layout(binding = 12, rgba16f) uniform writeonly image2D aux_img;
 layout(std430, binding = 7) buffer Frame {
 	vec4 view_rot[3]; // words 0..11: world -> view rotation rows
 	vec4 hp;          // 12..15: x 1.0 (exposure when the game gives none), y fire threshold (exposed), z slots, w -
-	uint stats[16];   // 16..31: 0 frames, 1 blobs, 2 lights in use, 3 flares drawn, 4 sampled pixels, 5 lit pixels
+	uint stats[16];   // 16..31: 0 frames, 1 blobs, 2 lights in use, 3 flares drawn, 4 sampled pixels, 5 lit pixels,
+	                  // 6 lit (W > 0) sampled, 7 of them inconclusive, 8 traced (hybrid), 9 hit, 10 history n sum, 11 shadowed
+	                  // (ratio < 0.5), 12 hybrid frames
 	vec4 lights[32];  // 32..159: 8 slots x [0] (uv, view z, fade) [1] (hue rgb, slow power) [2] (fast power, flicker,
 	                  // flare visibility, missing frames) [3] (view position xyz, power used)
 	vec4 cand[];      // 160..: 32x18 cells x (weight, uv x, uv y, nearest z), (mean exposed rgb, taps)
@@ -371,25 +389,166 @@ void Track() {
 }
 
 // ---- 2 light ----
-// The visibility of the light from p: a march in the depth buffer along the segment (its ends left out: the surface
-// itself and the flame's own geometry); a sample hidden behind the depth by more than the thickness (and by less
-// than 4 m, a front object far from the segment does not shadow) occludes, softly.
-float Visibility(vec3 p, vec3 lp, int steps) {
-	float vis = 1.0;
-	for (int s = 0; s < steps; ++s) {
-		float t  = 0.06 + 0.82 * (float(s) + 0.5) / float(steps);
+float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+
+// The light's visibility from p (view space) toward lp: 1 lit, 0 occluded; unc: 1 when some sample could not tell
+// (off-screen, or behind a surface nearer by more than the thickness).
+float March(vec3 p, vec3 lp, int max_steps, float jit, out float unc) {
+	unc = 0.0;
+	vec2 s0, s1;
+	if (!Project(p, s0)) return 1.0;
+	bool l_on = Project(lp, s1);
+	vec2  rs   = RenderSize();
+	float slen = l_on ? length((s1 - s0) * rs) : 1e4;
+	float n    = clamp(ceil(slen / 5.0), 4.0, float(max_steps));
+	float occ  = 0.0;
+	float z0 = p.z, z1 = lp.z;
+	for (int s = 0; s < max_steps; ++s) {
+		if (float(s) >= n) break;
+		float f  = 0.03 + 0.94 * (float(s) + jit) / n;
+		// (the 3D t whose projection is the screen fraction f: uniform steps on screen)
+		float t  = l_on ? f * z0 / max((1.0 - f) * z1 + f * z0, 1e-4) : f;
 		vec3  pt = mix(p, lp, t);
 		vec2  uv;
-		if (!Project(pt, uv) || any(lessThan(uv, vec2(0))) || any(greaterThan(uv, vec2(1)))) continue;
-		float d  = DepthAt(uv);
+		if (!Project(pt, uv) || any(lessThan(uv, vec2(0))) || any(greaterThan(uv, vec2(1)))) {
+			unc = 1.0;
+			continue;
+		}
+		float d = DepthAt(uv);
 		if (IsSky(d)) continue;
-		float dd = pt.z - ViewZ(d);
-		float tk = 0.12 + 0.015 * pt.z;
-		float o  = Sat((dd - tk) / tk) * (dd < 4.0 ? 1.0 : 0.0);
-		vis *= 1.0 - 0.9 * o;
-		if (vis < 0.02) return 0.0;
+		float dd   = pt.z - ViewZ(d);
+		float bias = 0.03 + 0.004 * pt.z;
+		float T    = clamp(0.4 + 0.08 * pt.z, 0.4, 3.0);
+		if (dd > T) unc = 1.0;
+		occ = max(occ, Sat((dd - bias) / bias) * Sat((T - dd) / (0.25 * T)));
+		if (occ >= 0.999) break;
 	}
-	return vis;
+	return 1.0 - occ;
+}
+
+void Shadow(ivec2 p) {
+	vec2  rs = RenderSize();
+	ivec2 sz = ivec2(rs);
+	if (any(greaterThanEqual(p, sz))) return;
+	float d  = texelFetch(depth_tex, p, 0).r;
+	float z  = IsSky(d) ? 1e6 : ViewZ(d);
+	if (IsSky(d) || z > push.light.w) {
+		imageStore(aux_img, p, vec4(1.0, 0.0, 0.0, z));
+		return;
+	}
+	vec2  uv   = (vec2(p) + 0.5) / rs;
+	vec3  pos  = ViewPosZ(uv, z);
+	vec3  N    = NormalAt(p, pos);
+	int   fr   = push.misc.y;
+	float jit  = fract(Ign(vec2(p) + 5.588238 * float(fr & 63)));
+	float ja   = fract(Ign(vec2(p.y, p.x) + 11.0 * float(fr & 63)) + 0.3);
+	float jr   = fract(jit + 0.618034 * float(fr & 255));
+	float jp   = fract(Ign(vec2(p) * 1.7 + 3.1 * float(fr & 63)) + 0.5);
+	float W = 0.0, Wv = 0.0, U = 0.0;
+	float wk[8], uk[8];
+	for (int k = 0; k < 8; ++k) {
+		wk[k] = 0.0, uk[k] = 0.0;
+		vec4 l0 = lights[k * 4];
+		if (l0.w <= 0.0) continue;
+		vec4  l3  = lights[k * 4 + 3];
+		float pwr = l3.w * l0.w;
+		if (pwr <= 0.0) continue;
+		vec3  L    = l3.xyz - pos;
+		float dist = length(L);
+		float R    = clamp(5.0 + 4.0 * sqrt(lights[k * 4 + 1].w), 5.0, 20.0) * push.light.x;
+		if (dist >= R || dist < 1e-3) continue;
+		vec3  l   = L / dist;
+		float ndl = dot(N, l);
+		if (ndl <= 0.0) continue;
+		float x   = dist / R;
+		float win = Sat(1.0 - x * x * x * x);
+		float w   = Luma(lights[k * 4 + 1].rgb) * pwr * win * win / (dist * dist + 1.0) * ndl;
+		if (w <= 0.0) continue;
+		// a point on the flame's disc, facing the receiver (the penumbra; resolved by the temporal pass)
+		vec3  b1  = normalize(cross(l, abs(l.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+		vec3  b2  = cross(l, b1);
+		float a   = 6.2831853 * ja;
+		vec3  tgt = l3.xyz + (b1 * cos(a) + b2 * sin(a)) * (0.1 * sqrt(jr));
+		float u;
+		float v = March(pos + N * 0.03, tgt, int(push.light.z), jit, u);
+		W += w, Wv += w * v, U += w * u;
+		wk[k] = w, uk[k] = w * u;
+	}
+	// The hybrid's pick among the inconclusive lights (probability uk / U).
+	int   pick = 0;
+	float acc  = 0.0, target = jp * U;
+	for (int k = 0; k < 8; ++k) {
+		if (uk[k] <= 0.0) continue;
+		pick = k;
+		acc += uk[k];
+		if (acc >= target) break;
+	}
+	float ratio = W > 0.0 ? Wv / W : 1.0;
+	float share = W > 0.0 ? min(U / W, 0.99) : 0.0;
+	if ((p.x & 3) == 0 && (p.y & 3) == 0 && W > 0.0) {
+		atomicAdd(stats[6], 1u);
+		if (share > 0.02) atomicAdd(stats[7], 1u);
+	}
+	imageStore(aux_img, p, vec4(ratio, W, float(pick) + share, z));
+}
+
+void Temporal(ivec2 p) {
+	vec2  rs = RenderSize();
+	ivec2 sz = ivec2(rs);
+	if (any(greaterThanEqual(p, sz))) return;
+	vec4 cur = texelFetch(src_tex, p, 0);
+	if (cur.y <= 0.0) {
+		imageStore(aux_img, p, vec4(1.0, 0.0, 0.0, cur.w));
+		return;
+	}
+	float mn = cur.x, mx = cur.x;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			vec4 q = texelFetch(src_tex, clamp(p + ivec2(x, y), ivec2(0), sz - 1), 0);
+			if (q.y <= 0.0) continue;
+			mn = min(mn, q.x), mx = max(mx, q.x);
+		}
+	float r = cur.x, n = 1.0;
+	if (push.motion.z > 0.0) {
+		vec2 uv  = (vec2(p) + 0.5) / rs;
+		vec2 puv = uv - textureLod(motion_tex, uv, 0).xy * push.motion.xy / rs;
+		if (all(greaterThan(puv, vec2(0))) && all(lessThan(puv, vec2(1)))) {
+			vec4 h = texelFetch(hist_tex, clamp(ivec2(puv * rs), ivec2(0), sz - 1), 0);
+			if (h.z > 0.0 && abs(h.w - cur.w) < 0.1 * cur.w + 0.05) {
+				float hr = clamp(h.x, mn - 0.15, mx + 0.15);
+				n        = min(h.y + 1.0, 12.0);
+				float al = max(1.0 / n, 0.1);
+				r        = mix(hr, cur.x, al);
+			}
+		}
+	}
+	if ((p.x & 3) == 0 && (p.y & 3) == 0) {
+		atomicAdd(stats[10], uint(n));
+		if (r < 0.5) atomicAdd(stats[11], 1u);
+	}
+	imageStore(aux_img, p, vec4(Sat(r), n, cur.y, cur.w));
+}
+
+void Spatial(ivec2 p) {
+	vec2  rs = RenderSize();
+	ivec2 sz = ivec2(rs);
+	if (any(greaterThanEqual(p, sz))) return;
+	vec4 c = texelFetch(src_tex, p, 0);
+	if (c.z <= 0.0) {
+		imageStore(aux_img, p, vec4(1.0, 0.0, 0.0, 0.0));
+		return;
+	}
+	// (fewer accumulated frames: a wider weight; a converged pixel keeps its own value more)
+	float sig = mix(2.0, 0.9, Sat((c.y - 1.0) / 8.0));
+	float sum = 0.0, ws = 0.0;
+	for (int y = -2; y <= 2; ++y)
+		for (int x = -2; x <= 2; ++x) {
+			vec4  q = texelFetch(src_tex, clamp(p + ivec2(x, y), ivec2(0), sz - 1), 0);
+			if (q.z <= 0.0) continue;
+			float w = exp(-float(x * x + y * y) / (2.0 * sig * sig)) * exp(-abs(q.w - c.w) / (0.02 * c.w + 0.02));
+			sum += q.x * w, ws += w;
+		}
+	imageStore(aux_img, p, vec4(ws > 0.0 ? sum / ws : c.x, 0.0, 0.0, 0.0));
 }
 
 void Light(ivec2 p) {
@@ -415,7 +574,6 @@ void Light(ivec2 p) {
 	vec3  alb   = AlbedoAt(p, c);
 	float rough = Gbuf() ? clamp(Field(push.dec.y, p), 0.25, 1.0) : 0.6;
 	float selfw = FireW(c * e, z, alb);
-	int   steps = int(push.light.z);
 	vec3  diff  = vec3(0), spec = vec3(0);
 	for (int k = 0; k < 8; ++k) {
 		vec4 l0 = lights[k * 4];
@@ -433,8 +591,7 @@ void Light(ivec2 p) {
 		float x   = dist / R;
 		float win = Sat(1.0 - x * x * x * x);
 		float att = win * win / (dist * dist + 1.0);
-		float vis = Visibility(pos + N * 0.04, l3.xyz, steps);
-		if (vis <= 0.0) continue;
+		float vis = 1.0; // (the occlusion: the filtered ratio below)
 		// A flicker that also shifts the hue: brighter = a little more yellow.
 		float fl  = lights[k * 4 + 2].y;
 		vec3  hue = lights[k * 4 + 1].rgb * mix(vec3(1.0), vec3(0.94, 1.06, 1.1), Sat((fl - 1.0) * 4.0));
@@ -447,7 +604,8 @@ void Light(ivec2 p) {
 		float D   = min(a2 / (PI * den * den), 8.0);
 		spec += E * ndl * D;
 	}
-	vec3  add  = (alb * diff * 3.0 + spec * push.light.y) * push.size.z * (1.0 - selfw);
+	float shade = Sat(texelFetch(src_tex, p, 0).r); // (modes 4 / 5 / 7: the torches' visibility here)
+	vec3  add  = (alb * diff * 3.0 + spec * push.light.y) * push.size.z * (1.0 - selfw) * shade;
 	add *= 1.0 - smoothstep(zmax * 0.6, zmax, z); // (fog and distant walls stay as drawn)
 	float al   = Luma(add);
 	float cap  = push.size.w;
@@ -512,5 +670,8 @@ void main() {
 	else if (mode == 1) {
 		if (gl_LocalInvocationIndex == 0u) Track();
 	} else if (mode == 2) Light(ivec2(gl_GlobalInvocationID.xy));
+	else if (mode == 4) Shadow(ivec2(gl_GlobalInvocationID.xy));
+	else if (mode == 5) Temporal(ivec2(gl_GlobalInvocationID.xy));
+	else if (mode == 7) Spatial(ivec2(gl_GlobalInvocationID.xy));
 	else Flare(ivec2(gl_GlobalInvocationID.xy));
 }

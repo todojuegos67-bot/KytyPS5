@@ -624,6 +624,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${torch_header}")
+# KYTY_TORCH_HW: the torch light's hardware-RT occlusion fallback through the scene TLAS (src/local/torch.cpp).
+set(torchhw_source "${KYTY_SOURCE_DIR}/local/torch-hw.comp")
+set(torchhw_spv "${gpu_tiler_generated_dir}/torchhw.spv")
+set(torchhw_header "${gpu_tiler_generated_dir}/torchhw_spv.h")
+add_custom_command(
+	OUTPUT "${torchhw_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${torchhw_spv}" "${torchhw_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${torchhw_spv} -DOUTPUT=${torchhw_header}
+	        -DSYMBOL=TORCHHW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${torchhw_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${torchhw_header}")
 
 # KYTY_HWRT_VOLSHADOW: TLAS-shadowed god-ray march (src/local/volshadow.cpp).
 set(volshadow_source "${KYTY_SOURCE_DIR}/local/volshadow.comp")
