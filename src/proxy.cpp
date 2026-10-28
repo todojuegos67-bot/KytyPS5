@@ -4,6 +4,7 @@
 #include "framegen.h"
 #include "overlay.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdarg>
 #include <cstdio>
@@ -444,7 +445,11 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue, const VkPrese
 			Log("pre-present submit failed");
 		}
 	}
-	return fg ? framegen::Present(queue, &present) : R().vkQueuePresentKHR(queue, &present);
+	if (fg) {
+		present.pNext = nullptr;  // (present id / regions / fences: not for the frame interpolation swapchain)
+		return framegen::Present(queue, &present);
+	}
+	return R().vkQueuePresentKHR(queue, &present);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* alloc, VkImage* image) {
@@ -500,11 +505,48 @@ VKAPI_ATTR void VKAPI_CALL Hook_CmdPipelineBarrier(VkCommandBuffer cb, VkPipelin
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Hook_GetDeviceProcAddr(VkDevice device, const char* name);
 
+// Extensions whose functions take the swapchain handle (present wait / id, Reflex latency, swapchain maintenance,
+// exclusive fullscreen, display timing): the FidelityFX frame interpolation swapchain is not a driver swapchain and
+// has no replacement for them, so they are always hidden from the game (DXVK then
+// simply does not use them).
+const char* const kHiddenExtensions[] = {
+    "VK_KHR_present_wait", "VK_KHR_present_wait2", "VK_KHR_present_id", "VK_KHR_present_id2", "VK_NV_low_latency2",
+    "VK_EXT_swapchain_maintenance1", "VK_EXT_full_screen_exclusive", "VK_AMD_anti_lag", "VK_GOOGLE_display_timing",
+    "VK_EXT_display_control"};
+
+VKAPI_ATTR VkResult VKAPI_CALL Hook_EnumerateDeviceExtensionProperties(VkPhysicalDevice physical, const char* layer,
+                                                                       uint32_t* count, VkExtensionProperties* props) {
+	auto real = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(R().gipa(R().instance, "vkEnumerateDeviceExtensionProperties"));
+	if (layer != nullptr) return real(physical, layer, count, props);
+	uint32_t n = 0;
+	VkResult r = real(physical, nullptr, &n, nullptr);
+	if (r != VK_SUCCESS) return r;
+	std::vector<VkExtensionProperties> all(n);
+	r = real(physical, nullptr, &n, all.data());
+	if (r != VK_SUCCESS && r != VK_INCOMPLETE) return r;
+	all.resize(n);
+	static bool logged = false;
+	std::vector<VkExtensionProperties> kept;
+	for (const auto& e: all) {
+		bool hide = false;
+		for (const char* h: kHiddenExtensions) hide |= std::strcmp(e.extensionName, h) == 0;
+		if (!hide) kept.push_back(e);
+		else if (!logged) Log("hidden from the game (frame interpolation swapchain): %s", e.extensionName);
+	}
+	logged = true;
+	if (props == nullptr) { *count = static_cast<uint32_t>(kept.size()); return VK_SUCCESS; }
+	const uint32_t copy = std::min<uint32_t>(*count, static_cast<uint32_t>(kept.size()));
+	std::copy_n(kept.begin(), copy, props);
+	*count = copy;
+	return copy < kept.size() ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
 struct HookEntry { const char* name; PFN_vkVoidFunction fn; bool device; };
 #define HOOK(n, f, d) {n, reinterpret_cast<PFN_vkVoidFunction>(&f), d}
 const HookEntry kHooks[] = {
     HOOK("vkGetDeviceProcAddr", Hook_GetDeviceProcAddr, true),
     HOOK("vkCreateDevice", Hook_CreateDevice, false),
+    HOOK("vkEnumerateDeviceExtensionProperties", Hook_EnumerateDeviceExtensionProperties, false),
     HOOK("vkCreateWin32SurfaceKHR", Hook_CreateWin32SurfaceKHR, false),
     HOOK("vkDestroyDevice", Hook_DestroyDevice, true),
     HOOK("vkQueueSubmit", Hook_QueueSubmit, true),

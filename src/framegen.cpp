@@ -214,6 +214,8 @@ VkResult CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info, 
 	create.swapchain      = &swapchain;
 	create.createInfo     = *info;
 	create.createInfo.oldSwapchain = VK_NULL_HANDLE;
+	create.createInfo.pNext = nullptr;  // (format lists / maintenance chains: not for the replacement swapchain)
+	create.createInfo.flags &= ~VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;
 	if (Q().game == VK_NULL_HANDLE) {  // before the first present: the graphics family's first queue (DXVK's)
 		R().vkGetDeviceQueue(device, Q().graphics_family, 0, &Q().game);
 		Q().game_family = Q().graphics_family;

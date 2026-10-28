@@ -78,10 +78,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $name = '${{ steps.pkg.outputs.name }}'
-          $tag = "injector-$($env:GITHUB_SHA.Substring(0, 8))"
+          $tag = "injector-$($env:GITHUB_SHA.Substring(0, 8))-r$($env:GITHUB_RUN_NUMBER)"
           gh release create $tag "out/$name.zip" --draft --target $env:GITHUB_SHA --title "$name (draft, untested)" `
             --notes "Generic DX11 (DXVK) injector, phase 1. DRAFT: not published. See README.md in the zip. zip md5 ${{ steps.pkg.outputs.zipmd5 }}"
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          $assets = gh api "repos/$env:GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \`"$tag\`") | .assets[] | \`"\(.id) \(.name) \(.size)\`""
-          $assets
-          "::notice title=asset::$assets zip md5 ${{ steps.pkg.outputs.zipmd5 }}"
+          $rels = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=30" | ConvertFrom-Json
+          $rel = $rels | Where-Object { $_.tag_name -eq $tag } | Select-Object -First 1
+          foreach ($a in $rel.assets) {
+            $line = "release $($rel.id) draft=$($rel.draft) asset id $($a.id) $($a.name) $($a.size) bytes, zip md5 ${{ steps.pkg.outputs.zipmd5 }}"
+            $line
+            "::notice title=asset::$line"
+          }
+          exit 0
