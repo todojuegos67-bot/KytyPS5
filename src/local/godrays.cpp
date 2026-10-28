@@ -98,6 +98,7 @@ struct {
 	// largest step, switches between the TLAS-shadowed and the depth-only march, the cause counters of missed feeds)
 	uint64_t                feed_seen = 0;
 	uint32_t                w_flips = 0;
+	float                   w_goal = 0.0f, feed_slow = -1.0f, raw_min = 2.0f, raw_max = -1.0f; // (vol-1027b: the fed weight, slowed)
 	float                   w_dprev = 0.0f;
 	uint32_t                fresh_frames = 0, gap_frames = 0, gap_run = 0, gap_max = 0, path_switches = 0, path_rt = 0;
 	float                   w_min = 2.0f, w_max = -1.0f, w_step = 0.0f, dir_step = 0.0f, w_prev = -1.0f;
@@ -359,18 +360,19 @@ void Log(int level, bool have_sun) {
 		const bool  jump  = g_gr.w_flips > 4 || g_gr.path_switches > 2;
 		const char* cause = !g_gr.sun_seen           ? "no sun yet (RT sun shadows off or not latched)"
 		                    : g_gr.path_switches > 2 ? "the TLAS / depth march switched"
-		                    : g_gr.w_flips > 4       ? "the sun weight pumped (the feed came in bursts)"
+		                    : g_gr.w_flips > 4       ? "the sun weight pumped"
 		                    : g_gr.gap_max > 30      ? "feed gaps (held: no visible change)"
 		                                             : "none";
 		std::printf("GODRAYS: flicker self-check %s (cause: %s): new sun feeds %u of %u frames, gaps %u (longest %u frames; not latched %u; "
-		            "sun-shadow gates fed through: RT sun cascades %u, no TLAS %u, pass images %u), weight %.3f-%.3f max step %.4f a frame, "
+		            "sun-shadow gates fed through: RT sun cascades %u, no TLAS %u, pass images %u), weight %.3f-%.3f (fed %.3f-%.3f) max step %.4f a frame, "
 		            "turned around %u times, view direction max step %.3f deg (camera turns too), TLAS-shadowed march %u frames, path switches %u\n",
 		            jump ? "JUMP" : "ok", cause, g_gr.fresh_frames, d[0], g_gr.gap_frames, g_gr.gap_max, g_gr.miss[0], g_gr.miss[1],
 		            g_gr.miss[2], g_gr.miss[3], static_cast<double>(g_gr.w_min > 1.5f ? 0.0f : g_gr.w_min),
-		            static_cast<double>(std::max(g_gr.w_max, 0.0f)), static_cast<double>(g_gr.w_step), g_gr.w_flips, static_cast<double>(g_gr.dir_step),
+		            static_cast<double>(std::max(g_gr.w_max, 0.0f)), static_cast<double>(g_gr.raw_min > 1.5f ? 0.0f : g_gr.raw_min),
+		            static_cast<double>(std::max(g_gr.raw_max, 0.0f)), static_cast<double>(g_gr.w_step), g_gr.w_flips, static_cast<double>(g_gr.dir_step),
 		            g_gr.path_rt, g_gr.path_switches);
 		g_gr.fresh_frames = g_gr.gap_frames = g_gr.gap_run = g_gr.gap_max = g_gr.path_switches = g_gr.path_rt = 0;
-		g_gr.w_min = 2.0f, g_gr.w_max = -1.0f, g_gr.w_step = g_gr.dir_step = 0.0f, g_gr.miss = {}, g_gr.w_flips = 0;
+		g_gr.w_min = 2.0f, g_gr.w_max = -1.0f, g_gr.w_step = g_gr.dir_step = 0.0f, g_gr.miss = {}, g_gr.w_flips = 0, g_gr.raw_min = 2.0f, g_gr.raw_max = -1.0f;
 	}
 	std::printf("GODRAYS: stats (level %d) GPU %.3f ms (max %.3f), sun %s (on screen %.0f %% of frames), lights %.2f a frame\n", level,
 	            g_gr.samples > 0 ? g_gr.sum_ms / g_gr.samples : 0.0, g_gr.max_ms,
@@ -482,7 +484,18 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 					}
 				}
 			}
-			if (fresh) target = g_gr_sun.weight, ++g_gr.feeds;
+			if (fresh) {
+				// (vol-1027b) The fed weight is the RT shadows' overcast factor: 0.5 + 0.5 * a probe of the sun-facing vs
+				// facing-away luminance on screen, so it swings 0.5-1.0 with what the camera looks at (owner log 10-28:
+				// fed every frame, weight 0.50-0.89, turned around 5-8 times in 10 s: the fog pumped). Followed here only
+				// as a 6 s average with a 0.1 dead band: the weather, not the view; a drop to 0 (the sun gone) still fades.
+				const float w = g_gr_sun.weight;
+				g_gr.raw_min = std::min(g_gr.raw_min, w), g_gr.raw_max = std::max(g_gr.raw_max, w);
+				if (g_gr.feed_slow < 0.0f || w <= 0.0f) g_gr.feed_slow = w;
+				else g_gr.feed_slow += (w - g_gr.feed_slow) * std::min(dt / 6.0f, 1.0f);
+				if (g_gr.sun_held <= 0.0f || std::abs(g_gr.feed_slow - g_gr.sun_held) > 0.1f || g_gr.feed_slow <= 0.0f) g_gr.w_goal = g_gr.feed_slow;
+				target = g_gr.w_goal, ++g_gr.feeds;
+			}
 			else if (g_gr.sun_seen) ++g_gr.stale;
 			// (self-check: was there a new feed since the last frame of this pass?)
 			if (g_gr_sun.seq != g_gr.feed_seen) {
