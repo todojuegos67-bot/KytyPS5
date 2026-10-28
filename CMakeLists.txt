@@ -593,6 +593,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${godrays_header}")
 
+# KYTY_TORCH / KYTY_TORCH_FLARE: firelight + lens flare from torches, screen-space (src/local/torch.cpp).
+set(torch_source "${KYTY_SOURCE_DIR}/local/torch.comp")
+set(torch_spv "${gpu_tiler_generated_dir}/torch.spv")
+set(torch_header "${gpu_tiler_generated_dir}/torch_spv.h")
+add_custom_command(
+	OUTPUT "${torch_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${torch_spv}" "${torch_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${torch_spv} -DOUTPUT=${torch_header}
+	        -DSYMBOL=TORCH_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${torch_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${torch_header}")
+
 # KYTY_HWRT_VOLSHADOW: TLAS-shadowed god-ray march (src/local/volshadow.cpp).
 set(volshadow_source "${KYTY_SOURCE_DIR}/local/volshadow.comp")
 set(volshadow_spv "${gpu_tiler_generated_dir}/volshadow.spv")
@@ -845,6 +861,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/shine.cpp"
 	"${KYTY_SOURCE_DIR}/local/godrays.h"
 	"${KYTY_SOURCE_DIR}/local/godrays.cpp"
+	"${KYTY_SOURCE_DIR}/local/torch.h"
+	"${KYTY_SOURCE_DIR}/local/torch.cpp"
 	"${KYTY_SOURCE_DIR}/local/volshadow.h"
 	"${KYTY_SOURCE_DIR}/local/volshadow.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-particles.h"

@@ -69,7 +69,7 @@ float Threshold() {
 	return t;
 }
 const char* Name(uint32_t p) {
-	static const char* names[] {"particles light", "sun shadows", "lamp/torch shadows", "reflections", "volumetric light", "gi+ao", "contact shadows", "water mirrors"};
+	static const char* names[] {"particles light", "sun shadows", "lamp/torch shadows", "reflections", "volumetric light", "gi+ao", "contact shadows", "water mirrors", "torch light", "lens flare"};
 	return p < Count ? names[p] : "?";
 }
 

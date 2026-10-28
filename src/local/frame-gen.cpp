@@ -35,6 +35,7 @@
 #include "local/gbuf-view.h"
 #include "local/shine.h"
 #include "local/godrays.h"
+#include "local/torch.h"
 #include "local/rt-local-lights.h"
 #include "local/rt-flicker.h"
 #include "local/rt-capture.h"
@@ -6725,7 +6726,8 @@ bool SsrApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 bool SsrWanted() {
 	return SsrLevel() > 0 || RtReflectionsWanted() || HwParticlesWanted() || ShineWanted() || GtaoLevel() > 0 || GbufViewWanted() ||
 	       SsgiEmissive() > 0.0f || // (rtfire: the emissive light reads the G-buffer copy's albedo)
-	       HwGiWanted();             // (KYTY_HWRT_AO / KYTY_HWRT_GI: its normal and albedo)
+	       HwGiWanted() ||           // (KYTY_HWRT_AO / KYTY_HWRT_GI: its normal and albedo)
+	       TorchLevel() > 0;         // (KYTY_TORCH: the firelight's normal, albedo and roughness)
 }
 bool SsrPassWanted() { return SsrLevel() > 0; }
 
@@ -9528,12 +9530,14 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Contact, "RtContactApply")
 	TimedPass("SsgiApply", [&] { SsgiApply(command, inputs); }); // (KYTY_SSGI: likewise; nothing when off)
 	TimedPass("GtaoApply", [&] { GtaoApply(command, inputs); }); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
+	probed(RtFlicker::Torch, "TorchApply", [&] { return TorchApply(command, inputs); }); // (KYTY_TORCH / KYTY_TORCH_FLARE: the firelight, torch.cpp; before SSR / RT reflections so they reflect it; nothing when off)
 	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Gi, "HwGiApply")
 	TimedPass("SsrApply", [&] { SsrApply(command, inputs); }); // (KYTY_SSR: likewise, after GTAO; nothing when off)
 	probed(RtFlicker::Reflections, "RtReflectionsApply", [&] { return RtReflectionsApply(command, inputs); }); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
 	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Water, "RtWaterApply")
 	TimedPass("ShineApply", [&] { ShineApply(command, inputs); }); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
 	probed(RtFlicker::Volumetric, "GodraysApply", [&] { return GodraysApply(command, inputs); }); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off; flicker self-check)
+	probed(RtFlicker::Flare, "TorchFlareApply", [&] { return TorchFlareApply(command, inputs); }); // (KYTY_TORCH_FLARE: the lens flare, last before the upscaler and the HUD; torch.cpp)
 	TimedPass("GbufViewApply", [&] { GbufViewApply(command, inputs); }); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
 	SharpenProbeTick();
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3 || g_sr_kind == 4;
