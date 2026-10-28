@@ -554,7 +554,7 @@ void CheckWork() {
 	// (10-28, the emulator launcher) Both versions shown; an installed version with the same or a newer date (the 8-digit
 	// YYYYMMDD in the tag) is never offered the published one (no downgrade).
 	const std::string cur  = Update::CurrentVersion();
-	const std::string both = "Version instalada: " + cur + "\nUltima release en GitHub: " + r.tag;
+	const std::string both = "Version instalada: " + cur + "\nUltima version del port en GitHub: " + r.tag;
 	const std::string dc = Update::TagDate(cur), dr = Update::TagDate(r.tag);
 	if (r.tag == cur) SetUpd(UpdateUi::UpToDate, both + "\nYa tienes la ultima version.");
 	else if (!dc.empty() && !dr.empty() && dc >= dr) SetUpd(UpdateUi::UpToDate, both + "\nTu version es igual o mas nueva. No hace falta actualizar.");
@@ -820,23 +820,11 @@ void DrawPcTab(float unit) {
 	const bool  busy = g_upd.busy.load();
 	const float bw = 330 * unit, bh = 52 * unit;
 	ImGui::BeginDisabled(busy);
+	// (10-28c) "Actualizar version" / "Volver a la version anterior" live only in the bottom bar (next to JUGAR / Salir);
+	// here only the confirmation once a newer port version was found.
 	if (state == UpdateUi::Available) {
 		if (ImGui::Button(("Actualizar a " + g_upd.release.tag).c_str(), {bw, bh})) StartWorker(InstallWork);
-	} else if (ImGui::Button(I18n::T("Actualizar version"), {bw, bh})) {
-		SetUpd(UpdateUi::Checking, "Buscando la ultima version en GitHub...");
-		StartWorker(CheckWork);
 	}
-	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip("Busca la ultima version publicada en GitHub y la instala en esta misma carpeta. Guarda los archivos del motor actuales en _backup_update (las 2 ultimas) y no toca la cache de shaders, las partidas, los seeds ni los ajustes.");
-	ImGui::SameLine();
-	if (ImGui::Button(I18n::T("Volver a la version anterior"), {bw, bh})) {
-		OpenRestore();
-		std::scoped_lock lock(g_upd.mutex);
-		state = g_upd.state;
-		text  = g_upd.text;
-	}
-	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip("Vuelve a una version guardada en _backup_update. Antes guarda la actual (se puede deshacer). No toca la cache de shaders, las partidas, los seeds ni los ajustes.");
 	ImGui::EndDisabled();
 	// (10-27c) "Anadir a Steam": a non-Steam shortcut with its icon and artwork (ds-steam.cpp).
 	{
@@ -1445,8 +1433,8 @@ void Draw(float width, float height) {
 			ImGui::PopFont();
 			ImGui::Separator();
 			ImGui::PushTextWrapPos(0.0f);
-			ImGui::TextUnformatted(g_desc_text.empty() && g_start_mode ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: siguiente valor.\nLB / RB o Q / E (o la lista de la izquierda): cambiar de sección.\n\nTodo se guarda en settings.ini y se aplica al pulsar JUGAR. Dentro del juego, F1 abre estas mismas opciones."
-			                       : g_desc_text.empty() ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: siguiente valor.\nLB / RB o Q / E (o la lista de la izquierda): cambiar de sección.\nB / Esc: volver al juego.\n\n(requiere reinicio): se guarda ya y se aplica en el próximo inicio. El resto se aplica al momento."
+			ImGui::TextUnformatted(g_desc_text.empty() && g_start_mode ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: abrir la lista y elegir.\nLB / RB o Q / E (o el desplegable Sección): cambiar de sección.\n\nTodo se guarda en settings.ini y se aplica al pulsar JUGAR. Dentro del juego, F1 abre estas mismas opciones."
+			                       : g_desc_text.empty() ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: abrir la lista y elegir.\nLB / RB o Q / E (o el desplegable Sección): cambiar de sección.\nB / Esc: volver al juego.\n\n(requiere reinicio): se guarda ya y se aplica en el próximo inicio. El resto se aplica al momento."
 			                                           : g_desc_text.c_str());
 			ImGui::PopTextWrapPos();
 			ImGui::EndChild();

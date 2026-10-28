@@ -585,7 +585,7 @@ Result ReadResult() {
 
 bool CheckLatest(Release* release, std::string* error) {
 	std::string body;
-	if (!HttpGet("https://api.github.com/repos/todojuegos67-bot/KytyPS5/releases/latest",
+	if (!HttpGet("https://api.github.com/repos/todojuegos67-bot/KytyPS5/releases?per_page=50",
 	             [&](const char* data, DWORD n, int64_t) {
 		             body.append(data, n);
 		             return body.size() < (8u << 20);
@@ -595,13 +595,20 @@ bool CheckLatest(Release* release, std::string* error) {
 		return false;
 	}
 	try {
-		const auto json = nlohmann::json::parse(body);
-		if (json.value("draft", false) || json.value("prerelease", false)) {
-			*error = "GitHub no devolvio ninguna version publicada.";
+		// (10-28c) Only the port's own releases (DemonsSoulsPC-*): releases/latest is the emulator's on purpose. The list
+		// comes newest first; the first published (not draft / prerelease) one with a DemonsSoulsPC-*.zip wins.
+		const auto list = nlohmann::json::parse(body);
+		if (!list.is_array()) {
+			*error = "Respuesta de GitHub no valida.";
 			return false;
 		}
-		release->tag    = json.value("tag_name", "");
+		for (const auto& json: list) {
+		if (json.value("draft", false) || json.value("prerelease", false)) continue;
+		const std::string tag = json.value("tag_name", "");
+		if (tag.rfind("DemonsSoulsPC-", 0) != 0) continue;
+		release->tag    = tag;
 		release->name   = json.value("name", "");
+		release->url.clear();
 		int64_t best    = -1;
 		for (const auto& a: json.value("assets", nlohmann::json::array())) {
 			const std::string name = a.value("name", "");
@@ -615,14 +622,10 @@ bool CheckLatest(Release* release, std::string* error) {
 				release->size  = size;
 			}
 		}
-		if (release->tag.empty()) {
-			*error = "GitHub no devolvio ninguna version.";
-			return false;
+		if (!release->url.empty()) return true;
 		}
-		if (release->url.empty()) {
-			*error = "La ultima version publicada (" + release->tag + ") no trae Demon's Souls PC (ningun DemonsSoulsPC-*.zip).";
-			return false;
-		}
+		*error = "No hay ninguna version del port (DemonsSoulsPC-*) publicada en GitHub.";
+		return false;
 	} catch (...) {
 		*error = "Respuesta de GitHub no valida.";
 		return false;
