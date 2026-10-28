@@ -19,6 +19,7 @@
 #include "SDL.h"
 #include "SDL_syswm.h"
 #include "imgui.h"
+#include "libs/trophy-cup.h"
 #include "imgui_internal.h" // ImGui::RegisterUserTexture (the background image)
 #if defined(_WIN32)
 #include "imgui_impl_sdl2.h"
@@ -724,8 +725,10 @@ void DrawTrophyTab(float unit) {
 		}
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 		const float r0 = 12.0f * unit;
-		dl->AddCircleFilled({at.x + 8 * unit + r0, at.y + h * 0.5f}, r0, ImGui::GetColorU32(r.earned ? grade_col[g] : grey));
-		const float tx = at.x + 16 * unit + 2 * r0;
+		// (10-28) The grade's cup next to an earned trophy (the popup's icon); a grey circle for the rest.
+		if (r.earned) Libs::Trophy::DrawCup(dl, at.x + 4 * unit, at.y + h * 0.5f - 18 * unit, 36 * unit, Libs::Trophy::CupColor(g));
+		else dl->AddCircleFilled({at.x + 8 * unit + r0, at.y + h * 0.5f}, r0, ImGui::GetColorU32(grey));
+		const float tx = at.x + 16 * unit + 2 * r0 + 6 * unit;
 		dl->AddText({tx, at.y + 4 * unit}, ImGui::GetColorU32(r.earned ? ImVec4 {1, 1, 1, 1} : grey),
 		            secret ? "Trofeo oculto" : r.name.c_str());
 		const std::string sub = secret ? std::string(grade_txt[g]) : std::string(grade_txt[g]) + " - " + r.detail;
@@ -1037,11 +1040,30 @@ void Draw(float width, float height) {
 	g_unit = unit;
 	const float footer  = (g_start_mode ? 250 : 150) * unit;
 	const bool  nvidia  = g_rt.pc.nvidia;
-	if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
+	// (10-28) The sections as a vertical list on the left (no tab strip to scroll): mouse, keyboard / D-pad navigation
+	// (A / Intro selects) and LB / RB or Q / E as before.
+	if (g_tab_request >= 0 && g_tab_request < kTabCount) g_tab = g_tab_request;
+	if (g_tab < 0 || g_tab >= kTabCount) g_tab = 0;
+	{
+		const float side_w = 210.0f * unit;
+		ImGui::BeginChild("##sections", {side_w, size.y - footer - ImGui::GetCursorPosY()}, ImGuiChildFlags_Borders);
+		ImGui::PushFont(nullptr, 22.0f * unit);
 		for (int t = 0; t < kTabCount; t++) {
-			const ImGuiTabItemFlags flags = g_tab_request == t ? ImGuiTabItemFlags_SetSelected : 0;
-			if (!ImGui::BeginTabItem((std::string(I18n::T(tabs[t])) + "###tab" + std::to_string(t)).c_str(), nullptr, flags)) continue;
-			g_tab = t;
+			const bool on = g_tab == t;
+			if (on) ImGui::PushStyleColor(ImGuiCol_Text, kGold);
+			if (ImGui::Selectable((std::string(I18n::T(tabs[t])) + "###sec" + std::to_string(t)).c_str(), on, ImGuiSelectableFlags_None,
+			                      {0, 40.0f * unit}))
+				g_tab = t;
+			if (on) ImGui::PopStyleColor();
+			if (on && g_tab_request == t) ImGui::SetScrollHereY();
+		}
+		ImGui::PopFont();
+		ImGui::EndChild();
+		ImGui::SameLine();
+	}
+	ImGui::BeginGroup();
+	{
+		for (int once = 0, t = g_tab; once < 1; once++) {
 			const float page_h = size.y - footer - ImGui::GetCursorPosY();
 			const float list_w = ImGui::GetContentRegionAvail().x * 0.62f;
 			ImGui::BeginChild("##page", {list_w, page_h}, ImGuiChildFlags_None);
@@ -1378,16 +1400,15 @@ void Draw(float width, float height) {
 			ImGui::PopFont();
 			ImGui::Separator();
 			ImGui::PushTextWrapPos(0.0f);
-			ImGui::TextUnformatted(g_desc_text.empty() && g_start_mode ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: siguiente valor.\nLB / RB o Q / E: cambiar de pestaña.\n\nTodo se guarda en settings.ini y se aplica al pulsar JUGAR. Dentro del juego, F1 abre estas mismas opciones."
-			                       : g_desc_text.empty() ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: siguiente valor.\nLB / RB o Q / E: cambiar de pestaña.\nB / Esc: volver al juego.\n\n(requiere reinicio): se guarda ya y se aplica en el próximo inicio. El resto se aplica al momento."
+			ImGui::TextUnformatted(g_desc_text.empty() && g_start_mode ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: siguiente valor.\nLB / RB o Q / E (o la lista de la izquierda): cambiar de sección.\n\nTodo se guarda en settings.ini y se aplica al pulsar JUGAR. Dentro del juego, F1 abre estas mismas opciones."
+			                       : g_desc_text.empty() ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: siguiente valor.\nLB / RB o Q / E (o la lista de la izquierda): cambiar de sección.\nB / Esc: volver al juego.\n\n(requiere reinicio): se guarda ya y se aplica en el próximo inicio. El resto se aplica al momento."
 			                                           : g_desc_text.c_str());
 			ImGui::PopTextWrapPos();
 			ImGui::EndChild();
 			ImGui::PopStyleColor();
-			ImGui::EndTabItem();
 		}
-		ImGui::EndTabBar();
 	}
+	ImGui::EndGroup();
 	g_tab_request = -1;
 	g_popup       = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
 	if (live_changed) ApplyLive(s);

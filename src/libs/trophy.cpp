@@ -440,6 +440,7 @@ void Record(State& s, int id) {
 	if (it != s.trophies.end()) {
 		t->grade = it->second.info.grade;
 		t->name  = it->second.info.name;
+		t->detail = it->second.info.detail;
 		t->icon_w = it->second.icon_w, t->icon_h = it->second.icon_h, t->icon = it->second.icon;
 	} else {
 		t->name = "Trophy " + std::to_string(id);

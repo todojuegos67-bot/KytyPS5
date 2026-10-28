@@ -24,6 +24,7 @@ struct Toast {
 	std::string           label;      // "Trofeo obtenido", in the game's language
 	std::string           grade_text; // "Bronce" ...
 	std::string           name;
+	std::string           detail; // (10-28) the description, in the game's language
 	int                   icon_w = 0, icon_h = 0;
 	std::vector<uint32_t> icon; // RGBA8 (IM_COL32 order), icon_w * icon_h; empty: none
 };
@@ -40,7 +41,7 @@ void Preload(); // the package read in the background (the emulator, once /app0 
 
 // The popup to draw now (nullptr: none) and its age in seconds; the presenter thread calls it each frame.
 std::shared_ptr<const Toast> CurrentToast(float* seconds);
-constexpr float TOAST_SECONDS = 5.6f; // slide in 0.35 s, shown, fade out the last 0.6 s
+constexpr float TOAST_SECONDS = 6.0f; // slide in 0.35 s, shown, fade out the last 0.6 s
 
 } // namespace Libs::Trophy
 

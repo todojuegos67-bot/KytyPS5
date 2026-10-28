@@ -1,5 +1,6 @@
 #include "local/port-live.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "libs/trophy-cup.h"
 
 #include "SDL.h"
 #include "common/assert.h"
@@ -1159,15 +1160,16 @@ struct SystemOverlay::Impl {
 		auto*       draw = ImGui::GetForegroundDrawList();
 		// (The names in Japanese, Chinese, Korean, Cyrillic...: the CJK face; Latin text: the panels' face.)
 		bool wide = false;
-		for (const unsigned char c: toast.name + toast.label) wide = wide || c >= 0xd0;
+		for (const unsigned char c: toast.name + toast.label + toast.detail) wide = wide || c >= 0xd0;
 		ImFont*     font      = wide && dialog_font != nullptr ? dialog_font : hud_font != nullptr ? hud_font : ImGui::GetFont();
 		const float big = 22.0f * unit, small = 16.0f * unit;
 		const float icon      = 64.0f * unit, pad = 12.0f * unit;
 		const std::string top = toast.grade_text.empty() ? toast.label : toast.grade_text + "  \xc2\xb7  " + toast.label;
 		const float text_w = std::max(font->CalcTextSizeA(big, FLT_MAX, 0.0f, toast.name.c_str()).x,
 		                              font->CalcTextSizeA(small, FLT_MAX, 0.0f, top.c_str()).x + 18.0f * unit);
-		const float w      = std::min(pad * 3.0f + icon + text_w + 8.0f * unit, static_cast<float>(region.extent.width) * 0.45f);
-		const float h      = icon + pad * 2.0f;
+		const float detail_w = std::min(font->CalcTextSizeA(small, FLT_MAX, 0.0f, toast.detail.c_str()).x, 520.0f * unit);
+		const float w      = std::min(pad * 3.0f + icon + std::max(text_w, detail_w) + 8.0f * unit, static_cast<float>(region.extent.width) * 0.45f);
+		const float h      = icon + pad * 2.0f + (toast.detail.empty() ? 0.0f : small + 4.0f * unit);
 		const float margin = 28.0f * unit;
 		const float x1_end = static_cast<float>(region.offset.x) + static_cast<float>(region.extent.width) - margin;
 		const float x0     = x1_end - w + (1.0f - ease) * (w + margin + 4.0f);
@@ -1177,33 +1179,13 @@ struct SystemOverlay::Impl {
 		draw->AddRectFilled({x0 + 3.0f * unit, y0 + 4.0f * unit}, {x0 + w + 3.0f * unit, y0 + h + 4.0f * unit}, IM_COL32(0, 0, 0, a(70)), round);
 		draw->AddRectFilled({x0, y0}, {x0 + w, y0 + h}, IM_COL32(28, 29, 33, a(235)), round);
 		draw->AddRect({x0, y0}, {x0 + w, y0 + h}, IM_COL32(255, 255, 255, a(22)), round, 0, 1.0f * unit);
-		// The icon.
+		// (10-28) The icon: a cup in the grade's colour (bronze / silver / gold / platinum).
 		const float ix = x0 + pad, iy = y0 + pad;
-		if (!toast.icon.empty() && toast.icon_w > 0 && toast.icon_h > 0) {
-			const float cw = icon / static_cast<float>(toast.icon_w), ch = icon / static_cast<float>(toast.icon_h);
-			for (int y = 0; y < toast.icon_h; y++) {
-				for (int x = 0; x < toast.icon_w; x++) {
-					const uint32_t p  = toast.icon[static_cast<size_t>(y) * toast.icon_w + x];
-					const uint32_t pa = static_cast<uint32_t>(static_cast<float>(p >> 24u) * alpha);
-					if (pa == 0) continue;
-					draw->AddRectFilled({ix + x * cw, iy + y * ch}, {ix + (x + 1) * cw + 0.5f, iy + (y + 1) * ch + 0.5f},
-					                    (p & 0x00ffffffu) | (pa << 24u));
-				}
-			}
-		} else {
-			draw->AddRectFilled({ix, iy}, {ix + icon, iy + icon}, IM_COL32(60, 62, 70, a(255)), 6.0f * unit);
-		}
-		// The grade's color: a small trophy cup mark, then the grade and the label.
-		ImU32 grade = IM_COL32(205, 127, 70, a(255)); // bronze
-		if (toast.grade == 1) grade = IM_COL32(170, 200, 235, a(255));
-		if (toast.grade == 2) grade = IM_COL32(236, 196, 72, a(255));
-		if (toast.grade == 3) grade = IM_COL32(200, 205, 212, a(255));
+		const ImU32 grade = Libs::Trophy::CupColor(toast.grade >= 1 && toast.grade <= 4 ? toast.grade : 4, alpha);
+		draw->AddRectFilled({ix, iy}, {ix + icon, iy + icon}, IM_COL32(44, 46, 54, a(255)), 10.0f * unit);
+		Libs::Trophy::DrawCup(draw, ix + icon * 0.1f, iy + icon * 0.08f, icon * 0.8f, grade, alpha);
 		const float tx = ix + icon + pad, ty = iy + 6.0f * unit;
-		const float cup = 12.0f * unit;
-		draw->AddRectFilled({tx, ty + 2.0f * unit}, {tx + cup, ty + cup * 0.75f}, grade, cup * 0.35f, ImDrawFlags_RoundCornersBottom);
-		draw->AddRectFilled({tx + cup * 0.42f, ty + cup * 0.75f}, {tx + cup * 0.58f, ty + cup}, grade);
-		draw->AddRectFilled({tx + cup * 0.2f, ty + cup}, {tx + cup * 0.8f, ty + cup + 2.0f * unit}, grade);
-		float lx = tx + cup + 6.0f * unit;
+		float lx = tx;
 		if (!toast.grade_text.empty()) {
 			draw->AddText(font, small, {lx, ty}, grade, toast.grade_text.c_str());
 			lx += font->CalcTextSizeA(small, FLT_MAX, 0.0f, toast.grade_text.c_str()).x;
@@ -1213,6 +1195,8 @@ struct SystemOverlay::Impl {
 		draw->AddText(font, small, {lx, ty}, IM_COL32(170, 172, 180, a(255)), toast.label.c_str());
 		const ImVec4 clip {x0, y0, x0 + w - pad, y0 + h};
 		draw->AddText(font, big, {tx, ty + small + 8.0f * unit}, IM_COL32(245, 245, 247, a(255)), toast.name.c_str(), nullptr, 0.0f, &clip);
+		if (!toast.detail.empty())
+			draw->AddText(font, small, {tx, ty + small + big + 14.0f * unit}, IM_COL32(190, 192, 200, a(255)), toast.detail.c_str(), nullptr, 0.0f, &clip);
 		return {x0, y0, x0 + w, y0 + h};
 	}
 

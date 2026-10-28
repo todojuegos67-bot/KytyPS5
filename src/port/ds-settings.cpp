@@ -917,7 +917,7 @@ bool FixedFg(const Settings& s) {
 void RtAllOff(Settings* s) {
 	s->rt_reflections = s->rt_sun = s->rt_fog = s->rt_particles = s->rt_metal = s->rt_ao = false;
 	// (10-28) and the screen-space set / new passes (rt_experimental itself stays as chosen)
-	s->rt_ss_refl = s->rt_ssgi = s->rt_shadows = s->ao = s->torch = "0";
+	s->rt_ss_refl = s->rt_ssgi = s->rt_shadows = s->ao = s->torch = s->godrays = s->rt_lamps = "0";
 	s->lens_flare = false;
 }
 
@@ -946,7 +946,6 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->reflections    = "normal";
 		s->res            = "fsr-calidad";
 		s->sharpness      = "0.75";
-		s->godrays        = "2"; // (10-25) Luz volumetrica Medio
 	} else if (preset == "equilibrado") {
 		// (10-25) The user's capture: DLSS Calidad (K), sharpness 100 %, textures Maximo, distance and shadows Alto, Detail
 		// High, Reflections / Object Fade High, AA Sharpness High, x16, extra sharp textures, all the post-processing.
@@ -960,7 +959,6 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->sharpness = "1";
 		s->res       = "dlss-calidad";
 		s->dlss_preset = "K";
-		s->godrays     = "1"; // (10-25) Luz volumetrica Bajo
 	} else if (preset == "ultra") {
 		max();
 		s->detail   = "muy-alto";
@@ -987,11 +985,12 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		post_on();
 		s->res       = "fsr-calidad";
 		s->sharpness = "1";
-		s->godrays   = "2"; // (10-25) Luz volumetrica Medio
 	} else {
 		max();
 	}
-	if (preset != "maximo") RtAllOff(s); // (10-26) every Souls mode: ray tracing No
+	// (10-28, the emulator launcher's rule) Every mode / preset: every RT effect No (Reflejos RT, Luz RT, Luz volumetrica,
+	// Oclusion ambiental, Luz de antorchas RT, Destellos de lente, Sombras RT and the hardware rows); enabled by hand after.
+	RtAllOff(s);
 }
 
 
@@ -1182,40 +1181,8 @@ std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
 	RtAllOff(s);
 	s->rt_lamps = "0";
 	s->godrays  = "0";
-	const double refl = rtk * (2.5 + 0.3 * mpx) / 1.0;
-	// (10-28) Hardware RT is experimental now (rt_experimental): the Configurador only picks it when that switch is on.
-	if (s->rt_hw_exp && vram >= 12 && !s->ram16_boost && ms + refl <= target) {
-		s->rt_reflections = true;
-		ms += refl;
-	}
-	if (rtf > 0 && ms + 0.2 * rtk <= target && gpu >= 25) {
-		s->godrays = gpu >= 80 ? "2" : "1";
-		ms += 0.2 * rtk;
-	}
-	if (s->rt_hw_exp && vram >= 16 && ms + 2.5 * rtk <= target) {
-		s->rt_lamps = gpu >= 120 ? "2" : "1";
-		ms += 2.5 * rtk;
-	}
-	// (10-28) The screen-space set, conservatively (its launcher costs on the 5080, scaled by the GPU score): only Bajo, only
-	// what still fits, and only on the stronger cards. Never Oclusion ambiental (its composite costs ~7 ms in game now),
-	// Luz RT (SSGI) or Hibrido.
-	const double g = 100.0 / std::max(gpu, 4);
-	if (gpu >= 55 && ms + 0.4 * g <= target) { // Sombras RT Bajo ~0,3 ms
-		s->rt_shadows = "1";
-		ms += 0.4 * g;
-	}
-	if (gpu >= 55 && ms + 0.4 * g <= target) { // Luz de antorchas RT Bajo ~0,3 ms
-		s->torch = "1";
-		ms += 0.4 * g;
-	}
-	if (gpu >= 55 && ms + 0.15 * g <= target) { // Destellos de lente ~0,1 ms
-		s->lens_flare = true;
-		ms += 0.15 * g;
-	}
-	if (gpu >= 80 && vram >= 12 && ms + 0.8 * g <= target) { // Reflejos RT Bajo ~0,6 ms
-		s->rt_ss_refl = "1";
-		ms += 0.8 * g;
-	}
+	// (10-28, the emulator launcher's rule) The Configurador's tiers leave every RT effect at No: the user turns them on by hand.
+	(void)rtk;
 	const auto label = [](const Choice* items, int count, const std::string& id) {
 		for (int i = 0; i < count; i++)
 			if (id == items[i].id) return items[i].label;
