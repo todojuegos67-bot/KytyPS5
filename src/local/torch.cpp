@@ -307,8 +307,10 @@ bool EnsureImages(GraphicContext& graphics, vk::Extent2D extent) {
 	for (Img* img: all) Retire(graphics, *img);
 	g_tc.ready = false, g_tc.history_valid = false, g_tc.shadow_history = false;
 	g_tc.extent = extent;
+	// (gpu-1028) the shadow's images at half resolution (TraceExtent)
+	const vk::Extent2D half {(extent.width + 1) / 2, (extent.height + 1) / 2};
 	for (Img* img: all)
-		if (!MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, extent, *img)) return false;
+		if (!MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, (img == &g_tc.out || img == &g_tc.flare) ? extent : half, *img)) return false;
 	return true;
 }
 
@@ -481,6 +483,7 @@ void Record(vk::CommandBuffer command, const UpscaleInputs& inputs, const RtRefl
 		command.pushConstants(g_tc.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 		if (mode == 0) command.dispatch(32, 18, 1);
 		else if (mode == 1) command.dispatch(1, 1, 1);
+		else if (mode == 4 || mode == 5 || mode == 7) command.dispatch((gx + 1) / 2, (gy + 1) / 2, 1); // (half resolution)
 		else command.dispatch(gx, gy, 1);
 		Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 		        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
@@ -530,7 +533,7 @@ bool RecordHybrid(GraphicContext& graphics, vk::CommandBuffer command, const Ups
 	std::memcpy(push.proj, tp.proj, sizeof(push.proj));
 	std::memcpy(push.depth_map, tp.depth_map, sizeof(push.depth_map));
 	push.size[0] = tp.size[0], push.size[1] = tp.size[1], push.size[2] = flipy > 0.5f ? -1.0f : 1.0f;
-	push.misc[0] = tp.misc[1], push.misc[1] = tp.misc[2] & 1;
+	push.misc[0] = tp.misc[1], push.misc[1] = tp.misc[2] & 1, push.misc[2] = 1; // (half-resolution trace)
 	const auto gen = vk::ImageLayout::eGeneral;
 	const vk::DescriptorImageInfo  src_info {g_tc.point, g_tc.raw.view, gen};
 	const vk::DescriptorImageInfo  depth_info {g_tc.point, inputs.depth.view, inputs.depth.layout};
@@ -556,7 +559,7 @@ bool RecordHybrid(GraphicContext& graphics, vk::CommandBuffer command, const Ups
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_tc.hw_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_tc.hw_layout, 0, HwBindings, writes);
 	command.pushConstants(g_tc.hw_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-	command.dispatch((inputs.color.extent.width + 7) / 8, (inputs.color.extent.height + 7) / 8, 1);
+	command.dispatch((inputs.color.extent.width / 2 + 8) / 8, (inputs.color.extent.height / 2 + 8) / 8, 1);
 	Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 	        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	++g_tc.hw_frames;
@@ -698,7 +701,7 @@ bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.misc[1] = static_cast<int32_t>(g_tc.frame & 0x7fffffff);
 	push.misc[2] = (row0_up ? 1 : 0) | (gbuf_ok ? 2 : 0) | (inputs.motion.view != nullptr ? 4 : 0) | (debug ? 8 : 0);
 	push.misc[3] = g_tc.game_exposure ? static_cast<int32_t>(inputs.exposure_index) : static_cast<int32_t>(ExposureIdx);
-	push.dec[0] = normal_code, push.dec[1] = rough_code;
+	push.dec[0] = normal_code, push.dec[1] = rough_code, push.dec[2] = 1; // (dec.z: the shadow passes' half-resolution shift)
 
 	g_timing_entry = static_cast<uint32_t>(g_tc.written % 8);
 	g_timing_open  = g_tc.pool != nullptr && g_tc.written < g_tc.read + 8;
