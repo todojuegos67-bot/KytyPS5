@@ -7,6 +7,7 @@
 // the menu offers.
 
 #include "port/ds-port.h"
+#include <functional>
 #include "port/ds-update.h"
 #include "port/ds-precompile.h"
 #include "port/ds-i18n.h"
@@ -319,7 +320,10 @@ void Describe(const char* label, const char* tip) {
 }
 
 // The row itself: `current` changed by `step` (-1 / +1) within count; true when it changed.
-bool SelectorRow(const char* label, bool restart, int count, int& current, const char* value, const char* tip) {
+// (10-28c) `list`: the label of each value; when set, a click / Cross / Enter opens a vertical dropdown list of
+// every value below the row (Left/Right still cycle as a shortcut). Without it (Sí/No rows) a click cycles.
+bool SelectorRow(const char* label, bool restart, int count, int& current, const char* value, const char* tip,
+                 const std::function<const char*(int)>* list = nullptr) {
 	ImGui::PushID(label);
 	const bool  disabled = (ImGui::GetCurrentContext()->CurrentItemFlags & ImGuiItemFlags_Disabled) != 0;
 	const float h        = 50.0f * g_unit;
@@ -337,7 +341,10 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 		    ImGui::IsKeyPressed(ImGuiKey_GamepadLStickRight))
 			step = +1;
 	}
-	if (clicked && !disabled) {
+	bool picked = false;
+	if (clicked && !disabled && list != nullptr && count > 1) {
+		ImGui::OpenPopup("##list");
+	} else if (clicked && !disabled) {
 		// (A click on the left arrow's half goes back.)
 		const float x = ImGui::GetIO().MousePos.x;
 		step          = ImGui::IsMouseReleased(0) && x < at.x + w * 0.72f && x > at.x + w * 0.45f ? -1 : +1;
@@ -369,7 +376,36 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 		dl->AddTriangleFilled({mid - half, cy}, {mid - half + s2, cy - s2}, {mid - half + s2, cy + s2}, arrow);
 		dl->AddTriangleFilled({mid + half, cy}, {mid + half - s2, cy - s2}, {mid + half - s2, cy + s2}, arrow);
 	}
+	if (list != nullptr) {
+		const float lw = std::max(320.0f * g_unit, w * 0.45f);
+		ImGui::SetNextWindowPos({at.x + w - lw, at.y + h});
+		ImGui::SetNextWindowSizeConstraints({lw, 0}, {lw, std::min(ImGui::GetIO().DisplaySize.y * 0.6f, 520.0f * g_unit)});
+		if (ImGui::BeginPopup("##list")) { // g_popup is set from IsPopupOpen: Circle closes this list, not the menu
+			for (int i = 0; i < count; i++) {
+				const bool on = i == current;
+				ImGui::PushID(i);
+				if (on) ImGui::PushStyleColor(ImGuiCol_Text, kGold);
+				if (ImGui::Selectable(I18n::T((*list)(i)), on, ImGuiSelectableFlags_None, {0, 40.0f * g_unit})) {
+					if (i != current) {
+						current = i;
+						picked  = true;
+					}
+					ImGui::CloseCurrentPopup();
+				}
+				if (on) {
+					ImGui::PopStyleColor();
+					if (ImGui::IsWindowAppearing()) {
+						ImGui::SetItemDefaultFocus();
+						ImGui::SetScrollHereY(0.5f);
+					}
+				}
+				ImGui::PopID();
+			}
+			ImGui::EndPopup();
+		}
+	}
 	ImGui::PopID();
+	if (picked) return true;
 	if (step == 0 || count <= 1) return false;
 	current = (current + step + count) % count;
 	return true;
@@ -382,7 +418,8 @@ bool ComboRow(const char* label, bool restart, int count, const Item* items, std
 	for (int i = 0; i < count; i++)
 		if (value == id(items[i])) current = i;
 	if (count == 0) return false;
-	if (!SelectorRow(label, restart, count, current, text(items[current]), tip)) return false;
+	const std::function<const char*(int)> list = [&](int i) -> const char* { return text(items[i]); };
+	if (!SelectorRow(label, restart, count, current, text(items[current]), tip, &list)) return false;
 	value = id(items[current]);
 	return true;
 }
