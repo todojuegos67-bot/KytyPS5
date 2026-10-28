@@ -232,10 +232,19 @@ static void InitOnce() {
 	});
 }
 
+// The loader's own exported trampolines: they dispatch through the handle they get (physical device, device), so
+// they work whichever instance owns it. 10-28, Wildlands: DXVK made instances A and B, destroyed B and then created
+// a device on A's physical device; looking the instance up by "the last one" gave a destroyed one (null) and the game
+// died in vkCreateDevice. Instance-level calls on a physical device now always go through these.
+static PFN_vkVoidFunction LoaderExport(const char* name) {
+	return g_real.loader != nullptr ? reinterpret_cast<PFN_vkVoidFunction>(GetProcAddress(g_real.loader, name)) : nullptr;
+}
+
 PFN_vkVoidFunction RealDeviceProc(const char* name) {
 	PFN_vkVoidFunction f = nullptr;
 	if (g_real.device != VK_NULL_HANDLE && g_real.gdpa != nullptr) f = g_real.gdpa(g_real.device, name);
-	if (f == nullptr && g_real.gipa != nullptr) f = g_real.gipa(g_real.instance, name);
+	if (f == nullptr && g_real.gipa != nullptr && g_real.instance != VK_NULL_HANDLE) f = g_real.gipa(g_real.instance, name);
+	if (f == nullptr) f = LoaderExport(name);
 	return f;
 }
 
@@ -243,7 +252,8 @@ void LoadDeviceFunctions(VkDevice device) {
 #define INJ_FN(name)                                                                                                 \
 	{                                                                                                                \
 		auto f = g_real.gdpa(device, #name);                                                                         \
-		if (f == nullptr) f = g_real.gipa(g_real.instance, #name);                                                   \
+		if (f == nullptr && g_real.instance != VK_NULL_HANDLE) f = g_real.gipa(g_real.instance, #name);              \
+		if (f == nullptr) f = LoaderExport(#name);                                                                   \
 		if (f != nullptr) g_real.name = reinterpret_cast<PFN_##name>(f);                                             \
 	}
 #include "device_functions.inl"
@@ -295,11 +305,94 @@ bool EnsureSlots() {
 	return true;
 }
 
+// Live instances (any number, created and destroyed in any order), which live instances enumerated each physical
+// device, and every device we created (DXVK may keep several alive; the one that makes the swapchain is "active").
+std::mutex g_objects_mutex;
+std::vector<VkInstance> g_live_instances;
+std::vector<std::pair<VkPhysicalDevice, VkInstance>> g_physical_owners;
+struct DeviceState {
+	VkInstance       instance = VK_NULL_HANDLE;
+	VkPhysicalDevice physical = VK_NULL_HANDLE;
+	Queues           queues;
+};
+std::vector<std::pair<VkDevice, DeviceState>> g_devices;
+
+bool Live(VkInstance instance) {
+	return std::find(g_live_instances.begin(), g_live_instances.end(), instance) != g_live_instances.end();
+}
+// The live instance that enumerated `physical` (latest first), else the last live instance, else none.
+VkInstance InstanceFor(VkPhysicalDevice physical) {
+	std::lock_guard lock(g_objects_mutex);
+	for (auto it = g_physical_owners.rbegin(); it != g_physical_owners.rend(); ++it)
+		if (it->first == physical && Live(it->second)) return it->second;
+	return g_live_instances.empty() ? VK_NULL_HANDLE : g_live_instances.back();
+}
+DeviceState* FindDevice(VkDevice device) {
+	for (auto& [d, st]: g_devices) if (d == device) return &st;
+	return nullptr;
+}
+bool Known(VkDevice device) {
+	std::lock_guard lock(g_objects_mutex);
+	return FindDevice(device) != nullptr;
+}
+
+void ReleaseActiveObjects() {
+	// Our objects on the active device (it stays alive: another device takes over, or it is about to be destroyed).
+	if (R().device == VK_NULL_HANDLE) return;
+	R().vkDeviceWaitIdle(R().device);
+	analyzer::Shutdown();
+	overlay::OnDeviceDestroyed();
+	framegen::OnDeviceDestroyed();
+	for (auto& s: g_slots) {
+		if (s.fence) R().vkDestroyFence(R().device, s.fence, nullptr);
+		if (s.done) R().vkDestroySemaphore(R().device, s.done, nullptr);
+	}
+	if (g_pool) R().vkDestroyCommandPool(R().device, g_pool, nullptr);
+	g_pool = VK_NULL_HANDLE;
+	g_slots = {};
+	g_swap = {};
+}
+
+void Activate(VkDevice device) {
+	DeviceState st;
+	{
+		std::lock_guard lock(g_objects_mutex);
+		const DeviceState* found = FindDevice(device);
+		if (found == nullptr) return;
+		st = *found;
+	}
+	auto& r = R();
+	r.device   = device;
+	r.physical = st.physical;
+	if (Live(st.instance)) r.instance = st.instance;
+	r.gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(LoaderExport("vkGetDeviceProcAddr"));
+	LoadDeviceFunctions(device);
+	Q() = st.queues;
+	g_presents = 0;
+	Log("active device %p (instance %p), frame generation queues %s", static_cast<void*>(device), static_cast<void*>(st.instance),
+	    st.queues.fg_queues_ok ? "yes" : "no");
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Hook_EnumeratePhysicalDevices(VkInstance instance, uint32_t* count, VkPhysicalDevice* devices) {
+	auto f = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(LoaderExport("vkEnumeratePhysicalDevices"));
+	VkResult r = f(instance, count, devices);
+	if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && devices != nullptr) {
+		std::lock_guard lock(g_objects_mutex);
+		for (uint32_t i = 0; i < *count; ++i) g_physical_owners.emplace_back(devices[i], instance);
+	}
+	return r;
+}
+
 VKAPI_ATTR void VKAPI_CALL Hook_DestroyInstance(VkInstance instance, const VkAllocationCallbacks* alloc) {
-	auto f = reinterpret_cast<PFN_vkDestroyInstance>(R().gipa(instance, "vkDestroyInstance"));
+	auto f = reinterpret_cast<PFN_vkDestroyInstance>(LoaderExport("vkDestroyInstance"));
 	Log("vkDestroyInstance %p", static_cast<void*>(instance));
 	f(instance, alloc);
-	if (instance == R().instance) R().instance = VK_NULL_HANDLE;
+	std::lock_guard lock(g_objects_mutex);
+	g_live_instances.erase(std::remove(g_live_instances.begin(), g_live_instances.end(), instance), g_live_instances.end());
+	// Only this instance's own entries go (another live instance may have enumerated the same physical device handle).
+	g_physical_owners.erase(std::remove_if(g_physical_owners.begin(), g_physical_owners.end(),
+	                                       [&](const auto& e) { return e.second == instance; }), g_physical_owners.end());
+	if (R().instance == instance) R().instance = g_live_instances.empty() ? VK_NULL_HANDLE : g_live_instances.back();
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateWin32SurfaceKHR(VkInstance instance, const VkWin32SurfaceCreateInfoKHR* info,
@@ -311,10 +404,17 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateWin32SurfaceKHR(VkInstance instance, c
 
 VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
                                                  const VkAllocationCallbacks* alloc, VkDevice* device) {
-	auto& r = R();
-	Log("vkCreateDevice (instance %p)", static_cast<void*>(r.instance));
-	auto  get_families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(r.gipa(r.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
-	auto  create = reinterpret_cast<PFN_vkCreateDevice>(r.gipa(r.instance, "vkCreateDevice"));
+	const VkInstance owner = InstanceFor(physical);
+	Log("vkCreateDevice (physical device %p, instance %p)", static_cast<void*>(physical), static_cast<void*>(owner));
+	auto get_families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(LoaderExport("vkGetPhysicalDeviceQueueFamilyProperties"));
+	auto create = reinterpret_cast<PFN_vkCreateDevice>(LoaderExport("vkCreateDevice"));
+	auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(LoaderExport("vkGetPhysicalDeviceProperties"));
+	auto get_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(LoaderExport("vkGetDeviceQueue"));
+	if (get_families == nullptr || create == nullptr || get_props == nullptr || get_queue == nullptr) {
+		Log("loader exports missing: device created without changes");
+		auto f = reinterpret_cast<PFN_vkCreateDevice>(LoaderExport("vkCreateDevice"));
+		return f != nullptr ? f(physical, info, alloc, device) : VK_ERROR_INITIALIZATION_FAILED;
+	}
 	uint32_t n = 0;
 	get_families(physical, &n, nullptr);
 	std::vector<VkQueueFamilyProperties> fam(n);
@@ -372,46 +472,59 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(VkPhysicalDevice physical, cons
 		result = create(physical, info, alloc, device);
 	}
 	if (result != VK_SUCCESS) return result;
-	r.physical = physical;
-	r.device = *device;
-	g_presents = 0;
-	r.gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(r.gipa(r.instance, "vkGetDeviceProcAddr"));
-	LoadDeviceFunctions(*device);
 	VkPhysicalDeviceProperties props {};
-	r.vkGetPhysicalDeviceProperties(physical, &props);
+	get_props(physical, &props);
 	Log("device: %s (Vulkan %u.%u.%u, driver %u)", props.deviceName, VK_API_VERSION_MAJOR(props.apiVersion),
 	    VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion), props.driverVersion);
-	auto& q = Q();
-	q = {};
+	DeviceState st;
+	st.instance = owner;
+	st.physical = physical;
+	auto& q = st.queues;
 	q.graphics_family = g;
 	q.game_family = g;
 	if (ok) {
 		q.compute_family = c;
-		r.vkGetDeviceQueue(*device, g, present_index, &q.present);
-		r.vkGetDeviceQueue(*device, c, compute_base, &q.async_compute);
-		r.vkGetDeviceQueue(*device, c, compute_base + 1, &q.image_acquire);
+		get_queue(*device, g, present_index, &q.present);
+		get_queue(*device, c, compute_base, &q.async_compute);
+		get_queue(*device, c, compute_base + 1, &q.image_acquire);
 		q.fg_queues_ok = q.present && q.async_compute && q.image_acquire;
 	}
-	Log("frame generation queues: %s (graphics family %u present index %u, compute family %u from index %u)",
-	    q.fg_queues_ok ? "created" : "NOT available", g, present_index, c, compute_base);
+	Log("device %p: frame generation queues %s (graphics family %u present index %u, compute family %u from index %u)",
+	    static_cast<void*>(*device), q.fg_queues_ok ? "created" : "NOT available", g, present_index, c, compute_base);
+	{
+		std::lock_guard lock(g_objects_mutex);
+		g_devices.emplace_back(*device, st);
+	}
+	if (R().device == VK_NULL_HANDLE) Activate(*device);  // else: becomes active when it makes a swapchain
 	return result;
 }
 
 VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device, const VkAllocationCallbacks* alloc) {
-	if (device == R().device) {
-		R().vkDeviceWaitIdle(device);
-		analyzer::Shutdown();
-		overlay::OnDeviceDestroyed();
-		framegen::OnDeviceDestroyed();
-		Log("device destroyed after %llu presents", static_cast<unsigned long long>(g_presents));
-		g_pool = VK_NULL_HANDLE;  // (freed with the device)
-		g_slots = {};
+	const bool active = device != VK_NULL_HANDLE && device == R().device;
+	if (active) {
+		std::lock_guard lock(QueueLock());
+		ReleaseActiveObjects();
+		Log("device %p destroyed after %llu presents", static_cast<void*>(device), static_cast<unsigned long long>(g_presents));
+	} else {
+		Log("device %p destroyed (not active)", static_cast<void*>(device));
 	}
-	R().vkDestroyDevice(device, alloc);
-	if (device == R().device) {
+	auto destroy = R().vkDestroyDevice != nullptr ? R().vkDestroyDevice
+	                                              : reinterpret_cast<PFN_vkDestroyDevice>(LoaderExport("vkDestroyDevice"));
+	destroy(device, alloc);
+	{
+		std::lock_guard lock(g_objects_mutex);
+		g_devices.erase(std::remove_if(g_devices.begin(), g_devices.end(), [&](const auto& e) { return e.first == device; }),
+		                g_devices.end());
+	}
+	if (active) {
 		R().device = VK_NULL_HANDLE;
 		Q() = {};
-		g_swap = {};
+		VkDevice next = VK_NULL_HANDLE;
+		{
+			std::lock_guard lock(g_objects_mutex);
+			if (!g_devices.empty()) next = g_devices.back().first;
+		}
+		if (next != VK_NULL_HANDLE) Activate(next);
 	}
 }
 
@@ -457,6 +570,12 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_GetSwapchainImagesKHR(VkDevice device, VkSwa
 
 VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* info,
                                                        const VkAllocationCallbacks* alloc, VkSwapchainKHR* out) {
+	if (device != R().device && Known(device)) {
+		std::lock_guard lock(QueueLock());
+		Log("swapchain on device %p: it becomes the active device", static_cast<void*>(device));
+		ReleaseActiveObjects();
+		Activate(device);
+	}
 	VkSwapchainCreateInfoKHR ci = *info;
 	ci.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;  // the overlay's render pass
 	VkResult r;
@@ -633,7 +752,7 @@ const char* const kHiddenExtensions[] = {
 
 VKAPI_ATTR VkResult VKAPI_CALL Hook_EnumerateDeviceExtensionProperties(VkPhysicalDevice physical, const char* layer,
                                                                        uint32_t* count, VkExtensionProperties* props) {
-	auto real = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(R().gipa(R().instance, "vkEnumerateDeviceExtensionProperties"));
+	auto real = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(LoaderExport("vkEnumerateDeviceExtensionProperties"));
 	if (layer != nullptr) return real(physical, layer, count, props);
 	uint32_t n = 0;
 	VkResult r = real(physical, nullptr, &n, nullptr);
@@ -664,6 +783,7 @@ const HookEntry kHooks[] = {
     HOOK("vkGetDeviceProcAddr", Hook_GetDeviceProcAddr, true),
     HOOK("vkCreateDevice", Hook_CreateDevice, false),
     HOOK("vkDestroyInstance", Hook_DestroyInstance, false),
+    HOOK("vkEnumeratePhysicalDevices", Hook_EnumeratePhysicalDevices, false),
     HOOK("vkEnumerateDeviceExtensionProperties", Hook_EnumerateDeviceExtensionProperties, false),
     HOOK("vkCreateWin32SurfaceKHR", Hook_CreateWin32SurfaceKHR, false),
     HOOK("vkDestroyDevice", Hook_DestroyDevice, true),
@@ -699,10 +819,10 @@ const HookEntry* FindHook(const char* name) {
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Hook_GetDeviceProcAddr(VkDevice device, const char* name) {
-	if (R().gdpa == nullptr) R().gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(R().gipa(R().instance, "vkGetDeviceProcAddr"));
-	PFN_vkVoidFunction real = R().gdpa(device, name);
+	static auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(LoaderExport("vkGetDeviceProcAddr"));
+	PFN_vkVoidFunction real = gdpa(device, name);
 	const HookEntry* h = FindHook(name);
-	if (h != nullptr && h->device && real != nullptr && device == R().device) return h->fn;
+	if (h != nullptr && h->device && real != nullptr && Known(device)) return h->fn;
 	return real;
 }
 
@@ -721,6 +841,10 @@ VKAPI_ATTR VkResult VKAPI_CALL inj_vkCreateInstance(const VkInstanceCreateInfo* 
 	VkResult r = create(info, alloc, instance);
 	if (r == VK_SUCCESS) {
 		R().instance = *instance;
+		{
+			std::lock_guard lock(g_objects_mutex);
+			g_live_instances.push_back(*instance);
+		}
 		Log("vkCreateInstance -> %p", static_cast<void*>(*instance));
 		if (info->pApplicationInfo) R().api_version = info->pApplicationInfo->apiVersion;
 		Log("vkCreateInstance: %s / %s", info->pApplicationInfo && info->pApplicationInfo->pApplicationName ? info->pApplicationInfo->pApplicationName : "?",
