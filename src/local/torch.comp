@@ -317,39 +317,42 @@ void Track() {
 		if (push.motion.z > 0.0 && all(greaterThan(l0.xy, vec2(0))) && all(lessThan(l0.xy, vec2(1))))
 			l0.xy -= textureLod(motion_tex, l0.xy, 0).xy * push.motion.xy / rs;
 		int   best = -1;
-		float bd   = 2.5;
+		float bd   = 3.5;
 		for (int b = 0; b < nb; ++b) {
 			if (claimed[b]) continue;
 			float zr = bw[b].w / max(l0.z, 1e-3);
-			if (zr < 0.7 || zr > 1.4) continue;
+			if (zr < 0.5 || zr > 2.0) continue; // (stable-1028: the blob's nearest depth jitters; wider)
 			float dist = length((bw[b].yz - l0.xy) * vec2(CW, CH));
 			if (dist < bd) bd = dist, best = b;
 		}
 		float target_vis = 0.0;
 		if (best >= 0) {
 			claimed[best] = true;
-			l0.xy = mix(l0.xy, bw[best].yz, 0.5);
-			l0.z  = mix(l0.z, bw[best].w, 0.5);
-			// (natural-1028) time constants, not per-frame fractions: fade in 0.35 s, hue 0.4 s, slow power 2 s, fast 0.3 s
-			l0.w  = min(1.0, l0.w + dt / 0.35);
-			l1.rgb = mix(l1.rgb, hu[best], 1.0 - exp(-dt / 0.4));
-			l1.w   = mix(l1.w, pw[best], 1.0 - exp(-dt / 2.0));
-			l2.x   = mix(l2.x, pw[best], 1.0 - exp(-dt / 0.3));
+			// (stable-1028) heavy smoothing: the blob's centroid and depth jitter with the flame's pixels; the light is held
+			// still (the motion vectors carry it with the camera), position 0.6 s, depth 0.6 s, hue 2 s, power 4 s / 1 s
+			l0.xy = mix(l0.xy, bw[best].yz, 1.0 - exp(-dt / 0.6));
+			l0.z  = mix(l0.z, bw[best].w, 1.0 - exp(-dt / 0.6));
+			l0.w  = min(1.0, l0.w + dt / 0.5);
+			l1.rgb = mix(l1.rgb, hu[best], 1.0 - exp(-dt / 2.0));
+			l1.w   = mix(l1.w, pw[best], 1.0 - exp(-dt / 4.0));
+			l2.x   = mix(l2.x, pw[best], 1.0 - exp(-dt / 1.0));
 			l2.w   = 0.0;
 			target_vis = 1.0;
 		} else {
-			// (a fire missed for a moment holds ~0.15 s before fading over 0.5 s: no pops from an intermittent detection)
+			// (stable-1028) a fire missed holds 2 s (the detection finds a torch on ~half the frames), then fades over 1 s
 			l2.w += dt;
-			if (l2.w > 0.15) l0.w = max(0.0, l0.w - dt / 0.5);
-			l2.x = mix(l2.x, l1.w, 1.0 - exp(-dt / 0.5));
+			if (l2.w > 2.0) l0.w = max(0.0, l0.w - dt / 1.0);
+			l2.x = mix(l2.x, l1.w, 1.0 - exp(-dt / 1.0));
 		}
 		// The flicker: the fast power over the slow one, clamped and eased (no frame-to-frame noise).
 		// (natural-1028) the blob's own brightness (fast / slow, +-6 %) and two slow incommensurate sines per slot
 		// (0.31 / 0.83 Hz, +-3 % / +-2 %), clamped 0.9..1.1, then low-passed (0.25 s): no frame-to-frame jumps.
-		float tt = push.flare.z + float(k) * 1.7;
-		float org = 0.03 * sin(6.2831853 * 0.31 * tt) + 0.02 * sin(6.2831853 * 0.83 * tt + 1.3);
-		float fl  = clamp(1.0 + clamp(l2.x / max(l1.w, 1e-3) - 1.0, -0.06, 0.06) + org, 0.9, 1.1);
-		l2.y      = mix(l2.y <= 0.0 ? 1.0 : l2.y, fl, 1.0 - exp(-dt / 0.25));
+		// (stable-1028) nearly steady, like a real torch: the blob's own swing +-1.5 %, two very slow sines (0.11 / 0.23 Hz,
+		// +-1 % each), total 0.97..1.03, low-passed 0.6 s
+		float tt  = push.flare.z + float(k) * 1.7;
+		float org = 0.01 * sin(6.2831853 * 0.11 * tt) + 0.01 * sin(6.2831853 * 0.23 * tt + 1.3);
+		float fl  = clamp(1.0 + clamp(l2.x / max(l1.w, 1e-3) - 1.0, -0.015, 0.015) + org, 0.97, 1.03);
+		l2.y      = mix(l2.y <= 0.0 ? 1.0 : l2.y, fl, 1.0 - exp(-dt / 0.6));
 		// The flare's source must be in view: the depth around it no nearer than the fire (a wall, a character in front).
 		if (target_vis > 0.0) {
 			float seen = 0.0;
@@ -379,13 +382,20 @@ void Track() {
 	for (int k = 0; k < slots; ++k) {
 		if (lights[k * 4].w > 0.0 || lights[k * 4 + 2].z > 0.0) continue;
 		int best = -1;
-		for (int b = 0; b < nb; ++b)
-			if (!claimed[b] && (best < 0 || bw[b].x > bw[best].x)) best = b;
+		for (int b = 0; b < nb; ++b) {
+			if (claimed[b] || (best >= 0 && bw[b].x <= bw[best].x)) continue;
+			// (stable-1028) never a second light on a fire already tracked (a duplicate popped in and out: lights 2.7 a
+			// frame for 0.8 blobs)
+			bool near = false;
+			for (int j = 0; j < 8; ++j)
+				if ((lights[j * 4].w > 0.0 || lights[j * 4 + 2].w > 0.0) && length((bw[b].yz - lights[j * 4].xy) * vec2(CW, CH)) < 5.0) near = true;
+			if (!near) best = b;
+		}
 		if (best < 0) break;
 		claimed[best] = true;
 		vec3 pos = ViewPosZ(bw[best].yz, bw[best].w);
 		pos -= normalize(pos) * 0.3;
-		lights[k * 4]     = vec4(bw[best].yz, bw[best].w, dt / 0.35);
+		lights[k * 4]     = vec4(bw[best].yz, bw[best].w, dt / 0.5);
 		lights[k * 4 + 1] = vec4(hu[best], pw[best]);
 		lights[k * 4 + 2] = vec4(pw[best], 1.0, 0.0, 0.0);
 		lights[k * 4 + 3] = vec4(pos, pw[best]);
@@ -396,6 +406,10 @@ void Track() {
 }
 
 // ---- 2 light ----
+// (gpu-1028) the shadow passes run at half resolution (push.dec.z: the shift): their pixel p <-> the full pixel FullPx(p)
+int   Shift() { return push.dec.z; }
+ivec2 TraceSize() { return (ivec2(RenderSize()) + (1 << Shift()) - 1) >> Shift(); }
+ivec2 FullPx(ivec2 p) { return min(p << Shift(), ivec2(RenderSize()) - 1); }
 float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 
 // The light's visibility from p (view space) toward lp: 1 lit, 0 occluded; unc: 1 when some sample could not tell
@@ -435,17 +449,17 @@ float March(vec3 p, vec3 lp, int max_steps, float jit, out float unc) {
 
 void Shadow(ivec2 p) {
 	vec2  rs = RenderSize();
-	ivec2 sz = ivec2(rs);
-	if (any(greaterThanEqual(p, sz))) return;
-	float d  = texelFetch(depth_tex, p, 0).r;
+	if (any(greaterThanEqual(p, TraceSize()))) return;
+	ivec2 fp = FullPx(p);
+	float d  = texelFetch(depth_tex, fp, 0).r;
 	float z  = IsSky(d) ? 1e6 : ViewZ(d);
 	if (IsSky(d) || z > push.light.w) {
 		imageStore(aux_img, p, vec4(1.0, 0.0, 0.0, z));
 		return;
 	}
-	vec2  uv   = (vec2(p) + 0.5) / rs;
+	vec2  uv   = (vec2(fp) + 0.5) / rs;
 	vec3  pos  = ViewPosZ(uv, z);
-	vec3  N    = NormalAt(p, pos);
+	vec3  N    = NormalAt(fp, pos);
 	int   fr   = push.misc.y;
 	float jit  = fract(Ign(vec2(p) + 5.588238 * float(fr & 63)));
 	float ja   = fract(Ign(vec2(p.y, p.x) + 11.0 * float(fr & 63)) + 0.3);
@@ -492,7 +506,7 @@ void Shadow(ivec2 p) {
 	}
 	float ratio = W > 0.0 ? Wv / W : 1.0;
 	float share = W > 0.0 ? min(U / W, 0.99) : 0.0;
-	if ((p.x & 3) == 0 && (p.y & 3) == 0 && W > 0.0) {
+	if ((p.x & 1) == 0 && (p.y & 1) == 0 && W > 0.0) {
 		atomicAdd(stats[6], 1u);
 		if (share > 0.02) atomicAdd(stats[7], 1u);
 	}
@@ -504,7 +518,7 @@ void Shadow(ivec2 p) {
 // alpha max(1 / n, 1 / 24). Out: (ratio, n (0: no torch light here), variance estimate, z).
 void Temporal(ivec2 p) {
 	vec2  rs = RenderSize();
-	ivec2 sz = ivec2(rs);
+	ivec2 sz = TraceSize();
 	if (any(greaterThanEqual(p, sz))) return;
 	vec4 cur = texelFetch(src_tex, p, 0);
 	if (cur.y <= 0.0) {
@@ -522,10 +536,10 @@ void Temporal(ivec2 p) {
 	float sigma = sqrt(max(m2 - m1 * m1, 0.0));
 	float r = cur.x, n = 1.0, var = sigma * sigma;
 	if (push.motion.z > 0.0) {
-		vec2 uv  = (vec2(p) + 0.5) / rs;
+		vec2 uv  = (vec2(FullPx(p)) + 0.5) / rs;
 		vec2 puv = uv - textureLod(motion_tex, uv, 0).xy * push.motion.xy / rs;
 		if (all(greaterThan(puv, vec2(0))) && all(lessThan(puv, vec2(1)))) {
-			vec4 h = texelFetch(hist_tex, clamp(ivec2(puv * rs), ivec2(0), sz - 1), 0);
+			vec4 h = texelFetch(hist_tex, clamp(ivec2(puv * rs) >> Shift(), ivec2(0), sz - 1), 0);
 			if (h.y > 0.0 && abs(h.w - cur.w) < 0.1 * cur.w + 0.05) {
 				float g  = 1.25 * sigma + 0.03;
 				float hr = clamp(h.x, m1 - g, m1 + g);
@@ -536,7 +550,7 @@ void Temporal(ivec2 p) {
 			}
 		}
 	}
-	if ((p.x & 3) == 0 && (p.y & 3) == 0) {
+	if ((p.x & 1) == 0 && (p.y & 1) == 0) {
 		atomicAdd(stats[10], uint(n));
 		if (r < 0.5) atomicAdd(stats[11], 1u);
 	}
@@ -549,7 +563,7 @@ void Temporal(ivec2 p) {
 // other surfaces (characters in front) never mix in. Keeps (ratio, n, variance / 2 per pass, z).
 void Spatial(ivec2 p) {
 	vec2  rs = RenderSize();
-	ivec2 sz = ivec2(rs);
+	ivec2 sz = TraceSize();
 	if (any(greaterThanEqual(p, sz))) return;
 	vec4 c = texelFetch(src_tex, p, 0);
 	if (c.y <= 0.0) {
@@ -557,7 +571,7 @@ void Spatial(ivec2 p) {
 		return;
 	}
 	int   step = max(int(push.flare.w), 1);
-	vec3  np   = NormalAt(p, ViewPosZ((vec2(p) + 0.5) / rs, c.w));
+	vec3  np   = NormalAt(FullPx(p), ViewPosZ((vec2(FullPx(p)) + 0.5) / rs, c.w));
 	float sd   = sqrt(max(c.z, 0.0)) * 4.0 + 0.02;
 	// (fewer accumulated frames: the luminance stop is looser)
 	sd *= mix(3.0, 1.0, Sat((c.y - 1.0) / 8.0));
@@ -572,7 +586,7 @@ void Spatial(ivec2 p) {
 			float w = kw[abs(x)] * kw[abs(y)];
 			w *= exp(-abs(v.w - c.w) / (0.01 * c.w * float(step) + 0.01));
 			if (x != 0 || y != 0) {
-				vec3 nq = NormalAt(q, ViewPosZ((vec2(q) + 0.5) / rs, v.w));
+				vec3 nq = NormalAt(FullPx(q), ViewPosZ((vec2(FullPx(q)) + 0.5) / rs, v.w));
 				w *= pow(max(dot(np, nq), 0.0), 32.0);
 				w *= exp(-abs(v.x - c.x) / sd);
 			}
@@ -635,7 +649,24 @@ void Light(ivec2 p) {
 		float D   = min(a2 / (PI * den * den), 8.0);
 		spec += E * ndl * D;
 	}
-	float shade = Sat(texelFetch(src_tex, p, 0).r); // (modes 4 / 5 / 7: the torches' visibility here)
+	// (gpu-1028) the half-resolution visibility, upsampled with depth weights (no bleeding across a character's edge)
+	float shade;
+	{
+		ivec2 ts = textureSize(src_tex, 0);
+		vec2  hp = (vec2(p) + 0.5) / float(1 << push.dec.z) - 0.5;
+		ivec2 b  = ivec2(floor(hp));
+		vec2  f  = hp - vec2(b);
+		float sw = 0.0, sv = 0.0, bestd = 1e9, bestv = 1.0;
+		for (int t = 0; t < 4; ++t) {
+			ivec2 o  = ivec2(t & 1, t >> 1);
+			vec4  q  = texelFetch(src_tex, clamp(b + o, ivec2(0), ts - 1), 0);
+			float dz = abs(q.w - z);
+			float w  = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y) * exp(-dz / (0.02 * z + 0.02));
+			sw += w, sv += w * q.x;
+			if (dz < bestd) bestd = dz, bestv = q.x;
+		}
+		shade = Sat(sw > 1e-3 ? sv / sw : bestv);
+	}
 	vec3  add  = (alb * diff * 3.0 + spec * push.light.y) * push.size.z * (1.0 - selfw) * shade;
 	add *= 1.0 - smoothstep(zmax * 0.6, zmax, z); // (fog and distant walls stay as drawn)
 	float al   = Luma(add);

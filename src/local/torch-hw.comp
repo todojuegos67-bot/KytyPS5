@@ -25,7 +25,7 @@ layout(push_constant) uniform Push {
 	vec4  proj;      // M[0], M[5], M[8], M[9] (torch.comp's view space)
 	vec4  depth_map; // M[10], M[14], M[11], M[15]
 	vec4  size;      // render w, h, y sign of the clip (hw-lights' convention: -1), -
-	ivec4 misc;      // frame, flags (1: torch.comp's row 0 = NDC y +1), -, -
+	ivec4 misc;      // frame, flags (1: torch.comp's row 0 = NDC y +1), shift (half-resolution trace: 1), -
 } push;
 
 float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
@@ -52,16 +52,18 @@ bool ViewToUvD(vec3 v, out vec2 uv, out float d) {
 void main() {
 	ivec2 p  = ivec2(gl_GlobalInvocationID.xy);
 	vec2  rs = push.size.xy;
-	if (any(greaterThanEqual(p, ivec2(rs)))) return;
+	ivec2 ts = textureSize(src_tex, 0);
+	if (any(greaterThanEqual(p, ts))) return;
+	ivec2 fp = min(p << push.misc.z, ivec2(rs) - 1);
 	vec4  s     = texelFetch(src_tex, p, 0);
 	float share = fract(s.z);
 	int   k     = int(floor(s.z + 1e-3));
-	bool  smp   = (p.x & 3) == 0 && (p.y & 3) == 0;
+	bool  smp   = (p.x & 1) == 0 && (p.y & 1) == 0;
 	if (s.y <= 0.0 || share <= 0.02 || k < 0 || k > 7) {
 		imageStore(out_img, p, s);
 		return;
 	}
-	vec2  uv = (vec2(p) + 0.5) / rs;
+	vec2  uv = (vec2(fp) + 0.5) / rs;
 	float d  = textureLod(depth_tex, uv, 0).r;
 	vec4  l3 = lights[k * 4 + 3];
 	vec2  luv;
