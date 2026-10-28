@@ -650,7 +650,11 @@ bool HwLightsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			e[0] = l.pos[0], e[1] = l.pos[1], e[2] = l.pos[2], e[3] = l.far_d;
 			e[4] = l.fwd[0], e[5] = l.fwd[1], e[6] = l.fwd[2];
 			// (the cone: the shadow frustum's half angle; its outer 15 % fades)
-			const float half = std::atan(std::max(l.tan_half, 0.01f));
+			// (ds-rt-shadow 10-28) never narrower than KYTY_HWRT_LIGHTS_MINCONE (45 deg half angle): the projection's x / y
+			// scale carries the spot pool's atlas scale too, so 1 / scale gave cones a fraction of the light's
+			// (20261028-044645: 81.6 % of probed pixels in a light's reach, 19.7 % facing it, 0.0 % in its cone: no shadow)
+			static const float min_half = EnvFloat("KYTY_HWRT_LIGHTS_MINCONE", 45.0f, 1.0f, 89.0f) * 0.01745329f;
+			const float half = std::max(std::atan(std::max(l.tan_half, 0.01f)), min_half);
 			e[7]  = l.point || half > 1.5f ? -2.0f : std::cos(half);
 			e[8]  = soft;
 			const float v = l.vis * l.cap_w;

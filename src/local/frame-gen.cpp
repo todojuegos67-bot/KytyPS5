@@ -8387,7 +8387,7 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 	static const float forced_bias = RtSunEnv("KYTY_RT_SUN_BIAS", -1.0f, -1.0f, 1.0f);
 	static const float forced_r    = RtSunEnv("KYTY_RT_SUN_R", -1.0f, -1.0f, 100.0f);
 	double r = 1.5; // (nothing measured yet: a moderate sun)
-	if (g_rs.log_r >= 0.0) r = std::exp2(g_rs.log_r) - 1.0;
+	if (g_rs.log_r >= 0.0) r = std::min(std::exp2(g_rs.log_r) - 1.0, static_cast<double>(RtSunEnv("KYTY_RT_SUN_RMAX", 3.0f, 0.1f, 40.0f)));
 	else if (g_cs.log_k >= 0.0) r = std::max(std::exp2(g_cs.log_k) - 1.0, 0.0) / 0.75;
 	if (forced_r >= 0.0f) r = forced_r;
 	float* f = reinterpret_cast<float*>(g_rs.buf_mapped + slot * kRtSunSlotBytes);
@@ -8399,7 +8399,10 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 	f[2] = static_cast<float>(r);
 	f[3] = 0.0f; // (strength x fade: RtSunSetFade)
 	f[4] = forced_hyp >= 0.0f ? std::floor(forced_hyp) : static_cast<float>(g_rs.hyp);
-	f[5] = forced_bias >= 0.0f ? forced_bias : static_cast<float>(g_rs.bias_m);
+	// (ds-rt-shadow 10-28) the bias never under 0.75 of the finest cascade's texel: the auto-bias settled at its 5 mm floor
+	// against a 0.38 m texel (20261028-044645), the cascade compare self-shadowed in stripes ("rayas") that the composite
+	// then amplified
+	f[5] = forced_bias >= 0.0f ? forced_bias : std::max(static_cast<float>(g_rs.bias_m), 0.75f * cs.front().texel);
 	f[6] = std::floor(debug);
 	f[7] = size;
 	// (ds-rt-shadow) the same brightening on a held copy as on a fresh one: the copy is the game's current cascade (it
@@ -8508,12 +8511,16 @@ void RtSunTakeCalib(const uint32_t* v, double pixels) {
 		}
 		const uint32_t cl = w[40], cs = w[43];
 		g_rs.r_lit = cl, g_rs.r_shadow = cs;
-		if (cl >= 60 && cs >= 60) {
+		// (ds-rt-shadow 10-28) R (sun / ambient) from >= 300 samples each, capped at 3, eased slowly: R 26-31 (20261028-044645,
+		// estimated off a few lit samples) multiplied any visibility difference ~27x: 35-41 % of pixels brightened, a still
+		// camera's sun flicker 11-23 % (max jump 93-357 %). The overcast areas measured 0.3-1.9 before.
+		static const double r_max = RtSunEnv("KYTY_RT_SUN_RMAX", 3.0f, 0.1f, 40.0f);
+		if (cl >= 300 && cs >= 300) {
 			const double k  = std::exp2((static_cast<double>(w[41]) / cl - static_cast<double>(w[44]) / cs) / 32.0);
 			const double nl = static_cast<double>(w[42]) / 256.0 / cl;
-			const double r  = std::clamp((k - 1.0) / std::max(nl, 0.3), 0.0, 40.0);
+			const double r  = std::clamp((k - 1.0) / std::max(nl, 0.3), 0.0, r_max);
 			const double lr = std::log2(1.0 + r);
-			g_rs.log_r      = g_rs.log_r < 0.0 ? lr : g_rs.log_r + (lr - g_rs.log_r) * 0.25;
+			g_rs.log_r      = g_rs.log_r < 0.0 ? lr : g_rs.log_r + (lr - g_rs.log_r) * 0.05;
 		}
 	}
 }
