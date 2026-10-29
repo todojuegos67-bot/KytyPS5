@@ -103,7 +103,21 @@ vec3 NormalAt(vec2 uv, vec3 p) { return NormalAtY(uv, p, YSign()); }
 // (ds-veg-1029) vegetation / moss / ivy in the game's lit colour (no G-buffer here): green clearly above red and blue.
 float VegColor(vec3 c) {
 	float m = max(max(c.r, c.b), 1e-6);
-	return smoothstep(1.08, 1.25, c.g / m) * step(1e-4, c.g);
+	return smoothstep(1.04, 1.18, c.g / m) * step(1e-4, c.g);
+}
+// (ds-veg-1029 r2) a vegetation pixel: green in the lit colour, or a depth normal that turns > ~37 degrees within 2 px
+// (leaf cards, grass, ivy clumps: noisy depth); walls and floors keep a steady normal.
+bool VegPix(vec2 uv, vec3 n, vec3 c) {
+	if (VegColor(c) > 0.5) return true;
+	vec2 t2 = 2.0 / RenderSize();
+	const vec2 o4[4] = vec2[](vec2(1, 0), vec2(-1, 0), vec2(0, 1), vec2(0, -1));
+	for (int i = 0; i < 4; ++i) {
+		vec2  q  = uv + o4[i] * t2;
+		float dq = textureLod(depth_tex, q, 0).r;
+		if (IsSky(dq)) continue;
+		if (dot(NormalAt(q, ViewPos(q, dq)), n) < 0.8) return true;
+	}
+	return false;
 }
 float NearW(float z) { return 1.0 - smoothstep(6.0, 40.0, z); }
 
@@ -162,9 +176,25 @@ float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 		// (ds-veg-1029) no occluder on vegetation (ivy / leaves / grass cards), and none a flush layer within 0.35 m that
 		// faces the receiver's way (a banner, decal, ivy a few cm off the wall): no halo around them
 		if (cand && VegColor(textureLod(color_tex, pr.xy, 0).rgb) > 0.5) cand = false;
-		if (cand && t < 0.35) {
-			vec3 op = ViewPos(pr.xy, sd);
-			if (dot(NormalAt(pr.xy, op), n) > 0.5) cand = false;
+		if (cand) {
+			// (ds-veg-1029 r2, the owner's ivy: black cards + a dark halo on the wall) the occluder's surface height over the
+			// receiver's plane: a layer within 0.2 m facing the same way (ivy, banner, decal, moss, a plaque on the wall) or
+			// anything within 5 cm of the plane (coplanar) is no occluder; corners (perpendicular) and overhangs (facing
+			// back) still are. And near the receiver the stricter pre-10-29 solid test (thin cards are noisy depth).
+			vec3  op = ViewPos(pr.xy, sd);
+			vec3  on = NormalAt(pr.xy, op);
+			float h  = dot(op - p, n);
+			if (h < 0.05 || (h < 0.2 && dot(on, n) > 0.5) || (t < 0.35 && dot(on, n) > 0.5)) cand = false;
+			if (cand && VegPix(pr.xy, on, textureLod(color_tex, pr.xy, 0).rgb)) cand = false; // (leaf / ivy / grass: no caster)
+			if (cand && t < 0.5) {
+				vec2  rs2 = 1.5 / RenderSize();
+				float b0 = abs(ViewZ(textureLod(depth_tex, pr.xy + vec2(rs2.x, 0), 0).r));
+				float b1 = abs(ViewZ(textureLod(depth_tex, pr.xy - vec2(rs2.x, 0), 0).r));
+				float b2 = abs(ViewZ(textureLod(depth_tex, pr.xy + vec2(0, rs2.y), 0).r));
+				float b3 = abs(ViewZ(textureLod(depth_tex, pr.xy - vec2(0, rs2.y), 0).r));
+				float tl = 0.02 * oz + 0.05;
+				if (!(abs(b0 + b1 - 2.0 * oz) < tl && abs(b2 + b3 - 2.0 * oz) < tl)) cand = false;
+			}
 		}
 		if (cand) {
 			// The occluder must be solid: its depth-buffer neighbours agree (alpha-tested foliage, grass, ivy and
@@ -207,7 +237,9 @@ void Trace(ivec2 pixel) {
 	vec3 p = ViewPos(uv, d);
 	vec3 n = NormalAt(uv, p);
 	imageStore(gbuf_out, pixel, vec4(n, abs(p.z)));
-	if (VegColor(textureLod(color_tex, uv, 0).rgb) > 0.5) { // (ds-veg-1029) vegetation receives none (nothing to blur out)
+	// (ds-veg-1029 r2) vegetation receives none: green in the lit colour, or a depth normal that turns > ~37 degrees within
+	// 2 px (leaf cards, grass, ivy clumps: noisy depth). Walls and floors keep a steady normal.
+	if (VegPix(uv, n, textureLod(color_tex, uv, 0).rgb)) {
 		imageStore(out_img, pixel, vec4(1));
 		return;
 	}
@@ -359,7 +391,7 @@ void Composite(ivec2 pixel, out float dark, out float zout) {
 	zout = z;
 	// Sky and far geometry / fog unchanged: screen-space data is only reliable near.
 	float fade = IsSky(d) ? 0.0 : 1.0 - smoothstep(push.cand[3].z, push.cand[3].w, z);
-	if (fade > 0.0 && VegColor(col.rgb) > 0.5) { // (ds-veg-1029) vegetation: factor 1
+	if (fade > 0.0 && VegPix(uv, NormalAt(uv, ViewPos(uv, d)), col.rgb)) { // (ds-veg-1029) vegetation: factor 1
 		zout = -1.0;
 		imageStore(out_img, pixel, col);
 		return;
