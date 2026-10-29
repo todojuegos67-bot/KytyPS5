@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/bb/bb_upscale.h"
+#include "core/address_space.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
@@ -607,6 +608,7 @@ bool Instance::CreateDevice() {
             BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties)),
             BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr))));
         if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss) {
+            Core::ReleaseDlssAddressHole();
             BB::Upscale::DryRunDevice(static_cast<VkInstance>(*instance),
                                       static_cast<VkPhysicalDevice>(physical_device),
                                       reinterpret_cast<const VkDeviceCreateInfo*>(&device_chain.get()));

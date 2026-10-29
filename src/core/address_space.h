@@ -11,6 +11,11 @@
 
 namespace Core {
 
+// DLSS: frees the address range held for NVIDIA NGX (right before vkCreateDevice) and logs
+// the largest free range below 1 TiB.
+void ReleaseDlssAddressHole();
+
+
 enum class MemoryPermission : u32 {
     None = 0,
     Read = 1 << 0,

@@ -634,7 +634,10 @@ void PreInstance() {
         // RTSS's implicit Vulkan layer makes the driver's vkCreateDevice fail when
         // VK_NVX_binary_import (which DLSS needs) is enabled (owner's dry runs, 10-30): off unless
         // BB_DLSS_KEEP_RTSS=1.
-        if (Env("BB_DLSS_KEEP_RTSS") == nullptr && Env("DISABLE_RTSS_LAYER") == nullptr) {
+        // (10-30: the real cause was the address space NGX needs, see address_space.cpp; RTSS
+        // only crashed on the device the driver had refused. Kept on; BB_DLSS_NO_RTSS=1 turns it
+        // off.)
+        if (Env("BB_DLSS_NO_RTSS") != nullptr && Env("DISABLE_RTSS_LAYER") == nullptr) {
             _putenv_s("DISABLE_RTSS_LAYER", "1");
             SetEnvironmentVariableA("DISABLE_RTSS_LAYER", "1");
             Checkpoint("DLSS: DISABLE_RTSS_LAYER=1 (RTSS's Vulkan layer breaks device creation with "
