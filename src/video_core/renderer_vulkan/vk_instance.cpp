@@ -25,6 +25,17 @@ std::vector<vk::PhysicalDevice> EnumeratePhysicalDevices(vk::UniqueInstance& ins
     auto [devices_result, devices] = instance->enumeratePhysicalDevices();
     ASSERT_MSG(devices_result == vk::Result::eSuccess, "Failed to enumerate physical devices: {}",
                vk::to_string(devices_result));
+    if (BB::Upscale::Enabled()) {
+        std::string list;
+        for (const auto d : devices) {
+            list += fmt::format(" {}", static_cast<const void*>(static_cast<VkPhysicalDevice>(d)));
+        }
+        BB::Upscale::Checkpoint(fmt::format(
+            "vkEnumeratePhysicalDevices on instance {}:{} (via {})",
+            static_cast<const void*>(static_cast<VkInstance>(*instance)), list,
+            BB::Upscale::Where(reinterpret_cast<const void*>(
+                VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumeratePhysicalDevices))));
+    }
     return std::move(devices);
 }
 
@@ -585,6 +596,16 @@ bool Instance::CreateDevice() {
             "vkGetDeviceProcAddr {}",
             queue_family_index, chain, f13.shaderIntegerDotProduct,
             reinterpret_cast<void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr)));
+        BB::Upscale::Checkpoint(fmt::format(
+            "vkCreateDevice: instance {}, physical device {}; vkCreateDevice {}; "
+            "vkEnumeratePhysicalDevices {}; vkGetPhysicalDeviceProperties {}; "
+            "vkGetDeviceProcAddr {}",
+            static_cast<const void*>(static_cast<VkInstance>(*instance)),
+            static_cast<const void*>(static_cast<VkPhysicalDevice>(physical_device)),
+            BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDevice)),
+            BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumeratePhysicalDevices)),
+            BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties)),
+            BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr))));
         BB::Upscale::Checkpoint(fmt::format("vkCreateDevice with {} extensions: {}",
                                             enabled_extensions.size(),
                                             fmt::join(enabled_extensions, " ")));

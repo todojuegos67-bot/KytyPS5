@@ -27,6 +27,7 @@
 #include <sl.h>
 #include <sl_consts.h>
 #include <sl_dlss.h>
+#include <sl_helpers_vk.h>
 #endif
 
 namespace BB::SR::Dlss {
@@ -45,7 +46,14 @@ struct Api {
     PFun_slEvaluateFeature* evaluate = nullptr;
     PFun_slDLSSSetOptions* dlss_set_options = nullptr;
     PFun_slDLSSGetOptimalSettings* dlss_get_optimal_settings = nullptr;
+    PFun_slGetFeatureRequirements* get_feature_requirements = nullptr;
+    PFun_slSetVulkanInfo* set_vulkan_info = nullptr;
 };
+// BB_SL_NO_INTERPOSER_LOADER=1: the system Vulkan loader for everything, Streamline told about the
+// device afterwards (slSetVulkanInfo, manual hooking); DLSS super resolution only.
+bool g_manual = false;
+std::vector<sl::Feature> g_features;
+std::vector<std::string> g_req_device_ext, g_req_instance_ext;
 Api g_api;
 bool g_loaded = false;
 bool g_ready = false;
@@ -205,10 +213,30 @@ bool Preload() {
             BBLogf("DLSS: sl.interposer.dll lacks an entry point: DLSS off");
             return false;
         }
+        load(g_api.get_feature_requirements, "slGetFeatureRequirements");
+        load(g_api.set_vulkan_info, "slSetVulkanInfo");
         static const std::wstring plugin_dir = dir.wstring();
         static const wchar_t* plugin_paths[]{plugin_dir.c_str()};
-        static std::vector<sl::Feature> features{sl::kFeatureDLSS, sl::kFeatureDLSS_G,
-                                                 sl::kFeatureReflex, sl::kFeaturePCL};
+        {
+            const char* m = std::getenv("BB_SL_NO_INTERPOSER_LOADER");
+            g_manual = m != nullptr && m[0] == '1' && g_api.set_vulkan_info != nullptr;
+            // BB_SL_FEATURES=dlss,dlssg,reflex,pcl (default all four; manual mode: dlss).
+            std::string list = std::getenv("BB_SL_FEATURES") ? std::getenv("BB_SL_FEATURES")
+                               : g_manual                    ? "dlss"
+                                                             : "dlss,dlssg,reflex,pcl";
+            const auto has = [&](const char* name) {
+                std::string l = "," + list + ",";
+                return l.find(std::string(",") + name + ",") != std::string::npos;
+            };
+            g_features.push_back(sl::kFeatureDLSS);
+            if (has("dlssg")) g_features.push_back(sl::kFeatureDLSS_G);
+            if (has("reflex")) g_features.push_back(sl::kFeatureReflex);
+            if (has("pcl")) g_features.push_back(sl::kFeaturePCL);
+            BBLogf("DLSS: Streamline features: %s; %s", list.c_str(),
+                   g_manual ? "manual hooking (system Vulkan loader, slSetVulkanInfo after the device)"
+                            : "sl.interposer.dll as the Vulkan loader");
+        }
+        auto& features = g_features;
         sl::Preferences preferences{};
         preferences.showConsole = false;
         preferences.logLevel = std::getenv("BB_DLSS_VERBOSE") ? sl::LogLevel::eVerbose
@@ -219,6 +247,7 @@ bool Preload() {
         preferences.logMessageCallback = LogMessage;
         preferences.flags = sl::PreferenceFlags::eDisableCLStateTracking |
                             sl::PreferenceFlags::eUseFrameBasedResourceTagging;
+        if (g_manual) preferences.flags |= sl::PreferenceFlags::eUseManualHooking;
         preferences.featuresToLoad = features.data();
         preferences.numFeaturesToLoad = static_cast<uint32_t>(features.size());
         preferences.engine = sl::EngineType::eCustom;
@@ -244,9 +273,29 @@ bool Preload() {
             BBLogf("DLSS: slInit failed (%d): DLSS off", static_cast<int>(result));
             return false;
         }
-        g_interposer = interposer.wstring();
-        BBLogf("DLSS: Streamline loaded from %s (the Vulkan loader from here on)",
-               dir.string().c_str());
+        if (!g_manual) g_interposer = interposer.wstring();
+        BBLogf("DLSS: Streamline loaded from %s%s", dir.string().c_str(),
+               g_manual ? " (manual hooking: the system loader stays)" : " (the Vulkan loader from here on)");
+        if (g_api.get_feature_requirements != nullptr) {
+            for (const sl::Feature f : g_features) {
+                sl::FeatureRequirements req{};
+                if (g_api.get_feature_requirements(f, req) != sl::Result::eOk) continue;
+                std::string dev, inst;
+                for (uint32_t i = 0; i < req.vkNumDeviceExtensions; ++i) {
+                    g_req_device_ext.emplace_back(req.vkDeviceExtensions[i]);
+                    dev += std::string(" ") + req.vkDeviceExtensions[i];
+                }
+                for (uint32_t i = 0; i < req.vkNumInstanceExtensions; ++i) {
+                    g_req_instance_ext.emplace_back(req.vkInstanceExtensions[i]);
+                    inst += std::string(" ") + req.vkInstanceExtensions[i];
+                }
+                BBLogf("DLSS: feature %u needs: device ext:%s; instance ext:%s; %u compute + %u "
+                       "graphics + %u optical-flow queues; %u vk12 + %u vk13 features",
+                       static_cast<uint32_t>(f), dev.c_str(), inst.c_str(),
+                       req.vkNumComputeQueuesRequired, req.vkNumGraphicsQueuesRequired,
+                       req.vkNumOpticalFlowQueuesRequired, req.vkNumFeatures12, req.vkNumFeatures13);
+            }
+        }
         return true;
     }();
     g_loaded = loaded;
@@ -257,9 +306,37 @@ const wchar_t* LoaderPath() {
     return g_loaded && !g_interposer.empty() ? g_interposer.c_str() : nullptr;
 }
 
-void OnDevice(vk::Instance, vk::PhysicalDevice physical, vk::Device) {
+bool Manual() {
+    return g_loaded && g_manual;
+}
+const std::vector<std::string>& RequiredDeviceExtensions() {
+    return g_req_device_ext;
+}
+const std::vector<std::string>& RequiredInstanceExtensions() {
+    return g_req_instance_ext;
+}
+
+void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device) {
     if (!g_loaded) {
         return;
+    }
+    if (g_manual) {
+        sl::VulkanInfo info{};
+        info.device = static_cast<VkDevice>(device);
+        info.instance = static_cast<VkInstance>(instance);
+        info.physicalDevice = static_cast<VkPhysicalDevice>(physical);
+        info.graphicsQueueFamily = 0;
+        info.graphicsQueueIndex = 0;
+        info.computeQueueFamily = 0;
+        info.computeQueueIndex = 0;
+        const auto r = g_api.set_vulkan_info(info);
+        BBLogf("DLSS: slSetVulkanInfo(device %p, instance %p, physical %p) returned %d",
+               static_cast<void*>(info.device), static_cast<void*>(info.instance),
+               static_cast<void*>(info.physicalDevice), static_cast<int>(r));
+        if (r != sl::Result::eOk) {
+            BBLogf("DLSS: Streamline did not take the device: DLSS off");
+            return;
+        }
     }
     sl::AdapterInfo adapter{};
     adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical);
@@ -423,6 +500,17 @@ bool Preload() {
 }
 const wchar_t* LoaderPath() {
     return nullptr;
+}
+bool Manual() {
+    return false;
+}
+const std::vector<std::string>& RequiredDeviceExtensions() {
+    static const std::vector<std::string> none;
+    return none;
+}
+const std::vector<std::string>& RequiredInstanceExtensions() {
+    static const std::vector<std::string> none;
+    return none;
 }
 void OnDevice(vk::Instance, vk::PhysicalDevice, vk::Device) {}
 bool Ready() {

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <vector>
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -70,6 +71,9 @@ struct Desc {
 namespace Dlss {
 bool Preload();                      // true when Streamline was loaded (BB_UPSCALER=dlss)
 const wchar_t* LoaderPath();         // sl.interposer.dll, or null
+bool Manual();                       // BB_SL_NO_INTERPOSER_LOADER=1: slSetVulkanInfo after the device
+const std::vector<std::string>& RequiredDeviceExtensions();   // slGetFeatureRequirements
+const std::vector<std::string>& RequiredInstanceExtensions();
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device);
 bool Ready();
 bool Evaluate(const Desc& desc);

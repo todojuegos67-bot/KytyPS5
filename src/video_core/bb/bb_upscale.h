@@ -67,6 +67,8 @@ bool RunBackend(const SR::Desc& desc);
 // Runs fn(arg) under a crash guard (Windows SEH): false on a crash, with the exception code,
 // address and faulting module in `fault`.
 bool GuardedCall(void (*fn)(void*), void* arg, std::string& fault);
+// "<pointer> (<module>+<offset>)" for a function pointer, for the init log.
+std::string Where(const void* p);
 // A start-up checkpoint: written and flushed at once to bb_upscale_init.log (next to the working
 // directory's shadPS4 log is asynchronous and may be cut off by a crash) and to the log.
 void Checkpoint(std::string_view text);

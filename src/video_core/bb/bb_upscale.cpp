@@ -640,6 +640,17 @@ void PreInstance() {
                    "DISABLE_VK_LAYER_VALVE_steam_fossilize_1=1, "
                    "VK_LOADER_LAYERS_DISABLE=VK_LAYER_OBS_HOOK");
 #endif
+        // The Vulkan loader's own messages (VK_LOADER_DEBUG) to bb_vkloader.log: the loader writes
+        // them to stderr, which is redirected to that file for this run.
+        if (Env("VK_LOADER_DEBUG") == nullptr) {
+            _putenv_s("VK_LOADER_DEBUG", "error,warn,layer,driver");
+            SetEnvironmentVariableA("VK_LOADER_DEBUG", "error,warn,layer,driver");
+        }
+        if (std::freopen("bb_vkloader.log", "w", stderr) != nullptr) {
+            std::setvbuf(stderr, nullptr, _IONBF, 0);
+            Checkpoint(fmt::format("DLSS: VK_LOADER_DEBUG={} -> bb_vkloader.log",
+                                   Env("VK_LOADER_DEBUG") ? Env("VK_LOADER_DEBUG") : ""));
+        }
         Checkpoint("DLSS: loading Streamline (slInit)");
         if (!SR::Dlss::Preload()) {
             Checkpoint("DLSS: Streamline not loaded: DLSS off, the game runs native");
@@ -677,6 +688,12 @@ void AddDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
         Checkpoint(fmt::format("device extension {} for {}: {}", name, SR::KindName(Cfg().kind),
                                has ? "added" : "NOT available"));
     };
+    if (Cfg().kind == SR::Kind::Dlss && SR::Dlss::Manual()) {
+        // Manual hooking: what Streamline's features asked for (slGetFeatureRequirements).
+        for (const auto& name : SR::Dlss::RequiredDeviceExtensions()) {
+            add(name.c_str());
+        }
+    }
     if (Cfg().kind == SR::Kind::Dlss && SR::Dlss::LoaderPath() != nullptr) {
         // Streamline enables VK_NV_low_latency2 (Reflex) on the device whatever plugins it loads,
         // without the present-id extension that needs: the driver then refuses (or crashes in)
@@ -788,6 +805,23 @@ bool CallFn(void (*fn)(void*), void* arg, FaultInfo* fault) {
 }
 #endif
 } // namespace
+
+std::string Where(const void* p) {
+#if defined(_WIN32)
+    char module[MAX_PATH] = "?";
+    HMODULE handle = nullptr;
+    if (p != nullptr &&
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCSTR>(p), &handle) &&
+        handle != nullptr) {
+        GetModuleFileNameA(handle, module, MAX_PATH);
+        return fmt::format("{} ({}+{:#x})", p, module,
+                           reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(handle));
+    }
+#endif
+    return fmt::format("{}", p);
+}
 
 bool GuardedCall(void (*fn)(void*), void* arg, std::string& fault) {
 #if defined(_WIN32)

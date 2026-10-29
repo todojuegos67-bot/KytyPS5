@@ -317,7 +317,20 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                VK_VERSION_MAJOR(available_version), VK_VERSION_MINOR(available_version));
 
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
-    const auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss && BB::SR::Dlss::Manual()) {
+        // (Manual hooking: the instance extensions Streamline's features need.)
+        static std::vector<std::string> extra;
+        for (const auto& name : BB::SR::Dlss::RequiredInstanceExtensions()) {
+            if (std::none_of(extensions.begin(), extensions.end(),
+                             [&](const char* e) { return name == e; })) {
+                extra.push_back(name);
+            }
+        }
+        for (const auto& name : extra) {
+            extensions.push_back(name.c_str());
+        }
+    }
 
     const vk::ApplicationInfo application_info = {
         .pApplicationName = "shadPS4",
@@ -468,8 +481,11 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     }
     auto [instance_result, instance] = vk::createInstanceUnique(instance_ci_chain.get());
     if (BB::Upscale::Enabled()) {
-        BB::Upscale::Checkpoint(
-            fmt::format("vkCreateInstance returned {}", vk::to_string(instance_result)));
+        BB::Upscale::Checkpoint(fmt::format(
+            "vkCreateInstance returned {}: instance {} via vkCreateInstance {}",
+            vk::to_string(instance_result),
+            instance_result == vk::Result::eSuccess ? static_cast<const void*>(static_cast<VkInstance>(*instance)) : nullptr,
+            BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateInstance))));
     }
     ASSERT_MSG(instance_result == vk::Result::eSuccess, "Failed to create instance: {}",
                vk::to_string(instance_result));
