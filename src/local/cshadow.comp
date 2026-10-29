@@ -100,6 +100,11 @@ vec3 NormalAt(vec2 uv, vec3 p) { return NormalAtY(uv, p, YSign()); }
 // How near the pixel is (1 within 6 m, 0 beyond 40 m): rays, strength and trust are generous near the camera
 // (contact shadows under the character, barrels, battlements) and conservative far away, where a pixel spans
 // decimetres, depth normals are the mesh's flat facets, and the game's shadow maps already have the shapes.
+// (ds-veg-1029) vegetation / moss / ivy in the game's lit colour (no G-buffer here): green clearly above red and blue.
+float VegColor(vec3 c) {
+	float m = max(max(c.r, c.b), 1e-6);
+	return smoothstep(1.08, 1.25, c.g / m) * step(1e-4, c.g);
+}
 float NearW(float z) { return 1.0 - smoothstep(6.0, 40.0, z); }
 
 // The march: occlusion toward the light (0 lit, 1 occluded by something in the depth buffer).
@@ -154,6 +159,13 @@ float March(vec3 p, vec3 n, vec3 l, float ndl, ivec2 pixel) {
 		// A ray far behind a depth step has left the occluder's volume: stop (a foreground object, not a caster).
 		if (delta > 4.0 * thick) break;
 		bool cand = delta > bias && delta < thick && t > t_min;
+		// (ds-veg-1029) no occluder on vegetation (ivy / leaves / grass cards), and none a flush layer within 0.35 m that
+		// faces the receiver's way (a banner, decal, ivy a few cm off the wall): no halo around them
+		if (cand && VegColor(textureLod(color_tex, pr.xy, 0).rgb) > 0.5) cand = false;
+		if (cand && t < 0.35) {
+			vec3 op = ViewPos(pr.xy, sd);
+			if (dot(NormalAt(pr.xy, op), n) > 0.5) cand = false;
+		}
 		if (cand) {
 			// The occluder must be solid: its depth-buffer neighbours agree (alpha-tested foliage, grass, ivy and
 			// silhouettes are noisy there and are no occluders).
@@ -195,6 +207,10 @@ void Trace(ivec2 pixel) {
 	vec3 p = ViewPos(uv, d);
 	vec3 n = NormalAt(uv, p);
 	imageStore(gbuf_out, pixel, vec4(n, abs(p.z)));
+	if (VegColor(textureLod(color_tex, uv, 0).rgb) > 0.5) { // (ds-veg-1029) vegetation receives none (nothing to blur out)
+		imageStore(out_img, pixel, vec4(1));
+		return;
+	}
 	vec3  l   = normalize(push.extra.yzw);
 	float ndl = dot(n, l);
 	float z   = abs(p.z);
@@ -343,6 +359,11 @@ void Composite(ivec2 pixel, out float dark, out float zout) {
 	zout = z;
 	// Sky and far geometry / fog unchanged: screen-space data is only reliable near.
 	float fade = IsSky(d) ? 0.0 : 1.0 - smoothstep(push.cand[3].z, push.cand[3].w, z);
+	if (fade > 0.0 && VegColor(col.rgb) > 0.5) { // (ds-veg-1029) vegetation: factor 1
+		zout = -1.0;
+		imageStore(out_img, pixel, col);
+		return;
+	}
 	float amt  = push.trace.z * fade;
 	if (amt <= 0.0) {
 		imageStore(out_img, pixel, col);
@@ -388,7 +409,7 @@ void Composite(ivec2 pixel, out float dark, out float zout) {
 }
 
 // The composite with its statistics (every invocation reaches the barriers: misc is uniform).
-shared uint s_stat[3];
+shared uint s_stat[4];
 void CompositeStats(ivec2 pixel) {
 	bool  inb  = pixel.x < int(RenderSize().x) && pixel.y < int(RenderSize().y);
 	float dark = 0.0, z = 0.0;
@@ -397,16 +418,17 @@ void CompositeStats(ivec2 pixel) {
 		return;
 	}
 	uint li = gl_LocalInvocationIndex;
-	if (li < 3u) s_stat[li] = 0u;
+	if (li < 4u) s_stat[li] = 0u;
 	barrier();
 	if (inb) Composite(pixel, dark, z);
+	if (inb && z < 0.0) atomicAdd(s_stat[3], 1u); // (ds-veg-1029) vegetation pixels
 	if (inb && dark > 0.1) {
 		atomicAdd(s_stat[0], 1u);
 		atomicAdd(s_stat[1], uint(clamp(dark, 0.0, 1.0) * 256.0 + 0.5));
 		atomicAdd(s_stat[2], uint(clamp(z * 2.0, 0.0, 400.0) + 0.5));
 	}
 	barrier();
-	if (li < 3u && s_stat[li] != 0u) atomicAdd(vote_buf.v[64u + uint(push.misc.w >> 8) * 4u + li], s_stat[li]);
+	if (li < 4u && s_stat[li] != 0u) atomicAdd(vote_buf.v[64u + uint(push.misc.w >> 8) * 4u + li], s_stat[li]);
 }
 
 // The light probe (mode 6, at render / 4, on the statistics frames): log2 luminance of the pixels facing the sun

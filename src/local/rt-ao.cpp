@@ -156,7 +156,7 @@ struct State {
 	std::array<double, Stamps - 1> pass_ms {};
 	uint32_t      ms_n = 0;
 	// stats
-	uint64_t sum[16] {};
+	uint64_t sum[20] {}; // (ds-veg-1029) 16: vegetation pixels, 17/18: rays past a vegetation / flush hit, 19: rays
 	uint32_t st_frames = 0, frames_on = 0, frames_still = 0;
 	float    log_light = 0.0f;
 	bool     light_valid = false;
@@ -462,7 +462,7 @@ void ReadStats(GraphicContext& graphics, int level, bool still) {
 	if (g_ao.stats_map == nullptr || g_ao.frame < Slots) return;
 	(void)vmaInvalidateAllocation(graphics.allocator, g_ao.stats_mem, 0, VK_WHOLE_SIZE);
 	const uint32_t* w = g_ao.stats_map + ((g_ao.frame + 1) % Slots) * SlotWords;
-	for (int i = 0; i < 16; ++i)
+	for (int i = 0; i < 20; ++i)
 		g_ao.sum[i] += w[i];
 	for (int i = 0; i < 4; ++i)
 		g_ao.votes[i] += w[8 + i];
@@ -514,6 +514,10 @@ void ReadStats(GraphicContext& graphics, int level, bool still) {
 		            s[1] > 0 ? static_cast<double>(s[13]) / 250.0 / s[1] : 1.0, s[1] > 0 ? static_cast<double>(s[15]) / 250.0 / s[1] : 0.0,
 		            pct(s[14], s[0]), pct(s[3], s[0]), s[1] > 0 ? static_cast<double>(s[2]) / 1000.0 / s[1] : 1.0,
 		            g_ao.ms_n > 0 ? g_ao.ms_sum / g_ao.ms_n : 0.0, g_ao.ms_n, per);
+		if (hw)
+			std::printf("PTAO: 10 s: vegetation (ds-veg-1029): %.1f%% of the pixels classed vegetation (left untouched); %.2f%% of the "
+			            "AO rays went past a vegetation hit, %.2f%% past a flush layer (< 0.35 m, same facing)\n",
+			            pct(s[16], s[0]), pct(s[17], s[19]), pct(s[18], s[19]));
 		std::printf("RTAO: 10 s: frame light %.4f; normal convention %d; %u frames on (%u camera still)\n",
 		            g_ao.light_valid ? std::exp2(g_ao.log_light) : 0.0f, g_ao.conv, g_ao.frames_on, g_ao.frames_still);
 	}

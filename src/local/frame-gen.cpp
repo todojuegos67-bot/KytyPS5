@@ -7779,7 +7779,7 @@ struct CShadowPass {
 	uint32_t                cam_mask = 0xfffu;
 	// Statistics (every 16th frame, read back 4 frames late; logged every 10 s with the GPU time).
 	int64_t                 stat_frame = -1;
-	double                  st_pixels = 0.0, st_n = 0.0, st_occ = 0.0, st_depth = 0.0;
+	double                  st_pixels = 0.0, st_n = 0.0, st_occ = 0.0, st_depth = 0.0, st_veg = 0.0; // (ds-veg-1029)
 	uint32_t                st_samples = 0;
 	// The light probe: log2 K smoothed (K the game's sun-lit to facing-away luminance ratio; -1 none yet) and the
 	// overcast factor it gives the strength (1 full sun .. 0.15 overcast).
@@ -8864,7 +8864,7 @@ void CShadowTakeStats() {
 		(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_cs.vote_mem, 0, VK_WHOLE_SIZE);
 		const uint32_t* v = g_cs.vote_mapped + 64;
 		g_cs.st_pixels += static_cast<double>(g_cs.render.width) * g_cs.render.height;
-		g_cs.st_n += v[0], g_cs.st_occ += v[1] / 256.0, g_cs.st_depth += v[2] / 2.0;
+		g_cs.st_n += v[0], g_cs.st_occ += v[1] / 256.0, g_cs.st_depth += v[2] / 2.0, g_cs.st_veg += v[3];
 		++g_cs.st_samples;
 		if (RtSunLevel() > 0) RtSunTakeCalib(v, static_cast<double>(g_cs.render.width) * g_cs.render.height);
 		if (g_cs.hw) {
@@ -8900,9 +8900,11 @@ void CShadowTakeStats() {
 		            100.0 * n / px, g_cs.st_occ / px, n > 0.0 ? g_cs.st_occ / n : 0.0, n > 0.0 ? g_cs.st_depth / n : 0.0,
 		            g_cs.log_k >= 0.0 ? std::exp2(g_cs.log_k) : 0.0, g_cs.sun_factor,
 		            g_cs.samples > 0 ? g_cs.sum_ms / g_cs.samples : 0.0, g_cs.st_samples, g_cs.samples);
+		std::printf("RTSHADOW: vegetation (ds-veg-1029): %.1f %% of pixels classed vegetation (left untouched; no vegetation or flush "
+		            "occluders)\n", 100.0 * g_cs.st_veg / px);
 		std::fflush(stdout);
 	}
-	g_cs.st_pixels = g_cs.st_n = g_cs.st_occ = g_cs.st_depth = 0.0;
+	g_cs.st_pixels = g_cs.st_n = g_cs.st_occ = g_cs.st_depth = g_cs.st_veg = 0.0;
 	g_cs.st_samples = 0;
 	g_cs.sum_ms     = 0.0;
 	g_cs.samples    = 0;
