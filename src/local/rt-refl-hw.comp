@@ -381,8 +381,11 @@ void main() {
 	bool r_out = Sat(acc) > r.smax + 0.02;
 	// The share: zero without history, a slow fade in over ~12 frames, the part the screen-space ray left, lower while
 	// the history is mostly stand-ins. Passed as share^2 in the confidence: the composite takes sqrt(confidence).
-	float ramp = valid ? smoothstep(1.0, 13.0, len) : 0.0;
-	float wf   = miss ? params.x * ramp * mix(0.4, 1.0, q) : 0.0; // (only where the screen-space ray found nothing)
+	// (fgrt-1029) No vanishing when the reflected thing leaves the screen or is under the player: a TLAS hit whose colour
+	// the previous screen cannot give keeps the stand-in (the references' light, the reflector's surroundings) at 85 %
+	// of the share instead of 40 %, from the first frame (half) and at full share after 4 frames, not 12.
+	float ramp = valid ? smoothstep(0.0, 4.0, len) : (miss && hit ? 0.5 : 0.0);
+	float wf   = miss ? params.x * ramp * mix(hit ? 0.85 : 0.4, 1.0, q) : 0.0; // (only where the screen-space ray found nothing)
 	wf         = clamp(isnan(wf) ? 0.0 : wf, 0.0, 0.8);
 	float a2   = wf * wf;
 	vec4 outv  = vec4(rad.rgb + Tonemap(acc) * a2, rad.a + a2);
@@ -405,4 +408,6 @@ void main() {
 	Stat(12, miss && !valid ? 1u : 0u);
 	Stat(13, lim ? 1u : 0u);
 	Stat(14, game_refs ? 1u : 0u);
+	Stat(15, miss && hit && !real && wf > 0.02 ? 1u : 0u); // (fgrt-1029) the TLAS hit's stand-in shown
+	Stat(16, !miss && rad.a > 0.0 ? 1u : 0u);              // (fgrt-1029) the screen-space hit kept
 }

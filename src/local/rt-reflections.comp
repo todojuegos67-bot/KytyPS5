@@ -900,8 +900,15 @@ void Atrous(ivec2 px) {
 		imageStore(out_a, px, c);
 		return;
 	}
+	// (fgrt-1029) Sharp glossy reflections: the passes by roughness (none below 0.12, one below 0.25, all above), and a
+	// smaller radius the glossier the surface.
+	int allowed = rough < 0.12 ? 0 : rough < 0.25 ? 1 : 8;
+	if (push.params.w >= float(1 << allowed)) {
+		imageStore(out_a, px, c);
+		return;
+	}
 	float var  = texelFetch(meta_tex, px, 0).w;
-	float step = push.params.w * mix(0.35, 1.0, smoothstep(0.05, 0.45, rough));
+	float step = push.params.w * mix(0.2, 1.0, smoothstep(0.12, 0.50, rough));
 	// Contact reflections (a short hit distance) stay sharp: the blur grows with the hit distance.
 	// (far away the same pixel radius covers far more surface: the radius shrinks with distance; grazing, sharper)
 	step *= clamp(25.0 / max(g.w, 1e-3), 0.3, 1.0);
@@ -1039,14 +1046,20 @@ vec3 Stabilize(ivec2 px, vec3 c0, vec3 outc, float d) {
 	}
 	vec3 res     = delta;
 	bool limited = false;
+	// (fgrt-1029) In motion the reflection stays sharp: near-full new contribution as soon as the camera or the player
+	// moves (0.25 px), the history clamped to a box around this frame's (no smearing); the slow blend and the change
+	// limit (the flash fix) only on a nearly still camera.
+	float mov = smoothstep(0.25, 1.5, mvp);
+	if (Sampled(px) && mov > 0.5) { Stat(32, 1); Stat(33, valid ? int(100.0 * mix(0.3, 0.97, mov)) : 100); }
 	if (!reset) {
-		float mov   = smoothstep(1.0, 6.0, mvp);
-		float alpha = valid ? mix(0.3, 0.85, mov) : 1.0;
-		vec3  tgt   = mix(hd, delta, alpha);
+		float alpha = valid ? mix(0.3, 0.97, mov) : 1.0;
 		float e     = GameExposure();
 		float lc    = Luma(max(c0, vec3(0)));
 		float lref  = max(max(lc, Luma(max(outc, vec3(0)))), 0.004 / max(e, 1e-12));
-		float lim   = (0.06 + 0.30 * mov) * lref;
+		vec3  box   = vec3(mix(4.0, 0.08, mov) * lref);
+		hd          = clamp(hd, delta - box, delta + box);
+		vec3  tgt   = mix(hd, delta, alpha);
+		float lim   = mov > 0.5 ? 1e30 : (0.06 + 0.60 * mov) * lref;
 		vec3  stp   = tgt - hd;
 		// (a darkening going back toward the game's pixel: twice the rate)
 		if (Luma(hd) < 0.0 && Luma(stp) > 0.0) lim *= 2.0;

@@ -138,7 +138,7 @@ constexpr uint32_t CalibFloors   = CalibBytes + 16 * 3;
 constexpr uint32_t CalibWet      = CalibFloors + 2; // puddle guess: count + 16 byte sums; water: the same
 constexpr uint32_t CalibHist     = 300;             // 16 byte fields x 16 bins
 constexpr uint32_t StatsIndex    = 560;
-constexpr uint32_t StatsCount    = 32;
+constexpr uint32_t StatsCount    = 34; // (fgrt-1029: 32 moving, 33 its blend)
 // (refl9) The metal survey (the shader's SURVEY, mode 8; never cleared): static / moving sample counts, set-bit counts
 // per class x layer x bit, byte histograms per class x field x 16 bins.
 constexpr uint32_t SurveyIndex   = 600;
@@ -496,7 +496,7 @@ constexpr LevelCfg Levels[5] = {
     {"off", false, false, 0, 0.0f, 0, 0.0f, 0.0f, 1.0f},
     {"low", false, true, 24, 0.45f, 1, 200.0f, 0.30f, 1.0f},
     {"medium", false, false, 32, 0.55f, 2, 300.0f, 0.45f, 1.0f},
-    {"high", false, false, 48, 0.60f, 3, 800.0f, 0.75f, 0.9f}, // (10-24 far: 400 m / 0.65)
+    {"high", true, false, 48, 0.60f, 3, 800.0f, 0.75f, 0.9f}, // (10-24 far: 400 m / 0.65)
     {"ultra", true, true, 72, 0.65f, 3, 1600.0f, 1.00f, 0.8f}, // (10-24 far: 64 / 600 m / 0.90)
 };
 const LevelCfg& Cfg(int level) { return Levels[std::clamp(level, 0, 4)]; }
@@ -737,6 +737,14 @@ void LogHwStats(double seconds) {
 	            100.0 * sm[6] / refl, 100.0 * sm[12] / refl, 100.0 * sm[13] / refl, static_cast<unsigned long long>(sm[7]),
 	            static_cast<unsigned long long>(sm[8]), static_cast<unsigned long long>(sm[9]),
 	            static_cast<unsigned long long>(sm[10]), static_cast<unsigned long long>(sm[11]));
+	{
+		// (fgrt-1029) Where the reflective pixels' colour came from: the screen-space hit, the TLAS hit (previous screen),
+		// the TLAS hit's stand-in (the source off screen or hidden: kept, not faded out).
+		const double ss = static_cast<double>(sm[16]), tl = static_cast<double>(sm[3]), sb = static_cast<double>(sm[15]);
+		const double all = std::max(ss + tl + sb, 1.0);
+		std::printf("RT reflections: sources (fgrt-1029): screen-space %.1f%%, TLAS fallback %.1f%% (previous screen %.1f%%, "
+		            "off-screen / hidden stand-in %.1f%%)\n", 100.0 * ss / all, 100.0 * (tl + sb) / all, 100.0 * tl / all, 100.0 * sb / all);
+	}
 	g_rt.hw_sum.fill(0);
 	g_rt.hw_frames = 0, g_rt.hw_skipped = 0;
 }
@@ -845,6 +853,8 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		// a hit's light was limited (fireflies), shares of the non-sky pixels.
 		std::printf("RT reflections: flash fix: last %.0f s: change limited on %.2f%% of the pixels, firefly limited on %.2f%%\n",
 		            std::chrono::duration<double>(now - g_rt.stat_time).count(), 100.0 * sm[30] / px, 100.0 * sm[31] / px);
+		std::printf("RT reflections: motion (fgrt-1029): moving on %.1f%% of the pixels, temporal blend while moving %.0f%% new "
+		            "(history clamped to this frame's box)\n", 100.0 * sm[32] / px, sm[32] ? double(sm[33]) / double(sm[32]) : 0.0);
 	}
 	LogHwStats(std::chrono::duration<double>(now - g_rt.stat_time).count()); // (refl-hybrid-1028)
 	std::fflush(stdout);
