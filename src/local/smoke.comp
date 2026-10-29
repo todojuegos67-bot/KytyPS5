@@ -64,7 +64,7 @@ vec3 ViewPosZ(vec2 uv, float z) {
 	nd.y *= YS();
 	return vec3((nd.x * w - z * push.proj.z) / push.proj.x, (nd.y * w - z * push.proj.w) / push.proj.y, z);
 }
-float Exposure() {
+float GameExposure() {
 	if ((push.misc.z & 8) == 0) return 1.0;
 	float e = exposure_values[push.misc.w];
 	return (e > 1e-12 && e < 1e12) ? e : 1.0;
@@ -81,7 +81,7 @@ const float LO = 0.006; // exposed |D|: no particle
 const float HI = 0.05;  // exposed |D|: a strong particle
 
 void Edge(ivec2 p) {
-	float e  = Exposure();
+	float e  = GameExposure();
 	float m  = Luma(abs(Delta(p))) * e;
 	float z  = ZAt(p);
 	float edge = 0.0;
@@ -121,7 +121,7 @@ void Rows(ivec2 p) {
 
 // (src_tex = the row pass, hist_tex = last frame's fade; game / pre for D, depth for z)
 void Cols(ivec2 p) {
-	float e = Exposure();
+	float e = GameExposure();
 	float m = Luma(abs(Delta(p))) * e;
 	float z = ZAt(p);
 	float fade = 1.0;
@@ -161,7 +161,7 @@ float Window(float d, float R) {
 void Composite(ivec2 p) {
 	vec3  c = texelFetch(color_tex, p, 0).rgb;
 	vec3  D = Delta(p);
-	float e = Exposure();
+	float e = GameExposure();
 	float m = Luma(abs(D)) * e;
 	vec3  corr = vec3(0);
 	if (m >= LO) {
