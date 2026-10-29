@@ -118,7 +118,7 @@ vec3 Eotf(vec3 c) {
 vec3 Encode(vec3 linear_exposed) { return Oetf(clamp(Knee(max(linear_exposed, vec3(0.0))), vec3(0.0), vec3(1.0))); }
 vec3 Decode(vec3 proxy) { return KneeInv(Eotf(clamp(proxy, vec3(0.0), vec3(1.0)))); }
 
-float Exposure() {
+float GameExposure() {
 	float e = exposure_values[push.exposure_index];
 	return (e > 0.0 && e < 65504.0) ? e : 1.0;
 }
@@ -145,7 +145,7 @@ void EncodeMain(ivec2 j) {
 			}
 		color = sum / float(n.x * n.y);
 	}
-	imageStore(proxy_img, j, vec4(Encode(color * Exposure()), 1.0));
+	imageStore(proxy_img, j, vec4(Encode(color * GameExposure()), 1.0));
 	// The guides: nearest (never blend depth across a silhouette), the motion through the warp.
 	vec2  n_now = x / full;
 	vec2  rsize = vec2(push.render);
