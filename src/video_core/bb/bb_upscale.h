@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "common/types.h"
 #include "video_core/bb/bb_sr.h"
@@ -60,6 +61,9 @@ void* ChainDeviceFeatures(vk::PhysicalDevice physical, const std::vector<const c
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device,
               VmaAllocator allocator, vk::Queue queue, u32 family);
 bool BackendReady();
+// A start-up checkpoint: written and flushed at once to bb_upscale_init.log (next to the working
+// directory's shadPS4 log is asynchronous and may be cut off by a crash) and to the log.
+void Checkpoint(std::string_view text);
 
 // ---- Frame tracking (GPU command processor thread) ----
 struct Target {

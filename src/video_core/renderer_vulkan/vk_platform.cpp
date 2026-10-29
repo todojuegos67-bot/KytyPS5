@@ -426,7 +426,15 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         },
     };
 
+    if (BB::Upscale::Enabled()) {
+        BB::Upscale::Checkpoint(fmt::format("vkCreateInstance (layers: {}; extensions: {})",
+                                            layers_string, extensions_string));
+    }
     auto [instance_result, instance] = vk::createInstanceUnique(instance_ci_chain.get());
+    if (BB::Upscale::Enabled()) {
+        BB::Upscale::Checkpoint(
+            fmt::format("vkCreateInstance returned {}", vk::to_string(instance_result)));
+    }
     ASSERT_MSG(instance_result == vk::Result::eSuccess, "Failed to create instance: {}",
                vk::to_string(instance_result));
 

@@ -605,7 +605,16 @@ bool Instance::CreateDevice() {
         bb_ci.pNext = BB::Upscale::ChainDeviceFeatures(physical_device, bb_enabled, bb_f12,
                                                        bb_f13, bb_f, const_cast<void*>(bb_ci.pNext));
     }
+    if (BB::Upscale::Enabled()) {
+        BB::Upscale::Checkpoint(fmt::format("vkCreateDevice with {} extensions: {}",
+                                            enabled_extensions.size(),
+                                            fmt::join(enabled_extensions, " ")));
+    }
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+    if (BB::Upscale::Enabled()) {
+        BB::Upscale::Checkpoint(
+            fmt::format("vkCreateDevice returned {}", vk::to_string(device_result)));
+    }
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
         return false;

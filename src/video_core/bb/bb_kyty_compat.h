@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
+#include <string_view>
 #include <vector>
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -104,6 +105,9 @@ inline uint32_t DisplayHeight(void*) {
 
 } // namespace Libs::Graphics
 
+namespace BB::Upscale {
+void Checkpoint(std::string_view text);
+}
 // The Demon's Souls code prints to stdout; here it goes to shadPS4's log.
 inline void BBLogf(const char* format, ...) {
     char text[1024];
@@ -115,5 +119,5 @@ inline void BBLogf(const char* format, ...) {
     while (n > 0 && (text[n - 1] == '\n' || text[n - 1] == '\r')) {
         text[--n] = '\0';
     }
-    LOG_INFO(Render_Vulkan, "[BB_UPSCALE] {}", text);
+    BB::Upscale::Checkpoint(text);
 }

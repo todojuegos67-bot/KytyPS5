@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -95,6 +96,21 @@ const char* Env(const char* name) {
     return value != nullptr && *value != '\0' ? value : nullptr;
 }
 
+// A crash guard: the upscaler's risky start-up steps (Streamline load, device creation, the first
+// evaluation) run with this file present; a crash leaves it behind and the next start runs native.
+constexpr const char* GuardFile = "bb_upscale_guard.txt";
+std::string g_guard_skipped;
+
+void GuardBegin(const char* kind, const char* step) {
+    if (std::FILE* f = std::fopen(GuardFile, "w")) {
+        std::fprintf(f, "%s\n%s\n", kind, step);
+        std::fclose(f);
+    }
+}
+void GuardEnd() {
+    std::remove(GuardFile);
+}
+
 Config ParseConfig() {
     Config c;
     const std::string up = Lower(Env("BB_UPSCALER"));
@@ -111,6 +127,26 @@ Config ParseConfig() {
         c.kind = SR::Kind::Fsr4;
     } else if (up == "native") {
         c.kind = SR::Kind::Native;
+    }
+    if (c.kind != SR::Kind::Off && c.kind != SR::Kind::Native) {
+        if (std::FILE* f = std::fopen(GuardFile, "r")) {
+            char kind[64]{}, step[128]{};
+            const bool read = std::fgets(kind, sizeof(kind), f) != nullptr &&
+                              std::fgets(step, sizeof(step), f) != nullptr;
+            std::fclose(f);
+            if (Env("BB_UPSCALE_RETRY") != nullptr) {
+                GuardEnd();
+            } else if (read) {
+                std::string k = kind, st = step;
+                while (!k.empty() && (k.back() == '\n' || k.back() == '\r')) k.pop_back();
+                while (!st.empty() && (st.back() == '\n' || st.back() == '\r')) st.pop_back();
+                g_guard_skipped = fmt::format(
+                    "{} crashed the previous start during \"{}\": running NATIVE this time "
+                    "(delete {} or set BB_UPSCALE_RETRY=1 to try it again)",
+                    k, st, GuardFile);
+                c.kind = SR::Kind::Native;
+            }
+        }
     }
     const std::string q = Lower(Env("BB_UPSCALE_MODE"));
     if (up != "dlaa" && !q.empty()) {
@@ -325,6 +361,7 @@ float g_jitter[2]{};
 std::chrono::steady_clock::time_point g_last_flip{};
 float g_delta_ms = 16.7f;
 std::string g_last_point;
+bool g_first_eval_pending = false;
 
 // the current draw
 struct DrawState {
@@ -453,6 +490,23 @@ std::string Describe(const Target& t) {
 
 } // namespace
 
+void Checkpoint(std::string_view text) {
+    static std::mutex m;
+    static std::FILE* file = nullptr;
+    static u32 lines = 0;
+    std::scoped_lock lk{m};
+    if (file == nullptr && lines == 0) {
+        file = std::fopen("bb_upscale_init.log", "w");
+    }
+    if (file != nullptr && lines < 400) {
+        std::fprintf(file, "%.*s\n", static_cast<int>(text.size()), text.data());
+        std::fflush(file);
+    }
+    ++lines;
+    LOG_INFO(Render_Vulkan, "[BB_UPSCALE] {}", text);
+    Common::Log::Flush();
+}
+
 const Config& Cfg() {
     static const Config config = ParseConfig();
     return config;
@@ -464,6 +518,9 @@ bool Enabled() {
 
 void PreInstance() {
     const auto& c = Cfg();
+    if (!g_guard_skipped.empty()) {
+        Checkpoint(g_guard_skipped);
+    }
     if (c.kind == SR::Kind::Off) {
         return;
     }
@@ -475,8 +532,14 @@ void PreInstance() {
              c.mv_reconstruct ? "reconstructed from depth + camera" : "zero",
              c.force_mode == 1 ? "scene" : c.force_mode == 2 ? "composite" : "auto",
              c.hudless_copy ? "on" : "off");
+    if (c.kind != SR::Kind::Off && c.kind != SR::Kind::Native) {
+        GuardBegin(SR::KindName(c.kind), "loading the upscaler and creating the Vulkan device");
+    }
     if (c.kind == SR::Kind::Dlss) {
-        SR::Dlss::Preload();
+        Checkpoint("DLSS: loading Streamline (slInit)");
+        if (!SR::Dlss::Preload()) {
+            Checkpoint("DLSS: Streamline not loaded: DLSS off, the game runs native");
+        }
     } else if (c.kind == SR::Kind::Xess) {
         SR::Xess::Load();
     } else if (c.kind == SR::Kind::Fsr3) {
@@ -491,6 +554,28 @@ const wchar_t* VulkanLoaderOverride() {
 void AddDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
                          const std::vector<std::string>& available,
                          std::vector<const char*>& extensions) {
+    const auto add = [&](const char* name) {
+        const bool has = std::find(available.begin(), available.end(), name) != available.end();
+        const bool added = std::any_of(extensions.begin(), extensions.end(),
+                                       [&](const char* e) { return std::strcmp(e, name) == 0; });
+        if (has && !added) {
+            extensions.push_back(name);
+        }
+        Checkpoint(fmt::format("device extension {} for {}: {}", name, SR::KindName(Cfg().kind),
+                               has ? "added" : "NOT available"));
+    };
+    if (Cfg().kind == SR::Kind::Dlss && SR::Dlss::LoaderPath() != nullptr) {
+        // Streamline enables VK_NV_low_latency2 (Reflex) on the device whatever plugins it loads,
+        // without the present-id extension that needs: the driver then refuses (or crashes in)
+        // vkCreateDevice. The Demon's Souls fork adds it the same way (vulkanWindow.cpp).
+        add(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+    }
+    if (Cfg().kind == SR::Kind::Fsr3) {
+        // The FidelityFX backend calls vkGetBufferMemoryRequirements2KHR by the extension's name
+        // (null without the extension): the Demon's Souls fork adds both (vulkanWindow.cpp).
+        add(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
+        add(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
+    }
     if (Cfg().kind == SR::Kind::Xess) {
         SR::Xess::AddDeviceExtensions(instance, physical, available, extensions);
     } else if (Cfg().kind == SR::Kind::Fsr4) {
@@ -530,8 +615,10 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
         break;
     }
     if (Enabled()) {
-        LOG_INFO(Render_Vulkan, "[BB_UPSCALE] {} back end {}", SR::KindName(Cfg().kind),
-                 BackendReady() ? "ready" : "NOT available: the game is shown as it renders");
+        Checkpoint(fmt::format("{} back end {}", SR::KindName(Cfg().kind),
+                               BackendReady() ? "ready"
+                                              : "NOT available: the game runs native (no upscale)"));
+        GuardEnd();
     }
 }
 
@@ -764,6 +851,14 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
         vk::to_string(format), p.hdr ? "HDR" : "LDR", p.depth_addr, p.output_w, p.output_h,
         g_learned.skip, p.camera_valid ? "reconstructed (camera found)" : "zero (no camera)",
         p.depth_inverted ? "inverted" : "forward"));
+    static bool first = true;
+    if (first) {
+        first = false;
+        GuardBegin(SR::KindName(Cfg().kind), "the first upscale");
+        Checkpoint(fmt::format("{}: first upscale {}x{} -> {}x{}", SR::KindName(Cfg().kind),
+                               p.render_w, p.render_h, p.output_w, p.output_h));
+        g_first_eval_pending = true;
+    }
     return Sample::Inject;
 }
 
@@ -863,6 +958,12 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         g_learned.have_prev_vp = false;
     }
     g_learned.last_injected = f.injected;
+    if (g_first_eval_pending) {
+        g_first_eval_pending = false;
+        GuardEnd();
+        Checkpoint(fmt::format("{}: first upscaled frame {}", SR::KindName(Cfg().kind),
+                               f.injected ? "done" : "FAILED: the game runs native"));
+    }
 
     ++g_stats.frames;
     g_stats.injected += f.injected ? 1 : 0;
