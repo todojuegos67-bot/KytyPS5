@@ -427,7 +427,7 @@ function Start-Game {
 		# (vol25) KYTY_RT_SUN=0: la sombra RT de pantalla a fuerza 0 da el sol a la volumetrica en cada frame (sin niebla que salta).
 		$sets += 'KYTY_RT_SUN=0'
 	} else { foreach ($n in 'KYTY_RT_SHADOWS', 'KYTY_RT_SHADOWS_STRENGTH') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue } }  # (audit) ni volumetrica ni Sombras RT: nada
-	if (-not $pureGame -and $cmbTorch -and $cmbTorch.SelectedIndex -gt 0) { $sets += "KYTY_TORCH=$([math]::Min(3, $cmbTorch.SelectedIndex))" }
+	if (-not $pureGame -and $cmbTorch -and $cmbTorch.SelectedIndex -gt 0) { $sets += "KYTY_TORCH=$([math]::Min(3, $cmbTorch.SelectedIndex))" } else { $sets += 'KYTY_TORCH=0' }
 	if (-not $pureGame -and $cmbTorch -and $cmbTorch.SelectedIndex -ge 4) {  # (torch-shadow-1028) Hibrido: la escena por hardware (TLAS) solo para la luz de antorchas
 		$sets += @('KYTY_TORCH_HW=1', 'KYTY_RT_HW_EXPERIMENTAL=1', 'KYTY_HWRT=1')
 		if ((Get-IniValue 'rthwexp' '0') -ne '1') { $sets += @('KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_SUN=0') }
@@ -440,9 +440,8 @@ function Start-Game {
 	if ($cmbDof -and -not $pureGame) { $sets += "KYTY_DOF=$([math]::Min(3, [math]::Max(0, $cmbDof.SelectedIndex)))" } else { $sets += 'KYTY_DOF=0' }  # (ds-dof-1029) profundidad de campo a distancia: No/Suave/Cinematico/Fuerte
 	$fovI = if ($cmbFov -and -not $pureGame) { [math]::Min(4, [math]::Max(0, $cmbFov.SelectedIndex)) } else { 0 }  # (ds-foveated-1029) DLSS 5 NR: No / PreSR / Foveado Suave / Medio / Fuerte
 	$fovU = "KYTY_DLSS_NR_UNSIGNED=$(if ($cmbFovU -and $cmbFovU.SelectedIndex -eq 1) { '1' } else { '0' })"  # Archivo DLSS 5: oficial / no oficial
-	$fovS = "KYTY_DLSS_NR_STRENGTH=$(if ($cmbFovS) { @('0.35', '0.65', '1')[[math]::Min(2, [math]::Max(0, $cmbFovS.SelectedIndex))] } else { '1' })"  # Intensidad DLSS 5: Baja / Media / Alta
-	if ($fovI -eq 1) { $sets += @('KYTY_DLSS_NR=1', 'KYTY_DLSS_NR_PRESR=1', 'KYTY_FOVEATED=0', $fovU, $fovS) }  # PreSR: antes del reescalado, a la resolucion de render
-	elseif ($fovI -ge 2) { $sets += @('KYTY_FOVEATED=1', 'KYTY_DLSS_NR_PRESR=0', $fovU, $fovS, "KYTY_FOV_EDGE=$(@('0.5', '0.5', '0.75', '0.5', '0.35')[$fovI])") }  # foveado despues del reescalado: borde 0,75 / 0,5 / 0,35
+	if ($fovI -eq 1) { $sets += @('KYTY_DLSS_NR=1', 'KYTY_DLSS_NR_PRESR=1', 'KYTY_FOVEATED=0', $fovU) }  # PreSR: antes del reescalado, a la resolucion de render
+	elseif ($fovI -ge 2) { $sets += @('KYTY_FOVEATED=1', 'KYTY_DLSS_NR_PRESR=0', $fovU, "KYTY_FOV_EDGE=$(@('0.5', '0.5', '0.75', '0.5', '0.35')[$fovI])") }  # foveado despues del reescalado: borde 0,75 / 0,5 / 0,35
 	else { $sets += @('KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0', 'KYTY_DLSS_NR_PRESR=0') }
 	if ($pureGame) {
 		# (audit) Juego original: fuera todo pase visual del emulador (RT, volumetrica, sombra RT, brillo, oclusion especular, GTAO,
@@ -2316,7 +2315,7 @@ $cmbRtSh = $null  # (10-29) Sombras RT retiradas (se veian mal)
 $cmbAoNew = $null  # (10-29) Path tracing retirado (se veia mal)
 $cmbRays = New-RtCombo 'Luz volumetrica' 'godrays2' 24 'Luz volumetrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms (mas rayos y mas pasos de sombra).' @('No', 'Bajo', 'Medio', 'Alto')
 $cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl2' 56 'Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, mas nitidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolucion completa y mas fuertes). Hybrid: High + hardware rays (real RT) only where the screen-space ray finds nothing (off-screen or hidden); the colour comes from the previous screen, limited to its surroundings and faded in slowly: no flashes. Needs an RT-capable GPU. ~+0.5 ms. Beta.' @('No', 'Bajo', 'Medio', 'Alto', 'Ultra', 'Extreme', 'Hybrid')  # (10-25 noche) Extremo = nivel 5 (refl10)  # (10-25) refl8; Ultra vuelve: el cierre era del frame generation AMD, no de los reflejos  # (refl-hybrid-1028) Hibrido = 6
-$cmbTorch = New-RtCombo 'RT torch light' 'torchrt' 536 'RT torch light: fire from torches, braziers and bonfires lights nearby walls, floors and structures with a warm flickering bounce, and is reflected on smooth or wet surfaces. It does not leak through walls or characters (checked against the depth). Screen-space only, no hardware RT. Only with DLSS, XeSS or FSR. Low 2 fires ~0.3 ms, Medium 4 ~0.5 ms, High 8 ~0.9 ms. Hybrid: High + hardware rays (real RT) where the screen cannot see what blocks the light (off-screen or behind something else); it only darkens, never adds light. Needs an RT-capable GPU. ~+0.5 ms.' @('No', 'Low', 'Medium', 'High', 'Hybrid')  # (torch-1028) (torch-shadow-1028) Hybrid
+$cmbTorch = $null  # (10-29) Luz de antorchas RT retirada (no gustaba el efecto)
 $cmbFlare = New-RtCombo 'Lens flare' 'lensflare' 568 'Lens flare from visible torches and fires: small lens ghosts, a soft star and streak. It fades out when the fire is hidden and near the screen edges. No halo, no screen-wide glow. Drawn before the HUD. Only with DLSS, XeSS or FSR. ~0.1 ms.' @('No', 'Yes')  # (torch-1028)
 $cmbDof = $null  # (10-29) profundidad de campo retirada
 $cmbSmoke = New-RtCombo 'Smoke & particles' 'smoke1029' 632 'More realistic smoke and particles on top of the game''s own (full resolution): Soft = smoke, particle fog and sparks no longer cut in a hard line where they meet floors and walls (they fade in over ~35 cm, film-style). Torches = also smoke near torches and braziers glows with their warm light (4.5 m radius, no flicker; needs RT torch light). Stable, no new shimmer. Only with DLSS, XeSS or FSR. ~0.3-0.6 ms.' @('No', 'Soft', 'Torches')  # (ds-particles-1029) KYTY_SMOKE
@@ -2810,16 +2809,8 @@ try {
 	$cmbFovU.Add_SelectedIndexChanged({ param($sender, $e) Set-IniValue $sender.Tag "$($sender.SelectedIndex)" })
 	$tips.SetToolTip($cmbFovU, 'Which nvngx_dlssnr.dll is accepted: Official = only with a valid NVIDIA signature. Unofficial = modified copies too (no valid signature); they work, but they are not from NVIDIA and nothing about them can be guaranteed. At your own risk.')
 	Move-To $lbFovU $gImg 10 186 112; Move-To $cmbFovU $gImg 124 184 282
-	$lbFovS = New-Label 'DLSS 5 strength' $smallFont $ink 0 0 88 22; $panel.Controls.Add($lbFovS)
-	$cmbFovS = New-Object System.Windows.Forms.ComboBox
-	$cmbFovS.DropDownStyle = 'DropDownList'; $cmbFovS.Font = $smallFont; $cmbFovS.Tag = 'dlss5strength'
-	foreach ($it in @('Low', 'Medium', 'High')) { [void]$cmbFovS.Items.Add($it) }
-	$v = 2; [void][int]::TryParse((Get-IniValue 'dlss5strength' '2'), [ref]$v); $cmbFovS.SelectedIndex = [math]::Min([math]::Max(0, $v), 2)
-	$cmbFovS.Add_SelectedIndexChanged({ param($sender, $e) Set-IniValue $sender.Tag "$($sender.SelectedIndex)" })
-	$tips.SetToolTip($cmbFovS, 'How much DLSS 5 Neural Rendering changes the image: Low = a touch, Medium = in between, High = the full effect (default).')
-	Move-To $lbFovS $gImg 10 218 112; Move-To $cmbFovS $gImg 124 216 282
-	$gImg.Height = $gImg.Height + 96
-	foreach ($g2 in @($gGfx, $gRt)) { if ($g2) { $g2.Top = $g2.Top + 96 } }
+	$gImg.Height = $gImg.Height + 64
+	foreach ($g2 in @($gGfx, $gRt)) { if ($g2) { $g2.Top = $g2.Top + 64 } }
 	if ($chkPure) { $cmbFov.Enabled = -not $chkPure.Checked }
 } catch { }
 # (10-26) Al elegir cualquier Modo Souls: todo el ray tracing en No (el usuario lo enciende a mano despues).
