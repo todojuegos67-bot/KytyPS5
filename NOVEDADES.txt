@@ -6,6 +6,11 @@ Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
 
 00. NUEVO (29-10) / NEW (29-10)
 -------------------------------
+- DLSS-G (NVIDIA): Reflex ahora va DENTRO del juego: su espera al empezar el fotograma del juego (lectura del mando),
+  marcadores de simulacion / envio / presentacion con el mismo numero de fotograma. Reflex es el unico limitador con
+  DLSS-G (sin el pacer del emulador). Linea [reflex] cada 10 s. KYTY_DLSSG_REFLEX_GAME=0: como antes.
+  DLSS-G: Reflex now runs INSIDE the game (sleep at the game's frame start, same frame ID on every marker); it is the
+  only pacer with DLSS-G. [reflex] log line every 10 s. KYTY_DLSSG_REFLEX_GAME=0: the old behaviour.
 - DLSS 5 (Neural Rendering, foveado): necesita nvngx_dlssnr.dll propio junto a kyty_emulator.exe; no se incluye.
   Launcher, Imagen > DLSS 5: No / PreSR (rapido) / Foveado Suave / Medio / Fuerte. Archivo DLSS 5: Oficial (por defecto).
   DLSS 5 (Neural Rendering, foveated): needs your own nvngx_dlssnr.dll next to kyty_emulator.exe; not included.
