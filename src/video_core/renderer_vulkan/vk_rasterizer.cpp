@@ -890,6 +890,18 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    if (VAddr bb_flip = 0; BB::Upscale::Enabled() && BB::Upscale::WantPresentUpscale(bb_flip)) {
+        bool ok = false;
+        const u32 bb_num_cb = static_cast<u32>(std::bit_width(pipeline->GetGraphicsKey().mrt_mask));
+        for (u32 cb = 0; cb < bb_num_cb && cb < cb_descs.size(); ++cb) {
+            if (cb_descs[cb].first &&
+                texture_cache.GetImage(cb_descs[cb].first).info.guest_address == bb_flip) {
+                ok = BBPresentUpscale(texture_cache.GetImage(cb_descs[cb].first));
+                break;
+            }
+        }
+        BB::Upscale::OnPresentUpscaled(ok);
+    }
     if (BB::Upscale::Enabled() && BB::Upscale::WantHudlessCopy() && cb_descs[0].first) {
         BBHudlessCopy(texture_cache.GetImage(cb_descs[0].first));
     }

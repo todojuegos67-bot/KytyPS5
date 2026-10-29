@@ -10,6 +10,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/bb/bb_analyze.h"
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/host_shaders/bb_hud_comp.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -45,6 +46,16 @@ struct BBVk {
     OwnImage mv;
     OwnImage output;
     OwnImage hudless;
+    // Upscaling to the window size: the presented image (upscale + HUD) and its pass.
+    OwnImage present_in; // RGBA16F copy of the presented image before the HUD
+    OwnImage present;
+    bool present_ready = false;
+    VAddr present_flip = 0;
+    bool hud_init = false, hud_failed = false;
+    vk::DescriptorSetLayout hud_set_layout{};
+    vk::PipelineLayout hud_layout{};
+    vk::Pipeline hud_pipeline{};
+    vk::Sampler linear{};
     vk::QueryPool queries{};
     std::array<bool, 8> query_pending{};
     u32 query_slot = 0;
@@ -243,6 +254,94 @@ vk::ImageView TransientView(Scheduler& scheduler, vk::Image image, vk::Format fo
     return view;
 }
 
+bool InitHud() {
+    if (g_bb.hud_init || g_bb.hud_failed) {
+        return g_bb.hud_init;
+    }
+    g_bb.hud_failed = true;
+    const auto device = g_bb.device;
+    std::array<vk::DescriptorSetLayoutBinding, 4> bindings{};
+    for (u32 i = 0; i < bindings.size(); ++i) {
+        bindings[i] = vk::DescriptorSetLayoutBinding{
+            .binding = i,
+            .descriptorType = i < 3 ? vk::DescriptorType::eCombinedImageSampler
+                                    : vk::DescriptorType::eStorageImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        };
+    }
+    auto [set_result, set_layout] =
+        device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        });
+    if (set_result != vk::Result::eSuccess) {
+        return false;
+    }
+    g_bb.hud_set_layout = set_layout;
+    const vk::PushConstantRange push{
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = 16,
+    };
+    auto [layout_result, layout] = device.createPipelineLayout(vk::PipelineLayoutCreateInfo{
+        .setLayoutCount = 1,
+        .pSetLayouts = &g_bb.hud_set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push,
+    });
+    if (layout_result != vk::Result::eSuccess) {
+        return false;
+    }
+    g_bb.hud_layout = layout;
+    const auto module = Compile(HostShaders::BB_HUD_COMP, vk::ShaderStageFlagBits::eCompute, device);
+    if (!module) {
+        return false;
+    }
+    auto [pipe_result, pipeline] = device.createComputePipeline(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage =
+                    vk::PipelineShaderStageCreateInfo{
+                        .stage = vk::ShaderStageFlagBits::eCompute,
+                        .module = module,
+                        .pName = "main",
+                    },
+                .layout = g_bb.hud_layout,
+            });
+    device.destroyShaderModule(module);
+    if (pipe_result != vk::Result::eSuccess) {
+        return false;
+    }
+    g_bb.hud_pipeline = pipeline;
+    auto [sampler_result, sampler] = device.createSampler(vk::SamplerCreateInfo{
+        .magFilter = vk::Filter::eLinear,
+        .minFilter = vk::Filter::eLinear,
+        .mipmapMode = vk::SamplerMipmapMode::eNearest,
+        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+    });
+    if (sampler_result != vk::Result::eSuccess) {
+        return false;
+    }
+    g_bb.linear = sampler;
+    g_bb.hud_failed = false;
+    g_bb.hud_init = true;
+    return true;
+}
+
+bool IsSrgb(vk::Format f) {
+    switch (f) {
+    case vk::Format::eR8G8B8A8Srgb:
+    case vk::Format::eB8G8R8A8Srgb:
+    case vk::Format::eA8B8G8R8SrgbPack32:
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace
 
 bool Rasterizer::BBInject(VideoCore::ImageId color_id, vk::ImageView& out_view,
@@ -252,15 +351,172 @@ bool Rasterizer::BBInject(VideoCore::ImageId color_id, vk::ImageView& out_view,
         return false;
     }
     ReadTimestamps();
+    auto& color = texture_cache.GetImage(color_id);
+    if (color.info.size.width != plan.render_w || color.info.size.height != plan.render_h) {
+        return false;
+    }
+    scheduler.EndRendering();
+    color.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {});
+    const auto color_view =
+        TransientView(scheduler, color.GetImage(), color.info.pixel_format,
+                      vk::ImageAspectFlagBits::eColor);
+    if (!color_view ||
+        !BBRecordUpscale(color.GetImage(), color_view, color.info.pixel_format, color.usage_flags)) {
+        return false;
+    }
+    out_view = g_bb.output.view;
+    out_layout = vk::ImageLayout::eGeneral;
+    return true;
+}
+
+bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
+    const auto& plan = BB::Upscale::CurrentPlan();
+    g_bb.present_ready = false;
+    if (!InitOnce(instance) || !InitHud()) {
+        return false;
+    }
+    ReadTimestamps();
+    if (flip.info.size.width != plan.render_w || flip.info.size.height != plan.render_h) {
+        return false;
+    }
+    // The post-processed image before the HUD, blitted into RGBA16F (a format every back end
+    // takes, whatever the presented image's format): the upscaler's input, and the HUD's reference.
+    const auto features =
+        instance.GetPhysicalDevice().getFormatProperties(flip.info.pixel_format).optimalTilingFeatures;
+    if (!(features & vk::FormatFeatureFlagBits::eBlitSrc) ||
+        !(features & vk::FormatFeatureFlagBits::eSampledImageFilterLinear)) {
+        LOG_WARNING(Render_Vulkan, "[BB_UPSCALE] the presented image's format {} cannot be blitted",
+                    vk::to_string(flip.info.pixel_format));
+        return false;
+    }
+    const vk::Extent2D extent{flip.info.size.width, flip.info.size.height};
+    if (!EnsureImage(g_bb.present_in, extent, vk::Format::eR16G16B16A16Sfloat,
+                     vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled)) {
+        return false;
+    }
+    scheduler.EndRendering();
+    flip.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
+    const auto cmd = scheduler.CommandBuffer();
+    Barrier(cmd, g_bb.present_in, vk::ImageLayout::eTransferDstOptimal,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+    const std::array<vk::Offset3D, 2> corners{
+        vk::Offset3D{0, 0, 0},
+        vk::Offset3D{static_cast<s32>(extent.width), static_cast<s32>(extent.height), 1}};
+    const vk::ImageBlit blit{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .srcOffsets = corners,
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstOffsets = corners,
+    };
+    cmd.blitImage(flip.GetImage(), vk::ImageLayout::eTransferSrcOptimal, g_bb.present_in.image,
+                  vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+    Barrier(cmd, g_bb.present_in, vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    if (!BBRecordUpscale(g_bb.present_in.image, g_bb.present_in.view, g_bb.present_in.format,
+                         g_bb.present_in.usage)) {
+        return false;
+    }
+    g_bb.present_ready = true;
+    g_bb.present_flip = flip.info.guest_address;
+    return true;
+}
+
+bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& flip,
+                                    vk::Format view_format, vk::ImageView& out_view,
+                                    vk::Extent2D& out_size) {
+    if (!g_bb.present_ready || g_bb.present_flip != flip.info.guest_address) {
+        return false;
+    }
+    g_bb.present_ready = false;
+    const vk::Extent2D render{flip.info.size.width, flip.info.size.height};
+    const vk::Extent2D output = g_bb.output.extent;
+    if (!g_bb.hud_init || !g_bb.output.image || !g_bb.present_in.image ||
+        g_bb.present_in.extent != render) {
+        return false;
+    }
+    if (!EnsureImage(g_bb.present, output, vk::Format::eR16G16B16A16Sfloat,
+                     vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled)) {
+        BB::Upscale::OnPresentFailed("the presented image was not created");
+        return false;
+    }
+    const auto final_view = TransientView(scheduler, flip.GetImage(), flip.info.pixel_format,
+                                          vk::ImageAspectFlagBits::eColor);
+    if (!final_view) {
+        BB::Upscale::OnPresentFailed("no view of the presented image");
+        return false;
+    }
+    Barrier(cmd, g_bb.present, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader,
+            vk::AccessFlagBits2::eShaderWrite);
+    struct {
+        u32 size[4];
+    } push{{output.width, output.height,
+            IsSrgb(view_format) && !IsSrgb(flip.info.pixel_format) ? 1u : 0u, 0u}};
+    const vk::DescriptorImageInfo up_info{g_bb.linear, g_bb.output.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo final_info{g_bb.linear, final_view,
+                                             vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo bare_info{g_bb.linear, g_bb.present_in.view,
+                                            vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo out_info{{}, g_bb.present.view, vk::ImageLayout::eGeneral};
+    const std::array writes{
+        vk::WriteDescriptorSet{
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &up_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &final_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstBinding = 2,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &bare_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstBinding = 3,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .pImageInfo = &out_info,
+        },
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_bb.hud_pipeline);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bb.hud_layout, 0, writes);
+    cmd.pushConstants(g_bb.hud_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+    cmd.dispatch((output.width + 7) / 8, (output.height + 7) / 8, 1);
+    Barrier(cmd, g_bb.present, vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    static bool said = false;
+    if (!said) {
+        said = true;
+        LOG_INFO(Render_Vulkan,
+                 "[BB_UPSCALE] presenting the upscaled image {}x{} (game output {}x{}, HUD added "
+                 "on top{})",
+                 output.width, output.height, render.width, render.height,
+                 push.size[2] ? ", sRGB decoded for the presenter" : "");
+    }
+    out_view = g_bb.present.view;
+    out_size = output;
+    return true;
+}
+
+bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view,
+                                 vk::Format color_format, vk::ImageUsageFlags color_usage) {
+    const auto& plan = BB::Upscale::CurrentPlan();
     if (!bb_gb_depth_valid) {
         return false;
     }
     const auto depth_id = texture_cache.FindImage(bb_gb_depth_desc);
     auto& depth = texture_cache.GetImage(depth_id);
-    auto& color = texture_cache.GetImage(color_id);
     if (depth.info.guest_address != plan.depth_addr || depth.info.size.width != plan.render_w ||
-        depth.info.size.height != plan.render_h || !depth.info.props.is_depth ||
-        color.info.size.width != plan.render_w || color.info.size.height != plan.render_h) {
+        depth.info.size.height != plan.render_h || !depth.info.props.is_depth) {
         static bool said = false;
         if (!said) {
             said = true;
@@ -268,7 +524,7 @@ bool Rasterizer::BBInject(VideoCore::ImageId color_id, vk::ImageView& out_view,
                         "[BB_UPSCALE] depth {:#x} {}x{} does not match the colour {}x{}: no "
                         "upscale",
                         depth.info.guest_address, depth.info.size.width, depth.info.size.height,
-                        color.info.size.width, color.info.size.height);
+                        plan.render_w, plan.render_h);
         }
         return false;
     }
@@ -284,14 +540,10 @@ bool Rasterizer::BBInject(VideoCore::ImageId color_id, vk::ImageView& out_view,
     }
 
     scheduler.EndRendering();
-    color.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {});
     depth.Transit(vk::ImageLayout::eDepthStencilReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
                   {});
     const auto cmd = scheduler.CommandBuffer();
 
-    const auto color_view =
-        TransientView(scheduler, color.GetImage(), color.info.pixel_format,
-                      vk::ImageAspectFlagBits::eColor);
     const auto depth_view =
         TransientView(scheduler, depth.GetImage(), depth.info.pixel_format,
                       vk::ImageAspectFlagBits::eDepth);
@@ -365,8 +617,8 @@ bool Rasterizer::BBInject(VideoCore::ImageId color_id, vk::ImageView& out_view,
 
     BB::SR::Desc desc{};
     desc.cmd = cmd;
-    desc.color = {color.GetImage(), color_view, color.info.pixel_format, render,
-                  vk::ImageLayout::eShaderReadOnlyOptimal, color.usage_flags};
+    desc.color = {color_image, color_view, color_format, render,
+                  vk::ImageLayout::eShaderReadOnlyOptimal, color_usage};
     desc.depth = {depth.GetImage(), depth_view, depth.info.pixel_format, render,
                   vk::ImageLayout::eDepthStencilReadOnlyOptimal, depth.usage_flags};
     desc.motion = {g_bb.mv.image, g_bb.mv.view, g_bb.mv.format, render,
@@ -409,12 +661,7 @@ bool Rasterizer::BBInject(VideoCore::ImageId color_id, vk::ImageView& out_view,
         g_bb.query_pending[slot] = true;
         g_bb.query_slot = (slot + 1) % g_bb.query_pending.size();
     }
-    if (!ok) {
-        return false;
-    }
-    out_view = g_bb.output.view;
-    out_layout = vk::ImageLayout::eGeneral;
-    return true;
+    return ok;
 }
 
 bool Rasterizer::BBUpscaledView(vk::ImageView& out_view, vk::ImageLayout& out_layout) const {

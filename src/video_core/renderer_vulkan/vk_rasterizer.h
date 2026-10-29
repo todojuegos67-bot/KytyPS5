@@ -42,6 +42,14 @@ public:
         return texture_cache;
     }
 
+    // Bloodborne upscaling to the window size (vk_rasterizer_bb.cpp): when this frame's flip image
+    // was upscaled before its HUD, adds the HUD onto the upscaled image (recorded into cmd, the
+    // flip image in shader-read layout) and returns that image's view and size to present.
+    bool BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& flip, vk::Format view_format,
+                            vk::ImageView& out_view, vk::Extent2D& out_size);
+    // Copies the presented image (before its HUD) and records the window-size upscale of it.
+    bool BBPresentUpscale(VideoCore::Image& flip);
+
     void Draw(bool is_indexed, u32 index_offset = 0);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address);
@@ -155,6 +163,8 @@ private:
                   vk::ImageLayout& out_layout);
     bool BBUpscaledView(vk::ImageView& out_view, vk::ImageLayout& out_layout) const;
     void BBHudlessCopy(VideoCore::Image& flip);
+    bool BBRecordUpscale(vk::Image image, vk::ImageView view, vk::Format format,
+                         vk::ImageUsageFlags usage);
     void BBOnDraw(u32 num_cb);
     bool attachment_feedback_loop{};
 };

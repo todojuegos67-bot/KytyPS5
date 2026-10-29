@@ -713,6 +713,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
 
     Frame* frame = GetRenderFrame();
+    if (BB::Upscale::Enabled()) {
+        // The presentation size (the window's game area): the upscaler's output size.
+        BB::Upscale::SetPresentSize(frame->width, frame->height);
+    }
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -769,13 +773,29 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                             readback);
     }
 
+    // Bloodborne: no HUD point this frame (no HUD drawn): the window-size upscale runs here.
+    if (BB::Upscale::Enabled() && BB::Upscale::TakeLateUpscale() &&
+        !rasterizer->BBPresentUpscale(image)) {
+        BB::Upscale::OnPresentFailed("the upscale at present failed");
+    }
+
     // Continue with host-side passes that draw the displayed (scaled) frame.
     image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
                   cmdbuf);
 
-    image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
+    // Bloodborne upscaling to the window size: the upscaled image with the HUD on top instead.
+    vk::Extent2D bb_size = image_size;
+    if (vk::ImageView bb_view{}; BB::Upscale::Enabled() &&
+                                 rasterizer->BBPresentComposite(cmdbuf, image, view_info.format,
+                                                                bb_view, bb_size)) {
+        image_view = bb_view;
+    } else {
+        bb_size = image_size;
+    }
+
+    image_view = fsr_pass.Render(cmdbuf, image_view, bb_size, {frame->width, frame->height},
                                  fsr_settings, frame->is_hdr);
-    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    pp_pass.Render(cmdbuf, image_view, bb_size, *frame, pp_settings);
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};

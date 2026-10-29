@@ -42,6 +42,7 @@ struct Config {
     bool mv_reconstruct = true;
     bool hudless_copy = false;
     int force_mode = 0; // 0 auto, 1 scene, 2 composite
+    bool to_window = true; // BB_UPSCALE_TO_WINDOW=0: never upscale past the game's own output size
     VAddr force_source = 0;
     u32 log_every = 600;
 };
@@ -127,5 +128,23 @@ const Plan& CurrentPlan();
 void OnInjected(bool ok, float mv_ms_unused);
 void OnGpuTime(double ms);
 void OnHudlessCopied();
+
+// ---- Upscaling to the window size ----
+// When the game renders its whole frame (3D, post-processing and HUD) at one size below the
+// presentation size (the frame the presenter scales the flip image into: the window), the upscaler
+// runs on the post-processed image just before the first HUD draw (an LDR copy of the presented
+// image), into an image at the presentation size; the presenter then adds the HUD on top (the
+// difference between the final presented image and that copy) and presents it. Any failure turns
+// it off for the session and the in-place path runs as before.
+void SetPresentSize(u32 width, u32 height); // the presenter's frame size, every flip
+// The current draw renders into the presented image: true once per frame, at its first HUD draw
+// (it samples no render-size image), when the upscale to the window size should run before it;
+// CurrentPlan() then describes it and `flip` is the presented image's address.
+bool WantPresentUpscale(VAddr& flip);
+void OnPresentUpscaled(bool ok);
+// No HUD point this frame although the scene was drawn: true once (at the flip), and the presenter
+// then runs the window-size upscale on the finished image (CurrentPlan()).
+bool TakeLateUpscale();
+void OnPresentFailed(std::string_view why);
 
 } // namespace BB::Upscale

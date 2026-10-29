@@ -19,6 +19,7 @@ set(SHADER_FILES
     post_process.frag
     tiling.comp
     bb_mv.comp
+    bb_hud.comp
     bb_fsr4_prep.comp
 )
 

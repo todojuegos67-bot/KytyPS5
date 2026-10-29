@@ -1,0 +1,38 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// The HUD on top of the window-size upscale (BB upscaling, bb_upscale.h): the game drew its HUD
+// at its own size into the presented image after the copy the upscaler read (hudless). Where the two
+// differ, that difference (the HUD, scaled to the window with bilinear filtering) is added to the
+// upscaled image; where the HUD covers the scene the game's own pixels are taken. Without HUD the
+// difference is exactly zero and the upscaled image is presented as is.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D upscaled_tex;
+layout(binding = 1) uniform sampler2D final_tex;
+layout(binding = 2) uniform sampler2D hudless_tex;
+layout(binding = 3, rgba16f) uniform writeonly image2D out_img;
+layout(push_constant) uniform Push {
+    uvec4 size; // width, height, decode sRGB (the presenter samples the flip through an sRGB view)
+} p;
+
+vec3 SrgbToLinear(vec3 c) {
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= int(p.size.x) || c.y >= int(p.size.y)) {
+        return;
+    }
+    vec2 uv = (vec2(c) + 0.5) / vec2(p.size.xy);
+    vec3 up = clamp(texelFetch(upscaled_tex, c, 0).rgb, 0.0, 1.0);
+    vec3 fin = textureLod(final_tex, uv, 0.0).rgb;
+    vec3 bare = textureLod(hudless_tex, uv, 0.0).rgb;
+    vec3 hud = fin - bare;
+    float cover = smoothstep(0.25, 0.5, max(max(abs(hud.r), abs(hud.g)), abs(hud.b)));
+    vec3 color = clamp(mix(up + hud, fin, cover), 0.0, 1.0);
+    if (p.size.z != 0u) {
+        color = SrgbToLinear(color);
+    }
+    imageStore(out_img, c, vec4(color, 1.0));
+}

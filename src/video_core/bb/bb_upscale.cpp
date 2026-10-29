@@ -191,6 +191,9 @@ Config ParseConfig() {
     }
     const std::string at = Lower(Env("BB_UPSCALE_AT"));
     c.force_mode = at == "scene" ? 1 : at == "composite" ? 2 : 0;
+    if (const char* s = Env("BB_UPSCALE_TO_WINDOW")) {
+        c.to_window = s[0] != '0';
+    }
     if (const char* s = Env("BB_UPSCALE_SRC")) {
         c.force_source = std::strtoull(s, nullptr, 0);
     }
@@ -360,6 +363,7 @@ struct FrameState {
     u64 scanned_draw = ~0ULL;
     u32 flip_draws = 0, hud_draws = 0, hud_other = 0, src_rewrites = 0;
     bool injected = false, inject_failed = false, redirecting = false, hudless = false;
+    bool present = false; // upscaled to the window size this frame
     std::vector<Candidate> camera;
 };
 
@@ -399,6 +403,10 @@ std::chrono::steady_clock::time_point g_last_flip{};
 float g_delta_ms = 16.7f;
 std::string g_last_point;
 bool g_first_eval_pending = false;
+// Upscaling to the window size (SetPresentSize).
+u32 g_present_w = 0, g_present_h = 0;
+bool g_present_dead = false;
+bool g_late_upscale = false; // no HUD point this frame: the presenter upscales the flip image
 
 // the current draw
 struct DrawState {
@@ -411,6 +419,7 @@ struct DrawState {
     bool scene = false;
     bool targets_flip = false;
     bool sampled_upscaled = false;
+    bool samples_render_size = false; // samples a render-size colour image it does not draw into
     bool analyze_dump = false;
 } g_draw;
 
@@ -458,8 +467,27 @@ VAddr LearnedSource() {
     return SceneMode() ? g_learned.scene_color : g_learned.comp_src;
 }
 
+void FillPresentPlan(VAddr flip, const char* where);
+
 bool Active() {
     return Cfg().kind != SR::Kind::Off && Cfg().kind != SR::Kind::Native && BackendReady();
+}
+
+// The game renders its whole frame at the presented image's size (scene mode), and the window is
+// larger: the upscaler's output is the window size (WantPresentUpscale) instead of in place.
+bool PresentMode() {
+    const auto& c = Cfg();
+    if (!c.to_window || g_present_dead || c.force_mode != 0 || c.force_source != 0 || !Active()) {
+        return false;
+    }
+    if (g_present_w == 0 || g_present_h == 0 || g_learned.render_w == 0 ||
+        g_learned.render_w != g_output_w || g_learned.render_h != g_output_h) {
+        return false;
+    }
+    if (g_present_w == g_output_w && g_present_h == g_output_h) {
+        return false; // input == output: native AA in place, as before
+    }
+    return g_present_w >= g_output_w && g_present_h >= g_output_h;
 }
 
 float Halton(u32 index, u32 base) {
@@ -1293,12 +1321,15 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
                  addr == f.gb_depth ? " [SCENE DEPTH]" : "");
         ++g_dump_lines;
     }
-    if (!IsColorSampleable(format)) {
-        return Sample::Keep;
-    }
     bool targets_it = false;
     for (u32 i = 0; i < g_draw.num_colors; ++i) {
         if (g_draw.colors[i].addr == addr) targets_it = true;
+    }
+    if (!targets_it && f.gb_w != 0 && width == f.gb_w && height == f.gb_h) {
+        g_draw.samples_render_size = true;
+    }
+    if (!IsColorSampleable(format)) {
+        return Sample::Keep;
     }
     const bool out_size = g_draw.num_colors > 0 && g_draw.colors[0].width == g_output_w &&
                           g_draw.colors[0].height == g_output_h;
@@ -1322,6 +1353,9 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     }
     // A qualifying sample of the source: the injection is at the one after its last write.
     const u32 index = f.qual_samples++;
+    if (PresentMode()) {
+        return Sample::Keep; // upscaled before the HUD instead (WantPresentUpscale)
+    }
     if (index < g_learned.skip || !Active() || f.inject_failed) {
         return Sample::Keep;
     }
@@ -1368,6 +1402,124 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
         g_first_eval_pending = true;
     }
     return Sample::Inject;
+}
+
+void SetPresentSize(u32 width, u32 height) {
+    if (!Enabled()) {
+        return;
+    }
+    std::scoped_lock lk{g_mutex};
+    if (width != g_present_w || height != g_present_h) {
+        LOG_INFO(Render_Vulkan, "[BB_UPSCALE] presentation (window) size {}x{}", width, height);
+    }
+    g_present_w = width;
+    g_present_h = height;
+}
+
+bool WantPresentUpscale(VAddr& flip) {
+    if (!Enabled()) {
+        return false;
+    }
+    std::scoped_lock lk{g_mutex};
+    auto& f = g_frame;
+    if (!g_draw.valid || g_draw.compute || !g_draw.targets_flip || f.injected ||
+        f.inject_failed || !PresentMode()) {
+        return false;
+    }
+    // After the scene and its last read by the post-processing; the draw into the presented image
+    // that samples a render-size image is the game's final post-processing pass, not the HUD.
+    if (f.gb_depth == 0 || f.scene_draws == 0 || f.qual_samples <= g_learned.skip ||
+        g_draw.samples_render_size || f.gb_w != g_output_w || f.gb_h != g_output_h) {
+        return false;
+    }
+    flip = 0;
+    for (u32 i = 0; i < g_draw.num_colors; ++i) {
+        const auto& t = g_draw.colors[i];
+        if (IsFlip(t.addr) && t.width == f.gb_w && t.height == f.gb_h) {
+            flip = t.addr;
+            break;
+        }
+    }
+    if (flip == 0) {
+        return false;
+    }
+    FillPresentPlan(flip, "before the first HUD draw");
+    return true;
+}
+
+namespace {
+void FillPresentPlan(VAddr flip, const char* where) {
+    auto& f = g_frame;
+    Plan& p = g_plan;
+    p = {};
+    p.scene_mode = false;
+    p.color_addr = flip;
+    p.depth_addr = f.gb_depth;
+    p.render_w = f.gb_w;
+    p.render_h = f.gb_h;
+    p.output_w = g_present_w;
+    p.output_h = g_present_h;
+    p.hdr = false; // the post-processed (tonemapped) image
+    p.reset = !g_learned.last_injected;
+    p.delta_ms = g_delta_ms;
+    p.viewport = f.viewport;
+    p.depth_inverted = f.depth_greater;
+    FillCamera(p);
+    const bool jitter_on = Cfg().jitter && p.camera_valid;
+    p.jitter[0] = jitter_on ? g_jitter[0] : 0.0f;
+    p.jitter[1] = jitter_on ? g_jitter[1] : 0.0f;
+    LogPoint(fmt::format(
+        "injection point: window-size upscale {}, source {:#x} (presented image, LDR) {}x{}, "
+        "depth {:#x}, output {}x{} (window), motion vectors {}, depth {}",
+        where, flip, p.render_w, p.render_h, p.depth_addr, p.output_w, p.output_h,
+        p.camera_valid ? "reconstructed (camera found)" : "zero (no camera)",
+        p.depth_inverted ? "inverted" : "forward"));
+    static bool first = true;
+    if (first) {
+        first = false;
+        GuardBegin(SR::KindName(Cfg().kind), "the first upscale");
+        Checkpoint(fmt::format("{}: {}x{} -> {}x{} (game output {}x{} upscaled to the window "
+                               "size, HUD added on top at present)",
+                               SR::KindName(Cfg().kind), p.render_w, p.render_h, p.output_w,
+                               p.output_h, g_output_w, g_output_h));
+        g_first_eval_pending = true;
+    }
+}
+} // namespace
+
+bool TakeLateUpscale() {
+    std::scoped_lock lk{g_mutex};
+    const bool late = g_late_upscale;
+    g_late_upscale = false;
+    return late;
+}
+
+void OnPresentUpscaled(bool ok) {
+    std::scoped_lock lk{g_mutex};
+    if (ok) {
+        g_frame.injected = true;
+        g_frame.redirecting = false;
+        g_frame.hudless = true;
+        g_frame.present = true;
+        return;
+    }
+    g_frame.inject_failed = true;
+    if (!g_present_dead) {
+        g_present_dead = true;
+        Checkpoint(fmt::format("{}: the window-size upscale failed: back to the in-place upscale "
+                               "at the game's size",
+                               SR::KindName(Cfg().kind)));
+    }
+}
+
+void OnPresentFailed(std::string_view why) {
+    std::scoped_lock lk{g_mutex};
+    if (!g_present_dead) {
+        g_present_dead = true;
+        Checkpoint(fmt::format("{}: window-size upscale off ({}): back to the in-place upscale "
+                               "at the game's size",
+                               SR::KindName(Cfg().kind), why));
+    }
 }
 
 const Plan& CurrentPlan() {
@@ -1489,6 +1641,16 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         Checkpoint(fmt::format("{}: first upscaled frame {}", SR::KindName(Cfg().kind),
                                f.injected ? "done" : "FAILED: the game runs native"));
     }
+    // The scene was drawn but no HUD point was found (no HUD this frame, e.g. a cut scene): the
+    // presenter upscales the finished image instead (TakeLateUpscale).
+    g_late_upscale = false;
+    if (PresentMode() && !f.injected && !f.inject_failed && f.gb_depth != 0 &&
+        f.gb_w == width && f.gb_h == height && f.qual_samples > g_learned.skip) {
+        FillPresentPlan(addr, "at present (no HUD draw found this frame)");
+        g_late_upscale = true;
+        f.injected = true;
+        g_learned.last_injected = true;
+    }
 
     ++g_stats.frames;
     g_stats.injected += f.injected ? 1 : 0;
@@ -1501,8 +1663,11 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     if (Enabled() && g_frame_no % Cfg().log_every == 0) {
         const auto& c = Cfg();
         const double ratio = SR::QualityRatio(c.kind, c.quality);
-        const u32 rec_w = static_cast<u32>(std::lround(g_output_w / ratio));
-        const u32 rec_h = static_cast<u32>(std::lround(g_output_h / ratio));
+        const bool to_window = PresentMode();
+        const u32 out_w = to_window ? g_present_w : g_output_w;
+        const u32 out_h = to_window ? g_present_h : g_output_h;
+        const u32 rec_w = static_cast<u32>(std::lround(out_w / ratio));
+        const u32 rec_h = static_cast<u32>(std::lround(out_h / ratio));
         const bool scene = SceneMode();
         LOG_INFO(Render_Vulkan,
                  "[BB_UPSCALE] frame {}: upscaler {} ({}, {}), {} mode, internal {}x{} -> output "
@@ -1510,8 +1675,9 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                  "({:+.3f},{:+.3f}), upscale GPU ms avg {:.3f} max {:.3f} ({} samples), injected "
                  "{}/{} frames, failed {}",
                  g_frame_no, SR::KindName(c.kind), SR::QualityName(c.quality),
-                 BackendReady() ? "ready" : "not ready", scene ? "scene" : "composite",
-                 g_learned.render_w, g_learned.render_h, g_output_w, g_output_h, rec_w, rec_h,
+                 BackendReady() ? "ready" : "not ready",
+                 to_window ? "window-size (before the HUD)" : scene ? "scene" : "composite",
+                 g_learned.render_w, g_learned.render_h, out_w, out_h, rec_w, rec_h,
                  LearnedSource(), g_learned.gb_depth,
                  !c.mv_reconstruct ? "zero (BB_MV=zero)"
                  : g_learned.have_prev_vp ? "reconstructed (depth + camera)"
@@ -1535,7 +1701,8 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                                                          return a.count < b.count;
                                                      })->count,
                  g_diag_asked, g_diag_inactive, g_diag_noscene, g_diag_calls, g_diag_small);
-        if (Active() && scene && (g_learned.render_w == g_output_w) && ratio > 1.01) {
+        if (Active() && scene && !to_window && (g_learned.render_w == g_output_w) &&
+            ratio > 1.01) {
             LOG_INFO(Render_Vulkan,
                      "[BB_UPSCALE] the game renders its 3D at the output size {}x{}: {} runs as "
                      "native AA. For {} set the game's internal resolution (patch) to {}x{}.",
@@ -1560,7 +1727,8 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
 
     // Jitter for the next frame.
     const double ratio = g_learned.render_w != 0
-                             ? static_cast<double>(g_output_w) / g_learned.render_w
+                             ? static_cast<double>(PresentMode() ? g_present_w : g_output_w) /
+                                   g_learned.render_w
                              : 1.0;
     const u32 phases = std::clamp<u32>(static_cast<u32>(std::ceil(8.0 * ratio * ratio)), 8, 64);
     g_jitter_index = (g_jitter_index + 1) % phases;
