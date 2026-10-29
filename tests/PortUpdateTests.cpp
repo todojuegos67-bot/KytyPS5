@@ -303,8 +303,9 @@ void TestLaunch() {
 	r.rt_hw_exp = true;
 	p           = Port::BuildLaunch(r, "PPSA01341", pc);
 	CHECK(EnvOf(p, "KYTY_RT_HW_EXPERIMENTAL") == "1");
-	CHECK(EnvOf(p, "KYTY_HWRT") == "1" && EnvOf(p, "KYTY_HWRT_SHADOW") == "2" && EnvOf(p, "KYTY_HWRT_LIGHTS") == "2" &&
-	      EnvOf(p, "KYTY_HWRT_PARTICLES") == "2" && EnvOf(p, "KYTY_HWRT_REFL_MATERIAL") == "1");
+	CHECK(EnvOf(p, "KYTY_HWRT") == "1" && EnvOf(p, "KYTY_HWRT_SHADOW") == "2" && EnvOf(p, "KYTY_HWRT_REFL_MATERIAL") == "1");
+	EnvOf(p, "KYTY_HWRT_LIGHTS", &has);
+	CHECK(!has); // (ds-pc-port10) no hardware RT Antorchas
 	Port::Settings g;
 	g.godrays = "3";
 	p         = Port::BuildLaunch(g, "PPSA01341", pc);
@@ -319,8 +320,8 @@ void TestLaunch() {
 		Port::Settings n;
 		p = Port::BuildLaunch(n, "PPSA01341", pc);
 		CHECK(EnvOf(p, "KYTY_AO") == "0");
-		EnvOf(p, "KYTY_TORCH", &has);
-		CHECK(!has);
+		CHECK(EnvOf(p, "KYTY_TORCH") == "0" && EnvOf(p, "KYTY_TORCH_FLARE") == "0" && EnvOf(p, "KYTY_TORCH_HW") == "0");
+		CHECK(EnvOf(p, "KYTY_FOVEATED") == "0" && EnvOf(p, "KYTY_DLSS_NR") == "0"); // (ds-pc-port10) DLSS 5 No
 		n.rt_ss_refl = "4";
 		n.rt_ssgi    = "4";
 		n.rt_shadows = "2";
@@ -331,10 +332,18 @@ void TestLaunch() {
 		p            = Port::BuildLaunch(n, "PPSA01341", pc);
 		CHECK(EnvOf(p, "KYTY_RT_REFLECTIONS") == "4" && EnvOf(p, "KYTY_RT_REFLECTIONS_MIN") == "0.55");
 		CHECK(EnvOf(p, "KYTY_SSGI") == "3" && EnvOf(p, "KYTY_SSGI_INTENSITY") == "1.6");
-		CHECK(EnvOf(p, "KYTY_RT_SHADOWS") == "2" && EnvOf(p, "KYTY_RT_SHADOWS_STRENGTH") == "0.5" && EnvOf(p, "KYTY_HWRT_SHADOW") == "0");
-		CHECK(EnvOf(p, "KYTY_GODRAYS") == "2" && EnvOf(p, "KYTY_AO") == "1");
-		CHECK(EnvOf(p, "KYTY_TORCH") == "3" && EnvOf(p, "KYTY_TORCH_HW") == "1" && EnvOf(p, "KYTY_RT_HW_EXPERIMENTAL") == "1" &&
-		      EnvOf(p, "KYTY_HWRT_REFL") == "0" && EnvOf(p, "KYTY_TORCH_FLARE") == "1");
+		// (ds-pc-port9) Path tracing and Sombras RT always off; (ds-pc-port10) the torch light, Hibrido and flare too.
+		CHECK(EnvOf(p, "KYTY_RT_SHADOWS") == "1" && EnvOf(p, "KYTY_RT_SHADOWS_STRENGTH") == "0");
+		CHECK(EnvOf(p, "KYTY_GODRAYS") == "2" && EnvOf(p, "KYTY_AO") == "0");
+		CHECK(EnvOf(p, "KYTY_TORCH") == "0" && EnvOf(p, "KYTY_TORCH_HW") == "0" && EnvOf(p, "KYTY_TORCH_FLARE") == "0");
+		{
+			Port::Settings d5;
+			d5.dlss5 = "3", d5.dlss5_unsigned = true, d5.dlss5_strength = "media";
+			p = Port::BuildLaunch(d5, "PPSA01341", pc);
+			CHECK(EnvOf(p, "KYTY_FOVEATED") == "1" && EnvOf(p, "KYTY_FOV_EDGE") == "0.35" && EnvOf(p, "KYTY_DLSS_NR_UNSIGNED") == "1" &&
+			      EnvOf(p, "KYTY_DLSS_NR_STRENGTH") == "0.65");
+			p = Port::BuildLaunch(n, "PPSA01341", pc);
+		}
 		Port::Settings live = n;
 		live.ao = "0", live.torch = "0", live.lens_flare = false, live.rt_shadows = "0";
 		CHECK(Port::LiveRtOff(n, live) == (8 | 16 | 32)); // (Sombras RT stays: Luz volumetrica needs the sun pass)
