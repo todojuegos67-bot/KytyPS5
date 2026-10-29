@@ -592,10 +592,9 @@ void PreInstance() {
 #if defined(_WIN32)
             char narrow[1024]{};
             std::wcstombs(narrow, loader, sizeof(narrow) - 1);
-            SetEnvironmentVariableW(L"SDL_VULKAN_LIBRARY", loader);
-            _putenv_s("SDL_VULKAN_LIBRARY", narrow);
-            Checkpoint(fmt::format("DLSS: SDL_VULKAN_LIBRARY = {} (set before the window); "
-                                   "vulkan-1.dll already loaded: {}",
+            // (SDL is not pointed at the interposer: shadPS4 makes its surface itself, and the
+            // interposer imports vulkan-1.dll anyway, so SDL's load only finds that module.)
+            Checkpoint(fmt::format("DLSS: Streamline ready, interposer {}; vulkan-1.dll loaded: {}",
                                    narrow, GetModuleHandleA("vulkan-1.dll") != nullptr));
 #endif
         }

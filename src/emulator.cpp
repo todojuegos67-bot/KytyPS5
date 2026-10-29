@@ -590,9 +590,15 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // Bloodborne upscaling: DLSS loads Streamline before the window so SDL takes Streamline's
     // interposer as its Vulkan library (SDL_VULKAN_LIBRARY), as the Demon's Souls fork does.
     BB::Upscale::PreInstance();
+    if (BB::Upscale::Enabled()) {
+        BB::Upscale::Checkpoint("creating the SDL window");
+    }
     window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
                                                    EmulatorSettings.GetWindowHeight(), controllers,
                                                    window_title);
+    if (BB::Upscale::Enabled()) {
+        BB::Upscale::Checkpoint("SDL window created");
+    }
 
     g_window = window.get();
 

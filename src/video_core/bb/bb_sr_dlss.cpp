@@ -225,10 +225,22 @@ bool Preload() {
         preferences.engineVersion = "1.0";
         preferences.projectId = "6a3f1d5e-4b7c-4f2a-9d8e-1c2b3a4d5e6f";
         preferences.renderAPI = sl::RenderAPI::eVulkan;
+        {
+            std::error_code ec;
+            BBLogf("DLSS: plugins present: sl.common.dll %d, sl.dlss.dll %d, nvngx_dlss.dll %d, "
+                   "sl.dlss_g.dll %d, sl.reflex.dll %d, sl.pcl.dll %d",
+                   std::filesystem::exists(dir / "sl.common.dll", ec) ? 1 : 0,
+                   std::filesystem::exists(dir / "sl.dlss.dll", ec) ? 1 : 0,
+                   std::filesystem::exists(dir / "nvngx_dlss.dll", ec) ? 1 : 0,
+                   std::filesystem::exists(dir / "sl.dlss_g.dll", ec) ? 1 : 0,
+                   std::filesystem::exists(dir / "sl.reflex.dll", ec) ? 1 : 0,
+                   std::filesystem::exists(dir / "sl.pcl.dll", ec) ? 1 : 0);
+        }
         BBLogf("DLSS: slInit (features DLSS, DLSS-G, Reflex, PCL; plugins in %s)",
                dir.string().c_str());
-        if (const auto result = g_api.init(preferences, sl::kSDKVersion);
-            result != sl::Result::eOk) {
+        const auto init_result = g_api.init(preferences, sl::kSDKVersion);
+        BBLogf("DLSS: slInit returned %d", static_cast<int>(init_result));
+        if (const auto result = init_result; result != sl::Result::eOk) {
             BBLogf("DLSS: slInit failed (%d): DLSS off", static_cast<int>(result));
             return false;
         }

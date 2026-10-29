@@ -273,23 +273,41 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 #endif
 
     BB::Upscale::PreInstance();
+    const bool bb = BB::Upscale::Enabled();
+    if (bb) {
+        BB::Upscale::Checkpoint("opening the Vulkan loader");
+    }
     static vk::detail::DynamicLoader dl = [] {
 #ifdef _WIN32
         if (const wchar_t* loader = BB::Upscale::VulkanLoaderOverride()) {
             // DLSS: Streamline's interposer is the Vulkan loader.
             const std::filesystem::path path{loader};
+            BB::Upscale::Checkpoint(fmt::format("Vulkan loader: {}", path.string()));
             return vk::detail::DynamicLoader(path.string());
         }
 #endif
         return vk::detail::DynamicLoader();
     }();
-    VULKAN_HPP_DEFAULT_DISPATCHER.init(
-        dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+    const auto gipa = dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+    if (bb) {
+        BB::Upscale::Checkpoint(fmt::format("vkGetInstanceProcAddr {}", reinterpret_cast<void*>(gipa)));
+    }
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(gipa);
+    if (bb) {
+        BB::Upscale::Checkpoint("vkEnumerateInstanceVersion");
+    }
 
     const auto [available_version_result, available_version] =
         VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion
             ? vk::enumerateInstanceVersion()
             : vk::ResultValue(vk::Result::eSuccess, VK_API_VERSION_1_0);
+    if (bb) {
+        BB::Upscale::Checkpoint(fmt::format("instance version {}.{} ({}); enumerating layers and "
+                                            "extensions",
+                                            VK_VERSION_MAJOR(available_version),
+                                            VK_VERSION_MINOR(available_version),
+                                            vk::to_string(available_version_result)));
+    }
     ASSERT_MSG(available_version_result == vk::Result::eSuccess,
                "Failed to query Vulkan API version: {}", vk::to_string(available_version_result));
     ASSERT_MSG(available_version >= TargetVulkanApiVersion,
