@@ -441,12 +441,12 @@ function Start-Game {
 	if ($pureGame) {
 		# (audit) Juego original: fuera todo pase visual del emulador (RT, volumetrica, sombra RT, brillo, oclusion especular, GTAO,
 		# SSGI, reflejos RT de pantalla, contacto, particulas RT); -Set manda sobre el entorno. Rendimiento, reescalador, FG y latencia igual.
-		$fxPat = '^KYTY_(HWRT|RT_REFLECTIONS|RT_SHADOWS|RT_SUN|RT_PARTICLES|RT_LOCAL|GODRAYS|SHINE|SPEC_OCCLUSION|GTAO|SSGI|SSR|CONTACT_SHADOWS|AO|TORCH|DOF)'
+		$fxPat = '^KYTY_(HWRT|RT_REFLECTIONS|RT_SHADOWS|RT_SUN|RT_PARTICLES|RT_LOCAL|GODRAYS|SHINE|SPEC_OCCLUSION|GTAO|SSGI|SSR|CONTACT_SHADOWS|AO|TORCH|DOF|SMOKE)'
 		$sets = @($sets | Where-Object { $_ -notmatch $fxPat })
 		foreach ($n in @(Get-ChildItem Env: | Where-Object { $_.Name -match $fxPat } | ForEach-Object { $_.Name })) { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 		$sets += @('KYTY_HWRT=0', 'KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_REFLECTIONS=0',
 			'KYTY_RT_SHADOWS=0', 'KYTY_CONTACT_SHADOWS=0', 'KYTY_RT_SUN=0', 'KYTY_RT_PARTICLES=0', 'KYTY_GODRAYS=0', 'KYTY_SHINE=0', 'KYTY_SPEC_OCCLUSION=0',
-			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0', 'KYTY_TORCH_HW=0', 'KYTY_RT_HW_EXPERIMENTAL=0', 'KYTY_DOF=0')
+			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0', 'KYTY_TORCH_HW=0', 'KYTY_SMOKE=0', 'KYTY_RT_HW_EXPERIMENTAL=0', 'KYTY_DOF=0')
 		$pa = @(); for ($i = 0; $i -lt $psargs.Count; $i++) { if ($psargs[$i] -eq '-Ssgi') { $i++; continue }; $pa += $psargs[$i] }; $psargs = $pa
 	}
 	# (10-24) Brillo metales retirado (no aportaba)
@@ -2306,6 +2306,8 @@ $cmbRtRf = New-RtCombo 'Reflejos RT' 'rtrefl2' 56 'Reflejos trazados por rayos g
 $cmbTorch = New-RtCombo 'Luz de antorchas RT' 'torchrt' 536 'Luz de antorchas RT: el fuego de antorchas, braseros y hogueras ilumina paredes, suelos y estructuras cercanas con un rebote calido que parpadea, y se refleja en superficies lisas o mojadas. No atraviesa paredes ni personajes (se comprueba en la profundidad). Solo en pantalla, sin RT por hardware. Solo con DLSS, XeSS o FSR. Bajo 2 fuegos ~0,3 ms, Medio 4 ~0,5 ms, Alto 8 ~0,9 ms. Hibrido: Alto + rayos por hardware (RT real) donde la pantalla no ve al que tapa la luz (fuera de pantalla o detras de otra cosa); solo oscurece, nunca anade luz. Necesita GPU con RT. ~+0,5 ms.' @('No', 'Bajo', 'Medio', 'Alto', 'Híbrido')  # (torch-1028) (torch-shadow-1028) Hibrido
 $cmbFlare = New-RtCombo 'Destellos de lente' 'lensflare' 568 'Destello de lente de antorchas y fuegos visibles: pequenos reflejos de la optica, una estrella y una raya suaves. Desaparece si el fuego queda tapado y cerca de los bordes. Sin halo ni velo en pantalla. Se dibuja antes del HUD. Solo con DLSS, XeSS o FSR. ~0,1 ms.' @('No', 'Sí')  # (torch-1028)
 $cmbDof = New-RtCombo 'Profundidad de campo' 'dof1029' 632 'Profundidad de campo a distancia: al fondo las cosas se ven mas borrosas, con un desenfoque de cine (disco suave; las luces brillantes del fondo se abren en bokeh redondo). Lo cercano y lo de media distancia queda nitido; el HUD siempre nitido. Hecho por el emulador (la del juego solo actua en cinematicas y menus). Solo con DLSS, XeSS o FSR. Suave: desde 40 m, poco. Cinematico (recomendado): desde 30 m. Fuerte: desde 25 m, muy visible. ~0,2-0,4 ms.' @('No', 'Suave', 'Cinemático', 'Fuerte')  # (ds-dof-1029) KYTY_DOF
+$cmbSmoke = New-RtCombo 'Humo y partículas' 'smoke1029' 664 'Humo y particulas mas realistas sobre las del propio juego (a resolucion completa): Suave = el humo, la niebla de particulas y las chispas ya no cortan en linea dura donde tocan suelo y paredes (se funden en ~35 cm, como en el cine). Antorchas = ademas el humo cerca de antorchas y braseros brilla con su luz calida (radio 4,5 m, sin parpadeo; necesita Luz de antorchas RT). Estable, sin brillos nuevos. Solo con DLSS, XeSS o FSR. ~0,3-0,6 ms.' @('No', 'Suave', 'Antorchas')  # (ds-particles-1029) KYTY_SMOKE
+if ($cmbSmoke -and (Get-IniValue 'smoke1029' '') -eq '') { $cmbSmoke.SelectedIndex = 2 }  # (ds-particles-1029) por defecto: Antorchas
 $cmbShine = $null  # (10-24) Brillo metales retirado
 # (10-24) Ajustes del juego: convars del propio motor, cada uno en Juego (no se toca) o en un nivel. Nombres, tipos,
 # rangos y valores de fabrica sacados del registro de convars del eboot 1.07 (constructor de cada convar: min / max;
@@ -2727,7 +2729,7 @@ if ($gCtl -and $btnCtl) { $gCtl.Top = $btnCtl.Bottom + 6 }
 # (audit) Casilla Juego original: al marcarla las filas de efectos quedan inactivas (sus valores se guardan).
 $chkPure = New-Check 'Juego original (sin efectos añadidos)' 0 0 396 'puregame'
 $tips.SetToolTip($chkPure, 'Apaga todos los efectos visuales que anade el emulador (ray tracing, luz volumetrica, sombras RT, brillo, oclusion, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, frame generation y latencia no cambian.')
-function Update-PureGame { foreach ($c in @($cmbRtRf, $cmbRt, $cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh)) { if ($c) { $c.Enabled = -not $chkPure.Checked } } }
+function Update-PureGame { foreach ($c in @($cmbRtRf, $cmbRt, $cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbSmoke)) { if ($c) { $c.Enabled = -not $chkPure.Checked } } }
 $chkPure.Add_CheckedChanged({ Update-PureGame })
 # (10-26) "Ray tracing" solo con RT real: fuera Luz RT (SSGI), Luz volumetrica de pantalla, Reflejos RT, Sol RT y Particulas RT de pantalla.
 # (Visible no sirve para leer antes de mostrar la ventana: se trabaja con listas.)
@@ -2736,7 +2738,7 @@ try {
 	$rtHwExp = (Get-IniValue 'rthwexp' '0') -eq '1'
 	$fake = @($cmbSun, $cmbPart, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater) | Where-Object { $_ }  # (10-27) solo reflejos, sombras RT y rayos volumetricos
 	$hideOnly = @(if (-not $rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } })  # (vol25) la Luz volumetrica ya no se oculta
-	$keep = @(@($cmbRtRf, $cmbRt, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh) | Where-Object { $_ }) + @(if ($rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } | Sort-Object Top })  # (vol25) Luz volumetrica del 10-25 visible otra vez, debajo
+	$keep = @(@($cmbRtRf, $cmbRt, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbSmoke, $cmbRtSh) | Where-Object { $_ }) + @(if ($rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } | Sort-Object Top })  # (vol25) Luz volumetrica del 10-25 visible otra vez, debajo
 	$lblOf = @{}
 	foreach ($c in @($fake + $hideOnly + $keep + @($cmbShQ, $cmbShD, $cmbAo) | Where-Object { $_ })) {
 		$lblOf[$c.GetHashCode()] = @($gRt.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and [math]::Abs($_.Top - ($c.Top + 2)) -le 4 })

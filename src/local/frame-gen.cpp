@@ -38,6 +38,7 @@
 #include "local/godrays.h"
 #include "local/torch.h"
 #include "local/dof.h"
+#include "local/smoke.h"
 #include "local/rt-local-lights.h"
 #include "local/rt-flicker.h"
 #include "local/rt-capture.h"
@@ -4632,10 +4633,10 @@ bool RtParticlesDebug() {
 	}();
 	return debug;
 }
-bool RtParticlesWanted() { return RtParticlesLevel() > 0 || RtParticlesDebug() || HwParticlesWanted(); }
+bool RtParticlesWanted() { return RtParticlesLevel() > 0 || RtParticlesDebug() || HwParticlesWanted() || SmokeWanted(); } // (ds-particles-1029: KYTY_SMOKE)
 // (hwrt3p) KYTY_HWRT_PARTICLES' read of the pre-particle copy (no SSGI counters; the copy is taken for it too).
 vk::ImageView RtParticlesPreCopy(uint64_t color_address, vk::Extent2D extent) {
-	if (!HwParticlesWanted()) return nullptr;
+	if (!HwParticlesWanted() && !SmokeWanted()) return nullptr; // (ds-particles-1029: KYTY_SMOKE reads it too)
 	const bool ok = g_rtpart.taken && g_rtpart.pre_view != nullptr && g_rtpart.pre_address == color_address &&
 	                g_rtpart.pre_flip == GuestFlips() && g_rtpart.pre.extent.width == extent.width &&
 	                g_rtpart.pre.extent.height == extent.height;
@@ -4675,7 +4676,7 @@ void BeforeSceneDraw(CommandBuffer& command, TextureCache& cache, const RenderSt
 		e.instances += draw.instances;
 		e.indices += draw.index_count;
 	}
-	if ((RtParticlesLevel() == 0 && !HwParticlesWanted()) || g_rtpart.taken) return; // (hwrt3p: also for KYTY_HWRT_PARTICLES)
+	if ((RtParticlesLevel() == 0 && !HwParticlesWanted() && !SmokeWanted()) || g_rtpart.taken) return; // (ds-particles-1029: KYTY_SMOKE) // (hwrt3p: also for KYTY_HWRT_PARTICLES)
 	// The particle pass's first draw: blended, depth test on, depth writes off (KYTY_RT_PARTICLES_VS pins the shaders).
 	static const std::vector<uint64_t> pinned = [] {
 		std::vector<uint64_t> out;
@@ -9545,6 +9546,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	TimedPass("GtaoApply", [&] { GtaoApply(command, inputs); }); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
 	probed(RtFlicker::Ao, "RtAoApply", [&] { return RtAoApply(command, inputs); }); // (ao-1028: KYTY_AO, rt-ao.cpp: the new ambient occlusion on the ambient term; nothing when off)
 	probed(RtFlicker::Torch, "TorchApply", [&] { return TorchApply(command, inputs); }); // (KYTY_TORCH / KYTY_TORCH_FLARE: the firelight, torch.cpp; before SSR / RT reflections so they reflect it; nothing when off)
+	TimedPass("SmokeApply", [&] { SmokeApply(command, inputs, inputs_in.color); }); // (ds-particles-1029: KYTY_SMOKE, smoke.cpp: soft particles + torch-lit smoke on the particle layer; after the torch tracked its lights; nothing when off)
 	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Gi, "HwGiApply")
 	TimedPass("SsrApply", [&] { SsrApply(command, inputs); }); // (KYTY_SSR: likewise, after GTAO; nothing when off)
 	probed(RtFlicker::Reflections, "RtReflectionsApply", [&] { return RtReflectionsApply(command, inputs); }); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)

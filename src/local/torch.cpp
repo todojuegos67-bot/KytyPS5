@@ -23,6 +23,7 @@
 // stand in. Every 10 s: "TORCH: stats" (blobs a frame, lights, lit-pixel %, flares, GPU ms); the RTFLICKER line has
 // "torch light" and "lens flare".
 #include "local/torch.h"
+#include "local/smoke.h"
 
 #include "graphics/presentation/videoOut.h"
 #include "gpu_tiler_shaders/torch_spv.h"
@@ -578,6 +579,7 @@ bool RecordHybrid(GraphicContext& graphics, vk::CommandBuffer command, const Ups
 }
 
 bool g_timing_open = false;
+uint64_t g_torch_tracked_flip = ~0ull; // (ds-particles-1029: the flip TorchApply last tracked its lights in)
 uint32_t g_timing_entry = 0;
 
 void CloseTiming(vk::CommandBuffer command) {
@@ -588,6 +590,14 @@ void CloseTiming(vk::CommandBuffer command) {
 }
 
 } // namespace
+
+// (ds-particles-1029) smoke.cpp reads the lights TorchApply tracked this flip; nothing here changes them.
+bool TorchLightsThisFlip(vk::Buffer& buffer, float& radius) {
+	if (g_tc.frame_buf == VK_NULL_HANDLE || g_torch_tracked_flip != GuestFlips()) return false;
+	buffer = vk::Buffer(g_tc.frame_buf);
+	radius = g_tc.push.light[0];
+	return true;
+}
 
 bool TorchHwWanted() {
 	static const bool on = [] {
@@ -773,6 +783,7 @@ bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		g_tc.shadow_history = true;
 	}
 	g_tc.tracked_frame = g_tc.frame;
+	g_torch_tracked_flip = GuestFlips(); // (ds-particles-1029: read only by smoke.cpp)
 	g_tc.history_valid = true;
 	if (!flare) {
 		FinishFrame(command);
