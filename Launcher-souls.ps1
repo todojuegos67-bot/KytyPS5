@@ -439,8 +439,9 @@ function Start-Game {
 	if (-not $pureGame -and $cmbFlare -and $cmbFlare.SelectedIndex -gt 0) { $sets += 'KYTY_TORCH_FLARE=1' }  # (torch-1028) destellos de lente
 	if ($cmbDof -and -not $pureGame) { $sets += "KYTY_DOF=$([math]::Min(3, [math]::Max(0, $cmbDof.SelectedIndex)))" } else { $sets += 'KYTY_DOF=0' }  # (ds-dof-1029) profundidad de campo a distancia: No/Suave/Cinematico/Fuerte
 	$fovI = if ($cmbFov -and -not $pureGame) { [math]::Min(4, [math]::Max(0, $cmbFov.SelectedIndex)) } else { 0 }  # (ds-foveated-1029) DLSS 5 NR: No / PreSR / Foveado Suave / Medio / Fuerte
-	if ($fovI -eq 1) { $sets += @('KYTY_DLSS_NR=1', 'KYTY_DLSS_NR_PRESR=1', 'KYTY_FOVEATED=0', 'KYTY_DLSS_NR_UNSIGNED=1') }  # PreSR: antes del reescalado, a la resolucion de render
-	elseif ($fovI -ge 2) { $sets += @('KYTY_FOVEATED=1', 'KYTY_DLSS_NR_PRESR=0', 'KYTY_DLSS_NR_UNSIGNED=1', "KYTY_FOV_EDGE=$(@('0.5', '0.5', '0.75', '0.5', '0.35')[$fovI])") }  # foveado despues del reescalado: borde 0,75 / 0,5 / 0,35
+	$fovU = "KYTY_DLSS_NR_UNSIGNED=$(if ($cmbFovU -and $cmbFovU.SelectedIndex -eq 1) { '1' } else { '0' })"  # Archivo DLSS 5: oficial / no oficial
+	if ($fovI -eq 1) { $sets += @('KYTY_DLSS_NR=1', 'KYTY_DLSS_NR_PRESR=1', 'KYTY_FOVEATED=0', $fovU) }  # PreSR: antes del reescalado, a la resolucion de render
+	elseif ($fovI -ge 2) { $sets += @('KYTY_FOVEATED=1', 'KYTY_DLSS_NR_PRESR=0', $fovU, "KYTY_FOV_EDGE=$(@('0.5', '0.5', '0.75', '0.5', '0.35')[$fovI])") }  # foveado despues del reescalado: borde 0,75 / 0,5 / 0,35
 	else { $sets += @('KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0', 'KYTY_DLSS_NR_PRESR=0') }
 	if ($pureGame) {
 		# (audit) Juego original: fuera todo pase visual del emulador (RT, volumetrica, sombra RT, brillo, oclusion especular, GTAO,
@@ -2800,8 +2801,16 @@ try {
 	$cmbFov.Add_SelectedIndexChanged({ param($sender, $e) Set-IniValue $sender.Tag "$($sender.SelectedIndex)" })
 	$tips.SetToolTip($cmbFov, 'DLSS 5 Neural Rendering de NVIDIA. PreSR (rápido): el NR antes del reescalado, sobre la imagen a resolucion de render (unas 4 veces menos pixeles que en 4K; el reescalador hace el resto). Foveado: el NR despues del reescalado (de FoveatedDLSS5): el NR a resolucion completa en el centro de la pantalla y a menos resolucion hacia los bordes (curva suave, horizontal y vertical por separado); ahorra GPU sin tocar el centro, que nunca pierde nitidez ni se oscurece. Suave: borde 0,75 (~16 % menos pixeles). Medio: 0,5 (~31 %). Fuerte: 0,35 (~39 %). Si ahorra menos de un 5 % se apaga solo. Necesita una NVIDIA RTX y el archivo nvngx_dlssnr.dll de NVIDIA junto al emulador o en su carpeta streamline (no viene incluido): sin el, DLSS normal. Solo con DLSS, XeSS o FSR. Experimental.'); $tips.SetToolTip($lbFov, 'DLSS 5 Neural Rendering de NVIDIA. PreSR (rápido): el NR antes del reescalado, sobre la imagen a resolucion de render (unas 4 veces menos pixeles que en 4K; el reescalador hace el resto). Foveado: el NR despues del reescalado (de FoveatedDLSS5): el NR a resolucion completa en el centro de la pantalla y a menos resolucion hacia los bordes (curva suave, horizontal y vertical por separado); ahorra GPU sin tocar el centro, que nunca pierde nitidez ni se oscurece. Suave: borde 0,75 (~16 % menos pixeles). Medio: 0,5 (~31 %). Fuerte: 0,35 (~39 %). Si ahorra menos de un 5 % se apaga solo. Necesita una NVIDIA RTX y el archivo nvngx_dlssnr.dll de NVIDIA junto al emulador o en su carpeta streamline (no viene incluido): sin el, DLSS normal. Solo con DLSS, XeSS o FSR. Experimental.'); $panel.Controls.Add($cmbFov)
 	Move-To $lbFov $gImg 10 154 112; Move-To $cmbFov $gImg 124 152 282
-	$gImg.Height = $gImg.Height + 32
-	foreach ($g2 in @($gGfx, $gRt)) { if ($g2) { $g2.Top = $g2.Top + 32 } }
+	$lbFovU = New-Label 'Archivo DLSS 5' $smallFont $ink 0 0 88 22; $panel.Controls.Add($lbFovU)
+	$cmbFovU = New-Object System.Windows.Forms.ComboBox
+	$cmbFovU.DropDownStyle = 'DropDownList'; $cmbFovU.Font = $smallFont; $cmbFovU.Tag = 'dlss5unofficial'
+	foreach ($it in @('Oficial (firmado por NVIDIA)', 'No oficial (bajo tu responsabilidad)')) { [void]$cmbFovU.Items.Add($it) }
+	$v = 0; [void][int]::TryParse((Get-IniValue 'dlss5unofficial' '0'), [ref]$v); $cmbFovU.SelectedIndex = [math]::Min([math]::Max(0, $v), 1)
+	$cmbFovU.Add_SelectedIndexChanged({ param($sender, $e) Set-IniValue $sender.Tag "$($sender.SelectedIndex)" })
+	$tips.SetToolTip($cmbFovU, 'Que nvngx_dlssnr.dll se acepta: Oficial = solo con firma valida de NVIDIA. No oficial = tambien copias modificadas (sin firma valida); funcionan, pero no son de NVIDIA y no se puede garantizar lo que hacen. Bajo tu responsabilidad.')
+	Move-To $lbFovU $gImg 10 186 112; Move-To $cmbFovU $gImg 124 184 282
+	$gImg.Height = $gImg.Height + 64
+	foreach ($g2 in @($gGfx, $gRt)) { if ($g2) { $g2.Top = $g2.Top + 64 } }
 	if ($chkPure) { $cmbFov.Enabled = -not $chkPure.Checked }
 } catch { }
 # (10-26) Al elegir cualquier Modo Souls: todo el ray tracing en No (el usuario lo enciende a mano despues).
