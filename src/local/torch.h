@@ -5,7 +5,7 @@
 // a glint on smooth / wet surfaces), screen-space only. KYTY_TORCH_FLARE=0|1 ("Destellos de lente"): a small lens flare
 // from the visible fires, after every other pass. Both on the PS5 Pro path's HDR color before the upscaler (and so
 // before the HUD). KYTY_TORCH_STRENGTH (1.0, 0..3), KYTY_TORCH_FLARE_STRENGTH (1.0, 0..3), KYTY_TORCH_LIGHT (the fire
-// threshold, exposed luminance, 1.5), KYTY_TORCH_RANGE (1.0, 0.3..3), KYTY_TORCH_DEBUG=1 (the added light only).
+// threshold, exposed luminance, 1.5), KYTY_TORCH_RADIUS (4.5 m, 1.5..8: the hard world cutoff), KYTY_TORCH_RANGE (1.0, 0.3..3, x the radius), KYTY_TORCH_DEBUG=1 (the added light only).
 // Off (both 0, the default): nothing created.
 #include "local/frame-gen.h"
 
