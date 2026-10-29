@@ -2,14 +2,16 @@
 // ambient occlusion written from scratch, recorded in FrameGen::Upscale in GTAO's old slot (before the reflections),
 // on the render-resolution colour before the upscaler. Replaces nothing of the RT passes; no hardware ray tracing.
 //
-//   Bajo  (1): half-res trace, 2 slices x 4 steps a side, 0.6 m, history 16 frames
-//   Medio (2): half-res trace, 3 slices x 6 steps a side, 0.8 m, history 24 frames
-//   Alto  (3): half-res trace, 4 slices x 8 steps a side, 1.0 m, history 32 frames
+//   Bajo  (1): half-res trace, 2 slices x 4 steps a side, 0.8 m (ao-strong-1029; was 0.6), history 16 frames
+//   Medio (2): half-res trace, 3 slices x 6 steps a side, 1.1 m (was 0.8), history 24 frames
+//   Alto  (3): half-res trace, 4 slices x 8 steps a side, 1.4 m (was 1.0), history 32 frames
 //   Passes: prep (trace-res linear z + normal) -> trace -> temporal -> a-trous (steps 1, 2) -> composite (joint-bilateral
 //   upsample + ambient-only apply). (ao2-1028) Alto at full res traced on the game's full-res depth cost 8.4 ms in game
 //   (RTX 5080, 720p); every level now traces at half res on its own R32F linear z, and the RTAO line times each pass.
 //
-// Knobs: KYTY_AO_STRENGTH (1), KYTY_AO_FLOOR (0.4: the ambient term keeps at least this), KYTY_AO_RADIUS (metres, the
+//   Ultra (4, KYTY_AO=4/ultra, not in the launcher): Alto's samples, 1.7 m, the strongest look.
+// Knobs: KYTY_AO_STRENGTH (1: x the level's 1.1 / 1.25 / 1.4 / 1.55, up to 3), KYTY_AO_POWER (1.6 / 1.9 / 2.2 / 2.5),
+// KYTY_AO_SHARE (0.55 / 0.65 / 0.75 / 0.85 of the colour counted as ambient at least), KYTY_AO_FLOOR (0.15, was 0.4: the ambient term keeps at least this), KYTY_AO_RADIUS (metres, the
 // level's), KYTY_AO_AMBIENT (6: the ambient light = this x the frame's geometric-mean light x albedo), KYTY_AO_FOG
 // (60 m: fade exp(-z / fog), the colour is after the game's fog; 0 off), KYTY_AO_VIEW=1 (the AO term alone),
 // KYTY_AO_GAME=keep (the game's own AO, r_enableAmbientShadowing, stays on: ours at half strength; by default
@@ -36,17 +38,18 @@ namespace {
 
 int ParseLevel(const char* v) {
 	if (v == nullptr || *v == '\0') return 0;
-	if (*v >= '0' && *v <= '9') return std::clamp(std::atoi(v), 0, 3);
+	if (*v >= '0' && *v <= '9') return std::clamp(std::atoi(v), 0, 4);
 	char w[8] {};
 	for (int i = 0; i < 7 && v[i] != '\0'; ++i) w[i] = static_cast<char>(v[i] | 0x20);
 	if (std::strncmp(w, "bajo", 4) == 0 || std::strncmp(w, "low", 3) == 0) return 1;
 	if (std::strncmp(w, "medi", 4) == 0) return 2;
 	if (std::strncmp(w, "alto", 4) == 0 || std::strncmp(w, "high", 4) == 0) return 3;
+	if (std::strncmp(w, "ultr", 4) == 0) return 4; // (ao-strong-1029)
 	return 0;
 }
 const char* LevelName(int l) {
-	static const char* names[] {"No", "Bajo", "Medio", "Alto"};
-	return names[std::clamp(l, 0, 3)];
+	static const char* names[] {"No", "Bajo", "Medio", "Alto", "Ultra"};
+	return names[std::clamp(l, 0, 4)];
 }
 float EnvF(const char* name, float fallback, float lo, float hi) {
 	const char* v = std::getenv(name);
@@ -74,8 +77,9 @@ struct FrameUbo {
 	float   rot0[4];
 	float   rot1[4];
 	float   rot2[4];
+	float   par2[4];
 };
-static_assert(sizeof(FrameUbo) == 160);
+static_assert(sizeof(FrameUbo) == 176);
 struct Push {
 	int32_t mode = 0;
 	float   step = 0.0f;
@@ -386,6 +390,9 @@ void ReadStats(GraphicContext& graphics, int level, bool still) {
 	            pct(s[3], s[0]), pct(s[3], s[1]), s[1] > 0 ? static_cast<double>(s[6]) / 10.0 / s[1] : 0.0, pct(s[1], s[0]),
 	            g_ao.light_valid ? std::exp2(g_ao.log_light) : 0.0f, g_ao.conv, g_ao.frames_on, g_ao.frames_still,
 	            pm(0), pm(1), pm(2), pm(3), pm(4), pm(5));
+	std::printf("RTAO strength: %s, mean AO factor %.3f (applied luminance ratio on the shaded surfaces), darkened > 30 %%: %.1f%% of "
+	            "the pixels\n",
+	            LevelName(level), s[1] > 0 ? static_cast<double>(s[7]) / 1000.0 / s[1] : 1.0, pct(s[12], s[0]));
 	std::fflush(stdout);
 	for (auto& v: g_ao.sum) v = 0;
 	g_ao.st_frames = g_ao.frames_on = g_ao.frames_still = 0;
@@ -425,8 +432,13 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	if (!(m[0] != 0.0f && m[5] != 0.0f && (m[11] != 0.0f || m[15] != 0.0f)) ||
 	    !std::all_of(m.begin(), m.end(), [](float v) { return std::isfinite(v); }))
 		return false;
-	static constexpr int   slices_by[4] {0, 2, 3, 4}, steps_by[4] {0, 4, 6, 8}, hist_by[4] {0, 16, 24, 32};
-	static constexpr float radius_by[4] {0.0f, 0.6f, 0.8f, 1.0f};
+	// (ao-strong-1029) "oscurece poco": longer radius, a power curve, strength > 1, a lower floor and a share of the whole
+	// colour treated as ambient, per level (Ultra = KYTY_AO=4: Alto's samples, the strongest look)
+	static constexpr int   slices_by[5] {0, 2, 3, 4, 4}, steps_by[5] {0, 4, 6, 8, 8}, hist_by[5] {0, 16, 24, 32, 32};
+	static constexpr float radius_by[5] {0.0f, 0.8f, 1.1f, 1.4f, 1.7f};
+	static constexpr float strength_by[5] {0.0f, 1.1f, 1.25f, 1.4f, 1.55f};
+	static constexpr float power_by[5] {1.0f, 1.6f, 1.9f, 2.2f, 2.5f};
+	static constexpr float share_by[5] {0.0f, 0.55f, 0.65f, 0.75f, 0.85f};
 	const bool             half = true; // (ao2-1028) every level: Alto full res cost 8.4 ms
 	if (!EnsurePipeline(*graphics) || !EnsureImages(*graphics, color.extent, half)) {
 		static bool said = false;
@@ -448,10 +460,12 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		const char* v = std::getenv("KYTY_AO_GAME");
 		return v != nullptr && (v[0] | 0x20) == 'k';
 	}();
-	static const float strength = EnvF("KYTY_AO_STRENGTH", 1.0f, 0.0f, 1.0f) * (keep ? 0.5f : 1.0f);
-	static const float floor_k  = EnvF("KYTY_AO_FLOOR", 0.4f, 0.0f, 1.0f);
+	static const float strength = EnvF("KYTY_AO_STRENGTH", 1.0f, 0.0f, 3.0f) * strength_by[level] * (keep ? 0.5f : 1.0f);
+	static const float power    = EnvF("KYTY_AO_POWER", power_by[level], 0.5f, 4.0f);
+	static const float share    = EnvF("KYTY_AO_SHARE", share_by[level], 0.0f, 1.0f);
+	static const float floor_k  = EnvF("KYTY_AO_FLOOR", 0.15f, 0.0f, 1.0f);
 	static const float ambient  = EnvF("KYTY_AO_AMBIENT", 6.0f, 0.0f, 100.0f);
-	static const float fog      = EnvF("KYTY_AO_FOG", 60.0f, 0.0f, 100000.0f);
+	static const float fog      = EnvF("KYTY_AO_FOG", 100.0f, 0.0f, 100000.0f);
 	static const bool  view     = EnvF("KYTY_AO_VIEW", 0.0f, 0.0f, 1.0f) > 0.5f;
 
 	RtReflGbuffer gbuf;
@@ -466,10 +480,10 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		const int  now  = (normals ? 1 : 0) | (albedo ? 2 : 0) | (gdepth ? 4 : 0);
 		if (now != said) {
 			said = now;
-			std::printf("RTAO: on (%s: %d slices x %d steps, %g m, history %d, %ux%u trace for %ux%u; strength %g, floor %g, ambient x%g, "
+			std::printf("RTAO: on (%s: %d slices x %d steps, %g m, history %d, %ux%u trace for %ux%u; strength %g, power %g, share %g, floor %g, ambient x%g, "
 			            "fog %g m; normals from %s, albedo %s, forward-drawn surfaces %s; the game's AO %s%s)\n",
 			            LevelName(level), slices_by[level], steps_by[level], radius, hist_by[level], g_ao.trace.width, g_ao.trace.height,
-			            color.extent.width, color.extent.height, strength, floor_k, ambient, fog, normals ? "the G-buffer + depth" : "depth",
+			            color.extent.width, color.extent.height, strength, power, share, floor_k, ambient, fog, normals ? "the G-buffer + depth" : "depth",
 			            albedo ? "from the G-buffer" : "0.35 (no G-buffer)", gdepth ? "skipped" : "not detectable",
 			            keep ? "kept (KYTY_AO_GAME=keep: ours at half strength)" : "replaced (r_enableAmbientShadowing=false)",
 			            view ? "; AO view" : "");
@@ -486,7 +500,8 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	ubo.trace[2] = strength, ubo.trace[3] = radius;
 	ubo.par[0] = floor_k, ubo.par[1] = fog;
 	ubo.par[2] = g_ao.light_valid ? std::exp2(g_ao.log_light) * ambient : 0.0f;
-	ubo.par[3] = 0.125f;
+	ubo.par[3] = 1.0f / 6.0f; // (ao-strong-1029) was 1/8 of the height
+	ubo.par2[0] = power, ubo.par2[1] = share;
 	ubo.cfg[0] = level, ubo.cfg[1] = static_cast<int32_t>(g_ao.frame);
 	ubo.cfg[2] = (inputs.reset ? 1 : 0) | (g_ao.history_valid ? 2 : 0) | (normals ? 4 : 0) | (albedo ? 8 : 0) | (half ? 16 : 0) |
 	             (gdepth ? 32 : 0) | (still ? 64 : 0) | (view ? 128 : 0);
