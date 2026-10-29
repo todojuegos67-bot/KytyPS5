@@ -392,7 +392,7 @@ function Start-Game {
 	# (10-23) KYTY_LOWMEM_VRAM retirado: con graficas de 8 GB bajaba el presupuesto a 4 GB y daba tirones (13-47% de tramos frente a 2-7%)
 	$sets += 'KYTY_FAULT_STATS=1'
 	$sets += 'KYTY_ALIAS_STATS=0'  # (10-23) el diagnostico de alias recorria todos los mapeos en cada map: tirones al cambiar de zona que empeoraban con la sesion
-	if ($fgConfig -eq 'fsr3-x4.json') { $sets += 'KYTY_VRR_CAP_FPS=224' }  # (10-22 d) en DLSS el tope se aplicaba dos veces: 14 reales x4 = 56
+	if ($fgConfig -eq 'fsr3-x4.json') { $sets += 'KYTY_VRR_CAP_FPS=auto' }  # (10-22 d) en DLSS el tope se aplicaba dos veces: 14 reales x4 = 56
 	if ($fgConfig -like '*dyn*') { $sets += 'KYTY_DYN_QUALITY=0.95' }  # (10-22 g) llenar el monitor: el menor multiplicador que llega a ~224 (80 reales = x3, 120 = x2)
 	# (10-23) Teclado y raton: velocidad de camara del juego (sin teclado y raton no se toca: la del menu del juego).
 	# (10-24) Convars extra: velocidad de camara (raton) y la prueba elegida en Ajustes (manchas negras).
@@ -410,6 +410,10 @@ function Start-Game {
 	$sets += 'KYTY_LOWLAT_PACE_BEFORE_INPUT=0'; $sets += 'KYTY_FLIP_QUEUE_LIMIT=0'; $sets += 'KYTY_PHASE_PACE=0'; if (Is-FixedFg) { $sets += 'KYTY_DISPLAYED_WAIT=1' }  # (10-25) cola de 1 fotograma como en consola: solo en los modos de 30/45 fijos (desbloqueado lo limitaba a ~90)  # (10-24) el limite de cola daba trompicones (juego sd 11 ms) y no bajaba la latencia: apagado
 	$pureGame = ($chkPure -and $chkPure.Checked)  # (audit) Juego original: ningun pase visual anadido
 	if ($cmbAoNew -and -not $pureGame) { $sets += "KYTY_AO=$([math]::Max(0, $cmbAoNew.SelectedIndex))" } else { $sets += 'KYTY_AO=0' }  # (ao-1028) oclusion ambiental nueva: No/Bajo/Medio/Alto
+	if ($cmbAoNew -and -not $pureGame -and $cmbAoNew.SelectedIndex -gt 0) {  # (ds-ptao-1029) Path tracing: la escena por hardware (TLAS) para los rayos; sin RT por hardware queda la oclusion de pantalla
+		$sets += @('KYTY_AO_HW=1', 'KYTY_RT_HW_EXPERIMENTAL=1', 'KYTY_HWRT=1')
+		if ((Get-IniValue 'rthwexp' '0') -ne '1') { $sets += @('KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_SUN=0') }
+	}
 	# (ds-shadow-1028) Sombras RT de pantalla (cshadow.comp, nunca RT real): No / Bajo / Medio / Alto = nivel 1 / 2 / 3 a fuerza
 	# 0,35 / 0,5 / 0,7. Con la Luz volumetrica y sin Sombras RT el pase sigue a fuerza 0 (solo da el sol a la volumetrica).
 	$shLv = if (-not $pureGame -and $cmbRtSh) { [math]::Min([math]::Max(0, $cmbRtSh.SelectedIndex), 3) } else { 0 }
@@ -433,15 +437,16 @@ function Start-Game {
 		if ((Get-IniValue 'rthwexp' '0') -ne '1') { $sets += @('KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_SUN=0') }
 	}
 	if (-not $pureGame -and $cmbFlare -and $cmbFlare.SelectedIndex -gt 0) { $sets += 'KYTY_TORCH_FLARE=1' }  # (torch-1028) destellos de lente
+	if ($cmbDof -and -not $pureGame) { $sets += "KYTY_DOF=$([math]::Min(3, [math]::Max(0, $cmbDof.SelectedIndex)))" } else { $sets += 'KYTY_DOF=0' }  # (ds-dof-1029) profundidad de campo a distancia: No/Suave/Cinematico/Fuerte
 	if ($pureGame) {
 		# (audit) Juego original: fuera todo pase visual del emulador (RT, volumetrica, sombra RT, brillo, oclusion especular, GTAO,
 		# SSGI, reflejos RT de pantalla, contacto, particulas RT); -Set manda sobre el entorno. Rendimiento, reescalador, FG y latencia igual.
-		$fxPat = '^KYTY_(HWRT|RT_REFLECTIONS|RT_SHADOWS|RT_SUN|RT_PARTICLES|RT_LOCAL|GODRAYS|SHINE|SPEC_OCCLUSION|GTAO|SSGI|SSR|CONTACT_SHADOWS|AO|TORCH)'
+		$fxPat = '^KYTY_(HWRT|RT_REFLECTIONS|RT_SHADOWS|RT_SUN|RT_PARTICLES|RT_LOCAL|GODRAYS|SHINE|SPEC_OCCLUSION|GTAO|SSGI|SSR|CONTACT_SHADOWS|AO|TORCH|DOF|SMOKE)'
 		$sets = @($sets | Where-Object { $_ -notmatch $fxPat })
 		foreach ($n in @(Get-ChildItem Env: | Where-Object { $_.Name -match $fxPat } | ForEach-Object { $_.Name })) { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 		$sets += @('KYTY_HWRT=0', 'KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_REFLECTIONS=0',
 			'KYTY_RT_SHADOWS=0', 'KYTY_CONTACT_SHADOWS=0', 'KYTY_RT_SUN=0', 'KYTY_RT_PARTICLES=0', 'KYTY_GODRAYS=0', 'KYTY_SHINE=0', 'KYTY_SPEC_OCCLUSION=0',
-			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0', 'KYTY_TORCH_HW=0', 'KYTY_RT_HW_EXPERIMENTAL=0')
+			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0', 'KYTY_TORCH_HW=0', 'KYTY_SMOKE=0', 'KYTY_RT_HW_EXPERIMENTAL=0', 'KYTY_DOF=0')
 		$pa = @(); for ($i = 0; $i -lt $psargs.Count; $i++) { if ($psargs[$i] -eq '-Ssgi') { $i++; continue }; $pa += $psargs[$i] }; $psargs = $pa
 	}
 	# (10-24) Brillo metales retirado (no aportaba)
@@ -457,7 +462,8 @@ function Start-Game {
 	# un tope a 56 los 60 del juego se comian 4 frames por segundo (tirones cada 0.25 s).
 	# (10-21 b) Con frame generation siempre 840 Hz y cada frame sale en cuanto esta listo (FLIP_WHEN_READY): por debajo
 	# de 60 los frames ya no se redondean a la rejilla de vblanks (a 40 reales salian con +-3 ms de vaiven: tirones con G-Sync).
-	if ($config -like 'dlss*' -or $config -eq 'fsr3-mfg-dynamic.json') { $psargs += @('-Vblank', '840') }  # (10-21: 60 = 14 pulsos, 56 = 15)
+	if ($config -like 'dlss*') { $psargs += @('-Vblank', '840') }
+	elseif ($config -eq 'fsr3-mfg-dynamic.json') { $psargs += @('-Vblank', '900') }  # (10-29 prueba) 900 Hz: 60 y 75 caben, 56 no -> el juego no se frena a 56 con AMD x4  # (10-21: 60 = 14 pulsos, 56 = 15)
 	elseif ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
 	# Sin frame generation, "FPS desbloqueados": vblank de 120 Hz (-Fps120, el modo probado de chenxiao07; a 240 los menus y el intro iban acelerados, 10-18), el juego pasa de 60 (a velocidad real:
 	# gameMinDeltaTime en run-windows); videos, menus y pantallas de carga siguen a 60.
@@ -813,7 +819,7 @@ function Get-ResFamilies {
 	# (10-22) Modo Souls equilibrado: frame generation de AMD, asi que sin DLSS (XeSS, FSR o el del juego).
 	if ($chkLowEnd45 -and $chkLowEnd45.Checked) { return @('', 'dlss', 'xess', 'fsr', 'fsr4', 'juego') }  # (10-23) DLSS tambien
 	$cfg = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
-	if ($cfg -like 'dlss*') { return @('', 'dlss', 'juego') }
+	if ($cfg -like 'dlss*') { return @('', 'dlss', 'xess', 'fsr', 'fsr4', 'juego') }  # (10-29) frame generation de NVIDIA con cualquier reescalador
 	if ($cfg -like 'fsr3*') { return @('', 'dlss', 'xess', 'fsr', 'fsr4', 'juego') }  # (10-23) DLSS + frame generation de AMD (prueba)
 	return @('', 'dlss', 'xess', 'fsr', 'fsr4', 'juego')
 }
@@ -1379,7 +1385,7 @@ $title = T 'Actualizar version' 'Update version'
 $BackupDirName = '_backup_update'
 # Datos del usuario: NUNCA se copian encima ni se mueven (carpetas raiz y patrones de archivo).
 $ExcludeDirs = @('_PipelineCache', '_SaveData', '_SaveData-copias', 'config', 'logs', 'profiles', $BackupDirName)
-$ExcludeFiles = @('*.ini', '*.seeds', '*.seeds.program', '*.prewarm2', 'game-path.txt', 'ram16.txt', 'version.txt')
+$ExcludeFiles = @('*.ini', '*.seeds', '*.seeds.program', '*.prewarm2', 'game-path.txt', 'ram16.txt', 'version.txt', 'amd_fidelityfx_vk.dll')  # (10-28) la DLL de AMD modificada (x3/x4) nunca se cambia al actualizar ni restaurar
 # Archivos del motor (solo raiz) que se mueven a la copia de seguridad.
 $EnginePatterns = @('*.exe', '*.dll', '*.ps1')
 
@@ -2295,11 +2301,14 @@ function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @(
 	return $c
 }
 $cmbRtSh = New-RtCombo 'Sombras RT' 'rtshadow2' 600 'Sombras del sol por rayos sobre la imagen (de pantalla, sin RT real): sombras de contacto que las del juego pierden (bajo brazos, entre piernas, junto a muros), con borde suave y estable. Solo donde el juego ya muestra sol. Solo con DLSS, XeSS o FSR. Bajo ~0,3 ms, Medio ~0,6 ms, Alto ~1 ms.' @('No', 'Bajo', 'Medio', 'Alto')  # (ds-shadow-1028)
-$cmbAoNew = New-RtCombo 'Oclusión ambiental' 'ao1028' 88 'Oclusion ambiental nueva (ao-1028, sin RT por hardware): oscurece solo la luz ambiental en rincones, juntas y bajo objetos, con radio en metros, sin halos ni ruido; nunca el cielo, el fuego ni lo emisivo. Sustituye a la oclusion del juego (no oscurece dos veces). Solo con DLSS, XeSS o FSR. Bajo ~0,3 ms, Medio ~0,5 ms, Alto ~1 ms (resolucion completa).' @('No', 'Bajo', 'Medio', 'Alto')  # (ao-1028) oclusion ambiental nueva (KYTY_AO), solo en Ray tracing
+$cmbAoNew = New-RtCombo 'Path tracing' 'ao1028' 88 'Path tracing (ds-ptao-1029, RT por hardware: la escena TLAS de la GPU): rayos por pixel desde cada superficie que dan la oclusion real (tambien de lo que esta fuera de pantalla o detras de la camara), un rebote de luz indirecta con el color de lo que tocan y sombras suaves de contacto hacia el sol y las antorchas. Sustituye solo la luz ambiental (las superficies abiertas no se oscurecen) y a la oclusion del juego. Sin RT por hardware: oclusion de pantalla suave. Solo con DLSS, XeSS o FSR. Bajo 1 rayo a media resolucion, Medio 1 rayo, Alto 2 rayos a resolucion completa (~1-3 ms).' @('No', 'Bajo', 'Medio', 'Alto')  # (ao-1028) oclusion ambiental nueva (KYTY_AO), solo en Ray tracing
 $cmbRays = New-RtCombo 'Luz volumetrica' 'godrays2' 24 'Luz volumetrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms (mas rayos y mas pasos de sombra).' @('No', 'Bajo', 'Medio', 'Alto')
 $cmbRtRf = New-RtCombo 'Reflejos RT' 'rtrefl2' 56 'Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, mas nitidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolucion completa y mas fuertes). Hibrido: Alto + rayos por hardware (RT real) solo donde el rayo de pantalla no encuentra nada (fuera de pantalla o tapado); el color sale de la pantalla anterior, limitado al de alrededor y entrando poco a poco: sin destellos. Necesita GPU con RT. ~+0,5 ms. Beta.' @('No', 'Bajo', 'Medio', 'Alto', 'Ultra', 'Extremo', 'Híbrido')  # (10-25 noche) Extremo = nivel 5 (refl10)  # (10-25) refl8; Ultra vuelve: el cierre era del frame generation AMD, no de los reflejos  # (refl-hybrid-1028) Hibrido = 6
 $cmbTorch = New-RtCombo 'Luz de antorchas RT' 'torchrt' 536 'Luz de antorchas RT: el fuego de antorchas, braseros y hogueras ilumina paredes, suelos y estructuras cercanas con un rebote calido que parpadea, y se refleja en superficies lisas o mojadas. No atraviesa paredes ni personajes (se comprueba en la profundidad). Solo en pantalla, sin RT por hardware. Solo con DLSS, XeSS o FSR. Bajo 2 fuegos ~0,3 ms, Medio 4 ~0,5 ms, Alto 8 ~0,9 ms. Hibrido: Alto + rayos por hardware (RT real) donde la pantalla no ve al que tapa la luz (fuera de pantalla o detras de otra cosa); solo oscurece, nunca anade luz. Necesita GPU con RT. ~+0,5 ms.' @('No', 'Bajo', 'Medio', 'Alto', 'Híbrido')  # (torch-1028) (torch-shadow-1028) Hibrido
 $cmbFlare = New-RtCombo 'Destellos de lente' 'lensflare' 568 'Destello de lente de antorchas y fuegos visibles: pequenos reflejos de la optica, una estrella y una raya suaves. Desaparece si el fuego queda tapado y cerca de los bordes. Sin halo ni velo en pantalla. Se dibuja antes del HUD. Solo con DLSS, XeSS o FSR. ~0,1 ms.' @('No', 'Sí')  # (torch-1028)
+$cmbDof = New-RtCombo 'Profundidad de campo' 'dof1029' 632 'Profundidad de campo a distancia: al fondo las cosas se ven mas borrosas, con un desenfoque de cine (disco suave; las luces brillantes del fondo se abren en bokeh redondo). Lo cercano y lo de media distancia queda nitido; el HUD siempre nitido. Hecho por el emulador (la del juego solo actua en cinematicas y menus). Solo con DLSS, XeSS o FSR. Suave: desde 40 m, poco. Cinematico (recomendado): desde 30 m. Fuerte: desde 25 m, muy visible. ~0,2-0,4 ms.' @('No', 'Suave', 'Cinemático', 'Fuerte')  # (ds-dof-1029) KYTY_DOF
+$cmbSmoke = New-RtCombo 'Humo y partículas' 'smoke1029' 664 'Humo y particulas mas realistas sobre las del propio juego (a resolucion completa): Suave = el humo, la niebla de particulas y las chispas ya no cortan en linea dura donde tocan suelo y paredes (se funden en ~35 cm, como en el cine). Antorchas = ademas el humo cerca de antorchas y braseros brilla con su luz calida (radio 4,5 m, sin parpadeo; necesita Luz de antorchas RT). Estable, sin brillos nuevos. Solo con DLSS, XeSS o FSR. ~0,3-0,6 ms.' @('No', 'Suave', 'Antorchas')  # (ds-particles-1029) KYTY_SMOKE
+if ($cmbSmoke -and (Get-IniValue 'smoke1029' '') -eq '') { $cmbSmoke.SelectedIndex = 2 }  # (ds-particles-1029) por defecto: Antorchas
 $cmbShine = $null  # (10-24) Brillo metales retirado
 # (10-24) Ajustes del juego: convars del propio motor, cada uno en Juego (no se toca) o en un nivel. Nombres, tipos,
 # rangos y valores de fabrica sacados del registro de convars del eboot 1.07 (constructor de cada convar: min / max;
@@ -2721,7 +2730,7 @@ if ($gCtl -and $btnCtl) { $gCtl.Top = $btnCtl.Bottom + 6 }
 # (audit) Casilla Juego original: al marcarla las filas de efectos quedan inactivas (sus valores se guardan).
 $chkPure = New-Check 'Juego original (sin efectos añadidos)' 0 0 396 'puregame'
 $tips.SetToolTip($chkPure, 'Apaga todos los efectos visuales que anade el emulador (ray tracing, luz volumetrica, sombras RT, brillo, oclusion, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, frame generation y latencia no cambian.')
-function Update-PureGame { foreach ($c in @($cmbRtRf, $cmbRt, $cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbRtSh)) { if ($c) { $c.Enabled = -not $chkPure.Checked } } }
+function Update-PureGame { foreach ($c in @($cmbRtRf, $cmbRt, $cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbSmoke)) { if ($c) { $c.Enabled = -not $chkPure.Checked } } }
 $chkPure.Add_CheckedChanged({ Update-PureGame })
 # (10-26) "Ray tracing" solo con RT real: fuera Luz RT (SSGI), Luz volumetrica de pantalla, Reflejos RT, Sol RT y Particulas RT de pantalla.
 # (Visible no sirve para leer antes de mostrar la ventana: se trabaja con listas.)
@@ -2730,7 +2739,7 @@ try {
 	$rtHwExp = (Get-IniValue 'rthwexp' '0') -eq '1'
 	$fake = @($cmbSun, $cmbPart, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater) | Where-Object { $_ }  # (10-27) solo reflejos, sombras RT y rayos volumetricos
 	$hideOnly = @(if (-not $rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } })  # (vol25) la Luz volumetrica ya no se oculta
-	$keep = @(@($cmbRtRf, $cmbRt, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbRtSh) | Where-Object { $_ }) + @(if ($rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } | Sort-Object Top })  # (vol25) Luz volumetrica del 10-25 visible otra vez, debajo
+	$keep = @(@($cmbRtRf, $cmbRt, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbSmoke, $cmbRtSh) | Where-Object { $_ }) + @(if ($rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } | Sort-Object Top })  # (vol25) Luz volumetrica del 10-25 visible otra vez, debajo
 	$lblOf = @{}
 	foreach ($c in @($fake + $hideOnly + $keep + @($cmbShQ, $cmbShD, $cmbAo) | Where-Object { $_ })) {
 		$lblOf[$c.GetHashCode()] = @($gRt.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and [math]::Abs($_.Top - ($c.Top + 2)) -le 4 })
@@ -2765,7 +2774,7 @@ try {
 	if ($pcCard) { $pcCard.Top = $gRt.Top + $gRt.Height + 12 }
 } catch { }
 # (10-26) Al elegir cualquier Modo Souls: todo el ray tracing en No (el usuario lo enciende a mano despues).
-function Set-RtAllOff { foreach ($c in @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRt, $cmbRtRf, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbRtSh, $cmbRays)) { if ($c -and $c.Items.Count -gt 0) { $c.SelectedIndex = 0 } } }
+function Set-RtAllOff { foreach ($c in @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRt, $cmbRtRf, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbRays)) { if ($c -and $c.Items.Count -gt 0) { $c.SelectedIndex = 0 } } }
 # (vol25) Luz volumetrica y Sombras sol RT comparten el pase del sol en el motor: con las dos, el sol de la volumetrica
 # llega a ratos (niebla que salta). Se excluyen: elegir una pone la otra en No.
 if ($false -and $cmbRays -and $cmbHSun) {  # (rt-vol 1ac512fe) ya pueden ir juntas

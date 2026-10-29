@@ -1,5 +1,7 @@
 #include "local/hwrt-scene.h"
 
+#include <cstdlib>
+
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
@@ -1466,6 +1468,18 @@ bool Requested() {
 		// (ds-rt1026-restore) The hardware-RT effects (TLAS: reflections, sun, lamps, GI, water, volumetric) are out of the
 		// default build again: KYTY_HWRT=1 is honoured only with KYTY_RT_HW_EXPERIMENTAL=1 ("RT real (experimental)").
 		const bool  asked = value != nullptr && *value == '1';
+		// (ds-ptao-1029) "Path tracing" (KYTY_AO > 0, the launcher's AO row) asks for the scene by itself unless KYTY_HWRT is
+		// set (0 keeps it off) or KYTY_AO_HW=0: the screen-space AO is only the fallback without ray queries.
+		if (value == nullptr || *value == '\0') {
+			const char* ao = std::getenv("KYTY_AO");
+			const char* hw = std::getenv("KYTY_AO_HW");
+			if (ao != nullptr && *ao != '\0' && *ao != '0' && (*ao < '0' || *ao > '9' || std::atoi(ao) > 0) && (ao[0] | 0x20) != 'n' &&
+			    !(hw != nullptr && *hw == '0')) {
+				std::printf("HWRT: the scene TLAS asked for by KYTY_AO=%s (path tracing)\n", ao);
+				std::fflush(stdout);
+				return true;
+			}
+		}
 		if (asked && !RtHwExperimental()) {
 			std::printf("HWRT: KYTY_HWRT=1 ignored: the 10-26 screen-space RT set is in use (KYTY_RT_HW_EXPERIMENTAL=1: the hardware RT, experimental)\n");
 			std::fflush(stdout);

@@ -1243,8 +1243,8 @@ void Draw(float width, float height) {
 					if (ChoiceRow("Luz volumétrica", changed_not_live(l.godrays != s.godrays, 4), kRtLevels, kRtLevelCount, s.godrays,
 					              "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms. Apagarla es inmediato."))
 						live_changed = true;
-					if (ChoiceRow("Oclusión ambiental", changed_not_live(l.ao != s.ao, 8), kRtLevels, kRtLevelCount, s.ao,
-					              "Oclusión ambiental nueva (sin RT por hardware): oscurece solo la luz ambiental en rincones, juntas y bajo objetos, con radio en metros, sin halos ni ruido; nunca el cielo, el fuego ni lo emisivo. Sustituye a la oclusión del juego. Solo con DLSS, XeSS o FSR. Ahora mismo cuesta unos 7 ms en el juego (se está arreglando): mejor en No. Apagarla es inmediato."))
+					if (ChoiceRow("Path tracing", changed_not_live(l.ao != s.ao, 8), kRtLevels, kRtLevelCount, s.ao,
+					              "Path tracing (RT por hardware: la escena TLAS de la GPU): rayos por píxel desde cada superficie que dan la oclusión real (también de lo que está fuera de pantalla o detrás de la cámara), un rebote de luz indirecta con el color de lo que tocan y sombras suaves de contacto hacia el sol y las antorchas. Sustituye solo la luz ambiental y a la oclusión del juego. Sin RT por hardware: oclusión de pantalla suave. Solo con DLSS, XeSS o FSR. Bajo 1 rayo a media resolución, Medio 1 rayo, Alto 2 rayos a resolución completa (~1-3 ms). Apagarlo es inmediato."))
 						live_changed = true;
 					if (ChoiceRow("Luz de antorchas RT", changed_not_live(l.torch != s.torch, 16), kTorchLevels, kTorchLevelCount, s.torch,
 					              "Luz de antorchas RT: el fuego de antorchas, braseros y hogueras ilumina paredes, suelos y estructuras cercanas con un rebote cálido que parpadea, y se refleja en superficies lisas o mojadas. No atraviesa paredes ni personajes. Solo en pantalla, sin RT por hardware. Solo con DLSS, XeSS o FSR. Bajo 2 fuegos ~0,3 ms, Medio 4 ~0,5 ms, Alto 8 ~0,9 ms. Híbrido: Alto + rayos por hardware (RT real) donde la pantalla no ve al que tapa la luz; solo oscurece, nunca añade luz. Necesita GPU con RT. ~+0,5 ms. Apagarla es inmediato."))
@@ -1257,6 +1257,8 @@ void Draw(float width, float height) {
 							live_changed = true;
 						}
 					}
+					ChoiceRow("Humo y partículas", s.smoke != l.smoke, kSmokeLevels, kSmokeLevelCount, s.smoke,
+					          "Humo y partículas más realistas sobre las del propio juego: Suave = el humo, la niebla de partículas y las chispas ya no cortan en línea dura donde tocan suelo y paredes (se funden en ~35 cm). Antorchas = además el humo cerca de antorchas y braseros brilla con su luz cálida (radio 4,5 m, sin parpadeo; necesita Luz de antorchas RT). Solo con DLSS, XeSS o FSR. ~0,3-0,6 ms.");
 					if (ChoiceRow("Sombras RT", changed_not_live(s.rt_shadows != l.rt_shadows, 64), kRtLevels, kRtLevelCount, s.rt_shadows,
 					              "Sombras del sol por rayos sobre la imagen (de pantalla, sin RT real): sombras de contacto que las del juego pierden (bajo brazos, entre piernas, junto a muros), con borde suave y estable. Solo donde el juego ya muestra sol. Solo con DLSS, XeSS o FSR. Bajo ~0,3 ms, Medio ~0,6 ms, Alto ~1 ms."))
 						live_changed = true;

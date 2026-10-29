@@ -454,6 +454,36 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${rt_ao_header}")
+# (ds-ptao-1029) the path-traced build of the same shader (ray queries into the KYTY_HWRT TLAS).
+set(rt_ao_hw_spv "${gpu_tiler_generated_dir}/rt_ao_hw.spv")
+set(rt_ao_hw_header "${gpu_tiler_generated_dir}/rt_ao_hw_spv.h")
+add_custom_command(
+	OUTPUT "${rt_ao_hw_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_AO_HW
+	        -o "${rt_ao_hw_spv}" "${rt_ao_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_ao_hw_spv} -DOUTPUT=${rt_ao_hw_header}
+	        -DSYMBOL=RT_AO_HW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rt_ao_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rt_ao_hw_header}")
+
+# KYTY_DOF (ds-dof-1029): the distance depth of field (src/local/dof.cpp).
+set(dof_source "${KYTY_SOURCE_DIR}/local/dof.comp")
+set(dof_spv "${gpu_tiler_generated_dir}/dof.spv")
+set(dof_header "${gpu_tiler_generated_dir}/dof_spv.h")
+add_custom_command(
+	OUTPUT "${dof_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${dof_spv}" "${dof_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${dof_spv} -DOUTPUT=${dof_header}
+	        -DSYMBOL=DOF_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${dof_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${dof_header}")
 
 # KYTY_SSR: screen-space reflections before the PS5 Pro path's upscaler (src/local/frame-gen.cpp).
 set(ssr_source "${KYTY_SOURCE_DIR}/local/ssr.comp")
@@ -609,6 +639,21 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${godrays_header}")
 
+# KYTY_SMOKE: soft particles + torch-lit smoke on the particle layer (src/local/smoke.cpp).
+set(smoke_source "${KYTY_SOURCE_DIR}/local/smoke.comp")
+set(smoke_spv "${gpu_tiler_generated_dir}/smoke.spv")
+set(smoke_header "${gpu_tiler_generated_dir}/smoke_spv.h")
+add_custom_command(
+	OUTPUT "${smoke_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${smoke_spv}" "${smoke_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${smoke_spv} -DOUTPUT=${smoke_header}
+	        -DSYMBOL=SMOKE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${smoke_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${smoke_header}")
 # KYTY_TORCH / KYTY_TORCH_FLARE: firelight + lens flare from torches, screen-space (src/local/torch.cpp).
 set(torch_source "${KYTY_SOURCE_DIR}/local/torch.comp")
 set(torch_spv "${gpu_tiler_generated_dir}/torch.spv")
@@ -891,6 +936,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/hwrt-gi.h"
 	"${KYTY_SOURCE_DIR}/local/rt-ao.h"
 	"${KYTY_SOURCE_DIR}/local/rt-ao.cpp"
+	"${KYTY_SOURCE_DIR}/local/dof.h"
+	"${KYTY_SOURCE_DIR}/local/dof.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-gi.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.h"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.cpp"
@@ -912,6 +959,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/godrays.cpp"
 	"${KYTY_SOURCE_DIR}/local/torch.h"
 	"${KYTY_SOURCE_DIR}/local/torch.cpp"
+	"${KYTY_SOURCE_DIR}/local/smoke.h"
+	"${KYTY_SOURCE_DIR}/local/smoke.cpp"
 	"${KYTY_SOURCE_DIR}/local/volshadow.h"
 	"${KYTY_SOURCE_DIR}/local/volshadow.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-particles.h"

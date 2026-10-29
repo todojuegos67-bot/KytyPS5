@@ -68,6 +68,8 @@ extern const Choice  kRtReflLevels[];  // Reflejos RT: No, Bajo, Medio, Alto, Ul
 extern const int     kRtReflLevelCount;
 extern const Choice  kRtLightLevels[]; // Luz RT (SSGI): No, Media, Alta, Ultra, Extremo
 extern const int     kRtLightLevelCount;
+extern const Choice  kSmokeLevels[]; // No, Suave, Antorchas (Humo y particulas)
+extern const int     kSmokeLevelCount;
 extern const Choice  kRtLevels[];      // No, Bajo, Medio, Alto (Luz volumetrica, Oclusion ambiental, Sombras RT)
 extern const int     kRtLevelCount;
 extern const Choice  kTorchLevels[];   // Luz de antorchas RT: No, Bajo, Medio, Alto, Hibrido
@@ -136,7 +138,8 @@ struct Settings {
 	std::string rt_ss_refl = "0";    // reflejos_rt: Reflejos RT 0-6 (KYTY_RT_REFLECTIONS; 4-5: more presence; 6 Hibrido)
 	std::string rt_ssgi = "0";       // luz_rt_pantalla: Luz RT (SSGI) 0 No, 1 Media, 2 Alta, 3 Ultra, 4 Extremo (KYTY_SSGI)
 	std::string rt_shadows = "0";    // sombras_rt: Sombras RT de pantalla 0-3 (KYTY_RT_SHADOWS, strength 0.35 / 0.5 / 0.7)
-	std::string ao = "0";            // oclusion_ao: Oclusion ambiental 0-3 (KYTY_AO); default No (its composite costs ~7 ms now)
+	std::string ao = "0";            // oclusion_ao: Path tracing 0-3 (KYTY_AO + KYTY_AO_HW, ds-ptao-1029); default No
+	std::string smoke = "2";         // humo_particulas: Humo y particulas 0 No, 1 Suave, 2 Antorchas (KYTY_SMOKE, ds-particles-1029); default Antorchas
 	std::string torch = "0";         // luz_antorchas: Luz de antorchas RT 0-3, 4 Hibrido (KYTY_TORCH, KYTY_TORCH_HW)
 	bool        lens_flare = false;  // destellos_lente: KYTY_TORCH_FLARE
 	bool        rt_hw_exp = false;   // rt_experimental: hardware RT (the launcher's rthwexp; KYTY_RT_HW_EXPERIMENTAL=1)

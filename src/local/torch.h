@@ -5,7 +5,7 @@
 // a glint on smooth / wet surfaces), screen-space only. KYTY_TORCH_FLARE=0|1 ("Destellos de lente"): a small lens flare
 // from the visible fires, after every other pass. Both on the PS5 Pro path's HDR color before the upscaler (and so
 // before the HUD). KYTY_TORCH_STRENGTH (1.0, 0..3), KYTY_TORCH_FLARE_STRENGTH (1.0, 0..3), KYTY_TORCH_LIGHT (the fire
-// threshold, exposed luminance, 1.5), KYTY_TORCH_RANGE (1.0, 0.3..3), KYTY_TORCH_DEBUG=1 (the added light only).
+// threshold, exposed luminance, 1.5), KYTY_TORCH_RADIUS (4.5 m, 1.5..8: the hard world cutoff), KYTY_TORCH_RANGE (1.0, 0.3..3, x the radius), KYTY_TORCH_DEBUG=1 (the added light only).
 // Off (both 0, the default): nothing created.
 #include "local/frame-gen.h"
 
@@ -18,6 +18,9 @@ namespace Libs::Graphics::FrameGen {
 bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs);
 // In Upscale, last (after the god rays): the lens flare from the lights TorchApply tracked this frame.
 bool TorchFlareApply(vk::CommandBuffer command, UpscaleInputs& inputs);
+// (ds-ptao-1029) Read only, for the path-traced shadows of rt-ao.cpp: the GPU buffer holding the tracked lights (8 slots x 4
+// vec4 at byte `offset`: [0] uv, view z, fade; [3] view position, power), as TorchApply left it (the last frame's). False: none.
+bool TorchLightsBuffer(vk::Buffer& buffer, vk::DeviceSize& offset);
 
 } // namespace Libs::Graphics::FrameGen
 

@@ -87,6 +87,8 @@ const int    kRtReflLevelCount = 7;
 const Choice kRtLightLevels[] = {{"0", "No"}, {"1", "Media"}, {"2", "Alta"}, {"3", "Ultra"}, {"4", "Extremo"}};
 const int    kRtLightLevelCount = 5;
 const Choice kRtLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}};
+const Choice kSmokeLevels[] = {{"0", "No"}, {"1", "Suave"}, {"2", "Antorchas"}}; // (ds-particles-1029)
+const int    kSmokeLevelCount = static_cast<int>(sizeof(kSmokeLevels) / sizeof(kSmokeLevels[0]));
 const int    kRtLevelCount = 4;
 const Choice kTorchLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Híbrido"}};
 const int    kTorchLevelCount = 5;
@@ -277,6 +279,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("luz_rt_pantalla", s->rt_ssgi);
 	str("sombras_rt", s->rt_shadows);
 	str("oclusion_ao", s->ao);
+	str("humo_particulas", s->smoke);
 	str("luz_antorchas", s->torch);
 	boo("destellos_lente", s->lens_flare);
 	boo("rt_experimental", s->rt_hw_exp);
@@ -289,6 +292,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	clamp_level(s->rt_ssgi, 4);
 	clamp_level(s->rt_shadows, 3);
 	clamp_level(s->ao, 3);
+	if (s->smoke != "0" && s->smoke != "1" && s->smoke != "2") s->smoke = "2"; // (ds-particles-1029) default Antorchas
 	clamp_level(s->torch, 4);
 	// (10-28) No presets or modes any more: an old modo_souls is dropped (its graphics stay as saved).
 	s->souls_mode = "ninguno";
@@ -405,8 +409,10 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "luz_rt_pantalla=" << s.rt_ssgi << "\n"
 	  << "; Sombras RT (sombras del sol de pantalla): 0 no, 1 bajo, 2 medio, 3 alto\n"
 	  << "sombras_rt=" << s.rt_shadows << "\n"
-	  << "; Oclusion ambiental: 0 no, 1 bajo, 2 medio, 3 alto (por ahora cuesta varios ms: mejor en 0)\n"
+	  << "; Path tracing (oclusion y luz indirecta por RT por hardware; sin RT por hardware, oclusion de pantalla): 0 no, 1 bajo, 2 medio, 3 alto\n"
 	  << "oclusion_ao=" << s.ao << "\n"
+	  << "; Humo y particulas: 0 no, 1 suave (sin cortes duros), 2 antorchas (ademas el humo brilla con la luz de las antorchas)\n"
+	  << "humo_particulas=" << s.smoke << "\n"
 	  << "; Luz de antorchas RT: 0 no, 1 bajo, 2 medio, 3 alto, 4 hibrido (alto + rayos por hardware; GPU con RT)\n"
 	  << "luz_antorchas=" << s.torch << "\n"
 	  << "; Destellos de lente de antorchas y fuegos: 1 si, 0 no\n"
@@ -683,7 +689,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	sets.emplace_back("KYTY_DLSSG_PACE", "grid"); // (10-22 e) reflexfree waited once per shown frame: 14 real
 	sets.emplace_back("KYTY_FAULT_STATS", "1");
 	sets.emplace_back("KYTY_ALIAS_STATS", "0"); // (10-23) the alias walk of every mapping: hitches on area changes
-	if (std::strcmp(fg->id, "amd-x4") == 0) sets.emplace_back("KYTY_VRR_CAP_FPS", "224");
+	if (std::strcmp(fg->id, "amd-x4") == 0) sets.emplace_back("KYTY_VRR_CAP_FPS", "auto"); // (10-29, the launcher) the VRR cap from the monitor
 	if (std::strstr(fg->config, "dyn") != nullptr) sets.emplace_back("KYTY_DYN_QUALITY", "0.95"); // (10-22 g) fill the monitor
 	if (s.metrics == "1" || s.metrics == "2") sets.emplace_back("KYTY_LATENCY", "1");
 	sets.emplace_back("KYTY_DEPTH_ARRAY_LOG", "1");
@@ -697,6 +703,17 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (10-28, ds-shadow-1028) Sombras RT (screen-space, cshadow.comp; never hardware RT): level 1 / 2 / 3 at strength 0.35 /
 	// 0.5 / 0.7, without the cascade mode or the TLAS. With Luz volumetrica and no Sombras RT the pass runs at strength 0.
 	sets.emplace_back("KYTY_AO", !s.pure_game && (s.ao == "1" || s.ao == "2" || s.ao == "3") ? s.ao : "0"); // (ao-1028)
+	// (ds-ptao-1029, the launcher's "Path tracing") the hardware scene (TLAS) for the AO's rays; without hardware RT the
+	// screen-space AO stays. The other hardware passes off without rt_experimental.
+	if (!s.pure_game && (s.ao == "1" || s.ao == "2" || s.ao == "3")) {
+		sets.emplace_back("KYTY_AO_HW", "1");
+		sets.emplace_back("KYTY_RT_HW_EXPERIMENTAL", "1");
+		sets.emplace_back("KYTY_HWRT", "1");
+		if (!s.rt_hw_exp)
+			for (const char* k: {"KYTY_HWRT_REFL", "KYTY_HWRT_SHADOW", "KYTY_HWRT_LIGHTS", "KYTY_HWRT_PARTICLES", "KYTY_HWRT_GI", "KYTY_HWRT_AO",
+			                     "KYTY_HWRT_CONTACT", "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_RT_SUN"})
+				sets.emplace_back(k, "0");
+	}
 	const bool godrays = !s.pure_game && (s.godrays == "1" || s.godrays == "2" || s.godrays == "3");
 	const bool shadows = !s.pure_game && (s.rt_shadows == "1" || s.rt_shadows == "2" || s.rt_shadows == "3");
 	if (godrays) sets.emplace_back("KYTY_GODRAYS", s.godrays);
@@ -740,10 +757,16 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 				sets.emplace_back(k, "0");
 	}
 	if (!s.pure_game && s.lens_flare) sets.emplace_back("KYTY_TORCH_FLARE", "1");
-	// Its vblank: 840 Hz with DLSS and AMD dynamic frame generation, 360 with the other frame generation, 960 unlocked
-	// without, else 60.
-	const bool vb840  = dlss_fg || std::strcmp(fg->id, "amd-dinamico") == 0;
-	const int  vblank = with_fg ? (vb840 ? 840 : 360) : (unlocked ? 960 : 60);
+	// (ds-particles-1029) Humo y particulas: No / Suave / Antorchas (KYTY_SMOKE 0-2).
+	sets.emplace_back("KYTY_SMOKE", !s.pure_game && (s.smoke == "1" || s.smoke == "2") ? s.smoke : "0");
+	// (ds-all-1029) The torch passes skip their work while no light is tracked (the detection keeps running).
+	sets.emplace_back("KYTY_TORCH_IDLE", "1");
+	// The emulator's distance depth of field (ds-dof-1029) is not in the port: always off.
+	sets.emplace_back("KYTY_DOF", "0");
+	// Its vblank: 840 Hz with DLSS frame generation, 900 with AMD dynamic (10-29, the launcher: 60 and 75 fit, 56 does
+	// not, so the game is not held at 56 with AMD x4), 360 with the other frame generation, 960 unlocked without, else 60.
+	const bool vb900  = std::strcmp(fg->id, "amd-dinamico") == 0;
+	const int  vblank = with_fg ? (dlss_fg ? 840 : vb900 ? 900 : 360) : (unlocked ? 960 : 60);
 	plan.vblank       = vblank;
 	const std::string& quality = s.quality;
 	const std::string& texture = s.texture_reduce;
@@ -858,7 +881,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (s.pure_game) {
 		static const char* fx[] = {"KYTY_HWRT", "KYTY_RT_REFLECTIONS", "KYTY_RT_SHADOWS", "KYTY_RT_SUN", "KYTY_RT_PARTICLES", "KYTY_RT_LOCAL",
 		                           "KYTY_GODRAYS", "KYTY_SHINE", "KYTY_SPEC_OCCLUSION", "KYTY_GTAO", "KYTY_SSGI", "KYTY_SSR", "KYTY_CONTACT_SHADOWS",
-		                           "KYTY_AO", "KYTY_TORCH"};
+		                           "KYTY_AO", "KYTY_TORCH", "KYTY_DOF", "KYTY_SMOKE"};
 		for (auto& [k, v]: env.list)
 			for (const char* p: fx)
 				if (k.rfind(p, 0) == 0) v.clear();
@@ -866,7 +889,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		                     "KYTY_RT_SHADOWS", "KYTY_CONTACT_SHADOWS", "KYTY_RT_SUN", "KYTY_RT_PARTICLES", "KYTY_GODRAYS", "KYTY_SHINE",
 		                     "KYTY_SPEC_OCCLUSION", "KYTY_GTAO", "KYTY_SSGI", "KYTY_SSR", "KYTY_HWRT_GI", "KYTY_HWRT_AO", "KYTY_HWRT_CONTACT",
 		                     "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_AO", "KYTY_TORCH", "KYTY_TORCH_FLARE",
-		                     "KYTY_TORCH_HW", "KYTY_RT_HW_EXPERIMENTAL"})
+		                     "KYTY_TORCH_HW", "KYTY_RT_HW_EXPERIMENTAL", "KYTY_SMOKE", "KYTY_DOF"})
 			env.Set(k, "0");
 	}
 	// settings.ini [Avanzado] extra: as -Set (KEY= removes it).
@@ -952,7 +975,7 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.pad_map != n.pad_map || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
 	       l.safe_gpu != n.safe_gpu || l.quality != n.quality || l.texture_reduce != n.texture_reduce ||
 	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.extra != n.extra ||
-	       l.rt_ss_refl != n.rt_ss_refl || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao ||
+	       l.rt_ss_refl != n.rt_ss_refl || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke ||
 	       l.torch != n.torch || l.lens_flare != n.lens_flare || l.rt_hw_exp != n.rt_hw_exp ||
 	       (l.sharpness == "auto") != (n.sharpness == "auto");
 }

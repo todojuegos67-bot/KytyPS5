@@ -11,3 +11,12 @@ fsr4_shaders/*.txt text
 # Add-to-Steam files and the owner's tested FidelityFX DLL: committed byte-identical, never converted.
 tools/local/steam/** -text
 tools/local/fsr3-mfg/prebuilt/** -text
+# Packaged root files (Demon's Souls launcher and tools): shipped byte-identical to the installed folder, never converted.
+/Launcher-souls.ps1 -text
+/Launcher-souls-EN.ps1 -text
+/metricas.ps1 -text
+/kbm_curve.txt -text
+/Medir-rendimiento.cmd -text
+/Medir-rendimiento.ps1 -text
+/Capturar-RT.cmd -text
+/Capturar-RT.ps1 -text

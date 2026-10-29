@@ -38,6 +38,8 @@
 #include "local/shine.h"
 #include "local/godrays.h"
 #include "local/torch.h"
+#include "local/dof.h"
+#include "local/smoke.h"
 #include "local/rt-local-lights.h"
 #include "local/rt-flicker.h"
 #include "local/rt-capture.h"
@@ -110,7 +112,7 @@ int      g_generate    = 0;     // frames to generate per rendered frame (0 = of
 // m = gen + 1 = the largest in [1, min(KYTY_FRAMEGEN (default 5), numFramesToGenerateMax (3 until known)) + 1] with
 // real * m <= target (10-22; up after real * (m + 1) <= 0.97 target for ~1 s, down at once past 1.02 target). The real
 // rate is never held to reach a multiplier; Reflex caps it at target / m. Target: KYTY_DLSSG_TARGET_FPS, default
-// refresh - refresh^2 / 3600 (224 on 240 Hz).
+// refresh x 14 / 15 of the current display mode (224 on 240 Hz, 134 on 144, 154 on 165, 336 on 360).
 bool     g_dlssg_dynamic   = false;
 float    g_dlssg_target_fps = 0.0f;
 int      g_dyn_gen         = 1;   // the current generated frame count in dynamic mode (g_generate is its maximum)
@@ -1027,12 +1029,18 @@ void Initialize() {
 		if (const char* st = std::getenv("KYTY_DLSSG_DYN_STRETCH"); st != nullptr && *st == '0') g_dyn_stretch = false;
 		if (const char* t = std::getenv("KYTY_DLSSG_TARGET_FPS"); t != nullptr && std::atof(t) > 0) {
 			g_dlssg_target_fps = static_cast<float>(std::atof(t));
+			std::printf("[dlssg] dynamic target %.0f fps (KYTY_DLSSG_TARGET_FPS)\n", static_cast<double>(g_dlssg_target_fps));
 		} else {
 			DEVMODEA dm {};
 			dm.dmSize = sizeof(dm);
 			if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm) != 0 && dm.dmDisplayFrequency > 30) {
+				// 10-29: the owner's rule, refresh x 14/15 (240 -> 224, 144 -> 134, 165 -> 154, 360 -> 336), kept in the VRR range.
 				const double hz    = dm.dmDisplayFrequency;
-				g_dlssg_target_fps = static_cast<float>(std::floor(hz - hz * hz / 3600.0));
+				g_dlssg_target_fps = static_cast<float>(std::floor(hz * 14.0 / 15.0 + 0.01));
+				std::printf("[dlssg] display refresh %u Hz (current mode): dynamic target %.0f fps\n", static_cast<unsigned>(dm.dmDisplayFrequency),
+				            static_cast<double>(g_dlssg_target_fps));
+			} else {
+				std::printf("[dlssg] display refresh unknown: dynamic target 224 fps\n");
 			}
 		}
 		if (g_dlssg_target_fps <= 0.0f) g_dlssg_target_fps = 224.0f;
@@ -1283,7 +1291,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 			mode.dmSize = sizeof(mode);
 			if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) != 0 && mode.dmDisplayFrequency > 30) {
 				const double hz = mode.dmDisplayFrequency;
-				cap             = static_cast<uint32_t>(hz - hz * hz / 3600.0);
+				cap             = static_cast<uint32_t>(std::floor(hz * 14.0 / 15.0 + 0.01)); // 10-29: as the dynamic target
 			}
 		}
 		// With KYTY_FLIP_FPS already holding the game at or under cap / (1 + generated) (x4: 56 on a 224 Hz vblank,
@@ -1619,10 +1627,12 @@ uint32_t DlssgReflexLimitUs(double interval) {
 // Not in cinematics or held cutscenes, nor with DLSS-G off. KYTY_DLSSG_FLIP_FLOOR=0: the pacer only. Fixed DLSS-G under
 // a cap (KYTY_VRR_CAP_FPS) likewise (10-23); it needs a vblank that 56 divides (840 Hz; 360 Hz refuses it: the pacer).
 void DynApplyReflexLimit(int gen) {
-	static const bool floor_on = [] {
-		const char* v = std::getenv("KYTY_DLSSG_FLIP_FLOOR");
-		return v == nullptr || *v != '0';
-	}();
+	// 10-29: the game's own flips are never held for MFG (the owner: the old "x4: game flips at 56" workaround is
+	// gone, dynamic and fixed). Holding them at 56 against the game's 60 Hz timing spiralled in log 20261029-032959:
+	// x4 real 59.3 -> 52 -> 46 -> 36 fps, the game's cpu 7 -> 19 ms, then x5/x6 on 37 real. Only the presentation
+	// pacer (RealFrameInterval = m / target on the vblank grid, as FSR3's KYTY_VRR_CAP_FPS path) keeps the shown rate
+	// under the VRR ceiling.
+	constexpr bool floor_on = false;
 	if (floor_on && DlssgPaceMode() < 2 && gen >= 0 && !VideoOut::CinematicPlaying() && !VideoOut::CutsceneHeld()) {
 		DynApplyFlipFloor(gen);
 	} else if (g_dyn_flip_fps != 0) {
@@ -1745,8 +1755,10 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 						g_dyn_flip_fps = 0;
 					}
 					DynApplyReflexLimit(g_dyn_gen);
-					std::printf("[dyn] x%d (from x%d): real %.1f fps, shown %.1f (target %.0f), free %.1f\n", g_dyn_gen + 1, from_m,
-					            real, std::min(real * from_m, T), T, g_dyn_dm.last_free);
+					std::printf("[dyn] x%d (from x%d): reason %s; real %.1f fps, shown %.1f (target %.0f), free %.1f (x%d est %.1f); pacing %s\n",
+					            g_dyn_gen + 1, from_m, g_dyn_dm.reason, real, std::min(real * from_m, T), T, g_dyn_dm.last_free,
+					            g_dyn_gen + 1, g_dyn_dm.next_est,
+					            g_dyn_flip_fps != 0 ? "game flips held" : g_real_interval.load() > 0.0 ? "vblank-grid pacer" : "none");
 				}
 				std::printf("[dlssg] dynamic x%d; real %.1f fps (smoothed %.1f), shown %.1f, target %.0f\n", g_dyn_gen + 1, real,
 				            g_dyn_real_fps, real * (g_dyn_gen + 1), static_cast<double>(g_dlssg_target_fps));
@@ -4628,10 +4640,10 @@ bool RtParticlesDebug() {
 	}();
 	return debug;
 }
-bool RtParticlesWanted() { return RtParticlesLevel() > 0 || RtParticlesDebug() || HwParticlesWanted(); }
+bool RtParticlesWanted() { return RtParticlesLevel() > 0 || RtParticlesDebug() || HwParticlesWanted() || SmokeWanted(); } // (ds-particles-1029: KYTY_SMOKE)
 // (hwrt3p) KYTY_HWRT_PARTICLES' read of the pre-particle copy (no SSGI counters; the copy is taken for it too).
 vk::ImageView RtParticlesPreCopy(uint64_t color_address, vk::Extent2D extent) {
-	if (!HwParticlesWanted()) return nullptr;
+	if (!HwParticlesWanted() && !SmokeWanted()) return nullptr; // (ds-particles-1029: KYTY_SMOKE reads it too)
 	const bool ok = g_rtpart.taken && g_rtpart.pre_view != nullptr && g_rtpart.pre_address == color_address &&
 	                g_rtpart.pre_flip == GuestFlips() && g_rtpart.pre.extent.width == extent.width &&
 	                g_rtpart.pre.extent.height == extent.height;
@@ -4671,7 +4683,7 @@ void BeforeSceneDraw(CommandBuffer& command, TextureCache& cache, const RenderSt
 		e.instances += draw.instances;
 		e.indices += draw.index_count;
 	}
-	if ((RtParticlesLevel() == 0 && !HwParticlesWanted()) || g_rtpart.taken) return; // (hwrt3p: also for KYTY_HWRT_PARTICLES)
+	if ((RtParticlesLevel() == 0 && !HwParticlesWanted() && !SmokeWanted()) || g_rtpart.taken) return; // (ds-particles-1029: KYTY_SMOKE) // (hwrt3p: also for KYTY_HWRT_PARTICLES)
 	// The particle pass's first draw: blended, depth test on, depth writes off (KYTY_RT_PARTICLES_VS pins the shaders).
 	static const std::vector<uint64_t> pinned = [] {
 		std::vector<uint64_t> out;
@@ -9465,7 +9477,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
-	if (RtContactLevel() > 0 || RtCapture::Enabled()) { // (KYTY_RT_CAPTURE reads the sun from it too) (KYTY_HWRT_CONTACT: rt-contact.cpp; the sun, R and this pass's final visibility)
+	if (RtContactLevel() > 0 || RtCapture::Enabled() || RtAoLevel() > 0) { // (ds-ptao-1029: the path-traced AO's sun shadow rays) (KYTY_RT_CAPTURE reads the sun from it too) (KYTY_HWRT_CONTACT: rt-contact.cpp; the sun, R and this pass's final visibility)
 		double r = 1.5;
 		if (sun_mode && g_rs.buf_mapped != nullptr) r = reinterpret_cast<const float*>(g_rs.buf_mapped + sun_slot * kRtSunSlotBytes)[2];
 		else if (g_cs.log_k >= 0.0) r = std::max(std::exp2(g_cs.log_k) - 1.0, 0.0) / 0.75;
@@ -9547,6 +9559,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	TimedPass("GtaoApply", [&] { GtaoApply(command, inputs); }); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
 	probed(RtFlicker::Ao, "RtAoApply", [&] { return RtAoApply(command, inputs); }); // (ao-1028: KYTY_AO, rt-ao.cpp: the new ambient occlusion on the ambient term; nothing when off)
 	probed(RtFlicker::Torch, "TorchApply", [&] { return TorchApply(command, inputs); }); // (KYTY_TORCH / KYTY_TORCH_FLARE: the firelight, torch.cpp; before SSR / RT reflections so they reflect it; nothing when off)
+	TimedPass("SmokeApply", [&] { SmokeApply(command, inputs, inputs_in.color); }); // (ds-particles-1029: KYTY_SMOKE, smoke.cpp: soft particles + torch-lit smoke on the particle layer; after the torch tracked its lights; nothing when off)
 	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Gi, "HwGiApply")
 	TimedPass("SsrApply", [&] { SsrApply(command, inputs); }); // (KYTY_SSR: likewise, after GTAO; nothing when off)
 	probed(RtFlicker::Reflections, "RtReflectionsApply", [&] { return RtReflectionsApply(command, inputs); }); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
@@ -9554,6 +9567,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	TimedPass("ShineApply", [&] { ShineApply(command, inputs); }); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
 	probed(RtFlicker::Volumetric, "GodraysApply", [&] { return GodraysApply(command, inputs); }); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off; flicker self-check)
 	probed(RtFlicker::Flare, "TorchFlareApply", [&] { return TorchFlareApply(command, inputs); }); // (KYTY_TORCH_FLARE: the lens flare, last before the upscaler and the HUD; torch.cpp)
+	TimedPass("DofApply", [&] { DofApply(command, inputs); }); // (ds-dof-1029, KYTY_DOF: the distance depth of field, dof.cpp; after every other pass, before the upscaler and the HUD; nothing when off)
 	TimedPass("GbufViewApply", [&] { GbufViewApply(command, inputs); }); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
 	SharpenProbeTick();
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3 || g_sr_kind == 4;

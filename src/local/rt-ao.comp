@@ -1,6 +1,17 @@
-#version 450
+#version 460
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef KYTY_AO_HW
+#extension GL_EXT_ray_query : require
+#endif
+// (ds-ptao-1029) Built twice (CMakeLists.txt): plain = the screen-space AO (the fallback without a scene TLAS), and with
+// -DKYTY_AO_HW = "Path tracing": the trace (mode 1) shoots cosine-weighted rays from the pixel's world position through
+// the KYTY_HWRT scene TLAS (hwrt-scene.cpp); a hit is shaded from the frame's own lit colour where it is on screen and
+// visible (exact first bounce of everything the camera sees), a dim estimate off screen. Out A = (bounce radiance rgb,
+// ambient visibility), B = (sun occlusion, torch occlusion, -, 1): soft shadow rays inside the sun's cone (the RT sun
+// pass's latched direction) and toward the strongest torch.comp light (its tracked lights, read only). Both go through
+// the same temporal (vec4) + edge-aware a-trous chain; the composite REPLACES the ambient term with visibility x
+// ambient + albedo x bounce, and removes the occluded share of the direct light only (see Composite).
 // (ao2-1028) cost: one prep pass writes a trace-res linear view z (R32F) + the normal; the trace reads only that
 // (half res for every level: 4x fewer, cache-friendly taps than the game's full-res depth), the composite no longer
 // rebuilds depth normals, the stats reduce per subgroup before one atomic (no serialized atomics on 1/16 pixels).
@@ -61,10 +72,23 @@ layout(std140, binding = 14) uniform Frame {
 	vec4  rot0;      // world -> view rows (the G-buffer camera's)
 	vec4  rot1;
 	vec4  rot2;
+	vec4  par2;      // (ao-strong-1029) x: power on the visibility, y: share of the whole colour treated as ambient
+	// (ds-ptao-1029) the path-traced variant only (zero for the screen-space one)
+	vec4  ivp[4];    // clip -> world rows (the TLAS camera; clip y = -(uv.y * 2 - 1))
+	vec4  vp[4];     // world -> clip rows
+	vec4  cam;       // world camera position, w: y sign of the clip (-1)
+	vec4  sun;       // xyz world direction toward the sun, w weight (0: none)
+	vec4  hw;        // x GI range (m), y AO radius (m), z rays per pixel, w bounce intensity
+	vec4  hw2;       // x sun ray length (m), y sun cone tan, z max darkening of the direct light, w off-screen hit radiance
 } u;
 layout(std430, binding = 15) buffer Stats { uint st[]; };
 layout(binding = 16) uniform sampler2D lz_tex;              // trace-res view z (1e6: sky), written by the prep
 layout(binding = 17, r32f) uniform writeonly image2D lz_out;
+#ifdef KYTY_AO_HW
+layout(binding = 18) uniform accelerationStructureEXT tlas;
+layout(std430, binding = 19) readonly buffer TorchLights { vec4 tl[32]; }; // torch.cpp's 8 slots (zeros: none)
+layout(binding = 20) uniform sampler2D shadow_tex; // composite: the denoised B (sun occ, torch occ)
+#endif
 
 // one atomic per subgroup (active lanes only)
 void StatAdd(uint idx, uint v) {
@@ -79,7 +103,7 @@ layout(push_constant) uniform Push {
 } push;
 
 // cfg.z flags
-const int F_RESET = 1, F_HIST = 2, F_NORMALS = 4, F_ALBEDO = 8, F_HALF = 16, F_GDEPTH = 32, F_STILL = 64, F_VIEW = 128;
+const int F_RESET = 1, F_HIST = 2, F_NORMALS = 4, F_ALBEDO = 8, F_HALF = 16, F_GDEPTH = 32, F_STILL = 64, F_VIEW = 128, F_TORCH = 256;
 const uint SLOT_WORDS = 32u;
 const float PI = 3.14159265, HALF_PI = 1.57079633;
 
@@ -278,12 +302,213 @@ void Trace(ivec2 tp) {
 	imageStore(out_img, tp, vec4(vis, 0, 0, 1));
 }
 
+
+#ifdef KYTY_AO_HW
+// ---- (ds-ptao-1029) the path-traced trace (mode 1 of the KYTY_AO_HW build) ----
+vec3 WorldPos(vec2 uv, float d) {
+	vec4 c = vec4(uv.x * 2.0 - 1.0, u.cam.w * (uv.y * 2.0 - 1.0), d, 1.0);
+	vec4 w = vec4(dot(u.ivp[0], c), dot(u.ivp[1], c), dot(u.ivp[2], c), dot(u.ivp[3], c));
+	return w.xyz / (abs(w.w) > 1e-20 ? w.w : 1e-20);
+}
+// world -> (uv, device depth); false behind the camera / off screen
+bool Project(vec3 X, out vec2 uv, out float d) {
+	vec4 x4 = vec4(X, 1.0);
+	vec4 c  = vec4(dot(u.vp[0], x4), dot(u.vp[1], x4), dot(u.vp[2], x4), dot(u.vp[3], x4));
+	uv = vec2(-1.0), d = 0.0;
+	if (c.w <= 1e-4) return false;
+	vec3 n = c.xyz / c.w;
+	uv = vec2(n.x, u.cam.w * n.y) * 0.5 + 0.5;
+	d  = n.z;
+	return all(greaterThan(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)));
+}
+vec3 WorldDepthNormal(ivec2 p, vec3 P) {
+	ivec2 rs = ivec2(RenderSize());
+	vec2  inv = 1.0 / RenderSize();
+	ivec2 pr = min(p + ivec2(1, 0), rs - 1), pl = max(p - ivec2(1, 0), ivec2(0));
+	ivec2 pd = min(p + ivec2(0, 1), rs - 1), pu = max(p - ivec2(0, 1), ivec2(0));
+	vec3  R = WorldPos((vec2(pr) + 0.5) * inv, texelFetch(depth_tex, pr, 0).r);
+	vec3  L = WorldPos((vec2(pl) + 0.5) * inv, texelFetch(depth_tex, pl, 0).r);
+	vec3  D = WorldPos((vec2(pd) + 0.5) * inv, texelFetch(depth_tex, pd, 0).r);
+	vec3  U = WorldPos((vec2(pu) + 0.5) * inv, texelFetch(depth_tex, pu, 0).r);
+	vec3  e = u.cam.xyz;
+	float dp = distance(P, e);
+	vec3  dx = abs(distance(R, e) - dp) < abs(dp - distance(L, e)) ? R - P : P - L;
+	vec3  dy = abs(distance(D, e) - dp) < abs(dp - distance(U, e)) ? D - P : P - U;
+	vec3  n  = cross(dx, dy);
+	float l  = length(n);
+	n = l > 1e-20 ? n / l : normalize(e - P);
+	return dot(n, e - P) < 0.0 ? -n : n;
+}
+// The receiver's mesh when it is a dynamic one (characters, armour: their captured positions may trail the depth): a
+// short ray across the pixel's own surface. Its custom index + 1 (0: static / none).
+uint Receiver(vec3 P, float z) {
+	vec3  v   = normalize(u.cam.xyz - P);
+	float tol = 0.06 + 0.01 * z;
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0x06, P + v * 0.25, 0.0, -v, 0.25 + tol);
+	while (rayQueryProceedEXT(rq)) {}
+	if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT &&
+	    abs(rayQueryGetIntersectionTEXT(rq, true) - 0.25) < tol)
+		return uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true)) + 1u;
+	return 0u;
+}
+// closest hit distance (-1: none) along dir, the receiver's own dynamic mesh skipped within skip_t
+float Hit(vec3 o, vec3 dir, float tmin, float tmax, uint rid, float skip_t) {
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, rid != 0u ? gl_RayFlagsNoOpaqueEXT : gl_RayFlagsOpaqueEXT, 0x03, o, tmin, dir, tmax);
+	while (rayQueryProceedEXT(rq)) {
+		if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+			bool self = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false)) + 1u == rid &&
+			            rayQueryGetIntersectionTEXT(rq, false) < skip_t;
+			if (!self) rayQueryConfirmIntersectionEXT(rq);
+		}
+	}
+	return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT ? rayQueryGetIntersectionTEXT(rq, true) : -1.0;
+}
+void Basis(vec3 n, out vec3 b1, out vec3 b2) {
+	b1 = normalize(cross(n, abs(n.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+	b2 = cross(n, b1);
+}
+// torch.comp's light k: world centre (false: slot empty)
+bool TorchPos(int k, out vec3 Lc, out float fade) {
+	vec4 l0 = tl[k * 4], l3 = tl[k * 4 + 3];
+	fade = l0.w;
+	Lc   = vec3(0.0);
+	if (!(l0.w > 0.0) || any(lessThanEqual(l0.xy, vec2(0.0))) || any(greaterThanEqual(l0.xy, vec2(1.0))) || !(l3.z > 0.05)) return false;
+	float den = l3.z * u.depth_map.z + u.depth_map.w;
+	if (abs(den) < 1e-12) return false;
+	float d = (u.depth_map.y + l3.z * u.depth_map.x) / den;
+	if (!(d > 0.0 && d < 1.0)) return false;
+	Lc = WorldPos(l0.xy, d);
+	return true;
+}
+void TraceHw(ivec2 tp) {
+	float z = texelFetch(lz_tex, tp, 0).r;
+	if (z >= 1e5) {
+		imageStore(out_img, tp, vec4(0, 0, 0, 1));
+		imageStore(gz_out, tp, vec4(0, 0, 0, 1));
+		return;
+	}
+	ivec2 rs = ivec2(RenderSize());
+	ivec2 fp = Flag(F_HALF) ? min(tp * 2, rs - 1) : min(tp, rs - 1);
+	// the prep's pixel: the nearest of the 2x2 at half res (re-found: its depth matches lz)
+	if (Flag(F_HALF)) {
+		float dbest = -1.0;
+		for (int i = 0; i < 4; ++i) {
+			ivec2 q  = min(tp * 2 + ivec2(i & 1, i >> 1), rs - 1);
+			float dq = texelFetch(depth_tex, q, 0).r;
+			if (dq > dbest) dbest = dq, fp = q;
+		}
+	}
+	vec2  uv = (vec2(fp) + 0.5) / RenderSize();
+	float d  = texelFetch(depth_tex, fp, 0).r;
+	vec3  P  = WorldPos(uv, d);
+	float dist = distance(P, u.cam.xyz);
+	// the normal: the prep's view normal (G-buffer + depth, convention-voted) back to world (R^T S n), checked against the
+	// world depth normal (the depth one where they disagree)
+	vec3 nv = texelFetch(gz_cur, tp, 0).xyz;
+	int  cv = u.cfg2.w;
+	if ((cv & 1) != 0) nv.y = -nv.y;
+	if ((cv & 2) != 0) nv.z = -nv.z;
+	vec3 nw = u.rot0.xyz * nv.x + u.rot1.xyz * nv.y + u.rot2.xyz * nv.z;
+	vec3 nd = WorldDepthNormal(fp, P);
+	vec3 N  = nd;
+	if (Flag(F_NORMALS) && length(nw) > 0.5) {
+		nw = normalize(nw);
+		if (dot(nw, u.cam.xyz - P) < 0.0) nw = -nw;
+		N = dot(nw, nd) > 0.4 ? nw : nd;
+	}
+	uint  rid  = Receiver(P, dist);
+	float skip = 0.2;
+	vec3  o    = P + N * (0.015 + 0.0015 * dist);
+	float tmin = 0.01 + 0.001 * dist;
+	int   rays = max(int(u.hw.z + 0.5), 1);
+	uint  fr   = uint(u.cfg.y) & 4095u;
+	// per pixel: interleaved gradient noise + an R2 step per frame (the temporal pass integrates the sequence)
+	vec2  base = vec2(Ign(vec2(tp)), Ign(vec2(tp.y, tp.x) + 17.0));
+	vec3  b1, b2;
+	Basis(N, b1, b2);
+	float R  = u.hw.x, Rao = u.hw.y;
+	vec3  bounce = vec3(0.0);
+	float occ    = 0.0;
+	for (int k = 0; k < rays; ++k) {
+		float fk = float(fr * uint(rays) + uint(k));
+		vec2  xi = fract(base + fk * vec2(0.7548776662, 0.5698402910));
+		float rr = sqrt(xi.x), ph = 6.2831853 * xi.y;
+		vec3  dir = normalize(b1 * (rr * cos(ph)) + b2 * (rr * sin(ph)) + N * sqrt(max(1.0 - xi.x, 0.0)));
+		float t   = Hit(o, dir, tmin, R, rid, skip);
+		if (t < 0.0) continue;
+		occ += clamp(1.0 - t / Rao, 0.0, 1.0);
+		// shade the hit: the lit colour of the frame where the hit is the visible surface there, else an estimate
+		vec3  H = o + dir * t;
+		vec2  huv;
+		float hd;
+		vec3  Lh = vec3(u.hw2.w);
+		if (Project(H, huv, hd)) {
+			float sd = textureLod(depth_tex, huv, 0).r;
+			vec3  S  = WorldPos(huv, sd);
+			if (!Sky(sd) && distance(S, H) < 0.08 + 0.02 * distance(H, u.cam.xyz)) {
+				vec3 c = textureLod(color_tex, huv, 0).rgb;
+				if (!(any(isnan(c)) || any(isinf(c)))) Lh = clamp(c, vec3(0.0), vec3(64.0));
+			}
+		}
+		bounce += Lh;
+	}
+	float vis = 1.0 - occ / float(rays);
+	bounce /= float(rays);
+	// direct-light shadow rays: the sun (inside its cone) and the strongest torch (on its flame's disc)
+	float occ_s = 0.0, occ_t = 0.0;
+	vec2  xs = fract(base.yx + float(fr) * vec2(0.5698402910, 0.7548776662));
+	if (u.sun.w > 0.0 && dot(N, u.sun.xyz) > 0.02) {
+		vec3 s1, s2;
+		Basis(u.sun.xyz, s1, s2);
+		float rr = sqrt(xs.x) * u.hw2.y, ph = 6.2831853 * xs.y;
+		vec3  dir = normalize(u.sun.xyz + (s1 * cos(ph) + s2 * sin(ph)) * rr);
+		float t   = Hit(o, dir, tmin, u.hw2.x, rid, skip);
+		if (t >= 0.0) occ_s = 1.0 - smoothstep(0.7 * u.hw2.x, u.hw2.x, t);
+	}
+	float tshare = 0.0;
+	if (Flag(F_TORCH)) {
+		float wbest = 0.0;
+		vec3  Lbest = vec3(0.0);
+		for (int k = 0; k < 8; ++k) {
+			vec3  Lc;
+			float fade;
+			if (!TorchPos(k, Lc, fade)) continue;
+			vec3  v  = Lc - P;
+			float dl = length(v);
+			if (dl > 6.0 || dl < 0.3) continue;
+			float ndl = dot(N, v / dl);
+			if (ndl <= 0.0) continue;
+			float win = 1.0 - dl / 6.0;
+			float w   = fade * win * win * ndl;
+			if (w > wbest) wbest = w, Lbest = Lc;
+		}
+		if (wbest > 0.0) {
+			tshare = clamp(wbest * 2.0, 0.0, 1.0);
+			vec3  ax = normalize(Lbest - P), t1, t2;
+			Basis(ax, t1, t2);
+			float r   = 0.1 * sqrt(xs.y);
+			vec3  tgt = Lbest + (t1 * cos(6.2831853 * xs.x) + t2 * sin(6.2831853 * xs.x)) * r;
+			vec3  dv  = tgt - o;
+			float len = length(dv);
+			if (len - 0.35 > tmin + 0.01) {
+				float t = Hit(o, dv / len, tmin, len - 0.35, rid, skip);
+				if (t >= 0.0) occ_t = tshare;
+			}
+		}
+	}
+	imageStore(out_img, tp, vec4(bounce, vis));
+	imageStore(gz_out, tp, vec4(occ_s, occ_t, tshare, 1.0));
+}
+#endif
+
 // ---- mode 2: temporal ----
 void Temporal(ivec2 tp) {
 	vec4  g   = texelFetch(gz_cur, tp, 0);
-	float raw = texelFetch(src_a, tp, 0).r;
+	vec4  raw = texelFetch(src_a, tp, 0);
 	if (g.w >= 1e5) {
-		imageStore(out_img, tp, vec4(1.0));
+		imageStore(out_img, tp, raw);
 		imageStore(cnt_out, tp, vec4(0.0));
 		return;
 	}
@@ -295,30 +520,34 @@ void Temporal(ivec2 tp) {
 	vec2  prev  = (vec2(tp) + 0.5) + mv / scale;
 	ivec2 pp    = ivec2(floor(prev));
 	float n     = 0.0;
-	float hist  = raw;
+	vec4  hist  = raw;
 	bool  ok    = Flag(F_HIST) && !Flag(F_RESET) && all(greaterThanEqual(pp, ivec2(0))) && all(lessThan(pp, ts));
 	if (ok) {
 		vec4 gp = texelFetch(gz_prev, pp, 0);
 		ok      = abs(gp.w - g.w) <= 0.03 * g.w + 0.02 && dot(gp.xyz, g.xyz) > 0.9;
 		if (ok) {
-			hist = texelFetch(hist_prev, pp, 0).r;
+			hist = texelFetch(hist_prev, pp, 0);
 			n    = texelFetch(cnt_prev, pp, 0).r;
 		}
 	}
 	if (ok && !Flag(F_STILL)) {
-		float m1 = 0.0, m2 = 0.0;
+		vec4 m1 = vec4(0.0), m2 = vec4(0.0);
 		for (int y = -1; y <= 1; ++y)
 			for (int x = -1; x <= 1; ++x) {
-				float v = texelFetch(src_a, clamp(tp + ivec2(x, y), ivec2(0), ts - 1), 0).r;
+				vec4 v = texelFetch(src_a, clamp(tp + ivec2(x, y), ivec2(0), ts - 1), 0);
 				m1 += v, m2 += v * v;
 			}
 		m1 /= 9.0;
-		float sd = sqrt(max(m2 / 9.0 - m1 * m1, 0.0));
-		hist     = clamp(hist, m1 - 1.5 * sd - 0.02, m1 + 1.5 * sd + 0.02);
+		vec4 sd = sqrt(max(m2 / 9.0 - m1 * m1, vec4(0.0)));
+		hist    = clamp(hist, m1 - 1.5 * sd - 0.02, m1 + 1.5 * sd + 0.02);
 	}
 	float c   = ok ? min(n + 1.0, float(u.cfg2.z)) : 1.0;
-	float res = ok ? hist + (raw - hist) / c : raw;
-	imageStore(out_img, tp, vec4(clamp(res, 0.0, 2.0), 0, 0, 1));
+	vec4  res = ok ? hist + (raw - hist) / c : raw;
+#ifdef KYTY_AO_HW
+	imageStore(out_img, tp, clamp(res, vec4(0.0), vec4(65000.0)));
+#else
+	imageStore(out_img, tp, vec4(clamp(res.r, 0.0, 2.0), 0, 0, 1));
+#endif
 	imageStore(cnt_out, tp, vec4(c, 0, 0, 1));
 }
 
@@ -326,13 +555,14 @@ void Temporal(ivec2 tp) {
 void Denoise(ivec2 tp) {
 	vec4 g = texelFetch(gz_cur, tp, 0);
 	if (g.w >= 1e5) {
-		imageStore(out_img, tp, vec4(1.0));
+		imageStore(out_img, tp, texelFetch(src_a, tp, 0));
 		return;
 	}
 	ivec2       ts = ivec2(TraceSize());
 	int         stp = int(push.step);
 	const float k[5] = float[5](1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0);
-	float acc = 0.0, ws = 0.0;
+	vec4  acc = vec4(0.0);
+	float ws  = 0.0;
 	for (int y = -2; y <= 2; ++y)
 		for (int x = -2; x <= 2; ++x) {
 			ivec2 q  = clamp(tp + ivec2(x, y) * stp, ivec2(0), ts - 1);
@@ -341,13 +571,35 @@ void Denoise(ivec2 tp) {
 			float cn = clamp(dot(gq.xyz, g.xyz), 0.0, 1.0);
 			cn *= cn, cn *= cn, cn *= cn;
 			float w = k[x + 2] * k[y + 2] * exp(-abs(gq.w - g.w) / (0.02 * g.w + 0.01)) * cn;
-			acc += w * texelFetch(src_a, q, 0).r;
+			acc += w * texelFetch(src_a, q, 0);
 			ws += w;
 		}
-	imageStore(out_img, tp, vec4(ws > 1e-6 ? acc / ws : texelFetch(src_a, tp, 0).r, 0, 0, 1));
+	imageStore(out_img, tp, ws > 1e-6 ? acc / ws : texelFetch(src_a, tp, 0));
 }
 
 // ---- mode 4: upsample + application ----
+vec4 UpsampleV(sampler2D src, ivec2 p, float z) {
+	if (!Flag(F_HALF)) return texelFetch(src, p, 0);
+	ivec2 ts   = ivec2(TraceSize());
+	vec2  f    = (vec2(p) + 0.5) * (TraceSize() / RenderSize()) - 0.5;
+	ivec2 b    = ivec2(floor(f));
+	vec2  fr   = f - vec2(b);
+	vec4  acc = vec4(0.0), bestv = texelFetch(src, clamp(b, ivec2(0), ts - 1), 0);
+	float ws = 0.0, best = 1e9;
+	for (int i = 0; i < 4; ++i) {
+		ivec2 o  = ivec2(i & 1, i >> 1);
+		ivec2 q  = clamp(b + o, ivec2(0), ts - 1);
+		vec4  g  = texelFetch(gz_cur, q, 0);
+		vec4  v  = texelFetch(src, q, 0);
+		float bw = (o.x == 1 ? fr.x : 1.0 - fr.x) * (o.y == 1 ? fr.y : 1.0 - fr.y);
+		float dz = abs(g.w - z);
+		float w  = max(bw, 1e-3) * exp(-dz / (0.01 * z + 0.005));
+		acc += w * v;
+		ws += w;
+		if (dz < best) best = dz, bestv = v;
+	}
+	return ws > 1e-4 ? acc / ws : bestv;
+}
 float Upsample(ivec2 p, float z) {
 	if (!Flag(F_HALF)) return texelFetch(src_a, p, 0).r;
 	ivec2 ts   = ivec2(TraceSize());
@@ -409,9 +661,54 @@ void Composite(ivec2 p) {
 		StatAdd(base + 4u, uint(clamp(log2(l) + 32.0, 0.0, 64.0) * 256.0));
 		StatAdd(base + 5u, 1u);
 	}
+#ifdef KYTY_AO_HW
+	{
+		// (ds-ptao-1029) path traced: the ambient term replaced by visibility x ambient + albedo x bounce; the direct light's
+		// occluded share (sun cone, nearest torch) removed. Open surfaces: visibility 1, no shadow ray hit: unchanged but
+		// for the bounce light their surroundings send.
+		vec4  A  = UpsampleV(src_a, p, z);
+		vec4  B  = UpsampleV(shadow_tex, p, z);
+		if (any(isnan(A)) || any(isinf(A))) A = vec4(0, 0, 0, 1);
+		if (any(isnan(B)) || any(isinf(B))) B = vec4(0.0);
+		float vis = clamp(A.a, 0.0, 1.0);
+		float vp  = pow(vis, u.par2.x);
+		float v   = clamp(1.0 - u.trace.z * (1.0 - vp), 0.0, 1.0);
+		vec3  vm  = max(MultiBounce(v, albedo), vec3(u.par.x));
+		float fade = u.par.y > 0.0 ? exp(-z / u.par.y) : 1.0;
+		vec3  cpos = max(col.rgb, vec3(0.0));
+		vec3  amb  = u.par.z > 0.0 ? min(cpos, max(albedo * u.par.z, cpos * u.par2.y)) : cpos * u.par2.y;
+		vec3  gi   = albedo * A.rgb * u.hw.w;
+		gi         = min(gi, max(amb, cpos * 0.35) + 1e-4); // nothing glows: the bounce at most the ambient it replaces again
+		vec3  amb_new = amb * vm + gi;
+		vec3  direct  = max(cpos - amb, vec3(0.0));
+		float sun_sh  = clamp(B.x, 0.0, 1.0) * (1.0 - clamp(B.z, 0.0, 1.0));
+		float dark    = clamp(sun_sh + clamp(B.y, 0.0, 1.0), 0.0, 1.0) * u.hw2.z;
+		vec3  res     = col.rgb + ((amb_new - amb) - direct * dark) * fade;
+		if (Flag(F_VIEW)) res = vec3(vis) * (1.0 - dark) * 0.5 + gi;
+		if (any(isnan(res)) || any(isinf(res))) res = col.rgb;
+		if (smp) {
+			StatAdd(base + 1u, 1u);
+			StatAdd(base + 2u, uint(vis * 1000.0 + 0.5));
+			float drop = l > 1e-5 ? 1.0 - Luma(res) / l : 0.0;
+			StatAdd(base + 3u, drop > 0.02 ? 1u : 0u);
+			StatAdd(base + 6u, uint(clamp(drop, 0.0, 1.0) * 1000.0 + 0.5));
+			StatAdd(base + 7u, uint(clamp(1.0 - drop, 0.0, 2.0) * 1000.0 + 0.5));
+			StatAdd(base + 12u, drop > 0.3 ? 1u : 0u);
+			float la = Luma(amb);
+			StatAdd(base + 13u, uint(clamp(la > 1e-5 ? Luma(amb_new) / la : 1.0, 0.0, 4.0) * 250.0 + 0.5)); // factor on the ambient
+			StatAdd(base + 14u, drop > 0.2 ? 1u : 0u);
+			StatAdd(base + 15u, uint(clamp(la > 1e-5 ? Luma(gi) / la : 0.0, 0.0, 4.0) * 250.0 + 0.5));      // indirect / ambient
+		}
+		imageStore(out_img, p, vec4(res, col.a));
+		return;
+	}
+#endif
 	float ao = Upsample(p, z);
 	ao       = (isnan(ao) || isinf(ao)) ? 1.0 : clamp(ao, 0.0, 1.0);
-	float v  = 1.0 - u.trace.z * (1.0 - ao);
+	// (ao-strong-1029) a power curve (creases / contact go much darker, open floors stay ~1: GTAO's mean visibility ~0.9
+	// was a 5 % drop) and a strength above 1 allowed
+	float ap = pow(min(ao / 0.95, 1.0), u.par2.x); // >= 0.95 (open floors, GTAO's bias): untouched
+	float v  = clamp(1.0 - u.trace.z * (1.0 - ap), 0.0, 1.0);
 	vec3  vm = max(MultiBounce(v, albedo), vec3(u.par.x));
 	float fade = u.par.y > 0.0 ? exp(-z / u.par.y) : 1.0;
 	vec3  k    = 1.0 - (1.0 - vm) * fade;
@@ -421,8 +718,14 @@ void Composite(ivec2 p) {
 	}
 	vec3 res = col.rgb;
 	if (u.par.z > 0.0) {
-		vec3 amb = min(max(col.rgb, vec3(0.0)), albedo * u.par.z);
+		// (ao-strong-1029) the ambient estimate was albedo x 6 x the frame's geometric-mean light: in Demon's Souls' dark,
+		// mostly indirect-lit scenes that was a small part of the colour, so the AO removed ~5 %. At least par2.y of the
+		// colour now counts as ambient (the rest: direct sun / torches keep their level).
+		vec3 cpos = max(col.rgb, vec3(0.0));
+		vec3 amb  = min(cpos, max(albedo * u.par.z, cpos * u.par2.y));
 		res      = col.rgb - amb * (1.0 - k);
+	} else {
+		res = col.rgb * mix(vec3(1.0), k, u.par2.y);
 	}
 	if (any(isnan(res)) || any(isinf(res))) res = col.rgb;
 	if (smp) {
@@ -431,6 +734,10 @@ void Composite(ivec2 p) {
 		float drop = l > 1e-5 ? 1.0 - Luma(res) / l : 0.0;
 		StatAdd(base + 3u, drop > 0.02 ? 1u : 0u);
 		StatAdd(base + 6u, uint(clamp(drop, 0.0, 1.0) * 1000.0 + 0.5));
+		StatAdd(base + 7u, uint(clamp(1.0 - drop, 0.0, 1.0) * 1000.0 + 0.5)); // (ao-strong-1029) the applied AO factor
+		StatAdd(base + 12u, drop > 0.3 ? 1u : 0u);                             // darkened by more than 30 %
+		StatAdd(base + 13u, uint(clamp(Luma(k * albedo) / max(Luma(albedo), 1e-5), 0.0, 4.0) * 250.0 + 0.5)); // (ds-ptao) factor on the ambient
+		StatAdd(base + 14u, drop > 0.2 ? 1u : 0u);
 	}
 	imageStore(out_img, p, vec4(res, col.a));
 }
@@ -441,7 +748,11 @@ void main() {
 	ivec2 size = ivec2(mode == 4 ? RenderSize() : TraceSize());
 	if (p.x >= size.x || p.y >= size.y) return;
 	if (mode == 0) Prep(p);
+#ifdef KYTY_AO_HW
+	else if (mode == 1) TraceHw(p);
+#else
 	else if (mode == 1) Trace(p);
+#endif
 	else if (mode == 2) Temporal(p);
 	else if (mode == 3) Denoise(p);
 	else Composite(p);

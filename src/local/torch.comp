@@ -50,7 +50,8 @@ layout(std430, binding = 7) buffer Frame {
 	vec4 hp;          // 12..15: x 1.0 (exposure when the game gives none), y fire threshold (exposed), z slots, w -
 	uint stats[16];   // 16..31: 0 frames, 1 blobs, 2 lights in use, 3 flares drawn, 4 sampled pixels, 5 lit pixels,
 	                  // 6 lit (W > 0) sampled, 7 of them inconclusive, 8 traced (hybrid), 9 hit, 10 history n sum, 11 shadowed
-	                  // (ratio < 0.5), 12 hybrid frames
+	                  // (ratio < 0.5), 12 self / player rejected, 13 lit radius sum (cm),
+	                  // 14 max lit radius this frame (cm, reset in mode 1), 15 lit beyond 4 m
 	vec4 lights[32];  // 32..159: 8 slots x [0] (uv, view z, fade) [1] (hue rgb, slow power) [2] (fast power, flicker,
 	                  // flare visibility, missing frames) [3] (view position xyz, power used)
 	vec4 cand[];      // 160..: 32x18 cells x (weight, uv x, uv y, nearest z), (mean exposed rgb, taps)
@@ -191,6 +192,9 @@ float FireW(vec3 col, float z, vec3 alb) {
 	float w = Smooth01((l - t) / t);
 	if (w <= 0.0) return 0.0;
 	float warm = Sat((col.r / max(col.g, 1e-4) - 1.35) / 0.8);
+	// (local-1029) a flame's temperature: blue well under green (white / blue-white highlights, sky, lit UI and the moon
+	// are not fire), and not a near-monochrome red (embers, blood, red cloth glints)
+	warm *= Sat((0.8 - col.b / max(col.g, 1e-4)) / 0.3) * Sat((4.5 - col.r / max(col.g, 1e-4)) / 1.5);
 	float gate = Gbuf() ? Sat((l / max(Luma(alb), 0.02) - 4.0) / 6.0) : 1.0;
 	return w * warm * gate;
 }
@@ -243,6 +247,7 @@ void Track() {
 	float dt    = clamp(push.motion.w, 0.001, 0.1);
 	vec2  rs    = RenderSize();
 	atomicAdd(stats[0], 1u);
+	stats[14] = 0u; // (local-1029) the per-frame max lit radius (cm); mode 2 runs after this
 	// Cluster: 8-connected cells of comparable depth.
 	int   lab[NCELL];
 	int   queue[NCELL];
@@ -341,7 +346,10 @@ void Track() {
 		} else {
 			// (stable-1028) a fire missed holds 2 s (the detection finds a torch on ~half the frames), then fades over 1 s
 			l2.w += dt;
-			if (l2.w > 2.0) l0.w = max(0.0, l0.w - dt / 1.0);
+			// (local-1029) probation: a light not yet faded in (seen < ~0.35 s: an ember, a glint, a one-frame false
+			// detection) is dropped in 0.2 s instead of holding 3 s; a confirmed torch keeps the 2 s hold (no new popping)
+			if (l0.w < 0.7 && l2.w > 0.1) l0.w = max(0.0, l0.w - dt / 0.2);
+			else if (l2.w > 2.0) l0.w = max(0.0, l0.w - dt / 1.0);
 			l2.x = mix(l2.x, l1.w, 1.0 - exp(-dt / 1.0));
 		}
 		// The flicker: the fast power over the slow one, clamped and eased (no frame-to-frame noise).
@@ -384,6 +392,7 @@ void Track() {
 		int best = -1;
 		for (int b = 0; b < nb; ++b) {
 			if (claimed[b] || (best >= 0 && bw[b].x <= bw[best].x)) continue;
+			if (bw[b].x < 1.0) continue; // (local-1029) a new light needs a real flame (>= ~1 full cell of fire), not a speck
 			// (stable-1028) never a second light on a fire already tracked (a duplicate popped in and out: lights 2.7 a
 			// frame for 0.8 blobs)
 			bool near = false;
@@ -447,6 +456,32 @@ float March(vec3 p, vec3 lp, int max_steps, float jit, out float unc) {
 	return 1.0 - occ;
 }
 
+// (local-1029) The one geometric test of modes 2 and 4 (so W and the light agree): a hard WORLD-space cutoff R
+// (push.light.x m, KYTY_TORCH_RADIUS) with a windowed inverse-square falloff that reaches 0 at R; N.L > 0; no
+// self-contact (< 0.45 m from the flame: the torch's own bracket, the hand holding it); the background well behind
+// the flame rejected on its depth; the player's own body never lit by a light it carries (rej = 1).
+// out att: the falloff (0: no light), l: unit vector to the light, dist (m).
+bool PlayerPx(vec2 uv, float z) { return z < 3.5 && abs(uv.x - 0.5) < 0.2 && uv.y > 0.2 && uv.y < 0.98; }
+bool Carried(vec3 lp) {
+	vec2 luv;
+	return lp.z < 3.0 && Project(lp, luv) && abs(luv.x - 0.5) < 0.3 && luv.y > 0.1 && luv.y < 0.98;
+}
+float Falloff(vec3 pos, vec3 N, vec3 lp, bool player, out vec3 l, out float dist, out float ndl, out int rej) {
+	rej = 0, ndl = 0.0;
+	vec3 L = lp - pos;
+	dist   = length(L);
+	l      = L / max(dist, 1e-4);
+	float R = push.light.x;
+	if (dist >= R) return 0.0;
+	if (pos.z - lp.z > 0.6 * R) return 0.0;              // (far background behind the flame)
+	if (dist < 0.45 || (player && dist < 1.3 && pos.z < lp.z + 0.3 && Carried(lp))) { rej = 1; return 0.0; } // (the body around a carried flame, not the wall behind it)
+	ndl = dot(N, l);
+	if (ndl <= 0.0) return 0.0;
+	float x   = dist / R;
+	float win = Sat(1.0 - x * x * x * x);
+	return win * win / (dist * dist + 1.0);
+}
+
 void Shadow(ivec2 p) {
 	vec2  rs = RenderSize();
 	if (any(greaterThanEqual(p, TraceSize()))) return;
@@ -460,6 +495,7 @@ void Shadow(ivec2 p) {
 	vec2  uv   = (vec2(fp) + 0.5) / rs;
 	vec3  pos  = ViewPosZ(uv, z);
 	vec3  N    = NormalAt(fp, pos);
+	bool  player = PlayerPx(uv, z);
 	int   fr   = push.misc.y;
 	float jit  = fract(Ign(vec2(p) + 5.588238 * float(fr & 63)));
 	float ja   = fract(Ign(vec2(p.y, p.x) + 11.0 * float(fr & 63)) + 0.3);
@@ -474,16 +510,12 @@ void Shadow(ivec2 p) {
 		vec4  l3  = lights[k * 4 + 3];
 		float pwr = l3.w * l0.w;
 		if (pwr <= 0.0) continue;
-		vec3  L    = l3.xyz - pos;
-		float dist = length(L);
-		float R    = clamp(5.0 + 4.0 * sqrt(lights[k * 4 + 1].w), 5.0, 20.0) * push.light.x;
-		if (dist >= R || dist < 1e-3) continue;
-		vec3  l   = L / dist;
-		float ndl = dot(N, l);
-		if (ndl <= 0.0) continue;
-		float x   = dist / R;
-		float win = Sat(1.0 - x * x * x * x);
-		float w   = Luma(lights[k * 4 + 1].rgb) * pwr * win * win / (dist * dist + 1.0) * ndl;
+		vec3  l;
+		float dist, ndl;
+		int   rj;
+		float att = Falloff(pos, N, l3.xyz, player, l, dist, ndl, rj);
+		if (att <= 0.0) continue;
+		float w   = Luma(lights[k * 4 + 1].rgb) * pwr * att * ndl;
 		if (w <= 0.0) continue;
 		// a point on the flame's disc, facing the receiver (the penumbra; resolved by the temporal pass)
 		vec3  b1  = normalize(cross(l, abs(l.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
@@ -620,35 +652,6 @@ void Light(ivec2 p) {
 	float rough = Gbuf() ? clamp(Field(push.dec.y, p), 0.25, 1.0) : 0.6;
 	float selfw = FireW(c * e, z, alb);
 	vec3  diff  = vec3(0), spec = vec3(0);
-	for (int k = 0; k < 8; ++k) {
-		vec4 l0 = lights[k * 4];
-		if (l0.w <= 0.0) continue;
-		vec4  l3  = lights[k * 4 + 3];
-		float pwr = l3.w * l0.w;
-		if (pwr <= 0.0) continue;
-		vec3  L    = l3.xyz - pos;
-		float dist = length(L);
-		float R    = clamp(5.0 + 4.0 * sqrt(lights[k * 4 + 1].w), 5.0, 20.0) * push.light.x;
-		if (dist >= R || dist < 1e-3) continue;
-		vec3  l   = L / dist;
-		float ndl = dot(N, l);
-		if (ndl <= 0.0) continue;
-		float x   = dist / R;
-		float win = Sat(1.0 - x * x * x * x);
-		float att = win * win / (dist * dist + 1.0);
-		float vis = 1.0; // (the occlusion: the filtered ratio below)
-		// A flicker that also shifts the hue: brighter = a little more yellow.
-		float fl  = lights[k * 4 + 2].y;
-		vec3  hue = lights[k * 4 + 1].rgb * mix(vec3(1.0), vec3(0.94, 1.06, 1.1), Sat((fl - 1.0) * 4.0));
-		vec3  E   = hue * pwr * att * vis;
-		diff += E * ndl;
-		vec3  H   = normalize(l + V);
-		float ndh = Sat(dot(N, H));
-		float a2  = rough * rough * rough * rough;
-		float den = ndh * ndh * (a2 - 1.0) + 1.0;
-		float D   = min(a2 / (PI * den * den), 8.0);
-		spec += E * ndl * D;
-	}
 	// (gpu-1028) the half-resolution visibility, upsampled with depth weights (no bleeding across a character's edge)
 	float shade;
 	{
@@ -667,13 +670,55 @@ void Light(ivec2 p) {
 		}
 		shade = Sat(sw > 1e-3 ? sv / sw : bestv);
 	}
+	// (local-1029) the visibility test first: a pixel the shadow pass sees fully occluded gets nothing (and costs nothing)
+	if (shade <= 0.02) {
+		imageStore(out_img, p, vec4(debug ? vec3(0) : c, 1.0));
+		return;
+	}
+	bool  player = PlayerPx(uv, z);
+	bool  selfrej = false;
+	float bestE = 0.0, bestd = 0.0;
+	for (int k = 0; k < 8; ++k) {
+		vec4 l0 = lights[k * 4];
+		if (l0.w <= 0.0) continue;
+		vec4  l3  = lights[k * 4 + 3];
+		float pwr = l3.w * l0.w;
+		if (pwr <= 0.0) continue;
+		vec3  l;
+		float dist, ndl;
+		int   rj;
+		float att = Falloff(pos, N, l3.xyz, player, l, dist, ndl, rj);
+		if (rj != 0) selfrej = true;
+		if (att <= 0.0) continue;
+		if (att * pwr > bestE) bestE = att * pwr, bestd = dist;
+		float vis = 1.0; // (the occlusion: the filtered ratio below)
+		// A flicker that also shifts the hue: brighter = a little more yellow.
+		float fl  = lights[k * 4 + 2].y;
+		vec3  hue = lights[k * 4 + 1].rgb * mix(vec3(1.0), vec3(0.94, 1.06, 1.1), Sat((fl - 1.0) * 4.0));
+		vec3  E   = hue * pwr * att * vis;
+		diff += E * ndl;
+		vec3  H   = normalize(l + V);
+		float ndh = Sat(dot(N, H));
+		float a2  = rough * rough * rough * rough;
+		float den = ndh * ndh * (a2 - 1.0) + 1.0;
+		float D   = min(a2 / (PI * den * den), 8.0);
+		spec += E * ndl * D;
+	}
 	vec3  add  = (alb * diff * 3.0 + spec * push.light.y) * push.size.z * (1.0 - selfw) * shade;
 	add *= 1.0 - smoothstep(zmax * 0.6, zmax, z); // (fog and distant walls stay as drawn)
+	if (player && z < 3.0) add *= 0.5; // (local-1029) characters near the camera: the light is for the environment
 	float al   = Luma(add);
 	float cap  = push.size.w;
 	add /= 1.0 + al / max(cap, 1e-3); // (soft cap, hue-preserving)
 	add  = Safe(add);
-	if (sample_px && Luma(add) > 0.01) atomicAdd(stats[5], 1u);
+	if (sample_px && Luma(add) > 0.01) {
+		atomicAdd(stats[5], 1u);
+		uint cm = uint(bestd * 100.0 + 0.5);
+		atomicAdd(stats[13], cm);
+		atomicMax(stats[14], cm);
+		if (bestd > 4.0) atomicAdd(stats[15], 1u);
+	}
+	if (sample_px && selfrej) atomicAdd(stats[12], 1u);
 	imageStore(out_img, p, vec4(debug ? add / e : c + add / e, 1.0));
 }
 
