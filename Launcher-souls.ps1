@@ -439,8 +439,8 @@ function Start-Game {
 	if (-not $pureGame -and $cmbFlare -and $cmbFlare.SelectedIndex -gt 0) { $sets += 'KYTY_TORCH_FLARE=1' }  # (torch-1028) destellos de lente
 	if ($cmbDof -and -not $pureGame) { $sets += "KYTY_DOF=$([math]::Min(3, [math]::Max(0, $cmbDof.SelectedIndex)))" } else { $sets += 'KYTY_DOF=0' }  # (ds-dof-1029) profundidad de campo a distancia: No/Suave/Cinematico/Fuerte
 	$fovI = if ($cmbFov -and -not $pureGame) { [math]::Min(4, [math]::Max(0, $cmbFov.SelectedIndex)) } else { 0 }  # (ds-foveated-1029) DLSS 5 NR: No / PreSR / Foveado Suave / Medio / Fuerte
-	if ($fovI -eq 1) { $sets += @('KYTY_DLSS_NR=1', 'KYTY_DLSS_NR_PRESR=1', 'KYTY_FOVEATED=0') }  # PreSR: antes del reescalado, a la resolucion de render
-	elseif ($fovI -ge 2) { $sets += @('KYTY_FOVEATED=1', 'KYTY_DLSS_NR_PRESR=0', "KYTY_FOV_EDGE=$(@('0.5', '0.5', '0.75', '0.5', '0.35')[$fovI])") }  # foveado despues del reescalado: borde 0,75 / 0,5 / 0,35
+	if ($fovI -eq 1) { $sets += @('KYTY_DLSS_NR=1', 'KYTY_DLSS_NR_PRESR=1', 'KYTY_FOVEATED=0', 'KYTY_DLSS_NR_UNSIGNED=1') }  # PreSR: antes del reescalado, a la resolucion de render
+	elseif ($fovI -ge 2) { $sets += @('KYTY_FOVEATED=1', 'KYTY_DLSS_NR_PRESR=0', 'KYTY_DLSS_NR_UNSIGNED=1', "KYTY_FOV_EDGE=$(@('0.5', '0.5', '0.75', '0.5', '0.35')[$fovI])") }  # foveado despues del reescalado: borde 0,75 / 0,5 / 0,35
 	else { $sets += @('KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0', 'KYTY_DLSS_NR_PRESR=0') }
 	if ($pureGame) {
 		# (audit) Juego original: fuera todo pase visual del emulador (RT, volumetrica, sombra RT, brillo, oclusion especular, GTAO,
