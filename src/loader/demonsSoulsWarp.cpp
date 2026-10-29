@@ -141,6 +141,8 @@ bool                                  g_picking = false; // the shown message is
 std::filesystem::path                 g_route;           // F6's file (made by the first waypoint)
 std::chrono::steady_clock::time_point g_route_start {};
 std::atomic_uint32_t                  g_waypoints {0};
+std::string                           g_resume_profile; // (ds-pc-port8) ArmResume: only this character's save, no HUD
+bool                                  g_quiet = false;
 
 void Show(std::string message, int seconds) {
 	g_message     = std::move(message);
@@ -167,6 +169,7 @@ void CheckDoneLocked() {
 	Show("Warp done: " + Describe(*g_armed), 4);
 	g_armed.reset();
 	g_active = false;
+	g_resume_profile.clear();
 }
 
 } // namespace
@@ -769,6 +772,7 @@ std::string HudText() {
 		g_checked = now;
 		CheckDoneLocked();
 	}
+	if (g_quiet) return {}; // (ds-pc-port8) the resume after F1 shows nothing
 	if (now < g_shown_until) return g_message;
 	if (!g_armed) return {};
 	return g_served ? "Warp: loading " + Describe(*g_armed)
@@ -822,8 +826,46 @@ bool PatchSave(std::vector<uint8_t>& data, const Spawn& spawn) {
 // A character's save while a warp is armed: SAVEDATA0PlayerProfile<n>/USR-DATA (the options are
 // SAVEDATA0OptionsProfile0's).
 static bool IsCharacterSave(const std::filesystem::path& real) {
-	return g_active.load(std::memory_order_relaxed) && real.filename() == "USR-DATA" &&
-	       real.parent_path().filename().string().find("PlayerProfile") != std::string::npos;
+	if (!g_active.load(std::memory_order_relaxed) || real.filename() != "USR-DATA") return false;
+	const auto profile = real.parent_path().filename().string();
+	if (profile.find("PlayerProfile") == std::string::npos) return false;
+	std::lock_guard lock(g_mutex);
+	return g_resume_profile.empty() || profile == g_resume_profile;
+}
+
+bool ArmResume(const std::string& profile, uint32_t map_uid, float x, float y, float z, float yaw_degrees) {
+	if (profile.empty() || map_uid == 0 || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(yaw_degrees))
+		return false;
+	char map[32] {};
+	std::snprintf(map, sizeof(map), "m%02x_%02x_%02x_%02x", (map_uid >> 24u) & 0xffu, (map_uid >> 16u) & 0xffu, (map_uid >> 8u) & 0xffu,
+	              map_uid & 0xffu);
+	std::lock_guard lock(g_mutex);
+	g_armed          = Spawn {map, "f1", map_uid, x, y, z, yaw_degrees};
+	g_served         = false;
+	g_save.clear();
+	g_resume_profile = profile;
+	g_quiet          = true;
+	g_active         = true;
+	std::printf("Resume (F1): %s/USR-DATA will be read at %s %.2f %.2f %.2f yaw %.1f\n", profile.c_str(), map, x, y, z, yaw_degrees);
+	std::fflush(stdout);
+	return true;
+}
+
+bool ResumeServed() {
+	std::lock_guard lock(g_mutex);
+	return g_quiet && g_served;
+}
+
+uint32_t SaveMapUid(const std::filesystem::path& save) {
+	return MapUidOf(ReadFile(save));
+}
+
+bool IsPlaceBuild() {
+#if defined(_WIN32)
+	return IsPlayerBuild();
+#else
+	return false;
+#endif
 }
 
 std::optional<uint64_t> RedirectedSize(const std::filesystem::path& real) {

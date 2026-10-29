@@ -16,7 +16,10 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <thread>
 #include <fstream>
 #include <cstring>
 #include <ctime>
@@ -243,6 +246,9 @@ static int32_t                   g_next_transaction_resource = 1;
 static std::deque<SaveDataEvent> g_save_data_events;
 static SaveDataMountSlots        g_mount_slots;
 static Common::Mutex             g_mount_mutex;
+// (ds-pc-port8) The PC port's save-and-quit (F1): once set, no new save can start (BlockForExit).
+static std::atomic<bool>         g_exit_block {false};
+static std::atomic<uint64_t>     g_player_mounts {0};
 
 static std::string get_title_id();
 // The save data memory (SaveDataSetSaveDataMemory2) kept on disk: it was only in RAM, and lost at every exit.
@@ -429,6 +435,71 @@ SaveSlotInfo GetSaveSlotInfo(std::string_view dir_name) {
 	const auto param = read_param(dir_name);
 	return {param.title, param.sub_title, param.detail,
 	        save_data_mtime(std::filesystem::path(SAVE_DATA_DIR) / get_title_id() / std::string(dir_name))};
+}
+
+static int MountedSlotsLocked() {
+	int mounted = 0;
+	for (size_t slot = 0; slot < SaveDataMountSlots::COUNT; slot++) {
+		if (g_mount_slots.IsMounted(slot)) mounted++;
+	}
+	return mounted;
+}
+
+int MountedSlots() {
+	Common::LockGuard lock(g_mount_mutex);
+	return MountedSlotsLocked();
+}
+
+uint64_t PlayerProfileMounts() {
+	return g_player_mounts.load(std::memory_order_acquire);
+}
+
+std::string TitleId() {
+	return get_title_id();
+}
+
+bool BlockForExit(int timeout_ms, int settle_ms) {
+	using Clock      = std::chrono::steady_clock;
+	const auto start = Clock::now();
+	auto       idle  = Clock::time_point {};
+	bool       quiet = false;
+	for (;;) {
+		const bool busy = MountedSlots() != 0 || LibKernel::FileSystem::OpenSaveWrites() != 0;
+		const auto now  = Clock::now();
+		if (busy) {
+			quiet = false;
+		} else if (!quiet) {
+			quiet = true;
+			idle  = now;
+		}
+		if (quiet && now - idle >= std::chrono::milliseconds(settle_ms)) {
+			Common::LockGuard lock(g_mount_mutex);
+			if (MountedSlotsLocked() == 0 && LibKernel::FileSystem::OpenSaveWrites() == 0) {
+				g_exit_block.store(true, std::memory_order_release);
+				std::printf("[save] closing (F1): no save in progress; new saves refused from now on\n");
+				std::fflush(stdout);
+				return true;
+			}
+			quiet = false;
+		}
+		if (now - start >= std::chrono::milliseconds(timeout_ms)) {
+			Common::LockGuard lock(g_mount_mutex);
+			g_exit_block.store(true, std::memory_order_release);
+			std::printf("[save] closing (F1): a save still busy after %d ms (%d slot(s) mounted, %d file(s) open); new saves refused\n",
+			            timeout_ms, MountedSlotsLocked(), LibKernel::FileSystem::OpenSaveWrites());
+			std::fflush(stdout);
+			return false;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+}
+
+void FlushAll() {
+	const auto title = std::filesystem::path(SAVE_DATA_DIR) / get_title_id();
+	std::error_code error;
+	for (const auto& entry: std::filesystem::directory_iterator(title, error)) {
+		if (entry.is_directory(error)) Backup::FlushSlot(slot_files(entry.path().filename().string()));
+	}
 }
 
 static int mount_save_data(int slot, std::string_view dir_name, const std::string& directory,
@@ -625,6 +696,10 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	const std::string dir_name = mount->dir_name->data;
 	const std::string mount_dir =
 	    std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" + dir_name;
+	if (g_exit_block.load(std::memory_order_acquire)) {
+		std::printf("[save] mount %s mode 0x%x: refused, the game is closing (F1)\n", dir_name.c_str(), mount->mount_mode);
+		return SAVE_DATA_ERROR_BUSY;
+	}
 	const bool create  = ((mount->mount_mode & 4u) != 0);
 	const bool create2 = ((mount->mount_mode & 32u) != 0);
 	const bool open    = (!create && !create2 && ((mount->mount_mode & 3u) != 0));
@@ -669,6 +744,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 
 	const int result = mount_save_data(slot, dir_name, mount_dir, created ? 1u : 0u, mount_result);
 	std::printf("[save] mount %s mode 0x%x%s: %d\n", dir_name.c_str(), mount->mount_mode, created ? " (created)" : "", result);
+	if (result == OK && dir_name.find("PlayerProfile") != std::string::npos) g_player_mounts.fetch_add(1, std::memory_order_acq_rel);
 	return result;
 }
 
@@ -759,6 +835,9 @@ int KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param
 	     reinterpret_cast<uint64_t>(set_param->param), reinterpret_cast<uint64_t>(set_param->icon),
 	     set_param->data_num, set_param->slot_id);
 
+	if (g_exit_block.load(std::memory_order_acquire)) {
+		return SAVE_DATA_ERROR_BUSY; // (ds-pc-port8) closing (F1)
+	}
 	const uint32_t data_num = (set_param->data_num == 0 ? 1 : set_param->data_num);
 	if (set_param->data != nullptr) {
 		for (uint32_t i = 0; i < data_num; i++) {

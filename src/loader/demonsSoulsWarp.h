@@ -66,6 +66,14 @@ std::string Sweep(double seconds, float radius);
 void RunQueuedCommand();
 
 bool        Arm(std::string_view map, std::string_view spawn);
+// (ds-pc-port8) The PC port's resume after F1 (save and quit): the next reads of the character's save `profile`
+// (SAVEDATA0PlayerProfile<n>/USR-DATA) get a copy with the player's place at F1 (`map_uid`: the save's own map; `yaw` in
+// degrees), as a warp without its HUD lines; it ends as a warp does, once the game saved on that map. The save on disk is
+// not touched. False: not 01.007.000 (no place known).
+bool     ArmResume(const std::string& profile, uint32_t map_uid, float x, float y, float z, float yaw_degrees);
+bool     ResumeServed(); // the game has read the copy (Continue)
+uint32_t SaveMapUid(const std::filesystem::path& save); // a USR-DATA's MAPUID (0: none)
+bool     IsPlaceBuild(); // 01.007.000: PlayerPlace works
 void        Disarm();
 void        Select(int step);    // the spawn point ToggleSelected arms
 void        ToggleSelected();

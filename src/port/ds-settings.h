@@ -90,6 +90,7 @@ struct Settings {
 	bool        game_language_set = false; // (idioma_juego / idioma in settings.ini)
 	std::string menu_language;    // (10-27b) idioma_menu: es, en, pt, fr, it, de (empty: the Windows UI language at start)
 	bool        backup_saves = true;
+	bool        continue_f1 = true; // (ds-pc-port8) continuar_f1: JUGAR after F1 (save and quit) continues by itself where F1 left
 	// [Pantalla]
 	bool        fullscreen = true;
 	int         width = 2560, height = 1440; // the window's (fullscreen: the desktop's size is used)

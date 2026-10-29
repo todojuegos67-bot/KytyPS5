@@ -14,6 +14,7 @@
 #include "port/ds-precompile.h"
 #include "port/ds-steam.h"
 #include "port/ds-i18n.h"
+#include "port/ds-resume.h"
 
 #include <nlohmann/json.hpp>
 
@@ -719,7 +720,10 @@ int main(int argc, char* argv[]) {
 	// (10-27c) No start menu: the exe starts the game (the folder asked once, settings.ini keeps it; options in F1).
 	// (10-28b) The launcher comes first (settings.ini menu_inicio=1, the default), and always at a first start (it holds
 	// the Configurador, configurado=0); not after F1's "Reiniciar ahora", nor with --sin-lanzador.
-	const bool start_menu = force_launcher || (!skip_launcher && !restarted && (settings.start_menu || !settings.configured));
+	// (ds-pc-port8) The launcher always comes first now (the game has no options menu any more: F1 saves and quits);
+	// --sin-lanzador skips it once.
+	(void)force_launcher;
+	const bool start_menu = !skip_launcher && !restarted;
 	while (!start_menu && !IsGame(settings.game)) {
 		if (!settings.game.empty())
 			Message("No hay eboot.bin en:\n" + settings.game + "\n\nElige la carpeta del juego volcado (la que tiene eboot.bin y sce_sys).");
@@ -834,6 +838,8 @@ int main(int argc, char* argv[]) {
 		const std::string game_before = settings.game;
 		Port::Runtime     menu_rt     = make_runtime(Port::BuildLaunch(settings, param.title_id, pc));
 		menu_rt.is_game               = [](const std::string& p) { return IsGame(p); };
+		// (ds-pc-port8) The launcher's background: fondo-launcher.jpg (the key art with the logo), else the splash's.
+		if (fs::exists(root / L"fondo-launcher.jpg", ec)) menu_rt.image_path = Utf8((root / L"fondo-launcher.jpg").wstring());
 		menu_rt.pick_folder           = [] { return PickFolder(); };
 		const bool play = Port::RunStartMenu(menu_rt, &settings);
 		Port::Precompile::Stop();
@@ -887,6 +893,8 @@ int main(int argc, char* argv[]) {
 
 	Port::Runtime runtime = make_runtime(plan);
 	Port::InstallMenu(runtime);
+	// (ds-pc-port8) After F1 (save and quit): the title passed by itself and the character back where F1 left.
+	Port::Resume::Prepare(root, param.title_id, settings.continue_f1);
 	std::atexit(RestartIfAsked);
 	std::at_quick_exit(RestartIfAsked);
 

@@ -84,7 +84,27 @@ struct File {
 	std::vector<uint8_t>                dirents;
 	uint64_t                            dents_offset;
 	bool                                cinematic = false; // under the game's cinematics folder (VideoOut::NoteCinematic)
+	bool                                save_write = false; // (ds-pc-port8) open for writing under _SaveData (OpenSaveWrites)
 };
+
+// (ds-pc-port8) The PC port's save-and-quit (F1) waits for the game's save files to be closed.
+static std::atomic<int>      g_save_writes_open {0};
+static std::atomic<uint64_t> g_save_write_opens {0};
+
+static bool IsUnderSaveData(const std::filesystem::path& real) {
+	for (const auto& part: real) {
+		if (part == "_SaveData") return true;
+	}
+	return false;
+}
+
+int OpenSaveWrites() {
+	return g_save_writes_open.load(std::memory_order_acquire);
+}
+
+uint64_t SaveWriteOpens() {
+	return g_save_write_opens.load(std::memory_order_acquire);
+}
 
 class FileDescriptors {
 public:
@@ -611,6 +631,11 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		}
 	}
 
+	file->save_write = !directory && rw_mode != Common::File::Mode::Read && IsUnderSaveData(file->real_name);
+	if (file->save_write) {
+		g_save_write_opens.fetch_add(1, std::memory_order_acq_rel);
+		g_save_writes_open.fetch_add(1, std::memory_order_acq_rel);
+	}
 	file->opened = true;
 	return descriptor;
 }
@@ -640,6 +665,10 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	}
 
 	file->opened = false;
+	if (file->save_write) {
+		file->save_write = false;
+		g_save_writes_open.fetch_sub(1, std::memory_order_acq_rel);
+	}
 
 	LOGF("\tClose: %s\n", Common::PathToString(file->real_name).c_str());
 

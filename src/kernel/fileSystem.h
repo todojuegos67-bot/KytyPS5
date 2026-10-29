@@ -46,6 +46,10 @@ struct Lifecycle {
 void                  Mount(const std::filesystem::path& folder, const std::string& point);
 void                  Umount(const std::string& folder_or_point);
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
+// (ds-pc-port8) Files under _SaveData open for writing now, and how many such opens there have been (the PC port's
+// save-and-quit waits until the game's save is closed).
+int      OpenSaveWrites();
+uint64_t SaveWriteOpens();
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
 int KYTY_SYSV_ABI     KernelClose(int d);

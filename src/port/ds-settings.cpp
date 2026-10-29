@@ -208,6 +208,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 		if (auto it = v.find(k); it != v.end() && !it->second.empty()) s->game_language_set = true;
 	str("idioma_menu", s->menu_language);
 	boo("copia_partidas", s->backup_saves);
+	boo("continuar_f1", s->continue_f1);
 	boo("pantalla_completa", s->fullscreen);
 	num("ancho", s->width);
 	num("alto", s->height);
@@ -310,7 +311,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 bool SaveSettings(const std::string& path, const Settings& s) {
 	std::ostringstream o;
 	const auto         b = [](bool x) { return x ? "1" : "0"; };
-	o << "; Demon's Souls PC - ajustes. Se cambian tambien dentro del juego (F1, o mantener R3 y pulsar OPTIONS).\n"
+	o << "; Demon's Souls PC - ajustes. Se cambian en el lanzador (se abre al ejecutar Demon's Souls.exe). En el juego F1 guarda y sale.\n"
 	  << "; 1 = si, 0 = no. Lo que no se reconoce se ignora; borrar este archivo vuelve a los valores por defecto.\n\n"
 	  << "[Juego]\n"
 	  << "; Carpeta del juego volcado (la que tiene eboot.bin y sce_sys), o un .zar. Vacia: se pregunta al arrancar.\n"
@@ -321,7 +322,9 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Idioma de los menus: es, en, pt, fr, it, de\n"
 	  << "idioma_menu=" << s.menu_language << "\n"
 	  << "; Copia de seguridad de _SaveData en _SaveData-copias antes de jugar\n"
-	  << "copia_partidas=" << b(s.backup_saves) << "\n\n"
+	  << "copia_partidas=" << b(s.backup_saves) << "\n"
+	  << "; En el juego F1 (o R3 + OPTIONS) guarda y cierra; 1: JUGAR pasa solo el titulo y continua donde se pulso F1\n"
+	  << "continuar_f1=" << b(s.continue_f1) << "\n\n"
 	  << "[Pantalla]\n"
 	  << "; Iluminacion IBL: mitad, completa; Teselado: bajo, medio, alto, ultra, extremo (vacio: segun la salida, 4K completa + alto, si no mitad + medio)\n"
 	  << "iluminacion_ibl=" << s.ibl << "\n"
@@ -466,7 +469,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "[Interfaz]\n"
 	  << "; Metricas en pantalla: 0 no, 1 FPS, 2 FPS + detalle\n"
 	  << "metricas=" << s.metrics << "\n"
-	  << "; Menu de inicio (como el launcher) antes del juego: 1 si, 0 arranca directo\n"
+	  << "; (Ya no se usa: el lanzador se abre siempre; \"Demon's Souls.exe\" --sin-lanzador lo salta una vez)\n"
 	  << "menu_inicio=" << b(s.start_menu) << "\n"
 	  << "; Vibracion del mando (el audio haptico del DualSense como vibracion; mandos Xbox, DualSense por Bluetooth)\n"
 	  << "vibracion=" << b(s.rumble) << "\n"

@@ -18,6 +18,17 @@ struct SaveSlotInfo {
 
 SaveSlotInfo GetSaveSlotInfo(std::string_view dir_name);
 
+// (ds-pc-port8) The PC port's save-and-quit (F1):
+int         MountedSlots();        // the slots the game has mounted now
+uint64_t    PlayerProfileMounts(); // successful mounts of a SAVEDATA0PlayerProfile* slot so far (the title reads it, Continue loads it)
+std::string TitleId();
+// Waits up to `timeout_ms` for no slot mounted and no save file open for writing during `settle_ms`, then refuses every
+// new mount and save data memory write (SAVE_DATA_ERROR_BUSY) until the process ends: no save starts after it. True:
+// the game was idle; false: the time ran out (new saves refused all the same).
+bool        BlockForExit(int timeout_ms, int settle_ms);
+// Every slot of this title flushed to disk.
+void        FlushAll();
+
 } // namespace Libs::SaveData
 
 #endif /* EMULATOR_SRC_LIBS_SAVEDATAINFO_H_ */

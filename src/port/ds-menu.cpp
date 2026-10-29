@@ -1,10 +1,10 @@
-// "Demon's Souls" PC port: the in-game options menu. Drawn by the system overlay (src/graphics/presentation/
-// systemOverlay.cpp) into the swapchain image, after the upscaler and outside frame generation: while it is open the
-// frames go out without generated ones (swapchain.cpp, PortLive::menu_open), and the game gets no input.
-//   F1, or R3 held + OPTIONS (OPTIONS then never reaches the game): open / close. Circle / Escape: close. L1 / R1, Q / E: the tabs.
-// What the engine applies while playing (sharpness, the fps cap, the frame generation multiplier of a fixed DLSS mode,
-// metrics, rumble, ray tracing turned off) is applied at once; the rest is saved to settings.ini and marked "(requiere reinicio)": applied at the next start, which
-// the menu offers.
+// "Demon's Souls" PC port: the launcher before the game (RunStartMenu: Launcher-souls.ps1's window, its groups, rows,
+// options and tooltips, every setting of settings.ini) and, in the game, F1 = save and quit (ds-resume.h).
+//   (ds-pc-port8) F1, or R3 held + OPTIONS (OPTIONS then never reaches the game): the game's save is let finish, the saves
+//   are copied, the place is kept for JUGAR and the game closes. There is no options menu in the game any more: every
+//   option is in the launcher. The other keys (F7 mouse, F8 metrics, F11 full screen) stay the emulator's.
+// Drawn by the system overlay (src/graphics/presentation/systemOverlay.cpp) into the swapchain image, after the upscaler
+// and outside frame generation.
 
 #include "port/ds-port.h"
 #include <functional>
@@ -12,6 +12,7 @@
 #include "port/ds-precompile.h"
 #include "port/ds-i18n.h"
 #include "port/ds-steam.h"
+#include "port/ds-resume.h"
 
 #include "local/perf-overlay.h"
 #include "local/port-live.h"
@@ -46,6 +47,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <shellapi.h>
 #endif
 
 namespace Port {
@@ -166,11 +168,27 @@ ImGuiKey KeyboardKey(SDL_Keycode key) {
 
 // Window thread, before the game's handling: true when the event is the menu's.
 bool OnEvent(const SDL_Event& e) {
+	// (ds-pc-port8) While F1's save and quit runs, the game gets no input (it is closing).
+	if (Resume::SaveAndQuitActive()) {
+		switch (e.type) {
+			case SDL_KEYDOWN:
+			case SDL_TEXTINPUT:
+			case SDL_TEXTEDITING:
+			case SDL_CONTROLLERBUTTONDOWN:
+			case SDL_CONTROLLERAXISMOTION:
+			case SDL_MOUSEMOTION:
+			case SDL_MOUSEBUTTONDOWN:
+			case SDL_MOUSEWHEEL: return true;
+			default: return false;
+		}
+	}
 	const bool open = g_open.load();
 	switch (e.type) {
 		case SDL_KEYDOWN:
 			if (e.key.keysym.sym == SDLK_F1 && e.key.repeat == 0) {
-				SetOpen(!open);
+				// (ds-pc-port8) F1: save and quit (no menu any more).
+				Resume::StartSaveAndQuit(g_rt.exe_path.parent_path());
+				Bump();
 				return true;
 			}
 			if (!open) return false;
@@ -196,7 +214,8 @@ bool OnEvent(const SDL_Event& e) {
 			const bool combo = b == SDL_CONTROLLER_BUTTON_START && PadHeld(e.cbutton.which, SDL_CONTROLLER_BUTTON_RIGHTSTICK);
 			if (combo) {
 				g_start_swallowed = true;
-				SetOpen(!open);
+				Resume::StartSaveAndQuit(g_rt.exe_path.parent_path()); // (ds-pc-port8) as F1
+				Bump();
 				return true;
 			}
 			if (!open) return false;
@@ -319,6 +338,81 @@ void Describe(const char* label, const char* tip) {
 	}
 }
 
+// (10-28c / ds-pc-port8) The dropdown list of a row or a launcher field: every value in a vertical list under (or over)
+// the field at `at` (`w` x `h`), `lw` wide; true when another value was picked. Opened with ImGui::OpenPopup("##list")
+// in the same ID scope. `brand`: the values coloured as the launcher's lists (NVIDIA / DLSS green, Intel / XeSS blue,
+// AMD / FSR red, the game's grey).
+ImVec4 BrandColor(const char* text, const ImVec4& other) {
+	const auto has = [&](const char* k) { return text != nullptr && std::strstr(text, k) != nullptr; };
+	if (has("NVIDIA") || has("DLSS") || has("Reflex")) return {0.46f, 0.73f, 0.0f, 1.0f};
+	if (has("Intel") || has("XeSS")) return {0.27f, 0.63f, 1.0f, 1.0f};
+	if (has("AMD") || has("FSR")) return {0.93f, 0.27f, 0.27f, 1.0f};
+	if (has("juego") || has("game") || has("jogo") || has("jeu") || has("gioco") || has("Spiel")) return {0.78f, 0.78f, 0.78f, 1.0f};
+	return other;
+}
+
+bool DropList(int count, int& current, const std::function<const char*(int)>& list, ImVec2 at, float w, float h, float lw, float itemH,
+              bool brand = false) {
+	bool picked = false;
+	{
+		// (10-29) Keep the list inside the window and the viewport: cap its height to the room there is, open it upward
+		// when there is more room above than below; when capped it scrolls (wheel, D-pad/arrows, scrollbar).
+		const ImGuiStyle& st     = ImGui::GetStyle();
+		const ImGuiViewport* vp  = ImGui::GetMainViewport();
+		const ImRect root        = ImGui::GetCurrentWindow()->RootWindow->Rect();
+		const float  top         = std::max(vp->WorkPos.y, root.Min.y) + 4.0f * g_unit;
+		const float  bottom      = std::min(vp->WorkPos.y + vp->WorkSize.y, root.Max.y) - 4.0f * g_unit;
+		const float  left        = std::max(vp->WorkPos.x, root.Min.x);
+		const float  rightEdge   = std::min(vp->WorkPos.x + vp->WorkSize.x, root.Max.x);
+		const float  full        = count * itemH + std::max(0, count - 1) * st.ItemSpacing.y + st.WindowPadding.y * 2.0f;
+		const float  below       = std::max(0.0f, bottom - (at.y + h));
+		const float  above       = std::max(0.0f, at.y - top);
+		const bool   up          = full > below && above > below;
+		const float  room        = std::max(itemH + st.WindowPadding.y * 2.0f, up ? above : below);
+		const float  lh          = std::min(full, std::min(room, bottom - top));
+		float        lx          = std::min(at.x + w - lw, rightEdge - lw);
+		lx                       = std::max(lx, left);
+		float ly                 = up ? at.y - lh : at.y + h;
+		ly                       = std::clamp(ly, top, std::max(top, bottom - lh));
+		ImGui::SetNextWindowPos({lx, ly});
+		ImGui::SetNextWindowSize({std::min(lw, rightEdge - left), lh});
+		const ImGuiWindowFlags pf = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+		                             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+		                             (full > lh ? ImGuiWindowFlags_AlwaysVerticalScrollbar : ImGuiWindowFlags_NoScrollbar);
+		if (ImGui::BeginPopupEx(ImGui::GetID("##list"), pf)) { // g_popup is set from IsPopupOpen: Circle closes this list, not the menu
+			for (int i = 0; i < count; i++) {
+				const bool on = i == current;
+				ImGui::PushID(i);
+				const char* text  = I18n::T(list(i));
+				const bool  color = on || brand;
+				if (color) ImGui::PushStyleColor(ImGuiCol_Text, on ? kGold : BrandColor(text, ImGui::GetStyleColorVec4(ImGuiCol_Text)));
+				if (ImGui::Selectable(text, on, ImGuiSelectableFlags_None, {0, itemH})) {
+					if (i != current) {
+						current = i;
+						picked  = true;
+					}
+					ImGui::CloseCurrentPopup();
+				}
+				if (color) ImGui::PopStyleColor();
+				if (on) {
+					if (ImGui::IsWindowAppearing()) {
+						ImGui::SetItemDefaultFocus();
+						ImGui::SetScrollHereY(0.5f);
+					}
+				}
+				// (10-29b) Keyboard / D-pad moving the selection past the visible edge scrolls the list with it, only on the
+				// frame the nav focus moved here from a nav input: never from the wheel, the scrollbar or mouse hover.
+				if (!ImGui::IsWindowAppearing() && ImGui::GetCurrentContext()->NavJustMovedToId == ImGui::GetItemID() &&
+				    !ImGui::GetIO().MouseDown[0] && !ImGui::IsItemVisible())
+					ImGui::SetScrollHereY(0.5f);
+				ImGui::PopID();
+			}
+			ImGui::EndPopup();
+		}
+	}
+	return picked;
+}
+
 // The row itself: `current` changed by `step` (-1 / +1) within count; true when it changed.
 // (10-28c) `list`: the label of each value; when set, a click / Cross / Enter opens a vertical dropdown list of
 // every value below the row (Left/Right still cycle as a shortcut). Without it (Sí/No rows) a click cycles.
@@ -376,62 +470,7 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 		dl->AddTriangleFilled({mid - half, cy}, {mid - half + s2, cy - s2}, {mid - half + s2, cy + s2}, arrow);
 		dl->AddTriangleFilled({mid + half, cy}, {mid + half - s2, cy - s2}, {mid + half - s2, cy + s2}, arrow);
 	}
-	if (list != nullptr) {
-		const float lw = std::max(320.0f * g_unit, w * 0.45f);
-		// (10-29) Keep the list inside the window and the viewport: cap its height to the room there is, open it upward
-		// when there is more room above than below; when capped it scrolls (wheel, D-pad/arrows, scrollbar).
-		const ImGuiStyle& st     = ImGui::GetStyle();
-		const ImGuiViewport* vp  = ImGui::GetMainViewport();
-		const ImRect root        = ImGui::GetCurrentWindow()->RootWindow->Rect();
-		const float  top         = std::max(vp->WorkPos.y, root.Min.y) + 4.0f * g_unit;
-		const float  bottom      = std::min(vp->WorkPos.y + vp->WorkSize.y, root.Max.y) - 4.0f * g_unit;
-		const float  left        = std::max(vp->WorkPos.x, root.Min.x);
-		const float  rightEdge   = std::min(vp->WorkPos.x + vp->WorkSize.x, root.Max.x);
-		const float  itemH       = 40.0f * g_unit;
-		const float  full        = count * itemH + std::max(0, count - 1) * st.ItemSpacing.y + st.WindowPadding.y * 2.0f;
-		const float  below       = std::max(0.0f, bottom - (at.y + h));
-		const float  above       = std::max(0.0f, at.y - top);
-		const bool   up          = full > below && above > below;
-		const float  room        = std::max(itemH + st.WindowPadding.y * 2.0f, up ? above : below);
-		const float  lh          = std::min(full, std::min(room, bottom - top));
-		float        lx          = std::min(at.x + w - lw, rightEdge - lw);
-		lx                       = std::max(lx, left);
-		float ly                 = up ? at.y - lh : at.y + h;
-		ly                       = std::clamp(ly, top, std::max(top, bottom - lh));
-		ImGui::SetNextWindowPos({lx, ly});
-		ImGui::SetNextWindowSize({std::min(lw, rightEdge - left), lh});
-		const ImGuiWindowFlags pf = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
-		                             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
-		                             (full > lh ? ImGuiWindowFlags_AlwaysVerticalScrollbar : ImGuiWindowFlags_NoScrollbar);
-		if (ImGui::BeginPopupEx(ImGui::GetID("##list"), pf)) { // g_popup is set from IsPopupOpen: Circle closes this list, not the menu
-			for (int i = 0; i < count; i++) {
-				const bool on = i == current;
-				ImGui::PushID(i);
-				if (on) ImGui::PushStyleColor(ImGuiCol_Text, kGold);
-				if (ImGui::Selectable(I18n::T((*list)(i)), on, ImGuiSelectableFlags_None, {0, itemH})) {
-					if (i != current) {
-						current = i;
-						picked  = true;
-					}
-					ImGui::CloseCurrentPopup();
-				}
-				if (on) {
-					ImGui::PopStyleColor();
-					if (ImGui::IsWindowAppearing()) {
-						ImGui::SetItemDefaultFocus();
-						ImGui::SetScrollHereY(0.5f);
-					}
-				}
-				// (10-29b) Keyboard / D-pad moving the selection past the visible edge scrolls the list with it, only on the
-				// frame the nav focus moved here from a nav input: never from the wheel, the scrollbar or mouse hover.
-				if (!ImGui::IsWindowAppearing() && ImGui::GetCurrentContext()->NavJustMovedToId == ImGui::GetItemID() &&
-				    !ImGui::GetIO().MouseDown[0] && !ImGui::IsItemVisible())
-					ImGui::SetScrollHereY(0.5f);
-				ImGui::PopID();
-			}
-			ImGui::EndPopup();
-		}
-	}
+	if (list != nullptr) picked = DropList(count, current, *list, at, w, h, std::max(320.0f * g_unit, w * 0.45f), 40.0f * g_unit);
 	ImGui::PopID();
 	if (picked) return true;
 	if (step == 0 || count <= 1) return false;
@@ -1602,8 +1641,1196 @@ void Draw(float width, float height) {
 	Bump(); // (redrawn while open: hover, the nav cursor)
 }
 
+// ---- (ds-pc-port8) The launcher: Launcher-souls.ps1's window, natively. The whole screen with fondo-launcher.jpg
+// (the logo stays visible on the left), the dark column of settings on the right (880 wide at 1080 lines) with its two
+// columns of groups (Imagen, Calidad grafica, Ray tracing | Frame generation, Pantalla y otros, Configurador,
+// Rendimiento / PC, JUGAR, Actualizar / Volver, Ajustes / Salir, Controles, TU EQUIPO, PayPal), the X left of the
+// column, Trofeos at the bottom left, Ajustes as a panel left of the column. Every row writes the same settings.ini key
+// as before (Settings), each one has its tooltip. Titles in a serif face, the rest Segoe UI. ----
+
+ImFont*        g_font_body  = nullptr; // Segoe UI
+ImFont*        g_font_semi  = nullptr; // Segoe UI Semibold
+ImFont*        g_font_serif = nullptr; // Palatino Linotype / Georgia / Times (titles, JUGAR)
+ImTextureData* g_knight     = nullptr; // caballero-espada.png (TU EQUIPO)
+int            g_knight_w = 0, g_knight_h = 0;
+bool           g_knight_tried   = false;
+bool           g_show_settings  = false;
+bool           g_show_controls  = false;
+bool           g_show_trophies  = false;
+bool           g_show_keys      = false;
+std::string    g_steam_text;
+std::mutex     g_steam_mutex;
+std::atomic<bool> g_steam_busy {false};
+
+const ImVec4 kInkL {0.925f, 0.91f, 0.88f, 1.0f};
+const ImVec4 kGoldL {0.87f, 0.77f, 0.55f, 1.0f};
+
+struct LBox {
+	ImVec2 at {};
+	float  w = 0;
+	bool   open = false;
+	bool   card = false;
+} g_lbox;
+
+float U(float v) {
+	return v * g_unit;
+}
+
+ImTextureData* LoadTexture(const std::string& path, int* w, int* h) {
+	int         channels = 0;
+	std::string bytes;
+	{
+		std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
+		bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+	}
+	auto* pixels = bytes.empty() ? nullptr
+	                             : stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()), static_cast<int>(bytes.size()), w, h,
+	                                                     &channels, 4);
+	if (pixels == nullptr) {
+		std::printf("[port] launcher image %s not loaded\n", path.c_str());
+		return nullptr;
+	}
+	auto* tex = IM_NEW(ImTextureData)();
+	tex->Create(ImTextureFormat_RGBA32, *w, *h);
+	std::memcpy(tex->GetPixels(), pixels, static_cast<size_t>(*w) * *h * 4);
+	tex->UseColors = true;
+	stbi_image_free(pixels);
+	ImGui::RegisterUserTexture(tex);
+	return tex;
+}
+
+void FreeTexture(ImTextureData*& tex) {
+	if (tex == nullptr) return;
+	ImGui::UnregisterUserTexture(tex);
+	IM_DELETE(tex);
+	tex = nullptr;
+}
+
+// The tooltip of the last item (the launcher's ToolTip: on hover, after a short pause; also on disabled rows).
+void Tip(const char* tip) {
+	if (tip == nullptr || *tip == '\0') return;
+	if (!ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled)) return;
+	if (ImGui::BeginTooltip()) {
+		ImGui::PushTextWrapPos(U(440));
+		ImGui::TextUnformatted(I18n::T(tip));
+		ImGui::PopTextWrapPos();
+		ImGui::EndTooltip();
+	}
+}
+
+// A group box (the launcher's GroupBox): its title in gold serif; the rows inside are placed from its left edge.
+void BoxBegin(const char* title, float w = 420, bool card = false) {
+	auto* dl = ImGui::GetWindowDrawList();
+	dl->ChannelsSplit(2);
+	dl->ChannelsSetCurrent(1);
+	g_lbox.at   = ImGui::GetCursorScreenPos();
+	g_lbox.w    = U(w);
+	g_lbox.open = true;
+	g_lbox.card = card;
+	ImGui::BeginGroup();
+	ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), g_lbox.at.y + U(card ? 12 : 6)});
+	ImGui::PushFont(g_font_serif, U(card ? 24 : 19));
+	ImGui::TextColored(kGoldL, "%s", I18n::T(title));
+	ImGui::PopFont();
+	ImGui::SetCursorScreenPos({g_lbox.at.x, g_lbox.at.y + U(card ? 46 : 32)});
+	ImGui::Dummy({g_lbox.w, 0});
+}
+
+void BoxEnd() {
+	ImGui::Dummy({g_lbox.w, U(8)});
+	ImGui::EndGroup();
+	auto*        dl  = ImGui::GetWindowDrawList();
+	const ImVec2 end = {g_lbox.at.x + g_lbox.w, ImGui::GetItemRectMax().y};
+	dl->ChannelsSetCurrent(0);
+	if (g_lbox.card) {
+		dl->AddRectFilledMultiColor(g_lbox.at, end, IM_COL32(30, 26, 20, 215), IM_COL32(20, 19, 19, 215), IM_COL32(12, 13, 18, 215),
+		                            IM_COL32(22, 20, 19, 215));
+		if (g_knight != nullptr && g_knight_h > 0) {
+			// The knight inside the card, bottom right, its sword towards the text (at most the card's height - 12).
+			const float ch = end.y - g_lbox.at.y;
+			const float k  = std::min({1.0f * g_unit, (ch - U(12)) / g_knight_h, g_lbox.w * 0.62f / g_knight_w});
+			const float kw = g_knight_w * k, kh = g_knight_h * k;
+			dl->AddImage(g_knight->GetTexRef(), {end.x - kw - U(6), end.y - kh - U(6)}, {end.x - U(6), end.y - U(6)}, {0, 0}, {1, 1},
+			             IM_COL32(255, 255, 255, 235));
+		}
+		dl->AddRect(g_lbox.at, end, IM_COL32(222, 196, 140, 150), U(14), 0, 1.5f);
+	} else {
+		dl->AddRectFilled(g_lbox.at, end, IM_COL32(10, 12, 17, 175), U(5));
+		dl->AddRect(g_lbox.at, end, IM_COL32(222, 196, 140, 70), U(5), 0, 1.0f);
+	}
+	dl->ChannelsMerge();
+	g_lbox.open = false;
+	ImGui::SetCursorScreenPos({g_lbox.at.x, end.y + U(8)});
+	ImGui::Dummy({g_lbox.w, 0});
+}
+
+// Rows: their top (screen y) and their end (the cursor under them, the full width taken).
+float RowY() {
+	return ImGui::GetCursorScreenPos().y;
+}
+
+void RowEnd(float y, float h = 32) {
+	ImGui::SetCursorScreenPos({g_lbox.at.x, y});
+	ImGui::Dummy({g_lbox.w, U(h)});
+}
+
+void Label(float y, const char* text, const char* tip, float x = 10) {
+	ImGui::SetCursorScreenPos({g_lbox.at.x + U(x), y + U(4)});
+	ImGui::TextUnformatted(I18n::T(text));
+	Tip(tip);
+}
+
+// A drop-down field (the launcher's ComboBox): the value and an arrow; a click, Cross or Enter opens the list of values.
+bool Field(const char* id, float y, int count, int& current, const std::function<const char*(int)>& list, const char* tip, float x, float w,
+           bool brand = false) {
+	if (count <= 0) return false;
+	current = std::clamp(current, 0, count - 1);
+	ImGui::PushID(id);
+	const ImVec2 at {g_lbox.at.x + U(x), y + U(2)};
+	const ImVec2 size {U(w), U(27)};
+	ImGui::SetCursorScreenPos(at);
+	const bool clicked  = ImGui::InvisibleButton("##f", size);
+	const bool disabled = (ImGui::GetCurrentContext()->CurrentItemFlags & ImGuiItemFlags_Disabled) != 0;
+	const bool hot      = !disabled && (ImGui::IsItemHovered() || ImGui::IsItemFocused());
+	Tip(tip);
+	if (clicked && !disabled && count > 1) ImGui::OpenPopup("##list");
+	auto*       dl    = ImGui::GetWindowDrawList();
+	const float alpha = disabled ? 0.45f : 1.0f;
+	dl->AddRectFilled(at, {at.x + size.x, at.y + size.y}, hot ? IM_COL32(40, 44, 58, 255) : IM_COL32(24, 26, 34, 255), U(3));
+	dl->AddRect(at, {at.x + size.x, at.y + size.y}, hot ? ImGui::GetColorU32(kGoldL) : IM_COL32(90, 92, 96, 200), U(3));
+	const char* shown = I18n::T(list(current));
+	ImVec4      ink   = brand ? BrandColor(shown, kInkL) : kInkL;
+	ink.w *= alpha;
+	const float fs = ImGui::GetFontSize();
+	dl->PushClipRect({at.x + U(6), at.y}, {at.x + size.x - U(22), at.y + size.y}, true);
+	dl->AddText(nullptr, 0.0f, {at.x + U(8), at.y + (size.y - fs) * 0.5f}, ImGui::GetColorU32(ink), shown);
+	dl->PopClipRect();
+	const float cx = at.x + size.x - U(12), cy = at.y + size.y * 0.5f, s = U(4.5f);
+	dl->AddTriangleFilled({cx - s, cy - s * 0.6f}, {cx + s, cy - s * 0.6f}, {cx, cy + s * 0.7f},
+	                      ImGui::GetColorU32(ImVec4 {kGoldL.x, kGoldL.y, kGoldL.z, alpha}));
+	const bool picked = DropList(count, current, list, at, size.x, size.y, std::max(size.x, U(250)), U(30), brand);
+	ImGui::PopID();
+	return picked;
+}
+
+template <typename Item, typename Id, typename Text>
+bool LRow(const char* label, int count, const Item* items, std::string& value, Id id, Text text, const char* tip, float fx = 124,
+          float fw = 282, bool brand = false, float lx = 10) {
+	const float y = RowY();
+	if (label != nullptr && *label != '\0' && fx > lx + 40) Label(y, label, tip, lx);
+	int current = 0;
+	for (int i = 0; i < count; i++)
+		if (value == id(items[i])) current = i;
+	const std::function<const char*(int)> list = [&](int i) -> const char* { return text(items[i]); };
+	const bool                            ch   = Field(label, y, count, current, list, tip, fx, fw, brand);
+	if (ch) value = id(items[current]);
+	RowEnd(y);
+	return ch;
+}
+
+bool LChoice(const char* label, const Choice* items, int count, std::string& value, const char* tip, float fx = 124, float fw = 282) {
+	return LRow(label, count, items, value, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; }, tip, fx, fw);
+}
+
+// A check box at `x` of the row at `y` (several may share a row; the caller ends it).
+bool LCheck(float y, const char* label, bool& v, const char* tip, float x = 12) {
+	ImGui::SetCursorScreenPos({g_lbox.at.x + U(x), y + U(3)});
+	ImGui::PushID(label);
+	const bool changed = ImGui::Checkbox(I18n::T(label), &v);
+	ImGui::PopID();
+	Tip(tip);
+	return changed;
+}
+
+bool LCheckRow(const char* label, bool& v, const char* tip) {
+	const float y = RowY();
+	const bool  c = LCheck(y, label, v, tip);
+	RowEnd(y);
+	return c;
+}
+
+// A slider with its text above it (the launcher's TrackBar), `w` wide at `x`.
+bool LSlider(float y, const char* label, float& v, float lo, float hi, const char* format, const char* tip, float x, float w) {
+	ImGui::SetCursorScreenPos({g_lbox.at.x + U(x), y + U(2)});
+	ImGui::TextUnformatted(I18n::T(label));
+	Tip(tip);
+	ImGui::SetCursorScreenPos({g_lbox.at.x + U(x), y + U(24)});
+	ImGui::SetNextItemWidth(U(w));
+	ImGui::PushID(label);
+	const bool changed = ImGui::SliderFloat("##s", &v, lo, hi, format);
+	ImGui::PopID();
+	Tip(tip);
+	return changed;
+}
+
+// The launcher's buttons: the primary one gold with dark text, the others dark with a grey border.
+bool LButton(const char* text, ImVec2 at, ImVec2 size, bool primary, ImFont* font, float font_size, const char* tip = nullptr) {
+	ImGui::SetCursorScreenPos(at);
+	if (primary) {
+		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.69f, 0.55f, 0.27f, 0.92f});
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.81f, 0.67f, 0.38f, 0.96f});
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0.60f, 0.47f, 0.22f, 1.0f});
+		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4 {0.08f, 0.06f, 0.04f, 1.0f});
+		ImGui::PushStyleColor(ImGuiCol_Border, kGoldL);
+	} else {
+		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.094f, 0.11f, 0.15f, 0.82f});
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.17f, 0.20f, 0.25f, 0.90f});
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0.24f, 0.27f, 0.33f, 1.0f});
+		ImGui::PushStyleColor(ImGuiCol_Text, kInkL);
+		ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.43f, 0.43f, 0.39f, 1.0f});
+	}
+	ImGui::PushFont(font, font_size);
+	const bool clicked = ImGui::Button(I18n::T(text), size);
+	ImGui::PopFont();
+	ImGui::PopStyleColor(5);
+	Tip(tip);
+	return clicked;
+}
+
+void OpenUrl(const char* url) {
+#if defined(_WIN32)
+	ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL);
+#else
+	(void)url;
+#endif
+}
+
+// The resolution choices (F1's ResolutionRow before): full screen, the desktop's or a monitor mode; window, its size.
+void ResolutionChoices(const Settings& s, std::vector<std::string>* ids, std::vector<std::string>* labels) {
+	static const char* sizes[] = {"1280x720", "1600x900", "1920x1080", "2560x1080", "2560x1440", "3440x1440", "3840x1600", "3840x2160"};
+	ids->clear();
+	labels->clear();
+	if (s.fullscreen) {
+		ids->emplace_back("escritorio");
+		labels->emplace_back(std::string(I18n::T("Escritorio")) +
+		                     (g_rt.pc.screen_h > 0 ? " (" + std::to_string(g_rt.pc.screen_h) + "p)" : std::string()));
+	}
+	for (const char* z: sizes) {
+		ids->emplace_back(z);
+		labels->emplace_back(z);
+	}
+	const std::string value = s.fullscreen ? s.resolution : std::to_string(s.width) + "x" + std::to_string(s.height);
+	if (std::find(ids->begin(), ids->end(), value) == ids->end()) {
+		ids->push_back(value);
+		labels->push_back(value);
+	}
+}
+
+void LauncherImage(Settings& s) {
+	const bool nvidia = g_rt.pc.nvidia;
+	BoxBegin("Imagen");
+	{
+		static std::vector<std::string> ids, labels;
+		ResolutionChoices(s, &ids, &labels);
+		std::vector<Choice> res;
+		for (size_t i = 0; i < ids.size(); i++) res.push_back({ids[i].c_str(), labels[i].c_str()});
+		std::string value = s.fullscreen ? s.resolution : std::to_string(s.width) + "x" + std::to_string(s.height);
+		const float y     = RowY();
+		Label(y, "Resolución", "Resolución de salida: la de Windows (Escritorio) u otra (el monitor cambia a ella mientras juegas). Los reescaladores calculan su resolución sobre ella. En ventana: el tamaño de la ventana.");
+		int current = 0;
+		for (size_t i = 0; i < res.size(); i++)
+			if (value == res[i].id) current = static_cast<int>(i);
+		const std::function<const char*(int)> list = [&](int i) -> const char* { return res[static_cast<size_t>(i)].label; };
+		if (Field("Resolución", y, static_cast<int>(res.size()), current, list,
+		          "Resolución de salida: la de Windows (Escritorio) u otra (el monitor cambia a ella mientras juegas). Los reescaladores calculan su resolución sobre ella. En ventana: el tamaño de la ventana.",
+		          124, 140)) {
+			value = res[static_cast<size_t>(current)].id;
+			if (s.fullscreen) {
+				s.resolution = value;
+			} else if (int w = 0, h = 0; std::sscanf(value.c_str(), "%dx%d", &w, &h) == 2) {
+				s.width  = w;
+				s.height = h;
+			}
+			// (10-29) A 4K output: Iluminacion IBL Completa + Teselado Alto; any other: Mitad + Medio (changeable after).
+			SetQualityForOutput(&s, OutputHeight(s, g_rt.pc));
+		}
+		// (10-29) The game's mode that is applied, next to it.
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(272), y + U(6)});
+		ImGui::PushFont(g_font_body, U(14));
+		ImGui::TextColored(kGoldL, "%s", I18n::T(OutputHeight(s, g_rt.pc) >= 2160 ? "Cinemático sin tope 30" : "Modo rendimiento"));
+		ImGui::PopFont();
+		Tip("4K: el modo rendimiento del juego (cinemáticas sin el tope de 30) con la calidad cinemática: iluminación completa y teselado denso. Otras resoluciones: modo rendimiento.");
+		RowEnd(y);
+	}
+	{
+		static std::vector<ResMode> shown;
+		shown.clear();
+		const int out_h = OutputHeight(s, g_rt.pc);
+		for (int i = 0; i < kResModeCount; i++) {
+			if (!nvidia && std::strcmp(kResModes[i].upscaler, "dlss") == 0) continue;
+			if (std::strcmp(kResModes[i].upscaler, "fsr4") == 0 && out_h / kResModes[i].value < 359 && s.res != kResModes[i].id) continue;
+			shown.push_back(kResModes[i]);
+		}
+		LRow("Reescalado", static_cast<int>(shown.size()), shown.data(), s.res, [](const ResMode& m) { return m.id; },
+		     [](const ResMode& m) { return m.label; },
+		     "Reescalado: dibuja el 3D a menos resolucion y lo sube a la de la pantalla (mas fps). DLSS: NVIDIA RTX. XeSS, FSR 3.1 y FSR 4: todas las graficas (FSR 4: modelo de AMD con INT8, RTX 20 / RX 6000 o mas nuevas; el 3D a 360 lineas como minimo).",
+		     124, 282, true);
+	}
+	ImGui::BeginDisabled(!nvidia);
+	LChoice("Preset DLSS", kDlssPresets, kDlssPresetCount, s.dlss_preset,
+	        nvidia ? "Modelo de DLSS: auto (el de NVIDIA), K = DLSS 4, L y M = DLSS 4.5 (mas nitidos, algo mas lentos)" : "Sin DLSS: tu grafica no es NVIDIA.");
+	ImGui::EndDisabled();
+	LChoice("Nitidez", kSharpness, kSharpnessCount, s.sharpness,
+	        "Nitidez del reescalado (DLSS, XeSS, FSR 3.1 y FSR 4), aplicada a la resolucion de la pantalla. Mas alto: mas nitido, pero puede marcar bordes y ruido.");
+	BoxEnd();
+}
+
+void LauncherQuality(Settings& s) {
+	BoxBegin("Calidad gráfica");
+	LChoice("Texturas", kTextureReduce, kTextureReduceCount, s.texture_reduce, "Tamaño de las texturas: Medio = la mitad, Bajo = un cuarto. Lo que más VRAM ahorra.");
+	LChoice("Distancia", kQualities, kQualityCount, s.quality, "Distancia de dibujado: a menos nivel, los objetos lejanos pasan antes a modelos más simples. Más FPS si va justo el procesador.");
+	LChoice("Sombras", kShadows, kShadowCount, s.shadows, "Sombras: Medio = las del sol hasta 125 m, Bajo = hasta 60 m y sin sombras de focos ni ambientales. Más FPS, pero pueden aparecer de golpe.");
+	LChoice("Detalle", kDetails, kDetailCount, s.detail, "Detalle del juego: sombras (cascadas y distancia), iluminación de entorno y relieve (teselado). Ultra > Muy alto (modo cine) > Alto (modo rendimiento de PS5) > Normal > Bajo.");
+	{
+		const float y = RowY();
+		LCheck(y, "Filtrado x16", s.af16, "Filtrado anisotrópico x16: suelos y paredes nítidos a lo lejos y en ángulo. Cuesta muy poco.", 10);
+		int current = 0;
+		for (int i = 0; i < kTextureSharpnessCount; i++)
+			if (s.texture_sharpness == kTextureSharpness[i].id) current = i;
+		const std::function<const char*(int)> list = [](int i) -> const char* { return kTextureSharpness[i].label; };
+		if (Field("Nitidez de texturas", y, kTextureSharpnessCount, current, list,
+		          "Texturas: nítidas = el detalle de la resolución final con reescalado. Extra nítidas: un escalón más (lo que recomienda NVIDIA para DLSS); puede brillar algo en rejas y hierba. Cuesta pocos FPS.",
+		          216, 190))
+			s.texture_sharpness = kTextureSharpness[current].id;
+		RowEnd(y);
+	}
+	LChoice("Reflejos", kReflections, kReflectionCount, s.reflections, "Reflejos del propio juego (agua, charcos, suelos): más pasos y más alcance en Ultra. Cuesta algo de GPU.");
+	LChoice("Desvanecimiento", kReflections, kReflectionCount, s.object_fade, "Distancia a la que los objetos lejanos se desvanecen. Ultra: aparecen de golpe mucho menos.");
+	LChoice("Nitidez del AA", kAaSharp, kAaSharpCount, s.aa_sharp, "Nitidez del antialiasing del juego. No cuesta FPS.");
+	{
+		// The game's post-processing (marked: as the game ships it), two to a row.
+		struct Post {
+			const char* label;
+			bool*       value;
+			const char* tip;
+		};
+		const Post post[] = {{"Desenfoque de movimiento", &s.motion_blur, "Desenfoque de movimiento del juego (Sí = como en PS5)."},
+		                     {"Profundidad de campo", &s.dof, "Desenfoque de lo lejano y de lo cercano en escenas (Sí = como en PS5)."},
+		                     {"Viñeta", &s.vignette, "Oscurecimiento de los bordes de la imagen (Sí = como en PS5)."},
+		                     {"Bloom", &s.bloom, "Resplandor alrededor de las luces fuertes (Sí = como en PS5)."},
+		                     {"Adaptación de la vista", &s.eye_adapt, "La exposición se adapta al pasar de zonas oscuras a claras, como el ojo (Sí = como en PS5)."}};
+		for (size_t i = 0; i < std::size(post); i += 2) {
+			const float y = RowY();
+			LCheck(y, post[i].label, *post[i].value, post[i].tip, 10);
+			if (i + 1 < std::size(post)) LCheck(y, post[i + 1].label, *post[i + 1].value, post[i + 1].tip, 216);
+			RowEnd(y, 30);
+		}
+	}
+	ResolveQualityAuto(&s, g_rt.pc);
+	LChoice("Iluminación IBL", kIbl, kIblCount, s.ibl, "Resolución de la iluminación de entorno (IBL) del juego: Completa = la del modo cine de PS5, más fina; Mitad = la del modo rendimiento. Con 4K empieza en Completa, con otras salidas en Mitad.");
+	LChoice("Teselado", kTess, kTessCount, s.tess, "Relieve por teselado del juego (suelos, muros, piedras): Bajo, Medio, Alto (el del modo cine de PS5), Ultra y Extremo (más relieve y más lejos; cuesta GPU). Con 4K empieza en Alto, con otras salidas en Medio.");
+	BoxEnd();
+}
+
+void LauncherRayTracing(Settings& s) {
+	BoxBegin("Ray tracing");
+	ImGui::BeginDisabled(s.pure_game);
+	const float fx = 154, fw = 252;
+	LRow("Reflejos RT", kRtReflLevelCount, kRtReflLevels, s.rt_ss_refl, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+	     "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Híbrido: Alto + rayos por hardware (RT real) solo donde el rayo de pantalla no encuentra nada. Necesita GPU con RT. Beta.",
+	     fx, fw);
+	LRow("Luz RT", kRtLightLevelCount, kRtLightLevels, s.rt_ssgi, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+	     "Iluminación por rayos sobre la imagen (luz rebotada y sombreado de contacto). Solo funciona con DLSS, XeSS o FSR. Cuesta FPS. Experimental.", fx, fw);
+	LRow("Luz volumétrica", kRtLevelCount, kRtLevels, s.godrays, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+	     "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms.", fx, fw);
+	LRow("Path tracing", kRtLevelCount, kRtLevels, s.ao, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+	     "Path tracing (RT por hardware: la escena TLAS de la GPU): rayos por píxel desde cada superficie que dan la oclusión real (también de lo que está fuera de pantalla o detrás de la cámara), un rebote de luz indirecta con el color de lo que tocan y sombras suaves de contacto hacia el sol y las antorchas. Sustituye solo la luz ambiental y a la oclusión del juego. Sin RT por hardware: oclusión de pantalla suave. Solo con DLSS, XeSS o FSR. Bajo 1 rayo a media resolución, Medio 1 rayo, Alto 2 rayos a resolución completa (~1-3 ms).",
+	     fx, fw);
+	LRow("Luz de antorchas RT", kTorchLevelCount, kTorchLevels, s.torch, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+	     "Luz de antorchas RT: el fuego de antorchas, braseros y hogueras ilumina paredes, suelos y estructuras cercanas con un rebote cálido que parpadea, y se refleja en superficies lisas o mojadas. No atraviesa paredes ni personajes. Solo en pantalla, sin RT por hardware. Solo con DLSS, XeSS o FSR. Bajo 2 fuegos ~0,3 ms, Medio 4 ~0,5 ms, Alto 8 ~0,9 ms. Híbrido: Alto + rayos por hardware (RT real) donde la pantalla no ve al que tapa la luz; solo oscurece, nunca añade luz. Necesita GPU con RT.",
+	     fx, fw);
+	{
+		std::string x = s.lens_flare ? "1" : "0";
+		if (LRow("Destellos de lente", kYesNoCount, kYesNo, x, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+		         "Destello de lente de antorchas y fuegos visibles: pequeños reflejos de la óptica, una estrella y una raya suaves. Desaparece si el fuego queda tapado y cerca de los bordes. Se dibuja antes del HUD. Solo con DLSS, XeSS o FSR. ~0,1 ms.",
+		         fx, fw))
+			s.lens_flare = x == "1";
+	}
+	LRow("Humo y partículas", kSmokeLevelCount, kSmokeLevels, s.smoke, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+	     "Humo y partículas más realistas sobre las del propio juego: Suave = el humo, la niebla de partículas y las chispas ya no cortan en línea dura donde tocan suelo y paredes (se funden en ~35 cm). Antorchas = además el humo cerca de antorchas y braseros brilla con su luz cálida (radio 4,5 m, sin parpadeo; necesita Luz de antorchas RT). Solo con DLSS, XeSS o FSR. ~0,3-0,6 ms.",
+	     fx, fw);
+	LRow("Sombras RT", kRtLevelCount, kRtLevels, s.rt_shadows, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+	     "Sombras del sol por rayos sobre la imagen (de pantalla, sin RT real): sombras de contacto que las del juego pierden (bajo brazos, entre piernas, junto a muros), con borde suave y estable. Solo donde el juego ya muestra sol. Solo con DLSS, XeSS o FSR. Bajo ~0,3 ms, Medio ~0,6 ms, Alto ~1 ms.",
+	     fx, fw);
+	ImGui::EndDisabled();
+	LCheckRow("RT por hardware (experimental)", s.rt_hw_exp,
+	          "Activa las opciones de trazado de rayos por hardware (Reflejos, Sombras sol y Antorchas por RT real). Experimental: puede tener fallos y cuesta mucha GPU y VRAM. Necesita GPU con RT.");
+	if (s.rt_hw_exp) {
+		ImGui::BeginDisabled(s.pure_game);
+		{
+			std::string x = s.rt_reflections ? "1" : "0";
+			if (LRow("Reflejos (RT real)", kYesNoCount, kYesNo, x, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+			         "Reflejos con trazado de rayos: refleja también lo que está fuera de pantalla o tapado, con sus texturas.", fx, fw))
+				s.rt_reflections = x == "1";
+		}
+		const bool sun_was = s.rt_sun;
+		{
+			std::string x = s.rt_sun ? "1" : "0";
+			if (LRow("Sombras sol (RT real)", kYesNoCount, kYesNo, x, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+			         "Sombras del sol con trazado de rayos: sombras de contacto y las que faltaban. No se puede usar a la vez que la Luz volumétrica ni las Sombras RT.",
+			         fx, fw))
+				s.rt_sun = x == "1";
+		}
+		{
+			std::string lamps = LampLevel(s);
+			if (LRow("Antorchas (RT real)", kRtLevelCount, kRtLevels, lamps, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+			         "Antorchas, lámparas, fuego y magia iluminan lo que tienen cerca con trazado de rayos y sombras reales. Bajo / Medio / Alto: más luces y más rayos.",
+			         fx, fw)) {
+				s.rt_lamps     = lamps;
+				s.rt_particles = lamps != "0";
+			}
+		}
+		// (vol25) Luz volumetrica / Sombras RT and Sombras sol share the engine's sun pass: choosing one turns the other off.
+		if (s.rt_sun && !sun_was) s.godrays = "0", s.rt_shadows = "0";
+		ImGui::EndDisabled();
+	}
+	if (s.rt_sun && s.rt_hw_exp && (s.godrays != "0" || s.rt_shadows != "0")) s.rt_sun = false;
+	LCheckRow("Juego original (sin efectos añadidos)", s.pure_game,
+	          "Apaga todos los efectos visuales que añade el emulador (ray tracing, luz volumétrica, sombras RT, oclusión, luz de antorchas, destellos, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, frame generation y latencia no cambian.");
+	BoxEnd();
+}
+
+void LauncherFrameGen(Settings& s) {
+	const bool nvidia = g_rt.pc.nvidia;
+	BoxBegin("Frame generation");
+	static std::vector<Choice> modes;
+	modes.clear();
+	for (const char* id: {"sin-fg", "amd-x2", "amd-x3", "amd-x4", "amd-dinamico", "dlss-x2", "dlss-x3", "dlss-x4", "dlss-dinamico"})
+		if (nvidia || std::strncmp(id, "dlss", 4) != 0) modes.push_back({id, FrameGenLabel(id)});
+	LRow("Frame generation", static_cast<int>(modes.size()), modes.data(), s.framegen, [](const Choice& c) { return c.id; },
+	     [](const Choice& c) { return c.label; }, "AMD: todas las graficas (tambien con reescalado DLSS). DLSS: NVIDIA RTX 40/50. FPS desbloqueados siempre.", 12,
+	     396, true);
+	if (s.framegen.rfind("dlss", 0) == 0) {
+		LChoice("Anti-Lag", kAntiLagDlssg, kAntiLagDlssgCount, s.antilag_dlssg,
+		        "Con la frame generation de NVIDIA (DLSS-G). Reflex: el de NVIDIA (recomendado). Anti-Lag / Ultra: el nuestro con Reflex apagado, para comparar cual va mejor.",
+		        124, 282);
+	} else if (s.framegen.rfind("amd", 0) == 0) {
+		std::string al = s.antilag_mode == "auto" || s.antilag_mode.empty() ? (g_rt.pc.amd ? "amd2" : "normal") : s.antilag_mode;
+		if (LChoice("Anti-Lag", g_rt.pc.amd ? kAntiLagAmd : kAntiLagOther, g_rt.pc.amd ? kAntiLagAmdCount : kAntiLagOtherCount, al,
+		            "Con la frame generation de AMD. Anti-Lag 2 (AMD): el de serie de las graficas AMD. Anti-Lag: el nuestro, como mucho 2 frames en cola antes de leer el mando. Ultra: 1 (aun menos retraso).",
+		            124, 282))
+			s.antilag_mode = al;
+	}
+	BoxEnd();
+}
+
+void LauncherDisplay(Settings& s) {
+	BoxBegin("Pantalla y otros");
+	{
+		const float y = RowY();
+		LCheck(y, "HDR", s.hdr, "HDR10: activa antes \"Usar HDR\" en la configuracion de pantalla de Windows", 12);
+		LCheck(y, "VSync", s.vsync, "VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando", 92);
+		LCheck(y, "G-Sync", s.gsync, "G-Sync / FreeSync: el emulador no ata su reloj a los Hz del monitor", 184);
+		static const Choice aspects[] = {{"16:9", "Monitor 16:9"}, {"21:9", "Monitor 21:9"}, {"32:9", "Monitor 32:9"}};
+		int current = 0;
+		for (int i = 0; i < 3; i++)
+			if (s.aspect == aspects[i].id) current = i;
+		const std::function<const char*(int)> list = [](int i) -> const char* { return aspects[i].label; };
+		if (Field("Monitor", y, 3, current, list,
+		          "Monitores panoramicos (ultrawide): el juego se dibuja a 21:9 o 32:9 en vez de estirarse. Funciona con DLSS, XeSS y FSR. Los videos y algunos menus se ven estirados.",
+		          280, 128))
+			s.aspect = aspects[current].id;
+		RowEnd(y);
+	}
+	{
+		static const Choice modes[] = {{"1", "Pantalla completa"}, {"0", "Ventana"}};
+		std::string mode = s.fullscreen ? "1" : "0";
+		if (LChoice("Modo de pantalla", modes, 2, mode, "Pantalla completa o ventana (F11 lo cambia en vivo).", 150, 256)) s.fullscreen = mode == "1";
+	}
+	LCheckRow("Mantener 16:9 (bandas negras)", s.aspect_fit, "Con un monitor panorámico: el juego en 16:9 con bandas negras a los lados en vez de estirarse.");
+	LChoice("Metricas", kMetrics, kMetricsCount, s.metrics, "Panel dentro del juego (F8 lo cambia en vivo): FPS, el modo de frame generation, latencia y el detalle.", 150, 256);
+	BoxEnd();
+}
+
+void LauncherConfigurator(Settings& s) {
+	BoxBegin("Configurador");
+	const float y = RowY() + U(2);
+	if (LButton("Optimizar según tu equipo", {g_lbox.at.x + U(12), y}, {U(396), U(34)}, false, g_font_semi, U(16),
+	            "Elige los ajustes con mejor rendimiento para tu gráfica, procesador, RAM y monitor (objetivo: 60 FPS o más) y los guarda en settings.ini. Cambia gráficos, ray tracing y la opción de 16 GB de RAM.")) {
+		g_cfg_why    = Optimize(g_rt.pc, &s);
+		s.configured = true;
+		Save();
+	}
+	RowEnd(y - U(2), 40);
+	if (!g_cfg_why.empty()) {
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), RowY()});
+		ImGui::BeginGroup();
+		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
+		ImGui::TextColored(kGoldL, "%s", I18n::T("Hemos elegido:"));
+		for (const auto& line: g_cfg_why) ImGui::BulletText("%s", line.c_str());
+		ImGui::PopTextWrapPos();
+		ImGui::EndGroup();
+	}
+	BoxEnd();
+}
+
+void LauncherPerformance(Settings& s) {
+	BoxBegin("Rendimiento / PC");
+	const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
+	{
+		const float y = RowY();
+		ImGui::BeginDisabled(!small);
+		LCheck(y, "Mejoras para equipos de 16 GB de RAM", s.ram16_boost,
+		       "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria). Solo en PCs de 20 GB de RAM o menos. No cambia los gráficos.");
+		ImGui::EndDisabled();
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(340), y + U(5)});
+		if (!small) ImGui::TextColored(kDim, I18n::T("RAM %d GB"), g_rt.pc.ram_gb);
+		else if (s.ram16_boost) ImGui::TextColored(kGoldL, "%s", I18n::T("RAM justa"));
+		Tip(small ? "RAM justa: perfil seguro. Cierra los navegadores mientras juegas." : "No hacen falta: solo en PCs de 20 GB de RAM o menos.");
+		RowEnd(y);
+	}
+	s.profile16 = LowRam(s, g_rt.pc);
+	{
+		const float y = RowY();
+		LCheck(y, "Simular 16 GB RAM", s.simulate_ram16, "Solo el juego: como mucho 12 GB en RAM (4 GB para Windows), el resto va al disco, como un PC de 16 GB.", 12);
+		LCheck(y, "Simular gráfica de 8 GB", s.simulate_vram8, "El juego solo puede usar 8 GB de VRAM, como una gráfica de 8 GB.", 216);
+		RowEnd(y);
+	}
+	{
+		const float y = RowY();
+		LCheck(y, "Modo GPU seguro", s.safe_gpu, "Para gráficas que se cuelgan o dan pantallazo azul: más estable, ~37% menos FPS.", 12);
+		LCheck(y, "Todos los CCD (Ryzen)", s.all_ccds, "Ryzen de dos CCD: No = el juego en el CCD con más caché L3 (más rápido); Sí = todos los núcleos.", 216);
+		RowEnd(y);
+	}
+	BoxEnd();
+}
+
+void LauncherControls(Settings& s) {
+	BoxBegin("Controles");
+	LCheckRow("Teclado y ratón", s.kbm,
+	          "Jugar con teclado y ratón: WASD para moverse, el ratón mueve la cámara, clic izquierdo R1, clic derecho L1, rueda o clic central fija objetivo. F7 suelta o captura el ratón. Con él activo la cámara gira sin la aceleración del juego, también con el stick derecho del mando: si juegas con mando, déjalo desactivado.");
+	ImGui::BeginDisabled(!s.kbm);
+	{
+		const float y = RowY();
+		LSlider(y, "Sensibilidad del ratón", s.kbm_sens, 0.05f, 4.0f, "%.2f", "Cuánto gira la cámara por cada movimiento del ratón (1.00 = normal).", 12, 190);
+		LSlider(y, "Antizona muerta", s.kbm_antidz, 0.0f, 0.5f, "%.2f",
+		        "Salta la zona muerta del stick del juego: con más, un movimiento pequeño del ratón ya gira la cámara. Si la cámara se mueve sola, bájalo.", 216, 190);
+		RowEnd(y, 58);
+	}
+	{
+		const float y   = RowY();
+		float       cam = static_cast<float>(s.kbm_camera);
+		if (LSlider(y, "Velocidad de cámara (ratón)", cam, 5.0f, 15.0f, "%.0f",
+		            "La velocidad máxima de giro de la cámara del juego con teclado y ratón. 10 = el máximo del menú del juego. 11-15 (extra, experimental): más rápido que el menú; si la cámara hace cosas raras, vuelve a 10.",
+		            12, 190))
+			s.kbm_camera = std::clamp(static_cast<int>(std::lround(cam)), 5, 15);
+		LCheck(y + U(20), "Cámara instantánea", s.kbm_warp,
+		       "Cámara instantánea (frame warp): la imagen gira con el ratón antes de que el juego dibuje el siguiente fotograma: la cámara responde al instante.", 216);
+		RowEnd(y, 58);
+	}
+	{
+		std::string cal = s.kbm_calibrate ? "1" : "0";
+		static const Choice cal_items[] = {{"0", "No"}, {"1", "En el próximo inicio"}};
+		if (LChoice("Calibrar cámara", cal_items, 2, cal,
+		            "Mide cómo gira la cámara del juego para que el ratón la mueva exactamente lo que se mueve (se guarda en kbm_curve.txt; una vez basta). Al iniciar: carga tu partida, quédate quieto en un sitio abierto sin tocar el ratón ni el stick; a los 3 s la cámara gira sola unos 13 s.",
+		            150, 256))
+			s.kbm_calibrate = cal == "1";
+	}
+	ImGui::EndDisabled();
+	{
+		const float y = RowY();
+		LCheck(y, "Vibración", s.rumble, "Vibración del mando.", 12);
+		ImGui::BeginDisabled(!s.rumble);
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(150), y + U(3)});
+		ImGui::SetNextItemWidth(U(256));
+		ImGui::SliderFloat("##rumble", &s.rumble_gain, 1.0f, 8.0f, I18n::T("Fuerza %.1f"));
+		Tip("Fuerza de la vibración del mando.");
+		ImGui::EndDisabled();
+		RowEnd(y);
+	}
+	{
+		const float y = RowY();
+		if (LButton(g_show_keys ? "Teclas  ^" : "Teclas  v", {g_lbox.at.x + U(12), y + U(2)}, {U(396), U(28)}, false, g_font_body, U(15),
+		            "Las teclas de teclado y ratón (se cambian en mapa_teclado de settings.ini)."))
+			g_show_keys = !g_show_keys;
+		RowEnd(y, 34);
+	}
+	if (g_show_keys) {
+		static const char* kDefault =
+		    "LeftStickUp=W;LeftStickDown=S;LeftStickLeft=A;LeftStickRight=D;Walk=Left Ctrl;R1=Mouse:Left;L1=Mouse:Right;R2=Shift+Mouse:Left;L2=Shift+Mouse:Right;R3=Mouse:Middle;R3=Mouse:WheelUp;R3=Mouse:WheelDown;Circle=Space;Square=E;Cross=F;Triangle=G;Left=Q;Right=R;Up=1;Down=2;Left=3;Right=4;Options=Tab;TouchPad=Backspace";
+		static const std::pair<const char*, const char*> names[] = {
+		    {"LeftStickUp", "Avanzar"}, {"LeftStickDown", "Retroceder"}, {"LeftStickLeft", "Izquierda"}, {"LeftStickRight", "Derecha"},
+		    {"Walk", "Caminar"}, {"R1", "R1 (ataque)"}, {"L1", "L1 (bloquear)"}, {"R2", "R2 (ataque fuerte)"}, {"L2", "L2 (parada)"},
+		    {"R3", "R3 (fijar objetivo)"}, {"Circle", "Círculo (rodar / correr)"}, {"Square", "Cuadrado (objeto)"}, {"Cross", "Cruz (acción)"},
+		    {"Triangle", "Triángulo (cambiar agarre)"}, {"Left", "Izquierda cruceta"}, {"Right", "Derecha cruceta"}, {"Up", "Arriba cruceta"},
+		    {"Down", "Abajo cruceta"}, {"Options", "Menú"}, {"TouchPad", "Panel táctil"}};
+		const std::string map = s.kbm_map.empty() ? std::string(kDefault) : s.kbm_map;
+		size_t            at  = 0;
+		while (at <= map.size()) {
+			const size_t      end  = std::min(map.find(';', at), map.size());
+			const std::string item = map.substr(at, end - at);
+			at                     = end + 1;
+			const size_t eq        = item.find('=');
+			if (eq == std::string::npos) continue;
+			const std::string c     = item.substr(0, eq);
+			std::string       shown = c;
+			for (const auto& [k, v]: names)
+				if (c == k) shown = I18n::T(v);
+			const float y = RowY();
+			ImGui::SetCursorScreenPos({g_lbox.at.x + U(16), y});
+			ImGui::TextUnformatted(shown.c_str());
+			ImGui::SetCursorScreenPos({g_lbox.at.x + U(230), y});
+			ImGui::TextColored(kGoldL, "%s", item.substr(eq + 1).c_str());
+			RowEnd(y, 22);
+		}
+	}
+	{
+		const float y = RowY();
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(4)});
+		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
+		ImGui::TextColored(kDim, "%s", I18n::T("En el juego: F1 guardar y salir (o R3 + OPTIONS).  F7: soltar o capturar el ratón.  F8: métricas.  F11 / Alt+Intro: pantalla completa."));
+		ImGui::PopTextWrapPos();
+		ImGui::Dummy({0, U(4)});
+	}
+	BoxEnd();
+}
+
+void LauncherPcCard() {
+	BoxBegin("TU EQUIPO", 420, true);
+	const auto& pc   = g_rt.pc;
+	const float wrap = g_lbox.at.x + g_lbox.w * 0.70f - ImGui::GetWindowPos().x;
+	const auto  put  = [&](const char* caption, const std::string& value, const ImVec4& color, bool big) {
+        ImGui::SetCursorScreenPos({g_lbox.at.x + U(16), RowY()});
+        ImGui::BeginGroup();
+        ImGui::PushFont(g_font_semi, U(14));
+        ImGui::TextColored(ImVec4 {0.80f, 0.76f, 0.70f, 1.0f}, "%s", I18n::T(caption));
+        ImGui::PopFont();
+        ImGui::PushFont(big ? g_font_semi : g_font_body, U(big ? 17 : 15));
+        ImGui::PushTextWrapPos(wrap);
+        ImGui::TextColored(color, "%s", value.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::PopFont();
+        ImGui::EndGroup();
+        ImGui::Dummy({0, U(5)});
+	};
+	const ImVec4 red {0.92f, 0.35f, 0.31f, 1.0f};
+	std::string  gpu = pc.gpu.empty() ? std::string(I18n::T("no detectada")) : pc.gpu;
+	if (pc.vram > 0) gpu += "  (" + std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB)";
+	if (!pc.nvidia && !pc.gpu.empty()) gpu += I18n::T("  (sin DLSS: solo NVIDIA)");
+	put("Gráfica", gpu, kInkL, true);
+	put("Procesador y RAM", (pc.cpu.empty() ? std::string("?") : pc.cpu) + "  |  " + std::to_string(pc.ram_gb) + " GB RAM", kInkL, false);
+	if (!pc.recommended.empty()) {
+		put("Modo recomendado", pc.recommended, pc.unsupported ? red : kGoldL, true);
+		put("Esperado (estimación)", pc.expected, pc.unsupported ? red : kInkL, false);
+	} else {
+		put("Modo recomendado", I18n::T("Gráfica sin datos: pulsa Optimizar según tu equipo y mira las métricas."), kInkL, false);
+	}
+	ImGui::SetCursorScreenPos({g_lbox.at.x + U(16), RowY()});
+	ImGui::TextColored(kDim, I18n::T("Versión instalada: %s"), Update::CurrentVersion());
+	BoxEnd();
+}
+
+// The rows of the Ajustes panel: FPS cap, the languages and the copy of the saves.
+void LauncherMoreSettings(Settings& s) {
+	{
+		static const Choice caps[] = {{"0", "Auto (bajo el refresco)"}, {"60", "60"}, {"90", "90"}, {"120", "120"}, {"144", "144"}, {"165", "165"}, {"224", "224"}};
+		std::string cap = s.fps_cap > 0 ? std::to_string(static_cast<int>(s.fps_cap)) : "0";
+		if (LChoice("Tope de FPS", caps, 7, cap, "Tope de FPS con G-Sync sin frame generation.", 150, 256)) s.fps_cap = static_cast<float>(std::atof(cap.c_str()));
+	}
+	{
+		std::vector<Choice> langs;
+		for (int i = 0; i < I18n::kMenuLanguageCount; i++) langs.push_back({I18n::kMenuLanguages[i], I18n::kMenuLanguageNames[i]});
+		if (s.menu_language.empty()) s.menu_language = "es";
+		if (LChoice("Idioma del menu", langs.data(), static_cast<int>(langs.size()), s.menu_language, "Idioma de este lanzador y de los mensajes del port.", 150, 256)) {
+			I18n::SetLanguage(s.menu_language);
+			// (The game's language follows the menu's until it is chosen on its own.)
+			if (!s.game_language_set) s.language = I18n::GameLanguageFor(s.menu_language);
+		}
+	}
+	{
+		std::string lang = std::to_string(s.language);
+		if (LChoice("Idioma", kLanguages, kLanguageCount, lang, "Idioma del juego (textos y voces).", 150, 256)) {
+			s.language          = std::atoi(lang.c_str());
+			s.game_language_set = true;
+		}
+	}
+	LCheckRow("Copia de las partidas al arrancar", s.backup_saves, "Copia _SaveData en _SaveData-copias cada vez que pulsas JUGAR.");
+}
+
+// Ajustes (the launcher's Settings panel, left of the column): the game's folder and Add to Steam.
+void LauncherSettingsPanel(Settings& s, float px, float height) {
+	const float w = std::max(U(420), std::min(U(610), px - U(464)));
+	ImGui::SetNextWindowPos({std::max(U(454), px - w - U(10)), height - U(84)}, ImGuiCond_Always, {0.0f, 1.0f});
+	ImGui::SetNextWindowSize({w, 0});
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.04f, 0.055f, 0.93f});
+	ImGui::Begin("##settings", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+	ImGui::PushFont(g_font_serif, U(20));
+	ImGui::TextColored(kGoldL, "%s", I18n::T("Carpeta del juego volcado (PPSA01341)"));
+	ImGui::PopFont();
+	ImGui::SameLine(w - U(48));
+	if (ImGui::SmallButton("X##close")) g_show_settings = false;
+	const bool valid = !g_rt.is_game || g_rt.is_game(s.game);
+	ImGui::PushTextWrapPos(0.0f);
+	ImGui::TextColored(valid ? kInkL : kWarn, "%s", s.game.empty() ? I18n::T("(sin elegir)") : s.game.c_str());
+	ImGui::PopTextWrapPos();
+	if (!valid) ImGui::TextColored(kWarn, "%s", I18n::T("(no valida: JUGAR te la pide)"));
+	if (ImGui::Button(I18n::T("Cambiar..."), {U(200), U(34)}) && g_rt.pick_folder) {
+		const std::string picked = g_rt.pick_folder();
+		if (!picked.empty() && (!g_rt.is_game || g_rt.is_game(picked))) {
+			s.game = picked;
+			Save();
+			g_status = "Guardado en settings.ini";
+		} else if (!picked.empty()) {
+			g_status = "Esa carpeta no tiene eboot.bin ni sce_sys: elige la carpeta del juego volcado.";
+		}
+	}
+	Tip("La carpeta con el juego volcado (la que tiene eboot.bin y sce_sys).");
+	ImGui::SameLine();
+	ImGui::BeginDisabled(g_steam_busy.load());
+	if (ImGui::Button(I18n::T("Añadir a Steam"), {U(200), U(34)})) {
+		g_steam_busy = true;
+		{
+			std::scoped_lock lock(g_steam_mutex);
+			g_steam_text = I18n::T("Añadiendo a Steam...");
+		}
+		std::thread([] {
+			std::string report;
+			const bool  ok = Steam::AddToSteam(g_rt.exe_path, &report);
+			std::scoped_lock lock(g_steam_mutex);
+			g_steam_text = (ok ? "OK: " : "ERROR: ") + report;
+			g_steam_busy = false;
+		}).detach();
+	}
+	ImGui::EndDisabled();
+	Tip("Anade \"Demon's Souls\" a la biblioteca de Steam como juego externo (con icono e imagenes). Mejor con Steam cerrado; si esta abierto, reinicialo para que aparezca.");
+	{
+		std::scoped_lock lock(g_steam_mutex);
+		ImGui::PushTextWrapPos(0.0f);
+		if (!g_steam_text.empty()) ImGui::TextUnformatted(g_steam_text.c_str());
+		else ImGui::TextColored(kDim, "%s", I18n::T("Steam debe cerrarse antes o reiniciarse después para que aparezca el acceso."));
+		ImGui::PopTextWrapPos();
+	}
+	if (!g_status.empty()) ImGui::TextColored(kDim, "%s", I18n::T(g_status.c_str()));
+	ImGui::Spacing();
+	ImGui::Separator();
+	{
+		// (The rows placed as in the column's groups: from this panel's left edge.)
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), 0});
+		g_lbox.at = {ImGui::GetCursorScreenPos().x - U(2), ImGui::GetCursorScreenPos().y + U(4)};
+		g_lbox.w  = w - U(28);
+		ImGui::SetCursorScreenPos(g_lbox.at);
+		ImGui::Dummy({0, 0});
+		LauncherMoreSettings(s);
+		ImGui::PopStyleVar();
+	}
+	ImGui::End();
+	ImGui::PopStyleColor();
+}
+
+// Actualizar version / Volver a la version anterior: their dialog (the network and the copy on a worker thread).
+void LauncherUpdatePanel(float px) {
+	UpdateUi::State state;
+	std::string     text;
+	{
+		std::scoped_lock lock(g_upd.mutex);
+		state = g_upd.state;
+		text  = g_upd.text;
+	}
+	if (state == UpdateUi::Idle) return;
+	const float w = U(610);
+	ImGui::SetNextWindowPos({std::max(U(8), px - w - U(10)), U(60)});
+	ImGui::SetNextWindowSize({w, 0});
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.04f, 0.055f, 0.95f});
+	ImGui::Begin("##update", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+	ImGui::PushFont(g_font_serif, U(20));
+	ImGui::TextColored(kGoldL, "%s", I18n::T(state == UpdateUi::Choosing || state == UpdateUi::Confirming ? "Volver a la version anterior" : "Actualizar version"));
+	ImGui::PopFont();
+	ImGui::TextColored(kDim, I18n::T("Version instalada: %s"), Update::CurrentVersion());
+	ImGui::PushTextWrapPos(0.0f);
+	if (!text.empty()) ImGui::TextUnformatted(text.c_str());
+	ImGui::PopTextWrapPos();
+	const bool  busy = g_upd.busy.load();
+	const float bh   = U(36);
+	if (state == UpdateUi::Checking || (state == UpdateUi::Working && g_upd.total.load() <= 0))
+		ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), {-1, U(10)}, "");
+	if (state == UpdateUi::Available) {
+		ImGui::BeginDisabled(busy);
+		if (ImGui::Button((std::string(I18n::T("Actualizar a ")) + g_upd.release.tag).c_str(), {U(300), bh})) StartWorker(InstallWork);
+		ImGui::EndDisabled();
+		ImGui::SameLine();
+	}
+	if (state == UpdateUi::Working && g_upd.total.load() > 0 && text.rfind("Descargando", 0) == 0) {
+		const float f = static_cast<float>(static_cast<double>(g_upd.done.load()) / static_cast<double>(g_upd.total.load()));
+		char        label[64];
+		std::snprintf(label, sizeof(label), "%.0f / %.0f MB", g_upd.done.load() / 1048576.0, g_upd.total.load() / 1048576.0);
+		ImGui::ProgressBar(f, {-1, 0}, label);
+		if (ImGui::Button(I18n::T("Cancelar"), {U(160), bh})) g_upd.cancel = true;
+	}
+	if (state == UpdateUi::Choosing || state == UpdateUi::Confirming) {
+		std::scoped_lock lock(g_upd.mutex);
+		for (int i = 0; i < static_cast<int>(g_upd.backups.size()); i++) {
+			if (ImGui::Selectable(g_upd.backups[i].version.c_str(), g_upd.chosen == i)) {
+				g_upd.chosen = i;
+				g_upd.state  = UpdateUi::Confirming;
+				g_upd.text   = "Se restaura la version " + g_upd.backups[i].version +
+				             ". Los archivos actuales del motor se guardan antes en _backup_update (se puede deshacer). La cache de shaders, las partidas, los seeds y los ajustes no se tocan.";
+			}
+		}
+	}
+	if (state == UpdateUi::Confirming) {
+		ImGui::BeginDisabled(busy);
+		if (ImGui::Button(I18n::T("Restaurar"), {U(200), bh})) StartWorker(RestoreWork);
+		ImGui::EndDisabled();
+		ImGui::SameLine();
+	}
+	if (state != UpdateUi::Working && state != UpdateUi::Checking) {
+		if (ImGui::Button(I18n::T("Cerrar"), {U(160), bh})) SetUpd(UpdateUi::Idle, "");
+	}
+	ImGui::End();
+	ImGui::PopStyleColor();
+}
+
+// Trofeos (bottom left): the button with the count and %, and the list above it when open.
+void LauncherTrophies(float height) {
+	static std::vector<TrophyRow> rows;
+	static double                 loaded_at = -100.0;
+	if (ImGui::GetTime() - loaded_at > 3.0) {
+		rows      = LoadTrophyRows();
+		loaded_at = ImGui::GetTime();
+		std::stable_sort(rows.begin(), rows.end(), [](const TrophyRow& a, const TrophyRow& b) { return a.earned && !b.earned; });
+	}
+	auto points = [](int g) { return g == 1 ? 300 : g == 2 ? 90 : g == 3 ? 30 : g == 4 ? 15 : 0; };
+	int  total = 0, have = 0, earned = 0;
+	for (const auto& r: rows) {
+		total += points(r.grade);
+		if (r.earned) {
+			have += points(r.grade);
+			earned++;
+		}
+	}
+	const int   pct = total > 0 ? have * 100 / total : 0;
+	char        title[128];
+	if (!rows.empty()) std::snprintf(title, sizeof(title), "%s   %d / %d   (%d%%)  %s", I18n::T("Trofeos"), earned, static_cast<int>(rows.size()), pct, g_show_trophies ? "^" : "v");
+	else std::snprintf(title, sizeof(title), "%s  %s", I18n::T("Trofeos"), g_show_trophies ? "^" : "v");
+	const ImVec2 at {U(24), height - U(70)};
+	ImGui::SetCursorScreenPos(at);
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.094f, 0.11f, 0.15f, 0.85f});
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.17f, 0.20f, 0.25f, 0.92f});
+	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.43f, 0.43f, 0.39f, 1.0f});
+	ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, {0.0f, 0.5f});
+	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {U(50), U(4)});
+	ImGui::PushFont(g_font_semi, U(17));
+	if (ImGui::Button((std::string(title) + "###trophies").c_str(), {U(420), U(46)})) g_show_trophies = !g_show_trophies;
+	ImGui::PopFont();
+	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(3);
+	Libs::Trophy::DrawCup(ImGui::GetWindowDrawList(), at.x + U(10), at.y + U(8), U(30), Libs::Trophy::CupColor(2));
+	if (!g_show_trophies) return;
+	const float lh = U(360);
+	ImGui::SetCursorScreenPos({at.x, at.y - U(6) - lh});
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.055f, 0.063f, 0.086f, 0.94f});
+	ImGui::BeginChild("##trophylist", {U(420), lh}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+	if (rows.empty()) {
+		ImGui::TextWrapped("%s", I18n::T("Aún no hay trofeos: aparecen al jugar."));
+	} else {
+		ImGui::TextColored(kGoldL, I18n::T("%d%% completado   -   %d / %d"), pct, earned, static_cast<int>(rows.size()));
+		ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4 {0.80f, 0.63f, 0.30f, 1.0f});
+		ImGui::ProgressBar(total > 0 ? static_cast<float>(have) / static_cast<float>(total) : 0.0f, {-1.0f, U(8)}, "");
+		ImGui::PopStyleColor();
+		static const ImVec4 grade_col[5] = {{0.6f, 0.6f, 0.6f, 1.0f}, {0.67f, 0.78f, 0.92f, 1.0f}, {0.93f, 0.77f, 0.28f, 1.0f},
+		                                    {0.78f, 0.80f, 0.83f, 1.0f}, {0.80f, 0.50f, 0.27f, 1.0f}};
+		static const char*  grade_txt[5] = {"", "Platino", "Oro", "Plata", "Bronce"};
+		for (const auto& r: rows) {
+			const int  g      = r.grade >= 1 && r.grade <= 4 ? r.grade : 0;
+			const bool secret = r.hidden && !r.earned;
+			ImGui::PushID(r.id);
+			ImGui::TextColored(r.earned ? grade_col[g] : ImVec4 {0.42f, 0.42f, 0.42f, 1.0f}, "%-8s", I18n::T(grade_txt[g]));
+			ImGui::SameLine(U(100));
+			ImGui::TextColored(r.earned ? kInkL : ImVec4 {0.45f, 0.45f, 0.45f, 1.0f}, "%s", secret ? I18n::T("Trofeo oculto") : r.name.c_str());
+			if (!secret) Tip(r.detail.c_str());
+			ImGui::PopID();
+		}
+	}
+	ImGui::EndChild();
+	ImGui::PopStyleColor();
+}
+
+void DrawLauncher(float width, float height) {
+	DrainInputs();
+	EnsureBackground();
+	if (!g_knight_tried) {
+		g_knight_tried = true;
+		g_knight       = LoadTexture(g_rt.exe_dir + "caballero-espada.png", &g_knight_w, &g_knight_h);
+	}
+	// The scale: 880 wide at 1080 lines (the launcher's pixels), the column at most 70 % of the width.
+	g_unit = std::clamp(height / 1080.0f, 0.55f, 3.0f);
+	if (U(880) > width * 0.70f) g_unit = std::max(0.45f, width * 0.70f / 880.0f);
+	const float px = width - U(880);
+	auto*       bg = ImGui::GetBackgroundDrawList();
+	bg->AddRectFilled({0, 0}, {width, height}, IM_COL32(14, 16, 22, 255));
+	if (g_background != nullptr && g_bg_w > 0 && g_bg_h > 0) {
+		// Cover the window, centered (what does not fit is cut at the sides or at the top and bottom).
+		const float scale = std::max(width / g_bg_w, height / g_bg_h);
+		const float w = g_bg_w * scale, h = g_bg_h * scale;
+		bg->AddImage(g_background->GetTexRef(), {(width - w) * 0.5f, (height - h) * 0.5f}, {(width + w) * 0.5f, (height + h) * 0.5f});
+	}
+	// Darker towards the bottom (Trofeos) and the column (the art stays bright on the left).
+	bg->AddRectFilledMultiColor({0, height * 0.55f}, {px, height}, IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 150),
+	                            IM_COL32(0, 0, 0, 150));
+	bg->AddRectFilledMultiColor({px - U(160), 0}, {px, height}, IM_COL32(0, 0, 0, 0), IM_COL32(4, 5, 8, 150), IM_COL32(4, 5, 8, 150),
+	                            IM_COL32(0, 0, 0, 0));
+	bg->AddRectFilled({px, 0}, {width, height}, IM_COL32(8, 10, 14, 205));
+	bg->AddLine({px, 0}, {px, height}, IM_COL32(222, 196, 140, 90), 1.0f);
+
+	auto& io = ImGui::GetIO();
+#if defined(NDEBUG)
+	io.ConfigErrorRecoveryEnableTooltip = false;
+	io.ConfigErrorRecoveryEnableAssert  = false;
+#endif
+	ImGuiContext& ctx           = *ImGui::GetCurrentContext();
+	const int     colors_before = ctx.ColorStack.Size, vars_before = ctx.StyleVarStack.Size;
+	ImGui::PushFont(g_font_body, U(16));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {U(16), U(14)});
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), U(6)});
+	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {U(6), U(3)});
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, U(3));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, U(6));
+	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, U(4));
+	ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, U(12));
+	ImGui::PushStyleColor(ImGuiCol_Text, kInkL);
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.04f, 0.055f, 0.93f});
+	ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4 {0.094f, 0.10f, 0.13f, 0.98f});
+	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.87f, 0.77f, 0.55f, 0.40f});
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4 {0.094f, 0.10f, 0.13f, 1.0f});
+	ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4 {0.16f, 0.17f, 0.22f, 1.0f});
+	ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4 {0.20f, 0.21f, 0.27f, 1.0f});
+	ImGui::PushStyleColor(ImGuiCol_CheckMark, kGoldL);
+	ImGui::PushStyleColor(ImGuiCol_SliderGrab, kGoldL);
+	ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4 {1.0f, 0.88f, 0.62f, 1.0f});
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.094f, 0.11f, 0.15f, 0.85f});
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.17f, 0.20f, 0.25f, 0.92f});
+	ImGui::PushStyleColor(ImGuiCol_Header, ImVec4 {0.24f, 0.25f, 0.31f, 1.0f});
+	ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4 {0.55f, 0.43f, 0.22f, 0.80f});
+	ImGui::PushStyleColor(ImGuiCol_NavCursor, kGoldL);
+	ImGui::PushStyleColor(ImGuiCol_PlotHistogram, kGoldL);
+
+	Settings& s = g_edit;
+	// Esc closes the launcher (as Salir), or first the panel or list that is open.
+	if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !g_popup.load()) {
+		if (g_show_settings) g_show_settings = false;
+		else if (g_upd.state != UpdateUi::Idle && !g_upd.busy.load()) SetUpd(UpdateUi::Idle, "");
+		else g_start_result = -1;
+	}
+
+	// The whole window: the X left of the column and Trofeos at the bottom left.
+	ImGui::SetNextWindowPos({0, 0});
+	ImGui::SetNextWindowSize({width, height});
+	ImGui::Begin("##launcher-back", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+	                                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus |
+	                                             ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoFocusOnAppearing);
+	{
+		const ImVec2 at {px - U(56), U(8)};
+		ImGui::SetCursorScreenPos(at);
+		const bool  close = ImGui::InvisibleButton("##close", {U(48), U(40)});
+		const bool  hot   = ImGui::IsItemHovered();
+		auto*       dl    = ImGui::GetWindowDrawList();
+		dl->AddRectFilled(at, {at.x + U(48), at.y + U(40)}, hot ? IM_COL32(180, 40, 40, 230) : IM_COL32(14, 16, 22, 220), U(3));
+		const float c = U(8);
+		const ImVec2 m {at.x + U(24), at.y + U(20)};
+		dl->AddLine({m.x - c, m.y - c}, {m.x + c, m.y + c}, ImGui::GetColorU32(kGoldL), U(2.2f));
+		dl->AddLine({m.x - c, m.y + c}, {m.x + c, m.y - c}, ImGui::GetColorU32(kGoldL), U(2.2f));
+		Tip("Cerrar el lanzador (Esc)");
+		if (close) g_start_result = -1;
+	}
+	LauncherTrophies(height);
+	ImGui::End();
+
+	// The column: two columns of groups, scrolled with the wheel when the screen is short.
+	ImGui::SetNextWindowPos({px, 0});
+	ImGui::SetNextWindowSize({U(880), height});
+	if (g_focus_once) ImGui::SetNextWindowFocus();
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+	ImGui::Begin("##launcher-column", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+	                                               ImGuiWindowFlags_NoSavedSettings);
+	ImGui::PopStyleVar();
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), 0});
+	const ImVec2 origin = ImGui::GetCursorScreenPos();
+	// Left: Imagen, Calidad grafica, Ray tracing.
+	ImGui::SetCursorScreenPos({origin.x + U(10), origin.y + U(10)});
+	ImGui::BeginGroup();
+	LauncherImage(s);
+	LauncherQuality(s);
+	LauncherRayTracing(s);
+	ImGui::EndGroup();
+	const float left_bottom = ImGui::GetItemRectMax().y;
+	// Right: Frame generation, Pantalla y otros, Configurador, Rendimiento / PC, the buttons, Controles, TU EQUIPO, PayPal.
+	ImGui::SetCursorScreenPos({origin.x + U(450), origin.y + U(10)});
+	ImGui::BeginGroup();
+	LauncherFrameGen(s);
+	LauncherDisplay(s);
+	LauncherConfigurator(s);
+	LauncherPerformance(s);
+	{
+		g_lbox.at = {origin.x + U(450), RowY()};
+		g_lbox.w  = U(420);
+		const float y   = RowY() + U(4);
+		const auto  v   = Precompile::State();
+		g_focus_once = false;
+		if (LButton(v.running && !v.playable ? "JUGAR (sin esperar)" : "JUGAR", {g_lbox.at.x, y}, {U(420), U(58)}, true, g_font_serif, U(30),
+		            v.running ? "Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez). Sin ella, el juego compila shaders al jugar (tirones)."
+		                      : "Guarda los ajustes en settings.ini y empieza el juego.")) {
+			// (No game folder: the picker at once; a valid one chosen, saved and played.)
+			bool ok = !g_rt.is_game || g_rt.is_game(s.game);
+			if (!ok && g_rt.pick_folder) {
+				const std::string picked = g_rt.pick_folder();
+				if (!picked.empty() && g_rt.is_game(picked)) {
+					s.game = picked;
+					ok     = true;
+				} else if (!picked.empty()) {
+					g_status        = "Esa carpeta no tiene eboot.bin ni sce_sys: elige la carpeta del juego volcado.";
+					g_show_settings = true;
+				}
+			}
+			if (ok) {
+				Save();
+				g_start_result = 1;
+			}
+		}
+		RowEnd(y - U(4), 66);
+		// (ds-pc-port8) Where JUGAR continues: the F1 save and quit.
+		{
+			const float       ry   = RowY();
+			const std::string when = Resume::Summary(g_rt.exe_path.parent_path());
+			LCheck(ry, "Continuar donde lo dejé (F1)", s.continue_f1,
+			       "En el juego, F1 (o R3 + OPTIONS) guarda y cierra. Con esto marcado, JUGAR pasa solo la pantalla de título y carga la partida en el sitio donde pulsaste F1.",
+			       0);
+			RowEnd(ry, 28);
+			if (!when.empty() && s.continue_f1) {
+				const float wy = RowY();
+				ImGui::SetCursorScreenPos({g_lbox.at.x + U(4), wy});
+				ImGui::PushTextWrapPos(g_lbox.at.x + U(420) - ImGui::GetWindowPos().x);
+				ImGui::PushFont(g_font_body, U(14));
+				char line[256];
+				std::snprintf(line, sizeof(line), I18n::T("Partida guardada con F1 el %s: JUGAR continúa allí."), when.c_str());
+				ImGui::TextColored(kGoldL, "%s", line);
+				ImGui::PopFont();
+				ImGui::PopTextWrapPos();
+				const float wend = ImGui::GetItemRectMax().y;
+				RowEnd(wy, (wend - wy) / g_unit + 4);
+			}
+		}
+		// The shaders' preparation (precompile): its state, bar and button.
+		{
+			const auto  pv = Precompile::State();
+			const float sy = RowY();
+			float       ty = sy;
+			if (pv.running) {
+				char label[64];
+				if (pv.total > 0) std::snprintf(label, sizeof(label), "%d / %d", pv.done, pv.total);
+				ImGui::SetCursorScreenPos({g_lbox.at.x, sy});
+				ImGui::ProgressBar(pv.total > 0 ? static_cast<float>(pv.done) / static_cast<float>(pv.total) : -1.0f * static_cast<float>(ImGui::GetTime()),
+				                   {U(420), U(18)}, pv.total > 0 ? label : "");
+				ty = sy + U(22);
+			}
+			ImGui::SetCursorScreenPos({g_lbox.at.x, ty});
+			ImGui::PushFont(g_font_body, U(14));
+			ImGui::PushTextWrapPos(g_lbox.at.x + U(290) - ImGui::GetWindowPos().x);
+			ImGui::TextColored(pv.failed ? kWarn : (pv.finished ? kGoldL : kDim), "%s",
+			                   pv.text.empty() ? I18n::T("Shaders: la cache de esta grafica ya esta preparada.") : I18n::T(pv.text.c_str()));
+			ImGui::PopTextWrapPos();
+			ImGui::PopFont();
+			const float text_end = ImGui::GetItemRectMax().y;
+			if (pv.running) {
+				if (LButton("Detener", {g_lbox.at.x + U(300), ty}, {U(120), U(28)}, false, g_font_body, U(14),
+				            "Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez)."))
+					std::thread([] { Precompile::Stop(); }).detach();
+			} else if (!pv.finished) {
+				if (LButton("Preparar shaders", {g_lbox.at.x + U(300), ty}, {U(120), U(28)}, false, g_font_body, U(14),
+				            "Compila ya todos los pipelines del juego para esta grafica (evita tirones la primera vez)."))
+					Precompile::Start();
+			}
+			RowEnd(sy, std::max(text_end, ty + U(30)) / g_unit - sy / g_unit + 6);
+		}
+		const float by = RowY();
+		ImGui::BeginDisabled(g_upd.busy.load());
+		if (LButton("Actualizar version", {g_lbox.at.x, by}, {U(205), U(44)}, false, g_font_semi, U(15),
+		            "Busca en GitHub la ultima version publicada del port (DemonsSoulsPC) y la instala en esta misma carpeta. Nunca baja de version. Los archivos actuales del motor se guardan en _backup_update; la cache de shaders, las partidas, los seeds y los ajustes no se tocan."))
+			OpenCheck();
+		if (LButton("Volver a la version anterior", {g_lbox.at.x + U(215), by}, {U(205), U(44)}, false, g_font_semi, U(14),
+		            "Vuelve a una version guardada en _backup_update. La actual se guarda antes (se puede deshacer). La cache de shaders, las partidas, los seeds y los ajustes no se tocan."))
+			OpenRestore();
+		ImGui::EndDisabled();
+		RowEnd(by, 52);
+		const float sy2 = RowY();
+		if (LButton("Ajustes", {g_lbox.at.x, sy2}, {U(205), U(44)}, false, g_font_semi, U(16), "La carpeta del juego y Añadir a Steam."))
+			g_show_settings = !g_show_settings;
+		if (LButton("Salir", {g_lbox.at.x + U(215), sy2}, {U(205), U(44)}, false, g_font_semi, U(16), "Cierra el lanzador sin jugar (Esc).")) g_start_result = -1;
+		RowEnd(sy2, 54);
+		const float cy = RowY();
+		if (LButton(g_show_controls ? "Controles  ^" : "Controles  v", {g_lbox.at.x, cy}, {U(420), U(40)}, false, g_font_semi, U(16),
+		            "Teclado y ratón, sensibilidad, cámara y vibración."))
+			g_show_controls = !g_show_controls;
+		RowEnd(cy, 48);
+	}
+	if (g_show_controls) LauncherControls(s);
+	LauncherPcCard();
+	{
+		// (The launcher's donation link: PayPal's page opens in the browser; nothing is sent from here.)
+		g_lbox.at        = {origin.x + U(450), RowY()};
+		g_lbox.w         = U(420);
+		const float      y    = RowY() + U(2);
+		const char*      text = I18n::T("\xE2\x99\xA5  Dona tu alma  -  PayPal: todojuegos67@gmail.com");
+		ImGui::PushFont(g_font_semi, U(15));
+		const ImVec2 ts = ImGui::CalcTextSize(text);
+		ImGui::SetCursorScreenPos({g_lbox.at.x + (U(420) - ts.x) * 0.5f, y});
+		ImGui::TextColored(kGoldL, "%s", text);
+		ImGui::PopFont();
+		if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+		if (ImGui::IsItemClicked()) OpenUrl("https://www.paypal.com/donate?business=todojuegos67%40gmail.com&currency_code=EUR");
+		Tip("Si te gusta el proyecto, puedes donar por PayPal. Gracias, portador de la maldición.");
+		RowEnd(y, 34);
+	}
+	ImGui::EndGroup();
+	const float right_bottom = ImGui::GetItemRectMax().y;
+	ImGui::SetCursorScreenPos({origin.x, std::max(left_bottom, right_bottom) + U(16)});
+	ImGui::Dummy({U(880), 0});
+	ImGui::PopStyleVar();
+	ImGui::End();
+
+	if (g_show_settings) LauncherSettingsPanel(s, px, height);
+	LauncherUpdatePanel(px);
+
+	g_popup = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
+	if (ctx.ColorStack.Size > colors_before) ImGui::PopStyleColor(ctx.ColorStack.Size - colors_before);
+	if (ctx.StyleVarStack.Size > vars_before) ImGui::PopStyleVar(ctx.StyleVarStack.Size - vars_before);
+	ImGui::PopFont();
+	Bump();
+}
+
 bool WantsOverlay() {
-	return g_open.load(std::memory_order_relaxed);
+	return g_open.load(std::memory_order_relaxed) || Resume::SaveAndQuitActive();
+}
+
+// (ds-pc-port8) In the game: F1's save and quit, a panel in the middle of the screen until the game closes.
+void DrawInGame(float width, float height) {
+	if (!Resume::SaveAndQuitActive()) return;
+	const float unit = std::max(std::min(width / 1920.0f, height / 1080.0f), 0.5f);
+	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, 150));
+	ImFont* font = FindFont("segoeui");
+	ImGui::PushFont(font, 28.0f * unit);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {36 * unit, 28 * unit});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8 * unit);
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.03f, 0.035f, 0.92f});
+	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.87f, 0.77f, 0.55f, 0.55f});
+	ImGui::SetNextWindowPos({width * 0.5f, height * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
+	ImGui::SetNextWindowSize({std::min(820 * unit, width - 32), 0}, ImGuiCond_Always);
+	ImGui::Begin("##SaveQuit", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+	                                         ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs);
+	ImGui::PushFont(nullptr, 40.0f * unit);
+	ImGui::TextColored(kGold, "%s", I18n::T("Guardar y salir"));
+	ImGui::PopFont();
+	ImGui::Separator();
+	ImGui::PushTextWrapPos(0.0f);
+	const std::string text = Resume::SaveAndQuitText();
+	ImGui::TextUnformatted(I18n::T(text.c_str()));
+	ImGui::TextColored(kDim, "%s", I18n::T("El juego se cierra solo en unos segundos. Al pulsar JUGAR en el lanzador continuarás donde estás."));
+	ImGui::PopTextWrapPos();
+	ImGui::End();
+	ImGui::PopStyleColor(2);
+	ImGui::PopStyleVar(2);
+	ImGui::PopFont();
+	Bump();
 }
 
 unsigned long long Revision() {
@@ -1615,6 +2842,7 @@ void Presented() {
 		g_first_present = false;
 		CloseSplash();
 	}
+	Resume::Presented(); // (ds-pc-port8) JUGAR after F1: the automatic Continue
 }
 
 void WindowCreated(SDL_Window* window) {
@@ -1638,7 +2866,7 @@ const char* Title() {
 	return "Demon's Souls";
 }
 
-const PortLive::Hooks kHooks {WindowCreated, OnEvent, Presented, WantsOverlay, Revision, Draw, Title};
+const PortLive::Hooks kHooks {WindowCreated, OnEvent, Presented, WantsOverlay, Revision, DrawInGame, Title};
 
 } // namespace
 
@@ -1692,15 +2920,23 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 		g_start_mode = false;
 		return true;
 	}
-	// (10-28b) The launcher: its own window (1600x900, at most 90% of the desktop), whatever the game's display mode.
-	int win_w = 1600, win_h = 900;
-	if (SDL_Rect desk {}; SDL_GetDisplayUsableBounds(0, &desk) == 0 && desk.w > 0 && desk.h > 0) {
-		const float k = std::min({1.0f, desk.w * 0.9f / win_w, desk.h * 0.9f / win_h});
+	// (ds-pc-port8) The launcher as Launcher-souls.ps1's: borderless over the whole main screen (the Configurador alone:
+	// a window of 1600x900, at most 90% of the desktop).
+	int    win_x = SDL_WINDOWPOS_CENTERED, win_y = SDL_WINDOWPOS_CENTERED, win_w = 1600, win_h = 900;
+	Uint32 flags = SDL_WINDOW_ALLOW_HIGHDPI;
+	if (SDL_Rect desk {}; !g_config_mode && SDL_GetDisplayBounds(0, &desk) == 0 && desk.w > 0 && desk.h > 0) {
+		win_x = desk.x;
+		win_y = desk.y;
+		win_w = desk.w;
+		win_h = desk.h;
+		flags |= SDL_WINDOW_BORDERLESS;
+	} else if (SDL_Rect usable {}; SDL_GetDisplayUsableBounds(0, &usable) == 0 && usable.w > 0 && usable.h > 0) {
+		const float k = std::min({1.0f, usable.w * 0.9f / win_w, usable.h * 0.9f / win_h});
 		win_w = static_cast<int>(win_w * k);
 		win_h = static_cast<int>(win_h * k);
+		flags |= SDL_WINDOW_RESIZABLE;
 	}
-	const Uint32 flags  = SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE;
-	SDL_Window*  window = SDL_CreateWindow("Demon's Souls", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, flags);
+	SDL_Window*  window = SDL_CreateWindow("Demon's Souls", win_x, win_y, win_w, win_h, flags);
 	SDL_Renderer* renderer = window != nullptr ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : nullptr;
 	if (renderer == nullptr) {
 		std::printf("[port] start menu: no window (%s): straight to the game\n", SDL_GetError());
@@ -1718,11 +2954,24 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	io.LogFilename = nullptr;
 	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
 	{
+		// (ds-pc-port8) Segoe UI for the text (the launcher's), Segoe UI Semibold for buttons and captions, and a serif face
+		// for the titles and JUGAR (Palatino Linotype, else Georgia, Constantia or Times New Roman: Windows' own).
 		wchar_t windows[MAX_PATH + 1] = {};
 		GetWindowsDirectoryW(windows, MAX_PATH);
-		const auto ttf = std::filesystem::path(windows) / L"Fonts" / L"segoeui.ttf";
-		std::error_code ec;
-		if (std::filesystem::exists(ttf, ec)) io.Fonts->AddFontFromFileTTF(ttf.string().c_str());
+		const auto fonts = std::filesystem::path(windows) / L"Fonts";
+		const auto load  = [&](std::initializer_list<const wchar_t*> names) -> ImFont* {
+			for (const wchar_t* name: names) {
+				std::error_code ec;
+				const auto      ttf = fonts / name;
+				if (std::filesystem::exists(ttf, ec)) return io.Fonts->AddFontFromFileTTF(ttf.string().c_str());
+			}
+			return nullptr;
+		};
+		g_font_body  = load({L"segoeui.ttf"});
+		g_font_semi  = load({L"seguisb.ttf", L"segoeuib.ttf"});
+		g_font_serif = load({L"palab.ttf", L"pala.ttf", L"georgiab.ttf", L"constanb.ttf", L"timesbd.ttf"});
+		if (g_font_semi == nullptr) g_font_semi = g_font_body;
+		if (g_font_serif == nullptr) g_font_serif = g_font_semi;
 	}
 	ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
 	ImGui_ImplSDLRenderer2_Init(renderer);
@@ -1736,19 +2985,16 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 		while (SDL_PollEvent(&e) == 1) {
 			ImGui_ImplSDL2_ProcessEvent(&e);
 			if (e.type == SDL_QUIT) g_start_result = -1;
-			if (e.type == SDL_KEYDOWN && e.key.repeat == 0) {
+			if (g_config_mode && e.type == SDL_KEYDOWN && e.key.repeat == 0) {
 				if (e.key.keysym.sym == SDLK_q || e.key.keysym.sym == SDLK_PAGEUP) Queue({Input::Tab, -1});
 				if (e.key.keysym.sym == SDLK_e || e.key.keysym.sym == SDLK_PAGEDOWN) Queue({Input::Tab, +1});
-			}
-			if (e.type == SDL_CONTROLLERBUTTONDOWN) {
-				if (e.cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) Queue({Input::Tab, -1});
-				if (e.cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) Queue({Input::Tab, +1});
 			}
 		}
 		ImGui_ImplSDLRenderer2_NewFrame();
 		ImGui_ImplSDL2_NewFrame();
 		ImGui::NewFrame();
-		Draw(io.DisplaySize.x, io.DisplaySize.y);
+		if (g_config_mode) Draw(io.DisplaySize.x, io.DisplaySize.y);
+		else DrawLauncher(io.DisplaySize.x, io.DisplaySize.y);
 		ImGui::Render();
 		SDL_RenderSetScale(renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
 		SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
@@ -1757,12 +3003,17 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 		SDL_RenderPresent(renderer);
 	}
 	if (g_start_result > 0) *settings = g_edit;
+	// (ds-pc-port8) As Launcher-souls.ps1 (each change written at once): Salir / Esc keep the changes too.
+	if (g_start_result < 0 && !g_config_mode) Save();
 	ImGui_ImplSDLRenderer2_Shutdown(); // (destroys the background's SDL texture too)
 	ImGui_ImplSDL2_Shutdown();
 	if (g_background != nullptr) {
 		ImGui::UnregisterUserTexture(g_background);
 		IM_DELETE(g_background);
 	}
+	FreeTexture(g_knight);
+	g_knight_tried = false;
+	g_font_body = g_font_semi = g_font_serif = nullptr;
 	ImGui::DestroyContext(context);
 	ImGui::SetCurrentContext(previous);
 	g_background       = nullptr;

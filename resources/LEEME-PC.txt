@@ -14,27 +14,30 @@ Como jugar
 
 No hace falta PowerShell ni ninguna consola: todo va dentro del exe.
 
-Menu de opciones dentro del juego
----------------------------------
-  F1                          abrir / cerrar
-  Mando: mantener R3 y pulsar OPTIONS  abrir / cerrar (OPTIONS no llega al juego)
-  Circulo / Esc               volver al juego
-  L1 / R1  (Q / E)            cambiar de pestana
-  Cruz / Enter                elegir
-
-Lo marcado con * necesita reiniciar el juego: el menu ofrece "Reiniciar ahora"
-(guarda antes en una hoguera, el juego guarda solo al descansar o al salir al menu).
-Se aplica al momento: nitidez, tope de FPS, metricas, vibracion y el multiplicador de los
-modos DLSS fijos (x2-x6, hasta el elegido al arrancar).
-Mientras el menu esta abierto no se generan frames (no se "arrastra" con la imagen) y el
-juego no recibe los botones.
-
-Pestanas del menu (como el lanzador anterior): Imagen, Frame generation, Calidad grafica, Ray tracing,
-Modos Souls, Pantalla y otros, Rendimiento / PC, Controles y Tu equipo (grafica, procesador, RAM y el modo
-recomendado para tu grafica).
-
-Buscar actualizacion (pestana "Tu equipo")
+El lanzador (al abrir "Demon's Souls.exe")
 ------------------------------------------
+Antes del juego se abre el lanzador, como el del emulador (Launcher-souls.ps1): la imagen del juego a toda
+pantalla y a la derecha la columna de opciones con sus grupos (Imagen, Calidad grafica, Ray tracing, Frame
+generation, Pantalla y otros, Configurador, Rendimiento / PC, Controles, TU EQUIPO), cada una con su ayuda al
+pasar el raton. Todo se guarda en settings.ini y se aplica al pulsar JUGAR. Abajo a la izquierda: Trofeos.
+Botones: JUGAR, Actualizar version, Volver a la version anterior, Ajustes (carpeta del juego y Anadir a Steam)
+y Salir (o Esc). "Demon's Souls.exe" --sin-lanzador arranca el juego directo una vez.
+
+F1 dentro del juego: guardar y salir
+------------------------------------
+  F1 (o con mando: mantener R3 y pulsar OPTIONS)   guarda y cierra el juego. Ya no hay menu en el juego:
+                                                    todas las opciones estan en el lanzador.
+Que hace: apunta el sitio exacto donde esta tu personaje, espera a que el juego termine de guardar si
+estaba guardando (nunca se corta un guardado a medias; desde ese momento no empieza ninguno nuevo),
+copia _SaveData en _SaveData-copias\F1-<fecha> (se guardan las 3 ultimas) y cierra el juego.
+Al abrir el exe y pulsar JUGAR: el juego pasa solo la intro y el titulo (pulsa Cruz en Continuar) y
+carga tu personaje en el sitio donde pulsaste F1 (version 01.007.000; en otras versiones, donde el juego
+guardo por ultima vez). Se desactiva con "Continuar donde lo deje (F1)" en el lanzador (continuar_f1=0).
+Lo que hiciste despues del ultimo guardado automatico del propio juego (almas o objetos recogidos en los
+ultimos segundos) puede no estar: el juego guarda solo a menudo, pero la posicion la pone el port.
+
+Buscar actualizacion (botones del lanzador)
+-------------------------------------------
   "Actualizar version": busca la ultima version publicada en GitHub (todojuegos67-bot/KytyPS5) y la compara con
   la tuya (se ve debajo de TU EQUIPO). Sale "Ya tienes la ultima version" o "Nueva version X - Cruz para
   actualizar". Al confirmar, descarga el zip, comprueba que trae "Demon's Souls.exe", guarda el exe y las DLL
@@ -49,7 +52,7 @@ Buscar actualizacion (pestana "Tu equipo")
   Solo pide permiso de administrador si la carpeta no se puede escribir (p. ej. dentro de Archivos de programa).
   El exe en uso se renombra a .old y se borra solo al abrir el juego la siguiente vez.
 
-Otras teclas: F8 metricas, F11 / Alt+Enter pantalla completa, F7 raton como mando.
+Otras teclas: F1 guardar y salir, F8 metricas, F11 / Alt+Enter pantalla completa, F7 raton como mando.
 
 settings.ini
 ------------
