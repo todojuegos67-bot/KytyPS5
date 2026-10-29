@@ -37,6 +37,7 @@
 #include "local/shine.h"
 #include "local/godrays.h"
 #include "local/torch.h"
+#include "local/dof.h"
 #include "local/rt-local-lights.h"
 #include "local/rt-flicker.h"
 #include "local/rt-capture.h"
@@ -9551,6 +9552,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	TimedPass("ShineApply", [&] { ShineApply(command, inputs); }); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
 	probed(RtFlicker::Volumetric, "GodraysApply", [&] { return GodraysApply(command, inputs); }); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off; flicker self-check)
 	probed(RtFlicker::Flare, "TorchFlareApply", [&] { return TorchFlareApply(command, inputs); }); // (KYTY_TORCH_FLARE: the lens flare, last before the upscaler and the HUD; torch.cpp)
+	TimedPass("DofApply", [&] { DofApply(command, inputs); }); // (ds-dof-1029, KYTY_DOF: the distance depth of field, dof.cpp; after every other pass, before the upscaler and the HUD; nothing when off)
 	TimedPass("GbufViewApply", [&] { GbufViewApply(command, inputs); }); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
 	SharpenProbeTick();
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3 || g_sr_kind == 4;

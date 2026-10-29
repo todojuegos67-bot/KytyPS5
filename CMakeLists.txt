@@ -455,6 +455,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${rt_ao_header}")
 
+# KYTY_DOF (ds-dof-1029): the distance depth of field (src/local/dof.cpp).
+set(dof_source "${KYTY_SOURCE_DIR}/local/dof.comp")
+set(dof_spv "${gpu_tiler_generated_dir}/dof.spv")
+set(dof_header "${gpu_tiler_generated_dir}/dof_spv.h")
+add_custom_command(
+	OUTPUT "${dof_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${dof_spv}" "${dof_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${dof_spv} -DOUTPUT=${dof_header}
+	        -DSYMBOL=DOF_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${dof_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${dof_header}")
+
 # KYTY_SSR: screen-space reflections before the PS5 Pro path's upscaler (src/local/frame-gen.cpp).
 set(ssr_source "${KYTY_SOURCE_DIR}/local/ssr.comp")
 set(ssr_spv "${gpu_tiler_generated_dir}/ssr.spv")
@@ -891,6 +907,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/hwrt-gi.h"
 	"${KYTY_SOURCE_DIR}/local/rt-ao.h"
 	"${KYTY_SOURCE_DIR}/local/rt-ao.cpp"
+	"${KYTY_SOURCE_DIR}/local/dof.h"
+	"${KYTY_SOURCE_DIR}/local/dof.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-gi.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.h"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.cpp"
