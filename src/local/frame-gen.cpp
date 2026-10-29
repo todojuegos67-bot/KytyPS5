@@ -1023,6 +1023,7 @@ void Initialize() {
 		if (const char* st = std::getenv("KYTY_DLSSG_DYN_STRETCH"); st != nullptr && *st == '0') g_dyn_stretch = false;
 		if (const char* t = std::getenv("KYTY_DLSSG_TARGET_FPS"); t != nullptr && std::atof(t) > 0) {
 			g_dlssg_target_fps = static_cast<float>(std::atof(t));
+			std::printf("[dlssg] dynamic target %.0f fps (KYTY_DLSSG_TARGET_FPS)\n", static_cast<double>(g_dlssg_target_fps));
 		} else {
 			DEVMODEA dm {};
 			dm.dmSize = sizeof(dm);
@@ -1035,8 +1036,6 @@ void Initialize() {
 			} else {
 				std::printf("[dlssg] display refresh unknown: dynamic target 224 fps\n");
 			}
-		} else {
-			std::printf("[dlssg] dynamic target %.0f fps (KYTY_DLSSG_TARGET_FPS)\n", static_cast<double>(g_dlssg_target_fps));
 		}
 		if (g_dlssg_target_fps <= 0.0f) g_dlssg_target_fps = 224.0f;
 		// First guess: the game's usual 60 real fps.
