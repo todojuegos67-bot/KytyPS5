@@ -9,6 +9,9 @@ Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
 - DLSS 5 (Neural Rendering, foveado): necesita nvngx_dlssnr.dll propio junto a kyty_emulator.exe; no se incluye.
   Launcher, Imagen > DLSS 5: No / PreSR (rapido) / Foveado Suave / Medio / Fuerte. Archivo DLSS 5: Oficial (por defecto).
   DLSS 5 (Neural Rendering, foveated): needs your own nvngx_dlssnr.dll next to kyty_emulator.exe; not included.
+- Reflejos RT: sin fogonazos. Los destellos sueltos (luces, cielo, emisivos) se limitan a la luz de alrededor y el
+  reflejo ya no salta de un frame a otro con la camara quieta (KYTY_RT_REFLECTIONS_STABLE=0 vuelve al anterior).
+  RT reflections: no more bright flashes; single bright hits are limited and the reflection is steady on a still camera.
 
 
 00. NUEVO (23-10 noche) / NEW (23-10 night)
