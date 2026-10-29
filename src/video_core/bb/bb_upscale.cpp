@@ -483,8 +483,10 @@ void FillCamera(Plan& p) {
     // ndc_z = alpha + beta / w (w the view depth)
     const double alpha = Dot3(r2, r3) / Dot3(r3, r3);
     const double beta = r2[3] - alpha * r3[3];
-    const double zs = g_frame.viewport.zscale;
-    p.depth_inverted = beta * zs > 0.0;
+    // (The depth direction stays the depth test's, as without a camera: a value that changes
+    // between frames recreated the FSR 3.1 / XeSS contexts, a stutter each time.)
+    (void)beta;
+    p.depth_inverted = g_frame.depth_greater;
     const double w0 = std::fabs(alpha) > 1e-9 ? -beta / alpha : 1e30;
     const double w1 = std::fabs(1.0 - alpha) > 1e-9 ? beta / (1.0 - alpha) : 1e30;
     double z_near = std::min(std::fabs(w0), std::fabs(w1));

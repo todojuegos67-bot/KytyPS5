@@ -76,6 +76,7 @@ jobs:
         Copy-Item fsr4_shaders "$out\fsr4_shaders" -Recurse
         Copy-Item fsr4_shaders\LICENSE-FSR4-v07.txt "$out\LICENSES\FSR4-v07-LICENSE.txt"
         Copy-Item documents\BB-UPSCALING.md "$out\BB-UPSCALING.md"
+        Copy-Item tools\bb\*.cmd, tools\bb\*.ps1 $out
         7z a bb-port-win64.zip ".\$out\*" | Out-Null
         $h = (Get-FileHash -Algorithm MD5 "$out\shadPS4.exe").Hash.ToLower()
         $z = (Get-FileHash -Algorithm MD5 bb-port-win64.zip).Hash.ToLower()

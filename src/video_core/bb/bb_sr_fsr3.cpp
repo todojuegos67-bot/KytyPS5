@@ -148,9 +148,17 @@ bool Evaluate(const Desc& desc) {
     uint32_t flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
     if (desc.hdr) flags |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE;
     if (desc.depth_inverted) flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
-    if (desc.z_far <= 0.0f || desc.z_far > 1e6f) flags |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
+    // Infinite far always (the camera's far plane, when found, varies; a flag change recreates
+    // the context and stalls the GPU).
+    flags |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
     if (g_context == nullptr || desc.render.width > g_render.width ||
         desc.render.height > g_render.height || desc.upscale != g_output || flags != g_flags) {
+        static uint32_t creations = 0;
+        if (++creations > 1) {
+            BBLogf("FSR 3.1: context recreated (%u): render %ux%u output %ux%u flags 0x%x", creations,
+                   desc.render.width, desc.render.height, desc.upscale.width, desc.upscale.height,
+                   flags);
+        }
         if (g_context != nullptr) {
             (void)vk::Device(g_device).waitIdle();
             g_ffx.DestroyContext(&g_context, nullptr);
@@ -203,7 +211,7 @@ bool Evaluate(const Desc& desc) {
     up.preExposure = 1.0f;
     up.reset = desc.reset;
     const float z_near = std::max(desc.z_near, 0.001f);
-    const float z_far = (flags & FFX_UPSCALE_ENABLE_DEPTH_INFINITE) ? FLT_MAX : desc.z_far;
+    const float z_far = FLT_MAX;
     // The SDK's convention: with inverted depth, near and far are given swapped.
     up.cameraNear = desc.depth_inverted ? z_far : z_near;
     up.cameraFar = desc.depth_inverted ? z_near : z_far;
