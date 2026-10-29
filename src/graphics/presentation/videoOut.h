@@ -27,6 +27,8 @@ void NoteWorldFile(const char* name) noexcept;
 bool MoviePlaying() noexcept;
 // An in-engine cinematic's files were read lately (KYTY_CINEMATIC_HOLD_MS): its frames keep 60.
 bool CinematicPlaying() noexcept;
+// The last [pace] window (5 s): how far the screen's frame steps were from the game's (mean ms, % over 2 ms).
+void PaceOffset(double* mean_ms, double* over2_pct) noexcept;
 // A held in-engine cutscene (KYTY_CUTSCENE_HOLD; until the player moves after its files were read).
 bool CutsceneHeld() noexcept;
 // Dynamic frame generation (10-21): the game's 3D view flipped at most `fps` a second, switched at runtime (0: none).

@@ -63,6 +63,7 @@ public:
 	[[nodiscard]] static bool GeneratesFrames() noexcept;
 	// KYTY_ANTILAG: the guest frame's index (its flip), for its PRESENT mark.
 	static void               SetLatencyIndex(Frame& frame, uint64_t index) noexcept;
+	static void               SetReflexIndex(Frame& frame, uint32_t index) noexcept; // 10-29: FrameGen::ReflexGameRecorded
 	// KYTY_KBM_WARP: the game-frame pad reads the frame shows (HostInputKbmOnFlip at its flip).
 	static void               SetKbmSeq(Frame& frame, uint64_t seq) noexcept;
 	void                         Discard(Frame& frame);

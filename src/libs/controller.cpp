@@ -14,6 +14,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "loader/demonsSoulsWarp.h"
 #include "local/anti-lag.h"
+#include "local/frame-gen.h"
 
 #include <algorithm>
 #include <array>
@@ -948,6 +949,7 @@ int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformati
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PRINT_NAME();
 	Loader::DemonsSoulsWarp::RunQueuedCommand(); // (live `gamecmd`: on the game's own thread)
+	Libs::Graphics::FrameGen::ReflexGameInput(); // 10-29: DLSS-G's Reflex sleep at the game's frame start
 	Libs::Graphics::AntiLag::OnInput("scePadReadState"); // KYTY_ANTILAG: the frame's INPUT mark
 
 	if (handle != 1) {
@@ -973,6 +975,7 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(num < 1 || num > 64);
+	Libs::Graphics::FrameGen::ReflexGameInput(); // 10-29: DLSS-G's Reflex sleep at the game's frame start
 	Libs::Graphics::AntiLag::OnInput("scePadRead"); // KYTY_ANTILAG: the frame's INPUT mark
 	if (handle != 1) {
 		return PAD_ERROR_INVALID_HANDLE;

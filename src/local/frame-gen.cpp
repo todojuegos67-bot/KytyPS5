@@ -354,6 +354,7 @@ struct Api {
 	PFun_slDLSSGGetState*        dlssg_get_state     = nullptr;
 	PFun_slReflexSetOptions*     reflex_set_options  = nullptr;
 	PFun_slReflexSleep*          reflex_sleep        = nullptr;
+	PFun_slReflexGetState*       reflex_get_state    = nullptr;
 	PFun_slPCLSetMarker*         pcl_set_marker      = nullptr;
 	PFun_slEvaluateFeature*      evaluate            = nullptr;
 	PFun_slDLSSSetOptions*       dlss_set_options    = nullptr;
@@ -796,8 +797,18 @@ bool Requested() {
 //     flip->present 48.7, 11.9 frames over 25 ms a window): no flip pacer and no flip floor on real frames, the only
 //     limit Reflex's frameLimitUs = 1e6 m / target (its sleep, at the guest frame start, holds the game), flips when
 //     ready; the game's own variable step above 60.
+bool ReflexInGame() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_DLSSG_REFLEX_GAME");
+		return v == nullptr || *v != '0';
+	}();
+	return on;
+}
 int DlssgPaceMode() {
 	static const int mode = [] {
+		// 10-29 ds-reflex: Reflex sleeps the game at its own frame start: it is the only pacer (its frameLimitUs the
+		// cap target / m); the launcher's KYTY_DLSSG_PACE=grid (our flip pacer against Reflex) is ignored.
+		if (ReflexInGame()) return 2;
 		const char* v = std::getenv("KYTY_DLSSG_PACE");
 		if (v != nullptr && std::strcmp(v, "adaptive") == 0) return 0;
 		if (v != nullptr && std::strcmp(v, "grid") == 0) return 1;
@@ -1264,6 +1275,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 	// pacer held every present ~25 ms (the game at ~37 fps), and with Reflex off the game reached ~56 but DLSS-G
 	// reported Reflex missing (a tinted picture).
 	FeatureFunction(sl::kFeatureReflex, "slReflexSleep", g_api.reflex_sleep);
+	FeatureFunction(sl::kFeatureReflex, "slReflexGetState", g_api.reflex_get_state);
 	sl::ReflexOptions& reflex = g_reflex_opts;
 	reflex = {};
 	reflex.mode = sl::ReflexMode::eLowLatency;
@@ -1652,6 +1664,9 @@ void DynApplyReflexLimit(int gen) {
 }
 #endif
 
+uint32_t g_rxg_presenting = 0; // present thread: the in-game Reflex index being presented (0: none)
+void     RxNotePresentStart(uint32_t index, std::chrono::steady_clock::time_point t);
+void     RxPresentedHook(uint32_t index);
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2D region,
                    vk::Format format, uint32_t image_count) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -1673,18 +1688,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		std::printf("[dyn] cinematic: back to 60, x%d\n", g_dyn_gen + 1);
 		std::fflush(stdout);
 	}
-	if (g_dlssg_dynamic && g_dyn_limit_us != 0 && usable) {
-		static std::chrono::steady_clock::time_point next {};
-		const auto step = std::chrono::microseconds(g_dyn_limit_us);
-		auto       t    = std::chrono::steady_clock::now();
-		if (next > t) {
-			g_dyn_slept += std::chrono::duration<double>(next - t).count();
-			std::this_thread::sleep_until(next - std::chrono::milliseconds(1));
-			while (std::chrono::steady_clock::now() < next) std::this_thread::yield();
-			t = next;
-		}
-		next = std::max(next, t - step) + step;
-	}
+	// (10-29 ds-reflex: the old per-present sleep of the dynamic multiplier is gone: Reflex is the only pacer.)
 	{
 		const auto now = std::chrono::steady_clock::now();
 		if (g_stat_start == std::chrono::steady_clock::time_point {}) g_stat_start = now;
@@ -1967,6 +1971,8 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	if (guest_index == 0) g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, token);
 	g_api.pcl_set_marker(sl::PCLMarker::ePresentStart, token);
 	g_present_begin = std::chrono::steady_clock::now();
+	g_rxg_presenting = guest_index != 0 && ReflexInGame() ? guest_index : 0;
+	if (g_rxg_presenting != 0) RxNotePresentStart(g_rxg_presenting, g_present_begin);
 #else
 	(void)inputs;
 	(void)backbuffer;
@@ -1987,6 +1993,8 @@ void AfterPresent() {
 		return;
 	}
 	g_api.pcl_set_marker(sl::PCLMarker::ePresentEnd, *g_token);
+	if (g_rxg_presenting != 0) RxPresentedHook(g_rxg_presenting);
+	g_rxg_presenting = 0;
 	const auto presents = ++g_presents;
 	if (presents % 30 != 1) {
 		return;
@@ -2156,7 +2164,7 @@ void NoteShader(uint64_t hash, char stage) {
 void ReflexGuestFlip(FrameInputs& fg) {
 	fg.reflex_index = 0;
 #ifdef KYTY_FRAMEGEN_STREAMLINE
-	if (!g_ready || !ReflexGuestMarkers() || g_api.pcl_set_marker == nullptr) return;
+	if (!g_ready || !ReflexGuestMarkers() || ReflexInGame() || g_api.pcl_set_marker == nullptr) return;
 	sl::FrameToken* token = nullptr;
 	if (g_rx_open != 0) {
 		uint32_t index = g_rx_open;
@@ -2185,6 +2193,154 @@ void ReflexGuestFlip(FrameInputs& fg) {
 
 void SetPresentReflexIndex(uint32_t index) {
 	g_rx_present.store(index, std::memory_order_relaxed);
+}
+
+// 10-29 ds-reflex: Reflex inside the game (frame-gen.h). The marker times of each index (steady clock), for the
+// 10 s [reflex] line: kRx* the markers in their order.
+namespace {
+enum RxMark : int { kRxSimStart, kRxSimEnd, kRxSubmitStart, kRxSubmitEnd, kRxPresentStart, kRxPresentEnd, kRxMarks };
+struct RxSlot {
+	uint32_t                              index = 0;
+	uint32_t                              mask  = 0;
+	std::chrono::steady_clock::time_point t[kRxMarks] {};
+};
+std::mutex                             g_rxg_mutex;
+RxSlot                                 g_rxg_ring[256];
+std::atomic<uint32_t>                  g_rxg_sim {0}; // the game's frame begun at its controller read, not yet flipped
+std::atomic<uint64_t>                  g_rxg_sleep_ns {0}, g_rxg_sleeps {0};
+double                                 g_rxg_sim_ms = 0, g_rxg_submit_ms = 0, g_rxg_s2p_ms = 0, g_rxg_s2p_max = 0;
+uint64_t                               g_rxg_n = 0, g_rxg_sync = 0, g_rxg_desync = 0, g_rxg_order = 0;
+uint32_t                               g_rxg_last_presented = 0;
+std::chrono::steady_clock::time_point  g_rxg_report {};
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+void RxMarkLocked(uint32_t index, RxMark mark, std::chrono::steady_clock::time_point now) {
+	auto& slot = g_rxg_ring[index % std::size(g_rxg_ring)];
+	if (slot.index != index) slot = RxSlot {index, 0, {}};
+	slot.mask |= 1u << mark;
+	slot.t[mark] = now;
+}
+bool RxMarker(uint32_t index, sl::PCLMarker marker, RxMark mark) {
+	sl::FrameToken* token = nullptr;
+	uint32_t        i     = index;
+	if (index == 0 || g_api.get_new_frame_token(token, &i) != sl::Result::eOk || token == nullptr) return false;
+	g_api.pcl_set_marker(marker, *token);
+	std::lock_guard lock(g_rxg_mutex);
+	RxMarkLocked(index, mark, std::chrono::steady_clock::now());
+	return true;
+}
+double RxMs(const RxSlot& s, RxMark a, RxMark b) {
+	return std::chrono::duration<double, std::milli>(s.t[b] - s.t[a]).count();
+}
+// A frame presented (its PRESENT_END): its marker times into the window; the line every 10 s.
+void RxPresented(uint32_t index) {
+	const auto now = std::chrono::steady_clock::now();
+	std::lock_guard lock(g_rxg_mutex);
+	RxMarkLocked(index, kRxPresentEnd, now);
+	const auto& s = g_rxg_ring[index % std::size(g_rxg_ring)];
+	constexpr uint32_t all = (1u << kRxMarks) - 1;
+	bool ordered = s.mask == all;
+	for (int m = 1; ordered && m < kRxMarks; ++m) ordered = s.t[m] >= s.t[m - 1];
+	if (s.mask == all) {
+		++g_rxg_n;
+		g_rxg_sim_ms += RxMs(s, kRxSimStart, kRxSimEnd);
+		g_rxg_submit_ms += RxMs(s, kRxSubmitStart, kRxSubmitEnd);
+		const double s2p = RxMs(s, kRxSimStart, kRxPresentEnd);
+		g_rxg_s2p_ms += s2p;
+		g_rxg_s2p_max = std::max(g_rxg_s2p_max, s2p);
+	}
+	if (ordered) ++g_rxg_sync; else ++g_rxg_desync;
+	if (index <= g_rxg_last_presented) ++g_rxg_order; // an index presented again or out of order
+	g_rxg_last_presented = std::max(g_rxg_last_presented, index);
+	if (g_rxg_report == std::chrono::steady_clock::time_point {}) g_rxg_report = now;
+	if (now - g_rxg_report < std::chrono::seconds(10)) return;
+	g_rxg_report = now;
+	// Reflex's own latency report (the driver's timestamps, us) for the frames it reports, and whether their frame IDs
+	// are ours (the ring's).
+	double   r_s2p = 0, r_gpu = 0;
+	uint32_t r_n = 0, r_ours = 0;
+	if (g_api.reflex_get_state != nullptr) {
+		static sl::ReflexState state {};
+		if (g_api.reflex_get_state(state) == sl::Result::eOk && state.latencyReportAvailable) {
+			for (const auto& r: state.frameReport) {
+				if (r.frameID == 0 || r.presentEndTime <= r.simStartTime || r.simStartTime == 0) continue;
+				++r_n;
+				r_s2p += static_cast<double>(r.presentEndTime - r.simStartTime) / 1000.0;
+				r_gpu += r.gpuActiveRenderTimeUs / 1000.0;
+				const auto& slot = g_rxg_ring[r.frameID % std::size(g_rxg_ring)];
+				if (slot.index == r.frameID && (slot.mask & (1u << kRxSimStart)) != 0) ++r_ours;
+			}
+		}
+	}
+	double off_ms = 0, off_pct = 0;
+	VideoOut::PaceOffset(&off_ms, &off_pct);
+	const uint64_t sleeps = g_rxg_sleeps.exchange(0);
+	const double   slept  = static_cast<double>(g_rxg_sleep_ns.exchange(0)) / 1e6;
+	const double   n      = static_cast<double>(std::max<uint64_t>(g_rxg_n, 1));
+	std::printf("[reflex] in-game: %llu frames, sim->present %.1f ms (max %.1f), sim %.1f, render submit %.1f, sleep %.2f ms/frame "
+	            "(%llu sleeps), frame limit %u us; markers in sync: %s (%llu ok, %llu not, %llu out of order); Reflex report: "
+	            "sim->present %.1f ms, gpu %.1f (%u frames, %u ours); screen vs game step %.2f ms (%.0f%% > 2 ms)\n",
+	            static_cast<unsigned long long>(g_rxg_n), g_rxg_s2p_ms / n, g_rxg_s2p_max, g_rxg_sim_ms / n, g_rxg_submit_ms / n,
+	            sleeps != 0 ? slept / static_cast<double>(sleeps) : 0.0, static_cast<unsigned long long>(sleeps),
+	            g_reflex_opts.frameLimitUs, g_rxg_desync == 0 && g_rxg_order == 0 && g_rxg_sync > 0 && (r_n == 0 || r_ours == r_n) ? "yes" : "no",
+	            static_cast<unsigned long long>(g_rxg_sync), static_cast<unsigned long long>(g_rxg_desync),
+	            static_cast<unsigned long long>(g_rxg_order), r_n != 0 ? r_s2p / r_n : 0.0, r_n != 0 ? r_gpu / r_n : 0.0, r_n,
+	            r_ours, off_ms, off_pct);
+	std::fflush(stdout);
+	g_rxg_n = g_rxg_sync = g_rxg_desync = g_rxg_order = 0;
+	g_rxg_sim_ms = g_rxg_submit_ms = g_rxg_s2p_ms = g_rxg_s2p_max = 0;
+}
+#endif
+} // namespace
+
+void ReflexGameInput() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_ready || !ReflexInGame() || g_api.pcl_set_marker == nullptr) return;
+	if (g_rxg_sim.load(std::memory_order_acquire) != 0) return; // (a second read in the same frame)
+	uint32_t        index = g_rx_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+	sl::FrameToken* token = nullptr;
+	if (g_api.get_new_frame_token(token, &index) != sl::Result::eOk || token == nullptr) return;
+	static const bool sleep = [] {
+		const char* value = std::getenv("KYTY_DLSSG_SLEEP");
+		return value == nullptr || *value != '0';
+	}();
+	if (sleep && g_api.reflex_sleep != nullptr) {
+		const auto t0 = std::chrono::steady_clock::now();
+		g_api.reflex_sleep(*token); // the game's thread: Reflex holds the game's frame start (and its frame limit)
+		g_rxg_sleep_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+		g_rxg_sleeps += 1;
+	}
+	g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, *token);
+	g_api.pcl_set_marker(sl::PCLMarker::eControllerInputSample, *token);
+	{
+		std::lock_guard lock(g_rxg_mutex);
+		RxMarkLocked(index, kRxSimStart, std::chrono::steady_clock::now());
+	}
+	g_rxg_sim.store(index, std::memory_order_release);
+#endif
+}
+
+uint32_t ReflexGameFlipReserved() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_ready || !ReflexInGame() || g_api.pcl_set_marker == nullptr) return 0;
+	const uint32_t index = g_rxg_sim.exchange(0, std::memory_order_acq_rel);
+	if (index == 0) return 0; // (a flip without a controller read: its markers at the present)
+	RxMarker(index, sl::PCLMarker::eSimulationEnd, kRxSimEnd);
+	RxMarker(index, sl::PCLMarker::eRenderSubmitStart, kRxSubmitStart);
+	return index;
+#else
+	return 0;
+#endif
+}
+
+void ReflexGameRecorded(FrameInputs& fg, uint32_t index) {
+	fg.reflex_index = 0;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (index == 0 || !g_ready || !ReflexInGame()) return;
+	if (RxMarker(index, sl::PCLMarker::eRenderSubmitEnd, kRxSubmitEnd)) fg.reflex_index = index;
+#else
+	(void)index;
+#endif
 }
 
 void NoteScene() {
@@ -9688,3 +9844,15 @@ void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInpu
 }
 
 } // namespace Libs::Graphics::FrameGen
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+namespace Libs::Graphics::FrameGen {
+void RxNotePresentStart(uint32_t index, std::chrono::steady_clock::time_point t) {
+	std::lock_guard lock(g_rxg_mutex);
+	RxMarkLocked(index, kRxPresentStart, t);
+}
+void RxPresentedHook(uint32_t index) {
+	RxPresented(index);
+}
+} // namespace Libs::Graphics::FrameGen
+#endif

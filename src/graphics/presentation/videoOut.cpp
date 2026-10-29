@@ -241,6 +241,7 @@ private:
 		FlipRequestSource           source;
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
+		uint32_t                    reflex_index;  // 10-29: DLSS-G's in-game Reflex frame index (FrameGen::ReflexGameFlipReserved), 0 none
 		uint64_t                    latency_index; // KYTY_ANTILAG: the frame's index (local/anti-lag.h), 0 none
 		uint64_t                    kbm_seq;       // KYTY_KBM: the game-frame pad reads this frame shows (HostInputKbmOnFlip)
 	};
@@ -645,6 +646,7 @@ struct PaceSeries {
 std::mutex     g_pace_mutex;
 PaceSeries     g_pace[2];
 std::chrono::steady_clock::time_point g_pace_report {};
+std::atomic<double> g_pace_offset_ms {0.0}, g_pace_offset_pct {0.0};
 bool PaceOn() {
 	static const bool on = [] { const char* v = std::getenv("KYTY_PACE_STATS"); return v == nullptr || v[0] != '0'; }();
 	return on;
@@ -688,10 +690,16 @@ void NotePace(int kind) noexcept {
 		}
 		std::printf("[pace] frame by frame the screen differs from the game's step by %.2f ms on average (max %.2f; %zu of %zu over 2 ms)\n",
 		            diff / n, big, over2, n);
+		g_pace_offset_ms.store(diff / n, std::memory_order_relaxed);
+		g_pace_offset_pct.store(100.0 * static_cast<double>(over2) / static_cast<double>(n), std::memory_order_relaxed);
 	}
 	std::fflush(stdout);
 	a.clear();
 	b.clear();
+}
+void PaceOffset(double* mean_ms, double* over2_pct) noexcept {
+	if (mean_ms != nullptr) *mean_ms = g_pace_offset_ms.load(std::memory_order_relaxed);
+	if (over2_pct != nullptr) *over2_pct = g_pace_offset_pct.load(std::memory_order_relaxed);
 }
 bool PlayerInputSeen() noexcept {
 	return g_world_ready.load(std::memory_order_relaxed);
@@ -1302,6 +1310,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	r.source     = source;
 	r.state      = RequestState::Reserved;
 	r.latency_index = Graphics::AntiLag::OnFlipReserved(); // KYTY_ANTILAG (local/anti-lag.h)
+	r.reflex_index  = Graphics::FrameGen::ReflexGameFlipReserved(); // 10-29: SIMULATION_END / RENDERSUBMIT_START
 	r.kbm_seq       = Graphics::HostInputKbmOnFlip();     // KYTY_KBM: one stick per game frame; the warp's shown reads
 
 	pending.push_back(r);
@@ -1499,6 +1508,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		EXIT("video-out request changed while recording, id=%" PRIu64 "\n", request_id);
 	}
 	prepared->frame = frame;
+	Graphics::Presenter::SetReflexIndex(*frame, prepared->reflex_index); // 10-29: RENDERSUBMIT_END, the frame's token
 }
 
 void FlipQueue::Complete(uint64_t request_id) {
@@ -1826,7 +1836,8 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	// Within a vblank of that time it is waited for precisely here (the port unlocked: the game reserves its next
 	// flip meanwhile; m_processing keeps this request at the front).
 	const uint32_t vblank_hz = std::max(Config::GetVblankFrequency(), 1u);
-	const bool     fg_paced  = !when_ready && FgPacingEnabled() && r.frame != nullptr && !fg_off && !MoviePlaying() && !CinematicPlaying() &&
+	const bool     fg_paced  = !when_ready && FgPacingEnabled() && r.frame != nullptr && !fg_off &&
+	                      !(Graphics::FrameGen::Enabled() && Graphics::FrameGen::ReflexInGame()) /* 10-29: Reflex paces DLSS-G */ && !MoviePlaying() && !CinematicPlaying() &&
 	                      Graphics::Presenter::GeneratesFrames() && Graphics::Presenter::IsSceneFrame(*r.frame) &&
 	                      Graphics::Presenter::IsGameView(*r.frame) && r.ready_time != g_fg_pacing.last_ready &&
 	                      FgPacingUpdate(r.ready_time, std::max(static_cast<double>(floor + 1) / vblank_hz, 1.0 / 60.0));

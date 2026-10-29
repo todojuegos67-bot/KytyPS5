@@ -1761,6 +1761,10 @@ void Presenter::SetLatencyIndex(Frame& frame, uint64_t index) noexcept {
 	frame.latency_index = index;
 }
 
+void Presenter::SetReflexIndex(Frame& frame, uint32_t index) noexcept {
+	FrameGen::ReflexGameRecorded(frame.fg, index);
+}
+
 void Presenter::SetKbmSeq(Frame& frame, uint64_t seq) noexcept {
 	frame.kbm_seq = seq;
 }

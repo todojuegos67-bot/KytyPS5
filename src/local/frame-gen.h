@@ -145,6 +145,19 @@ void NoteScene();
 void ReflexGuestFlip(FrameInputs& fg);
 // The Reflex index of the frame BeforePresent presents next (0: none, the markers at the present as before).
 void SetPresentReflexIndex(uint32_t index);
+// 10-29 ds-reflex: Reflex inside the game (KYTY_DLSSG_REFLEX_GAME, default on; =0 the 10-23 render-thread markers).
+//  - ReflexGameInput: the game's thread, its first controller read after a flip (the start of its frame, before it
+//    reads input and simulates): slReflexSleep with a new frame index, then SIMULATION_START and INPUT_SAMPLE.
+//  - ReflexGameFlipReserved: the game's flip (FlipQueue::Reserve): SIMULATION_END and RENDERSUBMIT_START of that index
+//    (the host's translation, recording and submission of the frame follow); the index goes with the flip request.
+//  - ReflexGameRecorded: the flip's commands recorded and submitted (FlipQueue::Prepare): RENDERSUBMIT_END; the index
+//    is the frame token BeforePresent / AfterPresent use for PRESENT_START / END and DLSS-G's tags and constants.
+// With it, Reflex is DLSS-G's only pacer: no flip pacer on the vblank grid, no KYTY_FG_PACING, the cap Reflex's own
+// frameLimitUs (target / multiplier). A 10 s "[reflex]" line reports the markers' timings.
+[[nodiscard]] bool     ReflexInGame();
+void                   ReflexGameInput();
+[[nodiscard]] uint32_t ReflexGameFlipReserved();
+void                   ReflexGameRecorded(FrameInputs& fg, uint32_t index);
 // The current guest frame ran the TAA pass so far, or the last one flipped did (HudAnchor: the game queues a frame's
 // interface before the flip of the one before).
 [[nodiscard]] bool SceneNoted();
