@@ -314,7 +314,9 @@ bool LooksLikeViewProj(const Mat& v) {
         if (!std::isfinite(x) || std::fabs(x) > 1e7) return false;
     const double n0 = Len3(r0), n1 = Len3(r1), n2 = Len3(r2), n3 = Len3(r3);
     // (Scale invariant: the game's view may carry a world scale, so the w row need not be unit.)
-    if (n3 < 1e-4 || n3 > 1e4) return false;
+    // The w row is the camera's forward axis: unit length (owner's XeSS dump, 10-29: the camera
+    // has it at 1.000; a constant with a 19.97-long row passed the scale-free test and won).
+    if (n3 < 0.97 || n3 > 1.03) return false;
     if (n0 < 1e-4 * n3 || n1 < 1e-4 * n3 || n2 < 1e-9) return false;
     const double aspect = n0 / n1;
     if (aspect < 0.2 || aspect > 5.0) return false;
@@ -471,9 +473,20 @@ float Halton(u32 index, u32 base) {
 }
 
 const Candidate* BestCamera() {
+    // Bloodborne keeps a camera-relative view-projection (no translation) next to the inverse of
+    // the full one (owner's dump): the full one is preferred, since only it moves with the camera's
+    // position; the camera-relative one only when nothing else is there.
+    const auto translated = [](const Candidate& c) {
+        return std::fabs(c.m.m[3]) + std::fabs(c.m.m[7]) + std::fabs(c.m.m[15]) > 1e-3;
+    };
     const Candidate* best = nullptr;
     for (const auto& c : g_frame.camera) {
-        if (best == nullptr || c.count > best->count) best = &c;
+        if (translated(c) && (best == nullptr || c.count > best->count)) best = &c;
+    }
+    if (best == nullptr) {
+        for (const auto& c : g_frame.camera) {
+            if (best == nullptr || c.count > best->count) best = &c;
+        }
     }
     if (best == nullptr) return nullptr;
     const u32 need = std::max<u32>(3, g_frame.scanned / 3);
@@ -1236,6 +1249,15 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         }
     }
     const Candidate* cam = Cfg().mv_reconstruct ? BestCamera() : nullptr;
+    if (cam != nullptr && Enabled() && g_frame_no % Cfg().log_every == 0) {
+        const auto& m = cam->m.m;
+        LOG_INFO(Render_Vulkan,
+                 "[BB_UPSCALE] frame {}: camera view-projection (seen in {} draws): {:.4g} {:.4g} "
+                 "{:.4g} {:.4g} / {:.4g} {:.4g} {:.4g} {:.4g} / {:.4g} {:.4g} {:.4g} {:.4g} / "
+                 "{:.4g} {:.4g} {:.4g} {:.4g}",
+                 g_frame_no, cam->count, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9],
+                 m[10], m[11], m[12], m[13], m[14], m[15]);
+    }
     if (cam != nullptr) {
         g_learned.prev_vp = cam->m;
         g_learned.have_prev_vp = true;

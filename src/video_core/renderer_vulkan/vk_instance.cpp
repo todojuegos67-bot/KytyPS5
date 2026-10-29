@@ -258,7 +258,9 @@ bool Instance::CreateDevice() {
                "Required Vulkan feature unavailable: nullDescriptor");
 
     // Optional
-    maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+    // (Under Streamline, DLSS: not enabled - the newest maintenance extension, unknown to it.)
+    maintenance_8 = BB::Upscale::VulkanLoaderOverride() == nullptr &&
+                    add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
     attachment_feedback_loop = add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
     if (attachment_feedback_loop) {
         attachment_feedback_loop =

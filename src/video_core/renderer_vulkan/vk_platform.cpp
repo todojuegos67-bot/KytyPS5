@@ -23,6 +23,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/bb/bb_upscale.h"
+#include <algorithm>
 #include <filesystem>
 
 #ifdef __APPLE__
@@ -323,7 +324,11 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
         .pEngineName = "shadPS4 Vulkan",
         .engineVersion = VK_MAKE_VERSION(1, 0, 0),
-        .apiVersion = available_version,
+        // Under Streamline (DLSS) the instance asks for Vulkan 1.3 at most, as the Demon's Souls
+        // fork does: the loader crashed in vkCreateDevice through the interposer with 1.4.
+        .apiVersion = BB::Upscale::VulkanLoaderOverride() != nullptr
+                          ? std::min<u32>(available_version, VK_API_VERSION_1_3)
+                          : available_version,
     };
 
     const std::string extensions_string = fmt::format("{}", fmt::join(extensions, ", "));
@@ -443,6 +448,11 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         },
     };
 
+    if (BB::Upscale::VulkanLoaderOverride() != nullptr) {
+        // (Streamline: no layer settings struct on the instance.)
+        instance_ci_chain.unlink<vk::LayerSettingsCreateInfoEXT>();
+        BB::Upscale::Checkpoint("DLSS: instance api clamped to 1.3, layer settings struct removed");
+    }
     if (BB::Upscale::Enabled()) {
         std::string chain;
         for (auto* node = static_cast<const VkBaseInStructure*>(instance_ci_chain.get().pNext);
