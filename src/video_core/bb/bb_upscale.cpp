@@ -13,6 +13,14 @@
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/bb/bb_analyze.h"
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef min
+#undef max
+#endif
 
 namespace BB::SR {
 
@@ -631,7 +639,69 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
     }
 }
 
+namespace {
+bool g_backend_dead = false;
+using EvaluateFn = bool (*)(const SR::Desc&);
+
+#if defined(_WIN32)
+// (No C++ objects in here: SEH only.)
+bool CallGuarded(EvaluateFn fn, const SR::Desc* desc, unsigned long* code) {
+    __try {
+        return fn(*desc);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *code = GetExceptionCode();
+        return false;
+    }
+}
+#endif
+} // namespace
+
+bool RunBackend(const SR::Desc& desc) {
+    if (g_backend_dead) {
+        return false;
+    }
+    EvaluateFn fn = nullptr;
+    switch (Cfg().kind) {
+    case SR::Kind::Dlss:
+        fn = &SR::Dlss::Evaluate;
+        break;
+    case SR::Kind::Xess:
+        fn = &SR::Xess::Evaluate;
+        break;
+    case SR::Kind::Fsr3:
+        fn = &SR::Fsr3::Evaluate;
+        break;
+    case SR::Kind::Fsr4:
+        fn = &SR::Fsr4::Evaluate;
+        break;
+    default:
+        return false;
+    }
+    static u32 failures = 0;
+#if defined(_WIN32)
+    unsigned long code = 0;
+    const bool ok = CallGuarded(fn, &desc, &code);
+    if (code != 0) {
+        g_backend_dead = true;
+        Checkpoint(fmt::format("{} crashed inside its dispatch (exception {:#x}): turned off, the "
+                               "game runs native",
+                               SR::KindName(Cfg().kind), code));
+        return false;
+    }
+#else
+    const bool ok = fn(desc);
+#endif
+    if (!ok && ++failures >= 8) {
+        g_backend_dead = true;
+        Checkpoint(fmt::format("{} failed {} times: turned off, the game runs native",
+                               SR::KindName(Cfg().kind), failures));
+    }
+    if (ok) failures = 0;
+    return ok;
+}
+
 bool BackendReady() {
+    if (g_backend_dead) return false;
     static int cached = -1;
     switch (Cfg().kind) {
     case SR::Kind::Dlss:

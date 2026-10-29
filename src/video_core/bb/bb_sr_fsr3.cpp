@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include "video_core/bb/bb_kyty_compat.h"
 #include "video_core/bb/bb_sr.h"
@@ -32,6 +33,32 @@ ffxFunctions g_ffx{};
 VkDevice g_device = VK_NULL_HANDLE;
 VkPhysicalDevice g_physical = VK_NULL_HANDLE;
 PFN_vkGetDeviceProcAddr g_gdpa = nullptr;
+PFN_vkGetDeviceProcAddr g_real_gdpa = nullptr;
+
+// The FidelityFX backend asks for some entry points by their KHR / EXT names (null on a device
+// without the extension even when the function is core): the core one is given instead, and any
+// name still missing is logged, so no null function pointer is ever called unannounced.
+PFN_vkVoidFunction VKAPI_CALL ProcAddr(VkDevice device, const char* name) {
+    PFN_vkVoidFunction function = g_real_gdpa(device, name);
+    if (function != nullptr || name == nullptr) {
+        return function;
+    }
+    std::string core = name;
+    for (const char* suffix : {"KHR", "EXT", "AMD", "NV"}) {
+        const std::size_t n = std::strlen(suffix);
+        if (core.size() > n && core.compare(core.size() - n, n, suffix) == 0) {
+            core.resize(core.size() - n);
+            function = g_real_gdpa(device, core.c_str());
+            break;
+        }
+    }
+    static uint32_t reports = 0;
+    if (reports++ < 32) {
+        BBLogf("FSR 3.1: device function %s %s", name,
+               function != nullptr ? "given as its core alias" : "MISSING (null)");
+    }
+    return function;
+}
 ffxContext g_context = nullptr;
 vk::Extent2D g_render{};
 vk::Extent2D g_output{};
@@ -105,7 +132,8 @@ void OnDevice(vk::PhysicalDevice physical, vk::Device device, PFN_vkGetDevicePro
     }
     g_physical = static_cast<VkPhysicalDevice>(physical);
     g_device = static_cast<VkDevice>(device);
-    g_gdpa = gdpa;
+    g_real_gdpa = gdpa;
+    g_gdpa = gdpa != nullptr ? &ProcAddr : nullptr;
 }
 
 bool Ready() {

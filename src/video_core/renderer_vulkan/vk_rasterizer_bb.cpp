@@ -394,33 +394,13 @@ bool Rasterizer::BBInject(VideoCore::ImageId color_id, vk::ImageView& out_view,
     std::copy(std::begin(plan.clip_to_prev_clip), std::end(plan.clip_to_prev_clip),
               desc.clip_to_prev_clip);
 
-    bool ok = false;
-    switch (BB::Upscale::Cfg().kind) {
-    case BB::SR::Kind::Dlss:
-        ok = BB::SR::Dlss::Evaluate(desc);
-        break;
-    case BB::SR::Kind::Xess:
-        ok = BB::SR::Xess::Evaluate(desc);
-        break;
-    case BB::SR::Kind::Fsr3:
-        ok = BB::SR::Fsr3::Evaluate(desc);
-        break;
-    case BB::SR::Kind::Fsr4: {
 #ifdef _WIN32
-        static const bool depth_set = [&] {
-            if (std::getenv("BB_FSR4_DEPTH_INVERT") == nullptr) {
-                _putenv_s("BB_FSR4_DEPTH_INVERT", plan.depth_inverted ? "1" : "0");
-            }
-            return true;
-        }();
-        (void)depth_set;
+    if (BB::Upscale::Cfg().kind == BB::SR::Kind::Fsr4 &&
+        std::getenv("BB_FSR4_DEPTH_INVERT") == nullptr) {
+        _putenv_s("BB_FSR4_DEPTH_INVERT", plan.depth_inverted ? "1" : "0");
+    }
 #endif
-        ok = BB::SR::Fsr4::Evaluate(desc);
-        break;
-    }
-    default:
-        break;
-    }
+    const bool ok = BB::Upscale::RunBackend(desc);
     // The back ends bind their own pipelines and descriptors; the game's next draw binds its own.
     Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral,
             vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eAllTransfer,

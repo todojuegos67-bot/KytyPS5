@@ -216,7 +216,6 @@ s32 loadModuleInternal(s32 index, s32 argc, const void* argv, s32* res_out) {
         constexpr auto ModulesToLoad = std::to_array<Core::SysModules>(
             {{"libSceNgs2.sprx", &Libraries::Ngs2::RegisterLib},
              {"libSceUlt.sprx", nullptr},
-             {"libSceAvPlayer.sprx", &Libraries::AvPlayer::RegisterLib},
              {"libSceAvPlayerStreaming.sprx", nullptr},
              {"libSceRtc.sprx", &Libraries::Rtc::RegisterLib},
              {"libSceJpegDec.sprx", nullptr},

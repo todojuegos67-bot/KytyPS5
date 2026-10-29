@@ -160,6 +160,11 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
             {"libSceAjm.sprx", Libraries::Ajm::RegisterLib},
             {"libSceErrorDialog.sprx", Libraries::ErrorDialog::RegisterLib},
             {"libSceImeDialog.sprx", Libraries::ImeDialog::RegisterLib},
+            // bb-port: AvPlayer is HLE again from the start, as up to shadPS4 23392e1 (v0.17.1, the
+            // owner's working build). Since "avplayer: allow LLE" (85382937) it only registered when
+            // the game loaded it through sceSysmodule; Bloodborne imports it directly, so every
+            // sceAvPlayer* call resolved to an unimplemented stub (log: "Stub resolved ... sceAvPlayerInit").
+            {"libSceAvPlayer.sprx", Libraries::AvPlayer::RegisterLib},
             {"libSceVdecsw.sprx", Libraries::Vdecsw::RegisterLib},
             {"libSceVideodec.sprx", Libraries::Videodec::RegisterLib},
             {"libSceVideodec2.sprx", Libraries::Videodec2::RegisterLib},
