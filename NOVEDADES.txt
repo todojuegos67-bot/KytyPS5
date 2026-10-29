@@ -4,6 +4,13 @@ DEMON'S SOULS (PS5) EN PC - NOVEDADES / WHAT'S NEW
 Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
 
 
+00. NUEVO (29-10) / NEW (29-10)
+-------------------------------
+- DLSS 5 (Neural Rendering, foveado): necesita nvngx_dlssnr.dll propio junto a kyty_emulator.exe; no se incluye.
+  Launcher, Imagen > DLSS 5: No / PreSR (rapido) / Foveado Suave / Medio / Fuerte. Archivo DLSS 5: Oficial (por defecto).
+  DLSS 5 (Neural Rendering, foveated): needs your own nvngx_dlssnr.dll next to kyty_emulator.exe; not included.
+
+
 00. NUEVO (23-10 noche) / NEW (23-10 night)
 -------------------------------------------
 - Frame generation dinamico: llena el monitor aunque la grafica vaya justa (x3-x5) y ya

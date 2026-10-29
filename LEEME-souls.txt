@@ -9,6 +9,7 @@ Reescalado (modo PS5 Pro del juego): DLSS (NVIDIA RTX), XeSS y FSR 3.1 (cualquie
 Frame generation: AMD (cualquier grafica, x2-x4) o DLSS (RTX 40/50).
 DLSS necesita el runtime Streamline de NVIDIA (no se incluye): copia la carpeta bin\x64 del
 Streamline SDK de NVIDIA como "streamline" junto a kyty_emulator.exe.
+DLSS 5 (Neural Rendering, foveado): necesita nvngx_dlssnr.dll propio junto a kyty_emulator.exe; no se incluye.
 TURBO: para graficas de 8 GB o menos (unos 6 GB de VRAM).
 Menu y cinematicas a 60; el frame generation se activa al cargar el mundo.
 Recomendado: 32 GB de RAM (con 16 GB Windows puede reiniciarse por un fallo de memoria de Windows).
