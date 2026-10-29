@@ -11,6 +11,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/bb/bb_analyze.h"
@@ -228,6 +229,24 @@ Config ParseConfig() {
     }
 #endif
     return c;
+}
+
+// BB_ANALYZE dumps also go to their own file in the working folder, bb_analyze_<upscaler>.log
+// (rewritten per run of that upscaler, so a later run of another one keeps it).
+template <typename... Args>
+void AnalyzeLog(fmt::format_string<Args...> format, Args&&... args) {
+    const std::string text = fmt::format(format, std::forward<Args>(args)...);
+    LOG_INFO(Render_Vulkan, "{}", text);
+    static std::FILE* file = [] {
+        const char* up = std::getenv("BB_UPSCALER");
+        std::string name = std::string("bb_analyze_") + (up && *up ? up : "off") + ".log";
+        return std::fopen(name.c_str(), "w");
+    }();
+    static u32 lines = 0;
+    if (file != nullptr && lines++ < 200000) {
+        std::fprintf(file, "%s\n", text.c_str());
+        std::fflush(file);
+    }
 }
 
 bool AnalyzeOn() {
@@ -647,6 +666,21 @@ void* ChainDeviceFeatures(vk::PhysicalDevice physical, const std::vector<const c
                           vk::PhysicalDeviceVulkan12Features& f12,
                           vk::PhysicalDeviceVulkan13Features& f13, vk::PhysicalDeviceFeatures& f,
                           void* next) {
+    if (Cfg().kind == SR::Kind::Dlss && SR::Dlss::LoaderPath() != nullptr) {
+        // VK_KHR_present_id enabled for Streamline's Reflex (VK_NV_low_latency2) needs its feature
+        // turned on too.
+        const bool has = std::any_of(extensions.begin(), extensions.end(), [](const char* e) {
+            return std::strcmp(e, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0;
+        });
+        if (has) {
+            static VkPhysicalDevicePresentIdFeaturesKHR present_id{};
+            present_id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
+            present_id.presentId = VK_TRUE;
+            present_id.pNext = next;
+            Checkpoint("DLSS: VkPhysicalDevicePresentIdFeaturesKHR{presentId} chained");
+            return &present_id;
+        }
+    }
     if (Cfg().kind == SR::Kind::Xess) {
         return SR::Xess::ChainDeviceFeatures(extensions, next);
     }
@@ -698,6 +732,52 @@ bool CallGuarded(EvaluateFn fn, const SR::Desc* desc, unsigned long* code) {
 }
 #endif
 } // namespace
+
+namespace {
+#if defined(_WIN32)
+struct FaultInfo {
+    unsigned long code = 0;
+    void* address = nullptr;
+};
+int FaultFilter(EXCEPTION_POINTERS* info, FaultInfo* out) {
+    out->code = info->ExceptionRecord->ExceptionCode;
+    out->address = info->ExceptionRecord->ExceptionAddress;
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+bool CallFn(void (*fn)(void*), void* arg, FaultInfo* fault) {
+    __try {
+        fn(arg);
+        return true;
+    } __except (FaultFilter(GetExceptionInformation(), fault)) {
+        return false;
+    }
+}
+#endif
+} // namespace
+
+bool GuardedCall(void (*fn)(void*), void* arg, std::string& fault) {
+#if defined(_WIN32)
+    FaultInfo info{};
+    if (CallFn(fn, arg, &info)) {
+        return true;
+    }
+    char module[MAX_PATH] = "?";
+    HMODULE handle = nullptr;
+    uintptr_t offset = 0;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCSTR>(info.address), &handle) &&
+        handle != nullptr) {
+        GetModuleFileNameA(handle, module, MAX_PATH);
+        offset = reinterpret_cast<uintptr_t>(info.address) - reinterpret_cast<uintptr_t>(handle);
+    }
+    fault = fmt::format("exception {:#x} at {} ({}+{:#x})", info.code, info.address, module, offset);
+    return false;
+#else
+    fn(arg);
+    return true;
+#endif
+}
 
 bool RunBackend(const SR::Desc& desc) {
     if (g_backend_dead) {
@@ -830,12 +910,12 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
             g_draw.analyze_dump = false;
         } else {
             if (g_dump_repeats > 0) {
-                LOG_INFO(Render_Vulkan, "[BB_ANALYZE]   ... {} more draw(s) with the same targets",
+                AnalyzeLog("[BB_ANALYZE]   ... {} more draw(s) with the same targets",
                          g_dump_repeats);
             }
             g_dump_repeats = 0;
             g_dump_last = key;
-            LOG_INFO(Render_Vulkan, "{}", line);
+            AnalyzeLog("{}", line);
             ++g_dump_lines;
         }
     }
@@ -852,7 +932,7 @@ void OnDispatch() {
     g_draw.compute = true;
     if (g_dump_frame && g_dump_lines < 1500) {
         g_draw.analyze_dump = true;
-        LOG_INFO(Render_Vulkan, "[BB_ANALYZE] frame={} dispatch {}", g_frame_no, g_frame.draws);
+        AnalyzeLog("[BB_ANALYZE] frame={} dispatch {}", g_frame_no, g_frame.draws);
         ++g_dump_lines;
     }
 }
@@ -873,14 +953,14 @@ void OnVertexConstants(const void* data, size_t size) {
     auto& f = g_frame;
     const u64 draw = f.draws;
     bool counted_draw = f.scanned_draw == draw;
-    if (g_draw.analyze_dump && g_dump_lines < 1500 && g_dump_cbs < 24) {
+    if (g_draw.analyze_dump && g_dump_lines < 1500 && g_dump_cbs < 64) {
         ++g_dump_cbs;
         const float* v = static_cast<const float*>(data);
         std::string text;
         for (size_t i = 0; i < std::min<size_t>(size / 4, 48); ++i) {
             text += fmt::format("{}{:.4g}", i % 4 == 0 ? (i ? " | " : "") : " ", v[i]);
         }
-        LOG_INFO(Render_Vulkan, "[BB_ANALYZE]   cb {:#x} size {} : {}",
+        AnalyzeLog("[BB_ANALYZE]   cb {:#x} size {} : {}",
                  reinterpret_cast<uintptr_t>(data), size, text);
         ++g_dump_lines;
     }
@@ -907,7 +987,7 @@ void OnVertexConstants(const void* data, size_t size) {
                 continue;
             }
             if (g_draw.analyze_dump && g_dump_lines < 1500) {
-                LOG_INFO(Render_Vulkan,
+                AnalyzeLog(
                          "[BB_ANALYZE]   camera candidate in cb {:#x}+{:#x} ({} layout{}): "
                          "{:.4g} {:.4g} {:.4g} {:.4g} / {:.4g} {:.4g} {:.4g} {:.4g} / {:.4g} "
                          "{:.4g} {:.4g} {:.4g} / {:.4g} {:.4g} {:.4g} {:.4g}",
@@ -949,7 +1029,7 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     std::scoped_lock lk{g_mutex};
     auto& f = g_frame;
     if (g_draw.analyze_dump && g_dump_lines < 1500) {
-        LOG_INFO(Render_Vulkan, "[BB_ANALYZE]   samples {:#x} {}x{} {}{}{}", addr, width, height,
+        AnalyzeLog("[BB_ANALYZE]   samples {:#x} {}x{} {}{}{}", addr, width, height,
                  vk::to_string(format), addr == f.scene_color ? " [SCENE COLOUR]" : "",
                  addr == f.gb_depth ? " [SCENE DEPTH]" : "");
         ++g_dump_lines;

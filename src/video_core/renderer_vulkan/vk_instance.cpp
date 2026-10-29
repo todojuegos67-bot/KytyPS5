@@ -587,7 +587,37 @@ bool Instance::CreateDevice() {
                                             enabled_extensions.size(),
                                             fmt::join(enabled_extensions, " ")));
     }
-    auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+    vk::Result device_result = vk::Result::eErrorInitializationFailed;
+    vk::UniqueDevice dev{};
+    {
+        // (Under a crash guard when an upscaler is on: a crash inside the driver or Streamline is
+        // logged with the faulting module instead of closing silently.)
+        struct CreateArgs {
+            VkPhysicalDevice physical;
+            const VkDeviceCreateInfo* info;
+            VkDevice device;
+            VkResult result;
+        } args{physical_device, reinterpret_cast<const VkDeviceCreateInfo*>(&device_chain.get()),
+               VK_NULL_HANDLE, VK_ERROR_INITIALIZATION_FAILED};
+        const auto create = [](void* p) {
+            auto* a = static_cast<CreateArgs*>(p);
+            a->result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDevice(a->physical, a->info, nullptr,
+                                                                      &a->device);
+        };
+        if (BB::Upscale::Enabled()) {
+            std::string fault;
+            if (!BB::Upscale::GuardedCall(create, &args, fault)) {
+                BB::Upscale::Checkpoint(fmt::format("vkCreateDevice CRASHED: {}", fault));
+                return false;
+            }
+        } else {
+            create(&args);
+        }
+        device_result = static_cast<vk::Result>(args.result);
+        if (args.result == VK_SUCCESS) {
+            dev = vk::UniqueDevice(vk::Device(args.device));
+        }
+    }
     if (BB::Upscale::Enabled()) {
         BB::Upscale::Checkpoint(
             fmt::format("vkCreateDevice returned {}", vk::to_string(device_result)));

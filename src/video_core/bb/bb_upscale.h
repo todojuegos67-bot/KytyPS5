@@ -64,6 +64,9 @@ bool BackendReady();
 // Records the selected back end; any failure (an error or a crash inside it) turns it off for the
 // rest of the session, so the game runs native instead of closing.
 bool RunBackend(const SR::Desc& desc);
+// Runs fn(arg) under a crash guard (Windows SEH): false on a crash, with the exception code,
+// address and faulting module in `fault`.
+bool GuardedCall(void (*fn)(void*), void* arg, std::string& fault);
 // A start-up checkpoint: written and flushed at once to bb_upscale_init.log (next to the working
 // directory's shadPS4 log is asynchronous and may be cut off by a crash) and to the log.
 void Checkpoint(std::string_view text);
