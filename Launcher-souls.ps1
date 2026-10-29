@@ -813,7 +813,7 @@ function Get-ResFamilies {
 	# (10-22) Modo Souls equilibrado: frame generation de AMD, asi que sin DLSS (XeSS, FSR o el del juego).
 	if ($chkLowEnd45 -and $chkLowEnd45.Checked) { return @('', 'dlss', 'xess', 'fsr', 'fsr4', 'juego') }  # (10-23) DLSS tambien
 	$cfg = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
-	if ($cfg -like 'dlss*') { return @('', 'dlss', 'juego') }
+	if ($cfg -like 'dlss*') { return @('', 'dlss', 'xess', 'fsr', 'fsr4', 'juego') }  # (10-29) frame generation de NVIDIA con cualquier reescalador
 	if ($cfg -like 'fsr3*') { return @('', 'dlss', 'xess', 'fsr', 'fsr4', 'juego') }  # (10-23) DLSS + frame generation de AMD (prueba)
 	return @('', 'dlss', 'xess', 'fsr', 'fsr4', 'juego')
 }
