@@ -378,14 +378,37 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 	}
 	if (list != nullptr) {
 		const float lw = std::max(320.0f * g_unit, w * 0.45f);
-		ImGui::SetNextWindowPos({at.x + w - lw, at.y + h});
-		ImGui::SetNextWindowSizeConstraints({lw, 0}, {lw, std::min(ImGui::GetIO().DisplaySize.y * 0.6f, 520.0f * g_unit)});
-		if (ImGui::BeginPopup("##list")) { // g_popup is set from IsPopupOpen: Circle closes this list, not the menu
+		// (10-29) Keep the list inside the window and the viewport: cap its height to the room there is, open it upward
+		// when there is more room above than below; when capped it scrolls (wheel, D-pad/arrows, scrollbar).
+		const ImGuiStyle& st     = ImGui::GetStyle();
+		const ImGuiViewport* vp  = ImGui::GetMainViewport();
+		const ImRect root        = ImGui::GetCurrentWindow()->RootWindow->Rect();
+		const float  top         = std::max(vp->WorkPos.y, root.Min.y) + 4.0f * g_unit;
+		const float  bottom      = std::min(vp->WorkPos.y + vp->WorkSize.y, root.Max.y) - 4.0f * g_unit;
+		const float  left        = std::max(vp->WorkPos.x, root.Min.x);
+		const float  rightEdge   = std::min(vp->WorkPos.x + vp->WorkSize.x, root.Max.x);
+		const float  itemH       = 40.0f * g_unit;
+		const float  full        = count * itemH + std::max(0, count - 1) * st.ItemSpacing.y + st.WindowPadding.y * 2.0f;
+		const float  below       = std::max(0.0f, bottom - (at.y + h));
+		const float  above       = std::max(0.0f, at.y - top);
+		const bool   up          = full > below && above > below;
+		const float  room        = std::max(itemH + st.WindowPadding.y * 2.0f, up ? above : below);
+		const float  lh          = std::min(full, std::min(room, bottom - top));
+		float        lx          = std::min(at.x + w - lw, rightEdge - lw);
+		lx                       = std::max(lx, left);
+		float ly                 = up ? at.y - lh : at.y + h;
+		ly                       = std::clamp(ly, top, std::max(top, bottom - lh));
+		ImGui::SetNextWindowPos({lx, ly});
+		ImGui::SetNextWindowSize({std::min(lw, rightEdge - left), lh});
+		const ImGuiWindowFlags pf = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+		                             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+		                             (full > lh ? ImGuiWindowFlags_AlwaysVerticalScrollbar : ImGuiWindowFlags_NoScrollbar);
+		if (ImGui::BeginPopupEx(ImGui::GetID("##list"), pf)) { // g_popup is set from IsPopupOpen: Circle closes this list, not the menu
 			for (int i = 0; i < count; i++) {
 				const bool on = i == current;
 				ImGui::PushID(i);
 				if (on) ImGui::PushStyleColor(ImGuiCol_Text, kGold);
-				if (ImGui::Selectable(I18n::T((*list)(i)), on, ImGuiSelectableFlags_None, {0, 40.0f * g_unit})) {
+				if (ImGui::Selectable(I18n::T((*list)(i)), on, ImGuiSelectableFlags_None, {0, itemH})) {
 					if (i != current) {
 						current = i;
 						picked  = true;
@@ -399,6 +422,8 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 						ImGui::SetScrollHereY(0.5f);
 					}
 				}
+				// Keyboard / D-pad moving the selection past the visible edge scrolls the list with it.
+				if (ImGui::IsItemFocused() && !ImGui::IsWindowAppearing() && !ImGui::IsItemVisible()) ImGui::SetScrollHereY(0.5f);
 				ImGui::PopID();
 			}
 			ImGui::EndPopup();
