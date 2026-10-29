@@ -43,6 +43,10 @@ extern const int     kLanguageCount;
 // (10-23) Calidad grafica (Launcher-souls.ps1's graphics group): the game's own settings (KYTY_GAME_CONVARS).
 extern const Choice  kShadows[];
 extern const int     kShadowCount;
+extern const Choice  kIbl[];         // (10-29) Iluminacion IBL: Mitad, Completa
+extern const int     kIblCount;
+extern const Choice  kTess[];        // (10-29) Teselado: Bajo, Medio, Alto, Ultra, Extremo
+extern const int     kTessCount;
 extern const Choice  kDetails[];
 extern const int     kDetailCount;
 extern const Choice  kReflections[];  // also the object fade's levels
@@ -121,6 +125,8 @@ struct Settings {
 	bool        gpu8 = false;        // Optimizacion tarjetas 8 GB (the menu sets the light preset)
 	std::string shadows = "maximo";  // maximo, alto (190 m), medio (125 m), bajo (60 m)
 	std::string detail = "alto";     // ultra, muy-alto, alto (the game's), normal, bajo
+	std::string ibl = "";            // iluminacion_ibl: mitad (HalfResX), completa (Full); empty: by the output (4K completa, else mitad)
+	std::string tess = "";           // teselado: bajo, medio, alto, ultra, extremo; empty: by the output (4K alto, else medio)
 	std::string reflections = "alto"; // ultra, alto (the game's), normal, bajo
 	std::string object_fade = "alto";
 	std::string aa_sharp = "normal"; // ultra, alto, normal (the game's), bajo, no
@@ -209,6 +215,11 @@ LaunchPlan BuildLaunch(const Settings& settings, const std::string& title_id, co
 // on an RTX 5080 + Ryzen 9 9950X3D at 4K). Writes only graphics, ray tracing and the RAM option into `settings`;
 // returns the explanation lines ("Hemos elegido: ...").
 std::vector<std::string> Optimize(const PcInfo& pc, Settings* settings);
+// (10-29) The output height (full screen mode / desktop, or the window), and the IBL / tessellation defaults for it
+// (4K: completa + alto, else mitad + medio). ResolveQualityAuto fills an empty ibl / tess with them.
+int  OutputHeight(const Settings& settings, const PcInfo& pc);
+void SetQualityForOutput(Settings* settings, int out_h);
+void ResolveQualityAuto(Settings* settings, const PcInfo& pc);
 // Ray tracing rows (Reflejos, Antorchas, Luz volumetrica, and since 10-28 Oclusion ambiental (8), Luz de antorchas RT (16),
 // Destellos de lente (32), Sombras RT (64)) turned off in the menu are applied live (PortLive::rt_off);
 // turning them on, or anything else, needs a restart.

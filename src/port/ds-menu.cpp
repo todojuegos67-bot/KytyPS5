@@ -938,7 +938,11 @@ void ResolutionRow(Settings& s) {
 			s.width  = w;
 			s.height = h;
 		}
+		// (10-29) A 4K output: Iluminacion IBL Completa + Teselado Alto; any other: Mitad + Medio (changeable after).
+		SetQualityForOutput(&s, OutputHeight(s, g_rt.pc));
 	}
+	// (10-29) The game always starts in its performance mode (no 30 cap); at 4K with the cinematic quality.
+	ImGui::TextColored(kDim, "%s", I18n::T(OutputHeight(s, g_rt.pc) >= 2160 ? "Cinemático sin tope 30" : "Modo rendimiento"));
 }
 
 // (10-28) The Configurador: the detected hardware, "Optimizar según tu equipo" (Optimize, ds-settings.cpp) and "Continuar".
@@ -1214,6 +1218,9 @@ void Draw(float width, float height) {
 					ChoiceRow("Distancia", true, kQualities, kQualityCount, s.quality, "Distancia de dibujado: a menos nivel, los objetos lejanos pasan antes a modelos más simples. Más FPS si va justo el procesador.");
 					ChoiceRow("Sombras", true, kShadows, kShadowCount, s.shadows, "Sombras: Medio = las del sol hasta 125 m, Bajo = hasta 60 m y sin sombras de focos ni ambientales. Más FPS, pero pueden aparecer de golpe.");
 					ChoiceRow("Detalle", true, kDetails, kDetailCount, s.detail, "Detalle del juego: sombras (cascadas y distancia), iluminación de entorno y relieve (teselado). Ultra > Muy alto (modo cine) > Alto (modo rendimiento de PS5) > Normal > Bajo.");
+					ResolveQualityAuto(&s, g_rt.pc);
+					ChoiceRow("Iluminación IBL", true, kIbl, kIblCount, s.ibl, "Resolución de la iluminación de entorno (IBL) del juego: Completa = la del modo cine de PS5, más fina; Mitad = la del modo rendimiento. Con 4K empieza en Completa, con otras salidas en Mitad.");
+					ChoiceRow("Teselado", true, kTess, kTessCount, s.tess, "Relieve por teselado del juego (suelos, muros, piedras): Bajo, Medio, Alto (el del modo cine de PS5), Ultra y Extremo (más relieve y más lejos; cuesta GPU). Con 4K empieza en Alto, con otras salidas en Medio.");
 					ChoiceRow("Reflejos", true, kReflections, kReflectionCount, s.reflections, "Reflejos del propio juego (agua, charcos, suelos): más pasos y más alcance en Ultra. Cuesta algo de GPU.");
 					CheckRow("Filtrado anisotrópico x16", true, s.af16, "Filtrado anisotrópico x16: suelos y paredes nítidos a lo lejos y en ángulo. Cuesta muy poco.");
 					ChoiceRow("Nitidez de texturas", true, kTextureSharpness, kTextureSharpnessCount, s.texture_sharpness,

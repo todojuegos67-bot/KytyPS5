@@ -63,6 +63,10 @@ const Choice kTextureReduce[] = {{"0", "Maximo"}, {"h", "Alto"}, {"1", "Medio"},
 const int    kTextureReduceCount = 4;
 const Choice kShadows[] = {{"maximo", "Maximo"}, {"alto", "Alto"}, {"medio", "Medio"}, {"bajo", "Bajo"}};
 const int    kShadowCount = 4;
+const Choice kIbl[] = {{"mitad", "Mitad"}, {"completa", "Completa"}};
+const int    kIblCount = 2;
+const Choice kTess[] = {{"bajo", "Bajo"}, {"medio", "Medio"}, {"alto", "Alto"}, {"ultra", "Ultra"}, {"extremo", "Extremo"}};
+const int    kTessCount = 5;
 const Choice kDetails[] = {{"ultra", "Ultra"}, {"muy-alto", "Muy alto (cine)"}, {"alto", "Alto (rendimiento de PS5)"}, {"normal", "Normal"}, {"bajo", "Bajo"}};
 const int    kDetailCount = 5;
 const Choice kReflections[] = {{"ultra", "Ultra"}, {"alto", "Alto (de serie)"}, {"normal", "Normal"}, {"bajo", "Bajo"}};
@@ -208,6 +212,10 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	num("ancho", s->width);
 	num("alto", s->height);
 	str("resolucion", s->resolution);
+	str("iluminacion_ibl", s->ibl);
+	if (s->ibl != "mitad" && s->ibl != "completa") s->ibl.clear();
+	str("teselado", s->tess);
+	if (s->tess != "bajo" && s->tess != "medio" && s->tess != "alto" && s->tess != "ultra" && s->tess != "extremo") s->tess.clear();
 	if (s->resolution.empty()) s->resolution = "escritorio";
 	boo("hdr", s->hdr);
 	boo("vsync", s->vsync);
@@ -315,6 +323,9 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Copia de seguridad de _SaveData en _SaveData-copias antes de jugar\n"
 	  << "copia_partidas=" << b(s.backup_saves) << "\n\n"
 	  << "[Pantalla]\n"
+	  << "; Iluminacion IBL: mitad, completa; Teselado: bajo, medio, alto, ultra, extremo (vacio: segun la salida, 4K completa + alto, si no mitad + medio)\n"
+	  << "iluminacion_ibl=" << s.ibl << "\n"
+	  << "teselado=" << s.tess << "\n"
 	  << "pantalla_completa=" << b(s.fullscreen) << "\n"
 	  << "; Tamano de la ventana (sin pantalla completa)\n"
 	  << "ancho=" << s.width << "\nalto=" << s.height << "\n"
@@ -796,8 +807,8 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (demons) {
 		int out_h = s.fullscreen && pc.screen_h > 0 ? pc.screen_h : (s.height > 0 ? s.height : 1440);
 		if (int w = 0, h = 0; s.fullscreen && std::sscanf(s.resolution.c_str(), "%dx%d", &w, &h) == 2 && h > 0) out_h = h;
-		// (10-29, the owner) Always Rendimiento (Cinematico held the cutscenes at 30); a 4K output gets the cinematic
-		// renderconfig quality instead, first in KYTY_GAME_CONVARS_EXTRA (the user's game settings after it win).
+		// (10-29, the owner) Always Rendimiento (Cinematico held the cutscenes at 30); the cinematic quality comes from
+		// Iluminacion IBL / Teselado (4K defaults: Completa + Alto), first in KYTY_GAME_CONVARS_EXTRA below.
 		env.Set("KYTY_DS_FORCE_MODE", "performance");
 		cine4k = out_h >= 2160;
 	}
@@ -855,12 +866,19 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		    {"medio", "sunShadowMaxDistance=125;sunShadowLightDistance=1000"},
 		    {"bajo", "sunShadowMaxDistance=60;sunShadowLightDistance=1000;r_enableAmbientShadowing=false;r_enableSpotShadows=false"}};
 		if (auto it = shadows.find(s.shadows); it != shadows.end()) env.AppendConvars(it->second);
-		if (cine4k) {
-			std::string x = "r_iblResolution=Full;r_tessellationDensity=18.0;r_tessellationSmallestEdgeLength=0.02;r_tessellationFadeOutStart=15.0;"
-			                "r_tessellationFadeOutRange=3.0";
-			// The user's Detalle / Sombras choices again after it (EXTRA is applied after KYTY_GAME_CONVARS).
-			if (auto it = details.find(s.detail); it != details.end()) x += ";" + it->second;
-			if (auto it = shadows.find(s.shadows); it != shadows.end()) x += ";" + it->second;
+		{
+			// (10-29) Iluminacion IBL and Teselado: first in KYTY_GAME_CONVARS_EXTRA (applied after KYTY_GAME_CONVARS, so they
+			// win over Detalle's own IBL / tessellation values); a user's own extra list after them.
+			const std::string ibl  = !s.ibl.empty() ? s.ibl : cine4k ? "completa" : "mitad";
+			const std::string tess = !s.tess.empty() ? s.tess : cine4k ? "alto" : "medio";
+			static const std::map<std::string, std::string> tess_cv = {
+			    {"bajo", "r_tessellationDensity=4.0;r_tessellationSmallestEdgeLength=0.08;r_tessellationFadeOutStart=6.0;r_tessellationFadeOutRange=2.0"},
+			    {"medio", "r_tessellationDensity=8.0;r_tessellationSmallestEdgeLength=0.04;r_tessellationFadeOutStart=12.0;r_tessellationFadeOutRange=3.0"},
+			    {"alto", "r_tessellationDensity=18.0;r_tessellationSmallestEdgeLength=0.02;r_tessellationFadeOutStart=15.0;r_tessellationFadeOutRange=3.0"},
+			    {"ultra", "r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.015;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0"},
+			    {"extremo", "r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.01;r_tessellationFadeOutStart=40.0;r_tessellationFadeOutRange=8.0"}};
+			std::string x = std::string("r_iblResolution=") + (ibl == "completa" ? "Full" : "HalfResX");
+			if (auto it = tess_cv.find(tess); it != tess_cv.end()) x += ";" + it->second;
 			if (const std::string old = env.Get("KYTY_GAME_CONVARS_EXTRA"); !old.empty()) x += ";" + old;
 			env.Set("KYTY_GAME_CONVARS_EXTRA", x);
 		}
@@ -988,7 +1006,7 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.pad_map != n.pad_map || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
 	       l.safe_gpu != n.safe_gpu || l.quality != n.quality || l.texture_reduce != n.texture_reduce ||
 	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.extra != n.extra ||
-	       l.rt_ss_refl != n.rt_ss_refl || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke ||
+	       l.rt_ss_refl != n.rt_ss_refl || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke || l.ibl != n.ibl || l.tess != n.tess ||
 	       l.torch != n.torch || l.lens_flare != n.lens_flare || l.rt_hw_exp != n.rt_hw_exp ||
 	       (l.sharpness == "auto") != (n.sharpness == "auto");
 }
@@ -1076,6 +1094,23 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 	RtAllOff(s);
 }
 
+
+int OutputHeight(const Settings& s, const PcInfo& pc) {
+	int out_h = s.fullscreen && pc.screen_h > 0 ? pc.screen_h : (s.height > 0 ? s.height : 1440);
+	if (int w = 0, h = 0; s.fullscreen && std::sscanf(s.resolution.c_str(), "%dx%d", &w, &h) == 2 && h > 0) out_h = h;
+	return out_h;
+}
+
+void SetQualityForOutput(Settings* s, int out_h) {
+	s->ibl  = out_h >= 2160 ? "completa" : "mitad";
+	s->tess = out_h >= 2160 ? "alto" : "medio";
+}
+
+void ResolveQualityAuto(Settings* s, const PcInfo& pc) {
+	const int out_h = OutputHeight(*s, pc);
+	if (s->ibl.empty()) s->ibl = out_h >= 2160 ? "completa" : "mitad";
+	if (s->tess.empty()) s->tess = out_h >= 2160 ? "alto" : "medio";
+}
 
 std::string LampLevel(const Settings& s) {
 	if (s.rt_lamps == "0" || s.rt_lamps == "1" || s.rt_lamps == "2" || s.rt_lamps == "3") return s.rt_lamps;
