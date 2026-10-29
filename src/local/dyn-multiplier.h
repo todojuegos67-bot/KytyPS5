@@ -51,6 +51,9 @@ struct DynMultiplier {
 	int    down_from = 0, nodown = 0, nodown_len = 15, free_n = 0; // a step down off the cap under test; probes paused; windows free
 	int    low_n = 0, short_n = 0;         // windows in a row under the level's minimum / under 90% of the target
 	int    qdown_n = 0, qup_n = 0;         // quality rule: windows in a row a lower level fits / shown under (q - 0.05) T
+	const char* reason = "start";          // 10-29: why the last switch was made (log)
+	double next_est = 0.0;                 // 10-29: the free estimate of the level switched to (log)
+	int    collapse_n = 0;                 // 10-29: windows in a row real far under what the level below predicts
 
 	static double Quality() {
 		static const double q = [] {
@@ -121,7 +124,9 @@ struct DynMultiplier {
 		last_free = free[m];
 		low_n     = real < MinReal(m) ? low_n + 1 : 0;
 		short_n   = std::min(real * m, T) < 0.9 * T ? short_n + 1 : 0;
-		auto go = [&](int to) {
+		auto go = [&](int to, const char* why = "rule") {
+			reason   = why;
+			next_est = Estimate(to, real, m);
 			settle  = 2;
 			up_n    = 0;
 			pinned  = 0;
@@ -146,7 +151,7 @@ struct DynMultiplier {
 				reverts[m] = std::min(reverts[m] + 1, 4);
 				block[m]   = 30 << (reverts[m] - 1);
 				free[m]  = 0.0;
-				return go(from);
+				return go(from, "step up not kept (shows < 5% more or real under the level's minimum)");
 			}
 			reverts[m] = 0; // kept
 		}
@@ -154,7 +159,7 @@ struct DynMultiplier {
 		if (m > 2 && (low_n >= 2 || m > maxm)) {
 			int to = std::min(m - 1, maxm);
 			while (to > 2 && free[to] > 0.0 && age[to] < 30 && free[to] < MinReal(to)) --to;
-			return go(to);
+			return go(to, "real under the level's minimum for 2 s");
 		}
 		// A step down off the cap under test: kept when it still shows >= 97% of the target, else back up and no
 		// step-down probe for 30 s, doubling per failed probe up to 4 min (a game held at 60 is not probed often).
@@ -166,9 +171,26 @@ struct DynMultiplier {
 				std::printf("[dyn] step down to x%d reverted: shown %.1f < %.1f\n", m, std::min(real * m, T), keep);
 				nodown_len = std::min(nodown_len * 2, 240);
 				nodown     = nodown_len;
-				return go(from);
+				return go(from, "step down reverted (shows under the keep rate)");
 			}
 			nodown_len = 15;
+		}
+		// 10-29: a real rate far under what the level below predicts for this one (free[m - 1] plus one generated
+		// frame's cost) is the emulator's own pacing collapsing (log 20261029-032959: x4 with the game's flips held at
+		// 56 fell 59 -> 36 real, then x5/x6 climbed on it), not the GPU: never a reason to go up. Back one level, and
+		// that level is not blocked (the pacing, not the GPU, failed); the step up is retried only by the rules.
+		{
+			const double below = m > 2 && free[m - 1] > 0.0 && age[m - 1] < 30 ? free[m - 1] : 0.0;
+			const double pred  = below > 0.0 ? 1.0 / (1.0 / below + (cost > 0.0 ? cost : 0.08 / below)) : 0.0;
+			collapse_n         = pred > 0.0 && real < 0.8 * std::min(pred, cap) ? collapse_n + 1 : 0;
+			if (collapse_n >= 2) {
+				std::printf("[dyn] x%d collapse: real %.1f < 80%% of %.1f predicted from x%d's free %.1f (pacing, not the GPU)\n", m, real,
+				            std::min(pred, cap), m - 1, below);
+				collapse_n = 0;
+				free[m]    = 0.0;
+				noup       = 10;
+				return go(m - 1, "real collapsed under the lower level's prediction (pacing)");
+			}
 		}
 		// 10-23 quality rule: the lowest multiplier that still shows q * target, with hysteresis (see the top).
 		if (const double q = Quality(); q > 0.0) {
@@ -181,24 +203,33 @@ struct DynMultiplier {
 					std::printf("[dyn] headroom: x%d -> x%d (real %.1f, x%d shows %.1f >= %.1f)\n", m, m - 1, real, m - 1,
 					            real * (m - 1), q * T);
 					noup = 5;
-					return go(m - 1);
+					return go(m - 1, "headroom: one level less still shows q x target");
 				}
-				if (!fits && pinned >= 3) { // held on target / m: the game may run faster with fewer generated frames
+				// 10-29: no probe when the level below is known (recent) not to reach the keep rate: x4 held at 56 on 224
+				// with x3 measured at 60 (180 < 212.8) bounced x4 -> x3 -> x4 and often stayed at x3 showing 180.
+				const bool below_short = free[m - 1] > 0.0 && age[m - 1] < 240 && free[m - 1] * (m - 1) < q * T;
+				if (!fits && pinned >= 3 && !below_short) { // held on target / m: the game may run faster with fewer generated frames
 					std::printf("[dyn] headroom probe: x%d -> x%d (real %.1f held at the cap %.1f)\n", m, m - 1, real, cap);
 					noup      = 5;
 					down_from = m;
-					return go(m - 1);
+					return go(m - 1, "headroom probe (held on the cap target / m)");
 				}
 			} else {
 				qdown_n = 0;
 			}
 			const int up = m + 1;
+			// 10-29: the smallest multiplier that reaches ~target: up only while the next level's free estimate meets
+			// its own minimum; x(m + 1) at target / (m + 1) when the measured rate reaches it (60 real at x3 -> x4 at
+			// 56). A step-up block from a pacing collapse does not hold a level whose estimate reaches target / up.
+			const double est_up = Estimate(up, real, m);
+			if (up <= maxm && block[up] > 0 && qup_n >= 3 && real >= 0.97 * T / up && est_up >= 0.97 * T / up) block[up] = 0;
 			if (up <= maxm && block[up] == 0 && noup == 0 && qup_n >= 3 && real >= MinReal(up)) {
 				std::printf("[dyn] x%d shows %.1f < %.1f for 3 s: up to x%d\n", m, shown, (q - 0.05) * T, up);
 				check_from  = m;
 				check_real  = real;
 				check_shown = shown;
-				return go(up);
+				return go(up, real >= 0.97 * T / up ? "shows < (q - 0.05) x target for 3 s; real reaches target / (m + 1)"
+				                                    : "shows < (q - 0.05) x target for 3 s; real under target / (m + 1), more frames needed");
 			}
 			return m;
 		}
@@ -216,7 +247,7 @@ struct DynMultiplier {
 				noup      = 10;
 				down_from = m;
 				free_n    = 0;
-				return go(m - 1);
+				return go(m - 1, "on the cap; the lower level's free rate reaches the target");
 			}
 		}
 		const int up = m + 1;
@@ -225,7 +256,7 @@ struct DynMultiplier {
 				check_from  = m;
 				check_real  = real;
 				check_shown = std::min(real * m, T);
-				return go(up);
+				return go(up, "the next level shows more (estimate)");
 			};
 			// The real rate is the game's own cap (56-60): the next level within target * 1.03 keeps it, so no estimate.
 			// Under 90% of the target for 5 s with real meeting the next level's minimum: probe it (the check reverts).
