@@ -35,6 +35,11 @@ struct View {
 	bool        running = false, finished = false, failed = false, playable = false; // playable: recorded play merged
 	int         done = 0, total = 0;
 	std::string text;
+	// (ds-pc-port11) The counting text's parts, for the launcher's own (translated) progress panel: the time left in
+	// seconds (-1: still estimating), the percent it resumed from (0: a fresh start), waiting for free memory.
+	long long eta_s       = -1;
+	int       resumed_pct = 0;
+	bool      waiting_mem = false;
 };
 View State();
 

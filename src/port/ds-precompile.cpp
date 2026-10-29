@@ -269,9 +269,13 @@ void Work() {
 			g_view.done = done;
 			const int pct = done * 100 / kShards;
 			std::string eta = "calculando el tiempo restante";
+			g_view.eta_s       = -1;
+			g_view.resumed_pct = resumed_pct;
+			g_view.waiting_mem = waiting_memory;
 			if (done_here > 0) {
 				const auto spent = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - begin).count();
 				const long long left = spent * (kShards - done) / done_here;
+				g_view.eta_s         = left;
 				eta = "quedan unos " + (left >= 3600 ? std::to_string(left / 3600) + " h " + std::to_string(left % 3600 / 60) + " min"
 				                                      : std::to_string(std::max<long long>(1, left / 60)) + " min");
 			}

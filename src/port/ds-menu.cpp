@@ -2541,6 +2541,71 @@ void LauncherTrophiesBox() {
 	RowEnd(ly, 306);
 }
 
+// (ds-pc-port11) Text with a dark outline (shadow) for the shaders' panel: legible over the panel and over the gold bar.
+void ShadowText(ImDrawList* dl, ImFont* font, float size, ImVec2 at, ImU32 col, const char* text, float wrap, bool outline = false) {
+	const float o = std::max(1.0f, size * 0.06f);
+	const ImU32 dark = IM_COL32(0, 0, 0, outline ? 235 : 190);
+	if (outline) {
+		for (int dx = -1; dx <= 1; dx++)
+			for (int dy = -1; dy <= 1; dy++)
+				if (dx != 0 || dy != 0) dl->AddText(font, size, {at.x + dx * o, at.y + dy * o}, dark, text, nullptr, wrap);
+	} else {
+		dl->AddText(font, size, {at.x + o, at.y + o}, dark, text, nullptr, wrap);
+	}
+	dl->AddText(font, size, at, col, text, nullptr, wrap);
+}
+
+// (ds-pc-port11) The animated hourglass beside the shaders' text while they precompile: the sand runs from the top bulb
+// into the bottom one, then the glass turns over (half a turn) and it starts again. Drawn every frame (the launcher
+// redraws at the display's refresh), from ImGui's clock.
+void DrawHourglass(ImDrawList* dl, ImVec2 c, float h, double t) {
+	constexpr double kRun = 2.6, kFlip = 0.6, kPi = 3.14159265358979323846;
+	const double     ph   = std::fmod(t, kRun + kFlip);
+	float            fill = 1.0f, angle = 0.0f;
+	if (ph < kRun) {
+		fill = static_cast<float>(ph / kRun);
+	} else {
+		const double k = (ph - kRun) / kFlip;
+		angle          = static_cast<float>(kPi * k * k * (3.0 - 2.0 * k)); // smoothstep
+	}
+	const float cs = std::cos(angle), sn = std::sin(angle);
+	const auto  P  = [&](float x, float y) { return ImVec2 {c.x + x * cs - y * sn, c.y + x * sn + y * cs}; };
+	const float hh = h * 0.5f, hw = h * 0.33f, gh = hh * 0.84f, nw = hw * 0.10f;
+	const ImU32 frame = IM_COL32(222, 196, 140, 255), glass = IM_COL32(236, 226, 205, 200), tint = IM_COL32(255, 255, 255, 26);
+	const ImU32 sand = IM_COL32(242, 196, 102, 255);
+	// The glass.
+	const ImVec2 top[3] = {P(-hw, -gh), P(hw, -gh), P(0, 0)};
+	const ImVec2 bot[3] = {P(0, 0), P(hw, gh), P(-hw, gh)};
+	dl->AddConvexPolyFilled(top, 3, tint);
+	dl->AddConvexPolyFilled(bot, 3, tint);
+	// The sand: what is left in the top bulb (a triangle down to the neck) and the heap in the bottom one.
+	const float s = std::sqrt(std::max(0.0f, 1.0f - fill)), k = 0.78f;
+	if (s > 0.02f) {
+		const ImVec2 st[3] = {P(-hw * k * s, -gh * s), P(hw * k * s, -gh * s), P(0, -gh * 0.03f)};
+		dl->AddConvexPolyFilled(st, 3, sand);
+	}
+	if (s < 0.98f) {
+		const ImVec2 sb[4] = {P(-hw * k * s, gh * std::max(s, 0.06f)), P(hw * k * s, gh * std::max(s, 0.06f)), P(hw * k, gh * 0.97f), P(-hw * k, gh * 0.97f)};
+		dl->AddConvexPolyFilled(sb, 4, sand);
+	}
+	// The falling stream, with grains running down it.
+	if (angle == 0.0f && fill > 0.0f && fill < 0.995f) {
+		const float y1 = gh * std::max(s, 0.06f);
+		dl->AddLine(P(0, 0), P(0, y1), sand, std::max(1.0f, h * 0.035f));
+		for (int i = 0; i < 3; i++) {
+			const float f = static_cast<float>(std::fmod(t * 2.2 + i / 3.0, 1.0));
+			dl->AddCircleFilled(P(0, y1 * f), std::max(1.0f, h * 0.035f), sand);
+		}
+	}
+	// The outline of the glass, the posts and the two caps.
+	const ImVec2 outline[6] = {P(-hw, -gh), P(hw, -gh), P(nw, 0), P(hw, gh), P(-hw, gh), P(-nw, 0)};
+	dl->AddPolyline(outline, 6, glass, ImDrawFlags_Closed, std::max(1.0f, h * 0.045f));
+	dl->AddLine(P(-hw * 1.18f, -hh), P(-hw * 1.18f, hh), frame, std::max(1.0f, h * 0.04f));
+	dl->AddLine(P(hw * 1.18f, -hh), P(hw * 1.18f, hh), frame, std::max(1.0f, h * 0.04f));
+	dl->AddLine(P(-hw * 1.4f, -hh), P(hw * 1.4f, -hh), frame, std::max(2.0f, h * 0.10f));
+	dl->AddLine(P(-hw * 1.4f, hh), P(hw * 1.4f, hh), frame, std::max(2.0f, h * 0.10f));
+}
+
 void DrawLauncher(float width, float height) {
 	DrainInputs();
 	EnsureBackground();
@@ -2613,8 +2678,49 @@ void DrawLauncher(float width, float height) {
 	// ---- The bottom of the column: the shaders' state, where JUGAR continues, JUGAR, Opciones and Salir. ----
 	const auto        pv   = Precompile::State();
 	const std::string when = s.continue_f1 ? Resume::Summary(g_rt.exe_path.parent_path()) : std::string();
-	float             bottom_h = U(58 + 8 + 40 + 16);
-	if (pv.running || !pv.finished || pv.failed) bottom_h += U(pv.running ? 44 : 26);
+	// (ds-pc-port11) The shaders' panel: its text in big light letters wrapped inside the column (an animated hourglass
+	// beside it while they precompile), then the progress bar with the percent and the parts, then Detener; all measured
+	// first so that nothing overlaps JUGAR below.
+	const bool  shader_row = pv.running || !pv.finished || pv.failed;
+	const float sh_pad = U(12), sh_glass = pv.running ? U(40) : 0.0f, sh_gap = pv.running ? U(12) : 0.0f;
+	const float sh_inner = U(420) - 2.0f * sh_pad;
+	const float sh_wrap  = sh_inner - sh_glass - sh_gap;
+	const float sh_head_size = U(20), sh_detail_size = U(17);
+	const bool  sh_button = pv.running || !pv.finished;
+	std::string sh_head, sh_detail;
+	float       sh_head_h = 0.0f, sh_detail_h = 0.0f, sh_text_h = 0.0f, sh_h = 0.0f;
+	if (shader_row) {
+		const std::string raw = pv.text.empty() ? std::string("Shaders: la cache de esta grafica ya esta preparada.") : pv.text;
+		const size_t      nl  = raw.find('\n');
+		sh_head               = I18n::T(raw.substr(0, nl).c_str());
+		if (nl != std::string::npos && pv.running) {
+			char part[128] = "";
+			if (pv.eta_s < 0) std::snprintf(part, sizeof(part), "%s", I18n::T("calculando el tiempo restante"));
+			else if (pv.eta_s >= 3600)
+				std::snprintf(part, sizeof(part), I18n::T("quedan unos %lld h %lld min"), pv.eta_s / 3600, pv.eta_s % 3600 / 60);
+			else std::snprintf(part, sizeof(part), I18n::T("quedan unos %lld min"), std::max<long long>(1, pv.eta_s / 60));
+			sh_detail = part;
+			if (pv.resumed_pct > 0) {
+				std::snprintf(part, sizeof(part), I18n::T("(retomada desde el %d %%)"), pv.resumed_pct);
+				sh_detail += std::string("  ") + part;
+			}
+			if (pv.waiting_mem) sh_detail += std::string("  ") + I18n::T("[esperando memoria libre]");
+		} else if (nl != std::string::npos) {
+			sh_detail = raw.substr(nl + 1);
+		}
+		ImGui::PushFont(g_font_semi, sh_head_size);
+		sh_head_h = ImGui::CalcTextSize(sh_head.c_str(), nullptr, false, sh_wrap).y;
+		ImGui::PopFont();
+		if (!sh_detail.empty()) {
+			ImGui::PushFont(g_font_semi, sh_detail_size);
+			sh_detail_h = U(6) + ImGui::CalcTextSize(sh_detail.c_str(), nullptr, false, sh_wrap).y;
+			ImGui::PopFont();
+		}
+		sh_text_h = std::max(sh_head_h + sh_detail_h, sh_glass > 0.0f ? U(50) : 0.0f);
+		sh_h      = sh_pad + sh_text_h + (pv.running ? U(12) + U(32) : 0.0f) + (sh_button ? U(12) + U(36) : 0.0f) + sh_pad;
+	}
+	float bottom_h = U(58 + 8 + 40 + 16);
+	if (shader_row) bottom_h += sh_h + U(14);
 	if (!when.empty()) bottom_h += U(26);
 	const float bottom_y = height - bottom_h - U(10);
 	// A dark backing under the column's text (only the column: the art stays as it is).
@@ -2631,31 +2737,51 @@ void DrawLauncher(float width, float height) {
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), 0});
 	g_lbox.at = {px + U(10), ImGui::GetCursorScreenPos().y};
 	g_lbox.w  = U(420);
-	if (pv.running || !pv.finished || pv.failed) {
+	if (shader_row) {
+		auto*       dl = ImGui::GetWindowDrawList();
 		const float sy = RowY();
-		float       ty = sy;
+		const float x0 = g_lbox.at.x, x1 = g_lbox.at.x + U(420);
+		// The semi-transparent dark panel (the art shows faintly through it).
+		dl->AddRectFilled({x0, sy}, {x1, sy + sh_h}, IM_COL32(5, 7, 11, 205), U(8));
+		dl->AddRect({x0, sy}, {x1, sy + sh_h}, IM_COL32(222, 196, 140, 120), U(8), 0, 1.25f);
+		const float tx = x0 + sh_pad + sh_glass + sh_gap;
+		float       cy = sy + sh_pad;
+		if (pv.running) DrawHourglass(dl, {x0 + sh_pad + sh_glass * 0.5f, cy + std::min(sh_text_h, U(64)) * 0.5f}, U(46), ImGui::GetTime());
+		const ImU32 head_col = ImGui::GetColorU32(pv.failed ? kWarn : kInkL);
+		ShadowText(dl, g_font_semi, sh_head_size, {tx, cy}, head_col, sh_head.c_str(), sh_wrap);
+		if (!sh_detail.empty())
+			ShadowText(dl, g_font_semi, sh_detail_size, {tx, cy + sh_head_h + U(6)}, ImGui::GetColorU32(kGoldL), sh_detail.c_str(), sh_wrap);
+		cy += sh_text_h;
 		if (pv.running) {
-			char label[64] = "";
-			if (pv.total > 0) std::snprintf(label, sizeof(label), "%d / %d", pv.done, pv.total);
-			ImGui::SetCursorScreenPos({g_lbox.at.x, sy});
-			ImGui::ProgressBar(pv.total > 0 ? static_cast<float>(pv.done) / static_cast<float>(pv.total) : -1.0f * static_cast<float>(ImGui::GetTime()),
-			                   {U(420), U(16)}, label);
-			ty = sy + U(20);
+			cy += U(12);
+			const float frac = pv.total > 0 ? static_cast<float>(pv.done) / static_cast<float>(pv.total) : -1.0f * static_cast<float>(ImGui::GetTime());
+			ImGui::SetCursorScreenPos({x0 + sh_pad, cy});
+			ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, U(5));
+			ImGui::ProgressBar(frac, {sh_inner, U(32)}, "");
+			ImGui::PopStyleVar();
+			char label[96] = "";
+			if (pv.total > 0)
+				std::snprintf(label, sizeof(label), I18n::T("%d %%   -   %d / %d partes"), pv.done * 100 / pv.total, pv.done, pv.total);
+			else std::snprintf(label, sizeof(label), "%s", I18n::T("Preparando..."));
+			ImGui::PushFont(g_font_semi, U(18));
+			const ImVec2 ls = ImGui::CalcTextSize(label);
+			ImGui::PopFont();
+			ShadowText(dl, g_font_semi, U(18), {x0 + sh_pad + (sh_inner - ls.x) * 0.5f, cy + (U(32) - ls.y) * 0.5f}, ImGui::GetColorU32(kInkL), label, 0.0f,
+			           true);
+			cy += U(32);
 		}
-		ImGui::SetCursorScreenPos({g_lbox.at.x, ty});
-		ImGui::PushFont(g_font_semi, U(14));
-		ImGui::TextColored(pv.failed ? kWarn : kInkL, "%s", pv.text.empty() ? I18n::T("Shaders: la cache de esta grafica ya esta preparada.") : I18n::T(pv.text.c_str()));
-		ImGui::PopFont();
-		if (pv.running) {
-			if (LButton("Detener", {g_lbox.at.x + U(320), ty}, {U(100), U(22)}, false, g_font_semi, U(13),
-			            "Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez)."))
-				std::thread([] { Precompile::Stop(); }).detach();
-		} else if (!pv.finished) {
-			if (LButton("Preparar shaders", {g_lbox.at.x + U(280), ty}, {U(140), U(22)}, false, g_font_semi, U(13),
-			            "Compila ya todos los pipelines del juego para esta grafica (evita tirones la primera vez)."))
+		if (sh_button) {
+			cy += U(12);
+			if (pv.running) {
+				if (LButton("Detener", {x0 + sh_pad, cy}, {U(180), U(36)}, false, g_font_semi, U(18),
+				            "Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez)."))
+					std::thread([] { Precompile::Stop(); }).detach();
+			} else if (LButton("Preparar shaders", {x0 + sh_pad, cy}, {U(240), U(36)}, false, g_font_semi, U(18),
+			                   "Compila ya todos los pipelines del juego para esta grafica (evita tirones la primera vez)."))
 				Precompile::Start();
 		}
-		RowEnd(sy, pv.running ? 44 : 26);
+		ImGui::SetCursorScreenPos({g_lbox.at.x, sy});
+		ImGui::Dummy({g_lbox.w, sh_h + U(14)});
 	}
 	if (!when.empty()) {
 		const float wy = RowY();
