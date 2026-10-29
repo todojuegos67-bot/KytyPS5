@@ -277,7 +277,10 @@ jobs:
           New-Item -ItemType Directory -Force "$out\LICENSES" | Out-Null
           Copy-Item fsr4_shaders\LICENSE-FSR4-v07.txt "$out\LICENSES\FSR4-v07-LICENSE.txt"
           # FSR 3 frame generation (KYTY_FSR3_FG): AMD's FidelityFX API DLL and its license.
-          Copy-Item _Build\deps\ffx\amd_fidelityfx_vk.dll, _Build\deps\ffx\FidelityFX-LICENSE.txt $out
+          # (ds-foveated-1029) The owner's tested patched x4 FidelityFX DLL (md5 62fb8b04...), committed, instead of the signed / built one.
+          $ffxPinned = 'tools\local\fsr3-mfg\prebuilt\amd_fidelityfx_vk.dll'
+          if ((Get-FileHash $ffxPinned -Algorithm MD5).Hash -ne '62FB8B049BFF9441323A4C5D0B4578E4') { throw 'the pinned amd_fidelityfx_vk.dll is not the x4 one (md5 62fb8b04...)' }
+          Copy-Item $ffxPinned, _Build\deps\ffx\FidelityFX-LICENSE.txt $out
           # The profile this build was optimized with (merged with the training runs, see "PGO profile").
           if (Test-Path tools\pgo\kyty.profdata) { Copy-Item tools\pgo\kyty.profdata "$out\kyty.profdata" }
           # The render-pass states the precompile program makes the seed file with: the first launch lists the
