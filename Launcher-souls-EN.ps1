@@ -462,7 +462,8 @@ function Start-Game {
 	# un tope a 56 los 60 del juego se comian 4 frames por segundo (tirones cada 0.25 s).
 	# (10-21 b) Con frame generation siempre 840 Hz y cada frame sale en cuanto esta listo (FLIP_WHEN_READY): por debajo
 	# de 60 los frames ya no se redondean a la rejilla de vblanks (a 40 reales salian con +-3 ms de vaiven: tirones con G-Sync).
-	if ($config -like 'dlss*' -or $config -eq 'fsr3-mfg-dynamic.json') { $psargs += @('-Vblank', '840') }  # (10-21: 60 = 14 pulsos, 56 = 15)
+	if ($config -like 'dlss*') { $psargs += @('-Vblank', '840') }
+	elseif ($config -eq 'fsr3-mfg-dynamic.json') { $psargs += @('-Vblank', '900') }  # (10-29 prueba) 900 Hz: 60 y 75 caben, 56 no -> el juego no se frena a 56 con AMD x4  # (10-21: 60 = 14 pulsos, 56 = 15)
 	elseif ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
 	# Sin frame generation, "FPS desbloqueados": vblank de 120 Hz (-Fps120, el modo probado de chenxiao07; a 240 los menus y el intro iban acelerados, 10-18), el juego pasa de 60 (a velocidad real:
 	# gameMinDeltaTime en run-windows); videos, menus y pantallas de carga siguen a 60.
