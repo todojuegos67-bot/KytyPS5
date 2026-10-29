@@ -581,6 +581,47 @@ bool RecordHybrid(GraphicContext& graphics, vk::CommandBuffer command, const Ups
 bool g_timing_open = false;
 uint64_t g_torch_tracked_flip = ~0ull; // (ds-particles-1029: the flip TorchApply last tracked its lights in)
 uint32_t g_timing_entry = 0;
+// (all-1029) idle early-out: with no tracked light, no blob and no fade-out in progress the shadow march, temporal,
+// a-trous, light and flare passes are skipped (they added nothing but cost ~2 ms: "lights 0.00 a frame ... GPU 2.055 ms").
+// Detection and tracking (modes 0 / 1, a 32x18 grid and one thread) keep running; the decision comes from the stats
+// readback (a few frames late): blobs (stats[1]) and lights in use (stats[2], fading ones included) both unchanged for
+// IdleFrames tracked frames. A new fire resumes the passes within the readback lag, while its light is still fading in
+// (0.5 s), so the look with lights is unchanged. KYTY_TORCH_IDLE=0 turns the early-out off.
+constexpr uint32_t IdleFrames = 8;
+bool     g_torch_idle  = false;
+uint32_t g_idle_seen[3] {};
+uint32_t g_idle_count  = 0;
+bool     g_idle_primed = false;
+
+void UpdateIdle() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_TORCH_IDLE");
+		return v == nullptr || *v != '0';
+	}();
+	if (!enabled || g_tc.mapped == nullptr) {
+		g_torch_idle = false;
+		return;
+	}
+	const uint32_t cur[3] {g_tc.mapped[0], g_tc.mapped[1], g_tc.mapped[2]}; // (frames tracked, blobs, lights in use)
+	if (!g_idle_primed) {
+		std::copy(cur, cur + 3, g_idle_seen), g_idle_primed = true, g_idle_count = 0;
+	} else if (cur[0] != g_idle_seen[0]) {
+		if (cur[1] == g_idle_seen[1] && cur[2] == g_idle_seen[2]) g_idle_count += cur[0] - g_idle_seen[0];
+		else g_idle_count = 0;
+		std::copy(cur, cur + 3, g_idle_seen);
+	}
+	const bool idle = g_idle_count >= IdleFrames;
+	if (idle != g_torch_idle) {
+		static int said = 0;
+		if (said < 20) {
+			++said;
+			std::printf("TORCH: %s\n", idle ? "idle (no lights, blobs or fade-out): light / shadow / flare passes skipped, detection runs"
+			                                : "lights found: full passes again");
+			std::fflush(stdout);
+		}
+	}
+	g_torch_idle = idle;
+}
 
 void CloseTiming(vk::CommandBuffer command) {
 	if (!g_timing_open) return;
@@ -763,7 +804,9 @@ bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	g_tc.push = push;
 	const RtReflGbuffer* gb = gbuf_ok ? &gbuf : nullptr;
 	Record(command, inputs, gb, g_tc.out, push, {0, 1});
-	if (level > 0) {
+	UpdateIdle();
+	if (g_torch_idle) g_tc.shadow_history = false; // (the shadow history restarts when the passes resume)
+	if (level > 0 && !g_torch_idle) {
 		// The shadow: raw march (4), the hybrid's rays (torch-hw.comp), temporal (5), spatial (7), then the light (2).
 		const uint32_t cur = static_cast<uint32_t>(g_tc.frame & 1u), prev = cur ^ 1u;
 		TorchPush      sp  = push;
@@ -790,7 +833,7 @@ bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		CloseTiming(command);
 		++g_tc.frame;
 	}
-	if (level == 0) return false;
+	if (level == 0 || g_torch_idle) return false;
 	ReplaceColor(inputs, g_tc.out);
 	return true;
 }
@@ -799,7 +842,7 @@ bool TorchFlareApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	if (!TorchFlareWanted() || command == nullptr || g_tc.pipeline == nullptr) return false;
 	if (g_tc.tracked_frame != g_tc.frame) return false; // (TorchApply did not track this frame)
 	const auto& color = inputs.color;
-	bool ok = color.view != nullptr && color.extent == g_tc.extent && inputs.depth.view != nullptr;
+	bool ok = !g_torch_idle && color.view != nullptr && color.extent == g_tc.extent && inputs.depth.view != nullptr; // (all-1029: idle, nothing to draw)
 	if (ok) {
 		Barrier(command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
 		        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
