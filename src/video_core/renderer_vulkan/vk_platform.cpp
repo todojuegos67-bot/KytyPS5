@@ -427,8 +427,17 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     };
 
     if (BB::Upscale::Enabled()) {
-        BB::Upscale::Checkpoint(fmt::format("vkCreateInstance (layers: {}; extensions: {})",
-                                            layers_string, extensions_string));
+        std::string chain;
+        for (auto* node = static_cast<const VkBaseInStructure*>(instance_ci_chain.get().pNext);
+             node != nullptr; node = node->pNext) {
+            chain += fmt::format(" {}", vk::to_string(static_cast<vk::StructureType>(node->sType)));
+        }
+        BB::Upscale::Checkpoint(fmt::format(
+            "vkCreateInstance (api {}.{}; layers: {}; extensions: {}; pNext:{}; loader "
+            "vkGetInstanceProcAddr {})",
+            VK_VERSION_MAJOR(application_info.apiVersion),
+            VK_VERSION_MINOR(application_info.apiVersion), layers_string, extensions_string, chain,
+            reinterpret_cast<void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr)));
     }
     auto [instance_result, instance] = vk::createInstanceUnique(instance_ci_chain.get());
     if (BB::Upscale::Enabled()) {

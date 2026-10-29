@@ -606,6 +606,22 @@ bool Instance::CreateDevice() {
                                                        bb_f13, bb_f, const_cast<void*>(bb_ci.pNext));
     }
     if (BB::Upscale::Enabled()) {
+        std::string chain;
+        for (auto* node = static_cast<const VkBaseInStructure*>(device_chain.get().pNext);
+             node != nullptr; node = node->pNext) {
+            chain += fmt::format(" {}", vk::to_string(static_cast<vk::StructureType>(node->sType)));
+        }
+        const auto& f12 = device_chain.get<vk::PhysicalDeviceVulkan12Features>();
+        const auto& f13 = device_chain.get<vk::PhysicalDeviceVulkan13Features>();
+        BB::Upscale::Checkpoint(fmt::format(
+            "vkCreateDevice pNext chain:{} | queue family {} x1 | vk12 timelineSemaphore {} "
+            "bufferDeviceAddress {} | vk13 synchronization2 {} dynamicRendering {} "
+            "shaderIntegerDotProduct {} | vkGetDeviceProcAddr {}",
+            chain, queue_family_index, f12.timelineSemaphore, f12.bufferDeviceAddress,
+            f13.synchronization2, f13.dynamicRendering, f13.shaderIntegerDotProduct,
+            reinterpret_cast<void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr)));
+    }
+    if (BB::Upscale::Enabled()) {
         BB::Upscale::Checkpoint(fmt::format("vkCreateDevice with {} extensions: {}",
                                             enabled_extensions.size(),
                                             fmt::join(enabled_extensions, " ")));

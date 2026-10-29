@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -513,9 +514,35 @@ void Checkpoint(std::string_view text) {
     static u32 lines = 0;
     std::scoped_lock lk{m};
     if (file == nullptr && lines == 0) {
-        file = std::fopen("bb_upscale_init.log", "w");
+        // Appended, the last 3 runs kept: a crashing run survives the native run after it.
+        std::string old;
+        if (std::FILE* in = std::fopen("bb_upscale_init.log", "rb")) {
+            char buf[4096];
+            std::size_t n;
+            while ((n = std::fread(buf, 1, sizeof(buf), in)) > 0) old.append(buf, n);
+            std::fclose(in);
+        }
+        const std::string marker = "==== run ";
+        std::vector<std::size_t> starts;
+        for (std::size_t at = old.find(marker); at != std::string::npos;
+             at = old.find(marker, at + 1)) {
+            starts.push_back(at);
+        }
+        if (starts.size() >= 3) {
+            old = old.substr(starts[starts.size() - 2]);
+        }
+        file = std::fopen("bb_upscale_init.log", "wb");
+        if (file != nullptr) {
+            std::fwrite(old.data(), 1, old.size(), file);
+            const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            char when[64]{};
+            std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+            std::fprintf(file, "==== run %s (BB_UPSCALER=%s) ====\n", when,
+                         Env("BB_UPSCALER") ? Env("BB_UPSCALER") : "");
+            std::fflush(file);
+        }
     }
-    if (file != nullptr && lines < 400) {
+    if (file != nullptr && lines < 600) {
         std::fprintf(file, "%.*s\n", static_cast<int>(text.size()), text.data());
         std::fflush(file);
     }
@@ -534,6 +561,11 @@ bool Enabled() {
 }
 
 void PreInstance() {
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
     const auto& c = Cfg();
     if (!g_guard_skipped.empty()) {
         Checkpoint(g_guard_skipped);
@@ -556,6 +588,16 @@ void PreInstance() {
         Checkpoint("DLSS: loading Streamline (slInit)");
         if (!SR::Dlss::Preload()) {
             Checkpoint("DLSS: Streamline not loaded: DLSS off, the game runs native");
+        } else if (const wchar_t* loader = SR::Dlss::LoaderPath()) {
+#if defined(_WIN32)
+            char narrow[1024]{};
+            std::wcstombs(narrow, loader, sizeof(narrow) - 1);
+            SetEnvironmentVariableW(L"SDL_VULKAN_LIBRARY", loader);
+            _putenv_s("SDL_VULKAN_LIBRARY", narrow);
+            Checkpoint(fmt::format("DLSS: SDL_VULKAN_LIBRARY = {} (set before the window); "
+                                   "vulkan-1.dll already loaded: {}",
+                                   narrow, GetModuleHandleA("vulkan-1.dll") != nullptr));
+#endif
         }
     } else if (c.kind == SR::Kind::Xess) {
         SR::Xess::Load();

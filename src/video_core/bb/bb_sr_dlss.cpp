@@ -182,6 +182,8 @@ bool Preload() {
             return false;
         }
         const auto interposer = dir / "sl.interposer.dll";
+        BBLogf("DLSS: LoadLibrary %s (vulkan-1.dll already loaded: %d)", interposer.string().c_str(),
+               GetModuleHandleA("vulkan-1.dll") != nullptr ? 1 : 0);
         HMODULE module = LoadLibraryW(interposer.c_str());
         if (module == nullptr) {
             BBLogf("DLSS: cannot load %s: DLSS off", interposer.string().c_str());
@@ -223,6 +225,8 @@ bool Preload() {
         preferences.engineVersion = "1.0";
         preferences.projectId = "6a3f1d5e-4b7c-4f2a-9d8e-1c2b3a4d5e6f";
         preferences.renderAPI = sl::RenderAPI::eVulkan;
+        BBLogf("DLSS: slInit (features DLSS, DLSS-G, Reflex, PCL; plugins in %s)",
+               dir.string().c_str());
         if (const auto result = g_api.init(preferences, sl::kSDKVersion);
             result != sl::Result::eOk) {
             BBLogf("DLSS: slInit failed (%d): DLSS off", static_cast<int>(result));

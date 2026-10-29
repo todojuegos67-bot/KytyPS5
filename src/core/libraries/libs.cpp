@@ -109,6 +109,8 @@ static void RegisterAudio3d(Core::Loader::SymbolsResolver* sym) {
 
 void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
     LOG_INFO(Lib_Kernel, "Initializing HLE libraries");
+    LOG_INFO(Lib_Kernel, "bb-port: libSceAvPlayer registered at start-up (HLE, or the LLE "
+                         "libSceAvPlayer.sprx when it is in the system modules folder)");
 
     auto* game_info = Common::Singleton<Common::ElfInfo>::Instance();
     const auto& sys_module_path = EmulatorSettings.GetSysModulesDir();
