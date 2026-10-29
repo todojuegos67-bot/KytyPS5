@@ -505,31 +505,54 @@ uint32_t CallEvaluate(EvaluateFn, VkCommandBuffer, const void*, const NgxParamet
 uint32_t CallRelease(ReleaseFn, void*) { return 0xBAD00001u; }
 #endif
 
-// The runtime: found, signed, loaded, its exports and the caller identity, initialized on this device. Once.
-bool EnsureRuntime(GraphicContext& graphics) {
-	if (g_rt.ready) return true;
-	if (g_rt.tried) return false;
-	g_rt.tried = true;
 #if defined(_WIN32)
+std::filesystem::path ExeDir() {
 	wchar_t exe[MAX_PATH] {};
 	GetModuleFileNameW(nullptr, exe, MAX_PATH);
-	const auto dir = std::filesystem::path(exe).parent_path();
+	return std::filesystem::path(exe).parent_path();
+}
+std::string PathText(const std::filesystem::path& p) {
+	try {
+		const auto u8 = p.u8string();
+		return std::string(u8.begin(), u8.end());
+	} catch (...) {
+		return "?";
+	}
+}
+// nvngx_dlssnr.dll beside the emulator, in its streamline folder, or in KYTY_STREAMLINE_DIR; `searched` lists where.
+std::filesystem::path FindRuntime(std::string& searched) {
+	const auto dir = ExeDir();
 	std::vector<std::filesystem::path> candidates {dir / "nvngx_dlssnr.dll", dir / "streamline" / "nvngx_dlssnr.dll"};
 	if (const wchar_t* env = _wgetenv(L"KYTY_STREAMLINE_DIR"); env != nullptr && *env != L'\0')
 		candidates.push_back(std::filesystem::path(env) / "nvngx_dlssnr.dll");
 	std::filesystem::path found;
 	for (const auto& c: candidates) {
 		std::error_code error;
+		if (!searched.empty()) searched += ", ";
+		searched += PathText(c);
 		if (found.empty() && std::filesystem::exists(c, error)) found = c;
 	}
+	return found;
+}
+#endif
+
+// The runtime: found, signed, loaded, its exports and the caller identity, initialized on this device. Once.
+bool EnsureRuntime(GraphicContext& graphics) {
+	if (g_rt.ready) return true;
+	if (g_rt.tried) return false;
+	g_rt.tried = true;
+#if defined(_WIN32)
+	const auto dir = ExeDir();
+	std::string searched;
+	const std::filesystem::path found = FindRuntime(searched);
 	if (found.empty()) {
 		std::printf("DLSS-NR: nvngx_dlssnr.dll not found (looked in %s and %s\\streamline): DLSS 5 Neural Rendering and the "
 		            "foveated grid are off, the upscaler's picture as usual. Place NVIDIA's nvngx_dlssnr.dll there to use it.\n",
-		            dir.string().c_str(), dir.string().c_str());
+		            PathText(dir).c_str(), PathText(dir).c_str());
 		std::fflush(stdout);
 		return false;
 	}
-	g_rt.path = found.string();
+	g_rt.path = PathText(found);
 	if (!LocalPlatform::IsNvidiaSigned(found.wstring()) && !EnvOn("KYTY_DLSS_NR_UNSIGNED")) {
 		std::printf("DLSS-NR: %s is not signed by NVIDIA: not loaded (KYTY_DLSS_NR_UNSIGNED=1 loads it anyway). NR off.\n",
 		            g_rt.path.c_str());
@@ -982,7 +1005,46 @@ bool DlssNrWanted() {
 	return wanted;
 }
 
+// One start-up line, whatever the switches: what the emulator was given, where the DLL was looked for, whether the
+// NR hook (FrameGen::Upscale, the PS5 Pro path's upscaler pass) is reachable in this mode.
+static void StartupLine(const std::vector<vk::ExtensionProperties>* available) {
+	static bool said = false;
+	if (said) return;
+	said = true;
+	const auto env = [](const char* name) {
+		const char* v = std::getenv(name);
+		return std::string(v != nullptr ? (*v != '\0' ? v : "(empty)") : "(unset)");
+	};
+	std::string dll = "Windows only";
+#if defined(_WIN32)
+	std::string searched;
+	const auto  found = FindRuntime(searched);
+	dll               = found.empty() ? "nvngx_dlssnr.dll NOT found (looked at " + searched + ")" : "nvngx_dlssnr.dll found at " + PathText(found);
+#endif
+	const std::string up = env("KYTY_UPSCALER");
+	const bool reachable = up == "dlss" || up == "xess" || up == "fsr" || up == "fsr4";
+	std::string ext = "-";
+	if (available != nullptr) {
+		const auto has = [&](const char* name) {
+			return std::any_of(available->begin(), available->end(),
+			                   [&](const vk::ExtensionProperties& e) { return std::strcmp(e.extensionName.data(), name) == 0; });
+		};
+		ext = std::string("VK_NVX_binary_import ") + (has("VK_NVX_binary_import") ? "yes" : "no") + ", VK_NVX_image_view_handle " +
+		      (has("VK_NVX_image_view_handle") ? "yes" : "no");
+	}
+	std::printf("DLSS-NR: start-up: KYTY_FOVEATED=%s KYTY_DLSS_NR=%s KYTY_FOV_EDGE=%s KYTY_FOV_WIDTH=%s KYTY_FOV_HEIGHT=%s KYTY_FOV_FALLOFF=%s -> NR %s; "
+	            "%s; KYTY_UPSCALER=%s: the NR hook (after the upscaler on the PS5 Pro path) is %s; device: %s\n",
+	            env("KYTY_FOVEATED").c_str(), env("KYTY_DLSS_NR").c_str(), env("KYTY_FOV_EDGE").c_str(), env("KYTY_FOV_WIDTH").c_str(),
+	            env("KYTY_FOV_HEIGHT").c_str(), env("KYTY_FOV_FALLOFF").c_str(),
+	            DlssNrWanted() ? (EnvOn("KYTY_FOVEATED") ? "wanted, foveated" : "wanted, uniform") : "off (neither switch is 1)", dll.c_str(),
+	            up.c_str(), reachable ? "reachable (it runs once the game's 3D view reaches the upscaler)"
+	                                  : "NOT reachable: no upscaler (the game's own TAA); choose DLSS, XeSS or FSR in Reescalado",
+	            ext.c_str());
+	std::fflush(stdout);
+}
+
 void DlssNrAddDeviceExtensions(const std::vector<vk::ExtensionProperties>& available, std::vector<const char*>& extensions) {
+	StartupLine(&available);
 	if (!DlssNrWanted()) return;
 	for (const char* name: {"VK_NVX_binary_import", "VK_NVX_image_view_handle", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME}) {
 		const bool have = std::any_of(available.begin(), available.end(), [&](const vk::ExtensionProperties& e) {
@@ -996,13 +1058,35 @@ void DlssNrAddDeviceExtensions(const std::vector<vk::ExtensionProperties>& avail
 }
 
 bool DlssNrApply(vk::CommandBuffer command, const UpscaleInputs& inputs) {
+	StartupLine(nullptr);
+	{
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("DLSS-NR: the upscaler pass reached the NR hook (output %ux%u, format %d, usage 0x%x): NR %s\n", inputs.output.extent.width,
+			            inputs.output.extent.height, static_cast<int>(inputs.output.format),
+			            static_cast<uint32_t>(static_cast<VkImageUsageFlags>(inputs.output.usage)),
+			            DlssNrWanted() ? (g.disabled ? "wanted but off (see above)" : "wanted") : "off (KYTY_FOVEATED / KYTY_DLSS_NR not 1)");
+			std::fflush(stdout);
+		}
+	}
 	if (!DlssNrWanted() || g.disabled) return false;
-	GraphicContext* graphics = inputs.graphics;
-	if (graphics == nullptr || command == nullptr) return false;
-	const auto& out = inputs.output;
-	if (out.view == nullptr || out.image == nullptr || inputs.depth.view == nullptr || inputs.motion.view == nullptr ||
-	    out.extent.width < 64 || out.extent.height < 64 || !(out.usage & vk::ImageUsageFlagBits::eTransferSrc))
+	const auto skip = [](const char* why) {
+		static std::string last;
+		if (last != why) {
+			last = why;
+			std::printf("DLSS-NR: skipped: %s\n", why);
+			std::fflush(stdout);
+		}
 		return false;
+	};
+	GraphicContext* graphics = inputs.graphics;
+	if (graphics == nullptr || command == nullptr) return skip("no graphics context / command buffer");
+	const auto& out = inputs.output;
+	if (out.view == nullptr || out.image == nullptr) return skip("the upscaled output has no image / view");
+	if (inputs.depth.view == nullptr || inputs.motion.view == nullptr) return skip("no depth or motion vectors from the game");
+	if (out.extent.width < 64 || out.extent.height < 64) return skip("the output is smaller than 64x64");
+	if (!(out.usage & vk::ImageUsageFlagBits::eTransferSrc)) return skip("the output cannot be copied (no transfer-src usage)");
 	if (VideoOut::MoviePlaying()) {
 		g.pending_reset = true;
 		return false;
