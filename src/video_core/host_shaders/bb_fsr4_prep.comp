@@ -1,0 +1,32 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors (from the Demon's Souls fork, src/local/fsr4-prep.comp)
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 450
+// KYTY_UPSCALER=fsr4 (fsr4-sr.cpp): the model's inputs that the game's images do not give as it wants them. The depth
+// at the render size into an R32F image (1 - depth with KYTY_FSR4_DEPTH_INVERT, the default: the game's depth is
+// reversed, the shipped modules dilate motion vectors by the closest forward depth), and the game's exposure (its
+// float at `index` of the buffer; 0 = none, which the model reads as 1) into the 1x1 R32F exposure texture.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth_in;
+layout(std430, binding = 1) readonly buffer Exposure {
+	float values[];
+} exposure;
+layout(r32f, binding = 2) uniform writeonly image2D depth_out;
+layout(r32f, binding = 3) uniform writeonly image2D exposure_out;
+layout(push_constant) uniform Push {
+	uint index;
+	uint has_exposure;
+	uint invert;
+	uint width;
+	uint height;
+} push;
+
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (p == ivec2(0)) {
+		float e = push.has_exposure != 0u ? exposure.values[push.index] : 0.0;
+		imageStore(exposure_out, ivec2(0), vec4(isnan(e) || isinf(e) || e < 0.0 ? 0.0 : e, 0.0, 0.0, 0.0));
+	}
+	if (p.x >= int(push.width) || p.y >= int(push.height)) return;
+	float d = texelFetch(depth_in, p, 0).r;
+	imageStore(depth_out, p, vec4(push.invert != 0u ? 1.0 - d : d, 0.0, 0.0, 0.0));
+}

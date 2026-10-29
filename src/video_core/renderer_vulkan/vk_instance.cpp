@@ -12,6 +12,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
@@ -221,7 +222,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 64> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -338,6 +339,15 @@ bool Instance::CreateDevice() {
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+
+    // Bloodborne upscaling: what Streamline / XeSS / FSR ask of the device.
+    std::vector<const char*> bb_extensions(enabled_extensions.begin(), enabled_extensions.end());
+    BB::Upscale::AddDeviceExtensions(*instance, physical_device, available_extensions,
+                                     bb_extensions);
+    for (std::size_t i = enabled_extensions.size(); i < bb_extensions.size(); ++i) {
+        LOG_INFO(Render_Vulkan, "Enabling extension: {} (upscaler)", bb_extensions[i]);
+        enabled_extensions.push_back(bb_extensions[i]);
+    }
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
@@ -549,7 +559,39 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceImageViewMinLodFeaturesEXT>();
     }
 
+    {
+        auto& bb_ci = device_chain.get<vk::DeviceCreateInfo>();
+        auto& bb_f12 = device_chain.get<vk::PhysicalDeviceVulkan12Features>();
+        auto& bb_f13 = device_chain.get<vk::PhysicalDeviceVulkan13Features>();
+        auto& bb_f = device_chain.get<vk::PhysicalDeviceFeatures2>().features;
+        const std::vector<const char*> bb_enabled(enabled_extensions.begin(),
+                                                  enabled_extensions.end());
+        bb_ci.pNext = BB::Upscale::ChainDeviceFeatures(physical_device, bb_enabled, bb_f12,
+                                                       bb_f13, bb_f, const_cast<void*>(bb_ci.pNext));
+        bb_ci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
+        bb_ci.ppEnabledExtensionNames = enabled_extensions.data();
+    }
+    if (BB::Upscale::Enabled()) {
+        std::string chain;
+        for (auto* node = static_cast<const VkBaseInStructure*>(device_chain.get().pNext);
+             node != nullptr; node = node->pNext) {
+            chain += fmt::format(" {}", vk::to_string(static_cast<vk::StructureType>(node->sType)));
+        }
+        const auto& f13 = device_chain.get<vk::PhysicalDeviceVulkan13Features>();
+        BB::Upscale::Checkpoint(fmt::format(
+            "vkCreateDevice: queue family {}; pNext chain:{}; vk13 shaderIntegerDotProduct {}; "
+            "vkGetDeviceProcAddr {}",
+            queue_family_index, chain, f13.shaderIntegerDotProduct,
+            reinterpret_cast<void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr)));
+        BB::Upscale::Checkpoint(fmt::format("vkCreateDevice with {} extensions: {}",
+                                            enabled_extensions.size(),
+                                            fmt::join(enabled_extensions, " ")));
+    }
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+    if (BB::Upscale::Enabled()) {
+        BB::Upscale::Checkpoint(
+            fmt::format("vkCreateDevice returned {}", vk::to_string(device_result)));
+    }
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
         return false;
@@ -593,6 +635,8 @@ bool Instance::CreateDevice() {
     }
 
     CreateAllocator();
+    BB::Upscale::OnDevice(*instance, physical_device, *device, allocator, graphics_queue,
+                          queue_family_index);
     return true;
 }
 

@@ -146,6 +146,16 @@ private:
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
     bool fault_process_pending{};
+
+    VideoCore::TextureCache::ImageDesc bb_gb_depth_desc{};
+    bool bb_gb_depth_valid{};
+
+    // Bloodborne upscaling (video_core/bb/bb_upscale.h, vk_rasterizer_bb.cpp).
+    bool BBInject(VideoCore::ImageId color_id, vk::ImageView& out_view,
+                  vk::ImageLayout& out_layout);
+    bool BBUpscaledView(vk::ImageView& out_view, vk::ImageLayout& out_layout) const;
+    void BBHudlessCopy(VideoCore::Image& flip);
+    void BBOnDraw(u32 num_cb);
     bool attachment_feedback_loop{};
 };
 

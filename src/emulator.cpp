@@ -56,6 +56,7 @@
 #include <unistd.h>
 #endif
 #include <core/file_format/npbind.h>
+#include "video_core/bb/bb_upscale.h"
 
 Frontend::WindowSDL* g_window = nullptr;
 
@@ -586,6 +587,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         }
     }
+    // Bloodborne upscaling: DLSS loads Streamline before the window so SDL takes Streamline's
+    // interposer as its Vulkan library (SDL_VULKAN_LIBRARY), as the Demon's Souls fork does.
+    BB::Upscale::PreInstance();
     window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
                                                    EmulatorSettings.GetWindowHeight(), controllers,
                                                    window_title);

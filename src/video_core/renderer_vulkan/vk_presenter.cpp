@@ -21,6 +21,8 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/bb/bb_analyze.h"
+#include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 
@@ -699,6 +701,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
+    if (BB::Analyze::Enabled()) {
+        const auto& bb_img = texture_cache.GetImage(image_id);
+        BB::Analyze::OnPresent(bb_img.info.size.width, bb_img.info.size.height,
+                               bb_img.info.pixel_format, cpu_address);
+    }
+    if (BB::Upscale::Enabled() || BB::Analyze::Enabled()) {
+        const auto& bb_img = texture_cache.GetImage(image_id);
+        BB::Upscale::OnFlip(cpu_address, bb_img.info.size.width, bb_img.info.size.height);
+    }
 
     Frame* frame = GetRenderFrame();
 

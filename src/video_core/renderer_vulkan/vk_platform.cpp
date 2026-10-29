@@ -22,6 +22,8 @@
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/bb/bb_upscale.h"
+#include <filesystem>
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -270,7 +272,17 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
 #endif
 
-    static vk::detail::DynamicLoader dl;
+    BB::Upscale::PreInstance();
+    static vk::detail::DynamicLoader dl = [] {
+#ifdef _WIN32
+        if (const wchar_t* loader = BB::Upscale::VulkanLoaderOverride()) {
+            // DLSS: Streamline's interposer is the Vulkan loader.
+            const std::filesystem::path path{loader};
+            return vk::detail::DynamicLoader(path.string());
+        }
+#endif
+        return vk::detail::DynamicLoader();
+    }();
     VULKAN_HPP_DEFAULT_DISPATCHER.init(
         dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
 
@@ -413,7 +425,24 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         },
     };
 
+    if (BB::Upscale::Enabled()) {
+        std::string chain;
+        for (auto* node = static_cast<const VkBaseInStructure*>(instance_ci_chain.get().pNext);
+             node != nullptr; node = node->pNext) {
+            chain += fmt::format(" {}", vk::to_string(static_cast<vk::StructureType>(node->sType)));
+        }
+        BB::Upscale::Checkpoint(fmt::format(
+            "vkCreateInstance (api {}.{}; layers: {}; extensions: {}; pNext:{}; loader "
+            "vkGetInstanceProcAddr {})",
+            VK_VERSION_MAJOR(application_info.apiVersion),
+            VK_VERSION_MINOR(application_info.apiVersion), layers_string, extensions_string, chain,
+            reinterpret_cast<void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr)));
+    }
     auto [instance_result, instance] = vk::createInstanceUnique(instance_ci_chain.get());
+    if (BB::Upscale::Enabled()) {
+        BB::Upscale::Checkpoint(
+            fmt::format("vkCreateInstance returned {}", vk::to_string(instance_result)));
+    }
     ASSERT_MSG(instance_result == vk::Result::eSuccess, "Failed to create instance: {}",
                vk::to_string(instance_result));
 
