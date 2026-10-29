@@ -273,6 +273,109 @@ struct DynMultiplier {
 		up_n = 0;
 		return m;
 	}
+
+	// 10-29 (ds-dlssg-pace-1029), DLSS-G only (FSR3 keeps Window): "real first". The real rate is never held under
+	// what the game and the GPU make just to fill a multiplier. Logs 20261029-201439 / 201911 / 211510: Window climbed
+	// x3 -> x6 while each step cost real frames (201911: 43.9 -> 41.6 -> 39.4 -> 37.1 real) because the screen showed
+	// < (q - 0.05) x target, and at x6 the real rate sat on the pacer's cap target / 6 = 37.3 (render idle 4 ms, the
+	// rest of the 26.8 ms frame held by the limiter); the screen then moved 1.3-1.4 ms off the game's own step on
+	// average (13-18% of the frames > 2 ms) against FSR3 x4's 0.74 ms (3%) at 38-42 real, under its cap. The quality
+	// rule's probe never ran (real under the cap most windows, and x5's old rate "short").
+	// Rules (cap(m) = T / m, the pacer's interval that keeps the shown rate under the VRR ceiling):
+	// - near the cap (real >= cap / Headroom(), 1.05: 95%) for 2 windows: the limiter, not the GPU, sets the real rate:
+	//   one generated frame less (cap(m - 1) lets the game run free).
+	// - up one level only when the real rate fits under the next cap with the same margin (real <= cap(m + 1) /
+	//   Headroom()) for 3 windows, and meets that level's minimum; so the largest m whose cap stays above the real rate:
+	//   the screen as close to the target as the GPU allows without a throttled real frame (the step's own cost only
+	//   lowers the real rate, so it does not come back down: no ping-pong). The game held at its 60 stays x3 on 224
+	//   (180 shown): x4 would hold it at 56. KYTY_DYN_HEADROOM=<1.0-1.5> sets the margin.
+	// - 2 windows after a step up: when it cost more than MaxLoss() (12%) of the real rate (more than a generated
+	//   frame's GPU cost: the presentation, not the GPU), back down and that level blocked 30 s (doubling, up to 4 min).
+	// - under the level's minimum (MinReal) for 2 windows: down. Hitches / loading (real < 60% of the window before)
+	//   and windows DLSS-G showed no generated frame (skip) decide nothing.
+	static double Headroom() {
+		static const double v = [] {
+			const char* e = std::getenv("KYTY_DYN_HEADROOM");
+			return e != nullptr && *e != '\0' ? std::clamp(std::atof(e), 1.0, 1.5) : 1.05;
+		}();
+		return v;
+	}
+	static double UpMargin() { return Headroom(); }
+	static double MaxLoss() { return 0.12; }
+
+	int  near_n = 0, fit_n = 0; // real-first: windows in a row near the cap / fitting under the next cap
+	int WindowRealFirst(int m, double real, double T, int maxm, bool hold = false, bool skip = false) {
+		if (hold) {
+			*this = DynMultiplier {};
+			return std::clamp(std::min(m, maxm), 2, kMax);
+		}
+		for (auto& b: block) b = std::max(b - 1, 0);
+		for (auto& a: age) ++a;
+		while (maxm > 2 && T / maxm < MinReal(maxm)) --maxm;
+		maxm = std::clamp(maxm, 2, kMax);
+		const double cap = T / m;
+		next_est         = 0.0;
+		if (skip) { // DLSS-G showed only the real frames: nothing to learn about m
+			prev_real = 0.0;
+			near_n = fit_n = low_n = 0;
+			last_free = real;
+			return std::min(m, maxm);
+		}
+		if (settle > 0) {
+			--settle;
+			prev_real = real;
+			last_free = real;
+			return m;
+		}
+		const double before = prev_real;
+		prev_real           = real;
+		if (before > 0.0 && real < 0.6 * before) {
+			last_free = before;
+			return m;
+		}
+		const bool at_cap = real >= cap / Headroom();
+		if (!at_cap) free[m] = (free[m] > 0.0 && age[m] < 30) ? 0.5 * free[m] + 0.5 * real : real;
+		age[m]    = 0;
+		last_free = at_cap ? std::max(real, free[m]) : free[m];
+		near_n    = at_cap ? near_n + 1 : 0;
+		low_n     = real < MinReal(m) ? low_n + 1 : 0;
+		const int    up  = m + 1;
+		const bool   fit = up <= maxm && real <= T / up / UpMargin() && real >= MinReal(up);
+		fit_n            = fit ? fit_n + 1 : 0;
+		auto go = [&](int to, const char* why) {
+			reason   = why;
+			next_est = to < m ? std::max(real, free[to]) : real;
+			settle   = 2;
+			near_n = fit_n = low_n = 0;
+			return to;
+		};
+		if (check_from != 0) {
+			const int from = check_from;
+			check_from     = 0;
+			if (check_real > 0.0 && real > 0.0) {
+				const double c = (1.0 / real - 1.0 / check_real) / std::max(m - from, 1);
+				if (c > 0.0) cost = cost > 0.0 ? 0.5 * cost + 0.5 * c : c;
+			}
+			if (real < (1.0 - MaxLoss()) * check_real || real < MinReal(m)) {
+				reverts[m] = std::min(reverts[m] + 1, 4);
+				block[m]   = 30 << (reverts[m] - 1);
+				free[m]    = 0.0;
+				std::printf("[dyn] x%d cost the real rate %.1f -> %.1f fps (%.0f%%): back to x%d, x%d blocked %d s\n", m, check_real,
+				            real, 100.0 * (1.0 - real / check_real), from, m, block[m]);
+				return go(from, "the step up cost more than a generated frame's GPU time (real rate fell)");
+			}
+			reverts[m] = 0;
+		}
+		if (m > maxm) return go(maxm, "over the largest level allowed now");
+		if (m > 2 && near_n >= 2) return go(m - 1, "real on the cap target / m for 2 s (held by the limiter): one generated frame less");
+		if (m > 2 && low_n >= 2) return go(m - 1, "real under the level's minimum for 2 s");
+		if (fit_n >= 3 && block[up] == 0) {
+			check_from = m;
+			check_real = real;
+			return go(up, "real fits under the next level's cap for 3 s (no real frame throttled)");
+		}
+		return m;
+	}
 };
 
 } // namespace Kyty::Local
