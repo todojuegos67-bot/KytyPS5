@@ -54,7 +54,8 @@
     "KYTY_ASYNC_DRAW_SYNC_SMALL": "0",
     "KYTY_FRAMEGEN": "5",
     "KYTY_FLIP_DECOUPLE": "1",
-    "KYTY_DLSSG_DYNAMIC": "1"
+    "KYTY_DLSSG_DYNAMIC": "1",
+    "KYTY_DYN_MIN_SCALE": "0.7"
   },
   "command": [
     "--",
