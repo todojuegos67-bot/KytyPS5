@@ -11,6 +11,12 @@ Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
   DLSS 5 (Neural Rendering, foveated): needs your own nvngx_dlssnr.dll next to kyty_emulator.exe; not included.
 - Reflejos RT: sin fogonazos. Los destellos sueltos (luces, cielo, emisivos) se limitan a la luz de alrededor y el
   reflejo ya no salta de un frame a otro con la camara quieta (KYTY_RT_REFLECTIONS_STABLE=0 vuelve al anterior).
+- DLSS-G dinamico (MFG): el multiplicador ya no frena los FPS reales para llenar el monitor. Elige el mayor xN cuyo
+  tope (224/N) queda por encima de los FPS reales; si los reales tocan el tope baja uno. Si DLSS-G deja de generar
+  (presented 1) el limitador se suelta. Linea nueva en el log "[dlssg] pace:" (FPS reales, GPU ocupada, causa de la
+  espera). KYTY_DYN_REAL_FIRST=0 vuelve a las reglas anteriores.
+  DLSS-G dynamic (MFG): the multiplier no longer holds the real frame rate down to fill the monitor (largest xN whose
+  cap 224/N stays above the real rate; one less when the real rate sits on the cap). New "[dlssg] pace:" log line.
   RT reflections: no more bright flashes; single bright hits are limited and the reflection is steady on a still camera.
 
 

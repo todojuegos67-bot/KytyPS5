@@ -218,6 +218,8 @@ inline void (*g_buffer_report)(const char* path) = nullptr;
 // Live "objects": counts of what the pipeline cache keeps for the session (PipelineCache), and shader modules alive.
 inline void (*g_objects_report)(uint64_t id) = nullptr;
 inline std::atomic<int64_t> g_shader_modules {0};
+// 10-29: the render thread's waits for guest work (GuestGpu::ThreadRun), steady-clock ns in all (the DLSS-G pace line).
+inline std::atomic<int64_t> g_render_idle_total_ns {0};
 // Live "sync": the GPU timelines, deferred submissions and pending guest readbacks (BufferCache::PrintSyncState):
 // where a stalled GPU thread waits.
 inline void (*g_sync_report)() = nullptr;

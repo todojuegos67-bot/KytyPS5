@@ -8,6 +8,7 @@
 #include "graphics/presentation/videoOut.h"
 #include <chrono>
 #include "live-census.h"
+#include "live-counters.h"
 
 #include "common/logging/log.h"
 #include "local-platform.h"
@@ -58,6 +59,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cwchar>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -928,6 +930,113 @@ void NoteGpuWaitMs(double) {}
 void NoteFlipPresentMs(double) {}
 #endif
 
+// 10-29 (ds-dlssg-pace-1029): where a real frame's time goes with DLSS-G (the "[dlssg] pace:" line, once a second).
+std::atomic<int64_t>  g_diag_pacer_ns {0};    // VideoOut: real frames held by our pacer (cap target / m) only
+std::atomic<uint32_t> g_diag_pacer_n {0};
+std::atomic<int64_t>  g_diag_gpudone_ns {0};  // VideoOut: guest flip reserved -> its GPU work done
+std::atomic<uint32_t> g_diag_gpudone_n {0};
+std::atomic<int64_t>  g_diag_reflex_ns {0};   // render thread: slReflexSleep at the guest flip
+std::atomic<bool>     g_not_generating {false}; // DLSS-G on, generated frames asked, but it presents only the real one
+void NotePacerHold(double seconds) {
+	g_diag_pacer_ns.fetch_add(static_cast<int64_t>(seconds * 1e9), std::memory_order_relaxed);
+	g_diag_pacer_n.fetch_add(1, std::memory_order_relaxed);
+}
+void NoteFlipGpuDone(double seconds) {
+	g_diag_gpudone_ns.fetch_add(static_cast<int64_t>(seconds * 1e9), std::memory_order_relaxed);
+	g_diag_gpudone_n.fetch_add(1, std::memory_order_relaxed);
+}
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+// The whole GPU's busy share as Windows' Task Manager shows it (PDH "\GPU Engine(*)\Utilization Percentage", summed
+// over the processes per engine; the busiest 3D engine, and the busiest engine of any type), on its own thread once a
+// second (a collection walks every engine instance: a few ms). pdh.dll is loaded at run time; -1 when unavailable.
+namespace GpuBusy {
+std::atomic<double> g_3d {-1.0}, g_any {-1.0}, g_ours {-1.0};
+std::atomic<bool>   g_started {false};
+wchar_t             g_any_type[32] {};
+
+using OpenQuery  = LONG(WINAPI*)(LPCWSTR, DWORD_PTR, HANDLE*);
+using AddCounter = LONG(WINAPI*)(HANDLE, LPCWSTR, DWORD_PTR, HANDLE*);
+using Collect    = LONG(WINAPI*)(HANDLE);
+struct Value { // PDH_FMT_COUNTERVALUE_ITEM_W (pdh.h), double format
+	LPWSTR name;
+	struct {
+		DWORD  status;
+		double value;
+	} v;
+};
+using GetArray = LONG(WINAPI*)(HANDLE, DWORD, LPDWORD, LPDWORD, Value*);
+
+void Run() {
+	LocalPlatform::SetThreadName("Kyty.GpuBusy");
+	HMODULE pdh = LoadLibraryW(L"pdh.dll");
+	if (pdh == nullptr) {
+		std::printf("[dlssg] GPU busy: pdh.dll not loaded (no GPU busy share in the pace line)\n");
+		return;
+	}
+	auto open    = reinterpret_cast<OpenQuery>(reinterpret_cast<void*>(GetProcAddress(pdh, "PdhOpenQueryW")));
+	auto add     = reinterpret_cast<AddCounter>(reinterpret_cast<void*>(GetProcAddress(pdh, "PdhAddEnglishCounterW")));
+	auto collect = reinterpret_cast<Collect>(reinterpret_cast<void*>(GetProcAddress(pdh, "PdhCollectQueryData")));
+	auto get     = reinterpret_cast<GetArray>(reinterpret_cast<void*>(GetProcAddress(pdh, "PdhGetFormattedCounterArrayW")));
+	HANDLE query = nullptr, counter = nullptr;
+	if (open == nullptr || add == nullptr || collect == nullptr || get == nullptr || open(nullptr, 0, &query) != 0 ||
+	    add(query, L"\\GPU Engine(*)\\Utilization Percentage", 0, &counter) != 0) {
+		std::printf("[dlssg] GPU busy: the GPU Engine counters are not available (no GPU busy share in the pace line)\n");
+		return;
+	}
+	collect(query);
+	const std::wstring ours = L"pid_" + std::to_wstring(GetCurrentProcessId()) + L"_";
+	std::vector<unsigned char> buffer;
+	for (;;) {
+		Sleep(1000);
+		if (collect(query) != 0) continue;
+		DWORD size = 0, count = 0;
+		constexpr DWORD kDouble = 0x00000200, kNoCap100 = 0x00008000; // PDH_FMT_DOUBLE | PDH_FMT_NOCAP100
+		LONG  status = get(counter, kDouble | kNoCap100, &size, &count, nullptr);
+		if (size == 0) continue;
+		buffer.resize(size);
+		status = get(counter, kDouble | kNoCap100, &size, &count, reinterpret_cast<Value*>(buffer.data()));
+		if (status != 0) continue;
+		const auto* items = reinterpret_cast<const Value*>(buffer.data());
+		// Instance: pid_<pid>_luid_<hi>_<lo>_phys_<n>_eng_<e>_engtype_<type>; summed per luid + phys + eng.
+		std::unordered_map<std::wstring, double> engines, ours_engines;
+		std::unordered_map<std::wstring, std::wstring> types;
+		for (DWORD i = 0; i < count; ++i) {
+			if (items[i].name == nullptr || (items[i].v.status != 0 && items[i].v.status != 1)) continue; // VALID / NEW data
+			const std::wstring name = items[i].name;
+			const auto         luid = name.find(L"luid_");
+			const auto         type = name.find(L"_engtype_");
+			if (luid == std::wstring::npos || type == std::wstring::npos) continue;
+			const std::wstring key = name.substr(luid, type - luid);
+			engines[key] += items[i].v.value;
+			types[key] = name.substr(type + 9);
+			if (name.compare(0, ours.size(), ours) == 0) ours_engines[key] += items[i].v.value;
+		}
+		double d3 = 0.0, any = 0.0, mine = 0.0;
+		std::wstring any_type;
+		for (const auto& [key, value]: engines) {
+			if (types[key] == L"3D") d3 = std::max(d3, value);
+			if (value > any) {
+				any      = value;
+				any_type = types[key];
+			}
+		}
+		for (const auto& [key, value]: ours_engines)
+			if (types[key] == L"3D") mine = std::max(mine, value);
+		std::wcsncpy(g_any_type, any_type.c_str(), 31);
+		g_3d   = std::min(d3, 100.0);
+		g_any  = std::min(any, 100.0);
+		g_ours = std::min(mine, 100.0);
+	}
+}
+void Start() {
+	if (g_started.exchange(true)) return;
+	if (const char* v = std::getenv("KYTY_DLSSG_GPU_BUSY"); v != nullptr && *v == '0') return;
+	std::thread(Run).detach();
+}
+} // namespace GpuBusy
+#endif
+
 bool WantsCamera() {
 	return g_ready && !g_camera.valid;
 }
@@ -1638,17 +1747,86 @@ void DynApplyReflexLimit(int gen) {
 		g_dyn_flip_fps = 0;
 		std::printf("[dyn] game flips at 60\n");
 	}
-	const double interval = gen < 0 || g_dyn_flip_fps != 0
+	const bool   idle     = gen >= 0 && g_not_generating.load(std::memory_order_relaxed);
+	const double interval = gen < 0 || g_dyn_flip_fps != 0 || idle
 	                            ? 0.0
 	                            : static_cast<double>(gen + 1) / std::max(static_cast<double>(g_dlssg_target_fps), 1.0);
 	if (g_real_interval.load() != interval)
-		std::printf("[dyn] pacer interval %.0f us for x%d%s\n", interval * 1e6, gen + 1, g_dyn_flip_fps != 0 ? " (game flips held instead)" : "");
+		std::printf("[dyn] pacer interval %.0f us for x%d%s\n", interval * 1e6, gen + 1,
+		            g_dyn_flip_fps != 0 ? " (game flips held instead)" : idle ? " (DLSS-G presents no generated frame: none)" : "");
 	g_real_interval       = interval; // the flip pacer (VideoOut, as FSR3's) holds real frames to it on the vblank grid
 	const uint32_t us     = DlssgReflexLimitUs(interval);
 	if (g_reflex_opts.frameLimitUs == us) return;
 	g_reflex_opts.frameLimitUs = us;
 	if (const auto result = g_api.reflex_set_options(g_reflex_opts); result != sl::Result::eOk)
 		LOGF("frame generation: slReflexSetOptions (dynamic limit) failed (%d)\n", static_cast<int>(result));
+}
+#endif
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+// 10-29 (ds-dlssg-pace-1029): once a second with DLSS-G, where a real frame's time went and what held it:
+// "[dlssg] pace: real R fps (xM, cap C: P% of it); per real frame F ms: render idle (waiting for the game) I, GPU done
+// G ms after the flip; held by our pacer H (n frames), Reflex sleep S, flip slot W; GPU busy B% 3D (A% busiest engine
+// <type>, ours O%); presented N; cause: ...". The cause is the largest share of the frame among: our pacer / flip slot
+// (the cap target / m holds the real rate), Reflex's sleep, the game waiting for its GPU work (with the GPU busy
+// share: saturated = GPU-bound; not = the work done late behind frame generation's presentation), the game's own
+// pace (it submits late: its CPU or its cap), the render thread's translation (CPU).
+void PrintPaceLine(double window, uint32_t frames, uint32_t generated_on) {
+	static int64_t  last_pacer = 0, last_gpudone = 0, last_reflex = 0, last_idle = 0;
+	static uint32_t last_pacer_n = 0, last_gpudone_n = 0;
+	static uint64_t last_slot = 0;
+	GpuBusy::Start();
+	const int64_t  pacer     = g_diag_pacer_ns.load(std::memory_order_relaxed);
+	const uint32_t pacer_n   = g_diag_pacer_n.load(std::memory_order_relaxed);
+	const int64_t  gpudone   = g_diag_gpudone_ns.load(std::memory_order_relaxed);
+	const uint32_t gpudone_n = g_diag_gpudone_n.load(std::memory_order_relaxed);
+	const int64_t  reflex    = g_diag_reflex_ns.load(std::memory_order_relaxed);
+	const int64_t  idle      = LiveCounters::g_render_idle_total_ns.load(std::memory_order_relaxed);
+	const uint64_t slot      = LiveCounters::Value(LiveCounters::FlipSlotWaitUs);
+	const double   n         = std::max(static_cast<double>(frames), 1.0);
+	const double   frame_ms  = window * 1e3 / n;
+	const double   pacer_ms  = static_cast<double>(pacer - last_pacer) / 1e6 / n;
+	const uint32_t held_n    = pacer_n - last_pacer_n;
+	const uint32_t done_n    = gpudone_n - last_gpudone_n;
+	const double   done_ms   = done_n != 0 ? static_cast<double>(gpudone - last_gpudone) / 1e6 / done_n : 0.0;
+	const double   reflex_ms = static_cast<double>(reflex - last_reflex) / 1e6 / n;
+	const double   idle_ms   = static_cast<double>(idle - last_idle) / 1e6 / n;
+	const double   slot_ms   = static_cast<double>(slot - last_slot) / 1e3 / n;
+	last_pacer = pacer, last_pacer_n = pacer_n, last_gpudone = gpudone, last_gpudone_n = gpudone_n, last_reflex = reflex;
+	last_idle = idle, last_slot = slot;
+	const double real     = frames / std::max(window, 1e-3);
+	const int    m        = static_cast<int>(PresentedFrames());
+	const double interval = g_real_interval.load();
+	const double cap      = interval > 0.0 ? 1.0 / interval : 0.0;
+	const double busy3d = GpuBusy::g_3d.load(), busy_any = GpuBusy::g_any.load(), ours = GpuBusy::g_ours.load();
+	char         busy[160];
+	if (busy3d >= 0.0) {
+		char type[32] {};
+		for (int i = 0; i < 31 && GpuBusy::g_any_type[i] != 0; ++i) type[i] = static_cast<char>(GpuBusy::g_any_type[i]);
+		std::snprintf(busy, sizeof(busy), "GPU busy %.0f%% 3D (busiest engine %.0f%% %s; this process %.0f%% 3D)", busy3d, busy_any,
+		              type, ours);
+	} else {
+		std::snprintf(busy, sizeof(busy), "GPU busy n/a");
+	}
+	// The cause: the largest share of the real frame.
+	const double share_pacer = (pacer_ms + slot_ms) / frame_ms, share_reflex = reflex_ms / frame_ms, share_idle = idle_ms / frame_ms;
+	const double busy_known  = busy3d >= 0.0 ? std::max(busy3d, busy_any) : -1.0;
+	const char*  cause       = "the render thread (translating the game's commands: CPU)";
+	if (g_not_generating.load(std::memory_order_relaxed)) cause = "DLSS-G is not generating (presented 1): the pacer is released";
+	else if (generated_on == 0) cause = "no frame generation this second (menu, movie, loading)";
+	else if (share_pacer >= 0.15 && share_pacer >= share_reflex) cause = "our pacer: the cap target / m holds the real rate (one generated frame less frees it)";
+	else if (share_reflex >= 0.15) cause = "Reflex's sleep at the guest flip holds the game";
+	else if (share_idle >= 0.3 && done_ms >= 0.5 * frame_ms)
+		cause = busy_known < 0.0   ? "the game waits for its GPU work (GPU busy unknown)"
+		        : busy_known >= 88 ? "the game waits for its GPU work: GPU-bound (the GPU is saturated)"
+		                           : "the game waits for its GPU work, but the GPU is not saturated: the work completes late (queued behind frame generation's presentation)";
+	else if (share_idle >= 0.3) cause = "the game's own pace (it submits late: its CPU or its frame cap)";
+	char capt[64];
+	if (cap > 0.0) std::snprintf(capt, sizeof(capt), "cap %.1f, %.0f%% of it", cap, 100.0 * real / cap);
+	else std::snprintf(capt, sizeof(capt), "no cap");
+	std::printf("[dlssg] pace: real %.1f fps (x%d shown, x%d asked, %s); per real frame %.1f ms: render idle (waiting for the game) %.1f, "
+	            "GPU done %.1f ms after the flip; held by our pacer %.1f (%u frames), Reflex sleep %.1f, flip slot %.1f; %s; cause: %s\n",
+	            real, m, CurrentGenerate() + 1, capt, frame_ms, idle_ms, done_ms, pacer_ms, held_n, reflex_ms, slot_ms, busy, cause);
 }
 #endif
 
@@ -1738,8 +1916,22 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 				const double T         = static_cast<double>(g_dlssg_target_fps);
 				const bool   cinematic = VideoOut::CinematicPlaying();
 				const int    maxgen    = cinematic ? std::min(2, g_dyn_max) : g_dyn_max;
-				int          next      = std::clamp(g_dyn_dm.Window(g_dyn_gen + 1, real, T, maxgen + 1,
-				                                                      cinematic || VideoOut::CutsceneHeld() || VideoOut::MoviePlaying()) - 1, 1, std::max(maxgen, 1));
+				const bool   held      = cinematic || VideoOut::CutsceneHeld() || VideoOut::MoviePlaying();
+				// 10-29: real first (dyn-multiplier.h WindowRealFirst) unless KYTY_DYN_REAL_FIRST=0 (the 10-22..10-29 rules).
+				static const bool real_first = [] {
+					const char* v = std::getenv("KYTY_DYN_REAL_FIRST");
+					const bool  on = v == nullptr || *v != '0';
+					std::printf("[dyn] rules: %s (KYTY_DYN_REAL_FIRST=%s)\n",
+					            on ? "real first: the largest multiplier whose cap target / m stays above the real rate, never "
+					                 "one that holds it"
+					               : "10-22..10-29 (shown rate, quality rule)",
+					            on ? "1" : "0");
+					return on;
+				}();
+				const int    m_next    = real_first ? g_dyn_dm.WindowRealFirst(g_dyn_gen + 1, real, T, maxgen + 1, held,
+				                                                                g_not_generating.load(std::memory_order_relaxed))
+				                                    : g_dyn_dm.Window(g_dyn_gen + 1, real, T, maxgen + 1, held);
+				int          next      = std::clamp(m_next - 1, 1, std::max(maxgen, 1));
 				if (next != g_dyn_gen) {
 					const int from_m = g_dyn_gen + 1;
 					g_dyn_gen      = next;
@@ -1767,6 +1959,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 			            g_stat_real, g_stat_present_ms / n, g_stat_present_max, g_stat_acquire_ms / n, g_stat_acquire_max,
 			            g_stat_submit_ms / n, g_stat_submit_max, g_stat_gpuwait_ms / n, g_stat_gpuwait_max, g_stat_before_ms / n,
 			            g_stat_before_max, g_stat_flip_ms / n, g_stat_flip_max);
+			PrintPaceLine(window, g_stat_real, g_stat_on);
 			std::fflush(stdout);
 			g_stat_start = now;
 			g_stat_real  = 0;
@@ -2009,6 +2202,24 @@ void AfterPresent() {
 		}
 	}
 	g_presented_frames.store(std::max(state.numFramesActuallyPresented, 1u), std::memory_order_relaxed);
+	{
+		// 10-29: DLSS-G on with generated frames asked for, but presenting only the real one (log 20261029-211510: ~8
+		// minutes at "presented 1" with x6 asked, status 0x0): our pacer still held the real frames to target / 6 = 37.3
+		// (flips 52.8 ms in the queue, input -> present 75 ms) while the screen showed those 37. Two samples in a row
+		// (~60 presents) release the pacer and the multiplier decides nothing; the first sample with generated frames
+		// restores both.
+		static uint32_t idle_samples = 0;
+		const bool      asked        = g_mode_set == 1 && CurrentGenerate() > 0;
+		idle_samples                 = asked && state.numFramesActuallyPresented <= 1 ? idle_samples + 1 : 0;
+		const bool      idle         = idle_samples >= 2;
+		if (idle != g_not_generating.load(std::memory_order_relaxed)) {
+			g_not_generating = idle;
+			std::printf("[dlssg] %s\n", idle ? "DLSS-G presents only the real frames (presented 1, generated frames asked): pacer released, "
+			                                   "multiplier paused (window not in front, an overlay, or DLSS-G's own choice)"
+			                                 : "DLSS-G generates again: pacer and multiplier back");
+			std::fflush(stdout);
+		}
+	}
 	// More generated frames asked for than the GPU makes (the launcher's 3x and up): as many as it makes.
 	if (state.numFramesToGenerateMax != 0 && static_cast<uint32_t>(g_generate) > state.numFramesToGenerateMax) {
 		LOGF("frame generation: %d generated frames asked for, the GPU makes up to %u\n", g_generate,
@@ -2175,7 +2386,12 @@ void ReflexGuestFlip(FrameInputs& fg) {
 		const char* value = std::getenv("KYTY_DLSSG_SLEEP");
 		return value == nullptr || *value != '0';
 	}();
-	if (sleep && g_api.reflex_sleep != nullptr) g_api.reflex_sleep(*token);
+	if (sleep && g_api.reflex_sleep != nullptr) {
+		const auto t0 = std::chrono::steady_clock::now();
+		g_api.reflex_sleep(*token);
+		g_diag_reflex_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+		                           std::memory_order_relaxed);
+	}
 	g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, *token);
 	g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, *token);
 	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, *token);

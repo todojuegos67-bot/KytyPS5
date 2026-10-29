@@ -100,6 +100,10 @@ void NoteGpuWaitMs(double ms);
 void NoteFlipPresentMs(double ms);
 void NoteSubmitMs(double ms);        // present thread: record + submit of the copy into the swapchain
 void NoteBeforePresentMs(double ms); // BeforePresent (Streamline tags and options)
+// 10-29 (the "[dlssg] pace:" line): VideoOut's flip thread, a ready real frame held by the cap (RealFrameInterval /
+// FSR 3's) alone for `seconds`; a guest flip's GPU work done `seconds` after the flip was reserved.
+void NotePacerHold(double seconds);
+void NoteFlipGpuDone(double seconds);
 // Before the device is created: why Streamline says DLSS-G cannot run with this GPU, driver and Windows (e.g.
 // hardware-accelerated GPU scheduling turned off), logged; empty when it can, or when frame generation is off. A refused
 // device's error repeats it.

@@ -1512,6 +1512,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 		}
 		request->state      = RequestState::Ready;
 		request->ready_time = std::chrono::steady_clock::now();
+		Graphics::FrameGen::NoteFlipGpuDone(std::chrono::duration<double>(request->ready_time - request->submit_time).count());
 		Graphics::AntiLag::OnFlipReady(request->latency_index); // KYTY_LOWLAT pacing / [lat] stages
 		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
@@ -1856,6 +1857,17 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 		// The FSR 3 / DLSS-G cap interval (RealFrameInterval) is at most the floor, so under the target: this replaces it.
 		// (Reflex's DLSS-G frame limit is that same cap or none, never above the floor: it never holds a paced frame.)
 		if (g_fg_pacing.target >= paced_interval) paced_wait = false;
+	}
+	// 10-29: how long the FSR 3 / DLSS-G cap alone held a ready frame (the DLSS-G "[dlssg] pace:" line).
+	static uint64_t                              s_hold_id = 0;
+	static std::chrono::steady_clock::time_point s_hold_since {};
+	if (paced_wait && due && s_hold_id != r.id) {
+		s_hold_id    = r.id;
+		s_hold_since = paced_now;
+	}
+	if (!paced_wait && s_hold_id == r.id && s_hold_id != 0) {
+		if (due) Graphics::FrameGen::NotePacerHold(std::chrono::duration<double>(std::chrono::steady_clock::now() - s_hold_since).count());
+		s_hold_id = 0;
 	}
 	if (paced_wait || !due) {
 		r.cfg->mutex.Unlock();
