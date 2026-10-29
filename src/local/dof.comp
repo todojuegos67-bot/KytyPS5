@@ -1,0 +1,215 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// KYTY_DOF=0..3 (dof.cpp; ds-dof-1029): "Profundidad de campo" No / Suave / Cinematico / Fuerte. A distance-only
+// (far-field) depth of field on the PS5 Pro path's render-resolution HDR colour, before the upscaler and the HUD.
+// Near and mid ground stay sharp; past the focus distance the blur ramps in with a smootherstep up to `ramp` x focus.
+// One shader, four modes (push.mode):
+//
+//   0 prep      (half res) 2x2 colour average; linear view z of the 2x2 (the NEAREST, so a sharp foreground edge never
+//               gets a background CoC); CoC in half-res pixels (sky / far plane = the full radius); out (rgb, coc), lz.
+//   1 bokeh     (half res) a gather disc ("scatter as gather"): a golden-angle spiral of N taps (24 / 36 / 48) over the
+//               centre's CoC radius; a tap counts only where its own CoC reaches the centre (|offset| <= its CoC), so a
+//               sharp foreground object is never smeared into the blurred background; bright taps (exposed luminance
+//               above ~1) weigh more, so highlights open into soft round bokeh discs instead of a grey gaussian smear;
+//               a soft disc edge (no ringing). The spiral is rotated per pixel and per frame (interleaved gradient noise
+//               x the golden ratio), and the temporal pass integrates it.
+//   2 temporal  (half res) motion-vector reprojection of the previous result, rejected on view z (> 4 %), clamped to the
+//               3x3 neighbourhood's min / max of the fresh bokeh; 1/8 of the new frame (1/4 while the camera moves).
+//   3 composite (full res) the full-res pixel's own CoC from the full-res depth; depth-aware upsample of the half-res
+//               bokeh (the 4 nearest texels, bilinear x z similarity; when none matches, the closest-z one); then
+//               mix(sharp, bokeh, smoothstep(CoC)): a pixel in focus is untouched (exactly the input colour).
+//               Stats: subgroup-reduced counts of all pixels and of the blurred ones (CoC > 0.5 half px).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;  // the render-res HDR colour
+layout(binding = 1) uniform sampler2D depth_tex;  // the game's depth (reverse Z)
+layout(binding = 2) uniform sampler2D motion_tex;
+layout(binding = 3) uniform sampler2D src_a;      // bokeh: the prep; temporal: the bokeh; composite: the history
+layout(binding = 4) uniform sampler2D hist_prev;  // temporal: last frame's result
+layout(binding = 5) uniform sampler2D lz_cur;     // half-res view z, this frame
+layout(binding = 6) uniform sampler2D lz_prev;    // last frame
+layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
+layout(binding = 8, r32f) uniform writeonly image2D lz_out;
+layout(std140, binding = 9) uniform Frame {
+	vec4  proj;      // M[0], M[5], M[8], M[9]
+	vec4  depth_map; // M[10], M[14], M[11], M[15]
+	vec4  motion;    // motion_scale.xy, render size.xy
+	vec4  half_;     // half size.xy, max CoC (half px), focus (m)
+	vec4  par;       // ramp end (m), highlight boost, highlight threshold (exposed), new-frame weight
+	ivec4 cfg;       // level, frame, flags, stats slot
+	ivec4 cfg2;      // taps, exposure index, debug, -
+} u;
+layout(std430, binding = 10) buffer Stats { uint st[]; };
+layout(std430, binding = 11) readonly buffer Exposure { float exposure_values[]; };
+
+layout(push_constant) uniform Push {
+	int mode;
+	int pad0, pad1, pad2;
+} push;
+
+const int  F_HIST = 1, F_MOTION = 2, F_STILL = 4;
+const uint SLOT_WORDS = 16u;
+const float GOLDEN_ANGLE = 2.39996323;
+
+bool Flag(int f) { return (u.cfg.z & f) != 0; }
+vec2 RenderSize() { return u.motion.zw; }
+vec2 HalfSize() { return u.half_.xy; }
+
+float ViewZ(float d) {
+	float den = d * u.depth_map.z - u.depth_map.x;
+	return abs(den) > 1e-12 ? abs((u.depth_map.y - d * u.depth_map.w) / den) : 1e6;
+}
+bool  Sky(float d) { return !(d > 1e-7) || d >= 0.9999999; }
+float LinZ(float d) { return Sky(d) ? 1e6 : ViewZ(d); }
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+float GameExposure() {
+	float e = exposure_values[u.cfg2.y];
+	return (e > 1e-12 && e < 1e12) ? e : 1.0;
+}
+// 0 in focus -> 1 full blur; a smootherstep from the focus distance to the ramp end (a gentle, natural roll-in)
+float CocFrac(float z) {
+	float t = clamp((z - u.half_.w) / max(u.par.x - u.half_.w, 1e-3), 0.0, 1.0);
+	return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+float Ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+
+void StatAdd(uint idx, uint v) {
+	uint t = subgroupAdd(v);
+	if (subgroupElect() && t != 0u) atomicAdd(st[idx], t);
+}
+
+void Prep(ivec2 p) {
+	ivec2 hs = ivec2(HalfSize());
+	if (any(greaterThanEqual(p, hs))) return;
+	ivec2 rs = ivec2(RenderSize());
+	ivec2 b  = p * 2;
+	vec3  c  = vec3(0.0);
+	float z  = 1e7;
+	for (int i = 0; i < 4; ++i) {
+		ivec2 q = min(b + ivec2(i & 1, i >> 1), rs - 1);
+		vec3  s = texelFetch(color_tex, q, 0).rgb;
+		c += all(greaterThanEqual(s, vec3(0.0))) && all(lessThan(s, vec3(65000.0))) ? s : vec3(0.0);
+		z = min(z, LinZ(texelFetch(depth_tex, q, 0).r));
+	}
+	c *= 0.25;
+	float coc = u.half_.z * CocFrac(z);
+	imageStore(out_img, p, vec4(c, coc));
+	imageStore(lz_out, p, vec4(z));
+}
+
+void Bokeh(ivec2 p) {
+	ivec2 hs = ivec2(HalfSize());
+	if (any(greaterThanEqual(p, hs))) return;
+	vec4  ctr = texelFetch(src_a, p, 0);
+	float r   = ctr.a;
+	if (r < 0.5) {
+		imageStore(out_img, p, ctr);
+		return;
+	}
+	vec2  inv  = 1.0 / HalfSize();
+	vec2  uv0  = (vec2(p) + 0.5) * inv;
+	float expo = GameExposure();
+	float thr  = u.par.z, boost = u.par.y;
+	int   n    = u.cfg2.x;
+	float rot  = 6.2831853 * fract(Ign(vec2(p)) + 0.61803399 * float(u.cfg.y & 255));
+	// the centre counts like any other tap
+	float lc   = Luma(ctr.rgb) * expo;
+	float wc   = 1.0 + boost * max(lc - thr, 0.0) / (1.0 + 0.25 * max(lc - thr, 0.0));
+	vec3  acc  = ctr.rgb * wc;
+	float wsum = wc;
+	for (int i = 0; i < n; ++i) {
+		float fi  = float(i) + 0.5;
+		float rad = sqrt(fi / float(n)) * r;      // uniform over the disc
+		float a   = fi * GOLDEN_ANGLE + rot;
+		vec2  off = vec2(cos(a), sin(a)) * rad;
+		vec4  s   = textureLod(src_a, uv0 + off * inv, 0.0); // (point sampler: one texel)
+		// the tap's own blur must reach here (soft by 1 px): sharp foreground taps stay out
+		float reach = clamp(s.a - rad + 1.0, 0.0, 1.0);
+		// a soft disc edge, no ringing
+		float edge = clamp(r - rad + 0.5, 0.0, 1.0);
+		float l    = Luma(s.rgb) * expo;
+		float h    = max(l - thr, 0.0);
+		float w    = reach * edge * (1.0 + boost * h / (1.0 + 0.25 * h));
+		acc += s.rgb * w;
+		wsum += w;
+	}
+	imageStore(out_img, p, vec4(acc / wsum, r));
+}
+
+void Temporal(ivec2 p) {
+	ivec2 hs = ivec2(HalfSize());
+	if (any(greaterThanEqual(p, hs))) return;
+	vec4  cur = texelFetch(src_a, p, 0);
+	float z   = texelFetch(lz_cur, p, 0).r;
+	vec3  mn = cur.rgb, mx = cur.rgb;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			if (x == 0 && y == 0) continue;
+			vec3 s = texelFetch(src_a, clamp(p + ivec2(x, y), ivec2(0), hs - 1), 0).rgb;
+			mn = min(mn, s), mx = max(mx, s);
+		}
+	vec4 res = cur;
+	if (Flag(F_HIST) && cur.a >= 0.5) {
+		vec2 full = (vec2(p) + 0.5) * 2.0;
+		vec2 mv   = Flag(F_MOTION) ? texelFetch(motion_tex, clamp(ivec2(full), ivec2(0), ivec2(RenderSize()) - 1), 0).rg * u.motion.xy
+		                           : vec2(0.0);
+		vec2 puv  = (full + mv) / RenderSize();
+		if (all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0)))) {
+			ivec2 pp = clamp(ivec2(puv * HalfSize()), ivec2(0), hs - 1);
+			float zp = texelFetch(lz_prev, pp, 0).r;
+			bool  ok = (z >= 1e5 && zp >= 1e5) || abs(zp - z) <= 0.04 * z + 0.05;
+			if (ok) {
+				vec3  h = clamp(textureLod(hist_prev, puv, 0.0).rgb, mn, mx);
+				float a = Flag(F_STILL) ? u.par.w : u.par.w * 2.0;
+				res.rgb = mix(h, cur.rgb, a);
+			}
+		}
+	}
+	imageStore(out_img, p, res);
+}
+
+void Composite(ivec2 p) {
+	ivec2 rs = ivec2(RenderSize());
+	bool  inside = all(lessThan(p, rs));
+	ivec2 q  = min(p, rs - 1);
+	vec4  sharp = texelFetch(color_tex, q, 0);
+	float z     = LinZ(texelFetch(depth_tex, q, 0).r);
+	float coc   = u.half_.z * CocFrac(z);
+	float k     = smoothstep(0.25, 1.5, coc); // under ~half a half-res pixel: untouched
+	vec4  o     = sharp;
+	if (k > 0.0) {
+		vec2  hp  = (vec2(q) + 0.5) * 0.5 - 0.5;
+		ivec2 b   = ivec2(floor(hp));
+		vec2  f   = hp - vec2(b);
+		ivec2 hs  = ivec2(HalfSize());
+		vec3  acc = vec3(0.0);
+		float ws  = 0.0, best = 1e9;
+		vec3  bc  = vec3(0.0);
+		for (int i = 0; i < 4; ++i) {
+			ivec2 o2 = ivec2(i & 1, i >> 1);
+			ivec2 t  = clamp(b + o2, ivec2(0), hs - 1);
+			float tz = texelFetch(lz_cur, t, 0).r;
+			vec3  tc = texelFetch(src_a, t, 0).rgb;
+			float bw = (o2.x == 1 ? f.x : 1.0 - f.x) * (o2.y == 1 ? f.y : 1.0 - f.y);
+			float dz = (z >= 1e5 && tz >= 1e5) ? 0.0 : abs(tz - z) / max(z, 1e-3);
+			float w  = bw * exp(-dz * dz * 400.0) + 1e-5 * bw;
+			acc += tc * w, ws += w;
+			if (dz < best) best = dz, bc = tc;
+		}
+		vec3 blur = best > 0.25 ? bc : acc / ws;
+		o.rgb     = u.cfg2.z != 0 ? vec3(k) : mix(sharp.rgb, blur, k);
+	}
+	if (inside) imageStore(out_img, p, o);
+	uint slot = uint(u.cfg.w) * SLOT_WORDS;
+	StatAdd(slot + 0u, inside ? 1u : 0u);
+	StatAdd(slot + 1u, (inside && coc > 0.5) ? 1u : 0u);
+}
+
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (push.mode == 0) Prep(p);
+	else if (push.mode == 1) Bokeh(p);
+	else if (push.mode == 2) Temporal(p);
+	else Composite(p);
+}
