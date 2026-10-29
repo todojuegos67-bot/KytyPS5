@@ -53,7 +53,7 @@ struct Api {
 // device afterwards (slSetVulkanInfo, manual hooking); DLSS super resolution only.
 bool g_manual = false;
 std::vector<sl::Feature> g_features;
-std::vector<std::string> g_req_device_ext, g_req_instance_ext;
+std::vector<std::string> g_req_device_ext, g_req_instance_ext, g_req_f12, g_req_f13;
 Api g_api;
 bool g_loaded = false;
 bool g_ready = false;
@@ -285,6 +285,17 @@ bool Preload() {
                     g_req_device_ext.emplace_back(req.vkDeviceExtensions[i]);
                     dev += std::string(" ") + req.vkDeviceExtensions[i];
                 }
+                std::string f12s, f13s;
+                for (uint32_t i = 0; i < req.vkNumFeatures12; ++i) {
+                    g_req_f12.emplace_back(req.vkFeatures12[i]);
+                    f12s += std::string(" ") + req.vkFeatures12[i];
+                }
+                for (uint32_t i = 0; i < req.vkNumFeatures13; ++i) {
+                    g_req_f13.emplace_back(req.vkFeatures13[i]);
+                    f13s += std::string(" ") + req.vkFeatures13[i];
+                }
+                BBLogf("DLSS: feature %u needs vk12 features:%s; vk13 features:%s",
+                       static_cast<uint32_t>(f), f12s.c_str(), f13s.c_str());
                 for (uint32_t i = 0; i < req.vkNumInstanceExtensions; ++i) {
                     g_req_instance_ext.emplace_back(req.vkInstanceExtensions[i]);
                     inst += std::string(" ") + req.vkInstanceExtensions[i];
@@ -314,6 +325,12 @@ const std::vector<std::string>& RequiredDeviceExtensions() {
 }
 const std::vector<std::string>& RequiredInstanceExtensions() {
     return g_req_instance_ext;
+}
+const std::vector<std::string>& RequiredFeatures12() {
+    return g_req_f12;
+}
+const std::vector<std::string>& RequiredFeatures13() {
+    return g_req_f13;
 }
 
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device) {
@@ -509,6 +526,14 @@ const std::vector<std::string>& RequiredDeviceExtensions() {
     return none;
 }
 const std::vector<std::string>& RequiredInstanceExtensions() {
+    static const std::vector<std::string> none;
+    return none;
+}
+const std::vector<std::string>& RequiredFeatures12() {
+    static const std::vector<std::string> none;
+    return none;
+}
+const std::vector<std::string>& RequiredFeatures13() {
     static const std::vector<std::string> none;
     return none;
 }

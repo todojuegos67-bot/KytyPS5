@@ -691,6 +691,8 @@ void AddDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
     if (Cfg().kind == SR::Kind::Dlss && SR::Dlss::Manual()) {
         // Manual hooking: what Streamline's features asked for (slGetFeatureRequirements).
         for (const auto& name : SR::Dlss::RequiredDeviceExtensions()) {
+            // (Not the EXT buffer device address with the core / KHR one: both is invalid.)
+            if (name == VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) continue;
             add(name.c_str());
         }
     }
@@ -717,6 +719,58 @@ void* ChainDeviceFeatures(vk::PhysicalDevice physical, const std::vector<const c
                           vk::PhysicalDeviceVulkan12Features& f12,
                           vk::PhysicalDeviceVulkan13Features& f13, vk::PhysicalDeviceFeatures& f,
                           void* next) {
+    if (Cfg().kind == SR::Kind::Dlss) {
+        // The Vulkan 1.2 / 1.3 features Streamline's features ask for, turned on in our own
+        // structs where the device has them, so nothing needs to be appended to the chain.
+        vk::PhysicalDeviceVulkan13Features s13{};
+        vk::PhysicalDeviceVulkan12Features s12{};
+        s12.pNext = &s13;
+        vk::PhysicalDeviceFeatures2 s{};
+        s.pNext = &s12;
+        physical.getFeatures2(&s);
+#define BB_F12(name)                                                                           \
+    {#name, &vk::PhysicalDeviceVulkan12Features::name}
+#define BB_F13(name)                                                                           \
+    {#name, &vk::PhysicalDeviceVulkan13Features::name}
+        static const std::pair<const char*, vk::Bool32 vk::PhysicalDeviceVulkan12Features::*> t12[] = {
+            BB_F12(bufferDeviceAddress), BB_F12(timelineSemaphore), BB_F12(descriptorIndexing),
+            BB_F12(runtimeDescriptorArray), BB_F12(descriptorBindingPartiallyBound),
+            BB_F12(descriptorBindingVariableDescriptorCount),
+            BB_F12(descriptorBindingUpdateUnusedWhilePending),
+            BB_F12(descriptorBindingSampledImageUpdateAfterBind),
+            BB_F12(descriptorBindingStorageImageUpdateAfterBind),
+            BB_F12(shaderSampledImageArrayNonUniformIndexing),
+            BB_F12(shaderStorageImageArrayNonUniformIndexing), BB_F12(scalarBlockLayout),
+            BB_F12(hostQueryReset), BB_F12(shaderFloat16), BB_F12(shaderInt8),
+            BB_F12(storageBuffer8BitAccess), BB_F12(uniformAndStorageBuffer8BitAccess),
+            BB_F12(vulkanMemoryModel), BB_F12(imagelessFramebuffer), BB_F12(separateDepthStencilLayouts),
+            BB_F12(uniformBufferStandardLayout), BB_F12(shaderSubgroupExtendedTypes)};
+        static const std::pair<const char*, vk::Bool32 vk::PhysicalDeviceVulkan13Features::*> t13[] = {
+            BB_F13(synchronization2), BB_F13(dynamicRendering), BB_F13(maintenance4),
+            BB_F13(shaderDemoteToHelperInvocation), BB_F13(subgroupSizeControl),
+            BB_F13(computeFullSubgroups), BB_F13(pipelineCreationCacheControl),
+            BB_F13(shaderIntegerDotProduct)};
+#undef BB_F12
+#undef BB_F13
+        for (const auto& name : SR::Dlss::RequiredFeatures12()) {
+            for (const auto& [n, m] : t12) {
+                if (name == n) {
+                    const bool has = s12.*m == VK_TRUE;
+                    if (has) f12.*m = VK_TRUE;
+                    Checkpoint(fmt::format("DLSS: vk12 {} {}", n, has ? "on" : "NOT supported"));
+                }
+            }
+        }
+        for (const auto& name : SR::Dlss::RequiredFeatures13()) {
+            for (const auto& [n, m] : t13) {
+                if (name == n) {
+                    const bool has = s13.*m == VK_TRUE;
+                    if (has) f13.*m = VK_TRUE;
+                    Checkpoint(fmt::format("DLSS: vk13 {} {}", n, has ? "on" : "NOT supported"));
+                }
+            }
+        }
+    }
     if (Cfg().kind == SR::Kind::Dlss && SR::Dlss::LoaderPath() != nullptr) {
         // VK_KHR_present_id enabled for Streamline's Reflex (VK_NV_low_latency2) needs its feature
         // turned on too.
@@ -821,6 +875,79 @@ std::string Where(const void* p) {
     }
 #endif
     return fmt::format("{}", p);
+}
+
+void DryRunDevice(VkInstance instance, VkPhysicalDevice physical, const VkDeviceCreateInfo* info) {
+#if defined(_WIN32)
+    HMODULE vk1 = GetModuleHandleA("vulkan-1.dll");
+    if (vk1 == nullptr || info == nullptr) {
+        return;
+    }
+    const auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+        reinterpret_cast<void*>(GetProcAddress(vk1, "vkGetInstanceProcAddr")));
+    if (gipa == nullptr) {
+        return;
+    }
+    const auto create = reinterpret_cast<PFN_vkCreateDevice>(gipa(instance, "vkCreateDevice"));
+    const auto destroy = reinterpret_cast<PFN_vkDestroyDevice>(gipa(instance, "vkDestroyDevice"));
+    if (create == nullptr || destroy == nullptr) {
+        return;
+    }
+    struct Try {
+        PFN_vkCreateDevice create;
+        PFN_vkDestroyDevice destroy;
+        VkPhysicalDevice physical;
+        VkDeviceCreateInfo ci;
+        VkResult result;
+    };
+    const auto attempt = [&](const std::vector<const char*>& exts, const std::string& label) {
+        Try t{create, destroy, physical, *info, VK_ERROR_UNKNOWN};
+        t.ci.enabledExtensionCount = static_cast<uint32_t>(exts.size());
+        t.ci.ppEnabledExtensionNames = exts.data();
+        std::string fault;
+        const bool ok = GuardedCall(
+            [](void* p) {
+                auto* x = static_cast<Try*>(p);
+                VkDevice d = VK_NULL_HANDLE;
+                x->result = x->create(x->physical, &x->ci, nullptr, &d);
+                if (x->result == VK_SUCCESS && d != VK_NULL_HANDLE) {
+                    x->destroy(d, nullptr);
+                }
+            },
+            &t, fault);
+        Checkpoint(fmt::format("DLSS dry run (system loader) {}: {}", label,
+                               ok ? vk::to_string(static_cast<vk::Result>(t.result))
+                                  : "CRASH " + fault));
+        return ok && t.result == VK_SUCCESS;
+    };
+    std::vector<const char*> base(info->ppEnabledExtensionNames,
+                                  info->ppEnabledExtensionNames + info->enabledExtensionCount);
+    attempt(base, "as we create it");
+    std::vector<const char*> added;
+    for (const auto& name : SR::Dlss::RequiredDeviceExtensions()) {
+        if (std::none_of(base.begin(), base.end(), [&](const char* e) { return name == e; }) &&
+            std::none_of(added.begin(), added.end(), [&](const char* e) { return name == e; })) {
+            added.push_back(name.c_str());
+        }
+    }
+    auto all = base;
+    all.insert(all.end(), added.begin(), added.end());
+    if (attempt(all, "with Streamline's extensions")) {
+        return;
+    }
+    for (std::size_t i = 0; i < added.size(); ++i) {
+        auto without = base;
+        for (std::size_t j = 0; j < added.size(); ++j) {
+            if (j != i) without.push_back(added[j]);
+        }
+        attempt(without, fmt::format("with Streamline's extensions but {}", added[i]));
+    }
+    for (std::size_t i = 0; i < base.size(); ++i) {
+        auto without = all;
+        without.erase(without.begin() + static_cast<std::ptrdiff_t>(i));
+        attempt(without, fmt::format("with Streamline's extensions, without our {}", base[i]));
+    }
+#endif
 }
 
 bool GuardedCall(void (*fn)(void*), void* arg, std::string& fault) {

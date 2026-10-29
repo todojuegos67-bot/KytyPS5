@@ -606,6 +606,11 @@ bool Instance::CreateDevice() {
             BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumeratePhysicalDevices)),
             BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties)),
             BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr))));
+        if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss) {
+            BB::Upscale::DryRunDevice(static_cast<VkInstance>(*instance),
+                                      static_cast<VkPhysicalDevice>(physical_device),
+                                      reinterpret_cast<const VkDeviceCreateInfo*>(&device_chain.get()));
+        }
         BB::Upscale::Checkpoint(fmt::format("vkCreateDevice with {} extensions: {}",
                                             enabled_extensions.size(),
                                             fmt::join(enabled_extensions, " ")));

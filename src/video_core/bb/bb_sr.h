@@ -74,6 +74,8 @@ const wchar_t* LoaderPath();         // sl.interposer.dll, or null
 bool Manual();                       // BB_SL_NO_INTERPOSER_LOADER=1: slSetVulkanInfo after the device
 const std::vector<std::string>& RequiredDeviceExtensions();   // slGetFeatureRequirements
 const std::vector<std::string>& RequiredInstanceExtensions();
+const std::vector<std::string>& RequiredFeatures12();
+const std::vector<std::string>& RequiredFeatures13();
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device);
 bool Ready();
 bool Evaluate(const Desc& desc);

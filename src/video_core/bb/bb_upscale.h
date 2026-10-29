@@ -69,6 +69,10 @@ bool RunBackend(const SR::Desc& desc);
 bool GuardedCall(void (*fn)(void*), void* arg, std::string& fault);
 // "<pointer> (<module>+<offset>)" for a function pointer, for the init log.
 std::string Where(const void* p);
+// DLSS: before the real vkCreateDevice, tries the same create info straight on the system Vulkan
+// loader (no Streamline), then with the extensions Streamline adds, then without each of them,
+// and logs every result: which addition the driver refuses.
+void DryRunDevice(VkInstance instance, VkPhysicalDevice physical, const VkDeviceCreateInfo* info);
 // A start-up checkpoint: written and flushed at once to bb_upscale_init.log (next to the working
 // directory's shadPS4 log is asynchronous and may be cut off by a crash) and to the log.
 void Checkpoint(std::string_view text);
