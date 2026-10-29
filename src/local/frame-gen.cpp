@@ -9559,6 +9559,8 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	probed(RtFlicker::Flare, "TorchFlareApply", [&] { return TorchFlareApply(command, inputs); }); // (KYTY_TORCH_FLARE: the lens flare, last before the upscaler and the HUD; torch.cpp)
 	TimedPass("DofApply", [&] { DofApply(command, inputs); }); // (ds-dof-1029, KYTY_DOF: the distance depth of field, dof.cpp; after every other pass, before the upscaler and the HUD; nothing when off)
 	TimedPass("GbufViewApply", [&] { GbufViewApply(command, inputs); }); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
+	// (ds-foveated-1029, KYTY_DLSS_NR_PRESR: DLSS 5 Neural Rendering on the render-res colour, before the upscaler; dlss-nr.cpp)
+	TimedPass("DlssNrPreSr", [&] { return DlssNrPreSr(command, inputs); });
 	SharpenProbeTick();
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3 || g_sr_kind == 4;
 	// XeSS and FSR 3.1: their output at the display's size (g_sr_mid; FSR 4 and DLSS do it themselves).

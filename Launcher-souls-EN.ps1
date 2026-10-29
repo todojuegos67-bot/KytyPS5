@@ -438,7 +438,10 @@ function Start-Game {
 	}
 	if (-not $pureGame -and $cmbFlare -and $cmbFlare.SelectedIndex -gt 0) { $sets += 'KYTY_TORCH_FLARE=1' }  # (torch-1028) destellos de lente
 	if ($cmbDof -and -not $pureGame) { $sets += "KYTY_DOF=$([math]::Min(3, [math]::Max(0, $cmbDof.SelectedIndex)))" } else { $sets += 'KYTY_DOF=0' }  # (ds-dof-1029) profundidad de campo a distancia: No/Suave/Cinematico/Fuerte
-	if ($cmbFov -and -not $pureGame -and $cmbFov.SelectedIndex -gt 0) { $sets += @('KYTY_FOVEATED=1', "KYTY_FOV_EDGE=$(@('0.5', '0.75', '0.5', '0.35')[[math]::Min(3, $cmbFov.SelectedIndex)])") } else { $sets += @('KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0') }  # (ds-foveated-1029) DLSS 5 NR foveado: No/Suave/Medio/Fuerte (borde 0,75/0,5/0,35)
+	$fovI = if ($cmbFov -and -not $pureGame) { [math]::Min(4, [math]::Max(0, $cmbFov.SelectedIndex)) } else { 0 }  # (ds-foveated-1029) DLSS 5 NR: No / PreSR / Foveado Suave / Medio / Fuerte
+	if ($fovI -eq 1) { $sets += @('KYTY_DLSS_NR=1', 'KYTY_DLSS_NR_PRESR=1', 'KYTY_FOVEATED=0') }  # PreSR: antes del reescalado, a la resolucion de render
+	elseif ($fovI -ge 2) { $sets += @('KYTY_FOVEATED=1', 'KYTY_DLSS_NR_PRESR=0', "KYTY_FOV_EDGE=$(@('0.5', '0.5', '0.75', '0.5', '0.35')[$fovI])") }  # foveado despues del reescalado: borde 0,75 / 0,5 / 0,35
+	else { $sets += @('KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0', 'KYTY_DLSS_NR_PRESR=0') }
 	if ($pureGame) {
 		# (audit) Juego original: fuera todo pase visual del emulador (RT, volumetrica, sombra RT, brillo, oclusion especular, GTAO,
 		# SSGI, reflejos RT de pantalla, contacto, particulas RT); -Set manda sobre el entorno. Rendimiento, reescalador, FG y latencia igual.
@@ -447,7 +450,7 @@ function Start-Game {
 		foreach ($n in @(Get-ChildItem Env: | Where-Object { $_.Name -match $fxPat } | ForEach-Object { $_.Name })) { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 		$sets += @('KYTY_HWRT=0', 'KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_REFLECTIONS=0',
 			'KYTY_RT_SHADOWS=0', 'KYTY_CONTACT_SHADOWS=0', 'KYTY_RT_SUN=0', 'KYTY_RT_PARTICLES=0', 'KYTY_GODRAYS=0', 'KYTY_SHINE=0', 'KYTY_SPEC_OCCLUSION=0',
-			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0', 'KYTY_TORCH_HW=0', 'KYTY_SMOKE=0', 'KYTY_RT_HW_EXPERIMENTAL=0', 'KYTY_DOF=0', 'KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0')
+			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0', 'KYTY_TORCH_HW=0', 'KYTY_SMOKE=0', 'KYTY_RT_HW_EXPERIMENTAL=0', 'KYTY_DOF=0', 'KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0', 'KYTY_DLSS_NR_PRESR=0')
 		$pa = @(); for ($i = 0; $i -lt $psargs.Count; $i++) { if ($psargs[$i] -eq '-Ssgi') { $i++; continue }; $pa += $psargs[$i] }; $psargs = $pa
 	}
 	# (10-24) Brillo metales retirado (no aportaba)
@@ -2787,13 +2790,15 @@ try {
 } catch { }
 # (ds-foveated-1029) Foveated DLSS in Image: DLSS 5 Neural Rendering, foveated (KYTY_FOVEATED, KYTY_FOV_EDGE); the left column moves down one row.
 try {
-	$lbFov = New-Label 'Foveated DLSS' $smallFont $ink 0 0 88 22; $panel.Controls.Add($lbFov)
+	$lbFov = New-Label 'DLSS 5' $smallFont $ink 0 0 88 22; $panel.Controls.Add($lbFov)
 	$cmbFov = New-Object System.Windows.Forms.ComboBox
-	$cmbFov.DropDownStyle = 'DropDownList'; $cmbFov.Font = $smallFont; $cmbFov.Tag = 'dlssfov1029'
-	foreach ($it in @('Off', 'Soft (edge 0.75)', 'Medium (0.5)', 'Strong (0.35)')) { [void]$cmbFov.Items.Add($it) }
-	$v = 0; [void][int]::TryParse((Get-IniValue 'dlssfov1029' '0'), [ref]$v); $cmbFov.SelectedIndex = [math]::Min([math]::Max(0, $v), 3)
+	$cmbFov.DropDownStyle = 'DropDownList'; $cmbFov.Font = $smallFont; $cmbFov.Tag = 'dlssfov1029b'
+	foreach ($it in @('Off', 'PreSR (fast)', 'Foveated Soft (edge 0.75)', 'Foveated Medium (0.5)', 'Foveated Strong (0.35)')) { [void]$cmbFov.Items.Add($it) }
+	$v = 0; [void][int]::TryParse((Get-IniValue 'dlssfov1029b' '-1'), [ref]$v)
+	if ($v -lt 0) { $o = 0; [void][int]::TryParse((Get-IniValue 'dlssfov1029' '0'), [ref]$o); $v = $(if ($o -gt 0) { $o + 1 } else { 0 }) }  # (antes: 1-3 = Suave/Medio/Fuerte)
+	$cmbFov.SelectedIndex = [math]::Min([math]::Max(0, $v), 4)
 	$cmbFov.Add_SelectedIndexChanged({ param($sender, $e) Set-IniValue $sender.Tag "$($sender.SelectedIndex)" })
-	$tips.SetToolTip($cmbFov, 'NVIDIA DLSS 5 Neural Rendering, foveated (from FoveatedDLSS5): NR at full resolution in the centre of the screen and at a lower resolution toward the edges (a smooth curve, horizontal and vertical separately); saves GPU without touching the centre, which never loses sharpness or gets darker. Soft: edge 0.75 (~16 % fewer pixels). Medium: 0.5 (~31 %). Strong: 0.35 (~39 %). It turns itself off when it saves less than 5 %. Needs an NVIDIA RTX and NVIDIA''s nvngx_dlssnr.dll next to the emulator or in its streamline folder (not included): without it, normal DLSS. Only with DLSS, XeSS or FSR. Experimental.'); $tips.SetToolTip($lbFov, 'NVIDIA DLSS 5 Neural Rendering, foveated (from FoveatedDLSS5): NR at full resolution in the centre of the screen and at a lower resolution toward the edges (a smooth curve, horizontal and vertical separately); saves GPU without touching the centre, which never loses sharpness or gets darker. Soft: edge 0.75 (~16 % fewer pixels). Medium: 0.5 (~31 %). Strong: 0.35 (~39 %). It turns itself off when it saves less than 5 %. Needs an NVIDIA RTX and NVIDIA''s nvngx_dlssnr.dll next to the emulator or in its streamline folder (not included): without it, normal DLSS. Only with DLSS, XeSS or FSR. Experimental.'); $panel.Controls.Add($cmbFov)
+	$tips.SetToolTip($cmbFov, 'NVIDIA DLSS 5 Neural Rendering. PreSR (fast): NR before the upscaler, on the render-resolution image (about 4 times fewer pixels than 4K; the upscaler does the rest). Foveated: NR after the upscaler (from FoveatedDLSS5): NR at full resolution in the centre of the screen and at a lower resolution toward the edges (a smooth curve, horizontal and vertical separately); saves GPU without touching the centre, which never loses sharpness or gets darker. Soft: edge 0.75 (~16 % fewer pixels). Medium: 0.5 (~31 %). Strong: 0.35 (~39 %). It turns itself off when it saves less than 5 %. Needs an NVIDIA RTX and NVIDIA''s nvngx_dlssnr.dll next to the emulator or in its streamline folder (not included): without it, normal DLSS. Only with DLSS, XeSS or FSR. Experimental.'); $tips.SetToolTip($lbFov, 'NVIDIA DLSS 5 Neural Rendering. PreSR (fast): NR before the upscaler, on the render-resolution image (about 4 times fewer pixels than 4K; the upscaler does the rest). Foveated: NR after the upscaler (from FoveatedDLSS5): NR at full resolution in the centre of the screen and at a lower resolution toward the edges (a smooth curve, horizontal and vertical separately); saves GPU without touching the centre, which never loses sharpness or gets darker. Soft: edge 0.75 (~16 % fewer pixels). Medium: 0.5 (~31 %). Strong: 0.35 (~39 %). It turns itself off when it saves less than 5 %. Needs an NVIDIA RTX and NVIDIA''s nvngx_dlssnr.dll next to the emulator or in its streamline folder (not included): without it, normal DLSS. Only with DLSS, XeSS or FSR. Experimental.'); $panel.Controls.Add($cmbFov)
 	Move-To $lbFov $gImg 10 154 112; Move-To $cmbFov $gImg 124 152 282
 	$gImg.Height = $gImg.Height + 32
 	foreach ($g2 in @($gGfx, $gRt)) { if ($g2) { $g2.Top = $g2.Top + 32 } }

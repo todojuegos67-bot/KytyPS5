@@ -12,6 +12,7 @@
 //
 //   KYTY_FOVEATED=0|1          the foveated grid (1 also turns NR on; 0 / unset: KYTY_DLSS_NR decides, uniform grid)
 //   KYTY_DLSS_NR=0|1           NR on the uniform grid (no foveation)
+//   KYTY_DLSS_NR_PRESR=1       with KYTY_DLSS_NR=1: NR before the upscaler on the render-res colour (DlssNrPreSr)
 //   KYTY_FOV_WIDTH / _HEIGHT   the full-res centre zone: a fraction of the output (<= 1) or output pixels (default 0.52 / 0.51,
 //                              2000 x 1100 at 3840 x 2160, FoveatedDLSS5's suggestion for 4K)
 //   KYTY_FOV_FALLOFF           the fall-off on every side: a fraction of the output's height (<= 1) or pixels (default 400 px
@@ -41,6 +42,10 @@ namespace Libs::Graphics::FrameGen {
 void DlssNrAddDeviceExtensions(const std::vector<vk::ExtensionProperties>& available, std::vector<const char*>& extensions);
 // In Upscale, after the upscaler wrote inputs.output: the model's edit applied to inputs.output in place. False: nothing.
 bool DlssNrApply(vk::CommandBuffer command, const UpscaleInputs& inputs);
+// KYTY_DLSS_NR_PRESR=1 (with KYTY_DLSS_NR=1): in Upscale, BEFORE the upscaler: the model on the render-res colour (its own
+// depth and motion, ~1/4 of the 4K pixels at 1080p->4K; OptiScaler-DLSSNR-PreSR's idea), inputs.color becomes the result
+// (rgba16f) the upscaler then reads. Uniform grid (no foveation). False: nothing done.
+bool DlssNrPreSr(vk::CommandBuffer command, UpscaleInputs& inputs);
 
 } // namespace Libs::Graphics::FrameGen
 

@@ -214,6 +214,11 @@ bool EnvOn(const char* name) {
 	const char* v = std::getenv(name);
 	return v != nullptr && *v != '\0' && *v != '0' && (*v | 0x20) != 'n' && (*v | 0x20) != 'f';
 }
+// KYTY_DLSS_NR_PRESR=1: NR on the render-res colour BEFORE the upscaler (OptiScaler-DLSSNR-PreSR's idea), uniform grid.
+bool PreSr() {
+	static const bool on = EnvOn("KYTY_DLSS_NR_PRESR");
+	return on;
+}
 void Say(const char* text) {
 	std::printf("%s\n", text);
 	std::fflush(stdout);
@@ -929,7 +934,7 @@ void Log(vk::Extent2D full) {
 
 // The grid for this output and the A/B's stage.
 void UpdateGrid(vk::Extent2D full) {
-	static const bool foveated = EnvOn("KYTY_FOVEATED");
+	static const bool foveated = EnvOn("KYTY_FOVEATED") && !PreSr();
 	static const bool measure  = [] {
 		const char* v = std::getenv("KYTY_FOV_MEASURE");
 		return v == nullptr || *v != '0';
@@ -1032,11 +1037,11 @@ static void StartupLine(const std::vector<vk::ExtensionProperties>* available) {
 		ext = std::string("VK_NVX_binary_import ") + (has("VK_NVX_binary_import") ? "yes" : "no") + ", VK_NVX_image_view_handle " +
 		      (has("VK_NVX_image_view_handle") ? "yes" : "no");
 	}
-	std::printf("DLSS-NR: start-up: KYTY_FOVEATED=%s KYTY_DLSS_NR=%s KYTY_FOV_EDGE=%s KYTY_FOV_WIDTH=%s KYTY_FOV_HEIGHT=%s KYTY_FOV_FALLOFF=%s -> NR %s; "
+	std::printf("DLSS-NR: start-up: KYTY_FOVEATED=%s KYTY_DLSS_NR=%s KYTY_DLSS_NR_PRESR=%s KYTY_FOV_EDGE=%s KYTY_FOV_WIDTH=%s KYTY_FOV_HEIGHT=%s KYTY_FOV_FALLOFF=%s -> NR %s; "
 	            "%s; KYTY_UPSCALER=%s: the NR hook (after the upscaler on the PS5 Pro path) is %s; device: %s\n",
-	            env("KYTY_FOVEATED").c_str(), env("KYTY_DLSS_NR").c_str(), env("KYTY_FOV_EDGE").c_str(), env("KYTY_FOV_WIDTH").c_str(),
+	            env("KYTY_FOVEATED").c_str(), env("KYTY_DLSS_NR").c_str(), env("KYTY_DLSS_NR_PRESR").c_str(), env("KYTY_FOV_EDGE").c_str(), env("KYTY_FOV_WIDTH").c_str(),
 	            env("KYTY_FOV_HEIGHT").c_str(), env("KYTY_FOV_FALLOFF").c_str(),
-	            DlssNrWanted() ? (EnvOn("KYTY_FOVEATED") ? "wanted, foveated" : "wanted, uniform") : "off (neither switch is 1)", dll.c_str(),
+	            DlssNrWanted() ? (PreSr() ? "wanted, PreSR (render-res colour, before the upscaler)" : EnvOn("KYTY_FOVEATED") ? "wanted, foveated, after the upscaler" : "wanted, uniform, after the upscaler") : "off (neither switch is 1)", dll.c_str(),
 	            up.c_str(), reachable ? "reachable (it runs once the game's 3D view reaches the upscaler)"
 	                                  : "NOT reachable: no upscaler (the game's own TAA); choose DLSS, XeSS or FSR in Reescalado",
 	            ext.c_str());
@@ -1057,20 +1062,9 @@ void DlssNrAddDeviceExtensions(const std::vector<vk::ExtensionProperties>& avail
 	std::fflush(stdout);
 }
 
-bool DlssNrApply(vk::CommandBuffer command, const UpscaleInputs& inputs) {
-	StartupLine(nullptr);
-	{
-		static bool said = false;
-		if (!said) {
-			said = true;
-			std::printf("DLSS-NR: the upscaler pass reached the NR hook (output %ux%u, format %d, usage 0x%x): NR %s\n", inputs.output.extent.width,
-			            inputs.output.extent.height, static_cast<int>(inputs.output.format),
-			            static_cast<uint32_t>(static_cast<VkImageUsageFlags>(inputs.output.usage)),
-			            DlssNrWanted() ? (g.disabled ? "wanted but off (see above)" : "wanted") : "off (KYTY_FOVEATED / KYTY_DLSS_NR not 1)");
-			std::fflush(stdout);
-		}
-	}
-	if (!DlssNrWanted() || g.disabled) return false;
+// The NR pass on `out` (the upscaled output, written in place; or with `pre` the render-res colour, read only, the
+// result in out16 handed back in `result`).
+static bool RunNr(vk::CommandBuffer command, const UpscaleInputs& inputs, const UpscaleImage& out, bool pre, UpscaleImage* result) {
 	const auto skip = [](const char* why) {
 		static std::string last;
 		if (last != why) {
@@ -1082,11 +1076,11 @@ bool DlssNrApply(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 	};
 	GraphicContext* graphics = inputs.graphics;
 	if (graphics == nullptr || command == nullptr) return skip("no graphics context / command buffer");
-	const auto& out = inputs.output;
-	if (out.view == nullptr || out.image == nullptr) return skip("the upscaled output has no image / view");
+	if (out.view == nullptr || out.image == nullptr) return skip("the image has no view");
 	if (inputs.depth.view == nullptr || inputs.motion.view == nullptr) return skip("no depth or motion vectors from the game");
 	if (out.extent.width < 64 || out.extent.height < 64) return skip("the output is smaller than 64x64");
-	if (!(out.usage & vk::ImageUsageFlagBits::eTransferSrc)) return skip("the output cannot be copied (no transfer-src usage)");
+	if (!pre && !(out.usage & vk::ImageUsageFlagBits::eTransferSrc)) return skip("the output cannot be copied (no transfer-src usage)");
+	if (pre && out.extent != inputs.depth.extent) return skip("PreSR: the colour and the depth differ in size");
 	if (VideoOut::MoviePlaying()) {
 		g.pending_reset = true;
 		return false;
@@ -1103,22 +1097,22 @@ bool DlssNrApply(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 	UpdateGrid(full);
 	const vk::Extent2D work {g.grid.x.work, g.grid.y.work};
 	// Full-res images (the copy of the frame; the rgba16f stand-in when the output takes no storage writes).
-	const bool direct = (out.usage & vk::ImageUsageFlagBits::eStorage) &&
+	const bool direct = !pre && (out.usage & vk::ImageUsageFlagBits::eStorage) &&
 	                    (graphics->physical_device.getFormatProperties(out.format).optimalTilingFeatures & vk::FormatFeatureFlagBits::eStorageImage);
-	if (!direct && !(out.usage & vk::ImageUsageFlagBits::eTransferDst)) {
+	if (!pre && !direct && !(out.usage & vk::ImageUsageFlagBits::eTransferDst)) {
 		Say("DLSS-NR: the upscaled output takes neither storage writes nor transfers. NR off.");
 		g.disabled = true;
 		return false;
 	}
-	if (g.keep.image == VK_NULL_HANDLE || old_full != full || (!direct && g.out16.image == VK_NULL_HANDLE)) {
+	if ((!pre && g.keep.image == VK_NULL_HANDLE) || old_full != full || (!direct && g.out16.image == VK_NULL_HANDLE)) {
 		// (Resized: the old full-res images go with the working ones, 32 frames later.)
-		if (g.keep.image != VK_NULL_HANDLE) {
+		if (g.keep.image != VK_NULL_HANDLE || g.out16.image != VK_NULL_HANDLE) {
 			Retired r;
 			r.images[0] = g.keep, r.images[1] = g.out16, r.frame = g.frame;
 			g.retired.push_back(r);
 			g.keep = {}, g.out16 = {};
 		}
-		bool ok = MakeImage(*graphics, vk::Format::eR16G16B16A16Sfloat, full, g.keep, false);
+		bool ok = pre || MakeImage(*graphics, vk::Format::eR16G16B16A16Sfloat, full, g.keep, false);
 		if (ok && !direct) ok = MakeImage(*graphics, vk::Format::eR16G16B16A16Sfloat, full, g.out16, false);
 		if (!ok) {
 			Say("DLSS-NR: could not create its full-resolution images. NR off.");
@@ -1148,7 +1142,7 @@ bool DlssNrApply(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		const float one[4] {1.0f, 1.0f, 1.0f, 1.0f};
 		command.updateBuffer(vk::Buffer(g.one), 0, sizeof(one), one);
 	}
-	{
+	if (!pre) {
 		vk::ImageBlit blit {};
 		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, out.level, out.layer, 1};
 		blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
@@ -1180,7 +1174,7 @@ bool DlssNrApply(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 	const auto          run      = [&](int mode, vk::Extent2D size) {
         const auto              gen = vk::ImageLayout::eGeneral;
         vk::DescriptorImageInfo infos[Bindings] {};
-        infos[0]  = {g.linear, g.keep.view, gen};
+        infos[0]  = pre ? vk::DescriptorImageInfo {g.linear, out.view, out.layout} : vk::DescriptorImageInfo {g.linear, g.keep.view, gen};
         infos[1]  = {g.point, inputs.depth.view, inputs.depth.layout};
         infos[2]  = {g.point, inputs.motion.view, inputs.motion.layout};
         infos[3]  = {nullptr, g.proxy.view, gen};
@@ -1189,7 +1183,7 @@ bool DlssNrApply(vk::CommandBuffer command, const UpscaleInputs& inputs) {
         infos[6]  = {g.linear, g.proxy.view, gen};
         infos[7]  = {g.linear, g.nr.view, gen};
         infos[8]  = {g.point, g.wdepth.view, gen};
-        infos[9]  = {nullptr, mode == 1 ? dst_view : g.keep.view, gen};
+        infos[9]  = {nullptr, mode == 1 ? dst_view : g.out16.view != nullptr ? g.out16.view : g.keep.view, gen};
         const vk::DescriptorBufferInfo exp_info = game_exposure
                                                       ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range}
                                                       : vk::DescriptorBufferInfo {vk::Buffer(g.one), 0, 16};
@@ -1227,18 +1221,19 @@ bool DlssNrApply(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 	p.Set("DLSSNR.MVecScaleX", 1.0f), p.Set("DLSSNR.MVecScaleY", 1.0f);
 	p.Set("DLSSNR.DepthInverted", 1);
 	p.Set("DLSSNR.Enabled", 1);
+	if (pre) p.Set("DLSSNR.JitterOffsetX", inputs.jitter_x), p.Set("DLSSNR.JitterOffsetY", inputs.jitter_y); // (the render-res colour is jittered)
 	const bool reset = g.pending_reset || inputs.reset;
 	p.Set("DLSSNR.Reset", reset ? 1 : 0);
 	g.pending_reset = false;
 	SetSteering(p);
-	const uint32_t result = CallEvaluate(g_rt.evaluate, static_cast<VkCommandBuffer>(command), g.feature, &p);
+	const uint32_t eval_result = CallEvaluate(g_rt.evaluate, static_cast<VkCommandBuffer>(command), g.feature, &p);
 	Barrier(command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite,
 	        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	if (timed) command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g.pool, entry * Stamps + 2);
-	const bool evaluated = result == NgxSuccess;
+	const bool evaluated = eval_result == NgxSuccess;
 	if (!evaluated) {
 		++g.eval_failures;
-		std::printf("DLSS-NR: evaluate returned 0x%08x%s (failure %u of 3)\n", result, result == 0xBAD0FFFFu ? " (it raised an exception)" : "",
+		std::printf("DLSS-NR: evaluate returned 0x%08x%s (failure %u of 3)\n", eval_result, eval_result == 0xBAD0FFFFu ? " (it raised an exception)" : "",
 		            g.eval_failures);
 		std::fflush(stdout);
 		if (g.eval_failures >= 3) {
@@ -1249,7 +1244,7 @@ bool DlssNrApply(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 	// 3. Resolve onto the frame (only when the model wrote its answer: else the frame stays as it was).
 	if (evaluated) {
 		run(1, full);
-		if (!direct) {
+		if (!direct && !pre) {
 			Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 			        vk::PipelineStageFlagBits2::eAllTransfer, vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite);
 			vk::ImageBlit blit {};
@@ -1271,15 +1266,54 @@ bool DlssNrApply(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		static bool said = false;
 		if (!said && evaluated) {
 			said = true;
-			std::printf("DLSS-NR: on: %ux%u output (format %d, %s), NR grid %ux%u, guides from %ux%u, exposure %s, strength %g%s\n", full.width,
-			            full.height, static_cast<int>(out.format), direct ? "written in place" : "via rgba16f + blit", work.width,
+			std::printf("DLSS-NR: on%s: %ux%u image (format %d, %s), NR grid %ux%u, guides from %ux%u, exposure %s, strength %g%s\n", pre ? " (PreSR, before the upscaler)" : " (after the upscaler)", full.width,
+			            full.height, static_cast<int>(out.format), pre ? "into an rgba16f colour the upscaler reads" : direct ? "written in place" : "via rgba16f + blit", work.width,
 			            work.height, inputs.depth.extent.width, inputs.depth.extent.height, game_exposure ? "the game's" : "1.0", strength,
 			            view ? ", density view" : "");
 			std::fflush(stdout);
 		}
 	}
 	Log(full);
+	if (evaluated && pre && result != nullptr) {
+		result->image  = vk::Image(g.out16.image);
+		result->view   = g.out16.view;
+		result->layout = vk::ImageLayout::eGeneral;
+		result->format = vk::Format::eR16G16B16A16Sfloat;
+		result->extent = full;
+		result->usage  = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc |
+		                vk::ImageUsageFlagBits::eTransferDst;
+		result->level = 0;
+		result->layer = 0;
+	}
 	return evaluated;
+}
+
+static void FirstReach(const char* where, const UpscaleImage& image) {
+	static bool said = false;
+	if (said) return;
+	said = true;
+	std::printf("DLSS-NR: the upscaler pass reached the NR hook (%s, %ux%u, format %d, usage 0x%x): NR %s%s\n", where, image.extent.width,
+	            image.extent.height, static_cast<int>(image.format), static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.usage)),
+	            DlssNrWanted() ? (g.disabled ? "wanted but off (see above)" : "wanted") : "off (KYTY_FOVEATED / KYTY_DLSS_NR not 1)",
+	            DlssNrWanted() ? (PreSr() ? ", PreSR: before the upscaler, on the render-res colour" : ", after the upscaler") : "");
+	std::fflush(stdout);
+}
+
+bool DlssNrApply(vk::CommandBuffer command, const UpscaleInputs& inputs) {
+	StartupLine(nullptr);
+	FirstReach("after the upscaler: its output", inputs.output);
+	if (!DlssNrWanted() || g.disabled || PreSr()) return false;
+	return RunNr(command, inputs, inputs.output, false, nullptr);
+}
+
+bool DlssNrPreSr(vk::CommandBuffer command, UpscaleInputs& inputs) {
+	StartupLine(nullptr);
+	if (!DlssNrWanted() || g.disabled || !PreSr()) return false;
+	FirstReach("PreSR: the render-res colour", inputs.color);
+	UpscaleImage result;
+	if (!RunNr(command, inputs, inputs.color, true, &result)) return false;
+	inputs.color = result;
+	return true;
 }
 
 } // namespace Libs::Graphics::FrameGen
