@@ -207,7 +207,11 @@ uint32_t KYTY_NGX_CONV ScalingRatioCallback(NgxParameter* parameters) {
 float EnvF(const char* name, float fallback, float lo, float hi) {
 	const char* v = std::getenv(name);
 	if (v == nullptr || *v == '\0') return fallback;
-	const float f = static_cast<float>(std::atof(v));
+	// ("0.35" from the launcher; a "0,35" taken as 0.35 too. The process keeps the C locale.)
+	std::string t(v);
+	for (auto& c: t)
+		if (c == ',') c = '.';
+	const float f = static_cast<float>(std::strtod(t.c_str(), nullptr));
 	return std::isfinite(f) ? std::clamp(f, lo, hi) : fallback;
 }
 bool EnvOn(const char* name) {
@@ -1037,9 +1041,10 @@ static void StartupLine(const std::vector<vk::ExtensionProperties>* available) {
 		ext = std::string("VK_NVX_binary_import ") + (has("VK_NVX_binary_import") ? "yes" : "no") + ", VK_NVX_image_view_handle " +
 		      (has("VK_NVX_image_view_handle") ? "yes" : "no");
 	}
-	std::printf("DLSS-NR: start-up: KYTY_FOVEATED=%s KYTY_DLSS_NR=%s KYTY_DLSS_NR_PRESR=%s KYTY_FOV_EDGE=%s KYTY_FOV_WIDTH=%s KYTY_FOV_HEIGHT=%s KYTY_FOV_FALLOFF=%s -> NR %s; "
+	std::printf("DLSS-NR: start-up: KYTY_FOVEATED=%s KYTY_DLSS_NR=%s KYTY_DLSS_NR_PRESR=%s KYTY_DLSS_NR_STRENGTH=%s (%g) KYTY_DLSS_NR_UNSIGNED=%s KYTY_FOV_EDGE=%s KYTY_FOV_WIDTH=%s KYTY_FOV_HEIGHT=%s KYTY_FOV_FALLOFF=%s -> NR %s; "
 	            "%s; KYTY_UPSCALER=%s: the NR hook (after the upscaler on the PS5 Pro path) is %s; device: %s\n",
-	            env("KYTY_FOVEATED").c_str(), env("KYTY_DLSS_NR").c_str(), env("KYTY_DLSS_NR_PRESR").c_str(), env("KYTY_FOV_EDGE").c_str(), env("KYTY_FOV_WIDTH").c_str(),
+	            env("KYTY_FOVEATED").c_str(), env("KYTY_DLSS_NR").c_str(), env("KYTY_DLSS_NR_PRESR").c_str(), env("KYTY_DLSS_NR_STRENGTH").c_str(),
+	            static_cast<double>(EnvF("KYTY_DLSS_NR_STRENGTH", 1.0f, 0.0f, 1.0f)), env("KYTY_DLSS_NR_UNSIGNED").c_str(), env("KYTY_FOV_EDGE").c_str(), env("KYTY_FOV_WIDTH").c_str(),
 	            env("KYTY_FOV_HEIGHT").c_str(), env("KYTY_FOV_FALLOFF").c_str(),
 	            DlssNrWanted() ? (PreSr() ? "wanted, PreSR (render-res colour, before the upscaler)" : EnvOn("KYTY_FOVEATED") ? "wanted, foveated, after the upscaler" : "wanted, uniform, after the upscaler") : "off (neither switch is 1)", dll.c_str(),
 	            up.c_str(), reachable ? "reachable (it runs once the game's 3D view reaches the upscaler)"
