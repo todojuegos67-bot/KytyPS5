@@ -1,0 +1,230 @@
+#version 450
+// KYTY_SMOKE (smoke.cpp): soft particles and torch-lit smoke on Demon's Souls' particle layer, before the upscaler.
+// The particle layer is exact: D = game colour (after the particle-translucent pass) - the copy taken right before its
+// first draw (frame-gen.cpp BeforeSceneDraw). For additive particles D = their emission; for alpha-blended ones
+// D = a (c - background), so scaling D by f is the same as drawing the particle with alpha x f: the fade below is the
+// classic soft-particle depth fade, applied after the fact.
+// Modes (push.misc.x):
+//   0 edge:      full res: a pixel without particle next to one with a strong particle (a hard step in D) on the SAME
+//                surface (depth continuous) whose background is continuous too: the line where a sprite was cut by
+//                the depth test (smoke meeting a wall / floor). aux = (edge, view z, exposed |D|, -).
+//   1 rows:      aux = per pixel the nearest edge in its row (|dx| <= Rmax) and that edge's z.
+//   2 cols:      the nearest edge (Euclidean, from the row pass) on a surface near this pixel's depth; the fade
+//                smoothstep(dist / R), R = soft distance (m) projected at this depth (px); then a temporal blend with
+//                the motion-reprojected history (depth-rejected): no shimmer from the jitter. aux = (fade, z).
+//   3 composite: colour + (fade - 1) x D; plus warm in-scattering from the torch lights torch.comp tracked this frame
+//                (view position, hue, SLOW power x fade: no flicker; inside their 4.5 m local radius), integrated along
+//                the view ray up to the surface, x the particle coverage (|D| over the pixel), never on emissive pixels.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex; // the colour so far (other passes applied)
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2) uniform sampler2D game_tex;  // the game's colour (after the particles)
+layout(binding = 3) uniform sampler2D pre_tex;   // the pre-particle copy
+layout(binding = 4) uniform sampler2D motion_tex;
+layout(binding = 5) uniform sampler2D src_tex;
+layout(binding = 6) uniform sampler2D hist_tex;
+layout(binding = 7, rgba16f) uniform writeonly image2D out_img;
+layout(binding = 8, rgba16f) uniform writeonly image2D aux_img;
+layout(std430, binding = 9) readonly buffer Torch {
+	vec4 tw[]; // torch.comp's Frame: lights at vec4 8.. (8 slots x 4)
+};
+layout(std430, binding = 10) readonly buffer Exposure {
+	float exposure_values[];
+};
+layout(std430, binding = 11) buffer Stats {
+	uint stats[16]; // 0 frames, 1 sampled px, 2 particle px, 3 edge px, 4 softened px, 5 torch-lit px, 6 lights a frame
+};
+
+layout(push_constant) uniform Push {
+	vec4  proj;      // M[0], M[5], M[8], M[9]
+	vec4  depth_map; // M[10], M[14], M[11], M[15]
+	vec4  size;      // w, h, soft strength (0..1), glow strength
+	vec4  par;       // soft distance (m), Rmax (px), torch radius (m), added-luminance cap (exposed)
+	vec4  motion;    // motion scale x, y, history valid, -
+	ivec4 misc;      // mode, frame, flags (1 NDC y flipped, 2 debug view, 4 torch lights bound, 8 game exposure), exposure index
+} push;
+
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+float Sat(float x) { return clamp(x, 0.0, 1.0); }
+vec3  Safe(vec3 c) { return (any(isnan(c)) || any(isinf(c))) ? vec3(0) : clamp(c, vec3(-6.0e4), vec3(6.0e4)); }
+float YS() { return (push.misc.z & 1) != 0 ? -1.0 : 1.0; }
+float ViewZ(float d) {
+	float den = d * push.depth_map.z - push.depth_map.x;
+	return abs(den) > 1e-12 ? (push.depth_map.y - d * push.depth_map.w) / den : 1e6;
+}
+bool  IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e3; }
+float ZAt(ivec2 p) {
+	float d = texelFetch(depth_tex, p, 0).r;
+	return IsSky(d) ? 1e6 : ViewZ(d);
+}
+vec3 ViewPosZ(vec2 uv, float z) {
+	float w  = z * push.depth_map.z + push.depth_map.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	nd.y *= YS();
+	return vec3((nd.x * w - z * push.proj.z) / push.proj.x, (nd.y * w - z * push.proj.w) / push.proj.y, z);
+}
+float Exposure() {
+	if ((push.misc.z & 8) == 0) return 1.0;
+	float e = exposure_values[push.misc.w];
+	return (e > 1e-12 && e < 1e12) ? e : 1.0;
+}
+vec3 Delta(ivec2 p) {
+	vec3 d = texelFetch(game_tex, p, 0).rgb - texelFetch(pre_tex, p, 0).rgb;
+	return (any(isnan(d)) || any(isinf(d))) ? vec3(0) : d;
+}
+bool InSize(ivec2 p) { return p.x >= 0 && p.y >= 0 && p.x < int(push.size.x) && p.y < int(push.size.y); }
+bool Sampled(ivec2 p) { return (p.x & 3) == 0 && (p.y & 3) == 0; }
+bool SameSurface(float a, float b) { return abs(a - b) < 0.03 * min(a, b) + 0.03; }
+
+const float LO = 0.006; // exposed |D|: no particle
+const float HI = 0.05;  // exposed |D|: a strong particle
+
+void Edge(ivec2 p) {
+	float e  = Exposure();
+	float m  = Luma(abs(Delta(p))) * e;
+	float z  = ZAt(p);
+	float edge = 0.0;
+	if (m < LO && z < 1e5) {
+		vec3 pre = texelFetch(pre_tex, p, 0).rgb;
+		const ivec2 nb[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+		for (int i = 0; i < 4; ++i) {
+			ivec2 q = p + nb[i];
+			if (!InSize(q)) continue;
+			float mq = Luma(abs(Delta(q))) * e;
+			if (mq < HI || mq < 6.0 * m + HI) continue;
+			if (!SameSurface(ZAt(q), z)) continue;
+			if (Luma(abs(texelFetch(pre_tex, q, 0).rgb - pre)) * e > 0.5 * mq) continue;
+			edge = 1.0;
+			break;
+		}
+	}
+	if (Sampled(p)) {
+		atomicAdd(stats[1], 1u);
+		if (m >= LO) atomicAdd(stats[2], 1u);
+		if (edge > 0.0) atomicAdd(stats[3], 1u);
+	}
+	imageStore(aux_img, p, vec4(edge, z, m, 0));
+}
+
+void Rows(ivec2 p) {
+	int   R    = int(push.par.y);
+	float best = 1e4, bz = 0.0;
+	for (int dx = -R; dx <= R; ++dx) {
+		ivec2 q = ivec2(p.x + dx, p.y);
+		if (!InSize(q)) continue;
+		vec4 a = texelFetch(src_tex, q, 0);
+		if (a.x > 0.5 && abs(float(dx)) < best) best = abs(float(dx)), bz = a.y;
+	}
+	imageStore(aux_img, p, vec4(best, bz, 0, 0));
+}
+
+// (src_tex = the row pass, hist_tex = last frame's fade; game / pre for D, depth for z)
+void Cols(ivec2 p) {
+	float e = Exposure();
+	float m = Luma(abs(Delta(p))) * e;
+	float z = ZAt(p);
+	float fade = 1.0;
+	if (m >= LO && z < 1e5) {
+		float fpx = abs(push.proj.x) * push.size.x * 0.5;
+		float Rp  = clamp(push.par.x * fpx / max(z, 0.05), 1.5, push.par.y);
+		int   R   = int(ceil(Rp));
+		float d2  = 1e8;
+		for (int dy = -R; dy <= R; ++dy) {
+			ivec2 q = ivec2(p.x, p.y + dy);
+			if (!InSize(q)) continue;
+			vec4 a = texelFetch(src_tex, q, 0);
+			if (a.x > 1e3 || !SameSurface(a.y, z)) continue;
+			d2 = min(d2, a.x * a.x + float(dy * dy));
+		}
+		float t = Sat(sqrt(d2) / Rp);
+		fade    = t * t * (3.0 - 2.0 * t);
+	}
+	if (push.motion.z > 0.5) {
+		vec2 rs  = push.size.xy;
+		vec2 uv  = (vec2(p) + 0.5) / rs;
+		vec2 puv = uv - textureLod(motion_tex, uv, 0).xy * push.motion.xy / rs;
+		if (all(greaterThan(puv, vec2(0))) && all(lessThan(puv, vec2(1)))) {
+			vec4 h = textureLod(hist_tex, puv, 0);
+			if (SameSurface(h.y, z) && !isnan(h.x)) fade = mix(Sat(h.x), fade, 0.4);
+		}
+	}
+	if (Sampled(p) && m >= LO && fade < 0.95) atomicAdd(stats[4], 1u);
+	imageStore(aux_img, p, vec4(fade, z, 0, 0));
+}
+
+float Window(float d, float R) {
+	float x = Sat(1.0 - (d * d) / (R * R));
+	return x * x;
+}
+
+void Composite(ivec2 p) {
+	vec3  c = texelFetch(color_tex, p, 0).rgb;
+	vec3  D = Delta(p);
+	float e = Exposure();
+	float m = Luma(abs(D)) * e;
+	vec3  corr = vec3(0);
+	if (m >= LO) {
+		float fade = Sat(texelFetch(src_tex, p, 0).x);
+		corr += (fade - 1.0) * D * push.size.z;
+		// Torch-lit smoke: the particle coverage of this pixel, never the fire itself.
+		vec3  game = texelFetch(game_tex, p, 0).rgb;
+		vec3  pre  = texelFetch(pre_tex, p, 0).rgb;
+		float cov  = Sat(Luma(abs(D)) / max(max(Luma(game), Luma(pre)), 1e-5)) * mix(1.0, fade, push.size.z);
+		float emi  = smoothstep(0.8, 1.6, Luma(game) * e);
+		cov *= 1.0 - emi;
+		if ((push.misc.z & 4) != 0 && push.size.w > 0.0 && cov > 0.01) {
+			float z    = ZAt(p);
+			vec2  uv   = (vec2(p) + 0.5) / push.size.xy;
+			vec3  sp   = ViewPosZ(uv, min(z, 1e4));
+			float tend = length(sp);
+			vec3  v    = sp / max(tend, 1e-4);
+			float R    = push.par.z;
+			vec3  glow = vec3(0);
+			for (int k = 0; k < 8; ++k) {
+				vec4 l0 = tw[8 + k * 4], l1 = tw[8 + k * 4 + 1], l3 = tw[8 + k * 4 + 3];
+				float pwr = l1.w * Sat(l0.w); // (slow power x fade: no flicker)
+				if (!(pwr > 0.0)) continue;
+				vec3  L  = l3.xyz;
+				float t0 = dot(L, v);
+				float h2 = max(dot(L, L) - t0 * t0, 0.0);
+				if (h2 >= R * R) continue;
+				float half_len = sqrt(R * R - h2);
+				float a = max(0.0, t0 - half_len), b = min(tend, t0 + half_len);
+				if (b <= a) continue;
+				float s = 0.0, dt = (b - a) / 8.0;
+				for (int i = 0; i < 8; ++i) {
+					float t = a + (float(i) + 0.5) * dt;
+					float d = length(v * t - L);
+					s += Window(d, R) / (d * d + 0.25);
+				}
+				glow += clamp(l1.rgb, vec3(0), vec3(4)) * pwr * s * dt;
+			}
+			// (smoke albedo ~0.6, isotropic phase; exposed, soft-capped, hue-preserving)
+			vec3 add = glow * cov * 0.6 / 3.14159265 * 0.5 * push.size.w;
+			float al = Luma(add);
+			add /= 1.0 + al / max(push.par.w, 1e-3);
+			if (Luma(add) > 0.002 && Sampled(p)) atomicAdd(stats[5], 1u);
+			corr += Safe(add) / e;
+		}
+	}
+	if (p == ivec2(0) && (push.misc.z & 4) != 0) {
+		uint n = 0u;
+		for (int k = 0; k < 8; ++k)
+			if (tw[8 + k * 4 + 1].w * tw[8 + k * 4].w > 0.0) ++n;
+		atomicAdd(stats[6], n);
+	}
+	if (p == ivec2(0)) atomicAdd(stats[0], 1u);
+	vec3 o = (push.misc.z & 2) != 0 ? abs(corr) * 4.0 : max(c + corr, vec3(0));
+	imageStore(out_img, p, vec4(Safe(o), 1.0));
+}
+
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (!InSize(p)) return;
+	int mode = push.misc.x;
+	if (mode == 0) Edge(p);
+	else if (mode == 1) Rows(p);
+	else if (mode == 2) Cols(p);
+	else Composite(p);
+}

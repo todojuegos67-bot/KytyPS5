@@ -609,6 +609,21 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${godrays_header}")
 
+# KYTY_SMOKE: soft particles + torch-lit smoke on the particle layer (src/local/smoke.cpp).
+set(smoke_source "${KYTY_SOURCE_DIR}/local/smoke.comp")
+set(smoke_spv "${gpu_tiler_generated_dir}/smoke.spv")
+set(smoke_header "${gpu_tiler_generated_dir}/smoke_spv.h")
+add_custom_command(
+	OUTPUT "${smoke_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${smoke_spv}" "${smoke_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${smoke_spv} -DOUTPUT=${smoke_header}
+	        -DSYMBOL=SMOKE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${smoke_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${smoke_header}")
 # KYTY_TORCH / KYTY_TORCH_FLARE: firelight + lens flare from torches, screen-space (src/local/torch.cpp).
 set(torch_source "${KYTY_SOURCE_DIR}/local/torch.comp")
 set(torch_spv "${gpu_tiler_generated_dir}/torch.spv")
@@ -912,6 +927,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/godrays.cpp"
 	"${KYTY_SOURCE_DIR}/local/torch.h"
 	"${KYTY_SOURCE_DIR}/local/torch.cpp"
+	"${KYTY_SOURCE_DIR}/local/smoke.h"
+	"${KYTY_SOURCE_DIR}/local/smoke.cpp"
 	"${KYTY_SOURCE_DIR}/local/volshadow.h"
 	"${KYTY_SOURCE_DIR}/local/volshadow.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-particles.h"
