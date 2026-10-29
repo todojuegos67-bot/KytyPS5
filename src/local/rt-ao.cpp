@@ -156,7 +156,7 @@ struct State {
 	std::array<double, Stamps - 1> pass_ms {};
 	uint32_t      ms_n = 0;
 	// stats
-	uint64_t sum[16] {};
+	uint64_t sum[20] {}; // (ds-veg-1029) 16: vegetation pixels, 17/18: rays past a vegetation / flush hit, 19: rays
 	uint32_t st_frames = 0, frames_on = 0, frames_still = 0;
 	float    log_light = 0.0f;
 	bool     light_valid = false;
@@ -462,7 +462,7 @@ void ReadStats(GraphicContext& graphics, int level, bool still) {
 	if (g_ao.stats_map == nullptr || g_ao.frame < Slots) return;
 	(void)vmaInvalidateAllocation(graphics.allocator, g_ao.stats_mem, 0, VK_WHOLE_SIZE);
 	const uint32_t* w = g_ao.stats_map + ((g_ao.frame + 1) % Slots) * SlotWords;
-	for (int i = 0; i < 16; ++i)
+	for (int i = 0; i < 20; ++i)
 		g_ao.sum[i] += w[i];
 	for (int i = 0; i < 4; ++i)
 		g_ao.votes[i] += w[8 + i];
@@ -514,6 +514,10 @@ void ReadStats(GraphicContext& graphics, int level, bool still) {
 		            s[1] > 0 ? static_cast<double>(s[13]) / 250.0 / s[1] : 1.0, s[1] > 0 ? static_cast<double>(s[15]) / 250.0 / s[1] : 0.0,
 		            pct(s[14], s[0]), pct(s[3], s[0]), s[1] > 0 ? static_cast<double>(s[2]) / 1000.0 / s[1] : 1.0,
 		            g_ao.ms_n > 0 ? g_ao.ms_sum / g_ao.ms_n : 0.0, g_ao.ms_n, per);
+		if (hw)
+			std::printf("PTAO: 10 s: vegetation (ds-veg-1029): %.1f%% of the pixels classed vegetation (left untouched); %.2f%% of the "
+			            "AO rays went past a vegetation hit, %.2f%% past a flush layer (< 0.35 m, same facing)\n",
+			            pct(s[16], s[0]), pct(s[17], s[19]), pct(s[18], s[19]));
 		std::printf("RTAO: 10 s: frame light %.4f; normal convention %d; %u frames on (%u camera still)\n",
 		            g_ao.light_valid ? std::exp2(g_ao.log_light) : 0.0f, g_ao.conv, g_ao.frames_on, g_ao.frames_still);
 	}
@@ -565,7 +569,11 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	static constexpr float share_by[5] {0.0f, 0.2f, 0.25f, 0.3f, 0.35f};
 	// (ds-ptao-1029) the path-traced levels: spp, GI range, AO radius, history, a-trous passes, half res
 	static constexpr int   hw_spp_by[5] {0, 1, 1, 2, 2}, hw_hist_by[5] {0, 32, 40, 48, 48}, hw_atrous_by[5] {0, 3, 3, 4, 4};
-	static constexpr float hw_range_by[5] {0.0f, 3.0f, 5.0f, 8.0f, 10.0f}, hw_ao_by[5] {0.0f, 0.6f, 0.9f, 1.2f, 1.5f};
+	static constexpr float hw_range_by[5] {0.0f, 3.0f, 5.0f, 8.0f, 10.0f}, hw_ao_by[5] {0.0f, 1.0f, 1.4f, 1.9f, 2.4f};
+	// (ds-ptstrong-1029) the 10-29 log: mean factor 0.95-0.96, > 20 % on 6 %: too faint. Stronger visibility (x strength, ^ power),
+	// a larger ambient share and a brighter bounce; the a-trous / temporal chain is unchanged.
+	static constexpr float hw_str_by[5] {0.0f, 1.5f, 1.7f, 1.9f, 2.3f}, hw_pow_by[5] {1.0f, 1.5f, 1.6f, 1.8f, 2.1f};
+	static constexpr float hw_share_by[5] {0.0f, 0.5f, 0.55f, 0.6f, 0.7f}, hw_gi_by[5] {0.0f, 2.0f, 2.2f, 2.5f, 3.0f};
 	static const bool      hw_wanted = [] {
 		const char* v = std::getenv("KYTY_AO_HW");
 		return !(v != nullptr && *v == '0');
@@ -641,10 +649,12 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	static const float fog      = EnvF("KYTY_AO_FOG", 80.0f, 0.0f, 100000.0f);
 	static const bool  view     = EnvF("KYTY_AO_VIEW", 0.0f, 0.0f, 1.0f) > 0.5f;
 	// path traced: the true visibility (power 1), the ambient's share of the colour 0.4, a floor 0.2
-	static const float gi_k     = EnvF("KYTY_AO_GI", 1.0f, 0.0f, 3.0f);
-	static const float sh_max   = EnvF("KYTY_AO_SHADOW", 0.6f, 0.0f, 0.95f);
+	static const float gi_k     = EnvF("KYTY_AO_GI", 1.0f, 0.0f, 3.0f) * hw_gi_by[level];
+	static const float sh_max   = EnvF("KYTY_AO_SHADOW", 0.75f, 0.0f, 0.95f);
 	static const float sun_len  = EnvF("KYTY_AO_SUN_LEN", 4.0f, 0.2f, 30.0f);
-	static const float hw_share = EnvF("KYTY_AO_HW_SHARE", 0.4f, 0.0f, 1.0f);
+	static const float hw_share = EnvF("KYTY_AO_HW_SHARE", hw_share_by[level], 0.0f, 1.0f);
+	static const float hw_str   = EnvF("KYTY_AO_STRENGTH", 1.0f, 0.0f, 3.0f) * hw_str_by[level];
+	static const float hw_pow   = EnvF("KYTY_AO_POWER", hw_pow_by[level], 0.5f, 4.0f);
 
 	RtReflGbuffer gbuf;
 	const bool    have_gbuf = RtReflGetGbuffer(gbuf) && gbuf.extent == color.extent;
@@ -660,9 +670,9 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			said = now;
 			if (hw)
 				std::printf("PTAO: on (%s: %d spp, %ux%u trace for %ux%u, history %d, %d a-trous; bounce x%g, direct-shadow max %g, sun rays %g m, "
-				            "ambient share %g; normals from %s, albedo %s)\n",
+				            "ambient share %g, strength %g, power %g, floor 0.12 (ptstrong-1029; target mean factor ~0.80-0.85 at Alto); normals from %s, albedo %s)\n",
 				            LevelName(level), hw_spp_by[level], g_ao.trace.width, g_ao.trace.height, color.extent.width, color.extent.height,
-				            hw_hist_by[level], hw_atrous_by[level], gi_k, sh_max, sun_len, hw_share,
+				            hw_hist_by[level], hw_atrous_by[level], gi_k, sh_max, sun_len, hw_share, hw_str, hw_pow,
 				            normals ? "the G-buffer + depth" : "depth", albedo ? "the G-buffer" : "0.35 (no G-buffer)");
 			else
 				std::printf("RTAO: on (%s: %d slices x %d steps, %g m, history %d, %ux%u trace for %ux%u; strength %g, power %g, share %g, floor %g, ambient x%g, "
@@ -692,11 +702,11 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	ubo.motion[0] = inputs.motion_scale_x, ubo.motion[1] = inputs.motion_scale_y;
 	ubo.motion[2] = static_cast<float>(color.extent.width), ubo.motion[3] = static_cast<float>(color.extent.height);
 	ubo.trace[0] = static_cast<float>(g_ao.trace.width), ubo.trace[1] = static_cast<float>(g_ao.trace.height);
-	ubo.trace[2] = hw ? 1.0f : strength, ubo.trace[3] = radius;
-	ubo.par[0] = hw ? 0.2f : floor_k, ubo.par[1] = fog;
+	ubo.trace[2] = hw ? hw_str : strength, ubo.trace[3] = radius;
+	ubo.par[0] = hw ? 0.12f : floor_k, ubo.par[1] = fog;
 	ubo.par[2] = l_frame * ambient;
 	ubo.par[3] = 1.0f / 8.0f; // (ds-ptao) back to 1/8 of the height
-	ubo.par2[0] = hw ? 1.0f : power, ubo.par2[1] = hw ? hw_share : share;
+	ubo.par2[0] = hw ? hw_pow : power, ubo.par2[1] = hw ? hw_share : share;
 	ubo.cfg[0] = level, ubo.cfg[1] = static_cast<int32_t>(g_ao.frame);
 	ubo.cfg[2] = (inputs.reset ? 1 : 0) | (g_ao.history_valid ? 2 : 0) | (normals ? 4 : 0) | (albedo ? 8 : 0) | (half ? 16 : 0) |
 	             (gdepth ? 32 : 0) | (still ? 64 : 0) | (view ? 128 : 0) | (torch ? 256 : 0);
@@ -714,7 +724,7 @@ bool RtAoApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		ubo.sun[0] = sun_dir[0], ubo.sun[1] = sun_dir[1], ubo.sun[2] = sun_dir[2], ubo.sun[3] = std::clamp(sun_w, 0.0f, 1.0f);
 		ubo.hw[0] = hw_range_by[level], ubo.hw[1] = hw_ao_by[level], ubo.hw[2] = static_cast<float>(hw_spp_by[level]), ubo.hw[3] = gi_k;
 		ubo.hw2[0] = sun_len, ubo.hw2[1] = std::tan(1.5f * 0.01745329f), ubo.hw2[2] = sh_max;
-		ubo.hw2[3] = l_frame * 0.5f; // (an off-screen hit: a dim estimate, half the frame's mean light)
+		ubo.hw2[3] = l_frame * 0.8f; // (ptstrong-1029: was 0.5) // (an off-screen hit: a dim estimate, half the frame's mean light)
 	}
 
 	const auto entry = static_cast<uint32_t>(g_ao.written % 8);

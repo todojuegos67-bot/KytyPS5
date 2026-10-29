@@ -76,8 +76,16 @@ extern const Choice  kSmokeLevels[]; // No, Suave, Antorchas (Humo y particulas)
 extern const int     kSmokeLevelCount;
 extern const Choice  kRtLevels[];      // No, Bajo, Medio, Alto (Luz volumetrica, Oclusion ambiental, Sombras RT)
 extern const int     kRtLevelCount;
-extern const Choice  kTorchLevels[];   // Luz de antorchas RT: No, Bajo, Medio, Alto, Hibrido
+extern const Choice  kTorchLevels[];   // Luz de antorchas RT: No, Bajo, Medio, Alto, Hibrido (ds-pc-port10: no longer offered)
 extern const int     kTorchLevelCount;
+// (ds-pc-port10) DLSS 5 (NVIDIA's Neural Rendering, ds-foveated-1029's foveated grid): No, Suave, Medio, Fuerte
+// (KYTY_FOVEATED=1, KYTY_FOV_EDGE 0.75 / 0.5 / 0.35), and its file: Oficial (signed by NVIDIA) / No oficial.
+extern const Choice  kDlss5Levels[];
+extern const int     kDlss5LevelCount;
+extern const Choice  kDlss5Files[];
+extern const int     kDlss5FileCount;
+extern const Choice  kDlss5Strengths[]; // Intensidad DLSS 5: Baja, Media, Alta (KYTY_DLSS_NR_STRENGTH 0.35 / 0.65 / 1)
+extern const int     kDlss5StrengthCount;
 extern const Choice  kYesNo[];
 extern const int     kYesNoCount;
 extern const Choice  kSoulsModes[];
@@ -108,6 +116,11 @@ struct Settings {
 	std::string res = "nativo";
 	std::string sharpness = "auto";
 	std::string dlss_preset = "auto";
+	// (ds-pc-port10) dlss5: DLSS 5 0 No, 1 Suave, 2 Medio, 3 Fuerte (NVIDIA RTX and the user's own nvngx_dlssnr.dll beside
+	// "Demon's Souls.exe"); dlss5_no_oficial: 1 loads an nvngx_dlssnr.dll not signed by NVIDIA (KYTY_DLSS_NR_UNSIGNED=1).
+	std::string dlss5 = "0";
+	bool        dlss5_unsigned = false;
+	std::string dlss5_strength = "alta"; // dlss5_intensidad: baja, media, alta (KYTY_DLSS_NR_STRENGTH 0.35 / 0.65 / 1)
 	// [FrameGeneration]
 	std::string framegen = "sin-fg";
 	// [Rendimiento]
@@ -146,7 +159,7 @@ struct Settings {
 	std::string rt_ssgi = "0";       // luz_rt_pantalla: Luz RT (SSGI) 0 No, 1 Media, 2 Alta, 3 Ultra, 4 Extremo (KYTY_SSGI)
 	std::string rt_shadows = "0";    // sombras_rt: Sombras RT de pantalla 0-3 (KYTY_RT_SHADOWS, strength 0.35 / 0.5 / 0.7)
 	std::string ao = "0";            // oclusion_ao: Path tracing 0-3 (KYTY_AO + KYTY_AO_HW, ds-ptao-1029); default No
-	std::string smoke = "2";         // humo_particulas: Humo y particulas 0 No, 1 Suave, 2 Antorchas (KYTY_SMOKE, ds-particles-1029); default Antorchas
+	std::string smoke = "1";         // humo_particulas: Humo y particulas 0 No, 1 Suave (KYTY_SMOKE, ds-particles-1029; ds-pc-port10: no Antorchas level); default Suave
 	std::string torch = "0";         // luz_antorchas: Luz de antorchas RT 0-3, 4 Hibrido (KYTY_TORCH, KYTY_TORCH_HW)
 	bool        lens_flare = false;  // destellos_lente: KYTY_TORCH_FLARE
 	bool        rt_hw_exp = false;   // rt_experimental: hardware RT (the launcher's rthwexp; KYTY_RT_HW_EXPERIMENTAL=1)

@@ -39,6 +39,7 @@
 #include "local/godrays.h"
 #include "local/torch.h"
 #include "local/dof.h"
+#include "local/dlss-nr.h"
 #include "local/smoke.h"
 #include "local/rt-local-lights.h"
 #include "local/rt-flicker.h"
@@ -7786,7 +7787,7 @@ struct CShadowPass {
 	uint32_t                cam_mask = 0xfffu;
 	// Statistics (every 16th frame, read back 4 frames late; logged every 10 s with the GPU time).
 	int64_t                 stat_frame = -1;
-	double                  st_pixels = 0.0, st_n = 0.0, st_occ = 0.0, st_depth = 0.0;
+	double                  st_pixels = 0.0, st_n = 0.0, st_occ = 0.0, st_depth = 0.0, st_veg = 0.0; // (ds-veg-1029)
 	uint32_t                st_samples = 0;
 	// The light probe: log2 K smoothed (K the game's sun-lit to facing-away luminance ratio; -1 none yet) and the
 	// overcast factor it gives the strength (1 full sun .. 0.15 overcast).
@@ -8871,7 +8872,7 @@ void CShadowTakeStats() {
 		(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_cs.vote_mem, 0, VK_WHOLE_SIZE);
 		const uint32_t* v = g_cs.vote_mapped + 64;
 		g_cs.st_pixels += static_cast<double>(g_cs.render.width) * g_cs.render.height;
-		g_cs.st_n += v[0], g_cs.st_occ += v[1] / 256.0, g_cs.st_depth += v[2] / 2.0;
+		g_cs.st_n += v[0], g_cs.st_occ += v[1] / 256.0, g_cs.st_depth += v[2] / 2.0, g_cs.st_veg += v[3];
 		++g_cs.st_samples;
 		if (RtSunLevel() > 0) RtSunTakeCalib(v, static_cast<double>(g_cs.render.width) * g_cs.render.height);
 		if (g_cs.hw) {
@@ -8893,7 +8894,7 @@ void CShadowTakeStats() {
 		}();
 		if (auto_sun && g_cs.log_k >= 0.0) {
 			const double k = std::exp2(g_cs.log_k), x = std::clamp((k - 1.15) / (2.0 - 1.15), 0.0, 1.0); // (10-24 r3: gentler)
-			g_cs.sun_factor = 0.5 + 0.5 * x * x * (3.0 - 2.0 * x);
+			g_cs.sun_factor = 0.7 + 0.3 * x * x * (3.0 - 2.0 * x); // (ptstrong-1029: overcast floor 0.5 -> 0.7)
 		}
 	}
 	const auto now = std::chrono::steady_clock::now();
@@ -8903,13 +8904,15 @@ void CShadowTakeStats() {
 	} else if (g_cs.st_samples > 0 || g_cs.samples > 0) {
 		const double n = g_cs.st_n, px = std::max(g_cs.st_pixels, 1.0);
 		std::printf("RTSHADOW: stats: %.1f %% of pixels shadowed (occlusion > 0.1), mean occlusion %.3f (%.3f on those), their "
-		            "mean depth %.1f m; sun lit/ambient K %.2f -> overcast factor %.2f; GPU %.3f ms (%u samples, %u frames)\n",
+		            "mean depth %.1f m; sun lit/ambient K %.2f -> overcast factor %.2f; GPU %.3f ms (%u samples, %u frames) [ptstrong: strength x1.6, ray 2.5 m, thick 0.25-0.6 m, cap 70 %%, target several %% shadowed]\n",
 		            100.0 * n / px, g_cs.st_occ / px, n > 0.0 ? g_cs.st_occ / n : 0.0, n > 0.0 ? g_cs.st_depth / n : 0.0,
 		            g_cs.log_k >= 0.0 ? std::exp2(g_cs.log_k) : 0.0, g_cs.sun_factor,
 		            g_cs.samples > 0 ? g_cs.sum_ms / g_cs.samples : 0.0, g_cs.st_samples, g_cs.samples);
+		std::printf("RTSHADOW: vegetation (ds-veg-1029): %.1f %% of pixels classed vegetation (left untouched; no vegetation or flush "
+		            "occluders)\n", 100.0 * g_cs.st_veg / px);
 		std::fflush(stdout);
 	}
-	g_cs.st_pixels = g_cs.st_n = g_cs.st_occ = g_cs.st_depth = 0.0;
+	g_cs.st_pixels = g_cs.st_n = g_cs.st_occ = g_cs.st_depth = g_cs.st_veg = 0.0;
 	g_cs.st_samples = 0;
 	g_cs.sum_ms     = 0.0;
 	g_cs.samples    = 0;
@@ -9254,8 +9257,8 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
 	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
 	push.trace[0] = static_cast<float>(g_cs.trace.width), push.trace[1] = static_cast<float>(g_cs.trace.height);
-	const float strength = RtShadowEnv("KYTY_RT_SHADOWS_STRENGTH", "KYTY_CONTACT_SHADOWS_STRENGTH", 0.5f, 1.0f) /* (10-24 r3: 0.6 looked thin) */;
-	const float length   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_LENGTH", "KYTY_CONTACT_SHADOWS_LENGTH", 1.5f, 10.0f), 0.25f); // (rtsart: 1.5 m: contact shadows; long rays only doubled the game's) // (10-24) 3 m (1 m was too short)
+	const float strength = std::min(RtShadowEnv("KYTY_RT_SHADOWS_STRENGTH", "KYTY_CONTACT_SHADOWS_STRENGTH", 0.5f, 1.0f) * 1.6f, 1.0f) /* (10-24 r3: 0.6 looked thin) (ptstrong-1029: x1.6, launcher 0.35/0.5/0.7 -> 0.56/0.8/1.0) */;
+	const float length   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_LENGTH", "KYTY_CONTACT_SHADOWS_LENGTH", 2.5f /* ptstrong-1029: was 1.5 */, 10.0f), 0.25f); // (rtsart: 1.5 m: contact shadows; long rays only doubled the game's) // (10-24) 3 m (1 m was too short)
 	const float fade_m   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_FADE", nullptr, 100.0f, 600.0f), 2.0f); // (10-24) 100-200 m by default; far (dist-1023): up to 600
 	push.trace[2] = strength, push.trace[3] = length;
 	for (int k = 0; k < 3; ++k) {
@@ -9569,6 +9572,8 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	probed(RtFlicker::Flare, "TorchFlareApply", [&] { return TorchFlareApply(command, inputs); }); // (KYTY_TORCH_FLARE: the lens flare, last before the upscaler and the HUD; torch.cpp)
 	TimedPass("DofApply", [&] { DofApply(command, inputs); }); // (ds-dof-1029, KYTY_DOF: the distance depth of field, dof.cpp; after every other pass, before the upscaler and the HUD; nothing when off)
 	TimedPass("GbufViewApply", [&] { GbufViewApply(command, inputs); }); // (KYTY_GBUF_VIEW: the G-buffer diagnostic, last: gbuf-view.cpp; nothing when off)
+	// (ds-foveated-1029, KYTY_DLSS_NR_PRESR: DLSS 5 Neural Rendering on the render-res colour, before the upscaler; dlss-nr.cpp)
+	TimedPass("DlssNrPreSr", [&] { return DlssNrPreSr(command, inputs); });
 	SharpenProbeTick();
 	const bool  ours = g_sr_kind == 2 || g_sr_kind == 3 || g_sr_kind == 4;
 	// XeSS and FSR 3.1: their output at the display's size (g_sr_mid; FSR 4 and DLSS do it themselves).
@@ -9636,6 +9641,9 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 		}
 	}
 	if (done && mid_image != nullptr) BlitMid(command, *mid_image, mid_size, inputs.output);
+	// (ds-foveated-1029, KYTY_DLSS_NR / KYTY_FOVEATED: DLSS 5 Neural Rendering on the upscaled output, foveated, before the
+	// game's bloom, depth of field and HUD; dlss-nr.cpp; nothing when off or without the user's nvngx_dlssnr.dll)
+	if (done) TimedPass("DlssNrApply", [&] { return DlssNrApply(command, inputs); });
 	return done;
 }
 

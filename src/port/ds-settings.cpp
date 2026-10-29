@@ -91,11 +91,19 @@ const int    kRtReflLevelCount = 7;
 const Choice kRtLightLevels[] = {{"0", "No"}, {"1", "Media"}, {"2", "Alta"}, {"3", "Ultra"}, {"4", "Extremo"}};
 const int    kRtLightLevelCount = 5;
 const Choice kRtLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}};
-const Choice kSmokeLevels[] = {{"0", "No"}, {"1", "Suave"}, {"2", "Antorchas"}}; // (ds-particles-1029)
+// (ds-particles-1029) No, Suave. (ds-pc-port10) Its "Antorchas" level (the smoke lit by the torch light) is gone with
+// the torch light: an old 2 is Suave.
+const Choice kSmokeLevels[] = {{"0", "No"}, {"1", "Suave"}};
 const int    kSmokeLevelCount = static_cast<int>(sizeof(kSmokeLevels) / sizeof(kSmokeLevels[0]));
 const int    kRtLevelCount = 4;
 const Choice kTorchLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Híbrido"}};
 const int    kTorchLevelCount = 5;
+const Choice kDlss5Levels[] = {{"0", "No"}, {"1", "Suave"}, {"2", "Medio"}, {"3", "Fuerte"}}; // (ds-pc-port10)
+const int    kDlss5LevelCount = 4;
+const Choice kDlss5Files[] = {{"0", "Oficial (firmado por NVIDIA)"}, {"1", "No oficial (bajo tu responsabilidad)"}};
+const int    kDlss5FileCount = 2;
+const Choice kDlss5Strengths[] = {{"baja", "Baja"}, {"media", "Media"}, {"alta", "Alta"}};
+const int    kDlss5StrengthCount = 3;
 const Choice kYesNo[] = {{"0", "No"}, {"1", "Sí"}};
 const int    kYesNoCount = 2;
 const Choice kSoulsModes[] = {{"ninguno", "Personalizado (ningun modo)"},
@@ -231,6 +239,10 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("reescalado", s->res);
 	str("nitidez", s->sharpness);
 	str("preset_dlss", s->dlss_preset);
+	str("dlss5", s->dlss5);
+	boo("dlss5_no_oficial", s->dlss5_unsigned);
+	str("dlss5_intensidad", s->dlss5_strength);
+	if (s->dlss5_strength != "baja" && s->dlss5_strength != "media") s->dlss5_strength = "alta";
 	str("frame_generation", s->framegen);
 	boo("perfil_16gb", s->profile16);
 	if (auto it = v.find("gama_baja"); it != v.end() && Bool(it->second, false)) s->souls_mode = "ligero"; // (before 10-23)
@@ -304,8 +316,9 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	clamp_level(s->rt_ssgi, 4);
 	clamp_level(s->rt_shadows, 3);
 	clamp_level(s->ao, 3);
-	if (s->smoke != "0" && s->smoke != "1" && s->smoke != "2") s->smoke = "2"; // (ds-particles-1029) default Antorchas
+	if (s->smoke != "0") s->smoke = "1"; // (ds-pc-port10) default Suave (an old 2, Antorchas, is Suave)
 	clamp_level(s->torch, 4);
+	clamp_level(s->dlss5, 3);
 	// (ds-pc-port9) The Modos Souls are back (Launcher-souls.ps1's): an unknown modo_souls is none.
 	{
 		bool known = false;
@@ -315,6 +328,12 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	// (ds-pc-port9) Path tracing, Sombras RT and the 16 GB RAM / 8 GB GPU simulations are gone: always off.
 	s->ao             = "0";
 	s->rt_shadows     = "0";
+	// (ds-pc-port10) Luz de antorchas RT (and its Hibrido, and the torch lens flare) is gone from the port: always off.
+	s->torch          = "0";
+	s->lens_flare     = false;
+	// (ds-pc-port10) and the hardware RT Antorchas (torches, lamps, fire and magic lights) too.
+	s->rt_lamps       = "0";
+	s->rt_particles   = false;
 	s->simulate_ram16 = false;
 	s->simulate_vram8 = false;
 	return true;
@@ -371,7 +390,15 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; auto, 0, 0.25, 0.5, 0.75, 1\n"
 	  << "nitidez=" << s.sharpness << "\n"
 	  << "; auto, K (DLSS 4), L o M (DLSS 4.5)\n"
-	  << "preset_dlss=" << s.dlss_preset << "\n\n"
+	  << "preset_dlss=" << s.dlss_preset << "\n"
+	  << "; DLSS 5 (Neural Rendering de NVIDIA, solo NVIDIA RTX): 0 no, 1 suave, 2 medio, 3 fuerte (suave / medio / fuerte bajan la\n"
+	  << "; resolucion en los bordes de la pantalla para ahorrar GPU; el centro siempre a resolucion completa). Necesita tu propio\n"
+	  << "; nvngx_dlssnr.dll junto a \"Demon's Souls.exe\" (no viene incluido).\n"
+	  << "dlss5=" << s.dlss5 << "\n"
+	  << "; Archivo DLSS 5: 0 oficial (solo si esta firmado por NVIDIA), 1 no oficial (lo carga aunque no lo este; bajo tu responsabilidad)\n"
+	  << "dlss5_no_oficial=" << b(s.dlss5_unsigned) << "\n"
+	  << "; Intensidad DLSS 5: baja, media, alta (cuanto se nota el efecto de NVIDIA)\n"
+	  << "dlss5_intensidad=" << s.dlss5_strength << "\n\n"
 	  << "[FrameGeneration]\n"
 	  << "; sin-fg, amd-x2, amd-x3, amd-x4, amd-120, amd-dinamico,\n"
 	  << "; dlss-x2, dlss-x3, dlss-x4, dlss-x5, dlss-x6, dlss-120, dlss-dinamico (NVIDIA RTX)\n"
@@ -439,12 +466,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "sombras_rt=" << s.rt_shadows << "\n"
 	  << "; Path tracing (oclusion y luz indirecta por RT por hardware; sin RT por hardware, oclusion de pantalla): 0 no, 1 bajo, 2 medio, 3 alto\n"
 	  << "oclusion_ao=" << s.ao << "\n"
-	  << "; Humo y particulas: 0 no, 1 suave (sin cortes duros), 2 antorchas (ademas el humo brilla con la luz de las antorchas)\n"
+	  << "; Humo y particulas: 0 no, 1 suave (sin cortes duros)\n"
 	  << "humo_particulas=" << s.smoke << "\n"
-	  << "; Luz de antorchas RT: 0 no, 1 bajo, 2 medio, 3 alto, 4 hibrido (alto + rayos por hardware; GPU con RT)\n"
-	  << "luz_antorchas=" << s.torch << "\n"
-	  << "; Destellos de lente de antorchas y fuegos: 1 si, 0 no\n"
-	  << "destellos_lente=" << b(s.lens_flare) << "\n"
 	  << "; RT por hardware (experimental): 1 activa las filas de trazado de rayos por hardware de abajo\n"
 	  << "rt_experimental=" << b(s.rt_hw_exp) << "\n"
 	  << "; Trazado de rayos por hardware (1 si, 0 no; solo con rt_experimental=1). Elegir un modo Souls los pone todos en 0.\n"
@@ -457,8 +480,6 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Luz volumetrica: 0 no, 1 bajo, 2 medio, 3 alto (excluye rt_sombras_sol)\n"
 	  << "luz_volumetrica=" << s.godrays << "\n"
 	  << "; Juego original: 1 apaga todos los efectos visuales que anade el emulador\n"
-	  << "; Antorchas (luces RT de antorchas, lamparas, fuego y magia): 0 no, 1 bajo, 2 medio, 3 alto\n"
-	  << "rt_antorchas=" << LampLevel(s) << "\n"
 	  << "juego_original=" << b(s.pure_game) << "\n\n"
 	  << "[Mandos]\n"
 	  << "; Teclado y raton (F7 tambien cambia el raton a mando en vivo)\n"
@@ -662,11 +683,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			hw.Set("KYTY_HWRT_REFL_MATERIAL", "1");
 		}
 		if (s.rt_sun) hw.Set("KYTY_HWRT_SHADOW", "2");
-		// (10-28) Antorchas: the launcher's hwlamp4 levels (KYTY_HWRT_LIGHTS 1-3).
-		if (const std::string lamps = LampLevel(s); lamps != "0") {
-			hw.Set("KYTY_HWRT_PARTICLES", "2");
-			hw.Set("KYTY_HWRT_LIGHTS", lamps);
-		}
+		// (ds-pc-port10) No hardware RT Antorchas in the port (KYTY_HWRT_LIGHTS / _PARTICLES never passed).
 		// (10-28, ds-rt1026-restore) Hardware RT only as experimental (rt_experimental): the engine needs KYTY_RT_HW_EXPERIMENTAL=1.
 		if (!hw.list.empty() && s.rt_hw_exp) {
 			sets.emplace_back("KYTY_RT_HW_EXPERIMENTAL", "1");
@@ -761,20 +778,11 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		sets.emplace_back("KYTY_RT_SHADOWS", "");
 		sets.emplace_back("KYTY_RT_SHADOWS_STRENGTH", "");
 	}
-	// (torch-1028) Luz de antorchas RT (screen-space) Bajo / Medio / Alto; Hibrido (torch-shadow-1028): Alto + the hardware
-	// scene (TLAS) for the torch light only (the other hardware passes off without rt_experimental). Destellos de lente.
-	if (!s.pure_game && s.torch != "0" && !s.torch.empty()) {
-		sets.emplace_back("KYTY_TORCH", std::to_string(std::min(std::atoi(s.torch.c_str()), 3)));
-		if (s.torch == "4") {
-			sets.emplace_back("KYTY_TORCH_HW", "1");
-			sets.emplace_back("KYTY_RT_HW_EXPERIMENTAL", "1");
-			sets.emplace_back("KYTY_HWRT", "1");
-			if (!s.rt_hw_exp)
-				for (const char* k: {"KYTY_HWRT_REFL", "KYTY_HWRT_SHADOW", "KYTY_HWRT_LIGHTS", "KYTY_HWRT_PARTICLES", "KYTY_HWRT_GI", "KYTY_HWRT_AO",
-				                     "KYTY_HWRT_CONTACT", "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_RT_SUN"})
-					sets.emplace_back(k, "0");
-		}
-	}
+	// (ds-pc-port10) Luz de antorchas RT (screen-space and its Hibrido) and the torch lens flare are gone from the port:
+	// always off.
+	sets.emplace_back("KYTY_TORCH", "0");
+	sets.emplace_back("KYTY_TORCH_HW", "0");
+	sets.emplace_back("KYTY_TORCH_FLARE", "0");
 	// (refl-hybrid-1028) Reflejos RT Hibrido: the hardware scene (TLAS) only to fill where the screen-space ray misses (the
 	// other hardware passes off without rt_experimental), as the launcher.
 	if (!s.pure_game && s.rt_ss_refl == "6") {
@@ -786,13 +794,31 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			                     "KYTY_HWRT_CONTACT", "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_RT_SUN"})
 				sets.emplace_back(k, "0");
 	}
-	if (!s.pure_game && s.lens_flare) sets.emplace_back("KYTY_TORCH_FLARE", "1");
 	// (ds-particles-1029) Humo y particulas: No / Suave / Antorchas (KYTY_SMOKE 0-2).
-	sets.emplace_back("KYTY_SMOKE", !s.pure_game && (s.smoke == "1" || s.smoke == "2") ? s.smoke : "0");
+	sets.emplace_back("KYTY_SMOKE", !s.pure_game && s.smoke != "0" ? "1" : "0");
 	// (ds-all-1029) The torch passes skip their work while no light is tracked (the detection keeps running).
 	sets.emplace_back("KYTY_TORCH_IDLE", "1");
 	// The emulator's distance depth of field (ds-dof-1029) is not in the port: always off.
 	sets.emplace_back("KYTY_DOF", "0");
+	// (ds-pc-port10, ds-foveated-1029's launcher) DLSS 5: NVIDIA's Neural Rendering after the upscaler on the foveated grid,
+	// full resolution in the centre and less towards the edges (KYTY_FOV_EDGE 0.75 / 0.5 / 0.35); No: off. The file:
+	// signed by NVIDIA only, or any (KYTY_DLSS_NR_UNSIGNED=1). NVIDIA only; without the user's nvngx_dlssnr.dll the
+	// engine logs it and the picture stays the upscaler's.
+	{
+		static const char* edge[] = {"0.5", "0.75", "0.5", "0.35"};
+		const int          level  = pc.nvidia && !s.pure_game ? std::clamp(std::atoi(s.dlss5.c_str()), 0, 3) : 0;
+		if (level > 0) {
+			sets.emplace_back("KYTY_FOVEATED", "1");
+			sets.emplace_back("KYTY_DLSS_NR_PRESR", "0");
+			sets.emplace_back("KYTY_FOV_EDGE", edge[level]);
+			sets.emplace_back("KYTY_DLSS_NR_UNSIGNED", s.dlss5_unsigned ? "1" : "0");
+			sets.emplace_back("KYTY_DLSS_NR_STRENGTH", s.dlss5_strength == "baja" ? "0.35" : s.dlss5_strength == "media" ? "0.65" : "1");
+		} else {
+			sets.emplace_back("KYTY_FOVEATED", "0");
+			sets.emplace_back("KYTY_DLSS_NR", "0");
+			sets.emplace_back("KYTY_DLSS_NR_PRESR", "0");
+		}
+	}
 	// Its vblank: 840 Hz with DLSS frame generation, 900 with AMD dynamic (10-29, the launcher: 60 and 75 fit, 56 does
 	// not, so the game is not held at 56 with AMD x4), 360 with the other frame generation, 960 unlocked without, else 60.
 	const bool vb900  = std::strcmp(fg->id, "amd-dinamico") == 0;
@@ -931,7 +957,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (s.pure_game) {
 		static const char* fx[] = {"KYTY_HWRT", "KYTY_RT_REFLECTIONS", "KYTY_RT_SHADOWS", "KYTY_RT_SUN", "KYTY_RT_PARTICLES", "KYTY_RT_LOCAL",
 		                           "KYTY_GODRAYS", "KYTY_SHINE", "KYTY_SPEC_OCCLUSION", "KYTY_GTAO", "KYTY_SSGI", "KYTY_SSR", "KYTY_CONTACT_SHADOWS",
-		                           "KYTY_AO", "KYTY_TORCH", "KYTY_DOF", "KYTY_SMOKE"};
+		                           "KYTY_AO", "KYTY_TORCH", "KYTY_DOF", "KYTY_SMOKE", "KYTY_FOVEATED", "KYTY_FOV_", "KYTY_DLSS_NR"};
 		for (auto& [k, v]: env.list)
 			for (const char* p: fx)
 				if (k.rfind(p, 0) == 0) v.clear();
@@ -939,7 +965,8 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		                     "KYTY_RT_SHADOWS", "KYTY_CONTACT_SHADOWS", "KYTY_RT_SUN", "KYTY_RT_PARTICLES", "KYTY_GODRAYS", "KYTY_SHINE",
 		                     "KYTY_SPEC_OCCLUSION", "KYTY_GTAO", "KYTY_SSGI", "KYTY_SSR", "KYTY_HWRT_GI", "KYTY_HWRT_AO", "KYTY_HWRT_CONTACT",
 		                     "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_AO", "KYTY_TORCH", "KYTY_TORCH_FLARE",
-		                     "KYTY_TORCH_HW", "KYTY_RT_HW_EXPERIMENTAL", "KYTY_SMOKE", "KYTY_DOF"})
+		                     "KYTY_TORCH_HW", "KYTY_RT_HW_EXPERIMENTAL", "KYTY_SMOKE", "KYTY_DOF", "KYTY_FOVEATED", "KYTY_DLSS_NR",
+		                     "KYTY_DLSS_NR_PRESR"})
 			env.Set(k, "0");
 	}
 	// settings.ini [Avanzado] extra: as -Set (KEY= removes it).
@@ -1026,7 +1053,8 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.safe_gpu != n.safe_gpu || l.quality != n.quality || l.texture_reduce != n.texture_reduce ||
 	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.extra != n.extra ||
 	       l.rt_ss_refl != n.rt_ss_refl || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke || l.ibl != n.ibl || l.tess != n.tess ||
-	       l.torch != n.torch || l.lens_flare != n.lens_flare || l.rt_hw_exp != n.rt_hw_exp ||
+	       l.torch != n.torch || l.lens_flare != n.lens_flare || l.rt_hw_exp != n.rt_hw_exp || l.dlss5 != n.dlss5 ||
+	       l.dlss5_unsigned != n.dlss5_unsigned || l.dlss5_strength != n.dlss5_strength ||
 	       (l.sharpness == "auto") != (n.sharpness == "auto");
 }
 
@@ -1339,11 +1367,8 @@ std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
 	else {
 		if (s->rt_ss_refl != "0") rt += "reflejos RT bajos; ";
 		if (s->rt_shadows != "0") rt += "sombras RT bajas; ";
-		if (s->torch != "0") rt += "luz de antorchas RT baja; ";
-		if (s->lens_flare) rt += "destellos de lente; ";
 		if (s->rt_reflections) rt += "reflejos RT por hardware; ";
 		if (s->godrays != "0") rt += std::string("luz volumétrica ") + (s->godrays == "2" ? "media; " : "baja; ");
-		if (s->rt_lamps != "0") rt += "antorchas RT por hardware; ";
 		rt.resize(rt.size() - 2);
 		rt += ".";
 	}

@@ -1,0 +1,224 @@
+#version 450
+// KYTY_DLSS_NR / KYTY_FOVEATED (dlss-nr.cpp; ds-foveated-1029): NVIDIA DLSS 5 Neural Rendering (NGX feature 18, the
+// user's nvngx_dlssnr.dll) on the PS5 Pro path's upscaled output, before the game's bloom / depth of field / HUD, and the
+// foveated working grid around it. A Vulkan port of the separable warp of FoveatedDLSS5 (github.com/maximedgoulet/
+// FoveatedDLSS5, MIT, on RenoDX's DLSS 5 add-on by clshortfuse, MIT; LICENSES/FoveatedDLSS5-RenoDX-MIT.txt):
+//
+//   per axis, density 1 inside a centre zone of a output pixels either side of the middle, a smoothstep fall-off over b
+//   pixels, density e beyond it (corners e x e). G(t) is the density's integral: the working position of a full-res
+//   position t pixels from the middle. The host picks the working extent with the output's parity and solves e so that
+//   G(half) lands on it exactly: every working texel centre inside the plateau IS a full-res texel centre (the centre is
+//   copied 1:1, never resampled), and the grid ends exactly at the screen edge.
+//
+// One shader, two modes (push.mode):
+//   0 encode  (working grid) the full-res colour x the game's exposure, area-filtered over the texel's footprint
+//             (exact texel inside the plateau), per channel L(1 + L/16)/(1 + L) (white at 4) then sRGB: the SDR proxy
+//             the model is shown; the game's depth (nearest) and motion resampled onto the same grid, the motion
+//             carried THROUGH the warp (the previous position warped, minus the current): the guides stay registered
+//             with the warped colour at MVecScale 1, so the model's single temporal history stays correct.
+//   1 resolve (full res) each output pixel's working position (the warp, the same function); the model's answer and the
+//             proxy there (inside the plateau one exact texel; in the fall-off and the edge a depth-aware bilinear, the
+//             4 taps weighed by their warped depth against the pixel's own: no halo across silhouettes), and their
+//             ratio per channel applied to the untouched full-res frame. The full-res detail is never thrown away: only
+//             the model's edit is coarser at the edges. At strength 0, or where the model changed nothing, the output is
+//             the input exactly.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D keep_tex;    // the frame as the upscaler left it (rgba16f copy, full res)
+layout(binding = 1) uniform sampler2D depth_tex;   // the game's depth, render res (reverse Z)
+layout(binding = 2) uniform sampler2D motion_tex;  // the game's motion, render res (x motion_scale = render px to previous)
+layout(binding = 3, rgba16f) uniform writeonly image2D proxy_img;  // encode: the proxy (working grid)
+layout(binding = 4, r32f) uniform writeonly image2D wdepth_img;    // encode: the warped depth
+layout(binding = 5, rg16f) uniform writeonly image2D wmotion_img;  // encode: the warped motion (working px)
+layout(binding = 6) uniform sampler2D proxy_tex;   // resolve: the proxy
+layout(binding = 7) uniform sampler2D nr_tex;      // resolve: the model's answer
+layout(binding = 8) uniform sampler2D wdepth_tex;  // resolve: the warped depth
+// No format qualifier (shaderStorageImageWriteWithoutFormat): the game's output format, or the rgba16f stand-in.
+layout(binding = 9) uniform writeonly image2D dst_img;
+layout(std430, binding = 10) readonly buffer Exposure { float exposure_values[]; };
+
+layout(push_constant) uniform Push {
+	ivec2 full;     // the output's size
+	ivec2 work;     // the working grid's
+	ivec2 render;   // the guides' (render) size
+	int   mode;
+	int   exposure_index;
+	vec4  ax;       // x axis: a (plateau half-width, px), b (fall-off, px), e (edge density), on (1 / 0)
+	vec4  ay;       // y axis
+	vec2  mv_scale; // the game's motion scale (to render px towards the previous frame)
+	float strength; // 0..1: how much of the model's edit
+	float debug;    // 1: the density map (white 1, dark the edge)
+} push;
+
+// ---- the warp (FoveatedDLSS5 foveation.hlsli, in pixels) ----
+float G(float t, vec4 p) {
+	float a = p.x, b = p.y, e = p.z, k = 1.0 - e;
+	if (t <= a) return t;
+	if (b > 0.0 && t < a + b) {
+		float q = (t - a) / b, q2 = q * q;
+		return a + b * (q - k * (q2 * q - 0.5 * q2 * q2));
+	}
+	return a + b * (1.0 - 0.5 * k) + e * (t - a - b);
+}
+// The density dG/dt.
+float Density(float t, vec4 p) {
+	float a = p.x, b = p.y, e = p.z, k = 1.0 - e;
+	if (t <= a) return 1.0;
+	if (b > 0.0 && t < a + b) {
+		float q = (t - a) / b;
+		return 1.0 - k * q * q * (3.0 - 2.0 * q);
+	}
+	return e;
+}
+// The inverse: h(q) = q - k (q^3 - q^4 / 2) has h' = 1 - k smoothstep(q) >= e >= 0.25, so Newton from q = r converges in
+// a few steps (FoveatedDLSS5 measured < 0.003 px at 7680 px with 4).
+float GInv(float g, vec4 p) {
+	float a = p.x, b = p.y, e = p.z, k = 1.0 - e;
+	if (g <= a) return g;
+	float ramp_area = b * (1.0 - 0.5 * k);
+	if (b <= 0.0 || g >= a + ramp_area) return a + b + (g - a - ramp_area) / e;
+	float r = (g - a) / b, q = r;
+	for (int i = 0; i < 5; ++i) {
+		float q2 = q * q;
+		float h  = q - k * (q2 * q - 0.5 * q2 * q2) - r;
+		float dh = 1.0 - k * (3.0 * q2 - 2.0 * q2 * q);
+		q        = clamp(q - h / dh, 0.0, 1.0);
+	}
+	return a + b * q;
+}
+// Full-res pixel coordinate (0..full) -> working coordinate (0..work), one axis; an axis off is the identity.
+float ToWork(float x, vec4 p, float full, float work) {
+	if (p.w < 0.5) return x;
+	float c = x - 0.5 * full;
+	return 0.5 * work + sign(c) * G(abs(c), p);
+}
+float ToFull(float u, vec4 p, float full, float work) {
+	if (p.w < 0.5) return u;
+	float c = u - 0.5 * work;
+	return 0.5 * full + sign(c) * GInv(abs(c), p);
+}
+float DensityAt(float x, vec4 p, float full) {
+	return p.w < 0.5 ? 1.0 : Density(abs(x - 0.5 * full), p);
+}
+
+// ---- the proxy's encoding ----
+const float W2 = 16.0; // white point 4, squared
+vec3 Knee(vec3 x) { return x * (1.0 + x / W2) / (1.0 + x); }
+vec3 KneeInv(vec3 f) {
+	f = clamp(f, vec3(0.0), vec3(0.9995));
+	vec3 m = 1.0 - f;
+	return (-m + sqrt(m * m + 4.0 * f / W2)) * (0.5 * W2);
+}
+vec3 Oetf(vec3 c) {
+	return mix(c * 12.92, 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+vec3 Eotf(vec3 c) {
+	return mix(c / 12.92, pow(max((c + 0.055) / 1.055, vec3(0.0)), vec3(2.4)), step(vec3(0.04045), c));
+}
+vec3 Encode(vec3 linear_exposed) { return Oetf(clamp(Knee(max(linear_exposed, vec3(0.0))), vec3(0.0), vec3(1.0))); }
+vec3 Decode(vec3 proxy) { return KneeInv(Eotf(clamp(proxy, vec3(0.0), vec3(1.0)))); }
+
+float GameExposure() {
+	float e = exposure_values[push.exposure_index];
+	return (e > 0.0 && e < 65504.0) ? e : 1.0;
+}
+
+void EncodeMain(ivec2 j) {
+	vec2  full = vec2(push.full), work = vec2(push.work);
+	vec2  u    = vec2(j) + 0.5;
+	vec2  x    = vec2(ToFull(u.x, push.ax, full.x, work.x), ToFull(u.y, push.ay, full.y, work.y));
+	// The footprint of this working texel on the full-res grid, per axis (1 inside the plateau).
+	vec2 dens = vec2(DensityAt(x.x, push.ax, full.x), DensityAt(x.y, push.ay, full.y));
+	vec2 foot = 1.0 / max(dens, vec2(0.25));
+	vec3 color;
+	if (foot.x < 1.001 && foot.y < 1.001) {
+		color = texelFetch(keep_tex, clamp(ivec2(floor(x)), ivec2(0), push.full - 1), 0).rgb;
+	} else {
+		// Bilinear taps over the footprint (a tent filter of the texel's area): no aliasing where up to 4 full-res
+		// pixels fold into one working texel.
+		ivec2 n    = ivec2(clamp(ceil(foot), vec2(1.0), vec2(4.0)));
+		vec3  sum  = vec3(0.0);
+		for (int sy = 0; sy < n.y; ++sy)
+			for (int sx = 0; sx < n.x; ++sx) {
+				vec2 o = (vec2(sx, sy) + 0.5) / vec2(n) - 0.5;
+				sum += textureLod(keep_tex, (x + o * foot) / full, 0.0).rgb;
+			}
+		color = sum / float(n.x * n.y);
+	}
+	imageStore(proxy_img, j, vec4(Encode(color * GameExposure()), 1.0));
+	// The guides: nearest (never blend depth across a silhouette), the motion through the warp.
+	vec2  n_now = x / full;
+	vec2  rsize = vec2(push.render);
+	ivec2 rt    = clamp(ivec2(floor(n_now * rsize)), ivec2(0), push.render - 1);
+	float depth = texelFetch(depth_tex, rt, 0).r;
+	vec2  mv    = texelFetch(motion_tex, rt, 0).rg * push.mv_scale; // render px to the previous position
+	vec2  x_prev = (n_now + mv / rsize) * full;
+	vec2  u_prev = vec2(ToWork(x_prev.x, push.ax, full.x, work.x), ToWork(x_prev.y, push.ay, full.y, work.y));
+	vec2  wmv    = u_prev - u;
+	if (any(isnan(wmv)) || any(isinf(wmv))) wmv = vec2(0.0);
+	imageStore(wdepth_img, j, vec4(depth, 0.0, 0.0, 0.0));
+	imageStore(wmotion_img, j, vec4(wmv, 0.0, 0.0));
+}
+
+void ResolveMain(ivec2 p) {
+	vec2 full = vec2(push.full), work = vec2(push.work);
+	vec2 x    = vec2(p) + 0.5;
+	vec4 orig = texelFetch(keep_tex, p, 0);
+	vec2 u    = vec2(ToWork(x.x, push.ax, full.x, work.x), ToWork(x.y, push.ay, full.y, work.y));
+	vec2 dens = vec2(DensityAt(x.x, push.ax, full.x), DensityAt(x.y, push.ay, full.y));
+	if (push.debug > 0.5) {
+		imageStore(dst_img, p, vec4(orig.rgb * (0.25 + 0.75 * dens.x * dens.y), orig.a));
+		return;
+	}
+	vec3 P, N;
+	if (dens.x > 0.9999 && dens.y > 0.9999) {
+		// The plateau: u is a working texel centre (the host's parity), the same texel the encode copied 1:1.
+		ivec2 t = clamp(ivec2(floor(u)), ivec2(0), push.work - 1);
+		P       = texelFetch(proxy_tex, t, 0).rgb;
+		N       = texelFetch(nr_tex, t, 0).rgb;
+	} else {
+		// Depth-aware bilinear (the edge-aware stretch): the 4 nearest working texels, bilinear x depth similarity to
+		// this pixel's own depth (render res, nearest); none similar: plain bilinear.
+		ivec2 rt   = clamp(ivec2(floor(x / full * vec2(push.render))), ivec2(0), push.render - 1);
+		float z    = texelFetch(depth_tex, rt, 0).r;
+		vec2  base = u - 0.5;
+		ivec2 i0   = ivec2(floor(base));
+		vec2  f    = base - vec2(i0);
+		vec3  sp = vec3(0.0), sn = vec3(0.0), bp = vec3(0.0), bn = vec3(0.0);
+		float sw = 0.0;
+		for (int k = 0; k < 4; ++k) {
+			ivec2 o  = ivec2(k & 1, k >> 1);
+			ivec2 t  = clamp(i0 + o, ivec2(0), push.work - 1);
+			float wb = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+			float zt = texelFetch(wdepth_tex, t, 0).r;
+			float rel = abs(zt - z) / max(max(zt, z), 1e-6);
+			float w   = wb / (1.0 + 64.0 * rel * rel);
+			vec3  tp  = texelFetch(proxy_tex, t, 0).rgb;
+			vec3  tn  = texelFetch(nr_tex, t, 0).rgb;
+			sp += w * tp, sn += w * tn, sw += w;
+			bp += wb * tp, bn += wb * tn;
+		}
+		if (sw > 1e-4) {
+			P = sp / sw, N = sn / sw;
+		} else {
+			P = bp, N = bn;
+		}
+	}
+	// The model's edit as a ratio on the untouched frame (exposed-linear, per channel, held within 1/4..4).
+	vec3 lp    = Decode(P), ln = Decode(N);
+	vec3 ratio = clamp((ln + 0.002) / (lp + 0.002), vec3(0.25), vec3(4.0));
+	vec3 rgb   = orig.rgb * mix(vec3(1.0), ratio, push.strength);
+	if (any(isnan(rgb)) || any(isinf(rgb))) rgb = orig.rgb;
+	imageStore(dst_img, p, vec4(rgb, orig.a));
+}
+
+void main() {
+	ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+	if (push.mode == 0) {
+		if (id.x >= push.work.x || id.y >= push.work.y) return;
+		EncodeMain(id);
+	} else {
+		if (id.x >= push.full.x || id.y >= push.full.y) return;
+		ResolveMain(id);
+	}
+}

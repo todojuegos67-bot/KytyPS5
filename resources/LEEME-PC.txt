@@ -65,6 +65,12 @@ Esta junto al exe y tiene comentarios en cada opcion. Equivalencias con el lanza
                      AMD FSR 4 (modelo v07 INT8, carpeta fsr4_shaders; el 3D a 360 lineas como minimo).
                       DLSS/XeSS/FSR van por el camino PS5 Pro del juego, a la relacion de la altura del monitor.
   nitidez           = Nitidez (auto, 0 ... 1).        preset_dlss = DLSS auto / K / L / M.
+  dlss5             = DLSS 5 (Neural Rendering de NVIDIA, solo NVIDIA RTX): 0 no, 1 suave, 2 medio, 3 fuerte.
+                      Suave / Medio / Fuerte bajan la resolucion en los bordes de la pantalla para ahorrar GPU; el
+                      centro siempre a resolucion completa. Necesita TU PROPIO nvngx_dlssnr.dll de NVIDIA junto a
+                      "Demon's Souls.exe" (NO viene incluido); sin el, la imagen de siempre.
+  dlss5_no_oficial  = Archivo DLSS 5: 0 oficial (solo firmado por NVIDIA), 1 no oficial (bajo tu responsabilidad).
+  dlss5_intensidad  = Intensidad DLSS 5: baja, media, alta (por defecto).
   frame_generation  = el desplegable de frame generation (sin-fg, amd-x2..x4, amd-120, amd-dinamico,
                       dlss-x2..x6, dlss-120, dlss-dinamico). Con frame generation el reloj virtual va a 360 Hz.
   hdr, vsync, gsync = las casillas HDR, VSync y G-Sync.
@@ -99,9 +105,9 @@ Esta junto al exe y tiene comentarios en cada opcion. Equivalencias con el lanza
   bordes_sombras    = Bordes sombras: 0 normal, 1 alta, 2 muy alta, 3 ultra.
   sombra_rincones   = Sombra rincones: 0 normal, 1 alta, 2 maxima (solo con rt_oclusion=1).
   [RayTracing] reflejos_rt 0-5, luz_rt_pantalla 0-4, sombras_rt 0-3, oclusion_ao 0-3 (mejor 0: cuesta ~7 ms),
-                luz_antorchas 0-4 (4 = hibrido), destellos_lente 0/1: efectos de pantalla (solo con DLSS, XeSS o FSR).
+                humo_particulas 0/1: efectos de pantalla (solo con DLSS, XeSS o FSR).
                 rt_experimental = 1: activa el RT por hardware (las filas siguientes).
-  [RayTracing] rt_reflejos, rt_sombras_sol, rt_niebla, rt_particulas, rt_metal, rt_oclusion = 1 si / 0 no
+  [RayTracing] rt_reflejos, rt_sombras_sol = 1 si / 0 no
                       (trazado de rayos por hardware; cualquier modo Souls los pone en 0). Luz RT y GTAO ya no existen.
   desenfoque_movimiento, profundidad_campo, vineteado, resplandor, adaptacion_ojo = postprocesado (1 como en PS5).
   filtrado_x16      = filtrado anisotropico x16.   texturas_nitidas = el detalle de la resolucion final (no toca la niebla).

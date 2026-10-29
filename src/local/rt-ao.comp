@@ -134,6 +134,16 @@ vec3 OctDecode(uint w) {
 	n.y -= n.y >= 0.0 ? t : -t;
 	return normalize(n);
 }
+// (ds-veg-1029) vegetation / moss / alpha cards: green-dominant G-buffer albedo (linear). 0..1.
+float VegAlbedo(ivec2 fp) {
+	if (!Flag(F_ALBEDO)) return 0.0;
+	ivec2 gs = textureSize(gb_albedo, 0);
+	uint  w  = texelFetch(gb_albedo, clamp(fp, ivec2(0), gs - 1), 0).r;
+	if (w == 0u) return 0.0;
+	vec3  a  = pow(vec3(float(w & 255u), float((w >> 8) & 255u), float((w >> 16) & 255u)) / 255.0, vec3(2.2));
+	float m  = max(max(a.r, a.b), 1e-3);
+	return smoothstep(1.06, 1.22, a.g / m) * step(0.015, a.g);
+}
 vec3 GbufNormal(ivec2 full_px, int conv, out bool ok) {
 	ok = false;
 	if (!Flag(F_NORMALS)) return vec3(0, 0, -1);
@@ -339,6 +349,45 @@ vec3 WorldDepthNormal(ivec2 p, vec3 P) {
 	n = l > 1e-20 ? n / l : normalize(e - P);
 	return dot(n, e - P) < 0.0 ? -n : n;
 }
+// (ds-veg-1029) vegetation / alpha-tested cards (ivy, grass, leaves, moss): green-dominant G-buffer albedo (linear), or
+// a G-buffer normal far from the depth's (a normal-mapped card in front of what the depth shows). 0..1.
+// (ds-veg-1029 r2) noisy depth: the depth normal turns > ~37 degrees within 2 px (leaf cards, grass, ivy clumps)
+bool VegNoise(ivec2 p, vec3 n) {
+	ivec2 rs = ivec2(RenderSize());
+	const ivec2 o4[4] = ivec2[](ivec2(2, 0), ivec2(-2, 0), ivec2(0, 2), ivec2(0, -2));
+	for (int i = 0; i < 4; ++i) {
+		ivec2 q  = clamp(p + o4[i], ivec2(0), rs - 1);
+		float dq = texelFetch(depth_tex, q, 0).r;
+		if (Sky(dq)) continue;
+		if (dot(WorldDepthNormal(q, WorldPos((vec2(q) + 0.5) / RenderSize(), dq)), n) < 0.8) return true;
+	}
+	return false;
+}
+float VegAt(ivec2 fp, vec3 nw, vec3 nd) {
+	float v = VegAlbedo(fp);
+	if (v < 0.5 && VegNoise(fp, nd)) v = 1.0;
+	if (length(nw) > 0.5) v = max(v, 1.0 - smoothstep(0.3, 0.55, dot(normalize(nw), nd)));
+	return v;
+}
+// (ds-veg-1029) a hit we do not count as an occluder: an on-screen visible hit on vegetation, or a flush layer (a hit
+// within 0.35 m whose surface faces the receiver's way: ivy / banner / decal / plaque a few cm off a wall, the wall
+// behind a thin prop). Corners (perpendicular) and overhangs (facing back) still count. 1: veg, 2: flush, 0: keep.
+int HitIgnored(vec3 H, float t, vec3 N, vec3 O) {
+	vec2  huv;
+	float hd;
+	if (!Project(H, huv, hd)) return 0;
+	float sd = textureLod(depth_tex, huv, 0).r;
+	if (Sky(sd)) return 0;
+	vec3 S = WorldPos(huv, sd);
+	if (distance(S, H) >= 0.08 + 0.02 * distance(H, u.cam.xyz)) return 0; // not the visible surface: unknown, kept
+	ivec2 hp = clamp(ivec2(huv * RenderSize()), ivec2(0), ivec2(RenderSize()) - 1);
+	vec3 hn = WorldDepthNormal(hp, S);
+	if (VegAlbedo(hp) > 0.5 || VegNoise(hp, hn)) return 1;
+	// (r2) height of the hit over the receiver's plane: coplanar (< 5 cm), or a same-facing layer within 0.2 m
+	float h = dot(S - O, N);
+	if (h < 0.05 || ((h < 0.2 || t < 0.35) && dot(hn, N) > 0.5)) return 2;
+	return 0;
+}
 // The receiver's mesh when it is a dynamic one (characters, armour: their captured positions may trail the depth): a
 // short ray across the pixel's own surface. Its custom index + 1 (0: static / none).
 uint Receiver(vec3 P, float z) {
@@ -364,6 +413,21 @@ float Hit(vec3 o, vec3 dir, float tmin, float tmax, uint rid, float skip_t) {
 		}
 	}
 	return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT ? rayQueryGetIntersectionTEXT(rq, true) : -1.0;
+}
+// (ds-veg-1029) Hit, past ignored hits (vegetation / flush layers: up to 3 skipped). why: the last ignore reason.
+float HitF(vec3 o, vec3 dir, float tmin, float tmax, uint rid, float skip_t, vec3 N, out int why) {
+	why = 0;
+	float t0 = tmin;
+	for (int i = 0; i < 4; ++i) {
+		float t = Hit(o, dir, t0, tmax, rid, skip_t);
+		if (t < 0.0) return -1.0;
+		int w = HitIgnored(o + dir * t, t, N, o);
+		if (w == 0) return t;
+		why = w;
+		t0  = t + 0.03;
+		if (t0 >= tmax) return -1.0;
+	}
+	return -1.0;
 }
 void Basis(vec3 n, out vec3 b1, out vec3 b2) {
 	b1 = normalize(cross(n, abs(n.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
@@ -418,7 +482,15 @@ void TraceHw(ivec2 tp) {
 		if (dot(nw, u.cam.xyz - P) < 0.0) nw = -nw;
 		N = dot(nw, nd) > 0.4 ? nw : nd;
 	}
+	// (ds-veg-1029) a vegetation receiver: nothing (visibility 1, no shadow), so the denoise spreads no darkness either
+	if (VegAt(fp, Flag(F_NORMALS) ? nw : vec3(0.0), nd) > 0.5) {
+		imageStore(out_img, tp, vec4(0.0, 0.0, 0.0, 1.0));
+		imageStore(gz_out, tp, vec4(0.0, 0.0, 0.0, 1.0));
+		return;
+	}
 	uint  rid  = Receiver(P, dist);
+	int   why;
+	uint  n_veg = 0u, n_flush = 0u;
 	float skip = 0.2;
 	vec3  o    = P + N * (0.015 + 0.0015 * dist);
 	float tmin = 0.01 + 0.001 * dist;
@@ -436,7 +508,9 @@ void TraceHw(ivec2 tp) {
 		vec2  xi = fract(base + fk * vec2(0.7548776662, 0.5698402910));
 		float rr = sqrt(xi.x), ph = 6.2831853 * xi.y;
 		vec3  dir = normalize(b1 * (rr * cos(ph)) + b2 * (rr * sin(ph)) + N * sqrt(max(1.0 - xi.x, 0.0)));
-		float t   = Hit(o, dir, tmin, R, rid, skip);
+		float t   = HitF(o, dir, tmin, R, rid, skip, N, why);
+		if (why == 1) ++n_veg;
+		if (why == 2) ++n_flush;
 		if (t < 0.0) continue;
 		occ += clamp(1.0 - t / Rao, 0.0, 1.0);
 		// shade the hit: the lit colour of the frame where the hit is the visible surface there, else an estimate
@@ -464,7 +538,7 @@ void TraceHw(ivec2 tp) {
 		Basis(u.sun.xyz, s1, s2);
 		float rr = sqrt(xs.x) * u.hw2.y, ph = 6.2831853 * xs.y;
 		vec3  dir = normalize(u.sun.xyz + (s1 * cos(ph) + s2 * sin(ph)) * rr);
-		float t   = Hit(o, dir, tmin, u.hw2.x, rid, skip);
+		float t   = HitF(o, dir, tmin, u.hw2.x, rid, skip, N, why);
 		if (t >= 0.0) occ_s = 1.0 - smoothstep(0.7 * u.hw2.x, u.hw2.x, t);
 	}
 	float tshare = 0.0;
@@ -493,10 +567,16 @@ void TraceHw(ivec2 tp) {
 			vec3  dv  = tgt - o;
 			float len = length(dv);
 			if (len - 0.35 > tmin + 0.01) {
-				float t = Hit(o, dv / len, tmin, len - 0.35, rid, skip);
+				float t = HitF(o, dv / len, tmin, len - 0.35, rid, skip, N, why);
 				if (t >= 0.0) occ_t = tshare;
 			}
 		}
+	}
+	if ((tp.x & 3) == 0 && (tp.y & 3) == 0) {
+		uint sb = uint(u.cfg.w) * SLOT_WORDS;
+		StatAdd(sb + 17u, n_veg);
+		StatAdd(sb + 18u, n_flush);
+		StatAdd(sb + 19u, uint(rays));
 	}
 	imageStore(out_img, tp, vec4(bounce, vis));
 	imageStore(gz_out, tp, vec4(occ_s, occ_t, tshare, 1.0));
@@ -666,6 +746,19 @@ void Composite(ivec2 p) {
 		// (ds-ptao-1029) path traced: the ambient term replaced by visibility x ambient + albedo x bounce; the direct light's
 		// occluded share (sun cone, nearest torch) removed. Open surfaces: visibility 1, no shadow ray hit: unchanged but
 		// for the bounce light their surroundings send.
+		// (ds-veg-1029) vegetation pixels: never touched by this pass (factor 1)
+		{
+			float veg = VegAlbedo(p);
+			if (veg < 0.5) {
+				vec3 Pw = WorldPos((vec2(p) + 0.5) / RenderSize(), d);
+				if (VegNoise(p, WorldDepthNormal(p, Pw))) veg = 1.0;
+			}
+			if (veg > 0.5) {
+				if (smp) StatAdd(base + 16u, 1u);
+				imageStore(out_img, p, col);
+				return;
+			}
+		}
 		vec4  A  = UpsampleV(src_a, p, z);
 		vec4  B  = UpsampleV(shadow_tex, p, z);
 		if (any(isnan(A)) || any(isinf(A))) A = vec4(0, 0, 0, 1);
@@ -703,6 +796,10 @@ void Composite(ivec2 p) {
 		return;
 	}
 #endif
+	if (VegAlbedo(p) > 0.5) { // (ds-veg-1029) vegetation: untouched by the screen-space AO too
+		imageStore(out_img, p, col);
+		return;
+	}
 	float ao = Upsample(p, z);
 	ao       = (isnan(ao) || isinf(ao)) ? 1.0 : clamp(ao, 0.0, 1.0);
 	// (ao-strong-1029) a power curve (creases / contact go much darker, open floors stay ~1: GTAO's mean visibility ~0.9
