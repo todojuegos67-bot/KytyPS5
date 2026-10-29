@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/bb/bb_analyze.h"
+#include "video_core/bb/bb_metrics.h"
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -1273,6 +1274,19 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                      rec_w, rec_h);
         }
         g_stats = {};
+    }
+
+    if (BB::Metrics::Enabled()) {
+        const auto& mc = Cfg();
+        if (Active() && f.injected) {
+            BB::Metrics::SetUpscaleLine(fmt::format(
+                "{} {} {}x{} -> {}x{}", SR::KindName(mc.kind), SR::QualityName(mc.quality),
+                g_plan.render_w, g_plan.render_h, g_plan.output_w, g_plan.output_h));
+        } else if (mc.kind == SR::Kind::Off || mc.kind == SR::Kind::Native) {
+            BB::Metrics::SetUpscaleLine("off");
+        } else {
+            BB::Metrics::SetUpscaleLine(fmt::format("{} (not running: native)", SR::KindName(mc.kind)));
+        }
     }
 
     // Jitter for the next frame.

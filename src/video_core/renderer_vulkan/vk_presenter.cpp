@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/bb/bb_analyze.h"
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/bb/bb_metrics.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 
@@ -1116,6 +1117,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
 
     free_frame();
     if (!is_reusing_frame) {
+        BB::Metrics::OnPresent();
         DebugState.IncFlipFrameNum();
     }
 }

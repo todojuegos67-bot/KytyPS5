@@ -1115,6 +1115,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_rasterizer.h
                src/video_core/renderer_vulkan/vk_rasterizer_bb.cpp
                src/video_core/bb/bb_analyze.h
+               src/video_core/bb/bb_metrics.cpp
+               src/video_core/bb/bb_metrics.h
                src/video_core/bb/bb_kyty_compat.h
                src/video_core/bb/bb_sr.h
                src/video_core/bb/bb_sr_dlss.cpp

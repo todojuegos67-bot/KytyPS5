@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/bb/bb_metrics.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
@@ -431,6 +432,7 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
 
 int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     LOG_TRACE(Lib_Pad, "called");
+    BB::Metrics::OnInput();
     if (pData == nullptr || num < 1 || num > ORBIS_PAD_MAX_DATA_NUM) {
         return ORBIS_PAD_ERROR_INVALID_ARG;
     }
