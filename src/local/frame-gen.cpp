@@ -8886,7 +8886,7 @@ void CShadowTakeStats() {
 		}();
 		if (auto_sun && g_cs.log_k >= 0.0) {
 			const double k = std::exp2(g_cs.log_k), x = std::clamp((k - 1.15) / (2.0 - 1.15), 0.0, 1.0); // (10-24 r3: gentler)
-			g_cs.sun_factor = 0.5 + 0.5 * x * x * (3.0 - 2.0 * x);
+			g_cs.sun_factor = 0.7 + 0.3 * x * x * (3.0 - 2.0 * x); // (ptstrong-1029: overcast floor 0.5 -> 0.7)
 		}
 	}
 	const auto now = std::chrono::steady_clock::now();
@@ -8896,7 +8896,7 @@ void CShadowTakeStats() {
 	} else if (g_cs.st_samples > 0 || g_cs.samples > 0) {
 		const double n = g_cs.st_n, px = std::max(g_cs.st_pixels, 1.0);
 		std::printf("RTSHADOW: stats: %.1f %% of pixels shadowed (occlusion > 0.1), mean occlusion %.3f (%.3f on those), their "
-		            "mean depth %.1f m; sun lit/ambient K %.2f -> overcast factor %.2f; GPU %.3f ms (%u samples, %u frames)\n",
+		            "mean depth %.1f m; sun lit/ambient K %.2f -> overcast factor %.2f; GPU %.3f ms (%u samples, %u frames) [ptstrong: strength x1.6, ray 2.5 m, thick 0.25-0.6 m, cap 70 %%, target several %% shadowed]\n",
 		            100.0 * n / px, g_cs.st_occ / px, n > 0.0 ? g_cs.st_occ / n : 0.0, n > 0.0 ? g_cs.st_depth / n : 0.0,
 		            g_cs.log_k >= 0.0 ? std::exp2(g_cs.log_k) : 0.0, g_cs.sun_factor,
 		            g_cs.samples > 0 ? g_cs.sum_ms / g_cs.samples : 0.0, g_cs.st_samples, g_cs.samples);
@@ -9247,8 +9247,8 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
 	push.motion[2] = static_cast<float>(color.extent.width), push.motion[3] = static_cast<float>(color.extent.height);
 	push.trace[0] = static_cast<float>(g_cs.trace.width), push.trace[1] = static_cast<float>(g_cs.trace.height);
-	const float strength = RtShadowEnv("KYTY_RT_SHADOWS_STRENGTH", "KYTY_CONTACT_SHADOWS_STRENGTH", 0.5f, 1.0f) /* (10-24 r3: 0.6 looked thin) */;
-	const float length   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_LENGTH", "KYTY_CONTACT_SHADOWS_LENGTH", 1.5f, 10.0f), 0.25f); // (rtsart: 1.5 m: contact shadows; long rays only doubled the game's) // (10-24) 3 m (1 m was too short)
+	const float strength = std::min(RtShadowEnv("KYTY_RT_SHADOWS_STRENGTH", "KYTY_CONTACT_SHADOWS_STRENGTH", 0.5f, 1.0f) * 1.6f, 1.0f) /* (10-24 r3: 0.6 looked thin) (ptstrong-1029: x1.6, launcher 0.35/0.5/0.7 -> 0.56/0.8/1.0) */;
+	const float length   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_LENGTH", "KYTY_CONTACT_SHADOWS_LENGTH", 2.5f /* ptstrong-1029: was 1.5 */, 10.0f), 0.25f); // (rtsart: 1.5 m: contact shadows; long rays only doubled the game's) // (10-24) 3 m (1 m was too short)
 	const float fade_m   = std::max(RtShadowEnv("KYTY_RT_SHADOWS_FADE", nullptr, 100.0f, 600.0f), 2.0f); // (10-24) 100-200 m by default; far (dist-1023): up to 600
 	push.trace[2] = strength, push.trace[3] = length;
 	for (int k = 0; k < 3; ++k) {
