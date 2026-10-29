@@ -485,6 +485,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${dof_header}")
 
+# KYTY_DLSS_NR / KYTY_FOVEATED (ds-foveated-1029): DLSS 5 Neural Rendering's foveated grid (src/local/dlss-nr.cpp).
+set(dlss_nr_source "${KYTY_SOURCE_DIR}/local/dlss-nr.comp")
+set(dlss_nr_spv "${gpu_tiler_generated_dir}/dlss_nr.spv")
+set(dlss_nr_header "${gpu_tiler_generated_dir}/dlss_nr_spv.h")
+add_custom_command(
+	OUTPUT "${dlss_nr_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${dlss_nr_spv}" "${dlss_nr_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${dlss_nr_spv} -DOUTPUT=${dlss_nr_header}
+	        -DSYMBOL=DLSS_NR_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${dlss_nr_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${dlss_nr_header}")
+
 # KYTY_SSR: screen-space reflections before the PS5 Pro path's upscaler (src/local/frame-gen.cpp).
 set(ssr_source "${KYTY_SOURCE_DIR}/local/ssr.comp")
 set(ssr_spv "${gpu_tiler_generated_dir}/ssr.spv")
@@ -938,6 +954,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/rt-ao.cpp"
 	"${KYTY_SOURCE_DIR}/local/dof.h"
 	"${KYTY_SOURCE_DIR}/local/dof.cpp"
+	"${KYTY_SOURCE_DIR}/local/dlss-nr.h"
+	"${KYTY_SOURCE_DIR}/local/dlss-nr.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-gi.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.h"
 	"${KYTY_SOURCE_DIR}/local/rt-local-lights.cpp"

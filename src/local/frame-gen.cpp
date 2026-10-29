@@ -38,6 +38,7 @@
 #include "local/godrays.h"
 #include "local/torch.h"
 #include "local/dof.h"
+#include "local/dlss-nr.h"
 #include "local/smoke.h"
 #include "local/rt-local-lights.h"
 #include "local/rt-flicker.h"
@@ -9623,6 +9624,9 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 		}
 	}
 	if (done && mid_image != nullptr) BlitMid(command, *mid_image, mid_size, inputs.output);
+	// (ds-foveated-1029, KYTY_DLSS_NR / KYTY_FOVEATED: DLSS 5 Neural Rendering on the upscaled output, foveated, before the
+	// game's bloom, depth of field and HUD; dlss-nr.cpp; nothing when off or without the user's nvngx_dlssnr.dll)
+	if (done) TimedPass("DlssNrApply", [&] { return DlssNrApply(command, inputs); });
 	return done;
 }
 

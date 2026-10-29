@@ -438,15 +438,16 @@ function Start-Game {
 	}
 	if (-not $pureGame -and $cmbFlare -and $cmbFlare.SelectedIndex -gt 0) { $sets += 'KYTY_TORCH_FLARE=1' }  # (torch-1028) destellos de lente
 	if ($cmbDof -and -not $pureGame) { $sets += "KYTY_DOF=$([math]::Min(3, [math]::Max(0, $cmbDof.SelectedIndex)))" } else { $sets += 'KYTY_DOF=0' }  # (ds-dof-1029) profundidad de campo a distancia: No/Suave/Cinematico/Fuerte
+	if ($cmbFov -and -not $pureGame -and $cmbFov.SelectedIndex -gt 0) { $sets += @('KYTY_FOVEATED=1', "KYTY_FOV_EDGE=$(@('0.5', '0.75', '0.5', '0.35')[[math]::Min(3, $cmbFov.SelectedIndex)])") } else { $sets += @('KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0') }  # (ds-foveated-1029) DLSS 5 NR foveado: No/Suave/Medio/Fuerte (borde 0,75/0,5/0,35)
 	if ($pureGame) {
 		# (audit) Juego original: fuera todo pase visual del emulador (RT, volumetrica, sombra RT, brillo, oclusion especular, GTAO,
 		# SSGI, reflejos RT de pantalla, contacto, particulas RT); -Set manda sobre el entorno. Rendimiento, reescalador, FG y latencia igual.
-		$fxPat = '^KYTY_(HWRT|RT_REFLECTIONS|RT_SHADOWS|RT_SUN|RT_PARTICLES|RT_LOCAL|GODRAYS|SHINE|SPEC_OCCLUSION|GTAO|SSGI|SSR|CONTACT_SHADOWS|AO|TORCH|DOF|SMOKE)'
+		$fxPat = '^KYTY_(HWRT|RT_REFLECTIONS|RT_SHADOWS|RT_SUN|RT_PARTICLES|RT_LOCAL|GODRAYS|SHINE|SPEC_OCCLUSION|GTAO|SSGI|SSR|CONTACT_SHADOWS|AO|TORCH|DOF|SMOKE|FOVEATED|FOV_|DLSS_NR)'
 		$sets = @($sets | Where-Object { $_ -notmatch $fxPat })
 		foreach ($n in @(Get-ChildItem Env: | Where-Object { $_.Name -match $fxPat } | ForEach-Object { $_.Name })) { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 		$sets += @('KYTY_HWRT=0', 'KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_REFLECTIONS=0',
 			'KYTY_RT_SHADOWS=0', 'KYTY_CONTACT_SHADOWS=0', 'KYTY_RT_SUN=0', 'KYTY_RT_PARTICLES=0', 'KYTY_GODRAYS=0', 'KYTY_SHINE=0', 'KYTY_SPEC_OCCLUSION=0',
-			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0', 'KYTY_TORCH_HW=0', 'KYTY_SMOKE=0', 'KYTY_RT_HW_EXPERIMENTAL=0', 'KYTY_DOF=0')
+			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0', 'KYTY_TORCH_HW=0', 'KYTY_SMOKE=0', 'KYTY_RT_HW_EXPERIMENTAL=0', 'KYTY_DOF=0', 'KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0')
 		$pa = @(); for ($i = 0; $i -lt $psargs.Count; $i++) { if ($psargs[$i] -eq '-Ssgi') { $i++; continue }; $pa += $psargs[$i] }; $psargs = $pa
 	}
 	# (10-24) Brillo metales retirado (no aportaba)
@@ -492,7 +493,7 @@ function Start-Game {
 	# (10-22) Modo 4K: el modo cinematico del juego a 4K nativo (sin reescalado).
 	# (10-22) El modo del juego siempre segun la salida: 4K = cinematico, lo demas = rendimiento (el juego guarda el
 	# ultimo en la partida y sin esto se quedaba en cinematico).
-	$psargs += @('-ForceMode', $(if (($cmbTest -and $script:testModes[[math]::Max(0, $cmbTest.SelectedIndex)][1] -eq 'TESTCINE') -or ($cmbOut -and $cmbOut.SelectedIndex -eq 1)) { 'cinematic' } else { 'performance' }))  # (10-25) 4K ya no fuerza el cinematico (bloqueaba el juego a 30 reales)
+	$psargs += @('-ForceMode', $(if (($cmbTest -and $script:testModes[[math]::Max(0, $cmbTest.SelectedIndex)][1] -eq 'TESTCINE') ) { 'cinematic' } else { 'performance' }))  # (10-29) 4K: modo rendimiento (sin el tope de 30 en cinematicas) con la calidad del cinematico (convars abajo)  # (10-25) 4K ya no fuerza el cinematico (bloqueaba el juego a 30 reales)
 	#  # (10-22) modos Souls: siempre rendimiento
 	# 1080p / 720p sin reescalador: el juego dibuja a esa altura.
 	if ($outH -lt 1440 -and -not $res[2]) { $res = @("${outH}p", $outH, '', 0) }
@@ -542,7 +543,9 @@ function Start-Game {
 	}
 	# (10-24) Ajustes del juego (ventana "Ajustes del juego"): en KYTY_GAME_CONVARS_EXTRA, que el emulador lee despues de
 	# KYTY_GAME_CONVARS (todo lo de run-windows): mandan. La variable que tuviera el usuario va detras (sus pruebas mandan).
-	$gsAll = @((Get-GameSettingsConvars), $script:userCvExtra) | Where-Object { $_ }
+	$tessLv = @('r_tessellationDensity=4.0;r_tessellationSmallestEdgeLength=0.08;r_tessellationFadeOutStart=6.0;r_tessellationFadeOutRange=2.0', 'r_tessellationDensity=8.0;r_tessellationSmallestEdgeLength=0.04;r_tessellationFadeOutStart=12.0;r_tessellationFadeOutRange=3.0', 'r_tessellationDensity=18.0;r_tessellationSmallestEdgeLength=0.02;r_tessellationFadeOutStart=15.0;r_tessellationFadeOutRange=3.0', 'r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.015;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0', 'r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.01;r_tessellationFadeOutStart=40.0;r_tessellationFadeOutRange=8.0')
+	$cine4k = @($(if ($cmbIbl -and $cmbIbl.SelectedIndex -eq 1) { 'r_iblResolution=Full' } else { 'r_iblResolution=HalfResX' }), $(if ($cmbTess) { $tessLv[[math]::Max(0, $cmbTess.SelectedIndex)] })) -join ';'  # (10-29) IBL y teselado del launcher (4K los pone en cinematico)
+	$gsAll = @($cine4k, (Get-GameSettingsConvars), $script:userCvExtra) | Where-Object { $_ }
 	if ($gsAll) { $env:KYTY_GAME_CONVARS_EXTRA = ($gsAll -join ';') } else { Remove-Item Env:KYTY_GAME_CONVARS_EXTRA -ErrorAction SilentlyContinue }
 	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Hidden | Out-Null
 	# (10-26) Equipos de 16 GB: limpiador de memoria en espera (standby) en tiempo real, como administrador. Si se rechaza el UAC, el juego sigue.
@@ -1072,7 +1075,11 @@ $gModes = New-Group 'Souls Modes' 450 174 420 114
 $gPc  = New-Group 'Performance / PC' 450 294 420 118  # (10-24) +28: fila del vaciado de RAM
 # Imagen: salida, reescalado, preset y nitidez.
 Move-To $lbOut $gImg 10 26 112
-Move-To $cmbOut $gImg 124 24 282
+Move-To $cmbOut $gImg 124 24 140
+$lbMode = New-Label '' $smallFont $gold 0 0 140 22; Move-To $lbMode $gImg 270 27 140  # (10-29) el modo del juego que se aplica
+$tips.SetToolTip($lbMode, '4K: the game's performance mode (cutscenes without the 30 cap) with cinematic quality: full lighting and dense tessellation. Other resolutions: performance mode.')
+function Update-ModeLabel { $lbMode.Text = if ($cmbOut.SelectedIndex -eq 1) { 'Cinematic, no 30 cap' } else { 'Performance mode' } }
+Update-ModeLabel; $cmbOut.Add_SelectedIndexChanged({ Update-ModeLabel })
 $lbRes = New-Label 'Upscaling' $smallFont $ink 0 0 88 22; Move-To $lbRes $gImg 10 58 112
 Move-To $cmbRes $gImg 124 56 282
 $lbPreset = New-Label 'DLSS preset' $smallFont $ink 0 0 88 22; Move-To $lbPreset $gImg 10 90 112
@@ -2300,14 +2307,19 @@ function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @(
 	Move-To $lb $gRt 10 ($y + 2) 112; Move-To $c $gRt 124 $y 282
 	return $c
 }
-$cmbRtSh = New-RtCombo 'RT shadows' 'rtshadow2' 600 'Screen-space ray-traced sun shadows (no hardware RT): the contact shadows the game misses (under arms, between legs, by walls), soft and stable. Only where the game already shows sunlight. DLSS, XeSS or FSR only. Low ~0.3 ms, Medium ~0.6 ms, High ~1 ms.' @('No', 'Low', 'Medium', 'High')  # (ds-shadow-1028)
-$cmbAoNew = New-RtCombo 'Path tracing' 'ao1028' 88 'Path tracing (ds-ptao-1029, hardware RT: the GPU scene TLAS): rays per pixel from every surface give real occlusion (also from off-screen and behind-camera geometry), one bounce of indirect light coloured by what they hit, and soft contact shadows toward the sun and the torches. Replaces only the ambient light (open surfaces are not darkened) and the in-game occlusion. Without hardware RT: a mild screen-space occlusion. Only with DLSS, XeSS or FSR. Low 1 ray at half resolution, Medium 1 ray, High 2 rays at full resolution (~1-3 ms).' @('No', 'Low', 'Medium', 'High')  # (ao-1028) oclusion ambiental nueva (KYTY_AO), solo en Ray tracing
+$cmbRtSh = $null  # (10-29) Sombras RT retiradas (se veian mal)
+$cmbAoNew = $null  # (10-29) Path tracing retirado (se veia mal)
 $cmbRays = New-RtCombo 'Luz volumetrica' 'godrays2' 24 'Luz volumetrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms (mas rayos y mas pasos de sombra).' @('No', 'Bajo', 'Medio', 'Alto')
 $cmbRtRf = New-RtCombo 'RT Reflections' 'rtrefl2' 56 'Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, mas nitidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolucion completa y mas fuertes). Hybrid: High + hardware rays (real RT) only where the screen-space ray finds nothing (off-screen or hidden); the colour comes from the previous screen, limited to its surroundings and faded in slowly: no flashes. Needs an RT-capable GPU. ~+0.5 ms. Beta.' @('No', 'Bajo', 'Medio', 'Alto', 'Ultra', 'Extreme', 'Hybrid')  # (10-25 noche) Extremo = nivel 5 (refl10)  # (10-25) refl8; Ultra vuelve: el cierre era del frame generation AMD, no de los reflejos  # (refl-hybrid-1028) Hibrido = 6
 $cmbTorch = New-RtCombo 'RT torch light' 'torchrt' 536 'RT torch light: fire from torches, braziers and bonfires lights nearby walls, floors and structures with a warm flickering bounce, and is reflected on smooth or wet surfaces. It does not leak through walls or characters (checked against the depth). Screen-space only, no hardware RT. Only with DLSS, XeSS or FSR. Low 2 fires ~0.3 ms, Medium 4 ~0.5 ms, High 8 ~0.9 ms. Hybrid: High + hardware rays (real RT) where the screen cannot see what blocks the light (off-screen or behind something else); it only darkens, never adds light. Needs an RT-capable GPU. ~+0.5 ms.' @('No', 'Low', 'Medium', 'High', 'Hybrid')  # (torch-1028) (torch-shadow-1028) Hybrid
 $cmbFlare = New-RtCombo 'Lens flare' 'lensflare' 568 'Lens flare from visible torches and fires: small lens ghosts, a soft star and streak. It fades out when the fire is hidden and near the screen edges. No halo, no screen-wide glow. Drawn before the HUD. Only with DLSS, XeSS or FSR. ~0.1 ms.' @('No', 'Yes')  # (torch-1028)
-$cmbDof = New-RtCombo 'Depth of field' 'dof1029' 632 'Distance depth of field: things far in the background look softly blurred, with a film-like blur (a smooth disc; bright background lights open into round bokeh). Near and mid ground stay sharp; the HUD always stays sharp. Done by the emulator (the game''s own only works in cutscenes and menus). Only with DLSS, XeSS or FSR. Subtle: from 40 m, light. Cinematic (recommended): from 30 m. Strong: from 25 m, clearly visible. ~0.2-0.4 ms.' @('Off', 'Subtle', 'Cinematic', 'Strong')  # (ds-dof-1029) KYTY_DOF
-$cmbSmoke = New-RtCombo 'Smoke & particles' 'smoke1029' 664 'More realistic smoke and particles on top of the game''s own (full resolution): Soft = smoke, particle fog and sparks no longer cut in a hard line where they meet floors and walls (they fade in over ~35 cm, film-style). Torches = also smoke near torches and braziers glows with their warm light (4.5 m radius, no flicker; needs RT torch light). Stable, no new shimmer. Only with DLSS, XeSS or FSR. ~0.3-0.6 ms.' @('No', 'Soft', 'Torches')  # (ds-particles-1029) KYTY_SMOKE
+$cmbDof = $null  # (10-29) profundidad de campo retirada
+$cmbSmoke = New-RtCombo 'Smoke & particles' 'smoke1029' 632 'More realistic smoke and particles on top of the game''s own (full resolution): Soft = smoke, particle fog and sparks no longer cut in a hard line where they meet floors and walls (they fade in over ~35 cm, film-style). Torches = also smoke near torches and braziers glows with their warm light (4.5 m radius, no flicker; needs RT torch light). Stable, no new shimmer. Only with DLSS, XeSS or FSR. ~0.3-0.6 ms.' @('No', 'Soft', 'Torches')  # (ds-particles-1029) KYTY_SMOKE
+$cmbIbl = New-RtCombo 'IBL lighting' 'ibl1029' 700 'The game's ambient lighting (IBL): Full = cinematic mode, more precise. Half = performance mode. 4K sets Full, the rest Half; you can change it afterwards.' @('Half (performance)', 'Full (cinematic)')  # (10-29) IBL del juego
+$cmbTess = New-RtCombo 'Tessellation' 'tess1029' 732 'Tessellation: real relief on floors, stones and walls. Medium = performance mode (8), High = cinematic mode (18), Ultra and Extreme denser and farther (GPU cost). 4K sets High, the rest Medium; you can change it afterwards.' @('Low', 'Medium (performance)', 'High (cinematic)', 'Ultra', 'Extreme')  # (10-29) teselado del juego
+if ((Get-IniValue 'ibl1029' '') -eq '') { $cmbIbl.SelectedIndex = $(if ($cmbOut.SelectedIndex -eq 1) { 1 } else { 0 }) }
+if ((Get-IniValue 'tess1029' '') -eq '') { $cmbTess.SelectedIndex = $(if ($cmbOut.SelectedIndex -eq 1) { 2 } else { 1 }) }
+$cmbOut.Add_SelectedIndexChanged({ $cmbIbl.SelectedIndex = $(if ($cmbOut.SelectedIndex -eq 1) { 1 } else { 0 }); $cmbTess.SelectedIndex = $(if ($cmbOut.SelectedIndex -eq 1) { 2 } else { 1 }) })  # (10-29) 4K: cinematico; el resto: rendimiento
 if ($cmbSmoke -and (Get-IniValue 'smoke1029' '') -eq '') { $cmbSmoke.SelectedIndex = 2 }  # (ds-particles-1029) por defecto: Antorchas
 $cmbShine = $null  # (10-24) Brillo metales retirado
 # (10-24) Ajustes del juego: convars del propio motor, cada uno en Juego (no se toca) o en un nivel. Nombres, tipos,
@@ -2730,7 +2742,7 @@ if ($gCtl -and $btnCtl) { $gCtl.Top = $btnCtl.Bottom + 6 }
 # (audit) Casilla Juego original: al marcarla las filas de efectos quedan inactivas (sus valores se guardan).
 $chkPure = New-Check 'Original game (no added effects)' 0 0 396 'puregame'
 $tips.SetToolTip($chkPure, 'Turns off every visual effect the emulator adds (ray tracing, volumetric light, RT shadows, shine, occlusion, SSGI, RT reflections). You see the game as it is. Performance, upscaler, frame generation and latency are unchanged.')
-function Update-PureGame { foreach ($c in @($cmbRtRf, $cmbRt, $cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbSmoke)) { if ($c) { $c.Enabled = -not $chkPure.Checked } } }
+function Update-PureGame { foreach ($c in @($cmbRtRf, $cmbRt, $cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbSmoke, $cmbFov)) { if ($c) { $c.Enabled = -not $chkPure.Checked } } }
 $chkPure.Add_CheckedChanged({ Update-PureGame })
 # (10-26) "Ray tracing" solo con RT real: fuera Luz RT (SSGI), Luz volumetrica de pantalla, Reflejos RT, Sol RT y Particulas RT de pantalla.
 # (Visible no sirve para leer antes de mostrar la ventana: se trabaja con listas.)
@@ -2741,7 +2753,7 @@ try {
 	$hideOnly = @(if (-not $rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } })  # (vol25) la Luz volumetrica ya no se oculta
 	$keep = @(@($cmbRtRf, $cmbRt, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbSmoke, $cmbRtSh) | Where-Object { $_ }) + @(if ($rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } | Sort-Object Top })  # (vol25) Luz volumetrica del 10-25 visible otra vez, debajo
 	$lblOf = @{}
-	foreach ($c in @($fake + $hideOnly + $keep + @($cmbShQ, $cmbShD, $cmbAo) | Where-Object { $_ })) {
+	foreach ($c in @($fake + $hideOnly + $keep + @($cmbShQ, $cmbShD, $cmbAo, $cmbIbl, $cmbTess) | Where-Object { $_ })) {
 		$lblOf[$c.GetHashCode()] = @($gRt.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and [math]::Abs($_.Top - ($c.Top + 2)) -le 4 })
 	}
 	foreach ($c in $fake) {
@@ -2756,7 +2768,7 @@ try {
 	$gy = 0; foreach ($pc in @($script:postChecks)) { if ($pc[0].Bottom -gt $gy) { $gy = $pc[0].Bottom } }
 	if ($gy -le 0) { $gy = $gGfx.Height - 10 }
 	$gy += 8; $gAdd = 0
-	foreach ($c in @($cmbShQ, $cmbShD) | Where-Object { $_ }) {
+	foreach ($c in @($cmbShQ, $cmbShD, $cmbIbl, $cmbTess) | Where-Object { $_ }) {
 		foreach ($o in $lblOf[$c.GetHashCode()]) { $gRt.Controls.Remove($o); $gGfx.Controls.Add($o); $o.Top = $gy + 2; $o.Left = 10; $o.Width = 112 }
 		$gRt.Controls.Remove($c); $gGfx.Controls.Add($c); $c.Top = $gy; $c.Left = 124; $c.Width = 282; $gy += 32; $gAdd += 32
 	}
@@ -2772,6 +2784,20 @@ try {
 	if ($lbGs) { $lbGs.Top = $y + 6; $y = $lbGs.Top + $lbGs.Height }
 	$gRt.Height = $y + 10
 	if ($pcCard) { $pcCard.Top = $gRt.Top + $gRt.Height + 12 }
+} catch { }
+# (ds-foveated-1029) Foveated DLSS in Image: DLSS 5 Neural Rendering, foveated (KYTY_FOVEATED, KYTY_FOV_EDGE); the left column moves down one row.
+try {
+	$lbFov = New-Label 'Foveated DLSS' $smallFont $ink 0 0 88 22; $panel.Controls.Add($lbFov)
+	$cmbFov = New-Object System.Windows.Forms.ComboBox
+	$cmbFov.DropDownStyle = 'DropDownList'; $cmbFov.Font = $smallFont; $cmbFov.Tag = 'dlssfov1029'
+	foreach ($it in @('Off', 'Soft (edge 0.75)', 'Medium (0.5)', 'Strong (0.35)')) { [void]$cmbFov.Items.Add($it) }
+	$v = 0; [void][int]::TryParse((Get-IniValue 'dlssfov1029' '0'), [ref]$v); $cmbFov.SelectedIndex = [math]::Min([math]::Max(0, $v), 3)
+	$cmbFov.Add_SelectedIndexChanged({ param($sender, $e) Set-IniValue $sender.Tag "$($sender.SelectedIndex)" })
+	$tips.SetToolTip($cmbFov, 'NVIDIA DLSS 5 Neural Rendering, foveated (from FoveatedDLSS5): NR at full resolution in the centre of the screen and at a lower resolution toward the edges (a smooth curve, horizontal and vertical separately); saves GPU without touching the centre, which never loses sharpness or gets darker. Soft: edge 0.75 (~16 % fewer pixels). Medium: 0.5 (~31 %). Strong: 0.35 (~39 %). It turns itself off when it saves less than 5 %. Needs an NVIDIA RTX and NVIDIA's nvngx_dlssnr.dll next to the emulator or in its streamline folder (not included): without it, normal DLSS. Only with DLSS, XeSS or FSR. Experimental.'); $tips.SetToolTip($lbFov, 'NVIDIA DLSS 5 Neural Rendering, foveated (from FoveatedDLSS5): NR at full resolution in the centre of the screen and at a lower resolution toward the edges (a smooth curve, horizontal and vertical separately); saves GPU without touching the centre, which never loses sharpness or gets darker. Soft: edge 0.75 (~16 % fewer pixels). Medium: 0.5 (~31 %). Strong: 0.35 (~39 %). It turns itself off when it saves less than 5 %. Needs an NVIDIA RTX and NVIDIA's nvngx_dlssnr.dll next to the emulator or in its streamline folder (not included): without it, normal DLSS. Only with DLSS, XeSS or FSR. Experimental.'); $panel.Controls.Add($cmbFov)
+	Move-To $lbFov $gImg 10 154 112; Move-To $cmbFov $gImg 124 152 282
+	$gImg.Height = $gImg.Height + 32
+	foreach ($g2 in @($gGfx, $gRt)) { if ($g2) { $g2.Top = $g2.Top + 32 } }
+	if ($chkPure) { $cmbFov.Enabled = -not $chkPure.Checked }
 } catch { }
 # (10-26) Al elegir cualquier Modo Souls: todo el ray tracing en No (el usuario lo enciende a mano despues).
 function Set-RtAllOff { foreach ($c in @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRt, $cmbRtRf, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbRays)) { if ($c -and $c.Items.Count -gt 0) { $c.SelectedIndex = 0 } } }

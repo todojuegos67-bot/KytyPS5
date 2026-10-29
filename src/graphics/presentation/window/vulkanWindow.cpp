@@ -43,6 +43,7 @@
 #include "frame-gen.h"
 #include "local/xess-sr.h"
 #include "local/fsr4-sr.h"
+#include "local/dlss-nr.h"
 #include "local/fsr3-fg.h"
 #include "local/anti-lag.h"
 #include "local/hwrt-scene.h"
@@ -1617,6 +1618,8 @@ void WindowContext::CreateVulkan() {
 			                                          device_extensions);
 		// KYTY_UPSCALER=fsr4: VK_KHR_compute_shader_derivatives (or the NV one) for the FSR 4 model (local/fsr4-sr.h).
 		Libs::Graphics::Fsr4::AddDeviceExtensions(available_extensions, device_extensions);
+		// KYTY_DLSS_NR / KYTY_FOVEATED: the vendor extensions NGX's Vulkan path loads the NR model through (local/dlss-nr.h).
+		Libs::Graphics::FrameGen::DlssNrAddDeviceExtensions(available_extensions, device_extensions);
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
 		// KYTY_HWRT=1: acceleration structures and ray queries (local/hwrt-scene.h; nothing asked for without it).
