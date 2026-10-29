@@ -792,10 +792,14 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (!s.aspect.empty() && s.aspect != "16:9") env.Set("KYTY_RENDER_ASPECT", s.aspect);
 	// -ForceMode performance (10-25: 4K no longer forces the cinematic mode: it held the game at 30 real).
 	// (10-28, the emulator launcher) A 4K output starts the game in Cinematico, the other outputs in Rendimiento.
+	bool cine4k = false;
 	if (demons) {
 		int out_h = s.fullscreen && pc.screen_h > 0 ? pc.screen_h : (s.height > 0 ? s.height : 1440);
 		if (int w = 0, h = 0; s.fullscreen && std::sscanf(s.resolution.c_str(), "%dx%d", &w, &h) == 2 && h > 0) out_h = h;
-		env.Set("KYTY_DS_FORCE_MODE", out_h >= 2160 ? "cinematic" : "performance");
+		// (10-29, the owner) Always Rendimiento (Cinematico held the cutscenes at 30); a 4K output gets the cinematic
+		// renderconfig quality instead, first in KYTY_GAME_CONVARS_EXTRA (the user's game settings after it win).
+		env.Set("KYTY_DS_FORCE_MODE", "performance");
+		cine4k = out_h >= 2160;
 	}
 	static const std::map<std::string, std::string> convars = {
 	    {"high", "r_forceViewportHeightForPixelSizeCalc=1080"},
@@ -851,6 +855,15 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		    {"medio", "sunShadowMaxDistance=125;sunShadowLightDistance=1000"},
 		    {"bajo", "sunShadowMaxDistance=60;sunShadowLightDistance=1000;r_enableAmbientShadowing=false;r_enableSpotShadows=false"}};
 		if (auto it = shadows.find(s.shadows); it != shadows.end()) env.AppendConvars(it->second);
+		if (cine4k) {
+			std::string x = "r_iblResolution=Full;r_tessellationDensity=18.0;r_tessellationSmallestEdgeLength=0.02;r_tessellationFadeOutStart=15.0;"
+			                "r_tessellationFadeOutRange=3.0";
+			// The user's Detalle / Sombras choices again after it (EXTRA is applied after KYTY_GAME_CONVARS).
+			if (auto it = details.find(s.detail); it != details.end()) x += ";" + it->second;
+			if (auto it = shadows.find(s.shadows); it != shadows.end()) x += ";" + it->second;
+			if (const std::string old = env.Get("KYTY_GAME_CONVARS_EXTRA"); !old.empty()) x += ";" + old;
+			env.Set("KYTY_GAME_CONVARS_EXTRA", x);
+		}
 	}
 	env.Set("KYTY_TEXTURE_REDUCE", texture == "h" || texture == "1" || texture == "2" ? texture : "0"); // (an old "auto": Maximo)
 	env.Default("KYTY_UNMAP_PROTECT_SKIP", "1");
