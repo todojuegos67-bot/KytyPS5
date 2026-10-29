@@ -607,6 +607,26 @@ void PreInstance() {
         GuardBegin(SR::KindName(c.kind), "loading the upscaler and creating the Vulkan device");
     }
     if (c.kind == SR::Kind::Dlss) {
+#if defined(_WIN32)
+        // Implicit Vulkan capture layers that crash inside vkCreateDevice under Streamline (owner's
+        // log: OBS's we-graphics-hook64.dll, 0xc0000005): turned off for this process only, before
+        // the Vulkan loader loads. (RTSS is left on.)
+        for (const char* var : {"DISABLE_VULKAN_OBS_CAPTURE", "DISABLE_VK_LAYER_VALVE_steam_overlay_1",
+                                "DISABLE_VK_LAYER_VALVE_steam_fossilize_1"}) {
+            if (Env(var) == nullptr) {
+                _putenv_s(var, "1");
+                SetEnvironmentVariableA(var, "1");
+            }
+        }
+        if (Env("VK_LOADER_LAYERS_DISABLE") == nullptr) {
+            _putenv_s("VK_LOADER_LAYERS_DISABLE", "VK_LAYER_OBS_HOOK");
+            SetEnvironmentVariableA("VK_LOADER_LAYERS_DISABLE", "VK_LAYER_OBS_HOOK");
+        }
+        Checkpoint("DLSS: implicit layers off for this process: DISABLE_VULKAN_OBS_CAPTURE=1, "
+                   "DISABLE_VK_LAYER_VALVE_steam_overlay_1=1, "
+                   "DISABLE_VK_LAYER_VALVE_steam_fossilize_1=1, "
+                   "VK_LOADER_LAYERS_DISABLE=VK_LAYER_OBS_HOOK");
+#endif
         Checkpoint("DLSS: loading Streamline (slInit)");
         if (!SR::Dlss::Preload()) {
             Checkpoint("DLSS: Streamline not loaded: DLSS off, the game runs native");
@@ -938,16 +958,24 @@ void OnDispatch() {
     }
 }
 
+u64 g_diag_asked = 0, g_diag_inactive = 0, g_diag_noscene = 0, g_diag_calls = 0, g_diag_small = 0;
+
 bool WantCameraScan() {
-    if (!Active() || !Cfg().mv_reconstruct) {
+    ++g_diag_asked;
+    if ((!Active() && !AnalyzeOn()) || !Cfg().mv_reconstruct) {
+        ++g_diag_inactive;
         return false;
     }
     std::scoped_lock lk{g_mutex};
-    return g_draw.valid && g_draw.scene && g_frame.scanned < 160;
+    const bool want = g_draw.valid && g_draw.scene && g_frame.scanned < 160;
+    if (!want) ++g_diag_noscene;
+    return want;
 }
 
 void OnVertexConstants(const void* data, size_t size) {
+    ++g_diag_calls;
     if (data == nullptr || size < 64) {
+        ++g_diag_small;
         return;
     }
     std::scoped_lock lk{g_mutex};
@@ -1257,7 +1285,8 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                  "[BB_UPSCALE] frame {}: HUD separation: draws into the presented image {}, HUD "
                  "draws after the upscale {} (never upscaled), upscale source drawn into after "
                  "the upscale {} (should stay 0), HUD-less copies {}, camera found in {}/{} frames "
-                 "(this frame: {} draws scanned, {} matrix candidates, best seen {} times)",
+                 "(this frame: {} draws scanned, {} matrix candidates, best seen {} times; scan "
+                 "asked {} inactive {} not-scene {} buffers {} too small {})",
                  g_frame_no, g_stats.flip_draws, g_stats.hud_draws, g_stats.src_rewrites,
                  g_stats.hudless, g_stats.camera_frames, g_stats.frames, f.scanned,
                  f.camera.size(),
@@ -1265,7 +1294,8 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                                   : std::max_element(f.camera.begin(), f.camera.end(),
                                                      [](const Candidate& a, const Candidate& b) {
                                                          return a.count < b.count;
-                                                     })->count);
+                                                     })->count,
+                 g_diag_asked, g_diag_inactive, g_diag_noscene, g_diag_calls, g_diag_small);
         if (Active() && scene && (g_learned.render_w == g_output_w) && ratio > 1.01) {
             LOG_INFO(Render_Vulkan,
                      "[BB_UPSCALE] the game renders its 3D at the output size {}x{}: {} runs as "

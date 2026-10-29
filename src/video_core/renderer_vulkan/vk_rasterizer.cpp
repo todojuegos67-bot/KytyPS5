@@ -610,14 +610,24 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                              Shader::PushData& push_data) {
     buffer_bindings.clear();
 
+    const bool bb_scan = (stage.l_stage == Shader::LogicalStage::Vertex ||
+                          stage.l_stage == Shader::LogicalStage::Fragment) &&
+                         BB::Upscale::WantCameraScan();
+    if (bb_scan) {
+        // Constants the shader reads through user-data pointers (the flattened SRT) and the user
+        // data itself, besides the constant buffers below.
+        if (!stage.flattened_ud_buf.empty()) {
+            BB::Upscale::OnVertexConstants(stage.flattened_ud_buf.data(),
+                                           stage.flattened_ud_buf.size() * sizeof(u32));
+        }
+        BB::Upscale::OnVertexConstants(stage.user_data.data(),
+                                       stage.user_data.size() * sizeof(u32));
+    }
     for (const auto& desc : stage.buffers) {
         const auto vsharp = desc.GetSharp(stage);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-            if ((stage.l_stage == Shader::LogicalStage::Vertex ||
-                 stage.l_stage == Shader::LogicalStage::Fragment) &&
-                !desc.is_written && BB::Upscale::WantCameraScan() &&
-                memory->IsValidGpuMapping(vsharp.base_address, size)) {
+            if (bb_scan && !desc.is_written && memory->IsValidMapping(vsharp.base_address, size)) {
                 BB::Upscale::OnVertexConstants(reinterpret_cast<const void*>(vsharp.base_address),
                                                size);
             }
