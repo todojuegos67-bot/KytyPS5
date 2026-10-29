@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -46,6 +47,10 @@ void InstallSixtyStep(Program* program);
 [[nodiscard]] double WideAspect();
 // The game's output's width when the wide output took effect (Install), else 0 (the game's 3840).
 [[nodiscard]] uint32_t WideOutputWidth();
+// The game's frame after its upscaler when KYTY_OUTPUT_HEIGHT took effect (Install, InstallOutputSize), else {0, 0}
+// (the game's 3840x2160).
+[[nodiscard]] uint32_t GameOutputWidth();
+[[nodiscard]] uint32_t GameOutputHeight();
 
 // The video settings' mode 3 case (the setter's and the constructor's): the output size, then the render size, as
 // RIP-relative pairs of 32-bit width and height (vmovsd), then a short jump (01.007.000); 01.005.000 loads the same
@@ -92,13 +97,40 @@ struct Size {
 	uint32_t width  = 0;
 	uint32_t height = 0;
 };
+// KYTY_OUTPUT_HEIGHT=<360..2160> (run-windows.ps1 -Set, the launcher's "Resolución": 720, 1080, 1440 or 2160): the
+// resolution the game comes out at. With the PS5 Pro path (an upscaler: DLSS, XeSS, FSR 3.1, FSR 4) the game's frame
+// after its upscaler - the upscaler's output, its bloom, depth of field and tone mapping (the video settings' fixed
+// 3840x2160 processing size and SuperResolution::InitContext's 3840x2160, InstallOutputSize) - is made at that height
+// (16:9: 1280x720, 1920x1080, 2560x1440) instead of 3840x2160; its interface layer and the flip image stay 3840x2160
+// (laid out for 4K only: the game's own 1080p modes showed their HUD off screen), the composite scaling the frame
+// into them. The window goes full screen at that resolution (graphics/presentation/window/window.cpp), so the
+// swapchain is made at it. KYTY_DS_GAME_OUTPUT=0: the game's output stays 3840x2160 (the upscalers then make the
+// display's size and blit it up, KYTY_DLSS_OUT_DISPLAY / KYTY_FSR4_OUT_DISPLAY). 0 when unset or out of range.
+inline uint32_t RequestedOutputHeight() {
+	static const uint32_t height = [] {
+		const char* v = std::getenv("KYTY_OUTPUT_HEIGHT");
+		const auto  h = v != nullptr && *v != 0 ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
+		return h >= 360 && h <= 2160 ? h : 0u;
+	}();
+	return height;
+}
+// Its 16:9 width (even): 1280, 1920, 2560, 3840.
+inline uint32_t RequestedOutputWidth() {
+	return static_cast<uint32_t>(std::lround(RequestedOutputHeight() * 16.0 / 9.0 / 2.0)) * 2u;
+}
+// The swapchain's size as last made (swapchain.cpp), for the start-up "Resolution:" line.
+inline std::atomic<uint32_t> g_swapchain_width {0}, g_swapchain_height {0};
+
 // The least render height: 720 (the PS5 Pro path's upscalers on a 4K output), 360 with KYTY_UPSCALER=fsr4 (its model
 // outputs the display's size, so a 1080 display's Balanced 635, Performance 540 and Ultra Performance 360 are in its
-// trained ratios). The menus' 480x270 background stays below either.
+// trained ratios) or a KYTY_OUTPUT_HEIGHT below 2160 (a 720 output's DLSS Performance 360, a 1080 one's Ultra
+// Performance 360). The menus' 480x270 background stays below either.
 inline uint32_t LeastRenderHeight() {
 	static const uint32_t least = [] {
 		const char* v = std::getenv("KYTY_UPSCALER");
-		return v != nullptr && std::string_view(v) == "fsr4" ? 360u : 720u;
+		if (v != nullptr && std::string_view(v) == "fsr4") return 360u;
+		const auto output = RequestedOutputHeight();
+		return output != 0 && output < 2160 ? 360u : 720u;
 	}();
 	return least;
 }

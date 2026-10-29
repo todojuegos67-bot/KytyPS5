@@ -30,6 +30,7 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsWarp.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -49,6 +50,8 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -961,6 +964,37 @@ void WindowContext::Run() {
 	}
 }
 
+// KYTY_OUTPUT_HEIGHT (the launcher's "Resolución", loader/demonsSoulsRenderSize.h): full screen at that resolution.
+// The display mode of that height at the desktop's aspect (16:9: 1280x720, 1920x1080, 2560x1440, 3840x2160), at the
+// desktop's refresh rate when the display has it at that size (else its highest), so the swapchain is made at it and
+// the display (or the GPU's scaler) fills the panel with it. False with no such mode (4K on a 1440 monitor without DSR
+// or VSR) or the desktop already at that height: the desktop's own size, as before.
+static bool OutputDisplayMode(int display, SDL_DisplayMode& out) {
+	const auto      height = static_cast<int>(Loader::DemonsSoulsRenderSize::RequestedOutputHeight());
+	SDL_DisplayMode desktop {};
+	if (height == 0 || SDL_GetDesktopDisplayMode(display, &desktop) != 0 || desktop.h <= 0 || desktop.h == height) return false;
+	const double aspect = static_cast<double>(desktop.w) / desktop.h;
+	int          best   = -1;
+	for (int i = 0; i < SDL_GetNumDisplayModes(display); ++i) {
+		SDL_DisplayMode mode {};
+		if (SDL_GetDisplayMode(display, i, &mode) != 0 || mode.h != height) continue;
+		const double mode_aspect = static_cast<double>(mode.w) / mode.h;
+		// (The desktop's aspect within 2 %, or 16:9 itself: the 3D is 16:9 unless KYTY_RENDER_ASPECT.)
+		const bool shape = std::fabs(mode_aspect / aspect - 1.0) < 0.02 ||
+		                   mode.w == static_cast<int>(Loader::DemonsSoulsRenderSize::RequestedOutputWidth());
+		if (!shape) continue;
+		// The desktop's aspect first, then its refresh rate, then the highest.
+		const int score = (std::fabs(mode_aspect / aspect - 1.0) < 0.02 ? 1 << 20 : 0) +
+		                  (mode.refresh_rate == desktop.refresh_rate ? 1 << 19 : 0) + std::min(mode.refresh_rate, 1 << 18) +
+		                  (mode.format == desktop.format ? 1 << 18 : 0);
+		if (score > best) {
+			best = score;
+			out  = mode;
+		}
+	}
+	return best >= 0;
+}
+
 static void WindowCreate(WindowContext& context) {
 	EXIT_IF(context.window != nullptr);
 	EXIT_IF(context.graphic_ctx.screen_width == 0);
@@ -1039,6 +1073,40 @@ static void WindowCreate(WindowContext& context) {
 
 	if (context.window == nullptr) {
 		EXIT("%s\n", SDL_GetError());
+	}
+
+	// KYTY_OUTPUT_HEIGHT: full screen at the chosen resolution (OutputDisplayMode); the swapchain is then made at it.
+	if (fullscreen && Loader::DemonsSoulsRenderSize::RequestedOutputHeight() != 0) {
+		const int       display = std::max(0, SDL_GetWindowDisplayIndex(context.window));
+		SDL_DisplayMode mode {}, desktop {};
+		SDL_GetDesktopDisplayMode(display, &desktop);
+		if (OutputDisplayMode(display, mode)) {
+			// (Not minimized when another window - the metrics overlay, the launcher - takes the focus: the display
+			// stays at that mode with the game behind it, as with the desktop's full screen.)
+			SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
+			if (SDL_SetWindowDisplayMode(context.window, &mode) == 0 &&
+			    SDL_SetWindowFullscreen(context.window, static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN)) == 0) {
+				context.graphic_ctx.screen_width  = static_cast<uint32_t>(mode.w);
+				context.graphic_ctx.screen_height = static_cast<uint32_t>(mode.h);
+				std::printf("Resolution: full screen at %dx%d, %d Hz (the display switched from the desktop's %dx%d for "
+				            "KYTY_OUTPUT_HEIGHT=%u; the swapchain is made at it)\n",
+				            mode.w, mode.h, mode.refresh_rate, desktop.w, desktop.h,
+				            Loader::DemonsSoulsRenderSize::RequestedOutputHeight());
+			} else {
+				std::printf("Resolution: the display could not switch to %dx%d (%s): full screen at the desktop's %dx%d\n",
+				            mode.w, mode.h, SDL_GetError(), desktop.w, desktop.h);
+				SDL_SetWindowFullscreen(context.window, static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP));
+			}
+		} else {
+			std::printf("Resolution: KYTY_OUTPUT_HEIGHT=%u: %s; full screen at the desktop's %dx%d (the presenter scales "
+			            "the game's frames to it)\n",
+			            Loader::DemonsSoulsRenderSize::RequestedOutputHeight(),
+			            desktop.h == static_cast<int>(Loader::DemonsSoulsRenderSize::RequestedOutputHeight())
+			                ? "the desktop is at that height"
+			                : "the display offers no mode of that height",
+			            desktop.w, desktop.h);
+		}
+		std::fflush(stdout);
 	}
 
 	// Resizable, so the title bar's maximize button is enabled: Windows greys it out for a
