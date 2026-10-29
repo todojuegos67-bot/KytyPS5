@@ -284,10 +284,14 @@ bool LooksLikeViewProj(const Mat& v) {
     for (double x : v.m)
         if (!std::isfinite(x) || std::fabs(x) > 1e7) return false;
     const double n0 = Len3(r0), n1 = Len3(r1), n2 = Len3(r2), n3 = Len3(r3);
-    if (n3 < 0.97 || n3 > 1.03) return false;
-    if (n0 < 0.1 || n0 > 50 || n1 < 0.1 || n1 > 50 || n2 < 1e-6) return false;
+    // (Scale invariant: the game's view may carry a world scale, so the w row need not be unit.)
+    if (n3 < 1e-4 || n3 > 1e4) return false;
+    if (n0 < 1e-4 * n3 || n1 < 1e-4 * n3 || n2 < 1e-9) return false;
+    const double aspect = n0 / n1;
+    if (aspect < 0.2 || aspect > 5.0) return false;
     if (std::fabs(Dot3(r0, r1)) / (n0 * n1) > 0.05) return false;
-    if (std::fabs(Dot3(r0, r3)) / n0 > 0.25 || std::fabs(Dot3(r1, r3)) / n1 > 0.25) return false;
+    if (std::fabs(Dot3(r0, r3)) / (n0 * n3) > 0.25 || std::fabs(Dot3(r1, r3)) / (n1 * n3) > 0.25)
+        return false;
     const double c[3]{r2[1] * r3[2] - r2[2] * r3[1], r2[2] * r3[0] - r2[0] * r3[2],
                       r2[0] * r3[1] - r2[1] * r3[0]};
     if (Len3(c) / (n2 * n3) > 0.05) return false;
@@ -322,6 +326,7 @@ struct FrameState {
     u64 draws = 0;
     u32 scene_draws = 0;
     u32 scanned = 0;
+    u64 scanned_draw = ~0ULL;
     u32 flip_draws = 0, hud_draws = 0, hud_other = 0, src_rewrites = 0;
     bool injected = false, inject_failed = false, redirecting = false, hudless = false;
     std::vector<Candidate> camera;
@@ -333,6 +338,7 @@ struct Learned {
     VAddr scene_color = 0;
     VAddr comp_src = 0;
     u32 skip = 0;
+    u32 skip_age = 0;
     u32 stable = 0;
     bool have_prev_vp = false;
     Mat prev_vp;
@@ -379,6 +385,9 @@ struct DrawState {
 
 bool g_dump_frame = false;
 u32 g_dump_lines = 0;
+u32 g_dump_cbs = 0;
+std::string g_dump_last;
+u32 g_dump_repeats = 0;
 
 bool IsFlip(VAddr addr) {
     return addr != 0 && std::find(g_flips.begin(), g_flips.end(), addr) != g_flips.end();
@@ -461,7 +470,7 @@ void FillCamera(Plan& p) {
     const double* r1 = &vp.m[4];
     const double* r2 = &vp.m[8];
     const double* r3 = &vp.m[12];
-    p.fov_y = static_cast<float>(2.0 * std::atan(1.0 / std::max(Len3(r1), 1e-6)));
+    p.fov_y = static_cast<float>(2.0 * std::atan(Len3(r3) / std::max(Len3(r1), 1e-9)));
     // ndc_z = alpha + beta / w (w the view depth)
     const double alpha = Dot3(r2, r3) / Dot3(r3, r3);
     const double beta = r2[3] - alpha * r3[3];
@@ -693,7 +702,7 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
     if (g_draw.targets_flip) {
         ++f.flip_draws;
     }
-    if (g_dump_frame && g_dump_lines < 600) {
+    if (g_dump_frame && g_dump_lines < 1500) {
         g_draw.analyze_dump = true;
         std::string line = fmt::format("[BB_ANALYZE] frame={} draw {} targets:", g_frame_no, f.draws);
         for (u32 i = 0; i < g_draw.num_colors; ++i) {
@@ -702,8 +711,20 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
         if (g_draw.has_depth) line += fmt::format(" d={}", Describe(*depth));
         if (g_draw.targets_flip) line += " [FLIP]";
         if (g_draw.scene) line += " [SCENE]";
-        LOG_INFO(Render_Vulkan, "{}", line);
-        ++g_dump_lines;
+        const std::string key = line.substr(line.find("targets:"));
+        if (key == g_dump_last && !g_draw.scene) {
+            ++g_dump_repeats;
+            g_draw.analyze_dump = false;
+        } else {
+            if (g_dump_repeats > 0) {
+                LOG_INFO(Render_Vulkan, "[BB_ANALYZE]   ... {} more draw(s) with the same targets",
+                         g_dump_repeats);
+            }
+            g_dump_repeats = 0;
+            g_dump_last = key;
+            LOG_INFO(Render_Vulkan, "{}", line);
+            ++g_dump_lines;
+        }
     }
 }
 
@@ -716,7 +737,7 @@ void OnDispatch() {
     g_draw = {};
     g_draw.valid = true;
     g_draw.compute = true;
-    if (g_dump_frame && g_dump_lines < 600) {
+    if (g_dump_frame && g_dump_lines < 1500) {
         g_draw.analyze_dump = true;
         LOG_INFO(Render_Vulkan, "[BB_ANALYZE] frame={} dispatch {}", g_frame_no, g_frame.draws);
         ++g_dump_lines;
@@ -728,7 +749,7 @@ bool WantCameraScan() {
         return false;
     }
     std::scoped_lock lk{g_mutex};
-    return g_draw.valid && g_draw.scene && g_frame.scanned < 64;
+    return g_draw.valid && g_draw.scene && g_frame.scanned < 160;
 }
 
 void OnVertexConstants(const void* data, size_t size) {
@@ -738,7 +759,18 @@ void OnVertexConstants(const void* data, size_t size) {
     std::scoped_lock lk{g_mutex};
     auto& f = g_frame;
     const u64 draw = f.draws;
-    bool counted_draw = false;
+    bool counted_draw = f.scanned_draw == draw;
+    if (g_draw.analyze_dump && g_dump_lines < 1500 && g_dump_cbs < 24) {
+        ++g_dump_cbs;
+        const float* v = static_cast<const float*>(data);
+        std::string text;
+        for (size_t i = 0; i < std::min<size_t>(size / 4, 48); ++i) {
+            text += fmt::format("{}{:.4g}", i % 4 == 0 ? (i ? " | " : "") : " ", v[i]);
+        }
+        LOG_INFO(Render_Vulkan, "[BB_ANALYZE]   cb {:#x} size {} : {}",
+                 reinterpret_cast<uintptr_t>(data), size, text);
+        ++g_dump_lines;
+    }
     const size_t n = std::min<size_t>(size, 4096) / 4;
     const float* w = static_cast<const float*>(data);
     for (size_t at = 0; at + 16 <= n; at += 4) {
@@ -747,11 +779,34 @@ void OnVertexConstants(const void* data, size_t size) {
             for (int i = 0; i < 4; ++i)
                 for (int j = 0; j < 4; ++j)
                     m.m[i * 4 + j] = layout == 0 ? w[at + i * 4 + j] : w[at + j * 4 + i];
-            if (!LooksLikeViewProj(m)) {
+            bool hit = LooksLikeViewProj(m);
+            bool inverse = false;
+            if (!hit && std::fabs(m.m[15]) + std::fabs(m.m[11]) + std::fabs(m.m[14]) > 1e-9) {
+                // The inverse view-projection (deferred lighting's position reconstruction).
+                Mat inv;
+                if (Invert(m, inv) && LooksLikeViewProj(inv)) {
+                    m = inv;
+                    hit = true;
+                    inverse = true;
+                }
+            }
+            if (!hit) {
                 continue;
+            }
+            if (g_draw.analyze_dump && g_dump_lines < 1500) {
+                LOG_INFO(Render_Vulkan,
+                         "[BB_ANALYZE]   camera candidate in cb {:#x}+{:#x} ({} layout{}): "
+                         "{:.4g} {:.4g} {:.4g} {:.4g} / {:.4g} {:.4g} {:.4g} {:.4g} / {:.4g} "
+                         "{:.4g} {:.4g} {:.4g} / {:.4g} {:.4g} {:.4g} {:.4g}",
+                         reinterpret_cast<uintptr_t>(data), at * 4, layout == 0 ? "row" : "column",
+                         inverse ? ", inverse" : "", m.m[0], m.m[1], m.m[2], m.m[3], m.m[4],
+                         m.m[5], m.m[6], m.m[7], m.m[8], m.m[9], m.m[10], m.m[11], m.m[12],
+                         m.m[13], m.m[14], m.m[15]);
+                ++g_dump_lines;
             }
             if (!counted_draw) {
                 ++f.scanned;
+                f.scanned_draw = draw;
                 counted_draw = true;
             }
             auto it = std::find_if(f.camera.begin(), f.camera.end(), [&](const Candidate& c) {
@@ -770,6 +825,7 @@ void OnVertexConstants(const void* data, size_t size) {
     }
     if (!counted_draw) {
         ++f.scanned;
+        f.scanned_draw = draw;
     }
 }
 
@@ -779,7 +835,7 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     }
     std::scoped_lock lk{g_mutex};
     auto& f = g_frame;
-    if (g_draw.analyze_dump && g_dump_lines < 600) {
+    if (g_draw.analyze_dump && g_dump_lines < 1500) {
         LOG_INFO(Render_Vulkan, "[BB_ANALYZE]   samples {:#x} {}x{} {}{}{}", addr, width, height,
                  vk::to_string(format), addr == f.scene_color ? " [SCENE COLOUR]" : "",
                  addr == f.gb_depth ? " [SCENE DEPTH]" : "");
@@ -944,7 +1000,15 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         g_learned.scene_color = f.scene_color;
         if (f.comp_src != 0) g_learned.comp_src = f.comp_src;
         if (src_before == LearnedSource()) {
-            g_learned.skip = f.last_write_after;
+            // The largest over the last 240 frames: a frame with one more write than usual must
+            // not have its upscale before that write.
+            if (f.last_write_after >= g_learned.skip) {
+                g_learned.skip = f.last_write_after;
+                g_learned.skip_age = 0;
+            } else if (++g_learned.skip_age > 240) {
+                g_learned.skip = f.last_write_after;
+                g_learned.skip_age = 0;
+            }
         } else {
             g_learned.skip = 0;
         }
@@ -998,9 +1062,16 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         LOG_INFO(Render_Vulkan,
                  "[BB_UPSCALE] frame {}: HUD separation: draws into the presented image {}, HUD "
                  "draws after the upscale {} (never upscaled), upscale source drawn into after "
-                 "the upscale {} (should stay 0), HUD-less copies {}, camera found in {}/{} frames",
+                 "the upscale {} (should stay 0), HUD-less copies {}, camera found in {}/{} frames "
+                 "(this frame: {} draws scanned, {} matrix candidates, best seen {} times)",
                  g_frame_no, g_stats.flip_draws, g_stats.hud_draws, g_stats.src_rewrites,
-                 g_stats.hudless, g_stats.camera_frames, g_stats.frames);
+                 g_stats.hudless, g_stats.camera_frames, g_stats.frames, f.scanned,
+                 f.camera.size(),
+                 f.camera.empty() ? 0u
+                                  : std::max_element(f.camera.begin(), f.camera.end(),
+                                                     [](const Candidate& a, const Candidate& b) {
+                                                         return a.count < b.count;
+                                                     })->count);
         if (Active() && scene && (g_learned.render_w == g_output_w) && ratio > 1.01) {
             LOG_INFO(Render_Vulkan,
                      "[BB_UPSCALE] the game renders its 3D at the output size {}x{}: {} runs as "
@@ -1027,6 +1098,9 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     ++g_frame_no;
     g_dump_frame = AnalyzeOn() && (g_frame_no % 1800 == 900);
     g_dump_lines = 0;
+    g_dump_cbs = 0;
+    g_dump_last.clear();
+    g_dump_repeats = 0;
     g_frame = {};
     g_draw = {};
 }

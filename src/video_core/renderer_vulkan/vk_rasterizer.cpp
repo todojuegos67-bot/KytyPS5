@@ -826,7 +826,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
-                if (stage.sw_stage == Shader::SwStage::Vertex && !desc.is_written &&
+                if ((stage.sw_stage == Shader::SwStage::Vertex ||
+                     stage.sw_stage == Shader::SwStage::Fragment) &&
+                    !desc.is_written &&
                     BB::Upscale::WantCameraScan() &&
                     memory->IsValidGpuMapping(vsharp.base_address, size)) {
                     BB::Upscale::OnVertexConstants(
