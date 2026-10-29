@@ -422,8 +422,11 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 						ImGui::SetScrollHereY(0.5f);
 					}
 				}
-				// Keyboard / D-pad moving the selection past the visible edge scrolls the list with it.
-				if (ImGui::IsItemFocused() && !ImGui::IsWindowAppearing() && !ImGui::IsItemVisible()) ImGui::SetScrollHereY(0.5f);
+				// (10-29b) Keyboard / D-pad moving the selection past the visible edge scrolls the list with it, only on the
+				// frame the nav focus moved here from a nav input: never from the wheel, the scrollbar or mouse hover.
+				if (!ImGui::IsWindowAppearing() && ImGui::GetCurrentContext()->NavJustMovedToId == ImGui::GetItemID() &&
+				    !ImGui::GetIO().MouseDown[0] && !ImGui::IsItemVisible())
+					ImGui::SetScrollHereY(0.5f);
 				ImGui::PopID();
 			}
 			ImGui::EndPopup();
