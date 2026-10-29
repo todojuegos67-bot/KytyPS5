@@ -433,6 +433,12 @@ void Log(int level, bool flare, bool have_gbuf) {
 	            static_cast<unsigned long long>(g_tc.hw_skipped), g_tc.hw_why != nullptr ? g_tc.hw_why : "-");
 	std::fflush(stdout);
 	g_tc.hw_frames = g_tc.hw_skipped = 0;
+	// (local-1029) the light's reach: distance from each lit sampled pixel to its strongest light
+	std::printf("TORCH: local: lights %.2f a frame, lit radius mean %.2f m, max %.2f m (last frame), %.2f %% of the lit pixels beyond 4 m, "
+	            "%.2f %% of the sampled pixels rejected as self / player\n",
+	            d[2] / fr, d[5] > 0 ? d[13] / 100.0 / d[5] : 0.0, cur[14] / 100.0, d[5] > 0 ? 100.0 * d[15] / d[5] : 0.0,
+	            d[4] > 0 ? 100.0 * d[12] / d[4] : 0.0);
+	std::fflush(stdout);
 }
 
 void ReplaceColor(UpscaleInputs& inputs, const Img& img) {
@@ -689,7 +695,8 @@ bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.depth_map[0] = m[10], push.depth_map[1] = m[14], push.depth_map[2] = m[11], push.depth_map[3] = m[15];
 	push.size[0] = static_cast<float>(color.extent.width), push.size[1] = static_cast<float>(color.extent.height);
 	push.size[2] = lstr, push.size[3] = 1.2f * lstr; // (the added-luminance soft cap, exposed)
-	push.light[0] = EnvFloat("KYTY_TORCH_RANGE", 1.0f, 0.3f, 3.0f), push.light[1] = 0.05f, push.light[2] = static_cast<float>(steps);
+	push.light[0] = EnvFloat("KYTY_TORCH_RADIUS", 4.5f, 1.5f, 8.0f) * EnvFloat("KYTY_TORCH_RANGE", 1.0f, 0.3f, 3.0f), // (local-1029: the hard world cutoff, m)
+	 push.light[1] = 0.05f, push.light[2] = static_cast<float>(steps);
 	push.light[3] = 130.0f;
 	push.flare[0] = fstr, push.flare[1] = static_cast<float>(color.extent.width) / static_cast<float>(color.extent.height);
 	static const auto t0 = now;
