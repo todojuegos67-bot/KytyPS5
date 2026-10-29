@@ -631,6 +631,15 @@ void PreInstance() {
                 SetEnvironmentVariableA(var, "1");
             }
         }
+        // RTSS's implicit Vulkan layer makes the driver's vkCreateDevice fail when
+        // VK_NVX_binary_import (which DLSS needs) is enabled (owner's dry runs, 10-30): off unless
+        // BB_DLSS_KEEP_RTSS=1.
+        if (Env("BB_DLSS_KEEP_RTSS") == nullptr && Env("DISABLE_RTSS_LAYER") == nullptr) {
+            _putenv_s("DISABLE_RTSS_LAYER", "1");
+            SetEnvironmentVariableA("DISABLE_RTSS_LAYER", "1");
+            Checkpoint("DLSS: DISABLE_RTSS_LAYER=1 (RTSS's Vulkan layer breaks device creation with "
+                       "VK_NVX_binary_import; BB_DLSS_KEEP_RTSS=1 keeps it)");
+        }
         if (Env("VK_LOADER_LAYERS_DISABLE") == nullptr) {
             _putenv_s("VK_LOADER_LAYERS_DISABLE", "VK_LAYER_OBS_HOOK");
             SetEnvironmentVariableA("VK_LOADER_LAYERS_DISABLE", "VK_LAYER_OBS_HOOK");
@@ -941,6 +950,50 @@ void DryRunDevice(VkInstance instance, VkPhysicalDevice physical, const VkDevice
             if (j != i) without.push_back(added[j]);
         }
         attempt(without, fmt::format("with Streamline's extensions but {}", added[i]));
+    }
+    // The same on a throwaway instance made without RTSS's layer (when the real one has it).
+    if (Env("DISABLE_RTSS_LAYER") == nullptr) {
+        _putenv_s("DISABLE_RTSS_LAYER", "1");
+        SetEnvironmentVariableA("DISABLE_RTSS_LAYER", "1");
+        const auto create_instance =
+            reinterpret_cast<PFN_vkCreateInstance>(gipa(nullptr, "vkCreateInstance"));
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        app.apiVersion = VK_API_VERSION_1_3;
+        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        ici.pApplicationInfo = &app;
+        VkInstance inst = VK_NULL_HANDLE;
+        if (create_instance != nullptr && create_instance(&ici, nullptr, &inst) == VK_SUCCESS) {
+            const auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+                gipa(inst, "vkEnumeratePhysicalDevices"));
+            const auto destroy_instance =
+                reinterpret_cast<PFN_vkDestroyInstance>(gipa(inst, "vkDestroyInstance"));
+            uint32_t n = 1;
+            VkPhysicalDevice pd = VK_NULL_HANDLE;
+            enumerate(inst, &n, &pd);
+            if (pd != VK_NULL_HANDLE) {
+                const auto create2 = reinterpret_cast<PFN_vkCreateDevice>(gipa(inst, "vkCreateDevice"));
+                const auto destroy2 = reinterpret_cast<PFN_vkDestroyDevice>(gipa(inst, "vkDestroyDevice"));
+                Try t{create2, destroy2, pd, *info, VK_ERROR_UNKNOWN};
+                t.ci.enabledExtensionCount = static_cast<uint32_t>(all.size());
+                t.ci.ppEnabledExtensionNames = all.data();
+                std::string fault;
+                const bool ok = GuardedCall(
+                    [](void* p) {
+                        auto* x = static_cast<Try*>(p);
+                        VkDevice d = VK_NULL_HANDLE;
+                        x->result = x->create(x->physical, &x->ci, nullptr, &d);
+                        if (x->result == VK_SUCCESS && d != VK_NULL_HANDLE) x->destroy(d, nullptr);
+                    },
+                    &t, fault);
+                Checkpoint(fmt::format("DLSS dry run (system loader, new instance WITHOUT the RTSS "
+                                       "layer) with Streamline's extensions: {}",
+                                       ok ? vk::to_string(static_cast<vk::Result>(t.result))
+                                          : "CRASH " + fault));
+            }
+            destroy_instance(inst, nullptr);
+        }
+        _putenv_s("DISABLE_RTSS_LAYER", "");
+        SetEnvironmentVariableA("DISABLE_RTSS_LAYER", nullptr);
     }
     for (std::size_t i = 0; i < base.size(); ++i) {
         auto without = all;
