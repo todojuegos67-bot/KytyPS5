@@ -18,6 +18,9 @@ namespace Libs::Graphics::FrameGen {
 bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs);
 // In Upscale, last (after the god rays): the lens flare from the lights TorchApply tracked this frame.
 bool TorchFlareApply(vk::CommandBuffer command, UpscaleInputs& inputs);
+// (ds-ptao-1029) Read only, for the path-traced shadows of rt-ao.cpp: the GPU buffer holding the tracked lights (8 slots x 4
+// vec4 at byte `offset`: [0] uv, view z, fade; [3] view position, power), as TorchApply left it (the last frame's). False: none.
+bool TorchLightsBuffer(vk::Buffer& buffer, vk::DeviceSize& offset);
 
 } // namespace Libs::Graphics::FrameGen
 
