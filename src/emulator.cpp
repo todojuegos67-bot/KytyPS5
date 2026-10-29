@@ -439,6 +439,40 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                                                           : "shad_log.txt",
                         append_log);
 
+    // Game layout report. Overlay discovery is done by MntPoints::Mount (same as upstream):
+    // /app0 = <base>-mods (if present) over <base>-UPDATE or <base>-patch over <base>.
+    {
+        const auto u8 = [](const std::filesystem::path& p) {
+            return Common::FS::PathToUTF8String(p);
+        };
+        std::error_code ec;
+        LOG_INFO(Loader, "[GameLayout] base path: {}", u8(game_folder));
+        auto update_path = FileSys::OverlayPath(game_folder, "-UPDATE");
+        if (!std::filesystem::exists(update_path, ec)) {
+            update_path = FileSys::OverlayPath(game_folder, "-patch");
+        }
+        if (FileSys::MntPoints::ignore_game_patches) {
+            LOG_INFO(Loader, "[GameLayout] update: ignored (--ignore-game-patch)");
+        } else if (std::filesystem::exists(update_path, ec)) {
+            const bool has_sfo =
+                std::filesystem::exists(update_path / "sce_sys" / "param.sfo", ec);
+            LOG_INFO(Loader, "[GameLayout] update path: {} (param.sfo from update: {})",
+                     u8(update_path), has_sfo);
+        } else {
+            LOG_INFO(Loader, "[GameLayout] update: none (looked for {}-UPDATE / -patch)",
+                     u8(game_folder));
+        }
+        const auto mods_path = FileSys::OverlayPath(game_folder, "-mods");
+        if (std::filesystem::exists(mods_path, ec)) {
+            LOG_INFO(Loader, "[GameLayout] mods path: {}", u8(mods_path));
+        } else {
+            LOG_INFO(Loader, "[GameLayout] mods: none (looked for {})", u8(mods_path));
+        }
+        LOG_INFO(Loader, "[GameLayout] final title id: {} app version: {}", id, app_version);
+        LOG_INFO(Loader, "[GameLayout] savedata dir: {}",
+                 u8(EmulatorSettings.GetHomeDir() / "<user_id>" / "savedata" / id));
+    }
+
     auto guest_eboot_path = "/app0/" + eboot_name.generic_string();
 
     auto& game_info = Common::ElfInfo::Instance();
