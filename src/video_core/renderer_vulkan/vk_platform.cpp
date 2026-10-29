@@ -13,6 +13,7 @@
 #define VK_USE_PLATFORM_XLIB_KHR
 #endif
 
+#include <filesystem>
 #include <vector>
 #include <fmt/ranges.h>
 
@@ -22,6 +23,7 @@
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/bb/bb_upscale.h"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -270,7 +272,18 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
 #endif
 
-    static vk::detail::DynamicLoader dl;
+    BB::Upscale::PreInstance();
+    static vk::detail::DynamicLoader dl = [] {
+#ifdef _WIN32
+        if (const wchar_t* loader = BB::Upscale::VulkanLoaderOverride()) {
+            // DLSS: Streamline's interposer is the Vulkan loader (it hooks instance and device
+            // creation for its plugins).
+            const std::filesystem::path path{loader};
+            return vk::detail::DynamicLoader(path.string());
+        }
+#endif
+        return vk::detail::DynamicLoader();
+    }();
     VULKAN_HPP_DEFAULT_DISPATCHER.init(
         dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
 

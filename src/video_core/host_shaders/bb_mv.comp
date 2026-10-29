@@ -1,0 +1,47 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Camera motion vectors from the scene depth (BB upscaling, bb_upscale.h): each pixel's surface
+// point, unprojected with this frame's guest viewport and moved into the previous frame's clip space
+// (clip_to_prev = prevViewProj * inverse(viewProj)), gives render pixels towards its previous
+// position. Unjittered: the jitter the scene was rasterised with is taken out first. Static geometry
+// only (Bloodborne has no per-object motion vectors).
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth_tex;
+layout(binding = 1, rg16f) uniform writeonly image2D mv_out;
+layout(push_constant) uniform Push {
+    vec4 r0;
+    vec4 r1;
+    vec4 r2;
+    vec4 r3;
+    vec4 vp_xy; // xscale, xoffset, yscale, yoffset
+    vec4 vp_z;  // zscale, zoffset, jitter x, jitter y
+    uvec4 size; // width, height, valid, 0
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= int(p.size.x) || c.y >= int(p.size.y)) {
+        return;
+    }
+    if (p.size.z == 0u) {
+        imageStore(mv_out, c, vec4(0.0));
+        return;
+    }
+    float d = texelFetch(depth_tex, c, 0).r;
+    vec2 s = vec2(c) + 0.5 - p.vp_z.zw;
+    vec4 ndc = vec4((s.x - p.vp_xy.y) / p.vp_xy.x, (s.y - p.vp_xy.w) / p.vp_xy.z,
+                    (d - p.vp_z.y) / p.vp_z.x, 1.0);
+    vec4 prev = vec4(dot(p.r0, ndc), dot(p.r1, ndc), dot(p.r2, ndc), dot(p.r3, ndc));
+    if (abs(prev.w) < 1e-6) {
+        imageStore(mv_out, c, vec4(0.0));
+        return;
+    }
+    prev.xy /= prev.w;
+    vec2 ps = vec2(prev.x * p.vp_xy.x + p.vp_xy.y, prev.y * p.vp_xy.z + p.vp_xy.w);
+    vec2 mv = ps - s;
+    if (any(isnan(mv)) || any(isinf(mv))) {
+        mv = vec2(0.0);
+    }
+    imageStore(mv_out, c, vec4(mv, 0.0, 0.0));
+}

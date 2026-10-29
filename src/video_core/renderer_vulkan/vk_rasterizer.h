@@ -132,6 +132,13 @@ private:
     bool IsComputeImageCopy(const Pipeline* pipeline);
     bool IsComputeImageClear(const Pipeline* pipeline);
 
+    // Bloodborne upscaling (video_core/bb/bb_upscale.h, vk_rasterizer_bb.cpp).
+    bool BBInject(VideoCore::ImageId color_id, vk::ImageView& out_view,
+                  vk::ImageLayout& out_layout);
+    bool BBUpscaledView(vk::ImageView& out_view, vk::ImageLayout& out_layout) const;
+    void BBHudlessCopy(VideoCore::Image& flip);
+    void BBOnDraw(u32 num_cb);
+
 private:
     friend class VideoCore::BufferCache;
 
@@ -175,6 +182,10 @@ private:
 
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+
+    VideoCore::TextureCache::ImageDesc bb_gb_depth_desc{};
+    bool bb_gb_depth_valid{};
+    u32 bb_gb_mrt{};
 };
 
 } // namespace Vulkan

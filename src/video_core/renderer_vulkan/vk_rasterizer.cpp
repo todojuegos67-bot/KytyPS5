@@ -3,6 +3,7 @@
 
 #include "common/debug.h"
 #include "video_core/bb/bb_analyze.h"
+#include "video_core/bb/bb_upscale.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -142,6 +143,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     } else {
         db_desc.image_id = {};
     }
+    BBOnDraw(std::bit_width(key.mrt_mask));
 }
 
 static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader::Info& info,
@@ -319,6 +321,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
+    BB::Upscale::OnDispatch();
 
     scheduler.PopPendingOperations();
 
@@ -354,6 +357,7 @@ void Rasterizer::DispatchDirect() {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
+    BB::Upscale::OnDispatch();
 
     scheduler.PopPendingOperations();
 
@@ -822,6 +826,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
+                if (stage.sw_stage == Shader::SwStage::Vertex && !desc.is_written &&
+                    BB::Upscale::WantCameraScan() &&
+                    memory->IsValidGpuMapping(vsharp.base_address, size)) {
+                    BB::Upscale::OnVertexConstants(
+                        reinterpret_cast<const void*>(vsharp.base_address), size);
+                }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
@@ -966,8 +976,25 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
-            image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
-                                     image.backing->state.layout);
+            vk::ImageView bb_view = *image_view.image_view;
+            vk::ImageLayout bb_layout = image.backing->state.layout;
+            if (!is_storage && !image.info.props.is_depth &&
+                (BB::Upscale::Enabled() || BB::Analyze::Enabled())) {
+                switch (BB::Upscale::OnSample(image.info.guest_address, image.info.size.width,
+                                              image.info.size.height, image.info.pixel_format)) {
+                case BB::Upscale::Sample::Inject: {
+                    const bool ok = BBInject(image_id, bb_view, bb_layout);
+                    BB::Upscale::OnInjected(ok, 0.0f);
+                    break;
+                }
+                case BB::Upscale::Sample::Redirect:
+                    BBUpscaledView(bb_view, bb_layout);
+                    break;
+                default:
+                    break;
+                }
+            }
+            image_infos.emplace_back(VK_NULL_HANDLE, bb_view, bb_layout);
         }
     }
 
@@ -1018,6 +1045,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    if (BB::Upscale::Enabled() && BB::Upscale::WantHudlessCopy() && cb_descs[0].image_id) {
+        BBHudlessCopy(texture_cache.GetImage(cb_descs[0].image_id));
+    }
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
@@ -1368,6 +1398,8 @@ void Rasterizer::UpdateViewportScissorState() const {
     }
 
     const auto& vp_ctl = regs.viewport_control;
+    float bb_jitter_x = 0.0f, bb_jitter_y = 0.0f;
+    const bool bb_jitter = BB::Upscale::Jitter(bb_jitter_x, bb_jitter_y);
     for (u32 i = 0; i < AmdGpu::NUM_VIEWPORTS; i++) {
         const auto& vp = regs.viewports[i];
         const auto& vp_d = regs.viewport_depths[i];
@@ -1416,6 +1448,10 @@ void Rasterizer::UpdateViewportScissorState() const {
             viewport.y = yoffset - yscale;
             viewport.width = xscale * 2.0f;
             viewport.height = yscale * 2.0f;
+            if (bb_jitter) {
+                viewport.x += bb_jitter_x;
+                viewport.y += bb_jitter_y;
+            }
         }
 
         viewports.push_back(viewport);

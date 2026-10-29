@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "video_core/bb/bb_analyze.h"
+#include "video_core/bb/bb_upscale.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -673,6 +674,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         const auto& bb_img = texture_cache.GetImage(image_id);
         BB::Analyze::OnPresent(bb_img.info.size.width, bb_img.info.size.height,
                                bb_img.info.pixel_format, cpu_address);
+    }
+    if (BB::Upscale::Enabled() || BB::Analyze::Enabled()) {
+        const auto& bb_img = texture_cache.GetImage(image_id);
+        BB::Upscale::OnFlip(cpu_address, bb_img.info.size.width, bb_img.info.size.height);
     }
 
     Frame* frame = GetRenderFrame();
