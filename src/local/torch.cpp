@@ -618,6 +618,13 @@ bool TorchFlareWanted() {
 	return on;
 }
 
+bool TorchLightsBuffer(vk::Buffer& buffer, vk::DeviceSize& offset) {
+	if (TorchLevel() <= 0 || g_tc.frame_buf == VK_NULL_HANDLE || g_tc.frame == 0) return false;
+	buffer = vk::Buffer(g_tc.frame_buf);
+	offset = 32 * 4;
+	return true;
+}
+
 bool TorchApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const int  level = TorchLevel();
 	const bool flare = TorchFlareWanted();

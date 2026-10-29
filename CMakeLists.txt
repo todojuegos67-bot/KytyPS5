@@ -454,6 +454,20 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${rt_ao_header}")
+# (ds-ptao-1029) the path-traced build of the same shader (ray queries into the KYTY_HWRT TLAS).
+set(rt_ao_hw_spv "${gpu_tiler_generated_dir}/rt_ao_hw.spv")
+set(rt_ao_hw_header "${gpu_tiler_generated_dir}/rt_ao_hw_spv.h")
+add_custom_command(
+	OUTPUT "${rt_ao_hw_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_AO_HW
+	        -o "${rt_ao_hw_spv}" "${rt_ao_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_ao_hw_spv} -DOUTPUT=${rt_ao_hw_header}
+	        -DSYMBOL=RT_AO_HW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rt_ao_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rt_ao_hw_header}")
 
 # KYTY_DOF (ds-dof-1029): the distance depth of field (src/local/dof.cpp).
 set(dof_source "${KYTY_SOURCE_DIR}/local/dof.comp")

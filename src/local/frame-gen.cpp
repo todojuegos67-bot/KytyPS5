@@ -9469,7 +9469,7 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	global(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	       vk::AccessFlagBits2::eMemoryRead);
-	if (RtContactLevel() > 0 || RtCapture::Enabled()) { // (KYTY_RT_CAPTURE reads the sun from it too) (KYTY_HWRT_CONTACT: rt-contact.cpp; the sun, R and this pass's final visibility)
+	if (RtContactLevel() > 0 || RtCapture::Enabled() || RtAoLevel() > 0) { // (ds-ptao-1029: the path-traced AO's sun shadow rays) (KYTY_RT_CAPTURE reads the sun from it too) (KYTY_HWRT_CONTACT: rt-contact.cpp; the sun, R and this pass's final visibility)
 		double r = 1.5;
 		if (sun_mode && g_rs.buf_mapped != nullptr) r = reinterpret_cast<const float*>(g_rs.buf_mapped + sun_slot * kRtSunSlotBytes)[2];
 		else if (g_cs.log_k >= 0.0) r = std::max(std::exp2(g_cs.log_k) - 1.0, 0.0) / 0.75;
