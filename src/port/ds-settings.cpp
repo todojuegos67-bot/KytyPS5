@@ -204,9 +204,12 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("carpeta_juego", s->game);
 	num("idioma", s->language);
 	num("idioma_juego", s->language);
-	for (const char* k: {"idioma", "idioma_juego"})
-		if (auto it = v.find(k); it != v.end() && !it->second.empty()) s->game_language_set = true;
-	str("idioma_menu", s->menu_language);
+	// (ds-pc-port9) The languages follow Windows' unless chosen in the launcher: idioma_interfaz (empty: Windows' UI
+	// language, read at each start) and idioma_juego_elegido=1 (else the game's follows the interface's). The older
+	// idioma_menu was written with the detected language at every start, so it is not read any more.
+	boo("idioma_juego_elegido", s->game_language_set);
+	str("idioma_interfaz", s->menu_language);
+	if (s->menu_language == "auto") s->menu_language.clear();
 	boo("copia_partidas", s->backup_saves);
 	boo("continuar_f1", s->continue_f1);
 	boo("pantalla_completa", s->fullscreen);
@@ -303,8 +306,17 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	clamp_level(s->ao, 3);
 	if (s->smoke != "0" && s->smoke != "1" && s->smoke != "2") s->smoke = "2"; // (ds-particles-1029) default Antorchas
 	clamp_level(s->torch, 4);
-	// (10-28) No presets or modes any more: an old modo_souls is dropped (its graphics stay as saved).
-	s->souls_mode = "ninguno";
+	// (ds-pc-port9) The Modos Souls are back (Launcher-souls.ps1's): an unknown modo_souls is none.
+	{
+		bool known = false;
+		for (int i = 0; i < kSoulsModeCount; i++) known = known || s->souls_mode == kSoulsModes[i].id;
+		if (!known) s->souls_mode = "ninguno";
+	}
+	// (ds-pc-port9) Path tracing, Sombras RT and the 16 GB RAM / 8 GB GPU simulations are gone: always off.
+	s->ao             = "0";
+	s->rt_shadows     = "0";
+	s->simulate_ram16 = false;
+	s->simulate_vram8 = false;
 	return true;
 }
 
@@ -319,8 +331,10 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Idioma de la consola: 3 espanol (Espana), 20 espanol (Latinoamerica), 1 ingles (EE. UU.), 18 ingles (R. U.)\n"
 	  << "; Idioma del juego (consola PS5: 3 espanol, 20 espanol latino, 1 ingles EE. UU., 18 ingles RU, 2 frances, 4 aleman, 5 italiano, 7 portugues, 17 portugues Brasil, 0 japones, 11 chino simplificado)\n"
 	  << "idioma_juego=" << s.language << "\n"
-	  << "; Idioma de los menus: es, en, pt, fr, it, de\n"
-	  << "idioma_menu=" << s.menu_language << "\n"
+	  << "; 1: idioma_juego elegido en el lanzador; 0: el del juego sigue al de la interfaz\n"
+	  << "idioma_juego_elegido=" << b(s.game_language_set) << "\n"
+	  << "; Idioma del lanzador y de los textos del port: es, en, pt, fr, it, de (vacio: el de Windows)\n"
+	  << "idioma_interfaz=" << s.menu_language << "\n"
 	  << "; Copia de seguridad de _SaveData en _SaveData-copias antes de jugar\n"
 	  << "copia_partidas=" << b(s.backup_saves) << "\n"
 	  << "; En el juego F1 (o R3 + OPTIONS) guarda y cierra; 1: JUGAR pasa solo el titulo y continua donde se pulso F1\n"
@@ -716,10 +730,12 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (The engine has no sun-fix yet: Luz volumetrica and Sombras sol stay exclusive, the menu turns the other off.)
 	// (10-28, ds-shadow-1028) Sombras RT (screen-space, cshadow.comp; never hardware RT): level 1 / 2 / 3 at strength 0.35 /
 	// 0.5 / 0.7, without the cascade mode or the TLAS. With Luz volumetrica and no Sombras RT the pass runs at strength 0.
-	sets.emplace_back("KYTY_AO", !s.pure_game && (s.ao == "1" || s.ao == "2" || s.ao == "3") ? s.ao : "0"); // (ao-1028)
+	// (ds-pc-port9) Path tracing (KYTY_AO + KYTY_AO_HW) and Sombras RT are retired (they looked bad): always off.
+	const bool ao_on = false;
+	sets.emplace_back("KYTY_AO", "0"); // (ao-1028)
 	// (ds-ptao-1029, the launcher's "Path tracing") the hardware scene (TLAS) for the AO's rays; without hardware RT the
 	// screen-space AO stays. The other hardware passes off without rt_experimental.
-	if (!s.pure_game && (s.ao == "1" || s.ao == "2" || s.ao == "3")) {
+	if (ao_on) {
 		sets.emplace_back("KYTY_AO_HW", "1");
 		sets.emplace_back("KYTY_RT_HW_EXPERIMENTAL", "1");
 		sets.emplace_back("KYTY_HWRT", "1");
@@ -729,7 +745,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 				sets.emplace_back(k, "0");
 	}
 	const bool godrays = !s.pure_game && (s.godrays == "1" || s.godrays == "2" || s.godrays == "3");
-	const bool shadows = !s.pure_game && (s.rt_shadows == "1" || s.rt_shadows == "2" || s.rt_shadows == "3");
+	const bool shadows = false; // (ds-pc-port9) Sombras RT retired
 	if (godrays) sets.emplace_back("KYTY_GODRAYS", s.godrays);
 	if (shadows) {
 		static const char* strength[] = {"0", "0.35", "0.5", "0.7"};

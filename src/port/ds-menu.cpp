@@ -1662,7 +1662,8 @@ std::string    g_steam_text;
 std::mutex     g_steam_mutex;
 std::atomic<bool> g_steam_busy {false};
 
-const ImVec4 kInkL {0.925f, 0.91f, 0.88f, 1.0f};
+const ImVec4 kInkL {0.97f, 0.96f, 0.93f, 1.0f};
+const ImVec4 kDimL {0.86f, 0.84f, 0.80f, 1.0f}; // (ds-pc-port9) secondary text, still high contrast
 const ImVec4 kGoldL {0.87f, 0.77f, 0.55f, 1.0f};
 
 struct LBox {
@@ -1745,18 +1746,10 @@ void BoxEnd() {
 	if (g_lbox.card) {
 		dl->AddRectFilledMultiColor(g_lbox.at, end, IM_COL32(30, 26, 20, 215), IM_COL32(20, 19, 19, 215), IM_COL32(12, 13, 18, 215),
 		                            IM_COL32(22, 20, 19, 215));
-		if (g_knight != nullptr && g_knight_h > 0) {
-			// The knight inside the card, bottom right, its sword towards the text (at most the card's height - 12).
-			const float ch = end.y - g_lbox.at.y;
-			const float k  = std::min({1.0f * g_unit, (ch - U(12)) / g_knight_h, g_lbox.w * 0.62f / g_knight_w});
-			const float kw = g_knight_w * k, kh = g_knight_h * k;
-			dl->AddImage(g_knight->GetTexRef(), {end.x - kw - U(6), end.y - kh - U(6)}, {end.x - U(6), end.y - U(6)}, {0, 0}, {1, 1},
-			             IM_COL32(255, 255, 255, 235));
-		}
 		dl->AddRect(g_lbox.at, end, IM_COL32(222, 196, 140, 150), U(14), 0, 1.5f);
 	} else {
-		dl->AddRectFilled(g_lbox.at, end, IM_COL32(10, 12, 17, 175), U(5));
-		dl->AddRect(g_lbox.at, end, IM_COL32(222, 196, 140, 70), U(5), 0, 1.0f);
+		dl->AddRectFilled(g_lbox.at, end, IM_COL32(9, 11, 15, 235), U(5));
+		dl->AddRect(g_lbox.at, end, IM_COL32(222, 196, 140, 95), U(5), 0, 1.0f);
 	}
 	dl->ChannelsMerge();
 	g_lbox.open = false;
@@ -1814,7 +1807,7 @@ bool Field(const char* id, float y, int count, int& current, const std::function
 }
 
 template <typename Item, typename Id, typename Text>
-bool LRow(const char* label, int count, const Item* items, std::string& value, Id id, Text text, const char* tip, float fx = 124,
+bool LRow(const char* label, int count, const Item* items, std::string& value, Id id, Text text, const char* tip, float fx = 146,
           float fw = 282, bool brand = false, float lx = 10) {
 	const float y = RowY();
 	if (label != nullptr && *label != '\0' && fx > lx + 40) Label(y, label, tip, lx);
@@ -1828,7 +1821,7 @@ bool LRow(const char* label, int count, const Item* items, std::string& value, I
 	return ch;
 }
 
-bool LChoice(const char* label, const Choice* items, int count, std::string& value, const char* tip, float fx = 124, float fw = 282) {
+bool LChoice(const char* label, const Choice* items, int count, std::string& value, const char* tip, float fx = 146, float fw = 260) {
 	return LRow(label, count, items, value, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; }, tip, fx, fw);
 }
 
@@ -1933,7 +1926,7 @@ void LauncherImage(Settings& s) {
 		const std::function<const char*(int)> list = [&](int i) -> const char* { return res[static_cast<size_t>(i)].label; };
 		if (Field("Resolución", y, static_cast<int>(res.size()), current, list,
 		          "Resolución de salida: la de Windows (Escritorio) u otra (el monitor cambia a ella mientras juegas). Los reescaladores calculan su resolución sobre ella. En ventana: el tamaño de la ventana.",
-		          124, 140)) {
+		          146, 260)) {
 			value = res[static_cast<size_t>(current)].id;
 			if (s.fullscreen) {
 				s.resolution = value;
@@ -1945,12 +1938,15 @@ void LauncherImage(Settings& s) {
 			SetQualityForOutput(&s, OutputHeight(s, g_rt.pc));
 		}
 		// (10-29) The game's mode that is applied, next to it.
-		ImGui::SetCursorScreenPos({g_lbox.at.x + U(272), y + U(6)});
-		ImGui::PushFont(g_font_body, U(14));
+		RowEnd(y);
+		// (The game mode that is applied, under it.)
+		const float my = RowY();
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(148), my});
+		ImGui::PushFont(g_font_semi, U(14));
 		ImGui::TextColored(kGoldL, "%s", I18n::T(OutputHeight(s, g_rt.pc) >= 2160 ? "Cinemático sin tope 30" : "Modo rendimiento"));
 		ImGui::PopFont();
 		Tip("4K: el modo rendimiento del juego (cinemáticas sin el tope de 30) con la calidad cinemática: iluminación completa y teselado denso. Otras resoluciones: modo rendimiento.");
-		RowEnd(y);
+		RowEnd(my, 22);
 	}
 	{
 		static std::vector<ResMode> shown;
@@ -1964,7 +1960,7 @@ void LauncherImage(Settings& s) {
 		LRow("Reescalado", static_cast<int>(shown.size()), shown.data(), s.res, [](const ResMode& m) { return m.id; },
 		     [](const ResMode& m) { return m.label; },
 		     "Reescalado: dibuja el 3D a menos resolucion y lo sube a la de la pantalla (mas fps). DLSS: NVIDIA RTX. XeSS, FSR 3.1 y FSR 4: todas las graficas (FSR 4: modelo de AMD con INT8, RTX 20 / RX 6000 o mas nuevas; el 3D a 360 lineas como minimo).",
-		     124, 282, true);
+		     146, 260, true);
 	}
 	ImGui::BeginDisabled(!nvidia);
 	LChoice("Preset DLSS", kDlssPresets, kDlssPresetCount, s.dlss_preset,
@@ -2005,14 +2001,14 @@ void LauncherQuality(Settings& s) {
 			const char* tip;
 		};
 		const Post post[] = {{"Desenfoque de movimiento", &s.motion_blur, "Desenfoque de movimiento del juego (Sí = como en PS5)."},
+		                     {"Bloom", &s.bloom, "Resplandor alrededor de las luces fuertes (Sí = como en PS5)."},
 		                     {"Profundidad de campo", &s.dof, "Desenfoque de lo lejano y de lo cercano en escenas (Sí = como en PS5)."},
 		                     {"Viñeta", &s.vignette, "Oscurecimiento de los bordes de la imagen (Sí = como en PS5)."},
-		                     {"Bloom", &s.bloom, "Resplandor alrededor de las luces fuertes (Sí = como en PS5)."},
 		                     {"Adaptación de la vista", &s.eye_adapt, "La exposición se adapta al pasar de zonas oscuras a claras, como el ojo (Sí = como en PS5)."}};
 		for (size_t i = 0; i < std::size(post); i += 2) {
 			const float y = RowY();
 			LCheck(y, post[i].label, *post[i].value, post[i].tip, 10);
-			if (i + 1 < std::size(post)) LCheck(y, post[i + 1].label, *post[i + 1].value, post[i + 1].tip, 216);
+			if (i + 1 < std::size(post)) LCheck(y, post[i + 1].label, *post[i + 1].value, post[i + 1].tip, 270);
 			RowEnd(y, 30);
 		}
 	}
@@ -2033,9 +2029,6 @@ void LauncherRayTracing(Settings& s) {
 	     "Iluminación por rayos sobre la imagen (luz rebotada y sombreado de contacto). Solo funciona con DLSS, XeSS o FSR. Cuesta FPS. Experimental.", fx, fw);
 	LRow("Luz volumétrica", kRtLevelCount, kRtLevels, s.godrays, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms.", fx, fw);
-	LRow("Path tracing", kRtLevelCount, kRtLevels, s.ao, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
-	     "Path tracing (RT por hardware: la escena TLAS de la GPU): rayos por píxel desde cada superficie que dan la oclusión real (también de lo que está fuera de pantalla o detrás de la cámara), un rebote de luz indirecta con el color de lo que tocan y sombras suaves de contacto hacia el sol y las antorchas. Sustituye solo la luz ambiental y a la oclusión del juego. Sin RT por hardware: oclusión de pantalla suave. Solo con DLSS, XeSS o FSR. Bajo 1 rayo a media resolución, Medio 1 rayo, Alto 2 rayos a resolución completa (~1-3 ms).",
-	     fx, fw);
 	LRow("Luz de antorchas RT", kTorchLevelCount, kTorchLevels, s.torch, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Luz de antorchas RT: el fuego de antorchas, braseros y hogueras ilumina paredes, suelos y estructuras cercanas con un rebote cálido que parpadea, y se refleja en superficies lisas o mojadas. No atraviesa paredes ni personajes. Solo en pantalla, sin RT por hardware. Solo con DLSS, XeSS o FSR. Bajo 2 fuegos ~0,3 ms, Medio 4 ~0,5 ms, Alto 8 ~0,9 ms. Híbrido: Alto + rayos por hardware (RT real) donde la pantalla no ve al que tapa la luz; solo oscurece, nunca añade luz. Necesita GPU con RT.",
 	     fx, fw);
@@ -2048,9 +2041,6 @@ void LauncherRayTracing(Settings& s) {
 	}
 	LRow("Humo y partículas", kSmokeLevelCount, kSmokeLevels, s.smoke, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Humo y partículas más realistas sobre las del propio juego: Suave = el humo, la niebla de partículas y las chispas ya no cortan en línea dura donde tocan suelo y paredes (se funden en ~35 cm). Antorchas = además el humo cerca de antorchas y braseros brilla con su luz cálida (radio 4,5 m, sin parpadeo; necesita Luz de antorchas RT). Solo con DLSS, XeSS o FSR. ~0,3-0,6 ms.",
-	     fx, fw);
-	LRow("Sombras RT", kRtLevelCount, kRtLevels, s.rt_shadows, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
-	     "Sombras del sol por rayos sobre la imagen (de pantalla, sin RT real): sombras de contacto que las del juego pierden (bajo brazos, entre piernas, junto a muros), con borde suave y estable. Solo donde el juego ya muestra sol. Solo con DLSS, XeSS o FSR. Bajo ~0,3 ms, Medio ~0,6 ms, Alto ~1 ms.",
 	     fx, fw);
 	ImGui::EndDisabled();
 	LCheckRow("RT por hardware (experimental)", s.rt_hw_exp,
@@ -2097,20 +2087,29 @@ void LauncherFrameGen(Settings& s) {
 	modes.clear();
 	for (const char* id: {"sin-fg", "amd-x2", "amd-x3", "amd-x4", "amd-dinamico", "dlss-x2", "dlss-x3", "dlss-x4", "dlss-dinamico"})
 		if (nvidia || std::strncmp(id, "dlss", 4) != 0) modes.push_back({id, FrameGenLabel(id)});
-	LRow("Frame generation", static_cast<int>(modes.size()), modes.data(), s.framegen, [](const Choice& c) { return c.id; },
-	     [](const Choice& c) { return c.label; }, "AMD: todas las graficas (tambien con reescalado DLSS). DLSS: NVIDIA RTX 40/50. FPS desbloqueados siempre.", 12,
-	     396, true);
-	if (s.framegen.rfind("dlss", 0) == 0) {
+	// (ds-pc-port9) Modo Souls ligero / equilibrado / low profile: AMD x2 fixed and its Anti-Lag Ultra (shown, not changeable).
+	const bool  fixed  = FixedFg(s);
+	std::string locked = "amd-x2", ultra = "ultra";
+	ImGui::BeginDisabled(fixed);
+	LRow("Frame generation", static_cast<int>(modes.size()), modes.data(), fixed ? locked : s.framegen, [](const Choice& c) { return c.id; },
+	     [](const Choice& c) { return c.label; },
+	     fixed ? "Con este Modo Souls la frame generation es fija: AMD x2." : "AMD: todas las graficas (tambien con reescalado DLSS). DLSS: NVIDIA RTX 40/50. FPS desbloqueados siempre.",
+	     12, 396, true);
+	if (fixed) {
+		LChoice("Anti-Lag", g_rt.pc.amd ? kAntiLagAmd : kAntiLagOther, g_rt.pc.amd ? kAntiLagAmdCount : kAntiLagOtherCount, ultra,
+		        "En los modos Souls ligero, equilibrado y low profile va siempre el nuestro en Ultra.", 146, 260);
+	} else if (s.framegen.rfind("dlss", 0) == 0) {
 		LChoice("Anti-Lag", kAntiLagDlssg, kAntiLagDlssgCount, s.antilag_dlssg,
 		        "Con la frame generation de NVIDIA (DLSS-G). Reflex: el de NVIDIA (recomendado). Anti-Lag / Ultra: el nuestro con Reflex apagado, para comparar cual va mejor.",
-		        124, 282);
+		        146, 260);
 	} else if (s.framegen.rfind("amd", 0) == 0) {
 		std::string al = s.antilag_mode == "auto" || s.antilag_mode.empty() ? (g_rt.pc.amd ? "amd2" : "normal") : s.antilag_mode;
 		if (LChoice("Anti-Lag", g_rt.pc.amd ? kAntiLagAmd : kAntiLagOther, g_rt.pc.amd ? kAntiLagAmdCount : kAntiLagOtherCount, al,
 		            "Con la frame generation de AMD. Anti-Lag 2 (AMD): el de serie de las graficas AMD. Anti-Lag: el nuestro, como mucho 2 frames en cola antes de leer el mando. Ultra: 1 (aun menos retraso).",
-		            124, 282))
+		            146, 260))
 			s.antilag_mode = al;
 	}
+	ImGui::EndDisabled();
 	BoxEnd();
 }
 
@@ -2173,19 +2172,16 @@ void LauncherPerformance(Settings& s) {
 		LCheck(y, "Mejoras para equipos de 16 GB de RAM", s.ram16_boost,
 		       "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria). Solo en PCs de 20 GB de RAM o menos. No cambia los gráficos.");
 		ImGui::EndDisabled();
-		ImGui::SetCursorScreenPos({g_lbox.at.x + U(340), y + U(5)});
-		if (!small) ImGui::TextColored(kDim, I18n::T("RAM %d GB"), g_rt.pc.ram_gb);
-		else if (s.ram16_boost) ImGui::TextColored(kGoldL, "%s", I18n::T("RAM justa"));
-		Tip(small ? "RAM justa: perfil seguro. Cierra los navegadores mientras juegas." : "No hacen falta: solo en PCs de 20 GB de RAM o menos.");
+		if (!small) Tip("No hacen falta: solo en PCs de 20 GB de RAM o menos.");
 		RowEnd(y);
+		if (small && s.ram16_boost) {
+			const float ny = RowY();
+			ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), ny});
+			ImGui::TextColored(kGoldL, "%s", I18n::T("RAM justa: perfil seguro. Cierra los navegadores mientras juegas."));
+			RowEnd(ny, 24);
+		}
 	}
 	s.profile16 = LowRam(s, g_rt.pc);
-	{
-		const float y = RowY();
-		LCheck(y, "Simular 16 GB RAM", s.simulate_ram16, "Solo el juego: como mucho 12 GB en RAM (4 GB para Windows), el resto va al disco, como un PC de 16 GB.", 12);
-		LCheck(y, "Simular gráfica de 8 GB", s.simulate_vram8, "El juego solo puede usar 8 GB de VRAM, como una gráfica de 8 GB.", 216);
-		RowEnd(y);
-	}
 	{
 		const float y = RowY();
 		LCheck(y, "Modo GPU seguro", s.safe_gpu, "Para gráficas que se cuelgan o dan pantallazo azul: más estable, ~37% menos FPS.", 12);
@@ -2278,147 +2274,154 @@ void LauncherControls(Settings& s) {
 		const float y = RowY();
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(4)});
 		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
-		ImGui::TextColored(kDim, "%s", I18n::T("En el juego: F1 guardar y salir (o R3 + OPTIONS).  F7: soltar o capturar el ratón.  F8: métricas.  F11 / Alt+Intro: pantalla completa."));
+		ImGui::TextColored(kDimL, "%s", I18n::T("En el juego: F1 guardar y salir (o R3 + OPTIONS).  F7: soltar o capturar el ratón.  F8: métricas.  F11 / Alt+Intro: pantalla completa."));
 		ImGui::PopTextWrapPos();
 		ImGui::Dummy({0, U(4)});
 	}
 	BoxEnd();
 }
 
-void LauncherPcCard() {
-	BoxBegin("TU EQUIPO", 420, true);
-	const auto& pc   = g_rt.pc;
-	const float wrap = g_lbox.at.x + g_lbox.w * 0.70f - ImGui::GetWindowPos().x;
-	const auto  put  = [&](const char* caption, const std::string& value, const ImVec4& color, bool big) {
-        ImGui::SetCursorScreenPos({g_lbox.at.x + U(16), RowY()});
-        ImGui::BeginGroup();
-        ImGui::PushFont(g_font_semi, U(14));
-        ImGui::TextColored(ImVec4 {0.80f, 0.76f, 0.70f, 1.0f}, "%s", I18n::T(caption));
-        ImGui::PopFont();
-        ImGui::PushFont(big ? g_font_semi : g_font_body, U(big ? 17 : 15));
-        ImGui::PushTextWrapPos(wrap);
-        ImGui::TextColored(color, "%s", value.c_str());
-        ImGui::PopTextWrapPos();
-        ImGui::PopFont();
-        ImGui::EndGroup();
-        ImGui::Dummy({0, U(5)});
+// (ds-pc-port9) Modos Souls (Launcher-souls.ps1's group): one at most; choosing one applies its preset (ApplyPreset:
+// the graphics, the upscaler and every ray tracing row to No); unticking it goes back to Maximo.
+void LauncherSoulsModes(Settings& s) {
+	BoxBegin("Modos Souls");
+	struct Mode {
+		const char* id;
+		const char* label;
+		const char* tip;
 	};
-	const ImVec4 red {0.92f, 0.35f, 0.31f, 1.0f};
-	std::string  gpu = pc.gpu.empty() ? std::string(I18n::T("no detectada")) : pc.gpu;
-	if (pc.vram > 0) gpu += "  (" + std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB)";
-	if (!pc.nvidia && !pc.gpu.empty()) gpu += I18n::T("  (sin DLSS: solo NVIDIA)");
-	put("Gráfica", gpu, kInkL, true);
-	put("Procesador y RAM", (pc.cpu.empty() ? std::string("?") : pc.cpu) + "  |  " + std::to_string(pc.ram_gb) + " GB RAM", kInkL, false);
-	if (!pc.recommended.empty()) {
-		put("Modo recomendado", pc.recommended, pc.unsupported ? red : kGoldL, true);
-		put("Esperado (estimación)", pc.expected, pc.unsupported ? red : kInkL, false);
-	} else {
-		put("Modo recomendado", I18n::T("Gráfica sin datos: pulsa Optimizar según tu equipo y mira las métricas."), kInkL, false);
+	static const Mode modes[] = {
+	    {"ligero", "Modo Souls ligero",
+	     "Adaptado para graficas de 8 GB como RTX 3060, RTX 3060 Ti, RTX 3070, RTX 2070/2080, RX 6600, RX 6600 XT o RX 6650 XT: el juego a 30 FPS estables y frame generation de AMD x2 (60 en pantalla). A 1080p, con el antialiasing de XeSS o de FSR (sin reescalar)."},
+	    {"equilibrado", "Modo Souls equilibrado",
+	     "Para graficas de la potencia de una RTX 3080: RTX 2080 Ti, RTX 3070 Ti, RTX 3080, RTX 3080 Ti, RTX 4060 Ti, RTX 4070, RX 6800, RX 6800 XT, RX 6900 XT, RX 6950 XT, RX 7700 XT, RX 7800 XT o Intel Arc B580: el juego a 45 FPS estables y frame generation de AMD x2 (90 en pantalla). A 1440p, con el reescalado que elijas."},
+	    {"ultra", "Modo Souls ultra",
+	     "Para RTX 5060 / 5060 Ti / 5070 / 5070 Ti y RX 9070 / 9070 XT: todo al maximo, Detail Very High, Luz RT y Oclusion en Alta. Los FPS dependen de la potencia de tu GPU y tu CPU."},
+	    {"extremo", "Modo Souls extremo",
+	     "Para enfermos de Souls. RTX 5080, RTX 5090 o superior: modo cinematico del juego a 4K y absolutamente todo al maximo (Ultra en todo, filtrado x16 y texturas nitidas). Los FPS dependen de la potencia de tu GPU y tu CPU."},
+	    {"low", "Modo Souls PC low profile (900p, todo en bajo)",
+	     "Para PCs modestos: 30 FPS reales con frame generation de AMD x2 (60 en pantalla), el juego a 900p reescalado con FSR (nitidez 50 %) y todos los graficos en bajo (texturas, distancia, sombras, detalle, reflejos, objetos y nitidez). Al quitarlo vuelve todo a Maximo y a 1440p."}};
+	const auto pick = [&](float y, const Mode& m, float x) {
+		bool on = s.souls_mode == m.id;
+		if (!LCheck(y, m.label, on, m.tip, x)) return;
+		ApplyPreset(&s, on ? m.id : "ninguno");
+		s.souls_mode = on ? m.id : "ninguno";
+	};
+	// Launcher-souls.ps1's places: ligero | equilibrado, ultra | extremo, PC low profile.
+	for (size_t i = 0; i < 4; i += 2) {
+		const float y = RowY();
+		pick(y, modes[i], 12);
+		pick(y, modes[i + 1], 216);
+		RowEnd(y);
 	}
-	ImGui::SetCursorScreenPos({g_lbox.at.x + U(16), RowY()});
-	ImGui::TextColored(kDim, I18n::T("Versión instalada: %s"), Update::CurrentVersion());
+	{
+		const float y = RowY();
+		pick(y, modes[4], 12);
+		RowEnd(y);
+	}
+	if (FixedFg(s)) {
+		const float y = RowY();
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), y + U(4)});
+		ImGui::TextColored(kGoldL, "%s", I18n::T(s.souls_mode == "equilibrado" ? "Frame generation fija: AMD x2 (45 reales, 90 en pantalla)." : "Frame generation fija: AMD x2 (30 reales, 60 en pantalla)."));
+		RowEnd(y, 28);
+	}
 	BoxEnd();
 }
 
-// The rows of the Ajustes panel: FPS cap, the languages and the copy of the saves.
-void LauncherMoreSettings(Settings& s) {
+// Ajustes (Launcher-souls.ps1's Settings): the game's folder, Add to Steam, the languages, the FPS cap, the copies.
+void LauncherAjustes(Settings& s) {
+	BoxBegin("Ajustes");
+	{
+		const bool  valid = !g_rt.is_game || g_rt.is_game(s.game);
+		const float y     = RowY();
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(2)});
+		ImGui::TextColored(kGoldL, "%s", I18n::T("Carpeta del juego volcado (PPSA01341)"));
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), ImGui::GetCursorScreenPos().y});
+		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
+		ImGui::TextColored(valid ? kInkL : kWarn, "%s", s.game.empty() ? I18n::T("(sin elegir)") : s.game.c_str());
+		if (!valid) ImGui::TextColored(kWarn, "%s", I18n::T("(no valida: JUGAR te la pide)"));
+		ImGui::PopTextWrapPos();
+		const float by = ImGui::GetCursorScreenPos().y + U(4);
+		if (LButton("Cambiar...", {g_lbox.at.x + U(12), by}, {U(190), U(32)}, false, g_font_semi, U(16),
+		            "La carpeta con el juego volcado (la que tiene eboot.bin y sce_sys).") &&
+		    g_rt.pick_folder) {
+			const std::string picked = g_rt.pick_folder();
+			if (!picked.empty() && (!g_rt.is_game || g_rt.is_game(picked))) {
+				s.game = picked;
+				Save();
+				g_status = "Guardado en settings.ini";
+			} else if (!picked.empty()) {
+				g_status = "Esa carpeta no tiene eboot.bin ni sce_sys: elige la carpeta del juego volcado.";
+			}
+		}
+		ImGui::BeginDisabled(g_steam_busy.load());
+		if (LButton("Añadir a Steam", {g_lbox.at.x + U(214), by}, {U(194), U(32)}, false, g_font_semi, U(16),
+		            "Anade \"Demon's Souls\" a la biblioteca de Steam como juego externo (con icono e imagenes). Mejor con Steam cerrado; si esta abierto, reinicialo para que aparezca.")) {
+			g_steam_busy = true;
+			{
+				std::scoped_lock lock(g_steam_mutex);
+				g_steam_text = I18n::T("Añadiendo a Steam...");
+			}
+			std::thread([] {
+				std::string report;
+				const bool  ok = Steam::AddToSteam(g_rt.exe_path, &report);
+				std::scoped_lock lock(g_steam_mutex);
+				g_steam_text = (ok ? "OK: " : "ERROR: ") + report;
+				g_steam_busy = false;
+			}).detach();
+		}
+		ImGui::EndDisabled();
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), by + U(38)});
+		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
+		{
+			std::scoped_lock lock(g_steam_mutex);
+			if (!g_steam_text.empty()) ImGui::TextColored(kInkL, "%s", g_steam_text.c_str());
+		}
+		if (!g_status.empty()) ImGui::TextColored(kGoldL, "%s", I18n::T(g_status.c_str()));
+		ImGui::PopTextWrapPos();
+		const float end = ImGui::GetCursorScreenPos().y;
+		RowEnd(y, (end - y) / g_unit + 2);
+	}
+	{
+		// (ds-pc-port9) "Automatico": Windows' UI language at every start (settings.ini idioma_interfaz empty).
+		std::vector<Choice> langs;
+		langs.push_back({"", "Automático (idioma de Windows)"});
+		for (int i = 0; i < I18n::kMenuLanguageCount; i++) langs.push_back({I18n::kMenuLanguages[i], I18n::kMenuLanguageNames[i]});
+		if (LChoice("Idioma del menu", langs.data(), static_cast<int>(langs.size()), s.menu_language,
+		            "Idioma de este lanzador y de los textos del port en el juego. Automático: el de Windows.", 150, 256)) {
+			const std::string ui = s.menu_language.empty() ? I18n::DetectWindowsLanguage() : s.menu_language;
+			I18n::SetLanguage(ui);
+			// (The game's language follows the menu's until it is chosen on its own.)
+			if (!s.game_language_set) s.language = I18n::GameLanguageFor(ui);
+		}
+	}
+	{
+		std::string lang = std::to_string(s.language);
+		if (LChoice("Idioma", kLanguages, kLanguageCount, lang, "Idioma del juego (textos y voces). Sigue al del menú hasta que elijas otro.", 150, 256)) {
+			s.language          = std::atoi(lang.c_str());
+			s.game_language_set = true;
+		}
+	}
 	{
 		static const Choice caps[] = {{"0", "Auto (bajo el refresco)"}, {"60", "60"}, {"90", "90"}, {"120", "120"}, {"144", "144"}, {"165", "165"}, {"224", "224"}};
 		std::string cap = s.fps_cap > 0 ? std::to_string(static_cast<int>(s.fps_cap)) : "0";
 		if (LChoice("Tope de FPS", caps, 7, cap, "Tope de FPS con G-Sync sin frame generation.", 150, 256)) s.fps_cap = static_cast<float>(std::atof(cap.c_str()));
 	}
-	{
-		std::vector<Choice> langs;
-		for (int i = 0; i < I18n::kMenuLanguageCount; i++) langs.push_back({I18n::kMenuLanguages[i], I18n::kMenuLanguageNames[i]});
-		if (s.menu_language.empty()) s.menu_language = "es";
-		if (LChoice("Idioma del menu", langs.data(), static_cast<int>(langs.size()), s.menu_language, "Idioma de este lanzador y de los mensajes del port.", 150, 256)) {
-			I18n::SetLanguage(s.menu_language);
-			// (The game's language follows the menu's until it is chosen on its own.)
-			if (!s.game_language_set) s.language = I18n::GameLanguageFor(s.menu_language);
-		}
-	}
-	{
-		std::string lang = std::to_string(s.language);
-		if (LChoice("Idioma", kLanguages, kLanguageCount, lang, "Idioma del juego (textos y voces).", 150, 256)) {
-			s.language          = std::atoi(lang.c_str());
-			s.game_language_set = true;
-		}
-	}
 	LCheckRow("Copia de las partidas al arrancar", s.backup_saves, "Copia _SaveData en _SaveData-copias cada vez que pulsas JUGAR.");
+	LCheckRow("Continuar donde lo dejé (F1)", s.continue_f1,
+	          "En el juego, F1 (o R3 + OPTIONS) guarda y cierra. Con esto marcado, JUGAR pasa solo la pantalla de título y carga la partida en el sitio donde pulsaste F1.");
+	{
+		const float y = RowY();
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(2)});
+		ImGui::TextColored(kDimL, I18n::T("Versión instalada: %s"), Update::CurrentVersion());
+		RowEnd(y, 26);
+	}
+	BoxEnd();
 }
 
-// Ajustes (the launcher's Settings panel, left of the column): the game's folder and Add to Steam.
-void LauncherSettingsPanel(Settings& s, float px, float height) {
-	const float w = std::max(U(420), std::min(U(610), px - U(464)));
-	ImGui::SetNextWindowPos({std::max(U(454), px - w - U(10)), height - U(84)}, ImGuiCond_Always, {0.0f, 1.0f});
-	ImGui::SetNextWindowSize({w, 0});
-	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.04f, 0.055f, 0.93f});
-	ImGui::Begin("##settings", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
-	ImGui::PushFont(g_font_serif, U(20));
-	ImGui::TextColored(kGoldL, "%s", I18n::T("Carpeta del juego volcado (PPSA01341)"));
-	ImGui::PopFont();
-	ImGui::SameLine(w - U(48));
-	if (ImGui::SmallButton("X##close")) g_show_settings = false;
-	const bool valid = !g_rt.is_game || g_rt.is_game(s.game);
-	ImGui::PushTextWrapPos(0.0f);
-	ImGui::TextColored(valid ? kInkL : kWarn, "%s", s.game.empty() ? I18n::T("(sin elegir)") : s.game.c_str());
-	ImGui::PopTextWrapPos();
-	if (!valid) ImGui::TextColored(kWarn, "%s", I18n::T("(no valida: JUGAR te la pide)"));
-	if (ImGui::Button(I18n::T("Cambiar..."), {U(200), U(34)}) && g_rt.pick_folder) {
-		const std::string picked = g_rt.pick_folder();
-		if (!picked.empty() && (!g_rt.is_game || g_rt.is_game(picked))) {
-			s.game = picked;
-			Save();
-			g_status = "Guardado en settings.ini";
-		} else if (!picked.empty()) {
-			g_status = "Esa carpeta no tiene eboot.bin ni sce_sys: elige la carpeta del juego volcado.";
-		}
-	}
-	Tip("La carpeta con el juego volcado (la que tiene eboot.bin y sce_sys).");
-	ImGui::SameLine();
-	ImGui::BeginDisabled(g_steam_busy.load());
-	if (ImGui::Button(I18n::T("Añadir a Steam"), {U(200), U(34)})) {
-		g_steam_busy = true;
-		{
-			std::scoped_lock lock(g_steam_mutex);
-			g_steam_text = I18n::T("Añadiendo a Steam...");
-		}
-		std::thread([] {
-			std::string report;
-			const bool  ok = Steam::AddToSteam(g_rt.exe_path, &report);
-			std::scoped_lock lock(g_steam_mutex);
-			g_steam_text = (ok ? "OK: " : "ERROR: ") + report;
-			g_steam_busy = false;
-		}).detach();
-	}
-	ImGui::EndDisabled();
-	Tip("Anade \"Demon's Souls\" a la biblioteca de Steam como juego externo (con icono e imagenes). Mejor con Steam cerrado; si esta abierto, reinicialo para que aparezca.");
-	{
-		std::scoped_lock lock(g_steam_mutex);
-		ImGui::PushTextWrapPos(0.0f);
-		if (!g_steam_text.empty()) ImGui::TextUnformatted(g_steam_text.c_str());
-		else ImGui::TextColored(kDim, "%s", I18n::T("Steam debe cerrarse antes o reiniciarse después para que aparezca el acceso."));
-		ImGui::PopTextWrapPos();
-	}
-	if (!g_status.empty()) ImGui::TextColored(kDim, "%s", I18n::T(g_status.c_str()));
-	ImGui::Spacing();
-	ImGui::Separator();
-	{
-		// (The rows placed as in the column's groups: from this panel's left edge.)
-		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), 0});
-		g_lbox.at = {ImGui::GetCursorScreenPos().x - U(2), ImGui::GetCursorScreenPos().y + U(4)};
-		g_lbox.w  = w - U(28);
-		ImGui::SetCursorScreenPos(g_lbox.at);
-		ImGui::Dummy({0, 0});
-		LauncherMoreSettings(s);
-		ImGui::PopStyleVar();
-	}
-	ImGui::End();
-	ImGui::PopStyleColor();
-}
-
-// Actualizar version / Volver a la version anterior: their dialog (the network and the copy on a worker thread).
-void LauncherUpdatePanel(float px) {
+// Actualizar version / Volver a la version anterior: their state, inside the options (the network and the copy on a
+// worker thread).
+void LauncherUpdateBox() {
 	UpdateUi::State state;
 	std::string     text;
 	{
@@ -2427,25 +2430,23 @@ void LauncherUpdatePanel(float px) {
 		text  = g_upd.text;
 	}
 	if (state == UpdateUi::Idle) return;
-	const float w = U(610);
-	ImGui::SetNextWindowPos({std::max(U(8), px - w - U(10)), U(60)});
-	ImGui::SetNextWindowSize({w, 0});
-	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.04f, 0.055f, 0.95f});
-	ImGui::Begin("##update", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
-	ImGui::PushFont(g_font_serif, U(20));
-	ImGui::TextColored(kGoldL, "%s", I18n::T(state == UpdateUi::Choosing || state == UpdateUi::Confirming ? "Volver a la version anterior" : "Actualizar version"));
-	ImGui::PopFont();
-	ImGui::TextColored(kDim, I18n::T("Version instalada: %s"), Update::CurrentVersion());
-	ImGui::PushTextWrapPos(0.0f);
-	if (!text.empty()) ImGui::TextUnformatted(text.c_str());
+	BoxBegin(state == UpdateUi::Choosing || state == UpdateUi::Confirming ? "Volver a la version anterior" : "Actualizar version");
+	const float y = RowY();
+	ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y});
+	ImGui::BeginGroup();
+	ImGui::PushItemWidth(U(396));
+	ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
+	ImGui::TextColored(kDimL, I18n::T("Version instalada: %s"), Update::CurrentVersion());
+	if (!text.empty()) ImGui::TextColored(kInkL, "%s", text.c_str());
 	ImGui::PopTextWrapPos();
 	const bool  busy = g_upd.busy.load();
-	const float bh   = U(36);
+	const float bh   = U(34);
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), U(6)});
 	if (state == UpdateUi::Checking || (state == UpdateUi::Working && g_upd.total.load() <= 0))
-		ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), {-1, U(10)}, "");
+		ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), {U(396), U(10)}, "");
 	if (state == UpdateUi::Available) {
 		ImGui::BeginDisabled(busy);
-		if (ImGui::Button((std::string(I18n::T("Actualizar a ")) + g_upd.release.tag).c_str(), {U(300), bh})) StartWorker(InstallWork);
+		if (ImGui::Button((std::string(I18n::T("Actualizar a ")) + g_upd.release.tag).c_str(), {U(260), bh})) StartWorker(InstallWork);
 		ImGui::EndDisabled();
 		ImGui::SameLine();
 	}
@@ -2453,13 +2454,13 @@ void LauncherUpdatePanel(float px) {
 		const float f = static_cast<float>(static_cast<double>(g_upd.done.load()) / static_cast<double>(g_upd.total.load()));
 		char        label[64];
 		std::snprintf(label, sizeof(label), "%.0f / %.0f MB", g_upd.done.load() / 1048576.0, g_upd.total.load() / 1048576.0);
-		ImGui::ProgressBar(f, {-1, 0}, label);
+		ImGui::ProgressBar(f, {U(396), 0}, label);
 		if (ImGui::Button(I18n::T("Cancelar"), {U(160), bh})) g_upd.cancel = true;
 	}
 	if (state == UpdateUi::Choosing || state == UpdateUi::Confirming) {
 		std::scoped_lock lock(g_upd.mutex);
 		for (int i = 0; i < static_cast<int>(g_upd.backups.size()); i++) {
-			if (ImGui::Selectable(g_upd.backups[i].version.c_str(), g_upd.chosen == i)) {
+			if (ImGui::Selectable(g_upd.backups[i].version.c_str(), g_upd.chosen == i, ImGuiSelectableFlags_None, {U(396), 0})) {
 				g_upd.chosen = i;
 				g_upd.state  = UpdateUi::Confirming;
 				g_upd.text   = "Se restaura la version " + g_upd.backups[i].version +
@@ -2469,19 +2470,23 @@ void LauncherUpdatePanel(float px) {
 	}
 	if (state == UpdateUi::Confirming) {
 		ImGui::BeginDisabled(busy);
-		if (ImGui::Button(I18n::T("Restaurar"), {U(200), bh})) StartWorker(RestoreWork);
+		if (ImGui::Button(I18n::T("Restaurar"), {U(180), bh})) StartWorker(RestoreWork);
 		ImGui::EndDisabled();
 		ImGui::SameLine();
 	}
 	if (state != UpdateUi::Working && state != UpdateUi::Checking) {
-		if (ImGui::Button(I18n::T("Cerrar"), {U(160), bh})) SetUpd(UpdateUi::Idle, "");
+		if (ImGui::Button(I18n::T("Cerrar"), {U(140), bh})) SetUpd(UpdateUi::Idle, "");
 	}
-	ImGui::End();
-	ImGui::PopStyleColor();
+	ImGui::PopStyleVar();
+	ImGui::PopItemWidth();
+	ImGui::EndGroup();
+	const float end = ImGui::GetItemRectMax().y;
+	RowEnd(y, (end - y) / g_unit + 4);
+	BoxEnd();
 }
 
-// Trofeos (bottom left): the button with the count and %, and the list above it when open.
-void LauncherTrophies(float height) {
+// Trofeos: the count and % and, opened, the list (inside the options).
+void LauncherTrophiesBox() {
 	static std::vector<TrophyRow> rows;
 	static double                 loaded_at = -100.0;
 	if (ImGui::GetTime() - loaded_at > 3.0) {
@@ -2498,79 +2503,80 @@ void LauncherTrophies(float height) {
 			earned++;
 		}
 	}
-	const int   pct = total > 0 ? have * 100 / total : 0;
-	char        title[128];
-	if (!rows.empty()) std::snprintf(title, sizeof(title), "%s   %d / %d   (%d%%)  %s", I18n::T("Trofeos"), earned, static_cast<int>(rows.size()), pct, g_show_trophies ? "^" : "v");
+	const int pct = total > 0 ? have * 100 / total : 0;
+	char      title[128];
+	if (!rows.empty())
+		std::snprintf(title, sizeof(title), "%s   %d / %d   (%d%%)  %s", I18n::T("Trofeos"), earned, static_cast<int>(rows.size()), pct, g_show_trophies ? "^" : "v");
 	else std::snprintf(title, sizeof(title), "%s  %s", I18n::T("Trofeos"), g_show_trophies ? "^" : "v");
-	const ImVec2 at {U(24), height - U(70)};
-	ImGui::SetCursorScreenPos(at);
-	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.094f, 0.11f, 0.15f, 0.85f});
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.17f, 0.20f, 0.25f, 0.92f});
-	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.43f, 0.43f, 0.39f, 1.0f});
+	const float y = RowY();
+	ImGui::SetCursorScreenPos({g_lbox.at.x, y});
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.094f, 0.11f, 0.15f, 0.92f});
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.17f, 0.20f, 0.25f, 0.95f});
+	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.55f, 0.53f, 0.48f, 1.0f});
 	ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, {0.0f, 0.5f});
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {U(50), U(4)});
-	ImGui::PushFont(g_font_semi, U(17));
-	if (ImGui::Button((std::string(title) + "###trophies").c_str(), {U(420), U(46)})) g_show_trophies = !g_show_trophies;
+	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {U(48), U(4)});
+	ImGui::PushFont(g_font_semi, U(16));
+	if (ImGui::Button((std::string(title) + "###trophies").c_str(), {U(420), U(40)})) g_show_trophies = !g_show_trophies;
 	ImGui::PopFont();
 	ImGui::PopStyleVar(2);
 	ImGui::PopStyleColor(3);
-	Libs::Trophy::DrawCup(ImGui::GetWindowDrawList(), at.x + U(10), at.y + U(8), U(30), Libs::Trophy::CupColor(2));
+	Libs::Trophy::DrawCup(ImGui::GetWindowDrawList(), g_lbox.at.x + U(10), y + U(6), U(28), Libs::Trophy::CupColor(2));
+	RowEnd(y, 46);
 	if (!g_show_trophies) return;
-	const float lh = U(360);
-	ImGui::SetCursorScreenPos({at.x, at.y - U(6) - lh});
-	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.055f, 0.063f, 0.086f, 0.94f});
-	ImGui::BeginChild("##trophylist", {U(420), lh}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+	const float ly = RowY();
+	ImGui::SetCursorScreenPos({g_lbox.at.x, ly});
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.04f, 0.045f, 0.06f, 0.95f});
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), U(4)});
+	ImGui::BeginChild("##trophylist", {U(420), U(300)}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
 	if (rows.empty()) {
 		ImGui::TextWrapped("%s", I18n::T("Aún no hay trofeos: aparecen al jugar."));
 	} else {
 		ImGui::TextColored(kGoldL, I18n::T("%d%% completado   -   %d / %d"), pct, earned, static_cast<int>(rows.size()));
-		ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4 {0.80f, 0.63f, 0.30f, 1.0f});
 		ImGui::ProgressBar(total > 0 ? static_cast<float>(have) / static_cast<float>(total) : 0.0f, {-1.0f, U(8)}, "");
-		ImGui::PopStyleColor();
-		static const ImVec4 grade_col[5] = {{0.6f, 0.6f, 0.6f, 1.0f}, {0.67f, 0.78f, 0.92f, 1.0f}, {0.93f, 0.77f, 0.28f, 1.0f},
-		                                    {0.78f, 0.80f, 0.83f, 1.0f}, {0.80f, 0.50f, 0.27f, 1.0f}};
+		static const ImVec4 grade_col[5] = {{0.7f, 0.7f, 0.7f, 1.0f}, {0.72f, 0.82f, 0.95f, 1.0f}, {0.96f, 0.80f, 0.32f, 1.0f},
+		                                    {0.84f, 0.86f, 0.88f, 1.0f}, {0.86f, 0.56f, 0.32f, 1.0f}};
 		static const char*  grade_txt[5] = {"", "Platino", "Oro", "Plata", "Bronce"};
 		for (const auto& r: rows) {
 			const int  g      = r.grade >= 1 && r.grade <= 4 ? r.grade : 0;
 			const bool secret = r.hidden && !r.earned;
 			ImGui::PushID(r.id);
-			ImGui::TextColored(r.earned ? grade_col[g] : ImVec4 {0.42f, 0.42f, 0.42f, 1.0f}, "%-8s", I18n::T(grade_txt[g]));
-			ImGui::SameLine(U(100));
-			ImGui::TextColored(r.earned ? kInkL : ImVec4 {0.45f, 0.45f, 0.45f, 1.0f}, "%s", secret ? I18n::T("Trofeo oculto") : r.name.c_str());
+			ImGui::TextColored(r.earned ? grade_col[g] : ImVec4 {0.62f, 0.62f, 0.62f, 1.0f}, "%s", I18n::T(grade_txt[g]));
+			ImGui::SameLine(U(96));
+			ImGui::TextColored(r.earned ? kInkL : ImVec4 {0.66f, 0.66f, 0.66f, 1.0f}, "%s", secret ? I18n::T("Trofeo oculto") : r.name.c_str());
 			if (!secret) Tip(r.detail.c_str());
 			ImGui::PopID();
 		}
 	}
 	ImGui::EndChild();
+	ImGui::PopStyleVar();
 	ImGui::PopStyleColor();
+	RowEnd(ly, 306);
 }
 
 void DrawLauncher(float width, float height) {
 	DrainInputs();
 	EnsureBackground();
-	if (!g_knight_tried) {
-		g_knight_tried = true;
-		g_knight       = LoadTexture(g_rt.exe_dir + "caballero-espada.png", &g_knight_w, &g_knight_h);
-	}
-	// The scale: 880 wide at 1080 lines (the launcher's pixels), the column at most 70 % of the width.
-	g_unit = std::clamp(height / 1080.0f, 0.55f, 3.0f);
-	if (U(880) > width * 0.70f) g_unit = std::max(0.45f, width * 0.70f / 880.0f);
-	const float px = width - U(880);
-	auto*       bg = ImGui::GetBackgroundDrawList();
+	// (ds-pc-port9) Bigger text: 1.125 x the launcher's pixels at 1080 lines; the column (440 of those) on the right, its
+	// width at most 34 % of the window: the art (the knight and the logo) is never covered.
+	g_unit = std::clamp(height / 1080.0f, 0.55f, 3.0f) * 1.125f;
+	if (U(452) > width * 0.28f) g_unit = std::max(0.45f, width * 0.28f / 452.0f);
+	const float col_w = U(440);
+	const float px    = width - col_w - U(12);
+	auto*       bg    = ImGui::GetBackgroundDrawList();
 	bg->AddRectFilled({0, 0}, {width, height}, IM_COL32(14, 16, 22, 255));
 	if (g_background != nullptr && g_bg_w > 0 && g_bg_h > 0) {
-		// Cover the window, centered (what does not fit is cut at the sides or at the top and bottom).
-		const float scale = std::max(width / g_bg_w, height / g_bg_h);
+		// (ds-pc-port9) The whole width of the art, always (the logo at the left and the knights stay in view, the column
+		// on the right only over the castle): a wider screen cuts only the ground at the bottom; a taller one gets dark
+		// bands above and below.
+		const float scale = width / g_bg_w;
 		const float w = g_bg_w * scale, h = g_bg_h * scale;
-		bg->AddImage(g_background->GetTexRef(), {(width - w) * 0.5f, (height - h) * 0.5f}, {(width + w) * 0.5f, (height + h) * 0.5f});
+		const float y0 = h >= height ? 0.0f : (height - h) * 0.5f;
+		bg->AddImage(g_background->GetTexRef(), {0, y0}, {w, y0 + h});
+		if (h < height) {
+			bg->AddRectFilledMultiColor({0, y0}, {width, y0 + U(60)}, IM_COL32(14, 16, 22, 255), IM_COL32(14, 16, 22, 255), IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 0));
+			bg->AddRectFilledMultiColor({0, y0 + h - U(60)}, {width, y0 + h}, IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 255), IM_COL32(14, 16, 22, 255));
+		}
 	}
-	// Darker towards the bottom (Trofeos) and the column (the art stays bright on the left).
-	bg->AddRectFilledMultiColor({0, height * 0.55f}, {px, height}, IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 150),
-	                            IM_COL32(0, 0, 0, 150));
-	bg->AddRectFilledMultiColor({px - U(160), 0}, {px, height}, IM_COL32(0, 0, 0, 0), IM_COL32(4, 5, 8, 150), IM_COL32(4, 5, 8, 150),
-	                            IM_COL32(0, 0, 0, 0));
-	bg->AddRectFilled({px, 0}, {width, height}, IM_COL32(8, 10, 14, 205));
-	bg->AddLine({px, 0}, {px, height}, IM_COL32(222, 196, 140, 90), 1.0f);
 
 	auto& io = ImGui::GetIO();
 #if defined(NDEBUG)
@@ -2579,8 +2585,8 @@ void DrawLauncher(float width, float height) {
 #endif
 	ImGuiContext& ctx           = *ImGui::GetCurrentContext();
 	const int     colors_before = ctx.ColorStack.Size, vars_before = ctx.StyleVarStack.Size;
-	ImGui::PushFont(g_font_body, U(16));
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {U(16), U(14)});
+	ImGui::PushFont(g_font_semi, U(16));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {U(14), U(12)});
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), U(6)});
 	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {U(6), U(3)});
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
@@ -2588,88 +2594,98 @@ void DrawLauncher(float width, float height) {
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, U(6));
 	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, U(4));
 	ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, U(12));
+	ImGui::PushStyleVar(ImGuiStyleVar_DisabledAlpha, 0.55f);
 	ImGui::PushStyleColor(ImGuiCol_Text, kInkL);
-	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.04f, 0.055f, 0.93f});
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4 {0.094f, 0.10f, 0.13f, 0.98f});
-	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.87f, 0.77f, 0.55f, 0.40f});
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.025f, 0.03f, 0.04f, 0.90f});
+	ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4 {0.07f, 0.075f, 0.10f, 0.99f});
+	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.87f, 0.77f, 0.55f, 0.45f});
 	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4 {0.094f, 0.10f, 0.13f, 1.0f});
 	ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4 {0.16f, 0.17f, 0.22f, 1.0f});
 	ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4 {0.20f, 0.21f, 0.27f, 1.0f});
 	ImGui::PushStyleColor(ImGuiCol_CheckMark, kGoldL);
 	ImGui::PushStyleColor(ImGuiCol_SliderGrab, kGoldL);
 	ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4 {1.0f, 0.88f, 0.62f, 1.0f});
-	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.094f, 0.11f, 0.15f, 0.85f});
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.17f, 0.20f, 0.25f, 0.92f});
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.094f, 0.11f, 0.15f, 0.90f});
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.17f, 0.20f, 0.25f, 0.95f});
 	ImGui::PushStyleColor(ImGuiCol_Header, ImVec4 {0.24f, 0.25f, 0.31f, 1.0f});
 	ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4 {0.55f, 0.43f, 0.22f, 0.80f});
 	ImGui::PushStyleColor(ImGuiCol_NavCursor, kGoldL);
 	ImGui::PushStyleColor(ImGuiCol_PlotHistogram, kGoldL);
+	ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, ImVec4 {0.0f, 0.0f, 0.0f, 0.25f});
+	ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, ImVec4 {0.55f, 0.48f, 0.36f, 0.85f});
 
 	Settings& s = g_edit;
-	// Esc closes the launcher (as Salir), or first the panel or list that is open.
+	// Esc: the open list, then the options, then the launcher (as Salir).
 	if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !g_popup.load()) {
-		if (g_show_settings) g_show_settings = false;
-		else if (g_upd.state != UpdateUi::Idle && !g_upd.busy.load()) SetUpd(UpdateUi::Idle, "");
+		if (g_upd.state != UpdateUi::Idle && !g_upd.busy.load()) SetUpd(UpdateUi::Idle, "");
+		else if (g_show_settings) g_show_settings = false;
 		else g_start_result = -1;
 	}
 
-	// The whole window: the X left of the column and Trofeos at the bottom left.
-	ImGui::SetNextWindowPos({0, 0});
-	ImGui::SetNextWindowSize({width, height});
-	ImGui::Begin("##launcher-back", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
-	                                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus |
-	                                             ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoFocusOnAppearing);
-	{
-		const ImVec2 at {px - U(56), U(8)};
-		ImGui::SetCursorScreenPos(at);
-		const bool  close = ImGui::InvisibleButton("##close", {U(48), U(40)});
-		const bool  hot   = ImGui::IsItemHovered();
-		auto*       dl    = ImGui::GetWindowDrawList();
-		dl->AddRectFilled(at, {at.x + U(48), at.y + U(40)}, hot ? IM_COL32(180, 40, 40, 230) : IM_COL32(14, 16, 22, 220), U(3));
-		const float c = U(8);
-		const ImVec2 m {at.x + U(24), at.y + U(20)};
-		dl->AddLine({m.x - c, m.y - c}, {m.x + c, m.y + c}, ImGui::GetColorU32(kGoldL), U(2.2f));
-		dl->AddLine({m.x - c, m.y + c}, {m.x + c, m.y - c}, ImGui::GetColorU32(kGoldL), U(2.2f));
-		Tip("Cerrar el lanzador (Esc)");
-		if (close) g_start_result = -1;
-	}
-	LauncherTrophies(height);
-	ImGui::End();
-
-	// The column: two columns of groups, scrolled with the wheel when the screen is short.
-	ImGui::SetNextWindowPos({px, 0});
-	ImGui::SetNextWindowSize({U(880), height});
-	if (g_focus_once) ImGui::SetNextWindowFocus();
+	// ---- The bottom of the column: the shaders' state, where JUGAR continues, JUGAR, Opciones and Salir. ----
+	const auto        pv   = Precompile::State();
+	const std::string when = s.continue_f1 ? Resume::Summary(g_rt.exe_path.parent_path()) : std::string();
+	float             bottom_h = U(58 + 8 + 40 + 16);
+	if (pv.running || !pv.finished || pv.failed) bottom_h += U(pv.running ? 44 : 26);
+	if (!when.empty()) bottom_h += U(26);
+	const float bottom_y = height - bottom_h - U(10);
+	// A dark backing under the column's text (only the column: the art stays as it is).
+	bg->AddRectFilledMultiColor({px + U(30), bottom_y - U(30)}, {width, height}, IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(4, 5, 8, 215),
+	                            IM_COL32(4, 5, 8, 215));
+	bg->AddRectFilledMultiColor({px - U(40), bottom_y - U(30)}, {px + U(30), height}, IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(4, 5, 8, 215),
+	                            IM_COL32(4, 5, 8, 0));
+	ImGui::SetNextWindowPos({px, bottom_y});
+	ImGui::SetNextWindowSize({col_w, bottom_h + U(10)});
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
-	ImGui::Begin("##launcher-column", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
-	                                               ImGuiWindowFlags_NoSavedSettings);
+	ImGui::Begin("##launcher-bottom", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+	                                               ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse);
 	ImGui::PopStyleVar();
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), 0});
-	const ImVec2 origin = ImGui::GetCursorScreenPos();
-	// Left: Imagen, Calidad grafica, Ray tracing.
-	ImGui::SetCursorScreenPos({origin.x + U(10), origin.y + U(10)});
-	ImGui::BeginGroup();
-	LauncherImage(s);
-	LauncherQuality(s);
-	LauncherRayTracing(s);
-	ImGui::EndGroup();
-	const float left_bottom = ImGui::GetItemRectMax().y;
-	// Right: Frame generation, Pantalla y otros, Configurador, Rendimiento / PC, the buttons, Controles, TU EQUIPO, PayPal.
-	ImGui::SetCursorScreenPos({origin.x + U(450), origin.y + U(10)});
-	ImGui::BeginGroup();
-	LauncherFrameGen(s);
-	LauncherDisplay(s);
-	LauncherConfigurator(s);
-	LauncherPerformance(s);
+	g_lbox.at = {px + U(10), ImGui::GetCursorScreenPos().y};
+	g_lbox.w  = U(420);
+	if (pv.running || !pv.finished || pv.failed) {
+		const float sy = RowY();
+		float       ty = sy;
+		if (pv.running) {
+			char label[64] = "";
+			if (pv.total > 0) std::snprintf(label, sizeof(label), "%d / %d", pv.done, pv.total);
+			ImGui::SetCursorScreenPos({g_lbox.at.x, sy});
+			ImGui::ProgressBar(pv.total > 0 ? static_cast<float>(pv.done) / static_cast<float>(pv.total) : -1.0f * static_cast<float>(ImGui::GetTime()),
+			                   {U(420), U(16)}, label);
+			ty = sy + U(20);
+		}
+		ImGui::SetCursorScreenPos({g_lbox.at.x, ty});
+		ImGui::PushFont(g_font_semi, U(14));
+		ImGui::TextColored(pv.failed ? kWarn : kInkL, "%s", pv.text.empty() ? I18n::T("Shaders: la cache de esta grafica ya esta preparada.") : I18n::T(pv.text.c_str()));
+		ImGui::PopFont();
+		if (pv.running) {
+			if (LButton("Detener", {g_lbox.at.x + U(320), ty}, {U(100), U(22)}, false, g_font_semi, U(13),
+			            "Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez)."))
+				std::thread([] { Precompile::Stop(); }).detach();
+		} else if (!pv.finished) {
+			if (LButton("Preparar shaders", {g_lbox.at.x + U(280), ty}, {U(140), U(22)}, false, g_font_semi, U(13),
+			            "Compila ya todos los pipelines del juego para esta grafica (evita tirones la primera vez)."))
+				Precompile::Start();
+		}
+		RowEnd(sy, pv.running ? 44 : 26);
+	}
+	if (!when.empty()) {
+		const float wy = RowY();
+		char        line[256];
+		std::snprintf(line, sizeof(line), I18n::T("Partida guardada con F1 el %s: JUGAR continúa allí."), when.c_str());
+		ImGui::SetCursorScreenPos({g_lbox.at.x, wy});
+		ImGui::PushFont(g_font_semi, U(14));
+		ImGui::TextColored(kGoldL, "%s", line);
+		ImGui::PopFont();
+		Tip("En el juego, F1 (o R3 + OPTIONS) guarda y cierra. Con esto marcado, JUGAR pasa solo la pantalla de título y carga la partida en el sitio donde pulsaste F1.");
+		RowEnd(wy, 26);
+	}
 	{
-		g_lbox.at = {origin.x + U(450), RowY()};
-		g_lbox.w  = U(420);
-		const float y   = RowY() + U(4);
-		const auto  v   = Precompile::State();
-		g_focus_once = false;
-		if (LButton(v.running && !v.playable ? "JUGAR (sin esperar)" : "JUGAR", {g_lbox.at.x, y}, {U(420), U(58)}, true, g_font_serif, U(30),
-		            v.running ? "Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez). Sin ella, el juego compila shaders al jugar (tirones)."
-		                      : "Guarda los ajustes en settings.ini y empieza el juego.")) {
+		const float y = RowY();
+		g_focus_once  = false;
+		if (LButton(pv.running && !pv.playable ? "JUGAR (sin esperar)" : "JUGAR", {g_lbox.at.x, y}, {U(420), U(58)}, true, g_font_serif, U(32),
+		            pv.running ? "Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez). Sin ella, el juego compila shaders al jugar (tirones)."
+		                       : "Guarda los ajustes en settings.ini y empieza el juego.")) {
 			// (No game folder: the picker at once; a valid one chosen, saved and played.)
 			bool ok = !g_rt.is_game || g_rt.is_game(s.game);
 			if (!ok && g_rt.pick_folder) {
@@ -2687,109 +2703,87 @@ void DrawLauncher(float width, float height) {
 				g_start_result = 1;
 			}
 		}
-		RowEnd(y - U(4), 66);
-		// (ds-pc-port8) Where JUGAR continues: the F1 save and quit.
-		{
-			const float       ry   = RowY();
-			const std::string when = Resume::Summary(g_rt.exe_path.parent_path());
-			LCheck(ry, "Continuar donde lo dejé (F1)", s.continue_f1,
-			       "En el juego, F1 (o R3 + OPTIONS) guarda y cierra. Con esto marcado, JUGAR pasa solo la pantalla de título y carga la partida en el sitio donde pulsaste F1.",
-			       0);
-			RowEnd(ry, 28);
-			if (!when.empty() && s.continue_f1) {
-				const float wy = RowY();
-				ImGui::SetCursorScreenPos({g_lbox.at.x + U(4), wy});
-				ImGui::PushTextWrapPos(g_lbox.at.x + U(420) - ImGui::GetWindowPos().x);
-				ImGui::PushFont(g_font_body, U(14));
-				char line[256];
-				std::snprintf(line, sizeof(line), I18n::T("Partida guardada con F1 el %s: JUGAR continúa allí."), when.c_str());
-				ImGui::TextColored(kGoldL, "%s", line);
-				ImGui::PopFont();
-				ImGui::PopTextWrapPos();
-				const float wend = ImGui::GetItemRectMax().y;
-				RowEnd(wy, (wend - wy) / g_unit + 4);
-			}
-		}
-		// The shaders' preparation (precompile): its state, bar and button.
-		{
-			const auto  pv = Precompile::State();
-			const float sy = RowY();
-			float       ty = sy;
-			if (pv.running) {
-				char label[64];
-				if (pv.total > 0) std::snprintf(label, sizeof(label), "%d / %d", pv.done, pv.total);
-				ImGui::SetCursorScreenPos({g_lbox.at.x, sy});
-				ImGui::ProgressBar(pv.total > 0 ? static_cast<float>(pv.done) / static_cast<float>(pv.total) : -1.0f * static_cast<float>(ImGui::GetTime()),
-				                   {U(420), U(18)}, pv.total > 0 ? label : "");
-				ty = sy + U(22);
-			}
-			ImGui::SetCursorScreenPos({g_lbox.at.x, ty});
-			ImGui::PushFont(g_font_body, U(14));
-			ImGui::PushTextWrapPos(g_lbox.at.x + U(290) - ImGui::GetWindowPos().x);
-			ImGui::TextColored(pv.failed ? kWarn : (pv.finished ? kGoldL : kDim), "%s",
-			                   pv.text.empty() ? I18n::T("Shaders: la cache de esta grafica ya esta preparada.") : I18n::T(pv.text.c_str()));
-			ImGui::PopTextWrapPos();
-			ImGui::PopFont();
-			const float text_end = ImGui::GetItemRectMax().y;
-			if (pv.running) {
-				if (LButton("Detener", {g_lbox.at.x + U(300), ty}, {U(120), U(28)}, false, g_font_body, U(14),
-				            "Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez)."))
-					std::thread([] { Precompile::Stop(); }).detach();
-			} else if (!pv.finished) {
-				if (LButton("Preparar shaders", {g_lbox.at.x + U(300), ty}, {U(120), U(28)}, false, g_font_body, U(14),
-				            "Compila ya todos los pipelines del juego para esta grafica (evita tirones la primera vez)."))
-					Precompile::Start();
-			}
-			RowEnd(sy, std::max(text_end, ty + U(30)) / g_unit - sy / g_unit + 6);
-		}
-		const float by = RowY();
-		ImGui::BeginDisabled(g_upd.busy.load());
-		if (LButton("Actualizar version", {g_lbox.at.x, by}, {U(205), U(44)}, false, g_font_semi, U(15),
-		            "Busca en GitHub la ultima version publicada del port (DemonsSoulsPC) y la instala en esta misma carpeta. Nunca baja de version. Los archivos actuales del motor se guardan en _backup_update; la cache de shaders, las partidas, los seeds y los ajustes no se tocan."))
-			OpenCheck();
-		if (LButton("Volver a la version anterior", {g_lbox.at.x + U(215), by}, {U(205), U(44)}, false, g_font_semi, U(14),
-		            "Vuelve a una version guardada en _backup_update. La actual se guarda antes (se puede deshacer). La cache de shaders, las partidas, los seeds y los ajustes no se tocan."))
-			OpenRestore();
-		ImGui::EndDisabled();
-		RowEnd(by, 52);
-		const float sy2 = RowY();
-		if (LButton("Ajustes", {g_lbox.at.x, sy2}, {U(205), U(44)}, false, g_font_semi, U(16), "La carpeta del juego y Añadir a Steam."))
-			g_show_settings = !g_show_settings;
-		if (LButton("Salir", {g_lbox.at.x + U(215), sy2}, {U(205), U(44)}, false, g_font_semi, U(16), "Cierra el lanzador sin jugar (Esc).")) g_start_result = -1;
-		RowEnd(sy2, 54);
-		const float cy = RowY();
-		if (LButton(g_show_controls ? "Controles  ^" : "Controles  v", {g_lbox.at.x, cy}, {U(420), U(40)}, false, g_font_semi, U(16),
-		            "Teclado y ratón, sensibilidad, cámara y vibración."))
-			g_show_controls = !g_show_controls;
-		RowEnd(cy, 48);
+		RowEnd(y, 66);
 	}
-	if (g_show_controls) LauncherControls(s);
-	LauncherPcCard();
 	{
-		// (The launcher's donation link: PayPal's page opens in the browser; nothing is sent from here.)
-		g_lbox.at        = {origin.x + U(450), RowY()};
-		g_lbox.w         = U(420);
-		const float      y    = RowY() + U(2);
-		const char*      text = I18n::T("\xE2\x99\xA5  Dona tu alma  -  PayPal: todojuegos67@gmail.com");
-		ImGui::PushFont(g_font_semi, U(15));
-		const ImVec2 ts = ImGui::CalcTextSize(text);
-		ImGui::SetCursorScreenPos({g_lbox.at.x + (U(420) - ts.x) * 0.5f, y});
-		ImGui::TextColored(kGoldL, "%s", text);
-		ImGui::PopFont();
-		if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-		if (ImGui::IsItemClicked()) OpenUrl("https://www.paypal.com/donate?business=todojuegos67%40gmail.com&currency_code=EUR");
-		Tip("Si te gusta el proyecto, puedes donar por PayPal. Gracias, portador de la maldición.");
-		RowEnd(y, 34);
+		const float y = RowY();
+		if (LButton(g_show_settings ? "Opciones  ^" : "Opciones  v", {g_lbox.at.x, y}, {U(310), U(40)}, false, g_font_semi, U(17),
+		            "Todas las opciones: Modos Souls, imagen, frame generation, calidad gráfica, ray tracing, pantalla, controles, ajustes, actualizar y trofeos."))
+			g_show_settings = !g_show_settings;
+		if (LButton("Salir", {g_lbox.at.x + U(320), y}, {U(100), U(40)}, false, g_font_semi, U(17), "Cierra el lanzador sin jugar (Esc)."))
+			g_start_result = -1;
+		RowEnd(y, 48);
 	}
-	ImGui::EndGroup();
-	const float right_bottom = ImGui::GetItemRectMax().y;
-	ImGui::SetCursorScreenPos({origin.x, std::max(left_bottom, right_bottom) + U(16)});
-	ImGui::Dummy({U(880), 0});
 	ImGui::PopStyleVar();
 	ImGui::End();
 
-	if (g_show_settings) LauncherSettingsPanel(s, px, height);
-	LauncherUpdatePanel(px);
+	// ---- Opciones: every group in one column above JUGAR, scrolled with the wheel. ----
+	if (g_show_settings) {
+		const float top = U(12);
+		ImGui::SetNextWindowPos({px, top});
+		ImGui::SetNextWindowSize({col_w, std::max(U(120), bottom_y - U(34) - top)});
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, U(8)});
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.02f, 0.025f, 0.035f, 0.88f});
+		ImGui::Begin("##launcher-options", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+		                                                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+		ImGui::PopStyleColor();
+		ImGui::PopStyleVar();
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), 0});
+		const ImVec2 origin = ImGui::GetCursorScreenPos();
+		ImGui::SetCursorScreenPos({origin.x + U(8), origin.y});
+		ImGui::BeginGroup();
+		LauncherUpdateBox();
+		LauncherSoulsModes(s);
+		LauncherImage(s);
+		LauncherFrameGen(s);
+		LauncherQuality(s);
+		LauncherRayTracing(s);
+		LauncherDisplay(s);
+		LauncherConfigurator(s);
+		LauncherPerformance(s);
+		{
+			g_lbox.at     = {origin.x + U(8), RowY()};
+			g_lbox.w      = U(420);
+			const float y = RowY();
+			if (LButton(g_show_controls ? "Controles  ^" : "Controles  v", {g_lbox.at.x, y}, {U(420), U(38)}, false, g_font_semi, U(16),
+			            "Teclado y ratón, sensibilidad, cámara y vibración."))
+				g_show_controls = !g_show_controls;
+			RowEnd(y, 46);
+		}
+		if (g_show_controls) LauncherControls(s);
+		LauncherAjustes(s);
+		{
+			g_lbox.at = {origin.x + U(8), RowY()};
+			g_lbox.w  = U(420);
+			LauncherTrophiesBox();
+			const float by = RowY();
+			ImGui::BeginDisabled(g_upd.busy.load());
+			if (LButton("Actualizar version", {g_lbox.at.x, by}, {U(205), U(40)}, false, g_font_semi, U(15),
+			            "Busca en GitHub la ultima version publicada del port (DemonsSoulsPC) y la instala en esta misma carpeta. Nunca baja de version. Los archivos actuales del motor se guardan en _backup_update; la cache de shaders, las partidas, los seeds y los ajustes no se tocan.")) {
+				OpenCheck();
+				ImGui::SetScrollY(0.0f);
+			}
+			if (LButton("Volver a la version anterior", {g_lbox.at.x + U(215), by}, {U(205), U(40)}, false, g_font_semi, U(13),
+			            "Vuelve a una version guardada en _backup_update. La actual se guarda antes (se puede deshacer). La cache de shaders, las partidas, los seeds y los ajustes no se tocan.")) {
+				OpenRestore();
+				ImGui::SetScrollY(0.0f);
+			}
+			ImGui::EndDisabled();
+			RowEnd(by, 48);
+			const float dy   = RowY();
+			const char* text = I18n::T("\xE2\x99\xA5  Dona tu alma  -  PayPal: todojuegos67@gmail.com");
+			const ImVec2 ts  = ImGui::CalcTextSize(text);
+			ImGui::SetCursorScreenPos({g_lbox.at.x + (U(420) - ts.x) * 0.5f, dy});
+			ImGui::TextColored(kGoldL, "%s", text);
+			if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+			if (ImGui::IsItemClicked()) OpenUrl("https://www.paypal.com/donate?business=todojuegos67%40gmail.com&currency_code=EUR");
+			Tip("Si te gusta el proyecto, puedes donar por PayPal. Gracias, portador de la maldición.");
+			RowEnd(dy, 30);
+		}
+		ImGui::EndGroup();
+		ImGui::PopStyleVar();
+		ImGui::End();
+	}
 
 	g_popup = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
 	if (ctx.ColorStack.Size > colors_before) ImGui::PopStyleColor(ctx.ColorStack.Size - colors_before);
@@ -2824,7 +2818,7 @@ void DrawInGame(float width, float height) {
 	ImGui::PushTextWrapPos(0.0f);
 	const std::string text = Resume::SaveAndQuitText();
 	ImGui::TextUnformatted(I18n::T(text.c_str()));
-	ImGui::TextColored(kDim, "%s", I18n::T("El juego se cierra solo en unos segundos. Al pulsar JUGAR en el lanzador continuarás donde estás."));
+	ImGui::TextColored(kDimL, "%s", I18n::T("El juego se cierra solo en unos segundos. Al pulsar JUGAR en el lanzador continuarás donde estás."));
 	ImGui::PopTextWrapPos();
 	ImGui::End();
 	ImGui::PopStyleColor(2);

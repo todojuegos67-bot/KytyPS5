@@ -16,12 +16,13 @@ No hace falta PowerShell ni ninguna consola: todo va dentro del exe.
 
 El lanzador (al abrir "Demon's Souls.exe")
 ------------------------------------------
-Antes del juego se abre el lanzador, como el del emulador (Launcher-souls.ps1): la imagen del juego a toda
-pantalla y a la derecha la columna de opciones con sus grupos (Imagen, Calidad grafica, Ray tracing, Frame
-generation, Pantalla y otros, Configurador, Rendimiento / PC, Controles, TU EQUIPO), cada una con su ayuda al
-pasar el raton. Todo se guarda en settings.ini y se aplica al pulsar JUGAR. Abajo a la izquierda: Trofeos.
-Botones: JUGAR, Actualizar version, Volver a la version anterior, Ajustes (carpeta del juego y Anadir a Steam)
-y Salir (o Esc). "Demon's Souls.exe" --sin-lanzador arranca el juego directo una vez.
+Antes del juego se abre el lanzador: la imagen del juego a toda pantalla (el logo y los caballeros siempre a la
+vista) y a la derecha solo JUGAR, "Opciones" y Salir. "Opciones" abre una columna con todos los grupos (Modos Souls,
+Imagen, Frame generation, Calidad grafica, Ray tracing, Pantalla y otros, Configurador, Rendimiento / PC, Controles,
+Ajustes, Trofeos, Actualizar version y Volver a la version anterior), cada opcion con su ayuda al pasar el raton.
+Todo se guarda en settings.ini y se aplica al pulsar JUGAR. Esc cierra las opciones (y otra vez, el lanzador).
+El idioma del lanzador y de los textos del port sigue al de Windows salvo que elijas otro (Ajustes > Idioma del menu).
+"Demon's Souls.exe" --sin-lanzador arranca el juego directo una vez.
 
 F1 dentro del juego: guardar y salir
 ------------------------------------

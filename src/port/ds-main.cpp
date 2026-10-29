@@ -711,9 +711,11 @@ int main(int argc, char* argv[]) {
 	}
 	// (10-27b) The menus' language: settings.ini's idioma_menu, else (a first start) the Windows UI language; the
 	// game's follows it until chosen.
-	if (settings.menu_language.empty()) settings.menu_language = Port::I18n::DetectWindowsLanguage();
-	if (!settings.game_language_set) settings.language = Port::I18n::GameLanguageFor(settings.menu_language);
-	Port::I18n::SetLanguage(settings.menu_language);
+	// (ds-pc-port9) An empty idioma_interfaz: Windows' UI language (GetUserDefaultUILanguage) at every start, not stored.
+	const std::string ui_language = settings.menu_language.empty() ? Port::I18n::DetectWindowsLanguage() : settings.menu_language;
+	if (!settings.game_language_set) settings.language = Port::I18n::GameLanguageFor(ui_language);
+	Port::I18n::SetLanguage(ui_language);
+	std::printf("[port] language: %s (%s)\n", ui_language.c_str(), settings.menu_language.empty() ? "Windows" : "chosen");
 	if (!restarted && !RamWarning()) return 0;
 	ShowSplash(image);
 	// (10-27b) With the start menu the game folder is chosen there (its "Carpeta del juego" row, or at JUGAR).
