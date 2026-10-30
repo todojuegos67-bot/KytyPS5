@@ -1441,7 +1441,7 @@ function Get-LatestRelease([int]$Timeout = 30) {
 	if ($win.Count) { $zips = $win }
 	$asset = $zips | Sort-Object size -Descending | Select-Object -First 1
 	if (-not $asset) { throw 'no zip asset' }
-	return [pscustomobject]@{ Tag = [string]$rel.tag_name; Name = [string]$rel.name; Asset = [string]$asset.name; Url = [string]$asset.browser_download_url; Size = [int64]$asset.size }
+	return [pscustomobject]@{ Tag = [string]$rel.tag_name; Name = [string]$rel.name; Published = [datetime]$rel.published_at; Asset = [string]$asset.name; Url = [string]$asset.browser_download_url; Size = [int64]$asset.size }
 }
 function Test-FolderWritable([string]$p) {
 	try { $t = Join-Path $p ('.ds-write-test-' + [guid]::NewGuid().ToString('N')); [IO.File]::WriteAllText($t, 'x'); Remove-Item -LiteralPath $t -Force; return $true } catch { return $false }
@@ -1674,6 +1674,8 @@ function Start-UpdateVersion([switch]$Startup) {
 	$dCur = if ($cur -match '(20\d{6})') { $Matches[1] } else { '' }
 	$dRel = if ($rel.Tag -match '(20\d{6})') { $Matches[1] } else { '' }
 	if ($Startup -and (($cur -and $cur -eq $rel.Tag -or ($dCur -and $dRel -and $dCur -gt $dRel)))) { return }
+	# (1030d) Installed after that release was published (a newer test build, a draft): no notice at start-up.
+	if ($Startup) { try { $vfi = Join-Path $root 'version.txt'; if ((Test-Path -LiteralPath $vfi) -and (Get-Item -LiteralPath $vfi).LastWriteTimeUtc -gt $rel.Published.ToUniversalTime()) { return } } catch { } }
 	if ($cur -and $cur -ne $rel.Tag -and $dCur -and $dRel -and $dCur -gt $dRel) {
 		[System.Windows.Forms.MessageBox]::Show((UT 'Version instalada: ' 'Installed version: ') + $cur + "`n" + (UT 'Ultima release en GitHub: ' 'Latest GitHub release: ') + $rel.Tag + "`n`n" + (UT 'Tu version es igual o mas nueva. No hace falta actualizar.' 'Your version is the same or newer. No update needed.'), $t, 'OK', 'Information') | Out-Null; return
 	}
