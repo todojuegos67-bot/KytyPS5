@@ -20,3 +20,4 @@ tools/local/fsr3-mfg/prebuilt/** -text
 /Medir-rendimiento.ps1 -text
 /Capturar-RT.cmd -text
 /Capturar-RT.ps1 -text
+*.ttf binary

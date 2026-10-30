@@ -1645,7 +1645,8 @@ void Draw(float width, float height) {
 
 ImFont*        g_font_body  = nullptr; // Segoe UI
 ImFont*        g_font_semi  = nullptr; // Segoe UI Semibold
-ImFont*        g_font_serif = nullptr; // Palatino Linotype / Georgia / Times (titles, JUGAR)
+ImFont*        g_font_serif = nullptr; // Palatino Linotype / Georgia / Times
+ImFont*        g_font_display = nullptr; // (ds-pc-port12) Cinzel, bundled (JUGAR and the section titles)
 ImTextureData* g_knight     = nullptr; // caballero-espada.png (TU EQUIPO)
 int            g_knight_w = 0, g_knight_h = 0;
 bool           g_knight_tried   = false;
@@ -1725,7 +1726,7 @@ void BoxBegin(const char* title, float w = 420, bool card = false) {
 	g_lbox.card = card;
 	ImGui::BeginGroup();
 	ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), g_lbox.at.y + U(card ? 12 : 6)});
-	ImGui::PushFont(g_font_serif, U(card ? 24 : 19));
+	ImGui::PushFont(g_font_display, U(card ? 25 : 20));
 	ImGui::TextColored(kGoldL, "%s", I18n::T(title));
 	ImGui::PopFont();
 	ImGui::SetCursorScreenPos({g_lbox.at.x, g_lbox.at.y + U(card ? 46 : 32)});
@@ -1868,7 +1869,24 @@ bool LButton(const char* text, ImVec2 at, ImVec2 size, bool primary, ImFont* fon
 		ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.43f, 0.43f, 0.39f, 1.0f});
 	}
 	ImGui::PushFont(font, font_size);
+	// (ds-pc-port12) The primary button in the display face: the label drawn engraved into the gold (dark letters, a
+	// light edge under them and a soft dark one above), on whole pixels so it stays crisp.
+	const bool engraved = primary && font == g_font_display;
+	if (engraved) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4 {0, 0, 0, 0});
 	const bool clicked = ImGui::Button(I18n::T(text), size);
+	if (engraved) {
+		ImGui::PopStyleColor();
+		auto*        dl  = ImGui::GetWindowDrawList();
+		const char*  t   = I18n::T(text);
+		const ImVec2 ts  = ImGui::CalcTextSize(t);
+		const ImVec2 mn  = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+		const ImVec2 p   = {std::floor(mn.x + (mx.x - mn.x - ts.x) * 0.5f), std::floor(mn.y + (mx.y - mn.y - ts.y) * 0.5f)};
+		const float  off = std::max(1.0f, std::round(font_size / 28.0f));
+		dl->AddText(font, font_size, {p.x, p.y + off}, IM_COL32(255, 238, 196, 150), t);   // the light lower edge
+		dl->AddText(font, font_size, {p.x, p.y - off}, IM_COL32(40, 26, 8, 90), t);        // the shade above
+		dl->AddText(font, font_size, p, IM_COL32(22, 14, 5, 255), t);                      // the letters
+		dl->AddText(font, font_size, {p.x + 0.5f * off, p.y}, IM_COL32(22, 14, 5, 160), t); // a touch more weight
+	}
 	ImGui::PopFont();
 	ImGui::PopStyleColor(5);
 	Tip(tip);
@@ -2797,7 +2815,7 @@ void DrawLauncher(float width, float height) {
 	{
 		const float y = RowY();
 		g_focus_once  = false;
-		if (LButton(pv.running && !pv.playable ? "JUGAR (sin esperar)" : "JUGAR", {g_lbox.at.x, y}, {U(420), U(58)}, true, g_font_serif, U(32),
+		if (LButton(pv.running && !pv.playable ? "JUGAR (sin esperar)" : "JUGAR", {g_lbox.at.x, y}, {U(420), U(58)}, true, g_font_display, U(35),
 		            pv.running ? "Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez). Sin ella, el juego compila shaders al jugar (tirones)."
 		                       : "Guarda los ajustes en settings.ini y empieza el juego.")) {
 			// (No game folder: the picker at once; a valid one chosen, saved and played.)
@@ -2835,7 +2853,8 @@ void DrawLauncher(float width, float height) {
 	if (g_show_settings) {
 		const float top = U(12);
 		ImGui::SetNextWindowPos({px, top});
-		ImGui::SetNextWindowSize({col_w, std::max(U(120), bottom_y - U(34) - top)});
+		// (ds-pc-port12) Down to just above the bottom block (it scrolls inside).
+		ImGui::SetNextWindowSize({col_w, std::max(U(120), bottom_y - U(6) - top)});
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, U(8)});
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.02f, 0.025f, 0.035f, 0.88f});
 		ImGui::Begin("##launcher-options", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -2843,6 +2862,9 @@ void DrawLauncher(float width, float height) {
 		ImGui::PopStyleColor();
 		ImGui::PopStyleVar();
 		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), 0});
+		// (ds-pc-port12) The options' labels and values 2 pt larger, in the regular face and a lighter ink.
+		ImGui::PushFont(g_font_body, U(18));
+		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4 {1.0f, 0.99f, 0.97f, 1.0f});
 		const ImVec2 origin = ImGui::GetCursorScreenPos();
 		ImGui::SetCursorScreenPos({origin.x + U(8), origin.y});
 		ImGui::BeginGroup();
@@ -2895,6 +2917,8 @@ void DrawLauncher(float width, float height) {
 			RowEnd(dy, 30);
 		}
 		ImGui::EndGroup();
+		ImGui::PopStyleColor();
+		ImGui::PopFont();
 		ImGui::PopStyleVar();
 		ImGui::End();
 	}
@@ -3080,6 +3104,23 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 		g_font_serif = load({L"palab.ttf", L"pala.ttf", L"georgiab.ttf", L"constanb.ttf", L"timesbd.ttf"});
 		if (g_font_semi == nullptr) g_font_semi = g_font_body;
 		if (g_font_serif == nullptr) g_font_serif = g_font_semi;
+		// (ds-pc-port12) Cinzel (OFL) from the exe's resources: rasterized at each exact size it is pushed at (ImGui 1.92's
+		// dynamic fonts), oversampled, with a subtle letter spacing.
+		if (HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(3), MAKEINTRESOURCEW(10)); res != nullptr) {
+			if (HGLOBAL mem = LoadResource(nullptr, res); mem != nullptr) {
+				void*       data = LockResource(mem);
+				const DWORD size = SizeofResource(nullptr, res);
+				if (data != nullptr && size > 0) {
+					ImFontConfig cfg;
+					cfg.FontDataOwnedByAtlas = false; // (the resource stays mapped for the process' life)
+					cfg.OversampleH          = 3;
+					cfg.OversampleV          = 2;
+					cfg.GlyphExtraAdvanceX   = 1.5f;
+					g_font_display           = io.Fonts->AddFontFromMemoryTTF(data, static_cast<int>(size), 0.0f, &cfg);
+				}
+			}
+		}
+		if (g_font_display == nullptr) g_font_display = g_font_serif;
 	}
 	ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
 	ImGui_ImplSDLRenderer2_Init(renderer);
