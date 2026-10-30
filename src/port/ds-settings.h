@@ -131,6 +131,7 @@ struct Settings {
 	std::string texture_reduce = "0";
 	bool        simulate_vram8 = false;
 	bool        all_ccds = false;
+	std::string precompile_threads = "preguntar"; // (ds-pc-port13) todos (every CPU thread), relajado, preguntar (ask first)
 	bool        antilag = false;     // (before 10-27) KYTY_ANTILAG: now antilag_mode
 	std::string antilag_mode = "auto"; // AMD frame generation: auto (amd2 on AMD, normal else), amd2, normal, ultra, no
 	std::string antilag_dlssg = "reflex"; // NVIDIA frame generation: reflex, normal, ultra (ours, Reflex off)

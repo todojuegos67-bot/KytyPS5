@@ -1,5 +1,7 @@
 // "Demon's Souls" PC port: precompile-windows.ps1 in the exe (ds-precompile.h).
 #include "port/ds-precompile.h"
+#include "port/ds-i18n.h"
+#include "port/ds-settings.h"
 
 #include <algorithm>
 #include <atomic>
@@ -30,6 +32,7 @@ std::mutex        g_mutex;
 View              g_view;
 std::atomic<bool> g_stop {false};
 std::thread       g_worker;
+std::atomic<bool> g_all_threads {false}; // (ds-pc-port13)
 
 void SetText(const std::string& text) {
 	std::scoped_lock lock(g_mutex);
@@ -96,7 +99,8 @@ Child Launch(const std::string& name, const std::wstring& args, bool claims) {
 		return h;
 	}();
 	if (job != nullptr) AssignProcessToJobObject(job, pi.hProcess);
-	if (g_setup.affinity != 0) SetProcessAffinityMask(pi.hProcess, static_cast<DWORD_PTR>(g_setup.affinity));
+	// (ds-pc-port13: every thread: any CPU)
+	if (g_setup.affinity != 0 && !g_all_threads) SetProcessAffinityMask(pi.hProcess, static_cast<DWORD_PTR>(g_setup.affinity));
 	// (Windows 11: no power throttling for a windowless process, as precompile-windows.ps1's Qos.High.)
 	PROCESS_POWER_THROTTLING_STATE state {PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED, 0};
 	SetProcessInformation(pi.hProcess, ProcessPowerThrottling, &state, sizeof(state));
@@ -174,8 +178,14 @@ void Work() {
 	// (10-27c) Bounded: a 32-thread PC ran 11 processes of 3 threads at once and rebooted (RAM, video memory or the
 	// driver). Now at most 4 processes of 2 threads (one per 8 CPUs), a new one only with 8 GB of RAM and of commit
 	// left, and one starting at a time (each creates its Vulkan device and translates its shaders first).
-	const int threads     = 2;
-	const int jobs        = std::clamp(g_setup.cpus / 8, 1, 4);
+	// (ds-pc-port13) All the CPU threads, on request: processes of 4 threads (one scales to ~4) up to every logical CPU
+	// (a 9950X3D: 8 x 4 = 32), still one starting at a time and each only with the free memory below.
+	const bool all        = g_all_threads;
+	const int  logical    = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+	const int threads     = all ? 4 : 2;
+	const int jobs        = all ? std::max(1, (logical + 3) / 4) : std::clamp(g_setup.cpus / 8, 1, 4);
+	std::printf("[port] precompile: %s, %d processes of %d threads at most\n", all ? "all CPU threads" : "relaxed", jobs, threads);
+	std::fflush(stdout);
 	const auto memory_ok  = [] {
 		MEMORYSTATUSEX m {};
 		m.dwLength = sizeof(m);
@@ -326,6 +336,36 @@ void Work() {
 
 void Configure(const Setup& setup) {
 	g_setup = setup;
+}
+
+void SetAllThreads(bool all) {
+	g_all_threads = all;
+}
+bool AllThreads() {
+	return g_all_threads;
+}
+
+void Choose(const std::string& ini, Settings* settings) {
+	if (settings == nullptr) return;
+	if (settings->precompile_threads != "todos" && settings->precompile_threads != "relajado") {
+		bool all = false;
+#if defined(_WIN32)
+		const std::string text = I18n::T("\xC2\xBFUsar todos los hilos de la CPU para precompilar m\xC3\xA1s r\xC3\xA1pido? (S\xC3\xAD = m\xC3\xA1xima "
+		                                 "velocidad, el PC ir\xC3\xA1 cargado; No = modo relajado)");
+		const std::string title = I18n::T("Preparar shaders");
+		all = MessageBoxW(nullptr, Wide(text).c_str(), Wide(title).c_str(), MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES;
+#endif
+		settings->precompile_threads = all ? "todos" : "relajado";
+		// (only this key into the file: the menu's other edits stay unsaved until it saves them)
+		Settings on_disk;
+		if (!ini.empty() && LoadSettings(ini, &on_disk)) {
+			on_disk.precompile_threads = settings->precompile_threads;
+			(void)SaveSettings(ini, on_disk);
+		} else if (!ini.empty()) {
+			(void)SaveSettings(ini, *settings);
+		}
+	}
+	SetAllThreads(settings->precompile_threads == "todos");
 }
 
 bool CacheCurrent() {

@@ -113,6 +113,7 @@
 #include "gpu_tiler_shaders/rt_reflections_spv.h"
 #include "gpu_tiler_shaders/rt_refl_hw_spv.h"
 #include "local/hwrt-scene.h"
+#include "local/rt-flicker.h"
 
 #include <algorithm>
 #include <array>
@@ -138,7 +139,8 @@ constexpr uint32_t CalibFloors   = CalibBytes + 16 * 3;
 constexpr uint32_t CalibWet      = CalibFloors + 2; // puddle guess: count + 16 byte sums; water: the same
 constexpr uint32_t CalibHist     = 300;             // 16 byte fields x 16 bins
 constexpr uint32_t StatsIndex    = 560;
-constexpr uint32_t StatsCount    = 34; // (fgrt-1029: 32 moving, 33 its blend)
+constexpr uint32_t StatsCount    = 40; // (fgrt-1029: 32 moving, 33 its blend; water-1030: 34..39 water)
+constexpr uint32_t WaterMaxStat  = 37; // (water-1030: an atomicMax, cleared every 10 s, not a counter)
 // (refl9) The metal survey (the shader's SURVEY, mode 8; never cleared): static / moving sample counts, set-bit counts
 // per class x layer x bit, byte histograms per class x field x 16 bins.
 constexpr uint32_t SurveyIndex   = 600;
@@ -205,6 +207,9 @@ struct RtPass {
 	RtImage                 rad2, fhist[2]; // (refl-hybrid-1028) the trace's result with the fill, the fill's history
 	RtImage                 chist[2];       // (rtfly-1029) the composite's contribution per render pixel (+ distance)
 	bool                    stable = true;  // (rtfly-1029) KYTY_RT_REFLECTIONS_STABLE
+	bool                    water_stable = true; // (water-1030) KYTY_RT_REFLECTIONS_WATER_STABLE
+	bool                    water_max_clear = false;
+	uint32_t                water_max = 0;
 	RtImage                 dummy; // 1x1 R32_UINT stand-in for absent G-buffer layers
 	std::vector<Retired>    retired;
 	VkBuffer                frame_buf = VK_NULL_HANDLE; // device-local: the shader's header, sums and counters
@@ -759,6 +764,10 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	for (uint32_t k = 0; k < StatsCount; ++k) {
 		const uint32_t v = c[k];
 		// (the first frames: the buffer's clear may not have run yet, its contents are a baseline only)
+		if (k == WaterMaxStat) { // (water-1030: the largest jump since the last clear)
+			if (g_rt.frame > 8 && !g_rt.water_max_clear) g_rt.water_max = std::max(g_rt.water_max, v);
+			continue;
+		}
 		if (g_rt.frame > 8) g_rt.stat_sum[k] += static_cast<uint32_t>(v - g_rt.stat_last[k]);
 		g_rt.stat_last[k] = v;
 	}
@@ -855,6 +864,18 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		            std::chrono::duration<double>(now - g_rt.stat_time).count(), 100.0 * sm[30] / px, 100.0 * sm[31] / px);
 		std::printf("RT reflections: motion (fgrt-1029): moving on %.1f%% of the pixels, temporal blend while moving %.0f%% new "
 		            "(history clamped to this frame's box)\n", 100.0 * sm[32] / px, sm[32] ? double(sm[33]) / double(sm[32]) : 0.0);
+	}
+	if (g_rt.stable) {
+		// (water-1030) The water flashes' own self-check (the RTFLICKER measure on the water / mirror-pool pixels only,
+		// the composite's contribution against the last frame's on a still camera; target ~0).
+		const double wp = static_cast<double>(std::max<uint64_t>(sm[34], 1));
+		std::printf("RTFLICKER: water reflections (water-1030, %s): changed > 10 %% %.3f %% (> 20 %% %.3f %%) of %llu probed points "
+		            "on a still camera, max jump %.1f %%; 3x3 clamp acted on %.2f%% of the pixels, misses filled %.2f%%; GPU %.3f ms\n",
+		            g_rt.water_stable ? "water fix on" : "water fix off: KYTY_RT_REFLECTIONS_WATER_STABLE=0", 100.0 * sm[35] / wp,
+		            100.0 * sm[36] / wp, static_cast<unsigned long long>(sm[34]), g_rt.water_max / 100.0, 100.0 * sm[38] / px,
+		            100.0 * sm[39] / px, g_rt.samples > 0 ? g_rt.sum_ms / g_rt.samples : 0.0);
+		g_rt.water_max       = 0;
+		g_rt.water_max_clear = true;
 	}
 	LogHwStats(std::chrono::duration<double>(now - g_rt.stat_time).count()); // (refl-hybrid-1028)
 	std::fflush(stdout);
@@ -1260,6 +1281,10 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			g_rt.pool_boost      = EnvFloat("KYTY_RT_REFLECTIONS_POOL_BOOST", 0.6f, 0.0f, 2.0f);
 			// (rtfly-1029) The firefly limit and the stabilisation of the composite's contribution (on unless "0").
 			if (const char* sv = std::getenv("KYTY_RT_REFLECTIONS_STABLE"); sv != nullptr && *sv == '0') g_rt.stable = false;
+			if (const char* wv = std::getenv("KYTY_RT_REFLECTIONS_WATER_STABLE"); wv != nullptr && *wv == '0') g_rt.water_stable = false;
+			std::printf("RT reflections: water flash fix (water-1030) %s: water / mirror pools clamped to their 3x3 hits, lone misses "
+			            "filled, the history kept while moving, a steadier water normal, 1.5x march steps on water "
+			            "(KYTY_RT_REFLECTIONS_WATER_STABLE=0: off)\n", g_rt.water_stable ? "on" : "off");
 			std::printf("RT reflections: flash fix (rtfly-1029) %s: the hit's light <= 4x the light around it (<= 4.0 exposed), "
 			            "the contribution kept per pixel and changed by <= 6%% of the pixel's light a frame on a still camera "
 			            "(KYTY_RT_REFLECTIONS_STABLE=0: off)\n", g_rt.stable ? "on" : "off");
@@ -1377,7 +1402,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0) |
 	               (g_rt.row0_up ? 16 : 0) | (cfg.checker ? 32 : 0) | (have_water ? 64 : 0) |
 	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0) |
-	               (g_rt.stable ? 1024 : 0); // (rtfly-1029: the firefly limit and the contribution's stabilisation)
+	               (g_rt.stable ? 1024 : 0) | // (rtfly-1029: the firefly limit and the contribution's stabilisation)
+	               (g_rt.water_stable ? 2048 : 0) | (RtFlicker::CameraStill() ? 4096 : 0); // (water-1030)
 	// (combo19: guided only while the guide is there; without it the material mask, refl6, instead of water only: the
 	// guide never found in play was the whole reason nothing changed)
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
@@ -1459,7 +1485,14 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		command.fillBuffer(vk::Buffer(g_rt.frame_buf), 0, VK_WHOLE_SIZE, 0);
 		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer,
 		        vk::AccessFlagBits2::eTransferWrite);
-	} else if (g_rt.calib_clear) {
+	} else if (g_rt.water_max_clear) {
+		// (water-1030) the water's largest-jump word from zero for the next 10 s
+		command.fillBuffer(vk::Buffer(g_rt.frame_buf), HeaderBytes + (StatsIndex + WaterMaxStat) * 4, 4, 0);
+		g_rt.water_max_clear = false;
+		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer,
+		        vk::AccessFlagBits2::eTransferWrite);
+	}
+	if (g_rt.calib_clear) {
 		// (a new calibration attempt: its sums from zero, the stats counters kept)
 		command.fillBuffer(vk::Buffer(g_rt.frame_buf), HeaderBytes, StatsIndex * 4, 0);
 		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer,

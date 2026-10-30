@@ -64,6 +64,14 @@ struct Input {
 Runtime                  g_rt;
 Settings                 g_edit;       // the menu's copy (present thread)
 Settings                 g_saved;      // what settings.ini holds now
+
+// (ds-pc-port13) Preparar shaders: all CPU threads or relaxed (asked the first time, then settings.ini's
+// precompilar_hilos; Opciones > Sistema changes it), then the precompile.
+void StartShaders() {
+	Precompile::Choose(g_rt.ini_path, &g_edit);
+	g_saved.precompile_threads = g_edit.precompile_threads;
+	Precompile::Start();
+}
 std::atomic<bool>        g_open {false};
 std::atomic<uint64_t>    g_revision {1};
 std::atomic<bool>        g_reset_edit {false};
@@ -722,7 +730,7 @@ void DrawShaderBlock(float unit) {
 		if (ImGui::SmallButton(I18n::T("Detener"))) std::thread([] { Precompile::Stop(); }).detach();
 	} else if (!v.finished) {
 		ImGui::SameLine();
-		if (ImGui::SmallButton(I18n::T("Preparar shaders"))) Precompile::Start();
+		if (ImGui::SmallButton(I18n::T("Preparar shaders"))) StartShaders();
 	}
 }
 
@@ -1417,6 +1425,13 @@ void Draw(float width, float height) {
 					else if (s.ram16_boost) ImGui::TextColored(kGold, "RAM %s: mejoras activadas. Cierra los navegadores mientras juegas.", s.simulate_ram16 ? "16 GB (simulado)" : (std::to_string(g_rt.pc.ram_gb) + " GB").c_str());
 					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para gráficas que se cuelgan o dan pantallazo azul: más estable, ~37% menos FPS.");
 					CheckRow("Usar todos los CCD (Ryzen de dos CCD)", true, s.all_ccds, "Ryzen de dos CCD: No = el juego en el CCD con más caché L3 (más rápido); Sí = todos los núcleos.");
+					{
+						// (ds-pc-port13) The shader precompile's CPU use (asked before the first one).
+						bool all = s.precompile_threads == "todos";
+						if (CheckRow("Precompilar shaders con todos los hilos de la CPU", false, all,
+						             "Sí = máxima velocidad, el PC irá cargado; No = modo relajado. Se aplica la próxima vez que se preparen los shaders."))
+							s.precompile_threads = all ? "todos" : "relajado", Precompile::SetAllThreads(all);
+					}
 					break;
 				}
 				case 7: { // Controles (the launcher's "Controles" and "Mapear mando")
@@ -2796,7 +2811,7 @@ void DrawLauncher(float width, float height) {
 					std::thread([] { Precompile::Stop(); }).detach();
 			} else if (LButton("Preparar shaders", {x0 + sh_pad, cy}, {U(240), U(36)}, false, g_font_semi, U(18),
 			                   "Compila ya todos los pipelines del juego para esta grafica (evita tirones la primera vez)."))
-				Precompile::Start();
+				StartShaders();
 		}
 		ImGui::SetCursorScreenPos({g_lbox.at.x, sy});
 		ImGui::Dummy({g_lbox.w, sh_h + U(14)});

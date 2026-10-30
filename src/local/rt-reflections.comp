@@ -80,7 +80,10 @@ layout(std430, binding = 18) buffer Frame {
 // metal > 0.5, 19 weight > 0.05 where the roughness < 0.1; refl8, the guide: 20 the game's SSR confidence > gparams.x, 21
 // our hit replaced > 5 % of the game's SSR, 22 sum of its confidence * 1000, 23 water with our mirror (weight > 0.05),
 // 24 its rgb set where its confidence is not; refl9: 25 metal > 0.5 (G-buffer surface), 26 glossy > 0.5 (not metal),
-// 27 sum of the metal / glossy paths' added weight * 1000, 28 metal with an added weight > 0.05, 29 glossy with one > 0.05);
+// 27 sum of the metal / glossy paths' added weight * 1000, 28 metal with an added weight > 0.05, 29 glossy with one > 0.05;
+// 30 / 31 the flash fix, 32 / 33 moving; water-1030, water and mirror pools: 34 points probed on a still camera, 35 changed
+// > 10 % of the pixel's light from the last frame, 36 > 20 %, 37 the largest jump (atomicMax, 1e-4 of the light; cleared
+// every 10 s by the CPU), 38 the 3x3 clamp acted, 39 a miss filled from its hits);
 // [CALIB_HIST + field * 16 + bin] byte histograms;
 // [SURVEY ...] (refl9) the metal survey (mode 8, never cleared): [0] static G-buffer samples, [1] moving (characters),
 // [2 + class * 128 + layer * 32 + bit] set-bit counts, [258 + class * 256 + field * 16 + bin] byte histograms (class 0
@@ -112,7 +115,8 @@ layout(push_constant) uniform Push {
 	                 // 32 checkerboard trace: half the trace pixels march each frame, the others keep their history,
 	                 // 64 the G-buffer-time depth is bound: water detection, 128 moving objects (characters) skipped,
 	                 // 256 the game's SSR (binding 21) bound, 512 guided by the game: no material or guess mask,
-                 // 1024 (rtfly-1029) the firefly limit and the contribution's stabilisation: Firefly / Stabilize)
+                 // 1024 (rtfly-1029) the firefly limit and the contribution's stabilisation: Firefly / Stabilize,
+                 // 2048 (water-1030) water / mirror pools held steady: WaterStable, 4096 the camera holds still (stats))
 	ivec4 dec;       // normal code (-1: depth normals), roughness field (-1: heuristic), packed layers, mode 7: the hi-z mip,
 	                 // else the gloss field (-1 none; its code inverts it: 1 - gloss)
 	ivec4 misc2;     // exposure index, hi-z levels, max iterations, metal field + 1 (0: none, f0 0.04)
@@ -408,7 +412,10 @@ float WaterMask(ivec2 rp, float d, vec2 uv, vec3 Nd) {
 	if (nearer <= 0.0) return 0.0;
 	float upf = UpFacing(Nd);
 	if (upf <= 0.0) return 0.0;
-	return nearer * upf * Flatness(uv, Nd, 0.93, 0.985); // (refl4: must be flat: never a character or a particle)
+	// (water-1030: with WaterStable a little more lenient, so rippling water does not drop in and out of the mask, a
+	// 40 % mirror on one frame and none the next)
+	bool ws = (push.misc.w & 2048) != 0;
+	return nearer * upf * Flatness(uv, Nd, ws ? 0.88 : 0.93, ws ? 0.97 : 0.985); // (refl4: must be flat: never a character or a particle)
 }
 // Flat water reflects as a mirror: its depth normal (noisy from the depth's precision far away) snapped to world up
 // when it is close to it; waves (normals further off) keep their own.
@@ -416,6 +423,9 @@ vec3 WaterNormal(vec3 Nd) {
 	if ((push.misc.w & 8) == 0) return Nd;
 	vec3  up = normalize(up_view.xyz);
 	float c  = dot(Nd, up);
+	// (water-1030, WaterStable: the per-pixel depth normal of ripples is noise (the depth's precision, the vertex waves):
+	// snapped level from 0.94, a smoothed blend below, so the mirror ray does not jump between hit and miss pixel to pixel)
+	if ((push.misc.w & 2048) != 0) return c > 0.94 ? up : normalize(mix(Nd, up, smoothstep(0.75, 0.94, c)));
 	return c > 0.97 ? up : normalize(mix(Nd, up, smoothstep(0.85, 0.97, c)));
 }
 // The previous frame's uv of a view-space point through clip -> previous clip (`flip`: the clip's y the other way).
@@ -615,6 +625,7 @@ vec3 SampleGgxVndf(vec3 N, vec3 V, float alpha, vec2 u) {
 	return normalize(tx * hl.x + ty * hl.y + N * hl.z);
 }
 
+bool WaterStable() { return (push.misc.w & 2048) != 0; } // (water-1030, see WaterClamp)
 bool Sampled(ivec2 p) { return ((p.x | p.y) & 3) == 0; } // (the stats: 1 pixel in 16)
 // (one atomic per subgroup: the lanes active here summed first)
 void Stat(int k, int v) {
@@ -764,6 +775,7 @@ void Trace(ivec2 px, bool march) {
 	vec4 hc;
 	float hdist;
 	int   iters = max(int(float(push.misc2.z) * mix(1.0, 0.5, smoothstep(0.15, 0.45, s.rough))), 8);
+	if (WaterStable() && s.water > 0.0) iters += iters / 2; // (water-1030: water's mirror ray finds more, a finer march)
 	if (!March(P, s.N, R, V, iters, hc, hdist)) { StoreMiss(px, s); return; }
 	if (st) Stat(5, 1);
 	imageStore(out_a, px, hc);
@@ -1010,6 +1022,47 @@ vec3 ClampEnergy(vec3 refl, float lc, float pool) {
 //              pops in or out in one frame. It only moves between the last result and this frame's, both within the
 //              darkening limit (MaxDarken), so it adds no darkening (vegetation, surfaces against walls).
 bool Stable() { return (push.misc.w & 1024) != 0; }
+// ---- (water-1030) Water flashes ----
+// Water and mirror pools reflect with a high weight (the minimum reflectance 0.4, the pool boost): one bright hit (sky,
+// sun, an emissive) or a ray that hits on one frame and misses on the next (rippling normals, the jitter) is a big jump
+// there, and the stabilisation let everything through as soon as the camera moved (water is still while the camera
+// moves). With WaterStable (misc.w & 2048, KYTY_RT_REFLECTIONS_WATER_STABLE=1, the default):
+//   WaterClamp: the hit's luminance clamped to the min .. max of its 3x3 neighbours' hits (the trace's own result, not the
+//               surface light): a single bright pixel is cut, an edge inside the neighbourhood stays (no blur); a lone hit
+//               among misses is weakened, a lone miss among hits (>= 5 of 8) takes their mean (no black-to-bright toggle).
+//   Stabilize:  on water the history is kept while moving too: at most 70 % new, the history clamped to a box of 0.6x
+//               the pixel's light around this frame's contribution, a change of at most 45 % of the light a frame.
+vec4 WaterClamp(ivec2 px, vec4 rf, bool st) {
+	vec2  ts  = TraceSize();
+	bool  full = all(equal(ivec2(ts), ivec2(RenderSize())));
+	ivec2 tp  = full ? px : ivec2((vec2(px) + 0.5) * ts / RenderSize());
+	ivec2 hi  = ivec2(ts) - 1;
+	float lmin = 1e30, lmax = 0.0, n = 0.0;
+	vec4  sum = vec4(0);
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			if (x == 0 && y == 0) continue;
+			vec4 q = texelFetch(src_a, clamp(tp + ivec2(x, y), ivec2(0), hi), 0);
+			if (Bad(q) || q.a < 1e-3) continue;
+			float l = Luma(q.rgb / q.a);
+			lmin = min(lmin, l), lmax = max(lmax, l), sum += q, n += 1.0;
+		}
+	bool hit = !Bad(rf) && rf.a >= 1e-3;
+	if (!hit) {
+		if (full && n >= 5.0) {
+			if (st) Stat(39, 1);
+			return sum / n;
+		}
+		return rf;
+	}
+	if (n < 3.0) return rf * (0.25 + 0.25 * n); // (a lone hit: the toggle's bright side)
+	vec3  c = rf.rgb / rf.a;
+	float l = Luma(c);
+	float t = clamp(l, lmin, lmax);
+	if (st) Stat(38, abs(t - l) > 0.02 * max(l, 0.05) ? 1 : 0);
+	if (l > 1e-6 && t != l) c *= t / l;
+	return vec4(c * rf.a, rf.a);
+}
 vec3 Firefly(ivec2 px, vec3 refl, vec3 c0, float e, float lg, bool st) {
 	float lr = Luma(max(refl, vec3(0)));
 	float lc = Luma(max(c0, vec3(0)));
@@ -1026,7 +1079,7 @@ vec3 Firefly(ivec2 px, vec3 refl, vec3 c0, float e, float lg, bool st) {
 	if (st) Stat(31, cl ? 1 : 0);
 	return cl ? refl * (cap / lr) : refl;
 }
-vec3 Stabilize(ivec2 px, vec3 c0, vec3 outc, float d) {
+vec3 Stabilize(ivec2 px, vec3 c0, vec3 outc, float d, bool wl) {
 	vec2  rs    = RenderSize();
 	vec2  uv    = (vec2(px) + 0.5) / rs;
 	float z     = abs(ViewZ(d));
@@ -1056,10 +1109,21 @@ vec3 Stabilize(ivec2 px, vec3 c0, vec3 outc, float d) {
 		float e     = GameExposure();
 		float lc    = Luma(max(c0, vec3(0)));
 		float lref  = max(max(lc, Luma(max(outc, vec3(0)))), 0.004 / max(e, 1e-12));
-		vec3  box   = vec3(mix(4.0, 0.08, mov) * lref);
+		bool  ww    = wl && WaterStable();
+		// (water-1030) What the water's reflection did since the last frame, on a still camera: the RTFLICKER-style line.
+		if (ww && valid && Sampled(px) && (push.misc.w & 4096) != 0) {
+			float ref = max(max(Luma(max(c0 + delta, vec3(0))), Luma(max(c0 + hd, vec3(0)))), 0.02);
+			float ch  = abs(Luma(delta) - Luma(hd)) / ref;
+			Stat(34, 1);
+			Stat(35, ch > 0.1 ? 1 : 0);
+			Stat(36, ch > 0.2 ? 1 : 0);
+			if (!isnan(ch)) atomicMax(calib[STATS + 37], int(min(ch, 100.0) * 10000.0));
+		}
+		if (ww) alpha = valid ? mix(0.3, 0.7, mov) : 1.0;
+		vec3  box   = vec3((ww ? mix(4.0, 0.6, mov) : mix(4.0, 0.08, mov)) * lref);
 		hd          = clamp(hd, delta - box, delta + box);
 		vec3  tgt   = mix(hd, delta, alpha);
-		float lim   = mov > 0.5 ? 1e30 : (0.06 + 0.60 * mov) * lref;
+		float lim   = ww ? (0.06 + 0.39 * mov) * lref : mov > 0.5 ? 1e30 : (0.06 + 0.60 * mov) * lref;
 		vec3  stp   = tgt - hd;
 		// (a darkening going back toward the game's pixel: twice the rate)
 		if (Luma(hd) < 0.0 && Luma(stp) > 0.0) lim *= 2.0;
@@ -1081,7 +1145,8 @@ vec3 Stabilize(ivec2 px, vec3 c0, vec3 outc, float d) {
 
 // The surface comes from the trace's (its roughness and mask, upsampled when the trace is at half resolution): the
 // wet-surface mask is not evaluated a second time per render pixel.
-vec3 CompositeRaw(ivec2 px, vec4 col, float d) {
+vec3 CompositeRaw(ivec2 px, vec4 col, float d, out bool wl) {
+	wl      = false;
 	bool st = Sampled(px);
 	if (st) Stat(0, 1);
 	vec2  uv = (vec2(px) + 0.5) / RenderSize();
@@ -1184,6 +1249,8 @@ vec3 CompositeRaw(ivec2 px, vec4 col, float d) {
 		if (mask < 0.01 && ex < 0.01) { return col.rgb; }
 	}
 	if (st && mask > 0.5 && water > 0.5) Stat(7, 1);
+	// (water-1030) Water and the mirror pools (the high-weight mirrors): the water flash fix below and in Stabilize.
+	wl = water > 0.0 || (pool > 0.5 && upf_c > 0.5 && metal <= 0.5 && fr_rough < 0.2);
 	// (refl3) Water and near-mirrors with a half-resolution trace: their own mirror ray at the render resolution, so
 	// the reflection keeps every pixel of detail (the upsampled, filtered one is the fallback where it finds nothing).
 	// (refl9b) Large pools too (up to a roughness of 0.25: wet stone under a puddle reads rougher than its water): their
@@ -1202,6 +1269,7 @@ vec3 CompositeRaw(ivec2 px, vec4 col, float d) {
 			rf = agree ? mix(hc, rf, 0.25 * (1.0 - pool)) : hc;
 		}
 	}
+	if (wl && WaterStable()) rf = WaterClamp(px, rf, st);
 	if (Bad(rf) || rf.a < 1e-3) {
 		return col.rgb;
 	}
@@ -1309,9 +1377,10 @@ void Composite(ivec2 px) {
 		if (Stable()) imageStore(out_b, px, vec4(0, 0, 0, -1)); // (no history here)
 		return;
 	}
-	vec3 outc = CompositeRaw(px, col, d);
+	bool wl   = false;
+	vec3 outc = CompositeRaw(px, col, d, wl);
 	if (BadV(outc)) outc = col.rgb;
-	if (Stable()) outc = Stabilize(px, col.rgb, outc, d);
+	if (Stable()) outc = Stabilize(px, col.rgb, outc, d, wl);
 	imageStore(out_a, px, vec4(clamp(outc, vec3(0), vec3(6.0e4)), col.a));
 }
 

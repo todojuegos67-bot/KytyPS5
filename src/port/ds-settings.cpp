@@ -251,6 +251,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("reducir_texturas", s->texture_reduce);
 	boo("simular_vram_8gb", s->simulate_vram8);
 	boo("todos_los_ccd", s->all_ccds);
+	str("precompilar_hilos", s->precompile_threads);
 	str("metricas", s->metrics);
 	boo("menu_inicio", s->start_menu);
 	boo("vibracion", s->rumble);
@@ -415,6 +416,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "simular_vram_8gb=" << b(s.simulate_vram8) << "\n"
 	  << "; Ryzen con dos CCD: 0 = el juego en el CCD con mas cache L3 (mas rapido); 1 = todos los nucleos\n"
 	  << "todos_los_ccd=" << b(s.all_ccds) << "\n"
+	  << "; Precompilar shaders: todos = todos los hilos de la CPU (mas rapido, el PC va cargado); relajado; preguntar\n"
+	  << "precompilar_hilos=" << s.precompile_threads << "\n"
 	  << "; Anti-Lag con la frame generation de AMD: auto (Anti-Lag 2 en graficas AMD, el nuestro en las demas), amd2, normal,\n"
 	  << "; ultra, no. En los modos Souls ligero, equilibrado y low profile va siempre el nuestro en Ultra.\n"
 	  << "antilag_modo=" << s.antilag_mode << "\n"

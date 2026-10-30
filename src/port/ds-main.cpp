@@ -805,12 +805,14 @@ int main(int argc, char* argv[]) {
 			std::fflush(stdout);
 			if (!current && start_menu) {
 				// (10-28b) The launcher shows first: the precompile runs beside it, with its bar (JUGAR stops it, what
-				// is done is kept).
+				// is done is kept). (ds-pc-port13: all CPU threads or relaxed, asked the first time)
+				Port::Precompile::Choose(ini, &settings);
 				Port::Precompile::Start();
 			} else if (!current) {
 				// (10-27c) Every pipeline of the game into this GPU's driver cache, before the game, with its bar; Esc plays
 				// now (what is done is kept, the rest the next start or beside the game).
 				g_splash.skip = false;
+				Port::Precompile::Choose(ini, &settings); // (ds-pc-port13)
 				if (HWND w = g_splash.window.load(); w != nullptr) SetForegroundWindow(w);
 				Port::Precompile::Start();
 				for (;;) {

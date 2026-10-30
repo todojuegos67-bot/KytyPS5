@@ -14,6 +14,10 @@
 #include <filesystem>
 #include <string>
 
+namespace Port {
+struct Settings;
+}
+
 namespace Port::Precompile {
 
 struct Setup {
@@ -26,6 +30,14 @@ struct Setup {
 };
 
 void Configure(const Setup& setup);
+// (ds-pc-port13) The CPU use of the precompile: all = every logical CPU thread of the PC (processes of 4 threads, as many
+// as the CPUs allow, any CPU), else relaxed (the 10-27c bounds: at most 4 processes of 2 threads on the game's CPUs). The
+// "waiting for free memory" gate (8 GB of RAM and of commit left for each new process) applies either way.
+void SetAllThreads(bool all);
+bool AllThreads();
+// settings.ini's precompilar_hilos: "todos" / "relajado"; anything else (not chosen yet): the Yes/No question (a window
+// of its own, in the menu's language), its answer stored into *settings and into `ini` (only that key). Then SetAllThreads.
+void Choose(const std::string& ini, Settings* settings);
 // "--driver-cache-status": the game's driver cache holds every static recipe of this GPU's and driver's inputs.
 bool CacheCurrent();
 void Start();
