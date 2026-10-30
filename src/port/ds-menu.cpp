@@ -1134,7 +1134,7 @@ void DrawConfigurator(float unit, bool in_tab = false) {
 
 // (ds-pc-port10) The DLSS 5 rows' tooltips (launcher and F1).
 const char* const kDlss5Tip =
-    "DLSS 5 (Neural Rendering de NVIDIA): mejora la imagen con la IA de NVIDIA despu\xC3\xA9s del reescalado. Solo NVIDIA RTX. Necesita tu propio archivo nvngx_dlssnr.dll junto a \"Demon's Souls.exe\" (no viene incluido): sin \xC3\xA9l se ve como siempre. Suave, Medio y Fuerte bajan la resoluci\xC3\xB3n en los bordes de la pantalla para ahorrar GPU (Suave un poco, Fuerte m\xC3\xA1s); el centro siempre va a resoluci\xC3\xB3n completa. Experimental.";
+    "DLSS 5 (Neural Rendering de NVIDIA): mejora la imagen con la IA de NVIDIA despu\xC3\xA9s del reescalado. Solo NVIDIA RTX. Necesita tu propio archivo nvngx_dlssnr.dll junto a \"Demon's Souls.exe\" (no viene incluido): sin \xC3\xA9l se ve como siempre. Compatibilidad: RTX 5000 s\xC3\xAD; RTX 4000 (Ada Lovelace) con el parche, sin estar confirmado al 100%; RTX 3000 y anteriores no (no tienen FP8). Suave, Medio y Fuerte bajan la resoluci\xC3\xB3n en los bordes de la pantalla para ahorrar GPU (Suave un poco, Fuerte m\xC3\xA1s); el centro siempre va a resoluci\xC3\xB3n completa. Experimental.";
 const char* const kDlss5StrengthTip =
     "Intensidad del efecto de DLSS 5: Baja, Media o Alta (la de NVIDIA, por defecto). M\xC3\xA1s baja: se parece m\xC3\xA1s a la imagen original del juego.";
 const char* const kDlss5FileTip =
@@ -2528,7 +2528,6 @@ void LauncherUpdateBox() {
 	ImGui::BeginGroup();
 	ImGui::PushItemWidth(U(396));
 	ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
-	ImGui::TextColored(kDimL, I18n::T("Version instalada: %s"), Update::CurrentVersion());
 	if (!text.empty()) ImGui::TextColored(kInkL, "%s", text.c_str());
 	ImGui::PopTextWrapPos();
 	const bool  busy = g_upd.busy.load();
