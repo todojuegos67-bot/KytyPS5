@@ -146,9 +146,32 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
         LOG_ERROR(Frontend, "Error getting display mode: {}", SDL_GetError());
         error = true;
     }
+    // Exclusive fullscreen switches the display to the mode closest to the configured window
+    // size (a DSR / VSR 3840x2160 mode on a 1440p panel, say) at the desktop's refresh rate, so
+    // the swapchain gets that size without the desktop being changed. Borderless keeps NULL (the
+    // desktop mode). No such mode: the desktop mode, logged.
+    SDL_DisplayMode exclusive_mode{};
+    const SDL_DisplayMode* fullscreen_mode = NULL;
+    const bool exclusive = EmulatorSettings.GetFullScreenMode() == "Fullscreen";
+    if (!error && exclusive) {
+        if (SDL_GetClosestFullscreenDisplayMode(displayIndex, width, height,
+                                                displayMode->refresh_rate, true,
+                                                &exclusive_mode)) {
+            fullscreen_mode = &exclusive_mode;
+        } else {
+            LOG_WARNING(Frontend,
+                        "display mode: no {}x{} fullscreen mode ({}), using the desktop mode "
+                        "{}x{}@{:.0f} Hz",
+                        width, height, SDL_GetError(), displayMode->w, displayMode->h,
+                        displayMode->refresh_rate);
+            fullscreen_mode = displayMode;
+        }
+        LOG_INFO(Frontend, "display mode: {}x{}@{:.0f} Hz (exclusive fullscreen{})",
+                 fullscreen_mode->w, fullscreen_mode->h, fullscreen_mode->refresh_rate,
+                 fullscreen_mode == displayMode ? ", desktop mode" : "");
+    }
     if (!error) {
-        SDL_SetWindowFullscreenMode(
-            window, EmulatorSettings.GetFullScreenMode() == "Fullscreen" ? displayMode : NULL);
+        SDL_SetWindowFullscreenMode(window, exclusive ? fullscreen_mode : NULL);
     }
     SDL_SetWindowFullscreen(window, EmulatorSettings.IsFullScreen());
     SDL_SyncWindow(window);
