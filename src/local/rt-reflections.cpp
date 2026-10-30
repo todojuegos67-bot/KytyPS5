@@ -98,6 +98,15 @@
 // the composite takes its square root). Every 10 s "RT reflections: hybrid:" with the traced / hit / previous-screen
 // shares, the fill share and the RTFLASH counters (raw: what the limits stopped; out: must stay 0). Not available this
 // frame (no TLAS built, no ray queries): the screen-space path alone, and the fill restarts from zero weight.
+//
+// (rtfly-1029) The flashes ("fogonazos"): RTFLICKER on a still camera (335/335 frames) gave the reflections 0.4-0.7 % of
+// their 360-420k points changing by > 10 % of the pixel's light a frame (0.2 % by > 20 %, the largest 95-98 %), every
+// other pass ~0: single bright hits and hits toggling hit / miss under the jitter. KYTY_RT_REFLECTIONS_STABLE (default 1;
+// 0: as before): a firefly limit on every path (the hit's light <= 4x the light around the reflector, <= 4.0 exposed,
+// never below the pixel's own or the game's reflected colour) and the composite's contribution (out - in) kept per render
+// pixel (chist), reprojected by the motion vector, averaged and limited to a change of 6 % of the pixel's light a frame on a
+// still camera (36 % moving); no added darkening (it moves only between two results that both keep MaxDarken). Every 10 s
+// "RT reflections: flash fix:" with the shares where each limit acted (stats 30 / 31).
 #include "local/rt-reflections.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -129,7 +138,7 @@ constexpr uint32_t CalibFloors   = CalibBytes + 16 * 3;
 constexpr uint32_t CalibWet      = CalibFloors + 2; // puddle guess: count + 16 byte sums; water: the same
 constexpr uint32_t CalibHist     = 300;             // 16 byte fields x 16 bins
 constexpr uint32_t StatsIndex    = 560;
-constexpr uint32_t StatsCount    = 32;
+constexpr uint32_t StatsCount    = 34; // (fgrt-1029: 32 moving, 33 its blend)
 // (refl9) The metal survey (the shader's SURVEY, mode 8; never cleared): static / moving sample counts, set-bit counts
 // per class x layer x bit, byte histograms per class x field x 16 bins.
 constexpr uint32_t SurveyIndex   = 600;
@@ -194,6 +203,8 @@ struct RtPass {
 	RtImage                 hiz, rad, aux, tmp_a, tmp_b, out;
 	RtImage                 gb[2], hist[2], meta[2];
 	RtImage                 rad2, fhist[2]; // (refl-hybrid-1028) the trace's result with the fill, the fill's history
+	RtImage                 chist[2];       // (rtfly-1029) the composite's contribution per render pixel (+ distance)
+	bool                    stable = true;  // (rtfly-1029) KYTY_RT_REFLECTIONS_STABLE
 	RtImage                 dummy; // 1x1 R32_UINT stand-in for absent G-buffer layers
 	std::vector<Retired>    retired;
 	VkBuffer                frame_buf = VK_NULL_HANDLE; // device-local: the shader's header, sums and counters
@@ -377,9 +388,10 @@ void Barrier(vk::CommandBuffer command, vk::PipelineStageFlags2 src_stage, vk::A
 	command.pipelineBarrier2(dependency);
 }
 
-std::array<RtImage*, 16> Sized() {
+std::array<RtImage*, 18> Sized() {
 	return {&g_rt.hiz, &g_rt.rad, &g_rt.aux, &g_rt.tmp_a, &g_rt.tmp_b, &g_rt.out, &g_rt.gb[0], &g_rt.gb[1], &g_rt.hist[0],
-	        &g_rt.hist[1], &g_rt.meta[0], &g_rt.meta[1], &g_rt.rad2, &g_rt.fhist[0], &g_rt.fhist[1], &g_rt.dummy};
+	        &g_rt.hist[1], &g_rt.meta[0], &g_rt.meta[1], &g_rt.rad2, &g_rt.fhist[0], &g_rt.fhist[1], &g_rt.chist[0],
+	        &g_rt.chist[1], &g_rt.dummy};
 }
 
 bool EnsurePipeline(GraphicContext& graphics) {
@@ -484,7 +496,7 @@ constexpr LevelCfg Levels[5] = {
     {"off", false, false, 0, 0.0f, 0, 0.0f, 0.0f, 1.0f},
     {"low", false, true, 24, 0.45f, 1, 200.0f, 0.30f, 1.0f},
     {"medium", false, false, 32, 0.55f, 2, 300.0f, 0.45f, 1.0f},
-    {"high", false, false, 48, 0.60f, 3, 800.0f, 0.75f, 0.9f}, // (10-24 far: 400 m / 0.65)
+    {"high", true, false, 48, 0.60f, 3, 800.0f, 0.75f, 0.9f}, // (10-24 far: 400 m / 0.65)
     {"ultra", true, true, 72, 0.65f, 3, 1600.0f, 1.00f, 0.8f}, // (10-24 far: 64 / 600 m / 0.90)
 };
 const LevelCfg& Cfg(int level) { return Levels[std::clamp(level, 0, 4)]; }
@@ -498,7 +510,8 @@ bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level) {
 	while (levels < MaxMips && ((render.width >> levels) > 0 || (render.height >> levels) > 0)) ++levels;
 	const auto f16 = vk::Format::eR16G16B16A16Sfloat;
 	bool ok = MakeImage(graphics, g_rt.hiz, vk::Format::eR32Sfloat, render, levels, true) &&
-	          MakeImage(graphics, g_rt.out, f16, render, 1, true);
+	          MakeImage(graphics, g_rt.out, f16, render, 1, true) && MakeImage(graphics, g_rt.chist[0], f16, render, 1, true) &&
+	          MakeImage(graphics, g_rt.chist[1], f16, render, 1, true);
 	for (auto* img: {&g_rt.rad, &g_rt.aux, &g_rt.tmp_a, &g_rt.tmp_b, &g_rt.gb[0], &g_rt.gb[1], &g_rt.hist[0], &g_rt.hist[1],
 	                 &g_rt.meta[0], &g_rt.meta[1], &g_rt.rad2, &g_rt.fhist[0], &g_rt.fhist[1]})
 		ok = ok && MakeImage(graphics, *img, f16, trace, 1, true);
@@ -724,6 +737,14 @@ void LogHwStats(double seconds) {
 	            100.0 * sm[6] / refl, 100.0 * sm[12] / refl, 100.0 * sm[13] / refl, static_cast<unsigned long long>(sm[7]),
 	            static_cast<unsigned long long>(sm[8]), static_cast<unsigned long long>(sm[9]),
 	            static_cast<unsigned long long>(sm[10]), static_cast<unsigned long long>(sm[11]));
+	{
+		// (fgrt-1029) Where the reflective pixels' colour came from: the screen-space hit, the TLAS hit (previous screen),
+		// the TLAS hit's stand-in (the source off screen or hidden: kept, not faded out).
+		const double ss = static_cast<double>(sm[16]), tl = static_cast<double>(sm[3]), sb = static_cast<double>(sm[15]);
+		const double all = std::max(ss + tl + sb, 1.0);
+		std::printf("RT reflections: sources (fgrt-1029): screen-space %.1f%%, TLAS fallback %.1f%% (previous screen %.1f%%, "
+		            "off-screen / hidden stand-in %.1f%%)\n", 100.0 * ss / all, 100.0 * (tl + sb) / all, 100.0 * tl / all, 100.0 * sb / all);
+	}
 	g_rt.hw_sum.fill(0);
 	g_rt.hw_frames = 0, g_rt.hw_skipped = 0;
 }
@@ -826,6 +847,14 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		            sm[22] / 1000.0 / px, pc(24), static_cast<unsigned long long>(g_rt.stat_guide_frames),
 		            static_cast<unsigned long long>(g_rt.stat_frames), gl.extent.width, gl.extent.height,
 		            static_cast<unsigned long long>(gl.cs), gl.slot, producer, RtReflGuideStatus());
+	}
+	if (g_rt.stable) {
+		// (rtfly-1029) Where the composite's contribution was held back this window (its change a frame limited) and where
+		// a hit's light was limited (fireflies), shares of the non-sky pixels.
+		std::printf("RT reflections: flash fix: last %.0f s: change limited on %.2f%% of the pixels, firefly limited on %.2f%%\n",
+		            std::chrono::duration<double>(now - g_rt.stat_time).count(), 100.0 * sm[30] / px, 100.0 * sm[31] / px);
+		std::printf("RT reflections: motion (fgrt-1029): moving on %.1f%% of the pixels, temporal blend while moving %.0f%% new "
+		            "(history clamped to this frame's box)\n", 100.0 * sm[32] / px, sm[32] ? double(sm[33]) / double(sm[32]) : 0.0);
 	}
 	LogHwStats(std::chrono::duration<double>(now - g_rt.stat_time).count()); // (refl-hybrid-1028)
 	std::fflush(stdout);
@@ -1229,6 +1258,11 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			g_rt.metal_tint      = EnvFloat("KYTY_RT_REFLECTIONS_METAL_TINT", 0.7f, 0.0f, 1.0f);
 			g_rt.min_area        = EnvFloat("KYTY_RT_REFLECTIONS_MIN_AREA", 10.0f, 0.0f, 64.0f);
 			g_rt.pool_boost      = EnvFloat("KYTY_RT_REFLECTIONS_POOL_BOOST", 0.6f, 0.0f, 2.0f);
+			// (rtfly-1029) The firefly limit and the stabilisation of the composite's contribution (on unless "0").
+			if (const char* sv = std::getenv("KYTY_RT_REFLECTIONS_STABLE"); sv != nullptr && *sv == '0') g_rt.stable = false;
+			std::printf("RT reflections: flash fix (rtfly-1029) %s: the hit's light <= 4x the light around it (<= 4.0 exposed), "
+			            "the contribution kept per pixel and changed by <= 6%% of the pixel's light a frame on a still camera "
+			            "(KYTY_RT_REFLECTIONS_STABLE=0: off)\n", g_rt.stable ? "on" : "off");
 			if (g_rt.dec_metal >= 0 && !g_rt.rough_trusted && FieldsOverlap(g_rt.dec_rough, g_rt.dec_metal) && g_rt.dec_gloss >= 0)
 				g_rt.dec_rough = g_rt.dec_gloss, g_rt.dec_gloss = -1; // (as SurveyDecide: a metal field is not a roughness)
 			std::printf("RT reflections: metal strength %g, glossy strength %g, metal tint %g, minimum area radius %g px (720p), pool "
@@ -1342,7 +1376,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.misc[2] = level;
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0) |
 	               (g_rt.row0_up ? 16 : 0) | (cfg.checker ? 32 : 0) | (have_water ? 64 : 0) |
-	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0);
+	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0) |
+	               (g_rt.stable ? 1024 : 0); // (rtfly-1029: the firefly limit and the contribution's stabilisation)
 	// (combo19: guided only while the guide is there; without it the material mask, refl6, instead of water only: the
 	// guide never found in play was the whole reason nothing changed)
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
@@ -1623,8 +1658,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 	{
 		Set s = base;
-		s.a = src, s.b = src, s.gcur = &g.gb[cur], s.gprev = &g.gb[cur], s.aux = &g.aux, s.meta = &g.meta[cur];
-		s.oa = &g.out, s.ob = &g.rad, s.oc = &g.rad;
+		// (rtfly-1029: binding 6 the last frame's contribution, binding 12 this frame's)
+		s.a = src, s.b = &g.chist[prev], s.gcur = &g.gb[cur], s.gprev = &g.gb[cur], s.aux = &g.aux, s.meta = &g.meta[cur];
+		s.oa = &g.out, s.ob = &g.chist[cur], s.oc = &g.rad;
 		run(4, s, g.render);
 		stamp(StComposite);
 	}

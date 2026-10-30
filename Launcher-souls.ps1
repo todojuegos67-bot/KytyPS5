@@ -25,6 +25,14 @@ $ErrorActionPreference = 'Stop'
 # (Any error that stops this script, with where it came from, in launcher-error.txt next to it.)
 trap { "$(Get-Date -Format s) $_`n$($_.ScriptStackTrace)" | Out-File -Append -LiteralPath (Join-Path $PSScriptRoot 'launcher-error.txt'); break }
 $root     = $PSScriptRoot
+# (10-29) Actualizacion del emulador en partes (kyty_emulator.exe.part0/1 + .md5): se unen al abrir el lanzador.
+try { $up0 = Join-Path $root 'kyty_emulator.exe.part0'; $up1 = Join-Path $root 'kyty_emulator.exe.part1'; $upm = Join-Path $root 'kyty_emulator.exe.md5'
+	if ((Test-Path -LiteralPath $up0) -and (Test-Path -LiteralPath $up1) -and (Test-Path -LiteralPath $upm)) {
+		$upTmp = Join-Path $root 'kyty_emulator.exe.new'; $fo = [System.IO.File]::Create($upTmp)
+		foreach ($pp in $up0, $up1) { $bytes = [System.IO.File]::ReadAllBytes($pp); $fo.Write($bytes, 0, $bytes.Length) }; $fo.Close()
+		$want = (Get-Content -LiteralPath $upm -Raw).Trim().ToLower(); $got = (Get-FileHash -LiteralPath $upTmp -Algorithm MD5).Hash.ToLower()
+		if ($got -eq $want) { Move-Item -LiteralPath $upTmp -Destination (Join-Path $root 'kyty_emulator.exe') -Force; Remove-Item -LiteralPath $up0, $up1, $upm -Force } else { Remove-Item -LiteralPath $upTmp -Force }
+	} } catch { }
 $exeName  = 'kyty_emulator.exe'
 $pathFile = Join-Path $root 'game-path.txt'
 $iniFile  = Join-Path $root 'launcher.ini'
@@ -354,7 +362,9 @@ function Start-Game {
 	$sets += 'KYTY_FG_PACING=0'  # (10-21) el reparto de frames del emulador (se quedaba en 20 FPS) apagado
 	# (10-22) Modo 4K: los reescaladores calculan su resolucion sobre 2160 (salida 4K), no sobre los 1440 del monitor.
 	$outH = Get-OutHeight
-	if ($outH -ne 1440) { $sets += "KYTY_DISPLAY_HEIGHT=$outH" }
+	# (res-1029) La resolucion elegida es la salida del juego, del reescalador y de la pantalla (KYTY_OUTPUT_HEIGHT), y la
+	# altura sobre la que los reescaladores calculan su 3D (KYTY_DISPLAY_HEIGHT), sea cual sea el monitor.
+	$sets += "KYTY_OUTPUT_HEIGHT=$outH"; $sets += "KYTY_DISPLAY_HEIGHT=$outH"
 	$sets += 'KYTY_DS_SIXTY_STEP=0'  # (10-22) el paso de 60 en cinematico no arreglaba las cinematicas: el modo como en PS5 y cinematicas a 30 reales
 	$sets += 'KYTY_DS_VARIABLE_STEP=1'  # (10-21) fisica al tiempo real de cada frame (physicsUseFixedTimestep=false)
 	# Nitidez del reescalado (KYTY_UPSCALE_SHARPNESS): FSR con su propio RCAS, DLSS y XeSS con un paso de nitidez despues.
@@ -438,12 +448,7 @@ function Start-Game {
 	}
 	if (-not $pureGame -and $cmbFlare -and $cmbFlare.SelectedIndex -gt 0) { $sets += 'KYTY_TORCH_FLARE=1' }  # (torch-1028) destellos de lente
 	if ($cmbDof -and -not $pureGame) { $sets += "KYTY_DOF=$([math]::Min(3, [math]::Max(0, $cmbDof.SelectedIndex)))" } else { $sets += 'KYTY_DOF=0' }  # (ds-dof-1029) profundidad de campo a distancia: No/Suave/Cinematico/Fuerte
-	$fovI = if ($cmbFov -and -not $pureGame) { [math]::Min(4, [math]::Max(0, $cmbFov.SelectedIndex)) } else { 0 }  # (ds-foveated-1029) DLSS 5 NR: No / PreSR / Foveado Suave / Medio / Fuerte
-	$fovU = "KYTY_DLSS_NR_UNSIGNED=$(if ($cmbFovU -and $cmbFovU.SelectedIndex -eq 1) { '1' } else { '0' })"  # Archivo DLSS 5: oficial / no oficial
-	$fovS = "KYTY_DLSS_NR_STRENGTH=$(if ($cmbFovS) { @('0.35', '0.65', '1')[[math]::Min(2, [math]::Max(0, $cmbFovS.SelectedIndex))] } else { '1' })"  # Intensidad DLSS 5: Baja / Media / Alta
-	if ($fovI -eq 1) { $sets += @('KYTY_DLSS_NR=1', 'KYTY_DLSS_NR_PRESR=1', 'KYTY_FOVEATED=0', $fovU, $fovS) }  # PreSR: antes del reescalado, a la resolucion de render
-	elseif ($fovI -ge 2) { $sets += @('KYTY_FOVEATED=1', 'KYTY_DLSS_NR_PRESR=0', $fovU, $fovS, "KYTY_FOV_EDGE=$(@('0.5', '0.5', '0.75', '0.5', '0.35')[$fovI])") }  # foveado despues del reescalado: borde 0,75 / 0,5 / 0,35
-	else { $sets += @('KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0', 'KYTY_DLSS_NR_PRESR=0') }
+	if ($cmbFov -and -not $pureGame -and $cmbFov.SelectedIndex -gt 0) { $sets += @('KYTY_FOVEATED=1', "KYTY_DLSS_NR_STRENGTH=$(if ($cmbFovS) { @('0.35', '0.65', '1')[[math]::Min(2, [math]::Max(0, $cmbFovS.SelectedIndex))] } else { '1' })", "KYTY_DLSS_NR_UNSIGNED=$(if ($cmbFovU -and $cmbFovU.SelectedIndex -eq 1) { '1' } else { '0' })", "KYTY_FOV_EDGE=$(@('0.5', '0.75', '0.5', '0.35')[[math]::Min(3, $cmbFov.SelectedIndex)])") } else { $sets += @('KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0') }  # (ds-foveated-1029) DLSS 5 NR foveado: No/Suave/Medio/Fuerte (borde 0,75/0,5/0,35)
 	if ($pureGame) {
 		# (audit) Juego original: fuera todo pase visual del emulador (RT, volumetrica, sombra RT, brillo, oclusion especular, GTAO,
 		# SSGI, reflejos RT de pantalla, contacto, particulas RT); -Set manda sobre el entorno. Rendimiento, reescalador, FG y latencia igual.
@@ -452,7 +457,7 @@ function Start-Game {
 		foreach ($n in @(Get-ChildItem Env: | Where-Object { $_.Name -match $fxPat } | ForEach-Object { $_.Name })) { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 		$sets += @('KYTY_HWRT=0', 'KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_REFLECTIONS=0',
 			'KYTY_RT_SHADOWS=0', 'KYTY_CONTACT_SHADOWS=0', 'KYTY_RT_SUN=0', 'KYTY_RT_PARTICLES=0', 'KYTY_GODRAYS=0', 'KYTY_SHINE=0', 'KYTY_SPEC_OCCLUSION=0',
-			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0', 'KYTY_TORCH_HW=0', 'KYTY_SMOKE=0', 'KYTY_RT_HW_EXPERIMENTAL=0', 'KYTY_DOF=0', 'KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0', 'KYTY_DLSS_NR_PRESR=0')
+			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0', 'KYTY_TORCH_HW=0', 'KYTY_SMOKE=0', 'KYTY_RT_HW_EXPERIMENTAL=0', 'KYTY_DOF=0', 'KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0')
 		$pa = @(); for ($i = 0; $i -lt $psargs.Count; $i++) { if ($psargs[$i] -eq '-Ssgi') { $i++; continue }; $pa += $psargs[$i] }; $psargs = $pa
 	}
 	# (10-24) Brillo metales retirado (no aportaba)
@@ -486,22 +491,17 @@ function Start-Game {
 	# (10-27) DLSS en Modo Souls ligero / PC low profile (base 1080 / 900): DLSS sale a 4K (camino PS5 Pro) y solo acepta el 3D a
 	# 2160 / ratio exacto (1440, 1256, 1080, 720). Con base 1080, Calidad 1.333 daba 810: DLSS lo rechazaba y el juego se subia
 	# sin DLSS. Ahora cualquier calidad de DLSS en esos modos va a 720 (1080 / 1.5 = DLSS Calidad de 1080p; 900 / 1.25).
-	if ($script:isNvidia -and $res[2] -eq 'dlss' -and (($chkLowEnd -and $chkLowEnd.Checked) -or ($chkSoulsLow -and $chkSoulsLow.Checked))) {
-		if (-not ($outH -eq 1080 -and [double]$res[1] -eq 1.0)) { $res = @($res[0], [math]::Round($outH / 720.0, 4), 'dlss', 0) }  # DLAA a 1080 (valido) se queda
-	}
-	# (10-28) DLSS en cualquier resolucion: solo acepta el 3D a 2160/1440/1256/1080/720; si la calidad elegida no cae en una,
-	# se usa la valida mas cercana por debajo (minimo 720) en vez de que el juego arranque sin DLSS.
-	if ($script:isNvidia -and $res[2] -eq 'dlss' -and [double]$res[1] -gt 0) {
-		$inH = [math]::Round($outH / [double]$res[1]); $ok = @(2160, 1440, 1256, 1080, 720)
-		if ($ok -notcontains $inH) { $pick = @($ok | Where-Object { $_ -le $inH -and $_ -le $outH } | Select-Object -First 1); if (-not $pick) { $pick = 720 }; $res = @($res[0], [math]::Round($outH / [double]$pick, 4), 'dlss', $res[3]) }
-	}
+	# (10-28) DLSS solo acepta ciertas alturas del 3D: la valida mas cercana por debajo. (res-1029) Sobre la resolucion
+	# elegida, que es la salida del juego y del reescalador (Resolve-Res, la misma cuenta que la etiqueta "3D:").
+	$res = Resolve-Res $res $outH
+	$env:KYTY_RES_UPSCALER = $(if ($res[2]) { "$($res[0])" } else { 'none' })  # (res-1029) para la linea "Resolution:" del log
 	# (10-22) Modo 4K: el modo cinematico del juego a 4K nativo (sin reescalado).
 	# (10-22) El modo del juego siempre segun la salida: 4K = cinematico, lo demas = rendimiento (el juego guarda el
 	# ultimo en la partida y sin esto se quedaba en cinematico).
 	$psargs += @('-ForceMode', $(if (($cmbTest -and $script:testModes[[math]::Max(0, $cmbTest.SelectedIndex)][1] -eq 'TESTCINE') ) { 'cinematic' } else { 'performance' }))  # (10-29) 4K: modo rendimiento (sin el tope de 30 en cinematicas) con la calidad del cinematico (convars abajo)  # (10-25) 4K ya no fuerza el cinematico (bloqueaba el juego a 30 reales)
 	#  # (10-22) modos Souls: siempre rendimiento
 	# 1080p / 720p sin reescalador: el juego dibuja a esa altura.
-	if ($outH -lt 1440 -and -not $res[2]) { $res = @("${outH}p", $outH, '', 0) }
+	# (res-1029) Sin reescalador el 3D ya es la salida (Resolve-Res, tambien a 4K).
 	# DLSS (reescalado) carga Streamline de NVIDIA; con la generacion de frames de AMD el emulador se cerraba al crear
 	# el dispositivo grafico. Con AMD: FSR o XeSS para reescalar.
 	if ($res[2] -like '*dlss' -and $config -like 'fsr3*') {
@@ -841,6 +841,49 @@ function Get-OutHeight {
 	if ($chk4K -and $chk4K.Checked) { return 2160 }
 	return 1440
 }
+# (res-1029) La resolucion elegida es la salida: el juego (su imagen tras el reescalador), el reescalador y la pantalla
+# (swapchain) salen a ella; el 3D = salida / calidad del reescalador, o la salida sin reescalador. KYTY_OUTPUT_HEIGHT.
+# Resolve-Res: la fila de reescalado tal como se lanza (DLSS a una altura que acepta; sin reescalador, la salida).
+function Resolve-Res($res, [int]$outH) {
+	# (10-27) DLSS en Modo Souls ligero / PC low profile (base 1080 / 900): el 3D a 720 (DLAA a 1080 se queda).
+	if ($script:isNvidia -and $res[2] -eq 'dlss' -and (($chkLowEnd -and $chkLowEnd.Checked) -or ($chkSoulsLow -and $chkSoulsLow.Checked))) {
+		if (-not ($outH -eq 1080 -and [double]$res[1] -eq 1.0)) { $res = @($res[0], [math]::Round($outH / 720.0, 4), 'dlss', 0) }
+	}
+	# (10-28 / res-1029) DLSS sale a la resolucion elegida: acepta el 3D entre la mitad de la salida y la salida, o el
+	# tercio justo (ultra rendimiento). Si la calidad elegida no cae ahi, la valida mas cercana por debajo (360 como
+	# minimo bajo 4K, 720 a 4K) en vez de que el juego arranque sin DLSS.
+	if ($script:isNvidia -and $res[2] -eq 'dlss' -and [double]$res[1] -gt 0) {
+		$least = if ($outH -lt 2160) { 360 } else { 720 }
+		$inH = [math]::Round($outH / [double]$res[1]); $half = [math]::Ceiling($outH / 2.0); $third = [math]::Round($outH / 3.0)
+		$ok = ($inH -ge $half -and $inH -le $outH -and $inH -ge $least) -or ($inH -eq $third -and $inH -ge $least)
+		if (-not $ok) {
+			$pick = if ($inH -gt $third -and $third -ge $least) { $third } elseif ($least -le $third) { $third } elseif ($least -ge $half) { $least } else { $half }
+			$res = @($res[0], [math]::Round($outH / [double]$pick, 4), 'dlss', $res[3])
+		}
+	}
+	# Sin reescalador: el 3D a la salida (nativo); las filas "del juego" a su altura, nunca por encima de la salida.
+	if (-not $res[2] -and ($res[0] -eq $resModes[0][0] -or [double]$res[1] -ge $outH)) { $res = @("${outH}p", $outH, '', 0) }
+	return $res
+}
+# El 3D que sale de una fila ya resuelta (lo que el emulador calcula: salida / ratio, entre 360 (720 a 4K) y la salida).
+function Get-Res3D($res, [int]$outH) {
+	$h = $outH
+	if ($res[2] -in 'dlss', 'xess', 'fsr', 'fsr4') {
+		$least = if ($outH -lt 2160 -or $res[2] -eq 'fsr4') { 360 } else { 720 }
+		$h = [math]::Min($outH, [math]::Max($least, [int][math]::Round($outH / [double]$res[1])))
+	} elseif ($res[1] -gt 0) { $h = [int]$res[1] }
+	$aspect = 16.0 / 9.0
+	if ($cmbAspect -and $cmbAspect.SelectedIndex -eq 1) { $aspect = 64.0 / 27.0 } elseif ($cmbAspect -and $cmbAspect.SelectedIndex -eq 2) { $aspect = 32.0 / 9.0 }
+	$w = [int]([math]::Round($h * $aspect / 8.0) * 8)
+	return "${w}x${h}"
+}
+function Update-Res3D {
+	if (-not $lb3D -or -not $script:resShown -or -not $cmbRes) { return }
+	$r0 = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
+	if (-not $r0 -or ($r0[1] -eq 0 -and $r0[2] -eq '')) { $lb3D.Text = ''; return }
+	$o = Get-OutHeight
+	$lb3D.Text = '3D: ' + (Get-Res3D (Resolve-Res $r0 $o) $o)
+}
 function Fill-Res {
 	$wanted = Get-IniValue 'scalelabel' '1440p nativo'
 	$titles = @{ 'dlss' = '--- NVIDIA DLSS ---'; 'xess' = '--- Intel XeSS ---'; 'fsr' = '--- AMD FSR 3.1 ---'; 'fsr4' = '--- AMD FSR 4 ---'; 'juego' = '--- Del juego ---' }
@@ -1082,6 +1125,12 @@ $gPc  = New-Group 'Rendimiento / PC' 450 294 420 118  # (10-24) +28: fila del va
 Move-To $lbOut $gImg 10 26 112
 Move-To $cmbOut $gImg 124 24 140
 $lbMode = New-Label '' $smallFont $gold 0 0 140 22; Move-To $lbMode $gImg 270 27 140  # (10-29) el modo del juego que se aplica
+# (res-1029) El 3D que sale de la resolucion y el reescalado elegidos, debajo del modo (dos lineas de letra pequena).
+$tinyFont = New-Object System.Drawing.Font('Segoe UI', 9)
+$lbMode.Font = $tinyFont; $lbMode.Location = New-Object System.Drawing.Point(270, 19); $lbMode.Size = New-Object System.Drawing.Size(146, 17)
+$lb3D = New-Label '' $tinyFont $ink 0 0 146 17; Move-To $lb3D $gImg 270 36 146
+$lb3D.Font = $tinyFont
+$tips.SetToolTip($lb3D, 'Tamano del 3D con la resolucion y el reescalado elegidos: la resolucion es la salida del juego, del reescalador y de la pantalla; el 3D = resolucion / calidad del reescalador (sin reescalador, la resolucion).')
 $tips.SetToolTip($lbMode, '4K: modo rendimiento del juego (cinematicas sin el tope de 30) con la calidad del cinematico: iluminacion completa y teselado denso. Otras resoluciones: modo rendimiento.')
 function Update-ModeLabel { $lbMode.Text = if ($cmbOut.SelectedIndex -eq 1) { 'Cinematico sin tope 30' } else { 'Modo rendimiento' } }
 Update-ModeLabel; $cmbOut.Add_SelectedIndexChanged({ Update-ModeLabel })
@@ -2794,13 +2843,11 @@ try {
 try {
 	$lbFov = New-Label 'DLSS 5' $smallFont $ink 0 0 88 22; $panel.Controls.Add($lbFov)
 	$cmbFov = New-Object System.Windows.Forms.ComboBox
-	$cmbFov.DropDownStyle = 'DropDownList'; $cmbFov.Font = $smallFont; $cmbFov.Tag = 'dlssfov1029b'
-	foreach ($it in @('No', 'PreSR (rápido)', 'Foveado Suave (borde 0,75)', 'Foveado Medio (0,5)', 'Foveado Fuerte (0,35)')) { [void]$cmbFov.Items.Add($it) }
-	$v = 0; [void][int]::TryParse((Get-IniValue 'dlssfov1029b' '-1'), [ref]$v)
-	if ($v -lt 0) { $o = 0; [void][int]::TryParse((Get-IniValue 'dlssfov1029' '0'), [ref]$o); $v = $(if ($o -gt 0) { $o + 1 } else { 0 }) }  # (antes: 1-3 = Suave/Medio/Fuerte)
-	$cmbFov.SelectedIndex = [math]::Min([math]::Max(0, $v), 4)
+	$cmbFov.DropDownStyle = 'DropDownList'; $cmbFov.Font = $smallFont; $cmbFov.Tag = 'dlssfov1029'
+	foreach ($it in @('No', 'Suave (borde 0,75)', 'Medio (0,5)', 'Fuerte (0,35)')) { [void]$cmbFov.Items.Add($it) }
+	$v = 0; [void][int]::TryParse((Get-IniValue 'dlssfov1029' '0'), [ref]$v); $cmbFov.SelectedIndex = [math]::Min([math]::Max(0, $v), 3)
 	$cmbFov.Add_SelectedIndexChanged({ param($sender, $e) Set-IniValue $sender.Tag "$($sender.SelectedIndex)" })
-	$tips.SetToolTip($cmbFov, 'DLSS 5 Neural Rendering de NVIDIA. PreSR (rápido): el NR antes del reescalado, sobre la imagen a resolucion de render (unas 4 veces menos pixeles que en 4K; el reescalador hace el resto). Foveado: el NR despues del reescalado (de FoveatedDLSS5): el NR a resolucion completa en el centro de la pantalla y a menos resolucion hacia los bordes (curva suave, horizontal y vertical por separado); ahorra GPU sin tocar el centro, que nunca pierde nitidez ni se oscurece. Suave: borde 0,75 (~16 % menos pixeles). Medio: 0,5 (~31 %). Fuerte: 0,35 (~39 %). Si ahorra menos de un 5 % se apaga solo. Necesita una NVIDIA RTX y el archivo nvngx_dlssnr.dll de NVIDIA junto al emulador o en su carpeta streamline (no viene incluido): sin el, DLSS normal. Solo con DLSS, XeSS o FSR. Experimental.'); $tips.SetToolTip($lbFov, 'DLSS 5 Neural Rendering de NVIDIA. PreSR (rápido): el NR antes del reescalado, sobre la imagen a resolucion de render (unas 4 veces menos pixeles que en 4K; el reescalador hace el resto). Foveado: el NR despues del reescalado (de FoveatedDLSS5): el NR a resolucion completa en el centro de la pantalla y a menos resolucion hacia los bordes (curva suave, horizontal y vertical por separado); ahorra GPU sin tocar el centro, que nunca pierde nitidez ni se oscurece. Suave: borde 0,75 (~16 % menos pixeles). Medio: 0,5 (~31 %). Fuerte: 0,35 (~39 %). Si ahorra menos de un 5 % se apaga solo. Necesita una NVIDIA RTX y el archivo nvngx_dlssnr.dll de NVIDIA junto al emulador o en su carpeta streamline (no viene incluido): sin el, DLSS normal. Solo con DLSS, XeSS o FSR. Experimental.'); $panel.Controls.Add($cmbFov)
+	$tips.SetToolTip($cmbFov, 'DLSS 5 Neural Rendering de NVIDIA con foveado (de FoveatedDLSS5): el NR a resolucion completa en el centro de la pantalla y a menos resolucion hacia los bordes (curva suave, horizontal y vertical por separado); ahorra GPU sin tocar el centro, que nunca pierde nitidez ni se oscurece. Suave: borde 0,75 (~16 % menos pixeles). Medio: 0,5 (~31 %). Fuerte: 0,35 (~39 %). Si ahorra menos de un 5 % se apaga solo. Necesita una NVIDIA RTX y el archivo nvngx_dlssnr.dll de NVIDIA junto al emulador o en su carpeta streamline (no viene incluido): sin el, DLSS normal. Solo con DLSS, XeSS o FSR. Experimental.'); $tips.SetToolTip($lbFov, 'DLSS 5 Neural Rendering de NVIDIA con foveado (de FoveatedDLSS5): el NR a resolucion completa en el centro de la pantalla y a menos resolucion hacia los bordes (curva suave, horizontal y vertical por separado); ahorra GPU sin tocar el centro, que nunca pierde nitidez ni se oscurece. Suave: borde 0,75 (~16 % menos pixeles). Medio: 0,5 (~31 %). Fuerte: 0,35 (~39 %). Si ahorra menos de un 5 % se apaga solo. Necesita una NVIDIA RTX y el archivo nvngx_dlssnr.dll de NVIDIA junto al emulador o en su carpeta streamline (no viene incluido): sin el, DLSS normal. Solo con DLSS, XeSS o FSR. Experimental.'); $panel.Controls.Add($cmbFov)
 	Move-To $lbFov $gImg 10 154 112; Move-To $cmbFov $gImg 124 152 282
 	$lbFovU = New-Label 'Archivo DLSS 5' $smallFont $ink 0 0 88 22; $panel.Controls.Add($lbFovU)
 	$cmbFovU = New-Object System.Windows.Forms.ComboBox
@@ -2989,5 +3036,9 @@ function Set-DoubleBufferAll($p) { foreach ($c in @($p.Controls)) { if ($c -is [
 Set-DoubleBufferAll $form
 $panel.ResumeLayout($true); $form.ResumeLayout($true)
 [void]$form.Handle; $form.PerformLayout()
+# (res-1029) La etiqueta "3D:" sigue a la resolucion, al reescalado y al formato de pantalla.
+$cmbOut.Add_SelectedIndexChanged({ Update-Res3D }); $cmbRes.Add_SelectedIndexChanged({ Update-Res3D })
+if ($cmbAspect) { $cmbAspect.Add_SelectedIndexChanged({ Update-Res3D }) }
+Update-Res3D
 $form.Add_Shown({ $form.Refresh(); $form.Opacity = 1 })
 [void]$form.ShowDialog()

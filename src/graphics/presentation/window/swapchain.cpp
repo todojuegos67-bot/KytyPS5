@@ -1125,6 +1125,8 @@ void Swapchain::Create() {
 	std::printf("Swapchain: %ux%u, present mode %d, %u images%s\n", m_extent.width, m_extent.height,
 	            static_cast<int>(create_info.presentMode), image_count, m_fsr3 ? " (FSR 3 frame generation)" : "");
 	std::fflush(stdout);
+	Loader::DemonsSoulsRenderSize::g_swapchain_width.store(m_extent.width);
+	Loader::DemonsSoulsRenderSize::g_swapchain_height.store(m_extent.height);
 	if (Config::HdrEnabled()) {
 		std::printf("Vulkan presentation: %s\n", m_hdr_active ? "HDR10 (PQ)" : "SDR");
 		std::fflush(stdout);

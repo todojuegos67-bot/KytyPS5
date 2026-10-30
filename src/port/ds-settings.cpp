@@ -623,23 +623,20 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		const int out_h = mode ? mode_h : s.fullscreen && pc.screen_h > 0 ? pc.screen_h : (s.height > 0 ? s.height : 1440);
 		if (!(out_h == 1080 && ratio == 1.0)) ratio = std::round(out_h / 720.0 * 10000.0) / 10000.0;
 	}
-	// (10-28, the launcher's "DLSS en cualquier resolucion") DLSS only takes the 3D at 2160 / 1440 / 1256 / 1080 / 720: when
-	// the chosen quality does not land on one, the nearest valid height at or below it (at least 720) instead of the game
-	// starting without DLSS.
+	// (ds-pc-port12, the emulator launcher's Resolve-Res of res-1029) The chosen resolution is the game's output, the upscaler's
+	// and the swapchain's; the 3D = output / the upscaler's ratio. DLSS takes the 3D between half the output and the output, or
+	// exactly a third (ultra performance), at least 360 lines (720 at 4K): else the nearest valid one below.
+	const int res_out_h = OutputHeight(s, pc);
 	if (upscaler == "dlss" && pc.nvidia && ratio > 0) {
-		int mode_w = 0, mode_h = 0;
-		const bool mode = s.fullscreen && std::sscanf(s.resolution.c_str(), "%dx%d", &mode_w, &mode_h) == 2 && mode_h > 0;
-		const int  out_h = mode ? mode_h : s.fullscreen && pc.screen_h > 0 ? pc.screen_h : (s.height > 0 ? s.height : 1440);
+		const int  out_h = res_out_h;
+		const int  least = out_h < 2160 ? 360 : 720;
 		const int  in_h  = static_cast<int>(std::lround(out_h / ratio));
-		static const int ok[] = {2160, 1440, 1256, 1080, 720};
-		if (std::find(std::begin(ok), std::end(ok), in_h) == std::end(ok)) {
-			int pick = 720;
-			for (int v: ok)
-				if (v <= in_h && v <= out_h) {
-					pick = v;
-					break;
-				}
-			ratio = std::round(out_h / static_cast<double>(pick) * 10000.0) / 10000.0;
+		const int  half  = (out_h + 1) / 2;
+		const int  third = static_cast<int>(std::lround(out_h / 3.0));
+		const bool ok    = (in_h >= half && in_h <= out_h && in_h >= least) || (in_h == third && in_h >= least);
+		if (!ok) {
+			const int pick = (least <= third) ? third : (least >= half ? least : half);
+			ratio          = std::round(out_h / static_cast<double>(pick) * 10000.0) / 10000.0;
 			plan.notes.emplace_back("DLSS: the 3D at " + std::to_string(pick) + " lines (" + std::to_string(in_h) + " is not a DLSS height)");
 		}
 	}
@@ -841,7 +838,18 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	env.Default("KYTY_NATIVE_XPR_INSTANCES", "1");
 	if (demons) env.Default("KYTY_GAME_CONVARS", "doIndexBufferCulling=false");
 	if (ratio > 0) env.Set("KYTY_UPSCALE_RATIO", Num(ratio));
-	if (upscaler.empty() && std::strncmp(res->id, "juego-", 6) == 0) env.Set("KYTY_RENDER_HEIGHT", Num(res->value)); // (-RenderHeight)
+	// (ds-pc-port12, res-1029) Without an upscaler the 3D is the output (native; the game's rows at their height, never above it).
+	if (upscaler.empty()) {
+		const bool juego = std::strncmp(res->id, "juego-", 6) == 0 && res->value < res_out_h;
+		const int  rh    = juego ? static_cast<int>(res->value) : res_out_h;
+		if (juego || rh != 1440) env.Set("KYTY_RENDER_HEIGHT", std::to_string(rh)); // (-RenderHeight)
+	}
+	// (ds-pc-port12, Launcher-souls.ps1 of ds-pacefix-1029) The output resolution and the height the upscalers work from.
+	if (demons) {
+		env.Set("KYTY_OUTPUT_HEIGHT", std::to_string(res_out_h));
+		env.Set("KYTY_DISPLAY_HEIGHT", std::to_string(res_out_h));
+		env.Set("KYTY_RES_UPSCALER", upscaler.empty() ? std::string("none") : std::string(res->id));
+	}
 	env.Remove("KYTY_UPSCALE");
 	if (upscaler == "dlss" && s.dlss_preset != "auto" && !s.dlss_preset.empty()) env.Set("KYTY_DLSS_PRESET", s.dlss_preset);
 	if (upscaler == "fsr4" && res->fsr4_preset != nullptr) env.Set("KYTY_FSR4_PRESET", res->fsr4_preset); // (run-windows -Fsr4Preset)

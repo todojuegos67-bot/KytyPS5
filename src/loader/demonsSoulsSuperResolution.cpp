@@ -1,4 +1,5 @@
 #include "loader/demonsSoulsSuperResolution.h"
+#include "loader/demonsSoulsRenderSize.h"
 
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "loader/guestCode.h"
@@ -71,8 +72,11 @@ void Install(Program* program) {
 	std::memcpy(reinterpret_cast<void*>(*site), Taken, sizeof(Taken));
 	g_active = true;
 	if (const auto enabled = GuestCode::FindUnique(*program, GuestCode::Pattern(EnabledCheck)); enabled) {
-		std::memcpy(reinterpret_cast<void*>(*enabled + 15), kind == "fsr4" ? AnyHeight360Bytes : AnyHeightBytes, sizeof(AnyHeightBytes));
+		// (KYTY_OUTPUT_HEIGHT below 2160: 360 for every upscaler, DemonsSoulsRenderSize::LeastRenderHeight.)
+		const bool from360 = DemonsSoulsRenderSize::LeastRenderHeight() == 360;
+		std::memcpy(reinterpret_cast<void*>(*enabled + 15), from360 ? AnyHeight360Bytes : AnyHeightBytes, sizeof(AnyHeightBytes));
 		if (kind == "fsr4") std::printf("Demon's Souls super resolution: FSR 4 takes a 3D of 360 lines and more (720 for the others)\n");
+		else if (from360) std::printf("Demon's Souls super resolution: a 3D of 360 lines and more (KYTY_OUTPUT_HEIGHT below 2160)\n");
 		g_any_height = true;
 	} else {
 		std::printf("Demon's Souls super resolution: its 1080 least render height check not found; 1080 at least\n");

@@ -111,7 +111,8 @@ layout(push_constant) uniform Push {
 	ivec4 misc;      // mode, frame, level, flags (1 reset, 2 history valid, 4 camera matrices, 8 up known, 16 row 0 = NDC y +1,
 	                 // 32 checkerboard trace: half the trace pixels march each frame, the others keep their history,
 	                 // 64 the G-buffer-time depth is bound: water detection, 128 moving objects (characters) skipped,
-	                 // 256 the game's SSR (binding 21) bound, 512 guided by the game: no material or guess mask)
+	                 // 256 the game's SSR (binding 21) bound, 512 guided by the game: no material or guess mask,
+                 // 1024 (rtfly-1029) the firefly limit and the contribution's stabilisation: Firefly / Stabilize)
 	ivec4 dec;       // normal code (-1: depth normals), roughness field (-1: heuristic), packed layers, mode 7: the hi-z mip,
 	                 // else the gloss field (-1 none; its code inverts it: 1 - gloss)
 	ivec4 misc2;     // exposure index, hi-z levels, max iterations, metal field + 1 (0: none, f0 0.04)
@@ -899,8 +900,15 @@ void Atrous(ivec2 px) {
 		imageStore(out_a, px, c);
 		return;
 	}
+	// (fgrt-1029) Sharp glossy reflections: the passes by roughness (none below 0.12, one below 0.25, all above), and a
+	// smaller radius the glossier the surface.
+	int allowed = rough < 0.12 ? 0 : rough < 0.25 ? 1 : 8;
+	if (push.params.w >= float(1 << allowed)) {
+		imageStore(out_a, px, c);
+		return;
+	}
 	float var  = texelFetch(meta_tex, px, 0).w;
-	float step = push.params.w * mix(0.35, 1.0, smoothstep(0.05, 0.45, rough));
+	float step = push.params.w * mix(0.2, 1.0, smoothstep(0.12, 0.50, rough));
 	// Contact reflections (a short hit distance) stay sharp: the blur grows with the hit distance.
 	// (far away the same pixel radius covers far more surface: the radius shrinks with distance; grazing, sharper)
 	step *= clamp(25.0 / max(g.w, 1e-3), 0.3, 1.0);
@@ -985,15 +993,95 @@ vec3 ClampEnergy(vec3 refl, float lc, float pool) {
 	return lr > cap ? refl * (cap / lr) : refl;
 }
 
+// ---- (rtfly-1029) The flashes ("fogonazos"): firefly limit and the composited contribution's temporal stabilisation ----
+// The RTFLICKER self-check (rt-flicker.cpp) showed, with the camera still: 0.4-0.7 % of the points the reflections touch
+// changed by > 10 % of the pixel's light from one frame to the next (0.2 % by > 20 %), the largest jump 95-98 %, every
+// other pass ~0. Single bright hits (lights, emissives, a lit wall) and hits toggling hit / miss under the upscaler's
+// jitter: the full-resolution mirror ray (water, pools, near-mirrors) is this frame's alone, and the trace's mask and
+// confidence change per pixel per frame, so the composite's weight did too. Two limits (misc.w & 1024,
+// KYTY_RT_REFLECTIONS_STABLE=1, the default; 0: the previous behaviour):
+//   Firefly:   the reflected light at most 4x the light around the reflector (the pixel and 4 taps 2 px away) + a little,
+//              and at most 4.0 display-referred (after the game's exposure); never below the pixel's own light or the
+//              game's own reflected colour (a lower target would darken it).
+//   Stabilize: the composite's contribution (its colour out - the game's colour in) kept per render pixel (binding 12,
+//              with the view distance), reprojected by the motion vector next frame (a different distance: no history,
+//              from zero), averaged (30 % new on a still camera, 85 % when it moves) and limited to a change of 6 % of
+//              the pixel's light a frame (36 % when moving), so a still camera gives a still reflection and nothing
+//              pops in or out in one frame. It only moves between the last result and this frame's, both within the
+//              darkening limit (MaxDarken), so it adds no darkening (vegetation, surfaces against walls).
+bool Stable() { return (push.misc.w & 1024) != 0; }
+vec3 Firefly(ivec2 px, vec3 refl, vec3 c0, float e, float lg, bool st) {
+	float lr = Luma(max(refl, vec3(0)));
+	float lc = Luma(max(c0, vec3(0)));
+	ivec2 hi = ivec2(RenderSize()) - 1;
+	float ln = 0.0;
+	ln += Luma(SafeColor(texelFetch(color_tex, clamp(px + ivec2(2, 0), ivec2(0), hi), 0).rgb));
+	ln += Luma(SafeColor(texelFetch(color_tex, clamp(px - ivec2(2, 0), ivec2(0), hi), 0).rgb));
+	ln += Luma(SafeColor(texelFetch(color_tex, clamp(px + ivec2(0, 2), ivec2(0), hi), 0).rgb));
+	ln += Luma(SafeColor(texelFetch(color_tex, clamp(px - ivec2(0, 2), ivec2(0), hi), 0).rgb));
+	float ie  = 1.0 / max(e, 1e-12);
+	float loc = max(lc, 0.25 * ln);
+	float cap = max(min(4.0 * loc + 0.01 * ie, 4.0 * ie), max(lc, lg));
+	bool  cl  = lr > cap && lr > 0.0;
+	if (st) Stat(31, cl ? 1 : 0);
+	return cl ? refl * (cap / lr) : refl;
+}
+vec3 Stabilize(ivec2 px, vec3 c0, vec3 outc, float d) {
+	vec2  rs    = RenderSize();
+	vec2  uv    = (vec2(px) + 0.5) / rs;
+	float z     = abs(ViewZ(d));
+	vec3  delta = outc - c0;
+	if (BadV(delta)) delta = vec3(0);
+	vec2  mv    = texelFetch(motion_tex, px, 0).xy * push.motion.xy / rs;
+	if (any(isnan(mv)) || any(isinf(mv))) mv = vec2(0);
+	vec2  puv   = uv + mv;
+	float mvp   = length(mv * rs);
+	bool  reset = (push.misc.w & 1) != 0 || (push.misc.w & 2) == 0;
+	vec3  hd    = vec3(0);
+	bool  valid = false;
+	if (!reset && InScreen(puv)) {
+		vec4 h = texelFetch(src_b, clamp(ivec2(puv * rs), ivec2(0), ivec2(rs) - 1), 0);
+		valid  = !Bad(h) && h.a > 0.0 && abs(h.a - z) < 0.05 * z + 0.05;
+		if (valid) hd = h.rgb;
+	}
+	vec3 res     = delta;
+	bool limited = false;
+	// (fgrt-1029) In motion the reflection stays sharp: near-full new contribution as soon as the camera or the player
+	// moves (0.25 px), the history clamped to a box around this frame's (no smearing); the slow blend and the change
+	// limit (the flash fix) only on a nearly still camera.
+	float mov = smoothstep(0.25, 1.5, mvp);
+	if (Sampled(px) && mov > 0.5) { Stat(32, 1); Stat(33, valid ? int(100.0 * mix(0.3, 0.97, mov)) : 100); }
+	if (!reset) {
+		float alpha = valid ? mix(0.3, 0.97, mov) : 1.0;
+		float e     = GameExposure();
+		float lc    = Luma(max(c0, vec3(0)));
+		float lref  = max(max(lc, Luma(max(outc, vec3(0)))), 0.004 / max(e, 1e-12));
+		vec3  box   = vec3(mix(4.0, 0.08, mov) * lref);
+		hd          = clamp(hd, delta - box, delta + box);
+		vec3  tgt   = mix(hd, delta, alpha);
+		float lim   = mov > 0.5 ? 1e30 : (0.06 + 0.60 * mov) * lref;
+		vec3  stp   = tgt - hd;
+		// (a darkening going back toward the game's pixel: twice the rate)
+		if (Luma(hd) < 0.0 && Luma(stp) > 0.0) lim *= 2.0;
+		float m = Max3(abs(stp));
+		if (m > lim) {
+			stp *= lim / m;
+			limited = true;
+		}
+		res = hd + stp;
+		// (never darker than MaxDarken of the game's pixel, as the composite)
+		float lr = Luma(res);
+		if (lr < -MaxDarken * lc) res *= MaxDarken * lc / max(-lr, 1e-30);
+	}
+	if (BadV(res)) res = vec3(0);
+	if (Sampled(px)) Stat(30, limited ? 1 : 0);
+	imageStore(out_b, px, vec4(res, max(z, 1e-3)));
+	return c0 + res;
+}
+
 // The surface comes from the trace's (its roughness and mask, upsampled when the trace is at half resolution): the
 // wet-surface mask is not evaluated a second time per render pixel.
-void Composite(ivec2 px) {
-	vec4  col = texelFetch(color_tex, px, 0);
-	float d   = texelFetch(depth_tex, px, 0).r;
-	if (IsSky(d) || Bad(col)) {
-		imageStore(out_a, px, col);
-		return;
-	}
+vec3 CompositeRaw(ivec2 px, vec4 col, float d) {
 	bool st = Sampled(px);
 	if (st) Stat(0, 1);
 	vec2  uv = (vec2(px) + 0.5) / RenderSize();
@@ -1048,8 +1136,7 @@ void Composite(ivec2 px) {
 	}
 	float rough = ax.x, mask = ax.y;
 	if (mask < 0.01 || rough > push.motion.z) {
-		imageStore(out_a, px, col);
-		return;
+		return col.rgb;
 	}
 	if (st && mask > 0.05) Stat(3, 1);
 	float water = WaterMask(px, d, uv, Nd);
@@ -1083,7 +1170,7 @@ void Composite(ivec2 px) {
 		mask = 0.0;
 		if (metal <= 0.5) ex = 0.0; // (refl9: a character's metal keeps the metal path)
 	}
-	if (mask < 0.01 && ex < 0.01) { imageStore(out_a, px, col); return; }
+	if (mask < 0.01 && ex < 0.01) { return col.rgb; }
 	// (refl9b) Floors (up-facing, not metal) and water: the area test (tiny / speckled wet patches out, large pools up).
 	float upf_c = UpFacing(Nd);
 	bool  floor_ = (upf_c > 0.0 && metal <= 0.5) || water > 0.0;
@@ -1094,7 +1181,7 @@ void Composite(ivec2 px) {
 		float fl = water > 0.0 ? 1.0 : upf_c;
 		mask *= mix(1.0, areaf, fl);
 		ex *= mix(1.0, areaf, fl);
-		if (mask < 0.01 && ex < 0.01) { imageStore(out_a, px, col); return; }
+		if (mask < 0.01 && ex < 0.01) { return col.rgb; }
 	}
 	if (st && mask > 0.5 && water > 0.5) Stat(7, 1);
 	// (refl3) Water and near-mirrors with a half-resolution trace: their own mirror ray at the render resolution, so
@@ -1116,11 +1203,13 @@ void Composite(ivec2 px) {
 		}
 	}
 	if (Bad(rf) || rf.a < 1e-3) {
-		imageStore(out_a, px, col);
-		return;
+		return col.rgb;
 	}
 	float e     = GameExposure();
 	vec3  refl  = InvTonemap(clamp(rf.rgb / rf.a, vec3(0), vec3(1))) / e;
+	// (rtfly-1029) Fireflies on every path (floors, walls, metal, guided): the hit's light limited by the light around the
+	// reflector, with a hard cap; never below the pixel's own or the game's reflection (so nothing darkens).
+	if (Stable()) refl = Firefly(px, refl, col.rgb, e, GuideMode() && water <= 0.0 ? Luma(GameReflColor(gs)) : 0.0, st);
 	vec3  V     = normalize(-P);
 	if (dot(N, V) < 0.02) N = normalize(N + V * (0.02 - dot(N, V) + 0.01));
 	float NoV   = clamp(dot(N, V), 0.0, 1.0);
@@ -1185,8 +1274,7 @@ void Composite(ivec2 px) {
 				Stat(29, metal <= 0.5 && wx > 0.05 ? 1 : 0);
 			}
 		}
-		imageStore(out_a, px, vec4(clamp(outg, vec3(0), vec3(6.0e4)), col.a));
-		return;
+		return outg;
 	}
 	// (the confidence through a square root: a 60 % hit rate averaged in should not cut the reflection to 60 %)
 	float w     = push.params.x * mask * sqrt(clamp(rf.a, 0.0, 1.0)) * Spec(fr_rough, NoV, metal, water);
@@ -1209,6 +1297,21 @@ void Composite(ivec2 px) {
 	}
 	vec3 outc = mix(col.rgb, refl, w);
 	if (BadV(outc)) outc = col.rgb;
+	return outc;
+}
+
+// The composite: this frame's (CompositeRaw), then (rtfly-1029) the firefly limit inside it and the stabilisation here.
+void Composite(ivec2 px) {
+	vec4  col = texelFetch(color_tex, px, 0);
+	float d   = texelFetch(depth_tex, px, 0).r;
+	if (IsSky(d) || Bad(col)) {
+		imageStore(out_a, px, col);
+		if (Stable()) imageStore(out_b, px, vec4(0, 0, 0, -1)); // (no history here)
+		return;
+	}
+	vec3 outc = CompositeRaw(px, col, d);
+	if (BadV(outc)) outc = col.rgb;
+	if (Stable()) outc = Stabilize(px, col.rgb, outc, d);
 	imageStore(out_a, px, vec4(clamp(outc, vec3(0), vec3(6.0e4)), col.a));
 }
 

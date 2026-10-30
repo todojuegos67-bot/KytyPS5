@@ -15,6 +15,7 @@
 #include <cstring>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Loader::DemonsSoulsRenderSize {
@@ -69,6 +70,8 @@ std::optional<uint64_t> FindUniqueData(const Program& program, std::span<const u
 
 double   g_wide_aspect = 0.0; // the aspect KYTY_RENDER_ASPECT installed (0: 16:9)
 uint32_t g_wide_output = 0;   // the output's width InstallWideOutput set (0: the game's 3840)
+uint32_t g_game_output_width = 0, g_game_output_height = 0; // InstallOutputSize's (0: the game's 3840x2160)
+Size     g_render {};         // the 3D's size InstallRenderSize left (for the "Resolution:" line)
 
 // The RIP-relative target of the disp32 at `site` + `at`, the instruction `length` bytes long.
 uint64_t RipTarget(uint64_t site, uint32_t at, uint32_t length) {
@@ -221,7 +224,15 @@ uint32_t WideOutputWidth() {
 	return g_wide_output;
 }
 
-void Install(Program* program) {
+uint32_t GameOutputWidth() {
+	return g_game_output_width;
+}
+
+uint32_t GameOutputHeight() {
+	return g_game_output_height;
+}
+
+static void InstallRenderSize(Program* program) {
 	const char* setting = std::getenv("KYTY_RENDER_HEIGHT");
 	const char* wide    = std::getenv("KYTY_RENDER_ASPECT");
 	const char* ratio_s = std::getenv("KYTY_UPSCALE_RATIO");
@@ -234,6 +245,7 @@ void Install(Program* program) {
 	const uint32_t game_width  = trinity ? TrinityWidth : RenderWidth;
 	const uint32_t game_height = trinity ? TrinityHeight : RenderHeight;
 	const int      mode        = trinity ? TrinityMode : PerformanceMode;
+	g_render                   = {game_width, game_height};
 	auto requested = setting != nullptr && *setting != 0 ? static_cast<uint32_t>(std::strtoul(setting, nullptr, 10))
 	                                                     : game_height;
 	// KYTY_UPSCALE_RATIO=<1..4> (the launcher's DLSS/FSR/XeSS presets: DLAA 1.0, Quality 1.5, Balanced 1.72,
@@ -246,6 +258,8 @@ void Install(Program* program) {
 		const char*  forced  = std::getenv("KYTY_DISPLAY_HEIGHT");
 		uint32_t     display = forced != nullptr && *forced != 0 ? static_cast<uint32_t>(std::strtoul(forced, nullptr, 10))
 		                                                         : LocalPlatform::DisplayHeight(nullptr);
+		// (KYTY_OUTPUT_HEIGHT: the 3D at the chosen output's height over the ratio, whatever the monitor.)
+		if (RequestedOutputHeight() != 0) display = RequestedOutputHeight();
 		if (display == 0) display = OutputHeight;
 		if (ratio >= 1.0 && ratio <= 4.0) {
 			const auto height = static_cast<uint32_t>(std::lround(display / ratio));
@@ -368,10 +382,86 @@ void Install(Program* program) {
 			            "into the 3840x2160 output\n");
 		}
 	}
+	g_render = size;
 	std::printf("Demon's Souls render size: performance mode renders %ux%u instead of %ux%u (output %ux%u)%s\n", size.width,
 	            size.height, game_width, game_height, g_wide_output != 0 ? g_wide_output : OutputWidth, OutputHeight,
 	            g_wide_output != 0 ? ", its projection and the output as wide" : aspect_store ? ", its projection as wide" : "");
 	cinematic_note(size.width, size.height);
+}
+
+// KYTY_OUTPUT_HEIGHT below 2160 with the PS5 Pro path: the game's frame after its upscaler at that size (16:9), in the
+// places 01.007.000 sizes it (DemonsSoulsRenderSize.h): SuperResolution::InitContext's 3840, 2160 and the fixed
+// 3840x2160 the video settings' setter, constructor and size query store in every mode's record (the size of the
+// upscaler's image and of the processing after it). The record's output - the interface layer and the flip image,
+// laid out for 3840x2160 - is kept: the game's composite scales the smaller frame into it (as the PS5's own 1440 3D).
+static void InstallOutputSize(Program* program) {
+	const uint32_t height = RequestedOutputHeight();
+	const uint32_t width  = RequestedOutputWidth();
+	if (height == 0 || height >= OutputHeight || !DemonsSoulsSuperResolution::Active()) return;
+	const char* setting = std::getenv("KYTY_DS_GAME_OUTPUT");
+	if (setting != nullptr && std::strcmp(setting, "0") == 0) {
+		std::printf("Demon's Souls output: KYTY_DS_GAME_OUTPUT=0: the game's frame stays 3840x2160 (the upscaler makes "
+		            "the %u lines and it is blitted up)\n",
+		            height);
+		return;
+	}
+	if (g_wide_output != 0 || g_wide_aspect != 0.0) {
+		std::printf("Demon's Souls output: a wider aspect (KYTY_RENDER_ASPECT) keeps the game's own output; %ux%u not "
+		            "applied\n",
+		            width, height);
+		return;
+	}
+	const auto contexts = GuestCode::Find(*program, GuestCode::Pattern(UpscalerContext), 2);
+	const auto setter   = GuestCode::Find(*program, GuestCode::Pattern(SetterFixedPair), 2);
+	const auto builder  = GuestCode::Find(*program, GuestCode::Pattern(ConstructorFixedPair), 2);
+	const auto query    = GuestCode::Find(*program, GuestCode::Pattern(QueryFixedPair), 2);
+	if (contexts.size() != 1 || setter.size() != 1 || builder.size() != 1 || query.size() != 1) {
+		std::printf("Demon's Souls output: the output size's places of a known build not found; the game's frame stays "
+		            "3840x2160\n");
+		return;
+	}
+	// mov esi, width; mov edx, height (InitContext's arguments).
+	std::memcpy(reinterpret_cast<void*>(contexts[0] + 1), &width, sizeof(width));
+	std::memcpy(reinterpret_cast<void*>(contexts[0] + 6), &height, sizeof(height));
+	// The three mov r64, height << 32 | width.
+	const uint64_t pair = static_cast<uint64_t>(height) << 32u | width;
+	std::memcpy(reinterpret_cast<void*>(setter[0] + 6), &pair, sizeof(pair));
+	std::memcpy(reinterpret_cast<void*>(builder[0] + 9), &pair, sizeof(pair));
+	std::memcpy(reinterpret_cast<void*>(query[0] + 5), &pair, sizeof(pair));
+	g_game_output_width  = width;
+	g_game_output_height = height;
+	std::printf("Demon's Souls output: the game's frame after its upscaler at %ux%u instead of 3840x2160 (its interface "
+	            "and flip image stay 3840x2160; KYTY_DS_GAME_OUTPUT=0: as before)\n",
+	            width, height);
+}
+
+void Install(Program* program) {
+	if (program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() ||
+	    program->file_name.filename() != "eboot.bin")
+		return;
+	InstallRenderSize(program);
+	InstallOutputSize(program);
+	// The start-up summary: what the launcher asked for and what the game, the upscaler and the swapchain make.
+	const bool  trinity = DemonsSoulsSuperResolution::Active();
+	const auto  render  = g_render.height != 0 ? g_render
+	                                           : Size {trinity ? TrinityWidth : RenderWidth, trinity ? TrinityHeight : RenderHeight};
+	const char* label   = std::getenv("KYTY_RES_UPSCALER");
+	const char* kind    = std::getenv("KYTY_UPSCALER");
+	std::string upscaler =
+	    !trinity ? std::string("none (the game's TAA)")
+	    : label != nullptr && *label != 0 ? std::string(label)
+	    : kind != nullptr                 ? std::string(kind)
+	                                      : std::string("the PS5 Pro path");
+	const uint32_t out_w = RequestedOutputHeight() != 0 ? RequestedOutputWidth() : OutputWidth;
+	const uint32_t out_h = RequestedOutputHeight() != 0 ? RequestedOutputHeight() : OutputHeight;
+	const uint32_t game_w = g_game_output_width != 0 ? g_game_output_width : trinity ? OutputWidth : render.width;
+	const uint32_t game_h = g_game_output_height != 0 ? g_game_output_height : trinity ? OutputHeight : render.height;
+	std::printf("Resolution: output %ux%u (%s), 3D %ux%u, upscaler %s, swapchain %ux%u; the game's frame %ux%u%s\n", out_w,
+	            out_h, RequestedOutputHeight() != 0 ? "launcher" : "the game's", render.width, render.height,
+	            upscaler.c_str(), g_swapchain_width.load(), g_swapchain_height.load(), game_w, game_h,
+	            trinity ? (g_game_output_height != 0 ? " (upscaler output)" : " (upscaler output, the game's 4K)")
+	                    : " (its 3D, composited by the game)");
+	std::fflush(stdout);
 }
 
 } // namespace Loader::DemonsSoulsRenderSize

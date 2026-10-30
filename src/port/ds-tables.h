@@ -70,7 +70,7 @@ inline constexpr Pair kDlssX4[] = {{"KYTY_VRR_CAP_FPS", "auto"}, {"KYTY_FRAMEGEN
 inline constexpr Pair kDlssX5[] = {{"KYTY_VRR_CAP_FPS", "auto"}, {"KYTY_FRAMEGEN", "4"}, {"KYTY_FLIP_DECOUPLE", "1"}, {"KYTY_FLIP_FPS", "40"}, {nullptr, nullptr}};
 inline constexpr Pair kDlssX6[] = {{"KYTY_VRR_CAP_FPS", "auto"}, {"KYTY_FRAMEGEN", "5"}, {"KYTY_FLIP_DECOUPLE", "1"}, {"KYTY_FLIP_FPS", "36"}, {nullptr, nullptr}};
 inline constexpr Pair kDlss120[] = {{"KYTY_VRR_CAP_FPS", "auto"}, {"KYTY_FRAMEGEN", "2"}, {"KYTY_FLIP_DECOUPLE", "1"}, {"KYTY_FLIP_FPS", "40"}, {nullptr, nullptr}};
-inline constexpr Pair kDlssDinamico[] = {{"KYTY_FRAMEGEN", "5"}, {"KYTY_FLIP_DECOUPLE", "1"}, {"KYTY_DLSSG_DYNAMIC", "1"}, {"KYTY_DYN_MIN_SCALE", "0.7"}, {nullptr, nullptr}};
+inline constexpr Pair kDlssDinamico[] = {{"KYTY_FRAMEGEN", "5"}, {"KYTY_FLIP_DECOUPLE", "1"}, {"KYTY_DLSSG_DYNAMIC", "1"}, {nullptr, nullptr}};
 inline constexpr FgMode kFgModes[] = {
 	{"sin-fg", "Sin frame generation", "sin-fg.json", kSinFg, 0},
 	{"amd-x2", "AMD x2", "fsr3.json", kAmdX2, 3},

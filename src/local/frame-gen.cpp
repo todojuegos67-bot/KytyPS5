@@ -1628,12 +1628,11 @@ uint32_t DlssgReflexLimitUs(double interval) {
 // Not in cinematics or held cutscenes, nor with DLSS-G off. KYTY_DLSSG_FLIP_FLOOR=0: the pacer only. Fixed DLSS-G under
 // a cap (KYTY_VRR_CAP_FPS) likewise (10-23); it needs a vblank that 56 divides (840 Hz; 360 Hz refuses it: the pacer).
 void DynApplyReflexLimit(int gen) {
-	// 10-29: the game's own flips are never held for MFG (the owner: the old "x4: game flips at 56" workaround is
-	// gone, dynamic and fixed). Holding them at 56 against the game's 60 Hz timing spiralled in log 20261029-032959:
-	// x4 real 59.3 -> 52 -> 46 -> 36 fps, the game's cpu 7 -> 19 ms, then x5/x6 on 37 real. Only the presentation
-	// pacer (RealFrameInterval = m / target on the vblank grid, as FSR3's KYTY_VRR_CAP_FPS path) keeps the shown rate
-	// under the VRR ceiling.
-	constexpr bool floor_on = false;
+	// (ds-pacefix-1029) the a53ced9 pacing restored: x4 holds the game's flips at 56 (KYTY_DLSSG_FLIP_FLOOR=0: the pacer only).
+	static const bool floor_on = [] {
+		const char* v = std::getenv("KYTY_DLSSG_FLIP_FLOOR");
+		return v == nullptr || *v != '0';
+	}();
 	if (floor_on && DlssgPaceMode() < 2 && gen >= 0 && !VideoOut::CinematicPlaying() && !VideoOut::CutsceneHeld()) {
 		DynApplyFlipFloor(gen);
 	} else if (g_dyn_flip_fps != 0) {
@@ -1756,10 +1755,8 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 						g_dyn_flip_fps = 0;
 					}
 					DynApplyReflexLimit(g_dyn_gen);
-					std::printf("[dyn] x%d (from x%d): reason %s; real %.1f fps, shown %.1f (target %.0f), free %.1f (x%d est %.1f); pacing %s\n",
-					            g_dyn_gen + 1, from_m, g_dyn_dm.reason, real, std::min(real * from_m, T), T, g_dyn_dm.last_free,
-					            g_dyn_gen + 1, g_dyn_dm.next_est,
-					            g_dyn_flip_fps != 0 ? "game flips held" : g_real_interval.load() > 0.0 ? "vblank-grid pacer" : "none");
+					std::printf("[dyn] x%d (from x%d): real %.1f fps, shown %.1f (target %.0f), free %.1f\n", g_dyn_gen + 1, from_m,
+					            real, std::min(real * from_m, T), T, g_dyn_dm.last_free);
 				}
 				std::printf("[dlssg] dynamic x%d; real %.1f fps (smoothed %.1f), shown %.1f, target %.0f\n", g_dyn_gen + 1, real,
 				            g_dyn_real_fps, real * (g_dyn_gen + 1), static_cast<double>(g_dlssg_target_fps));
@@ -9509,6 +9506,60 @@ bool SsgiWanted() { return SsgiQuality() > 0; }
 void RtReflectionsPrewarm(GraphicContext& graphics);
 void HwParticlesPrewarm(GraphicContext& graphics);
 
+namespace {
+// (ds-fgrt-1029) The RT passes' composite (SSGI, RT reflections, godrays, flare, ...) is a copy of our own: `inputs.color`
+// after them. Written back into the game's colour image (`inputs_in.color`) so every consumer of that image has it:
+// the stretch fallback (renderSuperResolution.cpp, which reads the game's image when the upscaler gives none) and DLSS
+// through Streamline when its present hook is never reached (AMD FSR 3 frame generation owns the swapchain:
+// "presentCommon() was not observed" in every such log), where the composite went missing from what was presented.
+bool CompositeWriteback(vk::CommandBuffer command, const UpscaleImage& from, const UpscaleImage& to) {
+	if (from.image == to.image || from.image == nullptr || to.image == nullptr) return false;
+	if (!(to.usage & vk::ImageUsageFlagBits::eTransferDst) || !(from.usage & vk::ImageUsageFlagBits::eTransferSrc)) return false;
+	if (from.extent != to.extent) return false;
+	const auto barrier = [&](vk::Image image, uint32_t level, uint32_t layer, vk::ImageLayout old_layout, vk::ImageLayout new_layout,
+	                         vk::AccessFlags2 src, vk::AccessFlags2 dst) {
+		vk::ImageMemoryBarrier2 b {};
+		b.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+		b.dstStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+		b.srcAccessMask       = src;
+		b.dstAccessMask       = dst;
+		b.oldLayout           = old_layout;
+		b.newLayout           = new_layout;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image               = image;
+		b.subresourceRange    = {vk::ImageAspectFlagBits::eColor, level, 1, layer, 1};
+		vk::DependencyInfo info {};
+		info.imageMemoryBarrierCount = 1;
+		info.pImageMemoryBarriers    = &b;
+		command.pipelineBarrier2(info);
+	};
+	const auto rw  = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	const auto src_layout = from.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : from.layout;
+	const auto dst_layout = to.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : to.layout;
+	barrier(from.image, from.level, from.layer, src_layout, vk::ImageLayout::eTransferSrcOptimal, rw, vk::AccessFlagBits2::eTransferRead);
+	barrier(to.image, to.level, to.layer, dst_layout, vk::ImageLayout::eTransferDstOptimal, rw, vk::AccessFlagBits2::eTransferWrite);
+	vk::ImageBlit blit {};
+	blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, from.level, from.layer, 1};
+	blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, to.level, to.layer, 1};
+	blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(from.extent.width), static_cast<int32_t>(from.extent.height), 1};
+	blit.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(to.extent.width), static_cast<int32_t>(to.extent.height), 1};
+	command.blitImage(from.image, vk::ImageLayout::eTransferSrcOptimal, to.image, vk::ImageLayout::eTransferDstOptimal, 1, &blit,
+	                  vk::Filter::eNearest);
+	barrier(from.image, from.level, from.layer, vk::ImageLayout::eTransferSrcOptimal, src_layout, vk::AccessFlagBits2::eTransferRead, rw);
+	barrier(to.image, to.level, to.layer, vk::ImageLayout::eTransferDstOptimal, dst_layout, vk::AccessFlagBits2::eTransferWrite, rw);
+	return true;
+}
+// KYTY_RT_COMPOSITE_WRITEBACK: 1 always, 0 never; unset: with AMD FSR 3 frame generation (Streamline sees no present).
+int CompositeWritebackMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_RT_COMPOSITE_WRITEBACK");
+		return value == nullptr || *value == '\0' ? -1 : (*value == '0' ? 0 : 1);
+	}();
+	return mode;
+}
+} // namespace
+
 bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	// (The RT passes' pipelines made beside the title screen, into a cache on disk, not on the world's first flip.
 	// KYTY_RT_PREWARM=0: made where first needed, as before.)
@@ -9590,7 +9641,39 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	g_dlss_mid_pending = false;
 #endif
+	// (ds-fgrt-1029) The composite into the game's colour image before the upscaler (CompositeWriteback).
+	const bool composited = inputs.color.image != inputs_in.color.image;
+	const int  wb_mode    = CompositeWritebackMode();
+	const bool fsr3_fg    = Fsr3::Active();
+	bool       written    = false;
+	if (composited && (wb_mode == 1 || (wb_mode < 0 && fsr3_fg))) {
+		written = CompositeWriteback(command, inputs.color, inputs_in.color);
+		if (written) {
+			const auto stretched_from = inputs.color;
+			inputs.color = inputs_in.color; // (the game's own, stable image: what Streamline knew from the first frame)
+			if (up.color.image == stretched_from.image) up.color = inputs_in.color;
+		}
+	}
 	const bool  done = ours ? UpscaleOurs(command, up) : UpscaleStreamline(command, inputs);
+	// No upscaler result: renderSuperResolution.cpp stretches the game's colour image; the composite goes there first.
+	if (!done && composited && !written && wb_mode != 0) written = CompositeWriteback(command, inputs.color, inputs_in.color);
+	{
+		static uint64_t frames = 0, reached = 0;
+		static bool     said   = false;
+		++frames;
+		const bool ok = !composited || written || done; // (done without write-back: the upscaler read the composite itself)
+		reached += ok ? 1u : 0u;
+		const char* upscaler = g_sr_kind == 1 ? "DLSS" : g_sr_kind == 2 ? "XeSS" : g_sr_kind == 3 ? "FSR 3.1" : g_sr_kind == 4 ? "FSR 4" : "none";
+		const char* fg       = fsr3_fg ? "AMD FSR3 FG" : Enabled() ? "NVIDIA DLSS-G" : "no FG";
+		if (!said || frames % 3600 == 0) {
+			said = true;
+			std::printf("%s: present source includes RT composite: %s (upscaler %s%s, %s, %s; %llu of %llu frames)\n",
+			            fsr3_fg ? "FSR3 FG" : "RT composite", ok ? "yes" : "no", upscaler, done ? "" : " gave none: stretched",
+			            fg, !composited ? "no RT pass changed the image" : written ? "written into the game's colour image" : "read by the upscaler",
+			            static_cast<unsigned long long>(reached), static_cast<unsigned long long>(frames));
+			std::fflush(stdout);
+		}
+	}
 	// DLSS's display-size image (KYTY_DLSS_OUT_DISPLAY): the sharpening's target, then blitted as XeSS's and FSR 3.1's.
 	VulkanImage* mid_image = to_mid ? &g_sr_mid.image : nullptr;
 	vk::Extent2D mid_size  = mid_extent;
