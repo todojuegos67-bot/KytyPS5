@@ -15,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -2430,9 +2431,89 @@ struct NpUniversalDataSystemMemoryStat {
 	size_t current_inuse_size;
 };
 
-struct NpUniversalDataSystemEvent {};
+struct NpUniversalDataSystemEventPropertyObject {
+	std::map<std::string, int64_t>     ints;
+	std::map<std::string, std::string> strings;
+	std::map<std::string, std::shared_ptr<NpUniversalDataSystemEventPropertyObject>> objects;
+};
 
-struct NpUniversalDataSystemEventPropertyObject {};
+struct NpUniversalDataSystemEvent {
+	std::string                              name;
+	NpUniversalDataSystemEventPropertyObject props;
+};
+
+#define UDS_TRACE()                                                                                                    \
+	do {                                                                                                               \
+		static std::once_flag uds_once;                                                                                \
+		const char* uds_name = __func__;                                                                               \
+		std::call_once(uds_once, [&] { std::printf("UDS: the game called sce%s\n", uds_name); });                      \
+	} while (false)
+
+static std::mutex g_uds_mutex;
+
+static void UdsSetInt(NpUniversalDataSystemEventPropertyObject* o, const char* key, int64_t v) {
+	if (o != nullptr && key != nullptr) {
+		std::lock_guard lock(g_uds_mutex);
+		o->ints[key] = v;
+	}
+}
+
+static std::string UdsLower(std::string t) {
+	for (auto& c: t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	return t;
+}
+
+// Finds an int property whose key contains all the given words (searched recursively, depth first).
+static bool UdsFindInt(const NpUniversalDataSystemEventPropertyObject& o, const char* w1, const char* w2, int64_t* v) {
+	for (const auto& [k, val]: o.ints) {
+		auto l = UdsLower(k);
+		if (l.find(w1) != std::string::npos && (w2 == nullptr || l.find(w2) != std::string::npos)) {
+			*v = val;
+			return true;
+		}
+	}
+	for (const auto& [k, c]: o.objects) {
+		if (c && UdsFindInt(*c, w1, w2, v)) return true;
+	}
+	return false;
+}
+
+static std::string UdsDump(const NpUniversalDataSystemEventPropertyObject& o) {
+	std::string r = "{";
+	for (const auto& [k, v]: o.ints) r += k + "=" + std::to_string(v) + " ";
+	for (const auto& [k, v]: o.strings) r += k + "=\"" + v + "\" ";
+	for (const auto& [k, c]: o.objects) r += k + "=" + (c ? UdsDump(*c) : std::string("{}")) + " ";
+	return r + "}";
+}
+
+static void UdsHandleEvent(const NpUniversalDataSystemEvent& e) {
+	auto        name = UdsLower(e.name);
+	std::string dump = UdsDump(e.props);
+	std::printf("UDS: event %s %s\n", e.name.c_str(), dump.c_str());
+	if (name.find("trophy") == std::string::npos) {
+		return;
+	}
+	int64_t id = -1;
+	if (!UdsFindInt(e.props, "trophy", "id", &id) && !UdsFindInt(e.props, "id", nullptr, &id)) {
+		std::printf("UDS: trophy event %s without a trophy id\n", e.name.c_str());
+		return;
+	}
+	bool unlock = name.find("unlock") != std::string::npos;
+	if (!unlock && name.find("progress") != std::string::npos) {
+		int64_t progress = 0, target = 0;
+		bool    hp = UdsFindInt(e.props, "progress", nullptr, &progress) || UdsFindInt(e.props, "value", nullptr, &progress) ||
+		          UdsFindInt(e.props, "current", nullptr, &progress);
+		bool ht = UdsFindInt(e.props, "target", nullptr, &target) || UdsFindInt(e.props, "max", nullptr, &target);
+		std::printf("UDS: trophy %d progress %lld / %lld\n", static_cast<int>(id), hp ? static_cast<long long>(progress) : -1LL,
+		            ht ? static_cast<long long>(target) : -1LL);
+		unlock = hp && ht && target > 0 && progress >= target;
+	}
+	if (unlock) {
+		int  plat = -1;
+		bool ok   = Libs::Trophy::Unlock(static_cast<int>(id), &plat);
+		std::printf("UDS: unlock trophy %d -> %s (platinum %d)\n", static_cast<int>(id), ok ? "new" : "already/failed", plat);
+	}
+}
 
 struct NpUniversalDataSystemEventPropertyArray {};
 
@@ -2449,6 +2530,7 @@ struct NpUniversalDataSystemStorageStat {
 static int KYTY_SYSV_ABI
 NpUniversalDataSystemInitialize(const NpUniversalDataSystemInitParam* param) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (param == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
@@ -2465,6 +2547,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemCreateContext(int* context, int us
                                                             uint32_t service_label,
                                                             uint64_t options) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (context != nullptr) {
 		*context = 1;
@@ -2480,6 +2563,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemCreateContext(int* context, int us
 
 static int KYTY_SYSV_ABI NpUniversalDataSystemCreateHandle(int* handle) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (handle == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
@@ -2494,6 +2578,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemCreateHandle(int* handle) {
 
 static int KYTY_SYSV_ABI NpUniversalDataSystemDestroyHandle(int handle) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t handle = %d\n", handle);
 
@@ -2502,6 +2587,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemDestroyHandle(int handle) {
 
 static int KYTY_SYSV_ABI NpUniversalDataSystemAbortHandle(int handle) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t handle = %d\n", handle);
 
@@ -2512,15 +2598,20 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemCreateEvent(
     const char* event_name, const NpUniversalDataSystemEventPropertyObject* prop,
     NpUniversalDataSystemEvent** new_event, NpUniversalDataSystemEventPropertyObject** prop_ptr) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (event_name == nullptr || new_event == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
 
-	*new_event = new NpUniversalDataSystemEvent;
+	*new_event         = new NpUniversalDataSystemEvent;
+	(*new_event)->name = event_name;
+	if (prop != nullptr) {
+		std::lock_guard lock(g_uds_mutex);
+		(*new_event)->props = *prop;
+	}
 	if (prop_ptr != nullptr) {
-		*prop_ptr = (prop != nullptr ? const_cast<NpUniversalDataSystemEventPropertyObject*>(prop)
-		                             : new NpUniversalDataSystemEventPropertyObject);
+		*prop_ptr = &(*new_event)->props;
 	}
 
 	LOGF("\t event_name = %s\n"
@@ -2537,6 +2628,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemCreateEvent(
 static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle, const void* event,
                                                         uint64_t options) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t context = %d\n"
 	     "\t handle  = %d\n"
@@ -2544,12 +2636,22 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle,
 	     "\t options = 0x%016" PRIx64 "\n",
 	     context, handle, reinterpret_cast<uint64_t>(event), options);
 
+	if (event != nullptr) {
+		NpUniversalDataSystemEvent copy;
+		{
+			std::lock_guard lock(g_uds_mutex);
+			copy = *static_cast<const NpUniversalDataSystemEvent*>(event);
+		}
+		UdsHandleEvent(copy);
+	}
+
 	return 0;
 }
 
 static int KYTY_SYSV_ABI
 NpUniversalDataSystemEventEstimateSize(const NpUniversalDataSystemEvent* event, size_t* size) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t event = 0x%016" PRIx64 "\n"
 	     "\t size  = 0x%016" PRIx64 "\n",
@@ -2568,6 +2670,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventToString(const NpUniversalDat
                                                             char* buf, size_t buf_size,
                                                             size_t* string_size) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t event       = 0x%016" PRIx64 "\n"
 	     "\t buf         = 0x%016" PRIx64 "\n"
@@ -2593,6 +2696,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventToString(const NpUniversalDat
 
 static int KYTY_SYSV_ABI NpUniversalDataSystemDestroyEvent(NpUniversalDataSystemEvent* event) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t event = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(event));
 
@@ -2604,6 +2708,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemDestroyEvent(NpUniversalDataSystem
 static int KYTY_SYSV_ABI NpUniversalDataSystemRegisterContext(int context, int handle,
                                                               uint64_t options) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t context = %d\n"
 	     "\t handle  = %d\n"
@@ -2615,6 +2720,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemRegisterContext(int context, int h
 
 static int KYTY_SYSV_ABI NpUniversalDataSystemDestroyContext(int context) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t context = %d\n", context);
 
@@ -2623,6 +2729,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemDestroyContext(int context) {
 
 static int KYTY_SYSV_ABI NpUniversalDataSystemGetMemoryStat(NpUniversalDataSystemMemoryStat* stat) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (stat == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
@@ -2636,6 +2743,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemGetMemoryStat(NpUniversalDataSyste
 static int KYTY_SYSV_ABI NpUniversalDataSystemCreateEventPropertyObject(
     NpUniversalDataSystemEventPropertyObject** new_object) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (new_object == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
@@ -2651,6 +2759,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemCreateEventPropertyObject(
 static int KYTY_SYSV_ABI
 NpUniversalDataSystemDestroyEventPropertyObject(NpUniversalDataSystemEventPropertyObject* object) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t object = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(object));
 
@@ -2662,6 +2771,7 @@ NpUniversalDataSystemDestroyEventPropertyObject(NpUniversalDataSystemEventProper
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetString(
     NpUniversalDataSystemEventPropertyObject* object, const char* key, const char* value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"
@@ -2673,12 +2783,18 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetString(
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
 
+	{
+		std::lock_guard lock(g_uds_mutex);
+		object->strings[key] = value;
+	}
+
 	return 0;
 }
 
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetInt32(
     NpUniversalDataSystemEventPropertyObject* object, const char* key, int32_t value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"
@@ -2689,12 +2805,15 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetInt32(
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
 
+	UdsSetInt(object, key, static_cast<int64_t>(value));
+
 	return 0;
 }
 
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetUInt32(
     NpUniversalDataSystemEventPropertyObject* object, const char* key, uint32_t value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
@@ -2705,12 +2824,15 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetUInt32(
 	     "\t value  = %" PRIu32 "\n",
 	     reinterpret_cast<uint64_t>(object), key, value);
 
+	UdsSetInt(object, key, static_cast<int64_t>(value));
+
 	return 0;
 }
 
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetInt64(
     NpUniversalDataSystemEventPropertyObject* object, const char* key, int64_t value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
@@ -2721,12 +2843,15 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetInt64(
 	     "\t value  = %" PRId64 "\n",
 	     reinterpret_cast<uint64_t>(object), key, value);
 
+	UdsSetInt(object, key, static_cast<int64_t>(value));
+
 	return 0;
 }
 
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetUInt64(
     NpUniversalDataSystemEventPropertyObject* object, const char* key, uint64_t value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
@@ -2737,12 +2862,15 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetUInt64(
 	     "\t value  = %" PRIu64 "\n",
 	     reinterpret_cast<uint64_t>(object), key, value);
 
+	UdsSetInt(object, key, static_cast<int64_t>(value));
+
 	return 0;
 }
 
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetFloat32(
     NpUniversalDataSystemEventPropertyObject* object, const char* key, float value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
@@ -2759,6 +2887,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetFloat32(
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetFloat64(
     NpUniversalDataSystemEventPropertyObject* object, const char* key, double value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
@@ -2775,6 +2904,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetFloat64(
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetBool(
     NpUniversalDataSystemEventPropertyObject* object, const char* key, bool value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
@@ -2785,6 +2915,8 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetBool(
 	     "\t value  = %d\n",
 	     reinterpret_cast<uint64_t>(object), key, value ? 1 : 0);
 
+	UdsSetInt(object, key, static_cast<int64_t>(value));
+
 	return 0;
 }
 
@@ -2792,6 +2924,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetBinary(
     NpUniversalDataSystemEventPropertyObject* object, const char* key, const void* value,
     size_t value_size) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (object == nullptr || key == nullptr || (value == nullptr && value_size != 0)) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
@@ -2812,15 +2945,22 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetObject(
     const NpUniversalDataSystemEventPropertyObject* value,
     NpUniversalDataSystemEventPropertyObject**      value_ptr) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
 
-	if (value_ptr != nullptr) {
-		*value_ptr =
-		    (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyObject*>(value)
-		                      : new NpUniversalDataSystemEventPropertyObject);
+	{
+		std::lock_guard lock(g_uds_mutex);
+		auto            child = std::make_shared<NpUniversalDataSystemEventPropertyObject>();
+		if (value != nullptr) {
+			*child = *value;
+		}
+		object->objects[key] = child;
+		if (value_ptr != nullptr) {
+			*value_ptr = child.get();
+		}
 	}
 
 	LOGF("\t object    = 0x%016" PRIx64 "\n"
@@ -2838,6 +2978,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetArray(
     const NpUniversalDataSystemEventPropertyArray* value,
     NpUniversalDataSystemEventPropertyArray**      value_ptr) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t object    = 0x%016" PRIx64 "\n"
 	     "\t key       = %s\n"
@@ -2861,6 +3002,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetArray(
 static int KYTY_SYSV_ABI
 NpUniversalDataSystemCreateEventPropertyArray(NpUniversalDataSystemEventPropertyArray** new_array) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (new_array == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
@@ -2876,6 +3018,7 @@ NpUniversalDataSystemCreateEventPropertyArray(NpUniversalDataSystemEventProperty
 static int KYTY_SYSV_ABI
 NpUniversalDataSystemDestroyEventPropertyArray(NpUniversalDataSystemEventPropertyArray* array) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t array = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(array));
 
@@ -2887,6 +3030,7 @@ NpUniversalDataSystemDestroyEventPropertyArray(NpUniversalDataSystemEventPropert
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetString(
     NpUniversalDataSystemEventPropertyArray* array, const char* value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t array = 0x%016" PRIx64 "\n"
 	     "\t value = %s\n",
@@ -2902,6 +3046,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetString(
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetInt32(
     NpUniversalDataSystemEventPropertyArray* array, int32_t value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t array = 0x%016" PRIx64 "\n"
 	     "\t value = %" PRId32 "\n",
@@ -2913,6 +3058,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetInt32(
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetUInt32(
     NpUniversalDataSystemEventPropertyArray* array, uint32_t value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t array = 0x%016" PRIx64 "\n"
 	     "\t value = %" PRIu32 "\n",
@@ -2924,6 +3070,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetUInt32(
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetInt64(
     NpUniversalDataSystemEventPropertyArray* array, int64_t value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t array = 0x%016" PRIx64 "\n"
 	     "\t value = %" PRId64 "\n",
@@ -2935,6 +3082,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetInt64(
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetUInt64(
     NpUniversalDataSystemEventPropertyArray* array, uint64_t value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t array = 0x%016" PRIx64 "\n"
 	     "\t value = %" PRIu64 "\n",
@@ -2946,6 +3094,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetUInt64(
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetFloat32(
     NpUniversalDataSystemEventPropertyArray* array, float value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t array = 0x%016" PRIx64 "\n"
 	     "\t value = %f\n",
@@ -2957,6 +3106,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetFloat32(
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetFloat64(
     NpUniversalDataSystemEventPropertyArray* array, double value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t array = 0x%016" PRIx64 "\n"
 	     "\t value = %f\n",
@@ -2968,6 +3118,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetFloat64(
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetBool(
     NpUniversalDataSystemEventPropertyArray* array, bool value) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t array = 0x%016" PRIx64 "\n"
 	     "\t value = %d\n",
@@ -2979,6 +3130,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetBool(
 static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetBinary(
     NpUniversalDataSystemEventPropertyArray* array, const void* value, size_t value_size) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t array      = 0x%016" PRIx64 "\n"
 	     "\t value      = 0x%016" PRIx64 "\n"
@@ -2998,15 +3150,22 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetObject(
     const NpUniversalDataSystemEventPropertyObject* value,
     NpUniversalDataSystemEventPropertyObject**      value_ptr) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (array == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
 
-	if (value_ptr != nullptr) {
-		*value_ptr =
-		    (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyObject*>(value)
-		                      : new NpUniversalDataSystemEventPropertyObject);
+	{
+		std::lock_guard lock(g_uds_mutex);
+		auto            child = std::make_shared<NpUniversalDataSystemEventPropertyObject>();
+		if (value != nullptr) {
+			*child = *value;
+		}
+		object->objects[key] = child;
+		if (value_ptr != nullptr) {
+			*value_ptr = child.get();
+		}
 	}
 
 	LOGF("\t array     = 0x%016" PRIx64 "\n"
@@ -3023,6 +3182,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetArray(
     const NpUniversalDataSystemEventPropertyArray* value,
     NpUniversalDataSystemEventPropertyArray**      value_ptr) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	if (array == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
@@ -3045,6 +3205,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetArray(
 static int KYTY_SYSV_ABI
 NpUniversalDataSystemGetStorageStat(int context, NpUniversalDataSystemStorageStat* stat) {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	LOGF("\t context = %d\n"
 	     "\t stat    = 0x%016" PRIx64 "\n",
@@ -3061,6 +3222,7 @@ NpUniversalDataSystemGetStorageStat(int context, NpUniversalDataSystemStorageSta
 
 static int KYTY_SYSV_ABI NpUniversalDataSystemTerminate() {
 	PRINT_NAME();
+	UDS_TRACE();
 
 	return 0;
 }
