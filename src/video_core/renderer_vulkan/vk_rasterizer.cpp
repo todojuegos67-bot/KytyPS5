@@ -762,8 +762,8 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
-    const bool bb_scan = (stage.l_stage == Shader::LogicalStage::Vertex ||
-                          stage.l_stage == Shader::LogicalStage::Fragment) &&
+    const bool bb_scan = (stage.sw_stage == Shader::SwStage::Vertex ||
+                          stage.sw_stage == Shader::SwStage::Fragment) &&
                          BB::Upscale::WantCameraScan();
     if (bb_scan) {
         // Constants the shader reads through user-data pointers (the flattened SRT) and the user
