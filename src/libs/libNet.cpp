@@ -3097,6 +3097,10 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetInt32(
 	     "\t value = %" PRId32 "\n",
 	     reinterpret_cast<uint64_t>(array), value);
 
+	if (array != nullptr) {
+		std::lock_guard lock(g_uds_mutex);
+		array->ints.push_back(static_cast<int64_t>(value));
+	}
 	return (array != nullptr ? 0 : NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT);
 }
 
@@ -3109,6 +3113,10 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetUInt32(
 	     "\t value = %" PRIu32 "\n",
 	     reinterpret_cast<uint64_t>(array), value);
 
+	if (array != nullptr) {
+		std::lock_guard lock(g_uds_mutex);
+		array->ints.push_back(static_cast<int64_t>(value));
+	}
 	return (array != nullptr ? 0 : NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT);
 }
 
@@ -3121,6 +3129,10 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetInt64(
 	     "\t value = %" PRId64 "\n",
 	     reinterpret_cast<uint64_t>(array), value);
 
+	if (array != nullptr) {
+		std::lock_guard lock(g_uds_mutex);
+		array->ints.push_back(static_cast<int64_t>(value));
+	}
 	return (array != nullptr ? 0 : NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT);
 }
 
@@ -3133,6 +3145,10 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetUInt64(
 	     "\t value = %" PRIu64 "\n",
 	     reinterpret_cast<uint64_t>(array), value);
 
+	if (array != nullptr) {
+		std::lock_guard lock(g_uds_mutex);
+		array->ints.push_back(static_cast<int64_t>(value));
+	}
 	return (array != nullptr ? 0 : NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT);
 }
 
@@ -3169,6 +3185,10 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetBool(
 	     "\t value = %d\n",
 	     reinterpret_cast<uint64_t>(array), value ? 1 : 0);
 
+	if (array != nullptr) {
+		std::lock_guard lock(g_uds_mutex);
+		array->ints.push_back(static_cast<int64_t>(value));
+	}
 	return (array != nullptr ? 0 : NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT);
 }
 
@@ -3187,26 +3207,6 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetBinary(
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
 
-	if (array != nullptr) {
-		std::lock_guard lock(g_uds_mutex);
-		array->ints.push_back(static_cast<int64_t>(value));
-	}
-	if (array != nullptr) {
-		std::lock_guard lock(g_uds_mutex);
-		array->ints.push_back(static_cast<int64_t>(value));
-	}
-	if (array != nullptr) {
-		std::lock_guard lock(g_uds_mutex);
-		array->ints.push_back(static_cast<int64_t>(value));
-	}
-	if (array != nullptr) {
-		std::lock_guard lock(g_uds_mutex);
-		array->ints.push_back(static_cast<int64_t>(value));
-	}
-	if (array != nullptr) {
-		std::lock_guard lock(g_uds_mutex);
-		array->ints.push_back(static_cast<int64_t>(value));
-	}
 	return 0;
 }
 
