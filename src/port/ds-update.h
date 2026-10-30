@@ -30,6 +30,8 @@ inline constexpr int         kKeepBackups = 2;
 
 // The version compiled into the exe (-DKYTY_DS_PORT_VERSION, the CI's package name = its release tag).
 const char* CurrentVersion();
+// (port21) When this build was made (the CI's clock, UTC): "30/10/2026 19:40 UTC".
+const char* BuildStamp();
 
 // `rel`: a path relative to the port's folder. True: the user's (never copied over, never backed up).
 // `game_rel`: the game's folder relative to the port's folder when it is inside it (empty: outside).

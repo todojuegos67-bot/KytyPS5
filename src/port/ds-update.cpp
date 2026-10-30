@@ -4,6 +4,8 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <fstream>
 #include <iterator>
 #include <set>
@@ -96,6 +98,20 @@ const char* const kUserFiles[] = {"game-path.txt", "ram16.txt", "kbm_curve.txt",
 
 const char* CurrentVersion() {
 	return KYTY_DS_PORT_VERSION;
+}
+
+const char* BuildStamp() {
+	static std::string stamp = [] {
+		// __DATE__ "Oct 30 2026", __TIME__ "19:40:12"
+		const std::string d = __DATE__, t = __TIME__;
+		static const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+		int m = 0;
+		for (int i = 0; i < 12; i++) if (d.compare(0, 3, months[i]) == 0) m = i + 1;
+		char buf[64];
+		std::snprintf(buf, sizeof(buf), "%02d/%02d/%s %s UTC", std::atoi(d.substr(4, 2).c_str()), m, d.substr(7, 4).c_str(), t.substr(0, 5).c_str());
+		return std::string(buf);
+	}();
+	return stamp.c_str();
 }
 
 std::string TagDate(const std::string& tag) {

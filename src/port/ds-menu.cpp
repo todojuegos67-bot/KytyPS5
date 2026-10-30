@@ -3020,7 +3020,8 @@ void DrawLauncher(float width, float height) {
 	{
 		char ver[256];
 		std::snprintf(ver, sizeof(ver), I18n::T("Version instalada: %s"), Update::CurrentVersion());
-		bg->AddText({U(12), height - U(26)}, IM_COL32(220, 214, 200, 230), ver);
+		const std::string line = std::string(ver) + "  \xC2\xB7  " + Update::BuildStamp();
+		bg->AddText({U(12), height - U(26)}, IM_COL32(220, 214, 200, 230), line.c_str());
 	}
 	StartupCheck();
 	UpdateNotice(width, height);
