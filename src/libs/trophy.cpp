@@ -370,6 +370,18 @@ void Load(State& s) {
 			s.trophies[e.info.id] = std::move(e);
 		}
 	}
+	if (!s.trophies.empty() && s.trophies.count(kNexusTrophyId) == 0) {
+		Entry e;
+		e.info.id    = kNexusTrophyId;
+		e.info.grade = 4;
+		const bool es = s.language.rfind("es", 0) == 0;
+		e.info.name   = es ? "Bienvenido al Nexo" : "Welcome to the Nexus";
+		e.info.detail = es ? "Llega al Nexo por primera vez." : "Reach the Nexus for the first time.";
+		if (const auto first = s.trophies.find(1); first != s.trophies.end()) {
+			e.icon_w = first->second.icon_w, e.icon_h = first->second.icon_h, e.icon = first->second.icon;
+		}
+		s.trophies[kNexusTrophyId] = std::move(e);
+	}
 	LOGF("Trophy: %zu trophies (%s), %zu unlocked\n", s.trophies.size(), s.language.c_str(), s.unlocked.size());
 	std::printf("Trophy: opened %s: %zu trophies, language %s (console language %u), %zu unlocked (%s)\n",
 	            Common::PathToString(ucp.filename()).c_str(), s.trophies.size(), s.language.c_str(), lang,
@@ -465,7 +477,7 @@ bool Unlock(int trophy_id, int* platinum_id) {
 	bool rest     = !s.trophies.empty();
 	for (const auto& [id, e]: s.trophies) {
 		if (e.info.grade == 1) platinum = id;
-		else if (s.unlocked.count(id) == 0) rest = false;
+		else if (id != kNexusTrophyId && s.unlocked.count(id) == 0) rest = false;
 	}
 	if (platinum >= 0 && rest && s.unlocked.count(platinum) == 0) {
 		Record(s, platinum);
