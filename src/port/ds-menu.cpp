@@ -208,8 +208,8 @@ bool OnEvent(const SDL_Event& e) {
 	switch (e.type) {
 		case SDL_KEYDOWN:
 			if (e.key.keysym.sym == SDLK_F1 && e.key.repeat == 0) {
-				// (ds-pc-port8) F1: save and quit (no menu any more).
-				Resume::StartSaveAndQuit(g_rt.exe_path.parent_path());
+				// (port26) F1: the small in-game menu (show the launcher next time; close the game). Nothing is saved or skipped.
+				SetOpen(!open);
 				Bump();
 				return true;
 			}
@@ -236,7 +236,7 @@ bool OnEvent(const SDL_Event& e) {
 			const bool combo = b == SDL_CONTROLLER_BUTTON_START && PadHeld(e.cbutton.which, SDL_CONTROLLER_BUTTON_RIGHTSTICK);
 			if (combo) {
 				g_start_swallowed = true;
-				Resume::StartSaveAndQuit(g_rt.exe_path.parent_path()); // (ds-pc-port8) as F1
+				SetOpen(!open); // (port26) as F1: the in-game menu
 				Bump();
 				return true;
 			}
@@ -3062,7 +3062,53 @@ bool WantsOverlay() {
 }
 
 // (ds-pc-port8) In the game: F1's save and quit, a panel in the middle of the screen until the game closes.
+void DrawInGameMenu(float width, float height) {
+	DrainInputs();
+	const float unit = std::max(std::min(width / 1920.0f, height / 1080.0f), 0.5f);
+	ImGui::GetIO().MouseDrawCursor = true;
+	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, 140));
+	ImFont* font = FindFont("segoeui");
+	ImGui::PushFont(font, 26.0f * unit);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {32 * unit, 24 * unit});
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12 * unit, 14 * unit});
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.03f, 0.035f, 0.94f});
+	ImGui::SetNextWindowPos({width * 0.5f, height * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
+	ImGui::Begin("##f1menu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
+	                                     ImGuiWindowFlags_NoSavedSettings);
+	ImGui::TextUnformatted(I18n::T("Demon's Souls PC"));
+	ImGui::Separator();
+	bool show = g_saved.start_menu;
+	if (ImGui::Checkbox(I18n::T("Mostrar el lanzador la pr\xC3\xB3xima vez que abras el juego"), &show)) {
+		Settings on_disk;
+		if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_saved;
+		on_disk.start_menu  = show;
+		g_saved.start_menu  = show;
+		g_edit.start_menu   = show;
+		(void)SaveSettings(g_rt.ini_path, on_disk);
+	}
+	const ImVec2 bs {420 * unit, 52 * unit};
+	if (ImGui::Button(I18n::T("Volver al juego"), bs)) SetOpen(false);
+	if (ImGui::Button(I18n::T("Cerrar el juego"), bs)) {
+		// Just closes: nothing saved, nothing skipped (the game's own saves are already on disk).
+#if defined(_WIN32)
+		ExitProcess(0);
+#else
+		std::_Exit(0);
+#endif
+	}
+	ImGui::TextDisabled("%s", I18n::T("F1 o Esc: volver al juego"));
+	ImGui::End();
+	ImGui::PopStyleColor();
+	ImGui::PopStyleVar(2);
+	ImGui::PopFont();
+}
+
 void DrawInGame(float width, float height) {
+	if (g_open.load() && !Resume::SaveAndQuitActive()) {
+		DrawInGameMenu(width, height);
+		return;
+	}
+	ImGui::GetIO().MouseDrawCursor = false;
 	if (!Resume::SaveAndQuitActive()) return;
 	const float unit = std::max(std::min(width / 1920.0f, height / 1080.0f), 0.5f);
 	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, 150));
