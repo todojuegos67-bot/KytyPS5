@@ -72,6 +72,20 @@ void StartShaders() {
 	g_saved.precompile_threads = g_edit.precompile_threads;
 	Precompile::Start();
 }
+// (ds-pc-port19) The precompile panel's mode button: all CPU threads <-> relaxed, saved to settings.ini (only that key);
+// a running precompile restarts in the new mode (finished parts are kept).
+void ToggleShaderThreads(bool running) {
+	const bool all             = g_edit.precompile_threads != "todos";
+	g_edit.precompile_threads  = all ? "todos" : "relajado";
+	g_saved.precompile_threads = g_edit.precompile_threads;
+	Precompile::SetAllThreads(all);
+	Settings on_disk;
+	if (LoadSettings(g_rt.ini_path, &on_disk)) {
+		on_disk.precompile_threads = g_edit.precompile_threads;
+		(void)SaveSettings(g_rt.ini_path, on_disk);
+	}
+	if (running) std::thread([] { Precompile::Stop(); Precompile::Start(); }).detach();
+}
 std::atomic<bool>        g_open {false};
 std::atomic<uint64_t>    g_revision {1};
 std::atomic<bool>        g_reset_edit {false};
@@ -2869,6 +2883,13 @@ void DrawLauncher(float width, float height) {
 			} else if (LButton("Preparar shaders", {x0 + sh_pad, cy}, {U(240), U(36)}, false, g_font_semi, U(18),
 			                   "Compila ya todos los pipelines del juego para esta grafica (evita tirones la primera vez)."))
 				StartShaders();
+			{
+				const bool all_now = g_edit.precompile_threads == "todos";
+				const float bx     = x0 + sh_pad + U(pv.running ? 196 : 256);
+				if (LButton(all_now ? "Hilos: m\xC3\xA1ximo" : "Hilos: relajado", {bx, cy}, {U(220), U(36)}, false, g_font_semi, U(18),
+				            "Cambia c\xC3\xB3mo precompila: m\xC3\xA1ximo = todos los hilos de la CPU (m\xC3\xA1s r\xC3\xA1pido, el PC va cargado); relajado = pocos hilos. Si est\xC3\xA1 precompilando, sigue en el modo nuevo sin perder lo hecho."))
+					ToggleShaderThreads(pv.running);
+			}
 		}
 		ImGui::SetCursorScreenPos({g_lbox.at.x, sy});
 		ImGui::Dummy({g_lbox.w, sh_h + U(14)});
