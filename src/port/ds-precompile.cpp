@@ -180,11 +180,11 @@ void Work() {
 	// left, and one starting at a time (each creates its Vulkan device and translates its shaders first).
 	// (ds-pc-port13) All the CPU threads, on request: processes of 4 threads (one scales to ~4) up to every logical CPU
 	// (a 9950X3D: 8 x 4 = 32), still one starting at a time and each only with the free memory below.
-	const bool all        = g_all_threads;
+	const bool all_cpu    = g_all_threads;
 	const int  logical    = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
-	const int threads     = all ? 4 : 2;
-	const int jobs        = all ? std::max(1, (logical + 3) / 4) : std::clamp(g_setup.cpus / 8, 1, 4);
-	std::printf("[port] precompile: %s, %d processes of %d threads at most\n", all ? "all CPU threads" : "relaxed", jobs, threads);
+	const int threads     = all_cpu ? 4 : 2;
+	const int jobs        = all_cpu ? std::max(1, (logical + 3) / 4) : std::clamp(g_setup.cpus / 8, 1, 4);
+	std::printf("[port] precompile: %s, %d processes of %d threads at most\n", all_cpu ? "all CPU threads" : "relaxed", jobs, threads);
 	std::fflush(stdout);
 	const auto memory_ok  = [] {
 		MEMORYSTATUSEX m {};
