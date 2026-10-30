@@ -1710,10 +1710,20 @@ Presenter::Frame* Presenter::PrepareLastFrame() {
 
 // KYTY_PRESENT_DIRECT=1 (a test for issue #37, a variable refresh rate that stopped engaging in v20261016b): each frame
 // is presented on the vblank thread as it is handed over, as before the presenter had a thread of its own (eadf554f).
+// Not with frame generation: the vblank thread then waits in the frame generator's presents (two a game frame), and the
+// game flipped at half the display's rate (FSR 3 at 60 Hz: 30.0 fps, done to flip 32 ms, against 60.2 and 16 ms on the
+// presenter's thread; issue #236: an RTX 4090 at 120 Hz held at 30 in every session).
 static bool PresentDirect() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_PRESENT_DIRECT");
-		return value != nullptr && value[0] == '1';
+		if (value == nullptr || value[0] != '1') return false;
+		if (const char* framegen = std::getenv("KYTY_FRAMEGEN"); framegen != nullptr && std::atoi(framegen) != 0) {
+			std::printf("Presentation: KYTY_PRESENT_DIRECT off with frame generation (it held the game at half the display's "
+			            "rate; issue #236)\n");
+			std::fflush(stdout);
+			return false;
+		}
+		return true;
 	}();
 	return on;
 }
