@@ -3151,16 +3151,9 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetObject(
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
 
-	{
-		std::lock_guard lock(g_uds_mutex);
-		auto            child = std::make_shared<NpUniversalDataSystemEventPropertyObject>();
-		if (value != nullptr) {
-			*child = *value;
-		}
-		object->objects[key] = child;
-		if (value_ptr != nullptr) {
-			*value_ptr = child.get();
-		}
+	if (value_ptr != nullptr) {
+		*value_ptr = (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyObject*>(value)
+		                               : new NpUniversalDataSystemEventPropertyObject);
 	}
 
 	LOGF("\t array     = 0x%016" PRIx64 "\n"
