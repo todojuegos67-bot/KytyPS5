@@ -183,7 +183,7 @@ void Work() {
 	const bool all_cpu    = g_all_threads;
 	const int  logical    = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
 	const int threads     = all_cpu ? 4 : 2;
-	const int jobs        = all_cpu ? std::max(1, (logical + 3) / 4) : std::clamp(g_setup.cpus / 8, 1, 4);
+	int       jobs        = all_cpu ? std::max(1, (logical + 3) / 4) : std::clamp(g_setup.cpus / 8, 1, 4);
 	std::printf("[port] precompile: %s, %d processes of %d threads at most\n", all_cpu ? "all CPU threads" : "relaxed", jobs, threads);
 	std::fflush(stdout);
 	const auto memory_ok  = [] {
@@ -237,6 +237,7 @@ void Work() {
 		std::string name;
 	};
 	std::vector<Running> running;
+	std::map<int, int>   retries;
 	const auto kill_all = [&] {
 		for (auto& r: running) {
 			TerminateProcess(r.c.process, 1);
@@ -303,10 +304,22 @@ void Work() {
 			}
 			Running r = running[k];
 			running.erase(running.begin() + static_cast<std::ptrdiff_t>(k));
-			if (Finish(r.c) != 0) {
-				kill_all();
-				(void)merge("merge-failed");
-				return fail("Fallo un trozo de la preparacion de shaders (" + r.name + "). Mira logs\\*-precompile.");
+			const int code = Finish(r.c);
+			if (code != 0) {
+				// (port15) A shard that dies (the driver under many compiling processes at once) is retried, with one
+				// process fewer each time, instead of failing the whole run; only 4 failures of the same shard stop it.
+				const int tries = ++retries[r.shard];
+				std::printf("[port] precompile: %s failed (exit %d, try %d); retrying with %d processes\n", r.name.c_str(), code, tries,
+				            std::max(1, jobs - 1));
+				std::fflush(stdout);
+				if (tries >= 4) {
+					kill_all();
+					(void)merge("merge-failed");
+					return fail("Fallo un trozo de la preparacion de shaders (" + r.name + "). Mira logs\\*-precompile.");
+				}
+				jobs = std::max(1, jobs - 1);
+				pending.push_front(r.shard);
+				continue;
 			}
 			done++;
 			done_here++;
