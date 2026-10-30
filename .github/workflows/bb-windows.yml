@@ -64,7 +64,7 @@ jobs:
         cmake --build build --config Release --parallel $env:NUMBER_OF_PROCESSORS 2>&1 | Tee-Object build.log
         $code = $LASTEXITCODE
         if ($code) {
-          Select-String -Path build.log -Pattern 'error' | Where-Object { $_.Line -notmatch 'warning' } |
+          Select-String -Path build.log -Pattern 'error: |error [A-Z]+[0-9]+|FAILED: |undefined symbol' |
             Select-Object -First 40 | ForEach-Object { Write-Output ("::error::" + $_.Line.Substring(0, [Math]::Min(900, $_.Line.Length))) }
           exit $code
         }
