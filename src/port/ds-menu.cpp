@@ -2823,6 +2823,7 @@ void DrawLauncher(float width, float height) {
 		sh_h      = sh_pad + sh_text_h + (pv.running ? U(12) + U(32) : 0.0f) + (sh_button ? U(12) + U(36) : 0.0f) + sh_pad;
 	}
 	float bottom_h = U(58 + 8 + 40 + 16);
+	if (g_rt.pick_folder) bottom_h += U(44); // (port26) the game folder row
 	if (shader_row) bottom_h += sh_h + U(14);
 	if (!when.empty()) bottom_h += U(26);
 	const float bottom_y = height - bottom_h - U(10);
@@ -2840,6 +2841,29 @@ void DrawLauncher(float width, float height) {
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), 0});
 	g_lbox.at = {px + U(10), ImGui::GetCursorScreenPos().y};
 	g_lbox.w  = U(420);
+	if (g_rt.pick_folder) {
+		// (port26) The game folder, above the shaders' panel: chosen, checked and saved to settings.ini at once (only that key).
+		const float y     = RowY();
+		std::string label = s.game.empty() ? std::string(I18n::T("Elegir carpeta del juego...")) : std::string(I18n::T("Carpeta del juego: ")) + s.game;
+		if (label.size() > 60) label = label.substr(0, 28) + "..." + label.substr(label.size() - 29);
+		if (LButton(label.c_str(), {g_lbox.at.x, y}, {U(420), U(36)}, false, g_font_semi, U(15),
+		            "Elige la carpeta de Demon's Souls (la que tiene eboot.bin y sce_sys). Se guarda al momento en settings.ini.")) {
+			const std::string picked = g_rt.pick_folder();
+			if (!picked.empty()) {
+				if (!g_rt.is_game || g_rt.is_game(picked)) {
+					s.game       = picked;
+					g_saved.game = picked;
+					Settings on_disk;
+					if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_edit;
+					on_disk.game = picked;
+					g_status = SaveSettings(g_rt.ini_path, on_disk) ? "Carpeta del juego guardada en settings.ini" : "No se pudo guardar settings.ini";
+				} else {
+					g_status = "Esa carpeta no es Demon's Souls (falta eboot.bin o sce_sys).";
+				}
+			}
+		}
+		RowEnd(y, 44);
+	}
 	if (shader_row) {
 		auto*       dl = ImGui::GetWindowDrawList();
 		const float sy = RowY();
@@ -2938,29 +2962,6 @@ void DrawLauncher(float width, float height) {
 		if (LButton("Salir", {g_lbox.at.x + U(320), y}, {U(100), U(40)}, false, g_font_semi, U(17), "Cierra el lanzador sin jugar (Esc)."))
 			g_start_result = -1;
 		RowEnd(y, 48);
-	}
-	if (g_rt.pick_folder) {
-		// (port25) The game folder, right here: chosen, checked and saved to settings.ini at once (only that key).
-		const float y     = RowY();
-		std::string label = s.game.empty() ? std::string(I18n::T("Elegir carpeta del juego...")) : std::string(I18n::T("Carpeta del juego: ")) + s.game;
-		if (label.size() > 60) label = label.substr(0, 28) + "..." + label.substr(label.size() - 29);
-		if (LButton(label.c_str(), {g_lbox.at.x, y}, {U(420), U(36)}, false, g_font_semi, U(15),
-		            "Elige la carpeta de Demon's Souls (la que tiene eboot.bin y sce_sys). Se guarda al momento en settings.ini.")) {
-			const std::string picked = g_rt.pick_folder();
-			if (!picked.empty()) {
-				if (!g_rt.is_game || g_rt.is_game(picked)) {
-					s.game       = picked;
-					g_saved.game = picked;
-					Settings on_disk;
-					if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_edit;
-					on_disk.game = picked;
-					g_status = SaveSettings(g_rt.ini_path, on_disk) ? "Carpeta del juego guardada en settings.ini" : "No se pudo guardar settings.ini";
-				} else {
-					g_status = "Esa carpeta no es Demon's Souls (falta eboot.bin o sce_sys).";
-				}
-			}
-		}
-		RowEnd(y, 44);
 	}
 	ImGui::PopStyleVar();
 	ImGui::End();
