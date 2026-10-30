@@ -632,7 +632,7 @@ void CheckWork() {
 	const std::string both = "Version instalada: " + cur + "\nUltima version del port en GitHub: " + r.tag;
 	const std::string dc = Update::TagDate(cur), dr = Update::TagDate(r.tag);
 	if (r.tag == cur) SetUpd(UpdateUi::UpToDate, both + "\nYa tienes la ultima version.");
-	else if (!dc.empty() && !dr.empty() && dc >= dr) SetUpd(UpdateUi::UpToDate, both + "\nTu version es igual o mas nueva. No hace falta actualizar.");
+	else if (!dc.empty() && !dr.empty() && dc > dr) SetUpd(UpdateUi::UpToDate, both + "\nTu version es mas nueva. No hace falta actualizar.");
 	else SetUpd(UpdateUi::Available, both + "\nNueva version " + r.tag + " \xE2\x80\x94 Cruz para actualizar");
 #else
 	SetUpd(UpdateUi::Failed, "Solo en Windows.");
@@ -728,7 +728,7 @@ void StartupCheck() {
 			if (!Update::CheckLatest(&r, &error)) return;
 			const std::string cur = Update::CurrentVersion();
 			const std::string dc = Update::TagDate(cur), dr = Update::TagDate(r.tag);
-			if (r.tag == cur || (!dc.empty() && !dr.empty() && dc >= dr)) return;
+			if (r.tag == cur || (!dc.empty() && !dr.empty() && dc > dr)) return;
 			{
 				std::scoped_lock lock(g_upd.mutex);
 				if (g_upd.busy.load()) return;
