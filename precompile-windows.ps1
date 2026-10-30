@@ -246,7 +246,7 @@ function Get-SeedPipelines([string]$file) {
 		$stream.Dispose()
 	}
 }
-if ($AllThreads) { $Gentle = $false; $Affinity = -1; if (-not $PSBoundParameters.ContainsKey('Threads')) { $Threads = 4 } }
+if ($AllThreads) { $Gentle = $false; $Affinity = -1; if (-not $PSBoundParameters.ContainsKey('Threads')) { $Threads = 2 } }  # (1030e) more processes of 2 threads: the driver compile scales by process
 if ($Affinity -eq 0) {
 	$config = @("$PSScriptRoot\launch.json", "$PSScriptRoot\run-windows.json") | Where-Object { Test-Path $_ } |
 		Select-Object -First 1
@@ -405,7 +405,7 @@ while ($first.Count -or $second.Count -or $running.Count) {
 				break
 			}
 			$script:memWait = $false
-			if ($script:lastStart -and ((Get-Date) - $script:lastStart).TotalSeconds -lt 4) { break }
+			if ($script:lastStart -and ((Get-Date) - $script:lastStart).TotalSeconds -lt 0.5) { break }
 		}
 		$script:lastStart = Get-Date
 		$seedFile, $shard = $pending.Dequeue()
