@@ -1215,6 +1215,16 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
             plan.hdr ? "HDR" : "LDR", vk::to_string(g_bb.output.format),
             copy && g_bb.present_encoded ? " (sRGB-encoded, decoded once in the HUD composite)"
                                          : "");
+        // The window path gets the same inputs as the in-place path: the game's depth, the
+        // camera-reconstructed motion vectors at the render size (bb_mv.comp), its jitter, reset.
+        if (copy && (g_bb.upscales == 1 || g_bb.upscales % 600 == 0)) {
+            BB::Upscale::Checkpoint(fmt::format(
+                "window path upscale {}: MV: {}, jitter {:+.4f},{:+.4f}, depth {}x{} ({:#x}), "
+                "reset {}",
+                g_bb.upscales, plan.camera_valid ? "camera-reconstructed" : "zero (no camera yet)",
+                plan.jitter[0], plan.jitter[1], depth.info.size.width, depth.info.size.height,
+                depth.info.guest_address, plan.reset ? "yes" : "no"));
+        }
         if (g_bb.upscales == 1) {
             BB::Upscale::SetUpscaleFormats(formats);
         }
