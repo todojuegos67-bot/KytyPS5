@@ -1036,10 +1036,17 @@ $btnPre.Add_Click({
 	$pre = Join-Path $root 'precompile-windows.ps1'
 	if (-not (Test-Path -LiteralPath $pre)) { [System.Windows.Forms.MessageBox]::Show('Falta precompile-windows.ps1', 'Launcher', 'OK', 'Error') | Out-Null; return }
 	$a = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$pre`"", '-Game', "`"$(Get-GamePath)`"")
-	# Suave: la mitad de la CPU a prioridad minima (PCs que se reiniciaban o se calentaban precompilando).
-	$suave = [System.Windows.Forms.MessageBox]::Show("Precompilar en modo SUAVE?`n`nSi: usa la mitad de la CPU, tarda mas y el PC no se calienta ni se reinicia.`nNo: a toda potencia (lo normal).", 'Precompilar shaders', 'YesNoCancel', 'Question')
-	if ($suave -eq 'Cancel') { return }
-	if ($suave -eq 'Yes') { $a += '-Gentle' }
+	# (water-1030) Todos los hilos de la CPU o modo relajado (la mitad de la CPU a prioridad minima, el -Gentle de antes):
+	# se pregunta la primera vez y se guarda en launcher.ini (precompilehilos=todos/relajado); se cambia en Settings.
+	$hilos = Get-IniValue 'precompilehilos' ''
+	if ($hilos -ne 'todos' -and $hilos -ne 'relajado') {
+		$r = [System.Windows.Forms.MessageBox]::Show("$([char]0xBF)Usar todos los hilos de la CPU para precompilar m$([char]0xE1)s r$([char]0xE1)pido? (S$([char]0xED) = m$([char]0xE1)xima velocidad, el PC ir$([char]0xE1) cargado; No = modo relajado)", 'Precompilar shaders', 'YesNoCancel', 'Question')
+		if ($r -eq 'Cancel') { return }
+		$hilos = if ($r -eq 'Yes') { 'todos' } else { 'relajado' }
+		Set-IniValue 'precompilehilos' $hilos
+		if ($chkPreHilos) { $chkPreHilos.Checked = ($hilos -eq 'todos') }
+	}
+	if ($hilos -eq 'todos') { $a += '-AllThreads' } else { $a += '-Gentle' }
 	Start-Process -FilePath 'powershell' -ArgumentList $a -WorkingDirectory $root | Out-Null
 })
 $panel.Controls.Add($btnPre)
@@ -2712,6 +2719,14 @@ $cmbTest.Add_SelectedIndexChanged({ Set-IniValue 'pruebamanchas' "$($cmbTest.Sel
 $cmbTest.Location = New-Object System.Drawing.Point(410, 100); $cmbTest.Size = New-Object System.Drawing.Size(180, 26)
 $tips.SetToolTip($cmbTest, 'Solo para pruebas: quita una cosa del juego o del emulador para encontrar el fallo de las manchas negras. Deja Prueba: ninguna para jugar normal.')
 $settings.Controls.Add($cmbTest)
+# (water-1030) Precompilar shaders: todos los hilos de la CPU o modo relajado (launcher.ini precompilehilos).
+$chkPreHilos = New-Object System.Windows.Forms.CheckBox
+$chkPreHilos.Text = 'Precompilar shaders con todos los hilos de la CPU'; $chkPreHilos.Font = $smallFont; $chkPreHilos.ForeColor = $ink
+$chkPreHilos.Location = New-Object System.Drawing.Point(20, 164); $chkPreHilos.Size = New-Object System.Drawing.Size(570, 24)
+$chkPreHilos.Checked = ((Get-IniValue 'precompilehilos' '') -eq 'todos')
+$chkPreHilos.Add_Click({ Set-IniValue 'precompilehilos' $(if ($chkPreHilos.Checked) { 'todos' } else { 'relajado' }) })
+$tips.SetToolTip($chkPreHilos, "S$([char]0xED) = m$([char]0xE1)xima velocidad, el PC ir$([char]0xE1) cargado; No = modo relajado (la mitad de la CPU, prioridad m$([char]0xED)nima).")
+$settings.Controls.Add($chkPreHilos)
 $btnSettings.Add_Click({ $settings.Visible = -not $settings.Visible })
 # (10-23) Cruz para cerrar Settings; al guardar bien tambien se cierra.
 $btnCloseSet = New-Button ([string][char]0x2715) 572 6 32 30 $false

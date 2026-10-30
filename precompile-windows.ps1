@@ -8,6 +8,7 @@
 #                                         each pipeline's own pipeline cache data, <title>_<version>.blobs, read
 #                                         alike (a .bin made before them stays in use, and a run adds to it)
 #   .\precompile-windows.ps1 -Jobs 8      8 processes at a time (default: 3 threads each on the allowed CPUs)
+#   .\precompile-windows.ps1 -AllThreads  every logical CPU thread (4 a process, any CPU; waits for free memory)
 #   .\precompile-windows.ps1 -Quick       only the shaders as recorded play used them (the release's hints and this
 #                                         PC's recordings): about half of a full run, what the places played so far
 #                                         need. A full run compiles those first too, and the game can start once
@@ -59,6 +60,9 @@ param(
 	[int]$Shards = 512,
 	[int64]$Affinity = 0, # 0: the launch config's CPUs (this PC's leave out 4 and 5, where the compiler crashes), else all
 	[switch]$Gentle, # half the CPUs (every other one), idle priority, half the processes: for PCs that overheat or restart
+	# (water-1030) Every logical CPU thread of the PC (any CPU, processes of 4 threads: a 9950X3D runs 8 x 4 = 32), a new
+	# process only with 8 GB of RAM and of commit free ("waiting for free memory"), as the PC port's precompile.
+	[switch]$AllThreads,
 	[switch]$Coverage,
 	[switch]$Quick,
 	[switch]$Full,
@@ -242,6 +246,7 @@ function Get-SeedPipelines([string]$file) {
 		$stream.Dispose()
 	}
 }
+if ($AllThreads) { $Gentle = $false; $Affinity = -1; if (-not $PSBoundParameters.ContainsKey('Threads')) { $Threads = 4 } }
 if ($Affinity -eq 0) {
 	$config = @("$PSScriptRoot\launch.json", "$PSScriptRoot\run-windows.json") | Where-Object { Test-Path $_ } |
 		Select-Object -First 1
@@ -279,6 +284,14 @@ $nvidiaCaches = Join-Path ([IO.Path]::GetTempPath()) "kyty-precompile-$stamp"
 Add-Type -Namespace KytyPrecompile -Name Qos -MemberDefinition @'
 [StructLayout(LayoutKind.Sequential)] public struct PowerThrottlingState { public uint Version, ControlMask, StateMask; }
 [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetProcessInformation(IntPtr process, int infoClass, ref PowerThrottlingState state, uint size);
+[StructLayout(LayoutKind.Sequential)] public struct MemoryStatusEx { public uint Length, Load; public ulong TotalPhys, AvailPhys, TotalPageFile, AvailPageFile, TotalVirtual, AvailVirtual, AvailExtendedVirtual; }
+[DllImport("kernel32.dll", SetLastError = true)] static extern bool GlobalMemoryStatusEx(ref MemoryStatusEx status);
+// (water-1030, -AllThreads) 8 GB of RAM and of commit left: room for one more process.
+public static bool MemoryOk() {
+	var m = new MemoryStatusEx { Length = (uint)Marshal.SizeOf(typeof(MemoryStatusEx)) };
+	if (!GlobalMemoryStatusEx(ref m)) return true;
+	return m.AvailPhys >= (8UL << 30) && m.AvailPageFile >= (8UL << 30);
+}
 public static bool High(IntPtr process) {
 	// ProcessPowerThrottling (4), PROCESS_POWER_THROTTLING_CURRENT_VERSION (1), EXECUTION_SPEED (1) controlled and off.
 	var state = new PowerThrottlingState { Version = 1, ControlMask = 1, StateMask = 0 };
@@ -383,6 +396,17 @@ while ($first.Count -or $second.Count -or $running.Count) {
 	$pending = $null
 	if ($first.Count) { $pending = $first } elseif ($tierMerged) { $pending = $second }
 	while ($pending -and $pending.Count -and $running.Count -lt $Jobs) {
+		# (water-1030, -AllThreads) a new process only with free memory, one starting at a time (4 s apart)
+		if ($AllThreads -and $running.Count) {
+			if (-not [KytyPrecompile.Qos]::MemoryOk()) {
+				if (-not $script:memWait) { Write-Host '  waiting for free memory (8 GB of RAM and of commit) before the next process' }
+				$script:memWait = $true
+				break
+			}
+			$script:memWait = $false
+			if ($script:lastStart -and ((Get-Date) - $script:lastStart).TotalSeconds -lt 4) { break }
+		}
+		$script:lastStart = Get-Date
 		$seedFile, $shard = $pending.Dequeue()
 		$name = 'shard' + ($shard -replace '/', 'of') + '-' + [IO.Path]::GetFileNameWithoutExtension($seedFile)
 		$running[$name] = @($seedFile, $shard, (Start-Precompile $name @('--seeds', "`"$seedFile`"", '--shard', $shard,
