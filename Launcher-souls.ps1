@@ -1429,9 +1429,9 @@ function Get-InstalledVersion {
 	try { if (Test-Path -LiteralPath $script:updVerFile) { $v = ((Get-Content -LiteralPath $script:updVerFile -Raw) -replace '^\uFEFF', '').Trim(); if ($v) { return $v } } } catch { }
 	return ''
 }
-function Get-LatestRelease {
+function Get-LatestRelease([int]$Timeout = 30) {
 	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-	$rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/todojuegos67-bot/KytyPS5/releases/latest' -Headers @{ 'User-Agent' = 'DS-Launcher'; 'Accept' = 'application/vnd.github+json' } -UseBasicParsing -TimeoutSec 30
+	$rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/todojuegos67-bot/KytyPS5/releases/latest' -Headers @{ 'User-Agent' = 'DS-Launcher'; 'Accept' = 'application/vnd.github+json' } -UseBasicParsing -TimeoutSec $Timeout
 	if ($rel.draft -or $rel.prerelease) { throw 'no published release' }
 	$zips = @($rel.assets | Where-Object { $_.name -like '*.zip' -and $_.name -notmatch '(?i)linux|macos|source|symbols|pdb' -and $_.browser_download_url -like 'https://*' })
 	$win = @($zips | Where-Object { $_.name -match '(?i)windows|win64|x64|DemonsSouls|KytyPS5' })
@@ -1659,15 +1659,18 @@ $f.Add_Shown({ $f.Activate(); Install })
 [void]$f.ShowDialog()
 exit $script:code
 '@
-function Start-UpdateVersion {
+function Start-UpdateVersion([switch]$Startup) {
 	$t = UT 'Actualizar version' 'Update version'
 	# 1) Comprobar version
 	$cur = Get-InstalledVersion
-	try { $form.Cursor = 'WaitCursor'; $rel = Get-LatestRelease }
+	# (ds-pc-port17) Al abrir: comprobacion silenciosa (sin avisos si falla o ya esta al dia).
+	if ($Startup) { try { $rel = Get-LatestRelease 8 } catch { return } }
+	else { try { $form.Cursor = 'WaitCursor'; $rel = Get-LatestRelease }
 	catch { [System.Windows.Forms.MessageBox]::Show((UT 'No se pudo consultar GitHub: ' 'Could not check GitHub: ') + $_.Exception.Message, $t, 'OK', 'Error') | Out-Null; return }
-	finally { $form.Cursor = 'Default' }
+	finally { $form.Cursor = 'Default' } }
 	$dCur = if ($cur -match '(20\d{6})') { $Matches[1] } else { '' }
 	$dRel = if ($rel.Tag -match '(20\d{6})') { $Matches[1] } else { '' }
+	if ($Startup -and (($cur -and $cur -eq $rel.Tag -or ($dCur -and $dRel -and $dCur -ge $dRel))) { return }
 	if ($cur -and $cur -ne $rel.Tag -and $dCur -and $dRel -and $dCur -ge $dRel) {
 		[System.Windows.Forms.MessageBox]::Show((UT 'Version instalada: ' 'Installed version: ') + $cur + "`n" + (UT 'Ultima release en GitHub: ' 'Latest GitHub release: ') + $rel.Tag + "`n`n" + (UT 'Tu version es igual o mas nueva. No hace falta actualizar.' 'Your version is the same or newer. No update needed.'), $t, 'OK', 'Information') | Out-Null; return
 	}
@@ -1679,6 +1682,9 @@ function Start-UpdateVersion {
 	$newTxt = if ($rel.Name -and $rel.Name -ne $rel.Tag) { "$($rel.Tag) - $($rel.Name)" } else { $rel.Tag }
 	$msg = (UT 'Version instalada: ' 'Installed version: ') + $curTxt + "`n" + (UT 'Version nueva: ' 'New version: ') + $newTxt + "`n" + $rel.Asset + ('  ({0:N0} MB)' -f ($rel.Size / 1MB)) + "`n`n" +
 		(UT 'Se actualiza en esta misma carpeta. Los archivos actuales del motor se guardan en _backup_update. La cache de shaders, las partidas, los seeds y los ajustes no se tocan. Actualizar?' 'It updates in this same folder. The current engine files are kept in _backup_update. The shader cache, save games, seeds and settings are not touched. Update?')
+	if ($Startup) {
+		$msg = (UT 'Hay una version nueva: ' 'A new version is available: ') + $newTxt + (UT '. Tienes: ' '. You have: ') + $curTxt + ".`n`n" + (UT 'Si = Actualizar ahora     No = Mas tarde' 'Yes = Update now     No = Later')
+	}
 	if ([System.Windows.Forms.MessageBox]::Show($msg, $t, 'YesNo', 'Question') -ne 'Yes') { return }
 	# 3) El juego debe estar cerrado
 	if (@(Get-Process -Name 'kyty_emulator' -ErrorAction SilentlyContinue).Count) {
@@ -3055,5 +3061,11 @@ $panel.ResumeLayout($true); $form.ResumeLayout($true)
 $cmbOut.Add_SelectedIndexChanged({ Update-Res3D }); $cmbRes.Add_SelectedIndexChanged({ Update-Res3D })
 if ($cmbAspect) { $cmbAspect.Add_SelectedIndexChanged({ Update-Res3D }) }
 Update-Res3D
+# (ds-pc-port17) La version instalada siempre visible (titulo de la ventana) y aviso de version nueva al abrir.
+$script:curVerShown = Get-InstalledVersion
+if ($script:curVerShown) { $form.Text = $form.Text + ' - ' + (UT 'Version: ' 'Version: ') + $script:curVerShown }
 $form.Add_Shown({ $form.Refresh(); $form.Opacity = 1 })
+$script:tmUpd = New-Object System.Windows.Forms.Timer; $script:tmUpd.Interval = 400
+$script:tmUpd.Add_Tick({ $script:tmUpd.Stop(); try { Start-UpdateVersion -Startup } catch { } })
+$form.Add_Shown({ $script:tmUpd.Start() })
 [void]$form.ShowDialog()
