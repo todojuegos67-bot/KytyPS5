@@ -1,3 +1,5 @@
+#include <chrono>
+#include <thread>
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -2491,6 +2493,19 @@ static void UdsHandleEvent(const NpUniversalDataSystemEvent& e) {
 	std::string dump = UdsDump(e.props);
 	std::printf("UDS: event %s %s\n", e.name.c_str(), dump.c_str());
 	// (1030c) The port's own trophy: the Nexus reached for the first time (the game's "Nexus" activity, uds00.ucp).
+	// (1030d) The first Nexus: the Vanguard fight ends (won or died), the fog loading screen, then the Nexus cutscene: the
+	// trophy pops a few seconds later, as the cutscene starts.
+	if (e.name == "DsActivityEnd") {
+		const auto a = e.props.strings.find("activityId");
+		if (a != e.props.strings.end() && a->second == "Tut2Van" && !Libs::Trophy::IsUnlocked(Libs::Trophy::kNexusTrophyId)) {
+			std::printf("UDS: Vanguard fight over -> port trophy %d in 12 s\n", Libs::Trophy::kNexusTrophyId);
+			std::thread([] {
+				std::this_thread::sleep_for(std::chrono::seconds(12));
+				int plat = -1;
+				(void)Libs::Trophy::Unlock(Libs::Trophy::kNexusTrophyId, &plat);
+			}).detach();
+		}
+	}
 	if (e.name == "DsActivityStart") {
 		const auto a = e.props.strings.find("activityId");
 		if (a != e.props.strings.end() && a->second == "Nexus") {
