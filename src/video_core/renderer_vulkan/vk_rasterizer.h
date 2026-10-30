@@ -49,6 +49,7 @@ public:
                             vk::ImageView& out_view, vk::Extent2D& out_size);
     // Copies the presented image (before its HUD) and records the window-size upscale of it.
     bool BBPresentUpscale(VideoCore::Image& flip);
+    static const char* BBPresentWhy();
 
     void Draw(bool is_indexed, u32 index_offset = 0);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,

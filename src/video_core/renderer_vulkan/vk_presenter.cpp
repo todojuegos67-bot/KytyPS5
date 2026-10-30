@@ -791,7 +791,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // Bloodborne: no HUD point this frame (no HUD drawn): the window-size upscale runs here.
     if (BB::Upscale::Enabled() && BB::Upscale::TakeLateUpscale() &&
         !rasterizer->BBPresentUpscale(image)) {
-        BB::Upscale::OnPresentFailed("the upscale at present failed");
+        BB::Upscale::OnPresentFailed(rasterizer->BBPresentWhy());
     }
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
@@ -804,8 +804,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                  rasterizer->BBPresentComposite(cmdbuf, image, view_info.format,
                                                                 bb_view, bb_size)) {
         image_view = bb_view;
+        if (BB::Upscale::Enabled()) BB::Upscale::OnPresentResult(true, "");
     } else {
         bb_size = image_size;
+        if (BB::Upscale::Enabled()) BB::Upscale::OnPresentResult(false, rasterizer->BBPresentWhy());
     }
 
     image_view = fsr_pass.Render(cmdbuf, image_view, bb_size, {frame->width, frame->height},

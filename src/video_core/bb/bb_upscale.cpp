@@ -403,6 +403,14 @@ std::chrono::steady_clock::time_point g_last_flip{};
 float g_delta_ms = 16.7f;
 std::string g_last_point;
 bool g_first_eval_pending = false;
+// The first-frame verdict: the window-size path is only known to work once the presenter has
+// shown the upscaled image (OnPresentResult); a failed attempt is retried a few times.
+bool g_eval_await_present = false;
+u32 g_eval_attempts = 0;
+constexpr u32 EvalMaxAttempts = 5;
+// Window-size path failures in a row; it is switched off only after PresentMaxFails of them.
+u32 g_present_fails = 0;
+constexpr u32 PresentMaxFails = 3;
 // Upscaling to the window size (SetPresentSize).
 u32 g_present_w = 0, g_present_h = 0;
 bool g_present_dead = false;
@@ -468,6 +476,8 @@ VAddr LearnedSource() {
 }
 
 void FillPresentPlan(VAddr flip, const char* where);
+void FirstEvalFailed(std::string_view why);
+void PresentFailedLocked(std::string_view why);
 
 bool Active() {
     return Cfg().kind != SR::Kind::Off && Cfg().kind != SR::Kind::Native && BackendReady();
@@ -1498,6 +1508,39 @@ void FillPresentPlan(VAddr flip, const char* where) {
 }
 } // namespace
 
+namespace {
+void FirstEvalFailed(std::string_view why) {
+    ++g_eval_attempts;
+    if (g_eval_attempts < EvalMaxAttempts) {
+        g_first_eval_pending = true; // judge the next upscaled frame
+        Checkpoint(fmt::format("{}: upscaled frame check {} of {} failed: {}; retrying",
+                               SR::KindName(Cfg().kind), g_eval_attempts, EvalMaxAttempts, why));
+        return;
+    }
+    g_first_eval_pending = false;
+    GuardEnd();
+    Checkpoint(fmt::format("{}: first upscaled frame FAILED after {} attempts (last: {}); the "
+                           "upscale stays on and is judged again by the per-frame counters",
+                           SR::KindName(Cfg().kind), g_eval_attempts, why));
+}
+
+void PresentFailedLocked(std::string_view why) {
+    ++g_present_fails;
+    if (g_present_dead) {
+        return;
+    }
+    if (g_present_fails < PresentMaxFails) {
+        Checkpoint(fmt::format("{}: window-size upscale failed ({} of {} in a row): {}; retrying",
+                               SR::KindName(Cfg().kind), g_present_fails, PresentMaxFails, why));
+        return;
+    }
+    g_present_dead = true;
+    Checkpoint(fmt::format("{}: window-size upscale off after {} failures in a row (last: {}): "
+                           "back to the in-place upscale at the game's size",
+                           SR::KindName(Cfg().kind), g_present_fails, why));
+}
+} // namespace
+
 bool TakeLateUpscale() {
     std::scoped_lock lk{g_mutex};
     const bool late = g_late_upscale;
@@ -1515,22 +1558,33 @@ void OnPresentUpscaled(bool ok) {
         return;
     }
     g_frame.inject_failed = true;
-    if (!g_present_dead) {
-        g_present_dead = true;
-        Checkpoint(fmt::format("{}: the window-size upscale failed: back to the in-place upscale "
-                               "at the game's size",
-                               SR::KindName(Cfg().kind)));
-    }
+    PresentFailedLocked("the window-size upscale before the HUD failed");
 }
 
 void OnPresentFailed(std::string_view why) {
     std::scoped_lock lk{g_mutex};
-    if (!g_present_dead) {
-        g_present_dead = true;
-        Checkpoint(fmt::format("{}: window-size upscale off ({}): back to the in-place upscale "
-                               "at the game's size",
-                               SR::KindName(Cfg().kind), why));
+    PresentFailedLocked(why);
+}
+
+void OnPresentResult(bool presented, std::string_view why) {
+    std::scoped_lock lk{g_mutex};
+    if (presented) {
+        g_present_fails = 0;
     }
+    if (!g_eval_await_present) {
+        return;
+    }
+    g_eval_await_present = false;
+    if (presented) {
+        GuardEnd();
+        Checkpoint(fmt::format("{}: first upscaled frame done: {}x{} presented at the window size "
+                               "{}x{} (attempt {})",
+                               SR::KindName(Cfg().kind), g_plan.render_w, g_plan.render_h,
+                               g_plan.output_w, g_plan.output_h, g_eval_attempts + 1));
+        return;
+    }
+    FirstEvalFailed(fmt::format("the presenter did not show the window-size image: {}",
+                                why.empty() ? "unknown" : why));
 }
 
 const Plan& CurrentPlan() {
@@ -1646,12 +1700,6 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         g_learned.have_prev_vp = false;
     }
     g_learned.last_injected = f.injected;
-    if (g_first_eval_pending) {
-        g_first_eval_pending = false;
-        GuardEnd();
-        Checkpoint(fmt::format("{}: first upscaled frame {}", SR::KindName(Cfg().kind),
-                               f.injected ? "done" : "FAILED: the game runs native"));
-    }
     // The scene was drawn but no HUD point was found (no HUD this frame, e.g. a cut scene): the
     // presenter upscales the finished image instead (TakeLateUpscale).
     g_late_upscale = false;
@@ -1661,6 +1709,34 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         g_late_upscale = true;
         f.injected = true;
         g_learned.last_injected = true;
+    }
+    // The first-frame verdict, after this frame's late (at present) decision: before, a frame
+    // upscaled at present still read as not injected here and was reported FAILED.
+    if (g_first_eval_pending) {
+        if (f.injected && (f.present || g_late_upscale)) {
+            // Window-size path: the verdict comes from the presenter (OnPresentResult).
+            g_first_eval_pending = false;
+            g_eval_await_present = true;
+        } else if (f.injected) {
+            g_first_eval_pending = false;
+            GuardEnd();
+            Checkpoint(fmt::format("{}: first upscaled frame done (in place, {}x{})",
+                                   SR::KindName(Cfg().kind), g_output_w, g_output_h));
+        } else {
+            const std::string why =
+                f.inject_failed   ? "the upscale dispatch failed (see the back end's log)"
+                : f.gb_depth == 0 ? "no 3D scene this frame (menu / loading)"
+                : f.gb_w != width || f.gb_h != height
+                    ? fmt::format("scene {}x{} is not the presented size {}x{}", f.gb_w, f.gb_h,
+                                  width, height)
+                : f.qual_samples <= g_learned.skip
+                    ? fmt::format("the source was sampled {} time(s), {} needed",
+                                  f.qual_samples, g_learned.skip + 1)
+                : !PresentMode() ? std::string("window-size mode is off (present path disabled or "
+                                               "sizes do not match)")
+                                 : std::string("no injection point this frame");
+            FirstEvalFailed(why);
+        }
     }
 
     ++g_stats.frames;

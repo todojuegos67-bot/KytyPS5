@@ -51,6 +51,7 @@ struct BBVk {
     OwnImage present;
     bool present_ready = false;
     VAddr present_flip = 0;
+    const char* present_why = ""; // why the last window-size upscale / composite failed
     bool hud_init = false, hud_failed = false;
     vk::DescriptorSetLayout hud_set_layout{};
     vk::PipelineLayout hud_layout{};
@@ -369,14 +370,20 @@ bool Rasterizer::BBInject(VideoCore::ImageId color_id, vk::ImageView& out_view,
     return true;
 }
 
+const char* Rasterizer::BBPresentWhy() {
+    return g_bb.present_why;
+}
+
 bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
     const auto& plan = BB::Upscale::CurrentPlan();
     g_bb.present_ready = false;
     if (!InitOnce(instance) || !InitHud()) {
+        g_bb.present_why = "the upscaler or the HUD shader could not be initialised";
         return false;
     }
     ReadTimestamps();
     if (flip.info.size.width != plan.render_w || flip.info.size.height != plan.render_h) {
+        g_bb.present_why = "the presented image is not the plan's render size";
         return false;
     }
     // The post-processed image before the HUD, blitted into RGBA16F (a format every back end
@@ -387,11 +394,13 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
         !(features & vk::FormatFeatureFlagBits::eSampledImageFilterLinear)) {
         LOG_WARNING(Render_Vulkan, "[BB_UPSCALE] the presented image's format {} cannot be blitted",
                     vk::to_string(flip.info.pixel_format));
+        g_bb.present_why = "the presented image's format cannot be blitted";
         return false;
     }
     const vk::Extent2D extent{flip.info.size.width, flip.info.size.height};
     if (!EnsureImage(g_bb.present_in, extent, vk::Format::eR16G16B16A16Sfloat,
                      vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled)) {
+        g_bb.present_why = "the RGBA16F input image could not be created";
         return false;
     }
     scheduler.EndRendering();
@@ -416,9 +425,11 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
     if (!BBRecordUpscale(g_bb.present_in.image, g_bb.present_in.view, g_bb.present_in.format,
                          g_bb.present_in.usage)) {
+        g_bb.present_why = "the upscaler dispatch was not recorded (depth / back end)";
         return false;
     }
     g_bb.present_ready = true;
+    g_bb.present_why = "";
     g_bb.present_flip = flip.info.guest_address;
     return true;
 }
@@ -426,7 +437,12 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
 bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& flip,
                                     vk::Format view_format, vk::ImageView& out_view,
                                     vk::Extent2D& out_size) {
-    if (!g_bb.present_ready || g_bb.present_flip != flip.info.guest_address) {
+    if (!g_bb.present_ready) {
+        if (*g_bb.present_why == '\0') g_bb.present_why = "no window-size upscale was recorded this frame";
+        return false;
+    }
+    if (g_bb.present_flip != flip.info.guest_address) {
+        g_bb.present_why = "the upscale was recorded for another presented image";
         return false;
     }
     g_bb.present_ready = false;
@@ -434,17 +450,23 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
     const vk::Extent2D output = g_bb.output.extent;
     if (!g_bb.hud_init || !g_bb.output.image || !g_bb.present_in.image ||
         g_bb.present_in.extent != render) {
+        g_bb.present_why = !g_bb.hud_init        ? "the HUD shader is not ready"
+                           : !g_bb.output.image  ? "no window-size output image"
+                           : !g_bb.present_in.image ? "no upscaler input image"
+                                                    : "the upscaler input is not the presented size";
         return false;
     }
     if (!EnsureImage(g_bb.present, output, vk::Format::eR16G16B16A16Sfloat,
                      vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled)) {
-        BB::Upscale::OnPresentFailed("the presented image was not created");
+        g_bb.present_why = "the presented image was not created";
+        BB::Upscale::OnPresentFailed(g_bb.present_why);
         return false;
     }
     const auto final_view = TransientView(scheduler, flip.GetImage(), flip.info.pixel_format,
                                           vk::ImageAspectFlagBits::eColor);
     if (!final_view) {
-        BB::Upscale::OnPresentFailed("no view of the presented image");
+        g_bb.present_why = "no view of the presented image";
+        BB::Upscale::OnPresentFailed(g_bb.present_why);
         return false;
     }
     Barrier(cmd, g_bb.present, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
@@ -504,6 +526,7 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
     }
     out_view = g_bb.present.view;
     out_size = output;
+    g_bb.present_why = "";
     return true;
 }
 

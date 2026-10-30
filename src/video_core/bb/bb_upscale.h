@@ -146,5 +146,7 @@ void OnPresentUpscaled(bool ok);
 // then runs the window-size upscale on the finished image (CurrentPlan()).
 bool TakeLateUpscale();
 void OnPresentFailed(std::string_view why);
+// The presenter's verdict for this frame: the window-size image was (or was not) presented.
+void OnPresentResult(bool presented, std::string_view why);
 
 } // namespace BB::Upscale
