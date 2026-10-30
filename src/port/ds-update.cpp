@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -611,7 +612,7 @@ Result ReadResult() {
 
 bool CheckLatest(Release* release, std::string* error) {
 	std::string body;
-	if (!HttpGet("https://api.github.com/repos/todojuegos67-bot/KytyPS5/releases?per_page=50",
+	if (!HttpGet("https://api.github.com/repos/todojuegos67-bot/KytyPS5/releases?per_page=100",
 	             [&](const char* data, DWORD n, int64_t) {
 		             body.append(data, n);
 		             return body.size() < (8u << 20);
@@ -628,7 +629,15 @@ bool CheckLatest(Release* release, std::string* error) {
 			*error = "Respuesta de GitHub no valida.";
 			return false;
 		}
-		for (const auto& json: list) {
+		// (port25) Newest PUBLISHED first (published_at), not the list's order (a release published later but created
+		// earlier came after older ones).
+		std::vector<nlohmann::json> sorted(list.begin(), list.end());
+		std::stable_sort(sorted.begin(), sorted.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
+			const auto pa = a.value("published_at", nlohmann::json()).is_string() ? a["published_at"].get<std::string>() : std::string();
+			const auto pb = b.value("published_at", nlohmann::json()).is_string() ? b["published_at"].get<std::string>() : std::string();
+			return pa > pb;
+		});
+		for (const auto& json: sorted) {
 		if (json.value("draft", false) || json.value("prerelease", false)) continue;
 		const std::string tag = json.value("tag_name", "");
 		if (tag.rfind("DemonsSoulsPC-", 0) != 0) continue;
