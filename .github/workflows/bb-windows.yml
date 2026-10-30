@@ -59,7 +59,15 @@ jobs:
     - name: Configure
       run: cmake --fresh -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
     - name: Build
-      run: cmake --build build --config Release --parallel $env:NUMBER_OF_PROCESSORS
+      shell: pwsh
+      run: |
+        cmake --build build --config Release --parallel $env:NUMBER_OF_PROCESSORS 2>&1 | Tee-Object build.log
+        $code = $LASTEXITCODE
+        if ($code) {
+          Select-String -Path build.log -Pattern 'error' | Where-Object { $_.Line -notmatch 'warning' } |
+            Select-Object -First 40 | ForEach-Object { Write-Output ("::error::" + $_.Line.Substring(0, [Math]::Min(900, $_.Line.Length))) }
+          exit $code
+        }
     - name: Package
       shell: pwsh
       run: |
