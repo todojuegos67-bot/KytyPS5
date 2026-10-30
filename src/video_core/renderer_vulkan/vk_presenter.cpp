@@ -16,6 +16,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "imgui/renderer/imgui_impl_vulkan.h"
 #include "imgui/shadnet_notifications_layer.h"
+#include <SDL3/SDL_video.h>
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
@@ -715,7 +716,21 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     Frame* frame = GetRenderFrame();
     if (BB::Upscale::Enabled()) {
         // The presentation size (the window's game area): the upscaler's output size.
-        BB::Upscale::SetPresentSize(frame->width, frame->height);
+        // Never above the monitor: a configured window of 3840x2160 on a 2560x1440 display is
+        // presented at most at the display's size (aspect kept).
+        u32 bb_w = frame->width, bb_h = frame->height;
+        if (SDL_Window* bb_win = window.GetSDLWindow()) {
+            SDL_Rect bb_db{};
+            const SDL_DisplayID bb_disp = SDL_GetDisplayForWindow(bb_win);
+            if (bb_disp != 0 && SDL_GetDisplayBounds(bb_disp, &bb_db) && bb_db.w > 0 &&
+                bb_db.h > 0 && (bb_w > static_cast<u32>(bb_db.w) || bb_h > static_cast<u32>(bb_db.h))) {
+                const double k = std::min(static_cast<double>(bb_db.w) / bb_w,
+                                          static_cast<double>(bb_db.h) / bb_h);
+                bb_w = static_cast<u32>(bb_w * k + 0.5);
+                bb_h = static_cast<u32>(bb_h * k + 0.5);
+            }
+        }
+        BB::Upscale::SetPresentSize(bb_w, bb_h);
     }
 
     const auto frame_subresources = vk::ImageSubresourceRange{

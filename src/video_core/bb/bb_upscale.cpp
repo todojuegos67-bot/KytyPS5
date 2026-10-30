@@ -1399,6 +1399,13 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
         GuardBegin(SR::KindName(Cfg().kind), "the first upscale");
         Checkpoint(fmt::format("{}: first upscale {}x{} -> {}x{}", SR::KindName(Cfg().kind),
                                p.render_w, p.render_h, p.output_w, p.output_h));
+        LOG_INFO(Render_Vulkan, "[BB_UPSCALE] upscale {}x{} -> {}x{} (window {}x{}){}",
+                 p.render_w, p.render_h, p.output_w, p.output_h, g_present_w, g_present_h,
+                 p.render_w == p.output_w && p.render_h == p.output_h
+                     ? ": same size, native AA only (the game already renders at this size)"
+                     : "");
+        Checkpoint(fmt::format("upscale {}x{} -> {}x{} (window {}x{})", p.render_w, p.render_h,
+                               p.output_w, p.output_h, g_present_w, g_present_h));
         g_first_eval_pending = true;
     }
     return Sample::Inject;
@@ -1482,6 +1489,10 @@ void FillPresentPlan(VAddr flip, const char* where) {
                                "size, HUD added on top at present)",
                                SR::KindName(Cfg().kind), p.render_w, p.render_h, p.output_w,
                                p.output_h, g_output_w, g_output_h));
+        LOG_INFO(Render_Vulkan, "[BB_UPSCALE] upscale {}x{} -> {}x{} (window {}x{})", p.render_w,
+                 p.render_h, p.output_w, p.output_h, g_present_w, g_present_h);
+        Checkpoint(fmt::format("upscale {}x{} -> {}x{} (window {}x{})", p.render_w, p.render_h,
+                               p.output_w, p.output_h, g_present_w, g_present_h));
         g_first_eval_pending = true;
     }
 }
@@ -1664,10 +1675,16 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         const auto& c = Cfg();
         const double ratio = SR::QualityRatio(c.kind, c.quality);
         const bool to_window = PresentMode();
+        // The size the upscale should reach: the window (presentation) when the game's frame is
+        // not larger than it, else the game's own output.
+        const bool win_target = g_present_w != 0 && g_present_h != 0 &&
+                                g_present_w >= g_output_w && g_present_h >= g_output_h;
         const u32 out_w = to_window ? g_present_w : g_output_w;
         const u32 out_h = to_window ? g_present_h : g_output_h;
-        const u32 rec_w = static_cast<u32>(std::lround(out_w / ratio));
-        const u32 rec_h = static_cast<u32>(std::lround(out_h / ratio));
+        const u32 want_w = win_target ? g_present_w : g_output_w;
+        const u32 want_h = win_target ? g_present_h : g_output_h;
+        const u32 rec_w = static_cast<u32>(std::lround(want_w / ratio));
+        const u32 rec_h = static_cast<u32>(std::lround(want_h / ratio));
         const bool scene = SceneMode();
         LOG_INFO(Render_Vulkan,
                  "[BB_UPSCALE] frame {}: upscaler {} ({}, {}), {} mode, internal {}x{} -> output "
@@ -1676,7 +1693,10 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                  "{}/{} frames, failed {}",
                  g_frame_no, SR::KindName(c.kind), SR::QualityName(c.quality),
                  BackendReady() ? "ready" : "not ready",
-                 to_window ? "window-size (before the HUD)" : scene ? "scene" : "composite",
+                 g_learned.render_w == 0 ? "no 3D scene seen yet (menu / loading / intro)"
+                 : to_window             ? "window-size (before the HUD)"
+                 : scene                 ? "scene"
+                                         : "composite",
                  g_learned.render_w, g_learned.render_h, out_w, out_h, rec_w, rec_h,
                  LearnedSource(), g_learned.gb_depth,
                  !c.mv_reconstruct ? "zero (BB_MV=zero)"
@@ -1701,13 +1721,14 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                                                          return a.count < b.count;
                                                      })->count,
                  g_diag_asked, g_diag_inactive, g_diag_noscene, g_diag_calls, g_diag_small);
-        if (Active() && scene && !to_window && (g_learned.render_w == g_output_w) &&
-            ratio > 1.01) {
+        if (Active() && scene && !to_window && g_learned.render_w != 0 &&
+            g_learned.render_w >= want_w && g_learned.render_h >= want_h && ratio > 1.01) {
             LOG_INFO(Render_Vulkan,
-                     "[BB_UPSCALE] the game renders its 3D at the output size {}x{}: {} runs as "
-                     "native AA. For {} set the game's internal resolution (patch) to {}x{}.",
-                     g_output_w, g_output_h, SR::KindName(c.kind), SR::QualityName(c.quality),
-                     rec_w, rec_h);
+                     "[BB_UPSCALE] the game renders its 3D at {}x{}, not below the window {}x{}: "
+                     "{} runs as native AA (nothing to upscale). For {} set the game's internal "
+                     "resolution (patch) to {}x{}, or none (native 1920x1080) on this window.",
+                     g_learned.render_w, g_learned.render_h, want_w, want_h, SR::KindName(c.kind),
+                     SR::QualityName(c.quality), rec_w, rec_h);
         }
         g_stats = {};
     }
