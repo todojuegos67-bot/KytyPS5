@@ -100,6 +100,16 @@ const char* CurrentVersion() {
 	return KYTY_DS_PORT_VERSION;
 }
 
+std::string BuildIso() {
+	const std::string d = __DATE__, t = __TIME__;
+	static const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+	int m = 0;
+	for (int i = 0; i < 12; i++) if (d.compare(0, 3, months[i]) == 0) m = i + 1;
+	char buf[32];
+	std::snprintf(buf, sizeof(buf), "%s-%02d-%02dT%s", d.substr(7, 4).c_str(), m, std::atoi(d.substr(4, 2).c_str()), t.c_str());
+	return buf;
+}
+
 const char* BuildStamp() {
 	static std::string stamp = [] {
 		// __DATE__ "Oct 30 2026", __TIME__ "19:40:12"
@@ -624,6 +634,7 @@ bool CheckLatest(Release* release, std::string* error) {
 		if (tag.rfind("DemonsSoulsPC-", 0) != 0) continue;
 		release->tag    = tag;
 		release->name   = json.value("name", "");
+		release->published = json.value("published_at", "");
 		release->url.clear();
 		int64_t best    = -1;
 		for (const auto& a: json.value("assets", nlohmann::json::array())) {

@@ -646,7 +646,7 @@ void CheckWork() {
 	const std::string both = "Version instalada: " + cur + "\nUltima version del port en GitHub: " + r.tag;
 	const std::string dc = Update::TagDate(cur), dr = Update::TagDate(r.tag);
 	if (r.tag == cur) SetUpd(UpdateUi::UpToDate, both + "\nYa tienes la ultima version.");
-	else if (!dc.empty() && !dr.empty() && dc > dr) SetUpd(UpdateUi::UpToDate, both + "\nTu version es mas nueva. No hace falta actualizar.");
+	else if ((!dc.empty() && !dr.empty() && dc > dr) || (r.published.size() >= 19 && r.published.substr(0, 19) <= Update::BuildIso())) SetUpd(UpdateUi::UpToDate, both + "\nTu version es mas nueva. No hace falta actualizar.");
 	else SetUpd(UpdateUi::Available, both + "\nNueva version " + r.tag + " \xE2\x80\x94 Cruz para actualizar");
 #else
 	SetUpd(UpdateUi::Failed, "Solo en Windows.");
@@ -742,7 +742,7 @@ void StartupCheck() {
 			if (!Update::CheckLatest(&r, &error)) return;
 			const std::string cur = Update::CurrentVersion();
 			const std::string dc = Update::TagDate(cur), dr = Update::TagDate(r.tag);
-			if (r.tag == cur || (!dc.empty() && !dr.empty() && dc > dr)) return;
+			if (r.tag == cur || (!dc.empty() && !dr.empty() && dc > dr) || (r.published.size() >= 19 && r.published.substr(0, 19) <= Update::BuildIso())) return;
 			{
 				std::scoped_lock lock(g_upd.mutex);
 				if (g_upd.busy.load()) return;
@@ -2885,7 +2885,8 @@ void DrawLauncher(float width, float height) {
 			{
 				const bool all_now = g_edit.precompile_threads == "todos";
 				const float bx     = x0 + sh_pad + U(pv.running ? 196 : 256);
-				if (LButton(all_now ? "Hilos: m\xC3\xA1ximo" : "Hilos: relajado", {bx, cy}, {U(220), U(36)}, false, g_font_semi, U(18),
+				const float bw     = std::max(U(120), std::min(U(220), x1 - sh_pad - bx));
+				if (LButton(all_now ? "Hilos: m\xC3\xA1ximo" : "Hilos: relajado", {bx, cy}, {bw, U(36)}, false, g_font_semi, U(18),
 				            "Cambia c\xC3\xB3mo precompila: m\xC3\xA1ximo = todos los hilos de la CPU (m\xC3\xA1s r\xC3\xA1pido, el PC va cargado); relajado = pocos hilos. Si est\xC3\xA1 precompilando, sigue en el modo nuevo sin perder lo hecho."))
 					ToggleShaderThreads(pv.running);
 			}

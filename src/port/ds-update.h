@@ -83,8 +83,11 @@ void PruneBackups(const fs::path& root, int keep, const std::vector<std::string>
 // ---- Windows: GitHub, the download, the unzip, the elevation. ----
 struct Release {
 	std::string tag, name, asset, url;
+	std::string published; // (port25) "2026-10-30T19:37:02Z"
 	int64_t     size = 0;
 };
+// (port25) This build's time as "2026-10-30T20:28:00" (UTC, the CI's clock): a release published before it is older.
+std::string BuildIso();
 // releases/latest of todojuegos67-bot/KytyPS5 and its port zip (DemonsSoulsPC-*.zip). false: `error` says why.
 // (10-28) The 8-digit YYYYMMDD date in a tag (the first "20" + 6 digits), or "" without one.
 std::string TagDate(const std::string& tag);
