@@ -3,10 +3,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <thread>
 #include <SDL3/SDL_audio.h>
+#include <fmt/format.h>
 #include <SDL3/SDL_hints.h>
 
 #include "common/logging/log.h"
@@ -14,6 +16,8 @@
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/kernel/threads.h"
+#include "video_core/bb/bb_audio_check.h"
+#include "video_core/bb/bb_upscale.h"
 
 // SIMD support detection
 #if defined(__x86_64__) || defined(_M_X64)
@@ -322,6 +326,25 @@ private:
 
         LOG_INFO(Lib_AudioOut, "Opened audio device: {} ({} Hz, {} ch, gain: {:.3f})", device_name,
                  sample_rate, num_channels, initial_gain);
+        {
+            // bb_upscale_init.log, every mode: which SDL driver and physical device got the stream.
+            const SDL_AudioDeviceID phys = SDL_GetAudioStreamDevice(stream);
+            const char* drv = SDL_GetCurrentAudioDriver();
+            const char* phys_name = SDL_GetAudioDeviceName(phys);
+            SDL_AudioSpec spec{};
+            int frames = 0;
+            SDL_GetAudioDeviceFormat(phys, &spec, &frames);
+            BB::Upscale::Checkpoint(fmt::format(
+                "audio open: port type {}, SDL audio driver \"{}\", config device \"{}\", SDL "
+                "device {} \"{}\" ({} Hz, {} ch, {} frames), stream {} ch, gain {:.3f}, "
+                "SDL_AUDIO_DRIVER env \"{}\", device paused {}",
+                static_cast<int>(type), drv ? drv : "(none)", device_name, phys,
+                phys_name ? phys_name : "?", spec.freq, spec.channels, frames,
+                ps4_downmix ? 2 : num_channels, initial_gain,
+                std::getenv("SDL_AUDIO_DRIVER") ? std::getenv("SDL_AUDIO_DRIVER") : "",
+                SDL_AudioDevicePaused(phys) ? "YES" : "no"));
+            BB::Audio::OnStreamOpened();
+        }
         return true;
     }
 

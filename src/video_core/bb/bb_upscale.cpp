@@ -646,9 +646,10 @@ void PreInstance() {
     }
     done = true;
     const auto& c = Cfg();
-    // The Windows audio session check (bb_audio_check.h): with an upscaler on, or BB_AUDIO_CHECK=1.
-    if (const char* ac = Env("BB_AUDIO_CHECK");
-        ac != nullptr ? ac[0] != '0' : c.kind != SR::Kind::Off) {
+    // The Windows audio session check (bb_audio_check.h).
+    // Now in every mode (native too) so the fork and the official exe can be compared;
+    // BB_AUDIO_CHECK=0 turns it off.
+    if (const char* ac = Env("BB_AUDIO_CHECK"); ac == nullptr || ac[0] != '0') {
         BB::Audio::StartCheck();
     }
     if (!g_guard_skipped.empty()) {

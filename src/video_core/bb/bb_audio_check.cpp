@@ -5,6 +5,7 @@
 #include "video_core/bb/bb_audio_check.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <string>
 #include <fmt/format.h>
@@ -140,72 +141,116 @@ int CheckEndpoint(IMMDevice* device, bool is_default, bool fix, int pass) {
     return found;
 }
 
-void Run() {
-    const char* fix_env = std::getenv("BB_AUDIO_FIX");
-    const bool fix = fix_env == nullptr || fix_env[0] != '0';
-    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return;
-    for (int pass = 1; pass <= 3; ++pass) {
-        Sleep(pass == 1 ? 25000 : 60000);
-        Com<IMMDeviceEnumerator> enumerator;
-        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                    __uuidof(IMMDeviceEnumerator),
-                                    reinterpret_cast<void**>(&enumerator)))) {
-            break;
+std::atomic<bool> g_opened{false};
+std::atomic<int> g_open_count{0};
+
+std::string Hr(HRESULT hr) {
+    return fmt::format("0x{:08x}", static_cast<unsigned>(hr));
+}
+
+void Pass(int pass, bool fix) {
+    Com<IMMDeviceEnumerator> enumerator;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator),
+                                  reinterpret_cast<void**>(&enumerator));
+    if (FAILED(hr)) {
+        BB::Upscale::Checkpoint(fmt::format(
+            "audio check {}: CoCreateInstance(MMDeviceEnumerator) failed {}", pass, Hr(hr)));
+        return;
+    }
+    Com<IMMDevice> def;
+    std::wstring def_id;
+    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &def);
+    if (FAILED(hr)) {
+        BB::Upscale::Checkpoint(fmt::format(
+            "audio check {}: no default output device (GetDefaultAudioEndpoint {})", pass, Hr(hr)));
+    } else {
+        LPWSTR id = nullptr;
+        if (SUCCEEDED(def->GetId(&id))) {
+            def_id = id;
+            CoTaskMemFree(id);
         }
-        Com<IMMDevice> def;
-        std::wstring def_id;
-        if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &def))) {
+        Com<IAudioEndpointVolume> endpoint;
+        float level = -1.0f;
+        BOOL mute = FALSE;
+        hr = def->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+                           reinterpret_cast<void**>(&endpoint));
+        if (SUCCEEDED(hr)) {
+            endpoint->GetMasterVolumeLevelScalar(&level);
+            endpoint->GetMute(&mute);
+        }
+        BB::Upscale::Checkpoint(fmt::format(
+            "audio check {}: default output device \"{}\": system volume {:.2f}, muted {}{}", pass,
+            DeviceName(def.p), level, mute ? "YES" : "no",
+            SUCCEEDED(hr) ? "" : " (endpoint volume " + Hr(hr) + ")"));
+    }
+    Com<IMMDeviceCollection> devices;
+    UINT n = 0;
+    int found = 0;
+    hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &devices);
+    if (FAILED(hr)) {
+        BB::Upscale::Checkpoint(
+            fmt::format("audio check {}: EnumAudioEndpoints failed {}", pass, Hr(hr)));
+    } else {
+        devices->GetCount(&n);
+        for (UINT i = 0; i < n; ++i) {
+            Com<IMMDevice> device;
+            if (FAILED(devices->Item(i, &device))) continue;
             LPWSTR id = nullptr;
-            if (SUCCEEDED(def->GetId(&id))) {
-                def_id = id;
+            bool is_default = false;
+            if (SUCCEEDED(device->GetId(&id))) {
+                is_default = def_id == id;
                 CoTaskMemFree(id);
             }
-            Com<IAudioEndpointVolume> endpoint;
-            if (SUCCEEDED(def->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
-                                        reinterpret_cast<void**>(&endpoint)))) {
-                float level = -1.0f;
-                BOOL mute = FALSE;
-                endpoint->GetMasterVolumeLevelScalar(&level);
-                endpoint->GetMute(&mute);
-                BB::Upscale::Checkpoint(fmt::format(
-                    "audio check {}: default output device \"{}\": system volume {:.2f}, muted {}",
-                    pass, DeviceName(def.p), level, mute ? "YES" : "no"));
-            }
-        }
-        Com<IMMDeviceCollection> devices;
-        UINT n = 0;
-        int found = 0;
-        if (SUCCEEDED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &devices))) {
-            devices->GetCount(&n);
-            for (UINT i = 0; i < n; ++i) {
-                Com<IMMDevice> device;
-                if (FAILED(devices->Item(i, &device))) continue;
-                LPWSTR id = nullptr;
-                bool is_default = false;
-                if (SUCCEEDED(device->GetId(&id))) {
-                    is_default = def_id == id;
-                    CoTaskMemFree(id);
-                }
-                found += CheckEndpoint(device.p, is_default, fix, pass);
-            }
-        }
-        if (found == 0) {
-            BB::Upscale::Checkpoint(fmt::format(
-                "audio check {}: no Windows audio session for this process on any of the {} "
-                "output devices (the emulator has not opened its audio stream)",
-                pass, n));
+            found += CheckEndpoint(device.p, is_default, fix, pass);
         }
     }
-    CoUninitialize();
+    if (found == 0) {
+        BB::Upscale::Checkpoint(fmt::format(
+            "audio check {}: no Windows audio session for this process on any of the {} "
+            "output devices ({} SDL audio stream(s) opened so far)",
+            pass, n, g_open_count.load()));
+    }
+}
+
+void Run() {
+    BB::Upscale::Checkpoint("audio check: thread started");
+    const char* fix_env = std::getenv("BB_AUDIO_FIX");
+    const bool fix = fix_env == nullptr || fix_env[0] != '0';
+    // Its own MTA; if this thread somehow has an apartment already, use it as it is.
+    const HRESULT init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(init) && init != RPC_E_CHANGED_MODE) {
+        BB::Upscale::Checkpoint(fmt::format("audio check: CoInitializeEx failed {}", Hr(init)));
+        return;
+    }
+    // Pass 1 three seconds after the game opens its first audio stream (at most 40 s after start),
+    // then 30 s and 90 s later.
+    for (int waited = 0; !g_opened.load() && waited < 40000; waited += 250) Sleep(250);
+    if (!g_opened.load()) {
+        BB::Upscale::Checkpoint("audio check: the game has not opened an audio stream after 40 s");
+    }
+    for (int pass = 1; pass <= 3; ++pass) {
+        Sleep(pass == 1 ? 3000 : pass == 2 ? 30000 : 60000);
+        Pass(pass, fix);
+    }
+    if (SUCCEEDED(init)) CoUninitialize();
 }
 
 } // namespace
 
 void StartCheck() {
-    static bool started = false;
-    if (started) return;
-    started = true;
-    std::thread(Run).detach();
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    try {
+        std::thread(Run).detach();
+    } catch (...) {
+        BB::Upscale::Checkpoint("audio check: could not start its thread");
+    }
+}
+
+void OnStreamOpened() {
+    g_open_count.fetch_add(1);
+    g_opened.store(true);
 }
 
 } // namespace BB::Audio
@@ -214,6 +259,7 @@ void StartCheck() {
 
 namespace BB::Audio {
 void StartCheck() {}
+void OnStreamOpened() {}
 } // namespace BB::Audio
 
 #endif

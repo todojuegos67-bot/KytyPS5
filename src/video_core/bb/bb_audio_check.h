@@ -10,4 +10,6 @@
 
 namespace BB::Audio {
 void StartCheck();
+// Called by the SDL audio back end after each stream opens: the first one triggers pass 1.
+void OnStreamOpened();
 }
