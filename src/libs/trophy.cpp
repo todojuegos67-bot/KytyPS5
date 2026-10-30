@@ -261,6 +261,8 @@ void SaveList(State& s) {
 		                {"detail", e.info.detail},
 		                {"hidden", e.info.hidden}});
 	}
+	std::error_code dir_ec;
+	std::filesystem::create_directories(s.store.parent_path(), dir_ec); // (1030d) a new _SaveData: the folder first
 	std::ofstream f(s.store.parent_path() / "trophies-list.json", std::ios::binary | std::ios::trunc);
 	if (f) f << j.dump(1, '\t');
 }
