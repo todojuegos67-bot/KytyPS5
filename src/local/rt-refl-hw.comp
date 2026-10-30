@@ -223,9 +223,23 @@ void main() {
 	vec4 g   = texelFetch(gb_cur, px, 0);
 	// Not reflective, the sky, or not traced this frame (the checkerboard's -1, kept for the temporal pass): unchanged,
 	// and no fill history (a later fill there starts from zero weight).
+	// (water2-1030) out_c.w carries + 2 on water (rt-reflections.comp's WaterFlag): the hit flag is mod(w, 2).
+	bool wat = !Bad(ax) && ax.w > 1.5;
 	if (g.w > 5e4 || ax.y < 0.01 || rad.a < 0.0 || Bad(rad) || Bad(g) || Bad(ax)) {
 		imageStore(rad_out, px, rad);
-		imageStore(fhist_out, px, vec4(0));
+		vec4 keep = vec4(0);
+		// (water2-1030) water not traced this frame (the checkerboard): its fill history carried over, not reset (the
+		// fill's weight restarted from zero every other frame there)
+		if (wat && rad.a < 0.0 && !Bad(g) && g.w < 5e4 && (misc.y & 1) != 0 && (misc.y & 2) == 0) {
+			vec2 uvk = (vec2(px) + 0.5) / ts;
+			vec2 mvk = texelFetch(motion_tex, RenderPixel(uvk), 0).xy * mparams.xy;
+			vec2 puk = uvk + (BadV(vec3(mvk, 0)) ? vec2(0) : mvk) / RenderSize();
+			if (InScreen(puk)) {
+				vec4 fk = texelFetch(fhist_prev, clamp(ivec2(puk * ts), ivec2(0), ivec2(ts) - 1), 0);
+				if (!Bad(fk) && fk.b >= 1.5) keep = fk;
+			}
+		}
+		imageStore(fhist_out, px, keep);
 		return;
 	}
 	vec2  uv  = (vec2(px) + 0.5) / ts;
@@ -241,7 +255,7 @@ void main() {
 	vec3  P     = ViewPos(ruv, d);
 	float dist  = abs(P.z);
 	float conf  = clamp(rad.a, 0.0, 1.0);
-	bool  miss  = ax.w < 0.5 || conf < 1e-3; // (the screen-space ray found nothing it could keep)
+	bool  miss  = mod(ax.w, 2.0) < 0.5 || conf < 1e-3; // (the screen-space ray found nothing it could keep)
 	ivec2 hi    = ivec2(ts) - 1;
 	vec2  mv_px = texelFetch(motion_tex, rp, 0).xy * mparams.xy;
 	if (BadV(vec3(mv_px, 0))) mv_px = vec2(0);
@@ -344,11 +358,17 @@ void main() {
 	vec2  puv_s = uv + mv_px / RenderSize();
 	bool  valid = (misc.y & 1) != 0 && (misc.y & 2) == 0 && InScreen(puv_s);
 	vec4  fh    = vec4(0);
+	int   psrc  = -1; // (water2-1030)
 	if (valid) {
 		ivec2 pp = clamp(ivec2(puv_s * ts), ivec2(0), hi);
 		vec4  pg = texelFetch(gb_prev, pp, 0);
 		valid    = !Bad(pg) && abs(pg.w - g.w) / max(g.w, 1e-3) < 0.06 && dot(pg.xyz, g.xyz) > 0.85;
 		fh       = texelFetch(fhist_prev, pp, 0); // (nearest: the length and the hit share are not filtered)
+		// (water2-1030) water's records: the last frame's source in r / g (+ 2 each bit), b + 2 marks one
+		if (valid && wat && !Bad(fh) && fh.b >= 1.5) {
+			psrc = (fh.r >= 1.5 ? 1 : 0) + (fh.g >= 1.5 ? 2 : 0);
+			fh.rgb -= 2.0 * step(vec3(1.5), fh.rgb);
+		}
 		if (Bad(fh) || fh.a < 1.0) valid = false; // (a length of at least 1: an accumulated fill)
 	}
 	float len = 0.0, q = 0.0;
@@ -359,16 +379,22 @@ void main() {
 		q      = fract(fh.a);
 		vec3 h = ClampHistory(InvTonemap(clamp(fh.rgb, vec3(0), vec3(1))), r);
 		if (miss) {
-			float alpha = max(1.0 / (len + 1.0), 0.125);
+			float alpha = max(1.0 / (len + 1.0), wat ? 0.2 : 0.125);
+			if (wat) alpha = min(alpha, 0.5);
 			acc         = mix(h, cand, alpha);
 			q           = mix(q, real ? 0.999 : 0.0, alpha);
+		} else if (wat) {
+			// (water2-1030) the screen-space hit feeds the fill's history on water: when the ray misses next frame the
+			// fill goes on from the same colour (no screen-space <-> TLAS / stand-in jump)
+			acc = mix(h, InvTonemap(clamp(rad.rgb / max(rad.a, 1e-3), vec3(0), vec3(1))), 0.25);
 		} else {
 			acc = h; // (the screen-space ray hit: the fill holds, unused at that weight)
 		}
-		// at most 1.5x brighter or darker than its history per frame
+		// at most 1.5x brighter or darker than its history per frame (water: 1.15x)
+		float kl = wat ? 1.15 : 1.5;
 		float lh = Luma(h), la = Luma(acc);
-		if (la > 1.5 * lh + 1e-6) acc *= (1.5 * lh) / max(la, 1e-12), lim = true;
-		else if (la < lh / 1.5 - 1e-6) acc = la > 1e-9 ? acc * ((lh / 1.5) / la) : h, lim = true;
+		if (la > kl * lh + 1e-6) acc *= (kl * lh) / max(la, 1e-12), lim = true;
+		else if (la < lh / kl - 1e-6) acc = la > 1e-9 ? acc * ((lh / kl) / la) : h, lim = true;
 		acc = Limit(acc, r); // (the limits again: the history may have come from other references)
 		float la2 = Luma(acc);
 		f_out = la2 > 2.0 * lh + 1e-4 || la2 < 0.5 * lh - 1e-4;
@@ -376,6 +402,7 @@ void main() {
 	} else {
 		len = miss ? 1.0 : 0.0; // (this frame's sample starts the history: its own weight is zero, below)
 		q   = real ? 0.999 : 0.0;
+		if (wat && !miss) acc = InvTonemap(clamp(rad.rgb / max(rad.a, 1e-3), vec3(0), vec3(1))), len = 1.0; // (water2-1030)
 	}
 	if (BadV(acc)) acc = r.mean, nan_n = 1u;
 	bool r_out = Sat(acc) > r.smax + 0.02;
@@ -384,14 +411,23 @@ void main() {
 	// (fgrt-1029) No vanishing when the reflected thing leaves the screen or is under the player: a TLAS hit whose colour
 	// the previous screen cannot give keeps the stand-in (the references' light, the reflector's surroundings) at 85 %
 	// of the share instead of 40 %, from the first frame (half) and at full share after 4 frames, not 12.
-	float ramp = valid ? smoothstep(0.0, 4.0, len) : (miss && hit ? 0.5 : 0.0);
-	float wf   = miss ? params.x * ramp * mix(hit ? 0.85 : 0.4, 1.0, q) : 0.0; // (only where the screen-space ray found nothing)
+	float ramp = valid ? smoothstep(0.0, 4.0, len) : (miss && (hit || wat) ? 0.5 : 0.0);
+	// (water2-1030) on water a TLAS miss weighs as a hidden hit's stand-in (the same colour, the references' mean): the
+	// rippling normal swung the ray between the two every frame, the fill's weight between 0.85^2 and 0.4^2
+	float wf   = miss ? params.x * ramp * mix(hit || wat ? 0.85 : 0.4, 1.0, q) : 0.0; // (only where the screen-space ray found nothing)
 	wf         = clamp(isnan(wf) ? 0.0 : wf, 0.0, 0.8);
 	float a2   = wf * wf;
 	vec4 outv  = vec4(rad.rgb + Tonemap(acc) * a2, rad.a + a2);
 	if (Bad(outv)) outv = rad, nan_n = 1u;
 	imageStore(rad_out, px, outv);
-	imageStore(fhist_out, px, vec4(Tonemap(acc), len + clamp(q, 0.0, 0.999)));
+	int  csrc = !miss ? 0 : real ? 1 : hit ? 2 : 3; // (water2-1030) screen-space, TLAS colour, hidden stand-in, TLAS miss
+	vec3 frgb = Tonemap(acc);
+	if (wat) frgb += 2.0 * vec3(float(csrc & 1), float((csrc >> 1) & 1), 1.0);
+	imageStore(fhist_out, px, vec4(frgb, len + clamp(q, 0.0, 0.999)));
+	// (water2-1030) water: the per-source switch rate (this frame's source against the last frame's, history-valid)
+	Stat(17, wat && psrc >= 0 ? 1u : 0u);
+	Stat(18, wat && psrc >= 0 && psrc != csrc ? 1u : 0u);
+	Stat(19, wat && psrc >= 0 && (psrc == 0) != (csrc == 0) ? 1u : 0u); // (screen-space <-> TLAS / stand-in)
 
 	Stat(0, 1u);
 	Stat(1, traced ? 1u : 0u);
