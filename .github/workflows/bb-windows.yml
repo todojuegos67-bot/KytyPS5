@@ -61,7 +61,7 @@ jobs:
     - name: Build
       shell: pwsh
       run: |
-        cmake --build build --config Release --parallel $env:NUMBER_OF_PROCESSORS 2>&1 | Tee-Object build.log
+        cmake --build build --config Release --parallel $env:NUMBER_OF_PROCESSORS -- -k 0 2>&1 | Tee-Object build.log
         $code = $LASTEXITCODE
         if ($code) {
           Select-String -Path build.log -Pattern 'error: |error [A-Z]+[0-9]+|FAILED: |undefined symbol' |
