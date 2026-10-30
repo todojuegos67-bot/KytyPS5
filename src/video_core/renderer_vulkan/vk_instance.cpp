@@ -12,6 +12,8 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/bb/bb_upscale.h"
+#include "core/address_space.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
@@ -24,6 +26,17 @@ std::vector<vk::PhysicalDevice> EnumeratePhysicalDevices(vk::UniqueInstance& ins
     auto [devices_result, devices] = instance->enumeratePhysicalDevices();
     ASSERT_MSG(devices_result == vk::Result::eSuccess, "Failed to enumerate physical devices: {}",
                vk::to_string(devices_result));
+    if (BB::Upscale::Enabled()) {
+        std::string list;
+        for (const auto d : devices) {
+            list += fmt::format(" {}", static_cast<const void*>(static_cast<VkPhysicalDevice>(d)));
+        }
+        BB::Upscale::Checkpoint(fmt::format(
+            "vkEnumeratePhysicalDevices on instance {}:{} (via {})",
+            static_cast<const void*>(static_cast<VkInstance>(*instance)), list,
+            BB::Upscale::Where(reinterpret_cast<const void*>(
+                VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumeratePhysicalDevices))));
+    }
     return std::move(devices);
 }
 
@@ -228,7 +241,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 64> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -264,9 +277,14 @@ bool Instance::CreateDevice() {
                "Required Vulkan feature unavailable: nullDescriptor");
 
     // Optional
-    maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
-    maintenance_6 = add_extension(VK_KHR_MAINTENANCE_6_EXTENSION_NAME);
-    maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+    // (Under Streamline, DLSS: the newer maintenance extensions are left off, as in 0.17.1.)
+    maintenance_5 = BB::Upscale::VulkanLoaderOverride() == nullptr &&
+                    add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+    maintenance_6 = BB::Upscale::VulkanLoaderOverride() == nullptr &&
+                    add_extension(VK_KHR_MAINTENANCE_6_EXTENSION_NAME);
+    // (Under Streamline, DLSS: not enabled - the newest maintenance extension, unknown to it.)
+    maintenance_8 = BB::Upscale::VulkanLoaderOverride() == nullptr &&
+                    add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
     attachment_feedback_loop = add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
     if (attachment_feedback_loop) {
         attachment_feedback_loop =
@@ -356,6 +374,15 @@ bool Instance::CreateDevice() {
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+
+    // Bloodborne upscaling: what Streamline / XeSS / FSR ask of the device.
+    std::vector<const char*> bb_extensions(enabled_extensions.begin(), enabled_extensions.end());
+    BB::Upscale::AddDeviceExtensions(*instance, physical_device, available_extensions,
+                                     bb_extensions);
+    for (std::size_t i = enabled_extensions.size(); i < bb_extensions.size(); ++i) {
+        LOG_INFO(Render_Vulkan, "Enabling extension: {} (upscaler)", bb_extensions[i]);
+        enabled_extensions.push_back(bb_extensions[i]);
+    }
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
@@ -585,7 +612,85 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
 
-    auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+    {
+        auto& bb_ci = device_chain.get<vk::DeviceCreateInfo>();
+        auto& bb_f12 = device_chain.get<vk::PhysicalDeviceVulkan12Features>();
+        auto& bb_f13 = device_chain.get<vk::PhysicalDeviceVulkan13Features>();
+        auto& bb_f = device_chain.get<vk::PhysicalDeviceFeatures2>().features;
+        const std::vector<const char*> bb_enabled(enabled_extensions.begin(),
+                                                  enabled_extensions.end());
+        bb_ci.pNext = BB::Upscale::ChainDeviceFeatures(physical_device, bb_enabled, bb_f12,
+                                                       bb_f13, bb_f, const_cast<void*>(bb_ci.pNext));
+        bb_ci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
+        bb_ci.ppEnabledExtensionNames = enabled_extensions.data();
+    }
+    if (BB::Upscale::Enabled()) {
+        std::string chain;
+        for (auto* node = static_cast<const VkBaseInStructure*>(device_chain.get().pNext);
+             node != nullptr; node = node->pNext) {
+            chain += fmt::format(" {}", vk::to_string(static_cast<vk::StructureType>(node->sType)));
+        }
+        const auto& f13 = device_chain.get<vk::PhysicalDeviceVulkan13Features>();
+        BB::Upscale::Checkpoint(fmt::format(
+            "vkCreateDevice: queue family {}; pNext chain:{}; vk13 shaderIntegerDotProduct {}; "
+            "vkGetDeviceProcAddr {}",
+            queue_family_index, chain, f13.shaderIntegerDotProduct,
+            reinterpret_cast<void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr)));
+        BB::Upscale::Checkpoint(fmt::format(
+            "vkCreateDevice: instance {}, physical device {}; vkCreateDevice {}; "
+            "vkEnumeratePhysicalDevices {}; vkGetPhysicalDeviceProperties {}; "
+            "vkGetDeviceProcAddr {}",
+            static_cast<const void*>(static_cast<VkInstance>(*instance)),
+            static_cast<const void*>(static_cast<VkPhysicalDevice>(physical_device)),
+            BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDevice)),
+            BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumeratePhysicalDevices)),
+            BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties)),
+            BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr))));
+        if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss) {
+            Core::ReleaseDlssAddressHole();
+            BB::Upscale::DryRunDevice(static_cast<VkInstance>(*instance),
+                                      static_cast<VkPhysicalDevice>(physical_device),
+                                      reinterpret_cast<const VkDeviceCreateInfo*>(&device_chain.get()));
+        }
+        BB::Upscale::Checkpoint(fmt::format("vkCreateDevice with {} extensions: {}",
+                                            enabled_extensions.size(),
+                                            fmt::join(enabled_extensions, " ")));
+    }
+    vk::Result device_result = vk::Result::eErrorInitializationFailed;
+    vk::UniqueDevice dev{};
+    {
+        // (Under a crash guard when an upscaler is on: a crash inside the driver or Streamline is
+        // logged with the faulting module instead of closing silently.)
+        struct CreateArgs {
+            VkPhysicalDevice physical;
+            const VkDeviceCreateInfo* info;
+            VkDevice device;
+            VkResult result;
+        } args{physical_device, reinterpret_cast<const VkDeviceCreateInfo*>(&device_chain.get()),
+               VK_NULL_HANDLE, VK_ERROR_INITIALIZATION_FAILED};
+        const auto create = [](void* p) {
+            auto* a = static_cast<CreateArgs*>(p);
+            a->result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDevice(a->physical, a->info, nullptr,
+                                                                      &a->device);
+        };
+        if (BB::Upscale::Enabled()) {
+            std::string fault;
+            if (!BB::Upscale::GuardedCall(create, &args, fault)) {
+                BB::Upscale::Checkpoint(fmt::format("vkCreateDevice CRASHED: {}", fault));
+                return false;
+            }
+        } else {
+            create(&args);
+        }
+        device_result = static_cast<vk::Result>(args.result);
+        if (args.result == VK_SUCCESS) {
+            dev = vk::UniqueDevice(vk::Device(args.device));
+        }
+    }
+    if (BB::Upscale::Enabled()) {
+        BB::Upscale::Checkpoint(
+            fmt::format("vkCreateDevice returned {}", vk::to_string(device_result)));
+    }
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
         return false;
@@ -629,6 +734,8 @@ bool Instance::CreateDevice() {
     }
 
     CreateAllocator();
+    BB::Upscale::OnDevice(*instance, physical_device, *device, allocator, graphics_queue,
+                          queue_family_index);
     return true;
 }
 

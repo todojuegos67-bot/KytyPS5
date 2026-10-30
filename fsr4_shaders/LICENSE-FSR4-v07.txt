@@ -1,0 +1,36 @@
+FSR4 v07 model asset notice
+==========================
+
+The accompanying `fsr4_model_v07_i8_*_{initializers,pre_weights}.bin` files
+are the exact model assets consumed by Q2RTX's experimental FSR4 v07 INT8/DOT4
+Vulkan implementation.  They were generated/copied from revision
+01446e6a74888bf349652fcf2cbf5f642d30c2bf of
+https://github.com/WinLinux1028/FidelityFX-SDK_WithFSR4 using Q2RTX's
+`src/refresh/vkpt/fsr4/compile_shaders_fsr4.sh`.
+
+The source tree distributing those assets states the following MIT license:
+
+Copyright (c) 2025 Advanced Micro Devices, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+This is an older source-v07 model payload, not AMD's binary-only FSR 4.1.1
+release. Q2RTX enforces each model asset's required size at runtime; the
+versioned shader manifests record the corresponding SHA-256 values for build
+and package verification.

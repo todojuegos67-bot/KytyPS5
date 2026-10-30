@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <map>
 #include <span>
 #include <vector>
 #include <fmt/format.h>
+#include <string_view>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
@@ -106,6 +108,30 @@ struct MemoryRegion {
     bool is_mapped;
 };
 
+void* dlss_hole = nullptr;
+
+void ReleaseDlssAddressHole() {
+    if (dlss_hole != nullptr) {
+        VirtualFree(dlss_hole, 0, MEM_RELEASE);
+        dlss_hole = nullptr;
+    }
+    // The largest free range below 1 TiB, for the log.
+    u64 best = 0, best_at = 0;
+    MEMORY_BASIC_INFORMATION info{};
+    for (VAddr a = 0x10000; a < 0x10000000000ULL;) {
+        if (!VirtualQuery(reinterpret_cast<PVOID>(a), &info, sizeof(info))) break;
+        const VAddr base = reinterpret_cast<VAddr>(info.BaseAddress);
+        const u64 size = info.RegionSize;
+        if (info.State == MEM_FREE && size > best) {
+            best = size;
+            best_at = base;
+        }
+        a = base + size;
+    }
+    LOG_INFO(Core, "[BB_UPSCALE] largest free address range below 1 TiB: {} GiB at {:#x}",
+             best >> 30, best_at);
+}
+
 struct AddressSpace::Impl {
     Impl() : process{GetCurrentProcess()} {
         // Determine the system's page alignment
@@ -143,6 +169,26 @@ struct AddressSpace::Impl {
                     Core,
                     "Older Windows version detected, reducing user max to {:#x} to avoid problems",
                     supported_user_max);
+            }
+        }
+
+        // DLSS (BB_UPSCALER=dlss): NVIDIA's NGX needs ~44 GiB of contiguous free address space
+        // below 1 TiB when the device is created with VK_NVX_binary_import; reserving all of it
+        // for the guest made the driver fail vkCreateDevice (Kyty, RTX 5080, issues #32/#45).
+        // The guest stops at 512 GiB as in Kyty, and a 64 GiB hole above it is held until right
+        // before vkCreateDevice (ReleaseDlssAddressHole).
+        if (const char* up = std::getenv("BB_UPSCALER");
+            up != nullptr && (std::string_view(up) == "dlss" || std::string_view(up) == "dlaa")) {
+            constexpr u64 DlssUserMax = 0x8000000000ULL;
+            if (supported_user_max > DlssUserMax) {
+                supported_user_max = DlssUserMax;
+                LOG_INFO(Core, "[BB_UPSCALE] DLSS: guest address space capped at {:#x}, "
+                               "64 GiB above it kept for NGX",
+                         supported_user_max);
+                dlss_hole = VirtualAlloc(reinterpret_cast<PVOID>(DlssUserMax), 64ULL << 30,
+                                         MEM_RESERVE, PAGE_NOACCESS);
+                LOG_INFO(Core, "[BB_UPSCALE] DLSS: 64 GiB hole at {:#x} {}", DlssUserMax,
+                         dlss_hole != nullptr ? "held" : "NOT reserved (already in use)");
             }
         }
 
@@ -908,3 +954,9 @@ boost::icl::interval_set<VAddr> AddressSpace::GetUsableRegions() {
 }
 
 } // namespace Core
+
+#ifndef _WIN32
+namespace Core {
+void ReleaseDlssAddressHole() {}
+} // namespace Core
+#endif

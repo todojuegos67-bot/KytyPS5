@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/debug.h"
+#include "video_core/bb/bb_analyze.h"
+#include "video_core/bb/bb_upscale.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -141,6 +143,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     } else {
         db_desc.image_id = {};
     }
+    BBOnDraw(std::bit_width(key.mrt_mask));
 }
 
 static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader::Info& info,
@@ -317,6 +320,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 }
 
 void Rasterizer::DispatchDirect() {
+    BB::Upscale::OnDispatch();
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -352,6 +356,7 @@ void Rasterizer::DispatchDirect() {
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+    BB::Upscale::OnDispatch();
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -757,6 +762,19 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
+    const bool bb_scan = (stage.l_stage == Shader::LogicalStage::Vertex ||
+                          stage.l_stage == Shader::LogicalStage::Fragment) &&
+                         BB::Upscale::WantCameraScan();
+    if (bb_scan) {
+        // Constants the shader reads through user-data pointers (the flattened SRT) and the user
+        // data itself, besides the constant buffers below.
+        if (!stage.flattened_ud_buf.empty()) {
+            BB::Upscale::OnVertexConstants(stage.flattened_ud_buf.data(),
+                                           stage.flattened_ud_buf.size() * sizeof(u32));
+        }
+        BB::Upscale::OnVertexConstants(stage.user_data.data(),
+                                       stage.user_data.size() * sizeof(u32));
+    }
     const u64 alignment = instance.StorageMinAlignment();
     for (const auto& desc : stage.buffers) {
         const auto src_access =
@@ -817,6 +835,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                if (bb_scan && !desc.is_written &&
+                    memory->IsValidMapping(vsharp.base_address, size)) {
+                    BB::Upscale::OnVertexConstants(
+                        reinterpret_cast<const void*>(vsharp.base_address), size);
+                }
                 if (size != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
@@ -965,8 +988,25 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
-            image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
-                                     image.backing->state.layout);
+            vk::ImageView bb_view = *image_view.image_view;
+            vk::ImageLayout bb_layout = image.backing->state.layout;
+            if (!is_storage && !image.info.props.is_depth &&
+                (BB::Upscale::Enabled() || BB::Analyze::Enabled())) {
+                switch (BB::Upscale::OnSample(image.info.guest_address, image.info.size.width,
+                                              image.info.size.height, image.info.pixel_format)) {
+                case BB::Upscale::Sample::Inject: {
+                    const bool ok = BBInject(image_id, bb_view, bb_layout);
+                    BB::Upscale::OnInjected(ok, 0.0f);
+                    break;
+                }
+                case BB::Upscale::Sample::Redirect:
+                    BBUpscaledView(bb_view, bb_layout);
+                    break;
+                default:
+                    break;
+                }
+            }
+            image_infos.emplace_back(VK_NULL_HANDLE, bb_view, bb_layout);
         }
     }
 
@@ -1017,6 +1057,23 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    if (VAddr bb_flip = 0; BB::Upscale::Enabled() && BB::Upscale::WantPresentUpscale(bb_flip)) {
+        bool ok = false;
+        const u32 bb_num_cb = static_cast<u32>(std::bit_width(pipeline->GetGraphicsKey().mrt_mask));
+        for (u32 cb = 0; cb < bb_num_cb && cb < cb_descs.size(); ++cb) {
+            if (cb_descs[cb].image_id &&
+                texture_cache.GetImage(cb_descs[cb].image_id).info.guest_address == bb_flip) {
+                ok = BBPresentUpscale(texture_cache.GetImage(cb_descs[cb].image_id));
+                break;
+            }
+        }
+        BB::Upscale::OnPresentUpscaled(ok);
+    }
+    if (BB::Upscale::Enabled() && BB::Upscale::WantHudlessCopy() && cb_descs[0].image_id) {
+        BBHudlessCopy(texture_cache.GetImage(cb_descs[0].image_id));
+    }
+    std::array<const VideoCore::Image*, 8> bb_cols{};
+    const VideoCore::Image* bb_depth = nullptr;
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
@@ -1080,6 +1137,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         attachment.is_clear = is_clear;
 
         image->usage.render_target = 1u;
+        bb_cols[cb] = image;
     }
     for (u32 cb = state.num_color_attachments; cb < state.color_attachments.size(); ++cb) {
         state.color_attachments[cb] = {};
@@ -1140,10 +1198,15 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
 
         image.usage.depth_target = true;
+        bb_depth = &image;
     } else {
         state.depth_stencil_attachment = {};
     }
 
+    if (BB::Analyze::Enabled()) {
+        BB::Analyze::OnPass(bb_cols, state.num_color_attachments, bb_depth, state.width,
+                            state.height);
+    }
     if (state.num_layers == std::numeric_limits<u16>::max()) {
         state.num_layers = 1;
     }
@@ -1359,6 +1422,8 @@ void Rasterizer::UpdateViewportScissorState() const {
     }
 
     const auto& vp_ctl = regs.viewport_control;
+    float bb_jitter_x = 0.0f, bb_jitter_y = 0.0f;
+    const bool bb_jitter = BB::Upscale::Jitter(bb_jitter_x, bb_jitter_y);
     for (u32 i = 0; i < AmdGpu::NUM_VIEWPORTS; i++) {
         const auto& vp = regs.viewports[i];
         const auto& vp_d = regs.viewport_depths[i];
@@ -1407,6 +1472,10 @@ void Rasterizer::UpdateViewportScissorState() const {
             viewport.y = yoffset - yscale;
             viewport.width = xscale * 2.0f;
             viewport.height = yscale * 2.0f;
+            if (bb_jitter) {
+                viewport.x += bb_jitter_x;
+                viewport.y += bb_jitter_y;
+            }
         }
 
         viewports.push_back(viewport);

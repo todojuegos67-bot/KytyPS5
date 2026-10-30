@@ -21,6 +21,9 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/bb/bb_analyze.h"
+#include "video_core/bb/bb_upscale.h"
+#include "video_core/bb/bb_metrics.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 
@@ -668,8 +671,30 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
+    if (BB::Analyze::Enabled()) {
+        const auto& bb_img = texture_cache.GetImage(image_id);
+        BB::Analyze::OnPresent(bb_img.info.size.width, bb_img.info.size.height,
+                               bb_img.info.pixel_format, cpu_address);
+    }
+    if (BB::Upscale::Enabled() || BB::Analyze::Enabled()) {
+        const auto& bb_img = texture_cache.GetImage(image_id);
+        BB::Upscale::OnFlip(cpu_address, bb_img.info.size.width, bb_img.info.size.height);
+    }
 
     Frame* frame = GetRenderFrame();
+    if (BB::Upscale::Enabled()) {
+        // The presentation size (the window's game area): the upscaler's output size.
+        // The output is the real window/swapchain size (DSR fullscreen may make this
+        // 3840x2160 on a 1440p panel). Never shrink it to the desktop mode or panel size;
+        // only sanity-clamp against the swapchain extent itself.
+        u32 bb_w = frame->width, bb_h = frame->height;
+        const vk::Extent2D bb_ext = swapchain.GetExtent();
+        if (bb_ext.width > 0 && bb_ext.height > 0) {
+            bb_w = std::min(bb_w, bb_ext.width);
+            bb_h = std::min(bb_h, bb_ext.height);
+        }
+        BB::Upscale::SetPresentSize(bb_w, bb_h);
+    }
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -734,20 +759,38 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
     }
 
+    // Bloodborne: no HUD point this frame (no HUD drawn): the window-size upscale runs here.
+    if (BB::Upscale::Enabled() && BB::Upscale::TakeLateUpscale() &&
+        !rasterizer->BBPresentUpscale(image)) {
+        BB::Upscale::OnPresentFailed(rasterizer->BBPresentWhy());
+    }
+
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
     runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
                     vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
     runtime.FlushBarriers();
 
-    image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
+    // Bloodborne upscaling to the window size: the upscaled image with the HUD on top instead.
+    vk::Extent2D bb_size = image_size;
+    if (vk::ImageView bb_view{}; BB::Upscale::Enabled() &&
+                                 rasterizer->BBPresentComposite(cmdbuf, image, view_info.format,
+                                                                bb_view, bb_size)) {
+        image_view = bb_view;
+        if (BB::Upscale::Enabled()) BB::Upscale::OnPresentResult(true, "");
+    } else {
+        bb_size = image_size;
+        if (BB::Upscale::Enabled()) BB::Upscale::OnPresentResult(false, rasterizer->BBPresentWhy());
+    }
+
+    image_view = fsr_pass.Render(cmdbuf, image_view, bb_size, {frame->width, frame->height},
                                  fsr_settings, frame->is_hdr);
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
-    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    pp_pass.Render(cmdbuf, image_view, bb_size, *frame, pp_settings);
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
@@ -1083,6 +1126,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
+        BB::Metrics::OnPresent();
         DebugState.IncFlipFrameNum();
     }
 }
