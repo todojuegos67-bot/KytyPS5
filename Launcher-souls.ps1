@@ -1431,8 +1431,10 @@ function Get-InstalledVersion {
 }
 function Get-LatestRelease([int]$Timeout = 30) {
 	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-	$rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/todojuegos67-bot/KytyPS5/releases/latest' -Headers @{ 'User-Agent' = 'DS-Launcher'; 'Accept' = 'application/vnd.github+json' } -UseBasicParsing -TimeoutSec $Timeout
-	if ($rel.draft -or $rel.prerelease) { throw 'no published release' }
+	# (1030c) The newest PUBLISHED emulator release (KytyPS5-*), not only the one marked Latest.
+	$list = Invoke-RestMethod -Uri 'https://api.github.com/repos/todojuegos67-bot/KytyPS5/releases?per_page=50' -Headers @{ 'User-Agent' = 'DS-Launcher'; 'Accept' = 'application/vnd.github+json' } -UseBasicParsing -TimeoutSec $Timeout
+	$rel = @($list | Where-Object { -not $_.draft -and -not $_.prerelease -and ([string]$_.tag_name) -like 'KytyPS5-*' } | Sort-Object { [datetime]$_.published_at } -Descending) | Select-Object -First 1
+	if (-not $rel) { throw 'no published release' }
 	$zips = @($rel.assets | Where-Object { $_.name -like '*.zip' -and $_.name -notmatch '(?i)linux|macos|source|symbols|pdb' -and $_.browser_download_url -like 'https://*' })
 	$win = @($zips | Where-Object { $_.name -match '(?i)windows|win64|x64|DemonsSouls|KytyPS5' })
 	if ($win.Count) { $zips = $win }
@@ -3064,6 +3066,18 @@ Update-Res3D
 # (ds-pc-port17) La version instalada siempre visible (titulo de la ventana) y aviso de version nueva al abrir.
 $script:curVerShown = Get-InstalledVersion
 if ($script:curVerShown) { $form.Text = $form.Text + ' - ' + (UT 'Version: ' 'Version: ') + $script:curVerShown }
+# (1030c) The installed version and when it was installed, small in the bottom-left corner.
+try {
+	$vfi = Join-Path $root 'version.txt'
+	$when = if (Test-Path -LiteralPath $vfi) { (Get-Item -LiteralPath $vfi).LastWriteTime.ToString('dd/MM/yyyy HH:mm') } else { '' }
+	$lblVer = New-Object System.Windows.Forms.Label
+	$lblVer.Text = (UT 'Version: ' 'Version: ') + $(if ($script:curVerShown) { $script:curVerShown } else { '?' }) + $(if ($when) { '  -  ' + (UT 'actualizada ' 'updated ') + $when } else { '' })
+	$lblVer.AutoSize = $true; $lblVer.BackColor = [System.Drawing.Color]::Transparent; $lblVer.ForeColor = [System.Drawing.Color]::FromArgb(200, 194, 180)
+	$lblVer.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+	$lblVer.Location = New-Object System.Drawing.Point(8, ($form.ClientSize.Height - 20))
+	$lblVer.Anchor = 'Bottom, Left'
+	$form.Controls.Add($lblVer); $lblVer.BringToFront()
+} catch { }
 $form.Add_Shown({ $form.Refresh(); $form.Opacity = 1 })
 $script:tmUpd = New-Object System.Windows.Forms.Timer; $script:tmUpd.Interval = 400
 $script:tmUpd.Add_Tick({ $script:tmUpd.Stop(); try { Start-UpdateVersion -Startup } catch { } })
