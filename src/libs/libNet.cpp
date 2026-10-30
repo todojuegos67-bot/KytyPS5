@@ -2428,10 +2428,19 @@ struct NpUniversalDataSystemMemoryStat {
 	size_t current_inuse_size;
 };
 
+struct NpUniversalDataSystemEventPropertyArray;
 struct NpUniversalDataSystemEventPropertyObject {
+	std::map<std::string, std::shared_ptr<NpUniversalDataSystemEventPropertyArray>> arrays;
 	std::map<std::string, int64_t>     ints;
 	std::map<std::string, std::string> strings;
 	std::map<std::string, std::shared_ptr<NpUniversalDataSystemEventPropertyObject>> objects;
+};
+
+// (1030e) Arrays kept too (the game's DsActivityAvailabilityChange lists the activities in them).
+struct NpUniversalDataSystemEventPropertyArray {
+	std::vector<std::string>                                               strings;
+	std::vector<int64_t>                                                   ints;
+	std::vector<std::shared_ptr<NpUniversalDataSystemEventPropertyObject>> objects;
 };
 
 struct NpUniversalDataSystemEvent {
@@ -2480,6 +2489,14 @@ static std::string UdsDump(const NpUniversalDataSystemEventPropertyObject& o) {
 	for (const auto& [k, v]: o.ints) r += k + "=" + std::to_string(v) + " ";
 	for (const auto& [k, v]: o.strings) r += k + "=\"" + v + "\" ";
 	for (const auto& [k, c]: o.objects) r += k + "=" + (c ? UdsDump(*c) : std::string("{}")) + " ";
+	for (const auto& [k, a]: o.arrays) {
+		if (!a) continue;
+		r += k + "=[";
+		for (const auto& v: a->strings) r += "\"" + v + "\" ";
+		for (const auto& v: a->ints) r += std::to_string(v) + " ";
+		for (const auto& c: a->objects) r += (c ? UdsDump(*c) : std::string("{}")) + " ";
+		r += "] ";
+	}
 	return r + "}";
 }
 
@@ -2536,7 +2553,7 @@ static void UdsHandleEvent(const NpUniversalDataSystemEvent& e) {
 	}
 }
 
-struct NpUniversalDataSystemEventPropertyArray {};
+
 
 struct NpUniversalDataSystemStorageStat {
 	size_t in_events;
@@ -3012,9 +3029,12 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetArray(
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
 
-	if (value_ptr != nullptr) {
-		*value_ptr = (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyArray*>(value)
-		                               : new NpUniversalDataSystemEventPropertyArray);
+	{
+		std::lock_guard lock(g_uds_mutex);
+		auto            child = std::make_shared<NpUniversalDataSystemEventPropertyArray>();
+		if (value != nullptr) *child = *value;
+		object->arrays[key] = child;
+		if (value_ptr != nullptr) *value_ptr = child.get();
 	}
 
 	return 0;
@@ -3059,6 +3079,10 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetString(
 
 	if (array == nullptr || value == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
+	}
+	{
+		std::lock_guard lock(g_uds_mutex);
+		array->strings.emplace_back(value);
 	}
 
 	return 0;
@@ -3163,6 +3187,26 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetBinary(
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
 
+	if (array != nullptr) {
+		std::lock_guard lock(g_uds_mutex);
+		array->ints.push_back(static_cast<int64_t>(value));
+	}
+	if (array != nullptr) {
+		std::lock_guard lock(g_uds_mutex);
+		array->ints.push_back(static_cast<int64_t>(value));
+	}
+	if (array != nullptr) {
+		std::lock_guard lock(g_uds_mutex);
+		array->ints.push_back(static_cast<int64_t>(value));
+	}
+	if (array != nullptr) {
+		std::lock_guard lock(g_uds_mutex);
+		array->ints.push_back(static_cast<int64_t>(value));
+	}
+	if (array != nullptr) {
+		std::lock_guard lock(g_uds_mutex);
+		array->ints.push_back(static_cast<int64_t>(value));
+	}
 	return 0;
 }
 
@@ -3177,9 +3221,12 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetObject(
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
 
-	if (value_ptr != nullptr) {
-		*value_ptr = (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyObject*>(value)
-		                               : new NpUniversalDataSystemEventPropertyObject);
+	{
+		std::lock_guard lock(g_uds_mutex);
+		auto            child = std::make_shared<NpUniversalDataSystemEventPropertyObject>();
+		if (value != nullptr) *child = *value;
+		array->objects.push_back(child);
+		if (value_ptr != nullptr) *value_ptr = child.get();
 	}
 
 	LOGF("\t array     = 0x%016" PRIx64 "\n"
