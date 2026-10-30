@@ -2490,6 +2490,15 @@ static void UdsHandleEvent(const NpUniversalDataSystemEvent& e) {
 	auto        name = UdsLower(e.name);
 	std::string dump = UdsDump(e.props);
 	std::printf("UDS: event %s %s\n", e.name.c_str(), dump.c_str());
+	// (1030c) The port's own trophy: the Nexus reached for the first time (the game's "Nexus" activity, uds00.ucp).
+	if (e.name == "DsActivityStart") {
+		const auto a = e.props.strings.find("activityId");
+		if (a != e.props.strings.end() && a->second == "Nexus") {
+			int  plat = -1;
+			bool ok   = Libs::Trophy::Unlock(Libs::Trophy::kNexusTrophyId, &plat);
+			std::printf("UDS: Nexus reached -> port trophy %d %s\n", Libs::Trophy::kNexusTrophyId, ok ? "new" : "already");
+		}
+	}
 	if (name.find("trophy") == std::string::npos) {
 		return;
 	}
@@ -2498,7 +2507,9 @@ static void UdsHandleEvent(const NpUniversalDataSystemEvent& e) {
 		std::printf("UDS: trophy event %s without a trophy id\n", e.name.c_str());
 		return;
 	}
-	bool unlock = name.find("unlock") != std::string::npos;
+	// (1030c) Demon's Souls posts DsLegacyTrophy {trophyId} (uds00.ucp); _UnlockTrophy {_trophy_id} too: any trophy
+	// event that is not a progress update unlocks.
+	bool unlock = name.find("progress") == std::string::npos;
 	if (!unlock && name.find("progress") != std::string::npos) {
 		int64_t progress = 0, target = 0;
 		bool    hp = UdsFindInt(e.props, "progress", nullptr, &progress) || UdsFindInt(e.props, "value", nullptr, &progress) ||

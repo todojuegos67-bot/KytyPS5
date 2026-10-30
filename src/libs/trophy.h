@@ -11,6 +11,9 @@
 namespace Libs::Trophy {
 
 // grade: 1 platinum, 2 gold, 3 silver, 4 bronze (as the NpTrophy2 API's), 0 unknown
+// (1030c) The port's own trophy (not the game's): the Nexus reached for the first time. Not needed for the platinum.
+constexpr int kNexusTrophyId = 100;
+
 struct Info {
 	int         id    = -1;
 	int         grade = 0;
