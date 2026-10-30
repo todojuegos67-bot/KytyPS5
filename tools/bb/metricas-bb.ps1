@@ -290,6 +290,9 @@ function Get-FileFps {
 		# (bb-upscale) "[up] <reescalador> <modo> <interna> -> <salida>" del emulador propio.
 		$m = [regex]::Matches($text, '\[up\] ([^\r\n]+)')
 		if ($m.Count -gt 0) { $r.up = $m[$m.Count - 1].Groups[1].Value.Trim() }
+		# (bb-upscale) "[res] game WxH -> output WxH ...": lo que el juego dibuja de verdad.
+		$m = [regex]::Matches($text, '\[res\] game ([0-9]+x[0-9]+) -> output ([0-9]+x[0-9]+)')
+		if ($m.Count -gt 0) { $r.resGame = $m[$m.Count - 1].Groups[1].Value; $r.resOut = $m[$m.Count - 1].Groups[2].Value }
 		if ($r.Count) { return $r }
 	} catch { }
 	return $null
@@ -397,7 +400,8 @@ $timer.Add_Tick({
 		$fsrOn = ($c.fsr -eq 'true'); $rcasOn = ($c.rcas -eq 'true')
 		$esc = if ($fsrOn) { 'FSR 1' + $(if ($rcasOn) { ' + RCAS' + $(if ($c.att) { $a = 0.0; if ([double]::TryParse($c.att, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$a)) { $DOT + ('{0:0} %' -f [Math]::Max(0, 100 - $a / 10)) } }) } else { '' }) } else { 'Nativo (sin FSR)' }
 		$rows.Add(@('Escala', $esc, $(if ($fsrOn) { $cRed } else { $cOrange })))
-		if ($c.iw -and $c.ih) { $rows.Add(@('Resol.', ("{0}x{1}{2}" -f $c.iw, $c.ih, $(if ($c.ww -and $c.wh) { " $ARROW $($c.ww)x$($c.wh)" } else { '' })), $(if ($fsrOn) { $cRed } else { $cOrange }))) }
+		if ($fps -and $fps.resGame) { $rows.Add(@('Resol.', ("{0} $ARROW {1}" -f $fps.resGame, $fps.resOut), $(if ($fsrOn) { $cRed } else { $cOrange }))) }
+		elseif ($c.iw -and $c.ih) { $rows.Add(@('Resol.', ("{0}x{1}{2}" -f $c.iw, $c.ih, $(if ($c.ww -and $c.wh) { " $ARROW $($c.ww)x$($c.wh)" } else { '' })), $(if ($fsrOn) { $cRed } else { $cOrange }))) }
 	}
 	if ($fps -and $fps.up -and $fps.up -ne 'off') { $rows.Add(@('Reesc.', $fps.up, $cRed)) }
 	if ("$($ini['safemode'])" -ne '0') { $rows.Add(@('', 'Modo seguro (config de shadPS4 tal cual)', $cKhaki)) }

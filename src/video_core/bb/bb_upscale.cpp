@@ -1844,11 +1844,15 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         // The periodic line in bb_upscale_init.log.
         Checkpoint(fmt::format(
             "[periodic] frame {}: {} upscaled {} of the last {} frames ({} in all, {} failed), "
-            "{}x{} -> {}x{} ({}), window {}x{}, game output {}x{}, GPU {:.2f} ms",
+            "{}x{} -> {}x{} ({}), window {}x{}, game output {}x{}, GPU {:.2f} ms{}",
             g_frame_no, SR::KindName(c.kind), g_stats.injected, g_stats.frames, g_total_upscaled,
             g_stats.failed, g_plan.render_w, g_plan.render_h, g_plan.output_w, g_plan.output_h,
             to_window ? "window-size" : "in place", g_present_w, g_present_h, g_output_w,
-            g_output_h, g_stats.gpu_samples ? g_stats.gpu_ms_sum / g_stats.gpu_samples : 0.0));
+            g_output_h, g_stats.gpu_samples ? g_stats.gpu_ms_sum / g_stats.gpu_samples : 0.0,
+            g_learned.render_w == 0
+                ? "; no 3D scene drawn yet (no depth + 3-target G-buffer pass: title screen, "
+                  "menu or loading), nothing to upscale until gameplay"
+                : ""));
         // Nothing to upscale: the game already renders at (or above) the window size.
         if (!g_said_nothing && Active() && g_learned.render_w != 0 && g_present_w != 0 &&
             g_learned.render_w >= g_present_w && g_learned.render_h >= g_present_h) {
@@ -1879,6 +1883,20 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         } else {
             BB::Metrics::SetUpscaleLine(fmt::format("{} (not running: native)", SR::KindName(mc.kind)));
         }
+        // The real sizes for the overlay's "Resol." row (the config's internal size is not what
+        // the game renders): the game's 3D size (its output size until a 3D scene is seen) and
+        // what reaches the window.
+        const bool up = Active() && f.injected;
+        const u32 gw = g_learned.render_w != 0 ? g_learned.render_w : g_output_w;
+        const u32 gh = g_learned.render_h != 0 ? g_learned.render_h : g_output_h;
+        const u32 ow = up ? g_plan.output_w : g_output_w;
+        const u32 oh = up ? g_plan.output_h : g_output_h;
+        BB::Metrics::SetResLine(fmt::format(
+            "game {}x{} -> output {}x{} (window {}x{}, {})", gw, gh, ow, oh, g_present_w,
+            g_present_h,
+            up ? "upscaled"
+            : g_learned.render_w == 0 ? "no 3D scene yet: title / menu / loading"
+                                      : "not upscaled"));
     }
 
     // Jitter for the next frame.

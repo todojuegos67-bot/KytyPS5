@@ -43,6 +43,7 @@ Clock::time_point g_last_present{};
 Clock::time_point g_window_start{};
 std::vector<double> g_frames, g_lat;
 std::string g_up = "[up] off";
+std::string g_res;
 
 int64_t Now() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
@@ -68,6 +69,14 @@ void SetUpscaleLine(const std::string& text) {
     }
     std::scoped_lock lk{g_mutex};
     g_up = "[up] " + text;
+}
+
+void SetResLine(const std::string& text) {
+    if (!Enabled()) {
+        return;
+    }
+    std::scoped_lock lk{g_mutex};
+    g_res = "[res] " + text;
 }
 
 void OnPresent() {
@@ -105,6 +114,7 @@ void OnPresent() {
                      p95);
     }
     std::fprintf(file, "%s\n", g_up.c_str());
+    if (!g_res.empty()) std::fprintf(file, "%s\n", g_res.c_str());
     std::fflush(file);
     g_frames.clear();
     g_lat.clear();
