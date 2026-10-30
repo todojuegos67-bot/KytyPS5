@@ -5,13 +5,19 @@
 // recorded in the rasterizer's command buffer at the injection point.
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
+#include <limits>
+#include <string>
+#include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/bb/bb_analyze.h"
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/host_shaders/bb_alpha_comp.h"
 #include "video_core/host_shaders/bb_hud_comp.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -62,6 +68,21 @@ struct BBVk {
     std::array<bool, 8> query_pending{};
     u32 query_slot = 0;
     double timestamp_period_ns = 1.0;
+    // The alpha / non-finite fix-up of the output (bb_alpha.comp).
+    bool alpha_init = false, alpha_failed = false;
+    vk::DescriptorSetLayout alpha_set_layout{};
+    vk::PipelineLayout alpha_layout{};
+    vk::Pipeline alpha_pipeline{};
+    // The output self-check: a few texels read back from the first upscales.
+    vk::Buffer check_buffer{};
+    VmaAllocation check_allocation{};
+    void* check_mapped = nullptr;
+    u64 check_tick = 0;
+    bool check_pending = false;
+    u32 check_done = 0;
+    u64 upscales = 0;
+    std::string check_what;
+    vk::Format present_src_format = vk::Format::eUndefined; // the flip image present_in copies
     std::vector<std::pair<u64, vk::ImageView>> transient_views;
 };
 BBVk g_bb;
@@ -241,11 +262,16 @@ void ReadTimestamps() {
 }
 
 vk::ImageView TransientView(Scheduler& scheduler, vk::Image image, vk::Format format,
-                            vk::ImageAspectFlags aspect) {
+                            vk::ImageAspectFlags aspect, vk::ComponentMapping components = {}) {
+    // Sampled only: a view in another format of the same image (sRGB of a UNORM image, say) need
+    // not support the image's other usages (storage).
+    const vk::ImageViewUsageCreateInfo usage{.usage = vk::ImageUsageFlagBits::eSampled};
     const auto [result, view] = g_bb.device.createImageView(vk::ImageViewCreateInfo{
+        .pNext = &usage,
         .image = image,
         .viewType = vk::ImageViewType::e2D,
         .format = format,
+        .components = components,
         .subresourceRange = {aspect, 0, 1, 0, 1},
     });
     if (result != vk::Result::eSuccess) {
@@ -327,7 +353,11 @@ bool InitHud() {
     if (sampler_result != vk::Result::eSuccess) {
         return false;
     }
-    g_bb.linear = sampler;
+    if (g_bb.linear) {
+        device.destroySampler(sampler);
+    } else {
+        g_bb.linear = sampler;
+    }
     g_bb.hud_failed = false;
     g_bb.hud_init = true;
     return true;
@@ -344,10 +374,246 @@ bool IsSrgb(vk::Format f) {
     }
 }
 
+// The UNORM twin of an sRGB format (and the format itself otherwise).
+vk::Format Unorm(vk::Format f) {
+    switch (f) {
+    case vk::Format::eR8G8B8A8Srgb:
+        return vk::Format::eR8G8B8A8Unorm;
+    case vk::Format::eB8G8R8A8Srgb:
+        return vk::Format::eB8G8R8A8Unorm;
+    case vk::Format::eA8B8G8R8SrgbPack32:
+        return vk::Format::eA8B8G8R8UnormPack32;
+    default:
+        return f;
+    }
+}
+
+// The format the game's own texture view reads the image through, when it differs from the
+// image's format only by its sRGB decode: the upscaler must read what the game's shader reads
+// (an sRGB view of a UNORM render target decodes to linear, the raw UNORM view does not).
+vk::Format SampledFormat(vk::Format image_format, vk::Format view_format) {
+    return view_format != image_format && Unorm(view_format) == Unorm(image_format)
+               ? view_format
+               : image_format;
+}
+
+const char* ColourSpace(vk::Format f) {
+    switch (f) {
+    case vk::Format::eR16G16B16A16Sfloat:
+    case vk::Format::eB10G11R11UfloatPack32:
+    case vk::Format::eR32G32B32A32Sfloat:
+        return "linear HDR";
+    case vk::Format::eR8G8B8A8Srgb:
+    case vk::Format::eB8G8R8A8Srgb:
+    case vk::Format::eA8B8G8R8SrgbPack32:
+        return "sRGB, decoded to linear on read";
+    default:
+        return "UNORM, gamma-encoded LDR";
+    }
+}
+
+bool InitAlpha() {
+    if (g_bb.alpha_init || g_bb.alpha_failed) {
+        return g_bb.alpha_init;
+    }
+    g_bb.alpha_failed = true;
+    const auto device = g_bb.device;
+    const std::array bindings{
+        vk::DescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+    };
+    auto [set_result, set_layout] =
+        device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        });
+    if (set_result != vk::Result::eSuccess) {
+        return false;
+    }
+    g_bb.alpha_set_layout = set_layout;
+    const vk::PushConstantRange push{
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = 16,
+    };
+    auto [layout_result, layout] = device.createPipelineLayout(vk::PipelineLayoutCreateInfo{
+        .setLayoutCount = 1,
+        .pSetLayouts = &g_bb.alpha_set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push,
+    });
+    if (layout_result != vk::Result::eSuccess) {
+        return false;
+    }
+    g_bb.alpha_layout = layout;
+    const auto module = CompileSPV(BB_ALPHA_COMP, device);
+    if (!module) {
+        return false;
+    }
+    auto [pipe_result, pipeline] = device.createComputePipeline(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage =
+                    vk::PipelineShaderStageCreateInfo{
+                        .stage = vk::ShaderStageFlagBits::eCompute,
+                        .module = module,
+                        .pName = "main",
+                    },
+                .layout = g_bb.alpha_layout,
+            });
+    device.destroyShaderModule(module);
+    if (pipe_result != vk::Result::eSuccess) {
+        return false;
+    }
+    g_bb.alpha_pipeline = pipeline;
+    if (!g_bb.linear) {
+        auto [sampler_result, sampler] = device.createSampler(vk::SamplerCreateInfo{
+            .magFilter = vk::Filter::eLinear,
+            .minFilter = vk::Filter::eLinear,
+            .mipmapMode = vk::SamplerMipmapMode::eNearest,
+            .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+        });
+        if (sampler_result != vk::Result::eSuccess) {
+            return false;
+        }
+        g_bb.linear = sampler;
+    }
+    g_bb.alpha_failed = false;
+    g_bb.alpha_init = true;
+    return true;
+}
+
+float HalfToFloat(u16 h) {
+    const u32 sign = (h >> 15) & 1, exp = (h >> 10) & 0x1f, man = h & 0x3ff;
+    float v;
+    if (exp == 0) {
+        v = std::ldexp(static_cast<float>(man), -24);
+    } else if (exp == 31) {
+        v = man != 0 ? std::numeric_limits<float>::quiet_NaN()
+                     : std::numeric_limits<float>::infinity();
+    } else {
+        v = std::ldexp(static_cast<float>(man | 0x400), static_cast<int>(exp) - 25);
+    }
+    return sign ? -v : v;
+}
+
+// The output self-check: once the GPU is past the copy, the five texels (centre and the four
+// quarter points) of the upscaled image: NaN / Inf, or all of them one colour, is a warning.
+void PollCheck(Scheduler& scheduler) {
+    if (!g_bb.check_pending || !scheduler.IsFree(g_bb.check_tick)) {
+        return;
+    }
+    g_bb.check_pending = false;
+    vmaInvalidateAllocation(g_bb.allocator, g_bb.check_allocation, 0, VK_WHOLE_SIZE);
+    const auto* half = static_cast<const u16*>(g_bb.check_mapped);
+    std::array<std::array<float, 4>, 5> px{};
+    bool bad = false, same = true;
+    std::string points;
+    for (u32 i = 0; i < px.size(); ++i) {
+        for (u32 c = 0; c < 4; ++c) {
+            px[i][c] = HalfToFloat(half[i * 4 + c]);
+            bad |= !std::isfinite(px[i][c]);
+        }
+        for (u32 c = 0; c < 3; ++c) {
+            same &= std::fabs(px[i][c] - px[0][c]) < 1e-3f;
+        }
+        points += fmt::format(" ({:.3f} {:.3f} {:.3f} a{:.2f})", px[i][0], px[i][1], px[i][2],
+                              px[i][3]);
+    }
+    if (bad) {
+        BB::Upscale::Checkpoint(fmt::format(
+            "WARNING: upscaled image self-check {}: NaN / Inf in the output ({}):{}",
+            g_bb.check_done, g_bb.check_what, points));
+    } else if (same) {
+        BB::Upscale::Checkpoint(fmt::format(
+            "WARNING: upscaled image self-check {}: the 5 sampled points are all one colour "
+            "({}; a flat / black / broken output, unless the frame really is one colour):{}",
+            g_bb.check_done, g_bb.check_what, points));
+    } else {
+        BB::Upscale::Checkpoint(fmt::format("upscaled image self-check {}: ok ({}):{}",
+                                            g_bb.check_done, g_bb.check_what, points));
+    }
+}
+
+// Records the copy of the five texels of the output (in General layout, last written by a
+// compute shader) for PollCheck.
+void RecordCheck(Scheduler& scheduler, vk::CommandBuffer cmd, vk::Extent2D output,
+                 const std::string& what) {
+    if (g_bb.check_pending || g_bb.check_done >= 3) {
+        return;
+    }
+    // The 1st, 2nd and 120th upscale.
+    if (g_bb.upscales != 1 && g_bb.upscales != 2 && g_bb.upscales != 120) {
+        return;
+    }
+    if (!g_bb.check_buffer) {
+        const VkBufferCreateInfo ci = vk::BufferCreateInfo{
+            .size = 64,
+            .usage = vk::BufferUsageFlagBits::eTransferDst,
+        };
+        VmaAllocationCreateInfo alloc{};
+        alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VkBuffer buffer{};
+        VmaAllocationInfo info{};
+        if (vmaCreateBuffer(g_bb.allocator, &ci, &alloc, &buffer, &g_bb.check_allocation, &info) !=
+            VK_SUCCESS) {
+            g_bb.check_done = 3;
+            return;
+        }
+        g_bb.check_buffer = buffer;
+        g_bb.check_mapped = info.pMappedData;
+    }
+    std::array<vk::BufferImageCopy, 5> regions{};
+    const std::array<std::array<u32, 2>, 5> at{{{output.width / 2, output.height / 2},
+                                                {output.width / 4, output.height / 4},
+                                                {output.width * 3 / 4, output.height / 4},
+                                                {output.width / 4, output.height * 3 / 4},
+                                                {output.width * 3 / 4, output.height * 3 / 4}}};
+    for (u32 i = 0; i < regions.size(); ++i) {
+        regions[i] = vk::BufferImageCopy{
+            .bufferOffset = i * 8,
+            .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .imageOffset = {static_cast<s32>(at[i][0]), static_cast<s32>(at[i][1]), 0},
+            .imageExtent = {1, 1, 1},
+        };
+    }
+    Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    cmd.copyImageToBuffer(g_bb.output.image, vk::ImageLayout::eGeneral, g_bb.check_buffer, regions);
+    Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
+            vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead);
+    const vk::MemoryBarrier2 host{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &host});
+    g_bb.check_tick = scheduler.CurrentTick();
+    g_bb.check_pending = true;
+    ++g_bb.check_done;
+    g_bb.check_what = what;
+}
+
 } // namespace
 
-bool Rasterizer::BBInject(VideoCore::ImageId color_id, vk::ImageView& out_view,
-                          vk::ImageLayout& out_layout) {
+bool Rasterizer::BBInject(VideoCore::ImageId color_id, const VideoCore::ImageViewInfo& view_info,
+                          vk::ImageView& out_view, vk::ImageLayout& out_layout) {
     const auto& plan = BB::Upscale::CurrentPlan();
     if (!InitOnce(instance)) {
         return false;
@@ -361,16 +627,18 @@ bool Rasterizer::BBInject(VideoCore::ImageId color_id, vk::ImageView& out_view,
     runtime.Transit(&color, vk::ImageLayout::eShaderReadOnlyOptimal,
                     vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
     runtime.FlushBarriers();
+    // The upscaler reads the image as the game's shader does: through the game's view format
+    // when that only adds / drops the sRGB decode (identity swizzle here; the game's swizzle is
+    // applied on the redirected view, BBUpscaledView).
+    const vk::Format in_format = instance.GetSupportedFormat(
+        SampledFormat(color.info.pixel_format, view_info.format), color.format_features);
     const auto color_view =
-        TransientView(scheduler, color.GetImage(), color.info.pixel_format,
-                      vk::ImageAspectFlagBits::eColor);
+        TransientView(scheduler, color.GetImage(), in_format, vk::ImageAspectFlagBits::eColor);
     if (!color_view ||
-        !BBRecordUpscale(color.GetImage(), color_view, color.info.pixel_format, color.usage_flags)) {
+        !BBRecordUpscale(color.GetImage(), color_view, in_format, color.usage_flags)) {
         return false;
     }
-    out_view = g_bb.output.view;
-    out_layout = vk::ImageLayout::eGeneral;
-    return true;
+    return BBUpscaledView(view_info, out_view, out_layout);
 }
 
 const char* Rasterizer::BBPresentWhy() {
@@ -428,6 +696,7 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
     Barrier(cmd, g_bb.present_in, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    g_bb.present_src_format = flip.info.pixel_format;
     if (!BBRecordUpscale(g_bb.present_in.image, g_bb.present_in.view, g_bb.present_in.format,
                          g_bb.present_in.usage)) {
         g_bb.present_why = "the upscaler dispatch was not recorded (depth / back end)";
@@ -538,6 +807,7 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
 bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view,
                                  vk::Format color_format, vk::ImageUsageFlags color_usage) {
     const auto& plan = BB::Upscale::CurrentPlan();
+    PollCheck(scheduler);
     if (!bb_gb_depth_valid) {
         return false;
     }
@@ -684,6 +954,56 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
             vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eAllTransfer,
             vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    if (ok) {
+        ++g_bb.upscales;
+        // The source's alpha back into the output, non-finite colour cleared (bb_alpha.comp).
+        if (InitAlpha()) {
+            Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral,
+                    vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+                    vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+            struct {
+                u32 size[4];
+            } push{{output.width, output.height, 0u, 0u}};
+            const vk::DescriptorImageInfo src_info{g_bb.linear ? g_bb.linear : g_bb.nearest,
+                                                   color_view,
+                                                   vk::ImageLayout::eShaderReadOnlyOptimal};
+            const vk::DescriptorImageInfo out_info{{}, g_bb.output.view, vk::ImageLayout::eGeneral};
+            const std::array writes{
+                vk::WriteDescriptorSet{
+                    .dstBinding = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                    .pImageInfo = &src_info,
+                },
+                vk::WriteDescriptorSet{
+                    .dstBinding = 1,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eStorageImage,
+                    .pImageInfo = &out_info,
+                },
+            };
+            cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_bb.alpha_pipeline);
+            cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bb.alpha_layout, 0, writes);
+            cmd.pushConstants(g_bb.alpha_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                              sizeof(push), &push);
+            cmd.dispatch((output.width + 7) / 8, (output.height + 7) / 8, 1);
+            Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral,
+                    vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+                    vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+        }
+        const bool copy = color_image == g_bb.present_in.image;
+        const vk::Format src = copy ? g_bb.present_src_format : color_format;
+        const std::string formats = fmt::format(
+            "{}{} ({}, {} flag) -> {}", copy ? "RGBA16F copy of " : "", vk::to_string(src),
+            ColourSpace(src), plan.hdr ? "HDR" : "LDR", vk::to_string(g_bb.output.format));
+        if (g_bb.upscales == 1) {
+            BB::Upscale::SetUpscaleFormats(formats);
+        }
+        RecordCheck(scheduler, cmd, output,
+                    fmt::format("upscale {} {}x{} -> {}x{}, {}", g_bb.upscales, render.width,
+                                render.height, output.width, output.height, formats));
+    }
     if (timed) {
         cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, g_bb.queries,
                             slot * 2 + 1);
@@ -693,11 +1013,20 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     return ok;
 }
 
-bool Rasterizer::BBUpscaledView(vk::ImageView& out_view, vk::ImageLayout& out_layout) const {
+bool Rasterizer::BBUpscaledView(const VideoCore::ImageViewInfo& view_info, vk::ImageView& out_view,
+                                vk::ImageLayout& out_layout) {
     if (!g_bb.output.view) {
         return false;
     }
     out_view = g_bb.output.view;
+    if (view_info.mapping != AmdGpu::IdentityMapping) {
+        // The game's own swizzle (its view of the source), on the upscaled image too.
+        if (const auto view = TransientView(scheduler, g_bb.output.image, g_bb.output.format,
+                                            vk::ImageAspectFlagBits::eColor,
+                                            LiverpoolToVK::ComponentMapping(view_info.mapping))) {
+            out_view = view;
+        }
+    }
     out_layout = vk::ImageLayout::eGeneral;
     return true;
 }
@@ -736,6 +1065,9 @@ void Rasterizer::BBHudlessCopy(VideoCore::Image& flip) {
 void Rasterizer::BBOnDraw(u32 num_cb) {
     if (!BB::Upscale::Enabled() && !BB::Analyze::Enabled()) {
         return;
+    }
+    if (g_bb.check_pending) {
+        PollCheck(scheduler);
     }
     const auto& regs = liverpool->regs;
     std::array<BB::Upscale::Target, AmdGpu::NUM_COLOR_BUFFERS> colors{};

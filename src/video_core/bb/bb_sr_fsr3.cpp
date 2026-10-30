@@ -145,7 +145,8 @@ bool Evaluate(const Desc& desc) {
         !desc.output.image) {
         return false;
     }
-    uint32_t flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    // Auto exposure only for HDR (linear) input: on tonemapped LDR input it shifts brightness.
+    uint32_t flags = desc.hdr ? FFX_UPSCALE_ENABLE_AUTO_EXPOSURE : 0u;
     if (desc.hdr) flags |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE;
     if (desc.depth_inverted) flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
     // Infinite far always (the camera's far plane, when found, varies; a flag change recreates

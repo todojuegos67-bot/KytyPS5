@@ -125,6 +125,8 @@ struct Plan {
     Viewport viewport;
 };
 const Plan& CurrentPlan();
+// The formats of the upscale just recorded ("<input> (<colour space>) -> <output>"), for the log.
+void SetUpscaleFormats(std::string text);
 void OnInjected(bool ok, float mv_ms_unused);
 void OnGpuTime(double ms);
 void OnHudlessCopied();

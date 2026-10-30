@@ -186,9 +186,10 @@ private:
     bool bb_gb_depth_valid{};
 
     // Bloodborne upscaling (video_core/bb/bb_upscale.h, vk_rasterizer_bb.cpp).
-    bool BBInject(VideoCore::ImageId color_id, vk::ImageView& out_view,
-                  vk::ImageLayout& out_layout);
-    bool BBUpscaledView(vk::ImageView& out_view, vk::ImageLayout& out_layout) const;
+    bool BBInject(VideoCore::ImageId color_id, const VideoCore::ImageViewInfo& view_info,
+                  vk::ImageView& out_view, vk::ImageLayout& out_layout);
+    bool BBUpscaledView(const VideoCore::ImageViewInfo& view_info, vk::ImageView& out_view,
+                        vk::ImageLayout& out_layout);
     void BBHudlessCopy(VideoCore::Image& flip);
     bool BBRecordUpscale(vk::Image image, vk::ImageView view, vk::Format format,
                          vk::ImageUsageFlags usage);

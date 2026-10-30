@@ -767,8 +767,14 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
+    // (Bloodborne upscaling: the HUD composite, BBPresentComposite, reads the flip image from a
+    // compute shader, so the barrier must cover the compute stage too; without an upscaler the
+    // barrier is the official one.)
     runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
-                    vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
+                    BB::Upscale::Enabled() ? vk::PipelineStageFlagBits2::eFragmentShader |
+                                                 vk::PipelineStageFlagBits2::eComputeShader
+                                           : vk::PipelineStageFlagBits2::eFragmentShader,
+                    vk::AccessFlagBits2::eShaderRead);
     runtime.FlushBarriers();
 
     // Bloodborne upscaling to the window size: the upscaled image with the HUD on top instead.

@@ -995,12 +995,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 switch (BB::Upscale::OnSample(image.info.guest_address, image.info.size.width,
                                               image.info.size.height, image.info.pixel_format)) {
                 case BB::Upscale::Sample::Inject: {
-                    const bool ok = BBInject(image_id, bb_view, bb_layout);
+                    const bool ok = BBInject(image_id, desc.view_info, bb_view, bb_layout);
                     BB::Upscale::OnInjected(ok, 0.0f);
                     break;
                 }
                 case BB::Upscale::Sample::Redirect:
-                    BBUpscaledView(bb_view, bb_layout);
+                    BBUpscaledView(desc.view_info, bb_view, bb_layout);
                     break;
                 default:
                     break;

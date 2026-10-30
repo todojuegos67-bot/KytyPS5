@@ -189,7 +189,8 @@ bool Evaluate(const Desc& desc) {
         !desc.output.view) {
         return false;
     }
-    uint32_t flags = XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE;
+    // Auto exposure only for HDR (linear) input: on tonemapped LDR input it shifts brightness.
+    uint32_t flags = desc.hdr ? XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE : 0u;
     if (desc.depth_inverted) flags |= XESS_INIT_FLAG_INVERTED_DEPTH;
     if (!desc.hdr) flags |= XESS_INIT_FLAG_LDR_INPUT_COLOR;
     if (g_context == nullptr || g_output != desc.upscale || g_render != desc.render ||

@@ -48,6 +48,7 @@ add_host_shader(fsr.comp fsr_rcas_comp SAMPLE_RCAS=1)
 add_host_shader(post_process.frag post_process_frag)
 add_host_shader(bb_mv.comp bb_mv_comp)
 add_host_shader(bb_hud.comp bb_hud_comp)
+add_host_shader(bb_alpha.comp bb_alpha_comp)
 add_host_shader(bb_fsr4_prep.comp bb_fsr4_prep_comp)
 
 foreach(BPP IN ITEMS 8 16 32 64 96 128)

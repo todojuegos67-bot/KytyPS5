@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/bb/bb_analyze.h"
+#include "video_core/bb/bb_audio_check.h"
 #include "video_core/bb/bb_metrics.h"
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -415,6 +416,11 @@ constexpr u32 PresentMaxFails = 3;
 u32 g_present_w = 0, g_present_h = 0;
 bool g_present_dead = false;
 bool g_late_upscale = false; // no HUD point this frame: the presenter upscales the flip image
+// The last upscale's formats (SetUpscaleFormats), for the init log.
+std::string g_up_formats = "?";
+bool g_said_presented = false;
+bool g_said_nothing = false;
+u64 g_total_upscaled = 0;
 
 // the current draw
 struct DrawState {
@@ -615,7 +621,7 @@ void Checkpoint(std::string_view text) {
             std::fflush(file);
         }
     }
-    if (file != nullptr && lines < 600) {
+    if (file != nullptr && lines < 4000) {
         std::fprintf(file, "%.*s\n", static_cast<int>(text.size()), text.data());
         std::fflush(file);
     }
@@ -640,6 +646,11 @@ void PreInstance() {
     }
     done = true;
     const auto& c = Cfg();
+    // The Windows audio session check (bb_audio_check.h): with an upscaler on, or BB_AUDIO_CHECK=1.
+    if (const char* ac = Env("BB_AUDIO_CHECK");
+        ac != nullptr ? ac[0] != '0' : c.kind != SR::Kind::Off) {
+        BB::Audio::StartCheck();
+    }
     if (!g_guard_skipped.empty()) {
         Checkpoint(g_guard_skipped);
     }
@@ -1577,6 +1588,13 @@ void OnPresentResult(bool presented, std::string_view why) {
     g_eval_await_present = false;
     if (presented) {
         GuardEnd();
+        if (!g_said_presented) {
+            g_said_presented = true;
+            Checkpoint(fmt::format("upscaled {}x{} -> {}x{}, format {}, presented ({}, window-size "
+                                   "path, HUD composited on top)",
+                                   g_plan.render_w, g_plan.render_h, g_plan.output_w,
+                                   g_plan.output_h, g_up_formats, SR::KindName(Cfg().kind)));
+        }
         Checkpoint(fmt::format("{}: first upscaled frame done: {}x{} presented at the window size "
                                "{}x{} (attempt {})",
                                SR::KindName(Cfg().kind), g_plan.render_w, g_plan.render_h,
@@ -1589,6 +1607,11 @@ void OnPresentResult(bool presented, std::string_view why) {
 
 const Plan& CurrentPlan() {
     return g_plan;
+}
+
+void SetUpscaleFormats(std::string text) {
+    std::scoped_lock lk{g_mutex};
+    g_up_formats = std::move(text);
 }
 
 void OnInjected(bool ok, float) {
@@ -1722,6 +1745,16 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             GuardEnd();
             Checkpoint(fmt::format("{}: first upscaled frame done (in place, {}x{})",
                                    SR::KindName(Cfg().kind), g_output_w, g_output_h));
+            if (!g_said_presented) {
+                g_said_presented = true;
+                Checkpoint(fmt::format(
+                    "upscaled {}x{} -> {}x{}, format {}, presented ({}, in place{})",
+                    g_plan.render_w, g_plan.render_h, g_plan.output_w, g_plan.output_h,
+                    g_up_formats, SR::KindName(Cfg().kind),
+                    g_plan.render_w == g_plan.output_w && g_plan.render_h == g_plan.output_h
+                        ? ": same size, anti-aliasing only, NOT an upscale"
+                        : ""));
+            }
         } else {
             const std::string why =
                 f.inject_failed   ? "the upscale dispatch failed (see the back end's log)"
@@ -1740,6 +1773,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     }
 
     ++g_stats.frames;
+    g_total_upscaled += f.injected ? 1 : 0;
     g_stats.injected += f.injected ? 1 : 0;
     g_stats.failed += f.inject_failed ? 1 : 0;
     g_stats.flip_draws += f.flip_draws;
@@ -1805,6 +1839,30 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                      "resolution (patch) to {}x{}, or none (native 1920x1080) on this window.",
                      g_learned.render_w, g_learned.render_h, want_w, want_h, SR::KindName(c.kind),
                      SR::QualityName(c.quality), rec_w, rec_h);
+        }
+        // The periodic line in bb_upscale_init.log.
+        Checkpoint(fmt::format(
+            "[periodic] frame {}: {} upscaled {} of the last {} frames ({} in all, {} failed), "
+            "{}x{} -> {}x{} ({}), window {}x{}, game output {}x{}, GPU {:.2f} ms",
+            g_frame_no, SR::KindName(c.kind), g_stats.injected, g_stats.frames, g_total_upscaled,
+            g_stats.failed, g_plan.render_w, g_plan.render_h, g_plan.output_w, g_plan.output_h,
+            to_window ? "window-size" : "in place", g_present_w, g_present_h, g_output_w,
+            g_output_h, g_stats.gpu_samples ? g_stats.gpu_ms_sum / g_stats.gpu_samples : 0.0));
+        // Nothing to upscale: the game already renders at (or above) the window size.
+        if (!g_said_nothing && Active() && g_learned.render_w != 0 && g_present_w != 0 &&
+            g_learned.render_w >= g_present_w && g_learned.render_h >= g_present_h) {
+            g_said_nothing = true;
+            Checkpoint(fmt::format(
+                "WARNING: NOTHING TO UPSCALE: the game renders its 3D at {}x{} and the window "
+                "(swapchain) is {}x{}: {} runs as anti-aliasing only. For a real upscale set the "
+                "Resolution Patch below the window, e.g. {}x{} ({}), or make the window larger "
+                "(DSR 3840x2160 in exclusive fullscreen).",
+                g_learned.render_w, g_learned.render_h, g_present_w, g_present_h,
+                SR::KindName(c.kind),
+                static_cast<u32>(std::lround(g_present_w / (ratio < 1.01 ? 1.5 : ratio))),
+                static_cast<u32>(std::lround(g_present_h / (ratio < 1.01 ? 1.5 : ratio))),
+                ratio < 1.01 ? "the native AA mode never upscales; quality = window / 1.5"
+                             : SR::QualityName(c.quality)));
         }
         g_stats = {};
     }

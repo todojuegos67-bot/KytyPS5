@@ -395,7 +395,8 @@ bool Evaluate(const Desc& desc) {
         options.outputWidth = desc.upscale.width;
         options.outputHeight = desc.upscale.height;
         options.colorBuffersHDR = desc.hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-        options.useAutoExposure = sl::Boolean::eTrue;
+        // Auto exposure only for HDR (linear) input: on tonemapped LDR input it shifts brightness.
+        options.useAutoExposure = desc.hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
         if (const char* preset = std::getenv("BB_DLSS_PRESET");
             preset != nullptr && *preset >= 'A' && *preset <= 'O') {
             const auto value = static_cast<sl::DLSSPreset>(*preset - 'A' + 1);
