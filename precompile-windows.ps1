@@ -373,6 +373,7 @@ if (!$Quick) {
 # shards make (a third of them) is compiled once.
 $env:KYTY_PRECOMPILE_CLAIMS = Join-Path $nvidiaCaches 'claims'
 $running = @{}
+$retries = @{}
 $finished = 0
 $split = 0
 $shown = Get-Date
@@ -435,7 +436,16 @@ while ($first.Count -or $second.Count -or $running.Count) {
 			$queue.Enqueue(@($seedFile, "$($i + $n)/$(2 * $n)"))
 			$split++
 		} elseif ($process.ExitCode -ne 0) {
-			throw "$name failed; logs: $logName"
+			# (retry-1030) A shard that dies (the driver under many compiling processes at once) runs again, with one
+			# process fewer from then on; only its 4th failure stops the run (what finished is kept for the next run).
+			$tries = 1 + [int]$retries[$name]
+			$retries[$name] = $tries
+			if ($tries -ge 4) { throw "$name failed $tries times; logs: $logName" }
+			$Jobs = [math]::Max(1, $Jobs - 1)
+			Write-Host "  $name failed (exit $($process.ExitCode), try $tries); again with $Jobs processes"
+			$queue = $second
+			if ($seedFile -eq $Recorded) { $queue = $first }
+			$queue.Enqueue(@($seedFile, $shard))
 		} else {
 			$finished++
 		}

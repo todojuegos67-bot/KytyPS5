@@ -1039,7 +1039,7 @@ $btnPre.Add_Click({
 	# (water-1030) Todos los hilos de la CPU o modo relajado (la mitad de la CPU a prioridad minima, el -Gentle de antes):
 	# se pregunta la primera vez y se guarda en launcher.ini (precompilehilos=todos/relajado); se cambia en Settings.
 	$hilos = Get-IniValue 'precompilehilos' ''
-	if ($hilos -ne 'todos' -and $hilos -ne 'relajado') {
+	if ($true) { # (1030b) asked every time: max threads or relaxed
 		$r = [System.Windows.Forms.MessageBox]::Show("$([char]0xBF)Usar todos los hilos de la CPU para precompilar m$([char]0xE1)s r$([char]0xE1)pido? (S$([char]0xED) = m$([char]0xE1)xima velocidad, el PC ir$([char]0xE1) cargado; No = modo relajado)", 'Precompilar shaders', 'YesNoCancel', 'Question')
 		if ($r -eq 'Cancel') { return }
 		$hilos = if ($r -eq 'Yes') { 'todos' } else { 'relajado' }
@@ -1670,8 +1670,8 @@ function Start-UpdateVersion([switch]$Startup) {
 	finally { $form.Cursor = 'Default' } }
 	$dCur = if ($cur -match '(20\d{6})') { $Matches[1] } else { '' }
 	$dRel = if ($rel.Tag -match '(20\d{6})') { $Matches[1] } else { '' }
-	if ($Startup -and (($cur -and $cur -eq $rel.Tag -or ($dCur -and $dRel -and $dCur -ge $dRel)))) { return }
-	if ($cur -and $cur -ne $rel.Tag -and $dCur -and $dRel -and $dCur -ge $dRel) {
+	if ($Startup -and (($cur -and $cur -eq $rel.Tag -or ($dCur -and $dRel -and $dCur -gt $dRel)))) { return }
+	if ($cur -and $cur -ne $rel.Tag -and $dCur -and $dRel -and $dCur -gt $dRel) {
 		[System.Windows.Forms.MessageBox]::Show((UT 'Version instalada: ' 'Installed version: ') + $cur + "`n" + (UT 'Ultima release en GitHub: ' 'Latest GitHub release: ') + $rel.Tag + "`n`n" + (UT 'Tu version es igual o mas nueva. No hace falta actualizar.' 'Your version is the same or newer. No update needed.'), $t, 'OK', 'Information') | Out-Null; return
 	}
 	if ($cur -and $cur -eq $rel.Tag) {
