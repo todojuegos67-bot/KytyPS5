@@ -1671,7 +1671,7 @@ function Start-UpdateVersion([switch]$Startup) {
 	finally { $form.Cursor = 'Default' } }
 	$dCur = if ($cur -match '(20\d{6})') { $Matches[1] } else { '' }
 	$dRel = if ($rel.Tag -match '(20\d{6})') { $Matches[1] } else { '' }
-	if ($Startup -and (($cur -and $cur -eq $rel.Tag -or ($dCur -and $dRel -and $dCur -ge $dRel))) { return }
+	if ($Startup -and (($cur -and $cur -eq $rel.Tag -or ($dCur -and $dRel -and $dCur -ge $dRel)))) { return }
 	if ($cur -and $cur -ne $rel.Tag -and $dCur -and $dRel -and $dCur -ge $dRel) {
 		[System.Windows.Forms.MessageBox]::Show((UT 'Version instalada: ' 'Installed version: ') + $cur + "`n" + (UT 'Ultima release en GitHub: ' 'Latest GitHub release: ') + $rel.Tag + "`n`n" + (UT 'Tu version es igual o mas nueva. No hace falta actualizar.' 'Your version is the same or newer. No update needed.'), $t, 'OK', 'Information') | Out-Null; return
 	}
