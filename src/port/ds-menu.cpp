@@ -713,6 +713,63 @@ void OpenCheck() {
 	StartWorker(CheckWork);
 }
 
+// (ds-pc-port17) At start: a silent check; a newer published port version shows a notice right away (update or later).
+std::atomic<bool> g_notice_ready {false};
+bool              g_notice_done = false;
+std::string       g_notice_text;
+
+void StartupCheck() {
+#if defined(_WIN32)
+	static std::once_flag once;
+	std::call_once(once, [] {
+		std::thread([] {
+			Update::Release r;
+			std::string     error;
+			if (!Update::CheckLatest(&r, &error)) return;
+			const std::string cur = Update::CurrentVersion();
+			const std::string dc = Update::TagDate(cur), dr = Update::TagDate(r.tag);
+			if (r.tag == cur || (!dc.empty() && !dr.empty() && dc >= dr)) return;
+			{
+				std::scoped_lock lock(g_upd.mutex);
+				if (g_upd.busy.load()) return;
+				g_upd.release = r;
+				g_notice_text = std::string(I18n::T("Hay una version nueva: ")) + (r.name.empty() ? r.tag : r.name + " (" + r.tag + ")") +
+				                I18n::T(". Tienes: ") + cur + ".";
+			}
+			g_notice_ready = true;
+			Bump();
+		}).detach();
+	});
+#endif
+}
+
+void UpdateNotice(float width, float height) {
+	if (g_notice_done || !g_notice_ready.load()) return;
+	std::string text;
+	{
+		std::scoped_lock lock(g_upd.mutex);
+		text = g_notice_text;
+	}
+	ImGui::SetNextWindowPos({width * 0.5f, height * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
+	ImGui::SetNextWindowSize({std::min(width - 32.0f, 620.0f * g_unit), 0});
+	ImGui::Begin("##update-notice", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+	                                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+	ImGui::SetWindowFocus();
+	ImGui::PushTextWrapPos(0.0f);
+	ImGui::TextUnformatted(text.c_str());
+	ImGui::PopTextWrapPos();
+	ImGui::Spacing();
+	if (ImGui::Button(I18n::T("Actualizar ahora"), {220 * g_unit, 40 * g_unit})) {
+		g_notice_done = true;
+		g_tab_request = 4;
+		SetUpd(UpdateUi::Working, "Descargando...");
+		StartWorker(InstallWork);
+	}
+	ImGui::SameLine();
+	if (ImGui::Button(I18n::T("Mas tarde"), {160 * g_unit, 40 * g_unit})) g_notice_done = true;
+	ImGui::End();
+}
+
 // (10-27b) The start menu's shader block: the static precompile's state, its progress bar and its button.
 void DrawShaderBlock(float unit) {
 	const auto v = Precompile::State();
@@ -2937,6 +2994,15 @@ void DrawLauncher(float width, float height) {
 		ImGui::PopStyleVar();
 		ImGui::End();
 	}
+
+	// (ds-pc-port17) The installed version, always visible (bottom left), and the startup update notice.
+	{
+		char ver[256];
+		std::snprintf(ver, sizeof(ver), I18n::T("Version instalada: %s"), Update::CurrentVersion());
+		bg->AddText({U(12), height - U(26)}, IM_COL32(220, 214, 200, 230), ver);
+	}
+	StartupCheck();
+	UpdateNotice(width, height);
 
 	g_popup = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
 	if (ctx.ColorStack.Size > colors_before) ImGui::PopStyleColor(ctx.ColorStack.Size - colors_before);
