@@ -83,6 +83,24 @@ struct BBVk {
     u64 upscales = 0;
     std::string check_what;
     vk::Format present_src_format = vk::Format::eUndefined; // the flip image present_in copies
+    // present_in holds sRGB-encoded (perceptual) LDR values: the upscaler is given and returns
+    // encoded colour, the HUD composite decodes it (bb_hud.comp flag 1).
+    bool present_encoded = false;
+    u64 composites = 0;
+    // The luminance self-check of the presented image (bb_hud.comp flag 2, frame 120).
+    vk::Buffer lum_buffer{};
+    VmaAllocation lum_allocation{};
+    void* lum_mapped = nullptr;
+    u64 lum_tick = 0;
+    bool lum_pending = false;
+    // Per-stage GPU timestamps of the window-size path: 4 frames x 8 stamps
+    // (0 copy, 1 MV + upscaler, 2 upscaler end, 3 alpha end, 4 composite, 5 composite end,
+    // 6 present pass end).
+    vk::QueryPool stage_queries{};
+    u32 stage_slot = 0;
+    bool stage_active = false;
+    std::array<bool, 4> stage_pending{};
+    std::array<u8, 4> stage_written{}; // bit mask of the written stamps
     std::vector<std::pair<u64, vk::ImageView>> transient_views;
 };
 BBVk g_bb;
@@ -234,13 +252,65 @@ bool InitOnce(const Instance& instance) {
     g_bb.mv_pipeline = pipeline;
     g_bb.nearest = sampler;
     g_bb.queries = query_result == vk::Result::eSuccess ? queries : vk::QueryPool{};
+    {
+        auto [stage_result, stage_pool] = device.createQueryPool(vk::QueryPoolCreateInfo{
+            .queryType = vk::QueryType::eTimestamp,
+            .queryCount = 32,
+        });
+        g_bb.stage_queries = stage_result == vk::Result::eSuccess ? stage_pool : vk::QueryPool{};
+    }
     g_bb.timestamp_period_ns =
         instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
     g_bb.init = true;
     return true;
 }
 
+void Stamp(vk::CommandBuffer cmd, u32 index) {
+    if (!g_bb.stage_active) {
+        return;
+    }
+    cmd.writeTimestamp2(index == 0 ? vk::PipelineStageFlagBits2::eTopOfPipe
+                                   : vk::PipelineStageFlagBits2::eBottomOfPipe,
+                        g_bb.stage_queries, g_bb.stage_slot * 8 + index);
+    g_bb.stage_written[g_bb.stage_slot] |= static_cast<u8>(1u << index);
+}
+
+void ReadStageTimestamps() {
+    if (!g_bb.stage_queries) {
+        return;
+    }
+    for (u32 slot = 0; slot < g_bb.stage_pending.size(); ++slot) {
+        if (!g_bb.stage_pending[slot] || (g_bb.stage_active && slot == g_bb.stage_slot)) {
+            continue;
+        }
+        std::array<u64, 14> data{};
+        const auto result = g_bb.device.getQueryPoolResults(
+            g_bb.stage_queries, slot * 8, 7, sizeof(data), data.data(), sizeof(u64) * 2,
+            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+        const u8 mask = g_bb.stage_written[slot];
+        bool ready = result == vk::Result::eSuccess;
+        for (u32 i = 0; i < 7 && ready; ++i) {
+            ready = !(mask & (1u << i)) || data[i * 2 + 1] != 0;
+        }
+        if (!ready) {
+            continue;
+        }
+        g_bb.stage_pending[slot] = false;
+        // Every stage needs its two ends; a missing stage counts 0 (alpha skipped, say).
+        const auto t = [&](u32 a, u32 b) {
+            if (!(mask & (1u << a)) || !(mask & (1u << b)) || data[b * 2] < data[a * 2]) {
+                return 0.0;
+            }
+            return static_cast<double>(data[b * 2] - data[a * 2]) * g_bb.timestamp_period_ns /
+                   1e6;
+        };
+        const double ms[BB::Upscale::kStages]{t(0, 1), t(1, 2), t(2, 3), t(4, 5), t(5, 6)};
+        BB::Upscale::OnStageTimes(ms);
+    }
+}
+
 void ReadTimestamps() {
+    ReadStageTimestamps();
     if (!g_bb.queries) {
         return;
     }
@@ -288,12 +358,13 @@ bool InitHud() {
     }
     g_bb.hud_failed = true;
     const auto device = g_bb.device;
-    std::array<vk::DescriptorSetLayoutBinding, 4> bindings{};
+    std::array<vk::DescriptorSetLayoutBinding, 5> bindings{};
     for (u32 i = 0; i < bindings.size(); ++i) {
         bindings[i] = vk::DescriptorSetLayoutBinding{
             .binding = i,
-            .descriptorType = i < 3 ? vk::DescriptorType::eCombinedImageSampler
-                                    : vk::DescriptorType::eStorageImage,
+            .descriptorType = i < 3    ? vk::DescriptorType::eCombinedImageSampler
+                              : i == 3 ? vk::DescriptorType::eStorageImage
+                                       : vk::DescriptorType::eStorageBuffer,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         };
@@ -610,6 +681,38 @@ void RecordCheck(Scheduler& scheduler, vk::CommandBuffer cmd, vk::Extent2D outpu
     g_bb.check_what = what;
 }
 
+// The luminance self-check (frame 120): the mean Rec.709 luminance of a 64x64 grid of the game's
+// presented image (the flip as the presenter would read it natively) and of what we present in
+// its place, both in the linear space the presenter's post process encodes once. More than 5 %
+// apart is a colour / gamma error (double encode, missing decode), not upscaling detail.
+void PollLuminance(Scheduler& scheduler) {
+    if (!g_bb.lum_pending || !scheduler.IsFree(g_bb.lum_tick)) {
+        return;
+    }
+    g_bb.lum_pending = false;
+    vmaInvalidateAllocation(g_bb.allocator, g_bb.lum_allocation, 0, VK_WHOLE_SIZE);
+    const auto* v = static_cast<const u32*>(g_bb.lum_mapped);
+    const u32 n = v[2];
+    if (n == 0) {
+        BB::Upscale::Checkpoint("WARNING: luminance self-check: no grid point was sampled");
+        return;
+    }
+    const double src = v[0] / 65536.0 / n, out = v[1] / 65536.0 / n;
+    const double diff = src > 1e-4 ? std::fabs(out - src) / src : std::fabs(out - src);
+    const std::string text = fmt::format(
+        "luminance self-check (frame 120, {} grid points of 64x64): game's presented image "
+        "{:.4f}, our presented output {:.4f}, {:+.1f} %{}",
+        n, src, out, src > 1e-4 ? (out - src) / src * 100.0 : 0.0,
+        g_bb.present_encoded ? " (upscaler on sRGB-encoded LDR)" : " (upscaler on linear)");
+    if (diff > 0.05) {
+        LOG_WARNING(Render_Vulkan, "[BB_UPSCALE] WARNING: {} - colour / gamma mismatch", text);
+        BB::Upscale::Checkpoint("WARNING: " + text + " - colour / gamma mismatch");
+    } else {
+        LOG_INFO(Render_Vulkan, "[BB_UPSCALE] {}: ok", text);
+        BB::Upscale::Checkpoint(text + ": ok");
+    }
+}
+
 } // namespace
 
 bool Rasterizer::BBInject(VideoCore::ImageId color_id, const VideoCore::ImageViewInfo& view_info,
@@ -641,6 +744,16 @@ bool Rasterizer::BBInject(VideoCore::ImageId color_id, const VideoCore::ImageVie
     return BBUpscaledView(view_info, out_view, out_layout);
 }
 
+void Rasterizer::BBStampPresentEnd(vk::CommandBuffer cmd) {
+    if (!g_bb.stage_active) {
+        return;
+    }
+    Stamp(cmd, 6);
+    g_bb.stage_pending[g_bb.stage_slot] = true;
+    g_bb.stage_active = false;
+    g_bb.stage_slot = (g_bb.stage_slot + 1) % g_bb.stage_pending.size();
+}
+
 const char* Rasterizer::BBPresentWhy() {
     return g_bb.present_why;
 }
@@ -669,16 +782,38 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
         return false;
     }
     const vk::Extent2D extent{flip.info.size.width, flip.info.size.height};
-    if (!EnsureImage(g_bb.present_in, extent, vk::Format::eR16G16B16A16Sfloat,
+    // The upscaler's colour space. An LDR (8-bit sRGB) flip: the back ends (FSR 4, FSR 3, XeSS,
+    // DLSS, all run without their HDR flag) are given the perceptual, sRGB-encoded values they
+    // are made for in LDR mode: the flip's bytes copied raw into its UNORM twin. Linear values
+    // in an LDR-flagged upscale do not come back as the game's image (dark tones lifted, washed
+    // out). The HUD composite decodes the result to linear for the presenter. BB_SR_LDR_LINEAR=1
+    // keeps the old linear RGBA16F input (A/B). HDR / UNORM / float flips: the blit into RGBA16F
+    // keeps what the flip's view reads (linear float, or already-encoded UNORM).
+    static const bool ldr_linear = [] {
+        const char* v = std::getenv("BB_SR_LDR_LINEAR");
+        return v != nullptr && *v == '1';
+    }();
+    const bool encoded = IsSrgb(flip.info.pixel_format) && !plan.hdr && !ldr_linear;
+    const vk::Format in_format =
+        encoded ? Unorm(flip.info.pixel_format) : vk::Format::eR16G16B16A16Sfloat;
+    if (!EnsureImage(g_bb.present_in, extent, in_format,
                      vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled)) {
-        g_bb.present_why = "the RGBA16F input image could not be created";
+        g_bb.present_why = "the upscaler input image could not be created";
         return false;
     }
+    g_bb.present_encoded = encoded;
     scheduler.EndRendering();
     runtime.Transit(&flip, vk::ImageLayout::eTransferSrcOptimal,
                     vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
     runtime.FlushBarriers();
     const auto cmd = scheduler.CommandBuffer();
+    // The per-stage timestamps of this frame (read back a few frames later).
+    g_bb.stage_active = g_bb.stage_queries && !g_bb.stage_pending[g_bb.stage_slot];
+    if (g_bb.stage_active) {
+        cmd.resetQueryPool(g_bb.stage_queries, g_bb.stage_slot * 8, 8);
+        g_bb.stage_written[g_bb.stage_slot] = 0;
+    }
+    Stamp(cmd, 0);
     Barrier(cmd, g_bb.present_in, vk::ImageLayout::eTransferDstOptimal,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
@@ -691,11 +826,24 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
         .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
         .dstOffsets = corners,
     };
-    cmd.blitImage(flip.GetImage(), vk::ImageLayout::eTransferSrcOptimal, g_bb.present_in.image,
-                  vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+    if (encoded) {
+        // Same size class (sRGB and its UNORM twin): the raw bytes, no decode.
+        const vk::ImageCopy copy{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .extent = {extent.width, extent.height, 1},
+        };
+        cmd.copyImage(flip.GetImage(), vk::ImageLayout::eTransferSrcOptimal, g_bb.present_in.image,
+                      vk::ImageLayout::eTransferDstOptimal, copy);
+    } else {
+        cmd.blitImage(flip.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+                      g_bb.present_in.image, vk::ImageLayout::eTransferDstOptimal, blit,
+                      vk::Filter::eNearest);
+    }
     Barrier(cmd, g_bb.present_in, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    Stamp(cmd, 1);
     g_bb.present_src_format = flip.info.pixel_format;
     if (!BBRecordUpscale(g_bb.present_in.image, g_bb.present_in.view, g_bb.present_in.format,
                          g_bb.present_in.usage)) {
@@ -743,19 +891,54 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
         BB::Upscale::OnPresentFailed(g_bb.present_why);
         return false;
     }
+    // The luminance self-check buffer (bound every frame, written on frame 120 only).
+    if (!g_bb.lum_buffer) {
+        const VkBufferCreateInfo ci = vk::BufferCreateInfo{
+            .size = 16,
+            .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+        };
+        VmaAllocationCreateInfo alloc{};
+        alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VkBuffer buffer{};
+        VmaAllocationInfo info{};
+        if (vmaCreateBuffer(g_bb.allocator, &ci, &alloc, &buffer, &g_bb.lum_allocation, &info) !=
+            VK_SUCCESS) {
+            g_bb.present_why = "the self-check buffer was not created";
+            return false;
+        }
+        g_bb.lum_buffer = buffer;
+        g_bb.lum_mapped = info.pMappedData;
+    }
+    PollLuminance(scheduler);
+    ++g_bb.composites;
+    const bool measure = g_bb.composites == 120 && !g_bb.lum_pending;
+    if (measure) {
+        cmd.fillBuffer(g_bb.lum_buffer, 0, 16, 0);
+        const vk::MemoryBarrier2 fill{
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+        };
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &fill});
+    }
+    Stamp(cmd, 4);
     Barrier(cmd, g_bb.present, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
             vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader,
             vk::AccessFlagBits2::eShaderWrite);
     struct {
         u32 size[4];
     } push{{output.width, output.height,
-            IsSrgb(view_format) && !IsSrgb(flip.info.pixel_format) ? 1u : 0u, 0u}};
+            IsSrgb(view_format) && !IsSrgb(flip.info.pixel_format) ? 1u : 0u,
+            (g_bb.present_encoded ? 1u : 0u) | (measure ? 2u : 0u)}};
     const vk::DescriptorImageInfo up_info{g_bb.linear, g_bb.output.view, vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo final_info{g_bb.linear, final_view,
                                              vk::ImageLayout::eShaderReadOnlyOptimal};
     const vk::DescriptorImageInfo bare_info{g_bb.linear, g_bb.present_in.view,
                                             vk::ImageLayout::eShaderReadOnlyOptimal};
     const vk::DescriptorImageInfo out_info{{}, g_bb.present.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorBufferInfo lum_info{g_bb.lum_buffer, 0, 16};
     const std::array writes{
         vk::WriteDescriptorSet{
             .dstBinding = 0,
@@ -781,6 +964,12 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
             .descriptorType = vk::DescriptorType::eStorageImage,
             .pImageInfo = &out_info,
         },
+        vk::WriteDescriptorSet{
+            .dstBinding = 4,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &lum_info,
+        },
     };
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_bb.hud_pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bb.hud_layout, 0, writes);
@@ -789,14 +978,29 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
     Barrier(cmd, g_bb.present, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    Stamp(cmd, 5);
+    if (measure) {
+        const vk::MemoryBarrier2 host{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &host});
+        g_bb.lum_tick = scheduler.CurrentTick();
+        g_bb.lum_pending = true;
+    }
     static bool said = false;
     if (!said) {
         said = true;
         LOG_INFO(Render_Vulkan,
                  "[BB_UPSCALE] presenting the upscaled image {}x{} (game output {}x{}, HUD added "
-                 "on top{})",
+                 "on top{}{})",
                  output.width, output.height, render.width, render.height,
-                 push.size[2] ? ", sRGB decoded for the presenter" : "");
+                 push.size[2] ? ", sRGB decoded for the presenter" : "",
+                 g_bb.present_encoded ? ", upscaler ran on sRGB-encoded LDR, decoded to linear "
+                                        "once here; the presenter encodes once"
+                                      : "");
     }
     out_view = g_bb.present.view;
     out_size = output;
@@ -949,6 +1153,10 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     }
 #endif
     const bool ok = BB::Upscale::RunBackend(desc);
+    const bool present_path = color_image == g_bb.present_in.image;
+    if (present_path) {
+        Stamp(cmd, 2);
+    }
     // The back ends bind their own pipelines and descriptors; the game's next draw binds its own.
     Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral,
             vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eAllTransfer,
@@ -957,7 +1165,9 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     if (ok) {
         ++g_bb.upscales;
         // The source's alpha back into the output, non-finite colour cleared (bb_alpha.comp).
-        if (InitAlpha()) {
+        // Not on the window-size path: the presenter reads no alpha (its view maps alpha to
+        // one) and the HUD composite clears non-finite colour itself: a 4K read + write saved.
+        if (!present_path && InitAlpha()) {
             Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral,
                     vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
                     vk::PipelineStageFlagBits2::eComputeShader,
@@ -995,8 +1205,16 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
         const bool copy = color_image == g_bb.present_in.image;
         const vk::Format src = copy ? g_bb.present_src_format : color_format;
         const std::string formats = fmt::format(
-            "{}{} ({}, {} flag) -> {}", copy ? "RGBA16F copy of " : "", vk::to_string(src),
-            ColourSpace(src), plan.hdr ? "HDR" : "LDR", vk::to_string(g_bb.output.format));
+            "{}{} ({}, {} flag) -> {}{}",
+            !copy                  ? ""
+            : g_bb.present_encoded ? "raw UNORM copy of "
+                                   : "RGBA16F copy of ",
+            vk::to_string(src),
+            copy && g_bb.present_encoded ? "sRGB-encoded perceptual values, as LDR upscalers take"
+                                         : ColourSpace(src),
+            plan.hdr ? "HDR" : "LDR", vk::to_string(g_bb.output.format),
+            copy && g_bb.present_encoded ? " (sRGB-encoded, decoded once in the HUD composite)"
+                                         : "");
         if (g_bb.upscales == 1) {
             BB::Upscale::SetUpscaleFormats(formats);
         }

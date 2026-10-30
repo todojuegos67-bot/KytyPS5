@@ -54,6 +54,8 @@ public:
     // Copies the presented image (before its HUD) and records the window-size upscale of it.
     bool BBPresentUpscale(VideoCore::Image& flip);
     static const char* BBPresentWhy();
+    // Bloodborne: the end of the presenter's pass, the last per-stage GPU timestamp.
+    static void BBStampPresentEnd(vk::CommandBuffer cmd);
 
     void Draw(bool is_indexed, u32 index_offset = 0);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,

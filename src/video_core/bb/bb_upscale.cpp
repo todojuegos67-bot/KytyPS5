@@ -387,6 +387,10 @@ struct Stats {
     u32 gpu_samples = 0;
     u64 flip_draws = 0, hud_draws = 0, hud_other = 0, src_rewrites = 0, hudless = 0;
     u64 camera_frames = 0;
+    double stage_ms[kStages]{};
+    u32 stage_samples = 0;
+    u32 big_w = 0, big_h = 0; // the largest colour target drawn (render-size check)
+    u64 big_draws = 0;        // draws into a colour target larger than the upscaler's input
 };
 
 std::mutex g_mutex;
@@ -1158,6 +1162,15 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
         g_draw.colors[i] = colors[i];
         if (colors[i].addr != 0) ++mrt;
         if (IsFlip(colors[i].addr)) g_draw.targets_flip = true;
+        const u64 area = u64(colors[i].width) * colors[i].height;
+        if (colors[i].addr != 0 && area > u64(g_stats.big_w) * g_stats.big_h) {
+            g_stats.big_w = colors[i].width;
+            g_stats.big_h = colors[i].height;
+        }
+        if (colors[i].addr != 0 && g_plan.render_w != 0 &&
+            (colors[i].width > g_plan.render_w || colors[i].height > g_plan.render_h)) {
+            ++g_stats.big_draws;
+        }
     }
     g_draw.has_depth = depth != nullptr && depth->addr != 0;
     if (g_draw.has_depth) g_draw.depth = *depth;
@@ -1633,6 +1646,12 @@ void OnGpuTime(double ms) {
     ++g_stats.gpu_samples;
 }
 
+void OnStageTimes(const double (&ms)[kStages]) {
+    std::scoped_lock lk{g_mutex};
+    for (u32 i = 0; i < kStages; ++i) g_stats.stage_ms[i] += ms[i];
+    ++g_stats.stage_samples;
+}
+
 bool Jitter(float& x, float& y) {
     if (!Active() || !Cfg().jitter) {
         return false;
@@ -1844,11 +1863,22 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         // The periodic line in bb_upscale_init.log.
         Checkpoint(fmt::format(
             "[periodic] frame {}: {} upscaled {} of the last {} frames ({} in all, {} failed), "
-            "{}x{} -> {}x{} ({}), window {}x{}, game output {}x{}, GPU {:.2f} ms{}",
+            "{}x{} -> {}x{} ({}), window {}x{}, game output {}x{}, GPU {:.2f} ms{}{}",
             g_frame_no, SR::KindName(c.kind), g_stats.injected, g_stats.frames, g_total_upscaled,
             g_stats.failed, g_plan.render_w, g_plan.render_h, g_plan.output_w, g_plan.output_h,
             to_window ? "window-size" : "in place", g_present_w, g_present_h, g_output_w,
             g_output_h, g_stats.gpu_samples ? g_stats.gpu_ms_sum / g_stats.gpu_samples : 0.0,
+            [&] {
+                const double n = g_stats.stage_samples ? g_stats.stage_samples : 1.0;
+                const auto& t = g_stats.stage_ms;
+                return fmt::format(
+                    " (stages ms: copy {:.2f}, MV+upscaler {:.2f}, alpha {:.2f}, HUD composite "
+                    "{:.2f}, present pass {:.2f}; total {:.2f}; {} samples); largest colour "
+                    "target {}x{}, {} draws into targets larger than {}x{}",
+                    t[0] / n, t[1] / n, t[2] / n, t[3] / n, t[4] / n,
+                    (t[0] + t[1] + t[2] + t[3] + t[4]) / n, g_stats.stage_samples, g_stats.big_w,
+                    g_stats.big_h, g_stats.big_draws, g_plan.render_w, g_plan.render_h);
+            }(),
             g_learned.render_w == 0
                 ? "; no 3D scene drawn yet (no depth + 3-target G-buffer pass: title screen, "
                   "menu or loading), nothing to upscale until gameplay"

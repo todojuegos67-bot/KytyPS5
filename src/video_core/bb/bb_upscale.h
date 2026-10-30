@@ -129,6 +129,9 @@ const Plan& CurrentPlan();
 void SetUpscaleFormats(std::string text);
 void OnInjected(bool ok, float mv_ms_unused);
 void OnGpuTime(double ms);
+// Per-stage GPU ms of the window-size path (copy, MV + upscaler, alpha, HUD composite, present).
+constexpr u32 kStages = 5;
+void OnStageTimes(const double (&ms)[kStages]);
 void OnHudlessCopied();
 
 // ---- Upscaling to the window size ----
