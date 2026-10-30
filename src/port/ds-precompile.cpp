@@ -182,8 +182,8 @@ void Work() {
 	// (a 9950X3D: 8 x 4 = 32), still one starting at a time and each only with the free memory below.
 	const bool all_cpu    = g_all_threads;
 	const int  logical    = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
-	const int threads     = all_cpu ? 4 : 2;
-	int       jobs        = all_cpu ? std::max(1, (logical + 3) / 4) : std::clamp(g_setup.cpus / 8, 1, 4);
+	const int threads     = 2; // (port25) the driver's compile scales by processes, not threads: more of them, 2 threads each
+	int       jobs        = all_cpu ? std::max(1, logical / 2) : std::clamp(g_setup.cpus / 8, 1, 4);
 	std::printf("[port] precompile: %s, %d processes of %d threads at most\n", all_cpu ? "all CPU threads" : "relaxed", jobs, threads);
 	std::fflush(stdout);
 	const auto memory_ok  = [] {
@@ -261,7 +261,7 @@ void Work() {
 				break;
 			}
 			// (One starting at a time: 4 s apart.)
-			if (!running.empty() && std::chrono::steady_clock::now() - last_start < std::chrono::seconds(4)) break;
+			if (!running.empty() && std::chrono::steady_clock::now() - last_start < std::chrono::milliseconds(all_cpu ? 500 : 4000)) break;
 			last_start = std::chrono::steady_clock::now();
 			const int i = pending.front();
 			pending.pop_front();
