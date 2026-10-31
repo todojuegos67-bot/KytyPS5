@@ -3765,6 +3765,10 @@ vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& fi
 		} else {
 			file.Close();
 			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
+			// (As the branches above: a cache the game cannot load is not warmed any more. Kept, the launcher took it for
+			// complete at every start and never precompiled again, and the game compiled every pipeline in play.)
+			std::error_code done_error;
+			std::filesystem::remove(StaticDonePath(file_path), done_error);
 		}
 	}
 
@@ -3776,6 +3780,8 @@ vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& fi
 	if (result != vk::Result::eSuccess && !initial_data.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: driver rejected {} ({}); starting empty", path,
 		                 vk::to_string(result));
+		std::error_code done_error;
+		std::filesystem::remove(StaticDonePath(file_path), done_error); // (the launcher precompiles it again)
 		initial_data.clear();
 		create.initialDataSize = 0;
 		create.pInitialData    = nullptr;
