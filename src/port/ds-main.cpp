@@ -631,6 +631,31 @@ void RestartIfAsked() {
 	}
 }
 
+// (ds-pc-port29) A crash leaves logs\crash-<time>.txt: the exception code, the faulting module and its offset.
+std::wstring g_crash_dir;
+LONG WINAPI PortCrashFilter(EXCEPTION_POINTERS* info) {
+	const DWORD code = info != nullptr && info->ExceptionRecord != nullptr ? info->ExceptionRecord->ExceptionCode : 0;
+	void*       addr = info != nullptr && info->ExceptionRecord != nullptr ? info->ExceptionRecord->ExceptionAddress : nullptr;
+	HMODULE     mod  = nullptr;
+	wchar_t     name[MAX_PATH] = L"?";
+	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(addr), &mod) &&
+	    mod != nullptr)
+		GetModuleFileNameW(mod, name, MAX_PATH);
+	const unsigned long long off = mod != nullptr ? reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(mod) : 0;
+	SYSTEMTIME t;
+	GetLocalTime(&t);
+	wchar_t file[MAX_PATH + 64];
+	swprintf(file, MAX_PATH + 64, L"%ls\\crash-%04u%02u%02u-%02u%02u%02u.txt", g_crash_dir.c_str(), t.wYear, t.wMonth, t.wDay, t.wHour,
+	         t.wMinute, t.wSecond);
+	if (FILE* f = _wfopen(file, L"w"); f != nullptr) {
+		std::fwprintf(f, L"exception 0x%08lx at %p\nmodule %ls + 0x%llx\n", code, addr, name, off);
+		std::fclose(f);
+	}
+	std::printf("[port] crash: exception 0x%08lx in %ls + 0x%llx\n", code, name, off);
+	std::fflush(stdout);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
 } // namespace
 
 namespace Port {
@@ -656,7 +681,13 @@ int main(int argc, char* argv[]) {
 	// (10-27) What an update left: the exe and the DLLs that were running then, renamed to .old.
 	const int olds = Port::Update::RemoveOldFiles(root);
 	fs::create_directories(root / L"logs", ec);
-	const bool restarted = argc > 1 && std::string(argv[1]) == "--restarted";
+	g_crash_dir = (root / L"logs").wstring();
+	SetUnhandledExceptionFilter(PortCrashFilter);
+	// (ds-pc-port29) --fg-relaunch: the game in a fresh process after the launcher (DLSS frame generation, see below).
+	bool fg_relaunch = false;
+	for (int i = 1; i < argc; i++)
+		if (std::string(argv[i]) == "--fg-relaunch") fg_relaunch = true;
+	const bool restarted = (argc > 1 && std::string(argv[1]) == "--restarted") || fg_relaunch;
 	// (10-28b) The launcher: --sin-lanzador (or --no-launcher) skips it this time, --lanzador shows it this time.
 	bool skip_launcher = false, force_launcher = false;
 	for (int i = 1; i < argc; i++) {
@@ -693,6 +724,10 @@ int main(int argc, char* argv[]) {
 	if (_wfreopen(Wide(log_err).c_str(), L"w", stderr) != nullptr)
 		SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stderr))));
 	SetEnv("KYTY_RUN_LOG", log_out);
+	// (ds-pc-port29) Unbuffered: a crash no longer loses the last lines.
+	setvbuf(stdout, nullptr, _IONBF, 0);
+	setvbuf(stderr, nullptr, _IONBF, 0);
+	if (fg_relaunch) std::printf("[port] DLSS frame generation: the game in its own process (no launcher window or D3D before Streamline)\n");
 
 	CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 	const std::string ini   = Utf8((root / L"settings.ini").wstring());
@@ -808,7 +843,7 @@ int main(int argc, char* argv[]) {
 				// is done is kept). (ds-pc-port13: all CPU threads or relaxed, asked the first time)
 				Port::Precompile::Choose(ini, &settings);
 				Port::Precompile::Start();
-			} else if (!current) {
+			} else if (!current && !fg_relaunch) {
 				// (10-27c) Every pipeline of the game into this GPU's driver cache, before the game, with its bar; Esc plays
 				// now (what is done is kept, the rest the next start or beside the game).
 				g_splash.skip = false;
@@ -850,6 +885,33 @@ int main(int argc, char* argv[]) {
 		if (!play || !IsGame(settings.game)) return 0;
 		settings.configured = true; // (10-28b) the Configurador is the launcher's Sistema tab
 		Port::SaveSettings(ini, settings);
+		// (ds-pc-port29) DLSS frame generation (Streamline's sl.interposer, the nvapi redirect, Reflex) must be the first
+		// graphics in its process, as in the emulator started from PowerShell: the launcher's SDL renderer has loaded
+		// D3D and NVIDIA's driver here (the process closed with no error). The game in a fresh process, no launcher.
+		{
+			const Port::LaunchPlan fg_plan = Port::BuildLaunch(settings, param.title_id, pc);
+			bool                   dlssg   = false;
+			for (const auto& [key, value]: fg_plan.env)
+				if (key == "KYTY_FRAMEGEN" && !value.empty() && value != "0") dlssg = true;
+			if (dlssg) {
+				std::printf("[port] DLSS frame generation: starting the game in a fresh process\n");
+				std::fflush(stdout);
+				ReleaseMutex(single);
+				CloseHandle(single);
+				std::wstring        command = L"\"" + g_exe.wstring() + L"\" --fg-relaunch --sin-lanzador";
+				STARTUPINFOW        si {};
+				PROCESS_INFORMATION pi {};
+				si.cb = sizeof(si);
+				if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr, root.c_str(), &si, &pi)) {
+					CloseHandle(pi.hThread);
+					CloseHandle(pi.hProcess);
+					Port::CloseSplash();
+					return 0;
+				}
+				std::printf("[port] DLSS frame generation: CreateProcess failed (%lu): in this process\n", GetLastError());
+				single = CreateMutexW(nullptr, TRUE, L"Local\\DemonsSoulsPC");
+			}
+		}
 		ShowSplash(image);
 		SplashStatus("Iniciando...");
 		mask = cpu_mask();
