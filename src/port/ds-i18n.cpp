@@ -428,6 +428,25 @@ const Row kRows[] = {
 	{{"Todas las opciones: Modos Souls, imagen, frame generation, calidad gr\xC3\xA1" "fica, ray tracing, pantalla, controles, ajustes, actualizar y trofeos.", "All the options: Souls modes, image, frame generation, graphics quality, ray tracing, display, controls, settings, update and trophies.", nullptr, nullptr, nullptr, nullptr}},
 	{{"No hacen falta: solo en PCs de 20 GB de RAM o menos.", "Not needed: only on PCs with 20 GB of RAM or less.", nullptr, nullptr, nullptr, nullptr}},
 	{{"Si te gusta el proyecto, puedes donar por PayPal. Gracias, portador de la maldici\xC3\xB3n.", "If you enjoy the project, you can donate via PayPal. Thank you, bearer of the curse.", nullptr, nullptr, nullptr, nullptr}},
+	// (port34) F1 > Ver trofeos
+	{{"Ver trofeos", "View trophies", "Ver trof\xC3\xA9us", "Voir les troph\xC3\xA9" "es", "Vedi trofei", "Troph\xC3\xA4" "en ansehen"}},
+	{{"TROFEOS", "TROPHIES", "TROF\xC3\x89US", "TROPH\xC3\x89" "ES", "TROFEI", "TROPH\xC3\x84" "EN"}},
+	{{"%d de %d trofeos obtenidos", "%d of %d trophies earned", "%d de %d trof\xC3\xA9us conquistados", "%d troph\xC3\xA9" "es obtenus sur %d", "%d trofei ottenuti su %d", "%d von %d Troph\xC3\xA4" "en erhalten"}},
+	{{"Todos", "All", "Todos", "Tous", "Tutti", "Alle"}},
+	{{"Obtenidos", "Earned", "Conquistados", "Obtenus", "Ottenuti", "Erhalten"}},
+	{{"Sin obtener", "Not earned", "N\xC3\xA3o conquistados", "Non obtenus", "Non ottenuti", "Nicht erhalten"}},
+	{{"Ordenar:", "Sort:", "Ordenar:", "Trier :", "Ordina:", "Sortieren:"}},
+	{{"Grado", "Grade", "Grau", "Rang", "Grado", "Stufe"}},
+	{{"Fecha", "Date", "Data", "Date", "Data", "Datum"}},
+	{{"Volver", "Back", "Voltar", "Retour", "Indietro", "Zur\xC3\xBC" "ck"}},
+	{{"L1/R1 o Q/E: filtro   \xC2\xB7   Y o Tab: orden   \xC2\xB7   B, Esc o F1: volver", "L1/R1 or Q/E: filter   \xC2\xB7   Y or Tab: sort   \xC2\xB7   B, Esc or F1: back", "L1/R1 ou Q/E: filtro   \xC2\xB7   Y ou Tab: ordem   \xC2\xB7   B, Esc ou F1: voltar", "L1/R1 ou Q/E : filtre   \xC2\xB7   Y ou Tab : tri   \xC2\xB7   B, \xC3\x89" "chap ou F1 : retour", "L1/R1 o Q/E: filtro   \xC2\xB7   Y o Tab: ordine   \xC2\xB7   B, Esc o F1: indietro", "L1/R1 oder Q/E: Filter   \xC2\xB7   Y oder Tab: Sortierung   \xC2\xB7   B, Esc oder F1: zur\xC3\xBC" "ck"}},
+	{{"Cargando los trofeos...", "Loading the trophies...", "Carregando os trof\xC3\xA9us...", "Chargement des troph\xC3\xA9" "es...", "Caricamento dei trofei...", "Troph\xC3\xA4" "en werden geladen..."}},
+	{{"No se encontraron los trofeos del juego (falta sce_sys/trophy2/trophy00.ucp).", "The game's trophies were not found (sce_sys/trophy2/trophy00.ucp is missing).", "Os trof\xC3\xA9us do jogo n\xC3\xA3o foram encontrados (falta sce_sys/trophy2/trophy00.ucp).", "Troph\xC3\xA9" "es du jeu introuvables (sce_sys/trophy2/trophy00.ucp manquant).", "Trofei del gioco non trovati (manca sce_sys/trophy2/trophy00.ucp).", "Die Troph\xC3\xA4" "en des Spiels wurden nicht gefunden (sce_sys/trophy2/trophy00.ucp fehlt)."}},
+	{{"A\xC3\xBAn no has obtenido ning\xC3\xBAn trofeo.", "You haven't earned any trophy yet.", "Voc\xC3\xAA ainda n\xC3\xA3o conquistou nenhum trof\xC3\xA9u.", "Vous n'avez encore obtenu aucun troph\xC3\xA9" "e.", "Non hai ancora ottenuto nessun trofeo.", "Du hast noch keine Troph\xC3\xA4" "e erhalten."}},
+	{{"\xC2\xA1Has obtenido todos los trofeos!", "You have earned every trophy!", "Voc\xC3\xAA conquistou todos os trof\xC3\xA9us!", "Vous avez obtenu tous les troph\xC3\xA9" "es !", "Hai ottenuto tutti i trofei!", "Du hast alle Troph\xC3\xA4" "en erhalten!"}},
+	{{"Se revelar\xC3\xA1 al obtenerlo.", "Revealed once earned.", "Ser\xC3\xA1 revelado ao conquist\xC3\xA1-lo.", "R\xC3\xA9v\xC3\xA9l\xC3\xA9 une fois obtenu.", "Verr\xC3\xA0 rivelato quando lo otterrai.", "Wird beim Erhalten enth\xC3\xBCllt."}},
+	{{"Obtenido", "Earned", "Conquistado", "Obtenu", "Ottenuto", "Erhalten"}},
+	{{"Obtenido el %s", "Earned on %s", "Conquistado em %s", "Obtenu le %s", "Ottenuto il %s", "Erhalten am %s"}},
 };
 // clang-format on
 

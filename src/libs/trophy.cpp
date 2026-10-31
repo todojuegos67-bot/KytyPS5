@@ -182,6 +182,9 @@ struct State {
 	std::map<int, Entry>                   trophies;
 	std::map<int, int64_t>                 unlocked; // id -> unix time
 	std::filesystem::path                  store;
+	std::filesystem::path                  ucp;     // (port34) the package read, for BuildArt
+	std::filesystem::path                  sce_sys; // (port34) the game's sce_sys (icon0.png)
+	std::string                            title;   // (port34) param.sfo's TITLE
 	std::deque<std::shared_ptr<const Toast>> queue;
 	std::chrono::steady_clock::time_point  shown_at {};
 };
@@ -279,6 +282,7 @@ void Load(State& s) {
 	std::printf("Trophy: init (title %s, sound %s, popups %s)\n", s.title_id.c_str(), SoundWanted() ? "on" : "off",
 	            PopupWanted() ? "on" : "off");
 	s.words             = LabelFor(Primary(lang));
+	if (!Loader::SystemContentParamSfoGetString("TITLE", &s.title)) s.title.clear();
 
 	// The unlocks so far.
 	if (std::ifstream f(s.store, std::ios::binary); f) {
@@ -299,6 +303,7 @@ void Load(State& s) {
 	for (const auto& f: std::filesystem::directory_iterator(dir, ec)) {
 		if (Lower(Common::PathToString(f.path().extension())) == ".ucp" && (ucp.empty() || f.path() < ucp)) ucp = f.path();
 	}
+	s.sce_sys = LibKernel::FileSystem::GetRealFilename("/app0") / "sce_sys";
 	std::map<std::string, Bytes> files;
 	if (ucp.empty() || !ReadUcp(ucp, files)) {
 		LOGF("Trophy: no trophy package in %s\n", Common::PathToString(dir).c_str());
@@ -306,6 +311,7 @@ void Load(State& s) {
 		            ucp.empty() ? "no .ucp" : "unreadable .ucp");
 		return;
 	}
+	s.ucp              = ucp;
 	const auto conf_it = files.find("tropconf.json");
 	if (conf_it == files.end()) {
 		std::printf("Trophy: %s has no tropconf.json\n", Common::PathToString(ucp).c_str());
@@ -466,6 +472,96 @@ void Record(State& s, int id) {
 	if (PopupWanted()) s.queue.push_back(std::move(t));
 }
 
+
+// (port34) Area-average downscale (bilinear when enlarging), premultiplied so transparent edges do not darken, into
+// dst (stride in pixels) at size x size.
+struct Tap {
+	int   i;
+	float w;
+};
+std::vector<std::vector<Tap>> Taps(int src, int dst) {
+	std::vector<std::vector<Tap>> taps(static_cast<size_t>(dst));
+	const float scale = static_cast<float>(src) / static_cast<float>(dst);
+	for (int x = 0; x < dst; x++) {
+		auto& t = taps[static_cast<size_t>(x)];
+		if (scale > 1.0f) {
+			const float a = static_cast<float>(x) * scale, b = a + scale;
+			for (int i = static_cast<int>(std::floor(a)); i < static_cast<int>(std::ceil(b)) && i < src; i++) {
+				const float w = std::min(b, static_cast<float>(i + 1)) - std::max(a, static_cast<float>(i));
+				if (w > 0.0f) t.push_back({i, w / scale});
+			}
+		} else {
+			const float c  = (static_cast<float>(x) + 0.5f) * scale - 0.5f;
+			const int   i0 = static_cast<int>(std::floor(c));
+			const float f  = c - static_cast<float>(i0);
+			t.push_back({std::clamp(i0, 0, src - 1), 1.0f - f});
+			t.push_back({std::clamp(i0 + 1, 0, src - 1), f});
+		}
+	}
+	return taps;
+}
+void Resample(const uint8_t* px, int w, int h, int size, uint32_t* dst, int stride) {
+	const auto tx = Taps(w, size), ty = Taps(h, size);
+	std::vector<float> rows(static_cast<size_t>(h) * size * 4); // horizontal pass (premultiplied)
+	for (int y = 0; y < h; y++) {
+		for (int x = 0; x < size; x++) {
+			float acc[4] = {};
+			for (const auto& t: tx[static_cast<size_t>(x)]) {
+				const uint8_t* p = px + (static_cast<size_t>(y) * w + t.i) * 4;
+				const float    a = p[3] / 255.0f;
+				acc[0] += p[0] * a * t.w, acc[1] += p[1] * a * t.w, acc[2] += p[2] * a * t.w, acc[3] += p[3] * t.w;
+			}
+			std::copy(acc, acc + 4, rows.begin() + static_cast<ptrdiff_t>((static_cast<size_t>(y) * size + x) * 4));
+		}
+	}
+	for (int y = 0; y < size; y++) {
+		for (int x = 0; x < size; x++) {
+			float acc[4] = {};
+			for (const auto& t: ty[static_cast<size_t>(y)]) {
+				const float* r = rows.data() + (static_cast<size_t>(t.i) * size + x) * 4;
+				for (int k = 0; k < 4; k++) acc[k] += r[k] * t.w;
+			}
+			const float a   = std::clamp(acc[3], 0.0f, 255.0f);
+			const float inv = a > 0.0f ? 255.0f / a : 0.0f;
+			const auto  c   = [&](float v) { return static_cast<uint32_t>(std::clamp(v * inv + 0.5f, 0.0f, 255.0f)); };
+			dst[static_cast<size_t>(y) * stride + x] =
+			    c(acc[0]) | (c(acc[1]) << 8u) | (c(acc[2]) << 16u) | (static_cast<uint32_t>(a + 0.5f) << 24u);
+		}
+	}
+}
+
+bool DecodeInto(const Bytes& png, Art& art, int slot) {
+	int   w = 0, h = 0, c = 0;
+	auto* px = stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &w, &h, &c, 4);
+	if (px == nullptr || w <= 0 || h <= 0 || w > 8192 || h > 8192) {
+		if (px != nullptr) stbi_image_free(px);
+		return false;
+	}
+	const int ox = (slot % art.cols) * art.stride, oy = (slot / art.cols) * art.stride;
+	uint32_t* base = art.pixels.data() + static_cast<size_t>(oy) * art.width + ox;
+	Resample(px, w, h, art.cell, base + static_cast<size_t>(art.pad) * art.width + art.pad, art.width);
+	stbi_image_free(px);
+	// The gutter: the cell's edge pixels repeated (no bleeding from the neighbours with linear filtering).
+	for (int y = 0; y < art.stride; y++) {
+		const int sy = std::clamp(y - art.pad, 0, art.cell - 1) + art.pad;
+		for (int x = 0; x < art.stride; x++) {
+			const int sx = std::clamp(x - art.pad, 0, art.cell - 1) + art.pad;
+			if (sx == x && sy == y) continue;
+			base[static_cast<size_t>(y) * art.width + x] = base[static_cast<size_t>(sy) * art.width + sx];
+		}
+	}
+	return true;
+}
+
+const Bytes* IconFile(const std::map<std::string, Bytes>& files, int id) {
+	char a[32], b[32];
+	std::snprintf(a, sizeof(a), "trop%d.png", id);
+	std::snprintf(b, sizeof(b), "trop%04d.png", id);
+	for (const char* n: {a, b})
+		if (const auto it = files.find(n); it != files.end()) return &it->second;
+	return nullptr;
+}
+
 } // namespace
 
 bool Unlock(int trophy_id, int* platinum_id) {
@@ -526,6 +622,79 @@ bool Snapshot(std::vector<Info>* all, std::vector<int>* unlocked) {
 		unlocked->clear();
 		for (const auto& [id, t]: s.unlocked) unlocked->push_back(id);
 	}
+	return true;
+}
+
+int TrySnapshot(std::vector<Info>* all, std::map<int, int64_t>* unlock_times) {
+	auto&            s = S();
+	std::unique_lock lock(s.mutex, std::try_to_lock);
+	if (!lock.owns_lock()) return 0;
+	if (!s.loaded) return -1;
+	if (s.trophies.empty()) return -2;
+	if (all != nullptr) {
+		all->clear();
+		for (const auto& [id, e]: s.trophies) all->push_back(e.info);
+	}
+	if (unlock_times != nullptr) *unlock_times = s.unlocked;
+	return 1;
+}
+
+bool UnlockTimes(std::map<int, int64_t>* unlock_times) {
+	auto&           s = S();
+	std::lock_guard lock(s.mutex);
+	if (!s.loaded) return false;
+	if (unlock_times != nullptr) *unlock_times = s.unlocked;
+	return true;
+}
+
+std::string GameTitle() {
+	auto&            s = S();
+	std::unique_lock lock(s.mutex, std::try_to_lock);
+	return lock.owns_lock() && s.loaded ? s.title : std::string();
+}
+
+bool BuildArt(int cell, Art* art) {
+	if (art == nullptr) return false;
+	*art = Art {};
+	std::filesystem::path ucp, sce_sys;
+	std::vector<int>      ids;
+	{
+		auto&           s = S();
+		std::lock_guard lock(s.mutex);
+		Load(s);
+		ucp     = s.ucp;
+		sce_sys = s.sce_sys;
+		for (const auto& [id, e]: s.trophies) ids.push_back(id);
+	}
+	if (ucp.empty() || ids.empty()) return false;
+	std::map<std::string, Bytes> files;
+	if (!ReadUcp(ucp, files)) return false;
+	art->cell   = std::clamp(cell, 32, 512);
+	art->pad    = 2;
+	art->stride = art->cell + art->pad * 2;
+	const int slots = static_cast<int>(ids.size()) + 1;
+	art->cols   = std::max(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(slots)))));
+	const int rows = (slots + art->cols - 1) / art->cols;
+	art->width  = art->cols * art->stride;
+	art->height = rows * art->stride;
+	art->pixels.assign(static_cast<size_t>(art->width) * art->height, 0);
+	int next = 0;
+	for (const int id: ids) {
+		const Bytes* png = IconFile(files, id);
+		if (png == nullptr && id == kNexusTrophyId) png = IconFile(files, 1); // (the port's own: trophy 1's icon, as the popup)
+		if (png != nullptr && DecodeInto(*png, *art, next)) art->slots[id] = next++;
+	}
+	{
+		std::error_code ec;
+		const auto      icon0 = sce_sys / "icon0.png";
+		if (std::filesystem::exists(icon0, ec)) {
+			std::ifstream f(icon0, std::ios::binary);
+			const Bytes   png((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+			if (!png.empty() && DecodeInto(png, *art, next)) art->game_slot = next++;
+		}
+	}
+	std::printf("Trophy: icon atlas %dx%d (%d px icons, %zu trophies%s)\n", art->width, art->height, art->cell, art->slots.size(),
+	            art->game_slot >= 0 ? ", game icon" : "");
 	return true;
 }
 
