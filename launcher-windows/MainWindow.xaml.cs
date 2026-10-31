@@ -70,7 +70,7 @@ partial class MainWindow : Window {
 	// The Sharpening row's value for each upscaler ("0" to "0.9"), and the upscaler whose value it shows.
 	string dlssSharpness = "0", fsrSharpness = "0.6", sharpnessShown = "";
 	CheckBox fullscreen, aspect, wideBars, hdr, fps120, vsync, lowLatency, fsr, cheats, redzone, safeGpu, ecores, presentDirect, vrrFlips,
-		antiLag, keepResident, fps30, padSpeaker, reopenLauncher;
+		antiLag, keepResident, fps30, padSpeaker, reopenLauncher, skipLogos;
 	TextBlock renderNote, outputNote, upscalerNote, frameGenNote, streamlineText, cheatState, bannerTitle, bannerLine, storeLine;
 	Image banner;
 	Border bannerFallback;
@@ -788,10 +788,13 @@ partial class MainWindow : Window {
 		choose.Margin = new Thickness(16, 0, 0, 0);
 		cheatState = new TextBlock { Foreground = Res<Brush>("TextDimBrush"), VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(14, 0, 0, 0) };
 		padSpeaker = Switch(S.Bool("pad_speaker"));
+		// The game's own switch for its start-up logos (KYTY_SKIP_LOGOS, issue #263).
+		skipLogos = Switch(S.Bool("skip_logos"));
 		return Page("game.title",
 			Section("game.console"),
 			Row("language", language, Desc(T("language.desc"))),
 			Row("audiooutput", audioOutput, Desc(T("audiooutput.desc"))),
+			Row("skiplogos", skipLogos, Desc(T("skiplogos.desc"))),
 			Section("game.controller"),
 			Row("padspeaker", padSpeaker, Desc(T("padspeaker.desc"))),
 			Row("padvolume", SliderRow(0, 100, 5, S.Int("pad_speaker_volume"),
@@ -989,6 +992,7 @@ partial class MainWindow : Window {
 		S.Set("dlss_sharpness", dlssSharpness == "0" ? "" : dlssSharpness);
 		S.Set("fsr_sharpness", fsrSharpness == "0.6" ? "" : fsrSharpness);
 		S.Set("audio_output", Value(audioOutput) as string ?? "");
+		S.Set("skip_logos", skipLogos.IsChecked == true);
 		S.Set("gpu", Value(gpu) as string ?? "");
 		if (context.FsrAvailable) S.Set("fsr", fsr.IsChecked == true);
 		S.Set("ecores", ecores.IsChecked == true);
@@ -1033,6 +1037,7 @@ partial class MainWindow : Window {
 		if (S.Bool("antilag")) options.Add(T("summary.antilag"));
 		if (S.Bool("keep_resident")) options.Add(T("summary.keepResident"));
 		if (!S.Bool("pad_speaker")) options.Add(T("summary.padSpeakerOff"));
+		if (S.Bool("skip_logos")) options.Add(T("summary.skipLogos"));
 		if (S.Str("extra_args").Length != 0) options.Add(T("summary.extra"));
 
 		var parts = new List<string> {

@@ -1258,6 +1258,8 @@ void LauncherWindow::GamePage() {
 		    }
 	    },
 	    T("audiooutput.desc"));
+	// The game's own switch for its start-up logos (KYTY_SKIP_LOGOS, issue #263).
+	Row("skiplogos", [&] { SettingSwitch("##skiplogos", "skip_logos"); }, T("skiplogos.desc"));
 	Section("game.cheats");
 	Row(
 	    "cheats",
@@ -1560,6 +1562,7 @@ std::string LauncherWindow::Summary(std::vector<std::pair<std::string, std::stri
 	if (S().Bool("present_direct")) options.emplace_back(T("summary.presentDirect"));
 	if (S().Bool("vrr_flips")) options.emplace_back(T("summary.vrrFlips"));
 	if (S().Bool("antilag")) options.emplace_back(T("summary.antilag"));
+	if (S().Bool("skip_logos")) options.emplace_back(T("summary.skipLogos"));
 	if (S().Bool("mangohud") && context_.HasMangoHud()) options.emplace_back(T("summary.mangohud"));
 	if (!S().Str("extra_args").empty()) options.emplace_back(T("summary.extra"));
 	auto join = [](const std::vector<std::string>& parts, const char* separator) {

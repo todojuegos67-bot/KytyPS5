@@ -50,7 +50,8 @@ $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false
 	ecores = $false; fps120 = $false; render = 1440; ratio = '16:9'; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0
 	hud = 0; streamline = ''; safegpu = $false; upscaler = ''; render_dlss = 1080; fsr = $false; output = 'auto'
 	lowlatency = $false; present_direct = $false; vrr_flips = $false; antilag = $false; keep_resident = $false; fps30 = $false; pad_speaker = $true
-	extra_args = ''; dlss_preset = ''; dlss_sharpness = ''; fsr_sharpness = ''; gpu = ''; output_auto = $true; audio_output = '' }
+	extra_args = ''; dlss_preset = ''; dlss_sharpness = ''; fsr_sharpness = ''; gpu = ''; output_auto = $true; audio_output = ''
+	skip_logos = $false }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -415,6 +416,8 @@ function Get-PlayCommand {
 	if ($fsrUpscaler -and "$($settings.fsr_sharpness)" -in @('0', '0.3', '0.9')) { $sets += "KYTY_FSR_SHARPNESS=$($settings.fsr_sharpness)" }
 	# KytyLauncher.exe's audio output the game is told (issue #207; none: a TV).
 	if ("$($settings.audio_output)" -cmatch '^(headphones|amplifier|soundbar)$') { $sets += "KYTY_AUDIO_OUTPUT=$($settings.audio_output)" }
+	# KytyLauncher.exe's start-up logos skipped (the game's own switch, issue #263).
+	if ($settings.skip_logos) { $sets += 'KYTY_SKIP_LOGOS=1' }
 	# KytyLauncher.exe's extra options (Advanced page): their -Set pairs join (or replace) the launcher's own.
 	$extra = Get-ExtraOptions
 	foreach ($option in $extra) {
