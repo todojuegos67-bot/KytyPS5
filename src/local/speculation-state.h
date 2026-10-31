@@ -13,6 +13,7 @@
 // At any other refused packet the speculation stops; what it recorded before is committed and the command buffer is
 // translated on from there.
 
+#include "common/guardedCopy.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -312,14 +313,14 @@ struct State {
 		// (Mostly nothing pending over the words: one look for all of them.)
 		const uint64_t bytes = uint64_t {4} * count;
 		if (bytes != 0 && !pending.MayHold(address, bytes)) {
-			std::memcpy(out, reinterpret_cast<const void*>(address), bytes);
+			if (!CopyGuest(out, address, bytes)) return false;
 			if (clean) NoteCleanRead(address, bytes);
 			return true;
 		}
 		if (bytes != 0 && !journal_set.Intersects(address, bytes) && !written_set.Intersects(address, bytes) &&
 		    !chain_written.Intersects(address, bytes) &&
 		    (previous.load(std::memory_order_relaxed) == nullptr || !chain_journal.Intersects(address, bytes))) {
-			std::memcpy(out, reinterpret_cast<const void*>(address), bytes);
+			if (!CopyGuest(out, address, bytes)) return false;
 			if (clean) NoteCleanRead(address, bytes);
 			return true;
 		}
@@ -333,6 +334,16 @@ struct State {
 		return true;
 	}
 
+	// Guest memory as a speculation's thread reads it: a page the GPU wrote (read-protected) is not read, the
+	// speculation refused, instead of the fault reading it back through the GPU thread (SendCommandSync), which
+	// may wait for this thread: a mode 4 hang at the stone arch had a speculation thread fault in TableEvaluate
+	// holding the catalog's shared lock while the GPU thread waited for it exclusively (10-31). The callers' page
+	// checks race with watchers added meanwhile.
+	[[nodiscard]] bool CopyGuest(void* out, uint64_t address, uint64_t bytes) noexcept {
+		if (Common::GuardedCopy(out, reinterpret_cast<const void*>(address), bytes) == 0) return true;
+		if (refused == nullptr) refused = "GPU-written guest memory (read fault)";
+		return false;
+	}
 	// One word (ReadJournaled): `by` the speculation whose pending write gave it (null: memory).
 	[[nodiscard]] bool ReadWord(uint64_t at, uint32_t& value, const State*& by) {
 		if (journal_set.Intersects(at, 4)) return Resolve(*this, at, value, by);
@@ -344,8 +355,7 @@ struct State {
 			}
 		// (A previous speculation's work's; a write of one finished since is in memory, or will be: a clean read.)
 		if (chain_written.Intersects(at, 4)) return false;
-		std::memcpy(&value, reinterpret_cast<const void*>(at), 4);
-		return true;
+		return CopyGuest(&value, at, 4);
 	}
 	// The word `state`'s latest pending write over it gives (a copy: its source's, with no write of that speculation
 	// or an earlier one pending over the source).
@@ -361,8 +371,8 @@ struct State {
 		}
 		const auto source = latest->value + (at - latest->address);
 		if (state.JournalIntersects(source, 4) || state.WrittenIntersects(source, 4)) return false;
+		if (!CopyGuest(&value, source, 4)) return false;
 		if (&state == this) NoteCleanRead(source, 4);
-		std::memcpy(&value, reinterpret_cast<const void*>(source), 4);
 		return true;
 	}
 
