@@ -3711,8 +3711,12 @@ void PipelineCache::InitializeDriverCache() {
 				if (SaveDriverCache(m_table_cache, m_table_cache_path, m_table_cache_saved_size)) saved = done;
 				table_at = std::chrono::steady_clock::now();
 			}
+			// A big main cache (a full precompile's: GBs) is not saved during play, only at the exit (Save): the driver
+			// serializes it whole (vkGetPipelineCacheData, ~2x its size in RAM) with the cache locked, and every pipeline
+			// the game made from it waited, seconds a save. Its in-play additions are few (the precompile holds the rest).
+			constexpr size_t BigCache = size_t {512} << 20u;
 			if (const auto done = m_main_pipelines_done.load(std::memory_order_acquire);
-			    done != main_saved && settled(m_main_pipeline_last_done, main_at)) {
+			    done != main_saved && m_driver_cache_saved_size < BigCache && settled(m_main_pipeline_last_done, main_at)) {
 				std::lock_guard save(m_main_cache_mutex);
 				if (SaveDriverCache(m_driver_cache, m_driver_cache_path, m_driver_cache_saved_size)) main_saved = done;
 				main_at = std::chrono::steady_clock::now();

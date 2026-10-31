@@ -990,6 +990,10 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	env.Default("KYTY_HITCH_LOG_MS", "40");
 	if (s.aspect_fit) env.Set("KYTY_PRESENT_ASPECT", "fit");
 	env.Default("KYTY_ASYNC_DRAW_PIPELINES", "1");
+	// The port's start menu precompiles every pipeline before the game: no second, in-game warm of every static recipe
+	// (~78K pipelines beside the game, the whole multi-GB driver cache saved every 4,000: the game crawled at the
+	// character select with "Preparando ... 8%" and a black screen). What the precompile lacks compiles at first use.
+	env.Default("KYTY_STATIC_WARMUP", "0");
 	// -Ram16 (10-24): "Optimizacion equipos 16 GB RAM" on a PC of 20 GB of RAM or less (or simulated) only.
 	if (low_ram) { // (10-27b) on low-RAM PCs only, whatever the old box says
 		env.Default("KYTY_RESIDENT_MB", "6144");
