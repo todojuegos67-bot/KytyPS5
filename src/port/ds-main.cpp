@@ -675,7 +675,9 @@ int main(int argc, char* argv[]) {
 
 	// One game at a time (a restart waits for the one before to end).
 	HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\DemonsSoulsPC");
-	if (GetLastError() == ERROR_ALREADY_EXISTS && WaitForSingleObject(single, restarted ? 60000 : 0) == WAIT_TIMEOUT) {
+	// (A game just closed may still be ending: saving its caches, its precompile stopping. Waited for, up to 30 s, instead
+	// of quitting at once.)
+	if (GetLastError() == ERROR_ALREADY_EXISTS && WaitForSingleObject(single, restarted ? 60000 : 30000) == WAIT_TIMEOUT) {
 		Message("Demon's Souls ya se esta ejecutando.", MB_ICONINFORMATION);
 		return 0;
 	}
@@ -846,7 +848,7 @@ int main(int argc, char* argv[]) {
 		if (fs::exists(root / L"fondo-launcher.jpg", ec)) menu_rt.image_path = Utf8((root / L"fondo-launcher.jpg").wstring());
 		menu_rt.pick_folder           = [] { return PickFolder(); };
 		const bool play = Port::RunStartMenu(menu_rt, &settings);
-		Port::Precompile::Stop();
+		Port::Precompile::Stop(/*save=*/play); // (closing: out at once, the shards merged at the next start)
 		if (!play || !IsGame(settings.game)) return 0;
 		settings.configured = true; // (10-28b) the Configurador is the launcher's Sistema tab
 		Port::SaveSettings(ini, settings);

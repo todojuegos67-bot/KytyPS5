@@ -35,6 +35,11 @@ View              g_view;
 std::atomic<bool> g_stop {false};
 std::thread       g_worker;
 std::atomic<bool> g_all_threads {false}; // (ds-pc-port13)
+// Stop(false), the game closing: no merge at the stop. The merge loads, merges and writes the whole driver cache (GBs,
+// minutes, not stoppable): with the window already closed the process lived on, and the next start found the
+// "one game at a time" mutex taken and quit. The finished shard files stay on disk: the next start's merge-before
+// takes them, and the precompile goes on from there.
+std::atomic<bool> g_save_on_stop {true};
 
 void SetText(const std::string& text) {
 	std::scoped_lock lock(g_mutex);
@@ -285,8 +290,11 @@ void Work() {
 	ForgetCachesWarmedUnderAnotherName();
 	SetEnvironmentVariableW(L"KYTY_WARM_DRIVER_CACHE_KEY", kDriverCacheKey);
 	const std::wstring base  = L"--seeds " + Quote(seeds);
+	// A merge that fails is tried once more, 3 s later (a game that just closed may still hold the cache file).
 	const auto         merge = [&](const std::string& name) {
-        return RunOne(name, base + L" --merge-driver-cache" + ShardsArg(), false, false) == 0;
+		if (RunOne(name, base + L" --merge-driver-cache" + ShardsArg(), false, false) == 0) return true;
+		Sleep(3000);
+		return RunOne(name + "-retry", base + L" --merge-driver-cache" + ShardsArg(), false, false) == 0;
 	};
 	const auto fail = [&](const std::string& what) {
 		std::scoped_lock lock(g_mutex);
@@ -297,7 +305,12 @@ void Work() {
 
 	// What an interrupted run finished (its shard files), then what is left.
 	SetText("Preparando shaders: lo que ya estaba hecho...");
-	if (!merge("merge-before")) return fail("No se pudo preparar los shaders (merge). Mira logs\\*-precompile.");
+	// (Not fatal: the shard files it could not take stay on disk, the shards the cache notes as done are skipped, and the
+	// merges below and at the end take the rest. Before, this failure stopped the precompile at every start.)
+	if (!merge("merge-before")) {
+		std::printf("[port] precompile: merge-before failed; going on (logs\\*-precompile\\merge-before*.out.log)\n");
+		std::fflush(stdout);
+	}
 	if (RunOne("status-before", base + L" --driver-cache-status" + ShardsArg()) != 0) return fail("");
 	bool              all  = false;
 	std::vector<bool> done_shards = ShardsDone(g_logs / L"status-before.out.log", &all);
@@ -330,8 +343,10 @@ void Work() {
 		if (g_stop) {
 			kill_all();
 			// What finished goes into the cache now: the game starts with it.
-			SetText("Preparando shaders: guardando lo hecho...");
-			(void)merge("merge-stopped");
+			if (g_save_on_stop) {
+				SetText("Preparando shaders: guardando lo hecho...");
+				(void)merge("merge-stopped");
+			}
 			return fail("");
 		}
 		bool waiting_memory = false;
@@ -406,10 +421,8 @@ void Work() {
 		}
 		// Merged as it goes (every 16 shards): a crash or a closed window keeps what was made.
 		if (done - merged_at >= 16) {
-			if (!merge("merge-" + std::to_string(done))) {
-				kill_all();
-				return fail("No se pudo guardar la cache de shaders (merge). Mira logs\\*-precompile.");
-			}
+			// (Not fatal either: the shard files stay and the next merge takes them.)
+			if (!merge("merge-" + std::to_string(done))) std::printf("[port] precompile: merge at %d failed; going on\n", done);
 			merged_at = done;
 		}
 	}
@@ -494,8 +507,9 @@ void Start() {
 #endif
 }
 
-void Stop() {
-	g_stop = true;
+void Stop(bool save) {
+	g_save_on_stop = save;
+	g_stop         = true;
 	if (g_worker.joinable()) g_worker.join();
 	std::scoped_lock lock(g_mutex);
 	g_view.running = false;

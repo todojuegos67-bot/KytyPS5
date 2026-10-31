@@ -3643,7 +3643,7 @@ void PipelineCache::InitializeDriverCache() {
 		// (10-27c) Never started over: a full precompile of 1.07 is ~2.5 GB on NVIDIA, past the 2 GiB below, and was
 		// dropped at the game's start (every pipeline compiled in play again, 7.6 s compute stalls). Up to the file
 		// format's 4 GiB.
-		if (warmed) return uint64_t {std::numeric_limits<uint32_t>::max()};
+		if (warmed) return std::numeric_limits<uint64_t>::max(); // (loaded and saved in pieces: no 4 GiB format limit)
 		if (ram != 0) limit = std::min(limit, ram >= (uint64_t {24} << 30u) ? ram / 16u : uint64_t {512} << 20u);
 		return store ? std::min(limit, StoreLimit) : limit;
 	};
@@ -3738,8 +3738,7 @@ vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& fi
 			PipelineCacheLog("Vulkan pipeline cache: starting {} over ({} bytes, limit {})", path, file_size, limit);
 			std::error_code done_error;
 			std::filesystem::remove(StaticDonePath(file_path), done_error);
-		} else if (file_size >= signature.size() + sizeof(uint64_t) &&
-		           file_size <= std::numeric_limits<uint32_t>::max()) {
+		} else if (file_size >= signature.size() + sizeof(uint64_t)) {
 			std::string cached_signature(signature.size(), '\0');
 			uint64_t    payload_hash = 0;
 			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
@@ -3749,11 +3748,20 @@ vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& fi
 			file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
 			          &signature_read);
 			file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
-			file.Read(initial_data.data(), static_cast<uint32_t>(initial_data.size()),
-			          &payload_read);
+			// In pieces: a full precompile's cache can pass 4 GiB (File::Read takes 32-bit sizes). Past 4 GiB it was
+			// "invalid file size": the game started with an empty cache and compiled every pipeline in play, and the
+			// precompile's merge started over from nothing.
+			uint64_t payload_total = 0;
+			for (bool more = true; more && payload_total < initial_data.size();) {
+				const auto piece = static_cast<uint32_t>(std::min<uint64_t>(initial_data.size() - payload_total, uint64_t {1} << 30u));
+				payload_read     = 0;
+				file.Read(initial_data.data() + payload_total, piece, &payload_read);
+				payload_total += payload_read;
+				more = payload_read == piece;
+			}
 			file.Close();
 			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
-			    payload_read != initial_data.size() || cached_signature != signature ||
+			    payload_total != initial_data.size() || cached_signature != signature ||
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
 				initial_data.clear();
 				PipelineCacheLog(
@@ -3812,8 +3820,7 @@ bool PipelineCache::SaveDriverCache(vk::PipelineCache cache, const std::filesyst
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
 		size   = 0;
 		result = m_graphics.device.getPipelineCacheData(cache, &size, nullptr);
-		if (result != vk::Result::eSuccess || size == 0 ||
-		    size > std::numeric_limits<uint32_t>::max()) {
+		if (result != vk::Result::eSuccess || size == 0) {
 			break;
 		}
 		if (size == saved_size) return true;
@@ -3823,8 +3830,7 @@ bool PipelineCache::SaveDriverCache(vk::PipelineCache cache, const std::filesyst
 			break;
 		}
 	}
-	if (result != vk::Result::eSuccess || size == 0 ||
-	    size > std::numeric_limits<uint32_t>::max()) {
+	if (result != vk::Result::eSuccess || size == 0) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
 		return false;
@@ -3841,10 +3847,17 @@ bool PipelineCache::SaveDriverCache(vk::PipelineCache cache, const std::filesyst
 	temp_path += ".tmp";
 	Common::File file;
 	uint32_t     prefix_written  = 0;
-	uint32_t     payload_written = 0;
+	uint64_t     payload_written = 0;
 	if (file.Create(temp_path)) {
 		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
-		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
+		// In pieces (File::Write takes 32-bit sizes): a cache past 4 GiB was "save failed" and never written.
+		for (bool more = true; more && payload_written < payload.size();) {
+			const auto piece   = static_cast<uint32_t>(std::min<uint64_t>(payload.size() - payload_written, uint64_t {1} << 30u));
+			uint32_t   written = 0;
+			file.Write(payload.data() + payload_written, piece, &written);
+			payload_written += written;
+			more = written == piece;
+		}
 	}
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
