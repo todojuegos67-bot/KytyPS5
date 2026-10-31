@@ -610,7 +610,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	}
 	const auto* fg = FindFg(fg_id);
 	for (const auto& p: Tables::kBaseEnv) env.Set(p.key, p.value);
-	for (int i = 0; i < fg->env_count; i++) env.Set(fg->env[i].key, fg->env[i].value);
+	for (int i = 0; i < fg->env_count && fg->env[i].key != nullptr; i++) env.Set(fg->env[i].key, fg->env[i].value);
 	const bool with_fg  = std::strcmp(fg->id, "sin-fg") != 0;
 	const bool amd_fg   = std::strncmp(fg->id, "amd", 3) == 0;
 	const bool dlss_fg  = std::strncmp(fg->id, "dlss", 4) == 0;

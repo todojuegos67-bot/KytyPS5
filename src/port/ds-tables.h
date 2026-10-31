@@ -84,6 +84,6 @@ inline constexpr FgMode kFgModes[] = {
 	{"dlss-x5", "200 FPS Nvidia Smooth x5", "dlss-x5.json", kDlssX5, 4},
 	{"dlss-x6", "216 FPS Nvidia Smooth x6", "dlss-x6.json", kDlssX6, 4},
 	{"dlss-120", "120 FPS Nvidia Smooth Souls", "dlss-x3-120.json", kDlss120, 4},
-	{"dlss-dinamico", "DLSS MFG dinamico (x2-x4)", "dlss-dynamic.json", kDlssDinamico, 4},
+	{"dlss-dinamico", "DLSS MFG dinamico (x2-x4)", "dlss-dynamic.json", kDlssDinamico, 3},
 };
 } // namespace Port::Tables

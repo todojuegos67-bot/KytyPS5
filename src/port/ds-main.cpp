@@ -648,7 +648,32 @@ LONG WINAPI PortCrashFilter(EXCEPTION_POINTERS* info) {
 	swprintf(file, MAX_PATH + 64, L"%ls\\crash-%04u%02u%02u-%02u%02u%02u.txt", g_crash_dir.c_str(), t.wYear, t.wMonth, t.wDay, t.wHour,
 	         t.wMinute, t.wSecond);
 	if (FILE* f = _wfopen(file, L"w"); f != nullptr) {
-		std::fwprintf(f, L"exception 0x%08lx at %p\nmodule %ls + 0x%llx\n", code, addr, name, off);
+		std::fwprintf(f, L"exception 0x%08lx at %p\nmodule %ls + 0x%llx\nstack:\n", code, addr, name, off);
+		// (ds-pc-port32) The faulting thread's stack from its context (x64 unwind data), up to 32 frames.
+		if (info != nullptr && info->ContextRecord != nullptr) {
+			CONTEXT ctx = *info->ContextRecord;
+			for (int frame = 0; frame < 32 && ctx.Rip != 0; frame++) {
+				HMODULE fm = nullptr;
+				wchar_t fn[MAX_PATH] = L"?";
+				if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				                       reinterpret_cast<LPCWSTR>(ctx.Rip), &fm) && fm != nullptr)
+					GetModuleFileNameW(fm, fn, MAX_PATH);
+				std::fwprintf(f, L"  #%02d %ls + 0x%llx\n", frame, fn,
+				              fm != nullptr ? static_cast<unsigned long long>(ctx.Rip - reinterpret_cast<uintptr_t>(fm)) : static_cast<unsigned long long>(ctx.Rip));
+				DWORD64 image = 0;
+				RUNTIME_FUNCTION* fe = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
+				if (fe == nullptr) {
+					// A leaf function: the return address is at Rsp.
+					if (ctx.Rsp == 0 || IsBadReadPtr(reinterpret_cast<void*>(ctx.Rsp), sizeof(DWORD64))) break;
+					ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+					ctx.Rsp += 8;
+				} else {
+					void*   handler_data = nullptr;
+					DWORD64 establisher  = 0;
+					RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fe, &ctx, &handler_data, &establisher, nullptr);
+				}
+			}
+		}
 		std::fclose(f);
 	}
 	std::printf("[port] crash: exception 0x%08lx in %ls + 0x%llx\n", code, name, off);
