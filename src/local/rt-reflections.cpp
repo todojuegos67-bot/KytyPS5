@@ -1574,7 +1574,17 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		header[34] = cap_px;   // (fparams.z)
 		header[35] = have_mat ? 0.0f : guess; // (fparams.w: the puddle guess's scale; off with a material field)
 		header[36] = g_rt.mat_lo, header[37] = g_rt.mat_hi, header[38] = g_rt.mat_scale; // (mparams)
-		header[39] = 0.0f;
+		// (refl-motion-1031, mparams.w) the motion de-smear: on unless KYTY_RT_REFLECTIONS_MOTION=0 (-1)
+		static const bool motion_fix = [] {
+			const char* e = std::getenv("KYTY_RT_REFLECTIONS_MOTION");
+			const bool  on = !(e != nullptr && e[0] == '0');
+			std::printf("RT reflections: motion de-smear (refl-motion-1031) %s: in motion (> 0.5 px a frame) the history's share "
+			            "falls and its YCoCg box tightens, water too; a still camera as before (KYTY_RT_REFLECTIONS_MOTION=0: off)\n",
+			            on ? "on" : "off");
+			std::fflush(stdout);
+			return on;
+		}();
+		header[39] = motion_fix ? 0.0f : -1.0f;
 		header[40] = g_rt.guide_lo, header[41] = g_rt.guide_hi, header[42] = g_rt.guide_premul ? 1.0f : 0.0f; // (gparams)
 		header[43] = g_rt.guide_strength;
 		// (refl9, xparams) the metal / glossy paths; the albedo layer L0 (its bits 0..23) unless the normal lives there

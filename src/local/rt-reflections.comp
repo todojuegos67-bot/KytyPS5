@@ -631,7 +631,8 @@ vec3 SampleGgxVndf(vec3 N, vec3 V, float alpha, vec2 u) {
 	return normalize(tx * hl.x + ty * hl.y + N * hl.z);
 }
 
-bool WaterStable() { return (push.misc.w & 2048) != 0; } // (water-1030, see WaterClamp)
+bool WaterStable() { return (push.misc.w & 2048) != 0; }
+bool MotionFix() { return mparams.w > -0.5; } // (refl-motion-1031; KYTY_RT_REFLECTIONS_MOTION=0: -1, off) // (water-1030, see WaterClamp)
 bool Sampled(ivec2 p) { return ((p.x | p.y) & 3) == 0; } // (the stats: 1 pixel in 16)
 // (one atomic per subgroup: the lanes active here summed first)
 void Stat(int k, int v) {
@@ -849,7 +850,8 @@ void Temporal(ivec2 px) {
 		bool  fl = e1 < e0;
 		// (only where the camera's matrices agree with the game's motion vector: static surfaces, the right frame)
 		if (min(e0, e1) < 3.0) {
-			float wv = 1.0 - smoothstep(0.1, 0.45, rough);
+			// (refl-motion-1031: alta / maxima the reflected point's parallax up to glossier surfaces too)
+			float wv = MotionFix() && int(yparams.z + 0.5) >= 1 ? 1.0 - smoothstep(0.25, 0.6, rough) : 1.0 - smoothstep(0.1, 0.45, rough);
 			vec2  vp = PrevUv(Xv, fl);
 			vec2  dv = vp - (fl ? s1 : s0);
 			if (!any(isnan(dv)) && length(dv) < 0.25) puv = puv_s + dv * wv;
@@ -857,6 +859,16 @@ void Temporal(ivec2 px) {
 	}
 	bool  valid = (push.misc.w & 1) == 0 && (push.misc.w & 2) != 0 && InScreen(puv_s) && InScreen(puv);
 	vec4  meta  = vec4(0);
+	// (refl-motion-1031) How fast the surface and its reflection move on screen (render pixels a frame, the larger of the
+	// two reprojections): 0 below 0.5 px (a still camera, its jitter: exactly as before), 1 from 3 px (Normal) / 2 px (Alta,
+	// Maxima). At speed the history's share falls and its colour box tightens, so the reflection does not smear.
+	float tmov = 0.0;
+	if (MotionFix()) {
+		vec2  rsz = RenderSize();
+		float vp  = max(length(mv * rsz), length((puv - uv) * rsz));
+		if (isnan(vp) || isinf(vp)) vp = 0.0;
+		tmov = smoothstep(0.5, int(yparams.z + 0.5) >= 1 ? 2.0 : 3.0, vp);
+	}
 	if (valid) {
 		ivec2 pp = clamp(ivec2(puv_s * ts), ivec2(0), hi);
 		vec4  pg = texelFetch(gb_prev, pp, 0);
@@ -872,6 +884,7 @@ void Temporal(ivec2 px) {
 		vec4  hist = textureLod(src_b, puv, 0);
 		if (Bad(hist)) hist = cur;
 		float k    = mix(0.75, 2.5, smoothstep(0.05, 0.4, rough)); // (refl3: mirrors clamped tighter: no ghosts)
+		k         *= mix(1.0, int(yparams.z + 0.5) >= 1 ? 0.4 : 0.6, tmov); // (refl-motion-1031: the YCoCg box tighter in motion)
 		vec3  hy   = clamp(YCoCg(hist.rgb), m1 - k * sig - 1e-4, m1 + k * sig + 1e-4);
 		hist.rgb   = max(Rgb(hy), vec3(0));
 		hist.a     = clamp(hist.a, a1 - k * asig - 0.02, a1 + k * asig + 0.02);
@@ -882,6 +895,12 @@ void Temporal(ivec2 px) {
 		if (sh == 1) amin = max(amin * 1.5, mix(0.35, 0.08, smoothstep(0.02, 0.3, rough)));
 		if (sh == 2) amin = max(amin * 2.0, mix(0.45, 0.14, smoothstep(0.02, 0.3, rough)));
 		float alpha = max(1.0 / len, amin);
+		// (refl-motion-1031) in motion the new frame's share rises toward amov (less on rough surfaces: their noise)
+		if (tmov > 0.0) {
+			float amov = (sh == 2 ? 0.85 : sh == 1 ? 0.7 : 0.5) * mix(1.0, 0.6, smoothstep(0.1, 0.5, rough));
+			alpha      = mix(alpha, max(alpha, amov), tmov);
+			len        = mix(len, min(len, 4.0), tmov);
+		}
 		// (a miss this frame against a held reflection: the history fades slowly instead of popping)
 		if (fresh && cur.a < hist.a * 0.5) alpha *= 0.5;
 		// (refl9b) a sample far brighter or darker than the history: taken in more slowly (per-pixel flicker)
@@ -1154,10 +1173,15 @@ vec3 Stabilize(ivec2 px, vec3 c0, vec3 outc, float d, bool wl) {
 		// pixel's light a frame. A source switch (screen-space hit, TLAS colour, stand-in, the mirror ray) is so blended
 		// over several frames instead of shown in one.
 		if (ww) alpha = valid ? mix(0.15, 0.25, mov) : 1.0;
-		vec3  box   = vec3((ww ? mix(1.5, 0.5, mov) : mix(4.0, 0.08, mov)) * lref);
+		// (refl-motion-1031) water while the camera moves: much more of this frame (Normal 60 %, Alta 80 %, Maxima 90 %), a
+		// tighter box and a looser change limit, so it does not smear; still camera (mov 0): the flash fix as it was.
+		int   msh   = int(yparams.z + 0.5);
+		bool  mfix  = MotionFix() && ww;
+		if (mfix && valid) alpha = mix(0.15, msh == 2 ? 0.9 : msh == 1 ? 0.8 : 0.6, mov);
+		vec3  box   = vec3((ww ? mix(1.5, mfix ? (msh >= 1 ? 0.15 : 0.3) : 0.5, mov) : mix(4.0, 0.08, mov)) * lref);
 		hd          = clamp(hd, delta - box, delta + box);
 		vec3  tgt   = mix(hd, delta, alpha);
-		float lim   = ww ? (0.06 + 0.09 * mov) * lref : mov > 0.5 ? 1e30 : (0.06 + 0.60 * mov) * lref;
+		float lim   = ww ? (0.06 + (mfix ? (msh >= 1 ? 4.0 : 0.5) : 0.09) * mov) * lref : mov > 0.5 ? 1e30 : (0.06 + 0.60 * mov) * lref;
 		vec3  stp   = tgt - hd;
 		// (a darkening going back toward the game's pixel: twice the rate)
 		if (Luma(hd) < 0.0 && Luma(stp) > 0.0) lim *= 2.0;
