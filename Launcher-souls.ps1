@@ -430,7 +430,8 @@ function Start-Game {
 	# 0,35 / 0,5 / 0,7. Con la Luz volumetrica y sin Sombras RT el pase sigue a fuerza 0 (solo da el sol a la volumetrica).
 	$shLv = if (-not $pureGame -and $cmbRtSh) { [math]::Min([math]::Max(0, $cmbRtSh.SelectedIndex), 3) } else { 0 }
 	$raysOn = (-not $pureGame -and $cmbRays -and $cmbRays.SelectedIndex -gt 0)
-	if ($raysOn) { $sets += "KYTY_GODRAYS=$($cmbRays.SelectedIndex)" }  # (10-25) luz volumetrica Bajo/Medio/Alto
+	if ($raysOn) { $sets += "KYTY_GODRAYS=$($cmbRays.SelectedIndex)" }
+	if (-not $pureGame -and $cmbMotes -and $cmbMotes.SelectedIndex -gt 0) { $sets += "KYTY_MOTES=$($cmbMotes.SelectedIndex)" } else { $sets += 'KYTY_MOTES=0' }  # (motes-1031) particulas volumetricas  # (10-25) luz volumetrica Bajo/Medio/Alto
 	if ($shLv -gt 0) {
 		$env:KYTY_RT_SHADOWS = "$shLv"; $env:KYTY_RT_SHADOWS_STRENGTH = @('0', '0.35', '0.5', '0.7')[$shLv]
 		$sets += @('KYTY_RT_SUN=0', 'KYTY_HWRT_SHADOW=0')  # (solo el camino de pantalla: sin cascadas ni TLAS)
@@ -458,7 +459,7 @@ function Start-Game {
 		$sets = @($sets | Where-Object { $_ -notmatch $fxPat })
 		foreach ($n in @(Get-ChildItem Env: | Where-Object { $_.Name -match $fxPat } | ForEach-Object { $_.Name })) { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
 		$sets += @('KYTY_HWRT=0', 'KYTY_HWRT_REFL=0', 'KYTY_HWRT_SHADOW=0', 'KYTY_HWRT_LIGHTS=0', 'KYTY_HWRT_PARTICLES=0', 'KYTY_HWRT_GI=0', 'KYTY_HWRT_AO=0', 'KYTY_HWRT_CONTACT=0', 'KYTY_HWRT_SOFTSUN=0', 'KYTY_HWRT_WATER=0', 'KYTY_HWRT_VOLSHADOW=0', 'KYTY_RT_REFLECTIONS=0',
-			'KYTY_RT_SHADOWS=0', 'KYTY_CONTACT_SHADOWS=0', 'KYTY_RT_SUN=0', 'KYTY_RT_PARTICLES=0', 'KYTY_GODRAYS=0', 'KYTY_SHINE=0', 'KYTY_SPEC_OCCLUSION=0',
+			'KYTY_RT_SHADOWS=0', 'KYTY_CONTACT_SHADOWS=0', 'KYTY_RT_SUN=0', 'KYTY_RT_PARTICLES=0', 'KYTY_GODRAYS=0', 'KYTY_MOTES=0', 'KYTY_SHINE=0', 'KYTY_SPEC_OCCLUSION=0',
 			'KYTY_GTAO=0', 'KYTY_SSGI=0', 'KYTY_SSR=0', 'KYTY_AO=0', 'KYTY_TORCH=0', 'KYTY_TORCH_FLARE=0', 'KYTY_TORCH_HW=0', 'KYTY_SMOKE=0', 'KYTY_RT_HW_EXPERIMENTAL=0', 'KYTY_DOF=0', 'KYTY_FOVEATED=0', 'KYTY_DLSS_NR=0')
 		$pa = @(); for ($i = 0; $i -lt $psargs.Count; $i++) { if ($psargs[$i] -eq '-Ssgi') { $i++; continue }; $pa += $psargs[$i] }; $psargs = $pa
 	}
@@ -2383,6 +2384,7 @@ function New-RtCombo([string]$label, [string]$key, $y, [string]$tip, $items = @(
 $cmbRtSh = $null  # (10-29) Sombras RT retiradas (se veian mal)
 $cmbAoNew = $null  # (10-29) Path tracing retirado (se veia mal)
 $cmbRays = New-RtCombo 'Luz volumetrica' 'godrays2' 24 'Luz volumetrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms (mas rayos y mas pasos de sombra).' @('No', 'Bajo', 'Medio', 'Alto')
+$cmbMotes = New-RtCombo 'Particulas volum.' 'motes1031' 1564 'Motas de polvo en suspension iluminadas por los rayos de sol y el halo de antorchas y lamparas (la luz volumetrica); flotan despacio y quedan fijas en el mundo. Sutil / Media / Densa: cuantas. Solo con DLSS, XeSS o FSR. ~0,2-0,5 ms.' @('No', 'Sutil', 'Media', 'Densa')  # (motes-1031) KYTY_MOTES
 $cmbRtRf = New-RtCombo 'Reflejos RT' 'rtrefl2' 56 'Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, mas nitidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolucion completa y mas fuertes). Hibrido: Alto + rayos por hardware (RT real) solo donde el rayo de pantalla no encuentra nada (fuera de pantalla o tapado); el color sale de la pantalla anterior, limitado al de alrededor y entrando poco a poco: sin destellos. Necesita GPU con RT. ~+0,5 ms. Beta.' @('No', 'Bajo', 'Medio', 'Alto', 'Ultra', 'Extremo', 'Híbrido')  # (10-25 noche) Extremo = nivel 5 (refl10)  # (10-25) refl8; Ultra vuelve: el cierre era del frame generation AMD, no de los reflejos  # (refl-hybrid-1028) Hibrido = 6
 $cmbRtSharp = New-RtCombo 'Nitidez reflejos RT' 'rtreflsharp' 1500 'Mas nitidez en los reflejos RT (superficies y agua). Normal: como ahora. Alta: rayos a resolucion completa en Bajo/Medio, menos desenfoque y menos mezcla con frames anteriores (~+0,3-0,8 ms). Maxima: ademas sin tablero de ajedrez, el desenfoque minimo y el historial mas corto; los espejos conservan el detalle, puede verse algo mas de ruido (~+0,6-1,5 ms).' @('Normal', 'Alta', 'Máxima')  # (refl-sharp-1031) KYTY_RT_REFLECTIONS_SHARP
 $cmbRtWaves = New-RtCombo 'Ondas agua reflejos' 'rtreflwaves' 1532 'Cuanto mueven las ondas del agua el rayo del reflejo (el agua se ve igual). Como ahora: sin cambios. Suaves: 40 % de la ondulacion, reflejos mas limpios. Espejo: el agua refleja como un espejo plano. Sin coste.' @('Como ahora', 'Suaves', 'Espejo')  # (refl-sharp-1031) KYTY_RT_REFLECTIONS_WATER_WAVES
@@ -2825,7 +2827,7 @@ if ($gCtl -and $btnCtl) { $gCtl.Top = $btnCtl.Bottom + 6 }
 # (audit) Casilla Juego original: al marcarla las filas de efectos quedan inactivas (sus valores se guardan).
 $chkPure = New-Check 'Juego original (sin efectos añadidos)' 0 0 396 'puregame'
 $tips.SetToolTip($chkPure, 'Apaga todos los efectos visuales que anade el emulador (ray tracing, luz volumetrica, sombras RT, brillo, oclusion, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, frame generation y latencia no cambian.')
-function Update-PureGame { foreach ($c in @($cmbRtRf, $cmbRtSharp, $cmbRtWaves, $cmbRt, $cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbSmoke, $cmbFov)) { if ($c) { $c.Enabled = -not $chkPure.Checked } } }
+function Update-PureGame { foreach ($c in @($cmbRtRf, $cmbRtSharp, $cmbRtWaves, $cmbRt, $cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRays, $cmbMotes, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbSmoke, $cmbFov)) { if ($c) { $c.Enabled = -not $chkPure.Checked } } }
 $chkPure.Add_CheckedChanged({ Update-PureGame })
 # (10-26) "Ray tracing" solo con RT real: fuera Luz RT (SSGI), Luz volumetrica de pantalla, Reflejos RT, Sol RT y Particulas RT de pantalla.
 # (Visible no sirve para leer antes de mostrar la ventana: se trabaja con listas.)
@@ -2834,7 +2836,7 @@ try {
 	$rtHwExp = (Get-IniValue 'rthwexp' '0') -eq '1'
 	$fake = @($cmbSun, $cmbPart, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater) | Where-Object { $_ }  # (10-27) solo reflejos, sombras RT y rayos volumetricos
 	$hideOnly = @(if (-not $rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } })  # (vol25) la Luz volumetrica ya no se oculta
-	$keep = @(@($cmbRtRf, $cmbRtSharp, $cmbRtWaves, $cmbRt, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbSmoke, $cmbRtSh) | Where-Object { $_ }) + @(if ($rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } | Sort-Object Top })  # (vol25) Luz volumetrica del 10-25 visible otra vez, debajo
+	$keep = @(@($cmbRtRf, $cmbRtSharp, $cmbRtWaves, $cmbRt, $cmbRays, $cmbMotes, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbSmoke, $cmbRtSh) | Where-Object { $_ }) + @(if ($rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } | Sort-Object Top })  # (vol25) Luz volumetrica del 10-25 visible otra vez, debajo
 	$lblOf = @{}
 	foreach ($c in @($fake + $hideOnly + $keep + @($cmbShQ, $cmbShD, $cmbAo, $cmbIbl, $cmbTess) | Where-Object { $_ })) {
 		$lblOf[$c.GetHashCode()] = @($gRt.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and [math]::Abs($_.Top - ($c.Top + 2)) -le 4 })
@@ -2899,7 +2901,7 @@ try {
 	if ($chkPure) { $cmbFov.Enabled = -not $chkPure.Checked }
 } catch { }
 # (10-26) Al elegir cualquier Modo Souls: todo el ray tracing en No (el usuario lo enciende a mano despues).
-function Set-RtAllOff { foreach ($c in @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRt, $cmbRtRf, $cmbRtSharp, $cmbRtWaves, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbRays)) { if ($c -and $c.Items.Count -gt 0) { $c.SelectedIndex = 0 } } }
+function Set-RtAllOff { foreach ($c in @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRt, $cmbRtRf, $cmbRtSharp, $cmbRtWaves, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbRays, $cmbMotes)) { if ($c -and $c.Items.Count -gt 0) { $c.SelectedIndex = 0 } } }
 # (vol25) Luz volumetrica y Sombras sol RT comparten el pase del sol en el motor: con las dos, el sol de la volumetrica
 # llega a ratos (niebla que salta). Se excluyen: elegir una pone la otra en No.
 if ($false -and $cmbRays -and $cmbHSun) {  # (rt-vol 1ac512fe) ya pueden ir juntas
