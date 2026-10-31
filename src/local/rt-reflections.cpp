@@ -535,11 +535,18 @@ int WaterWaves() {
 bool TraceFull(int level) { return Cfg(level).full || SharpLevel() >= 1; }
 bool TraceChecker(int level) { return Cfg(level).checker && SharpLevel() < 2; }
 
-bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level) {
-	if (g_rt.out.image != VK_NULL_HANDLE && g_rt.render == render && g_rt.level == level) return true;
+// (refl-res-1031) Maxima: the trace at the output (after-upscaler) size, at most 2x the render's per axis; else as before.
+vk::Extent2D TraceExtent(vk::Extent2D render, vk::Extent2D output, int level) {
+	if (SharpLevel() >= 2 && output.width > render.width && output.height > render.height)
+		return {std::min(output.width, render.width * 2), std::min(output.height, render.height * 2)};
+	return TraceFull(level) ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
+}
+
+bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level, vk::Extent2D output) {
+	const vk::Extent2D trace = TraceExtent(render, output, level);
+	if (g_rt.out.image != VK_NULL_HANDLE && g_rt.render == render && g_rt.level == level && g_rt.trace == trace) return true;
 	for (auto* img: Sized())
 		if (img != &g_rt.dummy) Retire(*img);
-	const vk::Extent2D trace = TraceFull(level) ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
 	uint32_t levels = 1;
 	while (levels < MaxMips && ((render.width >> levels) > 0 || (render.height >> levels) > 0)) ++levels;
 	const auto f16 = vk::Format::eR16G16B16A16Sfloat;
@@ -820,7 +827,9 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	if (now - g_rt.stat_time < std::chrono::seconds(10)) return;
 	const auto&    sm     = g_rt.stat_sum;
 	const double   px     = static_cast<double>(std::max<uint64_t>(sm[0], 1));
-	const double   area   = (TraceFull(level) ? 1.0 : 0.25) * (TraceChecker(level) ? 0.5 : 1.0); // (rays per render pixel)
+	const double   area   = (g_rt.render.width > 0 ? static_cast<double>(g_rt.trace.width) * g_rt.trace.height /
+	                                                   (static_cast<double>(g_rt.render.width) * g_rt.render.height)
+	                                             : 1.0) * (TraceChecker(level) ? 0.5 : 1.0); // (rays per render pixel)
 	const uint64_t copies = RtReflCopies();
 	const bool  mat    = g_rt.dec_rough >= 0 && g_rt.dec_normal >= 0;
 	const char* source = g_rt.stat_guide_frames > 0 ? (g_rt.have_water ? "the game's SSR (guide) + water" : "the game's SSR (guide)")
@@ -1260,7 +1269,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 		return false;
 	}
-	if (g_rt.images_failed || !EnsurePipeline(*graphics) || !EnsureImages(*graphics, color.extent, level)) {
+	if (g_rt.images_failed || !EnsurePipeline(*graphics) || !EnsureImages(*graphics, color.extent, level, inputs.output.extent)) {
 		static bool said = false;
 		if (!said) {
 			said = true;
