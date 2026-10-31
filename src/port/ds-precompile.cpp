@@ -271,6 +271,10 @@ long long PlannedPipelines(const fs::path& log) {
 //   4. shards of ~100 planned pipelines: the recorded tier, --merge --keep-shards ("listo para jugar"), the seeds' tier
 //   5. --merge --stamp --prune
 void Work() {
+	if (g_setup.refresh) {
+		SetText("Preparando shaders: la carpeta del juego...");
+		g_setup.refresh(g_setup);
+	}
 	const fs::path& root  = g_setup.root;
 	const fs::path& seeds = g_setup.seeds;
 	const std::string& id = g_setup.id;
@@ -553,6 +557,8 @@ void Choose(const std::string& ini, Settings* settings) {
 
 bool CacheCurrent() {
 #if defined(_WIN32)
+	if (g_setup.refresh) g_setup.refresh(g_setup);
+	if (g_setup.id.empty()) return false;
 	const fs::path out = g_setup.root / L"logs" / L"precompile-status.txt";
 	std::error_code ec;
 	fs::create_directories(out.parent_path(), ec);

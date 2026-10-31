@@ -828,7 +828,7 @@ void DrawShaderBlock(float unit) {
 		ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), {-1, 30 * unit}, "Preparando...");
 	}
 	ImGui::TextColored(v.failed ? kWarn : (v.finished ? kGold : kDim), "%s",
-	                   v.text.empty() ? I18n::T("Shaders: la cache de esta grafica ya esta preparada.") : v.text.c_str());
+	                   v.text.empty() ? I18n::T("Shaders: la cache de esta grafica ya esta preparada.") : I18n::T(v.text.c_str()));
 	if (v.running) {
 		ImGui::SameLine();
 		if (ImGui::SmallButton(I18n::T("Detener"))) std::thread([] { Precompile::Stop(); }).detach();

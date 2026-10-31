@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 
 namespace Port {
@@ -29,6 +30,11 @@ struct Setup {
 	int                   cpus     = 1;
 	std::string           cache_key;     // the game's KYTY_DRIVER_CACHE_KEY (DriverCacheKey); empty: the default one
 	std::string           shadow_filter; // the game's KYTY_SHADOW_FILTER ("" or "1".."3"): the precompile translates as it
+	// (ds-pc-port37) Before each precompile and status check: the game folder settings.ini holds now (both launcher
+	// buttons save it there), its seed file, hints and prefetch inputs made, game / id / seeds set from it. Without it a
+	// folder chosen in the launcher was precompiled as the one the port started with (another version: other seeds,
+	// 1000 parts or 250), and the game, started with the new one, found none of it.
+	std::function<void(Setup&)> refresh;
 };
 
 void Configure(const Setup& setup);

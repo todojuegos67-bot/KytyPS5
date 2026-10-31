@@ -871,6 +871,27 @@ int main(int argc, char* argv[]) {
 		ps.cpus     = cpus;
 		ps.cache_key     = Port::DriverCacheKey(settings);
 		ps.shadow_filter = Port::ShadowFilterLevel(settings);
+		{
+			const uint64_t pa = ps.affinity;
+			const int      pc = cpus;
+			ps.refresh        = [root, ini, pa, pc](Port::Precompile::Setup& setup) {
+				Port::Settings now;
+				if (!Port::LoadSettings(ini, &now) || now.game.empty() || !IsGame(now.game)) return;
+				setup.cache_key     = Port::DriverCacheKey(now);
+				setup.shadow_filter = Port::ShadowFilterLevel(now);
+				const GameParam p   = ReadParam(now.game);
+				const std::string id = p.title_id.empty() ? std::string() : p.title_id + "_" + p.version;
+				// The seed file, hints and prefetch inputs of that folder's version (quick when they are current).
+				PrepareShaders(root, now.game, p, pa, pc);
+				if (now.game != setup.game || id != setup.id)
+					std::printf("[port] precompile: game folder %s (%s), was %s (%s)\n", now.game.c_str(), id.c_str(), setup.game.c_str(),
+					            setup.id.c_str());
+				setup.game  = now.game;
+				setup.id    = id;
+				setup.seeds = root / Wide(id.empty() ? std::string("seeds.seeds") : "seeds-" + id + ".seeds");
+				std::fflush(stdout);
+			};
+		}
 		Port::Precompile::Configure(ps);
 		std::error_code pe;
 		if (!ps.id.empty() && fs::exists(ps.seeds, pe)) {
