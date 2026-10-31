@@ -120,7 +120,10 @@ public:
 	// The first `count` recorded buffers, in order, after this scheduler's open one (submitted first): the tick of
 	// the last.
 	uint64_t SubmitRecorded(Recorder& recorder, size_t count);
-	static constexpr size_t MaxSubmitEntries = 8; // command buffers in one submission
+	// SubmitRecorded's buffers held for one submission with what follows (KYTY_SPECULATE_BATCH_SUBMITS: a speculation's
+	// segments of one commit, ~100 submissions a frame otherwise): submitted now, or with the next Submit.
+	void FlushRecorded();
+	static constexpr size_t MaxSubmitEntries = 24; // command buffers in one submission
 	// Drops what was recorded (never submitted): the buffers are free again.
 	void DiscardRecorded(Recorder& recorder);
 
@@ -191,6 +194,8 @@ private:
 	uint32_t                     m_recorded_dispatches = 0;
 	uint32_t                     m_recorded_draws      = 0;
 	bool                         m_flush_deferred      = false; // DeferrableFlush left the open buffer open
+	std::array<SubmitEntry, MaxSubmitEntries> m_batch {}; // (SubmitRecorded's, not submitted yet: FlushRecorded)
+	size_t                                    m_batched = 0;
 	uint32_t                     m_deferred_checks     = 0;
 	// The last tick handed to the driver (its vkQueueSubmit returned: on the recording worker for a deferred one).
 	std::atomic<uint64_t>        m_driver_tick {0};

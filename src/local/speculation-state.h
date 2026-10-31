@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "live-switch.h"
 
 #include <algorithm>
 #include <array>
@@ -25,6 +26,7 @@
 #include <cstring>
 #include <deque>
 #include <immintrin.h>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -518,6 +520,61 @@ struct EffectSourceScope {
 	EffectSource       saved;
 };
 
+// The log index (+ 1) of the latest effect over each 256-byte unit (4 KiB for host writes), and over each 4 MiB
+// granule for writes larger than 1 MiB (KYTY_SPECULATE_STAMPS, on by default; Effects::Clear): a commit asks whether
+// anything was written over what a segment read since it began by looking at the units it read, instead of adding every
+// entry since to a range set and searching it for every read (commit bookkeeping was ~20% of the thread that commits,
+// 10-31). A unit stamped since is a candidate only: EffectsLog::FirstWriteOver decides. The thread that commits alone
+// writes and reads it.
+template <uint64_t UnitBits>
+struct WriteStamps {
+	static constexpr uint64_t GranuleBits  = 22; // (4 MiB a leaf)
+	static constexpr uint64_t LeafBits     = GranuleBits - UnitBits;
+	static constexpr uint64_t AddressLimit = uint64_t {1} << 40u;
+	static constexpr uint64_t BigWrite     = uint64_t {1} << 20u;
+	struct Leaf {
+		std::array<uint64_t, size_t {1} << LeafBits> units {};
+	};
+	struct Granule {
+		uint64_t              coarse = 0; // (a big write over some of it)
+		uint64_t              latest = 0; // (the latest stamp in it: a granule not written since is passed whole)
+		std::unique_ptr<Leaf> leaf;
+	};
+	std::vector<Granule> granules = std::vector<Granule>(AddressLimit >> GranuleBits);
+	void                 Stamp(uint64_t address, uint64_t size, uint64_t stamp) {
+		                if (size == 0 || address >= AddressLimit) return;
+		                const auto end = std::min(address + size, AddressLimit);
+		                if (end - address > BigWrite) {
+			                for (auto g = address >> GranuleBits, last = (end - 1) >> GranuleBits; g <= last; ++g)
+				                granules[g].coarse = granules[g].latest = stamp;
+			                return;
+		                }
+		                for (auto unit = address >> UnitBits, last = (end - 1) >> UnitBits; unit <= last; ++unit) {
+			                auto& granule = granules[unit >> LeafBits];
+			                if (!granule.leaf) granule.leaf = std::make_unique<Leaf>();
+			                granule.leaf->units[unit & ((uint64_t {1} << LeafBits) - 1)] = stamp;
+			                granule.latest                                                = stamp;
+		                }
+	}
+	// Whether an effect logged at index `from` or later may be over [address, address + size).
+	[[nodiscard]] bool MaybeSince(uint64_t address, uint64_t size, uint64_t from) const {
+		if (size == 0) return false;
+		if (address >= AddressLimit || address + size > AddressLimit) return true;
+		const auto last = (address + size - 1) >> UnitBits;
+		for (auto unit = address >> UnitBits; unit <= last;) {
+			const auto& granule = granules[unit >> LeafBits];
+			if (granule.latest <= from) { // (nothing in the granule since: to the next one)
+				unit = ((unit >> LeafBits) + 1) << LeafBits;
+				continue;
+			}
+			if (granule.coarse > from) return true;
+			if (granule.leaf && granule.leaf->units[unit & ((uint64_t {1} << LeafBits) - 1)] > from) return true;
+			++unit;
+		}
+		return false;
+	}
+};
+
 // What the translation of the thread that commits does (the normal translation, holes) that a speculation translated
 // before it must see, in order (each speculation is checked against what was logged since it began): the ranges its
 // GPU work writes, the guest memory it writes on the CPU (the processor's writes, copies, fills), the descriptor sets
@@ -533,7 +590,11 @@ struct EffectsLog {
 	uint64_t              base = 0;  // the index of entries.front() since the log began
 	std::atomic<uint64_t> end {0};   // entries since the log began (read where a speculation begins)
 	[[nodiscard]] uint64_t End() const noexcept { return end.load(std::memory_order_acquire); }
+	WriteStamps<8>         stamps;      // GPU and host writes
+	WriteStamps<12>        host_stamps; // host writes
 	void                   Add(Kind kind, uint64_t address, uint64_t size) {
+		                  if (kind != Kind::RetiredSet) stamps.Stamp(address, size, base + entries.size() + 1);
+		                  if (kind == Kind::HostWrite) host_stamps.Stamp(address, size, base + entries.size() + 1);
 		                  entries.push_back({kind, t_effect_source, address, size});
 		                  end.store(base + entries.size(), std::memory_order_release);
 	}
@@ -545,6 +606,27 @@ struct EffectsLog {
 				return &entry;
 		}
 		return nullptr;
+	}
+	// The first GPU write logged from `from` on over the range (null: none).
+	[[nodiscard]] const Entry* FirstGpuWriteOver(uint64_t from, uint64_t address, uint64_t size) const {
+		for (auto i = std::max(from, base); i < base + entries.size(); ++i) {
+			const auto& entry = entries[i - base];
+			if (entry.kind == Kind::GpuWrite && entry.address < address + size && address < entry.address + entry.size)
+				return &entry;
+		}
+		return nullptr;
+	}
+	// Each host write logged from `from` on over the range, clipped to it.
+	template <typename F>
+	void ForEachHostWriteOver(uint64_t from, uint64_t address, uint64_t size, F&& f) const {
+		if (!host_stamps.MaybeSince(address, size, from)) return;
+		for (auto i = std::max(from, base); i < base + entries.size(); ++i) {
+			const auto& entry = entries[i - base];
+			if (entry.kind != Kind::HostWrite || entry.address >= address + size || address >= entry.address + entry.size)
+				continue;
+			const auto begin = std::max(address, entry.address), end = std::min(address + size, entry.address + entry.size);
+			f(begin, end - begin);
+		}
 	}
 	// What no speculation began before.
 	void DropBefore(uint64_t index) {
@@ -559,7 +641,11 @@ struct Effects {
 	RangeSet              gpu_writes, host_writes;
 	std::vector<uint64_t> retired_sets;
 	uint64_t              next = 0; // the log's next entry to take
+	bool                  stamped = false; // (writes looked up in the log's stamps, not gathered here)
 	void                  Clear(uint64_t from) {
+		// (KYTY_SPECULATE_STAMPS, live: `set speculate_stamps 0` gathers GPU writes in a range set as before.)
+		static auto& on = LiveSwitch::Find("speculate_stamps", 1);
+		stamped = on.load(std::memory_order_relaxed) != 0;
 		gpu_writes.Clear();
 		host_writes.Clear();
 		retired_sets.clear();
@@ -569,8 +655,12 @@ struct Effects {
 		for (next = std::max(next, log.base); next < log.base + log.entries.size(); ++next) {
 			const auto& entry = log.entries[next - log.base];
 			switch (entry.kind) {
-				case EffectsLog::Kind::GpuWrite: gpu_writes.Add(entry.address, entry.size); break;
-				case EffectsLog::Kind::HostWrite: host_writes.Add(entry.address, entry.size); break;
+				case EffectsLog::Kind::GpuWrite:
+					if (!stamped) gpu_writes.Add(entry.address, entry.size);
+					break;
+				case EffectsLog::Kind::HostWrite:
+					if (!stamped) host_writes.Add(entry.address, entry.size);
+					break;
 				case EffectsLog::Kind::RetiredSet: retired_sets.push_back(entry.address); break;
 			}
 		}

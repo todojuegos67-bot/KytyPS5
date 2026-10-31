@@ -3104,7 +3104,9 @@ void CommandProcessor::EmitGlobalBarrier() {
 	}
 #endif
 
-	RenderLockGuard lock(m_renderer.GetMutex());
+	// (A speculation's thread records into its own command buffer: nothing the render lock guards.)
+	std::optional<RenderLockGuard> lock;
+	if (CommandScheduler::ThreadRecorder() == nullptr) lock.emplace(m_renderer.GetMutex());
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -3129,7 +3131,8 @@ void CommandProcessor::BreakComputeChain() {
 	// Guest synchronization may be implemented without a host command.
 	// It still ends the compatibility profile's independent dispatch group.
 	if (!GetScheduler().Active()) return;
-	RenderLockGuard lock(m_renderer.GetMutex());
+	std::optional<RenderLockGuard> lock; // (as EmitGlobalBarrier's)
+	if (CommandScheduler::ThreadRecorder() == nullptr) lock.emplace(m_renderer.GetMutex());
 	auto& buffer = CurrentBuffer();
 	if (buffer.ComputeChainPending()) (void)buffer.Handle();
 }

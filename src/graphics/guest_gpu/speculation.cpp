@@ -685,6 +685,8 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 	auto&      r        = *result;
 	const auto start    = NowNs();
 	const auto progress = r.failed ? Progress::Stopped : CommitSegments(r, cp);
+	// (Its segments' buffers held for one submission go now: a speculation thread may wait for their tick.)
+	m_renderer.GetCommandScheduler().FlushRecorded();
 	m_commit_ns += NowNs() - start;
 	if (progress == Progress::Blocked) {
 		m_blocked = std::move(result);
@@ -800,7 +802,17 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			const auto& to      = state.closed[index].end;
 			const auto& effects = m_effects;
 			// The guest memory it read on the CPU as no GPU work wrote it (and as it was): not written since.
-			if (!effects.gpu_writes.Empty() || !effects.host_writes.Empty())
+			// (Stamped: a page written since is a candidate, the log's entries since over the read decide.)
+			const bool any_since = m_log.End() > result.effects_from;
+			if (effects.stamped) {
+				if (any_since)
+					for (size_t i = from.clean_reads; i < to.clean_reads; ++i) {
+						const auto& read = state.clean_reads[i];
+						if (!m_log.stamps.MaybeSince(read.begin, read.end - read.begin, result.effects_from)) continue;
+						if (const auto* write = m_log.FirstWriteOver(result.effects_from, read.begin, read.end - read.begin))
+							return ++m_stop_reasons[WroteWhatItRead(write)], Progress::Stopped;
+					}
+			} else if (!effects.gpu_writes.Empty() || !effects.host_writes.Empty())
 				for (size_t i = from.clean_reads; i < to.clean_reads; ++i) {
 					const auto& read = state.clean_reads[i];
 					if (effects.gpu_writes.Intersects(read.begin, read.end - read.begin) ||
@@ -815,7 +827,15 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				              state.sets.begin() + static_cast<ptrdiff_t>(to.sets), retired) !=
 				    state.sets.begin() + static_cast<ptrdiff_t>(to.sets))
 					return ++m_stop_reasons["commit: a hole retired a set"], Progress::Stopped;
-			if (!effects.gpu_writes.Empty())
+			if (effects.stamped) {
+				if (any_since)
+					for (size_t i = from.cpu_copies; i < to.cpu_copies; ++i) {
+						const auto& copy = state.cpu_copies[i];
+						if (m_log.stamps.MaybeSince(copy.begin, copy.end - copy.begin, result.effects_from) &&
+						    m_log.FirstGpuWriteOver(result.effects_from, copy.begin, copy.end - copy.begin) != nullptr)
+							return ++m_stop_reasons["commit: GPU work wrote what it copies"], Progress::Stopped;
+					}
+			} else if (!effects.gpu_writes.Empty())
 				for (size_t i = from.cpu_copies; i < to.cpu_copies; ++i) {
 					const auto& copy = state.cpu_copies[i];
 					if (effects.gpu_writes.Intersects(copy.begin, copy.end - copy.begin))
@@ -879,7 +899,14 @@ void Speculation::Before(Result& result, size_t index) {
 		buffers.EnsureBufferContents(range.begin, range.end - range.begin);
 	}
 	// (What the holes wrote on the CPU since, over ranges it reads on the GPU.)
-	if (!m_effects.host_writes.Empty())
+	if (m_effects.stamped) {
+		if (m_log.End() > result.effects_from)
+			for (size_t i = from.buffer_ranges; i < to.buffer_ranges; ++i) {
+				const auto& range = state.buffer_ranges[i];
+				m_log.ForEachHostWriteOver(result.effects_from, range.begin, range.end - range.begin,
+				                           [&](uint64_t address, uint64_t size) { buffers.EnsureBufferContents(address, size); });
+			}
+	} else if (!m_effects.host_writes.Empty())
 		for (size_t i = from.buffer_ranges; i < to.buffer_ranges; ++i) {
 			const auto& range = state.buffer_ranges[i];
 			m_effects.host_writes.ForEachIntersection(range.begin, range.end - range.begin, [&](RangeSet::Range written) {

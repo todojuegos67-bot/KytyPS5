@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "live-switch.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -741,8 +742,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	// A compute chain's pending barrier closes this buffer (left pending, the next Begin recorded it into a buffer
 	// that had not begun).
 	(void)m_command.Handle();
-	std::array<SubmitEntry, 2> entries {};
-	size_t                     n = 0;
+	// (After the recorded buffers held for it: SubmitRecorded leaves room for these two.)
+	std::array<SubmitEntry, MaxSubmitEntries> entries {};
+	size_t                                    n = 0;
+	for (size_t i = 0; i < m_batched; ++i) entries[n++] = m_batch[i];
+	m_batched = 0;
 	if (!m_prologue.IsInvalid()) entries[n++] = ClosePrologue();
 	entries[n++]          = {m_command.m_buffer, false, m_command.m_timestamp_slot};
 	const auto tick       = SubmitBuffers({entries.data(), n}, submit);
@@ -955,6 +959,30 @@ uint64_t CommandScheduler::SubmitRecorded(Recorder& recorder, size_t count) {
 		m_recorded_draws      = 0;
 		m_flush_deferred      = false;
 	}
+	// Held for one submission with what follows (the next Submit; FlushRecorded): each buffer's tick is the one that
+	// submission gets (CurrentTick). Only while this scheduler has an open buffer, which that submission includes:
+	// the open buffer's work is fenced with CurrentTick, so held buffers are never submitted without it (a batch
+	// submitted alone would move the tick under it), except when the batch fills, the open buffer closed.
+	static auto& batch = LiveSwitch::Find("speculate_batch_submits", 1);
+	if (open && (batch.load(std::memory_order_relaxed) != 0 || m_batched != 0)) {
+		const auto hold = [&](const SubmitEntry& entry) {
+			if (m_batched + 2 >= MaxSubmitEntries) { // (room for Submit's prologue and open buffer)
+				(void)SubmitBuffers({m_batch.data(), m_batched}, {});
+				m_batched = 0;
+			}
+			m_batch[m_batched++] = entry;
+		};
+		for (size_t i = 0; i < n; ++i) hold(entries[i]);
+		uint64_t tick = 0;
+		for (size_t i = 0; i < count; ++i) {
+			const auto& recorded = recorder.recorded[i];
+			hold({recorder.buffers[recorded.index].first, recorded.ended, recorded.timestamp_slot});
+			tick = recorder.buffers[recorded.index].second = m_master.CurrentTick();
+		}
+		recorder.recorded.erase(recorder.recorded.begin(), recorder.recorded.begin() + static_cast<ptrdiff_t>(count));
+		BeginNext();
+		return tick;
+	}
 	uint64_t tick = 0;
 	for (size_t i = 0, first = 0; i < count; ++i) {
 		const auto& recorded = recorder.recorded[i];
@@ -970,6 +998,12 @@ uint64_t CommandScheduler::SubmitRecorded(Recorder& recorder, size_t count) {
 	recorder.recorded.erase(recorder.recorded.begin(), recorder.recorded.begin() + static_cast<ptrdiff_t>(count));
 	if (open) BeginNext();
 	return tick;
+}
+
+void CommandScheduler::FlushRecorded() {
+	if (m_batched == 0) return;
+	SubmitInfo submit;
+	Flush(submit); // (with the open buffer: SubmitRecorded)
 }
 
 void CommandScheduler::DiscardRecorded(Recorder& recorder) {
