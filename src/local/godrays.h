@@ -13,6 +13,13 @@ namespace Libs::Graphics::FrameGen {
 
 [[nodiscard]] int  GodraysLevel();
 [[nodiscard]] bool GodraysWanted();
+// (motes-1031) KYTY_MOTES=0|1|2|3 ("Particulas volumetricas": No / Sutil / Media / Densa): floating dust motes in the
+// air, anchored in the world and drifting, lit only by the volumetric light (sun shafts, torch / lamp halos) of this
+// pass. With KYTY_GODRAYS off the pass runs at level 1 for the motes' light alone (its own light not added).
+[[nodiscard]] int MotesLevel();
+// (motes-1031, frame-gen.cpp) The camera's view -> world matrix (rows 0..2 of the 4x4, column vectors), from the
+// G-buffer pass's view-projection and the upscaler's view -> clip. False: not known this frame.
+bool GodraysViewToWorld(const std::array<float, 16>& view_to_clip, std::array<float, 12>& rows);
 // In Upscale, after ShineApply: inputs.color becomes the composited copy. False: nothing done.
 bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs);
 // From CShadowApply (KYTY_RT_SHADOWS) every frame it knows the sun: the view-space direction to it and its weight.

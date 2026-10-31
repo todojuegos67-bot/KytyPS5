@@ -1392,6 +1392,7 @@ void Draw(float width, float height) {
 					if (ChoiceRow("Luz volumétrica", changed_not_live(l.godrays != s.godrays, 4), kRtLevels, kRtLevelCount, s.godrays,
 					              "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms. Apagarla es inmediato."))
 						live_changed = true;
+					ChoiceRow("Partículas volumétricas", s.motes != l.motes, kMotesLevels, kMotesLevelCount, s.motes, "Motas de polvo en suspensión iluminadas por los rayos de sol y el halo de antorchas y lámparas (la luz volumétrica); flotan despacio y quedan fijas en el mundo. Sutil / Media / Densa: cuántas. Solo con DLSS, XeSS o FSR. ~0,2-0,5 ms."); // (motes-1031)
 					// (ds-pc-port9 / ds-pc-port10) No Path tracing, Luz de antorchas RT or Destellos de lente in the port.
 					ChoiceRow("Humo y partículas", s.smoke != l.smoke, kSmokeLevels, kSmokeLevelCount, s.smoke,
 					          "Humo y partículas más realistas sobre las del propio juego: Suave = el humo, la niebla de partículas y las chispas ya no cortan en línea dura donde tocan suelo y paredes (se funden en ~35 cm). Solo con DLSS, XeSS o FSR. ~0,3 ms.");
@@ -2140,6 +2141,8 @@ void LauncherRayTracing(Settings& s) {
 	     "Iluminación por rayos sobre la imagen (luz rebotada y sombreado de contacto). Solo funciona con DLSS, XeSS o FSR. Cuesta FPS. Experimental.", fx, fw);
 	LRow("Luz volumétrica", kRtLevelCount, kRtLevels, s.godrays, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms.", fx, fw);
+	LRow("Partículas volum.", kMotesLevelCount, kMotesLevels, s.motes, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+	     "Motas de polvo en suspensión iluminadas por los rayos de sol y el halo de antorchas y lámparas (la luz volumétrica); flotan despacio y quedan fijas en el mundo. Sutil / Media / Densa: cuántas. Solo con DLSS, XeSS o FSR. ~0,2-0,5 ms.", fx, fw); // (motes-1031)
 	// (ds-pc-port10) Luz de antorchas RT and Destellos de lente are gone from the port (always off).
 	LRow("Humo y partículas", kSmokeLevelCount, kSmokeLevels, s.smoke, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Humo y partículas más realistas sobre las del propio juego: Suave = el humo, la niebla de partículas y las chispas ya no cortan en línea dura donde tocan suelo y paredes (se funden en ~35 cm). Solo con DLSS, XeSS o FSR. ~0,3 ms.",

@@ -40,6 +40,8 @@ layout(std430, binding = 6) buffer Frame {
 	uint stats[16];  // 0 frames, 1 lights in use summed, 2 sun on screen frames
 	vec4 sunc;       // the sun's hue (rgb, luminance 1), w: valid
 	vec4 lights[16]; // 8 slots x (uv x, uv y, depth, weight), (exposed rgb, age)
+	vec4 wview[3];   // (motes-1031) view -> world rows (column vectors)
+	vec4 mote;       // (motes-1031) x density (0 off), y time (s), z 1: wview valid, w layers
 	vec4 cand[];     // 16x9 cells x (exposed luminance, uv x, uv y, depth), (exposed rgb, -)
 };
 layout(std430, binding = 7) readonly buffer Exposure {
@@ -399,6 +401,49 @@ void Spatial(ivec2 q) {
 	imageStore(aux_out, q, vec4(Fin(s / w, 0.0, 4.0), c.y, c.z, 1));
 }
 
+// (motes-1031) World-anchored dust: per slab along the view ray (t 0.6 m .. 12 m, growing x1.35), the world cell under
+// the ray's slab centre holds at most one mote (hashed position in its inner part, hashed presence by the density),
+// drifting slowly and wobbling; a soft dot ~1.5 px across at its distance, faded at the slab's ends (no popping) and
+// cut by the surface (depth). Brightness: the pixel's in-scatter x a forward-scatter boost.
+float MHash(vec3 c) { return fract(sin(dot(c, vec3(12.9898, 78.233, 37.719))) * 43758.5453); }
+vec3  MHash3(vec3 c) { return vec3(MHash(c), MHash(c + 17.31), MHash(c + 41.97)); }
+vec3  ToWorld(vec3 v, float w) { vec4 h = vec4(v, w); return vec3(dot(wview[0], h), dot(wview[1], h), dot(wview[2], h)); }
+vec3 Motes(vec2 uv, float tmax, vec3 lit, vec2 rs) {
+	vec3  dirv = RayDir(uv);
+	vec3  ro   = ToWorld(vec3(0), 1.0);
+	vec3  rd   = normalize(ToWorld(dirv, 0.0));
+	float tm   = mote.y;
+	vec3  drift = vec3(0.021, -0.008, 0.013) * tm; // (a slow air current, m/s)
+	float px   = 2.0 / (abs(push.proj.y) * rs.y);  // (metres per pixel at 1 m)
+	int   n    = int(mote.w);
+	float t    = 0.6, acc = 0.0;
+	for (int i = 0; i < 10; ++i) {
+		if (i >= n) break;
+		float slab = t * 0.35;
+		float tc   = t + 0.5 * slab;
+		if (tc > tmax) break;
+		vec3  wp   = ro + rd * tc + drift;
+		vec3  cell = floor(wp / slab);
+		vec3  h    = MHash3(cell + float(i) * 101.0);
+		if (h.x < mote.x * 0.55) {
+			vec3  mp = (cell + 0.2 + 0.6 * MHash3(cell + 7.7)) * slab; // (inner 60 %)
+			mp += 0.02 * slab * sin(tm * (0.6 + h.y) + h.z * 6.283 + vec3(0.0, 2.1, 4.2)); // (wobble)
+			vec3  dv = mp - drift - ro;
+			float tt = dot(dv, rd);
+			if (tt > 0.3 && tt < tmax) {
+				float r    = 0.9 * px * tt; // (~1.8 px across)
+				float dist = length(dv - rd * tt);
+				float dot_ = exp(-dist * dist / (r * r));
+				float edge = 1.0 - smoothstep(0.35, 0.5, abs(tt - tc) / slab);
+				float near = smoothstep(0.3, 1.0, tt) * (1.0 - smoothstep(8.0, 12.0, tt));
+				acc += dot_ * edge * near * (0.5 + h.y);
+			}
+		}
+		t += slab;
+	}
+	return lit * min(acc, 2.0) * (2.5 + 2.5 * mote.x);
+}
+
 void Composite(ivec2 p) {
 	vec2 rs = RenderSize();
 	if (p.x >= int(rs.x) || p.y >= int(rs.y)) return;
@@ -455,6 +500,11 @@ void Composite(ivec2 p) {
 			add += Hue(lc) * (ll * 0.01 * I * fade * push.extra.z);
 		}
 	}
+	// (motes-1031) Dust motes in the lit air: the light they catch is this pixel's in-scatter (sun shafts, halos).
+	vec3 madd = vec3(0);
+	if (mote.x > 0.0 && mote.z > 0.5 && Luma(add) > 1e-5) madd = Motes(uv, sky ? 30.0 : length(ViewPos(uv, d)), add, rs);
+	if ((push.misc.z & 4) != 0) add = vec3(0); // (motes only: the pass's own light not added)
+	add += madd;
 	// Hue-preserving soft cap on the added (exposed) luminance, less over already bright pixels.
 	float al  = Luma(add);
 	float cap = push.size.w;

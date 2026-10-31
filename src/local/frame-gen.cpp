@@ -6336,6 +6336,36 @@ bool SsrViewRotation(const std::array<float, 16>& m, std::array<float, 12>& rows
 	return true;
 }
 
+// (motes-1031) view -> world: View = P^-1 * VP (as SsrViewRotation, the full 4x4), inverted.
+bool GodraysViewToWorld(const std::array<float, 16>& m, std::array<float, 12>& rows) {
+	std::array<float, 16> vp {};
+	{
+		std::lock_guard lock(g_ssr_gb.mutex);
+		if (!g_ssr_gb.have_vp || g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.vp_flip + 4) return false;
+		vp = g_ssr_gb.view_proj;
+	}
+	std::array<float, 16> pc {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j) pc[i * 4 + j] = m[j * 4 + i];
+	std::array<double, 16> pinv {};
+	if (!Inverse4(pc, pinv)) return false;
+	std::array<float, 16> view {};
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j) {
+			double d = 0.0;
+			for (int k = 0; k < 4; ++k) d += pinv[i * 4 + k] * vp[k * 4 + j];
+			if (!std::isfinite(d)) return false;
+			view[i * 4 + j] = static_cast<float>(d);
+		}
+	std::array<double, 16> inv {};
+	if (!Inverse4(view, inv)) return false;
+	for (int i = 0; i < 12; ++i) {
+		if (!std::isfinite(inv[i])) return false;
+		rows[i] = static_cast<float>(inv[i]);
+	}
+	return true;
+}
+
 // The calibration's verdict (after its frames are done): the normal layout, the roughness field; logged with the scores.
 void SsrAnalyze(uint32_t packed_count) {
 	if (g_ssr.calib_mapped == nullptr || g_graphics_ctx == nullptr) return;
@@ -6746,7 +6776,8 @@ bool SsrWanted() {
 	       SsgiEmissive() > 0.0f || // (rtfire: the emissive light reads the G-buffer copy's albedo)
 	       HwGiWanted() ||           // (KYTY_HWRT_AO / KYTY_HWRT_GI: its normal and albedo)
 	       RtAoLevel() > 0 ||        // (ao-1028: KYTY_AO: its normal, albedo and the lighting's depth)
-	       TorchLevel() > 0;         // (KYTY_TORCH: the firelight's normal, albedo and roughness)
+	       TorchLevel() > 0 ||       // (KYTY_TORCH: the firelight's normal, albedo and roughness)
+	       MotesLevel() > 0;         // (motes-1031: the G-buffer pass's view-projection, the motes' world anchor)
 }
 bool SsrPassWanted() { return SsrLevel() > 0; }
 

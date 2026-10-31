@@ -90,6 +90,8 @@ const Choice kRtReflLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3"
 const int    kRtReflLevelCount = 7;
 const Choice kRtReflSharp[] = {{"0", "Normal"}, {"1", "Alta"}, {"2", "M\xC3\xA1xima"}}; // (refl-sharp-1031)
 const int    kRtReflSharpCount = 3;
+const Choice kMotesLevels[] = {{"0", "No"}, {"1", "Sutil"}, {"2", "Media"}, {"3", "Densa"}}; // (motes-1031)
+const int    kMotesLevelCount = 4;
 const Choice kRtReflWaves[] = {{"0", "Como ahora"}, {"1", "Suaves"}, {"2", "Espejo"}}; // (refl-sharp-1031)
 const int    kRtReflWavesCount = 3;
 const Choice kRtLightLevels[] = {{"0", "No"}, {"1", "Media"}, {"2", "Alta"}, {"3", "Ultra"}, {"4", "Extremo"}};
@@ -273,6 +275,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("rt_metal", s->rt_metal);
 	boo("rt_oclusion", s->rt_ao);
 	str("luz_volumetrica", s->godrays);
+	str("particulas_volumetricas", s->motes);
 	boo("juego_original", s->pure_game);
 	str("bordes_sombras", s->shadow_edges);
 	str("sombra_rincones", s->corner_shadow);
@@ -321,6 +324,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	};
 	clamp_level(s->rt_ss_refl, 6);
 	clamp_level(s->rt_refl_sharp, 2);
+	clamp_level(s->motes, 3);
 	clamp_level(s->rt_refl_waves, 2);
 	clamp_level(s->rt_ssgi, 4);
 	clamp_level(s->rt_shadows, 3);
@@ -494,6 +498,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "rt_oclusion=" << b(s.rt_ao) << "\n"
 	  << "; Luz volumetrica: 0 no, 1 bajo, 2 medio, 3 alto (excluye rt_sombras_sol)\n"
 	  << "luz_volumetrica=" << s.godrays << "\n"
+	  << "; Particulas volumetricas (motas de polvo iluminadas por la luz volumetrica): 0 no, 1 sutil, 2 media, 3 densa\n"
+	  << "particulas_volumetricas=" << s.motes << "\n"
 	  << "; Juego original: 1 apaga todos los efectos visuales que anade el emulador\n"
 	  << "juego_original=" << b(s.pure_game) << "\n\n"
 	  << "[Mandos]\n"
@@ -781,13 +787,15 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	const bool godrays = !s.pure_game && (s.godrays == "1" || s.godrays == "2" || s.godrays == "3");
 	const bool shadows = false; // (ds-pc-port9) Sombras RT retired
 	if (godrays) sets.emplace_back("KYTY_GODRAYS", s.godrays);
+	const bool motes = !s.pure_game && (s.motes == "1" || s.motes == "2" || s.motes == "3"); // (motes-1031)
+	sets.emplace_back("KYTY_MOTES", motes ? s.motes : "");
 	if (shadows) {
 		static const char* strength[] = {"0", "0.35", "0.5", "0.7"};
 		sets.emplace_back("KYTY_RT_SHADOWS", s.rt_shadows);
 		sets.emplace_back("KYTY_RT_SHADOWS_STRENGTH", strength[std::atoi(s.rt_shadows.c_str())]);
 		sets.emplace_back("KYTY_RT_SUN", "0");
 		sets.emplace_back("KYTY_HWRT_SHADOW", "0");
-	} else if (godrays) {
+	} else if (godrays || motes) { // (motes-1031: the motes' light needs the sun too)
 		sets.emplace_back("KYTY_RT_SHADOWS", "1");
 		sets.emplace_back("KYTY_RT_SHADOWS_STRENGTH", "0");
 		sets.emplace_back("KYTY_RT_SUN", "0");
@@ -1074,7 +1082,7 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.detail != n.detail || l.reflections != n.reflections || l.object_fade != n.object_fade || l.aa_sharp != n.aa_sharp ||
 	       l.shadow_edges != n.shadow_edges || l.corner_shadow != n.corner_shadow || l.rt_reflections != n.rt_reflections ||
 	       l.rt_sun != n.rt_sun || l.rt_fog != n.rt_fog || LampLevel(l) != LampLevel(n) || l.rt_metal != n.rt_metal ||
-	       l.rt_ao != n.rt_ao || l.godrays != n.godrays || l.pure_game != n.pure_game || l.motion_blur != n.motion_blur || l.dof != n.dof || l.vignette != n.vignette ||
+	       l.rt_ao != n.rt_ao || l.godrays != n.godrays || l.motes != n.motes || l.pure_game != n.pure_game || l.motion_blur != n.motion_blur || l.dof != n.dof || l.vignette != n.vignette ||
 	       l.bloom != n.bloom || l.eye_adapt != n.eye_adapt || l.af16 != n.af16 || l.texture_sharpness != n.texture_sharpness ||
 	       l.kbm != n.kbm || l.kbm_sens != n.kbm_sens || l.kbm_antidz != n.kbm_antidz || l.kbm_map != n.kbm_map ||
 	       l.pad_map != n.pad_map || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
@@ -1093,7 +1101,7 @@ bool FixedFg(const Settings& s) {
 void RtAllOff(Settings* s) {
 	s->rt_reflections = s->rt_sun = s->rt_fog = s->rt_particles = s->rt_metal = s->rt_ao = false;
 	// (10-28) and the screen-space set / new passes (rt_experimental itself stays as chosen)
-	s->rt_ss_refl = s->rt_ssgi = s->rt_shadows = s->ao = s->torch = s->godrays = s->rt_lamps = "0";
+	s->rt_ss_refl = s->rt_ssgi = s->rt_shadows = s->ao = s->torch = s->godrays = s->rt_lamps = s->motes = "0";
 	s->lens_flare = false;
 }
 

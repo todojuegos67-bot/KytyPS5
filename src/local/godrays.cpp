@@ -43,7 +43,8 @@ constexpr uint32_t Bindings    = 10;
 constexpr uint32_t StatsWord   = 4;
 constexpr uint32_t StatsCount  = 16;
 constexpr uint32_t Cells       = 16 * 9;
-constexpr uint32_t FrameBytes  = (24 + 16 * 4 + Cells * 8) * 4;
+constexpr uint32_t FrameBytes  = (24 + 16 * 4 + 16 + Cells * 8) * 4; // (motes-1031: + wview[3], mote)
+constexpr uint32_t MoteBytesAt = (24 + 16 * 4) * 4;
 constexpr uint32_t ExposureIdx = 0; // hdr.x (1.0) when the game gives no exposure
 
 struct GodraysPush {
@@ -324,13 +325,22 @@ void Log(int level, bool have_sun) {
 
 } // namespace
 
-int GodraysLevel() {
+int GodraysEnvLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_GODRAYS");
 		return value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
 	}();
 	return level;
 }
+int MotesLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_MOTES");
+		return value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
+	}();
+	return level;
+}
+// (motes-1031) the motes alone run the pass at level 1, its own light not added
+int GodraysLevel() { return std::max(GodraysEnvLevel(), MotesLevel() > 0 ? 1 : 0); }
 bool GodraysWanted() { return GodraysLevel() > 0; }
 
 void GodraysSetSun(const std::array<double, 3>& view_dir, float weight) {
@@ -442,7 +452,7 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.motion[3] = static_cast<float>(steps);
 	const bool game_exposure = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
 	push.misc[1] = static_cast<int32_t>(g_gr.frame & 0x7fffffff);
-	push.misc[2] = (row0_up ? 1 : 0) | (debug ? 2 : 0);
+	push.misc[2] = (row0_up ? 1 : 0) | (debug ? 2 : 0) | (GodraysEnvLevel() == 0 ? 4 : 0); // (4: motes only)
 	push.misc[3] = game_exposure ? static_cast<int32_t>(inputs.exposure_index) : static_cast<int32_t>(ExposureIdx);
 	push.extra[0] = static_cast<float>(g_gr.qextent.width), push.extra[1] = static_cast<float>(g_gr.qextent.height);
 	push.extra[2] = lstr;
@@ -472,6 +482,25 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		std::array<float, 4> hdr {1.0f, EnvFloat("KYTY_GODRAYS_LIGHT", 3.0f, 0.5f, 100.0f), static_cast<float>(slots),
 		                          EnvFloat("KYTY_GODRAYS_LIGHT_RADIUS", 1.2f, 0.2f, 10.0f)};
 		command.updateBuffer(vk::Buffer(g_gr.frame_buf), 0, sizeof(hdr), hdr.data());
+		// (motes-1031) wview[3] (view -> world rows), mote: x density, y time (s), z valid, w layers
+		std::array<float, 16> mote {};
+		const int ml = MotesLevel();
+		std::array<float, 12> wrows {};
+		if (ml > 0 && GodraysViewToWorld(m, wrows)) {
+			std::copy(wrows.begin(), wrows.end(), mote.begin());
+			static const auto t0 = std::chrono::steady_clock::now();
+			const float t = std::fmod(std::chrono::duration<float>(now - t0).count(), 3600.0f);
+			mote[12] = ml == 1 ? 0.35f : ml == 2 ? 0.6f : 1.0f, mote[13] = t, mote[14] = 1.0f;
+			mote[15] = static_cast<float>(ml == 1 ? 6 : ml == 2 ? 8 : 10);
+		}
+		command.updateBuffer(vk::Buffer(g_gr.frame_buf), MoteBytesAt, sizeof(mote), mote.data());
+		static bool said = false;
+		if (!said && ml > 0) {
+			said = true;
+			std::printf("GODRAYS: volumetric motes (motes-1031) level %d (%s)\n", ml,
+			            GodraysEnvLevel() == 0 ? "the pass's own light not added: motes only" : "with the volumetric light");
+			std::fflush(stdout);
+		}
 	}
 	Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);

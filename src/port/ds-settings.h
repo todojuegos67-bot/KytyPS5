@@ -72,6 +72,8 @@ extern const Choice  kRtReflLevels[];  // Reflejos RT: No, Bajo, Medio, Alto, Ul
 extern const int     kRtReflLevelCount;
 extern const Choice  kRtReflSharp[];   // (refl-sharp-1031) Nitidez de reflejos RT: Normal, Alta, Maxima
 extern const int     kRtReflSharpCount;
+extern const Choice  kMotesLevels[];   // (motes-1031) Particulas volumetricas: No, Sutil, Media, Densa
+extern const int     kMotesLevelCount;
 extern const Choice  kRtReflWaves[];   // (refl-sharp-1031) Ondas del agua en reflejos: Como ahora, Suaves, Espejo
 extern const int     kRtReflWavesCount;
 extern const Choice  kRtLightLevels[]; // Luz RT (SSGI): No, Media, Alta, Ultra, Extremo
@@ -157,6 +159,7 @@ struct Settings {
 	bool        rt_reflections = false, rt_sun = false, rt_fog = false, rt_particles = false, rt_metal = false, rt_ao = false;
 	// (10-28) Antorchas (the launcher's hwlamp4): 0 No, 1 Bajo, 2 Medio, 3 Alto (KYTY_HWRT_LIGHTS level, with the RT particles).
 	std::string rt_lamps = "";       // empty: from rt_particles (an older settings.ini: Si = 2)
+	std::string motes = "0";         // (motes-1031) particulas_volumetricas: 0 No, 1 Sutil, 2 Media, 3 Densa (KYTY_MOTES)
 	std::string godrays = "0";       // Luz volumetrica: 0 No, 1 Bajo, 2 Medio, 3 Alto (KYTY_GODRAYS + the hidden RT sun pass)
 	bool        pure_game = false;   // Juego original: every visual pass the emulator adds off
 	// (10-28, ds-torch-1028) The screen-space RT set and the new passes (none needs hardware RT but Hibrido):
