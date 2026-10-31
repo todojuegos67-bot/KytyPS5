@@ -1857,6 +1857,16 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
+		// A state pass or a speculation may pass a command buffer after the GPU thread translated it, and the game may
+		// have written that memory again since (its labels are written then): a packet that does not fit ends a state
+		// pass there (the rest is translated the normal way) and is refused by a speculation, instead of the exits
+		// below (one ended a mode 4 run while the stone arch loaded, 10-31).
+		if ((m_state_only || spec != nullptr) && packet_header != 0x80000000u &&
+		    (remaining_dw < 2 || KYTY_PM4_LEN(packet_header) == 0 || KYTY_PM4_LEN(packet_header) > remaining_dw)) {
+			if (spec != nullptr) return refuse("malformed packet");
+			execution.m_suspended = true;
+			return;
+		}
 
 		if (packet_header == 0x80000000u) {
 			cursor.offset_dw++;
@@ -2112,14 +2122,33 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		                        opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO))
 			return refuse("draw"); // (no table draw took it)
 		uint32_t packet_dw = 0;
-		if (spec == nullptr) {
+		// (Off the GPU thread a handler's exit, a packet that cannot be, is a worker reading command memory the game
+		// reused or GPU work wrote: the speculation refuses it ("malformed packet", the spec report's stops) and a state
+		// pass ends there, as 4c1e5d95's length check does; the render thread keeps the exits. A COPY_DATA of another
+		// header ended a mode 4 run after a death, 5 Nov.)
+		if (spec == nullptr && m_state_only && !GuestGpu::IsGpuThread()) {
+			try {
+				const Common::RecoverableExitScope recoverable;
+				packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+			} catch (const Common::RecoverableExit& malformed) {
+				static std::atomic<uint32_t> reports {0};
+				if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+					std::printf("Speculation: a state pass ended at a malformed packet (header 0x%08x): %s\n", packet_header,
+					            malformed.message.c_str());
+				execution.m_suspended = true;
+				return;
+			}
+		} else if (spec == nullptr) {
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		} else {
 			// What would submit or wait for the GPU refuses the packet.
 			try {
+				const Common::RecoverableExitScope recoverable;
 				packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 			} catch (const CommandScheduler::RecorderRefusal& refusal) {
 				Spec::Refuse(refusal.what);
+			} catch (const Common::RecoverableExit&) {
+				Spec::Refuse("malformed packet");
 			}
 			if (spec->refused != nullptr) {
 				// Refused in an indirect buffer it opened: this level goes on past it.

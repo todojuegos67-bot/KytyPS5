@@ -529,11 +529,14 @@ struct EffectSourceScope {
 template <uint64_t UnitBits>
 struct WriteStamps {
 	static constexpr uint64_t GranuleBits  = 22; // (4 MiB a leaf)
+	static constexpr uint64_t BlockBits    = 16; // (64 KiB: writes over MidWrite are stamped by block)
 	static constexpr uint64_t LeafBits     = GranuleBits - UnitBits;
 	static constexpr uint64_t AddressLimit = uint64_t {1} << 40u;
 	static constexpr uint64_t BigWrite     = uint64_t {1} << 20u;
+	static constexpr uint64_t MidWrite     = uint64_t {1} << 14u;
 	struct Leaf {
-		std::array<uint64_t, size_t {1} << LeafBits> units {};
+		std::array<uint64_t, size_t {1} << LeafBits>                     units {};
+		std::array<uint64_t, size_t {1} << (GranuleBits - BlockBits)> blocks {};
 	};
 	struct Granule {
 		uint64_t              coarse = 0; // (a big write over some of it)
@@ -541,20 +544,25 @@ struct WriteStamps {
 		std::unique_ptr<Leaf> leaf;
 	};
 	std::vector<Granule> granules = std::vector<Granule>(AddressLimit >> GranuleBits);
-	void                 Stamp(uint64_t address, uint64_t size, uint64_t stamp) {
-		                if (size == 0 || address >= AddressLimit) return;
-		                const auto end = std::min(address + size, AddressLimit);
-		                if (end - address > BigWrite) {
-			                for (auto g = address >> GranuleBits, last = (end - 1) >> GranuleBits; g <= last; ++g)
-				                granules[g].coarse = granules[g].latest = stamp;
-			                return;
-		                }
-		                for (auto unit = address >> UnitBits, last = (end - 1) >> UnitBits; unit <= last; ++unit) {
-			                auto& granule = granules[unit >> LeafBits];
-			                if (!granule.leaf) granule.leaf = std::make_unique<Leaf>();
-			                granule.leaf->units[unit & ((uint64_t {1} << LeafBits) - 1)] = stamp;
-			                granule.latest                                                = stamp;
-		                }
+	// (A write of 16 KiB to 1 MiB stamps its 64 KiB blocks, one over 1 MiB its granules: at most 64 stores a write.
+	// Every unit cost ~1.5 ms a frame of the render thread for the async queue's culling buffers, 10-31.)
+	void Stamp(uint64_t address, uint64_t size, uint64_t stamp) {
+		if (size == 0 || address >= AddressLimit) return;
+		const auto end = std::min(address + size, AddressLimit);
+		if (end - address > BigWrite) {
+			for (auto g = address >> GranuleBits, last = (end - 1) >> GranuleBits; g <= last; ++g)
+				granules[g].coarse = granules[g].latest = stamp;
+			return;
+		}
+		const bool by_block = end - address > MidWrite;
+		const auto bits     = by_block ? BlockBits : UnitBits;
+		for (auto at = address >> bits, last = (end - 1) >> bits; at <= last; ++at) {
+			auto& granule = granules[(at << bits) >> GranuleBits];
+			if (!granule.leaf) granule.leaf = std::make_unique<Leaf>();
+			if (by_block) granule.leaf->blocks[at & ((uint64_t {1} << (GranuleBits - BlockBits)) - 1)] = stamp;
+			else granule.leaf->units[at & ((uint64_t {1} << LeafBits) - 1)] = stamp;
+			granule.latest = stamp;
+		}
 	}
 	// Whether an effect logged at index `from` or later may be over [address, address + size).
 	[[nodiscard]] bool MaybeSince(uint64_t address, uint64_t size, uint64_t from) const {
@@ -568,7 +576,12 @@ struct WriteStamps {
 				continue;
 			}
 			if (granule.coarse > from) return true;
-			if (granule.leaf && granule.leaf->units[unit & ((uint64_t {1} << LeafBits) - 1)] > from) return true;
+			if (granule.leaf) {
+				const auto& leaf = *granule.leaf;
+				if (leaf.units[unit & ((uint64_t {1} << LeafBits) - 1)] > from) return true;
+				if (leaf.blocks[((unit << UnitBits) >> BlockBits) & ((uint64_t {1} << (GranuleBits - BlockBits)) - 1)] > from)
+					return true;
+			}
 			++unit;
 		}
 		return false;
