@@ -463,6 +463,16 @@ float MovingRaw(vec2 uv, vec3 P) {
 }
 float Moving(vec2 uv, vec3 P) { return (push.misc.w & 128) != 0 ? MovingRaw(uv, P) : 0.0; }
 
+// (refl-motion-1031) Flat floors that are not water: the reflection's normal settled toward world up where the geometry
+// (the depth's normal) and the surface's own normal are both level, so the depth's stair-steps and the normal map's
+// bumps do not make a wave that slides over a mirror-like floor while walking. Water keeps WaterNormal (its own option).
+vec3 FlatFloor(vec3 N, vec3 Nd) {
+	if (!(mparams.w > -0.5) || (push.misc.w & 8) == 0) return N;
+	vec3  up = normalize(up_view.xyz);
+	float f  = smoothstep(0.93, 0.98, dot(Nd, up)) * smoothstep(0.85, 0.95, dot(N, up));
+	return f > 0.0 ? normalize(mix(N, up, 0.85 * f)) : N;
+}
+
 Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	Surf s;
 	vec3 Nd = NormalAt(ruv, P);
@@ -474,6 +484,7 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	float water = WaterMask(rp, d, ruv, Nd);
 	if (water > 0.0) match = false; // (the G-buffer holds the bed under the water)
 	s.N  = match ? Ng : (water > 0.0 ? WaterNormal(Nd) : Nd);
+	if (water <= 0.0) s.N = FlatFloor(s.N, Nd); // (refl-motion-1031)
 	s.Ng = Nd;
 	s.gb = match ? 1.0 : 0.0;
 	if (dot(s.N, V) < 0.02) s.N = normalize(s.N + V * (0.02 - dot(s.N, V) + 0.01)); // (back-facing by a little: bent)
@@ -1221,7 +1232,7 @@ vec3 CompositeRaw(ivec2 px, vec4 col, float d, out bool wl) {
 	vec3  Nd = NormalAt(uv, P);
 	vec3  Ng;
 	bool  match = GbufNormal(px, Ng) && dot(Ng, Nd) > 0.6;
-	vec3  N     = match ? Ng : Nd;
+	vec3  N     = FlatFloor(match ? Ng : Nd, Nd); // (refl-motion-1031; water: WaterNormal below)
 	if (st && match) Stat(6, 1);
 	if (st && (push.misc.w & 64) != 0) {
 		float d0 = texelFetch(gdepth, px, 0).r;
