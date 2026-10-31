@@ -27,6 +27,7 @@
 // Every 10 s "HWRTWATER: 10 s:" with the water draws captured, the water / puddle share of the screen, the rays' outcome,
 // the history's validity, the composited share, the TLAS alignment self-check and the GPU time; the flicker self-check
 // has its own "water mirrors" entry in the RTFLICKER line.
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/rt-water.h"
 #include "local/env-level.h"
 
@@ -260,7 +261,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_w.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_w.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_w.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_w.pipeline = nullptr;

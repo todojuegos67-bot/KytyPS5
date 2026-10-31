@@ -2,6 +2,7 @@
 // push descriptors; per frame a stats dispatch (256 x 144 samples) into one of 4 slots of a device buffer, copied to a
 // host buffer the CPU reads 3 frames later, then (unless the view is "stats") the view into our own image, which the
 // upscaler then reads in place of the game's color. Nothing of this exists while both variables are unset.
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/gbuf-view.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -240,7 +241,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_gv.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_gv.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_gv.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_gv.pipeline = nullptr;

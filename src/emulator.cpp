@@ -25,6 +25,7 @@
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 #include "loader/timer.h"
+#include "local/local-platform.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -198,6 +199,7 @@ void Run(const RunOptions& options) {
 	ClearDebugTextureFolder();
 
 	PrintSystemInfo();
+	LocalPlatform::AutoVcacheRenderCpus(); // (ds-perf-1031: before any worker thread starts)
 
 	int ok = atexit(KytyClose);
 	EXIT_NOT_IMPLEMENTED(ok != 0);

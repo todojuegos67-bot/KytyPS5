@@ -1,4 +1,5 @@
 // KYTY_RT_FLICKER: the ray-traced passes' flicker self-check (rt-flicker.h, rt-flicker.comp).
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/rt-flicker.h"
 
 #include "gpu_tiler_shaders/rtflicker_spv.h"
@@ -109,7 +110,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_f.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_f.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_f.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) return g_f.pipeline = nullptr, false;
 	vk::SamplerCreateInfo sampler {};

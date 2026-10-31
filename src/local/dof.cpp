@@ -16,6 +16,7 @@
 // KYTY_DOF_RADIUS (x the level's radius, 0..3), KYTY_DOF_BOKEH (x the highlight boost, 0..4), KYTY_DOF_VIEW=1 (the blur
 // amount alone, white = full).
 // Every 10 s one "DOF:" line: the level, the focus and ramp end, the share of pixels blurred, GPU ms (and per pass).
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/dof.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -202,7 +203,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_dof.layout;
-	const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_dof.pipeline);
+	const auto created = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_dof.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_dof.pipeline = nullptr;

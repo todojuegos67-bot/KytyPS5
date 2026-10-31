@@ -8,6 +8,7 @@
 #include "local/frame-gen.h" // (vulkan.hpp)
 
 #include <atomic>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -26,9 +27,22 @@ inline const char* Path() { return "_PipelineCache/local/rt-passes.bin"; }
 inline std::atomic<VkPipelineCache> g_cache {VK_NULL_HANDLE};
 inline std::atomic<VkDevice>        g_device {VK_NULL_HANDLE};
 
+// (ds-perf-1031) KYTY_PASS_DISK_CACHE=0: the local passes other than HWRT particles make their pipelines with no cache
+// (as before ds-perf-1031); default: every local compute pass (RT reflections, torch, godrays, SSGI, DLSS NR, sun
+// shadows, ...) through this disk cache, so their first use in a later session takes the driver's cache hit, not a
+// compile on the flip (10-31 log: 206-1465 ms each on first use).
+inline bool DiskCacheOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PASS_DISK_CACHE");
+		return !(value != nullptr && value[0] == '0');
+	}();
+	return on;
+}
+
 inline vk::PipelineCache Get(vk::Device device) {
 	static std::once_flag once;
 	std::call_once(once, [device] {
+		std::printf("Pass disk cache: %s (KYTY_PASS_DISK_CACHE=0: off)\n", DiskCacheOn() ? "on" : "off");
 		std::vector<char> data;
 		if (FILE* f = std::fopen(Path(), "rb")) {
 			std::fseek(f, 0, SEEK_END);
@@ -53,7 +67,7 @@ inline vk::PipelineCache Get(vk::Device device) {
 		g_device.store(static_cast<VkDevice>(device));
 		g_cache.store(static_cast<VkPipelineCache>(cache));
 	});
-	return vk::PipelineCache(g_cache.load());
+	return DiskCacheOn() ? vk::PipelineCache(g_cache.load()) : vk::PipelineCache(nullptr);
 }
 
 // Written after the prewarm and after each pipeline made on the flip path (a few a session).

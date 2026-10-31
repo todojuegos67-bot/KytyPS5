@@ -2655,7 +2655,7 @@ bool EnsureSharpen(GraphicContext& graphics, const VulkanImage& like) {
 		pipeline_info.stage.module = module;
 		pipeline_info.stage.pName  = "main";
 		pipeline_info.layout       = g_sharp.layout;
-		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_sharp.pipeline);
+		const auto created = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_sharp.pipeline);
 		device.destroyShaderModule(module, nullptr);
 		if (created != vk::Result::eSuccess) {
 			g_sharp.pipeline = nullptr;
@@ -2868,7 +2868,7 @@ bool EnsureBypassPipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_bypass.layout;
-	const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_bypass.pipeline);
+	const auto created = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_bypass.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_bypass.pipeline = nullptr;
@@ -4997,7 +4997,7 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		pipeline_info.stage.module = module;
 		pipeline_info.stage.pName  = "main";
 		pipeline_info.layout       = g_ssgi.layout;
-		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_ssgi.pipeline);
+		const auto created = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_ssgi.pipeline);
 		device.destroyShaderModule(module, nullptr);
 		if (created != vk::Result::eSuccess) {
 			g_ssgi.pipeline = nullptr;
@@ -5567,7 +5567,7 @@ bool GtaoEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
 		pipeline_info.stage.module = module;
 		pipeline_info.stage.pName  = "main";
 		pipeline_info.layout       = g_gtao.layout;
-		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_gtao.pipeline);
+		const auto created = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_gtao.pipeline);
 		device.destroyShaderModule(module, nullptr);
 		if (created != vk::Result::eSuccess) {
 			g_gtao.pipeline = nullptr;
@@ -6213,7 +6213,7 @@ bool SsrEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
 		pipeline_info.stage.module = module;
 		pipeline_info.stage.pName  = "main";
 		pipeline_info.layout       = g_ssr.layout;
-		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_ssr.pipeline);
+		const auto created = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_ssr.pipeline);
 		device.destroyShaderModule(module, nullptr);
 		if (created != vk::Result::eSuccess) {
 			g_ssr.pipeline = nullptr;
@@ -8577,7 +8577,7 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		pipeline_info.stage.module = module;
 		pipeline_info.stage.pName  = "main";
 		pipeline_info.layout       = g_cs.layout;
-		const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_cs.pipeline);
+		const auto created = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_cs.pipeline);
 		device.destroyShaderModule(module, nullptr);
 		if (created != vk::Result::eSuccess) {
 			g_cs.pipeline = nullptr;

@@ -107,6 +107,7 @@
 // pixel (chist), reprojected by the motion vector, averaged and limited to a change of 6 % of the pixel's light a frame on a
 // still camera (36 % moving); no added darkening (it moves only between two results that both keep MaxDarken). Every 10 s
 // "RT reflections: flash fix:" with the shares where each limit acted (stats 30 / 31).
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/rt-reflections.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -442,7 +443,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_rt.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_rt.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_rt.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_rt.pipeline = nullptr;
@@ -717,7 +718,7 @@ bool EnsureHwPipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_rt.hw_layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_rt.hw_pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_rt.hw_pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_rt.hw_pipeline = nullptr;
@@ -1269,7 +1270,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 		return false;
 	}
-	if (g_rt.images_failed || !EnsurePipeline(*graphics) || !EnsureImages(*graphics, color.extent, level, inputs.output.extent)) {
+	if (g_rt.images_failed || ![&] { std::lock_guard lock(LocalPassCache::EnsureMutex()); return EnsurePipeline(*graphics); }() || !EnsureImages(*graphics, color.extent, level, inputs.output.extent)) {
 		static bool said = false;
 		if (!said) {
 			said = true;
@@ -1502,7 +1503,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		else if (!HwScene::SceneCamera(vp)) why = "no scene camera yet";
 		else if (!InvertRows(vp, ivp)) why = "the scene camera is degenerate";
 		else if (!camera.prev) why = "no camera matrices (motion vectors only)";
-		else if (!EnsureHwPipeline(*graphics)) why = "could not create its ray query pipeline";
+		else if (![&] { std::lock_guard lock(LocalPassCache::EnsureMutex()); return EnsureHwPipeline(*graphics); }()) why = "could not create its ray query pipeline";
 		if (why != nullptr) {
 			++g_rt.hw_skipped;
 			if (g_rt.hw_why != why) {
@@ -1814,6 +1815,21 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 
 // (ds-rt1026-restore) The 10-25/26 RT reflections (c3e58bd5) restored; frame-gen.cpp's prewarm hook (09e52edf) kept as a
 // no-op: the pipeline is made on first use, as it was then.
-void RtReflectionsPrewarm(GraphicContext& /*graphics*/) {}
+// (ds-perf-1031) Made again beside the title screen (frame-gen.cpp's prewarm thread), under the pass cache's mutex
+// which the flip path takes too: the 10-31 log's first world frame waited 1465 ms in RtReflectionsApply.
+// KYTY_RT_PREWARM=0: on first use, as before.
+void RtReflectionsPrewarm(GraphicContext& graphics) {
+	if (RtReflectionsLevel() <= 0) return;
+	const auto begin = std::chrono::steady_clock::now();
+	bool hw = false;
+	{
+		std::lock_guard lock(LocalPassCache::EnsureMutex());
+		(void)EnsurePipeline(graphics);
+		if (HybridWanted() && HwScene::Active()) hw = EnsureHwPipeline(graphics);
+	}
+	std::printf("RT reflections: pipelines made beside the game%s in %.0f ms\n", hw ? " (with the hybrid's)" : "",
+	            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+	std::fflush(stdout);
+}
 
 } // namespace Libs::Graphics::FrameGen

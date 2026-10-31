@@ -17,6 +17,7 @@
 //  3 passes; 3 AO 3 + GI 2 (10 m), 3 passes. Temporal accumulation (motion vectors, disocclusion, clamped) + a-trous +
 //  a depth-aware upsample. KYTY_HWRT_GI_VIEW=1 the AO alone, 2 the added bounce x 4. Every 5 s "HWRTGI: GPU" timing.
 //  Off (both 0 / unset): nothing here runs (HwGiWanted false; GTAO, SSGI and the G-buffer copy exactly as before).
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/hwrt-gi.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -244,7 +245,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_gi.layout;
-	const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_gi.pipeline);
+	const auto created = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_gi.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_gi.pipeline = nullptr;
