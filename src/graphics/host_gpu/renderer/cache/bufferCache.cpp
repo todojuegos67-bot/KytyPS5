@@ -20,6 +20,7 @@
 #include "gpu_tiler_shaders/lod_stats_pack_spv.h"
 
 extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
 volatile std::atomic<uint32_t> kyty_local_buffer_residency_mode {1};
 volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {1};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_detach_mode {1};
@@ -80,6 +81,7 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "speculation-state.h"
 
 namespace Libs::Graphics {
 
@@ -715,8 +717,9 @@ void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& reques
 
 void BufferCache::DrainGuestReadback(uint64_t address, uint64_t size, bool gpu_read_only, bool gpu_write) {
 	// Read-only bindings use device bytes. Pending copies retain GPU ownership
-	// and CPU-clean pages, so synchronization cannot upload over those bytes.
-	if (!m_active_guest_readbacks || gpu_read_only) return;
+	// and CPU-clean pages, so synchronization cannot upload over those bytes. (A speculative translation's ranges
+	// are obtained again when it is committed.)
+	if (!m_active_guest_readbacks || gpu_read_only || Spec::Current() != nullptr) return;
 	for (size_t slot = 0; slot < GuestReadbackSlots; ++slot) {
 		const auto& request = m_guest_readbacks[slot];
 		if (!request) continue;
@@ -844,6 +847,7 @@ void BufferCache::InvalidateCopyFeedback(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 	if (kyty_local_copy_feedback_mode.load(std::memory_order_relaxed) == 0) return;
+	if (auto* spec = Spec::Current()) return void(spec->feedbacks.push_back({vaddr, vaddr + size})); // (at its commit)
 	const auto mapping_epoch = m_resources ? m_resources->MappingEpoch() : 0;
 	if (!m_resources || !GuestRange {vaddr, size}.Valid() ||
 	    ((vaddr | size) & 3u) != 0 || size > CopyFeedback::SlotSize ||
@@ -1244,9 +1248,12 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	// passes (it waits on that timeline only for the bytes' last writer). Freed then, its memory was
 	// in use again on GPUs short of VRAM (frequent GC): VK_ERROR_DEVICE_LOST.
 	const uint64_t readback = m_readback_queue ? m_readback_queue->Submitted() : 0;
-	const auto     erase    = [this, id, readback] {
+	// (A speculation's packet may still read it: Spec::PacketNow.)
+	const auto     packet   = Spec::PacketNow();
+	const auto     erase    = [this, id, readback, packet] {
 		if (readback != 0 && m_readback_queue) m_readback_queue->Wait(readback);
-		EraseSlot(id);
+		m_retired.emplace_back(id, packet);
+		EraseRetired();
 	};
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation(erase);
@@ -2072,6 +2079,9 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+	// (A speculative translation's lookup out of line, behind a plain global: KYTY_SPECULATE unset, main's body.)
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && Spec::Current() != nullptr) [[unlikely]]
+		return FindBufferSpec(vaddr, size);
 	// Registration changes still drain separately before retiring an owner.
 	DrainGuestReadback(vaddr, size, true);
 	if (vaddr == 0) {
@@ -2088,6 +2098,26 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	return CreateBuffer(vaddr, size);
+}
+
+// A speculative translation's FindBuffer: no drain (its work reads the buffer on the GPU, after its commit), the range
+// noted (its commit checks nothing registered over it since), nothing registered.
+BufferId BufferCache::FindBufferSpec(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0) {
+		return NULL_BUFFER_ID;
+	}
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid buffer discovery request\n");
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner != nullptr && *owner) {
+		auto& buffer = m_slot_buffers[*owner];
+		if (buffer.IsInBounds(vaddr, size)) {
+			Spec::Current()->NoteBufferRange(vaddr, size);
+			return *owner;
+		}
+	}
+	return Spec::Refuse("buffer registration"), NULL_BUFFER_ID;
 }
 
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
@@ -2594,6 +2624,14 @@ void BufferCache::EnsureBdaReadable(std::span<const GuestRange> ranges) {
 }
 
 void BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
+	if (auto* spec = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr) {
+		// Made current when the speculative translation is committed (an earlier segment's guest memory writes
+		// before it, the open segment's after its work).
+		if (spec->open_journal_set.Intersects(vaddr, size)) return Spec::Refuse("memory the processor writes");
+		if (m_memory_tracker.IsRegionCpuModified(vaddr, size) || spec->JournalIntersects(vaddr, size))
+			spec->NoteCurrent(vaddr, size);
+		return;
+	}
 	const auto id     = FindBuffer(vaddr, size);
 	auto&      buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
@@ -2601,17 +2639,52 @@ void BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
 }
 
 StreamBuffer& BufferCache::GetShaderUploadBuffer() noexcept {
+	if (const auto* spec = Spec::Current(); spec != nullptr && spec->shader_upload != nullptr) return *spec->shader_upload;
 	return kyty_local_stream_upload_mode.load(std::memory_order_relaxed) != 0 ? m_host_shader_upload
 	                                                                        : m_stream_buffer;
 }
 
 StreamBuffer& BufferCache::GetTableUploadBuffer() noexcept {
+	if (const auto* spec = Spec::Current(); spec != nullptr && spec->table_upload != nullptr) return *spec->table_upload;
 	return m_table_upload;
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	if (auto* spec = Spec::Current()) {
+		// As below: a small range the guest wrote, read from a copy in the (speculation's) ring, as no GPU work wrote
+		// it (speculation-state.h) and with no guest memory write of the speculation pending over it.
+		if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(vaddr, size) &&
+		    m_memory_tracker.IsRegionCpuModified(vaddr, size) && !spec->JournalIntersects(vaddr, size)) {
+			auto&      upload    = GetShaderUploadBuffer();
+			const auto alignment = std::max<uint64_t>(
+			    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 4);
+			auto [mapped, offset] = upload.Map(size, alignment, false);
+			if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(vaddr, mapped, size)) {
+				upload.Commit();
+				spec->NoteCleanRead(vaddr, size);
+				return {&upload, offset};
+			}
+		}
+		// A speculative translation (speculation-state.h): the registered buffer over the range, which its commit
+		// obtains again before the work (a range it reads made current, one it writes made GPU-owned).
+		const auto* owner  = m_page_table.Find(vaddr >> PageTable::kPageBits);
+		auto*       buffer = owner != nullptr && *owner ? m_slot_buffers.try_get(*owner) : nullptr;
+		if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size) ||
+		    (is_texel_buffer && m_texture_cache.HasGpuWrittenImageOverlap(vaddr, size)))
+			return Spec::Refuse("buffer lookup"), std::pair<Buffer*, uint64_t> {nullptr, 0};
+		// (An earlier segment's guest memory writes are made before its work, the open segment's after it, and its
+		// copies read their sources then.)
+		if (spec->open_journal_set.Intersects(vaddr, size) || (is_written && spec->open_copy_sources.Intersects(vaddr, size)))
+			return Spec::Refuse("memory the processor writes"), std::pair<Buffer*, uint64_t> {nullptr, 0};
+		if (is_written) spec->NoteWritten(vaddr, size);
+		else if (m_memory_tracker.IsRegionCpuModified(vaddr, size) || spec->JournalIntersects(vaddr, size))
+			spec->NoteCurrent(vaddr, size);
+		if (spec->touched_buffers.empty() || spec->touched_buffers.back() != *owner) spec->touched_buffers.push_back(*owner);
+		spec->NoteBufferRange(vaddr, size);
+		return {buffer, buffer->Offset(vaddr)};
+	}
 	DrainGuestReadback(vaddr, size, !is_written && !is_texel_buffer, is_written);
 	if (LiveTrace::WriteTicks())
 		LiveTrace::Event(LiveTrace::BufferUse, vaddr, size | (is_written ? uint64_t {1} << 63u : 0));
@@ -2643,6 +2716,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			TouchBuffer(*buffer);
 			InvalidateCopyFeedback(vaddr, size);
 			NoteGpuWrite(vaddr, size);
+			Spec::NoteGpuWrite(vaddr, size);
 			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
 			return {buffer, buffer->Offset(vaddr)};
@@ -2665,6 +2739,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			m_gpu_modified_ranges.Add(vaddr, size);
 		}
 		NoteGpuWrite(vaddr, size);
+		Spec::NoteGpuWrite(vaddr, size);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
 		memo = {vaddr, size, RegistrationEpoch(), m_gpu_coverage_epoch, id, is_texel_buffer};
@@ -2907,6 +2982,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	(void)m_texture_cache.ClearMeta(vaddr, value);
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
+		Spec::NoteHostWrite(vaddr, size);
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		if (Scout::Running()) Scout::NoteHostWrite(vaddr, size);
@@ -2933,8 +3009,17 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
+	auto* const spec = Spec::Current();
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+		if (spec != nullptr) {
+			// A speculative translation's copy is made at its commit, in order with its other guest memory writes,
+			// between ranges no GPU work wrote (speculation-state.h: work that writes them stops the commit first).
+			spec->NoteCpuCopy(src_vaddr, size);
+			spec->NoteCpuCopy(dst_vaddr, size);
+			spec->Journal(dst_vaddr, src_vaddr, static_cast<uint32_t>(size), true);
+			return;
+		}
 		CopyGuestMemory(dst_vaddr, src_vaddr, size);
 		return;
 	}
@@ -2949,6 +3034,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
+	if (spec != nullptr && spec->refused != nullptr) return; // (a buffer it would register)
 	EXIT_IF(src == nullptr || dst == nullptr);
 	if (src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size) {
 		EXIT("BufferCache: resolved Vulkan copy ranges overlap\n");
@@ -2979,6 +3065,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 			if (m_memory_tracker.MarkRegionAsCpuDirtyKeepProtection(address, bytes) &&
 			    (Libs::LibKernel::Memory::TryWriteCpuBacking(address, from, bytes) ||
 			     Libs::LibKernel::Memory::TryWriteBacking(address, from, bytes))) {
+				Spec::NoteHostWrite(address, bytes);
 				if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
 				return;
 			}
@@ -2989,6 +3076,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		// stale. A linear copy is a dispatch, no point the observation epoch moves at.)
 		m_memory_tracker.NoteHostWrite(address, bytes);
 		std::memcpy(reinterpret_cast<void*>(address), from, bytes);
+		Spec::NoteHostWrite(address, bytes);
 		if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
 	};
 	// Which destination pages differ: compared on helper threads too when the copy is large (the 4 MiB copy the culling
@@ -3060,11 +3148,13 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
-	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+	// (A speculative translation's own writes count.)
+	const auto* spec = Spec::Current();
+	return m_memory_tracker.IsRegionGpuModified(vaddr, size) || (spec != nullptr && spec->WrittenIntersects(vaddr, size));
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	// (Another thread's question: under the lock the GPU thread changes them under.)
+	// (Another thread's question, a speculation's: under the lock the GPU thread changes them under.)
 	if (!GuestGpu::IsGpuThread()) {
 		const std::shared_lock lock(m_gpu_modified_mutex);
 		return m_gpu_modified_ranges.Intersects(vaddr, size);
@@ -3073,7 +3163,10 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
-	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	// (Not a range a speculative translation's commit makes current. Behind a plain global: KYTY_SPECULATE unset, no
+	// thread-local read.)
+	const auto* spec = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr;
+	return m_memory_tracker.IsRegionCpuModified(vaddr, size) && (spec == nullptr || !spec->current_set.Contains(vaddr, size));
 }
 
 // Per flip, whatever the memory use: the CPU-written buffers no binding used for StaleTime go (at most MaxRetirements a
@@ -3134,16 +3227,20 @@ void BufferCache::RetireStaleBuffers(uint64_t tick) {
 	LiveCounters::Add(LiveCounters::GcBufferDeletes, stale.size());
 }
 
-void BufferCache::EraseSlot(BufferId id) {
-	// (A defragmentation move's new buffer destroyed before its pass ended: the pass frees the moved allocation, or,
-	// ending on the worker thread, Defragment once it ended. Defragment.)
-	for (const auto& move: m_defrag_moves) {
-		if (move.destination != id) continue;
-		auto& buffer = m_slot_buffers[id];
-		if (m_defrag_ending.valid() && buffer.Allocation() != nullptr) m_defrag_free_later.push_back(buffer.Allocation());
-		buffer.ReleaseAllocation();
-	}
-	m_slot_buffers.erase(id);
+void BufferCache::EraseRetired() {
+	std::erase_if(m_retired, [&](const auto& retired) {
+		if (!Spec::PacketsPassed(retired.second)) return false;
+		// (A defragmentation move's new buffer destroyed before its pass ended: the pass frees the moved allocation, or,
+		// ending on the worker thread, Defragment once it ended. Defragment.)
+		for (const auto& move: m_defrag_moves) {
+			if (move.destination != retired.first) continue;
+			auto& buffer = m_slot_buffers[retired.first];
+			if (m_defrag_ending.valid() && buffer.Allocation() != nullptr) m_defrag_free_later.push_back(buffer.Allocation());
+			buffer.ReleaseAllocation();
+		}
+		m_slot_buffers.erase(retired.first);
+		return true;
+	});
 }
 
 bool BufferCache::MoveSpilledBufferBack() {
@@ -3173,8 +3270,8 @@ bool BufferCache::MoveSpilledBufferBack() {
 	}
 	// The room the ones in use need, which the texture collector makes (SpilledRoom).
 	m_spilled_room = needed != 0 ? needed + Headroom : 0;
-	// (On the command buffer being recorded.)
-	if (!fits || !m_scheduler.Active() || m_scheduler.Current().IsInvalid()) {
+	// (On the command buffer being recorded, outside a speculation.)
+	if (!fits || !m_scheduler.Active() || m_scheduler.Current().IsInvalid() || Spec::Current() != nullptr) {
 		return false;
 	}
 	const auto begin    = m_slot_buffers[id].CpuAddress();
@@ -3217,7 +3314,7 @@ void BufferCache::Defragment(uint64_t tick) {
 	if (m_defrag_ending.valid()) {
 		if (m_defrag_ending.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
 		const auto result = m_defrag_ending.get();
-		// (Moved allocations of new buffers destroyed while the pass ended: EraseSlot.)
+		// (Moved allocations of new buffers destroyed while the pass ended: EraseRetired.)
 		for (auto* allocation: m_defrag_free_later) vmaFreeMemory(allocator, allocation);
 		m_defrag_free_later.clear();
 		m_defrag_moves.clear();
@@ -3246,7 +3343,7 @@ void BufferCache::Defragment(uint64_t tick) {
 	if (m_defrag_pass_open) {
 		for (const auto& move: m_defrag_moves)
 			if (move.source && m_slot_buffers.is_allocated(move.source)) return; // (one the GPU may still read)
-		// (A new buffer destroyed since: its memory and the moved allocation go with the pass. EraseSlot.)
+		// (A new buffer destroyed since: its memory and the moved allocation go with the pass. EraseRetired.)
 		for (uint32_t i = 0; i < m_defrag_pass.moveCount; ++i)
 			if (m_defrag_moves[i].destination && !m_slot_buffers.is_allocated(m_defrag_moves[i].destination))
 				m_defrag_pass.pMoves[i].operation = VMA_DEFRAGMENTATION_MOVE_OPERATION_DESTROY;
@@ -3273,8 +3370,8 @@ void BufferCache::Defragment(uint64_t tick) {
 			return;
 		}
 	}
-	// (On the command buffer being recorded: MoveSpilledBufferBack.)
-	if (!m_scheduler.Active() || m_scheduler.Current().IsInvalid()) return;
+	// (On the command buffer being recorded, outside a speculation: MoveSpilledBufferBack.)
+	if (!m_scheduler.Active() || m_scheduler.Current().IsInvalid() || Spec::Current() != nullptr) return;
 	// (The allocations of buffers erased before it stay till its end: their free on the reclaimer's thread waits.)
 	if (!HoldBufferFrees()) return;
 	timed.on         = true;
@@ -3351,6 +3448,7 @@ void BufferCache::EndDefragmentation() {
 }
 
 void BufferCache::RunGarbageCollector(bool collect) {
+	EraseRetired();
 	const auto tick = m_gc_tick++;
 	RetireStaleBuffers(tick);
 	// The game buffers in system memory are looked at every 60 flips, collection or not (this game's frames all read

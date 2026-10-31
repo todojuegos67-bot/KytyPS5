@@ -35,6 +35,7 @@
 #include <xxhash.h>
 #include "xpr-capture.h"
 #include "device-fault.h"
+#include "speculation-state.h"
 #include "live-census.h"
 #include "live-counters.h"
 
@@ -387,10 +388,19 @@ static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint3
                                       ShaderBufferResource& resolved_descriptor,
                                       uint32_t& resolved_clear, uint64_t& resolved_size);
 
+// The shader and user data of a dispatch (a compute clear's: RenderExecutor::m_meta_clears).
+static uint64_t MetaClearKey(const HW::ComputeShaderInfo& cs) {
+	std::array<uint32_t, 2 + HW::UserSgprInfo::SGPRS_MAX> words {static_cast<uint32_t>(cs.cs_regs.data_addr),
+	                                                              static_cast<uint32_t>(cs.cs_regs.data_addr >> 32u)};
+	const auto count = std::min<uint32_t>(cs.cs_regs.user_sgpr, HW::UserSgprInfo::SGPRS_MAX);
+	std::copy_n(cs.cs_user_sgpr.value, count, words.begin() + 2);
+	return XXH3_64bits(words.data(), (2 + count) * sizeof(uint32_t));
+}
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer& buffer, uint32_t group_x,
                                                 uint32_t group_y, uint32_t group_z,
-                                                uint32_t mode) {
+                                                uint32_t mode, uint64_t& cleared) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
@@ -440,6 +450,7 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 				    uniform_fill && descriptor.Base48() == fill_descriptor.Base48();
 				if (known ? cache.ClearMeta(descriptor.Base48(), fill_value)
 				          : cache.ClearMeta(descriptor.Base48())) {
+					cleared = descriptor.Base48();
 					return true;
 				}
 			}
@@ -620,8 +631,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		// of several): the same fill on the buffer cache's buffer, and the images over it note the value - one all of whose
 		// buffer writes were such fills is cleared instead of uploaded (TextureCache::InitializeImage).
 		const auto base = descriptor.Base48();
-		if (kyty_local_fill_clear_mode.load(std::memory_order_relaxed) != 0 && ((base | size) & 3u) == 0 &&
-		    cache.HasTrackedDataOverlap(base, size)) {
+		if (kyty_local_fill_clear_mode.load(std::memory_order_relaxed) != 0 && Spec::Current() == nullptr &&
+		    ((base | size) & 3u) == 0 && cache.HasTrackedDataOverlap(base, size)) {
 			const auto [buffer, offset] = m_context.GetBufferCache().ObtainBuffer(base, size, true, true);
 			if (buffer != nullptr && (offset & 3u) == 0) {
 				buffer->Fill(offset, size, packed_clear);
@@ -638,6 +649,34 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
 	}
 	return true;
+}
+
+void RenderExecutor::PredictDispatch(const HW::Shader& sh_ctx, uint32_t thread_group_x, uint32_t thread_group_y,
+                                     uint32_t thread_group_z, uint32_t mode, Spec::State& record) {
+	auto&       learned = Catalog();
+	const auto& cs      = sh_ctx.GetCs();
+	const auto& regs    = cs.cs_regs;
+	if (regs.data_addr == learned.m_linear_copy_shader && ShaderMapGeneration() == learned.m_linear_copy_generation) {
+		const DemonsSouls::LinearCopyDispatch dispatch {
+		    .user_data          = std::span<const uint32_t> {cs.cs_user_sgpr.value, regs.user_sgpr},
+		    .threads            = {regs.num_thread_x, regs.num_thread_y, regs.num_thread_z},
+		    .group_id           = {regs.tgid_x_en, regs.tgid_y_en, regs.tgid_z_en},
+		    .thread_ids         = regs.tidig_comp_cnt + 1u,
+		    .workgroup_register = regs.user_sgpr,
+		    .tg_size            = regs.tg_size_en,
+		    .thread_dimensions  = (mode & (1u << 5u)) != 0};
+		if (const auto copy = DemonsSouls::LinearCopyOf(dispatch, thread_group_x, thread_group_y, thread_group_z, mode)) {
+			auto& buffers = m_context.GetBufferCache();
+			if (buffers.IsRegionGpuModified(copy->dst, copy->bytes) || buffers.IsRegionGpuModified(copy->src, copy->bytes))
+				record.NoteWritten(copy->dst, copy->bytes);
+			else
+				record.Journal(copy->dst, copy->src, static_cast<uint32_t>(copy->bytes), true);
+			return;
+		}
+	}
+	const auto read = CatalogRead();
+	if (const auto found = learned.m_meta_clears.find(MetaClearKey(cs)); found != learned.m_meta_clears.end())
+		record.PredictClear(found->second);
 }
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -670,7 +709,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
-	RenderLockGuard lock(m_context.GetMutex());
+	// (The GPU thread's: a speculation's thread does not take it.)
+	std::optional<RenderLockGuard> lock;
+	if (Role() == 0) lock.emplace(m_context.GetMutex());
+	if (const auto* spec = Spec::Current(); spec != nullptr && spec->refused != nullptr) return;
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -686,6 +728,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// A compute shader the normal path dispatched before (TableDispatchSeen) whose program allows table mode (an
 	// indirect dispatch of threads: the normal path reads its counts).
 	const bool thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	m_dispatch_declined          = nullptr;
 	if (kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) != 0 && (!thread_dimensions || indirect_args == 0) &&
 	    (indirect_args != 0 || (thread_group_x != 0 && thread_group_y != 0 && thread_group_z != 0)) &&
 	    TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, thread_dimensions))
@@ -693,6 +736,21 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// A direct dispatch of no thread groups (with thread dimensions: no threads) runs nothing: skipped before its
 	// program is prepared (about 60 a frame at 1-1, each evaluating its resource tables first).
 	if (indirect_args == 0 && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) return;
+	// A speculative translation dispatches only the table way, or copies the linear copy shader's way
+	// (speculation-state.h).
+	const bool spec    = Spec::Current() != nullptr;
+	auto&      learned = Catalog();
+	if (spec && sh_ctx.GetCs().cs_regs.data_addr != learned.m_linear_copy_shader) {
+		// (A compute clear's hole clears its surface: the draws after it are holes that apply the clear.)
+		if (indirect_args == 0) {
+			const auto read = CatalogRead();
+			if (const auto found = learned.m_meta_clears.find(MetaClearKey(sh_ctx.GetCs())); found != learned.m_meta_clears.end())
+				Spec::Current()->PredictClear(found->second);
+		}
+		return Spec::Refuse(m_dispatch_declined != nullptr ? m_dispatch_declined
+		                    : thread_dimensions            ? "dispatch (thread dimensions)"
+		                                                   : "dispatch");
+	}
 	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS             = 0x41u;
 	constexpr uint32_t DISPATCH_INITIATOR_MODIFIER_BITS         = 0xa038u;
 	constexpr uint32_t DISPATCH_INITIATOR_KNOWN_MASK =
@@ -715,8 +773,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The linear copy shader, while its code stands: checked from the registers without its program (700+ small
 	// copies a frame in Boletaria, each preparing the same program).
-	if (indirect_args == 0 && cs_regs.cs_regs.data_addr == m_linear_copy_shader &&
-	    ShaderMapGeneration() == m_linear_copy_generation && (++m_linear_copy_uses & 63u) != 0 &&
+	// (Another executor's catalog: its owner proves the program now and then.)
+	if (indirect_args == 0 && cs_regs.cs_regs.data_addr == learned.m_linear_copy_shader &&
+	    ShaderMapGeneration() == learned.m_linear_copy_generation && ((++m_linear_copy_uses & 63u) != 0 || Role() != 0) &&
 	    !FrameCapture::Active()) {
 		const auto&                           regs = cs_regs.cs_regs;
 		const DemonsSouls::LinearCopyDispatch dispatch {
@@ -734,6 +793,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			return;
 		}
 	}
+	if (spec) return Spec::Refuse("linear copy");
 
 	NativePreparationScratch<ShaderComputeInputInfo> input_storage;
 	auto& input_info = input_storage.Get();
@@ -813,8 +873,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
-	if (indirect_args == 0 && TryConsumeComputeMetaClear(input_info, buffer, thread_group_x,
-	                                                     thread_group_y, thread_group_z, mode)) {
+	if (uint64_t cleared = 0; indirect_args == 0 && TryConsumeComputeMetaClear(input_info, buffer, thread_group_x,
+	                                                                          thread_group_y, thread_group_z, mode, cleared)) {
+		// (Learned for mode 4's holes only: KYTY_SPECULATE unset collects nothing.)
+		if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+			const auto write                            = CatalogWrite();
+			m_meta_clears[MetaClearKey(sh_ctx.GetCs())] = cleared;
+		}
 		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "meta_clear";
 		TableDispatchSeen(sh_ctx.GetCs(), "dispatch: meta clear", use_thread_dimensions);
 		ResetBindings();

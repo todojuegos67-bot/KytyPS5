@@ -19,7 +19,8 @@
 // SendCommandSync); the image going (UnregisterImage: the collector retires images no draw used for 20 s) has them
 // written back by the offload worker when the GPU is done, touches waiting till then. A host overwrite of all of them or
 // an unmap only drops them. A touch by a thread that cannot wait for the render thread (the upload worker, deferred GPU
-// work) is a miss: counted and logged, the bytes it sees zeros, and the render thread restores them after (Drain).
+// work, a speculation's recorder) is a miss: counted and logged, the bytes it sees zeros, and the render thread restores
+// them after (Drain).
 //
 // Read watchers go at once after a touch by game code (a guest thread holds no lock of the emulator's) or a host write or
 // unmap (normal context); after one by the emulator's own code the fault handler only gives the pages a protection that

@@ -14,8 +14,14 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <atomic>
+#include <shared_mutex>
 #include <unordered_set>
 #include <vector>
+
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
 
 namespace Libs::Graphics {
 
@@ -24,6 +30,9 @@ class Context;
 class UserConfig;
 class Shader;
 } // namespace HW
+namespace Spec {
+struct State;
+} // namespace Spec
 
 struct GraphicContext;
 struct ShaderBufferResource;
@@ -221,6 +230,11 @@ public:
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
 	                    uint64_t indirect_args = 0);
+	// A state pass's direct dispatch (Spec::t_record): the copy the linear copy shader makes (journaled, as a speculation's
+	// CopyBuffer journals it; one on GPU-written memory: its destination written) or the surface a compute clear clears
+	// (predicted), as the catalog knows them.
+	void PredictDispatch(const HW::Shader& sh_ctx, uint32_t thread_group_x, uint32_t thread_group_y,
+	                     uint32_t thread_group_z, uint32_t mode, Spec::State& record);
 	// An R_SUPER_RESOLUTION packet's upscale (graphics/guest_gpu/superResolution.h; renderSuperResolution.cpp).
 	void RunSuperResolution(CommandBuffer& buffer, const SuperResolution::Packet& packet);
 
@@ -292,10 +306,11 @@ private:
 	void                      BindRenderTarget(ImageId id);
 	void                      TrackImageBinding(ImageId id);
 	void                      ResetBindings();
+	// (`cleared`: the metadata address it cleared.)
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer& buffer, uint32_t group_x,
 	                                                     uint32_t group_y, uint32_t group_z,
-	                                                     uint32_t mode);
+	                                                     uint32_t mode, uint64_t& cleared);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
@@ -394,8 +409,22 @@ public:
 	// Table dispatches (KYTY_TABLE_DISPATCH): a dispatch drawn the table way, and the normal path's dispatches.
 	[[nodiscard]] bool TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
 	                                 uint64_t indirect_args, bool thread_dimensions);
-	// (`special`: the special path that took the dispatch; null: none.)
+	// Why the last TableDispatch that declined did (the hole's reason when a speculation's dispatch has no other way).
+	const char* m_dispatch_declined = nullptr;
+	// (`special`: the special path that took the dispatch, as a speculation's hole reason; null: none.)
 	void TableDispatchSeen(const HW::ComputeShaderInfo& cs, const char* special, bool thread_dimensions);
+	// What a speculative translation retired with `pending` (descriptor sets; CommandScheduler::PendingTick and up)
+	// gets `tick`.
+	void ResolvePendingTicks(uint64_t pending, uint64_t tick);
+	// A speculation's executor draws with what `owner` (the graphics queue's) learned: its table pairs and dispatches,
+	// draw states, linear copy shader and compute clears (RenderExecutor::Catalog); `role` its own proofs' (1..Roles-1:
+	// one per speculation thread).
+	void ReadCatalogOf(RenderExecutor& owner, uint32_t role) noexcept {
+		m_catalog = &owner;
+		m_role    = role;
+		owner.m_catalog_readers.fetch_add(1, std::memory_order_relaxed);
+	}
+	static constexpr uint32_t Roles = 9;
 
 private:
 	// Table draws (src/local/table-xpr.inc).
@@ -409,14 +438,38 @@ private:
 	// Deferred: the pair's table variant is on its way (TableTry): the normal path draws, storing no native record.
 	enum class TableResult { Drawn, Native, Store, Deferred };
 	std::shared_ptr<TableXpr> m_table_xpr;
-	// The executor's table state (made at its first use).
+	// The executor whose catalog this one reads (a speculation's: the graphics queue's), null: its own. It changes none
+	// of it but its own proofs in it (Role: TablePair::generation, TableImageSet::validated_frame...); what it holds of
+	// it across draws is dropped when the owner changed it (TableXpr::epoch).
+	RenderExecutor* m_catalog = nullptr;
+	uint32_t        m_role    = 0;
+	// Executors that read this one's catalog (ReadCatalogOf): its draw states stay while there are any.
+	std::atomic<uint32_t> m_catalog_readers {0};
+	[[nodiscard]] RenderExecutor& Catalog() noexcept { return m_catalog != nullptr ? *m_catalog : *this; }
+	// The catalog's owner changes its pairs and dispatches, image sets, draw states and compute clears under its lock
+	// exclusively (CatalogWrite); another executor reads them under it shared (CatalogRead, on its own thread).
+	mutable std::shared_mutex m_catalog_mutex;
+	// (Outside KYTY_SPECULATE=4 no other executor reads the catalog: no lock. The mode changes only between submissions.)
+	[[nodiscard]] std::unique_lock<std::shared_mutex> CatalogWrite() const {
+		return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? std::unique_lock(m_catalog_mutex)
+		                                                                       : std::unique_lock<std::shared_mutex>();
+	}
+	[[nodiscard]] std::shared_lock<std::shared_mutex> CatalogRead() { return std::shared_lock(Catalog().m_catalog_mutex); }
+	[[nodiscard]] uint32_t        Role() const noexcept { return m_role; }
+	// The catalog's table (null: nothing learned yet), and this executor's own table state.
+	[[nodiscard]] TableXpr*       CatalogTable() noexcept { return Catalog().m_table_xpr.get(); }
 	TableXpr&                     OwnTable();
+	void                          DropStaleCatalog();
 	void                          TableForgetStates();
 	void                          TableSweepPairs();
 	// The linear copy shader the normal path last copied with (DemonsSouls::TryLinearCopy), the shader map generation
 	// before its program was prepared, and its dispatches since (every 64th takes the normal path again).
 	std::atomic<uint64_t> m_linear_copy_shader {0}, m_linear_copy_generation {0};
 	uint32_t              m_linear_copy_uses = 0;
+	// The metadata surfaces compute dispatches cleared (TryConsumeComputeMetaClear), by their shader and user data: a
+	// speculation's hole of such a dispatch clears it (Spec::State::PredictClear). (Not the DCC fills
+	// TryConsumeComputeImageClear tracks: the normal path consumes those only where it can clear the image, 10-06.)
+	std::unordered_map<uint64_t, uint64_t> m_meta_clears;
 	TableResult TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
 	                     uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
 	TableResult TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,

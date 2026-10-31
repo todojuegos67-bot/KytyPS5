@@ -8,16 +8,19 @@
 namespace Libs::Graphics::HW {
 
 struct ColorBase {
+	bool operator==(const ColorBase&) const = default;
 	uint64_t addr = 0;
 };
 
 struct ColorView {
+	bool operator==(const ColorView&) const = default;
 	uint32_t base_array_slice_index = 0;
 	uint32_t last_array_slice_index = 0;
 	uint32_t current_mip_level      = 0;
 };
 
 struct ColorInfo {
+	bool operator==(const ColorInfo&) const = default;
 	bool fmask_compression_enable = false;
 	// uint32_t fmask_compression_mode   = 0;
 	bool                    fmask_data_compression_disable = false;
@@ -33,18 +36,21 @@ struct ColorInfo {
 };
 
 struct ColorAttrib {
+	bool operator==(const ColorAttrib&) const = default;
 	bool     force_dest_alpha_to_one = false;
 	uint32_t num_samples             = 0;
 	uint32_t num_fragments           = 0;
 };
 
 struct ColorAttrib2 {
+	bool operator==(const ColorAttrib2&) const = default;
 	uint32_t height         = 0;
 	uint32_t width          = 0;
 	uint32_t num_mip_levels = 0;
 };
 
 struct ColorAttrib3 {
+	bool operator==(const ColorAttrib3&) const = default;
 	uint32_t           depth                        = 0;
 	Prospero::TileMode tile_mode                    = Prospero::TileMode::kRenderTarget;
 	uint32_t           dimension                    = 0;
@@ -53,6 +59,7 @@ struct ColorAttrib3 {
 };
 
 struct ColorDccControl {
+	bool operator==(const ColorDccControl&) const = default;
 	enum class IndependentBlockSize : uint8_t { Disabled, Bytes64, Bytes128 };
 
 	uint32_t             max_uncompressed_block_size    = 2;
@@ -65,26 +72,32 @@ struct ColorDccControl {
 };
 
 struct ColorCmask {
+	bool operator==(const ColorCmask&) const = default;
 	uint64_t addr = 0;
 };
 
 struct ColorFmask {
+	bool operator==(const ColorFmask&) const = default;
 	uint64_t addr = 0;
 };
 
 struct ColorClearWord0 {
+	bool operator==(const ColorClearWord0&) const = default;
 	uint32_t word0 = 0;
 };
 
 struct ColorClearWord1 {
+	bool operator==(const ColorClearWord1&) const = default;
 	uint32_t word1 = 0;
 };
 
 struct ColorDccAddr {
+	bool operator==(const ColorDccAddr&) const = default;
 	uint64_t addr = 0;
 };
 
 struct RenderTarget {
+	bool operator==(const RenderTarget&) const = default;
 	ColorBase       base;
 	ColorView       view;
 	ColorInfo       info;
@@ -100,6 +113,7 @@ struct RenderTarget {
 };
 
 struct DepthZInfo {
+	bool operator==(const DepthZInfo&) const = default;
 	Prospero::DepthFormat                       format      = Prospero::DepthFormat::kInvalid;
 	uint32_t                                    num_samples = 0;
 	Prospero::TextureCompatiblePlaneCompression texture_compatibility =
@@ -135,6 +149,7 @@ struct DepthZInfo {
 };
 
 struct DepthStencilInfo {
+	bool operator==(const DepthStencilInfo&) const = default;
 	Prospero::StencilFormat            format = Prospero::StencilFormat::kInvalid;
 	Prospero::TextureCompatibleStencil texture_compatibility =
 	    Prospero::TextureCompatibleStencil::kDisable;
@@ -163,6 +178,7 @@ struct DepthStencilInfo {
 };
 
 struct DepthDepthView {
+	bool operator==(const DepthDepthView&) const = default;
 	uint32_t slice_start           = 0;
 	uint32_t slice_max             = 0;
 	uint8_t  current_mip_level     = 0;
@@ -171,12 +187,14 @@ struct DepthDepthView {
 };
 
 struct DepthDepthSizeXY {
+	bool operator==(const DepthDepthSizeXY&) const = default;
 	uint16_t x_max = 0;
 	uint16_t y_max = 0;
 	bool     valid = false;
 };
 
 struct DepthRenderTarget {
+	bool operator==(const DepthRenderTarget&) const = default;
 	DepthZInfo       z_info;
 	DepthStencilInfo stencil_info;
 	DepthDepthView   depth_view;
@@ -191,6 +209,7 @@ struct DepthRenderTarget {
 };
 
 struct RenderControl {
+	bool operator==(const RenderControl&) const = default;
 	bool    depth_clear_enable       = false;
 	bool    stencil_clear_enable     = false;
 	bool    resummarize_enable       = false;
@@ -203,6 +222,7 @@ struct RenderControl {
 };
 
 struct DepthRenderOverride {
+	bool operator==(const DepthRenderOverride&) const = default;
 	bool force_z_valid       = false;
 	bool force_z_dirty       = false;
 	bool force_stencil_valid = false;
@@ -210,6 +230,7 @@ struct DepthRenderOverride {
 };
 
 struct GdsOaCounter {
+	bool operator==(const GdsOaCounter&) const = default;
 	uint32_t counter = 0;
 	uint32_t address = 0;
 
@@ -222,6 +243,7 @@ struct GdsOaCounter {
 };
 
 struct GdsOaState {
+	bool operator==(const GdsOaState&) const = default;
 	static constexpr uint32_t COUNTERS_NUM = 8;
 
 	uint32_t     cntl = 0;
@@ -231,6 +253,7 @@ struct GdsOaState {
 };
 
 struct ClipControl {
+	bool operator==(const ClipControl&) const = default;
 	uint8_t user_clip_planes                    = 0;
 	uint8_t user_clip_plane_mode                = 0;
 	bool    dx_clip_space                       = false;
@@ -248,6 +271,7 @@ struct ClipControl {
 };
 
 struct DepthControl {
+	bool operator==(const DepthControl&) const = default;
 	bool    stencil_enable      = false;
 	bool    z_enable            = false;
 	bool    z_write_enable      = false;
@@ -259,6 +283,7 @@ struct DepthControl {
 };
 
 struct StencilControl {
+	bool operator==(const StencilControl&) const = default;
 	uint8_t stencil_fail     = 0;
 	uint8_t stencil_zpass    = 0;
 	uint8_t stencil_zfail    = 0;
@@ -268,6 +293,7 @@ struct StencilControl {
 };
 
 struct StencilMask {
+	bool operator==(const StencilMask&) const = default;
 	uint8_t stencil_testval      = 0;
 	uint8_t stencil_mask         = 0;
 	uint8_t stencil_writemask    = 0;
@@ -279,6 +305,7 @@ struct StencilMask {
 };
 
 struct ModeControl {
+	bool operator==(const ModeControl&) const = default;
 	bool    cull_front               = false;
 	bool    cull_back                = false;
 	bool    face                     = false;
@@ -293,6 +320,7 @@ struct ModeControl {
 };
 
 struct PolyOffset {
+	bool operator==(const PolyOffset&) const = default;
 	int8_t neg_num_db_bits = -23;
 	bool   db_is_float_fmt = true;
 	float  clamp           = 0.0f;
@@ -303,6 +331,7 @@ struct PolyOffset {
 };
 
 struct BlendControl {
+	bool operator==(const BlendControl&) const = default;
 	uint8_t color_srcblend       = 1;
 	uint8_t color_comb_fcn       = 0;
 	uint8_t color_destblend      = 0;
@@ -314,6 +343,7 @@ struct BlendControl {
 };
 
 struct BlendColor {
+	bool operator==(const BlendColor&) const = default;
 	float red   = 0.0f;
 	float green = 0.0f;
 	float blue  = 0.0f;
@@ -321,6 +351,7 @@ struct BlendColor {
 };
 
 struct EqaaControl {
+	bool operator==(const EqaaControl&) const = default;
 	uint8_t max_anchor_samples         = 0;
 	uint8_t ps_iter_samples            = 0;
 	uint8_t mask_export_num_samples    = 0;
@@ -332,22 +363,26 @@ struct EqaaControl {
 };
 
 struct ColorControl {
+	bool operator==(const ColorControl&) const = default;
 	uint8_t mode = 1;
 	uint8_t op   = 0xCC;
 };
 
 struct ScanModeControl {
+	bool operator==(const ScanModeControl&) const = default;
 	bool msaa_enable          = false;
 	bool vport_scissor_enable = true;
 	bool line_stipple_enable  = false;
 };
 
 struct AaSampleControl {
+	bool operator==(const AaSampleControl&) const = default;
 	uint64_t centroid_priority = 0;
 	uint32_t locations[16]     = {};
 };
 
 struct DepthShaderControl {
+	bool operator==(const DepthShaderControl&) const = default;
 	uint32_t other_bits                  = 0;
 	uint8_t  conservative_z_export_value = 0;
 	uint8_t  shader_z_behavior           = 0;
@@ -360,6 +395,7 @@ struct DepthShaderControl {
 };
 
 struct AaConfig {
+	bool operator==(const AaConfig&) const = default;
 	uint8_t msaa_num_samples      = 0;
 	bool    aa_mask_centroid_dtmn = false;
 	uint8_t max_sample_dist       = 0;
@@ -367,6 +403,7 @@ struct AaConfig {
 };
 
 struct Viewport {
+	bool operator==(const Viewport&) const = default;
 	float zmin                                  = 0.0f;
 	float zmax                                  = 0.0f;
 	float xscale                                = 1.0f;
@@ -383,6 +420,7 @@ struct Viewport {
 };
 
 struct ScreenViewport {
+	bool operator==(const ScreenViewport&) const = default;
 	Viewport viewports[16];
 	uint32_t transform_control                    = 1087;
 	int      screen_scissor_left                  = 0;
@@ -416,6 +454,7 @@ struct ScreenViewport {
 };
 
 struct HsShaderResource1 {
+	bool operator==(const HsShaderResource1&) const = default;
 	uint8_t vgprs                     = 0;
 	uint8_t priority                  = 0;
 	uint8_t float_mode                = 0;
@@ -429,6 +468,7 @@ struct HsShaderResource1 {
 };
 
 struct HsShaderResource2 {
+	bool operator==(const HsShaderResource2&) const = default;
 	bool     scratch_en   = false;
 	uint8_t  user_sgpr    = 0;
 	uint16_t lds_size     = 0;
@@ -436,6 +476,7 @@ struct HsShaderResource2 {
 };
 
 struct PsShaderResource1 {
+	bool operator==(const PsShaderResource1&) const = default;
 	uint8_t vgprs                    = 0;
 	uint8_t priority                 = 0;
 	uint8_t float_mode               = 0;
@@ -448,6 +489,7 @@ struct PsShaderResource1 {
 };
 
 struct PsShaderResource2 {
+	bool operator==(const PsShaderResource2&) const = default;
 	bool    scratch_en             = false;
 	uint8_t user_sgpr              = 0;
 	bool    wave_cnt_en            = false;
@@ -457,12 +499,14 @@ struct PsShaderResource2 {
 };
 
 struct PsStageRegisters {
+	bool operator==(const PsStageRegisters&) const = default;
 	uint64_t          data_addr = 0;
 	PsShaderResource1 rsrc1;
 	PsShaderResource2 rsrc2;
 };
 
 struct CsStageRegisters {
+	bool operator==(const CsStageRegisters&) const = default;
 
 	uint64_t data_addr                 = 0;
 	uint32_t num_thread_x              = 0;
@@ -490,20 +534,24 @@ struct CsStageRegisters {
 };
 
 struct EsStageRegisters {
+	bool operator==(const EsStageRegisters&) const = default;
 	uint64_t data_addr = 0;
 };
 
 struct LsStageRegisters {
+	bool operator==(const LsStageRegisters&) const = default;
 	uint64_t data_addr = 0;
 };
 
 struct HsStageRegisters {
+	bool operator==(const HsStageRegisters&) const = default;
 	uint64_t          data_addr = 0;
 	HsShaderResource1 rsrc1;
 	HsShaderResource2 rsrc2;
 };
 
 struct GsShaderResource1 {
+	bool operator==(const GsShaderResource1&) const = default;
 	uint8_t vgprs                     = 0;
 	uint8_t priority                  = 0;
 	uint8_t float_mode                = 0;
@@ -518,6 +566,7 @@ struct GsShaderResource1 {
 };
 
 struct GsShaderResource2 {
+	bool operator==(const GsShaderResource2&) const = default;
 	bool    scratch_en              = false;
 	uint8_t user_sgpr               = 0;
 	uint8_t es_vgpr_component_count = 0;
@@ -527,6 +576,7 @@ struct GsShaderResource2 {
 };
 
 struct GsStageRegisters {
+	bool operator==(const GsStageRegisters&) const = default;
 	uint64_t          data_addr      = 0;
 	uint64_t          user_data_addr = 0;
 	GsShaderResource1 rsrc1;
@@ -534,6 +584,7 @@ struct GsStageRegisters {
 };
 
 struct ShaderRegisters {
+	bool operator==(const ShaderRegisters&) const = default;
 	uint32_t m_spiVsOutConfig     = 0;
 	uint32_t m_spiShaderPosFormat = 0;
 	uint32_t m_paClVsOutCntl      = 0;
@@ -586,6 +637,7 @@ struct ShaderRegisters {
 enum class UserSgprType { Unknown, Region, Vsharp };
 
 struct UserSgprInfo {
+	bool operator==(const UserSgprInfo&) const = default;
 	static constexpr int SGPRS_MAX = 32;
 
 	uint32_t     value[SGPRS_MAX] = {0};
@@ -594,6 +646,7 @@ struct UserSgprInfo {
 };
 
 struct VertexShaderInfo {
+	bool operator==(const VertexShaderInfo&) const = default;
 	EsStageRegisters es_regs;
 	LsStageRegisters ls_regs;
 	HsStageRegisters hs_regs;
@@ -606,21 +659,25 @@ struct VertexShaderInfo {
 };
 
 struct PixelShaderInfo {
+	bool operator==(const PixelShaderInfo&) const = default;
 	PsStageRegisters ps_regs;
 	UserSgprInfo     ps_user_sgpr;
 };
 
 struct ComputeShaderInfo {
+	bool operator==(const ComputeShaderInfo&) const = default;
 	CsStageRegisters cs_regs;
 	UserSgprInfo     cs_user_sgpr;
 };
 
 struct GeControl {
+	bool operator==(const GeControl&) const = default;
 	uint16_t primitive_group_size = 0;
 	uint16_t vertex_group_size    = 0;
 };
 
 struct GeUserVgprEn {
+	bool operator==(const GeUserVgprEn&) const = default;
 	bool vgpr1 = false;
 	bool vgpr2 = false;
 	bool vgpr3 = false;
@@ -632,6 +689,7 @@ public:
 	~Context() = default;
 
 	KYTY_CLASS_DEFAULT_COPY(Context);
+	bool operator==(const Context&) const = default;
 
 	void Reset() { *this = Context(); }
 
@@ -944,6 +1002,7 @@ public:
 	~UserConfig() = default;
 
 	KYTY_CLASS_DEFAULT_COPY(UserConfig);
+	bool operator==(const UserConfig&) const = default;
 
 	void Reset() { *this = UserConfig(); }
 
@@ -985,6 +1044,7 @@ public:
 	~Shader() = default;
 
 	KYTY_CLASS_DEFAULT_COPY(Shader);
+	bool operator==(const Shader&) const = default;
 
 	void Reset() { *this = Shader(); }
 

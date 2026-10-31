@@ -41,6 +41,10 @@ volatile std::atomic<uint32_t> kyty_local_recording_spin {0};
 #endif
 }
 
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
+
 namespace LocalVulkanRecording {
 namespace {
 constexpr size_t ChunkBytes = 64 * 1024;
@@ -334,8 +338,9 @@ void InvalidateRawState() {
 
 // Work calls recorded by this thread (read by the render thread's barrier dedupe, which orders
 // only its own command stream): a plain increment, not a locked add on every command.
-thread_local uint64_t g_work_calls = 0;
-thread_local uint64_t g_packets    = 0;
+thread_local uint64_t g_writing_calls = 0; // (the work calls that change memory or images)
+thread_local uint64_t g_sync_calls    = 0; // (and the others: barriers, render pass begins, timestamps)
+thread_local uint64_t g_packets       = 0;
 #include "local-vulkan-recording.inc"
 } // namespace
 
@@ -346,8 +351,9 @@ void* ReplaceBindPipeline(void* entry) {
     original.vkCmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(entry);
     return replaced;
 }
-uint64_t WorkCalls() { return g_work_calls; }
-uint64_t RecordedWork() { return g_work_calls + g_packets; }
+uint64_t WorkCalls() { return g_writing_calls + g_sync_calls; }
+uint64_t RecordedWork() { return g_writing_calls + g_sync_calls + g_packets; }
+uint64_t RecordedWrites() { return g_writing_calls + g_packets; }
 void Drain() { if (producer) producer->Drain(); }
 bool PacketsEnabled() {
     return producer && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0;

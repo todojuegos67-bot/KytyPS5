@@ -59,6 +59,9 @@ extern volatile std::atomic_uint32_t kyty_local_table_mru;
 extern volatile std::atomic<uint32_t> kyty_local_table_gather_memo; // KYTY_TABLE_GATHER_MEMO (local/table-xpr.inc TableGather)
 #endif
 extern volatile std::atomic_uint32_t kyty_local_scout_mode;
+// Speculative translation of graphics command buffers (src/graphics/guest_gpu/speculation.h).
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode;
+extern volatile std::atomic_uint32_t kyty_local_speculate_threads;
 }
 
 inline void InitializePerformanceSwitches() {
@@ -176,6 +179,8 @@ inline void InitializePerformanceSwitches() {
 	    // Table lookups that ask the last answer first (bits: pair cache size, variant, image set).
 	    Switch {"KYTY_TABLE_MRU", &kyty_local_table_mru, 0, 7},
 #endif
+	    Switch {"KYTY_SPECULATE", &kyty_local_speculate_mode, 0, 4},
+	    Switch {"KYTY_SPECULATE_THREADS", &kyty_local_speculate_threads, 1, 8},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {
@@ -188,6 +193,11 @@ inline void InitializePerformanceSwitches() {
 		if (*text == '\0' || *end != '\0' || value < setting.minimum || value > setting.maximum) {
 			std::fprintf(stderr, "%s must be a value from %u to %u\n", setting.environment,
 			             setting.minimum, setting.maximum);
+			std::abort();
+		}
+		// (KYTY_SPECULATE: 0 or 4, the modes measured and kept.)
+		if (setting.value == &kyty_local_speculate_mode && value != 0 && value != 4) {
+			std::fprintf(stderr, "%s must be 0 or 4\n", setting.environment);
 			std::abort();
 		}
 		setting.value->store(static_cast<uint32_t>(value), std::memory_order_relaxed);

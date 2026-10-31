@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "speculation-state.h"
 
 #include <array>
 #include <atomic>
@@ -69,10 +70,13 @@ public:
 	// Appends the (epoch, address) entries logged after `epoch`; false when the
 	// log no longer reaches back that far.
 	[[nodiscard]] bool NewImageStartsSince(uint64_t epoch, std::vector<std::pair<uint64_t, uint64_t>>& out);
+	// The image (of `serial`) still registered, and no image registered or unregistered over its pages since `epoch`
+	// (a speculation's work used it: speculation.cpp).
+	[[nodiscard]] bool StillResolved(const Image& image, uint64_t serial, uint64_t epoch) const;
 	[[nodiscard]] uint64_t ResolutionEpoch() const {
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}
-	// Moves whenever an image's slot is erased (EraseSlot, the only place): an id allocated when it was E is still
+	// Moves whenever an image's slot is erased (EraseRetired, the only place): an id allocated when it was E is still
 	// allocated while it is E.
 	[[nodiscard]] uint64_t EraseEpoch() const { return m_erase_epoch.load(std::memory_order_acquire); }
 	// Only reuses discovery. FindTexture still refreshes contents and selects the current view.
@@ -122,6 +126,8 @@ public:
 	// The image, or null when `id` names no live image (an erased one a record kept): not touched.
 	[[nodiscard]] Image*        TryGetImage(ImageId id) noexcept { return m_slot_images.try_get(id); }
 	void MarkGpuWritten(ImageId id);
+	// A speculative translation's use of the image, when it is committed (`serial`: the image it used).
+	void TouchSpeculated(Image& image, uint64_t serial);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -263,8 +269,9 @@ private:
 	// can read it.
 	[[nodiscard]] bool        DetachImage(ImageId id);
 	void                      RetireImage(ImageId id);
-	// A deleted image destroyed, its slot erased (RetireImage's, once nothing uses it).
-	void                      EraseSlot(ImageId id);
+	// Deleted images a speculation's packet may still read (Spec::PacketsPassed), destroyed once it passed.
+	std::vector<std::pair<ImageId, Spec::PacketMarks>> m_retired;
+	void                                               EraseRetired();
 	// An image a depth overlap replaced, out of every index but kept (one an address, the collector's run it was parked
 	// at): ResolveDepthOverlap takes it back when the memory is asked for in its description again, instead of making
 	// another image (the game takes one surface as a depth target and as a color target in turn every frame).

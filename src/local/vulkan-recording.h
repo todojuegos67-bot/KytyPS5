@@ -59,6 +59,9 @@ uint64_t StateEpoch();
 uint64_t WorkCalls();
 // Work calls and packets (draws, descriptors) the calling thread recorded: unchanged = nothing recorded.
 uint64_t RecordedWork();
+// Commands that change memory or images (draws, dispatches, copies, clears) and packets the calling thread
+// recorded: unchanged = nothing but barriers and rendering scopes recorded.
+uint64_t RecordedWrites();
 class ProducerScope {
 public:
     ProducerScope();

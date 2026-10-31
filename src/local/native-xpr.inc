@@ -206,10 +206,19 @@ void NativeXprPrefetch(const std::vector<T>& values) {
 	NativeXprPrefetch(values.data(), std::min<size_t>(values.size() * sizeof(T), 1024));
 }
 
-// The reader ReadShaderRawGuestMemory uses for every SRT word.
+// The reader ReadShaderRawGuestMemory uses for every SRT word. (A speculative translation's: not memory its own work
+// or guest memory writes write, refused; else noted, as read as no GPU work wrote it: speculation-state.h.)
 uint32_t NativeXprReadGuestWord(uint64_t address) {
 	uint32_t value = 0;
 	if (!Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, &value, sizeof(value))) {
+		if (auto* spec = Spec::Current()) {
+			// (Its processor's pending writes as they leave it; not what its own work writes. A speculation's thread
+			// does not read what the GPU wrote: only the GPU thread's read fault reads it back.)
+			if (!GuestGpu::IsGpuThread() && Libs::LibKernel::Memory::ReadFaults(address, sizeof(value)))
+				return Spec::Refuse("GPU-written guest memory"), 0u;
+			if (!spec->ReadJournaled(address, 1, &value)) return Spec::Refuse("memory the processor writes"), 0u;
+			return value;
+		}
 		std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
 	}
 	return value;
@@ -264,8 +273,8 @@ struct RenderExecutor::NativeXprDrawState {
 	mutable uint64_t                 targets_checked = 0;
 	// TextureCache::EraseEpoch then, and the memory from the lowest target's first byte to the highest's (0, 0: not yet).
 	mutable uint64_t                 targets_erased = 0, targets_span_begin = 0, targets_span_end = 0;
-	// TextureCache::ImagesEpoch after the last table draw emitted the targets (UINT64_MAX: none): they stay in place
-	// while it does not move (RenderExecutor::TableDraw).
+	// TextureCache::ImagesEpoch after the main executor's last table draw emitted the targets (UINT64_MAX: none): they
+	// stay in place while it does not move (RenderExecutor::TableDraw).
 	mutable uint64_t                 emitted_epoch = UINT64_MAX;
 	// The sum of its targets' image serials then (KYTY_TABLE_SERIALS; UINT64_MAX: none).
 	mutable uint64_t                 emitted_serials = UINT64_MAX;
@@ -1054,6 +1063,7 @@ vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout l
 void RenderExecutor::NativeXprRetireSet(vk::DescriptorPool pool, vk::DescriptorSet set) {
 	if (!set) return;
 	TableMemoRetired(); // (a memo entry may hold it)
+	Spec::NoteRetiredSet(reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(set)));
 	NativeXprState().retired.push_back({pool, set, m_context.GetCommandScheduler().CurrentTick()});
 }
 
@@ -1074,10 +1084,20 @@ void RenderExecutor::NativeXprRetire(std::unique_ptr<NativeXprRecord> record, bo
 	cache.stale[hash] = std::move(record);
 }
 
+void RenderExecutor::ResolvePendingTicks(uint64_t pending, uint64_t tick) {
+	if (!m_native_xpr) return;
+	for (auto& item: m_native_xpr->retired)
+		if (item.tick == pending) item.tick = tick;
+}
+
 // The draw states no draw used for StateKeepFrames leave. What holds one by its address forgets it: this executor's
-// emission and lookup, its table's last draw and its image sets' transits.
+// emission and lookup, its table's last draw and its image sets' transits (TableXpr::epoch moves). Not while another
+// executor reads this catalog (a speculation's): it holds them across draws too.
 void RenderExecutor::NativeXprSweepStates(NativeXprCache& cache, uint64_t frame) {
-	if (cache.states.size() <= NativeXprCache::StatesKept) return;
+	if (Role() != 0 || m_catalog_readers.load(std::memory_order_relaxed) != 0 ||
+	    cache.states.size() <= NativeXprCache::StatesKept)
+		return;
+	const auto   write  = CatalogWrite();
 	const size_t before = cache.states.size();
 	std::erase_if(cache.states, [&](const auto& item) {
 		return item.second->UsedFrame() + NativeXprCache::StateKeepFrames < frame;
@@ -1838,7 +1858,8 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 	                                                       draw_state.dynamic.depth);
 	// Entries stay at their address (emission tracking compares pointers); a
 	// replaced state must be emitted again.
-	auto& slot = cache.states[state_key];
+	const auto write = CatalogWrite();
+	auto&      slot  = cache.states[state_key];
 	if (!slot) slot = std::make_unique<NativeXprDrawState>();
 	*slot = std::move(draw_state);
 	slot->Use(m_context.FrameNumber());
@@ -2617,6 +2638,12 @@ public:
 				           !m_resources.HasReadWatchers(first << 12u, 4096);
 			}
 			if (m_direct) {
+				// (A speculation's: as no GPU work wrote it, which a hole that writes it after disproves, and as its
+				// processor's pending writes leave it.)
+				if (auto* spec = Spec::Current()) {
+					if (!spec->ReadJournaled(address, count, out)) return Spec::Refuse("memory the processor writes");
+					return;
+				}
 				if (count <= 16) {
 					// (A run of a few words: a CRT call each, ~10-15 per evaluation, was ~2% of the render thread on a
 					// laptop's Ryzen 9 5900HX; inline, its render time 33.6 -> 33.0 ms a frame, same process.)
@@ -3109,23 +3136,31 @@ struct RenderExecutor::NativeXprDirect {
 bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer) {
 	auto&      textures   = m_context.GetTextureCache();
 	const auto meta_epoch = textures.MetaEpoch();
+	auto*      spec       = Spec::Current();
 	for (const auto& target: draw_state.targets) {
 		auto* image = textures.m_slot_images.try_get(target.id);
-		if (image == nullptr || image->serial != target.serial || !image->registered) return false;
-		if (image->binding.needs_rebind) return false;
-		if (!image->SafeToDownload()) return false;
-		if (target.metadata != 0 && draw_state.meta_epoch != meta_epoch &&
+		if (image == nullptr || image->serial != target.serial || !image->registered)
+			return Spec::Refuse("table: target released"), false;
+		if (image->binding.needs_rebind) return Spec::Refuse("table: target rebind"), false;
+		if (!image->SafeToDownload()) return Spec::Refuse("table: target download"), false;
+		// (A speculation asks each time: its answers are noted.)
+		if (target.metadata != 0 && (spec != nullptr || draw_state.meta_epoch != meta_epoch) &&
 		    textures.IsMetaCleared(target.metadata, target.slice)) {
-			// The normal path clears it first.
-			return false;
+			// The normal path clears it first. A speculation's draw is a hole that does: the draws after it find it
+			// cleared (speculation-state.h).
+			if (spec != nullptr) spec->ConsumeMeta(target.metadata, target.slice);
+			return Spec::Refuse("table: cleared target"), false;
 		}
 	}
-	draw_state.meta_epoch = meta_epoch;
+	// (Not a speculation's answer: it holds as after holes the commit may not reach.)
+	if (spec == nullptr) draw_state.meta_epoch = meta_epoch;
 	for (const auto& target: draw_state.targets) {
 		auto& image = textures.GetImage(target.id); // LRU, as acquisition does
-		// (The whole image's layout stands for its subresources while they share one state. Else (rendering to layer 0
-		// of four left the image's layout the target's, layers 1-3 sampled) the target's own subresources decide.)
-		if (image.CurrentState().layout != target.layout || !image.backing.subresource_states.empty())
+		// (The whole image's layout stands for its subresources while they share one state. Else, as after a
+		// speculation's commit that left a layer elsewhere (rendering to layer 0 of four left the image's layout the
+		// target's, layers 1-3 sampled), the target's own subresources decide; a speculation's always do: it does not
+		// see its holes' transitions.)
+		if (spec != nullptr || image.CurrentState().layout != target.layout || !image.backing.subresource_states.empty())
 			image.Transit(target.layout, target.access, target.range, vk_buffer);
 	}
 	return true;
@@ -3406,7 +3441,9 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	    (indexed && (index_base == 0 || index_bytes == 0)))
 		return false;
 	m_context.GetCommandScheduler().PopPendingOperations();
-	RenderLockGuard lock(m_context.GetMutex());
+	// (The GPU thread's: a speculation's thread does not take it.)
+	std::optional<RenderLockGuard> lock;
+	if (Role() == 0) lock.emplace(m_context.GetMutex());
 	NativeXprCollect();
 
 	if (!clean || !cache.state_key_valid) {
@@ -3419,7 +3456,8 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 		if (table == TableResult::Store) return LiveCounters::Add(LiveCounters::TableStores), false;
 		if (table == TableResult::Deferred) return false;
 	}
-	// A draw of vertices is drawn only the table way.
+	// A speculative translation draws only the table way (speculation-state.h), as does a draw of vertices.
+	if (Spec::Current() != nullptr) return Spec::Refuse("native record"), false;
 	if (!indexed) return false;
 	NativeXprKey(buffer, cache.key);
 	// Relocation: the pair's pointer words leave the key, and which use of the rest in the frame this

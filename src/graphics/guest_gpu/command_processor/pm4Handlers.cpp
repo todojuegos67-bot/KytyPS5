@@ -18,6 +18,7 @@
 #include "live-census.h"
 #include "write-guard.h"
 #include "live-counters.h"
+#include "speculation-state.h"
 
 #include <algorithm>
 #include <array>
@@ -81,7 +82,8 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 // rendering writes per-draw data in compute passes). Like the indirect draw arguments, bring
 // GPU-written bytes back before the command processor reads guest memory; without it a table
 // read before its first download is all zeros (an "unknown register 0" crash at startup).
-void SyncCommandMemory(uint64_t address, uint64_t bytes, const char* what) {
+// False when a speculative translation refused it (speculation-state.h): the packet applies nothing.
+[[nodiscard]] bool SyncCommandMemory(uint64_t address, uint64_t bytes, const char* what) {
 	LiveCounters::Add(LiveCounters::IndirectTables);
 	LiveCensus::Scope census(LiveCensus::CommandSync, 0, 0);
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(address, bytes)) {
@@ -92,6 +94,8 @@ void SyncCommandMemory(uint64_t address, uint64_t bytes, const char* what) {
 			     what, address, bytes);
 		}
 	}
+	const auto* spec = Spec::Current();
+	return spec == nullptr || spec->refused == nullptr;
 }
 
 // An entry of an indirect register table the emulator cannot apply: report the table once in a
@@ -2010,8 +2014,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 		     indirect_num_dw, buffer[2]);
 	}
 
-	SyncCommandMemory(reinterpret_cast<uint64_t>(indirect_buffer),
-	                  uint64_t {indirect_num_dw} * sizeof(uint32_t), "IndirectBuffer");
+	if (!SyncCommandMemory(reinterpret_cast<uint64_t>(indirect_buffer),
+	                       uint64_t {indirect_num_dw} * sizeof(uint32_t), "IndirectBuffer"))
+		return 3;
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
 	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw});
@@ -2267,11 +2272,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
-	SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectCxRegs");
-	// (KYTY_WRITE_GUARD: a table on a page a pending guest write guards, through the backing view: the bytes this
-	// thread wrote, local/write-guard.h.)
-	if (const auto* backing = WriteGuard::GuardedBacking(indirect_address, uint64_t {indirect_num_dw} * 8u))
-		indirect_buffer = const_cast<uint32_t*>(static_cast<const uint32_t*>(backing));
+	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectCxRegs"))
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
@@ -2349,11 +2351,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
-	SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectShRegs");
-	// (KYTY_WRITE_GUARD: a table on a page a pending guest write guards, through the backing view: the bytes this
-	// thread wrote, local/write-guard.h.)
-	if (const auto* backing = WriteGuard::GuardedBacking(indirect_address, uint64_t {indirect_num_dw} * 8u))
-		indirect_buffer = const_cast<uint32_t*>(static_cast<const uint32_t*>(backing));
+	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectShRegs"))
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
@@ -2408,11 +2407,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
-	SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectUcRegs");
-	// (KYTY_WRITE_GUARD: a table on a page a pending guest write guards, through the backing view: the bytes this
-	// thread wrote, local/write-guard.h.)
-	if (const auto* backing = WriteGuard::GuardedBacking(indirect_address, uint64_t {indirect_num_dw} * 8u))
-		indirect_buffer = const_cast<uint32_t*>(static_cast<const uint32_t*>(backing));
+	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectUcRegs"))
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),

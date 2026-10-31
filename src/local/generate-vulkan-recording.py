@@ -123,9 +123,13 @@ def generate(registry, header):
         mark = (f'LiveTrace::VulkanMark(commandBuffer, {mark_id}, {"true" if mark_id < 10 else "false"}{caller}); '
                 if mark_id is not None and ret == 'void' else '')
         declarations.append(f'static VKAPI_ATTR {ret} VKAPI_CALL Wrapped_{name}({", ".join(decl(p) for p in params)}) {{')
-        # Commands that do GPU work or synchronize: unchanged between two barriers = none in between.
-        if re.match(r'vkCmd(Draw|Dispatch|Copy|Fill|Clear|Blit|Resolve|UpdateBuffer|BeginRendering|PipelineBarrier|WriteTimestamp|ExecuteCommands)', name):
-            declarations.append('    ++g_work_calls;')
+        # Commands that do GPU work or synchronize (WorkCalls: unchanged between two barriers = none in between), one
+        # increment each as before: those that change memory or images (RecordedWrites), and the barriers, render pass
+        # begins and timestamps.
+        if re.match(r'vkCmd(Draw|Dispatch|Copy|Fill|Clear|Blit|Resolve|UpdateBuffer|ExecuteCommands)', name):
+            declarations.append('    ++g_writing_calls;')
+        elif re.match(r'vkCmd(BeginRendering|PipelineBarrier|WriteTimestamp)', name):
+            declarations.append('    ++g_sync_calls;')
         # Local diagnostic (live census): barriers by the code that records them.
         if name.startswith('vkCmdPipelineBarrier'):
             declarations.append('    if (LiveCensus::g_on.load(std::memory_order_relaxed) && LiveCensus::g_render) '

@@ -667,6 +667,12 @@ void StreamBuffer::Commit() {
 	watch.tick        = tick;
 }
 
+void StreamBuffer::ResolvePendingTicks(uint64_t pending, uint64_t tick) noexcept {
+	for (auto* watches: {&m_current_watches, &m_previous_watches})
+		for (auto& watch: *watches)
+			if (watch.tick == pending) watch.tick = tick;
+}
+
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {
 	EXIT_IF(source == nullptr);
 	const auto [data, offset] = Map(size, alignment);

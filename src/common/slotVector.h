@@ -32,9 +32,9 @@ struct SlotId {
 };
 
 // Stable-address slot storage for cache resources that are intentionally non-movable. A slot may be read from another
-// thread while the owner inserts and erases: the slots are in chunks that never move (published atomically), a slot's
-// generation and liveness are atomic. An erased object is destroyed by erase: a caller whose object another thread may
-// still be reading defers it.
+// thread while the owner inserts and erases (a speculative translation's thread, src/graphics/guest_gpu/speculation.h):
+// the slots are in chunks that never move (published atomically), a slot's generation and liveness are atomic. An
+// erased object is destroyed by erase: a caller whose object another thread may still be reading defers it.
 template <typename T>
 class SlotVector {
 public:

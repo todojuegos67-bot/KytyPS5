@@ -87,7 +87,7 @@ public:
 	               uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
-	// BufferCache state lives directly on the resource.
+	// BufferCache state lives directly on the resource (is_deleted also read by a speculative translation's thread).
 	std::atomic<bool> is_deleted {false};
 	int    stream_score = 0;
 	size_t lru_id       = 0;
@@ -136,6 +136,9 @@ public:
 	// KYTY_STAGING_STATS: an upload the caller sends around the ring (a temporary buffer, the
 	// large path), counted with its use.
 	void NoteBypass(uint64_t size);
+	// What was fenced with `pending` (a speculative translation's work: CommandScheduler::PendingTick and up) gets
+	// `tick`.
+	void ResolvePendingTicks(uint64_t pending, uint64_t tick) noexcept;
 
 private:
 	friend struct StreamBufferTestAccess;
