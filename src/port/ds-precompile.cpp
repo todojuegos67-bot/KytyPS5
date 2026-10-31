@@ -351,14 +351,31 @@ void Work() {
 	// 3. The plan (every pipeline once, with the work item that makes it first).
 	SetText("Preparando shaders: planificando (un minuto o dos)...");
 	const fs::path plan = g_logs / L"plan.bin";
-	if (has_recorded &&
-	    !run("plan-recorded", L"--seeds " + Quote(recorded) + L" --dry-run --plan " + Quote(plan) + L" --threads " + std::to_wstring(cpus)))
-		return fail(g_stop ? "" : "No se pudo planificar la preparacion de shaders. Mira logs\\*-precompile.");
-	{
-		std::wstring args = L"--seeds " + Quote(seeds) + L" --dry-run --plan " + Quote(plan) + L" --threads " + std::to_wstring(cpus) +
-		                    L" --static-inputs";
+	// (Not fatal: the first run's plan failed on players' PCs - every CPU thread translating every program at once, short of
+	// memory - and only a second start went on. Tried again on 4 threads; without a plan the shards still make every
+	// pipeline, some of them twice.)
+	bool use_plan = true;
+	const auto plan_step = [&](const std::string& name, const std::wstring& args_no_threads) {
+		if (run(name, args_no_threads + L" --threads " + std::to_wstring(cpus))) return true;
+		if (g_stop) return false;
+		std::error_code e;
+		fs::remove(plan, e);
+		return run(name + "-retry", args_no_threads + L" --threads " + std::to_wstring(std::min(cpus, 4)));
+	};
+	if (has_recorded && !plan_step("plan-recorded", L"--seeds " + Quote(recorded) + L" --dry-run --plan " + Quote(plan))) use_plan = false;
+	if (use_plan) {
+		std::wstring args = L"--seeds " + Quote(seeds) + L" --dry-run --plan " + Quote(plan) + L" --static-inputs";
 		if (has_recorded) args += L" --covered-by " + Quote(recorded);
-		if (!run("plan-seeds", args)) return fail(g_stop ? "" : "No se pudo planificar la preparacion de shaders. Mira logs\\*-precompile.");
+		if (!plan_step("plan-seeds", args)) use_plan = false;
+	}
+	if (g_stop) return fail("");
+	if (!use_plan) {
+		std::error_code e;
+		fs::remove(plan, e);
+		std::printf("[port] precompile: no plan (logs\\*-precompile\\plan-*.out.log); the shards go on without one\n");
+		std::fflush(stdout);
+		// (The prefetch inputs the seeds' plan writes: made apart.)
+		(void)run("inputs", L"--seeds " + Quote(seeds) + L" --no-pipelines --threads " + std::to_wstring(std::min(cpus, 4)) + L" --static-inputs");
 	}
 
 	// 4. The shards: ~100 planned pipelines each, the recorded tier first.
@@ -431,7 +448,7 @@ void Work() {
 			pending->pop_front();
 			const std::string name = "shard" + std::to_string(item.i) + "of" + std::to_string(item.n) + (item.first ? "-recorded" : "-seeds");
 			Child c = Launch(name, L"--seeds " + Quote(item.file) + L" --shard " + std::to_wstring(item.i) + L"/" + std::to_wstring(item.n) +
-			                           L" --threads " + std::to_wstring(threads) + L" --plan " + Quote(plan),
+			                           L" --threads " + std::to_wstring(threads) + (use_plan ? L" --plan " + Quote(plan) : std::wstring()),
 			                 true);
 			if (c.process == nullptr) {
 				kill_all();
