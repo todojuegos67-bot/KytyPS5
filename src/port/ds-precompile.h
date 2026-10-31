@@ -41,7 +41,8 @@ void Choose(const std::string& ini, Settings* settings);
 // "--driver-cache-status": the game's driver cache holds every static recipe of this GPU's and driver's inputs.
 bool CacheCurrent();
 void Start();
-void Stop(); // waits for the worker (the running shards are killed; what finished is kept)
+void Stop(bool save = true); // waits for the worker (the running shards are killed; what finished is kept). save: merged now
+                              // (false: the game closing; the finished shards are merged at the next start)
 
 struct View {
 	bool        running = false, finished = false, failed = false, playable = false; // playable: recorded play merged
