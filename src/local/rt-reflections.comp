@@ -66,7 +66,8 @@ layout(std430, binding = 18) buffer Frame {
 	                   // (KYTY_RT_REFLECTIONS_GLOSSY), z how much of the albedo's hue tints a metal's reflection, w the albedo
 	                   // layer (L0 bits 0..23 as sRGB rgb; < 0 none)
 	vec4 yparams;      // (refl9b) x the minimum reflective area's radius (render pixels; 0 off: KYTY_RT_REFLECTIONS_MIN_AREA),
-	                   // y the large pools' boost (KYTY_RT_REFLECTIONS_POOL_BOOST)
+	                   // y the large pools' boost (KYTY_RT_REFLECTIONS_POOL_BOOST), (refl-sharp-1031) z the sharpness
+	                   // (0 normal: as before, 1 alta, 2 maxima), w the water's waves in the reflection rays (0 as now, 1 soft, 2 mirror)
 	int  calib[];      // see CALIB_* below (calibration sums, then the cumulative stats counters)
 };
 // calib[] layout (ints): [0] samples; [CALIB_NORMAL + ((layer * NLAYOUTS + layout) * 2 + space) * 2 + convention] sum of
@@ -423,6 +424,10 @@ float WaterMask(ivec2 rp, float d, vec2 uv, vec3 Nd) {
 vec3 WaterNormal(vec3 Nd) {
 	if ((push.misc.w & 8) == 0) return Nd;
 	vec3  up = normalize(up_view.xyz);
+	// (refl-sharp-1031) the waves' perturbation of the reflection ray: soft keeps 40 % of it, mirror none (flat water)
+	int   wv = int(yparams.w + 0.5);
+	if (wv == 2 && dot(Nd, up) > 0.5) return up;
+	if (wv == 1) Nd = normalize(mix(up, Nd, 0.4));
 	float c  = dot(Nd, up);
 	// (water-1030, WaterStable: the per-pixel depth normal of ripples is noise (the depth's precision, the vertex waves):
 	// snapped level from 0.94, a smoothed blend below, so the mirror ray does not jump between hit and miss pixel to pixel)
@@ -870,9 +875,12 @@ void Temporal(ivec2 px) {
 		vec3  hy   = clamp(YCoCg(hist.rgb), m1 - k * sig - 1e-4, m1 + k * sig + 1e-4);
 		hist.rgb   = max(Rgb(hy), vec3(0));
 		hist.a     = clamp(hist.a, a1 - k * asig - 0.02, a1 + k * asig + 0.02);
-		len        = min(meta.x + 1.0, 32.0);
+		int   sh    = int(yparams.z + 0.5); // (refl-sharp-1031: alta / maxima a shorter history)
+		len        = min(meta.x + 1.0, sh == 2 ? 8.0 : sh == 1 ? 16.0 : 32.0);
 		// Mirrors follow quickly (a parallax error would ghost); rough surfaces average longer.
 		float amin  = mix(0.25, 0.04, smoothstep(0.02, 0.3, rough)) * push.motion.w; // (refl3: mirrors 0.25, was 0.15)
+		if (sh == 1) amin = max(amin * 1.5, mix(0.35, 0.08, smoothstep(0.02, 0.3, rough)));
+		if (sh == 2) amin = max(amin * 2.0, mix(0.45, 0.14, smoothstep(0.02, 0.3, rough)));
 		float alpha = max(1.0 / len, amin);
 		// (a miss this frame against a held reflection: the history fades slowly instead of popping)
 		if (fresh && cur.a < hist.a * 0.5) alpha *= 0.5;
@@ -911,13 +919,16 @@ void Atrous(ivec2 px) {
 	vec4 ax = texelFetch(aux_tex, px, 0);
 	float rough = ax.x;
 	// Mirrors (and pixels with nothing) stay as they are.
-	if (g.w > 5e4 || ax.y < 0.01 || rough < 0.03) {
+	int sh = int(yparams.z + 0.5); // (refl-sharp-1031: 0 normal, 1 alta, 2 maxima)
+	if (g.w > 5e4 || ax.y < 0.01 || rough < (sh == 2 ? 0.08 : sh == 1 ? 0.05 : 0.03)) {
 		imageStore(out_a, px, c);
 		return;
 	}
 	// (fgrt-1029) Sharp glossy reflections: the passes by roughness (none below 0.12, one below 0.25, all above), and a
 	// smaller radius the glossier the surface.
 	int allowed = rough < 0.12 ? 0 : rough < 0.25 ? 1 : 8;
+	if (sh == 1) allowed = rough < 0.18 ? 0 : rough < 0.35 ? 1 : 2;
+	if (sh == 2) allowed = rough < 0.25 ? 0 : rough < 0.45 ? 1 : 2;
 	if (push.params.w >= float(1 << allowed)) {
 		imageStore(out_a, px, c);
 		return;
@@ -928,6 +939,7 @@ void Atrous(ivec2 px) {
 	// (far away the same pixel radius covers far more surface: the radius shrinks with distance; grazing, sharper)
 	step *= clamp(25.0 / max(g.w, 1e-3), 0.3, 1.0);
 	if (ax.z > 0.0) step *= clamp(ax.z / max(g.w * 0.1, 1e-3), 0.3, 1.0);
+	step          *= sh == 2 ? 0.4 : sh == 1 ? 0.65 : 1.0; // (refl-sharp-1031: a smaller radius)
 	step           = max(step, 1.0);
 	const float kern[3] = float[](0.375, 0.25, 0.0625);
 	float lc       = c.a > 1e-3 ? Luma(c.rgb / c.a) : 0.0;

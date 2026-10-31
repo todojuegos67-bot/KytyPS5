@@ -322,7 +322,9 @@ function Start-Game {
 	if ($cmbRt.SelectedIndex -eq 4) { $sets += 'KYTY_SSGI_INTENSITY=1.6'; $sets += 'KYTY_SSGI_AO=0.4' }  # (10-25) Extremo: Ultra con mas luz rebotada y mas sombreado de contacto  # (10-24) iluminacion RT (vuelve)
 	foreach ($n in 'KYTY_RT_SHADOWS', 'KYTY_RT_REFLECTIONS') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }  # (10-24) RT beta
 	if ($cmbRtRf -and $cmbRtRf.SelectedIndex -gt 0) { $env:KYTY_RT_REFLECTIONS = $(if ($cmbRtRf.SelectedIndex -eq 6) { '3' } else { "$($cmbRtRf.SelectedIndex)" }) }  # (refl-hybrid-1028) Hibrido = Alto (nivel 3) + el relleno por hardware
-	foreach ($n in 'KYTY_RT_REFLECTIONS_MIN', 'KYTY_RT_REFLECTIONS_GUIDE_STRENGTH') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
+	foreach ($n in 'KYTY_RT_REFLECTIONS_MIN', 'KYTY_RT_REFLECTIONS_GUIDE_STRENGTH', 'KYTY_RT_REFLECTIONS_SHARP', 'KYTY_RT_REFLECTIONS_WATER_WAVES') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
+	if ($cmbRtRf -and $cmbRtRf.SelectedIndex -gt 0 -and $cmbRtSharp -and $cmbRtSharp.SelectedIndex -gt 0) { $env:KYTY_RT_REFLECTIONS_SHARP = "$($cmbRtSharp.SelectedIndex)" }  # (refl-sharp-1031) Nitidez: 1 alta, 2 maxima
+	if ($cmbRtRf -and $cmbRtRf.SelectedIndex -gt 0 -and $cmbRtWaves -and $cmbRtWaves.SelectedIndex -gt 0) { $env:KYTY_RT_REFLECTIONS_WATER_WAVES = "$($cmbRtWaves.SelectedIndex)" }  # (refl-sharp-1031) Ondas: 1 suaves, 2 espejo
 	if ($cmbRtRf -and $cmbRtRf.SelectedIndex -ge 4 -and $cmbRtRf.SelectedIndex -le 5) { $env:KYTY_RT_REFLECTIONS_MIN = '0.55'; $env:KYTY_RT_REFLECTIONS_GUIDE_STRENGTH = '1.3' }  # (10-25) Ultra: nivel 4 del emulador, mas presencia
 	# (10-25 noche) combo22: sol RT, calidad de sombra, profundidad, particulas RT
 	foreach ($n in 'KYTY_GTAO', 'KYTY_GTAO_STRENGTH', 'KYTY_GTAO_BENT') { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
@@ -2382,6 +2384,8 @@ $cmbRtSh = $null  # (10-29) Sombras RT retiradas (se veian mal)
 $cmbAoNew = $null  # (10-29) Path tracing retirado (se veia mal)
 $cmbRays = New-RtCombo 'Luz volumetrica' 'godrays2' 24 'Luz volumetrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms (mas rayos y mas pasos de sombra).' @('No', 'Bajo', 'Medio', 'Alto')
 $cmbRtRf = New-RtCombo 'Reflejos RT' 'rtrefl2' 56 'Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, mas nitidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolucion completa y mas fuertes). Hibrido: Alto + rayos por hardware (RT real) solo donde el rayo de pantalla no encuentra nada (fuera de pantalla o tapado); el color sale de la pantalla anterior, limitado al de alrededor y entrando poco a poco: sin destellos. Necesita GPU con RT. ~+0,5 ms. Beta.' @('No', 'Bajo', 'Medio', 'Alto', 'Ultra', 'Extremo', 'Híbrido')  # (10-25 noche) Extremo = nivel 5 (refl10)  # (10-25) refl8; Ultra vuelve: el cierre era del frame generation AMD, no de los reflejos  # (refl-hybrid-1028) Hibrido = 6
+$cmbRtSharp = New-RtCombo 'Nitidez reflejos RT' 'rtreflsharp' 1500 'Mas nitidez en los reflejos RT (superficies y agua). Normal: como ahora. Alta: rayos a resolucion completa en Bajo/Medio, menos desenfoque y menos mezcla con frames anteriores (~+0,3-0,8 ms). Maxima: ademas sin tablero de ajedrez, el desenfoque minimo y el historial mas corto; los espejos conservan el detalle, puede verse algo mas de ruido (~+0,6-1,5 ms).' @('Normal', 'Alta', 'Máxima')  # (refl-sharp-1031) KYTY_RT_REFLECTIONS_SHARP
+$cmbRtWaves = New-RtCombo 'Ondas agua reflejos' 'rtreflwaves' 1532 'Cuanto mueven las ondas del agua el rayo del reflejo (el agua se ve igual). Como ahora: sin cambios. Suaves: 40 % de la ondulacion, reflejos mas limpios. Espejo: el agua refleja como un espejo plano. Sin coste.' @('Como ahora', 'Suaves', 'Espejo')  # (refl-sharp-1031) KYTY_RT_REFLECTIONS_WATER_WAVES
 $cmbTorch = $null  # (10-29) Luz de antorchas RT retirada (no gustaba el efecto)
 $cmbFlare = New-RtCombo 'Destellos de lente' 'lensflare' 568 'Destello de lente de antorchas y fuegos visibles: pequenos reflejos de la optica, una estrella y una raya suaves. Desaparece si el fuego queda tapado y cerca de los bordes. Sin halo ni velo en pantalla. Se dibuja antes del HUD. Solo con DLSS, XeSS o FSR. ~0,1 ms.' @('No', 'Sí')  # (torch-1028)
 $cmbDof = $null  # (10-29) profundidad de campo retirada
@@ -2821,7 +2825,7 @@ if ($gCtl -and $btnCtl) { $gCtl.Top = $btnCtl.Bottom + 6 }
 # (audit) Casilla Juego original: al marcarla las filas de efectos quedan inactivas (sus valores se guardan).
 $chkPure = New-Check 'Juego original (sin efectos añadidos)' 0 0 396 'puregame'
 $tips.SetToolTip($chkPure, 'Apaga todos los efectos visuales que anade el emulador (ray tracing, luz volumetrica, sombras RT, brillo, oclusion, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, frame generation y latencia no cambian.')
-function Update-PureGame { foreach ($c in @($cmbRtRf, $cmbRt, $cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbSmoke, $cmbFov)) { if ($c) { $c.Enabled = -not $chkPure.Checked } } }
+function Update-PureGame { foreach ($c in @($cmbRtRf, $cmbRtSharp, $cmbRtWaves, $cmbRt, $cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbSmoke, $cmbFov)) { if ($c) { $c.Enabled = -not $chkPure.Checked } } }
 $chkPure.Add_CheckedChanged({ Update-PureGame })
 # (10-26) "Ray tracing" solo con RT real: fuera Luz RT (SSGI), Luz volumetrica de pantalla, Reflejos RT, Sol RT y Particulas RT de pantalla.
 # (Visible no sirve para leer antes de mostrar la ventana: se trabaja con listas.)
@@ -2830,7 +2834,7 @@ try {
 	$rtHwExp = (Get-IniValue 'rthwexp' '0') -eq '1'
 	$fake = @($cmbSun, $cmbPart, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater) | Where-Object { $_ }  # (10-27) solo reflejos, sombras RT y rayos volumetricos
 	$hideOnly = @(if (-not $rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } })  # (vol25) la Luz volumetrica ya no se oculta
-	$keep = @(@($cmbRtRf, $cmbRt, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbSmoke, $cmbRtSh) | Where-Object { $_ }) + @(if ($rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } | Sort-Object Top })  # (vol25) Luz volumetrica del 10-25 visible otra vez, debajo
+	$keep = @(@($cmbRtRf, $cmbRtSharp, $cmbRtWaves, $cmbRt, $cmbRays, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbSmoke, $cmbRtSh) | Where-Object { $_ }) + @(if ($rtHwExp) { @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHVolSh) | Where-Object { $_ } | Sort-Object Top })  # (vol25) Luz volumetrica del 10-25 visible otra vez, debajo
 	$lblOf = @{}
 	foreach ($c in @($fake + $hideOnly + $keep + @($cmbShQ, $cmbShD, $cmbAo, $cmbIbl, $cmbTess) | Where-Object { $_ })) {
 		$lblOf[$c.GetHashCode()] = @($gRt.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and [math]::Abs($_.Top - ($c.Top + 2)) -le 4 })
@@ -2895,7 +2899,7 @@ try {
 	if ($chkPure) { $cmbFov.Enabled = -not $chkPure.Checked }
 } catch { }
 # (10-26) Al elegir cualquier Modo Souls: todo el ray tracing en No (el usuario lo enciende a mano despues).
-function Set-RtAllOff { foreach ($c in @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRt, $cmbRtRf, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbRays)) { if ($c -and $c.Items.Count -gt 0) { $c.SelectedIndex = 0 } } }
+function Set-RtAllOff { foreach ($c in @($cmbHRef, $cmbHSun, $cmbHLamp, $cmbHGi, $cmbHCon, $cmbHSoft, $cmbHWater, $cmbHVolSh, $cmbRt, $cmbRtRf, $cmbRtSharp, $cmbRtWaves, $cmbAoNew, $cmbTorch, $cmbFlare, $cmbDof, $cmbRtSh, $cmbRays)) { if ($c -and $c.Items.Count -gt 0) { $c.SelectedIndex = 0 } } }
 # (vol25) Luz volumetrica y Sombras sol RT comparten el pase del sol en el motor: con las dos, el sol de la volumetrica
 # llega a ratos (niebla que salta). Se excluyen: elegir una pone la otra en No.
 if ($false -and $cmbRays -and $cmbHSun) {  # (rt-vol 1ac512fe) ya pueden ir juntas
