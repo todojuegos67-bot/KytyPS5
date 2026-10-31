@@ -56,8 +56,9 @@ extern "C" {
 // is skipped; the draw takes the normal path until a later store finds the variant ready.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_xpr_pipelines_mode {0};
 // KYTY_TABLE_GATHER_MEMO (TableGather): a V# whose four words equal the ones gathered last at its index keeps its
-// entry pointer without the hash and the prefetch. Consecutive draws share most of their buffers.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_gather_memo {0};
+// entry pointer without the hash and the prefetch. Consecutive draws share most of their buffers. On by default
+// (KYTY_TABLE_GATHER_MEMO=0 turns it off).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_gather_memo {1};
 // 1: relocation. Objects whose user data points at a new copy of the same tables every frame (a ring)
 // had keys new every frame, so no record; the pointer words (user data pairs the SRT reads through and
 // uses for nothing else) leave the key, and the record reads the same offsets from the new base.

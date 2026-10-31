@@ -143,7 +143,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_TABLE_XPR", &kyty_local_table_xpr_mode, 0, 2},
 	    // Table dispatches (src/local/table-xpr.inc).
 	    Switch {"KYTY_TABLE_DISPATCH", &kyty_local_table_dispatch_mode},
-	    // The table path's gather: a V# unchanged at its index since the last draw keeps its resolved entry (no hash).
+	    // The table path's gather: a V# unchanged at its index since the last draw keeps its resolved entry (no hash;
+	    // default on, 0 for an A/B).
 	    Switch {"KYTY_TABLE_GATHER_MEMO", &kyty_local_table_gather_memo},
 	    // Table dispatches of programs with an address probe's indirect image or reads by device address at offsets no
 	    // slot fixes (the light loops; default on, 0 for an A/B).
