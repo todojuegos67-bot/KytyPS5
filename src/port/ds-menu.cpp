@@ -1485,9 +1485,9 @@ void Draw(float width, float height) {
 					}
 					// (10-28) Mejoras para equipos de 16 GB de RAM: the launcher's 16 GB profile, on PCs of 20 GB or less.
 					const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
-					if (small) // (port28) hidden on PCs with more RAM
+					(void)small; // (port28) always shown and usable; off by default
 						CheckRow("Mejoras para equipos de 16 GB de RAM", s.ram16_boost != g_rt.launched.ram16_boost, s.ram16_boost,
-						         "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria). Solo en PCs de 20 GB de RAM o menos. No cambia los gráficos.");
+						         "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria). Pensado para PCs de 16 GB de RAM. No cambia los gráficos.");
 					s.profile16 = LowRam(s, g_rt.pc);
 					if (s.ram16_boost) ImGui::TextColored(kGold, "RAM %s: mejoras activadas. Cierra los navegadores mientras juegas.", s.simulate_ram16 ? "16 GB (simulado)" : (std::to_string(g_rt.pc.ram_gb) + " GB").c_str());
 					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para gráficas que se cuelgan o dan pantallazo azul: más estable, ~37% menos FPS.");
@@ -2258,13 +2258,10 @@ void LauncherConfigurator(Settings& s) {
 void LauncherPerformance(Settings& s) {
 	BoxBegin("Rendimiento / PC");
 	const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
-	if (small) { // (port28) only on PCs of 20 GB of RAM or less: hidden on the others
+	{ // (port28) always shown and usable; off by default
 		const float y = RowY();
-		ImGui::BeginDisabled(!small);
 		LCheck(y, "Mejoras para equipos de 16 GB de RAM", s.ram16_boost,
-		       "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria). Solo en PCs de 20 GB de RAM o menos. No cambia los gráficos.");
-		ImGui::EndDisabled();
-		if (!small) Tip("No hacen falta: solo en PCs de 20 GB de RAM o menos.");
+		       "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria). Pensado para PCs de 16 GB de RAM. No cambia los gráficos.");
 		RowEnd(y);
 		if (small && s.ram16_boost) {
 			const float ny = RowY();

@@ -188,7 +188,7 @@ struct Settings {
 	bool        kbm_calibrate = false; // (10-28) the next start measures the camera into kbm_curve.txt (KYTY_KBM_CALIBRATE), once
 	// [Configurador] (10-28)
 	bool        configured = false;  // the first-start dialog has been shown
-	bool        ram16_boost = true;  // Mejoras para equipos de 16 GB de RAM: the 16 GB profile + the RAM flush (PCs of 20 GB or less)
+	bool        ram16_boost = false; // Mejoras para equipos de 16 GB de RAM: the 16 GB profile + the RAM flush (PCs of 20 GB or less)
 	// [Interfaz]
 	std::string metrics = "0"; // KYTY_FPS_HUD 0/1/2
 	bool        start_menu = true; // (10-27b) menu_inicio: the launcher-style menu before the game

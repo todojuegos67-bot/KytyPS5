@@ -303,7 +303,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("raton_camara_instantanea", s->kbm_warp);
 	boo("raton_calibrar", s->kbm_calibrate);
 	boo("configurado", s->configured);
-	boo("mejoras_16gb", s->ram16_boost);
+	boo("mejoras_16gb_v2", s->ram16_boost); // (port28) new key: the old one was on by default
 	str("reflejos_rt", s->rt_ss_refl);
 	str("nitidez_reflejos_rt", s->rt_refl_sharp);
 	str("ondas_agua_reflejos", s->rt_refl_waves);
@@ -515,7 +515,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; 0: el configurador de hardware se muestra al arrancar\n"
 	  << "configurado=" << b(s.configured) << "\n"
 	  << "; Mejoras para equipos de 16 GB de RAM: perfil de 16 GB (solo en PCs de 20 GB de RAM o menos)\n"
-	  << "mejoras_16gb=" << b(s.ram16_boost) << "\n\n"
+	  << "mejoras_16gb_v2=" << b(s.ram16_boost) << "\n\n"
 	  << "[Interfaz]\n"
 	  << "; Metricas en pantalla: 0 no, 1 FPS, 2 FPS + detalle\n"
 	  << "metricas=" << s.metrics << "\n"
@@ -541,7 +541,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 
 bool LowRam(const Settings& s, const PcInfo& pc) {
 	// (10-28) "Mejoras para equipos de 16 GB de RAM" (on by default) on a PC of 20 GB or less, or simulated.
-	return s.simulate_ram16 || (s.ram16_boost && pc.ram_gb > 0 && pc.ram_gb <= 20);
+	return s.simulate_ram16 || s.ram16_boost; // (port28) usable on any PC (off by default; Optimizar turns it on at 20 GB or less)
 }
 
 void RecommendFor(PcInfo* pc) {
