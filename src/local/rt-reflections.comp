@@ -282,6 +282,28 @@ vec4  GameSsr(vec2 uv) {
 	if (Bad(g)) return vec4(0);
 	return vec4(max(g.rgb, vec3(0)), clamp(g.a, 0.0, 1.0));
 }
+// (refl-res-1031) Alta / Maxima: the game's half-resolution SSR (the guide) upsampled joint-bilaterally: the 4 texels
+// weighted by how close their depth is to this pixel's (no stair or wave pattern along edges and over floors); Normal:
+// the plain bilinear sample, as before.
+vec4 GameSsrAt(vec2 uv, float z) {
+	if (!HaveGuide() || int(yparams.z + 0.5) < 1) return GameSsr(uv);
+	vec2  gsz = vec2(textureSize(game_ssr, 0));
+	vec2  tc  = uv * gsz - 0.5;
+	vec2  i0  = floor(tc), fr = tc - i0;
+	vec4  sum = vec4(0);
+	float ws  = 0.0;
+	for (int k = 0; k < 4; ++k) {
+		vec2  o   = vec2(k & 1, k >> 1);
+		vec2  tuv = clamp((i0 + o + 0.5) / gsz, vec2(0.0), vec2(1.0));
+		float bw  = (o.x > 0.5 ? fr.x : 1.0 - fr.x) * (o.y > 0.5 ? fr.y : 1.0 - fr.y);
+		float tz  = abs(ViewZ(DepthAt(tuv)));
+		float w   = bw * exp(-abs(tz - z) / (0.03 * z + 0.02)) + 1e-4 * bw;
+		vec4  g   = textureLod(game_ssr, tuv, 0);
+		if (Bad(g)) continue;
+		sum += vec4(max(g.rgb, vec3(0)), clamp(g.a, 0.0, 1.0)) * w, ws += w;
+	}
+	return ws > 1e-6 ? sum / ws : GameSsr(uv);
+}
 // How much the game counts this pixel as reflecting (its SSR confidence through gparams.x..y).
 float GameMask(float a) { return smoothstep(gparams.x, max(gparams.y, gparams.x + 1e-3), a); }
 // The game's reflected color itself (not premultiplied).
@@ -495,7 +517,7 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 		// (refl8) The game decides: its SSR confidence here; the roughness field (when decoded) only narrows it to the
 		// mirror-like surfaces we sharpen and sets our lobe.
 		if (water <= 0.0 && GbufSurface(rp, d, match)) {
-			float gm  = GameMask(GameSsr(ruv).a);
+			float gm  = GameMask(GameSsrAt(ruv, abs(P.z)).a);
 			float mir = 1.0;
 			mat_pr = 0.05, mat_r = 0.0; // (no roughness field: a mirror ray, at the game's share)
 			if (match && have_mat) {
@@ -1257,7 +1279,7 @@ vec3 CompositeRaw(ivec2 px, vec4 col, float d, out bool wl) {
 	}
 	if (st) Stat(17, MovingRaw(uv, P) > 0.5 ? 1 : 0);
 	// (refl8) The game's own SSR here (the guide) and whether this pixel is the G-buffer's surface it belongs to.
-	vec4  gs     = GameSsr(uv);
+	vec4  gs     = GameSsrAt(uv, z);
 	bool  gsurf  = GuideMode() && HaveGuide() && GbufSurface(px, d, match);
 	float ga     = gsurf ? gs.a : 0.0;
 	if (st && GuideMode() && HaveGuide()) {
