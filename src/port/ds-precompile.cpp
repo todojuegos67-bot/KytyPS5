@@ -19,6 +19,8 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <dxgi.h>
+#include <cwctype>
 #endif
 
 namespace Port::Precompile {
@@ -61,6 +63,84 @@ struct Child {
 
 fs::path g_logs, g_nvidia;
 
+// (Its comment: below, at kShards.)
+constexpr const wchar_t* kDriverCacheKey = L"1f3c29b70e536c8f5a5e812e793b33ac2eb6858b4810ed98ca2a51b9fa5eed97";
+
+// The precompile runs under the game's executable name. AMD's Windows driver keys its pipelines (its pipeline cache,
+// VK_KHR_pipeline_binary keys) by the executable's name: what "kyty_shader_precompile.exe" compiled, "Demon's
+// Souls.exe" never found, and the game compiled those pipelines again while playing (issue #28, which
+// precompile-windows.ps1 fixed for kyty_emulator.exe, but the port's own precompile did not). A hard link (a copy where
+// the drive has no hard links) in _PipelineCache\precompile-as-game, with the DLLs beside it. Not in %TEMP% (issue #47:
+// Windows Defender took it for a dropper). Made once a session (an update replaces the files the links point to).
+fs::path PrecompileExe() {
+	static const fs::path exe = [] {
+		const fs::path source = g_setup.root / L"kyty_shader_precompile.exe";
+		const fs::path dir    = g_setup.root / L"_PipelineCache" / L"precompile-as-game";
+		const fs::path target = dir / L"Demon's Souls.exe";
+		std::error_code ec;
+		fs::create_directories(dir, ec);
+		const auto link = [&](const fs::path& from, const fs::path& to) {
+			std::error_code e;
+			fs::remove(to, e);
+			if (fs::exists(to, e)) {
+				// In use (a precompile left running) or locked: kept when it is the same file.
+				return fs::file_size(to, e) == fs::file_size(from, e) && fs::last_write_time(to, e) == fs::last_write_time(from, e);
+			}
+			if (CreateHardLinkW(to.c_str(), from.c_str(), nullptr)) return true;
+			return CopyFileW(from.c_str(), to.c_str(), FALSE) != 0;
+		};
+		bool ok = link(source, target);
+		for (const auto& entry: fs::directory_iterator(g_setup.root, ec)) {
+			if (!ok) break;
+			if (!entry.is_regular_file(ec)) continue;
+			auto ext = entry.path().extension().wstring();
+			std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+			if (ext == L".dll") ok = link(entry.path(), dir / entry.path().filename());
+		}
+		// Without it, the old behavior (the precompile still runs; AMD GPUs compile again in play).
+		return ok ? target : source;
+	}();
+	return exe;
+}
+
+// The primary adapter is AMD's (DXGI: no Vulkan instance in the launcher).
+bool PrimaryGpuIsAmd() {
+	IDXGIFactory1* factory = nullptr;
+	if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) || factory == nullptr) return false;
+	bool          amd     = false;
+	IDXGIAdapter1* adapter = nullptr;
+	if (SUCCEEDED(factory->EnumAdapters1(0, &adapter)) && adapter != nullptr) {
+		DXGI_ADAPTER_DESC1 desc {};
+		if (SUCCEEDED(adapter->GetDesc1(&desc))) amd = desc.VendorId == 0x1002u;
+		adapter->Release();
+	}
+	factory->Release();
+	return amd;
+}
+
+// Once: on an AMD GPU, a driver cache an earlier port warmed as "kyty_shader_precompile.exe" holds nothing the game
+// finds (PrecompileExe). Its ".static-done" notes are dropped so every shard compiles again, now under the game's name.
+void ForgetCachesWarmedUnderAnotherName() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+	std::error_code ec;
+	const fs::path marker = g_setup.root / L"_PipelineCache" / L"precompile-as-game" / L"warmed-as-game-v1";
+	if (fs::exists(marker, ec)) return;
+	if (PrimaryGpuIsAmd()) {
+		const fs::path local = g_setup.root / L"_PipelineCache" / L"local" / kDriverCacheKey;
+		for (const auto& entry: fs::directory_iterator(local, ec)) {
+			const auto name = entry.path().filename().wstring();
+			if (name.size() > 12 && name.ends_with(L".static-done")) {
+				std::error_code e;
+				fs::remove(entry.path(), e);
+			}
+		}
+	}
+	fs::create_directories(marker.parent_path(), ec);
+	std::ofstream(marker) << "precompile runs as \"Demon's Souls.exe\"\n";
+	});
+}
+
 // A precompile process: below normal priority, the launch's CPUs, its own empty NVIDIA disk cache (precompile-windows.ps1).
 Child Launch(const std::string& name, const std::wstring& args, bool claims) {
 	Child c;
@@ -74,7 +154,7 @@ Child Launch(const std::string& name, const std::wstring& args, bool claims) {
 	// the overlay) stay out of the precompile's processes; their caches are the port's own, in _PipelineCache.
 	SetEnvironmentVariableW(L"DISABLE_VK_LAYER_VALVE_steam_fossilize_1", L"1");
 	SetEnvironmentVariableW(L"DISABLE_VK_LAYER_VALVE_steam_overlay_1", L"1");
-	std::wstring        command = Quote(g_setup.root / L"kyty_shader_precompile.exe") + L" --game \"" + Wide(g_setup.game) + L"\" " + args;
+	std::wstring        command = Quote(PrecompileExe()) + L" --game \"" + Wide(g_setup.game) + L"\" " + args;
 	SECURITY_ATTRIBUTES sa {sizeof(sa), nullptr, TRUE};
 	HANDLE              out = CreateFileW(c.log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, 0, nullptr);
 	STARTUPINFOW        si {};
@@ -141,7 +221,6 @@ int RunOne(const std::string& name, const std::wstring& args, bool claims = fals
 // loads, _PipelineCache/local/<key>/<title>.bin, with every recipe of the static inputs (_PipelineCache/static/<id>.shaders,
 // made at the splash: 78,428 pipelines for 1.07), Shards of them below: 256 processes of 3 threads, as many at once as
 // the launch's CPUs make (the NVIDIA driver compiles nearly one pipeline at a time per process).
-constexpr const wchar_t* kDriverCacheKey = L"1f3c29b70e536c8f5a5e812e793b33ac2eb6858b4810ed98ca2a51b9fa5eed97";
 constexpr int            kShards         = 256;
 
 std::wstring ShardsArg() {
@@ -203,6 +282,7 @@ void Work() {
 	g_nvidia         = fs::path(temp) / fs::u8path("kyty-precompile-" + stamp);
 	std::error_code ec;
 	fs::create_directories(g_logs, ec);
+	ForgetCachesWarmedUnderAnotherName();
 	SetEnvironmentVariableW(L"KYTY_WARM_DRIVER_CACHE_KEY", kDriverCacheKey);
 	const std::wstring base  = L"--seeds " + Quote(seeds);
 	const auto         merge = [&](const std::string& name) {
@@ -388,6 +468,7 @@ bool CacheCurrent() {
 	fs::create_directories(out.parent_path(), ec);
 	g_logs   = g_setup.root / L"logs";
 	g_nvidia = g_setup.root / L"logs" / L"status-cache";
+	ForgetCachesWarmedUnderAnotherName();
 	SetEnvironmentVariableW(L"KYTY_WARM_DRIVER_CACHE_KEY", kDriverCacheKey);
 	// (10-27c) Current: the game's driver cache holds every recipe of this GPU's static inputs (--driver-cache-status).
 	const int code = RunOne("precompile-status", L"--seeds " + Quote(g_setup.seeds) + L" --driver-cache-status" + ShardsArg());
