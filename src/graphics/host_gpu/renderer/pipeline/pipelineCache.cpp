@@ -3196,6 +3196,17 @@ void PipelineCache::WarmPipelines(uint64_t compute_video, bool background, const
 		}
 		jobs.push_back(std::move(job));
 	}
+	// (port35-1031) KYTY_WARMUP_COMPUTE_FIRST (default 1; 0: recorded order): compute pipelines first, newest first among
+	// them. The game makes a missing compute pipeline on the render thread, waiting for it (port logs 10-31: 33-6400 ms
+	// each, 88 of them in a session), while a missing graphics pipeline goes to a worker; the warmup ran 137-300 s.
+	static const bool compute_first = [] {
+		const char* value = std::getenv("KYTY_WARMUP_COMPUTE_FIRST");
+		const bool  on    = !(value != nullptr && value[0] == '0');
+		std::printf("Shader warmup: compute pipelines first %s (KYTY_WARMUP_COMPUTE_FIRST=0: off)\n", on ? "on" : "off");
+		std::fflush(stdout);
+		return on;
+	}();
+	if (compute_first) std::stable_partition(jobs.begin(), jobs.end(), [](const Job& job) { return job.compute != nullptr; });
 	if (only != nullptr) {
 		// (A later scene's: what an earlier one made, or the game, stays.)
 		Common::LockGuard lock(m_mutex);

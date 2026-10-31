@@ -1010,6 +1010,22 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 	// In no cache: NVIDIA compiles this ~100x faster, so the draw or dispatch does not stall.
 	info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 	pipeline.unoptimized = true;
+	// (port35-1031) KYTY_FAST_BUILD_CACHE (default 1; 0: as before, no cache): the unoptimized build goes into the driver
+	// cache too and is looked up there first, so a pipeline made where first needed is a cache hit in the next session
+	// even when its optimized build did not reach the cache (port logs 10-31: 64 of 72 compute pipelines of 33-1450 ms
+	// made again on the render thread in the next session). Same pipeline, same flags as before: no visual change.
+	static const bool keep = [] {
+		const char* value = std::getenv("KYTY_FAST_BUILD_CACHE");
+		const bool  on    = !(value != nullptr && value[0] == '0');
+		std::printf("Fast-build cache: %s (unoptimized first builds kept in the driver cache; KYTY_FAST_BUILD_CACHE=0: off)\n",
+		            on ? "on" : "off");
+		std::fflush(stdout);
+		return on;
+	}();
+	if (keep && driver_cache != nullptr) {
+		if (cached(driver_cache)) return vk::Result::eSuccess;
+		return create(driver_cache, info);
+	}
 	return create(nullptr, info);
 }
 
