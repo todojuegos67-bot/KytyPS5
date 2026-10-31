@@ -3733,6 +3733,7 @@ void PipelineCache::InitializeDriverCache() {
 vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& file_path, uint64_t limit,
                                                  size_t& loaded_size) {
 	const auto path         = Common::PathToString(file_path);
+	const auto load_begin   = std::chrono::steady_clock::now();
 	const bool cache_exists = Common::File::IsFileExisting(file_path);
 	if (cache_exists) {
 		PipelineCacheLog("Vulkan pipeline cache: loading {}", path);
@@ -3812,8 +3813,8 @@ vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& fi
 	}
 	loaded_size = initial_data.size();
 	if (!initial_data.empty()) {
-		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {}", initial_data.size(),
-		                 path);
+		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {} in {} ms", initial_data.size(), path,
+		                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - load_begin).count());
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}

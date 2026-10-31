@@ -849,7 +849,18 @@ int main(int argc, char* argv[]) {
 	int cpus = count_cpus(mask);
 	// (10-27b) Shaders first (the seed file, the release's hints, the prefetch inputs: splash "Preparando shaders 1/3..3/3"),
 	// then the start menu, which runs the static precompile (precompile-windows.ps1) when this GPU's cache is not current.
+	// (Start-up time by phase in the log: "[port] tiempo de arranque: ...".)
+	const auto phase_start = std::chrono::steady_clock::now();
+	auto       phase_at    = phase_start;
+	const auto phase_done  = [&](const char* what) {
+		const auto now = std::chrono::steady_clock::now();
+		std::printf("[port] tiempo de arranque: %s %.1f s (total %.1f s)\n", what,
+		            std::chrono::duration<double>(now - phase_at).count(), std::chrono::duration<double>(now - phase_start).count());
+		std::fflush(stdout);
+		phase_at = now;
+	};
 	if (IsGame(settings.game)) PrepareShaders(root, settings.game, param, mask != system_mask ? mask : 0, cpus);
+	phase_done("preparar shaders (1/3-3/3)");
 	{
 		Port::Precompile::Setup ps;
 		ps.root     = root;
@@ -863,6 +874,7 @@ int main(int argc, char* argv[]) {
 		if (!ps.id.empty() && fs::exists(ps.seeds, pe)) {
 			SplashStatus("Comprobando la cache de shaders...");
 			const bool current = Port::Precompile::CacheCurrent();
+			phase_done("comprobar la cache");
 			std::printf("[port] driver pipeline cache: %s\n", current ? "every static recipe in it" : "to be made (start-up precompile)");
 			std::fflush(stdout);
 			if (!current && start_menu) {
@@ -897,6 +909,7 @@ int main(int argc, char* argv[]) {
 				SplashProgress(-1.0f);
 				SplashHint("");
 				std::printf("[port] precompile: %s\n", Port::Precompile::State().text.c_str());
+				phase_done("precompilacion antes del juego");
 			}
 		}
 	}
