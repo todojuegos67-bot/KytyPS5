@@ -1400,27 +1400,38 @@ void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<con
 		const bool  flat = form.valid && form.buffer_words.size() == 4 * plan.buffers.size() &&
 		                  user_data[st].size() >= form.user_words && user_data[st].size() <= 64;
 		const std::array<const uint32_t*, 3> bases {user_data[st].data(), block.data(), form.constants.data()};
+		const bool memo = kyty_local_table_gather_memo.load(std::memory_order_relaxed) != 0; // (KYTY_TABLE_GATHER_MEMO)
+		uint32_t   memo_hits = 0;
 		for (size_t i = 0; i < plan.buffers.size(); ++i) {
 			auto& [words4, entry] = entries[i];
+			std::array<uint32_t, 4> fresh;
 			if (flat) {
 				for (uint32_t w = 0; w < 4; ++w) {
 					const auto operand = form.buffer_words[4 * i + w];
-					words4[w]          = bases[operand >> 14u][operand & 0x3fffu];
+					fresh[w]           = bases[operand >> 14u][operand & 0x3fffu];
 				}
 			} else {
 				for (uint32_t w = 0; w < 4; ++w) {
 					const auto& operand = plan.buffers[i][w];
-					words4[w] = operand.kind == Kind::Immediate ? operand.value
-					            : operand.kind == Kind::Slot    ? block[operand.value]
-					            : TableCodeOperand(operand)     ? TableCodeWord(operand, st == 0 ? pair.vs : pair.ps)
-					            : operand.value - program.user_data_base < user_data[st].size()
-					                ? user_data[st][operand.value - program.user_data_base]
-					                : 0;
+					fresh[w] = operand.kind == Kind::Immediate ? operand.value
+					           : operand.kind == Kind::Slot    ? block[operand.value]
+					           : TableCodeOperand(operand)     ? TableCodeWord(operand, st == 0 ? pair.vs : pair.ps)
+					           : operand.value - program.user_data_base < user_data[st].size()
+					               ? user_data[st][operand.value - program.user_data_base]
+					               : 0;
 				}
 			}
-			entry = &table.resolved[XXH3_64bits(words4.data(), sizeof(words4)) & (TableXpr::ResolvedEntries - 1)];
+			// (The same words as gathered last at this index hash to the same entry: kept, no hash; the prefetch stays, the
+			// line is what TableBlocks reads.)
+			if (memo && entry != nullptr && words4 == fresh) {
+				++memo_hits;
+			} else {
+				words4 = fresh;
+				entry  = &table.resolved[XXH3_64bits(words4.data(), sizeof(words4)) & (TableXpr::ResolvedEntries - 1)];
+			}
 			__builtin_prefetch(entry);
 		}
+		if (memo_hits != 0) LiveCounters::Add(LiveCounters::TableGatherMemoHits, memo_hits);
 	}
 	table.gathered = &pair;
 }
