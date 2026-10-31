@@ -88,6 +88,10 @@ const int    kAntiLagDlssgCount = 3;
 const Choice kRtReflLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}, {"5", "Extremo"},
                               {"6", "H\xC3\xAD" "brido"}}; // (refl-hybrid-1028) Hibrido = Alto + the hardware fill
 const int    kRtReflLevelCount = 7;
+const Choice kRtReflSharp[] = {{"0", "Normal"}, {"1", "Alta"}, {"2", "M\xC3\xA1xima"}}; // (refl-sharp-1031)
+const int    kRtReflSharpCount = 3;
+const Choice kRtReflWaves[] = {{"0", "Como ahora"}, {"1", "Suaves"}, {"2", "Espejo"}}; // (refl-sharp-1031)
+const int    kRtReflWavesCount = 3;
 const Choice kRtLightLevels[] = {{"0", "No"}, {"1", "Media"}, {"2", "Alta"}, {"3", "Ultra"}, {"4", "Extremo"}};
 const int    kRtLightLevelCount = 5;
 const Choice kRtLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}};
@@ -301,6 +305,8 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("configurado", s->configured);
 	boo("mejoras_16gb", s->ram16_boost);
 	str("reflejos_rt", s->rt_ss_refl);
+	str("nitidez_reflejos_rt", s->rt_refl_sharp);
+	str("ondas_agua_reflejos", s->rt_refl_waves);
 	str("luz_rt_pantalla", s->rt_ssgi);
 	str("sombras_rt", s->rt_shadows);
 	str("oclusion_ao", s->ao);
@@ -314,6 +320,8 @@ bool LoadSettings(const std::string& path, Settings* s) {
 		v           = n >= 0 && n <= max && !v.empty() && std::isdigit(static_cast<unsigned char>(v[0])) != 0 ? std::to_string(n) : "0";
 	};
 	clamp_level(s->rt_ss_refl, 6);
+	clamp_level(s->rt_refl_sharp, 2);
+	clamp_level(s->rt_refl_waves, 2);
 	clamp_level(s->rt_ssgi, 4);
 	clamp_level(s->rt_shadows, 3);
 	clamp_level(s->ao, 3);
@@ -463,6 +471,10 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Efectos de pantalla (sin RT por hardware; solo con DLSS, XeSS o FSR):\n"
 	  << "; Reflejos RT: 0 no, 1 bajo, 2 medio, 3 alto, 4 ultra, 5 extremo, 6 hibrido (alto + relleno por hardware; GPU con RT)\n"
 	  << "reflejos_rt=" << s.rt_ss_refl << "\n"
+	  << "; Nitidez de reflejos RT: 0 normal (de serie), 1 alta, 2 maxima (mas nitidos, cuesta mas GPU)\n"
+	  << "nitidez_reflejos_rt=" << s.rt_refl_sharp << "\n"
+	  << "; Ondas del agua en reflejos: 0 como ahora, 1 suaves, 2 espejo (solo el rayo del reflejo; el agua se ve igual)\n"
+	  << "ondas_agua_reflejos=" << s.rt_refl_waves << "\n"
 	  << "; Luz RT (luz rebotada en pantalla): 0 no, 1 media, 2 alta, 3 ultra, 4 extremo\n"
 	  << "luz_rt_pantalla=" << s.rt_ssgi << "\n"
 	  << "; Sombras RT (sombras del sol de pantalla): 0 no, 1 bajo, 2 medio, 3 alto\n"
@@ -707,8 +719,13 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			sets.emplace_back("KYTY_RT_REFLECTIONS_MIN", "0.55");
 			sets.emplace_back("KYTY_RT_REFLECTIONS_GUIDE_STRENGTH", "1.3");
 		}
+		// (refl-sharp-1031) empty (unset) at the defaults: exactly the previous behaviour
+		sets.emplace_back("KYTY_RT_REFLECTIONS_SHARP", s.rt_refl_sharp == "0" ? "" : s.rt_refl_sharp);
+		sets.emplace_back("KYTY_RT_REFLECTIONS_WATER_WAVES", s.rt_refl_waves == "0" ? "" : s.rt_refl_waves);
 	} else {
 		sets.emplace_back("KYTY_RT_REFLECTIONS", "");
+		sets.emplace_back("KYTY_RT_REFLECTIONS_SHARP", "");
+		sets.emplace_back("KYTY_RT_REFLECTIONS_WATER_WAVES", "");
 	}
 	sets.emplace_back("KYTY_DLSSG_PRESET", "C");
 	sets.emplace_back("KYTY_FG_PACING", "0");        // (10-21) the emulator's frame pacing (stuck at 20 FPS) off
@@ -1063,7 +1080,7 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.pad_map != n.pad_map || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
 	       l.safe_gpu != n.safe_gpu || l.quality != n.quality || l.texture_reduce != n.texture_reduce ||
 	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.extra != n.extra ||
-	       l.rt_ss_refl != n.rt_ss_refl || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke || l.ibl != n.ibl || l.tess != n.tess ||
+	       l.rt_ss_refl != n.rt_ss_refl || l.rt_refl_sharp != n.rt_refl_sharp || l.rt_refl_waves != n.rt_refl_waves || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke || l.ibl != n.ibl || l.tess != n.tess ||
 	       l.torch != n.torch || l.lens_flare != n.lens_flare || l.rt_hw_exp != n.rt_hw_exp || l.dlss5 != n.dlss5 ||
 	       l.dlss5_unsigned != n.dlss5_unsigned || l.dlss5_strength != n.dlss5_strength ||
 	       (l.sharpness == "auto") != (n.sharpness == "auto");

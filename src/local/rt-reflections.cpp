@@ -513,11 +513,33 @@ constexpr LevelCfg Levels[5] = {
 };
 const LevelCfg& Cfg(int level) { return Levels[std::clamp(level, 0, 4)]; }
 
+// (refl-sharp-1031) "Nitidez de reflejos RT": KYTY_RT_REFLECTIONS_SHARP 0 normal (as before, exactly), 1 alta, 2 maxima.
+// Alta: a full-resolution trace on the low / medium levels, a smaller a-trous radius, less temporal history; maxima also
+// no checkerboard (every trace pixel marches every frame), the smallest radius and the shortest history.
+int SharpLevel() {
+	static const int v = [] {
+		const char* e = std::getenv("KYTY_RT_REFLECTIONS_SHARP");
+		return e != nullptr ? std::clamp(std::atoi(e), 0, 2) : 0;
+	}();
+	return v;
+}
+// (refl-sharp-1031) "Ondas del agua en reflejos": KYTY_RT_REFLECTIONS_WATER_WAVES 0 as now, 1 soft, 2 mirror: how much of
+// the water's normal perturbation the reflection rays (and their Fresnel) keep; the water's own shading is the game's.
+int WaterWaves() {
+	static const int v = [] {
+		const char* e = std::getenv("KYTY_RT_REFLECTIONS_WATER_WAVES");
+		return e != nullptr ? std::clamp(std::atoi(e), 0, 2) : 0;
+	}();
+	return v;
+}
+bool TraceFull(int level) { return Cfg(level).full || SharpLevel() >= 1; }
+bool TraceChecker(int level) { return Cfg(level).checker && SharpLevel() < 2; }
+
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level) {
 	if (g_rt.out.image != VK_NULL_HANDLE && g_rt.render == render && g_rt.level == level) return true;
 	for (auto* img: Sized())
 		if (img != &g_rt.dummy) Retire(*img);
-	const vk::Extent2D trace = Cfg(level).full ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
+	const vk::Extent2D trace = TraceFull(level) ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
 	uint32_t levels = 1;
 	while (levels < MaxMips && ((render.width >> levels) > 0 || (render.height >> levels) > 0)) ++levels;
 	const auto f16 = vk::Format::eR16G16B16A16Sfloat;
@@ -798,7 +820,7 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	if (now - g_rt.stat_time < std::chrono::seconds(10)) return;
 	const auto&    sm     = g_rt.stat_sum;
 	const double   px     = static_cast<double>(std::max<uint64_t>(sm[0], 1));
-	const double   area   = (Cfg(level).full ? 1.0 : 0.25) * (Cfg(level).checker ? 0.5 : 1.0); // (rays per render pixel)
+	const double   area   = (TraceFull(level) ? 1.0 : 0.25) * (TraceChecker(level) ? 0.5 : 1.0); // (rays per render pixel)
 	const uint64_t copies = RtReflCopies();
 	const bool  mat    = g_rt.dec_rough >= 0 && g_rt.dec_normal >= 0;
 	const char* source = g_rt.stat_guide_frames > 0 ? (g_rt.have_water ? "the game's SSR (guide) + water" : "the game's SSR (guide)")
@@ -1400,6 +1422,16 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const float min_refl = EnvFloat("KYTY_RT_REFLECTIONS_MIN", 0.4f, 0.0f, 0.8f);
 	const float guess    = EnvFloat("KYTY_RT_REFLECTIONS_GUESS", 0.0f, 0.0f, 1.0f);
 	const auto& cfg      = Cfg(level);
+	{
+		static bool said = false;
+		if (!said && (SharpLevel() > 0 || WaterWaves() > 0)) {
+			said = true;
+			std::printf("RT reflections: sharpness %d (KYTY_RT_REFLECTIONS_SHARP: 0 normal, 1 alta, 2 maxima), water waves in the "
+			            "reflection rays %d (KYTY_RT_REFLECTIONS_WATER_WAVES: 0 as now, 1 soft, 2 mirror) (refl-sharp-1031)\n",
+			            SharpLevel(), WaterWaves());
+			std::fflush(stdout);
+		}
+	}
 	const int   iters    = cfg.iters;
 	const float cutoff   = cfg.cutoff;
 	const int   passes   = cfg.passes;
@@ -1412,7 +1444,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			            "a-trous passes, strength %g, water minimum reflectance %g, roughness: a mirror below %.2f, nothing from %.2f, G-buffer %s, "
 			            "exposure %s, camera %s, %s)\n",
 			            level, cfg.name, g_rt.trace.width, g_rt.trace.height, color.extent.width, color.extent.height,
-			            cfg.checker ? " checkerboard" : "", g_rt.hiz.levels, iters, cap_px, passes, strength, min_refl, g_rt.mat_lo, g_rt.mat_hi, have_gbuf ? "copy found (calibrating)" : "not found yet (depth normals, heuristic)",
+			            TraceChecker(level) ? " checkerboard" : "", g_rt.hiz.levels, iters, cap_px, passes, strength, min_refl, g_rt.mat_lo, g_rt.mat_hi, have_gbuf ? "copy found (calibrating)" : "not found yet (depth normals, heuristic)",
 			            inputs.exposure_buffer != nullptr ? "the game's" : "1.0", camera.prev ? "matrices" : "motion vectors only",
 			            guide_mode ? (have_guide ? "guided by the game's SSR (found)" : "guided by the game's SSR (not found yet: the material mask until it is)")
 			                       : "material mask (KYTY_RT_REFLECTIONS_GUIDE=0)");
@@ -1432,7 +1464,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.misc[1] = static_cast<int32_t>(g_rt.frame & 0x7fffffff);
 	push.misc[2] = level;
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_rt.history_valid ? 2 : 0) | (camera.prev ? 4 : 0) | (camera.up_valid ? 8 : 0) |
-	               (g_rt.row0_up ? 16 : 0) | (cfg.checker ? 32 : 0) | (have_water ? 64 : 0) |
+	               (g_rt.row0_up ? 16 : 0) | (TraceChecker(level) ? 32 : 0) | (have_water ? 64 : 0) |
 	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0) |
 	               (g_rt.stable ? 1024 : 0) | // (rtfly-1029: the firefly limit and the contribution's stabilisation)
 	               (g_rt.water_stable ? 2048 : 0) | (RtFlicker::CameraStill() ? 4096 : 0); // (water-1030)
@@ -1551,6 +1583,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		// (refl9b, yparams) the minimum reflective area's radius in render pixels (KYTY_RT_REFLECTIONS_MIN_AREA, given at a
 		// 720-line render, scaled to this one) and the large pools' boost
 		header[48] = g_rt.min_area * static_cast<float>(color.extent.height) / 720.0f, header[49] = g_rt.pool_boost;
+		header[50] = static_cast<float>(SharpLevel()), header[51] = static_cast<float>(WaterWaves()); // (refl-sharp-1031)
 		command.updateBuffer(vk::Buffer(g_rt.frame_buf), 0, HeaderBytes, header.data());
 	}
 	if (hw_on) {
@@ -1654,7 +1687,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		Set s = base;
 		s.oa = &g.rad, s.ob = &g.gb[cur], s.oc = &g.aux;
 		// (checkerboard: a thread per pair of horizontal neighbours)
-		run(0, s, cfg.checker ? vk::Extent2D {(g.trace.width + 1) / 2, g.trace.height} : g.trace);
+		run(0, s, TraceChecker(level) ? vk::Extent2D {(g.trace.width + 1) / 2, g.trace.height} : g.trace);
 		stamp(StTrace);
 	}
 	if (hw_on) {

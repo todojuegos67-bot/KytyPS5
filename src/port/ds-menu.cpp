@@ -1382,6 +1382,11 @@ void Draw(float width, float height) {
 					              kRtReflLevels, kRtReflLevelCount, s.rt_ss_refl,
 					              "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Híbrido: Alto + rayos por hardware (RT real) solo donde el rayo de pantalla no encuentra nada. Necesita GPU con RT. Beta. Apagarlo es inmediato."))
 						live_changed = true;
+					// (refl-sharp-1031)
+					ChoiceRow("Nitidez de reflejos RT", s.rt_refl_sharp != l.rt_refl_sharp, kRtReflSharp, kRtReflSharpCount, s.rt_refl_sharp,
+					          "Más nitidez en los reflejos RT (superficies y agua). Normal: como ahora. Alta: rayos a resolución completa en Bajo/Medio, menos desenfoque y menos mezcla con frames anteriores (~+0,3-0,8 ms). Máxima: además sin tablero de ajedrez, el desenfoque mínimo y el historial más corto; los espejos conservan el detalle, puede verse algo más de ruido (~+0,6-1,5 ms).");
+					ChoiceRow("Ondas del agua en reflejos", s.rt_refl_waves != l.rt_refl_waves, kRtReflWaves, kRtReflWavesCount, s.rt_refl_waves,
+					          "Cuánto mueven las ondas del agua el rayo del reflejo (el agua se ve igual). Como ahora: sin cambios. Suaves: 40 % de la ondulación, reflejos más limpios. Espejo: el agua refleja como un espejo plano. Sin coste.");
 					ChoiceRow("Luz RT", s.rt_ssgi != l.rt_ssgi, kRtLightLevels, kRtLightLevelCount, s.rt_ssgi,
 					          "Iluminación por rayos sobre la imagen (luz rebotada y sombreado de contacto). Solo funciona con DLSS, XeSS o FSR. Cuesta FPS. Experimental.");
 					if (ChoiceRow("Luz volumétrica", changed_not_live(l.godrays != s.godrays, 4), kRtLevels, kRtLevelCount, s.godrays,
@@ -2135,6 +2140,11 @@ void LauncherRayTracing(Settings& s) {
 	LRow("Reflejos RT", kRtReflLevelCount, kRtReflLevels, s.rt_ss_refl, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Híbrido: Alto + rayos por hardware (RT real) solo donde el rayo de pantalla no encuentra nada. Necesita GPU con RT. Beta.",
 	     fx, fw);
+	// (refl-sharp-1031)
+	LRow("Nitidez reflejos RT", kRtReflSharpCount, kRtReflSharp, s.rt_refl_sharp, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+	     "Más nitidez en los reflejos RT (superficies y agua). Normal: como ahora. Alta: rayos a resolución completa en Bajo/Medio, menos desenfoque y menos mezcla con frames anteriores (~+0,3-0,8 ms). Máxima: además sin tablero de ajedrez, el desenfoque mínimo y el historial más corto; los espejos conservan el detalle, puede verse algo más de ruido (~+0,6-1,5 ms).", fx, fw);
+	LRow("Ondas agua reflejos", kRtReflWavesCount, kRtReflWaves, s.rt_refl_waves, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+	     "Cuánto mueven las ondas del agua el rayo del reflejo (el agua se ve igual). Como ahora: sin cambios. Suaves: 40 % de la ondulación, reflejos más limpios. Espejo: el agua refleja como un espejo plano. Sin coste.", fx, fw);
 	LRow("Luz RT", kRtLightLevelCount, kRtLightLevels, s.rt_ssgi, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Iluminación por rayos sobre la imagen (luz rebotada y sombreado de contacto). Solo funciona con DLSS, XeSS o FSR. Cuesta FPS. Experimental.", fx, fw);
 	LRow("Luz volumétrica", kRtLevelCount, kRtLevels, s.godrays, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
