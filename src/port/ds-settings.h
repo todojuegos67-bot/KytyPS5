@@ -231,6 +231,11 @@ struct PcInfo {
 void RecommendFor(PcInfo* pc); // fills recommended / expected / unsupported from `gpu`
 // (10-24) Launcher-souls.ps1 Test-LowRam: a PC of 20 GB of RAM or less, or "Simular 16 GB RAM".
 bool LowRam(const Settings& settings, const PcInfo& pc);
+// The driver cache key (KYTY_DRIVER_CACHE_KEY) and the translation switches the game and the precompile must share.
+// "Bordes sombras" (KYTY_SHADOW_FILTER 1-3) changes the SPIR-V of the lighting shaders at translation: each level has a
+// cache of its own (level 0: the one before), so a precompile made at another level is not taken for this one's.
+std::string DriverCacheKey(const Settings& settings);
+std::string ShadowFilterLevel(const Settings& settings); // "" (0) or "1".."3"
 
 // `title_id` from sce_sys/param.json (empty: unknown, the Demon's Souls engine settings still apply: this is its port).
 LaunchPlan BuildLaunch(const Settings& settings, const std::string& title_id, const PcInfo& pc = {});

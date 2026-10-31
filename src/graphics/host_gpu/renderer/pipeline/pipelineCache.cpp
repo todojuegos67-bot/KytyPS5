@@ -3745,7 +3745,15 @@ vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& fi
 		Common::File file(file_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_driver_cache_key);
-		if (file_size > limit) {
+		// Loaded whole only with RAM to spare: the file's bytes and the driver's copy of them (NVIDIA copies a loaded
+		// cache whole) are ~2x its size at once. A 4+ GiB cache on a PC short of free RAM held the game on a black
+		// screen while Windows paged; then it is not loaded, as before the 4 GiB fix (its pipelines compile in play).
+		const uint64_t available = LocalPlatform::AvailablePhysicalMemory();
+		if (file_size > (uint64_t {1} << 30u) && available != 0 && available < file_size * 5 / 2 + (uint64_t {2} << 30u)) {
+			file.Close();
+			PipelineCacheLog("Vulkan pipeline cache: {} not loaded ({} MiB; {} MiB of RAM free, too little to load it)", path,
+			                 file_size >> 20u, available >> 20u);
+		} else if (file_size > limit) {
 			file.Close();
 			PipelineCacheLog("Vulkan pipeline cache: starting {} over ({} bytes, limit {})", path, file_size, limit);
 			std::error_code done_error;

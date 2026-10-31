@@ -545,6 +545,16 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 }
 
 
+std::string ShadowFilterLevel(const Settings& s) {
+	return s.shadow_edges == "1" || s.shadow_edges == "2" || s.shadow_edges == "3" ? s.shadow_edges : std::string();
+}
+
+std::string DriverCacheKey(const Settings& s) {
+	std::string key = "1f3c29b70e536c8f5a5e812e793b33ac2eb6858b4810ed98ca2a51b9fa5eed97";
+	if (const auto level = ShadowFilterLevel(s); !level.empty()) key.replace(key.size() - 2, 2, "f" + level);
+	return key;
+}
+
 bool LowRam(const Settings& s, const PcInfo& pc) {
 	// (10-28) "Mejoras para equipos de 16 GB de RAM" (on by default) on a PC of 20 GB or less, or simulated.
 	return s.simulate_ram16 || s.ram16_boost; // (port28) usable on any PC (off by default; Optimizar turns it on at 20 GB or less)
@@ -691,7 +701,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	}
 	// (10-26) GTAO and the screen-space RT (Luz RT, volumetric, RT reflections, RT sun, RT particles) are gone: never passed.
 	// Bordes sombras: the game's shadow maps filtered (KYTY_SHADOW_FILTER).
-	if (s.shadow_edges == "1" || s.shadow_edges == "2" || s.shadow_edges == "3") sets.emplace_back("KYTY_SHADOW_FILTER", s.shadow_edges);
+	if (const auto level = ShadowFilterLevel(s); !level.empty()) sets.emplace_back("KYTY_SHADOW_FILTER", level);
 	// (10-27b) Ray tracing (hardware), the s25 launcher: only Reflejos, Sombras sol and Luces antorcha/lamparas (No / Si);
 	// no hardware volumetric, metal or AO.
 	{
@@ -966,7 +976,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	}
 	env.Set("KYTY_TEXTURE_REDUCE", texture == "h" || texture == "1" || texture == "2" ? texture : "0"); // (an old "auto": Maximo)
 	env.Default("KYTY_UNMAP_PROTECT_SKIP", "1");
-	env.Set("KYTY_DRIVER_CACHE_KEY", "1f3c29b70e536c8f5a5e812e793b33ac2eb6858b4810ed98ca2a51b9fa5eed97");
+	env.Set("KYTY_DRIVER_CACHE_KEY", DriverCacheKey(s));
 	env.Set("KYTY_SHADER_WARMUP_ONLY", "");
 	// (10-27b) The shader warmup and prefetch run beside the game's intro and title screen: their progress line stays on
 	// screen until they finish ("Preparando shaders X/Y"; the launcher's 6 s hid it).

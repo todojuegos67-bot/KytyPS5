@@ -869,6 +869,8 @@ int main(int argc, char* argv[]) {
 		ps.seeds    = root / Wide(ps.id.empty() ? std::string("seeds.seeds") : "seeds-" + ps.id + ".seeds");
 		ps.affinity = mask != system_mask ? mask : 0;
 		ps.cpus     = cpus;
+		ps.cache_key     = Port::DriverCacheKey(settings);
+		ps.shadow_filter = Port::ShadowFilterLevel(settings);
 		Port::Precompile::Configure(ps);
 		std::error_code pe;
 		if (!ps.id.empty() && fs::exists(ps.seeds, pe)) {

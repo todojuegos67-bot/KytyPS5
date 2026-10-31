@@ -68,8 +68,11 @@ struct Child {
 
 fs::path g_logs, g_nvidia;
 
-// (Its comment: below, at kShards.)
-constexpr const wchar_t* kDriverCacheKey = L"1f3c29b70e536c8f5a5e812e793b33ac2eb6858b4810ed98ca2a51b9fa5eed97";
+// (Its comment: below, at kShards.) The game's (Setup::cache_key, DriverCacheKey: one per "Bordes sombras" level).
+std::wstring DriverKey() {
+	return g_setup.cache_key.empty() ? std::wstring(L"1f3c29b70e536c8f5a5e812e793b33ac2eb6858b4810ed98ca2a51b9fa5eed97")
+	                                 : std::wstring(g_setup.cache_key.begin(), g_setup.cache_key.end());
+}
 
 // The precompile runs under the game's executable name. AMD's Windows driver keys its pipelines (its pipeline cache,
 // VK_KHR_pipeline_binary keys) by the executable's name: what "kyty_shader_precompile.exe" compiled, "Demon's
@@ -132,7 +135,7 @@ void ForgetCachesWarmedUnderAnotherName() {
 	const fs::path marker = g_setup.root / L"_PipelineCache" / L"precompile-as-game" / L"warmed-as-game-v1";
 	if (fs::exists(marker, ec)) return;
 	if (PrimaryGpuIsAmd()) {
-		const fs::path local = g_setup.root / L"_PipelineCache" / L"local" / kDriverCacheKey;
+		const fs::path local = g_setup.root / L"_PipelineCache" / L"local" / DriverKey();
 		for (const auto& entry: fs::directory_iterator(local, ec)) {
 			const auto name = entry.path().filename().wstring();
 			if (name.size() > 12 && name.ends_with(L".static-done")) {
@@ -288,7 +291,9 @@ void Work() {
 	std::error_code ec;
 	fs::create_directories(g_logs, ec);
 	ForgetCachesWarmedUnderAnotherName();
-	SetEnvironmentVariableW(L"KYTY_WARM_DRIVER_CACHE_KEY", kDriverCacheKey);
+	SetEnvironmentVariableW(L"KYTY_WARM_DRIVER_CACHE_KEY", DriverKey().c_str());
+	// The game's translation switches: a pipeline translated otherwise is another pipeline, never found by the game.
+	SetEnvironmentVariableW(L"KYTY_SHADOW_FILTER", g_setup.shadow_filter.empty() ? nullptr : std::wstring(g_setup.shadow_filter.begin(), g_setup.shadow_filter.end()).c_str());
 	const std::wstring base  = L"--seeds " + Quote(seeds);
 	// A merge that fails is tried once more, 3 s later (a game that just closed may still hold the cache file).
 	const auto         merge = [&](const std::string& name) {
@@ -482,7 +487,9 @@ bool CacheCurrent() {
 	g_logs   = g_setup.root / L"logs";
 	g_nvidia = g_setup.root / L"logs" / L"status-cache";
 	ForgetCachesWarmedUnderAnotherName();
-	SetEnvironmentVariableW(L"KYTY_WARM_DRIVER_CACHE_KEY", kDriverCacheKey);
+	SetEnvironmentVariableW(L"KYTY_WARM_DRIVER_CACHE_KEY", DriverKey().c_str());
+	// The game's translation switches: a pipeline translated otherwise is another pipeline, never found by the game.
+	SetEnvironmentVariableW(L"KYTY_SHADOW_FILTER", g_setup.shadow_filter.empty() ? nullptr : std::wstring(g_setup.shadow_filter.begin(), g_setup.shadow_filter.end()).c_str());
 	// (10-27c) Current: the game's driver cache holds every recipe of this GPU's static inputs (--driver-cache-status).
 	const int code = RunOne("precompile-status", L"--seeds " + Quote(g_setup.seeds) + L" --driver-cache-status" + ShardsArg());
 	const std::string text = ReadAll(g_logs / L"precompile-status.out.log");

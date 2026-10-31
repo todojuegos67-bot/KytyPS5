@@ -27,6 +27,8 @@ struct Setup {
 	std::filesystem::path seeds; // seeds-<id>.seeds (made before)
 	uint64_t              affinity = 0;
 	int                   cpus     = 1;
+	std::string           cache_key;     // the game's KYTY_DRIVER_CACHE_KEY (DriverCacheKey); empty: the default one
+	std::string           shadow_filter; // the game's KYTY_SHADOW_FILTER ("" or "1".."3"): the precompile translates as it
 };
 
 void Configure(const Setup& setup);
