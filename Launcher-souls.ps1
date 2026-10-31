@@ -435,7 +435,7 @@ function Start-Game {
 	if ($shLv -gt 0) {
 		$env:KYTY_RT_SHADOWS = "$shLv"; $env:KYTY_RT_SHADOWS_STRENGTH = @('0', '0.35', '0.5', '0.7')[$shLv]
 		$sets += @('KYTY_RT_SUN=0', 'KYTY_HWRT_SHADOW=0')  # (solo el camino de pantalla: sin cascadas ni TLAS)
-	} elseif ($raysOn) {
+	} elseif ($raysOn -or (-not $pureGame -and $cmbMotes -and $cmbMotes.SelectedIndex -gt 0)) {  # (motes-1031) las particulas tambien necesitan el sol
 		$env:KYTY_RT_SHADOWS = '1'; $env:KYTY_RT_SHADOWS_STRENGTH = '0'
 		# (vol25) KYTY_RT_SUN=0: la sombra RT de pantalla a fuerza 0 da el sol a la volumetrica en cada frame (sin niebla que salta).
 		$sets += 'KYTY_RT_SUN=0'
