@@ -1436,17 +1436,10 @@ void Draw(float width, float height) {
 					}
 					CheckRow("HDR", true, s.hdr, "HDR10: activa antes \"Usar HDR\" en la configuracion de pantalla de Windows");
 					CheckRow("VSync", true, s.vsync, "VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando");
-					CheckRow("G-Sync", true, s.gsync, "G-Sync / FreeSync: el emulador no ata su reloj a los Hz del monitor");
 					if (ChoiceRow("Metricas", false, kMetrics, kMetricsCount, s.metrics, "Panel dentro del juego (F8 lo cambia en vivo): FPS, el modo de frame generation, latencia y el detalle. Ya no abre una ventana aparte.")) live_changed = true;
 					static const Choice aspects[] = {{"16:9", "Monitor 16:9"}, {"21:9", "Monitor 21:9"}, {"32:9", "Monitor 32:9"}};
 					ChoiceRow("Monitor", true, aspects, 3, s.aspect, "Monitores panoramicos (ultrawide): el juego se dibuja a 21:9 o 32:9 en vez de estirarse. Funciona con DLSS, XeSS y FSR. Los videos y algunos menus se ven estirados.");
 					CheckRow("Mantener 16:9 (bandas negras)", true, s.aspect_fit);
-					static const Choice caps[] = {{"0", "Auto (bajo el refresco)"}, {"60", "60"}, {"90", "90"}, {"120", "120"}, {"144", "144"}, {"165", "165"}, {"224", "224"}};
-					std::string cap = s.fps_cap > 0 ? std::to_string(static_cast<int>(s.fps_cap)) : "0";
-					if (ChoiceRow("Tope de FPS (G-Sync, sin FG)", false, caps, 7, cap, "En vivo con G-Sync sin frame generation")) {
-						s.fps_cap    = static_cast<float>(std::atof(cap.c_str()));
-						live_changed = true;
-					}
 					{
 						std::vector<Choice> langs;
 						for (int i = 0; i < I18n::kMenuLanguageCount; i++) langs.push_back({I18n::kMenuLanguages[i], I18n::kMenuLanguageNames[i]});
@@ -1492,13 +1485,11 @@ void Draw(float width, float height) {
 					}
 					// (10-28) Mejoras para equipos de 16 GB de RAM: the launcher's 16 GB profile, on PCs of 20 GB or less.
 					const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
-					ImGui::BeginDisabled(!small);
-					CheckRow("Mejoras para equipos de 16 GB de RAM", s.ram16_boost != g_rt.launched.ram16_boost, s.ram16_boost,
-					         "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria). Solo en PCs de 20 GB de RAM o menos. No cambia los gráficos.");
-					ImGui::EndDisabled();
+					if (small) // (port28) hidden on PCs with more RAM
+						CheckRow("Mejoras para equipos de 16 GB de RAM", s.ram16_boost != g_rt.launched.ram16_boost, s.ram16_boost,
+						         "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria). Solo en PCs de 20 GB de RAM o menos. No cambia los gráficos.");
 					s.profile16 = LowRam(s, g_rt.pc);
-					if (!small) ImGui::TextColored(kDim, "RAM %d GB: no hacen falta (solo en PCs de 20 GB o menos).", g_rt.pc.ram_gb);
-					else if (s.ram16_boost) ImGui::TextColored(kGold, "RAM %s: mejoras activadas. Cierra los navegadores mientras juegas.", s.simulate_ram16 ? "16 GB (simulado)" : (std::to_string(g_rt.pc.ram_gb) + " GB").c_str());
+					if (s.ram16_boost) ImGui::TextColored(kGold, "RAM %s: mejoras activadas. Cierra los navegadores mientras juegas.", s.simulate_ram16 ? "16 GB (simulado)" : (std::to_string(g_rt.pc.ram_gb) + " GB").c_str());
 					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para gráficas que se cuelgan o dan pantallazo azul: más estable, ~37% menos FPS.");
 					CheckRow("Usar todos los CCD (Ryzen de dos CCD)", true, s.all_ccds, "Ryzen de dos CCD: No = el juego en el CCD con más caché L3 (más rápido); Sí = todos los núcleos.");
 					{
@@ -2221,7 +2212,6 @@ void LauncherDisplay(Settings& s) {
 		const float y = RowY();
 		LCheck(y, "HDR", s.hdr, "HDR10: activa antes \"Usar HDR\" en la configuracion de pantalla de Windows", 12);
 		LCheck(y, "VSync", s.vsync, "VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando", 92);
-		LCheck(y, "G-Sync", s.gsync, "G-Sync / FreeSync: el emulador no ata su reloj a los Hz del monitor", 184);
 		static const Choice aspects[] = {{"16:9", "Monitor 16:9"}, {"21:9", "Monitor 21:9"}, {"32:9", "Monitor 32:9"}};
 		int current = 0;
 		for (int i = 0; i < 3; i++)
@@ -2268,7 +2258,7 @@ void LauncherConfigurator(Settings& s) {
 void LauncherPerformance(Settings& s) {
 	BoxBegin("Rendimiento / PC");
 	const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
-	{
+	if (small) { // (port28) only on PCs of 20 GB of RAM or less: hidden on the others
 		const float y = RowY();
 		ImGui::BeginDisabled(!small);
 		LCheck(y, "Mejoras para equipos de 16 GB de RAM", s.ram16_boost,
@@ -2503,11 +2493,6 @@ void LauncherAjustes(Settings& s) {
 			s.language          = std::atoi(lang.c_str());
 			s.game_language_set = true;
 		}
-	}
-	{
-		static const Choice caps[] = {{"0", "Auto (bajo el refresco)"}, {"60", "60"}, {"90", "90"}, {"120", "120"}, {"144", "144"}, {"165", "165"}, {"224", "224"}};
-		std::string cap = s.fps_cap > 0 ? std::to_string(static_cast<int>(s.fps_cap)) : "0";
-		if (LChoice("Tope de FPS", caps, 7, cap, "Tope de FPS con G-Sync sin frame generation.", 150, 256)) s.fps_cap = static_cast<float>(std::atof(cap.c_str()));
 	}
 	LCheckRow("Copia de las partidas al arrancar", s.backup_saves, "Copia _SaveData en _SaveData-copias cada vez que pulsas JUGAR.");
 	LCheckRow("Continuar donde lo dejé (F1)", s.continue_f1,
