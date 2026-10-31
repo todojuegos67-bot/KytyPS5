@@ -64,6 +64,8 @@ bool FlushProcessWriteBuffers();
 // The calling thread kept off the CPUs of a list (KYTY_RENDER_CPUS; null or empty: any CPU); with
 // below-normal priority too: background work that must not hold up the game's threads.
 void AvoidCpuList(const char* avoid_cpus);
+// (ds-perf-1031) KYTY_RENDER_CPUS set to the larger L3's CPUs on a dual-CCD X3D (KYTY_VCACHE_PIN=0: off). Start-up.
+void AutoVcacheRenderCpus();
 void MakeBackgroundThread(const char* avoid_cpus);
 // The calling thread above the normal priority of the game's threads (Windows: THREAD_PRIORITY_HIGHEST; Linux:
 // unchanged): the render thread, which every frame waits for, is not time-sliced against them on its CPUs.

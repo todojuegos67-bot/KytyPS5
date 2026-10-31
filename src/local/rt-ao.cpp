@@ -33,6 +33,7 @@
 // floor 0.3, radius 0.7 / 0.9 / 1.1 m).
 // Every 10 s one "RTAO:" line: GPU ms, mean AO, the share of pixels darkened, the frame light, the normal convention.
 // The flicker self-check (KYTY_RT_FLICKER) probes it as "ambient occlusion" (frame-gen.cpp).
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/rt-ao.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -249,7 +250,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_ao.layout;
-	const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_ao.pipeline);
+	const auto created = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_ao.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_ao.pipeline = nullptr;
@@ -346,7 +347,7 @@ bool EnsureHwPipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_ao.hw_layout;
-	const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_ao.hw_pipeline);
+	const auto created = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_ao.hw_pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_ao.hw_pipeline = nullptr;

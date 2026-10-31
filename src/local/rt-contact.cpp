@@ -19,6 +19,7 @@
 // half-angle, deg, 1.5), _FADE (fade start, 25 m; out at 1.6x), _KNEE (contrast taken as texture, 0.15), _AMBIENT (local
 // light share knee, 0.03), _GUARD (1 s mean screen darkening above it: off 5 s, 0.2).
 // Every 10 s: "HWRTCONTACT: stats" (darkened pixels, mean darkening, blended-away pixels, ray hit rates, GPU ms).
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/rt-contact.h"
 #include "local/env-level.h"
 
@@ -233,7 +234,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_ct.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_ct.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_ct.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_ct.pipeline = nullptr;

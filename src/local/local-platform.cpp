@@ -166,6 +166,52 @@ uint32_t ThreadId() {
 	return static_cast<uint32_t>(GetCurrentThreadId());
 }
 
+
+// (ds-perf-1031) KYTY_VCACHE_PIN (default 1 in the experimental build; 0: off): on a CPU whose L3 caches differ in
+// size (Ryzen X3D with two CCDs: 96 MiB vs 32 MiB), KYTY_RENDER_CPUS set, when unset, to the larger cache's CPUs
+// without CPU 0's core: the memory-latency-bound render thread there, the background compile/prefetch threads
+// (which keep off KYTY_RENDER_CPUS) on the other CCD. Nothing on a CPU with one L3 size.
+void AutoVcacheRenderCpus() {
+	const char* pin = std::getenv("KYTY_VCACHE_PIN");
+	if (pin != nullptr && pin[0] == '0') { std::printf("VCache pin: off (KYTY_VCACHE_PIN=0)\n"); return; }
+	if (const char* cpus = std::getenv("KYTY_RENDER_CPUS"); cpus != nullptr && *cpus != '\0') {
+		std::printf("VCache pin: KYTY_RENDER_CPUS=%s given: kept\n", cpus);
+		return;
+	}
+	DWORD size = 0;
+	(void)GetLogicalProcessorInformationEx(RelationCache, nullptr, &size);
+	if (size == 0) return;
+	std::vector<uint8_t> buffer(size);
+	auto* first = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
+	if (!GetLogicalProcessorInformationEx(RelationCache, first, &size)) return;
+	uint64_t best_mask = 0, best_size = 0, min_size = ~uint64_t(0);
+	int      l3s = 0;
+	for (DWORD offset = 0; offset < size;) {
+		const auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+		if (info->Size == 0) break;
+		if (info->Relationship == RelationCache && info->Cache.Level == 3 && info->Cache.GroupMask.Group == 0) {
+			++l3s;
+			const uint64_t bytes = info->Cache.CacheSize;
+			min_size = std::min(min_size, bytes);
+			if (bytes > best_size) best_size = bytes, best_mask = static_cast<uint64_t>(info->Cache.GroupMask.Mask);
+		}
+		offset += info->Size;
+	}
+	if (l3s < 2 || best_size == min_size || best_mask == 0) {
+		std::printf("VCache pin: not used (%d L3 caches of one size)\n", l3s);
+		return;
+	}
+	if (best_mask & 1u) best_mask &= ~uint64_t(3); // (CPU 0's core: most interrupts land there)
+	std::string list;
+	for (int cpu = 0; cpu < 64; ++cpu)
+		if ((best_mask >> cpu) & 1u) list += (list.empty() ? "" : ",") + std::to_string(cpu);
+	if (list.empty()) return;
+	(void)_putenv_s("KYTY_RENDER_CPUS", list.c_str());
+	std::printf("VCache pin: render thread on the %llu MiB L3 CPUs %s (other L3: %llu MiB; KYTY_VCACHE_PIN=0: off)\n",
+	            static_cast<unsigned long long>(best_size >> 20), list.c_str(), static_cast<unsigned long long>(min_size >> 20));
+	std::fflush(stdout);
+}
+
 void PinThreadToCpuList(const char* list) {
 	if (const auto mask = CpuListMask(list); mask != 0) (void)SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(mask));
 }
@@ -2131,6 +2177,8 @@ static bool MaskToSet(uint64_t mask, cpu_set_t* set) {
 		if ((mask >> cpu) & 1u) CPU_SET(cpu, set);
 	return mask != 0;
 }
+
+void AutoVcacheRenderCpus() {}
 
 void PinThreadToCpuList(const char* list) {
 	cpu_set_t set;

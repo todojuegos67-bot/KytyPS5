@@ -16,6 +16,7 @@
 //   4.5 m local radius), in-scattering integrated along the view ray to the surface (8 fixed steps, no noise), soft-capped;
 //   never on fire pixels. KYTY_SMOKE_GLOW (1.0, 0..3).
 // KYTY_SMOKE_VIEW=1: the correction only (x4). Every 10 s "SMOKE: stats" (what is active, resolution, %, GPU ms).
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/smoke.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -203,7 +204,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_sm.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_sm.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_sm.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_sm.pipeline = nullptr;

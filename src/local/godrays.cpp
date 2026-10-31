@@ -21,6 +21,7 @@
 // gr4: every stage sanitized (NaN / Inf -> 0, a bad depth -> far), the history restarted on a gap or never-written
 // texels, invalid motion vectors rejected, the sky's history short, our light never blackens a pixel; boosts lowered.
 // Every 10 s: "GODRAYS: stats" with the GPU ms, the sun on / off screen and the lights used.
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/godrays.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -225,7 +226,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_gr.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_gr.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_gr.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_gr.pipeline = nullptr;

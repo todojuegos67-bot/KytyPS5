@@ -5,6 +5,7 @@
 
 #include "frame-gen.h"
 #include "local-platform.h"
+#include "local-pass-cache.h" // (ds-perf-1031)
 #include "gpu_tiler_shaders/fsr4_prep_spv.h"
 
 #include <nlohmann/json.hpp>
@@ -405,7 +406,7 @@ bool BuildPipe(vk::Device device, Pipe& p) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = p.module.entry.c_str();
 	pipeline_info.layout       = p.layout;
-	const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &p.pipeline);
+	const auto created = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &p.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		p.pipeline = nullptr;

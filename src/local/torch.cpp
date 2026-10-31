@@ -22,6 +22,7 @@
 // Without the G-buffer copy (it comes with KYTY_RT_REFLECTIONS / Reflejos RT) the depth's normals and the colour's chroma
 // stand in. Every 10 s: "TORCH: stats" (blobs a frame, lights, lit-pixel %, flares, GPU ms); the RTFLICKER line has
 // "torch light" and "lens flare".
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/torch.h"
 #include "local/smoke.h"
 
@@ -255,7 +256,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_tc.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_tc.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_tc.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_tc.pipeline = nullptr;
@@ -377,7 +378,7 @@ bool EnsureHwPipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_tc.hw_layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_tc.hw_pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_tc.hw_pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_tc.hw_pipeline = nullptr;

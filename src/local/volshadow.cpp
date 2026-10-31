@@ -14,6 +14,7 @@
 // view-projection (the TLAS's world), logged once with the RTSHADOW one to compare. Every 10 s: "VOLSHADOW: stats" with
 // rays, occluded share, the TLAS alignment probe and the GPU ms.
 // Options: KYTY_HWRT_VOLSHADOW_LEN (sun ray length, 300 m).
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/volshadow.h"
 #include "local/env-level.h"
 
@@ -210,7 +211,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_vs.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_vs.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_vs.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_vs.pipeline = nullptr;

@@ -15,6 +15,7 @@
 // default 2:0:8), KYTY_SHINE_GLOSS (same syntax, default none; e.g. 1:16:8g), KYTY_SHINE_FLIPY (1: row 0 = NDC y +1, default).
 // KYTY_SHINE_METAL (a metal field, same syntax; default none: the dark-albedo heuristic), KYTY_SHINE_LIGHTS=0 (sun only).
 // Every 10 s: "SHINE: stats" with the share of pixels highlighted / sharpened, the mean lights found and the GPU ms.
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/shine.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -228,7 +229,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_sh.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_sh.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_sh.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_sh.pipeline = nullptr;

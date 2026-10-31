@@ -14,6 +14,7 @@
 // pixels within this of the camera, 60 m), _FLIPY (1: row 0 = NDC y +1, default), _GUARD (a 1 s window whose mean
 // darkening over the screen exceeds it turns the pass off for 5 s, logged; 0.25).
 // Every 10 s: "HWRTLIGHTS: stats" with lights used, darkened pixels, their mean darkening and the GPU ms.
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/hw-lights.h"
 #include "local/env-level.h"
 
@@ -335,7 +336,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g_hl.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_hl.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_hl.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g_hl.pipeline = nullptr;

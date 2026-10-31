@@ -1,6 +1,7 @@
 #include "kbm-warp.h"
 
 #include "frame-gen.h"
+#include "local-pass-cache.h" // (ds-perf-1031)
 #include "gpu_tiler_shaders/kbm_warp_spv.h"
 
 #include <algorithm>
@@ -139,7 +140,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g.pipeline = nullptr;

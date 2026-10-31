@@ -16,6 +16,7 @@
 //   and the edge density is solved so the grid ends exactly at the screen edge (the plateau is texel-exact both ways).
 // Credit and licences: LICENSES/FoveatedDLSS5-RenoDX-MIT.txt. No NVIDIA file is shipped: nvngx_dlssnr.dll is the
 // user's (NVIDIA driver / app packages carry it); without it this does nothing and says so once.
+#include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/dlss-nr.h"
 
 #include "graphics/presentation/videoOut.h"
@@ -714,7 +715,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
 	pipeline_info.layout       = g.layout;
-	const auto created         = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g.pipeline);
+	const auto created         = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g.pipeline);
 	device.destroyShaderModule(module, nullptr);
 	if (created != vk::Result::eSuccess) {
 		g.pipeline = nullptr;
