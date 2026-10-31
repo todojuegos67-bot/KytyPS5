@@ -2528,8 +2528,7 @@ void LauncherAjustes(Settings& s) {
 		}
 	}
 	LCheckRow("Copia de las partidas al arrancar", s.backup_saves, "Copia _SaveData en _SaveData-copias cada vez que pulsas JUGAR.");
-	LCheckRow("Continuar donde lo dejé (F1)", s.continue_f1,
-	          "En el juego, F1 (o R3 + OPTIONS) guarda y cierra. Con esto marcado, JUGAR pasa solo la pantalla de título y carga la partida en el sitio donde pulsaste F1.");
+	// (ds-pc-port37) "Continuar donde lo dejé (F1)" removed (the owner asked).
 	{
 		const float y = RowY();
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(2)});
@@ -2808,7 +2807,7 @@ void DrawLauncher(float width, float height) {
 
 	// ---- The bottom of the column: the shaders' state, where JUGAR continues, JUGAR, Opciones and Salir. ----
 	const auto        pv   = Precompile::State();
-	const std::string when = s.continue_f1 ? Resume::Summary(g_rt.exe_path.parent_path()) : std::string();
+	const std::string when; // (ds-pc-port37: no "continue where F1 left")
 	// (ds-pc-port11) The shaders' panel: its text in big light letters wrapped inside the column (an animated hourglass
 	// beside it while they precompile), then the progress bar with the percent and the parts, then Detener; all measured
 	// first so that nothing overlaps JUGAR below.

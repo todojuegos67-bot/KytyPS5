@@ -1028,7 +1028,7 @@ int main(int argc, char* argv[]) {
 	Port::Runtime runtime = make_runtime(plan);
 	Port::InstallMenu(runtime);
 	// (ds-pc-port8) After F1 (save and quit): the title passed by itself and the character back where F1 left.
-	Port::Resume::Prepare(root, param.title_id, settings.continue_f1);
+	Port::Resume::Prepare(root, param.title_id, false); // (ds-pc-port37) "continue where F1 left" removed
 	std::atexit(RestartIfAsked);
 	std::at_quick_exit(RestartIfAsked);
 
