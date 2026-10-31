@@ -225,65 +225,72 @@ int RunOne(const std::string& name, const std::wstring& args, bool claims = fals
 	return Finish(c);
 }
 
-// (10-27c) The game's driver cache key (ds-settings.cpp KYTY_DRIVER_CACHE_KEY): the precompile warms the cache the game
-// loads, _PipelineCache/local/<key>/<title>.bin, with every recipe of the static inputs (_PipelineCache/static/<id>.shaders,
-// made at the splash: 78,428 pipelines for 1.07), Shards of them below: 256 processes of 3 threads, as many at once as
-// the launch's CPUs make (the NVIDIA driver compiles nearly one pipeline at a time per process).
-constexpr int            kShards         = 256;
-
-std::wstring ShardsArg() {
-	return L" --shard 0/" + std::to_wstring(kShards);
-}
-
-// The shards the driver cache holds already (--driver-cache-status), or all of them.
-std::vector<bool> ShardsDone(const fs::path& log, bool* all) {
-	std::vector<bool> done(kShards, false);
-	const std::string text = ReadAll(log);
-	*all                   = text.find("driver cache warm") != std::string::npos;
-	if (*all) return std::vector<bool>(kShards, true);
-	const auto at = text.find("driver cache shards done:");
-	if (at != std::string::npos) {
-		const auto end = text.find('\n', at);
-		std::string list = text.substr(at + 25, end == std::string::npos ? std::string::npos : end - at - 25);
-		size_t      pos  = 0;
-		while (pos < list.size()) {
-			while (pos < list.size() && list[pos] == ' ') pos++;
-			size_t next = pos;
-			while (next < list.size() && list[next] >= '0' && list[next] <= '9') next++;
-			if (next == pos) break;
-			const int i = std::stoi(list.substr(pos, next - pos));
-			if (i >= 0 && i < kShards) done[i] = true;
-			pos = next;
-		}
+// The old (10-27c) way's driver cache, warmed with every static recipe: one multi-GB file the game loaded whole at every
+// start, saved whole during play. Gone once the static store is current (the launcher's way below holds those pipelines).
+void RemoveOldWarmedCache() {
+	std::error_code ec;
+	const fs::path local = g_setup.root / L"_PipelineCache" / L"local" / DriverKey();
+	bool           warmed = false;
+	for (const auto& entry: fs::directory_iterator(local, ec))
+		if (entry.path().filename().wstring().ends_with(L".static-done")) warmed = true;
+	if (!warmed) return;
+	uint64_t freed = 0;
+	for (const auto& entry: fs::directory_iterator(local, ec)) {
+		const auto name = entry.path().filename().wstring();
+		// (<title>.bin, its .static-done note, shard files; the table cache and played binaries are the game's own: kept.)
+		if (name.find(L".table.") != std::wstring::npos || name.find(L".played.") != std::wstring::npos) continue;
+		std::error_code e;
+		const auto size = entry.is_regular_file(e) ? entry.file_size(e) : 0;
+		if (fs::remove(entry.path(), e)) freed += size;
 	}
-	return done;
+	std::printf("[port] precompile: the old warmed driver cache removed (%llu MiB): the static store holds its pipelines\n",
+	            static_cast<unsigned long long>(freed >> 20u));
+	std::fflush(stdout);
 }
 
+// The pipelines a seed file's dry run planned as its own (precompile-windows.ps1 Get-PlannedPipelines), 0 without one.
+long long PlannedPipelines(const fs::path& log) {
+	const std::string text = ReadAll(log);
+	const auto        at   = text.rfind("of them this seed file's");
+	if (at == std::string::npos) return 0;
+	const auto open = text.rfind('(', at);
+	if (open == std::string::npos) return 0;
+	std::smatch m;
+	const std::string part = text.substr(open, at - open + 32);
+	if (std::regex_search(part, m, std::regex(R"(\((\d+) pipelines, (\d+) of them)"))) return std::stoll(m[2].str());
+	return 0;
+}
+
+// (ds-pc-port37) The emulator launcher's precompile (precompile-windows.ps1), the same steps: the static pipeline store
+// (_PipelineCache/static/<title>_<version>.binaries or .blobs) the game reads one pipeline at a time as it needs it. The
+// 10-27c way (every recipe warmed into one driver cache of several GB, loaded whole at each start and saved whole during
+// play) is gone: the game started slowly, stalled while it was saved, and lost it all past 4 GiB.
+//   1. recorded play: the release's hints, this PC's warmup recordings -> --make-hints, --apply-hints -> hinted seeds
+//   2. --merge (what an interrupted run finished)
+//   3. the plan: recorded first, then the seeds (--covered-by the recorded ones)
+//   4. shards of ~100 planned pipelines: the recorded tier, --merge --keep-shards ("listo para jugar"), the seeds' tier
+//   5. --merge --stamp --prune
 void Work() {
 	const fs::path& root  = g_setup.root;
 	const fs::path& seeds = g_setup.seeds;
-	// (10-27c) Bounded: a 32-thread PC ran 11 processes of 3 threads at once and rebooted (RAM, video memory or the
-	// driver). Now at most 4 processes of 2 threads (one per 8 CPUs), a new one only with 8 GB of RAM and of commit
-	// left, and one starting at a time (each creates its Vulkan device and translates its shaders first).
-	// (ds-pc-port13) All the CPU threads, on request: processes of 4 threads (one scales to ~4) up to every logical CPU
-	// (a 9950X3D: 8 x 4 = 32), still one starting at a time and each only with the free memory below.
+	const std::string& id = g_setup.id;
 	const bool all_cpu    = g_all_threads;
 	const int  logical    = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
-	const int threads     = 2; // (port25) the driver's compile scales by processes, not threads: more of them, 2 threads each
-	int       jobs        = all_cpu ? std::max(1, logical / 2) : std::clamp(g_setup.cpus / 8, 1, 4);
-	std::printf("[port] precompile: %s, %d processes of %d threads at most\n", all_cpu ? "all CPU threads" : "relaxed", jobs, threads);
+	const int  threads    = 3; // (precompile-windows.ps1 -Threads)
+	const int  cpus       = all_cpu ? logical : std::max(1, g_setup.cpus);
+	// All of them (the launcher's: one process per 3 CPUs); relaxed: half of that.
+	int jobs = std::max(1, (cpus + threads - 1) / threads);
+	if (!all_cpu) jobs = std::max(1, jobs / 2);
+	std::printf("[port] precompile (as the launcher's): %s, %d processes of %d threads\n", all_cpu ? "all CPU threads" : "relaxed", jobs, threads);
 	std::fflush(stdout);
-	const auto memory_ok  = [] {
+	const auto memory_ok = [] {
 		MEMORYSTATUSEX m {};
 		m.dwLength = sizeof(m);
 		if (!GlobalMemoryStatusEx(&m)) return true;
-		constexpr DWORDLONG Need = DWORDLONG {8} << 30u;
+		constexpr DWORDLONG Need = DWORDLONG {3} << 30u;
 		return m.ullAvailPhys >= Need && m.ullAvailPageFile >= Need;
 	};
-	auto      last_start = std::chrono::steady_clock::now() - std::chrono::seconds(60);
-	const auto begin     = std::chrono::steady_clock::now();
-	int        done_here = 0;
-	wchar_t   temp[MAX_PATH + 1] = {};
+	wchar_t temp[MAX_PATH + 1] = {};
 	GetTempPathW(MAX_PATH, temp);
 	const auto stamp = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
 	g_logs           = root / L"logs" / fs::u8path(stamp + "-precompile");
@@ -291,51 +298,98 @@ void Work() {
 	std::error_code ec;
 	fs::create_directories(g_logs, ec);
 	ForgetCachesWarmedUnderAnotherName();
-	SetEnvironmentVariableW(L"KYTY_WARM_DRIVER_CACHE_KEY", DriverKey().c_str());
+	SetEnvironmentVariableW(L"KYTY_WARM_DRIVER_CACHE_KEY", nullptr);
 	// The game's translation switches: a pipeline translated otherwise is another pipeline, never found by the game.
 	SetEnvironmentVariableW(L"KYTY_SHADOW_FILTER", g_setup.shadow_filter.empty() ? nullptr : std::wstring(g_setup.shadow_filter.begin(), g_setup.shadow_filter.end()).c_str());
-	const std::wstring base  = L"--seeds " + Quote(seeds);
-	// A merge that fails is tried once more, 3 s later (a game that just closed may still hold the cache file).
-	const auto         merge = [&](const std::string& name) {
-		if (RunOne(name, base + L" --merge-driver-cache" + ShardsArg(), false, false) == 0) return true;
-		Sleep(3000);
-		return RunOne(name + "-retry", base + L" --merge-driver-cache" + ShardsArg(), false, false) == 0;
-	};
 	const auto fail = [&](const std::string& what) {
 		std::scoped_lock lock(g_mutex);
 		g_view.failed  = !g_stop;
 		g_view.running = false;
 		g_view.text    = g_stop ? "Preparacion de shaders detenida: lo hecho se guarda y sigue la proxima vez." : what;
 	};
+	const auto run = [&](const std::string& name, const std::wstring& args, bool stoppable = true) {
+		return RunOne(name, args, false, stoppable) == 0;
+	};
 
-	// What an interrupted run finished (its shard files), then what is left.
+	// 1. Recorded play (precompile-windows.ps1: the release's hints and this PC's warmup recordings, together).
+	SetText("Preparando shaders: partidas grabadas...");
+	fs::path recorded;
+	{
+		std::vector<fs::path> sources;
+		const fs::path released = root / Wide("released-" + id + ".seeds"); // (made at the splash, ds-main PrepareShaders)
+		if (fs::exists(released, ec)) sources.push_back(released);
+		for (const auto& dir: fs::directory_iterator(root / L"_PipelineCache" / L"warmup-v2", ec)) {
+			const fs::path f = dir.path() / Wide(id + ".shaders");
+			if (fs::exists(f, ec)) sources.push_back(f);
+		}
+		const fs::path manual = root / Wide("recorded-" + id + ".seeds");
+		if (fs::exists(manual, ec)) sources.push_back(manual);
+		if (sources.size() == 1 && sources[0] == released) {
+			recorded = released;
+		} else if (!sources.empty()) {
+			const fs::path together = root / Wide("recorded-play-" + id + ".hints");
+			const fs::path hinted   = root / Wide("hinted-" + id + ".seeds");
+			std::wstring   args     = L"--seeds " + Quote(seeds) + L" --make-hints " + Quote(together);
+			for (const auto& f: sources) args += L" --recorded " + Quote(f);
+			if (run("make-hints", args) &&
+			    run("apply-hints", L"--seeds " + Quote(seeds) + L" --apply-hints " + Quote(together) + L" --out " + Quote(hinted)))
+				recorded = hinted;
+			else if (fs::exists(released, ec))
+				recorded = released;
+		}
+		if (g_stop) return fail("");
+	}
+	const bool has_recorded = !recorded.empty() && fs::exists(recorded, ec);
+
+	// 2. What an interrupted run finished.
 	SetText("Preparando shaders: lo que ya estaba hecho...");
-	// (Not fatal: the shard files it could not take stay on disk, the shards the cache notes as done are skipped, and the
-	// merges below and at the end take the rest. Before, this failure stopped the precompile at every start.)
-	if (!merge("merge-before")) {
-		std::printf("[port] precompile: merge-before failed; going on (logs\\*-precompile\\merge-before*.out.log)\n");
+	if (!run("merge-before", L"--merge", false)) {
+		std::printf("[port] precompile: merge-before failed; going on\n");
 		std::fflush(stdout);
 	}
-	if (RunOne("status-before", base + L" --driver-cache-status" + ShardsArg()) != 0) return fail("");
-	bool              all  = false;
-	std::vector<bool> done_shards = ShardsDone(g_logs / L"status-before.out.log", &all);
-	std::deque<int>   pending;
-	for (int i = 0; i < kShards; i++)
-		if (!done_shards[i]) pending.push_back(i);
-	int done = kShards - static_cast<int>(pending.size()), merged_at = done;
-	const int resumed_pct = done * 100 / kShards;
+
+	// 3. The plan (every pipeline once, with the work item that makes it first).
+	SetText("Preparando shaders: planificando (un minuto o dos)...");
+	const fs::path plan = g_logs / L"plan.bin";
+	if (has_recorded &&
+	    !run("plan-recorded", L"--seeds " + Quote(recorded) + L" --dry-run --plan " + Quote(plan) + L" --threads " + std::to_wstring(cpus)))
+		return fail(g_stop ? "" : "No se pudo planificar la preparacion de shaders. Mira logs\\*-precompile.");
+	{
+		std::wstring args = L"--seeds " + Quote(seeds) + L" --dry-run --plan " + Quote(plan) + L" --threads " + std::to_wstring(cpus) +
+		                    L" --static-inputs";
+		if (has_recorded) args += L" --covered-by " + Quote(recorded);
+		if (!run("plan-seeds", args)) return fail(g_stop ? "" : "No se pudo planificar la preparacion de shaders. Mira logs\\*-precompile.");
+	}
+
+	// 4. The shards: ~100 planned pipelines each, the recorded tier first.
+	struct Item {
+		fs::path    file;
+		int         i = 0, n = 1;
+		bool        first = false;
+	};
+	std::deque<Item> first, second;
+	if (has_recorded) {
+		const long long planned = PlannedPipelines(g_logs / L"plan-recorded.out.log");
+		const int       count   = static_cast<int>(std::max<long long>(1, (std::max<long long>(planned, 100) + 99) / 100));
+		for (int i = 0; i < count; i++) first.push_back({recorded, i, count, true});
+	}
+	{
+		const long long planned = PlannedPipelines(g_logs / L"plan-seeds.out.log");
+		const int       count   = static_cast<int>(std::max<long long>(512, (planned + 99) / 100));
+		for (int i = 0; i < count; i++) second.push_back({seeds, i, count, false});
+	}
+	int total = static_cast<int>(first.size() + second.size()), done = 0;
 	{
 		std::scoped_lock lock(g_mutex);
-		g_view.total = kShards;
-		g_view.done  = done;
+		g_view.total = total;
+		g_view.done  = 0;
 	}
 	struct Running {
-		int         shard;
+		Item        item;
 		Child       c;
 		std::string name;
 	};
 	std::vector<Running> running;
-	std::map<int, int>   retries;
 	const auto kill_all = [&] {
 		for (auto& r: running) {
 			TerminateProcess(r.c.process, 1);
@@ -344,57 +398,46 @@ void Work() {
 		}
 		running.clear();
 	};
-	while (!pending.empty() || !running.empty()) {
+	const auto begin      = std::chrono::steady_clock::now();
+	auto       last_start = begin - std::chrono::seconds(60);
+	bool       tier_merged = first.empty();
+	while (!first.empty() || !second.empty() || !running.empty()) {
 		if (g_stop) {
 			kill_all();
-			// What finished goes into the cache now: the game starts with it.
 			if (g_save_on_stop) {
 				SetText("Preparando shaders: guardando lo hecho...");
-				(void)merge("merge-stopped");
+				(void)run("merge-stopped", L"--merge", false);
 			}
 			return fail("");
 		}
+		// The recorded tier done: merged (shards kept for the final merge) so the game can use it now.
+		if (!tier_merged && first.empty() && running.empty()) {
+			tier_merged = true;
+			SetText("Preparando shaders: guardando lo de las partidas grabadas...");
+			(void)RunOne("merge-recorded", L"--merge --keep-shards", false, false);
+			std::scoped_lock lock(g_mutex);
+			g_view.playable = true;
+		}
+		std::deque<Item>* pending = !first.empty() ? &first : tier_merged ? &second : nullptr;
 		bool waiting_memory = false;
-		while (!pending.empty() && static_cast<int>(running.size()) < jobs) {
+		while (pending != nullptr && !pending->empty() && static_cast<int>(running.size()) < jobs) {
 			if (!memory_ok()) {
 				waiting_memory = true;
 				break;
 			}
-			// (One starting at a time: 4 s apart.)
-			if (!running.empty() && std::chrono::steady_clock::now() - last_start < std::chrono::milliseconds(all_cpu ? 500 : 4000)) break;
+			if (!running.empty() && std::chrono::steady_clock::now() - last_start < std::chrono::milliseconds(300)) break;
 			last_start = std::chrono::steady_clock::now();
-			const int i = pending.front();
-			pending.pop_front();
-			const std::string name = "warm" + std::to_string(i) + "of" + std::to_string(kShards);
-			Child c = Launch(name, base + L" --warm-driver-cache --shard " + std::to_wstring(i) + L"/" + std::to_wstring(kShards) +
-			                           L" --threads " + std::to_wstring(threads),
-			                 false);
+			const Item item = pending->front();
+			pending->pop_front();
+			const std::string name = "shard" + std::to_string(item.i) + "of" + std::to_string(item.n) + (item.first ? "-recorded" : "-seeds");
+			Child c = Launch(name, L"--seeds " + Quote(item.file) + L" --shard " + std::to_wstring(item.i) + L"/" + std::to_wstring(item.n) +
+			                           L" --threads " + std::to_wstring(threads) + L" --plan " + Quote(plan),
+			                 true);
 			if (c.process == nullptr) {
 				kill_all();
 				return fail("No se pudo arrancar kyty_shader_precompile.exe.");
 			}
-			running.push_back({i, c, name});
-		}
-		{
-			std::scoped_lock lock(g_mutex);
-			g_view.done = done;
-			const int pct = done * 100 / kShards;
-			std::string eta = "calculando el tiempo restante";
-			g_view.eta_s       = -1;
-			g_view.resumed_pct = resumed_pct;
-			g_view.waiting_mem = waiting_memory;
-			if (done_here > 0) {
-				const auto spent = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - begin).count();
-				const long long left = spent * (kShards - done) / done_here;
-				g_view.eta_s         = left;
-				eta = "quedan unos " + (left >= 3600 ? std::to_string(left / 3600) + " h " + std::to_string(left % 3600 / 60) + " min"
-				                                      : std::to_string(std::max<long long>(1, left / 60)) + " min");
-			}
-			g_view.text = "Ten paciencia: se están precompilando los shaders del juego (solo la primera vez).\n" + std::to_string(pct) +
-			              " %  (" + std::to_string(done) + " / " + std::to_string(kShards) + " partes, " + eta + ")" +
-			              (resumed_pct > 0 ? "  (retomada desde el " + std::to_string(resumed_pct) + " %)"
-			                   : std::string()) +
-			              (waiting_memory ? "  [esperando memoria libre]" : "");
+			running.push_back({item, c, name});
 		}
 		Sleep(250);
 		for (size_t k = 0; k < running.size();) {
@@ -405,35 +448,47 @@ void Work() {
 			Running r = running[k];
 			running.erase(running.begin() + static_cast<std::ptrdiff_t>(k));
 			const int code = Finish(r.c);
-			if (code != 0) {
-				// (port15) A shard that dies (the driver under many compiling processes at once) is retried, with one
-				// process fewer each time, instead of failing the whole run; only 4 failures of the same shard stop it.
-				const int tries = ++retries[r.shard];
-				std::printf("[port] precompile: %s failed (exit %d, try %d); retrying with %d processes\n", r.name.c_str(), code, tries,
-				            std::max(1, jobs - 1));
-				std::fflush(stdout);
-				if (tries >= 4) {
-					kill_all();
-					(void)merge("merge-failed");
-					return fail("Fallo un trozo de la preparacion de shaders (" + r.name + "). Mira logs\\*-precompile.");
-				}
-				jobs = std::max(1, jobs - 1);
-				pending.push_front(r.shard);
+			if (code == 3 && r.item.n < 65536) {
+				// (Too many pipelines for one shard, NVIDIA's dictionary: split in two, as the launcher's.)
+				auto& q = r.item.first ? first : second;
+				q.push_back({r.item.file, r.item.i, 2 * r.item.n, r.item.first});
+				q.push_back({r.item.file, r.item.i + r.item.n, 2 * r.item.n, r.item.first});
+				total++;
 				continue;
 			}
+			if (code != 0) {
+				kill_all();
+				(void)run("merge-failed", L"--merge", false);
+				return fail("Fallo un trozo de la preparacion de shaders (" + r.name + "). Lo hecho se guarda. Mira logs\\*-precompile.");
+			}
 			done++;
-			done_here++;
 		}
-		// Merged as it goes (every 16 shards): a crash or a closed window keeps what was made.
-		if (done - merged_at >= 16) {
-			// (Not fatal either: the shard files stay and the next merge takes them.)
-			if (!merge("merge-" + std::to_string(done))) std::printf("[port] precompile: merge at %d failed; going on\n", done);
-			merged_at = done;
+		{
+			std::scoped_lock lock(g_mutex);
+			g_view.total       = total;
+			g_view.done        = done;
+			g_view.waiting_mem = waiting_memory;
+			const int pct      = total > 0 ? done * 100 / total : 0;
+			std::string eta    = "calculando el tiempo restante";
+			g_view.eta_s       = -1;
+			if (done > 0) {
+				const auto      spent = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - begin).count();
+				const long long left  = spent * (total - done) / done;
+				g_view.eta_s          = left;
+				eta = "quedan unos " + (left >= 3600 ? std::to_string(left / 3600) + " h " + std::to_string(left % 3600 / 60) + " min"
+				                                     : std::to_string(std::max<long long>(1, left / 60)) + " min");
+			}
+			g_view.text = "Ten paciencia: se estan precompilando los shaders del juego (solo la primera vez).\n" + std::to_string(pct) +
+			              " %  (" + std::to_string(done) + " / " + std::to_string(total) + " partes, " + eta + ")" +
+			              (waiting_memory ? "  [esperando memoria libre]" : "");
 		}
 	}
+
+	// 5. The final merge: the store of this run's pipelines, stamped.
 	SetText("Preparando shaders: guardando la cache...");
-	if (!merge("merge")) return fail("No se pudo guardar la cache de shaders (merge). Mira logs\\*-precompile.");
+	if (!run("merge", L"--merge --stamp --prune", false)) return fail("No se pudo guardar la cache de shaders (merge). Mira logs\\*-precompile.");
 	fs::remove_all(g_nvidia, ec);
+	RemoveOldWarmedCache();
 	std::scoped_lock lock(g_mutex);
 	g_view.running  = false;
 	g_view.finished = true;
@@ -487,13 +542,14 @@ bool CacheCurrent() {
 	g_logs   = g_setup.root / L"logs";
 	g_nvidia = g_setup.root / L"logs" / L"status-cache";
 	ForgetCachesWarmedUnderAnotherName();
-	SetEnvironmentVariableW(L"KYTY_WARM_DRIVER_CACHE_KEY", DriverKey().c_str());
-	// The game's translation switches: a pipeline translated otherwise is another pipeline, never found by the game.
+	SetEnvironmentVariableW(L"KYTY_WARM_DRIVER_CACHE_KEY", nullptr);
 	SetEnvironmentVariableW(L"KYTY_SHADOW_FILTER", g_setup.shadow_filter.empty() ? nullptr : std::wstring(g_setup.shadow_filter.begin(), g_setup.shadow_filter.end()).c_str());
-	// (10-27c) Current: the game's driver cache holds every recipe of this GPU's static inputs (--driver-cache-status).
-	const int code = RunOne("precompile-status", L"--seeds " + Quote(g_setup.seeds) + L" --driver-cache-status" + ShardsArg());
+	// (ds-pc-port37) Current as the launcher's: the static store is this GPU's and driver's and not older than the seeds.
+	const int code = RunOne("precompile-status", L"--seeds " + Quote(g_setup.seeds) + L" --status");
 	const std::string text = ReadAll(g_logs / L"precompile-status.out.log");
-	return code == 0 && text.find("driver cache warm") != std::string::npos;
+	const bool current = code == 0 && text.find("static cache current") != std::string::npos;
+	if (current) RemoveOldWarmedCache();
+	return current;
 #else
 	return true;
 #endif
