@@ -81,26 +81,48 @@ struct ImageUse {
 	bool                          found_buffer_modified = false; // (Image::IsBufferModified when the segment found it)
 };
 
-// The 64 KiB granules ranges were added over, hashed into 4096 bits (a range over 64 granules or more: all): one look
-// before a range set's search, for reads mostly of memory nothing pending writes.
+// The 64 KiB granules ranges were added over, hashed into 4096 bits, and up to BigRanges ranges over 64 granules or
+// more as they are (more: all): one look before a range set's search, for reads mostly of memory nothing pending
+// writes. (With every range of 4 MiB or more taken as all, 88% of a speculation thread's ~125K reads a frame went on to
+// four range set searches: about a quarter of its translation, 10-31.)
 struct GranuleFilter {
+	static constexpr size_t  BigRanges = 8;
 	std::array<uint64_t, 64> bits {};
 	bool                     all = false;
+	uint32_t                 big_count = 0;
+	std::array<std::pair<uint64_t, uint64_t>, BigRanges> big {}; // [begin, end)
 	[[nodiscard]] static uint32_t Bit(uint64_t granule) noexcept {
 		return static_cast<uint32_t>((granule * 0x9E3779B97F4A7C15ull) >> 52u);
+	}
+	void AddBig(uint64_t begin, uint64_t end) noexcept {
+		// (KYTY_SPECULATE_BIG_FILTER, live speculate_big_filter: 0 takes any as all, as before.)
+		static auto& kept = LiveSwitch::Find("speculate_big_filter", 1);
+		if (kept.load(std::memory_order_relaxed) == 0) {
+			all = true;
+			return;
+		}
+		for (uint32_t i = 0; i < big_count; ++i)
+			if (big[i].first <= end && begin <= big[i].second) { // (overlapping or touching: one range)
+				big[i] = {std::min(big[i].first, begin), std::max(big[i].second, end)};
+				return;
+			}
+		if (big_count == BigRanges) {
+			all = true;
+			return;
+		}
+		big[big_count++] = {begin, end};
 	}
 	void Add(uint64_t address, uint64_t size) noexcept {
 		if (size == 0) return;
 		const auto first = address >> 16u, last = (address + size - 1) >> 16u;
-		if (last - first >= 64) {
-			all = true;
-			return;
-		}
+		if (last - first >= 64) return AddBig(address, address + size);
 		for (auto granule = first; granule <= last; ++granule) bits[Bit(granule) >> 6u] |= uint64_t {1} << (Bit(granule) & 63u);
 	}
 	[[nodiscard]] bool MayHold(uint64_t address, uint64_t size) const noexcept {
 		if (all) return true;
 		if (size == 0) return false;
+		for (uint32_t i = 0; i < big_count; ++i)
+			if (big[i].first < address + size && address < big[i].second) return true;
 		const auto first = address >> 16u, last = (address + size - 1) >> 16u;
 		if (last - first >= 64) return true;
 		for (auto granule = first; granule <= last; ++granule)
@@ -110,10 +132,12 @@ struct GranuleFilter {
 	void Merge(const GranuleFilter& other) noexcept {
 		all = all || other.all;
 		for (size_t i = 0; i < bits.size(); ++i) bits[i] |= other.bits[i];
+		for (uint32_t i = 0; i < other.big_count && !all; ++i) AddBig(other.big[i].first, other.big[i].second);
 	}
 	void Clear() noexcept {
 		bits.fill(0);
-		all = false;
+		all       = false;
+		big_count = 0;
 	}
 };
 
