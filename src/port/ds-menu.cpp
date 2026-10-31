@@ -45,6 +45,7 @@
 #include <set>
 #include <mutex>
 #include <string>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -708,10 +709,13 @@ void InstallWork() {
 	else res = Update::RunElevated(g_rt.exe_path, {L"--update-helper", root.wstring(), zip.wstring(), std::filesystem::u8path(r.tag).wstring(), g_rt.game_rel.wstring()});
 	std::error_code ec;
 	std::filesystem::remove(zip, ec);
-	if (res.ok)
+	// Restarted by itself (before, a line asked to close and open it again: missed, the update looked like it did nothing).
+	if (res.ok) {
 		SetUpd(UpdateUi::Done, "Actualizacion completada a la version " + r.tag +
-		                           ". Cierra el juego y vuelve a abrirlo para usar la nueva version. Tus shaders compilados y partidas guardadas se mantienen.");
-	else SetUpd(UpdateUi::Failed, res.error);
+		                           ". Reiniciando con la nueva version... Tus shaders compilados y partidas guardadas se mantienen.");
+		std::this_thread::sleep_for(std::chrono::seconds(3));
+		RequestRestart();
+	} else SetUpd(UpdateUi::Failed, res.error);
 #endif
 }
 
@@ -734,8 +738,11 @@ void RestoreWork() {
 		res = Update::RunElevated(g_rt.exe_path, {L"--restore-helper", root.wstring(), std::filesystem::u8path(b.name).wstring(),
 		                                          std::filesystem::u8path(Update::CurrentVersion()).wstring(), g_rt.game_rel.wstring()});
 	}
-	if (res.ok) SetUpd(UpdateUi::Done, "Restaurada la version " + b.version + ". Cierra el juego y vuelve a abrirlo.");
-	else SetUpd(UpdateUi::Failed, res.error);
+	if (res.ok) {
+		SetUpd(UpdateUi::Done, "Restaurada la version " + b.version + ". Reiniciando...");
+		std::this_thread::sleep_for(std::chrono::seconds(3));
+		RequestRestart();
+	} else SetUpd(UpdateUi::Failed, res.error);
 #endif
 }
 

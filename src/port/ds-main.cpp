@@ -909,7 +909,12 @@ int main(int argc, char* argv[]) {
 		menu_rt.pick_folder           = [] { return PickFolder(); };
 		const bool play = Port::RunStartMenu(menu_rt, &settings);
 		Port::Precompile::Stop(/*save=*/play); // (closing: out at once, the shards merged at the next start)
-		if (!play || !IsGame(settings.game)) return 0;
+		if (!play || !IsGame(settings.game)) {
+			// (An update or a "Reiniciar ahora" from the launcher: it closed asking for a restart.)
+			if (single != nullptr) ReleaseMutex(single);
+			RestartIfAsked();
+			return 0;
+		}
 		settings.configured = true; // (10-28b) the Configurador is the launcher's Sistema tab
 		Port::SaveSettings(ini, settings);
 		// (ds-pc-port29) DLSS frame generation (Streamline's sl.interposer, the nvapi redirect, Reflex) must be the first
