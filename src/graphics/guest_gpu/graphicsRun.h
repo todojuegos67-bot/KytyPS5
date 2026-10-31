@@ -127,6 +127,11 @@ private:
 	// KYTY_SPECULATE (speculation.h): made at the first graphics command buffer it translates.
 	std::unique_ptr<Speculation>                                     m_speculation;
 	std::atomic<Speculation*>                                        m_ahead {nullptr}; // KYTY_SPECULATE=4's
+	// KYTY_SPECULATE_ASYNC=<queue id> (mode 4): that async compute queue's command buffers speculated too, by
+	// KYTY_SPECULATE_ASYNC_THREADS threads of their own (the culling chain's, 3.7 ms a frame on the GPU thread, 10-31).
+	std::unique_ptr<Speculation>                                     m_speculation_async;
+	std::atomic<Speculation*>                                        m_ahead_async {nullptr};
+	uint32_t                                                         m_async_queue = 0; // (0: none)
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
 	uint64_t        m_submit_id = 0;

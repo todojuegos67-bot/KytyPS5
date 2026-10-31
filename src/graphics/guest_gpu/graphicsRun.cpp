@@ -1022,6 +1022,13 @@ void GuestGpu::Enqueue(Submission submission) {
 		             : submission.type == SubmissionType::Graphics && submission.constant_commands.empty()
 		                 ? Speculation::Job::Kind::Graphics
 		                 : Speculation::Job::Kind::Other});
+	// (KYTY_SPECULATE_ASYNC: that queue's command buffers, passed and translated as the graphics queue's are.)
+	if (auto* ahead = m_ahead_async.load(std::memory_order_acquire);
+	    ahead != nullptr && submission.queue_id == m_async_queue && submission.queue_id != 0)
+		ahead->Push({submission.serial, submission.commands, submission.reset_processor,
+		             submission.type == SubmissionType::Compute && submission.constant_commands.empty()
+		                 ? Speculation::Job::Kind::Graphics
+		                 : Speculation::Job::Kind::Other});
 	LiveTrace::Event(LiveTrace::Submit, submission.queue_id | static_cast<uint32_t>(submission.type) << 8u,
 	                 submission.commands.size());
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -1095,6 +1102,17 @@ void GuestGpu::ThreadRun(void* data) {
 	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
 		gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer);
 		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
+		if (const char* async = std::getenv("KYTY_SPECULATE_ASYNC"); async != nullptr && std::atoi(async) > 0 &&
+		                                                              static_cast<uint32_t>(std::atoi(async)) < QueueCount) {
+			const auto  queue   = static_cast<uint32_t>(std::atoi(async));
+			const char* threads = std::getenv("KYTY_SPECULATE_ASYNC_THREADS");
+			const auto  base    = std::min<uint32_t>(kyty_local_speculate_threads.load(std::memory_order_relaxed), 8u);
+			gpu->m_speculation_async = std::make_unique<Speculation>(
+			    gpu->m_renderer, static_cast<int>(ComputeQueueBase + queue - 1), base,
+			    threads != nullptr && std::atoi(threads) > 0 ? static_cast<uint32_t>(std::atoi(threads)) : 4u);
+			gpu->m_async_queue = queue;
+			gpu->m_ahead_async.store(gpu->m_speculation_async.get(), std::memory_order_release);
+		}
 	}
 	LiveControl::Start();
 	XprCapture::Initialize();
@@ -1273,12 +1291,16 @@ bool GuestGpu::Process(Submission& submission) {
 	if (speculate && !m_speculation) m_speculation = std::make_unique<Speculation>(m_renderer);
 	// (What the translation does a speculation not committed yet must see.)
 	struct EffectsScope {
-		explicit EffectsScope(Speculation* speculation) {
-			Spec::t_effects = speculation != nullptr ? &speculation->Log() : nullptr;
+		EffectsScope(Speculation* speculation, Speculation* async) {
+			Spec::t_effects       = speculation != nullptr ? &speculation->Log() : nullptr;
+			Spec::t_effects_async = async != nullptr ? &async->Log() : nullptr;
 		}
-		~EffectsScope() { Spec::t_effects = nullptr; }
+		~EffectsScope() {
+			Spec::t_effects       = nullptr;
+			Spec::t_effects_async = nullptr;
+		}
 		KYTY_CLASS_NO_COPY(EffectsScope);
-	} effects_scope {m_speculation.get()};
+	} effects_scope {m_speculation.get(), m_speculation_async.get()};
 
 	cp.BufferInit();
 	bool complete = true;
@@ -1426,6 +1448,55 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		}
 		case SubmissionType::Compute: {
+			// KYTY_SPECULATE_ASYNC: that async queue's command buffers chunk by chunk, as the graphics queue's (above).
+			if (m_speculation_async && submission.queue_id == m_async_queue && submission.constant_commands.empty()) {
+				auto&                   speculation = *m_speculation_async;
+				bool                    progressed  = false;
+				const Speculation::Job  job {submission.serial, submission.commands};
+				struct QueueTime {
+					Speculation& speculation;
+					uint64_t     start = Speculation::NowNs();
+					~QueueTime() { speculation.NoteQueueTime(Speculation::NowNs() - start); }
+				} queue_time {speculation};
+				for (;;) {
+					if (!submission.spec_normal) {
+						const auto outcome = speculation.Blocked(submission.serial)
+						                         ? speculation.Resume(cp, submission.command_execution)
+						                         : speculation.CommitReady(cp, job, submission.spec_chunk,
+						                                                   submission.command_execution, submission.spec_end);
+						progressed |= outcome != Speculation::Outcome::None;
+						if (outcome == Speculation::Outcome::Blocked) break;
+						if (outcome == Speculation::Outcome::Whole) {
+							submission.command_complete = true;
+							break;
+						}
+						if (outcome == Speculation::Outcome::Chunk) {
+							++submission.spec_chunk;
+							continue;
+						}
+						submission.spec_normal = true;
+					}
+					cp.SetStopAt(submission.spec_end ? &*submission.spec_end : nullptr);
+					const auto processed = cp.Process(submission.command_execution, submission.commands);
+					cp.SetStopAt(nullptr);
+					progressed |= submission.command_execution.MadeProgress();
+					if (cp.TakeStopReached()) {
+						submission.spec_normal = false;
+						submission.spec_end.reset();
+						++submission.spec_chunk;
+						continue;
+					}
+					submission.command_complete = processed == Pm4ProcessResult::Complete;
+					break;
+				}
+				complete = submission.command_complete;
+				if (complete) m_renderer.GetGpuResources().EndSubmission();
+				if (progressed || speculation.Blocked(submission.serial)) {
+					if (complete) cp.BufferFlushDeferrable();
+					else cp.BufferFlush();
+				}
+				break;
+			}
 			const auto      num_dw = static_cast<uint32_t>(submission.commands.size());
 			const auto*     buffer = submission.commands.data();
 			static uint32_t compute_batch_log_count = 0;
@@ -1463,6 +1534,9 @@ bool GuestGpu::Process(Submission& submission) {
 	// (KYTY_SPECULATE=4: the state after the graphics queue's submission, for a chain that could not follow it.)
 	if (complete && submission.queue_id == 0 && m_ahead.load(std::memory_order_relaxed) != nullptr)
 		m_speculation->Done(submission.serial, cp);
+	if (complete && submission.queue_id == m_async_queue && submission.queue_id != 0 &&
+	    m_ahead_async.load(std::memory_order_relaxed) != nullptr)
+		m_speculation_async->Done(submission.serial, cp);
 
 	return complete;
 }

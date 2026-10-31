@@ -75,9 +75,9 @@ static const char* WroteWhatItRead(const Spec::EffectsLog::Entry* entry) {
 	return names[entry->kind == Spec::EffectsLog::Kind::GpuWrite ? 0 : 1][static_cast<size_t>(entry->source)];
 }
 
-Speculation::Translator::Translator(RenderContext& renderer, uint32_t number)
+Speculation::Translator::Translator(RenderContext& renderer, uint32_t number, int interrupt_id)
     : index(number), draw(std::make_unique<RenderExecutor>(renderer)), compute(std::make_unique<RenderExecutor>(renderer)),
-      executors {draw.get(), compute.get()}, cp(std::make_unique<CommandProcessor>(renderer, 0)),
+      executors {draw.get(), compute.get()}, cp(std::make_unique<CommandProcessor>(renderer, interrupt_id)),
       table_upload(std::make_unique<StreamBuffer>(renderer.GetGraphics(), renderer.GetCommandScheduler(), MemoryUsage::Upload,
                                                   uint64_t {64} << 20u,
                                                   AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress)),
@@ -87,15 +87,17 @@ Speculation::Translator::Translator(RenderContext& renderer, uint32_t number)
 	compute->ReadCatalogOf(renderer.DefaultComputeRenderExecutor(), 1 + number);
 }
 
-Speculation::Speculation(RenderContext& renderer)
-    : m_renderer(renderer), m_chain(std::make_unique<CommandProcessor>(renderer, 0)),
-      m_state(std::make_unique<CommandProcessor>(renderer, 0)) {
+Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t base, uint32_t threads)
+    : m_renderer(renderer), m_chain(std::make_unique<CommandProcessor>(renderer, interrupt_id)),
+      m_state(std::make_unique<CommandProcessor>(renderer, interrupt_id)), m_interrupt_id(interrupt_id) {
 	m_state->SetStateOnly(true);
-	const auto threads = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4
-	                         ? std::clamp<uint32_t>(kyty_local_speculate_threads.load(std::memory_order_relaxed), 1u,
-	                                                static_cast<uint32_t>(Spec::MaxPacketSlots))
-	                         : 1u;
-	for (uint32_t i = 0; i < threads; ++i) m_translators.push_back(std::make_unique<Translator>(renderer, i));
+	if (threads == 0)
+		threads = kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4
+		              ? kyty_local_speculate_threads.load(std::memory_order_relaxed)
+		              : 1u;
+	// (Packet slots and executor roles: Spec::MaxPacketSlots, RenderExecutor::Roles less the GPU thread's.)
+	threads = std::clamp<uint32_t>(threads, 1u, static_cast<uint32_t>(Spec::MaxPacketSlots) - std::min<uint32_t>(base, Spec::MaxPacketSlots - 1));
+	for (uint32_t i = 0; i < threads; ++i) m_translators.push_back(std::make_unique<Translator>(renderer, base + i, interrupt_id));
 }
 
 Speculation::~Speculation() {
@@ -154,7 +156,7 @@ void Speculation::Done(uint64_t serial, const CommandProcessor& cp) {
 		m_jobs.pop_front();
 	}
 	m_done_serial = serial;
-	if (!m_done_state) m_done_state = std::make_unique<CommandProcessor>(m_renderer, 0);
+	if (!m_done_state) m_done_state = std::make_unique<CommandProcessor>(m_renderer, m_interrupt_id);
 	m_done_state->CopyStateFrom(cp, false);
 	m_ahead_wake.notify_all();
 }
@@ -179,7 +181,7 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 	for (;;) {
 		// A chunk from here: where it starts, and its record, which reads through the one before while that is not done.
 		Chunk chunk;
-		chunk.start = std::make_unique<CommandProcessor>(m_renderer, 0);
+		chunk.start = std::make_unique<CommandProcessor>(m_renderer, m_interrupt_id);
 		chunk.start->CopyStateFrom(*m_state, false);
 		chunk.at = execution;
 		{
@@ -534,8 +536,8 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 		result              = std::make_unique<Result>();
 		result->owner       = &translator;
 		result->recorder    = scheduler.CreateRecorder();
-		result->start_state = std::make_unique<CommandProcessor>(m_renderer, 0);
-		result->end_state   = std::make_unique<CommandProcessor>(m_renderer, 0);
+		result->start_state = std::make_unique<CommandProcessor>(m_renderer, m_interrupt_id);
+		result->end_state   = std::make_unique<CommandProcessor>(m_renderer, m_interrupt_id);
 	}
 	auto& r = *result;
 	// (A speculation's thread records and ends its buffers; the GPU thread's go through its recording stream.)
@@ -586,6 +588,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	processor.SetStopAt(stop != nullptr ? &stop_at : nullptr);
 	// (What it translates is not done: nothing it does is an effect.)
 	auto* const effects = std::exchange(Spec::t_effects, nullptr);
+	auto* const effects_async = std::exchange(Spec::t_effects_async, nullptr);
 	RenderContext::SetThreadExecutors(&translator.executors);
 	{
 	Spec::t_state = &r.state;
@@ -621,7 +624,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 				break;
 			}
 			// A hole: the segment ends before it, the next begins after it, from the processor state there.
-			if (r.hole_states.size() == r.holes.size()) r.hole_states.push_back(std::make_unique<CommandProcessor>(m_renderer, 0));
+			if (r.hole_states.size() == r.holes.size()) r.hole_states.push_back(std::make_unique<CommandProcessor>(m_renderer, m_interrupt_id));
 			r.hole_states[r.holes.size()]->CopyStateFrom(processor, false);
 			auto& hole  = r.holes.emplace_back();
 			hole.packet = packet;
@@ -653,6 +656,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	}
 	if (GuestGpu::IsGpuThread()) RenderContext::SetThreadExecutors(nullptr);
 	Spec::t_effects = effects;
+	Spec::t_effects_async = effects_async;
 	DrawStateObserver::Invalidate();
 	r.end_ns     = NowNs();
 	r.progressed = !r.holes.empty() || spec.MadeProgress();

@@ -424,7 +424,7 @@ public:
 		m_role    = role;
 		owner.m_catalog_readers.fetch_add(1, std::memory_order_relaxed);
 	}
-	static constexpr uint32_t Roles = 9;
+	static constexpr uint32_t Roles = 13; // (the GPU thread, Spec::MaxPacketSlots speculation threads)
 
 private:
 	// Table draws (src/local/table-xpr.inc).

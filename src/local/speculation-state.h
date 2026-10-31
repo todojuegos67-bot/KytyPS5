@@ -719,7 +719,7 @@ inline thread_local EffectsLog* t_effects = nullptr;
 // t_packet_slot), 0 between translations. A buffer or image the thread that commits releases (unregistered: no later
 // lookup finds it) is destroyed after the packets it may have been looked up in: PacketNow when it is released,
 // WaitPacketPassed before it is destroyed.
-inline constexpr size_t                                MaxPacketSlots = 8;
+inline constexpr size_t                                MaxPacketSlots = 12; // (8 graphics queue threads, 4 async)
 inline std::array<std::atomic<uint64_t>, MaxPacketSlots> g_packet {};
 inline thread_local size_t                             t_packet_slot = 0;
 inline thread_local uint64_t                           t_packets     = 0;
@@ -741,15 +741,27 @@ using PacketMarks = std::array<uint64_t, MaxPacketSlots>;
 	return true;
 }
 
+// (KYTY_SPECULATE_ASYNC: the async queue's speculation logs them too.)
+inline thread_local EffectsLog* t_effects_async = nullptr;
+// (KYTY_SPECULATE unset: no effects log on any thread, and the hot callers (ObtainBuffer's writes, the host writes)
+// read a plain global instead of two thread-locals.)
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
 inline void NoteGpuWrite(uint64_t address, uint64_t size) {
-	if (t_effects != nullptr && size != 0) t_effects->Add(EffectsLog::Kind::GpuWrite, address, size);
+	if (size == 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0) return;
+	if (t_effects != nullptr) t_effects->Add(EffectsLog::Kind::GpuWrite, address, size);
+	if (t_effects_async != nullptr) t_effects_async->Add(EffectsLog::Kind::GpuWrite, address, size);
 }
 inline void NoteHostWrite(uint64_t address, uint64_t size) {
-	if (t_effects != nullptr && size != 0) t_effects->Add(EffectsLog::Kind::HostWrite, address, size);
+	if (size == 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0) return;
+	if (t_effects != nullptr) t_effects->Add(EffectsLog::Kind::HostWrite, address, size);
+	if (t_effects_async != nullptr) t_effects_async->Add(EffectsLog::Kind::HostWrite, address, size);
 }
 inline void NoteRetiredSet(uint64_t set) {
 	if (!On()) return;
 	if (t_effects != nullptr) t_effects->Add(EffectsLog::Kind::RetiredSet, set, 0);
+	if (t_effects_async != nullptr) t_effects_async->Add(EffectsLog::Kind::RetiredSet, set, 0);
 }
 
 } // namespace Libs::Graphics::Spec

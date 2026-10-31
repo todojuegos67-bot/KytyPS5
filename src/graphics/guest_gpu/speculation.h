@@ -45,7 +45,9 @@ class StreamBuffer;
 // (RenderExecutor::ReadCatalogOf); its holes and the rest of the command buffer are translated by those.
 class Speculation {
 public:
-	explicit Speculation(RenderContext& renderer);
+	// `interrupt_id`: the queue's processor's (0: the graphics queue; an async compute queue's: KYTY_SPECULATE_ASYNC);
+	// `base`: the first speculation thread's packet slot and executor role less one (after another speculation's).
+	explicit Speculation(RenderContext& renderer, int interrupt_id = 0, uint32_t base = 0, uint32_t threads = 0);
 	~Speculation();
 	KYTY_CLASS_NO_COPY(Speculation);
 
@@ -150,7 +152,7 @@ private:
 	// 3), the serial it translates, its latest result (the commits unlink it), when the translation going on began
 	// (m_clock; 0: none: it walks no speculation before it).
 	struct Translator {
-		explicit Translator(RenderContext& renderer, uint32_t number);
+		explicit Translator(RenderContext& renderer, uint32_t number, int interrupt_id);
 		uint32_t                                   index = 0;
 		std::unique_ptr<RenderExecutor>            draw, compute;
 		RenderContext::Executors                   executors;
@@ -240,6 +242,7 @@ private:
 	std::atomic<uint64_t>                    m_pending {CommandScheduler::PendingTick}; // the latest pending tick
 	// What the normal translation did, and what of it was logged since the result being committed began.
 	Spec::EffectsLog                     m_log;
+	int                                  m_interrupt_id = 0; // its queue's processor's
 	Spec::Effects                        m_effects;
 	// Outcomes since the last report: command buffers committed whole, partly, not at all; segments and holes
 	// committed; why packets became holes, why speculations or commits stopped.
