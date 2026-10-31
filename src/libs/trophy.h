@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_LIBS_TROPHY_H_
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,6 +28,7 @@ struct Toast {
 	std::string           label;      // "Trofeo obtenido", in the game's language
 	std::string           grade_text; // "Bronce" ...
 	std::string           name;
+	std::string           detail; // (10-28) the description, in the game's language
 	int                   icon_w = 0, icon_h = 0;
 	std::vector<uint32_t> icon; // RGBA8 (IM_COL32 order), icon_w * icon_h; empty: none
 };
@@ -37,7 +39,28 @@ bool Unlock(int trophy_id, int* platinum_id);
 bool IsUnlocked(int trophy_id);
 bool GetInfo(int trophy_id, Info* info);
 int  Count();
-void Preload(); // the package read in the background (the emulator, once /app0 is mounted)
+// (F1 Trofeos) Every trophy and the unlocked ids, only when the module already loaded them (never loads): false if not.
+bool Snapshot(std::vector<Info>* all, std::vector<int>* unlocked);
+void Preload();
+
+// (port34 Ver trofeos) The F1 trophy page's data. Never waits on the trophy mutex (the present thread calls it): 1 the
+// list and the unlock times (id -> unix time, 0 unknown) were copied, 0 busy (keep the last copy), -1 not loaded yet,
+// -2 loaded but no trophies (no trophy package).
+int  TrySnapshot(std::vector<Info>* all, std::map<int, int64_t>* unlock_times);
+bool UnlockTimes(std::map<int, int64_t>* unlock_times); // (waits on the mutex) id -> unix time of every unlock
+std::string GameTitle(); // param.sfo's TITLE once loaded ("" before)
+
+// The trophy icons at full quality, packed into one RGBA8 atlas (one texture, one descriptor). Each cell is cell x cell
+// with a pad-pixel edge-extended gutter; slot i is at ((i % cols) * stride + pad, (i / cols) * stride + pad).
+struct Art {
+	int                   cell = 0, pad = 0, stride = 0, cols = 0, width = 0, height = 0;
+	std::vector<uint32_t> pixels;    // RGBA8 (IM_COL32 order), width * height
+	std::map<int, int>    slots;     // trophy id -> slot
+	int                   game_slot = -1; // sce_sys/icon0.png
+};
+// Reads the package again and decodes every icon (slow: call it on a worker thread). The mutex is held only to copy
+// the package path. false: no package (art left empty).
+bool BuildArt(int cell, Art* art); // the package read in the background (the emulator, once /app0 is mounted)
 
 // The popup to draw now (nullptr: none) and its age in seconds; the presenter thread calls it each frame.
 std::shared_ptr<const Toast> CurrentToast(float* seconds);

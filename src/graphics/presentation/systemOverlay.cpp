@@ -11,6 +11,7 @@
 #include "libs/dialog.h"
 #include "libs/ime.h"
 #include "libs/imeDialog.h"
+#include "libs/trophy-page.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -476,8 +477,10 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto dialog = DialogIme::GetVisualState();
 	const auto error  = ErrorDialog::GetVisualState();
 	const auto save   = SaveDialog::GetVisualState();
-	return {core.active || dialog.active || error.active || save.active,
-	        core.revision + dialog.revision + error.revision + save.revision};
+	// (ds-troph) F1's menu and trophy page (libs/trophy-page.h).
+	const bool page = Libs::TrophyPage::IsOpen();
+	return {core.active || dialog.active || error.active || save.active || page,
+	        core.revision + dialog.revision + error.revision + save.revision + Libs::TrophyPage::Revision()};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -1312,7 +1315,8 @@ struct SystemOverlay::Impl {
 	                  SystemOverlayHud* hud) {
 		OverlaySnapshot snapshot;
 		bool            dialog = GetOverlaySnapshot(&snapshot);
-		if (!dialog && hud == nullptr) {
+		const bool      page   = Libs::TrophyPage::IsOpen();
+		if (!dialog && hud == nullptr && !page) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1345,7 +1349,7 @@ struct SystemOverlay::Impl {
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
 		if (dialog && (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session)) {
-			if (hud == nullptr) {
+			if (hud == nullptr && !page) {
 				ImGui::EndFrame();
 				return false;
 			}
@@ -1363,6 +1367,7 @@ struct SystemOverlay::Impl {
 		if (hud != nullptr) {
 			DrawHud(*hud);
 		}
+		Libs::TrophyPage::Draw(static_cast<float>(frame_extent.width), static_cast<float>(frame_extent.height));
 		ImGui::Render();
 		extent = frame_extent;
 		return true;

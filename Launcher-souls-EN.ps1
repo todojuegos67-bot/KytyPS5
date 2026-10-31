@@ -3062,7 +3062,348 @@ function Update-TrophySection([bool]$open) {
 	$lvTrophy.EndUpdate()
 	$gTrophy.BringToFront(); $btnTrophy.BringToFront()
 }
-$btnTrophy.Add_Click({ Update-TrophySection (-not $gTrophy.Visible) })
+# (ds-troph) The trophy window: every trophy (earned and missing) with its real icon (the emulator exports them to
+# _SaveData\PPSA01341\trophy-icons when it reads the .ucp), progress, counts per grade, filters, order, animations.
+# A double-buffered control compiled here; if it cannot be compiled, the old list panel is used.
+$script:trophyViewOk = $false
+try {
+	Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Drawing.Text;
+using System.Windows.Forms;
+
+namespace KytyTrophies {
+
+public class Item {
+	public int Id; public string Grade = ""; public string Name = ""; public string Detail = ""; public bool Hidden; public bool Earned; public long Time;
+	public Image Icon; internal Bitmap Big, Grey; internal int CacheSize; internal float Hot;
+}
+
+public class Labels {
+	public string Title = "Trofeos", Header = "TROFEOS", Progress = "{0} de {1} trofeos obtenidos";
+	public string All = "Todos", Earned = "Obtenidos", Missing = "Sin obtener", Sort = "Ordenar:", ByGrade = "Grado", ByDate = "Fecha";
+	public string Hidden = "Trofeo oculto", HiddenDetail = "Se revelará al obtenerlo.", EarnedOn = "Obtenido el {0}", NotEarned = "Sin obtener";
+	public string Platinum = "Platino", Gold = "Oro", Silver = "Plata", Bronze = "Bronce";
+	public string NoData = "Aún no hay datos de trofeos: se crean al iniciar el juego.", NoneEarned = "Aún no has obtenido ningún trofeo.", AllEarned = "¡Has obtenido todos los trofeos!";
+	public string Close = "Cerrar", Keys = "Rueda o flechas: desplazar   ·   Tab: filtro   ·   Esc: cerrar";
+}
+
+public class View : Control {
+	public List<Item> Items = new List<Item>();
+	public Image GameIcon; public string GameTitle = "Demon's Souls"; public Labels L = new Labels();
+	int filter, sort, sel = -1; float scroll, target, pillX = -1, pillW; DateTime opened = DateTime.Now, listAt = DateTime.Now;
+	List<Item> view = new List<Item>(); Timer timer; float k = 1f; Point mouse = new Point(-1, -1);
+	RectangleF[] pills = new RectangleF[3]; RectangleF sortRect, closeRect, listRect;
+	Font fBody, fSmall, fName, fTitle, fBig, fPct, fGrade;
+
+	public static float Dpi() { try { using (var g = Graphics.FromHwnd(IntPtr.Zero)) return Math.Max(1f, g.DpiX / 96f); } catch { return 1f; } }
+	public View() {
+		SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+		BackColor = Color.FromArgb(17, 18, 22); TabStop = true;
+		timer = new Timer(); timer.Interval = 15; timer.Tick += delegate { Tick(); }; timer.Start();
+	}
+	protected override void Dispose(bool disposing) { if (disposing) { timer.Stop(); timer.Dispose(); foreach (var i in Items) { if (i.Big != null) i.Big.Dispose(); if (i.Grey != null) i.Grey.Dispose(); } } base.Dispose(disposing); }
+	protected override bool IsInputKey(Keys key) { return true; }
+
+	void Fonts() {
+		if (fBody != null) return;
+		k = Dpi();
+		fBody = new Font("Segoe UI", 10.5f); fSmall = new Font("Segoe UI", 9.5f); fName = new Font("Segoe UI Semibold", 12.5f, FontStyle.Bold);
+		fTitle = new Font("Segoe UI Semibold", 22f, FontStyle.Bold); fBig = new Font("Segoe UI Semibold", 11f, FontStyle.Bold);
+		fPct = new Font("Segoe UI Semibold", 16f, FontStyle.Bold); fGrade = new Font("Segoe UI Semibold", 9f, FontStyle.Bold);
+	}
+	float U(float v) { return v * k; }
+	static float Ease(double t) { if (t < 0) t = 0; if (t > 1) t = 1; return (float)(1 - Math.Pow(1 - t, 3)); }
+
+	public void Rebuild() {
+		view.Clear();
+		foreach (var i in Items) if (filter == 0 || (filter == 1 && i.Earned) || (filter == 2 && !i.Earned)) view.Add(i);
+		var order = new Dictionary<Item, int>(); for (int n = 0; n < view.Count; n++) order[view[n]] = n;
+		view.Sort(delegate(Item a, Item b) {
+			if (sort == 1) { if (a.Earned != b.Earned) return a.Earned ? -1 : 1; if (a.Earned && a.Time != b.Time) return b.Time.CompareTo(a.Time); }
+			int ga = Rank(a.Grade), gb = Rank(b.Grade); if (ga != gb) return ga.CompareTo(gb);
+			if (a.Id != b.Id) return a.Id.CompareTo(b.Id); return order[a].CompareTo(order[b]);
+		});
+		listAt = DateTime.Now; target = 0; Invalidate();
+	}
+	static int Rank(string g) { return g == "P" ? 1 : g == "G" ? 2 : g == "S" ? 3 : g == "B" ? 4 : 5; }
+	static int Points(string g) { return g == "P" ? 300 : g == "G" ? 90 : g == "S" ? 30 : 15; }
+	public static Color GradeColor(string g, int a) {
+		switch (g) { case "P": return Color.FromArgb(a, 170, 200, 235); case "G": return Color.FromArgb(a, 236, 196, 72); case "S": return Color.FromArgb(a, 200, 205, 212); case "B": return Color.FromArgb(a, 205, 127, 70); }
+		return Color.FromArgb(a, 110, 110, 110);
+	}
+	string GradeName(string g) { return g == "P" ? L.Platinum : g == "G" ? L.Gold : g == "S" ? L.Silver : g == "B" ? L.Bronze : ""; }
+
+	int Cols() { return listRect.Width >= U(1000) ? 2 : 1; }
+	float CardH() { return U(118); }
+	float Gap() { return U(12); }
+	float MaxScroll() { int c = Cols(); int rows = (view.Count + c - 1) / c; return Math.Max(0, rows * (CardH() + Gap()) - Gap() - listRect.Height + U(4)); }
+
+	void Tick() {
+		bool anim = (DateTime.Now - opened).TotalSeconds < 1.6 || (DateTime.Now - listAt).TotalSeconds < 1.2;
+		if (Math.Abs(target - scroll) > 0.3f) { scroll += (target - scroll) * 0.22f; anim = true; } else scroll = target;
+		for (int n = 0; n < view.Count; n++) { var i = view[n]; float t = n == sel ? 1f : 0f; if (Math.Abs(i.Hot - t) > 0.01f) { i.Hot += (t - i.Hot) * 0.25f; anim = true; } else i.Hot = t; }
+		if (pillX >= 0 && Math.Abs(pills[filter].X - pillX) > 0.5f) anim = true;
+		foreach (var i in view) if (i.Earned) { anim = true; break; } // (the shimmer and the platinum's halo)
+		var f = FindForm(); if (f != null && f.Opacity < 1) { f.Opacity = Math.Min(1.0, Ease((DateTime.Now - opened).TotalSeconds / 0.3)); anim = true; }
+		if (anim) Invalidate();
+	}
+
+	void SetFilter(int f) { if (f == filter) return; filter = f; sel = -1; Rebuild(); }
+	void ToggleSort() { sort = 1 - sort; Rebuild(); }
+	void EnsureVisible() {
+		if (sel < 0) return; int c = Cols(); float top = (sel / c) * (CardH() + Gap());
+		if (top < target) target = top - U(6); if (top + CardH() > target + listRect.Height) target = top + CardH() - listRect.Height + U(6);
+		target = Math.Max(0, Math.Min(MaxScroll(), target));
+	}
+	protected override void OnKeyDown(KeyEventArgs e) {
+		int c = Cols(); int n = view.Count;
+		switch (e.KeyCode) {
+			case Keys.Escape: { var f = FindForm(); if (f != null) f.Close(); return; }
+			case Keys.Tab: SetFilter((filter + (e.Shift ? 2 : 1)) % 3); return;
+			case Keys.S: ToggleSort(); return;
+			case Keys.Down: if (n > 0) { sel = sel < 0 ? 0 : Math.Min(n - 1, sel + c); EnsureVisible(); } break;
+			case Keys.Up: if (n > 0) { sel = sel < 0 ? 0 : Math.Max(0, sel - c); EnsureVisible(); } break;
+			case Keys.Right: if (n > 0) { sel = sel < 0 ? 0 : Math.Min(n - 1, sel + 1); EnsureVisible(); } break;
+			case Keys.Left: if (n > 0) { sel = sel < 0 ? 0 : Math.Max(0, sel - 1); EnsureVisible(); } break;
+			case Keys.PageDown: target = Math.Min(MaxScroll(), target + listRect.Height * 0.9f); break;
+			case Keys.PageUp: target = Math.Max(0, target - listRect.Height * 0.9f); break;
+			case Keys.Home: target = 0; if (n > 0) sel = 0; break;
+			case Keys.End: target = MaxScroll(); if (n > 0) sel = n - 1; break;
+		}
+		Invalidate();
+	}
+	protected override void OnMouseWheel(MouseEventArgs e) { target = Math.Max(0, Math.Min(MaxScroll(), target - e.Delta / 120f * (CardH() + Gap()) * 0.8f)); Invalidate(); }
+	protected override void OnMouseMove(MouseEventArgs e) {
+		mouse = e.Location; int hit = HitCard(e.Location); if (hit != sel && hit >= 0) sel = hit;
+		bool hand = false; foreach (var p in pills) if (p.Contains(e.Location)) hand = true;
+		if (sortRect.Contains(e.Location) || closeRect.Contains(e.Location)) hand = true;
+		Cursor = hand ? Cursors.Hand : Cursors.Default; Invalidate();
+	}
+	protected override void OnMouseLeave(EventArgs e) { mouse = new Point(-1, -1); Invalidate(); }
+	protected override void OnMouseDown(MouseEventArgs e) {
+		Focus();
+		for (int n = 0; n < 3; n++) if (pills[n].Contains(e.Location)) { SetFilter(n); return; }
+		if (sortRect.Contains(e.Location)) { ToggleSort(); return; }
+		if (closeRect.Contains(e.Location)) { var f = FindForm(); if (f != null) f.Close(); }
+	}
+	int HitCard(Point p) {
+		if (!listRect.Contains(p)) return -1; int c = Cols(); float cw = (listRect.Width - Gap() * (c - 1)) / c;
+		float lx = p.X - listRect.X, ly = p.Y - listRect.Y + scroll; int col = (int)(lx / (cw + Gap())), row = (int)(ly / (CardH() + Gap()));
+		if (col >= c || lx - col * (cw + Gap()) > cw || ly - row * (CardH() + Gap()) > CardH()) return -1;
+		int i = row * c + col; return i >= 0 && i < view.Count ? i : -1;
+	}
+
+	static GraphicsPath Round(RectangleF r, float rad) {
+		var p = new GraphicsPath(); float d = Math.Min(rad * 2, Math.Min(r.Width, r.Height)); if (d <= 0.5f) { p.AddRectangle(r); return p; }
+		p.AddArc(r.X, r.Y, d, d, 180, 90); p.AddArc(r.Right - d, r.Y, d, d, 270, 90); p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90); p.AddArc(r.X, r.Bottom - d, d, d, 90, 90); p.CloseFigure(); return p;
+	}
+	static void Fill(Graphics g, RectangleF r, float rad, Color c) { using (var p = Round(r, rad)) using (var b = new SolidBrush(c)) g.FillPath(b, p); }
+	static void Stroke(Graphics g, RectangleF r, float rad, Color c, float w) { using (var p = Round(r, rad)) using (var pen = new Pen(c, w)) g.DrawPath(pen, p); }
+	public static void Cup(Graphics g, float x, float y, float s, Color col) {
+		using (var b = new SolidBrush(col)) using (var pen = new Pen(col, s * 0.07f)) {
+			g.DrawEllipse(pen, x + s * 0.09f, y + s * 0.17f, s * 0.26f, s * 0.26f); g.DrawEllipse(pen, x + s * 0.65f, y + s * 0.17f, s * 0.26f, s * 0.26f);
+			using (var bowl = Round(new RectangleF(x + s * 0.24f, y + s * 0.0f - s * 0.0f + s * 0.12f - s * 0.2f, s * 0.52f, s * 0.6f), s * 0.24f)) { g.SetClip(new RectangleF(x, y + s * 0.10f, s, s * 0.42f)); g.FillPath(b, bowl); g.ResetClip(); }
+			g.FillRectangle(b, x + s * 0.22f, y + s * 0.10f, s * 0.56f, s * 0.06f); g.FillRectangle(b, x + s * 0.45f, y + s * 0.50f, s * 0.10f, s * 0.20f);
+			g.FillRectangle(b, x + s * 0.34f, y + s * 0.70f, s * 0.32f, s * 0.08f); g.FillRectangle(b, x + s * 0.26f, y + s * 0.78f, s * 0.48f, s * 0.10f);
+			using (var sh = new SolidBrush(Color.FromArgb((int)(90 * col.A / 255f), 255, 255, 255))) g.FillRectangle(sh, x + s * 0.32f, y + s * 0.18f, s * 0.06f, s * 0.22f);
+		}
+	}
+	static void Lock(Graphics g, float x, float y, float s, Color col) {
+		using (var pen = new Pen(col, s * 0.11f)) g.DrawArc(pen, x + s * 0.28f, y + s * 0.2f, s * 0.44f, s * 0.44f, 180, 180);
+		using (var pen = new Pen(col, s * 0.11f)) { g.DrawLine(pen, x + s * 0.28f, y + s * 0.42f, x + s * 0.28f, y + s * 0.5f); g.DrawLine(pen, x + s * 0.72f, y + s * 0.42f, x + s * 0.72f, y + s * 0.5f); }
+		Fill(g, new RectangleF(x + s * 0.16f, y + s * 0.48f, s * 0.68f, s * 0.46f), s * 0.1f, col);
+	}
+	// The icon scaled once to the drawn size (bicubic), and its grey copy for locked trophies.
+	void Cache(Item i, int size) {
+		if (i.Icon == null || (i.CacheSize == size && i.Big != null)) return;
+		if (i.Big != null) i.Big.Dispose(); if (i.Grey != null) i.Grey.Dispose();
+		i.Big = new Bitmap(size, size, PixelFormat.Format32bppPArgb);
+		using (var g = Graphics.FromImage(i.Big)) { g.InterpolationMode = InterpolationMode.HighQualityBicubic; g.PixelOffsetMode = PixelOffsetMode.HighQuality; g.DrawImage(i.Icon, new Rectangle(0, 0, size, size)); }
+		i.Grey = new Bitmap(size, size, PixelFormat.Format32bppPArgb);
+		using (var g = Graphics.FromImage(i.Grey)) using (var ia = new ImageAttributes()) {
+			float a = 0.30f, b = 0.59f, c = 0.11f, d = 0.45f;
+			ia.SetColorMatrix(new ColorMatrix(new float[][] { new float[] { a * d, a * d, a * d, 0, 0 }, new float[] { b * d, b * d, b * d, 0, 0 }, new float[] { c * d, c * d, c * d, 0, 0 }, new float[] { 0, 0, 0, 1, 0 }, new float[] { 0.04f, 0.04f, 0.045f, 0, 1 } }));
+			g.DrawImage(i.Big, new Rectangle(0, 0, size, size), 0, 0, size, size, GraphicsUnit.Pixel, ia);
+		}
+		i.CacheSize = size;
+	}
+	static Color A(Color c, float a) { return Color.FromArgb(Math.Max(0, Math.Min(255, (int)(c.A * a))), c.R, c.G, c.B); }
+
+	protected override void OnPaint(PaintEventArgs e) {
+		Fonts();
+		var g = e.Graphics; g.SmoothingMode = SmoothingMode.AntiAlias; g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit; g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+		float W = ClientSize.Width, H = ClientSize.Height, pad = U(24), now = (float)(DateTime.Now - opened).TotalSeconds;
+		var gold = Color.FromArgb(222, 196, 140); var ink = Color.FromArgb(240, 238, 232); var dim = Color.FromArgb(160, 158, 152);
+		// Totals.
+		int total = 0, have = 0, earned = 0; var gt = new Dictionary<string, int>(); var gh = new Dictionary<string, int>();
+		foreach (var s in new[] { "P", "G", "S", "B" }) { gt[s] = 0; gh[s] = 0; }
+		foreach (var i in Items) { total += Points(i.Grade); if (gt.ContainsKey(i.Grade)) gt[i.Grade]++; if (i.Earned) { have += Points(i.Grade); earned++; if (gh.ContainsKey(i.Grade)) gh[i.Grade]++; } }
+		float frac = total > 0 ? (float)have / total : 0f;
+		// Header band.
+		float hh = U(140);
+		using (var lg = new LinearGradientBrush(new RectangleF(0, 0, W, hh), Color.FromArgb(150, 46, 40, 30), Color.FromArgb(0, 17, 18, 22), LinearGradientMode.Vertical)) g.FillRectangle(lg, 0, 0, W, hh);
+		float isz = U(100), ix = pad, iy = (hh - isz) / 2;
+		Fill(g, new RectangleF(ix - U(2), iy - U(2), isz + U(4), isz + U(4)), U(14), Color.FromArgb(90, 222, 196, 140));
+		if (GameIcon != null) { using (var p = Round(new RectangleF(ix, iy, isz, isz), U(12))) { g.SetClip(p); g.DrawImage(GameIcon, ix, iy, isz, isz); g.ResetClip(); } }
+		else { Fill(g, new RectangleF(ix, iy, isz, isz), U(12), Color.FromArgb(40, 42, 50)); Cup(g, ix + isz * 0.15f, iy + isz * 0.12f, isz * 0.7f, GradeColor("G", 255)); }
+		float tx = ix + isz + U(22), gw = Math.Min(U(4 * 92), W * 0.36f), gx0 = W - pad - gw, tw = gx0 - U(24) - tx;
+		TextRenderer.DrawText(g, L.Header, fGrade, new Rectangle((int)tx, (int)iy, (int)tw, (int)U(20)), gold, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+		TextRenderer.DrawText(g, GameTitle, fTitle, new Rectangle((int)tx, (int)(iy + U(14)), (int)tw, (int)U(44)), ink, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+		TextRenderer.DrawText(g, string.Format(L.Progress, earned, Items.Count), fBody, new Rectangle((int)tx, (int)(iy + U(56)), (int)tw, (int)U(22)), Color.FromArgb(200, 198, 192), TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+		string pct = ((int)Math.Floor(frac * 100 + 0.0001)).ToString() + "%";
+		float pw = TextRenderer.MeasureText("100%", fPct).Width, bx0 = tx, bx1 = Math.Max(tx + U(40), gx0 - U(30) - pw), by = iy + isz - U(12), bh = U(10);
+		Fill(g, new RectangleF(bx0, by, bx1 - bx0, bh), bh / 2, Color.FromArgb(26, 255, 255, 255));
+		float shown = frac * Ease((now - 0.15) / 0.9);
+		if (shown > 0.001f) {
+			var fr = new RectangleF(bx0, by, Math.Max(bh, (bx1 - bx0) * shown), bh);
+			using (var lg = new LinearGradientBrush(fr, Color.FromArgb(176, 132, 64), Color.FromArgb(236, 204, 120), LinearGradientMode.Horizontal)) using (var p = Round(fr, bh / 2)) g.FillPath(lg, p);
+			Shimmer(g, fr, now, 0);
+		}
+		TextRenderer.DrawText(g, pct, fPct, new Point((int)(bx1 + U(10)), (int)(by + bh / 2 - U(15))), gold);
+		string[] gs = { "P", "G", "S", "B" }; float cw4 = gw / 4;
+		for (int n = 0; n < 4; n++) {
+			float cx = gx0 + cw4 * n, cup = Math.Min(U(38), cw4 * 0.5f), cy = iy + U(4);
+			if (n == 0 && gh["P"] > 0) { float p = 0.5f + 0.5f * (float)Math.Sin(now * 2.4); for (int q = 0; q < 4; q++) { float r = cup * (0.55f + 0.14f * q + 0.08f * p); using (var b = new SolidBrush(Color.FromArgb((int)(255 * (0.07f - 0.014f * q)), 170, 200, 235))) g.FillEllipse(b, cx + cw4 / 2 - r, cy + cup / 2 - r, r * 2, r * 2); } }
+			Cup(g, cx + (cw4 - cup) / 2, cy, cup, GradeColor(gs[n], 255));
+			TextRenderer.DrawText(g, gh[gs[n]] + "/" + gt[gs[n]], fBig, new Rectangle((int)cx, (int)(cy + cup + U(4)), (int)cw4, (int)U(22)), ink, TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPadding);
+			TextRenderer.DrawText(g, GradeName(gs[n]), fGrade, new Rectangle((int)cx, (int)(cy + cup + U(28)), (int)cw4, (int)U(18)), GradeColor(gs[n], 255), TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPadding);
+		}
+		// Filters, order.
+		float fy = hh + U(6), fh = U(36), x = pad;
+		string[] names = { L.All, L.Earned, L.Missing }; int[] counts = { Items.Count, earned, Items.Count - earned };
+		for (int n = 0; n < 3; n++) { string t = names[n] + "  " + counts[n]; float w = TextRenderer.MeasureText(t, fBody).Width + U(28); pills[n] = new RectangleF(x, fy, w, fh); x += w + U(8); }
+		if (pillX < 0) { pillX = pills[filter].X; pillW = pills[filter].Width; }
+		pillX += (pills[filter].X - pillX) * 0.25f; pillW += (pills[filter].Width - pillW) * 0.25f;
+		Fill(g, new RectangleF(pillX, fy, pillW, fh), fh / 2, Color.FromArgb(242, 222, 196, 140));
+		for (int n = 0; n < 3; n++) {
+			bool hot = pills[n].Contains(mouse);
+			if (n != filter) Stroke(g, pills[n], fh / 2, Color.FromArgb(hot ? 115 : 46, 255, 255, 255), U(1));
+			TextRenderer.DrawText(g, names[n] + "  " + counts[n], fBody, Rectangle.Round(pills[n]), n == filter && Math.Abs(pillX - pills[filter].X) < U(20) ? Color.FromArgb(24, 22, 18) : Color.FromArgb(225, 222, 215), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+		}
+		string st = L.Sort + " " + (sort == 0 ? L.ByGrade : L.ByDate); float sw = TextRenderer.MeasureText(st, fBody).Width + U(28);
+		sortRect = new RectangleF(W - pad - sw, fy, sw, fh);
+		Stroke(g, sortRect, fh / 2, Color.FromArgb(sortRect.Contains(mouse) ? 210 : 100, 222, 196, 140), U(1));
+		TextRenderer.DrawText(g, st, fBody, Rectangle.Round(sortRect), gold, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+		using (var pen = new Pen(Color.FromArgb(20, 255, 255, 255), U(1))) g.DrawLine(pen, pad, fy + fh + U(8), W - pad, fy + fh + U(8));
+		// Footer.
+		float footH = U(42); closeRect = new RectangleF(pad, H - footH + U(4), TextRenderer.MeasureText(L.Close, fBody).Width + U(36), footH - U(12));
+		Stroke(g, closeRect, U(8), Color.FromArgb(closeRect.Contains(mouse) ? 150 : 64, 255, 255, 255), U(1));
+		TextRenderer.DrawText(g, L.Close, fBody, Rectangle.Round(closeRect), ink, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+		TextRenderer.DrawText(g, L.Keys, fSmall, new Rectangle((int)(closeRect.Right + U(16)), (int)closeRect.Y, (int)(W - pad - closeRect.Right - U(16)), (int)closeRect.Height), dim, TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+		// The list.
+		listRect = new RectangleF(pad, fy + fh + U(18), W - pad * 2 - U(10), Math.Max(0, H - footH - (fy + fh + U(18)) - U(6)));
+		if (Items.Count == 0 || view.Count == 0) {
+			string msg = Items.Count == 0 ? L.NoData : filter == 1 ? L.NoneEarned : L.AllEarned;
+			TextRenderer.DrawText(g, msg, fName, Rectangle.Round(listRect), Color.FromArgb(210, 206, 198), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak);
+			return;
+		}
+		int cols = Cols(); float gap = Gap(), ch = CardH(), cw = (listRect.Width - gap * (cols - 1)) / cols, ms = MaxScroll();
+		if (target > ms) target = ms; if (scroll > ms) scroll = ms;
+		g.SetClip(listRect);
+		float lt = (float)(DateTime.Now - listAt).TotalSeconds; int first = Math.Max(0, (int)(scroll / (ch + gap)) - 1) * cols;
+		int icon = (int)U(92);
+		for (int n = first; n < view.Count; n++) {
+			int r = n / cols, c = n % cols; float y0 = listRect.Y + r * (ch + gap) - scroll; if (y0 > listRect.Bottom) break;
+			var it = view[n]; bool secret = it.Hidden && !it.Earned;
+			float ap = Ease((lt - 0.08 - 0.035 * Math.Min(n - first, 16)) / 0.35); if (ap <= 0) continue;
+			float x0 = listRect.X + c * (cw + gap), yy = y0 + (1 - ap) * U(18), sc = 1 + 0.015f * it.Hot;
+			var card = new RectangleF(x0 + cw / 2 - cw / 2 * sc, yy + ch / 2 - ch / 2 * sc, cw * sc, ch * sc);
+			var gc = GradeColor(it.Grade, 255); float cr = U(12);
+			if (it.Hot > 0.01f) for (int q = 3; q >= 1; q--) Stroke(g, RectangleF.Inflate(card, q * U(2.5f), q * U(2.5f)), cr + q * U(2.5f), A(gc, ap * it.Hot * (0.22f - 0.05f * q)), U(2.5f));
+			Fill(g, card, cr, A(it.Earned ? Color.FromArgb(31, 32, 38) : Color.FromArgb(24, 25, 29), ap));
+			Stroke(g, card, cr, it.Hot > 0.01f ? A(gc, ap * (0.35f + 0.6f * it.Hot)) : Color.FromArgb((int)(18 * ap), 255, 255, 255), U(1 + it.Hot));
+			float isz2 = icon * (1 + 0.05f * it.Hot), icx = card.X + U(12) + icon / 2f, icy = card.Y + card.Height / 2;
+			var ir = new RectangleF(icx - isz2 / 2, icy - isz2 / 2, isz2, isz2);
+			if (it.Grade == "P" && it.Earned) { float p = 0.5f + 0.5f * (float)Math.Sin(now * 2.2 + it.Id); for (int q = 1; q <= 5; q++) Fill(g, RectangleF.Inflate(ir, q * U(2.4f) * (1 + p * 0.4f), q * U(2.4f) * (1 + p * 0.4f)), U(10) + q * U(2.4f), Color.FromArgb((int)(255 * (0.10f - 0.018f * q) * ap * (0.6f + 0.4f * p)), 170, 205, 245)); }
+			Fill(g, ir, U(10), A(Color.FromArgb(40, 42, 50), ap));
+			if (!secret && it.Icon != null) {
+				Cache(it, icon);
+				using (var p = Round(ir, U(10))) { var old = g.Clip; g.SetClip(p, CombineMode.Intersect); g.DrawImage(it.Earned ? it.Big : it.Grey, ir); if (it.Earned) Shimmer(g, ir, now, it.Id * 0.61f); g.Clip = old; }
+			} else if (secret) {
+				TextRenderer.DrawText(g, "?", fTitle, Rectangle.Round(ir), Color.FromArgb(120, 120, 126), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+			} else Cup(g, ir.X + ir.Width * 0.15f, ir.Y + ir.Height * 0.12f, ir.Width * 0.7f, it.Earned ? gc : Color.FromArgb(110, 110, 110));
+			if (!it.Earned) { float ls = U(26); using (var b = new SolidBrush(Color.FromArgb(230, 14, 14, 17))) g.FillEllipse(b, ir.Right - ls - U(1), ir.Bottom - ls - U(1), ls, ls); Lock(g, ir.Right - ls + ls * 0.1f, ir.Bottom - ls + ls * 0.02f, ls * 0.8f, Color.FromArgb(200, 200, 205)); }
+			Stroke(g, ir, U(10), it.Earned ? A(gc, 0.55f * ap) : Color.FromArgb(16, 255, 255, 255), U(1));
+			float tx2 = card.X + U(12) + icon + U(18), tw2 = card.Right - U(14) - tx2;
+			string nm = secret ? L.Hidden : it.Name, dt = secret ? L.HiddenDetail : it.Detail;
+			TextRenderer.DrawText(g, nm, fName, new Rectangle((int)tx2, (int)(card.Y + U(10)), (int)tw2, (int)U(26)), it.Earned ? Color.FromArgb(246, 244, 240) : Color.FromArgb(170, 170, 176), TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+			TextRenderer.DrawText(g, dt, fBody, new Rectangle((int)tx2, (int)(card.Y + U(38)), (int)tw2, (int)U(40)), it.Earned ? Color.FromArgb(196, 196, 204) : Color.FromArgb(128, 128, 136), TextFormatFlags.WordBreak | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+			float ly = card.Bottom - U(28), cup2 = U(18);
+			Cup(g, tx2, ly, cup2, it.Earned ? gc : A(gc, 0.55f));
+			string gn = GradeName(it.Grade); TextRenderer.DrawText(g, gn, fGrade, new Point((int)(tx2 + cup2 + U(4)), (int)(ly + U(1))), it.Earned ? gc : A(gc, 0.6f), TextFormatFlags.NoPadding);
+			float gw2 = TextRenderer.MeasureText(gn, fGrade, Size.Empty, TextFormatFlags.NoPadding).Width;
+			string when = it.Earned ? (it.Time > 0 ? string.Format(L.EarnedOn, DateTimeOffset.FromUnixTimeSeconds(it.Time).LocalDateTime.ToString("dd/MM/yyyy HH:mm")) : L.Earned) : L.NotEarned;
+			TextRenderer.DrawText(g, "·  " + when, fSmall, new Rectangle((int)(tx2 + cup2 + U(10) + gw2), (int)ly, (int)Math.Max(0, tw2 - cup2 - U(10) - gw2), (int)U(20)), it.Earned ? gold : Color.FromArgb(140, 140, 148), TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+		}
+		g.ResetClip();
+		if (ms > 0) {
+			float bx = W - pad - U(2), th = Math.Max(U(40), listRect.Height * listRect.Height / (listRect.Height + ms)), ty = listRect.Y + (listRect.Height - th) * (scroll / ms);
+			Fill(g, new RectangleF(bx - U(2), listRect.Y, U(4), listRect.Height), U(2), Color.FromArgb(13, 255, 255, 255));
+			Fill(g, new RectangleF(bx - U(2), ty, U(4), th), U(2), Color.FromArgb(150, 222, 196, 140));
+		}
+	}
+	static void Shimmer(Graphics g, RectangleF r, float t, float phase) {
+		float period = 4.2f, sweep = 0.95f, u = ((t + phase) % period) / sweep; if (u >= 1 || r.Width < 2) return;
+		float cx = r.X - r.Width * 0.6f + u * r.Width * 2.2f, sl = r.Height * 0.45f; var old = g.Clip; g.SetClip(r, CombineMode.Intersect);
+		float[] half = { 0.16f, 0.09f, 0.035f }; int[] al = { 20, 31, 51 };
+		for (int q = 0; q < 3; q++) { float h = r.Width * half[q]; using (var b = new SolidBrush(Color.FromArgb(al[q], 255, 255, 255))) g.FillPolygon(b, new[] { new PointF(cx - h + sl, r.Y), new PointF(cx + h + sl, r.Y), new PointF(cx + h - sl, r.Bottom), new PointF(cx - h - sl, r.Bottom) }); }
+		g.Clip = old;
+	}
+
+	// The window: dark, sized to the screen, fading in.
+	public static void ShowWindow(IWin32Window owner, View v, string title, Icon icon) {
+		var f = new Form(); f.Text = title; f.BackColor = Color.FromArgb(17, 18, 22); f.StartPosition = FormStartPosition.CenterScreen; f.KeyPreview = false;
+		f.FormBorderStyle = FormBorderStyle.Sizable; f.ShowInTaskbar = false; f.Opacity = 0; if (icon != null) f.Icon = icon;
+		var wa = Screen.FromPoint(Cursor.Position).WorkingArea; float k = Dpi();
+		f.Size = new Size(Math.Min(wa.Width - 40, (int)(1180 * k)), Math.Min(wa.Height - 40, (int)(820 * k))); f.MinimumSize = new Size((int)(640 * k), (int)(480 * k));
+		v.Dock = DockStyle.Fill; f.Controls.Add(v); v.Rebuild(); f.Shown += delegate { v.Focus(); };
+		f.ShowDialog(owner); f.Dispose();
+	}
+}
+}
+'@ -ErrorAction Stop
+	$script:trophyViewOk = $true
+} catch { }
+function Read-TrophyImage([string]$path) {
+	try { if (Test-Path -LiteralPath $path) { $ms = New-Object System.IO.MemoryStream (, [System.IO.File]::ReadAllBytes($path)); return [System.Drawing.Image]::FromStream($ms) } } catch { }
+	return $null
+}
+function Show-TrophyWindow {
+	$v = New-Object KytyTrophies.View
+	$L = $v.L
+	$L.Title = 'Trophies'; $L.Header = 'TROPHIES'; $L.Progress = '{0} of {1} trophies earned'
+	$L.All = 'All'; $L.Earned = 'Earned'; $L.Missing = 'Not earned'; $L.Sort = 'Sort:'; $L.ByGrade = 'Grade'; $L.ByDate = 'Date'
+	$L.Hidden = 'Hidden trophy'; $L.HiddenDetail = 'Revealed once earned.'; $L.EarnedOn = 'Earned on {0}'; $L.NotEarned = 'Not earned'
+	$L.Platinum = 'Platinum'; $L.Gold = 'Gold'; $L.Silver = 'Silver'; $L.Bronze = 'Bronze'
+	$L.NoData = 'No trophy data yet: it is created when the game starts.'; $L.NoneEarned = 'You have not earned any trophy yet.'; $L.AllEarned = 'You have earned every trophy!'
+	$L.Close = 'Close'; $L.Keys = ('Wheel or arrows: scroll   ' + [char]0xB7 + '   Tab: filter   ' + [char]0xB7 + '   S: sort   ' + [char]0xB7 + '   Esc: close')
+	$listFile = Join-Path $trophyDir 'trophies-list.json'; $unFile = Join-Path $trophyDir 'trophies.json'
+	$list = @(); if (Test-Path -LiteralPath $listFile) { $list = @((Get-Content -LiteralPath $listFile -Raw -Encoding UTF8 | ConvertFrom-Json).trophies) }
+	$un = @{}
+	if (Test-Path -LiteralPath $unFile) { $j = Get-Content -LiteralPath $unFile -Raw -Encoding UTF8 | ConvertFrom-Json; if ($j.unlocked) { foreach ($p in $j.unlocked.PSObject.Properties) { $un[[string]$p.Name] = [long]$p.Value } } }
+	$iconDir = Join-Path $trophyDir 'trophy-icons'
+	foreach ($t in $list) {
+		if ($null -eq $t) { continue }
+		$it = New-Object KytyTrophies.Item
+		$it.Id = [int]$t.id; $it.Grade = [string]$t.grade; $it.Name = [string]$t.name; $it.Detail = [string]$t.detail; $it.Hidden = [bool]$t.hidden
+		$it.Earned = $un.ContainsKey([string]$t.id); if ($it.Earned) { $it.Time = $un[[string]$t.id] }
+		$ip = if ($t.icon) { Join-Path $trophyDir ([string]$t.icon) } else { Join-Path $iconDir ('trop{0:D3}.png' -f $it.Id) }
+		$it.Icon = Read-TrophyImage $ip
+		$v.Items.Add($it)
+	}
+	$v.GameIcon = Read-TrophyImage (Join-Path $iconDir 'icon0.png')
+	[KytyTrophies.View]::ShowWindow($form, $v, 'Trophies', $form.Icon)
+	try { Update-TrophySection $false } catch { }
+}
+$btnTrophy.Add_Click({
+	if ($script:trophyViewOk) { try { Show-TrophyWindow; return } catch { } }
+	Update-TrophySection (-not $gTrophy.Visible)
+})
 try { Update-TrophySection $false } catch { }
 function Set-DoubleBufferAll($p) { foreach ($c in @($p.Controls)) { if ($c -is [System.Windows.Forms.Panel] -or $c -is [System.Windows.Forms.GroupBox] -or $c -is [System.Windows.Forms.PictureBox]) { Set-DoubleBuffer $c }; if ($c.Controls.Count) { Set-DoubleBufferAll $c } } }
 Set-DoubleBufferAll $form

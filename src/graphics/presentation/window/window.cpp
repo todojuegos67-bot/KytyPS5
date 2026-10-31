@@ -38,6 +38,7 @@
 #include "debug-snapshot.h"
 #include "perf-overlay.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "libs/trophy-page.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/startupProgress.h"
 #include <cstdlib>
@@ -657,6 +658,10 @@ void WindowContext::ProcessEvent(double time_s) {
 		return;
 	}
 	if (ProcessSystemOverlayInput(*event)) {
+		return;
+	}
+	// (ds-troph) F1: the in-game menu (Volver al juego, Ver trofeos, Cerrar el juego); while open the game gets no input.
+	if (Libs::TrophyPage::HandleEvent(*event)) {
 		return;
 	}
 
