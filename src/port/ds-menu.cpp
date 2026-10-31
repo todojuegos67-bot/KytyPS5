@@ -1019,7 +1019,7 @@ void DrawPcTab(float unit) {
 			}
 			std::thread([] {
 				std::string report;
-				const bool  ok = Steam::AddToSteam(g_rt.exe_path, &report);
+				const bool  ok = Steam::RunAddToSteamScript(g_rt.exe_path, &report) || Steam::AddToSteam(g_rt.exe_path, &report);
 				std::scoped_lock lock(steam_mutex);
 				steam_text = (ok ? "OK: " : "ERROR: ") + report;
 				steam_busy = false;
@@ -2489,7 +2489,7 @@ void LauncherAjustes(Settings& s) {
 			}
 			std::thread([] {
 				std::string report;
-				const bool  ok = Steam::AddToSteam(g_rt.exe_path, &report);
+				const bool  ok = Steam::RunAddToSteamScript(g_rt.exe_path, &report) || Steam::AddToSteam(g_rt.exe_path, &report);
 				std::scoped_lock lock(g_steam_mutex);
 				g_steam_text = (ok ? "OK: " : "ERROR: ") + report;
 				g_steam_busy = false;

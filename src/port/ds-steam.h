@@ -11,6 +11,9 @@
 namespace Port::Steam {
 
 // Spanish text of what was done (or why not); true when at least one Steam user has the shortcut now.
+// (ds-pc-port37) The launcher's button: runs Anadir-a-Steam.cmd beside the exe (the script players use, which works) in
+// its own window. False (report says why) when it is not there or does not start: then AddToSteam below.
+bool RunAddToSteamScript(const std::filesystem::path& exe, std::string* report);
 bool AddToSteam(const std::filesystem::path& exe, std::string* report);
 
 } // namespace Port::Steam

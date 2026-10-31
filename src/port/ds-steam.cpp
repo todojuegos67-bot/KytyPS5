@@ -4,6 +4,7 @@
 #include "stb_image.h"
 
 #include <windows.h>
+#include <shellapi.h>
 #include <wincodec.h>
 
 #include <algorithm>
@@ -212,6 +213,32 @@ bool WriteIcon(const fs::path& ico) {
 }
 
 } // namespace
+
+bool RunAddToSteamScript(const fs::path& exe, std::string* report) {
+	const fs::path  folder = exe.parent_path();
+	const fs::path  cmd    = folder / L"Anadir-a-Steam.cmd";
+	std::error_code ec;
+	if (!fs::exists(cmd, ec)) {
+		*report = "No esta Anadir-a-Steam.cmd junto al exe.";
+		return false;
+	}
+	// Through cmd.exe /c, in a console of its own (the script ends with "pause": its result stays readable).
+	const std::wstring params = L"/c \"\"" + cmd.wstring() + L"\"\"";
+	SHELLEXECUTEINFOW  info {};
+	info.cbSize       = sizeof(info);
+	info.fMask        = SEE_MASK_NOASYNC;
+	info.lpVerb       = L"open";
+	info.lpFile       = L"cmd.exe";
+	info.lpParameters = params.c_str();
+	info.lpDirectory  = folder.c_str();
+	info.nShow        = SW_SHOWNORMAL;
+	if (!ShellExecuteExW(&info)) {
+		*report = "No se pudo abrir Anadir-a-Steam.cmd (error " + std::to_string(GetLastError()) + ").";
+		return false;
+	}
+	*report = "Abierto Anadir-a-Steam.cmd: sigue lo que dice su ventana.";
+	return true;
+}
 
 bool AddToSteam(const fs::path& exe, std::string* report) {
 	std::string& r = *report;
