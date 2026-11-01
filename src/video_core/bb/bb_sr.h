@@ -48,6 +48,8 @@ struct Desc {
     Image depth;  // render size, depth read only
     Image motion; // render size, RG16F pixels towards the previous frame, shader read
     Image output; // upscale size, RGBA16F, GENERAL, storage
+    Image reactive; // render size, R8 0..1: trust the current frame (particles, fire, fog)
+    bool has_reactive = false;
     vk::Extent2D render{};
     vk::Extent2D upscale{};
     float jitter[2]{}; // render pixels, the sub-pixel offset the scene was rasterised with

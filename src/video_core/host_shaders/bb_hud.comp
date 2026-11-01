@@ -21,11 +21,17 @@ layout(binding = 1) uniform sampler2D final_tex;
 layout(binding = 2) uniform sampler2D hudless_tex;
 layout(binding = 3, rgba16f) uniform writeonly image2D out_img;
 layout(std430, binding = 4) buffer Lum {
-    uint sums[4]; // source, output, count
+    uint sums[8]; // luminance source, output, count, 0, saturation source, output
 } lum;
 layout(push_constant) uniform Push {
     uvec4 size; // width, height, decode sRGB at the end (flip read raw, presenter view sRGB), flags
 } p;
+
+float Saturation(vec3 c) {
+    float hi = max(max(c.r, c.g), c.b);
+    float lo = min(min(c.r, c.g), c.b);
+    return hi > 1e-5 ? clamp((hi - lo) / hi, 0.0, 1.0) : 0.0;
+}
 
 vec3 SrgbToLinear(vec3 c) {
     return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));
@@ -66,6 +72,8 @@ void main() {
             atomicAdd(lum.sums[0], uint(Luma(fin) * 65536.0 + 0.5));
             atomicAdd(lum.sums[1], uint(Luma(color) * 65536.0 + 0.5));
             atomicAdd(lum.sums[2], 1u);
+            atomicAdd(lum.sums[4], uint(Saturation(fin) * 65536.0 + 0.5));
+            atomicAdd(lum.sums[5], uint(Saturation(color) * 65536.0 + 0.5));
         }
     }
     imageStore(out_img, c, vec4(color, 1.0));
