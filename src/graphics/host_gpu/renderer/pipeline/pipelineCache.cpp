@@ -4533,9 +4533,9 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 			// (KYTY_HITCH_LOG_MS: a pipeline no cache held, compiled while its draws took another path.)
 			SlowLog::Scope slow([&](double ms) {
 				const auto* pixel = job->ps_active ? job->ps_input_info.stage.program : nullptr;
-				std::printf("SLOW AsyncGraphicsPipeline %.1f ms %s VS=0x%016llx PS=0x%016llx\n", ms, table ? "table" : "native",
+				std::printf("SLOW AsyncGraphicsPipeline %.1f ms %s VS=0x%016llx PS=0x%016llx; %s\n", ms, table ? "table" : "native",
 				            static_cast<unsigned long long>(job->vs_input_info.stage.program->shader_hash),
-				            static_cast<unsigned long long>(pixel != nullptr ? pixel->shader_hash : 0));
+				            static_cast<unsigned long long>(pixel != nullptr ? pixel->shader_hash : 0), LastPipelineStoreOutcome());
 			}, SlowLog::HitchThreshold());
 			CreatePipelineInternal(m_graphics, *job->pipeline, job->rendering, job->vertex_input,
 			                       job->vs_input_info, job->vertex_program,
@@ -4578,10 +4578,10 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	SlowLog::Scope create_slow([&](double ms) {
 		const auto* vs = vs_input_info.stage.program;
 		const auto* ps = ps_active ? ps_input_info->stage.program : nullptr;
-		std::printf("SLOW CreateGraphicsPipeline %.1f ms VS=%llu PS=%llu VS=0x%016llx PS=0x%016llx\n", ms,
+		std::printf("SLOW CreateGraphicsPipeline %.1f ms VS=%llu PS=%llu VS=0x%016llx PS=0x%016llx; %s\n", ms,
 		            static_cast<unsigned long long>(vs_id), static_cast<unsigned long long>(ps_id),
 		            static_cast<unsigned long long>(vs != nullptr ? vs->shader_hash : 0),
-		            static_cast<unsigned long long>(ps != nullptr ? ps->shader_hash : 0));
+		            static_cast<unsigned long long>(ps != nullptr ? ps->shader_hash : 0), LastPipelineStoreOutcome());
 	}, SlowLog::HitchThreshold());
 	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 	// (The render thread's own waits: the slow frame lines' translate/pipeline counts.)
@@ -4676,9 +4676,9 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	SlowLog::Scope create_slow([&](double ms) {
 		const auto* cs = input_info.stage.program;
-		std::printf("SLOW CreateComputePipeline %.1f ms CS=%llu CS=0x%016llx\n", ms,
+		std::printf("SLOW CreateComputePipeline %.1f ms CS=%llu CS=0x%016llx; %s\n", ms,
 		            static_cast<unsigned long long>(compute_program.id),
-		            static_cast<unsigned long long>(cs != nullptr ? cs->shader_hash : 0));
+		            static_cast<unsigned long long>(cs != nullptr ? cs->shader_hash : 0), LastPipelineStoreOutcome());
 	}, SlowLog::HitchThreshold());
 	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 	// (The render thread's own waits: the slow frame lines' translate/pipeline counts.)
@@ -4749,8 +4749,8 @@ PipelineCache::Pipeline* PipelineCache::TryCreateComputePipeline(const ShaderCom
 	m_table_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
 	TableWorkers().Push([this, job] { // (table dispatches' pipelines)
 		SlowLog::Scope slow([&](double ms) {
-			std::printf("SLOW AsyncComputePipeline %.1f ms table CS=0x%016llx\n", ms,
-			            static_cast<unsigned long long>(job->input_info.stage.program->shader_hash));
+			std::printf("SLOW AsyncComputePipeline %.1f ms table CS=0x%016llx; %s\n", ms,
+			            static_cast<unsigned long long>(job->input_info.stage.program->shader_hash), LastPipelineStoreOutcome());
 		}, SlowLog::HitchThreshold());
 		CreatePipelineInternal(m_graphics, *job->pipeline, job->input_info, job->module, TablePipelineCache(),
 		                       PipelineBuild::Full, true);

@@ -1013,6 +1013,9 @@ void BypassCommandHooks(vk::Device device) {
 }
 
 namespace { int SsgiQuality(); }
+// (ds-pc-port41) The title-screen prewarm thread: SsgiEnsure / CShadowEnsure make their pipelines only (no images at a
+// guessed size; the first world frame makes them at the real one).
+thread_local bool t_pipelines_only = false;
 void Initialize() {
 	{
 		const char* ssgi = std::getenv("KYTY_SSGI");
@@ -5019,6 +5022,7 @@ bool SsgiEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		g_ssgi.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
 		g_ssgi.failed    = false;
 	}
+	if (t_pipelines_only) return true; // (ds-pc-port41: the prewarm)
 	if (g_ssgi.out.image.image != nullptr && g_ssgi.render == render && g_ssgi.quality == quality) return true;
 	device.waitIdle();
 	for (auto* img : SsgiAll())
@@ -8612,6 +8616,7 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 		g_cs.period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
 		g_cs.failed    = false;
 	}
+	if (t_pipelines_only) return true; // (ds-pc-port41: the prewarm)
 	if (g_cs.out.image.image != nullptr && g_cs.render == render && g_cs.quality == quality) return true;
 	device.waitIdle();
 	SsgiImage* all[] {&g_cs.raw, &g_cs.tmp_a, &g_cs.tmp_b, &g_cs.out, &g_cs.history[0], &g_cs.history[1], &g_cs.gbuf[0],
@@ -9591,25 +9596,64 @@ int CompositeWritebackMode() {
 }
 } // namespace
 
+void GodraysPrewarm(GraphicContext& graphics);
+void SmokePrewarm(GraphicContext& graphics);
+void DlssNrPrewarm(GraphicContext& graphics);
+
+// (ds-pc-port41) Every local pass's pipelines for the settings in use, on a thread of their own at the first guest flip
+// (the logos / title screen), through the pass disk cache: was at the first Upscale, i.e. the first world frame, racing
+// the passes themselves (11-01 log: SsgiApply 237, RtReflectionsApply 1654, GodraysApply 237, CShadowApply 267,
+// SmokeApply 66, DlssNrApply 427 ms on their first frames). Pipelines only: the images are made at the real size on the
+// first world frame. Each under the pass cache's mutex, which Upscale takes for the passes too (never made twice).
+// The sun pass (CShadow) is left to its first use when it would trace the hardware scene (its variant depends on the
+// TLAS being active then). KYTY_RT_PREWARM=0: on first use, as before.
+void PrewarmLocalPasses(GraphicContext& graphics) {
+	static std::once_flag prewarm;
+	std::call_once(prewarm, [&graphics] {
+		const char* value = std::getenv("KYTY_RT_PREWARM");
+		if (value != nullptr && value[0] == '0') return;
+		std::thread([g = &graphics] {
+			LocalPlatform::SetThreadName("Kyty.RtPrewarm");
+			auto&      graphics = *g;
+			const auto begin    = std::chrono::steady_clock::now();
+			std::string made;
+			const auto timed = [&](const char* name, const auto& run) {
+				const auto t0 = std::chrono::steady_clock::now();
+				run();
+				char text[64];
+				std::snprintf(text, sizeof(text), "%s%s %.0f ms", made.empty() ? "" : ", ", name,
+				              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+				made += text;
+			};
+			t_pipelines_only = true;
+			timed("RT reflections", [&] { RtReflectionsPrewarm(graphics); });
+			timed("HW particles", [&] { HwParticlesPrewarm(graphics); });
+			if (SsgiQuality() > 0)
+				timed("SSGI", [&] {
+					std::lock_guard lock(LocalPassCache::EnsureMutex());
+					(void)SsgiEnsure(graphics, {64, 64}, SsgiQuality());
+				});
+			if (ContactQuality() > 0 && HwShadowLevel() <= 0)
+				timed("sun shadows", [&] {
+					std::lock_guard lock(LocalPassCache::EnsureMutex());
+					(void)CShadowEnsure(graphics, {64, 64}, ContactQuality());
+				});
+			timed("godrays", [&] { GodraysPrewarm(graphics); });
+			timed("smoke", [&] { SmokePrewarm(graphics); });
+			timed("DLSS-NR", [&] { DlssNrPrewarm(graphics); });
+			t_pipelines_only = false;
+			LocalPassCache::Save();
+			std::printf("RT passes: pipelines made at the title screen in %.0f ms (%s; KYTY_RT_PREWARM=0: on first use)\n",
+			            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(), made.c_str());
+			std::fflush(stdout);
+		}).detach();
+	});
+}
+
 bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
-	// (The RT passes' pipelines made beside the title screen, into a cache on disk, not on the world's first flip.
-	// KYTY_RT_PREWARM=0: made where first needed, as before.)
+	// (The local passes' pipelines: PrewarmLocalPasses, from the first guest flip; here too in case none came first.)
 	if (inputs_in.graphics != nullptr) {
-		static std::once_flag prewarm;
-		std::call_once(prewarm, [graphics = inputs_in.graphics] {
-			const char* value = std::getenv("KYTY_RT_PREWARM");
-			if (value != nullptr && value[0] == '0') return;
-			std::thread([graphics] {
-				LocalPlatform::SetThreadName("Kyty.RtPrewarm");
-				const auto begin = std::chrono::steady_clock::now();
-				RtReflectionsPrewarm(*graphics);
-				HwParticlesPrewarm(*graphics);
-				LocalPassCache::Save();
-				std::printf("RT passes: pipelines made beside the game in %.0f ms (KYTY_RT_PREWARM=0: on first use)\n",
-				            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
-				std::fflush(stdout);
-			}).detach();
-		});
+		PrewarmLocalPasses(*inputs_in.graphics);
 		static uint32_t upscales = 0;
 		if (++upscales == 3600) std::thread([] { LocalPassCache::Save(); }).detach(); // (what the flip path made later)
 	}
@@ -9636,6 +9680,8 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 		const UpscaleImage before = inputs.color;
 		if (TimedPass(name, apply)) RtFlicker::Probe(command, inputs.graphics, pass, before, inputs.color);
 	};
+	// (ds-pc-port41) The passes under the pass cache's mutex: never while the title-screen prewarm makes one of theirs.
+	std::unique_lock passes_lock(LocalPassCache::EnsureMutex());
 	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Particles, "HwParticlesApply")
 	probed(RtFlicker::Sun, "CShadowApply", [&] { return CShadowApply(command, inputs); }); // (KYTY_RT_SHADOWS: direct-sun shadows first; inputs.color becomes the composited copy)
 	probed(RtFlicker::Lights, "HwLightsApply", [&] { return HwLightsApply(command, inputs); }); // (KYTY_HWRT_LIGHTS: ray-traced local-light shadows, hw-lights.cpp; nothing when off)

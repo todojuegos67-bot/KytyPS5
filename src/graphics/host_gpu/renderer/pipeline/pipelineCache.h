@@ -548,6 +548,8 @@ bool PipelineKeyLog();
 void ReportStaticStore();
 // Whether the static store gave the last pipeline this thread made (shaders.cpp).
 bool LastPipelineFromStore();
+// (ds-pc-port41) This thread's last pipeline: why the static store did not give it ("" not asked).
+const char* LastPipelineStoreOutcome();
 // The pipeline's handle for a binding now (the GPU thread): the flip noted, and the pipeline made again first when it was
 // evicted (PipelineCache::EvictIdlePipelines).
 vk::Pipeline BindPipelineHandle(const PipelineCache::Pipeline& pipeline);

@@ -1419,4 +1419,12 @@ bool DlssNrPreSr(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	return true;
 }
 
+// (ds-pc-port41) The pipeline made at the title screen on the prewarm thread (frame-gen.cpp PrewarmLocalPasses), under the
+// pass cache's mutex (the flip path takes it too): its first world frame no longer compiles it.
+void DlssNrPrewarm(GraphicContext& graphics) {
+	if (!(DlssNrWanted())) return;
+	std::lock_guard lock(LocalPassCache::EnsureMutex());
+	(void)EnsurePipeline(graphics);
+}
+
 } // namespace Libs::Graphics::FrameGen

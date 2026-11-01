@@ -1679,6 +1679,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->CopyFrom(buffer, image);
 	frame->scene    = FrameGen::TakeScene();
 	frame->fg.valid = false;
+	FrameGen::PrewarmLocalPasses(m_impl->window.graphic_ctx); // (ds-pc-port41: once, at the first guest flip)
 	if (FrameGen::Capturing()) {
 		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(),
 		                        buffer, frame->fg, image_id, image);

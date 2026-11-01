@@ -204,6 +204,8 @@ bool ReplaceTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<
 // by the raw jittered frame's, its alpha (flags later passes read) kept. False: nothing done.
 bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
+// (ds-pc-port41) The local passes' pipelines on a thread of their own, once, from the first guest flip (the title screen).
+void PrewarmLocalPasses(GraphicContext& graphics);
 // Present thread, in the present's command buffer: the HUD-less image scaled to the backbuffer (DLSS-G), into `region`
 // (the presenter's present region) with black around it when that is not the whole backbuffer.
 void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,

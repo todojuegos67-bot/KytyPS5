@@ -752,9 +752,14 @@ void ReportStaticStore() {
 // (KYTY_PIPELINE_SOURCE_LOG) Whether the static cache or store gave this thread's last pipeline, and for a pipeline
 // cache blob: its size and the microseconds of its read, of the cache made of it and of the pipeline's creation.
 static thread_local bool t_static_hit = false;
+// (ds-pc-port41) Why this thread's last pipeline was not made of the static store (its SLOW line names it).
+static thread_local const char* t_store_why = "";
 
 bool LastPipelineFromStore() {
 	return t_static_hit;
+}
+const char* LastPipelineStoreOutcome() {
+	return t_store_why;
 }
 struct BlobTimes {
 	size_t bytes     = 0;
@@ -896,11 +901,15 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 					if (writer != nullptr) writer->Copy(key, *store);
 					if (writer == nullptr) g_binary_outcomes.Count(g_binary_outcomes.hits);
 					t_static_hit = true;
+					t_store_why  = "static store hit";
 					return vk::Result::eSuccess;
 				}
 				if (writer == nullptr) g_binary_outcomes.Refused(result);
+				t_store_why = "static store: the driver refused its binaries";
 			} else if (writer == nullptr && store != nullptr) {
-				g_binary_outcomes.Count(store->Holds(key) ? g_binary_outcomes.damaged : g_binary_outcomes.absent);
+				const bool held = store->Holds(key);
+				g_binary_outcomes.Count(held ? g_binary_outcomes.damaged : g_binary_outcomes.absent);
+				t_store_why = held ? "static store: held, binaries not loadable" : "static store: not among the precompiled (runtime variant)";
 			}
 			if (played != nullptr) {
 				if (const auto binaries = played->Load(key); !binaries.binaries.empty()) {
@@ -916,6 +925,7 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 			if (writer != nullptr) return CapturePipelineBinaries(graphics, pipeline, info, driver_cache, key, create);
 		} else if (writer == nullptr && store != nullptr) {
 			g_binary_outcomes.Count(g_binary_outcomes.unasked);
+			t_store_why = "static store: no driver key";
 		}
 	}
 	// Without pipeline binaries, its own cache data by its identity: a cache made of it gives the pipeline without
