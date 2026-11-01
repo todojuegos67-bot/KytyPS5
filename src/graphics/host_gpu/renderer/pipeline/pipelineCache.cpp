@@ -425,25 +425,70 @@ static bool LoadPlanBytes(const SpilledPlan& in, ShaderRecompiler::IR::ResourceP
 // the GPU and driver, the translator's device features and the translator's own switches; another identity is another
 // folder (the old ones removed). Each record carries the XXH3 of its bytes; a record that does not read back is translated.
 class SpirvDiskStore {
+	// (ds-pc-port45) The length of an older build's header ("KytySpirvDisk1:<git hash>|<revision>|<the rest>\n") whose rest
+	// is this identity's after "tr1|": the same translation, written before the store was keyed on the translator's
+	// version (port37-port44; only translator version 1 takes them). 0: not one. (The identity holds a newline itself.)
+	static size_t LegacyHeader(const std::filesystem::path& path, const std::string& identity) {
+		constexpr std::string_view Prefix = "KytySpirvDisk1:";
+		constexpr std::string_view Ours   = "tr1|";
+		if (!identity.starts_with(Ours)) return 0;
+		std::ifstream in(path, std::ios::binary);
+		std::string   head(256, '\0');
+		in.read(head.data(), static_cast<std::streamsize>(head.size()));
+		head.resize(static_cast<size_t>(in.gcount()));
+		if (!head.starts_with(Prefix)) return 0;
+		const auto first  = head.find('|', Prefix.size());
+		const auto second = first == std::string::npos ? std::string::npos : head.find('|', first + 1);
+		if (second == std::string::npos || head.substr(0, second).find('\n') != std::string::npos) return 0;
+		const std::string expected = head.substr(0, second + 1) + identity.substr(Ours.size()) + "\n";
+		std::string       got(expected.size(), '\0');
+		in.clear();
+		in.seekg(0);
+		if (!in.read(got.data(), static_cast<std::streamsize>(got.size())) || got != expected) return 0;
+		return expected.size();
+	}
+
 public:
 	bool Open(const std::filesystem::path& root, const std::string& identity, const std::string& game) {
 		const auto id   = fmt::format("{:016x}", XXH3_64bits(identity.data(), identity.size()));
 		const auto dir  = root / id;
 		std::error_code ec;
-		// (Other identities: an older build's or driver's translations, never read again.)
+		m_path = dir / (game + ".spv");
+		const std::string header = "KytySpirvDisk1:" + identity + "\n";
+		// (ds-pc-port45) A store of the same translation written by an older build (port37-port44: its identity began with
+		// that build's git hash and revision, so every update threw it away): taken over, its file moved here, its header
+		// accepted as it is.
+		if (!std::filesystem::exists(m_path, ec)) {
+			for (const auto& entry: std::filesystem::directory_iterator(root, ec)) {
+				if (!entry.is_directory(ec) || entry.path().filename() == id) continue;
+				const auto old = entry.path() / (game + ".spv");
+				if (std::filesystem::is_regular_file(old, ec) && LegacyHeader(old, identity) != 0) {
+					std::filesystem::create_directories(dir, ec);
+					std::filesystem::rename(old, m_path, ec);
+					std::printf("Shader prefetch: the disk store of %s taken over (same translator)\n",
+					            Common::PathToString(entry.path().filename()).c_str());
+					break;
+				}
+			}
+		}
+		// (Other identities: another translator's, driver's or GPU's translations, never read again.)
 		for (const auto& entry: std::filesystem::directory_iterator(root, ec))
 			if (entry.is_directory(ec) && entry.path().filename() != id) std::filesystem::remove_all(entry.path(), ec);
 		std::filesystem::create_directories(dir, ec);
-		m_path = dir / (game + ".spv");
-		const std::string header = "KytySpirvDisk1:" + identity + "\n";
 		uint64_t          size   = std::filesystem::exists(m_path, ec) ? std::filesystem::file_size(m_path, ec) : 0;
 		bool              fresh  = true;
+		size_t header_len = 0;
 		if (size >= header.size()) {
 			std::ifstream in(m_path, std::ios::binary);
 			std::string   got(header.size(), '\0');
-			if (in.read(got.data(), static_cast<std::streamsize>(got.size())) && got == header) {
+			if (in.read(got.data(), static_cast<std::streamsize>(got.size())) && got == header) header_len = header.size();
+		}
+		if (header_len == 0 && size > 0) header_len = LegacyHeader(m_path, identity);
+		if (header_len != 0) {
+			std::ifstream in(m_path, std::ios::binary);
+			{
 				fresh       = false;
-				uint64_t at = header.size();
+				uint64_t at = header_len;
 				for (;;) {
 					uint64_t key = 0, hash = 0;
 					uint32_t len = 0;
@@ -514,9 +559,14 @@ private:
 	uint64_t                              m_end = 0;
 };
 
+// (ds-pc-port45) The translator's version: the SPIR-V store is keyed on it, not on the build. Bump it whenever a change
+// makes the shader recompiler (graphics/shader/recompiler, the resource plans, the prefetch's records) translate any
+// program differently; builds that leave the translation alone keep every translation already on disk.
+static constexpr uint32_t SpirvTranslatorVersion = 1;
+
 // Everything the translation of a program depends on besides its inputs (SpirvDiskStore's identity).
 static std::string SpirvDiskIdentity(const std::string& prefetch_identity) {
-	std::string id = fmt::format("{}|{}|{}|{:08x}|{}", KYTY_GIT_HASH, KYTY_GIT_REVISION, prefetch_identity,
+	std::string id = fmt::format("tr{}|{}|{:08x}|{}", SpirvTranslatorVersion, prefetch_identity,
 	                             ShaderRecompiler::Frontend::TranslatorDeviceFeatures(), ShaderRecompiler::IR::PortableShaders() ? 1 : 0);
 	// (The translator's own switches: graphics/shader reads these.)
 	for (const char* name: {"KYTY_LANE_LOCAL", "KYTY_LANE_LOCAL_COOP_RANGE", "KYTY_LANE_LOCAL_COOP_SKIP", "KYTY_LANE_LOCAL_UNIFORM_LOADS",

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <fstream>
 #include <iterator>
@@ -261,6 +262,45 @@ void RememberHints() {
 	if (store.empty()) return;
 	std::ofstream(fs::path(store.wstring() + L".hints-sum"), std::ios::binary) << HintsSum();
 }
+// (ds-pc-port45) This PC's recorded play (warmup-v2's <id>.shaders, recorded-<id>.seeds) when the static store was last
+// current: its bytes. The store's 63,849 pipelines against the emulator's 73,959 on the same PC (11-01): the port's
+// precompile ran on a new install, before any play was recorded (the release's hints alone, no hinted seeds), and was
+// never run again as play recorded the runtime variants (its specializations: the "not among the precompiled" ones).
+uint64_t RecordedBytes() {
+	uint64_t        total = 0;
+	std::error_code ec;
+	for (const auto& dir: fs::directory_iterator(g_setup.root / L"_PipelineCache" / L"warmup-v2", ec)) {
+		const fs::path f = dir.path() / Wide(g_setup.id + ".shaders");
+		if (fs::is_regular_file(f, ec)) total += fs::file_size(f, ec);
+	}
+	const fs::path manual = g_setup.root / Wide("recorded-" + g_setup.id + ".seeds");
+	if (fs::is_regular_file(manual, ec)) total += fs::file_size(manual, ec);
+	return total;
+}
+fs::path RecordedSumFile() {
+	const fs::path store = StoreFile();
+	return store.empty() ? fs::path {} : fs::path(store.wstring() + L".recorded-sum");
+}
+void RememberRecorded() {
+	if (const auto f = RecordedSumFile(); !f.empty()) std::ofstream(f, std::ios::binary) << RecordedBytes();
+}
+// New recorded play since the store was made (2 % more and at least 256 KiB, or none noted while some exists): the
+// precompile runs again, with it as hints (what the store holds is copied, not compiled again).
+bool RecordedPlayGrew() {
+	const auto f = RecordedSumFile();
+	if (f.empty()) return false;
+	const uint64_t now = RecordedBytes();
+	if (now == 0) return false;
+	const std::string saved = ReadAll(f);
+	const uint64_t    then  = saved.empty() ? 0 : std::strtoull(saved.c_str(), nullptr, 10);
+	const bool        grew  = now > then && (then == 0 || (now - then >= (256u << 10u) && (now - then) * 50 >= then));
+	if (grew)
+		std::printf("[port] precompile: this PC's recorded play grew (%llu -> %llu bytes): its variants into the static store\n",
+		            static_cast<unsigned long long>(then), static_cast<unsigned long long>(now));
+	std::fflush(stdout);
+	return grew;
+}
+
 void KeepStoreCurrentForSameHints() {
 	const fs::path store = StoreFile(), hints = HintsFile();
 	std::error_code ec;
@@ -646,6 +686,7 @@ void Work() {
 	fs::remove_all(resume_dir, ec);
 	fs::remove_all(g_nvidia, ec);
 	RememberHints();
+	RememberRecorded(); // (ds-pc-port45: the recorded play this store holds)
 	RemoveOldWarmedCache();
 	std::scoped_lock lock(g_mutex);
 	g_view.running  = false;
@@ -708,9 +749,11 @@ bool CacheCurrent() {
 	// (ds-pc-port37) Current as the launcher's: the static store is this GPU's and driver's and not older than the seeds.
 	const int code = RunOne("precompile-status", L"--seeds " + Quote(g_setup.seeds) + L" --status");
 	const std::string text = ReadAll(g_logs / L"precompile-status.out.log");
-	const bool current = code == 0 && text.find("static cache current") != std::string::npos;
+	bool current = code == 0 && text.find("static cache current") != std::string::npos;
+	if (current && RecordedPlayGrew()) current = false; // (ds-pc-port45)
 	if (current) {
 		RememberHints(); // (for the next update: its hints compared by content)
+		RememberRecorded();
 		RemoveOldWarmedCache();
 	}
 	return current;
