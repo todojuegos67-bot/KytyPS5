@@ -171,7 +171,17 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	// The guest threads' fault tax in time ([fps+] fault_*_ns): what each kind costs the game's own threads.
+	struct FaultTimer {
+		LiveCounters::Id                      id    = LiveCounters::FaultReadNs;
+		std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+		~FaultTimer() {
+			LiveCounters::Add(id, static_cast<uint64_t>(
+			                          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+		}
+	} fault_timer;
 	if (access == PageFaultAccess::Write) {
+		fault_timer.id = LiveCounters::FaultWriteNs;
 		// A never-written granule's first write (fresh memory): unwatched, done unless another watcher holds the page.
 		if (FreshFirstWrite(fault_vaddr)) {
 			uint64_t first = 0, end = 0;
@@ -182,6 +192,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		// writable.)
 		const bool in_remap = LibKernel::Memory::InRemapWindow(fault_vaddr);
 		if (TryInvalidateCpuWriteWindow(fault_vaddr)) {
+			fault_timer.id = LiveCounters::FaultWindowNs;
 			LiveCounters::Add(LiveCounters::WindowFault);
 			if (FaultStatsOn()) NoteFault(fault_vaddr, 0);
 			if (in_remap) LiveCounters::Add(LiveCounters::RemapWindowWrites);

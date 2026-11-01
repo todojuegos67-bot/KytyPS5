@@ -2356,6 +2356,8 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	BufferFlush();
 
+	// (Time blocked here is neither idle nor work: the flip/present cadence holding the game, e.g. frame generation.)
+	LiveCounters::ScopedUs flip_wait(LiveCounters::FlipDoneWaitUs);
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
 }
