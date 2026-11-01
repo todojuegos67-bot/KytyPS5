@@ -92,6 +92,12 @@ void ToggleShaderThreads(bool running) {
 }
 std::atomic<bool>        g_open {false};
 std::atomic<bool>        g_trophy_page {false};      // (port34) F1 > Ver trofeos is shown (window and present threads)
+// (ds-pc-port37) F1 > Mapear mando / Teclado y raton: the page shown (0 none, 1 pad mapper, 2 keyboard and mouse), and a
+// key or mouse button being captured for a binding (the window thread writes its SDL name; Esc cancels).
+std::atomic<int>         g_f1_page {0};
+std::atomic<bool>        g_kbm_capture {false};
+std::mutex               g_capture_mutex;
+std::string              g_captured; // "" while waiting; "\x1b" cancelled
 std::atomic<bool>        g_focus_trophy_btn_request {false}; // (port34) window thread: back from it, focus its button
 int                      g_trophy_tab_delta = 0;     // (port34) present thread: L1/R1, Q/E on the trophy page
 bool                     g_focus_trophy_btn = false;
@@ -228,7 +234,21 @@ bool OnEvent(const SDL_Event& e) {
 				return true;
 			}
 			if (!open) return false;
+			if (g_kbm_capture.load() && e.key.repeat == 0) {
+				// (ds-pc-port37) A key for a binding: its SDL name (what KYTY_KBM_MAP reads), Esc cancels.
+				std::scoped_lock lock(g_capture_mutex);
+				const SDL_Keycode k = e.key.keysym.sym;
+				g_captured = k == SDLK_ESCAPE ? std::string("\x1b") : std::string(SDL_GetKeyName(k));
+				if (g_captured.empty()) g_captured = "\x1b";
+				g_kbm_capture = false;
+				Bump();
+				return true;
+			}
 			if (e.key.keysym.sym == SDLK_ESCAPE && e.key.repeat == 0) {
+				if (g_f1_page.exchange(0) != 0) {
+					Bump();
+					return true;
+				}
 				if (g_trophy_page.exchange(false)) {
 					g_focus_trophy_btn_request = true;
 					Bump();
@@ -306,12 +326,28 @@ bool OnEvent(const SDL_Event& e) {
 		case SDL_MOUSEBUTTONDOWN:
 		case SDL_MOUSEBUTTONUP:
 			if (!open) return false;
+			if (g_kbm_capture.load() && e.type == SDL_MOUSEBUTTONDOWN) {
+				const char* b = e.button.button == SDL_BUTTON_LEFT ? "Mouse:Left" : e.button.button == SDL_BUTTON_RIGHT ? "Mouse:Right"
+				              : e.button.button == SDL_BUTTON_MIDDLE ? "Mouse:Middle" : e.button.button == SDL_BUTTON_X1 ? "Mouse:X1" : "Mouse:X2";
+				std::scoped_lock lock(g_capture_mutex);
+				g_captured    = std::string((SDL_GetModState() & KMOD_SHIFT) != 0 ? "Shift+" : "") + b;
+				g_kbm_capture = false;
+				Bump();
+				return true;
+			}
 			Queue({Input::MousePos, 0, false, static_cast<float>(e.button.x), static_cast<float>(e.button.y)});
 			Queue({Input::MouseButton, e.button.button == SDL_BUTTON_RIGHT ? 1 : (e.button.button == SDL_BUTTON_MIDDLE ? 2 : 0),
 			       e.type == SDL_MOUSEBUTTONDOWN});
 			return e.type == SDL_MOUSEBUTTONDOWN;
 		case SDL_MOUSEWHEEL:
 			if (!open) return false;
+			if (g_kbm_capture.load() && e.wheel.y != 0) {
+				std::scoped_lock lock(g_capture_mutex);
+				g_captured    = e.wheel.y > 0 ? "Mouse:WheelUp" : "Mouse:WheelDown";
+				g_kbm_capture = false;
+				Bump();
+				return true;
+			}
 			Queue({Input::Wheel, 0, false, static_cast<float>(e.wheel.x), static_cast<float>(e.wheel.y)});
 			return true;
 		default: return false;
@@ -4021,11 +4057,227 @@ bool Draw(float width, float height, float unit) {
 
 } // namespace TrophyPage
 
+
+// ---- (ds-pc-port37) F1 > Mapear mando and F1 > Teclado y raton: pages of the in-game menu (as Ver trofeos). ----
+namespace F1Pages {
+ImTextureData* g_mouse = nullptr;
+ImGuiContext*  g_mouse_ctx = nullptr;
+int            g_mouse_w = 0, g_mouse_h = 0;
+bool           g_mouse_tried = false;
+void LoadMouse() {
+	if (g_mouse != nullptr && g_mouse_ctx != ImGui::GetCurrentContext()) g_mouse = nullptr, g_mouse_tried = false;
+	if (g_mouse_tried) return;
+	g_mouse_tried = true;
+	std::ifstream in(g_rt.exe_path.parent_path() / L"raton.png", std::ios::binary);
+	const std::string bytes {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+	int   channels = 0;
+	auto* px = bytes.empty() ? nullptr
+	                         : stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()), static_cast<int>(bytes.size()), &g_mouse_w,
+	                                                 &g_mouse_h, &channels, 4);
+	if (px == nullptr) return;
+	g_mouse = IM_NEW(ImTextureData)();
+	g_mouse->Create(ImTextureFormat_RGBA32, g_mouse_w, g_mouse_h);
+	std::memcpy(g_mouse->GetPixels(), px, static_cast<size_t>(g_mouse_w) * g_mouse_h * 4);
+	g_mouse->UseColors = true;
+	stbi_image_free(px);
+	ImGui::RegisterUserTexture(g_mouse);
+	g_mouse_ctx = ImGui::GetCurrentContext();
+}
+
+constexpr const char* kKbmDefault =
+    "LeftStickUp=W;LeftStickDown=S;LeftStickLeft=A;LeftStickRight=D;Walk=Left Ctrl;R1=Mouse:Left;L1=Mouse:Right;R2=Shift+Mouse:Left;"
+    "L2=Shift+Mouse:Right;R3=Mouse:Middle;R3=Mouse:WheelUp;R3=Mouse:WheelDown;Circle=Space;Square=E;Cross=F;Triangle=G;Left=Q;Right=R;"
+    "Up=1;Down=2;Left=3;Right=4;Options=Tab;TouchPad=Backspace";
+const char* ControlName(const std::string& c) {
+	static const std::pair<const char*, const char*> names[] = {
+	    {"LeftStickUp", "Mover adelante"}, {"LeftStickDown", "Mover atrás"}, {"LeftStickLeft", "Mover a la izquierda"},
+	    {"LeftStickRight", "Mover a la derecha"}, {"Walk", "Andar (media velocidad)"}, {"R1", "R1 (ataque)"}, {"L1", "L1 (bloquear)"},
+	    {"R2", "R2 (ataque fuerte)"}, {"L2", "L2 (parry / fuerte izq.)"}, {"R3", "R3 (fijar objetivo)"}, {"Circle", "Círculo (rodar / atrás)"},
+	    {"Square", "Cuadrado (usar objeto)"}, {"Cross", "Cruz (interactuar)"}, {"Triangle", "Triángulo (dos manos)"},
+	    {"Left", "Izquierda (cambiar mano izq.)"}, {"Right", "Derecha (cambiar mano der.)"}, {"Up", "Arriba (cambiar magia)"},
+	    {"Down", "Abajo (cambiar objeto)"}, {"Options", "Options (menú)"}, {"TouchPad", "Panel táctil"}};
+	for (const auto& [k, v]: names)
+		if (c == k) return I18n::T(v);
+	return c.c_str();
+}
+std::string KeyText(const std::string& k) {
+	if (k.empty() || k == "None") return I18n::T("(sin asignar)");
+	std::string pre, key = k;
+	if (key.rfind("Shift+", 0) == 0) pre = std::string(I18n::T("Mayús + ")), key = key.substr(6);
+	static const std::pair<const char*, const char*> names[] = {
+	    {"Mouse:Left", "Clic izquierdo"}, {"Mouse:Right", "Clic derecho"}, {"Mouse:Middle", "Clic central"}, {"Mouse:X1", "Botón lateral 1"},
+	    {"Mouse:X2", "Botón lateral 2"}, {"Mouse:WheelUp", "Rueda arriba"}, {"Mouse:WheelDown", "Rueda abajo"}, {"Space", "Espacio"},
+	    {"Left Ctrl", "Ctrl izq."}, {"Left Shift", "Mayús izq."}, {"Left Alt", "Alt izq."}, {"Backspace", "Retroceso"}, {"Return", "Intro"}};
+	for (const auto& [a, b]: names)
+		if (key == a) return pre + I18n::T(b);
+	return pre + key;
+}
+
+std::vector<std::pair<std::string, std::string>> g_rows; // (control, key) being edited
+int  g_capture_row = -1;
+bool g_loaded      = false;
+std::string g_note;
+
+void SaveNow() {
+	Settings on_disk;
+	if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_saved;
+	on_disk.pad_map    = g_edit.pad_map;
+	on_disk.kbm        = g_edit.kbm;
+	on_disk.kbm_sens   = g_edit.kbm_sens;
+	on_disk.kbm_antidz = g_edit.kbm_antidz;
+	on_disk.kbm_camera = g_edit.kbm_camera;
+	on_disk.kbm_warp   = g_edit.kbm_warp;
+	on_disk.kbm_map    = g_edit.kbm_map;
+	g_note = SaveSettings(g_rt.ini_path, on_disk) ? I18n::T("Guardado en settings.ini. Se aplica al reiniciar el juego.") : I18n::T("No se pudo guardar settings.ini");
+	g_saved.pad_map = on_disk.pad_map, g_saved.kbm = on_disk.kbm, g_saved.kbm_sens = on_disk.kbm_sens, g_saved.kbm_antidz = on_disk.kbm_antidz;
+	g_saved.kbm_camera = on_disk.kbm_camera, g_saved.kbm_warp = on_disk.kbm_warp, g_saved.kbm_map = on_disk.kbm_map;
+}
+
+// Both pages: a centred window; false when the page closes.
+bool Begin(const char* title, float width, float height, float unit) {
+	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, 160));
+	ImGui::SetNextWindowPos({width * 0.5f, height * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
+	ImGui::SetNextWindowSize({std::min(width * 0.94f, 1500 * unit), std::min(height * 0.92f, 980 * unit)}, ImGuiCond_Always);
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.03f, 0.035f, 0.96f});
+	ImGui::Begin(title, nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+	ImGui::TextColored(kGold, "%s", I18n::T(title));
+	ImGui::Separator();
+	return true;
+}
+bool Footer(float unit) {
+	ImGui::Separator();
+	bool close = false;
+	if (ImGui::Button(I18n::T("Guardar"), {220 * unit, 46 * unit})) SaveNow();
+	ImGui::SameLine();
+	if (g_saved.pad_map != g_rt.launched.pad_map || g_saved.kbm != g_rt.launched.kbm || g_saved.kbm_map != g_rt.launched.kbm_map ||
+	    g_saved.kbm_sens != g_rt.launched.kbm_sens || g_saved.kbm_antidz != g_rt.launched.kbm_antidz ||
+	    g_saved.kbm_camera != g_rt.launched.kbm_camera || g_saved.kbm_warp != g_rt.launched.kbm_warp) {
+		if (ImGui::Button(I18n::T("Reiniciar ahora"), {220 * unit, 46 * unit})) RequestRestart();
+		ImGui::SameLine();
+	}
+	if (ImGui::Button(I18n::T("Volver"), {220 * unit, 46 * unit})) close = true;
+	if (!g_note.empty()) {
+		ImGui::SameLine();
+		ImGui::TextColored(kDim, "%s", g_note.c_str());
+	}
+	ImGui::End();
+	ImGui::PopStyleColor();
+	return !close;
+}
+
+bool DrawPad(float width, float height, float unit) {
+	Begin("Mapear mando", width, height, unit);
+	ImGui::BeginChild("##padpage", {0, -64 * unit});
+	(void)PadMap::Draw(g_edit, unit);
+	ImGui::EndChild();
+	return Footer(unit);
+}
+
+bool DrawKbm(float width, float height, float unit) {
+	if (!g_loaded) {
+		g_rows.clear();
+		const std::string map = g_edit.kbm_map.empty() ? std::string(kKbmDefault) : g_edit.kbm_map;
+		size_t at = 0;
+		while (at <= map.size()) {
+			const size_t end  = std::min(map.find(';', at), map.size());
+			const auto   item = map.substr(at, end - at);
+			at                = end + 1;
+			const size_t eq   = item.find('=');
+			if (eq != std::string::npos) g_rows.emplace_back(item.substr(0, eq), item.substr(eq + 1));
+		}
+		g_loaded = true;
+	}
+	LoadMouse();
+	Begin("Teclado y ratón", width, height, unit);
+	ImGui::BeginChild("##kbmpage", {0, -64 * unit});
+	ImGui::Checkbox(I18n::T("Jugar con teclado y ratón"), &g_edit.kbm);
+	ImGui::TextWrapped("%s", I18n::T("WASD para moverse, el ratón mueve la cámara, clic izquierdo R1, clic derecho L1, rueda o clic central fija objetivo. F7 suelta o captura el ratón. Si juegas con mando, déjalo desactivado."));
+	ImGui::BeginDisabled(!g_edit.kbm);
+	ImGui::SetNextItemWidth(420 * unit);
+	ImGui::SliderFloat(I18n::T("Sensibilidad del ratón"), &g_edit.kbm_sens, 0.05f, 4.0f, "%.2f");
+	ImGui::SetNextItemWidth(420 * unit);
+	ImGui::SliderFloat(I18n::T("Antizona muerta"), &g_edit.kbm_antidz, 0.0f, 0.5f, "%.2f");
+	ImGui::SetNextItemWidth(420 * unit);
+	ImGui::SliderInt(I18n::T("Velocidad de cámara (ratón)"), &g_edit.kbm_camera, 5, 15);
+	ImGui::Checkbox(I18n::T("Cámara instantánea (frame warp)"), &g_edit.kbm_warp);
+	if (g_mouse != nullptr) {
+		const float h = 200 * unit, w = h * g_mouse_w / std::max(1, g_mouse_h);
+		const ImVec2 at = {ImGui::GetWindowPos().x + ImGui::GetWindowWidth() - w - 24 * unit, ImGui::GetWindowPos().y + 8 * unit};
+		ImGui::GetWindowDrawList()->AddImage(g_mouse->GetTexRef(), at, {at.x + w, at.y + h});
+	}
+	ImGui::Spacing();
+	ImGui::TextColored(kGold, "%s", I18n::T("Teclas"));
+	// A captured key or button for the row waiting.
+	{
+		std::scoped_lock lock(g_capture_mutex);
+		if (g_capture_row >= 0 && !g_kbm_capture.load() && !g_captured.empty()) {
+			if (g_captured != "\x1b" && g_capture_row < static_cast<int>(g_rows.size())) {
+				// A key does one thing: another row with it is left without one (the launcher's rule).
+				for (auto& r: g_rows)
+					if (r.second == g_captured) r.second = "None";
+				g_rows[g_capture_row].second = g_captured;
+			}
+			g_captured.clear();
+			g_capture_row = -1;
+		}
+	}
+	if (ImGui::BeginTable("##kbmkeys", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+		for (int i = 0; i < static_cast<int>(g_rows.size()); i++) {
+			ImGui::PushID(i);
+			ImGui::TableNextRow();
+			ImGui::TableSetColumnIndex(0);
+			ImGui::TextUnformatted(ControlName(g_rows[i].first));
+			ImGui::TableSetColumnIndex(1);
+			if (g_capture_row == i) ImGui::TextColored(kWarn, "%s", I18n::T("Pulsa una tecla o un botón del ratón (Esc: cancelar)"));
+			else ImGui::TextColored(kGold, "%s", KeyText(g_rows[i].second).c_str());
+			ImGui::TableSetColumnIndex(2);
+			if (ImGui::SmallButton(I18n::T("Cambiar")) && g_capture_row < 0) {
+				std::scoped_lock lock(g_capture_mutex);
+				g_captured.clear();
+				g_capture_row = i;
+				g_kbm_capture = true;
+			}
+			ImGui::SameLine();
+			if (ImGui::SmallButton(I18n::T("Quitar"))) g_rows[i].second = "None";
+			ImGui::PopID();
+		}
+		ImGui::EndTable();
+	}
+	if (ImGui::Button(I18n::T("Teclas de serie"))) {
+		g_edit.kbm_map.clear();
+		g_loaded = false;
+	}
+	ImGui::EndDisabled();
+	ImGui::EndChild();
+	// The rows as KYTY_KBM_MAP (the defaults: empty).
+	if (g_loaded) {
+		std::string map;
+		for (const auto& [c, k]: g_rows) map += (map.empty() ? "" : ";") + c + "=" + k;
+		g_edit.kbm_map = map == kKbmDefault ? std::string() : map;
+	}
+	const bool open = Footer(unit);
+	if (!open) {
+		g_kbm_capture = false;
+		g_capture_row = -1;
+		g_loaded      = false;
+	}
+	return open;
+}
+} // namespace F1Pages
+
 // (ds-pc-port8) In the game: F1's save and quit, a panel in the middle of the screen until the game closes.
 void DrawInGameMenu(float width, float height) {
 	DrainInputs();
 	const float unit = std::max(std::min(width / 1920.0f, height / 1080.0f), 0.5f);
 	ImGui::GetIO().MouseDrawCursor = true;
+	if (const int page = g_f1_page.load(); page != 0) {
+		const bool open = page == 1 ? F1Pages::DrawPad(width, height, unit) : F1Pages::DrawKbm(width, height, unit);
+		if (!open) {
+			g_f1_page = 0;
+			F1Pages::g_note.clear();
+		}
+		return;
+	}
 	if (g_trophy_page.load()) {
 		if (!TrophyPage::Draw(width, height, unit)) {
 			g_trophy_page      = false;
@@ -4068,7 +4320,9 @@ void DrawInGameMenu(float width, float height) {
 		g_trophy_page = true;
 		Bump();
 	}
-	if (ImGui::Button(I18n::T("Cerrar el juego"), bs)) {
+	if (ImGui::Button(I18n::T("Mapear mando"), bs)) g_f1_page = 1;
+	if (ImGui::Button(I18n::T("Teclado y ratón"), bs)) g_f1_page = 2;
+		if (ImGui::Button(I18n::T("Cerrar el juego"), bs)) {
 		// Just closes: nothing saved, nothing skipped (the game's own saves are already on disk).
 #if defined(_WIN32)
 		ExitProcess(0);

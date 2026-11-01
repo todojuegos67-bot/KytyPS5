@@ -259,7 +259,7 @@ jobs:
             # (ds-pc-port8) The launcher's background (the key art with the logo). (ds-pc-port9: no TU EQUIPO card, no knight.)
             Copy-Item fondo-launcher.jpg $out
             # (ds-pc-port37) The pad mapper's drawings (F1 / launcher > Controles > Mapear mando), as the emulator launcher's.
-            Copy-Item mando-ps5.png, mando-8bitdo.png $out
+            Copy-Item mando-ps5.png, mando-8bitdo.png, raton.png $out
             # (ds-pc-port37) Metricas: the emulator launcher's window (metricas.ps1), started by the port at JUGAR.
             Copy-Item metricas.ps1 $out
             Copy-Item resources\settings.ini "$out\settings.ini"
