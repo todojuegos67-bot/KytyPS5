@@ -10,7 +10,7 @@ upscaler. The code is in `src/video_core/bb/`. It reuses the Demon's Souls fork'
 |---|---|---|
 | `BB_UPSCALER` | `off`, `native`, `dlss`, `dlaa`, `xess`, `fsr3`, `fsr4` | `off` |
 | `BB_UPSCALE_MODE` | `native` (DLAA/AA, 1.0), `ultraquality+` (XeSS 1.3), `ultraquality` (XeSS 1.5), `quality` (1.5, XeSS 1.7), `balanced` (1.72, XeSS 2.0), `performance` (2.0, XeSS 2.3), `ultraperf` (3.0), `drs` (FSR 4 dynamic model) | `quality` |
-| `BB_UPSCALE_SHARPNESS` | 0..1 (FSR 3.1 / FSR 4 RCAS) | `0.3` |
+| `BB_UPSCALE_SHARPNESS` (alias `BB_SHARPNESS`) | 0..1: FSR 3.1 / FSR 4 RCAS; after DLSS / DLAA / XeSS the presenter runs RCAS (attenuation (1-s)*2) | `0.3` |
 | `BB_UPSCALE_JITTER` | `0` / `1`: sub-pixel viewport jitter on the scene passes (only while a camera is found) | `1` |
 | `BB_MV` | `reconstruct` (from depth plus camera) / `zero` | `reconstruct` |
 | `BB_UPSCALE_AT` | `auto`, `scene` (HDR before post-processing), `composite` (where render size changes to output size) | `auto` |

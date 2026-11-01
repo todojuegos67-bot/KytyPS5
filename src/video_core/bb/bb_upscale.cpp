@@ -180,7 +180,7 @@ Config ParseConfig() {
             c.quality = SR::Quality::Dynamic;
         }
     }
-    if (const char* s = Env("BB_UPSCALE_SHARPNESS")) {
+    if (const char* s = Env("BB_UPSCALE_SHARPNESS") ? Env("BB_UPSCALE_SHARPNESS") : Env("BB_SHARPNESS")) {
         c.sharpness = std::clamp(static_cast<float>(std::atof(s)), 0.0f, 1.0f);
     }
     if (const char* s = Env("BB_UPSCALE_JITTER")) {
@@ -1742,12 +1742,14 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     } else {
         g_learned.have_prev_vp = false;
     }
+    const bool prev_injected = g_learned.last_injected;
     g_learned.last_injected = f.injected;
     // The scene was drawn but no HUD point was found (no HUD this frame, e.g. a cut scene): the
     // presenter upscales the finished image instead (TakeLateUpscale).
     g_late_upscale = false;
     if (PresentMode() && !f.injected && !f.inject_failed && f.gb_depth != 0 &&
         f.gb_w == width && f.gb_h == height && f.qual_samples > g_learned.skip) {
+        g_learned.last_injected = prev_injected;
         FillPresentPlan(addr, "at present (no HUD draw found this frame)");
         g_late_upscale = true;
         f.injected = true;

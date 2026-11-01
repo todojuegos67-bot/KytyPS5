@@ -288,7 +288,7 @@ void ReadStageTimestamps() {
             g_bb.stage_queries, slot * 8, 7, sizeof(data), data.data(), sizeof(u64) * 2,
             vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
         const u8 mask = g_bb.stage_written[slot];
-        bool ready = result == vk::Result::eSuccess;
+        bool ready = result == vk::Result::eSuccess || result == vk::Result::eNotReady;
         for (u32 i = 0; i < 7 && ready; ++i) {
             ready = !(mask & (1u << i)) || data[i * 2 + 1] != 0;
         }
