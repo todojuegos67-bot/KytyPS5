@@ -4582,7 +4582,11 @@ void Start() {
 #if defined(_WIN32)
 				       nv, cpu,
 #endif
-				       idle0, total0); // (ds-pc-port43: no Bump: redrawn with the game's own frames)
+				       idle0, total0);
+				// (ds-pc-port45) The revision moves again, so the game's own frames redraw the panel with the new values (port43
+				// dropped this Bump: the panel stopped updating). An idle vblank still does not re-present for it: the
+				// presenter's refresh_revision counts the port's revision only while its menu is open (systemOverlay.cpp).
+				Bump();
 			}
 			std::this_thread::sleep_for(std::chrono::seconds(1));
 		}
