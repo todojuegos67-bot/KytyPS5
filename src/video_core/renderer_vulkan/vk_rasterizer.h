@@ -62,7 +62,8 @@ public:
     // the slot's own images (the game reuses its own before the frame is presented), the camera
     // and jitter of its upscale; and the upscaled image before the HUD at the output size (the
     // composite without the HUD) when the window-size path presented it. False: not a 3D frame.
-    bool BBFrameGenCapture(u32 slot, BB::FG::Inputs& out, vk::ImageView& hudless_view);
+    bool BBFrameGenCapture(u32 slot, BB::FG::Inputs& out, vk::ImageView& hudless_view,
+                           vk::Format view_format);
 
     void Draw(bool is_indexed, u32 index_offset = 0);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,

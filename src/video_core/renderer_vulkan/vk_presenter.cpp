@@ -875,8 +875,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // its image without the HUD through the same passes (FSR / sharpening and post-processing).
     frame->fg = {};
     if (vk::ImageView fg_source{};
-        BB::FG::WantInputs() && rasterizer->BBFrameGenCapture(frame->id, frame->fg, fg_source) &&
-        bb_presented && fg_source && EnsureFgHudless(frame)) {
+        BB::FG::WantInputs() &&
+        rasterizer->BBFrameGenCapture(frame->id, frame->fg, fg_source, view_info.format) &&
+        fg_source && EnsureFgHudless(frame)) {
         const auto fg_cmd = draw_scheduler.CommandBuffer();
         const vk::MemoryBarrier2 war{
             .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader |

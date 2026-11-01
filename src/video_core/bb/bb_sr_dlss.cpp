@@ -7,6 +7,7 @@
 // through it and it adds what DLSS needs. The DLSS-G, Reflex and PCL plugins load too (DLSS-G stays
 // off): the Demon's Souls fork found the device creation failing with the DLSS plugin alone, and
 // phase 2 (frame generation) needs them.
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -65,6 +66,8 @@ bool g_ready = false;
 std::wstring g_interposer;
 uint32_t g_refusals = 0;
 HMODULE g_module = nullptr;
+std::atomic<uint32_t> g_frame_counter{0};
+std::atomic<uint32_t> g_last_frame{0};
 
 // The Demon's Souls fork's LocalPlatform::IsNvidiaSigned: a valid Authenticode signature whose
 // signer is "NVIDIA Corporation" (Streamline then checks its plugins' signatures itself).
@@ -373,6 +376,14 @@ bool Loaded() {
     return g_loaded;
 }
 
+uint32_t NextFrameIndex() {
+    return g_frame_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+uint32_t LastFrameIndex() {
+    return g_last_frame.load(std::memory_order_relaxed);
+}
+
 void* Proc(const char* name) {
     return g_loaded && g_module != nullptr
                ? reinterpret_cast<void*>(GetProcAddress(g_module, name))
@@ -503,8 +514,11 @@ bool Evaluate(const Desc& desc) {
         options_quality = desc.quality;
         options_hdr = desc.hdr;
     }
-    static uint32_t frame = 0;
-    ++frame;
+    // One frame index stream for every Streamline feature (DLSS and DLSS-G): its frame-based
+    // tagging and Reflex / PCL follow it, two counters interleaved made DLSS-G read another
+    // frame's constants.
+    uint32_t frame = NextFrameIndex();
+    g_last_frame.store(frame, std::memory_order_relaxed);
     sl::FrameToken* token = nullptr;
     if (g_api.get_new_frame_token(token, &frame) != sl::Result::eOk || token == nullptr) {
         return false;
@@ -620,6 +634,12 @@ bool Manual() {
 }
 bool Loaded() {
     return false;
+}
+uint32_t NextFrameIndex() {
+    return 0;
+}
+uint32_t LastFrameIndex() {
+    return 0;
 }
 void* Proc(const char*) {
     return nullptr;

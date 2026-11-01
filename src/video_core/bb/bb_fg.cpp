@@ -238,7 +238,10 @@ struct Api {
 } g_api;
 sl::ReflexOptions g_reflex_opts{};
 sl::FrameToken* g_token = nullptr;
-uint32_t g_frame_index = 1u << 30; // (apart from the super resolution's own frame indices)
+uint32_t g_frame_index = 0; // the shared Streamline frame index stream (SR::Dlss::NextFrameIndex)
+bool g_off_only = false;    // Streamline loaded for DLSS alone: DLSS-G kept off with valid formats
+vk::Extent2D g_off_backbuffer{};
+vk::Format g_off_format = vk::Format::eUndefined;
 bool g_options_set = false;
 vk::Extent2D g_options_backbuffer{}, g_options_render{};
 vk::Format g_options_format = vk::Format::eUndefined;
@@ -246,7 +249,8 @@ uint64_t g_presents = 0;
 Clock::time_point g_present_begin{};
 // The per-second line.
 Clock::time_point g_stat_start{};
-uint32_t g_stat_real = 0, g_stat_on = 0;
+uint32_t g_stat_real = 0, g_stat_on = 0, g_stat_hudless = 0;
+uint32_t g_last_status = 0;
 double g_stat_present_ms = 0, g_stat_present_max = 0;
 double g_pace_n = 0, g_pace_sum = 0, g_pace_sq = 0;
 
@@ -398,6 +402,16 @@ bool Feature(sl::Feature feature, const char* name, F*& function) {
 
 void OnDevice(vk::PhysicalDevice physical) {
     if (Cfg().kind != Kind::Dlss) {
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+        // DLSS super resolution alone: sl.dlss_g is loaded too (device creation needs it) and
+        // checks its formats at every present: kept off with valid formats (KeepOff).
+        if (SR::Dlss::Loaded() &&
+            SR::Dlss::FeatureReady(static_cast<uint32_t>(sl::kFeatureDLSS_G), physical)) {
+            g_api.dlssg_set_options = reinterpret_cast<PFun_slDLSSGSetOptions*>(
+                SR::Dlss::FeatureProc(static_cast<uint32_t>(sl::kFeatureDLSS_G), "slDLSSGSetOptions"));
+            g_off_only = g_api.dlssg_set_options != nullptr;
+        }
+#endif
         return;
     }
     g_generate = std::clamp(Cfg().multiplier - 1, 1, 5);
@@ -592,10 +606,11 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
             }
             const uint32_t shown_per = g_mode_set == 1 ? PresentedFrames() : 1u;
             Printf("[dlssg] %s x%u; real %.1f fps, shown %.1f fps; generation on %u of %u frames; "
-                   "present call %.2f ms (max %.1f)",
+                   "present call %.2f ms (max %.1f); HUD-less %u, state 0x%x",
                    g_dynamic ? "dynamic" : "fixed", shown_per, g_stat_real / window,
                    g_stat_real / window * static_cast<double>(shown_per), g_stat_on, g_stat_real,
-                   g_stat_present_ms / n, g_stat_present_max);
+                   g_stat_present_ms / n, g_stat_present_max, g_stat_hudless, g_last_status);
+            g_stat_hudless = 0;
             g_stat_start = now;
             g_stat_real = 0;
             g_stat_on = 0;
@@ -649,12 +664,28 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
         options.colorWidth = backbuffer.width;
         options.colorHeight = backbuffer.height;
         options.colorBufferFormat = static_cast<uint32_t>(static_cast<VkFormat>(format));
+        // Every format defined, inputs or not (Streamline: "Cannot have undefined format" and no
+        // generation otherwise): the inputs' own, else what they will be (D32S8 depth, RG16F
+        // vectors, the HUD-less image in the backbuffer's format).
+        options.mvecDepthWidth = g_options_render.width != 0 ? g_options_render.width : backbuffer.width;
+        options.mvecDepthHeight =
+            g_options_render.height != 0 ? g_options_render.height : backbuffer.height;
+        options.mvecBufferFormat = static_cast<uint32_t>(VK_FORMAT_R16G16_SFLOAT);
+        options.depthBufferFormat = static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT);
+        options.hudLessBufferFormat = static_cast<uint32_t>(static_cast<VkFormat>(format));
+        options.uiBufferFormat = static_cast<uint32_t>(static_cast<VkFormat>(format));
         if (usable) {
             options.mvecDepthWidth = inputs->render.width;
             options.mvecDepthHeight = inputs->render.height;
-            options.mvecBufferFormat = static_cast<uint32_t>(static_cast<VkFormat>(inputs->motion.format));
-            options.depthBufferFormat = static_cast<uint32_t>(static_cast<VkFormat>(inputs->depth.format));
-            if (inputs->has_hudless) {
+            if (inputs->motion.format != vk::Format::eUndefined) {
+                options.mvecBufferFormat =
+                    static_cast<uint32_t>(static_cast<VkFormat>(inputs->motion.format));
+            }
+            if (inputs->depth.format != vk::Format::eUndefined) {
+                options.depthBufferFormat =
+                    static_cast<uint32_t>(static_cast<VkFormat>(inputs->depth.format));
+            }
+            if (inputs->has_hudless && inputs->hudless.format != vk::Format::eUndefined) {
                 options.hudLessBufferFormat =
                     static_cast<uint32_t>(static_cast<VkFormat>(inputs->hudless.format));
             }
@@ -669,7 +700,13 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
         g_options_format = format;
     }
 
-    g_frame_index++;
+    // This frame's DLSS evaluate index when it has one (the same token, another viewport), else
+    // the next of the shared stream; never backwards.
+    {
+        const uint32_t own = usable && inputs->sl_frame > g_frame_index ? inputs->sl_frame
+                                                                        : SR::Dlss::NextFrameIndex();
+        g_frame_index = std::max(own, g_frame_index + 1);
+    }
     if (g_api.get_new_frame_token(g_token, &g_frame_index) != sl::Result::eOk || g_token == nullptr) {
         g_token = nullptr;
         return;
@@ -724,6 +761,7 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                                  inputs->hudless.extent.width == backbuffer.width &&
                                  inputs->hudless.extent.height == backbuffer.height;
         if (tag_hudless) {
+            ++g_stat_hudless;
             tags.emplace_back(&hudless, sl::kBufferTypeHUDLessColor,
                               sl::ResourceLifecycle::eValidUntilPresent, &hudless_extent);
         }
@@ -739,13 +777,14 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
             dumped = true;
             Printf("[dlssg] inputs: frame %u camera %s, mvecScale %.6g %.6g jitter %.4g %.4g near "
                    "%.4g far %.4g fov %.4g depthInverted %d | depth %ux%u fmt %u, motion %ux%u fmt "
-                   "%u, hudless %s %ux%u, backbuffer %ux%u, region %d,%d %ux%u, setTag %d",
+                   "%u, hudless %s (%s) %ux%u, backbuffer %ux%u, region %d,%d %ux%u, setTag %d",
                    g_frame_index, inputs->camera_valid ? "valid" : "INVALID",
                    constants.mvecScale.x, constants.mvecScale.y, constants.jitterOffset.x,
                    constants.jitterOffset.y, constants.cameraNear, constants.cameraFar,
                    constants.cameraFOV, static_cast<int>(constants.depthInverted), depth.width,
                    depth.height, depth.nativeFormat, motion.width, motion.height,
-                   motion.nativeFormat, tag_hudless ? "tagged" : "not tagged", hudless.width,
+                   motion.nativeFormat, tag_hudless ? "tagged" : "not tagged", inputs->hudless_source,
+                   hudless.width,
                    hudless.height, backbuffer.width, backbuffer.height, region.offset.x,
                    region.offset.y, region.extent.width, region.extent.height,
                    static_cast<int>(tag_result));
@@ -797,6 +836,7 @@ void AfterPresent() {
     {
         static uint32_t last_status = ~0u;
         const auto status = static_cast<uint32_t>(state.status);
+        g_last_status = status;
         if (status != last_status || presents < 120) {
             last_status = status;
             Printf("[dlssg] state: status 0x%x, presented %u, generate max %u", status,
@@ -836,8 +876,35 @@ void AfterPresent() {
 #endif
 }
 
+void KeepOff(vk::Extent2D backbuffer, vk::Format format, uint32_t image_count) {
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+    if (!g_off_only || (g_off_backbuffer == backbuffer && g_off_format == format)) {
+        return;
+    }
+    sl::DLSSGOptions options{};
+    options.mode = sl::DLSSGMode::eOff;
+    options.numBackBuffers = image_count;
+    options.colorWidth = options.mvecDepthWidth = backbuffer.width;
+    options.colorHeight = options.mvecDepthHeight = backbuffer.height;
+    options.colorBufferFormat = options.hudLessBufferFormat = options.uiBufferFormat =
+        static_cast<uint32_t>(static_cast<VkFormat>(format));
+    options.mvecBufferFormat = static_cast<uint32_t>(VK_FORMAT_R16G16_SFLOAT);
+    options.depthBufferFormat = static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT);
+    const auto result = g_api.dlssg_set_options(sl::ViewportHandle{0}, options);
+    Printf("DLSS-G: kept off (DLSS super resolution only), formats given (%d)",
+           static_cast<int>(result));
+    g_off_backbuffer = backbuffer;
+    g_off_format = format;
+#else
+    (void)backbuffer;
+    (void)format;
+    (void)image_count;
+#endif
+}
+
 void SwapchainChanging() {
 #if defined(_WIN32) && defined(BB_STREAMLINE)
+    g_off_backbuffer = {};
     if (!g_ready || g_mode_set != 1) {
         return;
     }
@@ -977,6 +1044,8 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                    vk::Format format, vk::Rect2D region, uint32_t image_count) {
     if (Dlssg::Ready()) {
         Dlssg::BeforePresent(inputs, backbuffer, region, format, image_count);
+    } else {
+        Dlssg::KeepOff(backbuffer, format, image_count);
     }
     if (Amd::Active()) {
         Amd::BeforePresent(inputs, swapchain, backbuffer, format);
