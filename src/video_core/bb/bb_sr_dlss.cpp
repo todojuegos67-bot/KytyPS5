@@ -497,6 +497,17 @@ bool Evaluate(const Desc& desc) {
                         sl::ResourceLifecycle::eValidUntilEvaluate, &render),
     };
     const uint32_t tag_count = desc.has_reactive ? 5u : 4u;
+    static const char* const tag_names[5]{"input colour", "output", "depth", "motion vectors",
+                                          "reactive (bias current colour)"};
+    for (uint32_t i = 0; i < tag_count; ++i) {
+        if (tags[i].resource->nativeFormat == 0) {
+            static uint32_t reports = 0;
+            if (reports++ < 8) {
+                BBLogf("DLSS: tag %u (%s) has VK_FORMAT_UNDEFINED (%ux%u)", i, tag_names[i],
+                       tags[i].resource->width, tags[i].resource->height);
+            }
+        }
+    }
     auto* command_buffer =
         reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(desc.cmd));
     if (const auto result = g_api.set_tag_for_frame(*token, viewport, tags, tag_count, command_buffer);
