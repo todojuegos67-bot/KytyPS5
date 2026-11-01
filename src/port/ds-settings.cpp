@@ -3,6 +3,7 @@
 #include "port/ds-tables.h"
 
 #include <algorithm>
+#include <thread>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -257,6 +258,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("reducir_texturas", s->texture_reduce);
 	boo("simular_vram_8gb", s->simulate_vram8);
 	boo("todos_los_ccd", s->all_ccds);
+	boo("carga_shaders_maxima", s->shader_turbo);
 	str("precompilar_hilos", s->precompile_threads);
 	str("metricas", s->metrics);
 	boo("menu_inicio", s->start_menu);
@@ -428,6 +430,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "simular_vram_8gb=" << b(s.simulate_vram8) << "\n"
 	  << "; Ryzen con dos CCD: 0 = el juego en el CCD con mas cache L3 (mas rapido); 1 = todos los nucleos\n"
 	  << "todos_los_ccd=" << b(s.all_ccds) << "\n"
+	  << "; Carga de shaders al maximo: la preparacion de shaders del juego con todos los hilos de la CPU (1) o con pocos (0)\n"
+	  << "carga_shaders_maxima=" << b(s.shader_turbo) << "\n"
 	  << "; Precompilar shaders: todos = todos los hilos de la CPU (mas rapido, el PC va cargado); relajado; preguntar\n"
 	  << "precompilar_hilos=" << s.precompile_threads << "\n"
 	  << "; Anti-Lag con la frame generation de AMD: auto (Anti-Lag 2 en graficas AMD, el nuestro en las demas), amd2, normal,\n"
@@ -1073,6 +1077,16 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (~78K pipelines beside the game, the whole multi-GB driver cache saved every 4,000: the game crawled at the
 	// character select with "Preparando ... 8%" and a black screen). What the precompile lacks compiles at first use.
 	env.Default("KYTY_STATIC_WARMUP", "0");
+	// (ds-pc-port37) "Carga de shaders al maximo": the translation of the game's shaders at the start (the prefetch: every
+	// shader of the game, then the recorded ones' warmup) on every CPU thread, at background priority (the game stays ahead).
+	// By default the prefetch took CPUs - 12, at most half of them, and half of that after the recorded programs (a 16-thread
+	// CPU: 4, then 2), the warmup a fixed 16: minutes of "Preparando shaders" at every start.
+	if (s.shader_turbo) {
+		const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
+		env.Set("KYTY_SHADER_PREFETCH_THREADS", std::to_string(std::min(cpus, 64u)));
+		env.Set("KYTY_SHADER_WARMUP_THREADS", std::to_string(cpus));
+		env.Set("KYTY_SHADER_FOLLOW_THREADS", "4");
+	}
 	// -Ram16 (10-24): "Optimizacion equipos 16 GB RAM" on a PC of 20 GB of RAM or less (or simulated) only.
 	if (low_ram) { // (10-27b) on low-RAM PCs only, whatever the old box says
 		env.Default("KYTY_RESIDENT_MB", "6144");
@@ -1180,7 +1194,7 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.kbm != n.kbm || l.kbm_sens != n.kbm_sens || l.kbm_antidz != n.kbm_antidz || l.kbm_map != n.kbm_map ||
 	       l.pad_map != n.pad_map || l.game_settings != n.game_settings || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
 	       l.safe_gpu != n.safe_gpu || l.quality != n.quality || l.texture_reduce != n.texture_reduce ||
-	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.extra != n.extra ||
+	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.shader_turbo != n.shader_turbo || l.extra != n.extra ||
 	       l.rt_ss_refl != n.rt_ss_refl || l.rt_refl_sharp != n.rt_refl_sharp || l.rt_refl_waves != n.rt_refl_waves || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke || l.ibl != n.ibl || l.tess != n.tess ||
 	       l.torch != n.torch || l.lens_flare != n.lens_flare || l.rt_hw_exp != n.rt_hw_exp || l.dlss5 != n.dlss5 ||
 	       l.dlss5_unsigned != n.dlss5_unsigned || l.dlss5_strength != n.dlss5_strength ||

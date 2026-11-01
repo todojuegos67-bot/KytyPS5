@@ -1730,6 +1730,8 @@ void Draw(float width, float height) {
 					if (s.ram16_boost) ImGui::TextColored(kGold, "RAM %s: mejoras activadas. Cierra los navegadores mientras juegas.", s.simulate_ram16 ? "16 GB (simulado)" : (std::to_string(g_rt.pc.ram_gb) + " GB").c_str());
 					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para gráficas que se cuelgan o dan pantallazo azul: más estable, ~37% menos FPS.");
 					CheckRow("Usar todos los CCD (Ryzen de dos CCD)", true, s.all_ccds, "Ryzen de dos CCD: No = el juego en el CCD con más caché L3 (más rápido); Sí = todos los núcleos.");
+					CheckRow("Carga de shaders al máximo", true, s.shader_turbo,
+					         "La preparación de shaders al empezar la partida con todos los hilos de la CPU (en prioridad baja: el juego va primero). Mucho más rápida; mientras dura pueden bajar algo los FPS. No = pocos hilos, como antes (para portátiles o CPUs justas).");
 					{
 						// (ds-pc-port13) The shader precompile's CPU use (asked before the first one).
 						bool all = s.precompile_threads == "todos";
