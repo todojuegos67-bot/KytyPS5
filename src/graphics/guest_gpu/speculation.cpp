@@ -959,8 +959,14 @@ void Speculation::After(Result& result, size_t index) {
 	for (size_t i = from.touched_images; i < to.touched_images; ++i)
 		textures.TouchSpeculated(*state.touched_images[i].first, state.touched_images[i].second);
 	for (size_t i = from.touched_buffers; i < to.touched_buffers; ++i) buffers.TouchSpeculated(state.touched_buffers[i]);
-	// (The buffer copies recorded before a label are made first, as WriteGuestMemory does: issue #196.)
-	if (from.writes != to.writes) AsyncUpload::Drain();
+	// The work before the processor's guest memory writes is on the GPU before them, as in order (BufferFlush): the
+	// segments' buffers held for one submission go first. (Labels written while that work was held made ~1.5 frames
+	// in 1,000 lose whole passes at the stone arch: speculate_batch_submits.) The buffer copies recorded before a label
+	// are made first, as WriteGuestMemory does: issue #196.
+	if (from.writes != to.writes) {
+		m_renderer.GetCommandScheduler().FlushRecorded();
+		AsyncUpload::Drain();
+	}
 	for (size_t i = from.writes; i < to.writes; ++i) {
 		const auto& write = state.writes[i];
 		if (write.copy) {

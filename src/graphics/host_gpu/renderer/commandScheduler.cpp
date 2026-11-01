@@ -962,22 +962,27 @@ uint64_t CommandScheduler::SubmitRecorded(Recorder& recorder, size_t count) {
 	// Held for one submission with what follows (the next Submit; FlushRecorded): each buffer's tick is the one that
 	// submission gets (CurrentTick). Only while this scheduler has an open buffer, which that submission includes:
 	// the open buffer's work is fenced with CurrentTick, so held buffers are never submitted without it (a batch
-	// submitted alone would move the tick under it), except when the batch fills, the open buffer closed.
+	// submitted alone would move the tick under it). When the batch fills it is submitted alone, but only once the
+	// closed open buffer is in it: everything fenced with that tick goes in that submission (split from the batch, the
+	// open buffer went a tick late, its stream buffer and descriptor space free a tick early). The batch keeps room for
+	// Submit's prologue and open buffer.
 	static auto& batch = LiveSwitch::Find("speculate_batch_submits", 1);
 	if (open && (batch.load(std::memory_order_relaxed) != 0 || m_batched != 0)) {
-		const auto hold = [&](const SubmitEntry& entry) {
-			if (m_batched + 2 >= MaxSubmitEntries) { // (room for Submit's prologue and open buffer)
+		EXIT_IF(m_batched + n > MaxSubmitEntries);
+		for (size_t i = 0; i < n; ++i) m_batch[m_batched++] = entries[i];
+		uint64_t tick = 0;
+		for (size_t i = 0; i < count; ++i) {
+			if (m_batched + 2 >= MaxSubmitEntries) {
 				(void)SubmitBuffers({m_batch.data(), m_batched}, {});
 				m_batched = 0;
 			}
-			m_batch[m_batched++] = entry;
-		};
-		for (size_t i = 0; i < n; ++i) hold(entries[i]);
-		uint64_t tick = 0;
-		for (size_t i = 0; i < count; ++i) {
 			const auto& recorded = recorder.recorded[i];
-			hold({recorder.buffers[recorded.index].first, recorded.ended, recorded.timestamp_slot});
+			m_batch[m_batched++] = {recorder.buffers[recorded.index].first, recorded.ended, recorded.timestamp_slot};
 			tick = recorder.buffers[recorded.index].second = m_master.CurrentTick();
+		}
+		if (m_batched + 2 > MaxSubmitEntries) {
+			(void)SubmitBuffers({m_batch.data(), m_batched}, {});
+			m_batched = 0;
 		}
 		recorder.recorded.erase(recorder.recorded.begin(), recorder.recorded.begin() + static_cast<ptrdiff_t>(count));
 		BeginNext();
