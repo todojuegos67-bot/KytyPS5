@@ -340,6 +340,8 @@ void DrainInputs() {
 	}
 }
 
+
+
 void EnsureBackground() {
 	if (g_background_tried) return;
 	g_background_tried = true;
@@ -373,6 +375,185 @@ ImFont* FindFont(const char* name) {
 const ImVec4 kGold {0.87f, 0.77f, 0.55f, 1.0f};
 const ImVec4 kWarn {1.0f, 0.78f, 0.30f, 1.0f};
 const ImVec4 kDim {0.72f, 0.70f, 0.66f, 1.0f};
+
+// ---- (ds-pc-port37) "Mapear mando": the emulator launcher's pad mapper (Launcher-souls.ps1 Show-PadMapper) in the menu. ----
+// The same drawings (mando-ps5.png: the game's PS5 controls; mando-8bitdo.png: your controller's physical buttons, SDL names)
+// and the same button centres measured on them (350 px high). Pick a physical button (on the right drawing or in the list),
+// then the PS5 control it does (on the left drawing or in its list). Saved as mapa_mando (KYTY_PAD_MAP), empty = default.
+namespace PadMap {
+struct Spot {
+	const char* name;
+	float       x, y, d, h; // centre and size in the drawing's pixels (h = d but the touchpad's)
+};
+const char* const kPhys[] = {"a", "b", "x", "y", "leftshoulder", "rightshoulder", "lefttrigger", "righttrigger",
+                             "leftstick", "rightstick", "start", "back", "dpup", "dpdown", "dpleft", "dpright"};
+const char* const kDefault[] = {"Cross", "Circle", "Square", "Triangle", "L1", "R1", "L2", "R2",
+                                "L3", "R3", "Options", "None", "Up", "Down", "Left", "Right"};
+const char* const kPs5[] = {"Cross", "Circle", "Square", "Triangle", "L1", "R1", "L2", "R2", "L3", "R3",
+                            "Options", "TouchPad", "Up", "Down", "Left", "Right", "None"};
+const Spot kPsSpots[] = {{"Up", 96, 62, 29, 29},        {"Down", 96, 126, 29, 29},    {"Left", 65, 93, 29, 29},
+                         {"Right", 128, 93, 29, 29},    {"Triangle", 435, 60, 38, 38}, {"Circle", 472, 94, 38, 38},
+                         {"Cross", 435, 131, 38, 38},   {"Square", 398, 94, 38, 38},   {"L3", 178, 160, 67, 67},
+                         {"R3", 346, 160, 67, 67},      {"Options", 389, 32, 20, 20},  {"TouchPad", 265, 52, 150, 80}};
+const Spot kXbSpots[] = {{"y", 416, 58, 38, 38},        {"x", 377, 95, 38, 38},        {"b", 456, 95, 38, 38},
+                         {"a", 416, 132, 38, 38},       {"leftstick", 125, 86, 72, 72}, {"rightstick", 339, 156, 72, 72},
+                         {"dpup", 193, 140, 25, 25},    {"dpdown", 193, 192, 25, 25},  {"dpleft", 167, 166, 25, 25},
+                         {"dpright", 219, 166, 25, 25}, {"back", 226, 89, 22, 22},     {"start", 312, 89, 22, 22}};
+
+const char* Label(const std::string& c) {
+	static const std::pair<const char*, const char*> names[] = {
+	    {"Cross", "Cruz"}, {"Circle", "Círculo"}, {"Square", "Cuadrado"}, {"Triangle", "Triángulo"}, {"Options", "Options"},
+	    {"TouchPad", "Panel táctil"}, {"Up", "Cruceta arriba"}, {"Down", "Cruceta abajo"}, {"Left", "Cruceta izquierda"},
+	    {"Right", "Cruceta derecha"}, {"None", "(nada)"}, {"a", "A"}, {"b", "B"}, {"x", "X"}, {"y", "Y"},
+	    {"leftshoulder", "LB / L1"}, {"rightshoulder", "RB / R1"}, {"lefttrigger", "LT / L2"}, {"righttrigger", "RT / R2"},
+	    {"leftstick", "Stick izq. (L3)"}, {"rightstick", "Stick der. (R3)"}, {"start", "Start"}, {"back", "Select / Back"},
+	    {"dpup", "Cruceta arriba"}, {"dpdown", "Cruceta abajo"}, {"dpleft", "Cruceta izquierda"}, {"dpright", "Cruceta derecha"}};
+	for (const auto& [k, v]: names)
+		if (c == k) return I18n::T(v);
+	return c.c_str();
+}
+
+struct Tex {
+	ImTextureData* tex = nullptr;
+	int            w = 0, h = 0;
+	ImGuiContext*  ctx = nullptr;
+	bool           tried = false;
+};
+Tex g_ps, g_xb;
+
+void Load(Tex& t, const wchar_t* file) {
+	if (t.tex != nullptr && t.ctx != ImGui::GetCurrentContext()) t = {}; // (another context: its backend owns the old one)
+	if (t.tried) return;
+	t.tried = true;
+	std::ifstream in(g_rt.exe_path.parent_path() / file, std::ios::binary);
+	const std::string bytes {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+	int   channels = 0;
+	auto* px = bytes.empty() ? nullptr
+	                         : stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()), static_cast<int>(bytes.size()), &t.w,
+	                                                 &t.h, &channels, 4);
+	if (px == nullptr) return;
+	t.tex = IM_NEW(ImTextureData)();
+	t.tex->Create(ImTextureFormat_RGBA32, t.w, t.h);
+	std::memcpy(t.tex->GetPixels(), px, static_cast<size_t>(t.w) * t.h * 4);
+	t.tex->UseColors = true;
+	stbi_image_free(px);
+	ImGui::RegisterUserTexture(t.tex);
+	t.ctx = ImGui::GetCurrentContext();
+}
+
+std::map<std::string, std::string> Parse(const std::string& text) {
+	std::map<std::string, std::string> m;
+	for (size_t i = 0; i < std::size(kPhys); i++) m[kPhys[i]] = kDefault[i];
+	size_t at = 0;
+	while (at <= text.size()) {
+		const size_t end  = std::min(text.find(';', at), text.size());
+		const auto   item = text.substr(at, end - at);
+		at                = end + 1;
+		const size_t eq   = item.find('=');
+		if (eq != std::string::npos && m.contains(item.substr(0, eq))) m[item.substr(0, eq)] = item.substr(eq + 1);
+	}
+	return m;
+}
+
+std::string Format(const std::map<std::string, std::string>& m) {
+	bool same = true;
+	for (size_t i = 0; i < std::size(kPhys); i++) same = same && m.at(kPhys[i]) == kDefault[i];
+	if (same) return {};
+	std::string out;
+	for (const char* k: kPhys) out += (out.empty() ? "" : ";") + std::string(k) + "=" + m.at(k);
+	return out;
+}
+
+std::string g_sel = "a"; // the physical button being mapped
+
+// Draws one drawing with its spots at `at`, `scale`; returns the spot clicked ("" none). `hot(name)`: highlighted.
+template <typename Hot>
+std::string Drawing(const char* id, Tex& t, const Spot* spots, size_t n, ImVec2 at, float scale, Hot hot) {
+	auto*       dl = ImGui::GetWindowDrawList();
+	const float w = t.w > 0 ? t.w * scale : 540 * scale, h = 350 * scale;
+	if (t.tex != nullptr) dl->AddImage(t.tex->GetTexRef(), at, {at.x + w, at.y + h});
+	else dl->AddRectFilled(at, {at.x + w, at.y + h}, IM_COL32(40, 44, 54, 255), 12 * scale);
+	std::string clicked;
+	for (size_t i = 0; i < n; i++) {
+		const Spot& sp = spots[i];
+		const ImVec2 c {at.x + sp.x * scale, at.y + sp.y * scale};
+		const ImVec2 half {sp.d * scale * 0.5f, sp.h * scale * 0.5f};
+		ImGui::SetCursorScreenPos({c.x - half.x, c.y - half.y});
+		ImGui::PushID(id);
+		ImGui::PushID(static_cast<int>(i));
+		const bool pressed = ImGui::InvisibleButton("##spot", {std::max(1.0f, half.x * 2), std::max(1.0f, half.y * 2)});
+		const bool over    = ImGui::IsItemHovered();
+		ImGui::PopID();
+		ImGui::PopID();
+		const bool  on   = hot(sp.name);
+		const ImU32 ring = on ? IM_COL32(236, 200, 120, 255) : over ? IM_COL32(236, 200, 120, 200) : IM_COL32(236, 200, 120, 90);
+		if (on || over) {
+			if (sp.d != sp.h) dl->AddRectFilled({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y}, IM_COL32(236, 200, 120, 90), 8 * scale);
+			else dl->AddCircleFilled(c, half.x, IM_COL32(236, 200, 120, 90));
+		}
+		if (sp.d != sp.h) dl->AddRect({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y}, ring, 8 * scale, 0, on ? 3.0f : 1.5f);
+		else dl->AddCircle(c, half.x, ring, 0, on ? 3.0f : 1.5f);
+		if (over) ImGui::SetTooltip("%s", Label(sp.name));
+		if (pressed) clicked = sp.name;
+	}
+	ImGui::SetCursorScreenPos({at.x, at.y + h});
+	return clicked;
+}
+
+// The section; true when the mapping changed.
+bool Draw(Settings& s, float unit) {
+	Load(g_ps, L"mando-ps5.png");
+	Load(g_xb, L"mando-8bitdo.png");
+	auto m       = Parse(s.pad_map);
+	bool changed = false;
+	ImGui::TextWrapped("%s", I18n::T("1. Elige un botón de TU mando (dibujo de la derecha o la lista). 2. Elige qué botón del juego hace (dibujo de la izquierda). Se aplica al reiniciar el juego."));
+	const float avail = ImGui::GetContentRegionAvail().x;
+	const float scale = std::min(unit, (avail - 16 * unit) / (2 * 540.0f));
+	const ImVec2 at   = ImGui::GetCursorScreenPos();
+	ImGui::TextColored(kGold, "%s", I18n::T("Botón del juego (PS5)"));
+	ImGui::SetCursorScreenPos({at.x + 540 * scale + 16 * unit, at.y});
+	ImGui::TextColored(kGold, "%s", I18n::T("Tu mando"));
+	const float top = at.y + ImGui::GetTextLineHeightWithSpacing();
+	const std::string target = m[g_sel];
+	const std::string ps = Drawing("ps", g_ps, kPsSpots, std::size(kPsSpots), {at.x, top}, scale, [&](const char* n) { return target == n; });
+	const std::string xb = Drawing("xb", g_xb, kXbSpots, std::size(kXbSpots), {at.x + 540 * scale + 16 * unit, top}, scale,
+	                               [&](const char* n) { return g_sel == n; });
+	if (!xb.empty()) g_sel = xb;
+	if (!ps.empty() && m[g_sel] != ps) {
+		m[g_sel] = ps;
+		changed  = true;
+	}
+	ImGui::SetCursorScreenPos({at.x, top + 350 * scale + 8 * unit});
+	// The shoulders and triggers (not on the drawings) and every button: the list.
+	if (ImGui::BeginTable("##padmap", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchSame)) {
+		for (const char* k: kPhys) {
+			ImGui::TableNextRow();
+			ImGui::TableSetColumnIndex(0);
+			if (ImGui::Selectable(Label(k), g_sel == k, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) g_sel = k;
+			ImGui::TableSetColumnIndex(1);
+			ImGui::PushID(k);
+			ImGui::SetNextItemWidth(-1);
+			if (ImGui::BeginCombo("##to", Label(m[k]))) {
+				for (const char* c: kPs5)
+					if (ImGui::Selectable(Label(c), m[k] == c)) {
+						m[k]    = c;
+						g_sel   = k;
+						changed = true;
+					}
+				ImGui::EndCombo();
+			}
+			ImGui::PopID();
+		}
+		ImGui::EndTable();
+	}
+	if (ImGui::Button(I18n::T("Restablecer los botones de serie"))) {
+		m       = Parse("");
+		changed = true;
+	}
+	if (changed) s.pad_map = Format(m);
+	return changed;
+}
+} // namespace PadMap
 
 // (10-27c) A video game's options row: the label on the left, "<  value  >" on the right; Left/Right (arrows, D-pad,
 // left stick) or a click change the value, A / Enter the next one. The focused (or hovered) row's text goes to the
@@ -1569,7 +1750,12 @@ void Draw(float width, float height) {
 					if (CheckRow("Vibración", false, s.rumble, "Vibración del mando (en vivo).")) live_changed = true;
 					if (SliderRow("Fuerza de la vibración", s.rumble_gain, 1.0f, 8.0f, "%.1f", "Fuerza de la vibración del mando (en vivo).")) live_changed = true;
 					ImGui::Spacing();
-					ImGui::TextColored(kDim, "%s", s.pad_map.empty() ? "Mando: botones de serie (mapa_mando en settings.ini para cambiarlos)." : "Mando: remapeado (mapa_mando en settings.ini).");
+					if (ImGui::CollapsingHeader(I18n::T("Mapear mando"))) {
+						(void)PadMap::Draw(s, unit);
+						if (s.pad_map != l.pad_map && !g_start_mode)
+							ImGui::TextColored(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}, "%s", I18n::T("   (requiere reinicio)"));
+					}
+					ImGui::TextColored(kDim, "%s", s.pad_map.empty() ? I18n::T("Mando: botones de serie.") : I18n::T("Mando: remapeado."));
 					// (10-28) The key bindings (the launcher's "Mapear mando" > Teclado y ratón), read only.
 					if (ImGui::CollapsingHeader("Teclas (teclado y ratón)")) {
 						static const char* kDefault =
