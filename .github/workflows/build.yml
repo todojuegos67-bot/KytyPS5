@@ -260,6 +260,8 @@ jobs:
             Copy-Item fondo-launcher.jpg $out
             # (ds-pc-port37) The pad mapper's drawings (F1 / launcher > Controles > Mapear mando), as the emulator launcher's.
             Copy-Item mando-ps5.png, mando-8bitdo.png $out
+            # (ds-pc-port37) Metricas: the emulator launcher's window (metricas.ps1), started by the port at JUGAR.
+            Copy-Item metricas.ps1 $out
             Copy-Item resources\settings.ini "$out\settings.ini"
             Copy-Item resources\LEEME-PC.txt "$out\LEEME.txt"
             Set-Content "$out\_PipelineCache\LEEME.txt" -Encoding ASCII -Value 'Cache de shaders y pipelines de esta grafica: no la borres (se rehace sola tras actualizar el driver).'

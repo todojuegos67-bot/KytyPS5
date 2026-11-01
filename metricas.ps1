@@ -9,7 +9,9 @@ param(
 	[switch]$LossLess,
 	[switch]$NoOverlay,
 	[string]$LogDir = "",
-	[string]$Titulo = "DEMON'S SOULS REMAKE"
+	[string]$Titulo = "DEMON'S SOULS REMAKE",
+	# (ds-pc-port37) El proceso del juego: el emulador (kyty_emulator) o el port de PC ("Demon's Souls").
+	[string]$Proceso = 'kyty_emulator*'
 )
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -31,7 +33,7 @@ if ($NoOverlay) {
 	if ($RamGB -le 0) { exit 0 }
 	$emuSeen = $false; $emuGone = 0
 	while ($true) {
-		$emuWin = Get-Process -Name 'kyty_emulator*' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }
+		$emuWin = Get-Process -Name $Proceso -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }
 		if ($emuWin) {
 			$emuSeen = $true; $emuGone = 0
 			$p = $emuWin | Select-Object -First 1
@@ -443,7 +445,7 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
 $timer.Add_Tick({
 	# Se cierra sola cuando se cierra el juego (despues de haberlo visto abierto).
-	$emu = Get-Process -Name 'kyty_emulator*' -ErrorAction SilentlyContinue
+	$emu = Get-Process -Name $Proceso -ErrorAction SilentlyContinue
 	$emuWin = $emu | Where-Object { $_.MainWindowHandle -ne 0 }
 	# (Despues de que salga la ventana del juego: antes reserva su memoria de golpe, y con el limite ya puesto fallaba.)
 	if ($RamGB -gt 0 -and $emuWin) {

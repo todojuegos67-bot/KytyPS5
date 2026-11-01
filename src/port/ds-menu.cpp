@@ -772,7 +772,7 @@ void ApplyLive(const Settings& s) {
 	PortLive::fps_cap     = s.fps_cap;
 	PortLive::rumble      = s.rumble ? 1 : 0;
 	PortLive::rumble_gain = s.rumble_gain > 0 ? s.rumble_gain : 4.0f;
-	const int level       = s.metrics == "2" ? 2 : (s.metrics == "1" ? 1 : 0);
+	const int level       = 0; // (ds-pc-port37) Metricas is the launcher's window (metricas.ps1); the in-game panel stays on F8
 	for (int i = 0; i < 3 && PerfOverlay::Level() != level; i++) PerfOverlay::CycleLevel();
 	PortLive::rt_off = LiveRtOff(g_rt.launched, s); // (10-28) RT passes off live
 }

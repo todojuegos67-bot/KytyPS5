@@ -1155,7 +1155,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (s.kbm_calibrate) env.Set("KYTY_KBM", "1");
 	if ((s.kbm || s.kbm_calibrate) && demons) env.AppendConvars("cp11_Setting_CameraSpeed=" + std::to_string(std::clamp(s.kbm_camera, 5, 15)));
 	// The port's own: metrics (the launcher started metricas.ps1; here the in-game panel) and rumble.
-	env.Set("KYTY_FPS_HUD", s.metrics == "1" || s.metrics == "2" ? s.metrics : "");
+	env.Set("KYTY_FPS_HUD", ""); // (ds-pc-port37) Metricas: the emulator launcher's metricas.ps1 window (ds-main); F8 still shows the in-game panel
 	env.Set("KYTY_HAPTIC_RUMBLE", s.rumble ? "1" : "0");
 	env.Set("KYTY_HAPTIC_RUMBLE_GAIN", Num(s.rumble_gain > 0 ? s.rumble_gain : 4.0f));
 	plan.env   = env.list;

@@ -597,6 +597,57 @@ void PrepareShaders(const fs::path& root, const std::string& game, const GamePar
 	std::fflush(stdout);
 }
 
+// (ds-pc-port37) "Metricas" as the emulator launcher's: its metricas.ps1 window (always on top: GPU, VRAM, CPU, RAM, FPS,
+// the frametime graph, the upscaler, frame generation, Anti-Lag and the Souls mode), with the launcher.ini values it
+// reads (scalelabel, fglabel, antilagon, soulsmodo, dlsspreset) written from settings.ini as the launcher writes them.
+void StartMetricsWindow(const fs::path& root, const Port::Settings& s, const Port::PcInfo& pc) {
+	std::error_code ec;
+	const fs::path script = root / L"metricas.ps1";
+	if (!fs::exists(script, ec)) {
+		std::printf("[port] metrics: metricas.ps1 not found next to the exe\n");
+		return;
+	}
+	const std::string souls = s.souls_mode;
+	const std::string modo  = souls == "ligero" ? "Modo Souls ligero" : souls == "equilibrado" ? "Modo Souls equilibrado"
+	                        : souls == "ultra" ? "Modo Souls ultra" : souls == "extremo" ? "Modo Souls extremo"
+	                        : souls == "low" ? "Modo Souls PC low profile" : "Personalizado";
+	const bool  fixed = souls == "ligero" || souls == "equilibrado" || souls == "low";
+	std::string fg    = fixed ? modo : Port::FrameGenLabel(s.framegen);
+	std::string al    = "No";
+	if (fixed) al = "Ultra";
+	else if (s.framegen.rfind("dlss", 0) == 0) al = s.antilag_dlssg == "ultra" ? "Ultra (Reflex apagado)" : s.antilag_dlssg == "normal" ? "Normal (Reflex apagado)" : "Reflex (DLSS-G)";
+	else if (s.framegen.rfind("amd", 0) == 0) {
+		const std::string m = s.antilag_mode.empty() || s.antilag_mode == "auto" ? (pc.amd ? "amd2" : "normal") : s.antilag_mode;
+		al = m == "amd2" ? "Anti-Lag 2 (AMD)" : m == "ultra" ? "Ultra" : m == "no" ? "No" : "Normal";
+	}
+	const int preset = s.dlss_preset == "K" ? 1 : s.dlss_preset == "L" ? 2 : s.dlss_preset == "M" ? 3 : 0;
+	{
+		std::ofstream ini(root / L"launcher.ini", std::ios::binary | std::ios::trunc);
+		const char* scale = Port::kResModes[0].label;
+		for (int i = 0; i < Port::kResModeCount; i++)
+			if (s.res == Port::kResModes[i].id) scale = Port::kResModes[i].label;
+		ini << "scalelabel=" << scale << "\r\n"
+		    << "fglabel=" << fg << "\r\n"
+		    << "antilagon=" << al << "\r\n"
+		    << "soulsmodo=" << modo << "\r\n"
+		    << "dlsspreset=" << preset << "\r\n";
+	}
+	std::wstring command = L"\"" + std::wstring(_wgetenv(L"SystemRoot") != nullptr ? _wgetenv(L"SystemRoot") : L"C:\\Windows") +
+	                       L"\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" +
+	                       script.wstring() + L"\" -LogDir \"" + (root / L"logs").wstring() + L"\" -Proceso \"Demon's Souls\"";
+	if (s.simulate_vram8) command += L" -VramMB 8192";
+	STARTUPINFOW        si {};
+	PROCESS_INFORMATION pi {};
+	si.cb = sizeof(si);
+	if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, root.c_str(), &si, &pi)) {
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+		std::printf("[port] metrics: metricas.ps1 started (as the emulator launcher's)\n");
+	} else {
+		std::printf("[port] metrics: metricas.ps1 did not start (%lu)\n", GetLastError());
+	}
+}
+
 void BackupSaves(const fs::path& root) {
 	std::error_code ec;
 	const fs::path  src = root / L"_SaveData";
@@ -1023,6 +1074,7 @@ int main(int argc, char* argv[]) {
 	std::fflush(stdout);
 
 	if (settings.backup_saves) BackupSaves(root);
+	if (settings.metrics == "1" || settings.metrics == "2") StartMetricsWindow(root, settings, pc);
 	if (mask != system_mask) SetProcessAffinityMask(GetCurrentProcess(), static_cast<DWORD_PTR>(mask));
 	SplashStatus("Iniciando...");
 
