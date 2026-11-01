@@ -30,6 +30,9 @@
 #include "stb_image.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdarg>
+#include <regex>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -129,6 +132,11 @@ std::vector<std::string> g_cfg_why;             // its "Hemos elegido: ..." line
 void Bump() {
 	g_revision.fetch_add(1, std::memory_order_relaxed);
 }
+
+namespace MetricsPanel { // (ds-pc-port41, below)
+void Toggle();
+bool Shown();
+} // namespace MetricsPanel
 
 // ---- (ds-pc-port38) The F1 menu's animations: open / close (fade and scale), page slide, buttons' hover and focus. ----
 // Times on the steady clock (window and present threads); the overlay is redrawn (Bump) while one runs.
@@ -288,6 +296,11 @@ bool OnEvent(const SDL_Event& e) {
 	const bool open = g_open.load();
 	switch (e.type) {
 		case SDL_KEYDOWN:
+			// (ds-pc-port41) F8: the Metricas panel (metricas.ps1's, top-centre), not the emulator's overlay.
+			if (e.key.keysym.sym == SDLK_F8) {
+				if (e.key.repeat == 0) MetricsPanel::Toggle();
+				return true;
+			}
 			if (e.key.keysym.sym == SDLK_F1 && e.key.repeat == 0) {
 				// (port26) F1: the small in-game menu (show the launcher next time; close the game). Nothing is saved or skipped.
 				if (open && g_trophy_page.exchange(false)) { // (port34) the trophy page: back to the menu
@@ -3506,7 +3519,7 @@ void DrawLauncher(float width, float height) {
 }
 
 bool WantsOverlay() {
-	return g_open.load(std::memory_order_relaxed) || Resume::SaveAndQuitActive() || Anim::Closing(); // (ds-pc-port38: the fade-out)
+	return MetricsPanel::Shown() || g_open.load(std::memory_order_relaxed) || Resume::SaveAndQuitActive() || Anim::Closing(); // (ds-pc-port38: the fade-out)
 }
 
 // (port34) F1 > Ver trofeos: every trophy of the game, as the PS5's trophy page. Drawn with draw lists in one window of
@@ -4175,6 +4188,475 @@ bool Draw(float width, float height, float unit) {
 } // namespace TrophyPage
 
 
+// ---- (ds-pc-port41) "Metricas" in the game: the emulator launcher's metricas.ps1 window drawn by the port's overlay, top-centre.
+// The same rows in the same order, labels, colours (LimeGreen / Red / DeepSkyBlue / Orange / White / Khaki / Gold, names
+// grey 150), Consolas Bold 15 / 16 / 34 / 10 px x S (S = screen height / 1080, 1..2.5), no background (the window was
+// transparent), the 60 s frametime graph (green mean, orange peaks, 8.3 / 16.7 / 33.3 lines, 40 ms top). The same
+// sources: NVML (what nvidia-smi reads) for GPU % / temperature / clock / VRAM, the processor's "% Processor
+// Performance" counter x its maximum clock, CPU % from the system times, RAM and commit from Windows, and FPS / frame /
+// latency / multiplier / upscaler from this run's log with metricas.ps1's own patterns. F8 shows / hides it.
+namespace MetricsPanel {
+struct Row {
+	std::string name, value;
+	ImU32       color;
+};
+constexpr ImU32 kGreen = IM_COL32(50, 205, 50, 255), kRed = IM_COL32(255, 0, 0, 255), kBlue = IM_COL32(0, 191, 255, 255),
+                kOrange = IM_COL32(255, 165, 0, 255), kWhite = IM_COL32(255, 255, 255, 255), kKhaki = IM_COL32(240, 230, 140, 255),
+                kGold = IM_COL32(255, 215, 0, 255), kName = IM_COL32(150, 150, 150, 255);
+std::mutex          g_mutex;
+std::vector<Row>    g_rows;
+std::string         g_fps_text;
+ImU32               g_fps_color = kWhite;
+std::vector<double> g_ft, g_ft_max;
+std::atomic<bool>   g_shown {false}, g_started {false};
+
+ImU32 UseColor(double used, double total) {
+	if (total <= 0) return kOrange;
+	const double f = used / total;
+	return f < 0.70 ? kGreen : f < 0.85 ? kGold : f < 0.95 ? kOrange : kRed;
+}
+std::string Fmt(const char* f, ...) {
+	char    text[256];
+	va_list args;
+	va_start(args, f);
+	std::vsnprintf(text, sizeof(text), f, args);
+	va_end(args);
+	return text;
+}
+
+#if defined(_WIN32)
+// NVML (nvml.dll, the driver's: what nvidia-smi queries).
+struct Nvml {
+	bool  ok = false;
+	void* dev = nullptr;
+	int (*util)(void*, unsigned int*) = nullptr; // nvmlDeviceGetUtilizationRates (gpu, memory)
+	int (*temp)(void*, int, unsigned int*) = nullptr;
+	int (*clock)(void*, int, unsigned int*) = nullptr;
+	int (*mem)(void*, unsigned long long*) = nullptr; // nvmlDeviceGetMemoryInfo (total, free, used)
+	void Init() {
+		HMODULE m = LoadLibraryW(L"nvml.dll");
+		if (m == nullptr) {
+			wchar_t sys[MAX_PATH] = {};
+			GetSystemDirectoryW(sys, MAX_PATH);
+			m = LoadLibraryW((std::wstring(sys) + L"\\nvml.dll").c_str());
+		}
+		if (m == nullptr) return;
+		auto init  = reinterpret_cast<int (*)()>(reinterpret_cast<void*>(GetProcAddress(m, "nvmlInit_v2")));
+		auto get   = reinterpret_cast<int (*)(unsigned int, void**)>(reinterpret_cast<void*>(GetProcAddress(m, "nvmlDeviceGetHandleByIndex_v2")));
+		util       = reinterpret_cast<int (*)(void*, unsigned int*)>(reinterpret_cast<void*>(GetProcAddress(m, "nvmlDeviceGetUtilizationRates")));
+		temp       = reinterpret_cast<int (*)(void*, int, unsigned int*)>(reinterpret_cast<void*>(GetProcAddress(m, "nvmlDeviceGetTemperature")));
+		clock      = reinterpret_cast<int (*)(void*, int, unsigned int*)>(reinterpret_cast<void*>(GetProcAddress(m, "nvmlDeviceGetClockInfo")));
+		mem        = reinterpret_cast<int (*)(void*, unsigned long long*)>(reinterpret_cast<void*>(GetProcAddress(m, "nvmlDeviceGetMemoryInfo")));
+		ok = init != nullptr && get != nullptr && util != nullptr && temp != nullptr && mem != nullptr && init() == 0 && get(0, &dev) == 0;
+	}
+};
+// "\Processor Information(_Total)\% Processor Performance" (pdh.dll by name), as metricas.ps1's counter.
+struct CpuPerf {
+	void* query = nullptr;
+	void* counter = nullptr;
+	long (*collect)(void*) = nullptr;
+	long (*value)(void*, unsigned long, unsigned long*, void*) = nullptr;
+	int max_mhz = 0;
+	void Init() {
+		HKEY key = nullptr;
+		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_READ, &key) == ERROR_SUCCESS) {
+			DWORD mhz = 0, size = sizeof(mhz);
+			if (RegQueryValueExW(key, L"~MHz", nullptr, nullptr, reinterpret_cast<BYTE*>(&mhz), &size) == ERROR_SUCCESS) max_mhz = static_cast<int>(mhz);
+			RegCloseKey(key);
+		}
+		HMODULE m = LoadLibraryW(L"pdh.dll");
+		if (m == nullptr) return;
+		auto open = reinterpret_cast<long (*)(const wchar_t*, uintptr_t, void**)>(reinterpret_cast<void*>(GetProcAddress(m, "PdhOpenQueryW")));
+		auto add  = reinterpret_cast<long (*)(void*, const wchar_t*, uintptr_t, void**)>(reinterpret_cast<void*>(GetProcAddress(m, "PdhAddEnglishCounterW")));
+		collect   = reinterpret_cast<long (*)(void*)>(reinterpret_cast<void*>(GetProcAddress(m, "PdhCollectQueryData")));
+		value     = reinterpret_cast<long (*)(void*, unsigned long, unsigned long*, void*)>(reinterpret_cast<void*>(GetProcAddress(m, "PdhGetFormattedCounterValue")));
+		if (open == nullptr || add == nullptr || collect == nullptr || value == nullptr) return;
+		if (open(nullptr, 0, &query) != 0) return;
+		if (add(query, L"\\Processor Information(_Total)\\% Processor Performance", 0, &counter) != 0) counter = nullptr;
+		if (counter != nullptr) collect(query);
+	}
+	int Mhz() {
+		if (counter == nullptr || max_mhz <= 0) return 0;
+		struct {
+			unsigned long status;
+			double        value;
+		} v {};
+		collect(query);
+		if (value(counter, 0x200 /* PDH_FMT_DOUBLE */, nullptr, &v) != 0) return 0;
+		return static_cast<int>(std::lround(v.value * max_mhz / 100.0));
+	}
+};
+#endif
+
+// The log's last 64 KiB (Get-Fps) and, read on from where it stopped, the upscaler's lines (Update-ScaleLog).
+struct LogState {
+	std::string path;
+	uint64_t    pos = 0;
+	std::string kind, ratio, xess_ver, preset;
+	int         in_h = 0, out_h = 0, native = 0;
+	bool        dlss_ready = false, force4k = false;
+	int64_t     last_key = -1;
+	std::chrono::steady_clock::time_point last_key_at {};
+};
+
+double Num(const std::string& s) {
+	return std::strtod(s.c_str(), nullptr);
+}
+
+void Sample(LogState& L,
+#if defined(_WIN32)
+            Nvml& nv, CpuPerf& cpu,
+#endif
+            uint64_t& idle0, uint64_t& total0) {
+	std::vector<Row> rows;
+	const Settings&  s = g_rt.launched;
+	// The launcher.ini values (StartMetricsWindow's): scalelabel, fglabel, antilagon, soulsmodo, dlsspreset.
+	const std::string souls = s.souls_mode;
+	const std::string modo  = souls == "ligero" ? "Modo Souls ligero" : souls == "equilibrado" ? "Modo Souls equilibrado"
+	                        : souls == "ultra" ? "Modo Souls ultra" : souls == "extremo" ? "Modo Souls extremo"
+	                        : souls == "low" ? "Modo Souls PC low profile" : "Personalizado";
+	const bool  fixed = souls == "ligero" || souls == "equilibrado" || souls == "low";
+	std::string fg_label = fixed ? modo : FrameGenLabel(s.framegen);
+	std::string al       = "No";
+	if (fixed) al = "Ultra";
+	else if (s.framegen.rfind("dlss", 0) == 0) al = s.antilag_dlssg == "ultra" ? "Ultra (Reflex apagado)" : s.antilag_dlssg == "normal" ? "Normal (Reflex apagado)" : "Reflex (DLSS-G)";
+	else if (s.framegen.rfind("amd", 0) == 0) {
+		const std::string m = s.antilag_mode.empty() || s.antilag_mode == "auto" ? (g_rt.pc.amd ? "amd2" : "normal") : s.antilag_mode;
+		al = m == "amd2" ? "Anti-Lag 2 (AMD)" : m == "ultra" ? "Ultra" : m == "no" ? "No" : "Normal";
+	}
+	std::string scale_label = kResModes[0].label;
+	for (int i = 0; i < kResModeCount; i++)
+		if (s.res == kResModes[i].id) scale_label = kResModes[i].label;
+	const int dlss_preset = s.dlss_preset == "K" ? 1 : s.dlss_preset == "L" ? 2 : s.dlss_preset == "M" ? 3 : 0;
+#if defined(_WIN32)
+	if (nv.ok) {
+		unsigned int u[2] = {}, t = 0, clk = 0;
+		unsigned long long m[3] = {};
+		nv.util(nv.dev, u);
+		nv.temp(nv.dev, 0, &t);
+		if (nv.clock != nullptr) nv.clock(nv.dev, 0 /* graphics */, &clk);
+		nv.mem(nv.dev, m);
+		const double used = static_cast<double>(m[2] >> 20), total = static_cast<double>(m[0] >> 20);
+		rows.push_back({"GPU", Fmt("%3u %%   %u C", u[0], t), kOrange});
+		if (clk > 0) rows.push_back({"GPU reloj", Fmt("%4u MHz", clk), kOrange});
+		rows.push_back({"VRAM", Fmt("%.1f / %.0f GB", used / 1024.0, total / 1024.0), UseColor(used, total)});
+	} else {
+		rows.push_back({"GPU", "(sin nvidia-smi)", kOrange});
+		if (g_rt.pc.amd) rows.push_back({"GPU reloj", "n/a", kOrange});
+	}
+	{
+		FILETIME fi, fk, fu;
+		if (GetSystemTimes(&fi, &fk, &fu)) {
+			const auto q = [](FILETIME f) { return (static_cast<uint64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+			const uint64_t idle = q(fi), total = q(fk) + q(fu);
+			const double   busy = total > total0 ? 100.0 * (1.0 - static_cast<double>(idle - idle0) / static_cast<double>(total - total0)) : 0.0;
+			idle0 = idle, total0 = total;
+			rows.push_back({"CPU", Fmt("%3d %%", static_cast<int>(std::lround(std::clamp(busy, 0.0, 100.0)))), kOrange});
+		}
+		if (const int mhz = cpu.Mhz(); mhz > 0) rows.push_back({"CPU reloj", Fmt("%4d MHz", mhz), kOrange});
+		MEMORYSTATUSEX ms {};
+		ms.dwLength = sizeof(ms);
+		if (GlobalMemoryStatusEx(&ms)) {
+			const double gb = 1024.0 * 1024.0 * 1024.0;
+			const double used = static_cast<double>(ms.ullTotalPhys - ms.ullAvailPhys) / gb, total = static_cast<double>(ms.ullTotalPhys) / gb;
+			rows.push_back({"RAM", Fmt("%.1f / %.0f GB", used, total), UseColor(used, total)});
+			const double climit = static_cast<double>(ms.ullTotalPageFile) / gb, cused = climit - static_cast<double>(ms.ullAvailPageFile) / gb;
+			if (climit > 0) rows.push_back({"Commit", Fmt("%.1f / %.0f GB", cused, climit), cused / climit > 0.90 ? kRed : UseColor(cused, climit)});
+		}
+	}
+#endif
+	// Get-Fps: the log's last 64 KiB.
+	const char* log_env = std::getenv("KYTY_RUN_LOG");
+	std::string text;
+	uint64_t    len = 0, take = 0;
+	if (log_env != nullptr && *log_env != '\0') {
+		std::ifstream in(std::filesystem::u8path(log_env), std::ios::binary);
+		in.seekg(0, std::ios::end);
+		len  = static_cast<uint64_t>(in.tellg());
+		take = std::min<uint64_t>(len, 65536);
+		text.resize(take);
+		in.seekg(static_cast<std::streamoff>(len - take));
+		in.read(text.data(), static_cast<std::streamsize>(take));
+		// Update-ScaleLog: on from the last position, up to 8 MiB at a time.
+		if (L.path != log_env) L = LogState {}, L.path = log_env;
+		if (len < L.pos) L.pos = 0;
+		const uint64_t more = std::min<uint64_t>(len - L.pos, 8u << 20);
+		std::string    part(more, '\0');
+		in.clear();
+		in.seekg(static_cast<std::streamoff>(L.pos));
+		in.read(part.data(), static_cast<std::streamsize>(more));
+		L.pos += more;
+		std::smatch mm;
+		const auto last = [&](const std::string& t, const std::regex& re, std::smatch& out) {
+			bool found = false;
+			for (std::sregex_iterator it(t.begin(), t.end(), re), end; it != end; ++it) out = *it, found = true;
+			return found;
+		};
+		static const std::regex re_ratio(R"(KYTY_UPSCALE_RATIO=([0-9.]+) on a (\d{3,4}) high display: (\d{3,4}))");
+		static const std::regex re_disp(R"(on a (\d{3,4}) high display)");
+		static const std::regex re_preset(R"(DLSS[^\r\n]*?(?:preset|model[o]?)[ =:]+([A-Z])\b)");
+		static const std::regex re_sr(R"((DLSS|XeSS|FSR 3\.1)[^\r\n]*?(\d{3,4})x(\d{3,4}) -> (\d{3,4})x(\d{3,4}))");
+		static const std::regex re_native(R"(performance mode renders (\d{3,4})x(\d{3,4}))");
+		static const std::regex re_xess(R"(XeSS: libxess\.dll ([0-9.]+) loaded)");
+		if (last(part, re_ratio, mm)) L.ratio = mm[1], L.out_h = std::atoi(mm[2].str().c_str()), L.in_h = std::atoi(mm[3].str().c_str());
+		else if (last(part, re_disp, mm)) L.out_h = std::atoi(mm[1].str().c_str());
+		if (part.find("starts in its cinematic mode (KYTY_DS_FORCE_MODE") != std::string::npos) {
+			L.force4k = true;
+			if (L.out_h == 0) L.out_h = 2160;
+		}
+		if (std::regex_search(part, std::regex(R"(DLSS super resolution[^\r\n]*ready)"))) L.dlss_ready = true, L.kind = "DLSS";
+		if (std::regex_search(part, mm, re_xess)) {
+			L.xess_ver = mm[1];
+			if (L.kind.empty()) L.kind = "XeSS";
+		}
+		if (last(part, re_preset, mm)) L.preset = mm[1];
+		{
+			std::vector<std::smatch> all;
+			for (std::sregex_iterator it(part.begin(), part.end(), re_sr), end; it != end; ++it) all.push_back(*it);
+			for (auto it = all.rbegin(); it != all.rend(); ++it) {
+				const int h = std::atoi((*it)[3].str().c_str());
+				if (h >= 600) {
+					L.kind = (*it)[1].str() == "FSR 3.1" ? "FSR" : (*it)[1].str();
+					L.in_h = h;
+					if (L.out_h == 0) L.out_h = std::atoi((*it)[5].str().c_str());
+					break;
+				}
+			}
+		}
+		if (last(part, re_native, mm)) L.native = std::atoi(mm[2].str().c_str());
+	}
+	struct {
+		double mean = 0, max = 0, fps = 0, fg_shown = 0, lat_mean = 0, lat_p95 = 0;
+		int    fg_mult = 0;
+		int64_t key = -1;
+		bool   any = false;
+	} f;
+	if (!text.empty()) {
+		static const std::regex re_fps(R"(\[fps\] \d+ frames: mean ([0-9.]+) ms, max ([0-9.]+))");
+		static const std::regex re_f5(R"(Frames \(5 s\): ([0-9.]+) fps)");
+		static const std::regex re_rs(R"(\[[a-z0-9]+\][^\r\n]*?real ([0-9.]+) fps, shown ([0-9.]+) fps)");
+		static const std::regex re_x(R"(\[(dlssg|fsr3-mfg)\][^\r\n]*?x(\d))");
+		static const std::regex re_lat(R"(\[lat\] input->present mean ([0-9.]+) ms, p95 ([0-9.]+), max ([0-9.]+); \+scanout ([0-9.]+); fg \+([0-9.]+) \(n (\d+)\)(?:; total ([0-9.]+), p95 ([0-9.]+))?)");
+		std::vector<std::smatch> fm;
+		for (std::sregex_iterator it(text.begin(), text.end(), re_fps), end; it != end; ++it) fm.push_back(*it);
+		int64_t prev_idx = -1;
+		if (!fm.empty()) {
+			f.any = true;
+			prev_idx = fm.size() > 1 ? fm[fm.size() - 2].position(0) : -1;
+			f.mean = Num(fm.back()[1]), f.max = Num(fm.back()[2]);
+			if (f.mean > 0) f.fps = std::round(1000.0 / f.mean);
+			f.key = static_cast<int64_t>(len - take) + fm.back().position(0);
+		} else {
+			std::smatch m5;
+			for (std::sregex_iterator it(text.begin(), text.end(), re_f5), end; it != end; ++it) m5 = *it;
+			if (!m5.empty()) f.any = true, f.fps = std::round(Num(m5[1]));
+		}
+		std::smatch mx, mr, ml;
+		bool hx = false, hr = false, hl = false;
+		for (std::sregex_iterator it(text.begin(), text.end(), re_x), end; it != end; ++it) mx = *it, hx = true;
+		for (std::sregex_iterator it(text.begin(), text.end(), re_rs), end; it != end; ++it) mr = *it, hr = true;
+		for (std::sregex_iterator it(text.begin(), text.end(), re_lat), end; it != end; ++it) ml = *it, hl = true;
+		if (hx) f.fg_mult = std::atoi(mx[2].str().c_str());
+		if (hr && mr.position(0) > prev_idx && mr[2].str() != mr[1].str()) f.fg_shown = std::round(Num(mr[2]));
+		if (hl) {
+			const double add = Num(ml[4]) + Num(ml[5]);
+			f.lat_mean = ml[7].matched ? Num(ml[7]) : Num(ml[1]) + add;
+			f.lat_p95  = ml[8].matched ? Num(ml[8]) : Num(ml[2]) + add;
+		}
+	}
+	const bool fg_on = !fg_label.empty() && fg_label != "Sin frame generation" && fg_label != "No frame generation";
+	double     shown = 0;
+	std::vector<double> ft, ftm;
+	{
+		std::scoped_lock lock(g_mutex);
+		ft = g_ft, ftm = g_ft_max;
+	}
+	if (f.any) {
+		shown = f.fg_shown > 0 && fg_on ? f.fg_shown : f.fps;
+		if (f.mean > 0) {
+			rows.push_back({"Frame", Fmt("%.1f ms", f.mean), kOrange});
+			if (f.key != L.last_key) {
+				L.last_key_at = std::chrono::steady_clock::now();
+				L.last_key    = f.key;
+				ft.push_back(f.mean), ftm.push_back(f.max);
+				while (ft.size() > 60) ft.erase(ft.begin()), ftm.erase(ftm.begin());
+			}
+		}
+	}
+	if (f.lat_mean > 0) {
+		const ImU32 lc = f.lat_mean < 40 ? kGreen : f.lat_mean < 60 ? kGold : f.lat_mean < 80 ? kOrange : kRed;
+		rows.push_back({"Latencia", Fmt("%.0f ms (p95 %.0f)", f.lat_mean, f.lat_p95), lc});
+	}
+	// Get-Scale.
+	{
+		const char*       dot   = " \xC2\xB7 ";
+		const char*       arrow = "\xE2\x86\x92";
+		const std::string lk    = scale_label.substr(0, scale_label.find(' '));
+		std::string       kind  = L.kind;
+		if (kind.empty() && (lk == "DLSS" || lk == "XeSS" || lk == "FSR")) kind = lk;
+		const int out_h = L.out_h != 0 ? L.out_h : (g_rt.pc.screen_h > 0 ? g_rt.pc.screen_h : 1440);
+		std::string rk, mode, res, model;
+		const auto mode_name = [](const std::string& label) {
+			const size_t sp = label.find(' ');
+			if (sp == std::string::npos) return std::string();
+			std::string m = label.substr(sp + 1);
+			const std::pair<const char*, const char*> reps[] = {{"U.cal.+", "Ultra calidad+"}, {"U.calidad", "Ultra calidad"}, {"Equilib.", "Equilibrado"},
+			                                                    {"U.rendim.", "Ultra rendimiento"}, {"Rendim.", "Rendimiento"}};
+			for (const auto& [a, b]: reps)
+				if (const size_t at = m.find(a); at != std::string::npos) m.replace(at, std::strlen(a), b);
+			return m;
+		};
+		if (!kind.empty()) {
+			rk = kind;
+			if (lk == kind) mode = mode_name(scale_label);
+			int in_h = L.in_h;
+			if (in_h == 0 && lk == kind && !L.ratio.empty()) in_h = static_cast<int>(std::lround(out_h / Num(L.ratio)));
+			std::string ratio = !L.ratio.empty() ? " (x" + L.ratio + ")" : in_h != 0 ? Fmt(" (x%.3g)", out_h / static_cast<double>(in_h)) : std::string();
+			res = in_h != 0 ? Fmt("%dp %s %dp%s", in_h, arrow, out_h, ratio.c_str()) : Fmt("%s %dp", arrow, out_h);
+			if (kind == "DLSS") {
+				std::string pk = L.preset;
+				if (pk.empty()) pk = std::array<const char*, 4> {"", "K", "L", "M"}[dlss_preset];
+				model = pk == "K" ? "K (Transformer, DLSS 4)" : pk == "L" ? "L (Transformer, DLSS 4.5)" : pk == "M" ? "M (Transformer, DLSS 4.5)" : pk.empty() ? "auto (NVIDIA)" : pk;
+				if (!L.dlss_ready && L.in_h == 0) model += " ...";
+			} else if (kind == "XeSS") model = L.xess_ver == "2.0.2" ? "XeSS 3.0.2" : !L.xess_ver.empty() ? "XeSS " + L.xess_ver : "XeSS";
+			else if (kind == "FSR") model = "FSR 3.1";
+		} else if (L.force4k) rk = "Nativo", res = "2160p (4K)";
+		else if (scale_label.find("juego") != std::string::npos) rk = "Juego", res = Fmt("%sp %s %dp", scale_label.substr(0, scale_label.find('p')).c_str(), arrow, out_h), model = "reescalado del juego";
+		else if (L.native != 0) rk = "Nativo", res = Fmt("%dp %s %dp", L.native, arrow, out_h);
+		else rk = scale_label;
+		if (scale_label.rfind("FSR 4", 0) == 0 && rk == "FSR") rk = "FSR 4", mode = scale_label.substr(6), model = "FSR 4 (IA, modelo v07)";
+		if (!rk.empty()) {
+			const ImU32 col = rk == "DLSS" ? kGreen : rk == "FSR" || rk == "FSR 4" ? kRed : rk == "XeSS" ? kBlue : kOrange;
+			rows.push_back({"Escala", mode.empty() ? rk : rk + dot + mode, col});
+			if (!res.empty()) rows.push_back({"Resol.", res, col});
+			if (!model.empty()) rows.push_back({"Modelo", model, col});
+		}
+	}
+	const bool fg_nv = fg_label.find("DLSS") != std::string::npos || fg_label.find("Nvidia") != std::string::npos;
+	if (fg_on) {
+		const ImU32 fg_col = fg_nv ? kGreen : kRed;
+		if (fg_label.rfind("MODO ", 0) == 0 || fg_label.rfind("MODE ", 0) == 0) rows.push_back({"", fg_label, fg_col});
+		else {
+			rows.push_back({"FG", fg_label + (fg_nv ? " (modelo C)" : ""), fg_col});
+			if (f.fg_mult > 0) rows.push_back({"FG ahora", Fmt("x%d", f.fg_mult), fg_col});
+		}
+	}
+	rows.push_back({"Anti-Lag", al, al == "No" ? kKhaki : kGreen});
+	rows.push_back({"", modo, kKhaki});
+	if (f.key >= 0 && L.last_key_at != std::chrono::steady_clock::time_point {} &&
+	    std::chrono::steady_clock::now() - L.last_key_at > std::chrono::seconds(3))
+		shown = 0;
+	std::scoped_lock lock(g_mutex);
+	g_rows     = std::move(rows);
+	g_fps_text = shown > 0 ? Fmt("FPS %.0f", shown) : std::string();
+	g_fps_color = fg_on ? (fg_nv ? kGreen : kRed) : kWhite;
+	g_ft = std::move(ft), g_ft_max = std::move(ftm);
+}
+
+void Start() {
+	if (g_started.exchange(true)) return;
+	std::thread([] {
+		LogState L;
+#if defined(_WIN32)
+		Nvml    nv;
+		CpuPerf cpu;
+		nv.Init();
+		cpu.Init();
+#endif
+		uint64_t idle0 = 0, total0 = 0;
+		for (;;) {
+			if (g_shown.load(std::memory_order_relaxed)) {
+				Sample(L,
+#if defined(_WIN32)
+				       nv, cpu,
+#endif
+				       idle0, total0);
+				Bump();
+			}
+			std::this_thread::sleep_for(std::chrono::seconds(1));
+		}
+	}).detach();
+}
+
+bool Shown() {
+	return g_shown.load(std::memory_order_relaxed);
+}
+
+void Toggle() {
+	g_shown = !g_shown.load();
+	if (g_shown.load()) Start();
+	Bump();
+}
+
+// Top-centre, 10 px x S from the top.
+void Draw(float width, float height) {
+	if (!g_shown.load(std::memory_order_relaxed)) return;
+	const float S = std::clamp(height / 1080.0f, 1.0f, 2.5f);
+	ImFont*     f = FindFont("consolab");
+	if (f == nullptr) f = FindFont("segoeui");
+	if (f == nullptr) f = ImGui::GetFont();
+	std::vector<Row>    rows;
+	std::string         fps;
+	ImU32               fps_col;
+	std::vector<double> ft, ftm;
+	{
+		std::scoped_lock lock(g_mutex);
+		rows = g_rows, fps = g_fps_text, fps_col = g_fps_color, ft = g_ft, ftm = g_ft_max;
+	}
+	if (rows.empty()) rows.push_back({"", "Cargando...", kOrange});
+	const float row_px = std::round(15 * S), title_px = std::round(16 * S), fps_px = std::round(34 * S), small_px = std::round(10 * S);
+	const float pad = std::round(8 * S), row_h = std::ceil(row_px * 1.12f), title_h = std::ceil(title_px * 1.4f), fps_h = fps.empty() ? 0.0f : std::ceil(fps_px * 1.1f);
+	float name_w = std::round(90 * S), val_w = std::round(230 * S), wide_w = 0;
+	for (const auto& r: rows) {
+		const float w = f->CalcTextSizeA(row_px, FLT_MAX, 0, r.value.c_str()).x;
+		if (!r.name.empty()) {
+			name_w = std::max(name_w, f->CalcTextSizeA(row_px, FLT_MAX, 0, r.name.c_str()).x + std::round(10 * S));
+			val_w  = std::max(val_w, w);
+		} else wide_w = std::max(wide_w, w);
+	}
+	const float W = std::min(std::max(name_w + val_w, wide_w) + 2 * pad, width * 0.4f);
+	const float graph_h = std::round(90 * S);
+	const float x0 = std::floor((width - W) * 0.5f), y0 = std::round(10 * S);
+	auto*       dl = ImGui::GetForegroundDrawList();
+	const char* title = "DEMON'S SOULS REMAKE";
+	const float tw = f->CalcTextSizeA(title_px, FLT_MAX, 0, title).x;
+	dl->AddText(f, title_px, {std::floor(x0 + (W - tw) * 0.5f), y0 + pad}, kWhite, title);
+	float y = y0 + pad + title_h;
+	const ImVec4 clip {x0, y0, x0 + W, y0 + 4000};
+	for (const auto& r: rows) {
+		if (!r.name.empty()) {
+			dl->AddText(f, row_px, {x0 + pad, y}, kName, r.name.c_str(), nullptr, 0, &clip);
+			dl->AddText(f, row_px, {x0 + pad + name_w, y}, r.color, r.value.c_str(), nullptr, 0, &clip);
+		} else dl->AddText(f, row_px, {x0 + pad, y}, r.color, r.value.c_str(), nullptr, 0, &clip);
+		y += row_h;
+	}
+	if (!fps.empty()) {
+		dl->AddText(f, fps_px, {x0 + pad, y}, fps_col, fps.c_str());
+		y += fps_h;
+	}
+	y += pad;
+	// The frametime graph: 40 ms at the top, 8.3 / 16.7 / 33.3 lines, the peaks (orange) and the mean (green).
+	const float gy = y, gw = W, top = 40.0f;
+	for (float ms: {8.3f, 16.7f, 33.3f}) {
+		const float ly = gy + graph_h - ms / top * graph_h;
+		dl->AddLine({x0, ly}, {x0 + gw, ly}, IM_COL32(60, 60, 60, 255));
+	}
+	dl->AddText(f, small_px, {x0, gy}, IM_COL32(128, 128, 128, 255), "frametime (ms)  40   verde media, naranja picos");
+	dl->AddText(f, small_px, {x0, gy + graph_h - 16.7f / top * graph_h - small_px}, IM_COL32(128, 128, 128, 255), "16.7");
+	const auto line = [&](const std::vector<double>& list, ImU32 col) {
+		if (list.size() < 2) return;
+		const float step = gw / 59.0f, xs = x0 + gw - (list.size() - 1) * step;
+		for (size_t i = 1; i < list.size(); i++) {
+			const float y1 = gy + graph_h - std::min(static_cast<float>(list[i - 1]), top) / top * graph_h;
+			const float y2 = gy + graph_h - std::min(static_cast<float>(list[i]), top) / top * graph_h;
+			dl->AddLine({xs + (i - 1) * step, y1}, {xs + i * step, y2}, col, 2.0f * S);
+		}
+	};
+	line(ftm, IM_COL32(255, 150, 40, 255));
+	line(ft, IM_COL32(0, 255, 0, 255));
+}
+} // namespace MetricsPanel
+
 // ---- (ds-pc-port37) F1 > Mapear mando and F1 > Teclado y raton: pages of the in-game menu (as Ver trofeos). ----
 namespace F1Pages {
 ImTextureData* g_mouse = nullptr;
@@ -4548,6 +5030,7 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 }
 
 void DrawInGame(float width, float height) {
+	MetricsPanel::Draw(width, height); // (ds-pc-port41) under the menu too
 	if (g_open.load() && !Resume::SaveAndQuitActive()) {
 		DrawInGameMenu(width, height);
 		return;
@@ -4625,6 +5108,8 @@ const PortLive::Hooks kHooks {WindowCreated, OnEvent, Presented, WantsOverlay, R
 
 void InstallMenu(const Runtime& runtime) {
 	g_rt    = runtime;
+	// (ds-pc-port41) Metricas (settings.ini metricas=1/2): the panel shown from the start (F8 hides it).
+	if (runtime.launched.metrics == "1" || runtime.launched.metrics == "2") MetricsPanel::Toggle();
 	g_saved = runtime.launched;
 	g_edit  = runtime.launched;
 	ApplyLive(runtime.launched);

@@ -1354,7 +1354,11 @@ int main(int argc, char* argv[]) {
 	std::fflush(stdout);
 
 	if (settings.backup_saves) BackupSaves(root);
-	if (settings.metrics == "1" || settings.metrics == "2") StartMetricsWindow(root, settings, pc);
+	// (ds-pc-port41) Metricas is drawn in the game now (ds-menu.cpp MetricsPanel: metricas.ps1's rows, top-centre); the
+	// separate metricas.ps1 window only with KYTY_PORT_METRICS_WINDOW=1.
+	if ((settings.metrics == "1" || settings.metrics == "2") && std::getenv("KYTY_PORT_METRICS_WINDOW") != nullptr &&
+	    std::string(std::getenv("KYTY_PORT_METRICS_WINDOW")) == "1")
+		StartMetricsWindow(root, settings, pc);
 	if (mask != system_mask) SetProcessAffinityMask(GetCurrentProcess(), static_cast<DWORD_PTR>(mask));
 	SplashStatus("Iniciando...");
 

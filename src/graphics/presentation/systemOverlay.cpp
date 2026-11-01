@@ -674,6 +674,10 @@ struct SystemOverlay::Impl {
 		if (exists(fonts + "segoeuib.ttf")) {
 			hud_font = io.Fonts->AddFontFromFileTTF((fonts + "segoeuib.ttf").c_str(), 32.0f);
 		}
+		// (ds-pc-port41) Consolas Bold for the PC port's Metricas panel (metricas.ps1's face); found by name there.
+		if (exists(fonts + "consolab.ttf")) {
+			(void)io.Fonts->AddFontFromFileTTF((fonts + "consolab.ttf").c_str(), 32.0f);
+		}
 		// The dialogs draw the game's own texts (save names and their detail, messages), which are not
 		// ASCII: the system's CJK face where Windows has one, with the ranges those texts use. Plain
 		// "?" for every character is what the default font, which only holds ASCII, drew before.
