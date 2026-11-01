@@ -852,7 +852,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     vk::Extent2D fsr_out{frame->width, frame->height};
     auto frame_fsr = fsr_settings;
-    if (bb_presented && (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss ||
+    if ((bb_presented || (BB::Upscale::Enabled() && BB::Upscale::LastFrameUpscaled())) &&
+        (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss ||
                          BB::Upscale::Cfg().kind == BB::SR::Kind::Xess ||
                          BB::Upscale::Cfg().kind == BB::SR::Kind::Native) &&
         BB::Upscale::LiveSharpness() > 0.0f) {
