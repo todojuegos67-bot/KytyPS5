@@ -931,13 +931,15 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			// (ds-pc-port40) Suave / Medio / Fuerte used to change only the foveated grid's edge density (GPU time): the
 			// model's look stayed the same at every level and "alta" was the default 1. Now the level is the model's own
 			// DLSSNR.Intensity and Intensidad the share of its edit applied (above 1: amplified), so each step is visible.
-			static const char* intensity[] = {"1", "0.75", "1", "1"}; // (ds-pc-port43) never above the model's 1 (1.5 at Fuerte: 100% of the pixels edited, the odd colours)
+			static const char* intensity[] = {"1", "0.75", "1.1", "1.5"}; // (port40, as the user saw Intensidad media)
 			sets.emplace_back("KYTY_DLSS_NR", "1");
-			sets.emplace_back("KYTY_DLSS_NR_INTENSITY", intensity[level]);
-			// (ds-pc-port43) The share of the model's edit applied stays at most 1 (the model's own picture): above 1 the edit
-			// was extrapolated past what the model made (1.5 at "alta"), the user's "colores raros" with DLSS 5. The model's
-			// own Intensity (the levels above) is what makes it stronger; baja / media / alta 0.5 / 0.75 / 1.
-			sets.emplace_back("KYTY_DLSS_NR_STRENGTH", s.dlss5_strength == "baja" ? "0.5" : s.dlss5_strength == "media" ? "0.75" : "1");
+			// (ds-pc-port43) Intensidad alta: the glitches (odd colours) only there. The model's own intensity at most 1 and the
+			// edit share a little above media's (1.15): a bit stronger than media, no extrapolated colours. Baja / media as in
+			// port42 (media looked right to the user).
+			const bool alta = s.dlss5_strength != "baja" && s.dlss5_strength != "media";
+			sets.emplace_back("KYTY_DLSS_NR_INTENSITY", alta && std::atof(intensity[level]) > 1.0 ? "1" : intensity[level]);
+			// (ds-pc-port43) The share of the model's edit: baja 0.5, media 1 (as port42), alta 1.15 (was 1.5).
+			sets.emplace_back("KYTY_DLSS_NR_STRENGTH", s.dlss5_strength == "baja" ? "0.5" : s.dlss5_strength == "media" ? "1" : "1.15");
 		} else {
 			sets.emplace_back("KYTY_FOVEATED", "0");
 			sets.emplace_back("KYTY_DLSS_NR", "0");
