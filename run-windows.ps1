@@ -340,6 +340,9 @@ public static long[] L3() {
 			$best = 0
 			for ($i = 2; $i + 1 -lt $l3.Count; $i += 2) { if ($l3[$i + 1] -gt $l3[$best + 1]) { $best = $i } }
 			$ccd = $l3[$best] -band $all
+			# (ds-pc-port47) Only an asymmetric V-Cache part (L3 sizes differ: 7950X3D, 9950X3D); otherwise no affinity.
+			$sizes = @(for ($i = 1; $i -lt $l3.Count; $i += 2) { $l3[$i] }) | Sort-Object -Unique
+			if ($sizes.Count -lt 2) { $ccd = 0 }
 			if ($ccd -ne 0) {
 				$mask = $ccd
 				Write-Host ("CPU:      {0} L3 caches; the emulator on the one of {1} MiB (CPUs 0x{2:X})" -f ($l3.Count / 2), ($l3[$best + 1] / 1MB), $ccd)

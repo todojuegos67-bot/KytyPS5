@@ -451,12 +451,13 @@ uint64_t LargestL3Mask() {
 	if (!GetLogicalProcessorInformationEx(RelationCache, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
 	                                      &length))
 		return 0;
-	uint64_t best_mask = 0, best_size = 0;
+	uint64_t best_mask = 0, best_size = 0, min_size = ~uint64_t(0);
 	int      count     = 0;
 	for (DWORD offset = 0; offset < length;) {
 		const auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data() + offset);
 		if (info->Relationship == RelationCache && info->Cache.Level == 3 && info->Cache.GroupMask.Group == 0) {
 			count++;
+			min_size = std::min<uint64_t>(min_size, info->Cache.CacheSize);
 			if (info->Cache.CacheSize > best_size) {
 				best_size = info->Cache.CacheSize;
 				best_mask = info->Cache.GroupMask.Mask;
@@ -464,7 +465,9 @@ uint64_t LargestL3Mask() {
 		}
 		offset += info->Size;
 	}
-	return count >= 2 ? best_mask : 0;
+	// (ds-pc-port47) Only a CPU whose L3 caches differ (an asymmetric V-Cache part: 7950X3D, 9950X3D): one CCD for the
+	// game. One L3, or several of one size (7950X, Threadripper, Intel): 0, no affinity at all.
+	return count >= 2 && best_size > min_size ? best_mask : 0;
 }
 
 std::string PerformanceCpus(uint64_t allowed) {
