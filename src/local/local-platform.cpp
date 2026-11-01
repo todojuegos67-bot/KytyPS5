@@ -877,6 +877,14 @@ void MakeCriticalThread() {
 	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 }
 
+void SetThreadNormalPriority(uint32_t thread_id, bool normal) {
+	if (thread_id == 0) return;
+	HANDLE thread = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION, FALSE, thread_id);
+	if (thread == nullptr) return;
+	(void)SetThreadPriority(thread, normal ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
+	CloseHandle(thread);
+}
+
 namespace {
 // d3dkmthk.h (WDK) structures for the display's vertical blank, taken from gdi32 at run time.
 using KmtHandle = UINT;
@@ -2328,6 +2336,8 @@ void MakeBackgroundThread(const char* avoid_cpus) {
 }
 
 void MakeCriticalThread() {}
+
+void SetThreadNormalPriority(uint32_t /*thread_id*/, bool /*normal*/) {}
 
 void SleepUntilPrecise(int64_t deadline_ns) {
 	using clock = std::chrono::steady_clock;

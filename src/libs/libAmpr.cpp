@@ -14,6 +14,7 @@
 #include "loader/systemContent.h"
 #include "local-platform.h"
 #include "scene-tags.h"
+#include "shader-gate.h"
 #include "slow-log.h"
 #include "soft-release.h"
 
@@ -1314,6 +1315,8 @@ static void NoteSceneRead(const std::string& path) {
 		if (c >= '0' && c <= '9') id = id << 4u | static_cast<uint32_t>(c - '0');
 		else if (c != '_') return;
 	}
+	// (ds-pc-port44) No world before the start-up's shaders and pipelines are all made (local/shader-gate.h).
+	ShaderGate::WaitBeforeWorld(name);
 	SceneTags::Enter(id != 0 ? id : 0x80000000u);
 	// A map's load list: the world (the world gate: frame generation and frames above 60 from here).
 	VideoOut::NoteWorldFile(path.c_str());

@@ -70,6 +70,9 @@ void MakeBackgroundThread(const char* avoid_cpus);
 // The calling thread above the normal priority of the game's threads (Windows: THREAD_PRIORITY_HIGHEST; Linux:
 // unchanged): the render thread, which every frame waits for, is not time-sliced against them on its CPUs.
 void MakeCriticalThread();
+// (ds-pc-port44) Another thread of the process (ThreadId) at normal priority (`normal`) or below it again: a background
+// worker the render thread waits for (Windows; elsewhere nothing).
+void SetThreadNormalPriority(uint32_t thread_id, bool normal);
 
 // The refresh rate in Hz of the display a window is on (its HWND on Windows; 0 when unknown or elsewhere).
 int DisplayRefreshHz(void* window);

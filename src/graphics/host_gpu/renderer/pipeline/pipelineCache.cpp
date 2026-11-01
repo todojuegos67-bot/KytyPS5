@@ -29,6 +29,7 @@
 #include "native-resource-state.h"
 #include "shader-warmup-cache.h"
 #include "scene-tags.h"
+#include "shader-gate.h"
 #include "live-census.h"
 #include "live-counters.h"
 #include "device-fault.h"
@@ -282,6 +283,16 @@ bool DumpWanted(uint64_t hash) {
 
 // (ds-pc-port42) Render-thread pipeline creations slow enough to log (SLOW Create*Pipeline): the session's count, at the end.
 static std::atomic<uint32_t> g_render_pipeline_hitches {0};
+
+// (ds-pc-port44) Pipelines the game made itself (where first needed: on the render thread or its async workers, not the
+// warmup), and of them those the driver compiled (not made of the static store's binaries): "runtime-created pipelines"
+// at the end. Their recipes go into the recording (warmup-v2), which the next start-up's warmup makes before play.
+static std::atomic<uint64_t> g_runtime_pipelines {0};
+static std::atomic<uint64_t> g_runtime_compiled {0};
+static void CountRuntimePipeline(bool from_store) {
+	g_runtime_pipelines.fetch_add(1, std::memory_order_relaxed);
+	if (!from_store) g_runtime_compiled.fetch_add(1, std::memory_order_relaxed);
+}
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
@@ -831,6 +842,8 @@ struct PipelineCache::ProgramCache {
 			uint32_t                                          first_record = UINT32_MAX; // (by_record's index of it)
 			std::vector<uint32_t>                             records;
 			std::atomic<uint8_t>                              state {Pending};
+			std::atomic<uint32_t>                             worker {0};      // (ds-pc-port44) its translating thread
+			std::atomic<bool>                                 boosted {false}; // (raised for the render thread waiting)
 			std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 			std::vector<PrefetchedModule>                     modules;
 			// The plan in the scratch file instead (zstd-compressed ResourcePlanSerial bytes): `plan` stays empty until
@@ -841,6 +854,7 @@ struct PipelineCache::ProgramCache {
 			std::shared_ptr<const ShaderRecompiler::IR::LinearSrtPlan>       plan_linear;
 		};
 		~Prefetch() {
+			ShaderGate::prefetch_running.store(false, std::memory_order_release); // (ds-pc-port44)
 			{
 				std::lock_guard lock(follow_mutex);
 				stop.store(true, std::memory_order_relaxed);
@@ -856,6 +870,7 @@ struct PipelineCache::ProgramCache {
 		std::vector<std::unique_ptr<Group>>                    groups; // in translation order
 		std::unordered_map<ProgramKey, Group*, ProgramKeyHash> index;  // read-only once `ready`
 		std::atomic<bool>                                      ready {false}, stop {false};
+		std::chrono::steady_clock::time_point                  started = std::chrono::steady_clock::now(); // (ds-pc-port44)
 		std::atomic<size_t>                                    next {0}, finished {0};
 		// The groups of recorded programs (the first ones) and how many workers go on after them (StartPrefetch).
 		size_t   recorded_groups = 0;
@@ -995,6 +1010,7 @@ struct PipelineCache::ProgramCache {
 	                   uint32_t host_subgroup_size) {
 		prefetch = std::make_unique<Prefetch>();
 		prefetch_live.store(prefetch.get(), std::memory_order_release);
+		ShaderGate::prefetch_running.store(true, std::memory_order_release); // (ds-pc-port44: until all are translated)
 		prefetch->loader = std::thread([this, path = std::move(path), identity = std::move(identity),
 		                                warm = std::move(warm), recorded = std::move(recorded),
 		                                released = std::move(released), host_subgroup_size]() mutable {
@@ -1002,6 +1018,15 @@ struct PipelineCache::ProgramCache {
 			LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
 			auto&      p     = *prefetch;
 			const auto begin = std::chrono::steady_clock::now();
+			// (ds-pc-port44) A prefetch that ends here without workers (no inputs, no temporary file), or with nothing to
+			// translate, holds no world load (local/shader-gate.h).
+			struct GateRelease {
+				Prefetch& p;
+				~GateRelease() {
+					if (!p.ready.load(std::memory_order_acquire) || p.groups.empty())
+						ShaderGate::prefetch_running.store(false, std::memory_order_release);
+				}
+			} gate_release {p};
 			// The release's recorded play (other PCs' tours of every world and players' play: the release's
 			// specialization hints, which precompile-windows.ps1 completes with this PC's seed file). A new install's prefetch
 			// went biggest first and had not reached the level's programs when the game got there: entering 1-1, the render
@@ -1169,9 +1194,13 @@ struct PipelineCache::ProgramCache {
 			if (n >= p.groups.size()) break;
 			(void)RunGroup(p, *p.groups[n]);
 			if (p.finished.fetch_add(1, std::memory_order_relaxed) + 1 == p.groups.size()) {
-				PipelineCacheLog("Shader prefetch: all {} programs translated, {} MiB of SPIR-V ({} MiB compressed)",
+				PipelineCacheLog("Shader prefetch: all {} programs translated, {} MiB of SPIR-V ({} MiB compressed), {} ms "
+				                 "after its start ({} from the disk store)",
 				                 p.groups.size(), p.spirv_bytes.load(std::memory_order_relaxed) >> 20u,
-				                 p.spill_end.load(std::memory_order_relaxed) >> 20u);
+				                 p.spill_end.load(std::memory_order_relaxed) >> 20u,
+				                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - p.started).count(),
+				                 p.disk_hits.load(std::memory_order_relaxed));
+				ShaderGate::prefetch_running.store(false, std::memory_order_release);
 				std::vector<std::vector<uint32_t>>().swap(p.inputs.records); // no longer read
 				const auto mib = [&](PrefetchMemoryPart part) { return p.memory[part].load(std::memory_order_relaxed) >> 20u; };
 				PipelineCacheLog("Shader prefetch memory (MiB): plan values {} memory infos {} other {} info {}, modules info {} "
@@ -1217,11 +1246,15 @@ struct PipelineCache::ProgramCache {
 	bool RunGroup(Prefetch& p, Prefetch::Group& group) {
 		auto expected = static_cast<uint8_t>(Prefetch::Pending);
 		if (!group.state.compare_exchange_strong(expected, Prefetch::Running, std::memory_order_acq_rel)) return false;
+		const auto self = LocalPlatform::ThreadId();
+		group.worker.store(self, std::memory_order_release);
 		PrefetchTranslate(group);
 		AddGroupMemory(p, group);
 		SpillPlan(p, group);
 		group.state.store(Prefetch::Done, std::memory_order_release);
 		group.state.notify_all();
+		// (ds-pc-port44) Raised while the render thread waited for this group (PrefetchedGroup): background again.
+		if (group.boosted.exchange(false, std::memory_order_acq_rel)) LocalPlatform::SetThreadNormalPriority(self, false);
 		return true;
 	}
 
@@ -1477,6 +1510,11 @@ struct PipelineCache::ProgramCache {
 			prefetch->claimed++;
 			return nullptr;
 		}
+		// (ds-pc-port44) The 11-01 log's dispatch.program=870 ms (translate_us=3201: not its own translation): the render
+		// thread waited here for a prefetch worker translating this program at below-normal priority, time-sliced
+		// against the warmup's and the driver's compile threads. The worker at normal priority for the wait.
+		if (state == Prefetch::Running && !group.boosted.exchange(true, std::memory_order_acq_rel))
+			LocalPlatform::SetThreadNormalPriority(group.worker.load(std::memory_order_acquire), true);
 		for (; state == Prefetch::Running; state = group.state.load(std::memory_order_acquire))
 			group.state.wait(Prefetch::Running, std::memory_order_acquire);
 		if (state != Prefetch::Done || group.source != SourceDigest(params.code, params.back_code) || !LoadSpilledPlan(group))
@@ -2854,6 +2892,9 @@ void PipelineCache::ReportSession() {
 	PipelineCacheLog("Made where first needed: {} programs translated ({:.0f} ms), {} pipelines ({:.0f} ms)",
 	                 m_program_cache->render_translations, m_program_cache->render_translate_ms, m_render_pipelines,
 	                 m_render_pipeline_ms);
+	// (ds-pc-port44) Every pipeline the game made itself this session (its recipe recorded for the next start-up's warmup).
+	PipelineCacheLog("runtime-created pipelines: {} ({} made by the driver: compiled or from its pipeline cache; {} of the static store's binaries)",
+	                 g_runtime_pipelines.load(), g_runtime_compiled.load(), g_runtime_pipelines.load() - g_runtime_compiled.load());
 	ReportStaticStore();
 	std::printf("Pipeline hitches on the render thread (a frame waited >= %.0f ms for a pipeline made there): %u\n", SlowLog::HitchThreshold(),
 	            g_render_pipeline_hitches.load());
@@ -3151,6 +3192,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		if (settings.background) {
 			m_program_cache->warmup.StartWriter();
 			m_program_cache->warming = true;
+			ShaderGate::warmup_running.store(true, std::memory_order_release); // (ds-pc-port44)
 			m_warmup_thread          = std::thread([this, settings] { RunWarmup(settings); });
 		} else {
 			RunWarmup(settings);
@@ -3181,7 +3223,16 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 	// By scene (local/scene-tags.h): the shader prefetch at once, the pipelines once the game loads its first scene (after
 	// the title and menus, whose own it makes where needed), those of later scenes as it loads them (SceneLoop).
 	const bool by_scene = settings.background && settings.warm_pipelines && m_scene_warmup && !m_warm_cache_only;
-	if (by_scene && !m_warmup_stop.load(std::memory_order_relaxed)) StartShaderPrefetch(std::move(recorded_inputs));
+	// (ds-pc-port44) Beside the game the shader prefetch starts with the pipelines too, not after them: both on every
+	// thread during the PS5 logo and the intro video (the shader gate holds the first world until both are done).
+	const bool prefetch_now = by_scene || (settings.background && ShaderGate::Enabled());
+	bool       prefetch_started = false;
+	if (prefetch_now && !m_warmup_stop.load(std::memory_order_relaxed)) {
+		StartShaderPrefetch(std::move(recorded_inputs));
+		prefetch_started = true;
+	}
+	size_t pipelines_loaded = 0;
+	const size_t recipes_recorded = programs.warm_recipes.size();
 	if (settings.warm_pipelines && !m_warmup_stop.load(std::memory_order_relaxed)) {
 		const auto pipelines_begin = std::chrono::steady_clock::now();
 		if (by_scene) {
@@ -3194,7 +3245,15 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 			if (!m_warmup_stop.load(std::memory_order_relaxed))
 				WarmScene(SceneTags::Current(), settings.compute_video, true);
 		} else {
+			{
+				Common::LockGuard lock(m_mutex);
+				pipelines_loaded = m_graphics_pipelines.size() + m_compute_pipelines.size();
+			}
 			WarmPipelines(m_warm_cache_only ? UINT64_MAX : settings.compute_video, settings.background);
+			{
+				Common::LockGuard lock(m_mutex);
+				pipelines_loaded = m_graphics_pipelines.size() + m_compute_pipelines.size() - pipelines_loaded;
+			}
 			if (m_warm_cache_only && !m_warmup_stop.load(std::memory_order_relaxed) && m_driver_cache != nullptr) {
 				{
 					std::lock_guard save(m_main_cache_mutex);
@@ -3217,6 +3276,10 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 		programs.static_warm.records   = {};
 		programs.static_warm.pipelines = {};
 	}
+	// (ds-pc-port44) The warmup's time and what it made (the line the user asked for).
+	PipelineCacheLog("Shader warmup: warmup time {} ms, {} pipelines loaded ({} recipes recorded; {})",
+	                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count(),
+	                 pipelines_loaded, recipes_recorded, by_scene ? "by scene: the rest as each world loads" : "all at start-up");
 	if (settings.background) {
 		Common::LockGuard lock(m_mutex);
 		programs.warming = false;
@@ -3253,11 +3316,12 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 			std::_Exit(0);
 		}
 	}
+	ShaderGate::warmup_running.store(false, std::memory_order_release); // (ds-pc-port44)
 	if (by_scene) {
 		SceneLoop(settings.compute_video);
 		return;
 	}
-	if (!m_warmup_stop.load(std::memory_order_relaxed)) StartShaderPrefetch(std::move(recorded_inputs));
+	if (!prefetch_started && !m_warmup_stop.load(std::memory_order_relaxed)) StartShaderPrefetch(std::move(recorded_inputs));
 }
 
 void PipelineCache::WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory) {
@@ -4548,6 +4612,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 			                       job->ps_active ? &job->ps_input_info : nullptr, job->pixel_program,
 			                       job->static_params, table ? TablePipelineCache() : m_driver_cache,
 			                       job->native_bindings);
+			CountRuntimePipeline(LastPipelineFromStore());
 			if (KeepsRemake(m_graphics, *job->pipeline, LastPipelineFromStore())) {
 				GraphicsMakeInputs inputs;
 				inputs.rendering       = job->rendering;
@@ -4604,6 +4669,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	                       vertex_program, ps_input_info, pixel_program, static_params,
 	                       m_driver_cache, native_bindings, FirstBuild(m_graphics));
 	const bool from_store = LastPipelineFromStore();
+	CountRuntimePipeline(from_store);
 	m_render_pipelines++;
 	m_render_pipeline_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - create_begin).count();
 	MainPipelineDone();
@@ -4700,6 +4766,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
 	                       FirstBuild(m_graphics));
 	const bool from_store = LastPipelineFromStore();
+	CountRuntimePipeline(from_store);
 	m_render_pipelines++;
 	m_render_pipeline_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - create_begin).count();
 	MainPipelineDone();
@@ -4762,6 +4829,7 @@ PipelineCache::Pipeline* PipelineCache::TryCreateComputePipeline(const ShaderCom
 		}, SlowLog::HitchThreshold());
 		CreatePipelineInternal(m_graphics, *job->pipeline, job->input_info, job->module, TablePipelineCache(),
 		                       PipelineBuild::Full, true);
+		CountRuntimePipeline(LastPipelineFromStore());
 		if (KeepsRemake(m_graphics, *job->pipeline, LastPipelineFromStore())) {
 			job->pipeline->remake = std::make_shared<const std::function<void(Pipeline&)>>(
 			    [this, input_info = job->input_info, module = job->module](Pipeline& target) {

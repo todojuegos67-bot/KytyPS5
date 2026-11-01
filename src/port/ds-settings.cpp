@@ -1090,6 +1090,11 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	env.Default("KYTY_STATIC_WARMUP", "0");
 	// (ds-pc-port43) The SPIR-V disk store back on (port37): the odd colours were DLSS 5 alta, not the store.
 	env.Default("KYTY_SPIRV_DISK", "1");
+	// (ds-pc-port44) Shaders and pipelines as the emulator's launcher loads them, all of them before play: every recorded
+	// pipeline at start-up (not world by world: KYTY_SCENE_WARMUP), the prefetch beside it from the first frame, and the
+	// game's first world load held until both are done, the progress line on screen (local/shader-gate.h).
+	env.Default("KYTY_SCENE_WARMUP", "0");
+	env.Default("KYTY_SHADER_GATE", "1");
 	// (ds-pc-port37) "Carga de shaders al maximo": the translation of the game's shaders at the start (the prefetch: every
 	// shader of the game, then the recorded ones' warmup) on every CPU thread, at background priority (the game stays ahead).
 	// By default the prefetch took CPUs - 12, at most half of them, and half of that after the recorded programs (a 16-thread

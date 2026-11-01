@@ -26,6 +26,7 @@
 #include "local/anti-lag.h"
 #include "local/rt-local-lights.h"
 #include "local-platform.h"
+#include "shader-gate.h"
 #include "perf-overlay.h"
 #if defined(_WIN32)
 #include "SDL_syswm.h"
@@ -587,12 +588,15 @@ struct Presenter::Impl {
 			return value != nullptr && *value != '\0' ? std::max(0, std::atoi(value)) : 6;
 		}();
 		if (status_shown == std::chrono::steady_clock::time_point {}) status_shown = now;
-		if (hide_after > 0 && now - status_shown >= std::chrono::seconds(hide_after)) return;
+		// (ds-pc-port44) A world load held at the shader gate (local/shader-gate.h): the line stays while it waits.
+		const bool gate = ShaderGate::waiting.load(std::memory_order_acquire);
+		if (!gate && hide_after > 0 && now - status_shown >= std::chrono::seconds(hide_after)) return;
 		std::array<char, 128> line {};
 		const bool es = PortLive::status_es.load(std::memory_order_relaxed); // (the PC port)
 		if (es && (progress.done < progress.total || progress.label != nullptr)) {
 			const bool pipelines = progress.label != nullptr && std::strstr(progress.label, "pipelines") != nullptr;
-			std::snprintf(line.data(), line.size(), "%s %zu/%zu  (%zu%%)", pipelines ? "Preparando pipelines" : "Preparando shaders",
+			std::snprintf(line.data(), line.size(), "%s%s %zu/%zu  (%zu%%)", gate ? "Antes de jugar: " : "",
+			              pipelines ? "Preparando pipelines" : "Preparando shaders",
 			              progress.done, progress.total, progress.done * 100 / progress.total);
 		} else if (progress.done < progress.total || progress.label != nullptr) {
 			std::snprintf(line.data(), line.size(), "%s %zu%%  (%zu / %zu)",
