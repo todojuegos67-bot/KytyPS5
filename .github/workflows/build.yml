@@ -276,8 +276,17 @@ jobs:
               Copy-Item _Build\deps\streamline\sdk\bin\x64\*.dll "$out\streamline"
               Get-ChildItem _Build\deps\streamline\sdk -File | Where-Object Name -match 'license' | Copy-Item -Destination "$out\streamline"
             }
-            # (10-28b) The owner's tested patched FidelityFX DLL (x4), committed, instead of the signed/built one.
-            Copy-Item tools\local\fsr3-mfg\prebuilt\amd_fidelityfx_vk.dll, _Build\deps\ffx\FidelityFX-LICENSE.txt $out
+            # (ds-pc-port41) The FidelityFX DLL built here from tools/local/fsr3-mfg/ffx-sdk-v1.1.4-mfg.patch (the step above,
+            # always on ds-pc-port branches), not the committed prebuilt: that one (10-29) predates the patch's command
+            # list pool fix (8 lists, no wait: VulkanCommandPool::get returned null and occupy() wrote to 0x38, the AMD
+            # MFG x2-x4 crashes of 10-31 / 11-01: 'cmp r15, 8' then 'inc qword [rsi+0x38]' with rsi 0 in the crash dump).
+            # The built DLL must carry the fix (its wait message); else the build fails rather than ship the crash.
+            $ffx = '_Build\deps\ffx\amd_fidelityfx_vk.dll'
+            if (!(Test-Path $ffx)) { throw 'patched amd_fidelityfx_vk.dll not built' }
+            $ffxText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($ffx))
+            if (!$ffxText.Contains('command lists of queue family')) { throw 'amd_fidelityfx_vk.dll lacks the command list pool fix' }
+            if (!$ffxText.Contains('KYTY_FSR3_FG_ACTIVE')) { throw 'amd_fidelityfx_vk.dll lacks the dynamic multiplier' }
+            Copy-Item $ffx, _Build\deps\ffx\FidelityFX-LICENSE.txt $out
             # (10-28b) Add-to-Steam files in the folder root.
             Copy-Item tools\local\steam\Anadir-a-Steam.cmd, tools\local\steam\Anadir-a-Steam.ps1, tools\local\steam\fondo-steam.jpg $out
             # (10-28) AMD FSR 4 (Reescalado FSR 4): the v07 INT8 model next to the exe, checked against its manifests.
