@@ -11,6 +11,9 @@ offer (last item): the launcher asks you to precompile again, and that run compi
   buttons the game shows: the bottom one is Cross and the right one Circle (before, they went by label: A, on the right,
   was Cross). Joy-Cons, 8BitDo pads in Switch mode and GameCube pads too; `-Set SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1`
   goes back to the labels.
+- **Steam Big Picture: the controller works right after you quit the game** (#217): after a game started from Big
+  Picture ended, Big Picture stayed without focus until a click or Alt+Tab. The launcher now gives it the focus back
+  once Steam has seen the game end.
 - **Less work on the render thread** (PR #257, credit @ponhei9502): a buffer description the game hands over unchanged
   keeps its looked-up entry instead of being hashed again, about 0.5 ms less per frame at Boletaria 1-1 on an RTX 5090
   (`-Set KYTY_TABLE_GATHER_MEMO=0` turns it off).
@@ -24,7 +27,7 @@ offer (last item): the launcher asks you to precompile again, and that run compi
 - **Precompile: more shaders** for DLSS, frame generation and the 1440p output (#260, credit @2000Arsen, from a full
   playthrough): 859 programs and 894 pipelines more, fewer first-use stutters with those settings.
 - **Thanks** to @ponhei9502 for PR #257, to @2000Arsen for the shader list, and to @HybOj, @forensicssix-debug, @ft1704,
-  @jrodriguezml and @tao755-maker for their reports and tests.
+  @jrodriguezml, @tao755-maker and @javsp for their reports and tests.
 
 ## New in v20261031
 
@@ -72,6 +75,8 @@ Your precompiled shaders stay valid: the shaders are the same as in v20261030.
 - **Nintendo Switch Pro 等任天堂布局手柄**（#262）：正面按键改为按位置对应，与游戏显示的 PlayStation 按键一致：下方为 ×，右方为
   ○（以前按标签对应：右边的 A 是 ×）。Joy-Con、Switch 模式的 8BitDo 手柄和 GameCube 手柄同样如此；
   `-Set SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1` 恢复按标签对应。
+- **Steam Big Picture：退出游戏后手柄立即可用**（#217）：从 Big Picture 启动的游戏结束后，Big Picture 一直没有焦点，需要点一下或
+  按 Alt+Tab。现在 Steam 确认游戏结束后，启动器会把焦点交还给它。
 - **渲染线程的工作更少**（PR #257，感谢 @ponhei9502）：游戏交来的缓冲区描述没有变化时，沿用已查到的条目，不再重新计算哈希；
   RTX 5090 在波雷塔利亚 1-1 每帧约少 0.5 ms（`-Set KYTY_TABLE_GATHER_MEMO=0` 关闭）。
 - **FSR 3 插帧：在菜单和加载时按 F11**（#174）：插帧暂停时（主菜单、加载画面）切换全屏，可能导致画面冻结或显卡设备丢失。
@@ -81,8 +86,8 @@ Your precompiled shaders stay valid: the shaders are the same as in v20261030.
   帧率只剩显示器刷新率的一半）。
 - **预编译：更多着色器**，覆盖 DLSS、插帧和 1440p 输出（#260，感谢 @2000Arsen 提供的完整通关记录）：多 859 个程序、894 条
   管线，这些设置下首次出现的卡顿更少。
-- **感谢** @ponhei9502 的 PR #257、@2000Arsen 提供的着色器列表，以及 @HybOj、@forensicssix-debug、@ft1704、@jrodriguezml 和
-  @tao755-maker 的反馈与测试。
+- **感谢** @ponhei9502 的 PR #257、@2000Arsen 提供的着色器列表，以及 @HybOj、@forensicssix-debug、@ft1704、@jrodriguezml、
+  @tao755-maker 和 @javsp 的反馈与测试。
 
 ## v20261031 的变化
 
