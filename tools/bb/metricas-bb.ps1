@@ -291,8 +291,15 @@ function Get-FileFps {
 		$m = [regex]::Matches($text, '\[up\] ([^\r\n]+)')
 		if ($m.Count -gt 0) { $r.up = $m[$m.Count - 1].Groups[1].Value.Trim() }
 		# (bb-upscale) "[res] game WxH -> output WxH ...": lo que el juego dibuja de verdad.
-		$m = [regex]::Matches($text, '\[res\] game ([0-9]+x[0-9]+) -> output ([0-9]+x[0-9]+)')
-		if ($m.Count -gt 0) { $r.resGame = $m[$m.Count - 1].Groups[1].Value; $r.resOut = $m[$m.Count - 1].Groups[2].Value }
+		# Salida real: la ventana. Si el reescalador no corre, el presentador solo estira la imagen.
+		$m = [regex]::Matches($text, '\[res\] game ([0-9]+x[0-9]+) -> output ([0-9]+x[0-9]+) \(window ([0-9]+x[0-9]+), ([^)\r\n]*)\)')
+		if ($m.Count -gt 0) {
+			$g = $m[$m.Count - 1].Groups; $r.resGame = $g[1].Value; $r.resOut = $g[3].Value
+			if ($g[4].Value -notmatch '^upscaled') { $r.resOut = "$($g[3].Value) (estirado, sin reescalar)" }
+		} else {
+			$m = [regex]::Matches($text, '\[res\] game ([0-9]+x[0-9]+) -> output ([0-9]+x[0-9]+)')
+			if ($m.Count -gt 0) { $r.resGame = $m[$m.Count - 1].Groups[1].Value; $r.resOut = $m[$m.Count - 1].Groups[2].Value }
+		}
 		if ($r.Count) { return $r }
 	} catch { }
 	return $null
