@@ -348,6 +348,10 @@ struct State {
 			if (clean) NoteCleanRead(address, bytes);
 			return true;
 		}
+		// (KYTY_SPECULATE_COPY_RUNS, live speculate_copy_runs 0: word by word, as before.)
+		static auto& copy_runs = LiveSwitch::Find("speculate_copy_runs", 1);
+		if (count > 1 && copy_runs.load(std::memory_order_relaxed) != 0)
+			if (const auto run = ReadCopyRun(address, count, out); run != Run::NotOne) return run == Run::Read;
 		for (uint32_t i = 0; i < count; ++i) {
 			const uint64_t at = address + 4ull * i;
 			const State*   by = nullptr;
@@ -380,6 +384,39 @@ struct State {
 		// (A previous speculation's work's; a write of one finished since is in memory, or will be: a clean read.)
 		if (chain_written.Intersects(at, 4)) return false;
 		return CopyGuest(&value, at, 4);
+	}
+	// The words ReadWord gives one by one, in one read when one copy gives them all: the latest pending write over any
+	// of them (of this speculation, else of the first one before it with any) is a copy over all of them, with nothing
+	// pending over its source and no write of the work of a speculation walked before it over them. (The game's 4 MiB
+	// copy of its constants each frame put every descriptor read there on the word path: ~11% of a speculation's
+	// thread.) NotOne: not that case, the word path decides.
+	enum class Run { NotOne, Read, Refused };
+	[[nodiscard]] Run ReadCopyRun(uint64_t address, uint32_t count, uint32_t* out) {
+		const uint64_t bytes = uint64_t {4} * count;
+		const State*   owner = nullptr;
+		if (journal_set.Intersects(address, bytes)) {
+			owner = this;
+		} else {
+			if (written_set.Intersects(address, bytes) || !chain_journal.Intersects(address, bytes)) return Run::NotOne;
+			for (const State* state = previous.load(); state != nullptr && owner == nullptr; state = state->previous.load()) {
+				if (state->written_set.Intersects(address, bytes)) return Run::NotOne;
+				if (state->journal_set.Intersects(address, bytes)) owner = state;
+			}
+			if (owner == nullptr) return Run::NotOne;
+		}
+		const auto latest = std::find_if(owner->writes.rbegin(), owner->writes.rend(), [&](const MemoryWrite& write) {
+			return write.address < address + bytes && address < write.address + write.size;
+		});
+		if (latest == owner->writes.rend() || !latest->copy || latest->address > address ||
+		    address + bytes > latest->address + latest->size)
+			return Run::NotOne;
+		const auto source = latest->value + (address - latest->address);
+		if (owner->JournalIntersects(source, bytes) || owner->WrittenIntersects(source, bytes)) return Run::Refused;
+		if (!CopyGuest(out, source, bytes)) return Run::Refused;
+		if (owner == this) NoteCleanRead(source, bytes);
+		else
+			for (uint32_t i = 0; i < count; ++i) chain_reads.push_back({address + 4ull * i, out[i]});
+		return Run::Read;
 	}
 	// The word `state`'s latest pending write over it gives (a copy: its source's, with no write of that speculation
 	// or an earlier one pending over the source).
