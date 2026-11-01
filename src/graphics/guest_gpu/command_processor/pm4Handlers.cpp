@@ -122,6 +122,14 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 // the commit checks). The pass reads tables as they are (no command-memory sync off the GPU thread): one GPU work wrote
 // whose pages the GPU thread has not read-protected yet, or one the game has reused, may be other data. Such a table,
 // floats read as pairs, set DB_RENDER_CONTROL's copy-depth-to-color bit and ended a mode 4 run at the arch (11-01).
+// A state pass's register packet past its bank (a command buffer of other data): reported a few times.
+void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+		std::printf("Speculation: a state pass skipped a register packet of other data (header 0x%08x, register 0x%08x)\n",
+		            cmd_id, offset);
+}
+
 [[nodiscard]] bool GuardTable(uint32_t*& table, uint32_t pairs, uint32_t bank) {
 	if (GuestGpu::IsGpuThread()) return true;
 	thread_local std::vector<uint32_t> copy;
@@ -2746,6 +2754,11 @@ KYTY_CP_OP_PARSER(CpOpSetContextReg) {
 	}
 
 	if (cmd_offset >= Pm4::CX_NUM) {
+		if (!GuestGpu::IsGpuThread()) { // (as CpOpSetShaderReg's)
+			if (Spec::Current() != nullptr) Spec::Refuse("register packet of other data");
+			else ReportOtherData(cmd_id, buffer[0]);
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
 		EXIT("unknown extended context register\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32
 		     "\n\tcmd_offset = %08" PRIx32 "\n\tvalue = %08" PRIx32 "\n",
 		     num_dw - dw, cmd_id, cmd_offset, buffer[1]);
@@ -2790,7 +2803,17 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 		return 2;
 	}
 
-	EXIT_NOT_IMPLEMENTED(cmd_offset >= Pm4::SH_NUM);
+	if (cmd_offset >= Pm4::SH_NUM) {
+		// (Off the GPU thread, a register packet past its bank is a command buffer of other data, one the game reused or GPU
+		// work wrote: the speculation is refused, a state pass skips it; its chunks' start states then differ, which the
+		// commit checks. A mode 4 run ended here during the arch's load, 11-01.)
+		if (!GuestGpu::IsGpuThread()) {
+			if (Spec::Current() != nullptr) Spec::Refuse("register packet of other data");
+			else ReportOtherData(cmd_id, buffer[0]);
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
+		EXIT_NOT_IMPLEMENTED(cmd_offset >= Pm4::SH_NUM);
+	}
 
 	auto pfunc = g_hw_sh_func[cmd_offset];
 
@@ -2843,6 +2866,11 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	if (cmd_offset >= Pm4::UC_NUM) {
+		if (!GuestGpu::IsGpuThread()) { // (as CpOpSetShaderReg's)
+			if (Spec::Current() != nullptr) Spec::Refuse("register packet of other data");
+			else ReportOtherData(cmd_id, buffer[0]);
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
 		EXIT("unsupported UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
 		     "), cmd_id = 0x%08" PRIx32 "\n",
 		     cmd_offset, raw_cmd_offset, cmd_id);
