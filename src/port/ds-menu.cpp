@@ -101,7 +101,7 @@ std::mutex               g_mutex;
 std::deque<Input>        g_inputs;
 int                      g_passthrough = 0; // window thread: zeroed axes sent to the game as the menu opened
 int                      g_cursor_before = -1;
-constexpr int            kTabCount = 6; // (10-27c) Gráficos, Pantalla, Sonido, Controles, Sistema, Trofeos
+constexpr int            kTabCount = 7; // (10-27c) Gráficos, Pantalla, Sonido, Controles, Sistema, Trofeos; (ds-pc-port37) Ajustes del juego
 int                      g_tab = 0, g_tab_request = -1;
 int                      g_fg_live = 0;
 std::string              g_status;
@@ -1432,14 +1432,14 @@ void Draw(float width, float height) {
 	// left, the focused row's description on the right.
 	// (10-28b) The launcher (before the game): Imagen, Calidad gráfica, Ray tracing, Controles, Sistema (the Configurador
 	// folded in) and Trofeos; the same sections and rows as F1, so both write the same settings.ini the same way.
-	const char* game_tabs[kTabCount]     = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos"};
-	const char* launcher_tabs[kTabCount] = {"Imagen", "Calidad gráfica", "Ray tracing", "Controles", "Sistema", "Trofeos"};
+	const char* game_tabs[kTabCount]     = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos", "Ajustes del juego"};
+	const char* launcher_tabs[kTabCount] = {"Imagen", "Calidad gráfica", "Ray tracing", "Controles", "Sistema", "Trofeos", "Ajustes del juego"};
 	const char* const* tabs = g_start_mode ? launcher_tabs : game_tabs;
-	static const std::vector<int> game_groups[kTabCount] = {{0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}}; // (10-28) no Modos Souls
-	static const std::vector<int> launcher_groups[kTabCount] = {{5, 0, 1}, {2}, {3}, {7}, {9, 6, 8}, {}};
+	static const std::vector<int> game_groups[kTabCount] = {{0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}, {10}}; // (10-28) no Modos Souls
+	static const std::vector<int> launcher_groups[kTabCount] = {{5, 0, 1}, {2}, {3}, {7}, {9, 6, 8}, {}, {10}};
 	const std::vector<int>* groups = g_start_mode ? launcher_groups : game_groups;
-	static const char* section_names[10] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
-	                                        "Pantalla", "Rendimiento", "Controles", "Tu equipo", "Configurador"};
+	static const char* section_names[11] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
+	                                        "Pantalla", "Rendimiento", "Controles", "Tu equipo", "Configurador", "Ajustes del juego"};
 	g_unit = unit;
 	const float footer  = (g_start_mode ? 250 : 150) * unit;
 	const bool  nvidia  = g_rt.pc.nvidia;
@@ -1584,30 +1584,6 @@ void Draw(float width, float height) {
 					CheckRow("Bloom", true, s.bloom, "Resplandor alrededor de las luces fuertes (Sí = como en PS5).");
 					CheckRow("Adaptación de la vista", true, s.eye_adapt, "La exposición se adapta al pasar de zonas oscuras a claras, como el ojo (Sí = como en PS5).");
 					ImGui::TextColored(kDim, "%s", "Son ajustes internos del juego: los lee al arrancar.");
-					// (ds-pc-port37) The emulator launcher's "Ajustes del juego": the engine's own convars, each at the game's own
-					// value (Predeterminado) or a level; they win over the rows above (KYTY_GAME_CONVARS_EXTRA, after them).
-					ImGui::Spacing();
-					if (ImGui::CollapsingHeader(I18n::T("Ajustes del juego"))) {
-						static const Choice levels[] = {{"0", "Predeterminado"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}, {"5", "Extremo"}};
-						static const Choice onoff[]  = {{"0", "Predeterminado"}, {"1", "No"}, {"2", "Sí"}};
-						ImGui::TextWrapped("%s", I18n::T("Ajustes del propio juego. Predeterminado = como viene en PS5, sin tocar nada. Pasa el ratón por encima de cada uno para ver qué hace y lo que cuesta. Mandan sobre las filas de arriba."));
-						size_t      n   = 0;
-						const auto* all = GameSettings(&n);
-						const char* sec = "";
-						for (size_t i = 0; i < n; i++) {
-							const GameSetting& g = all[i];
-							if (std::strcmp(sec, g.section) != 0) {
-								sec = g.section;
-								ImGui::Spacing();
-								ImGui::TextColored(kGold, "%s", I18n::T(sec));
-							}
-							std::string v = std::to_string(GameSettingLevel(s, g.id));
-							ImGui::PushID(g.id);
-							if (ChoiceRow(g.name, true, g.onoff ? onoff : levels, g.onoff ? 3 : 6, v, g.tip)) SetGameSettingLevel(&s, g.id, std::atoi(v.c_str()));
-							ImGui::PopID();
-						}
-						if (ImGui::Button(I18n::T("Todo predeterminado"))) s.game_settings.clear();
-					}
 					break;
 				}
 				case 3: { // Ray tracing (ds-torch-1028's launcher rows, in its order; hardware RT only with the experimental switch)
@@ -1700,6 +1676,29 @@ void Draw(float width, float height) {
 					ImGui::TextWrapped("%s", s.game.c_str());
 					ImGui::TextColored(kDim, "%s", g_start_mode ? "Se cambia abajo (Cambiar...)." : "Se cambia en el menu de inicio, antes del juego.");
 					break;
+				}
+				case 10: { // (ds-pc-port37) Ajustes del juego: the emulator launcher's window, as a section of its own
+					Section("Ajustes del juego");
+						static const Choice levels[] = {{"0", "Predeterminado"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}, {"5", "Extremo"}};
+						static const Choice onoff[]  = {{"0", "Predeterminado"}, {"1", "No"}, {"2", "Sí"}};
+						ImGui::TextWrapped("%s", I18n::T("Ajustes del propio juego. Predeterminado = como viene en PS5, sin tocar nada. Pasa el ratón por encima de cada uno para ver qué hace y lo que cuesta. Mandan sobre las opciones de Calidad gráfica."));
+						size_t      n   = 0;
+						const auto* all = GameSettings(&n);
+						const char* sec = "";
+						for (size_t i = 0; i < n; i++) {
+							const GameSetting& g = all[i];
+							if (std::strcmp(sec, g.section) != 0) {
+								sec = g.section;
+								ImGui::Spacing();
+								ImGui::TextColored(kGold, "%s", I18n::T(sec));
+							}
+							std::string v = std::to_string(GameSettingLevel(s, g.id));
+							ImGui::PushID(g.id);
+							if (ChoiceRow(g.name, true, g.onoff ? onoff : levels, g.onoff ? 3 : 6, v, g.tip)) SetGameSettingLevel(&s, g.id, std::atoi(v.c_str()));
+							ImGui::PopID();
+						}
+						if (ImGui::Button(I18n::T("Todo predeterminado"))) s.game_settings.clear();
+										break;
 				}
 				case 9: DrawConfigurator(unit, true); break; // (10-28b) the launcher's Sistema: hardware and Optimizar
 				case 6: { // Sistema
