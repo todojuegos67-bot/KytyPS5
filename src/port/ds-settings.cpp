@@ -1084,28 +1084,16 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	env.Default("KYTY_HITCH_LOG_MS", "40");
 	if (s.aspect_fit) env.Set("KYTY_PRESENT_ASPECT", "fit");
 	env.Default("KYTY_ASYNC_DRAW_PIPELINES", "1");
-	// The port's start menu precompiles every pipeline before the game: no second, in-game warm of every static recipe
-	// (~78K pipelines beside the game, the whole multi-GB driver cache saved every 4,000: the game crawled at the
-	// character select with "Preparando ... 8%" and a black screen). What the precompile lacks compiles at first use.
-	env.Default("KYTY_STATIC_WARMUP", "0");
-	// (ds-pc-port43) The SPIR-V disk store back on (port37): the odd colours were DLSS 5 alta, not the store.
-	env.Default("KYTY_SPIRV_DISK", "1");
-	// (ds-pc-port44) Shaders and pipelines as the emulator's launcher loads them, all of them before play: every recorded
-	// pipeline at start-up (not world by world: KYTY_SCENE_WARMUP), the prefetch beside it from the first frame, and the
-	// game's first world load held until both are done, the progress line on screen (local/shader-gate.h).
-	env.Default("KYTY_SCENE_WARMUP", "0");
-	env.Default("KYTY_SHADER_GATE", "1");
-	// (ds-pc-port37) "Carga de shaders al maximo": the translation of the game's shaders at the start (the prefetch: every
-	// shader of the game, then the recorded ones' warmup) on every CPU thread, at background priority (the game stays ahead).
-	// By default the prefetch took CPUs - 12, at most half of them, and half of that after the recorded programs (a 16-thread
-	// CPU: 4, then 2), the warmup a fixed 16: minutes of "Preparando shaders" at every start.
-	if (s.shader_turbo) {
-		const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-		env.Set("KYTY_SHADER_PREFETCH_THREADS", std::to_string(std::min(cpus, 64u)));
-		// (ds-pc-port46) As the emulator launcher's (launch.json: KYTY_SHADER_WARMUP_THREADS=16; no follow helpers set: the
-		// default 2).
-		env.Set("KYTY_SHADER_WARMUP_THREADS", "16");
-	}
+	// (ds-pc-port47) "Debe funcionar exactamente como en el launcher": every shader default as the emulator's (de604751
+	// with its launch.json): KYTY_STATIC_WARMUP, KYTY_SCENE_WARMUP (by map) and the prefetch threads (16, then 8) left to
+	// the emulator's own defaults, no shader gate, and no SPIR-V disk store (the emulator has none: off). The warmup on 16
+	// threads, launch.json's KYTY_SHADER_WARMUP_THREADS.
+	env.Set("KYTY_SPIRV_DISK", "0");
+	env.Set("KYTY_SHADER_GATE", "");
+	env.Set("KYTY_SCENE_WARMUP", "");
+	env.Set("KYTY_STATIC_WARMUP", "");
+	env.Set("KYTY_SHADER_PREFETCH_THREADS", "");
+	env.Set("KYTY_SHADER_WARMUP_THREADS", "16");
 	// -Ram16 (10-24): "Optimizacion equipos 16 GB RAM" on a PC of 20 GB of RAM or less (or simulated) only.
 	if (low_ram) { // (10-27b) on low-RAM PCs only, whatever the old box says
 		env.Default("KYTY_RESIDENT_MB", "6144");

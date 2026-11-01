@@ -1346,12 +1346,7 @@ int main(int argc, char* argv[]) {
 		// may run on (the V-Cache CCD: 16 on a 9950X3D), less the render and game threads, not every CPU of the PC
 		// (hardware_concurrency: 32 threads squeezed onto 16 CPUs next to the render thread, the in-game hitches).
 		// (ds-pc-port46) The warmup threads as the emulator launcher's fixed 16 (was the CCD's CPUs - 2: 14).
-		// (ds-pc-port41) The prefetch translates for minutes beside play (11-01: 19978 programs, done long after the first
-		// fights) at the same background priority as the driver's pipeline compiles: on 14 of 16 CPUs it starved them
-		// (2.1-2.6 s per pipeline in the first fights). Half the game's CPUs, the emulator launcher's bound.
-		// (ds-pc-port44) Every CPU of the game's again, as the emulator's 16: the prefetch is done before play now (the shader
-		// gate holds the first world until it is), so it no longer runs beside the fights.
-		if (settings.shader_turbo && key == "KYTY_SHADER_PREFETCH_THREADS") value = std::to_string(std::max(2, cpus));
+		// (ds-pc-port47) The prefetch threads left to the emulator's default (no override).
 	}
 	for (const auto& [key, value]: plan.env) SetEnv(key, value);
 	std::printf("[port] switches: %zu, vblank %d Hz\n", plan.env.size(), plan.vblank);
