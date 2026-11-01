@@ -4821,7 +4821,7 @@ bool Footer(float unit) {
 
 bool DrawPad(float width, float height, float unit) {
 	Begin("Mapear mando", width, height, unit);
-	ImGui::BeginChild("##padpage", {0, -std::round(84 * unit)});
+	ImGui::BeginChild("##padpage", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened); // (ds-pc-port41) the D-pad / stick move row by row inside the list and the page follows the focus
 	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
 	(void)PadMap::Draw(g_edit, unit);
 	ImGui::EndChild();
@@ -4844,7 +4844,7 @@ bool DrawKbm(float width, float height, float unit) {
 	}
 	LoadMouse();
 	Begin("Teclado y ratón", width, height, unit);
-	ImGui::BeginChild("##kbmpage", {0, -std::round(84 * unit)});
+	ImGui::BeginChild("##kbmpage", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened); // (ds-pc-port41) the D-pad / stick move row by row inside the list and the page follows the focus
 	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
 	ImGui::Checkbox(I18n::T("Jugar con teclado y ratón"), &g_edit.kbm);
 	Anim::Highlight(unit);
