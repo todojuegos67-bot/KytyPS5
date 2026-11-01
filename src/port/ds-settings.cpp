@@ -931,7 +931,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			// (ds-pc-port40) Suave / Medio / Fuerte used to change only the foveated grid's edge density (GPU time): the
 			// model's look stayed the same at every level and "alta" was the default 1. Now the level is the model's own
 			// DLSSNR.Intensity and Intensidad the share of its edit applied (above 1: amplified), so each step is visible.
-			static const char* intensity[] = {"1", "0.75", "1.1", "1.5"};
+			static const char* intensity[] = {"1", "0.75", "1", "1"}; // (ds-pc-port43) never above the model's 1 (1.5 at Fuerte: 100% of the pixels edited, the odd colours)
 			sets.emplace_back("KYTY_DLSS_NR", "1");
 			sets.emplace_back("KYTY_DLSS_NR_INTENSITY", intensity[level]);
 			// (ds-pc-port43) The share of the model's edit applied stays at most 1 (the model's own picture): above 1 the edit
