@@ -225,6 +225,53 @@ int RunOne(const std::string& name, const std::wstring& args, bool claims = fals
 	return Finish(c);
 }
 
+// (ds-pc-port37) The static store is "outdated" when the release's hints file is newer than it (StaticCacheCurrent): every
+// update ships that file with the build's date, the same bytes or not, and every update precompiled everything again.
+// The hints' content is remembered when a precompile ends (<store>.hints-sum); at the next check, the same content
+// with a newer date gets the store's date back, so only new hints make a precompile.
+fs::path HintsFile() {
+	return g_setup.root / L"tools" / L"local" / L"static-precompile" / Wide("hints-" + g_setup.id + ".hints");
+}
+fs::path StoreFile() {
+	fs::path best;
+	fs::file_time_type at {};
+	std::error_code ec;
+	for (const wchar_t* ext: {L".binaries", L".blobs", L".bin"}) {
+		const fs::path f = g_setup.root / L"_PipelineCache" / L"static" / (Wide(g_setup.id) + ext);
+		if (!fs::exists(f, ec)) continue;
+		const auto t = fs::last_write_time(f, ec);
+		if (best.empty() || t > at) {
+			best = f;
+			at   = t;
+		}
+	}
+	return best;
+}
+std::string HintsSum() {
+	const std::string bytes = ReadAll(HintsFile());
+	if (bytes.empty()) return {};
+	uint64_t h = 1469598103934665603ull;
+	for (const unsigned char c: bytes) h = (h ^ c) * 1099511628211ull;
+	return std::to_string(bytes.size()) + ":" + std::to_string(h);
+}
+void RememberHints() {
+	const fs::path store = StoreFile();
+	if (store.empty()) return;
+	std::ofstream(fs::path(store.wstring() + L".hints-sum"), std::ios::binary) << HintsSum();
+}
+void KeepStoreCurrentForSameHints() {
+	const fs::path store = StoreFile(), hints = HintsFile();
+	std::error_code ec;
+	if (store.empty() || !fs::exists(hints, ec)) return;
+	const std::string saved = ReadAll(fs::path(store.wstring() + L".hints-sum"));
+	if (saved.empty() || saved != HintsSum()) return;
+	const auto store_time = fs::last_write_time(store, ec);
+	if (ec || fs::last_write_time(hints, ec) <= store_time) return;
+	fs::last_write_time(hints, store_time - std::chrono::seconds(1), ec);
+	std::printf("[port] precompile: the release's hints are the same as the store's: no precompile for the update\n");
+	std::fflush(stdout);
+}
+
 // The old (10-27c) way's driver cache, warmed with every static recipe: one multi-GB file the game loaded whole at every
 // start, saved whole during play. Gone once the static store is current (the launcher's way below holds those pipelines).
 void RemoveOldWarmedCache() {
@@ -509,6 +556,7 @@ void Work() {
 	SetText("Preparando shaders: guardando la cache...");
 	if (!run("merge", L"--merge --stamp --prune", false)) return fail("No se pudo guardar la cache de shaders (merge). Mira logs\\*-precompile.");
 	fs::remove_all(g_nvidia, ec);
+	RememberHints();
 	RemoveOldWarmedCache();
 	std::scoped_lock lock(g_mutex);
 	g_view.running  = false;
@@ -567,11 +615,15 @@ bool CacheCurrent() {
 	ForgetCachesWarmedUnderAnotherName();
 	SetEnvironmentVariableW(L"KYTY_WARM_DRIVER_CACHE_KEY", nullptr);
 	SetEnvironmentVariableW(L"KYTY_SHADOW_FILTER", g_setup.shadow_filter.empty() ? nullptr : std::wstring(g_setup.shadow_filter.begin(), g_setup.shadow_filter.end()).c_str());
+	KeepStoreCurrentForSameHints();
 	// (ds-pc-port37) Current as the launcher's: the static store is this GPU's and driver's and not older than the seeds.
 	const int code = RunOne("precompile-status", L"--seeds " + Quote(g_setup.seeds) + L" --status");
 	const std::string text = ReadAll(g_logs / L"precompile-status.out.log");
 	const bool current = code == 0 && text.find("static cache current") != std::string::npos;
-	if (current) RemoveOldWarmedCache();
+	if (current) {
+		RememberHints(); // (for the next update: its hints compared by content)
+		RemoveOldWarmedCache();
+	}
 	return current;
 #else
 	return true;
