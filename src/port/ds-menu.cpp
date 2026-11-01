@@ -3158,15 +3158,17 @@ void DrawLauncher(float width, float height) {
 		}
 	}
 	if (ImFont* f = g_font_semi != nullptr ? g_font_semi : ImGui::GetFont(); f != nullptr) {
-		// (ds-pc-port38) The fork's credit, small and subtle at the art's top-right corner (left of the column, which the
-		// Opciones panel covers from the top): a soft plate and shadow under light text, readable on light and dark art.
-		const float  size = std::max(12.0f, std::round(U(14)));
-		const char*  text = "Fork: todojuegos67";
-		const ImVec2 ts   = f->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
-		const ImVec2 at   = {std::floor(px - U(18) - ts.x), std::floor(U(14))};
-		bg->AddRectFilled({at.x - U(8), at.y - U(4)}, {at.x + ts.x + U(8), at.y + ts.y + U(4)}, IM_COL32(0, 0, 0, 96), U(4));
-		bg->AddText(f, size, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, 210), text);
-		bg->AddText(f, size, at, IM_COL32(236, 226, 204, 215), text);
+		// (ds-pc-port39) The fork's credit at the window's top-right corner, tight to it (margin 11 px x the unit, right-aligned
+		// by its measured width), small and subtle with a soft shadow; on the foreground list: above the Opciones column.
+		auto*        fg     = ImGui::GetForegroundDrawList();
+		const float  size   = std::max(12.0f, std::round(U(14)));
+		const float  margin = std::round(U(11));
+		const char*  text   = "Fork: todojuegos67";
+		const ImVec2 ts     = f->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+		const ImVec2 at     = {std::floor(width - margin - ts.x), margin};
+		fg->AddText(f, size, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, 170), text);
+		fg->AddText(f, size, {at.x + 1.5f, at.y + 1.5f}, IM_COL32(0, 0, 0, 90), text);
+		fg->AddText(f, size, at, IM_COL32(236, 226, 204, 200), text);
 	}
 
 	auto& io = ImGui::GetIO();
