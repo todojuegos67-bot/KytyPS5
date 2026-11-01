@@ -1379,6 +1379,10 @@ bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean)
 	    !Graphics::GuestGpu::IsTranslatingThread() || !IsGpuAddressRange(vaddr, size))
 		return false;
 	if (!clean && !g_gpu_resources->HasReadWatchers(vaddr, size) && SpeculationReadsClean(vaddr, size)) {
+		// A speculation's thread: the GPU thread may read-protect the page after the look above (work it commits
+		// writes it), and a fault there waits for the GPU thread, which may wait for this thread (a mode 4 hang at the
+		// stone arch, 11-01): a guarded read, none on a fault (the caller's word reads refuse the speculation).
+		if (!Graphics::GuestGpu::IsGpuThread()) return Common::GuardedCopy(data, reinterpret_cast<const void*>(vaddr), size) == 0;
 		// 8..64 bytes of whole words: fixed-size moves inline, a variable-size memcpy is a CRT call
 		// (thousands of SRT span reads per frame).
 		auto*       out = static_cast<uint8_t*>(data);

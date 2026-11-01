@@ -98,6 +98,23 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return spec == nullptr || spec->refused == nullptr;
 }
 
+// Off the GPU thread (a speculation's translation or a state pass), an indirect register table read in one guarded
+// copy: the GPU thread may read-protect its pages after SyncCommandMemory looked (work it commits writes them), and a
+// fault there waits for the GPU thread, which may wait for this thread (the hang of 11-01 had that in a span read). A
+// fault refuses a speculation; a state pass applies nothing of the table (its chunks' start states then differ from
+// the GPU thread's, which the commit checks).
+[[nodiscard]] bool GuardTable(uint32_t*& table, uint32_t pairs) {
+	if (GuestGpu::IsGpuThread()) return true;
+	thread_local std::vector<uint32_t> copy;
+	copy.resize(size_t {pairs} * 2u);
+	if (Common::GuardedCopy(copy.data(), table, uint64_t {pairs} * 8u) != 0) {
+		if (Spec::Current() != nullptr) Spec::Refuse("GPU-written guest memory");
+		return false;
+	}
+	table = copy.data();
+	return true;
+}
+
 // An entry of an indirect register table the emulator cannot apply: report the table once in a
 // while and skip the entry (the hardware ignores writes to unused register slots).
 void ReportIndirectRegister(const char* bank, uint64_t address, uint32_t count, uint32_t index,
@@ -2274,6 +2291,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectCxRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable(indirect_buffer, indirect_num_dw)) return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
@@ -2353,6 +2371,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectShRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable(indirect_buffer, indirect_num_dw)) return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
@@ -2409,6 +2428,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectUcRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable(indirect_buffer, indirect_num_dw)) return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
