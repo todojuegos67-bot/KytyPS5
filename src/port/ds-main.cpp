@@ -881,8 +881,9 @@ int main(int argc, char* argv[]) {
 				setup.shadow_filter = Port::ShadowFilterLevel(now);
 				const GameParam p   = ReadParam(now.game);
 				const std::string id = p.title_id.empty() ? std::string() : p.title_id + "_" + p.version;
-				// The seed file, hints and prefetch inputs of that folder's version (quick when they are current).
-				PrepareShaders(root, now.game, p, pa, pc);
+				// The seed file, hints and prefetch inputs of that folder's version: only for another folder or version (the
+				// start-up one was prepared at the splash; doing it again here doubled the start-up's shader steps).
+				if (now.game != setup.game || id != setup.id) PrepareShaders(root, now.game, p, pa, pc);
 				if (now.game != setup.game || id != setup.id)
 					std::printf("[port] precompile: game folder %s (%s), was %s (%s)\n", now.game.c_str(), id.c_str(), setup.game.c_str(),
 					            setup.id.c_str());

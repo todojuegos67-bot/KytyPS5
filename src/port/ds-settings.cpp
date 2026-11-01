@@ -1063,7 +1063,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	env.Set("KYTY_SHADER_WARMUP_BACKGROUND", "");
 	env.Set("KYTY_SHADER_PREFETCH", "");
 	env.Set("KYTY_PREFETCH_RELEASE", "");
-	env.Set("KYTY_STATUS_HUD_SECONDS", "0");
+	env.Set("KYTY_STATUS_HUD_SECONDS", "6"); // (ds-pc-port37) as the emulator launcher's: shown 6 s, the work goes on behind
 	env.Default("KYTY_SHADER_WARMUP_SECONDS", "60");
 	env.Default("KYTY_TABLE_STORE_BUDGET", "8");
 	env.Default("KYTY_HITCH_LOG_MS", "40");
